@@ -242,7 +242,7 @@ impl AgentManager {
     }
 
     /// 各セッションの状態変化(承認待ち・自動承認・終了)を検知して返す。毎フレーム呼んで良い。
-    /// 全自動YESで起動した claude セッションは承認プロンプトへ自動応答する。
+    /// 全自動YESで起動した対応 CLI は承認プロンプトへ自動応答する。
     pub fn poll_events(&mut self) -> Vec<SessionEvent> {
         use crate::terminal::Attention;
         let mut events = Vec::new();
@@ -277,22 +277,28 @@ impl AgentManager {
         }
     }
 
-    /// 指定セッションの権限モードを1段階サイクルする(Claude へ Shift+Tab を送る)。
-    /// Shift+Tab の端末バイト列は ESC [ Z (CBT)。
-    pub fn cycle_permission(&mut self, i: usize) {
-        if let Some(s) = self.sessions.get_mut(i) {
-            if s.running() {
-                s.write_bytes(b"\x1b[Z");
-            }
+    /// 指定セッションの権限モード切替 UI を開く/切り替える。
+    /// Claude/Antigravity は Shift+Tab、Codex は `/permissions` を送る。
+    pub fn cycle_permission(&mut self, i: usize) -> Option<&'static str> {
+        let s = self.sessions.get_mut(i)?;
+        if !s.running() {
+            return None;
         }
+        let keys = s.permission_switch_keys()?;
+        let hint = s.permission_switch_hint()?;
+        s.write_bytes(keys);
+        Some(hint)
     }
 
-    /// 実行中の全 claude セッションへ Shift+Tab を送る。送った件数を返す。
+    /// 実行中の対応 CLI セッションへ、それぞれの権限モード切替入力を送る。送った件数を返す。
     pub fn cycle_permission_all(&mut self) -> usize {
         let mut n = 0;
         for s in &mut self.sessions {
-            if s.running() && s.command.contains("claude") {
-                s.write_bytes(b"\x1b[Z");
+            if !s.running() {
+                continue;
+            }
+            if let Some(keys) = s.permission_switch_keys() {
+                s.write_bytes(keys);
                 n += 1;
             }
         }

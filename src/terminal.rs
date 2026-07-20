@@ -40,7 +40,7 @@ pub struct Session {
     scroll: usize,
     /// IME 変換中テキスト(未確定文字列)。UI 側だけの状態で PTY へは送らない。
     pub preedit: String,
-    /// Claude Code などが承認待ち(プロンプト表示中)と推定される状態。
+    /// CLI エージェントが承認待ち(プロンプト表示中)と推定される状態。
     pub attention: bool,
     /// 終了通知を出したかどうか(多重通知の防止)。
     pub notified_exit: bool,
@@ -55,6 +55,13 @@ pub struct Session {
     sel_anchor: Option<(u16, u16)>,
     /// コピー完了フィードバックの表示開始時刻。
     copied_at: Option<Instant>,
+    /// ユーザーがキーボードから直接この端末へ文字を送ったか。
+    ///
+    /// 音声入力は「さっき書いた分を Backspace で消して書き直す」方式なので、
+    /// 途中で人が手で打ったり Enter で送信したりすると、覚えている内容と
+    /// 入力欄の中身がずれる。ずれたことに気づけるよう印を立て、
+    /// 音声側が読んだら下ろす (`take_user_typed`)。
+    user_typed: bool,
 }
 
 /// scan_attention の結果。
@@ -67,7 +74,7 @@ pub enum Attention {
 
 /// 全自動YESモード用: 画面の承認プロンプトを分類し、送るキー列と説明を返す。
 ///
-/// bypass 起動でも Claude Code は起動時/プラン承認などで対話プロンプトを出すため、
+/// bypass 起動でも CLI エージェントは起動時/プラン承認などで対話プロンプトを出すため、
 /// これに答えないと「全自動なのに進まない」状態になる。
 pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
     // 初回の bypass 警告: デフォルト選択が「1. No, exit」なので
@@ -186,6 +193,7 @@ impl Session {
             selection: None,
             sel_anchor: None,
             copied_at: None,
+            user_typed: false,
         })
     }
 
@@ -198,14 +206,37 @@ impl Session {
         }
     }
 
-    /// claude セッションか(権限モード切替ボタンを出すか)。
-    pub fn is_claude(&self) -> bool {
-        self.command.contains("claude")
+    fn command_head(&self) -> Option<&str> {
+        self.command.split_whitespace().next()
     }
 
-    /// 全自動YESの対象セッションか(claude を bypass 権限で起動した場合のみ)。
+    /// Zaivern 側で承認モードを統一制御している CLI エージェントか。
+    pub fn is_permission_agent(&self) -> bool {
+        matches!(self.command_head(), Some("claude" | "codex" | "agy"))
+    }
+
+    /// 実行中セッションへ送れる権限モード切替のキー列。
+    pub fn permission_switch_keys(&self) -> Option<&'static [u8]> {
+        match self.command_head()? {
+            "claude" | "agy" => Some(b"\x1b[Z"),
+            "codex" => Some(b"/permissions\r"),
+            _ => None,
+        }
+    }
+
+    /// 権限モード切替ボタンの説明。
+    pub fn permission_switch_hint(&self) -> Option<&'static str> {
+        match self.command_head()? {
+            "claude" => Some("権限モード切替 (Shift+Tab)"),
+            "agy" => Some("権限モード切替 (Shift+Tab)"),
+            "codex" => Some("権限モード切替 (/permissions)"),
+            _ => None,
+        }
+    }
+
+    /// 全自動YESの対象セッションか(bypass 権限で起動した対応 CLI のみ)。
     pub fn auto_yes(&self) -> bool {
-        self.launched_bypass && self.is_claude()
+        self.launched_bypass && self.is_permission_agent()
     }
 
     /// 画面内容から「ユーザーの承認待ち」を推定する(約1秒間隔)。
@@ -260,6 +291,12 @@ impl Session {
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
+    }
+
+    /// 前回聞いてから人が手で打ったか。読んだ時点で印は下ろす。
+    /// 音声入力が「書き込み済みの文字列」の追跡を捨てるかどうかの判断に使う。
+    pub fn take_user_typed(&mut self) -> bool {
+        std::mem::take(&mut self.user_typed)
     }
 
     /// 文字列をそのままPTYへ書き込む(プログラム的な入力送信)。成功で true。
@@ -946,6 +983,8 @@ pub fn draw(
             }
         }
         if !out.is_empty() {
+            // 人が打った分は音声入力の書き込み追跡とずれるので印を立てる
+            session.user_typed = true;
             session.write_bytes(&out);
             session.set_scroll(0);
         }

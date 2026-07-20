@@ -358,22 +358,46 @@ func friendly(_ message: String) -> String {
     return message
 }
 
+func now() -> Double { Date().timeIntervalSince1970 }
+
+/// ひと息つくまでの秒数。これだけ言葉が伸びなかったら、そこまでを確定させる。
+let pauseSeconds = 1.2
+
 /// 停止を指示されるまで動き続ける認識ループ。
 ///
 /// SFSpeechRecognizer の 1 タスクは 1 分程度で自動的に終わり、文が確定するたびに
 /// タスクも終了する。喋り続けている間ずっと文字を出したいので、**マイク(音声エンジン)は
 /// 開いたままタスクだけを張り直す**。こうすると Enter で入力欄を空にした直後でも、
 /// 録音し直すことなくそのまま次の発話を拾える。
+///
+/// さらに、オンデバイス認識は「録音を止めるまで isFinal を返さない」ため、放っておくと
+/// 喋っている間ずっと partial のままで入力欄に何も溜まらない。そこで **息継ぎ
+/// (pauseSeconds) を検知したらそこで区切って確定させる**。区切るときは新しいタスクを
+/// 先に張ってから古い方を endAudio するので、切れ目の音声を取りこぼさない。
 final class Listener {
     let engine = AVAudioEngine()
+    let reqLock = NSLock()
     var request: SFSpeechAudioBufferRecognitionRequest?
     var task: SFSpeechRecognitionTask?
     var recognizer: SFSpeechRecognizer?
     var lastText = ""
     var finished = false
+    /// 区切りごとに増える世代番号。古いタスクからの partial を無視するために使う
+    var gen = 0
+    /// lastText が最後に伸びた時刻 (息継ぎ判定用)
+    var lastChange = now()
     /// 暴走検知用: 直近 5 秒間にタスクを張り直した回数
     var restartsInWindow = 0
-    var windowStart = Date().timeIntervalSince1970
+    var windowStart = now()
+
+    /// タップから触られるので、リクエストの差し替えは必ずロックして行う。
+    func swapRequest(_ next: SFSpeechAudioBufferRecognitionRequest?) -> SFSpeechAudioBufferRecognitionRequest? {
+        reqLock.lock()
+        let old = request
+        request = next
+        reqLock.unlock()
+        return old
+    }
 
     func start() {
         guard let rec = SFSpeechRecognizer(locale: Locale(identifier: locale)) else {
@@ -390,7 +414,10 @@ final class Listener {
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buf, _ in
-            self?.request?.append(buf)
+            guard let self = self else { return }
+            self.reqLock.lock()
+            self.request?.append(buf)
+            self.reqLock.unlock()
         }
         engine.prepare()
         do { try engine.start() } catch {
@@ -398,20 +425,56 @@ final class Listener {
             exit(1)
         }
         listen()
+        // 息継ぎを見張って、区切りがついたところから順に確定させていく
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.closeSegmentIfPaused()
+        }
         emit("R")
     }
 
-    /// 認識タスクを 1 つ張る。終わったら (停止指示が無い限り) 自動で張り直す。
-    func listen() {
-        guard !finished, let rec = recognizer else { return }
+    /// 言葉が pauseSeconds 以上伸びていなければ、そこまでをひとまとまりとして確定する。
+    ///
+    /// **確定 `F` はここで自分から出す。** 古いタスクのコールバックに任せてはいけない —
+    /// 確定が空文字だったりタスクが確定を出さずに死んだりすると `F` が永久に出ず、
+    /// Zaivern 側は「まだ書き換えてよい文字列」を抱えたままになる。すると次のひとことの
+    /// partial がその差分として計算され、**前の文を消して上書きしてしまう**
+    /// (= 喋り直すたびに入力欄が置き換わり、続けて溜まっていかない)。
+    ///
+    /// 出す文字列は、すでに `P` として流したものと同じ `lastText`。Zaivern 側の差分は
+    /// 空になるので端末へは 1 バイトも出ず、追跡だけが締められる。以後この区切りは
+    /// もう書き換わらないので、次のひとことはその後ろへ書き足されていく。
+    ///
+    /// 先に確定を出してから次のタスクを張るので、新しい `P` が古い `F` を追い越す
+    /// 余地はない。閉じた世代のコールバックは以後すべて捨てる。
+    func closeSegmentIfPaused() {
+        guard !finished, !lastText.isEmpty else { return }
+        guard now() - lastChange >= pauseSeconds else { return }
+        emit("F", lastText)
+        let old = listen()
+        old?.endAudio()
+    }
+
+    /// 認識タスクを 1 つ張り、置き換えられた前のリクエストを返す。
+    ///
+    /// 古いタスクのコールバックは世代番号で見分けて丸ごと捨てる。確定は
+    /// `closeSegmentIfPaused` がすでに出しているので、拾い直す必要はない。
+    @discardableResult
+    func listen() -> SFSpeechAudioBufferRecognitionRequest? {
+        guard !finished, let rec = recognizer else { return nil }
+        gen += 1
+        let myGen = gen
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
         if rec.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
-        request = req
+        let old = swapRequest(req)
         lastText = ""
+        lastChange = now()
 
         task = rec.recognitionTask(with: req) { [weak self] result, error in
             guard let self = self else { return }
+            // 区切りで閉じた世代は用済み。確定は closeSegmentIfPaused が出しているので、
+            // ここで何か出すと確定済みの文を後から書き換えてしまう
+            guard myGen == self.gen else { return }
             if let result = result {
                 let text = result.bestTranscription.formattedString
                 if result.isFinal {
@@ -421,6 +484,7 @@ final class Listener {
                     return
                 } else if text != self.lastText {
                     self.lastText = text
+                    self.lastChange = now()
                     emit("P", text)
                 }
             }
@@ -436,6 +500,7 @@ final class Listener {
                 }
             }
         }
+        return old
     }
 
     /// 停止指示が出ていなければ、間を置かずに次のタスクを張る。
@@ -444,11 +509,11 @@ final class Listener {
     /// 短時間に張り直しすぎたら諦めてエラーを返す。
     func restart() {
         task = nil
-        request = nil
+        _ = swapRequest(nil)
         guard !finished else { return }
-        let now = Date().timeIntervalSince1970
-        if now - windowStart > 5 {
-            windowStart = now
+        let t = now()
+        if t - windowStart > 5 {
+            windowStart = t
             restartsInWindow = 0
         }
         restartsInWindow += 1
@@ -465,7 +530,7 @@ final class Listener {
         finished = true
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        request?.endAudio()
+        swapRequest(nil)?.endAudio()
         let pending = lastText
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             // 確定が来なかったときは途中経過を確定として返す
@@ -543,6 +608,38 @@ mod tests {
         assert!(HELPER_SWIFT.contains("func restart()"));
         assert!(HELPER_SWIFT.contains("self.restart()"));
         assert!(HELPER_SWIFT.contains("guard !finished"));
+    }
+
+    #[test]
+    fn helper_finalizes_on_pauses() {
+        // オンデバイス認識は停止するまで isFinal を返さないので、息継ぎで区切って
+        // 確定させる仕組みが要る (これが無いと入力欄に何も溜まらない)
+        assert!(HELPER_SWIFT.contains("func closeSegmentIfPaused()"));
+        assert!(HELPER_SWIFT.contains("pauseSeconds"));
+        assert!(HELPER_SWIFT.contains("Timer.scheduledTimer"));
+        // 区切りの前後で音を落とさないよう、新タスクを張ってから旧リクエストを閉じる
+        assert!(HELPER_SWIFT.contains("let old = listen()"));
+        assert!(HELPER_SWIFT.contains("old?.endAudio()"));
+        // 古いタスクの partial を拾わないための世代管理
+        assert!(HELPER_SWIFT.contains("myGen == self.gen"));
+    }
+
+    #[test]
+    fn helper_emits_final_before_the_next_partial() {
+        // Zaivern 側は partial が届くたびに前回ぶんを消して書き直すので、確定 `F` が
+        // 出ないままだと次のひとことが前の文を消して上書きしてしまう (= 続けて
+        // 溜まっていかない)。区切りでは古いタスクのコールバックに任せず、
+        // 新しいタスクを張る前に自分で確定を出すこと。
+        let close = HELPER_SWIFT
+            .split("func closeSegmentIfPaused()")
+            .nth(1)
+            .expect("closeSegmentIfPaused があること");
+        let emit = close.find("emit(\"F\", lastText)").expect("区切りで自ら確定を出すこと");
+        let relisten = close.find("let old = listen()").expect("次のタスクを張ること");
+        assert!(emit < relisten, "確定は新しいタスクを張る前に出すこと");
+        // 閉じた世代のコールバックは確定も含めて丸ごと捨てる (確定済みの文を
+        // 後から書き換えないため)
+        assert!(HELPER_SWIFT.contains("guard myGen == self.gen else { return }"));
     }
 
     #[test]

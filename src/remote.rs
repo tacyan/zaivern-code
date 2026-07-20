@@ -782,7 +782,7 @@ const CMDS = [
   ['\u{1F520} フォント +', 'font_inc'], ['\u{1F520} フォント −', 'font_dec'],
   ['\u{1F332} ツリー更新', 'tree'], ['\u{1F6e1} 承認モード', 'approval_ask'],
   ['⚡ 全自動モード', 'approval_auto'], ['\u{1F916} Agent優先モード', 'approval_agent'],
-  ['\u{1F6e1} 権限切替(全Claude)', 'permission_cycle'],
+  ['\u{1F6e1} 権限切替(全Agent)', 'permission_cycle'],
 ];
 function renderCmds() {
   const el = $('cmds');

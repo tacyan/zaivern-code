@@ -27,7 +27,7 @@ pub enum Cmd {
     /// 既定の承認モード: "ask"(毎回ユーザー承認) | "auto"(全自動YES) | "agent"(Agent欄優先)
     SetApproval(String),
     TogglePet,
-    /// 実行中の全 claude セッションの権限モードを切替(Shift+Tab 送信)
+    /// 実行中の対応エージェントの権限モードを切替
     CyclePermissionAll,
     SetPetImage,
     ResetPetImage,

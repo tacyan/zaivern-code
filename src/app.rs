@@ -42,6 +42,10 @@ enum SidebarTab {
 ///
 /// 認識結果は対象セッションの入力欄へ「挿入するだけ」で Enter は送らない。
 /// 送信するかどうかは必ずユーザーが自分で決める (誤送信防止)。
+///
+/// 認識中のテキストは確定を待たずに入力欄へ流し込む。話している途中の文字は
+/// 変換のたびに書き換わるので、直前に書いた分を `live` に覚えておき、
+/// 食い違うところだけ Backspace で消してから続きを送る。
 #[derive(Default)]
 struct VoiceState {
     /// 起動中の認識プロセス (None = 停止中)。⏹ を押すまで動き続ける
@@ -56,6 +60,99 @@ struct VoiceState {
     stopping_at: Option<Instant>,
     /// 直前に文字を送った先。宛先が変わったら区切りの空白を入れない
     last_sent_to: Option<u64>,
+    /// 直前に送った文字列の末尾の 1 文字 (区切り空白を入れるか決めるのに使う)
+    last_char: Option<char>,
+    /// いま入力欄に書き込んである「まだ確定していない」文字列。
+    /// 区切りの空白を付けたならそれも含む (差分計算をこの 1 本で完結させるため)。
+    live: String,
+    /// `live` の先頭に区切りの空白を付けたか
+    live_space: bool,
+}
+
+/// 入力欄へ 1 回ぶん反映するための編集。
+struct VoiceEdit {
+    /// Backspace (0x7f) で消す文字数
+    del: usize,
+    /// 消したあとに書き足す文字列
+    add: String,
+    /// 反映後、入力欄に書いてあるはずの文字列 (区切りの空白を含む)
+    want: String,
+    /// `want` の先頭に区切りの空白を付けたか
+    space: bool,
+}
+
+impl VoiceEdit {
+    /// 送るものが無い (同じ途中経過がもう一度届いた) か。
+    fn is_noop(&self) -> bool {
+        self.del == 0 && self.add.is_empty()
+    }
+
+    /// 端末へ送るバイト列。`submit` なら最後に Enter まで付ける。
+    fn bytes(&self, submit: bool) -> Vec<u8> {
+        let mut out: Vec<u8> = vec![0x7f; self.del]; // 0x7f = DEL、端末の Backspace
+        out.extend_from_slice(self.add.as_bytes());
+        if submit {
+            out.push(b'\r');
+        }
+        out
+    }
+}
+
+impl VoiceState {
+    /// 入力欄が空になった (送信した / ユーザーが手で消した) ときに呼ぶ。
+    /// 書き込み済みの追跡を捨てるので、次の認識テキストは先頭から書き出される。
+    fn reset_live(&mut self) {
+        self.live.clear();
+        self.live_space = false;
+        self.last_char = None;
+    }
+
+    /// 認識テキスト `body` を届け先 `dest` の入力欄へ反映するための編集を組み立てる。
+    /// ここでは状態を変えない — 実際に書き込めたら `commit` を呼ぶこと。
+    fn plan(&self, body: &str, dest: u64) -> VoiceEdit {
+        // 区切りの空白を入れるかは、その区切りの書き出し時に一度だけ決めて据え置く
+        // (話している途中で変換が変わっても、空白が付いたり消えたりしないように)。
+        let space = if self.live.is_empty() {
+            self.last_sent_to == Some(dest) && needs_space(self.last_char, body.chars().next())
+        } else {
+            self.live_space
+        };
+        let want = if space {
+            format!(" {body}")
+        } else {
+            body.to_string()
+        };
+        let (del, add) = diff_edit(&self.live, &want);
+        VoiceEdit {
+            del,
+            add,
+            want,
+            space,
+        }
+    }
+
+    /// 書き込めた編集を状態へ反映する。
+    ///
+    /// 確定した分 (`is_final`) はもう書き換えないので追跡をやめる。これで次の
+    /// ひとことは前の文を消さずにその後ろへ書き足される — 2 回目以降の発話が
+    /// 同じ入力欄に溜まっていくのはここが効いている。
+    fn commit(&mut self, edit: VoiceEdit, is_final: bool, submit: bool, dest: u64) {
+        if submit {
+            // Enter まで送ったので入力欄は空。次はまた先頭から書き出す
+            self.reset_live();
+            self.last_sent_to = None;
+            return;
+        }
+        self.last_sent_to = Some(dest);
+        if is_final {
+            self.last_char = edit.want.chars().last();
+            self.live.clear();
+            self.live_space = false;
+        } else {
+            self.live = edit.want;
+            self.live_space = edit.space;
+        }
+    }
 }
 
 /// kind: 0 = ok(緑), 1 = warn(黄), 2 = err(赤)
@@ -1301,10 +1398,10 @@ impl ZaivernApp {
                 let n = self.agents.cycle_permission_all();
                 if n > 0 {
                     self.toast_warn(format!(
-                        "🛡 {n} 件の Claude に権限モード切替を送信しました（各画面の表示を確認してください）"
+                        "🛡 {n} 件のエージェントに権限モード切替を送信しました（各画面の表示を確認してください）"
                     ));
                 } else {
-                    self.toast("実行中の Claude セッションがありません", false);
+                    self.toast("実行中の対応エージェントがありません", false);
                 }
             }
             Cmd::SetPetImage => {
@@ -1384,6 +1481,7 @@ impl ZaivernApp {
             Cmd::SetVoiceTarget(t) => {
                 self.voice.target = t;
                 self.voice.last_sent_to = None;
+                self.voice.reset_live();
                 self.cfg.voice_target = t.name().to_string();
                 config::save_state(&self.cfg);
             }
@@ -1938,13 +2036,13 @@ impl ZaivernApp {
                         .response
                         .on_hover_text("デスクトップペット 🦀 の表示・画像変更");
 
-                        // 実行中の全 Claude を一括で権限モード切替
+                        // 実行中の対応エージェントを一括で権限モード切替
                         if self.agents.running_count() > 0
                             && ui
                                 .button(RichText::new("🛡 全切替").color(theme.ok))
                                 .on_hover_text(
-                                    "実行中の全 Claude に Shift+Tab を送り権限モードを切替(cycle)します。\n\
-                                     bypass↔確認 を切り替えられます(順送りなので希望の表示になるまで押してください)",
+                                    "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
+                                     Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
                                 )
                                 .clicked()
                         {
@@ -2207,12 +2305,12 @@ impl ZaivernApp {
                                                 RichText::new("○").color(theme.err)
                                             };
                                             ui.label(dot);
-                                            let badge = if s.is_claude() {
+                                            let badge = if s.is_permission_agent() {
                                                 s.approval_badge()
                                             } else {
                                                 ""
                                             };
-                                            let is_claude = s.is_claude();
+                                            let permission_hint = s.permission_switch_hint();
                                             ui.label(
                                                 RichText::new(format!(
                                                     "{}{} {}",
@@ -2229,15 +2327,14 @@ impl ZaivernApp {
                                                     if ui.small_button("⟳").clicked() {
                                                         restart = Some(i);
                                                     }
-                                                    if is_claude
-                                                        && ui
+                                                    if let Some(hint) = permission_hint {
+                                                        if ui
                                                             .small_button("🛡")
-                                                            .on_hover_text(
-                                                                "権限モード切替 (Shift+Tab)",
-                                                            )
+                                                            .on_hover_text(hint)
                                                             .clicked()
-                                                    {
-                                                        cycle = Some(i);
+                                                        {
+                                                            cycle = Some(i);
+                                                        }
                                                     }
                                                     ui.label(
                                                         RichText::new(s.uptime())
@@ -2549,8 +2646,12 @@ impl ZaivernApp {
             }
         }
         if let Some(i) = cycle {
-            self.agents.cycle_permission(i);
-            self.toast_warn("🛡 権限モード切替を送信しました（Claude の表示を確認してください）");
+            match self.agents.cycle_permission(i) {
+                Some(hint) => self.toast_warn(format!(
+                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）"
+                )),
+                None => self.toast("このセッションは権限モード切替に未対応です", false),
+            }
         }
         if let Some(i) = remove {
             self.agents.remove(i);
@@ -2597,7 +2698,11 @@ impl ZaivernApp {
                                         RichText::new("○").size(10.0).color(theme.err)
                                     };
                                     ui.label(dot);
-                                    let badge = if s.is_claude() { s.approval_badge() } else { "" };
+                                    let badge = if s.is_permission_agent() {
+                                        s.approval_badge()
+                                    } else {
+                                        ""
+                                    };
                                     let r = ui.selectable_label(
                                         i == active_ix,
                                         format!("{}{} {}", badge, s.icon, s.title),
@@ -2606,9 +2711,11 @@ impl ZaivernApp {
                                         set_active = Some(i);
                                     }
                                     r.context_menu(|ui| {
-                                        if s.is_claude() && ui.button("🛡 権限モードを切替 (Shift+Tab)").clicked() {
-                                            cycle = Some(i);
-                                            ui.close_menu();
+                                        if let Some(hint) = s.permission_switch_hint() {
+                                            if ui.button(format!("🛡 {hint}")).clicked() {
+                                                cycle = Some(i);
+                                                ui.close_menu();
+                                            }
                                         }
                                         if ui.button("⟳ 再起動").clicked() {
                                             restart = Some(i);
@@ -2645,22 +2752,22 @@ impl ZaivernApp {
                             if ui.button("⟳").on_hover_text("再起動").clicked() {
                                 restart = Some(self.agents.active);
                             }
-                            let is_claude = self
+                            let permission_hint = self
                                 .agents
                                 .sessions
                                 .get(self.agents.active)
-                                .map(|s| s.is_claude())
-                                .unwrap_or(false);
-                            if is_claude
-                                && ui
+                                .and_then(|s| s.permission_switch_hint());
+                            if let Some(hint) = permission_hint {
+                                if ui
                                     .button("🛡")
-                                    .on_hover_text(
-                                        "権限モードを切替（この Claude に Shift+Tab 送信）。\n\
-                                         bypass↔確認 を切り替えます(順送り。希望の表示になるまで押してください)",
-                                    )
+                                    .on_hover_text(format!(
+                                        "{hint}\n\
+                                         実行中セッションの画面表示を確認してください"
+                                    ))
                                     .clicked()
-                            {
-                                cycle = Some(self.agents.active);
+                                {
+                                    cycle = Some(self.agents.active);
+                                }
                             }
                         }
                     });
@@ -2691,8 +2798,12 @@ impl ZaivernApp {
             }
         }
         if let Some(i) = cycle {
-            self.agents.cycle_permission(i);
-            self.toast_warn("🛡 権限モード切替を送信しました（Claude の表示を確認してください）");
+            match self.agents.cycle_permission(i) {
+                Some(hint) => self.toast_warn(format!(
+                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）"
+                )),
+                None => self.toast("このセッションは権限モード切替に未対応です", false),
+            }
         }
         if let Some(i) = remove {
             self.agents.remove(i);
@@ -2738,8 +2849,8 @@ impl ZaivernApp {
                         if ui
                             .button(RichText::new("🛡 全切替").color(theme.ok))
                             .on_hover_text(
-                                "実行中の全 Claude に Shift+Tab を送り権限モードを切替(cycle)します。\n\
-                                 bypass↔確認 を一括で切り替え(順送り)",
+                                "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
+                                 Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
                             )
                             .clicked()
                         {
@@ -2875,7 +2986,7 @@ impl ZaivernApp {
                                                     RichText::new("○").color(theme.err)
                                                 };
                                                 ui.label(dot);
-                                                let badge = if s.is_claude() {
+                                                let badge = if s.is_permission_agent() {
                                                     s.approval_badge()
                                                 } else {
                                                     ""
@@ -2893,7 +3004,7 @@ impl ZaivernApp {
                                                         .size(10.5)
                                                         .color(theme.text_dim),
                                                 );
-                                                let is_claude = s.is_claude();
+                                                let permission_hint = s.permission_switch_hint();
                                                 ui.with_layout(
                                                     egui::Layout::right_to_left(
                                                         egui::Align::Center,
@@ -2913,15 +3024,14 @@ impl ZaivernApp {
                                                         {
                                                             restart = Some(i);
                                                         }
-                                                        if is_claude
-                                                            && ui
+                                                        if let Some(hint) = permission_hint {
+                                                            if ui
                                                                 .small_button("🛡")
-                                                                .on_hover_text(
-                                                                    "権限モード切替 (Shift+Tab)",
-                                                                )
+                                                                .on_hover_text(hint)
                                                                 .clicked()
-                                                        {
-                                                            cycle = Some(i);
+                                                            {
+                                                                cycle = Some(i);
+                                                            }
                                                         }
                                                         if ui
                                                             .small_button("🔍")
@@ -2982,8 +3092,12 @@ impl ZaivernApp {
             self.apply_cmd(Cmd::CyclePermissionAll, ctx);
         }
         if let Some(i) = cycle {
-            self.agents.cycle_permission(i);
-            self.toast_warn("🛡 権限モード切替を送信しました（Claude の表示を確認してください）");
+            match self.agents.cycle_permission(i) {
+                Some(hint) => self.toast_warn(format!(
+                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）"
+                )),
+                None => self.toast("このセッションは権限モード切替に未対応です", false),
+            }
         }
         if let Some(i) = launch {
             self.launch_preset(i, ctx);
@@ -3714,7 +3828,7 @@ impl ZaivernApp {
                 ),
                 (
                     "🛡".into(),
-                    "実行中の全 Claude の権限モードを切替 (Shift+Tab)".into(),
+                    "実行中の全エージェントの権限モードを切替".into(),
                     String::new(),
                     Cmd::CyclePermissionAll,
                 ),
@@ -4181,10 +4295,15 @@ impl ZaivernApp {
                 voice::Event::Ready => {
                     self.voice.ready = true;
                 }
-                voice::Event::Partial(t) => self.voice.partial = t,
+                // 途中経過も確定も同じ経路で入力欄へ流す。違いは、確定した分は
+                // もう書き換えないので追跡をやめる (= 次のひとことが後ろへ続く) 点だけ。
+                voice::Event::Partial(t) => {
+                    self.voice.partial = t.clone();
+                    self.apply_voice_text(&t, false);
+                }
                 voice::Event::Final(t) => {
                     self.voice.partial.clear();
-                    self.insert_voice_text(&t);
+                    self.apply_voice_text(&t, true);
                 }
                 voice::Event::Error(e) => {
                     self.toast(format!("🎤 {e}"), false);
@@ -4210,78 +4329,106 @@ impl ZaivernApp {
         }
     }
 
-    /// 認識テキストを対象セッションの入力欄へ挿入する。
+    /// 認識テキストを対象セッションの入力欄へ流し込む。
+    ///
+    /// 確定を待たずに、話している途中 (`is_final == false`) の文字もそのまま
+    /// 入力欄へ書き込む。喋りが進んで変換が変わると前に書いた文字列は書き換わるので、
+    /// **前回書いた分と食い違うところだけ Backspace で消してから続きを送る**。
+    /// これで入力欄が二重になったり、消し残しが出たりしない。
     ///
     /// **Enter は送らない**。ユーザーが内容を見て自分で Enter を押すまで
     /// エージェントへは送信されない。設定した合図キーワードを話したときだけ、
-    /// キーワードを取り除いたうえで Enter まで送る。
-    fn insert_voice_text(&mut self, text: &str) {
+    /// キーワードを取り除いたうえで Enter まで送る。合図の判定は確定したときだけ
+    /// 行う (途中経過で誤爆させない)。
+    fn apply_voice_text(&mut self, text: &str, is_final: bool) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
         let kw = self.cfg.voice_keyword.trim().to_string();
-        let (body, submit) = match kw.is_empty() {
-            true => (text.to_string(), false),
-            false => match strip_trailing_keyword(text, &kw) {
+        let (body, submit) = match is_final && !kw.is_empty() {
+            false => (text.to_string(), false),
+            true => match strip_trailing_keyword(text, &kw) {
                 Some(rest) => (rest, true),
                 None => (text.to_string(), false),
             },
         };
         let body = body.trim().to_string();
-        let payload = if submit {
-            format!("{body}\r")
-        } else {
-            body.clone()
-        };
-
         if body.is_empty() && !submit {
             return;
         }
 
-        // 話し続けている間は前の文とくっつかないよう区切りの空白を入れる。
-        // 宛先が変わった直後と、Enter で送った直後は先頭なので入れない。
-        let sent = match self.resolve_voice_target() {
-            Some(id) => {
-                let sep = self.voice.last_sent_to == Some(id);
-                match self.agents.sessions.iter_mut().find(|s| s.id == id) {
-                    Some(s) if s.running() => {
-                        let out = if sep { format!(" {payload}") } else { payload };
-                        s.write_bytes(out.as_bytes());
-                        self.voice.last_sent_to = if submit { None } else { Some(id) };
-                        Some(s.title.clone())
-                    }
-                    _ => None,
+        // 宛先が変わったら、前の入力欄に書いた文字はそのまま残して書き出しからやり直す
+        // (別のセッションへ Backspace を送り込んでしまわないように)。
+        let dest = self.resolve_voice_target();
+        let key = match dest {
+            Some(id) => id,
+            None => u64::MAX,
+        };
+        if self.voice.last_sent_to.is_some_and(|k| k != key) {
+            self.voice.live.clear();
+            self.voice.last_char = None;
+        }
+
+        // 録音中に人が手で打った (Enter で送った・自分で消した) なら、覚えている
+        // 書き込み内容はもう当てにならない。Backspace を送り込まず書き出しから
+        // やり直す — Enter で入力欄が空になったあとも、そのまま話し続けられる。
+        let typed = match dest {
+            Some(id) => self
+                .agents
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .is_some_and(|s| s.take_user_typed()),
+            None => self
+                .agents
+                .sessions
+                .iter_mut()
+                .fold(false, |acc, s| s.take_user_typed() || acc),
+        };
+        if typed {
+            self.voice.reset_live();
+        }
+
+        let edit = self.voice.plan(&body, key);
+        // 同じ途中経過がもう一度届いただけなら端末へ何も送らない。
+        // ただし確定と送信は、送るバイトが無くても追跡の締めが要るので通す。
+        if edit.is_noop() && !submit && !is_final {
+            return;
+        }
+        let out = edit.bytes(submit);
+
+        let sent = match dest {
+            Some(id) => match self.agents.sessions.iter_mut().find(|s| s.id == id) {
+                Some(s) if s.running() => {
+                    s.write_bytes(&out);
+                    Some(s.title.clone())
                 }
-            }
+                _ => None,
+            },
             None if self.voice.target == voice::Target::Broadcast => {
                 let n = self.agents.running_count();
                 if n == 0 {
                     None
                 } else {
                     // ブロードキャストは Enter 込みの broadcast() を使わず、
-                    // 挿入のみ / 送信ありを自分で選ぶ
-                    let sep = self.voice.last_sent_to == Some(u64::MAX);
-                    let out = if sep { format!(" {payload}") } else { payload };
+                    // 書き込みのみ / 送信ありを自分で選ぶ
                     for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
-                        s.write_bytes(out.as_bytes());
+                        s.write_bytes(&out);
                     }
-                    self.voice.last_sent_to = if submit { None } else { Some(u64::MAX) };
                     Some(format!("{n} セッション"))
                 }
             }
             None => None,
         };
 
-        match sent {
-            Some(where_) if submit => {
-                self.toast(format!("🎤▶ {where_} へ送信: {body}"), true)
-            }
-            Some(where_) => self.toast(
-                format!("🎤 {where_} の入力欄へ (Enter で送信): {body}"),
-                true,
-            ),
-            None => self.toast_warn("音声入力の宛先セッションが見つかりません"),
+        let Some(where_) = sent else {
+            self.toast_warn("音声入力の宛先セッションが見つかりません");
+            return;
+        };
+        self.voice.commit(edit, is_final, submit, key);
+        if submit {
+            self.toast(format!("🎤▶ {where_} へ送信: {body}"), true);
         }
     }
 
@@ -4367,8 +4514,8 @@ impl ZaivernApp {
                         }
                         ui.label(
                             RichText::new(
-                                "話した内容は入力欄に入り続けます。送信は自分で Enter を押したときだけ。\n\
-                                 Enter で空になっても録音は続いているので、そのまま話せます",
+                                "話しながらリアルタイムで入力欄へ書き込まれます。送信は自分で Enter を押したときだけ。\n\
+                                 Enter で空になっても録音は続いているので、そのまま話し続けられます",
                             )
                             .size(11.0)
                             .color(theme.text_dim),
@@ -4378,8 +4525,9 @@ impl ZaivernApp {
 
         if let Some(t) = set_target {
             self.voice.target = t;
-            // 宛先が変わったら区切りの空白をリセットする
+            // 宛先が変わったら、前の入力欄の追跡を捨てて書き出しからやり直す
             self.voice.last_sent_to = None;
+            self.voice.reset_live();
             if t != voice::Target::Session(0) {
                 self.cfg.voice_target = t.name().to_string();
                 config::save_state(&self.cfg);
@@ -5072,6 +5220,48 @@ fn rel_label(p: &Path, ws: &Path) -> String {
 
 /// ペット画像を読み込み egui テクスチャ化する。長辺 256px に縮小する。
 /// URL やファイルを OS の既定アプリ (ブラウザ等) で開く。
+/// 入力欄に書いてある `old` を `new` にするための編集を求める。
+///
+/// 返すのは (消す文字数, 書き足す文字列)。端末の入力欄はカーソル位置から
+/// Backspace で消すしかないので、**共通する先頭はそのまま残し、そこから後ろを
+/// まるごと消して書き直す**。話しながら変換が変わっても、変わった部分だけの
+/// やり取りで済む。
+fn diff_edit(old: &str, new: &str) -> (usize, String) {
+    let common = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let del = old.chars().count() - common;
+    let add: String = new.chars().skip(common).collect();
+    (del, add)
+}
+
+/// 音声のひとまとまりを前の続きへ書き足すとき、間に空白が要るか。
+///
+/// 息継ぎのたびに区切って入力欄へ足していくので、英文は単語がつながらないよう
+/// 空白を入れる。日本語は元々分かち書きしないため、入れると逆に読みにくい。
+fn needs_space(tail: Option<char>, head: Option<char>) -> bool {
+    let (Some(a), Some(b)) = (tail, head) else {
+        return false;
+    };
+    if a.is_whitespace() || b.is_whitespace() {
+        return false;
+    }
+    !is_cjk(a) && !is_cjk(b)
+}
+
+/// 分かち書きしない文字 (かな・漢字・全角記号など)。
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3000..=0x303F   // 全角の句読点・記号
+        | 0x3040..=0x30FF // ひらがな・カタカナ
+        | 0x3400..=0x4DBF | 0x4E00..=0x9FFF // 漢字
+        | 0xF900..=0xFAFF // 互換漢字
+        | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 // 全角英数・記号
+    )
+}
+
 /// 認識テキストの末尾が合図キーワードなら、それを取り除いた本文を返す。
 /// 音声認識は句読点を付けることがあるので、末尾の記号は無視して判定する。
 fn strip_trailing_keyword(text: &str, keyword: &str) -> Option<String> {
@@ -5187,4 +5377,242 @@ fn install_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joins_japanese_without_spaces() {
+        // 息継ぎごとに区切って書き足しても、日本語は分かち書きにならない
+        assert!(!needs_space(Some('る'), Some('修')));
+        assert!(!needs_space(Some('。'), Some('あ')));
+        assert!(!needs_space(Some('た'), Some('。')));
+    }
+
+    #[test]
+    fn separates_english_words() {
+        assert!(needs_space(Some('o'), Some('w')));
+        assert!(needs_space(Some('.'), Some('T')));
+    }
+
+    #[test]
+    fn no_space_at_the_start_or_next_to_existing_space() {
+        // 先頭 (まだ何も送っていない)
+        assert!(!needs_space(None, Some('a')));
+        assert!(!needs_space(Some('a'), None));
+        // すでに空白があるところへ重ねない
+        assert!(!needs_space(Some(' '), Some('a')));
+    }
+
+    #[test]
+    fn mixed_scripts_follow_the_japanese_side() {
+        // 日本語と英語が隣り合うときは詰める (「Rustで」を割らない)
+        assert!(!needs_space(Some('t'), Some('で')));
+        assert!(!needs_space(Some('を'), Some('R')));
+    }
+
+    #[test]
+    fn streaming_appends_only_the_new_tail() {
+        // 話し進めているだけの間は、増えたぶんを足すだけで消さない
+        assert_eq!(diff_edit("", "こん"), (0, "こん".into()));
+        assert_eq!(diff_edit("こん", "こんにちは"), (0, "にちは".into()));
+    }
+
+    #[test]
+    fn streaming_rewrites_only_what_changed() {
+        // 変換が確定して後ろが書き換わったケース。共通する先頭は残す
+        // (「きょうは」まで同じ → 「いいてんき」3 文字を消して「良い天気」を書く)
+        assert_eq!(diff_edit("きょうはいい", "きょうは良い"), (2, "良い".into()));
+        // 文字数は「バイト数」ではなく「文字数」で数える (日本語が壊れないこと)
+        let (del, add) = diff_edit("あいうえお", "あい");
+        assert_eq!((del, add.as_str()), (3, ""));
+    }
+
+    #[test]
+    fn streaming_is_a_noop_when_nothing_changed() {
+        // 同じ partial が続けて届いても端末へは何も送らない
+        assert_eq!(diff_edit("こんにちは", "こんにちは"), (0, String::new()));
+    }
+
+    #[test]
+    fn streaming_erases_everything_when_the_head_changes() {
+        // 先頭から変わったら全部消して書き直す
+        assert_eq!(diff_edit("abc", "xyz"), (3, "xyz".into()));
+    }
+
+    #[test]
+    fn streaming_handles_the_separator_space_as_part_of_the_text() {
+        // 区切りの空白も live に含めて数えるので、書き換えても空白が消えない
+        assert_eq!(diff_edit(" and", " and then"), (0, " then".into()));
+    }
+
+    /// 届け先セッションの id (テスト用の適当な値)
+    const DEST: u64 = 1;
+
+    #[test]
+    fn second_utterance_continues_in_the_same_field() {
+        let mut v = VoiceState::default();
+
+        // 1 回目 — 話しながら partial が伸びていく。増えたぶんだけ書き足す
+        let e = v.plan("こん", DEST);
+        assert_eq!((e.del, e.add.as_str()), (0, "こん"));
+        v.commit(e, false, false, DEST);
+        let e = v.plan("こんにちは", DEST);
+        assert_eq!((e.del, e.add.as_str()), (0, "にちは"));
+        v.commit(e, false, false, DEST);
+
+        // 確定。中身は最後の partial と同じで送るバイトは無いが、
+        // ここで追跡を締めないと 2 回目の発話が 1 回目を消してしまう
+        let e = v.plan("こんにちは", DEST);
+        assert!(e.is_noop());
+        v.commit(e, true, false, DEST);
+        assert!(v.live.is_empty(), "確定した分は書き換え対象から外れること");
+
+        // 2 回目 — 前の文を 1 文字も消さずに、その後ろへ書き足す
+        let e = v.plan("さようなら", DEST);
+        assert_eq!((e.del, e.add.as_str()), (0, "さようなら"));
+    }
+
+    #[test]
+    fn second_utterance_is_spaced_in_english_and_stays_spaced() {
+        let mut v = VoiceState::default();
+        let e = v.plan("hello", DEST);
+        v.commit(e, true, false, DEST);
+
+        // 続きの発話は単語がつながらないよう空白を挟む
+        let e = v.plan("world", DEST);
+        assert_eq!((e.del, e.add.as_str()), (0, " world"));
+        v.commit(e, false, false, DEST);
+
+        // 途中で認識が変わっても区切りの空白は据え置き (" world" → " word")
+        let e = v.plan("word", DEST);
+        assert_eq!((e.del, e.add.as_str()), (2, "d"));
+        assert_eq!(e.want, " word");
+    }
+
+    #[test]
+    fn submitting_starts_the_next_utterance_from_scratch() {
+        let mut v = VoiceState::default();
+        let e = v.plan("送ります", DEST);
+        v.commit(e, true, true, DEST);
+        // Enter を送ったので入力欄は空 — 消す文字も区切りの空白も無い
+        assert!(v.live.is_empty());
+        assert_eq!(v.last_char, None);
+        assert_eq!(v.last_sent_to, None);
+        let e = v.plan("次の話", DEST);
+        assert_eq!((e.del, e.add.as_str()), (0, "次の話"));
+    }
+
+    #[test]
+    fn switching_destination_does_not_backspace_the_new_one() {
+        let mut v = VoiceState::default();
+        let e = v.plan("前の宛先へ", DEST);
+        v.commit(e, false, false, DEST);
+
+        // 宛先が変わったら追跡を捨てる (apply_voice_text がやること)
+        v.live.clear();
+        v.last_char = None;
+        // 別セッションへは先頭から書き出す。空白も Backspace も入らない
+        let e = v.plan("新しい宛先へ", 2);
+        assert_eq!((e.del, e.add.as_str()), (0, "新しい宛先へ"));
+    }
+
+    /// テスト用の入力欄シミュレータ。端末へ送ったバイト列を実際に当ててみる。
+    /// 0x7f で末尾を 1 文字消し、残りは書き足す (`\r` は送信 = 空になる)。
+    fn apply_bytes(field: &mut String, bytes: &[u8]) {
+        let del = bytes.iter().take_while(|b| **b == 0x7f).count();
+        for _ in 0..del {
+            field.pop();
+        }
+        let rest = &bytes[del..];
+        if rest.last() == Some(&b'\r') {
+            field.clear();
+            return;
+        }
+        field.push_str(std::str::from_utf8(rest).unwrap());
+    }
+
+    #[test]
+    fn dictation_lands_in_the_field_as_spoken() {
+        // 実際の認識の流れを再現する: 話しながら変換が書き換わり、息継ぎで確定し、
+        // 2 回目の発話がその後ろへ続く。入力欄に残る文字列を突き合わせる。
+        let mut v = VoiceState::default();
+        let mut field = String::new();
+        let step = |v: &mut VoiceState, field: &mut String, text: &str, is_final: bool| {
+            let e = v.plan(text, DEST);
+            apply_bytes(field, &e.bytes(false));
+            v.commit(e, is_final, false, DEST);
+        };
+
+        // 1 回目 — 「せかい」が「世界」へ変換されても二重にならない
+        step(&mut v, &mut field, "こんにちは", false);
+        assert_eq!(field, "こんにちは");
+        step(&mut v, &mut field, "こんにちはせかい", false);
+        assert_eq!(field, "こんにちはせかい");
+        step(&mut v, &mut field, "こんにちは世界", false);
+        assert_eq!(field, "こんにちは世界");
+        // 確定 — 中身は直前と同じなので端末へは何も送らない
+        step(&mut v, &mut field, "こんにちは世界", true);
+        assert_eq!(field, "こんにちは世界");
+
+        // 2 回目 — 1 回目を 1 文字も消さずに後ろへ続く
+        step(&mut v, &mut field, "これは", false);
+        assert_eq!(field, "こんにちは世界これは");
+        step(&mut v, &mut field, "これは二回目です", false);
+        step(&mut v, &mut field, "これは二回目です", true);
+        assert_eq!(field, "こんにちは世界これは二回目です");
+
+        // 3 回目まで続けても崩れない
+        step(&mut v, &mut field, "さらに三回目", false);
+        step(&mut v, &mut field, "さらに三回目も", true);
+        assert_eq!(field, "こんにちは世界これは二回目ですさらに三回目も");
+    }
+
+    #[test]
+    fn english_dictation_keeps_words_apart() {
+        let mut v = VoiceState::default();
+        let mut field = String::new();
+        for (text, is_final) in [("hello", false), ("hello", true), ("world", false), ("world", true)]
+        {
+            let e = v.plan(text, DEST);
+            apply_bytes(&mut field, &e.bytes(false));
+            v.commit(e, is_final, false, DEST);
+        }
+        assert_eq!(field, "hello world");
+    }
+
+    #[test]
+    fn edit_bytes_are_backspaces_then_text() {
+        let e = VoiceEdit {
+            del: 2,
+            add: "は".into(),
+            want: "は".into(),
+            space: false,
+        };
+        let mut want = b"\x7f\x7f".to_vec();
+        want.extend_from_slice("は".as_bytes());
+        assert_eq!(e.bytes(false), want);
+        // 合図キーワードで送信するときだけ Enter が付く
+        want.push(b'\r');
+        assert_eq!(e.bytes(true), want);
+    }
+
+    #[test]
+    fn reset_live_forgets_what_was_written() {
+        // ユーザーが手で Enter を押した後などに呼ぶ。次は先頭から書き出す
+        let mut v = VoiceState {
+            live: "書きかけ".into(),
+            live_space: true,
+            last_char: Some('け'),
+            ..Default::default()
+        };
+        v.reset_live();
+        assert!(v.live.is_empty());
+        assert!(!v.live_space);
+        assert_eq!(v.last_char, None);
+        // 追跡を捨てた直後は区切りの空白も入らない
+        assert!(!needs_space(v.last_char, Some('a')));
+    }
 }
