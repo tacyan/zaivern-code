@@ -50,6 +50,10 @@ pub struct Config {
     pub agents: Vec<AgentPreset>,
     /// キーバインドの上書き: action名 → "cmd+shift+p" 形式 (src/keybinds.rs 参照)
     pub keybindings: HashMap<String, String>,
+    /// エージェント監視 (スーパーバイザー) の設定。
+    /// `[supervisor]` セクションが無い既存の config.toml でも、
+    /// `SupervisorConfig` 側の `#[serde(default)]` により既定値で読み込まれる。
+    pub supervisor: crate::supervisor::SupervisorConfig,
 }
 
 impl Default for Config {
@@ -79,6 +83,7 @@ impl Default for Config {
             voice_keyword: String::new(),
             agents: default_agents(),
             keybindings: HashMap::new(),
+            supervisor: crate::supervisor::SupervisorConfig::default(),
         }
     }
 }
@@ -331,10 +336,17 @@ pub fn ensure_default() {
     }
 }
 
-/// Load global config merged with the project overlay.
+/// Load global config merged with each root's project overlay.
 /// `with_state`: UI 選択 (state.toml) を最後に適用するか。
 /// 起動時は true、「設定を再読み込み」では false (config.toml を正とする)。
-pub fn load(workspace: &Path, with_state: bool) -> Config {
+///
+/// マルチルート時のマージ規則: `roots` の順に `<root>/.zaivern.toml` を適用する。
+/// つまり **後のルートが前のルートを上書きする (last wins)**。
+/// これは「後から追加したフォルダの設定が効く」という直感に沿い、また
+/// 単一ルート時の挙動と完全に一致する。
+/// ただし `agents` は上書きではなく順に追加、`keybindings` はキー単位で
+/// 上書きマージ (last wins) — いずれも従来の単一ルート時の規則そのまま。
+pub fn load(roots: &[PathBuf], with_state: bool) -> Config {
     ensure_default();
 
     let mut cfg: Config = std::fs::read_to_string(config_path())
@@ -410,7 +422,22 @@ pub fn load(workspace: &Path, with_state: bool) -> Config {
         }
     }
 
-    let overlay_path = workspace.join(".zaivern.toml");
+    for root in roots {
+        apply_overlay(&mut cfg, root);
+    }
+
+    if cfg.approval_mode != "auto" && cfg.approval_mode != "agent" {
+        cfg.approval_mode = "ask".into();
+    }
+    cfg.editor_font_size = cfg.editor_font_size.clamp(8.0, 32.0);
+    cfg.terminal_font_size = cfg.terminal_font_size.clamp(7.0, 28.0);
+    cfg.pet_scale = cfg.pet_scale.clamp(0.5, 2.0);
+    cfg
+}
+
+/// `<root>/.zaivern.toml` を 1 枚 `cfg` に重ねる。無ければ何もしない。
+fn apply_overlay(cfg: &mut Config, root: &Path) {
+    let overlay_path = root.join(".zaivern.toml");
     if let Ok(s) = std::fs::read_to_string(&overlay_path) {
         if let Ok(o) = toml::from_str::<Overlay>(&s) {
             if let Some(t) = o.theme {
@@ -438,14 +465,6 @@ pub fn load(workspace: &Path, with_state: bool) -> Config {
             }
         }
     }
-
-    if cfg.approval_mode != "auto" && cfg.approval_mode != "agent" {
-        cfg.approval_mode = "ask".into();
-    }
-    cfg.editor_font_size = cfg.editor_font_size.clamp(8.0, 32.0);
-    cfg.terminal_font_size = cfg.terminal_font_size.clamp(7.0, 28.0);
-    cfg.pet_scale = cfg.pet_scale.clamp(0.5, 2.0);
-    cfg
 }
 
 /// Persist the current UI choices (theme / approval mode / pet) without
@@ -475,5 +494,39 @@ pub fn save_state(cfg: &Config) {
     if let Ok(s) = toml::to_string_pretty(&st) {
         let _ = std::fs::create_dir_all(zaivern_dir());
         let _ = std::fs::write(state_path(), s);
+    }
+}
+
+#[cfg(test)]
+mod supervisor_field_tests {
+    use super::*;
+
+    /// `[supervisor]` セクションが無い既存の config.toml が、
+    /// これまでどおり読めて既定値が入ることを確かめる。
+    #[test]
+    fn config_without_supervisor_section_still_loads() {
+        assert!(
+            !DEFAULT_CONFIG.contains("[supervisor]"),
+            "この検証は [supervisor] を書いていない設定を前提にしている"
+        );
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定の設定が読めなくなった");
+        assert_eq!(cfg.theme, "zaivern-dark");
+        assert_eq!(cfg.agents.len(), 7);
+        // supervisor は SupervisorConfig の既定値で埋まる
+        let d = crate::supervisor::SupervisorConfig::default();
+        assert_eq!(cfg.supervisor.enabled, d.enabled);
+        assert_eq!(cfg.supervisor.sample_interval_ms, d.sample_interval_ms);
+        assert_eq!(cfg.supervisor.allow_auto_restart, d.allow_auto_restart);
+    }
+
+    /// 手元の `~/.zaivern/config.toml` があるなら、それも読めることを確かめる。
+    /// 無い環境では何もしない (CI で落とさない)。
+    #[test]
+    fn existing_user_config_still_loads() {
+        let Ok(s) = std::fs::read_to_string(config_path()) else {
+            return;
+        };
+        let cfg: Config = toml::from_str(&s).expect("既存の config.toml が読めなくなった");
+        assert!(!cfg.theme.is_empty());
     }
 }

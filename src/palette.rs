@@ -6,7 +6,12 @@ pub enum Cmd {
     SaveAs,
     CloseTab,
     NewFile,
+    /// ワークスペースを「置き換える」(従来どおり)
     OpenFolder,
+    /// フォルダをワークスペースに追加する (マルチルート)
+    AddFolder,
+    /// 指定フォルダをワークスペースから削除する (最後の 1 つは削除できない)
+    RemoveFolder(PathBuf),
     ToggleTerminal,
     ToggleCockpit,
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替

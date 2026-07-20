@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,27 @@ pub enum LineMark {
 }
 
 const STATUS_CACHE_TTL: Duration = Duration::from_secs(2);
+const BRANCH_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// `dir` が属する git リポジトリのトップレベルを返す(非 repo / git 不在なら None)。
+/// ルートがリポジトリのサブディレクトリでも正しいトップレベルが得られる。
+pub fn discover_toplevel(dir: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(s))
+}
 
 pub struct Git {
     workspace: PathBuf,
@@ -38,6 +59,8 @@ pub struct Git {
     last_refresh: Option<Instant>,
     /// 相対パス → (text_hash, 行マーク) のキャッシュ。
     marks_cache: HashMap<String, (u64, Vec<(usize, LineMark)>)>,
+    /// ブランチ名の TTL キャッシュ (値, 取得時刻)。
+    branch_cache: Option<(Option<String>, Instant)>,
 }
 
 impl Git {
@@ -47,6 +70,7 @@ impl Git {
             status_cache: HashMap::new(),
             last_refresh: None,
             marks_cache: HashMap::new(),
+            branch_cache: None,
         }
     }
 
@@ -56,7 +80,34 @@ impl Git {
             self.status_cache.clear();
             self.marks_cache.clear();
             self.last_refresh = None;
+            self.branch_cache = None;
         }
+    }
+
+    /// 現在のブランチ名 (3 秒 TTL キャッシュ)。detached HEAD なら短縮 SHA。
+    ///
+    /// `.git/HEAD` の直接パースではなく `git rev-parse` を使うため、
+    /// worktree / submodule / `.git` がファイルのケースでも正しく動く。
+    pub fn branch(&mut self) -> Option<String> {
+        if let Some((v, at)) = &self.branch_cache {
+            if at.elapsed() < BRANCH_CACHE_TTL {
+                return v.clone();
+            }
+        }
+        // `branch --show-current` は「まだ 1 コミットも無い (unborn HEAD)」でも
+        // ブランチ名を返す。detached HEAD のときだけ空になるので、
+        // その場合は短縮 SHA へフォールバックする。
+        let name = self
+            .run_git(&["branch", "--show-current"])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.run_git(&["rev-parse", "--short", "HEAD"])
+                    .map(|h| h.trim().to_string())
+                    .filter(|h| !h.is_empty())
+            });
+        self.branch_cache = Some((name.clone(), Instant::now()));
+        name
     }
 
     /// 2 秒キャッシュ付きで `git -C <ws> status --porcelain=v1` を実行しパースする。
@@ -113,6 +164,121 @@ impl Git {
             return None;
         }
         String::from_utf8(out.stdout).ok()
+    }
+}
+
+/// マルチルートワークスペース用の Git 束ね。
+///
+/// ルートそのものではなく **リポジトリのトップレベル**をキーにするため、
+/// - ルートが repo のサブディレクトリでも status / diff が正しく引ける
+/// - 同一 repo 内の 2 ルートは 1 つの `Git` を共有する(git 実行が二重にならない)
+///
+/// トップレベル探索 (`rev-parse --show-toplevel`) はルート毎に 1 回だけ行い
+/// キャッシュする。status / diff の TTL キャッシュは `Git` 側のものをそのまま使う。
+pub struct GitSet {
+    roots: Vec<PathBuf>,
+    /// repo トップレベル → Git
+    repos: HashMap<PathBuf, Git>,
+    /// ルート → repo トップレベル (None = 非 repo。再探索しない)
+    toplevels: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl GitSet {
+    pub fn new(roots: Vec<PathBuf>) -> Self {
+        let mut s = Self {
+            roots: Vec::new(),
+            repos: HashMap::new(),
+            toplevels: HashMap::new(),
+        };
+        s.set_roots(roots);
+        s
+    }
+
+    /// ルート一覧を差し替える。既に探索済みのルートのキャッシュは再利用する。
+    pub fn set_roots(&mut self, roots: Vec<PathBuf>) {
+        self.roots = roots;
+        for r in self.roots.clone() {
+            self.ensure_repo(&r);
+        }
+        // どのルートからも到達しなくなった repo を捨てる
+        let live: Vec<PathBuf> = self
+            .roots
+            .iter()
+            .filter_map(|r| self.toplevels.get(r).cloned().flatten())
+            .collect();
+        self.repos.retain(|top, _| live.contains(top));
+        self.toplevels.retain(|r, _| self.roots.contains(r));
+    }
+
+    /// `root` の repo トップレベルを(未探索なら探索して)確定させる。
+    fn ensure_repo(&mut self, root: &Path) -> Option<PathBuf> {
+        if let Some(t) = self.toplevels.get(root) {
+            return t.clone();
+        }
+        let top = discover_toplevel(root);
+        self.toplevels.insert(root.to_path_buf(), top.clone());
+        if let Some(t) = &top {
+            self.repos
+                .entry(t.clone())
+                .or_insert_with(|| Git::new(t.clone()));
+        }
+        top
+    }
+
+    /// `abs` を含むルート(最長一致)。
+    fn root_for(&self, abs: &Path) -> Option<&PathBuf> {
+        self.roots
+            .iter()
+            .filter(|r| abs.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+    }
+
+    /// `abs` → (repo トップレベル, repo からの相対パス)。
+    fn resolve(&self, abs: &Path) -> Option<(PathBuf, String)> {
+        let root = self.root_for(abs)?;
+        let top = self.toplevels.get(root)?.clone()?;
+        let rel = abs.strip_prefix(&top).ok()?;
+        Some((top, rel.to_string_lossy().to_string()))
+    }
+
+    /// 全 repo の status を TTL 付きで更新する。
+    pub fn refresh_if_stale(&mut self) {
+        for g in self.repos.values_mut() {
+            g.refresh_if_stale();
+        }
+    }
+
+    /// 絶対パスのステータス (refresh_if_stale 済み前提)。
+    pub fn file_status(&self, abs: &Path) -> Option<FileStatus> {
+        let (top, rel) = self.resolve(abs)?;
+        self.repos.get(&top)?.file_status(&rel)
+    }
+
+    /// 全 repo の変更ファイル数の合計。
+    pub fn dirty_count(&self) -> usize {
+        self.repos.values().map(|g| g.dirty_count()).sum()
+    }
+
+    /// 絶対パスの行マーク。repo 外なら空。
+    pub fn line_marks(&mut self, abs: &Path, text_hash: u64) -> Vec<(usize, LineMark)> {
+        let Some((top, rel)) = self.resolve(abs) else {
+            return Vec::new();
+        };
+        match self.repos.get_mut(&top) {
+            Some(g) => g.line_marks(&rel, text_hash),
+            None => Vec::new(),
+        }
+    }
+
+    /// primary ルートが属する repo のブランチ名。
+    pub fn branch(&mut self) -> Option<String> {
+        let top = self.roots.first().and_then(|r| self.toplevels.get(r))?.clone()?;
+        self.repos.get_mut(&top)?.branch()
+    }
+
+    /// repo の数(ステータスバー等で「複数リポジトリ」表示に使う)。
+    pub fn repo_count(&self) -> usize {
+        self.repos.len()
     }
 }
 
@@ -279,6 +445,106 @@ index 1234567..89abcde 100644
     fn non_hunk_lines_and_garbage_ignored() {
         assert!(parse_hunk_marks("").is_empty());
         assert!(parse_hunk_marks("hello world\n+not a hunk\n@@ broken @@").is_empty());
+    }
+
+    /// `git init` した使い捨てリポジトリを作る。git が無い環境では None。
+    fn temp_repo(tag: &str) -> Option<PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "zaivern-git-test-{}-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos,
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp repo dir");
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["init", "--quiet"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            std::fs::remove_dir_all(&dir).ok();
+            return None;
+        }
+        Some(dir)
+    }
+
+    #[test]
+    fn toplevel_discovery_from_subdirectory() {
+        let Some(repo) = temp_repo("toplevel") else {
+            return; // git が無い環境ではスキップ
+        };
+        let sub = repo.join("crates").join("inner");
+        std::fs::create_dir_all(&sub).expect("mkdir sub");
+
+        let canon_repo = repo.canonicalize().expect("canonicalize repo");
+        assert_eq!(
+            discover_toplevel(&sub).map(|p| p.canonicalize().unwrap()),
+            Some(canon_repo.clone()),
+            "サブディレクトリからでも repo トップレベルが取れる",
+        );
+
+        // サブディレクトリをルートにしても、repo トップレベル基準で解決される
+        let mut set = GitSet::new(vec![sub.canonicalize().expect("canonicalize sub")]);
+        assert_eq!(set.repo_count(), 1);
+        let (top, rel) = set
+            .resolve(&sub.canonicalize().unwrap().join("lib.rs"))
+            .expect("resolve should find the repo");
+        assert_eq!(top.canonicalize().unwrap(), canon_repo);
+        assert_eq!(rel, "crates/inner/lib.rs", "repo 相対パスになる");
+
+        // ブランチ名は rev-parse 経由で取れる(worktree/submodule 対応)
+        assert!(set.branch().is_some(), "初期化直後でもブランチ名が取れる");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn two_roots_in_same_repo_share_one_git() {
+        let Some(repo) = temp_repo("shared") else {
+            return;
+        };
+        let a = repo.join("a");
+        let b = repo.join("b");
+        std::fs::create_dir_all(&a).expect("mkdir a");
+        std::fs::create_dir_all(&b).expect("mkdir b");
+
+        let set = GitSet::new(vec![
+            a.canonicalize().expect("canon a"),
+            b.canonicalize().expect("canon b"),
+        ]);
+        assert_eq!(set.repo_count(), 1, "同一 repo の 2 ルートは Git を共有する");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn non_repo_root_yields_no_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "zaivern-git-norepo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // /tmp 配下が repo でない前提が崩れる環境もあるため、結果は緩く検証する
+        let mut set = GitSet::new(vec![dir.canonicalize().expect("canon")]);
+        if set.repo_count() == 0 {
+            assert!(set.branch().is_none());
+            assert_eq!(set.dirty_count(), 0);
+            assert!(set.line_marks(&dir.join("x.rs"), 0).is_empty());
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
