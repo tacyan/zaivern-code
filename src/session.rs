@@ -137,6 +137,7 @@ mod tests {
             active: Some(1),
             sidebar_open: true,
             panel_open: false,
+            roots: Vec::new(),
             ..Default::default()
         };
 
@@ -160,6 +161,7 @@ mod tests {
             active: None,
             sidebar_open: false,
             panel_open: true,
+            roots: Vec::new(),
             ..Default::default()
         };
 
@@ -188,6 +190,7 @@ mod tests {
             active: Some(0),
             sidebar_open: true,
             panel_open: true,
+            roots: Vec::new(),
             ..Default::default()
         };
 
@@ -222,14 +225,15 @@ mod tests {
             sidebar_tab: "git".into(),
             ..Default::default()
         };
-        save_to(&dir, std::slice::from_ref(&workspace), &data);
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
+        let roots = std::slice::from_ref(&workspace);
+        save_to(&dir, roots, &data);
+        let loaded = load_from(&dir, roots).expect("session should load");
         assert_eq!(loaded.sidebar_tab, "git");
 
         // 旧バージョンのセッション (sidebar_tab フィールド無し) も読めること
         let old = "open_files = []\nsidebar_open = true\npanel_open = false\n";
-        std::fs::write(session_file_in(&dir, std::slice::from_ref(&workspace)), old).expect("write old session");
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("old session should still load");
+        std::fs::write(session_file_in(&dir, roots), old).expect("write old session");
+        let loaded = load_from(&dir, roots).expect("old session should still load");
         assert_eq!(loaded.sidebar_tab, "");
         assert!(loaded.sidebar_open);
 
@@ -349,6 +353,7 @@ mod tests {
             active: Some(0),
             sidebar_open: false,
             panel_open: false,
+            roots: Vec::new(),
             ..Default::default()
         };
         save_to(&dir, std::slice::from_ref(&workspace), &first);
@@ -358,6 +363,7 @@ mod tests {
             active: Some(1),
             sidebar_open: true,
             panel_open: true,
+            roots: Vec::new(),
             ..Default::default()
         };
         save_to(&dir, std::slice::from_ref(&workspace), &second);

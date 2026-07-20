@@ -129,8 +129,8 @@ impl Default for Config {
             voice_keyword: String::new(),
             agents: default_agents(),
             keybindings: HashMap::new(),
-            plugins: PluginsConfig::default(),
             supervisor: crate::supervisor::SupervisorConfig::default(),
+            plugins: PluginsConfig::default(),
         }
     }
 }
