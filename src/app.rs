@@ -7,7 +7,7 @@ use eframe::egui::{self, Align2, Color32, FontId, RichText};
 
 use crate::agents::{AgentManager, SessionEvent};
 use crate::config::{self, Config};
-use crate::editor::{hash_str, Buffer, Editor};
+use crate::editor::{disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
 use crate::file_tree::{self, FileTree, TreeActions};
 use crate::fuzzy;
@@ -95,6 +95,8 @@ pub struct ZaivernApp {
     broadcast_input: String,
     git: (Option<String>, Option<Instant>),
     gitinfo: git::Git,
+    /// 外部変更チェックの直近実行時刻(約1秒スロットリング)
+    ext_check_at: Option<Instant>,
     keys: Keybinds,
     /// ペットの固定位置(None=右下うろうろ)
     pet_pos: Option<egui::Pos2>,
@@ -158,6 +160,7 @@ impl ZaivernApp {
         let mut app = Self {
             tree: FileTree::new(workspace.clone(), cfg.show_hidden_files),
             gitinfo: git::Git::new(workspace.clone()),
+            ext_check_at: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
             theme,
             workspace,
@@ -479,6 +482,8 @@ impl ZaivernApp {
                                     match std::fs::write(&path, &b.text) {
                                         Ok(()) => {
                                             b.saved_hash = hash_str(&b.text);
+                                            b.disk_mtime = disk_mtime(&path);
+                                            b.conflict_notified = None;
                                             self.toast(
                                                 format!("🔌 {} → 整形して保存しました", r.title),
                                                 true,
@@ -847,8 +852,59 @@ impl ZaivernApp {
 
     fn open_path(&mut self, path: &Path) {
         match self.editor.open(path, &self.highlighter) {
-            Ok(()) => self.persist_session(),
+            Ok(reloaded) => {
+                if reloaded {
+                    if let Some(i) = self.editor.active {
+                        let title = self.editor.buffers[i].title.clone();
+                        self.toast(format!("↻ {title} を再読み込みしました(外部で変更)"), true);
+                        self.queue_lsp_change(i);
+                    }
+                }
+                self.persist_session()
+            }
             Err(e) => self.toast(e, false),
+        }
+    }
+
+    /// 開いているタブのファイルが外部(エージェント等)で書き換えられていないか
+    /// 約1秒ごとに確認する。未保存の編集が無いバッファはディスクの内容へ自動で
+    /// 読み直し、編集と競合したバッファは上書きせず一度だけ警告する。
+    fn check_external_changes(&mut self) {
+        let fresh = self
+            .ext_check_at
+            .map(|t| t.elapsed().as_millis() < 1000)
+            .unwrap_or(false);
+        if fresh {
+            return;
+        }
+        self.ext_check_at = Some(Instant::now());
+        for ev in self.editor.check_external() {
+            match ev {
+                ExternalEvent::Reloaded { index, title } => {
+                    self.toast(format!("↻ {title} を再読み込みしました(外部で変更)"), true);
+                    self.queue_lsp_change(index);
+                }
+                ExternalEvent::Conflict { title } => {
+                    self.toast_warn(format!(
+                        "⚠ {title} が外部で変更されました — 未保存の編集があるため読み直していません(⌘S で上書き)"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// リロード後のテキストを LSP へ(デバウンス付きで)通知する
+    fn queue_lsp_change(&mut self, i: usize) {
+        let Some(b) = self.editor.buffers.get(i) else {
+            return;
+        };
+        let Some(p) = b.path.clone() else {
+            return;
+        };
+        let lang_id = snippets::lang_id_for(&b.lang).to_string();
+        if self.lsp.contains_key(&lang_id) {
+            self.lsp_pending
+                .insert(p, (b.text.clone(), Instant::now(), lang_id));
         }
     }
 
@@ -931,6 +987,8 @@ impl ZaivernApp {
                 b.saved_hash = hash_str(&text);
                 b.lang = lang;
                 b.cache = None;
+                b.disk_mtime = disk_mtime(&path);
+                b.conflict_notified = None;
                 self.tree.invalidate();
                 self.toast(format!("💾 保存しました: {}", path.display()), true);
                 true
@@ -3830,6 +3888,8 @@ impl ZaivernApp {
                 match std::fs::write(&path, &b.text) {
                     Ok(()) => {
                         b.saved_hash = hash_str(&b.text);
+                        b.disk_mtime = disk_mtime(&path);
+                        b.conflict_notified = None;
                         self.tree.invalidate();
                         self.toast(
                             format!("💾 保存しました (スマホから): {}", path.display()),
@@ -3856,7 +3916,12 @@ impl ZaivernApp {
                         .to_string();
                 }
                 match self.editor.open(&p, &self.highlighter) {
-                    Ok(()) => {
+                    Ok(reloaded) => {
+                        if reloaded {
+                            if let Some(i) = self.editor.active {
+                                self.queue_lsp_change(i);
+                            }
+                        }
                         self.persist_session();
                         json!({"ok": true}).to_string()
                     }
@@ -4056,6 +4121,9 @@ impl eframe::App for ZaivernApp {
 
         // プラグインコマンドの実行結果をエディタへ反映する
         self.process_plugin_results(ctx);
+
+        // 外部(エージェント等)によるファイル書き換えを検知して自動リロードする
+        self.check_external_changes();
 
         // LSP: デバウンスした変更を送信し、閉じたドキュメントを did_close する
         self.flush_lsp_changes();
