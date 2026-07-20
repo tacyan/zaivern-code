@@ -46,8 +46,41 @@ struct EditState {
     focus: bool,
 }
 
+/// 複数ルート(マルチルートワークスペース)の正規化。
+///
+/// ルール（重複・二重表示を防ぐため）:
+/// - 入力順を保ち、`[0]` を primary(既存の単一ルート相当)として扱う。
+/// - ディレクトリでないものは黙って捨てる。
+/// - 比較・保持ともに canonicalize 済みパスを使う(シンボリックリンク差と
+///   `..` を吸収する)。canonicalize できない場合は入力パスのまま使う。
+/// - 既に採用済みルートと同一、またはその配下(ネスト)なら捨てる
+///   — 親ルートのツリーから辿れるので二重に並べない。
+/// - 逆に新しいルートが採用済みルートの祖先なら、広い方を採用して
+///   配下の既存ルートを取り除く(位置は最初に現れた場所を保つ)。
+pub fn normalize_roots(input: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in input {
+        if !p.is_dir() {
+            continue;
+        }
+        let c = p.canonicalize().unwrap_or(p);
+        if out.iter().any(|r| c.starts_with(r)) {
+            continue; // 同一 or 既存ルート配下 → 既に見えている
+        }
+        // 新ルートが既存ルートの祖先なら、狭い方を畳んで広い方を残す
+        if let Some(pos) = out.iter().position(|r| r.starts_with(&c)) {
+            out.retain(|r| !r.starts_with(&c));
+            out.insert(pos, c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub struct FileTree {
-    pub root: PathBuf,
+    /// ワークスペースのルート一覧(常に 1 件以上)。`roots[0]` が primary。
+    pub roots: Vec<PathBuf>,
     cache: HashMap<PathBuf, Vec<Entry>>,
     /// キャッシュ取得時のディレクトリ mtime(外部変更検知用)。
     /// エントリの追加・削除・リネームで親ディレクトリの mtime が変わる。
@@ -57,9 +90,10 @@ pub struct FileTree {
 }
 
 impl FileTree {
-    pub fn new(root: PathBuf, show_hidden: bool) -> Self {
+    /// `roots` は 1 件以上を想定 (空でも落ちないが何も描かれない)。
+    pub fn new(roots: Vec<PathBuf>, show_hidden: bool) -> Self {
         Self {
-            root,
+            roots,
             cache: HashMap::new(),
             mtimes: HashMap::new(),
             show_hidden,
@@ -67,11 +101,20 @@ impl FileTree {
         }
     }
 
-    pub fn set_root(&mut self, root: PathBuf) {
-        self.root = root;
+    pub fn set_roots(&mut self, roots: Vec<PathBuf>) {
+        self.roots = roots;
         self.cache.clear();
         self.mtimes.clear();
         self.edit = None;
+    }
+
+    /// `p` を含むルート(最長一致)。どのルートにも属さなければ None。
+    pub fn root_for(&self, p: &Path) -> Option<&Path> {
+        self.roots
+            .iter()
+            .filter(|r| p.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+            .map(|r| r.as_path())
     }
 
     pub fn invalidate(&mut self) {
@@ -160,8 +203,42 @@ impl FileTree {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, theme: &Theme, actions: &mut TreeActions) {
-        let root = self.root.clone();
-        self.dir_ui(ui, &root, theme, actions, 0);
+        let roots = self.roots.clone();
+        // 単一ルート時は従来どおりヘッダ無しで直下を描く(見た目を変えない)。
+        if roots.len() <= 1 {
+            let root = roots.into_iter().next().unwrap_or_else(|| PathBuf::from("."));
+            self.dir_ui(ui, &root, theme, actions, 0);
+            return;
+        }
+        for root in &roots {
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.to_string_lossy().to_string());
+            let cr = egui::CollapsingHeader::new(
+                RichText::new(format!("📚 {name}")).color(theme.text).strong(),
+            )
+            .id_salt(root)
+            .default_open(true)
+            .show(ui, |ui| {
+                self.dir_ui(ui, root, theme, actions, 0);
+            });
+            cr.header_response.context_menu(|ui| {
+                if ui.button("➕ 新規ファイル").clicked() {
+                    self.start_new_file(root.clone());
+                    ui.close_menu();
+                }
+                if ui.button("🗂 新規フォルダ").clicked() {
+                    self.start_new_dir(root.clone());
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("📋 フルパスをコピー").clicked() {
+                    ui.ctx().copy_text(root.to_string_lossy().to_string());
+                    ui.close_menu();
+                }
+            });
+        }
     }
 
     /// この dir 直下に New 系のインライン入力を出すべきか。
@@ -291,9 +368,10 @@ impl FileTree {
                     }
                     ui.separator();
                     if ui.button("🤖 パスをエージェントに送信").clicked() {
-                        let rel = e
-                            .path
-                            .strip_prefix(&self.root)
+                        // マルチルート: そのパスを含むルートからの相対パスにする
+                        let rel = self
+                            .root_for(&e.path)
+                            .and_then(|r| e.path.strip_prefix(r).ok())
                             .unwrap_or(&e.path)
                             .to_string_lossy()
                             .to_string();
@@ -327,9 +405,10 @@ impl FileTree {
                     }
                     ui.separator();
                     if ui.button("🤖 パスをエージェントに送信").clicked() {
-                        let rel = e
-                            .path
-                            .strip_prefix(&self.root)
+                        // マルチルート: そのパスを含むルートからの相対パスにする
+                        let rel = self
+                            .root_for(&e.path)
+                            .and_then(|r| e.path.strip_prefix(r).ok())
                             .unwrap_or(&e.path)
                             .to_string_lossy()
                             .to_string();
@@ -364,11 +443,89 @@ mod tests {
         *m = m.map(|x| x - Duration::from_secs(2));
     }
 
+    /// canonicalize 後の比較用（macOS の /tmp → /private/tmp 等を吸収）。
+    fn canon(p: &Path) -> PathBuf {
+        p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+    }
+
+    #[test]
+    fn normalize_roots_dedups_and_keeps_order() {
+        let dir = unique_temp_dir("zaivern-tree-test", "norm-dedup");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::create_dir_all(&a).expect("mkdir a");
+        std::fs::create_dir_all(&b).expect("mkdir b");
+
+        let out = normalize_roots(vec![a.clone(), b.clone(), a.clone()]);
+        assert_eq!(out, vec![canon(&a), canon(&b)], "重複は落ち、順序は保たれる");
+
+        // `..` 経由の別表記も canonicalize で同一視される
+        let a_alt = dir.join("b").join("..").join("a");
+        let out = normalize_roots(vec![a.clone(), a_alt]);
+        assert_eq!(out, vec![canon(&a)]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_roots_drops_nested_and_prefers_ancestor() {
+        let dir = unique_temp_dir("zaivern-tree-test", "norm-nest");
+        let parent = dir.join("parent");
+        let child = parent.join("child");
+        let other = dir.join("other");
+        std::fs::create_dir_all(&child).expect("mkdir child");
+        std::fs::create_dir_all(&other).expect("mkdir other");
+
+        // 親が先: 子は親から辿れるので捨てる
+        let out = normalize_roots(vec![parent.clone(), child.clone()]);
+        assert_eq!(out, vec![canon(&parent)], "子ルートは二重表示しない");
+
+        // 子が先: 後から来た祖先の方が広いので、子を畳んで親に置き換える
+        let out = normalize_roots(vec![child.clone(), other.clone(), parent.clone()]);
+        assert_eq!(
+            out,
+            vec![canon(&parent), canon(&other)],
+            "祖先が勝ち、位置は最初に現れた場所を保つ"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_roots_ignores_non_directories() {
+        let dir = unique_temp_dir("zaivern-tree-test", "norm-nondir");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let file = dir.join("note.txt");
+        std::fs::write(&file, "x").expect("write");
+
+        let out = normalize_roots(vec![file, dir.join("missing"), real.clone()]);
+        assert_eq!(out, vec![canon(&real)], "ファイル・存在しないパスは捨てる");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn root_for_picks_longest_match() {
+        // ネストしたルートを（正規化を通さず）直接持たせても最長一致で解決する
+        let t = FileTree::new(
+            vec![PathBuf::from("/ws/a"), PathBuf::from("/ws/a/deep")],
+            false,
+        );
+        assert_eq!(t.root_for(Path::new("/ws/a/x.rs")), Some(Path::new("/ws/a")));
+        assert_eq!(
+            t.root_for(Path::new("/ws/a/deep/x.rs")),
+            Some(Path::new("/ws/a/deep")),
+        );
+        assert_eq!(t.root_for(Path::new("/elsewhere/x.rs")), None);
+        assert_eq!(t.roots[0], PathBuf::from("/ws/a"), "primary は roots[0]");
+    }
+
     #[test]
     fn refresh_is_noop_without_changes() {
         let dir = unique_temp_dir("zaivern-tree-test", "noop");
         std::fs::write(dir.join("a.txt"), "x").expect("write");
-        let mut t = FileTree::new(dir.clone(), false);
+        let mut t = FileTree::new(vec![dir.clone()], false);
         assert_eq!(t.entries(&dir).len(), 1);
         assert!(!t.refresh_if_changed());
         assert!(t.cache.contains_key(&dir), "変化が無ければキャッシュは保持");
@@ -377,7 +534,7 @@ mod tests {
     #[test]
     fn refresh_detects_external_create() {
         let dir = unique_temp_dir("zaivern-tree-test", "create");
-        let mut t = FileTree::new(dir.clone(), false);
+        let mut t = FileTree::new(vec![dir.clone()], false);
         assert!(t.entries(&dir).is_empty());
 
         std::fs::write(dir.join("agent.rs"), "fn main() {}").expect("external create");
@@ -393,7 +550,7 @@ mod tests {
         let dir = unique_temp_dir("zaivern-tree-test", "delete");
         let path = dir.join("gone.txt");
         std::fs::write(&path, "x").expect("write");
-        let mut t = FileTree::new(dir.clone(), false);
+        let mut t = FileTree::new(vec![dir.clone()], false);
         assert_eq!(t.entries(&dir).len(), 1);
 
         std::fs::remove_file(&path).expect("external delete");

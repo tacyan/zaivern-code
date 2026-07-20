@@ -4,14 +4,18 @@ mod agents;
 mod app;
 mod cli;
 mod config;
+mod coordinator;
+mod diff;
 mod editor;
 mod editor_ops;
 mod file_tree;
 mod fuzzy;
 mod git;
 mod git_panel;
+mod github;
 mod highlight;
 mod html;
+mod ide;
 mod jsonc;
 mod keybinds;
 mod lsp;
@@ -26,6 +30,7 @@ mod remote;
 mod sound;
 mod session;
 mod snippets;
+mod supervisor;
 mod terminal;
 #[cfg(test)]
 mod test_util;
@@ -59,12 +64,27 @@ fn main() -> eframe::Result<()> {
         std::process::exit(code);
     }
 
-    let workspace = std::env::args()
-        .nth(1)
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_dir())
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // CLI でなければ、引数はマルチルートワークスペースとして解釈する: `zai dirA dirB dirC`。
+    // ディレクトリはルートに、ファイルは起動後に開くタブになる。
+    // 存在しない引数・その他は黙って無視する（起動は止めない）。
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for a in &args {
+        let p = std::path::PathBuf::from(a);
+        if p.is_dir() {
+            dirs.push(p);
+        } else if p.is_file() {
+            files.push(p);
+        }
+    }
+    // 引数無し = カレントディレクトリ（従来どおり）。roots は決して空にしない。
+    let mut roots = file_tree::normalize_roots(dirs);
+    if roots.is_empty() {
+        roots = file_tree::normalize_roots(std::env::current_dir().ok());
+    }
+    if roots.is_empty() {
+        roots.push(std::path::PathBuf::from("."));
+    }
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1480.0, 940.0])
@@ -82,6 +102,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Zaivern Code",
         options,
-        Box::new(move |cc| Ok(Box::new(app::ZaivernApp::new(cc, workspace)))),
+        Box::new(move |cc| Ok(Box::new(app::ZaivernApp::new(cc, roots, files)))),
     )
 }

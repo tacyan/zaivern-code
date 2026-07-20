@@ -225,6 +225,20 @@ fn send_json(writer: &Mutex<ChildStdin>, v: &Value) -> std::io::Result<()> {
 
 impl LspClient {
     /// server_cmd は $SHELL -lc 経由で起動 (PATH 解決のため)。initialize→initialized まで行う。
+    ///
+    /// マルチルートワークスペースの扱い:
+    /// ここでは 1 サーバー = 1 ルート（`rootUri` / `workspaceFolders` は常に 1 要素）とし、
+    /// 呼び出し側 (app.rs) が **(言語ID, ルート) をキーにサーバーを 1 つずつ起動する**。
+    ///
+    /// もう一方の選択肢は `workspaceFolders` に全ルートを並べて
+    /// `workspace/didChangeWorkspaceFolders` で増減を通知する方式で、
+    /// プロセス数は 1 つで済む。しかし
+    /// - サーバー側の対応がまちまち (rust-analyzer は複数ルートを 1 プロセスで
+    ///   扱えるが、多くの軽量サーバーは最初の rootUri しか見ない)
+    /// - 動的追加/削除の通知に対応していないサーバーでは無言で壊れる
+    /// ため、確実に正しく動く「ルート毎に 1 プロセス」を採用した。
+    /// トレードオフはルート数 × 言語数だけプロセスが増えること
+    /// (実際にはそのルートでファイルを開いた言語のぶんだけ遅延起動される)。
     pub fn spawn(
         server_cmd: &str,
         root: &Path,

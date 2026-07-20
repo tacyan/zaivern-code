@@ -8,6 +8,8 @@ use eframe::egui::{self, Align2, Color32, FontId, RichText};
 use crate::agents::{AgentManager, SessionEvent};
 use crate::cli;
 use crate::config::{self, Config};
+use crate::coordinator;
+use crate::supervisor;
 use crate::editor::{disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
 use crate::file_tree::{self, FileTree, TreeActions};
@@ -201,10 +203,28 @@ enum EditOp {
     Move(bool),
 }
 
+/// LSP サーバーのキー: (言語ID, ルート)。ルート毎に 1 プロセス起動する
+/// (理由とトレードオフは `lsp::LspClient::spawn` のコメント参照)。
+type LspKey = (String, PathBuf);
+
+/// ファイル索引の 1 エントリ (マルチルート対応)。
+///
+/// 曖昧さ回避のため **絶対パスを正**として持つ。`rel` は所属ルートからの
+/// 相対パスで、あいまい検索のマッチ品質を単一ルート時と同じに保つために使う。
+/// `label` は表示用で、複数ルートに同じ `rel` が存在するときだけ
+/// `<ルート名>/<rel>` の形にする (良いエディタと同じ挙動)。
+#[derive(Clone)]
+struct IndexedFile {
+    abs: PathBuf,
+    rel: String,
+    label: String,
+}
+
 pub struct ZaivernApp {
     cfg: Config,
     theme: Theme,
-    workspace: PathBuf,
+    /// ワークスペースのルート一覧。**常に 1 件以上**。`roots[0]` が primary。
+    roots: Vec<PathBuf>,
     tree: FileTree,
     editor: Editor,
     agents: AgentManager,
@@ -219,7 +239,7 @@ pub struct ZaivernApp {
     md_pre_cache: Option<(u64, u64, String)>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
-    file_index: Vec<String>,
+    file_index: Vec<IndexedFile>,
     index_at: Option<Instant>,
     /// カスタムテーマ (~/.zaivern/themes + プラグイン同梱): (表示名, JSONフルパス)
     custom_themes: Vec<(String, String)>,
@@ -241,8 +261,8 @@ pub struct ZaivernApp {
     remote_open: bool,
     qr_tex: Option<egui::TextureHandle>,
     broadcast_input: String,
-    git: (Option<String>, Option<Instant>),
-    gitinfo: git::Git,
+    gitinfo: git::GitSet,
+    /// Git サイドバー。単一 repo 表示なので常に primary ルートを見る。
     git_panel: git_panel::GitPanel,
     /// 外部変更チェックの直近実行時刻(約1秒スロットリング)
     ext_check_at: Option<Instant>,
@@ -280,11 +300,11 @@ pub struct ZaivernApp {
     /// 言語ID → スニペット一覧(拡張の snippet ファイル由来)
     snippets_by_lang: HashMap<String, Vec<Snippet>>,
     /// 言語ID → 起動済み LSP クライアント
-    lsp: HashMap<String, lsp::LspClient>,
+    lsp: HashMap<LspKey, lsp::LspClient>,
     /// did_open 済みのパス(重複送信の防止)
     lsp_opened: HashSet<PathBuf>,
     /// 診断の変更をデバウンスするための保留(パス→(最新テキスト, 受信時刻, 言語ID))
-    lsp_pending: HashMap<PathBuf, (String, Instant, String)>,
+    lsp_pending: HashMap<PathBuf, (String, Instant, LspKey)>,
     /// which() の「見つからなかった」結果のキャッシュ(実行ファイル名→最後に確認した時刻)。
     /// 肯定結果は入れない(見つかればサーバーが起動して self.lsp に載り、二度と which されない)。
     lsp_which_missing: HashMap<String, Instant>,
@@ -308,33 +328,132 @@ pub struct ZaivernApp {
     plugins_tab_was_open: bool,
     /// 音声入力の実行状態
     voice: VoiceState,
+
+    // ── 監視・連携 ────────────────────────────────────────────
+    /// エージェントの異常 (停滞・ループ・エラー多発など) を見張る。
+    supervisor: supervisor::Supervisor,
+
+    /// エージェント間 / ユーザー宛メッセージの配達係。
+    coordinator: coordinator::Coordinator,
+
+    /// 確認が必要な介入の待ち行列。先頭をダイアログに出す。
+    /// **確認を取るまで絶対に実行しない** (安全の要)。
+    pending_intervention: Vec<supervisor::InterventionIntent>,
+
+    /// 確認が必要な「前任セッションの停止」提案の待ち行列。
+    pending_stop: Vec<coordinator::Proposal>,
+
+    /// 停止を実行し、プロセスが本当に消えるのを待っているタスク (タスクID, セッションID)。
+    stopping: Vec<(coordinator::TaskId, u64)>,
+
+    /// coordinator に登録済みのセッション ID。増減の差分で登録/解除する。
+    known_sessions: HashSet<u64>,
+
+    /// スーパーバイザーが最後に見た状態。変化したときだけ coordinator へ橋渡しする。
+    sup_last_state: HashMap<u64, supervisor::SessionState>,
+
+    /// 次にサンプリングしてよい時刻 (supervisor 側の間引き間隔に合わせる)。
+    sup_next_at: Option<Instant>,
+
+    /// 音声側がまだ読んでいない「ユーザーが手入力した」フラグの持ち越し袋。
+    typed_voice: HashMap<u64, bool>,
+
+    /// スーパーバイザー側の同フラグ。
+    typed_sup: HashMap<u64, bool>,
+
+    /// 端末へ伝え済みのテーマ色 (OSC 10/11 の問い合わせ応答用)。
+    report_colors: HashMap<u64, (Color32, Color32)>,
+}
+
+/// 介入をそのまま実行してよいか、確認ダイアログへ回すか。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IntentRoute {
+    /// 無確認で実行してよい (記録・通知のみ)。
+    Run,
+    /// ユーザーの確認を取ってからでないと実行しない。
+    Confirm,
+}
+
+/// **安全の要**: 確認が要る介入・破壊的な介入は、必ず確認ダイアログへ回す。
+///
+/// `needs_confirmation` を見るだけでなく `destructive()` も併せて見るのは、
+/// 万一設定やゲートの取り違えで確認フラグが落ちても、再起動・停止だけは
+/// 無確認で走らせないための二重の歯止め。
+fn route_intent(it: &supervisor::InterventionIntent) -> IntentRoute {
+    if it.needs_confirmation || it.action.destructive() {
+        IntentRoute::Confirm
+    } else {
+        IntentRoute::Run
+    }
+}
+
+/// coordinator へ渡すセッション状態を決める **純関数**。
+///
+/// 誤って `Idle` と判定すると、作業中のエージェントの入力欄へ文字を流し込んで
+/// 入力を壊してしまう。だから少しでも曖昧なら必ず `Unknown` に倒す
+/// (`Unknown` には何も配達されない)。
+fn coordinator_state(
+    running: bool,
+    attention: bool,
+    sup: Option<supervisor::SessionState>,
+) -> coordinator::SessionState {
+    use coordinator::SessionState as C;
+    use supervisor::SessionState as S;
+
+    // プロセスが居ない = 終了。ここに曖昧さは無い。
+    if !running {
+        return C::Exited;
+    }
+    // 承認プロンプトで止まっている。割り込ませない。
+    if attention {
+        return C::WaitingApproval;
+    }
+    match sup {
+        // 直近に出力が動いた = 作業中。
+        Some(S::Working) => C::Working,
+        // 静かでプロンプトへ戻っている = 待機。ここだけが配達可能。
+        Some(S::Idle) => C::Idle,
+        Some(S::WaitingApproval) => C::WaitingApproval,
+        Some(S::Stalled) => C::Stalled,
+        // ループ / エラー多発 / 異常終了 / 完了扱いは「いま入力を受け付けられるか」が
+        // 判断できない。まだ一度も観測していない (None) 場合も同じく分からない。
+        Some(S::Looping) | Some(S::Errored) | Some(S::Crashed) | Some(S::Done) | None => C::Unknown,
+    }
 }
 
 impl ZaivernApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, workspace: PathBuf) -> Self {
+    /// `roots` は必ず 1 件以上 (呼び出し側で `file_tree::normalize_roots` 済み)。
+    /// `open_files` はコマンドライン引数で渡されたファイル (起動後に開く)。
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        roots: Vec<PathBuf>,
+        open_files: Vec<PathBuf>,
+    ) -> Self {
         install_fonts(&cc.egui_ctx);
-        let cfg = config::load(&workspace, true);
+        // 空で渡されても決して空のままにしない (roots[0] が常に存在する不変条件)
+        let roots = if roots.is_empty() {
+            vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+        } else {
+            roots
+        };
+        let cfg = config::load(&roots, true);
         let theme = resolve_theme(&cfg.theme);
         theme::apply(&cc.egui_ctx, &theme);
 
-        let ws_name = workspace
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| workspace.to_string_lossy().to_string());
         cc.egui_ctx
-            .send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                "Zaivern Code — {ws_name}"
-            )));
+            .send_viewport_cmd(egui::ViewportCommand::Title(workspace_title(&roots)));
 
         let (plugin_tx, plugin_rx) = mpsc::channel();
         let mut app = Self {
-            tree: FileTree::new(workspace.clone(), cfg.show_hidden_files),
-            gitinfo: git::Git::new(workspace.clone()),
-            git_panel: git_panel::GitPanel::new(workspace.clone()),
+            tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
+            gitinfo: git::GitSet::new(roots.clone()),
+            git_panel: git_panel::GitPanel::new(
+                roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
+            ),
             ext_check_at: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
             theme,
-            workspace,
+            roots,
             editor: Editor::new(),
             agents: AgentManager::new(),
             palette: Palette::new(),
@@ -368,7 +487,6 @@ impl ZaivernApp {
             voice: VoiceState::default(),
             qr_tex: None,
             broadcast_input: String::new(),
-            git: (None, None),
             pet_pos: match (cfg.pet_x, cfg.pet_y) {
                 (Some(x), Some(y)) => Some(egui::pos2(x, y)),
                 _ => None,
@@ -400,6 +518,17 @@ impl ZaivernApp {
             hook_git_branch: None,
             pending_hooks: Vec::new(),
             plugins_tab_was_open: false,
+            supervisor: supervisor::Supervisor::new(cfg.supervisor.clone()),
+            coordinator: coordinator::Coordinator::new(),
+            pending_intervention: Vec::new(),
+            pending_stop: Vec::new(),
+            stopping: Vec::new(),
+            known_sessions: HashSet::new(),
+            sup_last_state: HashMap::new(),
+            sup_next_at: None,
+            typed_voice: HashMap::new(),
+            typed_sup: HashMap::new(),
+            report_colors: HashMap::new(),
             cfg,
         };
         // ユーザー指定のペット画像をロード
@@ -411,7 +540,7 @@ impl ZaivernApp {
         match remote::RemoteServer::start(cc.egui_ctx.clone()) {
             Ok(s) => {
                 // CLI (`zai open` など) が接続先を見つけられるよう接続情報を書き出す
-                let ws = app.workspace.to_string_lossy().to_string();
+                let ws = app.primary_root().to_string_lossy().to_string();
                 if let Err(e) = cli::write_instance_file(s.port, &s.token, &ws) {
                     eprintln!("インスタンス情報の書き出しに失敗しました: {e}");
                 }
@@ -420,8 +549,73 @@ impl ZaivernApp {
             Err(e) => app.remote_err = Some(e),
         }
         app.rebuild_index();
-        app.restore_session();
+        app.restore_session(&cc.egui_ctx);
+        // コマンドラインで渡されたファイルはセッション復元の後に開く
+        // (最後に開いたものがアクティブになる)
+        for f in open_files {
+            app.open_path(&f);
+        }
         app
+    }
+
+    /// primary ルート (= `roots[0]`)。単一ルート時代の `self.workspace` 相当。
+    /// ダイアログの初期ディレクトリ・エージェントの cwd 等、
+    /// 「1 つ選ぶしかない」場面で使う。
+    fn primary_root(&self) -> &Path {
+        self.roots.first().map(|p| p.as_path()).unwrap_or(Path::new("."))
+    }
+
+    /// トースト等の表示用: 所属ルートからの相対パス。
+    /// 複数ルートのときはどのフォルダの話か分かるようルート名を前置する。
+    /// どのルートにも属さなければ絶対パスのまま。
+    fn rel_label(&self, p: &Path) -> String {
+        match self.root_for(p).and_then(|r| {
+            p.strip_prefix(r)
+                .ok()
+                .map(|rel| (root_name(r), rel.display().to_string()))
+        }) {
+            Some((name, rel)) if self.roots.len() > 1 => format!("{name}/{rel}"),
+            Some((_, rel)) => rel,
+            None => p.display().to_string(),
+        }
+    }
+
+    /// `p` を含むルート (最長一致)。どのルートにも属さなければ None。
+    fn root_for(&self, p: &Path) -> Option<&Path> {
+        self.roots
+            .iter()
+            .filter(|r| p.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+            .map(|r| r.as_path())
+    }
+
+    /// ルート一覧を差し替え、ツリー / git / 索引 / タイトルを追随させる。
+    /// 現在のセッションを先に保存してから切り替える。
+    /// `roots` が空になる呼び出しは無視する (不変条件を守る)。
+    fn set_roots(&mut self, roots: Vec<PathBuf>, ctx: &egui::Context) {
+        if roots.is_empty() {
+            return;
+        }
+        self.persist_session();
+        self.apply_roots(roots, ctx);
+    }
+
+    /// `set_roots` からセッション保存を除いた部分 (セッション復元中に使う)。
+    fn apply_roots(&mut self, roots: Vec<PathBuf>, ctx: &egui::Context) {
+        if roots.is_empty() {
+            return;
+        }
+        self.roots = roots;
+        self.tree.set_roots(self.roots.clone());
+        self.gitinfo.set_roots(self.roots.clone());
+        // Git パネルは単一 repo 表示。GitSet と同じ「primary ルート」を見せることで、
+        // サイドバーとステータスバーのブランチ表示が食い違わないようにする。
+        self.git_panel.set_workspace(self.primary_root().to_path_buf());
+        // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
+        self.cfg = config::load(&self.roots, true);
+        self.tree.show_hidden = self.cfg.show_hidden_files;
+        self.rebuild_index();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(workspace_title(&self.roots)));
     }
 
     // ─── プラグイン (コマンド / スニペット / テーマ) ─────────────────
@@ -522,7 +716,7 @@ impl ZaivernApp {
             .get(self.agents.active)
             .map(|s| s.preset_name.clone())
             .unwrap_or_default();
-        let workspace = self.workspace.clone();
+        let workspace = self.primary_root().to_path_buf();
         let (line, column) = self.editor.cursor;
         let Some(p) = self.plugins.iter().find(|p| p.name == plugin_name) else {
             return Vec::new();
@@ -629,7 +823,7 @@ impl ZaivernApp {
                 command,
                 stdin_text,
                 envs,
-                workdir: self.workspace.clone(),
+                workdir: self.primary_root().to_path_buf(),
                 buffer_id,
                 replace_range,
                 resave: false,
@@ -868,7 +1062,7 @@ impl ZaivernApp {
                     let p = if Path::new(&path).is_absolute() {
                         PathBuf::from(&path)
                     } else {
-                        self.workspace.join(&path)
+                        self.primary_root().join(&path)
                     };
                     self.open_path(&p);
                     if let Some(n) = line {
@@ -1015,7 +1209,7 @@ impl ZaivernApp {
                     command,
                     stdin_text: String::new(),
                     envs,
-                    workdir: self.workspace.clone(),
+                    workdir: self.primary_root().to_path_buf(),
                     buffer_id: None,
                     replace_range: None,
                     resave: false,
@@ -1063,7 +1257,7 @@ impl ZaivernApp {
                     command,
                     stdin_text: String::new(),
                     envs,
-                    workdir: self.workspace.clone(),
+                    workdir: self.primary_root().to_path_buf(),
                     buffer_id: None,
                     replace_range: None,
                     resave: false,
@@ -1138,7 +1332,7 @@ impl ZaivernApp {
                 command,
                 stdin_text: String::new(),
                 envs,
-                workdir: self.workspace.clone(),
+                workdir: self.primary_root().to_path_buf(),
                 buffer_id: None,
                 replace_range: None,
                 resave: false,
@@ -1159,7 +1353,12 @@ impl ZaivernApp {
         };
         match self
             .agents
-            .launch(&preset, &self.workspace, crate::agents::Approval::Agent, ctx)
+            .launch(
+                &preset,
+                &self.primary_root().to_path_buf(),
+                crate::agents::Approval::Agent,
+                ctx,
+            )
         {
             Ok(()) => self.toast(format!("▶ {command} を実行しています"), true),
             Err(e) => self.toast(format!("実行に失敗: {e}"), false),
@@ -1254,7 +1453,7 @@ impl ZaivernApp {
                     command,
                     stdin_text: text.clone(),
                     envs,
-                    workdir: self.workspace.clone(),
+                    workdir: self.primary_root().to_path_buf(),
                     buffer_id: Some(buffer_id),
                     replace_range: None,
                     resave: true,
@@ -1276,7 +1475,14 @@ impl ZaivernApp {
         let Some(server_cmd) = lsp_server_for(&lang_id) else {
             return;
         };
-        if !self.lsp.contains_key(&lang_id) {
+        // マルチルート: そのファイルが属するルート毎にサーバーを起動する。
+        // ルート外のファイルは primary ルートのサーバーに預ける。
+        let root = self
+            .root_for(path)
+            .unwrap_or_else(|| self.primary_root())
+            .to_path_buf();
+        let key: LspKey = (lang_id.clone(), root.clone());
+        if !self.lsp.contains_key(&key) {
             let bin = server_cmd.split_whitespace().next().unwrap_or("");
             // which() は $SHELL -lc のサブプロセスを起動する。ここは毎フレーム通るので、
             // 「見つからなかった」結果を短時間だけ覚えて spawn 連発を防ぐ。
@@ -1290,15 +1496,15 @@ impl ZaivernApp {
                 return; // サーバー未インストールなら静かに無効
             }
             self.lsp_which_missing.remove(bin);
-            match lsp::LspClient::spawn(server_cmd, &self.workspace, ctx.clone()) {
+            match lsp::LspClient::spawn(server_cmd, &root, ctx.clone()) {
                 Ok(client) => {
-                    self.lsp.insert(lang_id.clone(), client);
+                    self.lsp.insert(key.clone(), client);
                 }
                 Err(_) => return,
             }
         }
         if !self.lsp_opened.contains(path) {
-            if let Some(client) = self.lsp.get(&lang_id) {
+            if let Some(client) = self.lsp.get(&key) {
                 // 本文はこの一回だけ必要。self.lsp / self.editor はどちらも不変借用なので両立する
                 let text = self
                     .editor
@@ -1313,6 +1519,15 @@ impl ZaivernApp {
         }
     }
 
+    /// `path` / 言語から LSP サーバーのキーを作る (起動はしない)。
+    fn lsp_key_for(&self, path: &Path, lang: &str) -> LspKey {
+        let root = self
+            .root_for(path)
+            .unwrap_or_else(|| self.primary_root())
+            .to_path_buf();
+        (snippets::lang_id_for(lang).to_string(), root)
+    }
+
     /// デバウンスした did_change を実際に送る(update から毎フレーム呼ぶ)。
     fn flush_lsp_changes(&mut self) {
         if self.lsp_pending.is_empty() {
@@ -1325,8 +1540,8 @@ impl ZaivernApp {
             .map(|(p, _)| p.clone())
             .collect();
         for p in ready {
-            if let Some((text, _, lang_id)) = self.lsp_pending.remove(&p) {
-                if let Some(client) = self.lsp.get(&lang_id) {
+            if let Some((text, _, key)) = self.lsp_pending.remove(&p) {
+                if let Some(client) = self.lsp.get(&key) {
                     client.did_change(&p, &text);
                 }
             }
@@ -1343,8 +1558,8 @@ impl ZaivernApp {
         let Some(path) = self.editor.buffers[i].path.as_ref() else {
             return (by_line, 0, 0);
         };
-        let lang_id = snippets::lang_id_for(&self.editor.buffers[i].lang);
-        let Some(client) = self.lsp.get(lang_id) else {
+        let key = self.lsp_key_for(path, &self.editor.buffers[i].lang);
+        let Some(client) = self.lsp.get(&key) else {
             return (by_line, 0, 0);
         };
         for d in client.diagnostics(path) {
@@ -1374,15 +1589,36 @@ impl ZaivernApp {
             sidebar_open: self.sidebar_open,
             panel_open: self.agents.panel_open,
             sidebar_tab: self.sidebar_tab.as_key().to_string(),
+            // ルート一覧そのものも保存する (再起動で全フォルダを復元するため)
+            roots: self
+                .roots
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
         };
-        session::save(&self.workspace, &data);
+        session::save(&self.roots, &data);
+        // マルチルート時は primary ルート単独のキーでも保存しておく。
+        // これで `zai <primaryフォルダ>` だけで起動しても、
+        // 保存されている roots からワークスペース全体を復元できる。
+        if self.roots.len() > 1 {
+            session::save(&self.roots[..1], &data);
+        }
     }
 
     /// 保存済みセッション(開いていたタブ等)を復元する。
-    fn restore_session(&mut self) {
-        let Some(sess) = session::load(&self.workspace) else {
+    /// セッションに記録されたルート一覧の方が広ければ、フォルダ構成ごと復元する。
+    fn restore_session(&mut self, ctx: &egui::Context) {
+        let Some(sess) = session::load(&self.roots) else {
             return;
         };
+        // 記録されていたルート一覧が現在のルートをすべて含み、かつより広いなら
+        // マルチルートワークスペースとして開き直す。
+        let saved = file_tree::normalize_roots(
+            sess.roots.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        );
+        if saved.len() > self.roots.len() && self.roots.iter().all(|r| saved.contains(r)) {
+            self.apply_roots(saved, ctx);
+        }
         let base = self.editor.buffers.len();
         for f in &sess.open_files {
             let _ = self.editor.open(Path::new(f), &self.highlighter);
@@ -1461,6 +1697,14 @@ impl ZaivernApp {
     }
 
     fn rebuild_index(&mut self) {
+        self.file_index = build_file_index(&self.roots);
+        self.index_at = Some(Instant::now());
+    }
+}
+
+/// 全ルートを走査してファイル索引を作る (純関数 — テスト可能)。
+fn build_file_index(roots: &[PathBuf]) -> Vec<IndexedFile> {
+    {
         const SKIP: [&str; 10] = [
             "target",
             "node_modules",
@@ -1473,56 +1717,77 @@ impl ZaivernApp {
             ".next",
             ".cache",
         ];
-        let mut out: Vec<String> = Vec::new();
-        let mut stack = vec![(self.workspace.clone(), 0usize)];
-        while let Some((dir, depth)) = stack.pop() {
-            if depth > 12 || out.len() >= 8000 {
-                continue;
-            }
-            let Ok(rd) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                if is_dir {
-                    if !SKIP.contains(&name.as_str()) && !name.starts_with('.') {
-                        stack.push((e.path(), depth + 1));
+        let mut out: Vec<IndexedFile> = Vec::new();
+        // ルートを跨いで DFS。エントリは絶対パスを正として持ち、
+        // 相対パスは所属ルート基準で作る (あいまい検索の品質を保つため)。
+        for root in roots {
+            let root_name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.to_string_lossy().to_string());
+            let mut stack = vec![(root.clone(), 0usize)];
+            while let Some((dir, depth)) = stack.pop() {
+                if depth > 12 || out.len() >= 8000 {
+                    continue;
+                }
+                let Ok(rd) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    if is_dir {
+                        if !SKIP.contains(&name.as_str()) && !name.starts_with('.') {
+                            stack.push((e.path(), depth + 1));
+                        }
+                    } else if name != ".DS_Store" {
+                        let abs = e.path();
+                        let rel = abs
+                            .strip_prefix(root)
+                            .unwrap_or(&abs)
+                            .to_string_lossy()
+                            .to_string();
+                        out.push(IndexedFile {
+                            abs,
+                            label: format!("{root_name}/{rel}"),
+                            rel,
+                        });
                     }
-                } else if name != ".DS_Store" {
-                    let rel = e
-                        .path()
-                        .strip_prefix(&self.workspace)
-                        .unwrap_or(&e.path())
-                        .to_string_lossy()
-                        .to_string();
-                    out.push(rel);
                 }
             }
         }
-        out.sort();
-        self.file_index = out;
-        self.index_at = Some(Instant::now());
-    }
-
-    fn git_branch(&mut self) -> Option<String> {
-        let fresh = self
-            .git
-            .1
-            .map(|t| t.elapsed().as_secs() < 3)
-            .unwrap_or(false);
-        if !fresh {
-            self.git.1 = Some(Instant::now());
-            self.git.0 = std::fs::read_to_string(git_head_path(&self.workspace))
-                .ok()
-                .map(|s| {
-                    let s = s.trim();
-                    s.strip_prefix("ref: refs/heads/")
-                        .map(str::to_string)
-                        .unwrap_or_else(|| s.chars().take(8).collect())
-                });
+        // 表示ラベル: 相対パスが 2 ルート以上で衝突するときだけ
+        // `<ルート名>/<rel>` にする (VS Code 等と同じ「必要なときだけ曖昧回避」)。
+        if roots.len() > 1 {
+            let mut seen: HashMap<&str, usize> = HashMap::new();
+            for f in &out {
+                *seen.entry(f.rel.as_str()).or_insert(0) += 1;
+            }
+            let unique: HashSet<String> = seen
+                .iter()
+                .filter(|(_, n)| **n == 1)
+                .map(|(r, _)| (*r).to_string())
+                .collect();
+            for f in &mut out {
+                if unique.contains(&f.rel) {
+                    f.label = f.rel.clone();
+                }
+            }
+        } else {
+            for f in &mut out {
+                f.label = f.rel.clone();
+            }
         }
-        self.git.0.clone()
+        out.sort_by(|a, b| a.label.cmp(&b.label));
+        out
+    }
+}
+
+impl ZaivernApp {
+
+    /// primary ルートが属する repo のブランチ名 (git.rs 側で TTL キャッシュ)。
+    fn git_branch(&mut self) -> Option<String> {
+        self.gitinfo.branch()
     }
 
     fn open_path(&mut self, path: &Path) {
@@ -1582,30 +1847,43 @@ impl ZaivernApp {
         let Some(p) = b.path.clone() else {
             return;
         };
-        let lang_id = snippets::lang_id_for(&b.lang).to_string();
-        if self.lsp.contains_key(&lang_id) {
+        let key = self.lsp_key_for(&p, &b.lang);
+        if self.lsp.contains_key(&key) {
             self.lsp_pending
-                .insert(p, (b.text.clone(), Instant::now(), lang_id));
+                .insert(p, (b.text.clone(), Instant::now(), key));
         }
     }
 
     fn launch_preset(&mut self, i: usize, ctx: &egui::Context) {
-        use crate::agents::{apply_approval, command_is_bypass, Approval};
+        use crate::agents::{
+            apply_approval, command_is_bypass, env_enables_auto, merged_env, spec_for_command,
+            Approval,
+        };
         let Some(p) = self.cfg.agents.get(i).cloned() else {
             return;
         };
         let approval = Approval::from_mode(&self.cfg.approval_mode);
         // 実際に起動されるコマンドで bypass かどうかを判定する
         // (Agent優先モードではプリセットのフラグがそのまま効く)
-        let is_bypass = command_is_bypass(&apply_approval(&p.command, approval));
-        let head = p.command.split_whitespace().next().unwrap_or("");
-        let is_agent_cli = matches!(head, "claude" | "codex" | "agy");
+        //
+        // goose / aider は全自動フラグを持たず環境変数でしか自動承認できないため、
+        // コマンド文字列だけを見る command_is_bypass では取りこぼす。
+        // 環境変数側の判定も OR で足さないと、全自動で動いているのに
+        // 🛡(承認あり) と表示してしまう。
+        let launched = apply_approval(&p.command, approval);
+        let env = merged_env(&p.command, approval, &p.env);
+        let is_bypass = command_is_bypass(&launched) || env_enables_auto(&p.command, &env);
+        // カタログにあるエージェントかどうかで判定する。
+        // 先頭トークンの直接比較だと /usr/local/bin/claude のような
+        // 絶対パス指定で一致に失敗する(spec_for_command は末尾要素で照合する)。
+        let is_agent_cli = spec_for_command(&p.command).is_some();
         let via = if approval == Approval::Agent {
             "（Agent欄の指定どおり）"
         } else {
             "（既定モード）"
         };
-        match self.agents.launch(&p, &self.workspace, approval, ctx) {
+        let cwd = self.primary_root().to_path_buf();
+        match self.agents.launch(&p, &cwd, approval, ctx) {
             Ok(()) => {
                 if is_agent_cli && is_bypass {
                     self.toast_warn(format!(
@@ -1645,7 +1923,7 @@ impl ZaivernApp {
         };
         let path = if need_dialog {
             match rfd::FileDialog::new()
-                .set_directory(&self.workspace)
+                .set_directory(self.primary_root())
                 .save_file()
             {
                 Some(p) => p,
@@ -1743,22 +2021,17 @@ impl ZaivernApp {
     }
 
     /// 指定フォルダをワークスペースとして開き直す (フォルダを開く / worktree を開く)。
+    /// マルチルート化後は `set_roots` に一本化してある。ツリー / GitSet / Git パネル /
+    /// 索引 / タイトルはすべてその中で追随するので、ここで個別に触らない。
+    /// 「開き直す」なので既存のルートは置き換わる (トーストで結果を明示する)。
     fn open_workspace(&mut self, dir: PathBuf, ctx: &egui::Context) {
-        self.persist_session();
-        self.workspace = dir.clone();
-        self.tree.set_root(dir.clone());
-        self.gitinfo.set_workspace(dir.clone());
-        self.git_panel.set_workspace(dir.clone());
-        self.rebuild_index();
-        self.restore_session();
-        self.git = (None, None);
-        let name = dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-            "Zaivern Code — {name}"
-        )));
+        let roots = file_tree::normalize_roots(vec![dir.clone()]);
+        if roots.is_empty() {
+            self.toast_warn(format!("📂 {} を開けませんでした", dir.display()));
+            return;
+        }
+        self.set_roots(roots, ctx);
+        self.restore_session(ctx);
         self.toast(format!("📂 {} を開きました", dir.display()), true);
     }
 
@@ -1788,10 +2061,52 @@ impl ZaivernApp {
             Cmd::NewFile => self.editor.new_untitled(),
             Cmd::OpenFolder => {
                 if let Some(dir) = rfd::FileDialog::new()
-                    .set_directory(&self.workspace)
+                    .set_directory(self.primary_root())
                     .pick_folder()
                 {
                     self.open_workspace(dir, ctx);
+                }
+            }
+            Cmd::AddFolder => {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_directory(self.primary_root())
+                    .pick_folder()
+                {
+                    let before = self.roots.len();
+                    let mut next = self.roots.clone();
+                    next.push(dir.clone());
+                    let next = file_tree::normalize_roots(next);
+                    // normalize_roots が畳んだ = 既存ルート配下だった
+                    if next.len() == before && next.iter().any(|r| dir.starts_with(r)) {
+                        self.toast_warn(format!(
+                            "{} は既にワークスペースに含まれています",
+                            dir.display()
+                        ));
+                    } else {
+                        self.set_roots(next, ctx);
+                        self.toast(
+                            format!("📚 {} をワークスペースに追加しました", dir.display()),
+                            true,
+                        );
+                    }
+                }
+            }
+            Cmd::RemoveFolder(dir) => {
+                if self.roots.len() <= 1 {
+                    // ルートが空になると行き先が無くなるので拒否する
+                    self.toast_warn("最後のフォルダは削除できません");
+                } else {
+                    let next: Vec<PathBuf> =
+                        self.roots.iter().filter(|r| **r != dir).cloned().collect();
+                    if next.len() == self.roots.len() {
+                        self.toast_warn("そのフォルダはワークスペースにありません");
+                    } else {
+                        self.set_roots(next, ctx);
+                        self.toast(
+                            format!("🗂 {} をワークスペースから削除しました", dir.display()),
+                            true,
+                        );
+                    }
                 }
             }
             Cmd::ToggleTerminal => {
@@ -1875,12 +2190,15 @@ impl ZaivernApp {
                 self.open_path(&config::config_path());
             }
             Cmd::ReloadConfig => {
-                self.cfg = config::load(&self.workspace, false);
+                self.cfg = config::load(&self.roots, false);
                 self.theme = resolve_theme(&self.cfg.theme);
                 theme::apply(ctx, &self.theme);
                 self.tree.show_hidden = self.cfg.show_hidden_files;
                 self.tree.invalidate();
                 self.rebuild_plugins();
+                // 監視設定も入れ替える。サンプル間隔が変わるので次回刻みも捨てる。
+                self.supervisor.set_config(self.cfg.supervisor.clone());
+                self.sup_next_at = None;
                 self.keys = Keybinds::from_overrides(&self.cfg.keybindings);
                 for b in &mut self.editor.buffers {
                     b.cache = None;
@@ -1901,7 +2219,8 @@ impl ZaivernApp {
                 let rel = self.editor.active.and_then(|i| {
                     let b = &self.editor.buffers[i];
                     b.path.as_ref().map(|p| {
-                        p.strip_prefix(&self.workspace)
+                        self.root_for(p)
+                            .and_then(|r| p.strip_prefix(r).ok())
                             .unwrap_or(p)
                             .to_string_lossy()
                             .to_string()
@@ -2127,7 +2446,8 @@ impl ZaivernApp {
     fn run_action(&mut self, a: Action, ctx: &egui::Context) {
         match a {
             Action::OpenFile(p) => {
-                let p = self.workspace.join(p);
+                // p は絶対パス (file_index が絶対パスを正として持つ)。
+                // 同名の相対パスが複数ルートにあっても取り違えない。
                 self.open_path(&p);
             }
             Action::Cmd(c) => self.apply_cmd(c, ctx),
@@ -2318,15 +2638,26 @@ impl ZaivernApp {
                     );
                     ui.separator();
 
-                    let ws_name = self
-                        .workspace
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| self.workspace.to_string_lossy().to_string());
+                    let ws_name = roots_label(&self.roots);
                     ui.menu_button(format!("📂 {ws_name}"), |ui| {
                         if ui.button("フォルダを開く…").clicked() {
                             cmds.push(Cmd::OpenFolder);
                             ui.close_menu();
+                        }
+                        if ui.button("フォルダをワークスペースに追加…").clicked() {
+                            cmds.push(Cmd::AddFolder);
+                            ui.close_menu();
+                        }
+                        if self.roots.len() > 1 {
+                            ui.menu_button("フォルダをワークスペースから削除", |ui| {
+                                for r in &self.roots {
+                                    let name = root_name(r);
+                                    if ui.button(name).clicked() {
+                                        cmds.push(Cmd::RemoveFolder(r.clone()));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                         }
                         if ui.button("ツリーを再読み込み").clicked() {
                             cmds.push(Cmd::RefreshTree);
@@ -2709,7 +3040,7 @@ impl ZaivernApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     let dim = |s: String| RichText::new(s).size(11.5).color(theme.text_dim);
-                    ui.label(dim(format!("📂 {}", self.workspace.display())));
+                    ui.label(dim(format!("📂 {}", roots_label(&self.roots))));
                     if let Some(b) = &branch {
                         ui.label(dim(format!("🌿 {b}")));
                         if dirty > 0 {
@@ -2844,13 +3175,7 @@ impl ZaivernApp {
                     SidebarTab::Files => {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(
-                                    self.workspace
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default(),
-                                )
-                                .strong(),
+                                RichText::new(roots_label(&self.roots)).strong(),
                             );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -3325,10 +3650,11 @@ impl ZaivernApp {
             }
         }
         if let Some(pi) = pl_export {
+            let root = self.primary_root().to_path_buf();
             let res = self
                 .plugins
                 .get(pi)
-                .map(|p| plugins::export(p, &self.workspace));
+                .map(|p| plugins::export(p, &root));
             match res {
                 Some(Ok(path)) => {
                     self.toast(format!("📤 エクスポートしました: {}", path.display()), true)
@@ -3356,10 +3682,10 @@ impl ZaivernApp {
             self.send_to_agent(t);
         }
         if nf_root {
-            self.tree.start_new_file(self.workspace.clone());
+            self.tree.start_new_file(self.primary_root().to_path_buf());
         }
         if nd_root {
-            self.tree.start_new_dir(self.workspace.clone());
+            self.tree.start_new_dir(self.primary_root().to_path_buf());
         }
         if let Some(p) = actions.create_file {
             let res = std::fs::OpenOptions::new()
@@ -3372,7 +3698,7 @@ impl ZaivernApp {
                     self.tree.invalidate();
                     self.open_path(&p);
                     self.toast(
-                        format!("➕ {} を作成しました", rel_label(&p, &self.workspace)),
+                        format!("➕ {} を作成しました", self.rel_label(&p)),
                         true,
                     );
                 }
@@ -3382,7 +3708,7 @@ impl ZaivernApp {
         if let Some(p) = actions.create_dir {
             if p.exists() {
                 self.toast(
-                    format!("既に存在します: {}", rel_label(&p, &self.workspace)),
+                    format!("既に存在します: {}", self.rel_label(&p)),
                     false,
                 );
             } else {
@@ -3390,7 +3716,7 @@ impl ZaivernApp {
                     Ok(()) => {
                         self.tree.invalidate();
                         self.toast(
-                            format!("🗂 {} を作成しました", rel_label(&p, &self.workspace)),
+                            format!("🗂 {} を作成しました", self.rel_label(&p)),
                             true,
                         );
                     }
@@ -3401,7 +3727,7 @@ impl ZaivernApp {
         if let Some((from, to)) = actions.rename {
             if to.exists() {
                 self.toast(
-                    format!("既に存在します: {}", rel_label(&to, &self.workspace)),
+                    format!("既に存在します: {}", self.rel_label(&to)),
                     false,
                 );
             } else {
@@ -3411,7 +3737,7 @@ impl ZaivernApp {
                         self.tree.invalidate();
                         self.persist_session();
                         self.toast(
-                            format!("✏ {} に変更しました", rel_label(&to, &self.workspace)),
+                            format!("✏ {} に変更しました", self.rel_label(&to)),
                             true,
                         );
                     }
@@ -3932,7 +4258,14 @@ impl ZaivernApp {
                                     } else {
                                         Color32::TRANSPARENT
                                     };
-                                    egui::Frame::none()
+                                    // タブは Frame 全体を当たり判定にする。Label に
+                                    // Sense を付けるとテキストの矩形しか反応せず、
+                                    // inner_margin の余白を押しても切り替わらない
+                                    // (押せるのは見た目のタブの 3 割ほどしかない)。
+                                    // × は Sense を持たせず座標で判定する — 後から
+                                    // 呼ぶ interact に当たり判定を奪われて閉じるボタンが
+                                    // 無反応になるのを避けるため。
+                                    let fr = egui::Frame::none()
                                         .fill(fill)
                                         .rounding(egui::Rounding {
                                             nw: 7.0,
@@ -3954,25 +4287,40 @@ impl ZaivernApp {
                                             } else {
                                                 theme.text_dim
                                             };
-                                            let r = ui.add(
+                                            ui.add(
                                                 egui::Label::new(
                                                     RichText::new(name).color(color),
                                                 )
-                                                .sense(egui::Sense::click()),
+                                                .selectable(false),
                                             );
-                                            if r.clicked() {
-                                                activate = Some(i);
-                                            }
-                                            let x = ui.add(
+                                            ui.add(
                                                 egui::Label::new(
                                                     RichText::new("×").color(theme.text_dim),
                                                 )
-                                                .sense(egui::Sense::click()),
-                                            );
-                                            if x.clicked() {
-                                                close_req = Some(i);
-                                            }
+                                                .selectable(false),
+                                            )
+                                            .rect
                                         });
+                                    let x_rect = fr.inner;
+                                    let tab = ui.interact(
+                                        fr.response.rect,
+                                        ui.id().with(("editor-tab", i)),
+                                        egui::Sense::click(),
+                                    );
+                                    if tab.hovered() {
+                                        ui.ctx()
+                                            .set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    if tab.clicked() {
+                                        if tab
+                                            .interact_pointer_pos()
+                                            .is_some_and(|p| x_rect.expand(4.0).contains(p))
+                                        {
+                                            close_req = Some(i);
+                                        } else {
+                                            activate = Some(i);
+                                        }
+                                    }
                                 }
                             });
                         });
@@ -4284,14 +4632,10 @@ impl ZaivernApp {
         let theme_warn = self.theme.warn;
         let theme_err = self.theme.err;
         self.gitinfo.refresh_if_stale();
-        let rel = self.editor.buffers[active]
-            .path
-            .as_ref()
-            .and_then(|p| p.strip_prefix(&self.workspace).ok())
-            .map(|p| p.to_string_lossy().to_string());
+        let abs = self.editor.buffers[active].path.clone();
         let text_hash = hash_str(&self.editor.buffers[active].text);
-        let marks: Vec<(usize, git::LineMark)> = match rel {
-            Some(r) => self.gitinfo.line_marks(&r, text_hash),
+        let marks: Vec<(usize, git::LineMark)> = match abs {
+            Some(p) => self.gitinfo.line_marks(&p, text_hash),
             None => Vec::new(),
         };
 
@@ -4564,11 +4908,11 @@ impl ZaivernApp {
         // LSP: テキストが変わったらデバウンスして did_change を予約
         if changed {
             if let (Some(p), lang) = (path_clone.clone(), lang_clone.clone()) {
-                let lang_id = snippets::lang_id_for(&lang).to_string();
-                if self.lsp.contains_key(&lang_id) {
+                let key = self.lsp_key_for(&p, &lang);
+                if self.lsp.contains_key(&key) {
                     let text = self.editor.buffers[active].text.clone();
                     self.lsp_pending
-                        .insert(p, (text, Instant::now(), lang_id));
+                        .insert(p, (text, Instant::now(), key));
                 }
             }
         }
@@ -4586,6 +4930,7 @@ impl ZaivernApp {
                 ("💾".into(), "名前を付けて保存".into(), "⌘⇧S".into(), Cmd::SaveAs),
                 ("📄".into(), "新規ファイル".into(), "⌘N".into(), Cmd::NewFile),
                 ("📂".into(), "フォルダを開く…".into(), String::new(), Cmd::OpenFolder),
+                ("📚".into(), "フォルダをワークスペースに追加".into(), String::new(), Cmd::AddFolder),
                 ("❌".into(), "タブを閉じる".into(), "⌘W".into(), Cmd::CloseTab),
                 ("🔍".into(), "ファイル内検索".into(), "⌘F".into(), Cmd::OpenFind),
                 ("🖥".into(), "ターミナル表示切替".into(), "⌘J".into(), Cmd::ToggleTerminal),
@@ -4686,6 +5031,18 @@ impl ZaivernApp {
                     ));
                 }
             }
+            // ルートが 2 つ以上のときだけ削除コマンドを出す
+            // (最後の 1 つは削除できない = roots は決して空にならない)
+            if self.roots.len() > 1 {
+                for r in &self.roots {
+                    cmds.push((
+                        "🗂".into(),
+                        format!("フォルダをワークスペースから削除: {}", root_name(r)),
+                        String::new(),
+                        Cmd::RemoveFolder(r.clone()),
+                    ));
+                }
+            }
             for (i, p) in self.cfg.agents.iter().enumerate() {
                 cmds.push((
                     p.icon.clone(),
@@ -4714,14 +5071,17 @@ impl ZaivernApp {
                 }
             }
         } else {
-            for rel in &self.file_index {
-                if let Some(score) = fuzzy::score(&q, rel) {
-                    let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
+            for f in &self.file_index {
+                // マッチはルート相対パスに対して行い、単一ルート時と同じ
+                // あいまい検索の品質を保つ。表示 (detail) は曖昧回避済みラベル、
+                // 実際に開くのは絶対パス。
+                if let Some(score) = fuzzy::score(&q, &f.rel) {
+                    let name = f.rel.rsplit('/').next().unwrap_or(&f.rel).to_string();
                     items.push(Item {
                         icon: file_tree::icon_for(&name).to_string(),
                         label: name,
-                        detail: rel.clone(),
-                        action: Action::OpenFile(PathBuf::from(rel)),
+                        detail: f.label.clone(),
+                        action: Action::OpenFile(f.abs.clone()),
                         score,
                     });
                 }
@@ -5233,17 +5593,12 @@ impl ZaivernApp {
         // 書き込み内容はもう当てにならない。Backspace を送り込まず書き出しから
         // やり直す — Enter で入力欄が空になったあとも、そのまま話し続けられる。
         let typed = match dest {
-            Some(id) => self
-                .agents
-                .sessions
-                .iter_mut()
-                .find(|s| s.id == id)
-                .is_some_and(|s| s.take_user_typed()),
-            None => self
-                .agents
-                .sessions
-                .iter_mut()
-                .fold(false, |acc, s| s.take_user_typed() || acc),
+            Some(id) => self.take_typed_voice(id),
+            None => {
+                let ids: Vec<u64> = self.agents.sessions.iter().map(|s| s.id).collect();
+                ids.into_iter()
+                    .fold(false, |acc, id| self.take_typed_voice(id) || acc)
+            }
         };
         if typed {
             self.voice.reset_live();
@@ -5435,11 +5790,7 @@ impl ZaivernApp {
         use serde_json::json;
         match q {
             remote::Query::State => {
-                let ws = self
-                    .workspace
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                let ws = roots_label(&self.roots);
                 let tabs: Vec<_> = self
                     .editor
                     .buffers
@@ -5493,7 +5844,10 @@ impl ZaivernApp {
                 None => json!({"ok": false}).to_string(),
             },
             remote::Query::Files => {
-                let files: Vec<&String> = self.file_index.iter().take(4000).collect();
+                // 全ルートの索引を表示ラベル (曖昧なときだけルート名付き) で返す。
+                // OpenFile ではこのラベルを索引で引き直して絶対パスに戻す。
+                let files: Vec<&String> =
+                    self.file_index.iter().take(4000).map(|f| &f.label).collect();
                 json!({"ok": true, "files": files}).to_string()
             }
             remote::Query::SetText { text, index, save } => {
@@ -5544,14 +5898,41 @@ impl ZaivernApp {
                 }
             }
             remote::Query::OpenFile(rel, line) => {
-                // パストラバーサル防御: ワークスペース外は開かせない
-                let p = self.workspace.join(rel);
-                let ws = self
-                    .workspace
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.workspace.clone());
+                // `..` を含む要求は入口で拒否する。
+                // canonicalize は「存在しないパス」で失敗し、その場合の
+                // フォールバック比較は `..` を解決しないまま前方一致してしまうため、
+                // 後段のチェックに任せずここで落とす。
+                if Path::new(rel)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return json!({"ok": false, "error": "ワークスペース外は開けません"})
+                        .to_string();
+                }
+                // 索引の表示ラベル → 絶対パス (マルチルートでも一意に定まる)。
+                // 索引に無ければ各ルートからの相対パスとして解決を試みる。
+                let p = self
+                    .file_index
+                    .iter()
+                    .find(|f| f.label == *rel)
+                    .map(|f| f.abs.clone())
+                    .or_else(|| {
+                        self.roots
+                            .iter()
+                            .map(|r| r.join(rel))
+                            .find(|c| c.is_file())
+                    })
+                    .unwrap_or_else(|| self.primary_root().join(rel));
+
+                // パストラバーサル防御 (セキュリティ上の要): canonicalize したうえで
+                // 「いずれかのルート配下」でなければ開かせない。ルートが増えても
+                // 判定は緩めず、各ルートについて同じ前方一致チェックを行う。
                 let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
-                if !canon.starts_with(&ws) {
+                let inside = self.roots.iter().any(|r| {
+                    let root = r.canonicalize().unwrap_or_else(|_| r.clone());
+                    canon.starts_with(&root)
+                });
+                if !inside {
                     return json!({"ok": false, "error": "ワークスペース外は開けません"})
                         .to_string();
                 }
@@ -5881,6 +6262,441 @@ impl ZaivernApp {
             self.toast("URL をコピーしました", true);
         }
     }
+
+    // ─── 監視・連携 (supervisor / coordinator / 端末フック) ──────────
+
+    /// セッションの増減を supervisor / coordinator へ反映する。
+    ///
+    /// 起動・削除・再起動 (再起動は ID が変わる) をここ 1 か所で拾うので、
+    /// 個々の操作箇所へ手を入れずに済む。
+    fn reconcile_sessions(&mut self) {
+        let live: HashSet<u64> = self.agents.sessions.iter().map(|s| s.id).collect();
+
+        let gone: Vec<u64> = self.known_sessions.difference(&live).copied().collect();
+        for id in gone {
+            self.supervisor.forget(id);
+            self.coordinator.unregister_session(id);
+            self.known_sessions.remove(&id);
+            self.sup_last_state.remove(&id);
+            self.typed_sup.remove(&id);
+            self.typed_voice.remove(&id);
+            self.report_colors.remove(&id);
+            // 消えたセッションについての確認ダイアログはもう意味がない。
+            self.pending_intervention.retain(|p| p.session_id != id);
+        }
+
+        let fresh: Vec<u64> = live.difference(&self.known_sessions).copied().collect();
+        for id in fresh {
+            self.coordinator.register_session(id);
+            self.known_sessions.insert(id);
+        }
+    }
+
+    /// 端末との細かい連携: フォーカス通知・クリップボード・色問い合わせへの応答。
+    fn terminal_hooks(&mut self, ctx: &egui::Context, win_focused: bool) {
+        let (fg, bg) = (self.theme.term_fg, self.theme.term_bg);
+
+        // テーマ色を伝えていない (= 起動直後 / テーマ変更後) セッションを先に洗い出す。
+        let stale: Vec<u64> = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| self.report_colors.get(&s.id) != Some(&(fg, bg)))
+            .map(|s| s.id)
+            .collect();
+
+        let mut clip: Option<String> = None;
+        for s in self.agents.sessions.iter_mut() {
+            // 端末アプリ (vim / helix 等) へフォーカスの出入りを伝える。内部で重複排除される。
+            s.set_focus(win_focused);
+            // OSC 52 のヤンクを拾う。これで Neovim / Helix のコピーがシステムへ乗る。
+            if let Some(t) = s.take_clipboard() {
+                clip = Some(t);
+            }
+        }
+
+        for id in stale {
+            if let Some(s) = self.agents.sessions.iter().find(|s| s.id == id) {
+                s.set_report_colors(fg, bg);
+            }
+            self.report_colors.insert(id, (fg, bg));
+        }
+
+        if let Some(t) = clip {
+            ctx.copy_text(t);
+        }
+    }
+
+    /// 毎フレーム: エージェントを見張り、返ってきた介入を実行する。
+    fn supervise(&mut self, ctx: &egui::Context, win_focused: bool) {
+        // 「ユーザーが手で打った」フラグは端末側で 1 回しか取れず、音声入力とも
+        // 取り合いになる。ここで一度だけ読み取って、双方の持ち越し袋へ配る。
+        for s in self.agents.sessions.iter_mut() {
+            if s.take_user_typed() {
+                self.typed_voice.insert(s.id, true);
+                self.typed_sup.insert(s.id, true);
+            }
+        }
+
+        if !self.cfg.supervisor.enabled {
+            return;
+        }
+        // supervisor 側も内部で間引くが、無駄に画面テキストを取り出さないよう
+        // こちらでも同じ間隔 (+ 余裕 50ms) で刻む。UI スレッドは止めない。
+        let now = Instant::now();
+        if self.sup_next_at.is_some_and(|t| now < t) {
+            return;
+        }
+        self.sup_next_at = Some(
+            now + Duration::from_millis(self.cfg.supervisor.sample_interval_ms.saturating_add(50)),
+        );
+
+        let mut typed = std::mem::take(&mut self.typed_sup);
+        let snaps: Vec<supervisor::SessionSnapshot> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| {
+                supervisor::SessionSnapshot::from_session(s, typed.remove(&s.id).unwrap_or(false))
+            })
+            .collect();
+
+        let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
+        for it in self.supervisor.tick(&snaps, approval) {
+            match route_intent(&it) {
+                IntentRoute::Confirm => {
+                    // 同じセッション・同じ操作の確認が二重に積まれないようにする。
+                    let dup = self
+                        .pending_intervention
+                        .iter()
+                        .any(|p| p.session_id == it.session_id && p.action == it.action);
+                    if !dup {
+                        self.toast_warn(it.toast_line());
+                        self.pending_intervention.push(it);
+                    }
+                }
+                IntentRoute::Run => self.run_intervention(it, ctx, win_focused),
+            }
+        }
+
+        self.bridge_states();
+    }
+
+    /// スーパーバイザーの見立ての変化を coordinator へ伝える。
+    /// 状態が変わった瞬間だけ通すので、毎フレーム叩き続けることにはならない。
+    fn bridge_states(&mut self) {
+        let now = Instant::now();
+        let seen: Vec<(u64, Option<supervisor::SessionState>)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| (s.id, self.supervisor.state_of(s.id)))
+            .collect();
+        for (id, st) in seen {
+            let Some(st) = st else { continue };
+            if self.sup_last_state.get(&id) == Some(&st) {
+                continue;
+            }
+            self.sup_last_state.insert(id, st);
+            match st {
+                supervisor::SessionState::Stalled => self.coordinator.note_stalled(id, now),
+                supervisor::SessionState::Crashed | supervisor::SessionState::Done => {
+                    self.coordinator.note_exited(id, now)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 毎フレーム: 配達待ちのメッセージを流し、ユーザー宛は必ず UI へ出す。
+    fn coordinate(&mut self, win_focused: bool) {
+        // 1) いまのセッション状態表。曖昧なら Unknown (= 配達しない)。
+        let states: Vec<(coordinator::SessionId, coordinator::SessionState)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.id,
+                    coordinator_state(s.running(), s.attention, self.supervisor.state_of(s.id)),
+                )
+            })
+            .collect();
+
+        // 2) 注入して安全なセッションへ 1 通ずつ配達する。
+        for d in self.coordinator.take_deliverable(&states) {
+            if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == d.session) {
+                s.write_bytes(d.text.as_bytes());
+            }
+        }
+
+        // 3) ユーザー宛は握り潰さない。抑制もエスカレーションも必ず見える形にする。
+        for m in self.coordinator.take_user_messages() {
+            let line = format!("📮 {} — {}", m.kind.label(), m.body);
+            self.toast_warn(line.clone());
+            if !win_focused {
+                notify::notify("Zaivern Code", &line);
+            }
+        }
+
+        // 4) 前任セッションの停止提案を承認モードのゲートに通す。
+        self.gate_stop_proposals();
+        // 5) 実際にプロセスが消えたものだけ「停止確認済み」にする。
+        self.confirm_stopped_sessions();
+    }
+
+    /// 停止提案 → [`coordinator::gate_for`] → 自動承認なら即実行 / 要確認なら待ち行列へ。
+    fn gate_stop_proposals(&mut self) {
+        let mode = match self.cfg.approval_mode.as_str() {
+            "auto" => coordinator::PermissionMode::Auto,
+            "agent" => coordinator::PermissionMode::Agent,
+            _ => coordinator::PermissionMode::Ask,
+        };
+        let task_ids: Vec<coordinator::TaskId> = self
+            .coordinator
+            .tasks()
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.state,
+                    coordinator::TaskState::Stalled | coordinator::TaskState::Failed
+                )
+            })
+            .map(|t| t.id)
+            .collect();
+
+        for tid in task_ids {
+            if self.stopping.iter().any(|(t, _)| *t == tid) {
+                continue;
+            }
+            let queued = self.pending_stop.iter().any(|p| {
+                let coordinator::Proposal::StopSession { task, .. } = p;
+                *task == tid
+            });
+            if queued {
+                continue;
+            }
+            let Some(p) = self.coordinator.propose_stop(tid) else {
+                continue;
+            };
+            match coordinator::gate_for(mode) {
+                coordinator::ProposalGate::AutoApproved => self.execute_stop(p),
+                coordinator::ProposalGate::NeedsUserConfirm => self.pending_stop.push(p),
+            }
+        }
+    }
+
+    /// 停止を実行する。**自動承認済み / ユーザー確認済みのものだけ**ここへ来る。
+    fn execute_stop(&mut self, p: coordinator::Proposal) {
+        let coordinator::Proposal::StopSession {
+            session,
+            task,
+            reason,
+        } = p;
+        if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == session) {
+            s.kill();
+        }
+        self.toast_warn(format!("🛑 {reason}"));
+        // プロセスが本当に消えるまで confirm_stopped は呼ばない。
+        self.stopping.push((task, session));
+    }
+
+    /// 停止待ちのうち、プロセスが消えたものだけ確定させる。
+    fn confirm_stopped_sessions(&mut self) {
+        if self.stopping.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let done: Vec<(coordinator::TaskId, u64)> = self
+            .stopping
+            .iter()
+            .filter(|(_, sid)| {
+                !self
+                    .agents
+                    .sessions
+                    .iter()
+                    .any(|s| s.id == *sid && s.running())
+            })
+            .copied()
+            .collect();
+        for (tid, _) in done {
+            self.coordinator.confirm_stopped(tid, now);
+            self.stopping.retain(|(t, _)| *t != tid);
+        }
+    }
+
+    /// 介入を実際に実行する。確認が要るものは、呼び出し側で確認済みであること。
+    fn run_intervention(
+        &mut self,
+        it: supervisor::InterventionIntent,
+        ctx: &egui::Context,
+        win_focused: bool,
+    ) {
+        use supervisor::Intervention as I;
+        let idx = self
+            .agents
+            .sessions
+            .iter()
+            .position(|s| s.id == it.session_id);
+
+        match it.action {
+            // 記録だけ。UI には出さない。
+            I::Observe => {}
+            I::Notify => {
+                let line = it.toast_line();
+                self.toast_warn(line.clone());
+                // 通知はウィンドウが非アクティブなときだけ (このファイルの既存の作法)
+                if !win_focused {
+                    notify::notify("Zaivern Code", &line);
+                }
+            }
+            I::AutoAnswer => {
+                let (Some(i), Some(payload)) = (idx, it.payload.clone()) else {
+                    return;
+                };
+                if let Some(s) = self.agents.sessions.get_mut(i) {
+                    s.write_bytes(payload.as_bytes());
+                    s.resolve_attention();
+                }
+                self.toast(format!("🛡 {} へ自動応答しました", it.session_title), true);
+            }
+            I::Nudge => {
+                let (Some(i), Some(payload)) = (idx, it.payload.clone()) else {
+                    return;
+                };
+                let sent = self
+                    .agents
+                    .sessions
+                    .get_mut(i)
+                    .is_some_and(|s| s.send_text(&format!("{payload}\r")));
+                if sent {
+                    self.toast_warn(format!("🛡 {} を促しました: {payload}", it.session_title));
+                }
+            }
+            I::Restart => {
+                let Some(i) = idx else { return };
+                // 再起動すると ID が変わる。古い ID の記録はここで捨て、
+                // 新しい ID は次フレームの reconcile_sessions が拾う。
+                self.supervisor.forget(it.session_id);
+                self.coordinator.note_exited(it.session_id, Instant::now());
+                self.sup_last_state.remove(&it.session_id);
+                match self.agents.restart(i, ctx) {
+                    Ok(()) => self.toast_warn(format!("🛡 {} を再起動しました", it.session_title)),
+                    Err(e) => self.toast(e, false),
+                }
+            }
+            I::Halt => {
+                let Some(i) = idx else { return };
+                if let Some(s) = self.agents.sessions.get_mut(i) {
+                    s.kill();
+                }
+                self.coordinator.note_exited(it.session_id, Instant::now());
+                self.toast_warn(format!("🛡 {} を停止しました", it.session_title));
+            }
+        }
+    }
+
+    /// 介入の確認モーダル。`needs_confirmation` の介入は、ここで「実行」を
+    /// 押されない限り絶対に実行されない。
+    fn intervention_confirm_ui(&mut self, ctx: &egui::Context, win_focused: bool) {
+        if self.pending_intervention.is_empty() {
+            return;
+        }
+        let it = self.pending_intervention[0].clone();
+        let warn = self.theme.warn;
+        let rest = self.pending_intervention.len() - 1;
+        let mut decided: Option<bool> = None;
+
+        egui::Window::new("エージェント監視からの提案")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(it.confirm_body());
+                if rest > 0 {
+                    ui.label(
+                        RichText::new(format!("ほかに {rest} 件の提案があります"))
+                            .small()
+                            .color(warn),
+                    );
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let label = format!("▶ {} を実行", it.action.label());
+                    if ui.button(RichText::new(label).color(warn)).clicked() {
+                        decided = Some(true);
+                    }
+                    if ui.button("何もしない").clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+
+        match decided {
+            Some(true) => {
+                self.pending_intervention.remove(0);
+                self.run_intervention(it, ctx, win_focused);
+            }
+            Some(false) => {
+                self.pending_intervention.remove(0);
+            }
+            None => {}
+        }
+    }
+
+    /// 前任セッションを止める提案の確認モーダル。
+    fn stop_confirm_ui(&mut self, ctx: &egui::Context) {
+        if self.pending_stop.is_empty() {
+            return;
+        }
+        let p = self.pending_stop[0].clone();
+        let coordinator::Proposal::StopSession { ref reason, .. } = p;
+        let body = reason.clone();
+        let warn = self.theme.warn;
+        let mut decided: Option<bool> = None;
+
+        egui::Window::new("セッション停止の確認")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(&body);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("🛑 停止する").color(warn)).clicked() {
+                        decided = Some(true);
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+
+        match decided {
+            Some(true) => {
+                self.pending_stop.remove(0);
+                self.execute_stop(p);
+            }
+            Some(false) => {
+                self.pending_stop.remove(0);
+            }
+            None => {}
+        }
+    }
+
+    /// 音声側が読む「ユーザーが手で打った」フラグ。
+    /// 端末側の生フラグは監視 (supervise) も読むので、
+    /// 取りこぼさないよう持ち越し袋と OR して返す。
+    fn take_typed_voice(&mut self, id: u64) -> bool {
+        let live = self
+            .agents
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.take_user_typed());
+        let carried = self.typed_voice.remove(&id).unwrap_or(false);
+        live || carried
+    }
 }
 
 impl eframe::App for ZaivernApp {
@@ -6019,6 +6835,13 @@ impl eframe::App for ZaivernApp {
             self.pet_attention_notified.retain(|_, at| at.elapsed().as_secs() < 10);
         }
 
+        // ── 監視・連携 ────────────────────────────────────────
+        // セッションの増減を先に反映してから、見張り → 配達の順で回す。
+        self.reconcile_sessions();
+        self.terminal_hooks(ctx, win_focused);
+        self.supervise(ctx, win_focused);
+        self.coordinate(win_focused);
+
         self.top_bar(ctx);
         self.status_bar(ctx);
         self.sidebar(ctx);
@@ -6040,6 +6863,8 @@ impl eframe::App for ZaivernApp {
         self.new_plugin_ui(ctx);
         self.close_confirm_ui(ctx);
         self.delete_confirm_ui(ctx);
+        self.intervention_confirm_ui(ctx, win_focused);
+        self.stop_confirm_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
         self.toasts_ui(ctx);
@@ -6175,39 +7000,34 @@ impl eframe::App for ZaivernApp {
     }
 }
 
-/// ワークスペースからの相対パス表示(外なら絶対パス)。
-/// `.git` がファイルのとき、その中身 (`gitdir: <path>`) から実際の git ディレクトリを取り出す。
-/// 相対パスは workspace 基準で解決する。
-fn parse_gitdir_file(contents: &str, workspace: &Path) -> Option<PathBuf> {
-    let raw = contents
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
-        .trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let p = PathBuf::from(raw);
-    Some(if p.is_absolute() { p } else { workspace.join(p) })
+
+/// ルートの表示名(フォルダ名。取れなければフルパス)。
+fn root_name(root: &Path) -> String {
+    root.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.to_string_lossy().to_string())
 }
 
-/// ブランチ表示のために読むべき HEAD のパス。
-/// 通常のリポジトリは `<ws>/.git/HEAD` だが、linked worktree では `.git` が
-/// ディレクトリではなくファイルなので、それが指す git ディレクトリ配下の HEAD を読む。
-fn git_head_path(workspace: &Path) -> PathBuf {
-    let dot_git = workspace.join(".git");
-    if dot_git.is_file() {
-        if let Some(dir) = std::fs::read_to_string(&dot_git)
-            .ok()
-            .and_then(|s| parse_gitdir_file(&s, workspace))
-        {
-            return dir.join("HEAD");
+/// ワークスペース全体の短い表示名。
+/// 単一ルートなら従来どおりフォルダ名だけ、複数なら `a, b (+2)` の形。
+fn roots_label(roots: &[PathBuf]) -> String {
+    match roots.len() {
+        0 => String::new(),
+        1 => root_name(&roots[0]),
+        n => {
+            let head: Vec<String> = roots.iter().take(2).map(|r| root_name(r)).collect();
+            if n > 2 {
+                format!("{} (+{})", head.join(", "), n - 2)
+            } else {
+                head.join(", ")
+            }
         }
     }
-    dot_git.join("HEAD")
 }
 
-fn rel_label(p: &Path, ws: &Path) -> String {
-    p.strip_prefix(ws).unwrap_or(p).display().to_string()
+/// ウィンドウタイトル。
+fn workspace_title(roots: &[PathBuf]) -> String {
+    format!("Zaivern Code — {}", roots_label(roots))
 }
 
 /// ペット画像を読み込み egui テクスチャ化する。長辺 256px に縮小する。
@@ -6430,35 +7250,127 @@ fn install_fonts(ctx: &egui::Context) {
 mod tests {
     use super::*;
 
+    /// std::env::temp_dir() 配下に一意なディレクトリを作る。
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "zaivern-index-test-{}-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos,
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("create unique temp dir");
+        dir
+    }
+
+    fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir -p");
+        std::fs::write(path, body).expect("write file");
+    }
+
+    /// DoD: 2 つのルートに同じ相対パス (`src/main.rs`) があっても、
+    /// あいまい検索から「正しい方のファイル」が開けること。
     #[test]
-    fn parses_gitdir_from_worktree_dot_git_file() {
-        let ws = Path::new("/repo/.claude/worktrees/feature");
+    fn two_roots_with_same_relative_path_resolve_to_distinct_files() {
+        let base = unique_temp_dir("collide");
+        let a = base.join("alpha");
+        let b = base.join("beta");
+        write(&a.join("src/main.rs"), "fn main() { /* ALPHA */ }");
+        write(&b.join("src/main.rs"), "fn main() { /* BETA */ }");
+        // 片方にしか無いファイルは曖昧でないのでラベルにルート名が付かない
+        write(&a.join("only_in_alpha.rs"), "x");
 
-        // linked worktree の `.git` ファイル (git が書く形式は絶対パス + 末尾改行)
-        let abs = "gitdir: /repo/.git/worktrees/feature\n";
-        assert_eq!(
-            parse_gitdir_file(abs, ws),
-            Some(PathBuf::from("/repo/.git/worktrees/feature"))
-        );
+        let roots = file_tree::normalize_roots(vec![a.clone(), b.clone()]);
+        assert_eq!(roots.len(), 2, "別ツリーの 2 ルートは畳まれない");
+        let index = build_file_index(&roots);
 
-        // 相対パスは workspace 基準で解決する
-        let rel = "gitdir: ../../../.git/worktrees/feature\n";
-        assert_eq!(
-            parse_gitdir_file(rel, ws),
-            Some(ws.join("../../../.git/worktrees/feature"))
-        );
+        // 衝突する rel は両方ともルート名付きラベルになる
+        let mains: Vec<&IndexedFile> =
+            index.iter().filter(|f| f.rel == "src/main.rs").collect();
+        assert_eq!(mains.len(), 2, "両方のルートから索引される");
+        let mut labels: Vec<&str> = mains.iter().map(|f| f.label.as_str()).collect();
+        labels.sort();
+        assert_eq!(labels, ["alpha/src/main.rs", "beta/src/main.rs"]);
 
-        // gitdir 行が無い / 空なら None (通常の .git ディレクトリへフォールバックする)
-        assert_eq!(parse_gitdir_file("ref: refs/heads/main\n", ws), None);
-        assert_eq!(parse_gitdir_file("gitdir:   \n", ws), None);
-        assert_eq!(parse_gitdir_file("", ws), None);
+        // 衝突しない rel はルート名を付けない (単一ルート時と同じ見え方)
+        let only = index
+            .iter()
+            .find(|f| f.rel == "only_in_alpha.rs")
+            .expect("indexed");
+        assert_eq!(only.label, "only_in_alpha.rs", "曖昧でなければ素の相対パス");
+
+        // ★ 本丸: ラベルから開くと「その」ファイルの中身が読める
+        for f in &mains {
+            assert!(f.abs.is_absolute(), "索引は絶対パスを正として持つ");
+            let body = std::fs::read_to_string(&f.abs).expect("read indexed file");
+            let expected = if f.label.starts_with("alpha/") {
+                "ALPHA"
+            } else {
+                "BETA"
+            };
+            assert!(
+                body.contains(expected),
+                "{} を開くと {} 側の中身であるべき (実際: {body})",
+                f.label,
+                expected,
+            );
+        }
+
+        // あいまい検索は相対パスに対して効く (単一ルート時と同じ品質)
+        let hits: Vec<&IndexedFile> = index
+            .iter()
+            .filter(|f| fuzzy::score("srcmain", &f.rel).is_some())
+            .collect();
+        assert_eq!(hits.len(), 2, "両方が候補に出る");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 単一ルートでは索引のラベルが従来どおり素の相対パスであること (非退行)。
+    #[test]
+    fn single_root_index_labels_are_plain_relative_paths() {
+        let base = unique_temp_dir("single");
+        write(&base.join("src/main.rs"), "fn main() {}");
+        write(&base.join("README.md"), "# hi");
+
+        let roots = file_tree::normalize_roots(vec![base.clone()]);
+        let index = build_file_index(&roots);
+        let mut labels: Vec<&str> = index.iter().map(|f| f.label.as_str()).collect();
+        labels.sort();
+        assert_eq!(labels, ["README.md", "src/main.rs"]);
+        assert!(index.iter().all(|f| f.label == f.rel));
+        assert!(index.iter().all(|f| f.abs.is_absolute()));
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
-    fn git_head_path_falls_back_to_dot_git_dir() {
-        // `.git` が存在しない (=ファイルでない) 場合は従来どおり <ws>/.git/HEAD
-        let ws = Path::new("/no/such/workspace");
-        assert_eq!(git_head_path(ws), ws.join(".git").join("HEAD"));
+    fn roots_label_shortens_for_many_roots() {
+        assert_eq!(roots_label(&[]), "");
+        assert_eq!(roots_label(&[PathBuf::from("/x/alpha")]), "alpha");
+        assert_eq!(
+            roots_label(&[PathBuf::from("/x/alpha"), PathBuf::from("/y/beta")]),
+            "alpha, beta"
+        );
+        assert_eq!(
+            roots_label(&[
+                PathBuf::from("/x/alpha"),
+                PathBuf::from("/y/beta"),
+                PathBuf::from("/z/gamma"),
+                PathBuf::from("/w/delta"),
+            ]),
+            "alpha, beta (+2)"
+        );
+        assert_eq!(
+            workspace_title(&[PathBuf::from("/x/alpha")]),
+            "Zaivern Code — alpha"
+        );
     }
 
     #[test]
@@ -6722,5 +7634,177 @@ mod tests {
         assert_eq!(v.last_char, None);
         // 追跡を捨てた直後は区切りの空白も入らない
         assert!(!needs_space(v.last_char, Some('a')));
+    }
+}
+
+// ─── セッション状態マッピングと確認ゲートのテスト ───────────────────
+//
+// どちらも「間違えると実害が出る」純関数なので、ここで縛っておく。
+// - 状態マッピング: 誤った Idle 判定 = 作業中のエージェントへ文字を注入して壊す
+// - 確認ゲート:     確認なしの再起動/停止 = ユーザーの作業内容を失う
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+    use crate::coordinator::SessionState as C;
+    use crate::supervisor::SessionState as S;
+
+    fn intent(
+        action: supervisor::Intervention,
+        needs_confirmation: bool,
+    ) -> supervisor::InterventionIntent {
+        supervisor::InterventionIntent {
+            session_id: 1,
+            session_title: "テスト".into(),
+            action,
+            anomaly: supervisor::Anomaly::Stall,
+            reason: "理由".into(),
+            needs_confirmation,
+            payload: None,
+            at_ms: 0,
+        }
+    }
+
+    // ── セッション状態マッピング ──────────────────────────────
+
+    #[test]
+    fn dead_process_is_exited() {
+        // 生きていなければ、監視の見立てが何であろうと終了。
+        for sup in [None, Some(S::Working), Some(S::Idle), Some(S::Done)] {
+            assert_eq!(coordinator_state(false, false, sup), C::Exited);
+            assert_eq!(coordinator_state(false, true, sup), C::Exited);
+        }
+    }
+
+    #[test]
+    fn attention_wins_over_everything_while_running() {
+        // 承認プロンプトで止まっている相手には割り込ませない。
+        for sup in [None, Some(S::Working), Some(S::Idle)] {
+            assert_eq!(coordinator_state(true, true, sup), C::WaitingApproval);
+        }
+    }
+
+    #[test]
+    fn recent_output_is_working_and_quiet_prompt_is_idle() {
+        assert_eq!(coordinator_state(true, false, Some(S::Working)), C::Working);
+        assert_eq!(coordinator_state(true, false, Some(S::Idle)), C::Idle);
+    }
+
+    #[test]
+    fn unobserved_session_is_unknown_not_idle() {
+        // まだ一度も観測していない = 何も分からない。ここを Idle にすると
+        // 起動直後の忙しいエージェントへ文字を流し込んでしまう。
+        assert_eq!(coordinator_state(true, false, None), C::Unknown);
+    }
+
+    #[test]
+    fn ambiguous_states_map_to_unknown() {
+        // ループ / エラー多発 / 異常終了 / 完了扱いは「いま入力を受け付けられるか」
+        // が判断できない。すべて Unknown に倒す。
+        for sup in [S::Looping, S::Errored, S::Crashed, S::Done] {
+            assert_eq!(
+                coordinator_state(true, false, Some(sup)),
+                C::Unknown,
+                "{sup:?} は曖昧なので Unknown でなければならない"
+            );
+        }
+    }
+
+    #[test]
+    fn only_idle_is_deliverable_among_running_states() {
+        // 配達されうるのは待機だけ、という不変条件を coordinator 側の判定で確かめる。
+        let cases = [
+            (None, false),
+            (Some(S::Working), false),
+            (Some(S::Idle), true),
+            (Some(S::WaitingApproval), false),
+            (Some(S::Stalled), false),
+            (Some(S::Looping), false),
+            (Some(S::Errored), false),
+            (Some(S::Crashed), false),
+            (Some(S::Done), false),
+        ];
+        for (sup, want) in cases {
+            let st = coordinator_state(true, false, sup);
+            assert_eq!(
+                coordinator::deliverable(st),
+                want,
+                "sup={sup:?} → {st:?} の配達可否が想定と違う"
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_session_is_never_delivered_to() {
+        let st = coordinator_state(true, false, Some(S::Stalled));
+        assert_eq!(st, C::Stalled);
+        assert!(!coordinator::deliverable(st));
+    }
+
+    // ── 確認ゲート ──────────────────────────────────────────
+
+    #[test]
+    fn needs_confirmation_intent_never_runs_directly() {
+        // 確認フラグが立っていたら、どの操作であろうと確認ダイアログ行き。
+        for action in [
+            supervisor::Intervention::Observe,
+            supervisor::Intervention::Notify,
+            supervisor::Intervention::AutoAnswer,
+            supervisor::Intervention::Nudge,
+            supervisor::Intervention::Restart,
+            supervisor::Intervention::Halt,
+        ] {
+            assert_eq!(
+                route_intent(&intent(action, true)),
+                IntentRoute::Confirm,
+                "{action:?} は確認が必要なのに無確認で実行されようとしている"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_intents_are_confirmed_even_without_the_flag() {
+        // 二重の歯止め: 確認フラグが落ちていても再起動・停止は無確認で走らせない。
+        for action in [
+            supervisor::Intervention::Restart,
+            supervisor::Intervention::Halt,
+        ] {
+            assert_eq!(route_intent(&intent(action, false)), IntentRoute::Confirm);
+        }
+    }
+
+    #[test]
+    fn harmless_intents_run_without_a_dialog() {
+        for action in [
+            supervisor::Intervention::Observe,
+            supervisor::Intervention::Notify,
+            supervisor::Intervention::AutoAnswer,
+            supervisor::Intervention::Nudge,
+        ] {
+            assert_eq!(route_intent(&intent(action, false)), IntentRoute::Run);
+        }
+    }
+
+    #[test]
+    fn supervisor_gate_and_app_route_agree_on_restart_and_halt() {
+        // 既定設定では再起動・停止はどの承認モードでも「要確認」。
+        // その結果を app 側のルーティングが必ず確認へ回すことまで通しで確かめる。
+        let cfg = supervisor::SupervisorConfig::default();
+        for (mode, approval) in [
+            ("ask", crate::agents::Approval::Ask),
+            ("auto", crate::agents::Approval::Auto),
+            ("agent", crate::agents::Approval::Agent),
+        ] {
+            for action in [
+                supervisor::Intervention::Restart,
+                supervisor::Intervention::Halt,
+            ] {
+                let g = supervisor::gate(action, approval, &cfg);
+                assert!(
+                    matches!(g, supervisor::GateResult::NeedConfirm(_)),
+                    "{action:?} / {mode} が既定で自動実行になっている: {g:?}"
+                );
+                assert_eq!(route_intent(&intent(action, true)), IntentRoute::Confirm);
+            }
+        }
     }
 }
