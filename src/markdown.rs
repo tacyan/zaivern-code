@@ -8,6 +8,9 @@
 //! 描画は egui の `horizontal_wrapped` + スパン単位の Label で行い、
 //! リンクは `Hyperlink` としてクリックでブラウザが開く。
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use eframe::egui::{self, Color32, FontId, RichText};
 
 use crate::highlight::Highlighter;
@@ -34,6 +37,8 @@ pub struct Span {
     pub strike: bool,
     /// Some(url) ならリンク (画像は "🖼 alt" テキストのリンクに落とす)
     pub link: Option<String>,
+    /// `![alt](url)` 由来。ローカルファイルなら実画像として描画する
+    pub image: bool,
 }
 
 fn flush(out: &mut Vec<Span>, cur: &mut String, strong: bool, em: bool, strike: bool) {
@@ -131,6 +136,7 @@ pub fn parse_inline(s: &str) -> Vec<Span> {
                     out.push(Span {
                         text: format!("🖼 {}", if alt.is_empty() { &url } else { &alt }),
                         link: Some(url.clone()),
+                        image: true,
                         ..Default::default()
                     });
                     i = ni;
@@ -281,12 +287,108 @@ pub fn append_para(para: &mut String, line: &str) {
     para.push_str(line);
 }
 
+// ─── 画像 ───────────────────────────────────────────────────────────
+
+/// プレビュー内で参照されたローカル画像のテクスチャキャッシュ。
+/// mtime をキーに含めるため、外部でファイルが差し替わると自動で再読込される。
+#[derive(Default)]
+pub struct ImageCache {
+    map: HashMap<String, (Option<std::time::SystemTime>, Option<egui::TextureHandle>)>,
+}
+
+impl ImageCache {
+    fn get(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+        let key = path.to_string_lossy().to_string();
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if let Some((cached, tex)) = self.map.get(&key) {
+            if *cached == mtime {
+                return tex.clone();
+            }
+        }
+        let tex = load_image_texture(ctx, path);
+        self.map.insert(key, (mtime, tex.clone()));
+        tex
+    }
+}
+
+/// 画像ファイルをテクスチャへ読み込む (長辺 1600px へ縮小)。
+fn load_image_texture(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > 20 * 1024 * 1024 {
+        return None;
+    }
+    let img = image::load_from_memory(&bytes).ok()?;
+    let mut rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    const MAX: u32 = 1600;
+    if w > MAX || h > MAX {
+        let scale = MAX as f32 / w.max(h) as f32;
+        let nw = ((w as f32 * scale) as u32).max(1);
+        let nh = ((h as f32 * scale) as u32).max(1);
+        rgba = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
+    }
+    let (w, h) = rgba.dimensions();
+    let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+    Some(ctx.load_texture(
+        format!("zv-md-img:{}", path.display()),
+        color,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// 画像 URL をローカルパスへ解決する。http(s) や存在しないパスは None。
+fn resolve_image(dir: Option<&Path>, url: &str) -> Option<PathBuf> {
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
+        return None;
+    }
+    let clean = url.split(['?', '#']).next().unwrap_or(url);
+    if clean.is_empty() {
+        return None;
+    }
+    let p = Path::new(clean);
+    let full = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        dir?.join(p)
+    };
+    full.is_file().then_some(full)
+}
+
 // ─── 描画 ───────────────────────────────────────────────────────────
 
+/// スパン描画に必要な文脈 (画像の基準ディレクトリとテクスチャキャッシュ)。
+pub struct RenderCtx<'a> {
+    /// 相対パス画像の基準 (通常はバッファのあるディレクトリ)
+    pub dir: Option<&'a Path>,
+    pub images: &'a mut ImageCache,
+}
+
 /// インラインスパン列をその場に描く (呼び出し側が wrap コンテナを用意する)。
-fn spans_ui(ui: &mut egui::Ui, theme: &Theme, text: &str, size: f32, strong_all: bool, color: Color32) {
+fn spans_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    text: &str,
+    size: f32,
+    strong_all: bool,
+    color: Color32,
+    rctx: &mut RenderCtx,
+) {
     for sp in parse_inline(text) {
         if let Some(url) = &sp.link {
+            // ローカル画像は実際に描画する。それ以外 (リモート/欠損) はリンク表示
+            if sp.image {
+                if let Some(path) = resolve_image(rctx.dir, url) {
+                    if let Some(tex) = rctx.images.get(ui.ctx(), &path) {
+                        let avail = ui.available_width().max(60.0);
+                        ui.add(
+                            egui::Image::new(&tex)
+                                .max_width(avail.min(tex.size_vec2().x)),
+                        )
+                        .on_hover_text(url);
+                        continue;
+                    }
+                }
+            }
             ui.hyperlink_to(RichText::new(&sp.text).size(size), url)
                 .on_hover_text(url);
             continue;
@@ -313,10 +415,18 @@ fn spans_ui(ui: &mut egui::Ui, theme: &Theme, text: &str, size: f32, strong_all:
 }
 
 /// 1行を折り返しつきで描く。
-fn line_ui(ui: &mut egui::Ui, theme: &Theme, text: &str, size: f32, strong_all: bool, color: Color32) {
+fn line_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    text: &str,
+    size: f32,
+    strong_all: bool,
+    color: Color32,
+    rctx: &mut RenderCtx,
+) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        spans_ui(ui, theme, text, size, strong_all, color);
+        spans_ui(ui, theme, text, size, strong_all, color, rctx);
     });
 }
 
@@ -349,9 +459,10 @@ fn table_cell_ui(
     strong_all: bool,
     color: Color32,
     align: TableAlign,
+    rctx: &mut RenderCtx,
 ) {
     if align == TableAlign::Left {
-        line_ui(ui, theme, text, size, strong_all, color);
+        line_ui(ui, theme, text, size, strong_all, color, rctx);
         return;
     }
     let w = ui.available_width();
@@ -360,7 +471,7 @@ fn table_cell_ui(
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.set_min_width(w);
         ui.add_space(if align == TableAlign::Right { pad } else { pad * 0.5 });
-        spans_ui(ui, theme, text, size, strong_all, color);
+        spans_ui(ui, theme, text, size, strong_all, color, rctx);
     });
 }
 
@@ -400,16 +511,25 @@ fn code_block_ui(
 }
 
 /// Markdown 全文を ui へ描画する。
-pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, text: &str) {
+/// `rctx` は画像解決用の文脈 (基準ディレクトリ + テクスチャキャッシュ)。
+pub fn render(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    hl: &Highlighter,
+    base: f32,
+    text: &str,
+    rctx: &mut RenderCtx,
+) {
     ui.spacing_mut().item_spacing.y = 6.0;
     let lines: Vec<&str> = text.lines().collect();
     let mut para = String::new();
-    let flush_para = |ui: &mut egui::Ui, para: &mut String, theme: &Theme| {
-        if !para.is_empty() {
-            line_ui(ui, theme, para, base, false, theme.text);
+    let flush_para =
+        |ui: &mut egui::Ui, para: &mut String, theme: &Theme, rctx: &mut RenderCtx| {
+            if !para.trim_end().is_empty() {
+                line_ui(ui, theme, para.trim_end(), base, false, theme.text, rctx);
+            }
             para.clear();
-        }
-    };
+        };
 
     let mut i = 0;
     while i < lines.len() {
@@ -419,7 +539,7 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
 
         // フェンスコード
         if let Some(rest) = trimmed.strip_prefix("```") {
-            flush_para(ui, &mut para, theme);
+            flush_para(ui, &mut para, theme, rctx);
             let lang_tok = rest.trim().to_string();
             let start = i + 1;
             let mut end = start;
@@ -438,10 +558,10 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
         // 見出し
         let hashes = trimmed.chars().take_while(|&c| c == '#').count();
         if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
-            flush_para(ui, &mut para, theme);
+            flush_para(ui, &mut para, theme, rctx);
             let scale = [1.85f32, 1.5, 1.28, 1.12, 1.02, 0.95][hashes - 1];
             ui.add_space(if hashes <= 2 { 8.0 } else { 4.0 });
-            line_ui(ui, theme, trimmed[hashes + 1..].trim(), base * scale, true, theme.text);
+            line_ui(ui, theme, trimmed[hashes + 1..].trim(), base * scale, true, theme.text, rctx);
             if hashes <= 2 {
                 ui.separator();
             }
@@ -451,7 +571,7 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
 
         // 水平線
         if is_hr(trimmed) {
-            flush_para(ui, &mut para, theme);
+            flush_para(ui, &mut para, theme, rctx);
             ui.separator();
             i += 1;
             continue;
@@ -459,13 +579,13 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
 
         // 引用 (連続する > 行をまとめる)
         if trimmed.starts_with('>') {
-            flush_para(ui, &mut para, theme);
+            flush_para(ui, &mut para, theme, rctx);
             while i < lines.len() && lines[i].trim_start().starts_with('>') {
                 let body = lines[i].trim_start()[1..].trim_start();
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.label(RichText::new("▍ ").color(theme.accent).size(base));
-                    spans_ui(ui, theme, body, base, false, theme.text_dim);
+                    spans_ui(ui, theme, body, base, false, theme.text_dim, rctx);
                 });
                 i += 1;
             }
@@ -476,7 +596,7 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
         if trimmed.starts_with('|')
             && lines.get(i + 1).map(|l| is_table_sep(l)).unwrap_or(false)
         {
-            flush_para(ui, &mut para, theme);
+            flush_para(ui, &mut para, theme, rctx);
             let header = split_row(trimmed);
             let aligns = table_aligns(lines[i + 1]);
             let ncols = header.len().max(1);
@@ -517,7 +637,7 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
                                     for (c, cell) in header.iter().enumerate() {
                                         table_cell_ui(
                                             ui, theme, cell, base, true, theme.text,
-                                            col_align(c),
+                                            col_align(c), rctx,
                                         );
                                     }
                                     ui.end_row();
@@ -525,7 +645,7 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
                                         for (c, cell) in row.iter().enumerate() {
                                             table_cell_ui(
                                                 ui, theme, cell, base, false, theme.text,
-                                                col_align(c),
+                                                col_align(c), rctx,
                                             );
                                         }
                                         ui.end_row();
@@ -539,7 +659,7 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
 
         // リスト
         if let Some((off, bullet)) = list_marker(trimmed) {
-            flush_para(ui, &mut para, theme);
+            flush_para(ui, &mut para, theme, rctx);
             let done = bullet == "☑";
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -547,7 +667,7 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
                 let bcol = if done { theme.ok } else { theme.accent };
                 ui.label(RichText::new(format!("{bullet} ")).color(bcol).size(base));
                 let tcol = if done { theme.text_dim } else { theme.text };
-                spans_ui(ui, theme, &trimmed[off..], base, false, tcol);
+                spans_ui(ui, theme, &trimmed[off..], base, false, tcol, rctx);
             });
             i += 1;
             continue;
@@ -555,16 +675,20 @@ pub fn render(ui: &mut egui::Ui, theme: &Theme, hl: &Highlighter, base: f32, tex
 
         // 空行 = 段落の区切り
         if trimmed.is_empty() {
-            flush_para(ui, &mut para, theme);
+            flush_para(ui, &mut para, theme, rctx);
             i += 1;
             continue;
         }
 
-        // 通常テキスト → 段落として連結
+        // 通常テキスト → 段落として連結。
+        // 行末スペース2つ (Markdown のハード改行、<br> 由来も同じ) は段落を確定する
         append_para(&mut para, trimmed);
+        if line.ends_with("  ") {
+            flush_para(ui, &mut para, theme, rctx);
+        }
         i += 1;
     }
-    flush_para(ui, &mut para, theme);
+    flush_para(ui, &mut para, theme, rctx);
 }
 
 // ─── テスト ─────────────────────────────────────────────────────────
