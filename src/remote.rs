@@ -15,7 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -37,8 +37,29 @@ pub enum Query {
     },
     /// コマンド実行 (name, 数値引数)
     Cmd(String, i64),
-    /// ワークスペース相対パスのファイルを開く
-    OpenFile(String),
+    /// ワークスペース相対パスのファイルを開く。
+    /// line が Some なら、その行 (1 始まり) へカーソルを移動する。
+    OpenFile(String, Option<usize>),
+    /// トースト通知を出す (message, level)。
+    /// level は "info" | "warn" | "error"。
+    Notify(String, String),
+    /// プラグインのパネル内容を書き換える (plugin, panel, text)。
+    /// plugin が空文字なら、その panel id を持つ最初のプラグインへ送る。
+    SetPanel {
+        plugin: String,
+        panel: String,
+        text: String,
+    },
+    /// ステータスバーへ任意の文字列を出す (空文字で消す)。
+    SetStatus(String),
+    /// エージェントの入力欄へ差し込む。
+    /// agent が空ならアクティブなエージェント、名前指定ならその名前に一致するもの。
+    /// submit=false なら Enter は送らない (送信は人の操作で行う)。
+    Prompt {
+        text: String,
+        agent: String,
+        submit: bool,
+    },
     /// タブ切替
     Tab(usize),
     /// アクティブなエージェントのターミナル画面テキスト
@@ -55,6 +76,36 @@ pub enum Query {
         id: i64,
         submit: bool,
     },
+}
+
+impl Query {
+    /// UI スレッドの応答を待たずに即座に 200 を返してよい要求か。
+    ///
+    /// macOS はウィンドウが前面に無いとイベントループごと凍結させるため、
+    /// 「UI スレッドに投げて応答を待つ」方式だと CLI から叩いたときに
+    /// 高確率でタイムアウトする (実測: 10 秒間で CPU 時間 0.01 秒)。
+    ///
+    /// 状態を返さない一方向の指示は、キューに積んだ時点で成功とみなす。
+    /// エディタが次に動いたときに必ず適用されるので取りこぼしは無い。
+    /// 逆に現在の状態を読む要求 (State/File/Files/Term) は、
+    /// 実際の値が必要なので従来どおり待つ。
+    fn is_fire_and_forget(&self) -> bool {
+        matches!(
+            self,
+            Query::Notify(..)
+                | Query::SetPanel { .. }
+                | Query::SetStatus(..)
+                | Query::Prompt { .. }
+                | Query::OpenFile(..)
+                | Query::Cmd(..)
+                | Query::TermInput(..)
+        )
+    }
+
+    /// 即答するときに返す JSON。
+    fn ack(&self) -> &'static str {
+        r#"{"ok":true,"queued":true}"#
+    }
 }
 
 /// サーバスレッド → UI スレッドへのリクエスト。UI 側は必ず respond すること。
@@ -255,7 +306,30 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
             save: json.get("save").and_then(|v| v.as_bool()).unwrap_or(false),
         },
         ("POST", "/api/cmd") => Query::Cmd(s("name"), n("arg")),
-        ("POST", "/api/open") => Query::OpenFile(s("path")),
+        ("POST", "/api/open") => Query::OpenFile(
+            s("path"),
+            json.get("line")
+                .and_then(|v| v.as_i64())
+                .filter(|l| *l > 0)
+                .map(|l| l as usize),
+        ),
+        ("POST", "/api/notify") => {
+            let level = s("level");
+            let level = if level.is_empty() { "info".into() } else { level };
+            Query::Notify(s("message"), level)
+        }
+        ("POST", "/api/panel") => Query::SetPanel {
+            plugin: s("plugin"),
+            panel: s("panel"),
+            text: s("text"),
+        },
+        ("POST", "/api/status") => Query::SetStatus(s("text")),
+        ("POST", "/api/prompt") => Query::Prompt {
+            text: s("text"),
+            agent: s("agent"),
+            // 既定は「挿入のみ」。/api/voice と同じ約束にする
+            submit: json.get("submit").and_then(|v| v.as_bool()).unwrap_or(false),
+        },
         ("POST", "/api/tab") => Query::Tab(n("index").max(0) as usize),
         ("POST", "/api/term") => {
             Query::TermInput(s("text"), json.get("raw").and_then(|v| v.as_bool()).unwrap_or(false))
@@ -269,17 +343,42 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
         _ => return respond(&mut stream, 404, "application/json", br#"{"ok":false,"error":"unknown api"}"#),
     };
 
-    // UI スレッドへ渡して応答を待つ
+    // UI スレッドへ渡す
     let (rtx, rrx) = mpsc::sync_channel::<String>(1);
+    let immediate = query.is_fire_and_forget().then(|| query.ack());
     if tx.send(Request { query, reply: rtx }).is_err() {
         return respond(&mut stream, 500, "application/json", br#"{"ok":false,"error":"app closed"}"#);
     }
-    ctx.request_repaint();
-    match rrx.recv_timeout(Duration::from_secs(3)) {
-        Ok(js) => respond(&mut stream, 200, "application/json; charset=utf-8", js.as_bytes()),
-        Err(_) => respond(&mut stream, 504, "application/json", br#"{"ok":false,"error":"timeout"}"#),
+
+    // 一方向の指示は積んだ時点で成功。UI スレッドの復帰を待たない。
+    if let Some(js) = immediate {
+        ctx.request_repaint();
+        return respond(&mut stream, 200, "application/json; charset=utf-8", js.as_bytes());
+    }
+    // UI スレッドは次のフレームでしか応答できない。ウィンドウが背面や
+    // 非表示だとフレームが来る間隔が延びるため、1 回だけ起こして待つと
+    // 取りこぼす。応答が返るまで一定間隔で起こし続ける。
+    let deadline = Instant::now() + REMOTE_TIMEOUT;
+    let reply = loop {
+        ctx.request_repaint();
+        match rrx.recv_timeout(Duration::from_millis(150)) {
+            Ok(js) => break Some(js),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    break None;
+                }
+            }
+        }
+    };
+    match reply {
+        Some(js) => respond(&mut stream, 200, "application/json; charset=utf-8", js.as_bytes()),
+        None => respond(&mut stream, 504, "application/json", br#"{"ok":false,"error":"timeout"}"#),
     }
 }
+
+/// UI スレッドの応答を待つ上限。背面ウィンドウでもフレームが 1 回は来る余裕を取る。
+const REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) {
     let status = match code {

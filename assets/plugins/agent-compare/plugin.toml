@@ -1,0 +1,55 @@
+[plugin]
+name = "agent-compare"
+version = "0.1.0"
+author = "Zaivern"
+description = "並列に進めた各ブランチの成果を並べて比べ、良かったものを取り込む"
+api = 2
+
+[[setting]]
+key = "base"
+type = "string"
+default = ""
+label = "比較元ブランチ（空なら自動判定）"
+
+[[setting]]
+key = "detail"
+type = "bool"
+default = true
+label = "ブランチごとの変更ファイル一覧も表示する"
+
+[[command]]
+id = "summary"
+title = "成果を比較"
+icon = "⚖️"
+run = 'sh "$ZV_PLUGIN_DIR/compare.sh"'
+input = "none"
+output = "new_tab"
+timeout_secs = 60
+
+[[command]]
+id = "summary_panel"
+title = "比較をパネルへ表示"
+icon = "📊"
+run = 'sh "$ZV_PLUGIN_DIR/compare.sh"'
+input = "none"
+output = "panel"
+panel = "compare"
+timeout_secs = 60
+
+[[command]]
+id = "pick"
+title = "採用して取り込む"
+icon = "🏆"
+run = 'sh "$ZV_PLUGIN_DIR/pick.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 60
+
+[[panel]]
+id = "compare"
+title = "成果比較"
+icon = "⚖️"
+run = 'sh "$ZV_PLUGIN_DIR/compare.sh"'
+refresh = "manual"
+interval_secs = 60
+format = "markdown"
