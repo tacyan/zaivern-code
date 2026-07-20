@@ -9,6 +9,7 @@ use crate::agents::{AgentManager, SessionEvent};
 use crate::cli;
 use crate::config::{self, Config};
 use crate::coordinator;
+use crate::orchestration;
 use crate::supervisor;
 use crate::editor::{disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
@@ -346,6 +347,9 @@ pub struct ZaivernApp {
     /// 停止を実行し、プロセスが本当に消えるのを待っているタスク (タスクID, セッションID)。
     stopping: Vec<(coordinator::TaskId, u64)>,
 
+    /// タスク UI・メッセージ送信・発信マーカー取り込みの状態 (`orchestration`)。
+    orch: orchestration::OrchState,
+
     /// coordinator に登録済みのセッション ID。増減の差分で登録/解除する。
     known_sessions: HashSet<u64>,
 
@@ -523,6 +527,7 @@ impl ZaivernApp {
             pending_intervention: Vec::new(),
             pending_stop: Vec::new(),
             stopping: Vec::new(),
+            orch: orchestration::OrchState::default(),
             known_sessions: HashSet::new(),
             sup_last_state: HashMap::new(),
             sup_next_at: None,
@@ -2123,6 +2128,15 @@ impl ZaivernApp {
                 self.persist_session();
             }
             Cmd::ToggleCockpit => self.cockpit = !self.cockpit,
+            // フォームは Cockpit の中で描くので、一緒に開く。
+            Cmd::NewTask => {
+                self.cockpit = true;
+                self.orch.open_task_form();
+            }
+            Cmd::SendAgentMessage => {
+                self.cockpit = true;
+                self.orch.open_msg_form();
+            }
             Cmd::ToggleMdPreview => {
                 // Cockpit ビュー中はエディタが出ていないので何もしない
                 if !self.cockpit {
@@ -3936,6 +3950,8 @@ impl ZaivernApp {
         let mut voice: Option<u64> = None;
         let mut voice_all = false;
         let mut voice_stop = false;
+        let mut orch_acts: Vec<orchestration::OrchAction> = Vec::new();
+        let orch_rows = self.orch_rows();
 
         egui::Frame::none()
             .inner_margin(egui::Margin::same(12.0))
@@ -4015,6 +4031,16 @@ impl ZaivernApp {
                     });
                 });
                 ui.add_space(8.0);
+
+                // 調停レイヤ (タスク一覧・作成・メッセージ送信)。描画は orchestration 側。
+                orch_acts = orchestration::cockpit_section(
+                    &mut self.orch,
+                    ui,
+                    &theme,
+                    self.coordinator.tasks(),
+                    &orch_rows,
+                    &orchestration::bus_status(&self.coordinator, &orch_rows),
+                );
 
                 let n = self.agents.sessions.len();
                 if n == 0 {
@@ -4225,6 +4251,20 @@ impl ZaivernApp {
         if let Some(i) = remove {
             self.agents.remove(i);
         }
+        // タスク作成 / メッセージ送信のフォームと、押されたボタンの適用。
+        orch_acts.extend(orchestration::task_form_ui(
+            &mut self.orch,
+            ctx,
+            &theme,
+            &orch_rows,
+        ));
+        orch_acts.extend(orchestration::message_form_ui(
+            &mut self.orch,
+            ctx,
+            &theme,
+            &orch_rows,
+        ));
+        self.orch_apply(orch_acts);
     }
 
     // ─── UI: editor ─────────────────────────────────────────────────
@@ -4933,6 +4973,8 @@ impl ZaivernApp {
                 ("🔍".into(), "ファイル内検索".into(), "⌘F".into(), Cmd::OpenFind),
                 ("🖥".into(), "ターミナル表示切替".into(), "⌘J".into(), Cmd::ToggleTerminal),
                 ("🎛".into(), "Cockpit 切替".into(), "⌘⇧C".into(), Cmd::ToggleCockpit),
+                ("📋".into(), "タスクを作成してエージェントに割り当て".into(), String::new(), Cmd::NewTask),
+                ("📮".into(), "エージェントへメッセージを送る".into(), String::new(), Cmd::SendAgentMessage),
                 ("👁".into(), "Markdown/HTML プレビュー切替".into(), "⌘⇧V".into(), Cmd::ToggleMdPreview),
                 ("📁".into(), "サイドバー切替".into(), "⌘B".into(), Cmd::ToggleSidebar),
                 ("🌿".into(), "Git パネルを開く".into(), String::new(), Cmd::OpenGitPanel),
@@ -6117,6 +6159,8 @@ impl ZaivernApp {
                     "sidebar" => Some(Cmd::ToggleSidebar),
                     "git" => Some(Cmd::OpenGitPanel),
                     "cockpit" => Some(Cmd::ToggleCockpit),
+                    "new_task" => Some(Cmd::NewTask),
+                    "agent_message" => Some(Cmd::SendAgentMessage),
                     "font_inc" => Some(Cmd::FontInc),
                     "font_dec" => Some(Cmd::FontDec),
                     "tree" => Some(Cmd::RefreshTree),
@@ -6274,6 +6318,7 @@ impl ZaivernApp {
         for id in gone {
             self.supervisor.forget(id);
             self.coordinator.unregister_session(id);
+            self.orch.forget(id);
             self.known_sessions.remove(&id);
             self.sup_last_state.remove(&id);
             self.typed_sup.remove(&id);
@@ -6422,9 +6467,11 @@ impl ZaivernApp {
             .collect();
 
         // 2) 注入して安全なセッションへ 1 通ずつ配達する。
+        let mut delivered_to: Vec<u64> = Vec::new();
         for d in self.coordinator.take_deliverable(&states) {
             if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == d.session) {
                 s.write_bytes(d.text.as_bytes());
+                delivered_to.push(d.session);
             }
         }
 
@@ -6441,15 +6488,13 @@ impl ZaivernApp {
         self.gate_stop_proposals();
         // 5) 実際にプロセスが消えたものだけ「停止確認済み」にする。
         self.confirm_stopped_sessions();
+        // 6) 発信マーカーの取り込みと、停止確認済みタスクの引き継ぎ。
+        self.orch_tick(&delivered_to);
     }
 
     /// 停止提案 → [`coordinator::gate_for`] → 自動承認なら即実行 / 要確認なら待ち行列へ。
     fn gate_stop_proposals(&mut self) {
-        let mode = match self.cfg.approval_mode.as_str() {
-            "auto" => coordinator::PermissionMode::Auto,
-            "agent" => coordinator::PermissionMode::Agent,
-            _ => coordinator::PermissionMode::Ask,
-        };
+        let mode = orchestration::permission_mode(&self.cfg.approval_mode);
         let task_ids: Vec<coordinator::TaskId> = self
             .coordinator
             .tasks()
@@ -6521,6 +6566,93 @@ impl ZaivernApp {
             self.coordinator.confirm_stopped(tid, now);
             self.stopping.retain(|(t, _)| *t != tid);
         }
+    }
+
+    // ─── 調停レイヤ (orchestration) への橋渡し ──────────────────────
+    //
+    // 判断も描画も `orchestration` 側に置いてある。ここにあるのは
+    // 「いまのセッションを写す」「返ってきた副作用を実行する」だけ。
+
+    /// 生きているセッションを `orchestration` 用の要約へ写す。
+    fn orch_rows(&self) -> Vec<orchestration::SessionRow> {
+        self.agents
+            .sessions
+            .iter()
+            .map(|s| orchestration::SessionRow {
+                id: s.id,
+                title: s.title.clone(),
+                running: s.running(),
+                state: coordinator_state(s.running(), s.attention, self.supervisor.state_of(s.id)),
+            })
+            .collect()
+    }
+
+    /// `orchestration` が返した副作用 (トースト・PTY への書き込み) を実行する。
+    fn orch_effects(&mut self, eff: orchestration::Effects) {
+        for (sid, text) in eff.writes {
+            if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == sid) {
+                s.write_bytes(text.as_bytes());
+            }
+        }
+        for (line, ok) in eff.toasts {
+            self.toast(line, ok);
+        }
+    }
+
+    /// UI から出てきた要求をまとめて実行する。
+    fn orch_apply(&mut self, acts: Vec<orchestration::OrchAction>) {
+        if acts.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let rows = self.orch_rows();
+        for a in acts {
+            let eff = orchestration::apply_action(&mut self.coordinator, &rows, a, now);
+            self.orch_effects(eff);
+        }
+    }
+
+    /// 毎フレーム: 発信マーカーの取り込みと、停止確認済みタスクの引き継ぎ。
+    ///
+    /// `delivered_to` は今フレームで実際に本文が入力へ入ったセッション。
+    fn orch_tick(&mut self, delivered_to: &[u64]) {
+        let now = Instant::now();
+        orchestration::note_delivered(&mut self.coordinator, delivered_to, now);
+
+        // 画面の走査は間引く。UI スレッドを塞がないため。
+        if orchestration::scan_due(&mut self.orch, now) {
+            let rows = self.orch_rows();
+            let screens: Vec<(u64, String)> = self
+                .agents
+                .sessions
+                .iter()
+                .filter(|s| s.running())
+                .map(|s| {
+                    let text = s
+                        .parser
+                        .lock()
+                        .map(|p| p.screen().contents())
+                        .unwrap_or_default();
+                    (s.id, text)
+                })
+                .collect();
+            for (id, screen) in screens {
+                let eff = orchestration::scan_outbound(
+                    &mut self.orch,
+                    &mut self.coordinator,
+                    id,
+                    &screen,
+                    &rows,
+                    now,
+                );
+                self.orch_effects(eff);
+            }
+        }
+
+        // 前任の停止が確認できたタスクだけを次の担当へ渡す。
+        let rows = self.orch_rows();
+        let eff = orchestration::redispatch_ready(&mut self.orch, &mut self.coordinator, &rows, now);
+        self.orch_effects(eff);
     }
 
     /// 介入を実際に実行する。確認が要るものは、呼び出し側で確認済みであること。

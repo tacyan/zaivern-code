@@ -21,6 +21,7 @@ mod keybinds;
 mod lsp;
 mod markdown;
 mod notify;
+mod orchestration;
 mod palette;
 mod pet;
 mod pet_bubble;

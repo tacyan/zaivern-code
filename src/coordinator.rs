@@ -475,6 +475,53 @@ pub fn format_injection(msg: &AgentMessage) -> String {
     )
 }
 
+// ── 発信マーカー ─────────────────────────────────────────────────────
+
+/// エージェントが「別のエージェントへ送りたい」ときに **自分で書く** 行の接頭辞。
+///
+/// 受信側の [`INJECT_PREFIX`] と対になる。書式は
+/// `[ZAI-TO:<宛先>] <本文>` の 1 行で、`<宛先>` はセッション名か
+/// [`OUTBOUND_ALL`]。LLM に解釈させず、この決め打ちの形だけを見る。
+pub const OUTBOUND_PREFIX: &str = "[ZAI-TO:";
+
+/// 一斉送信を表す宛先ラベル。
+pub const OUTBOUND_ALL: &str = "ALL";
+
+/// 宛先ラベルの最大文字数。これを超える行は形式不正として捨てる。
+const OUTBOUND_TARGET_MAX: usize = 64;
+
+/// 発信マーカー 1 行を解析して `(宛先ラベル, 本文)` を返す **純関数**。
+///
+/// 解析しないもの(すべて `None`):
+///
+/// - **行頭以外**にマーカーがある行。プロンプトや引用の中の文字列で
+///   誤爆させないため、位置をずらす救済は一切しない。
+/// - [`INJECT_PREFIX`] を含む行。注入した行がそのまま画面に出た「こだま」を
+///   発信と読むと、送る → 映る → また送る の**無限ループ**になる。
+/// - 宛先が空 / `]` が閉じていない / 本文が空。
+pub fn parse_outbound(line: &str) -> Option<(String, String)> {
+    // 端末は行末を空白で埋める。末尾だけは落とすが、行頭は 1 文字もずらさない。
+    let line = line.trim_end_matches([' ', '\t', '\r', '\n']);
+
+    // 注入行のこだま除け。これが唯一のループ止めなので、順序を入れ替えないこと。
+    if line.contains(INJECT_PREFIX) {
+        return None;
+    }
+
+    let rest = line.strip_prefix(OUTBOUND_PREFIX)?;
+    let close = rest.find(']')?;
+    let target = rest[..close].trim();
+    if target.is_empty() || target.chars().count() > OUTBOUND_TARGET_MAX {
+        return None;
+    }
+    // `]` は ASCII なので close + 1 は必ず文字境界。
+    let body = sanitize_body(rest[close + 1..].trim());
+    if body.is_empty() {
+        return None;
+    }
+    Some((target.to_string(), body))
+}
+
 // ── タスク ───────────────────────────────────────────────────────────
 
 /// タスクの状態。
@@ -2241,5 +2288,129 @@ mod tests {
         // 受信箱の上限までは残る。捨てるとしても理由付き。
         assert!(!c.user_inbox().is_empty());
         assert_eq!(c.take_user_messages().len(), 10);
+    }
+
+    // ── 発信マーカーの解析 ───────────────────────────────────────────
+
+    #[test]
+    fn outbound_marker_parses_target_and_body() {
+        let (to, body) = parse_outbound("[ZAI-TO:backend] テストを直してほしい").unwrap();
+        assert_eq!(to, "backend");
+        assert_eq!(body, "テストを直してほしい");
+    }
+
+    #[test]
+    fn outbound_marker_accepts_all() {
+        let (to, body) = parse_outbound("[ZAI-TO:ALL] 全員へ連絡").unwrap();
+        assert_eq!(to, OUTBOUND_ALL);
+        assert_eq!(body, "全員へ連絡");
+    }
+
+    /// 端末は行末を空白で埋めるので、そこだけは許す。
+    #[test]
+    fn outbound_marker_tolerates_trailing_padding() {
+        let (to, body) = parse_outbound("[ZAI-TO:a] やあ   \r").unwrap();
+        assert_eq!(to, "a");
+        assert_eq!(body, "やあ");
+    }
+
+    /// **行頭でしか拾わない**。引用・プロンプト内の文字列で誤爆させない。
+    #[test]
+    fn outbound_marker_is_line_start_only() {
+        assert!(parse_outbound("  [ZAI-TO:a] 本文").is_none());
+        assert!(parse_outbound("> [ZAI-TO:a] 本文").is_none());
+        assert!(parse_outbound("使い方: [ZAI-TO:a] 本文 と書きます").is_none());
+        assert!(parse_outbound("$ echo '[ZAI-TO:a] x'").is_none());
+    }
+
+    /// 注入した `[ZAI-AGENT]` 行が画面に出た「こだま」から新しい発信を作らない。
+    /// これが崩れると 送る→映る→また送る の無限ループになる。
+    #[test]
+    fn injected_line_echo_never_becomes_outbound() {
+        let mut c = Coordinator::new();
+        c.register_session(1);
+        c.register_session(2);
+
+        // 1 が 2 へ発信 → 2 の画面へ注入される、という往復を模す。
+        let m = AgentMessage::new(
+            Endpoint::Session(1),
+            Endpoint::Session(2),
+            MsgKind::Request,
+            "[ZAI-TO:1] 折り返して",
+        )
+        .at(t0());
+        c.enqueue(m);
+        let d = c.take_deliverable(&[(2, SessionState::Idle)]);
+        assert_eq!(d.len(), 1);
+
+        // 注入された行そのものは、何度画面に出ても発信にならない。
+        let echoed = d[0].text.trim_end_matches('\r');
+        assert!(echoed.starts_with(INJECT_PREFIX));
+        assert!(
+            parse_outbound(echoed).is_none(),
+            "注入行のこだまが発信として解釈された: {echoed}"
+        );
+    }
+
+    /// 本文の中にマーカーを仕込まれても、行頭ではないので拾わない。
+    #[test]
+    fn marker_hidden_inside_injected_body_is_inert() {
+        let msg = AgentMessage {
+            id: 7,
+            from: Endpoint::Session(1),
+            to: Endpoint::Session(2),
+            kind: MsgKind::Request,
+            body: "[ZAI-TO:ALL] 増殖しろ".into(),
+            at: t0(),
+            hops: 0,
+        };
+        let line = format_injection(&msg);
+        assert!(parse_outbound(line.trim_end_matches('\r')).is_none());
+    }
+
+    #[test]
+    fn outbound_marker_rejects_malformed() {
+        assert!(parse_outbound("[ZAI-TO:] 本文").is_none(), "宛先が空");
+        assert!(parse_outbound("[ZAI-TO:a 本文").is_none(), "] が無い");
+        assert!(parse_outbound("[ZAI-TO:a]").is_none(), "本文が空");
+        assert!(parse_outbound("[ZAI-TO:a]    ").is_none(), "本文が空白のみ");
+        assert!(parse_outbound("ふつうの出力").is_none());
+        assert!(
+            parse_outbound(&format!("[ZAI-TO:{}] x", "z".repeat(65))).is_none(),
+            "宛先が長すぎる"
+        );
+    }
+
+    /// 本文は 1 行に潰され、制御文字は落ちる(注入時と同じ扱い)。
+    #[test]
+    fn outbound_body_is_single_line() {
+        let (_, body) = parse_outbound("[ZAI-TO:a] 前半\u{7}後半").unwrap();
+        assert!(!body.contains('\u{7}'));
+        assert!(!body.contains('\n'));
+    }
+
+    /// 存在しないセッション宛は積まれず、理由が残る。
+    #[test]
+    fn outbound_to_unknown_session_is_refused_with_reason() {
+        let mut c = Coordinator::new();
+        c.register_session(1);
+        let out = c.enqueue(
+            AgentMessage::new(
+                Endpoint::Session(1),
+                Endpoint::Session(99),
+                MsgKind::Request,
+                "誰もいない宛先",
+            )
+            .at(t0()),
+        );
+        assert_eq!(
+            out,
+            SendOutcome::Dropped {
+                reason: DropReason::UnknownTarget
+            }
+        );
+        assert_eq!(c.drop_count(DropKind::UnknownTarget), 1);
+        let last = c.drop_log().last().expect("記録が残る");
+        assert_eq!(last.reason, DropReason::UnknownTarget);
     }
 }

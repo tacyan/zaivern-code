@@ -14,6 +14,10 @@ pub enum Cmd {
     RemoveFolder(PathBuf),
     ToggleTerminal,
     ToggleCockpit,
+    /// タスク作成フォームを開く (Cockpit も一緒に開く)
+    NewTask,
+    /// エージェントへのメッセージ送信フォームを開く
+    SendAgentMessage,
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替
     ToggleMdPreview,
     ToggleSidebar,
