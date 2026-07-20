@@ -1051,7 +1051,7 @@ mod tests {
         let spec = SpawnSpec {
             title: "pet-e2e".into(),
             preset_name: "test".into(),
-            icon: "🦀".into(),
+            icon: "🐾".into(),
             command: cmd.into(),
             cwd: std::env::temp_dir(),
             env: HashMap::new(),

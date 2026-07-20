@@ -205,7 +205,7 @@ pub const CATALOG: &[IdeSpec] = &[
     IdeSpec {
         key: "intellij",
         label: "IntelliJ IDEA",
-        icon: "🧠",
+        icon: "💡",
         bin: "idea",
         version_marker: "",
         path_markers: &["intellij", "idea.app", "/idea"],
@@ -250,7 +250,7 @@ pub const CATALOG: &[IdeSpec] = &[
     IdeSpec {
         key: "rustrover",
         label: "RustRover",
-        icon: "🦀",
+        icon: "🐾",
         bin: "rustrover",
         version_marker: "",
         path_markers: &["rustrover"],
@@ -311,7 +311,7 @@ pub const CATALOG: &[IdeSpec] = &[
     IdeSpec {
         key: "android-studio",
         label: "Android Studio",
-        icon: "🤖",
+        icon: "👾",
         bin: "studio",
         // studio --version は何も出力しない (実測)。実体パスで判定する。
         version_marker: "",

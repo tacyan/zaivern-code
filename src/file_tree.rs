@@ -228,7 +228,7 @@ impl FileTree {
                     self.start_new_file(root.clone());
                     ui.close_menu();
                 }
-                if ui.button("🗂 新規フォルダ").clicked() {
+                if ui.button("📂 新規フォルダ").clicked() {
                     self.start_new_dir(root.clone());
                     ui.close_menu();
                 }
@@ -353,7 +353,7 @@ impl FileTree {
                         self.start_new_file(e.path.clone());
                         ui.close_menu();
                     }
-                    if ui.button("🗂 新規フォルダ").clicked() {
+                    if ui.button("📂 新規フォルダ").clicked() {
                         self.start_new_dir(e.path.clone());
                         ui.close_menu();
                     }
@@ -367,7 +367,7 @@ impl FileTree {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("🤖 パスをエージェントに送信").clicked() {
+                    if ui.button("👾 パスをエージェントに送信").clicked() {
                         // マルチルート: そのパスを含むルートからの相対パスにする
                         let rel = self
                             .root_for(&e.path)
@@ -404,7 +404,7 @@ impl FileTree {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("🤖 パスをエージェントに送信").clicked() {
+                    if ui.button("👾 パスをエージェントに送信").clicked() {
                         // マルチルート: そのパスを含むルートからの相対パスにする
                         let rel = self
                             .root_for(&e.path)
@@ -564,7 +564,7 @@ mod tests {
 pub fn icon_for(name: &str) -> &'static str {
     let ext = name.rsplit('.').next().unwrap_or("");
     match ext {
-        "rs" => "🦀",
+        "rs" => "🐾",
         "md" | "markdown" => "📝",
         "toml" | "json" | "yaml" | "yml" | "ini" | "cfg" => "⚙️",
         "js" | "jsx" | "ts" | "tsx" | "mjs" => "📜",
