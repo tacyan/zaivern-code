@@ -25,6 +25,8 @@ mod sound;
 mod session;
 mod snippets;
 mod terminal;
+#[cfg(test)]
+mod test_util;
 mod theme;
 mod theme_json;
 mod voice;

@@ -181,26 +181,8 @@ fn parse_color(s: &str) -> Option<Color32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::unique_temp_dir;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// std::env::temp_dir() 配下に一意なディレクトリを自作する（HOME 非依存）。
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "zaivern-themejson-test-{}-{}-{}-{}",
-            tag,
-            std::process::id(),
-            nanos,
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).expect("create unique temp dir");
-        dir
-    }
 
     fn write_theme(dir: &Path, file: &str, body: &str) -> PathBuf {
         let p = dir.join(file);
@@ -308,7 +290,7 @@ mod tests {
 
     #[test]
     fn scan_flat_collects_json_and_strips_color_theme_suffix() {
-        let dir = unique_temp_dir("scan");
+        let dir = unique_temp_dir("zaivern-themejson-test", "scan");
         write_theme(&dir, "solarized-color-theme.json", "{}");
         write_theme(&dir, "plain.json", "{}");
         write_theme(&dir, "notes.txt", "not a theme");
@@ -340,7 +322,7 @@ mod tests {
 
     #[test]
     fn load_broken_json_returns_parse_error() {
-        let dir = unique_temp_dir("broken");
+        let dir = unique_temp_dir("zaivern-themejson-test", "broken");
         let p = write_theme(&dir, "broken.json", "{ this is not json ");
         let err = match load(&p) {
             Err(e) => e,
@@ -351,7 +333,7 @@ mod tests {
 
     #[test]
     fn load_empty_object_falls_back_to_defaults() {
-        let dir = unique_temp_dir("empty");
+        let dir = unique_temp_dir("zaivern-themejson-test", "empty");
         let p = write_theme(&dir, "empty.json", "{}");
         let t = load(&p).expect("empty object should still load");
         assert_eq!(t.bg, Color32::from_rgb(0x1e, 0x1e, 0x1e));
@@ -363,21 +345,21 @@ mod tests {
 
     #[test]
     fn load_uses_name_field_as_label() {
-        let dir = unique_temp_dir("label");
+        let dir = unique_temp_dir("zaivern-themejson-test", "label");
         let p = write_theme(&dir, "whatever.json", r#"{"name": "My Theme"}"#);
         assert_eq!(load(&p).expect("load").label, "My Theme");
     }
 
     #[test]
     fn load_falls_back_to_file_stem_without_color_theme_suffix() {
-        let dir = unique_temp_dir("stem");
+        let dir = unique_temp_dir("zaivern-themejson-test", "stem");
         let p = write_theme(&dir, "dracula-color-theme.json", "{}");
         assert_eq!(load(&p).expect("load").label, "dracula");
     }
 
     #[test]
     fn load_maps_colors_section() {
-        let dir = unique_temp_dir("colors");
+        let dir = unique_temp_dir("zaivern-themejson-test", "colors");
         let src = r##"{
             // 行コメント入り JSONC
             "name": "Mapped",
@@ -405,7 +387,7 @@ mod tests {
 
     #[test]
     fn load_uses_key_fallback_order() {
-        let dir = unique_temp_dir("fallback");
+        let dir = unique_temp_dir("zaivern-themejson-test", "fallback");
         // sideBar.background は無く activityBar.background だけある
         let src = r##"{"colors": {
             "editor.background": "#101010",
@@ -417,7 +399,7 @@ mod tests {
 
     #[test]
     fn load_ignores_unknown_keys_and_invalid_color_values() {
-        let dir = unique_temp_dir("invalid");
+        let dir = unique_temp_dir("zaivern-themejson-test", "invalid");
         let src = r##"{"colors": {
             "editor.background": "rgb(1,2,3)",
             "totally.unknown.key": "#123456",
@@ -432,7 +414,7 @@ mod tests {
 
     #[test]
     fn load_light_type_wins_over_dark_background() {
-        let dir = unique_temp_dir("light-type");
+        let dir = unique_temp_dir("zaivern-themejson-test", "light-type");
         let src = r##"{"type": "light", "colors": {"editor.background": "#000000"}}"##;
         let p = write_theme(&dir, "lt.json", src);
         let t = load(&p).expect("load");
@@ -443,14 +425,14 @@ mod tests {
 
     #[test]
     fn load_hc_light_type_is_treated_as_light() {
-        let dir = unique_temp_dir("hc-light");
+        let dir = unique_temp_dir("zaivern-themejson-test", "hc-light");
         let p = write_theme(&dir, "hc.json", r#"{"type": "hc-light"}"#);
         assert!(!load(&p).expect("load").dark);
     }
 
     #[test]
     fn load_infers_light_from_background_luminance_when_type_missing() {
-        let dir = unique_temp_dir("infer");
+        let dir = unique_temp_dir("zaivern-themejson-test", "infer");
         let src = r##"{"colors": {"editor.background": "#fafafa"}}"##;
         let p = write_theme(&dir, "infer.json", src);
         let t = load(&p).expect("load");
@@ -460,7 +442,7 @@ mod tests {
 
     #[test]
     fn load_accepts_url_like_string_in_json() {
-        let dir = unique_temp_dir("url");
+        let dir = unique_temp_dir("zaivern-themejson-test", "url");
         // 文字列内の // がコメント除去で壊されないこと（壊れると JSON 解析に失敗する）
         let src = r##"{"name": "Has URL", "homepage": "http://example.com/x", "colors": {"editor.background": "#123456"}}"##;
         let p = write_theme(&dir, "url.json", src);

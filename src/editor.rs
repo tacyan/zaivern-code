@@ -217,25 +217,7 @@ impl Editor {
 mod tests {
     use super::*;
     use crate::highlight::Highlighter;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// std::env::temp_dir() 配下に一意なディレクトリを自作する（HOME 非依存）。
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "zaivern-editor-test-{}-{}-{}-{}",
-            tag,
-            std::process::id(),
-            nanos,
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).expect("create unique temp dir");
-        dir
-    }
+    use crate::test_util::unique_temp_dir;
 
     /// 外部変更を mtime 差として確実に検知させる（同一秒内の書き換え対策）。
     fn bump_mtime(path: &Path) {
@@ -258,7 +240,7 @@ mod tests {
 
     #[test]
     fn external_change_reloads_clean_buffer() {
-        let dir = unique_temp_dir("reload");
+        let dir = unique_temp_dir("zaivern-editor-test", "reload");
         let (mut ed, path, _hl) = open_one(&dir, "a.md", "old");
 
         std::fs::write(&path, "new").expect("external write");
@@ -276,7 +258,7 @@ mod tests {
 
     #[test]
     fn external_change_keeps_dirty_buffer_and_warns_once() {
-        let dir = unique_temp_dir("conflict");
+        let dir = unique_temp_dir("zaivern-editor-test", "conflict");
         let (mut ed, path, _hl) = open_one(&dir, "a.md", "old");
         ed.buffers[0].text = "my unsaved edit".into();
 
@@ -294,7 +276,7 @@ mod tests {
 
     #[test]
     fn reopen_reloads_from_disk() {
-        let dir = unique_temp_dir("reopen");
+        let dir = unique_temp_dir("zaivern-editor-test", "reopen");
         let (mut ed, path, hl) = open_one(&dir, "a.md", "old");
 
         std::fs::write(&path, "new").expect("external write");
@@ -308,7 +290,7 @@ mod tests {
 
     #[test]
     fn identical_disk_content_syncs_without_event() {
-        let dir = unique_temp_dir("touch");
+        let dir = unique_temp_dir("zaivern-editor-test", "touch");
         let (mut ed, path, _hl) = open_one(&dir, "a.md", "same");
 
         // 内容は同じで mtime だけ変わった（touch 相当）→ イベント無し

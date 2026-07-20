@@ -354,26 +354,8 @@ fn dir_mtime(dir: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::test_util::unique_temp_dir;
     use std::time::Duration;
-
-    /// std::env::temp_dir() 配下に一意なディレクトリを自作する（HOME 非依存）。
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "zaivern-tree-test-{}-{}-{}-{}",
-            tag,
-            std::process::id(),
-            nanos,
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).expect("create unique temp dir");
-        dir
-    }
 
     /// 記録済みの mtime を過去へずらし、同一秒内の外部変更でも差が出るようにする
     /// （mtime 粒度が粗いファイルシステムでもテストを決定的にするため）。
@@ -384,7 +366,7 @@ mod tests {
 
     #[test]
     fn refresh_is_noop_without_changes() {
-        let dir = unique_temp_dir("noop");
+        let dir = unique_temp_dir("zaivern-tree-test", "noop");
         std::fs::write(dir.join("a.txt"), "x").expect("write");
         let mut t = FileTree::new(dir.clone(), false);
         assert_eq!(t.entries(&dir).len(), 1);
@@ -394,7 +376,7 @@ mod tests {
 
     #[test]
     fn refresh_detects_external_create() {
-        let dir = unique_temp_dir("create");
+        let dir = unique_temp_dir("zaivern-tree-test", "create");
         let mut t = FileTree::new(dir.clone(), false);
         assert!(t.entries(&dir).is_empty());
 
@@ -408,7 +390,7 @@ mod tests {
 
     #[test]
     fn refresh_detects_external_delete() {
-        let dir = unique_temp_dir("delete");
+        let dir = unique_temp_dir("zaivern-tree-test", "delete");
         let path = dir.join("gone.txt");
         std::fs::write(&path, "x").expect("write");
         let mut t = FileTree::new(dir.clone(), false);
