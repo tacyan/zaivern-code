@@ -1,0 +1,82 @@
+name: Release
+
+# リリース公開 (gh release create) をトリガに 5 ターゲットをビルドし、
+# ビルド済みバイナリをそのリリースに添付する。
+# 手動再実行: gh workflow run release.yml -f tag=v0.1.0
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: linux-x86_64,   runner: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  archive: tar }
+          - { label: linux-arm64,    runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar }
+          - { label: macos-arm64,    runner: macos-latest,     target: aarch64-apple-darwin,      archive: tar }
+          - { label: macos-x86_64,   runner: macos-latest,     target: x86_64-apple-darwin,       archive: tar }
+          - { label: windows-x86_64, runner: windows-latest,   target: x86_64-pc-windows-msvc,    archive: zip }
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: echo "tag=${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: startsWith(matrix.label, 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          name="zai-${{ steps.tag.outputs.tag }}-${{ matrix.label }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/zai" LICENSE README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "zai-${{ steps.tag.outputs.tag }}-${{ matrix.label }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/zai.exe", "LICENSE", "README.md" $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=(zai-*.tar.gz zai-*.zip)
+          gh release upload "${{ steps.tag.outputs.tag }}" "${files[@]}" --clobber

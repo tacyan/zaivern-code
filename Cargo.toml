@@ -26,3 +26,4 @@ qrcode = { version = "0.14", default-features = false }
 [profile.release]
 opt-level = 3
 lto = "thin"
+strip = "symbols"
