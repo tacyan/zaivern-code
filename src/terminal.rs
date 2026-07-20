@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -30,7 +30,8 @@ pub struct Session {
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
     pub parser: Arc<Mutex<vt100::Parser>>,
-    writer: Box<dyn IoWrite + Send>,
+    /// PTY への書き込み口。問い合わせへの返事を読取スレッドからも書くため共有する。
+    writer: Arc<Mutex<Box<dyn IoWrite + Send>>>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     pub exited: Arc<AtomicBool>,
@@ -62,6 +63,24 @@ pub struct Session {
     /// 入力欄の中身がずれる。ずれたことに気づけるよう印を立て、
     /// 音声側が読んだら下ろす (`take_user_typed`)。
     user_typed: bool,
+    /// DECSCUSR で指定された現在のカーソル形状(読取スレッドが書き、描画が読む)。
+    cursor_shape: Arc<AtomicU8>,
+    /// アプリが CSI ?1004h でフォーカス通知を要求しているか。
+    /// (set_focus 経由でのみ読む。app.rs から呼ばれるまでは未使用)
+    #[allow(dead_code)]
+    focus_reports: Arc<AtomicBool>,
+    /// 直近に PTY へ送ったフォーカス状態(同じ状態の連投を防ぐ)。
+    #[allow(dead_code)]
+    focus_sent: Option<bool>,
+    /// OSC 52 で受け取ったクリップボード書き込み要求。app.rs が取り出して egui に渡す。
+    #[allow(dead_code)]
+    clipboard_pending: Arc<Mutex<Option<String>>>,
+    /// OSC 10/11 の色問い合わせに返す前景/背景色 (0xRRGGBB)。
+    /// 読取スレッド側が使う。set_report_colors で上書きできる。
+    #[allow(dead_code)]
+    report_fg: Arc<AtomicU32>,
+    #[allow(dead_code)]
+    report_bg: Arc<AtomicU32>,
 }
 
 /// scan_attention の結果。
@@ -103,6 +122,418 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
     None
 }
 
+// ── 端末問い合わせへの応答 (query / response) ────────────────────────────
+//
+// vt100 は「読むだけ」の実装で、端末側から返事を書き戻さない。ところが TUI
+// アプリ(Neovim / Helix / lazygit / yazi / k9s …)は起動時にカーソル位置や
+// 端末種別を問い合わせ、**返事が来るまで待つ**。無視すると固まるか、返事の
+// 代わりに問い合わせ文字列そのものがアプリの入力バッファへ紛れ込み、ユーザー
+// には「勝手に変な文字が打たれた」ように見える。
+//
+// そこで PTY 出力を vt100 とは別に軽く走査し、該当シーケンスへ PTY へ返事を
+// 書き戻す。読み込みチャンクの途中でシーケンスが切れる(CSI 6n が "\x1b[6" と
+// "n" に分かれて届く)のが定番の落とし穴なので、未完成分は pending に持ち越す。
+
+/// カーソル形状 (DECSCUSR: CSI Ps SP q)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CursorShape {
+    /// Ps = 0,1,2 — ブロック(既定)
+    #[default]
+    Block,
+    /// Ps = 3,4 — アンダーライン
+    Underline,
+    /// Ps = 5,6 — 縦バー(Neovim / Helix の挿入モード)
+    Bar,
+}
+
+impl CursorShape {
+    fn from_ps(ps: u16) -> Self {
+        match ps {
+            3 | 4 => CursorShape::Underline,
+            5 | 6 => CursorShape::Bar,
+            // 0,1,2 と未知の値はブロック扱い(xterm と同じ挙動)
+            _ => CursorShape::Block,
+        }
+    }
+    fn to_u8(self) -> u8 {
+        match self {
+            CursorShape::Block => 0,
+            CursorShape::Underline => 1,
+            CursorShape::Bar => 2,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => CursorShape::Underline,
+            2 => CursorShape::Bar,
+            _ => CursorShape::Block,
+        }
+    }
+}
+
+/// 走査で見つかった「端末が反応すべき事柄」。
+#[derive(Debug, PartialEq, Eq)]
+pub enum TermEvent {
+    /// そのまま PTY へ書き戻す固定の返事。
+    Reply(Vec<u8>),
+    /// CSI 6n — 返事にカーソル位置が要るので呼び出し側で組み立てる。
+    CursorReport,
+    /// CSI ?6n (DECXCPR) — 同上だが返事に "?" が付く。
+    ExtCursorReport,
+    /// DECSCUSR によるカーソル形状変更。
+    CursorShape(CursorShape),
+    /// CSI ?1004h/l — フォーカス通知の要求/解除。
+    FocusReports(bool),
+    /// OSC 52 — システムクリップボードへの書き込み要求。
+    Clipboard(String),
+    /// OSC 10/11 の色問い合わせ (10=前景 / 11=背景)。
+    ColorQuery(u8),
+}
+
+/// Primary DA (CSI c) の返事。
+///
+/// `CSI ?62;1;6;9;15;22c` = VT220 相当 + 132桁(1) + 選択消去(6) + NRCS(9) +
+/// テクニカル文字(15) + **ANSIカラー(22)**。xterm-256color を名乗る端末が返す
+/// 典型値に合わせてある。22 を含めるのでアプリは色を有効にし、逆に **4(sixel)
+/// を含めない**ので yazi / ranger は画像プレビューを諦めてテキストへ落ちる
+/// (こちらは sixel を描けないため、これが正しい断り方)。
+const DA1_REPLY: &[u8] = b"\x1b[?62;1;6;9;15;22c";
+
+/// Secondary DA (CSI >c)。>0 = VT100系, 95 = ファームウェア版, 0 = ROM版。
+/// 「素性の知れた無害な端末」として扱われる値。
+const DA2_REPLY: &[u8] = b"\x1b[>0;95;0c";
+
+/// Tertiary DA (CSI =c / DECRPTUI)。ユニットIDは全ゼロ。
+const DA3_REPLY: &[u8] = b"\x1bP!|00000000\x1b\\";
+
+/// 持ち越しバッファの上限。これを超えて閉じないシーケンスは壊れているとみなす。
+const MAX_PENDING: usize = 64 * 1024;
+/// OSC 52 の base64 入力長の上限(復号前)。
+const MAX_CLIPBOARD_B64: usize = 512 * 1024;
+
+/// 1つのシーケンスを読んだ結果。
+enum SeqParse {
+    /// n バイト消費した(返事の有無に関わらず前進する)。
+    Consumed(usize),
+    /// チャンク境界で切れている。次の read と繋げて読み直す。
+    Incomplete,
+}
+
+/// PTY 出力ストリームの先読み走査器。read のたびに `scan` を呼ぶ。
+#[derive(Default)]
+pub struct QueryScanner {
+    /// チャンク境界で切れたシーケンスの断片。
+    pending: Vec<u8>,
+}
+
+impl QueryScanner {
+    /// チャンクを走査してイベント列を返す。
+    ///
+    /// vt100 へは呼び出し側が別途「全バイトをちょうど1回」流す。こちらの
+    /// pending は完全に独立したバッファなので、二重投入にはならない。
+    pub fn scan(&mut self, chunk: &[u8]) -> Vec<TermEvent> {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        let mut incomplete: Option<usize> = None;
+        while i < buf.len() {
+            if buf[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+            match parse_seq(&buf[i..], &mut out) {
+                SeqParse::Consumed(n) => i += n.max(1),
+                SeqParse::Incomplete => {
+                    incomplete = Some(i);
+                    break;
+                }
+            }
+        }
+        self.pending = match incomplete {
+            Some(s) if buf.len() - s <= MAX_PENDING => buf[s..].to_vec(),
+            // 上限超え(閉じない OSC など)は諦めて捨てる。無限に太らせない。
+            _ => Vec::new(),
+        };
+        out
+    }
+}
+
+/// buf[0] == ESC 前提で1シーケンスを読む。
+fn parse_seq(buf: &[u8], out: &mut Vec<TermEvent>) -> SeqParse {
+    if buf.len() < 2 {
+        return SeqParse::Incomplete;
+    }
+    match buf[1] {
+        b'[' => parse_csi(buf, out),
+        b']' => parse_string(buf, 2, out, on_osc),
+        b'P' => parse_string(buf, 2, out, on_dcs),
+        b'_' => parse_string(buf, 2, out, on_apc),
+        // ESC ESC は前の1つが捨てられた合図。2つ目から読み直す。
+        0x1b => SeqParse::Consumed(1),
+        // ESC = / ESC M / ESC ( B など。関心が無いので2バイト進めるだけ。
+        _ => SeqParse::Consumed(2),
+    }
+}
+
+/// CSI: ESC [ <params 0x30-0x3F> <intermediates 0x20-0x2F> <final 0x40-0x7E>
+fn parse_csi(buf: &[u8], out: &mut Vec<TermEvent>) -> SeqParse {
+    let mut i = 2;
+    while i < buf.len() && (0x30..=0x3f).contains(&buf[i]) {
+        i += 1;
+    }
+    let pend = i;
+    while i < buf.len() && (0x20..=0x2f).contains(&buf[i]) {
+        i += 1;
+    }
+    if i - 2 > 256 {
+        // 常識外に長い = 壊れている。ESC 1バイト分だけ進めて同期し直す。
+        return SeqParse::Consumed(1);
+    }
+    if i >= buf.len() {
+        return SeqParse::Incomplete;
+    }
+    let final_b = buf[i];
+    if !(0x40..=0x7e).contains(&final_b) {
+        return SeqParse::Consumed(1);
+    }
+    let params = &buf[2..pend];
+    let inter = &buf[pend..i];
+    on_csi(params, inter, final_b, out);
+    SeqParse::Consumed(i + 1)
+}
+
+fn on_csi(params: &[u8], inter: &[u8], final_b: u8, out: &mut Vec<TermEvent>) {
+    match (final_b, inter) {
+        // ── DSR: 端末状態の問い合わせ ──
+        (b'n', b"") => match params {
+            b"6" => out.push(TermEvent::CursorReport),
+            b"5" => out.push(TermEvent::Reply(b"\x1b[0n".to_vec())),
+            b"?6" => out.push(TermEvent::ExtCursorReport),
+            _ => {}
+        },
+        // ── Device Attributes ──
+        (b'c', b"") => match params {
+            b"" | b"0" => out.push(TermEvent::Reply(DA1_REPLY.to_vec())),
+            b">" | b">0" => out.push(TermEvent::Reply(DA2_REPLY.to_vec())),
+            b"=" | b"=0" => out.push(TermEvent::Reply(DA3_REPLY.to_vec())),
+            _ => {}
+        },
+        // ── DECSCUSR: CSI Ps SP q (中間バイトが空白なのが目印) ──
+        (b'q', b" ") => {
+            let ps = parse_num(params).unwrap_or(0);
+            out.push(TermEvent::CursorShape(CursorShape::from_ps(ps)));
+        }
+        // ── XTVERSION: CSI > Ps q (中間バイト無し) ──
+        // kitty / WezTerm を名乗ると解釈できないプロトコルを送られるので、
+        // 素直に自分の名前を返して「特別扱いしないでくれ」と伝える。
+        (b'q', b"") if params.first() == Some(&b'>') => {
+            let name = format!(
+                "\x1bP>|Zaivern Code({})\x1b\\",
+                option_env!("CARGO_PKG_VERSION").unwrap_or("0")
+            );
+            out.push(TermEvent::Reply(name.into_bytes()));
+        }
+        // ── DEC プライベートモードの set/reset ──
+        (b'h', b"") | (b'l', b"") if params.first() == Some(&b'?') => {
+            let set = final_b == b'h';
+            for p in params[1..].split(|c| *c == b';') {
+                if p == b"1004" {
+                    out.push(TermEvent::FocusReports(set));
+                }
+            }
+        }
+        // ── kitty キーボードプロトコル問い合わせ (CSI ?u) ──
+        // ここで `CSI ?0u` などを返すと「対応している」と誤解され、以後 kitty
+        // 形式のキー入力を期待されてしまう(こちらは生成できない)。仕様どおり
+        // 黙って捨てるのが正しい断り方で、アプリは直後に必ず送ってくる DA1 の
+        // 返事(上で応答済み)で「非対応」と判定して従来のキー入力へ落ちる。
+        (b'u', b"?") => {}
+        _ => {}
+    }
+}
+
+/// 先頭の10進数を読む(空なら None)。
+fn parse_num(s: &[u8]) -> Option<u16> {
+    let mut n: u32 = 0;
+    let mut any = false;
+    for &c in s {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        any = true;
+        n = n.saturating_mul(10).saturating_add((c - b'0') as u32);
+    }
+    if any {
+        Some(n.min(u16::MAX as u32) as u16)
+    } else {
+        None
+    }
+}
+
+/// OSC / DCS / APC の共通形: <導入> ... (BEL | ESC \)
+fn parse_string(
+    buf: &[u8],
+    body_start: usize,
+    out: &mut Vec<TermEvent>,
+    f: fn(&[u8], &mut Vec<TermEvent>),
+) -> SeqParse {
+    let mut j = body_start;
+    while j < buf.len() {
+        match buf[j] {
+            0x07 => {
+                f(&buf[body_start..j], out);
+                return SeqParse::Consumed(j + 1);
+            }
+            0x1b => {
+                if j + 1 >= buf.len() {
+                    return SeqParse::Incomplete;
+                }
+                if buf[j + 1] == b'\\' {
+                    f(&buf[body_start..j], out);
+                    return SeqParse::Consumed(j + 2);
+                }
+                // ST 以外の ESC = 文字列シーケンスの中断。その ESC から読み直す。
+                return SeqParse::Consumed(j);
+            }
+            _ => j += 1,
+        }
+    }
+    SeqParse::Incomplete
+}
+
+fn on_osc(body: &[u8], out: &mut Vec<TermEvent>) {
+    let (ps, rest) = match body.iter().position(|c| *c == b';') {
+        Some(k) => (&body[..k], &body[k + 1..]),
+        None => (body, &body[body.len()..]),
+    };
+    match ps {
+        // OSC 52: クリップボード。"52;<選択先>;<base64>"
+        b"52" => {
+            let data = match rest.iter().position(|c| *c == b';') {
+                Some(k) => &rest[k + 1..],
+                None => return,
+            };
+            // "?" は読み出し要求。端末の中身を勝手に渡すのは危険なので断る。
+            if data == b"?" || data.is_empty() {
+                return;
+            }
+            if data.len() > MAX_CLIPBOARD_B64 {
+                return;
+            }
+            if let Some(bytes) = base64_decode(data) {
+                if let Ok(s) = String::from_utf8(bytes) {
+                    out.push(TermEvent::Clipboard(s));
+                }
+            }
+        }
+        // OSC 10/11: 前景色/背景色の問い合わせ。Neovim が 'background' の
+        // 自動判定に使う。無視すると返事待ちの分だけ起動が遅れる。
+        b"10" | b"11" if rest.first() == Some(&b'?') => {
+            let n = if ps == b"10" { 10 } else { 11 };
+            out.push(TermEvent::ColorQuery(n));
+        }
+        _ => {}
+    }
+}
+
+fn on_dcs(body: &[u8], out: &mut Vec<TermEvent>) {
+    // XTGETTCAP: DCS + q <cap を16進にしたもの> ST
+    // 対応していないので「失敗」形式 DCS 0 + r <要求内容> ST を返す。黙って
+    // いると問い合わせ側が固まる。
+    if body.starts_with(b"+q") {
+        let mut r = Vec::with_capacity(body.len() + 8);
+        r.extend_from_slice(b"\x1bP0+r");
+        r.extend_from_slice(&body[2..]);
+        r.extend_from_slice(b"\x1b\\");
+        out.push(TermEvent::Reply(r));
+    }
+}
+
+fn on_apc(body: &[u8], out: &mut Vec<TermEvent>) {
+    // kitty グラフィックスプロトコルの打診: ESC _ G <key=value,...>;<payload> ESC \
+    // 画像は描けないのでエラー応答で明確に断る。黙っていると yazi などが
+    // タイムアウトまで固まる(調査で最も危険とされたケース)。
+    if body.first() != Some(&b'G') {
+        return;
+    }
+    let ctrl = match body.iter().position(|c| *c == b';') {
+        Some(k) => &body[1..k],
+        None => &body[1..],
+    };
+    let mut id: &[u8] = b"0";
+    for kv in ctrl.split(|c| *c == b',') {
+        if let Some(v) = kv.strip_prefix(b"i=") {
+            id = v;
+        }
+        // q=2 は「応答不要」。仕様どおり黙る。
+        if kv == b"q=2" {
+            return;
+        }
+    }
+    let mut r = Vec::with_capacity(id.len() + 24);
+    r.extend_from_slice(b"\x1b_Gi=");
+    r.extend_from_slice(id);
+    r.extend_from_slice(b";ENOTSUPPORTED\x1b\\");
+    out.push(TermEvent::Reply(r));
+}
+
+/// CSI 6n / CSI ?6n の返事を組み立てる。row/col は 0 始まり、返事は 1 始まり。
+pub fn cursor_report(row: u16, col: u16, ext: bool) -> Vec<u8> {
+    let q = if ext { "?" } else { "" };
+    format!("\x1b[{}{};{}R", q, row as u32 + 1, col as u32 + 1).into_bytes()
+}
+
+/// OSC 10/11 の返事。xterm と同じ 16bit/成分の rgb: 形式で返す。
+pub fn color_report(ps: u8, rgb: u32) -> Vec<u8> {
+    let (r, g, b) = ((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+    format!("\x1b]{ps};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\").into_bytes()
+}
+
+/// 標準 base64 の復号(依存追加を避けるため自前)。不正なら None。
+fn base64_decode(src: &[u8]) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    }
+    let mut out = Vec::with_capacity(src.len() / 4 * 3 + 3);
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    let mut pad = 0usize;
+    for &c in src {
+        // 長い payload は改行で折り返されて届くことがある
+        if c == b'\r' || c == b'\n' {
+            continue;
+        }
+        if c == b'=' {
+            pad += 1;
+            continue;
+        }
+        // パディングの後ろにデータが来るのは不正
+        if pad > 0 {
+            return None;
+        }
+        acc = (acc << 6) | val(c)?;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+            acc &= (1u32 << nbits) - 1;
+        }
+    }
+    // 余りが 6bit 以上 = 4文字境界に 1 文字だけ余った不正な入力
+    if pad > 2 || nbits >= 6 || acc != 0 {
+        return None;
+    }
+    Some(out)
+}
+
 impl Session {
     pub fn spawn(id: u64, spec: SpawnSpec, ctx: egui::Context) -> Result<Self, String> {
         let (rows, cols) = (30u16, 110u16);
@@ -132,17 +563,70 @@ impl Session {
             .master
             .try_clone_reader()
             .map_err(|e| e.to_string())?;
+
+        let writer: Arc<Mutex<Box<dyn IoWrite + Send>>> =
+            Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| e.to_string())?));
+        let cursor_shape = Arc::new(AtomicU8::new(CursorShape::Block.to_u8()));
+        let focus_reports = Arc::new(AtomicBool::new(false));
+        let clipboard_pending: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        // 既定はダークテーマ寄りの色。app.rs から set_report_colors で上書きできる。
+        let report_fg = Arc::new(AtomicU32::new(0xe6e6e6));
+        let report_bg = Arc::new(AtomicU32::new(0x12141a));
+
         {
             let parser = parser.clone();
             let exited = exited.clone();
             let ctx = ctx.clone();
+            let writer = writer.clone();
+            let cursor_shape = cursor_shape.clone();
+            let focus_reports = focus_reports.clone();
+            let clipboard_pending = clipboard_pending.clone();
+            let report_fg = report_fg.clone();
+            let report_bg = report_bg.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
+                let mut scanner = QueryScanner::default();
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            // 先に vt100 へ流してから走査する。CSI 6n はアプリが
+                            // 「ここまで描いた」直後に送って返事を待つものなので、
+                            // チャンクを反映し終えたカーソル位置が正解になる。
                             parser.lock().unwrap().process(&buf[..n]);
+                            let mut reply: Vec<u8> = Vec::new();
+                            for ev in scanner.scan(&buf[..n]) {
+                                match ev {
+                                    TermEvent::Reply(b) => reply.extend_from_slice(&b),
+                                    TermEvent::CursorReport | TermEvent::ExtCursorReport => {
+                                        let ext = matches!(ev, TermEvent::ExtCursorReport);
+                                        let (r, c) = {
+                                            let p = parser.lock().unwrap();
+                                            p.screen().cursor_position()
+                                        };
+                                        reply.extend_from_slice(&cursor_report(r, c, ext));
+                                    }
+                                    TermEvent::CursorShape(s) => {
+                                        cursor_shape.store(s.to_u8(), Ordering::Relaxed);
+                                    }
+                                    TermEvent::FocusReports(on) => {
+                                        focus_reports.store(on, Ordering::Relaxed);
+                                    }
+                                    TermEvent::Clipboard(s) => {
+                                        *clipboard_pending.lock().unwrap() = Some(s);
+                                    }
+                                    TermEvent::ColorQuery(ps) => {
+                                        let rgb = if ps == 10 { &report_fg } else { &report_bg }
+                                            .load(Ordering::Relaxed);
+                                        reply.extend_from_slice(&color_report(ps, rgb));
+                                    }
+                                }
+                            }
+                            if !reply.is_empty() {
+                                let mut w = writer.lock().unwrap();
+                                let _ = w.write_all(&reply);
+                                let _ = w.flush();
+                            }
                             ctx.request_repaint();
                         }
                     }
@@ -163,9 +647,12 @@ impl Session {
             });
         }
 
-        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-
-        let launched_bypass = crate::agents::command_is_bypass(&spec.command);
+        // 全自動起動の判定は 2 ルートある。フラグ型 (claude の
+        // --dangerously-skip-permissions など) と、フラグを持たない CLI の
+        // 環境変数型 (goose の GOOSE_MODE=auto / aider の AIDER_YES_ALWAYS=1)。
+        // 後者を見ないと goose / aider は Auto でも全自動YESが働かない。
+        let launched_bypass = crate::agents::command_is_bypass(&spec.command)
+            || crate::agents::env_enables_auto(&spec.command, &spec.env);
 
         Ok(Self {
             id,
@@ -194,6 +681,12 @@ impl Session {
             sel_anchor: None,
             copied_at: None,
             user_typed: false,
+            cursor_shape,
+            focus_reports,
+            focus_sent: None,
+            clipboard_pending,
+            report_fg,
+            report_bg,
         })
     }
 
@@ -206,32 +699,31 @@ impl Session {
         }
     }
 
-    fn command_head(&self) -> Option<&str> {
-        self.command.split_whitespace().next()
+    /// このセッションのコマンドに対応するカタログ定義。
+    ///
+    /// 先頭トークンの**末尾パス要素**で引くので、`/usr/local/bin/claude` や
+    /// `~/.local/bin/agy` のような絶対/相対パス起動でも正しく一致する
+    /// (以前は生の先頭トークンを文字列比較していたため、パス付きだと
+    /// 既存の claude / codex / agy でも権限機能が丸ごと効かなかった)。
+    fn spec(&self) -> Option<&'static crate::agents::AgentSpec> {
+        crate::agents::spec_for_command(&self.command)
     }
 
     /// Zaivern 側で承認モードを統一制御している CLI エージェントか。
+    /// 判定はカタログ由来なので、カタログに足した CLI は自動的に対象になる。
     pub fn is_permission_agent(&self) -> bool {
-        matches!(self.command_head(), Some("claude" | "codex" | "agy"))
+        self.spec().is_some()
     }
 
     /// 実行中セッションへ送れる権限モード切替のキー列。
+    /// 実機で確認できていない CLI では None(誤ったキーを送らない)。
     pub fn permission_switch_keys(&self) -> Option<&'static [u8]> {
-        match self.command_head()? {
-            "claude" | "agy" => Some(b"\x1b[Z"),
-            "codex" => Some(b"/permissions\r"),
-            _ => None,
-        }
+        self.spec()?.switch_keys_bytes()
     }
 
-    /// 権限モード切替ボタンの説明。
+    /// 権限モード切替ボタンの説明。未確認の CLI では None。
     pub fn permission_switch_hint(&self) -> Option<&'static str> {
-        match self.command_head()? {
-            "claude" => Some("権限モード切替 (Shift+Tab)"),
-            "agy" => Some("権限モード切替 (Shift+Tab)"),
-            "codex" => Some("権限モード切替 (/permissions)"),
-            _ => None,
-        }
+        self.spec()?.switch_hint_text()
     }
 
     /// 全自動YESの対象セッションか(bypass 権限で起動した対応 CLI のみ)。
@@ -289,8 +781,55 @@ impl Session {
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        let mut w = self.writer.lock().unwrap();
+        let _ = w.write_all(bytes);
+        let _ = w.flush();
+    }
+
+    /// アプリが DECSCUSR で指定した現在のカーソル形状。
+    ///
+    /// Neovim / Helix は挿入モードで縦バーへ切り替える。追従しないと
+    /// 「ずっとブロックのままで壊れて見える」ため描画側でこれを見る。
+    pub fn cursor_shape(&self) -> CursorShape {
+        CursorShape::from_u8(self.cursor_shape.load(Ordering::Relaxed))
+    }
+
+    /// ウィンドウのフォーカス状態を伝える。
+    ///
+    /// アプリが CSI ?1004h を出しているときだけ ESC[I / ESC[O を送る。
+    /// Neovim の FocusGained/FocusLost や lazygit の自動更新がこれを見ている。
+    /// 呼び出し側 (app.rs) が `ctx.input(|i| i.viewport().focused)` を毎フレーム
+    /// 渡す想定。状態が変わらない限り送らないので毎フレーム呼んでよい。
+    #[allow(dead_code)] // TODO(app.rs 連携): 毎フレーム呼び出しを繋ぐまで未使用
+    pub fn set_focus(&mut self, focused: bool) {
+        if !self.focus_reports.load(Ordering::Relaxed) || !self.running() {
+            return;
+        }
+        if self.focus_sent == Some(focused) {
+            return;
+        }
+        self.focus_sent = Some(focused);
+        self.write_bytes(if focused { b"\x1b[I" } else { b"\x1b[O" });
+    }
+
+    /// OSC 52 でアプリが要求したクリップボード内容を取り出す(取り出したら消える)。
+    ///
+    /// Neovim / Helix の「システムクリップボードへヤンク」がこれで届く。
+    /// 呼び出し側が `ui.output_mut(|o| o.copied_text = s)` 等へ流す想定。
+    #[allow(dead_code)] // TODO(app.rs 連携): egui のクリップボードへ流すまで未使用
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard_pending.lock().unwrap().take()
+    }
+
+    /// OSC 10/11 の色問い合わせに返す前景/背景色を設定する。
+    /// Neovim はこれで背景の明暗を判定し 'background' を決める。
+    #[allow(dead_code)] // TODO(app.rs 連携): テーマ色を渡すまで未使用
+    pub fn set_report_colors(&self, fg: egui::Color32, bg: egui::Color32) {
+        let pack = |c: egui::Color32| {
+            ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32
+        };
+        self.report_fg.store(pack(fg), Ordering::Relaxed);
+        self.report_bg.store(pack(bg), Ordering::Relaxed);
     }
 
     /// 前回聞いてから人が手で打ったか。読んだ時点で印は下ろす。
@@ -611,6 +1150,142 @@ mod tests {
         }
         assert!(approved, "承認後に子プロセスが進まなかった");
         s.kill();
+    }
+
+    // ── 権限モード判定のカタログ経由ルーティング ──────────────────────
+
+    /// 指定コマンド文字列で Session を1つ起こす。
+    /// ここで見たいのは `self.command` から引く判定だけなので、
+    /// 実際にそのバイナリが存在する必要は無い(shell が not found で終わるだけ)。
+    fn probe_session(id: u64, command: &str) -> super::Session {
+        probe_session_env(id, command, std::collections::HashMap::new())
+    }
+
+    fn probe_session_env(
+        id: u64,
+        command: &str,
+        env: std::collections::HashMap<String, String>,
+    ) -> super::Session {
+        use super::{Session, SpawnSpec};
+        Session::spawn(
+            id,
+            SpawnSpec {
+                title: "probe".into(),
+                preset_name: "probe".into(),
+                icon: "🔍".into(),
+                command: command.into(),
+                cwd: std::env::temp_dir(),
+                env,
+            },
+            eframe::egui::Context::default(),
+        )
+        .expect("PTY起動")
+    }
+
+    /// 絶対パス起動でもカタログに一致すること。
+    /// 以前は先頭トークンを生で文字列比較していたため、`/usr/local/bin/claude`
+    /// だと既存の claude / codex / agy ですら権限機能が全部死んでいた。
+    #[test]
+    fn absolute_path_command_head_resolves() {
+        let mut s = probe_session(9101, "/usr/local/bin/claude --model opus");
+        assert!(s.is_permission_agent(), "絶対パスの claude が認識されない");
+        assert_eq!(s.permission_switch_keys(), Some(&b"\x1b[Z"[..]));
+        assert_eq!(
+            s.permission_switch_hint(),
+            Some("権限モード切替 (Shift+Tab)")
+        );
+        s.kill();
+
+        // 相対パス・~ 展開前の形・サブコマンド形式も同様
+        let mut s = probe_session(9102, "~/.local/bin/agy -p");
+        assert!(s.is_permission_agent());
+        s.kill();
+        let mut s = probe_session(9103, "./node_modules/.bin/codex exec");
+        assert!(s.is_permission_agent());
+        assert_eq!(s.permission_switch_keys(), Some(&b"/permissions\r"[..]));
+        s.kill();
+    }
+
+    /// カタログに載った新しい CLI も権限エージェントとして認識される。
+    #[test]
+    fn new_catalog_agents_are_permission_agents() {
+        for (i, cmd) in ["opencode", "copilot", "amp", "goose run", "aider"]
+            .iter()
+            .enumerate()
+        {
+            let mut s = probe_session(9200 + i as u64, cmd);
+            assert!(s.is_permission_agent(), "{} が認識されない", cmd);
+            s.kill();
+        }
+        // カタログ外は従来どおり対象外
+        let mut s = probe_session(9250, "bash -lc ls");
+        assert!(!s.is_permission_agent());
+        s.kill();
+    }
+
+    /// 実機確認できていない CLI は切替キーを一切返さない。
+    /// (生きたセッションへ当て推量のキーを撃ち込まないための安全性テスト)
+    #[test]
+    fn unverified_agents_expose_no_switch_keys() {
+        for (i, cmd) in ["opencode", "goose run", "aider", "amp"].iter().enumerate() {
+            let mut s = probe_session(9300 + i as u64, cmd);
+            assert!(s.is_permission_agent(), "{}", cmd);
+            assert_eq!(s.permission_switch_keys(), None, "{}", cmd);
+            assert_eq!(s.permission_switch_hint(), None, "{}", cmd);
+            s.kill();
+        }
+    }
+
+    /// 安全性: Ask モードでは、どの CLI でも自動YESにならない。
+    #[test]
+    fn auto_yes_is_false_under_ask_for_new_agents() {
+        use crate::agents::{apply_approval, Approval};
+        for (i, bin) in ["opencode", "copilot", "amp", "claude", "codex", "goose"]
+            .iter()
+            .enumerate()
+        {
+            let cmd = apply_approval(bin, Approval::Ask);
+            let mut s = probe_session(9400 + i as u64, &cmd);
+            assert!(
+                !s.auto_yes(),
+                "Ask モードなのに自動YESが有効: {} -> {}",
+                bin,
+                cmd
+            );
+            s.kill();
+        }
+    }
+
+    /// Auto モードなら新しい CLI でも自動YESの対象になる(gap #3 の本体)。
+    #[test]
+    fn auto_yes_is_true_under_auto_for_new_agents() {
+        use crate::agents::{apply_approval, Approval};
+        for (i, bin) in ["opencode", "copilot", "amp", "mimo"].iter().enumerate() {
+            let cmd = apply_approval(bin, Approval::Auto);
+            let mut s = probe_session(9500 + i as u64, &cmd);
+            assert!(s.auto_yes(), "Auto モードで自動YESが働かない: {}", cmd);
+            s.kill();
+        }
+    }
+
+    /// 環境変数型 (goose / aider) の Auto も自動YESの対象になる。
+    /// フラグを持たないので `command_is_bypass` だけでは拾えない経路。
+    #[test]
+    fn auto_yes_follows_auto_env_for_flagless_agents() {
+        use crate::agents::{merged_env, Approval};
+        use std::collections::HashMap;
+        let empty = HashMap::new();
+        for (i, bin) in ["goose", "aider"].iter().enumerate() {
+            let auto = merged_env(bin, Approval::Auto, &empty);
+            let mut s = probe_session_env(9600 + i as u64, bin, auto);
+            assert!(s.auto_yes(), "{} の Auto が自動YESにならない", bin);
+            s.kill();
+
+            let ask = merged_env(bin, Approval::Ask, &empty);
+            let mut s = probe_session_env(9610 + i as u64, bin, ask);
+            assert!(!s.auto_yes(), "{} の Ask が自動YESになっている", bin);
+            s.kill();
+        }
     }
 }
 
@@ -1127,14 +1802,36 @@ pub fn draw(
         );
 
         if session.scroll == 0 && !screen.hide_cursor() {
-            if focused {
-                painter.rect_filled(cursor_rect, 1.0, theme.accent.gamma_multiply(0.55));
+            // DECSCUSR の指定に合わせて形を変える(バー=挿入モード等)。
+            // 点滅は目が疲れるうえ再描画が増えるので形だけ再現する。
+            let shape = session.cursor_shape();
+            let thin_w = (cell_w * 0.18).max(1.5);
+            let thin_h = (cell_h * 0.14).max(1.5);
+            let shape_rect = match shape {
+                CursorShape::Block => cursor_rect,
+                CursorShape::Underline => egui::Rect::from_min_max(
+                    egui::pos2(cursor_rect.min.x, cursor_rect.max.y - thin_h),
+                    cursor_rect.max,
+                ),
+                CursorShape::Bar => egui::Rect::from_min_max(
+                    cursor_rect.min,
+                    egui::pos2(cursor_rect.min.x + thin_w, cursor_rect.max.y),
+                ),
+            };
+            if shape == CursorShape::Block {
+                if focused {
+                    painter.rect_filled(cursor_rect, 1.0, theme.accent.gamma_multiply(0.55));
+                } else {
+                    painter.rect_stroke(
+                        cursor_rect,
+                        1.0,
+                        egui::Stroke::new(1.0_f32, theme.accent.gamma_multiply(0.7)),
+                    );
+                }
             } else {
-                painter.rect_stroke(
-                    cursor_rect,
-                    1.0,
-                    egui::Stroke::new(1.0_f32, theme.accent.gamma_multiply(0.7)),
-                );
+                // 細い形は薄いと見えないので、非フォーカス時も塗りで描く
+                let a = if focused { 1.0 } else { 0.5 };
+                painter.rect_filled(shape_rect, 1.0, theme.accent.gamma_multiply(a));
             }
         }
 
@@ -1265,4 +1962,430 @@ pub fn draw(
     }
 
     response
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    /// 走査してイベント列を得る(1チャンク版)。
+    fn scan1(input: &[u8]) -> Vec<TermEvent> {
+        QueryScanner::default().scan(input)
+    }
+
+    /// Reply イベントのバイト列を全部つなげる。
+    fn replies(evs: &[TermEvent]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for e in evs {
+            if let TermEvent::Reply(b) = e {
+                v.extend_from_slice(b);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn dsr_cursor_position_is_one_based() {
+        assert_eq!(scan1(b"\x1b[6n"), vec![TermEvent::CursorReport]);
+        // 0始まりの (0,0) は 1始まりの 1;1
+        assert_eq!(cursor_report(0, 0, false), b"\x1b[1;1R".to_vec());
+        assert_eq!(cursor_report(11, 4, false), b"\x1b[12;5R".to_vec());
+        // DECXCPR は "?" 付き
+        assert_eq!(scan1(b"\x1b[?6n"), vec![TermEvent::ExtCursorReport]);
+        assert_eq!(cursor_report(11, 4, true), b"\x1b[?12;5R".to_vec());
+    }
+
+    #[test]
+    fn dsr_device_status_replies_ok() {
+        assert_eq!(replies(&scan1(b"\x1b[5n")), b"\x1b[0n".to_vec());
+    }
+
+    #[test]
+    fn primary_da_reports_color_but_not_sixel() {
+        let r = replies(&scan1(b"\x1b[c"));
+        assert_eq!(r, b"\x1b[?62;1;6;9;15;22c".to_vec());
+        // CSI 0c も同じ
+        assert_eq!(replies(&scan1(b"\x1b[0c")), r);
+        let s = String::from_utf8(r).unwrap();
+        assert!(s.contains(";22c"), "ANSIカラー(22)を申告する");
+        assert!(!s.contains(";4;"), "sixel(4)は申告しない");
+    }
+
+    #[test]
+    fn secondary_and_tertiary_da() {
+        assert_eq!(replies(&scan1(b"\x1b[>c")), b"\x1b[>0;95;0c".to_vec());
+        assert_eq!(replies(&scan1(b"\x1b[>0c")), b"\x1b[>0;95;0c".to_vec());
+        assert_eq!(replies(&scan1(b"\x1b[=c")), b"\x1bP!|00000000\x1b\\".to_vec());
+    }
+
+    #[test]
+    fn xtversion_answers_with_our_own_name() {
+        let r = String::from_utf8(replies(&scan1(b"\x1b[>0q"))).unwrap();
+        assert!(r.starts_with("\x1bP>|Zaivern Code("), "got {r:?}");
+        assert!(r.ends_with("\x1b\\"));
+        // kitty / WezTerm を名乗らない = 特殊プロトコルを送られない
+        assert!(!r.contains("kitty") && !r.contains("WezTerm"));
+    }
+
+    #[test]
+    fn xtgettcap_answers_unsupported_form() {
+        // DCS + q 544e ST ("TN" を16進で)
+        let r = replies(&scan1(b"\x1bP+q544e\x1b\\"));
+        assert_eq!(r, b"\x1bP0+r544e\x1b\\".to_vec());
+    }
+
+    #[test]
+    fn kitty_keyboard_query_is_declined_silently() {
+        // 返事をすると「対応している」と誤解されるので何も返さない
+        assert_eq!(scan1(b"\x1b[?u"), vec![]);
+        // ただし直後の DA1 にはちゃんと答える(アプリはこれで非対応と判定する)
+        assert_eq!(
+            replies(&scan1(b"\x1b[?u\x1b[c")),
+            b"\x1b[?62;1;6;9;15;22c".to_vec()
+        );
+    }
+
+    #[test]
+    fn kitty_graphics_probe_gets_an_error_reply() {
+        let r = replies(&scan1(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"));
+        assert_eq!(r, b"\x1b_Gi=31;ENOTSUPPORTED\x1b\\".to_vec());
+        // q=2 (応答不要) のときは黙る
+        assert_eq!(replies(&scan1(b"\x1b_Gi=7,q=2,a=q;AA\x1b\\")), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn decscusr_all_ps_values() {
+        use CursorShape::*;
+        let cases: &[(&[u8], CursorShape)] = &[
+            (b"\x1b[ q", Block),      // 引数省略 = 既定
+            (b"\x1b[0 q", Block),
+            (b"\x1b[1 q", Block),     // 点滅ブロック
+            (b"\x1b[2 q", Block),     // 固定ブロック
+            (b"\x1b[3 q", Underline), // 点滅アンダーライン
+            (b"\x1b[4 q", Underline),
+            (b"\x1b[5 q", Bar),       // 点滅バー (nvim/helix の挿入モード)
+            (b"\x1b[6 q", Bar),
+            (b"\x1b[9 q", Block),     // 未知の値はブロックへ倒す
+        ];
+        for (seq, want) in cases {
+            assert_eq!(
+                scan1(seq),
+                vec![TermEvent::CursorShape(*want)],
+                "seq={:?}",
+                String::from_utf8_lossy(seq)
+            );
+        }
+        // 中間バイトの空白が無い CSI 6 q は DECSCUSR ではない(誤検出しない)
+        assert_eq!(scan1(b"\x1b[6q"), vec![]);
+    }
+
+    #[test]
+    fn focus_mode_set_and_reset() {
+        assert_eq!(scan1(b"\x1b[?1004h"), vec![TermEvent::FocusReports(true)]);
+        assert_eq!(scan1(b"\x1b[?1004l"), vec![TermEvent::FocusReports(false)]);
+        // 他のモードとまとめて指定されても拾う
+        assert_eq!(
+            scan1(b"\x1b[?1049;1004;2004h"),
+            vec![TermEvent::FocusReports(true)]
+        );
+        // 別モードだけなら何も起きない
+        assert_eq!(scan1(b"\x1b[?1049h"), vec![]);
+    }
+
+    // ── チャンク境界で切れたシーケンス(この実装の一番の勘所) ──
+
+    #[test]
+    fn query_split_across_two_reads() {
+        let mut s = QueryScanner::default();
+        // "\x1b[6" までで read が返り、続きは次の read で来る
+        assert_eq!(s.scan(b"hello\x1b[6"), vec![]);
+        assert_eq!(s.scan(b"n"), vec![TermEvent::CursorReport]);
+    }
+
+    #[test]
+    fn query_split_at_every_possible_offset() {
+        // どこで切れても必ず1回だけ検出されること
+        let seq = b"abc\x1b[6n\x1b[c\x1b[6 qdef";
+        for cut in 0..=seq.len() {
+            let mut s = QueryScanner::default();
+            let mut evs = s.scan(&seq[..cut]);
+            evs.extend(s.scan(&seq[cut..]));
+            assert_eq!(
+                evs,
+                vec![
+                    TermEvent::CursorReport,
+                    TermEvent::Reply(DA1_REPLY.to_vec()),
+                    TermEvent::CursorShape(CursorShape::Bar),
+                ],
+                "cut={cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc_and_dcs_split_across_reads() {
+        let seq = b"\x1b]52;c;aGk=\x07\x1bP+q544e\x1b\\";
+        for cut in 0..=seq.len() {
+            let mut s = QueryScanner::default();
+            let mut evs = s.scan(&seq[..cut]);
+            evs.extend(s.scan(&seq[cut..]));
+            assert_eq!(
+                evs,
+                vec![
+                    TermEvent::Clipboard("hi".into()),
+                    TermEvent::Reply(b"\x1bP0+r544e\x1b\\".to_vec()),
+                ],
+                "cut={cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_one_byte_at_a_time() {
+        // 極端な例: 1バイトずつ届いても取りこぼさない
+        let seq = b"\x1b[6n\x1b[?1004h\x1b[5 q";
+        let mut s = QueryScanner::default();
+        let mut evs = Vec::new();
+        for b in seq {
+            evs.extend(s.scan(&[*b]));
+        }
+        assert_eq!(
+            evs,
+            vec![
+                TermEvent::CursorReport,
+                TermEvent::FocusReports(true),
+                TermEvent::CursorShape(CursorShape::Bar),
+            ]
+        );
+    }
+
+    // ── OSC 52 / base64 ──
+
+    #[test]
+    fn osc52_decodes_all_padding_variants() {
+        // 余り0 / 余り2文字(==) / 余り3文字(=) の3パターン
+        let cases: &[(&[u8], &str)] = &[
+            (b"\x1b]52;c;YWJjZGVm\x07", "abcdef"),     // 6byte, パディング無し
+            (b"\x1b]52;c;YQ==\x07", "a"),              // "=="
+            (b"\x1b]52;c;YWI=\x07", "ab"),             // "="
+            (b"\x1b]52;c;\x07", ""),                   // 空(何も起きない, 下で確認)
+        ];
+        for (seq, want) in &cases[..3] {
+            assert_eq!(scan1(seq), vec![TermEvent::Clipboard((*want).into())]);
+        }
+        assert_eq!(scan1(cases[3].0), vec![]);
+        // ST 終端でも同じ
+        assert_eq!(
+            scan1(b"\x1b]52;c;YWJj\x1b\\"),
+            vec![TermEvent::Clipboard("abc".into())]
+        );
+        // 日本語 (UTF-8) も通る
+        assert_eq!(
+            scan1(b"\x1b]52;c;44GC44GE\x07"),
+            vec![TermEvent::Clipboard("あい".into())]
+        );
+        // 折り返された base64
+        assert_eq!(
+            scan1(b"\x1b]52;c;YWJj\r\nZGVm\x07"),
+            vec![TermEvent::Clipboard("abcdef".into())]
+        );
+    }
+
+    #[test]
+    fn osc52_read_request_is_refused() {
+        // "?" は端末の中身を読み出す要求。勝手に渡さない。
+        assert_eq!(scan1(b"\x1b]52;c;?\x07"), vec![]);
+    }
+
+    #[test]
+    fn osc52_malformed_payloads_are_dropped() {
+        for bad in [
+            &b"\x1b]52;c;YWJ!\x07"[..],   // 不正な文字
+            &b"\x1b]52;c;YWJjZ\x07"[..],  // 4文字境界に1文字余る
+            &b"\x1b]52;c;=YWJj\x07"[..],  // パディングの後にデータ
+            &b"\x1b]52;c;YQ===\x07"[..],  // パディング過剰
+            &b"\x1b]52;c;/w==\x07"[..],   // 0xFF = 不正な UTF-8
+        ] {
+            assert_eq!(scan1(bad), vec![], "bad={:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn osc52_oversized_payload_is_dropped() {
+        let mut seq = b"\x1b]52;c;".to_vec();
+        seq.extend(std::iter::repeat(b'A').take(MAX_CLIPBOARD_B64 + 4));
+        seq.push(0x07);
+        assert_eq!(scan1(&seq), vec![]);
+    }
+
+    #[test]
+    fn unterminated_string_does_not_grow_forever() {
+        let mut s = QueryScanner::default();
+        // 終端の来ない OSC を延々流し込んでも pending は上限で捨てられる
+        s.scan(b"\x1b]52;c;");
+        for _ in 0..40 {
+            s.scan(&vec![b'A'; 4096]);
+        }
+        assert!(s.pending.len() <= MAX_PENDING);
+    }
+
+    #[test]
+    fn osc_color_queries() {
+        assert_eq!(scan1(b"\x1b]10;?\x1b\\"), vec![TermEvent::ColorQuery(10)]);
+        assert_eq!(scan1(b"\x1b]11;?\x07"), vec![TermEvent::ColorQuery(11)]);
+        assert_eq!(color_report(11, 0x12141a), b"\x1b]11;rgb:1212/1414/1a1a\x1b\\".to_vec());
+        // 色の「設定」(? が無い) には返事をしない
+        assert_eq!(scan1(b"\x1b]11;#000000\x07"), vec![]);
+    }
+
+    // ── 誤検出しないこと ──
+
+    #[test]
+    fn ordinary_output_produces_no_replies() {
+        let evs = scan1(
+            b"\x1b[1;32mgreen\x1b[0m\r\n\x1b[2J\x1b[H\x1b[?1049h\x1b[38;2;255;0;0mred\x1b[m",
+        );
+        assert_eq!(evs, vec![]);
+    }
+
+    #[test]
+    fn garbage_escapes_do_not_desync_the_scanner() {
+        // 壊れた ESC の直後の正しい問い合わせを取りこぼさない
+        assert_eq!(
+            scan1(b"\x1b[\x01\x1b[6n"),
+            vec![TermEvent::CursorReport]
+        );
+        assert_eq!(scan1(b"\x1b\x1b[6n"), vec![TermEvent::CursorReport]);
+        // OSC が ST 以外の ESC で中断されても続きを読む
+        assert_eq!(scan1(b"\x1b]52;c;YQ\x1b[6n"), vec![TermEvent::CursorReport]);
+    }
+}
+
+/// 本物の PTY を相手にした結合テスト。
+///
+/// 単体テストは「走査器が正しいバイト列を作る」ことしか見ない。ここでは実際に
+/// 子プロセスを起こし、返事が**子プロセスの標準入力まで届く**ことを確かめる。
+#[cfg(test)]
+#[cfg(unix)]
+mod pty_tests {
+    use super::*;
+
+    /// スクリプトを PTY で走らせ、画面に needle が出るまで待って画面全体を返す。
+    fn run_in_pty(script: &str, secs: u64) -> String {
+        let dir = std::env::temp_dir().join(format!("zaivern-pty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("t{}.sh", script.len()));
+        std::fs::write(&path, script).unwrap();
+
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            command: format!("/bin/bash --noprofile --norc {}", path.display()),
+            cwd: dir.clone(),
+            env: HashMap::new(),
+        };
+        let mut sess = Session::spawn(1, spec, egui::Context::default()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(secs);
+        let mut screen = String::new();
+        while Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            screen = sess.parser.lock().unwrap().screen().contents();
+            if screen.contains("DONE") {
+                break;
+            }
+        }
+        sess.kill();
+        let _ = std::fs::remove_file(&path);
+        screen
+    }
+
+    /// CSI 6n の返事が本当に子プロセスの入力へ届くか。
+    /// ESC は見やすいよう '^' へ置換して表示している。
+    #[test]
+    fn child_receives_cursor_position_reply() {
+        let out = run_in_pty(
+            r#"
+stty raw -echo min 0 time 30
+printf '\033[6n'
+sleep 1
+R=$(dd bs=1 count=32 2>/dev/null | tr '\033' '^')
+stty sane
+printf '\r\nCPR<%s>\r\nDONE\r\n' "$R"
+"#,
+            15,
+        );
+        assert!(out.contains("CPR<"), "画面: {out}");
+        // ESC [ <row> ; <col> R が返っていること
+        let body = out.split("CPR<").nth(1).unwrap().split('>').next().unwrap();
+        assert!(body.starts_with("^["), "CPR の返事が来ていない: {body:?}");
+        assert!(body.ends_with('R'), "CPR の終端が R でない: {body:?}");
+        let nums = &body[2..body.len() - 1];
+        let (row, col) = nums.split_once(';').expect("row;col 形式であること");
+        assert!(row.parse::<u16>().unwrap() >= 1, "行は1始まり: {body:?}");
+        assert!(col.parse::<u16>().unwrap() >= 1, "列は1始まり: {body:?}");
+    }
+
+    /// Primary DA の返事が子プロセスへ届くか。
+    #[test]
+    fn child_receives_primary_da_reply() {
+        let out = run_in_pty(
+            r#"
+stty raw -echo min 0 time 30
+printf '\033[c'
+sleep 1
+R=$(dd bs=1 count=32 2>/dev/null | tr '\033' '^')
+stty sane
+printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
+"#,
+            15,
+        );
+        let body = out.split("DA<").nth(1).unwrap().split('>').next().unwrap();
+        assert_eq!(body, "^[?62;1;6;9;15;22c", "画面: {out}");
+    }
+
+    /// DECSCUSR がセッションのカーソル形状へ反映されるか(描画側が見る値)。
+    #[test]
+    fn decscusr_updates_session_cursor_shape() {
+        let dir = std::env::temp_dir();
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            // バー → アンダーライン → ブロック と切り替える
+            command: "printf '\\033[6 q'; sleep 5".into(),
+            cwd: dir,
+            env: HashMap::new(),
+        };
+        let mut sess = Session::spawn(2, spec, egui::Context::default()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while Instant::now() < deadline && sess.cursor_shape() != CursorShape::Bar {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(sess.cursor_shape(), CursorShape::Bar);
+        sess.kill();
+    }
+
+    /// OSC 52 が take_clipboard で取り出せるか。
+    #[test]
+    fn osc52_reaches_take_clipboard() {
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            // "yanked" を base64 で
+            command: "printf '\\033]52;c;eWFua2Vk\\007'; sleep 5".into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+        };
+        let mut sess = Session::spawn(3, spec, egui::Context::default()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut got = None;
+        while Instant::now() < deadline && got.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            got = sess.take_clipboard();
+        }
+        assert_eq!(got.as_deref(), Some("yanked"));
+        sess.kill();
+    }
 }
