@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
 
+use crate::agent_picker::{self, AgentPicker};
 use crate::agents::{AgentManager, SessionEvent};
 use crate::cli;
 use crate::config::{self, Config};
@@ -311,6 +312,9 @@ pub struct ZaivernApp {
     gh_rx: mpsc::Receiver<github::GhOutcome>,
     /// 「➕ 新規プラグイン」ダイアログの入力名(None = 閉)
     new_plugin_name: Option<String>,
+    /// カタログ全 CLI から選んでプリセットを足すピッカー。
+    /// PATH 検出はこの中のワーカースレッドが行う(UI スレッドは待たない)。
+    agent_picker: AgentPicker,
     /// 言語ID → スニペット一覧(拡張の snippet ファイル由来)
     snippets_by_lang: HashMap<String, Vec<Snippet>>,
     /// 言語ID → 起動済み LSP クライアント
@@ -596,6 +600,7 @@ impl ZaivernApp {
             gh_tx,
             gh_rx,
             new_plugin_name: None,
+            agent_picker: AgentPicker::default(),
             snippets_by_lang: HashMap::new(),
             lsp: HashMap::new(),
             lsp_opened: HashSet::new(),
@@ -1555,6 +1560,45 @@ impl ZaivernApp {
         }
     }
 
+    /// 「エージェントを追加」ピッカーを描き、選ばれたものを cfg.agents へ足す。
+    ///
+    /// ピッカー側は操作を返すだけにして、設定への反映はここで行う
+    /// (パネルのクロージャの中から self を可変で触らないための定石)。
+    fn agent_picker_ui(&mut self, ctx: &egui::Context) {
+        // 検出結果の取り込みはウィンドウの開閉に関係なく毎フレーム行う。
+        self.agent_picker.poll();
+        let theme = self.theme.clone();
+        let action = agent_picker::ui(&mut self.agent_picker, ctx, &theme, &self.cfg.agents);
+        match action {
+            Some(agent_picker::PickerAction::Reprobe) => {
+                self.agent_picker.probe(ctx);
+                self.toast("⟳ PATH を調べています…", true);
+            }
+            Some(agent_picker::PickerAction::Add { preset, spec }) => {
+                let installed = self.agent_picker.is_installed(spec.bin);
+                let name = preset.name.clone();
+                match config::append_agent_preset(&preset) {
+                    Ok(()) => {
+                        // 先に config.toml へ書けたものだけをメモリへ足す。
+                        // (書けていないのに一覧へ出すと、再起動で消えて混乱する)
+                        self.cfg.agents.push(preset);
+                        if installed {
+                            self.toast(format!("➕ {name} を追加しました"), true);
+                        } else {
+                            // 起動しても必ず失敗するので、黙って足したように見せない。
+                            self.toast_warn(format!(
+                                "➕ {name} を追加しましたが、{} は未インストールです → {}",
+                                spec.bin, spec.install
+                            ));
+                        }
+                    }
+                    Err(e) => self.toast(format!("設定に書けませんでした: {e}"), false),
+                }
+            }
+            None => {}
+        }
+    }
+
     /// 保存直後に on_save フック (整形など) を持つプラグインコマンドを起動する。
     fn run_on_save_hooks(&mut self, buf_index: usize, ctx: &egui::Context) {
         let b = &self.editor.buffers[buf_index];
@@ -2037,7 +2081,7 @@ impl ZaivernApp {
             self.agents.panel_open = true;
             self.toast("アクティブなエージェントに送信しました", true);
         } else {
-            self.toast("エージェントセッションがありません（🤖 Agent＋ から起動）", false);
+            self.toast("エージェントセッションがありません（👾 Agent＋ から起動）", false);
         }
     }
 
@@ -2256,7 +2300,7 @@ impl ZaivernApp {
                     } else {
                         self.set_roots(next, ctx);
                         self.toast(
-                            format!("🗂 {} をワークスペースから削除しました", dir.display()),
+                            format!("📂 {} をワークスペースから削除しました", dir.display()),
                             true,
                         );
                     }
@@ -2278,6 +2322,7 @@ impl ZaivernApp {
                 self.persist_session();
             }
             Cmd::ToggleCockpit => self.cockpit = !self.cockpit,
+            Cmd::OpenAgentPicker => self.agent_picker.open(ctx),
             // フォームは Cockpit の中で描くので、一緒に開く。
             Cmd::NewTask => {
                 self.cockpit = true;
@@ -2412,7 +2457,7 @@ impl ZaivernApp {
                         "⚡ 既定=全自動: 以後起動する Claude/Codex/Antigravity はすべて自動承認 (bypass フラグ付与)",
                     ),
                     "agent" => self.toast(
-                        "🤖 既定=Agent優先: 以後は各プリセットのコマンドどおりに起動します（(全自動) プリセットのみ自動承認）",
+                        "👾 既定=Agent優先: 以後は各プリセットのコマンドどおりに起動します（(全自動) プリセットのみ自動承認）",
                         true,
                     ),
                     _ => self.toast(
@@ -2429,9 +2474,9 @@ impl ZaivernApp {
                 config::save_state(&self.cfg);
                 self.toast(
                     if self.cfg.show_pet {
-                        "🦀 ペットを表示しました"
+                        "🐾 ペットを表示しました"
                     } else {
-                        "🦀 ペットを隠しました（🐾 で再表示）"
+                        "🐾 ペットを隠しました（🐾 で再表示）"
                     },
                     true,
                 );
@@ -2474,7 +2519,7 @@ impl ZaivernApp {
                 self.cfg.pet_x = None;
                 self.cfg.pet_y = None;
                 config::save_state(&self.cfg);
-                self.toast("🦀 ペットの位置を既定(右下)に戻しました", true);
+                self.toast("🐾 ペットの位置を既定(右下)に戻しました", true);
             }
             Cmd::SetPetVariant(name) => {
                 self.cfg.pet_variant = name;
@@ -3036,7 +3081,7 @@ impl ZaivernApp {
                         ui.menu_button("🐾", |ui| {
                             let show = self.cfg.show_pet;
                             if ui
-                                .selectable_label(show, if show { "🦀 表示中" } else { "🦀 非表示" })
+                                .selectable_label(show, if show { "🐾 表示中" } else { "🐾 非表示" })
                                 .clicked()
                             {
                                 cmds.push(Cmd::TogglePet);
@@ -3051,7 +3096,7 @@ impl ZaivernApp {
                                 cmds.push(Cmd::ResetPetImage);
                                 ui.close_menu();
                             }
-                            if ui.button("🦀 位置を右下に戻す").clicked() {
+                            if ui.button("🐾 位置を右下に戻す").clicked() {
                                 cmds.push(Cmd::ResetPetPos);
                                 ui.close_menu();
                             }
@@ -3060,7 +3105,7 @@ impl ZaivernApp {
                             ui.menu_button("🎭 見た目", |ui| {
                                 for (v, label) in [
                                     (pet::PetVariant::Blocky, "🟦 ブロック"),
-                                    (pet::PetVariant::Crab, "🦀 カニ"),
+                                    (pet::PetVariant::Crab, "🐾 カニ"),
                                     (pet::PetVariant::Cat, "🐱 ネコ"),
                                     (pet::PetVariant::Cloud, "☁ クラウド"),
                                 ] {
@@ -3100,7 +3145,7 @@ impl ZaivernApp {
                             }
                         })
                         .response
-                        .on_hover_text("デスクトップペット 🦀 の表示・画像変更");
+                        .on_hover_text("デスクトップペット 🐾 の表示・画像変更");
 
                         // 実行中の対応エージェントを一括で権限モード切替
                         if self.agents.running_count() > 0
@@ -3124,7 +3169,7 @@ impl ZaivernApp {
                                 true,
                             ),
                             "agent" => (
-                                RichText::new("🤖 既定:Agent優先").color(theme.ok).strong(),
+                                RichText::new("👾 既定:Agent優先").color(theme.ok).strong(),
                                 "ask",
                                 true,
                             ),
@@ -3136,7 +3181,7 @@ impl ZaivernApp {
                                 "「次に起動する」エージェント (Claude/Codex/Antigravity) の既定権限モード\n\
                                  🛡 承認 = 操作のたびに許可が必要（bypass フラグを除去）\n\
                                  ⚡ 全自動 = すべて自動YES（bypass フラグを付与）\n\
-                                 🤖 Agent優先 = Agent欄プリセットのコマンドどおり（(全自動) プリセットのみ自動YES）\n\
+                                 👾 Agent優先 = Agent欄プリセットのコマンドどおり（(全自動) プリセットのみ自動YES）\n\
                                  クリックで 承認→全自動→Agent優先 の順に切替\n\
                                  ※ 実行中のセッションは各行の 🛡 ボタンで個別に切替できます",
                             )
@@ -3151,12 +3196,21 @@ impl ZaivernApp {
                             cmds.push(Cmd::ToggleCockpit);
                         }
 
-                        ui.menu_button("🤖 Agent ＋", |ui| {
+                        ui.menu_button("👾 Agent ＋", |ui| {
                             for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
                                 if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
                                     cmds.push(Cmd::NewAgent(i));
                                     ui.close_menu();
                                 }
+                            }
+                            ui.separator();
+                            if ui
+                                .button("➕ エージェントを追加…")
+                                .on_hover_text("対応している CLI エージェントの一覧から選んで足す")
+                                .clicked()
+                            {
+                                cmds.push(Cmd::OpenAgentPicker);
+                                ui.close_menu();
                             }
                         })
                         .response
@@ -3234,7 +3288,7 @@ impl ZaivernApp {
                         }
                         let (ap_text, ap_color) = match self.cfg.approval_mode.as_str() {
                             "auto" => ("⚡ 全自動", theme.warn),
-                            "agent" => ("🤖 Agent優先", theme.ok),
+                            "agent" => ("👾 Agent優先", theme.ok),
                             _ => ("🛡 承認", theme.ok),
                         };
                         ui.label(RichText::new(ap_text).size(11.5).color(ap_color));
@@ -3261,7 +3315,7 @@ impl ZaivernApp {
                         if total > 0 {
                             let r = ui.add(
                                 egui::Label::new(
-                                    RichText::new(format!("🤖 {running}/{total}"))
+                                    RichText::new(format!("👾 {running}/{total}"))
                                         .size(11.5)
                                         .color(if running > 0 {
                                             theme.ok
@@ -3328,14 +3382,31 @@ impl ZaivernApp {
             .width_range(180.0..=440.0)
             .show_animated(ctx, self.sidebar_open, |ui| {
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Files, "📁 ファイル");
-                    let agents_label = format!("🤖 Agents ({})", self.agents.sessions.len());
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Agents, agents_label);
-                    let pl_label = format!("🔌 プラグイン ({})", self.plugins.len());
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Plugins, pl_label);
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Git, "🌿 Git");
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::GitHub, "🐙 GitHub");
+                // タブは横に並べきれないので折り返す。
+                // ui.horizontal は折り返さないため、5 つのタブ(合計 500px 超)を
+                // 幅 180〜440px のサイドバーへ入れるとパネル外へはみ出し、
+                // 最後のタブだけが見えて残りが押し出される。
+                // 幅が狭いときはラベルを絵文字だけに縮め、名称はホバーで出す。
+                ui.horizontal_wrapped(|ui| {
+                    let narrow = ui.available_width() < 300.0;
+                    let n_agents = self.agents.sessions.len();
+                    let n_plugins = self.plugins.len();
+                    let tabs: [(SidebarTab, String, &str); 5] = [
+                        (SidebarTab::Files, "📁".into(), "ファイル"),
+                        (SidebarTab::Agents, format!("👾 {n_agents}"), "Agents"),
+                        (SidebarTab::Plugins, format!("🔌 {n_plugins}"), "プラグイン"),
+                        (SidebarTab::Git, "🌿".into(), "Git"),
+                        (SidebarTab::GitHub, "🐙".into(), "GitHub"),
+                    ];
+                    for (tab, short, name) in tabs {
+                        let label = if narrow {
+                            short.clone()
+                        } else {
+                            format!("{short} {name}")
+                        };
+                        ui.selectable_value(&mut self.sidebar_tab, tab, label)
+                            .on_hover_text(name);
+                    }
                 });
                 ui.separator();
 
@@ -3351,7 +3422,7 @@ impl ZaivernApp {
                                     if ui.button("⟳").on_hover_text("再読み込み").clicked() {
                                         refresh = true;
                                     }
-                                    if ui.button("🗂").on_hover_text("新規フォルダ").clicked() {
+                                    if ui.button("📂").on_hover_text("新規フォルダ").clicked() {
                                         nd_root = true;
                                     }
                                     if ui.button("➕").on_hover_text("新規ファイル").clicked() {
@@ -3906,7 +3977,7 @@ impl ZaivernApp {
                     Ok(()) => {
                         self.tree.invalidate();
                         self.toast(
-                            format!("🗂 {} を作成しました", self.rel_label(&p)),
+                            format!("📂 {} を作成しました", self.rel_label(&p)),
                             true,
                         );
                     }
@@ -4226,7 +4297,7 @@ impl ZaivernApp {
 
                 // ── 監視役 LLM (スーパーエージェント) の選択 ──────────────
                 egui::CollapsingHeader::new(
-                    RichText::new("🧠 スーパーエージェント (監視役 LLM)")
+                    RichText::new("💡 スーパーエージェント (監視役 LLM)")
                         .strong()
                         .color(theme.text),
                 )
@@ -4951,7 +5022,7 @@ impl ZaivernApp {
                 open_folder = true;
             }
             if ui
-                .add_sized([300.0, 36.0], egui::Button::new("🤖 Claude Code を起動"))
+                .add_sized([300.0, 36.0], egui::Button::new("👾 Claude Code を起動"))
                 .clicked()
             {
                 launch_claude = true;
@@ -5324,13 +5395,19 @@ impl ZaivernApp {
                 ("🔍".into(), "ファイル内検索".into(), "⌘F".into(), Cmd::OpenFind),
                 ("🖥".into(), "ターミナル表示切替".into(), "⌘J".into(), Cmd::ToggleTerminal),
                 ("🎛".into(), "Cockpit 切替".into(), "⌘⇧C".into(), Cmd::ToggleCockpit),
+                (
+                    "➕".into(),
+                    "エージェントを追加 (対応 CLI の一覧から選ぶ)".into(),
+                    String::new(),
+                    Cmd::OpenAgentPicker,
+                ),
                 ("📋".into(), "タスクを作成してエージェントに割り当て".into(), String::new(), Cmd::NewTask),
                 ("📮".into(), "エージェントへメッセージを送る".into(), String::new(), Cmd::SendAgentMessage),
                 ("👁".into(), "Markdown/HTML プレビュー切替".into(), "⌘⇧V".into(), Cmd::ToggleMdPreview),
                 ("📁".into(), "サイドバー切替".into(), "⌘B".into(), Cmd::ToggleSidebar),
                 ("🌿".into(), "Git パネルを開く".into(), String::new(), Cmd::OpenGitPanel),
                 (
-                    "🤖".into(),
+                    "👾".into(),
                     "現在のファイルをエージェントに送信 (@path)".into(),
                     String::new(),
                     Cmd::SendFileToAgent,
@@ -5355,7 +5432,7 @@ impl ZaivernApp {
                     Cmd::SetApproval("auto".into()),
                 ),
                 (
-                    "🤖".into(),
+                    "👾".into(),
                     "承認モード: Agent欄優先 (プリセットのコマンドどおり)".into(),
                     String::new(),
                     Cmd::SetApproval("agent".into()),
@@ -5381,7 +5458,7 @@ impl ZaivernApp {
                 ),
                 ("🖼".into(), "ペット画像を変更…".into(), String::new(), Cmd::SetPetImage),
                 ("↺".into(), "ペット画像を既定に戻す".into(), String::new(), Cmd::ResetPetImage),
-                ("🦀".into(), "ペット位置を右下に戻す".into(), String::new(), Cmd::ResetPetPos),
+                ("🐾".into(), "ペット位置を右下に戻す".into(), String::new(), Cmd::ResetPetPos),
                 ("➕".into(), "新規プラグインを作成…".into(), String::new(), Cmd::NewPlugin),
                 ("📦".into(), "プラグインをインストール… (.zvplug / .zip)".into(), String::new(), Cmd::InstallPlugin),
                 ("🔌".into(), "プラグインを表示".into(), String::new(), Cmd::ShowPlugins),
@@ -5431,7 +5508,7 @@ impl ZaivernApp {
             if self.roots.len() > 1 {
                 for r in &self.roots {
                     cmds.push((
-                        "🗂".into(),
+                        "📂".into(),
                         format!("フォルダをワークスペースから削除: {}", root_name(r)),
                         String::new(),
                         Cmd::RemoveFolder(r.clone()),
@@ -6822,7 +6899,7 @@ impl ZaivernApp {
         // 確認ゲートを飛ばす近道は作らない。
         let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
         for d in self.supervisor.poll_diagnoses() {
-            self.toast(format!("🧠 AI 診断: {}", d.summary), false);
+            self.toast(format!("💡 AI 診断: {}", d.summary), false);
             if let Some(it) = self.supervisor.intent_from_diagnosis(&d, approval) {
                 self.accept_intent(it, ctx, win_focused);
             }
@@ -7319,6 +7396,9 @@ impl eframe::App for ZaivernApp {
         // gh (GitHub CLI) の実行結果を GitHub パネルへ反映する
         self.process_gh_results();
 
+        // 「エージェントを追加」ピッカー (PATH 検出の結果取り込みも兼ねる)
+        self.agent_picker_ui(ctx);
+
         // フック: 起動時 (初回フレームの後に一度だけ)
         if !self.startup_hooks_done {
             self.startup_hooks_done = true;
@@ -7466,7 +7546,7 @@ impl eframe::App for ZaivernApp {
         self.voice_hud(ctx);
         self.toasts_ui(ctx);
 
-        // デスクトップペット 🦀
+        // デスクトップペット 🐾
         if self.cfg.show_pet {
             let now = Instant::now();
             let attention = self
@@ -7536,7 +7616,7 @@ impl eframe::App for ZaivernApp {
                     .map(|(i, s)| pet_bubble::BubbleItem {
                         session_idx: i,
                         key: s.id,
-                        icon: if s.icon.is_empty() { "🤖".into() } else { s.icon.clone() },
+                        icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
                         title: s.title.clone(),
                     })
                     .collect();
@@ -8550,6 +8630,52 @@ mod super_agent_tests {
         assert!(!picks.iter().any(|c| c.trim().is_empty()));
     }
 
+    /// ピッカーで足したプリセットが、そのまま監視役の候補一覧に載ること。
+    /// 「追加はできたが監視役には選べない」という中途半端な状態を防ぐ。
+    #[test]
+    fn ピッカーで足したプリセットは監視役候補に載る() {
+        for spec in crate::agents::AGENT_CATALOG {
+            let p = crate::agent_picker::plain_preset(spec);
+            let rejected = super_agent_reject_reason(&p.command).is_some();
+            assert_eq!(
+                rejected,
+                spec.headless.is_empty(),
+                "{}: 追加したプリセットの監視役可否がカタログと食い違う",
+                spec.bin
+            );
+        }
+    }
+
+    /// ピッカーで足したプリセットに、承認モードがちゃんと効くこと。
+    /// (足せても全自動/承認の切替が効かなければ、壊れた項目でしかない)
+    #[test]
+    fn ピッカーで足したプリセットに承認モードが効く() {
+        use crate::agents::{apply_approval, Approval};
+        for spec in crate::agents::AGENT_CATALOG {
+            let p = crate::agent_picker::plain_preset(spec);
+            // Auto: フラグを持つ CLI なら必ず付与される
+            let auto = apply_approval(&p.command, Approval::Auto);
+            if !spec.auto_flag.is_empty() {
+                assert!(
+                    auto.contains(spec.auto_flag),
+                    "{}: Auto にしても自動承認フラグが付かない",
+                    spec.bin
+                );
+            }
+            // Ask: 全自動プリセットからは必ずフラグが外れる
+            if let Some(a) = crate::agent_picker::auto_preset(spec) {
+                let ask = apply_approval(&a.command, Approval::Ask);
+                if !spec.auto_flag.is_empty() {
+                    assert!(
+                        !ask.contains(spec.auto_flag),
+                        "{}: Ask にしても自動承認フラグが残る",
+                        spec.bin
+                    );
+                }
+            }
+        }
+    }
+
     // ---- 自己診断ガードのセッション対応付け ----
 
     fn rows() -> Vec<(u64, bool, String)> {
@@ -8681,5 +8807,58 @@ mod super_agent_tests {
         sv.tick(&[snap(1), snap(2)], Approval::Ask);
         assert!(sv.state_of(1).is_some(), "監視役自身の状態も見立てられるべき");
         assert!(sv.state_of(2).is_some());
+    }
+}
+
+#[cfg(test)]
+mod glyph_tests {
+    /// UI で使う記号が、実際のフォント構成で描画できることを保証する。
+    ///
+    /// egui 同梱の NotoEmoji はサブセットで、macOS の Apple Color Emoji は
+    /// カラービットマップなので egui 0.29 では使えない。そのため一部の絵文字
+    /// (🤖 U+1F916 / 🦀 U+1F980 など) はどのフォントにも無く、豆腐(□)として描画される。
+    /// 見た目だけの問題に見えて、利用者にはボタンの意味が分からなくなる。
+    #[test]
+    fn ui_symbols_have_glyphs() {
+        // UI 上で意味を担っている記号だけを並べる。
+        // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
+        const UI_SYMBOLS: &str = "📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
+                                  🔍📡🖱📦🍚🌀🔷🔶🕊👷🐦🅰🌊⌘➡🔩🌙🎏🎐🐉💠";
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        ctx.run(Default::default(), |_| {});
+        let fid = egui::FontId::proportional(14.0);
+        let missing: String = ctx.fonts(|f| {
+            UI_SYMBOLS
+                .chars()
+                .filter(|c| !f.has_glyphs(&fid, &c.to_string()))
+                .collect()
+        });
+        assert!(
+            missing.is_empty(),
+            "フォントに無い記号が UI で使われている(豆腐になる): [{missing}]"
+        );
+    }
+
+    /// カタログの 29 エージェントのアイコンは「エージェントを追加」ピッカーに
+    /// そのまま並ぶ。1 つでも豆腐になると、その行だけ意味が読めなくなるので
+    /// カタログ側のアイコンも UI 記号と同じ基準で検査する。
+    #[test]
+    fn catalog_icons_have_glyphs() {
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
+        let fid = egui::FontId::proportional(14.0);
+        let missing: Vec<String> = ctx.fonts(|f| {
+            crate::agents::AGENT_CATALOG
+                .iter()
+                .filter(|s| !f.has_glyphs(&fid, s.icon))
+                .map(|s| format!("{}={}", s.bin, s.icon))
+                .collect()
+        });
+        assert!(
+            missing.is_empty(),
+            "カタログのアイコンが豆腐になる: {missing:?}"
+        );
     }
 }

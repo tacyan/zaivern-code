@@ -110,7 +110,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "claude",
         label: "Claude Code",
-        icon: "🤖",
+        icon: "👾",
         auto_flag: "--dangerously-skip-permissions",
         auto_env: &[],
         strip: &["--dangerously-skip-permissions"],
@@ -124,7 +124,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "codex",
         label: "Codex",
-        icon: "🧠",
+        icon: "💡",
         auto_flag: "--dangerously-bypass-approvals-and-sandbox",
         auto_env: &[],
         strip: &[
@@ -142,7 +142,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "grok",
         label: "Grok",
-        icon: "🛰",
+        icon: "📡",
         auto_flag: "--always-approve",
         auto_env: &[],
         strip: &["--always-approve", "--yolo"],
@@ -241,7 +241,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "agy",
         label: "Antigravity",
-        icon: "🪐",
+        icon: "🚀",
         auto_flag: "--dangerously-skip-permissions",
         auto_env: &[],
         strip: &["--dangerously-skip-permissions", "--yolo"],
@@ -255,7 +255,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "pi",
         label: "Pi",
-        icon: "🥧",
+        icon: "🔷",
         auto_flag: "-a",
         auto_env: &[],
         strip: &["-a"],
@@ -269,7 +269,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "omp",
         label: "oh-my-pi",
-        icon: "🧿",
+        icon: "🔶",
         auto_flag: "--auto-approve",
         auto_env: &[],
         strip: &["--auto-approve", "--yolo"],
@@ -283,7 +283,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "hermes",
         label: "Hermes",
-        icon: "🪽",
+        icon: "🕊",
         auto_flag: "--yolo",
         auto_env: &[],
         strip: &["--yolo"],
@@ -311,7 +311,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "goose",
         label: "Goose",
-        icon: "🪿",
+        icon: "🐦",
         auto_flag: "",
         auto_env: &[("GOOSE_MODE", "auto")],
         strip: &[],
@@ -339,7 +339,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "autohand",
         label: "Autohand",
-        icon: "🖐",
+        icon: "✋",
         auto_flag: "--unrestricted",
         auto_env: &[],
         strip: &["--unrestricted"],
@@ -353,7 +353,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "crush",
         label: "Crush",
-        icon: "🫧",
+        icon: "🌊",
         auto_flag: "",
         auto_env: &[],
         strip: &[],
@@ -367,7 +367,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "cline",
         label: "Cline",
-        icon: "🧵",
+        icon: "🔗",
         auto_flag: "--auto-approve",
         auto_env: &[],
         strip: &["--auto-approve", "--yolo"],
@@ -409,7 +409,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "droid",
         label: "Droid",
-        icon: "🤖",
+        icon: "👾",
         auto_flag: "--skip-permissions-unsafe",
         auto_env: &[],
         strip: &["--skip-permissions-unsafe"],
@@ -423,7 +423,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "kilo",
         label: "Kilo Code",
-        icon: "🧱",
+        icon: "🔩",
         auto_flag: "--auto",
         auto_env: &[],
         strip: &["--auto"],
@@ -493,7 +493,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "acli",
         label: "Rovo Dev",
-        icon: "🧩",
+        icon: "💠",
         auto_flag: "--yolo",
         auto_env: &[],
         strip: &["--yolo"],

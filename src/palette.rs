@@ -25,6 +25,8 @@ pub enum Cmd {
     OpenGitPanel,
     OpenFind,
     NewAgent(usize),
+    /// カタログ全 CLI から選んでプリセットを追加するピッカーを開く
+    OpenAgentPicker,
     FocusAgent(usize),
     RestartAgent,
     KillAgent,

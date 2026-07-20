@@ -211,7 +211,7 @@ fn default_agents() -> Vec<AgentPreset> {
         AgentPreset {
             name: "Claude Code".into(),
             command: "claude".into(),
-            icon: "🤖".into(),
+            icon: "👾".into(),
             ..Default::default()
         },
         AgentPreset {
@@ -223,7 +223,7 @@ fn default_agents() -> Vec<AgentPreset> {
         AgentPreset {
             name: "Codex".into(),
             command: "codex".into(),
-            icon: "🧠".into(),
+            icon: "💡".into(),
             ..Default::default()
         },
         AgentPreset {
@@ -334,10 +334,10 @@ show_hidden_files = true
 #   "auto"  = すべて自動YES（各CLIの bypass フラグを自動付与）
 #   "agent" = Agent欄優先（プリセットのコマンドに書かれたフラグをそのまま使う。
 #             「(全自動)」プリセットと通常プリセットを使い分けたい場合はこれ）
-# ツールバーの 🛡/⚡/🤖 ボタンでも切替できます
+# ツールバーの 🛡/⚡/👾 ボタンでも切替できます
 approval_mode = "ask"
 
-# デスクトップペット (🦀) の表示
+# デスクトップペット (🐾) の表示
 show_pet = true
 
 # ── ペットの好み設定 ──────────────
@@ -386,7 +386,7 @@ show_pet = true
 
 [[agents]]
 name = "Claude Code"
-icon = "🤖"
+icon = "👾"
 command = "claude"
 
 [[agents]]
@@ -396,7 +396,7 @@ command = "claude --dangerously-skip-permissions"
 
 [[agents]]
 name = "Codex"
-icon = "🧠"
+icon = "💡"
 command = "codex"
 
 [[agents]]
@@ -421,7 +421,7 @@ command = ""
 
 # [[agents]]
 # name = "Claude (Opus 明示)"
-# icon = "🧠"
+# icon = "💡"
 # command = "claude --model claude-opus-4-8"
 # env = { MAX_THINKING_TOKENS = "31999" }
 
@@ -630,6 +630,59 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
 /// ユーザーのコメントや並び順は保たれる (区画内のコメントは失われる)。
 pub fn save_plugins_section(cfg: &Config) -> Result<(), String> {
     save_plugins_config(&cfg.plugins)
+}
+
+/// `[[agents]]` ブロック 1 件分の TOML テキストを作る。
+///
+/// 手で組み立てずに toml クレートへ通すのは、名前やコマンドに `"` や `\` が
+/// 入っていても壊れた config.toml を書かないため。
+/// env はインラインテーブルにする。追記位置に関係なく 1 行で閉じるので、
+/// 後からさらに `[[agents]]` を足しても前のブロックに吸われる事故が起きない。
+fn render_agent_preset(p: &AgentPreset) -> String {
+    let mut s = String::from("\n[[agents]]\n");
+    let kv = |k: &str, v: &str| format!("{k} = {}\n", toml::Value::String(v.to_string()));
+    s.push_str(&kv("name", &p.name));
+    s.push_str(&kv("icon", &p.icon));
+    s.push_str(&kv("command", &p.command));
+    if let Some(cwd) = &p.cwd {
+        s.push_str(&kv("cwd", cwd));
+    }
+    if !p.env.is_empty() {
+        // 並びを固定して、書き出しを決定的にする。
+        let mut keys: Vec<&String> = p.env.keys().collect();
+        keys.sort();
+        let body: Vec<String> = keys
+            .iter()
+            .map(|k| {
+                format!(
+                    "{} = {}",
+                    toml::Value::String((*k).clone()),
+                    toml::Value::String(p.env[*k].clone())
+                )
+            })
+            .collect();
+        s.push_str(&format!("env = {{ {} }}\n", body.join(", ")));
+    }
+    s
+}
+
+/// config.toml の末尾に `[[agents]]` を 1 件書き足す。
+///
+/// 既存の行は 1 文字も触らない。カタログは「そこから足す元ネタ」であって
+/// 利用者のプリセット一覧の置き換えではないので、手書きのコメントも並び順も
+/// そのまま残さなければならない。
+pub fn append_agent_preset(preset: &AgentPreset) -> Result<(), String> {
+    let path = config_path();
+    ensure_default();
+    let mut raw = std::fs::read_to_string(&path).unwrap_or_default();
+    if !raw.is_empty() && !raw.ends_with('\n') {
+        raw.push('\n');
+    }
+    raw.push_str(&render_agent_preset(preset));
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, raw).map_err(|e| format!("config.toml を書けません: {e}"))
 }
 
 /// config.toml から `[plugins]` 区画だけを読む (GUI を起動せずに使える)。
@@ -851,6 +904,105 @@ mod tests {
             assert!(!a.name.is_empty(), "名前が空のプリセットがある");
             assert!(!a.icon.is_empty(), "{} のアイコンが空", a.name);
         }
+    }
+
+    // ---- [[agents]] の追記 ----
+
+    #[test]
+    fn rendered_agent_preset_parses_back_unchanged() {
+        let mut env = HashMap::new();
+        env.insert("GOOSE_MODE".to_string(), "auto".to_string());
+        let p = AgentPreset {
+            name: "Goose (全自動)".into(),
+            command: "goose".into(),
+            icon: "⚡".into(),
+            cwd: None,
+            env,
+        };
+        let text = render_agent_preset(&p);
+        let back: Config = toml::from_str(&text).expect("追記したブロックは読み戻せる");
+        let a = back.agents.last().expect("agents が空");
+        assert_eq!(a.name, p.name);
+        assert_eq!(a.command, p.command);
+        assert_eq!(a.icon, p.icon);
+        assert_eq!(a.env.get("GOOSE_MODE").map(String::as_str), Some("auto"));
+    }
+
+    #[test]
+    fn rendered_agent_preset_escapes_quotes_and_backslashes() {
+        let p = AgentPreset {
+            name: "変な \"名前\"".into(),
+            command: r#"foo --msg "a\b""#.into(),
+            icon: "👾".into(),
+            cwd: Some(r"C:\tmp".into()),
+            env: HashMap::new(),
+        };
+        let text = render_agent_preset(&p);
+        let back: Config = toml::from_str(&text).expect("引用符が入っても壊れない");
+        let a = back.agents.last().unwrap();
+        assert_eq!(a.name, p.name);
+        assert_eq!(a.command, p.command);
+        assert_eq!(a.cwd.as_deref(), Some(r"C:\tmp"));
+    }
+
+    #[test]
+    fn appending_a_preset_keeps_every_existing_one() {
+        // 既存の config.toml を書き換えない ＝ 追記後も元のプリセットが全部残る。
+        let base = DEFAULT_CONFIG.to_string();
+        let before: Config = toml::from_str(&base).unwrap();
+        let p = AgentPreset {
+            name: "Qwen Code".into(),
+            command: "qwen".into(),
+            icon: "🐉".into(),
+            cwd: None,
+            env: HashMap::new(),
+        };
+        let after_text = format!("{base}{}", render_agent_preset(&p));
+        // 元の本文は 1 文字も変わっていない
+        assert!(after_text.starts_with(&base));
+        let after: Config = toml::from_str(&after_text).expect("追記後もパースできる");
+        assert_eq!(after.agents.len(), before.agents.len() + 1);
+        for (i, a) in before.agents.iter().enumerate() {
+            assert_eq!(after.agents[i].name, a.name, "既存プリセットの順序が崩れた");
+            assert_eq!(after.agents[i].command, a.command);
+        }
+        assert_eq!(after.agents.last().unwrap().command, "qwen");
+    }
+
+    #[test]
+    fn appending_twice_does_not_swallow_the_previous_block() {
+        // env をインラインテーブルにしている理由の回帰テスト。
+        // ヘッダ形式 ([agents.env]) だと、次に足した [[agents]] との間で
+        // 所属が壊れやすい。
+        let mut env = HashMap::new();
+        env.insert("A".to_string(), "1".to_string());
+        let first = AgentPreset {
+            name: "First".into(),
+            command: "goose".into(),
+            icon: "🐦".into(),
+            cwd: None,
+            env,
+        };
+        let second = AgentPreset {
+            name: "Second".into(),
+            command: "qwen".into(),
+            icon: "🐉".into(),
+            cwd: None,
+            env: HashMap::new(),
+        };
+        let text = format!(
+            "{}{}{}",
+            DEFAULT_CONFIG,
+            render_agent_preset(&first),
+            render_agent_preset(&second)
+        );
+        let cfg: Config = toml::from_str(&text).expect("2 回追記してもパースできる");
+        let names: Vec<&str> = cfg.agents.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"First") && names.contains(&"Second"));
+        let f = cfg.agents.iter().find(|a| a.name == "First").unwrap();
+        assert_eq!(f.env.get("A").map(String::as_str), Some("1"));
+        let s = cfg.agents.iter().find(|a| a.name == "Second").unwrap();
+        assert!(s.env.is_empty(), "後続ブロックが前の env を吸い込んだ");
     }
 
     // ---- DEFAULT_CONFIG テンプレート ----
