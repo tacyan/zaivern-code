@@ -83,29 +83,11 @@ fn save_to(dir: &Path, workspace: &Path, data: &SessionData) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// std::env::temp_dir() 配下に一意なディレクトリを自作する（HOME 非依存）。
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "zaivern-session-test-{}-{}-{}-{}",
-            tag,
-            std::process::id(),
-            nanos,
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).expect("create unique temp dir");
-        dir
-    }
+    use crate::test_util::unique_temp_dir;
 
     #[test]
     fn roundtrip_save_then_load() {
-        let dir = unique_temp_dir("roundtrip");
+        let dir = unique_temp_dir("zaivern-session-test", "roundtrip");
         let workspace = dir.join("my-workspace");
         let data = SessionData {
             open_files: vec![
@@ -132,7 +114,7 @@ mod tests {
 
     #[test]
     fn roundtrip_with_active_none() {
-        let dir = unique_temp_dir("none-active");
+        let dir = unique_temp_dir("zaivern-session-test", "none-active");
         let workspace = dir.join("ws-no-active");
         let data = SessionData {
             open_files: vec![],
@@ -155,7 +137,7 @@ mod tests {
 
     #[test]
     fn roundtrip_with_japanese_paths() {
-        let dir = unique_temp_dir("japanese");
+        let dir = unique_temp_dir("zaivern-session-test", "japanese");
         // ワークスペース自体も日本語パス（実在させて canonicalize 経路も通す）
         let workspace = dir.join("日本語ワークスペース").join("プロジェクト");
         std::fs::create_dir_all(&workspace).expect("create japanese workspace dir");
@@ -181,7 +163,7 @@ mod tests {
 
     #[test]
     fn load_missing_session_returns_none() {
-        let dir = unique_temp_dir("missing");
+        let dir = unique_temp_dir("zaivern-session-test", "missing");
         let workspace = dir.join("never-saved-workspace");
 
         assert!(load_from(&dir, &workspace).is_none());
@@ -194,7 +176,7 @@ mod tests {
 
     #[test]
     fn sidebar_tab_roundtrips_and_old_file_without_it_still_loads() {
-        let dir = unique_temp_dir("sidebar-tab");
+        let dir = unique_temp_dir("zaivern-session-test", "sidebar-tab");
         let workspace = dir.join("ws-tab");
 
         let data = SessionData {
@@ -232,7 +214,7 @@ mod tests {
 
     #[test]
     fn save_overwrites_existing_session() {
-        let dir = unique_temp_dir("overwrite");
+        let dir = unique_temp_dir("zaivern-session-test", "overwrite");
         let workspace = dir.join("ws");
 
         let first = SessionData {

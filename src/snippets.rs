@@ -2,6 +2,8 @@
 //! (name -> { prefix, body, description }) and expands snippet templates
 //! ($1, ${1:default}, ${1|a,b|}, $TM_FILENAME, escapes) for Tab expansion.
 
+use crate::jsonc::strip_jsonc;
+
 #[derive(Clone)]
 pub struct Snippet {
     // name / description / language は VS Code スニペット形式の忠実な写しで、
@@ -19,87 +21,6 @@ pub struct Snippet {
 // ---------------------------------------------------------------------------
 // JSONC-tolerant parsing of snippet files
 // ---------------------------------------------------------------------------
-
-/// Strip // and /* */ comments (string-aware) and trailing commas so that
-/// JSONC snippet files survive serde_json.
-fn strip_jsonc(src: &str) -> String {
-    let cs: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    let mut in_str = false;
-    while i < cs.len() {
-        let c = cs[i];
-        if in_str {
-            out.push(c);
-            if c == '\\' && i + 1 < cs.len() {
-                out.push(cs[i + 1]);
-                i += 2;
-                continue;
-            }
-            if c == '"' {
-                in_str = false;
-            }
-            i += 1;
-        } else if c == '"' {
-            in_str = true;
-            out.push(c);
-            i += 1;
-        } else if c == '/' && i + 1 < cs.len() && cs[i + 1] == '/' {
-            while i < cs.len() && cs[i] != '\n' {
-                i += 1;
-            }
-        } else if c == '/' && i + 1 < cs.len() && cs[i + 1] == '*' {
-            i += 2;
-            while i + 1 < cs.len() && !(cs[i] == '*' && cs[i + 1] == '/') {
-                i += 1;
-            }
-            i = (i + 2).min(cs.len());
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    // Second pass: drop trailing commas before } or ]
-    let cs: Vec<char> = out.chars().collect();
-    let mut out2 = String::with_capacity(out.len());
-    let mut in_str = false;
-    let mut i = 0;
-    while i < cs.len() {
-        let c = cs[i];
-        if in_str {
-            out2.push(c);
-            if c == '\\' && i + 1 < cs.len() {
-                out2.push(cs[i + 1]);
-                i += 2;
-                continue;
-            }
-            if c == '"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            in_str = true;
-            out2.push(c);
-            i += 1;
-            continue;
-        }
-        if c == ',' {
-            let mut j = i + 1;
-            while j < cs.len() && cs[j].is_whitespace() {
-                j += 1;
-            }
-            if j < cs.len() && (cs[j] == '}' || cs[j] == ']') {
-                i += 1;
-                continue;
-            }
-        }
-        out2.push(c);
-        i += 1;
-    }
-    out2
-}
 
 fn json_str_or_join(v: &serde_json::Value, sep: &str) -> Option<String> {
     match v {

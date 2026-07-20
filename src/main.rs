@@ -11,6 +11,7 @@ mod git;
 mod git_panel;
 mod highlight;
 mod html;
+mod jsonc;
 mod keybinds;
 mod lsp;
 mod markdown;
@@ -25,6 +26,8 @@ mod sound;
 mod session;
 mod snippets;
 mod terminal;
+#[cfg(test)]
+mod test_util;
 mod theme;
 mod theme_json;
 mod voice;
