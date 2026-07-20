@@ -1,0 +1,79 @@
+# === Rust / Cargo ===
+/target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock はバイナリクレートのためコミットする（ignore しない）
+
+# === Coverage / Profiling / Bench ===
+*.profraw
+*.profdata
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+flamegraph.svg
+perf.data*
+mutants.out*/
+
+# === Zaivern 実行時生成物 ===
+# 本体の設定・セッション・プラグインは ~/.zaivern/ 配下（リポジトリ外）。
+# .zaivern.toml はワークスペース単位の個人上書き設定（テーマ・フォント等）なので ignore。
+# チームで共有したい場合はこの行を削除して git add -f すること。
+.zaivern.toml
+
+# === Claude Code / AI agents ===
+.claude/settings.local.json
+.fable5/
+.aider*
+.cursor/
+.codex/
+.windsurf/
+
+# === Editors / IDEs ===
+# ディレクトリごと ( .vscode/ ) 除外すると !再包含 が効かないため /* で中身を除外する
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.iml
+.zed/
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+
+# === macOS ===
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# === Windows ===
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# === Linux ===
+.directory
+.Trash-*
+
+# === Logs / Temp ===
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+.cache/
+
+# === Secrets / Env ===
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# === App artifacts (拡張の実体は ~/.zaivern/ 配下。手元に落とした .vsix はコミットしない) ===
+*.vsix
