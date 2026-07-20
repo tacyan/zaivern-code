@@ -10,6 +10,7 @@ mod fuzzy;
 mod git;
 mod highlight;
 mod html;
+mod jsonc;
 mod keybinds;
 mod lsp;
 mod markdown;
