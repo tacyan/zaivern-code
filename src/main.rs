@@ -2,6 +2,7 @@
 
 mod agents;
 mod app;
+mod cli;
 mod config;
 mod editor;
 mod editor_ops;
@@ -51,6 +52,13 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // サブコマンド指定なら CLI として処理して終了する。
+    // 引数なし / ディレクトリ指定のときは None が返り、そのまま GUI を起動する。
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = cli::try_run_cli(&args) {
+        std::process::exit(code);
+    }
+
     let workspace = std::env::args()
         .nth(1)
         .map(std::path::PathBuf::from)

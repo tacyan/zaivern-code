@@ -1,0 +1,75 @@
+[plugin]
+name = "remote-host"
+version = "0.1.0"
+author = "Zaivern"
+description = "手元の作業を ssh 越しのマシンへ持って行き、向こうで動かして結果を持ち帰る"
+api = 2
+
+[[setting]]
+key = "host"
+type = "string"
+default = ""
+label = "リモートホスト（user@example.com）"
+
+[[setting]]
+key = "path"
+type = "string"
+default = ""
+label = "リモート作業ディレクトリ（空なら ~/ワークスペース名）"
+
+[[setting]]
+key = "ssh_opts"
+type = "string"
+default = ""
+label = "ssh の追加オプション（例: -p 2222）"
+
+[[setting]]
+key = "agent_cmd"
+type = "string"
+default = ""
+label = "リモートのエージェント起動コマンド（空なら使用中のエージェント）"
+
+[[command]]
+id = "exec"
+title = "リモートで実行"
+icon = "🖥"
+run = 'sh "$ZV_PLUGIN_DIR/exec.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "push"
+title = "リモートへ同期"
+icon = "⬆️"
+run = 'sh "$ZV_PLUGIN_DIR/push.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "pull"
+title = "リモートから取得"
+icon = "⬇️"
+run = 'sh "$ZV_PLUGIN_DIR/pull.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "agent"
+title = "リモートでエージェント起動"
+icon = "🛰"
+run = 'sh "$ZV_PLUGIN_DIR/agent.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "worktree"
+title = "リモートのワークツリーを作成"
+icon = "🌿"
+run = 'sh "$ZV_PLUGIN_DIR/worktree.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 30

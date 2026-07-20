@@ -1,0 +1,75 @@
+# ワークスペースの種類を判定し、テスト・ビルド・整形・任意スクリプトを
+# ターミナルで実行できるようにする標準プラグイン。
+
+[plugin]
+name = "quick-actions"
+version = "0.1.0"
+author = "Zaivern"
+description = "プロジェクトを判定して、テスト・ビルド・整形・スクリプトを実行する"
+api = 2
+
+[[command]]
+id = "script"
+title = "スクリプトを実行"
+icon = "▶️"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/run.sh" script'
+input = "selection"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "test"
+title = "テストを実行"
+icon = "🧪"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/run.sh" test'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "build"
+title = "ビルド"
+icon = "🔨"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/run.sh" build'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "fmt"
+title = "整形"
+icon = "✨"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/run.sh" fmt'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "refresh"
+title = "実行パネルを更新"
+icon = "⟳"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/startup.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[hook]]
+event = "startup"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/startup.sh"'
+output = "actions"
+timeout_secs = 30
+
+[[panel]]
+id = "runner"
+title = "実行"
+icon = "⚡"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/panel.sh"'
+refresh = "on_open"
+format = "markdown"
+
+[[setting]]
+key = "default_script"
+type = "string"
+default = ""
+label = "既定のスクリプト名"
+secret = false

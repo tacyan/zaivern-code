@@ -1,0 +1,50 @@
+# 表示中のページから UI 要素を写し取り、エージェントのプロンプトへ渡す標準プラグイン。
+# 追加のバイナリや埋め込みブラウザは使わず、OS 標準の仕組みだけで動く。
+
+[plugin]
+name = "element-capture"
+version = "0.1.0"
+author = "Zaivern"
+description = "ページ上の UI 要素と画面の切り取りをエージェントへ渡す"
+api = 2
+
+[[command]]
+id = "pick"
+title = "要素を取り込む"
+icon = "🎯"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/pick.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 120
+
+[[command]]
+id = "paste"
+title = "要素情報を貼り付け"
+icon = "📋"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/paste.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 90
+
+[[command]]
+id = "region"
+title = "画面を切り取ってプロンプトへ"
+icon = "✂️"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/region.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 90
+
+[[setting]]
+key = "browser_app"
+type = "string"
+default = ""
+label = "ブラウザのアプリ名 (空なら自動検出)"
+secret = false
+
+[[setting]]
+key = "pick_timeout_secs"
+type = "int"
+default = 60
+label = "要素の選択を待つ秒数"
+secret = false
