@@ -112,7 +112,7 @@ Even in an era where AI writes 90% of the code, the last 10% — the architectur
 ## Why Rust — a heavy cockpit is no cockpit at all
 
 - **No Electron. No Node.** A single native binary with GPU rendering via egui. Instant startup; idle memory lighter than one browser tab
-- **A real PTY terminal** (portable-pty + vt100). Claude Code's full-screen TUI runs as-is. 256-color / TrueColor, bracketed paste, scrollback
+- **A real PTY terminal** (portable-pty + vt100). Claude Code's full-screen TUI runs as-is. 256-color / TrueColor, bracketed paste, scrollback — plus the unglamorous compatibility work: terminal queries (device attributes, cursor position, background colour) are actually *answered*, because a query left hanging either freezes the TUI waiting for a reply or dumps raw escape text into its input box. Cursor-shape changes, focus in/out reporting, and OSC 52 clipboard writes are handled too
 - **One codebase for macOS / Windows / Linux.** Child processes are killed automatically on exit — no orphan processes left behind
 - Lineage: **Zed's speed × Cmux's parallel agents × AGI Cockpit's pilot-seat UX**
 
@@ -135,7 +135,10 @@ Everything below is the manual for each instrument on the flight deck.
 ### 👾 Multi-agent
 - Launch agent presets with one click (⌘⇧A) and run multiple sessions in parallel
 - Per-session status (●/○), uptime, restart, force-kill
-- Permission modes auto-apply to presets whose command starts with `claude` / `codex` / `agy` (no flags needed in the preset). Any other CLI agent — Gemini CLI included — runs in parallel just by registering a preset
+- **29 CLI agents are recognized by a built-in catalog**: Claude Code / Codex / Grok / Cursor / GitHub Copilot / OpenCode / MiMo Code / Amp / OpenClaude / Antigravity / Pi / oh-my-pi / Hermes / Devin / Goose / Auggie / Autohand / Crush / Cline / Command Code / Continue / Droid / Kilo Code / Kimi / Kiro / Mistral Vibe / Qwen Code / Rovo Dev / Aider
+- **`Agent +` opens the catalog picker** — a searchable list you add from. Agents already installed on your machine sort to the top; the ones that aren't show you the install command instead of failing silently
+- Permission modes (🛡 Approve / ⚡ Full-auto) auto-apply to every agent in the catalog. **You never have to write the flags in your preset** — and for Goose and Aider, which have no blanket auto-approve flag at all, the same mode is applied through environment variables instead
+- A CLI agent that isn't in the catalog still runs in parallel — just register it as a preset
 - Push permission-mode changes to running sessions via each row's 🛡 button (or "🛡 switch all")
 
 ### 🔔 Notifications + sounds
@@ -149,15 +152,43 @@ Everything below is the manual for each instrument on the flight deck.
 - Click to toggle the Cockpit (jumps to the waiting session if one exists), drag to reposition (auto-saved)
 - 🎭 4 looks (blocky / crab / cat / cloud) + swap in any image you like, 📏 3 sizes
 
-### 🔌 Plugins (build one, share it, get one)
-A plugin system anyone who can write shell commands can use. A plugin is one folder under `~/.zaivern/plugins/<name>/`, declaring up to three kinds of things in `plugin.toml`:
+### 📦 Bundled plugins (working from the moment you install)
+Every major capability ships as a plugin. On first launch they unpack into `~/.zaivern/plugins/` and are **enabled as-is**. There is nothing to configure.
 
-- **▶ Commands**: run any shell command and feed the result back into the editor
-  - `input` = `none` | `selection` | `file`; `output` = `replace` | `insert` | `new_tab` | `notify` | `silent`
+| Plugin | What it does |
+|---|---|
+| 🌳 `worktrees` | Split work trees and run them in parallel. **Hand one instruction to several agents at once**, compare the results, merge the one you like |
+| ⚖️ `agent-compare` | Line up the parallel results side by side, compare how much each one changed, pick the winner and take it |
+| 💬 `diff-review` | Collect comments on diff lines, then send them back to the agent in one go |
+| 📋 `tasks` | List issues and change requests, and spin a working branch straight out of one. Diffs and comment posting included |
+| 🖧 `remote-host` | Run, sync, and launch agents on another machine |
+| 🎯 `element-capture` | Pick an element on screen and pass its structure, styles, and a cropped image into the prompt |
+| 📊 `usage-meter` | Show agent usage in a panel |
+| ⚡ `quick-actions` | Detect the project type and run test / build / format immediately |
+
+They are just shell scripts. **Read them, copy them, rewrite them.** Anything you don't want can be disabled from the 🔌 tab.
+
+### 🔌 Plugins (build one, share it, get one)
+If you can write shell, you can write one. A single folder under `~/.zaivern/plugins/<name>/` plus a `plugin.toml`. No Rust, no rebuild.
+
+- **▶ Commands**: run a shell command and feed the result back into the editor
+  - `input` = `none` | `selection` | `file`
+  - `output` = `replace` | `insert` | `new_tab` | `notify` | `silent` | `agent_prompt` | `panel` | `actions`
   - Scope by language with `langs = ["rust"]`, bind a shortcut with `keybind = "cmd+alt+f"`, run automatically on save with `on_save = true` (formatter-friendly)
-  - Environment variables `ZV_FILE` / `ZV_LANG` / `ZV_WORKSPACE` / `ZV_PLUGIN_DIR` are available. Runs in the background with a timeout; never overwrites a buffer you edited mid-run
-- **🎨 Themes**: bundle color-theme JSON (VS Code-compatible, JSONC OK). Standalone themes in `~/.zaivern/themes/*.json` are picked up automatically
-- **✂️ Snippets**: VS Code-compatible format. Type the prefix and press Tab to expand (`${1:default}` tab stops, `$0`, variables; multibyte-safe)
+  - Runs in the background with a timeout. If you edited the buffer mid-run, it will not overwrite you
+- **📊 Panels**: add your own display area to the sidebar (refresh manually, on open, or on an interval; Markdown rendering supported)
+- **🪝 Hooks**: fire on startup, file open/close, save, **agent completion**, approval-wait, git changes, or a fixed interval
+- **⚙️ Settings**: declare values for the user to fill in; they arrive as `ZV_CFG_<KEY>`
+- **🎨 Themes / ✂️ Snippets**: bundle the usual editor-compatible formats unchanged
+
+**Drive the app itself**: set `output = "actions"` and every line of stdout becomes an instruction (JSON Lines).
+
+```sh
+echo '{"action":"open_file","path":"src/main.rs","line":42}'
+echo '{"action":"agent_prompt","agent":"claude","text":"write tests for this function"}'
+```
+
+Open files, notify, open tabs, run things in the terminal, rewrite a panel, **talk to an agent** — all fair game. `agent_prompt` **only places the text in the input box** unless you explicitly pass `submit`, so nothing runs off on its own.
 
 Three buttons to manage it all: **➕ New** (generates a full sample template), **📤 Export** (writes a `.zvplug` you can hand to anyone), **📦 Install** (just pick a received `.zvplug` / `.zip`).
 
@@ -167,6 +198,7 @@ Three buttons to manage it all: **➕ New** (generates a full sample template), 
 name = "json-fmt"
 version = "0.1.0"
 description = "Format JSON on save"
+api = 2
 
 [[command]]
 title = "Format JSON"
@@ -178,6 +210,23 @@ on_save = true
 keybind = "cmd+alt+f"
 ```
 
+📖 **The full guide lives in [docs/plugins.md](docs/plugins.md)** — a 3-minute build walkthrough, every field, an action cheat sheet, and what to do when it misbehaves.
+
+### ⌨️ Drive it from the command line
+`zai` can control a running editor from the outside. Plugins can use it — and so can **the agents themselves**.
+
+```bash
+zai open src/main.rs --line 42     # open a file
+zai notify "build is green"        # raise a notification
+zai prompt "write tests for this"  # drop text into the agent's input box (does not send)
+zai run "cargo test"               # run it in the terminal
+zai status "deploying"             # show it in the status bar
+zai plugin list                    # list plugins
+zai plugin new <name>              # scaffold one
+```
+
+Bare `zai` and `zai .` still launch the GUI, exactly as before.
+
 ### 🔤 Language servers (LSP)
 If `rust-analyzer` / `typescript-language-server` / `pyright-langserver` / `gopls` is on your PATH it starts automatically and shows diagnostics (errors/warnings). The line-number gutter turns red/yellow, and the status bar shows `⛔count ⚠count`. Editing works normally even without any server installed.
 
@@ -188,6 +237,56 @@ Type Japanese directly inside the terminal. Uncommitted composition text is over
 
 ### 🌿 Git line gutter
 In a git repository, line numbers are color-coded by diff (green = added, yellow = modified). The status bar shows the branch name + changed-file count (±N).
+
+### 📚 Multi-folder workspace
+Open several folders at once. List them as arguments — `zai frontend backend shared` — or add one later from the command palette's "Add folder to workspace".
+
+- The file tree lists each root under its own heading (with a single root, it looks exactly as it always did)
+- File search spans every root. **Only when the same relative path exists in more than one root** does Zaivern prefix the folder name to tell them apart — no noise the rest of the time
+- git detects the real repository per root (`rev-parse --show-toplevel`), so opening a *subdirectory* of a repo still shows correct diffs. Two roots inside the same repository share one git state
+- Session restore is keyed on the *set* of roots, so reordering them still restores the same workspace
+
+### 🐙 GitHub integration
+List pull requests and issues, read a PR's diff, and switch branches — all through the `gh` command. **No extra auth setup**: if you've run `gh auth login`, it already works. On a machine without `gh`, the panel is disabled cleanly rather than erroring at you.
+
+A PR diff opens as a read-only tab rendered in the inline diff view, with added and removed lines colour-coded.
+
+### 🧭 Open in an external IDE
+Send the file you're editing to another editor **with your cursor line intact**. VS Code / Cursor / Zed / Trae / Kiro / Sublime / the JetBrains family / Xcode / Fleet / Neovide / Emacs are supported.
+
+Installed IDEs are detected automatically, and only those are offered. If your `code` command has been hijacked by some other product, Zaivern resolves the real binary and identifies it correctly. Apps that ship no CLI are handed the file over their URL scheme.
+
+### 🔭 Agent supervision and hand-off
+Run several agents and sooner or later one goes quiet, repeats the same failure, or dies. This is the layer that notices and does something about it.
+
+- **Detection**: stalling (silence with no progress), looping (the same output over and over), a storm of errors, abnormal exit, an approval prompt left unattended, runaway output. Spinners and counters are correctly treated as *not* progress
+- **Intervention escalates**: record → notify → auto-approve → nudge → restart → stop. **Restart and stop always ask you first**, by default, because in-flight work gets lost either way. In 🛡 Approve mode, nothing above "notify" is ever done automatically
+- **Reassignment**: a stalled task is handed to a different agent. An agent that already failed a task never gets it back. **The hand-off does not happen until the previous holder is confirmed stopped** — otherwise two agents edit the same files. When the retry budget is spent, it escalates to you instead of looping forever
+- **Inter-agent messaging**: a message is delivered only when the recipient is idle, because interrupting mid-generation corrupts its input. Hop limits, rate limits, and round-trip detection all apply, and any message that couldn't be delivered is recorded with the reason
+
+**Hand out the work.** Create a "task" from the cockpit and either assign it to a specific agent or let auto-assignment decide. The list shows state, owner, and attempt count, and anything the system gave up on shows as a red `NeedsUser`. If an assignment is refused, you get the reason in plain words — nothing is worse than silence.
+
+**Let the agents talk to each other.** Besides sending by hand, an agent can write this at the start of a line and it goes straight to the target:
+
+```
+[ZAI-TO:backend] the migration passed, go ahead on the API side
+[ZAI-TO:ALL] moved the shared type definitions into types.ts
+```
+
+There is no LLM guessing at which sentences look like they're addressed to someone. **Only the line-start marker counts — deterministic, on purpose.** And when an injected message is echoed back onto the screen, it does not get re-sent as a new message (get that wrong and messages multiply without end).
+
+### 💡 Super Agent — give the watchdog a brain
+The supervision itself runs on Rust rules. You don't need an LLM to spot a stall or a loop, and **if the watchdog is an LLM, nobody is left to notice when the watchdog breaks.** So detection stays deterministic code.
+
+On top of that, you can ask an AI the one question code is bad at: *"okay, so what's the right move here?"* In the cockpit's **💡 Super Agent**, you just **pick which CLI agent supervises**.
+
+- The default is **"none"**. Pick nothing and no LLM is ever queried
+- **Only agents that support non-interactive execution are selectable.** One that doesn't would open an interactive screen and never return, so it isn't offered in the first place
+- It receives **only redacted recent output**. API keys, GitHub tokens, email addresses, and home-directory paths are masked automatically
+- **The supervisor is itself supervised, like everyone else.** Exempt it and you've built a single point of failure
+- **It can still do normal work.** You don't have to burn a slot on supervision alone. It just won't be asked to diagnose its own stall — asking a frozen agent why it froze gets you nothing
+- **AI advice does not move the permission gate.** If it recommends a restart or a stop, you still confirm — even in ⚡ Full-auto mode
+- If the response can't be parsed, **nothing happens**. A watchdog that manufactures actions out of ambiguous answers is more dangerous than one that stays quiet
 
 ### 💾 Session restore
 On restart, the previous tabs, active tab, and panel state are restored automatically per workspace (`~/.zaivern/sessions/`).
@@ -220,6 +319,12 @@ cargo build --release
 
 # Launch (pass a workspace path; defaults to the current directory)
 ./target/release/zai ~/dev/my-project
+
+# Open several folders at once
+./target/release/zai ~/dev/frontend ~/dev/backend ~/dev/shared
+
+# Mix in a file argument and it opens as a tab
+./target/release/zai ~/dev/my-project README.md
 ```
 
 The same code builds on macOS / Windows / Linux (Linux needs rfd dependencies such as `libgtk-3-dev`).
@@ -264,7 +369,7 @@ editor_font_size = 15.0
 terminal_font_size = 13.0
 show_hidden_files = true
 
-# Default permission mode (auto-applied to claude / codex / agy)
+# Default permission mode (auto-applied to all 29 agents in the catalog)
 #   "ask"   = user approval required every time (safe, default)
 #   "auto"  = auto-YES to everything (bypass flags added per CLI)
 #   "agent" = agent-first (use whatever flags the preset command says)
@@ -351,11 +456,24 @@ src/
 ├── editor_ops.rs    Pure text-editing operations (multibyte-safe)
 ├── highlight.rs     syntect → egui LayoutJob conversion (hash-cached)
 ├── snippets.rs      VS Code-compatible snippet parsing & Tab expansion
-├── file_tree.rs     Lazy-loading file tree + context menu
+├── file_tree.rs     Lazy-loading file tree (multi-root) + context menu
 ├── fuzzy.rs         Fuzzy-match scoring
 ├── palette.rs       Command palette state & action definitions
 ├── keybinds.rs      Customizable keybindings
-├── git.rs           git CLI integration (branch, per-line diff marks)
+├── git.rs           git CLI integration (repo detection, branch, per-line diff marks)
+├── git_panel.rs     Git side panel (list and switch branches / worktrees)
+├── github.rs        GitHub integration (via gh CLI — PR/Issue/diffs, async)
+├── diff.rs          Unified diff parser + inline diff view
+├── ide.rs           Hand-off to external IDEs (open at the current line)
+├── panels.rs        Rendering for the GitHub panel, PR diff tabs, IDE integration
+├── supervisor.rs    Agent supervision (stall/loop/abnormal-exit detection, escalating intervention)
+├── coordinator.rs   Inter-agent messaging and task reassignment
+├── orchestration.rs Task creation UI, hand-off driving, message send/receive assembly
+├── diagnostician.rs Supervising LLM (calls the chosen CLI agent non-interactively to diagnose)
+├── markdown.rs      Markdown parsing and preview rendering
+├── html.rs          HTML preview rendering
+├── jsonc.rs         Reading JSON with comments (JSONC)
+├── cli.rs           `zai` subcommands (the control channel for driving the app from outside)
 ├── lsp.rs           Minimal LSP client (stdio JSON-RPC, diagnostics)
 ├── terminal.rs      PTY sessions + vt100 rendering + approval-prompt detection/auto-reply
 ├── agents.rs        Session management (launch/restart/destroy/broadcast/permission modes)
@@ -386,9 +504,19 @@ src/
 - [x] Pet upgrades (4 looks, custom images, sizes, sleep/walk, sounds, approve/deny from the bubble)
 - [x] Voice input (🎤/⏹ only, records until stopped, inserts into the input box for a manual Enter, configurable destination/language/engine)
 - [x] Cross-platform voice input (built-in on macOS; Windows' own recognizer when one is installed; a browser page on Linux and on Windows without one; keyboard dictation guidance on phones)
+- [x] Inline diff view (unified diff parsing and colour-coded rendering)
+- [x] Multi-folder workspace (open several folders at once)
+- [x] GitHub integration (PR / Issue lists, PR diff viewing, branch operations)
+- [x] Agent catalog (29 CLI agents configured automatically per permission mode)
+- [x] External IDE integration (open in another editor with the cursor line intact)
+- [x] Agent supervision (detect stalls, loops, and abnormal exits, then intervene in stages)
+- [x] Inter-agent messaging and task reassignment
+- [x] Terminal compatibility hardening (query responses, cursor shape, focus reporting, OSC 52)
+- [x] Super Agent (pick the supervising LLM from the UI, redaction, destructive actions always confirmed)
+- [x] Task creation from the cockpit and hand-off of stalled tasks
+- [x] Inter-agent messages (sent with a `[ZAI-TO:target]` line-start marker)
 - [ ] LSP completion & hover UI (foundation implemented; UI to come)
 - [ ] Plugin grammars (TextMate) & registry sharing
-- [ ] Inline diff view
 - [ ] Split editor
 
 ## License
