@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
 
 use crate::agents::{AgentManager, SessionEvent};
+use crate::cli;
 use crate::config::{self, Config};
 use crate::editor::{disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
@@ -261,6 +262,22 @@ pub struct ZaivernApp {
     lsp_pending: HashMap<PathBuf, (String, Instant, String)>,
     /// アクティブバッファの診断件数 (エラー, 警告) — ステータスバー用
     diag_counts: (usize, usize),
+    /// プラグインパネルの内容: (プラグイン名, パネルID) → 本文
+    plugin_panels: HashMap<(String, String), String>,
+    /// プラグインがステータスバーへ出した文字列(空なら非表示)
+    plugin_status: String,
+    /// interval フックの最終実行時刻: (プラグイン名, イベント名) → 時刻
+    hook_last_run: HashMap<(String, String), Instant>,
+    /// パネルの最終更新時刻: (プラグイン名, パネルID) → 時刻
+    panel_last_run: HashMap<(String, String), Instant>,
+    /// startup フックを起動済みか(初回フレーム後に一度だけ走らせる)
+    startup_hooks_done: bool,
+    /// 直近に観測した git ブランチ名(git_change フックの検知用)
+    hook_git_branch: Option<String>,
+    /// 起動待ちのフック(egui の Context が要るので update で消化する)
+    pending_hooks: Vec<(plugins::HookEvent, Option<PathBuf>)>,
+    /// 前フレームでプラグインタブが見えていたか(on_open パネルの検知用)
+    plugins_tab_was_open: bool,
     /// 音声入力の実行状態
     voice: VoiceState,
 }
@@ -345,6 +362,14 @@ impl ZaivernApp {
             lsp_opened: HashSet::new(),
             lsp_pending: HashMap::new(),
             diag_counts: (0, 0),
+            plugin_panels: HashMap::new(),
+            plugin_status: String::new(),
+            hook_last_run: HashMap::new(),
+            panel_last_run: HashMap::new(),
+            startup_hooks_done: false,
+            hook_git_branch: None,
+            pending_hooks: Vec::new(),
+            plugins_tab_was_open: false,
             cfg,
         };
         // ユーザー指定のペット画像をロード
@@ -354,7 +379,14 @@ impl ZaivernApp {
         app.rebuild_plugins();
         // スマホリモートサーバを起動 (LAN 内からブラウザで操作可能に)
         match remote::RemoteServer::start(cc.egui_ctx.clone()) {
-            Ok(s) => app.remote = Some(s),
+            Ok(s) => {
+                // CLI (`zai open` など) が接続先を見つけられるよう接続情報を書き出す
+                let ws = app.workspace.to_string_lossy().to_string();
+                if let Err(e) = cli::write_instance_file(s.port, &s.token, &ws) {
+                    eprintln!("インスタンス情報の書き出しに失敗しました: {e}");
+                }
+                app.remote = Some(s);
+            }
             Err(e) => app.remote_err = Some(e),
         }
         app.rebuild_index();
@@ -367,11 +399,29 @@ impl ZaivernApp {
     /// インストール済みプラグインを再スキャンし、スニペット辞書・テーマ一覧・
     /// コマンドキーバインドを作り直す。
     fn rebuild_plugins(&mut self) {
+        use plugins::PluginList;
+
+        // 同梱の標準プラグインを ~/.zaivern/plugins へ展開してからスキャンする
+        // (バンドル版が新しいときだけ上書きするので、ユーザーの編集は残る)
+        if let Some(root) = plugins::plugins_root() {
+            plugins::seed_bundled(&root);
+        }
         self.plugins = plugins::scan_installed();
+        // 無効化リストと保存済み設定値を反映する。無効なプラグインは
+        // 以降の登録 (コマンド/キーバインド/テーマ/スニペット) から一切外れる
+        self.plugins.apply_disabled(&self.cfg.plugins.disabled);
+        self.plugins.apply_all_settings(&self.cfg.plugins.settings);
+
+        // 閉じたプラグインのパネル内容は残さない
+        self.plugin_panels.retain(|(pl, id), _| {
+            self.plugins
+                .iter()
+                .any(|p| p.active() && &p.name == pl && p.panels.iter().any(|x| &x.id == id))
+        });
 
         // スニペットを言語IDごとに集約
         let mut by_lang: HashMap<String, Vec<Snippet>> = HashMap::new();
-        for p in &self.plugins {
+        for p in self.plugins.iter().filter(|p| p.active()) {
             for (lang, path) in &p.snippet_files {
                 let snips = snippets::parse_file(path, lang);
                 if !snips.is_empty() {
@@ -384,7 +434,7 @@ impl ZaivernApp {
         // テーマ一覧 = ~/.zaivern/themes + プラグイン同梱テーマ(パスで重複排除)
         let mut themes = theme_json::discover_user_themes();
         let mut seen: HashSet<String> = themes.iter().map(|(_, p)| p.clone()).collect();
-        for p in &self.plugins {
+        for p in self.plugins.iter().filter(|p| p.active()) {
             for (label, path) in &p.themes {
                 let ps = path.to_string_lossy().to_string();
                 if seen.insert(ps.clone()) {
@@ -398,6 +448,9 @@ impl ZaivernApp {
         // コマンドの keybind をパースしてキャッシュ (不正な文字列は無視)
         self.plugin_keys.clear();
         for (pi, p) in self.plugins.iter().enumerate() {
+            if !p.active() {
+                continue;
+            }
             for (ci, c) in p.commands.iter().enumerate() {
                 if let Some(sc) = c.keybind.as_deref().and_then(parse_shortcut) {
                     self.plugin_keys.push((sc, pi, ci));
@@ -406,17 +459,88 @@ impl ZaivernApp {
         }
     }
 
+    /// アクティブバッファでいま選択されているテキスト (無選択なら None)。
+    fn active_selection(&self, ctx: &egui::Context) -> Option<String> {
+        let b = self.editor.active.map(|i| &self.editor.buffers[i])?;
+        let ed_id = egui::Id::new(("zaivern-buffer", b.id));
+        let r = egui::TextEdit::load_state(ctx, ed_id)?.cursor.char_range()?;
+        let (s, e) = (
+            r.primary.index.min(r.secondary.index),
+            r.primary.index.max(r.secondary.index),
+        );
+        if s == e {
+            return None;
+        }
+        Some(b.text.chars().skip(s).take(e - s).collect())
+    }
+
+    /// プラグインプロセスへ渡す環境変数一式を組み立てる (仕様 3章)。
+    /// ワークスペース・カーソル位置・ブランチ名など、その時点のアプリの状態を集めて
+    /// `plugins::command_env` に渡す。設定値 (`ZV_CFG_*`) は向こうで足される。
+    fn plugin_envs(
+        &mut self,
+        plugin_name: &str,
+        file: Option<&Path>,
+        lang: &str,
+        selection: &str,
+        event: Option<plugins::HookEvent>,
+    ) -> Vec<(String, String)> {
+        let branch = self.git_branch().unwrap_or_default();
+        let agent = self
+            .agents
+            .sessions
+            .get(self.agents.active)
+            .map(|s| s.preset_name.clone())
+            .unwrap_or_default();
+        let workspace = self.workspace.clone();
+        let (line, column) = self.editor.cursor;
+        let Some(p) = self.plugins.iter().find(|p| p.name == plugin_name) else {
+            return Vec::new();
+        };
+        plugins::command_env(
+            p,
+            &plugins::EnvContext {
+                file,
+                lang,
+                workspace: &workspace,
+                selection,
+                line,
+                column,
+                agent: &agent,
+                event,
+                git_branch: &branch,
+            },
+        )
+    }
+
     /// プラグインコマンドを実行する。stdin へ渡す入力(選択範囲/ファイル)を集めて
     /// ワーカースレッドへ投げ、結果は plugin_rx 経由で process_plugin_results が適用する。
     fn run_plugin_command(&mut self, pi: usize, ci: usize, ctx: &egui::Context) {
-        let (Some(plugin), Some(command)) = (
-            self.plugins.get(pi),
-            self.plugins.get(pi).and_then(|p| p.commands.get(ci)),
-        ) else {
+        // 位置は「その場で名前と安定IDへ」変換し、実行はIDで引き直す。
+        // こうしておくと再スキャンで番号がずれても別のコマンドを撃たない。
+        let Some((plugin_name, cmd_id)) = self
+            .plugins
+            .get(pi)
+            .and_then(|p| p.commands.get(ci).map(|c| (p.name.clone(), c.id.clone())))
+        else {
             return;
         };
+        self.run_plugin_command_by_id(&plugin_name, &cmd_id, ctx);
+    }
+
+    /// プラグイン名 + コマンドの安定IDでコマンドを実行する。
+    fn run_plugin_command_by_id(&mut self, plugin: &str, cmd_id: &str, ctx: &egui::Context) {
+        use plugins::PluginList;
+        let Some((plugin, command)) = self.plugins.find_command(plugin, cmd_id) else {
+            self.toast(format!("🔌 コマンドが見つかりません: {plugin}/{cmd_id}"), false);
+            return;
+        };
+        if !plugin.active() {
+            let name = plugin.name.clone();
+            self.toast(format!("🔌 {name} は無効になっています"), false);
+            return;
+        }
         let plugin_name = plugin.name.clone();
-        let plugin_dir = plugin.dir.clone();
         let command = command.clone();
 
         let active = self.editor.active.map(|i| &self.editor.buffers[i]);
@@ -461,22 +585,13 @@ impl ZaivernApp {
             }
         };
 
-        let file = active
-            .and_then(|b| b.path.as_ref())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let envs = vec![
-            ("ZV_FILE".to_string(), file),
-            ("ZV_LANG".to_string(), lang_id),
-            (
-                "ZV_WORKSPACE".to_string(),
-                self.workspace.to_string_lossy().to_string(),
-            ),
-            (
-                "ZV_PLUGIN_DIR".to_string(),
-                plugin_dir.to_string_lossy().to_string(),
-            ),
-        ];
+        let file = active.and_then(|b| b.path.clone());
+        // ZV_SELECTION は入力モードによらず「いま選択中のテキスト」を渡す
+        let selection = match command.input {
+            plugins::CmdInput::Selection => stdin_text.clone(),
+            _ => self.active_selection(ctx).unwrap_or_default(),
+        };
+        let envs = self.plugin_envs(&plugin_name, file.as_deref(), &lang_id, &selection, None);
         let title = command.title.clone();
         plugins::run_async(
             plugins::RunRequest {
@@ -507,9 +622,9 @@ impl ZaivernApp {
                 );
                 continue;
             }
-            match r.output {
-                plugins::CmdOutput::Silent => {}
-                plugins::CmdOutput::Notify => {
+            match r.sink {
+                plugins::CmdSink::Silent => {}
+                plugins::CmdSink::Notify => {
                     let msg = if r.stdout.trim().is_empty() {
                         "完了しました".to_string()
                     } else {
@@ -518,7 +633,7 @@ impl ZaivernApp {
                     self.toast(format!("🔌 {}: {msg}", r.title), true);
                     notify::notify(&format!("Zaivern — {}", r.title), &msg);
                 }
-                plugins::CmdOutput::NewTab => {
+                plugins::CmdSink::NewTab => {
                     self.editor.new_untitled();
                     if let Some(i) = self.editor.active {
                         let b = &mut self.editor.buffers[i];
@@ -529,7 +644,7 @@ impl ZaivernApp {
                     }
                     self.toast(format!("🔌 {} → 新規タブ", r.title), true);
                 }
-                plugins::CmdOutput::Insert => {
+                plugins::CmdSink::Insert => {
                     let Some(i) = self
                         .editor
                         .buffers
@@ -554,7 +669,7 @@ impl ZaivernApp {
                     self.pending_select = Some((end, end));
                     self.toast(format!("🔌 {} を挿入しました", r.title), true);
                 }
-                plugins::CmdOutput::Replace => {
+                plugins::CmdSink::Replace => {
                     let Some(i) = self
                         .editor
                         .buffers
@@ -629,7 +744,395 @@ impl ZaivernApp {
                         }
                     }
                 }
+                // エージェントの入力欄へ差し込むだけ。送信は必ず人の操作で行う
+                plugins::CmdSink::AgentPrompt => {
+                    let text = r.stdout.trim_end_matches('\n').to_string();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    self.send_agent_prompt(None, &text, false);
+                }
+                // 指定パネルの本文を差し替える
+                plugins::CmdSink::Panel => {
+                    let Some(panel) = r.panel.clone() else {
+                        self.toast(format!("🔌 {}: 出力先パネルが未指定です", r.title), false);
+                        continue;
+                    };
+                    self.set_plugin_panel(&r.plugin, &panel, r.stdout.clone());
+                }
+                // stdout の JSON Lines をアクションとして実行する
+                plugins::CmdSink::Actions => {
+                    let plugin = r.plugin.clone();
+                    let actions = r.actions.clone();
+                    self.run_plugin_actions(&plugin, actions, ctx);
+                }
             }
+        }
+    }
+
+    /// プラグインパネルの本文を書き込む。存在しないパネルなら false。
+    fn set_plugin_panel(&mut self, plugin: &str, panel: &str, text: String) -> bool {
+        let exists = self
+            .plugins
+            .iter()
+            .any(|p| p.active() && p.name == plugin && p.panels.iter().any(|x| x.id == panel));
+        if !exists {
+            self.toast(format!("🔌 パネルが見つかりません: {plugin}/{panel}"), false);
+            return false;
+        }
+        self.plugin_panels
+            .insert((plugin.to_string(), panel.to_string()), text);
+        self.panel_last_run
+            .insert((plugin.to_string(), panel.to_string()), Instant::now());
+        true
+    }
+
+    /// エージェントの入力欄へテキストを差し込む。`submit` が true のときだけ Enter を送る。
+    /// `agent` が None ならアクティブなセッション、Some なら名前 (プリセット名/タイトル) で探す。
+    fn send_agent_prompt(&mut self, agent: Option<&str>, text: &str, submit: bool) -> bool {
+        let payload = if submit {
+            format!("{text}\r")
+        } else {
+            text.to_string()
+        };
+        let idx = match agent.map(str::trim).filter(|a| !a.is_empty()) {
+            Some(name) => self.agents.sessions.iter().position(|s| {
+                s.running() && (s.preset_name == name || s.title == name)
+            }),
+            None => self
+                .agents
+                .sessions
+                .get(self.agents.active)
+                .filter(|s| s.running())
+                .map(|_| self.agents.active),
+        };
+        let Some(i) = idx else {
+            self.toast("エージェントセッションが見つかりません", false);
+            return false;
+        };
+        let title = {
+            let s = &mut self.agents.sessions[i];
+            s.write_bytes(payload.as_bytes());
+            s.title.clone()
+        };
+        self.agents.panel_open = true;
+        let verb = if submit { "送信" } else { "入力欄へ" };
+        self.toast(
+            format!("🔌 {title} {verb}: {}", notify::truncate_chars(text, 60)),
+            true,
+        );
+        true
+    }
+
+    /// プラグインが返したアクション (仕様 2章) を順に実行する。
+    fn run_plugin_actions(
+        &mut self,
+        plugin: &str,
+        actions: Vec<plugins::PluginAction>,
+        ctx: &egui::Context,
+    ) {
+        use plugins::PluginAction as A;
+        for a in actions {
+            match a {
+                A::OpenFile { path, line } => {
+                    let p = if Path::new(&path).is_absolute() {
+                        PathBuf::from(&path)
+                    } else {
+                        self.workspace.join(&path)
+                    };
+                    self.open_path(&p);
+                    if let Some(n) = line {
+                        self.goto_line(n as usize);
+                    }
+                }
+                A::Notify { message, level } => {
+                    let msg = notify::truncate_chars(message.trim(), 200);
+                    match level {
+                        plugins::NotifyLevel::Info => self.toast(format!("🔌 {msg}"), true),
+                        plugins::NotifyLevel::Warn => self.toast_warn(format!("🔌 {msg}")),
+                        plugins::NotifyLevel::Error => self.toast(format!("🔌 {msg}"), false),
+                    }
+                    if !matches!(level, plugins::NotifyLevel::Info) {
+                        notify::notify("Zaivern Code", &msg);
+                    }
+                }
+                A::InsertText { text } => self.insert_at_cursor(&text, ctx),
+                A::ReplaceBuffer { text } => match self.editor.active {
+                    Some(i) => {
+                        let b = &mut self.editor.buffers[i];
+                        b.text = text;
+                        b.cache = None;
+                        b.gutter = None;
+                        self.toast("🔌 バッファを置き換えました", true);
+                    }
+                    None => self.toast("🔌 置き換え先のタブがありません", false),
+                },
+                A::NewTab { title, text } => {
+                    self.editor.new_untitled();
+                    if let Some(i) = self.editor.active {
+                        let b = &mut self.editor.buffers[i];
+                        b.title = title;
+                        b.text = text;
+                        b.cache = None;
+                        b.gutter = None;
+                    }
+                }
+                A::AgentPrompt {
+                    agent,
+                    text,
+                    submit,
+                } => {
+                    self.send_agent_prompt(agent.as_deref(), &text, submit);
+                }
+                A::RunTerminal { command, cwd } => self.run_in_terminal(&command, cwd.as_deref(), ctx),
+                A::OpenUrl { url } => {
+                    open_external(&url);
+                    self.toast(format!("🔗 {url} を開きました"), true);
+                }
+                A::SetPanel { panel, text } => {
+                    self.set_plugin_panel(plugin, &panel, text);
+                }
+                A::SetStatus { text } => self.plugin_status = text,
+                A::RefreshFiles => {
+                    self.tree.invalidate();
+                    self.rebuild_index();
+                }
+                A::SetSetting { key, value } => {
+                    self.cfg.plugins.set_setting(plugin, &key, &value);
+                    if let Err(e) = config::save_plugins_section(&self.cfg) {
+                        self.toast(format!("設定の保存に失敗: {e}"), false);
+                    }
+                    // 実行中のプラグインへも即座に反映する
+                    if let Some(p) = self.plugins.iter_mut().find(|p| p.name == plugin) {
+                        if let Some(vals) = self.cfg.plugins.settings.get(plugin) {
+                            p.apply_settings(vals);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 1 始まりの行番号へカーソルを移動し、その行が見えるようスクロールする。
+    fn goto_line(&mut self, line: usize) {
+        let Some(i) = self.editor.active else {
+            return;
+        };
+        let line = line.max(1);
+        let text = &self.editor.buffers[i].text;
+        let char_pos = text
+            .split_inclusive('\n')
+            .take(line - 1)
+            .map(|l| l.chars().count())
+            .sum::<usize>()
+            .min(text.chars().count());
+        self.pending_select = Some((char_pos, char_pos));
+        self.pending_scroll =
+            Some(((line - 1) as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
+    }
+
+    /// カーソル位置へテキストを差し込む。
+    fn insert_at_cursor(&mut self, text: &str, ctx: &egui::Context) {
+        let Some(i) = self.editor.active else {
+            self.toast("🔌 挿入先のタブがありません", false);
+            return;
+        };
+        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        let cur = egui::TextEdit::load_state(ctx, ed_id)
+            .and_then(|st| st.cursor.char_range())
+            .map(|c| c.primary.index)
+            .unwrap_or_else(|| self.editor.buffers[i].text.chars().count());
+        let b = &mut self.editor.buffers[i];
+        let cur = cur.min(b.text.chars().count());
+        let byte = editor_ops::char_to_byte(&b.text, cur);
+        b.text.insert_str(byte, text);
+        b.cache = None;
+        b.gutter = None;
+        let end = cur + text.chars().count();
+        self.pending_select = Some((end, end));
+    }
+
+    /// フックの起動を予約する。実際の起動は update から `fire_hooks` で行う
+    /// (egui の Context が要るため)。
+    fn queue_hook(&mut self, event: plugins::HookEvent, file: Option<PathBuf>) {
+        self.pending_hooks.push((event, file));
+    }
+
+    /// 指定イベントのフックを一斉に起動する (仕様 1章 `[[hook]]`)。
+    /// 実行は既存の非同期機構に載せるので UI スレッドは止まらない。
+    fn fire_hooks(&mut self, event: plugins::HookEvent, file: Option<PathBuf>, ctx: &egui::Context) {
+        use plugins::PluginList;
+        let targets: Vec<(String, plugins::PluginCommand)> = self
+            .plugins
+            .active_hooks(event)
+            .into_iter()
+            .map(|(p, h)| (p.name.clone(), h.as_command(&p.name)))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let lang = file
+            .as_deref()
+            .and_then(|p| p.extension())
+            .map(|e| snippets::lang_id_for(&e.to_string_lossy()).to_string())
+            .unwrap_or_default();
+        for (plugin_name, command) in targets {
+            let envs =
+                self.plugin_envs(&plugin_name, file.as_deref(), &lang, "", Some(event));
+            plugins::run_async(
+                plugins::RunRequest {
+                    plugin: plugin_name,
+                    command,
+                    stdin_text: String::new(),
+                    envs,
+                    workdir: self.workspace.clone(),
+                    buffer_id: None,
+                    replace_range: None,
+                    resave: false,
+                },
+                self.plugin_tx.clone(),
+                ctx.clone(),
+            );
+        }
+    }
+
+    /// 時間で動くもの — interval フックと interval 更新のパネル — を回す。
+    /// 毎フレーム呼ばれるので、まだ間隔に達していないものは何もしない。
+    fn tick_plugin_timers(&mut self, ctx: &egui::Context) {
+        use plugins::PluginList;
+
+        // interval フック: プラグイン毎に前回実行からの経過を見る
+        let due: Vec<(String, plugins::PluginCommand)> = self
+            .plugins
+            .active_hooks(plugins::HookEvent::Interval)
+            .into_iter()
+            .filter(|(p, h)| {
+                let key = (p.name.clone(), h.event.as_str().to_string());
+                match self.hook_last_run.get(&key) {
+                    Some(at) => at.elapsed().as_secs() >= h.interval_secs.max(5),
+                    None => true,
+                }
+            })
+            .map(|(p, h)| (p.name.clone(), h.as_command(&p.name)))
+            .collect();
+        for (plugin_name, command) in due {
+            self.hook_last_run.insert(
+                (plugin_name.clone(), plugins::HookEvent::Interval.as_str().to_string()),
+                Instant::now(),
+            );
+            let envs = self.plugin_envs(
+                &plugin_name,
+                None,
+                "",
+                "",
+                Some(plugins::HookEvent::Interval),
+            );
+            plugins::run_async(
+                plugins::RunRequest {
+                    plugin: plugin_name,
+                    command,
+                    stdin_text: String::new(),
+                    envs,
+                    workdir: self.workspace.clone(),
+                    buffer_id: None,
+                    replace_range: None,
+                    resave: false,
+                },
+                self.plugin_tx.clone(),
+                ctx.clone(),
+            );
+        }
+
+        // パネルはプラグインタブが見えているときだけ更新する
+        let tab_open = self.sidebar_open && self.sidebar_tab == SidebarTab::Plugins;
+        let just_opened = tab_open && !self.plugins_tab_was_open;
+        self.plugins_tab_was_open = tab_open;
+        if !tab_open {
+            return;
+        }
+        // refresh = on_open のパネルは、タブを開いた瞬間に取り直す
+        if just_opened {
+            let on_open: Vec<(String, String)> = self
+                .plugins
+                .active_panels()
+                .into_iter()
+                .filter(|(_, pa)| {
+                    pa.refresh == plugins::PanelRefresh::OnOpen && !pa.run.trim().is_empty()
+                })
+                .map(|(p, pa)| (p.name.clone(), pa.id.clone()))
+                .collect();
+            for (plugin_name, panel_id) in on_open {
+                self.refresh_panel(&plugin_name, &panel_id, ctx);
+            }
+        }
+        let panels: Vec<(String, String)> = self
+            .plugins
+            .active_panels()
+            .into_iter()
+            .filter(|(_, pa)| {
+                pa.refresh == plugins::PanelRefresh::Interval && !pa.run.trim().is_empty()
+            })
+            .filter(|(p, pa)| {
+                let key = (p.name.clone(), pa.id.clone());
+                match self.panel_last_run.get(&key) {
+                    Some(at) => at.elapsed().as_secs() >= pa.interval_secs.max(5),
+                    None => true,
+                }
+            })
+            .map(|(p, pa)| (p.name.clone(), pa.id.clone()))
+            .collect();
+        for (plugin_name, panel_id) in panels {
+            self.refresh_panel(&plugin_name, &panel_id, ctx);
+        }
+    }
+
+    /// パネルの `run` を実行して本文を取り直す。`run` が空のパネルは
+    /// アクション (`set_panel`) 経由でしか更新されないので何もしない。
+    fn refresh_panel(&mut self, plugin_name: &str, panel_id: &str, ctx: &egui::Context) {
+        use plugins::PluginList;
+        let Some((_, panel)) = self.plugins.find_panel(plugin_name, panel_id) else {
+            return;
+        };
+        if panel.run.trim().is_empty() {
+            return;
+        }
+        let command = panel.as_command();
+        self.panel_last_run.insert(
+            (plugin_name.to_string(), panel_id.to_string()),
+            Instant::now(),
+        );
+        let envs = self.plugin_envs(plugin_name, None, "", "", None);
+        plugins::run_async(
+            plugins::RunRequest {
+                plugin: plugin_name.to_string(),
+                command,
+                stdin_text: String::new(),
+                envs,
+                workdir: self.workspace.clone(),
+                buffer_id: None,
+                replace_range: None,
+                resave: false,
+            },
+            self.plugin_tx.clone(),
+            ctx.clone(),
+        );
+    }
+
+    /// ターミナル (エージェントパネル) で任意のコマンドを走らせる。
+    fn run_in_terminal(&mut self, command: &str, cwd: Option<&str>, ctx: &egui::Context) {
+        let preset = config::AgentPreset {
+            name: notify::truncate_chars(command, 24),
+            icon: "🔌".to_string(),
+            command: command.to_string(),
+            cwd: cwd.map(|s| s.to_string()),
+            env: HashMap::new(),
+        };
+        match self
+            .agents
+            .launch(&preset, &self.workspace, crate::agents::Approval::Agent, ctx)
+        {
+            Ok(()) => self.toast(format!("▶ {command} を実行しています"), true),
+            Err(e) => self.toast(format!("実行に失敗: {e}"), false),
         }
     }
 
@@ -703,27 +1206,18 @@ impl ZaivernApp {
             return;
         };
         let (text, buffer_id) = (b.text.clone(), b.id);
-        let mut launched: Vec<(String, plugins::PluginCommand, PathBuf)> = Vec::new();
-        for p in &self.plugins {
+        // file_save フックも同じ契機で走らせる (整形の on_save とは別系統)
+        self.fire_hooks(plugins::HookEvent::FileSave, Some(path.clone()), ctx);
+        let mut launched: Vec<(String, plugins::PluginCommand)> = Vec::new();
+        for p in self.plugins.iter().filter(|p| p.active()) {
             for c in &p.commands {
                 if c.on_save && c.lang_matches(&lang_id) {
-                    launched.push((p.name.clone(), c.clone(), p.dir.clone()));
+                    launched.push((p.name.clone(), c.clone()));
                 }
             }
         }
-        for (plugin_name, command, plugin_dir) in launched {
-            let envs = vec![
-                ("ZV_FILE".to_string(), path.to_string_lossy().to_string()),
-                ("ZV_LANG".to_string(), lang_id.clone()),
-                (
-                    "ZV_WORKSPACE".to_string(),
-                    self.workspace.to_string_lossy().to_string(),
-                ),
-                (
-                    "ZV_PLUGIN_DIR".to_string(),
-                    plugin_dir.to_string_lossy().to_string(),
-                ),
-            ];
+        for (plugin_name, command) in launched {
+            let envs = self.plugin_envs(&plugin_name, Some(&path), &lang_id, "", None);
             plugins::run_async(
                 plugins::RunRequest {
                     plugin: plugin_name,
@@ -991,6 +1485,7 @@ impl ZaivernApp {
                         self.queue_lsp_change(i);
                     }
                 }
+                self.queue_hook(plugins::HookEvent::FileOpen, Some(path.to_path_buf()));
                 self.persist_session()
             }
             Err(e) => self.toast(e, false),
@@ -2149,6 +2644,17 @@ impl ZaivernApp {
                             );
                         }
                     }
+                    // プラグインが set_status で出した文字列
+                    if !self.plugin_status.trim().is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "🔌 {}",
+                                notify::truncate_chars(self.plugin_status.trim(), 80)
+                            ))
+                            .size(11.5)
+                            .color(theme.ok),
+                        );
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(dim("Zaivern v0.2".into()));
@@ -2228,6 +2734,18 @@ impl ZaivernApp {
         let mut pl_run: Option<(usize, usize)> = None;
         let mut pl_export: Option<usize> = None;
         let mut pl_open: Option<PathBuf> = None;
+        // 有効/無効の切り替え要求 (プラグイン名, 有効か)
+        let mut pl_toggle: Option<(String, bool)> = None;
+        // 設定値の変更要求 (プラグイン名, キー, 値)
+        let mut pl_setting: Option<(String, String, String)> = None;
+        // パネルの手動更新要求 (プラグイン名, パネルID)
+        let mut pl_panel_refresh: Option<(String, String)> = None;
+        // パネルの本文はクロージャの中では読むだけなので、先に借りをほどく
+        let panel_texts = self.plugin_panels.clone();
+        // Markdown パネルの描画に要るもの (画像キャッシュは借りて後で戻す)
+        let mut md_images = std::mem::take(&mut self.md_images);
+        let md_base = self.cfg.editor_font_size;
+        let hl = &self.highlighter;
 
         egui::SidePanel::left("zv-side")
             .resizable(true)
@@ -2427,6 +2945,14 @@ impl ZaivernApp {
                                                         .size(10.5)
                                                         .color(theme.text_dim),
                                                 );
+                                                ui.label(
+                                                    RichText::new(format!("API{}", p.api))
+                                                        .size(10.0)
+                                                        .color(theme.text_dim),
+                                                )
+                                                .on_hover_text(
+                                                    "マニフェストの api バージョン",
+                                                );
                                                 ui.with_layout(
                                                     egui::Layout::right_to_left(
                                                         egui::Align::Center,
@@ -2459,11 +2985,31 @@ impl ZaivernApp {
                                                     },
                                                 );
                                             });
+                                            // 有効/無効。無効にするとコマンド・フック・
+                                            // パネル・テーマ・スニペットを一切登録しない
+                                            let mut enabled = p.enabled;
+                                            if ui
+                                                .checkbox(&mut enabled, "有効")
+                                                .on_hover_text(
+                                                    "外すとコマンド・フック・パネル・テーマを読み込みません",
+                                                )
+                                                .changed()
+                                            {
+                                                pl_toggle = Some((p.name.clone(), enabled));
+                                            }
                                             if let Some(err) = &p.error {
                                                 ui.label(
                                                     RichText::new(format!("⚠ {err}"))
                                                         .size(10.5)
                                                         .color(theme.warn),
+                                                );
+                                                return;
+                                            }
+                                            if !p.enabled {
+                                                ui.label(
+                                                    RichText::new("(無効)")
+                                                        .size(10.5)
+                                                        .color(theme.text_dim),
                                                 );
                                                 return;
                                             }
@@ -2476,8 +3022,10 @@ impl ZaivernApp {
                                             }
                                             ui.label(
                                                 RichText::new(format!(
-                                                    "▶{}  🎨{}  ✂{}{}",
+                                                    "▶{}  🪝{}  📋{}  🎨{}  ✂{}{}",
                                                     p.commands.len(),
+                                                    p.hooks.len(),
+                                                    p.panels.len(),
                                                     p.themes.len(),
                                                     p.snippet_files.len(),
                                                     if p.author.is_empty() {
@@ -2510,6 +3058,124 @@ impl ZaivernApp {
                                                     );
                                                 }
                                             }
+
+                                            // 設定 ([[setting]]) — 変更したその場で保存する
+                                            if !p.settings.is_empty() {
+                                                ui.add_space(2.0);
+                                                egui::CollapsingHeader::new("⚙ 設定")
+                                                    .id_salt(("zv-plset", pi))
+                                                    .show(ui, |ui| {
+                                                        for s in &p.settings {
+                                                            let label = if s.label.is_empty() {
+                                                                s.key.clone()
+                                                            } else {
+                                                                s.label.clone()
+                                                            };
+                                                            let cur = p.setting(&s.key);
+                                                            match s.kind {
+                                                                plugins::SettingType::Bool => {
+                                                                    let mut on =
+                                                                        cur.trim() == "true";
+                                                                    if ui
+                                                                        .checkbox(&mut on, label)
+                                                                        .changed()
+                                                                    {
+                                                                        pl_setting = Some((
+                                                                            p.name.clone(),
+                                                                            s.key.clone(),
+                                                                            on.to_string(),
+                                                                        ));
+                                                                    }
+                                                                }
+                                                                _ => {
+                                                                    ui.label(
+                                                                        RichText::new(label)
+                                                                            .size(10.5)
+                                                                            .color(theme.text_dim),
+                                                                    );
+                                                                    let mut v = cur.clone();
+                                                                    let te =
+                                                                        egui::TextEdit::singleline(
+                                                                            &mut v,
+                                                                        )
+                                                                        .password(s.secret)
+                                                                        .desired_width(f32::INFINITY);
+                                                                    if ui.add(te).changed() {
+                                                                        // 型に合わない入力は保存しない
+                                                                        if s.kind.accepts(&v) {
+                                                                            pl_setting = Some((
+                                                                                p.name.clone(),
+                                                                                s.key.clone(),
+                                                                                v,
+                                                                            ));
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    });
+                                            }
+
+                                            // パネル ([[panel]]) — 本文をそのまま描く
+                                            for pa in &p.panels {
+                                                ui.add_space(2.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{} {}",
+                                                            pa.icon, pa.title
+                                                        ))
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(theme.text),
+                                                    );
+                                                    if !pa.run.trim().is_empty()
+                                                        && ui
+                                                            .small_button("⟳")
+                                                            .on_hover_text("このパネルを更新")
+                                                            .clicked()
+                                                    {
+                                                        pl_panel_refresh = Some((
+                                                            p.name.clone(),
+                                                            pa.id.clone(),
+                                                        ));
+                                                    }
+                                                });
+                                                let key =
+                                                    (p.name.clone(), pa.id.clone());
+                                                match panel_texts.get(&key) {
+                                                    Some(t) if !t.trim().is_empty() => {
+                                                        match pa.format {
+                                                            plugins::PanelFormat::Markdown => {
+                                                                let mut rctx =
+                                                                    markdown::RenderCtx {
+                                                                        dir: None,
+                                                                        images: &mut md_images,
+                                                                    };
+                                                                markdown::render(
+                                                                    ui, &theme, &hl, md_base,
+                                                                    t, &mut rctx,
+                                                                );
+                                                            }
+                                                            plugins::PanelFormat::Text => {
+                                                                ui.label(
+                                                                    RichText::new(t)
+                                                                        .monospace()
+                                                                        .size(11.0)
+                                                                        .color(theme.text),
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {
+                                                        ui.label(
+                                                            RichText::new("(内容なし)")
+                                                                .size(10.5)
+                                                                .color(theme.text_dim),
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         });
                                     ui.add_space(4.0);
                                 }
@@ -2517,6 +3183,35 @@ impl ZaivernApp {
                     }
                 }
             });
+
+        self.md_images = md_images;
+
+        // 有効/無効の切り替えを保存し、登録内容を作り直す
+        if let Some((name, enabled)) = pl_toggle {
+            self.cfg.plugins.set_enabled(&name, enabled);
+            if let Err(e) = config::save_plugins_section(&self.cfg) {
+                self.toast(format!("設定の保存に失敗: {e}"), false);
+            }
+            self.rebuild_plugins();
+            let verb = if enabled { "有効" } else { "無効" };
+            self.toast(format!("🔌 {name} を{verb}にしました"), true);
+        }
+        // 設定値の変更を保存し、実行中のプラグインへも反映する
+        if let Some((name, key, value)) = pl_setting {
+            self.cfg.plugins.set_setting(&name, &key, &value);
+            if let Err(e) = config::save_plugins_section(&self.cfg) {
+                self.toast(format!("設定の保存に失敗: {e}"), false);
+            }
+            if let Some(vals) = self.cfg.plugins.settings.get(&name).cloned() {
+                if let Some(p) = self.plugins.iter_mut().find(|p| p.name == name) {
+                    p.apply_settings(&vals);
+                }
+            }
+        }
+        // パネルの手動更新
+        if let Some((name, panel)) = pl_panel_refresh {
+            self.refresh_panel(&name, &panel, ctx);
+        }
 
         if pl_new {
             self.apply_cmd(Cmd::NewPlugin, ctx);
@@ -4684,7 +5379,7 @@ impl ZaivernApp {
                     }
                 }
             }
-            remote::Query::OpenFile(rel) => {
+            remote::Query::OpenFile(rel, line) => {
                 // パストラバーサル防御: ワークスペース外は開かせない
                 let p = self.workspace.join(rel);
                 let ws = self
@@ -4703,10 +5398,75 @@ impl ZaivernApp {
                                 self.queue_lsp_change(i);
                             }
                         }
+                        self.queue_hook(plugins::HookEvent::FileOpen, Some(p.clone()));
                         self.persist_session();
+                        if let Some(n) = line {
+                            self.goto_line(*n);
+                        }
                         json!({"ok": true}).to_string()
                     }
                     Err(e) => json!({"ok": false, "error": e}).to_string(),
+                }
+            }
+            // プラグイン / CLI からのトースト通知
+            remote::Query::Notify(message, level) => {
+                let msg = notify::truncate_chars(message.trim(), 200);
+                match level.trim() {
+                    "warn" => self.toast_warn(format!("🔌 {msg}")),
+                    "error" => self.toast(format!("🔌 {msg}"), false),
+                    _ => self.toast(format!("🔌 {msg}"), true),
+                }
+                json!({"ok": true}).to_string()
+            }
+            // プラグインパネルの本文を書き換える
+            remote::Query::SetPanel {
+                plugin,
+                panel,
+                text,
+            } => {
+                // plugin が空なら、その panel id を持つ最初の有効プラグインへ送る
+                let target = if plugin.trim().is_empty() {
+                    self.plugins
+                        .iter()
+                        .find(|p| p.active() && p.panels.iter().any(|x| &x.id == panel))
+                        .map(|p| p.name.clone())
+                } else {
+                    Some(plugin.clone())
+                };
+                match target {
+                    Some(name) if self.set_plugin_panel(&name, panel, text.clone()) => {
+                        json!({"ok": true, "plugin": name}).to_string()
+                    }
+                    _ => json!({
+                        "ok": false,
+                        "error": format!("パネルが見つかりません: {panel}"),
+                    })
+                    .to_string(),
+                }
+            }
+            // ステータスバーへ任意の文字列を出す (空文字で消える)
+            remote::Query::SetStatus(text) => {
+                self.plugin_status = text.clone();
+                json!({"ok": true}).to_string()
+            }
+            // エージェントの入力欄へ差し込む (submit=true のときだけ Enter)
+            remote::Query::Prompt {
+                text,
+                agent,
+                submit,
+            } => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return json!({"ok": false, "error": "テキストが空です"}).to_string();
+                }
+                if self.send_agent_prompt(Some(agent.as_str()), &text, *submit) {
+                    json!({"ok": true, "sent": 1}).to_string()
+                } else {
+                    json!({
+                        "ok": false,
+                        "error": "エージェントセッションが見つかりません",
+                    })
+                    .to_string()
                 }
             }
             remote::Query::Tab(i) => {
@@ -4960,6 +5720,15 @@ impl ZaivernApp {
 
 impl eframe::App for ZaivernApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 低頻度の定期フレームを必ず予約しておく。
+        //
+        // スマホリモートと CLI (`zai notify` など) からの要求は、UI スレッドが
+        // フレームを回した時にしか処理できない。ウィンドウが背面や非表示だと
+        // OS 側で更新が抑制され、request_repaint だけでは十数秒フレームが
+        // 来ないことがあり、要求が取りこぼされる。
+        // 4fps 相当なら負荷はごくわずかで、外部からの操作が常に届くようになる。
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+
         // 音声入力が先。押している間だけ録音するキーは他所へ渡さない
         // (ターミナルが PTY へ転送してしまうため)
         self.poll_voice(ctx);
@@ -4971,6 +5740,25 @@ impl eframe::App for ZaivernApp {
 
         // プラグインコマンドの実行結果をエディタへ反映する
         self.process_plugin_results(ctx);
+
+        // フック: 起動時 (初回フレームの後に一度だけ)
+        if !self.startup_hooks_done {
+            self.startup_hooks_done = true;
+            self.hook_git_branch = self.git_branch();
+            self.fire_hooks(plugins::HookEvent::Startup, None, ctx);
+        }
+        // フック: ブランチが切り替わったら git_change
+        let branch = self.git_branch();
+        if branch != self.hook_git_branch {
+            self.hook_git_branch = branch;
+            self.fire_hooks(plugins::HookEvent::GitChange, None, ctx);
+        }
+        // 予約されたフック (ファイル操作・エージェントの状態変化) を消化する
+        for (event, file) in std::mem::take(&mut self.pending_hooks) {
+            self.fire_hooks(event, file, ctx);
+        }
+        // interval フックと interval 更新のパネルを回す
+        self.tick_plugin_timers(ctx);
 
         // 外部(エージェント等)によるファイル書き換えを検知して自動リロードする
         self.check_external_changes();
@@ -5019,6 +5807,9 @@ impl eframe::App for ZaivernApp {
                     if !win_focused {
                         notify::notify("Zaivern Code", &format!("🔔 {title} が承認待ちです"));
                     }
+                    if !throttled {
+                        self.queue_hook(plugins::HookEvent::AgentAttention, None);
+                    }
                 }
                 SessionEvent::AutoApproved(title, desc) => {
                     self.toast(format!("⚡ {title}: {desc} を自動送信しました"), true);
@@ -5043,6 +5834,7 @@ impl eframe::App for ZaivernApp {
                         let mark = if code == 0 { "✅" } else { "❌" };
                         notify::notify("Zaivern Code", &format!("{mark} {title} が終了しました"));
                     }
+                    self.queue_hook(plugins::HookEvent::AgentFinish, None);
                 }
             }
         }
@@ -5210,6 +6002,11 @@ impl eframe::App for ZaivernApp {
                 }
             }
         }
+    }
+
+    /// 終了時に、CLI 向けの接続情報ファイルを片付ける。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        cli::remove_instance_file();
     }
 }
 

@@ -1,0 +1,86 @@
+[plugin]
+name = "worktrees"
+version = "0.1.0"
+author = "Zaivern"
+description = "作業ごとに git ワークツリーを切り、並列で進めて最後に取り込む"
+api = 2
+
+[[setting]]
+key = "count"
+type = "int"
+default = 3
+label = "並列エージェント数"
+
+[[setting]]
+key = "root"
+type = "string"
+default = ""
+label = "ワークツリー置き場（空ならリポジトリの隣）"
+
+[[setting]]
+key = "agent_cmd"
+type = "string"
+default = ""
+label = "エージェント起動コマンド（空なら使用中のエージェント）"
+
+[[command]]
+id = "create"
+title = "ワークツリーを作成"
+icon = "🌿"
+run = 'sh "$ZV_PLUGIN_DIR/create.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 60
+
+[[command]]
+id = "parallel"
+title = "並列エージェントを起動"
+icon = "🚀"
+run = 'sh "$ZV_PLUGIN_DIR/parallel.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 120
+
+[[command]]
+id = "list"
+title = "ワークツリー一覧"
+icon = "📋"
+run = 'sh "$ZV_PLUGIN_DIR/list.sh"'
+input = "none"
+output = "panel"
+panel = "worktrees"
+timeout_secs = 30
+
+[[command]]
+id = "remove"
+title = "ワークツリーを削除"
+icon = "🗑"
+run = 'sh "$ZV_PLUGIN_DIR/remove.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 60
+
+[[command]]
+id = "merge"
+title = "変更を取り込む"
+icon = "🔀"
+run = 'sh "$ZV_PLUGIN_DIR/merge.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 60
+
+[[hook]]
+event = "git_change"
+run = 'sh "$ZV_PLUGIN_DIR/list.sh"'
+output = "panel"
+panel = "worktrees"
+timeout_secs = 30
+
+[[panel]]
+id = "worktrees"
+title = "ワークツリー"
+icon = "🌿"
+run = 'sh "$ZV_PLUGIN_DIR/list.sh"'
+refresh = "on_open"
+interval_secs = 30
+format = "markdown"
