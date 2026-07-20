@@ -869,6 +869,7 @@ impl ZaivernApp {
     /// 開いているタブのファイルが外部(エージェント等)で書き換えられていないか
     /// 約1秒ごとに確認する。未保存の編集が無いバッファはディスクの内容へ自動で
     /// 読み直し、編集と競合したバッファは上書きせず一度だけ警告する。
+    /// あわせてファイルツリーも外部でのファイル追加・削除を検知して自動更新する。
     fn check_external_changes(&mut self) {
         let fresh = self
             .ext_check_at
@@ -878,6 +879,7 @@ impl ZaivernApp {
             return;
         }
         self.ext_check_at = Some(Instant::now());
+        self.tree.refresh_if_changed();
         for ev in self.editor.check_external() {
             match ev {
                 ExternalEvent::Reloaded { index, title } => {

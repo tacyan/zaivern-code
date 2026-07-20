@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use eframe::egui::{self, RichText};
 
@@ -48,6 +49,9 @@ struct EditState {
 pub struct FileTree {
     pub root: PathBuf,
     cache: HashMap<PathBuf, Vec<Entry>>,
+    /// キャッシュ取得時のディレクトリ mtime(外部変更検知用)。
+    /// エントリの追加・削除・リネームで親ディレクトリの mtime が変わる。
+    mtimes: HashMap<PathBuf, Option<SystemTime>>,
     pub show_hidden: bool,
     edit: Option<EditState>,
 }
@@ -57,6 +61,7 @@ impl FileTree {
         Self {
             root,
             cache: HashMap::new(),
+            mtimes: HashMap::new(),
             show_hidden,
             edit: None,
         }
@@ -65,11 +70,27 @@ impl FileTree {
     pub fn set_root(&mut self, root: PathBuf) {
         self.root = root;
         self.cache.clear();
+        self.mtimes.clear();
         self.edit = None;
     }
 
     pub fn invalidate(&mut self) {
         self.cache.clear();
+        self.mtimes.clear();
+    }
+
+    /// キャッシュ済みの各階層をディレクトリ mtime で確認し、外部(エージェント等)で
+    /// ファイルが追加・削除・リネームされていたら全キャッシュを破棄する。
+    /// 変化があれば true(次フレームの描画でディスクから読み直される)。
+    pub fn refresh_if_changed(&mut self) -> bool {
+        let changed = self
+            .mtimes
+            .iter()
+            .any(|(dir, cached)| dir_mtime(dir) != *cached);
+        if changed {
+            self.invalidate();
+        }
+        changed
     }
 
     /// `dir` 直下への新規ファイル作成を開始する(インライン入力を出す)。
@@ -134,6 +155,7 @@ impl FileTree {
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         self.cache.insert(dir.to_path_buf(), v.clone());
+        self.mtimes.insert(dir.to_path_buf(), dir_mtime(dir));
         v
     }
 
@@ -321,6 +343,82 @@ impl FileTree {
                 });
             }
         }
+    }
+}
+
+/// ディレクトリの更新時刻。取得できない(削除された等)場合は None。
+fn dir_mtime(dir: &Path) -> Option<SystemTime> {
+    std::fs::metadata(dir).and_then(|m| m.modified()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// std::env::temp_dir() 配下に一意なディレクトリを自作する（HOME 非依存）。
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "zaivern-tree-test-{}-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos,
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("create unique temp dir");
+        dir
+    }
+
+    /// 記録済みの mtime を過去へずらし、同一秒内の外部変更でも差が出るようにする
+    /// （mtime 粒度が粗いファイルシステムでもテストを決定的にするため）。
+    fn backdate_recorded(t: &mut FileTree, dir: &Path) {
+        let m = t.mtimes.get_mut(dir).expect("dir is cached");
+        *m = m.map(|x| x - Duration::from_secs(2));
+    }
+
+    #[test]
+    fn refresh_is_noop_without_changes() {
+        let dir = unique_temp_dir("noop");
+        std::fs::write(dir.join("a.txt"), "x").expect("write");
+        let mut t = FileTree::new(dir.clone(), false);
+        assert_eq!(t.entries(&dir).len(), 1);
+        assert!(!t.refresh_if_changed());
+        assert!(t.cache.contains_key(&dir), "変化が無ければキャッシュは保持");
+    }
+
+    #[test]
+    fn refresh_detects_external_create() {
+        let dir = unique_temp_dir("create");
+        let mut t = FileTree::new(dir.clone(), false);
+        assert!(t.entries(&dir).is_empty());
+
+        std::fs::write(dir.join("agent.rs"), "fn main() {}").expect("external create");
+        backdate_recorded(&mut t, &dir);
+
+        assert!(t.refresh_if_changed(), "外部作成を検知する");
+        let names: Vec<_> = t.entries(&dir).iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["agent.rs"]);
+    }
+
+    #[test]
+    fn refresh_detects_external_delete() {
+        let dir = unique_temp_dir("delete");
+        let path = dir.join("gone.txt");
+        std::fs::write(&path, "x").expect("write");
+        let mut t = FileTree::new(dir.clone(), false);
+        assert_eq!(t.entries(&dir).len(), 1);
+
+        std::fs::remove_file(&path).expect("external delete");
+        backdate_recorded(&mut t, &dir);
+
+        assert!(t.refresh_if_changed(), "外部削除を検知する");
+        assert!(t.entries(&dir).is_empty());
     }
 }
 
