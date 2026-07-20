@@ -57,6 +57,53 @@ pub struct Config {
     /// `[supervisor]` セクションが無い既存の config.toml でも、
     /// `SupervisorConfig` 側の `#[serde(default)]` により既定値で読み込まれる。
     pub supervisor: crate::supervisor::SupervisorConfig,
+    /// 監視役 LLM (スーパーエージェント) の設定。
+    /// `[super_agent]` セクションが無い既存の config.toml でも、
+    /// `SuperAgentConfig` 側の `#[serde(default)]` により既定値 (= なし) で読み込まれる。
+    pub super_agent: SuperAgentConfig,
+}
+
+/// `[super_agent]` セクション。**どのエージェントに他のエージェントを見張らせるか**。
+///
+/// 既定は「なし」。決定論的な監視 (supervisor) は この設定に関わらず常に働くので、
+/// ここが空でも見張り自体は成立する。LLM はあくまで助言役。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SuperAgentConfig {
+    /// 監視役に使うプリセットのコマンド。空文字 = なし (LLM には相談しない)。
+    pub command: String,
+    /// LLM への相談を有効にするか。`command` が空ならこの値によらず相談しない。
+    pub enabled: bool,
+    /// 診断 1 回あたりのハード期限 (秒)。5 秒未満は診断側で 5 秒に丸められる。
+    pub timeout_secs: u64,
+}
+
+impl Default for SuperAgentConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            enabled: false,
+            timeout_secs: 60,
+        }
+    }
+}
+
+impl SuperAgentConfig {
+    /// 監視役として実際に動かす対象のコマンド。無効・未選択なら `None`。
+    ///
+    /// 「有効フラグが立っている」だけでは足りない。コマンドが空なら誰も選ばれて
+    /// いないので、ここで必ず弾く。
+    pub fn active_command(&self) -> Option<&str> {
+        if !self.enabled {
+            return None;
+        }
+        let c = self.command.trim();
+        if c.is_empty() {
+            None
+        } else {
+            Some(c)
+        }
+    }
 }
 
 /// `[plugins]` セクション。
@@ -130,6 +177,7 @@ impl Default for Config {
             agents: default_agents(),
             keybindings: HashMap::new(),
             supervisor: crate::supervisor::SupervisorConfig::default(),
+            super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),
         }
     }
@@ -245,6 +293,11 @@ struct UiState {
     voice_lang: Option<String>,
     voice_command: Option<String>,
     voice_keyword: Option<String>,
+    /// 監視役 LLM の選択。UI から選ぶものなので、手書きの config.toml ではなく
+    /// state 側に置く (config.toml をアプリが書き換えない方針に合わせる)。
+    super_agent_command: Option<String>,
+    super_agent_enabled: Option<bool>,
+    super_agent_timeout_secs: Option<u64>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -491,6 +544,15 @@ pub fn load(roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.voice_keyword {
                     cfg.voice_keyword = v;
                 }
+                if let Some(v) = st.super_agent_command {
+                    cfg.super_agent.command = v;
+                }
+                if let Some(v) = st.super_agent_enabled {
+                    cfg.super_agent.enabled = v;
+                }
+                if let Some(v) = st.super_agent_timeout_secs {
+                    cfg.super_agent.timeout_secs = v;
+                }
             }
         }
     }
@@ -505,6 +567,13 @@ pub fn load(roots: &[PathBuf], with_state: bool) -> Config {
     cfg.editor_font_size = cfg.editor_font_size.clamp(8.0, 32.0);
     cfg.terminal_font_size = cfg.terminal_font_size.clamp(7.0, 28.0);
     cfg.pet_scale = cfg.pet_scale.clamp(0.5, 2.0);
+    // 期限が 0 だと診断側で毎回丸められて分かりにくいので、ここで下限を揃える。
+    cfg.super_agent.timeout_secs = cfg.super_agent.timeout_secs.clamp(5, 600);
+    // LLM 相談の ON/OFF は「監視役が選ばれているか」から導く。
+    // `[supervisor] llm_escalation` を単独で立てても、相談相手が居なければ
+    // 何も起きない (request_diagnosis が no-op になる) ため、UI の見え方と
+    // 実挙動がずれないようここで一本化する。
+    cfg.supervisor.llm_escalation = cfg.super_agent.active_command().is_some();
     cfg
 }
 
@@ -677,6 +746,9 @@ pub fn save_state(cfg: &Config) {
         voice_lang: Some(cfg.voice_lang.clone()),
         voice_command: Some(cfg.voice_command.clone()),
         voice_keyword: Some(cfg.voice_keyword.clone()),
+        super_agent_command: Some(cfg.super_agent.command.clone()),
+        super_agent_enabled: Some(cfg.super_agent.enabled),
+        super_agent_timeout_secs: Some(cfg.super_agent.timeout_secs),
     };
     if let Ok(s) = toml::to_string_pretty(&st) {
         let _ = std::fs::create_dir_all(zaivern_dir());
@@ -1052,6 +1124,9 @@ mod tests {
             voice_lang: Some("en-US".into()),
             voice_command: Some("my-stt --lang {lang}".into()),
             voice_keyword: Some("送信".into()),
+            super_agent_command: Some("claude".into()),
+            super_agent_enabled: Some(true),
+            super_agent_timeout_secs: Some(45),
         };
         let s = toml::to_string_pretty(&st).expect("UiState は TOML 化できる");
         let back: UiState = toml::from_str(&s).expect("読み戻せる");
@@ -1068,6 +1143,10 @@ mod tests {
         // エスケープが必要な制御文字も往復する
         assert_eq!(back.pet_approve_keys, Some("\r".to_string()));
         assert_eq!(back.pet_deny_keys, Some("\u{1b}".to_string()));
+        // 監視役 LLM の選択も state に残る
+        assert_eq!(back.super_agent_command, Some("claude".to_string()));
+        assert_eq!(back.super_agent_enabled, Some(true));
+        assert_eq!(back.super_agent_timeout_secs, Some(45));
     }
 
     #[test]
@@ -1172,6 +1251,80 @@ mod supervisor_field_tests {
         };
         let cfg: Config = toml::from_str(&s).expect("既存の config.toml が読めなくなった");
         assert!(!cfg.theme.is_empty());
+        // 新しく生えた [super_agent] を書いていない既存ファイルでも既定値で埋まる
+        assert_eq!(cfg.super_agent, SuperAgentConfig::default());
+    }
+}
+
+#[cfg(test)]
+mod super_agent_field_tests {
+    use super::*;
+
+    /// DoD: `[super_agent]` セクションが無い既存の config.toml が、
+    /// これまでどおり読めて「なし」の既定値が入ること。
+    #[test]
+    fn super_agentセクションが無い設定も読める() {
+        assert!(
+            !DEFAULT_CONFIG.contains("[super_agent]"),
+            "この検証は [super_agent] を書いていない設定を前提にしている"
+        );
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定の設定が読めなくなった");
+        assert_eq!(cfg.super_agent.command, "");
+        assert!(!cfg.super_agent.enabled);
+        assert_eq!(cfg.super_agent.timeout_secs, 60);
+        assert_eq!(cfg.super_agent.active_command(), None);
+    }
+
+    /// 何も書かれていない TOML でも既定値どおりに読める。
+    #[test]
+    fn 空のtomlでも既定の監視役はなし() {
+        let cfg: Config = toml::from_str("").expect("空の TOML");
+        assert_eq!(cfg.super_agent, SuperAgentConfig::default());
+    }
+
+    /// 部分指定 (コマンドだけ) でも他は既定値のまま。
+    #[test]
+    fn 監視役の部分指定が読める() {
+        let cfg: Config =
+            toml::from_str("[super_agent]\ncommand = \"claude\"\nenabled = true\n").expect("TOML");
+        assert_eq!(cfg.super_agent.command, "claude");
+        assert!(cfg.super_agent.enabled);
+        assert_eq!(cfg.super_agent.timeout_secs, 60);
+        assert_eq!(cfg.super_agent.active_command(), Some("claude"));
+    }
+
+    /// DoD: 有効フラグだけ立っていてコマンドが空なら、監視役は居ない扱い。
+    /// ここを取り違えると「誰も選ばれていないのに相談モードが ON」になる。
+    #[test]
+    fn コマンドが空なら有効フラグだけでは動かない() {
+        let c = SuperAgentConfig {
+            command: "   ".into(),
+            enabled: true,
+            timeout_secs: 30,
+        };
+        assert_eq!(c.active_command(), None);
+    }
+
+    /// 無効化されていれば、コマンドが入っていても動かない。
+    #[test]
+    fn 無効化されていれば監視役は居ない() {
+        let c = SuperAgentConfig {
+            command: "claude".into(),
+            enabled: false,
+            timeout_secs: 30,
+        };
+        assert_eq!(c.active_command(), None);
+    }
+
+    /// 前後の空白は落として渡す (診断側のカタログ照合が空白で失敗しないように)。
+    #[test]
+    fn コマンドの前後空白は落ちる() {
+        let c = SuperAgentConfig {
+            command: "  codex  ".into(),
+            enabled: true,
+            timeout_secs: 30,
+        };
+        assert_eq!(c.active_command(), Some("codex"));
     }
 }
 

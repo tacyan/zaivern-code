@@ -5,6 +5,7 @@ mod app;
 mod cli;
 mod config;
 mod coordinator;
+mod diagnostician;
 mod diff;
 mod editor;
 mod editor_ops;

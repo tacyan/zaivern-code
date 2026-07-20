@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
@@ -9,6 +9,7 @@ use crate::agents::{AgentManager, SessionEvent};
 use crate::cli;
 use crate::config::{self, Config};
 use crate::coordinator;
+use crate::diagnostician;
 use crate::orchestration;
 use crate::supervisor;
 use crate::editor::{disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
@@ -379,6 +380,70 @@ pub struct ZaivernApp {
 
     /// 端末へ伝え済みのテーマ色 (OSC 10/11 の問い合わせ応答用)。
     report_colors: HashMap<u64, (Color32, Color32)>,
+
+    // ── 監視役 LLM (スーパーエージェント) ───────────────────────
+    /// 設定で選ばれた監視役の実体。未選択・構築失敗なら `None`。
+    /// supervisor 側にも同じ `Arc` を渡してあるが、`set_self_session` や
+    /// `last_error` を UI から読むためにこちらでも保持する。
+    super_agent: Option<Arc<diagnostician::CliDiagnostician>>,
+
+    /// 監視役を組み立てられなかった理由 (日本語)。UI に必ず出す。
+    /// **黙って無効化しない**: ユーザーが選んだのに効いていない状態を隠さない。
+    super_agent_err: Option<String>,
+
+    /// いま `set_self_session` に登録しているセッション ID。
+    /// 監視役の CLI は普通の作業にも使えるので、そのセッションが立ち上がったら
+    /// ここへ入れて「自分自身の診断」を断らせる。
+    super_agent_session: Option<u64>,
+
+    /// セッションごとに最後に LLM へ相談した異常種別。
+    /// 同じ異常で毎ティック CLI を叩かないための歯止め。
+    sup_last_diag: HashMap<u64, supervisor::Anomaly>,
+}
+
+/// 監視役に選べないプリセットの理由。選べるなら `None`。
+///
+/// ヘッドレス実行に対応しない CLI を選ばせると、診断のたびに対話 TUI が
+/// 起動して期限まで無言でぶら下がる。**選択肢に出す前にここで弾く**。
+fn super_agent_reject_reason(command: &str) -> Option<String> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return Some("素のシェルなので診断を頼めません".into());
+    }
+    let Some(spec) = crate::agents::spec_for_command(cmd) else {
+        return Some("既知のエージェント CLI ではないため対応可否を判断できません".into());
+    };
+    if spec.headless.is_empty() {
+        return Some(format!(
+            "{} はヘッドレス実行に対応していません (対話 TUI しか起動できません)",
+            spec.label
+        ));
+    }
+    None
+}
+
+/// 監視役として選ばれたコマンドで動いているセッションを 1 つ選ぶ **純関数**。
+///
+/// プリセットのコマンドは権限モードによってフラグが付け外しされるため、
+/// 文字列の完全一致では取りこぼす。カタログの実行ファイル名まで落として比べる。
+/// 見つからなければ `None` (= 自己診断ガードは働かせなくてよい)。
+fn pick_self_session(rows: &[(u64, bool, String)], command: &str) -> Option<u64> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    let want = crate::agents::spec_for_command(cmd).map(|s| s.bin);
+    rows.iter()
+        .find(|(_, running, c)| {
+            if !*running {
+                return false;
+            }
+            match (want, crate::agents::spec_for_command(c.trim())) {
+                (Some(a), Some(b)) => a == b.bin,
+                _ => c.trim() == cmd,
+            }
+        })
+        .map(|(id, _, _)| *id)
 }
 
 /// 介入をそのまま実行してよいか、確認ダイアログへ回すか。
@@ -557,8 +622,14 @@ impl ZaivernApp {
             typed_voice: HashMap::new(),
             typed_sup: HashMap::new(),
             report_colors: HashMap::new(),
+            super_agent: None,
+            super_agent_err: None,
+            super_agent_session: None,
+            sup_last_diag: HashMap::new(),
             cfg,
         };
+        // 設定で選ばれている監視役を組み立てる (失敗したら理由を残して先へ進む)。
+        app.apply_super_agent();
         // ユーザー指定のペット画像をロード
         if let Some(path) = app.cfg.pet_image.clone() {
             app.pet_tex = load_pet_texture(&cc.egui_ctx, Path::new(&path));
@@ -2290,6 +2361,8 @@ impl ZaivernApp {
                 // 監視設定も入れ替える。サンプル間隔が変わるので次回刻みも捨てる。
                 self.supervisor.set_config(self.cfg.supervisor.clone());
                 self.sup_next_at = None;
+                // 監視役 LLM も選び直されているかもしれないので作り直す。
+                self.apply_super_agent();
                 self.keys = Keybinds::from_overrides(&self.cfg.keybindings);
                 for b in &mut self.editor.buffers {
                     b.cache = None;
@@ -4056,6 +4129,10 @@ impl ZaivernApp {
         let mut voice_all = false;
         let mut voice_stop = false;
         let mut orch_acts: Vec<orchestration::OrchAction> = Vec::new();
+        // 監視役 LLM の変更は、借用の都合でいったんここへ退避して閉じた後に適用する。
+        let mut super_pick: Option<String> = None;
+        let mut super_enabled: Option<bool> = None;
+        let mut super_timeout: Option<u64> = None;
         let orch_rows = self.orch_rows();
 
         egui::Frame::none()
@@ -4146,6 +4223,144 @@ impl ZaivernApp {
                     &orch_rows,
                     &orchestration::bus_status(&self.coordinator, &orch_rows),
                 );
+
+                // ── 監視役 LLM (スーパーエージェント) の選択 ──────────────
+                egui::CollapsingHeader::new(
+                    RichText::new("🧠 スーパーエージェント (監視役 LLM)")
+                        .strong()
+                        .color(theme.text),
+                )
+                .id_salt("super-agent-section")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "決定論的な見張り (停滞・ループ・エラー多発の検知) は、この設定に\
+                             関わらず常に動きます。ここで選んだエージェントは異常時に所見と\
+                             推奨を返す助言役で、再起動・停止などの破壊的な操作は今までどおり\
+                             確認ダイアログを通ります。選んだエージェントは普通の作業にも\
+                             そのまま使えますし、そのセッション自身も見張りの対象です。",
+                        )
+                        .size(12.0)
+                        .color(theme.text_dim),
+                    );
+                    ui.add_space(6.0);
+
+                    let cur = self.cfg.super_agent.command.trim().to_string();
+                    const NONE_LABEL: &str = "なし（監視のみ・LLM相談しない）";
+                    let cur_label = if cur.is_empty() {
+                        NONE_LABEL.to_string()
+                    } else {
+                        self.cfg
+                            .agents
+                            .iter()
+                            .find(|p| p.command.trim() == cur)
+                            .map(|p| format!("{} {}", p.icon, p.name))
+                            .unwrap_or_else(|| cur.clone())
+                    };
+
+                    egui::ComboBox::from_id_salt("super-agent-pick")
+                        .selected_text(cur_label)
+                        .width(320.0)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(cur.is_empty(), NONE_LABEL).clicked() {
+                                super_pick = Some(String::new());
+                            }
+                            for p in self.cfg.agents.iter() {
+                                let cmd = p.command.trim().to_string();
+                                // ヘッドレス非対応のプリセットは選ばせない。
+                                // 選べてしまうと対話 TUI が起動して期限まで返らない。
+                                match super_agent_reject_reason(&cmd) {
+                                    None => {
+                                        if ui
+                                            .selectable_label(
+                                                cur == cmd,
+                                                format!("{} {}", p.icon, p.name),
+                                            )
+                                            .clicked()
+                                        {
+                                            super_pick = Some(cmd);
+                                        }
+                                    }
+                                    Some(why) => {
+                                        ui.add_enabled(
+                                            false,
+                                            egui::Button::new(
+                                                RichText::new(format!(
+                                                    "{} {} — 選べません",
+                                                    p.icon, p.name
+                                                ))
+                                                .color(theme.text_dim),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .on_disabled_hover_text(why);
+                                    }
+                                }
+                            }
+                        });
+
+                    ui.horizontal(|ui| {
+                        let mut en = self.cfg.super_agent.enabled;
+                        if ui
+                            .checkbox(&mut en, "LLM に相談する")
+                            .on_hover_text(
+                                "OFF にすると相談だけ止まります。決定論的な見張りは動き続けます",
+                            )
+                            .changed()
+                        {
+                            super_enabled = Some(en);
+                        }
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("診断の期限").color(theme.text_dim));
+                        let mut t = self.cfg.super_agent.timeout_secs as i64;
+                        if ui
+                            .add(egui::DragValue::new(&mut t).range(5..=600).suffix(" 秒"))
+                            .on_hover_text("この時間で返事が無ければ診断は捨てます (最低 5 秒)")
+                            .changed()
+                        {
+                            super_timeout = Some(t.clamp(5, 600) as u64);
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    match (&self.super_agent, &self.super_agent_err) {
+                        (Some(d), _) => {
+                            let (cmd, label) = d.describe();
+                            ui.label(
+                                RichText::new(format!("✅ 監視役: {label}  (`{cmd}`)"))
+                                    .color(theme.ok),
+                            );
+                            if let Some(id) = d.self_session_id() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "自己診断ガード: セッション #{id} は監視役自身なので、\
+                                         そのセッションの診断は必ず断ります"
+                                    ))
+                                    .size(12.0)
+                                    .color(theme.text_dim),
+                                );
+                            }
+                            // 診断を見送った理由を隠さない。黙って何もしない監視役が
+                            // いちばん質が悪い。
+                            if let Some(e) = d.last_error() {
+                                ui.label(
+                                    RichText::new(format!("⚠ 直近の診断を見送りました: {e}"))
+                                        .color(theme.warn),
+                                );
+                            }
+                        }
+                        (None, Some(e)) => {
+                            ui.label(RichText::new(format!("⚠ {e}")).color(theme.err));
+                        }
+                        (None, None) => {
+                            ui.label(
+                                RichText::new("監視役: なし（決定論的な見張りだけが動いています）")
+                                    .color(theme.text_dim),
+                            );
+                        }
+                    }
+                });
+                ui.add_space(8.0);
 
                 let n = self.agents.sessions.len();
                 if n == 0 {
@@ -4370,6 +4585,28 @@ impl ZaivernApp {
             &orch_rows,
         ));
         self.orch_apply(orch_acts);
+
+        // 監視役 LLM の変更を反映する (閉じた後に適用するのが app.rs の作法)。
+        let mut super_changed = false;
+        if let Some(cmd) = super_pick {
+            // 「なし」を選んだら相談自体を止める。エージェントを選んだ場合は、
+            // わざわざもう 1 か所チェックを入れさせない。
+            self.cfg.super_agent.enabled = !cmd.is_empty();
+            self.cfg.super_agent.command = cmd;
+            super_changed = true;
+        }
+        if let Some(en) = super_enabled {
+            self.cfg.super_agent.enabled = en;
+            super_changed = true;
+        }
+        if let Some(t) = super_timeout {
+            self.cfg.super_agent.timeout_secs = t;
+            super_changed = true;
+        }
+        if super_changed {
+            self.apply_super_agent();
+            config::save_state(&self.cfg);
+        }
     }
 
     // ─── UI: editor ─────────────────────────────────────────────────
@@ -6433,6 +6670,71 @@ impl ZaivernApp {
 
     // ─── 監視・連携 (supervisor / coordinator / 端末フック) ──────────
 
+    /// 設定に書かれた監視役 LLM を組み立て直す。
+    ///
+    /// 起動時と設定変更時に必ず通る 1 か所。ここで
+    /// `supervisor.llm_escalation` も併せて決めるので、「選んだのに効かない」
+    /// も「選んでいないのに走る」も起こらない。
+    fn apply_super_agent(&mut self) {
+        self.super_agent = None;
+        self.super_agent_err = None;
+        self.super_agent_session = None;
+
+        if let Some(cmd) = self.cfg.super_agent.active_command().map(str::to_string) {
+            if let Some(why) = super_agent_reject_reason(&cmd) {
+                self.super_agent_err = Some(format!("`{cmd}` は監視役にできません: {why}"));
+            } else {
+                let root = Some(self.primary_root().to_path_buf());
+                match diagnostician::CliDiagnostician::new(&cmd, root) {
+                    Ok(d) => {
+                        let d = Arc::new(
+                            d.with_timeout(Duration::from_secs(self.cfg.super_agent.timeout_secs)),
+                        );
+                        self.supervisor
+                            .set_diagnostician(d.clone() as Arc<dyn supervisor::Diagnostician>);
+                        self.super_agent = Some(d);
+                    }
+                    // 日本語の理由をそのまま見せる。黙って無効化はしない。
+                    Err(e) => self.super_agent_err = Some(format!("`{cmd}`: {e}")),
+                }
+            }
+        }
+
+        // 実体が建ったときだけ相談を許す。フックを外す口は supervisor 側に無いが、
+        // llm_escalation が false なら request_diagnosis も intent_from_diagnosis も
+        // 何もしないので、実質的に切れている。
+        self.cfg.supervisor.llm_escalation = self.super_agent.is_some();
+        self.supervisor.set_config(self.cfg.supervisor.clone());
+        self.sup_last_diag.clear();
+        self.sync_super_agent_session();
+
+        if let Some(e) = self.super_agent_err.clone() {
+            self.toast_warn(format!("⚠ 監視役 LLM を有効にできませんでした — {e}"));
+        }
+    }
+
+    /// 監視役の CLI が動いているセッションを `set_self_session` へ反映する。
+    ///
+    /// これを忘れると自己診断ガードが眠ったままになり、詰まった当人に
+    /// 「なぜ詰まったか」を聞きにいって期限まで返らない、という事故になる。
+    fn sync_super_agent_session(&mut self) {
+        let Some(d) = self.super_agent.clone() else {
+            self.super_agent_session = None;
+            return;
+        };
+        let rows: Vec<(u64, bool, String)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| (s.id, s.running(), s.command.clone()))
+            .collect();
+        let id = pick_self_session(&rows, &self.cfg.super_agent.command);
+        if id != self.super_agent_session {
+            self.super_agent_session = id;
+            d.set_self_session(id);
+        }
+    }
+
     /// セッションの増減を supervisor / coordinator へ反映する。
     ///
     /// 起動・削除・再起動 (再起動は ID が変わる) をここ 1 か所で拾うので、
@@ -6450,6 +6752,7 @@ impl ZaivernApp {
             self.typed_sup.remove(&id);
             self.typed_voice.remove(&id);
             self.report_colors.remove(&id);
+            self.sup_last_diag.remove(&id);
             // 消えたセッションについての確認ダイアログはもう意味がない。
             self.pending_intervention.retain(|p| p.session_id != id);
         }
@@ -6459,6 +6762,9 @@ impl ZaivernApp {
             self.coordinator.register_session(id);
             self.known_sessions.insert(id);
         }
+
+        // 監視役自身のセッションが増減したかもしれないので追従する。
+        self.sync_super_agent_session();
     }
 
     /// 端末との細かい連携: フォーカス通知・クリップボード・色問い合わせへの応答。
@@ -6510,6 +6816,18 @@ impl ZaivernApp {
         if !self.cfg.supervisor.enabled {
             return;
         }
+
+        // LLM から返ってきた診断を先に回収する。間引き待ちで取りこぼさないよう
+        // サンプリング刻みの前に置く。**推奨はここでも同じ経路へ流すだけ**で、
+        // 確認ゲートを飛ばす近道は作らない。
+        let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
+        for d in self.supervisor.poll_diagnoses() {
+            self.toast(format!("🧠 AI 診断: {}", d.summary), false);
+            if let Some(it) = self.supervisor.intent_from_diagnosis(&d, approval) {
+                self.accept_intent(it, ctx, win_focused);
+            }
+        }
+
         // supervisor 側も内部で間引くが、無駄に画面テキストを取り出さないよう
         // こちらでも同じ間隔 (+ 余裕 50ms) で刻む。UI スレッドは止めない。
         let now = Instant::now();
@@ -6530,25 +6848,45 @@ impl ZaivernApp {
             })
             .collect();
 
-        let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
         for it in self.supervisor.tick(&snaps, approval) {
-            match route_intent(&it) {
-                IntentRoute::Confirm => {
-                    // 同じセッション・同じ操作の確認が二重に積まれないようにする。
-                    let dup = self
-                        .pending_intervention
-                        .iter()
-                        .any(|p| p.session_id == it.session_id && p.action == it.action);
-                    if !dup {
-                        self.toast_warn(it.toast_line());
-                        self.pending_intervention.push(it);
-                    }
-                }
-                IntentRoute::Run => self.run_intervention(it, ctx, win_focused),
+            // 異常が変わった瞬間だけ LLM に相談する。同じ異常が続いている間
+            // 毎ティック CLI を起動しては、監視のほうがよほど負荷になる。
+            let (sid, anomaly) = (it.session_id, it.anomaly);
+            if self.sup_last_diag.get(&sid) != Some(&anomaly) {
+                self.sup_last_diag.insert(sid, anomaly);
+                // llm_escalation が false / 監視役未設定なら、この呼び出しは no-op。
+                self.supervisor.request_diagnosis(sid, anomaly, ctx);
             }
+            self.accept_intent(it, ctx, win_focused);
         }
 
         self.bridge_states();
+    }
+
+    /// 介入の意図を受け取り、**確認ゲートを通してから**実行する唯一の入口。
+    ///
+    /// 決定論的な見張りからの提案も、LLM の助言由来の提案もここへ集める。
+    /// 経路を 1 本にしておかないと、片方だけ確認を飛ばす抜け道がいつか生える。
+    fn accept_intent(
+        &mut self,
+        it: supervisor::InterventionIntent,
+        ctx: &egui::Context,
+        win_focused: bool,
+    ) {
+        match route_intent(&it) {
+            IntentRoute::Confirm => {
+                // 同じセッション・同じ操作の確認が二重に積まれないようにする。
+                let dup = self
+                    .pending_intervention
+                    .iter()
+                    .any(|p| p.session_id == it.session_id && p.action == it.action);
+                if !dup {
+                    self.toast_warn(it.toast_line());
+                    self.pending_intervention.push(it);
+                }
+            }
+            IntentRoute::Run => self.run_intervention(it, ctx, win_focused),
+        }
     }
 
     /// スーパーバイザーの見立ての変化を coordinator へ伝える。
@@ -8115,5 +8453,233 @@ mod wiring_tests {
                 assert_eq!(route_intent(&intent(action, true)), IntentRoute::Confirm);
             }
         }
+    }
+}
+
+// ─── 監視役 LLM (スーパーエージェント) の選択と配線のテスト ─────────────
+//
+// ここで縛るのは「選ばせてはいけないものを選ばせない」「選んだのに黙って
+// 効かない状態にしない」「LLM の助言でも確認を飛ばさない」の 3 点。
+#[cfg(test)]
+mod super_agent_tests {
+    use super::*;
+    use crate::agents::{Approval, AGENT_CATALOG};
+
+    /// DoD: 既定は「なし」。何も設定していない人が、知らないうちに自分の
+    /// エージェントを外部プロセスへ相談させられることは無い。
+    #[test]
+    fn 既定の監視役はなし() {
+        let c = Config::default();
+        assert_eq!(c.super_agent.command, "");
+        assert!(!c.super_agent.enabled);
+        assert_eq!(c.super_agent.active_command(), None);
+        // 相談相手が居ないので LLM エスカレーションも当然 OFF
+        assert!(!c.supervisor.llm_escalation);
+    }
+
+    /// 素のシェル (コマンド空) のプリセットは監視役にできない。
+    #[test]
+    fn 素のシェルは監視役に選べない() {
+        assert!(super_agent_reject_reason("").is_some());
+        assert!(super_agent_reject_reason("   ").is_some());
+    }
+
+    /// DoD: カタログに無いコマンドは「対応しているか判断できない」として弾く。
+    /// 判らないものをヘッドレス扱いすると、対話 TUI が上がって期限まで返らない。
+    #[test]
+    fn カタログに無いコマンドは非対応扱い() {
+        for cmd in ["definitely-not-an-agent", "vim", "python3 -i"] {
+            let why = super_agent_reject_reason(cmd)
+                .unwrap_or_else(|| panic!("{cmd} は非対応として弾かれるべき"));
+            assert!(
+                why.contains("既知のエージェント CLI ではない"),
+                "理由が伝わる文言であること: {why}"
+            );
+        }
+    }
+
+    /// DoD: ヘッドレス実行に対応しないエージェントは選択肢から外れる。
+    ///
+    /// カタログの全 CLI について「headless が空 ⇔ 選べない」を突き合わせるので、
+    /// 将来ヘッドレス非対応の CLI が追加された瞬間から実効的な検査になる。
+    #[test]
+    fn ヘッドレス非対応のプリセットは選択肢から外れる() {
+        for spec in AGENT_CATALOG {
+            let ok = super_agent_reject_reason(spec.bin).is_none();
+            assert_eq!(
+                ok,
+                !spec.headless.is_empty(),
+                "{} は headless={:?} なので選択可否は {} であるべき",
+                spec.bin,
+                spec.headless,
+                !spec.headless.is_empty()
+            );
+            if !ok {
+                let why = super_agent_reject_reason(spec.bin).expect("理由");
+                assert!(
+                    why.contains("ヘッドレス"),
+                    "非対応の理由はヘッドレスに触れること: {why}"
+                );
+            }
+        }
+    }
+
+    /// 選べると判定したコマンドは、実際に `CliDiagnostician` を組み立てられること。
+    /// UI の可否判定と実体の構築可否がずれていたら、選んだ瞬間にエラーになる。
+    #[test]
+    fn 選択可能な判定と実体の構築可否が一致する() {
+        for spec in AGENT_CATALOG {
+            let ok = super_agent_reject_reason(spec.bin).is_none();
+            let built = diagnostician::CliDiagnostician::new(spec.bin, None).is_ok();
+            assert_eq!(ok, built, "{} で UI 判定と構築可否がずれている", spec.bin);
+        }
+    }
+
+    /// 既定のプリセット一覧から、実際に監視役として出せるものが 1 つ以上ある。
+    #[test]
+    fn 既定プリセットに監視役候補が存在する() {
+        let c = Config::default();
+        let picks: Vec<&str> = c
+            .agents
+            .iter()
+            .filter(|p| super_agent_reject_reason(&p.command).is_none())
+            .map(|p| p.command.as_str())
+            .collect();
+        assert!(!picks.is_empty(), "既定プリセットに候補が無いのはおかしい");
+        // 素のシェル (コマンド空) は必ず候補外
+        assert!(!picks.iter().any(|c| c.trim().is_empty()));
+    }
+
+    // ---- 自己診断ガードのセッション対応付け ----
+
+    fn rows() -> Vec<(u64, bool, String)> {
+        vec![
+            (1, true, "codex".into()),
+            (2, true, "claude --dangerously-skip-permissions".into()),
+            (3, false, "claude".into()),
+        ]
+    }
+
+    /// DoD: 監視役の CLI で動いているセッションを正しく拾う。
+    /// 権限フラグ付きで起動されていても、同じ CLI なら自分自身と見なす。
+    #[test]
+    fn 自己セッションはフラグ違いでも同じcliとして拾う() {
+        assert_eq!(pick_self_session(&rows(), "claude"), Some(2));
+        assert_eq!(pick_self_session(&rows(), "codex"), Some(1));
+    }
+
+    /// 動いていないセッションは自分自身として登録しない (もう詰まりようがない)。
+    #[test]
+    fn 終了済みセッションは自己セッションにしない() {
+        let r = vec![(3u64, false, "claude".to_string())];
+        assert_eq!(pick_self_session(&r, "claude"), None);
+    }
+
+    /// DoD: 起動 → 停止 → 別 ID で再起動、を通して追従すること。
+    /// ここが固定されたままだと、生きているセッションの診断を誤って断り続ける。
+    #[test]
+    fn 自己セッションidは起動と停止をまたいで追従する() {
+        // まだ起動していない
+        assert_eq!(pick_self_session(&[], "claude"), None);
+        // 起動
+        let a = vec![(7u64, true, "claude".to_string())];
+        assert_eq!(pick_self_session(&a, "claude"), Some(7));
+        // 終了
+        let b = vec![(7u64, false, "claude".to_string())];
+        assert_eq!(pick_self_session(&b, "claude"), None);
+        // 別 ID で再起動
+        let c = vec![(7u64, false, "claude".to_string()), (9, true, "claude".into())];
+        assert_eq!(pick_self_session(&c, "claude"), Some(9));
+    }
+
+    /// 監視役が未選択 (空文字) なら、どのセッションも自分自身にはならない。
+    #[test]
+    fn 監視役未選択なら自己セッションは無し() {
+        assert_eq!(pick_self_session(&rows(), ""), None);
+    }
+
+    /// 選んだ CLI が 1 つも動いていなければ登録しない。
+    #[test]
+    fn 該当cliが居なければ自己セッションは無し() {
+        assert_eq!(pick_self_session(&rows(), "goose"), None);
+    }
+
+    // ---- LLM の助言も同じ確認ゲートを通る ----
+
+    fn snap(id: u64) -> supervisor::SessionSnapshot {
+        supervisor::SessionSnapshot {
+            id,
+            title: format!("agent {id}"),
+            screen_text: String::new(),
+            running: true,
+            waiting_approval: false,
+            exit_code: None,
+            user_typed: false,
+            total_output_bytes: None,
+        }
+    }
+
+    /// **安全の要**: LLM が再起動・停止を勧めても、必ず確認ダイアログへ回る。
+    /// 権限モードが全自動 (Auto) でも例外にしない。
+    #[test]
+    fn llm推奨の破壊的操作は必ず確認を通る() {
+        for action in [
+            supervisor::Intervention::Restart,
+            supervisor::Intervention::Halt,
+        ] {
+            let mut cfg = supervisor::SupervisorConfig::default();
+            cfg.llm_escalation = true;
+            let mut sv = supervisor::Supervisor::new(cfg);
+            // セッションを認識させる
+            sv.tick(&[snap(1)], Approval::Auto);
+
+            let d = supervisor::Diagnosis {
+                session_id: 1,
+                anomaly: supervisor::Anomaly::Stall,
+                summary: "出力が止まっています".into(),
+                recommended: action,
+            };
+            let Some(it) = sv.intent_from_diagnosis(&d, Approval::Auto) else {
+                continue;
+            };
+            assert!(
+                it.needs_confirmation,
+                "{action:?} は LLM 由来でも確認が必要"
+            );
+            assert_eq!(
+                route_intent(&it),
+                IntentRoute::Confirm,
+                "{action:?} は確認ダイアログへ回るべき"
+            );
+        }
+    }
+
+    /// 監視役が選ばれていない (llm_escalation=false) 間は、診断が来ても
+    /// 意図に変換しない。フックの取り外し口が無くてもここで確実に止まる。
+    #[test]
+    fn llm相談offなら診断は意図に変換されない() {
+        let cfg = supervisor::SupervisorConfig::default();
+        assert!(!cfg.llm_escalation);
+        let mut sv = supervisor::Supervisor::new(cfg);
+        sv.tick(&[snap(1)], Approval::Auto);
+        let d = supervisor::Diagnosis {
+            session_id: 1,
+            anomaly: supervisor::Anomaly::Stall,
+            summary: "止まっています".into(),
+            recommended: supervisor::Intervention::Nudge,
+        };
+        assert!(sv.intent_from_diagnosis(&d, Approval::Auto).is_none());
+    }
+
+    /// DoD: 監視役自身も決定論的な見張りの対象に含まれる (単一障害点にしない)。
+    /// スナップショットは全セッションから作るので、監視役だけ除外されることは無い。
+    #[test]
+    fn 監視役自身も監視対象に含まれる() {
+        let cfg = supervisor::SupervisorConfig::default();
+        let mut sv = supervisor::Supervisor::new(cfg);
+        // 1 番が監視役として選ばれている想定でも、両方を渡して両方が見られる
+        sv.tick(&[snap(1), snap(2)], Approval::Ask);
+        assert!(sv.state_of(1).is_some(), "監視役自身の状態も見立てられるべき");
+        assert!(sv.state_of(2).is_some());
     }
 }
