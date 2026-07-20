@@ -7,7 +7,6 @@
 //! ハンクヘッダの解釈は `git::parse_range` / `git::parse_hunk_marks` と同じ流儀
 //! (カウント省略 = 1、行番号は diff 上 1-based) に揃えてある。
 
-#![allow(dead_code)]
 
 use eframe::egui::{self, Color32, FontId, RichText};
 

@@ -23,6 +23,7 @@ mod markdown;
 mod notify;
 mod orchestration;
 mod palette;
+mod panels;
 mod pet;
 mod pet_bubble;
 mod pet_variants;

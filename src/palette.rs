@@ -80,6 +80,13 @@ pub enum Cmd {
     ShowPlugins,
     /// プラグインコマンドを実行 (plugins[i] の commands[j])
     RunPlugin(usize, usize),
+
+    /// 検出済みの外部 IDE (`ide::IdeSpec::key`) で、現在のファイルを
+    /// 現在のカーソル行で開く。
+    OpenInIde(String),
+
+    /// 検出済みの外部 IDE でワークスペース (primary ルート) を開く。
+    OpenFolderInIde(String),
 }
 
 #[derive(Clone)]

@@ -23,7 +23,10 @@ use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::lsp;
 use crate::markdown;
 use crate::notify;
+use crate::github;
+use crate::ide;
 use crate::palette::{Action, Cmd, Item, Palette};
+use crate::panels;
 use crate::pet;
 use crate::pet_bubble;
 use crate::remote;
@@ -42,6 +45,7 @@ enum SidebarTab {
     Agents,
     Plugins,
     Git,
+    GitHub,
 }
 
 impl SidebarTab {
@@ -52,6 +56,7 @@ impl SidebarTab {
             SidebarTab::Agents => "agents",
             SidebarTab::Plugins => "plugins",
             SidebarTab::Git => "git",
+            SidebarTab::GitHub => "github",
         }
     }
 
@@ -61,6 +66,7 @@ impl SidebarTab {
             "agents" => SidebarTab::Agents,
             "plugins" => SidebarTab::Plugins,
             "git" => SidebarTab::Git,
+            "github" => SidebarTab::GitHub,
             _ => SidebarTab::Files,
         }
     }
@@ -296,6 +302,12 @@ pub struct ZaivernApp {
     /// プラグインコマンド実行結果の受け渡し(ワーカースレッド → UI)
     plugin_tx: mpsc::Sender<plugins::RunOutcome>,
     plugin_rx: mpsc::Receiver<plugins::RunOutcome>,
+    /// GitHub パネル (PR / Issue 一覧・PR 差分キャッシュ)
+    github: panels::GithubPanel,
+    /// gh CLI の実行結果の受け渡し(ワーカースレッド → UI)。
+    /// gh は 1 回 0.6 秒ほどかかるので UI スレッドでは絶対に回さない。
+    gh_tx: mpsc::Sender<github::GhOutcome>,
+    gh_rx: mpsc::Receiver<github::GhOutcome>,
     /// 「➕ 新規プラグイン」ダイアログの入力名(None = 閉)
     new_plugin_name: Option<String>,
     /// 言語ID → スニペット一覧(拡張の snippet ファイル由来)
@@ -448,6 +460,14 @@ impl ZaivernApp {
             .send_viewport_cmd(egui::ViewportCommand::Title(workspace_title(&roots)));
 
         let (plugin_tx, plugin_rx) = mpsc::channel();
+        let (gh_tx, gh_rx) = mpsc::channel();
+        // 外部 IDE の検出は IDE ごとにシェルを起動するので UI スレッドでは回さない。
+        // 結果は ide::cached() に載るため、受信側はここで捨ててよい
+        // (送信が Err になるだけで、検出結果そのものは失われない)。
+        {
+            let (ide_tx, _ide_rx) = mpsc::channel();
+            ide::detect_async(ide_tx, cc.egui_ctx.clone());
+        }
         let mut app = Self {
             tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
             gitinfo: git::GitSet::new(roots.clone()),
@@ -507,6 +527,9 @@ impl ZaivernApp {
             plugin_keys: Vec::new(),
             plugin_tx,
             plugin_rx,
+            github: panels::GithubPanel::default(),
+            gh_tx,
+            gh_rx,
             new_plugin_name: None,
             snippets_by_lang: HashMap::new(),
             lsp: HashMap::new(),
@@ -838,6 +861,37 @@ impl ZaivernApp {
             ctx.clone(),
         );
         self.toast(format!("🔌 {title} を実行中…"), true);
+    }
+
+    /// ワーカースレッドから届いた gh の結果を GitHub パネルへ反映する。
+    /// (plugin_rx と同じ流儀 — try_recv でだけ受け、UI スレッドは待たない)
+    fn process_gh_results(&mut self) {
+        while let Ok(out) = self.gh_rx.try_recv() {
+            match panels::apply_gh_outcome(&mut self.github, out) {
+                panels::GhEffect::None => {}
+                panels::GhEffect::Toast(msg, ok) => self.toast(msg, ok),
+                panels::GhEffect::OpenDiff {
+                    number,
+                    title,
+                    text,
+                } => {
+                    let id = self.editor.open_virtual(
+                        title,
+                        text,
+                        crate::editor::BufferKind::PrDiff { number },
+                    );
+                    // 同じタブを使い回すので、古いパース結果は捨てる
+                    self.github.drop_diff_cache(id);
+                }
+            }
+        }
+    }
+
+    /// GitHub パネルが積んだ gh リクエストを、必ず別スレッドで実行する。
+    fn dispatch_gh(&mut self, reqs: Vec<github::GhRequest>, ctx: &egui::Context) {
+        for req in reqs {
+            github::run_async(req, self.gh_tx.clone(), ctx.clone());
+        }
     }
 
     /// ワーカースレッドから届いたプラグインコマンドの結果をエディタへ適用する。
@@ -1920,6 +1974,12 @@ impl ZaivernApp {
         let Some(i) = self.editor.active else {
             return false;
         };
+        // PR 差分などの非ファイルタブは保存できない。ここで止めないと
+        // 「名前を付けて保存」ダイアログが開いて差分がファイルとして書き出される。
+        if self.editor.buffers[i].kind.read_only() {
+            self.toast("このタブは読み取り専用です (保存できません)", false);
+            return false;
+        }
         let (need_dialog, cur_path) = {
             let b = &self.editor.buffers[i];
             (as_new || b.path.is_none(), b.path.clone())
@@ -2059,6 +2119,25 @@ impl ZaivernApp {
             Cmd::CloseTab => {
                 if let Some(i) = self.editor.active {
                     self.request_close(i);
+                }
+            }
+            Cmd::OpenInIde(key) => {
+                let file = self
+                    .editor
+                    .active
+                    .and_then(|i| self.editor.buffers[i].path.clone());
+                let root = self.primary_root().to_path_buf();
+                let cursor = self.editor.cursor;
+                match panels::open_in_ide(&key, file.as_deref(), cursor, &root, false) {
+                    Ok(msg) => self.toast(msg, true),
+                    Err(msg) => self.toast(msg, false),
+                }
+            }
+            Cmd::OpenFolderInIde(key) => {
+                let root = self.primary_root().to_path_buf();
+                match panels::open_in_ide(&key, None, (1, 1), &root, true) {
+                    Ok(msg) => self.toast(msg, true),
+                    Err(msg) => self.toast(msg, false),
                 }
             }
             Cmd::NewFile => self.editor.new_untitled(),
@@ -3154,6 +3233,9 @@ impl ZaivernApp {
         let mut pl_export: Option<usize> = None;
         let mut pl_open: Option<PathBuf> = None;
         let mut git_actions = git_panel::GitActions::default();
+        // GitHub パネル用 (クロージャ内で self を可変借用するため先に複製しておく)
+        let mut gh_actions = panels::GithubActions::default();
+        let gh_roots = self.roots.clone();
         // 有効/無効の切り替え要求 (プラグイン名, 有効か)
         let mut pl_toggle: Option<(String, bool)> = None;
         // 設定値の変更要求 (プラグイン名, キー, 値)
@@ -3180,6 +3262,7 @@ impl ZaivernApp {
                     let pl_label = format!("🔌 プラグイン ({})", self.plugins.len());
                     ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Plugins, pl_label);
                     ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Git, "🌿 Git");
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::GitHub, "🐙 GitHub");
                 });
                 ui.separator();
 
@@ -3604,9 +3687,31 @@ impl ZaivernApp {
                                 self.git_panel.ui(ui, &theme, &mut git_actions);
                             });
                     }
+                    SidebarTab::GitHub => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("zv-github")
+                            .auto_shrink(false)
+                            .show(ui, |ui| {
+                                panels::github_ui(
+                                    ui,
+                                    &theme,
+                                    &mut self.github,
+                                    &gh_roots,
+                                    &mut gh_actions,
+                                );
+                            });
+                    }
                 }
             });
 
+        // gh の呼び出しは 1 本残らずワーカースレッドへ回す
+        if !gh_actions.requests.is_empty() {
+            let reqs = std::mem::take(&mut gh_actions.requests);
+            self.dispatch_gh(reqs, ctx);
+        }
+        if let Some((msg, ok)) = gh_actions.toast {
+            self.toast(msg, ok);
+        }
         if let Some((msg, ok)) = git_actions.toast {
             self.toast(msg, ok);
         }
@@ -4380,6 +4485,15 @@ impl ZaivernApp {
             self.welcome_ui(ui);
             return;
         }
+        // PR 差分タブはファイルではないので、専用の読み取り専用ビューを出して終わる
+        // (TextEdit を一切出さないので、編集も保存も原理的に起きない)
+        if let Some(i) = self.editor.active {
+            if let crate::editor::BufferKind::PrDiff { number } = self.editor.buffers[i].kind {
+                let b = &self.editor.buffers[i];
+                panels::pr_diff_ui(ui, &theme, number, b.id, &b.text, &mut self.github);
+                return;
+            }
+        }
         // Markdown / HTML ファイルは 編集/プレビュー の切替バーを出す
         // (Cockpit ビュー中は editor_area 自体が描画されないため自動的に除外)
         let (is_md, is_html) = self
@@ -5036,6 +5150,10 @@ impl ZaivernApp {
                 ("🔌".into(), "プラグインを表示".into(), String::new(), Cmd::ShowPlugins),
                 ("⟳".into(), "プラグインを再スキャン".into(), String::new(), Cmd::RescanPlugins),
             ];
+            // 実際に検出できた外部 IDE だけを出す (検出は起動時にワーカーで走る)
+            for (icon, label, cmd) in panels::ide_palette_entries() {
+                cmds.push((icon, label, String::new(), cmd));
+            }
             // 実行中のセッション毎に音声入力エントリを出す (パレットで「音声」検索用)
             for s in self.agents.sessions.iter().take(20) {
                 cmds.push((
@@ -5901,6 +6019,14 @@ impl ZaivernApp {
                     return json!({
                         "ok": false,
                         "error": "PC 側でタブが切り替わっています — 再読込してください",
+                    })
+                    .to_string();
+                }
+                // PR 差分などの読み取り専用タブはスマホ側からも書き換えさせない
+                if self.editor.buffers[active].kind.read_only() {
+                    return json!({
+                        "ok": false,
+                        "error": "このタブは読み取り専用です (PR 差分などは編集できません)",
                     })
                     .to_string();
                 }
@@ -6851,6 +6977,9 @@ impl eframe::App for ZaivernApp {
 
         // プラグインコマンドの実行結果をエディタへ反映する
         self.process_plugin_results(ctx);
+
+        // gh (GitHub CLI) の実行結果を GitHub パネルへ反映する
+        self.process_gh_results();
 
         // フック: 起動時 (初回フレームの後に一度だけ)
         if !self.startup_hooks_done {
