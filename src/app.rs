@@ -259,6 +259,9 @@ pub struct ZaivernApp {
     lsp_opened: HashSet<PathBuf>,
     /// 診断の変更をデバウンスするための保留(パス→(最新テキスト, 受信時刻, 言語ID))
     lsp_pending: HashMap<PathBuf, (String, Instant, String)>,
+    /// which() の「見つからなかった」結果のキャッシュ(実行ファイル名→最後に確認した時刻)。
+    /// 肯定結果は入れない(見つかればサーバーが起動して self.lsp に載り、二度と which されない)。
+    lsp_which_missing: HashMap<String, Instant>,
     /// アクティブバッファの診断件数 (エラー, 警告) — ステータスバー用
     diag_counts: (usize, usize),
     /// 音声入力の実行状態
@@ -344,6 +347,7 @@ impl ZaivernApp {
             lsp: HashMap::new(),
             lsp_opened: HashSet::new(),
             lsp_pending: HashMap::new(),
+            lsp_which_missing: HashMap::new(),
             diag_counts: (0, 0),
             cfg,
         };
@@ -744,16 +748,28 @@ impl ZaivernApp {
     // ─── LSP (言語サーバー) ─────────────────────────────────────────
 
     /// バッファを開いた/表示したときに、その言語のサーバーを必要なら起動し did_open する。
-    fn ensure_lsp(&mut self, ctx: &egui::Context, path: &Path, lang: &str, text: &str) {
+    ///
+    /// `buf_idx` は did_open に送る本文を持つバッファの添字。本文は初回の did_open で
+    /// しか使わないので、呼び出し側で毎フレーム clone せず、必要になった所で借りる。
+    fn ensure_lsp(&mut self, ctx: &egui::Context, path: &Path, lang: &str, buf_idx: usize) {
         let lang_id = snippets::lang_id_for(lang).to_string();
         let Some(server_cmd) = lsp_server_for(&lang_id) else {
             return;
         };
         if !self.lsp.contains_key(&lang_id) {
             let bin = server_cmd.split_whitespace().next().unwrap_or("");
+            // which() は $SHELL -lc のサブプロセスを起動する。ここは毎フレーム通るので、
+            // 「見つからなかった」結果を短時間だけ覚えて spawn 連発を防ぐ。
+            let now = Instant::now();
+            if which_result_is_fresh(self.lsp_which_missing.get(bin).copied(), now, WHICH_MISS_TTL)
+            {
+                return; // 直近で確認済み。未インストールのまま
+            }
             if !which(bin) {
+                self.lsp_which_missing.insert(bin.to_string(), now);
                 return; // サーバー未インストールなら静かに無効
             }
+            self.lsp_which_missing.remove(bin);
             match lsp::LspClient::spawn(server_cmd, &self.workspace, ctx.clone()) {
                 Ok(client) => {
                     self.lsp.insert(lang_id.clone(), client);
@@ -761,10 +777,19 @@ impl ZaivernApp {
                 Err(_) => return,
             }
         }
-        if self.lsp_opened.insert(path.to_path_buf()) {
+        if !self.lsp_opened.contains(path) {
             if let Some(client) = self.lsp.get(&lang_id) {
+                // 本文はこの一回だけ必要。self.lsp / self.editor はどちらも不変借用なので両立する
+                let text = self
+                    .editor
+                    .buffers
+                    .get(buf_idx)
+                    .map(|b| b.text.as_str())
+                    .unwrap_or("");
                 client.did_open(path, &lang_id, text);
             }
+            // クライアントの有無に関わらず登録するのは元の insert と同じ挙動
+            self.lsp_opened.insert(path.to_path_buf());
         }
     }
 
@@ -3500,9 +3525,8 @@ impl ZaivernApp {
         let path_clone = self.editor.buffers[active].path.clone();
         let lang_clone = self.editor.buffers[active].lang.clone();
         if let Some(p) = path_clone.clone() {
-            let text = self.editor.buffers[active].text.clone();
             let ctx = ui.ctx().clone();
-            self.ensure_lsp(&ctx, &p, &lang_clone, &text);
+            self.ensure_lsp(&ctx, &p, &lang_clone, active);
         }
         let (diag_by_line, derr, dwarn) = self.active_diagnostics();
         self.diag_counts = (derr, dwarn);
@@ -5314,6 +5338,24 @@ fn lsp_server_for(lang_id: &str) -> Option<&'static str> {
     }
 }
 
+/// which() の否定結果を覚えておく時間。
+///
+/// 3 秒: 60fps なら約 180 フレーム分の spawn が 1 回に減る一方、人が LSP サーバーを
+/// インストールし終える時間(cargo install / npm -g で数十秒〜数分)よりずっと短いので、
+/// 「起動中に入れたサーバーがいずれ認識される」性質は保たれる。
+/// そもそも egui は再描画要求があるときしかフレームを回さないため、再確認の間隔は
+/// 元から不定だった(アイドル中は何分でも確認されない)。TTL はその保証を弱めない。
+const WHICH_MISS_TTL: Duration = Duration::from_secs(3);
+
+/// 記録済みの which 結果がまだ有効か(= which() の再実行を省けるか)。
+/// `last_checked` が None(未確認)なら常に再確認する。
+fn which_result_is_fresh(last_checked: Option<Instant>, now: Instant, ttl: Duration) -> bool {
+    match last_checked {
+        Some(t) => now.saturating_duration_since(t) < ttl,
+        None => false,
+    }
+}
+
 /// コマンドが PATH 上に存在するか($SHELL -lc 経由で which)。
 fn which(bin: &str) -> bool {
     if bin.is_empty() {
@@ -5382,6 +5424,36 @@ fn install_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn which_cache_rechecks_when_never_checked() {
+        // 未確認なら必ず which() を実行する(初回は元の挙動と同じ)
+        let now = Instant::now();
+        assert!(!which_result_is_fresh(None, now, WHICH_MISS_TTL));
+    }
+
+    #[test]
+    fn which_cache_suppresses_repeat_within_ttl() {
+        // TTL 以内の再確認は省く = 毎フレームのサブプロセス生成が消える
+        let now = Instant::now();
+        let just_now = now - Duration::from_millis(1);
+        assert!(which_result_is_fresh(Some(just_now), now, WHICH_MISS_TTL));
+    }
+
+    #[test]
+    fn which_cache_expires_after_ttl() {
+        // TTL を過ぎたら再確認する = 起動後にインストールしても いずれ 認識される
+        let now = Instant::now();
+        let old = now - WHICH_MISS_TTL - Duration::from_millis(1);
+        assert!(!which_result_is_fresh(Some(old), now, WHICH_MISS_TTL));
+        // 境界(ちょうど TTL)も再確認側に倒す
+        assert!(!which_result_is_fresh(Some(now - WHICH_MISS_TTL), now, WHICH_MISS_TTL));
+    }
+
+    #[test]
+    fn which_cache_ttl_is_short_enough_to_feel_immediate() {
+        assert!(WHICH_MISS_TTL <= Duration::from_secs(5));
+    }
 
     #[test]
     fn joins_japanese_without_spaces() {
