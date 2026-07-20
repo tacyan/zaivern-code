@@ -34,8 +34,9 @@ pub struct Config {
     pub pet_approve_keys: String,
     /// 拒否時に PTY へ送るキー (既定は ESC)
     pub pet_deny_keys: String,
-    /// 音声認識エンジン: "auto" | "mac" | "command" | "off"
-    /// auto = macOS なら内蔵 (mac)、その他 OS は voice_command
+    /// 音声認識エンジン: "auto" | "mac" | "powershell" | "browser" | "command" | "off"
+    /// auto = macOS は内蔵、voice_command 設定済みならそれ、Windows は標準の
+    /// 音声認識、残りはブラウザの /voice ページ (src/voice.rs の resolve_engine)
     pub voice_engine: String,
     /// 音声入力の既定の届け先: "active"(アクティブなエージェント) | "broadcast"(全員)
     pub voice_target: String,
@@ -249,14 +250,24 @@ show_pet = true
 # 押すまで送信されません。Enter で入力欄が空になっても録音は続いたままなので、
 # そのまま次の指示を話せます。ツールバーの 🎤 メニューからも変更できます。
 #
-# voice_engine = "auto"    # "auto" | "mac"(内蔵) | "command"(外部) | "off"
+# voice_engine = "auto"    # "auto" | "mac" | "powershell" | "browser" | "command" | "off"
 # voice_target = "active"  # 届け先: "active"(アクティブなエージェント) | "broadcast"(全員)
 # voice_lang = "ja-JP"     # 認識する言語
 # voice_keyword = ""       # このキーワードを話すと Enter まで自動送信 ("" = 常に手動)
 #
-# macOS 以外、または独自の認識エンジンを使う場合は "command" にして
-# voice_command を設定します。標準出力へ 1 行ずつ認識テキストを吐き、
-# 標準入力に "q" が来たら終了するコマンドを想定しています ({lang} は言語に置換)。
+# "auto" は上から順に:
+#   macOS                     → "mac"        内蔵の Swift ヘルパー
+#   voice_command が設定済み  → "command"    下記の外部コマンド
+#   Windows (対応言語あり)    → "powershell" Windows 標準の音声認識 (オフライン)
+#   それ以外                  → "browser"    ブラウザの音声入力ページを開く
+#
+# "browser" はスマホリモートの /voice を 127.0.0.1 で開き、ブラウザの音声認識に
+# 喋らせます。マイクはブラウザ側なので、ページを閉じれば止まります。
+# Chrome が入っていれば Chrome で開きます (Edge の音声認識は不安定なため)。
+#
+# 独自の認識エンジンを使う場合は voice_command を設定します。標準出力へ 1 行ずつ
+# 認識テキストを吐き、標準入力に "q" が来たら終了するコマンドを想定しています
+# ({lang} は言語に置換)。auto のままでも、設定されていれば mac 以外では優先されます。
 # voice_engine = "command"
 # voice_command = "my-stt --lang {lang} --stream"
 

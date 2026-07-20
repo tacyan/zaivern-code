@@ -89,7 +89,19 @@ And when Enter clears the box, **the mic is still listening**. The next thought 
 - Pick "active" and the destination follows you as you move between tabs
 - Set a spoken trigger word (e.g. "send") and only then will Enter be sent for you — off by default, so sending stays manual
 - Language and engine live in the ▾ menu next to 🎤 in the top bar
-- macOS uses the built-in on-device recognizer; on other systems, plug any engine into `voice_command`
+
+And it works **on every platform**. `voice_engine = "auto"` picks the route for you, so pressing 🎤 is still the whole interaction.
+
+| Where you are | What actually runs |
+|---|---|
+| **macOS** | The system's built-in recognizer. Fully offline. |
+| **Windows** | Windows' own speech recognition, offline — but **only if a recognizer for your language is installed**. The Japanese one ships solely with Japanese-language Windows, and Microsoft deprecated the whole feature in Win11 24H2. Zaivern probes for it at runtime and quietly falls back to the browser route below if it isn't there. |
+| **Linux / Windows without a recognizer** | A local voice page (`http://127.0.0.1:<port>/voice`) opens and you speak into **the browser's microphone**. Chrome/Chromium is preferred, and Zaivern always tells you which browser it opened — Edge's `webkitSpeechRecognition` can't be trusted. |
+| **Phone (remote)** | **Your phone keyboard's own dictation** — the 🎤 on Gboard, or iOS voice input. |
+
+The phone is the odd one out for a reason: the remote is plain HTTP over your LAN, and browser speech recognition flatly requires a secure context. It used to fail there in a silent retry loop. Now the page notices and points you at keyboard dictation instead — **no HTTPS, no page permission, nothing to grant**. Browsers with no Speech API at all (iOS Safari, Firefox) get the same guidance. The text still only reaches the input box. **Enter is still yours to press.**
+
+Want your own recognizer? Set `voice_command` as before — on anything but macOS, it always wins.
 
 ### 📝 And the final stroke is still yours — a Zed-inspired editor
 
@@ -348,7 +360,7 @@ src/
 ├── terminal.rs      PTY sessions + vt100 rendering + approval-prompt detection/auto-reply
 ├── agents.rs        Session management (launch/restart/destroy/broadcast/permission modes)
 ├── remote.rs        Phone remote (built-in HTTP server, QR code, token auth)
-├── voice.rs         Voice input (records until stopped, inserts without sending, pluggable engine)
+├── voice.rs         Voice input (records until stopped, inserts without sending, auto-picks mac/Windows/browser)
 ├── session.rs       Per-workspace session restore
 ├── notify.rs        OS-native notifications
 ├── sound.rs         Sound effects (fire-and-forget OS-standard sounds)
@@ -373,6 +385,7 @@ src/
 - [x] 3 permission modes (🛡 Approve / ⚡ Full-auto / 🤖 Agent-first) + bulk switch for running sessions
 - [x] Pet upgrades (4 looks, custom images, sizes, sleep/walk, sounds, approve/deny from the bubble)
 - [x] Voice input (🎤/⏹ only, records until stopped, inserts into the input box for a manual Enter, configurable destination/language/engine)
+- [x] Cross-platform voice input (built-in on macOS; Windows' own recognizer when one is installed; a browser page on Linux and on Windows without one; keyboard dictation guidance on phones)
 - [ ] LSP completion & hover UI (foundation implemented; UI to come)
 - [ ] Plugin grammars (TextMate) & registry sharing
 - [ ] Inline diff view

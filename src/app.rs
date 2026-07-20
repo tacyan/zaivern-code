@@ -1854,11 +1854,21 @@ impl ZaivernApp {
                                     .color(if rec { theme.err } else { theme.text }),
                             )
                             .on_hover_text(if rec {
-                                "録音中 — もう一度押すと止まります"
+                                "録音中 — もう一度押すと止まります".to_string()
                             } else {
-                                "音声入力を始める\n\
-                                 ⏹ を押すまで、話した内容が入力欄に入り続けます\n\
-                                 (Enter は送られないので、確認して自分で送信)"
+                                // この PC で実際に通る経路を先に見せる (押してから
+                                // 「使えません」と言われるのを避ける)
+                                format!(
+                                    "音声入力を始める\n\
+                                     ⏹ を押すまで、話した内容が入力欄に入り続けます\n\
+                                     (Enter は送られないので、確認して自分で送信)\n\
+                                     {}",
+                                    voice::route_hint(
+                                        &self.cfg.voice_engine,
+                                        &self.cfg.voice_lang,
+                                        &self.cfg.voice_command,
+                                    )
+                                )
                             })
                             .clicked()
                         {
@@ -1948,6 +1958,8 @@ impl ZaivernApp {
                                     for (v, label) in [
                                         ("auto", "自動 (この OS に合わせる)"),
                                         ("mac", "macOS 内蔵の音声認識"),
+                                        ("powershell", "Windows 標準の音声認識"),
+                                        ("browser", "ブラウザの音声入力ページ"),
                                         ("command", "外部コマンド (config.toml の voice_command)"),
                                         ("off", "無効"),
                                     ] {
@@ -4249,6 +4261,17 @@ impl ZaivernApp {
             self.toast_warn("音声入力の宛先がありません — 先にエージェントを起動してください");
             return;
         }
+        // ブラウザ経路は子プロセスを持たない — /voice をブラウザで開いて、
+        // 認識結果は Web Speech API から /api/voice 経由で戻ってくる。
+        if voice::resolve_engine(
+            &self.cfg.voice_engine,
+            &self.cfg.voice_lang,
+            &self.cfg.voice_command,
+        ) == "browser"
+        {
+            self.open_voice_page();
+            return;
+        }
         match voice::start(
             &self.cfg.voice_engine,
             &self.cfg.voice_lang,
@@ -4270,6 +4293,43 @@ impl ZaivernApp {
                 self.toast(format!("🎤 {e}"), false);
             }
         }
+    }
+
+    /// ブラウザの音声入力ページ (`/voice`) を開く。
+    ///
+    /// `http://127.0.0.1:PORT` は W3C の Secure Contexts 上「信頼できるオリジン」
+    /// なので、TLS 無しでも Web Speech API が動く。マイクはブラウザ側なので
+    /// Zaivern 内に録音プロセスは立たない (⏹ も出ない — 閉じれば止まる)。
+    fn open_voice_page(&mut self) {
+        let Some(r) = self.remote.as_ref() else {
+            self.toast(
+                "🎤 ブラウザの音声入力ページを開けません — スマホリモートが起動していません\
+                 (config.toml の voice_command に外部コマンドを設定する手もあります)"
+                    .to_string(),
+                false,
+            );
+            return;
+        };
+        let url = format!("http://127.0.0.1:{}/voice?t={}", r.port, r.token);
+        // Edge の webkitSpeechRecognition は不安定なので Chrome があればそちらを使う。
+        // どちらで開いたかは必ず伝える (黙って既定ブラウザに投げない)。
+        let browser = match chrome_path() {
+            Some(p) => {
+                let _ = std::process::Command::new(p).arg(&url).spawn();
+                "Chrome"
+            }
+            None => {
+                open_external(&url);
+                "既定のブラウザ"
+            }
+        };
+        self.toast(
+            format!(
+                "🎤 {browser} で音声入力ページを開きました — これから先はそちらのマイクが 🎤 です\
+                 (認識テキストは入力欄に入るだけ。送信は自分で Enter)"
+            ),
+            true,
+        );
     }
 
     /// 録音を止める。認識プロセスは最後の確定テキストを返してから終了するので、
@@ -5270,6 +5330,43 @@ fn strip_trailing_keyword(text: &str, keyword: &str) -> Option<String> {
     });
     let rest = trimmed.strip_suffix(keyword)?;
     Some(rest.trim_end().to_string())
+}
+
+/// Chrome / Chromium の実行ファイルを探す。
+///
+/// Web Speech API は Chrome が一番素直に動く。Edge の `webkitSpeechRecognition` は
+/// v134 の退行以来あてにならないので、Chrome が居るならそちらを優先する。
+fn chrome_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    const CANDIDATES: &[&str] = &[
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+    #[cfg(target_os = "windows")]
+    const CANDIDATES: &[&str] = &[
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    const CANDIDATES: &[&str] = &[
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+    ];
+    // Windows は管理者権限なしで入れると %LOCALAPPDATA% 側に入る。
+    // こちらの方がむしろ普通なので、固定パスより先に見る。
+    #[cfg(target_os = "windows")]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let p = PathBuf::from(local).join(r"Google\Chrome\Application\chrome.exe");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
 }
 
 fn open_external(target: &str) {

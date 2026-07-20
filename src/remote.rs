@@ -371,6 +371,60 @@ mod tests {
         // 実制御文字が紛れ込んでいないこと
         assert!(!VOICE_PAGE.contains('\u{1b}'));
     }
+
+    #[test]
+    fn pages_detect_insecure_context() {
+        // http (LAN の IP) では Web Speech API が動かない。両ページとも
+        // 事前判定して、黙って壊れるのではなく理由を出すこと
+        for p in [PAGE, VOICE_PAGE] {
+            assert!(p.contains("isSecureContext"));
+            assert!(p.contains("speechBlockReason"));
+            assert!(p.contains("'insecure'"));
+            assert!(p.contains("'unsupported'"));
+        }
+    }
+
+    #[test]
+    fn pages_guide_to_keyboard_dictation() {
+        // 使えない端末では OS キーボードの音声入力へ逃がす。
+        // 案内文は「原因」と「次にすること」の両方を日本語で書くこと
+        for p in [PAGE, VOICE_PAGE] {
+            assert!(p.contains("keyboardDictation"));
+            assert!(p.contains("dictationHint"));
+            // 次にすること (キーボードの音声入力を使う)
+            assert!(p.contains("を押して、入力欄に話しかけてください"));
+            // 原因
+            assert!(p.contains("この接続 (http) ではブラウザの音声認識が使えません。"));
+            assert!(p.contains("このブラウザは音声認識 (Web Speech API) に未対応です。"));
+            // PC 側の案内は実ポートを埋める (8899 決め打ちにしない)
+            assert!(p.contains("location.port"));
+            assert!(p.contains("'/voice'"));
+        }
+    }
+
+    #[test]
+    fn pages_handle_network_error_without_restart_loop() {
+        // network は http 経由では復帰しない。再開させず案内に切り替えること。
+        // no-speech (無音) だけは従来どおり onend で再開してよい
+        for p in [PAGE, VOICE_PAGE] {
+            assert!(p.contains("e === 'network'"));
+            assert!(p.contains("keyboardDictation"));
+            assert!(p.contains("if (e === 'no-speech') return;"));
+        }
+    }
+
+    #[test]
+    fn fatal_voice_error_does_not_auto_restart() {
+        // 致命的エラー後に onend が再開すると、画面上は無反応のまま無限に回る。
+        // voiceFatal ガードで止まっていること
+        for p in [PAGE, VOICE_PAGE] {
+            assert!(p.contains("voiceFatal"));
+            assert!(p.contains("if (voiceFatal) return;"));
+            assert!(p.contains("voiceFatal = true"));
+            // 再開のたびにガードを解除していること (一度きりで死なない)
+            assert!(p.contains("voiceFatal = false"));
+        }
+    }
 }
 
 // ─── スマホ用ページ (完全内蔵・依存ゼロ) ─────────────────────────────
@@ -438,6 +492,13 @@ const PAGE: &str = r##"<!DOCTYPE html>
   .btn.pri { background:#1f6feb; border-color:#1f6feb; color:#fff; }
   .btn.warn { background:#6e2c1e; border-color:#f85149; }
   .btn:active { opacity:.7; }
+  /* 音声が使えない端末への案内 (トーストと違い消えない) */
+  #vnote {
+    display:none; margin:0 0 8px; padding:9px 11px; border-radius:8px;
+    background:#3a2c12; border:1px solid #d29922; color:#f2dfb4;
+    font-size:12px; line-height:1.65; word-break:break-all;
+  }
+  #vnote.show { display:block; }
   .grow { flex:1; }
   #meta { font-size:11px; color:#8b949e; }
   #filter, #ti {
@@ -501,6 +562,7 @@ const PAGE: &str = r##"<!DOCTYPE html>
   <!-- エージェント -->
   <section class="view" id="v-agent">
     <div class="chips" id="achips"></div>
+    <div id="vnote"></div>
     <div id="scr" class="empty">エージェントがいません</div>
     <div class="keys" id="keys"></div>
     <div class="bar">
@@ -653,8 +715,57 @@ KEYS.forEach(([label, seq]) => {
 // マイクボタンでトグル。話した内容は下の入力欄に溜まっていくだけで、
 // 自動送信はしない。送るのは [⤵ 入れる] か [送信] を押したときだけ。
 // 無音で認識が切れてもモードが ON なら自動で録音を再開する。
-let voiceAgent = -1, recog = null, lastInterim = '';
+// voiceFatal = 復帰不能なエラーで止めた印。これが立っている間は onend で再開しない
+// (network 等で無限リスタートし、画面上は無反応のまま壊れるのを防ぐ)
+let voiceAgent = -1, recog = null, lastInterim = '', voiceFatal = false;
 function speechAPI() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
+// 音声認識が使えるかを事前判定する。使えない理由コードを返す:
+//   'insecure'    … http 接続 = セキュアコンテキストでない (スマホから見る場合はこれ)
+//   'unsupported' … SpeechRecognition が無い (iOS Safari / Firefox など)
+//   ''            … 使える
+function speechBlockReason() {
+  if (!window.isSecureContext) return 'insecure';
+  if (!speechAPI()) return 'unsupported';
+  return '';
+}
+// OS キーボードのディクテーション (Gboard の 🎤 / iOS 音声入力) への案内文。
+// キーボード側の音声入力は https でなくても、ページ側の権限も要らずに使える。
+// 原因と、いま何をすればいいかの両方を必ず書く。
+function dictationHint(reason) {
+  // 実際に待ち受けているポートをそのまま案内する (既定 8899 とは限らない)。
+  // /voice の API はトークンを要るので、いま持っているものを付けて渡す
+  const p = location.port || '8899';
+  const u = 'http://127.0.0.1:' + p + '/voice' + (TOK ? '?t=' + encodeURIComponent(TOK) : '');
+  const how = 'キーボードの \u{1F3A4} を押して、入力欄に話しかけてください（送信は手動 Enter）。'
+    + 'PC からは ' + u + ' で連続認識が使えます。';
+  const why = reason === 'unsupported'
+    ? 'このブラウザは音声認識 (Web Speech API) に未対応です。'
+    : reason === 'network'
+    ? '音声認識サーバーに接続できませんでした（http 接続では利用できません）。'
+    : 'この接続 (http) ではブラウザの音声認識が使えません。';
+  return why + how;
+}
+function showNote(m) { const n = $('vnote'); n.textContent = m; n.classList.add('show'); }
+function hideNote() { const n = $('vnote'); n.textContent = ''; n.classList.remove('show'); }
+// 認識が使えないときの代替: 入力欄にフォーカスしてキーボード音声入力へ誘導する。
+// 自動送信はしないので、話した内容は入力欄に残ったままになる。
+function keyboardDictation(i, reason) {
+  if (i >= 0) api('/api/cmd', {name:'agent_focus', arg:i}).then(pollState).catch(() => {});
+  const t = $('ti');
+  t.focus();
+  try { t.setSelectionRange(t.value.length, t.value.length); } catch (e) {}
+  t.placeholder = '\u{1F3A4} キーボードの音声入力で話しかけてください — 送信は手動';
+  showNote(dictationHint(reason));
+  toast('キーボードの \u{1F3A4} から入力してください');
+}
+// 復帰不能なエラー。再開させずに止め、理由を消えない形で残す
+function fatalVoiceStop(msg) {
+  voiceFatal = true;
+  stopVoice0();
+  renderAgents();
+  showNote(msg);
+  toast(msg);
+}
 function stopVoice0() {
   voiceAgent = -1;
   const r = recog; recog = null;
@@ -663,11 +774,15 @@ function stopVoice0() {
   lastInterim = '';
   $('ti').placeholder = 'エージェントへ指示を送る…';
 }
-function stopVoice() { stopVoice0(); renderAgents(); toast('\u{1F3A4} 音声入力モード OFF'); }
+function stopVoice() { stopVoice0(); hideNote(); renderAgents(); toast('\u{1F3A4} 音声入力モード OFF'); }
 function startVoice(i) {
+  // 使えない端末では死んだエラーを出さず、キーボード音声入力へ逃がす
+  const reason = speechBlockReason();
+  if (reason) { stopVoice0(); renderAgents(); keyboardDictation(i, reason); return; }
   const C = speechAPI();
-  if (!C) { toast('この端末のブラウザは音声入力に未対応です'); return; }
   stopVoice0();
+  hideNote();
+  voiceFatal = false;
   voiceAgent = i;
   api('/api/cmd', {name:'agent_focus', arg:i}).then(pollState).catch(() => {});
   const r = new C();
@@ -695,13 +810,23 @@ function startVoice(i) {
     }
   };
   r.onerror = ev => {
-    if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-      toast('マイクが許可されていません（ブラウザ設定を確認）'); stopVoice();
-    } else if (ev.error === 'audio-capture') {
-      toast('マイクが見つかりません'); stopVoice();
+    const e = ev.error;
+    if (e === 'no-speech') return;              // 無音だけ: onend の自動再開に任せる
+    if (e === 'not-allowed' || e === 'service-not-allowed') {
+      fatalVoiceStop('マイクが許可されていません（ブラウザ設定を確認）');
+    } else if (e === 'network') {
+      // 認識サーバーへ到達できない = http 経由ではほぼ復帰しない。案内して終わる
+      voiceFatal = true;
+      stopVoice0(); renderAgents();
+      keyboardDictation(i, 'network');
+    } else if (e === 'audio-capture') {
+      fatalVoiceStop('マイクが見つかりません');
+    } else if (e === 'aborted') {
+      stopVoice0(); renderAgents();            // 明示停止・画面遷移。黙って終わる
     }
   };
   r.onend = () => {
+    if (voiceFatal) return;                    // 致命的エラー後は再開しない
     if (recog === r && voiceAgent === i) {
       try { r.start(); } catch (e) { stopVoice(); }
     }
@@ -895,7 +1020,8 @@ const VOICE_PAGE: &str = r##"<!DOCTYPE html>
 const qs = new URLSearchParams(location.search);
 const TOK = qs.get('t') || '';
 let target = qs.get('target') || 'all';  // 'all' またはセッション id
-let agents = [], active = false, recog = null;
+// voiceFatal = 復帰不能なエラーで止めた印。立っている間は onend で再開しない
+let agents = [], active = false, recog = null, voiceFatal = false;
 const $ = id => document.getElementById(id);
 const HINT0 = 'マイクボタンを押して話しかけてください — 内容を確認してからボタンで送ります';
 
@@ -965,6 +1091,47 @@ $('send').onclick = () => send(true);
 $('put').onclick = () => send(false);
 $('clear').onclick = () => { $('draft').value = ''; };
 function speechAPI() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
+// 音声認識が使えるかを事前判定する。使えない理由コードを返す:
+//   'insecure'    … http 接続 = セキュアコンテキストでない (LAN の IP で開いた場合)
+//   'unsupported' … SpeechRecognition が無い (iOS Safari / Firefox など)
+//   ''            … 使える
+function speechBlockReason() {
+  if (!window.isSecureContext) return 'insecure';
+  if (!speechAPI()) return 'unsupported';
+  return '';
+}
+// OS キーボードのディクテーションへの案内文。キーボード側の音声入力なら
+// https でなくても、ページ側の権限も要らずに使える。
+// 原因と、いま何をすればいいかの両方を必ず書く。
+function dictationHint(reason) {
+  // 実際に待ち受けているポートをそのまま案内する (既定 8899 とは限らない)。
+  // /voice の API はトークンを要るので、いま持っているものを付けて渡す
+  const p = location.port || '8899';
+  const u = 'http://127.0.0.1:' + p + '/voice' + (TOK ? '?t=' + encodeURIComponent(TOK) : '');
+  const how = 'キーボードの \u{1F3A4} を押して、入力欄に話しかけてください（送信は手動 Enter）。'
+    + 'PC からは ' + u + ' で連続認識が使えます。';
+  const why = reason === 'unsupported'
+    ? 'このブラウザは音声認識 (Web Speech API) に未対応です。'
+    : reason === 'network'
+    ? '音声認識サーバーに接続できませんでした（http 接続では利用できません）。'
+    : 'この接続 (http) ではブラウザの音声認識が使えません。';
+  return why + how;
+}
+// 認識が使えないときの代替: 下書き欄へフォーカスしてキーボード音声入力へ誘導する。
+// 自動送信はしないので、話した内容は下書き欄に残ったままになる。
+function keyboardDictation(reason) {
+  const d = $('draft');
+  d.focus();
+  try { d.setSelectionRange(d.value.length, d.value.length); } catch (e) {}
+  d.placeholder = '\u{1F3A4} キーボードの音声入力で話しかけてください — 送信は手動';
+  $('hint').textContent = dictationHint(reason);
+}
+// 復帰不能なエラー。再開させずに止め、理由を残す
+function fatalVoiceStop(msg) {
+  voiceFatal = true;
+  stopVoice();
+  $('hint').textContent = msg;
+}
 function stopVoice() {
   active = false;
   const r = recog; recog = null;
@@ -972,13 +1139,14 @@ function stopVoice() {
   $('mic').classList.remove('rec');
   $('hint').textContent = HINT0;
   $('interim').textContent = '';
+  $('draft').placeholder = '話した内容がここに溜まります。直してから送信できます。';
 }
 function startVoice() {
+  // 使えない環境では死んだエラーを出さず、キーボード音声入力へ逃がす
+  const reason = speechBlockReason();
+  if (reason) { keyboardDictation(reason); return; }
   const C = speechAPI();
-  if (!C) {
-    $('hint').textContent = 'このブラウザは音声認識に未対応です — Chrome か Safari をお使いください';
-    return;
-  }
+  voiceFatal = false;
   const r = new C();
   recog = r; active = true;
   r.lang = 'ja-JP';
@@ -1000,16 +1168,25 @@ function startVoice() {
     }
   };
   r.onerror = ev => {
-    if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-      $('hint').textContent = 'マイクが許可されていません — アドレスバーのマイク設定を確認してください';
+    const e = ev.error;
+    if (e === 'no-speech') return;             // 無音だけ: onend の自動再開に任せる
+    if (e === 'not-allowed' || e === 'service-not-allowed') {
+      fatalVoiceStop('マイクが許可されていません — アドレスバーのマイク設定を確認してください');
+    } else if (e === 'network') {
+      // 認識サーバーへ到達できない = http 経由ではほぼ復帰しない。案内して終わる
+      voiceFatal = true;
       stopVoice();
-    } else if (ev.error === 'audio-capture') {
-      $('hint').textContent = 'マイクが見つかりません';
-      stopVoice();
+      keyboardDictation('network');
+    } else if (e === 'audio-capture') {
+      fatalVoiceStop('マイクが見つかりません');
+    } else if (e === 'aborted') {
+      stopVoice();                             // 明示停止・画面遷移。黙って終わる
     }
   };
   r.onend = () => {
-    // 無音で切れてもモードが ON の間は自動で再開する
+    // 無音で切れてもモードが ON の間は自動で再開する。
+    // ただし致命的エラー後は再開しない (無反応のまま無限に回るのを防ぐ)
+    if (voiceFatal) return;
     if (recog === r && active) { try { r.start(); } catch (e) { stopVoice(); } }
   };
   try { r.start(); } catch (e) { $('hint').textContent = '音声認識を開始できません'; stopVoice(); return; }
