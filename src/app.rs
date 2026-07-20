@@ -3499,6 +3499,17 @@ impl ZaivernApp {
         let font = FontId::monospace(self.cfg.editor_font_size);
         let row_h = ui.fonts(|f| f.row_height(&font));
         self.last_row_h = row_h;
+        // galley をフレーム跨ぎでキャッシュするためのフォント世代キー。
+        // egui は pixels_per_point 変更時とフォントアトラス逼迫時(fill_ratio > 0.8)に
+        // FontsImpl ごと作り直し、そのとき全グリフの UV が変わる。古い galley を
+        // 使い回すと描画が壊れるため、作り直しを検知できる値をキーに混ぜておく。
+        // (アトラスは作り直しで初期サイズに戻るのでサイズ変化で検知できる)
+        let font_gen = {
+            let sz = ui.fonts(|f| f.font_image_size());
+            (sz[0] as u64).rotate_left(23)
+                ^ (sz[1] as u64).rotate_left(47)
+                ^ (ui.ctx().pixels_per_point().to_bits() as u64).rotate_left(41)
+        };
         let view_h = self.last_view_h;
         let theme_bg = self.theme.bg;
 
@@ -3595,10 +3606,14 @@ impl ZaivernApp {
                 .wrapping_mul(37)
                 .wrapping_add((*l as u64) << 3 | *sev as u64);
         }
+        // galley までキャッシュするので、キーには LayoutJob の内容(行数/マーク/診断/
+        // フォントサイズ/テーマ)に加えてラスタライズ側の font_gen も含める。
+        // font family は常に Monospace 固定なので font.size のみで足りる。
         let gutter_key = (line_count as u64)
             ^ marks_hash.rotate_left(17)
             ^ diag_hash.rotate_left(29)
             ^ (font.size.to_bits() as u64)
+            ^ font_gen
             ^ hash_str(&syntect_theme).rotate_left(3);
         if gutter.as_ref().map(|(k, _)| *k) != Some(gutter_key) {
             let width = line_count.to_string().len().max(3);
@@ -3631,31 +3646,39 @@ impl ZaivernApp {
                     },
                 );
             }
-            *gutter = Some((gutter_key, job));
+            *gutter = Some((gutter_key, ui.fonts(|f| f.layout_job(job))));
         }
 
         let ed_id = egui::Id::new(("zaivern-buffer", *id));
+        // wrap 幅(_wrap)を無視してよい理由: highlight::layout_job は常に
+        // wrap.max_width = f32::INFINITY を設定する(横スクロールのため折り返さない)。
+        // よって galley は wrap 幅に依存せず、フレーム跨ぎで使い回せる。
         let mut layouter = |ui: &egui::Ui, t: &str, _wrap: f32| {
             let key = hash_str(t)
                 ^ hash_str(lang.as_str())
                 ^ hash_str(&syntect_theme)
-                ^ (font.size.to_bits() as u64);
-            let job = match cache {
-                Some((k, j)) if *k == key => j.clone(),
+                ^ (font.size.to_bits() as u64)
+                ^ font_gen;
+            match cache {
+                // ヒット時は Arc の参照カウント増加のみ。
+                // LayoutJob のコピーも egui 側の job ハッシュ計算も起きない。
+                Some((k, g)) if *k == key => g.clone(),
                 _ => {
                     let j = hl.layout_job(t, lang, &syntect_theme, font.clone(), theme_text);
-                    *cache = Some((key, j.clone()));
-                    j
+                    let g = ui.fonts(|f| f.layout_job(j));
+                    *cache = Some((key, g.clone()));
+                    g
                 }
-            };
-            ui.fonts(|f| f.layout_job(job))
+            }
         };
 
         // ガター(行番号)は VS Code 同様、水平スクロールでは動かない固定表示。
         // 本文の上に後描きするため、幅と galley を先に確定しておく。
-        let gutter_galley = ui.fonts(|f| {
-            f.layout_job(gutter.as_ref().map(|(_, j)| j.clone()).unwrap_or_default())
-        });
+        let gutter_galley = match gutter.as_ref() {
+            // Arc の参照カウント増加だけ。LayoutJob のコピーも再レイアウトも起きない。
+            Some((_, g)) => g.clone(),
+            None => ui.fonts(|f| f.layout_job(Default::default())),
+        };
         let gutter_w = gutter_galley.size().x + 22.0;
 
         let mut sa = egui::ScrollArea::both()

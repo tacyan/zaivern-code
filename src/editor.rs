@@ -3,7 +3,9 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use eframe::egui::text::LayoutJob;
+use std::sync::Arc;
+
+use eframe::egui::Galley;
 
 use crate::highlight::Highlighter;
 
@@ -33,10 +35,15 @@ pub struct Buffer {
     pub text: String,
     pub saved_hash: u64,
     pub lang: String,
-    /// (cache key, layout job) — recomputed only when text/theme/font change.
-    pub cache: Option<(u64, LayoutJob)>,
-    /// (cache key, gutter layout job) — 行番号 + git 差分マーク色。
-    pub gutter: Option<(u64, LayoutJob)>,
+    /// (cache key, 本文 galley) — recomputed only when text/theme/font change.
+    /// 折り返し無効(wrap.max_width = INFINITY)なので galley は wrap 幅に依存せず、
+    /// フレーム跨ぎで使い回せる。
+    pub cache: Option<(u64, Arc<Galley>)>,
+    /// (cache key, gutter galley) — 行番号 + git 差分マーク色。
+    /// galley 化まで済ませて持つので、毎フレームの LayoutJob コピーが要らない。
+    /// キーには font size と pixels_per_point が入っており、
+    /// フォント/DPI が変われば作り直される。
+    pub gutter: Option<(u64, Arc<Galley>)>,
     /// 読み込み/保存時点のディスク上の mtime。外部変更はこれとの差分で検知する。
     pub disk_mtime: Option<SystemTime>,
     /// 警告済みの外部変更 mtime(同じ競合を連続通知しないため)。
