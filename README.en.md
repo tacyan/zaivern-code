@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.sh
 irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 ```
 
-Launch with `zai [workspace path]`. Prebuilt binaries for every OS are also available directly from [**Releases**](https://github.com/tacyan/zaivern-code/releases/latest) (macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64).
+Once installed, just type `zai .` inside any project folder — that's your cockpit (`zai [workspace path]` also works). **Run the same one-liner again at any time to update to the latest version.** Prebuilt binaries for every OS are also available directly from [**Releases**](https://github.com/tacyan/zaivern-code/releases/latest) (macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64).
 
 ---
 
@@ -55,7 +55,7 @@ Launch with `zai [workspace path]`. Prebuilt binaries for every OS are also avai
 
 ### 🎛 See the whole fleet — Agent Cockpit
 
-Press ⌘⇧C and every running agent lines up in a grid. Each cell is not a decorative preview — it's a **live terminal you can type into directly**. Claude Code pushing the implementation forward, Codex repairing tests, Gemini CLI writing docs — the first time you watch five agents working at once on a single screen, expect goosebumps.
+Click **🎛 Cockpit** in the toolbar (or press ⌘⇧C) and every running agent lines up in a grid. Each cell is not a decorative preview — it's a **live terminal you can type into directly**. Claude Code pushing the implementation forward, Codex repairing tests, Gemini CLI writing docs — the first time you watch five agents working at once on a single screen, expect goosebumps.
 
 ### 📣 One order, everyone moves — Broadcast
 
@@ -76,6 +76,20 @@ You're not staring at cold logs — **a companion taps you on the shoulder.** De
 ### 📱 Leave your desk — the command continues — Phone Remote
 
 Tap 📱 in the top bar, scan the QR code, and any phone on the same Wi-Fi becomes your remote control. From the sofa, from the balcony, while the coffee brews — approvals, new instructions, file edits, progress checks. **While the agents are working, there is no reason left for you to be chained to a desk.** (Per-launch random token auth, LAN only.)
+
+### 🎤 Just speak — one mic button, nothing else
+
+**Press 🎤. That's it.** Everything you say flows into your agent's input box and keeps flowing — no key to hold down, no shortcut to memorize, no browser window on the side. It runs until you press the **⏹ right next to it**.
+
+The important part is what happens next: **nothing**. Speech recognition makes mistakes, so Zaivern never presses Enter for you. Read what landed in the box, fix it if you want, and send it when you're satisfied. **Speak fast, send deliberately.**
+
+And when Enter clears the box, **the mic is still listening**. The next thought can start the moment the last one is sent — your rhythm never breaks.
+
+- Send to **🎯 the active agent** or **📣 every agent** — switchable while still recording
+- Pick "active" and the destination follows you as you move between tabs
+- Set a spoken trigger word (e.g. "send") and only then will Enter be sent for you — off by default, so sending stays manual
+- Language and engine live in the ▾ menu next to 🎤 in the top bar
+- macOS uses the built-in on-device recognizer; on other systems, plug any engine into `voice_command`
 
 ### 📝 And the final stroke is still yours — a Zed-inspired editor
 
@@ -175,7 +189,7 @@ On restart, the previous tabs, active tab, and panel state are restored automati
 
 ## Installing (manual)
 
-The one-liners at the top are fastest. `install.sh` places a prebuilt binary from GitHub Releases at `~/.local/bin/zai`, and on platforms without a matching binary it builds from source with Rust (auto-installing rustup if needed).
+The one-liners at the top are fastest. `install.sh` places a prebuilt binary from GitHub Releases at `~/.local/bin/zai`, and on platforms without a matching binary it builds from source with Rust (auto-installing rustup if needed). If Zaivern Code is already installed, the script acts as an **updater** — it fetches the latest version and also refreshes any stale `zai` binary left elsewhere on your PATH.
 
 - **Prebuilt binary**: grab your OS's archive from [Releases](https://github.com/tacyan/zaivern-code/releases/latest), extract `zai` (`zai.exe` on Windows), and put it somewhere on your PATH
 - **From source** (requires Rust):
@@ -334,6 +348,7 @@ src/
 ├── terminal.rs      PTY sessions + vt100 rendering + approval-prompt detection/auto-reply
 ├── agents.rs        Session management (launch/restart/destroy/broadcast/permission modes)
 ├── remote.rs        Phone remote (built-in HTTP server, QR code, token auth)
+├── voice.rs         Voice input (records until stopped, inserts without sending, pluggable engine)
 ├── session.rs       Per-workspace session restore
 ├── notify.rs        OS-native notifications
 ├── sound.rs         Sound effects (fire-and-forget OS-standard sounds)
@@ -357,6 +372,7 @@ src/
 - [x] VS Code-grade scrolling (fixed gutter, scrollBeyondLastLine, PageUp/PageDown)
 - [x] 3 permission modes (🛡 Approve / ⚡ Full-auto / 🤖 Agent-first) + bulk switch for running sessions
 - [x] Pet upgrades (4 looks, custom images, sizes, sleep/walk, sounds, approve/deny from the bubble)
+- [x] Voice input (🎤/⏹ only, records until stopped, inserts into the input box for a manual Enter, configurable destination/language/engine)
 - [ ] LSP completion & hover UI (foundation implemented; UI to come)
 - [ ] Plugin grammars (TextMate) & registry sharing
 - [ ] Inline diff view

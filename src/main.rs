@@ -9,6 +9,7 @@ mod file_tree;
 mod fuzzy;
 mod git;
 mod highlight;
+mod html;
 mod keybinds;
 mod lsp;
 mod markdown;
@@ -25,6 +26,7 @@ mod snippets;
 mod terminal;
 mod theme;
 mod theme_json;
+mod voice;
 
 use eframe::egui;
 

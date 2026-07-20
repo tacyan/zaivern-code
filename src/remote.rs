@@ -46,6 +46,15 @@ pub enum Query {
     /// アクティブなエージェントへ入力を送る (payload, raw)。
     /// raw=false はテキスト+Enter、raw=true はバイト列そのまま (制御キー用)。
     TermInput(String, bool),
+    /// 音声入力ページからの送信。id はセッション id (インデックスではない)、
+    /// 負数なら全エージェントへブロードキャスト。
+    /// submit=false ならテキストを入力欄へ挿入するだけで Enter は送らない
+    /// (PC 側と同じく、送信は必ず人の操作で行う)。
+    VoiceSend {
+        text: String,
+        id: i64,
+        submit: bool,
+    },
 }
 
 /// サーバスレッド → UI スレッドへのリクエスト。UI 側は必ず respond すること。
@@ -213,6 +222,10 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
     if path == "/" || path == "/index.html" {
         return respond(&mut stream, 200, "text/html; charset=utf-8", PAGE.as_bytes());
     }
+    if path == "/voice" {
+        // PC 用の音声入力ページ (Web Speech API — 127.0.0.1 で開くこと)
+        return respond(&mut stream, 200, "text/html; charset=utf-8", VOICE_PAGE.as_bytes());
+    }
     if !path.starts_with("/api/") {
         return respond(&mut stream, 404, "text/plain", b"not found");
     }
@@ -247,6 +260,12 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
         ("POST", "/api/term") => {
             Query::TermInput(s("text"), json.get("raw").and_then(|v| v.as_bool()).unwrap_or(false))
         }
+        ("POST", "/api/voice") => Query::VoiceSend {
+            text: s("text"),
+            id: json.get("id").and_then(|v| v.as_i64()).unwrap_or(-1),
+            // 既定は「挿入のみ」。送信は明示的に submit=true を渡したときだけ
+            submit: json.get("submit").and_then(|v| v.as_bool()).unwrap_or(false),
+        },
         _ => return respond(&mut stream, 404, "application/json", br#"{"ok":false,"error":"unknown api"}"#),
     };
 
@@ -324,6 +343,33 @@ mod tests {
         assert!(PAGE.contains("startVoice"));
         assert!(PAGE.contains("stopVoice"));
         assert!(PAGE.contains("chip mic"));
+    }
+
+    #[test]
+    fn pages_never_auto_send() {
+        // 話しただけで送信されないこと: 送信はボタン経由の関数だけが行う。
+        // 認識結果ハンドラから直接 API を叩く実装に戻したら気付けるようにする。
+        assert!(PAGE.contains("sendInput"));
+        assert!(!PAGE.contains("sendVoice"));
+        assert!(PAGE.contains("入れる"));
+        assert!(VOICE_PAGE.contains("id=\"draft\""));
+        assert!(VOICE_PAGE.contains("send(true)"));
+        assert!(VOICE_PAGE.contains("send(false)"));
+        assert!(VOICE_PAGE.contains("submit: submit"));
+    }
+
+    #[test]
+    fn voice_page_contains_required_parts() {
+        // PC 用音声入力ページ (生文字列の破損検知)
+        assert!(VOICE_PAGE.contains("<!DOCTYPE html>"));
+        assert!(VOICE_PAGE.contains("webkitSpeechRecognition"));
+        assert!(VOICE_PAGE.contains("/api/voice"));
+        assert!(VOICE_PAGE.contains("/api/state"));
+        assert!(VOICE_PAGE.contains("全エージェントへブロードキャスト"));
+        assert!(VOICE_PAGE.contains("入力欄へ入れる"));
+        assert!(VOICE_PAGE.contains("</html>"));
+        // 実制御文字が紛れ込んでいないこと
+        assert!(!VOICE_PAGE.contains('\u{1b}'));
     }
 }
 
@@ -460,6 +506,7 @@ const PAGE: &str = r##"<!DOCTYPE html>
     <div class="bar">
       <input id="ti" type="text" autocapitalize="off" autocorrect="off"
         placeholder="エージェントへ指示を送る…">
+      <button class="btn" id="tput" title="Enter を送らずに入力欄へ入れるだけ">&#10549; 入れる</button>
       <button class="btn pri" id="tsend">送信</button>
     </div>
   </section>
@@ -603,8 +650,9 @@ KEYS.forEach(([label, seq]) => {
   $('keys').appendChild(b);
 });
 // ─── 音声入力モード (エージェント毎) ───
-// マイクボタンでトグル。ON の間は話した内容が確定するたび、そのエージェントへ
-// 自動送信される。無音で認識が切れてもモードが ON なら自動で録音を再開する。
+// マイクボタンでトグル。話した内容は下の入力欄に溜まっていくだけで、
+// 自動送信はしない。送るのは [⤵ 入れる] か [送信] を押したときだけ。
+// 無音で認識が切れてもモードが ON なら自動で録音を再開する。
 let voiceAgent = -1, recog = null, lastInterim = '';
 function speechAPI() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
 function stopVoice0() {
@@ -633,14 +681,17 @@ function startVoice(i) {
       const t = ev.results[k][0].transcript;
       if (ev.results[k].isFinal) fin += t; else interim += t;
     }
-    if (interim && ($('ti').value === '' || $('ti').value === lastInterim)) {
-      $('ti').value = interim; lastInterim = interim;
-    }
+    // 途中経過は「入力欄の末尾に仮表示」。確定したらその場で本文に変わる
+    const base = $('ti').value.endsWith(lastInterim) && lastInterim
+      ? $('ti').value.slice(0, -lastInterim.length)
+      : $('ti').value;
     fin = fin.trim();
     if (fin) {
-      if ($('ti').value === lastInterim) $('ti').value = '';
+      $('ti').value = (base + (base && !base.endsWith(' ') ? ' ' : '') + fin).trim();
       lastInterim = '';
-      sendVoice(fin);
+    } else {
+      $('ti').value = base + interim;
+      lastInterim = interim;
     }
   };
   r.onerror = ev => {
@@ -656,20 +707,10 @@ function startVoice(i) {
     }
   };
   try { r.start(); } catch (e) { toast('音声入力を開始できません'); stopVoice0(); renderAgents(); return; }
-  $('ti').placeholder = '\u{1F3A4} 話しかけてください…';
+  $('ti').placeholder = '\u{1F3A4} 話した内容がここに溜まります — 送信はボタンで';
   renderAgents();
   const a = (state.agents || [])[i];
-  toast('\u{1F3A4} 音声入力モード ON → ' + (a ? a.title : ''));
-}
-async function sendVoice(text) {
-  const target = voiceAgent;
-  if (target < 0) return;
-  try {
-    // ボタンで選んだエージェントへ確実に届くよう、送信のたびにフォーカスし直す
-    await api('/api/cmd', {name:'agent_focus', arg:target});
-    await api('/api/term', {text: text, raw: false});
-    toast('\u{1F3A4}→ ' + text);
-  } catch (e) { toast('送信に失敗しました'); }
+  toast('\u{1F3A4} 音声入力モード ON → ' + (a ? a.title : '') + ' (自動送信はしません)');
 }
 function renderAgents() {
   const el = $('achips');
@@ -717,13 +758,21 @@ async function pollTerm() {
   clearTimeout(termTimer);
   termTimer = setTimeout(pollTerm, 1500);
 }
-$('tsend').onclick = async () => {
-  const v = $('ti').value;
+// 送信 = テキスト + Enter。入れる = テキストのみ (PC 側で内容を見て Enter)
+async function sendInput(submit) {
+  const v = $('ti').value.trim();
   if (!v) return;
-  await api('/api/term', {text: v, raw: false}).catch(() => {});
-  $('ti').value = '';
-};
-$('ti').addEventListener('keydown', e => { if (e.key === 'Enter') $('tsend').onclick(); });
+  if (voiceAgent >= 0) {
+    // 音声モード中は、選んだエージェントへ確実に届くようフォーカスし直す
+    await api('/api/cmd', {name:'agent_focus', arg:voiceAgent}).catch(() => {});
+  }
+  await api('/api/term', {text: v, raw: !submit}).catch(() => {});
+  $('ti').value = ''; lastInterim = '';
+  toast(submit ? '送信しました' : 'PC の入力欄に入れました (Enter で送信)');
+}
+$('tsend').onclick = () => sendInput(true);
+$('tput').onclick = () => sendInput(false);
+$('ti').addEventListener('keydown', e => { if (e.key === 'Enter') sendInput(true); });
 
 // ─── コマンド ───
 const CMDS = [
@@ -751,6 +800,225 @@ function renderCmds() {
 
 pollState();
 setInterval(pollState, 2500);
+</script>
+</body>
+</html>
+"##;
+
+// ─── PC 用 音声入力ページ ────────────────────────────────────────────
+//
+// デスクトップの 🎤 ボタンから 127.0.0.1 で開かれる (Web Speech API は
+// セキュアコンテキスト必須のため localhost であることが重要)。
+// 送信先はセッション id で選択でき、?target=<id|all> で初期選択が決まる。
+
+const VOICE_PAGE: &str = r##"<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0d1117">
+<title>Zaivern 音声入力</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background:#0d1117; color:#e6edf3; min-height:100vh;
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
+    display:flex; flex-direction:column; align-items:center;
+  }
+  header {
+    width:100%; display:flex; align-items:center; gap:10px;
+    padding:12px 18px; background:#161b22; border-bottom:1px solid #21262d;
+  }
+  .logo { font-weight:800; font-size:15px; color:#7ee1ff; letter-spacing:.5px; }
+  #dot { width:9px; height:9px; border-radius:50%; background:#f85149; }
+  #dot.on { background:#3fb950; box-shadow:0 0 6px #3fb95088; }
+  main { width:100%; max-width:680px; padding:22px 18px 40px; display:flex; flex-direction:column; gap:12px; }
+  h2 { font-size:12.5px; color:#8b949e; font-weight:600; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip {
+    background:#21262d; color:#c9d1d9; border:1px solid #30363d;
+    border-radius:16px; padding:8px 14px; font-size:13.5px; cursor:pointer;
+  }
+  .chip.act { background:#1f3a5f; border-color:#7ee1ff; color:#7ee1ff; }
+  #mic {
+    margin:14px auto 4px; width:120px; height:120px; border-radius:50%;
+    border:2px solid #30363d; background:#161b22; color:#e6edf3;
+    font-size:46px; cursor:pointer;
+  }
+  #mic.rec { background:#6e2c1e; border-color:#f85149; animation:zvpulse 1.1s ease-in-out infinite; }
+  @keyframes zvpulse { 50% { box-shadow:0 0 24px #f85149; } }
+  #hint { text-align:center; color:#8b949e; font-size:13px; min-height:1.5em; }
+  #interim { text-align:center; color:#7ee1ff; font-size:15px; min-height:1.6em; }
+  #draft {
+    width:100%; min-height:96px; resize:vertical; background:#0d1117; color:#e6edf3;
+    border:1px solid #30363d; border-radius:10px; padding:12px 14px; font-size:15px;
+    line-height:1.6; outline:none; font-family:inherit;
+  }
+  #draft:focus { border-color:#7ee1ff; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .grow { flex:1; }
+  .btn {
+    background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:8px;
+    padding:10px 16px; font-size:13.5px; font-weight:600; cursor:pointer;
+  }
+  .btn.pri { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  .btn:active { opacity:.7; }
+  #log { display:flex; flex-direction:column; gap:6px; }
+  #log div {
+    background:#161b22; border:1px solid #21262d; border-radius:8px;
+    padding:8px 12px; font-size:13.5px; word-break:break-all;
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">&#9889; ZAIVERN &#127908; 音声入力</span>
+  <span id="dot"></span>
+</header>
+<main>
+  <h2>送信先 (クリックで切替 — 話している途中でも変更できます)</h2>
+  <div class="chips" id="targets"></div>
+  <button id="mic">&#127908;</button>
+  <div id="hint">マイクボタンを押して話しかけてください — 内容を確認してからボタンで送ります</div>
+  <div id="interim"></div>
+  <textarea id="draft" placeholder="話した内容がここに溜まります。直してから送信できます。"></textarea>
+  <div class="row">
+    <button class="btn" id="clear">&#128465; 消す</button>
+    <span class="grow"></span>
+    <button class="btn" id="put" title="Enter を送らずに入力欄へ入れるだけ">&#10549; 入力欄へ入れる</button>
+    <button class="btn pri" id="send">&#9654; 送信 (Enter まで送る)</button>
+  </div>
+  <div id="log"></div>
+</main>
+<script>
+'use strict';
+const qs = new URLSearchParams(location.search);
+const TOK = qs.get('t') || '';
+let target = qs.get('target') || 'all';  // 'all' またはセッション id
+let agents = [], active = false, recog = null;
+const $ = id => document.getElementById(id);
+const HINT0 = 'マイクボタンを押して話しかけてください — 内容を確認してからボタンで送ります';
+
+async function api(path, body) {
+  const opt = body
+    ? { method:'POST', headers:{'Content-Type':'application/json','X-Token':TOK}, body:JSON.stringify(body) }
+    : { headers:{'X-Token':TOK} };
+  const r = await fetch(path, opt);
+  if (!r.ok) throw 0;
+  return r.json();
+}
+function renderTargets() {
+  const el = $('targets');
+  el.innerHTML = '';
+  const all = document.createElement('button');
+  all.className = 'chip' + (target === 'all' ? ' act' : '');
+  all.textContent = '\u{1F4E3} 全エージェントへブロードキャスト';
+  all.onclick = () => { target = 'all'; renderTargets(); };
+  el.appendChild(all);
+  agents.forEach(a => {
+    const c = document.createElement('button');
+    c.className = 'chip' + (String(a.id) === String(target) ? ' act' : '');
+    c.textContent = (a.running ? '● ' : '○ ') + a.icon + ' ' + a.title;
+    c.onclick = () => { target = String(a.id); renderTargets(); };
+    el.appendChild(c);
+  });
+}
+async function poll() {
+  try {
+    const s = await api('/api/state');
+    agents = s.agents || [];
+    $('dot').classList.add('on');
+    // 選択中のセッションが閉じられたらブロードキャストへ戻す
+    if (target !== 'all' && !agents.some(a => String(a.id) === String(target))) target = 'all';
+    renderTargets();
+  } catch (e) { $('dot').classList.remove('on'); }
+}
+function targetName() {
+  if (target === 'all') return '\u{1F4E3} 全エージェント';
+  const a = agents.find(x => String(x.id) === String(target));
+  return a ? a.icon + ' ' + a.title : '?';
+}
+function addLog(m) {
+  const d = document.createElement('div');
+  d.textContent = m;
+  $('log').prepend(d);
+  while ($('log').childElementCount > 50) $('log').lastChild.remove();
+}
+// submit=false は入力欄へ入れるだけ (Enter は送らない)。
+// 話しただけでは絶対に送信されない — 押したときだけ送る。
+async function send(submit) {
+  const text = $('draft').value.trim();
+  if (!text) return;
+  const id = target === 'all' ? -1 : Number(target);
+  const name = targetName();
+  try {
+    const r = await api('/api/voice', {text: text, id: id, submit: submit});
+    if (r.ok) {
+      addLog((submit ? '▶ 送信 ' : '⤵ 入力欄へ ') + name + ' ← ' + text);
+      $('draft').value = '';
+    } else {
+      addLog('⚠ ' + (r.error || '失敗') + ': ' + text);
+    }
+  } catch (e) { addLog('⚠ 送信に失敗しました: ' + text); }
+}
+$('send').onclick = () => send(true);
+$('put').onclick = () => send(false);
+$('clear').onclick = () => { $('draft').value = ''; };
+function speechAPI() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
+function stopVoice() {
+  active = false;
+  const r = recog; recog = null;
+  if (r) { r.onend = null; try { r.stop(); } catch (e) {} }
+  $('mic').classList.remove('rec');
+  $('hint').textContent = HINT0;
+  $('interim').textContent = '';
+}
+function startVoice() {
+  const C = speechAPI();
+  if (!C) {
+    $('hint').textContent = 'このブラウザは音声認識に未対応です — Chrome か Safari をお使いください';
+    return;
+  }
+  const r = new C();
+  recog = r; active = true;
+  r.lang = 'ja-JP';
+  r.continuous = true;
+  r.interimResults = true;
+  r.onresult = ev => {
+    let fin = '', interim = '';
+    for (let k = ev.resultIndex; k < ev.results.length; k++) {
+      const t = ev.results[k][0].transcript;
+      if (ev.results[k].isFinal) fin += t; else interim += t;
+    }
+    $('interim').textContent = interim;
+    fin = fin.trim();
+    if (fin) {
+      // 確定した文は下書き欄へ足していくだけ。送信はボタンを押したときだけ
+      $('interim').textContent = '';
+      const d = $('draft');
+      d.value = (d.value + (d.value && !d.value.endsWith(' ') ? ' ' : '') + fin).trim();
+    }
+  };
+  r.onerror = ev => {
+    if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+      $('hint').textContent = 'マイクが許可されていません — アドレスバーのマイク設定を確認してください';
+      stopVoice();
+    } else if (ev.error === 'audio-capture') {
+      $('hint').textContent = 'マイクが見つかりません';
+      stopVoice();
+    }
+  };
+  r.onend = () => {
+    // 無音で切れてもモードが ON の間は自動で再開する
+    if (recog === r && active) { try { r.start(); } catch (e) { stopVoice(); } }
+  };
+  try { r.start(); } catch (e) { $('hint').textContent = '音声認識を開始できません'; stopVoice(); return; }
+  $('mic').classList.add('rec');
+  $('hint').textContent = '\u{1F3A4} 認識中 — もう一度押すと停止します';
+}
+$('mic').onclick = () => (active ? stopVoice() : startVoice());
+poll();
+setInterval(poll, 2500);
 </script>
 </body>
 </html>

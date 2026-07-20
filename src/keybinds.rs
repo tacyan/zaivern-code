@@ -234,6 +234,15 @@ fn key_from_name(name: &str) -> Option<Key> {
         "f10" => F10,
         "f11" => F11,
         "f12" => F12,
+        // F13 以降は macOS で輝度/音量キーと競合しないので音声入力向き
+        "f13" => F13,
+        "f14" => F14,
+        "f15" => F15,
+        "f16" => F16,
+        "f17" => F17,
+        "f18" => F18,
+        "f19" => F19,
+        "f20" => F20,
         "up" => ArrowUp,
         "down" => ArrowDown,
         "left" => ArrowLeft,
@@ -276,6 +285,10 @@ mod tests {
             Some(sc(Modifiers::CTRL, Key::Backtick))
         );
         assert_eq!(parse_shortcut("ctrl+backtick"), parse_shortcut("ctrl+`"));
+        // F13 以降 (macOS で輝度/音量キーと競合しない) もバインドできる
+        assert_eq!(parse_shortcut("f13"), Some(sc(Modifiers::NONE, Key::F13)));
+        assert_eq!(parse_shortcut("cmd+f20"), Some(sc(Modifiers::COMMAND, Key::F20)));
+        assert_eq!(parse_shortcut("f21"), None);
     }
 
     #[test]

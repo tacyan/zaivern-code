@@ -13,6 +13,7 @@ use crate::file_tree::{self, FileTree, TreeActions};
 use crate::fuzzy;
 use crate::git;
 use crate::highlight::Highlighter;
+use crate::html;
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::lsp;
 use crate::markdown;
@@ -28,12 +29,33 @@ use crate::terminal;
 use crate::theme::{self, Theme};
 use crate::plugins;
 use crate::theme_json;
+use crate::voice;
 
 #[derive(PartialEq, Clone, Copy)]
 enum SidebarTab {
     Files,
     Agents,
     Plugins,
+}
+
+/// 音声入力 (プッシュトゥトーク) の実行状態。
+///
+/// 認識結果は対象セッションの入力欄へ「挿入するだけ」で Enter は送らない。
+/// 送信するかどうかは必ずユーザーが自分で決める (誤送信防止)。
+#[derive(Default)]
+struct VoiceState {
+    /// 起動中の認識プロセス (None = 停止中)。⏹ を押すまで動き続ける
+    session: Option<voice::Session>,
+    /// マイクが開いたか (認識準備完了)
+    ready: bool,
+    /// 認識テキストの届け先
+    target: voice::Target,
+    /// 認識途中のテキスト (HUD 表示用)
+    partial: String,
+    /// 停止要求を出した時刻 (確定待ちのタイムアウト用)
+    stopping_at: Option<Instant>,
+    /// 直前に文字を送った先。宛先が変わったら区切りの空白を入れない
+    last_sent_to: Option<u64>,
 }
 
 /// kind: 0 = ok(緑), 1 = warn(黄), 2 = err(赤)
@@ -67,8 +89,12 @@ pub struct ZaivernApp {
     palette: Palette,
     highlighter: Highlighter,
     cockpit: bool,
-    /// Markdown ファイルをレンダリング表示するモード (Cockpit 以外で有効)
+    /// Markdown/HTML ファイルをレンダリング表示するモード (Cockpit 以外で有効)
     md_preview: bool,
+    /// プレビューが参照するローカル画像のテクスチャキャッシュ
+    md_images: markdown::ImageCache,
+    /// プレビュー用の変換結果キャッシュ (バッファ id, テキストハッシュ, 変換後 Markdown)
+    md_pre_cache: Option<(u64, u64, String)>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
     file_index: Vec<String>,
@@ -138,6 +164,8 @@ pub struct ZaivernApp {
     lsp_pending: HashMap<PathBuf, (String, Instant, String)>,
     /// アクティブバッファの診断件数 (エラー, 警告) — ステータスバー用
     diag_counts: (usize, usize),
+    /// 音声入力の実行状態
+    voice: VoiceState,
 }
 
 impl ZaivernApp {
@@ -170,6 +198,8 @@ impl ZaivernApp {
             highlighter: Highlighter::new(),
             cockpit: false,
             md_preview: false,
+            md_images: markdown::ImageCache::default(),
+            md_pre_cache: None,
             sidebar_open: true,
             sidebar_tab: SidebarTab::Files,
             file_index: Vec::new(),
@@ -192,6 +222,7 @@ impl ZaivernApp {
             remote: None,
             remote_err: None,
             remote_open: false,
+            voice: VoiceState::default(),
             qr_tex: None,
             broadcast_input: String::new(),
             git: (None, None),
@@ -853,6 +884,9 @@ impl ZaivernApp {
     fn open_path(&mut self, path: &Path) {
         match self.editor.open(path, &self.highlighter) {
             Ok(reloaded) => {
+                // Cockpit 表示中はエディタが隠れており「開けていない」ように
+                // 見えるため、ファイルを開いたらエディタ画面へ戻す
+                self.cockpit = false;
                 if reloaded {
                     if let Some(i) = self.editor.active {
                         let title = self.editor.buffers[i].title.clone();
@@ -1128,18 +1162,19 @@ impl ZaivernApp {
             Cmd::ToggleMdPreview => {
                 // Cockpit ビュー中はエディタが出ていないので何もしない
                 if !self.cockpit {
-                    let is_md = self
+                    let ok = self
                         .editor
                         .active
                         .map(|i| {
                             let b = &self.editor.buffers[i];
                             markdown::is_markdown(&b.title, &b.lang)
+                                || html::is_html(&b.title, &b.lang)
                         })
                         .unwrap_or(false);
-                    if is_md {
+                    if ok {
                         self.md_preview = !self.md_preview;
                     } else {
-                        self.toast("Markdown ファイルではありません", false);
+                        self.toast("Markdown / HTML ファイルではありません", false);
                     }
                 }
             }
@@ -1336,6 +1371,55 @@ impl ZaivernApp {
             }
             Cmd::ToggleRemote => {
                 self.remote_open = !self.remote_open;
+            }
+            Cmd::VoiceInput(target) => {
+                // 🎤 のトグル。録音中に押したら止める
+                if self.voice.session.is_some() {
+                    self.stop_voice();
+                } else {
+                    self.start_voice(target, ctx);
+                }
+            }
+            Cmd::VoiceStop => self.stop_voice(),
+            Cmd::SetVoiceTarget(t) => {
+                self.voice.target = t;
+                self.voice.last_sent_to = None;
+                self.cfg.voice_target = t.name().to_string();
+                config::save_state(&self.cfg);
+            }
+            Cmd::SetVoiceEngine(e) => {
+                self.cfg.voice_engine = e;
+                config::save_state(&self.cfg);
+                if self.cfg.voice_engine == "command" && self.cfg.voice_command.trim().is_empty() {
+                    self.toast_warn(
+                        "外部エンジンを使うには config.toml の voice_command を設定してください",
+                    );
+                } else {
+                    self.toast(
+                        format!("🎤 音声認識エンジン: {}", self.cfg.voice_engine),
+                        true,
+                    );
+                }
+            }
+            Cmd::SetVoiceLang(l) => {
+                self.cfg.voice_lang = l;
+                config::save_state(&self.cfg);
+                self.toast(format!("🎤 認識言語: {}", self.cfg.voice_lang), true);
+            }
+            Cmd::SetVoiceKeyword(k) => {
+                self.cfg.voice_keyword = k;
+                config::save_state(&self.cfg);
+                if self.cfg.voice_keyword.is_empty() {
+                    self.toast("🎤 送信は常に手動 Enter になりました", true);
+                } else {
+                    self.toast(
+                        format!(
+                            "🎤 「{}」と話すとそのまま送信します",
+                            self.cfg.voice_keyword
+                        ),
+                        true,
+                    );
+                }
             }
             Cmd::NewPlugin => {
                 if self.new_plugin_name.is_none() {
@@ -1645,12 +1729,144 @@ impl ZaivernApp {
                             .on_hover_text(
                                 "スマホから操作 — QR コードを表示\n\
                                  同じ Wi-Fi のスマホで読み取るだけで、編集・保存・\n\
-                                 エージェント操作(Claude の承認も)ができます",
+                                 エージェント操作(Claude の承認も)ができます\n\
+                                 🎤 音声入力: PC は Cockpit 各タブの 🎤 /\n\
+                                 ブロードキャスト欄の 🎤、スマホは「エージェント」タブ",
                             )
                             .clicked()
                         {
                             cmds.push(Cmd::ToggleRemote);
                         }
+
+                        // 音声入力: 🎤 で開始、隣の ⏹ で停止。押している間だけの
+                        // 録音キーは無し — ボタンだけで完結する
+                        let rec = self.voice.session.is_some();
+                        if rec
+                            && ui
+                                .button(RichText::new("⏹").color(theme.err).strong())
+                                .on_hover_text("音声入力を止める")
+                                .clicked()
+                        {
+                            cmds.push(Cmd::VoiceStop);
+                        }
+                        if ui
+                            .selectable_label(
+                                rec,
+                                RichText::new(if rec { "🔴" } else { "🎤" })
+                                    .color(if rec { theme.err } else { theme.text }),
+                            )
+                            .on_hover_text(if rec {
+                                "録音中 — もう一度押すと止まります"
+                            } else {
+                                "音声入力を始める\n\
+                                 ⏹ を押すまで、話した内容が入力欄に入り続けます\n\
+                                 (Enter は送られないので、確認して自分で送信)"
+                            })
+                            .clicked()
+                        {
+                            let t = voice::Target::from_name(&self.cfg.voice_target);
+                            cmds.push(Cmd::VoiceInput(t));
+                        }
+                        ui.menu_button("▾", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "話した内容は入力欄に入るだけです。\n\
+                                     送信されるのは自分で Enter を押したときだけ。",
+                                )
+                                .size(11.0)
+                                .color(theme.text_dim),
+                            );
+                            ui.separator();
+                            if ui
+                                .button(if rec {
+                                    "⏹ 録音を止める"
+                                } else {
+                                    "🎤 いま録音する (アクティブなエージェントへ)"
+                                })
+                                .clicked()
+                            {
+                                let t = voice::Target::from_name(&self.cfg.voice_target);
+                                cmds.push(Cmd::VoiceInput(t));
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            // 届け先。録音中は HUD からも切り替えられる
+                            let cur = if rec {
+                                self.voice.target
+                            } else {
+                                voice::Target::from_name(&self.cfg.voice_target)
+                            };
+                            ui.label(RichText::new("届け先").size(11.0).color(theme.text_dim));
+                            for (t, label) in [
+                                (voice::Target::Active, "🎯 アクティブなエージェント"),
+                                (voice::Target::Broadcast, "📣 全エージェントへブロードキャスト"),
+                            ] {
+                                if ui.radio(cur == t, label).clicked() {
+                                    cmds.push(Cmd::SetVoiceTarget(t));
+                                    ui.close_menu();
+                                }
+                            }
+                            ui.menu_button(format!("🌐 言語: {}", self.cfg.voice_lang), |ui| {
+                                for (code, label) in [
+                                    ("ja-JP", "日本語"),
+                                    ("en-US", "English (US)"),
+                                    ("zh-CN", "中文"),
+                                    ("ko-KR", "한국어"),
+                                ] {
+                                    if ui.radio(self.cfg.voice_lang == code, label).clicked() {
+                                        cmds.push(Cmd::SetVoiceLang(code.to_string()));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                            ui.menu_button(
+                                if self.cfg.voice_keyword.is_empty() {
+                                    "🗣 合図で送信: なし (常に手動 Enter)".to_string()
+                                } else {
+                                    format!("🗣 合図で送信: 「{}」", self.cfg.voice_keyword)
+                                },
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(
+                                            "この言葉で終わったときだけ Enter まで送ります",
+                                        )
+                                        .size(11.0)
+                                        .color(theme.text_dim),
+                                    );
+                                    for kw in ["", "送信", "送って", "オーケー"] {
+                                        let sel = self.cfg.voice_keyword == kw;
+                                        let label = if kw.is_empty() { "なし" } else { kw };
+                                        if ui.radio(sel, label).clicked() {
+                                            cmds.push(Cmd::SetVoiceKeyword(kw.to_string()));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                },
+                            );
+                            ui.separator();
+                            ui.menu_button(
+                                format!("⚙ エンジン: {}", self.cfg.voice_engine),
+                                |ui| {
+                                    for (v, label) in [
+                                        ("auto", "自動 (この OS に合わせる)"),
+                                        ("mac", "macOS 内蔵の音声認識"),
+                                        ("command", "外部コマンド (config.toml の voice_command)"),
+                                        ("off", "無効"),
+                                    ] {
+                                        if ui.radio(self.cfg.voice_engine == v, label).clicked() {
+                                            cmds.push(Cmd::SetVoiceEngine(v.to_string()));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                },
+                            );
+                        })
+                        .response
+                        .on_hover_text(
+                            "音声入力 — キーを押している間だけ録音し、\n\
+                             認識テキストをエージェントの入力欄へ挿入します。\n\
+                             Enter は送られないので、確認してから自分で送信できます。",
+                        );
 
                         // ペットメニュー(表示切替・画像変更)
                         ui.menu_button("🐾", |ui| {
@@ -2494,6 +2710,9 @@ impl ZaivernApp {
         let mut cycle: Option<usize> = None;
         let mut cycle_all = false;
         let mut broadcast: Option<String> = None;
+        let mut voice: Option<u64> = None;
+        let mut voice_all = false;
+        let mut voice_stop = false;
 
         egui::Frame::none()
             .inner_margin(egui::Margin::same(12.0))
@@ -2545,6 +2764,30 @@ impl ZaivernApp {
                         if (send.clicked() || enter) && !self.broadcast_input.trim().is_empty() {
                             broadcast = Some(self.broadcast_input.trim().to_string());
                             self.broadcast_input.clear();
+                        }
+                        // 音声で全エージェントの入力欄へ入れる (送信は各自 Enter)
+                        let rec = self.voice.session.is_some();
+                        if rec
+                            && ui
+                                .button(RichText::new("⏹").color(theme.err).strong())
+                                .on_hover_text("音声入力を止める")
+                                .clicked()
+                        {
+                            voice_stop = true;
+                        }
+                        if ui
+                            .selectable_label(
+                                rec && self.voice.target == voice::Target::Broadcast,
+                                if rec { "🔴" } else { "🎤" },
+                            )
+                            .on_hover_text(
+                                "音声入力 → 全エージェントの入力欄へ\n\
+                                 ⏹ を押すまで話した内容が入り続けます。\n\
+                                 送信はされないので、自分で Enter を押してください",
+                            )
+                            .clicked()
+                        {
+                            voice_all = true;
                         }
                     });
                 });
@@ -2620,6 +2863,7 @@ impl ZaivernApp {
                                             ui.set_width(cell_w - 18.0);
                                             ui.set_height(cell_h - 18.0);
                                             let s = &mut self.agents.sessions[i];
+                                            let sid = s.id;
                                             ui.horizontal(|ui| {
                                                 let dot = if s.running() {
                                                     if s.attention {
@@ -2688,6 +2932,25 @@ impl ZaivernApp {
                                                         {
                                                             focus = Some(i);
                                                         }
+                                                        if ui
+                                                            .small_button(
+                                                                if self.voice.target == voice::Target::Session(sid)
+                                                                    && self.voice.session.is_some()
+                                                                {
+                                                                    "🔴"
+                                                                } else {
+                                                                    "🎤"
+                                                                },
+                                                            )
+                                                            .on_hover_text(
+                                                                "このエージェントへ音声入力\n\
+                                                                 話した内容がこのタブの入力欄に入ります。\n\
+                                                                 送信されないので、確認して Enter を押してください",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            voice = Some(sid);
+                                                        }
                                                     },
                                                 );
                                             });
@@ -2705,6 +2968,15 @@ impl ZaivernApp {
         if let Some(text) = broadcast {
             self.agents.broadcast(&text);
             self.toast(format!("📣 {} セッションへ送信しました", self.agents.running_count()), true);
+        }
+        if voice_stop {
+            self.stop_voice();
+        }
+        if let Some(id) = voice {
+            self.apply_cmd(Cmd::VoiceInput(voice::Target::Session(id)), ctx);
+        }
+        if voice_all {
+            self.apply_cmd(Cmd::VoiceInput(voice::Target::Broadcast), ctx);
         }
         if cycle_all {
             self.apply_cmd(Cmd::CyclePermissionAll, ctx);
@@ -2820,35 +3092,43 @@ impl ZaivernApp {
             self.welcome_ui(ui);
             return;
         }
-        // Markdown ファイルは 編集/プレビュー の切替バーを出す
+        // Markdown / HTML ファイルは 編集/プレビュー の切替バーを出す
         // (Cockpit ビュー中は editor_area 自体が描画されないため自動的に除外)
-        let is_md = self
+        let (is_md, is_html) = self
             .editor
             .active
             .map(|i| {
                 let b = &self.editor.buffers[i];
-                markdown::is_markdown(&b.title, &b.lang)
+                (
+                    markdown::is_markdown(&b.title, &b.lang),
+                    html::is_html(&b.title, &b.lang),
+                )
             })
-            .unwrap_or(false);
-        if is_md {
-            self.md_toggle_bar(ui);
+            .unwrap_or((false, false));
+        if is_md || is_html {
+            self.md_toggle_bar(ui, is_html);
             if self.md_preview {
-                self.markdown_preview_ui(ui);
+                self.markdown_preview_ui(ui, is_html);
                 return;
             }
         }
         self.code_editor_ui(ui);
     }
 
-    /// Markdown 用の 編集/プレビュー 切替バー。
-    fn md_toggle_bar(&mut self, ui: &mut egui::Ui) {
+    /// Markdown / HTML 用の 編集/プレビュー 切替バー。
+    fn md_toggle_bar(&mut self, ui: &mut egui::Ui, is_html: bool) {
         let theme = self.theme.clone();
+        let path = self
+            .editor
+            .active
+            .and_then(|i| self.editor.buffers[i].path.clone());
         egui::Frame::none()
             .fill(theme.panel_alt)
             .inner_margin(egui::Margin::symmetric(10.0, 3.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Ⓜ Markdown").size(11.5).color(theme.text_dim));
+                    let label = if is_html { "🌐 HTML" } else { "Ⓜ Markdown" };
+                    ui.label(RichText::new(label).size(11.5).color(theme.text_dim));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let p = ui.selectable_label(
                             self.md_preview,
@@ -2864,20 +3144,63 @@ impl ZaivernApp {
                         if e.on_hover_text("ソースを編集 (⌘⇧V)").clicked() {
                             self.md_preview = false;
                         }
+                        // HTML はブラウザで開けば完全な見た目で確認できる
+                        if is_html {
+                            let b = ui.add_enabled(
+                                path.is_some(),
+                                egui::Button::new(
+                                    RichText::new("🌐 ブラウザで開く").size(12.0),
+                                ),
+                            );
+                            if b.on_hover_text(
+                                "既定ブラウザで完全表示 (ディスクに保存済みの内容)",
+                            )
+                            .clicked()
+                            {
+                                if let Some(p) = &path {
+                                    open_external(&p.display().to_string());
+                                }
+                            }
+                        }
                     });
                 });
             });
     }
 
-    /// Markdown のレンダリングプレビュー画面。
-    fn markdown_preview_ui(&mut self, ui: &mut egui::Ui) {
+    /// Markdown / HTML のレンダリングプレビュー画面。
+    /// HTML は Markdown へ変換してから同じレンダラで描く。
+    fn markdown_preview_ui(&mut self, ui: &mut egui::Ui, is_html: bool) {
         let Some(active) = self.editor.active else {
             return;
         };
         let id = self.editor.buffers[active].id;
-        let text = self.editor.buffers[active].text.clone();
+        // 変換 (HTML→MD / 埋め込みHTML展開) は重いので内容が変わったときだけ行う
+        let h = hash_str(&self.editor.buffers[active].text);
+        let cached = self
+            .md_pre_cache
+            .as_ref()
+            .is_some_and(|(cid, ch, _)| *cid == id && *ch == h);
+        if !cached {
+            let raw = &self.editor.buffers[active].text;
+            let processed = if is_html {
+                html::html_to_md(raw)
+            } else {
+                html::preprocess_markdown(raw)
+            };
+            self.md_pre_cache = Some((id, h, processed));
+        }
+        let text = match &self.md_pre_cache {
+            Some((_, _, t)) => t.clone(),
+            None => return,
+        };
+        let dir = self.editor.buffers[active]
+            .path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let theme = self.theme.clone();
         let base = self.cfg.editor_font_size;
+        let hl = &self.highlighter;
+        let images = &mut self.md_images;
         egui::ScrollArea::vertical()
             .id_salt(("md-preview", id))
             .auto_shrink([false, false])
@@ -2892,7 +3215,11 @@ impl ZaivernApp {
                         egui::Frame::none()
                             .inner_margin(egui::Margin::symmetric(18.0, 14.0))
                             .show(ui, |ui| {
-                                markdown::render(ui, &theme, &self.highlighter, base, &text);
+                                let mut rctx = markdown::RenderCtx {
+                                    dir: dir.as_deref(),
+                                    images,
+                                };
+                                markdown::render(ui, &theme, hl, base, &text, &mut rctx);
                             });
                     });
                 });
@@ -3339,7 +3666,7 @@ impl ZaivernApp {
                 ("🔍".into(), "ファイル内検索".into(), "⌘F".into(), Cmd::OpenFind),
                 ("🖥".into(), "ターミナル表示切替".into(), "⌘J".into(), Cmd::ToggleTerminal),
                 ("🎛".into(), "Cockpit 切替".into(), "⌘⇧C".into(), Cmd::ToggleCockpit),
-                ("👁".into(), "Markdown プレビュー切替".into(), "⌘⇧V".into(), Cmd::ToggleMdPreview),
+                ("👁".into(), "Markdown/HTML プレビュー切替".into(), "⌘⇧V".into(), Cmd::ToggleMdPreview),
                 ("📁".into(), "サイドバー切替".into(), "⌘B".into(), Cmd::ToggleSidebar),
                 (
                     "🤖".into(),
@@ -3380,6 +3707,12 @@ impl ZaivernApp {
                     Cmd::ToggleRemote,
                 ),
                 (
+                    "🎤".into(),
+                    "音声入力: 全エージェントの入力欄へ (送信は自分で Enter)".into(),
+                    String::new(),
+                    Cmd::VoiceInput(voice::Target::Broadcast),
+                ),
+                (
                     "🛡".into(),
                     "実行中の全 Claude の権限モードを切替 (Shift+Tab)".into(),
                     String::new(),
@@ -3393,6 +3726,15 @@ impl ZaivernApp {
                 ("🔌".into(), "プラグインを表示".into(), String::new(), Cmd::ShowPlugins),
                 ("⟳".into(), "プラグインを再スキャン".into(), String::new(), Cmd::RescanPlugins),
             ];
+            // 実行中のセッション毎に音声入力エントリを出す (パレットで「音声」検索用)
+            for s in self.agents.sessions.iter().take(20) {
+                cmds.push((
+                    "🎤".into(),
+                    format!("音声入力: {} {} の入力欄へ (送信は自分で Enter)", s.icon, s.title),
+                    String::new(),
+                    Cmd::VoiceInput(voice::Target::Session(s.id)),
+                ));
+            }
             for t in theme::all() {
                 cmds.push((
                     "🎨".into(),
@@ -3782,6 +4124,293 @@ impl ZaivernApp {
 
     // ─── スマホリモート ─────────────────────────────────────────────
 
+    // ─── 音声入力 (Zaivern 内で完結) ────────────────────────────────
+
+    /// 音声入力を開始する。⏹ を押すまで録音し続ける。
+    fn start_voice(&mut self, target: voice::Target, ctx: &egui::Context) {
+        if self.voice.session.is_some() {
+            return;
+        }
+        if self.agents.running_count() == 0 {
+            self.toast_warn("音声入力の宛先がありません — 先にエージェントを起動してください");
+            return;
+        }
+        match voice::start(
+            &self.cfg.voice_engine,
+            &self.cfg.voice_lang,
+            &self.cfg.voice_command,
+            ctx,
+        ) {
+            Ok(s) => {
+                self.voice = VoiceState {
+                    session: Some(s),
+                    target,
+                    ..Default::default()
+                };
+                if self.cfg.pet_sounds {
+                    self.sound.play(SoundKind::Confirm);
+                }
+            }
+            Err(e) => {
+                self.voice = VoiceState::default();
+                self.toast(format!("🎤 {e}"), false);
+            }
+        }
+    }
+
+    /// 録音を止める。認識プロセスは最後の確定テキストを返してから終了するので、
+    /// ここでは kill せず `stopping_at` を立てて確定を待つ。
+    fn stop_voice(&mut self) {
+        if let Some(s) = self.voice.session.as_mut() {
+            s.stop();
+            if self.voice.stopping_at.is_none() {
+                self.voice.stopping_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// 音声入力の主処理。毎フレーム呼ぶ。
+    fn poll_voice(&mut self, ctx: &egui::Context) {
+        let events = match self.voice.session.as_ref() {
+            Some(s) => s.poll(),
+            None => return,
+        };
+        let mut ended = false;
+        for ev in events {
+            match ev {
+                voice::Event::Ready => {
+                    self.voice.ready = true;
+                }
+                voice::Event::Partial(t) => self.voice.partial = t,
+                voice::Event::Final(t) => {
+                    self.voice.partial.clear();
+                    self.insert_voice_text(&t);
+                }
+                voice::Event::Error(e) => {
+                    self.toast(format!("🎤 {e}"), false);
+                    ended = true;
+                }
+                voice::Event::Ended => ended = true,
+            }
+        }
+
+        // 停止要求から一定時間たっても終わらないプロセスは打ち切る
+        let timed_out = self
+            .voice
+            .stopping_at
+            .is_some_and(|at| at.elapsed() > Duration::from_secs(5));
+        if ended || timed_out {
+            if let Some(mut s) = self.voice.session.take() {
+                s.kill();
+            }
+            self.voice = VoiceState::default();
+        } else {
+            // 録音中は HUD を動かし続ける
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+    }
+
+    /// 認識テキストを対象セッションの入力欄へ挿入する。
+    ///
+    /// **Enter は送らない**。ユーザーが内容を見て自分で Enter を押すまで
+    /// エージェントへは送信されない。設定した合図キーワードを話したときだけ、
+    /// キーワードを取り除いたうえで Enter まで送る。
+    fn insert_voice_text(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let kw = self.cfg.voice_keyword.trim().to_string();
+        let (body, submit) = match kw.is_empty() {
+            true => (text.to_string(), false),
+            false => match strip_trailing_keyword(text, &kw) {
+                Some(rest) => (rest, true),
+                None => (text.to_string(), false),
+            },
+        };
+        let body = body.trim().to_string();
+        let payload = if submit {
+            format!("{body}\r")
+        } else {
+            body.clone()
+        };
+
+        if body.is_empty() && !submit {
+            return;
+        }
+
+        // 話し続けている間は前の文とくっつかないよう区切りの空白を入れる。
+        // 宛先が変わった直後と、Enter で送った直後は先頭なので入れない。
+        let sent = match self.resolve_voice_target() {
+            Some(id) => {
+                let sep = self.voice.last_sent_to == Some(id);
+                match self.agents.sessions.iter_mut().find(|s| s.id == id) {
+                    Some(s) if s.running() => {
+                        let out = if sep { format!(" {payload}") } else { payload };
+                        s.write_bytes(out.as_bytes());
+                        self.voice.last_sent_to = if submit { None } else { Some(id) };
+                        Some(s.title.clone())
+                    }
+                    _ => None,
+                }
+            }
+            None if self.voice.target == voice::Target::Broadcast => {
+                let n = self.agents.running_count();
+                if n == 0 {
+                    None
+                } else {
+                    // ブロードキャストは Enter 込みの broadcast() を使わず、
+                    // 挿入のみ / 送信ありを自分で選ぶ
+                    let sep = self.voice.last_sent_to == Some(u64::MAX);
+                    let out = if sep { format!(" {payload}") } else { payload };
+                    for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
+                        s.write_bytes(out.as_bytes());
+                    }
+                    self.voice.last_sent_to = if submit { None } else { Some(u64::MAX) };
+                    Some(format!("{n} セッション"))
+                }
+            }
+            None => None,
+        };
+
+        match sent {
+            Some(where_) if submit => {
+                self.toast(format!("🎤▶ {where_} へ送信: {body}"), true)
+            }
+            Some(where_) => self.toast(
+                format!("🎤 {where_} の入力欄へ (Enter で送信): {body}"),
+                true,
+            ),
+            None => self.toast_warn("音声入力の宛先セッションが見つかりません"),
+        }
+    }
+
+    /// いま文字を届けるべきセッション id。ブロードキャストなら None。
+    /// `Active` は毎回引き直すので、録音中にタブを切り替えれば宛先も移る。
+    fn resolve_voice_target(&self) -> Option<u64> {
+        match self.voice.target {
+            voice::Target::Broadcast => None,
+            voice::Target::Active => {
+                self.agents.sessions.get(self.agents.active).map(|s| s.id)
+            }
+            voice::Target::Session(id) => Some(id),
+        }
+    }
+
+    /// 録音中に画面上部へ出すパネル。認識中の文字・届け先の切替・⏹ 停止を持つ。
+    fn voice_hud(&mut self, ctx: &egui::Context) {
+        if self.voice.session.is_none() {
+            return;
+        }
+        let theme = self.theme.clone();
+        let stopping = self.voice.stopping_at.is_some();
+        let head = if stopping {
+            "🎤 最後のひとことを待っています…".to_string()
+        } else if self.voice.ready {
+            let dots = (self.voice.partial.len() % 3) + 1;
+            format!("🔴 録音中{}", "・".repeat(dots))
+        } else {
+            "🎤 マイクを準備しています…".to_string()
+        };
+        let target_label = self.voice_target_label();
+        let mut stop = false;
+        let mut set_target: Option<voice::Target> = None;
+
+        egui::Area::new(egui::Id::new("zv-voice-hud"))
+            .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 56.0))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(theme.panel)
+                    .stroke(egui::Stroke::new(
+                        1.5_f32,
+                        if stopping { theme.accent } else { theme.err },
+                    ))
+                    .rounding(egui::Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(600.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(head).strong().color(theme.text));
+                            ui.label(
+                                RichText::new(format!("→ {target_label}")).color(theme.text_dim),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button(RichText::new("⏹ 停止").strong())
+                                        .on_hover_text("録音をやめます")
+                                        .clicked()
+                                    {
+                                        stop = true;
+                                    }
+                                },
+                            );
+                        });
+                        // 録音したまま届け先を切り替えられる
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("届け先:").size(11.0).color(theme.text_dim));
+                            for (t, label) in [
+                                (voice::Target::Active, "🎯 アクティブなエージェント"),
+                                (voice::Target::Broadcast, "📣 全エージェント"),
+                            ] {
+                                let sel = self.voice.target == t;
+                                if ui.selectable_label(sel, RichText::new(label).size(11.5)).clicked()
+                                    && !sel
+                                {
+                                    set_target = Some(t);
+                                }
+                            }
+                        });
+                        if !self.voice.partial.is_empty() {
+                            ui.label(RichText::new(&self.voice.partial).color(theme.accent));
+                        }
+                        ui.label(
+                            RichText::new(
+                                "話した内容は入力欄に入り続けます。送信は自分で Enter を押したときだけ。\n\
+                                 Enter で空になっても録音は続いているので、そのまま話せます",
+                            )
+                            .size(11.0)
+                            .color(theme.text_dim),
+                        );
+                    });
+            });
+
+        if let Some(t) = set_target {
+            self.voice.target = t;
+            // 宛先が変わったら区切りの空白をリセットする
+            self.voice.last_sent_to = None;
+            if t != voice::Target::Session(0) {
+                self.cfg.voice_target = t.name().to_string();
+                config::save_state(&self.cfg);
+            }
+        }
+        if stop {
+            self.stop_voice();
+        }
+    }
+
+    /// 届け先の表示名。
+    fn voice_target_label(&self) -> String {
+        match self.voice.target {
+            voice::Target::Broadcast => {
+                format!("📣 全エージェント ({})", self.agents.running_count())
+            }
+            voice::Target::Active | voice::Target::Session(_) => {
+                match self.resolve_voice_target() {
+                    Some(id) => self
+                        .agents
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map(|s| format!("{} {}", s.icon, s.title))
+                        .unwrap_or_else(|| "(見つかりません)".into()),
+                    None => "(エージェントがいません)".into(),
+                }
+            }
+        }
+    }
+
     /// リモートサーバに溜まったリクエストを処理して応答する。毎フレーム呼ぶ。
     fn poll_remote(&mut self, ctx: &egui::Context) {
         let reqs: Vec<remote::Request> = match &self.remote {
@@ -3823,7 +4452,7 @@ impl ZaivernApp {
                     .iter()
                     .map(|s| {
                         json!({
-                            "title": s.title, "icon": s.icon,
+                            "id": s.id, "title": s.title, "icon": s.icon,
                             "running": s.running(), "attention": s.attention,
                         })
                     })
@@ -3840,6 +4469,8 @@ impl ZaivernApp {
                     "cursor": [self.editor.cursor.0, self.editor.cursor.1],
                     "agents": agents, "agent_active": self.agents.active,
                     "presets": presets, "approval": self.cfg.approval_mode,
+                    // 音声入力ページ (スマホ) が参照する設定
+                    "voice": {"kw": self.cfg.voice_keyword, "lang": self.cfg.voice_lang},
                 })
                 .to_string()
             }
@@ -3949,6 +4580,54 @@ impl ZaivernApp {
                 }
                 None => json!({"ok": false}).to_string(),
             },
+            remote::Query::VoiceSend { text, id, submit } => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return json!({"ok": false, "error": "テキストが空です"}).to_string();
+                }
+                // submit=false は入力欄へ挿入するだけ (Enter は送らない)
+                let payload = if *submit {
+                    format!("{text}\r")
+                } else {
+                    text.clone()
+                };
+                let verb = if *submit { "送信" } else { "入力欄へ" };
+                if *id < 0 {
+                    // 全エージェントへブロードキャスト
+                    let n = self.agents.running_count();
+                    if n == 0 {
+                        return json!({"ok": false, "error": "実行中のセッションがありません"})
+                            .to_string();
+                    }
+                    for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
+                        s.write_bytes(payload.as_bytes());
+                    }
+                    self.toast(format!("🎤📣 {n} セッション {verb}: {text}"), true);
+                    json!({"ok": true, "sent": n}).to_string()
+                } else {
+                    // セッション id 指定 (インデックスではなく id — 閉じてもずれない)
+                    match self
+                        .agents
+                        .sessions
+                        .iter_mut()
+                        .find(|s| s.id == *id as u64)
+                    {
+                        Some(s) if s.running() => {
+                            s.write_bytes(payload.as_bytes());
+                            let title = s.title.clone();
+                            self.toast(format!("🎤 {title} {verb}: {text}"), true);
+                            json!({"ok": true, "sent": 1}).to_string()
+                        }
+                        Some(_) => json!({"ok": false, "error": "セッションが停止しています"})
+                            .to_string(),
+                        None => json!({
+                            "ok": false,
+                            "error": "セッションが見つかりません (閉じられた可能性)",
+                        })
+                        .to_string(),
+                    }
+                }
+            }
             remote::Query::TermInput(payload, raw) => match self.agents.active_session() {
                 Some(s) if s.running() => {
                     if *raw {
@@ -4054,6 +4733,7 @@ impl ZaivernApp {
         let qr_tex = self.qr_tex.clone();
         let mut open = self.remote_open;
         let mut copy = false;
+        let mut open_voice = false;
 
         egui::Window::new("📱 スマホリモート")
             .open(&mut open)
@@ -4090,11 +4770,24 @@ impl ZaivernApp {
                             ui.label(
                                 RichText::new(
                                     "スマホから: ファイルの編集・保存・オープン、\n\
-                                     エージェント操作 (Claude の承認・指示も OK)、各種コマンド",
+                                     エージェント操作 (Claude の承認・指示も OK)、各種コマンド\n\
+                                     🎤 音声入力: スマホは「エージェント」タブのマイクボタン",
                                 )
                                 .size(11.5)
                                 .color(theme.text_dim),
                             );
+                            ui.add_space(6.0);
+                            ui.separator();
+                            if ui
+                                .button("🎤 PC で音声入力する")
+                                .on_hover_text(
+                                    "Zaivern 内で音声認識し、話した内容を\n\
+                                     エージェントの入力欄へ入れます (送信は自分で Enter)",
+                                )
+                                .clicked()
+                            {
+                                open_voice = true;
+                            }
                         });
                     }
                     (None, Some(e)) => {
@@ -4105,6 +4798,9 @@ impl ZaivernApp {
             });
 
         self.remote_open = open;
+        if open_voice {
+            self.apply_cmd(Cmd::VoiceInput(voice::Target::Broadcast), ctx);
+        }
         if copy {
             if let Some(u) = url_full {
                 ctx.copy_text(u);
@@ -4116,6 +4812,10 @@ impl ZaivernApp {
 
 impl eframe::App for ZaivernApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 音声入力が先。押している間だけ録音するキーは他所へ渡さない
+        // (ターミナルが PTY へ転送してしまうため)
+        self.poll_voice(ctx);
+
         self.handle_shortcuts(ctx);
 
         // スマホリモートからのリクエストを処理する
@@ -4236,6 +4936,7 @@ impl eframe::App for ZaivernApp {
         self.close_confirm_ui(ctx);
         self.delete_confirm_ui(ctx);
         self.remote_window(ctx);
+        self.voice_hud(ctx);
         self.toasts_ui(ctx);
 
         // デスクトップペット 🦀
@@ -4370,6 +5071,28 @@ fn rel_label(p: &Path, ws: &Path) -> String {
 }
 
 /// ペット画像を読み込み egui テクスチャ化する。長辺 256px に縮小する。
+/// URL やファイルを OS の既定アプリ (ブラウザ等) で開く。
+/// 認識テキストの末尾が合図キーワードなら、それを取り除いた本文を返す。
+/// 音声認識は句読点を付けることがあるので、末尾の記号は無視して判定する。
+fn strip_trailing_keyword(text: &str, keyword: &str) -> Option<String> {
+    let trimmed = text.trim_end_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '。' | '、' | '.' | ',' | '!' | '?' | '！' | '？')
+    });
+    let rest = trimmed.strip_suffix(keyword)?;
+    Some(rest.trim_end().to_string())
+}
+
+fn open_external(target: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(target).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", target])
+        .spawn();
+}
+
 fn load_pet_texture(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
     let bytes = std::fs::read(path).ok()?;
     let img = image::load_from_memory(&bytes).ok()?;

@@ -34,6 +34,19 @@ pub struct Config {
     pub pet_approve_keys: String,
     /// 拒否時に PTY へ送るキー (既定は ESC)
     pub pet_deny_keys: String,
+    /// 音声認識エンジン: "auto" | "mac" | "command" | "off"
+    /// auto = macOS なら内蔵 (mac)、その他 OS は voice_command
+    pub voice_engine: String,
+    /// 音声入力の既定の届け先: "active"(アクティブなエージェント) | "broadcast"(全員)
+    pub voice_target: String,
+    /// 認識言語 (BCP-47)
+    pub voice_lang: String,
+    /// 外部音声認識コマンド (mac 以外 / 独自エンジン用)。
+    /// 標準出力に 1 行ずつテキストを吐き、stdin の "q" で停止する実装を想定。
+    /// {lang} は voice_lang に置換される。
+    pub voice_command: String,
+    /// 話すと自動で Enter まで送るキーワード (空文字 = 常に手動 Enter)
+    pub voice_keyword: String,
     pub agents: Vec<AgentPreset>,
     /// キーバインドの上書き: action名 → "cmd+shift+p" 形式 (src/keybinds.rs 参照)
     pub keybindings: HashMap<String, String>,
@@ -59,6 +72,11 @@ impl Default for Config {
             pet_bubbles: true,
             pet_approve_keys: "\r".into(),
             pet_deny_keys: "\u{1b}".into(),
+            voice_engine: "auto".into(),
+            voice_target: "active".into(),
+            voice_lang: "ja-JP".into(),
+            voice_command: String::new(),
+            voice_keyword: String::new(),
             agents: default_agents(),
             keybindings: HashMap::new(),
         }
@@ -168,6 +186,11 @@ struct UiState {
     pet_bubbles: Option<bool>,
     pet_approve_keys: Option<String>,
     pet_deny_keys: Option<String>,
+    voice_engine: Option<String>,
+    voice_target: Option<String>,
+    voice_lang: Option<String>,
+    voice_command: Option<String>,
+    voice_keyword: Option<String>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -219,6 +242,23 @@ show_pet = true
 # pet_bubbles = true       # 承認バブル
 # pet_approve_keys = "\r"    # 承認時にPTYへ送るキー (Enter)
 # pet_deny_keys = "\u001B"   # 拒否時にPTYへ送るキー (ESC)
+
+# ── 音声入力 (🎤) ──────────────
+# 🎤 を押すと録音が始まり、⏹ を押すまで話した内容がエージェントの入力欄へ
+# 流れ込み続けます。Enter は送られないので、内容を確認して自分で Enter を
+# 押すまで送信されません。Enter で入力欄が空になっても録音は続いたままなので、
+# そのまま次の指示を話せます。ツールバーの 🎤 メニューからも変更できます。
+#
+# voice_engine = "auto"    # "auto" | "mac"(内蔵) | "command"(外部) | "off"
+# voice_target = "active"  # 届け先: "active"(アクティブなエージェント) | "broadcast"(全員)
+# voice_lang = "ja-JP"     # 認識する言語
+# voice_keyword = ""       # このキーワードを話すと Enter まで自動送信 ("" = 常に手動)
+#
+# macOS 以外、または独自の認識エンジンを使う場合は "command" にして
+# voice_command を設定します。標準出力へ 1 行ずつ認識テキストを吐き、
+# 標準入力に "q" が来たら終了するコマンドを想定しています ({lang} は言語に置換)。
+# voice_engine = "command"
+# voice_command = "my-stt --lang {lang} --stream"
 
 # ── AIエージェント / ターミナルのプリセット ──────────────
 # command はログインシェル (-lc) 経由で実行されます。
@@ -351,6 +391,21 @@ pub fn load(workspace: &Path, with_state: bool) -> Config {
                 if let Some(v) = st.pet_deny_keys {
                     cfg.pet_deny_keys = v;
                 }
+                if let Some(v) = st.voice_engine {
+                    cfg.voice_engine = v;
+                }
+                if let Some(v) = st.voice_target {
+                    cfg.voice_target = v;
+                }
+                if let Some(v) = st.voice_lang {
+                    cfg.voice_lang = v;
+                }
+                if let Some(v) = st.voice_command {
+                    cfg.voice_command = v;
+                }
+                if let Some(v) = st.voice_keyword {
+                    cfg.voice_keyword = v;
+                }
             }
         }
     }
@@ -411,6 +466,11 @@ pub fn save_state(cfg: &Config) {
         pet_bubbles: Some(cfg.pet_bubbles),
         pet_approve_keys: Some(cfg.pet_approve_keys.clone()),
         pet_deny_keys: Some(cfg.pet_deny_keys.clone()),
+        voice_engine: Some(cfg.voice_engine.clone()),
+        voice_target: Some(cfg.voice_target.clone()),
+        voice_lang: Some(cfg.voice_lang.clone()),
+        voice_command: Some(cfg.voice_command.clone()),
+        voice_keyword: Some(cfg.voice_keyword.clone()),
     };
     if let Ok(s) = toml::to_string_pretty(&st) {
         let _ = std::fs::create_dir_all(zaivern_dir());

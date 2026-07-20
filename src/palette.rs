@@ -46,6 +46,19 @@ pub enum Cmd {
     TogglePetBubbles,
     /// スマホリモートの QR コードウィンドウ表示切替
     ToggleRemote,
+    /// 音声入力の録音を開始/停止する。認識テキストは届け先の入力欄へ
+    /// 挿入されるだけで、Enter は送られない
+    VoiceInput(crate::voice::Target),
+    /// 録音を止める (⏹ ボタン)
+    VoiceStop,
+    /// 音声入力の既定の届け先を変える (アクティブ / ブロードキャスト)
+    SetVoiceTarget(crate::voice::Target),
+    /// 音声認識エンジン ("auto"|"mac"|"command"|"off")
+    SetVoiceEngine(String),
+    /// 認識言語 (BCP-47。"ja-JP" など)
+    SetVoiceLang(String),
+    /// 話すと Enter まで送る合図キーワード (空文字で無効)
+    SetVoiceKeyword(String),
     /// 新規プラグインのテンプレートを作成 (名前入力ダイアログを開く)
     NewPlugin,
     /// .zvplug / .zip ファイルを選んでプラグインをインストール
