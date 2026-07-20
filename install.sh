@@ -40,6 +40,11 @@ install_prebuilt() {
         x86_64|amd64)  arch=x86_64 ;;
         *) return 1 ;;
     esac
+    # Rosetta 配下のシェルは uname -m が x86_64 になるため実 CPU で補正
+    if [ "$os" = "macos" ] && [ "$arch" = "x86_64" ] \
+        && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+        arch=arm64
+    fi
     tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
         | sed -En 's/.*"tag_name": *"([^"]+)".*/\1/p' | head -n1) || return 1
     [ -n "$tag" ] || return 1
