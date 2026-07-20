@@ -7028,6 +7028,42 @@ fn workspace_title(roots: &[PathBuf]) -> String {
     format!("Zaivern Code — {}", roots_label(roots))
 }
 
+/// `.git` がファイルのとき、その中身 (`gitdir: <path>`) から実際の git ディレクトリを取り出す。
+/// 相対パスは workspace 基準で解決する。
+#[allow(dead_code)]
+fn parse_gitdir_file(contents: &str, workspace: &Path) -> Option<PathBuf> {
+    let raw = contents
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(raw);
+    Some(if p.is_absolute() { p } else { workspace.join(p) })
+}
+
+/// ブランチ表示のために読むべき HEAD のパス。
+/// 通常のリポジトリは `<ws>/.git/HEAD` だが、linked worktree では `.git` が
+/// ディレクトリではなくファイルなので、それが指す git ディレクトリ配下の HEAD を読む。
+///
+/// 現在のブランチ表示は git.rs (`git branch --show-current`) 経由なので、
+/// この関数は呼ばれていない。linked worktree の扱いを自前で解決する必要が出た
+/// ときのために、テスト付きで残してある。
+#[allow(dead_code)]
+fn git_head_path(workspace: &Path) -> PathBuf {
+    let dot_git = workspace.join(".git");
+    if dot_git.is_file() {
+        if let Some(dir) = std::fs::read_to_string(&dot_git)
+            .ok()
+            .and_then(|s| parse_gitdir_file(&s, workspace))
+        {
+            return dir.join("HEAD");
+        }
+    }
+    dot_git.join("HEAD")
+}
+
 /// ペット画像を読み込み egui テクスチャ化する。長辺 256px に縮小する。
 /// URL やファイルを OS の既定アプリ (ブラウザ等) で開く。
 /// 入力欄に書いてある `old` を `new` にするための編集を求める。
