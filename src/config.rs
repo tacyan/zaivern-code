@@ -477,3 +477,460 @@ pub fn save_state(cfg: &Config) {
         let _ = std::fs::write(state_path(), s);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // load() / ensure_default() / save_state() は実ユーザーの ~/.zaivern を
+    // 読み書きするためテストしない。ここでは純粋なパース・既定値・マージ対象の
+    // データ構造だけを検証する。
+
+    // ---- Config / AgentPreset の既定値 ----
+
+    #[test]
+    fn default_config_has_expected_values() {
+        let c = Config::default();
+        assert_eq!(c.theme, "zaivern-dark");
+        assert_eq!(c.editor_font_size, 15.0);
+        assert_eq!(c.terminal_font_size, 13.0);
+        assert!(c.show_hidden_files);
+        assert_eq!(c.approval_mode, "ask", "既定は必ず安全側 (ask)");
+        assert!(c.show_pet);
+        assert_eq!(c.pet_image, None);
+        assert_eq!(c.pet_x, None);
+        assert_eq!(c.pet_y, None);
+        assert_eq!(c.pet_variant, "blocky");
+        assert_eq!(c.pet_scale, 1.0);
+        assert!(c.pet_free_roam);
+        assert!(c.pet_sleep);
+        assert!(c.pet_sounds);
+        assert!(c.pet_bubbles);
+        assert_eq!(c.pet_approve_keys, "\r", "承認は Enter");
+        assert_eq!(c.pet_deny_keys, "\u{1b}", "拒否は ESC");
+        assert_eq!(c.voice_engine, "auto");
+        assert_eq!(c.voice_target, "active");
+        assert_eq!(c.voice_lang, "ja-JP");
+        assert_eq!(c.voice_command, "");
+        assert_eq!(c.voice_keyword, "", "空 = 常に手動 Enter");
+        assert!(c.keybindings.is_empty());
+        assert!(!c.agents.is_empty());
+    }
+
+    #[test]
+    fn default_agent_preset_is_plain_shell() {
+        let a = AgentPreset::default();
+        assert_eq!(a.name, "Shell");
+        assert_eq!(a.command, "", "空コマンド = ログインシェル");
+        assert_eq!(a.icon, "🖥");
+        assert_eq!(a.cwd, None);
+        assert!(a.env.is_empty());
+    }
+
+    #[test]
+    fn default_agents_cover_every_cli() {
+        let agents = default_agents();
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Claude Code",
+                "Claude Code (全自動)",
+                "Codex",
+                "Codex (全自動)",
+                "Antigravity",
+                "Antigravity (全自動)",
+                "Shell",
+            ]
+        );
+    }
+
+    #[test]
+    fn default_agents_auto_presets_carry_bypass_flags() {
+        let agents = default_agents();
+        for a in &agents {
+            if a.name.contains("全自動") {
+                assert!(
+                    a.command.contains("--dangerously"),
+                    "{} に bypass フラグが無い: {:?}",
+                    a.name,
+                    a.command
+                );
+            }
+        }
+        // 通常プリセットは素のコマンドのまま
+        let plain: Vec<&str> = agents
+            .iter()
+            .filter(|a| !a.name.contains("全自動"))
+            .map(|a| a.command.as_str())
+            .collect();
+        assert_eq!(plain, vec!["claude", "codex", "agy", ""]);
+    }
+
+    #[test]
+    fn default_agents_all_have_icon_and_name() {
+        for a in default_agents() {
+            assert!(!a.name.is_empty(), "名前が空のプリセットがある");
+            assert!(!a.icon.is_empty(), "{} のアイコンが空", a.name);
+        }
+    }
+
+    // ---- DEFAULT_CONFIG テンプレート ----
+
+    #[test]
+    fn default_config_template_parses_into_config() {
+        let c: Config = toml::from_str(DEFAULT_CONFIG).expect("同梱テンプレは常にパースできる");
+        assert_eq!(c.theme, "zaivern-dark");
+        assert_eq!(c.editor_font_size, 15.0);
+        assert_eq!(c.terminal_font_size, 13.0);
+        assert!(c.show_hidden_files);
+        assert_eq!(c.approval_mode, "ask");
+        assert!(c.show_pet);
+        // コメントアウトされている項目は Default から埋まる
+        assert_eq!(c.voice_engine, "auto");
+        assert_eq!(c.pet_variant, "blocky");
+        assert!(c.keybindings.is_empty(), "keybindings 例はコメントアウト");
+    }
+
+    #[test]
+    fn default_config_template_agents_match_default_agents() {
+        let c: Config = toml::from_str(DEFAULT_CONFIG).expect("parse ok");
+        let from_template: Vec<(&str, &str)> = c
+            .agents
+            .iter()
+            .map(|a| (a.name.as_str(), a.command.as_str()))
+            .collect();
+        let builtin = default_agents();
+        let from_code: Vec<(&str, &str)> = builtin
+            .iter()
+            .map(|a| (a.name.as_str(), a.command.as_str()))
+            .collect();
+        assert_eq!(
+            from_template, from_code,
+            "テンプレートと default_agents() がずれている"
+        );
+    }
+
+    // ---- Config のデシリアライズ (正常系) ----
+
+    #[test]
+    fn config_from_empty_toml_equals_defaults() {
+        let c: Config = toml::from_str("").expect("空 TOML は既定値");
+        let d = Config::default();
+        assert_eq!(c.theme, d.theme);
+        assert_eq!(c.approval_mode, d.approval_mode);
+        assert_eq!(c.editor_font_size, d.editor_font_size);
+        assert_eq!(c.agents.len(), d.agents.len(), "agents も既定が入る");
+    }
+
+    #[test]
+    fn config_partial_toml_keeps_other_defaults() {
+        let c: Config = toml::from_str("theme = \"zaivern-light\"\n").expect("parse ok");
+        assert_eq!(c.theme, "zaivern-light");
+        assert_eq!(c.approval_mode, "ask", "書かれていない項目は既定のまま");
+        assert_eq!(c.terminal_font_size, 13.0);
+    }
+
+    #[test]
+    fn config_ignores_unknown_fields() {
+        // deny_unknown_fields を付けていないので、将来削除された項目が
+        // 残っていても設定全体が壊れない
+        let c: Config = toml::from_str("theme = \"x\"\nlegacy_option = 42\n")
+            .expect("未知のキーは無視される");
+        assert_eq!(c.theme, "x");
+    }
+
+    #[test]
+    fn config_accepts_optional_pet_position() {
+        let c: Config =
+            toml::from_str("pet_x = 12.5\npet_y = -3.0\npet_image = \"/tmp/p.png\"\n")
+                .expect("parse ok");
+        assert_eq!(c.pet_x, Some(12.5));
+        assert_eq!(c.pet_y, Some(-3.0));
+        assert_eq!(c.pet_image, Some("/tmp/p.png".to_string()));
+    }
+
+    #[test]
+    fn config_parses_keybindings_table() {
+        let c: Config = toml::from_str("[keybindings]\nsave = \"cmd+s\"\n").expect("parse ok");
+        assert_eq!(c.keybindings.get("save").map(String::as_str), Some("cmd+s"));
+        assert_eq!(c.keybindings.len(), 1);
+    }
+
+    #[test]
+    fn agent_preset_parses_env_and_cwd() {
+        let c: Config = toml::from_str(
+            "[[agents]]\nname = \"X\"\ncommand = \"x --go\"\ncwd = \"/tmp\"\nenv = { A = \"1\" }\n",
+        )
+        .expect("parse ok");
+        assert_eq!(c.agents.len(), 1, "書かれた agents が既定を置き換える");
+        let a = &c.agents[0];
+        assert_eq!(a.name, "X");
+        assert_eq!(a.command, "x --go");
+        assert_eq!(a.cwd, Some("/tmp".to_string()));
+        assert_eq!(a.env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(a.icon, "🖥", "icon 省略時は既定アイコン");
+    }
+
+    #[test]
+    fn agent_preset_allows_all_fields_omitted() {
+        let c: Config = toml::from_str("[[agents]]\n").expect("空の agents 要素も既定で埋まる");
+        assert_eq!(c.agents.len(), 1);
+        assert_eq!(c.agents[0].name, "Shell");
+        assert_eq!(c.agents[0].command, "");
+    }
+
+    // ---- Config のデシリアライズ (境界値・異常系) ----
+
+    #[test]
+    fn config_empty_strings_survive_parsing() {
+        // load() 側で正規化されるので、パース段階では空文字がそのまま通る
+        let c: Config = toml::from_str("theme = \"\"\napproval_mode = \"\"\nvoice_lang = \"\"\n")
+            .expect("parse ok");
+        assert_eq!(c.theme, "");
+        assert_eq!(c.approval_mode, "");
+        assert_eq!(c.voice_lang, "");
+    }
+
+    #[test]
+    fn config_extreme_font_sizes_parse_unclamped() {
+        // clamp は load() の中でのみ行われる (パース自体は素通し)
+        let c: Config = toml::from_str("editor_font_size = 999.0\nterminal_font_size = -5.0\n")
+            .expect("parse ok");
+        assert_eq!(c.editor_font_size, 999.0);
+        assert_eq!(c.terminal_font_size, -5.0);
+        assert_eq!(c.editor_font_size.clamp(8.0, 32.0), 32.0);
+        assert_eq!(c.terminal_font_size.clamp(7.0, 28.0), 7.0);
+    }
+
+    #[test]
+    fn config_pet_scale_clamp_boundaries() {
+        let c: Config = toml::from_str("pet_scale = 0.0\n").expect("parse ok");
+        assert_eq!(c.pet_scale.clamp(0.5, 2.0), 0.5);
+        let c: Config = toml::from_str("pet_scale = 5.0\n").expect("parse ok");
+        assert_eq!(c.pet_scale.clamp(0.5, 2.0), 2.0);
+        let c: Config = toml::from_str("pet_scale = 1.4\n").expect("parse ok");
+        assert_eq!(c.pet_scale.clamp(0.5, 2.0), 1.4, "範囲内はそのまま");
+    }
+
+    #[test]
+    fn config_empty_agents_list_parses_as_empty() {
+        // load() は空なら default_agents() を入れ直す
+        let c: Config = toml::from_str("agents = []\n").expect("parse ok");
+        assert!(c.agents.is_empty());
+    }
+
+    #[test]
+    fn config_rejects_malformed_toml() {
+        assert!(toml::from_str::<Config>("theme = ").is_err(), "値が無い");
+        assert!(toml::from_str::<Config>("[[agents\n").is_err(), "括弧が閉じていない");
+        assert!(toml::from_str::<Config>("= \"x\"\n").is_err(), "キーが無い");
+    }
+
+    #[test]
+    fn config_rejects_wrong_field_types() {
+        assert!(
+            toml::from_str::<Config>("editor_font_size = \"big\"\n").is_err(),
+            "f32 に文字列"
+        );
+        assert!(
+            toml::from_str::<Config>("show_hidden_files = 3\n").is_err(),
+            "bool に整数"
+        );
+        assert!(
+            toml::from_str::<Config>("theme = true\n").is_err(),
+            "String に真偽値"
+        );
+        assert!(
+            toml::from_str::<Config>("agents = \"claude\"\n").is_err(),
+            "配列に文字列"
+        );
+        assert!(
+            toml::from_str::<Config>("keybindings = 1\n").is_err(),
+            "テーブルに整数"
+        );
+    }
+
+    // ---- Overlay (<workspace>/.zaivern.toml) ----
+
+    #[test]
+    fn overlay_empty_is_all_none() {
+        let o: Overlay = toml::from_str("").expect("空でも成立する");
+        assert_eq!(o.theme, None);
+        assert_eq!(o.editor_font_size, None);
+        assert_eq!(o.terminal_font_size, None);
+        assert_eq!(o.show_hidden_files, None);
+        assert_eq!(o.approval_mode, None);
+        assert_eq!(o.show_pet, None);
+        assert!(o.agents.is_empty(), "overlay の agents は既定を持たない");
+        assert!(o.keybindings.is_empty());
+    }
+
+    #[test]
+    fn overlay_parses_only_present_fields() {
+        let o: Overlay = toml::from_str("theme = \"zaivern-midnight\"\nshow_pet = false\n")
+            .expect("parse ok");
+        assert_eq!(o.theme, Some("zaivern-midnight".to_string()));
+        assert_eq!(o.show_pet, Some(false));
+        assert_eq!(o.approval_mode, None, "未指定はグローバル設定を残す");
+        assert_eq!(o.editor_font_size, None);
+    }
+
+    #[test]
+    fn overlay_agents_are_appended_not_replaced() {
+        // load() は cfg.agents.extend(o.agents) するので、overlay 側は追加分だけ
+        let o: Overlay =
+            toml::from_str("[[agents]]\nname = \"Proj\"\ncommand = \"make\"\n").expect("parse ok");
+        assert_eq!(o.agents.len(), 1);
+        assert_eq!(o.agents[0].name, "Proj");
+
+        let mut merged = default_agents();
+        let before = merged.len();
+        merged.extend(o.agents);
+        assert_eq!(merged.len(), before + 1);
+        assert_eq!(merged.last().map(|a| a.name.as_str()), Some("Proj"));
+    }
+
+    #[test]
+    fn overlay_keybindings_merge_per_key() {
+        let o: Overlay = toml::from_str("[keybindings]\nsave = \"ctrl+s\"\nrun = \"f5\"\n")
+            .expect("parse ok");
+        let mut base: HashMap<String, String> = HashMap::new();
+        base.insert("save".into(), "cmd+s".into());
+        base.insert("quit".into(), "cmd+q".into());
+        for (k, v) in o.keybindings {
+            base.insert(k, v);
+        }
+        assert_eq!(base.get("save").map(String::as_str), Some("ctrl+s"), "上書き");
+        assert_eq!(base.get("run").map(String::as_str), Some("f5"), "追加");
+        assert_eq!(base.get("quit").map(String::as_str), Some("cmd+q"), "温存");
+        assert_eq!(base.len(), 3);
+    }
+
+    #[test]
+    fn overlay_rejects_wrong_types_and_malformed_toml() {
+        assert!(toml::from_str::<Overlay>("show_pet = \"yes\"\n").is_err());
+        assert!(toml::from_str::<Overlay>("editor_font_size = \"big\"\n").is_err());
+        assert!(toml::from_str::<Overlay>("theme = \n").is_err());
+    }
+
+    #[test]
+    fn overlay_ignores_fields_it_does_not_own() {
+        // pet_* や voice_* はプロジェクト overlay の対象外だが、書かれていても壊れない
+        let o: Overlay = toml::from_str("theme = \"x\"\nvoice_lang = \"en-US\"\npet_scale = 2.0\n")
+            .expect("未知キーは無視");
+        assert_eq!(o.theme, Some("x".to_string()));
+    }
+
+    // ---- UiState (~/.zaivern/state.toml) ----
+
+    #[test]
+    fn ui_state_roundtrip_preserves_values() {
+        let st = UiState {
+            theme: Some("zaivern-light".into()),
+            approval_mode: Some("auto".into()),
+            show_pet: Some(false),
+            pet_image: Some("/tmp/p.png".into()),
+            pet_x: Some(10.0),
+            pet_y: Some(20.5),
+            pet_variant: Some("cat".into()),
+            pet_scale: Some(1.4),
+            pet_free_roam: Some(false),
+            pet_sleep: Some(false),
+            pet_sounds: Some(true),
+            pet_bubbles: Some(true),
+            pet_approve_keys: Some("\r".into()),
+            pet_deny_keys: Some("\u{1b}".into()),
+            voice_engine: Some("command".into()),
+            voice_target: Some("broadcast".into()),
+            voice_lang: Some("en-US".into()),
+            voice_command: Some("my-stt --lang {lang}".into()),
+            voice_keyword: Some("送信".into()),
+        };
+        let s = toml::to_string_pretty(&st).expect("UiState は TOML 化できる");
+        let back: UiState = toml::from_str(&s).expect("読み戻せる");
+        assert_eq!(back.theme, Some("zaivern-light".to_string()));
+        assert_eq!(back.approval_mode, Some("auto".to_string()));
+        assert_eq!(back.show_pet, Some(false));
+        assert_eq!(back.pet_image, Some("/tmp/p.png".to_string()));
+        assert_eq!(back.pet_x, Some(10.0));
+        assert_eq!(back.pet_y, Some(20.5));
+        assert_eq!(back.pet_variant, Some("cat".to_string()));
+        assert_eq!(back.pet_scale, Some(1.4));
+        assert_eq!(back.pet_free_roam, Some(false));
+        assert_eq!(back.voice_keyword, Some("送信".to_string()));
+        // エスケープが必要な制御文字も往復する
+        assert_eq!(back.pet_approve_keys, Some("\r".to_string()));
+        assert_eq!(back.pet_deny_keys, Some("\u{1b}".to_string()));
+    }
+
+    #[test]
+    fn ui_state_skips_none_fields() {
+        let st = UiState {
+            theme: Some("zaivern-dark".into()),
+            ..Default::default()
+        };
+        let s = toml::to_string_pretty(&st).expect("None 混じりでも TOML 化できる");
+        assert!(s.contains("theme"));
+        assert!(!s.contains("pet_image"), "None は書き出されない: {s}");
+        let back: UiState = toml::from_str(&s).expect("読み戻せる");
+        assert_eq!(back.theme, Some("zaivern-dark".to_string()));
+        assert_eq!(back.pet_image, None);
+    }
+
+    #[test]
+    fn ui_state_empty_toml_is_all_none() {
+        let st: UiState = toml::from_str("").expect("空でも成立する");
+        assert_eq!(st.theme, None);
+        assert_eq!(st.approval_mode, None);
+        assert_eq!(st.pet_scale, None);
+        assert_eq!(st.voice_engine, None);
+    }
+
+    #[test]
+    fn ui_state_rejects_wrong_types() {
+        assert!(toml::from_str::<UiState>("pet_scale = \"big\"\n").is_err());
+        assert!(toml::from_str::<UiState>("show_pet = 1\n").is_err());
+    }
+
+    // ---- approval_mode 正規化 (load() 末尾のロジックと同じ規則) ----
+
+    #[test]
+    fn approval_mode_normalization_rules() {
+        let normalize = |m: &str| -> String {
+            if m != "auto" && m != "agent" {
+                "ask".to_string()
+            } else {
+                m.to_string()
+            }
+        };
+        assert_eq!(normalize("auto"), "auto");
+        assert_eq!(normalize("agent"), "agent");
+        assert_eq!(normalize("ask"), "ask");
+        assert_eq!(normalize(""), "ask", "空文字は安全側へ");
+        assert_eq!(normalize("AUTO"), "ask", "大文字は認識されない (現仕様)");
+        assert_eq!(normalize(" auto "), "ask", "前後の空白は許容されない");
+        assert_eq!(normalize("yolo"), "ask", "未知の値は安全側へ");
+    }
+
+    // ---- パス解決 ----
+
+    #[test]
+    fn config_and_state_paths_share_zaivern_dir() {
+        let c = config_path();
+        let s = state_path();
+        assert_eq!(c.file_name().and_then(|f| f.to_str()), Some("config.toml"));
+        assert_eq!(s.file_name().and_then(|f| f.to_str()), Some("state.toml"));
+        assert_eq!(c.parent(), s.parent(), "同じ ~/.zaivern に置かれる");
+        assert!(c.parent().is_some_and(|p| p.ends_with(".zaivern")));
+        assert!(c.is_absolute() || c.starts_with("."), "home 不明時は ./.zaivern");
+    }
+
+    #[test]
+    fn overlay_path_is_workspace_local() {
+        let ws = Path::new("/tmp/some-workspace");
+        let p: PathBuf = ws.join(".zaivern.toml");
+        assert_eq!(p, PathBuf::from("/tmp/some-workspace/.zaivern.toml"));
+        assert!(p.starts_with(ws));
+    }
+}
