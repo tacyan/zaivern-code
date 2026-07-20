@@ -131,7 +131,7 @@ Rust 導入済みなら直接:
 cargo install --git https://github.com/tacyan/zaivern-code --locked
 ```
 
-いずれも `~/.cargo/bin/zaivern-code` に配置されます。起動は `zaivern-code [ワークスペースのパス]`。
+いずれも `~/.cargo/bin/zai` に配置されます。起動は `zai [ワークスペースのパス]`。
 
 ---
 
@@ -142,7 +142,7 @@ cargo install --git https://github.com/tacyan/zaivern-code --locked
 cargo build --release
 
 # 起動(引数でワークスペースを指定。省略時はカレントディレクトリ)
-./target/release/zaivern-code ~/dev/my-project
+./target/release/zai ~/dev/my-project
 ```
 
 macOS / Windows / Linux で同一コードのままビルドできます(Linux は要 `libgtk-3-dev` 等の rfd 依存)。

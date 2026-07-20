@@ -5,6 +5,10 @@ edition = "2021"
 description = "Zaivern Code — Rust-native AI cockpit editor (Zed × Cmux × AGI Cockpit)"
 license = "Apache-2.0"
 
+[[bin]]
+name = "zai"
+path = "src/main.rs"
+
 [dependencies]
 eframe = "0.29"
 egui = "0.29"

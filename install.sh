@@ -46,10 +46,10 @@ fi
 say "GitHub からビルド・インストールします(初回は数分かかります)..."
 cargo install --git "$REPO_URL" --locked zaivern-code
 
-bin_path=$(command -v zaivern-code 2>/dev/null || echo "$HOME/.cargo/bin/zaivern-code")
+bin_path=$(command -v zai 2>/dev/null || echo "$HOME/.cargo/bin/zai")
 say ""
 say "✅ インストール完了: $bin_path"
-say "   起動: zaivern-code [ワークスペースのパス]"
+say "   起動: zai [ワークスペースのパス]"
 case ":$PATH:" in
     *":$HOME/.cargo/bin:"*) ;;
     *) say "⚠ ~/.cargo/bin が PATH にありません。シェルの rc に以下を追記してください:"
