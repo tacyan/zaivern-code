@@ -4,6 +4,7 @@ mod agent_picker;
 mod agents;
 mod app;
 mod cli;
+mod commander;
 mod config;
 mod coordinator;
 mod diagnostician;

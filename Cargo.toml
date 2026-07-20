@@ -1,6 +1,6 @@
 [package]
 name = "zaivern-code"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Zaivern Code — Rust-native AI cockpit editor (Zed × Cmux × AGI Cockpit)"
 license = "Apache-2.0"

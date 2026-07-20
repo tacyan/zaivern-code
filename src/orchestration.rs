@@ -741,11 +741,16 @@ pub fn cockpit_section(
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("📮 メッセージ").clicked() {
+            // 「タスク」と「メッセージ」は 1 つに統合し、全エージェントへの
+            // ブロードキャスト送信に一本化する (個別宛はフォーム内で選べる)。
+            if ui
+                .button("📣 全エージェントへブロードキャスト")
+                .on_hover_text("メッセージを全エージェントへ送ります (フォームで個別宛にも変更可)")
+                .clicked()
+            {
+                st.msg_target = MsgTarget::Broadcast;
+                st.msg_body.clear();
                 st.msg_open = true;
-            }
-            if ui.button("＋ タスク").clicked() {
-                st.form_open = true;
             }
         });
     });

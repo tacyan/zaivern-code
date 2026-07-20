@@ -8,6 +8,7 @@ use eframe::egui::{self, Align2, Color32, FontId, RichText};
 use crate::agent_picker::{self, AgentPicker};
 use crate::agents::{AgentManager, SessionEvent};
 use crate::cli;
+use crate::commander;
 use crate::config::{self, Config};
 use crate::coordinator;
 use crate::diagnostician;
@@ -403,6 +404,19 @@ pub struct ZaivernApp {
     /// セッションごとに最後に LLM へ相談した異常種別。
     /// 同じ異常で毎ティック CLI を叩かないための歯止め。
     sup_last_diag: HashMap<u64, supervisor::Anomaly>,
+
+    // ── 指揮 (スーパーエージェントが他エージェントを内部で指揮) ────────
+    /// 指揮官の出力から配達済みの指示ハッシュ (二重配達を防ぐ。有界)。
+    /// 指揮官セッションは `super_agent_session` を使う。
+    commander_seen: HashSet<u64>,
+
+    /// 指揮官へ状況フィードを流した最後の時刻 (`super_agent.timeout_secs` 間隔)。
+    commander_last_feed: Option<Instant>,
+
+    /// エージェントのタブをクリックして選び直したとき、次にアクティブ端末を
+    /// 描くフレームでキーボードフォーカスを移すための予約フラグ。
+    /// これが無いと、タブを押しても端末をもう一度クリックするまで入力が移らない。
+    term_focus_pending: bool,
 }
 
 /// 監視役に選べないプリセットの理由。選べるなら `None`。
@@ -631,6 +645,9 @@ impl ZaivernApp {
             super_agent_err: None,
             super_agent_session: None,
             sup_last_diag: HashMap::new(),
+            commander_seen: HashSet::new(),
+            commander_last_feed: None,
+            term_focus_pending: false,
             cfg,
         };
         // 設定で選ばれている監視役を組み立てる (失敗したら理由を残して先へ進む)。
@@ -2370,6 +2387,7 @@ impl ZaivernApp {
                     self.agents.active = i;
                     self.agents.panel_open = true;
                     self.cockpit = false;
+                    self.term_focus_pending = true;
                 }
             }
             Cmd::RestartAgent => {
@@ -4104,6 +4122,9 @@ impl ZaivernApp {
                                 }
                                 if let Some(i) = set_active {
                                     self.agents.active = i;
+                                    // タブで選び直したら、その端末をアクティブな
+                                    // 入力先 (フォーカス) にする。
+                                    self.term_focus_pending = true;
                                 }
                             });
                         });
@@ -4151,8 +4172,14 @@ impl ZaivernApp {
                 ui.add_space(4.0);
 
                 let font = self.cfg.terminal_font_size;
+                let want_focus = self.term_focus_pending;
+                self.term_focus_pending = false;
                 if let Some(s) = self.agents.active_session() {
-                    terminal::draw(ui, s, &theme, font, true, true, true);
+                    let resp = terminal::draw(ui, s, &theme, font, true, true, true);
+                    // タブ選択でアクティブになった端末へ、その場でフォーカスを渡す。
+                    if want_focus {
+                        resp.request_focus();
+                    }
                 } else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
@@ -4297,7 +4324,7 @@ impl ZaivernApp {
 
                 // ── 監視役 LLM (スーパーエージェント) の選択 ──────────────
                 egui::CollapsingHeader::new(
-                    RichText::new("💡 スーパーエージェント (監視役 LLM)")
+                    RichText::new("💡 スーパーエージェント (指揮役)")
                         .strong()
                         .color(theme.text),
                 )
@@ -4306,10 +4333,13 @@ impl ZaivernApp {
                     ui.label(
                         RichText::new(
                             "決定論的な見張り (停滞・ループ・エラー多発の検知) は、この設定に\
-                             関わらず常に動きます。ここで選んだエージェントは異常時に所見と\
-                             推奨を返す助言役で、再起動・停止などの破壊的な操作は今までどおり\
-                             確認ダイアログを通ります。選んだエージェントは普通の作業にも\
-                             そのまま使えますし、そのセッション自身も見張りの対象です。",
+                             関わらず常に動き、異常はここと通知で知らせます。ここで選んだ\
+                             エージェントを『指揮官』にすると、他のエージェントの状況が自動で\
+                             指揮官へ内部フィードされ、指揮官が `@対象: 指示` (全員へは `@all:`) と\
+                             書くと、その相手が安全になった瞬間に届きます。停止・再起動などの\
+                             破壊的な操作を自動でエージェントへ投げることはしません。選んだ\
+                             エージェントは普通の作業にもそのまま使えますし、そのセッション自身も\
+                             見張りの対象です。",
                         )
                         .size(12.0)
                         .color(theme.text_dim),
@@ -4317,7 +4347,7 @@ impl ZaivernApp {
                     ui.add_space(6.0);
 
                     let cur = self.cfg.super_agent.command.trim().to_string();
-                    const NONE_LABEL: &str = "なし（監視のみ・LLM相談しない）";
+                    const NONE_LABEL: &str = "なし（監視のみ・指揮しない）";
                     let cur_label = if cur.is_empty() {
                         NONE_LABEL.to_string()
                     } else {
@@ -4373,20 +4403,22 @@ impl ZaivernApp {
                     ui.horizontal(|ui| {
                         let mut en = self.cfg.super_agent.enabled;
                         if ui
-                            .checkbox(&mut en, "LLM に相談する")
+                            .checkbox(&mut en, "指揮を有効にする")
                             .on_hover_text(
-                                "OFF にすると相談だけ止まります。決定論的な見張りは動き続けます",
+                                "OFF にすると指揮だけ止まります。決定論的な見張りは動き続けます",
                             )
                             .changed()
                         {
                             super_enabled = Some(en);
                         }
                         ui.add_space(12.0);
-                        ui.label(RichText::new("診断の期限").color(theme.text_dim));
+                        ui.label(RichText::new("状況フィード間隔").color(theme.text_dim));
                         let mut t = self.cfg.super_agent.timeout_secs as i64;
                         if ui
                             .add(egui::DragValue::new(&mut t).range(5..=600).suffix(" 秒"))
-                            .on_hover_text("この時間で返事が無ければ診断は捨てます (最低 5 秒)")
+                            .on_hover_text(
+                                "この間隔で他エージェントの状況を指揮官へ内部フィードします (最低 5 秒)",
+                            )
                             .changed()
                         {
                             super_timeout = Some(t.clamp(5, 600) as u64);
@@ -4398,26 +4430,29 @@ impl ZaivernApp {
                         (Some(d), _) => {
                             let (cmd, label) = d.describe();
                             ui.label(
-                                RichText::new(format!("✅ 監視役: {label}  (`{cmd}`)"))
+                                RichText::new(format!("✅ 指揮官: {label}  (`{cmd}`)"))
                                     .color(theme.ok),
                             );
-                            if let Some(id) = d.self_session_id() {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "自己診断ガード: セッション #{id} は監視役自身なので、\
-                                         そのセッションの診断は必ず断ります"
-                                    ))
-                                    .size(12.0)
-                                    .color(theme.text_dim),
-                                );
-                            }
-                            // 診断を見送った理由を隠さない。黙って何もしない監視役が
-                            // いちばん質が悪い。
-                            if let Some(e) = d.last_error() {
-                                ui.label(
-                                    RichText::new(format!("⚠ 直近の診断を見送りました: {e}"))
+                            match d.self_session_id() {
+                                Some(id) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "指揮官セッション: #{id} — このセッションが `@対象: 指示`\
+                                             (全員へは `@all:`) で他のエージェントを内部から指揮します"
+                                        ))
+                                        .size(12.0)
+                                        .color(theme.text_dim),
+                                    );
+                                }
+                                None => {
+                                    ui.label(
+                                        RichText::new(
+                                            "指揮官セッションを待っています — 選んだ CLI でセッションを起動すると指揮を始めます",
+                                        )
+                                        .size(12.0)
                                         .color(theme.warn),
-                                );
+                                    );
+                                }
                             }
                         }
                         (None, Some(e)) => {
@@ -4425,7 +4460,7 @@ impl ZaivernApp {
                         }
                         (None, None) => {
                             ui.label(
-                                RichText::new("監視役: なし（決定論的な見張りだけが動いています）")
+                                RichText::new("指揮官: なし（決定論的な見張りだけが動いています）")
                                     .color(theme.text_dim),
                             );
                         }
@@ -6752,6 +6787,116 @@ impl ZaivernApp {
     /// 起動時と設定変更時に必ず通る 1 か所。ここで
     /// `supervisor.llm_escalation` も併せて決めるので、「選んだのに効かない」
     /// も「選んでいないのに走る」も起こらない。
+    /// スーパーエージェント (指揮官) が他の全エージェントを内部で指揮する。
+    ///
+    /// 指揮官セッション = `super_agent_session` (選ばれた監視役 CLI で動いている
+    /// セッション)。毎フレーム:
+    /// 1. 指揮官の画面から `@対象: 指示` (`@all:` は全員) を拾い、coordinator バスへ積む。
+    /// 2. `super_agent.timeout_secs` 間隔 (既定 60 秒) で、他エージェントの状況を
+    ///    指揮官の端末へ内部フィードする。
+    ///
+    /// **全て内部**で完結し、外部の subagent へは投げない。停止・再起動はこの経路では
+    /// 表現しない (積むのは非破壊の本文だけ)。実際の配達は coordinator が
+    /// 「注入して安全な瞬間」にのみ行う。
+    fn drive_commander(&mut self) {
+        let Some(cmd_id) = self.super_agent_session else {
+            return;
+        };
+
+        // 1) 指揮官の画面 → 指示。まず画面文字列を取り出してからロックを離す。
+        let screen = self
+            .agents
+            .sessions
+            .iter()
+            .find(|s| s.id == cmd_id)
+            .and_then(|s| s.parser.lock().ok().map(|p| p.screen().contents()))
+            .unwrap_or_default();
+        if self.commander_seen.len() > 512 {
+            self.commander_seen.clear();
+        }
+        for d in commander::parse_directives(&screen, coordinator::INJECT_PREFIX) {
+            if !self.commander_seen.insert(d.hash) {
+                continue; // 既に配達済み (画面に残っているだけ)
+            }
+            let body = supervisor::redact(&d.body, coordinator::INJECT_BODY_MAX);
+            match d.target {
+                commander::Target::All => {
+                    // Broadcast は coordinator 側で送信元(指揮官)を自動的に除く。
+                    self.coordinator.enqueue(coordinator::AgentMessage::new(
+                        coordinator::Endpoint::Session(cmd_id),
+                        coordinator::Endpoint::Broadcast,
+                        coordinator::MsgKind::Request,
+                        body,
+                    ));
+                }
+                commander::Target::Named(name) => {
+                    let tid = self
+                        .agents
+                        .sessions
+                        .iter()
+                        .find(|s| s.id != cmd_id && commander::title_matches(&s.title, &name))
+                        .map(|s| s.id);
+                    if let Some(tid) = tid {
+                        self.coordinator.enqueue(coordinator::AgentMessage::new(
+                            coordinator::Endpoint::Session(cmd_id),
+                            coordinator::Endpoint::Session(tid),
+                            coordinator::MsgKind::Request,
+                            body,
+                        ));
+                    }
+                    // 宛先が見つからないときは黙って捨てる (誤爆した @mention 対策)。
+                }
+            }
+        }
+
+        // 2) 状況フィード (既定 60 秒ごと)。
+        let now = Instant::now();
+        let interval = Duration::from_secs(self.cfg.super_agent.timeout_secs.max(5));
+        let due = self
+            .commander_last_feed
+            .map(|t| now.duration_since(t) >= interval)
+            .unwrap_or(true);
+        if due {
+            // 先に (id, title, 直近行) を集めてから supervisor を借りる (借用衝突回避)。
+            let basics: Vec<(u64, String, String)> = self
+                .agents
+                .sessions
+                .iter()
+                .filter(|s| s.id != cmd_id)
+                .map(|s| {
+                    let last = s
+                        .parser
+                        .lock()
+                        .ok()
+                        .map(|p| commander::last_nonempty_line(&p.screen().contents()))
+                        .unwrap_or_default();
+                    (s.id, s.title.clone(), last)
+                })
+                .collect();
+            let others: Vec<commander::AgentStatus> = basics
+                .into_iter()
+                .map(|(id, title, last)| commander::AgentStatus {
+                    title,
+                    state: self
+                        .supervisor
+                        .state_of(id)
+                        .map(|st| st.label())
+                        .unwrap_or("不明"),
+                    last_line: supervisor::redact(&last, 120).trim().to_string(),
+                })
+                .collect();
+            if let Some(body) = commander::build_status_digest(&others) {
+                self.coordinator.enqueue(coordinator::AgentMessage::new(
+                    coordinator::Endpoint::Supervisor,
+                    coordinator::Endpoint::Session(cmd_id),
+                    coordinator::MsgKind::Status,
+                    body,
+                ));
+            }
+            self.commander_last_feed = Some(now);
+        }
+    }
+
     fn apply_super_agent(&mut self) {
         self.super_agent = None;
         self.super_agent_err = None;
@@ -6777,16 +6922,21 @@ impl ZaivernApp {
             }
         }
 
-        // 実体が建ったときだけ相談を許す。フックを外す口は supervisor 側に無いが、
-        // llm_escalation が false なら request_diagnosis も intent_from_diagnosis も
-        // 何もしないので、実質的に切れている。
-        self.cfg.supervisor.llm_escalation = self.super_agent.is_some();
+        // 指揮方式へ移行: LLM 診断 (CLI の spawn) は使わない。`llm_escalation` を
+        // 常に false に固定して診断経路を止める (request_diagnosis は入口で no-op、
+        // diagnose() は呼ばれない = **CLI を spawn しない / 停止・再起動を提案しない**)。
+        // 監視役の実体 (CliDiagnostician) は「指揮官セッションの特定」と UI 表示に
+        // だけ使い、実際にエージェントへ働きかけるのは drive_commander() の指揮のみ。
+        self.cfg.supervisor.llm_escalation = false;
         self.supervisor.set_config(self.cfg.supervisor.clone());
         self.sup_last_diag.clear();
+        // 指揮官が変わったら配達済み記録とフィード時刻をやり直す。
+        self.commander_seen.clear();
+        self.commander_last_feed = None;
         self.sync_super_agent_session();
 
         if let Some(e) = self.super_agent_err.clone() {
-            self.toast_warn(format!("⚠ 監視役 LLM を有効にできませんでした — {e}"));
+            self.toast_warn(format!("⚠ スーパーエージェントを有効にできませんでした — {e}"));
         }
     }
 
@@ -6926,12 +7076,21 @@ impl ZaivernApp {
             .collect();
 
         for it in self.supervisor.tick(&snaps, approval) {
-            // 異常が変わった瞬間だけ LLM に相談する。同じ異常が続いている間
-            // 毎ティック CLI を起動しては、監視のほうがよほど負荷になる。
+            // 見張りは「検知」と「ユーザーへの通知」だけに徹する。
+            // 停止 (Restart/Halt)・一時停止・促しメッセージ (Nudge)・自動応答
+            // (AutoAnswer) を **エージェントへ直接投げない**。エージェントへ実際に
+            // 働きかけるのは、スーパーエージェントの指揮 (drive_commander) のみ。
+            use supervisor::Intervention as I;
+            if matches!(
+                it.action,
+                I::AutoAnswer | I::Nudge | I::Restart | I::Halt
+            ) {
+                continue;
+            }
+            // llm_escalation は常に false なので、この相談は入口で no-op (spawn しない)。
             let (sid, anomaly) = (it.session_id, it.anomaly);
             if self.sup_last_diag.get(&sid) != Some(&anomaly) {
                 self.sup_last_diag.insert(sid, anomaly);
-                // llm_escalation が false / 監視役未設定なら、この呼び出しは no-op。
                 self.supervisor.request_diagnosis(sid, anomaly, ctx);
             }
             self.accept_intent(it, ctx, win_focused);
@@ -6994,6 +7153,10 @@ impl ZaivernApp {
 
     /// 毎フレーム: 配達待ちのメッセージを流し、ユーザー宛は必ず UI へ出す。
     fn coordinate(&mut self, win_focused: bool) {
+        // 0) 指揮官の状況フィードと、`@対象:` 指示を coordinator へ積む
+        //    (実際の配達は下の take_deliverable が安全な瞬間に行う)。
+        self.drive_commander();
+
         // 1) いまのセッション状態表。曖昧なら Unknown (= 配達しない)。
         let states: Vec<(coordinator::SessionId, coordinator::SessionState)> = self
             .agents
@@ -8826,7 +8989,7 @@ mod glyph_tests {
                                   🔍📡🖱📦🍚🌀🔷🔶🕊👷🐦🅰🌊⌘➡🔩🌙🎏🎐🐉💠";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);
-        ctx.run(Default::default(), |_| {});
+        let _ = ctx.run(Default::default(), |_| {});
         let fid = egui::FontId::proportional(14.0);
         let missing: String = ctx.fonts(|f| {
             UI_SYMBOLS
