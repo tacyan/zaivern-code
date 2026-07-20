@@ -12,6 +12,7 @@ use crate::editor_ops;
 use crate::file_tree::{self, FileTree, TreeActions};
 use crate::fuzzy;
 use crate::git;
+use crate::git_panel;
 use crate::highlight::Highlighter;
 use crate::html;
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
@@ -36,6 +37,29 @@ enum SidebarTab {
     Files,
     Agents,
     Plugins,
+    Git,
+}
+
+impl SidebarTab {
+    /// セッション保存用のキー文字列。
+    fn as_key(self) -> &'static str {
+        match self {
+            SidebarTab::Files => "files",
+            SidebarTab::Agents => "agents",
+            SidebarTab::Plugins => "plugins",
+            SidebarTab::Git => "git",
+        }
+    }
+
+    /// セッションのキー文字列から復元する。未知/空なら既定の Files。
+    fn from_key(s: &str) -> Self {
+        match s {
+            "agents" => SidebarTab::Agents,
+            "plugins" => SidebarTab::Plugins,
+            "git" => SidebarTab::Git,
+            _ => SidebarTab::Files,
+        }
+    }
 }
 
 /// 音声入力 (プッシュトゥトーク) の実行状態。
@@ -218,6 +242,7 @@ pub struct ZaivernApp {
     broadcast_input: String,
     git: (Option<String>, Option<Instant>),
     gitinfo: git::Git,
+    git_panel: git_panel::GitPanel,
     /// 外部変更チェックの直近実行時刻(約1秒スロットリング)
     ext_check_at: Option<Instant>,
     keys: Keybinds,
@@ -285,6 +310,7 @@ impl ZaivernApp {
         let mut app = Self {
             tree: FileTree::new(workspace.clone(), cfg.show_hidden_files),
             gitinfo: git::Git::new(workspace.clone()),
+            git_panel: git_panel::GitPanel::new(workspace.clone()),
             ext_check_at: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
             theme,
@@ -828,6 +854,7 @@ impl ZaivernApp {
             active: self.editor.active,
             sidebar_open: self.sidebar_open,
             panel_open: self.agents.panel_open,
+            sidebar_tab: self.sidebar_tab.as_key().to_string(),
         };
         session::save(&self.workspace, &data);
     }
@@ -848,6 +875,7 @@ impl ZaivernApp {
             }
         }
         self.sidebar_open = sess.sidebar_open;
+        self.sidebar_tab = SidebarTab::from_key(&sess.sidebar_tab);
         self.agents.panel_open = sess.panel_open;
     }
 
@@ -966,7 +994,7 @@ impl ZaivernApp {
             .unwrap_or(false);
         if !fresh {
             self.git.1 = Some(Instant::now());
-            self.git.0 = std::fs::read_to_string(self.workspace.join(".git").join("HEAD"))
+            self.git.0 = std::fs::read_to_string(git_head_path(&self.workspace))
                 .ok()
                 .map(|s| {
                     let s = s.trim();
@@ -1194,6 +1222,26 @@ impl ZaivernApp {
             Some((line as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
     }
 
+    /// 指定フォルダをワークスペースとして開き直す (フォルダを開く / worktree を開く)。
+    fn open_workspace(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        self.persist_session();
+        self.workspace = dir.clone();
+        self.tree.set_root(dir.clone());
+        self.gitinfo.set_workspace(dir.clone());
+        self.git_panel.set_workspace(dir.clone());
+        self.rebuild_index();
+        self.restore_session();
+        self.git = (None, None);
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "Zaivern Code — {name}"
+        )));
+        self.toast(format!("📂 {} を開きました", dir.display()), true);
+    }
+
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
             Cmd::Save => {
@@ -1223,21 +1271,7 @@ impl ZaivernApp {
                     .set_directory(&self.workspace)
                     .pick_folder()
                 {
-                    self.persist_session();
-                    self.workspace = dir.clone();
-                    self.tree.set_root(dir.clone());
-                    self.gitinfo.set_workspace(dir.clone());
-                    self.rebuild_index();
-                    self.restore_session();
-                    self.git = (None, None);
-                    let name = dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                        "Zaivern Code — {name}"
-                    )));
-                    self.toast(format!("📂 {} を開きました", dir.display()), true);
+                    self.open_workspace(dir, ctx);
                 }
             }
             Cmd::ToggleTerminal => {
@@ -1277,6 +1311,11 @@ impl ZaivernApp {
             }
             Cmd::ToggleSidebar => {
                 self.sidebar_open = !self.sidebar_open;
+                self.persist_session();
+            }
+            Cmd::OpenGitPanel => {
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::Git;
                 self.persist_session();
             }
             Cmd::OpenFind => {
@@ -2240,6 +2279,7 @@ impl ZaivernApp {
         let mut pl_run: Option<(usize, usize)> = None;
         let mut pl_export: Option<usize> = None;
         let mut pl_open: Option<PathBuf> = None;
+        let mut git_actions = git_panel::GitActions::default();
 
         egui::SidePanel::left("zv-side")
             .resizable(true)
@@ -2253,6 +2293,7 @@ impl ZaivernApp {
                     ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Agents, agents_label);
                     let pl_label = format!("🔌 プラグイン ({})", self.plugins.len());
                     ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Plugins, pl_label);
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Git, "🌿 Git");
                 });
                 ui.separator();
 
@@ -2527,9 +2568,23 @@ impl ZaivernApp {
                                 }
                             });
                     }
+                    SidebarTab::Git => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("zv-git")
+                            .auto_shrink(false)
+                            .show(ui, |ui| {
+                                self.git_panel.ui(ui, &theme, &mut git_actions);
+                            });
+                    }
                 }
             });
 
+        if let Some((msg, ok)) = git_actions.toast {
+            self.toast(msg, ok);
+        }
+        if let Some(dir) = git_actions.open_path {
+            self.open_workspace(dir, ctx);
+        }
         if pl_new {
             self.apply_cmd(Cmd::NewPlugin, ctx);
         }
@@ -3794,6 +3849,7 @@ impl ZaivernApp {
                 ("🎛".into(), "Cockpit 切替".into(), "⌘⇧C".into(), Cmd::ToggleCockpit),
                 ("👁".into(), "Markdown/HTML プレビュー切替".into(), "⌘⇧V".into(), Cmd::ToggleMdPreview),
                 ("📁".into(), "サイドバー切替".into(), "⌘B".into(), Cmd::ToggleSidebar),
+                ("🌿".into(), "Git パネルを開く".into(), String::new(), Cmd::OpenGitPanel),
                 (
                     "🤖".into(),
                     "現在のファイルをエージェントに送信 (@path)".into(),
@@ -4872,6 +4928,7 @@ impl ZaivernApp {
                     "close_tab" => Some(Cmd::CloseTab),
                     "terminal" => Some(Cmd::ToggleTerminal),
                     "sidebar" => Some(Cmd::ToggleSidebar),
+                    "git" => Some(Cmd::OpenGitPanel),
                     "cockpit" => Some(Cmd::ToggleCockpit),
                     "font_inc" => Some(Cmd::FontInc),
                     "font_dec" => Some(Cmd::FontDec),
@@ -5274,6 +5331,36 @@ impl eframe::App for ZaivernApp {
 }
 
 /// ワークスペースからの相対パス表示(外なら絶対パス)。
+/// `.git` がファイルのとき、その中身 (`gitdir: <path>`) から実際の git ディレクトリを取り出す。
+/// 相対パスは workspace 基準で解決する。
+fn parse_gitdir_file(contents: &str, workspace: &Path) -> Option<PathBuf> {
+    let raw = contents
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(raw);
+    Some(if p.is_absolute() { p } else { workspace.join(p) })
+}
+
+/// ブランチ表示のために読むべき HEAD のパス。
+/// 通常のリポジトリは `<ws>/.git/HEAD` だが、linked worktree では `.git` が
+/// ディレクトリではなくファイルなので、それが指す git ディレクトリ配下の HEAD を読む。
+fn git_head_path(workspace: &Path) -> PathBuf {
+    let dot_git = workspace.join(".git");
+    if dot_git.is_file() {
+        if let Some(dir) = std::fs::read_to_string(&dot_git)
+            .ok()
+            .and_then(|s| parse_gitdir_file(&s, workspace))
+        {
+            return dir.join("HEAD");
+        }
+    }
+    dot_git.join("HEAD")
+}
+
 fn rel_label(p: &Path, ws: &Path) -> String {
     p.strip_prefix(ws).unwrap_or(p).display().to_string()
 }
@@ -5479,6 +5566,37 @@ fn install_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_gitdir_from_worktree_dot_git_file() {
+        let ws = Path::new("/repo/.claude/worktrees/feature");
+
+        // linked worktree の `.git` ファイル (git が書く形式は絶対パス + 末尾改行)
+        let abs = "gitdir: /repo/.git/worktrees/feature\n";
+        assert_eq!(
+            parse_gitdir_file(abs, ws),
+            Some(PathBuf::from("/repo/.git/worktrees/feature"))
+        );
+
+        // 相対パスは workspace 基準で解決する
+        let rel = "gitdir: ../../../.git/worktrees/feature\n";
+        assert_eq!(
+            parse_gitdir_file(rel, ws),
+            Some(ws.join("../../../.git/worktrees/feature"))
+        );
+
+        // gitdir 行が無い / 空なら None (通常の .git ディレクトリへフォールバックする)
+        assert_eq!(parse_gitdir_file("ref: refs/heads/main\n", ws), None);
+        assert_eq!(parse_gitdir_file("gitdir:   \n", ws), None);
+        assert_eq!(parse_gitdir_file("", ws), None);
+    }
+
+    #[test]
+    fn git_head_path_falls_back_to_dot_git_dir() {
+        // `.git` が存在しない (=ファイルでない) 場合は従来どおり <ws>/.git/HEAD
+        let ws = Path::new("/no/such/workspace");
+        assert_eq!(git_head_path(ws), ws.join(".git").join("HEAD"));
+    }
 
     #[test]
     fn joins_japanese_without_spaces() {

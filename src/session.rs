@@ -20,6 +20,9 @@ pub struct SessionData {
     pub active: Option<usize>,
     pub sidebar_open: bool,
     pub panel_open: bool,
+    /// サイドバーのタブ ("files"|"agents"|"plugins"|"git")。
+    /// 旧バージョンのセッションファイルには無いので空文字なら既定タブ扱い。
+    pub sidebar_tab: String,
 }
 
 /// `~/.zaivern/sessions/<workspaceハッシュhex>.toml` から読む。無ければ None。
@@ -113,6 +116,7 @@ mod tests {
             active: Some(1),
             sidebar_open: true,
             panel_open: false,
+            ..Default::default()
         };
 
         save_to(&dir, &workspace, &data);
@@ -135,6 +139,7 @@ mod tests {
             active: None,
             sidebar_open: false,
             panel_open: true,
+            ..Default::default()
         };
 
         save_to(&dir, &workspace, &data);
@@ -162,6 +167,7 @@ mod tests {
             active: Some(0),
             sidebar_open: true,
             panel_open: true,
+            ..Default::default()
         };
 
         save_to(&dir, &workspace, &data);
@@ -182,6 +188,29 @@ mod tests {
         // 保存先ディレクトリ自体が無い場合も None
         let ghost_dir = dir.join("no-such-dir");
         assert!(load_from(&ghost_dir, &workspace).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sidebar_tab_roundtrips_and_old_file_without_it_still_loads() {
+        let dir = unique_temp_dir("sidebar-tab");
+        let workspace = dir.join("ws-tab");
+
+        let data = SessionData {
+            sidebar_tab: "git".into(),
+            ..Default::default()
+        };
+        save_to(&dir, &workspace, &data);
+        let loaded = load_from(&dir, &workspace).expect("session should load");
+        assert_eq!(loaded.sidebar_tab, "git");
+
+        // 旧バージョンのセッション (sidebar_tab フィールド無し) も読めること
+        let old = "open_files = []\nsidebar_open = true\npanel_open = false\n";
+        std::fs::write(session_file_in(&dir, &workspace), old).expect("write old session");
+        let loaded = load_from(&dir, &workspace).expect("old session should still load");
+        assert_eq!(loaded.sidebar_tab, "");
+        assert!(loaded.sidebar_open);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -211,6 +240,7 @@ mod tests {
             active: Some(0),
             sidebar_open: false,
             panel_open: false,
+            ..Default::default()
         };
         save_to(&dir, &workspace, &first);
 
@@ -219,6 +249,7 @@ mod tests {
             active: Some(1),
             sidebar_open: true,
             panel_open: true,
+            ..Default::default()
         };
         save_to(&dir, &workspace, &second);
 

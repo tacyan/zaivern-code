@@ -8,6 +8,7 @@ mod editor_ops;
 mod file_tree;
 mod fuzzy;
 mod git;
+mod git_panel;
 mod highlight;
 mod html;
 mod keybinds;
