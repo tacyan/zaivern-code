@@ -7,6 +7,10 @@
 #   2. ビルド済みが無い環境や取得失敗時はソースからビルド
 #      (Rust が無ければ rustup ごと非対話でセットアップ)
 #
+# 2回目以降の実行は「更新」として動作する:
+#   最新版を取得して上書きし、PATH 上の別の場所(~/.cargo/bin 等)に残った
+#   古い zai も同じバイナリで揃える(古い方が先に見つかって起動するのを防ぐ)
+#
 # 環境変数:
 #   ZAI_INSTALL_DIR    ビルド済みバイナリの配置先 (既定: ~/.local/bin)
 #   ZAI_FROM_SOURCE=1  常にソースビルドする
@@ -26,6 +30,19 @@ path_hint() {
         *) say "⚠ $1 が PATH にありません。シェルの rc に以下を追記してください:"
            say "   export PATH=\"$1:\$PATH\"" ;;
     esac
+}
+
+# 既知のインストール先に残った古い zai を新バイナリで揃える
+# (PATH 順によっては古い方が起動してしまい「更新されない」ように見えるため)
+sync_stale() {
+    new_bin="$1"; skip_dir="$2"
+    for d in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+        [ "$d" = "$skip_dir" ] && continue
+        if [ -x "$d/zai" ]; then
+            say "旧バイナリを更新します: $d/zai"
+            install -m 755 "$new_bin" "$d/zai" || true
+        fi
+    done
 }
 
 # --- ビルド済みバイナリのインストール ----------------------------------------
@@ -56,10 +73,13 @@ install_prebuilt() {
     curl -fsSL "$url" -o "$tmp/$name.tar.gz" || return 1
     tar xzf "$tmp/$name.tar.gz" -C "$tmp" || return 1
     mkdir -p "$INSTALL_DIR" || return 1
+    verb="インストール"
+    [ -x "$INSTALL_DIR/zai" ] && verb="更新"
     install -m 755 "$tmp/$name/zai" "$INSTALL_DIR/zai" || return 1
+    sync_stale "$tmp/$name/zai" "$INSTALL_DIR"
     say ""
-    say "✅ インストール完了: $INSTALL_DIR/zai ($tag)"
-    say "   起動: zai [ワークスペースのパス]"
+    say "✅ ${verb}完了: $INSTALL_DIR/zai ($tag)"
+    say "   起動: プロジェクトのフォルダで zai . (または zai [ワークスペースのパス])"
     path_hint "$INSTALL_DIR"
     return 0
 }
@@ -100,11 +120,13 @@ if [ "$(uname -s)" = "Linux" ] && command -v apt-get >/dev/null 2>&1; then
 fi
 
 # 4. GitHub から直接ビルド & インストール
+#    --force: 同一バージョンがインストール済みでも再ビルドして上書き(=再実行で更新)
 say "GitHub からビルド・インストールします(初回は数分かかります)..."
-cargo install --git "$REPO_URL" --locked zaivern-code
+cargo install --git "$REPO_URL" --locked --force zaivern-code
 
+sync_stale "$HOME/.cargo/bin/zai" "$HOME/.cargo/bin"
 bin_path=$(command -v zai 2>/dev/null || echo "$HOME/.cargo/bin/zai")
 say ""
 say "✅ インストール完了: $bin_path"
-say "   起動: zai [ワークスペースのパス]"
+say "   起動: プロジェクトのフォルダで zai . (または zai [ワークスペースのパス])"
 path_hint "$HOME/.cargo/bin"
