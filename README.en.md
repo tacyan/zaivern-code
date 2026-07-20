@@ -63,11 +63,11 @@ Click **🎛 Cockpit** in the toolbar (or press ⌘⇧C) and every running agent
 
 ### 🛡 The reins stay in your hands — 3 permission modes
 
-When you attack, use **⚡ Full-auto**: bypass flags are added to each CLI automatically, and the interactive prompts that survive even bypass mode (first-run warnings, folder-trust confirmations, plan approvals) are detected from the screen text and answered automatically — a two-layer system. When you defend, use **🛡 Approve**: any bypass flags smuggled into a command are stripped automatically, failing safe. And **🤖 Agent-first** respects whatever flags your preset says, verbatim. Switch with one click in the toolbar; push the change to already-running sessions in bulk.
+When you attack, use **⚡ Full-auto**: bypass flags are added to each CLI automatically, and the interactive prompts that survive even bypass mode (first-run warnings, folder-trust confirmations, plan approvals) are detected from the screen text and answered automatically — a two-layer system. When you defend, use **🛡 Approve**: any bypass flags smuggled into a command are stripped automatically, failing safe. And **👾 Agent-first** respects whatever flags your preset says, verbatim. Switch with one click in the toolbar; push the change to already-running sessions in bulk.
 
 **Speed and safety were never an either/or.**
 
-### 🔔 When you're needed, you will know — notifications and your sidekick 🦀 Zaigani
+### 🔔 When you're needed, you will know — notifications and your sidekick 🐾 Zaigani
 
 The instant an agent asks for approval — a popup appears, a sound plays, the session's ● turns yellow, and **Zaigani**, the little desktop pet strolling in the corner of your screen, starts fidgeting with an "❗ approval needed" sign. A bubble floats above its head: **✔ Approve / ✖ Deny**, one click. When a run succeeds it jumps 🎉; when one fails it goes 💥 with X-eyes.
 
@@ -125,14 +125,14 @@ Everything below is the manual for each instrument on the flight deck.
 ### 📝 Editor
 - Syntax highlighting via syntect (Rust / TS / Python / Go / Markdown and many more, auto-detected by extension)
 - Tabs, line-number gutter, unsaved indicator (●), save confirmation before closing
-- VS Code-grade file operations in the file tree: ➕ new file / 🗂 new folder (inline input), ✏ rename (open tabs' paths and languages follow automatically), 🗑 delete (with confirmation dialog)
+- VS Code-grade file operations in the file tree: ➕ new file / 📂 new folder (inline input), ✏ rename (open tabs' paths and languages follow automatically), 🗑 delete (with confirmation dialog)
 - Right-click menu: open / new / rename / delete / "Send path to agent (@path)" / copy full path
 - In-file search (⌘F, hit count, jump-to-hit centered on screen)
 - VS Code-grade scrolling: fixed gutter, scrollBeyondLastLine, PageUp/PageDown
 - Fuzzy command palette (⌘P for files, ⌘⇧P for commands)
 - Git branch display, automatic Japanese UI font fallback
 
-### 🤖 Multi-agent
+### 👾 Multi-agent
 - Launch agent presets with one click (⌘⇧A) and run multiple sessions in parallel
 - Per-session status (●/○), uptime, restart, force-kill
 - Permission modes auto-apply to presets whose command starts with `claude` / `codex` / `agy` (no flags needed in the preset). Any other CLI agent — Gemini CLI included — runs in parallel just by registering a preset
@@ -142,7 +142,7 @@ Everything below is the manual for each instrument on the flight deck.
 - Approval-wait, success (✅), and failure (❌ + exit code) announced via popup + OS-native sounds (can be turned off)
 - When the window is unfocused, notifications also go to macOS Notification Center (Linux: notify-send)
 
-### 🦀 Desktop pet "Zaigani"
+### 🐾 Desktop pet "Zaigani"
 - Blinks, follows your cursor with its eyes, wanders around; dozes off when idle → deep sleep (💤), startled hop when you come back
 - Agent-linked reactions: marching "⚙ n" while agents run (faster with more agents), grooving (🎵) at 3+, fidgeting on approval-wait, 🎉 on success / 💥 on failure
 - 💬 Approval bubble: ✔ Approve / ✖ Deny / Open with one click (keys sent to the PTY are customizable via `pet_approve_keys` / `pet_deny_keys`)
@@ -270,7 +270,7 @@ show_hidden_files = true
 #   "agent" = agent-first (use whatever flags the preset command says)
 approval_mode = "ask"
 
-# Desktop pet 🦀
+# Desktop pet 🐾
 show_pet = true
 # pet_variant = "blocky"   # look: "blocky" | "crab" | "cat" | "cloud"
 # pet_scale = 1.0          # size: 0.75=S / 1.0=M / 1.4=L
@@ -284,7 +284,7 @@ show_pet = true
 # ── AI agent presets (add as many as you like) ──
 [[agents]]
 name = "Claude Code"
-icon = "🤖"
+icon = "👾"
 command = "claude"
 
 [[agents]]
@@ -294,7 +294,7 @@ command = "claude --dangerously-skip-permissions"
 
 [[agents]]
 name = "Codex"
-icon = "🧠"
+icon = "💡"
 command = "codex"
 
 [[agents]]
@@ -319,7 +319,7 @@ command = ""          # empty string = login shell
 
 # [[agents]]
 # name = "Claude (explicit Opus)"
-# icon = "🧠"
+# icon = "💡"
 # command = "claude --model claude-opus-4-8"
 # env = { MAX_THINKING_TOKENS = "31999" }
 ```
@@ -331,7 +331,7 @@ command = ""          # empty string = login shell
 - **Choices made in the UI are auto-saved to `~/.zaivern/state.toml`** (theme, approval mode, pet settings) — your handwritten config.toml stays clean. "Reload settings" gives config.toml priority.
 
 ### Command tricks
-- Right-click in the file tree → "🤖 Send path to agent" types `@path ` (Claude Code's file-reference syntax)
+- Right-click in the file tree → "👾 Send path to agent" types `@path ` (Claude Code's file-reference syntax)
 - Command palette → "Send current file to agent (@path)"
 - Use the Cockpit's broadcast to send the same instruction to multiple Claude Code sessions at once
 - Answer approval waits from the pet's bubble with one click — or from your phone when you're away
@@ -382,7 +382,7 @@ src/
 - [x] Plugin system (commands, on-save hooks, themes, snippets, .zvplug distribution)
 - [x] Phone remote (view/edit/command agents from a LAN browser)
 - [x] VS Code-grade scrolling (fixed gutter, scrollBeyondLastLine, PageUp/PageDown)
-- [x] 3 permission modes (🛡 Approve / ⚡ Full-auto / 🤖 Agent-first) + bulk switch for running sessions
+- [x] 3 permission modes (🛡 Approve / ⚡ Full-auto / 👾 Agent-first) + bulk switch for running sessions
 - [x] Pet upgrades (4 looks, custom images, sizes, sleep/walk, sounds, approve/deny from the bubble)
 - [x] Voice input (🎤/⏹ only, records until stopped, inserts into the input box for a manual Enter, configurable destination/language/engine)
 - [x] Cross-platform voice input (built-in on macOS; Windows' own recognizer when one is installed; a browser page on Linux and on Windows without one; keyboard dictation guidance on phones)
