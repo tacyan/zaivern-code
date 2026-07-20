@@ -1,0 +1,90 @@
+# 課題と PR の一覧・作業開始・差分確認・レビュー依頼をまとめた標準プラグイン。
+# gh コマンドが使えることが前提。未導入・未認証のときは日本語で案内する。
+
+[plugin]
+name = "tasks"
+version = "0.1.0"
+author = "Zaivern"
+description = "課題と PR の一覧、作業ブランチの作成、差分表示、レビュー依頼"
+api = 2
+
+[[command]]
+id = "pr-list"
+title = "PR一覧"
+icon = "🔀"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/pr-list.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "issue-list"
+title = "課題一覧"
+icon = "🗂"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/issue-list.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "issue-branch"
+title = "課題からブランチを作成"
+icon = "🌱"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/issue-branch.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 60
+
+[[command]]
+id = "pr-diff"
+title = "PRの差分を表示"
+icon = "📄"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/pr-diff.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 60
+
+[[command]]
+id = "pr-review"
+title = "PRをレビュー依頼"
+icon = "🙏"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/pr-review.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 30
+
+[[panel]]
+id = "tasks"
+title = "課題"
+icon = "📋"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/panel.sh"'
+refresh = "on_open"
+format = "markdown"
+
+[[setting]]
+key = "default_issue"
+type = "string"
+default = ""
+label = "既定の課題番号"
+secret = false
+
+[[setting]]
+key = "branch_prefix"
+type = "string"
+default = "work"
+label = "作業ブランチの接頭辞"
+secret = false
+
+[[setting]]
+key = "list_limit"
+type = "int"
+default = 20
+label = "一覧の取得件数"
+secret = false
+
+[[setting]]
+key = "review_message"
+type = "string"
+default = "レビューをお願いします。"
+label = "レビュー依頼の本文"
+secret = false

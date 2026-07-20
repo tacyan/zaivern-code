@@ -1,0 +1,50 @@
+# ローカルに残るセッション記録から、トークンや費用の目安を見える化する標準プラグイン。
+# 記録に無い数値は必ず「取得不可」と表示し、推定値は作らない。
+
+[plugin]
+name = "usage-meter"
+version = "0.1.0"
+author = "Zaivern"
+description = "セッション記録から使用量の目安を集計して表示する"
+api = 2
+
+[[command]]
+id = "refresh"
+title = "使用量を更新"
+icon = "📊"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/refresh.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 60
+
+[[command]]
+id = "report"
+title = "使用量レポートを開く"
+icon = "🧾"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/report.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 60
+
+[[hook]]
+event = "interval"
+interval_secs = 900
+run = 'sh "$ZV_PLUGIN_DIR/scripts/refresh.sh"'
+output = "actions"
+timeout_secs = 60
+
+[[panel]]
+id = "usage"
+title = "使用量"
+icon = "📊"
+run = 'sh "$ZV_PLUGIN_DIR/scripts/panel.sh"'
+refresh = "interval"
+interval_secs = 900
+format = "markdown"
+
+[[setting]]
+key = "extra_dirs"
+type = "string"
+default = ""
+label = "追加の探索ディレクトリ (カンマ区切り)"
+secret = false

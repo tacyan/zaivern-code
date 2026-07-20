@@ -1,0 +1,69 @@
+[plugin]
+name = "diff-review"
+version = "0.1.0"
+author = "Zaivern"
+description = "差分を読みながら行単位でコメントを溜め、まとめてエージェントへ渡す"
+api = 2
+
+[[setting]]
+key = "agent"
+type = "string"
+default = ""
+label = "送信先エージェント（空なら使用中のエージェント）"
+
+[[setting]]
+key = "submit"
+type = "bool"
+default = false
+label = "エージェントへ送るとき自動で送信する"
+
+[[setting]]
+key = "max_lines"
+type = "int"
+default = 4000
+label = "新規タブに表示する差分の最大行数"
+
+[[command]]
+id = "review"
+title = "差分をレビュー"
+icon = "🔍"
+run = 'sh "$ZV_PLUGIN_DIR/review.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 60
+
+[[command]]
+id = "comment"
+title = "コメントを追加"
+icon = "💬"
+run = 'sh "$ZV_PLUGIN_DIR/comment.sh"'
+input = "selection"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "send"
+title = "コメントをエージェントへ送る"
+icon = "📤"
+run = 'sh "$ZV_PLUGIN_DIR/send.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[command]]
+id = "clear"
+title = "コメントを破棄"
+icon = "🧹"
+run = 'sh "$ZV_PLUGIN_DIR/clear.sh"'
+input = "none"
+output = "actions"
+timeout_secs = 30
+
+[[panel]]
+id = "review"
+title = "レビュー"
+icon = "💬"
+run = 'sh "$ZV_PLUGIN_DIR/pending.sh"'
+refresh = "on_open"
+interval_secs = 30
+format = "markdown"
