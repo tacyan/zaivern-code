@@ -716,6 +716,7 @@ impl ZaivernApp {
             .get(self.agents.active)
             .map(|s| s.preset_name.clone())
             .unwrap_or_default();
+        // マルチルート対応後は「代表ルート」をワークスペースとして渡す。
         let workspace = self.primary_root().to_path_buf();
         let (line, column) = self.editor.cursor;
         let Some(p) = self.plugins.iter().find(|p| p.name == plugin_name) else {
@@ -1351,14 +1352,11 @@ impl ZaivernApp {
             cwd: cwd.map(|s| s.to_string()),
             env: HashMap::new(),
         };
+        // self.agents を可変で借りる前にルートを取り出しておく
+        let root = self.primary_root().to_path_buf();
         match self
             .agents
-            .launch(
-                &preset,
-                &self.primary_root().to_path_buf(),
-                crate::agents::Approval::Agent,
-                ctx,
-            )
+            .launch(&preset, &root, crate::agents::Approval::Agent, ctx)
         {
             Ok(()) => self.toast(format!("▶ {command} を実行しています"), true),
             Err(e) => self.toast(format!("実行に失敗: {e}"), false),
@@ -7249,25 +7247,8 @@ fn install_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::unique_temp_dir;
 
-    /// std::env::temp_dir() 配下に一意なディレクトリを作る。
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "zaivern-index-test-{}-{}-{}-{}",
-            tag,
-            std::process::id(),
-            nanos,
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).expect("create unique temp dir");
-        dir
-    }
 
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir -p");
@@ -7278,7 +7259,7 @@ mod tests {
     /// あいまい検索から「正しい方のファイル」が開けること。
     #[test]
     fn two_roots_with_same_relative_path_resolve_to_distinct_files() {
-        let base = unique_temp_dir("collide");
+        let base = unique_temp_dir("zaivern-app-test", "collide");
         let a = base.join("alpha");
         let b = base.join("beta");
         write(&a.join("src/main.rs"), "fn main() { /* ALPHA */ }");
@@ -7335,7 +7316,7 @@ mod tests {
     /// 単一ルートでは索引のラベルが従来どおり素の相対パスであること (非退行)。
     #[test]
     fn single_root_index_labels_are_plain_relative_paths() {
-        let base = unique_temp_dir("single");
+        let base = unique_temp_dir("zaivern-app-test", "single");
         write(&base.join("src/main.rs"), "fn main() {}");
         write(&base.join("README.md"), "# hi");
 

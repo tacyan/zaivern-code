@@ -1142,6 +1142,40 @@ mod tests {
 }
 
 #[cfg(test)]
+mod supervisor_field_tests {
+    use super::*;
+
+    /// `[supervisor]` セクションが無い既存の config.toml が、
+    /// これまでどおり読めて既定値が入ることを確かめる。
+    #[test]
+    fn config_without_supervisor_section_still_loads() {
+        assert!(
+            !DEFAULT_CONFIG.contains("[supervisor]"),
+            "この検証は [supervisor] を書いていない設定を前提にしている"
+        );
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定の設定が読めなくなった");
+        assert_eq!(cfg.theme, "zaivern-dark");
+        assert_eq!(cfg.agents.len(), 7);
+        // supervisor は SupervisorConfig の既定値で埋まる
+        let d = crate::supervisor::SupervisorConfig::default();
+        assert_eq!(cfg.supervisor.enabled, d.enabled);
+        assert_eq!(cfg.supervisor.sample_interval_ms, d.sample_interval_ms);
+        assert_eq!(cfg.supervisor.allow_auto_restart, d.allow_auto_restart);
+    }
+
+    /// 手元の `~/.zaivern/config.toml` があるなら、それも読めることを確かめる。
+    /// 無い環境では何もしない (CI で落とさない)。
+    #[test]
+    fn existing_user_config_still_loads() {
+        let Ok(s) = std::fs::read_to_string(config_path()) else {
+            return;
+        };
+        let cfg: Config = toml::from_str(&s).expect("既存の config.toml が読めなくなった");
+        assert!(!cfg.theme.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod plugins_config_tests {
     use super::*;
 
@@ -1256,39 +1290,5 @@ mod plugins_config_tests {
         let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定 config.toml が壊れている");
         assert!(cfg.plugins.is_enabled("worktrees"));
         assert!(!cfg.agents.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod supervisor_field_tests {
-    use super::*;
-
-    /// `[supervisor]` セクションが無い既存の config.toml が、
-    /// これまでどおり読めて既定値が入ることを確かめる。
-    #[test]
-    fn config_without_supervisor_section_still_loads() {
-        assert!(
-            !DEFAULT_CONFIG.contains("[supervisor]"),
-            "この検証は [supervisor] を書いていない設定を前提にしている"
-        );
-        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定の設定が読めなくなった");
-        assert_eq!(cfg.theme, "zaivern-dark");
-        assert_eq!(cfg.agents.len(), 7);
-        // supervisor は SupervisorConfig の既定値で埋まる
-        let d = crate::supervisor::SupervisorConfig::default();
-        assert_eq!(cfg.supervisor.enabled, d.enabled);
-        assert_eq!(cfg.supervisor.sample_interval_ms, d.sample_interval_ms);
-        assert_eq!(cfg.supervisor.allow_auto_restart, d.allow_auto_restart);
-    }
-
-    /// 手元の `~/.zaivern/config.toml` があるなら、それも読めることを確かめる。
-    /// 無い環境では何もしない (CI で落とさない)。
-    #[test]
-    fn existing_user_config_still_loads() {
-        let Ok(s) = std::fs::read_to_string(config_path()) else {
-            return;
-        };
-        let cfg: Config = toml::from_str(&s).expect("既存の config.toml が読めなくなった");
-        assert!(!cfg.theme.is_empty());
     }
 }

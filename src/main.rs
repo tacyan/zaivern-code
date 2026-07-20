@@ -58,13 +58,13 @@ fn load_icon() -> Option<egui::IconData> {
 
 fn main() -> eframe::Result<()> {
     // サブコマンド指定なら CLI として処理して終了する。
-    // 引数なし / ディレクトリ指定のときは None が返り、そのまま GUI を起動する。
+    // 引数なし / パス指定のときは None が返り、そのまま GUI 起動へ進む。
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = cli::try_run_cli(&args) {
         std::process::exit(code);
     }
 
-    // CLI でなければ、引数はマルチルートワークスペースとして解釈する: `zai dirA dirB dirC`。
+    // 引数はマルチルートワークスペースとして解釈する: `zai dirA dirB dirC`。
     // ディレクトリはルートに、ファイルは起動後に開くタブになる。
     // 存在しない引数・その他は黙って無視する（起動は止めない）。
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
