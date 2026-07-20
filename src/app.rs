@@ -15,6 +15,7 @@ use crate::editor_ops;
 use crate::file_tree::{self, FileTree, TreeActions};
 use crate::fuzzy;
 use crate::git;
+use crate::git_panel;
 use crate::highlight::Highlighter;
 use crate::html;
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
@@ -39,6 +40,29 @@ enum SidebarTab {
     Files,
     Agents,
     Plugins,
+    Git,
+}
+
+impl SidebarTab {
+    /// セッション保存用のキー文字列。
+    fn as_key(self) -> &'static str {
+        match self {
+            SidebarTab::Files => "files",
+            SidebarTab::Agents => "agents",
+            SidebarTab::Plugins => "plugins",
+            SidebarTab::Git => "git",
+        }
+    }
+
+    /// セッションのキー文字列から復元する。未知/空なら既定の Files。
+    fn from_key(s: &str) -> Self {
+        match s {
+            "agents" => SidebarTab::Agents,
+            "plugins" => SidebarTab::Plugins,
+            "git" => SidebarTab::Git,
+            _ => SidebarTab::Files,
+        }
+    }
 }
 
 /// 音声入力 (プッシュトゥトーク) の実行状態。
@@ -238,6 +262,7 @@ pub struct ZaivernApp {
     qr_tex: Option<egui::TextureHandle>,
     broadcast_input: String,
     gitinfo: git::GitSet,
+    git_panel: git_panel::GitPanel,
     /// 外部変更チェックの直近実行時刻(約1秒スロットリング)
     ext_check_at: Option<Instant>,
     keys: Keybinds,
@@ -421,6 +446,9 @@ impl ZaivernApp {
         let mut app = Self {
             tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
             gitinfo: git::GitSet::new(roots.clone()),
+            git_panel: git_panel::GitPanel::new(
+                roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
+            ),
             ext_check_at: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
             theme,
@@ -579,6 +607,9 @@ impl ZaivernApp {
         self.roots = roots;
         self.tree.set_roots(self.roots.clone());
         self.gitinfo.set_roots(self.roots.clone());
+        // Git パネルは代表ルートのリポジトリを見る
+        self.git_panel
+            .set_workspace(self.roots.first().cloned().unwrap_or_default());
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
         self.tree.show_hidden = self.cfg.show_hidden_files;
@@ -1560,6 +1591,7 @@ impl ZaivernApp {
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect(),
+            sidebar_tab: self.sidebar_tab.as_key().to_string(),
         };
         session::save(&self.roots, &data);
         // マルチルート時は primary ルート単独のキーでも保存しておく。
@@ -1595,6 +1627,7 @@ impl ZaivernApp {
             }
         }
         self.sidebar_open = sess.sidebar_open;
+        self.sidebar_tab = SidebarTab::from_key(&sess.sidebar_tab);
         self.agents.panel_open = sess.panel_open;
     }
 
@@ -1984,6 +2017,16 @@ impl ZaivernApp {
             Some((line as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
     }
 
+    /// 指定フォルダをワークスペースとして開き直す (フォルダを開く / worktree を開く)。
+    /// マルチルート対応後は「ルート一覧をそのフォルダ 1 つに差し替える」意味になる。
+    /// タイトル更新と Git パネルの追随は set_roots -> apply_roots 側でまとめて行う。
+    fn open_workspace(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        let roots = file_tree::normalize_roots(vec![dir.clone()]);
+        self.set_roots(roots, ctx);
+        self.restore_session(ctx);
+        self.toast(format!("📂 {} を開きました", dir.display()), true);
+    }
+
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
             Cmd::Save => {
@@ -2013,11 +2056,7 @@ impl ZaivernApp {
                     .set_directory(self.primary_root())
                     .pick_folder()
                 {
-                    // 「フォルダを開く」= ワークスペースを置き換える (従来どおり)
-                    let roots = file_tree::normalize_roots(vec![dir.clone()]);
-                    self.set_roots(roots, ctx);
-                    self.restore_session(ctx);
-                    self.toast(format!("📂 {} を開きました", dir.display()), true);
+                    self.open_workspace(dir, ctx);
                 }
             }
             Cmd::AddFolder => {
@@ -2099,6 +2138,11 @@ impl ZaivernApp {
             }
             Cmd::ToggleSidebar => {
                 self.sidebar_open = !self.sidebar_open;
+                self.persist_session();
+            }
+            Cmd::OpenGitPanel => {
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::Git;
                 self.persist_session();
             }
             Cmd::OpenFind => {
@@ -2692,11 +2736,21 @@ impl ZaivernApp {
                                     .color(if rec { theme.err } else { theme.text }),
                             )
                             .on_hover_text(if rec {
-                                "録音中 — もう一度押すと止まります"
+                                "録音中 — もう一度押すと止まります".to_string()
                             } else {
-                                "音声入力を始める\n\
-                                 ⏹ を押すまで、話した内容が入力欄に入り続けます\n\
-                                 (Enter は送られないので、確認して自分で送信)"
+                                // この PC で実際に通る経路を先に見せる (押してから
+                                // 「使えません」と言われるのを避ける)
+                                format!(
+                                    "音声入力を始める\n\
+                                     ⏹ を押すまで、話した内容が入力欄に入り続けます\n\
+                                     (Enter は送られないので、確認して自分で送信)\n\
+                                     {}",
+                                    voice::route_hint(
+                                        &self.cfg.voice_engine,
+                                        &self.cfg.voice_lang,
+                                        &self.cfg.voice_command,
+                                    )
+                                )
                             })
                             .clicked()
                         {
@@ -2786,6 +2840,8 @@ impl ZaivernApp {
                                     for (v, label) in [
                                         ("auto", "自動 (この OS に合わせる)"),
                                         ("mac", "macOS 内蔵の音声認識"),
+                                        ("powershell", "Windows 標準の音声認識"),
+                                        ("browser", "ブラウザの音声入力ページ"),
                                         ("command", "外部コマンド (config.toml の voice_command)"),
                                         ("off", "無効"),
                                     ] {
@@ -3077,6 +3133,7 @@ impl ZaivernApp {
         let mut pl_run: Option<(usize, usize)> = None;
         let mut pl_export: Option<usize> = None;
         let mut pl_open: Option<PathBuf> = None;
+        let mut git_actions = git_panel::GitActions::default();
         // 有効/無効の切り替え要求 (プラグイン名, 有効か)
         let mut pl_toggle: Option<(String, bool)> = None;
         // 設定値の変更要求 (プラグイン名, キー, 値)
@@ -3102,6 +3159,7 @@ impl ZaivernApp {
                     ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Agents, agents_label);
                     let pl_label = format!("🔌 プラグイン ({})", self.plugins.len());
                     ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Plugins, pl_label);
+                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Git, "🌿 Git");
                 });
                 ui.separator();
 
@@ -3518,8 +3576,23 @@ impl ZaivernApp {
                                 }
                             });
                     }
+                    SidebarTab::Git => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("zv-git")
+                            .auto_shrink(false)
+                            .show(ui, |ui| {
+                                self.git_panel.ui(ui, &theme, &mut git_actions);
+                            });
+                    }
                 }
             });
+
+        if let Some((msg, ok)) = git_actions.toast {
+            self.toast(msg, ok);
+        }
+        if let Some(dir) = git_actions.open_path {
+            self.open_workspace(dir, ctx);
+        }
 
         self.md_images = md_images;
 
@@ -4856,6 +4929,7 @@ impl ZaivernApp {
                 ("🎛".into(), "Cockpit 切替".into(), "⌘⇧C".into(), Cmd::ToggleCockpit),
                 ("👁".into(), "Markdown/HTML プレビュー切替".into(), "⌘⇧V".into(), Cmd::ToggleMdPreview),
                 ("📁".into(), "サイドバー切替".into(), "⌘B".into(), Cmd::ToggleSidebar),
+                ("🌿".into(), "Git パネルを開く".into(), String::new(), Cmd::OpenGitPanel),
                 (
                     "🤖".into(),
                     "現在のファイルをエージェントに送信 (@path)".into(),
@@ -5338,6 +5412,17 @@ impl ZaivernApp {
             self.toast_warn("音声入力の宛先がありません — 先にエージェントを起動してください");
             return;
         }
+        // ブラウザ経路は子プロセスを持たない — /voice をブラウザで開いて、
+        // 認識結果は Web Speech API から /api/voice 経由で戻ってくる。
+        if voice::resolve_engine(
+            &self.cfg.voice_engine,
+            &self.cfg.voice_lang,
+            &self.cfg.voice_command,
+        ) == "browser"
+        {
+            self.open_voice_page();
+            return;
+        }
         match voice::start(
             &self.cfg.voice_engine,
             &self.cfg.voice_lang,
@@ -5359,6 +5444,43 @@ impl ZaivernApp {
                 self.toast(format!("🎤 {e}"), false);
             }
         }
+    }
+
+    /// ブラウザの音声入力ページ (`/voice`) を開く。
+    ///
+    /// `http://127.0.0.1:PORT` は W3C の Secure Contexts 上「信頼できるオリジン」
+    /// なので、TLS 無しでも Web Speech API が動く。マイクはブラウザ側なので
+    /// Zaivern 内に録音プロセスは立たない (⏹ も出ない — 閉じれば止まる)。
+    fn open_voice_page(&mut self) {
+        let Some(r) = self.remote.as_ref() else {
+            self.toast(
+                "🎤 ブラウザの音声入力ページを開けません — スマホリモートが起動していません\
+                 (config.toml の voice_command に外部コマンドを設定する手もあります)"
+                    .to_string(),
+                false,
+            );
+            return;
+        };
+        let url = format!("http://127.0.0.1:{}/voice?t={}", r.port, r.token);
+        // Edge の webkitSpeechRecognition は不安定なので Chrome があればそちらを使う。
+        // どちらで開いたかは必ず伝える (黙って既定ブラウザに投げない)。
+        let browser = match chrome_path() {
+            Some(p) => {
+                let _ = std::process::Command::new(p).arg(&url).spawn();
+                "Chrome"
+            }
+            None => {
+                open_external(&url);
+                "既定のブラウザ"
+            }
+        };
+        self.toast(
+            format!(
+                "🎤 {browser} で音声入力ページを開きました — これから先はそちらのマイクが 🎤 です\
+                 (認識テキストは入力欄に入るだけ。送信は自分で Enter)"
+            ),
+            true,
+        );
     }
 
     /// 録音を止める。認識プロセスは最後の確定テキストを返してから終了するので、
@@ -5987,6 +6109,7 @@ impl ZaivernApp {
                     "close_tab" => Some(Cmd::CloseTab),
                     "terminal" => Some(Cmd::ToggleTerminal),
                     "sidebar" => Some(Cmd::ToggleSidebar),
+                    "git" => Some(Cmd::OpenGitPanel),
                     "cockpit" => Some(Cmd::ToggleCockpit),
                     "font_inc" => Some(Cmd::FontInc),
                     "font_dec" => Some(Cmd::FontDec),
@@ -6898,6 +7021,42 @@ fn workspace_title(roots: &[PathBuf]) -> String {
     format!("Zaivern Code — {}", roots_label(roots))
 }
 
+/// `.git` がファイルのとき、その中身 (`gitdir: <path>`) から実際の git ディレクトリを取り出す。
+/// 相対パスは workspace 基準で解決する。
+#[allow(dead_code)]
+fn parse_gitdir_file(contents: &str, workspace: &Path) -> Option<PathBuf> {
+    let raw = contents
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(raw);
+    Some(if p.is_absolute() { p } else { workspace.join(p) })
+}
+
+/// ブランチ表示のために読むべき HEAD のパス。
+/// 通常のリポジトリは `<ws>/.git/HEAD` だが、linked worktree では `.git` が
+/// ディレクトリではなくファイルなので、それが指す git ディレクトリ配下の HEAD を読む。
+///
+/// 現在のブランチ表示は git.rs (`git branch --show-current`) 経由なので、
+/// この関数は呼ばれていない。linked worktree の扱いを自前で解決する必要が出た
+/// ときのために、テスト付きで残してある。
+#[allow(dead_code)]
+fn git_head_path(workspace: &Path) -> PathBuf {
+    let dot_git = workspace.join(".git");
+    if dot_git.is_file() {
+        if let Some(dir) = std::fs::read_to_string(&dot_git)
+            .ok()
+            .and_then(|s| parse_gitdir_file(&s, workspace))
+        {
+            return dir.join("HEAD");
+        }
+    }
+    dot_git.join("HEAD")
+}
+
 /// ペット画像を読み込み egui テクスチャ化する。長辺 256px に縮小する。
 /// URL やファイルを OS の既定アプリ (ブラウザ等) で開く。
 /// 入力欄に書いてある `old` を `new` にするための編集を求める。
@@ -6950,6 +7109,43 @@ fn strip_trailing_keyword(text: &str, keyword: &str) -> Option<String> {
     });
     let rest = trimmed.strip_suffix(keyword)?;
     Some(rest.trim_end().to_string())
+}
+
+/// Chrome / Chromium の実行ファイルを探す。
+///
+/// Web Speech API は Chrome が一番素直に動く。Edge の `webkitSpeechRecognition` は
+/// v134 の退行以来あてにならないので、Chrome が居るならそちらを優先する。
+fn chrome_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    const CANDIDATES: &[&str] = &[
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+    #[cfg(target_os = "windows")]
+    const CANDIDATES: &[&str] = &[
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    const CANDIDATES: &[&str] = &[
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+    ];
+    // Windows は管理者権限なしで入れると %LOCALAPPDATA% 側に入る。
+    // こちらの方がむしろ普通なので、固定パスより先に見る。
+    #[cfg(target_os = "windows")]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let p = PathBuf::from(local).join(r"Google\Chrome\Application\chrome.exe");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
 }
 
 fn open_external(target: &str) {
@@ -7185,6 +7381,37 @@ mod tests {
             workspace_title(&[PathBuf::from("/x/alpha")]),
             "Zaivern Code — alpha"
         );
+    }
+
+    #[test]
+    fn parses_gitdir_from_worktree_dot_git_file() {
+        let ws = Path::new("/repo/.claude/worktrees/feature");
+
+        // linked worktree の `.git` ファイル (git が書く形式は絶対パス + 末尾改行)
+        let abs = "gitdir: /repo/.git/worktrees/feature\n";
+        assert_eq!(
+            parse_gitdir_file(abs, ws),
+            Some(PathBuf::from("/repo/.git/worktrees/feature"))
+        );
+
+        // 相対パスは workspace 基準で解決する
+        let rel = "gitdir: ../../../.git/worktrees/feature\n";
+        assert_eq!(
+            parse_gitdir_file(rel, ws),
+            Some(ws.join("../../../.git/worktrees/feature"))
+        );
+
+        // gitdir 行が無い / 空なら None (通常の .git ディレクトリへフォールバックする)
+        assert_eq!(parse_gitdir_file("ref: refs/heads/main\n", ws), None);
+        assert_eq!(parse_gitdir_file("gitdir:   \n", ws), None);
+        assert_eq!(parse_gitdir_file("", ws), None);
+    }
+
+    #[test]
+    fn git_head_path_falls_back_to_dot_git_dir() {
+        // `.git` が存在しない (=ファイルでない) 場合は従来どおり <ws>/.git/HEAD
+        let ws = Path::new("/no/such/workspace");
+        assert_eq!(git_head_path(ws), ws.join(".git").join("HEAD"));
     }
 
     #[test]

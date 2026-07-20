@@ -17,6 +17,8 @@ pub enum Cmd {
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替
     ToggleMdPreview,
     ToggleSidebar,
+    /// サイドバーを Git タブで開く
+    OpenGitPanel,
     OpenFind,
     NewAgent(usize),
     FocusAgent(usize),

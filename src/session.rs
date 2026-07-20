@@ -23,6 +23,9 @@ pub struct SessionData {
     /// ワークスペースのルート一覧(絶対パス)。再起動時に全フォルダを復元する。
     /// 旧形式(単一ルート)のファイルでは空 — その場合は起動時のルートを使う。
     pub roots: Vec<String>,
+    /// サイドバーのタブ ("files"|"agents"|"plugins"|"git")。
+    /// 旧バージョンのセッションファイルには無いので空文字なら既定タブ扱い。
+    pub sidebar_tab: String,
 }
 
 /// `~/.zaivern/sessions/<ルート集合ハッシュhex>.toml` から読む。無ければ None。
@@ -135,6 +138,7 @@ mod tests {
             sidebar_open: true,
             panel_open: false,
             roots: Vec::new(),
+            ..Default::default()
         };
 
         save_to(&dir, std::slice::from_ref(&workspace), &data);
@@ -158,6 +162,7 @@ mod tests {
             sidebar_open: false,
             panel_open: true,
             roots: Vec::new(),
+            ..Default::default()
         };
 
         save_to(&dir, std::slice::from_ref(&workspace), &data);
@@ -186,6 +191,7 @@ mod tests {
             sidebar_open: true,
             panel_open: true,
             roots: Vec::new(),
+            ..Default::default()
         };
 
         save_to(&dir, std::slice::from_ref(&workspace), &data);
@@ -206,6 +212,30 @@ mod tests {
         // 保存先ディレクトリ自体が無い場合も None
         let ghost_dir = dir.join("no-such-dir");
         assert!(load_from(&ghost_dir, std::slice::from_ref(&workspace)).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sidebar_tab_roundtrips_and_old_file_without_it_still_loads() {
+        let dir = unique_temp_dir("zaivern-session-test", "sidebar-tab");
+        let workspace = dir.join("ws-tab");
+
+        let data = SessionData {
+            sidebar_tab: "git".into(),
+            ..Default::default()
+        };
+        let roots = std::slice::from_ref(&workspace);
+        save_to(&dir, roots, &data);
+        let loaded = load_from(&dir, roots).expect("session should load");
+        assert_eq!(loaded.sidebar_tab, "git");
+
+        // 旧バージョンのセッション (sidebar_tab フィールド無し) も読めること
+        let old = "open_files = []\nsidebar_open = true\npanel_open = false\n";
+        std::fs::write(session_file_in(&dir, roots), old).expect("write old session");
+        let loaded = load_from(&dir, roots).expect("old session should still load");
+        assert_eq!(loaded.sidebar_tab, "");
+        assert!(loaded.sidebar_open);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -265,6 +295,7 @@ mod tests {
                 a.to_string_lossy().into_owned(),
                 b.to_string_lossy().into_owned(),
             ],
+            ..Default::default()
         };
 
         save_to(&dir, &[a.clone(), b.clone()], &data);
@@ -292,6 +323,7 @@ mod tests {
             sidebar_open: true,
             panel_open: false,
             roots: Vec::new(),
+            ..Default::default()
         };
         std::fs::create_dir_all(&dir).ok();
         std::fs::write(
@@ -322,6 +354,7 @@ mod tests {
             sidebar_open: false,
             panel_open: false,
             roots: Vec::new(),
+            ..Default::default()
         };
         save_to(&dir, std::slice::from_ref(&workspace), &first);
 
@@ -331,6 +364,7 @@ mod tests {
             sidebar_open: true,
             panel_open: true,
             roots: Vec::new(),
+            ..Default::default()
         };
         save_to(&dir, std::slice::from_ref(&workspace), &second);
 

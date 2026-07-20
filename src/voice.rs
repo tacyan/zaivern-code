@@ -9,7 +9,14 @@
 //!   埋め込んであり、初回だけ `swiftc` で `~/.zaivern/voice/` にビルドされる。
 //!   Info.plist をバイナリに埋め込むことで、マイク/音声認識の許可ダイアログが
 //!   Zaivern 名義で出るようにしている。
-//! - `command`: 任意の外部コマンド (Windows/Linux や自前エンジン用)。
+//! - `powershell`: Windows 標準の System.Speech (オフラインのディクテーション)。
+//!   ソースはこのファイルに埋め込んであり、`~/.zaivern/voice/` へ展開して
+//!   `powershell.exe` (5.1) で走らせる。PowerShell 7 (pwsh) には System.Speech が
+//!   無いので必ず `powershell.exe` を使うこと。
+//! - `browser`: スマホリモートの `/voice` ページをブラウザで開き、Web Speech API に
+//!   認識させる。子プロセスを持たないので `Session` にはならず、`App` 側で直接
+//!   ブラウザを開く (`start` を呼んではいけない)。どの OS でも使える最後の砦。
+//! - `command`: 任意の外部コマンド (自前エンジン用)。
 //!
 //! ## 子プロセスとの取り決め (両エンジン共通)
 //! 標準出力へ 1 行 1 イベント:
@@ -24,8 +31,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 
 use eframe::egui;
+
+/// Windows: GUI アプリから子プロセスを起こすときにコンソール窓を出さないフラグ。
+/// (src/sound.rs と同じ値)
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 認識テキストの届け先。
 ///
@@ -115,16 +128,116 @@ impl Drop for Session {
     }
 }
 
-/// 設定から実際に使うエンジン名を決める ("mac" | "command" | "off")。
-pub fn resolve_engine(engine: &str) -> &'static str {
+/// 設定から実際に使うエンジン名を決める。
+/// 返るのは "mac" | "powershell" | "browser" | "command" | "off" のどれか。
+///
+/// シェルを起動する認識器の探索が入るので、描画のたびに呼ばないこと
+/// (探索結果は [`powershell_recognizers`] が一度だけキャッシュする)。
+pub fn resolve_engine(engine: &str, lang: &str, command: &str) -> &'static str {
+    // auto 以外なら探索は不要 — 無駄に powershell.exe を起こさない
+    let ps_ok = if engine == "mac" || engine == "command" || engine == "powershell"
+        || engine == "browser" || engine == "off" || !command.trim().is_empty()
+    {
+        false
+    } else {
+        recognizer_matches(powershell_recognizers(), lang)
+    };
+    resolve_engine_core(engine, std::env::consts::OS, ps_ok, command)
+}
+
+/// [`resolve_engine`] の純粋な中身。OS と「Windows 側に認識器があるか」を
+/// 引数で受け取るので、どの OS 上でも全パターンをテストできる。
+///
+/// auto の優先順位は上から:
+///   1. macOS → 内蔵の Swift ヘルパー
+///   2. voice_command が設定済み → その外部コマンド (旧来の逃げ道を残す)
+///   3. Windows で対応言語の認識器あり → PowerShell
+///   4. それ以外 → ブラウザの /voice ページ
+fn resolve_engine_core(engine: &str, os: &str, ps_ok: bool, command: &str) -> &'static str {
     match engine {
         "mac" => "mac",
         "command" => "command",
+        "powershell" => "powershell",
+        "browser" => "browser",
         "off" => "off",
-        // auto: macOS は内蔵、その他は外部コマンド
-        _ if cfg!(target_os = "macos") => "mac",
-        _ => "command",
+        // auto
+        _ if os == "macos" => "mac",
+        _ if !command.trim().is_empty() => "command",
+        _ if os == "windows" && ps_ok => "powershell",
+        _ => "browser",
     }
+}
+
+/// 🎤 を押したとき実際に通る経路を、ツールチップ用の 1 行で返す。
+/// 探索結果はキャッシュ済みなので描画スレッドから呼んでよい。
+pub fn route_hint(engine: &str, lang: &str, command: &str) -> &'static str {
+    match resolve_engine(engine, lang, command) {
+        "mac" => "この PC では macOS 内蔵の音声認識を使います",
+        "powershell" => "この PC では Windows 標準の音声認識を使います",
+        "command" => "この PC では config.toml の voice_command を使います",
+        "browser" => "この PC ではブラウザの音声入力ページが開きます (そちらのマイクで話します)",
+        _ => "音声入力は無効に設定されています",
+    }
+}
+
+/// Windows にインストール済みの音声認識エンジンのカルチャ名一覧。
+/// `powershell.exe` を起こすので、`OnceLock` で 1 回だけ調べて使い回す。
+/// Windows 以外では常に空。
+pub fn powershell_recognizers() -> &'static [String] {
+    static CACHE: OnceLock<Vec<String>> = OnceLock::new();
+    CACHE.get_or_init(probe_powershell_recognizers)
+}
+
+fn probe_powershell_recognizers() -> Vec<String> {
+    if !cfg!(target_os = "windows") {
+        return Vec::new();
+    }
+    let mut c = Command::new("powershell.exe");
+    c.args([
+        "-NoProfile",
+        "-Command",
+        "Add-Type -AssemblyName System.Speech; \
+         [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers() \
+         | % { $_.Culture.Name }",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    let Ok(out) = c.output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 一覧の中に `lang` を扱える認識器があるか。
+/// 完全一致が無ければ言語部分 (ja-JP の "ja") だけで拾う — 埋め込みスクリプト側の
+/// 選び方と揃えてある。
+fn recognizer_matches(list: &[String], lang: &str) -> bool {
+    let lang = lang.trim();
+    if lang.is_empty() {
+        return false;
+    }
+    let primary = |s: &str| s.split('-').next().unwrap_or("").to_ascii_lowercase();
+    let want = primary(lang);
+    list.iter()
+        .any(|c| c.eq_ignore_ascii_case(lang) || primary(c) == want)
+}
+
+/// macOS 以外で `voice_engine = "mac"` が選ばれたときの案内。
+/// swiftc / xcode-select の話をしても意味が無いので、OS 名と代替手段だけを出す。
+fn mac_only_error(os: &str) -> String {
+    format!(
+        "voice_engine = \"mac\" は macOS 専用です (この PC は {os})。\
+         config.toml の voice_engine を \"auto\" に戻すと、{os} に合った方法\
+         (Windows なら標準の音声認識、それ以外はブラウザの音声入力ページ) が使われます"
+    )
 }
 
 /// 認識を開始する。`ctx` は結果が届いたとき UI を起こすために使う。
@@ -134,12 +247,38 @@ pub fn start(
     command: &str,
     ctx: &egui::Context,
 ) -> Result<Session, String> {
-    let mut cmd = match resolve_engine(engine) {
+    let mut cmd = match resolve_engine(engine, lang, command) {
         "off" => return Err("音声入力は無効に設定されています (🎤 メニューで変更できます)".into()),
+        "browser" => {
+            // ブラウザ経路は子プロセスを持たない。App 側が /voice を開くので
+            // ここまで来るのは呼び出しミス。
+            return Err("ブラウザの音声入力ページを使う設定です (start は呼ばれません)".into());
+        }
         "mac" => {
+            // mac エンジンは macOS 専用。他の OS で swiftc を探しに行っても
+            // 意味不明なエラーになるだけなので、ここで打ち切る。
+            if !cfg!(target_os = "macos") {
+                return Err(mac_only_error(std::env::consts::OS));
+            }
             let bin = ensure_mac_helper()?;
             let mut c = Command::new(bin);
             c.arg(lang);
+            c
+        }
+        "powershell" => {
+            let script = ensure_powershell_helper()?;
+            let mut c = Command::new("powershell.exe");
+            c.arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(&script)
+                .arg(lang);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(CREATE_NO_WINDOW);
+            }
             c
         }
         _ => {
@@ -309,6 +448,107 @@ pub fn ensure_mac_helper() -> Result<PathBuf, String> {
     let _ = std::fs::write(&stamp, want);
     Ok(bin)
 }
+
+// ─── Windows 内蔵ヘルパー ───────────────────────────────────────────
+
+/// 埋め込みの PowerShell スクリプトを `~/.zaivern/voice/` へ展開してパスを返す。
+/// 中身が変わったときだけ書き直す (mac ヘルパーと同じ stamp 方式)。
+pub fn ensure_powershell_helper() -> Result<PathBuf, String> {
+    let dir = voice_dir();
+    let src = dir.join("zv-listen.ps1");
+    let stamp = dir.join("zv-listen.ps1.stamp");
+    let want = format!("{:x}", fnv1a(HELPER_PS1.as_bytes()));
+
+    if src.exists() && std::fs::read_to_string(&stamp).ok().as_deref() == Some(want.as_str()) {
+        return Ok(src);
+    }
+
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+    // PowerShell 5.1 は BOM が無いと UTF-8 の .ps1 を誤読する (日本語が化ける)
+    let mut bytes = String::from("\u{feff}");
+    bytes.push_str(HELPER_PS1);
+    std::fs::write(&src, bytes).map_err(|e| format!("音声スクリプトを書けません: {e}"))?;
+    let _ = std::fs::write(&stamp, want);
+    Ok(src)
+}
+
+/// System.Speech を使う常駐ヘルパー。`~/.zaivern/voice/zv-listen.ps1` へ展開される。
+///
+/// 認識イベントは別スレッドから飛んでくるが、PowerShell の
+/// `Register-ObjectEvent -Action` はパイプラインが空くまで動かない (stdin 待ちで
+/// 止まると発火しない) ので、購読と stdin 待ちはまとめて C# 側に持たせている。
+const HELPER_PS1: &str = r#"# zv-listen.ps1 — Zaivern Code 内蔵の音声認識ヘルパー (自動生成)
+# powershell.exe (5.1) 専用。pwsh (PowerShell 7) には System.Speech がありません。
+param([string]$Lang = "ja-JP")
+$ErrorActionPreference = "Stop"
+# Zaivern 側は UTF-8 の行として読むので、既定の OEM コードページに落とさない
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+try {
+    Add-Type -AssemblyName System.Speech
+} catch {
+    [Console]::Out.WriteLine("E Windows の音声認識 (System.Speech) を読み込めません: $($_.Exception.Message)")
+    exit 1
+}
+Add-Type -ReferencedAssemblies System.Speech -TypeDefinition @"
+using System;
+using System.Speech.Recognition;
+
+public class ZvListen {
+    static readonly object gate = new object();
+
+    // 1 行 1 イベント: R / P <text> / F <text> / E <msg>
+    static void Emit(string tag, string body) {
+        lock (gate) {
+            body = (body ?? "").Replace("\r", " ").Replace("\n", " ");
+            Console.Out.WriteLine(body.Length == 0 ? tag : tag + " " + body);
+            Console.Out.Flush();
+        }
+    }
+
+    // 完全一致を優先し、無ければ言語部分 (ja-JP の ja) で拾う
+    static RecognizerInfo Pick(string lang) {
+        RecognizerInfo loose = null;
+        string primary = lang.Split('-')[0];
+        foreach (RecognizerInfo ri in SpeechRecognitionEngine.InstalledRecognizers()) {
+            if (string.Equals(ri.Culture.Name, lang, StringComparison.OrdinalIgnoreCase)) return ri;
+            if (loose == null && string.Equals(ri.Culture.TwoLetterISOLanguageName, primary, StringComparison.OrdinalIgnoreCase)) loose = ri;
+        }
+        return loose;
+    }
+
+    public static int Run(string lang) {
+        RecognizerInfo info = Pick(lang);
+        if (info == null) {
+            Emit("E", "この言語の音声認識が Windows にありません: " + lang + " (設定 > 時刻と言語 > 音声認識 で言語を追加してください)");
+            return 1;
+        }
+        SpeechRecognitionEngine rec = new SpeechRecognitionEngine(info);
+        // ディクテーション文法 = 決まり文句ではなく自由な話し言葉を拾う
+        rec.LoadGrammar(new DictationGrammar());
+        rec.SpeechHypothesized += delegate(object s, SpeechHypothesizedEventArgs e) { Emit("P", e.Result.Text); };
+        rec.SpeechRecognized += delegate(object s, SpeechRecognizedEventArgs e) { Emit("F", e.Result.Text); };
+        try {
+            rec.SetInputToDefaultAudioDevice();
+        } catch (Exception ex) {
+            Emit("E", "マイクを開けません: " + ex.Message + " (設定 > プライバシー > マイク を確認してください)");
+            return 1;
+        }
+        // Multiple = 1 文で終わらず、止めるまで認識し続ける
+        rec.RecognizeAsync(RecognizeMode.Multiple);
+        Emit("R", "");
+        // 停止は stdin の "q" + 改行。パイプが閉じたときも止める。
+        string line;
+        while ((line = Console.In.ReadLine()) != null) {
+            if (line.Trim() == "q") break;
+        }
+        try { rec.RecognizeAsyncStop(); } catch { }
+        try { rec.Dispose(); } catch { }
+        return 0;
+    }
+}
+"@
+exit [ZvListen]::Run($Lang)
+"#;
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -643,11 +883,92 @@ mod tests {
     }
 
     #[test]
-    fn auto_engine_depends_on_os() {
-        let want = if cfg!(target_os = "macos") { "mac" } else { "command" };
-        assert_eq!(resolve_engine("auto"), want);
-        assert_eq!(resolve_engine("command"), "command");
-        assert_eq!(resolve_engine("off"), "off");
+    fn explicit_engine_wins_on_every_os() {
+        // 明示指定は OS も探索結果も見ない
+        for os in ["macos", "windows", "linux"] {
+            for ps in [true, false] {
+                for cmd in ["", "whisper --stdout"] {
+                    for name in ["mac", "command", "powershell", "browser", "off"] {
+                        assert_eq!(resolve_engine_core(name, os, ps, cmd), name);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_engine_matrix() {
+        // macOS は探索結果によらず内蔵 (voice_command があっても内蔵が勝つ)
+        assert_eq!(resolve_engine_core("auto", "macos", false, ""), "mac");
+        assert_eq!(resolve_engine_core("auto", "macos", true, ""), "mac");
+        assert_eq!(resolve_engine_core("auto", "macos", false, "whisper"), "mac");
+
+        // Windows: 認識器があれば PowerShell、無ければブラウザ
+        assert_eq!(resolve_engine_core("auto", "windows", true, ""), "powershell");
+        assert_eq!(resolve_engine_core("auto", "windows", false, ""), "browser");
+
+        // Linux/その他は常にブラウザ (認識器の有無は関係ない)
+        assert_eq!(resolve_engine_core("auto", "linux", false, ""), "browser");
+        assert_eq!(resolve_engine_core("auto", "linux", true, ""), "browser");
+
+        // voice_command が入っていれば mac 以外では必ずそれが勝つ (旧来の逃げ道)
+        for os in ["windows", "linux"] {
+            for ps in [true, false] {
+                assert_eq!(resolve_engine_core("auto", os, ps, "whisper --stdout"), "command");
+                // 空白だけは「未設定」とみなす
+                assert_ne!(resolve_engine_core("auto", os, ps, "   "), "command");
+            }
+        }
+    }
+
+    #[test]
+    fn recognizer_lookup_falls_back_to_language() {
+        let list = vec!["en-US".to_string(), "ja-JP".to_string()];
+        assert!(recognizer_matches(&list, "ja-JP"));
+        assert!(recognizer_matches(&list, "JA-jp")); // 大小無視
+        assert!(recognizer_matches(&list, "ja")); // 言語だけでも拾う
+        assert!(recognizer_matches(&list, "en-GB")); // 地域違いは言語で拾う
+        assert!(!recognizer_matches(&list, "fr-FR"));
+        assert!(!recognizer_matches(&list, ""));
+        assert!(!recognizer_matches(&[], "ja-JP"));
+    }
+
+    #[test]
+    fn mac_engine_is_rejected_off_macos() {
+        // macOS 以外で "mac" を選んだら swiftc の話ではなく、OS 名と代替手段を出すこと
+        for os in ["windows", "linux"] {
+            let err = mac_only_error(os);
+            assert!(err.contains("macOS 専用"), "{err}");
+            assert!(err.contains(os), "{err}");
+            assert!(err.contains("auto"), "{err}");
+            assert!(!err.contains("swiftc"), "{err}");
+            assert!(!err.contains("xcode-select"), "{err}");
+        }
+    }
+
+    #[test]
+    fn powershell_helper_speaks_the_line_protocol() {
+        // R / P / F / E を出し、stdin の "q" で止まること
+        assert!(HELPER_PS1.contains("Emit(\"R\", \"\")"));
+        assert!(HELPER_PS1.contains("Emit(\"P\", e.Result.Text)"));
+        assert!(HELPER_PS1.contains("Emit(\"F\", e.Result.Text)"));
+        assert!(HELPER_PS1.contains("Emit(\"E\""));
+        assert!(HELPER_PS1.contains("Console.In.ReadLine()"));
+        assert!(HELPER_PS1.contains("if (line.Trim() == \"q\") break;"));
+        assert!(HELPER_PS1.contains("RecognizeAsyncStop()"));
+    }
+
+    #[test]
+    fn powershell_helper_dictates_continuously() {
+        // 1 文で終わる実装への先祖返り検知
+        assert!(HELPER_PS1.contains("DictationGrammar"));
+        assert!(HELPER_PS1.contains("RecognizeMode.Multiple"));
+        assert!(HELPER_PS1.contains("SpeechHypothesized"));
+        assert!(HELPER_PS1.contains("SpeechRecognized"));
+        // 日本語が化けないよう UTF-8 で吐くこと
+        assert!(HELPER_PS1.contains("[Console]::OutputEncoding"));
+        // pwsh には System.Speech が無いので powershell.exe 前提であること
+        assert!(HELPER_PS1.contains("System.Speech"));
     }
 
     /// 埋め込み Swift が実際に swiftc を通ることを確認する。

@@ -11,6 +11,7 @@ mod editor_ops;
 mod file_tree;
 mod fuzzy;
 mod git;
+mod git_panel;
 mod github;
 mod highlight;
 mod html;
