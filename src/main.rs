@@ -22,6 +22,7 @@ mod lsp;
 mod markdown;
 mod notify;
 mod palette;
+mod panels;
 mod pet;
 mod pet_bubble;
 mod pet_variants;

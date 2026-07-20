@@ -28,9 +28,36 @@ pub enum ExternalEvent {
     Conflict { title: String },
 }
 
+/// タブの種類。
+///
+/// ファイル以外の中身 (PR 差分など) をタブとして開けるようにするための印。
+/// `Buffer` に持たせることで、タブの切り替え・クローズ・アクティブ管理は
+/// 既存の仕組みをそのまま使い回せる。
+///
+/// **`File` 以外は読み取り専用。** 保存 / LSP / git ガターは対象外
+/// (これらは `path` が `Some` であることを前提に動くため、`path: None` と
+/// `read_only()` の二重の防御で守る)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BufferKind {
+    /// 通常のファイル (または未保存の untitled)。
+    #[default]
+    File,
+    /// GitHub の Pull Request 差分ビュー。
+    PrDiff { number: u64 },
+}
+
+impl BufferKind {
+    /// このタブが読み取り専用か。
+    pub fn read_only(&self) -> bool {
+        !matches!(self, BufferKind::File)
+    }
+}
+
 pub struct Buffer {
     pub id: u64,
     pub path: Option<PathBuf>,
+    /// タブの種類 (既定は通常ファイル)。
+    pub kind: BufferKind,
     pub title: String,
     pub text: String,
     pub saved_hash: u64,
@@ -83,6 +110,7 @@ impl Editor {
         self.buffers.push(Buffer {
             id,
             path: None,
+            kind: BufferKind::File,
             title: format!("untitled-{}", self.untitled_count),
             text: String::new(),
             saved_hash: hash_str(""),
@@ -124,6 +152,7 @@ impl Editor {
         self.buffers.push(Buffer {
             id,
             path: Some(canon),
+            kind: BufferKind::File,
             title,
             saved_hash: hash_str(&text),
             text,
@@ -139,6 +168,41 @@ impl Editor {
 
     /// バッファをディスクの内容で読み直す。読み直したときだけ true。
     /// 未保存の編集があるバッファには触らない。読めない場合(削除等)も何もしない。
+    /// ファイルに紐づかないタブを開き、そのバッファ id を返す。
+    ///
+    /// 同じ `kind` のタブが既にあれば内容を差し替えて使い回す
+    /// (同じ PR を二度開いてもタブが増えない)。`path` は必ず `None` なので、
+    /// 保存 / LSP / git ガター / セッション復元はいずれもこのタブを素通りする。
+    pub fn open_virtual(&mut self, title: String, text: String, kind: BufferKind) -> u64 {
+        if let Some(i) = self.buffers.iter().position(|b| b.kind == kind) {
+            let b = &mut self.buffers[i];
+            b.title = title;
+            b.saved_hash = hash_str(&text);
+            b.text = text;
+            b.cache = None;
+            b.gutter = None;
+            self.active = Some(i);
+            return b.id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.buffers.push(Buffer {
+            id,
+            path: None,
+            kind,
+            title,
+            saved_hash: hash_str(&text),
+            text,
+            lang: "Diff".into(),
+            cache: None,
+            gutter: None,
+            disk_mtime: None,
+            conflict_notified: None,
+        });
+        self.active = Some(self.buffers.len() - 1);
+        id
+    }
+
     pub fn reload_from_disk(&mut self, i: usize) -> bool {
         let Some(b) = self.buffers.get_mut(i) else {
             return false;
