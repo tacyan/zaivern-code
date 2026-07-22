@@ -3832,7 +3832,16 @@ impl ZaivernApp {
                                         })
                                         .rounding(egui::Rounding::same(6.0))
                                         .inner_margin(egui::Margin::symmetric(8.0, 6.0));
-                                    let fr = frame.show(ui, |ui| {
+                                    // 行の余白クリックでフォーカスできるようにする。
+                                    // 後掛けの ui.interact は行内の ✕/⟳/🛡 ボタンへの
+                                    // クリックを奪う (ヒットテストは後登録が勝つ) ため、
+                                    // UiBuilder::sense で行の判定を先に登録する。
+                                    let fr = ui.scope_builder(
+                                        egui::UiBuilder::new()
+                                            .id_salt(("agent-row", i))
+                                            .sense(egui::Sense::click()),
+                                        |ui| {
+                                    frame.show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             let dot = if s.running() {
                                                 if s.attention {
@@ -3850,12 +3859,18 @@ impl ZaivernApp {
                                                 ""
                                             };
                                             let permission_hint = s.permission_switch_hint();
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{}{} {}",
-                                                    badge, s.icon, s.title
-                                                ))
-                                                .color(theme.text),
+                                            // 選択可能ラベルはクリックを吸ってしまい
+                                            // 行クリック (フォーカス) が効かなくなるので、
+                                            // タイトルは文字選択を切ってクリックを行へ通す
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(format!(
+                                                        "{}{} {}",
+                                                        badge, s.icon, s.title
+                                                    ))
+                                                    .color(theme.text),
+                                                )
+                                                .selectable(false),
                                             );
                                             if s.has_unread() && !active {
                                                 ui.label(
@@ -3903,11 +3918,9 @@ impl ZaivernApp {
                                             );
                                         });
                                     });
-                                    let resp = ui.interact(
-                                        fr.response.rect,
-                                        egui::Id::new(("agent-row", i)),
-                                        egui::Sense::click(),
+                                        },
                                     );
+                                    let resp = fr.response;
                                     if resp.clicked() {
                                         focus = Some(i);
                                     }
@@ -5125,11 +5138,23 @@ impl ZaivernApp {
                                     }
                                     let active = i == self.agents.active;
                                     let stroke = if active {
-                                        egui::Stroke::new(1.5_f32, theme.accent)
+                                        egui::Stroke::new(2.0_f32, theme.accent)
                                     } else {
                                         egui::Stroke::new(1.0_f32, theme.border)
                                     };
-                                    let cell = egui::Frame::none()
+                                    // セル内の余白クリックでも選択できるようにする。
+                                    // egui のヒットテストは同一レイヤーでは「後に登録
+                                    // したウィジェット」が勝つため、描画後に全面
+                                    // ui.interact を掛けるとセル内のボタンやミニ
+                                    // ターミナルへのクリックをすべて奪ってしまう。
+                                    // UiBuilder::sense はコンテナの判定を子より先に
+                                    // 登録するので、余白クリックだけを拾える。
+                                    let cell = ui.scope_builder(
+                                        egui::UiBuilder::new()
+                                            .id_salt(("cockpit-cell-select", i))
+                                            .sense(egui::Sense::click()),
+                                        |ui| {
+                                    egui::Frame::none()
                                         .fill(theme.panel_alt)
                                         .stroke(stroke)
                                         .rounding(egui::Rounding::same(8.0))
@@ -5267,16 +5292,17 @@ impl ZaivernApp {
                                             }
                                             });
                                         });
-                                    // ヘッダー等、セル内の余白クリックでも選択できる
-                                    // ようにする。ボタンやミニターミナルはより小さい
-                                    // ウィジェットとしてヒットテストで優先されるため、
-                                    // この後掛けの interact が動作を奪うことはない。
-                                    let cell_resp = ui.interact(
-                                        cell.response.rect,
-                                        egui::Id::new(("cockpit-cell-select", i)),
-                                        egui::Sense::click(),
+                                        },
                                     );
-                                    if cell_resp.clicked() {
+                                    // セル内のどこを押しても (タイトル文字・各ボタン・
+                                    // ミニターミナル含め) 紫枠のアクティブ選択が追従する。
+                                    // contains_pointer は子ウィジェットに覆われていても
+                                    // true になるだけでイベントは奪わないため、クリック
+                                    // 自体は各ボタン・ターミナルがそのまま処理できる。
+                                    if cell.response.clicked()
+                                        || (cell.response.contains_pointer()
+                                            && ui.input(|i| i.pointer.primary_pressed()))
+                                    {
                                         select = Some(i);
                                     }
                                 }
@@ -10159,6 +10185,222 @@ mod super_agent_tests {
         sv.tick(&[snap(1), snap(2)], Approval::Ask);
         assert!(sv.state_of(1).is_some(), "監視役自身の状態も見立てられるべき");
         assert!(sv.state_of(2).is_some());
+    }
+
+    /// Cockpit セル / Agents サイドバー行と同じ「クリックで選択できるコンテナ +
+    /// 内側のボタン」構造で、ボタンへのクリックがコンテナに奪われないことを保証する。
+    ///
+    /// egui のヒットテストは同一レイヤーでは「後に登録したウィジェット」が勝つため、
+    /// 描画後にコンテナ全面へ ui.interact を掛けると内側のボタン・ミニターミナルが
+    /// 一切クリックできなくなる (v0.3.0 で実際に起きたバグ)。正しくは
+    /// UiBuilder::sense + scope_builder でコンテナの判定を子より先に登録する。
+    /// 再現テスト: エージェント (セル) が複数あるとき、別のセルのターミナルを
+    /// クリックしたらアクティブ (紫枠) がそのセルへ移動すること。
+    #[test]
+    fn cockpit_purple_moves_to_clicked_cell_with_multiple_agents() {
+        use egui::{pos2, vec2, PointerButton, Pos2, Rect};
+
+        let ctx = egui::Context::default();
+        let mut active: usize = 0;
+
+        let click = |at: Pos2, pressed: bool| -> Vec<egui::Event> {
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+
+        let mut draw = |active: &mut usize, events: Vec<egui::Event>| -> Vec<Rect> {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(980.0, 420.0))),
+                events,
+                ..Default::default()
+            };
+            let mut term_rects = vec![Rect::NOTHING; 2];
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut select: Option<usize> = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("cockpit-grid")
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for i in 0..2usize {
+                                    let is_active = i == *active;
+                                    let stroke = if is_active {
+                                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(160, 100, 250))
+                                    } else {
+                                        egui::Stroke::new(1.0_f32, egui::Color32::GRAY)
+                                    };
+                                    let cell = ui.scope_builder(
+                                        egui::UiBuilder::new()
+                                            .id_salt(("cockpit-cell-select", i))
+                                            .sense(egui::Sense::click()),
+                                        |ui| {
+                                            egui::Frame::none()
+                                                .stroke(stroke)
+                                                .inner_margin(egui::Margin::same(8.0))
+                                                .show(ui, |ui| {
+                                                    ui.vertical(|ui| {
+                                                        ui.set_width(430.0);
+                                                        ui.set_height(160.0);
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(format!("● agent {i}"));
+                                                            let _ = ui.small_button("🎤");
+                                                        });
+                                                        // ミニターミナル相当: 残り全域 click_and_drag
+                                                        let avail = ui.available_size();
+                                                        let (rect, resp) = ui.allocate_exact_size(
+                                                            avail,
+                                                            egui::Sense::click_and_drag(),
+                                                        );
+                                                        if resp.clicked() || resp.drag_started() {
+                                                            resp.request_focus();
+                                                        }
+                                                        if resp.clicked()
+                                                            || resp.drag_started()
+                                                            || resp.gained_focus()
+                                                        {
+                                                            select = Some(i);
+                                                        }
+                                                        rect
+                                                    })
+                                                    .inner
+                                                })
+                                                .inner
+                                        },
+                                    );
+                                    term_rects[i] = cell.inner;
+                                    if cell.response.clicked()
+                                        || (cell.response.contains_pointer()
+                                            && ui.input(|inp| inp.pointer.primary_pressed()))
+                                    {
+                                        select = Some(i);
+                                    }
+                                }
+                            });
+                        });
+                    if let Some(i) = select {
+                        *active = i;
+                    }
+                });
+            });
+            term_rects
+        };
+
+        let rects = draw(&mut active, vec![]);
+        assert!(rects[0] != rects[1] && rects[1].width() > 50.0, "前提: セルが2つ並ぶ");
+
+        // 2 つ目のセルのターミナルをクリック → 紫が 1 へ移動
+        let at = rects[1].center();
+        let _ = draw(&mut active, click(at, true));
+        let _ = draw(&mut active, click(at, false));
+        assert_eq!(active, 1, "別セルのターミナルをクリックしたら紫が移動する");
+
+        // 戻す: 1 つ目のセルのターミナルをクリック → 紫が 0 へ移動
+        let at = rects[0].center();
+        let _ = draw(&mut active, click(at, true));
+        let _ = draw(&mut active, click(at, false));
+        assert_eq!(active, 0, "元のセルへも移動できる");
+    }
+
+    #[test]
+    fn cockpit_cell_container_does_not_steal_inner_clicks() {
+        use egui::{pos2, vec2, PointerButton, Pos2, Rect};
+
+        let ctx = egui::Context::default();
+
+        // 1 フレーム描いて、コンテナとボタンの実座標を egui に登録させる。
+        // クリック判定は「前フレームのウィジェット矩形」に対して行われるため、
+        // 押す→離すをそれぞれ別フレームで流す。
+        // 戻り値: (ボタンが押された, セル選択が発火した, ボタン/タイトル/セルの矩形)
+        let draw = |events: Vec<egui::Event>| -> (bool, bool, Rect, Rect, Rect) {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = (false, false, Rect::NOTHING, Rect::NOTHING, Rect::NOTHING);
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let cell = ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .id_salt("test-cell")
+                            .sense(egui::Sense::click()),
+                        |ui| {
+                            egui::Frame::none()
+                                .inner_margin(egui::Margin::same(8.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_size(vec2(300.0, 120.0));
+                                    // 実セルと同じく、文字選択できるタイトルラベル
+                                    // (クリックを吸う) も置く
+                                    let title = ui.label("🤖 agent-title");
+                                    (ui.button("🎤"), title)
+                                })
+                                .inner
+                        },
+                    );
+                    let (btn, title) = cell.inner;
+                    // 本番 cockpit_ui と同じ選択条件
+                    let selected = cell.response.clicked()
+                        || (cell.response.contains_pointer()
+                            && ui.input(|i| i.pointer.primary_pressed()));
+                    out = (btn.clicked(), selected, btn.rect, title.rect, cell.response.rect);
+                });
+            });
+            out
+        };
+
+        let click = |at: Pos2, pressed: bool| -> Vec<egui::Event> {
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+
+        let (_, _, btn_rect, title_rect, cell_rect) = draw(vec![]);
+        assert!(
+            cell_rect.contains_rect(btn_rect) && cell_rect.contains_rect(title_rect),
+            "前提: ボタンとタイトルはコンテナの内側にある"
+        );
+
+        // ボタンの中心をクリック → ボタンが押され、押した時点で選択も追従する
+        let (_, sel_on_press, ..) = draw(click(btn_rect.center(), true));
+        let (btn_clicked, ..) = draw(click(btn_rect.center(), false));
+        assert!(
+            btn_clicked,
+            "コンテナ (セル選択) が内側のボタンのクリックを奪ってはいけない"
+        );
+        assert!(sel_on_press, "ボタンを押した時点で紫枠の選択が追従する");
+
+        // タイトル文字 (文字選択がクリックを吸うラベル) を押しても選択が追従する
+        let (_, sel_on_press, ..) = draw(click(title_rect.center(), true));
+        let _ = draw(click(title_rect.center(), false));
+        assert!(
+            sel_on_press,
+            "タイトル文字を押してもセル選択 (紫枠) が追従する"
+        );
+
+        // ボタンの外 (コンテナの余白) をクリックしても選択できる
+        let empty = pos2(cell_rect.max.x - 12.0, cell_rect.max.y - 12.0);
+        assert!(cell_rect.contains(empty) && !btn_rect.contains(empty));
+        let (_, sel_on_press, ..) = draw(click(empty, true));
+        let (btn_clicked, sel_on_release, ..) = draw(click(empty, false));
+        assert!(
+            sel_on_press && sel_on_release,
+            "余白クリックでセルを選択できる"
+        );
+        assert!(!btn_clicked);
     }
 }
 
