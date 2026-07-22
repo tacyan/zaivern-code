@@ -48,6 +48,9 @@ pub struct Config {
     pub voice_command: String,
     /// 話すと自動で Enter まで送るキーワード (空文字 = 常に手動 Enter)
     pub voice_keyword: String,
+    /// 外部通知の Webhook URL (空 = 無効)。承認待ち・終了・レート制限を
+    /// curl で POST する。ntfy トピック URL / Slack / Discord の Incoming Webhook に対応。
+    pub webhook_url: String,
     pub agents: Vec<AgentPreset>,
     /// キーバインドの上書き: action名 → "cmd+shift+p" 形式 (src/keybinds.rs 参照)
     pub keybindings: HashMap<String, String>,
@@ -174,6 +177,7 @@ impl Default for Config {
             voice_lang: "ja-JP".into(),
             voice_command: String::new(),
             voice_keyword: String::new(),
+            webhook_url: String::new(),
             agents: default_agents(),
             keybindings: HashMap::new(),
             supervisor: crate::supervisor::SupervisorConfig::default(),
@@ -340,6 +344,14 @@ approval_mode = "ask"
 # デスクトップペット (🐾) の表示
 show_pet = true
 
+# ── 外出先への通知 (Webhook) ──────────────
+# 承認待ち・終了・レート制限のイベントを外部サービスへ POST します (curl 使用)。
+# ntfy ならスマホアプリを入れてトピックを購読するだけでプッシュ通知になります。
+# Slack / Discord の Incoming Webhook URL はドメインから自動判別して JSON で送ります。
+# webhook_url = "https://ntfy.sh/あなたのトピック名"
+# webhook_url = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+# webhook_url = "https://discord.com/api/webhooks/XXX/YYY"
+
 # ── ペットの好み設定 ──────────────
 # pet_variant = "blocky"   # 見た目: "blocky" | "crab" | "cat" | "cloud"
 # pet_scale = 1.0          # 大きさ: 0.75=小 / 1.0=中 / 1.4=大
@@ -424,6 +436,21 @@ command = ""
 # icon = "💡"
 # command = "claude --model claude-opus-4-8"
 # env = { MAX_THINKING_TOKENS = "31999" }
+
+# ── アカウント/プロファイル切替 ──────────────
+# env に設定ディレクトリを指定すると、同じ CLI を別アカウント (別サブスク) で
+# 並列起動できます。片方の制限に当たっても、もう片方はそのまま走り続けます。
+# [[agents]]
+# name = "Claude (仕事用アカウント)"
+# icon = "🏢"
+# command = "claude"
+# env = { CLAUDE_CONFIG_DIR = "~/.claude-work" }
+#
+# [[agents]]
+# name = "Codex (サブ垢)"
+# icon = "🅾"
+# command = "codex"
+# env = { CODEX_HOME = "~/.codex-alt" }
 
 # [[agents]]
 # name = "Gemini CLI"

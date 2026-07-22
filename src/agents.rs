@@ -13,6 +13,8 @@ pub enum SessionEvent {
     AutoApproved(String, &'static str),
     /// (title, exit code) — セッションが終了した
     Exited(String, u32),
+    /// (title, 警告行) — レート制限/使用上限の警告を新たに検知した
+    RateLimited(String, String),
 }
 
 /// 既定の承認モード (config.approval_mode に対応)。
@@ -675,8 +677,16 @@ pub fn merged_env(
         }
     }
     // プリセット優先: 後から入れて上書きする。
+    // 値の先頭 `~/` はホームへ展開する (env は $SHELL を経由せず
+    // CommandBuilder へ直接渡るため、シェルの ~ 展開が効かない。
+    // CLAUDE_CONFIG_DIR = "~/.claude-work" のようなパス指定を動かすため)。
     for (k, v) in preset_env {
-        out.insert(k.clone(), v.clone());
+        let v = if v.starts_with("~/") {
+            expand_home(v).to_string_lossy().into_owned()
+        } else {
+            v.clone()
+        };
+        out.insert(k.clone(), v);
     }
     out
 }
@@ -751,6 +761,7 @@ impl AgentManager {
 
         let id = self.next_id;
         self.next_id += 1;
+        let log_path = Some(crate::session::term_log_path(workspace, id, &title));
         let session = Session::spawn(
             id,
             SpawnSpec {
@@ -760,6 +771,7 @@ impl AgentManager {
                 command: apply_approval(&preset.command, approval),
                 cwd,
                 env: merged_env(&preset.command, approval, &preset.env),
+                log_path,
             },
             ctx.clone(),
         )?;
@@ -785,6 +797,8 @@ impl AgentManager {
                 command: old.command.clone(),
                 cwd: old.cwd.clone(),
                 env: old.env.clone(),
+                // 同じログへ追記する (ヘッダ行で起動の区切りが分かる)
+                log_path: old.log_path.clone(),
             },
             ctx.clone(),
         )?;
@@ -824,6 +838,9 @@ impl AgentManager {
                     }
                     Some(Attention::AutoReplied(desc)) => {
                         events.push(SessionEvent::AutoApproved(s.title.clone(), desc));
+                    }
+                    Some(Attention::RateLimited(line)) => {
+                        events.push(SessionEvent::RateLimited(s.title.clone(), line));
                     }
                     None => {}
                 }

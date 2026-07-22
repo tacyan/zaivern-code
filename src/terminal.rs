@@ -17,6 +17,9 @@ pub struct SpawnSpec {
     pub command: String,
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
+    /// PTY 生出力のログ書き出し先。None ならログを残さない。
+    /// 再起動をまたいで「前回何をしていたか」を読み返すための素材になる。
+    pub log_path: Option<PathBuf>,
 }
 
 pub struct Session {
@@ -81,6 +84,20 @@ pub struct Session {
     report_fg: Arc<AtomicU32>,
     #[allow(dead_code)]
     report_bg: Arc<AtomicU32>,
+    /// 最後に「見た」(mark_read した) 時点の意味的画面ハッシュ。未読判定の基準。
+    seen_hash: u64,
+    /// 現在の意味的画面ハッシュ。スピナー・経過秒・カウンタの揺れは
+    /// 正規化済みなので、変化 = 本当に新しい出力 (scan_attention の周期で更新)。
+    cur_hash: u64,
+    /// 手動の「あとで見る」ピン。フォーカスを当て直す (acknowledge) まで未読扱い。
+    pub pinned_unread: bool,
+    /// レート制限/使用上限の警告が画面に出ているとき、その行。
+    /// 警告が画面から消える (2 スキャン連続で不検出) と自動で外れる。
+    pub rate_limited: Option<String>,
+    /// レート制限警告を連続で見失った回数 (2 回で解除。1 回では画面遷移の瞬きと区別できない)。
+    rl_miss: u8,
+    /// このセッションの生ログの書き出し先 (再起動時の引き継ぎ・UI 表示用)。
+    pub log_path: Option<PathBuf>,
 }
 
 /// scan_attention の結果。
@@ -89,6 +106,106 @@ pub enum Attention {
     NeedsApproval,
     /// 全自動YESモードが承認プロンプトへ自動応答した(説明文)。
     AutoReplied(&'static str),
+    /// レート制限/使用上限の警告を新たに検知した(警告行)。
+    RateLimited(String),
+}
+
+/// 画面テキストの「意味的な」ハッシュ。
+///
+/// スピナー・経過秒・トークン数などの揺れを supervisor::normalize_line で
+/// 潰してから畳むので、値の変化 = 本当に新しい出力。これを未読判定に使う
+/// (生バイトを数えると、アイドル中の点滅や時計の再描画で永遠に未読になる)。
+fn semantic_hash(text: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for line in text.lines() {
+        let n = crate::supervisor::normalize_line(line, false);
+        if !n.trim().is_empty() {
+            n.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// 画面テキストからレート制限/使用上限の警告行を探す。見つかればその行。
+///
+/// パターンは Claude Code (`usage limit reached` / `5-hour limit reached ∙ resets …`)、
+/// Codex (`You've hit your usage limit`)、一般的な API エラーに合わせてある。
+/// 誤検知(会話の中で制限の話をしているだけ)を避けるため、単語 "limit" 単体には
+/// 反応しない。
+pub fn detect_rate_limit(text: &str) -> Option<String> {
+    const PATTERNS: [&str; 9] = [
+        "usage limit reached",
+        "5-hour limit reached",
+        "weekly limit reached",
+        "session limit reached",
+        "hit your usage limit",
+        "approaching usage limit",
+        "rate limit reached",
+        "too many requests",
+        "quota exceeded",
+    ];
+    for line in text.lines() {
+        let low = line.to_lowercase();
+        if PATTERNS.iter().any(|p| low.contains(p)) {
+            return Some(line.trim().to_string());
+        }
+    }
+    None
+}
+
+/// PTY 生出力のログ書き出し先。上限を超えたら `.old` へローテートし、
+/// 常に「直近の分」がファイルに残るようにする(無限に太らせない)。
+struct LogSink {
+    file: std::fs::File,
+    path: PathBuf,
+    written: u64,
+}
+
+/// 1 ファイルあたりのログ上限。超えると .old へ退避して書き直す
+/// (合計で最大 2 倍まで。直近分は必ず .log 側にある)。
+const LOG_CAP: u64 = 4 * 1024 * 1024;
+
+impl LogSink {
+    fn open(path: &Path, header: &str) -> Option<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok()?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut s = Self {
+            file,
+            path: path.to_path_buf(),
+            written,
+        };
+        s.write(header.as_bytes());
+        Some(s)
+    }
+
+    fn write(&mut self, chunk: &[u8]) {
+        if self.written.saturating_add(chunk.len() as u64) > LOG_CAP {
+            // ローテート失敗 (権限など) でも書き込み自体は諦めない:
+            // truncate で開き直して先頭から書く。
+            let _ = std::fs::rename(&self.path, self.path.with_extension("log.old"));
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+            {
+                self.file = f;
+                self.written = 0;
+            }
+        }
+        if self.file.write_all(chunk).is_ok() {
+            self.written += chunk.len() as u64;
+        }
+    }
 }
 
 /// 全自動YESモード用: 画面の承認プロンプトを分類し、送るキー列と説明を返す。
@@ -573,6 +690,19 @@ impl Session {
         let report_fg = Arc::new(AtomicU32::new(0xe6e6e6));
         let report_bg = Arc::new(AtomicU32::new(0x12141a));
 
+        // 生ログの書き出し (F5: スクロールバック永続化)。ヘッダで起動を区切る。
+        let log_sink: Option<LogSink> = spec.log_path.as_ref().and_then(|p| {
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let header = format!(
+                "\n===== [Zaivern] {} — `{}` (epoch {}) =====\n",
+                spec.title, spec.command, epoch
+            );
+            LogSink::open(p, &header)
+        });
+
         {
             let parser = parser.clone();
             let exited = exited.clone();
@@ -583,6 +713,7 @@ impl Session {
             let clipboard_pending = clipboard_pending.clone();
             let report_fg = report_fg.clone();
             let report_bg = report_bg.clone();
+            let mut log_sink = log_sink;
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut scanner = QueryScanner::default();
@@ -590,6 +721,9 @@ impl Session {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            if let Some(l) = log_sink.as_mut() {
+                                l.write(&buf[..n]);
+                            }
                             // 先に vt100 へ流してから走査する。CSI 6n はアプリが
                             // 「ここまで描いた」直後に送って返事を待つものなので、
                             // チャンクを反映し終えたカーソル位置が正解になる。
@@ -687,6 +821,12 @@ impl Session {
             clipboard_pending,
             report_fg,
             report_bg,
+            seen_hash: 0,
+            cur_hash: 0,
+            pinned_unread: false,
+            rate_limited: None,
+            rl_miss: 0,
+            log_path: spec.log_path,
         })
     }
 
@@ -740,6 +880,26 @@ impl Session {
         }
         self.last_scan = Instant::now();
         let text = self.parser.lock().unwrap().screen().contents();
+        // 未読判定用: 意味的な画面ハッシュを更新する (スピナー等の揺れは無視)。
+        self.cur_hash = semantic_hash(&text);
+        // レート制限の「継続 / 解除」の追跡。新規検知の確定は末尾で行う
+        // (承認イベントと同時のときは承認を優先し、通知を次回スキャンへ持ち越すため)。
+        let rl_detect = detect_rate_limit(&text);
+        if self.rate_limited.is_some() {
+            match &rl_detect {
+                Some(line) => {
+                    self.rate_limited = Some(line.clone());
+                    self.rl_miss = 0;
+                }
+                None => {
+                    self.rl_miss += 1;
+                    if self.rl_miss >= 2 {
+                        self.rate_limited = None;
+                        self.rl_miss = 0;
+                    }
+                }
+            }
+        }
         const PATTERNS: [&str; 6] = [
             "Do you want",
             "Would you like to proceed",
@@ -770,10 +930,40 @@ impl Session {
             }
         }
         if newly {
-            Some(Attention::NeedsApproval)
-        } else {
-            None
+            return Some(Attention::NeedsApproval);
         }
+        // レート制限の新規検知。他に返すイベントが無いときだけ確定させる。
+        if self.rate_limited.is_none() {
+            if let Some(line) = rl_detect {
+                self.rate_limited = Some(line.clone());
+                self.rl_miss = 0;
+                return Some(Attention::RateLimited(line));
+            }
+        }
+        None
+    }
+
+    /// 未読か。「最後に見た時点から意味的な画面内容が変わった」または手動ピン。
+    pub fn has_unread(&self) -> bool {
+        self.pinned_unread || self.cur_hash != self.seen_hash
+    }
+
+    /// 表示中のセッションを既読へ。毎フレーム呼んで良い。
+    /// 手動の「あとで見る」ピンはここでは外さない (見続けている間に消えると
+    /// ピンの意味が無くなるため。外すのは acknowledge)。
+    pub fn mark_read(&mut self) {
+        self.seen_hash = self.cur_hash;
+    }
+
+    /// ユーザーが明示的にこのセッションへフォーカスした / 既読にした。ピンも外す。
+    pub fn acknowledge(&mut self) {
+        self.seen_hash = self.cur_hash;
+        self.pinned_unread = false;
+    }
+
+    /// 「あとで見る」ピンを立てる (次に acknowledge するまで未読のまま)。
+    pub fn mark_unread(&mut self) {
+        self.pinned_unread = true;
     }
 
     pub fn running(&self) -> bool {
@@ -1055,6 +1245,7 @@ mod tests {
             command: cmd.into(),
             cwd: std::env::temp_dir(),
             env: HashMap::new(),
+            log_path: None,
         };
         let mut s =
             Session::spawn(999, spec, eframe::egui::Context::default()).expect("PTY起動");
@@ -1112,6 +1303,7 @@ mod tests {
             command: cmd.into(),
             cwd: std::env::temp_dir(),
             env: HashMap::new(),
+            log_path: None,
         };
         let mut s =
             Session::spawn(998, spec, eframe::egui::Context::default()).expect("PTY起動");
@@ -1176,6 +1368,7 @@ mod tests {
                 command: command.into(),
                 cwd: std::env::temp_dir(),
                 env,
+                log_path: None,
             },
             eframe::egui::Context::default(),
         )
@@ -2284,6 +2477,7 @@ mod pty_tests {
             command: format!("/bin/bash --noprofile --norc {}", path.display()),
             cwd: dir.clone(),
             env: HashMap::new(),
+            log_path: None,
         };
         let mut sess = Session::spawn(1, spec, egui::Context::default()).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(secs);
@@ -2356,6 +2550,7 @@ printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
             command: "printf '\\033[6 q'; sleep 5".into(),
             cwd: dir,
             env: HashMap::new(),
+            log_path: None,
         };
         let mut sess = Session::spawn(2, spec, egui::Context::default()).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
@@ -2377,6 +2572,7 @@ printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
             command: "printf '\\033]52;c;eWFua2Vk\\007'; sleep 5".into(),
             cwd: std::env::temp_dir(),
             env: HashMap::new(),
+            log_path: None,
         };
         let mut sess = Session::spawn(3, spec, egui::Context::default()).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(10);

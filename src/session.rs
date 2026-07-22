@@ -81,6 +81,57 @@ fn roots_hash(roots: &[PathBuf]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// ターミナル生ログの置き場: `~/.zaivern/term_logs/<ワークスペースハッシュ>/`。
+///
+/// ワークスペース単位で分けるので、同じプロジェクトを開き直せば前回のログが
+/// そのまま並ぶ (スクロールバック永続化)。
+pub fn term_log_dir(workspace: &Path) -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".zaivern")
+        .join("term_logs")
+        .join(workspace_hash(workspace))
+}
+
+/// セッション 1 本分のログファイルパス。ファイル名にタイトルを含めて
+/// 一覧で見分けられるようにする (パスに使えない文字は `_` へ)。
+pub fn term_log_path(workspace: &Path, session_id: u64, title: &str) -> PathBuf {
+    let safe: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .take(40)
+        .collect();
+    term_log_dir(workspace).join(format!("{safe}-{session_id}.log"))
+}
+
+/// 古いターミナルログの掃除。新しい方から `keep` 本を残して削除する
+/// (`.old` ローテート分は本体と対で消す)。起動時に一度呼ぶ想定。
+pub fn prune_term_logs(workspace: &Path, keep: usize) {
+    let mut logs = list_term_logs(workspace);
+    for p in logs.split_off(keep.min(logs.len())) {
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("log.old"));
+    }
+}
+
+/// ワークスペースの既存ログ一覧 (新しい順)。「📜 前回ログ」メニューの素材。
+pub fn list_term_logs(workspace: &Path) -> Vec<PathBuf> {
+    let dir = term_log_dir(workspace);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "log").unwrap_or(false))
+        .filter_map(|e| {
+            let t = e.metadata().ok()?.modified().ok()?;
+            Some((t, e.path()))
+        })
+        .collect();
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    logs.into_iter().map(|(_, p)| p).collect()
+}
+
 /// 内部: ワークスペース絶対パス → 安定ハッシュhex文字列（DefaultHasher）。
 /// canonicalize できる場合は正規化してシンボリックリンク差を吸収する。
 fn workspace_hash(workspace: &Path) -> String {

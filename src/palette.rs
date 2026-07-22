@@ -10,6 +10,8 @@ pub enum Cmd {
     OpenFolder,
     /// フォルダをワークスペースに追加する (マルチルート)
     AddFolder,
+    /// 指定パスをワークスペースに追加する (`#` パレットの git worktree 追加)
+    AddFolderPath(PathBuf),
     /// 指定フォルダをワークスペースから削除する (最後の 1 つは削除できない)
     RemoveFolder(PathBuf),
     ToggleTerminal,
@@ -146,8 +148,22 @@ impl Palette {
         self.input.trim_start().starts_with('>')
     }
 
+    /// `@` で始まる = エージェントセッション / プリセットの横断検索モード。
+    pub fn is_agent_mode(&self) -> bool {
+        self.input.trim_start().starts_with('@')
+    }
+
+    /// `#` で始まる = ワークスペースルート / git worktree の横断検索モード。
+    pub fn is_root_mode(&self) -> bool {
+        self.input.trim_start().starts_with('#')
+    }
+
     pub fn query(&self) -> &str {
         let t = self.input.trim_start();
-        t.strip_prefix('>').map(|s| s.trim_start()).unwrap_or(t)
+        t.strip_prefix('>')
+            .or_else(|| t.strip_prefix('@'))
+            .or_else(|| t.strip_prefix('#'))
+            .map(|s| s.trim_start())
+            .unwrap_or(t)
     }
 }
