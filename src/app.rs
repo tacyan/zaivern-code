@@ -241,7 +241,7 @@ pub struct ZaivernApp {
     palette: Palette,
     highlighter: Highlighter,
     cockpit: bool,
-    /// Markdown/HTML ファイルをレンダリング表示するモード (Cockpit 以外で有効)
+    /// Markdown/HTML ファイルをレンダリング表示するモード (Cockpit の編集ペインでも有効)
     md_preview: bool,
     /// プレビューが参照するローカル画像のテクスチャキャッシュ
     md_images: markdown::ImageCache,
@@ -1982,9 +1982,8 @@ impl ZaivernApp {
     fn open_path(&mut self, path: &Path) {
         match self.editor.open(path, &self.highlighter) {
             Ok(reloaded) => {
-                // Cockpit 表示中はエディタが隠れており「開けていない」ように
-                // 見えるため、ファイルを開いたらエディタ画面へ戻す
-                self.cockpit = false;
+                // Cockpit 表示中でも左の編集ペインに開いた内容が見えるため、
+                // ビューは切り替えない
                 if reloaded {
                     if let Some(i) = self.editor.active {
                         let title = self.editor.buffers[i].title.clone();
@@ -2350,22 +2349,19 @@ impl ZaivernApp {
                 self.orch.open_msg_form();
             }
             Cmd::ToggleMdPreview => {
-                // Cockpit ビュー中はエディタが出ていないので何もしない
-                if !self.cockpit {
-                    let ok = self
-                        .editor
-                        .active
-                        .map(|i| {
-                            let b = &self.editor.buffers[i];
-                            markdown::is_markdown(&b.title, &b.lang)
-                                || html::is_html(&b.title, &b.lang)
-                        })
-                        .unwrap_or(false);
-                    if ok {
-                        self.md_preview = !self.md_preview;
-                    } else {
-                        self.toast("Markdown / HTML ファイルではありません", false);
-                    }
+                let ok = self
+                    .editor
+                    .active
+                    .map(|i| {
+                        let b = &self.editor.buffers[i];
+                        markdown::is_markdown(&b.title, &b.lang)
+                            || html::is_html(&b.title, &b.lang)
+                    })
+                    .unwrap_or(false);
+                if ok {
+                    self.md_preview = !self.md_preview;
+                } else {
+                    self.toast("Markdown / HTML ファイルではありません", false);
                 }
             }
             Cmd::ToggleSidebar => {
@@ -4498,10 +4494,11 @@ impl ZaivernApp {
                     return;
                 }
 
-                let cols = if n <= 1 { 1 } else { 2 };
-                let rows = n.div_ceil(cols);
                 let spacing = 10.0;
                 let avail = ui.available_size();
+                // 編集ペインとの分割で幅が狭いときは 1 列に落とす
+                let cols = if n <= 1 || avail.x < 640.0 { 1 } else { 2 };
+                let rows = n.div_ceil(cols);
                 let cell_w = (avail.x - spacing * (cols as f32 - 1.0)) / cols as f32 - 4.0;
                 let cell_h = (((avail.y - spacing * (rows as f32 - 1.0)) / rows as f32) - 4.0)
                     .max(150.0);
@@ -4838,7 +4835,7 @@ impl ZaivernApp {
             }
         }
         // Markdown / HTML ファイルは 編集/プレビュー の切替バーを出す
-        // (Cockpit ビュー中は editor_area 自体が描画されないため自動的に除外)
+        // (Cockpit の編集ペインに出ているときも同様に切り替えられる)
         let (is_md, is_html) = self
             .editor
             .active
@@ -7693,7 +7690,23 @@ impl eframe::App for ZaivernApp {
             .show(ctx, |ui| {
                 if self.cockpit {
                     let ctx = ui.ctx().clone();
-                    self.cockpit_ui(ui, &ctx);
+                    // ファイルを開いていれば左に編集ペインを並べて出す。
+                    // Cockpit との切り替え無しでファイルが見えるようにするため。
+                    if self.editor.buffers.is_empty() {
+                        self.cockpit_ui(ui, &ctx);
+                    } else {
+                        let avail = ui.available_width();
+                        egui::SidePanel::left("cockpit-editor-split")
+                            .frame(egui::Frame::none().fill(theme_bg))
+                            .resizable(true)
+                            .default_width((avail * 0.42).max(280.0))
+                            .min_width(220.0)
+                            .max_width(avail * 0.75)
+                            .show_inside(ui, |ui| self.editor_area(ui));
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::none().fill(theme_bg))
+                            .show_inside(ui, |ui| self.cockpit_ui(ui, &ctx));
+                    }
                 } else {
                     self.editor_area(ui);
                 }
