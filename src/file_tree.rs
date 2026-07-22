@@ -386,6 +386,10 @@ impl FileTree {
             } else {
                 let label = format!("{} {}", icon_for(&e.name), e.name);
                 let resp = ui.selectable_label(false, RichText::new(label).color(theme.text));
+                // エージェントのターミナルへドラッグ&ドロップでパスを渡せる
+                // (クリック=開く はそのまま。ドラッグとクリックは egui が排他にする)
+                let resp = resp.interact(egui::Sense::click_and_drag());
+                resp.dnd_set_drag_payload(e.path.clone());
                 if resp.clicked() {
                     actions.open = Some(e.path.clone());
                 }

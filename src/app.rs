@@ -8060,6 +8060,47 @@ impl eframe::App for ZaivernApp {
                 }
             });
 
+        // ── OS からのファイルドロップ ──
+        // ターミナル (terminal::draw) が受けた分は印が立つので、残りをエディタ側で
+        // 処理する: ファイル → タブで開く / フォルダ → ワークスペースに追加。
+        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let consumed = ctx
+                .data_mut(|d| d.remove_temp::<bool>(egui::Id::new("zv-drop-consumed")))
+                .unwrap_or(false);
+            if !consumed {
+                for f in dropped {
+                    let Some(p) = f.path else { continue };
+                    if p.is_dir() {
+                        self.add_folder_to_workspace(p, ctx);
+                    } else {
+                        self.open_path(&p);
+                    }
+                }
+            }
+        }
+        // ドラッグ中は行き先のヒントを出す
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            egui::Area::new(egui::Id::new("zv-drop-hint"))
+                .order(egui::Order::Foreground)
+                .anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(self.theme.panel)
+                        .stroke(egui::Stroke::new(1.0_f32, self.theme.accent))
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "ターミナルへドロップ = @パスを入力欄へ挿入 ・ それ以外 = エディタで開く (フォルダは追加)",
+                                )
+                                .color(self.theme.text),
+                            );
+                        });
+                });
+        }
+
         self.palette_ui(ctx);
         self.new_plugin_ui(ctx);
         self.close_confirm_ui(ctx);

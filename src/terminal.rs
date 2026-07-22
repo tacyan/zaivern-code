@@ -1692,6 +1692,18 @@ fn copy_selection(ui: &egui::Ui, session: &mut Session) {
     }
 }
 
+/// ドロップ/送信用のパス表記。セッションの cwd 配下なら相対、それ以外は絶対。
+/// canonicalize は両側に best-effort で当て、シンボリックリンク差を吸収する。
+fn prompt_path(path: &Path, cwd: &Path) -> String {
+    let c_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let c_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    c_path
+        .strip_prefix(&c_cwd)
+        .unwrap_or(&c_path)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Render a terminal session. `interactive` forwards keyboard input on focus,
 /// `allow_resize` lets this view drive the PTY size.
 /// `hover_scroll`: ホバーだけでホイールを履歴スクロールに使うか。
@@ -1717,6 +1729,37 @@ pub fn draw(
         response.request_focus();
     }
     let focused = interactive && response.has_focus();
+
+    // ── ドラッグ&ドロップでパスをプロンプトへ挿入 ──
+    // ファイルツリーの行 (内部ドラッグ) と OS からのファイルドロップの両方を受ける。
+    // 送信 (Enter) はしない — 入力欄に @パス が入るだけなので、暴発しない。
+    if let Some(path) = response.dnd_release_payload::<PathBuf>() {
+        let text = format!("@{} ", prompt_path(&path, &session.cwd));
+        session.write_bytes(text.as_bytes());
+    }
+    let os_dropped: Vec<egui::DroppedFile> = ui.input(|i| i.raw.dropped_files.clone());
+    if !os_dropped.is_empty() && ui.rect_contains_pointer(rect) {
+        let mut text = String::new();
+        for f in &os_dropped {
+            if let Some(p) = &f.path {
+                text.push_str(&format!("@{} ", prompt_path(p, &session.cwd)));
+            }
+        }
+        if !text.is_empty() {
+            session.write_bytes(text.as_bytes());
+            // エディタ側の既定処理 (タブで開く) と二重にならないよう印を立てる
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(egui::Id::new("zv-drop-consumed"), true));
+        }
+    }
+    // ドラッグ中はドロップ先が分かるよう枠を光らせる
+    let dragging_file = response.dnd_hover_payload::<PathBuf>().is_some()
+        || (ui.input(|i| !i.raw.hovered_files.is_empty())
+            && ui.rect_contains_pointer(rect));
+    if dragging_file {
+        ui.painter()
+            .rect_stroke(rect, 6.0, egui::Stroke::new(2.0_f32, theme.accent));
+    }
 
     let padding = 6.0;
     if allow_resize {
