@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use eframe::egui::{self, RichText};
 
+use crate::i18n::tr;
 use crate::theme::Theme;
 
 #[derive(Clone)]
@@ -224,16 +225,16 @@ impl FileTree {
                 self.dir_ui(ui, root, theme, actions, 0);
             });
             cr.header_response.context_menu(|ui| {
-                if ui.button("➕ 新規ファイル").clicked() {
+                if ui.button(tr("➕ 新規ファイル")).clicked() {
                     self.start_new_file(root.clone());
                     ui.close_menu();
                 }
-                if ui.button("📂 新規フォルダ").clicked() {
+                if ui.button(tr("📂 新規フォルダ")).clicked() {
                     self.start_new_dir(root.clone());
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("📋 フルパスをコピー").clicked() {
+                if ui.button(tr("📋 フルパスをコピー")).clicked() {
                     ui.ctx().copy_text(root.to_string_lossy().to_string());
                     ui.close_menu();
                 }
@@ -277,7 +278,7 @@ impl FileTree {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut es.text)
                     .desired_width(f32::INFINITY)
-                    .hint_text("名前を入力して Enter"),
+                    .hint_text(tr("名前を入力して Enter")),
             );
             if es.focus {
                 resp.request_focus();
@@ -349,25 +350,25 @@ impl FileTree {
                     self.dir_ui(ui, &e.path, theme, actions, depth + 1);
                 });
                 cr.header_response.context_menu(|ui| {
-                    if ui.button("➕ 新規ファイル").clicked() {
+                    if ui.button(tr("➕ 新規ファイル")).clicked() {
                         self.start_new_file(e.path.clone());
                         ui.close_menu();
                     }
-                    if ui.button("📂 新規フォルダ").clicked() {
+                    if ui.button(tr("📂 新規フォルダ")).clicked() {
                         self.start_new_dir(e.path.clone());
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("✏ 名前を変更").clicked() {
+                    if ui.button(tr("✏ 名前を変更")).clicked() {
                         self.start_rename(e.path.clone());
                         ui.close_menu();
                     }
-                    if ui.button("🗑 削除…").clicked() {
+                    if ui.button(tr("🗑 削除…")).clicked() {
                         actions.delete = Some(e.path.clone());
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("👾 パスをエージェントに送信").clicked() {
+                    if ui.button(tr("👾 パスをエージェントに送信")).clicked() {
                         // マルチルート: そのパスを含むルートからの相対パスにする
                         let rel = self
                             .root_for(&e.path)
@@ -378,7 +379,7 @@ impl FileTree {
                         actions.send_to_agent = Some(format!("@{rel} "));
                         ui.close_menu();
                     }
-                    if ui.button("📋 フルパスをコピー").clicked() {
+                    if ui.button(tr("📋 フルパスをコピー")).clicked() {
                         ui.ctx().copy_text(e.path.to_string_lossy().to_string());
                         ui.close_menu();
                     }
@@ -394,21 +395,21 @@ impl FileTree {
                     actions.open = Some(e.path.clone());
                 }
                 resp.context_menu(|ui| {
-                    if ui.button("📂 エディタで開く").clicked() {
+                    if ui.button(tr("📂 エディタで開く")).clicked() {
                         actions.open = Some(e.path.clone());
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("✏ 名前を変更").clicked() {
+                    if ui.button(tr("✏ 名前を変更")).clicked() {
                         self.start_rename(e.path.clone());
                         ui.close_menu();
                     }
-                    if ui.button("🗑 削除…").clicked() {
+                    if ui.button(tr("🗑 削除…")).clicked() {
                         actions.delete = Some(e.path.clone());
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("👾 パスをエージェントに送信").clicked() {
+                    if ui.button(tr("👾 パスをエージェントに送信")).clicked() {
                         // マルチルート: そのパスを含むルートからの相対パスにする
                         let rel = self
                             .root_for(&e.path)
@@ -419,7 +420,7 @@ impl FileTree {
                         actions.send_to_agent = Some(format!("@{rel} "));
                         ui.close_menu();
                     }
-                    if ui.button("📋 フルパスをコピー").clicked() {
+                    if ui.button(tr("📋 フルパスをコピー")).clicked() {
                         ui.ctx().copy_text(e.path.to_string_lossy().to_string());
                         ui.close_menu();
                     }

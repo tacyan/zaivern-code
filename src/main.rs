@@ -18,6 +18,7 @@ mod git_panel;
 mod github;
 mod highlight;
 mod html;
+mod i18n;
 mod ide;
 mod jsonc;
 mod keybinds;

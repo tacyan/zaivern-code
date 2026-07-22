@@ -19,6 +19,7 @@ use egui::RichText;
 
 use crate::agents::{AgentSpec, AGENT_CATALOG};
 use crate::config::AgentPreset;
+use crate::i18n::{tr, trf};
 use crate::theme::Theme;
 
 /// 全自動プリセットの名前につける接尾辞 (config.toml の既定プリセットに合わせる)。
@@ -322,7 +323,7 @@ pub fn ui(
         picker.installed.count(),
     );
 
-    egui::Window::new("👾 エージェントを追加")
+    egui::Window::new(tr("👾 エージェントを追加"))
         .collapsible(false)
         .resizable(true)
         .default_width(620.0)
@@ -335,28 +336,34 @@ pub fn ui(
                 ui.add(
                     egui::TextEdit::singleline(&mut picker.filter)
                         .desired_width(220.0)
-                        .hint_text("名前で絞り込み"),
+                        .hint_text(tr("名前で絞り込み")),
                 );
                 if ui
                     .button("⟳")
-                    .on_hover_text("PATH を引き直す (今インストールしたものを拾う)")
+                    .on_hover_text(tr("PATH を引き直す (今インストールしたものを拾う)"))
                     .clicked()
                 {
                     action = Some(PickerAction::Reprobe);
                 }
                 let status = if probing {
-                    "検出中…".to_string()
+                    tr("検出中…")
                 } else if done {
-                    format!("{found} / {} 件がインストール済み", AGENT_CATALOG.len())
+                    trf(
+                        "{found} / {total} 件がインストール済み",
+                        &[
+                            ("found", found.to_string()),
+                            ("total", AGENT_CATALOG.len().to_string()),
+                        ],
+                    )
                 } else {
-                    "未検出".to_string()
+                    tr("未検出")
                 };
                 ui.label(RichText::new(status).size(11.5).color(theme.text_dim));
             });
             ui.label(
-                RichText::new(
+                RichText::new(tr(
                     "選ぶと ~/.zaivern/config.toml の末尾に追加されます。既存の設定は書き換えません。",
-                )
+                ))
                 .size(10.5)
                 .color(theme.text_dim),
             );
@@ -369,7 +376,7 @@ pub fn ui(
                 }
                 if rows.is_empty() {
                     ui.label(
-                        RichText::new("該当するエージェントがありません")
+                        RichText::new(tr("該当するエージェントがありません"))
                             .color(theme.text_dim),
                     );
                 }
@@ -405,18 +412,18 @@ fn agent_row(
                 .color(theme.text_dim),
         );
         if row.installed {
-            ui.label(RichText::new("✅ インストール済み").size(10.5).color(theme.ok));
+            ui.label(RichText::new(tr("✅ インストール済み")).size(10.5).color(theme.ok));
         } else {
-            ui.label(RichText::new("⚠ 未インストール").size(10.5).color(theme.warn));
+            ui.label(RichText::new(tr("⚠ 未インストール")).size(10.5).color(theme.warn));
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // 全自動から先に置く (右詰めなので、描画順と見た目の順が逆になる)
             if let Some(has_auto) = row.has_auto {
                 let auto_btn = if has_auto {
-                    ui.add_enabled(false, egui::Button::new("追加済み (全自動)"))
+                    ui.add_enabled(false, egui::Button::new(tr("追加済み (全自動)")))
                 } else {
-                    ui.button("＋ 全自動")
+                    ui.button(tr("＋ 全自動"))
                 };
                 if auto_btn.clicked() {
                     if let Some(mut p) = auto_preset(spec) {
@@ -426,9 +433,9 @@ fn agent_row(
                 }
             }
             let plain_btn = if row.has_plain {
-                ui.add_enabled(false, egui::Button::new("追加済み"))
+                ui.add_enabled(false, egui::Button::new(tr("追加済み")))
             } else {
-                ui.button("＋ 追加")
+                ui.button(tr("＋ 追加"))
             };
             if plain_btn.clicked() {
                 let mut p = plain_preset(spec);
@@ -441,7 +448,7 @@ fn agent_row(
     // カタログに書かれている落とし穴メモ。ここが利用者から見える唯一の場所。
     if !spec.note.is_empty() {
         ui.label(
-            RichText::new(format!("⚠ {}", spec.note))
+            RichText::new(format!("⚠ {}", tr(spec.note)))
                 .size(10.5)
                 .color(theme.warn),
         );
@@ -449,7 +456,7 @@ fn agent_row(
     // 未インストールなら入れ方を併記する。
     if !row.installed && !spec.install.is_empty() {
         ui.label(
-            RichText::new(format!("インストール: {}", spec.install))
+            RichText::new(trf("インストール: {cmd}", &[("cmd", spec.install.to_string())]))
                 .size(10.5)
                 .color(theme.text_dim),
         );

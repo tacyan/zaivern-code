@@ -10,6 +10,8 @@
 
 use eframe::egui;
 
+use crate::i18n::{tr, trf};
+
 // ── レイアウト定数 ─────────────────────────────────────────────
 
 /// カードの幅
@@ -108,7 +110,7 @@ pub fn draw(
             .interactable(false)
             .show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new(format!("+他{overflow}件"))
+                    egui::RichText::new(trf("+他{overflow}件", &[("overflow", overflow.to_string())]))
                         .small()
                         .color(theme.text_dim),
                 );
@@ -176,19 +178,19 @@ fn draw_card(
                 // ── 2 行目: ボタン行 [✔ 承認] [✖ 拒否] [開く] [×]
                 ui.horizontal(|ui| {
                     if ui
-                        .button(egui::RichText::new("✔ 承認").color(theme.ok))
+                        .button(egui::RichText::new(tr("✔ 承認")).color(theme.ok))
                         .clicked()
                     {
                         actions.push(BubbleAction::Approve(idx));
                     }
                     if ui
-                        .button(egui::RichText::new("✖ 拒否").color(theme.err))
+                        .button(egui::RichText::new(tr("✖ 拒否")).color(theme.err))
                         .clicked()
                     {
                         actions.push(BubbleAction::Deny(idx));
                     }
                     if ui
-                        .button(egui::RichText::new("開く").color(theme.accent))
+                        .button(egui::RichText::new(tr("開く")).color(theme.accent))
                         .clicked()
                     {
                         actions.push(BubbleAction::Focus(idx));

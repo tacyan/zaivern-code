@@ -8,6 +8,7 @@ use std::time::Instant;
 use eframe::egui;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
+use crate::i18n::{tr, trf};
 use crate::theme::Theme;
 
 pub struct SpawnSpec {
@@ -662,13 +663,13 @@ impl Session {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| format!("PTYを開けませんでした: {e}"))?;
+            .map_err(|e| trf("PTYを開けませんでした: {e}", &[("e", e.to_string())]))?;
 
         let cmd = build_command(&spec.command, &spec.cwd, &spec.env);
         let mut child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| format!("起動に失敗しました: {e}"))?;
+            .map_err(|e| trf("起動に失敗しました: {e}", &[("e", e.to_string())]))?;
         let killer = child.clone_killer();
         drop(pair.slave);
 
@@ -2228,7 +2229,7 @@ pub fn draw(
 
     // 履歴表示中だけ「⤓ 一番下へ」ボタンを出す。一番下(scroll == 0)なら何も表示しない。
     if session.scroll > 0 {
-        let label = format!("⤒ {} ⤓ 一番下へ", session.scroll);
+        let label = trf("⤒ {n} ⤓ 一番下へ", &[("n", session.scroll.to_string())]);
         let galley = painter.layout_no_wrap(
             label.clone(),
             egui::FontId::proportional(11.0),
@@ -2247,7 +2248,7 @@ pub fn draw(
             .fill(theme.warn)
             .rounding(4.0),
         );
-        if r.on_hover_text("クリックで履歴表示を終了して一番下(最新)へ戻る")
+        if r.on_hover_text(tr("クリックで履歴表示を終了して一番下(最新)へ戻る"))
             .clicked()
         {
             session.set_scroll(0);
@@ -2267,7 +2268,7 @@ pub fn draw(
         painter.text(
             egui::pos2(rect.max.x - 8.0, rect.max.y - 6.0),
             egui::Align2::RIGHT_BOTTOM,
-            format!("✕ 終了 (code {code})"),
+            trf("✕ 終了 (code {code})", &[("code", code.to_string())]),
             egui::FontId::proportional(11.0),
             theme.err,
         );
@@ -2278,19 +2279,19 @@ pub fn draw(
         response.context_menu(|ui| {
             let has_sel = session.selection.is_some();
             if ui
-                .add_enabled(has_sel, egui::Button::new("📋 選択をコピー (⌘C)"))
+                .add_enabled(has_sel, egui::Button::new(tr("📋 選択をコピー (⌘C)")))
                 .clicked()
             {
                 copy_selection(ui, session);
                 ui.close_menu();
             }
-            if ui.button("📄 画面全体をコピー").clicked() {
+            if ui.button(tr("📄 画面全体をコピー")).clicked() {
                 let text = session.parser.lock().unwrap().screen().contents();
                 ui.ctx().copy_text(text);
                 session.copied_at = Some(Instant::now());
                 ui.close_menu();
             }
-            if has_sel && ui.button("✕ 選択を解除").clicked() {
+            if has_sel && ui.button(tr("✕ 選択を解除")).clicked() {
                 session.selection = None;
                 session.sel_anchor = None;
                 ui.close_menu();
@@ -2302,7 +2303,7 @@ pub fn draw(
     if let Some(t) = session.copied_at {
         if t.elapsed().as_millis() < 1200 {
             let galley = painter.layout_no_wrap(
-                "📋 コピーしました".into(),
+                tr("📋 コピーしました"),
                 egui::FontId::proportional(12.0),
                 theme.term_bg,
             );

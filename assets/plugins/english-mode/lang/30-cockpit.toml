@@ -1,0 +1,117 @@
+# コックピット (orchestration / agent_picker / fuzzy / palette / pet_bubble) の辞書。
+# 形式: "日本語原文" = "English" / プレースホルダ {name} は訳文にもそのまま残す。
+
+# ── orchestration.rs: 調停セクション ─────────────────────────────────
+
+"📋 タスクとメッセージ" = "📋 Tasks & Messages"
+"未完了 {open} 件" = "{open} open"
+"⚠ 人手待ち {stuck} 件" = "⚠ {stuck} need a human"
+"📮 配達待ち {n}" = "📮 {n} pending delivery"
+"相手が待機状態になってから届きます" = "Delivered once the recipient is idle"
+"直近の破棄はありません" = "No recent drops"
+"🗑 破棄 {drops} / 溢れ {overflow}" = "🗑 dropped {drops} / overflowed {overflow}"
+"直近: {hint}" = "Latest: {hint}"
+"📣 全エージェントへブロードキャスト" = "📣 Broadcast to all agents"
+"メッセージを全エージェントへ送ります (フォームで個別宛にも変更可)" = "Sends a message to all agents (you can switch to a single recipient in the form)"
+
+# ── orchestration.rs: タスク一覧 ─────────────────────────────────────
+
+"タイトル" = "Title"
+"状態" = "State"
+"担当" = "Assignee"
+"試行" = "Attempts"
+"\n\nこれまでの経過:\n" = "\n\nHistory so far:\n"
+"・{c}\n" = "- {c}\n"
+"\n(古い履歴 {n} 件は省略)" = "\n({n} older entries omitted)"
+"失敗" = "failed"
+"割当済" = "assigned"
+"⚠ 人手が必要" = "⚠ needs a human"
+"↻ 再割当" = "↻ Reassign"
+"再試行の上限に達しています。人が担当を決め直してください" = "Retry limit reached. A human must pick the next assignee"
+
+# ── orchestration.rs: タスク作成フォーム ─────────────────────────────
+
+"📋 新しいタスク" = "📋 New Task"
+"例: ログイン画面のテストを直す" = "e.g. Fix the login screen tests"
+"内容" = "Description"
+"担当するエージェントへそのまま送られます" = "Sent verbatim to the assigned agent"
+"必要な能力 (任意・カンマ区切り)" = "Required capabilities (optional, comma-separated)"
+"自動割り当て" = "Auto-assign"
+"稼働中のエージェントがいないため、いま割り当てはできません" = "No agents are running, so nothing can be assigned right now"
+"▶ 作成して割り当て" = "▶ Create & Assign"
+
+# ── orchestration.rs: メッセージ送信フォーム ─────────────────────────
+
+"📮 エージェントへ送信" = "📮 Send to Agent"
+"宛先" = "To"
+"種別" = "Kind"
+"全エージェント (一斉送信)" = "All agents (broadcast)"
+"全エージェント" = "All agents"
+"監視役" = "Supervisor"
+"あなた" = "You"
+"相手が待機状態になったときに届きます" = "Delivered when the recipient becomes idle"
+"作業中のエージェントには割り込みません。安全な状態になるまで待ってから届きます" = "Working agents are never interrupted; delivery waits until they are in a safe state"
+"📮 送信" = "📮 Send"
+
+# ── orchestration.rs: トースト ───────────────────────────────────────
+
+"タスク #{tid} は {name} に割り当てましたが、本文を送れませんでした: {reason}" = "Task #{tid} was assigned to {name}, but the body could not be sent: {reason}"
+"📋 タスク #{tid}「{title}」を {name} に割り当てました (相手が待機状態になり次第、本文を送ります)" = "📋 Task #{tid} \"{title}\" assigned to {name} (the body will be sent once it is idle)"
+"📋 タスク #{tid} を割り当てられません: {reason}" = "📋 Cannot assign task #{tid}: {reason}"
+"📋 タスク #{tid} を {name} へ渡し直しました" = "📋 Task #{tid} reassigned to {name}"
+"📋 タスク #{tid} の再割り当てを断りました: {reason}" = "📋 Refused to reassign task #{tid}: {reason}"
+"✅ タスク #{tid} を完了にしました" = "✅ Task #{tid} marked as done"
+"⚠ タスク #{tid} を失敗にしました" = "⚠ Task #{tid} marked as failed"
+"📮 #{id} を {dest} へ送りました" = "📮 Sent #{id} to {dest}"
+"📮 #{id} は届け先がいませんでした" = "📮 #{id} had no recipients"
+"📮 #{id} を {delivered_to} 件へ一斉送信しました" = "📮 Broadcast #{id} to {delivered_to} recipients"
+"📮 {dest} への送信は届きません: {reason}" = "📮 Message to {dest} will not be delivered: {reason}"
+"🔁 タスク #{tid} を {name} へ引き継ぎました ({reason})" = "🔁 Task #{tid} handed over to {name} ({reason})"
+"🛑 タスク #{tid} は引き渡しません: 前任 session:{previous} の停止が未確認です" = "🛑 Task #{tid} will not be handed over: previous holder session:{previous} is not confirmed stopped"
+"📮 {name} の発信を破棄: 宛先「{target}」が見つかりません" = "📮 Dropped outbound message from {name}: target \"{target}\" not found"
+"📮 {name} の発信を抑制: {window} あたり {per} 通の上限に達しました" = "📮 Throttled outbound from {name}: reached the limit of {per} messages per {window}"
+
+# ── coordinator の label() がコックピット UI に表示されるもの ─────────
+
+"依頼" = "Request"
+"返答" = "Reply"
+"引き継ぎ" = "Handoff"
+"状況" = "Status"
+"質問" = "Question"
+"エスカレーション" = "Escalation"
+"セッション消滅" = "session died"
+"手動" = "manual"
+"該当タスクが無い" = "no such task"
+"タスクは既に終了している" = "the task is already finished"
+"割り当て可能なセッションがいない" = "no session is available for assignment"
+"同一相手への送信が多すぎる" = "too many messages to the same recipient"
+"全体の送信量が多すぎる" = "too many messages overall"
+"一斉送信が多すぎる" = "too many broadcasts"
+"2 者間の往復を検出したため抑制" = "suppressed: ping-pong between two sessions detected"
+"受信箱が満杯のため古いものを破棄" = "mailbox full; oldest message dropped"
+"宛先セッションが存在しない" = "the target session does not exist"
+"自分宛のため破棄" = "dropped: self-addressed"
+
+# ── agent_picker.rs: エージェント追加ピッカー ────────────────────────
+
+"👾 エージェントを追加" = "👾 Add Agent"
+"名前で絞り込み" = "Filter by name"
+"PATH を引き直す (今インストールしたものを拾う)" = "Re-scan PATH (picks up tools you just installed)"
+"検出中…" = "Detecting…"
+"{found} / {total} 件がインストール済み" = "{found} of {total} installed"
+"未検出" = "Not detected yet"
+"選ぶと ~/.zaivern/config.toml の末尾に追加されます。既存の設定は書き換えません。" = "Your picks are appended to the end of ~/.zaivern/config.toml. Existing settings are never modified."
+"該当するエージェントがありません" = "No matching agents"
+"✅ インストール済み" = "✅ installed"
+"⚠ 未インストール" = "⚠ not installed"
+"追加済み (全自動)" = "Added (full-auto)"
+"＋ 全自動" = "＋ Full-auto"
+"追加済み" = "Added"
+"＋ 追加" = "＋ Add"
+"インストール: {cmd}" = "Install: {cmd}"
+
+# ── pet_bubble.rs: 承認バブル ────────────────────────────────────────
+
+"✔ 承認" = "✔ Approve"
+"✖ 拒否" = "✖ Deny"
+"+他{overflow}件" = "+{overflow} more"

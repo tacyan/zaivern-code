@@ -22,6 +22,7 @@ use crate::git;
 use crate::git_panel;
 use crate::highlight::Highlighter;
 use crate::html;
+use crate::i18n::{self, tr, trf};
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::lsp;
 use crate::markdown;
@@ -434,15 +435,15 @@ pub struct ZaivernApp {
 fn super_agent_reject_reason(command: &str) -> Option<String> {
     let cmd = command.trim();
     if cmd.is_empty() {
-        return Some("素のシェルなので診断を頼めません".into());
+        return Some(tr("素のシェルなので診断を頼めません"));
     }
     let Some(spec) = crate::agents::spec_for_command(cmd) else {
-        return Some("既知のエージェント CLI ではないため対応可否を判断できません".into());
+        return Some(tr("既知のエージェント CLI ではないため対応可否を判断できません"));
     };
     if spec.headless.is_empty() {
-        return Some(format!(
-            "{} はヘッドレス実行に対応していません (対話 TUI しか起動できません)",
-            spec.label
+        return Some(trf(
+            "{label} はヘッドレス実行に対応していません (対話 TUI しか起動できません)",
+            &[("label", spec.label.to_string())],
         ));
     }
     None
@@ -781,14 +782,57 @@ impl ZaivernApp {
 
         // 同梱の標準プラグインを ~/.zaivern/plugins へ展開してからスキャンする
         // (バンドル版が新しいときだけ上書きするので、ユーザーの編集は残る)
+        let mut existed: HashSet<String> = HashSet::new();
         if let Some(root) = plugins::plugins_root() {
+            // 「初回インストール」の検知用に、展開前からあったディレクトリ名を控える
+            if let Ok(rd) = std::fs::read_dir(&root) {
+                existed = rd
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    .collect();
+            }
             plugins::seed_bundled(&root);
         }
         self.plugins = plugins::scan_installed();
+        // `default_enabled = false` のプラグイン (english-mode 等、入れただけで
+        // 挙動が変わるもの) は初回展開時だけ無効で始める。一度でもユーザーが
+        // 触った後は cfg 側の記録に従う (更新シードで勝手に無効へ戻さない)。
+        let mut newly_disabled = false;
+        for p in self.plugins.iter() {
+            if !p.default_enabled
+                && !existed.contains(&p.name)
+                && !self.cfg.plugins.disabled.iter().any(|d| d == &p.name)
+            {
+                self.cfg.plugins.disabled.push(p.name.clone());
+                newly_disabled = true;
+            }
+        }
+        if newly_disabled {
+            let _ = config::save_plugins_section(&self.cfg);
+        }
         // 無効化リストと保存済み設定値を反映する。無効なプラグインは
         // 以降の登録 (コマンド/キーバインド/テーマ/スニペット) から一切外れる
         self.plugins.apply_disabled(&self.cfg.plugins.disabled);
         self.plugins.apply_all_settings(&self.cfg.plugins.settings);
+
+        // UI 言語: 有効な言語プラグインの辞書を i18n へ入れる。無ければ None で
+        // 日本語へ戻す。複数あれば名前順の先頭 (scan_installed が名前順)。
+        // 読めない辞書は黙って捨てず、理由をトーストで見せる。
+        let mut dict: Option<HashMap<String, String>> = None;
+        let mut lang_err: Option<String> = None;
+        for p in self.plugins.iter().filter(|p| p.active()) {
+            if let Some(lang) = &p.language {
+                match i18n::load_dict(&lang.dict) {
+                    Ok(d) => dict = Some(d),
+                    Err(e) => lang_err = Some(format!("{}: {e}", p.name)),
+                }
+                break;
+            }
+        }
+        i18n::set_dict(dict);
+        if let Some(e) = lang_err {
+            self.toast(trf("⚠ UI 言語辞書を読めません — {e}", &[("e", e)]), false);
+        }
 
         // 閉じたプラグインのパネル内容は残さない
         self.plugin_panels.retain(|(pl, id), _| {
@@ -911,12 +955,18 @@ impl ZaivernApp {
     fn run_plugin_command_by_id(&mut self, plugin: &str, cmd_id: &str, ctx: &egui::Context) {
         use plugins::PluginList;
         let Some((plugin, command)) = self.plugins.find_command(plugin, cmd_id) else {
-            self.toast(format!("🔌 コマンドが見つかりません: {plugin}/{cmd_id}"), false);
+            self.toast(
+                trf(
+                    "🔌 コマンドが見つかりません: {plugin}/{cmd_id}",
+                    &[("plugin", plugin.to_string()), ("cmd_id", cmd_id.to_string())],
+                ),
+                false,
+            );
             return;
         };
         if !plugin.active() {
             let name = plugin.name.clone();
-            self.toast(format!("🔌 {name} は無効になっています"), false);
+            self.toast(trf("🔌 {name} は無効になっています", &[("name", name)]), false);
             return;
         }
         let plugin_name = plugin.name.clone();
@@ -928,7 +978,13 @@ impl ZaivernApp {
             .unwrap_or_default();
         if !command.lang_matches(&lang_id) {
             self.toast(
-                format!("「{}」は {:?} 用のコマンドです", command.title, command.langs),
+                trf(
+                    "「{title}」は {langs} 用のコマンドです",
+                    &[
+                        ("title", command.title.clone()),
+                        ("langs", format!("{:?}", command.langs)),
+                    ],
+                ),
                 false,
             );
             return;
@@ -940,13 +996,13 @@ impl ZaivernApp {
             plugins::CmdInput::File => match active {
                 Some(b) => (b.text.clone(), Some(b.id), None),
                 None => {
-                    self.toast("実行にはファイルを開いてください", false);
+                    self.toast(tr("実行にはファイルを開いてください"), false);
                     return;
                 }
             },
             plugins::CmdInput::Selection => {
                 let Some(b) = active else {
-                    self.toast("実行にはファイルを開いてください", false);
+                    self.toast(tr("実行にはファイルを開いてください"), false);
                     return;
                 };
                 let ed_id = egui::Id::new(("zaivern-buffer", b.id));
@@ -956,7 +1012,7 @@ impl ZaivernApp {
                     .unwrap_or((0, 0));
                 let (s, e) = (range.0.min(range.1), range.0.max(range.1));
                 if s == e {
-                    self.toast("選択範囲がありません", false);
+                    self.toast(tr("選択範囲がありません"), false);
                     return;
                 }
                 let sel: String = b.text.chars().skip(s).take(e - s).collect();
@@ -986,7 +1042,7 @@ impl ZaivernApp {
             self.plugin_tx.clone(),
             ctx.clone(),
         );
-        self.toast(format!("🔌 {title} を実行中…"), true);
+        self.toast(trf("🔌 {title} を実行中…", &[("title", title)]), true);
     }
 
     /// ワーカースレッドから届いた gh の結果を GitHub パネルへ反映する。
@@ -1025,9 +1081,13 @@ impl ZaivernApp {
         while let Ok(r) = self.plugin_rx.try_recv() {
             if !r.ok {
                 let msg = r.stderr.trim();
-                let msg = if msg.is_empty() { "失敗しました (出力なし)" } else { msg };
+                let msg = if msg.is_empty() {
+                    tr("失敗しました (出力なし)")
+                } else {
+                    msg.to_string()
+                };
                 self.toast(
-                    format!("🔌 {} ({}): {}", r.title, r.plugin, notify::truncate_chars(msg, 200)),
+                    format!("🔌 {} ({}): {}", r.title, r.plugin, notify::truncate_chars(&msg, 200)),
                     false,
                 );
                 continue;
@@ -1036,7 +1096,7 @@ impl ZaivernApp {
                 plugins::CmdSink::Silent => {}
                 plugins::CmdSink::Notify => {
                     let msg = if r.stdout.trim().is_empty() {
-                        "完了しました".to_string()
+                        tr("完了しました")
                     } else {
                         notify::truncate_chars(r.stdout.trim(), 200)
                     };
@@ -1052,7 +1112,10 @@ impl ZaivernApp {
                         b.cache = None;
                         b.gutter = None;
                     }
-                    self.toast(format!("🔌 {} → 新規タブ", r.title), true);
+                    self.toast(
+                        trf("🔌 {title} → 新規タブ", &[("title", r.title.clone())]),
+                        true,
+                    );
                 }
                 plugins::CmdSink::Insert => {
                     let Some(i) = self
@@ -1061,7 +1124,13 @@ impl ZaivernApp {
                         .iter()
                         .position(|b| Some(b.id) == r.buffer_id)
                     else {
-                        self.toast(format!("🔌 {}: 反映先のタブが閉じられています", r.title), false);
+                        self.toast(
+                            trf(
+                                "🔌 {title}: 反映先のタブが閉じられています",
+                                &[("title", r.title.clone())],
+                            ),
+                            false,
+                        );
                         continue;
                     };
                     let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
@@ -1077,7 +1146,10 @@ impl ZaivernApp {
                     b.gutter = None;
                     let end = cur + r.stdout.chars().count();
                     self.pending_select = Some((end, end));
-                    self.toast(format!("🔌 {} を挿入しました", r.title), true);
+                    self.toast(
+                        trf("🔌 {title} を挿入しました", &[("title", r.title.clone())]),
+                        true,
+                    );
                 }
                 plugins::CmdSink::Replace => {
                     let Some(i) = self
@@ -1086,7 +1158,13 @@ impl ZaivernApp {
                         .iter()
                         .position(|b| Some(b.id) == r.buffer_id)
                     else {
-                        self.toast(format!("🔌 {}: 反映先のタブが閉じられています", r.title), false);
+                        self.toast(
+                            trf(
+                                "🔌 {title}: 反映先のタブが閉じられています",
+                                &[("title", r.title.clone())],
+                            ),
+                            false,
+                        );
                         continue;
                     };
                     let b = &mut self.editor.buffers[i];
@@ -1096,7 +1174,10 @@ impl ZaivernApp {
                             let cur_sel: String = b.text.chars().skip(s).take(e - s).collect();
                             if cur_sel != r.original {
                                 self.toast(
-                                    format!("🔌 {}: 実行中に編集されたため適用を中止しました", r.title),
+                                    trf(
+                                        "🔌 {title}: 実行中に編集されたため適用を中止しました",
+                                        &[("title", r.title.clone())],
+                                    ),
                                     false,
                                 );
                                 continue;
@@ -1108,13 +1189,16 @@ impl ZaivernApp {
                             b.gutter = None;
                             let np = s + r.stdout.chars().count();
                             self.pending_select = Some((np, np));
-                            self.toast(format!("🔌 {} を適用しました", r.title), true);
+                            self.toast(trf("🔌 {title} を適用しました", &[("title", r.title.clone())]), true);
                         }
                         // ファイル全体の置換 (整形など)
                         None => {
                             if b.text != r.original {
                                 self.toast(
-                                    format!("🔌 {}: 実行中に編集されたため適用を中止しました", r.title),
+                                    trf(
+                                        "🔌 {title}: 実行中に編集されたため適用を中止しました",
+                                        &[("title", r.title.clone())],
+                                    ),
                                     false,
                                 );
                                 continue;
@@ -1123,7 +1207,13 @@ impl ZaivernApp {
                                 if r.resave {
                                     continue; // 保存時フックで変更なし → 静かに終了
                                 }
-                                self.toast(format!("🔌 {}: 変更はありません", r.title), true);
+                                self.toast(
+                                    trf(
+                                        "🔌 {title}: 変更はありません",
+                                        &[("title", r.title.clone())],
+                                    ),
+                                    true,
+                                );
                                 continue;
                             }
                             b.text = r.stdout.clone();
@@ -1138,18 +1228,27 @@ impl ZaivernApp {
                                             b.disk_mtime = disk_mtime(&path);
                                             b.conflict_notified = None;
                                             self.toast(
-                                                format!("🔌 {} → 整形して保存しました", r.title),
+                                                trf(
+                                                    "🔌 {title} → 整形して保存しました",
+                                                    &[("title", r.title.clone())],
+                                                ),
                                                 true,
                                             );
                                         }
                                         Err(e) => self.toast(
-                                            format!("🔌 {}: 再保存に失敗: {e}", r.title),
+                                            trf(
+                                                "🔌 {title}: 再保存に失敗: {e}",
+                                                &[
+                                                    ("title", r.title.clone()),
+                                                    ("e", e.to_string()),
+                                                ],
+                                            ),
                                             false,
                                         ),
                                     }
                                 }
                             } else {
-                                self.toast(format!("🔌 {} を適用しました", r.title), true);
+                                self.toast(trf("🔌 {title} を適用しました", &[("title", r.title.clone())]), true);
                             }
                         }
                     }
@@ -1165,7 +1264,13 @@ impl ZaivernApp {
                 // 指定パネルの本文を差し替える
                 plugins::CmdSink::Panel => {
                     let Some(panel) = r.panel.clone() else {
-                        self.toast(format!("🔌 {}: 出力先パネルが未指定です", r.title), false);
+                        self.toast(
+                            trf(
+                                "🔌 {title}: 出力先パネルが未指定です",
+                                &[("title", r.title.clone())],
+                            ),
+                            false,
+                        );
                         continue;
                     };
                     self.set_plugin_panel(&r.plugin, &panel, r.stdout.clone());
@@ -1187,7 +1292,13 @@ impl ZaivernApp {
             .iter()
             .any(|p| p.active() && p.name == plugin && p.panels.iter().any(|x| x.id == panel));
         if !exists {
-            self.toast(format!("🔌 パネルが見つかりません: {plugin}/{panel}"), false);
+            self.toast(
+                trf(
+                    "🔌 パネルが見つかりません: {plugin}/{panel}",
+                    &[("plugin", plugin.to_string()), ("panel", panel.to_string())],
+                ),
+                false,
+            );
             return false;
         }
         self.plugin_panels
@@ -1217,7 +1328,7 @@ impl ZaivernApp {
                 .map(|_| self.agents.active),
         };
         let Some(i) = idx else {
-            self.toast("エージェントセッションが見つかりません", false);
+            self.toast(tr("エージェントセッションが見つかりません"), false);
             return false;
         };
         let title = {
@@ -1226,7 +1337,7 @@ impl ZaivernApp {
             s.title.clone()
         };
         self.agents.panel_open = true;
-        let verb = if submit { "送信" } else { "入力欄へ" };
+        let verb = if submit { tr("送信") } else { tr("入力欄へ") };
         self.toast(
             format!("🔌 {title} {verb}: {}", notify::truncate_chars(text, 60)),
             true,
@@ -1273,9 +1384,9 @@ impl ZaivernApp {
                         b.text = text;
                         b.cache = None;
                         b.gutter = None;
-                        self.toast("🔌 バッファを置き換えました", true);
+                        self.toast(tr("🔌 バッファを置き換えました"), true);
                     }
-                    None => self.toast("🔌 置き換え先のタブがありません", false),
+                    None => self.toast(tr("🔌 置き換え先のタブがありません"), false),
                 },
                 A::NewTab { title, text } => {
                     self.editor.new_untitled();
@@ -1297,7 +1408,7 @@ impl ZaivernApp {
                 A::RunTerminal { command, cwd } => self.run_in_terminal(&command, cwd.as_deref(), ctx),
                 A::OpenUrl { url } => {
                     open_external(&url);
-                    self.toast(format!("🔗 {url} を開きました"), true);
+                    self.toast(trf("🔗 {url} を開きました", &[("url", url)]), true);
                 }
                 A::SetPanel { panel, text } => {
                     self.set_plugin_panel(plugin, &panel, text);
@@ -1310,7 +1421,7 @@ impl ZaivernApp {
                 A::SetSetting { key, value } => {
                     self.cfg.plugins.set_setting(plugin, &key, &value);
                     if let Err(e) = config::save_plugins_section(&self.cfg) {
-                        self.toast(format!("設定の保存に失敗: {e}"), false);
+                        self.toast(trf("設定の保存に失敗: {e}", &[("e", e.to_string())]), false);
                     }
                     // 実行中のプラグインへも即座に反映する
                     if let Some(p) = self.plugins.iter_mut().find(|p| p.name == plugin) {
@@ -1344,7 +1455,7 @@ impl ZaivernApp {
     /// カーソル位置へテキストを差し込む。
     fn insert_at_cursor(&mut self, text: &str, ctx: &egui::Context) {
         let Some(i) = self.editor.active else {
-            self.toast("🔌 挿入先のタブがありません", false);
+            self.toast(tr("🔌 挿入先のタブがありません"), false);
             return;
         };
         let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
@@ -1543,8 +1654,11 @@ impl ZaivernApp {
             .agents
             .launch(&preset, &root, crate::agents::Approval::Agent, ctx)
         {
-            Ok(()) => self.toast(format!("▶ {command} を実行しています"), true),
-            Err(e) => self.toast(format!("実行に失敗: {e}"), false),
+            Ok(()) => self.toast(
+                trf("▶ {command} を実行しています", &[("command", command.to_string())]),
+                true,
+            ),
+            Err(e) => self.toast(trf("実行に失敗: {e}", &[("e", e.to_string())]), false),
         }
     }
 
@@ -1558,13 +1672,13 @@ impl ZaivernApp {
         let mut open = true;
         let mut create = false;
         let mut cancel = false;
-        egui::Window::new("➕ 新規プラグイン")
+        egui::Window::new(tr("➕ 新規プラグイン"))
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
             .show(ctx, |ui| {
-                ui.label("プラグイン名 (小文字英数と - _ のみ):");
+                ui.label(tr("プラグイン名 (小文字英数と - _ のみ):"));
                 let re = ui.text_edit_singleline(&mut name);
                 if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     create = true;
@@ -1572,20 +1686,20 @@ impl ZaivernApp {
                 let ok = plugins::valid_name(&name.trim().to_lowercase());
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(ok, egui::Button::new("作成")).clicked() {
+                    if ui.add_enabled(ok, egui::Button::new(tr("作成"))).clicked() {
                         create = true;
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(tr("キャンセル")).clicked() {
                         cancel = true;
                     }
                     if !name.trim().is_empty() && !ok {
-                        ui.label(RichText::new("名前が不正です").color(theme.warn));
+                        ui.label(RichText::new(tr("名前が不正です")).color(theme.warn));
                     }
                 });
                 ui.label(
-                    RichText::new(
+                    RichText::new(tr(
                         "~/.zaivern/plugins/<名前>/ にコマンド・テーマ・スニペットの\nテンプレート一式を生成し、plugin.toml を開きます",
-                    )
+                    ))
                     .size(10.5)
                     .color(theme.text_dim),
                 );
@@ -1595,11 +1709,14 @@ impl ZaivernApp {
                 Ok(dir) => {
                     self.rebuild_plugins();
                     self.open_path(&dir.join("plugin.toml"));
-                    self.toast(format!("➕ 作成しました: {}", dir.display()), true);
+                    self.toast(
+                        trf("➕ 作成しました: {dir}", &[("dir", dir.display().to_string())]),
+                        true,
+                    );
                     self.new_plugin_name = None;
                 }
                 Err(e) => {
-                    self.toast(format!("作成失敗: {e}"), false);
+                    self.toast(trf("作成失敗: {e}", &[("e", e.to_string())]), false);
                     self.new_plugin_name = Some(name);
                 }
             }
@@ -1622,7 +1739,7 @@ impl ZaivernApp {
         match action {
             Some(agent_picker::PickerAction::Reprobe) => {
                 self.agent_picker.probe(ctx);
-                self.toast("⟳ PATH を調べています…", true);
+                self.toast(tr("⟳ PATH を調べています…"), true);
             }
             Some(agent_picker::PickerAction::Add { preset, spec }) => {
                 let installed = self.agent_picker.is_installed(spec.bin);
@@ -1633,16 +1750,23 @@ impl ZaivernApp {
                         // (書けていないのに一覧へ出すと、再起動で消えて混乱する)
                         self.cfg.agents.push(preset);
                         if installed {
-                            self.toast(format!("➕ {name} を追加しました"), true);
+                            self.toast(trf("➕ {name} を追加しました", &[("name", name)]), true);
                         } else {
                             // 起動しても必ず失敗するので、黙って足したように見せない。
-                            self.toast_warn(format!(
-                                "➕ {name} を追加しましたが、{} は未インストールです → {}",
-                                spec.bin, spec.install
+                            self.toast_warn(trf(
+                                "➕ {name} を追加しましたが、{bin} は未インストールです → {install}",
+                                &[
+                                    ("name", name),
+                                    ("bin", spec.bin.to_string()),
+                                    ("install", spec.install.to_string()),
+                                ],
                             ));
                         }
                     }
-                    Err(e) => self.toast(format!("設定に書けませんでした: {e}"), false),
+                    Err(e) => self.toast(
+                        trf("設定に書けませんでした: {e}", &[("e", e.to_string())]),
+                        false,
+                    ),
                 }
             }
             None => {}
@@ -1873,7 +1997,7 @@ impl ZaivernApp {
         let prefix = editor_ops::comment_prefix_for(&self.editor.buffers[i].lang);
         if matches!(op, EditOp::ToggleComment) && prefix.is_none() {
             let lang = self.editor.buffers[i].lang.clone();
-            self.toast(format!("{lang} の行コメント記法が不明です"), false);
+            self.toast(trf("{lang} の行コメント記法が不明です", &[("lang", lang)]), false);
             return;
         }
 
@@ -2022,7 +2146,10 @@ impl ZaivernApp {
                 if reloaded {
                     if let Some(i) = self.editor.active {
                         let title = self.editor.buffers[i].title.clone();
-                        self.toast(format!("↻ {title} を再読み込みしました(外部で変更)"), true);
+                        self.toast(
+                            trf("↻ {title} を再読み込みしました(外部で変更)", &[("title", title)]),
+                            true,
+                        );
                         self.queue_lsp_change(i);
                     }
                 }
@@ -2050,12 +2177,16 @@ impl ZaivernApp {
         for ev in self.editor.check_external() {
             match ev {
                 ExternalEvent::Reloaded { index, title } => {
-                    self.toast(format!("↻ {title} を再読み込みしました(外部で変更)"), true);
+                    self.toast(
+                        trf("↻ {title} を再読み込みしました(外部で変更)", &[("title", title)]),
+                        true,
+                    );
                     self.queue_lsp_change(index);
                 }
                 ExternalEvent::Conflict { title } => {
-                    self.toast_warn(format!(
-                        "⚠ {title} が外部で変更されました — 未保存の編集があるため読み直していません(⌘S で上書き)"
+                    self.toast_warn(trf(
+                        "⚠ {title} が外部で変更されました — 未保存の編集があるため読み直していません(⌘S で上書き)",
+                        &[("title", title)],
                     ));
                 }
             }
@@ -2101,25 +2232,34 @@ impl ZaivernApp {
         // 絶対パス指定で一致に失敗する(spec_for_command は末尾要素で照合する)。
         let is_agent_cli = spec_for_command(&p.command).is_some();
         let via = if approval == Approval::Agent {
-            "（Agent欄の指定どおり）"
+            tr("（Agent欄の指定どおり）")
         } else {
-            "（既定モード）"
+            tr("（既定モード）")
         };
         let cwd = self.primary_root().to_path_buf();
         match self.agents.launch(&p, &cwd, approval, ctx) {
             Ok(()) => {
                 if is_agent_cli && is_bypass {
-                    self.toast_warn(format!(
-                        "⚡ {} を全自動モードで起動しました{via}",
-                        p.name
+                    self.toast_warn(trf(
+                        "⚡ {name} を全自動モードで起動しました{via}",
+                        &[("name", p.name.clone()), ("via", via)],
                     ));
                 } else if is_agent_cli {
                     self.toast(
-                        format!("🛡 {} を承認モードで起動しました{via}", p.name),
+                        trf(
+                            "🛡 {name} を承認モードで起動しました{via}",
+                            &[("name", p.name.clone()), ("via", via)],
+                        ),
                         true,
                     );
                 } else {
-                    self.toast(format!("{} {} を起動しました", p.icon, p.name), true);
+                    self.toast(
+                        trf(
+                            "{icon} {name} を起動しました",
+                            &[("icon", p.icon.clone()), ("name", p.name.clone())],
+                        ),
+                        true,
+                    );
                 }
             }
             Err(e) => self.toast(e, false),
@@ -2130,9 +2270,9 @@ impl ZaivernApp {
         if let Some(s) = self.agents.active_session() {
             s.write_bytes(text.as_bytes());
             self.agents.panel_open = true;
-            self.toast("アクティブなエージェントに送信しました", true);
+            self.toast(tr("アクティブなエージェントに送信しました"), true);
         } else {
-            self.toast("エージェントセッションがありません（👾 Agent＋ から起動）", false);
+            self.toast(tr("エージェントセッションがありません（👾 Agent＋ から起動）"), false);
         }
     }
 
@@ -2143,7 +2283,7 @@ impl ZaivernApp {
         // PR 差分などの非ファイルタブは保存できない。ここで止めないと
         // 「名前を付けて保存」ダイアログが開いて差分がファイルとして書き出される。
         if self.editor.buffers[i].kind.read_only() {
-            self.toast("このタブは読み取り専用です (保存できません)", false);
+            self.toast(tr("このタブは読み取り専用です (保存できません)"), false);
             return false;
         }
         let (need_dialog, cur_path) = {
@@ -2178,11 +2318,14 @@ impl ZaivernApp {
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 self.tree.invalidate();
-                self.toast(format!("💾 保存しました: {}", path.display()), true);
+                self.toast(
+                    trf("💾 保存しました: {path}", &[("path", path.display().to_string())]),
+                    true,
+                );
                 true
             }
             Err(e) => {
-                self.toast(format!("保存に失敗しました: {e}"), false);
+                self.toast(trf("保存に失敗しました: {e}", &[("e", e.to_string())]), false);
                 false
             }
         }
@@ -2234,7 +2377,7 @@ impl ZaivernApp {
             .or_else(|| hay.find(needle));
 
         let Some(byte_pos) = found else {
-            self.toast("見つかりませんでした", false);
+            self.toast(tr("見つかりませんでした"), false);
             self.find.last = None;
             return;
         };
@@ -2256,12 +2399,18 @@ impl ZaivernApp {
     fn open_workspace(&mut self, dir: PathBuf, ctx: &egui::Context) {
         let roots = file_tree::normalize_roots(vec![dir.clone()]);
         if roots.is_empty() {
-            self.toast_warn(format!("📂 {} を開けませんでした", dir.display()));
+            self.toast_warn(trf(
+                "📂 {dir} を開けませんでした",
+                &[("dir", dir.display().to_string())],
+            ));
             return;
         }
         self.set_roots(roots, ctx);
         self.restore_session(ctx);
-        self.toast(format!("📂 {} を開きました", dir.display()), true);
+        self.toast(
+            trf("📂 {dir} を開きました", &[("dir", dir.display().to_string())]),
+            true,
+        );
     }
 
     /// GitHub Issue の「⚡ 着手」ワンフロー:
@@ -2442,22 +2591,31 @@ impl ZaivernApp {
                 if dir.is_dir() {
                     self.add_folder_to_workspace(dir, ctx);
                 } else {
-                    self.toast(format!("フォルダがありません: {}", dir.display()), false);
+                    self.toast(
+                        trf(
+                            "フォルダがありません: {dir}",
+                            &[("dir", dir.display().to_string())],
+                        ),
+                        false,
+                    );
                 }
             }
             Cmd::RemoveFolder(dir) => {
                 if self.roots.len() <= 1 {
                     // ルートが空になると行き先が無くなるので拒否する
-                    self.toast_warn("最後のフォルダは削除できません");
+                    self.toast_warn(tr("最後のフォルダは削除できません"));
                 } else {
                     let next: Vec<PathBuf> =
                         self.roots.iter().filter(|r| **r != dir).cloned().collect();
                     if next.len() == self.roots.len() {
-                        self.toast_warn("そのフォルダはワークスペースにありません");
+                        self.toast_warn(tr("そのフォルダはワークスペースにありません"));
                     } else {
                         self.set_roots(next, ctx);
                         self.toast(
-                            format!("📂 {} をワークスペースから削除しました", dir.display()),
+                            trf(
+                                "📂 {dir} をワークスペースから削除しました",
+                                &[("dir", dir.display().to_string())],
+                            ),
                             true,
                         );
                     }
@@ -2502,7 +2660,7 @@ impl ZaivernApp {
                 if ok {
                     self.md_preview = !self.md_preview;
                 } else {
-                    self.toast("Markdown / HTML ファイルではありません", false);
+                    self.toast(tr("Markdown / HTML ファイルではありません"), false);
                 }
             }
             Cmd::ToggleSidebar => {
@@ -2547,7 +2705,10 @@ impl ZaivernApp {
                     b.cache = None;
                 }
                 config::save_state(&self.cfg);
-                self.toast(format!("🎨 {} を適用しました", self.theme.label), true);
+                self.toast(
+                    trf("🎨 {label} を適用しました", &[("label", self.theme.label.clone())]),
+                    true,
+                );
             }
             Cmd::OpenConfig => {
                 config::ensure_default();
@@ -2571,7 +2732,7 @@ impl ZaivernApp {
                     b.gutter = None;
                 }
                 config::save_state(&self.cfg);
-                self.toast("🔄 設定を再読み込みしました", true);
+                self.toast(tr("🔄 設定を再読み込みしました"), true);
             }
             Cmd::FontInc => {
                 self.cfg.editor_font_size = (self.cfg.editor_font_size + 1.0).min(32.0);
@@ -2594,13 +2755,13 @@ impl ZaivernApp {
                 });
                 match rel {
                     Some(r) => self.send_to_agent(format!("@{r} ")),
-                    None => self.toast("保存済みのファイルを開いてください", false),
+                    None => self.toast(tr("保存済みのファイルを開いてください"), false),
                 }
             }
             Cmd::RefreshTree => {
                 self.tree.invalidate();
                 self.rebuild_index();
-                self.toast("🌲 ツリーを再読み込みしました", true);
+                self.toast(tr("🌲 ツリーを再読み込みしました"), true);
             }
             Cmd::SetApproval(mode) => {
                 let mode = match mode.as_str() {
@@ -2610,20 +2771,20 @@ impl ZaivernApp {
                 self.cfg.approval_mode = mode.clone();
                 config::save_state(&self.cfg);
                 match mode.as_str() {
-                    "auto" => self.toast_warn(
+                    "auto" => self.toast_warn(tr(
                         "⚡ 既定=全自動: 以後起動する Claude/Codex/Antigravity はすべて自動承認 (bypass フラグ付与)",
-                    ),
+                    )),
                     "agent" => self.toast(
-                        "👾 既定=Agent優先: 以後は各プリセットのコマンドどおりに起動します（(全自動) プリセットのみ自動承認）",
+                        tr("👾 既定=Agent優先: 以後は各プリセットのコマンドどおりに起動します（(全自動) プリセットのみ自動承認）"),
                         true,
                     ),
                     _ => self.toast(
-                        "🛡 既定=承認: 以後起動する Claude/Codex/Antigravity は操作ごとに許可が必要です",
+                        tr("🛡 既定=承認: 以後起動する Claude/Codex/Antigravity は操作ごとに許可が必要です"),
                         true,
                     ),
                 }
                 if self.agents.running_count() > 0 {
-                    self.toast("実行中のセッションは各行の 🛡 ボタン（または 🛡 全切替）で切替できます", true);
+                    self.toast(tr("実行中のセッションは各行の 🛡 ボタン（または 🛡 全切替）で切替できます"), true);
                 }
             }
             Cmd::TogglePet => {
@@ -2631,9 +2792,9 @@ impl ZaivernApp {
                 config::save_state(&self.cfg);
                 self.toast(
                     if self.cfg.show_pet {
-                        "🐾 ペットを表示しました"
+                        tr("🐾 ペットを表示しました")
                     } else {
-                        "🐾 ペットを隠しました（🐾 で再表示）"
+                        tr("🐾 ペットを隠しました（🐾 で再表示）")
                     },
                     true,
                 );
@@ -2641,16 +2802,17 @@ impl ZaivernApp {
             Cmd::CyclePermissionAll => {
                 let n = self.agents.cycle_permission_all();
                 if n > 0 {
-                    self.toast_warn(format!(
-                        "🛡 {n} 件のエージェントに権限モード切替を送信しました（各画面の表示を確認してください）"
+                    self.toast_warn(trf(
+                        "🛡 {n} 件のエージェントに権限モード切替を送信しました（各画面の表示を確認してください）",
+                        &[("n", n.to_string())],
                     ));
                 } else {
-                    self.toast("実行中の対応エージェントがありません", false);
+                    self.toast(tr("実行中の対応エージェントがありません"), false);
                 }
             }
             Cmd::SetPetImage => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("画像", &["png", "jpg", "jpeg", "gif", "webp"])
+                    .add_filter(tr("画像"), &["png", "jpg", "jpeg", "gif", "webp"])
                     .pick_file()
                 {
                     match load_pet_texture(ctx, &path) {
@@ -2659,9 +2821,9 @@ impl ZaivernApp {
                             self.cfg.pet_image = Some(path.to_string_lossy().to_string());
                             self.cfg.show_pet = true;
                             config::save_state(&self.cfg);
-                            self.toast("🖼 ペット画像を変更しました", true);
+                            self.toast(tr("🖼 ペット画像を変更しました"), true);
                         }
-                        None => self.toast("画像を読み込めませんでした", false),
+                        None => self.toast(tr("画像を読み込めませんでした"), false),
                     }
                 }
             }
@@ -2669,14 +2831,14 @@ impl ZaivernApp {
                 self.pet_tex = None;
                 self.cfg.pet_image = None;
                 config::save_state(&self.cfg);
-                self.toast("↺ ペットを既定の絵に戻しました", true);
+                self.toast(tr("↺ ペットを既定の絵に戻しました"), true);
             }
             Cmd::ResetPetPos => {
                 self.pet_pos = None;
                 self.cfg.pet_x = None;
                 self.cfg.pet_y = None;
                 config::save_state(&self.cfg);
-                self.toast("🐾 ペットの位置を既定(右下)に戻しました", true);
+                self.toast(tr("🐾 ペットの位置を既定(右下)に戻しました"), true);
             }
             Cmd::SetPetVariant(name) => {
                 self.cfg.pet_variant = name;
@@ -2699,9 +2861,9 @@ impl ZaivernApp {
                 config::save_state(&self.cfg);
                 self.toast(
                     if self.cfg.pet_sounds {
-                        "🔔 効果音を有効にしました"
+                        tr("🔔 効果音を有効にしました")
                     } else {
-                        "🔕 効果音を無効にしました"
+                        tr("🔕 効果音を無効にしました")
                     },
                     true,
                 );
@@ -2733,12 +2895,15 @@ impl ZaivernApp {
                 self.cfg.voice_engine = e;
                 config::save_state(&self.cfg);
                 if self.cfg.voice_engine == "command" && self.cfg.voice_command.trim().is_empty() {
-                    self.toast_warn(
+                    self.toast_warn(tr(
                         "外部エンジンを使うには config.toml の voice_command を設定してください",
-                    );
+                    ));
                 } else {
                     self.toast(
-                        format!("🎤 音声認識エンジン: {}", self.cfg.voice_engine),
+                        trf(
+                            "🎤 音声認識エンジン: {engine}",
+                            &[("engine", self.cfg.voice_engine.clone())],
+                        ),
                         true,
                     );
                 }
@@ -2746,18 +2911,21 @@ impl ZaivernApp {
             Cmd::SetVoiceLang(l) => {
                 self.cfg.voice_lang = l;
                 config::save_state(&self.cfg);
-                self.toast(format!("🎤 認識言語: {}", self.cfg.voice_lang), true);
+                self.toast(
+                    trf("🎤 認識言語: {lang}", &[("lang", self.cfg.voice_lang.clone())]),
+                    true,
+                );
             }
             Cmd::SetVoiceKeyword(k) => {
                 self.cfg.voice_keyword = k;
                 config::save_state(&self.cfg);
                 if self.cfg.voice_keyword.is_empty() {
-                    self.toast("🎤 送信は常に手動 Enter になりました", true);
+                    self.toast(tr("🎤 送信は常に手動 Enter になりました"), true);
                 } else {
                     self.toast(
-                        format!(
-                            "🎤 「{}」と話すとそのまま送信します",
-                            self.cfg.voice_keyword
+                        trf(
+                            "🎤 「{keyword}」と話すとそのまま送信します",
+                            &[("keyword", self.cfg.voice_keyword.clone())],
                         ),
                         true,
                     );
@@ -2770,32 +2938,37 @@ impl ZaivernApp {
             }
             Cmd::InstallPlugin => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Zaivern プラグイン", &["zvplug", "zip"])
+                    .add_filter(tr("Zaivern プラグイン"), &["zvplug", "zip"])
                     .pick_file()
                 {
                     match plugins::install(&path) {
                         Ok(p) => {
-                            let msg = format!(
-                                "📦 {} v{} をインストールしました(コマンド{} / テーマ{} / スニペット{})",
-                                p.name,
-                                p.version,
-                                p.commands.len(),
-                                p.themes.len(),
-                                p.snippet_files.len()
+                            let msg = trf(
+                                "📦 {name} v{version} をインストールしました(コマンド{commands} / テーマ{themes} / スニペット{snippets})",
+                                &[
+                                    ("name", p.name.clone()),
+                                    ("version", p.version.clone()),
+                                    ("commands", p.commands.len().to_string()),
+                                    ("themes", p.themes.len().to_string()),
+                                    ("snippets", p.snippet_files.len().to_string()),
+                                ],
                             );
                             self.rebuild_plugins();
                             self.sidebar_open = true;
                             self.sidebar_tab = SidebarTab::Plugins;
                             self.toast(msg, true);
                         }
-                        Err(e) => self.toast(format!("インストール失敗: {e}"), false),
+                        Err(e) => self.toast(trf("インストール失敗: {e}", &[("e", e.to_string())]), false),
                     }
                 }
             }
             Cmd::RescanPlugins => {
                 self.rebuild_plugins();
                 self.toast(
-                    format!("🔌 プラグインを再スキャンしました({} 件)", self.plugins.len()),
+                    trf(
+                        "🔌 プラグインを再スキャンしました({n} 件)",
+                        &[("n", self.plugins.len().to_string())],
+                    ),
                     true,
                 );
             }
@@ -3006,16 +3179,16 @@ impl ZaivernApp {
 
                     let ws_name = roots_label(&self.roots);
                     ui.menu_button(format!("📂 {ws_name}"), |ui| {
-                        if ui.button("フォルダを開く…").clicked() {
+                        if ui.button(tr("フォルダを開く…")).clicked() {
                             cmds.push(Cmd::OpenFolder);
                             ui.close_menu();
                         }
-                        if ui.button("フォルダをワークスペースに追加…").clicked() {
+                        if ui.button(tr("フォルダをワークスペースに追加…")).clicked() {
                             cmds.push(Cmd::AddFolder);
                             ui.close_menu();
                         }
                         if self.roots.len() > 1 {
-                            ui.menu_button("フォルダをワークスペースから削除", |ui| {
+                            ui.menu_button(tr("フォルダをワークスペースから削除"), |ui| {
                                 for r in &self.roots {
                                     let name = root_name(r);
                                     if ui.button(name).clicked() {
@@ -3025,16 +3198,16 @@ impl ZaivernApp {
                                 }
                             });
                         }
-                        if ui.button("ツリーを再読み込み").clicked() {
+                        if ui.button(tr("ツリーを再読み込み")).clicked() {
                             cmds.push(Cmd::RefreshTree);
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("⚙ 設定 config.toml を開く").clicked() {
+                        if ui.button(tr("⚙ 設定 config.toml を開く")).clicked() {
                             cmds.push(Cmd::OpenConfig);
                             ui.close_menu();
                         }
-                        if ui.button("🔄 設定を再読み込み").clicked() {
+                        if ui.button(tr("🔄 設定を再読み込み")).clicked() {
                             cmds.push(Cmd::ReloadConfig);
                             ui.close_menu();
                         }
@@ -3056,7 +3229,10 @@ impl ZaivernApp {
                             if !self.custom_themes.is_empty() {
                                 ui.separator();
                                 ui.menu_button(
-                                    format!("🔌 カスタムテーマ ({})", self.custom_themes.len()),
+                                    trf(
+                                        "🔌 カスタムテーマ ({n})",
+                                        &[("n", self.custom_themes.len().to_string())],
+                                    ),
                                     |ui| {
                                         egui::ScrollArea::vertical()
                                             .id_salt("custom-themes")
@@ -3075,18 +3251,18 @@ impl ZaivernApp {
                             }
                         })
                         .response
-                        .on_hover_text("テーマ（プラグインのカスタムテーマも使えます）");
+                        .on_hover_text(tr("テーマ（プラグインのカスタムテーマも使えます）"));
 
                         // スマホリモート (QR コード表示)
                         if ui
                             .selectable_label(self.remote_open, "📱")
-                            .on_hover_text(
+                            .on_hover_text(tr(
                                 "スマホから操作 — QR コードを表示\n\
                                  同じ Wi-Fi のスマホで読み取るだけで、編集・保存・\n\
                                  エージェント操作(Claude の承認も)ができます\n\
                                  🎤 音声入力: PC は Cockpit 各タブの 🎤 /\n\
                                  ブロードキャスト欄の 🎤、スマホは「エージェント」タブ",
-                            )
+                            ))
                             .clicked()
                         {
                             cmds.push(Cmd::ToggleRemote);
@@ -3098,7 +3274,7 @@ impl ZaivernApp {
                         if rec
                             && ui
                                 .button(RichText::new("⏹").color(theme.err).strong())
-                                .on_hover_text("音声入力を止める")
+                                .on_hover_text(tr("音声入力を止める"))
                                 .clicked()
                         {
                             cmds.push(Cmd::VoiceStop);
@@ -3110,20 +3286,24 @@ impl ZaivernApp {
                                     .color(if rec { theme.err } else { theme.text }),
                             )
                             .on_hover_text(if rec {
-                                "録音中 — もう一度押すと止まります".to_string()
+                                tr("録音中 — もう一度押すと止まります")
                             } else {
                                 // この PC で実際に通る経路を先に見せる (押してから
                                 // 「使えません」と言われるのを避ける)
-                                format!(
+                                trf(
                                     "音声入力を始める\n\
                                      ⏹ を押すまで、話した内容が入力欄に入り続けます\n\
                                      (Enter は送られないので、確認して自分で送信)\n\
-                                     {}",
-                                    voice::route_hint(
-                                        &self.cfg.voice_engine,
-                                        &self.cfg.voice_lang,
-                                        &self.cfg.voice_command,
-                                    )
+                                     {hint}",
+                                    &[(
+                                        "hint",
+                                        voice::route_hint(
+                                            &self.cfg.voice_engine,
+                                            &self.cfg.voice_lang,
+                                            &self.cfg.voice_command,
+                                        )
+                                        .to_string(),
+                                    )],
                                 )
                             })
                             .clicked()
@@ -3133,19 +3313,19 @@ impl ZaivernApp {
                         }
                         ui.menu_button("▾", |ui| {
                             ui.label(
-                                RichText::new(
+                                RichText::new(tr(
                                     "話した内容は入力欄に入るだけです。\n\
                                      送信されるのは自分で Enter を押したときだけ。",
-                                )
+                                ))
                                 .size(11.0)
                                 .color(theme.text_dim),
                             );
                             ui.separator();
                             if ui
                                 .button(if rec {
-                                    "⏹ 録音を止める"
+                                    tr("⏹ 録音を止める")
                                 } else {
-                                    "🎤 いま録音する (アクティブなエージェントへ)"
+                                    tr("🎤 いま録音する (アクティブなエージェントへ)")
                                 })
                                 .clicked()
                             {
@@ -3160,17 +3340,19 @@ impl ZaivernApp {
                             } else {
                                 voice::Target::from_name(&self.cfg.voice_target)
                             };
-                            ui.label(RichText::new("届け先").size(11.0).color(theme.text_dim));
+                            ui.label(RichText::new(tr("届け先")).size(11.0).color(theme.text_dim));
                             for (t, label) in [
                                 (voice::Target::Active, "🎯 アクティブなエージェント"),
                                 (voice::Target::Broadcast, "📣 全エージェントへブロードキャスト"),
                             ] {
-                                if ui.radio(cur == t, label).clicked() {
+                                if ui.radio(cur == t, tr(label)).clicked() {
                                     cmds.push(Cmd::SetVoiceTarget(t));
                                     ui.close_menu();
                                 }
                             }
-                            ui.menu_button(format!("🌐 言語: {}", self.cfg.voice_lang), |ui| {
+                            ui.menu_button(
+                                trf("🌐 言語: {lang}", &[("lang", self.cfg.voice_lang.clone())]),
+                                |ui| {
                                 for (code, label) in [
                                     ("ja-JP", "日本語"),
                                     ("en-US", "English (US)"),
@@ -3185,21 +3367,25 @@ impl ZaivernApp {
                             });
                             ui.menu_button(
                                 if self.cfg.voice_keyword.is_empty() {
-                                    "🗣 合図で送信: なし (常に手動 Enter)".to_string()
+                                    tr("🗣 合図で送信: なし (常に手動 Enter)")
                                 } else {
-                                    format!("🗣 合図で送信: 「{}」", self.cfg.voice_keyword)
+                                    trf(
+                                        "🗣 合図で送信: 「{keyword}」",
+                                        &[("keyword", self.cfg.voice_keyword.clone())],
+                                    )
                                 },
                                 |ui| {
                                     ui.label(
-                                        RichText::new(
+                                        RichText::new(tr(
                                             "この言葉で終わったときだけ Enter まで送ります",
-                                        )
+                                        ))
                                         .size(11.0)
                                         .color(theme.text_dim),
                                     );
                                     for kw in ["", "送信", "送って", "オーケー"] {
                                         let sel = self.cfg.voice_keyword == kw;
-                                        let label = if kw.is_empty() { "なし" } else { kw };
+                                        let label =
+                                            if kw.is_empty() { tr("なし") } else { kw.to_string() };
                                         if ui.radio(sel, label).clicked() {
                                             cmds.push(Cmd::SetVoiceKeyword(kw.to_string()));
                                             ui.close_menu();
@@ -3209,7 +3395,10 @@ impl ZaivernApp {
                             );
                             ui.separator();
                             ui.menu_button(
-                                format!("⚙ エンジン: {}", self.cfg.voice_engine),
+                                trf(
+                                    "⚙ エンジン: {engine}",
+                                    &[("engine", self.cfg.voice_engine.clone())],
+                                ),
                                 |ui| {
                                     for (v, label) in [
                                         ("auto", "自動 (この OS に合わせる)"),
@@ -3219,7 +3408,7 @@ impl ZaivernApp {
                                         ("command", "外部コマンド (config.toml の voice_command)"),
                                         ("off", "無効"),
                                     ] {
-                                        if ui.radio(self.cfg.voice_engine == v, label).clicked() {
+                                        if ui.radio(self.cfg.voice_engine == v, tr(label)).clicked() {
                                             cmds.push(Cmd::SetVoiceEngine(v.to_string()));
                                             ui.close_menu();
                                         }
@@ -3228,55 +3417,58 @@ impl ZaivernApp {
                             );
                         })
                         .response
-                        .on_hover_text(
+                        .on_hover_text(tr(
                             "音声入力 — キーを押している間だけ録音し、\n\
                              認識テキストをエージェントの入力欄へ挿入します。\n\
                              Enter は送られないので、確認してから自分で送信できます。",
-                        );
+                        ));
 
                         // ペットメニュー(表示切替・画像変更)
                         ui.menu_button("🐾", |ui| {
                             let show = self.cfg.show_pet;
                             if ui
-                                .selectable_label(show, if show { "🐾 表示中" } else { "🐾 非表示" })
+                                .selectable_label(
+                                    show,
+                                    if show { tr("🐾 表示中") } else { tr("🐾 非表示") },
+                                )
                                 .clicked()
                             {
                                 cmds.push(Cmd::TogglePet);
                                 ui.close_menu();
                             }
                             ui.separator();
-                            if ui.button("🖼 画像を変更…").clicked() {
+                            if ui.button(tr("🖼 画像を変更…")).clicked() {
                                 cmds.push(Cmd::SetPetImage);
                                 ui.close_menu();
                             }
-                            if ui.button("↺ 既定の絵に戻す").clicked() {
+                            if ui.button(tr("↺ 既定の絵に戻す")).clicked() {
                                 cmds.push(Cmd::ResetPetImage);
                                 ui.close_menu();
                             }
-                            if ui.button("🐾 位置を右下に戻す").clicked() {
+                            if ui.button(tr("🐾 位置を右下に戻す")).clicked() {
                                 cmds.push(Cmd::ResetPetPos);
                                 ui.close_menu();
                             }
                             ui.separator();
                             // 見た目バリアント(ラジオ選択。候補は pet::PetVariant から生成)
-                            ui.menu_button("🎭 見た目", |ui| {
+                            ui.menu_button(tr("🎭 見た目"), |ui| {
                                 for (v, label) in [
                                     (pet::PetVariant::Blocky, "🟦 ブロック"),
                                     (pet::PetVariant::Crab, "🐾 カニ"),
                                     (pet::PetVariant::Cat, "🐱 ネコ"),
                                     (pet::PetVariant::Cloud, "☁ クラウド"),
                                 ] {
-                                    if ui.radio(self.cfg.pet_variant == v.name(), label).clicked() {
+                                    if ui.radio(self.cfg.pet_variant == v.name(), tr(label)).clicked() {
                                         cmds.push(Cmd::SetPetVariant(v.name().to_string()));
                                         ui.close_menu();
                                     }
                                 }
                             });
                             // 表示スケール(ラジオ選択)
-                            ui.menu_button("📏 サイズ", |ui| {
+                            ui.menu_button(tr("📏 サイズ"), |ui| {
                                 for (v, label) in [(0.75f32, "小"), (1.0, "中"), (1.4, "大")] {
                                     let sel = (self.cfg.pet_scale - v).abs() < 0.01;
-                                    if ui.radio(sel, label).clicked() {
+                                    if ui.radio(sel, tr(label)).clicked() {
                                         cmds.push(Cmd::SetPetScale(v));
                                         ui.close_menu();
                                     }
@@ -3285,33 +3477,33 @@ impl ZaivernApp {
                             ui.separator();
                             // 挙動の切替(チェックボックス。cfg は apply_cmd 側で保存)
                             let mut roam = self.cfg.pet_free_roam;
-                            if ui.checkbox(&mut roam, "🚶 うろうろ散歩").clicked() {
+                            if ui.checkbox(&mut roam, tr("🚶 うろうろ散歩")).clicked() {
                                 cmds.push(Cmd::TogglePetFreeRoam);
                             }
                             let mut sleep = self.cfg.pet_sleep;
-                            if ui.checkbox(&mut sleep, "💤 居眠り").clicked() {
+                            if ui.checkbox(&mut sleep, tr("💤 居眠り")).clicked() {
                                 cmds.push(Cmd::TogglePetSleep);
                             }
                             let mut sounds = self.cfg.pet_sounds;
-                            if ui.checkbox(&mut sounds, "🔔 効果音").clicked() {
+                            if ui.checkbox(&mut sounds, tr("🔔 効果音")).clicked() {
                                 cmds.push(Cmd::TogglePetSounds);
                             }
                             let mut bubbles = self.cfg.pet_bubbles;
-                            if ui.checkbox(&mut bubbles, "💬 承認バブル").clicked() {
+                            if ui.checkbox(&mut bubbles, tr("💬 承認バブル")).clicked() {
                                 cmds.push(Cmd::TogglePetBubbles);
                             }
                         })
                         .response
-                        .on_hover_text("デスクトップペット 🐾 の表示・画像変更");
+                        .on_hover_text(tr("デスクトップペット 🐾 の表示・画像変更"));
 
                         // 実行中の対応エージェントを一括で権限モード切替
                         if self.agents.running_count() > 0
                             && ui
-                                .button(RichText::new("🛡 全切替").color(theme.ok))
-                                .on_hover_text(
+                                .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
+                                .on_hover_text(tr(
                                     "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
                                      Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
-                                )
+                                ))
                                 .clicked()
                         {
                             cmds.push(Cmd::CyclePermissionAll);
@@ -3321,27 +3513,27 @@ impl ZaivernApp {
                         let mode = self.cfg.approval_mode.as_str();
                         let (ap_label, next_mode, highlight) = match mode {
                             "auto" => (
-                                RichText::new("⚡ 既定:全自動").color(theme.warn).strong(),
+                                RichText::new(tr("⚡ 既定:全自動")).color(theme.warn).strong(),
                                 "agent",
                                 true,
                             ),
                             "agent" => (
-                                RichText::new("👾 既定:Agent優先").color(theme.ok).strong(),
+                                RichText::new(tr("👾 既定:Agent優先")).color(theme.ok).strong(),
                                 "ask",
                                 true,
                             ),
-                            _ => (RichText::new("🛡 既定:承認").color(theme.ok), "auto", false),
+                            _ => (RichText::new(tr("🛡 既定:承認")).color(theme.ok), "auto", false),
                         };
                         if ui
                             .selectable_label(highlight, ap_label)
-                            .on_hover_text(
+                            .on_hover_text(tr(
                                 "「次に起動する」エージェント (Claude/Codex/Antigravity) の既定権限モード\n\
                                  🛡 承認 = 操作のたびに許可が必要（bypass フラグを除去）\n\
                                  ⚡ 全自動 = すべて自動YES（bypass フラグを付与）\n\
                                  👾 Agent優先 = Agent欄プリセットのコマンドどおり（(全自動) プリセットのみ自動YES）\n\
                                  クリックで 承認→全自動→Agent優先 の順に切替\n\
                                  ※ 実行中のセッションは各行の 🛡 ボタンで個別に切替できます",
-                            )
+                            ))
                             .clicked()
                         {
                             cmds.push(Cmd::SetApproval(next_mode.into()));
@@ -3349,7 +3541,7 @@ impl ZaivernApp {
 
                         let cockpit =
                             ui.selectable_label(self.cockpit, RichText::new("🎛 Cockpit"));
-                        if cockpit.on_hover_text("全エージェント一覧 (⌘⇧C)").clicked() {
+                        if cockpit.on_hover_text(tr("全エージェント一覧 (⌘⇧C)")).clicked() {
                             cmds.push(Cmd::ToggleCockpit);
                         }
 
@@ -3362,8 +3554,8 @@ impl ZaivernApp {
                             }
                             ui.separator();
                             if ui
-                                .button("➕ エージェントを追加…")
-                                .on_hover_text("対応している CLI エージェントの一覧から選んで足す")
+                                .button(tr("➕ エージェントを追加…"))
+                                .on_hover_text(tr("対応している CLI エージェントの一覧から選んで足す"))
                                 .clicked()
                             {
                                 cmds.push(Cmd::OpenAgentPicker);
@@ -3371,11 +3563,11 @@ impl ZaivernApp {
                             }
                         })
                         .response
-                        .on_hover_text("エージェントを起動 (⌘⇧A)");
+                        .on_hover_text(tr("エージェントを起動 (⌘⇧A)"));
 
                         if ui
                             .button("🔍")
-                            .on_hover_text("コマンドパレット (⌘P / ⌘⇧P)")
+                            .on_hover_text(tr("コマンドパレット (⌘P / ⌘⇧P)"))
                             .clicked()
                         {
                             self.palette.open_files();
@@ -3384,7 +3576,11 @@ impl ZaivernApp {
                         let running = self.agents.running_count();
                         if running > 0 {
                             ui.label(
-                                RichText::new(format!("● {running} 稼働中")).color(theme.ok),
+                                RichText::new(trf(
+                                    "● {running} 稼働中",
+                                    &[("running", running.to_string())],
+                                ))
+                                .color(theme.ok),
                             );
                         }
                     });
@@ -3448,7 +3644,7 @@ impl ZaivernApp {
                             "agent" => ("👾 Agent優先", theme.ok),
                             _ => ("🛡 承認", theme.ok),
                         };
-                        ui.label(RichText::new(ap_text).size(11.5).color(ap_color));
+                        ui.label(RichText::new(tr(ap_text)).size(11.5).color(ap_color));
                         ui.label(dim(self.theme.label.clone()));
                         let (ln, col) = self.editor.cursor;
                         if let Some(i) = self.editor.active {
@@ -3482,7 +3678,7 @@ impl ZaivernApp {
                                 )
                                 .sense(egui::Sense::click()),
                             );
-                            if r.on_hover_text("Cockpit を開く").clicked() {
+                            if r.on_hover_text(tr("Cockpit を開く")).clicked() {
                                 toggle_cockpit = true;
                             }
                         }
@@ -3562,6 +3758,7 @@ impl ZaivernApp {
                         (SidebarTab::GitHub, "🐙".into(), "GitHub"),
                     ];
                     for (tab, short, name) in tabs {
+                        let name = tr(name);
                         let label = if narrow {
                             short.clone()
                         } else {
@@ -3582,13 +3779,13 @@ impl ZaivernApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("⟳").on_hover_text("再読み込み").clicked() {
+                                    if ui.button("⟳").on_hover_text(tr("再読み込み")).clicked() {
                                         refresh = true;
                                     }
-                                    if ui.button("📂").on_hover_text("新規フォルダ").clicked() {
+                                    if ui.button("📂").on_hover_text(tr("新規フォルダ")).clicked() {
                                         nd_root = true;
                                     }
-                                    if ui.button("➕").on_hover_text("新規ファイル").clicked() {
+                                    if ui.button("➕").on_hover_text(tr("新規ファイル")).clicked() {
                                         nf_root = true;
                                     }
                                 },
@@ -3715,7 +3912,7 @@ impl ZaivernApp {
                                 }
 
                                 ui.add_space(8.0);
-                                ui.label(RichText::new("── プリセット ──").color(theme.text_dim));
+                                ui.label(RichText::new(tr("── プリセット ──")).color(theme.text_dim));
                                 for (i, p) in self.cfg.agents.iter().enumerate() {
                                     if ui
                                         .add_sized(
@@ -3732,27 +3929,27 @@ impl ZaivernApp {
                     SidebarTab::Plugins => {
                         ui.horizontal(|ui| {
                             if ui
-                                .button("➕ 新規作成")
-                                .on_hover_text("プラグインのテンプレート一式を生成")
+                                .button(tr("➕ 新規作成"))
+                                .on_hover_text(tr("プラグインのテンプレート一式を生成"))
                                 .clicked()
                             {
                                 pl_new = true;
                             }
                             if ui
-                                .button("📦 インストール…")
-                                .on_hover_text(".zvplug / .zip を取り込む")
+                                .button(tr("📦 インストール…"))
+                                .on_hover_text(tr(".zvplug / .zip を取り込む"))
                                 .clicked()
                             {
                                 pl_install = true;
                             }
-                            if ui.button("⟳").on_hover_text("再スキャン").clicked() {
+                            if ui.button("⟳").on_hover_text(tr("再スキャン")).clicked() {
                                 pl_rescan = true;
                             }
                         });
                         ui.label(
-                            RichText::new(
+                            RichText::new(tr(
                                 "コマンド・テーマ・スニペットを 1 フォルダで。📤 で配布用 .zvplug を作成",
-                            )
+                            ))
                             .size(10.5)
                             .color(theme.text_dim),
                         );
@@ -3763,9 +3960,9 @@ impl ZaivernApp {
                             .show(ui, |ui| {
                                 if self.plugins.is_empty() {
                                     ui.label(
-                                        RichText::new(
+                                        RichText::new(tr(
                                             "プラグインがありません。➕ から自作できます",
-                                        )
+                                        ))
                                         .color(theme.text_dim),
                                     );
                                 }
@@ -3791,9 +3988,9 @@ impl ZaivernApp {
                                                         .size(10.0)
                                                         .color(theme.text_dim),
                                                 )
-                                                .on_hover_text(
+                                                .on_hover_text(tr(
                                                     "マニフェストの api バージョン",
-                                                );
+                                                ));
                                                 ui.with_layout(
                                                     egui::Layout::right_to_left(
                                                         egui::Align::Center,
@@ -3801,23 +3998,23 @@ impl ZaivernApp {
                                                     |ui| {
                                                         if ui
                                                             .small_button("🗑")
-                                                            .on_hover_text("アンインストール")
+                                                            .on_hover_text(tr("アンインストール"))
                                                             .clicked()
                                                         {
                                                             pl_uninstall = Some(p.dir.clone());
                                                         }
                                                         if ui
                                                             .small_button("📤")
-                                                            .on_hover_text(
+                                                            .on_hover_text(tr(
                                                                 "配布用 .zvplug をエクスポート",
-                                                            )
+                                                            ))
                                                             .clicked()
                                                         {
                                                             pl_export = Some(pi);
                                                         }
                                                         if ui
                                                             .small_button("📝")
-                                                            .on_hover_text("plugin.toml を開く")
+                                                            .on_hover_text(tr("plugin.toml を開く"))
                                                             .clicked()
                                                         {
                                                             pl_open =
@@ -3830,10 +4027,10 @@ impl ZaivernApp {
                                             // パネル・テーマ・スニペットを一切登録しない
                                             let mut enabled = p.enabled;
                                             if ui
-                                                .checkbox(&mut enabled, "有効")
-                                                .on_hover_text(
+                                                .checkbox(&mut enabled, tr("有効"))
+                                                .on_hover_text(tr(
                                                     "外すとコマンド・フック・パネル・テーマを読み込みません",
-                                                )
+                                                ))
                                                 .changed()
                                             {
                                                 pl_toggle = Some((p.name.clone(), enabled));
@@ -3848,7 +4045,7 @@ impl ZaivernApp {
                                             }
                                             if !p.enabled {
                                                 ui.label(
-                                                    RichText::new("(無効)")
+                                                    RichText::new(tr("(無効)"))
                                                         .size(10.5)
                                                         .color(theme.text_dim),
                                                 );
@@ -3903,7 +4100,7 @@ impl ZaivernApp {
                                             // 設定 ([[setting]]) — 変更したその場で保存する
                                             if !p.settings.is_empty() {
                                                 ui.add_space(2.0);
-                                                egui::CollapsingHeader::new("⚙ 設定")
+                                                egui::CollapsingHeader::new(tr("⚙ 設定"))
                                                     .id_salt(("zv-plset", pi))
                                                     .show(ui, |ui| {
                                                         for s in &p.settings {
@@ -3973,7 +4170,7 @@ impl ZaivernApp {
                                                     if !pa.run.trim().is_empty()
                                                         && ui
                                                             .small_button("⟳")
-                                                            .on_hover_text("このパネルを更新")
+                                                            .on_hover_text(tr("このパネルを更新"))
                                                             .clicked()
                                                     {
                                                         pl_panel_refresh = Some((
@@ -4010,7 +4207,7 @@ impl ZaivernApp {
                                                     }
                                                     _ => {
                                                         ui.label(
-                                                            RichText::new("(内容なし)")
+                                                            RichText::new(tr("(内容なし)"))
                                                                 .size(10.5)
                                                                 .color(theme.text_dim),
                                                         );
@@ -4072,17 +4269,26 @@ impl ZaivernApp {
         if let Some((name, enabled)) = pl_toggle {
             self.cfg.plugins.set_enabled(&name, enabled);
             if let Err(e) = config::save_plugins_section(&self.cfg) {
-                self.toast(format!("設定の保存に失敗: {e}"), false);
+                self.toast(
+                    trf("設定の保存に失敗: {e}", &[("e", e)]),
+                    false,
+                );
             }
             self.rebuild_plugins();
-            let verb = if enabled { "有効" } else { "無効" };
-            self.toast(format!("🔌 {name} を{verb}にしました"), true);
+            let verb = tr(if enabled { "有効" } else { "無効" });
+            self.toast(
+                trf(
+                    "🔌 {name} を{verb}にしました",
+                    &[("name", name), ("verb", verb)],
+                ),
+                true,
+            );
         }
         // 設定値の変更を保存し、実行中のプラグインへも反映する
         if let Some((name, key, value)) = pl_setting {
             self.cfg.plugins.set_setting(&name, &key, &value);
             if let Err(e) = config::save_plugins_section(&self.cfg) {
-                self.toast(format!("設定の保存に失敗: {e}"), false);
+                self.toast(trf("設定の保存に失敗: {e}", &[("e", e.to_string())]), false);
             }
             if let Some(vals) = self.cfg.plugins.settings.get(&name).cloned() {
                 if let Some(p) = self.plugins.iter_mut().find(|p| p.name == name) {
@@ -4108,9 +4314,12 @@ impl ZaivernApp {
             match plugins::uninstall(&dir) {
                 Ok(()) => {
                     self.rebuild_plugins();
-                    self.toast("🗑 プラグインをアンインストールしました", true);
+                    self.toast(tr("🗑 プラグインをアンインストールしました"), true);
                 }
-                Err(e) => self.toast(format!("アンインストール失敗: {e}"), false),
+                Err(e) => self.toast(
+                    trf("アンインストール失敗: {e}", &[("e", e.to_string())]),
+                    false,
+                ),
             }
         }
         if let Some(pi) = pl_export {
@@ -4120,10 +4329,17 @@ impl ZaivernApp {
                 .get(pi)
                 .map(|p| plugins::export(p, &root));
             match res {
-                Some(Ok(path)) => {
-                    self.toast(format!("📤 エクスポートしました: {}", path.display()), true)
-                }
-                Some(Err(e)) => self.toast(format!("エクスポート失敗: {e}"), false),
+                Some(Ok(path)) => self.toast(
+                    trf(
+                        "📤 エクスポートしました: {path}",
+                        &[("path", path.display().to_string())],
+                    ),
+                    true,
+                ),
+                Some(Err(e)) => self.toast(
+                    trf("エクスポート失敗: {e}", &[("e", e.to_string())]),
+                    false,
+                ),
                 None => {}
             }
         }
@@ -4162,17 +4378,17 @@ impl ZaivernApp {
                     self.tree.invalidate();
                     self.open_path(&p);
                     self.toast(
-                        format!("➕ {} を作成しました", self.rel_label(&p)),
+                        trf("➕ {path} を作成しました", &[("path", self.rel_label(&p))]),
                         true,
                     );
                 }
-                Err(e) => self.toast(format!("作成できません: {e}"), false),
+                Err(e) => self.toast(trf("作成できません: {e}", &[("e", e.to_string())]), false),
             }
         }
         if let Some(p) = actions.create_dir {
             if p.exists() {
                 self.toast(
-                    format!("既に存在します: {}", self.rel_label(&p)),
+                    trf("既に存在します: {path}", &[("path", self.rel_label(&p))]),
                     false,
                 );
             } else {
@@ -4180,18 +4396,21 @@ impl ZaivernApp {
                     Ok(()) => {
                         self.tree.invalidate();
                         self.toast(
-                            format!("📂 {} を作成しました", self.rel_label(&p)),
+                            trf("📂 {path} を作成しました", &[("path", self.rel_label(&p))]),
                             true,
                         );
                     }
-                    Err(e) => self.toast(format!("フォルダを作成できません: {e}"), false),
+                    Err(e) => self.toast(
+                        trf("フォルダを作成できません: {e}", &[("e", e.to_string())]),
+                        false,
+                    ),
                 }
             }
         }
         if let Some((from, to)) = actions.rename {
             if to.exists() {
                 self.toast(
-                    format!("既に存在します: {}", self.rel_label(&to)),
+                    trf("既に存在します: {path}", &[("path", self.rel_label(&to))]),
                     false,
                 );
             } else {
@@ -4201,11 +4420,14 @@ impl ZaivernApp {
                         self.tree.invalidate();
                         self.persist_session();
                         self.toast(
-                            format!("✏ {} に変更しました", self.rel_label(&to)),
+                            trf("✏ {path} に変更しました", &[("path", self.rel_label(&to))]),
                             true,
                         );
                     }
-                    Err(e) => self.toast(format!("名前を変更できません: {e}"), false),
+                    Err(e) => self.toast(
+                        trf("名前を変更できません: {e}", &[("e", e.to_string())]),
+                        false,
+                    ),
                 }
             }
         }
@@ -4225,10 +4447,11 @@ impl ZaivernApp {
         }
         if let Some(i) = cycle {
             match self.agents.cycle_permission(i) {
-                Some(hint) => self.toast_warn(format!(
-                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）"
+                Some(hint) => self.toast_warn(trf(
+                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）",
+                    &[("hint", hint.to_string())],
                 )),
-                None => self.toast("このセッションは権限モード切替に未対応です", false),
+                None => self.toast(tr("このセッションは権限モード切替に未対応です"), false),
             }
         }
         if let Some(i) = remove {
@@ -4311,22 +4534,22 @@ impl ZaivernApp {
                                             }
                                         }
                                         if s.has_unread() {
-                                            if ui.button("✓ 既読にする").clicked() {
+                                            if ui.button(tr("✓ 既読にする")).clicked() {
                                                 set_read = Some(i);
                                                 ui.close_menu();
                                             }
                                         } else if ui
-                                            .button("📩 あとで見る (未読にする)")
+                                            .button(tr("📩 あとで見る (未読にする)"))
                                             .clicked()
                                         {
                                             set_unread = Some(i);
                                             ui.close_menu();
                                         }
-                                        if ui.button("⟳ 再起動").clicked() {
+                                        if ui.button(tr("⟳ 再起動")).clicked() {
                                             restart = Some(i);
                                             ui.close_menu();
                                         }
-                                        if ui.button("✕ 閉じる").clicked() {
+                                        if ui.button(tr("✕ 閉じる")).clicked() {
                                             remove = Some(i);
                                             ui.close_menu();
                                         }
@@ -4353,7 +4576,7 @@ impl ZaivernApp {
                         });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("⌄").on_hover_text("パネルを隠す (⌘J)").clicked() {
+                        if ui.button("⌄").on_hover_text(tr("パネルを隠す (⌘J)")).clicked() {
                             self.agents.panel_open = false;
                         }
                         ui.menu_button("📜", |ui| {
@@ -4391,10 +4614,10 @@ impl ZaivernApp {
                             }
                         });
                         if !self.agents.sessions.is_empty() {
-                            if ui.button("✕").on_hover_text("セッションを閉じる").clicked() {
+                            if ui.button("✕").on_hover_text(tr("セッションを閉じる")).clicked() {
                                 remove = Some(self.agents.active);
                             }
-                            if ui.button("⟳").on_hover_text("再起動").clicked() {
+                            if ui.button("⟳").on_hover_text(tr("再起動")).clicked() {
                                 restart = Some(self.agents.active);
                             }
                             let permission_hint = self
@@ -4405,9 +4628,10 @@ impl ZaivernApp {
                             if let Some(hint) = permission_hint {
                                 if ui
                                     .button("🛡")
-                                    .on_hover_text(format!(
+                                    .on_hover_text(trf(
                                         "{hint}\n\
-                                         実行中セッションの画面表示を確認してください"
+                                         実行中セッションの画面表示を確認してください",
+                                        &[("hint", hint.to_string())],
                                     ))
                                     .clicked()
                                 {
@@ -4433,7 +4657,7 @@ impl ZaivernApp {
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
                         ui.label(
-                            RichText::new("セッションがありません — ＋ から起動してください")
+                            RichText::new(tr("セッションがありません — ＋ から起動してください"))
                                 .color(theme.text_dim),
                         );
                     });
@@ -4450,10 +4674,11 @@ impl ZaivernApp {
         }
         if let Some(i) = cycle {
             match self.agents.cycle_permission(i) {
-                Some(hint) => self.toast_warn(format!(
-                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）"
+                Some(hint) => self.toast_warn(trf(
+                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）",
+                    &[("hint", hint.to_string())],
                 )),
-                None => self.toast("このセッションは権限モード切替に未対応です", false),
+                None => self.toast(tr("このセッションは権限モード切替に未対応です"), false),
             }
         }
         if let Some(i) = remove {
@@ -4535,20 +4760,23 @@ impl ZaivernApp {
                     let running = self.agents.running_count();
                     let total = self.agents.sessions.len();
                     ui.label(
-                        RichText::new(format!("{running} 稼働中 / {total} セッション"))
-                            .color(theme.text_dim),
+                        RichText::new(trf(
+                            "{running} 稼働中 / {total} セッション",
+                            &[("running", running.to_string()), ("total", total.to_string())],
+                        ))
+                        .color(theme.text_dim),
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕ 閉じる").clicked() {
+                        if ui.button(tr("✕ 閉じる")).clicked() {
                             self.cockpit = false;
                         }
                         if ui
-                            .button(RichText::new("🛡 全切替").color(theme.ok))
-                            .on_hover_text(
+                            .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
+                            .on_hover_text(tr(
                                 "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
                                  Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
-                            )
+                            ))
                             .clicked()
                         {
                             cycle_all = true;
@@ -4561,11 +4789,11 @@ impl ZaivernApp {
                                 }
                             }
                         });
-                        let send = ui.button("📣 送信");
+                        let send = ui.button(tr("📣 送信"));
                         let input = ui.add(
                             egui::TextEdit::singleline(&mut self.broadcast_input)
                                 .desired_width(300.0)
-                                .hint_text("全エージェントへブロードキャスト…"),
+                                .hint_text(tr("全エージェントへブロードキャスト…")),
                         );
                         let enter = input.lost_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -4578,7 +4806,7 @@ impl ZaivernApp {
                         if rec
                             && ui
                                 .button(RichText::new("⏹").color(theme.err).strong())
-                                .on_hover_text("音声入力を止める")
+                                .on_hover_text(tr("音声入力を止める"))
                                 .clicked()
                         {
                             voice_stop = true;
@@ -4588,11 +4816,11 @@ impl ZaivernApp {
                                 rec && self.voice.target == voice::Target::Broadcast,
                                 if rec { "🔴" } else { "🎤" },
                             )
-                            .on_hover_text(
+                            .on_hover_text(tr(
                                 "音声入力 → 全エージェントの入力欄へ\n\
                                  ⏹ を押すまで話した内容が入り続けます。\n\
                                  送信はされないので、自分で Enter を押してください",
-                            )
+                            ))
                             .clicked()
                         {
                             voice_all = true;
@@ -4613,14 +4841,14 @@ impl ZaivernApp {
 
                 // ── 監視役 LLM (スーパーエージェント) の選択 ──────────────
                 egui::CollapsingHeader::new(
-                    RichText::new("💡 スーパーエージェント (指揮役)")
+                    RichText::new(tr("💡 スーパーエージェント (指揮役)"))
                         .strong()
                         .color(theme.text),
                 )
                 .id_salt("super-agent-section")
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(
+                        RichText::new(tr(
                             "決定論的な見張り (停滞・ループ・エラー多発の検知) は、この設定に\
                              関わらず常に動き、異常はここと通知で知らせます。ここでは\
                              いま起動しているエージェントの中から名前で 1 体を『指揮官』に\
@@ -4630,7 +4858,7 @@ impl ZaivernApp {
                              瞬間に届きます。停止・再起動などの破壊的な操作を自動でエージェントへ\
                              投げることはしません。指名したエージェントは普通の作業にもそのまま\
                              使えますし、そのセッション自身も見張りの対象です。",
-                        )
+                        ))
                         .size(12.0)
                         .color(theme.text_dim),
                     );
@@ -4638,9 +4866,9 @@ impl ZaivernApp {
 
                     let cur_cmd = self.cfg.super_agent.command.trim().to_string();
                     let cur_title = self.cfg.super_agent.session_title.trim().to_string();
-                    const NONE_LABEL: &str = "なし（監視のみ・指揮しない）";
+                    let none_label = tr("なし（監視のみ・指揮しない）");
                     let cur_label = if cur_cmd.is_empty() && cur_title.is_empty() {
-                        NONE_LABEL.to_string()
+                        none_label.clone()
                     } else if !cur_title.is_empty() {
                         // セッション指名中: 起動中ならアイコン付き、居なければ待機表示。
                         self.agents
@@ -4648,7 +4876,9 @@ impl ZaivernApp {
                             .iter()
                             .find(|s| s.title.trim() == cur_title)
                             .map(|s| format!("{} {}", s.icon, s.title))
-                            .unwrap_or_else(|| format!("{cur_title}（未起動）"))
+                            .unwrap_or_else(|| {
+                                trf("{title}（未起動）", &[("title", cur_title.clone())])
+                            })
                     } else {
                         // 旧形式 (コマンドのみ指定): プリセット名で表示する。
                         self.cfg
@@ -4666,7 +4896,7 @@ impl ZaivernApp {
                             if ui
                                 .selectable_label(
                                     cur_cmd.is_empty() && cur_title.is_empty(),
-                                    NONE_LABEL,
+                                    none_label.as_str(),
                                 )
                                 .clicked()
                             {
@@ -4674,10 +4904,10 @@ impl ZaivernApp {
                             }
                             if self.agents.sessions.is_empty() {
                                 ui.label(
-                                    RichText::new(
+                                    RichText::new(tr(
                                         "起動中のエージェントがいません — \
                                          セッションを起動するとここに並びます",
-                                    )
+                                    ))
                                     .size(12.0)
                                     .color(theme.text_dim),
                                 );
@@ -4688,7 +4918,7 @@ impl ZaivernApp {
                                 // 終了済み・ヘッドレス非対応の CLI は選ばせない。
                                 // 後者を選べてしまうと対話 TUI が起動して期限まで返らない。
                                 let why = if !s.running() {
-                                    Some("終了しています (再起動すると選べます)".to_string())
+                                    Some(tr("終了しています (再起動すると選べます)"))
                                 } else {
                                     super_agent_reject_reason(&s.command)
                                 };
@@ -4711,12 +4941,15 @@ impl ZaivernApp {
                                         ui.add_enabled(
                                             false,
                                             egui::Button::new(
-                                                RichText::new(format!("{label} — 選べません"))
-                                                    .color(theme.text_dim),
+                                                RichText::new(trf(
+                                                    "{label} — 選べません",
+                                                    &[("label", label)],
+                                                ))
+                                                .color(theme.text_dim),
                                             )
                                             .frame(false),
                                         )
-                                        .on_disabled_hover_text(why);
+                                        .on_disabled_hover_text(tr(&why));
                                     }
                                 }
                             }
@@ -4725,22 +4958,26 @@ impl ZaivernApp {
                     ui.horizontal(|ui| {
                         let mut en = self.cfg.super_agent.enabled;
                         if ui
-                            .checkbox(&mut en, "指揮を有効にする")
-                            .on_hover_text(
+                            .checkbox(&mut en, tr("指揮を有効にする"))
+                            .on_hover_text(tr(
                                 "OFF にすると指揮だけ止まります。決定論的な見張りは動き続けます",
-                            )
+                            ))
                             .changed()
                         {
                             super_enabled = Some(en);
                         }
                         ui.add_space(12.0);
-                        ui.label(RichText::new("状況フィード間隔").color(theme.text_dim));
+                        ui.label(RichText::new(tr("状況フィード間隔")).color(theme.text_dim));
                         let mut t = self.cfg.super_agent.timeout_secs as i64;
                         if ui
-                            .add(egui::DragValue::new(&mut t).range(5..=600).suffix(" 秒"))
-                            .on_hover_text(
-                                "この間隔で他エージェントの状況を指揮官へ内部フィードします (最低 5 秒)",
+                            .add(
+                                egui::DragValue::new(&mut t)
+                                    .range(5..=600)
+                                    .suffix(tr(" 秒")),
                             )
+                            .on_hover_text(tr(
+                                "この間隔で他エージェントの状況を指揮官へ内部フィードします (最低 5 秒)",
+                            ))
                             .changed()
                         {
                             super_timeout = Some(t.clamp(5, 600) as u64);
@@ -4752,17 +4989,27 @@ impl ZaivernApp {
                         (Some(d), _) => {
                             let (cmd, label) = d.describe();
                             let head = if cur_title.is_empty() {
-                                format!("✅ 指揮官: {label}  (`{cmd}`)")
+                                trf(
+                                    "✅ 指揮官: {label}  (`{cmd}`)",
+                                    &[("label", label.to_string()), ("cmd", cmd.to_string())],
+                                )
                             } else {
-                                format!("✅ 指揮官: {cur_title}  ({label})")
+                                trf(
+                                    "✅ 指揮官: {title}  ({label})",
+                                    &[
+                                        ("title", cur_title.clone()),
+                                        ("label", label.to_string()),
+                                    ],
+                                )
                             };
                             ui.label(RichText::new(head).color(theme.ok));
                             match d.self_session_id() {
                                 Some(id) => {
                                     ui.label(
-                                        RichText::new(format!(
+                                        RichText::new(trf(
                                             "指揮官セッション: #{id} — このセッションが `@対象: 指示`\
-                                             (全員へは `@all:`) で他のエージェントを内部から指揮します"
+                                             (全員へは `@all:`) で他のエージェントを内部から指揮します",
+                                            &[("id", id.to_string())],
                                         ))
                                         .size(12.0)
                                         .color(theme.text_dim),
@@ -4770,12 +5017,14 @@ impl ZaivernApp {
                                 }
                                 None => {
                                     let wait = if cur_title.is_empty() {
-                                        "指揮官セッションを待っています — 選んだ CLI でセッションを起動すると指揮を始めます"
-                                            .to_string()
+                                        tr(
+                                            "指揮官セッションを待っています — 選んだ CLI でセッションを起動すると指揮を始めます",
+                                        )
                                     } else {
-                                        format!(
-                                            "指揮官セッション『{cur_title}』を待っています — \
-                                             同じ名前のセッションが起動すると指揮を始めます"
+                                        trf(
+                                            "指揮官セッション『{title}』を待っています — \
+                                             同じ名前のセッションが起動すると指揮を始めます",
+                                            &[("title", cur_title.clone())],
                                         )
                                     };
                                     ui.label(
@@ -4789,8 +5038,10 @@ impl ZaivernApp {
                         }
                         (None, None) => {
                             ui.label(
-                                RichText::new("指揮官: なし（決定論的な見張りだけが動いています）")
-                                    .color(theme.text_dim),
+                                RichText::new(tr(
+                                    "指揮官: なし（決定論的な見張りだけが動いています）",
+                                ))
+                                .color(theme.text_dim),
                             );
                         }
                     }
@@ -4803,12 +5054,12 @@ impl ZaivernApp {
                         ui.add_space(ui.available_height() * 0.25);
                         ui.label(RichText::new("🎛").size(52.0));
                         ui.label(
-                            RichText::new("エージェントがまだいません")
+                            RichText::new(tr("エージェントがまだいません"))
                                 .size(18.0)
                                 .color(theme.text),
                         );
                         ui.label(
-                            RichText::new("プリセットから並列セッションを起動しましょう")
+                            RichText::new(tr("プリセットから並列セッションを起動しましょう"))
                                 .color(theme.text_dim),
                         );
                         ui.add_space(12.0);
@@ -4925,14 +5176,14 @@ impl ZaivernApp {
                                                     |ui| {
                                                         if ui
                                                             .small_button("✕")
-                                                            .on_hover_text("閉じる")
+                                                            .on_hover_text(tr("閉じる"))
                                                             .clicked()
                                                         {
                                                             remove = Some(i);
                                                         }
                                                         if ui
                                                             .small_button("⟳")
-                                                            .on_hover_text("再起動")
+                                                            .on_hover_text(tr("再起動"))
                                                             .clicked()
                                                         {
                                                             restart = Some(i);
@@ -4948,9 +5199,9 @@ impl ZaivernApp {
                                                         }
                                                         if ui
                                                             .small_button("🔍")
-                                                            .on_hover_text(
+                                                            .on_hover_text(tr(
                                                                 "下部パネルにフォーカス",
-                                                            )
+                                                            ))
                                                             .clicked()
                                                         {
                                                             focus = Some(i);
@@ -4965,11 +5216,11 @@ impl ZaivernApp {
                                                                     "🎤"
                                                                 },
                                                             )
-                                                            .on_hover_text(
+                                                            .on_hover_text(tr(
                                                                 "このエージェントへ音声入力\n\
                                                                  話した内容がこのタブの入力欄に入ります。\n\
                                                                  送信されないので、確認して Enter を押してください",
-                                                            )
+                                                            ))
                                                             .clicked()
                                                         {
                                                             voice = Some(sid);
@@ -5011,7 +5262,13 @@ impl ZaivernApp {
 
         if let Some(text) = broadcast {
             self.agents.broadcast(&text);
-            self.toast(format!("📣 {} セッションへ送信しました", self.agents.running_count()), true);
+            self.toast(
+                trf(
+                    "📣 {n} セッションへ送信しました",
+                    &[("n", self.agents.running_count().to_string())],
+                ),
+                true,
+            );
         }
         if voice_stop {
             self.stop_voice();
@@ -5027,10 +5284,11 @@ impl ZaivernApp {
         }
         if let Some(i) = cycle {
             match self.agents.cycle_permission(i) {
-                Some(hint) => self.toast_warn(format!(
-                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）"
+                Some(hint) => self.toast_warn(trf(
+                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）",
+                    &[("hint", hint.to_string())],
                 )),
-                None => self.toast("このセッションは権限モード切替に未対応です", false),
+                None => self.toast(tr("このセッションは権限モード切替に未対応です"), false),
             }
         }
         if let Some(i) = launch {
@@ -5286,16 +5544,16 @@ impl ZaivernApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let p = ui.selectable_label(
                             self.md_preview,
-                            RichText::new("👁 プレビュー").size(12.0),
+                            RichText::new(tr("👁 プレビュー")).size(12.0),
                         );
-                        if p.on_hover_text("レンダリング表示 (⌘⇧V)").clicked() {
+                        if p.on_hover_text(tr("レンダリング表示 (⌘⇧V)")).clicked() {
                             self.md_preview = true;
                         }
                         let e = ui.selectable_label(
                             !self.md_preview,
-                            RichText::new("✏ 編集").size(12.0),
+                            RichText::new(tr("✏ 編集")).size(12.0),
                         );
-                        if e.on_hover_text("ソースを編集 (⌘⇧V)").clicked() {
+                        if e.on_hover_text(tr("ソースを編集 (⌘⇧V)")).clicked() {
                             self.md_preview = false;
                         }
                         // HTML はブラウザで開けば完全な見た目で確認できる
@@ -5303,12 +5561,12 @@ impl ZaivernApp {
                             let b = ui.add_enabled(
                                 path.is_some(),
                                 egui::Button::new(
-                                    RichText::new("🌐 ブラウザで開く").size(12.0),
+                                    RichText::new(tr("🌐 ブラウザで開く")).size(12.0),
                                 ),
                             );
-                            if b.on_hover_text(
+                            if b.on_hover_text(tr(
                                 "既定ブラウザで完全表示 (ディスクに保存済みの内容)",
-                            )
+                            ))
                             .clicked()
                             {
                                 if let Some(p) = &path {
@@ -5394,7 +5652,7 @@ impl ZaivernApp {
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.find.query)
                             .desired_width(260.0)
-                            .hint_text("ファイル内検索…"),
+                            .hint_text(tr("ファイル内検索…")),
                     );
                     if self.find.focus {
                         resp.request_focus();
@@ -5406,7 +5664,7 @@ impl ZaivernApp {
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         do_find = true;
                     }
-                    if ui.button("次へ ↓").clicked() {
+                    if ui.button(tr("次へ ↓")).clicked() {
                         do_find = true;
                     }
                     if let Some(i) = self.editor.active {
@@ -5417,7 +5675,8 @@ impl ZaivernApp {
                                 .matches(&self.find.query.to_lowercase())
                                 .count();
                             ui.label(
-                                RichText::new(format!("{count} 件")).color(theme.text_dim),
+                                RichText::new(trf("{count} 件", &[("count", count.to_string())]))
+                                    .color(theme.text_dim),
                             );
                         }
                     }
@@ -5454,19 +5713,19 @@ impl ZaivernApp {
                     .color(theme.text),
             );
             ui.label(
-                RichText::new("Rust製 AI-Native エディタ — Zed の速度 × Cmux の並列エージェント × AGI Cockpit の操縦席")
+                RichText::new(tr("Rust製 AI-Native エディタ — Zed の速度 × Cmux の並列エージェント × AGI Cockpit の操縦席"))
                     .color(theme.text_dim),
             );
             ui.add_space(22.0);
 
             if ui
-                .add_sized([300.0, 36.0], egui::Button::new("📂 フォルダを開く"))
+                .add_sized([300.0, 36.0], egui::Button::new(tr("📂 フォルダを開く")))
                 .clicked()
             {
                 open_folder = true;
             }
             if ui
-                .add_sized([300.0, 36.0], egui::Button::new("👾 Claude Code を起動"))
+                .add_sized([300.0, 36.0], egui::Button::new(tr("👾 Claude Code を起動")))
                 .clicked()
             {
                 launch_claude = true;
@@ -5482,11 +5741,11 @@ impl ZaivernApp {
             let hint = |s: &str, k: String| -> RichText {
                 RichText::new(format!("{k}  —  {s}")).size(12.5).color(theme.text_dim)
             };
-            ui.label(hint("ファイル検索", format!("{key}P")));
-            ui.label(hint("コマンドパレット", format!("{key}⇧P")));
-            ui.label(hint("ターミナル / エージェントパネル", format!("{key}J")));
-            ui.label(hint("エージェント起動", format!("{key}⇧A")));
-            ui.label(hint("Cockpit ビュー", format!("{key}⇧C")));
+            ui.label(hint(&tr("ファイル検索"), format!("{key}P")));
+            ui.label(hint(&tr("コマンドパレット"), format!("{key}⇧P")));
+            ui.label(hint(&tr("ターミナル / エージェントパネル"), format!("{key}J")));
+            ui.label(hint(&tr("エージェント起動"), format!("{key}⇧A")));
+            ui.label(hint(&tr("Cockpit ビュー"), format!("{key}⇧C")));
         });
 
         let ctx = ui.ctx().clone();
@@ -5830,83 +6089,83 @@ impl ZaivernApp {
 
         if self.palette.is_command_mode() {
             let mut cmds: Vec<(String, String, String, Cmd)> = vec![
-                ("💾".into(), "保存".into(), "⌘S".into(), Cmd::Save),
-                ("💾".into(), "名前を付けて保存".into(), "⌘⇧S".into(), Cmd::SaveAs),
-                ("📄".into(), "新規ファイル".into(), "⌘N".into(), Cmd::NewFile),
-                ("📂".into(), "フォルダを開く…".into(), String::new(), Cmd::OpenFolder),
-                ("📚".into(), "フォルダをワークスペースに追加".into(), String::new(), Cmd::AddFolder),
-                ("❌".into(), "タブを閉じる".into(), "⌘W".into(), Cmd::CloseTab),
-                ("🔍".into(), "ファイル内検索".into(), "⌘F".into(), Cmd::OpenFind),
-                ("🖥".into(), "ターミナル表示切替".into(), "⌘J".into(), Cmd::ToggleTerminal),
-                ("🎛".into(), "Cockpit 切替".into(), "⌘⇧C".into(), Cmd::ToggleCockpit),
+                ("💾".into(), tr("保存"), "⌘S".into(), Cmd::Save),
+                ("💾".into(), tr("名前を付けて保存"), "⌘⇧S".into(), Cmd::SaveAs),
+                ("📄".into(), tr("新規ファイル"), "⌘N".into(), Cmd::NewFile),
+                ("📂".into(), tr("フォルダを開く…"), String::new(), Cmd::OpenFolder),
+                ("📚".into(), tr("フォルダをワークスペースに追加"), String::new(), Cmd::AddFolder),
+                ("❌".into(), tr("タブを閉じる"), "⌘W".into(), Cmd::CloseTab),
+                ("🔍".into(), tr("ファイル内検索"), "⌘F".into(), Cmd::OpenFind),
+                ("🖥".into(), tr("ターミナル表示切替"), "⌘J".into(), Cmd::ToggleTerminal),
+                ("🎛".into(), tr("Cockpit 切替"), "⌘⇧C".into(), Cmd::ToggleCockpit),
                 (
                     "➕".into(),
-                    "エージェントを追加 (対応 CLI の一覧から選ぶ)".into(),
+                    tr("エージェントを追加 (対応 CLI の一覧から選ぶ)"),
                     String::new(),
                     Cmd::OpenAgentPicker,
                 ),
-                ("📋".into(), "タスクを作成してエージェントに割り当て".into(), String::new(), Cmd::NewTask),
-                ("📮".into(), "エージェントへメッセージを送る".into(), String::new(), Cmd::SendAgentMessage),
-                ("👁".into(), "Markdown/HTML プレビュー切替".into(), "⌘⇧V".into(), Cmd::ToggleMdPreview),
-                ("📁".into(), "サイドバー切替".into(), "⌘B".into(), Cmd::ToggleSidebar),
-                ("🌿".into(), "Git パネルを開く".into(), String::new(), Cmd::OpenGitPanel),
+                ("📋".into(), tr("タスクを作成してエージェントに割り当て"), String::new(), Cmd::NewTask),
+                ("📮".into(), tr("エージェントへメッセージを送る"), String::new(), Cmd::SendAgentMessage),
+                ("👁".into(), tr("Markdown/HTML プレビュー切替"), "⌘⇧V".into(), Cmd::ToggleMdPreview),
+                ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),
+                ("🌿".into(), tr("Git パネルを開く"), String::new(), Cmd::OpenGitPanel),
                 (
                     "👾".into(),
-                    "現在のファイルをエージェントに送信 (@path)".into(),
+                    tr("現在のファイルをエージェントに送信 (@path)"),
                     String::new(),
                     Cmd::SendFileToAgent,
                 ),
-                ("⟳".into(), "アクティブなエージェントを再起動".into(), String::new(), Cmd::RestartAgent),
-                ("🗑".into(), "アクティブなエージェントを終了".into(), String::new(), Cmd::KillAgent),
-                ("⚙".into(), "設定 config.toml を開く".into(), String::new(), Cmd::OpenConfig),
-                ("🔄".into(), "設定を再読み込み".into(), String::new(), Cmd::ReloadConfig),
-                ("🔠".into(), "フォント拡大".into(), "⌘+".into(), Cmd::FontInc),
-                ("🔠".into(), "フォント縮小".into(), "⌘-".into(), Cmd::FontDec),
-                ("🌲".into(), "ファイルツリー再読み込み".into(), String::new(), Cmd::RefreshTree),
+                ("⟳".into(), tr("アクティブなエージェントを再起動"), String::new(), Cmd::RestartAgent),
+                ("🗑".into(), tr("アクティブなエージェントを終了"), String::new(), Cmd::KillAgent),
+                ("⚙".into(), tr("設定 config.toml を開く"), String::new(), Cmd::OpenConfig),
+                ("🔄".into(), tr("設定を再読み込み"), String::new(), Cmd::ReloadConfig),
+                ("🔠".into(), tr("フォント拡大"), "⌘+".into(), Cmd::FontInc),
+                ("🔠".into(), tr("フォント縮小"), "⌘-".into(), Cmd::FontDec),
+                ("🌲".into(), tr("ファイルツリー再読み込み"), String::new(), Cmd::RefreshTree),
                 (
                     "🛡".into(),
-                    "承認モード: 毎回ユーザー承認 (Claude/Codex/Antigravity)".into(),
+                    tr("承認モード: 毎回ユーザー承認 (Claude/Codex/Antigravity)"),
                     String::new(),
                     Cmd::SetApproval("ask".into()),
                 ),
                 (
                     "⚡".into(),
-                    "承認モード: 全自動 YES (Claude/Codex/Antigravity)".into(),
+                    tr("承認モード: 全自動 YES (Claude/Codex/Antigravity)"),
                     String::new(),
                     Cmd::SetApproval("auto".into()),
                 ),
                 (
                     "👾".into(),
-                    "承認モード: Agent欄優先 (プリセットのコマンドどおり)".into(),
+                    tr("承認モード: Agent欄優先 (プリセットのコマンドどおり)"),
                     String::new(),
                     Cmd::SetApproval("agent".into()),
                 ),
-                ("🐾".into(), "ペット表示切替".into(), String::new(), Cmd::TogglePet),
+                ("🐾".into(), tr("ペット表示切替"), String::new(), Cmd::TogglePet),
                 (
                     "📱".into(),
-                    "スマホリモート (QR コード表示)".into(),
+                    tr("スマホリモート (QR コード表示)"),
                     String::new(),
                     Cmd::ToggleRemote,
                 ),
                 (
                     "🎤".into(),
-                    "音声入力: 全エージェントの入力欄へ (送信は自分で Enter)".into(),
+                    tr("音声入力: 全エージェントの入力欄へ (送信は自分で Enter)"),
                     String::new(),
                     Cmd::VoiceInput(voice::Target::Broadcast),
                 ),
                 (
                     "🛡".into(),
-                    "実行中の全エージェントの権限モードを切替".into(),
+                    tr("実行中の全エージェントの権限モードを切替"),
                     String::new(),
                     Cmd::CyclePermissionAll,
                 ),
-                ("🖼".into(), "ペット画像を変更…".into(), String::new(), Cmd::SetPetImage),
-                ("↺".into(), "ペット画像を既定に戻す".into(), String::new(), Cmd::ResetPetImage),
-                ("🐾".into(), "ペット位置を右下に戻す".into(), String::new(), Cmd::ResetPetPos),
-                ("➕".into(), "新規プラグインを作成…".into(), String::new(), Cmd::NewPlugin),
-                ("📦".into(), "プラグインをインストール… (.zvplug / .zip)".into(), String::new(), Cmd::InstallPlugin),
-                ("🔌".into(), "プラグインを表示".into(), String::new(), Cmd::ShowPlugins),
-                ("⟳".into(), "プラグインを再スキャン".into(), String::new(), Cmd::RescanPlugins),
+                ("🖼".into(), tr("ペット画像を変更…"), String::new(), Cmd::SetPetImage),
+                ("↺".into(), tr("ペット画像を既定に戻す"), String::new(), Cmd::ResetPetImage),
+                ("🐾".into(), tr("ペット位置を右下に戻す"), String::new(), Cmd::ResetPetPos),
+                ("➕".into(), tr("新規プラグインを作成…"), String::new(), Cmd::NewPlugin),
+                ("📦".into(), tr("プラグインをインストール… (.zvplug / .zip)"), String::new(), Cmd::InstallPlugin),
+                ("🔌".into(), tr("プラグインを表示"), String::new(), Cmd::ShowPlugins),
+                ("⟳".into(), tr("プラグインを再スキャン"), String::new(), Cmd::RescanPlugins),
             ];
             // 実際に検出できた外部 IDE だけを出す (検出は起動時にワーカーで走る)
             for (icon, label, cmd) in panels::ide_palette_entries() {
@@ -5916,7 +6175,10 @@ impl ZaivernApp {
             for s in self.agents.sessions.iter().take(20) {
                 cmds.push((
                     "🎤".into(),
-                    format!("音声入力: {} {} の入力欄へ (送信は自分で Enter)", s.icon, s.title),
+                    trf(
+                        "音声入力: {icon} {title} の入力欄へ (送信は自分で Enter)",
+                        &[("icon", s.icon.clone()), ("title", s.title.clone())],
+                    ),
                     String::new(),
                     Cmd::VoiceInput(voice::Target::Session(s.id)),
                 ));
@@ -5924,7 +6186,7 @@ impl ZaivernApp {
             for t in theme::all() {
                 cmds.push((
                     "🎨".into(),
-                    format!("テーマ: {}", t.label),
+                    trf("テーマ: {label}", &[("label", t.label.clone())]),
                     String::new(),
                     Cmd::SetTheme(t.name.clone()),
                 ));
@@ -5932,7 +6194,7 @@ impl ZaivernApp {
             for (label, path) in self.custom_themes.iter().take(80) {
                 cmds.push((
                     "🔌".into(),
-                    format!("テーマ (カスタム): {label}"),
+                    trf("テーマ (カスタム): {label}", &[("label", label.clone())]),
                     String::new(),
                     Cmd::SetTheme(path.clone()),
                 ));
@@ -5953,7 +6215,10 @@ impl ZaivernApp {
                 for r in &self.roots {
                     cmds.push((
                         "📂".into(),
-                        format!("フォルダをワークスペースから削除: {}", root_name(r)),
+                        trf(
+                            "フォルダをワークスペースから削除: {name}",
+                            &[("name", root_name(r))],
+                        ),
                         String::new(),
                         Cmd::RemoveFolder(r.clone()),
                     ));
@@ -5962,7 +6227,7 @@ impl ZaivernApp {
             for (i, p) in self.cfg.agents.iter().enumerate() {
                 cmds.push((
                     p.icon.clone(),
-                    format!("エージェント起動: {}", p.name),
+                    trf("エージェント起動: {name}", &[("name", p.name.clone())]),
                     String::new(),
                     Cmd::NewAgent(i),
                 ));
@@ -5970,7 +6235,7 @@ impl ZaivernApp {
             for (i, s) in self.agents.sessions.iter().enumerate() {
                 cmds.push((
                     s.icon.clone(),
-                    format!("エージェントへ移動: {}", s.title),
+                    trf("エージェントへ移動: {title}", &[("title", s.title.clone())]),
                     String::new(),
                     Cmd::FocusAgent(i),
                 ));
@@ -6176,9 +6441,9 @@ impl ZaivernApp {
 
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.palette.input)
-                                .hint_text(
+                                .hint_text(tr(
                                     "ファイル検索…  （> コマンド / @ エージェント / # worktree）",
-                                )
+                                ))
                                 .font(FontId::proportional(16.0))
                                 .desired_width(f32::INFINITY),
                         );
@@ -6270,7 +6535,7 @@ impl ZaivernApp {
                                 }
                                 if items.is_empty() {
                                     ui.label(
-                                        RichText::new("該当なし").color(theme.text_dim),
+                                        RichText::new(tr("該当なし")).color(theme.text_dim),
                                     );
                                 }
                             });
@@ -6299,21 +6564,24 @@ impl ZaivernApp {
         let title = self.editor.buffers[i].title.clone();
         let mut decided: Option<u8> = None;
 
-        egui::Window::new("未保存の変更")
+        egui::Window::new(tr("未保存の変更"))
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(format!("「{title}」には未保存の変更があります。"));
+                ui.label(trf(
+                    "「{title}」には未保存の変更があります。",
+                    &[("title", title.clone())],
+                ));
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("💾 保存して閉じる").clicked() {
+                    if ui.button(tr("💾 保存して閉じる")).clicked() {
                         decided = Some(0);
                     }
-                    if ui.button("🗑 保存せずに閉じる").clicked() {
+                    if ui.button(tr("🗑 保存せずに閉じる")).clicked() {
                         decided = Some(1);
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(tr("キャンセル")).clicked() {
                         decided = Some(2);
                     }
                 });
@@ -6374,24 +6642,30 @@ impl ZaivernApp {
         let warn = self.theme.warn;
         let mut decided: Option<bool> = None;
 
-        egui::Window::new("削除の確認")
+        egui::Window::new(tr("削除の確認"))
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                let what = if is_dir { "フォルダ(中身ごと)" } else { "ファイル" };
-                ui.label(format!("{what}「{name}」を削除しますか？"));
+                ui.label(if is_dir {
+                    trf(
+                        "フォルダ(中身ごと)「{name}」を削除しますか？",
+                        &[("name", name.clone())],
+                    )
+                } else {
+                    trf("ファイル「{name}」を削除しますか？", &[("name", name.clone())])
+                });
                 ui.label(
-                    RichText::new("この操作は取り消せません")
+                    RichText::new(tr("この操作は取り消せません"))
                         .small()
                         .color(warn),
                 );
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new("🗑 削除").color(warn)).clicked() {
+                    if ui.button(RichText::new(tr("🗑 削除")).color(warn)).clicked() {
                         decided = Some(true);
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(tr("キャンセル")).clicked() {
                         decided = Some(false);
                     }
                 });
@@ -6424,9 +6698,12 @@ impl ZaivernApp {
                         }
                         self.tree.invalidate();
                         self.persist_session();
-                        self.toast(format!("🗑 {name} を削除しました"), true);
+                        self.toast(
+                            trf("🗑 {name} を削除しました", &[("name", name.clone())]),
+                            true,
+                        );
                     }
-                    Err(e) => self.toast(format!("削除できません: {e}"), false),
+                    Err(e) => self.toast(trf("削除できません: {e}", &[("e", e.to_string())]), false),
                 }
                 self.pending_delete = None;
             }
@@ -6474,7 +6751,7 @@ impl ZaivernApp {
             return;
         }
         if self.agents.running_count() == 0 {
-            self.toast_warn("音声入力の宛先がありません — 先にエージェントを起動してください");
+            self.toast_warn(tr("音声入力の宛先がありません — 先にエージェントを起動してください"));
             return;
         }
         // ブラウザ経路は子プロセスを持たない — /voice をブラウザで開いて、
@@ -6519,9 +6796,10 @@ impl ZaivernApp {
     fn open_voice_page(&mut self) {
         let Some(r) = self.remote.as_ref() else {
             self.toast(
-                "🎤 ブラウザの音声入力ページを開けません — スマホリモートが起動していません\
-                 (config.toml の voice_command に外部コマンドを設定する手もあります)"
-                    .to_string(),
+                tr(
+                    "🎤 ブラウザの音声入力ページを開けません — スマホリモートが起動していません\
+                     (config.toml の voice_command に外部コマンドを設定する手もあります)",
+                ),
                 false,
             );
             return;
@@ -6532,17 +6810,18 @@ impl ZaivernApp {
         let browser = match chrome_path() {
             Some(p) => {
                 let _ = std::process::Command::new(p).arg(&url).spawn();
-                "Chrome"
+                "Chrome".to_string()
             }
             None => {
                 open_external(&url);
-                "既定のブラウザ"
+                tr("既定のブラウザ")
             }
         };
         self.toast(
-            format!(
+            trf(
                 "🎤 {browser} で音声入力ページを開きました — これから先はそちらのマイクが 🎤 です\
-                 (認識テキストは入力欄に入るだけ。送信は自分で Enter)"
+                 (認識テキストは入力欄に入るだけ。送信は自分で Enter)",
+                &[("browser", browser)],
             ),
             true,
         );
@@ -6687,19 +6966,25 @@ impl ZaivernApp {
                     for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
                         s.write_bytes(&out);
                     }
-                    Some(format!("{n} セッション"))
+                    Some(trf("{n} セッション", &[("n", n.to_string())]))
                 }
             }
             None => None,
         };
 
         let Some(where_) = sent else {
-            self.toast_warn("音声入力の宛先セッションが見つかりません");
+            self.toast_warn(tr("音声入力の宛先セッションが見つかりません"));
             return;
         };
         self.voice.commit(edit, is_final, submit, key);
         if submit {
-            self.toast(format!("🎤▶ {where_} へ送信: {body}"), true);
+            self.toast(
+                trf(
+                    "🎤▶ {where} へ送信: {body}",
+                    &[("where", where_), ("body", body.to_string())],
+                ),
+                true,
+            );
         }
     }
 
@@ -6723,12 +7008,12 @@ impl ZaivernApp {
         let theme = self.theme.clone();
         let stopping = self.voice.stopping_at.is_some();
         let head = if stopping {
-            "🎤 最後のひとことを待っています…".to_string()
+            tr("🎤 最後のひとことを待っています…")
         } else if self.voice.ready {
             let dots = (self.voice.partial.len() % 3) + 1;
-            format!("🔴 録音中{}", "・".repeat(dots))
+            trf("🔴 録音中{dots}", &[("dots", "・".repeat(dots))])
         } else {
-            "🎤 マイクを準備しています…".to_string()
+            tr("🎤 マイクを準備しています…")
         };
         let target_label = self.voice_target_label();
         let mut stop = false;
@@ -6756,8 +7041,8 @@ impl ZaivernApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .button(RichText::new("⏹ 停止").strong())
-                                        .on_hover_text("録音をやめます")
+                                        .button(RichText::new(tr("⏹ 停止")).strong())
+                                        .on_hover_text(tr("録音をやめます"))
                                         .clicked()
                                     {
                                         stop = true;
@@ -6767,13 +7052,13 @@ impl ZaivernApp {
                         });
                         // 録音したまま届け先を切り替えられる
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("届け先:").size(11.0).color(theme.text_dim));
+                            ui.label(RichText::new(tr("届け先:")).size(11.0).color(theme.text_dim));
                             for (t, label) in [
                                 (voice::Target::Active, "🎯 アクティブなエージェント"),
                                 (voice::Target::Broadcast, "📣 全エージェント"),
                             ] {
                                 let sel = self.voice.target == t;
-                                if ui.selectable_label(sel, RichText::new(label).size(11.5)).clicked()
+                                if ui.selectable_label(sel, RichText::new(tr(label)).size(11.5)).clicked()
                                     && !sel
                                 {
                                     set_target = Some(t);
@@ -6784,10 +7069,10 @@ impl ZaivernApp {
                             ui.label(RichText::new(&self.voice.partial).color(theme.accent));
                         }
                         ui.label(
-                            RichText::new(
+                            RichText::new(tr(
                                 "話しながらリアルタイムで入力欄へ書き込まれます。送信は自分で Enter を押したときだけ。\n\
                                  Enter で空になっても録音は続いているので、そのまま話し続けられます",
-                            )
+                            ))
                             .size(11.0)
                             .color(theme.text_dim),
                         );
@@ -6812,9 +7097,10 @@ impl ZaivernApp {
     /// 届け先の表示名。
     fn voice_target_label(&self) -> String {
         match self.voice.target {
-            voice::Target::Broadcast => {
-                format!("📣 全エージェント ({})", self.agents.running_count())
-            }
+            voice::Target::Broadcast => trf(
+                "📣 全エージェント ({n})",
+                &[("n", self.agents.running_count().to_string())],
+            ),
             voice::Target::Active | voice::Target::Session(_) => {
                 match self.resolve_voice_target() {
                     Some(id) => self
@@ -6823,8 +7109,8 @@ impl ZaivernApp {
                         .iter()
                         .find(|s| s.id == id)
                         .map(|s| format!("{} {}", s.icon, s.title))
-                        .unwrap_or_else(|| "(見つかりません)".into()),
-                    None => "(エージェントがいません)".into(),
+                        .unwrap_or_else(|| tr("(見つかりません)")),
+                    None => tr("(エージェントがいません)"),
                 }
             }
         }
@@ -6951,7 +7237,10 @@ impl ZaivernApp {
                         b.conflict_notified = None;
                         self.tree.invalidate();
                         self.toast(
-                            format!("💾 保存しました (スマホから): {}", path.display()),
+                            trf(
+                                "💾 保存しました (スマホから): {path}",
+                                &[("path", path.display().to_string())],
+                            ),
                             true,
                         );
                         json!({"ok": true, "dirty": false}).to_string()
@@ -7109,7 +7398,7 @@ impl ZaivernApp {
                 } else {
                     text.clone()
                 };
-                let verb = if *submit { "送信" } else { "入力欄へ" };
+                let verb = if *submit { tr("送信") } else { tr("入力欄へ") };
                 if *id < 0 {
                     // 全エージェントへブロードキャスト
                     let n = self.agents.running_count();
@@ -7120,7 +7409,17 @@ impl ZaivernApp {
                     for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
                         s.write_bytes(payload.as_bytes());
                     }
-                    self.toast(format!("🎤📣 {n} セッション {verb}: {text}"), true);
+                    self.toast(
+                        trf(
+                            "🎤📣 {n} セッション {verb}: {text}",
+                            &[
+                                ("n", n.to_string()),
+                                ("verb", verb),
+                                ("text", text.to_string()),
+                            ],
+                        ),
+                        true,
+                    );
                     json!({"ok": true, "sent": n}).to_string()
                 } else {
                     // セッション id 指定 (インデックスではなく id — 閉じてもずれない)
@@ -7256,7 +7555,7 @@ impl ZaivernApp {
         let mut copy = false;
         let mut open_voice = false;
 
-        egui::Window::new("📱 スマホリモート")
+        egui::Window::new(tr("📱 スマホリモート"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -7267,7 +7566,7 @@ impl ZaivernApp {
                     (Some(url), _) => {
                         ui.vertical_centered(|ui| {
                             ui.label(
-                                RichText::new("同じ Wi-Fi のスマホで QR を読み取るだけで接続")
+                                RichText::new(tr("同じ Wi-Fi のスマホで QR を読み取るだけで接続"))
                                     .color(theme.text),
                             );
                             ui.add_space(8.0);
@@ -7284,27 +7583,27 @@ impl ZaivernApp {
                                     .desired_width(320.0)
                                     .font(FontId::monospace(12.0)),
                             );
-                            if ui.button("📋 URL をコピー").clicked() {
+                            if ui.button(tr("📋 URL をコピー")).clicked() {
                                 copy = true;
                             }
                             ui.add_space(6.0);
                             ui.label(
-                                RichText::new(
+                                RichText::new(tr(
                                     "スマホから: ファイルの編集・保存・オープン、\n\
                                      エージェント操作 (Claude の承認・指示も OK)、各種コマンド\n\
                                      🎤 音声入力: スマホは「エージェント」タブのマイクボタン",
-                                )
+                                ))
                                 .size(11.5)
                                 .color(theme.text_dim),
                             );
                             ui.add_space(6.0);
                             ui.separator();
                             if ui
-                                .button("🎤 PC で音声入力する")
-                                .on_hover_text(
+                                .button(tr("🎤 PC で音声入力する"))
+                                .on_hover_text(tr(
                                     "Zaivern 内で音声認識し、話した内容を\n\
                                      エージェントの入力欄へ入れます (送信は自分で Enter)",
-                                )
+                                ))
                                 .clicked()
                             {
                                 open_voice = true;
@@ -7312,7 +7611,10 @@ impl ZaivernApp {
                         });
                     }
                     (None, Some(e)) => {
-                        ui.colored_label(theme.err, format!("リモートサーバ起動失敗: {e}"));
+                        ui.colored_label(
+                            theme.err,
+                            trf("リモートサーバ起動失敗: {e}", &[("e", e.to_string())]),
+                        );
                     }
                     _ => {}
                 }
@@ -7326,7 +7628,7 @@ impl ZaivernApp {
             if let Some(u) = url_full {
                 ctx.copy_text(u);
             }
-            self.toast("URL をコピーしました", true);
+            self.toast(tr("URL をコピーしました"), true);
         }
     }
 
@@ -7454,7 +7756,10 @@ impl ZaivernApp {
 
         if let Some(cmd) = self.cfg.super_agent.active_command().map(str::to_string) {
             if let Some(why) = super_agent_reject_reason(&cmd) {
-                self.super_agent_err = Some(format!("`{cmd}` は監視役にできません: {why}"));
+                self.super_agent_err = Some(trf(
+                    "`{cmd}` は監視役にできません: {why}",
+                    &[("cmd", cmd.clone()), ("why", why)],
+                ));
             } else {
                 let root = Some(self.primary_root().to_path_buf());
                 match diagnostician::CliDiagnostician::new(&cmd, root) {
@@ -7486,7 +7791,10 @@ impl ZaivernApp {
         self.sync_super_agent_session();
 
         if let Some(e) = self.super_agent_err.clone() {
-            self.toast_warn(format!("⚠ スーパーエージェントを有効にできませんでした — {e}"));
+            self.toast_warn(trf(
+                "⚠ スーパーエージェントを有効にできませんでした — {e}",
+                &[("e", e)],
+            ));
         }
     }
 
@@ -7607,7 +7915,7 @@ impl ZaivernApp {
         // 確認ゲートを飛ばす近道は作らない。
         let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
         for d in self.supervisor.poll_diagnoses() {
-            self.toast(format!("💡 AI 診断: {}", d.summary), false);
+            self.toast(trf("💡 AI 診断: {summary}", &[("summary", d.summary.clone())]), false);
             if let Some(it) = self.supervisor.intent_from_diagnosis(&d, approval) {
                 self.accept_intent(it, ctx, win_focused);
             }
@@ -7739,7 +8047,7 @@ impl ZaivernApp {
 
         // 3) ユーザー宛は握り潰さない。抑制もエスカレーションも必ず見える形にする。
         for m in self.coordinator.take_user_messages() {
-            let line = format!("📮 {} — {}", m.kind.label(), m.body);
+            let line = format!("📮 {} — {}", tr(m.kind.label()), m.body);
             self.toast_warn(line.clone());
             if !win_focused {
                 notify::notify("Zaivern Code", &line);
@@ -7950,7 +8258,13 @@ impl ZaivernApp {
                     s.write_bytes(payload.as_bytes());
                     s.resolve_attention();
                 }
-                self.toast(format!("🛡 {} へ自動応答しました", it.session_title), true);
+                self.toast(
+                    trf(
+                        "🛡 {title} へ自動応答しました",
+                        &[("title", it.session_title.clone())],
+                    ),
+                    true,
+                );
             }
             I::Nudge => {
                 let (Some(i), Some(payload)) = (idx, it.payload.clone()) else {
@@ -7962,7 +8276,10 @@ impl ZaivernApp {
                     .get_mut(i)
                     .is_some_and(|s| s.send_text(&format!("{payload}\r")));
                 if sent {
-                    self.toast_warn(format!("🛡 {} を促しました: {payload}", it.session_title));
+                    self.toast_warn(trf(
+                        "🛡 {title} を促しました: {payload}",
+                        &[("title", it.session_title.clone()), ("payload", payload)],
+                    ));
                 }
             }
             I::Restart => {
@@ -7973,7 +8290,10 @@ impl ZaivernApp {
                 self.coordinator.note_exited(it.session_id, Instant::now());
                 self.sup_last_state.remove(&it.session_id);
                 match self.agents.restart(i, ctx) {
-                    Ok(()) => self.toast_warn(format!("🛡 {} を再起動しました", it.session_title)),
+                    Ok(()) => self.toast_warn(trf(
+                        "🛡 {title} を再起動しました",
+                        &[("title", it.session_title.clone())],
+                    )),
                     Err(e) => self.toast(e, false),
                 }
             }
@@ -7983,7 +8303,10 @@ impl ZaivernApp {
                     s.kill();
                 }
                 self.coordinator.note_exited(it.session_id, Instant::now());
-                self.toast_warn(format!("🛡 {} を停止しました", it.session_title));
+                self.toast_warn(trf(
+                    "🛡 {title} を停止しました",
+                    &[("title", it.session_title.clone())],
+                ));
             }
         }
     }
@@ -7999,7 +8322,7 @@ impl ZaivernApp {
         let rest = self.pending_intervention.len() - 1;
         let mut decided: Option<bool> = None;
 
-        egui::Window::new("エージェント監視からの提案")
+        egui::Window::new(tr("エージェント監視からの提案"))
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -8007,18 +8330,24 @@ impl ZaivernApp {
                 ui.label(it.confirm_body());
                 if rest > 0 {
                     ui.label(
-                        RichText::new(format!("ほかに {rest} 件の提案があります"))
-                            .small()
-                            .color(warn),
+                        RichText::new(trf(
+                            "ほかに {rest} 件の提案があります",
+                            &[("rest", rest.to_string())],
+                        ))
+                        .small()
+                        .color(warn),
                     );
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let label = format!("▶ {} を実行", it.action.label());
+                    let label = trf(
+                        "▶ {action} を実行",
+                        &[("action", tr(it.action.label()))],
+                    );
                     if ui.button(RichText::new(label).color(warn)).clicked() {
                         decided = Some(true);
                     }
-                    if ui.button("何もしない").clicked() {
+                    if ui.button(tr("何もしない")).clicked() {
                         decided = Some(false);
                     }
                 });
@@ -8047,7 +8376,7 @@ impl ZaivernApp {
         let warn = self.theme.warn;
         let mut decided: Option<bool> = None;
 
-        egui::Window::new("セッション停止の確認")
+        egui::Window::new(tr("セッション停止の確認"))
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -8055,10 +8384,10 @@ impl ZaivernApp {
                 ui.label(&body);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new("🛑 停止する").color(warn)).clicked() {
+                    if ui.button(RichText::new(tr("🛑 停止する")).color(warn)).clicked() {
                         decided = Some(true);
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(tr("キャンセル")).clicked() {
                         decided = Some(false);
                     }
                 });
@@ -8175,8 +8504,9 @@ impl eframe::App for ZaivernApp {
                         .is_some_and(|at| at.elapsed().as_secs() < 10);
                     if !throttled {
                         self.pet_attention_notified.insert(title.clone(), Instant::now());
-                        self.toast_warn(format!(
-                            "🔔 {title} が承認待ちです — パネルで確認してください"
+                        self.toast_warn(trf(
+                            "🔔 {title} が承認待ちです — パネルで確認してください",
+                            &[("title", title.clone())],
                         ));
                         if self.cfg.pet_sounds {
                             self.sound.play(SoundKind::Confirm);
@@ -8184,7 +8514,10 @@ impl eframe::App for ZaivernApp {
                     }
                     // OS 通知はペット導入前からの挙動なのでそのまま
                     if !win_focused {
-                        notify::notify("Zaivern Code", &format!("🔔 {title} が承認待ちです"));
+                        notify::notify(
+                            "Zaivern Code",
+                            &trf("🔔 {title} が承認待ちです", &[("title", title.clone())]),
+                        );
                     }
                     if !throttled {
                         notify::webhook(
@@ -8196,18 +8529,33 @@ impl eframe::App for ZaivernApp {
                     }
                 }
                 SessionEvent::AutoApproved(title, desc) => {
-                    self.toast(format!("⚡ {title}: {desc} を自動送信しました"), true);
+                    self.toast(
+                        trf(
+                            "⚡ {title}: {desc} を自動送信しました",
+                            &[("title", title.clone()), ("desc", desc.to_string())],
+                        ),
+                        true,
+                    );
                 }
                 SessionEvent::Exited(title, code) => {
                     if code == 0 {
-                        self.toast(format!("✅ {title} が終了しました"), true);
+                        self.toast(
+                            trf("✅ {title} が終了しました", &[("title", title.clone())]),
+                            true,
+                        );
                         // ペットが少しのあいだ喜ぶ + 完了音
                         self.pet_happy_until = Some(Instant::now() + Duration::from_secs(4));
                         if self.cfg.pet_sounds {
                             self.sound.play(SoundKind::Complete);
                         }
                     } else {
-                        self.toast(format!("❌ {title} が終了しました (code {code})"), false);
+                        self.toast(
+                            trf(
+                                "❌ {title} が終了しました (code {code})",
+                                &[("title", title.clone()), ("code", code.to_string())],
+                            ),
+                            false,
+                        );
                         // ペットが少しのあいだ落ち込む + エラー音
                         self.pet_error_until = Some(Instant::now() + Duration::from_secs(6));
                         if self.cfg.pet_sounds {
@@ -8216,7 +8564,13 @@ impl eframe::App for ZaivernApp {
                     }
                     if !win_focused {
                         let mark = if code == 0 { "✅" } else { "❌" };
-                        notify::notify("Zaivern Code", &format!("{mark} {title} が終了しました"));
+                        notify::notify(
+                            "Zaivern Code",
+                            &trf(
+                                "{mark} {title} が終了しました",
+                                &[("mark", mark.to_string()), ("title", title.clone())],
+                            ),
+                        );
                     }
                     let mark = if code == 0 { "✅" } else { "❌" };
                     notify::webhook(
@@ -8497,7 +8851,7 @@ impl eframe::App for ZaivernApp {
                             });
                             if let Some((true, title, id)) = sent {
                                 self.pet_bubble_answered.insert(id, Instant::now());
-                                self.toast(format!("✔ 承認を送信: {title}"), true);
+                                self.toast(trf("✔ 承認を送信: {title}", &[("title", title)]), true);
                             }
                         }
                         pet_bubble::BubbleAction::Deny(i) => {
@@ -8511,7 +8865,7 @@ impl eframe::App for ZaivernApp {
                             });
                             if let Some((true, title, id)) = sent {
                                 self.pet_bubble_answered.insert(id, Instant::now());
-                                self.toast(format!("✖ 拒否を送信: {title}"), true);
+                                self.toast(trf("✖ 拒否を送信: {title}", &[("title", title)]), true);
                             }
                         }
                         pet_bubble::BubbleAction::Focus(i) => {

@@ -171,6 +171,7 @@ Every major capability ships as a plugin. On first launch they unpack into `~/.z
 | 🎯 `element-capture` | Pick an element on screen and pass its structure, styles, and a cropped image into the prompt |
 | 📊 `usage-meter` | Show agent usage in a panel |
 | ⚡ `quick-actions` | Detect the project type and run test / build / format immediately |
+| 🌐 `english-mode` | Language pack that switches the UI to English (the only one that starts disabled; toggle it in the 🔌 tab — English instantly, back to Japanese when off. The `lang/*.toml` dictionaries are editable) |
 
 They are just shell scripts. **Read them, copy them, rewrite them.** Anything you don't want can be disabled from the 🔌 tab.
 

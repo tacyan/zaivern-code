@@ -30,6 +30,7 @@ use crate::coordinator::{
     self, AgentMessage, AssignRefusal, Endpoint, MsgKind, ReassignReason, SendOutcome, SessionId,
     SessionInfo, SessionState, Task, TaskId, TaskState,
 };
+use crate::i18n::{tr, trf};
 use crate::theme::Theme;
 
 // ── 上限 ─────────────────────────────────────────────────────────────
@@ -104,7 +105,7 @@ pub fn bus_status(co: &coordinator::Coordinator, rows: &[SessionRow]) -> BusStat
             d.msg_id,
             describe_endpoint(rows, d.from),
             describe_endpoint(rows, d.to),
-            d.reason.label()
+            tr(&d.reason.label())
         )
     });
     st
@@ -339,19 +340,27 @@ pub fn apply_action(
                     // 本文はバスへ積む。相手が「注入して安全な状態」になってから届く。
                     match co.queue_handoff(tid, sid, now) {
                         SendOutcome::Dropped { reason } => {
-                            eff.warn(format!(
-                                "タスク #{tid} は {name} に割り当てましたが、本文を送れませんでした: {}",
-                                reason.label()
+                            eff.warn(trf(
+                                "タスク #{tid} は {name} に割り当てましたが、本文を送れませんでした: {reason}",
+                                &[
+                                    ("tid", tid.to_string()),
+                                    ("name", name),
+                                    ("reason", tr(&reason.label())),
+                                ],
                             ));
                         }
                         _ => {
-                            eff.ok(format!(
-                                "📋 タスク #{tid}「{title}」を {name} に割り当てました (相手が待機状態になり次第、本文を送ります)"
+                            eff.ok(trf(
+                                "📋 タスク #{tid}「{title}」を {name} に割り当てました (相手が待機状態になり次第、本文を送ります)",
+                                &[("tid", tid.to_string()), ("title", title), ("name", name)],
                             ));
                         }
                     }
                 }
-                Err(r) => eff.warn(format!("📋 タスク #{tid} を割り当てられません: {}", r.label())),
+                Err(r) => eff.warn(trf(
+                    "📋 タスク #{tid} を割り当てられません: {reason}",
+                    &[("tid", tid.to_string()), ("reason", tr(&r.label()))],
+                )),
             }
         }
 
@@ -367,23 +376,26 @@ pub fn apply_action(
         OrchAction::Retry(tid) => {
             let cands = candidates(rows);
             match co.redispatch(tid, &cands, ReassignReason::Manual, now) {
-                Ok(sid) => eff.ok(format!(
-                    "📋 タスク #{tid} を {} へ渡し直しました",
-                    row_label(rows, sid)
+                Ok(sid) => eff.ok(trf(
+                    "📋 タスク #{tid} を {name} へ渡し直しました",
+                    &[("tid", tid.to_string()), ("name", row_label(rows, sid))],
                 )),
-                Err(r) => eff.warn(format!("📋 タスク #{tid} の再割り当てを断りました: {}", r.label())),
+                Err(r) => eff.warn(trf(
+                    "📋 タスク #{tid} の再割り当てを断りました: {reason}",
+                    &[("tid", tid.to_string()), ("reason", tr(&r.label()))],
+                )),
             }
         }
 
         OrchAction::MarkDone(tid) => {
             co.note_done(tid, now);
-            eff.ok(format!("✅ タスク #{tid} を完了にしました"));
+            eff.ok(trf("✅ タスク #{tid} を完了にしました", &[("tid", tid.to_string())]));
         }
 
         OrchAction::MarkFailed(tid) => {
             let holder = co.task(tid).and_then(|t| t.assigned).unwrap_or(0);
             co.note_failed(tid, holder, "ユーザーが失敗と判断した", now);
-            eff.warn(format!("⚠ タスク #{tid} を失敗にしました"));
+            eff.warn(trf("⚠ タスク #{tid} を失敗にしました", &[("tid", tid.to_string())]));
         }
     }
     eff
@@ -393,17 +405,24 @@ pub fn apply_action(
 fn report_send(out: &SendOutcome, dest: &str) -> Effects {
     let mut eff = Effects::default();
     match out {
-        SendOutcome::Queued { id } => eff.ok(format!("📮 #{id} を {dest} へ送りました")),
+        SendOutcome::Queued { id } => eff.ok(trf(
+            "📮 #{id} を {dest} へ送りました",
+            &[("id", id.to_string()), ("dest", dest.to_string())],
+        )),
         SendOutcome::Broadcast { id, delivered_to } => {
             if *delivered_to == 0 {
-                eff.warn(format!("📮 #{id} は届け先がいませんでした"));
+                eff.warn(trf("📮 #{id} は届け先がいませんでした", &[("id", id.to_string())]));
             } else {
-                eff.ok(format!("📮 #{id} を {delivered_to} 件へ一斉送信しました"));
+                eff.ok(trf(
+                    "📮 #{id} を {delivered_to} 件へ一斉送信しました",
+                    &[("id", id.to_string()), ("delivered_to", delivered_to.to_string())],
+                ));
             }
         }
-        SendOutcome::Dropped { reason } => {
-            eff.warn(format!("📮 {dest} への送信は届きません: {}", reason.label()))
-        }
+        SendOutcome::Dropped { reason } => eff.warn(trf(
+            "📮 {dest} への送信は届きません: {reason}",
+            &[("dest", dest.to_string()), ("reason", tr(&reason.label()))],
+        )),
     }
     eff
 }
@@ -417,7 +436,7 @@ fn row_label(rows: &[SessionRow], id: SessionId) -> String {
 
 fn describe_target(rows: &[SessionRow], to: MsgTarget) -> String {
     match to {
-        MsgTarget::Broadcast => "全エージェント".into(),
+        MsgTarget::Broadcast => tr("全エージェント"),
         MsgTarget::Session(id) => row_label(rows, id),
     }
 }
@@ -487,16 +506,20 @@ pub fn redispatch_ready(
         match co.redispatch(tid, &cands, reason, now) {
             Ok(sid) => {
                 st.escalated.remove(&tid);
-                eff.warn(format!(
-                    "🔁 タスク #{tid} を {} へ引き継ぎました ({})",
-                    row_label(rows, sid),
-                    reason.label()
+                eff.warn(trf(
+                    "🔁 タスク #{tid} を {name} へ引き継ぎました ({reason})",
+                    &[
+                        ("tid", tid.to_string()),
+                        ("name", row_label(rows, sid)),
+                        ("reason", tr(reason.label())),
+                    ],
                 ));
             }
             Err(AssignRefusal::PreviousHolderNotStopped { previous }) => {
                 // 順序が崩れている。回避せず、そのまま見せて止まる。
-                eff.warn(format!(
-                    "🛑 タスク #{tid} は引き渡しません: 前任 session:{previous} の停止が未確認です"
+                eff.warn(trf(
+                    "🛑 タスク #{tid} は引き渡しません: 前任 session:{previous} の停止が未確認です",
+                    &[("tid", tid.to_string()), ("previous", previous.to_string())],
                 ));
             }
             Err(AssignRefusal::NoEligibleCandidate) => {
@@ -597,18 +620,22 @@ pub fn scan_outbound(
 
         let Some(dest) = resolve_target(&target, rows, from) else {
             st.unknown_target_drops += 1;
-            eff.warn(format!(
-                "📮 {} の発信を破棄: 宛先「{target}」が見つかりません",
-                row_label(rows, from)
+            eff.warn(trf(
+                "📮 {name} の発信を破棄: 宛先「{target}」が見つかりません",
+                &[("name", row_label(rows, from)), ("target", target)],
             ));
             continue;
         };
 
         if !st.allow_outbound(from, now) {
             st.rate_capped_drops += 1;
-            eff.warn(format!(
-                "📮 {} の発信を抑制: {OUTBOUND_WINDOW:?} あたり {OUTBOUND_PER_WINDOW} 通の上限に達しました",
-                row_label(rows, from)
+            eff.warn(trf(
+                "📮 {name} の発信を抑制: {window} あたり {per} 通の上限に達しました",
+                &[
+                    ("name", row_label(rows, from)),
+                    ("window", format!("{OUTBOUND_WINDOW:?}")),
+                    ("per", OUTBOUND_PER_WINDOW.to_string()),
+                ],
             ));
             continue;
         }
@@ -659,10 +686,10 @@ fn resolve_target(target: &str, rows: &[SessionRow], from: SessionId) -> Option<
 
 fn describe_endpoint(rows: &[SessionRow], e: Endpoint) -> String {
     match e {
-        Endpoint::Broadcast => "全エージェント".into(),
+        Endpoint::Broadcast => tr("全エージェント"),
         Endpoint::Session(id) => row_label(rows, id),
-        Endpoint::Supervisor => "監視役".into(),
-        Endpoint::User => "あなた".into(),
+        Endpoint::Supervisor => tr("監視役"),
+        Endpoint::User => tr("あなた"),
     }
 }
 
@@ -704,7 +731,7 @@ pub fn cockpit_section(
 
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("📋 タスクとメッセージ")
+            RichText::new(tr("📋 タスクとメッセージ"))
                 .strong()
                 .color(theme.accent),
         );
@@ -713,10 +740,13 @@ pub fn cockpit_section(
             .iter()
             .filter(|t| t.state == TaskState::NeedsUser)
             .count();
-        ui.label(RichText::new(format!("未完了 {open} 件")).color(theme.text_dim));
+        ui.label(
+            RichText::new(trf("未完了 {open} 件", &[("open", open.to_string())]))
+                .color(theme.text_dim),
+        );
         if stuck > 0 {
             ui.label(
-                RichText::new(format!("⚠ 人手待ち {stuck} 件"))
+                RichText::new(trf("⚠ 人手待ち {stuck} 件", &[("stuck", stuck.to_string())]))
                     .strong()
                     .color(theme.err),
             );
@@ -724,28 +754,35 @@ pub fn cockpit_section(
         // 配達待ちと、抑制されて消えた分。黙って消えたように見せない。
         if bus.queued > 0 {
             ui.label(
-                RichText::new(format!("📮 配達待ち {}", bus.queued)).color(theme.text_dim),
+                RichText::new(trf("📮 配達待ち {n}", &[("n", bus.queued.to_string())]))
+                    .color(theme.text_dim),
             )
-            .on_hover_text("相手が待機状態になってから届きます");
+            .on_hover_text(tr("相手が待機状態になってから届きます"));
         }
         if bus.drops > 0 || bus.overflowed > 0 {
             let hint = bus
                 .last_drop
                 .clone()
-                .unwrap_or_else(|| "直近の破棄はありません".into());
+                .unwrap_or_else(|| tr("直近の破棄はありません"));
             ui.label(
-                RichText::new(format!("🗑 破棄 {} / 溢れ {}", bus.drops, bus.overflowed))
-                    .color(theme.warn),
+                RichText::new(trf(
+                    "🗑 破棄 {drops} / 溢れ {overflow}",
+                    &[
+                        ("drops", bus.drops.to_string()),
+                        ("overflow", bus.overflowed.to_string()),
+                    ],
+                ))
+                .color(theme.warn),
             )
-            .on_hover_text(format!("直近: {hint}"));
+            .on_hover_text(trf("直近: {hint}", &[("hint", hint)]));
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // 「タスク」と「メッセージ」は 1 つに統合し、全エージェントへの
             // ブロードキャスト送信に一本化する (個別宛はフォーム内で選べる)。
             if ui
-                .button("📣 全エージェントへブロードキャスト")
-                .on_hover_text("メッセージを全エージェントへ送ります (フォームで個別宛にも変更可)")
+                .button(tr("📣 全エージェントへブロードキャスト"))
+                .on_hover_text(tr("メッセージを全エージェントへ送ります (フォームで個別宛にも変更可)"))
                 .clicked()
             {
                 st.msg_target = MsgTarget::Broadcast;
@@ -781,7 +818,7 @@ fn task_list(
                 .spacing([10.0, 4.0])
                 .show(ui, |ui| {
                     for h in ["ID", "タイトル", "状態", "担当", "試行", ""] {
-                        ui.label(RichText::new(h).small().color(theme.text_dim));
+                        ui.label(RichText::new(tr(h)).small().color(theme.text_dim));
                     }
                     ui.end_row();
 
@@ -799,19 +836,21 @@ fn task_list(
                         // 引き継ぎ材料も一緒に見せる。次の担当が何を継いだかが分かる。
                         let mut hover = t.description.clone();
                         if !t.context().is_empty() {
-                            hover.push_str("\n\nこれまでの経過:\n");
+                            hover.push_str(&tr("\n\nこれまでの経過:\n"));
                             for c in t.context() {
-                                hover.push_str(&format!("・{c}\n"));
+                                hover.push_str(&trf("・{c}\n", &[("c", c.clone())]));
                             }
                         }
                         if t.history_dropped() > 0 {
-                            hover
-                                .push_str(&format!("\n(古い履歴 {} 件は省略)", t.history_dropped()));
+                            hover.push_str(&trf(
+                                "\n(古い履歴 {n} 件は省略)",
+                                &[("n", t.history_dropped().to_string())],
+                            ));
                         }
                         ui.label(if needs_user { title.strong() } else { title })
                             .on_hover_text(hover.trim_end());
 
-                        let mut badge_txt = RichText::new(badge).color(color);
+                        let mut badge_txt = RichText::new(tr(badge)).color(color);
                         if needs_user {
                             badge_txt = badge_txt.strong();
                         }
@@ -825,18 +864,18 @@ fn task_list(
                         ui.label(RichText::new(t.attempts.to_string()).color(theme.text_dim));
 
                         ui.horizontal(|ui| {
-                            if !t.state.is_terminal() && ui.small_button("完了").clicked() {
+                            if !t.state.is_terminal() && ui.small_button(tr("完了")).clicked() {
                                 acts.push(OrchAction::MarkDone(t.id));
                             }
-                            if !t.state.is_terminal() && ui.small_button("失敗").clicked() {
+                            if !t.state.is_terminal() && ui.small_button(tr("失敗")).clicked() {
                                 acts.push(OrchAction::MarkFailed(t.id));
                             }
                             if needs_user
                                 && ui
-                                    .small_button(RichText::new("↻ 再割当").color(theme.err))
-                                    .on_hover_text(
+                                    .small_button(RichText::new(tr("↻ 再割当")).color(theme.err))
+                                    .on_hover_text(tr(
                                         "再試行の上限に達しています。人が担当を決め直してください",
-                                    )
+                                    ))
                                     .clicked()
                             {
                                 acts.push(OrchAction::Retry(t.id));
@@ -862,7 +901,7 @@ pub fn task_form_ui(
     let mut close = false;
     let mut open = true;
 
-    egui::Window::new("📋 新しいタスク")
+    egui::Window::new(tr("📋 新しいタスク"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -870,25 +909,25 @@ pub fn task_form_ui(
         .show(ctx, |ui| {
             ui.set_min_width(420.0);
 
-            ui.label(RichText::new("タイトル").small().color(theme.text_dim));
+            ui.label(RichText::new(tr("タイトル")).small().color(theme.text_dim));
             ui.add(
                 egui::TextEdit::singleline(&mut st.title)
                     .desired_width(f32::INFINITY)
-                    .hint_text("例: ログイン画面のテストを直す"),
+                    .hint_text(tr("例: ログイン画面のテストを直す")),
             );
 
             ui.add_space(6.0);
-            ui.label(RichText::new("内容").small().color(theme.text_dim));
+            ui.label(RichText::new(tr("内容")).small().color(theme.text_dim));
             ui.add(
                 egui::TextEdit::multiline(&mut st.description)
                     .desired_width(f32::INFINITY)
                     .desired_rows(4)
-                    .hint_text("担当するエージェントへそのまま送られます"),
+                    .hint_text(tr("担当するエージェントへそのまま送られます")),
             );
 
             ui.add_space(6.0);
             ui.label(
-                RichText::new("必要な能力 (任意・カンマ区切り)")
+                RichText::new(tr("必要な能力 (任意・カンマ区切り)"))
                     .small()
                     .color(theme.text_dim),
             );
@@ -900,15 +939,15 @@ pub fn task_form_ui(
 
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("担当").small().color(theme.text_dim));
+                ui.label(RichText::new(tr("担当")).small().color(theme.text_dim));
                 let current = match st.target {
-                    TaskTarget::Auto => "自動割り当て".to_string(),
+                    TaskTarget::Auto => tr("自動割り当て"),
                     TaskTarget::Session(id) => row_label(rows, id),
                 };
                 egui::ComboBox::from_id_salt("orch-task-target")
                     .selected_text(current)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut st.target, TaskTarget::Auto, "自動割り当て");
+                        ui.selectable_value(&mut st.target, TaskTarget::Auto, tr("自動割り当て"));
                         for r in rows.iter().filter(|r| r.running) {
                             ui.selectable_value(
                                 &mut st.target,
@@ -921,7 +960,7 @@ pub fn task_form_ui(
 
             if rows.iter().all(|r| !r.running) {
                 ui.label(
-                    RichText::new("稼働中のエージェントがいないため、いま割り当てはできません")
+                    RichText::new(tr("稼働中のエージェントがいないため、いま割り当てはできません"))
                         .small()
                         .color(theme.warn),
                 );
@@ -931,7 +970,7 @@ pub fn task_form_ui(
             ui.horizontal(|ui| {
                 let ready = !st.title.trim().is_empty();
                 if ui
-                    .add_enabled(ready, egui::Button::new("▶ 作成して割り当て"))
+                    .add_enabled(ready, egui::Button::new(tr("▶ 作成して割り当て")))
                     .clicked()
                 {
                     acts.push(OrchAction::CreateTask {
@@ -947,7 +986,7 @@ pub fn task_form_ui(
                     });
                     close = true;
                 }
-                if ui.button("キャンセル").clicked() {
+                if ui.button(tr("キャンセル")).clicked() {
                     close = true;
                 }
             });
@@ -977,7 +1016,7 @@ pub fn message_form_ui(
     let mut close = false;
     let mut open = true;
 
-    egui::Window::new("📮 エージェントへ送信")
+    egui::Window::new(tr("📮 エージェントへ送信"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -986,7 +1025,7 @@ pub fn message_form_ui(
             ui.set_min_width(420.0);
 
             ui.horizontal(|ui| {
-                ui.label(RichText::new("宛先").small().color(theme.text_dim));
+                ui.label(RichText::new(tr("宛先")).small().color(theme.text_dim));
                 let current = describe_target(rows, st.msg_target);
                 egui::ComboBox::from_id_salt("orch-msg-target")
                     .selected_text(current)
@@ -994,7 +1033,7 @@ pub fn message_form_ui(
                         ui.selectable_value(
                             &mut st.msg_target,
                             MsgTarget::Broadcast,
-                            "全エージェント (一斉送信)",
+                            tr("全エージェント (一斉送信)"),
                         );
                         for r in rows.iter().filter(|r| r.running) {
                             ui.selectable_value(
@@ -1005,9 +1044,9 @@ pub fn message_form_ui(
                         }
                     });
 
-                ui.label(RichText::new("種別").small().color(theme.text_dim));
+                ui.label(RichText::new(tr("種別")).small().color(theme.text_dim));
                 egui::ComboBox::from_id_salt("orch-msg-kind")
-                    .selected_text(st.msg_kind.label())
+                    .selected_text(tr(st.msg_kind.label()))
                     .show_ui(ui, |ui| {
                         for k in [
                             MsgKind::Request,
@@ -1016,7 +1055,7 @@ pub fn message_form_ui(
                             MsgKind::Question,
                             MsgKind::Handoff,
                         ] {
-                            ui.selectable_value(&mut st.msg_kind, k, k.label());
+                            ui.selectable_value(&mut st.msg_kind, k, tr(k.label()));
                         }
                     });
             });
@@ -1026,13 +1065,13 @@ pub fn message_form_ui(
                 egui::TextEdit::multiline(&mut st.msg_body)
                     .desired_width(f32::INFINITY)
                     .desired_rows(4)
-                    .hint_text("相手が待機状態になったときに届きます"),
+                    .hint_text(tr("相手が待機状態になったときに届きます")),
             );
 
             ui.label(
-                RichText::new(
+                RichText::new(tr(
                     "作業中のエージェントには割り込みません。安全な状態になるまで待ってから届きます",
-                )
+                ))
                 .small()
                 .color(theme.text_dim),
             );
@@ -1040,7 +1079,7 @@ pub fn message_form_ui(
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let ready = !st.msg_body.trim().is_empty();
-                if ui.add_enabled(ready, egui::Button::new("📮 送信")).clicked() {
+                if ui.add_enabled(ready, egui::Button::new(tr("📮 送信"))).clicked() {
                     acts.push(OrchAction::SendMessage {
                         to: st.msg_target,
                         kind: st.msg_kind,
@@ -1048,7 +1087,7 @@ pub fn message_form_ui(
                     });
                     close = true;
                 }
-                if ui.button("閉じる").clicked() {
+                if ui.button(tr("閉じる")).clicked() {
                     close = true;
                 }
             });

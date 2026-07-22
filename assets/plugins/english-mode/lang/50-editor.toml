@@ -1,0 +1,19 @@
+# エディタまわり (ide / editor_ops / terminal / markdown) の辞書。
+# 形式: "日本語原文" = "English" / プレースホルダ {name} は訳文にもそのまま残す。
+
+# ── terminal.rs ──────────────────────────────────────────────────────────
+"PTYを開けませんでした: {e}" = "Could not open PTY: {e}"
+"起動に失敗しました: {e}" = "Failed to launch: {e}"
+"⤒ {n} ⤓ 一番下へ" = "⤒ {n} ⤓ Jump to bottom"
+"クリックで履歴表示を終了して一番下(最新)へ戻る" = "Click to leave scrollback and jump to the bottom (latest)"
+"✕ 終了 (code {code})" = "✕ Exited (code {code})"
+"📋 選択をコピー (⌘C)" = "📋 Copy selection (⌘C)"
+"📄 画面全体をコピー" = "📄 Copy entire screen"
+"✕ 選択を解除" = "✕ Clear selection"
+"📋 コピーしました" = "📋 Copied"
+
+# ── ide.rs ───────────────────────────────────────────────────────────────
+"URL を開けませんでした ({url}): {e}" = "Could not open URL ({url}): {e}"
+"{label} が見つかりません ({bin} が PATH にありません)" = "{label} not found ({bin} is not in PATH)"
+"{label} の起動に失敗しました: {e}" = "Failed to launch {label}: {e}"
+"{label} が見つかりません ({bin} が PATH に無く、URL スキームもありません)" = "{label} not found ({bin} is not in PATH and it has no URL scheme)"

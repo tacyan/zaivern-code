@@ -47,6 +47,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 
+use crate::i18n::trf;
+
 /// ファイルを「指定行で開く」ときの引数の形。IDE ごとに流儀が違う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileArgStyle {
@@ -747,7 +749,12 @@ fn open_url(url: &str) -> Result<(), String> {
         c.args(["/C", "start", "", url]);
         c
     };
-    spawn_detached(&mut cmd).map_err(|e| format!("URL を開けませんでした ({url}): {e}"))
+    spawn_detached(&mut cmd).map_err(|e| {
+        trf(
+            "URL を開けませんでした ({url}): {e}",
+            &[("url", url.to_string()), ("e", e.to_string())],
+        )
+    })
 }
 
 /// 子プロセスを切り離して起動する。
@@ -777,15 +784,23 @@ pub fn launch(spec: &IdeSpec, args: &[String]) -> Result<(), String> {
     let bin = match which_path(spec.bin) {
         Some(p) => p,
         None => {
-            return Err(format!(
-                "{} が見つかりません ({} が PATH にありません)",
-                spec.label, spec.bin
+            return Err(trf(
+                "{label} が見つかりません ({bin} が PATH にありません)",
+                &[
+                    ("label", spec.label.to_string()),
+                    ("bin", spec.bin.to_string()),
+                ],
             ))
         }
     };
     let mut cmd = Command::new(&bin);
     cmd.args(args);
-    spawn_detached(&mut cmd).map_err(|e| format!("{} の起動に失敗しました: {e}", spec.label))
+    spawn_detached(&mut cmd).map_err(|e| {
+        trf(
+            "{label} の起動に失敗しました: {e}",
+            &[("label", spec.label.to_string()), ("e", e.to_string())],
+        )
+    })
 }
 
 /// ファイルを指定行・指定列で開く。**行・列は 1 始まり。**
@@ -799,9 +814,12 @@ pub fn launch_file(spec: &IdeSpec, path: &Path, line: usize, col: usize) -> Resu
     if let Some(url) = url_for(spec, path, line, col) {
         return open_url(&url);
     }
-    Err(format!(
-        "{} が見つかりません ({} が PATH に無く、URL スキームもありません)",
-        spec.label, spec.bin
+    Err(trf(
+        "{label} が見つかりません ({bin} が PATH に無く、URL スキームもありません)",
+        &[
+            ("label", spec.label.to_string()),
+            ("bin", spec.bin.to_string()),
+        ],
     ))
 }
 
@@ -813,9 +831,12 @@ pub fn launch_folder(spec: &IdeSpec, dir: &Path, add: bool) -> Result<(), String
     if let Some(url) = folder_url_for(spec, dir) {
         return open_url(&url);
     }
-    Err(format!(
-        "{} が見つかりません ({} が PATH に無く、URL スキームもありません)",
-        spec.label, spec.bin
+    Err(trf(
+        "{label} が見つかりません ({bin} が PATH に無く、URL スキームもありません)",
+        &[
+            ("label", spec.label.to_string()),
+            ("bin", spec.bin.to_string()),
+        ],
     ))
 }
 

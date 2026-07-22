@@ -369,10 +369,28 @@ pub struct Plugin {
     pub setting_values: HashMap<String, String>,
     pub themes: Vec<(String, PathBuf)>,        // (label, json path)
     pub snippet_files: Vec<(String, PathBuf)>, // (language, path)
+    /// UI 言語パック (`[language]`)。有効なプラグインのものが i18n へ入る。
+    pub language: Option<PluginLanguage>,
+    /// 初回インストール時に有効で始めるか (マニフェストの `default_enabled`)。
+    /// 既定 true。false のものは初回シード時に無効リストへ入れる。
+    pub default_enabled: bool,
     /// 無効化されていないか。無効なら一切登録しない (一覧には残す)。
     pub enabled: bool,
     /// マニフェストが壊れている場合の理由 (一覧に ⚠ 表示するため)。
     pub error: Option<String>,
+}
+
+/// UI 言語パックの宣言。
+#[derive(Clone, Debug)]
+pub struct PluginLanguage {
+    /// 言語ID (例: "en")。
+    #[allow(dead_code)]
+    pub id: String,
+    /// 表示名 (例: "English")。
+    #[allow(dead_code)]
+    pub name: String,
+    /// 辞書のパス (解決済み)。ファイルまたはディレクトリ。
+    pub dict: PathBuf,
 }
 
 impl Plugin {
@@ -504,6 +522,8 @@ struct RawManifest {
     themes: Vec<RawTheme>,
     #[serde(default, rename = "snippet")]
     snippets: Vec<RawSnippet>,
+    #[serde(default)]
+    language: Option<RawLanguage>,
 }
 
 #[derive(Deserialize)]
@@ -517,6 +537,22 @@ struct RawPlugin {
     description: String,
     #[serde(default)]
     api: Option<u32>,
+    /// 初回インストール時に有効で始めるか (省略時 true)。
+    /// UI 言語のように「入れただけで挙動が変わる」プラグインは false にする。
+    #[serde(default)]
+    default_enabled: Option<bool>,
+}
+
+/// `[language]` セクション。UI 言語パック。
+#[derive(Deserialize)]
+struct RawLanguage {
+    /// 言語ID (例: "en")。
+    id: String,
+    /// 表示名 (例: "English")。省略時は id。
+    #[serde(default)]
+    name: String,
+    /// 辞書のパス (プラグインディレクトリ相対)。ファイルまたはディレクトリ。
+    dict: String,
 }
 
 #[derive(Deserialize)]
@@ -658,6 +694,8 @@ fn scan_root(root: &Path) -> Vec<Plugin> {
                 setting_values: HashMap::new(),
                 themes: Vec::new(),
                 snippet_files: Vec::new(),
+                language: None,
+                default_enabled: true,
                 enabled: true,
                 error: Some(e),
             }),
@@ -917,6 +955,28 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
         })
         .collect();
 
+    let language = match m.language {
+        None => None,
+        Some(l) => {
+            let id = l.id.trim().to_lowercase();
+            if id.is_empty() {
+                return Err("[language] に id が必要です (例: \"en\")".into());
+            }
+            if l.dict.trim().is_empty() {
+                return Err("[language] に dict (辞書のパス) が必要です".into());
+            }
+            Some(PluginLanguage {
+                name: if l.name.trim().is_empty() {
+                    id.clone()
+                } else {
+                    l.name.trim().to_string()
+                },
+                id,
+                dict: resolve_rel(dir, &l.dict),
+            })
+        }
+    };
+
     let mut p = Plugin {
         name,
         version: some_or(&m.plugin.version, "0.1.0"),
@@ -931,6 +991,8 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
         setting_values: HashMap::new(),
         themes,
         snippet_files,
+        language,
+        default_enabled: m.plugin.default_enabled.unwrap_or(true),
         enabled: true,
         error: None,
     };
@@ -1262,6 +1324,17 @@ const BUNDLED: &[(&str, &[(&str, &str)])] = &[
             ("scripts/picker.js", include_str!("../assets/plugins/element-capture/scripts/picker.js")),
             ("scripts/poll.js", include_str!("../assets/plugins/element-capture/scripts/poll.js")),
             ("scripts/region.sh", include_str!("../assets/plugins/element-capture/scripts/region.sh")),
+        ],
+    ),
+    (
+        "english-mode",
+        &[
+            ("lang/10-common.toml", include_str!("../assets/plugins/english-mode/lang/10-common.toml")),
+            ("lang/20-app.toml", include_str!("../assets/plugins/english-mode/lang/20-app.toml")),
+            ("lang/30-cockpit.toml", include_str!("../assets/plugins/english-mode/lang/30-cockpit.toml")),
+            ("lang/40-panels.toml", include_str!("../assets/plugins/english-mode/lang/40-panels.toml")),
+            ("lang/50-editor.toml", include_str!("../assets/plugins/english-mode/lang/50-editor.toml")),
+            ("plugin.toml", include_str!("../assets/plugins/english-mode/plugin.toml")),
         ],
     ),
     (
@@ -2032,6 +2105,77 @@ mod tests {
         assert!(create_template_at(&root, "日本語").is_err());
         assert!(create_template_at(&root, "").is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 言語パックのマニフェストを読める() {
+        let d = temp_dir("lang");
+        std::fs::write(
+            d.join("plugin.toml"),
+            r#"
+[plugin]
+name = "my-lang"
+default_enabled = false
+[language]
+id = "EN"
+dict = "lang"
+"#,
+        )
+        .unwrap();
+        let p = parse_manifest(&d).expect("parse ok");
+        assert!(!p.default_enabled, "default_enabled = false が読める");
+        let l = p.language.expect("language section");
+        assert_eq!(l.id, "en", "id は小文字化される");
+        assert_eq!(l.name, "en", "name 省略時は id");
+        assert_eq!(l.dict, d.join("lang"), "dict はプラグイン相対で解決される");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn 言語パックのidとdictは必須() {
+        let d = temp_dir("langbad");
+        std::fs::write(
+            d.join("plugin.toml"),
+            "[plugin]\nname = \"x\"\n[language]\nid = \"\"\ndict = \"lang\"\n",
+        )
+        .unwrap();
+        assert!(parse_manifest(&d).unwrap_err().contains("id"));
+        std::fs::write(
+            d.join("plugin.toml"),
+            "[plugin]\nname = \"x\"\n[language]\nid = \"en\"\ndict = \"\"\n",
+        )
+        .unwrap();
+        assert!(parse_manifest(&d).unwrap_err().contains("dict"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 既存プラグイン (指定なし) の挙動が変わらないこと。
+    #[test]
+    fn default_enabledの既定はtrue() {
+        let d = temp_dir("defen");
+        std::fs::write(d.join("plugin.toml"), "[plugin]\nname = \"x\"\n").unwrap();
+        let p = parse_manifest(&d).expect("parse ok");
+        assert!(p.default_enabled);
+        assert!(p.language.is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// DoD: 同梱の english-mode がそのまま健全で、辞書が実際に読めること。
+    /// ここが通らないと「プラグインは入るが英語にならない」という壊れ方をする。
+    #[test]
+    fn 同梱english_modeが健全で辞書が読める() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/plugins/english-mode");
+        let p = parse_manifest(&dir).expect("english-mode manifest parses");
+        assert!(!p.default_enabled, "初回は無効で入る (勝手に英語にしない)");
+        let l = p.language.as_ref().expect("language section");
+        assert_eq!(l.id, "en");
+        let dict = crate::i18n::load_dict(&l.dict).expect("辞書が読める");
+        assert!(
+            dict.len() >= 20,
+            "主要ラベルの訳が入っている (現在 {} 件)",
+            dict.len()
+        );
+        assert_eq!(dict.get("設定").map(String::as_str), Some("Settings"));
     }
 
     #[test]

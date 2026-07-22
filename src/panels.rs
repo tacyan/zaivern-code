@@ -21,6 +21,7 @@ use eframe::egui::{self, RichText};
 
 use crate::diff::{self, FileDiff};
 use crate::github::{self, GhOutcome, GhRequest, Issue, PullRequest, RepoInfo};
+use crate::i18n::{tr, trf};
 use crate::ide;
 use crate::palette::Cmd;
 use crate::theme::Theme;
@@ -131,7 +132,7 @@ pub fn apply_gh_outcome(panel: &mut GithubPanel, out: GhOutcome) -> GhEffect {
             panel.pending_diff = None;
             GhEffect::OpenDiff {
                 number,
-                title: format!("PR #{number} 差分"),
+                title: trf("PR #{number} 差分", &[("number", number.to_string())]),
                 text,
             }
         }
@@ -179,7 +180,7 @@ pub fn github_ui(
         return;
     }
     let Some(root) = roots.get(panel.root_idx.min(roots.len().saturating_sub(1))) else {
-        ui.label(RichText::new("ワークスペースが開かれていません").color(theme.text_dim));
+        ui.label(RichText::new(tr("ワークスペースが開かれていません")).color(theme.text_dim));
         return;
     };
     let root = root.clone();
@@ -193,7 +194,7 @@ pub fn github_ui(
             .unwrap_or_else(|| "🐙 GitHub".to_string());
         ui.label(RichText::new(title).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("⟳").on_hover_text("再取得").clicked() {
+            if ui.button("⟳").on_hover_text(tr("再取得")).clicked() {
                 panel.reset();
             }
             if panel.inflight > 0 {
@@ -274,7 +275,7 @@ pub fn github_ui(
                     ui,
                     theme,
                     panel.inflight > 0,
-                    "オープンな Pull Request はありません",
+                    &tr("オープンな Pull Request はありません"),
                 );
             }
             for pr in &panel.prs {
@@ -285,7 +286,7 @@ pub fn github_ui(
         }
         GhTab::Issues => {
             if panel.issues.is_empty() {
-                empty_state(ui, theme, panel.inflight > 0, "オープンな Issue はありません");
+                empty_state(ui, theme, panel.inflight > 0, &tr("オープンな Issue はありません"));
             }
             for is in &panel.issues {
                 issue_row(ui, theme, is, presets, &root, actions);
@@ -298,7 +299,10 @@ pub fn github_ui(
         if panel.pending_diff != Some(number) {
             panel.pending_diff = Some(number);
             request(panel, actions, GhRequest::PrDiff { root, number });
-            actions.toast = Some((format!("🐙 PR #{number} の差分を取得中…"), true));
+            actions.toast = Some((
+                trf("🐙 PR #{number} の差分を取得中…", &[("number", number.to_string())]),
+                true,
+            ));
         }
     }
 }
@@ -306,15 +310,15 @@ pub fn github_ui(
 /// gh が入っていないときの説明。責めない・慌てない文面にする。
 fn gh_missing_ui(ui: &mut egui::Ui, theme: &Theme) {
     ui.add_space(6.0);
-    ui.label(RichText::new("🐙 GitHub 連携は利用できません").strong());
+    ui.label(RichText::new(tr("🐙 GitHub 連携は利用できません")).strong());
     ui.add_space(4.0);
     ui.label(
-        RichText::new("GitHub CLI (gh) が見つかりませんでした。インストールすると、この場所に Pull Request と Issue の一覧が出ます。")
+        RichText::new(tr("GitHub CLI (gh) が見つかりませんでした。インストールすると、この場所に Pull Request と Issue の一覧が出ます。"))
             .color(theme.text_dim)
             .size(11.5),
     );
     ui.add_space(6.0);
-    ui.label(RichText::new("インストール:").color(theme.text_dim).size(11.5));
+    ui.label(RichText::new(tr("インストール:")).color(theme.text_dim).size(11.5));
     ui.label(
         RichText::new("  brew install gh   (macOS)")
             .monospace()
@@ -329,7 +333,7 @@ fn gh_missing_ui(ui: &mut egui::Ui, theme: &Theme) {
     );
     ui.add_space(6.0);
     ui.label(
-        RichText::new("インストール後は gh auth login で認証し、Zaivern を再起動してください。")
+        RichText::new(tr("インストール後は gh auth login で認証し、Zaivern を再起動してください。"))
             .color(theme.text_dim)
             .size(11.5),
     );
@@ -338,7 +342,7 @@ fn gh_missing_ui(ui: &mut egui::Ui, theme: &Theme) {
 /// 一覧が空のときの表示。取得中と「本当に 0 件」を区別する。
 fn empty_state(ui: &mut egui::Ui, theme: &Theme, loading: bool, msg: &str) {
     ui.add_space(8.0);
-    let text = if loading { "取得中…" } else { msg };
+    let text = if loading { tr("取得中…") } else { msg.to_string() };
     ui.label(RichText::new(text).color(theme.text_dim).size(11.5));
 }
 
@@ -385,7 +389,7 @@ fn pr_row(ui: &mut egui::Ui, theme: &Theme, pr: &PullRequest, busy: bool) -> boo
                 if busy {
                     ui.add(
                         egui::Label::new(
-                            RichText::new("差分を取得中…").color(theme.warn).size(10.5),
+                            RichText::new(tr("差分を取得中…")).color(theme.warn).size(10.5),
                         )
                         .selectable(false),
                     );
@@ -401,7 +405,7 @@ fn pr_row(ui: &mut egui::Ui, theme: &Theme, pr: &PullRequest, busy: bool) -> boo
     if hit.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    hit.on_hover_text("クリックで差分をタブに開く").clicked()
+    hit.on_hover_text(tr("クリックで差分をタブに開く")).clicked()
 }
 
 /// Issue 1 行。「⚡ 着手」で worktree + エージェント起動のワンフローが始まる。
@@ -506,11 +510,18 @@ pub fn pr_diff_ui(
         .inner_margin(egui::Margin::symmetric(10.0, 6.0))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("🐙 PR #{number} の差分")).strong());
                 ui.label(
-                    RichText::new(format!(
-                        "{} ファイル · +{add} -{del} · 読み取り専用",
-                        files.len()
+                    RichText::new(trf("🐙 PR #{number} の差分", &[("number", number.to_string())]))
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(trf(
+                        "{n} ファイル · +{add} -{del} · 読み取り専用",
+                        &[
+                            ("n", files.len().to_string()),
+                            ("add", add.to_string()),
+                            ("del", del.to_string()),
+                        ],
                     ))
                     .color(theme.text_dim)
                     .size(11.0),
@@ -525,7 +536,7 @@ pub fn pr_diff_ui(
             if files.is_empty() {
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new("この PR に差分はありません")
+                    RichText::new(tr("この PR に差分はありません"))
                         .color(theme.text_dim)
                         .size(11.5),
                 );
@@ -569,7 +580,10 @@ pub fn ide_label(d: &ide::DetectedIde) -> String {
     if d.confirmed && d.identity_verified {
         format!("{} {}", d.icon, d.label)
     } else {
-        format!("{} {} (暫定)", d.icon, d.label)
+        trf(
+            "{icon} {label} (暫定)",
+            &[("icon", d.icon.to_string()), ("label", d.label.to_string())],
+        )
     }
 }
 
@@ -586,12 +600,15 @@ pub fn ide_palette_entries() -> Vec<(String, String, Cmd)> {
         let name = ide_label(d);
         out.push((
             "↗".to_string(),
-            format!("外部IDE: {name} で現在のファイルを開く (現在行)"),
+            trf(
+                "外部IDE: {name} で現在のファイルを開く (現在行)",
+                &[("name", name.clone())],
+            ),
             Cmd::OpenInIde(d.key.to_string()),
         ));
         out.push((
             "📂".to_string(),
-            format!("外部IDE: {name} でワークスペースを開く"),
+            trf("外部IDE: {name} でワークスペースを開く", &[("name", name)]),
             Cmd::OpenFolderInIde(d.key.to_string()),
         ));
     }
@@ -609,15 +626,25 @@ pub fn open_in_ide(
     folder: bool,
 ) -> Result<String, String> {
     let Some(spec) = ide::spec_by_key(key) else {
-        return Err(format!("未知の IDE です: {key}"));
+        return Err(trf("未知の IDE です: {key}", &[("key", key.to_string())]));
     };
     if folder {
         ide::launch_folder(spec, root, false)
-            .map(|()| format!("{} {} でフォルダを開きました", spec.icon, spec.label))
-            .map_err(|e| format!("{} を起動できませんでした: {e}", spec.label))
+            .map(|()| {
+                trf(
+                    "{icon} {label} でフォルダを開きました",
+                    &[("icon", spec.icon.to_string()), ("label", spec.label.to_string())],
+                )
+            })
+            .map_err(|e| {
+                trf(
+                    "{label} を起動できませんでした: {e}",
+                    &[("label", spec.label.to_string()), ("e", e.to_string())],
+                )
+            })
     } else {
         let Some(path) = file else {
-            return Err("外部 IDE で開けるのは保存済みのファイルだけです".into());
+            return Err(tr("外部 IDE で開けるのは保存済みのファイルだけです"));
         };
         let (line, col) = ide_line_col(cursor);
         ide::launch_file(spec, path, line, col)
@@ -626,9 +653,22 @@ pub fn open_in_ide(
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.display().to_string());
-                format!("{} {} で {name}:{line} を開きました", spec.icon, spec.label)
+                trf(
+                    "{icon} {label} で {name}:{line} を開きました",
+                    &[
+                        ("icon", spec.icon.to_string()),
+                        ("label", spec.label.to_string()),
+                        ("name", name),
+                        ("line", line.to_string()),
+                    ],
+                )
             })
-            .map_err(|e| format!("{} を起動できませんでした: {e}", spec.label))
+            .map_err(|e| {
+                trf(
+                    "{label} を起動できませんでした: {e}",
+                    &[("label", spec.label.to_string()), ("e", e.to_string())],
+                )
+            })
     }
 }
 

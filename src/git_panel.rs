@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
 
+use crate::i18n::{tr, trf};
 use crate::theme::Theme;
 
 /// 一覧キャッシュの寿命。切れたら次フレームで再収集を仕込む。
@@ -100,7 +101,7 @@ impl WorktreeEntry {
                     .collect();
                 format!("(detached {short})")
             }
-            (None, false) => "(不明)".to_string(),
+            (None, false) => tr("(不明)"),
         }
     }
 }
@@ -194,7 +195,7 @@ fn run_git(ws: &Path, args: &[&str]) -> Result<String, RunErr> {
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(RunErr::Failed(if err.is_empty() {
-            format!("git {} が失敗しました", args.join(" "))
+            trf("git {args} が失敗しました", &[("args", args.join(" "))])
         } else {
             err
         }));
@@ -207,10 +208,10 @@ fn collect(ws: &Path) -> RepoState {
     let toplevel = match run_git(ws, &["rev-parse", "--show-toplevel"]) {
         Ok(s) => PathBuf::from(s.trim()),
         Err(RunErr::Spawn(_)) => {
-            return RepoState::Unavailable("git コマンドが見つかりません".into());
+            return RepoState::Unavailable(tr("git コマンドが見つかりません"));
         }
         Err(RunErr::Failed(_)) => {
-            return RepoState::Unavailable("ここは git リポジトリではありません".into());
+            return RepoState::Unavailable(tr("ここは git リポジトリではありません"));
         }
     };
 
@@ -413,22 +414,22 @@ pub fn parse_status_porcelain(output: &str) -> Vec<ChangeEntry> {
 pub fn validate_branch_name(input: &str) -> Result<String, String> {
     let n = input.trim();
     if n.is_empty() {
-        return Err("名前を入力してください".into());
+        return Err(tr("名前を入力してください"));
     }
     if n.starts_with('-') {
-        return Err("名前を - で始めることはできません".into());
+        return Err(tr("名前を - で始めることはできません"));
     }
     if n.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err("名前に空白や制御文字は使えません".into());
+        return Err(tr("名前に空白や制御文字は使えません"));
     }
     if n.contains("..") || n.contains("@{") {
-        return Err("名前に .. や @{ は使えません".into());
+        return Err(tr("名前に .. や @{ は使えません"));
     }
     if n.chars().any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')) {
-        return Err("名前に ~ ^ : ? * [ \\ は使えません".into());
+        return Err(tr("名前に ~ ^ : ? * [ \\ は使えません"));
     }
     if n.starts_with('/') || n.ends_with('/') || n.ends_with(".lock") {
-        return Err("名前の先頭/末尾が不正です".into());
+        return Err(tr("名前の先頭/末尾が不正です"));
     }
     Ok(n.to_string())
 }
@@ -437,16 +438,16 @@ pub fn validate_branch_name(input: &str) -> Result<String, String> {
 pub fn validate_worktree_input(input: &str) -> Result<String, String> {
     let n = input.trim();
     if n.is_empty() {
-        return Err("worktree 名を入力してください".into());
+        return Err(tr("worktree 名を入力してください"));
     }
     if n.starts_with('-') {
-        return Err("名前を - で始めることはできません".into());
+        return Err(tr("名前を - で始めることはできません"));
     }
     if n.chars().any(char::is_control) {
-        return Err("名前に制御文字は使えません".into());
+        return Err(tr("名前に制御文字は使えません"));
     }
     if n.contains("..") {
-        return Err("名前に .. は使えません".into());
+        return Err(tr("名前に .. は使えません"));
     }
     Ok(n.to_string())
 }
@@ -566,7 +567,7 @@ impl GitPanel {
             RepoState::Loading => {
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(12.0));
-                    ui.label(RichText::new("読み込み中…").color(theme.text_dim).small());
+                    ui.label(RichText::new(tr("読み込み中…")).color(theme.text_dim).small());
                 });
             }
             RepoState::Unavailable(msg) => {
@@ -587,7 +588,7 @@ impl GitPanel {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(11.0));
                 ui.label(
-                    RichText::new(format!("{} 実行中…", self.job_label))
+                    RichText::new(trf("{label} 実行中…", &[("label", self.job_label.clone())]))
                         .color(theme.text_dim)
                         .small(),
                 );
@@ -612,7 +613,7 @@ impl GitPanel {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(!busy, egui::Button::new("⟳").small())
-                    .on_hover_text("リフレッシュ")
+                    .on_hover_text(tr("リフレッシュ"))
                     .clicked()
                 {
                     self.invalidate();
@@ -634,11 +635,11 @@ impl GitPanel {
                         .strong()
                         .color(theme.warn),
                 )
-                .on_hover_text("ブランチから外れています。作業前にブランチを作るか切り替えてください");
+                .on_hover_text(tr("ブランチから外れています。作業前にブランチを作るか切り替えてください"));
             }
             HeadState::Unknown => {
                 ui.label(
-                    RichText::new("HEAD 不明 (まだコミットがないかもしれません)")
+                    RichText::new(tr("HEAD 不明 (まだコミットがないかもしれません)"))
                         .color(theme.text_dim)
                         .small(),
                 );
@@ -655,7 +656,7 @@ impl GitPanel {
         req: &mut Option<Job>,
     ) {
         egui::CollapsingHeader::new(
-            RichText::new(format!("ブランチ ({})", info.branches.local.len()))
+            RichText::new(trf("ブランチ ({n})", &[("n", info.branches.local.len().to_string())]))
                 .color(theme.text)
                 .small(),
         )
@@ -685,11 +686,11 @@ impl GitPanel {
                         egui::Button::new(label).frame(false),
                     );
                     let resp = if b.current {
-                        resp.on_hover_text("現在のブランチ")
+                        resp.on_hover_text(tr("現在のブランチ"))
                     } else if b.other_worktree {
-                        resp.on_hover_text("別の worktree で使用中。切替は git が判断します")
+                        resp.on_hover_text(tr("別の worktree で使用中。切替は git が判断します"))
                     } else {
-                        resp.on_hover_text("クリックで切り替え (git checkout)")
+                        resp.on_hover_text(tr("クリックで切り替え (git checkout)"))
                     };
                     if resp.clicked() {
                         *req = Some(Job::Checkout(b.name.clone()));
@@ -698,7 +699,7 @@ impl GitPanel {
             }
             if info.branches.local.is_empty() {
                 ui.label(
-                    RichText::new("ローカルブランチがありません")
+                    RichText::new(tr("ローカルブランチがありません"))
                         .color(theme.text_dim)
                         .small(),
                 );
@@ -708,7 +709,7 @@ impl GitPanel {
             ui.horizontal(|ui| {
                 let te = egui::TextEdit::singleline(&mut self.new_branch_input)
                     .desired_width(f32::INFINITY)
-                    .hint_text("新しいブランチ名");
+                    .hint_text(tr("新しいブランチ名"));
                 let resp = ui.add_enabled(!busy, te);
                 let enter =
                     resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -720,7 +721,7 @@ impl GitPanel {
                 if ui
                     .add_enabled(
                         !busy && !self.new_branch_input.trim().is_empty(),
-                        egui::Button::new(RichText::new("＋ ブランチ作成").small()),
+                        egui::Button::new(RichText::new(tr("＋ ブランチ作成")).small()),
                     )
                     .on_hover_text("git checkout -b")
                     .clicked()
@@ -738,7 +739,10 @@ impl GitPanel {
 
             if !info.branches.remote.is_empty() {
                 egui::CollapsingHeader::new(
-                    RichText::new(format!("リモート追跡 ({})", info.branches.remote.len()))
+                    RichText::new(trf(
+                        "リモート追跡 ({n})",
+                        &[("n", info.branches.remote.len().to_string())],
+                    ))
                         .color(theme.text_dim)
                         .small(),
                 )
@@ -796,9 +800,9 @@ impl GitPanel {
                             if ui
                                 .add_enabled(
                                     !is_current && !w.bare,
-                                    egui::Button::new(RichText::new("開く").small()),
+                                    egui::Button::new(RichText::new(tr("開く")).small()),
                                 )
-                                .on_hover_text("この worktree をワークスペースとして開く")
+                                .on_hover_text(tr("この worktree をワークスペースとして開く"))
                                 .clicked()
                             {
                                 actions.open_path = Some(w.path.clone());
@@ -812,10 +816,10 @@ impl GitPanel {
             ui.horizontal(|ui| {
                 let te = egui::TextEdit::singleline(&mut self.worktree_input)
                     .desired_width(f32::INFINITY)
-                    .hint_text("新しい worktree 名 / 絶対パス");
+                    .hint_text(tr("新しい worktree 名 / 絶対パス"));
                 let _ = ui.add_enabled(!busy, te);
             });
-            ui.checkbox(&mut self.worktree_new_branch, RichText::new("同名のブランチも作る").small());
+            ui.checkbox(&mut self.worktree_new_branch, RichText::new(tr("同名のブランチも作る")).small());
 
             // 作成先プレビュー (どこに出来るかを隠さない)
             if !self.worktree_input.trim().is_empty() {
@@ -836,7 +840,7 @@ impl GitPanel {
             if ui
                 .add_enabled(
                     !busy && !self.worktree_input.trim().is_empty(),
-                    egui::Button::new(RichText::new("＋ worktree 作成").small()),
+                    egui::Button::new(RichText::new(tr("＋ worktree 作成")).small()),
                 )
                 .on_hover_text("git worktree add")
                 .clicked()
@@ -856,7 +860,7 @@ impl GitPanel {
 
     fn changes_ui(&self, ui: &mut egui::Ui, theme: &Theme, info: &RepoInfo) {
         egui::CollapsingHeader::new(
-            RichText::new(format!("変更ファイル ({})", info.changes.len()))
+            RichText::new(trf("変更ファイル ({n})", &[("n", info.changes.len().to_string())]))
                 .color(theme.text)
                 .small(),
         )
@@ -865,7 +869,7 @@ impl GitPanel {
         .show(ui, |ui| {
             if info.changes.is_empty() {
                 ui.label(
-                    RichText::new("変更はありません")
+                    RichText::new(tr("変更はありません"))
                         .color(theme.text_dim)
                         .small(),
                 );
@@ -949,7 +953,10 @@ impl GitPanel {
         match spawned {
             Ok(_) => self.pending = Some(rx),
             Err(e) => {
-                self.state = RepoState::Unavailable(format!("git 情報を取得できません: {e}"));
+                self.state = RepoState::Unavailable(trf(
+                    "git 情報を取得できません: {e}",
+                    &[("e", e.to_string())],
+                ));
             }
         }
     }
@@ -969,7 +976,7 @@ impl GitPanel {
             },
             Job::NewBranch(b) => match validate_branch_name(&b) {
                 Ok(b) => (
-                    format!("ブランチ作成 {b}"),
+                    trf("ブランチ作成 {b}", &[("b", b.clone())]),
                     vec!["checkout".into(), "-b".into(), b],
                 ),
                 Err(e) => {
@@ -980,7 +987,7 @@ impl GitPanel {
             Job::WorktreeAdd { path, branch } => {
                 let p = path.to_string_lossy().into_owned();
                 if p.trim().is_empty() || p.starts_with('-') {
-                    actions.toast = Some(("worktree のパスが不正です".into(), false));
+                    actions.toast = Some((tr("worktree のパスが不正です"), false));
                     return;
                 }
                 let mut args: Vec<String> =
@@ -990,7 +997,7 @@ impl GitPanel {
                     args.push(b);
                 }
                 args.push(p.clone());
-                (format!("worktree 作成 {p}"), args)
+                (trf("worktree 作成 {p}", &[("p", p)]), args)
             }
             Job::Fetch => (
                 "fetch".to_string(),
@@ -1008,8 +1015,14 @@ impl GitPanel {
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
                 // stderr は加工せずそのまま伝える (git の拒否理由を握り潰さない)
                 let msg = match run_git(&ws, &argv) {
-                    Ok(_) => (format!("{label2} 完了"), true),
-                    Err(e) => (format!("{label2} 失敗: {}", e.text()), false),
+                    Ok(_) => (trf("{label2} 完了", &[("label2", label2.clone())]), true),
+                    Err(e) => (
+                        trf(
+                            "{label2} 失敗: {e}",
+                            &[("label2", label2.clone()), ("e", e.text().to_string())],
+                        ),
+                        false,
+                    ),
                 };
                 let _ = tx.send(msg);
                 ctx2.request_repaint();
@@ -1023,7 +1036,7 @@ impl GitPanel {
                 self.worktree_input.clear();
             }
             Err(e) => {
-                actions.toast = Some((format!("git を起動できません: {e}"), false));
+                actions.toast = Some((trf("git を起動できません: {e}", &[("e", e.to_string())]), false));
             }
         }
     }

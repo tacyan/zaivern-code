@@ -1,0 +1,18 @@
+# english-mode — Zaivern Code の UI を英語表示に切り替える言語パック。
+#
+# 有効にすると UI が English になり、無効に戻すと日本語へ戻ります。
+# 辞書は lang/*.toml (「日本語原文」 = "English translation")。訳が無い文字列は
+# 日本語のまま表示されます (壊れない)。辞書はユーザーが自由に編集できます。
+
+[plugin]
+name = "english-mode"
+version = "1.0.0"
+author = "Zaivern"
+description = "Switch the Zaivern Code UI to English (UI を英語表示に切り替えます)"
+# 入れただけで UI 言語が変わるのは驚きなので、初回は無効で入れる。
+default_enabled = false
+
+[language]
+id = "en"
+name = "English"
+dict = "lang"

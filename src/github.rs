@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use crate::i18n::{tr, trf};
+
 /// 既定タイムアウト。`gh pr list` は実測 0.6 秒程度だが、ネットワーク不調に備える。
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// `gh pr checkout` は fetch を伴うため長めに取る。
@@ -60,12 +62,16 @@ impl GhRequest {
     /// エラー表示に使う日本語のラベル。
     pub fn label(&self) -> String {
         match self {
-            GhRequest::RepoView { .. } => "リポジトリ情報の取得".into(),
-            GhRequest::PrList { .. } => "Pull Request 一覧の取得".into(),
-            GhRequest::IssueList { .. } => "Issue 一覧の取得".into(),
-            GhRequest::PrDiff { number, .. } => format!("PR #{number} の差分取得"),
-            GhRequest::PrCheckout { number, .. } => format!("PR #{number} のチェックアウト"),
-            GhRequest::BranchList { .. } => "ブランチ一覧の取得".into(),
+            GhRequest::RepoView { .. } => tr("リポジトリ情報の取得"),
+            GhRequest::PrList { .. } => tr("Pull Request 一覧の取得"),
+            GhRequest::IssueList { .. } => tr("Issue 一覧の取得"),
+            GhRequest::PrDiff { number, .. } => {
+                trf("PR #{number} の差分取得", &[("number", number.to_string())])
+            }
+            GhRequest::PrCheckout { number, .. } => {
+                trf("PR #{number} のチェックアウト", &[("number", number.to_string())])
+            }
+            GhRequest::BranchList { .. } => tr("ブランチ一覧の取得"),
         }
     }
 
@@ -159,7 +165,10 @@ impl GhOutcome {
     /// エラーなら整形済みの 1 行メッセージ。
     pub fn error_text(&self) -> Option<String> {
         match self {
-            GhOutcome::Error { req_label, message } => Some(format!("{req_label}に失敗: {message}")),
+            GhOutcome::Error { req_label, message } => Some(trf(
+                "{req_label}に失敗: {message}",
+                &[("req_label", req_label.clone()), ("message", message.clone())],
+            )),
             _ => None,
         }
     }
@@ -230,7 +239,7 @@ pub fn check_auth() -> Result<(), String> {
             let stderr = trim_stderr(&String::from_utf8_lossy(&out.stderr));
             Err(msg_not_authenticated(&stderr))
         }
-        Err(e) => Err(format!("gh を起動できません: {e}")),
+        Err(e) => Err(trf("gh を起動できません: {e}", &[("e", e.to_string())])),
     }
 }
 
@@ -261,9 +270,9 @@ pub fn run_blocking(req: &GhRequest) -> GhOutcome {
     }
     let root = req.root();
     if !root.is_dir() {
-        return fail(format!(
-            "作業ディレクトリが見つかりません: {}",
-            root.display()
+        return fail(trf(
+            "作業ディレクトリが見つかりません: {path}",
+            &[("path", root.display().to_string())],
         ));
     }
 
@@ -339,7 +348,7 @@ pub fn run_blocking(req: &GhRequest) -> GhOutcome {
             GhOutcome::Checkout {
                 number: *number,
                 message: if msg.is_empty() {
-                    format!("PR #{number} をチェックアウトしました")
+                    trf("PR #{number} をチェックアウトしました", &[("number", number.to_string())])
                 } else {
                     msg.to_string()
                 },
@@ -369,7 +378,7 @@ fn capture(root: &Path, args: &[&str], timeout: Duration) -> Result<String, Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("gh を起動できません: {e}"))?;
+        .map_err(|e| trf("gh を起動できません: {e}", &[("e", e.to_string())]))?;
 
     // stdout/stderr を別スレッドで読み切る (パイプ満杯によるデッドロック回避)。
     let out_rx = child.stdout.take().map(spawn_reader);
@@ -383,14 +392,16 @@ fn capture(root: &Path, args: &[&str], timeout: Duration) -> Result<String, Stri
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!(
-                        "gh の応答が {} 秒を超えたため中断しました",
-                        timeout.as_secs()
+                    return Err(trf(
+                        "gh の応答が {secs} 秒を超えたため中断しました",
+                        &[("secs", timeout.as_secs().to_string())],
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(e) => return Err(format!("gh の終了待ちに失敗しました: {e}")),
+            Err(e) => {
+                return Err(trf("gh の終了待ちに失敗しました: {e}", &[("e", e.to_string())]))
+            }
         }
     };
 
@@ -416,13 +427,13 @@ fn spawn_reader<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<S
 // ---------------------------------------------------------------------------
 
 pub fn msg_gh_missing() -> String {
-    "GitHub CLI (gh) が見つかりません。https://cli.github.com からインストールしてください。".into()
+    tr("GitHub CLI (gh) が見つかりません。https://cli.github.com からインストールしてください。")
 }
 
 pub fn msg_not_authenticated(detail: &str) -> String {
-    let base = "GitHub にログインしていません。ターミナルで `gh auth login` を実行してください。";
+    let base = tr("GitHub にログインしていません。ターミナルで `gh auth login` を実行してください。");
     if detail.is_empty() {
-        base.into()
+        base
     } else {
         format!("{base} (gh: {detail})")
     }
@@ -436,8 +447,11 @@ pub fn classify_failure(code: Option<i32>, stderr: &str) -> String {
 
     if detail.is_empty() {
         return match code {
-            Some(c) => format!("gh が終了コード {c} で失敗しました (詳細メッセージなし)"),
-            None => "gh がシグナルで中断されました".into(),
+            Some(c) => trf(
+                "gh が終了コード {c} で失敗しました (詳細メッセージなし)",
+                &[("c", c.to_string())],
+            ),
+            None => tr("gh がシグナルで中断されました"),
         };
     }
 
@@ -452,7 +466,10 @@ pub fn classify_failure(code: Option<i32>, stderr: &str) -> String {
     }
     // git リポジトリではない
     if lower.contains("not a git repository") || lower.contains("no git repository") {
-        return format!("ここは git リポジトリではありません。(gh: {detail})");
+        return trf(
+            "ここは git リポジトリではありません。(gh: {detail})",
+            &[("detail", detail.clone())],
+        );
     }
     // GitHub リモートがない / base repo を決められない
     if lower.contains("no git remotes")
@@ -460,16 +477,23 @@ pub fn classify_failure(code: Option<i32>, stderr: &str) -> String {
         || lower.contains("could not determine base repository")
         || lower.contains("no remotes found")
     {
-        return format!(
-            "GitHub のリモートが設定されていません。`git remote add origin <URL>` を実行してください。(gh: {detail})"
+        return trf(
+            "GitHub のリモートが設定されていません。`git remote add origin <URL>` を実行してください。(gh: {detail})",
+            &[("detail", detail.clone())],
         );
     }
     // 権限・存在しない
     if lower.contains("http 404") || lower.contains("could not resolve to a repository") {
-        return format!("リポジトリが見つからないか、参照する権限がありません。(gh: {detail})");
+        return trf(
+            "リポジトリが見つからないか、参照する権限がありません。(gh: {detail})",
+            &[("detail", detail.clone())],
+        );
     }
     if lower.contains("http 403") || lower.contains("rate limit") {
-        return format!("GitHub API に拒否されました (権限不足かレート制限)。(gh: {detail})");
+        return trf(
+            "GitHub API に拒否されました (権限不足かレート制限)。(gh: {detail})",
+            &[("detail", detail.clone())],
+        );
     }
     // ネットワーク
     if lower.contains("dial tcp")
@@ -477,12 +501,18 @@ pub fn classify_failure(code: Option<i32>, stderr: &str) -> String {
         || lower.contains("connection refused")
         || lower.contains("i/o timeout")
     {
-        return format!("GitHub へ接続できません。ネットワークを確認してください。(gh: {detail})");
+        return trf(
+            "GitHub へ接続できません。ネットワークを確認してください。(gh: {detail})",
+            &[("detail", detail.clone())],
+        );
     }
 
     match code {
-        Some(c) => format!("gh が終了コード {c} で失敗しました: {detail}"),
-        None => format!("gh が中断されました: {detail}"),
+        Some(c) => trf(
+            "gh が終了コード {c} で失敗しました: {detail}",
+            &[("c", c.to_string()), ("detail", detail.clone())],
+        ),
+        None => trf("gh が中断されました: {detail}", &[("detail", detail.clone())]),
     }
 }
 
@@ -510,15 +540,19 @@ pub fn trim_stderr(stderr: &str) -> String {
 fn decode(json: &str, what: &str) -> Result<serde_json::Value, String> {
     let text = json.trim();
     if text.is_empty() {
-        return Err(format!("{what}の応答が空でした"));
+        return Err(trf("{what}の応答が空でした", &[("what", what.to_string())]));
     }
-    serde_json::from_str(text)
-        .map_err(|e| format!("{what}の応答を JSON として解釈できませんでした: {e}"))
+    serde_json::from_str(text).map_err(|e| {
+        trf(
+            "{what}の応答を JSON として解釈できませんでした: {e}",
+            &[("what", what.to_string()), ("e", e.to_string())],
+        )
+    })
 }
 
 fn as_array<'a>(v: &'a serde_json::Value, what: &str) -> Result<&'a Vec<serde_json::Value>, String> {
     v.as_array()
-        .ok_or_else(|| format!("{what}の応答が配列ではありません"))
+        .ok_or_else(|| trf("{what}の応答が配列ではありません", &[("what", what.to_string())]))
 }
 
 fn str_at(v: &serde_json::Value, key: &str) -> String {
@@ -553,8 +587,8 @@ pub fn author_display(author: Option<&serde_json::Value>) -> String {
 /// `gh pr list --json number,title,author,headRefName,baseRefName,isDraft,state,updatedAt,additions,deletions,url`
 /// の出力をパースする。空配列 `[]` は空 Vec (エラーではない)。
 pub fn parse_prs(json: &str) -> Result<Vec<PullRequest>, String> {
-    let v = decode(json, "Pull Request 一覧")?;
-    let arr = as_array(&v, "Pull Request 一覧")?;
+    let v = decode(json, &tr("Pull Request 一覧"))?;
+    let arr = as_array(&v, &tr("Pull Request 一覧"))?;
     Ok(arr
         .iter()
         .map(|it| PullRequest {
@@ -575,8 +609,8 @@ pub fn parse_prs(json: &str) -> Result<Vec<PullRequest>, String> {
 
 /// `gh issue list --json number,title,author,state,labels,updatedAt,url` の出力をパースする。
 pub fn parse_issues(json: &str) -> Result<Vec<Issue>, String> {
-    let v = decode(json, "Issue 一覧")?;
-    let arr = as_array(&v, "Issue 一覧")?;
+    let v = decode(json, &tr("Issue 一覧"))?;
+    let arr = as_array(&v, &tr("Issue 一覧"))?;
     Ok(arr
         .iter()
         .map(|it| Issue {
@@ -607,13 +641,13 @@ pub fn parse_issues(json: &str) -> Result<Vec<Issue>, String> {
 
 /// `gh repo view --json name,owner,defaultBranchRef,url` の出力をパースする。
 pub fn parse_repo(json: &str) -> Result<RepoInfo, String> {
-    let v = decode(json, "リポジトリ情報")?;
+    let v = decode(json, &tr("リポジトリ情報"))?;
     if !v.is_object() {
-        return Err("リポジトリ情報の応答がオブジェクトではありません".into());
+        return Err(tr("リポジトリ情報の応答がオブジェクトではありません"));
     }
     let name = str_at(&v, "name");
     if name.is_empty() {
-        return Err("リポジトリ情報に name が含まれていません".into());
+        return Err(tr("リポジトリ情報に name が含まれていません"));
     }
     Ok(RepoInfo {
         owner: v
@@ -638,8 +672,8 @@ pub fn parse_repo(json: &str) -> Result<RepoInfo, String> {
 
 /// `gh api repos/{owner}/{repo}/branches` の出力をパースする。
 pub fn parse_branches(json: &str) -> Result<Vec<Branch>, String> {
-    let v = decode(json, "ブランチ一覧")?;
-    let arr = as_array(&v, "ブランチ一覧")?;
+    let v = decode(json, &tr("ブランチ一覧"))?;
+    let arr = as_array(&v, &tr("ブランチ一覧"))?;
     Ok(arr
         .iter()
         .filter_map(|it| {
