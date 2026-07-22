@@ -47,6 +47,67 @@ pub fn notify(title: &str, body: &str) {
     }
 }
 
+/// Webhook へイベントを POST する (curl にシェルアウト、非同期・失敗は無視)。
+///
+/// 形式は URL のドメインから自動判別する:
+/// - Slack (`hooks.slack.com`) / Discord (`discord.com` / `discordapp.com`)
+///   → JSON。`text` と `content` の両キーを入れるので、どちらのサービスでも読める。
+/// - それ以外 (ntfy のトピック URL など) → プレーンテキスト本文 + `Title:` ヘッダ
+///   (ntfy の標準的な受け口。Title 非対応のサービスでも本文は届く)。
+///
+/// curl は macOS / Windows 10+ / ほとんどの Linux に同梱されている。
+/// 無い環境では spawn が失敗して黙って何もしない (通知は常にベストエフォート)。
+pub fn webhook(url: &str, title: &str, body: &str) {
+    let url = url.trim();
+    if url.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
+        return;
+    }
+    let body = truncate_chars(body, MAX_BODY_CHARS);
+    let is_json = url.contains("hooks.slack.com")
+        || url.contains("discord.com/api/webhooks")
+        || url.contains("discordapp.com/api/webhooks");
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fsS", "-m", "10", "-o", if cfg!(windows) { "NUL" } else { "/dev/null" }]);
+    if is_json {
+        let payload = format!(
+            "{{\"text\":{t},\"content\":{t}}}",
+            t = json_string(&format!("{title}\n{body}"))
+        );
+        cmd.args(["-H", "Content-Type: application/json", "-d", &payload]);
+    } else {
+        // ntfy 形式: 本文はプレーンテキスト、タイトルはヘッダで渡す。
+        // ヘッダは latin-1 しか通らない実装があるため、日本語タイトルは
+        // ntfy の UTF-8 拡張 (RFC 2047 は使わず X-Title に生 UTF-8) に任せる。
+        cmd.args(["-H", &format!("X-Title: {}", sanitize_header(title)), "-d", &body]);
+    }
+    cmd.arg(url);
+    let _ = cmd.spawn();
+}
+
+/// JSON 文字列リテラルへのエスケープ(純関数)。
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// HTTP ヘッダ値に入れられない改行類を落とす(ヘッダインジェクション防止)。
+fn sanitize_header(s: &str) -> String {
+    s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
+}
+
 /// AppleScript の二重引用符リテラル用エスケープ(純関数)。
 /// `\` → `\\`、`"` → `\"`。char 単位で処理するためマルチバイト安全。
 fn escape_applescript(s: &str) -> String {

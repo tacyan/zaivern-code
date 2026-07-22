@@ -584,7 +584,8 @@ fn hash_slice(v: &[u64]) -> u64 {
 }
 
 /// ANSI エスケープを落とす (vt100 経由なら基本入っていないが、生ログでも使えるように)。
-fn strip_ansi(s: &str) -> String {
+/// ターミナル生ログの「📜 前回ログ」表示 (app.rs) からも使う。
+pub fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

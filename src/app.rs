@@ -239,6 +239,14 @@ pub struct ZaivernApp {
     editor: Editor,
     agents: AgentManager,
     palette: Palette,
+    /// `#` パレット用の git worktree キャッシュ (branch, path, 追加済みか)。
+    /// パレットを開いている間だけ保持し、閉じると破棄する
+    /// (palette_items は毎フレーム呼ばれるため、都度 git を叩かない)。
+    palette_worktrees: Option<Vec<(String, PathBuf, bool)>>,
+    /// セッションが安全 (Idle) になったら入力欄へ入れる指示文
+    /// (セッションid, 積んだ時刻, 本文)。Issue 着手フローが積む。
+    /// 起動直後の信頼確認プロンプト等へ流れ込まないよう、配達を遅らせる。
+    pending_prompts: Vec<(u64, Instant, String)>,
     highlighter: Highlighter,
     cockpit: bool,
     /// Markdown/HTML ファイルをレンダリング表示するモード (Cockpit の編集ペインでも有効)
@@ -511,6 +519,7 @@ fn route_intent(it: &supervisor::InterventionIntent) -> IntentRoute {
 fn coordinator_state(
     running: bool,
     attention: bool,
+    rate_limited: bool,
     sup: Option<supervisor::SessionState>,
 ) -> coordinator::SessionState {
     use coordinator::SessionState as C;
@@ -523,6 +532,11 @@ fn coordinator_state(
     // 承認プロンプトで止まっている。割り込ませない。
     if attention {
         return C::WaitingApproval;
+    }
+    // レート制限中は進めない = 停滞扱い。新しいタスクを振らず、配達もしない
+    // (制限が明けて警告が画面から消えれば自動で元の状態判定へ戻る)。
+    if rate_limited {
+        return C::Stalled;
     }
     match sup {
         // 直近に出力が動いた = 作業中。
@@ -581,6 +595,8 @@ impl ZaivernApp {
             editor: Editor::new(),
             agents: AgentManager::new(),
             palette: Palette::new(),
+            palette_worktrees: None,
+            pending_prompts: Vec::new(),
             highlighter: Highlighter::new(),
             cockpit: false,
             md_preview: false,
@@ -1814,6 +1830,8 @@ impl ZaivernApp {
     /// 保存済みセッション(開いていたタブ等)を復元する。
     /// セッションに記録されたルート一覧の方が広ければ、フォルダ構成ごと復元する。
     fn restore_session(&mut self, ctx: &egui::Context) {
+        // ついでに古いターミナルログを掃除する (新しい 40 本だけ残す)
+        session::prune_term_logs(self.primary_root(), 40);
         let Some(sess) = session::load(&self.roots) else {
             return;
         };
@@ -2246,6 +2264,121 @@ impl ZaivernApp {
         self.toast(format!("📂 {} を開きました", dir.display()), true);
     }
 
+    /// GitHub Issue の「⚡ 着手」ワンフロー:
+    /// worktree 作成 → ワークスペースへ追加 → エージェント起動 → 着手指示を入力欄へ。
+    ///
+    /// 置き場とブランチ名は worktrees プラグインと同じ規約
+    /// (リポジトリの隣に `<repo>-wt-<slug>`、ブランチ `wt/<slug>`)。
+    /// 指示文の投入はセッションが安全 (Idle) になるまで待つ — 起動直後に書くと
+    /// フォルダ信頼確認などの起動時プロンプトへ流れ込んで誤答になるため。
+    fn start_issue_flow(
+        &mut self,
+        root: &Path,
+        issue: &github::Issue,
+        preset_idx: usize,
+        ctx: &egui::Context,
+    ) {
+        let Some(preset) = self.cfg.agents.get(preset_idx).cloned() else {
+            return;
+        };
+        let git = |args: &[&str]| -> Result<String, String> {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+            }
+        };
+        let repo = match git(&["rev-parse", "--show-toplevel"]) {
+            Ok(p) => PathBuf::from(p),
+            Err(e) => {
+                self.toast(format!("git リポジトリではありません: {e}"), false);
+                return;
+            }
+        };
+        let name = repo
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".into());
+        let slug = format!("issue-{}", issue.number);
+        let branch = format!("wt/{slug}");
+        let dir = repo
+            .parent()
+            .unwrap_or(&repo)
+            .join(format!("{name}-wt-{slug}"));
+
+        if dir.is_dir() {
+            // 既にある = 前回の着手の続き。作り直さずそのまま使う。
+            self.toast(format!("🌿 既存の worktree を再利用します: {}", dir.display()), true);
+        } else {
+            // ブランチが残っていたら -b 無しで拾い、無ければ新規に切る
+            let fresh = git(&["worktree", "add", "-b", &branch, &dir.to_string_lossy()]);
+            if let Err(e1) = fresh {
+                if let Err(e2) = git(&["worktree", "add", &dir.to_string_lossy(), &branch]) {
+                    self.toast(format!("worktree を作成できません: {e1} / {e2}"), false);
+                    return;
+                }
+            }
+            self.toast(
+                format!("🌿 worktree を作成しました: {} (ブランチ {branch})", dir.display()),
+                true,
+            );
+        }
+
+        self.add_folder_to_workspace(dir.clone(), ctx);
+
+        // worktree を作業ディレクトリにしてエージェントを起動
+        let mut p = preset;
+        p.cwd = Some(dir.to_string_lossy().into_owned());
+        let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
+        if let Err(e) = self.agents.launch(&p, &dir, approval, ctx) {
+            self.toast(e, false);
+            return;
+        }
+        let sid = match self.agents.sessions.last() {
+            Some(s) => s.id,
+            None => return,
+        };
+        let prompt = format!(
+            "GitHub Issue #{n}「{title}」に着手してください。詳細は `gh issue view {n}` で確認できます。\
+             この作業ツリー (ブランチ {branch}) はこの issue 専用です。実装が終わったらテストを通してコミットしてください。",
+            n = issue.number,
+            title = issue.title,
+        );
+        self.pending_prompts.push((sid, Instant::now(), prompt));
+        self.toast(
+            "⚡ エージェントを起動しました — 準備ができ次第、着手指示を入力欄へ入れます",
+            true,
+        );
+    }
+
+    /// フォルダをワークスペースへ追加する (AddFolder ダイアログと
+    /// `#` パレットの worktree 追加が共有する本体)。
+    fn add_folder_to_workspace(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        let before = self.roots.len();
+        let mut next = self.roots.clone();
+        next.push(dir.clone());
+        let next = file_tree::normalize_roots(next);
+        // normalize_roots が畳んだ = 既存ルート配下だった
+        if next.len() == before && next.iter().any(|r| dir.starts_with(r)) {
+            self.toast_warn(format!(
+                "{} は既にワークスペースに含まれています",
+                dir.display()
+            ));
+        } else {
+            self.set_roots(next, ctx);
+            self.toast(
+                format!("📚 {} をワークスペースに追加しました", dir.display()),
+                true,
+            );
+        }
+    }
+
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
             Cmd::Save => {
@@ -2302,23 +2435,14 @@ impl ZaivernApp {
                     .set_directory(self.primary_root())
                     .pick_folder()
                 {
-                    let before = self.roots.len();
-                    let mut next = self.roots.clone();
-                    next.push(dir.clone());
-                    let next = file_tree::normalize_roots(next);
-                    // normalize_roots が畳んだ = 既存ルート配下だった
-                    if next.len() == before && next.iter().any(|r| dir.starts_with(r)) {
-                        self.toast_warn(format!(
-                            "{} は既にワークスペースに含まれています",
-                            dir.display()
-                        ));
-                    } else {
-                        self.set_roots(next, ctx);
-                        self.toast(
-                            format!("📚 {} をワークスペースに追加しました", dir.display()),
-                            true,
-                        );
-                    }
+                    self.add_folder_to_workspace(dir, ctx);
+                }
+            }
+            Cmd::AddFolderPath(dir) => {
+                if dir.is_dir() {
+                    self.add_folder_to_workspace(dir, ctx);
+                } else {
+                    self.toast(format!("フォルダがありません: {}", dir.display()), false);
                 }
             }
             Cmd::RemoveFolder(dir) => {
@@ -2401,6 +2525,8 @@ impl ZaivernApp {
                     self.agents.panel_open = true;
                     self.cockpit = false;
                     self.term_focus_pending = true;
+                    // 明示的なフォーカス = 既読 (「あとで見る」ピンも外す)
+                    self.agents.sessions[i].acknowledge();
                 }
             }
             Cmd::RestartAgent => {
@@ -3394,6 +3520,12 @@ impl ZaivernApp {
         // GitHub パネル用 (クロージャ内で self を可変借用するため先に複製しておく)
         let mut gh_actions = panels::GithubActions::default();
         let gh_roots = self.roots.clone();
+        let gh_presets: Vec<(String, String)> = self
+            .cfg
+            .agents
+            .iter()
+            .map(|p| (p.icon.clone(), p.name.clone()))
+            .collect();
         // 有効/無効の切り替え要求 (プラグイン名, 有効か)
         let mut pl_toggle: Option<(String, bool)> = None;
         // 設定値の変更要求 (プラグイン名, キー, 値)
@@ -3474,6 +3606,7 @@ impl ZaivernApp {
                             .id_salt("zv-agents")
                             .auto_shrink(false)
                             .show(ui, |ui| {
+                                let mut set_unread: Option<usize> = None;
                                 for (i, s) in self.agents.sessions.iter().enumerate() {
                                     let active = i == self.agents.active;
                                     let frame = egui::Frame::none()
@@ -3509,6 +3642,24 @@ impl ZaivernApp {
                                                 ))
                                                 .color(theme.text),
                                             );
+                                            if s.has_unread() && !active {
+                                                ui.label(
+                                                    RichText::new("◆")
+                                                        .size(9.0)
+                                                        .color(theme.accent),
+                                                )
+                                                .on_hover_text(
+                                                    "最後に見てから新しい出力があります",
+                                                );
+                                            }
+                                            if let Some(line) = &s.rate_limited {
+                                                ui.label(
+                                                    RichText::new("⏳").color(theme.warn),
+                                                )
+                                                .on_hover_text(format!(
+                                                    "レート制限/使用上限: {line}"
+                                                ));
+                                            }
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
@@ -3543,6 +3694,23 @@ impl ZaivernApp {
                                     );
                                     if resp.clicked() {
                                         focus = Some(i);
+                                    }
+                                    resp.context_menu(|ui| {
+                                        if !s.has_unread()
+                                            && ui.button("📩 あとで見る (未読にする)").clicked()
+                                        {
+                                            set_unread = Some(i);
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("🔍 フォーカス").clicked() {
+                                            focus = Some(i);
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+                                if let Some(i) = set_unread {
+                                    if let Some(s) = self.agents.sessions.get_mut(i) {
+                                        s.mark_unread();
                                     }
                                 }
 
@@ -3872,6 +4040,7 @@ impl ZaivernApp {
                                     &theme,
                                     &mut self.github,
                                     &gh_roots,
+                                    &gh_presets,
                                     &mut gh_actions,
                                 );
                             });
@@ -3886,6 +4055,9 @@ impl ZaivernApp {
         }
         if let Some((msg, ok)) = gh_actions.toast {
             self.toast(msg, ok);
+        }
+        if let Some((root, issue, preset_idx)) = gh_actions.start_issue {
+            self.start_issue_flow(&root, &issue, preset_idx, ctx);
         }
         if let Some((msg, ok)) = git_actions.toast {
             self.toast(msg, ok);
@@ -4073,6 +4245,7 @@ impl ZaivernApp {
         let mut restart: Option<usize> = None;
         let mut remove: Option<usize> = None;
         let mut cycle: Option<usize> = None;
+        let mut open_log: Option<PathBuf> = None;
 
         egui::TopBottomPanel::bottom("zv-terminal")
             .resizable(true)
@@ -4093,6 +4266,8 @@ impl ZaivernApp {
                             ui.horizontal(|ui| {
                                 let active_ix = self.agents.active;
                                 let mut set_active: Option<usize> = None;
+                                let mut set_unread: Option<usize> = None;
+                                let mut set_read: Option<usize> = None;
                                 for (i, s) in self.agents.sessions.iter().enumerate() {
                                     let dot = if s.running() {
                                         if s.attention {
@@ -4113,6 +4288,18 @@ impl ZaivernApp {
                                         i == active_ix,
                                         format!("{}{} {}", badge, s.icon, s.title),
                                     );
+                                    if s.has_unread() && i != active_ix {
+                                        ui.label(
+                                            RichText::new("◆").size(9.0).color(theme.accent),
+                                        )
+                                        .on_hover_text("最後に見てから新しい出力があります");
+                                    }
+                                    if let Some(line) = &s.rate_limited {
+                                        ui.label(RichText::new("⏳").color(theme.warn))
+                                            .on_hover_text(format!(
+                                                "レート制限/使用上限: {line}"
+                                            ));
+                                    }
                                     if r.clicked() {
                                         set_active = Some(i);
                                     }
@@ -4122,6 +4309,18 @@ impl ZaivernApp {
                                                 cycle = Some(i);
                                                 ui.close_menu();
                                             }
+                                        }
+                                        if s.has_unread() {
+                                            if ui.button("✓ 既読にする").clicked() {
+                                                set_read = Some(i);
+                                                ui.close_menu();
+                                            }
+                                        } else if ui
+                                            .button("📩 あとで見る (未読にする)")
+                                            .clicked()
+                                        {
+                                            set_unread = Some(i);
+                                            ui.close_menu();
                                         }
                                         if ui.button("⟳ 再起動").clicked() {
                                             restart = Some(i);
@@ -4133,11 +4332,22 @@ impl ZaivernApp {
                                         }
                                     });
                                 }
+                                if let Some(i) = set_unread {
+                                    if let Some(s) = self.agents.sessions.get_mut(i) {
+                                        s.mark_unread();
+                                    }
+                                }
+                                if let Some(i) = set_read {
+                                    if let Some(s) = self.agents.sessions.get_mut(i) {
+                                        s.acknowledge();
+                                    }
+                                }
                                 if let Some(i) = set_active {
                                     self.agents.active = i;
                                     // タブで選び直したら、その端末をアクティブな
                                     // 入力先 (フォーカス) にする。
                                     self.term_focus_pending = true;
+                                    self.agents.sessions[i].acknowledge();
                                 }
                             });
                         });
@@ -4146,6 +4356,32 @@ impl ZaivernApp {
                         if ui.button("⌄").on_hover_text("パネルを隠す (⌘J)").clicked() {
                             self.agents.panel_open = false;
                         }
+                        ui.menu_button("📜", |ui| {
+                            ui.label(
+                                RichText::new("ターミナルログ (再起動しても残ります)")
+                                    .size(11.5)
+                                    .color(theme.text_dim),
+                            );
+                            let logs = crate::session::list_term_logs(self.primary_root());
+                            if logs.is_empty() {
+                                ui.label(RichText::new("まだありません").color(theme.text_dim));
+                            }
+                            for p in logs.into_iter().take(30) {
+                                let name = p
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let size = std::fs::metadata(&p)
+                                    .map(|m| m.len() / 1024)
+                                    .unwrap_or(0);
+                                if ui.button(format!("📜 {name}  ({size} KB)")).clicked() {
+                                    open_log = Some(p);
+                                    ui.close_menu();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("前回セッションのターミナルログを開く");
                         ui.menu_button("＋", |ui| {
                             for (i, p) in self.cfg.agents.iter().enumerate() {
                                 if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
@@ -4223,6 +4459,42 @@ impl ZaivernApp {
         if let Some(i) = remove {
             self.agents.remove(i);
         }
+        if let Some(p) = open_log {
+            self.open_term_log(&p);
+        }
+    }
+
+    /// ターミナル生ログを ANSI 除去して読み取り専用の新規タブで開く。
+    fn open_term_log(&mut self, path: &Path) {
+        // ローテート済みの直前分 (.old) があれば先頭へ繋げ、時系列で読めるようにする
+        let old = std::fs::read(path.with_extension("log.old")).unwrap_or_default();
+        let cur = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.toast(format!("ログを読めません: {e}"), false);
+                return;
+            }
+        };
+        let mut raw = old;
+        raw.extend_from_slice(&cur);
+        let text = String::from_utf8_lossy(&raw);
+        let clean: String = supervisor::strip_ansi(&text)
+            .chars()
+            .filter(|c| *c != '\r' && (*c >= ' ' || *c == '\n' || *c == '\t'))
+            .collect();
+        let title = format!(
+            "📜 {}",
+            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+        );
+        self.editor.new_untitled();
+        if let Some(i) = self.editor.active {
+            let b = &mut self.editor.buffers[i];
+            b.title = title;
+            b.text = clean;
+            b.cache = None;
+            b.gutter = None;
+        }
+        self.cockpit = false;
     }
 
     // ─── UI: cockpit ────────────────────────────────────────────────
@@ -4621,6 +4893,25 @@ impl ZaivernApp {
                                                     .strong()
                                                     .color(theme.text),
                                                 );
+                                                if s.has_unread() && !active {
+                                                    ui.label(
+                                                        RichText::new("◆")
+                                                            .size(9.0)
+                                                            .color(theme.accent),
+                                                    )
+                                                    .on_hover_text(
+                                                        "最後に見てから新しい出力があります",
+                                                    );
+                                                }
+                                                if let Some(line) = &s.rate_limited {
+                                                    ui.label(
+                                                        RichText::new("⏳")
+                                                            .color(theme.warn),
+                                                    )
+                                                    .on_hover_text(format!(
+                                                        "レート制限/使用上限: {line}"
+                                                    ));
+                                                }
                                                 ui.label(
                                                     RichText::new(s.uptime())
                                                         .size(10.5)
@@ -5695,6 +5986,88 @@ impl ZaivernApp {
                     });
                 }
             }
+        } else if self.palette.is_agent_mode() {
+            // `@` — エージェントセッションへジャンプ / プリセット起動
+            for (i, s) in self.agents.sessions.iter().enumerate() {
+                let state = if s.running() {
+                    if s.attention {
+                        "🔔 承認待ち"
+                    } else if s.rate_limited.is_some() {
+                        "⏳ レート制限"
+                    } else {
+                        "稼働中"
+                    }
+                } else {
+                    "終了"
+                };
+                let unread = if s.has_unread() { " ◆未読" } else { "" };
+                if let Some(score) = fuzzy::score(&q, &s.title) {
+                    items.push(Item {
+                        icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
+                        label: s.title.clone(),
+                        detail: format!("{state}{unread} ・ {}", s.uptime()),
+                        action: Action::Cmd(Cmd::FocusAgent(i)),
+                        // 承認待ち・未読を上へ
+                        score: score
+                            + if s.attention { 40 } else { 0 }
+                            + if s.has_unread() { 20 } else { 0 },
+                    });
+                }
+            }
+            for (i, p) in self.cfg.agents.iter().enumerate() {
+                let label = format!("起動: {}", p.name);
+                if let Some(score) = fuzzy::score(&q, &label) {
+                    items.push(Item {
+                        icon: p.icon.clone(),
+                        label,
+                        detail: p.command.clone(),
+                        action: Action::Cmd(Cmd::NewAgent(i)),
+                        score: score - 50, // 既存セッションより下に出す
+                    });
+                }
+            }
+        } else if self.palette.is_root_mode() {
+            // `#` — ワークスペースルートと git worktree の横断
+            for r in &self.roots {
+                let label = format!("フォルダを外す: {}", root_name(r));
+                if self.roots.len() > 1 {
+                    if let Some(score) = fuzzy::score(&q, &label) {
+                        items.push(Item {
+                            icon: "📚".into(),
+                            label,
+                            detail: r.display().to_string(),
+                            action: Action::Cmd(Cmd::RemoveFolder(r.clone())),
+                            score: score - 30,
+                        });
+                    }
+                }
+            }
+            for (branch, path, added) in
+                self.palette_worktrees.as_deref().unwrap_or(&[])
+            {
+                if *added {
+                    continue; // 既にワークスペースにあるものは「外す」側で出る
+                }
+                let label = format!("worktree を開く: {branch}");
+                if let Some(score) = fuzzy::score(&q, &label) {
+                    items.push(Item {
+                        icon: "🌿".into(),
+                        label,
+                        detail: path.display().to_string(),
+                        action: Action::Cmd(Cmd::AddFolderPath(path.clone())),
+                        score,
+                    });
+                }
+            }
+            if let Some(score) = fuzzy::score(&q, "フォルダをワークスペースに追加…") {
+                items.push(Item {
+                    icon: "📂".into(),
+                    label: "フォルダをワークスペースに追加…".into(),
+                    detail: String::new(),
+                    action: Action::Cmd(Cmd::AddFolder),
+                    score: score - 60,
+                });
+            }
         } else {
             for f in &self.file_index {
                 // マッチはルート相対パスに対して行い、単一ルート時と同じ
@@ -5718,9 +6091,65 @@ impl ZaivernApp {
         items
     }
 
+    /// 各ルートの git worktree 一覧。パレットを開いている間だけキャッシュされる。
+    fn list_git_worktrees(&self) -> Vec<(String, PathBuf, bool)> {
+        let canon =
+            |p: &Path| -> PathBuf { p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) };
+        let roots: Vec<PathBuf> = self.roots.iter().map(|r| canon(r)).collect();
+        let mut out: Vec<(String, PathBuf, bool)> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        for root in &self.roots {
+            let Ok(o) = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["worktree", "list", "--porcelain"])
+                .output()
+            else {
+                continue;
+            };
+            if !o.status.success() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&o.stdout);
+            let mut path: Option<PathBuf> = None;
+            let mut branch = String::new();
+            for line in text.lines().chain(std::iter::once("")) {
+                if let Some(p) = line.strip_prefix("worktree ") {
+                    path = Some(PathBuf::from(p));
+                } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                    branch = b.to_string();
+                } else if line == "detached" {
+                    branch = "(detached)".into();
+                } else if line.is_empty() {
+                    if let Some(p) = path.take() {
+                        let cp = canon(&p);
+                        if seen.insert(cp.clone()) {
+                            let added = roots.contains(&cp);
+                            let label = if branch.is_empty() {
+                                p.file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default()
+                            } else {
+                                std::mem::take(&mut branch)
+                            };
+                            out.push((label, p, added));
+                        }
+                    }
+                    branch.clear();
+                }
+            }
+        }
+        out
+    }
+
     fn palette_ui(&mut self, ctx: &egui::Context) {
         if !self.palette.open {
             return;
+        }
+        // `#` モードに入った最初のフレームで worktree 一覧を取り込む
+        // (git はここでしか叩かない。閉じたら破棄)。
+        if self.palette.is_root_mode() && self.palette_worktrees.is_none() {
+            self.palette_worktrees = Some(self.list_git_worktrees());
         }
         let theme = self.theme.clone();
         let items = self.palette_items();
@@ -5747,7 +6176,9 @@ impl ZaivernApp {
 
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.palette.input)
-                                .hint_text("ファイル検索…  （先頭に > でコマンド）")
+                                .hint_text(
+                                    "ファイル検索…  （> コマンド / @ エージェント / # worktree）",
+                                )
                                 .font(FontId::proportional(16.0))
                                 .desired_width(f32::INFINITY),
                         );
@@ -5848,6 +6279,7 @@ impl ZaivernApp {
 
         if close {
             self.palette.close();
+            self.palette_worktrees = None;
         }
         if let Some(a) = execute {
             self.run_action(a, ctx);
@@ -7291,7 +7723,7 @@ impl ZaivernApp {
             .map(|s| {
                 (
                     s.id,
-                    coordinator_state(s.running(), s.attention, self.supervisor.state_of(s.id)),
+                    coordinator_state(s.running(), s.attention, s.rate_limited.is_some(), self.supervisor.state_of(s.id)),
                 )
             })
             .collect();
@@ -7412,7 +7844,7 @@ impl ZaivernApp {
                 id: s.id,
                 title: s.title.clone(),
                 running: s.running(),
-                state: coordinator_state(s.running(), s.attention, self.supervisor.state_of(s.id)),
+                state: coordinator_state(s.running(), s.attention, s.rate_limited.is_some(), self.supervisor.state_of(s.id)),
             })
             .collect()
     }
@@ -7755,6 +8187,11 @@ impl eframe::App for ZaivernApp {
                         notify::notify("Zaivern Code", &format!("🔔 {title} が承認待ちです"));
                     }
                     if !throttled {
+                        notify::webhook(
+                            &self.cfg.webhook_url,
+                            "🔔 承認待ち",
+                            &format!("{title} が承認を待っています"),
+                        );
                         self.queue_hook(plugins::HookEvent::AgentAttention, None);
                     }
                 }
@@ -7781,8 +8218,83 @@ impl eframe::App for ZaivernApp {
                         let mark = if code == 0 { "✅" } else { "❌" };
                         notify::notify("Zaivern Code", &format!("{mark} {title} が終了しました"));
                     }
+                    let mark = if code == 0 { "✅" } else { "❌" };
+                    notify::webhook(
+                        &self.cfg.webhook_url,
+                        &format!("{mark} エージェント終了"),
+                        &format!("{title} が終了しました (code {code})"),
+                    );
                     self.queue_hook(plugins::HookEvent::AgentFinish, None);
                 }
+                SessionEvent::RateLimited(title, line) => {
+                    self.toast_warn(format!("⏳ {title} がレート制限/使用上限に達しました"));
+                    if self.cfg.pet_sounds {
+                        self.sound.play(SoundKind::Confirm);
+                    }
+                    if !win_focused {
+                        notify::notify(
+                            "Zaivern Code",
+                            &format!("⏳ {title} がレート制限/使用上限に達しました"),
+                        );
+                    }
+                    notify::webhook(
+                        &self.cfg.webhook_url,
+                        "⏳ レート制限",
+                        &format!("{title}: {line}"),
+                    );
+                }
+            }
+        }
+
+        // ── Issue 着手フローの「安全になったら入力欄へ」配達 ──
+        // Idle (静かでプロンプトへ戻っている) を待って指示文を入れる。
+        // 45 秒待っても Idle にならない場合は、承認待ちでない限り入れてしまう
+        // (スピナーの誤検知等で永遠に待たないため)。2 分で諦めて知らせる。
+        if !self.pending_prompts.is_empty() {
+            let mut rest: Vec<(u64, Instant, String)> = Vec::new();
+            let mut delivered: Vec<String> = Vec::new();
+            let mut gave_up: Vec<String> = Vec::new();
+            for (sid, queued, text) in std::mem::take(&mut self.pending_prompts) {
+                let idle = matches!(
+                    self.supervisor.state_of(sid),
+                    Some(supervisor::SessionState::Idle)
+                );
+                let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == sid) else {
+                    continue; // セッションが消えた
+                };
+                if !s.running() {
+                    continue;
+                }
+                let overdue = queued.elapsed().as_secs() >= 45 && !s.attention;
+                if idle || overdue {
+                    s.write_bytes(text.as_bytes());
+                    delivered.push(s.title.clone());
+                } else if queued.elapsed().as_secs() < 120 {
+                    rest.push((sid, queued, text));
+                } else {
+                    gave_up.push(s.title.clone());
+                }
+            }
+            self.pending_prompts = rest;
+            for title in delivered {
+                self.toast(
+                    format!("📋 {title} の入力欄に着手指示を入れました — 確認して Enter"),
+                    true,
+                );
+            }
+            for title in gave_up {
+                self.toast_warn(format!(
+                    "指示文を配達できませんでした ({title}): セッションが落ち着きません"
+                ));
+            }
+        }
+
+        // 表示中のアクティブセッションを既読にする。未読 (◆) は
+        // 「見ていない間に意味的な出力が変わった」セッションだけに残る。
+        if self.agents.panel_open || self.cockpit {
+            let active = self.agents.active;
+            if let Some(s) = self.agents.sessions.get_mut(active) {
+                s.mark_read();
             }
         }
 
@@ -7840,6 +8352,47 @@ impl eframe::App for ZaivernApp {
                     self.editor_area(ui);
                 }
             });
+
+        // ── OS からのファイルドロップ ──
+        // ターミナル (terminal::draw) が受けた分は印が立つので、残りをエディタ側で
+        // 処理する: ファイル → タブで開く / フォルダ → ワークスペースに追加。
+        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let consumed = ctx
+                .data_mut(|d| d.remove_temp::<bool>(egui::Id::new("zv-drop-consumed")))
+                .unwrap_or(false);
+            if !consumed {
+                for f in dropped {
+                    let Some(p) = f.path else { continue };
+                    if p.is_dir() {
+                        self.add_folder_to_workspace(p, ctx);
+                    } else {
+                        self.open_path(&p);
+                    }
+                }
+            }
+        }
+        // ドラッグ中は行き先のヒントを出す
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            egui::Area::new(egui::Id::new("zv-drop-hint"))
+                .order(egui::Order::Foreground)
+                .anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(self.theme.panel)
+                        .stroke(egui::Stroke::new(1.0_f32, self.theme.accent))
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "ターミナルへドロップ = @パスを入力欄へ挿入 ・ それ以外 = エディタで開く (フォルダは追加)",
+                                )
+                                .color(self.theme.text),
+                            );
+                        });
+                });
+        }
 
         self.palette_ui(ctx);
         self.new_plugin_ui(ctx);
@@ -8702,8 +9255,8 @@ mod wiring_tests {
     fn dead_process_is_exited() {
         // 生きていなければ、監視の見立てが何であろうと終了。
         for sup in [None, Some(S::Working), Some(S::Idle), Some(S::Done)] {
-            assert_eq!(coordinator_state(false, false, sup), C::Exited);
-            assert_eq!(coordinator_state(false, true, sup), C::Exited);
+            assert_eq!(coordinator_state(false, false, false, sup), C::Exited);
+            assert_eq!(coordinator_state(false, true, false, sup), C::Exited);
         }
     }
 
@@ -8711,21 +9264,21 @@ mod wiring_tests {
     fn attention_wins_over_everything_while_running() {
         // 承認プロンプトで止まっている相手には割り込ませない。
         for sup in [None, Some(S::Working), Some(S::Idle)] {
-            assert_eq!(coordinator_state(true, true, sup), C::WaitingApproval);
+            assert_eq!(coordinator_state(true, true, false, sup), C::WaitingApproval);
         }
     }
 
     #[test]
     fn recent_output_is_working_and_quiet_prompt_is_idle() {
-        assert_eq!(coordinator_state(true, false, Some(S::Working)), C::Working);
-        assert_eq!(coordinator_state(true, false, Some(S::Idle)), C::Idle);
+        assert_eq!(coordinator_state(true, false, false, Some(S::Working)), C::Working);
+        assert_eq!(coordinator_state(true, false, false, Some(S::Idle)), C::Idle);
     }
 
     #[test]
     fn unobserved_session_is_unknown_not_idle() {
         // まだ一度も観測していない = 何も分からない。ここを Idle にすると
         // 起動直後の忙しいエージェントへ文字を流し込んでしまう。
-        assert_eq!(coordinator_state(true, false, None), C::Unknown);
+        assert_eq!(coordinator_state(true, false, false, None), C::Unknown);
     }
 
     #[test]
@@ -8734,7 +9287,7 @@ mod wiring_tests {
         // が判断できない。すべて Unknown に倒す。
         for sup in [S::Looping, S::Errored, S::Crashed, S::Done] {
             assert_eq!(
-                coordinator_state(true, false, Some(sup)),
+                coordinator_state(true, false, false, Some(sup)),
                 C::Unknown,
                 "{sup:?} は曖昧なので Unknown でなければならない"
             );
@@ -8756,7 +9309,7 @@ mod wiring_tests {
             (Some(S::Done), false),
         ];
         for (sup, want) in cases {
-            let st = coordinator_state(true, false, sup);
+            let st = coordinator_state(true, false, false, sup);
             assert_eq!(
                 coordinator::deliverable(st),
                 want,
@@ -8767,7 +9320,7 @@ mod wiring_tests {
 
     #[test]
     fn stalled_session_is_never_delivered_to() {
-        let st = coordinator_state(true, false, Some(S::Stalled));
+        let st = coordinator_state(true, false, false, Some(S::Stalled));
         assert_eq!(st, C::Stalled);
         assert!(!coordinator::deliverable(st));
     }
