@@ -113,3 +113,7 @@
 "🗑 削除…" = "🗑 Delete…"
 "👾 パスをエージェントに送信" = "👾 Send Path to Agent"
 "📂 エディタで開く" = "📂 Open in Editor"
+
+# ── Issue からの着手メニュー ─────────────────────────────────────────────
+"⚡ 着手" = "⚡ Start work"
+"worktree を切って選んだエージェントで着手します" = "Creates a worktree and starts the chosen agent on it"

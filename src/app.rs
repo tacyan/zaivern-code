@@ -2463,18 +2463,33 @@ impl ZaivernApp {
 
         if dir.is_dir() {
             // 既にある = 前回の着手の続き。作り直さずそのまま使う。
-            self.toast(format!("🌿 既存の worktree を再利用します: {}", dir.display()), true);
+            self.toast(
+                trf(
+                    "🌿 既存の worktree を再利用します: {dir}",
+                    &[("dir", dir.display().to_string())],
+                ),
+                true,
+            );
         } else {
             // ブランチが残っていたら -b 無しで拾い、無ければ新規に切る
             let fresh = git(&["worktree", "add", "-b", &branch, &dir.to_string_lossy()]);
             if let Err(e1) = fresh {
                 if let Err(e2) = git(&["worktree", "add", &dir.to_string_lossy(), &branch]) {
-                    self.toast(format!("worktree を作成できません: {e1} / {e2}"), false);
+                    self.toast(
+                        trf(
+                            "worktree を作成できません: {e1} / {e2}",
+                            &[("e1", e1), ("e2", e2)],
+                        ),
+                        false,
+                    );
                     return;
                 }
             }
             self.toast(
-                format!("🌿 worktree を作成しました: {} (ブランチ {branch})", dir.display()),
+                trf(
+                    "🌿 worktree を作成しました: {dir} (ブランチ {branch})",
+                    &[("dir", dir.display().to_string()), ("branch", branch.clone())],
+                ),
                 true,
             );
         }
@@ -2501,7 +2516,7 @@ impl ZaivernApp {
         );
         self.pending_prompts.push((sid, Instant::now(), prompt));
         self.toast(
-            "⚡ エージェントを起動しました — 準備ができ次第、着手指示を入力欄へ入れます",
+            tr("⚡ エージェントを起動しました — 準備ができ次第、着手指示を入力欄へ入れます"),
             true,
         );
     }
@@ -2515,14 +2530,17 @@ impl ZaivernApp {
         let next = file_tree::normalize_roots(next);
         // normalize_roots が畳んだ = 既存ルート配下だった
         if next.len() == before && next.iter().any(|r| dir.starts_with(r)) {
-            self.toast_warn(format!(
-                "{} は既にワークスペースに含まれています",
-                dir.display()
+            self.toast_warn(trf(
+                "{dir} は既にワークスペースに含まれています",
+                &[("dir", dir.display().to_string())],
             ));
         } else {
             self.set_roots(next, ctx);
             self.toast(
-                format!("📚 {} をワークスペースに追加しました", dir.display()),
+                trf(
+                    "📚 {dir} をワークスペースに追加しました",
+                    &[("dir", dir.display().to_string())],
+                ),
                 true,
             );
         }
@@ -3845,16 +3863,17 @@ impl ZaivernApp {
                                                         .size(9.0)
                                                         .color(theme.accent),
                                                 )
-                                                .on_hover_text(
+                                                .on_hover_text(tr(
                                                     "最後に見てから新しい出力があります",
-                                                );
+                                                ));
                                             }
                                             if let Some(line) = &s.rate_limited {
                                                 ui.label(
                                                     RichText::new("⏳").color(theme.warn),
                                                 )
-                                                .on_hover_text(format!(
-                                                    "レート制限/使用上限: {line}"
+                                                .on_hover_text(trf(
+                                                    "レート制限/使用上限: {line}",
+                                                    &[("line", line.clone())],
                                                 ));
                                             }
                                             ui.with_layout(
@@ -3894,12 +3913,14 @@ impl ZaivernApp {
                                     }
                                     resp.context_menu(|ui| {
                                         if !s.has_unread()
-                                            && ui.button("📩 あとで見る (未読にする)").clicked()
+                                            && ui
+                                                .button(tr("📩 あとで見る (未読にする)"))
+                                                .clicked()
                                         {
                                             set_unread = Some(i);
                                             ui.close_menu();
                                         }
-                                        if ui.button("🔍 フォーカス").clicked() {
+                                        if ui.button(tr("🔍 フォーカス")).clicked() {
                                             focus = Some(i);
                                             ui.close_menu();
                                         }
@@ -4515,12 +4536,13 @@ impl ZaivernApp {
                                         ui.label(
                                             RichText::new("◆").size(9.0).color(theme.accent),
                                         )
-                                        .on_hover_text("最後に見てから新しい出力があります");
+                                        .on_hover_text(tr("最後に見てから新しい出力があります"));
                                     }
                                     if let Some(line) = &s.rate_limited {
                                         ui.label(RichText::new("⏳").color(theme.warn))
-                                            .on_hover_text(format!(
-                                                "レート制限/使用上限: {line}"
+                                            .on_hover_text(trf(
+                                                "レート制限/使用上限: {line}",
+                                                &[("line", line.clone())],
                                             ));
                                     }
                                     if r.clicked() {
@@ -4528,7 +4550,7 @@ impl ZaivernApp {
                                     }
                                     r.context_menu(|ui| {
                                         if let Some(hint) = s.permission_switch_hint() {
-                                            if ui.button(format!("🛡 {hint}")).clicked() {
+                                            if ui.button(format!("🛡 {}", tr(hint))).clicked() {
                                                 cycle = Some(i);
                                                 ui.close_menu();
                                             }
@@ -4581,13 +4603,15 @@ impl ZaivernApp {
                         }
                         ui.menu_button("📜", |ui| {
                             ui.label(
-                                RichText::new("ターミナルログ (再起動しても残ります)")
+                                RichText::new(tr("ターミナルログ (再起動しても残ります)"))
                                     .size(11.5)
                                     .color(theme.text_dim),
                             );
                             let logs = crate::session::list_term_logs(self.primary_root());
                             if logs.is_empty() {
-                                ui.label(RichText::new("まだありません").color(theme.text_dim));
+                                ui.label(
+                                    RichText::new(tr("まだありません")).color(theme.text_dim),
+                                );
                             }
                             for p in logs.into_iter().take(30) {
                                 let name = p
@@ -4604,7 +4628,7 @@ impl ZaivernApp {
                             }
                         })
                         .response
-                        .on_hover_text("前回セッションのターミナルログを開く");
+                        .on_hover_text(tr("前回セッションのターミナルログを開く"));
                         ui.menu_button("＋", |ui| {
                             for (i, p) in self.cfg.agents.iter().enumerate() {
                                 if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
@@ -4696,7 +4720,7 @@ impl ZaivernApp {
         let cur = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
-                self.toast(format!("ログを読めません: {e}"), false);
+                self.toast(trf("ログを読めません: {e}", &[("e", e.to_string())]), false);
                 return;
             }
         };
@@ -5150,17 +5174,18 @@ impl ZaivernApp {
                                                             .size(9.0)
                                                             .color(theme.accent),
                                                     )
-                                                    .on_hover_text(
+                                                    .on_hover_text(tr(
                                                         "最後に見てから新しい出力があります",
-                                                    );
+                                                    ));
                                                 }
                                                 if let Some(line) = &s.rate_limited {
                                                     ui.label(
                                                         RichText::new("⏳")
                                                             .color(theme.warn),
                                                     )
-                                                    .on_hover_text(format!(
-                                                        "レート制限/使用上限: {line}"
+                                                    .on_hover_text(trf(
+                                                        "レート制限/使用上限: {line}",
+                                                        &[("line", line.clone())],
                                                     ));
                                                 }
                                                 ui.label(
@@ -6254,7 +6279,7 @@ impl ZaivernApp {
         } else if self.palette.is_agent_mode() {
             // `@` — エージェントセッションへジャンプ / プリセット起動
             for (i, s) in self.agents.sessions.iter().enumerate() {
-                let state = if s.running() {
+                let state = tr(if s.running() {
                     if s.attention {
                         "🔔 承認待ち"
                     } else if s.rate_limited.is_some() {
@@ -6264,8 +6289,8 @@ impl ZaivernApp {
                     }
                 } else {
                     "終了"
-                };
-                let unread = if s.has_unread() { " ◆未読" } else { "" };
+                });
+                let unread = if s.has_unread() { tr(" ◆未読") } else { String::new() };
                 if let Some(score) = fuzzy::score(&q, &s.title) {
                     items.push(Item {
                         icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
@@ -6280,7 +6305,8 @@ impl ZaivernApp {
                 }
             }
             for (i, p) in self.cfg.agents.iter().enumerate() {
-                let label = format!("起動: {}", p.name);
+                // 訳語のラベルに対して検索する (英語UIなら英語で当たるように)
+                let label = trf("起動: {name}", &[("name", p.name.clone())]);
                 if let Some(score) = fuzzy::score(&q, &label) {
                     items.push(Item {
                         icon: p.icon.clone(),
@@ -6294,7 +6320,10 @@ impl ZaivernApp {
         } else if self.palette.is_root_mode() {
             // `#` — ワークスペースルートと git worktree の横断
             for r in &self.roots {
-                let label = format!("フォルダを外す: {}", root_name(r));
+                let label = trf(
+                    "フォルダを外す: {name}",
+                    &[("name", root_name(r).to_string())],
+                );
                 if self.roots.len() > 1 {
                     if let Some(score) = fuzzy::score(&q, &label) {
                         items.push(Item {
@@ -6313,7 +6342,7 @@ impl ZaivernApp {
                 if *added {
                     continue; // 既にワークスペースにあるものは「外す」側で出る
                 }
-                let label = format!("worktree を開く: {branch}");
+                let label = trf("worktree を開く: {branch}", &[("branch", branch.clone())]);
                 if let Some(score) = fuzzy::score(&q, &label) {
                     items.push(Item {
                         icon: "🌿".into(),
@@ -6324,10 +6353,11 @@ impl ZaivernApp {
                     });
                 }
             }
-            if let Some(score) = fuzzy::score(&q, "フォルダをワークスペースに追加…") {
+            let add_label = tr("フォルダをワークスペースに追加…");
+            if let Some(score) = fuzzy::score(&q, &add_label) {
                 items.push(Item {
                     icon: "📂".into(),
-                    label: "フォルダをワークスペースに追加…".into(),
+                    label: add_label,
                     detail: String::new(),
                     action: Action::Cmd(Cmd::AddFolder),
                     score: score - 60,
@@ -8522,8 +8552,8 @@ impl eframe::App for ZaivernApp {
                     if !throttled {
                         notify::webhook(
                             &self.cfg.webhook_url,
-                            "🔔 承認待ち",
-                            &format!("{title} が承認を待っています"),
+                            &tr("🔔 承認待ち"),
+                            &trf("{title} が承認を待っています", &[("title", title.clone())]),
                         );
                         self.queue_hook(plugins::HookEvent::AgentAttention, None);
                     }
@@ -8532,7 +8562,7 @@ impl eframe::App for ZaivernApp {
                     self.toast(
                         trf(
                             "⚡ {title}: {desc} を自動送信しました",
-                            &[("title", title.clone()), ("desc", desc.to_string())],
+                            &[("title", title.clone()), ("desc", tr(desc))],
                         ),
                         true,
                     );
@@ -8575,25 +8605,34 @@ impl eframe::App for ZaivernApp {
                     let mark = if code == 0 { "✅" } else { "❌" };
                     notify::webhook(
                         &self.cfg.webhook_url,
-                        &format!("{mark} エージェント終了"),
-                        &format!("{title} が終了しました (code {code})"),
+                        &trf("{mark} エージェント終了", &[("mark", mark.to_string())]),
+                        &trf(
+                            "{title} が終了しました (code {code})",
+                            &[("title", title.clone()), ("code", code.to_string())],
+                        ),
                     );
                     self.queue_hook(plugins::HookEvent::AgentFinish, None);
                 }
                 SessionEvent::RateLimited(title, line) => {
-                    self.toast_warn(format!("⏳ {title} がレート制限/使用上限に達しました"));
+                    self.toast_warn(trf(
+                        "⏳ {title} がレート制限/使用上限に達しました",
+                        &[("title", title.clone())],
+                    ));
                     if self.cfg.pet_sounds {
                         self.sound.play(SoundKind::Confirm);
                     }
                     if !win_focused {
                         notify::notify(
                             "Zaivern Code",
-                            &format!("⏳ {title} がレート制限/使用上限に達しました"),
+                            &trf(
+                                "⏳ {title} がレート制限/使用上限に達しました",
+                                &[("title", title.clone())],
+                            ),
                         );
                     }
                     notify::webhook(
                         &self.cfg.webhook_url,
-                        "⏳ レート制限",
+                        &tr("⏳ レート制限"),
                         &format!("{title}: {line}"),
                     );
                 }
@@ -8632,13 +8671,17 @@ impl eframe::App for ZaivernApp {
             self.pending_prompts = rest;
             for title in delivered {
                 self.toast(
-                    format!("📋 {title} の入力欄に着手指示を入れました — 確認して Enter"),
+                    trf(
+                        "📋 {title} の入力欄に着手指示を入れました — 確認して Enter",
+                        &[("title", title)],
+                    ),
                     true,
                 );
             }
             for title in gave_up {
-                self.toast_warn(format!(
-                    "指示文を配達できませんでした ({title}): セッションが落ち着きません"
+                self.toast_warn(trf(
+                    "指示文を配達できませんでした ({title}): セッションが落ち着きません",
+                    &[("title", title)],
                 ));
             }
         }
@@ -8739,9 +8782,9 @@ impl eframe::App for ZaivernApp {
                         .inner_margin(egui::Margin::symmetric(14.0, 8.0))
                         .show(ui, |ui| {
                             ui.label(
-                                RichText::new(
+                                RichText::new(tr(
                                     "ターミナルへドロップ = @パスを入力欄へ挿入 ・ それ以外 = エディタで開く (フォルダは追加)",
-                                )
+                                ))
                                 .color(self.theme.text),
                             );
                         });

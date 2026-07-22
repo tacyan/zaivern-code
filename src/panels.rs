@@ -437,11 +437,11 @@ fn issue_row(
                             .selectable(false),
                     );
                     if !presets.is_empty() {
-                        ui.menu_button(RichText::new("⚡ 着手").size(11.0), |ui| {
+                        ui.menu_button(RichText::new(tr("⚡ 着手")).size(11.0), |ui| {
                             ui.label(
-                                RichText::new(
+                                RichText::new(tr(
                                     "worktree を切って選んだエージェントで着手します",
-                                )
+                                ))
                                 .size(11.0)
                                 .color(theme.text_dim),
                             );
