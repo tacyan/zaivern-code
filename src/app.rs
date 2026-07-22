@@ -4214,6 +4214,9 @@ impl ZaivernApp {
         let theme = self.theme.clone();
         let mut launch: Option<usize> = None;
         let mut focus: Option<usize> = None;
+        // グリッドのセルを選んだら、そのセッションをアクティブ (紫枠) にする。
+        // Cockpit は開いたままにしたいので focus (下部パネルへ移動) とは別に持つ。
+        let mut select: Option<usize> = None;
         let mut restart: Option<usize> = None;
         let mut remove: Option<usize> = None;
         let mut cycle: Option<usize> = None;
@@ -4521,7 +4524,7 @@ impl ZaivernApp {
                                     } else {
                                         egui::Stroke::new(1.0_f32, theme.border)
                                     };
-                                    egui::Frame::none()
+                                    let cell = egui::Frame::none()
                                         .fill(theme.panel_alt)
                                         .stroke(stroke)
                                         .rounding(egui::Rounding::same(8.0))
@@ -4621,15 +4624,36 @@ impl ZaivernApp {
                                                             .clicked()
                                                         {
                                                             voice = Some(sid);
+                                                            select = Some(i);
                                                         }
                                                     },
                                                 );
                                             });
-                                            terminal::draw(
+                                            let term = terminal::draw(
                                                 ui, s, &theme, mini_font, true, true, false,
                                             );
+                                            // ミニターミナルをクリックして入力を始めた
+                                            // セッションへ、アクティブ (紫枠) を追従させる。
+                                            if term.clicked()
+                                                || term.drag_started()
+                                                || term.gained_focus()
+                                            {
+                                                select = Some(i);
+                                            }
                                             });
                                         });
+                                    // ヘッダー等、セル内の余白クリックでも選択できる
+                                    // ようにする。ボタンやミニターミナルはより小さい
+                                    // ウィジェットとしてヒットテストで優先されるため、
+                                    // この後掛けの interact が動作を奪うことはない。
+                                    let cell_resp = ui.interact(
+                                        cell.response.rect,
+                                        egui::Id::new(("cockpit-cell-select", i)),
+                                        egui::Sense::click(),
+                                    );
+                                    if cell_resp.clicked() {
+                                        select = Some(i);
+                                    }
                                 }
                             });
                         }
@@ -4663,6 +4687,11 @@ impl ZaivernApp {
         if let Some(i) = launch {
             self.launch_preset(i, ctx);
         }
+        if let Some(i) = select {
+            if i < self.agents.sessions.len() {
+                self.agents.active = i;
+            }
+        }
         if let Some(i) = focus {
             self.apply_cmd(Cmd::FocusAgent(i), ctx);
         }
@@ -4675,6 +4704,8 @@ impl ZaivernApp {
             self.agents.remove(i);
         }
         // タスク作成 / メッセージ送信のフォームと、押されたボタンの適用。
+        let prev_task_target = self.orch.target;
+        let prev_msg_target = self.orch.msg_target;
         orch_acts.extend(orchestration::task_form_ui(
             &mut self.orch,
             ctx,
@@ -4687,6 +4718,37 @@ impl ZaivernApp {
             &theme,
             &orch_rows,
         ));
+        // 指示の宛先で特定のエージェントを選んだら (または送ったら)、
+        // そのセッションへアクティブ (紫枠) を移す。
+        let mut picked: Option<u64> = None;
+        if self.orch.target != prev_task_target {
+            if let orchestration::TaskTarget::Session(id) = self.orch.target {
+                picked = Some(id);
+            }
+        }
+        if self.orch.msg_target != prev_msg_target {
+            if let orchestration::MsgTarget::Session(id) = self.orch.msg_target {
+                picked = Some(id);
+            }
+        }
+        for a in &orch_acts {
+            match a {
+                orchestration::OrchAction::CreateTask {
+                    target: orchestration::TaskTarget::Session(id),
+                    ..
+                }
+                | orchestration::OrchAction::SendMessage {
+                    to: orchestration::MsgTarget::Session(id),
+                    ..
+                } => picked = Some(*id),
+                _ => {}
+            }
+        }
+        if let Some(id) = picked {
+            if let Some(ix) = self.agents.sessions.iter().position(|s| s.id == id) {
+                self.agents.active = ix;
+            }
+        }
         self.orch_apply(orch_acts);
 
         // 監視役 LLM の変更を反映する (閉じた後に適用するのが app.rs の作法)。
