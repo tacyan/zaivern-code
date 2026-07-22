@@ -6,6 +6,8 @@
 //! - [`parse_directives`] — 指揮官の画面出力から `@対象: 指示` を拾う。
 //! - [`build_status_digest`] — 他エージェントの状況を 1 段落へまとめる
 //!   (指揮官の端末へ内部フィードする本文)。
+//! - [`feed_signature`] — 状況フィードの「変化」を見分けるシグネチャ。
+//!   前回送信時と同じなら送らない (余計なメッセージを流さない) ための鍵。
 //! - [`title_matches`] / [`last_nonempty_line`] — 配線側の小道具。
 //!
 //! ## 方針
@@ -137,9 +139,30 @@ pub fn build_status_digest(others: &[AgentStatus]) -> Option<String> {
     Some(format!(
         "他エージェントの状況 — {}。\
          指揮するときは 1 行で「@対象: 内容」と書けば、その相手が安全になった瞬間に届きます\
-         (全員へは @all:)。停止・再起動はできません。指示は非破壊の内容だけにしてください。",
+         (全員へは @all:)。停止・再起動はできません。指示は非破壊の内容だけにしてください。\
+         この状況は変化があったときだけ届きます (定期便はありません)。",
         parts.join(" / ")
     ))
+}
+
+/// 状況フィードの「変化」を見分ける決定論シグネチャ。`pairs` は (タイトル, 状態)。
+///
+/// - **直近行は含めない**。作業中のエージェントの画面末尾は毎フレーム揺れるので、
+///   含めると「常に変化あり」になってフィードが止まらなくなる。
+/// - 並び順に依存しない (セッション一覧の並び替えだけでは変化と見なさない)。
+///   同じ (タイトル, 状態) が複数あっても打ち消し合わないよう、XOR ではなく
+///   ソートしてから順に混ぜる。
+pub fn feed_signature(pairs: &[(&str, &str)]) -> u64 {
+    let mut keys: Vec<String> = pairs
+        .iter()
+        .map(|(title, state)| format!("{title}\u{0}{state}"))
+        .collect();
+    keys.sort();
+    let mut h = DefaultHasher::new();
+    for k in &keys {
+        k.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// 指示の宛先タイトルが、あるセッションのタイトルに一致するとみなせるか。
@@ -222,6 +245,28 @@ mod tests {
         assert!(s.contains("codex-1=停滞"));
         assert!(s.contains("@対象: 内容"));
         assert!(s.contains("停止・再起動はできません"));
+    }
+
+    #[test]
+    fn feed_signature_ignores_order_and_last_line() {
+        // 並び替えだけでは変化と見なさない
+        let a = feed_signature(&[("a", "作業中"), ("b", "停滞")]);
+        let b = feed_signature(&[("b", "停滞"), ("a", "作業中")]);
+        assert_eq!(a, b);
+        // 状態が変わればシグネチャも変わる
+        let c = feed_signature(&[("a", "停滞"), ("b", "停滞")]);
+        assert_ne!(a, c);
+        // (feed_signature は直近行を受け取らない = 画面末尾の揺れでは変化しない)
+    }
+
+    #[test]
+    fn feed_signature_duplicates_do_not_cancel() {
+        // 同名同状態の 2 体が「空」と同じシグネチャに潰れてはいけない
+        let two = feed_signature(&[("x", "作業中"), ("x", "作業中")]);
+        let none = feed_signature(&[]);
+        let one = feed_signature(&[("x", "作業中")]);
+        assert_ne!(two, none);
+        assert_ne!(two, one);
     }
 
     #[test]

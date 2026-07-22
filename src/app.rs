@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
@@ -11,7 +11,6 @@ use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
 use crate::coordinator;
-use crate::diagnostician;
 use crate::orchestration;
 use crate::supervisor;
 use crate::editor::{disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
@@ -395,19 +394,10 @@ pub struct ZaivernApp {
     /// 端末へ伝え済みのテーマ色 (OSC 10/11 の問い合わせ応答用)。
     report_colors: HashMap<u64, (Color32, Color32)>,
 
-    // ── 監視役 LLM (スーパーエージェント) ───────────────────────
-    /// 設定で選ばれた監視役の実体。未選択・構築失敗なら `None`。
-    /// supervisor 側にも同じ `Arc` を渡してあるが、`set_self_session` や
-    /// `last_error` を UI から読むためにこちらでも保持する。
-    super_agent: Option<Arc<diagnostician::CliDiagnostician>>,
-
-    /// 監視役を組み立てられなかった理由 (日本語)。UI に必ず出す。
-    /// **黙って無効化しない**: ユーザーが選んだのに効いていない状態を隠さない。
-    super_agent_err: Option<String>,
-
-    /// いま `set_self_session` に登録しているセッション ID。
-    /// 監視役の CLI は普通の作業にも使えるので、そのセッションが立ち上がったら
-    /// ここへ入れて「自分自身の診断」を断らせる。
+    // ── スーパーエージェント (指揮官) ───────────────────────────
+    /// いま指揮官として扱っているセッション ID。指名なし・未起動なら `None`。
+    /// 指名 (タイトル/コマンド) から毎フレーム引き直すので、再起動で ID が
+    /// 変わっても、途中で指名を変えても追従する。
     super_agent_session: Option<u64>,
 
     /// セッションごとに最後に LLM へ相談した異常種別。
@@ -419,8 +409,13 @@ pub struct ZaivernApp {
     /// 指揮官セッションは `super_agent_session` を使う。
     commander_seen: HashSet<u64>,
 
-    /// 指揮官へ状況フィードを流した最後の時刻 (`super_agent.timeout_secs` 間隔)。
+    /// 指揮官へ状況フィードを流した最後の時刻。`super_agent.timeout_secs` を
+    /// 「最短間隔」として使う (それより短い間隔では送らない)。
     commander_last_feed: Option<Instant>,
+
+    /// 最後に指揮官へ送った状況フィードのシグネチャ (タイトル+状態)。
+    /// 同じシグネチャの間は送らない = **変化があったときだけ**内部フィードする。
+    commander_feed_sig: Option<u64>,
 
     /// エージェントのタブをクリックして選び直したとき、次にアクティブ端末を
     /// 描くフレームでキーボードフォーカスを移すための予約フラグ。
@@ -428,22 +423,17 @@ pub struct ZaivernApp {
     term_focus_pending: bool,
 }
 
-/// 監視役に選べないプリセットの理由。選べるなら `None`。
+/// 指揮官に選べないセッションの理由。選べるなら `None`。
 ///
-/// ヘッドレス実行に対応しない CLI を選ばせると、診断のたびに対話 TUI が
-/// 起動して期限まで無言でぶら下がる。**選択肢に出す前にここで弾く**。
-fn super_agent_reject_reason(command: &str) -> Option<String> {
-    let cmd = command.trim();
-    if cmd.is_empty() {
-        return Some(tr("素のシェルなので診断を頼めません"));
-    }
-    let Some(spec) = crate::agents::spec_for_command(cmd) else {
-        return Some(tr("既知のエージェント CLI ではないため対応可否を判断できません"));
-    };
-    if spec.headless.is_empty() {
-        return Some(trf(
-            "{label} はヘッドレス実行に対応していません (対話 TUI しか起動できません)",
-            &[("label", spec.label.to_string())],
+/// 指揮はそのセッションの端末内で完結する (ヘッドレス起動も外部 subagent も
+/// 使わない) ので、CLI の種類やヘッドレス対応は問わない — **起動しているどの
+/// エージェントでも指揮官にできる**。唯一の例外が素のシェル: 状況フィードは
+/// 末尾 Enter 付きで注入されるため、シェルだと本文がそのままコマンドとして
+/// 実行されてしまう。これだけは選択肢に出す前にここで弾く。
+fn commander_reject_reason(command: &str) -> Option<String> {
+    if command.trim().is_empty() {
+        return Some(tr(
+            "素のシェルは指揮官にできません (注入した行がコマンドとして実行されてしまいます)",
         ));
     }
     None
@@ -675,16 +665,15 @@ impl ZaivernApp {
             typed_voice: HashMap::new(),
             typed_sup: HashMap::new(),
             report_colors: HashMap::new(),
-            super_agent: None,
-            super_agent_err: None,
             super_agent_session: None,
             sup_last_diag: HashMap::new(),
             commander_seen: HashSet::new(),
             commander_last_feed: None,
+            commander_feed_sig: None,
             term_focus_pending: false,
             cfg,
         };
-        // 設定で選ばれている監視役を組み立てる (失敗したら理由を残して先へ進む)。
+        // 設定で指名されている指揮官を反映する (居なければ起動を待つだけ)。
         app.apply_super_agent();
         // ユーザー指定のペット画像をロード
         if let Some(path) = app.cfg.pet_image.clone() {
@@ -4888,13 +4877,14 @@ impl ZaivernApp {
                         RichText::new(tr(
                             "決定論的な見張り (停滞・ループ・エラー多発の検知) は、この設定に\
                              関わらず常に動き、異常はここと通知で知らせます。ここでは\
-                             いま起動しているエージェントの中から名前で 1 体を『指揮官』に\
-                             指名します (作業の途中でもいつでも選び直せます)。指名すると、\
-                             他のエージェントの状況が自動で指揮官へ内部フィードされ、指揮官が\
-                             `@対象: 指示` (全員へは `@all:`) と書くと、その相手が安全になった\
-                             瞬間に届きます。停止・再起動などの破壊的な操作を自動でエージェントへ\
-                             投げることはしません。指名したエージェントは普通の作業にもそのまま\
-                             使えますし、そのセッション自身も見張りの対象です。",
+                             いま起動しているエージェントの中からどれでも 1 体を『指揮官』に\
+                             指名できます (作業の途中でもいつでも交代できます)。指名すると、\
+                             他のエージェントの状況に変化があったときだけ指揮官へ内部\
+                             フィードされ、指揮官が `@対象: 指示` (全員へは `@all:`) と書くと、\
+                             その相手が安全になった瞬間に届きます。それ以外のときは何も送りません。\
+                             停止・再起動などの破壊的な操作を自動でエージェントへ投げることは\
+                             しません。指名したエージェントは普通の作業にもそのまま使えますし、\
+                             そのセッション自身も見張りの対象です。",
                         ))
                         .size(12.0)
                         .color(theme.text_dim),
@@ -4949,15 +4939,15 @@ impl ZaivernApp {
                                     .color(theme.text_dim),
                                 );
                             }
-                            // いま居るセッションを名前で並べる (途中からの指名・変更用)。
+                            // いま居るセッションを名前で並べる (途中からの指名・交代用)。
+                            // 指揮は端末内で完結するので、起動しているエージェントなら
+                            // どれでも選べる (素のシェルだけは注入の危険があるので除外)。
                             for s in self.agents.sessions.iter() {
                                 let label = format!("{} {}", s.icon, s.title);
-                                // 終了済み・ヘッドレス非対応の CLI は選ばせない。
-                                // 後者を選べてしまうと対話 TUI が起動して期限まで返らない。
                                 let why = if !s.running() {
                                     Some(tr("終了しています (再起動すると選べます)"))
                                 } else {
-                                    super_agent_reject_reason(&s.command)
+                                    commander_reject_reason(&s.command)
                                 };
                                 match why {
                                     None => {
@@ -5004,7 +4994,7 @@ impl ZaivernApp {
                             super_enabled = Some(en);
                         }
                         ui.add_space(12.0);
-                        ui.label(RichText::new(tr("状況フィード間隔")).color(theme.text_dim));
+                        ui.label(RichText::new(tr("フィード最短間隔")).color(theme.text_dim));
                         let mut t = self.cfg.super_agent.timeout_secs as i64;
                         if ui
                             .add(
@@ -5013,7 +5003,8 @@ impl ZaivernApp {
                                     .suffix(tr(" 秒")),
                             )
                             .on_hover_text(tr(
-                                "この間隔で他エージェントの状況を指揮官へ内部フィードします (最低 5 秒)",
+                                "他エージェントの状況に変化があったときだけ、前回から最低この間隔を\
+                                 空けて指揮官へ内部フィードします (最低 5 秒)。変化が無ければ何も送りません",
                             ))
                             .changed()
                         {
@@ -5022,65 +5013,58 @@ impl ZaivernApp {
                     });
 
                     ui.add_space(4.0);
-                    match (&self.super_agent, &self.super_agent_err) {
-                        (Some(d), _) => {
-                            let (cmd, label) = d.describe();
-                            let head = if cur_title.is_empty() {
+                    let appointed =
+                        self.cfg.super_agent.enabled && (!cur_cmd.is_empty() || !cur_title.is_empty());
+                    if let Some(id) = self.super_agent_session {
+                        // 指揮官が実際に動いている。セッションは毎フレーム引き直して
+                        // いるので、この ID は今この瞬間の指揮官を指す。
+                        let head = self
+                            .agents
+                            .sessions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| {
                                 trf(
-                                    "✅ 指揮官: {label}  (`{cmd}`)",
-                                    &[("label", label.to_string()), ("cmd", cmd.to_string())],
-                                )
-                            } else {
-                                trf(
-                                    "✅ 指揮官: {title}  ({label})",
+                                    "✅ 指揮官: {icon} {title}  (#{id})",
                                     &[
-                                        ("title", cur_title.clone()),
-                                        ("label", label.to_string()),
+                                        ("icon", s.icon.to_string()),
+                                        ("title", s.title.clone()),
+                                        ("id", id.to_string()),
                                     ],
                                 )
-                            };
-                            ui.label(RichText::new(head).color(theme.ok));
-                            match d.self_session_id() {
-                                Some(id) => {
-                                    ui.label(
-                                        RichText::new(trf(
-                                            "指揮官セッション: #{id} — このセッションが `@対象: 指示`\
-                                             (全員へは `@all:`) で他のエージェントを内部から指揮します",
-                                            &[("id", id.to_string())],
-                                        ))
-                                        .size(12.0)
-                                        .color(theme.text_dim),
-                                    );
-                                }
-                                None => {
-                                    let wait = if cur_title.is_empty() {
-                                        tr(
-                                            "指揮官セッションを待っています — 選んだ CLI でセッションを起動すると指揮を始めます",
-                                        )
-                                    } else {
-                                        trf(
-                                            "指揮官セッション『{title}』を待っています — \
-                                             同じ名前のセッションが起動すると指揮を始めます",
-                                            &[("title", cur_title.clone())],
-                                        )
-                                    };
-                                    ui.label(
-                                        RichText::new(wait).size(12.0).color(theme.warn),
-                                    );
-                                }
-                            }
-                        }
-                        (None, Some(e)) => {
-                            ui.label(RichText::new(format!("⚠ {e}")).color(theme.err));
-                        }
-                        (None, None) => {
-                            ui.label(
-                                RichText::new(tr(
-                                    "指揮官: なし（決定論的な見張りだけが動いています）",
-                                ))
-                                .color(theme.text_dim),
-                            );
-                        }
+                            })
+                            .unwrap_or_default();
+                        ui.label(RichText::new(head).color(theme.ok));
+                        ui.label(
+                            RichText::new(tr(
+                                "このセッションが `@対象: 指示` (全員へは `@all:`) で他の\
+                                 エージェントを内部から指揮します。状況は変化があったときだけ\
+                                 内部フィードされます",
+                            ))
+                            .size(12.0)
+                            .color(theme.text_dim),
+                        );
+                    } else if appointed {
+                        // 指名済みだが、その相手がまだ (もう) 起動していない。
+                        let wait = if cur_title.is_empty() {
+                            tr(
+                                "指揮官セッションを待っています — 選んだ CLI でセッションを起動すると指揮を始めます",
+                            )
+                        } else {
+                            trf(
+                                "指揮官セッション『{title}』を待っています — \
+                                 同じ名前のセッションが起動すると指揮を始めます",
+                                &[("title", cur_title.clone())],
+                            )
+                        };
+                        ui.label(RichText::new(wait).size(12.0).color(theme.warn));
+                    } else {
+                        ui.label(
+                            RichText::new(tr(
+                                "指揮官: なし（決定論的な見張りだけが動いています）",
+                            ))
+                            .color(theme.text_dim),
+                        );
                     }
                 });
                 ui.add_space(8.0);
@@ -7690,18 +7674,14 @@ impl ZaivernApp {
 
     // ─── 監視・連携 (supervisor / coordinator / 端末フック) ──────────
 
-    /// 設定に書かれた監視役 LLM を組み立て直す。
-    ///
-    /// 起動時と設定変更時に必ず通る 1 か所。ここで
-    /// `supervisor.llm_escalation` も併せて決めるので、「選んだのに効かない」
-    /// も「選んでいないのに走る」も起こらない。
     /// スーパーエージェント (指揮官) が他の全エージェントを内部で指揮する。
     ///
-    /// 指揮官セッション = `super_agent_session` (選ばれた監視役 CLI で動いている
-    /// セッション)。毎フレーム:
+    /// 指揮官セッション = `super_agent_session`。指名なし・無効なら何もしない
+    /// (= **内部で指揮するときだけ動く**)。毎フレーム:
     /// 1. 指揮官の画面から `@対象: 指示` (`@all:` は全員) を拾い、coordinator バスへ積む。
-    /// 2. `super_agent.timeout_secs` 間隔 (既定 60 秒) で、他エージェントの状況を
-    ///    指揮官の端末へ内部フィードする。
+    /// 2. 他エージェントの状況に **変化があったときだけ**、指揮官の端末へ内部
+    ///    フィードする。変化が無ければ何も送らない (余計なメッセージを流さない)。
+    ///    `super_agent.timeout_secs` は連続変化のときの最短送信間隔。
     ///
     /// **全て内部**で完結し、外部の subagent へは投げない。停止・再起動はこの経路では
     /// 表現しない (積むのは非破壊の本文だけ)。実際の配達は coordinator が
@@ -7757,130 +7737,129 @@ impl ZaivernApp {
             }
         }
 
-        // 2) 状況フィード (既定 60 秒ごと)。
+        // 2) 状況フィード — 変化があったときだけ送る。
+        //    まず前回送信からの最短間隔 (連続変化のレート制限) を確かめ、次に
+        //    (タイトル, 状態) のシグネチャを安く計算する (端末ロック不要)。
+        //    前回送信時と同じなら **何も送らない** — 静かな艦隊に定期便は流さない。
         let now = Instant::now();
         let interval = Duration::from_secs(self.cfg.super_agent.timeout_secs.max(5));
-        let due = self
+        let rate_ok = self
             .commander_last_feed
             .map(|t| now.duration_since(t) >= interval)
             .unwrap_or(true);
-        if due {
-            // 先に (id, title, 直近行) を集めてから supervisor を借りる (借用衝突回避)。
-            let basics: Vec<(u64, String, String)> = self
-                .agents
-                .sessions
-                .iter()
-                .filter(|s| s.id != cmd_id)
-                .map(|s| {
-                    let last = s
-                        .parser
-                        .lock()
-                        .ok()
-                        .map(|p| commander::last_nonempty_line(&p.screen().contents()))
-                        .unwrap_or_default();
-                    (s.id, s.title.clone(), last)
-                })
-                .collect();
-            let others: Vec<commander::AgentStatus> = basics
-                .into_iter()
-                .map(|(id, title, last)| commander::AgentStatus {
-                    title,
-                    state: self
-                        .supervisor
-                        .state_of(id)
-                        .map(|st| st.label())
-                        .unwrap_or("不明"),
-                    last_line: supervisor::redact(&last, 120).trim().to_string(),
-                })
-                .collect();
-            if let Some(body) = commander::build_status_digest(&others) {
-                self.coordinator.enqueue(coordinator::AgentMessage::new(
-                    coordinator::Endpoint::Supervisor,
-                    coordinator::Endpoint::Session(cmd_id),
-                    coordinator::MsgKind::Status,
-                    body,
-                ));
-            }
-            self.commander_last_feed = Some(now);
-        }
-    }
-
-    fn apply_super_agent(&mut self) {
-        self.super_agent = None;
-        self.super_agent_err = None;
-        self.super_agent_session = None;
-
-        if let Some(cmd) = self.cfg.super_agent.active_command().map(str::to_string) {
-            if let Some(why) = super_agent_reject_reason(&cmd) {
-                self.super_agent_err = Some(trf(
-                    "`{cmd}` は監視役にできません: {why}",
-                    &[("cmd", cmd.clone()), ("why", why)],
-                ));
-            } else {
-                let root = Some(self.primary_root().to_path_buf());
-                match diagnostician::CliDiagnostician::new(&cmd, root) {
-                    Ok(d) => {
-                        let d = Arc::new(
-                            d.with_timeout(Duration::from_secs(self.cfg.super_agent.timeout_secs)),
-                        );
-                        self.supervisor
-                            .set_diagnostician(d.clone() as Arc<dyn supervisor::Diagnostician>);
-                        self.super_agent = Some(d);
-                    }
-                    // 日本語の理由をそのまま見せる。黙って無効化はしない。
-                    Err(e) => self.super_agent_err = Some(format!("`{cmd}`: {e}")),
-                }
-            }
-        }
-
-        // 指揮方式へ移行: LLM 診断 (CLI の spawn) は使わない。`llm_escalation` を
-        // 常に false に固定して診断経路を止める (request_diagnosis は入口で no-op、
-        // diagnose() は呼ばれない = **CLI を spawn しない / 停止・再起動を提案しない**)。
-        // 監視役の実体 (CliDiagnostician) は「指揮官セッションの特定」と UI 表示に
-        // だけ使い、実際にエージェントへ働きかけるのは drive_commander() の指揮のみ。
-        self.cfg.supervisor.llm_escalation = false;
-        self.supervisor.set_config(self.cfg.supervisor.clone());
-        self.sup_last_diag.clear();
-        // 指揮官が変わったら配達済み記録とフィード時刻をやり直す。
-        self.commander_seen.clear();
-        self.commander_last_feed = None;
-        self.sync_super_agent_session();
-
-        if let Some(e) = self.super_agent_err.clone() {
-            self.toast_warn(trf(
-                "⚠ スーパーエージェントを有効にできませんでした — {e}",
-                &[("e", e)],
-            ));
-        }
-    }
-
-    /// 指揮官セッション (監視役の CLI が動いているセッション) を
-    /// `set_self_session` へ反映する。
-    ///
-    /// タイトルで指名されていればそのセッション、指名が無ければ同じ CLI の
-    /// 最初のセッションを使う。毎フレーム呼ばれるので、途中で指名を変えたり
-    /// 再起動で ID が変わったりしてもここで追従する。
-    /// これを忘れると自己診断ガードが眠ったままになり、詰まった当人に
-    /// 「なぜ詰まったか」を聞きにいって期限まで返らない、という事故になる。
-    fn sync_super_agent_session(&mut self) {
-        let Some(d) = self.super_agent.clone() else {
-            self.super_agent_session = None;
+        if !rate_ok {
             return;
-        };
-        let rows: Vec<(u64, bool, String, String)> = self
+        }
+        let meta: Vec<(u64, String, &'static str)> = self
             .agents
             .sessions
             .iter()
-            .map(|s| (s.id, s.running(), s.command.clone(), s.title.clone()))
+            .filter(|s| s.id != cmd_id)
+            .map(|s| {
+                let state = self
+                    .supervisor
+                    .state_of(s.id)
+                    .map(|st| st.label())
+                    .unwrap_or("不明");
+                (s.id, s.title.clone(), state)
+            })
             .collect();
-        let id = pick_commander_session(
-            &rows,
-            &self.cfg.super_agent.session_title,
-            &self.cfg.super_agent.command,
-        );
+        let pairs: Vec<(&str, &str)> = meta.iter().map(|(_, t, st)| (t.as_str(), *st)).collect();
+        let sig = commander::feed_signature(&pairs);
+        if self.commander_feed_sig == Some(sig) {
+            return; // 変化なし — 余計なメッセージは流さない
+        }
+        // 変化があったときだけ、直近行を集めて (ここで初めて端末をロックする) 送る。
+        let others: Vec<commander::AgentStatus> = meta
+            .into_iter()
+            .map(|(id, title, state)| {
+                let last = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .and_then(|s| {
+                        s.parser
+                            .lock()
+                            .ok()
+                            .map(|p| commander::last_nonempty_line(&p.screen().contents()))
+                    })
+                    .unwrap_or_default();
+                commander::AgentStatus {
+                    title,
+                    state,
+                    last_line: supervisor::redact(&last, 120).trim().to_string(),
+                }
+            })
+            .collect();
+        if let Some(body) = commander::build_status_digest(&others) {
+            self.coordinator.enqueue(coordinator::AgentMessage::new(
+                coordinator::Endpoint::Supervisor,
+                coordinator::Endpoint::Session(cmd_id),
+                coordinator::MsgKind::Status,
+                body,
+            ));
+            // 送れたときだけ記録する。相手が居ない間 (= digest 無し) に
+            // シグネチャを覚えてしまうと、最初の 1 体が現れたときの初回
+            // ブリーフィングを取りこぼす。
+            self.commander_last_feed = Some(now);
+            self.commander_feed_sig = Some(sig);
+        }
+    }
+
+    /// 設定 (指揮官の指名) を反映し直す。起動時と設定変更時に必ず通る 1 か所。
+    ///
+    /// 指揮官は外部プロセスを持たない — 指名されたセッションの端末そのものが
+    /// 指揮官なので、ここでやるのは「LLM 診断経路を止めておく」ことと
+    /// 「指揮の作業状態のリセット」だけ。実際の対応付けは
+    /// `sync_super_agent_session` が毎フレーム行う。
+    fn apply_super_agent(&mut self) {
+        // 指揮方式: LLM 診断 (CLI の spawn) は使わない。`llm_escalation` を
+        // 常に false に固定して診断経路を止める (request_diagnosis は入口で no-op、
+        // diagnose() は呼ばれない = **CLI を spawn しない / 停止・再起動を提案しない**)。
+        // エージェントへ働きかけるのは drive_commander() の内部指揮のみ。
+        self.cfg.supervisor.llm_escalation = false;
+        self.supervisor.set_config(self.cfg.supervisor.clone());
+        self.sup_last_diag.clear();
+        // 指名が変わったので、指揮の作業状態は sync 側で必ずやり直させる。
+        self.super_agent_session = None;
+        self.commander_seen.clear();
+        self.commander_last_feed = None;
+        self.commander_feed_sig = None;
+        self.sync_super_agent_session();
+    }
+
+    /// 指名 (タイトル / コマンド) から指揮官セッションを引き直す。
+    ///
+    /// タイトルで指名されていればそのセッション、指名が無ければ同じ CLI の
+    /// 最初のセッションを使う。毎フレーム呼ばれるので、途中で指名を変えたり
+    /// 再起動で ID が変わったりしてもここで追従する。指揮官が交代した瞬間は
+    /// 前任の画面から拾った配達済み記録・フィード状態を必ず捨てる — 持ち越すと
+    /// 新しい指揮官への初回ブリーフィングが飛んだり、前任と同文の指示が
+    /// 二重配達扱いで握り潰されたりする。
+    fn sync_super_agent_session(&mut self) {
+        let sa = &self.cfg.super_agent;
+        let appointed = sa.enabled
+            && (!sa.session_title.trim().is_empty() || !sa.command.trim().is_empty());
+        let id = if appointed {
+            // 素のシェル (コマンド空) は候補から外す。状況フィードは末尾 Enter
+            // 付きで注入されるため、シェルだと本文がそのまま実行されてしまう。
+            let rows: Vec<(u64, bool, String, String)> = self
+                .agents
+                .sessions
+                .iter()
+                .filter(|s| commander_reject_reason(&s.command).is_none())
+                .map(|s| (s.id, s.running(), s.command.clone(), s.title.clone()))
+                .collect();
+            pick_commander_session(&rows, &sa.session_title, &sa.command)
+        } else {
+            None
+        };
         if id != self.super_agent_session {
             self.super_agent_session = id;
-            d.set_self_session(id);
+            self.commander_seen.clear();
+            self.commander_last_feed = None;
+            self.commander_feed_sig = None;
         }
     }
 
@@ -9853,72 +9832,44 @@ mod super_agent_tests {
         assert!(!c.supervisor.llm_escalation);
     }
 
-    /// 素のシェル (コマンド空) のプリセットは監視役にできない。
+    /// 素のシェル (コマンド空) は指揮官にできない。注入行がそのまま
+    /// シェルコマンドとして実行されてしまうため、これだけは必ず弾く。
     #[test]
-    fn 素のシェルは監視役に選べない() {
-        assert!(super_agent_reject_reason("").is_some());
-        assert!(super_agent_reject_reason("   ").is_some());
+    fn 素のシェルは指揮官に選べない() {
+        assert!(commander_reject_reason("").is_some());
+        assert!(commander_reject_reason("   ").is_some());
     }
 
-    /// DoD: カタログに無いコマンドは「対応しているか判断できない」として弾く。
-    /// 判らないものをヘッドレス扱いすると、対話 TUI が上がって期限まで返らない。
+    /// DoD: 起動しているエージェントなら **どれでも** 指揮官に選べる。
+    /// 指揮は端末内で完結するので、カタログ登録もヘッドレス対応も要らない。
+    /// カタログ外のカスタムプリセットも、ユーザーがエージェントとして
+    /// 登録したものなら候補になる。
     #[test]
-    fn カタログに無いコマンドは非対応扱い() {
-        for cmd in ["definitely-not-an-agent", "vim", "python3 -i"] {
-            let why = super_agent_reject_reason(cmd)
-                .unwrap_or_else(|| panic!("{cmd} は非対応として弾かれるべき"));
+    fn どのエージェントでも指揮官に選べる() {
+        for cmd in ["my-custom-agent", "python3 my_agent.py"] {
             assert!(
-                why.contains("既知のエージェント CLI ではない"),
-                "理由が伝わる文言であること: {why}"
+                commander_reject_reason(cmd).is_none(),
+                "{cmd} はカタログ外でも指揮官候補であるべき"
             );
         }
-    }
-
-    /// DoD: ヘッドレス実行に対応しないエージェントは選択肢から外れる。
-    ///
-    /// カタログの全 CLI について「headless が空 ⇔ 選べない」を突き合わせるので、
-    /// 将来ヘッドレス非対応の CLI が追加された瞬間から実効的な検査になる。
-    #[test]
-    fn ヘッドレス非対応のプリセットは選択肢から外れる() {
         for spec in AGENT_CATALOG {
-            let ok = super_agent_reject_reason(spec.bin).is_none();
-            assert_eq!(
-                ok,
-                !spec.headless.is_empty(),
-                "{} は headless={:?} なので選択可否は {} であるべき",
+            assert!(
+                commander_reject_reason(spec.bin).is_none(),
+                "{} は headless={:?} に関わらず指揮官候補であるべき",
                 spec.bin,
-                spec.headless,
-                !spec.headless.is_empty()
+                spec.headless
             );
-            if !ok {
-                let why = super_agent_reject_reason(spec.bin).expect("理由");
-                assert!(
-                    why.contains("ヘッドレス"),
-                    "非対応の理由はヘッドレスに触れること: {why}"
-                );
-            }
         }
     }
 
-    /// 選べると判定したコマンドは、実際に `CliDiagnostician` を組み立てられること。
-    /// UI の可否判定と実体の構築可否がずれていたら、選んだ瞬間にエラーになる。
+    /// 既定のプリセット一覧から、実際に指揮官として出せるものが 1 つ以上ある。
     #[test]
-    fn 選択可能な判定と実体の構築可否が一致する() {
-        for spec in AGENT_CATALOG {
-            let ok = super_agent_reject_reason(spec.bin).is_none();
-            let built = diagnostician::CliDiagnostician::new(spec.bin, None).is_ok();
-            assert_eq!(ok, built, "{} で UI 判定と構築可否がずれている", spec.bin);
-        }
-    }
-
-    /// 既定のプリセット一覧から、実際に監視役として出せるものが 1 つ以上ある。
-    #[test]
-    fn 既定プリセットに監視役候補が存在する() {
+    fn 既定プリセットに指揮官候補が存在する() {
         let c = Config::default();
         let picks: Vec<&str> = c
             .agents
             .iter()
-            .filter(|p| super_agent_reject_reason(&p.command).is_none())
+            .filter(|p| commander_reject_reason(&p.command).is_none())
             .map(|p| p.command.as_str())
             .collect();
         assert!(!picks.is_empty(), "既定プリセットに候補が無いのはおかしい");
@@ -9926,17 +9877,15 @@ mod super_agent_tests {
         assert!(!picks.iter().any(|c| c.trim().is_empty()));
     }
 
-    /// ピッカーで足したプリセットが、そのまま監視役の候補一覧に載ること。
-    /// 「追加はできたが監視役には選べない」という中途半端な状態を防ぐ。
+    /// ピッカーで足したプリセットが、そのまま指揮官の候補一覧に載ること。
+    /// 「追加はできたが指揮官には選べない」という中途半端な状態を防ぐ。
     #[test]
-    fn ピッカーで足したプリセットは監視役候補に載る() {
+    fn ピッカーで足したプリセットは指揮官候補に載る() {
         for spec in crate::agents::AGENT_CATALOG {
             let p = crate::agent_picker::plain_preset(spec);
-            let rejected = super_agent_reject_reason(&p.command).is_some();
-            assert_eq!(
-                rejected,
-                spec.headless.is_empty(),
-                "{}: 追加したプリセットの監視役可否がカタログと食い違う",
+            assert!(
+                commander_reject_reason(&p.command).is_none(),
+                "{}: 追加したプリセットが指揮官候補に載らない",
                 spec.bin
             );
         }
