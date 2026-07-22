@@ -1191,6 +1191,128 @@ mod tests {
         assert!(auto_yes_reply("ビルドが完了しました").is_none());
     }
 
+    // ── レート制限の検知 ──────────────────────────────────────────────
+
+    use super::detect_rate_limit;
+
+    #[test]
+    fn rate_limit_detects_known_cli_messages() {
+        // Claude Code のフッタ表記
+        let l = detect_rate_limit("some output\n5-hour limit reached ∙ resets 3am\n").unwrap();
+        assert!(l.contains("resets 3am"));
+        // 一般的な使用上限
+        assert!(detect_rate_limit("Usage limit reached. Try again later.").is_some());
+        // Codex 系
+        assert!(detect_rate_limit("You've hit your usage limit.").is_some());
+        // API エラー
+        assert!(detect_rate_limit("HTTP 429: Too Many Requests").is_some());
+        // 事前警告
+        assert!(detect_rate_limit("Approaching usage limit · 80%").is_some());
+    }
+
+    #[test]
+    fn rate_limit_ignores_normal_conversation() {
+        // 「limit」という単語や制限の話題だけでは反応しない
+        assert!(detect_rate_limit("we should limit the retries to 3").is_none());
+        assert!(detect_rate_limit("set a rate limiter on the API").is_none());
+        assert!(detect_rate_limit("普通のビルド出力です").is_none());
+    }
+
+    // ── 未読管理 (意味的ハッシュ) ────────────────────────────────────
+
+    use super::semantic_hash;
+
+    #[test]
+    fn semantic_hash_ignores_spinners_and_counters() {
+        // スピナー記号と数値カウンタの揺れだけでは変わらない
+        let a = semantic_hash("⠋ Working… 12s · 3.2k tokens\nreading files");
+        let b = semantic_hash("⠙ Working… 13s · 3.4k tokens\nreading files");
+        assert_eq!(a, b, "スピナー/カウンタの揺れで未読になってはいけない");
+        // 本当に新しい出力では変わる
+        let c = semantic_hash("⠋ Working… 12s\nreading files\ndone: wrote main.rs");
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn unread_lifecycle_via_real_pty() {
+        use super::{Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let spec = SpawnSpec {
+            title: "unread-e2e".into(),
+            preset_name: "test".into(),
+            icon: "◆".into(),
+            command: "echo UNREAD_MARKER_1; sleep 30".into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s = Session::spawn(997, spec, eframe::egui::Context::default()).expect("PTY起動");
+        assert!(!s.has_unread(), "起動直後はまだ何も出ていない");
+
+        // 出力が出る → スキャンで cur_hash が動き、未読になる
+        let mut unread = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = s.scan_attention(false);
+            if s.has_unread() {
+                unread = true;
+                break;
+            }
+        }
+        assert!(unread, "新しい出力で未読が立たなかった");
+
+        // 見た (mark_read) → 既読へ
+        s.mark_read();
+        assert!(!s.has_unread());
+
+        // 「あとで見る」ピン → mark_read では消えず、acknowledge で消える
+        s.mark_unread();
+        assert!(s.has_unread());
+        s.mark_read();
+        assert!(s.has_unread(), "ピンは表示中の既読処理では外れない");
+        s.acknowledge();
+        assert!(!s.has_unread());
+        s.kill();
+    }
+
+    #[test]
+    fn pty_log_records_output_and_survives_restart_semantics() {
+        use super::{Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("zaivern-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = dir.join("probe-1.log");
+        let spec = SpawnSpec {
+            title: "log-e2e".into(),
+            preset_name: "test".into(),
+            icon: "📜".into(),
+            command: "echo LOG_MARKER_OK".into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: Some(log.clone()),
+        };
+        let mut s = Session::spawn(996, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut ok = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("LOG_MARKER_OK") {
+                ok = true;
+                break;
+            }
+        }
+        assert!(ok, "PTY 出力がログに書かれなかった");
+        // ヘッダで起動の区切りが分かる
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("===== [Zaivern] log-e2e"));
+        s.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::{normalize_sel, selection_text, word_selection};
 
     #[test]

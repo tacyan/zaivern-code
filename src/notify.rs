@@ -185,4 +185,27 @@ mod tests {
     fn escape_powershell_single_quotes() {
         assert_eq!(escape_powershell_single_quoted("it's a 'test'"), "it''s a ''test''");
     }
+
+    // ── Webhook ──────────────────────────────────────────────────────
+
+    #[test]
+    fn json_string_escapes_specials() {
+        assert_eq!(json_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(json_string("line1\nline2"), "\"line1\\nline2\"");
+        assert_eq!(json_string("タブ\tと制御\u{1}"), "\"タブ\\tと制御\\u0001\"");
+    }
+
+    #[test]
+    fn header_strips_newlines() {
+        // ヘッダインジェクション対策: 改行は落ちる
+        assert_eq!(sanitize_header("題名\r\nX-Evil: 1"), "題名X-Evil: 1");
+    }
+
+    #[test]
+    fn webhook_rejects_non_http_urls() {
+        // URL でないもの・空は何もしない (spawn さえしない)。パニックしないことの確認。
+        webhook("", "t", "b");
+        webhook("ftp://example.com", "t", "b");
+        webhook("javascript:alert(1)", "t", "b");
+    }
 }

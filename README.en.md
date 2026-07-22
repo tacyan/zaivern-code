@@ -129,7 +129,8 @@ Everything below is the manual for each instrument on the flight deck.
 - Right-click menu: open / new / rename / delete / "Send path to agent (@path)" / copy full path
 - In-file search (⌘F, hit count, jump-to-hit centered on screen)
 - VS Code-grade scrolling: fixed gutter, scrollBeyondLastLine, PageUp/PageDown
-- Fuzzy command palette (⌘P for files, ⌘⇧P for commands)
+- Fuzzy command palette (⌘P for files, ⌘⇧P for commands, **`@` for agents, `#` for git worktrees** — one box searches files, commands, sessions, and worktrees)
+- **Drag & drop**: drop a file-tree item, or any file/image from your OS, onto an agent's terminal and `@path` lands in its input field (nothing is submitted). Drop on the editor to open a tab; drop a folder to add it to the workspace
 - Git branch display, automatic Japanese UI font fallback
 
 ### 👾 Multi-agent
@@ -140,10 +141,15 @@ Everything below is the manual for each instrument on the flight deck.
 - Permission modes (🛡 Approve / ⚡ Full-auto) auto-apply to every agent in the catalog. **You never have to write the flags in your preset** — and for Goose and Aider, which have no blanket auto-approve flag at all, the same mode is applied through environment variables instead
 - A CLI agent that isn't in the catalog still runs in parallel — just register it as a preset
 - Push permission-mode changes to running sessions via each row's 🛡 button (or "🛡 switch all")
+- **Unread markers (◆)**: a session gets a ◆ when it produced *semantically* new output since you last looked (spinner ticks and elapsed-time counters don't count). Shown on tabs, the sidebar, and Cockpit cells alike; right-click "📩 mark unread" to pin one for later
+- **Rate-limit detection (⏳)**: warnings like `usage limit reached` are detected on screen and surfaced as a badge + notification. **A rate-limited session is never assigned new tasks**; it rejoins automatically once the limit clears
+- **Account/profile switching**: put `CLAUDE_CONFIG_DIR` / `CODEX_HOME` etc. in a preset's `env` to run **the same CLI under different accounts (subscriptions) in parallel** (a leading `~/` in values expands to your home directory)
+- **📜 Persistent terminal logs**: each session's raw output is kept under `~/.zaivern/term_logs/` (4 MB rotation, newest 40 files), and the 📜 menu on the terminal panel reopens last session's log — "how far did it get last night?" survives a restart
 
 ### 🔔 Notifications + sounds
 - Approval-wait, success (✅), and failure (❌ + exit code) announced via popup + OS-native sounds (can be turned off)
 - When the window is unfocused, notifications also go to macOS Notification Center (Linux: notify-send)
+- **Webhook push for when you're out**: set `webhook_url` in `config.toml` to an [ntfy](https://ntfy.sh) topic URL or a Slack / Discord incoming webhook and approval-waits, exits, and rate limits are POSTed there. With ntfy, subscribing on your phone is all it takes — **even outside your LAN you'll know when you're needed** (the phone remote itself stays LAN-only)
 
 ### 🐾 Desktop pet "Zaigani"
 - Blinks, follows your cursor with its eyes, wanders around; dozes off when idle → deep sleep (💤), startled hop when you come back
@@ -250,6 +256,8 @@ Open several folders at once. List them as arguments — `zai frontend backend s
 List pull requests and issues, read a PR's diff, and switch branches — all through the `gh` command. **No extra auth setup**: if you've run `gh auth login`, it already works. On a machine without `gh`, the panel is disabled cleanly rather than erroring at you.
 
 A PR diff opens as a read-only tab rendered in the inline diff view, with added and removed lines colour-coded.
+
+**⚡ Start on an issue in one click.** Pick an agent from an issue's "⚡ 着手" (start) menu and Zaivern will (1) create a dedicated git worktree next to the repo (branch `wt/issue-N`, same convention as the worktrees plugin), (2) add it to the workspace, (3) launch the agent with that directory as its working dir, and (4) drop a kick-off instruction into its input field once the session has settled. **You still press Enter** — so you can edit the instruction before it runs.
 
 ### 🧭 Open in an external IDE
 Send the file you're editing to another editor **with your cursor line intact**. VS Code / Cursor / Zed / Trae / Kiro / Sublime / the JetBrains family / Xcode / Fleet / Neovide / Emacs are supported.
@@ -374,6 +382,11 @@ show_hidden_files = true
 #   "auto"  = auto-YES to everything (bypass flags added per CLI)
 #   "agent" = agent-first (use whatever flags the preset command says)
 approval_mode = "ask"
+
+# Push notifications while you're away: an ntfy topic URL or a
+# Slack / Discord incoming webhook. Approval-waits, exits, and
+# rate limits are POSTed there ("" = off)
+# webhook_url = "https://ntfy.sh/your-topic"
 
 # Desktop pet 🐾
 show_pet = true

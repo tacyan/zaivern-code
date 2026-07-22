@@ -167,3 +167,29 @@ impl Palette {
             .unwrap_or(t)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Palette;
+
+    #[test]
+    fn prefixes_route_to_modes_and_query_strips_them() {
+        let mut p = Palette::new();
+        p.input = "> save".into();
+        assert!(p.is_command_mode());
+        assert_eq!(p.query(), "save");
+
+        p.input = "@ claude".into();
+        assert!(p.is_agent_mode() && !p.is_command_mode() && !p.is_root_mode());
+        assert_eq!(p.query(), "claude");
+
+        p.input = "#issue".into();
+        assert!(p.is_root_mode());
+        assert_eq!(p.query(), "issue");
+
+        // 素の入力はファイル検索 (どのモードでもない)
+        p.input = "main.rs".into();
+        assert!(!p.is_command_mode() && !p.is_agent_mode() && !p.is_root_mode());
+        assert_eq!(p.query(), "main.rs");
+    }
+}

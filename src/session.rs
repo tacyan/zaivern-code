@@ -425,4 +425,43 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ── ターミナルログのパスと掃除 ──────────────────────────────────
+
+    #[test]
+    fn term_log_path_sanitizes_title() {
+        let p = term_log_path(Path::new("/tmp"), 7, "Claude Code #2 (全自動)/危険");
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        // パス区切りや空白は _ に置き換わり、id で一意になる
+        assert!(name.ends_with("-7.log"), "{name}");
+        assert!(!name.contains('/') && !name.contains(' '), "{name}");
+    }
+
+    #[test]
+    fn prune_term_logs_keeps_newest() {
+        use std::time::Duration;
+        let ws = crate::test_util::unique_temp_dir("zaivern-termlog-test", "prune");
+        std::fs::create_dir_all(&ws).unwrap();
+        let dir = term_log_dir(&ws);
+        std::fs::create_dir_all(&dir).unwrap();
+        // mtime 差を付けて 4 本作る
+        for i in 0..4u64 {
+            let p = dir.join(format!("t-{i}.log"));
+            std::fs::write(&p, format!("log {i}")).unwrap();
+            let t = std::time::SystemTime::now() - Duration::from_secs((4 - i) * 10);
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(t).unwrap();
+        }
+        prune_term_logs(&ws, 2);
+        let left = list_term_logs(&ws);
+        assert_eq!(left.len(), 2, "新しい 2 本だけ残る");
+        let names: Vec<String> = left
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"t-3.log".to_string()), "{names:?}");
+        assert!(names.contains(&"t-2.log".to_string()), "{names:?}");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&ws).ok();
+    }
 }

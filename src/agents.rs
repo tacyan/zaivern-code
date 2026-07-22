@@ -1230,6 +1230,23 @@ mod tests {
     }
 
     #[test]
+    fn preset_env_tilde_expands_to_home() {
+        // CLAUDE_CONFIG_DIR = "~/.claude-work" のようなプロファイル切替を
+        // 動かすため、値先頭の ~/ はホームへ展開される (env はシェルを経由しない)
+        let mut preset = HashMap::new();
+        preset.insert("CLAUDE_CONFIG_DIR".to_string(), "~/.claude-work".to_string());
+        preset.insert("PLAIN".to_string(), "no~tilde/inside".to_string());
+        let e = merged_env("claude", Approval::Ask, &preset);
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            e.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(home.join(".claude-work").to_str().unwrap())
+        );
+        // 先頭以外の ~ はそのまま
+        assert_eq!(e.get("PLAIN").map(String::as_str), Some("no~tilde/inside"));
+    }
+
+    #[test]
     fn preset_env_wins_over_auto_env() {
         let mut preset = HashMap::new();
         preset.insert("GOOSE_MODE".to_string(), "approve".to_string());

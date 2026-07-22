@@ -9183,6 +9183,21 @@ mod wiring_tests {
         assert!(!coordinator::deliverable(st));
     }
 
+    #[test]
+    fn rate_limited_session_is_stalled_for_assignment() {
+        // レート制限中は進めない: 新規タスクを振らず、メッセージも配達しない
+        let st = coordinator_state(true, false, true, Some(S::Idle));
+        assert_eq!(st, C::Stalled);
+        assert!(!coordinator::deliverable(st));
+        // 承認待ちの方が優先 (制限中でも承認には応えられる)
+        assert_eq!(
+            coordinator_state(true, true, true, Some(S::Idle)),
+            C::WaitingApproval
+        );
+        // 制限が解けたら通常判定に戻る
+        assert_eq!(coordinator_state(true, false, false, Some(S::Idle)), C::Idle);
+    }
+
     // ── 確認ゲート ──────────────────────────────────────────
 
     #[test]
