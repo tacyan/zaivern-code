@@ -72,6 +72,11 @@ pub struct Config {
 pub struct SuperAgentConfig {
     /// 監視役に使うプリセットのコマンド。空文字 = なし (LLM には相談しない)。
     pub command: String,
+    /// 指揮官に指名したセッションのタイトル (例: `Claude Code (全自動) #3`)。
+    /// 空文字 = 指名なし (旧来どおり `command` に一致する最初のセッションを使う)。
+    /// セッション ID は再起動で変わるため、再起動をまたいでも追従できる
+    /// タイトルで持つ。
+    pub session_title: String,
     /// LLM への相談を有効にするか。`command` が空ならこの値によらず相談しない。
     pub enabled: bool,
     /// 診断 1 回あたりのハード期限 (秒)。5 秒未満は診断側で 5 秒に丸められる。
@@ -82,6 +87,7 @@ impl Default for SuperAgentConfig {
     fn default() -> Self {
         Self {
             command: String::new(),
+            session_title: String::new(),
             enabled: false,
             timeout_secs: 60,
         }
@@ -296,6 +302,7 @@ struct UiState {
     /// 監視役 LLM の選択。UI から選ぶものなので、手書きの config.toml ではなく
     /// state 側に置く (config.toml をアプリが書き換えない方針に合わせる)。
     super_agent_command: Option<String>,
+    super_agent_session_title: Option<String>,
     super_agent_enabled: Option<bool>,
     super_agent_timeout_secs: Option<u64>,
 }
@@ -546,6 +553,9 @@ pub fn load(roots: &[PathBuf], with_state: bool) -> Config {
                 }
                 if let Some(v) = st.super_agent_command {
                     cfg.super_agent.command = v;
+                }
+                if let Some(v) = st.super_agent_session_title {
+                    cfg.super_agent.session_title = v;
                 }
                 if let Some(v) = st.super_agent_enabled {
                     cfg.super_agent.enabled = v;
@@ -800,6 +810,7 @@ pub fn save_state(cfg: &Config) {
         voice_command: Some(cfg.voice_command.clone()),
         voice_keyword: Some(cfg.voice_keyword.clone()),
         super_agent_command: Some(cfg.super_agent.command.clone()),
+        super_agent_session_title: Some(cfg.super_agent.session_title.clone()),
         super_agent_enabled: Some(cfg.super_agent.enabled),
         super_agent_timeout_secs: Some(cfg.super_agent.timeout_secs),
     };
@@ -1277,6 +1288,7 @@ mod tests {
             voice_command: Some("my-stt --lang {lang}".into()),
             voice_keyword: Some("送信".into()),
             super_agent_command: Some("claude".into()),
+            super_agent_session_title: Some("Claude Code (全自動) #3".into()),
             super_agent_enabled: Some(true),
             super_agent_timeout_secs: Some(45),
         };
@@ -1295,8 +1307,12 @@ mod tests {
         // エスケープが必要な制御文字も往復する
         assert_eq!(back.pet_approve_keys, Some("\r".to_string()));
         assert_eq!(back.pet_deny_keys, Some("\u{1b}".to_string()));
-        // 監視役 LLM の選択も state に残る
+        // 監視役 LLM の選択も state に残る (指名セッションのタイトル含む)
         assert_eq!(back.super_agent_command, Some("claude".to_string()));
+        assert_eq!(
+            back.super_agent_session_title,
+            Some("Claude Code (全自動) #3".to_string())
+        );
         assert_eq!(back.super_agent_enabled, Some(true));
         assert_eq!(back.super_agent_timeout_secs, Some(45));
     }
@@ -1453,6 +1469,7 @@ mod super_agent_field_tests {
             command: "   ".into(),
             enabled: true,
             timeout_secs: 30,
+            ..Default::default()
         };
         assert_eq!(c.active_command(), None);
     }
@@ -1464,6 +1481,7 @@ mod super_agent_field_tests {
             command: "claude".into(),
             enabled: false,
             timeout_secs: 30,
+            ..Default::default()
         };
         assert_eq!(c.active_command(), None);
     }
@@ -1475,6 +1493,7 @@ mod super_agent_field_tests {
             command: "  codex  ".into(),
             enabled: true,
             timeout_secs: 30,
+            ..Default::default()
         };
         assert_eq!(c.active_command(), Some("codex"));
     }

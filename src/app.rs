@@ -440,19 +440,36 @@ fn super_agent_reject_reason(command: &str) -> Option<String> {
     None
 }
 
-/// 監視役として選ばれたコマンドで動いているセッションを 1 つ選ぶ **純関数**。
+/// 指揮官セッションを 1 つ選ぶ **純関数**。`rows` は (id, running, command, title)。
 ///
-/// プリセットのコマンドは権限モードによってフラグが付け外しされるため、
-/// 文字列の完全一致では取りこぼす。カタログの実行ファイル名まで落として比べる。
+/// - `title` が指名されていれば、**タイトル一致** (trim 済みの完全一致) で動いている
+///   セッションを返す。見つからなければ `None` — 同じ CLI の別セッションへ勝手に
+///   フォールバックしない (「#3 を指名したのに #1 が指揮官になる」事故を防ぐ)。
+///   セッション ID は再起動で変わるが、タイトルは引き継がれるので追従できる。
+/// - `title` が空なら旧来どおりコマンドで選ぶ。プリセットのコマンドは権限モードに
+///   よってフラグが付け外しされるため、文字列の完全一致では取りこぼす。カタログの
+///   実行ファイル名まで落として比べる。
+///
 /// 見つからなければ `None` (= 自己診断ガードは働かせなくてよい)。
-fn pick_self_session(rows: &[(u64, bool, String)], command: &str) -> Option<u64> {
+fn pick_commander_session(
+    rows: &[(u64, bool, String, String)],
+    title: &str,
+    command: &str,
+) -> Option<u64> {
+    let want_title = title.trim();
+    if !want_title.is_empty() {
+        return rows
+            .iter()
+            .find(|(_, running, _, t)| *running && t.trim() == want_title)
+            .map(|(id, _, _, _)| *id);
+    }
     let cmd = command.trim();
     if cmd.is_empty() {
         return None;
     }
     let want = crate::agents::spec_for_command(cmd).map(|s| s.bin);
     rows.iter()
-        .find(|(_, running, c)| {
+        .find(|(_, running, c, _)| {
             if !*running {
                 return false;
             }
@@ -461,7 +478,7 @@ fn pick_self_session(rows: &[(u64, bool, String)], command: &str) -> Option<u64>
                 _ => c.trim() == cmd,
             }
         })
-        .map(|(id, _, _)| *id)
+        .map(|(id, _, _, _)| *id)
 }
 
 /// 介入をそのまま実行してよいか、確認ダイアログへ回すか。
@@ -4227,7 +4244,8 @@ impl ZaivernApp {
         let mut voice_stop = false;
         let mut orch_acts: Vec<orchestration::OrchAction> = Vec::new();
         // 監視役 LLM の変更は、借用の都合でいったんここへ退避して閉じた後に適用する。
-        let mut super_pick: Option<String> = None;
+        // 指名は (コマンド, セッションタイトル)。両方空 = なし。
+        let mut super_pick: Option<(String, String)> = None;
         let mut super_enabled: Option<bool> = None;
         let mut super_timeout: Option<u64> = None;
         let orch_rows = self.orch_rows();
@@ -4332,64 +4350,97 @@ impl ZaivernApp {
                     ui.label(
                         RichText::new(
                             "決定論的な見張り (停滞・ループ・エラー多発の検知) は、この設定に\
-                             関わらず常に動き、異常はここと通知で知らせます。ここで選んだ\
-                             エージェントを『指揮官』にすると、他のエージェントの状況が自動で\
-                             指揮官へ内部フィードされ、指揮官が `@対象: 指示` (全員へは `@all:`) と\
-                             書くと、その相手が安全になった瞬間に届きます。停止・再起動などの\
-                             破壊的な操作を自動でエージェントへ投げることはしません。選んだ\
-                             エージェントは普通の作業にもそのまま使えますし、そのセッション自身も\
-                             見張りの対象です。",
+                             関わらず常に動き、異常はここと通知で知らせます。ここでは\
+                             いま起動しているエージェントの中から名前で 1 体を『指揮官』に\
+                             指名します (作業の途中でもいつでも選び直せます)。指名すると、\
+                             他のエージェントの状況が自動で指揮官へ内部フィードされ、指揮官が\
+                             `@対象: 指示` (全員へは `@all:`) と書くと、その相手が安全になった\
+                             瞬間に届きます。停止・再起動などの破壊的な操作を自動でエージェントへ\
+                             投げることはしません。指名したエージェントは普通の作業にもそのまま\
+                             使えますし、そのセッション自身も見張りの対象です。",
                         )
                         .size(12.0)
                         .color(theme.text_dim),
                     );
                     ui.add_space(6.0);
 
-                    let cur = self.cfg.super_agent.command.trim().to_string();
+                    let cur_cmd = self.cfg.super_agent.command.trim().to_string();
+                    let cur_title = self.cfg.super_agent.session_title.trim().to_string();
                     const NONE_LABEL: &str = "なし（監視のみ・指揮しない）";
-                    let cur_label = if cur.is_empty() {
+                    let cur_label = if cur_cmd.is_empty() && cur_title.is_empty() {
                         NONE_LABEL.to_string()
+                    } else if !cur_title.is_empty() {
+                        // セッション指名中: 起動中ならアイコン付き、居なければ待機表示。
+                        self.agents
+                            .sessions
+                            .iter()
+                            .find(|s| s.title.trim() == cur_title)
+                            .map(|s| format!("{} {}", s.icon, s.title))
+                            .unwrap_or_else(|| format!("{cur_title}（未起動）"))
                     } else {
+                        // 旧形式 (コマンドのみ指定): プリセット名で表示する。
                         self.cfg
                             .agents
                             .iter()
-                            .find(|p| p.command.trim() == cur)
+                            .find(|p| p.command.trim() == cur_cmd)
                             .map(|p| format!("{} {}", p.icon, p.name))
-                            .unwrap_or_else(|| cur.clone())
+                            .unwrap_or_else(|| cur_cmd.clone())
                     };
 
                     egui::ComboBox::from_id_salt("super-agent-pick")
                         .selected_text(cur_label)
                         .width(320.0)
                         .show_ui(ui, |ui| {
-                            if ui.selectable_label(cur.is_empty(), NONE_LABEL).clicked() {
-                                super_pick = Some(String::new());
+                            if ui
+                                .selectable_label(
+                                    cur_cmd.is_empty() && cur_title.is_empty(),
+                                    NONE_LABEL,
+                                )
+                                .clicked()
+                            {
+                                super_pick = Some((String::new(), String::new()));
                             }
-                            for p in self.cfg.agents.iter() {
-                                let cmd = p.command.trim().to_string();
-                                // ヘッドレス非対応のプリセットは選ばせない。
-                                // 選べてしまうと対話 TUI が起動して期限まで返らない。
-                                match super_agent_reject_reason(&cmd) {
+                            if self.agents.sessions.is_empty() {
+                                ui.label(
+                                    RichText::new(
+                                        "起動中のエージェントがいません — \
+                                         セッションを起動するとここに並びます",
+                                    )
+                                    .size(12.0)
+                                    .color(theme.text_dim),
+                                );
+                            }
+                            // いま居るセッションを名前で並べる (途中からの指名・変更用)。
+                            for s in self.agents.sessions.iter() {
+                                let label = format!("{} {}", s.icon, s.title);
+                                // 終了済み・ヘッドレス非対応の CLI は選ばせない。
+                                // 後者を選べてしまうと対話 TUI が起動して期限まで返らない。
+                                let why = if !s.running() {
+                                    Some("終了しています (再起動すると選べます)".to_string())
+                                } else {
+                                    super_agent_reject_reason(&s.command)
+                                };
+                                match why {
                                     None => {
                                         if ui
                                             .selectable_label(
-                                                cur == cmd,
-                                                format!("{} {}", p.icon, p.name),
+                                                cur_title == s.title.trim(),
+                                                label,
                                             )
                                             .clicked()
                                         {
-                                            super_pick = Some(cmd);
+                                            super_pick = Some((
+                                                s.command.trim().to_string(),
+                                                s.title.trim().to_string(),
+                                            ));
                                         }
                                     }
                                     Some(why) => {
                                         ui.add_enabled(
                                             false,
                                             egui::Button::new(
-                                                RichText::new(format!(
-                                                    "{} {} — 選べません",
-                                                    p.icon, p.name
-                                                ))
-                                                .color(theme.text_dim),
+                                                RichText::new(format!("{label} — 選べません"))
+                                                    .color(theme.text_dim),
                                             )
                                             .frame(false),
                                         )
@@ -4428,10 +4479,12 @@ impl ZaivernApp {
                     match (&self.super_agent, &self.super_agent_err) {
                         (Some(d), _) => {
                             let (cmd, label) = d.describe();
-                            ui.label(
-                                RichText::new(format!("✅ 指揮官: {label}  (`{cmd}`)"))
-                                    .color(theme.ok),
-                            );
+                            let head = if cur_title.is_empty() {
+                                format!("✅ 指揮官: {label}  (`{cmd}`)")
+                            } else {
+                                format!("✅ 指揮官: {cur_title}  ({label})")
+                            };
+                            ui.label(RichText::new(head).color(theme.ok));
                             match d.self_session_id() {
                                 Some(id) => {
                                     ui.label(
@@ -4444,12 +4497,17 @@ impl ZaivernApp {
                                     );
                                 }
                                 None => {
-                                    ui.label(
-                                        RichText::new(
-                                            "指揮官セッションを待っています — 選んだ CLI でセッションを起動すると指揮を始めます",
+                                    let wait = if cur_title.is_empty() {
+                                        "指揮官セッションを待っています — 選んだ CLI でセッションを起動すると指揮を始めます"
+                                            .to_string()
+                                    } else {
+                                        format!(
+                                            "指揮官セッション『{cur_title}』を待っています — \
+                                             同じ名前のセッションが起動すると指揮を始めます"
                                         )
-                                        .size(12.0)
-                                        .color(theme.warn),
+                                    };
+                                    ui.label(
+                                        RichText::new(wait).size(12.0).color(theme.warn),
                                     );
                                 }
                             }
@@ -4753,11 +4811,12 @@ impl ZaivernApp {
 
         // 監視役 LLM の変更を反映する (閉じた後に適用するのが app.rs の作法)。
         let mut super_changed = false;
-        if let Some(cmd) = super_pick {
+        if let Some((cmd, title)) = super_pick {
             // 「なし」を選んだら相談自体を止める。エージェントを選んだ場合は、
             // わざわざもう 1 か所チェックを入れさせない。
             self.cfg.super_agent.enabled = !cmd.is_empty();
             self.cfg.super_agent.command = cmd;
+            self.cfg.super_agent.session_title = title;
             super_changed = true;
         }
         if let Some(en) = super_enabled {
@@ -6999,8 +7058,12 @@ impl ZaivernApp {
         }
     }
 
-    /// 監視役の CLI が動いているセッションを `set_self_session` へ反映する。
+    /// 指揮官セッション (監視役の CLI が動いているセッション) を
+    /// `set_self_session` へ反映する。
     ///
+    /// タイトルで指名されていればそのセッション、指名が無ければ同じ CLI の
+    /// 最初のセッションを使う。毎フレーム呼ばれるので、途中で指名を変えたり
+    /// 再起動で ID が変わったりしてもここで追従する。
     /// これを忘れると自己診断ガードが眠ったままになり、詰まった当人に
     /// 「なぜ詰まったか」を聞きにいって期限まで返らない、という事故になる。
     fn sync_super_agent_session(&mut self) {
@@ -7008,13 +7071,17 @@ impl ZaivernApp {
             self.super_agent_session = None;
             return;
         };
-        let rows: Vec<(u64, bool, String)> = self
+        let rows: Vec<(u64, bool, String, String)> = self
             .agents
             .sessions
             .iter()
-            .map(|s| (s.id, s.running(), s.command.clone()))
+            .map(|s| (s.id, s.running(), s.command.clone(), s.title.clone()))
             .collect();
-        let id = pick_self_session(&rows, &self.cfg.super_agent.command);
+        let id = pick_commander_session(
+            &rows,
+            &self.cfg.super_agent.session_title,
+            &self.cfg.super_agent.command,
+        );
         if id != self.super_agent_session {
             self.super_agent_session = id;
             d.set_self_session(id);
@@ -8914,58 +8981,140 @@ mod super_agent_tests {
         }
     }
 
-    // ---- 自己診断ガードのセッション対応付け ----
+    // ---- 指揮官セッションの対応付け (タイトル指名 / コマンド一致) ----
 
-    fn rows() -> Vec<(u64, bool, String)> {
+    fn rows() -> Vec<(u64, bool, String, String)> {
         vec![
-            (1, true, "codex".into()),
-            (2, true, "claude --dangerously-skip-permissions".into()),
-            (3, false, "claude".into()),
+            (1, true, "codex".into(), "Codex CLI (全自動)".into()),
+            (
+                2,
+                true,
+                "claude --dangerously-skip-permissions".into(),
+                "Claude Code (全自動)".into(),
+            ),
+            (3, false, "claude".into(), "Claude Code (全自動) #2".into()),
         ]
     }
 
-    /// DoD: 監視役の CLI で動いているセッションを正しく拾う。
-    /// 権限フラグ付きで起動されていても、同じ CLI なら自分自身と見なす。
+    /// 3 体同じ CLI が並んでいても、タイトルで指名した 1 体だけが指揮官になる。
+    /// これが「起動中のエージェントから名前で選ぶ」UI の土台。
     #[test]
-    fn 自己セッションはフラグ違いでも同じcliとして拾う() {
-        assert_eq!(pick_self_session(&rows(), "claude"), Some(2));
-        assert_eq!(pick_self_session(&rows(), "codex"), Some(1));
+    fn タイトル指名で該当セッションだけを拾う() {
+        let r: Vec<(u64, bool, String, String)> = vec![
+            (
+                1,
+                true,
+                "claude --dangerously-skip-permissions".into(),
+                "Claude Code (全自動)".into(),
+            ),
+            (
+                2,
+                true,
+                "claude --dangerously-skip-permissions".into(),
+                "Claude Code (全自動) #2".into(),
+            ),
+            (
+                3,
+                true,
+                "claude --dangerously-skip-permissions".into(),
+                "Claude Code (全自動) #3".into(),
+            ),
+        ];
+        assert_eq!(
+            pick_commander_session(
+                &r,
+                "Claude Code (全自動) #3",
+                "claude --dangerously-skip-permissions"
+            ),
+            Some(3)
+        );
     }
 
-    /// 動いていないセッションは自分自身として登録しない (もう詰まりようがない)。
+    /// DoD: 指名した相手が居なければ `None`。同じ CLI の別セッションへ勝手に
+    /// フォールバックしない (「#3 を指名したのに #1 が指揮官になる」事故を防ぐ)。
     #[test]
-    fn 終了済みセッションは自己セッションにしない() {
-        let r = vec![(3u64, false, "claude".to_string())];
-        assert_eq!(pick_self_session(&r, "claude"), None);
+    fn 指名相手が居なければフォールバックしない() {
+        let r: Vec<(u64, bool, String, String)> = vec![
+            (1, true, "claude".into(), "Claude Code (全自動)".into()),
+            (3, false, "claude".into(), "Claude Code (全自動) #3".into()),
+        ];
+        assert_eq!(
+            pick_commander_session(&r, "Claude Code (全自動) #3", "claude"),
+            None
+        );
+    }
+
+    /// DoD: 指名は再起動 (別 ID・同タイトル) をまたいで追従する。
+    /// ID で固定すると再起動のたびに指名が外れてしまう。
+    #[test]
+    fn 指名は再起動で変わったidに追従する() {
+        let title = "Claude Code (全自動) #3";
+        let a: Vec<(u64, bool, String, String)> =
+            vec![(7, true, "claude".into(), title.into())];
+        assert_eq!(pick_commander_session(&a, title, "claude"), Some(7));
+        // 再起動で ID が変わっても同じタイトルなら追従
+        let b: Vec<(u64, bool, String, String)> =
+            vec![(9, true, "claude".into(), title.into())];
+        assert_eq!(pick_commander_session(&b, title, "claude"), Some(9));
+    }
+
+    /// タイトルの前後空白は無視して照合する (state.toml の手編集にも耐える)。
+    #[test]
+    fn 指名タイトルの前後空白は無視する() {
+        let r: Vec<(u64, bool, String, String)> =
+            vec![(1, true, "claude".into(), "Claude Code (全自動)".into())];
+        assert_eq!(
+            pick_commander_session(&r, "  Claude Code (全自動)  ", "claude"),
+            Some(1)
+        );
+    }
+
+    /// DoD (旧形式): 指名が空なら、監視役の CLI で動いているセッションを正しく拾う。
+    /// 権限フラグ付きで起動されていても、同じ CLI なら自分自身と見なす。
+    #[test]
+    fn 指名なしならフラグ違いでも同じcliとして拾う() {
+        assert_eq!(pick_commander_session(&rows(), "", "claude"), Some(2));
+        assert_eq!(pick_commander_session(&rows(), "", "codex"), Some(1));
+    }
+
+    /// 動いていないセッションは指揮官として登録しない (もう詰まりようがない)。
+    #[test]
+    fn 終了済みセッションは指揮官にしない() {
+        let r = vec![(3u64, false, "claude".to_string(), "Claude Code".to_string())];
+        assert_eq!(pick_commander_session(&r, "", "claude"), None);
+        assert_eq!(pick_commander_session(&r, "Claude Code", "claude"), None);
     }
 
     /// DoD: 起動 → 停止 → 別 ID で再起動、を通して追従すること。
     /// ここが固定されたままだと、生きているセッションの診断を誤って断り続ける。
     #[test]
-    fn 自己セッションidは起動と停止をまたいで追従する() {
+    fn 指揮官セッションidは起動と停止をまたいで追従する() {
         // まだ起動していない
-        assert_eq!(pick_self_session(&[], "claude"), None);
+        assert_eq!(pick_commander_session(&[], "", "claude"), None);
         // 起動
-        let a = vec![(7u64, true, "claude".to_string())];
-        assert_eq!(pick_self_session(&a, "claude"), Some(7));
+        let a = vec![(7u64, true, "claude".to_string(), "Claude Code".to_string())];
+        assert_eq!(pick_commander_session(&a, "", "claude"), Some(7));
         // 終了
-        let b = vec![(7u64, false, "claude".to_string())];
-        assert_eq!(pick_self_session(&b, "claude"), None);
+        let b = vec![(7u64, false, "claude".to_string(), "Claude Code".to_string())];
+        assert_eq!(pick_commander_session(&b, "", "claude"), None);
         // 別 ID で再起動
-        let c = vec![(7u64, false, "claude".to_string()), (9, true, "claude".into())];
-        assert_eq!(pick_self_session(&c, "claude"), Some(9));
+        let c = vec![
+            (7u64, false, "claude".to_string(), "Claude Code".to_string()),
+            (9, true, "claude".into(), "Claude Code".into()),
+        ];
+        assert_eq!(pick_commander_session(&c, "", "claude"), Some(9));
     }
 
-    /// 監視役が未選択 (空文字) なら、どのセッションも自分自身にはならない。
+    /// 監視役が未選択 (空文字) なら、どのセッションも指揮官にはならない。
     #[test]
-    fn 監視役未選択なら自己セッションは無し() {
-        assert_eq!(pick_self_session(&rows(), ""), None);
+    fn 監視役未選択なら指揮官セッションは無し() {
+        assert_eq!(pick_commander_session(&rows(), "", ""), None);
     }
 
     /// 選んだ CLI が 1 つも動いていなければ登録しない。
     #[test]
-    fn 該当cliが居なければ自己セッションは無し() {
-        assert_eq!(pick_self_session(&rows(), "goose"), None);
+    fn 該当cliが居なければ指揮官セッションは無し() {
+        assert_eq!(pick_commander_session(&rows(), "", "goose"), None);
     }
 
     // ---- LLM の助言も同じ確認ゲートを通る ----
