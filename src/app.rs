@@ -243,6 +243,10 @@ pub struct ZaivernApp {
     /// パレットを開いている間だけ保持し、閉じると破棄する
     /// (palette_items は毎フレーム呼ばれるため、都度 git を叩かない)。
     palette_worktrees: Option<Vec<(String, PathBuf, bool)>>,
+    /// セッションが安全 (Idle) になったら入力欄へ入れる指示文
+    /// (セッションid, 積んだ時刻, 本文)。Issue 着手フローが積む。
+    /// 起動直後の信頼確認プロンプト等へ流れ込まないよう、配達を遅らせる。
+    pending_prompts: Vec<(u64, Instant, String)>,
     highlighter: Highlighter,
     cockpit: bool,
     /// Markdown/HTML ファイルをレンダリング表示するモード (Cockpit 以外で有効)
@@ -575,6 +579,7 @@ impl ZaivernApp {
             agents: AgentManager::new(),
             palette: Palette::new(),
             palette_worktrees: None,
+            pending_prompts: Vec::new(),
             highlighter: Highlighter::new(),
             cockpit: false,
             md_preview: false,
@@ -2243,6 +2248,99 @@ impl ZaivernApp {
         self.toast(format!("📂 {} を開きました", dir.display()), true);
     }
 
+    /// GitHub Issue の「⚡ 着手」ワンフロー:
+    /// worktree 作成 → ワークスペースへ追加 → エージェント起動 → 着手指示を入力欄へ。
+    ///
+    /// 置き場とブランチ名は worktrees プラグインと同じ規約
+    /// (リポジトリの隣に `<repo>-wt-<slug>`、ブランチ `wt/<slug>`)。
+    /// 指示文の投入はセッションが安全 (Idle) になるまで待つ — 起動直後に書くと
+    /// フォルダ信頼確認などの起動時プロンプトへ流れ込んで誤答になるため。
+    fn start_issue_flow(
+        &mut self,
+        root: &Path,
+        issue: &github::Issue,
+        preset_idx: usize,
+        ctx: &egui::Context,
+    ) {
+        let Some(preset) = self.cfg.agents.get(preset_idx).cloned() else {
+            return;
+        };
+        let git = |args: &[&str]| -> Result<String, String> {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+            }
+        };
+        let repo = match git(&["rev-parse", "--show-toplevel"]) {
+            Ok(p) => PathBuf::from(p),
+            Err(e) => {
+                self.toast(format!("git リポジトリではありません: {e}"), false);
+                return;
+            }
+        };
+        let name = repo
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "repo".into());
+        let slug = format!("issue-{}", issue.number);
+        let branch = format!("wt/{slug}");
+        let dir = repo
+            .parent()
+            .unwrap_or(&repo)
+            .join(format!("{name}-wt-{slug}"));
+
+        if dir.is_dir() {
+            // 既にある = 前回の着手の続き。作り直さずそのまま使う。
+            self.toast(format!("🌿 既存の worktree を再利用します: {}", dir.display()), true);
+        } else {
+            // ブランチが残っていたら -b 無しで拾い、無ければ新規に切る
+            let fresh = git(&["worktree", "add", "-b", &branch, &dir.to_string_lossy()]);
+            if let Err(e1) = fresh {
+                if let Err(e2) = git(&["worktree", "add", &dir.to_string_lossy(), &branch]) {
+                    self.toast(format!("worktree を作成できません: {e1} / {e2}"), false);
+                    return;
+                }
+            }
+            self.toast(
+                format!("🌿 worktree を作成しました: {} (ブランチ {branch})", dir.display()),
+                true,
+            );
+        }
+
+        self.add_folder_to_workspace(dir.clone(), ctx);
+
+        // worktree を作業ディレクトリにしてエージェントを起動
+        let mut p = preset;
+        p.cwd = Some(dir.to_string_lossy().into_owned());
+        let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
+        if let Err(e) = self.agents.launch(&p, &dir, approval, ctx) {
+            self.toast(e, false);
+            return;
+        }
+        let sid = match self.agents.sessions.last() {
+            Some(s) => s.id,
+            None => return,
+        };
+        let prompt = format!(
+            "GitHub Issue #{n}「{title}」に着手してください。詳細は `gh issue view {n}` で確認できます。\
+             この作業ツリー (ブランチ {branch}) はこの issue 専用です。実装が終わったらテストを通してコミットしてください。",
+            n = issue.number,
+            title = issue.title,
+        );
+        self.pending_prompts.push((sid, Instant::now(), prompt));
+        self.toast(
+            "⚡ エージェントを起動しました — 準備ができ次第、着手指示を入力欄へ入れます",
+            true,
+        );
+    }
+
     /// フォルダをワークスペースへ追加する (AddFolder ダイアログと
     /// `#` パレットの worktree 追加が共有する本体)。
     fn add_folder_to_workspace(&mut self, dir: PathBuf, ctx: &egui::Context) {
@@ -3409,6 +3507,12 @@ impl ZaivernApp {
         // GitHub パネル用 (クロージャ内で self を可変借用するため先に複製しておく)
         let mut gh_actions = panels::GithubActions::default();
         let gh_roots = self.roots.clone();
+        let gh_presets: Vec<(String, String)> = self
+            .cfg
+            .agents
+            .iter()
+            .map(|p| (p.icon.clone(), p.name.clone()))
+            .collect();
         // 有効/無効の切り替え要求 (プラグイン名, 有効か)
         let mut pl_toggle: Option<(String, bool)> = None;
         // 設定値の変更要求 (プラグイン名, キー, 値)
@@ -3923,6 +4027,7 @@ impl ZaivernApp {
                                     &theme,
                                     &mut self.github,
                                     &gh_roots,
+                                    &gh_presets,
                                     &mut gh_actions,
                                 );
                             });
@@ -3937,6 +4042,9 @@ impl ZaivernApp {
         }
         if let Some((msg, ok)) = gh_actions.toast {
             self.toast(msg, ok);
+        }
+        if let Some((root, issue, preset_idx)) = gh_actions.start_issue {
+            self.start_issue_flow(&root, &issue, preset_idx, ctx);
         }
         if let Some((msg, ok)) = git_actions.toast {
             self.toast(msg, ok);
@@ -8009,6 +8117,49 @@ impl eframe::App for ZaivernApp {
                         &format!("{title}: {line}"),
                     );
                 }
+            }
+        }
+
+        // ── Issue 着手フローの「安全になったら入力欄へ」配達 ──
+        // Idle (静かでプロンプトへ戻っている) を待って指示文を入れる。
+        // 45 秒待っても Idle にならない場合は、承認待ちでない限り入れてしまう
+        // (スピナーの誤検知等で永遠に待たないため)。2 分で諦めて知らせる。
+        if !self.pending_prompts.is_empty() {
+            let mut rest: Vec<(u64, Instant, String)> = Vec::new();
+            let mut delivered: Vec<String> = Vec::new();
+            let mut gave_up: Vec<String> = Vec::new();
+            for (sid, queued, text) in std::mem::take(&mut self.pending_prompts) {
+                let idle = matches!(
+                    self.supervisor.state_of(sid),
+                    Some(supervisor::SessionState::Idle)
+                );
+                let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == sid) else {
+                    continue; // セッションが消えた
+                };
+                if !s.running() {
+                    continue;
+                }
+                let overdue = queued.elapsed().as_secs() >= 45 && !s.attention;
+                if idle || overdue {
+                    s.write_bytes(text.as_bytes());
+                    delivered.push(s.title.clone());
+                } else if queued.elapsed().as_secs() < 120 {
+                    rest.push((sid, queued, text));
+                } else {
+                    gave_up.push(s.title.clone());
+                }
+            }
+            self.pending_prompts = rest;
+            for title in delivered {
+                self.toast(
+                    format!("📋 {title} の入力欄に着手指示を入れました — 確認して Enter"),
+                    true,
+                );
+            }
+            for title in gave_up {
+                self.toast_warn(format!(
+                    "指示文を配達できませんでした ({title}): セッションが落ち着きません"
+                ));
             }
         }
 

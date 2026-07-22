@@ -92,6 +92,9 @@ pub struct GithubActions {
     pub requests: Vec<GhRequest>,
     /// 画面に出したいメッセージ (本文, 成功なら true)。
     pub toast: Option<(String, bool)>,
+    /// 「⚡ 着手」: この Issue 用の worktree を切ってエージェントを起動する
+    /// (リポジトリのルート, Issue, プリセット index)。
+    pub start_issue: Option<(PathBuf, Issue, usize)>,
 }
 
 /// gh の結果を受けて app.rs にやってほしいこと。
@@ -167,6 +170,7 @@ pub fn github_ui(
     theme: &Theme,
     panel: &mut GithubPanel,
     roots: &[PathBuf],
+    presets: &[(String, String)],
     actions: &mut GithubActions,
 ) {
     // gh が無ければパネルごと無効。壊れた UI を出すより黙って説明する。
@@ -284,7 +288,7 @@ pub fn github_ui(
                 empty_state(ui, theme, panel.inflight > 0, "オープンな Issue はありません");
             }
             for is in &panel.issues {
-                issue_row(ui, theme, is);
+                issue_row(ui, theme, is, presets, &root, actions);
             }
         }
     }
@@ -400,8 +404,15 @@ fn pr_row(ui: &mut egui::Ui, theme: &Theme, pr: &PullRequest, busy: bool) -> boo
     hit.on_hover_text("クリックで差分をタブに開く").clicked()
 }
 
-/// Issue 1 行 (表示のみ)。
-fn issue_row(ui: &mut egui::Ui, theme: &Theme, is: &Issue) {
+/// Issue 1 行。「⚡ 着手」で worktree + エージェント起動のワンフローが始まる。
+fn issue_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    is: &Issue,
+    presets: &[(String, String)],
+    root: &Path,
+    actions: &mut GithubActions,
+) {
     egui::Frame::none()
         .inner_margin(egui::Margin::symmetric(6.0, 5.0))
         .show(ui, |ui| {
@@ -421,6 +432,29 @@ fn issue_row(ui: &mut egui::Ui, theme: &Theme, is: &Issue) {
                         egui::Label::new(RichText::new(&is.title).color(theme.text).size(12.0))
                             .selectable(false),
                     );
+                    if !presets.is_empty() {
+                        ui.menu_button(RichText::new("⚡ 着手").size(11.0), |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "worktree を切って選んだエージェントで着手します",
+                                )
+                                .size(11.0)
+                                .color(theme.text_dim),
+                            );
+                            for (i, (icon, name)) in presets.iter().enumerate() {
+                                if ui.button(format!("{icon} {name}")).clicked() {
+                                    actions.start_issue =
+                                        Some((root.to_path_buf(), is.clone(), i));
+                                    ui.close_menu();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "この Issue 専用の git worktree を作成し、\n\
+                             そこでエージェントを起動して着手指示を入力欄に入れます",
+                        );
+                    }
                 });
                 let labels = if is.labels.is_empty() {
                     String::new()
@@ -712,7 +746,7 @@ mod tests {
 
         let _ = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                github_ui(ui, &theme, &mut panel, &roots, &mut actions);
+                github_ui(ui, &theme, &mut panel, &roots, &[], &mut actions);
             });
         });
 
