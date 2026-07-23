@@ -827,12 +827,16 @@ impl AgentManager {
 
     /// 各セッションの状態変化(承認待ち・自動承認・終了)を検知して返す。毎フレーム呼んで良い。
     /// 全自動YESで起動した対応 CLI は承認プロンプトへ自動応答する。
-    pub fn poll_events(&mut self) -> Vec<SessionEvent> {
+    ///
+    /// `allow_auto_yes` が false のときは bypass 起動でも自動応答せず、
+    /// 承認待ち (NeedsApproval) として報告するだけに留める。ペットの承認
+    /// バブルが有効な間、勝手にYESを送らずユーザーのクリックを待つための栓。
+    pub fn poll_events(&mut self, allow_auto_yes: bool) -> Vec<SessionEvent> {
         use crate::terminal::Attention;
         let mut events = Vec::new();
         for s in self.sessions.iter_mut() {
             if s.running() {
-                match s.scan_attention(s.auto_yes()) {
+                match s.scan_attention(allow_auto_yes && s.auto_yes()) {
                     Some(Attention::NeedsApproval) => {
                         events.push(SessionEvent::NeedsApproval(s.title.clone()));
                     }

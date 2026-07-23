@@ -2,16 +2,25 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use eframe::egui::{self, RichText};
+use eframe::egui::{self, Key, Modifiers, RichText};
 
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use crate::theme::Theme;
+
+use egui::collapsing_header::CollapsingState;
 
 #[derive(Clone)]
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+}
+
+/// 貼り付けの種類(コピー or 切り取りによる移動)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transfer {
+    Copy,
+    Move,
 }
 
 /// What the user asked for via the tree UI this frame.
@@ -27,6 +36,10 @@ pub struct TreeActions {
     pub rename: Option<(PathBuf, PathBuf)>,
     /// 削除要求(確認ダイアログは呼び出し側が出す)
     pub delete: Option<PathBuf>,
+    /// 貼り付け (コピー元, 貼り付け先フルパス, 種類)。fs 操作は呼び出し側。
+    pub transfer: Option<(PathBuf, PathBuf, Transfer)>,
+    /// ユーザーへ知らせたい注意(貼り付け不可など)。呼び出し側がトーストで出す。
+    pub notice: Option<String>,
 }
 
 /// ツリー内インライン編集の種類。
@@ -79,6 +92,17 @@ pub fn normalize_roots(input: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf>
     out
 }
 
+/// キーボード操作用の可視行(描画順のスナップショット)。
+struct Row {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    /// dir のとき、現在展開されているか
+    open: bool,
+    /// 親ディレクトリ行(可視行として存在する場合のみ)
+    parent: Option<PathBuf>,
+}
+
 pub struct FileTree {
     /// ワークスペースのルート一覧(常に 1 件以上)。`roots[0]` が primary。
     pub roots: Vec<PathBuf>,
@@ -88,6 +112,19 @@ pub struct FileTree {
     mtimes: HashMap<PathBuf, Option<SystemTime>>,
     pub show_hidden: bool,
     edit: Option<EditState>,
+    /// 選択中(キーボードフォーカス)の行。VS Code のエクスプローラー選択に相当。
+    selected: Option<PathBuf>,
+    /// ツリーがキーボード操作の対象か(最後のクリックがツリー内だったか)。
+    focused: bool,
+    /// 内部クリップボード (パス, 切り取りか)。VS Code の filesExplorer.copy/cut。
+    clipboard: Option<(PathBuf, bool)>,
+    /// 次の描画でこの行を可視位置までスクロールする。
+    scroll_to: Option<PathBuf>,
+    /// タイプアヘッド(文字入力で行へジャンプ)のバッファと最終入力時刻。
+    type_buf: String,
+    type_at: f64,
+    /// 今フレーム、行のコンテキストメニューが開いていたか(フォーカス維持用)。
+    menu_open: bool,
 }
 
 impl FileTree {
@@ -99,6 +136,13 @@ impl FileTree {
             mtimes: HashMap::new(),
             show_hidden,
             edit: None,
+            selected: None,
+            focused: false,
+            clipboard: None,
+            scroll_to: None,
+            type_buf: String::new(),
+            type_at: 0.0,
+            menu_open: false,
         }
     }
 
@@ -107,6 +151,49 @@ impl FileTree {
         self.cache.clear();
         self.mtimes.clear();
         self.edit = None;
+        self.selected = None;
+        self.clipboard = None;
+        self.scroll_to = None;
+    }
+
+    /// エクスプローラーへキーボードフォーカスを移す (VS Code: ⌘⇧E)。
+    pub fn focus(&mut self) {
+        self.focused = true;
+    }
+
+    /// 外部(アプリ側)から選択を移す。次フレームで見える位置までスクロールする。
+    pub fn select(&mut self, p: &Path) {
+        self.selected = Some(p.to_path_buf());
+        self.scroll_to = Some(p.to_path_buf());
+    }
+
+    /// `p` 配下(自身含む)を指していた選択・クリップボードを外す(削除後の後始末)。
+    pub fn deselect_under(&mut self, p: &Path) {
+        if self.selected.as_deref().is_some_and(|s| s.starts_with(p)) {
+            self.selected = None;
+        }
+        if self.clipboard.as_ref().is_some_and(|(c, _)| c.starts_with(p)) {
+            self.clipboard = None;
+        }
+    }
+
+    /// 新規作成の対象ディレクトリ(VS Code 同様、選択中の場所を優先)。
+    pub fn new_entry_dir(&self) -> PathBuf {
+        match self.selected.as_deref() {
+            Some(p) if p.is_dir() => p.to_path_buf(),
+            Some(p) => p
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.fallback_root()),
+            None => self.fallback_root(),
+        }
+    }
+
+    fn fallback_root(&self) -> PathBuf {
+        self.roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// `p` を含むルート(最長一致)。どのルートにも属さなければ None。
@@ -204,41 +291,390 @@ impl FileTree {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, theme: &Theme, actions: &mut TreeActions) {
+        self.menu_open = false;
+        let ctx = ui.ctx().clone();
+        // 描画前に可視行のスナップショットを取り、キーボード操作を先に処理する
+        // (選択の移動・開閉が同じフレームの描画へ反映される)。
+        let rows = self.visible_rows(&ctx);
+        self.handle_keys(ui, actions, &rows);
+
         let roots = self.roots.clone();
         // 単一ルート時は従来どおりヘッダ無しで直下を描く(見た目を変えない)。
         if roots.len() <= 1 {
             let root = roots.into_iter().next().unwrap_or_else(|| PathBuf::from("."));
             self.dir_ui(ui, &root, theme, actions, 0);
+        } else {
+            for root in &roots {
+                let name = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| root.to_string_lossy().to_string());
+                let sel = self.selected.as_deref() == Some(root.as_path());
+                let st = CollapsingState::load_with_default_open(&ctx, dir_state_id(root), true);
+                let hr = st.show_header(ui, |ui| {
+                    ui.selectable_label(
+                        sel,
+                        RichText::new(format!("📚 {name}")).color(theme.text).strong(),
+                    )
+                });
+                let (_, header, _) = hr.body(|ui| self.dir_ui(ui, root, theme, actions, 0));
+                let resp = header.inner;
+                if resp.clicked() {
+                    self.select(root);
+                    self.focused = true;
+                    toggle_open(&ctx, root, true);
+                }
+                if resp.secondary_clicked() {
+                    self.select(root);
+                    self.focused = true;
+                }
+                self.maybe_scroll(&resp, root);
+                resp.context_menu(|ui| {
+                    self.menu_open = true;
+                    if menu_btn(ui, tr("➕ 新規ファイル"), "") {
+                        self.start_new_file(root.clone());
+                    }
+                    if menu_btn(ui, tr("📂 新規フォルダ"), "") {
+                        self.start_new_dir(root.clone());
+                    }
+                    ui.separator();
+                    let can_paste = self.clipboard.is_some();
+                    if menu_btn_enabled(ui, can_paste, tr("📋 貼り付け"), h("⌘V", "Ctrl+V")) {
+                        self.paste_into(root.clone(), actions);
+                    }
+                    ui.separator();
+                    if menu_btn(ui, tr("📋 フルパスをコピー"), h("⌥⌘C", "Shift+Alt+C")) {
+                        ui.ctx().copy_text(root.to_string_lossy().to_string());
+                    }
+                });
+            }
+        }
+
+        // フォーカスの出入り: ツリー(スクロール領域)内クリックで得て、外クリックで手放す。
+        // コンテキストメニューはスクロール領域の外に描かれるため、メニュー操作中は保つ。
+        if ui.input(|i| i.pointer.any_pressed()) {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                if ui.clip_rect().contains(pos) {
+                    self.focused = true;
+                } else if !self.menu_open {
+                    self.focused = false;
+                }
+            }
+        }
+        // スクロール要求はこのフレームで消化(行が見つからなくても持ち越さない)
+        self.scroll_to = None;
+    }
+
+    /// 可視行(描画順)のスナップショットを作る。開閉状態は egui 側の
+    /// CollapsingState を参照する。
+    fn visible_rows(&mut self, ctx: &egui::Context) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let roots = self.roots.clone();
+        if roots.len() <= 1 {
+            if let Some(root) = roots.first() {
+                self.collect_rows(ctx, root, None, &mut rows, 0);
+            }
+        } else {
+            for root in &roots {
+                let open = is_open(ctx, root, true);
+                rows.push(Row {
+                    path: root.clone(),
+                    name: root
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| root.to_string_lossy().to_string()),
+                    is_dir: true,
+                    open,
+                    parent: None,
+                });
+                if open {
+                    self.collect_rows(ctx, root, Some(root), &mut rows, 0);
+                }
+            }
+        }
+        rows
+    }
+
+    fn collect_rows(
+        &mut self,
+        ctx: &egui::Context,
+        dir: &Path,
+        parent: Option<&Path>,
+        rows: &mut Vec<Row>,
+        depth: usize,
+    ) {
+        if depth > 24 {
             return;
         }
-        for root in &roots {
-            let name = root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| root.to_string_lossy().to_string());
-            let cr = egui::CollapsingHeader::new(
-                RichText::new(format!("📚 {name}")).color(theme.text).strong(),
+        for e in self.entries(dir) {
+            let open = e.is_dir && is_open(ctx, &e.path, false);
+            rows.push(Row {
+                path: e.path.clone(),
+                name: e.name.clone(),
+                is_dir: e.is_dir,
+                open,
+                parent: parent.map(Path::to_path_buf),
+            });
+            if open {
+                self.collect_rows(ctx, &e.path, Some(&e.path), rows, depth + 1);
+            }
+        }
+    }
+
+    /// VS Code エクスプローラー準拠のキーボード操作。
+    /// テキスト入力等が egui フォーカスを持っている間は一切奪わない。
+    fn handle_keys(&mut self, ui: &mut egui::Ui, actions: &mut TreeActions, rows: &[Row]) {
+        if !self.focused || self.edit.is_some() {
+            return;
+        }
+        if ui.ctx().memory(|m| m.focused().is_some()) {
+            return;
+        }
+        if rows.is_empty() {
+            return;
+        }
+        let mac = cfg!(target_os = "macos");
+        let ctx = ui.ctx().clone();
+        let sel_idx = self
+            .selected
+            .as_ref()
+            .and_then(|s| rows.iter().position(|r| &r.path == s));
+        // タイプアヘッド用の文字は消費前に読む(修飾キー付きは Text にならない)
+        let (typed, now) = ui.input(|i| {
+            let t: String = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            (t, i.time)
+        });
+        let pressed = |m: Modifiers, k: Key| ui.input_mut(|i| i.consume_key(m, k));
+        let roots = self.roots.clone();
+        let is_root = move |p: &Path| roots.iter().any(|r| r == p);
+
+        // ── ナビゲーション (list.focusUp/Down/First/Last) ──
+        let mut go: Option<usize> = None;
+        if pressed(Modifiers::NONE, Key::ArrowDown) {
+            go = Some(sel_idx.map(|i| (i + 1).min(rows.len() - 1)).unwrap_or(0));
+        }
+        if pressed(Modifiers::NONE, Key::ArrowUp) {
+            go = Some(sel_idx.map(|i| i.saturating_sub(1)).unwrap_or(rows.len() - 1));
+        }
+        if pressed(Modifiers::NONE, Key::Home) {
+            go = Some(0);
+        }
+        if pressed(Modifiers::NONE, Key::End) {
+            go = Some(rows.len() - 1);
+        }
+        if let Some(i) = go {
+            self.select(&rows[i].path);
+        }
+
+        // ── ← : 折りたたみ / 親へ (list.collapse)。→ : 展開 / 最初の子へ (list.expand) ──
+        if pressed(Modifiers::NONE, Key::ArrowLeft) || (mac && pressed(Modifiers::COMMAND, Key::ArrowUp)) {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                if r.is_dir && r.open {
+                    set_open(&ctx, &r.path, false);
+                } else if let Some(p) = r.parent.clone() {
+                    self.select(&p);
+                }
+            }
+        }
+        if pressed(Modifiers::NONE, Key::ArrowRight) {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                if r.is_dir && !r.open {
+                    set_open(&ctx, &r.path, true);
+                } else if r.is_dir && r.open {
+                    let child = rows
+                        .iter()
+                        .find(|c| c.parent.as_deref() == Some(r.path.as_path()));
+                    if let Some(c) = child {
+                        let p = c.path.clone();
+                        self.select(&p);
+                    }
+                }
+            }
+        }
+        // 全折りたたみ (list.collapseAll): Ctrl+← / ⌘←
+        if pressed(Modifiers::COMMAND, Key::ArrowLeft) {
+            for r in rows.iter().filter(|r| r.is_dir && r.open) {
+                // マルチルートのルート見出しは開いたままにする(VS Code と同じ)
+                if !is_root(&r.path) {
+                    set_open(&ctx, &r.path, false);
+                }
+            }
+        }
+
+        // ── 開く/リネーム (renameFile: F2 / mac Enter, openAndPassFocus: Enter / ⌘↓) ──
+        let open_or_toggle = |r: &Row, actions: &mut TreeActions, ctx: &egui::Context| {
+            if r.is_dir {
+                toggle_open(ctx, &r.path, is_root(&r.path));
+            } else {
+                actions.open = Some(r.path.clone());
+            }
+        };
+        if pressed(Modifiers::NONE, Key::Enter) {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                if mac {
+                    // macOS: Enter は名前の変更 (ルートは対象外)
+                    if !is_root(&r.path) {
+                        self.start_rename(r.path.clone());
+                    }
+                } else {
+                    open_or_toggle(r, actions, &ctx);
+                }
+            }
+        }
+        if !mac && pressed(Modifiers::NONE, Key::F2) {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                if !is_root(&r.path) {
+                    self.start_rename(r.path.clone());
+                }
+            }
+        }
+        if mac && pressed(Modifiers::COMMAND, Key::ArrowDown) {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                open_or_toggle(r, actions, &ctx);
+            }
+        }
+        // Space: ファイルはフォーカスを保ったまま開く / フォルダは開閉 (list.toggleExpand)
+        if pressed(Modifiers::NONE, Key::Space) && self.type_buf.is_empty() {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                open_or_toggle(r, actions, &ctx);
+            }
+        }
+
+        // ── クリップボード (filesExplorer.copy/cut/paste) ──
+        if pressed(Modifiers::COMMAND, Key::C) {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                if !is_root(&r.path) {
+                    self.clipboard = Some((r.path.clone(), false));
+                }
+            }
+        }
+        if pressed(Modifiers::COMMAND, Key::X) {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                if !is_root(&r.path) {
+                    self.clipboard = Some((r.path.clone(), true));
+                }
+            }
+        }
+        if pressed(Modifiers::COMMAND, Key::V) {
+            let dest = self.paste_dest_dir(rows, sel_idx);
+            self.paste_into(dest, actions);
+        }
+        // Escape: 切り取りの取り消し (filesExplorer.cancelCut)
+        if matches!(self.clipboard, Some((_, true))) && pressed(Modifiers::NONE, Key::Escape) {
+            self.clipboard = None;
+        }
+
+        // ── パスのコピー (copyFilePath: ⌥⌘C / Shift+Alt+C,
+        //    copyRelativeFilePath mac: ⇧⌥⌘C。Windows はコード系のため menu のみ) ──
+        let copy_path = if mac {
+            pressed(Modifiers::COMMAND.plus(Modifiers::ALT), Key::C)
+        } else {
+            pressed(Modifiers::SHIFT.plus(Modifiers::ALT), Key::C)
+        };
+        if copy_path {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                ctx.copy_text(r.path.to_string_lossy().to_string());
+            }
+        }
+        if mac
+            && pressed(
+                Modifiers::COMMAND.plus(Modifiers::ALT).plus(Modifiers::SHIFT),
+                Key::C,
             )
-            .id_salt(root)
-            .default_open(true)
-            .show(ui, |ui| {
-                self.dir_ui(ui, root, theme, actions, 0);
-            });
-            cr.header_response.context_menu(|ui| {
-                if ui.button(tr("➕ 新規ファイル")).clicked() {
-                    self.start_new_file(root.clone());
-                    ui.close_menu();
+        {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                let rel = self.rel_of(&r.path);
+                ctx.copy_text(rel);
+            }
+        }
+
+        // ── 削除 (moveFileToTrash / deleteFile — アプリ側で確認ダイアログ) ──
+        let del = if mac {
+            pressed(Modifiers::COMMAND, Key::Backspace)
+                || pressed(Modifiers::COMMAND.plus(Modifiers::ALT), Key::Backspace)
+                || pressed(Modifiers::NONE, Key::Delete)
+        } else {
+            pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::SHIFT, Key::Delete)
+        };
+        if del {
+            if let Some(r) = sel_idx.map(|i| &rows[i]) {
+                if !is_root(&r.path) {
+                    actions.delete = Some(r.path.clone());
                 }
-                if ui.button(tr("📂 新規フォルダ")).clicked() {
-                    self.start_new_dir(root.clone());
-                    ui.close_menu();
+            }
+        }
+
+        // ── タイプアヘッド: 文字入力で名前が前方一致する行へジャンプ ──
+        let typed: String = typed.chars().filter(|c| !c.is_control()).collect();
+        if !typed.trim().is_empty() {
+            if now - self.type_at > 1.2 {
+                self.type_buf.clear();
+            }
+            self.type_at = now;
+            self.type_buf.push_str(&typed.to_lowercase());
+            let start = sel_idx.unwrap_or(0);
+            let hit = (0..rows.len())
+                .map(|k| (start + k) % rows.len())
+                .find(|&i| rows[i].name.to_lowercase().starts_with(&self.type_buf));
+            if let Some(i) = hit {
+                let p = rows[i].path.clone();
+                self.select(&p);
+            }
+        } else if now - self.type_at > 1.2 {
+            self.type_buf.clear();
+        }
+    }
+
+    /// キーボード貼り付けの宛先: 選択がフォルダならその中、ファイルなら親、無選択なら primary。
+    fn paste_dest_dir(&self, rows: &[Row], sel_idx: Option<usize>) -> PathBuf {
+        match sel_idx.map(|i| &rows[i]) {
+            Some(r) if r.is_dir => r.path.clone(),
+            Some(r) => r
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.fallback_root()),
+            None => self.fallback_root(),
+        }
+    }
+
+    /// クリップボードの内容を `dest_dir` へ貼り付ける(実 fs 操作は actions 経由で呼び出し側)。
+    fn paste_into(&mut self, dest_dir: PathBuf, actions: &mut TreeActions) {
+        let Some((src, cut)) = self.clipboard.clone() else {
+            return;
+        };
+        match paste_plan(&src, cut, &dest_dir) {
+            Ok(None) => {}
+            Ok(Some((dest, kind))) => {
+                actions.transfer = Some((src, dest, kind));
+                if cut {
+                    self.clipboard = None;
                 }
-                ui.separator();
-                if ui.button(tr("📋 フルパスをコピー")).clicked() {
-                    ui.ctx().copy_text(root.to_string_lossy().to_string());
-                    ui.close_menu();
-                }
-            });
+            }
+            Err(msg) => actions.notice = Some(msg),
+        }
+    }
+
+    /// そのパスを含むルートからの相対パス(どのルートにも属さなければフルパス)。
+    fn rel_of(&self, p: &Path) -> String {
+        self.root_for(p)
+            .and_then(|r| p.strip_prefix(r).ok())
+            .unwrap_or(p)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// 選択行がスクロール外に出ていたら見える位置まで運ぶ。
+    fn maybe_scroll(&self, resp: &egui::Response, path: &Path) {
+        if self.scroll_to.as_deref() == Some(path) {
+            resp.scroll_to_me(None);
         }
     }
 
@@ -301,6 +737,9 @@ impl FileTree {
                                 .map(|p| p.join(name))
                                 .unwrap_or_else(|| PathBuf::from(name));
                             if new_path != es.target {
+                                // 成否はアプリ側で判るが、成功時に選択が付いて
+                                // くるよう先に移しておく(失敗時は無害)
+                                self.selected = Some(new_path.clone());
                                 actions.rename = Some((es.target.clone(), new_path));
                             }
                         }
@@ -337,96 +776,279 @@ impl FileTree {
                 self.edit_row_ui(ui, actions);
                 continue;
             }
+            let sel = self.selected.as_deref() == Some(e.path.as_path());
+            // 切り取り待ちの項目は薄く描く(VS Code と同じ合図)
+            let cut_pending =
+                matches!(&self.clipboard, Some((p, true)) if p == &e.path);
+            let color = if cut_pending {
+                theme.text.gamma_multiply(0.5)
+            } else {
+                theme.text
+            };
             if e.is_dir {
+                let ctx = ui.ctx().clone();
+                let mut st =
+                    CollapsingState::load_with_default_open(&ctx, dir_state_id(&e.path), false);
                 // 新規作成の入力を出している間は対象フォルダを強制的に開く
-                let force_open = self.editing_new_in(&e.path).then_some(true);
-                let cr = egui::CollapsingHeader::new(
-                    RichText::new(format!("📁 {}", e.name)).color(theme.text),
-                )
-                .id_salt(&e.path)
-                .default_open(false)
-                .open(force_open)
-                .show(ui, |ui| {
-                    self.dir_ui(ui, &e.path, theme, actions, depth + 1);
+                if self.editing_new_in(&e.path) && !st.is_open() {
+                    st.set_open(true);
+                    st.store(&ctx);
+                }
+                let hr = st.show_header(ui, |ui| {
+                    ui.selectable_label(sel, RichText::new(format!("📁 {}", e.name)).color(color))
                 });
-                cr.header_response.context_menu(|ui| {
-                    if ui.button(tr("➕ 新規ファイル")).clicked() {
+                let (_, header, _) =
+                    hr.body(|ui| self.dir_ui(ui, &e.path, theme, actions, depth + 1));
+                let resp = header.inner;
+                if resp.clicked() {
+                    // VS Code: フォルダのクリックは選択 + 開閉
+                    self.select(&e.path);
+                    self.scroll_to = None; // クリック行は既に見えている
+                    self.focused = true;
+                    toggle_open(&ctx, &e.path, false);
+                }
+                if resp.secondary_clicked() {
+                    self.select(&e.path);
+                    self.scroll_to = None;
+                    self.focused = true;
+                }
+                self.maybe_scroll(&resp, &e.path);
+                resp.context_menu(|ui| {
+                    self.menu_open = true;
+                    if menu_btn(ui, tr("➕ 新規ファイル"), "") {
                         self.start_new_file(e.path.clone());
-                        ui.close_menu();
                     }
-                    if ui.button(tr("📂 新規フォルダ")).clicked() {
+                    if menu_btn(ui, tr("📂 新規フォルダ"), "") {
                         self.start_new_dir(e.path.clone());
-                        ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button(tr("✏ 名前を変更")).clicked() {
+                    self.clipboard_menu(ui, &e.path, e.path.clone(), actions);
+                    ui.separator();
+                    self.path_menu(ui, &e.path, actions);
+                    ui.separator();
+                    if menu_btn(ui, tr("✏ 名前を変更"), h("Enter", "F2")) {
                         self.start_rename(e.path.clone());
-                        ui.close_menu();
                     }
-                    if ui.button(tr("🗑 削除…")).clicked() {
+                    if menu_btn(ui, tr("🗑 削除…"), h("⌘⌫", "Delete")) {
                         actions.delete = Some(e.path.clone());
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button(tr("👾 パスをエージェントに送信")).clicked() {
-                        // マルチルート: そのパスを含むルートからの相対パスにする
-                        let rel = self
-                            .root_for(&e.path)
-                            .and_then(|r| e.path.strip_prefix(r).ok())
-                            .unwrap_or(&e.path)
-                            .to_string_lossy()
-                            .to_string();
-                        actions.send_to_agent = Some(format!("@{rel} "));
-                        ui.close_menu();
-                    }
-                    if ui.button(tr("📋 フルパスをコピー")).clicked() {
-                        ui.ctx().copy_text(e.path.to_string_lossy().to_string());
-                        ui.close_menu();
                     }
                 });
             } else {
                 let label = format!("{} {}", icon_for(&e.name), e.name);
-                let resp = ui.selectable_label(false, RichText::new(label).color(theme.text));
+                let resp = ui.selectable_label(sel, RichText::new(label).color(color));
                 // エージェントのターミナルへドラッグ&ドロップでパスを渡せる
                 // (クリック=開く はそのまま。ドラッグとクリックは egui が排他にする)
                 let resp = resp.interact(egui::Sense::click_and_drag());
                 resp.dnd_set_drag_payload(e.path.clone());
                 if resp.clicked() {
+                    self.select(&e.path);
+                    self.scroll_to = None;
+                    self.focused = true;
                     actions.open = Some(e.path.clone());
                 }
+                if resp.secondary_clicked() {
+                    self.select(&e.path);
+                    self.scroll_to = None;
+                    self.focused = true;
+                }
+                self.maybe_scroll(&resp, &e.path);
                 resp.context_menu(|ui| {
-                    if ui.button(tr("📂 エディタで開く")).clicked() {
+                    self.menu_open = true;
+                    if menu_btn(ui, tr("📂 エディタで開く"), h("⌘↓", "Enter")) {
                         actions.open = Some(e.path.clone());
-                        ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button(tr("✏ 名前を変更")).clicked() {
+                    let parent = e
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.fallback_root());
+                    self.clipboard_menu(ui, &e.path, parent, actions);
+                    ui.separator();
+                    self.path_menu(ui, &e.path, actions);
+                    ui.separator();
+                    if menu_btn(ui, tr("✏ 名前を変更"), h("Enter", "F2")) {
                         self.start_rename(e.path.clone());
-                        ui.close_menu();
                     }
-                    if ui.button(tr("🗑 削除…")).clicked() {
+                    if menu_btn(ui, tr("🗑 削除…"), h("⌘⌫", "Delete")) {
                         actions.delete = Some(e.path.clone());
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button(tr("👾 パスをエージェントに送信")).clicked() {
-                        // マルチルート: そのパスを含むルートからの相対パスにする
-                        let rel = self
-                            .root_for(&e.path)
-                            .and_then(|r| e.path.strip_prefix(r).ok())
-                            .unwrap_or(&e.path)
-                            .to_string_lossy()
-                            .to_string();
-                        actions.send_to_agent = Some(format!("@{rel} "));
-                        ui.close_menu();
-                    }
-                    if ui.button(tr("📋 フルパスをコピー")).clicked() {
-                        ui.ctx().copy_text(e.path.to_string_lossy().to_string());
-                        ui.close_menu();
                     }
                 });
             }
         }
+    }
+
+    /// 切り取り / コピー / 貼り付け のメニュー節。`paste_dir` は貼り付け先。
+    fn clipboard_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &Path,
+        paste_dir: PathBuf,
+        actions: &mut TreeActions,
+    ) {
+        if menu_btn(ui, tr("✂ 切り取り"), h("⌘X", "Ctrl+X")) {
+            self.clipboard = Some((path.to_path_buf(), true));
+            self.focused = true;
+        }
+        if menu_btn(ui, tr("📄 コピー"), h("⌘C", "Ctrl+C")) {
+            self.clipboard = Some((path.to_path_buf(), false));
+            self.focused = true;
+        }
+        let can_paste = self.clipboard.is_some();
+        if menu_btn_enabled(ui, can_paste, tr("📋 貼り付け"), h("⌘V", "Ctrl+V")) {
+            self.paste_into(paste_dir, actions);
+            self.focused = true;
+        }
+    }
+
+    /// パスのコピー / エージェント送信 のメニュー節。
+    fn path_menu(&mut self, ui: &mut egui::Ui, path: &Path, actions: &mut TreeActions) {
+        if menu_btn(ui, tr("📋 フルパスをコピー"), h("⌥⌘C", "Shift+Alt+C")) {
+            ui.ctx().copy_text(path.to_string_lossy().to_string());
+        }
+        if menu_btn(ui, tr("📋 相対パスをコピー"), h("⇧⌥⌘C", "")) {
+            let rel = self.rel_of(path);
+            ui.ctx().copy_text(rel);
+        }
+        if menu_btn(ui, tr("👾 パスをエージェントに送信"), "") {
+            let rel = self.rel_of(path);
+            actions.send_to_agent = Some(format!("@{rel} "));
+        }
+    }
+}
+
+/// メニュー項目(右端にショートカット表示付き)。クリックでメニューを閉じる。
+fn menu_btn(ui: &mut egui::Ui, label: String, hint: &str) -> bool {
+    menu_btn_enabled(ui, true, label, hint)
+}
+
+fn menu_btn_enabled(ui: &mut egui::Ui, enabled: bool, label: String, hint: &str) -> bool {
+    let mut b = egui::Button::new(label);
+    if !hint.is_empty() {
+        b = b.shortcut_text(hint);
+    }
+    let clicked = ui.add_enabled(enabled, b).clicked();
+    if clicked {
+        ui.close_menu();
+    }
+    clicked
+}
+
+/// プラットフォーム別のショートカット表示 (mac 表記 / Windows・Linux 表記)。
+fn h(mac: &'static str, win: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        mac
+    } else {
+        win
+    }
+}
+
+/// フォルダ開閉状態の egui 保存キー。Ui の入れ子に依存しない安定 Id。
+fn dir_state_id(path: &Path) -> egui::Id {
+    egui::Id::new(("zv-tree-dir", path))
+}
+
+fn is_open(ctx: &egui::Context, path: &Path, default: bool) -> bool {
+    CollapsingState::load(ctx, dir_state_id(path))
+        .map(|s| s.is_open())
+        .unwrap_or(default)
+}
+
+fn set_open(ctx: &egui::Context, path: &Path, open: bool) {
+    let mut st = CollapsingState::load_with_default_open(ctx, dir_state_id(path), open);
+    st.set_open(open);
+    st.store(ctx);
+}
+
+fn toggle_open(ctx: &egui::Context, path: &Path, default: bool) {
+    let now = is_open(ctx, path, default);
+    set_open(ctx, path, !now);
+}
+
+/// 貼り付けの実行計画。`Ok(None)` は何もしない(同じ場所への切り取り貼り付け等)。
+/// エラーはそのままユーザーへ見せるメッセージ。
+pub fn paste_plan(
+    src: &Path,
+    cut: bool,
+    dest_dir: &Path,
+) -> Result<Option<(PathBuf, Transfer)>, String> {
+    if !src.exists() {
+        return Err(tr("貼り付け元が見つかりません"));
+    }
+    let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
+        return Err(tr("貼り付け元が見つかりません"));
+    };
+    if src.is_dir() && dest_dir.starts_with(src) {
+        return Err(tr("フォルダを自身の中へは貼り付けできません"));
+    }
+    if cut {
+        if src.parent() == Some(dest_dir) {
+            return Ok(None); // 同じ場所への移動は VS Code 同様なにもしない
+        }
+        let dest = dest_dir.join(&name);
+        if dest.exists() {
+            return Err(trf("既に存在します: {path}", &[("path", name)]));
+        }
+        return Ok(Some((dest, Transfer::Move)));
+    }
+    Ok(Some((
+        next_paste_path(dest_dir, &name, src.is_dir()),
+        Transfer::Copy,
+    )))
+}
+
+/// VS Code の `explorer.incrementalNaming = "simple"` 準拠の重複回避:
+/// `file.ts` → `file copy.ts` → `file copy 2.ts` → …(フォルダは拡張子分割なし)。
+pub fn next_paste_path(dest_dir: &Path, src_name: &str, is_dir: bool) -> PathBuf {
+    let first = dest_dir.join(src_name);
+    if !first.exists() {
+        return first;
+    }
+    let (mut stem, ext) = if is_dir {
+        (src_name.to_string(), "")
+    } else {
+        match src_name.rfind('.') {
+            Some(i) if i > 0 => {
+                let (s, e) = src_name.split_at(i);
+                (s.to_string(), e)
+            }
+            _ => (src_name.to_string(), ""),
+        }
+    };
+    loop {
+        stem = bump_copy_name(&stem);
+        let cand = dest_dir.join(format!("{stem}{ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+}
+
+/// `x` → `x copy` → `x copy 2` → `x copy 3` …(VS Code の /^(.+ copy)( \d+)?$/ と同じ)。
+fn bump_copy_name(stem: &str) -> String {
+    if let Some(head) = stem.strip_suffix(" copy") {
+        return format!("{head} copy 2");
+    }
+    if let Some(idx) = stem.rfind(" copy ") {
+        let (head, tail) = stem.split_at(idx);
+        if let Ok(n) = tail[" copy ".len()..].parse::<u64>() {
+            return format!("{head} copy {}", n + 1);
+        }
+    }
+    format!("{stem} copy")
+}
+
+/// ファイルは fs::copy、フォルダは再帰コピー。
+pub fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for e in std::fs::read_dir(src)? {
+            let e = e?;
+            copy_recursively(&e.path(), &dst.join(e.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
     }
 }
 
@@ -548,6 +1170,82 @@ mod tests {
         assert!(t.refresh_if_changed(), "外部作成を検知する");
         let names: Vec<_> = t.entries(&dir).iter().map(|e| e.name.clone()).collect();
         assert_eq!(names, ["agent.rs"]);
+    }
+
+    #[test]
+    fn paste_naming_follows_vscode_simple_increment() {
+        let dir = unique_temp_dir("zaivern-tree-test", "paste-name");
+        std::fs::write(dir.join("a.txt"), "x").expect("write");
+
+        // 衝突なし → そのままの名前
+        assert_eq!(next_paste_path(&dir, "b.txt", false), dir.join("b.txt"));
+        // 1 回目の衝突 → "a copy.txt"
+        assert_eq!(next_paste_path(&dir, "a.txt", false), dir.join("a copy.txt"));
+        // "a copy.txt" が既にある → "a copy 2.txt" → "a copy 3.txt"
+        std::fs::write(dir.join("a copy.txt"), "x").expect("write");
+        assert_eq!(next_paste_path(&dir, "a.txt", false), dir.join("a copy 2.txt"));
+        std::fs::write(dir.join("a copy 2.txt"), "x").expect("write");
+        assert_eq!(next_paste_path(&dir, "a.txt", false), dir.join("a copy 3.txt"));
+        // コピー名自体を貼り付けても "copy copy" にはならない
+        assert_eq!(
+            next_paste_path(&dir, "a copy.txt", false),
+            dir.join("a copy 3.txt")
+        );
+        // フォルダはドットで分割しない
+        std::fs::create_dir(dir.join("v1.2")).expect("mkdir");
+        assert_eq!(next_paste_path(&dir, "v1.2", true), dir.join("v1.2 copy"));
+        // 隠しファイル(先頭ドット)は拡張子扱いしない
+        std::fs::write(dir.join(".env"), "x").expect("write");
+        assert_eq!(next_paste_path(&dir, ".env", false), dir.join(".env copy"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paste_plan_rules() {
+        let dir = unique_temp_dir("zaivern-tree-test", "paste-plan");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").expect("write");
+
+        // コピー: 同じフォルダへは "f copy.txt" が生える
+        let plan = paste_plan(&file, false, &dir).expect("plan");
+        assert_eq!(plan, Some((dir.join("f copy.txt"), Transfer::Copy)));
+        // 切り取り: 同じフォルダへは何もしない
+        assert_eq!(paste_plan(&file, true, &dir).expect("plan"), None);
+        // 切り取り: 別フォルダへは移動
+        assert_eq!(
+            paste_plan(&file, true, &sub).expect("plan"),
+            Some((sub.join("f.txt"), Transfer::Move))
+        );
+        // フォルダを自分の中へは貼り付けない
+        assert!(paste_plan(&dir, false, &sub).is_err());
+        // 消えたソースはエラー
+        assert!(paste_plan(&dir.join("gone.txt"), false, &sub).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copy_recursively_copies_nested_tree() {
+        let dir = unique_temp_dir("zaivern-tree-test", "copy-rec");
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("nest")).expect("mkdir");
+        std::fs::write(src.join("a.txt"), "A").expect("write");
+        std::fs::write(src.join("nest").join("b.txt"), "B").expect("write");
+
+        let dst = dir.join("dst");
+        copy_recursively(&src, &dst).expect("copy");
+        assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "A");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("nest").join("b.txt")).unwrap(),
+            "B"
+        );
+        // 元は残る
+        assert!(src.join("a.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
