@@ -3035,6 +3035,18 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::ToggleSidebar)) {
             cmds.push(Cmd::ToggleSidebar);
         }
+        // VS Code: ⌘⇧E / Ctrl+Shift+E = エクスプローラーを表示してフォーカス
+        if consume(ctx, self.keys.get(BindAction::FocusExplorer)) {
+            self.sidebar_open = true;
+            self.sidebar_tab = SidebarTab::Files;
+            // エディタ等が持つキーボードフォーカスを外し、ツリーへ渡す
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+            self.tree.focus();
+        }
         if consume(ctx, self.keys.get(BindAction::Find)) {
             cmds.push(Cmd::OpenFind);
         }
@@ -4385,10 +4397,11 @@ impl ZaivernApp {
             self.send_to_agent(t);
         }
         if nf_root {
-            self.tree.start_new_file(self.primary_root().to_path_buf());
+            // VS Code 同様、ツリーの選択位置(フォルダ/ファイルの親)へ作る
+            self.tree.start_new_file(self.tree.new_entry_dir());
         }
         if nd_root {
-            self.tree.start_new_dir(self.primary_root().to_path_buf());
+            self.tree.start_new_dir(self.tree.new_entry_dir());
         }
         if let Some(p) = actions.create_file {
             let res = std::fs::OpenOptions::new()
@@ -4399,6 +4412,7 @@ impl ZaivernApp {
             match res {
                 Ok(()) => {
                     self.tree.invalidate();
+                    self.tree.select(&p);
                     self.open_path(&p);
                     self.toast(
                         trf("➕ {path} を作成しました", &[("path", self.rel_label(&p))]),
@@ -4418,6 +4432,7 @@ impl ZaivernApp {
                 match std::fs::create_dir(&p) {
                     Ok(()) => {
                         self.tree.invalidate();
+                        self.tree.select(&p);
                         self.toast(
                             trf("📂 {path} を作成しました", &[("path", self.rel_label(&p))]),
                             true,
@@ -4441,6 +4456,7 @@ impl ZaivernApp {
                     Ok(()) => {
                         self.retarget_buffers(&from, &to);
                         self.tree.invalidate();
+                        self.tree.select(&to);
                         self.persist_session();
                         self.toast(
                             trf("✏ {path} に変更しました", &[("path", self.rel_label(&to))]),
@@ -4453,6 +4469,39 @@ impl ZaivernApp {
                     ),
                 }
             }
+        }
+        // 貼り付け (⌘C/⌘X → ⌘V): コピーは再帰コピー、切り取りは移動
+        if let Some((src, dest, kind)) = actions.transfer {
+            let res = match kind {
+                file_tree::Transfer::Move => std::fs::rename(&src, &dest),
+                file_tree::Transfer::Copy => file_tree::copy_recursively(&src, &dest),
+            };
+            match res {
+                Ok(()) => {
+                    if kind == file_tree::Transfer::Move {
+                        self.retarget_buffers(&src, &dest);
+                        self.persist_session();
+                    }
+                    self.tree.invalidate();
+                    self.tree.select(&dest);
+                    let msg = match kind {
+                        file_tree::Transfer::Move => {
+                            trf("➡ {path} へ移動しました", &[("path", self.rel_label(&dest))])
+                        }
+                        file_tree::Transfer::Copy => {
+                            trf("📋 {path} に貼り付けました", &[("path", self.rel_label(&dest))])
+                        }
+                    };
+                    self.toast(msg, true);
+                }
+                Err(e) => self.toast(
+                    trf("貼り付けできません: {e}", &[("e", e.to_string())]),
+                    false,
+                ),
+            }
+        }
+        if let Some(msg) = actions.notice {
+            self.toast_warn(msg);
         }
         if let Some(p) = actions.delete {
             self.pending_delete = Some(p);
@@ -6737,6 +6786,7 @@ impl ZaivernApp {
                             self.editor.close(i);
                         }
                         self.tree.invalidate();
+                        self.tree.deselect_under(&path);
                         self.persist_session();
                         self.toast(
                             trf("🗑 {name} を削除しました", &[("name", name.clone())]),

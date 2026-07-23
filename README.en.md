@@ -358,11 +358,33 @@ The same code builds on macOS / Windows / Linux (Linux needs rfd dependencies su
 | PageUp / PageDown | Cursor + scroll by one screen |
 | Enter | Auto-indent (previous line's indent, extra level after `{ ( [ :`) |
 | ⌘B | Toggle sidebar |
+| ⌘⇧E | Show and focus the Explorer (file tree) |
 | ⌘+ / ⌘- | Font size up / down |
+
+### File tree (same defaults as VS Code's Explorer)
+
+Click a row (or use the keys) to select it first. Bindings follow VS Code's per-platform defaults.
+
+| Action | macOS | Windows / Linux |
+|---|---|---|
+| Rename | Enter | F2 |
+| Open in editor | ⌘↓ | Enter |
+| Open keeping focus / toggle folder | Space | Space |
+| Copy / Cut / Paste | ⌘C / ⌘X / ⌘V | Ctrl+C / Ctrl+X / Ctrl+V |
+| Cancel cut | Esc | Esc |
+| Delete (with confirm dialog) | ⌘⌫ (also ⌥⌘⌫) | Delete (also Shift+Delete) |
+| Copy full path | ⌥⌘C | Shift+Alt+C |
+| Copy relative path | ⇧⌥⌘C | (context menu) |
+| Move up/down / first/last | ↑↓ / Home・End | ↑↓ / Home・End |
+| Collapse & to parent / expand & to first child | ← / → | ← / → |
+| Collapse all | ⌘← | Ctrl+← |
+| Type-ahead (jump by name) | just type | just type |
+
+Pasting onto an existing name auto-renames the VS Code way: `file copy.ts` → `file copy 2.ts` → … Items pending cut are shown dimmed.
 
 On Windows / Linux, read ⌘ as Ctrl. Inside the terminal, control keys like Ctrl+C, arrows, Tab, and Esc go straight to the PTY (Shift/Option+Enter is sent as a newline, supporting Claude Code's multi-line input).
 
-Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `close_tab` `new_file` `palette_files` `palette_commands` `toggle_terminal` `toggle_sidebar` `find` `toggle_cockpit` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`).
+Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `close_tab` `new_file` `palette_files` `palette_commands` `toggle_terminal` `toggle_sidebar` `find` `toggle_cockpit` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
 
 ---
 

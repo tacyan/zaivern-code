@@ -29,10 +29,12 @@ pub enum BindAction {
     DuplicateLine,
     MoveLineUp,
     MoveLineDown,
+    /// エクスプローラー(ファイルツリー)へフォーカス (VS Code: ⌘⇧E / Ctrl+Shift+E)
+    FocusExplorer,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 18] = [
+const ALL_ACTIONS: [BindAction; 19] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -51,6 +53,7 @@ const ALL_ACTIONS: [BindAction; 18] = [
     BindAction::DuplicateLine,
     BindAction::MoveLineUp,
     BindAction::MoveLineDown,
+    BindAction::FocusExplorer,
 ];
 
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
@@ -77,6 +80,7 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::DuplicateLine => KeyboardShortcut::new(cmd_shift, Key::D),
         BindAction::MoveLineUp => KeyboardShortcut::new(alt, Key::ArrowUp),
         BindAction::MoveLineDown => KeyboardShortcut::new(alt, Key::ArrowDown),
+        BindAction::FocusExplorer => KeyboardShortcut::new(cmd_shift, Key::E),
     }
 }
 
@@ -132,6 +136,7 @@ impl Keybinds {
             "duplicate_line" => DuplicateLine,
             "move_line_up" => MoveLineUp,
             "move_line_down" => MoveLineDown,
+            "focus_explorer" => FocusExplorer,
             _ => return None,
         })
     }
