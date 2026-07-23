@@ -9,6 +9,10 @@ use syntect::util::LinesWithEndings;
 /// Files larger than this are laid out without highlighting to stay snappy.
 const MAX_HIGHLIGHT_BYTES: usize = 400_000;
 
+/// Single lines longer than this (e.g. minified JS) are laid out without
+/// highlighting so one huge line cannot freeze the UI.
+const MAX_HIGHLIGHT_LINE_BYTES: usize = 8_192;
+
 pub struct Highlighter {
     ps: SyntaxSet,
     ts: ThemeSet,
@@ -94,6 +98,18 @@ impl Highlighter {
 
         let mut h = HighlightLines::new(syntax, theme);
         for line in LinesWithEndings::from(text) {
+            if line.len() > MAX_HIGHLIGHT_LINE_BYTES {
+                job.append(
+                    line,
+                    0.0,
+                    TextFormat {
+                        font_id: font.clone(),
+                        color: fallback,
+                        ..Default::default()
+                    },
+                );
+                continue;
+            }
             match h.highlight_line(line, &self.ps) {
                 Ok(regions) => {
                     for (style, piece) in regions {
@@ -113,6 +129,9 @@ impl Highlighter {
                     }
                 }
                 Err(_) => {
+                    // エラー後の HighlightLines は内部状態が壊れている可能性が
+                    // あるので、以降の行のために作り直す。
+                    h = HighlightLines::new(syntax, theme);
                     job.append(
                         line,
                         0.0,
@@ -490,6 +509,23 @@ mod tests {
         let job = job_of(&text, "Rust");
         assert_eq!(job.sections.len(), 1, "large files must be laid out in one plain span");
         assert_eq!(job.sections[0].format.color, fallback());
+    }
+
+    #[test]
+    fn oversized_single_line_is_passed_through_without_highlighting() {
+        // minify された JS のような 1 行だけ巨大なテキストでも、その行は
+        // 素通し (フォールバック色) にして残りの行はハイライトを続ける。
+        let long_line = format!("let s = \"{}\";\n", "x".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1));
+        let text = format!("fn main() {{}}\n{long_line}// tail\n");
+        let job = job_of(&text, "Rust");
+        assert_spans_ok(&job, &text);
+
+        // 巨大行はフォールバック色で 1 スパンとして追加される
+        let long_start = text.find("let s").expect("long line present");
+        assert_eq!(color_at(&job, long_start), fallback());
+        // 前後の行は通常どおりハイライトされる
+        assert_ne!(color_of(&job, "fn"), fallback());
+        assert_ne!(color_of(&job, "// tail"), fallback());
     }
 
     #[test]

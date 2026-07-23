@@ -117,3 +117,11 @@
 # ── Issue からの着手メニュー ─────────────────────────────────────────────
 "⚡ 着手" = "⚡ Start work"
 "worktree を切って選んだエージェントで着手します" = "Creates a worktree and starts the chosen agent on it"
+
+# ── ファイルツリー VS Code 風キーバインド (2026-07-24) ─────────────────
+"✂ 切り取り" = "✂ Cut"
+"📄 コピー" = "📄 Copy"
+"📋 貼り付け" = "📋 Paste"
+"📋 相対パスをコピー" = "📋 Copy Relative Path"
+"貼り付け元が見つかりません" = "The source to paste no longer exists"
+"フォルダを自身の中へは貼り付けできません" = "Cannot paste a folder into itself"

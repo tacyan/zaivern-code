@@ -15,6 +15,12 @@ pub fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+/// キャッシュキー合成用。XOR と違い非可換なので、値の入れ替わりで
+/// 同じキーに衝突しない (FNV 風の乗算 + 加算)。
+pub fn combine_hash(acc: u64, v: u64) -> u64 {
+    acc.wrapping_mul(0x100000001b3).wrapping_add(v)
+}
+
 /// ディスク上の最終更新時刻(外部変更検知用)。
 pub fn disk_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
@@ -307,6 +313,24 @@ mod tests {
         let mut ed = Editor::new();
         assert_eq!(ed.open(&path, &hl), Ok(false));
         (ed, path, hl)
+    }
+
+    #[test]
+    fn combine_hash_is_order_sensitive() {
+        // XOR と違い、値が入れ替わっただけの組はキャッシュキーが衝突しない
+        let samples = [
+            (hash_str("rust"), hash_str("python")),
+            (hash_str("theme-a"), hash_str("theme-b")),
+            (1u64, 2u64),
+            (0u64, u64::MAX),
+        ];
+        for (a, b) in samples {
+            assert_ne!(
+                combine_hash(a, b),
+                combine_hash(b, a),
+                "combine_hash({a:#x}, {b:#x}) must depend on argument order"
+            );
+        }
     }
 
     #[test]

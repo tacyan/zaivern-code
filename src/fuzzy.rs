@@ -1,4 +1,6 @@
 /// Simple fuzzy subsequence scoring: higher is better, None means no match.
+/// 貪欲な一回走査ではなく、DP で最良の割り付け (連続・境界ボーナスの合計が
+/// 最大になるマッチ位置の組) を選ぶ。O(query長 × target長)。
 pub fn score(query: &str, target: &str) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
@@ -9,42 +11,55 @@ pub fn score(query: &str, target: &str) -> Option<i32> {
         return None;
     }
 
-    let mut qi = 0usize;
-    let mut score = 0i32;
-    let mut streak = 0i32;
-    let mut last_match = -10i32;
-
-    for (ti, &c) in t.iter().enumerate() {
-        if qi >= q.len() {
-            break;
+    // 大半の候補は不一致なので、まず O(len) の部分列チェックで足切りする
+    {
+        let mut qi = 0usize;
+        for &c in &t {
+            if qi < q.len() && c == q[qi] {
+                qi += 1;
+            }
         }
-        if c == q[qi] {
-            let ti = ti as i32;
-            score += 10;
-            if ti == last_match + 1 {
-                streak += 1;
-                score += 15 * streak.min(4);
-            } else {
-                streak = 0;
-            }
-            if ti == 0 {
-                score += 25;
-            } else {
-                let prev = t[(ti - 1) as usize];
-                if matches!(prev, '/' | '\\' | '_' | '-' | '.' | ' ') {
-                    score += 20;
-                }
-            }
-            last_match = ti;
-            qi += 1;
+        if qi < q.len() {
+            return None;
         }
     }
 
-    if qi == q.len() {
-        Some(score - (t.len() as i32) / 4)
-    } else {
-        None
+    // 状態 s: 0 = 直前の t 位置でマッチしていない (連続ボーナスなし)、
+    //         k (1..=5) = 直前位置でマッチ済みで streak = k-1 (4 で頭打ち)。
+    // next[qi][s] = t[ti..] に q[qi..] を割り付けたときの最高スコア。
+    let mut next = vec![[None::<i32>; 6]; q.len() + 1];
+    next[q.len()] = [Some(0); 6];
+    let mut cur = next.clone();
+
+    for ti in (0..t.len()).rev() {
+        for qi in (0..q.len()).rev() {
+            for s in 0..6usize {
+                let skip = next[qi][0];
+                let matched = if t[ti] == q[qi] {
+                    let (streak_bonus, s2) = if s == 0 {
+                        (0, 1)
+                    } else {
+                        let streak = s.min(4);
+                        (15 * streak as i32, streak + 1)
+                    };
+                    let pos_bonus = if ti == 0 {
+                        25
+                    } else if matches!(t[ti - 1], '/' | '\\' | '_' | '-' | '.' | ' ') {
+                        20
+                    } else {
+                        0
+                    };
+                    next[qi + 1][s2].map(|r| r + 10 + streak_bonus + pos_bonus)
+                } else {
+                    None
+                };
+                cur[qi][s] = skip.max(matched);
+            }
+        }
+        std::mem::swap(&mut cur, &mut next);
     }
+
+    next[0][0].map(|best| best - (t.len() as i32) / 4)
 }
 
 #[cfg(test)]
@@ -298,18 +313,37 @@ mod tests {
         assert_eq!(score("abd", "abc"), None);
     }
 
-    // ---- 現在の挙動の記録: 貪欲マッチは最良の並びを選ばない ----
+    // ---- 最良割り付け: 貪欲マッチが取り逃がしていた並びを選べる ----
 
     #[test]
-    fn greedy_matching_can_pick_a_worse_alignment() {
-        // "xbyybc": 貪欲に先頭側の 'b' を消費するため、末尾の "bc" という
-        // 連続一致を取り逃がす。同じ長さでダミーの 'b' が無い "xxxxbc" のほうが
-        // 高スコアになる (現在の実装の既知の限界)。
+    fn decoy_char_does_not_lose_the_consecutive_bonus() {
         let with_decoy = score("bc", "xbyybc").expect("should match");
         let without_decoy = score("bc", "xxxxbc").expect("should match");
+        assert_eq!(with_decoy, without_decoy);
+    }
+
+    #[test]
+    fn contiguous_alignment_beats_greedy_split() {
+        // "abc_ac" は先頭の飛び飛び (a@0, c@2) と末尾の連続 "ac" の 2 通り。
+        // 貪欲実装は前者しか見ず "abcxac" と同点にしていたが、
+        // 境界直後の連続一致のほうが高スコアになるべき。
+        let contiguous = score("ac", "abc_ac").expect("should match");
+        let split_only = score("ac", "abcxac").expect("should match");
         assert!(
-            with_decoy < without_decoy,
-            "greedy alignment loses the consecutive bonus ({with_decoy} vs {without_decoy})"
+            contiguous > split_only,
+            "contiguous ({contiguous}) should beat greedy split ({split_only})"
+        );
+    }
+
+    #[test]
+    fn hidden_boundary_match_outranks_plain_match() {
+        // 貪欲実装は "xbyy_bc" の先頭 'b' を消費して 末尾の "_bc" を見落とし、
+        // "xxxxbc" より低く順位付けしていた。正しくは逆。
+        let boundary_run = score("bc", "xbyy_bc").expect("should match");
+        let plain_run = score("bc", "xxxxbc").expect("should match");
+        assert!(
+            boundary_run > plain_run,
+            "boundary run ({boundary_run}) should outrank plain run ({plain_run})"
         );
     }
 }
