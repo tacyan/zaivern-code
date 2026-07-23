@@ -1,20 +1,19 @@
 //! 指名スーパーエージェント(指揮官)の純ロジック。
 //!
-//! 選んだ 1 つの CLI エージェントを「指揮官」にして、他のエージェントを内部で
-//! 指揮させるための、UI にもセッションにも依存しない純関数だけを置く。
+//! 選んだ 1 つの CLI エージェントを「指揮官」にするための、UI にもセッションにも
+//! 依存しない純関数だけを置く。
 //!
 //! - [`parse_directives`] — 指揮官の画面出力から `@対象: 指示` を拾う。
-//! - [`build_status_digest`] — 他エージェントの状況を 1 段落へまとめる
-//!   (指揮官の端末へ内部フィードする本文)。
-//! - [`feed_signature`] — 状況フィードの「変化」を見分けるシグネチャ。
-//!   前回送信時と同じなら送らない (余計なメッセージを流さない) ための鍵。
-//! - [`title_matches`] / [`last_nonempty_line`] — 配線側の小道具。
+//! - [`title_matches`] — 配線側の小道具(宛先タイトルの照合)。
 //!
 //! ## 方針
-//! - **破壊的操作は一切扱わない**。ここが返すのは「どの相手へどんな本文を流すか」
-//!   だけで、停止・再起動は表現できない。実際の配達は coordinator が安全な瞬間に行う。
+//! - **セッションの入力欄へは何も書かない**。拾った指示はユーザー宛の通知に
+//!   なるだけで、実際に他エージェントへ流すかはユーザーが決める。
+//!   (以前は指示の配達と状況フィードを各端末へ自動注入していたが、ユーザーが
+//!   入力中の欄に勝手に文字が流れ込むため廃止した。)
+//! - **破壊的操作は一切扱わない**。停止・再起動は表現できない。
 //! - 判断(指揮の中身)は選んだエージェント自身が端末内で行う。外部の subagent へは
-//!   投げない。この関数群はその出力を右から左へ流すだけ。
+//!   投げない。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -35,16 +34,6 @@ pub struct Directive {
     pub body: String,
     /// 同じ指示の二重配達を防ぐための決定論ハッシュ。
     pub hash: u64,
-}
-
-/// 状況フィード 1 体分。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentStatus {
-    pub title: String,
-    /// 監督レイヤの状態ラベル(「作業中」など)。
-    pub state: &'static str,
-    /// 秘匿化済みの直近 1 行(空でも可)。
-    pub last_line: String,
 }
 
 /// 全員宛と解釈するキーワードか。
@@ -116,55 +105,6 @@ pub fn parse_directives(screen: &str, inject_prefix: &str) -> Vec<Directive> {
     out
 }
 
-/// 他エージェントの状況を 1 段落にまとめる(指揮官へ内部フィードする本文)。
-/// 相手がいなければ `None`。
-///
-/// 末尾に「指示の書き方」を添えて、ふつうの CLI エージェントが指揮官として
-/// 振る舞えるようにする(= これが端末に入る唯一の“プロンプト”。内部で完結)。
-pub fn build_status_digest(others: &[AgentStatus]) -> Option<String> {
-    if others.is_empty() {
-        return None;
-    }
-    let parts: Vec<String> = others
-        .iter()
-        .map(|a| {
-            let tail = a.last_line.trim();
-            if tail.is_empty() {
-                format!("{}={}", a.title, a.state)
-            } else {
-                format!("{}={}「{}」", a.title, a.state, tail)
-            }
-        })
-        .collect();
-    Some(format!(
-        "他エージェントの状況 — {}。\
-         指揮するときは 1 行で「@対象: 内容」と書けば、その相手が安全になった瞬間に届きます\
-         (全員へは @all:)。停止・再起動はできません。指示は非破壊の内容だけにしてください。\
-         この状況は変化があったときだけ届きます (定期便はありません)。",
-        parts.join(" / ")
-    ))
-}
-
-/// 状況フィードの「変化」を見分ける決定論シグネチャ。`pairs` は (タイトル, 状態)。
-///
-/// - **直近行は含めない**。作業中のエージェントの画面末尾は毎フレーム揺れるので、
-///   含めると「常に変化あり」になってフィードが止まらなくなる。
-/// - 並び順に依存しない (セッション一覧の並び替えだけでは変化と見なさない)。
-///   同じ (タイトル, 状態) が複数あっても打ち消し合わないよう、XOR ではなく
-///   ソートしてから順に混ぜる。
-pub fn feed_signature(pairs: &[(&str, &str)]) -> u64 {
-    let mut keys: Vec<String> = pairs
-        .iter()
-        .map(|(title, state)| format!("{title}\u{0}{state}"))
-        .collect();
-    keys.sort();
-    let mut h = DefaultHasher::new();
-    for k in &keys {
-        k.hash(&mut h);
-    }
-    h.finish()
-}
-
 /// 指示の宛先タイトルが、あるセッションのタイトルに一致するとみなせるか。
 /// 大文字小文字を無視した部分一致(短い呼び名でも当たるように)。
 pub fn title_matches(title: &str, query: &str) -> bool {
@@ -172,17 +112,6 @@ pub fn title_matches(title: &str, query: &str) -> bool {
     let q = query.to_lowercase();
     let q = q.trim();
     !q.is_empty() && (t == q || t.contains(q))
-}
-
-/// 画面テキストの末尾から数えて最初の非空行(trim 済み)。無ければ空文字。
-pub fn last_nonempty_line(screen: &str) -> String {
-    screen
-        .lines()
-        .rev()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .to_string()
 }
 
 #[cfg(test)]
@@ -234,46 +163,8 @@ mod tests {
     }
 
     #[test]
-    fn digest_empty_is_none_and_nonempty_has_protocol() {
-        assert!(build_status_digest(&[]).is_none());
-        let s = build_status_digest(&[AgentStatus {
-            title: "codex-1".into(),
-            state: "停滞",
-            last_line: "waiting…".into(),
-        }])
-        .unwrap();
-        assert!(s.contains("codex-1=停滞"));
-        assert!(s.contains("@対象: 内容"));
-        assert!(s.contains("停止・再起動はできません"));
-    }
-
-    #[test]
-    fn feed_signature_ignores_order_and_last_line() {
-        // 並び替えだけでは変化と見なさない
-        let a = feed_signature(&[("a", "作業中"), ("b", "停滞")]);
-        let b = feed_signature(&[("b", "停滞"), ("a", "作業中")]);
-        assert_eq!(a, b);
-        // 状態が変わればシグネチャも変わる
-        let c = feed_signature(&[("a", "停滞"), ("b", "停滞")]);
-        assert_ne!(a, c);
-        // (feed_signature は直近行を受け取らない = 画面末尾の揺れでは変化しない)
-    }
-
-    #[test]
-    fn feed_signature_duplicates_do_not_cancel() {
-        // 同名同状態の 2 体が「空」と同じシグネチャに潰れてはいけない
-        let two = feed_signature(&[("x", "作業中"), ("x", "作業中")]);
-        let none = feed_signature(&[]);
-        let one = feed_signature(&[("x", "作業中")]);
-        assert_ne!(two, none);
-        assert_ne!(two, one);
-    }
-
-    #[test]
-    fn title_match_and_last_line() {
+    fn title_match() {
         assert!(title_matches("Claude — main", "claude"));
         assert!(!title_matches("Claude", "codex"));
-        assert_eq!(last_nonempty_line("a\nb\n   \n\n"), "b");
-        assert_eq!(last_nonempty_line("   \n"), "");
     }
 }

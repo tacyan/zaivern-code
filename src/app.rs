@@ -404,18 +404,10 @@ pub struct ZaivernApp {
     /// 同じ異常で毎ティック CLI を叩かないための歯止め。
     sup_last_diag: HashMap<u64, supervisor::Anomaly>,
 
-    // ── 指揮 (スーパーエージェントが他エージェントを内部で指揮) ────────
-    /// 指揮官の出力から配達済みの指示ハッシュ (二重配達を防ぐ。有界)。
+    // ── 指揮 (スーパーエージェントの指示をユーザーへ届ける) ────────
+    /// 指揮官の出力から通知済みの指示ハッシュ (二重通知を防ぐ。有界)。
     /// 指揮官セッションは `super_agent_session` を使う。
     commander_seen: HashSet<u64>,
-
-    /// 指揮官へ状況フィードを流した最後の時刻。`super_agent.timeout_secs` を
-    /// 「最短間隔」として使う (それより短い間隔では送らない)。
-    commander_last_feed: Option<Instant>,
-
-    /// 最後に指揮官へ送った状況フィードのシグネチャ (タイトル+状態)。
-    /// 同じシグネチャの間は送らない = **変化があったときだけ**内部フィードする。
-    commander_feed_sig: Option<u64>,
 
     /// エージェントのタブをクリックして選び直したとき、次にアクティブ端末を
     /// 描くフレームでキーボードフォーカスを移すための予約フラグ。
@@ -425,15 +417,15 @@ pub struct ZaivernApp {
 
 /// 指揮官に選べないセッションの理由。選べるなら `None`。
 ///
-/// 指揮はそのセッションの端末内で完結する (ヘッドレス起動も外部 subagent も
-/// 使わない) ので、CLI の種類やヘッドレス対応は問わない — **起動しているどの
-/// エージェントでも指揮官にできる**。唯一の例外が素のシェル: 状況フィードは
-/// 末尾 Enter 付きで注入されるため、シェルだと本文がそのままコマンドとして
-/// 実行されてしまう。これだけは選択肢に出す前にここで弾く。
+/// 指揮はそのセッションの画面を**読むだけ**で成立する (端末へは何も注入しない)
+/// ので、CLI の種類やヘッドレス対応は問わない — **起動しているどのエージェント
+/// でも指揮官にできる**。唯一の例外が素のシェル: コマンド出力のエコーに
+/// `@対象:` らしき行が混ざると指示として誤検出しやすいため、選択肢に出す前に
+/// ここで弾く。
 fn commander_reject_reason(command: &str) -> Option<String> {
     if command.trim().is_empty() {
         return Some(tr(
-            "素のシェルは指揮官にできません (注入した行がコマンドとして実行されてしまいます)",
+            "素のシェルは指揮官にできません (画面のエコーを @指示 と誤検出しやすいためです)",
         ));
     }
     None
@@ -499,6 +491,29 @@ fn route_intent(it: &supervisor::InterventionIntent) -> IntentRoute {
         IntentRoute::Confirm
     } else {
         IntentRoute::Run
+    }
+}
+
+/// 指揮官の `@対象: 指示` をユーザー宛の通知文へ変える **純関数**。
+///
+/// 指揮官の指示は**どのセッションの入力欄にも自動で書き込まない**。ユーザーへ
+/// 見せるだけにして、実際に流すかどうかはユーザーが決める(勝手な注入の禁止)。
+/// `titles` は指揮官以外のセッションのタイトル一覧。宛先がどれにも一致しない
+/// `@mention` の誤爆は `None` で黙って捨てる(従来の配達時と同じふるまい)。
+fn commander_notice(d: &commander::Directive, titles: &[String]) -> Option<String> {
+    let body = supervisor::redact(&d.body, coordinator::INJECT_BODY_MAX);
+    match &d.target {
+        commander::Target::All => Some(trf(
+            "指揮官の指示 (全員宛): {body}",
+            &[("body", body)],
+        )),
+        commander::Target::Named(name) => {
+            let title = titles.iter().find(|t| commander::title_matches(t, name))?;
+            Some(trf(
+                "指揮官の指示 ({title} 宛): {body}",
+                &[("title", title.clone()), ("body", body)],
+            ))
+        }
     }
 }
 
@@ -679,8 +694,6 @@ impl ZaivernApp {
             super_agent_session: None,
             sup_last_diag: HashMap::new(),
             commander_seen: HashSet::new(),
-            commander_last_feed: None,
-            commander_feed_sig: None,
             term_focus_pending: false,
             cfg,
         };
@@ -4781,7 +4794,6 @@ impl ZaivernApp {
         // 指名は (コマンド, セッションタイトル)。両方空 = なし。
         let mut super_pick: Option<(String, String)> = None;
         let mut super_enabled: Option<bool> = None;
-        let mut super_timeout: Option<u64> = None;
         let orch_rows = self.orch_rows();
 
         egui::Frame::none()
@@ -4889,12 +4901,13 @@ impl ZaivernApp {
                             "決定論的な見張り (停滞・ループ・エラー多発の検知) は、この設定に\
                              関わらず常に動き、異常はここと通知で知らせます。ここでは\
                              いま起動しているエージェントの中からどれでも 1 体を『指揮官』に\
-                             指名できます (作業の途中でもいつでも交代できます)。指名すると、\
-                             他のエージェントの状況に変化があったときだけ指揮官へ内部\
-                             フィードされ、指揮官が `@対象: 指示` (全員へは `@all:`) と書くと、\
-                             その相手が安全になった瞬間に届きます。それ以外のときは何も送りません。\
-                             停止・再起動などの破壊的な操作を自動でエージェントへ投げることは\
-                             しません。指名したエージェントは普通の作業にもそのまま使えますし、\
+                             指名できます (作業の途中でもいつでも交代できます)。指揮官が\
+                             `@対象: 指示` (全員へは `@all:`) と書くと、その内容が **📮 通知**\
+                             としてユーザーへ届きます。どのエージェントの入力欄にも自動では\
+                             書き込みません — 指示を実際に流すかはユーザーが決めます\
+                             (Cockpit の一斉送信や各端末への手入力で)。停止・再起動などの\
+                             破壊的な操作を自動でエージェントへ投げることもしません。\
+                             指名したエージェントは普通の作業にもそのまま使えますし、\
                              そのセッション自身も見張りの対象です。",
                         ))
                         .size(12.0)
@@ -4951,8 +4964,8 @@ impl ZaivernApp {
                                 );
                             }
                             // いま居るセッションを名前で並べる (途中からの指名・交代用)。
-                            // 指揮は端末内で完結するので、起動しているエージェントなら
-                            // どれでも選べる (素のシェルだけは注入の危険があるので除外)。
+                            // 指揮は画面を読むだけなので、起動しているエージェントなら
+                            // どれでも選べる (素のシェルだけは誤検出しやすいので除外)。
                             for s in self.agents.sessions.iter() {
                                 let label = format!("{} {}", s.icon, s.title);
                                 let why = if !s.running() {
@@ -5004,23 +5017,6 @@ impl ZaivernApp {
                         {
                             super_enabled = Some(en);
                         }
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(tr("フィード最短間隔")).color(theme.text_dim));
-                        let mut t = self.cfg.super_agent.timeout_secs as i64;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut t)
-                                    .range(5..=600)
-                                    .suffix(tr(" 秒")),
-                            )
-                            .on_hover_text(tr(
-                                "他エージェントの状況に変化があったときだけ、前回から最低この間隔を\
-                                 空けて指揮官へ内部フィードします (最低 5 秒)。変化が無ければ何も送りません",
-                            ))
-                            .changed()
-                        {
-                            super_timeout = Some(t.clamp(5, 600) as u64);
-                        }
                     });
 
                     ui.add_space(4.0);
@@ -5048,9 +5044,9 @@ impl ZaivernApp {
                         ui.label(RichText::new(head).color(theme.ok));
                         ui.label(
                             RichText::new(tr(
-                                "このセッションが `@対象: 指示` (全員へは `@all:`) で他の\
-                                 エージェントを内部から指揮します。状況は変化があったときだけ\
-                                 内部フィードされます",
+                                "このセッションが `@対象: 指示` (全員へは `@all:`) と書くと、\
+                                 その内容が 📮 通知としてユーザーへ届きます。エージェントの\
+                                 入力欄へ自動で書き込むことはありません",
                             ))
                             .size(12.0)
                             .color(theme.text_dim),
@@ -5416,10 +5412,6 @@ impl ZaivernApp {
         }
         if let Some(en) = super_enabled {
             self.cfg.super_agent.enabled = en;
-            super_changed = true;
-        }
-        if let Some(t) = super_timeout {
-            self.cfg.super_agent.timeout_secs = t;
             super_changed = true;
         }
         if super_changed {
@@ -7685,24 +7677,23 @@ impl ZaivernApp {
 
     // ─── 監視・連携 (supervisor / coordinator / 端末フック) ──────────
 
-    /// スーパーエージェント (指揮官) が他の全エージェントを内部で指揮する。
+    /// スーパーエージェント (指揮官) の指示をユーザーへ届ける。
     ///
-    /// 指揮官セッション = `super_agent_session`。指名なし・無効なら何もしない
-    /// (= **内部で指揮するときだけ動く**)。毎フレーム:
-    /// 1. 指揮官の画面から `@対象: 指示` (`@all:` は全員) を拾い、coordinator バスへ積む。
-    /// 2. 他エージェントの状況に **変化があったときだけ**、指揮官の端末へ内部
-    ///    フィードする。変化が無ければ何も送らない (余計なメッセージを流さない)。
-    ///    `super_agent.timeout_secs` は連続変化のときの最短送信間隔。
+    /// 指揮官セッション = `super_agent_session`。指名なし・無効なら何もしない。
+    /// 毎フレーム、指揮官の画面から `@対象: 指示` (`@all:` は全員) を拾い、
+    /// **ユーザー宛の通知 (📮)** として coordinator バスへ積む。
     ///
-    /// **全て内部**で完結し、外部の subagent へは投げない。停止・再起動はこの経路では
-    /// 表現しない (積むのは非破壊の本文だけ)。実際の配達は coordinator が
-    /// 「注入して安全な瞬間」にのみ行う。
+    /// **どのセッションの入力欄へも書き込まない**。以前はここから指示の配達と
+    /// 状況フィードを各端末へ自動注入していたが、ユーザーが入力中の欄へ勝手に
+    /// 文字が流れ込む(しかも折り返しで説明文が指示に誤検出されて連投される)
+    /// ため廃止した。指示を実際に流すかは、通知を見たユーザーが決める
+    /// (Cockpit の一斉送信や各端末への手入力で)。
     fn drive_commander(&mut self) {
         let Some(cmd_id) = self.super_agent_session else {
             return;
         };
 
-        // 1) 指揮官の画面 → 指示。まず画面文字列を取り出してからロックを離す。
+        // 指揮官の画面 → 指示。まず画面文字列を取り出してからロックを離す。
         let screen = self
             .agents
             .sessions
@@ -7713,108 +7704,27 @@ impl ZaivernApp {
         if self.commander_seen.len() > 512 {
             self.commander_seen.clear();
         }
-        for d in commander::parse_directives(&screen, coordinator::INJECT_PREFIX) {
-            if !self.commander_seen.insert(d.hash) {
-                continue; // 既に配達済み (画面に残っているだけ)
-            }
-            let body = supervisor::redact(&d.body, coordinator::INJECT_BODY_MAX);
-            match d.target {
-                commander::Target::All => {
-                    // Broadcast は coordinator 側で送信元(指揮官)を自動的に除く。
-                    self.coordinator.enqueue(coordinator::AgentMessage::new(
-                        coordinator::Endpoint::Session(cmd_id),
-                        coordinator::Endpoint::Broadcast,
-                        coordinator::MsgKind::Request,
-                        body,
-                    ));
-                }
-                commander::Target::Named(name) => {
-                    let tid = self
-                        .agents
-                        .sessions
-                        .iter()
-                        .find(|s| s.id != cmd_id && commander::title_matches(&s.title, &name))
-                        .map(|s| s.id);
-                    if let Some(tid) = tid {
-                        self.coordinator.enqueue(coordinator::AgentMessage::new(
-                            coordinator::Endpoint::Session(cmd_id),
-                            coordinator::Endpoint::Session(tid),
-                            coordinator::MsgKind::Request,
-                            body,
-                        ));
-                    }
-                    // 宛先が見つからないときは黙って捨てる (誤爆した @mention 対策)。
-                }
-            }
-        }
-
-        // 2) 状況フィード — 変化があったときだけ送る。
-        //    まず前回送信からの最短間隔 (連続変化のレート制限) を確かめ、次に
-        //    (タイトル, 状態) のシグネチャを安く計算する (端末ロック不要)。
-        //    前回送信時と同じなら **何も送らない** — 静かな艦隊に定期便は流さない。
-        let now = Instant::now();
-        let interval = Duration::from_secs(self.cfg.super_agent.timeout_secs.max(5));
-        let rate_ok = self
-            .commander_last_feed
-            .map(|t| now.duration_since(t) >= interval)
-            .unwrap_or(true);
-        if !rate_ok {
-            return;
-        }
-        let meta: Vec<(u64, String, &'static str)> = self
+        let titles: Vec<String> = self
             .agents
             .sessions
             .iter()
             .filter(|s| s.id != cmd_id)
-            .map(|s| {
-                let state = self
-                    .supervisor
-                    .state_of(s.id)
-                    .map(|st| st.label())
-                    .unwrap_or("不明");
-                (s.id, s.title.clone(), state)
-            })
+            .map(|s| s.title.clone())
             .collect();
-        let pairs: Vec<(&str, &str)> = meta.iter().map(|(_, t, st)| (t.as_str(), *st)).collect();
-        let sig = commander::feed_signature(&pairs);
-        if self.commander_feed_sig == Some(sig) {
-            return; // 変化なし — 余計なメッセージは流さない
-        }
-        // 変化があったときだけ、直近行を集めて (ここで初めて端末をロックする) 送る。
-        let others: Vec<commander::AgentStatus> = meta
-            .into_iter()
-            .map(|(id, title, state)| {
-                let last = self
-                    .agents
-                    .sessions
-                    .iter()
-                    .find(|s| s.id == id)
-                    .and_then(|s| {
-                        s.parser
-                            .lock()
-                            .ok()
-                            .map(|p| commander::last_nonempty_line(&p.screen().contents()))
-                    })
-                    .unwrap_or_default();
-                commander::AgentStatus {
-                    title,
-                    state,
-                    last_line: supervisor::redact(&last, 120).trim().to_string(),
-                }
-            })
-            .collect();
-        if let Some(body) = commander::build_status_digest(&others) {
+        for d in commander::parse_directives(&screen, coordinator::INJECT_PREFIX) {
+            if !self.commander_seen.insert(d.hash) {
+                continue; // 既に通知済み (画面に残っているだけ)
+            }
+            // 宛先が実在しない @mention の誤爆は従来どおり黙って捨てる。
+            let Some(text) = commander_notice(&d, &titles) else {
+                continue;
+            };
             self.coordinator.enqueue(coordinator::AgentMessage::new(
-                coordinator::Endpoint::Supervisor,
                 coordinator::Endpoint::Session(cmd_id),
-                coordinator::MsgKind::Status,
-                body,
+                coordinator::Endpoint::User,
+                coordinator::MsgKind::Request,
+                text,
             ));
-            // 送れたときだけ記録する。相手が居ない間 (= digest 無し) に
-            // シグネチャを覚えてしまうと、最初の 1 体が現れたときの初回
-            // ブリーフィングを取りこぼす。
-            self.commander_last_feed = Some(now);
-            self.commander_feed_sig = Some(sig);
         }
     }
 
@@ -7828,15 +7738,13 @@ impl ZaivernApp {
         // 指揮方式: LLM 診断 (CLI の spawn) は使わない。`llm_escalation` を
         // 常に false に固定して診断経路を止める (request_diagnosis は入口で no-op、
         // diagnose() は呼ばれない = **CLI を spawn しない / 停止・再起動を提案しない**)。
-        // エージェントへ働きかけるのは drive_commander() の内部指揮のみ。
+        // 指揮官の指示はユーザー宛の通知になるだけで、エージェントへは働きかけない。
         self.cfg.supervisor.llm_escalation = false;
         self.supervisor.set_config(self.cfg.supervisor.clone());
         self.sup_last_diag.clear();
         // 指名が変わったので、指揮の作業状態は sync 側で必ずやり直させる。
         self.super_agent_session = None;
         self.commander_seen.clear();
-        self.commander_last_feed = None;
-        self.commander_feed_sig = None;
         self.sync_super_agent_session();
     }
 
@@ -7845,16 +7753,15 @@ impl ZaivernApp {
     /// タイトルで指名されていればそのセッション、指名が無ければ同じ CLI の
     /// 最初のセッションを使う。毎フレーム呼ばれるので、途中で指名を変えたり
     /// 再起動で ID が変わったりしてもここで追従する。指揮官が交代した瞬間は
-    /// 前任の画面から拾った配達済み記録・フィード状態を必ず捨てる — 持ち越すと
-    /// 新しい指揮官への初回ブリーフィングが飛んだり、前任と同文の指示が
-    /// 二重配達扱いで握り潰されたりする。
+    /// 前任の画面から拾った通知済み記録を必ず捨てる — 持ち越すと前任と同文の
+    /// 指示が二重通知扱いで握り潰されたりする。
     fn sync_super_agent_session(&mut self) {
         let sa = &self.cfg.super_agent;
         let appointed = sa.enabled
             && (!sa.session_title.trim().is_empty() || !sa.command.trim().is_empty());
         let id = if appointed {
-            // 素のシェル (コマンド空) は候補から外す。状況フィードは末尾 Enter
-            // 付きで注入されるため、シェルだと本文がそのまま実行されてしまう。
+            // 素のシェル (コマンド空) は候補から外す。エコーの @行 を指示と
+            // 誤検出しやすい (理由文は commander_reject_reason 参照)。
             let rows: Vec<(u64, bool, String, String)> = self
                 .agents
                 .sessions
@@ -7869,8 +7776,6 @@ impl ZaivernApp {
         if id != self.super_agent_session {
             self.super_agent_session = id;
             self.commander_seen.clear();
-            self.commander_last_feed = None;
-            self.commander_feed_sig = None;
         }
     }
 
@@ -8065,8 +7970,8 @@ impl ZaivernApp {
 
     /// 毎フレーム: 配達待ちのメッセージを流し、ユーザー宛は必ず UI へ出す。
     fn coordinate(&mut self, win_focused: bool) {
-        // 0) 指揮官の状況フィードと、`@対象:` 指示を coordinator へ積む
-        //    (実際の配達は下の take_deliverable が安全な瞬間に行う)。
+        // 0) 指揮官の `@対象:` 指示をユーザー宛の通知として coordinator へ積む
+        //    (セッションへの自動注入はしない。下の take_user_messages で UI へ出る)。
         self.drive_commander();
 
         // 1) いまのセッション状態表。曖昧なら Unknown (= 配達しない)。
@@ -9797,6 +9702,24 @@ mod wiring_tests {
         ] {
             assert_eq!(route_intent(&intent(action, false)), IntentRoute::Run);
         }
+    }
+
+    #[test]
+    fn commander_notice_goes_to_user_and_drops_unknown_targets() {
+        let titles = vec!["Claude — main".to_string(), "codex-1".to_string()];
+        let ds = crate::commander::parse_directives(
+            "@all: 全員テストを回して\n@codex: ビルドを直して\n@居ない人: これは誤爆",
+            crate::coordinator::INJECT_PREFIX,
+        );
+        assert_eq!(ds.len(), 3);
+        // 全員宛・実在する宛先はユーザー向けの通知文になる
+        let all = commander_notice(&ds[0], &titles).expect("全員宛は通知になるはず");
+        assert!(all.contains("全員テストを回して"));
+        let named = commander_notice(&ds[1], &titles).expect("実在宛先は通知になるはず");
+        assert!(named.contains("codex-1"));
+        assert!(named.contains("ビルドを直して"));
+        // 実在しない宛先の誤爆は黙って捨てる
+        assert!(commander_notice(&ds[2], &titles).is_none());
     }
 
     #[test]
