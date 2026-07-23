@@ -59,6 +59,8 @@ pub enum Cmd {
     TogglePetSounds,
     /// 承認待ちの吹き出し表示
     TogglePetBubbles,
+    /// 承認プロンプトへの自動YES (オフ=ユーザー承認必須)
+    TogglePetAutoYes,
     /// スマホリモートの QR コードウィンドウ表示切替
     ToggleRemote,
     /// 音声入力の録音を開始/停止する。認識テキストは届け先の入力欄へ

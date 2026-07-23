@@ -40,6 +40,8 @@ pub struct Config {
     pub pet_sounds: bool,
     /// 承認バブルを表示するか
     pub pet_bubbles: bool,
+    /// 承認プロンプトへ自動で YES を送るか (オフ=ユーザー承認必須)
+    pub pet_auto_yes: bool,
     /// 承認時に PTY へ送るキー (既定は Enter)
     pub pet_approve_keys: String,
     /// 拒否時に PTY へ送るキー (既定は ESC)
@@ -192,6 +194,7 @@ impl Default for Config {
             pet_sleep: true,
             pet_sounds: true,
             pet_bubbles: true,
+            pet_auto_yes: false,
             pet_approve_keys: "\r".into(),
             pet_deny_keys: "\u{1b}".into(),
             voice_engine: "auto".into(),
@@ -312,6 +315,7 @@ struct UiState {
     pet_sleep: Option<bool>,
     pet_sounds: Option<bool>,
     pet_bubbles: Option<bool>,
+    pet_auto_yes: Option<bool>,
     pet_approve_keys: Option<String>,
     pet_deny_keys: Option<String>,
     voice_engine: Option<String>,
@@ -384,6 +388,7 @@ show_pet = true
 # pet_sleep = true         # 無操作で睡眠
 # pet_sounds = true        # 効果音
 # pet_bubbles = true       # 承認バブル
+# pet_auto_yes = false    # 承認プロンプトへ自動でYES (オフ=ユーザー承認必須)
 # pet_approve_keys = "\r"    # 承認時にPTYへ送るキー (Enter)
 # pet_deny_keys = "\u001B"   # 拒否時にPTYへ送るキー (ESC)
 
@@ -578,6 +583,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 }
                 if let Some(v) = st.pet_bubbles {
                     cfg.pet_bubbles = v;
+                }
+                if let Some(v) = st.pet_auto_yes {
+                    cfg.pet_auto_yes = v;
                 }
                 if let Some(v) = st.pet_approve_keys {
                     cfg.pet_approve_keys = v;
@@ -868,6 +876,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         pet_sleep: Some(cfg.pet_sleep),
         pet_sounds: Some(cfg.pet_sounds),
         pet_bubbles: Some(cfg.pet_bubbles),
+        pet_auto_yes: Some(cfg.pet_auto_yes),
         pet_approve_keys: Some(cfg.pet_approve_keys.clone()),
         pet_deny_keys: Some(cfg.pet_deny_keys.clone()),
         voice_engine: Some(cfg.voice_engine.clone()),
@@ -914,6 +923,7 @@ mod tests {
         assert!(c.pet_sleep);
         assert!(c.pet_sounds);
         assert!(c.pet_bubbles);
+        assert!(!c.pet_auto_yes, "自動YESは既定でオフ (ユーザー承認必須)");
         assert_eq!(c.pet_approve_keys, "\r", "承認は Enter");
         assert_eq!(c.pet_deny_keys, "\u{1b}", "拒否は ESC");
         assert_eq!(c.voice_engine, "auto");
@@ -1346,6 +1356,7 @@ mod tests {
             pet_sleep: Some(false),
             pet_sounds: Some(true),
             pet_bubbles: Some(true),
+            pet_auto_yes: Some(true),
             pet_approve_keys: Some("\r".into()),
             pet_deny_keys: Some("\u{1b}".into()),
             voice_engine: Some("command".into()),
@@ -1369,6 +1380,7 @@ mod tests {
         assert_eq!(back.pet_variant, Some("cat".to_string()));
         assert_eq!(back.pet_scale, Some(1.4));
         assert_eq!(back.pet_free_roam, Some(false));
+        assert_eq!(back.pet_auto_yes, Some(true));
         assert_eq!(back.voice_keyword, Some("送信".to_string()));
         // エスケープが必要な制御文字も往復する
         assert_eq!(back.pet_approve_keys, Some("\r".to_string()));
