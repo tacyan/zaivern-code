@@ -867,9 +867,12 @@ impl Session {
         self.spec()?.switch_hint_text()
     }
 
-    /// 全自動YESの対象セッションか(bypass 権限で起動した対応 CLI のみ)。
-    pub fn auto_yes(&self) -> bool {
-        self.launched_bypass && self.is_permission_agent()
+    /// メニューの自動YES (`pet_auto_yes` = allow) の対象セッションか。
+    /// 対象はカタログ既知の CLI のみ(素のシェルの y/n プロンプトへは撃ち込まない)。
+    /// 起動時の承認モード (Ask/bypass) には依存しない — 以前は bypass 起動のみを
+    /// 対象にしていたため、Ask 起動だと自動YESをオンにしても何も送られなかった。
+    pub fn auto_yes_target(&self, allow: bool) -> bool {
+        allow && self.is_permission_agent()
     }
 
     /// 画面内容から「ユーザーの承認待ち」を推定する(約1秒間隔)。
@@ -1552,9 +1555,9 @@ mod tests {
         }
     }
 
-    /// 安全性: Ask モードでは、どの CLI でも自動YESにならない。
+    /// Ask モード起動は bypass 起動と判定しない(⚡バッジを誤表示しない)。
     #[test]
-    fn auto_yes_is_false_under_ask_for_new_agents() {
+    fn bypass_launch_is_false_under_ask_for_new_agents() {
         use crate::agents::{apply_approval, Approval};
         for (i, bin) in ["opencode", "copilot", "amp", "claude", "codex", "goose"]
             .iter()
@@ -1563,8 +1566,8 @@ mod tests {
             let cmd = apply_approval(bin, Approval::Ask);
             let mut s = probe_session(9400 + i as u64, &cmd);
             assert!(
-                !s.auto_yes(),
-                "Ask モードなのに自動YESが有効: {} -> {}",
+                !s.launched_bypass,
+                "Ask モードなのに bypass 起動と判定: {} -> {}",
                 bin,
                 cmd
             );
@@ -1572,36 +1575,57 @@ mod tests {
         }
     }
 
-    /// Auto モードなら新しい CLI でも自動YESの対象になる(gap #3 の本体)。
+    /// Auto モードなら新しい CLI でも bypass 起動と判定される(gap #3 の本体)。
     #[test]
-    fn auto_yes_is_true_under_auto_for_new_agents() {
+    fn bypass_launch_is_true_under_auto_for_new_agents() {
         use crate::agents::{apply_approval, Approval};
         for (i, bin) in ["opencode", "copilot", "amp", "mimo"].iter().enumerate() {
             let cmd = apply_approval(bin, Approval::Auto);
             let mut s = probe_session(9500 + i as u64, &cmd);
-            assert!(s.auto_yes(), "Auto モードで自動YESが働かない: {}", cmd);
+            assert!(s.launched_bypass, "Auto モードが bypass 判定されない: {}", cmd);
             s.kill();
         }
     }
 
-    /// 環境変数型 (goose / aider) の Auto も自動YESの対象になる。
+    /// 環境変数型 (goose / aider) の Auto も bypass 起動と判定される。
     /// フラグを持たないので `command_is_bypass` だけでは拾えない経路。
     #[test]
-    fn auto_yes_follows_auto_env_for_flagless_agents() {
+    fn bypass_launch_follows_auto_env_for_flagless_agents() {
         use crate::agents::{merged_env, Approval};
         use std::collections::HashMap;
         let empty = HashMap::new();
         for (i, bin) in ["goose", "aider"].iter().enumerate() {
             let auto = merged_env(bin, Approval::Auto, &empty);
             let mut s = probe_session_env(9600 + i as u64, bin, auto);
-            assert!(s.auto_yes(), "{} の Auto が自動YESにならない", bin);
+            assert!(s.launched_bypass, "{} の Auto が bypass 判定されない", bin);
             s.kill();
 
             let ask = merged_env(bin, Approval::Ask, &empty);
             let mut s = probe_session_env(9610 + i as u64, bin, ask);
-            assert!(!s.auto_yes(), "{} の Ask が自動YESになっている", bin);
+            assert!(!s.launched_bypass, "{} の Ask が bypass 判定されている", bin);
             s.kill();
         }
+    }
+
+    /// メニューの自動YES (pet_auto_yes) は起動時の承認モードに依存しない。
+    /// 以前は bypass 起動のみを対象にしていたため、Ask 起動のセッションでは
+    /// 自動YESをオンにしても承認プロンプトが放置された(再発防止)。
+    #[test]
+    fn pet_auto_yes_covers_ask_launched_sessions() {
+        use crate::agents::{apply_approval, Approval};
+        let cmd = apply_approval("claude", Approval::Ask);
+        let mut s = probe_session(9700, &cmd);
+        assert!(
+            s.auto_yes_target(true),
+            "Ask 起動でも pet_auto_yes オンなら自動YESの対象"
+        );
+        assert!(!s.auto_yes_target(false), "pet_auto_yes オフでは自動応答しない");
+        s.kill();
+
+        // カタログ外の素のコマンドは対象外(y/n プロンプトへ誤爆しない)
+        let mut sh = probe_session(9701, "sleep 1");
+        assert!(!sh.auto_yes_target(true), "カタログ外セッションは自動YESの対象外");
+        sh.kill();
     }
 }
 
