@@ -502,6 +502,17 @@ fn route_intent(it: &supervisor::InterventionIntent) -> IntentRoute {
     }
 }
 
+/// ペットの承認バブルでユーザーが手動承認できる状態か (**純関数**)。
+///
+/// この間は全自動YES (`Session::auto_yes`) による自動応答を保留する。
+/// バブルを画面に出しながら裏で自動応答すると「✔ 承認 を押す前に勝手に
+/// YESが送られる」挙動になるため、バブルが出せる限りユーザーのクリックを
+/// 待つ。バブルはペット表示中 (`show_pet`) にしか描かれないので、ペットか
+/// バブルを切っていれば従来どおり全自動YESが働く。
+fn pet_manual_approval(show_pet: bool, pet_bubbles: bool) -> bool {
+    show_pet && pet_bubbles
+}
+
 /// coordinator へ渡すセッション状態を決める **純関数**。
 ///
 /// 誤って `Idle` と判定すると、作業中のエージェントの入力欄へ文字を流し込んで
@@ -8578,7 +8589,9 @@ impl eframe::App for ZaivernApp {
 
         // エージェントの状態変化を通知する(非フォーカス時は OS 通知も)
         let win_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-        for ev in self.agents.poll_events() {
+        // ペットの承認バブルが出せる間は全自動YESを保留し、ユーザーの ✔ 承認 を待つ
+        let allow_auto_yes = !pet_manual_approval(self.cfg.show_pet, self.cfg.pet_bubbles);
+        for ev in self.agents.poll_events(allow_auto_yes) {
             match ev {
                 SessionEvent::NeedsApproval(title) => {
                     // 同じセッションへのトースト+効果音は10秒に1回まで
@@ -9834,6 +9847,17 @@ mod wiring_tests {
         ] {
             assert_eq!(route_intent(&intent(action, false)), IntentRoute::Run);
         }
+    }
+
+    #[test]
+    fn pet_bubble_suspends_auto_yes_only_while_it_can_be_shown() {
+        // バブルが出せる = ペット表示中かつバブル有効。この間だけ全自動YESを
+        // 保留してユーザーの ✔ 承認 を待つ (勝手にYESが送られる報告への対策)。
+        assert!(pet_manual_approval(true, true));
+        // ペット非表示 or バブル無効なら承認する手段が画面に無いので従来どおり自動。
+        assert!(!pet_manual_approval(false, true));
+        assert!(!pet_manual_approval(true, false));
+        assert!(!pet_manual_approval(false, false));
     }
 
     #[test]
