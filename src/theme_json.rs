@@ -162,6 +162,10 @@ fn shift(c: Color32, d: i16) -> Color32 {
 
 fn parse_color(s: &str) -> Option<Color32> {
     let hex = s.trim().strip_prefix('#')?;
+    // from_str_radix は先頭の '+' を受理してしまうので、16進数字のみを許す
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let h = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
     match hex.len() {
         3 => {
@@ -254,6 +258,16 @@ mod tests {
         assert_eq!(parse_color("#gggggg"), None);
         assert_eq!(parse_color("#zzz"), None);
         assert_eq!(parse_color("#12345g"), None);
+    }
+
+    #[test]
+    fn parse_color_rejects_sign_prefixed_components() {
+        // u8::from_str_radix は先頭の '+' を受理するので、検証なしだと
+        // "#+f0000" のような不正値が有効な色として通ってしまう
+        assert_eq!(parse_color("#+f0000"), None);
+        assert_eq!(parse_color("#-f0000"), None);
+        assert_eq!(parse_color("#12+345"), None);
+        assert_eq!(parse_color("#1122+344"), None);
     }
 
     #[test]

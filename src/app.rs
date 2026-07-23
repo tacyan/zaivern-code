@@ -13,7 +13,7 @@ use crate::config::{self, Config};
 use crate::coordinator;
 use crate::orchestration;
 use crate::supervisor;
-use crate::editor::{disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
+use crate::editor::{combine_hash, disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
 use crate::file_tree::{self, FileTree, TreeActions};
 use crate::fuzzy;
@@ -1840,6 +1840,11 @@ impl ZaivernApp {
         }
         if !self.lsp_opened.contains(path) {
             if let Some(client) = self.lsp.get(&key) {
+                // initialize 完了前に通知を送ってはならない (LSP 仕様)。
+                // ここは毎フレーム通るので、ready になった次のフレームで did_open される
+                if !client.is_ready() {
+                    return;
+                }
                 // 本文はこの一回だけ必要。self.lsp / self.editor はどちらも不変借用なので両立する
                 let text = self
                     .editor
@@ -1875,6 +1880,11 @@ impl ZaivernApp {
             .map(|(p, _)| p.clone())
             .collect();
         for p in ready {
+            // did_open 前 (initialize 未完了を含む) のドキュメントには送らない。
+            // pending に残しておき、ensure_lsp が did_open した後のフレームで送る
+            if !self.lsp_opened.contains(&p) {
+                continue;
+            }
             if let Some((text, _, key)) = self.lsp_pending.remove(&p) {
                 if let Some(client) = self.lsp.get(&key) {
                     client.did_change(&p, &text);
@@ -2706,6 +2716,7 @@ impl ZaivernApp {
             }
             Cmd::SetTheme(name) => {
                 self.theme = resolve_theme(&name);
+                self.cfg.global_theme = name.clone();
                 self.cfg.theme = name;
                 theme::apply(ctx, &self.theme);
                 for b in &mut self.editor.buffers {
@@ -2776,6 +2787,7 @@ impl ZaivernApp {
                     _ => "ask".into(),
                 };
                 self.cfg.approval_mode = mode.clone();
+                self.cfg.global_approval_mode = mode.clone();
                 config::save_state(&self.cfg);
                 match mode.as_str() {
                     "auto" => self.toast_warn(tr(
@@ -2796,6 +2808,7 @@ impl ZaivernApp {
             }
             Cmd::TogglePet => {
                 self.cfg.show_pet = !self.cfg.show_pet;
+                self.cfg.global_show_pet = self.cfg.show_pet;
                 config::save_state(&self.cfg);
                 self.toast(
                     if self.cfg.show_pet {
@@ -2827,6 +2840,7 @@ impl ZaivernApp {
                             self.pet_tex = Some(tex);
                             self.cfg.pet_image = Some(path.to_string_lossy().to_string());
                             self.cfg.show_pet = true;
+                            self.cfg.global_show_pet = true;
                             config::save_state(&self.cfg);
                             self.toast(tr("🖼 ペット画像を変更しました"), true);
                         }
@@ -5914,12 +5928,15 @@ impl ZaivernApp {
         // galley までキャッシュするので、キーには LayoutJob の内容(行数/マーク/診断/
         // フォントサイズ/テーマ)に加えてラスタライズ側の font_gen も含める。
         // font family は常に Monospace 固定なので font.size のみで足りる。
-        let gutter_key = (line_count as u64)
-            ^ marks_hash.rotate_left(17)
-            ^ diag_hash.rotate_left(29)
-            ^ (font.size.to_bits() as u64)
-            ^ font_gen
-            ^ hash_str(&syntect_theme).rotate_left(3);
+        let gutter_key = [
+            marks_hash,
+            diag_hash,
+            font.size.to_bits() as u64,
+            font_gen,
+            hash_str(&syntect_theme),
+        ]
+        .into_iter()
+        .fold(line_count as u64, combine_hash);
         if gutter.as_ref().map(|(k, _)| *k) != Some(gutter_key) {
             let width = line_count.to_string().len().max(3);
             let mark_map: HashMap<usize, git::LineMark> = marks.iter().cloned().collect();
@@ -5959,11 +5976,14 @@ impl ZaivernApp {
         // wrap.max_width = f32::INFINITY を設定する(横スクロールのため折り返さない)。
         // よって galley は wrap 幅に依存せず、フレーム跨ぎで使い回せる。
         let mut layouter = |ui: &egui::Ui, t: &str, _wrap: f32| {
-            let key = hash_str(t)
-                ^ hash_str(lang.as_str())
-                ^ hash_str(&syntect_theme)
-                ^ (font.size.to_bits() as u64)
-                ^ font_gen;
+            let key = [
+                hash_str(lang.as_str()),
+                hash_str(&syntect_theme),
+                font.size.to_bits() as u64,
+                font_gen,
+            ]
+            .into_iter()
+            .fold(hash_str(t), combine_hash);
             match cache {
                 // ヒット時は Arc の参照カウント増加のみ。
                 // LayoutJob のコピーも egui 側の job ハッシュ計算も起きない。

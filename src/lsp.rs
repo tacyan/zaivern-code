@@ -8,9 +8,9 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -198,8 +198,9 @@ enum Pending {
 
 struct Shared {
     alive: AtomicBool,
-    init_done: Mutex<bool>,
-    init_cv: Condvar,
+    /// initialize 応答を受信し initialized 通知を送信済み。
+    /// これが立つまで他の通知・リクエストを送ってはならない (LSP 仕様)。
+    init_done: AtomicBool,
     diags: Mutex<HashMap<PathBuf, Vec<Diagnostic>>>,
     pending: Mutex<HashMap<u64, Pending>>,
     completion: Mutex<Option<Vec<CompletionItem>>>,
@@ -208,23 +209,51 @@ struct Shared {
     latest_hover: AtomicU64,
 }
 
+impl Shared {
+    fn new() -> Self {
+        Shared {
+            alive: AtomicBool::new(true),
+            init_done: AtomicBool::new(false),
+            diags: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            completion: Mutex::new(None),
+            hover: Mutex::new(None),
+            latest_completion: AtomicU64::new(0),
+            latest_hover: AtomicU64::new(0),
+        }
+    }
+}
+
 pub struct LspClient {
     child: Child,
-    writer: Arc<Mutex<ChildStdin>>,
+    tx: mpsc::Sender<Value>,
     shared: Arc<Shared>,
     next_id: AtomicU64,
     versions: Mutex<HashMap<PathBuf, i64>>,
 }
 
-fn send_json(writer: &Mutex<ChildStdin>, v: &Value) -> std::io::Result<()> {
-    let bytes = encode_message(&v.to_string());
-    let mut w = writer.lock().unwrap();
-    w.write_all(&bytes)?;
-    w.flush()
+/// チャネルへ積むだけ (サーバー I/O 待ちなし)。実際の書き込みは writer_loop が行う。
+fn send_json(tx: &mpsc::Sender<Value>, v: Value) -> Result<(), mpsc::SendError<Value>> {
+    tx.send(v)
+}
+
+/// 書き込み専用スレッド: ChildStdin を専有し、チャネルで受けた JSON をフレーミングして書く。
+/// サーバーが詰まってもブロックするのはこのスレッドだけで、送信側は巻き込まれない。
+/// 全 Sender の drop (チャネル切断) か書き込み失敗で終了する。
+fn writer_loop<W: Write>(mut stdin: W, rx: mpsc::Receiver<Value>, shared: Arc<Shared>) {
+    while let Ok(v) = rx.recv() {
+        let bytes = encode_message(&v.to_string());
+        if stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_err() {
+            shared.alive.store(false, Ordering::SeqCst);
+            break;
+        }
+    }
 }
 
 impl LspClient {
-    /// server_cmd は $SHELL -lc 経由で起動 (PATH 解決のため)。initialize→initialized まで行う。
+    /// server_cmd は $SHELL -lc 経由で起動 (PATH 解決のため)。initialize は送信だけして
+    /// すぐ返る (UI スレッドをブロックしない)。応答は受信スレッドが処理して is_ready が
+    /// true になるので、呼び出し側はそれまで通知・リクエストを送らないこと。
     ///
     /// マルチルートワークスペースの扱い:
     /// ここでは 1 サーバー = 1 ルート（`rootUri` / `workspaceFolders` は常に 1 要素）とし、
@@ -259,18 +288,8 @@ impl LspClient {
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let stderr = child.stderr.take().ok_or("no stderr")?;
 
-        let writer = Arc::new(Mutex::new(stdin));
-        let shared = Arc::new(Shared {
-            alive: AtomicBool::new(true),
-            init_done: Mutex::new(false),
-            init_cv: Condvar::new(),
-            diags: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
-            completion: Mutex::new(None),
-            hover: Mutex::new(None),
-            latest_completion: AtomicU64::new(0),
-            latest_hover: AtomicU64::new(0),
-        });
+        let (tx, rx) = mpsc::channel::<Value>();
+        let shared = Arc::new(Shared::new());
 
         // stderr 読み捨てスレッド (パイプ詰まり防止)
         std::thread::spawn(move || {
@@ -279,16 +298,22 @@ impl LspClient {
             while matches!(sink.read(&mut buf), Ok(n) if n > 0) {}
         });
 
+        // 書き込みスレッド (ChildStdin を専有。送信側はチャネルに積むだけ)
+        {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || writer_loop(stdin, rx, shared));
+        }
+
         // 受信スレッド
         {
             let shared = Arc::clone(&shared);
-            let writer = Arc::clone(&writer);
-            std::thread::spawn(move || reader_loop(stdout, shared, writer, ctx));
+            let tx = tx.clone();
+            std::thread::spawn(move || reader_loop(stdout, shared, tx, ctx));
         }
 
         let client = LspClient {
             child,
-            writer,
+            tx,
             shared,
             next_id: AtomicU64::new(1),
             versions: Mutex::new(HashMap::new()),
@@ -323,31 +348,23 @@ impl LspClient {
             .unwrap()
             .insert(id, Pending::Initialize);
         send_json(
-            &client.writer,
-            &json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":init_params}),
+            &client.tx,
+            json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":init_params}),
         )
         .map_err(|e| format!("failed to send initialize: {e}"))?;
 
-        // initialize 応答待ち (受信スレッドが initialized 通知送信後にフラグを立てる)
-        let done = client.shared.init_done.lock().unwrap();
-        let (done, timeout) = client
-            .shared
-            .init_cv
-            .wait_timeout_while(done, Duration::from_secs(20), |d| !*d)
-            .unwrap();
-        drop(done);
-        if timeout.timed_out() {
-            let mut client = client;
-            let _ = client.child.kill();
-            let _ = client.child.wait();
-            client.shared.alive.store(false, Ordering::SeqCst);
-            return Err("LSP initialize timed out".into());
-        }
+        // initialize 応答は待たない。受信スレッドが initialized 通知送信後に
+        // init_done を立てるので、呼び出し側は is_ready で確認する。
         Ok(client)
     }
 
     pub fn is_alive(&self) -> bool {
         self.shared.alive.load(Ordering::SeqCst)
+    }
+
+    /// initialize ハンドシェイク完了。false の間は LSP 機能は使えない (送信は保留すること)。
+    pub fn is_ready(&self) -> bool {
+        self.shared.init_done.load(Ordering::SeqCst)
     }
 
     pub fn did_open(&self, path: &Path, language_id: &str, text: &str) {
@@ -450,12 +467,12 @@ impl LspClient {
         if self.is_alive() {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
             let _ = send_json(
-                &self.writer,
-                &json!({"jsonrpc":"2.0","id":id,"method":"shutdown","params":null}),
+                &self.tx,
+                json!({"jsonrpc":"2.0","id":id,"method":"shutdown","params":null}),
             );
             let _ = send_json(
-                &self.writer,
-                &json!({"jsonrpc":"2.0","method":"exit","params":null}),
+                &self.tx,
+                json!({"jsonrpc":"2.0","method":"exit","params":null}),
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -466,14 +483,14 @@ impl LspClient {
 
     fn notify(&self, method: &str, params: Value) {
         let msg = json!({"jsonrpc":"2.0","method":method,"params":params});
-        if send_json(&self.writer, &msg).is_err() {
+        if send_json(&self.tx, msg).is_err() {
             self.shared.alive.store(false, Ordering::SeqCst);
         }
     }
 
     fn request_raw(&self, id: u64, method: &str, params: Value) {
         let msg = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        if send_json(&self.writer, &msg).is_err() {
+        if send_json(&self.tx, msg).is_err() {
             self.shared.alive.store(false, Ordering::SeqCst);
         }
     }
@@ -494,7 +511,7 @@ impl Drop for LspClient {
 fn reader_loop(
     mut stdout: ChildStdout,
     shared: Arc<Shared>,
-    writer: Arc<Mutex<ChildStdin>>,
+    tx: mpsc::Sender<Value>,
     ctx: eframe::egui::Context,
 ) {
     let mut dec = FrameDecoder::new();
@@ -503,15 +520,14 @@ fn reader_loop(
         match stdout.read(&mut buf) {
             Ok(0) | Err(_) => {
                 shared.alive.store(false, Ordering::SeqCst);
-                // spawn が initialize 待ちで停止しないよう起こす
-                shared.init_cv.notify_all();
+                // tx が drop され (LspClient 側と合わせて) writer_loop も終了する
                 ctx.request_repaint();
                 break;
             }
             Ok(n) => {
                 dec.push(&buf[..n]);
                 while let Some(msg) = dec.next_message() {
-                    handle_message(&msg, &shared, &writer);
+                    handle_message(&msg, &shared, &tx);
                 }
                 ctx.request_repaint();
             }
@@ -519,7 +535,7 @@ fn reader_loop(
     }
 }
 
-fn handle_message(raw: &str, shared: &Arc<Shared>, writer: &Mutex<ChildStdin>) {
+fn handle_message(raw: &str, shared: &Arc<Shared>, tx: &mpsc::Sender<Value>) {
     let v: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => return,
@@ -542,7 +558,7 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, writer: &Mutex<ChildStdin>) {
             } else {
                 Value::Null
             };
-            let _ = send_json(writer, &json!({"jsonrpc":"2.0","id":id,"result":result}));
+            let _ = send_json(tx, json!({"jsonrpc":"2.0","id":id,"result":result}));
         }
         // 通知
         (false, Some("textDocument/publishDiagnostics")) => {
@@ -561,13 +577,13 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, writer: &Mutex<ChildStdin>) {
             let result = v.get("result").cloned().unwrap_or(Value::Null);
             match kind {
                 Some(Pending::Initialize) => {
-                    // initialized 通知を先に送ってからフラグを立てる (順序保証)
+                    // initialized 通知を先にチャネルへ積んでからフラグを立てる (順序保証:
+                    // is_ready を見てから送られる通知より必ず先にサーバーへ届く)
                     let _ = send_json(
-                        writer,
-                        &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+                        tx,
+                        json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
                     );
-                    *shared.init_done.lock().unwrap() = true;
-                    shared.init_cv.notify_all();
+                    shared.init_done.store(true, Ordering::SeqCst);
                 }
                 Some(Pending::Completion) => {
                     if shared.latest_completion.load(Ordering::SeqCst) == id {
@@ -822,6 +838,58 @@ mod tests {
         assert_eq!(char_index_to_lsp_pos(t, 99), (1, 2));
     }
 
+    // ---- 書き込みスレッド / initialize フラグ ----
+
+    #[test]
+    fn writer_loop_encodes_messages_in_order() {
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(Shared::new());
+        send_json(&tx, json!({"a":1})).unwrap();
+        send_json(&tx, json!({"b":2})).unwrap();
+        drop(tx); // チャネル切断で writer_loop が終了する
+        let mut out: Vec<u8> = Vec::new();
+        writer_loop(&mut out, rx, Arc::clone(&shared));
+        let mut expected = encode_message(&json!({"a":1}).to_string());
+        expected.extend_from_slice(&encode_message(&json!({"b":2}).to_string()));
+        assert_eq!(out, expected);
+        assert!(shared.alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn writer_loop_exits_on_write_error_without_hanging() {
+        struct FailWriter;
+        impl Write for FailWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stuck"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(Shared::new());
+        send_json(&tx, json!({"x":true})).unwrap();
+        // Sender が生きていても書き込み失敗で戻る (recv で永久待ちしない)
+        writer_loop(FailWriter, rx, Arc::clone(&shared));
+        assert!(!shared.alive.load(Ordering::SeqCst));
+        drop(tx);
+    }
+
+    #[test]
+    fn initialize_response_flips_ready_and_queues_initialized() {
+        let shared = Arc::new(Shared::new());
+        shared.pending.lock().unwrap().insert(1, Pending::Initialize);
+        let (tx, rx) = mpsc::channel();
+        assert!(!shared.init_done.load(Ordering::SeqCst));
+        handle_message(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, &shared, &tx);
+        assert!(shared.init_done.load(Ordering::SeqCst));
+        let v = rx.try_recv().expect("initialized notification queued");
+        assert_eq!(
+            v.get("method").and_then(|m| m.as_str()),
+            Some("initialized")
+        );
+    }
+
     // ---- 統合スモーク: rust-analyzer ----
 
     #[test]
@@ -844,6 +912,12 @@ mod tests {
             Ok(c) => c,
             Err(e) => panic!("spawn failed: {e}"),
         };
+        // spawn は待たずに返るので、テスト側で initialize 完了をポーリングする
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !client.is_ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(client.is_ready(), "initialize should complete within 20s");
         assert!(client.is_alive(), "client should be alive after initialize");
         let main_rs = root.join("src").join("main.rs");
         let text = std::fs::read_to_string(&main_rs).expect("read src/main.rs");

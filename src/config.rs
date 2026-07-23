@@ -13,6 +13,16 @@ pub struct Config {
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
     pub show_pet: bool,
+    /// state.toml へ書き戻すグローバル値の控え (プロジェクト overlay 適用前)。
+    /// save_state はこちらを書くので、.zaivern.toml のプロジェクト値が
+    /// グローバル state.toml へ漏れて永続化されることはない。
+    /// 設定ファイルには読み書きしない (メモリ上だけ)。
+    #[serde(skip)]
+    pub global_theme: String,
+    #[serde(skip)]
+    pub global_approval_mode: String,
+    #[serde(skip)]
+    pub global_show_pet: bool,
     /// ペット画像のフルパス(None なら内蔵ドット絵)
     pub pet_image: Option<String>,
     /// ペットの固定位置(None なら右下うろうろ)
@@ -170,6 +180,9 @@ impl Default for Config {
             show_hidden_files: true,
             approval_mode: "ask".into(),
             show_pet: true,
+            global_theme: "zaivern-dark".into(),
+            global_approval_mode: "ask".into(),
+            global_show_pet: true,
             pet_image: None,
             pet_x: None,
             pet_y: None,
@@ -318,6 +331,8 @@ pub fn config_path() -> PathBuf {
     zaivern_dir().join("config.toml")
 }
 
+// 実体は save_state_to_dir() が dir から組むため、現在はテストからのみ参照。
+#[allow(dead_code)]
 pub fn state_path() -> PathBuf {
     zaivern_dir().join("state.toml")
 }
@@ -511,8 +526,12 @@ pub fn ensure_default() {
 /// 上書きマージ (last wins) — いずれも従来の単一ルート時の規則そのまま。
 pub fn load(roots: &[PathBuf], with_state: bool) -> Config {
     ensure_default();
+    load_from_dir(&zaivern_dir(), roots, with_state)
+}
 
-    let mut cfg: Config = std::fs::read_to_string(config_path())
+/// `load()` の実体。テストから一時ディレクトリを差し込めるよう分離している。
+fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
+    let mut cfg: Config = std::fs::read_to_string(dir.join("config.toml"))
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default();
@@ -522,7 +541,7 @@ pub fn load(roots: &[PathBuf], with_state: bool) -> Config {
     }
 
     if with_state {
-        if let Ok(s) = std::fs::read_to_string(state_path()) {
+        if let Ok(s) = std::fs::read_to_string(dir.join("state.toml")) {
             if let Ok(st) = toml::from_str::<UiState>(&s) {
                 if let Some(t) = st.theme {
                     cfg.theme = t;
@@ -597,12 +616,20 @@ pub fn load(roots: &[PathBuf], with_state: bool) -> Config {
         }
     }
 
+    // overlay を重ねる前のグローバル値を控える。save_state はこの控えを書く。
+    cfg.global_theme = cfg.theme.clone();
+    cfg.global_approval_mode = cfg.approval_mode.clone();
+    cfg.global_show_pet = cfg.show_pet;
+
     for root in roots {
         apply_overlay(&mut cfg, root);
     }
 
     if cfg.approval_mode != "auto" && cfg.approval_mode != "agent" {
         cfg.approval_mode = "ask".into();
+    }
+    if cfg.global_approval_mode != "auto" && cfg.global_approval_mode != "agent" {
+        cfg.global_approval_mode = "ask".into();
     }
     cfg.editor_font_size = cfg.editor_font_size.clamp(8.0, 32.0);
     cfg.terminal_font_size = cfg.terminal_font_size.clamp(7.0, 28.0);
@@ -818,11 +845,20 @@ fn render_plugins_section(plugins: &PluginsConfig) -> String {
 
 /// Persist the current UI choices (theme / approval mode / pet) without
 /// touching the user's hand-written config.toml.
+///
+/// theme / approval_mode / show_pet はプロジェクト overlay で上書きされ得るため、
+/// セッション中の値ではなく `global_*` の控えを書く。UI から変更したときは
+/// 呼び出し側が控えも更新するので、本当の変更はちゃんと永続化される。
 pub fn save_state(cfg: &Config) {
+    save_state_to_dir(&zaivern_dir(), cfg);
+}
+
+/// `save_state()` の実体。テストから一時ディレクトリを差し込めるよう分離している。
+fn save_state_to_dir(dir: &Path, cfg: &Config) {
     let st = UiState {
-        theme: Some(cfg.theme.clone()),
-        approval_mode: Some(cfg.approval_mode.clone()),
-        show_pet: Some(cfg.show_pet),
+        theme: Some(cfg.global_theme.clone()),
+        approval_mode: Some(cfg.global_approval_mode.clone()),
+        show_pet: Some(cfg.global_show_pet),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -845,8 +881,8 @@ pub fn save_state(cfg: &Config) {
         super_agent_timeout_secs: Some(cfg.super_agent.timeout_secs),
     };
     if let Ok(s) = toml::to_string_pretty(&st) {
-        let _ = std::fs::create_dir_all(zaivern_dir());
-        let _ = std::fs::write(state_path(), s);
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(dir.join("state.toml"), s);
     }
 }
 
@@ -855,8 +891,8 @@ mod tests {
     use super::*;
 
     // load() / ensure_default() / save_state() は実ユーザーの ~/.zaivern を
-    // 読み書きするためテストしない。ここでは純粋なパース・既定値・マージ対象の
-    // データ構造だけを検証する。
+    // 読み書きするためテストしない。実体の load_from_dir() / save_state_to_dir()
+    // は state_overlay_tests で一時ディレクトリを差し込んで検証する。
 
     // ---- Config / AgentPreset の既定値 ----
 
@@ -1644,5 +1680,73 @@ mod plugins_config_tests {
         let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定 config.toml が壊れている");
         assert!(cfg.plugins.is_enabled("worktrees"));
         assert!(!cfg.agents.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod state_overlay_tests {
+    use super::*;
+
+    // プロジェクト overlay とグローバル state.toml の分離。
+    // 実ユーザーの ~/.zaivern に触れないよう、実体の load_from_dir() /
+    // save_state_to_dir() に一時ディレクトリを差し込んで検証する。
+
+    #[test]
+    fn プロジェクトoverlayの値はsave_stateでグローバルに漏れない() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "no-leak-home");
+        let root = crate::test_util::unique_temp_dir("zaivern-config-test", "no-leak-root");
+        std::fs::write(
+            home.join("state.toml"),
+            "theme = \"global-theme\"\napproval_mode = \"auto\"\nshow_pet = false\n",
+        )
+        .expect("write state.toml");
+        std::fs::write(
+            root.join(".zaivern.toml"),
+            "theme = \"project-theme\"\napproval_mode = \"agent\"\nshow_pet = true\n",
+        )
+        .expect("write .zaivern.toml");
+
+        let cfg = load_from_dir(&home, &[root.clone()], true);
+        // セッション中はプロジェクトの値が効く
+        assert_eq!(cfg.theme, "project-theme");
+        assert_eq!(cfg.approval_mode, "agent");
+        assert!(cfg.show_pet);
+
+        // プロジェクトを開いただけで保存されても、グローバルは壊れない
+        save_state_to_dir(&home, &cfg);
+        let raw = std::fs::read_to_string(home.join("state.toml")).expect("re-read state.toml");
+        let st: UiState = toml::from_str(&raw).expect("parse state.toml");
+        assert_eq!(st.theme.as_deref(), Some("global-theme"));
+        assert_eq!(st.approval_mode.as_deref(), Some("auto"));
+        assert_eq!(st.show_pet, Some(false));
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ユーザーが変えた値はoverlay下でも永続化される() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "persist-home");
+        let root = crate::test_util::unique_temp_dir("zaivern-config-test", "persist-root");
+        std::fs::write(home.join("state.toml"), "theme = \"global-theme\"\n")
+            .expect("write state.toml");
+        std::fs::write(root.join(".zaivern.toml"), "theme = \"project-theme\"\n")
+            .expect("write .zaivern.toml");
+
+        let mut cfg = load_from_dir(&home, &[root.clone()], true);
+        // UI からの変更相当 (Cmd::SetTheme / Cmd::TogglePet): 控えも一緒に更新する
+        cfg.theme = "user-picked".into();
+        cfg.global_theme = "user-picked".into();
+        cfg.show_pet = false;
+        cfg.global_show_pet = false;
+
+        save_state_to_dir(&home, &cfg);
+        let raw = std::fs::read_to_string(home.join("state.toml")).expect("re-read state.toml");
+        let st: UiState = toml::from_str(&raw).expect("parse state.toml");
+        assert_eq!(st.theme.as_deref(), Some("user-picked"));
+        assert_eq!(st.show_pet, Some(false));
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
