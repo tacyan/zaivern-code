@@ -146,12 +146,11 @@ fn ground_shadow(painter: &Painter, rect: Rect, u: f32, lift: f32, dragging: boo
 }
 
 /// 白目＋瞳タイプの目を 1 個描く（カニ・ネコ用）
-/// `rx`/`ry` は白目の半径（px）。`look` は瞳のカーソル追従オフセット。
+/// `r` は白目の半径（px、x=横/y=縦）。`look` は瞳のカーソル追従オフセット。
 fn draw_ball_eye(
     painter: &Painter,
     c: Pos2,
-    rx: f32,
-    ry: f32,
+    r: Vec2,
     mode: EyeMode,
     look: Vec2,
     ink: Color32,
@@ -161,21 +160,21 @@ fn draw_ball_eye(
     match mode {
         EyeMode::Closed => {
             // 閉眼 → 水平線
-            painter.line_segment([c + vec2(-rx, 0.0), c + vec2(rx, 0.0)], Stroke::new(lw, ink));
+            painter.line_segment([c + vec2(-r.x, 0.0), c + vec2(r.x, 0.0)], Stroke::new(lw, ink));
         }
         EyeMode::Cross => {
             // ×目
-            let r = rx * 0.9;
-            painter.line_segment([c + vec2(-r, -r), c + vec2(r, r)], Stroke::new(lw, ink));
-            painter.line_segment([c + vec2(-r, r), c + vec2(r, -r)], Stroke::new(lw, ink));
+            let d = r.x * 0.9;
+            painter.line_segment([c + vec2(-d, -d), c + vec2(d, d)], Stroke::new(lw, ink));
+            painter.line_segment([c + vec2(-d, d), c + vec2(d, -d)], Stroke::new(lw, ink));
         }
         EyeMode::Arc => {
             // にっこり ^ の山型アーク
             painter.add(Shape::line(
                 vec![
-                    c + vec2(-rx, ry * 0.4),
-                    c + vec2(0.0, -ry * 0.5),
-                    c + vec2(rx, ry * 0.4),
+                    c + vec2(-r.x, r.y * 0.4),
+                    c + vec2(0.0, -r.y * 0.5),
+                    c + vec2(r.x, r.y * 0.4),
                 ],
                 Stroke::new(lw, ink),
             ));
@@ -183,25 +182,25 @@ fn draw_ball_eye(
         EyeMode::Open | EyeMode::Half => {
             // 半目は白目を下半分だけにして上にまぶた線を引く
             let (cc, ry2) = if mode == EyeMode::Half {
-                (c + vec2(0.0, ry * 0.25), ry * 0.55)
+                (c + vec2(0.0, r.y * 0.25), r.y * 0.55)
             } else {
-                (c, ry)
+                (c, r.y)
             };
-            painter.add(Shape::ellipse_filled(cc, vec2(rx, ry2), Color32::WHITE));
+            painter.add(Shape::ellipse_filled(cc, vec2(r.x, ry2), Color32::WHITE));
             painter.add(Shape::ellipse_stroke(
                 cc,
-                vec2(rx, ry2),
+                vec2(r.x, ry2),
                 Stroke::new(1.0 * u, ink),
             ));
             if mode == EyeMode::Half {
                 painter.line_segment(
-                    [cc + vec2(-rx, -ry2), cc + vec2(rx, -ry2)],
+                    [cc + vec2(-r.x, -ry2), cc + vec2(r.x, -ry2)],
                     Stroke::new(lw, ink),
                 );
             }
             // 瞳: eye_look に追従（白目からはみ出さない範囲でクランプ）
             let off = vec2(
-                look.x.clamp(-rx * 0.4, rx * 0.4),
+                look.x.clamp(-r.x * 0.4, r.x * 0.4),
                 look.y.clamp(-ry2 * 0.35, ry2 * 0.35),
             );
             painter.circle_filled(cc + off, ry2 * 0.5, ink);
@@ -333,8 +332,8 @@ pub fn draw_crab(painter: &Painter, rect: Rect, t: f64, state: PetState, p: &Dra
             Stroke::new(2.0 * u, OUTLINE),
         );
     }
-    draw_ball_eye(painter, le, 4.8 * u, 4.8 * u, eyes, p.eye_look, Color32::BLACK, u);
-    draw_ball_eye(painter, re, 4.8 * u, 4.8 * u, eyes, p.eye_look, Color32::BLACK, u);
+    draw_ball_eye(painter, le, vec2(4.8 * u, 4.8 * u), eyes, p.eye_look, Color32::BLACK, u);
+    draw_ball_eye(painter, re, vec2(4.8 * u, 4.8 * u), eyes, p.eye_look, Color32::BLACK, u);
     if state == PetState::Annoyed {
         angry_brows(painter, le, re, OUTLINE, u);
     }
@@ -438,8 +437,8 @@ pub fn draw_cat(painter: &Painter, rect: Rect, t: f64, state: PetState, p: &Draw
     // ── 目（アーモンド形。瞳がカーソル追従） ──
     let eyes = eye_mode(state, p.blink);
     let (le, re) = (q(-6.0, -2.0), q(6.0, -2.0));
-    draw_ball_eye(painter, le, 3.4 * u, 2.6 * u, eyes, p.eye_look, INK, u);
-    draw_ball_eye(painter, re, 3.4 * u, 2.6 * u, eyes, p.eye_look, INK, u);
+    draw_ball_eye(painter, le, vec2(3.4 * u, 2.6 * u), eyes, p.eye_look, INK, u);
+    draw_ball_eye(painter, re, vec2(3.4 * u, 2.6 * u), eyes, p.eye_look, INK, u);
     if state == PetState::Annoyed {
         angry_brows(painter, le, re, INK, u);
     }

@@ -448,6 +448,15 @@ fn spans_width(ui: &egui::Ui, text: &str, size: f32) -> f32 {
     })
 }
 
+/// テーブルセルの書式ひとまとめ (table_cell_ui の引数構造化用。値の器のみで計算はしない)。
+#[derive(Clone, Copy)]
+struct CellStyle {
+    size: f32,
+    strong: bool,
+    color: Color32,
+    align: TableAlign,
+}
+
 /// テーブルの1セルを揃え付きで描く。
 /// 中央/右揃えの列はセル幅いっぱいを確保して余白で寄せる
 /// (egui::Grid のセルは常に左詰めのため、揃えはセル内で自前で行う)。
@@ -455,12 +464,10 @@ fn table_cell_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     text: &str,
-    size: f32,
-    strong_all: bool,
-    color: Color32,
-    align: TableAlign,
+    style: CellStyle,
     rctx: &mut RenderCtx,
 ) {
+    let CellStyle { size, strong: strong_all, color, align } = style;
     if align == TableAlign::Left {
         line_ui(ui, theme, text, size, strong_all, color, rctx);
         return;
@@ -635,18 +642,24 @@ pub fn render(
                                 .spacing([16.0, 5.0])
                                 .show(ui, |ui| {
                                     for (c, cell) in header.iter().enumerate() {
-                                        table_cell_ui(
-                                            ui, theme, cell, base, true, theme.text,
-                                            col_align(c), rctx,
-                                        );
+                                        let style = CellStyle {
+                                            size: base,
+                                            strong: true,
+                                            color: theme.text,
+                                            align: col_align(c),
+                                        };
+                                        table_cell_ui(ui, theme, cell, style, rctx);
                                     }
                                     ui.end_row();
                                     for row in &rows {
                                         for (c, cell) in row.iter().enumerate() {
-                                            table_cell_ui(
-                                                ui, theme, cell, base, false, theme.text,
-                                                col_align(c), rctx,
-                                            );
+                                            let style = CellStyle {
+                                                size: base,
+                                                strong: false,
+                                                color: theme.text,
+                                                align: col_align(c),
+                                            };
+                                            table_cell_ui(ui, theme, cell, style, rctx);
                                         }
                                         ui.end_row();
                                     }

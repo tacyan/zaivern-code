@@ -405,275 +405,6 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_is_10_hex_chars() {
-        let t = gen_token();
-        assert_eq!(t.len(), 10);
-        assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn subslice_finds_header_end() {
-        assert_eq!(find_subslice(b"GET / HTTP/1.1\r\n\r\nbody", b"\r\n\r\n"), Some(14));
-        assert_eq!(find_subslice(b"abc", b"\r\n\r\n"), None);
-    }
-
-    #[test]
-    fn page_contains_required_parts() {
-        // 埋め込みページが最低限の構造を持つこと (生文字列の破損検知)
-        assert!(PAGE.contains("<!DOCTYPE html>"));
-        assert!(PAGE.contains("/api/state"));
-        assert!(PAGE.contains("/api/term"));
-        assert!(PAGE.contains("</html>"));
-        // JS 側のエスケープが実制御文字に化けていないこと
-        assert!(PAGE.contains("\\u001b"));
-        assert!(!PAGE.contains('\u{1b}'));
-    }
-
-    #[test]
-    fn page_contains_voice_input_parts() {
-        // エージェント毎の音声入力モード (Web Speech API) が組み込まれていること
-        assert!(PAGE.contains("webkitSpeechRecognition"));
-        assert!(PAGE.contains("音声入力モード"));
-        assert!(PAGE.contains("startVoice"));
-        assert!(PAGE.contains("stopVoice"));
-        assert!(PAGE.contains("chip mic"));
-    }
-
-    #[test]
-    fn pages_never_auto_send() {
-        // 話しただけで送信されないこと: 送信はボタン経由の関数だけが行う。
-        // 認識結果ハンドラから直接 API を叩く実装に戻したら気付けるようにする。
-        assert!(PAGE.contains("sendInput"));
-        assert!(!PAGE.contains("sendVoice"));
-        assert!(PAGE.contains("入れる"));
-        assert!(VOICE_PAGE.contains("id=\"draft\""));
-        assert!(VOICE_PAGE.contains("send(true)"));
-        assert!(VOICE_PAGE.contains("send(false)"));
-        assert!(VOICE_PAGE.contains("submit: submit"));
-    }
-
-    #[test]
-    fn voice_page_contains_required_parts() {
-        // PC 用音声入力ページ (生文字列の破損検知)
-        assert!(VOICE_PAGE.contains("<!DOCTYPE html>"));
-        assert!(VOICE_PAGE.contains("webkitSpeechRecognition"));
-        assert!(VOICE_PAGE.contains("/api/voice"));
-        assert!(VOICE_PAGE.contains("/api/state"));
-        assert!(VOICE_PAGE.contains("全エージェントへブロードキャスト"));
-        assert!(VOICE_PAGE.contains("入力欄へ入れる"));
-        assert!(VOICE_PAGE.contains("</html>"));
-        // 実制御文字が紛れ込んでいないこと
-        assert!(!VOICE_PAGE.contains('\u{1b}'));
-    }
-
-    #[test]
-    fn pages_detect_insecure_context() {
-        // http (LAN の IP) では Web Speech API が動かない。両ページとも
-        // 事前判定して、黙って壊れるのではなく理由を出すこと
-        for p in [PAGE, VOICE_PAGE] {
-            assert!(p.contains("isSecureContext"));
-            assert!(p.contains("speechBlockReason"));
-            assert!(p.contains("'insecure'"));
-            assert!(p.contains("'unsupported'"));
-        }
-    }
-
-    #[test]
-    fn pages_guide_to_keyboard_dictation() {
-        // 使えない端末では OS キーボードの音声入力へ逃がす。
-        // 案内文は「原因」と「次にすること」の両方を日本語で書くこと
-        for p in [PAGE, VOICE_PAGE] {
-            assert!(p.contains("keyboardDictation"));
-            assert!(p.contains("dictationHint"));
-            // 次にすること (キーボードの音声入力を使う)
-            assert!(p.contains("を押して、入力欄に話しかけてください"));
-            // 原因
-            assert!(p.contains("この接続 (http) ではブラウザの音声認識が使えません。"));
-            assert!(p.contains("このブラウザは音声認識 (Web Speech API) に未対応です。"));
-            // PC 側の案内は実ポートを埋める (8899 決め打ちにしない)
-            assert!(p.contains("location.port"));
-            assert!(p.contains("'/voice'"));
-        }
-    }
-
-    #[test]
-    fn pages_handle_network_error_without_restart_loop() {
-        // network は http 経由では復帰しない。再開させず案内に切り替えること。
-        // no-speech (無音) だけは従来どおり onend で再開してよい
-        for p in [PAGE, VOICE_PAGE] {
-            assert!(p.contains("e === 'network'"));
-            assert!(p.contains("keyboardDictation"));
-            assert!(p.contains("if (e === 'no-speech') return;"));
-        }
-    }
-
-    #[test]
-    fn fatal_voice_error_does_not_auto_restart() {
-        // 致命的エラー後に onend が再開すると、画面上は無反応のまま無限に回る。
-        // voiceFatal ガードで止まっていること
-        for p in [PAGE, VOICE_PAGE] {
-            assert!(p.contains("voiceFatal"));
-            assert!(p.contains("if (voiceFatal) return;"));
-            assert!(p.contains("voiceFatal = true"));
-            // 再開のたびにガードを解除していること (一度きりで死なない)
-            assert!(p.contains("voiceFatal = false"));
-        }
-    }
-
-    // ─── Query の純粋ロジック ────────────────────────────────────────
-
-    /// 全 variant を代表値で 1 つずつ構築する (網羅テスト用)。
-    fn all_query_variants() -> Vec<Query> {
-        vec![
-            Query::State,
-            Query::File,
-            Query::Files,
-            Query::SetText {
-                text: "abc".into(),
-                index: 0,
-                save: false,
-            },
-            Query::Cmd("save".into(), 1),
-            Query::OpenFile("src/main.rs".into(), Some(10)),
-            Query::Notify("hello".into(), "info".into()),
-            Query::SetPanel {
-                plugin: "p".into(),
-                panel: "out".into(),
-                text: "t".into(),
-            },
-            Query::SetStatus("busy".into()),
-            Query::Prompt {
-                text: "fix it".into(),
-                agent: String::new(),
-                submit: false,
-            },
-            Query::Tab(2),
-            Query::Term,
-            Query::TermInput("ls".into(), false),
-            Query::VoiceSend {
-                text: "音声".into(),
-                id: -1,
-                submit: false,
-            },
-        ]
-    }
-
-    #[test]
-    fn fire_and_forget_classification_covers_every_variant() {
-        // 期待値をワイルドカード無しの match で書く: variant を追加すると
-        // ここがコンパイルエラーになり、分類の見直しを強制できる
-        for q in all_query_variants() {
-            let expected = match &q {
-                // 現在の状態を読む要求 (+ 状態を返す必要がある操作) は応答を待つ
-                Query::State
-                | Query::File
-                | Query::Files
-                | Query::SetText { .. }
-                | Query::Tab(..)
-                | Query::Term
-                | Query::VoiceSend { .. } => false,
-                // 一方向の指示はキューに積んだ時点で成功 (macOS 凍結対策)
-                Query::Notify(..)
-                | Query::SetPanel { .. }
-                | Query::SetStatus(..)
-                | Query::Prompt { .. }
-                | Query::OpenFile(..)
-                | Query::Cmd(..)
-                | Query::TermInput(..) => true,
-            };
-            assert_eq!(q.is_fire_and_forget(), expected);
-        }
-    }
-
-    #[test]
-    fn state_reading_queries_wait_for_reply() {
-        // State/File/Files/Term は実際の値が必要なので即答してはいけない
-        assert!(!Query::State.is_fire_and_forget());
-        assert!(!Query::File.is_fire_and_forget());
-        assert!(!Query::Files.is_fire_and_forget());
-        assert!(!Query::Term.is_fire_and_forget());
-        assert!(!Query::Tab(0).is_fire_and_forget());
-    }
-
-    #[test]
-    fn one_way_commands_are_fire_and_forget() {
-        assert!(Query::Notify("n".into(), "warn".into()).is_fire_and_forget());
-        assert!(Query::SetStatus(String::new()).is_fire_and_forget());
-        assert!(Query::Cmd("build".into(), 0).is_fire_and_forget());
-        assert!(Query::SetPanel {
-            plugin: String::new(),
-            panel: "log".into(),
-            text: "x".into(),
-        }
-        .is_fire_and_forget());
-    }
-
-    #[test]
-    fn set_text_always_waits_even_with_save() {
-        // タブ不一致なら拒否される (誤上書き防止) ので、結果を返す必要がある
-        for save in [false, true] {
-            let q = Query::SetText {
-                text: "body".into(),
-                index: 1,
-                save,
-            };
-            assert!(!q.is_fire_and_forget());
-        }
-    }
-
-    #[test]
-    fn voice_send_always_waits() {
-        // 挿入のみ / 送信あり / ブロードキャストのどれでも応答を待つ
-        for (id, submit) in [(0i64, false), (3, true), (-1, false), (-1, true)] {
-            let q = Query::VoiceSend {
-                text: "テスト".into(),
-                id,
-                submit,
-            };
-            assert!(!q.is_fire_and_forget());
-        }
-    }
-
-    #[test]
-    fn prompt_is_fire_and_forget_regardless_of_flags() {
-        // agent 指定や submit の有無で分類が変わらないこと
-        for (agent, submit) in [("", false), ("", true), ("claude", false), ("claude", true)] {
-            let q = Query::Prompt {
-                text: "p".into(),
-                agent: agent.into(),
-                submit,
-            };
-            assert!(q.is_fire_and_forget());
-        }
-    }
-
-    #[test]
-    fn term_input_is_fire_and_forget_for_text_and_raw() {
-        // テキスト+Enter (raw=false) も制御バイト列 (raw=true) も片道
-        assert!(Query::TermInput("echo hi".into(), false).is_fire_and_forget());
-        assert!(Query::TermInput("\x03".into(), true).is_fire_and_forget());
-    }
-
-    #[test]
-    fn open_file_is_fire_and_forget_with_and_without_line() {
-        assert!(Query::OpenFile("a.rs".into(), None).is_fire_and_forget());
-        assert!(Query::OpenFile("a.rs".into(), Some(42)).is_fire_and_forget());
-    }
-
-    #[test]
-    fn ack_is_fixed_queued_json_for_all_variants() {
-        // ack は variant によらず固定の JSON (スマホ側 JS が queued を見る)
-        for q in all_query_variants() {
-            assert_eq!(q.ack(), r#"{"ok":true,"queued":true}"#);
-        }
-    }
-}
-
 // ─── スマホ用ページ (完全内蔵・依存ゼロ) ─────────────────────────────
 
 const PAGE: &str = r##"<!DOCTYPE html>
@@ -1447,3 +1178,272 @@ setInterval(poll, 2500);
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_is_10_hex_chars() {
+        let t = gen_token();
+        assert_eq!(t.len(), 10);
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn subslice_finds_header_end() {
+        assert_eq!(find_subslice(b"GET / HTTP/1.1\r\n\r\nbody", b"\r\n\r\n"), Some(14));
+        assert_eq!(find_subslice(b"abc", b"\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn page_contains_required_parts() {
+        // 埋め込みページが最低限の構造を持つこと (生文字列の破損検知)
+        assert!(PAGE.contains("<!DOCTYPE html>"));
+        assert!(PAGE.contains("/api/state"));
+        assert!(PAGE.contains("/api/term"));
+        assert!(PAGE.contains("</html>"));
+        // JS 側のエスケープが実制御文字に化けていないこと
+        assert!(PAGE.contains("\\u001b"));
+        assert!(!PAGE.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn page_contains_voice_input_parts() {
+        // エージェント毎の音声入力モード (Web Speech API) が組み込まれていること
+        assert!(PAGE.contains("webkitSpeechRecognition"));
+        assert!(PAGE.contains("音声入力モード"));
+        assert!(PAGE.contains("startVoice"));
+        assert!(PAGE.contains("stopVoice"));
+        assert!(PAGE.contains("chip mic"));
+    }
+
+    #[test]
+    fn pages_never_auto_send() {
+        // 話しただけで送信されないこと: 送信はボタン経由の関数だけが行う。
+        // 認識結果ハンドラから直接 API を叩く実装に戻したら気付けるようにする。
+        assert!(PAGE.contains("sendInput"));
+        assert!(!PAGE.contains("sendVoice"));
+        assert!(PAGE.contains("入れる"));
+        assert!(VOICE_PAGE.contains("id=\"draft\""));
+        assert!(VOICE_PAGE.contains("send(true)"));
+        assert!(VOICE_PAGE.contains("send(false)"));
+        assert!(VOICE_PAGE.contains("submit: submit"));
+    }
+
+    #[test]
+    fn voice_page_contains_required_parts() {
+        // PC 用音声入力ページ (生文字列の破損検知)
+        assert!(VOICE_PAGE.contains("<!DOCTYPE html>"));
+        assert!(VOICE_PAGE.contains("webkitSpeechRecognition"));
+        assert!(VOICE_PAGE.contains("/api/voice"));
+        assert!(VOICE_PAGE.contains("/api/state"));
+        assert!(VOICE_PAGE.contains("全エージェントへブロードキャスト"));
+        assert!(VOICE_PAGE.contains("入力欄へ入れる"));
+        assert!(VOICE_PAGE.contains("</html>"));
+        // 実制御文字が紛れ込んでいないこと
+        assert!(!VOICE_PAGE.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn pages_detect_insecure_context() {
+        // http (LAN の IP) では Web Speech API が動かない。両ページとも
+        // 事前判定して、黙って壊れるのではなく理由を出すこと
+        for p in [PAGE, VOICE_PAGE] {
+            assert!(p.contains("isSecureContext"));
+            assert!(p.contains("speechBlockReason"));
+            assert!(p.contains("'insecure'"));
+            assert!(p.contains("'unsupported'"));
+        }
+    }
+
+    #[test]
+    fn pages_guide_to_keyboard_dictation() {
+        // 使えない端末では OS キーボードの音声入力へ逃がす。
+        // 案内文は「原因」と「次にすること」の両方を日本語で書くこと
+        for p in [PAGE, VOICE_PAGE] {
+            assert!(p.contains("keyboardDictation"));
+            assert!(p.contains("dictationHint"));
+            // 次にすること (キーボードの音声入力を使う)
+            assert!(p.contains("を押して、入力欄に話しかけてください"));
+            // 原因
+            assert!(p.contains("この接続 (http) ではブラウザの音声認識が使えません。"));
+            assert!(p.contains("このブラウザは音声認識 (Web Speech API) に未対応です。"));
+            // PC 側の案内は実ポートを埋める (8899 決め打ちにしない)
+            assert!(p.contains("location.port"));
+            assert!(p.contains("'/voice'"));
+        }
+    }
+
+    #[test]
+    fn pages_handle_network_error_without_restart_loop() {
+        // network は http 経由では復帰しない。再開させず案内に切り替えること。
+        // no-speech (無音) だけは従来どおり onend で再開してよい
+        for p in [PAGE, VOICE_PAGE] {
+            assert!(p.contains("e === 'network'"));
+            assert!(p.contains("keyboardDictation"));
+            assert!(p.contains("if (e === 'no-speech') return;"));
+        }
+    }
+
+    #[test]
+    fn fatal_voice_error_does_not_auto_restart() {
+        // 致命的エラー後に onend が再開すると、画面上は無反応のまま無限に回る。
+        // voiceFatal ガードで止まっていること
+        for p in [PAGE, VOICE_PAGE] {
+            assert!(p.contains("voiceFatal"));
+            assert!(p.contains("if (voiceFatal) return;"));
+            assert!(p.contains("voiceFatal = true"));
+            // 再開のたびにガードを解除していること (一度きりで死なない)
+            assert!(p.contains("voiceFatal = false"));
+        }
+    }
+
+    // ─── Query の純粋ロジック ────────────────────────────────────────
+
+    /// 全 variant を代表値で 1 つずつ構築する (網羅テスト用)。
+    fn all_query_variants() -> Vec<Query> {
+        vec![
+            Query::State,
+            Query::File,
+            Query::Files,
+            Query::SetText {
+                text: "abc".into(),
+                index: 0,
+                save: false,
+            },
+            Query::Cmd("save".into(), 1),
+            Query::OpenFile("src/main.rs".into(), Some(10)),
+            Query::Notify("hello".into(), "info".into()),
+            Query::SetPanel {
+                plugin: "p".into(),
+                panel: "out".into(),
+                text: "t".into(),
+            },
+            Query::SetStatus("busy".into()),
+            Query::Prompt {
+                text: "fix it".into(),
+                agent: String::new(),
+                submit: false,
+            },
+            Query::Tab(2),
+            Query::Term,
+            Query::TermInput("ls".into(), false),
+            Query::VoiceSend {
+                text: "音声".into(),
+                id: -1,
+                submit: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn fire_and_forget_classification_covers_every_variant() {
+        // 期待値をワイルドカード無しの match で書く: variant を追加すると
+        // ここがコンパイルエラーになり、分類の見直しを強制できる
+        for q in all_query_variants() {
+            let expected = match &q {
+                // 現在の状態を読む要求 (+ 状態を返す必要がある操作) は応答を待つ
+                Query::State
+                | Query::File
+                | Query::Files
+                | Query::SetText { .. }
+                | Query::Tab(..)
+                | Query::Term
+                | Query::VoiceSend { .. } => false,
+                // 一方向の指示はキューに積んだ時点で成功 (macOS 凍結対策)
+                Query::Notify(..)
+                | Query::SetPanel { .. }
+                | Query::SetStatus(..)
+                | Query::Prompt { .. }
+                | Query::OpenFile(..)
+                | Query::Cmd(..)
+                | Query::TermInput(..) => true,
+            };
+            assert_eq!(q.is_fire_and_forget(), expected);
+        }
+    }
+
+    #[test]
+    fn state_reading_queries_wait_for_reply() {
+        // State/File/Files/Term は実際の値が必要なので即答してはいけない
+        assert!(!Query::State.is_fire_and_forget());
+        assert!(!Query::File.is_fire_and_forget());
+        assert!(!Query::Files.is_fire_and_forget());
+        assert!(!Query::Term.is_fire_and_forget());
+        assert!(!Query::Tab(0).is_fire_and_forget());
+    }
+
+    #[test]
+    fn one_way_commands_are_fire_and_forget() {
+        assert!(Query::Notify("n".into(), "warn".into()).is_fire_and_forget());
+        assert!(Query::SetStatus(String::new()).is_fire_and_forget());
+        assert!(Query::Cmd("build".into(), 0).is_fire_and_forget());
+        assert!(Query::SetPanel {
+            plugin: String::new(),
+            panel: "log".into(),
+            text: "x".into(),
+        }
+        .is_fire_and_forget());
+    }
+
+    #[test]
+    fn set_text_always_waits_even_with_save() {
+        // タブ不一致なら拒否される (誤上書き防止) ので、結果を返す必要がある
+        for save in [false, true] {
+            let q = Query::SetText {
+                text: "body".into(),
+                index: 1,
+                save,
+            };
+            assert!(!q.is_fire_and_forget());
+        }
+    }
+
+    #[test]
+    fn voice_send_always_waits() {
+        // 挿入のみ / 送信あり / ブロードキャストのどれでも応答を待つ
+        for (id, submit) in [(0i64, false), (3, true), (-1, false), (-1, true)] {
+            let q = Query::VoiceSend {
+                text: "テスト".into(),
+                id,
+                submit,
+            };
+            assert!(!q.is_fire_and_forget());
+        }
+    }
+
+    #[test]
+    fn prompt_is_fire_and_forget_regardless_of_flags() {
+        // agent 指定や submit の有無で分類が変わらないこと
+        for (agent, submit) in [("", false), ("", true), ("claude", false), ("claude", true)] {
+            let q = Query::Prompt {
+                text: "p".into(),
+                agent: agent.into(),
+                submit,
+            };
+            assert!(q.is_fire_and_forget());
+        }
+    }
+
+    #[test]
+    fn term_input_is_fire_and_forget_for_text_and_raw() {
+        // テキスト+Enter (raw=false) も制御バイト列 (raw=true) も片道
+        assert!(Query::TermInput("echo hi".into(), false).is_fire_and_forget());
+        assert!(Query::TermInput("\x03".into(), true).is_fire_and_forget());
+    }
+
+    #[test]
+    fn open_file_is_fire_and_forget_with_and_without_line() {
+        assert!(Query::OpenFile("a.rs".into(), None).is_fire_and_forget());
+        assert!(Query::OpenFile("a.rs".into(), Some(42)).is_fire_and_forget());
+    }
+
+    #[test]
+    fn ack_is_fixed_queued_json_for_all_variants() {
+        // ack は variant によらず固定の JSON (スマホ側 JS が queued を見る)
+        for q in all_query_variants() {
+            assert_eq!(q.ack(), r#"{"ok":true,"queued":true}"#);
+        }
+    }
+}
