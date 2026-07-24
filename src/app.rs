@@ -4887,34 +4887,7 @@ impl ZaivernApp {
         md_images: &mut markdown::ImageCache,
         pl: &mut PluginActions,
     ) {
-        let md_base = self.cfg.editor_font_size;
-        let hl = &self.highlighter;
-        ui.horizontal(|ui| {
-            if ui
-                .button(tr("➕ 新規作成"))
-                .on_hover_text(tr("プラグインのテンプレート一式を生成"))
-                .clicked()
-            {
-                pl.new_plugin = true;
-            }
-            if ui
-                .button(tr("📦 インストール…"))
-                .on_hover_text(tr(".zvplug / .zip を取り込む"))
-                .clicked()
-            {
-                pl.install = true;
-            }
-            if ui.button("⟳").on_hover_text(tr("再スキャン")).clicked() {
-                pl.rescan = true;
-            }
-        });
-        ui.label(
-            RichText::new(tr(
-                "コマンド・テーマ・スニペットを 1 フォルダで。📤 で配布用 .zvplug を作成",
-            ))
-            .size(10.5)
-            .color(theme.text_dim),
-        );
+        self.sidebar_plugins_toolbar_ui(ui, theme, pl);
         ui.separator();
         egui::ScrollArea::vertical()
             .id_salt("zv-plugins")
@@ -4934,57 +4907,7 @@ impl ZaivernApp {
                         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                         .fill(theme.panel_alt)
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(&p.name)
-                                        .strong()
-                                        .color(theme.text),
-                                );
-                                ui.label(
-                                    RichText::new(format!("v{}", p.version))
-                                        .size(10.5)
-                                        .color(theme.text_dim),
-                                );
-                                ui.label(
-                                    RichText::new(format!("API{}", p.api))
-                                        .size(10.0)
-                                        .color(theme.text_dim),
-                                )
-                                .on_hover_text(tr(
-                                    "マニフェストの api バージョン",
-                                ));
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(
-                                        egui::Align::Center,
-                                    ),
-                                    |ui| {
-                                        if ui
-                                            .small_button("🗑")
-                                            .on_hover_text(tr("アンインストール"))
-                                            .clicked()
-                                        {
-                                            pl.uninstall = Some(p.dir.clone());
-                                        }
-                                        if ui
-                                            .small_button("📤")
-                                            .on_hover_text(tr(
-                                                "配布用 .zvplug をエクスポート",
-                                            ))
-                                            .clicked()
-                                        {
-                                            pl.export = Some(pi);
-                                        }
-                                        if ui
-                                            .small_button("📝")
-                                            .on_hover_text(tr("plugin.toml を開く"))
-                                            .clicked()
-                                        {
-                                            pl.open =
-                                                Some(p.dir.join("plugin.toml"));
-                                        }
-                                    },
-                                );
-                            });
+                            self.plugin_card_header_ui(ui, theme, pl, pi, p);
                             // 有効/無効。無効にするとコマンド・フック・
                             // パネル・テーマ・スニペットを一切登録しない
                             let mut enabled = p.enabled;
@@ -5059,127 +4982,253 @@ impl ZaivernApp {
                                 }
                             }
 
-                            // 設定 ([[setting]]) — 変更したその場で保存する
-                            if !p.settings.is_empty() {
-                                ui.add_space(2.0);
-                                egui::CollapsingHeader::new(tr("⚙ 設定"))
-                                    .id_salt(("zv-plset", pi))
-                                    .show(ui, |ui| {
-                                        for s in &p.settings {
-                                            let label = if s.label.is_empty() {
-                                                s.key.clone()
-                                            } else {
-                                                s.label.clone()
-                                            };
-                                            let cur = p.setting(&s.key);
-                                            match s.kind {
-                                                plugins::SettingType::Bool => {
-                                                    let mut on =
-                                                        cur.trim() == "true";
-                                                    if ui
-                                                        .checkbox(&mut on, label)
-                                                        .changed()
-                                                    {
-                                                        pl.setting = Some((
-                                                            p.name.clone(),
-                                                            s.key.clone(),
-                                                            on.to_string(),
-                                                        ));
-                                                    }
-                                                }
-                                                _ => {
-                                                    ui.label(
-                                                        RichText::new(label)
-                                                            .size(10.5)
-                                                            .color(theme.text_dim),
-                                                    );
-                                                    let mut v = cur.clone();
-                                                    let te =
-                                                        egui::TextEdit::singleline(
-                                                            &mut v,
-                                                        )
-                                                        .password(s.secret)
-                                                        .desired_width(f32::INFINITY);
-                                                    if ui.add(te).changed() {
-                                                        // 型に合わない入力は保存しない
-                                                        if s.kind.accepts(&v) {
-                                                            pl.setting = Some((
-                                                                p.name.clone(),
-                                                                s.key.clone(),
-                                                                v,
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
-                            }
+                            self.plugin_settings_ui(ui, theme, pl, pi, p);
 
-                            // パネル ([[panel]]) — 本文をそのまま描く
-                            for pa in &p.panels {
-                                ui.add_space(2.0);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} {}",
-                                            pa.icon, pa.title
-                                        ))
-                                        .size(11.0)
-                                        .strong()
-                                        .color(theme.text),
-                                    );
-                                    if !pa.run.trim().is_empty()
-                                        && ui
-                                            .small_button("⟳")
-                                            .on_hover_text(tr("このパネルを更新"))
-                                            .clicked()
-                                    {
-                                        pl.panel_refresh = Some((
-                                            p.name.clone(),
-                                            pa.id.clone(),
-                                        ));
-                                    }
-                                });
-                                let key =
-                                    (p.name.clone(), pa.id.clone());
-                                match panel_texts.get(&key) {
-                                    Some(t) if !t.trim().is_empty() => {
-                                        match pa.format {
-                                            plugins::PanelFormat::Markdown => {
-                                                let mut rctx =
-                                                    markdown::RenderCtx {
-                                                        dir: None,
-                                                        images: &mut *md_images,
-                                                    };
-                                                markdown::render(
-                                                    ui, theme, hl, md_base,
-                                                    t, &mut rctx,
-                                                );
-                                            }
-                                            plugins::PanelFormat::Text => {
-                                                ui.label(
-                                                    RichText::new(t)
-                                                        .monospace()
-                                                        .size(11.0)
-                                                        .color(theme.text),
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        ui.label(
-                                            RichText::new(tr("(内容なし)"))
-                                                .size(10.5)
-                                                .color(theme.text_dim),
-                                        );
-                                    }
-                                }
-                            }
+                            self.plugin_panels_ui(
+                                ui, theme, panel_texts, md_images, pl, p,
+                            );
                         });
                     ui.add_space(4.0);
                 }
             });
+    }
+
+    /// サイドバー: プラグインタブ上部のツールバー (新規/インストール/再スキャン) と
+    /// 説明行。ボタンは PluginActions に記録するだけ。
+    fn sidebar_plugins_toolbar_ui(
+        &self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        pl: &mut PluginActions,
+    ) {
+        ui.horizontal(|ui| {
+            if ui
+                .button(tr("➕ 新規作成"))
+                .on_hover_text(tr("プラグインのテンプレート一式を生成"))
+                .clicked()
+            {
+                pl.new_plugin = true;
+            }
+            if ui
+                .button(tr("📦 インストール…"))
+                .on_hover_text(tr(".zvplug / .zip を取り込む"))
+                .clicked()
+            {
+                pl.install = true;
+            }
+            if ui.button("⟳").on_hover_text(tr("再スキャン")).clicked() {
+                pl.rescan = true;
+            }
+        });
+        ui.label(
+            RichText::new(tr(
+                "コマンド・テーマ・スニペットを 1 フォルダで。📤 で配布用 .zvplug を作成",
+            ))
+            .size(10.5)
+            .color(theme.text_dim),
+        );
+    }
+
+    /// プラグインカードの見出し行 (名前/バージョン/API と右寄せの
+    /// アンインストール/エクスポート/plugin.toml ボタン)。
+    fn plugin_card_header_ui(
+        &self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        pl: &mut PluginActions,
+        pi: usize,
+        p: &plugins::Plugin,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(&p.name)
+                    .strong()
+                    .color(theme.text),
+            );
+            ui.label(
+                RichText::new(format!("v{}", p.version))
+                    .size(10.5)
+                    .color(theme.text_dim),
+            );
+            ui.label(
+                RichText::new(format!("API{}", p.api))
+                    .size(10.0)
+                    .color(theme.text_dim),
+            )
+            .on_hover_text(tr(
+                "マニフェストの api バージョン",
+            ));
+            ui.with_layout(
+                egui::Layout::right_to_left(
+                    egui::Align::Center,
+                ),
+                |ui| {
+                    if ui
+                        .small_button("🗑")
+                        .on_hover_text(tr("アンインストール"))
+                        .clicked()
+                    {
+                        pl.uninstall = Some(p.dir.clone());
+                    }
+                    if ui
+                        .small_button("📤")
+                        .on_hover_text(tr(
+                            "配布用 .zvplug をエクスポート",
+                        ))
+                        .clicked()
+                    {
+                        pl.export = Some(pi);
+                    }
+                    if ui
+                        .small_button("📝")
+                        .on_hover_text(tr("plugin.toml を開く"))
+                        .clicked()
+                    {
+                        pl.open =
+                            Some(p.dir.join("plugin.toml"));
+                    }
+                },
+            );
+        });
+    }
+
+    /// プラグインの設定 ([[setting]]) — 変更したその場で保存する。
+    fn plugin_settings_ui(
+        &self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        pl: &mut PluginActions,
+        pi: usize,
+        p: &plugins::Plugin,
+    ) {
+        if !p.settings.is_empty() {
+            ui.add_space(2.0);
+            egui::CollapsingHeader::new(tr("⚙ 設定"))
+                .id_salt(("zv-plset", pi))
+                .show(ui, |ui| {
+                    for s in &p.settings {
+                        let label = if s.label.is_empty() {
+                            s.key.clone()
+                        } else {
+                            s.label.clone()
+                        };
+                        let cur = p.setting(&s.key);
+                        match s.kind {
+                            plugins::SettingType::Bool => {
+                                let mut on =
+                                    cur.trim() == "true";
+                                if ui
+                                    .checkbox(&mut on, label)
+                                    .changed()
+                                {
+                                    pl.setting = Some((
+                                        p.name.clone(),
+                                        s.key.clone(),
+                                        on.to_string(),
+                                    ));
+                                }
+                            }
+                            _ => {
+                                ui.label(
+                                    RichText::new(label)
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                );
+                                let mut v = cur.clone();
+                                let te =
+                                    egui::TextEdit::singleline(
+                                        &mut v,
+                                    )
+                                    .password(s.secret)
+                                    .desired_width(f32::INFINITY);
+                                if ui.add(te).changed() {
+                                    // 型に合わない入力は保存しない
+                                    if s.kind.accepts(&v) {
+                                        pl.setting = Some((
+                                            p.name.clone(),
+                                            s.key.clone(),
+                                            v,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+        }
+    }
+
+    /// プラグインのパネル ([[panel]]) — 本文をそのまま描く。
+    fn plugin_panels_ui(
+        &self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        panel_texts: &HashMap<(String, String), String>,
+        md_images: &mut markdown::ImageCache,
+        pl: &mut PluginActions,
+        p: &plugins::Plugin,
+    ) {
+        let md_base = self.cfg.editor_font_size;
+        let hl = &self.highlighter;
+        for pa in &p.panels {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} {}",
+                        pa.icon, pa.title
+                    ))
+                    .size(11.0)
+                    .strong()
+                    .color(theme.text),
+                );
+                if !pa.run.trim().is_empty()
+                    && ui
+                        .small_button("⟳")
+                        .on_hover_text(tr("このパネルを更新"))
+                        .clicked()
+                {
+                    pl.panel_refresh = Some((
+                        p.name.clone(),
+                        pa.id.clone(),
+                    ));
+                }
+            });
+            let key =
+                (p.name.clone(), pa.id.clone());
+            match panel_texts.get(&key) {
+                Some(t) if !t.trim().is_empty() => {
+                    match pa.format {
+                        plugins::PanelFormat::Markdown => {
+                            let mut rctx =
+                                markdown::RenderCtx {
+                                    dir: None,
+                                    images: &mut *md_images,
+                                };
+                            markdown::render(
+                                ui, theme, hl, md_base,
+                                t, &mut rctx,
+                            );
+                        }
+                        plugins::PanelFormat::Text => {
+                            ui.label(
+                                RichText::new(t)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(theme.text),
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    ui.label(
+                        RichText::new(tr("(内容なし)"))
+                            .size(10.5)
+                            .color(theme.text_dim),
+                    );
+                }
+            }
+        }
     }
 
     /// ファイルツリー由来のアクション (開く/新規作成/リネーム/貼り付け等) を
