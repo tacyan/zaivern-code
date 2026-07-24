@@ -1912,6 +1912,11 @@ mod tests {
             mac_agent_input_bytes(egui::Key::Backspace, mac_command()),
             Some(b"\x15".as_slice())
         );
+        // ⌘K = 画面クリア (Ctrl+L)
+        assert_eq!(
+            mac_agent_input_bytes(egui::Key::K, mac_command()),
+            Some(b"\x0c".as_slice())
+        );
         // Command なしでは何も返さない
         assert_eq!(
             mac_agent_input_bytes(egui::Key::ArrowLeft, egui::Modifiers::ALT),
@@ -3059,6 +3064,7 @@ fn mac_agent_input_bytes(key: egui::Key, m: egui::Modifiers) -> Option<&'static 
         K::ArrowLeft => Some(b"\x01"),  // ⌘← = 行頭 (Ctrl+A)
         K::ArrowRight => Some(b"\x05"), // ⌘→ = 行末 (Ctrl+E)
         K::Backspace => Some(b"\x15"),  // ⌘⌫ = 行頭まで削除 (Ctrl+U)
+        K::K => Some(b"\x0c"),          // ⌘K = 画面クリア (Ctrl+L 再描画)
         _ => None,
     }
 }
