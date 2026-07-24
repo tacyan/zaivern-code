@@ -243,6 +243,26 @@ impl GlobalSearchState {
     }
 }
 
+/// プラグインタブで押されたボタン類。クロージャの中では記録だけして、
+/// パネル描画後に self へ反映する (TreeActions / GitActions と同じ流儀)。
+#[derive(Default)]
+struct PluginActions {
+    new_plugin: bool,
+    install: bool,
+    rescan: bool,
+    uninstall: Option<PathBuf>,
+    theme: Option<String>,
+    run: Option<(usize, usize)>,
+    export: Option<usize>,
+    open: Option<PathBuf>,
+    /// 有効/無効の切り替え要求 (プラグイン名, 有効か)
+    toggle: Option<(String, bool)>,
+    /// 設定値の変更要求 (プラグイン名, キー, 値)
+    setting: Option<(String, String, String)>,
+    /// パネルの手動更新要求 (プラグイン名, パネルID)
+    panel_refresh: Option<(String, String)>,
+}
+
 /// キーバインド駆動のエディタ編集操作
 enum EditOp {
     ToggleComment,
@@ -4174,14 +4194,8 @@ impl ZaivernApp {
         let mut refresh = false;
         let mut nf_root = false;
         let mut nd_root = false;
-        let mut pl_new = false;
-        let mut pl_install = false;
-        let mut pl_rescan = false;
-        let mut pl_uninstall: Option<PathBuf> = None;
-        let mut pl_theme: Option<String> = None;
-        let mut pl_run: Option<(usize, usize)> = None;
-        let mut pl_export: Option<usize> = None;
-        let mut pl_open: Option<PathBuf> = None;
+        // プラグインタブのボタン類 (クロージャの中では記録だけする)
+        let mut pl = PluginActions::default();
         let mut git_actions = git_panel::GitActions::default();
         // GitHub パネル用 (クロージャ内で self を可変借用するため先に複製しておく)
         let mut gh_actions = panels::GithubActions::default();
@@ -4192,12 +4206,6 @@ impl ZaivernApp {
             .iter()
             .map(|p| (p.icon.clone(), p.name.clone()))
             .collect();
-        // 有効/無効の切り替え要求 (プラグイン名, 有効か)
-        let mut pl_toggle: Option<(String, bool)> = None;
-        // 設定値の変更要求 (プラグイン名, キー, 値)
-        let mut pl_setting: Option<(String, String, String)> = None;
-        // パネルの手動更新要求 (プラグイン名, パネルID)
-        let mut pl_panel_refresh: Option<(String, String)> = None;
         // 検索タブ (VS Code: ⇧⌘F) のアクション。クロージャ内では記録だけして
         // パネル描画後に self へ反映する
         let mut gsearch_go = false;
@@ -4206,8 +4214,6 @@ impl ZaivernApp {
         let panel_texts = self.plugin_panels.clone();
         // Markdown パネルの描画に要るもの (画像キャッシュは借りて後で戻す)
         let mut md_images = std::mem::take(&mut self.md_images);
-        let md_base = self.cfg.editor_font_size;
-        let hl = &self.highlighter;
 
         egui::SidePanel::left("zv-side")
             .resizable(true)
@@ -4247,480 +4253,42 @@ impl ZaivernApp {
 
                 match self.sidebar_tab {
                     SidebarTab::Files => {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(roots_label(&self.roots)).strong(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("⟳").on_hover_text(tr("再読み込み")).clicked() {
-                                        refresh = true;
-                                    }
-                                    if ui.button("📂").on_hover_text(tr("新規フォルダ")).clicked() {
-                                        nd_root = true;
-                                    }
-                                    if ui.button("➕").on_hover_text(tr("新規ファイル")).clicked() {
-                                        nf_root = true;
-                                    }
-                                },
-                            );
-                        });
-                        egui::ScrollArea::vertical()
-                            .id_salt("zv-tree")
-                            .auto_shrink(false)
-                            .show(ui, |ui| {
-                                self.tree.ui(ui, &theme, &mut actions);
-                            });
-                    }
-                    SidebarTab::Search => {
-                        let (go, jump) = global_search_panel(
+                        self.sidebar_files_ui(
                             ui,
                             &theme,
-                            &mut self.gsearch,
-                            &self.file_index,
+                            &mut actions,
+                            &mut refresh,
+                            &mut nf_root,
+                            &mut nd_root,
                         );
-                        gsearch_go |= go;
-                        if jump.is_some() {
-                            gsearch_jump = jump;
-                        }
+                    }
+                    SidebarTab::Search => {
+                        self.sidebar_search_ui(
+                            ui,
+                            &theme,
+                            &mut gsearch_go,
+                            &mut gsearch_jump,
+                        );
                     }
                     SidebarTab::Agents => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("zv-agents")
-                            .auto_shrink(false)
-                            .show(ui, |ui| {
-                                let mut set_unread: Option<usize> = None;
-                                for (i, s) in self.agents.sessions.iter().enumerate() {
-                                    let active = i == self.agents.active;
-                                    let frame = egui::Frame::none()
-                                        .fill(if active {
-                                            theme.accent_soft
-                                        } else {
-                                            Color32::TRANSPARENT
-                                        })
-                                        .rounding(egui::Rounding::same(6.0))
-                                        .inner_margin(egui::Margin::symmetric(8.0, 6.0));
-                                    // 行の余白クリックでフォーカスできるようにする。
-                                    // 後掛けの ui.interact は行内の ✕/⟳/🛡 ボタンへの
-                                    // クリックを奪う (ヒットテストは後登録が勝つ) ため、
-                                    // UiBuilder::sense で行の判定を先に登録する。
-                                    let fr = ui.scope_builder(
-                                        egui::UiBuilder::new()
-                                            .id_salt(("agent-row", i))
-                                            .sense(egui::Sense::click()),
-                                        |ui| {
-                                    frame.show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let dot = if s.running() {
-                                                if s.attention {
-                                                    RichText::new("●").color(theme.warn)
-                                                } else {
-                                                    RichText::new("●").color(theme.ok)
-                                                }
-                                            } else {
-                                                RichText::new("○").color(theme.err)
-                                            };
-                                            ui.label(dot);
-                                            let badge = if s.is_permission_agent() {
-                                                s.approval_badge()
-                                            } else {
-                                                ""
-                                            };
-                                            let permission_hint = s.permission_switch_hint();
-                                            // 選択可能ラベルはクリックを吸ってしまい
-                                            // 行クリック (フォーカス) が効かなくなるので、
-                                            // タイトルは文字選択を切ってクリックを行へ通す
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(format!(
-                                                        "{}{} {}",
-                                                        badge, s.icon, s.title
-                                                    ))
-                                                    .color(theme.text),
-                                                )
-                                                .selectable(false),
-                                            );
-                                            if s.has_unread() && !active {
-                                                ui.label(
-                                                    RichText::new("◆")
-                                                        .size(9.0)
-                                                        .color(theme.accent),
-                                                )
-                                                .on_hover_text(tr(
-                                                    "最後に見てから新しい出力があります",
-                                                ));
-                                            }
-                                            if let Some(line) = &s.rate_limited {
-                                                ui.label(
-                                                    RichText::new("⏳").color(theme.warn),
-                                                )
-                                                .on_hover_text(trf(
-                                                    "レート制限/使用上限: {line}",
-                                                    &[("line", line.clone())],
-                                                ));
-                                            }
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui.small_button("✕").clicked() {
-                                                        remove = Some(i);
-                                                    }
-                                                    if ui.small_button("⟳").clicked() {
-                                                        restart = Some(i);
-                                                    }
-                                                    if let Some(hint) = permission_hint {
-                                                        if ui
-                                                            .small_button("🛡")
-                                                            .on_hover_text(hint)
-                                                            .clicked()
-                                                        {
-                                                            cycle = Some(i);
-                                                        }
-                                                    }
-                                                    ui.label(
-                                                        RichText::new(s.uptime())
-                                                            .size(10.5)
-                                                            .color(theme.text_dim),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                    });
-                                        },
-                                    );
-                                    let resp = fr.response;
-                                    if resp.clicked() {
-                                        focus = Some(i);
-                                    }
-                                    resp.context_menu(|ui| {
-                                        if !s.has_unread()
-                                            && ui
-                                                .button(tr("📩 あとで見る (未読にする)"))
-                                                .clicked()
-                                        {
-                                            set_unread = Some(i);
-                                            ui.close_menu();
-                                        }
-                                        if ui.button(tr("🔍 フォーカス")).clicked() {
-                                            focus = Some(i);
-                                            ui.close_menu();
-                                        }
-                                    });
-                                }
-                                if let Some(i) = set_unread {
-                                    if let Some(s) = self.agents.sessions.get_mut(i) {
-                                        s.mark_unread();
-                                    }
-                                }
-
-                                ui.add_space(8.0);
-                                ui.label(RichText::new(tr("── プリセット ──")).color(theme.text_dim));
-                                for (i, p) in self.cfg.agents.iter().enumerate() {
-                                    if ui
-                                        .add_sized(
-                                            [ui.available_width(), 26.0],
-                                            egui::Button::new(format!("{} {}", p.icon, p.name)),
-                                        )
-                                        .clicked()
-                                    {
-                                        launch = Some(i);
-                                    }
-                                }
-                            });
+                        self.sidebar_agents_ui(
+                            ui,
+                            &theme,
+                            &mut launch,
+                            &mut focus,
+                            &mut restart,
+                            &mut remove,
+                            &mut cycle,
+                        );
                     }
                     SidebarTab::Plugins => {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button(tr("➕ 新規作成"))
-                                .on_hover_text(tr("プラグインのテンプレート一式を生成"))
-                                .clicked()
-                            {
-                                pl_new = true;
-                            }
-                            if ui
-                                .button(tr("📦 インストール…"))
-                                .on_hover_text(tr(".zvplug / .zip を取り込む"))
-                                .clicked()
-                            {
-                                pl_install = true;
-                            }
-                            if ui.button("⟳").on_hover_text(tr("再スキャン")).clicked() {
-                                pl_rescan = true;
-                            }
-                        });
-                        ui.label(
-                            RichText::new(tr(
-                                "コマンド・テーマ・スニペットを 1 フォルダで。📤 で配布用 .zvplug を作成",
-                            ))
-                            .size(10.5)
-                            .color(theme.text_dim),
+                        self.sidebar_plugins_ui(
+                            ui,
+                            &theme,
+                            &panel_texts,
+                            &mut md_images,
+                            &mut pl,
                         );
-                        ui.separator();
-                        egui::ScrollArea::vertical()
-                            .id_salt("zv-plugins")
-                            .auto_shrink(false)
-                            .show(ui, |ui| {
-                                if self.plugins.is_empty() {
-                                    ui.label(
-                                        RichText::new(tr(
-                                            "プラグインがありません。➕ から自作できます",
-                                        ))
-                                        .color(theme.text_dim),
-                                    );
-                                }
-                                for (pi, p) in self.plugins.iter().enumerate() {
-                                    egui::Frame::none()
-                                        .rounding(egui::Rounding::same(6.0))
-                                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                                        .fill(theme.panel_alt)
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new(&p.name)
-                                                        .strong()
-                                                        .color(theme.text),
-                                                );
-                                                ui.label(
-                                                    RichText::new(format!("v{}", p.version))
-                                                        .size(10.5)
-                                                        .color(theme.text_dim),
-                                                );
-                                                ui.label(
-                                                    RichText::new(format!("API{}", p.api))
-                                                        .size(10.0)
-                                                        .color(theme.text_dim),
-                                                )
-                                                .on_hover_text(tr(
-                                                    "マニフェストの api バージョン",
-                                                ));
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        if ui
-                                                            .small_button("🗑")
-                                                            .on_hover_text(tr("アンインストール"))
-                                                            .clicked()
-                                                        {
-                                                            pl_uninstall = Some(p.dir.clone());
-                                                        }
-                                                        if ui
-                                                            .small_button("📤")
-                                                            .on_hover_text(tr(
-                                                                "配布用 .zvplug をエクスポート",
-                                                            ))
-                                                            .clicked()
-                                                        {
-                                                            pl_export = Some(pi);
-                                                        }
-                                                        if ui
-                                                            .small_button("📝")
-                                                            .on_hover_text(tr("plugin.toml を開く"))
-                                                            .clicked()
-                                                        {
-                                                            pl_open =
-                                                                Some(p.dir.join("plugin.toml"));
-                                                        }
-                                                    },
-                                                );
-                                            });
-                                            // 有効/無効。無効にするとコマンド・フック・
-                                            // パネル・テーマ・スニペットを一切登録しない
-                                            let mut enabled = p.enabled;
-                                            if ui
-                                                .checkbox(&mut enabled, tr("有効"))
-                                                .on_hover_text(tr(
-                                                    "外すとコマンド・フック・パネル・テーマを読み込みません",
-                                                ))
-                                                .changed()
-                                            {
-                                                pl_toggle = Some((p.name.clone(), enabled));
-                                            }
-                                            if let Some(err) = &p.error {
-                                                ui.label(
-                                                    RichText::new(format!("⚠ {err}"))
-                                                        .size(10.5)
-                                                        .color(theme.warn),
-                                                );
-                                                return;
-                                            }
-                                            if !p.enabled {
-                                                ui.label(
-                                                    RichText::new(tr("(無効)"))
-                                                        .size(10.5)
-                                                        .color(theme.text_dim),
-                                                );
-                                                return;
-                                            }
-                                            if !p.description.is_empty() {
-                                                ui.label(
-                                                    RichText::new(&p.description)
-                                                        .size(10.5)
-                                                        .color(theme.text_dim),
-                                                );
-                                            }
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "▶{}  🪝{}  📋{}  🎨{}  ✂{}{}",
-                                                    p.commands.len(),
-                                                    p.hooks.len(),
-                                                    p.panels.len(),
-                                                    p.themes.len(),
-                                                    p.snippet_files.len(),
-                                                    if p.author.is_empty() {
-                                                        String::new()
-                                                    } else {
-                                                        format!("  by {}", p.author)
-                                                    }
-                                                ))
-                                                .size(10.5)
-                                                .color(theme.text_dim),
-                                            );
-                                            for (ci, c) in p.commands.iter().enumerate() {
-                                                let btn = ui
-                                                    .small_button(format!("{} {}", c.icon, c.title));
-                                                let btn = match &c.keybind {
-                                                    Some(k) => btn.on_hover_text(k),
-                                                    None => btn,
-                                                };
-                                                if btn.clicked() {
-                                                    pl_run = Some((pi, ci));
-                                                }
-                                            }
-                                            for (label, path) in &p.themes {
-                                                if ui
-                                                    .small_button(format!("🎨 {label}"))
-                                                    .clicked()
-                                                {
-                                                    pl_theme = Some(
-                                                        path.to_string_lossy().to_string(),
-                                                    );
-                                                }
-                                            }
-
-                                            // 設定 ([[setting]]) — 変更したその場で保存する
-                                            if !p.settings.is_empty() {
-                                                ui.add_space(2.0);
-                                                egui::CollapsingHeader::new(tr("⚙ 設定"))
-                                                    .id_salt(("zv-plset", pi))
-                                                    .show(ui, |ui| {
-                                                        for s in &p.settings {
-                                                            let label = if s.label.is_empty() {
-                                                                s.key.clone()
-                                                            } else {
-                                                                s.label.clone()
-                                                            };
-                                                            let cur = p.setting(&s.key);
-                                                            match s.kind {
-                                                                plugins::SettingType::Bool => {
-                                                                    let mut on =
-                                                                        cur.trim() == "true";
-                                                                    if ui
-                                                                        .checkbox(&mut on, label)
-                                                                        .changed()
-                                                                    {
-                                                                        pl_setting = Some((
-                                                                            p.name.clone(),
-                                                                            s.key.clone(),
-                                                                            on.to_string(),
-                                                                        ));
-                                                                    }
-                                                                }
-                                                                _ => {
-                                                                    ui.label(
-                                                                        RichText::new(label)
-                                                                            .size(10.5)
-                                                                            .color(theme.text_dim),
-                                                                    );
-                                                                    let mut v = cur.clone();
-                                                                    let te =
-                                                                        egui::TextEdit::singleline(
-                                                                            &mut v,
-                                                                        )
-                                                                        .password(s.secret)
-                                                                        .desired_width(f32::INFINITY);
-                                                                    if ui.add(te).changed() {
-                                                                        // 型に合わない入力は保存しない
-                                                                        if s.kind.accepts(&v) {
-                                                                            pl_setting = Some((
-                                                                                p.name.clone(),
-                                                                                s.key.clone(),
-                                                                                v,
-                                                                            ));
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    });
-                                            }
-
-                                            // パネル ([[panel]]) — 本文をそのまま描く
-                                            for pa in &p.panels {
-                                                ui.add_space(2.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.label(
-                                                        RichText::new(format!(
-                                                            "{} {}",
-                                                            pa.icon, pa.title
-                                                        ))
-                                                        .size(11.0)
-                                                        .strong()
-                                                        .color(theme.text),
-                                                    );
-                                                    if !pa.run.trim().is_empty()
-                                                        && ui
-                                                            .small_button("⟳")
-                                                            .on_hover_text(tr("このパネルを更新"))
-                                                            .clicked()
-                                                    {
-                                                        pl_panel_refresh = Some((
-                                                            p.name.clone(),
-                                                            pa.id.clone(),
-                                                        ));
-                                                    }
-                                                });
-                                                let key =
-                                                    (p.name.clone(), pa.id.clone());
-                                                match panel_texts.get(&key) {
-                                                    Some(t) if !t.trim().is_empty() => {
-                                                        match pa.format {
-                                                            plugins::PanelFormat::Markdown => {
-                                                                let mut rctx =
-                                                                    markdown::RenderCtx {
-                                                                        dir: None,
-                                                                        images: &mut md_images,
-                                                                    };
-                                                                markdown::render(
-                                                                    ui, &theme, hl, md_base,
-                                                                    t, &mut rctx,
-                                                                );
-                                                            }
-                                                            plugins::PanelFormat::Text => {
-                                                                ui.label(
-                                                                    RichText::new(t)
-                                                                        .monospace()
-                                                                        .size(11.0)
-                                                                        .color(theme.text),
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                    _ => {
-                                                        ui.label(
-                                                            RichText::new(tr("(内容なし)"))
-                                                                .size(10.5)
-                                                                .color(theme.text_dim),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        });
-                                    ui.add_space(4.0);
-                                }
-                            });
                     }
                     SidebarTab::Git => {
                         egui::ScrollArea::vertical()
@@ -4769,7 +4337,7 @@ impl ZaivernApp {
         self.md_images = md_images;
 
         // 有効/無効の切り替えを保存し、登録内容を作り直す
-        if let Some((name, enabled)) = pl_toggle {
+        if let Some((name, enabled)) = pl.toggle {
             self.cfg.plugins.set_enabled(&name, enabled);
             if let Err(e) = config::save_plugins_section(&self.cfg) {
                 self.toast(
@@ -4788,7 +4356,7 @@ impl ZaivernApp {
             );
         }
         // 設定値の変更を保存し、実行中のプラグインへも反映する
-        if let Some((name, key, value)) = pl_setting {
+        if let Some((name, key, value)) = pl.setting {
             self.cfg.plugins.set_setting(&name, &key, &value);
             if let Err(e) = config::save_plugins_section(&self.cfg) {
                 self.toast(trf("設定の保存に失敗: {e}", &[("e", e.to_string())]), false);
@@ -4800,7 +4368,7 @@ impl ZaivernApp {
             }
         }
         // パネルの手動更新
-        if let Some((name, panel)) = pl_panel_refresh {
+        if let Some((name, panel)) = pl.panel_refresh {
             self.refresh_panel(&name, &panel, ctx);
         }
 
@@ -4812,16 +4380,16 @@ impl ZaivernApp {
             self.jump_to_lsp_pos(&path, line, 0);
         }
 
-        if pl_new {
+        if pl.new_plugin {
             self.apply_cmd(Cmd::NewPlugin, ctx);
         }
-        if pl_install {
+        if pl.install {
             self.apply_cmd(Cmd::InstallPlugin, ctx);
         }
-        if pl_rescan {
+        if pl.rescan {
             self.apply_cmd(Cmd::RescanPlugins, ctx);
         }
-        if let Some(dir) = pl_uninstall {
+        if let Some(dir) = pl.uninstall {
             match plugins::uninstall(&dir) {
                 Ok(()) => {
                     self.rebuild_plugins();
@@ -4833,7 +4401,7 @@ impl ZaivernApp {
                 ),
             }
         }
-        if let Some(pi) = pl_export {
+        if let Some(pi) = pl.export {
             let root = self.primary_root().to_path_buf();
             let res = self
                 .plugins
@@ -4854,15 +4422,565 @@ impl ZaivernApp {
                 None => {}
             }
         }
-        if let Some(path) = pl_open {
+        if let Some(path) = pl.open {
             self.open_path(&path);
         }
-        if let Some((pi, ci)) = pl_run {
+        if let Some((pi, ci)) = pl.run {
             self.apply_cmd(Cmd::RunPlugin(pi, ci), ctx);
         }
-        if let Some(t) = pl_theme {
+        if let Some(t) = pl.theme {
             self.apply_cmd(Cmd::SetTheme(t), ctx);
         }
+        self.apply_tree_actions(actions, refresh, nf_root, nd_root, ctx);
+        if let Some(i) = launch {
+            self.launch_preset(i, ctx);
+        }
+        if let Some(i) = focus {
+            self.apply_cmd(Cmd::FocusAgent(i), ctx);
+        }
+        if let Some(i) = restart {
+            if let Err(e) = self.agents.restart(i, ctx) {
+                self.toast(e, false);
+            }
+        }
+        if let Some(i) = cycle {
+            match self.agents.cycle_permission(i) {
+                Some(hint) => self.toast_warn(trf(
+                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）",
+                    &[("hint", hint.to_string())],
+                )),
+                None => self.toast(tr("このセッションは権限モード切替に未対応です"), false),
+            }
+        }
+        if let Some(i) = remove {
+            self.agents.remove(i);
+        }
+    }
+
+    /// サイドバー: ファイルタブ (ツリー + 新規作成/再読み込みボタン)。
+    /// 押されたボタンは記録だけして呼び出し側で self へ反映する。
+    fn sidebar_files_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        actions: &mut TreeActions,
+        refresh: &mut bool,
+        nf_root: &mut bool,
+        nd_root: &mut bool,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(roots_label(&self.roots)).strong());
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui.button("⟳").on_hover_text(tr("再読み込み")).clicked() {
+                        *refresh = true;
+                    }
+                    if ui.button("📂").on_hover_text(tr("新規フォルダ")).clicked() {
+                        *nd_root = true;
+                    }
+                    if ui.button("➕").on_hover_text(tr("新規ファイル")).clicked() {
+                        *nf_root = true;
+                    }
+                },
+            );
+        });
+        egui::ScrollArea::vertical()
+            .id_salt("zv-tree")
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                self.tree.ui(ui, theme, actions);
+            });
+    }
+
+    /// サイドバー: 検索タブ (VS Code: ⇧⌘F)。開始/ジャンプは記録だけして
+    /// パネル描画後に呼び出し側で self へ反映する。
+    fn sidebar_search_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        go: &mut bool,
+        jump: &mut Option<(PathBuf, usize)>,
+    ) {
+        let (g, j) = global_search_panel(ui, theme, &mut self.gsearch, &self.file_index);
+        *go |= g;
+        if j.is_some() {
+            *jump = j;
+        }
+    }
+
+    /// サイドバー: Agents タブ (セッション一覧 + プリセット起動)。
+    /// 押されたボタンは Option に記録だけして呼び出し側で反映する。
+    #[allow(clippy::too_many_arguments)]
+    fn sidebar_agents_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        launch: &mut Option<usize>,
+        focus: &mut Option<usize>,
+        restart: &mut Option<usize>,
+        remove: &mut Option<usize>,
+        cycle: &mut Option<usize>,
+    ) {
+        egui::ScrollArea::vertical()
+            .id_salt("zv-agents")
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                let mut set_unread: Option<usize> = None;
+                for (i, s) in self.agents.sessions.iter().enumerate() {
+                    let active = i == self.agents.active;
+                    let frame = egui::Frame::none()
+                        .fill(if active {
+                            theme.accent_soft
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0));
+                    // 行の余白クリックでフォーカスできるようにする。
+                    // 後掛けの ui.interact は行内の ✕/⟳/🛡 ボタンへの
+                    // クリックを奪う (ヒットテストは後登録が勝つ) ため、
+                    // UiBuilder::sense で行の判定を先に登録する。
+                    let fr = ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .id_salt(("agent-row", i))
+                            .sense(egui::Sense::click()),
+                        |ui| {
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let dot = if s.running() {
+                                if s.attention {
+                                    RichText::new("●").color(theme.warn)
+                                } else {
+                                    RichText::new("●").color(theme.ok)
+                                }
+                            } else {
+                                RichText::new("○").color(theme.err)
+                            };
+                            ui.label(dot);
+                            let badge = if s.is_permission_agent() {
+                                s.approval_badge()
+                            } else {
+                                ""
+                            };
+                            let permission_hint = s.permission_switch_hint();
+                            // 選択可能ラベルはクリックを吸ってしまい
+                            // 行クリック (フォーカス) が効かなくなるので、
+                            // タイトルは文字選択を切ってクリックを行へ通す
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "{}{} {}",
+                                        badge, s.icon, s.title
+                                    ))
+                                    .color(theme.text),
+                                )
+                                .selectable(false),
+                            );
+                            if s.has_unread() && !active {
+                                ui.label(
+                                    RichText::new("◆")
+                                        .size(9.0)
+                                        .color(theme.accent),
+                                )
+                                .on_hover_text(tr(
+                                    "最後に見てから新しい出力があります",
+                                ));
+                            }
+                            if let Some(line) = &s.rate_limited {
+                                ui.label(
+                                    RichText::new("⏳").color(theme.warn),
+                                )
+                                .on_hover_text(trf(
+                                    "レート制限/使用上限: {line}",
+                                    &[("line", line.clone())],
+                                ));
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("✕").clicked() {
+                                        *remove = Some(i);
+                                    }
+                                    if ui.small_button("⟳").clicked() {
+                                        *restart = Some(i);
+                                    }
+                                    if let Some(hint) = permission_hint {
+                                        if ui
+                                            .small_button("🛡")
+                                            .on_hover_text(hint)
+                                            .clicked()
+                                        {
+                                            *cycle = Some(i);
+                                        }
+                                    }
+                                    ui.label(
+                                        RichText::new(s.uptime())
+                                            .size(10.5)
+                                            .color(theme.text_dim),
+                                    );
+                                },
+                            );
+                        });
+                    });
+                        },
+                    );
+                    let resp = fr.response;
+                    if resp.clicked() {
+                        *focus = Some(i);
+                    }
+                    resp.context_menu(|ui| {
+                        if !s.has_unread()
+                            && ui
+                                .button(tr("📩 あとで見る (未読にする)"))
+                                .clicked()
+                        {
+                            set_unread = Some(i);
+                            ui.close_menu();
+                        }
+                        if ui.button(tr("🔍 フォーカス")).clicked() {
+                            *focus = Some(i);
+                            ui.close_menu();
+                        }
+                    });
+                }
+                if let Some(i) = set_unread {
+                    if let Some(s) = self.agents.sessions.get_mut(i) {
+                        s.mark_unread();
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.label(RichText::new(tr("── プリセット ──")).color(theme.text_dim));
+                for (i, p) in self.cfg.agents.iter().enumerate() {
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 26.0],
+                            egui::Button::new(format!("{} {}", p.icon, p.name)),
+                        )
+                        .clicked()
+                    {
+                        *launch = Some(i);
+                    }
+                }
+            });
+    }
+
+    /// サイドバー: プラグインタブ。ボタン類は PluginActions に記録だけして
+    /// パネル描画後に呼び出し側で self へ反映する。
+    fn sidebar_plugins_ui(
+        &self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        panel_texts: &HashMap<(String, String), String>,
+        md_images: &mut markdown::ImageCache,
+        pl: &mut PluginActions,
+    ) {
+        let md_base = self.cfg.editor_font_size;
+        let hl = &self.highlighter;
+        ui.horizontal(|ui| {
+            if ui
+                .button(tr("➕ 新規作成"))
+                .on_hover_text(tr("プラグインのテンプレート一式を生成"))
+                .clicked()
+            {
+                pl.new_plugin = true;
+            }
+            if ui
+                .button(tr("📦 インストール…"))
+                .on_hover_text(tr(".zvplug / .zip を取り込む"))
+                .clicked()
+            {
+                pl.install = true;
+            }
+            if ui.button("⟳").on_hover_text(tr("再スキャン")).clicked() {
+                pl.rescan = true;
+            }
+        });
+        ui.label(
+            RichText::new(tr(
+                "コマンド・テーマ・スニペットを 1 フォルダで。📤 で配布用 .zvplug を作成",
+            ))
+            .size(10.5)
+            .color(theme.text_dim),
+        );
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("zv-plugins")
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if self.plugins.is_empty() {
+                    ui.label(
+                        RichText::new(tr(
+                            "プラグインがありません。➕ から自作できます",
+                        ))
+                        .color(theme.text_dim),
+                    );
+                }
+                for (pi, p) in self.plugins.iter().enumerate() {
+                    egui::Frame::none()
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .fill(theme.panel_alt)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(&p.name)
+                                        .strong()
+                                        .color(theme.text),
+                                );
+                                ui.label(
+                                    RichText::new(format!("v{}", p.version))
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                );
+                                ui.label(
+                                    RichText::new(format!("API{}", p.api))
+                                        .size(10.0)
+                                        .color(theme.text_dim),
+                                )
+                                .on_hover_text(tr(
+                                    "マニフェストの api バージョン",
+                                ));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(
+                                        egui::Align::Center,
+                                    ),
+                                    |ui| {
+                                        if ui
+                                            .small_button("🗑")
+                                            .on_hover_text(tr("アンインストール"))
+                                            .clicked()
+                                        {
+                                            pl.uninstall = Some(p.dir.clone());
+                                        }
+                                        if ui
+                                            .small_button("📤")
+                                            .on_hover_text(tr(
+                                                "配布用 .zvplug をエクスポート",
+                                            ))
+                                            .clicked()
+                                        {
+                                            pl.export = Some(pi);
+                                        }
+                                        if ui
+                                            .small_button("📝")
+                                            .on_hover_text(tr("plugin.toml を開く"))
+                                            .clicked()
+                                        {
+                                            pl.open =
+                                                Some(p.dir.join("plugin.toml"));
+                                        }
+                                    },
+                                );
+                            });
+                            // 有効/無効。無効にするとコマンド・フック・
+                            // パネル・テーマ・スニペットを一切登録しない
+                            let mut enabled = p.enabled;
+                            if ui
+                                .checkbox(&mut enabled, tr("有効"))
+                                .on_hover_text(tr(
+                                    "外すとコマンド・フック・パネル・テーマを読み込みません",
+                                ))
+                                .changed()
+                            {
+                                pl.toggle = Some((p.name.clone(), enabled));
+                            }
+                            if let Some(err) = &p.error {
+                                ui.label(
+                                    RichText::new(format!("⚠ {err}"))
+                                        .size(10.5)
+                                        .color(theme.warn),
+                                );
+                                return;
+                            }
+                            if !p.enabled {
+                                ui.label(
+                                    RichText::new(tr("(無効)"))
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                );
+                                return;
+                            }
+                            if !p.description.is_empty() {
+                                ui.label(
+                                    RichText::new(&p.description)
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                );
+                            }
+                            ui.label(
+                                RichText::new(format!(
+                                    "▶{}  🪝{}  📋{}  🎨{}  ✂{}{}",
+                                    p.commands.len(),
+                                    p.hooks.len(),
+                                    p.panels.len(),
+                                    p.themes.len(),
+                                    p.snippet_files.len(),
+                                    if p.author.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("  by {}", p.author)
+                                    }
+                                ))
+                                .size(10.5)
+                                .color(theme.text_dim),
+                            );
+                            for (ci, c) in p.commands.iter().enumerate() {
+                                let btn = ui
+                                    .small_button(format!("{} {}", c.icon, c.title));
+                                let btn = match &c.keybind {
+                                    Some(k) => btn.on_hover_text(k),
+                                    None => btn,
+                                };
+                                if btn.clicked() {
+                                    pl.run = Some((pi, ci));
+                                }
+                            }
+                            for (label, path) in &p.themes {
+                                if ui
+                                    .small_button(format!("🎨 {label}"))
+                                    .clicked()
+                                {
+                                    pl.theme = Some(
+                                        path.to_string_lossy().to_string(),
+                                    );
+                                }
+                            }
+
+                            // 設定 ([[setting]]) — 変更したその場で保存する
+                            if !p.settings.is_empty() {
+                                ui.add_space(2.0);
+                                egui::CollapsingHeader::new(tr("⚙ 設定"))
+                                    .id_salt(("zv-plset", pi))
+                                    .show(ui, |ui| {
+                                        for s in &p.settings {
+                                            let label = if s.label.is_empty() {
+                                                s.key.clone()
+                                            } else {
+                                                s.label.clone()
+                                            };
+                                            let cur = p.setting(&s.key);
+                                            match s.kind {
+                                                plugins::SettingType::Bool => {
+                                                    let mut on =
+                                                        cur.trim() == "true";
+                                                    if ui
+                                                        .checkbox(&mut on, label)
+                                                        .changed()
+                                                    {
+                                                        pl.setting = Some((
+                                                            p.name.clone(),
+                                                            s.key.clone(),
+                                                            on.to_string(),
+                                                        ));
+                                                    }
+                                                }
+                                                _ => {
+                                                    ui.label(
+                                                        RichText::new(label)
+                                                            .size(10.5)
+                                                            .color(theme.text_dim),
+                                                    );
+                                                    let mut v = cur.clone();
+                                                    let te =
+                                                        egui::TextEdit::singleline(
+                                                            &mut v,
+                                                        )
+                                                        .password(s.secret)
+                                                        .desired_width(f32::INFINITY);
+                                                    if ui.add(te).changed() {
+                                                        // 型に合わない入力は保存しない
+                                                        if s.kind.accepts(&v) {
+                                                            pl.setting = Some((
+                                                                p.name.clone(),
+                                                                s.key.clone(),
+                                                                v,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                            }
+
+                            // パネル ([[panel]]) — 本文をそのまま描く
+                            for pa in &p.panels {
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} {}",
+                                            pa.icon, pa.title
+                                        ))
+                                        .size(11.0)
+                                        .strong()
+                                        .color(theme.text),
+                                    );
+                                    if !pa.run.trim().is_empty()
+                                        && ui
+                                            .small_button("⟳")
+                                            .on_hover_text(tr("このパネルを更新"))
+                                            .clicked()
+                                    {
+                                        pl.panel_refresh = Some((
+                                            p.name.clone(),
+                                            pa.id.clone(),
+                                        ));
+                                    }
+                                });
+                                let key =
+                                    (p.name.clone(), pa.id.clone());
+                                match panel_texts.get(&key) {
+                                    Some(t) if !t.trim().is_empty() => {
+                                        match pa.format {
+                                            plugins::PanelFormat::Markdown => {
+                                                let mut rctx =
+                                                    markdown::RenderCtx {
+                                                        dir: None,
+                                                        images: &mut *md_images,
+                                                    };
+                                                markdown::render(
+                                                    ui, theme, hl, md_base,
+                                                    t, &mut rctx,
+                                                );
+                                            }
+                                            plugins::PanelFormat::Text => {
+                                                ui.label(
+                                                    RichText::new(t)
+                                                        .monospace()
+                                                        .size(11.0)
+                                                        .color(theme.text),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        ui.label(
+                                            RichText::new(tr("(内容なし)"))
+                                                .size(10.5)
+                                                .color(theme.text_dim),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+            });
+    }
+
+    /// ファイルツリー由来のアクション (開く/新規作成/リネーム/貼り付け等) を
+    /// 描画後にまとめて反映する。
+    fn apply_tree_actions(
+        &mut self,
+        actions: TreeActions,
+        refresh: bool,
+        nf_root: bool,
+        nd_root: bool,
+        ctx: &egui::Context,
+    ) {
         if refresh {
             self.apply_cmd(Cmd::RefreshTree, ctx);
         }
@@ -4981,29 +5099,6 @@ impl ZaivernApp {
         }
         if let Some(p) = actions.delete {
             self.pending_delete = Some(p);
-        }
-        if let Some(i) = launch {
-            self.launch_preset(i, ctx);
-        }
-        if let Some(i) = focus {
-            self.apply_cmd(Cmd::FocusAgent(i), ctx);
-        }
-        if let Some(i) = restart {
-            if let Err(e) = self.agents.restart(i, ctx) {
-                self.toast(e, false);
-            }
-        }
-        if let Some(i) = cycle {
-            match self.agents.cycle_permission(i) {
-                Some(hint) => self.toast_warn(trf(
-                    "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）",
-                    &[("hint", hint.to_string())],
-                )),
-                None => self.toast(tr("このセッションは権限モード切替に未対応です"), false),
-            }
-        }
-        if let Some(i) = remove {
-            self.agents.remove(i);
         }
     }
 
