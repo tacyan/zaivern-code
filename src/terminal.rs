@@ -41,6 +41,9 @@ pub struct SearchUi {
     pub index: usize,
     /// 次のフレームで検索バーの入力欄へフォーカスを移す (開いた直後用)。
     pub focus_pending: bool,
+    /// 現在ヒットの表示位置: (ジャンプ時の scroll 量, 可視行)。
+    /// scroll が変わったら無効として扱う (強調表示だけの情報)。
+    pub current_vis: Option<(usize, u16)>,
 }
 
 pub struct Session {
@@ -1517,6 +1520,7 @@ impl Session {
         if hits.is_empty() {
             self.search.hit_line = None;
             self.search.index = 0;
+            self.search.current_vis = None;
             return false;
         }
         let pos = match (self.search.hit_line, forward) {
@@ -1531,7 +1535,13 @@ impl Session {
         let hit = hits[pos];
         self.search.hit_line = Some(hit);
         self.search.index = pos + 1;
-        self.set_scroll(search_scroll_target(hit, lines.len(), rows));
+        let target = search_scroll_target(hit, lines.len(), rows);
+        self.set_scroll(target);
+        // 現在ヒットの可視行を覚える (強調表示用)。scroll が変わるまで有効。
+        let window_start = lines.len().saturating_sub(rows).saturating_sub(target);
+        let vis = hit.saturating_sub(window_start);
+        self.search.current_vis =
+            (vis < rows).then(|| (target, u16::try_from(vis).unwrap_or(u16::MAX)));
         true
     }
 
@@ -2012,6 +2022,9 @@ mod tests {
         assert_eq!(session.search.total, 8);
         assert_eq!(session.search.index, 8);
         let first_hit = session.search.hit_line.unwrap();
+        // 現在ヒットの可視行が画面内に入っている (強調表示用)
+        let (_, vis) = session.search.current_vis.unwrap();
+        assert!(vis < 30, "可視行は画面行数未満: {vis}");
         // 前 (古い方) へ → row065 のはず (絶対行も戻り量も増える)
         assert!(session.search_step(false));
         assert_eq!(session.search.index, 7);
@@ -3285,6 +3298,7 @@ fn terminal_search_bar_ui(
                         session.search.hit_line = None;
                         session.search.index = 0;
                         session.search.total = 0;
+                        session.search.current_vis = None;
                         session.set_scroll(0);
                     }
                 });
@@ -3317,6 +3331,13 @@ fn paint_search_highlights(
     let (rows, cols) = screen.size();
     let fill = theme.warn.gamma_multiply(0.30);
     let stroke = egui::Stroke::new(1.0_f32, theme.warn.gamma_multiply(0.75));
+    // 現在ヒット行はより濃く強調する (ジャンプ後に scroll が動いたら通常表示)
+    let cur_row = session
+        .search
+        .current_vis
+        .and_then(|(s, r)| (s == session.scroll).then_some(r));
+    let cur_fill = theme.warn.gamma_multiply(0.55);
+    let cur_stroke = egui::Stroke::new(1.5_f32, theme.warn);
     for row in 0..rows {
         // 行の小文字化文字列と「文字 → (セル列, セル幅)」対応表を作る
         let mut chars: Vec<char> = Vec::new();
@@ -3353,7 +3374,11 @@ fn paint_search_highlights(
                     egui::pos2(x0, y0),
                     egui::pos2(x1.min(rect.max.x), (y0 + cell_h).min(rect.max.y)),
                 );
-                painter.rect(r, 2.0, fill, stroke);
+                if cur_row == Some(row) {
+                    painter.rect(r, 2.0, cur_fill, cur_stroke);
+                } else {
+                    painter.rect(r, 2.0, fill, stroke);
+                }
                 i += q.len();
             } else {
                 i += 1;
@@ -4092,6 +4117,11 @@ pub fn draw(
                 let text = lock_ok(&session.parser).screen().contents();
                 ui.ctx().copy_text(text);
                 session.copied_at = Some(Instant::now());
+                ui.close_menu();
+            }
+            if ui.button(tr("🔍 端末内を検索 (⌘F)")).clicked() {
+                session.search.open = true;
+                session.search.focus_pending = true;
                 ui.close_menu();
             }
             if has_sel && ui.button(tr("✕ 選択を解除")).clicked() {

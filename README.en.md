@@ -390,6 +390,20 @@ The same code builds on macOS / Windows / Linux (Linux needs rfd dependencies su
 | ⌘⇧E | Show and focus the Explorer (file tree) |
 | ⌘+ / ⌘- | Font size up / down |
 
+### Agent terminal (macOS)
+
+When an agent terminal has focus, the standard Mac editing keys just work.
+
+| Key | Action |
+|---|---|
+| ⌘A | Select the whole screen (then ⌘C to copy) |
+| ⌘F | **Search inside the terminal** (full scrollback; Enter = older / ⇧Enter = newer, Esc closes) |
+| ⌘K | Clear the screen (sends Ctrl+L so TUIs redraw safely) |
+| ⌘← / ⌘→ | Jump to start / end of the input line |
+| ⌘⌫ | Delete to the start of the line |
+| ⌥← / ⌥→ | Move by word |
+| ⌥⌫ | Delete the previous word |
+
 ### File tree (same defaults as VS Code's Explorer)
 
 Click a row (or use the keys) to select it first. Bindings follow VS Code's per-platform defaults.
