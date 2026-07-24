@@ -225,19 +225,76 @@ impl LogSink {
 /// bypass 起動でも CLI エージェントは起動時/プラン承認などで対話プロンプトを出すため、
 /// これに答えないと「全自動なのに進まない」状態になる。
 pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
-    // ⚡ 最優先: Antigravity CLI (Google AGY) 専用の自動YESプロンプト判定
-    if text.contains("Antigravity") || text.contains("AGY") || text.contains("antigravity") {
-        if text.contains("(y/n)") || text.contains("[y/N]") || text.contains("[y/n]") || text.contains("(y/N)") {
-            return Some((b"y\r", "Antigravityの(y/n)問い合わせに自動「y」"));
-        }
-        if text.contains("❯ 1. Yes") || text.contains("❯ 1. Allow") || text.contains("❯ 1. はい") {
+    // ⚡ 最優先: Antigravity CLI (Google AGY) 専用の自動YESプロンプト超強化判定
+    if text.contains("Antigravity") || text.contains("AGY") || text.contains("antigravity") || text.contains("agy") {
+        // カーソル選択プロンプト（❯ 1 / ❯ Yes / ❯ Allow / ❯ はい / ❯ 許可 / ❯ Accept / ❯ Proceed）
+        if text.contains("❯ 1")
+            || text.contains("❯ Yes")
+            || text.contains("❯ Allow")
+            || text.contains("❯ はい")
+            || text.contains("❯ 許可")
+            || text.contains("❯ Accept")
+            || text.contains("❯ Proceed")
+            || text.contains("❯ Continue")
+        {
             return Some((b"\r", "Antigravityのカーソル選択プロンプトに自動「Enter」"));
         }
-        if text.contains("1. Yes") || text.contains("1. Allow") || text.contains("1. はい") || text.contains("1. 許可") {
+
+        // 選択番号「1.」/「1)」/「[1]」/「(1)」の肯定選択肢
+        let has_num_one = text.contains("1. Yes")
+            || text.contains("1. Allow")
+            || text.contains("1. はい")
+            || text.contains("1. 許可")
+            || text.contains("1. Accept")
+            || text.contains("1. Proceed")
+            || text.contains("1. Continue")
+            || text.contains("1. Approve")
+            || text.contains("1) Yes")
+            || text.contains("1) Allow")
+            || text.contains("[1] Yes")
+            || text.contains("[1] Allow")
+            || text.contains("(1) Yes")
+            || text.contains("(1) Allow");
+        if has_num_one {
             return Some((b"1", "Antigravityの選択プロンプトに自動「1」"));
         }
-        if text.contains("Allow execute") || text.contains("Allow tool") || text.contains("Allow command") || text.contains("Allow action") || text.contains("実行を許可") || text.contains("ツールを許可") {
-            return Some((b"y\r", "Antigravityの実行許可に自動「y」"));
+
+        // y/n テキスト形式
+        if text.contains("(y/n)")
+            || text.contains("[y/N]")
+            || text.contains("[y/n]")
+            || text.contains("(y/N)")
+            || text.contains("(Y/n)")
+            || text.contains("[Y/n]")
+            || text.contains("(yes/no)")
+            || text.contains("[yes/no]")
+            || text.contains("(y/n)?")
+            || text.contains("[y/N]?")
+        {
+            return Some((b"y\r", "Antigravityの(y/n)問い合わせに自動「y」"));
+        }
+
+        // 実行・許可・操作の全肯定キーワード
+        let has_action_kw = text.contains("Allow")
+            || text.contains("Approve")
+            || text.contains("Confirm")
+            || text.contains("Execute")
+            || text.contains("Run")
+            || text.contains("Proceed")
+            || text.contains("Accept")
+            || text.contains("許可")
+            || text.contains("承認")
+            || text.contains("実行")
+            || text.contains("適用")
+            || text.contains("続行")
+            || text.contains("保存");
+        if has_action_kw {
+            return Some((b"y\r", "Antigravityの承認画面に自動「y」"));
+        }
+
+        // Antigravity の表示で質問マーク「?」「？」が含まれる、または末尾に入力待ちがある場合
+        if text.contains('?') || text.contains('？') || recent_lines_has_question(text) {
+            return Some((b"y\r", "Antigravityの問いかけに自動「y」"));
         }
     }
 
@@ -1564,6 +1621,16 @@ mod tests {
         // 日本語プロンプトパターン
         let (bytes, _) = auto_yes_reply("Antigravity: ツールを許可しますか？ [y/N]").unwrap();
         assert_eq!(bytes, b"y\r");
+
+        // 追加された拡張プロンプトパターン
+        let (bytes, _) = auto_yes_reply("AGY: Proceed with file save?").unwrap();
+        assert_eq!(bytes, b"y\r");
+
+        let (bytes, _) = auto_yes_reply("antigravity: 変更を適用しますか？").unwrap();
+        assert_eq!(bytes, b"y\r");
+
+        let (bytes, _) = auto_yes_reply("Antigravity: Select option\n  1. Allow always\n  2. Deny").unwrap();
+        assert_eq!(bytes, b"1");
     }
 
     #[test]
