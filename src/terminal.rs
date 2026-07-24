@@ -1682,7 +1682,7 @@ mod tests {
             log_path: None,
         };
         let mut s =
-            Session::spawn(994, spec, eframe::egui::Context::default()).expect("PTY起動");
+            Session::spawn(992, spec, eframe::egui::Context::default()).expect("PTY起動");
         s.auto_yes_resend_after = Duration::from_secs(2);
 
         // 1) 最初の自動YES
@@ -1717,6 +1717,103 @@ mod tests {
             }
         }
         assert_eq!(after_manual, 0, "手動応答後に勝手な再送をした");
+        s.kill();
+    }
+
+    #[test]
+    fn auto_yes_visible_choice_is_received_by_child_process() {
+        use super::{Attention, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        // 実際の PTY に承認選択肢を表示して入力を待ち、自動 YES が届いた場合だけ
+        // 成功マーカーを出す。分類だけでなく、画面検知→キー送信→子プロセス受信を通す。
+        let cmd = r#"printf 'Do you want to execute this command?\n[y] Yes, approve\n[n] No\nChoice (y/n): '; read ans; if [ "$ans" = y ]; then echo AUTO_YES_E2E_APPROVED; else echo AUTO_YES_E2E_DENIED; fi"#;
+        let spec = SpawnSpec {
+            title: "auto-yes-visible-e2e".into(),
+            preset_name: "test".into(),
+            icon: "⚡".into(),
+            command: cmd.into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s =
+            Session::spawn(994, spec, eframe::egui::Context::default()).expect("PTY起動");
+
+        let mut auto_replied = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            let screen = s.parser.lock().unwrap().screen().contents();
+            if screen.contains("Choice (y/n):") {
+                eprintln!("承認前のPTY画面:\n{screen}");
+            }
+            if matches!(
+                s.scan_attention(true),
+                Some(Attention::AutoReplied("「y」"))
+            ) {
+                auto_replied = true;
+                break;
+            }
+        }
+        assert!(auto_replied, "表示された承認選択肢へ自動YESが送られなかった");
+
+        let mut approved = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            let text = s.parser.lock().unwrap().screen().contents();
+            if text.contains("AUTO_YES_E2E_APPROVED") {
+                eprintln!("自動YES受信後のPTY画面:\n{text}");
+                approved = true;
+                break;
+            }
+            assert!(
+                !text.contains("AUTO_YES_E2E_DENIED"),
+                "子プロセスがYES以外を受信した"
+            );
+        }
+        assert!(approved, "子プロセスが自動YESを受信して承認処理を完了しなかった");
+        s.kill();
+    }
+
+    #[test]
+    fn disabled_auto_yes_leaves_visible_choice_waiting() {
+        use super::{Attention, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let cmd = r#"printf 'Do you want to execute this command?\n[y] Yes, approve\n[n] No\nChoice (y/n): '; read ans; if [ "$ans" = y ]; then echo DISABLED_AUTO_YES_APPROVED; else echo DISABLED_AUTO_YES_DENIED; fi"#;
+        let spec = SpawnSpec {
+            title: "disabled-auto-yes-visible-e2e".into(),
+            preset_name: "test".into(),
+            icon: "🛡".into(),
+            command: cmd.into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s =
+            Session::spawn(993, spec, eframe::egui::Context::default()).expect("PTY起動");
+
+        let mut needs_approval = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(false), Some(Attention::NeedsApproval)) {
+                needs_approval = true;
+                break;
+            }
+        }
+        assert!(needs_approval, "自動YESオフ時に承認待ちとして検知されなかった");
+        assert!(s.attention, "自動YESオフ時に承認通知条件が立たなかった");
+
+        // 自動入力が誤送信されないことを、子プロセスを待たせたまま確認する。
+        std::thread::sleep(Duration::from_millis(1_200));
+        let screen = s.parser.lock().unwrap().screen().contents();
+        eprintln!("自動YESオフで待機中のPTY画面:\n{screen}");
+        assert!(screen.contains("Choice (y/n):"));
+        assert!(!screen.contains("DISABLED_AUTO_YES_APPROVED"));
+        assert!(!screen.contains("DISABLED_AUTO_YES_DENIED"));
+        assert!(s.running(), "承認入力前に子プロセスが終了した");
         s.kill();
     }
 
