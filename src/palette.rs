@@ -263,4 +263,160 @@ mod tests {
         assert!(!p.is_command_mode() && !p.is_agent_mode() && !p.is_root_mode());
         assert_eq!(p.query(), "main.rs");
     }
+
+    #[test]
+    fn new_starts_closed_with_empty_state() {
+        let p = Palette::new();
+        assert!(!p.open);
+        assert!(p.input.is_empty());
+        assert_eq!(p.selected, 0);
+        assert!(!p.just_opened);
+        assert!(!p.is_command_mode() && !p.is_agent_mode() && !p.is_root_mode());
+        assert_eq!(p.query(), "");
+    }
+
+    #[test]
+    fn open_files_resets_input_and_selection() {
+        let mut p = Palette::new();
+        p.input = "stale".into();
+        p.selected = 7;
+        p.open_files();
+        assert!(p.open);
+        assert!(p.input.is_empty());
+        assert_eq!(p.selected, 0);
+        assert!(p.just_opened);
+        assert!(!p.is_command_mode());
+    }
+
+    #[test]
+    fn open_commands_seeds_prompt_prefix() {
+        let mut p = Palette::new();
+        p.input = "stale".into();
+        p.selected = 3;
+        p.open_commands();
+        assert!(p.open);
+        assert_eq!(p.input, ">");
+        assert_eq!(p.selected, 0);
+        assert!(p.just_opened);
+        assert!(p.is_command_mode());
+        // プレフィックスだけならクエリは空
+        assert_eq!(p.query(), "");
+    }
+
+    #[test]
+    fn close_clears_input_and_selection() {
+        let mut p = Palette::new();
+        p.open_commands();
+        p.input = ">save".into();
+        p.selected = 2;
+        p.close();
+        assert!(!p.open);
+        assert!(p.input.is_empty());
+        assert_eq!(p.selected, 0);
+        // close() は just_opened を触らない (現実装どおり)
+        assert!(p.just_opened);
+        assert!(!p.is_command_mode() && !p.is_agent_mode() && !p.is_root_mode());
+        assert_eq!(p.query(), "");
+    }
+
+    #[test]
+    fn switching_files_to_commands_resets_state() {
+        let mut p = Palette::new();
+        p.open_files();
+        p.input = "main.rs".into();
+        p.selected = 5;
+        p.open_commands();
+        assert!(p.open);
+        assert_eq!(p.input, ">");
+        assert_eq!(p.selected, 0);
+        assert!(p.is_command_mode());
+    }
+
+    #[test]
+    fn switching_commands_to_files_resets_state() {
+        let mut p = Palette::new();
+        p.open_commands();
+        p.input = "> sav".into();
+        p.selected = 4;
+        p.open_files();
+        assert!(p.open);
+        assert!(p.input.is_empty());
+        assert_eq!(p.selected, 0);
+        assert!(!p.is_command_mode());
+    }
+
+    #[test]
+    fn mode_predicates_are_mutually_exclusive() {
+        let mut p = Palette::new();
+        for (input, cmd, agent, root) in [
+            (">x", true, false, false),
+            ("@x", false, true, false),
+            ("#x", false, false, true),
+            ("x", false, false, false),
+        ] {
+            p.input = input.into();
+            assert_eq!(p.is_command_mode(), cmd, "input={input:?}");
+            assert_eq!(p.is_agent_mode(), agent, "input={input:?}");
+            assert_eq!(p.is_root_mode(), root, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn predicates_ignore_leading_whitespace() {
+        let mut p = Palette::new();
+        p.input = "   >save".into();
+        assert!(p.is_command_mode());
+        p.input = "\t@claude".into();
+        assert!(p.is_agent_mode());
+        p.input = "  #wt".into();
+        assert!(p.is_root_mode());
+    }
+
+    #[test]
+    fn prefix_not_at_start_is_no_mode() {
+        let mut p = Palette::new();
+        p.input = "a>b".into();
+        assert!(!p.is_command_mode() && !p.is_agent_mode() && !p.is_root_mode());
+        // プレフィックス扱いされないので入力がそのままクエリになる
+        assert_eq!(p.query(), "a>b");
+    }
+
+    #[test]
+    fn query_prefix_only_is_empty() {
+        let mut p = Palette::new();
+        for input in [">", "@", "#", ">   ", "  @\t"] {
+            p.input = input.into();
+            assert_eq!(p.query(), "", "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn query_strips_only_one_prefix() {
+        let mut p = Palette::new();
+        // 2 文字目以降のプレフィックス文字は残る (現実装どおり)
+        p.input = ">>foo".into();
+        assert_eq!(p.query(), ">foo");
+        p.input = ">@foo".into();
+        assert_eq!(p.query(), "@foo");
+        p.input = "@#foo".into();
+        assert_eq!(p.query(), "#foo");
+    }
+
+    #[test]
+    fn query_trims_leading_but_keeps_inner_and_trailing() {
+        let mut p = Palette::new();
+        p.input = "  >  open file ".into();
+        assert_eq!(p.query(), "open file ");
+        p.input = "  foo  bar ".into();
+        assert_eq!(p.query(), "foo  bar ");
+    }
+
+    #[test]
+    fn query_empty_input_is_empty() {
+        let mut p = Palette::new();
+        p.input = String::new();
+        assert_eq!(p.query(), "");
+        p.input = "   ".into();
+        assert_eq!(p.query(), "");
+    }
 }
