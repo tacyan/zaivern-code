@@ -239,14 +239,20 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         switch_keys: "",
         switch_hint: "",
     },
-    // Antigravity CLI (Google)。全自動フラグは claude と同名。
+    // Antigravity CLI (Google)。全自動フラグは claude と同名。自動承認環境変数も完全サポート。
     AgentSpec {
         bin: "agy",
         label: "Antigravity",
         icon: "🚀",
         auto_flag: "--dangerously-skip-permissions",
-        auto_env: &[],
-        strip: &["--dangerously-skip-permissions", "--yolo"],
+        auto_env: &[("ANTIGRAVITY_AUTO_APPROVE", "1"), ("AGY_AUTO_APPROVE", "1")],
+        strip: &[
+            "--dangerously-skip-permissions",
+            "--yolo",
+            "--auto-approve",
+            "--yes",
+            "-y",
+        ],
         headless: "-p",
         model_flag: "--model",
         install: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
@@ -701,6 +707,27 @@ pub fn merged_env(
     out
 }
 
+/// Claude Code などのエージェントが同一マシン・他プロセス・他セッションと競合を起こさないよう、
+/// セッション ID ごとに環境変数を安全に分離・アイソレートしたマップを生成する。
+/// `CLAUDE_CONFIG_DIR` が未指定の場合、`~/.claude-sessions/session-{session_id}` を自動割り当てし、
+/// 複数 Claude インスタンスの同時起動時のファイルロック衝突を回避する。
+pub fn isolated_env_for_session(
+    command: &str,
+    session_id: u64,
+    approval: Approval,
+    preset_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut env = merged_env(command, approval, preset_env);
+    if let Some(spec) = spec_for_command(command) {
+        if spec.bin == "claude" && !env.contains_key("CLAUDE_CONFIG_DIR") {
+            let isolated_path = format!("~/.claude-sessions/session-{}", session_id);
+            let expanded = expand_home(&isolated_path).to_string_lossy().into_owned();
+            env.insert("CLAUDE_CONFIG_DIR".to_string(), expanded);
+        }
+    }
+    env
+}
+
 /// 環境変数だけで全自動になっている CLI か(auto_flag を持たない goose / aider 用)。
 ///
 /// `command_is_bypass` はコマンド文字列しか見ないので、フラグを持たない CLI では
@@ -911,7 +938,7 @@ impl AgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_approval, env_enables_auto, merged_env, Approval};
+    use super::{apply_approval, env_enables_auto, isolated_env_for_session, merged_env, Approval};
     use std::collections::HashMap;
 
     #[test]
@@ -1299,6 +1326,22 @@ mod tests {
         c.insert("GOOSE_MODE".to_string(), "auto".to_string());
         assert!(!env_enables_auto("claude", &c));
         assert!(!env_enables_auto("mycmd", &c));
+    }
+
+    #[test]
+    fn isolated_env_assigns_session_config_dir_for_claude() {
+        let empty = HashMap::new();
+        let env = isolated_env_for_session("claude", 42, Approval::Ask, &empty);
+        let home = dirs::home_dir().unwrap();
+        let expected = home.join(".claude-sessions/session-42").to_str().unwrap().to_string();
+        assert_eq!(env.get("CLAUDE_CONFIG_DIR"), Some(&expected));
+
+        // 明示的に指定されていれば上書きしない
+        let mut preset = HashMap::new();
+        preset.insert("CLAUDE_CONFIG_DIR".to_string(), "~/custom-claude".to_string());
+        let env_custom = isolated_env_for_session("claude", 42, Approval::Ask, &preset);
+        let expected_custom = home.join("custom-claude").to_str().unwrap().to_string();
+        assert_eq!(env_custom.get("CLAUDE_CONFIG_DIR"), Some(&expected_custom));
     }
 
     /// launch と同じ経路: Auto なら環境変数が入り、それを Session 側が

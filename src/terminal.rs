@@ -225,6 +225,22 @@ impl LogSink {
 /// bypass 起動でも CLI エージェントは起動時/プラン承認などで対話プロンプトを出すため、
 /// これに答えないと「全自動なのに進まない」状態になる。
 pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
+    // ⚡ 最優先: Antigravity CLI (Google AGY) 専用の自動YESプロンプト判定
+    if text.contains("Antigravity") || text.contains("AGY") || text.contains("antigravity") {
+        if text.contains("(y/n)") || text.contains("[y/N]") || text.contains("[y/n]") || text.contains("(y/N)") {
+            return Some((b"y\r", "Antigravityの(y/n)問い合わせに自動「y」"));
+        }
+        if text.contains("❯ 1. Yes") || text.contains("❯ 1. Allow") || text.contains("❯ 1. はい") {
+            return Some((b"\r", "Antigravityのカーソル選択プロンプトに自動「Enter」"));
+        }
+        if text.contains("1. Yes") || text.contains("1. Allow") || text.contains("1. はい") || text.contains("1. 許可") {
+            return Some((b"1", "Antigravityの選択プロンプトに自動「1」"));
+        }
+        if text.contains("Allow execute") || text.contains("Allow tool") || text.contains("Allow command") || text.contains("Allow action") || text.contains("実行を許可") || text.contains("ツールを許可") {
+            return Some((b"y\r", "Antigravityの実行許可に自動「y」"));
+        }
+    }
+
     // 初回の bypass 警告: デフォルト選択が「1. No, exit」なので
     // Enter ではなく番号キー「2」で「Yes, I accept」を直接選ぶ。
     if text.contains("Bypass Permissions mode") && text.contains("Yes, I accept") {
@@ -247,6 +263,7 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         || text.contains("confirm")
         || text.contains("proceed")
         || text.contains("Allow")
+        || text.contains("Antigravity")
         || text.contains("実行しますか")
         || text.contains("許可しますか")
         || text.contains("続行しますか")
@@ -260,7 +277,8 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         || text.contains("Allow command")
         || text.contains("Allow tool")
         || text.contains("Allow action")
-        || text.contains("Allow file");
+        || text.contains("Allow file")
+        || text.contains("Antigravity:");
     if agent_approval && (text.contains("1. Yes") || text.contains("1. Allow") || text.contains("Yes, proceed") || text.contains("Yes, allow")) {
         return Some((b"y", "Codex/Antigravityの承認に「Yes」"));
     }
@@ -312,7 +330,13 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
 
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
 /// auto_yes_reply だけが分類する特殊プロンプトも含める。
-const SIG_MARKS: [&str; 41] = [
+const SIG_MARKS: [&str; 47] = [
+    "Antigravity",
+    "Antigravity:",
+    "AGY:",
+    "Allow execute",
+    "Allow tool",
+    "Allow action",
     "Do you want",
     "Would you like to proceed",
     "Would you like to run",
@@ -1395,6 +1419,26 @@ mod tests {
                       › 1. Yes\n  2. No";
         let (bytes, _) = auto_yes_reply(screen).unwrap();
         assert_eq!(bytes, b"y");
+    }
+
+    #[test]
+    fn antigravity_all_prompts_send_auto_yes() {
+        // (y/n) パターン
+        let (bytes, desc) = auto_yes_reply("Antigravity: Allow execute this command? (y/n) ").unwrap();
+        assert_eq!(bytes, b"y\r");
+        assert!(desc.contains("Antigravity"));
+
+        // 1. Allow パターン
+        let (bytes, _) = auto_yes_reply("Antigravity: Allow tool call?\n  1. Allow\n  2. Deny").unwrap();
+        assert_eq!(bytes, b"1");
+
+        // ❯ 1. Yes パターン
+        let (bytes, _) = auto_yes_reply("AGY: Confirm action\n  ❯ 1. Yes\n    2. No").unwrap();
+        assert_eq!(bytes, b"\r");
+
+        // 日本語プロンプトパターン
+        let (bytes, _) = auto_yes_reply("Antigravity: ツールを許可しますか？ [y/N]").unwrap();
+        assert_eq!(bytes, b"y\r");
     }
 
     #[test]

@@ -271,6 +271,10 @@ fn default_agents() -> Vec<AgentPreset> {
             name: "Antigravity (全自動)".into(),
             command: "agy --dangerously-skip-permissions".into(),
             icon: "⚡".into(),
+            env: HashMap::from([
+                ("ANTIGRAVITY_AUTO_APPROVE".to_string(), "1".to_string()),
+                ("AGY_AUTO_APPROVE".to_string(), "1".to_string()),
+            ]),
             ..Default::default()
         },
         AgentPreset {
