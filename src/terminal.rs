@@ -64,7 +64,8 @@ pub struct Session {
     auto_stall_since: Option<Instant>,
     /// 停滞監視の基準となる意味的画面ハッシュ (auto_stall_since とペア)。
     auto_stall_hash: u64,
-    /// 自動YESの再送までの停滞時間。既定 30 秒 (テストで短縮する)。
+    /// 自動YESが効かなかったとき、ペットの承認操作へ切り替えるまでの停滞時間。
+    /// 既定 30 秒 (テストで短縮する)。
     auto_yes_resend_after: Duration,
     /// マウスドラッグによる文字選択: (開始セル, 終了セル)。(row, col) の画面表示座標。
     pub selection: Option<((u16, u16), (u16, u16))>,
@@ -1254,8 +1255,8 @@ impl Session {
             }
         }
         // 自動YESの停滞ウォッチドッグ: 自動応答したのに同じプロンプトのまま
-        // 画面が 30 秒間まったく変化しない (= 応答が取りこぼされた) 場合だけ、
-        // もう一度だけ応答を送る。以後も停滞が続けば 30 秒おきに繰り返す。
+        // 画面が 30 秒間まったく変化しない (= 応答が取りこぼされた) 場合は、
+        // YESを再送せず、ペットの「✔ 承認」ボタンと同じ操作へ切り替える。
         // 出力が流れている間 (cur_hash が動く間) は「進んでいる」ので送らない —
         // 応答済みプロンプトが画面に残っているだけの状態への連打事故を防ぐ。
         if auto_yes && present && self.answered_sig == sig {
@@ -1263,12 +1264,12 @@ impl Session {
                 if self.cur_hash != self.auto_stall_hash {
                     self.auto_stall_hash = self.cur_hash;
                     self.auto_stall_since = Some(Instant::now());
-                } else if since.elapsed() >= self.auto_yes_resend_after {
-                    if let Some((bytes, desc)) = reply {
-                        self.auto_stall_since = Some(Instant::now());
-                        self.write_bytes(bytes);
-                        return Some(Attention::AutoReplied(desc));
-                    }
+                } else if since.elapsed() >= self.auto_yes_resend_after
+                    && self.press_pet_approve_button(None)
+                {
+                    return Some(Attention::AutoReplied(
+                        "自動YES停滞のためペットの承認ボタンを自動押下",
+                    ));
                 }
             }
         }
@@ -1422,6 +1423,25 @@ impl Session {
         let text = lock_ok(&self.parser).screen().contents();
         let (bytes, _) = auto_yes_reply(&text)?;
         std::str::from_utf8(bytes).ok()
+    }
+
+    /// ペットの「✔ 承認」ボタンと同じ承認操作を実行する。
+    ///
+    /// 画面に合う承認キーを優先し、分類不能時だけ `fallback` を使う。
+    /// 送信成功時は同じプロンプトを解決済みにし、以後の再送を止める。
+    pub fn press_pet_approve_button(&mut self, fallback: Option<&str>) -> bool {
+        let keys = self
+            .approve_reply()
+            .map(str::to_owned)
+            .or_else(|| fallback.map(str::to_owned));
+        let Some(keys) = keys else {
+            return false;
+        };
+        if !self.send_text(&keys) {
+            return false;
+        }
+        self.resolve_attention();
+        true
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -2079,7 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_yes_resends_after_stall_timeout() {
+    fn auto_yes_presses_pet_approve_after_stall_timeout() {
         use super::{Attention, Session, SpawnSpec};
         use std::collections::HashMap;
         use std::time::Duration;
@@ -2111,27 +2131,28 @@ mod tests {
         }
         assert!(first, "最初の自動YESが送られなかった");
 
-        // 2) 画面が固まったまま 2 秒経過 → ウォッチドッグが再送する
-        let mut resent = 0u32;
+        // 2) 画面が固まったまま 2 秒経過 → ペットの承認操作へ切り替える
+        let mut pet_approved = 0u32;
         for _ in 0..60 {
             std::thread::sleep(Duration::from_millis(100));
-            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
-                resent += 1;
+            if let Some(Attention::AutoReplied(desc)) = s.scan_attention(true) {
+                assert!(desc.contains("ペットの承認ボタン"));
+                pet_approved += 1;
                 break;
             }
         }
-        assert_eq!(resent, 1, "停滞 2 秒後に自動YESが再送されなかった");
+        assert_eq!(pet_approved, 1, "停滞 2 秒後にペット承認が実行されなかった");
+        assert!(s.auto_stall_since.is_none(), "ペット承認後も停滞監視が残った");
 
-        // 3) 手動応答扱いにするとウォッチドッグは止まる
-        s.resolve_attention();
-        let mut after_manual = 0u32;
+        // 3) ペット承認後は、同じ画面が残っても再送しない
+        let mut repeated = 0u32;
         for _ in 0..30 {
             std::thread::sleep(Duration::from_millis(100));
             if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
-                after_manual += 1;
+                repeated += 1;
             }
         }
-        assert_eq!(after_manual, 0, "手動応答後に勝手な再送をした");
+        assert_eq!(repeated, 0, "ペット承認後に同じプロンプトへ再送した");
         s.kill();
     }
 
@@ -2555,7 +2576,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stall_resend_repeats_each_interval_but_not_within_it() {
+    fn stall_fallback_presses_pet_approve_only_once() {
         use super::Attention;
         use std::time::{Duration, Instant};
 
@@ -2579,7 +2600,7 @@ mod tests {
         s.last_scan = Instant::now() - Duration::from_millis(900);
         assert!(s.scan_attention(true).is_none(), "間隔未満で二重発火した");
 
-        // 3) 間隔経過後に 1 回目の再送が発火する
+        // 3) 間隔経過後にペット承認が発火する
         let mut second = None;
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(100));
@@ -2593,17 +2614,17 @@ mod tests {
                 _ => {}
             }
         }
-        let second = second.expect("停滞 1 回目の再送が発火しなかった");
+        let second = second.expect("停滞後のペット承認が発火しなかった");
         assert!(
             second.duration_since(first) >= Duration::from_millis(550),
-            "再送間隔 (600ms) より早く再送された"
+            "ペット承認の待機時間 (600ms) より早く発火した"
         );
 
-        // 4) 再送直後も間隔未満では発火しない
+        // 4) ペット承認直後は再発火しない
         s.last_scan = Instant::now() - Duration::from_millis(900);
-        assert!(s.scan_attention(true).is_none(), "再送直後に二重発火した");
+        assert!(s.scan_attention(true).is_none(), "ペット承認直後に二重発火した");
 
-        // 5) さらに間隔が経てば 2 回目の再送も発火する (間隔ごとの周期動作)
+        // 5) さらに間隔が経っても同じプロンプトには再発火しない
         let mut third = false;
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(100));
@@ -2613,7 +2634,7 @@ mod tests {
                 break;
             }
         }
-        assert!(third, "2 回目以降の周期再送が発火しなかった");
+        assert!(!third, "ペット承認後に同じプロンプトへ再発火した");
         s.kill();
     }
 

@@ -6483,11 +6483,7 @@ impl ZaivernApp {
                     // 優先する (Bypass 警告は Enter だと「No, exit」になるため)。
                     let fallback = self.cfg.pet_approve_keys.clone();
                     let sent = self.agents.sessions.get_mut(i).map(|s| {
-                        let keys = s.approve_reply().map(str::to_string).unwrap_or(fallback);
-                        let ok = s.send_text(&keys);
-                        if ok {
-                            s.resolve_attention();
-                        }
+                        let ok = s.press_pet_approve_button(Some(&fallback));
                         (ok, s.title.clone())
                     });
                     if let Some((true, title)) = sent {
@@ -10231,14 +10227,7 @@ impl eframe::App for ZaivernApp {
                             let sent = self.agents.sessions.get_mut(i).map(|s| {
                                 // 画面のプロンプトに合った承認キーを優先する
                                 // (Bypass 警告は Enter だと「No, exit」になるため)
-                                let keys = s
-                                    .approve_reply()
-                                    .map(str::to_string)
-                                    .unwrap_or(fallback);
-                                let ok = s.send_text(&keys);
-                                if ok {
-                                    s.resolve_attention();
-                                }
+                                let ok = s.press_pet_approve_button(Some(&fallback));
                                 (ok, s.title.clone(), s.id)
                             });
                             if let Some((true, title, id)) = sent {
