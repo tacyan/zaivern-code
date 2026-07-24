@@ -443,10 +443,25 @@ pub fn diff_ui(ui: &mut egui::Ui, theme: &Theme, files: &[FileDiff]) {
                     ui.label(RichText::new(msg).color(theme.text_dim).size(size));
                     return;
                 }
+                // 仮想化: 画面外の行はウィジェットを組み立てず、同じ高さの
+                // 空白だけ確保する。数千行の PR でも毎フレームのコストは
+                // 可視行ぶんだけになる (行高は最初に描いた 1 行から実測)。
+                let clip = ui.clip_rect();
+                let mut row_h: Option<f32> = None;
                 for hunk in &file.hunks {
                     hunk_header_ui(ui, theme, &pal, hunk, size);
                     for line in &hunk.lines {
-                        diff_line_ui(ui, theme, &pal, line, size);
+                        if let Some(h) = row_h {
+                            let top = ui.cursor().top();
+                            if top + h < clip.top() || top > clip.bottom() {
+                                ui.allocate_space(egui::vec2(ui.available_width(), h));
+                                continue;
+                            }
+                        }
+                        let h = diff_line_ui(ui, theme, &pal, line, size);
+                        if row_h.is_none() {
+                            row_h = Some(h);
+                        }
                     }
                 }
             });
@@ -497,14 +512,21 @@ fn hunk_header_ui(ui: &mut egui::Ui, theme: &Theme, pal: &DiffPalette, hunk: &Hu
 }
 
 /// 1 行分: [旧行番号][新行番号] +/- 本文。
-fn diff_line_ui(ui: &mut egui::Ui, theme: &Theme, pal: &DiffPalette, line: &DiffLine, size: f32) {
+/// 1 行を描き、実際に占めた高さを返す (仮想化のプレースホルダ用)。
+fn diff_line_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    pal: &DiffPalette,
+    line: &DiffLine,
+    size: f32,
+) -> f32 {
     let (bg, sign_fg, sign) = match line.kind {
         LineKind::Added => (pal.add_bg, pal.add_fg, "+"),
         LineKind::Removed => (pal.del_bg, pal.del_fg, "-"),
         LineKind::Context => (theme.bg, theme.text_dim, " "),
     };
     let w = ui.available_width();
-    egui::Frame::none().fill(bg).show(ui, |ui| {
+    let resp = egui::Frame::none().fill(bg).show(ui, |ui| {
         ui.set_min_width(w);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -529,6 +551,7 @@ fn diff_line_ui(ui: &mut egui::Ui, theme: &Theme, pal: &DiffPalette, line: &Diff
             );
         });
     });
+    resp.response.rect.height()
 }
 
 /// 行番号 1 列 (右寄せ)。番号が無い側は空欄。
