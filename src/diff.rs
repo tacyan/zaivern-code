@@ -177,8 +177,23 @@ fn unquote_git_path(s: &str) -> String {
 
 /// `diff --git a/x b/y` の残り部分から (old, new) を取り出す。
 /// スペースを含むパスに備え、まず ` b/` を境界として探す。
+/// パス自体が ` b/` を含む場合 (`a b/c.rs` 等) は rfind だけだと誤分割
+/// するため、「両側が同じパスになる分割」を優先して選ぶ (リネーム以外の
+/// diff は old == new なのでこれで正しく直る)。
 fn split_git_header(rest: &str) -> Option<(String, String)> {
-    if let Some(pos) = rest.rfind(" b/") {
+    let candidates: Vec<usize> = rest
+        .match_indices(" b/")
+        .map(|(i, _)| i)
+        .collect();
+    // 両側が一致する分割があればそれが正解 (非リネームの通常ケース)
+    for &pos in &candidates {
+        let (a, b) = rest.split_at(pos);
+        let (a, b) = (strip_side_prefix(a), strip_side_prefix(&b[1..]));
+        if a == b {
+            return Some((a, b));
+        }
+    }
+    if let Some(&pos) = candidates.last() {
         let (a, b) = rest.split_at(pos);
         return Some((strip_side_prefix(a), strip_side_prefix(&b[1..])));
     }
@@ -1118,6 +1133,25 @@ diff --git a/b b/b
                 assert!(delta > 120, "theme {} contrast too low: {}", t.name, delta);
             }
         }
+    }
+
+    #[test]
+    fn split_git_header_handles_b_slash_inside_path() {
+        // パスに " b/" を含むケース: 両側一致の分割を選ぶ
+        assert_eq!(
+            split_git_header("a/a b/c.rs b/a b/c.rs"),
+            Some(("a b/c.rs".to_string(), "a b/c.rs".to_string()))
+        );
+        // 通常ケース
+        assert_eq!(
+            split_git_header("a/src/main.rs b/src/main.rs"),
+            Some(("src/main.rs".to_string(), "src/main.rs".to_string()))
+        );
+        // リネーム (不一致) は従来どおり最後の " b/" で割る
+        assert_eq!(
+            split_git_header("a/old.rs b/new.rs"),
+            Some(("old.rs".to_string(), "new.rs".to_string()))
+        );
     }
 
     #[test]
