@@ -200,6 +200,7 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "status"
             | "state"
             | "plugin"
+            | "app"
             | "--help"
             | "-h"
             | "--version"
@@ -231,6 +232,10 @@ Zaivern Code — CLI 制御チャネル
   zai plugin enable <名前>              有効化
   zai plugin disable <名前>             無効化
 
+アプリ登録 (OS のアプリ一覧から起動できるようにします):
+  zai app install                       Launchpad / アプリメニュー / スタートメニューへ登録
+  zai app uninstall                     登録を解除
+
 その他:
   zai --help | -h                       このヘルプ
   zai --version | -V                    バージョン
@@ -246,6 +251,11 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         return None;
     }
     let rest = &args[1..];
+    // "app" はプロジェクトによくあるディレクトリ名。単独指定で ./app が実在するなら
+    // ワークスペース指定として GUI 起動に譲る (登録は `zai app install` と明示する)。
+    if first == "app" && rest.is_empty() && std::path::Path::new("app").is_dir() {
+        return None;
+    }
     Some(match first.as_str() {
         "--help" | "-h" => {
             println!("{HELP}");
@@ -256,6 +266,7 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
             0
         }
         "plugin" => run_plugin(rest),
+        "app" => crate::desktop::run(rest),
         other => match run_remote(other, rest) {
             Ok(out) => {
                 if !out.is_empty() {
@@ -508,8 +519,8 @@ mod tests {
     #[test]
     fn every_spec_subcommand_is_recognized() {
         for a in [
-            "open", "notify", "prompt", "run", "panel", "status", "state", "plugin", "--help",
-            "-h", "--version", "-V",
+            "open", "notify", "prompt", "run", "panel", "status", "state", "plugin", "app",
+            "--help", "-h", "--version", "-V",
         ] {
             assert!(is_cli_subcommand(a), "{a} は CLI サブコマンドであるべき");
         }
@@ -546,6 +557,8 @@ mod tests {
             "zai plugin new",
             "zai plugin enable",
             "zai plugin disable",
+            "zai app install",
+            "zai app uninstall",
             "--help",
             "--version",
         ] {

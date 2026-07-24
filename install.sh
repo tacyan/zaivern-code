@@ -77,9 +77,12 @@ install_prebuilt() {
     [ -x "$INSTALL_DIR/zai" ] && verb="更新"
     install -m 755 "$tmp/$name/zai" "$INSTALL_DIR/zai" || return 1
     sync_stale "$tmp/$name/zai" "$INSTALL_DIR"
+    # OS のアプリ一覧 (Launchpad / アプリメニュー) へも登録する。失敗しても続行。
+    "$INSTALL_DIR/zai" app install || true
     say ""
     say "✅ ${verb}完了: $INSTALL_DIR/zai ($tag)"
     say "   起動: プロジェクトのフォルダで zai . (または zai [ワークスペースのパス])"
+    say "   OS のアプリ一覧の「Zaivern Code」からも起動できます (解除: zai app uninstall)"
     path_hint "$INSTALL_DIR"
     return 0
 }
@@ -126,7 +129,10 @@ cargo install --git "$REPO_URL" --locked --force zaivern-code
 
 sync_stale "$HOME/.cargo/bin/zai" "$HOME/.cargo/bin"
 bin_path=$(command -v zai 2>/dev/null || echo "$HOME/.cargo/bin/zai")
+# OS のアプリ一覧 (Launchpad / アプリメニュー) へも登録する。失敗しても続行。
+"$bin_path" app install || true
 say ""
 say "✅ インストール完了: $bin_path"
 say "   起動: プロジェクトのフォルダで zai . (または zai [ワークスペースのパス])"
+say "   OS のアプリ一覧の「Zaivern Code」からも起動できます (解除: zai app uninstall)"
 path_hint "$HOME/.cargo/bin"

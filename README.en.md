@@ -49,6 +49,8 @@ irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 
 Once installed, just type `zai .` inside any project folder — that's your cockpit (`zai [workspace path]` also works). **Run the same one-liner again at any time to update to the latest version.** Prebuilt binaries for every OS are also available directly from [**Releases**](https://github.com/tacyan/zaivern-code/releases/latest) (macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64).
 
+The installer also **registers "Zaivern Code" in your OS app list** — launch it without a terminal from Launchpad / Spotlight on macOS, the application menu on Linux, or the Start Menu on Windows (your home directory becomes the workspace). Register or remove manually with `zai app install` / `zai app uninstall`.
+
 ---
 
 ## The view from the cockpit
@@ -255,6 +257,8 @@ zai run "cargo test"               # run it in the terminal
 zai status "deploying"             # show it in the status bar
 zai plugin list                    # list plugins
 zai plugin new <name>              # scaffold one
+zai app install                    # register in the OS app list (Launchpad / menu / Start Menu)
+zai app uninstall                  # remove that registration
 ```
 
 Bare `zai` and `zai .` still launch the GUI, exactly as before.
