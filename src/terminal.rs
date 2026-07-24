@@ -1499,7 +1499,7 @@ impl Session {
 
     /// ターミナル画面全体の文字列をすべて選択状態にする (Ctrl+A / Cmd+A)
     pub fn select_all(&mut self) {
-        let p = self.parser.lock().unwrap();
+        let p = lock_ok(&self.parser);
         let (rows, cols) = p.screen().size();
         if rows > 0 && cols > 0 {
             self.selection = Some(((0, 0), (rows.saturating_sub(1), cols.saturating_sub(1))));
@@ -1593,7 +1593,7 @@ impl Session {
     /// 各行 `max` 文字までで返す (上から下へ時系列順)。英数字か仮名漢字を 1 文字も
     /// 含まない行 (罫線・入力枠だけの行) や空行は飛ばす。
     pub fn screen_tail_lines(&self, rows: usize, max: usize) -> Vec<String> {
-        let text = self.parser.lock().unwrap().screen().contents();
+        let text = lock_ok(&self.parser).screen().contents();
         pick_tail_lines(&text, rows, max)
     }
 }

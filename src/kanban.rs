@@ -513,6 +513,7 @@ fn header_ui(
             let send = ui.button(tr("📣 送信"));
             let input = ui.add(
                 egui::TextEdit::singleline(&mut st.broadcast_input)
+                    .id(egui::Id::new("kanban-broadcast-input"))
                     .desired_width(220.0)
                     .hint_text(tr("全エージェントへブロードキャスト…")),
             );
@@ -520,10 +521,11 @@ fn header_ui(
             if (send.clicked() || enter) && !st.broadcast_input.trim().is_empty() {
                 acts.push(KanbanAction::Broadcast(st.broadcast_input.trim().to_string()));
                 st.broadcast_input.clear();
-                // Enter 送信でフォーカスが外れるので戻し、連続入力できるようにする
-                if enter {
-                    input.request_focus();
-                }
+            }
+            // Enter でフォーカスが外れるので戻し、連続入力できるようにする
+            // (空入力の Enter でも戻す — 戻さないと入力欄が死んだように見える)
+            if enter {
+                input.request_focus();
             }
             ui.label(
                 RichText::new(trf("連続稼働 {t}", &[("t", fmt_uptime(now_ms))]))
@@ -1063,6 +1065,11 @@ fn card_ui(
                             ui.horizontal(|ui| {
                                 let input = ui.add(
                                     egui::TextEdit::singleline(&mut st.prompt_input)
+                                        // ID を明示して固定する: 自動 ID は列と
+                                        // 並び順に依存するため、入力中に他カードが
+                                        // 状態遷移するとフォーカスと IME 変換中
+                                        // テキストが消えてしまう
+                                        .id(egui::Id::new(("kanban-prompt", c.id)))
                                         .desired_width(
                                             (ui.available_width() - 56.0).max(80.0),
                                         )
@@ -1083,6 +1090,10 @@ fn card_ui(
                                     });
                                     st.prompt_input.clear();
                                     st.prompt_for = None;
+                                } else if enter {
+                                    // 空入力の Enter ではフォーカスを戻す
+                                    // (欄は開いたままなので打ち直せるように)
+                                    input.request_focus();
                                 }
                             });
                         }

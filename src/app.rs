@@ -5860,10 +5860,11 @@ impl ZaivernApp {
                     let expanded = self.agent_input_buf.submit();
                     acts.broadcast = Some(expanded);
                     self.broadcast_input.clear();
-                    // Enter 送信でフォーカスが外れるので戻し、連続入力できるようにする
-                    if enter {
-                        input.request_focus();
-                    }
+                }
+                // Enter でフォーカスが外れるので戻し、連続入力できるようにする
+                // (空入力の Enter でも戻す — 戻さないと入力欄が死んだように見える)
+                if enter {
+                    input.request_focus();
                 }
                 // 音声で全エージェントの入力欄へ入れる (送信は各自 Enter)
                 let rec = self.voice.session.is_some();

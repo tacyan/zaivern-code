@@ -151,7 +151,12 @@ impl RemoteServer {
             .name("zv-remote-accept".into())
             .spawn(move || {
                 for stream in listener.incoming() {
-                    let Ok(stream) = stream else { continue };
+                    let Ok(stream) = stream else {
+                        // fd 枯渇などで accept が失敗し続けると待機なしの
+                        // ビジーループになるため、少し休んでから再試行する
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    };
                     let tx = tx.clone();
                     let ctx = ctx.clone();
                     let tok = tok.clone();
@@ -290,8 +295,24 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
         return respond(&mut stream, 401, "application/json", br#"{"ok":false,"error":"unauthorized"}"#);
     }
 
-    let json: serde_json::Value =
-        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+    // POST のボディが JSON として読めない場合は 400 で弾く。
+    // Null に落として続行すると全フィールドが既定値になり、
+    // /api/text が text="" でアクティブバッファを空にしてしまう。
+    let json: serde_json::Value = if method == "POST" {
+        match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"invalid json body"}"#,
+                );
+            }
+        }
+    } else {
+        serde_json::Value::Null
+    };
     let s = |k: &str| json.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let n = |k: &str| json.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
 
@@ -300,11 +321,22 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
         ("GET", "/api/file") => Query::File,
         ("GET", "/api/files") => Query::Files,
         ("GET", "/api/term") => Query::Term,
-        ("POST", "/api/text") => Query::SetText {
-            text: s("text"),
-            index: json.get("index").and_then(|v| v.as_i64()).unwrap_or(-1),
-            save: json.get("save").and_then(|v| v.as_bool()).unwrap_or(false),
-        },
+        ("POST", "/api/text") => {
+            // text フィールドが無いリクエストで空文字を適用しない (バッファ全消し防止)
+            if json.get("text").and_then(|v| v.as_str()).is_none() {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"missing text"}"#,
+                );
+            }
+            Query::SetText {
+                text: s("text"),
+                index: json.get("index").and_then(|v| v.as_i64()).unwrap_or(-1),
+                save: json.get("save").and_then(|v| v.as_bool()).unwrap_or(false),
+            }
+        }
         ("POST", "/api/cmd") => Query::Cmd(s("name"), n("arg")),
         ("POST", "/api/open") => Query::OpenFile(
             s("path"),
