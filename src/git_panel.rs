@@ -81,6 +81,9 @@ pub struct WorktreeEntry {
     pub detached: bool,
     pub bare: bool,
     pub locked: bool,
+    /// このワークスペースが今開いている worktree か。収集時に前計算する
+    /// (canonicalize は実 FS syscall なので毎フレームの UI では呼ばない)。
+    pub current: bool,
 }
 
 impl WorktreeEntry {
@@ -183,7 +186,9 @@ impl RunErr {
 /// `git -C <ws> <args>` を同期実行する。呼ぶ側がスレッドを用意すること。
 fn run_git(ws: &Path, args: &[&str]) -> Result<String, RunErr> {
     let mut c = Command::new("git");
-    c.arg("-C").arg(ws).args(args);
+    // color.ui=always な環境でも ANSI エスケープ無しの出力を得る
+    // (branch 一覧の "* " マーカー判定やブランチ名検証が壊れないように)
+    c.arg("-c").arg("color.ui=false").arg("-C").arg(ws).args(args);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -231,9 +236,13 @@ fn collect(ws: &Path) -> RepoState {
         },
     };
 
-    let worktrees = run_git(ws, &["worktree", "list", "--porcelain"])
+    let mut worktrees = run_git(ws, &["worktree", "list", "--porcelain"])
         .map(|s| parse_worktree_porcelain(&s))
         .unwrap_or_default();
+    // 「今ここ」の worktree をこのバックグラウンドスレッドで前計算しておく
+    for w in &mut worktrees {
+        w.current = same_path(&w.path, &toplevel);
+    }
 
     let changes = run_git(ws, &["status", "--porcelain=v1"])
         .map(|s| parse_status_porcelain(&s))
@@ -285,6 +294,7 @@ pub fn parse_worktree_porcelain(output: &str) -> Vec<WorktreeEntry> {
                     detached: false,
                     bare: false,
                     locked: false,
+                    current: false,
                 });
             }
             "HEAD" => {
@@ -387,7 +397,9 @@ pub fn parse_status_porcelain(output: &str) -> Vec<ChangeEntry> {
     let mut out = Vec::new();
     for line in output.lines() {
         // "XY " の 3 バイト + パス。マーカーは ASCII 固定。
-        if line.len() < 4 || !line.is_char_boundary(3) {
+        // 行頭がマルチバイト文字だと [..2] / [3..] が文字の内部を指して
+        // パニックするため、両方の境界を検査してから切り出す。
+        if line.len() < 4 || !line.is_char_boundary(2) || !line.is_char_boundary(3) {
             continue;
         }
         let code = line[..2].to_string();
@@ -536,6 +548,10 @@ impl GitPanel {
         if self.workspace != ws {
             self.workspace = ws;
             self.state = RepoState::Loading;
+            // 旧ワークスペース向けの飛行中の収集は受信口ごと捨てる。
+            // 残すと旧リポジトリの結果が新パネルとして表示され、
+            // そのブランチ名で checkout を発行できてしまう。
+            self.pending = None;
             self.invalidate();
         }
     }
@@ -775,7 +791,7 @@ impl GitPanel {
         .default_open(true)
         .show(ui, |ui| {
             for w in &info.worktrees {
-                let is_current = same_path(&w.path, &info.toplevel);
+                let is_current = w.current;
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(if is_current { "●" } else { "○" })
@@ -966,6 +982,13 @@ impl GitPanel {
         if self.job.is_some() {
             return;
         }
+        // 成功時に消すのは、そのジョブが使った入力欄だけ。
+        // Fetch や Checkout で入力途中のブランチ名/worktree 名を消さない。
+        let (clear_branch, clear_worktree) = match &job {
+            Job::NewBranch(_) => (true, false),
+            Job::WorktreeAdd { .. } => (false, true),
+            _ => (false, false),
+        };
         let (label, args) = match job {
             Job::Checkout(b) => match validate_branch_name(&b) {
                 Ok(b) => (format!("checkout {b}"), vec!["checkout".into(), b]),
@@ -1031,9 +1054,13 @@ impl GitPanel {
             Ok(_) => {
                 self.job = Some(rx);
                 self.job_label = label;
-                // 入力欄は投げたら空にする
-                self.new_branch_input.clear();
-                self.worktree_input.clear();
+                // 使った入力欄だけ空にする
+                if clear_branch {
+                    self.new_branch_input.clear();
+                }
+                if clear_worktree {
+                    self.worktree_input.clear();
+                }
             }
             Err(e) => {
                 actions.toast = Some((trf("git を起動できません: {e}", &[("e", e.to_string())]), false));
@@ -1245,6 +1272,9 @@ bare
         let v = parse_status_porcelain(" M ドキュメント/メモ.md\n");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].path, "ドキュメント/メモ.md");
+        // 行頭からマルチバイト文字の行 (is_char_boundary(2) が偽) でも落ちない
+        assert!(parse_status_porcelain("あいう\n").is_empty());
+        assert!(parse_status_porcelain("アM path\n").is_empty());
     }
 
     #[test]
