@@ -23,6 +23,7 @@ mutants.out*/
 # === Claude Code / AI agents ===
 .claude/settings.local.json
 .fable5/
+.night/
 .aider*
 .cursor/
 .codex/
