@@ -4258,7 +4258,7 @@ impl ZaivernApp {
                             .id_salt("zv-tree")
                             .auto_shrink(false)
                             .show(ui, |ui| {
-                                self.tree.ui(ui, &theme, &mut actions);
+                                self.tree.ui(ui, &theme, &self.gitinfo, &mut actions);
                             });
                     }
                     SidebarTab::Search => {
