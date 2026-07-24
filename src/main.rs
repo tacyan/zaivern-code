@@ -24,6 +24,7 @@ mod html;
 mod i18n;
 mod ide;
 mod jsonc;
+mod kanban;
 mod keybinds;
 mod lsp;
 mod markdown;
