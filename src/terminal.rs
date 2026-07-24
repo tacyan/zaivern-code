@@ -2063,6 +2063,299 @@ mod tests {
         s.kill();
     }
 
+    // ── 900ms スキャンスロットルの境界 ────────────────────────────────
+
+    /// 承認プロンプトを出す子を実PTYで起こす (unix 前提のテスト用ヘルパ)。
+    #[cfg(unix)]
+    fn spawn_prompt_session(id: u64, cmd: &str) -> super::Session {
+        use super::{Session, SpawnSpec};
+        use std::collections::HashMap;
+        Session::spawn(
+            id,
+            SpawnSpec {
+                title: "attention-e2e".into(),
+                preset_name: "test".into(),
+                icon: "⏱".into(),
+                command: cmd.into(),
+                cwd: std::env::temp_dir(),
+                env: HashMap::new(),
+                log_path: None,
+            },
+            eframe::egui::Context::default(),
+        )
+        .expect("PTY起動")
+    }
+
+    /// scan_attention を通さず、画面に needle が出るまで直接待つ。
+    /// (スロットルの検証では「プロンプトは確実に見えている」状態から始めたい)
+    #[cfg(unix)]
+    fn wait_prompt_on_screen(s: &super::Session, needle: &str) {
+        use std::time::Duration;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if s.parser.lock().unwrap().screen().contents().contains(needle) {
+                return;
+            }
+        }
+        panic!("プロンプト {needle:?} が画面に出なかった");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_throttle_blocks_under_900ms_and_adopts_at_boundary() {
+        use super::Attention;
+        use std::time::{Duration, Instant};
+
+        // 入力を読まずにプロンプトを出しっぱなしにする子 (エコー無し)。
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let mut s = spawn_prompt_session(981, cmd);
+        wait_prompt_on_screen(&s, "(y/n)");
+
+        // 900ms 未満: プロンプトが画面に見えていても None のまま。
+        // cur_hash (未読判定用の意味的ハッシュ) もスロットル中は更新されない。
+        s.last_scan = Instant::now();
+        assert!(s.scan_attention(false).is_none(), "スロットル中に検出された");
+        assert_eq!(s.cur_hash, 0, "スロットル中に cur_hash が更新された");
+        assert!(!s.attention);
+
+        // 850ms 相当でもまだ弾かれる (閾値 900ms の下側ブラケット)
+        s.last_scan = Instant::now() - Duration::from_millis(850);
+        assert!(s.scan_attention(false).is_none());
+        assert_eq!(s.cur_hash, 0);
+
+        // 900ms ちょうどで境界を通過 → 検出が採用され、ハッシュも動く
+        s.last_scan = Instant::now() - Duration::from_millis(900);
+        assert!(
+            matches!(s.scan_attention(false), Some(Attention::NeedsApproval)),
+            "境界通過のスキャンで検出されなかった"
+        );
+        assert!(s.attention);
+        assert_ne!(s.cur_hash, 0, "採用されたスキャンで cur_hash が更新されるはず");
+        s.kill();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn throttled_scan_does_not_extend_the_900ms_window() {
+        use super::Attention;
+        use std::time::{Duration, Instant};
+
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let mut s = spawn_prompt_session(982, cmd);
+        wait_prompt_on_screen(&s, "(y/n)");
+
+        // 窓の起点は「最後に採用されたスキャン」。弾かれた試行では動かない。
+        s.last_scan = Instant::now() - Duration::from_millis(500);
+        assert!(s.scan_attention(false).is_none(), "500ms 経過では弾かれるはず");
+        std::thread::sleep(Duration::from_millis(500));
+        // 起点から計 ~1000ms。もし弾かれた試行が last_scan を更新していたら
+        // まだ ~500ms しか経っていないことになり None のままになる。
+        assert!(
+            matches!(s.scan_attention(false), Some(Attention::NeedsApproval)),
+            "弾かれた試行がスロットル窓を延長した"
+        );
+        s.kill();
+    }
+
+    // ── 自動YES 無効↔有効の切替 ──────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn enabling_auto_yes_replies_to_already_detected_prompt() {
+        use super::Attention;
+        use std::time::{Duration, Instant};
+
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let mut s = spawn_prompt_session(983, cmd);
+
+        // 1) 自動YESオフで検出済み (バブル待ちの状態)
+        let mut detected = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(false), Some(Attention::NeedsApproval)) {
+                detected = true;
+                break;
+            }
+        }
+        assert!(detected, "オフのうちに承認プロンプトが検知されなかった");
+        assert!(s.attention);
+
+        // 2) オンへ切替 → 次の採用スキャンで同じプロンプトへ自動応答される
+        s.last_scan = Instant::now() - Duration::from_millis(900);
+        assert!(
+            matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))),
+            "オン切替後の次スキャンで自動応答されなかった"
+        );
+        assert!(!s.attention, "自動応答後は承認待ちが解除される");
+
+        // 3) 同じプロンプトが画面に残っていても応答は一度きり
+        s.last_scan = Instant::now() - Duration::from_millis(900);
+        assert!(s.scan_attention(true).is_none());
+        s.kill();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disabling_auto_yes_after_reply_stops_redetection_and_resend() {
+        use super::Attention;
+        use std::time::{Duration, Instant};
+
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let mut s = spawn_prompt_session(984, cmd);
+        // 停滞閾値を大きく超えさせても「オフなら再送しない」ことを見るため短縮。
+        s.auto_yes_resend_after = Duration::from_millis(300);
+
+        // 1) オンで自動応答済みにする
+        let mut replied = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
+                replied = true;
+                break;
+            }
+        }
+        assert!(replied, "自動YESが送られなかった");
+
+        // 2) オフへ切替。プロンプトは画面に残ったまま停滞閾値 (300ms) を超えるが、
+        //    再検出 (NeedsApproval) も停滞再送 (AutoReplied) も起きない
+        std::thread::sleep(Duration::from_millis(400));
+        for _ in 0..8 {
+            s.last_scan = Instant::now() - Duration::from_millis(900);
+            match s.scan_attention(false) {
+                Some(Attention::AutoReplied(_)) => panic!("オフ切替後に停滞再送された"),
+                Some(Attention::NeedsApproval) => {
+                    panic!("応答済みプロンプトをオフ切替後に再検出した")
+                }
+                _ => {}
+            }
+            assert!(!s.attention);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        s.kill();
+    }
+
+    // ── 停滞再送の周期性 ─────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn stall_resend_repeats_each_interval_but_not_within_it() {
+        use super::Attention;
+        use std::time::{Duration, Instant};
+
+        // 応答 (y\r) を無視してプロンプトが固まったままの子。
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let mut s = spawn_prompt_session(985, cmd);
+        s.auto_yes_resend_after = Duration::from_millis(600);
+
+        // 1) 最初の自動YES
+        let mut first = None;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
+                first = Some(Instant::now());
+                break;
+            }
+        }
+        let first = first.expect("最初の自動YESが送られなかった");
+
+        // 2) 直後の採用スキャンでは再送しない (間隔未満の二重発火防止)
+        s.last_scan = Instant::now() - Duration::from_millis(900);
+        assert!(s.scan_attention(true).is_none(), "間隔未満で二重発火した");
+
+        // 3) 間隔経過後に 1 回目の再送が発火する
+        let mut second = None;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            s.last_scan = Instant::now() - Duration::from_millis(900);
+            match s.scan_attention(true) {
+                Some(Attention::AutoReplied(_)) => {
+                    second = Some(Instant::now());
+                    break;
+                }
+                Some(Attention::NeedsApproval) => panic!("応答済みプロンプトを再検出した"),
+                _ => {}
+            }
+        }
+        let second = second.expect("停滞 1 回目の再送が発火しなかった");
+        assert!(
+            second.duration_since(first) >= Duration::from_millis(550),
+            "再送間隔 (600ms) より早く再送された"
+        );
+
+        // 4) 再送直後も間隔未満では発火しない
+        s.last_scan = Instant::now() - Duration::from_millis(900);
+        assert!(s.scan_attention(true).is_none(), "再送直後に二重発火した");
+
+        // 5) さらに間隔が経てば 2 回目の再送も発火する (間隔ごとの周期動作)
+        let mut third = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            s.last_scan = Instant::now() - Duration::from_millis(900);
+            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
+                third = true;
+                break;
+            }
+        }
+        assert!(third, "2 回目以降の周期再送が発火しなかった");
+        s.kill();
+    }
+
+    // ── 選択肢が画面外へスクロールした場合 ────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_scrolled_off_screen_clears_attention_without_events() {
+        use super::Attention;
+        use std::time::{Duration, Instant};
+
+        // プロンプトを出して 3 秒待った後、行を氾濫させて選択肢を
+        // 可視域 (30 行) の外へ追い出し、入力自体は待ち続ける子。
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 3; i=0; while [ $i -lt 40 ]; do echo "filler-$i"; i=$((i+1)); done; sleep 30"#;
+        let mut s = spawn_prompt_session(986, cmd);
+
+        // 1) まず承認待ちとして検出される
+        let mut detected = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(false), Some(Attention::NeedsApproval)) {
+                detected = true;
+                break;
+            }
+        }
+        assert!(detected, "承認プロンプトが検知されなかった");
+        assert!(s.attention);
+
+        // 2) 氾濫でプロンプトが可視画面から消えるまで待つ
+        let mut gone = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if !s.parser.lock().unwrap().screen().contents().contains("(y/n)") {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "プロンプトが画面外へ流れなかった");
+
+        // 3) 現挙動: 子はまだ入力を待っているが、選択肢が画面外に出ると
+        //    次の採用スキャンで承認待ちは黙って解除され、イベントは出ない
+        //    (解除を知らせる Attention は存在しない)。
+        s.last_scan = Instant::now() - Duration::from_millis(900);
+        assert!(
+            s.scan_attention(false).is_none(),
+            "画面外へ流れたプロンプトでイベントが出た"
+        );
+        assert!(!s.attention, "画面外に流れたプロンプトの承認待ちが解除されなかった");
+
+        // 4) 以後も再検出しない (画面に見えないものは検出対象外)
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(100));
+            s.last_scan = Instant::now() - Duration::from_millis(900);
+            assert!(s.scan_attention(false).is_none());
+            assert!(!s.attention);
+        }
+        s.kill();
+    }
+
     // ── 権限モード判定のカタログ経由ルーティング ──────────────────────
 
     /// 指定コマンド文字列で Session を1つ起こす。

@@ -1427,4 +1427,140 @@ mod tests {
             assert!(m.active_session().is_none(), "空なら active_session は None");
         }
     }
+
+    // ---- poll_events(): 承認待ちのまま子が exit した場合 ----
+    // remove_active と同じく実PTYで Session を起こす (unix 限定)。
+    #[cfg(unix)]
+    mod poll_events_exit {
+        use crate::agents::{AgentManager, SessionEvent};
+        use crate::terminal::{Session, SpawnSpec};
+        use eframe::egui;
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        /// 指定コマンドの実セッションを 1 本だけ持つマネージャを作る。
+        fn manager_with(cmd: &str, id: u64) -> AgentManager {
+            let spec = SpawnSpec {
+                title: "poll-e2e".into(),
+                preset_name: "test".into(),
+                icon: "🧪".into(),
+                command: cmd.into(),
+                cwd: std::env::temp_dir(),
+                env: HashMap::new(),
+                log_path: None,
+            };
+            let s = Session::spawn(id, spec, egui::Context::default())
+                .expect("テスト用セッションの起動に失敗");
+            let mut m = AgentManager::new();
+            m.sessions.push(s);
+            m
+        }
+
+        #[test]
+        fn exit_while_awaiting_approval_emits_exited_once_and_clears_attention() {
+            // 承認プロンプトを出し、応答を待ったまま 3 秒で子が勝手に終了する。
+            let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 3"#;
+            let mut m = manager_with(cmd, 9901);
+
+            // 1) 生きている間は承認待ちとして報告される
+            let mut needs = false;
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                for ev in m.poll_events(false) {
+                    if matches!(ev, SessionEvent::NeedsApproval(_)) {
+                        needs = true;
+                    }
+                }
+                if needs {
+                    break;
+                }
+            }
+            assert!(needs, "終了前の承認プロンプトが検知されなかった");
+            assert!(m.sessions[0].attention);
+
+            // 2) 承認待ちのまま子が exit → Exited が一回だけ出て、承認待ちは
+            //    解除される。自動YESを許可していても、死んだセッションへ
+            //    NeedsApproval / AutoApproved が誤発火しない。
+            let mut exited = 0u32;
+            let mut stray = 0u32;
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                for ev in m.poll_events(true) {
+                    match ev {
+                        SessionEvent::Exited(..) => exited += 1,
+                        SessionEvent::NeedsApproval(_) | SessionEvent::AutoApproved(..) => {
+                            stray += 1
+                        }
+                        SessionEvent::RateLimited(..) => {}
+                    }
+                }
+                if exited > 0 {
+                    break;
+                }
+            }
+            assert_eq!(exited, 1, "Exited が一回だけ届かなかった");
+            assert!(!m.sessions[0].attention, "子の終了後も承認待ちが残った");
+            assert_eq!(stray, 0, "死んだセッションへ承認イベントが誤発火した");
+
+            // 3) 以後なんどポーリングしても Exited は増えない (多重通知の防止)
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(100));
+                for ev in m.poll_events(true) {
+                    match ev {
+                        SessionEvent::Exited(..) => exited += 1,
+                        SessionEvent::NeedsApproval(_) | SessionEvent::AutoApproved(..) => {
+                            stray += 1
+                        }
+                        SessionEvent::RateLimited(..) => {}
+                    }
+                }
+            }
+            assert_eq!(exited, 1, "Exited が多重通知された");
+            assert_eq!(stray, 0);
+        }
+
+        #[test]
+        fn prompt_then_immediate_exit_only_reports_exited() {
+            // プロンプトを表示した直後に子が終了する。初回スキャンの機会
+            // (起動から 900ms) より先に死ぬため、承認系イベントは一切出ずに
+            // Exited だけが届くのが現挙動。
+            let cmd = r#"printf 'Do you want to proceed? (y/n) '; exit 0"#;
+            let mut m = manager_with(cmd, 9902);
+
+            let mut exited = 0u32;
+            let mut stray = 0u32;
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(100));
+                for ev in m.poll_events(true) {
+                    match ev {
+                        SessionEvent::Exited(..) => exited += 1,
+                        SessionEvent::NeedsApproval(_) | SessionEvent::AutoApproved(..) => {
+                            stray += 1
+                        }
+                        SessionEvent::RateLimited(..) => {}
+                    }
+                }
+                if exited > 0 {
+                    break;
+                }
+            }
+            assert_eq!(exited, 1, "Exited が届かなかった");
+            assert_eq!(
+                stray, 0,
+                "プロンプト直後に死んだセッションへ承認イベントが誤発火した"
+            );
+            assert!(!m.sessions[0].attention);
+
+            // 画面にはプロンプトが残っているが、死んだセッションはスキャン対象外
+            let screen = m.sessions[0].parser.lock().unwrap().screen().contents();
+            assert!(screen.contains("(y/n)"), "前提: プロンプトは画面に残っている");
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(
+                    m.poll_events(true).is_empty(),
+                    "死んだセッションへイベントが出た"
+                );
+            }
+        }
+    }
 }
