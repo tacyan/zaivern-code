@@ -3181,23 +3181,12 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
                 }
             }
             egui::Event::Key {
-                key: egui::Key::A,
-                pressed: true,
-                modifiers,
-                ..
-            } if modifiers.mac_cmd || modifiers.command || (modifiers.ctrl && modifiers.shift) => {
-                session.select_all();
-            }
-            egui::Event::Key {
                 key,
                 pressed: true,
                 modifiers,
                 ..
             } => {
                 if modifiers.mac_cmd {
-                    if *key == egui::Key::A {
-                        session.select_all();
-                    }
                     continue;
                 }
                 // IME 変換中はキーを IME に任せる(Enter/矢印で確定・候補選択するため)
