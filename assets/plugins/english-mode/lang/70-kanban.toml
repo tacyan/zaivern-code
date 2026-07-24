@@ -12,7 +12,8 @@
 "Cockpit へ切替" = "Switch to Cockpit"
 
 # ── 看板本体 ──
-"カードは状態が変わると自動で列の間を移動します — ドラッグは不要です" = "Cards move between columns automatically as agent state changes — no dragging needed"
+"カードは状態が変わると自動でレーンを移動します — ドラッグは不要です" = "Cards move between lanes automatically as agent state changes — no dragging needed"
+"まだ出力がありません" = "No output yet"
 "停滞・異常" = "Stalled / Trouble"
 "完了・終了" = "Done / Exited"
 "レート制限" = "rate limited"

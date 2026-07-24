@@ -3119,6 +3119,8 @@ impl ZaivernApp {
                 self.kanban = !self.kanban;
                 if self.kanban {
                     self.cockpit = false;
+                    // 看板はターミナルパネル内のタブなので、パネルごと出す
+                    self.agents.panel_open = true;
                 }
             }
             Cmd::OpenAgentPicker => self.agent_picker.open(ctx),
@@ -3168,6 +3170,8 @@ impl ZaivernApp {
                     self.agents.active = i;
                     self.agents.panel_open = true;
                     self.cockpit = false;
+                    // 看板タブ表示中はパネルの中身が看板なので、端末ビューへ戻す
+                    self.kanban = false;
                     self.term_focus_pending = true;
                     // 明示的なフォーカス = 既読 (「あとで見る」ピンも外す)
                     self.agents.sessions[i].acknowledge();
@@ -5525,7 +5529,9 @@ impl ZaivernApp {
                                 if let Some(i) = set_active {
                                     self.agents.active = i;
                                     // タブで選び直したら、その端末をアクティブな
-                                    // 入力先 (フォーカス) にする。
+                                    // 入力先 (フォーカス) にする。看板タブ表示中
+                                    // なら端末ビューへ戻す。
+                                    self.kanban = false;
                                     self.term_focus_pending = true;
                                     self.agents.sessions[i].acknowledge();
                                 }
@@ -5535,6 +5541,16 @@ impl ZaivernApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("⌄").on_hover_text(tr("パネルを隠す (⌘J)")).clicked() {
                             self.agents.panel_open = false;
+                        }
+                        // 看板タブ: パネルの中身を 端末 ⇄ フリート看板 で切り替える
+                        if ui
+                            .selectable_label(self.kanban, tr("📋 看板"))
+                            .on_hover_text(tr(
+                                "フリート看板 — 全エージェントの状況を俯瞰 (⌘⇧K)",
+                            ))
+                            .clicked()
+                        {
+                            self.kanban = !self.kanban;
                         }
                         ui.menu_button("📜", |ui| {
                             ui.label(
@@ -5606,7 +5622,11 @@ impl ZaivernApp {
                 let font = self.cfg.terminal_font_size;
                 let want_focus = self.term_focus_pending;
                 self.term_focus_pending = false;
-                if let Some(s) = self.agents.active_session() {
+                if self.kanban {
+                    // 「📋 看板」タブ: 端末の代わりにフリート看板を敷き詰める
+                    let ctx = ui.ctx().clone();
+                    self.kanban_ui(ui, &ctx);
+                } else if let Some(s) = self.agents.active_session() {
                     let resp = terminal::draw(ui, s, &theme, font, true, true, true);
                     // タブ選択でアクティブになった端末へ、その場でフォーカスを渡す。
                     if want_focus {
@@ -5751,6 +5771,8 @@ impl ZaivernApp {
                 {
                     self.kanban = true;
                     self.cockpit = false;
+                    // 看板はターミナルパネル内のタブなので、パネルごと出す
+                    self.agents.panel_open = true;
                 }
                 if ui
                     .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
@@ -6447,7 +6469,8 @@ impl ZaivernApp {
                         ""
                     },
                     can_cycle: s.permission_switch_hint().is_some(),
-                    tail: s.screen_tail(120),
+                    // フル幅カードのライブプレビュー: 画面末尾の意味のある行を数行
+                    tail_lines: s.screen_tail_lines(8, 220),
                     task,
                 }
             })
@@ -10025,7 +10048,8 @@ impl eframe::App for ZaivernApp {
 
         // 表示中のアクティブセッションを既読にする。未読 (◆) は
         // 「見ていない間に意味的な出力が変わった」セッションだけに残る。
-        if self.agents.panel_open || self.cockpit {
+        // 看板タブ表示中はパネルに端末が見えていないので既読にしない。
+        if (self.agents.panel_open && !self.kanban) || self.cockpit {
             let active = self.agents.active;
             if let Some(s) = self.agents.sessions.get_mut(active) {
                 s.mark_read();
@@ -10063,11 +10087,9 @@ impl eframe::App for ZaivernApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme_bg))
             .show(ctx, |ui| {
-                if self.kanban {
-                    // 看板は横幅が命 (5 列) なので、編集ペインとは分割しない。
-                    let ctx = ui.ctx().clone();
-                    self.kanban_ui(ui, &ctx);
-                } else if self.cockpit {
+                // 看板はここではなくターミナルパネル内の「📋 看板」タブで描く
+                // (terminal_panel 参照)。エディタと同時に見えるようにするため。
+                if self.cockpit {
                     let ctx = ui.ctx().clone();
                     // ファイルを開いていれば左に編集ペインを並べて出す。
                     // Cockpit との切り替え無しでファイルが見えるようにするため。

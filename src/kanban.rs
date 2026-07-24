@@ -1,9 +1,12 @@
-//! フリート看板 (Fleet Kanban) — 全エージェントを状態列で俯瞰・指揮するカンバン画面。
+//! フリート看板 (Fleet Kanban) — 全エージェントを状態レーンで俯瞰・指揮する画面。
+//! ターミナルパネル右端の「📋 看板」タブから、パネル内のビューとして開く。
 //!
 //! 各エージェントセッションを 1 枚のカードとして、状態
-//! (待機 / 作業中 / 承認待ち / 停滞・異常 / 完了・終了) の列に自動で並べる。
-//! カードをドラッグする必要はない — supervisor の状態判定が変われば
-//! カードが勝手に列を移動するので、目視で「誰が何をしているか」が分かる。
+//! (待機 / 作業中 / 承認待ち / 停滞・異常 / 完了・終了) のレーンに自動で並べる。
+//! カードは画面の横幅いっぱいを使い、割り当てタスクと画面末尾のライブ
+//! プレビューを載せる — 「いま何を実装中か」がカードだけで分かるのが狙い。
+//! ドラッグは不要 — supervisor の状態判定が変われば
+//! カードが勝手にレーンを移動するので、目視で「誰が何をしているか」が分かる。
 //!
 //! 作法は orchestration.rs と同じ: 判断と描画はこのモジュール、
 //! 副作用 (PTY への書き込み・起動・再起動…) は `KanbanAction` で app.rs へ返す。
@@ -159,8 +162,8 @@ pub struct Card {
     pub permission_badge: &'static str,
     /// 権限モード切替キーを送れるか
     pub can_cycle: bool,
-    /// 画面末尾の「意味のある 1 行」= いま何をしているか
-    pub tail: String,
+    /// 画面末尾の「意味のある行」たち (時系列順) = いま何を実装中かのライブプレビュー
+    pub tail_lines: Vec<String>,
     /// coordinator に割り当て中のタスク名
     pub task: Option<String>,
 }
@@ -296,7 +299,7 @@ fn header_ui(
     });
     ui.label(
         RichText::new(tr(
-            "カードは状態が変わると自動で列の間を移動します — ドラッグは不要です",
+            "カードは状態が変わると自動でレーンを移動します — ドラッグは不要です",
         ))
         .size(11.5)
         .color(theme.text_dim),
@@ -341,89 +344,59 @@ fn board_ui(
     cards: &[Card],
     acts: &mut Vec<KanbanAction>,
 ) {
-    let spacing = 10.0;
-    let n = COLUMNS.len() as f32;
-    // 画面が広ければ均等割り、狭ければ 232px で横スクロールに逃がす
-    let col_w = ((ui.available_width() - spacing * (n - 1.0)) / n).clamp(232.0, 460.0);
-    let board_h = ui.available_height().max(220.0);
-
-    egui::ScrollArea::horizontal()
+    // カードに横幅いっぱいを使わせたいので、列を横に並べず
+    // 「状態レーン (フル幅の帯) を縦に積む」レイアウトにする。
+    // 空のレーンは出さない — 限られた縦空間を実物のカードに回す。
+    egui::ScrollArea::vertical()
         .id_salt("kanban-board")
         .auto_shrink(false)
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = spacing;
-            ui.horizontal_top(|ui| {
-                for (ci, col) in COLUMNS.iter().enumerate() {
-                    let members: Vec<&Card> =
-                        cards.iter().filter(|c| c.column == *col).collect();
-                    column_ui(st, ui, theme, *col, ci, col_w, board_h, &members, acts);
+            for col in COLUMNS {
+                let members: Vec<&Card> =
+                    cards.iter().filter(|c| c.column == col).collect();
+                if members.is_empty() {
+                    continue;
                 }
-            });
+                lane_ui(st, ui, theme, col, &members, acts);
+                ui.add_space(10.0);
+            }
         });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn column_ui(
+/// フル幅の状態レーン: 色付き見出し + 下線 + 所属カード (縦積み)。
+fn lane_ui(
     st: &mut KanbanState,
     ui: &mut egui::Ui,
     theme: &Theme,
     col: Column,
-    ci: usize,
-    col_w: f32,
-    board_h: f32,
     members: &[&Card],
     acts: &mut Vec<KanbanAction>,
 ) {
     let color = col.color(theme);
-    ui.allocate_ui(egui::vec2(col_w, board_h), |ui| {
-        egui::Frame::none()
-            .fill(theme.panel)
-            .stroke(egui::Stroke::new(1.0_f32, theme.border))
-            .rounding(egui::Rounding::same(10.0))
-            .inner_margin(egui::Margin::same(8.0))
-            .show(ui, |ui| {
-                ui.set_width(col_w - 16.0);
-                ui.set_min_height(board_h - 18.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("●").color(color));
-                    ui.label(RichText::new(tr(col.title())).strong().color(theme.text))
-                        .on_hover_text(tr(col.hint()));
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                RichText::new(members.len().to_string())
-                                    .color(theme.text_dim),
-                            );
-                        },
-                    );
-                });
-                // 列カラーの下線 (どの列かが遠目にも分かる)
-                let (line, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 2.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .rect_filled(line, 1.0_f32, color.gamma_multiply(0.6));
-                ui.add_space(6.0);
-
-                egui::ScrollArea::vertical()
-                    .id_salt(("kanban-col", ci))
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        if members.is_empty() {
-                            ui.add_space(10.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(RichText::new("—").color(theme.text_dim));
-                            });
-                        }
-                        for c in members {
-                            card_ui(st, ui, theme, c, acts);
-                            ui.add_space(8.0);
-                        }
-                    });
-            });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("●").color(color));
+        ui.label(
+            RichText::new(tr(col.title()))
+                .size(15.0)
+                .strong()
+                .color(theme.text),
+        )
+        .on_hover_text(tr(col.hint()));
+        ui.label(RichText::new(members.len().to_string()).color(theme.text_dim));
     });
+    // レーンカラーの下線 (どの状態かが遠目にも分かる)
+    let (line, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 2.0),
+        egui::Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(line, 1.0_f32, color.gamma_multiply(0.6));
+    ui.add_space(8.0);
+
+    for c in members {
+        card_ui(st, ui, theme, c, acts);
+        ui.add_space(10.0);
+    }
 }
 
 fn card_ui(
@@ -454,7 +427,8 @@ fn card_ui(
                 .show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.set_width(ui.available_width());
-                        // 1 段目: 状態ドット + 権限バッジ + アイコン + タイトル / 稼働時間
+                        // 1 段目: 状態ドット + 権限バッジ + アイコン + タイトル +
+                        //         状態チップ + ⏳ + 未読 / 右端: 稼働時間
                         ui.horizontal(|ui| {
                             let dot = if c.running { "●" } else { "○" };
                             ui.label(RichText::new(dot).color(color));
@@ -463,9 +437,29 @@ fn card_ui(
                                     "{}{} {}",
                                     c.permission_badge, c.icon, c.title
                                 ))
+                                .size(15.0)
                                 .strong()
                                 .color(theme.text),
                             );
+                            egui::Frame::none()
+                                .fill(theme.accent_soft)
+                                .rounding(egui::Rounding::same(6.0))
+                                .inner_margin(egui::Margin::symmetric(7.0, 2.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(&c.state_label)
+                                            .size(11.5)
+                                            .strong()
+                                            .color(color),
+                                    );
+                                });
+                            if let Some(line) = &c.rate_limited {
+                                ui.label(RichText::new("⏳").color(theme.warn))
+                                    .on_hover_text(trf(
+                                        "レート制限/使用上限: {line}",
+                                        &[("line", line.clone())],
+                                    ));
+                            }
                             if c.unread {
                                 ui.label(RichText::new("◆").size(9.0).color(theme.accent))
                                     .on_hover_text(tr("最後に見てから新しい出力があります"));
@@ -481,46 +475,53 @@ fn card_ui(
                                 },
                             );
                         });
-                        // 2 段目: 状態チップ + ⏳ + 📋 割り当てタスク
-                        ui.horizontal(|ui| {
-                            egui::Frame::none()
-                                .fill(theme.accent_soft)
-                                .rounding(egui::Rounding::same(6.0))
-                                .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new(&c.state_label)
-                                            .size(11.0)
-                                            .strong()
-                                            .color(color),
-                                    );
-                                });
-                            if let Some(line) = &c.rate_limited {
-                                ui.label(RichText::new("⏳").color(theme.warn))
-                                    .on_hover_text(trf(
-                                        "レート制限/使用上限: {line}",
-                                        &[("line", line.clone())],
-                                    ));
-                            }
-                            if let Some(task) = &c.task {
-                                let short: String = task.chars().take(24).collect();
-                                ui.label(
-                                    RichText::new(format!("📋 {short}"))
-                                        .size(11.0)
-                                        .color(theme.text_dim),
+                        // 2 段目: 📋 割り当てタスク = 何を実装させているか (あれば大きく)
+                        if let Some(task) = &c.task {
+                            ui.add_space(2.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("📋 {task}"))
+                                        .size(13.0)
+                                        .color(theme.text),
                                 )
-                                .on_hover_text(task);
-                            }
-                        });
-                        // 3 段目: 画面末尾の 1 行 = いま何をしているか
-                        if !c.tail.is_empty() {
-                            ui.label(
-                                RichText::new(&c.tail)
-                                    .size(10.5)
-                                    .monospace()
-                                    .color(theme.text_dim),
-                            );
+                                .truncate(),
+                            )
+                            .on_hover_text(task);
                         }
+                        // 3 段目: ライブ画面プレビュー = 画面末尾の意味のある数行。
+                        // 「いま何を実装中か」をカードから離れずに読めるようにする。
+                        ui.add_space(6.0);
+                        egui::Frame::none()
+                            .fill(theme.bg)
+                            .stroke(egui::Stroke::new(1.0_f32, theme.border))
+                            .rounding(egui::Rounding::same(6.0))
+                            .inner_margin(egui::Margin::same(8.0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                if c.tail_lines.is_empty() {
+                                    ui.label(
+                                        RichText::new(tr("まだ出力がありません"))
+                                            .size(11.5)
+                                            .color(theme.text_dim),
+                                    );
+                                }
+                                let last = c.tail_lines.len().saturating_sub(1);
+                                for (i, line) in c.tail_lines.iter().enumerate() {
+                                    // 最新行だけ明るくする = 目が「いまの行」へ行く
+                                    let col =
+                                        if i == last { theme.text } else { theme.text_dim };
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(line)
+                                                .size(11.5)
+                                                .monospace()
+                                                .color(col),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                            });
                         // 承認待ちだけに出る目立つ操作列
                         if c.attention {
                             ui.add_space(2.0);

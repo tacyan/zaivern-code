@@ -1510,23 +1510,31 @@ impl Session {
         }
     }
 
-    /// 看板カード用: 画面の「意味のある最後の 1 行」を `max` 文字までで返す。
-    /// 罫線だけの行 (入力枠の底辺など) や空行は飛ばす。無ければ空文字。
-    pub fn screen_tail(&self, max: usize) -> String {
+    /// 看板カードのライブプレビュー用: 画面末尾の「内容のある行」を最大 `rows` 行、
+    /// 各行 `max` 文字までで返す (上から下へ時系列順)。英数字か仮名漢字を 1 文字も
+    /// 含まない行 (罫線・入力枠だけの行) や空行は飛ばす。
+    pub fn screen_tail_lines(&self, rows: usize, max: usize) -> Vec<String> {
         let text = self.parser.lock().unwrap().screen().contents();
-        pick_tail_line(&text)
-            .map(|l| truncate_chars(l, max))
-            .unwrap_or_default()
+        pick_tail_lines(&text, rows, max)
     }
 }
 
-/// 画面テキストから「内容のある最後の行」を選ぶ。英数字か仮名漢字を 1 文字でも
-/// 含む行だけを内容ありとみなす (罫線・入力枠だけの行は飛ばす)。
-fn pick_tail_line(text: &str) -> Option<&str> {
-    text.lines()
+/// [`Session::screen_tail_lines`] の本体 (テスト用に分離)。
+/// インデントは表示情報なので行頭の空白は残し、行末だけ落とす。
+fn pick_tail_lines(text: &str, rows: usize, max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
         .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && l.chars().any(char::is_alphanumeric))
+        .map(str::trim_end)
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && t.chars().any(char::is_alphanumeric)
+        })
+        .take(rows)
+        .map(|l| truncate_chars(l, max))
+        .collect();
+    lines.reverse();
+    lines
 }
 
 /// `max` 文字を超える文字列を「…」付きで詰める (char 境界で安全に切る)。
@@ -1547,19 +1555,12 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tail_tests {
-    use super::{pick_tail_line, truncate_chars};
+    use super::truncate_chars;
 
     #[test]
     fn tail_skips_border_and_blank_lines() {
         let screen = "✻ テストを実行中…\n╭──────╮\n│ >    │\n╰──────╯\n\n";
-        assert_eq!(pick_tail_line(screen), Some("✻ テストを実行中…"));
-    }
-
-    #[test]
-    fn tail_prefers_last_content_line() {
-        let screen = "old line\n✔ cargo build finished\n";
-        assert_eq!(pick_tail_line(screen), Some("✔ cargo build finished"));
-        assert_eq!(pick_tail_line("╭──╮\n╰──╯"), None);
+        assert_eq!(super::pick_tail_lines(screen, 8, 120), vec!["✻ テストを実行中…"]);
     }
 
     #[test]
@@ -1567,6 +1568,24 @@ mod tail_tests {
         assert_eq!(truncate_chars("短い", 10), "短い");
         // 5 文字上限 → 4 文字 + 「…」
         assert_eq!(truncate_chars("あいうえおかき", 5), "あいうえ…");
+    }
+
+    #[test]
+    fn tail_lines_keep_order_and_skip_borders() {
+        let screen = "1st line\n╭──────╮\n  fn main() {\n│ >    │\n✻ テスト実行中…\n\n";
+        // 罫線・空行は飛ばし、時系列順 (上→下) のまま返す
+        assert_eq!(
+            super::pick_tail_lines(screen, 8, 120),
+            vec!["1st line", "  fn main() {", "✻ テスト実行中…"]
+        );
+        // rows で末尾側から絞る (古い行が落ちる)
+        assert_eq!(
+            super::pick_tail_lines(screen, 2, 120),
+            vec!["  fn main() {", "✻ テスト実行中…"]
+        );
+        // 行頭インデントは残し、行末空白と長すぎる行だけ詰める
+        assert_eq!(super::pick_tail_lines("  abcdef   \n", 4, 4), vec!["  a…"]);
+        assert!(super::pick_tail_lines("╭──╮\n╰──╯", 4, 120).is_empty());
     }
 }
 
