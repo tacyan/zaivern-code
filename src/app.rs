@@ -3856,399 +3856,440 @@ impl ZaivernApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(
-                        RichText::new("⚡ ZAIVERN")
-                            .strong()
-                            .size(16.0)
-                            .color(theme.accent),
-                    );
-                    ui.separator();
-
-                    // VS Code と同じ 8 メニュー
-                    // (ファイル/編集/選択/表示/移動/実行/ターミナル/ヘルプ)
-                    let mut menu_cmds = menu_bar::ui(ui, &menu_info, &self.keys);
-                    cmds.append(&mut menu_cmds);
-
-                    if let Some(b) = &branch {
-                        ui.label(RichText::new(format!("🌿 {b}")).color(theme.text_dim));
-                    }
+                    self.top_bar_left(ui, &theme, &menu_info, &branch, &mut cmds);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.menu_button("🎨", |ui| {
-                            for t in theme::all() {
-                                let sel = t.name == self.cfg.theme;
-                                if ui.selectable_label(sel, t.label.clone()).clicked() {
-                                    cmds.push(Cmd::SetTheme(t.name.clone()));
-                                    ui.close_menu();
-                                }
-                            }
-                            if !self.custom_themes.is_empty() {
-                                ui.separator();
-                                ui.menu_button(
-                                    trf(
-                                        "🔌 カスタムテーマ ({n})",
-                                        &[("n", self.custom_themes.len().to_string())],
-                                    ),
-                                    |ui| {
-                                        egui::ScrollArea::vertical()
-                                            .id_salt("custom-themes")
-                                            .max_height(340.0)
-                                            .show(ui, |ui| {
-                                                for (label, path) in self.custom_themes.clone() {
-                                                    let sel = self.cfg.theme == path;
-                                                    if ui.selectable_label(sel, label).clicked() {
-                                                        cmds.push(Cmd::SetTheme(path));
-                                                        ui.close_menu();
-                                                    }
-                                                }
-                                            });
-                                    },
-                                );
-                            }
-                        })
-                        .response
-                        .on_hover_text(tr("テーマ（プラグインのカスタムテーマも使えます）"));
-
-                        // スマホリモート (QR コード表示)
-                        if ui
-                            .selectable_label(self.remote_open, "📱")
-                            .on_hover_text(tr(
-                                "スマホから操作 — QR コードを表示\n\
-                                 同じ Wi-Fi のスマホで読み取るだけで、編集・保存・\n\
-                                 エージェント操作(Claude の承認も)ができます\n\
-                                 🎤 音声入力: PC は Cockpit 各タブの 🎤 /\n\
-                                 ブロードキャスト欄の 🎤、スマホは「エージェント」タブ",
-                            ))
-                            .clicked()
-                        {
-                            cmds.push(Cmd::ToggleRemote);
-                        }
-
-                        // 音声入力: 🎤 で開始、隣の ⏹ で停止。押している間だけの
-                        // 録音キーは無し — ボタンだけで完結する
-                        let rec = self.voice.session.is_some();
-                        if rec
-                            && ui
-                                .button(RichText::new("⏹").color(theme.err).strong())
-                                .on_hover_text(tr("音声入力を止める"))
-                                .clicked()
-                        {
-                            cmds.push(Cmd::VoiceStop);
-                        }
-                        if ui
-                            .selectable_label(
-                                rec,
-                                RichText::new(if rec { "🔴" } else { "🎤" })
-                                    .color(if rec { theme.err } else { theme.text }),
-                            )
-                            .on_hover_text(if rec {
-                                tr("録音中 — もう一度押すと止まります")
-                            } else {
-                                // この PC で実際に通る経路を先に見せる (押してから
-                                // 「使えません」と言われるのを避ける)
-                                trf(
-                                    "音声入力を始める\n\
-                                     ⏹ を押すまで、話した内容が入力欄に入り続けます\n\
-                                     (Enter は送られないので、確認して自分で送信)\n\
-                                     {hint}",
-                                    &[(
-                                        "hint",
-                                        voice::route_hint(
-                                            &self.cfg.voice_engine,
-                                            &self.cfg.voice_lang,
-                                            &self.cfg.voice_command,
-                                        )
-                                        .to_string(),
-                                    )],
-                                )
-                            })
-                            .clicked()
-                        {
-                            let t = voice::Target::from_name(&self.cfg.voice_target);
-                            cmds.push(Cmd::VoiceInput(t));
-                        }
-                        ui.menu_button("▾", |ui| {
-                            ui.label(
-                                RichText::new(tr(
-                                    "話した内容は入力欄に入るだけです。\n\
-                                     送信されるのは自分で Enter を押したときだけ。",
-                                ))
-                                .size(11.0)
-                                .color(theme.text_dim),
-                            );
-                            ui.separator();
-                            if ui
-                                .button(if rec {
-                                    tr("⏹ 録音を止める")
-                                } else {
-                                    tr("🎤 いま録音する (アクティブなエージェントへ)")
-                                })
-                                .clicked()
-                            {
-                                let t = voice::Target::from_name(&self.cfg.voice_target);
-                                cmds.push(Cmd::VoiceInput(t));
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            // 届け先。録音中は HUD からも切り替えられる
-                            let cur = if rec {
-                                self.voice.target
-                            } else {
-                                voice::Target::from_name(&self.cfg.voice_target)
-                            };
-                            ui.label(RichText::new(tr("届け先")).size(11.0).color(theme.text_dim));
-                            for (t, label) in [
-                                (voice::Target::Active, "🎯 アクティブなエージェント"),
-                                (voice::Target::Broadcast, "📣 全エージェントへブロードキャスト"),
-                            ] {
-                                if ui.radio(cur == t, tr(label)).clicked() {
-                                    cmds.push(Cmd::SetVoiceTarget(t));
-                                    ui.close_menu();
-                                }
-                            }
-                            ui.menu_button(
-                                trf("🌐 言語: {lang}", &[("lang", self.cfg.voice_lang.clone())]),
-                                |ui| {
-                                for (code, label) in [
-                                    ("ja-JP", "日本語"),
-                                    ("en-US", "English (US)"),
-                                    ("zh-CN", "中文"),
-                                    ("ko-KR", "한국어"),
-                                ] {
-                                    if ui.radio(self.cfg.voice_lang == code, label).clicked() {
-                                        cmds.push(Cmd::SetVoiceLang(code.to_string()));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                            ui.menu_button(
-                                if self.cfg.voice_keyword.is_empty() {
-                                    tr("🗣 合図で送信: なし (常に手動 Enter)")
-                                } else {
-                                    trf(
-                                        "🗣 合図で送信: 「{keyword}」",
-                                        &[("keyword", self.cfg.voice_keyword.clone())],
-                                    )
-                                },
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(tr(
-                                            "この言葉で終わったときだけ Enter まで送ります",
-                                        ))
-                                        .size(11.0)
-                                        .color(theme.text_dim),
-                                    );
-                                    for kw in ["", "送信", "送って", "オーケー"] {
-                                        let sel = self.cfg.voice_keyword == kw;
-                                        let label =
-                                            if kw.is_empty() { tr("なし") } else { kw.to_string() };
-                                        if ui.radio(sel, label).clicked() {
-                                            cmds.push(Cmd::SetVoiceKeyword(kw.to_string()));
-                                            ui.close_menu();
-                                        }
-                                    }
-                                },
-                            );
-                            ui.separator();
-                            ui.menu_button(
-                                trf(
-                                    "⚙ エンジン: {engine}",
-                                    &[("engine", self.cfg.voice_engine.clone())],
-                                ),
-                                |ui| {
-                                    for (v, label) in [
-                                        ("auto", "自動 (この OS に合わせる)"),
-                                        ("mac", "macOS 内蔵の音声認識"),
-                                        ("powershell", "Windows 標準の音声認識"),
-                                        ("browser", "ブラウザの音声入力ページ"),
-                                        ("command", "外部コマンド (config.toml の voice_command)"),
-                                        ("off", "無効"),
-                                    ] {
-                                        if ui.radio(self.cfg.voice_engine == v, tr(label)).clicked() {
-                                            cmds.push(Cmd::SetVoiceEngine(v.to_string()));
-                                            ui.close_menu();
-                                        }
-                                    }
-                                },
-                            );
-                        })
-                        .response
-                        .on_hover_text(tr(
-                            "音声入力 — キーを押している間だけ録音し、\n\
-                             認識テキストをエージェントの入力欄へ挿入します。\n\
-                             Enter は送られないので、確認してから自分で送信できます。",
-                        ));
-
-                        // ペットメニュー(表示切替・画像変更)
-                        ui.menu_button("🐾", |ui| {
-                            let show = self.cfg.show_pet;
-                            if ui
-                                .selectable_label(
-                                    show,
-                                    if show { tr("🐾 表示中") } else { tr("🐾 非表示") },
-                                )
-                                .clicked()
-                            {
-                                cmds.push(Cmd::TogglePet);
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button(tr("🖼 画像を変更…")).clicked() {
-                                cmds.push(Cmd::SetPetImage);
-                                ui.close_menu();
-                            }
-                            if ui.button(tr("↺ 既定の絵に戻す")).clicked() {
-                                cmds.push(Cmd::ResetPetImage);
-                                ui.close_menu();
-                            }
-                            if ui.button(tr("🐾 位置を右下に戻す")).clicked() {
-                                cmds.push(Cmd::ResetPetPos);
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            // 見た目バリアント(ラジオ選択。候補は pet::PetVariant から生成)
-                            ui.menu_button(tr("🎭 見た目"), |ui| {
-                                for (v, label) in [
-                                    (pet::PetVariant::Blocky, "🟦 ブロック"),
-                                    (pet::PetVariant::Crab, "🐾 カニ"),
-                                    (pet::PetVariant::Cat, "🐱 ネコ"),
-                                    (pet::PetVariant::Cloud, "☁ クラウド"),
-                                ] {
-                                    if ui.radio(self.cfg.pet_variant == v.name(), tr(label)).clicked() {
-                                        cmds.push(Cmd::SetPetVariant(v.name().to_string()));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                            // 表示スケール(ラジオ選択)
-                            ui.menu_button(tr("📏 サイズ"), |ui| {
-                                for (v, label) in [(0.75f32, "小"), (1.0, "中"), (1.4, "大")] {
-                                    let sel = (self.cfg.pet_scale - v).abs() < 0.01;
-                                    if ui.radio(sel, tr(label)).clicked() {
-                                        cmds.push(Cmd::SetPetScale(v));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                            ui.separator();
-                            // 挙動の切替(チェックボックス。cfg は apply_cmd 側で保存)
-                            let mut roam = self.cfg.pet_free_roam;
-                            if ui.checkbox(&mut roam, tr("🚶 うろうろ散歩")).clicked() {
-                                cmds.push(Cmd::TogglePetFreeRoam);
-                            }
-                            let mut sleep = self.cfg.pet_sleep;
-                            if ui.checkbox(&mut sleep, tr("💤 居眠り")).clicked() {
-                                cmds.push(Cmd::TogglePetSleep);
-                            }
-                            let mut sounds = self.cfg.pet_sounds;
-                            if ui.checkbox(&mut sounds, tr("🔔 効果音")).clicked() {
-                                cmds.push(Cmd::TogglePetSounds);
-                            }
-                            let mut bubbles = self.cfg.pet_bubbles;
-                            if ui.checkbox(&mut bubbles, tr("💬 承認バブル")).clicked() {
-                                cmds.push(Cmd::TogglePetBubbles);
-                            }
-                            let mut auto_yes = self.cfg.pet_auto_yes;
-                            if ui.checkbox(&mut auto_yes, tr("⚡ 自動YES")).clicked() {
-                                cmds.push(Cmd::TogglePetAutoYes);
-                            }
-                        })
-                        .response
-                        .on_hover_text(tr("デスクトップペット 🐾 の表示・画像変更"));
-
-                        // 実行中の対応エージェントを一括で権限モード切替
-                        if self.agents.running_count() > 0
-                            && ui
-                                .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
-                                .on_hover_text(tr(
-                                    "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
-                                     Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
-                                ))
-                                .clicked()
-                        {
-                            cmds.push(Cmd::CyclePermissionAll);
-                        }
-
-                        // 承認モード切替(次回起動の既定)。クリックで 承認→全自動→Agent優先 を順送り
-                        let mode = self.cfg.approval_mode.as_str();
-                        let (ap_label, next_mode, highlight) = match mode {
-                            "auto" => (
-                                RichText::new(tr("⚡ 既定:全自動")).color(theme.warn).strong(),
-                                "agent",
-                                true,
-                            ),
-                            "agent" => (
-                                RichText::new(tr("👾 既定:Agent優先")).color(theme.ok).strong(),
-                                "ask",
-                                true,
-                            ),
-                            _ => (RichText::new(tr("🛡 既定:承認")).color(theme.ok), "auto", false),
-                        };
-                        if ui
-                            .selectable_label(highlight, ap_label)
-                            .on_hover_text(tr(
-                                "「次に起動する」エージェント (Claude/Codex/Antigravity) の既定権限モード\n\
-                                 🛡 承認 = 操作のたびに許可が必要（bypass フラグを除去）\n\
-                                 ⚡ 全自動 = すべて自動YES（bypass フラグを付与）\n\
-                                 👾 Agent優先 = Agent欄プリセットのコマンドどおり（(全自動) プリセットのみ自動YES）\n\
-                                 クリックで 承認→全自動→Agent優先 の順に切替\n\
-                                 ※ 実行中のセッションは各行の 🛡 ボタンで個別に切替できます",
-                            ))
-                            .clicked()
-                        {
-                            cmds.push(Cmd::SetApproval(next_mode.into()));
-                        }
-
-                        let cockpit =
-                            ui.selectable_label(self.cockpit, RichText::new("🎛 Cockpit"));
-                        if cockpit.on_hover_text(tr("全エージェント一覧 (⌘⇧C)")).clicked() {
-                            cmds.push(Cmd::ToggleCockpit);
-                        }
-
-                        ui.menu_button("👾 Agent ＋", |ui| {
-                            for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
-                                if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
-                                    cmds.push(Cmd::NewAgent(i));
-                                    ui.close_menu();
-                                }
-                            }
-                            ui.separator();
-                            if ui
-                                .button(tr("➕ エージェントを追加…"))
-                                .on_hover_text(tr("対応している CLI エージェントの一覧から選んで足す"))
-                                .clicked()
-                            {
-                                cmds.push(Cmd::OpenAgentPicker);
-                                ui.close_menu();
-                            }
-                        })
-                        .response
-                        .on_hover_text(tr("エージェントを起動 (⌘⇧A)"));
-
-                        if ui
-                            .button("🔍")
-                            .on_hover_text(tr("コマンドパレット (⌘P / ⌘⇧P)"))
-                            .clicked()
-                        {
-                            self.palette.open_files();
-                        }
-
-                        let running = self.agents.running_count();
-                        if running > 0 {
-                            ui.label(
-                                RichText::new(trf(
-                                    "● {running} 稼働中",
-                                    &[("running", running.to_string())],
-                                ))
-                                .color(theme.ok),
-                            );
-                        }
+                        self.top_bar_theme_menu(ui, &mut cmds);
+                        self.top_bar_remote_and_voice(ui, &theme, &mut cmds);
+                        self.top_bar_pet_menu(ui, &mut cmds);
+                        self.top_bar_agent_controls(ui, &theme, &mut cmds);
                     });
                 });
             });
 
         for c in cmds {
             self.apply_cmd(c, ctx);
+        }
+    }
+
+    /// トップバー左側: ロゴ・VS Code 準拠メニューバー・ブランチ表示。
+    /// ボタン類は cmds に記録だけして呼び出し側で self へ反映する。
+    fn top_bar_left(
+        &self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        menu_info: &menu_bar::MenuInfo,
+        branch: &Option<String>,
+        cmds: &mut Vec<Cmd>,
+    ) {
+        ui.label(
+            RichText::new("⚡ ZAIVERN")
+                .strong()
+                .size(16.0)
+                .color(theme.accent),
+        );
+        ui.separator();
+
+        // VS Code と同じ 8 メニュー
+        // (ファイル/編集/選択/表示/移動/実行/ターミナル/ヘルプ)
+        let mut menu_cmds = menu_bar::ui(ui, menu_info, &self.keys);
+        cmds.append(&mut menu_cmds);
+
+        if let Some(b) = branch {
+            ui.label(RichText::new(format!("🌿 {b}")).color(theme.text_dim));
+        }
+    }
+
+    /// トップバー: 🎨 テーマ選択メニュー (プラグインのカスタムテーマ含む)。
+    fn top_bar_theme_menu(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        ui.menu_button("🎨", |ui| {
+            for t in theme::all() {
+                let sel = t.name == self.cfg.theme;
+                if ui.selectable_label(sel, t.label.clone()).clicked() {
+                    cmds.push(Cmd::SetTheme(t.name.clone()));
+                    ui.close_menu();
+                }
+            }
+            if !self.custom_themes.is_empty() {
+                ui.separator();
+                ui.menu_button(
+                    trf(
+                        "🔌 カスタムテーマ ({n})",
+                        &[("n", self.custom_themes.len().to_string())],
+                    ),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("custom-themes")
+                            .max_height(340.0)
+                            .show(ui, |ui| {
+                                for (label, path) in self.custom_themes.clone() {
+                                    let sel = self.cfg.theme == path;
+                                    if ui.selectable_label(sel, label).clicked() {
+                                        cmds.push(Cmd::SetTheme(path));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                    },
+                );
+            }
+        })
+        .response
+        .on_hover_text(tr("テーマ（プラグインのカスタムテーマも使えます）"));
+    }
+
+    /// トップバー: 📱 スマホリモートと 🎤 音声入力まわり。
+    fn top_bar_remote_and_voice(
+        &self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        cmds: &mut Vec<Cmd>,
+    ) {
+        // スマホリモート (QR コード表示)
+        if ui
+            .selectable_label(self.remote_open, "📱")
+            .on_hover_text(tr(
+                "スマホから操作 — QR コードを表示\n\
+                 同じ Wi-Fi のスマホで読み取るだけで、編集・保存・\n\
+                 エージェント操作(Claude の承認も)ができます\n\
+                 🎤 音声入力: PC は Cockpit 各タブの 🎤 /\n\
+                 ブロードキャスト欄の 🎤、スマホは「エージェント」タブ",
+            ))
+            .clicked()
+        {
+            cmds.push(Cmd::ToggleRemote);
+        }
+
+        // 音声入力: 🎤 で開始、隣の ⏹ で停止。押している間だけの
+        // 録音キーは無し — ボタンだけで完結する
+        let rec = self.voice.session.is_some();
+        if rec
+            && ui
+                .button(RichText::new("⏹").color(theme.err).strong())
+                .on_hover_text(tr("音声入力を止める"))
+                .clicked()
+        {
+            cmds.push(Cmd::VoiceStop);
+        }
+        if ui
+            .selectable_label(
+                rec,
+                RichText::new(if rec { "🔴" } else { "🎤" })
+                    .color(if rec { theme.err } else { theme.text }),
+            )
+            .on_hover_text(if rec {
+                tr("録音中 — もう一度押すと止まります")
+            } else {
+                // この PC で実際に通る経路を先に見せる (押してから
+                // 「使えません」と言われるのを避ける)
+                trf(
+                    "音声入力を始める\n\
+                     ⏹ を押すまで、話した内容が入力欄に入り続けます\n\
+                     (Enter は送られないので、確認して自分で送信)\n\
+                     {hint}",
+                    &[(
+                        "hint",
+                        voice::route_hint(
+                            &self.cfg.voice_engine,
+                            &self.cfg.voice_lang,
+                            &self.cfg.voice_command,
+                        )
+                        .to_string(),
+                    )],
+                )
+            })
+            .clicked()
+        {
+            let t = voice::Target::from_name(&self.cfg.voice_target);
+            cmds.push(Cmd::VoiceInput(t));
+        }
+        ui.menu_button("▾", |ui| {
+            ui.label(
+                RichText::new(tr(
+                    "話した内容は入力欄に入るだけです。\n\
+                     送信されるのは自分で Enter を押したときだけ。",
+                ))
+                .size(11.0)
+                .color(theme.text_dim),
+            );
+            ui.separator();
+            if ui
+                .button(if rec {
+                    tr("⏹ 録音を止める")
+                } else {
+                    tr("🎤 いま録音する (アクティブなエージェントへ)")
+                })
+                .clicked()
+            {
+                let t = voice::Target::from_name(&self.cfg.voice_target);
+                cmds.push(Cmd::VoiceInput(t));
+                ui.close_menu();
+            }
+            ui.separator();
+            // 届け先。録音中は HUD からも切り替えられる
+            let cur = if rec {
+                self.voice.target
+            } else {
+                voice::Target::from_name(&self.cfg.voice_target)
+            };
+            ui.label(RichText::new(tr("届け先")).size(11.0).color(theme.text_dim));
+            for (t, label) in [
+                (voice::Target::Active, "🎯 アクティブなエージェント"),
+                (voice::Target::Broadcast, "📣 全エージェントへブロードキャスト"),
+            ] {
+                if ui.radio(cur == t, tr(label)).clicked() {
+                    cmds.push(Cmd::SetVoiceTarget(t));
+                    ui.close_menu();
+                }
+            }
+            ui.menu_button(
+                trf("🌐 言語: {lang}", &[("lang", self.cfg.voice_lang.clone())]),
+                |ui| {
+                for (code, label) in [
+                    ("ja-JP", "日本語"),
+                    ("en-US", "English (US)"),
+                    ("zh-CN", "中文"),
+                    ("ko-KR", "한국어"),
+                ] {
+                    if ui.radio(self.cfg.voice_lang == code, label).clicked() {
+                        cmds.push(Cmd::SetVoiceLang(code.to_string()));
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.menu_button(
+                if self.cfg.voice_keyword.is_empty() {
+                    tr("🗣 合図で送信: なし (常に手動 Enter)")
+                } else {
+                    trf(
+                        "🗣 合図で送信: 「{keyword}」",
+                        &[("keyword", self.cfg.voice_keyword.clone())],
+                    )
+                },
+                |ui| {
+                    ui.label(
+                        RichText::new(tr(
+                            "この言葉で終わったときだけ Enter まで送ります",
+                        ))
+                        .size(11.0)
+                        .color(theme.text_dim),
+                    );
+                    for kw in ["", "送信", "送って", "オーケー"] {
+                        let sel = self.cfg.voice_keyword == kw;
+                        let label =
+                            if kw.is_empty() { tr("なし") } else { kw.to_string() };
+                        if ui.radio(sel, label).clicked() {
+                            cmds.push(Cmd::SetVoiceKeyword(kw.to_string()));
+                            ui.close_menu();
+                        }
+                    }
+                },
+            );
+            ui.separator();
+            ui.menu_button(
+                trf(
+                    "⚙ エンジン: {engine}",
+                    &[("engine", self.cfg.voice_engine.clone())],
+                ),
+                |ui| {
+                    for (v, label) in [
+                        ("auto", "自動 (この OS に合わせる)"),
+                        ("mac", "macOS 内蔵の音声認識"),
+                        ("powershell", "Windows 標準の音声認識"),
+                        ("browser", "ブラウザの音声入力ページ"),
+                        ("command", "外部コマンド (config.toml の voice_command)"),
+                        ("off", "無効"),
+                    ] {
+                        if ui.radio(self.cfg.voice_engine == v, tr(label)).clicked() {
+                            cmds.push(Cmd::SetVoiceEngine(v.to_string()));
+                            ui.close_menu();
+                        }
+                    }
+                },
+            );
+        })
+        .response
+        .on_hover_text(tr(
+            "音声入力 — キーを押している間だけ録音し、\n\
+             認識テキストをエージェントの入力欄へ挿入します。\n\
+             Enter は送られないので、確認してから自分で送信できます。",
+        ));
+    }
+
+    /// トップバー: 🐾 ペットメニュー (表示切替・画像変更)。
+    fn top_bar_pet_menu(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        // ペットメニュー(表示切替・画像変更)
+        ui.menu_button("🐾", |ui| {
+            let show = self.cfg.show_pet;
+            if ui
+                .selectable_label(
+                    show,
+                    if show { tr("🐾 表示中") } else { tr("🐾 非表示") },
+                )
+                .clicked()
+            {
+                cmds.push(Cmd::TogglePet);
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button(tr("🖼 画像を変更…")).clicked() {
+                cmds.push(Cmd::SetPetImage);
+                ui.close_menu();
+            }
+            if ui.button(tr("↺ 既定の絵に戻す")).clicked() {
+                cmds.push(Cmd::ResetPetImage);
+                ui.close_menu();
+            }
+            if ui.button(tr("🐾 位置を右下に戻す")).clicked() {
+                cmds.push(Cmd::ResetPetPos);
+                ui.close_menu();
+            }
+            ui.separator();
+            // 見た目バリアント(ラジオ選択。候補は pet::PetVariant から生成)
+            ui.menu_button(tr("🎭 見た目"), |ui| {
+                for (v, label) in [
+                    (pet::PetVariant::Blocky, "🟦 ブロック"),
+                    (pet::PetVariant::Crab, "🐾 カニ"),
+                    (pet::PetVariant::Cat, "🐱 ネコ"),
+                    (pet::PetVariant::Cloud, "☁ クラウド"),
+                ] {
+                    if ui.radio(self.cfg.pet_variant == v.name(), tr(label)).clicked() {
+                        cmds.push(Cmd::SetPetVariant(v.name().to_string()));
+                        ui.close_menu();
+                    }
+                }
+            });
+            // 表示スケール(ラジオ選択)
+            ui.menu_button(tr("📏 サイズ"), |ui| {
+                for (v, label) in [(0.75f32, "小"), (1.0, "中"), (1.4, "大")] {
+                    let sel = (self.cfg.pet_scale - v).abs() < 0.01;
+                    if ui.radio(sel, tr(label)).clicked() {
+                        cmds.push(Cmd::SetPetScale(v));
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.separator();
+            // 挙動の切替(チェックボックス。cfg は apply_cmd 側で保存)
+            let mut roam = self.cfg.pet_free_roam;
+            if ui.checkbox(&mut roam, tr("🚶 うろうろ散歩")).clicked() {
+                cmds.push(Cmd::TogglePetFreeRoam);
+            }
+            let mut sleep = self.cfg.pet_sleep;
+            if ui.checkbox(&mut sleep, tr("💤 居眠り")).clicked() {
+                cmds.push(Cmd::TogglePetSleep);
+            }
+            let mut sounds = self.cfg.pet_sounds;
+            if ui.checkbox(&mut sounds, tr("🔔 効果音")).clicked() {
+                cmds.push(Cmd::TogglePetSounds);
+            }
+            let mut bubbles = self.cfg.pet_bubbles;
+            if ui.checkbox(&mut bubbles, tr("💬 承認バブル")).clicked() {
+                cmds.push(Cmd::TogglePetBubbles);
+            }
+            let mut auto_yes = self.cfg.pet_auto_yes;
+            if ui.checkbox(&mut auto_yes, tr("⚡ 自動YES")).clicked() {
+                cmds.push(Cmd::TogglePetAutoYes);
+            }
+        })
+        .response
+        .on_hover_text(tr("デスクトップペット 🐾 の表示・画像変更"));
+    }
+
+    /// トップバー: エージェント関連 (権限一括切替・既定承認モード・Cockpit・
+    /// エージェント起動・コマンドパレット・稼働数表示)。
+    fn top_bar_agent_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        cmds: &mut Vec<Cmd>,
+    ) {
+        // 実行中の対応エージェントを一括で権限モード切替
+        if self.agents.running_count() > 0
+            && ui
+                .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
+                .on_hover_text(tr(
+                    "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
+                     Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
+                ))
+                .clicked()
+        {
+            cmds.push(Cmd::CyclePermissionAll);
+        }
+
+        // 承認モード切替(次回起動の既定)。クリックで 承認→全自動→Agent優先 を順送り
+        let mode = self.cfg.approval_mode.as_str();
+        let (ap_label, next_mode, highlight) = match mode {
+            "auto" => (
+                RichText::new(tr("⚡ 既定:全自動")).color(theme.warn).strong(),
+                "agent",
+                true,
+            ),
+            "agent" => (
+                RichText::new(tr("👾 既定:Agent優先")).color(theme.ok).strong(),
+                "ask",
+                true,
+            ),
+            _ => (RichText::new(tr("🛡 既定:承認")).color(theme.ok), "auto", false),
+        };
+        if ui
+            .selectable_label(highlight, ap_label)
+            .on_hover_text(tr(
+                "「次に起動する」エージェント (Claude/Codex/Antigravity) の既定権限モード\n\
+                 🛡 承認 = 操作のたびに許可が必要（bypass フラグを除去）\n\
+                 ⚡ 全自動 = すべて自動YES（bypass フラグを付与）\n\
+                 👾 Agent優先 = Agent欄プリセットのコマンドどおり（(全自動) プリセットのみ自動YES）\n\
+                 クリックで 承認→全自動→Agent優先 の順に切替\n\
+                 ※ 実行中のセッションは各行の 🛡 ボタンで個別に切替できます",
+            ))
+            .clicked()
+        {
+            cmds.push(Cmd::SetApproval(next_mode.into()));
+        }
+
+        let cockpit =
+            ui.selectable_label(self.cockpit, RichText::new("🎛 Cockpit"));
+        if cockpit.on_hover_text(tr("全エージェント一覧 (⌘⇧C)")).clicked() {
+            cmds.push(Cmd::ToggleCockpit);
+        }
+
+        ui.menu_button("👾 Agent ＋", |ui| {
+            for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
+                if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
+                    cmds.push(Cmd::NewAgent(i));
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            if ui
+                .button(tr("➕ エージェントを追加…"))
+                .on_hover_text(tr("対応している CLI エージェントの一覧から選んで足す"))
+                .clicked()
+            {
+                cmds.push(Cmd::OpenAgentPicker);
+                ui.close_menu();
+            }
+        })
+        .response
+        .on_hover_text(tr("エージェントを起動 (⌘⇧A)"));
+
+        if ui
+            .button("🔍")
+            .on_hover_text(tr("コマンドパレット (⌘P / ⌘⇧P)"))
+            .clicked()
+        {
+            self.palette.open_files();
+        }
+
+        let running = self.agents.running_count();
+        if running > 0 {
+            ui.label(
+                RichText::new(trf(
+                    "● {running} 稼働中",
+                    &[("running", running.to_string())],
+                ))
+                .color(theme.ok),
+            );
         }
     }
 
