@@ -1399,6 +1399,15 @@ impl Session {
         self.set_scroll(n);
     }
 
+    /// ターミナル画面全体の文字列をすべて選択状態にする (Ctrl+A / Cmd+A)
+    pub fn select_all(&mut self) {
+        let p = self.parser.lock().unwrap();
+        let (rows, cols) = p.screen().size();
+        if rows > 0 && cols > 0 {
+            self.selection = Some(((0, 0), (rows.saturating_sub(1), cols.saturating_sub(1))));
+        }
+    }
+
     /// (代替画面か, アプリがマウス報告を有効にしているか, SGRエンコードか)。
     /// 代替画面(vim / less / Claude Code 等)にはスクロールバック履歴が無いため、
     /// ローカルスクロールではなくホイールをアプリへ転送する必要がある。
@@ -1705,7 +1714,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    use super::{normalize_sel, selection_text, word_selection};
+    use super::{normalize_sel, selection_text, word_selection, Session};
 
     #[test]
     fn normalize_sel_orders_row_major() {
@@ -1721,6 +1730,23 @@ mod tests {
         p.process(b"hello world");
         assert_eq!(selection_text(p.screen(), ((0, 0), (0, 4))), "hello");
         assert_eq!(selection_text(p.screen(), ((0, 6), (0, 10))), "world");
+    }
+
+    #[test]
+    fn session_select_all_covers_entire_screen() {
+        let dir = std::env::current_dir().unwrap();
+        let spec = super::SpawnSpec {
+            title: "test".into(),
+            command: "echo hello".into(),
+            cwd: dir,
+            env: std::collections::HashMap::new(),
+            preset_name: String::new(),
+            icon: "💬".into(),
+            log_path: None,
+        };
+        let mut session = Session::spawn(9991, spec, eframe::egui::Context::default()).unwrap();
+        session.select_all();
+        assert!(session.selection.is_some());
     }
 
     #[test]
@@ -2784,12 +2810,23 @@ pub fn draw(
                     }
                 }
                 egui::Event::Key {
+                    key: egui::Key::A,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.mac_cmd || modifiers.command || (modifiers.ctrl && modifiers.shift) => {
+                    session.select_all();
+                }
+                egui::Event::Key {
                     key,
                     pressed: true,
                     modifiers,
                     ..
                 } => {
                     if modifiers.mac_cmd {
+                        if *key == egui::Key::A {
+                            session.select_all();
+                        }
                         continue;
                     }
                     // IME 変換中はキーを IME に任せる(Enter/矢印で確定・候補選択するため)
