@@ -2444,6 +2444,362 @@ fn prompt_path(path: &Path, cwd: &Path) -> String {
         .into_owned()
 }
 
+/// マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行)。
+fn handle_mouse_selection(
+    session: &mut Session,
+    response: &egui::Response,
+    rect: egui::Rect,
+    padding: f32,
+    cell_w: f32,
+    cell_h: f32,
+) {
+    let (rows_n, cols_n) = session.size;
+    let to_cell = |pos: egui::Pos2| -> (u16, u16) {
+        let c = ((pos.x - rect.min.x - padding) / cell_w).floor().max(0.0) as u16;
+        let r = ((pos.y - rect.min.y - padding) / cell_h).floor().max(0.0) as u16;
+        (
+            r.min(rows_n.saturating_sub(1)),
+            c.min(cols_n.saturating_sub(1)),
+        )
+    };
+    if response.clicked() {
+        // クリック(ドラッグなし)で選択解除
+        session.selection = None;
+        session.sel_anchor = None;
+    }
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        if let Some(pos) = response.interact_pointer_pos() {
+            session.sel_anchor = Some(to_cell(pos));
+            session.selection = None;
+        }
+    }
+    if response.dragged_by(egui::PointerButton::Primary) {
+        if let (Some(anchor), Some(pos)) =
+            (session.sel_anchor, response.interact_pointer_pos())
+        {
+            session.selection = Some((anchor, to_cell(pos)));
+        }
+    }
+    if response.double_clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let (r, c) = to_cell(pos);
+            session.selection = {
+                let p = lock_ok(&session.parser);
+                word_selection(p.screen(), r, c)
+            };
+        }
+    }
+    if response.triple_clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let (r, _) = to_cell(pos);
+            session.selection = Some(((r, 0), (r, cols_n.saturating_sub(1))));
+        }
+    }
+}
+
+/// フォーカス中のキーボード/IME/ペースト入力を PTY へ転送する。
+fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: egui::Id) {
+    ui.memory_mut(|m| {
+        m.set_focus_lock_filter(
+            focus_id,
+            egui::EventFilter {
+                tab: true,
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                escape: true,
+            },
+        )
+    });
+    let events = ui.input(|i| i.events.clone());
+    let (app_cursor, bracketed) = {
+        let p = lock_ok(&session.parser);
+        let s = p.screen();
+        (s.application_cursor(), s.bracketed_paste())
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let mut want_copy = false;
+    for ev in &events {
+        match ev {
+            // ⌘C: 選択範囲をクリップボードへ(選択が無ければ何もしない)。
+            // Ctrl+C は Key イベントとしてそのまま PTY へ届く(SIGINT)。
+            egui::Event::Copy => {
+                want_copy = true;
+            }
+            egui::Event::Text(t) => {
+                out.extend_from_slice(t.as_bytes());
+            }
+            // IME(日本語入力など): 変換確定文字列を PTY へ送り、
+            // 変換中の未確定文字列はオーバーレイ表示用に保持する。
+            egui::Event::Ime(ime) => match ime {
+                egui::ImeEvent::Commit(t) => {
+                    out.extend_from_slice(t.as_bytes());
+                    session.preedit.clear();
+                }
+                egui::ImeEvent::Preedit(t) => {
+                    session.preedit = t.clone();
+                }
+                egui::ImeEvent::Enabled | egui::ImeEvent::Disabled => {
+                    session.preedit.clear();
+                }
+            },
+            egui::Event::Paste(t) => {
+                if bracketed {
+                    out.extend_from_slice(b"\x1b[200~");
+                }
+                out.extend_from_slice(t.as_bytes());
+                if bracketed {
+                    out.extend_from_slice(b"\x1b[201~");
+                }
+            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                if modifiers.mac_cmd {
+                    continue;
+                }
+                // IME 変換中はキーを IME に任せる(Enter/矢印で確定・候補選択するため)
+                if !session.preedit.is_empty() {
+                    continue;
+                }
+                if let Some(b) = key_bytes(*key, *modifiers, app_cursor) {
+                    out.extend_from_slice(&b);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !out.is_empty() {
+        // 人が打った分は音声入力の書き込み追跡とずれるので印を立てる。
+        // 承認プロンプトへの手入力応答もここで「応答済み」として解決する
+        // (自動YESオフの手動運転で attention を引きずらないため)。
+        session.note_user_input();
+        session.write_bytes(&out);
+        session.set_scroll(0);
+    }
+    if want_copy {
+        copy_selection(ui, session);
+    }
+}
+
+/// ホイール入力の処理: マウス報告転送 / 矢印キー代用 / ローカル履歴スクロール。
+fn handle_wheel_scroll(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    rect: egui::Rect,
+    padding: f32,
+    cell_w: f32,
+    cell_h: f32,
+) {
+    let dy = ui.input(|i| i.raw_scroll_delta.y);
+    if dy.abs() > 0.5 {
+        let (alt, mouse_on, sgr) = session.wheel_modes();
+        let up = dy > 0.0;
+        // ホイールの移動量をノッチ数へ(1〜8)
+        let notches = ((dy.abs() / cell_h).ceil() as i32).clamp(1, 8);
+        if mouse_on {
+            // アプリがマウス報告中: ホイールをそのまま転送する。
+            // これで Claude Code / less / vim などがアプリ側でスクロールする。
+            let hover = ui
+                .input(|i| i.pointer.hover_pos())
+                .unwrap_or_else(|| rect.center());
+            let col = (((hover.x - rect.min.x - padding) / cell_w).floor().max(0.0)) as u16;
+            let row = (((hover.y - rect.min.y - padding) / cell_h).floor().max(0.0)) as u16;
+            for _ in 0..notches {
+                session.send_wheel(up, col, row, sgr);
+            }
+            // 代替画面に切り替わった後もローカル履歴表示が残らないようにする
+            if session.scroll != 0 {
+                session.set_scroll(0);
+            }
+        } else if alt {
+            // マウス無効の全画面アプリ: 矢印キーで代用スクロール
+            let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
+            for _ in 0..notches {
+                session.write_bytes(arrow);
+            }
+            if session.scroll != 0 {
+                session.set_scroll(0);
+            }
+        } else {
+            // 通常画面(シェル等): ローカルのスクロールバック履歴。
+            // 整数切り捨てで 0 行になると、ゆっくりスクロールしたとき
+            // 一番下(scroll=0)まで戻り切れず履歴表示が残るため、
+            // 1 イベントにつき最低 1 行は必ず動かす。
+            let mut lines = (dy / cell_h * 2.0) as i64;
+            if lines == 0 {
+                lines = if up { 1 } else { -1 };
+            }
+            session.adjust_scroll(lines);
+        }
+        // 外側 ScrollArea との二重スクロールを防ぐためホイールを消費する
+        ui.input_mut(|i| {
+            i.raw_scroll_delta.y = 0.0;
+            i.smooth_scroll_delta.y = 0.0;
+        });
+    }
+}
+
+/// 画面グリッド(文字セル・選択ハイライト)、カーソル、IME オーバーレイの描画。
+#[allow(clippy::too_many_arguments)]
+fn draw_screen(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    session: &Session,
+    theme: &Theme,
+    font_id: &egui::FontId,
+    rect: egui::Rect,
+    padding: f32,
+    cell_w: f32,
+    cell_h: f32,
+    focused: bool,
+) {
+    let sel_norm = session.selection.map(normalize_sel);
+    let parser = lock_ok(&session.parser);
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let origin = rect.min + egui::vec2(padding, padding);
+
+    for r in 0..rows {
+        for cix in 0..cols {
+            let Some(cell) = screen.cell(r, cix) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let x = origin.x + cix as f32 * cell_w;
+            let y = origin.y + r as f32 * cell_h;
+            if y + cell_h > rect.max.y {
+                break;
+            }
+            if x >= rect.max.x {
+                continue;
+            }
+            let w = if cell.is_wide() { cell_w * 2.0 } else { cell_w };
+            let cell_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, cell_h));
+
+            let mut fg = cell_color(theme, cell.fgcolor(), true);
+            let mut bg = match cell.bgcolor() {
+                vt100::Color::Default => None,
+                other => Some(cell_color(theme, other, false)),
+            };
+            if cell.inverse() {
+                let old = fg;
+                fg = bg.unwrap_or(theme.term_bg);
+                bg = Some(old);
+            }
+            if let Some(bgc) = bg {
+                painter.rect_filled(cell_rect, 0.0, bgc);
+            }
+            // 選択範囲のハイライト(文字色はそのまま、背景に半透明アクセント)
+            if let Some(sel) = sel_norm {
+                if cell_selected(r, cix, sel) {
+                    painter.rect_filled(cell_rect, 0.0, theme.accent.gamma_multiply(0.3));
+                }
+            }
+            let contents = cell.contents();
+            if !contents.is_empty() && contents != " " {
+                let color = if cell.bold() { brighten(fg) } else { fg };
+                painter.text(
+                    egui::pos2(x, y),
+                    egui::Align2::LEFT_TOP,
+                    contents,
+                    font_id.clone(),
+                    color,
+                );
+            }
+            if cell.underline() {
+                painter.line_segment(
+                    [
+                        egui::pos2(x, y + cell_h - 1.0),
+                        egui::pos2(x + w, y + cell_h - 1.0),
+                    ],
+                    egui::Stroke::new(1.0_f32, fg),
+                );
+            }
+        }
+    }
+
+    let (cr, cc) = screen.cursor_position();
+    let cursor_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            origin.x + cc as f32 * cell_w,
+            origin.y + cr as f32 * cell_h,
+        ),
+        egui::vec2(cell_w, cell_h),
+    );
+
+    if session.scroll == 0 && !screen.hide_cursor() {
+        // DECSCUSR の指定に合わせて形を変える(バー=挿入モード等)。
+        // 点滅は目が疲れるうえ再描画が増えるので形だけ再現する。
+        let shape = session.cursor_shape();
+        let thin_w = (cell_w * 0.18).max(1.5);
+        let thin_h = (cell_h * 0.14).max(1.5);
+        let shape_rect = match shape {
+            CursorShape::Block => cursor_rect,
+            CursorShape::Underline => egui::Rect::from_min_max(
+                egui::pos2(cursor_rect.min.x, cursor_rect.max.y - thin_h),
+                cursor_rect.max,
+            ),
+            CursorShape::Bar => egui::Rect::from_min_max(
+                cursor_rect.min,
+                egui::pos2(cursor_rect.min.x + thin_w, cursor_rect.max.y),
+            ),
+        };
+        if shape == CursorShape::Block {
+            if focused {
+                painter.rect_filled(cursor_rect, 1.0, theme.accent.gamma_multiply(0.55));
+            } else {
+                painter.rect_stroke(
+                    cursor_rect,
+                    1.0,
+                    egui::Stroke::new(1.0_f32, theme.accent.gamma_multiply(0.7)),
+                );
+            }
+        } else {
+            // 細い形は薄いと見えないので、非フォーカス時も塗りで描く
+            let a = if focused { 1.0 } else { 0.5 };
+            painter.rect_filled(shape_rect, 1.0, theme.accent.gamma_multiply(a));
+        }
+    }
+
+    if focused {
+        // IME を有効化し、変換候補ウィンドウをカーソル位置に出す
+        // (これが無いと日本語入力イベントが届かない)
+        ui.ctx().output_mut(|o| {
+            o.mutable_text_under_cursor = true;
+            o.ime = Some(egui::output::IMEOutput {
+                rect,
+                cursor_rect,
+            });
+        });
+
+        // IME 変換中の未確定文字列をカーソル位置にオーバーレイ表示
+        if !session.preedit.is_empty() {
+            let galley = painter.layout_no_wrap(
+                session.preedit.clone(),
+                font_id.clone(),
+                theme.term_fg,
+            );
+            let pos = cursor_rect.min;
+            let bg = egui::Rect::from_min_size(pos, galley.size()).expand(1.0);
+            painter.rect_filled(bg, 2.0, theme.accent.gamma_multiply(0.35));
+            painter.galley(pos, galley, theme.term_fg);
+            painter.line_segment(
+                [
+                    egui::pos2(bg.min.x, bg.max.y),
+                    egui::pos2(bg.max.x, bg.max.y),
+                ],
+                egui::Stroke::new(1.5_f32, theme.accent),
+            );
+        }
+    }
+}
+
 /// Render a terminal session. `interactive` forwards keyboard input on focus,
 /// `allow_resize` lets this view drive the PTY size.
 /// `hover_scroll`: ホバーだけでホイールを履歴スクロールに使うか。
@@ -2510,48 +2866,7 @@ pub fn draw(
 
     // ── マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行) ──
     if interactive {
-        let (rows_n, cols_n) = session.size;
-        let to_cell = |pos: egui::Pos2| -> (u16, u16) {
-            let c = ((pos.x - rect.min.x - padding) / cell_w).floor().max(0.0) as u16;
-            let r = ((pos.y - rect.min.y - padding) / cell_h).floor().max(0.0) as u16;
-            (
-                r.min(rows_n.saturating_sub(1)),
-                c.min(cols_n.saturating_sub(1)),
-            )
-        };
-        if response.clicked() {
-            // クリック(ドラッグなし)で選択解除
-            session.selection = None;
-            session.sel_anchor = None;
-        }
-        if response.drag_started_by(egui::PointerButton::Primary) {
-            if let Some(pos) = response.interact_pointer_pos() {
-                session.sel_anchor = Some(to_cell(pos));
-                session.selection = None;
-            }
-        }
-        if response.dragged_by(egui::PointerButton::Primary) {
-            if let (Some(anchor), Some(pos)) =
-                (session.sel_anchor, response.interact_pointer_pos())
-            {
-                session.selection = Some((anchor, to_cell(pos)));
-            }
-        }
-        if response.double_clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let (r, c) = to_cell(pos);
-                session.selection = {
-                    let p = lock_ok(&session.parser);
-                    word_selection(p.screen(), r, c)
-                };
-            }
-        }
-        if response.triple_clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let (r, _) = to_cell(pos);
-                session.selection = Some(((r, 0), (r, cols_n.saturating_sub(1))));
-            }
-        }
+        handle_mouse_selection(session, &response, rect, padding, cell_w, cell_h);
     }
 
     // 代替画面(Claude Code / vim / less 等)にスクロールバック履歴は無いため、
@@ -2561,290 +2876,21 @@ pub fn draw(
     }
 
     if focused {
-        ui.memory_mut(|m| {
-            m.set_focus_lock_filter(
-                response.id,
-                egui::EventFilter {
-                    tab: true,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    escape: true,
-                },
-            )
-        });
-        let events = ui.input(|i| i.events.clone());
-        let (app_cursor, bracketed) = {
-            let p = lock_ok(&session.parser);
-            let s = p.screen();
-            (s.application_cursor(), s.bracketed_paste())
-        };
-        let mut out: Vec<u8> = Vec::new();
-        let mut want_copy = false;
-        for ev in &events {
-            match ev {
-                // ⌘C: 選択範囲をクリップボードへ(選択が無ければ何もしない)。
-                // Ctrl+C は Key イベントとしてそのまま PTY へ届く(SIGINT)。
-                egui::Event::Copy => {
-                    want_copy = true;
-                }
-                egui::Event::Text(t) => {
-                    out.extend_from_slice(t.as_bytes());
-                }
-                // IME(日本語入力など): 変換確定文字列を PTY へ送り、
-                // 変換中の未確定文字列はオーバーレイ表示用に保持する。
-                egui::Event::Ime(ime) => match ime {
-                    egui::ImeEvent::Commit(t) => {
-                        out.extend_from_slice(t.as_bytes());
-                        session.preedit.clear();
-                    }
-                    egui::ImeEvent::Preedit(t) => {
-                        session.preedit = t.clone();
-                    }
-                    egui::ImeEvent::Enabled | egui::ImeEvent::Disabled => {
-                        session.preedit.clear();
-                    }
-                },
-                egui::Event::Paste(t) => {
-                    if bracketed {
-                        out.extend_from_slice(b"\x1b[200~");
-                    }
-                    out.extend_from_slice(t.as_bytes());
-                    if bracketed {
-                        out.extend_from_slice(b"\x1b[201~");
-                    }
-                }
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } => {
-                    if modifiers.mac_cmd {
-                        continue;
-                    }
-                    // IME 変換中はキーを IME に任せる(Enter/矢印で確定・候補選択するため)
-                    if !session.preedit.is_empty() {
-                        continue;
-                    }
-                    if let Some(b) = key_bytes(*key, *modifiers, app_cursor) {
-                        out.extend_from_slice(&b);
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !out.is_empty() {
-            // 人が打った分は音声入力の書き込み追跡とずれるので印を立てる。
-            // 承認プロンプトへの手入力応答もここで「応答済み」として解決する
-            // (自動YESオフの手動運転で attention を引きずらないため)。
-            session.note_user_input();
-            session.write_bytes(&out);
-            session.set_scroll(0);
-        }
-        if want_copy {
-            copy_selection(ui, session);
-        }
+        forward_keyboard_input(ui, session, response.id);
     } else if !session.preedit.is_empty() {
         session.preedit.clear();
     }
 
     if interactive && (focused || hover_scroll) && response.hovered() {
-        let dy = ui.input(|i| i.raw_scroll_delta.y);
-        if dy.abs() > 0.5 {
-            let (alt, mouse_on, sgr) = session.wheel_modes();
-            let up = dy > 0.0;
-            // ホイールの移動量をノッチ数へ(1〜8)
-            let notches = ((dy.abs() / cell_h).ceil() as i32).clamp(1, 8);
-            if mouse_on {
-                // アプリがマウス報告中: ホイールをそのまま転送する。
-                // これで Claude Code / less / vim などがアプリ側でスクロールする。
-                let hover = ui
-                    .input(|i| i.pointer.hover_pos())
-                    .unwrap_or_else(|| rect.center());
-                let col = (((hover.x - rect.min.x - padding) / cell_w).floor().max(0.0)) as u16;
-                let row = (((hover.y - rect.min.y - padding) / cell_h).floor().max(0.0)) as u16;
-                for _ in 0..notches {
-                    session.send_wheel(up, col, row, sgr);
-                }
-                // 代替画面に切り替わった後もローカル履歴表示が残らないようにする
-                if session.scroll != 0 {
-                    session.set_scroll(0);
-                }
-            } else if alt {
-                // マウス無効の全画面アプリ: 矢印キーで代用スクロール
-                let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-                for _ in 0..notches {
-                    session.write_bytes(arrow);
-                }
-                if session.scroll != 0 {
-                    session.set_scroll(0);
-                }
-            } else {
-                // 通常画面(シェル等): ローカルのスクロールバック履歴。
-                // 整数切り捨てで 0 行になると、ゆっくりスクロールしたとき
-                // 一番下(scroll=0)まで戻り切れず履歴表示が残るため、
-                // 1 イベントにつき最低 1 行は必ず動かす。
-                let mut lines = (dy / cell_h * 2.0) as i64;
-                if lines == 0 {
-                    lines = if up { 1 } else { -1 };
-                }
-                session.adjust_scroll(lines);
-            }
-            // 外側 ScrollArea との二重スクロールを防ぐためホイールを消費する
-            ui.input_mut(|i| {
-                i.raw_scroll_delta.y = 0.0;
-                i.smooth_scroll_delta.y = 0.0;
-            });
-        }
+        handle_wheel_scroll(ui, session, rect, padding, cell_w, cell_h);
     }
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, theme.term_bg);
 
-    let sel_norm = session.selection.map(normalize_sel);
-    {
-        let parser = lock_ok(&session.parser);
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        let origin = rect.min + egui::vec2(padding, padding);
-
-        for r in 0..rows {
-            for cix in 0..cols {
-                let Some(cell) = screen.cell(r, cix) else {
-                    continue;
-                };
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-                let x = origin.x + cix as f32 * cell_w;
-                let y = origin.y + r as f32 * cell_h;
-                if y + cell_h > rect.max.y {
-                    break;
-                }
-                if x >= rect.max.x {
-                    continue;
-                }
-                let w = if cell.is_wide() { cell_w * 2.0 } else { cell_w };
-                let cell_rect =
-                    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, cell_h));
-
-                let mut fg = cell_color(theme, cell.fgcolor(), true);
-                let mut bg = match cell.bgcolor() {
-                    vt100::Color::Default => None,
-                    other => Some(cell_color(theme, other, false)),
-                };
-                if cell.inverse() {
-                    let old = fg;
-                    fg = bg.unwrap_or(theme.term_bg);
-                    bg = Some(old);
-                }
-                if let Some(bgc) = bg {
-                    painter.rect_filled(cell_rect, 0.0, bgc);
-                }
-                // 選択範囲のハイライト(文字色はそのまま、背景に半透明アクセント)
-                if let Some(sel) = sel_norm {
-                    if cell_selected(r, cix, sel) {
-                        painter.rect_filled(cell_rect, 0.0, theme.accent.gamma_multiply(0.3));
-                    }
-                }
-                let contents = cell.contents();
-                if !contents.is_empty() && contents != " " {
-                    let color = if cell.bold() { brighten(fg) } else { fg };
-                    painter.text(
-                        egui::pos2(x, y),
-                        egui::Align2::LEFT_TOP,
-                        contents,
-                        font_id.clone(),
-                        color,
-                    );
-                }
-                if cell.underline() {
-                    painter.line_segment(
-                        [
-                            egui::pos2(x, y + cell_h - 1.0),
-                            egui::pos2(x + w, y + cell_h - 1.0),
-                        ],
-                        egui::Stroke::new(1.0_f32, fg),
-                    );
-                }
-            }
-        }
-
-        let (cr, cc) = screen.cursor_position();
-        let cursor_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                origin.x + cc as f32 * cell_w,
-                origin.y + cr as f32 * cell_h,
-            ),
-            egui::vec2(cell_w, cell_h),
-        );
-
-        if session.scroll == 0 && !screen.hide_cursor() {
-            // DECSCUSR の指定に合わせて形を変える(バー=挿入モード等)。
-            // 点滅は目が疲れるうえ再描画が増えるので形だけ再現する。
-            let shape = session.cursor_shape();
-            let thin_w = (cell_w * 0.18).max(1.5);
-            let thin_h = (cell_h * 0.14).max(1.5);
-            let shape_rect = match shape {
-                CursorShape::Block => cursor_rect,
-                CursorShape::Underline => egui::Rect::from_min_max(
-                    egui::pos2(cursor_rect.min.x, cursor_rect.max.y - thin_h),
-                    cursor_rect.max,
-                ),
-                CursorShape::Bar => egui::Rect::from_min_max(
-                    cursor_rect.min,
-                    egui::pos2(cursor_rect.min.x + thin_w, cursor_rect.max.y),
-                ),
-            };
-            if shape == CursorShape::Block {
-                if focused {
-                    painter.rect_filled(cursor_rect, 1.0, theme.accent.gamma_multiply(0.55));
-                } else {
-                    painter.rect_stroke(
-                        cursor_rect,
-                        1.0,
-                        egui::Stroke::new(1.0_f32, theme.accent.gamma_multiply(0.7)),
-                    );
-                }
-            } else {
-                // 細い形は薄いと見えないので、非フォーカス時も塗りで描く
-                let a = if focused { 1.0 } else { 0.5 };
-                painter.rect_filled(shape_rect, 1.0, theme.accent.gamma_multiply(a));
-            }
-        }
-
-        if focused {
-            // IME を有効化し、変換候補ウィンドウをカーソル位置に出す
-            // (これが無いと日本語入力イベントが届かない)
-            ui.ctx().output_mut(|o| {
-                o.mutable_text_under_cursor = true;
-                o.ime = Some(egui::output::IMEOutput {
-                    rect,
-                    cursor_rect,
-                });
-            });
-
-            // IME 変換中の未確定文字列をカーソル位置にオーバーレイ表示
-            if !session.preedit.is_empty() {
-                let galley = painter.layout_no_wrap(
-                    session.preedit.clone(),
-                    font_id.clone(),
-                    theme.term_fg,
-                );
-                let pos = cursor_rect.min;
-                let bg = egui::Rect::from_min_size(pos, galley.size()).expand(1.0);
-                painter.rect_filled(bg, 2.0, theme.accent.gamma_multiply(0.35));
-                painter.galley(pos, galley, theme.term_fg);
-                painter.line_segment(
-                    [
-                        egui::pos2(bg.min.x, bg.max.y),
-                        egui::pos2(bg.max.x, bg.max.y),
-                    ],
-                    egui::Stroke::new(1.5_f32, theme.accent),
-                );
-            }
-        }
-    }
+    draw_screen(
+        ui, &painter, session, theme, &font_id, rect, padding, cell_w, cell_h, focused,
+    );
 
     // 履歴表示中だけ「⤓ 一番下へ」ボタンを出す。一番下(scroll == 0)なら何も表示しない。
     if session.scroll > 0 {
@@ -3191,7 +3237,7 @@ mod query_tests {
     #[test]
     fn osc52_oversized_payload_is_dropped() {
         let mut seq = b"\x1b]52;c;".to_vec();
-        seq.extend(std::iter::repeat(b'A').take(MAX_CLIPBOARD_B64 + 4));
+        seq.extend(std::iter::repeat_n(b'A', MAX_CLIPBOARD_B64 + 4));
         seq.push(0x07);
         assert_eq!(scan1(&seq), vec![]);
     }
