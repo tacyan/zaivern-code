@@ -1858,7 +1858,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    use super::{normalize_sel, selection_text, word_selection, Session};
+    use super::{
+        mac_agent_input_bytes, normalize_sel, selection_text, word_selection, Session,
+    };
+
+    #[test]
+    fn mac_command_a_is_forwarded_to_agent_input_as_select_all() {
+        let command = egui::Modifiers {
+            alt: false,
+            ctrl: false,
+            shift: false,
+            mac_cmd: true,
+            command: true,
+        };
+        assert_eq!(
+            mac_agent_input_bytes(egui::Key::A, command),
+            Some(b"\x01".as_slice())
+        );
+        assert_eq!(mac_agent_input_bytes(egui::Key::C, command), None);
+        assert_eq!(
+            mac_agent_input_bytes(egui::Key::A, egui::Modifiers::CTRL),
+            None
+        );
+    }
 
     #[test]
     fn normalize_sel_orders_row_major() {
@@ -2940,6 +2962,17 @@ fn key_bytes(key: egui::Key, m: egui::Modifiers, app_cursor: bool) -> Option<Vec
     Some(b)
 }
 
+/// macOS の標準編集ショートカットを、エージェント側の入力欄が受け取る
+/// Control キーへ変換する。Command 系を一括転送するとアプリ全体の
+/// ショートカットまで PTY に漏れるため、対応対象を明示的に限定する。
+fn mac_agent_input_bytes(key: egui::Key, m: egui::Modifiers) -> Option<&'static [u8]> {
+    if m.mac_cmd && key == egui::Key::A {
+        Some(b"\x01")
+    } else {
+        None
+    }
+}
+
 fn ansi_color(theme: &Theme, i: u8) -> egui::Color32 {
     if i < 16 {
         theme.ansi[i as usize]
@@ -3192,6 +3225,9 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
                 ..
             } => {
                 if modifiers.mac_cmd {
+                    if let Some(b) = mac_agent_input_bytes(*key, *modifiers) {
+                        out.extend_from_slice(b);
+                    }
                     continue;
                 }
                 // IME 変換中はキーを IME に任せる(Enter/矢印で確定・候補選択するため)
