@@ -1115,8 +1115,9 @@ fn dir_mtime(dir: &Path) -> Option<SystemTime> {
 }
 
 pub fn icon_for(name: &str) -> &'static str {
-    let ext = name.rsplit('.').next().unwrap_or("");
-    match ext {
+    // 拡張子は大小無視で判定する (README.MD 等が既定アイコンに落ちないように)
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
         "rs" => "🐾",
         "md" | "markdown" => "📝",
         "toml" | "json" | "yaml" | "yml" | "ini" | "cfg" => "⚙️",
@@ -1221,6 +1222,13 @@ mod tests {
         );
         assert_eq!(t.root_for(Path::new("/elsewhere/x.rs")), None);
         assert_eq!(t.roots[0], PathBuf::from("/ws/a"), "primary は roots[0]");
+    }
+
+    #[test]
+    fn icon_for_ignores_extension_case() {
+        assert_eq!(icon_for("README.MD"), icon_for("readme.md"));
+        assert_eq!(icon_for("Main.RS"), icon_for("main.rs"));
+        assert_ne!(icon_for("README.MD"), icon_for("unknown.zzz"), "既定に落ちていない");
     }
 
     #[test]

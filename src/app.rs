@@ -920,7 +920,9 @@ impl ZaivernApp {
             }
         }
         if newly_disabled {
-            let _ = config::save_plugins_section(&self.cfg);
+            if let Err(e) = config::save_plugins_section(&self.cfg) {
+                self.toast(trf("設定の保存に失敗: {e}", &[("e", e.to_string())]), false);
+            }
         }
         // 無効化リストと保存済み設定値を反映する。無効なプラグインは
         // 以降の登録 (コマンド/キーバインド/テーマ/スニペット) から一切外れる
