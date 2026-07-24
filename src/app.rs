@@ -7102,6 +7102,8 @@ impl ZaivernApp {
         };
         let view_h = self.last_view_h;
         let theme_bg = self.theme.bg;
+        // 現在行ハイライト用 (テキストの上に重ねるのでごく薄く)
+        let cur_line_hl = self.theme.text.gamma_multiply(0.045);
 
         let mut pending_select = self.pending_select.take();
         let pending_scroll = self.pending_scroll.take();
@@ -7456,6 +7458,27 @@ impl ZaivernApp {
                 // オフセットを配置後に適用するため、state.offset ではなく
                 // これを使わないとガターが 1 フレームずれて「泳ぐ」
                 text_top = Some(output.response.rect.top());
+
+                // 現在行ハイライト (VS Code 相当)。選択中は出さない。
+                // テキスト描画の後に重ねるため、文字を邪魔しない極薄の帯にする。
+                if output.response.has_focus() {
+                    if let Some(cr) = output.cursor_range {
+                        if cr.primary.ccursor.index == cr.secondary.ccursor.index {
+                            let row = output.galley.pos_from_cursor(&cr.primary);
+                            let row_rect = egui::Rect::from_min_max(
+                                egui::pos2(
+                                    output.response.rect.left(),
+                                    output.galley_pos.y + row.min.y,
+                                ),
+                                egui::pos2(
+                                    output.response.rect.right(),
+                                    output.galley_pos.y + row.max.y,
+                                ),
+                            );
+                            ui.painter().rect_filled(row_rect, 0.0, cur_line_hl);
+                        }
+                    }
+                }
 
                 if let Some(cr) = output.cursor_range {
                     let idx = cr.primary.ccursor.index;
