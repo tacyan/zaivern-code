@@ -263,6 +263,29 @@ struct PluginActions {
     panel_refresh: Option<(String, String)>,
 }
 
+/// Cockpit で押されたボタン類。クロージャの中では記録だけして、
+/// パネル描画後に self へ反映する (PluginActions と同じ流儀)。
+#[derive(Default)]
+struct CockpitActions {
+    launch: Option<usize>,
+    focus: Option<usize>,
+    /// グリッドのセルを選んだら、そのセッションをアクティブ (紫枠) にする。
+    /// Cockpit は開いたままにしたいので focus (下部パネルへ移動) とは別に持つ。
+    select: Option<usize>,
+    restart: Option<usize>,
+    remove: Option<usize>,
+    cycle: Option<usize>,
+    cycle_all: bool,
+    broadcast: Option<String>,
+    voice: Option<u64>,
+    voice_all: bool,
+    voice_stop: bool,
+    /// 監視役 LLM の変更は、借用の都合でいったんここへ退避して閉じた後に適用する。
+    /// 指名は (コマンド, セッションタイトル)。両方空 = なし。
+    super_pick: Option<(String, String)>,
+    super_enabled: Option<bool>,
+}
+
 /// キーバインド駆動のエディタ編集操作
 enum EditOp {
     ToggleComment,
@@ -5372,106 +5395,15 @@ impl ZaivernApp {
 
     fn cockpit_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let theme = self.theme.clone();
-        let mut launch: Option<usize> = None;
-        let mut focus: Option<usize> = None;
-        // グリッドのセルを選んだら、そのセッションをアクティブ (紫枠) にする。
-        // Cockpit は開いたままにしたいので focus (下部パネルへ移動) とは別に持つ。
-        let mut select: Option<usize> = None;
-        let mut restart: Option<usize> = None;
-        let mut remove: Option<usize> = None;
-        let mut cycle: Option<usize> = None;
-        let mut cycle_all = false;
-        let mut broadcast: Option<String> = None;
-        let mut voice: Option<u64> = None;
-        let mut voice_all = false;
-        let mut voice_stop = false;
+        // 押されたボタン類はクロージャの中では記録だけして、描画後に self へ反映する。
+        let mut acts = CockpitActions::default();
         let mut orch_acts: Vec<orchestration::OrchAction> = Vec::new();
-        // 監視役 LLM の変更は、借用の都合でいったんここへ退避して閉じた後に適用する。
-        // 指名は (コマンド, セッションタイトル)。両方空 = なし。
-        let mut super_pick: Option<(String, String)> = None;
-        let mut super_enabled: Option<bool> = None;
         let orch_rows = self.orch_rows();
 
         egui::Frame::none()
             .inner_margin(egui::Margin::same(12.0))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("🎛 Agent Cockpit")
-                            .size(20.0)
-                            .strong()
-                            .color(theme.accent),
-                    );
-                    let running = self.agents.running_count();
-                    let total = self.agents.sessions.len();
-                    ui.label(
-                        RichText::new(trf(
-                            "{running} 稼働中 / {total} セッション",
-                            &[("running", running.to_string()), ("total", total.to_string())],
-                        ))
-                        .color(theme.text_dim),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(tr("✕ 閉じる")).clicked() {
-                            self.cockpit = false;
-                        }
-                        if ui
-                            .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
-                            .on_hover_text(tr(
-                                "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
-                                 Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
-                            ))
-                            .clicked()
-                        {
-                            cycle_all = true;
-                        }
-                        ui.menu_button("＋ Agent", |ui| {
-                            for (i, p) in self.cfg.agents.iter().enumerate() {
-                                if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
-                                    launch = Some(i);
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-                        let send = ui.button(tr("📣 送信"));
-                        let input = ui.add(
-                            egui::TextEdit::singleline(&mut self.broadcast_input)
-                                .desired_width(300.0)
-                                .hint_text(tr("全エージェントへブロードキャスト…")),
-                        );
-                        let enter = input.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if (send.clicked() || enter) && !self.broadcast_input.trim().is_empty() {
-                            broadcast = Some(self.broadcast_input.trim().to_string());
-                            self.broadcast_input.clear();
-                        }
-                        // 音声で全エージェントの入力欄へ入れる (送信は各自 Enter)
-                        let rec = self.voice.session.is_some();
-                        if rec
-                            && ui
-                                .button(RichText::new("⏹").color(theme.err).strong())
-                                .on_hover_text(tr("音声入力を止める"))
-                                .clicked()
-                        {
-                            voice_stop = true;
-                        }
-                        if ui
-                            .selectable_label(
-                                rec && self.voice.target == voice::Target::Broadcast,
-                                if rec { "🔴" } else { "🎤" },
-                            )
-                            .on_hover_text(tr(
-                                "音声入力 → 全エージェントの入力欄へ\n\
-                                 ⏹ を押すまで話した内容が入り続けます。\n\
-                                 送信はされないので、自分で Enter を押してください",
-                            ))
-                            .clicked()
-                        {
-                            voice_all = true;
-                        }
-                    });
-                });
+                self.cockpit_header_ui(ui, &theme, &mut acts);
                 ui.add_space(8.0);
 
                 // 調停レイヤ (タスク一覧・作成・メッセージ送信)。描画は orchestration 側。
@@ -5484,421 +5416,543 @@ impl ZaivernApp {
                     &orchestration::bus_status(&self.coordinator, &orch_rows),
                 );
 
-                // ── 監視役 LLM (スーパーエージェント) の選択 ──────────────
-                egui::CollapsingHeader::new(
-                    RichText::new(tr("💡 スーパーエージェント (指揮役)"))
-                        .strong()
-                        .color(theme.text),
-                )
-                .id_salt("super-agent-section")
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(tr(
-                            "決定論的な見張り (停滞・ループ・エラー多発の検知) は、この設定に\
-                             関わらず常に動き、異常はここと通知で知らせます。ここでは\
-                             いま起動しているエージェントの中からどれでも 1 体を『指揮官』に\
-                             指名できます (作業の途中でもいつでも交代できます)。指揮官が\
-                             `@対象: 指示` (全員へは `@all:`) と書くと、その内容が **📮 通知**\
-                             としてユーザーへ届きます。どのエージェントの入力欄にも自動では\
-                             書き込みません — 指示を実際に流すかはユーザーが決めます\
-                             (Cockpit の一斉送信や各端末への手入力で)。停止・再起動などの\
-                             破壊的な操作を自動でエージェントへ投げることもしません。\
-                             指名したエージェントは普通の作業にもそのまま使えますし、\
-                             そのセッション自身も見張りの対象です。",
-                        ))
-                        .size(12.0)
-                        .color(theme.text_dim),
-                    );
-                    ui.add_space(6.0);
+                self.cockpit_super_agent_ui(ui, &theme, &mut acts);
+                ui.add_space(8.0);
 
-                    let cur_cmd = self.cfg.super_agent.command.trim().to_string();
-                    let cur_title = self.cfg.super_agent.session_title.trim().to_string();
-                    let none_label = tr("なし（監視のみ・指揮しない）");
-                    let cur_label = if cur_cmd.is_empty() && cur_title.is_empty() {
-                        none_label.clone()
-                    } else if !cur_title.is_empty() {
-                        // セッション指名中: 起動中ならアイコン付き、居なければ待機表示。
-                        self.agents
-                            .sessions
-                            .iter()
-                            .find(|s| s.title.trim() == cur_title)
-                            .map(|s| format!("{} {}", s.icon, s.title))
-                            .unwrap_or_else(|| {
-                                trf("{title}（未起動）", &[("title", cur_title.clone())])
-                            })
-                    } else {
-                        // 旧形式 (コマンドのみ指定): プリセット名で表示する。
-                        self.cfg
-                            .agents
-                            .iter()
-                            .find(|p| p.command.trim() == cur_cmd)
-                            .map(|p| format!("{} {}", p.icon, p.name))
-                            .unwrap_or_else(|| cur_cmd.clone())
-                    };
+                self.cockpit_grid_ui(ui, &theme, &mut acts);
+            });
 
-                    egui::ComboBox::from_id_salt("super-agent-pick")
-                        .selected_text(cur_label)
-                        .width(320.0)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(
-                                    cur_cmd.is_empty() && cur_title.is_empty(),
-                                    none_label.as_str(),
-                                )
-                                .clicked()
-                            {
-                                super_pick = Some((String::new(), String::new()));
-                            }
-                            if self.agents.sessions.is_empty() {
-                                ui.label(
-                                    RichText::new(tr(
-                                        "起動中のエージェントがいません — \
-                                         セッションを起動するとここに並びます",
-                                    ))
-                                    .size(12.0)
-                                    .color(theme.text_dim),
-                                );
-                            }
-                            // いま居るセッションを名前で並べる (途中からの指名・交代用)。
-                            // 指揮は画面を読むだけなので、起動しているエージェントなら
-                            // どれでも選べる (素のシェルだけは誤検出しやすいので除外)。
-                            for s in self.agents.sessions.iter() {
-                                let label = format!("{} {}", s.icon, s.title);
-                                let why = if !s.running() {
-                                    Some(tr("終了しています (再起動すると選べます)"))
-                                } else {
-                                    commander_reject_reason(&s.command)
-                                };
-                                match why {
-                                    None => {
-                                        if ui
-                                            .selectable_label(
-                                                cur_title == s.title.trim(),
-                                                label,
-                                            )
-                                            .clicked()
-                                        {
-                                            super_pick = Some((
-                                                s.command.trim().to_string(),
-                                                s.title.trim().to_string(),
-                                            ));
-                                        }
-                                    }
-                                    Some(why) => {
-                                        ui.add_enabled(
-                                            false,
-                                            egui::Button::new(
-                                                RichText::new(trf(
-                                                    "{label} — 選べません",
-                                                    &[("label", label)],
-                                                ))
-                                                .color(theme.text_dim),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .on_disabled_hover_text(tr(&why));
-                                    }
-                                }
-                            }
-                        });
+        self.apply_cockpit_actions(ctx, &theme, &orch_rows, acts, orch_acts);
+    }
 
-                    ui.horizontal(|ui| {
-                        let mut en = self.cfg.super_agent.enabled;
-                        if ui
-                            .checkbox(&mut en, tr("指揮を有効にする"))
-                            .on_hover_text(tr(
-                                "OFF にすると指揮だけ止まります。決定論的な見張りは動き続けます",
-                            ))
-                            .changed()
-                        {
-                            super_enabled = Some(en);
+    /// Cockpit のヘッダー行 (タイトル・稼働数・閉じる/全切替・Agent 起動・
+    /// 一斉送信・音声)。押されたボタンは acts に記録だけして呼び出し側で反映する。
+    fn cockpit_header_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        acts: &mut CockpitActions,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("🎛 Agent Cockpit")
+                    .size(20.0)
+                    .strong()
+                    .color(theme.accent),
+            );
+            let running = self.agents.running_count();
+            let total = self.agents.sessions.len();
+            ui.label(
+                RichText::new(trf(
+                    "{running} 稼働中 / {total} セッション",
+                    &[("running", running.to_string()), ("total", total.to_string())],
+                ))
+                .color(theme.text_dim),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(tr("✕ 閉じる")).clicked() {
+                    self.cockpit = false;
+                }
+                if ui
+                    .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
+                    .on_hover_text(tr(
+                        "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
+                         Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
+                    ))
+                    .clicked()
+                {
+                    acts.cycle_all = true;
+                }
+                ui.menu_button("＋ Agent", |ui| {
+                    for (i, p) in self.cfg.agents.iter().enumerate() {
+                        if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
+                            acts.launch = Some(i);
+                            ui.close_menu();
                         }
-                    });
+                    }
+                });
+                let send = ui.button(tr("📣 送信"));
+                let input = ui.add(
+                    egui::TextEdit::singleline(&mut self.broadcast_input)
+                        .desired_width(300.0)
+                        .hint_text(tr("全エージェントへブロードキャスト…")),
+                );
+                let enter = input.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (send.clicked() || enter) && !self.broadcast_input.trim().is_empty() {
+                    acts.broadcast = Some(self.broadcast_input.trim().to_string());
+                    self.broadcast_input.clear();
+                }
+                // 音声で全エージェントの入力欄へ入れる (送信は各自 Enter)
+                let rec = self.voice.session.is_some();
+                if rec
+                    && ui
+                        .button(RichText::new("⏹").color(theme.err).strong())
+                        .on_hover_text(tr("音声入力を止める"))
+                        .clicked()
+                {
+                    acts.voice_stop = true;
+                }
+                if ui
+                    .selectable_label(
+                        rec && self.voice.target == voice::Target::Broadcast,
+                        if rec { "🔴" } else { "🎤" },
+                    )
+                    .on_hover_text(tr(
+                        "音声入力 → 全エージェントの入力欄へ\n\
+                         ⏹ を押すまで話した内容が入り続けます。\n\
+                         送信はされないので、自分で Enter を押してください",
+                    ))
+                    .clicked()
+                {
+                    acts.voice_all = true;
+                }
+            });
+        });
+    }
 
-                    ui.add_space(4.0);
-                    let appointed =
-                        self.cfg.super_agent.enabled && (!cur_cmd.is_empty() || !cur_title.is_empty());
-                    if let Some(id) = self.super_agent_session {
-                        // 指揮官が実際に動いている。セッションは毎フレーム引き直して
-                        // いるので、この ID は今この瞬間の指揮官を指す。
-                        let head = self
-                            .agents
-                            .sessions
-                            .iter()
-                            .find(|s| s.id == id)
-                            .map(|s| {
-                                trf(
-                                    "✅ 指揮官: {icon} {title}  (#{id})",
-                                    &[
-                                        ("icon", s.icon.to_string()),
-                                        ("title", s.title.clone()),
-                                        ("id", id.to_string()),
-                                    ],
-                                )
-                            })
-                            .unwrap_or_default();
-                        ui.label(RichText::new(head).color(theme.ok));
+    /// Cockpit: 監視役 LLM (スーパーエージェント) の選択セクション。
+    /// 変更は acts に記録だけして呼び出し側で反映する。
+    fn cockpit_super_agent_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        acts: &mut CockpitActions,
+    ) {
+        // ── 監視役 LLM (スーパーエージェント) の選択 ──────────────
+        egui::CollapsingHeader::new(
+            RichText::new(tr("💡 スーパーエージェント (指揮役)"))
+                .strong()
+                .color(theme.text),
+        )
+        .id_salt("super-agent-section")
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(tr(
+                    "決定論的な見張り (停滞・ループ・エラー多発の検知) は、この設定に\
+                     関わらず常に動き、異常はここと通知で知らせます。ここでは\
+                     いま起動しているエージェントの中からどれでも 1 体を『指揮官』に\
+                     指名できます (作業の途中でもいつでも交代できます)。指揮官が\
+                     `@対象: 指示` (全員へは `@all:`) と書くと、その内容が **📮 通知**\
+                     としてユーザーへ届きます。どのエージェントの入力欄にも自動では\
+                     書き込みません — 指示を実際に流すかはユーザーが決めます\
+                     (Cockpit の一斉送信や各端末への手入力で)。停止・再起動などの\
+                     破壊的な操作を自動でエージェントへ投げることもしません。\
+                     指名したエージェントは普通の作業にもそのまま使えますし、\
+                     そのセッション自身も見張りの対象です。",
+                ))
+                .size(12.0)
+                .color(theme.text_dim),
+            );
+            ui.add_space(6.0);
+
+            let cur_cmd = self.cfg.super_agent.command.trim().to_string();
+            let cur_title = self.cfg.super_agent.session_title.trim().to_string();
+            let none_label = tr("なし（監視のみ・指揮しない）");
+            let cur_label = if cur_cmd.is_empty() && cur_title.is_empty() {
+                none_label.clone()
+            } else if !cur_title.is_empty() {
+                // セッション指名中: 起動中ならアイコン付き、居なければ待機表示。
+                self.agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.title.trim() == cur_title)
+                    .map(|s| format!("{} {}", s.icon, s.title))
+                    .unwrap_or_else(|| {
+                        trf("{title}（未起動）", &[("title", cur_title.clone())])
+                    })
+            } else {
+                // 旧形式 (コマンドのみ指定): プリセット名で表示する。
+                self.cfg
+                    .agents
+                    .iter()
+                    .find(|p| p.command.trim() == cur_cmd)
+                    .map(|p| format!("{} {}", p.icon, p.name))
+                    .unwrap_or_else(|| cur_cmd.clone())
+            };
+
+            egui::ComboBox::from_id_salt("super-agent-pick")
+                .selected_text(cur_label)
+                .width(320.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(
+                            cur_cmd.is_empty() && cur_title.is_empty(),
+                            none_label.as_str(),
+                        )
+                        .clicked()
+                    {
+                        acts.super_pick = Some((String::new(), String::new()));
+                    }
+                    if self.agents.sessions.is_empty() {
                         ui.label(
                             RichText::new(tr(
-                                "このセッションが `@対象: 指示` (全員へは `@all:`) と書くと、\
-                                 その内容が 📮 通知としてユーザーへ届きます。エージェントの\
-                                 入力欄へ自動で書き込むことはありません",
+                                "起動中のエージェントがいません — \
+                                 セッションを起動するとここに並びます",
                             ))
                             .size(12.0)
                             .color(theme.text_dim),
                         );
-                    } else if appointed {
-                        // 指名済みだが、その相手がまだ (もう) 起動していない。
-                        let wait = if cur_title.is_empty() {
-                            tr(
-                                "指揮官セッションを待っています — 選んだ CLI でセッションを起動すると指揮を始めます",
-                            )
+                    }
+                    // いま居るセッションを名前で並べる (途中からの指名・交代用)。
+                    // 指揮は画面を読むだけなので、起動しているエージェントなら
+                    // どれでも選べる (素のシェルだけは誤検出しやすいので除外)。
+                    for s in self.agents.sessions.iter() {
+                        let label = format!("{} {}", s.icon, s.title);
+                        let why = if !s.running() {
+                            Some(tr("終了しています (再起動すると選べます)"))
                         } else {
-                            trf(
-                                "指揮官セッション『{title}』を待っています — \
-                                 同じ名前のセッションが起動すると指揮を始めます",
-                                &[("title", cur_title.clone())],
-                            )
+                            commander_reject_reason(&s.command)
                         };
-                        ui.label(RichText::new(wait).size(12.0).color(theme.warn));
-                    } else {
-                        ui.label(
-                            RichText::new(tr(
-                                "指揮官: なし（決定論的な見張りだけが動いています）",
-                            ))
-                            .color(theme.text_dim),
-                        );
+                        match why {
+                            None => {
+                                if ui
+                                    .selectable_label(
+                                        cur_title == s.title.trim(),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    acts.super_pick = Some((
+                                        s.command.trim().to_string(),
+                                        s.title.trim().to_string(),
+                                    ));
+                                }
+                            }
+                            Some(why) => {
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new(
+                                        RichText::new(trf(
+                                            "{label} — 選べません",
+                                            &[("label", label)],
+                                        ))
+                                        .color(theme.text_dim),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_disabled_hover_text(tr(&why));
+                            }
+                        }
                     }
                 });
-                ui.add_space(8.0);
 
-                let n = self.agents.sessions.len();
-                if n == 0 {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.25);
-                        ui.label(RichText::new("🎛").size(52.0));
-                        ui.label(
-                            RichText::new(tr("エージェントがまだいません"))
-                                .size(18.0)
-                                .color(theme.text),
-                        );
-                        ui.label(
-                            RichText::new(tr("プリセットから並列セッションを起動しましょう"))
-                                .color(theme.text_dim),
-                        );
-                        ui.add_space(12.0);
-                        for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
-                            if ui
-                                .add_sized(
-                                    [280.0, 34.0],
-                                    egui::Button::new(format!("{} {}", p.icon, p.name)),
-                                )
-                                .clicked()
+            ui.horizontal(|ui| {
+                let mut en = self.cfg.super_agent.enabled;
+                if ui
+                    .checkbox(&mut en, tr("指揮を有効にする"))
+                    .on_hover_text(tr(
+                        "OFF にすると指揮だけ止まります。決定論的な見張りは動き続けます",
+                    ))
+                    .changed()
+                {
+                    acts.super_enabled = Some(en);
+                }
+            });
+
+            ui.add_space(4.0);
+            let appointed =
+                self.cfg.super_agent.enabled && (!cur_cmd.is_empty() || !cur_title.is_empty());
+            if let Some(id) = self.super_agent_session {
+                // 指揮官が実際に動いている。セッションは毎フレーム引き直して
+                // いるので、この ID は今この瞬間の指揮官を指す。
+                let head = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| {
+                        trf(
+                            "✅ 指揮官: {icon} {title}  (#{id})",
+                            &[
+                                ("icon", s.icon.to_string()),
+                                ("title", s.title.clone()),
+                                ("id", id.to_string()),
+                            ],
+                        )
+                    })
+                    .unwrap_or_default();
+                ui.label(RichText::new(head).color(theme.ok));
+                ui.label(
+                    RichText::new(tr(
+                        "このセッションが `@対象: 指示` (全員へは `@all:`) と書くと、\
+                         その内容が 📮 通知としてユーザーへ届きます。エージェントの\
+                         入力欄へ自動で書き込むことはありません",
+                    ))
+                    .size(12.0)
+                    .color(theme.text_dim),
+                );
+            } else if appointed {
+                // 指名済みだが、その相手がまだ (もう) 起動していない。
+                let wait = if cur_title.is_empty() {
+                    tr(
+                        "指揮官セッションを待っています — 選んだ CLI でセッションを起動すると指揮を始めます",
+                    )
+                } else {
+                    trf(
+                        "指揮官セッション『{title}』を待っています — \
+                         同じ名前のセッションが起動すると指揮を始めます",
+                        &[("title", cur_title.clone())],
+                    )
+                };
+                ui.label(RichText::new(wait).size(12.0).color(theme.warn));
+            } else {
+                ui.label(
+                    RichText::new(tr(
+                        "指揮官: なし（決定論的な見張りだけが動いています）",
+                    ))
+                    .color(theme.text_dim),
+                );
+            }
+        });
+    }
+
+    /// Cockpit: セッションのグリッド描画 (空のときはプリセット起動の案内)。
+    /// 押されたボタンは acts に記録だけして呼び出し側で反映する。
+    fn cockpit_grid_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        acts: &mut CockpitActions,
+    ) {
+        let n = self.agents.sessions.len();
+        if n == 0 {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.25);
+                ui.label(RichText::new("🎛").size(52.0));
+                ui.label(
+                    RichText::new(tr("エージェントがまだいません"))
+                        .size(18.0)
+                        .color(theme.text),
+                );
+                ui.label(
+                    RichText::new(tr("プリセットから並列セッションを起動しましょう"))
+                        .color(theme.text_dim),
+                );
+                ui.add_space(12.0);
+                for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
+                    if ui
+                        .add_sized(
+                            [280.0, 34.0],
+                            egui::Button::new(format!("{} {}", p.icon, p.name)),
+                        )
+                        .clicked()
+                    {
+                        acts.launch = Some(i);
+                    }
+                }
+            });
+            return;
+        }
+
+        let spacing = 10.0;
+        let avail = ui.available_size();
+        // 編集ペインとの分割で幅が狭いときは 1 列に落とす
+        let cols = if n <= 1 || avail.x < 640.0 { 1 } else { 2 };
+        let rows = n.div_ceil(cols);
+        let cell_w = (avail.x - spacing * (cols as f32 - 1.0)) / cols as f32 - 4.0;
+        let cell_h = (((avail.y - spacing * (rows as f32 - 1.0)) / rows as f32) - 4.0)
+            .max(150.0);
+        let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("cockpit-grid")
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                for row in 0..rows {
+                    ui.horizontal(|ui| {
+                        for col in 0..cols {
+                            let i = row * cols + col;
+                            if i >= n {
+                                continue;
+                            }
+                            let active = i == self.agents.active;
+                            let stroke = if active {
+                                egui::Stroke::new(2.0_f32, theme.accent)
+                            } else {
+                                egui::Stroke::new(1.0_f32, theme.border)
+                            };
+                            // セル内の余白クリックでも選択できるようにする。
+                            // egui のヒットテストは同一レイヤーでは「後に登録
+                            // したウィジェット」が勝つため、描画後に全面
+                            // ui.interact を掛けるとセル内のボタンやミニ
+                            // ターミナルへのクリックをすべて奪ってしまう。
+                            // UiBuilder::sense はコンテナの判定を子より先に
+                            // 登録するので、余白クリックだけを拾える。
+                            let cell = ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .id_salt(("cockpit-cell-select", i))
+                                    .sense(egui::Sense::click()),
+                                |ui| {
+                            egui::Frame::none()
+                                .fill(theme.panel_alt)
+                                .stroke(stroke)
+                                .rounding(egui::Rounding::same(8.0))
+                                .inner_margin(egui::Margin::same(8.0))
+                                .show(ui, |ui| {
+                                    // Frame は親 (horizontal な行) のレイアウトを
+                                    // 継承するため、明示的に縦積みへ切り替える。
+                                    // これが無いとヘッダーとターミナルが横に並び
+                                    // 画面外へはみ出す。
+                                    ui.vertical(|ui| {
+                                    ui.set_width(cell_w - 18.0);
+                                    ui.set_height(cell_h - 18.0);
+                                    let s = &mut self.agents.sessions[i];
+                                    let sid = s.id;
+                                    ui.horizontal(|ui| {
+                                        let dot = if s.running() {
+                                            if s.attention {
+                                                RichText::new("●").color(theme.warn)
+                                            } else {
+                                                RichText::new("●").color(theme.ok)
+                                            }
+                                        } else {
+                                            RichText::new("○").color(theme.err)
+                                        };
+                                        ui.label(dot);
+                                        let badge = if s.is_permission_agent() {
+                                            s.approval_badge()
+                                        } else {
+                                            ""
+                                        };
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{}{} {}",
+                                                badge, s.icon, s.title
+                                            ))
+                                            .strong()
+                                            .color(theme.text),
+                                        );
+                                        if s.has_unread() && !active {
+                                            ui.label(
+                                                RichText::new("◆")
+                                                    .size(9.0)
+                                                    .color(theme.accent),
+                                            )
+                                            .on_hover_text(tr(
+                                                "最後に見てから新しい出力があります",
+                                            ));
+                                        }
+                                        if let Some(line) = &s.rate_limited {
+                                            ui.label(
+                                                RichText::new("⏳")
+                                                    .color(theme.warn),
+                                            )
+                                            .on_hover_text(trf(
+                                                "レート制限/使用上限: {line}",
+                                                &[("line", line.clone())],
+                                            ));
+                                        }
+                                        ui.label(
+                                            RichText::new(s.uptime())
+                                                .size(10.5)
+                                                .color(theme.text_dim),
+                                        );
+                                        let permission_hint = s.permission_switch_hint();
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(
+                                                egui::Align::Center,
+                                            ),
+                                            |ui| {
+                                                if ui
+                                                    .small_button("✕")
+                                                    .on_hover_text(tr("閉じる"))
+                                                    .clicked()
+                                                {
+                                                    acts.remove = Some(i);
+                                                }
+                                                if ui
+                                                    .small_button("⟳")
+                                                    .on_hover_text(tr("再起動"))
+                                                    .clicked()
+                                                {
+                                                    acts.restart = Some(i);
+                                                }
+                                                if let Some(hint) = permission_hint {
+                                                    if ui
+                                                        .small_button("🛡")
+                                                        .on_hover_text(hint)
+                                                        .clicked()
+                                                    {
+                                                        acts.cycle = Some(i);
+                                                    }
+                                                }
+                                                if ui
+                                                    .small_button("🔍")
+                                                    .on_hover_text(tr(
+                                                        "下部パネルにフォーカス",
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    acts.focus = Some(i);
+                                                }
+                                                if ui
+                                                    .small_button(
+                                                        if self.voice.target == voice::Target::Session(sid)
+                                                            && self.voice.session.is_some()
+                                                        {
+                                                            "🔴"
+                                                        } else {
+                                                            "🎤"
+                                                        },
+                                                    )
+                                                    .on_hover_text(tr(
+                                                        "このエージェントへ音声入力\n\
+                                                         話した内容がこのタブの入力欄に入ります。\n\
+                                                         送信されないので、確認して Enter を押してください",
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    acts.voice = Some(sid);
+                                                    acts.select = Some(i);
+                                                }
+                                            },
+                                        );
+                                    });
+                                    let term = terminal::draw(
+                                        ui, s, theme, mini_font, true, true, false,
+                                    );
+                                    // ミニターミナルをクリックして入力を始めた
+                                    // セッションへ、アクティブ (紫枠) を追従させる。
+                                    if term.clicked()
+                                        || term.drag_started()
+                                        || term.gained_focus()
+                                    {
+                                        acts.select = Some(i);
+                                    }
+                                    });
+                                });
+                                },
+                            );
+                            // セル内のどこを押しても (タイトル文字・各ボタン・
+                            // ミニターミナル含め) 紫枠のアクティブ選択が追従する。
+                            // contains_pointer は子ウィジェットに覆われていても
+                            // true になるだけでイベントは奪わないため、クリック
+                            // 自体は各ボタン・ターミナルがそのまま処理できる。
+                            if cell.response.clicked()
+                                || (cell.response.contains_pointer()
+                                    && ui.input(|i| i.pointer.primary_pressed()))
                             {
-                                launch = Some(i);
+                                acts.select = Some(i);
                             }
                         }
                     });
-                    return;
                 }
-
-                let spacing = 10.0;
-                let avail = ui.available_size();
-                // 編集ペインとの分割で幅が狭いときは 1 列に落とす
-                let cols = if n <= 1 || avail.x < 640.0 { 1 } else { 2 };
-                let rows = n.div_ceil(cols);
-                let cell_w = (avail.x - spacing * (cols as f32 - 1.0)) / cols as f32 - 4.0;
-                let cell_h = (((avail.y - spacing * (rows as f32 - 1.0)) / rows as f32) - 4.0)
-                    .max(150.0);
-                let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
-
-                egui::ScrollArea::vertical()
-                    .id_salt("cockpit-grid")
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        for row in 0..rows {
-                            ui.horizontal(|ui| {
-                                for col in 0..cols {
-                                    let i = row * cols + col;
-                                    if i >= n {
-                                        continue;
-                                    }
-                                    let active = i == self.agents.active;
-                                    let stroke = if active {
-                                        egui::Stroke::new(2.0_f32, theme.accent)
-                                    } else {
-                                        egui::Stroke::new(1.0_f32, theme.border)
-                                    };
-                                    // セル内の余白クリックでも選択できるようにする。
-                                    // egui のヒットテストは同一レイヤーでは「後に登録
-                                    // したウィジェット」が勝つため、描画後に全面
-                                    // ui.interact を掛けるとセル内のボタンやミニ
-                                    // ターミナルへのクリックをすべて奪ってしまう。
-                                    // UiBuilder::sense はコンテナの判定を子より先に
-                                    // 登録するので、余白クリックだけを拾える。
-                                    let cell = ui.scope_builder(
-                                        egui::UiBuilder::new()
-                                            .id_salt(("cockpit-cell-select", i))
-                                            .sense(egui::Sense::click()),
-                                        |ui| {
-                                    egui::Frame::none()
-                                        .fill(theme.panel_alt)
-                                        .stroke(stroke)
-                                        .rounding(egui::Rounding::same(8.0))
-                                        .inner_margin(egui::Margin::same(8.0))
-                                        .show(ui, |ui| {
-                                            // Frame は親 (horizontal な行) のレイアウトを
-                                            // 継承するため、明示的に縦積みへ切り替える。
-                                            // これが無いとヘッダーとターミナルが横に並び
-                                            // 画面外へはみ出す。
-                                            ui.vertical(|ui| {
-                                            ui.set_width(cell_w - 18.0);
-                                            ui.set_height(cell_h - 18.0);
-                                            let s = &mut self.agents.sessions[i];
-                                            let sid = s.id;
-                                            ui.horizontal(|ui| {
-                                                let dot = if s.running() {
-                                                    if s.attention {
-                                                        RichText::new("●").color(theme.warn)
-                                                    } else {
-                                                        RichText::new("●").color(theme.ok)
-                                                    }
-                                                } else {
-                                                    RichText::new("○").color(theme.err)
-                                                };
-                                                ui.label(dot);
-                                                let badge = if s.is_permission_agent() {
-                                                    s.approval_badge()
-                                                } else {
-                                                    ""
-                                                };
-                                                ui.label(
-                                                    RichText::new(format!(
-                                                        "{}{} {}",
-                                                        badge, s.icon, s.title
-                                                    ))
-                                                    .strong()
-                                                    .color(theme.text),
-                                                );
-                                                if s.has_unread() && !active {
-                                                    ui.label(
-                                                        RichText::new("◆")
-                                                            .size(9.0)
-                                                            .color(theme.accent),
-                                                    )
-                                                    .on_hover_text(tr(
-                                                        "最後に見てから新しい出力があります",
-                                                    ));
-                                                }
-                                                if let Some(line) = &s.rate_limited {
-                                                    ui.label(
-                                                        RichText::new("⏳")
-                                                            .color(theme.warn),
-                                                    )
-                                                    .on_hover_text(trf(
-                                                        "レート制限/使用上限: {line}",
-                                                        &[("line", line.clone())],
-                                                    ));
-                                                }
-                                                ui.label(
-                                                    RichText::new(s.uptime())
-                                                        .size(10.5)
-                                                        .color(theme.text_dim),
-                                                );
-                                                let permission_hint = s.permission_switch_hint();
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        if ui
-                                                            .small_button("✕")
-                                                            .on_hover_text(tr("閉じる"))
-                                                            .clicked()
-                                                        {
-                                                            remove = Some(i);
-                                                        }
-                                                        if ui
-                                                            .small_button("⟳")
-                                                            .on_hover_text(tr("再起動"))
-                                                            .clicked()
-                                                        {
-                                                            restart = Some(i);
-                                                        }
-                                                        if let Some(hint) = permission_hint {
-                                                            if ui
-                                                                .small_button("🛡")
-                                                                .on_hover_text(hint)
-                                                                .clicked()
-                                                            {
-                                                                cycle = Some(i);
-                                                            }
-                                                        }
-                                                        if ui
-                                                            .small_button("🔍")
-                                                            .on_hover_text(tr(
-                                                                "下部パネルにフォーカス",
-                                                            ))
-                                                            .clicked()
-                                                        {
-                                                            focus = Some(i);
-                                                        }
-                                                        if ui
-                                                            .small_button(
-                                                                if self.voice.target == voice::Target::Session(sid)
-                                                                    && self.voice.session.is_some()
-                                                                {
-                                                                    "🔴"
-                                                                } else {
-                                                                    "🎤"
-                                                                },
-                                                            )
-                                                            .on_hover_text(tr(
-                                                                "このエージェントへ音声入力\n\
-                                                                 話した内容がこのタブの入力欄に入ります。\n\
-                                                                 送信されないので、確認して Enter を押してください",
-                                                            ))
-                                                            .clicked()
-                                                        {
-                                                            voice = Some(sid);
-                                                            select = Some(i);
-                                                        }
-                                                    },
-                                                );
-                                            });
-                                            let term = terminal::draw(
-                                                ui, s, &theme, mini_font, true, true, false,
-                                            );
-                                            // ミニターミナルをクリックして入力を始めた
-                                            // セッションへ、アクティブ (紫枠) を追従させる。
-                                            if term.clicked()
-                                                || term.drag_started()
-                                                || term.gained_focus()
-                                            {
-                                                select = Some(i);
-                                            }
-                                            });
-                                        });
-                                        },
-                                    );
-                                    // セル内のどこを押しても (タイトル文字・各ボタン・
-                                    // ミニターミナル含め) 紫枠のアクティブ選択が追従する。
-                                    // contains_pointer は子ウィジェットに覆われていても
-                                    // true になるだけでイベントは奪わないため、クリック
-                                    // 自体は各ボタン・ターミナルがそのまま処理できる。
-                                    if cell.response.clicked()
-                                        || (cell.response.contains_pointer()
-                                            && ui.input(|i| i.pointer.primary_pressed()))
-                                    {
-                                        select = Some(i);
-                                    }
-                                }
-                            });
-                        }
-                    });
             });
+    }
 
-        if let Some(text) = broadcast {
+    /// Cockpit 描画後に、記録されたアクションを self へ反映する
+    /// (クロージャを閉じた後に適用するのが app.rs の作法)。
+    fn apply_cockpit_actions(
+        &mut self,
+        ctx: &egui::Context,
+        theme: &Theme,
+        orch_rows: &[orchestration::SessionRow],
+        acts: CockpitActions,
+        mut orch_acts: Vec<orchestration::OrchAction>,
+    ) {
+        if let Some(text) = acts.broadcast {
             self.agents.broadcast(&text);
             self.toast(
                 trf(
@@ -5908,19 +5962,19 @@ impl ZaivernApp {
                 true,
             );
         }
-        if voice_stop {
+        if acts.voice_stop {
             self.stop_voice();
         }
-        if let Some(id) = voice {
+        if let Some(id) = acts.voice {
             self.apply_cmd(Cmd::VoiceInput(voice::Target::Session(id)), ctx);
         }
-        if voice_all {
+        if acts.voice_all {
             self.apply_cmd(Cmd::VoiceInput(voice::Target::Broadcast), ctx);
         }
-        if cycle_all {
+        if acts.cycle_all {
             self.apply_cmd(Cmd::CyclePermissionAll, ctx);
         }
-        if let Some(i) = cycle {
+        if let Some(i) = acts.cycle {
             match self.agents.cycle_permission(i) {
                 Some(hint) => self.toast_warn(trf(
                     "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）",
@@ -5929,23 +5983,23 @@ impl ZaivernApp {
                 None => self.toast(tr("このセッションは権限モード切替に未対応です"), false),
             }
         }
-        if let Some(i) = launch {
+        if let Some(i) = acts.launch {
             self.launch_preset(i, ctx);
         }
-        if let Some(i) = select {
+        if let Some(i) = acts.select {
             if i < self.agents.sessions.len() {
                 self.agents.active = i;
             }
         }
-        if let Some(i) = focus {
+        if let Some(i) = acts.focus {
             self.apply_cmd(Cmd::FocusAgent(i), ctx);
         }
-        if let Some(i) = restart {
+        if let Some(i) = acts.restart {
             if let Err(e) = self.agents.restart(i, ctx) {
                 self.toast(e, false);
             }
         }
-        if let Some(i) = remove {
+        if let Some(i) = acts.remove {
             self.agents.remove(i);
         }
         // タスク作成 / メッセージ送信のフォームと、押されたボタンの適用。
@@ -5954,14 +6008,14 @@ impl ZaivernApp {
         orch_acts.extend(orchestration::task_form_ui(
             &mut self.orch,
             ctx,
-            &theme,
-            &orch_rows,
+            theme,
+            orch_rows,
         ));
         orch_acts.extend(orchestration::message_form_ui(
             &mut self.orch,
             ctx,
-            &theme,
-            &orch_rows,
+            theme,
+            orch_rows,
         ));
         // 指示の宛先で特定のエージェントを選んだら (または送ったら)、
         // そのセッションへアクティブ (紫枠) を移す。
@@ -5998,7 +6052,7 @@ impl ZaivernApp {
 
         // 監視役 LLM の変更を反映する (閉じた後に適用するのが app.rs の作法)。
         let mut super_changed = false;
-        if let Some((cmd, title)) = super_pick {
+        if let Some((cmd, title)) = acts.super_pick {
             // 「なし」を選んだら相談自体を止める。エージェントを選んだ場合は、
             // わざわざもう 1 か所チェックを入れさせない。
             self.cfg.super_agent.enabled = !cmd.is_empty();
@@ -6006,7 +6060,7 @@ impl ZaivernApp {
             self.cfg.super_agent.session_title = title;
             super_changed = true;
         }
-        if let Some(en) = super_enabled {
+        if let Some(en) = acts.super_enabled {
             self.cfg.super_agent.enabled = en;
             super_changed = true;
         }
