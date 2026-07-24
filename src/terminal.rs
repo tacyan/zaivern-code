@@ -225,6 +225,14 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
     if text.contains("trust the files in this folder") {
         return Some((b"\r", "フォルダ信頼確認に「Yes」"));
     }
+    // Codex TUI の承認画面。Claude 系とは質問文と選択カーソルが異なるため、
+    // 明示的な承認文 + Yes 選択肢の組み合わせで判定し、ショートカット y を送る。
+    let codex_approval = text.contains("Would you like to run")
+        || text.contains("needs your approval")
+        || text.contains("Do you want to approve network access");
+    if codex_approval && (text.contains("1. Yes") || text.contains("Yes, proceed")) {
+        return Some((b"y", "Codexの承認に「Yes」"));
+    }
     // 選択カーソルが Yes の上にある一般的な確認 → Enter で確定。
     if text.contains("❯ 1. Yes") {
         return Some((b"\r", "「Yes」"));
@@ -244,9 +252,12 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
 
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
 /// auto_yes_reply だけが分類する特殊プロンプトも含める。
-const SIG_MARKS: [&str; 10] = [
+const SIG_MARKS: [&str; 13] = [
     "Do you want",
     "Would you like to proceed",
+    "Would you like to run",
+    "needs your approval",
+    "Do you want to approve network access",
     "❯ 1. Yes",
     "1. Yes",
     "(y/n)",
@@ -1253,9 +1264,28 @@ mod tests {
     }
 
     #[test]
+    fn codex_command_approval_sends_yes_shortcut() {
+        let screen = "Would you like to run the following command?\n\
+                      $ cargo test\n\
+                      › 1. Yes, proceed (y)\n\
+                        2. Yes, and don't ask again for commands that start with `cargo test`";
+        let (bytes, _) = auto_yes_reply(screen).unwrap();
+        assert_eq!(bytes, b"y");
+    }
+
+    #[test]
+    fn codex_network_approval_sends_yes_shortcut() {
+        let screen = "Do you want to approve network access to \"crates.io\"?\n\
+                      › 1. Yes\n  2. No";
+        let (bytes, _) = auto_yes_reply(screen).unwrap();
+        assert_eq!(bytes, b"y");
+    }
+
+    #[test]
     fn plain_output_is_not_a_prompt() {
         // 質問文なしの番号リスト(通常の出力)には反応しない
         assert!(auto_yes_reply("手順:\n1. Yes と入力\n2. 実行").is_none());
+        assert!(auto_yes_reply("Codex needs your approval before deployment.").is_none());
         assert!(auto_yes_reply("ビルドが完了しました").is_none());
     }
 
