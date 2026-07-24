@@ -822,6 +822,12 @@ impl AgentManager {
             return;
         }
         self.sessions.remove(i);
+        // active より左を閉じたら、フォーカス中セッションが左へ1つ詰まるので
+        // active も詰める(でないとキーボード/リモート入力が隣のセッションへ流れる)。
+        // i == active が最右のときは下のクランプが左隣へ寄せる(従来挙動のまま)。
+        if i < self.active {
+            self.active -= 1;
+        }
         if self.active >= self.sessions.len() && !self.sessions.is_empty() {
             self.active = self.sessions.len() - 1;
         }
@@ -1311,6 +1317,114 @@ mod tests {
             assert!(env_enables_auto(bin, &auto), "{} は Auto で全自動になるべき", bin);
             let ask = merged_env(bin, Approval::Ask, &empty);
             assert!(!env_enables_auto(bin, &ask), "{} は Ask で全自動になってはいけない", bin);
+        }
+    }
+
+    // ---- remove() の active 保存 ----
+    // Session は PTY 上の実プロセスが要るため、terminal.rs の pty_tests と同じく
+    // Session::spawn で /bin/sleep を起動して組み立てる (unix 限定)。
+    #[cfg(unix)]
+    mod remove_active {
+        use crate::agents::AgentManager;
+        use crate::terminal::{Session, SpawnSpec};
+        use eframe::egui;
+        use std::collections::HashMap;
+
+        /// n 本の実セッション (id は 1..=n) を持つマネージャを作る。
+        fn mgr(n: usize) -> AgentManager {
+            let mut m = AgentManager::new();
+            for i in 0..n {
+                let spec = SpawnSpec {
+                    title: format!("s{}", i + 1),
+                    preset_name: "t".into(),
+                    icon: "t".into(),
+                    command: "/bin/sleep 30".into(),
+                    cwd: std::env::temp_dir(),
+                    env: HashMap::new(),
+                    log_path: None,
+                };
+                let s = Session::spawn(i as u64 + 1, spec, egui::Context::default())
+                    .expect("テスト用セッションの起動に失敗");
+                m.sessions.push(s);
+            }
+            m
+        }
+
+        /// app.rs の閉じる経路と同じく、殺してから取り除く。
+        fn close(m: &mut AgentManager, i: usize) {
+            m.sessions[i].kill();
+            m.remove(i);
+        }
+
+        fn kill_all(m: &mut AgentManager) {
+            for s in m.sessions.iter_mut() {
+                s.kill();
+            }
+        }
+
+        #[test]
+        fn closing_left_of_active_keeps_same_session_focused() {
+            // [1,2,3] active=2(id3) → 左端を閉じても id3 を指し続ける
+            let mut m = mgr(3);
+            m.active = 2;
+            close(&mut m, 0);
+            let (active, id) = (m.active, m.sessions[m.active].id);
+            kill_all(&mut m);
+            assert_eq!(active, 1, "active は1つ左へ詰まる");
+            assert_eq!(id, 3, "フォーカス中のセッションがすり替わってはいけない");
+        }
+
+        #[test]
+        fn closing_active_middle_moves_to_right_neighbor() {
+            // [1,2,3] active=1(id2) → 自分を閉じたら据え置きで右隣 id3 へ
+            let mut m = mgr(3);
+            m.active = 1;
+            close(&mut m, 1);
+            let (active, id) = (m.active, m.sessions[m.active].id);
+            kill_all(&mut m);
+            assert_eq!(active, 1);
+            assert_eq!(id, 3, "中間の active を閉じたら右隣へ移る");
+        }
+
+        #[test]
+        fn closing_active_rightmost_clamps_to_left_neighbor() {
+            // [1,2,3] active=2(id3) → 最右の自分を閉じたら左隣 id2 へクランプ
+            let mut m = mgr(3);
+            m.active = 2;
+            close(&mut m, 2);
+            let (active, id) = (m.active, m.sessions[m.active].id);
+            kill_all(&mut m);
+            assert_eq!(active, 1);
+            assert_eq!(id, 2, "最右の active を閉じたら左隣へ移る");
+        }
+
+        #[test]
+        fn closing_right_of_active_leaves_active_untouched() {
+            // [1,2,3] active=0(id1) → 右を閉じても active 不変
+            let mut m = mgr(3);
+            m.active = 0;
+            close(&mut m, 2);
+            let (active, id) = (m.active, m.sessions[m.active].id);
+            kill_all(&mut m);
+            assert_eq!(active, 0);
+            assert_eq!(id, 1);
+        }
+
+        #[test]
+        fn closing_everything_never_leaves_active_out_of_bounds() {
+            // 先頭から全部閉じても active が範囲外を指さない
+            let mut m = mgr(3);
+            m.active = 2;
+            while !m.sessions.is_empty() {
+                close(&mut m, 0);
+                assert!(
+                    m.sessions.is_empty() || m.active < m.sessions.len(),
+                    "active={} len={}",
+                    m.active,
+                    m.sessions.len()
+                );
+            }
+            assert!(m.active_session().is_none(), "空なら active_session は None");
         }
     }
 }
