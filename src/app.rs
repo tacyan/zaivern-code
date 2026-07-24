@@ -1335,6 +1335,8 @@ impl ZaivernApp {
         };
         let title = {
             let s = &mut self.agents.sessions[i];
+            // 明示的な送り込みはユーザーの応答扱い (承認エピソードを解決する)
+            s.note_user_input();
             s.write_bytes(payload.as_bytes());
             s.title.clone()
         };
@@ -2280,6 +2282,7 @@ impl ZaivernApp {
 
     fn send_to_agent(&mut self, text: String) {
         if let Some(s) = self.agents.active_session() {
+            s.note_user_input();
             s.write_bytes(text.as_bytes());
             self.agents.panel_open = true;
             self.toast(tr("アクティブなエージェントに送信しました"), true);
@@ -7061,6 +7064,10 @@ impl ZaivernApp {
         let sent = match dest {
             Some(id) => match self.agents.sessions.iter_mut().find(|s| s.id == id) {
                 Some(s) if s.running() => {
+                    // 音声もユーザーの応答扱い。ただし user_typed を立てると
+                    // 音声側が自分の書き込みを「手入力」と誤認して live 追跡を
+                    // 捨ててしまうため、承認エピソードの解決だけを行う。
+                    s.resolve_attention();
                     s.write_bytes(&out);
                     Some(s.title.clone())
                 }
@@ -7074,6 +7081,7 @@ impl ZaivernApp {
                     // ブロードキャストは Enter 込みの broadcast() を使わず、
                     // 書き込みのみ / 送信ありを自分で選ぶ
                     for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
+                        s.resolve_attention();
                         s.write_bytes(&out);
                     }
                     Some(trf("{n} セッション", &[("n", n.to_string())]))
@@ -7517,6 +7525,8 @@ impl ZaivernApp {
                             .to_string();
                     }
                     for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
+                        // リモートからの手動送信もユーザーの応答扱い
+                        s.note_user_input();
                         s.write_bytes(payload.as_bytes());
                     }
                     self.toast(
@@ -7540,6 +7550,7 @@ impl ZaivernApp {
                         .find(|s| s.id == *id as u64)
                     {
                         Some(s) if s.running() => {
+                            s.note_user_input();
                             s.write_bytes(payload.as_bytes());
                             let title = s.title.clone();
                             self.toast(format!("🎤 {title} {verb}: {text}"), true);
@@ -7557,6 +7568,8 @@ impl ZaivernApp {
             }
             remote::Query::TermInput(payload, raw) => match self.agents.active_session() {
                 Some(s) if s.running() => {
+                    // スマホの端末キー/入力欄 = 手入力。承認エピソードを解決する
+                    s.note_user_input();
                     if *raw {
                         s.write_bytes(payload.as_bytes());
                     } else {
