@@ -1500,7 +1500,14 @@ impl Supervisor {
         // --- はしごを昇る ---
         let mut intents = Vec::new();
         let active: HashSet<Anomaly> = found.iter().map(|(a, _)| *a).collect();
-        mon.escalation.retain(|k, _| active.contains(k));
+        // 間欠的にフラつく異常 (境界を跨いで揺れる Runaway 等) が 1 tick の
+        // 検出漏れで since_ms/step を失うと、escalate_after に永遠に届かない。
+        // last_seen_ms から一定の猶予内は状態を保持する。
+        const ESCALATION_GRACE_MS: u64 = 30_000;
+        mon.escalation.retain(|k, e| {
+            active.contains(k)
+                || now_ms.saturating_sub(e.last_seen_ms) < ESCALATION_GRACE_MS
+        });
 
         for (anomaly, reason) in &found {
             // 借用を跨がないよう、いったん値として取り出してから書き戻す
@@ -1524,8 +1531,10 @@ impl Supervisor {
                 cfg.escalate_after_secs.saturating_mul(1000)
             };
 
+            // 段は「実際に意図を出せたとき」だけ進める。先に進めると
+            // cooldown やレート制限で make_intent が None の場合に、その段の
+            // 通知/介入が永久にスキップされてしまう (次 tick で再試行させる)。
             if esc.step == 0 && held >= notify_at {
-                esc.step = 1;
                 if let Some(i) = Self::make_intent(
                     mon,
                     snap,
@@ -1537,10 +1546,10 @@ impl Supervisor {
                     now_ms,
                 ) {
                     intents.push(i);
+                    esc.step = 1;
                 }
             }
             if esc.step == 1 && held >= escalate_at {
-                esc.step = 2;
                 let action = anomaly.desired_action();
                 let payload = match action {
                     Intervention::Nudge => Some(cfg.nudge_text.clone()),
@@ -1559,6 +1568,7 @@ impl Supervisor {
                 ) {
                     i.payload = payload;
                     intents.push(i);
+                    esc.step = 2;
                 }
             }
             mon.escalation.insert(*anomaly, esc);

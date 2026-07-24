@@ -81,8 +81,12 @@ pub enum Event {
     Partial(String),
     /// 確定テキスト
     Final(String),
-    /// エラー (ユーザーに見せる文言)
+    /// エラー (ユーザーに見せる文言)。録音は終了する。
     Error(String),
+    /// 警告 (ユーザーに見せるが録音は続ける)。stderr 由来のノイズは
+    /// CoreAudio 等が無害な 1 行を吐くことがあり、致命扱いすると
+    /// その瞬間に録音が止まってしまう。
+    Warning(String),
     /// プロセスが終了した
     Ended,
 }
@@ -346,7 +350,9 @@ pub fn start(
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                     if first && !line.trim().is_empty() {
                         first = false;
-                        let _ = t.send(Event::Error(line));
+                        // stderr は警告どまり: 認識が本当に死んだなら stdout の
+                        // "E " 行か Ended で別途伝わる
+                        let _ = t.send(Event::Warning(line));
                         c.request_repaint();
                     }
                 }

@@ -376,10 +376,18 @@ pub fn apply_action(
         OrchAction::Retry(tid) => {
             let cands = candidates(rows);
             match co.redispatch(tid, &cands, ReassignReason::Manual, now) {
-                Ok(sid) => eff.ok(trf(
-                    "📋 タスク #{tid} を {name} へ渡し直しました",
-                    &[("tid", tid.to_string()), ("name", row_label(rows, sid))],
-                )),
+                Ok((sid, outcome)) => {
+                    eff.ok(trf(
+                        "📋 タスク #{tid} を {name} へ渡し直しました",
+                        &[("tid", tid.to_string()), ("name", row_label(rows, sid))],
+                    ));
+                    if let SendOutcome::Dropped { reason } = outcome {
+                        eff.warn(trf(
+                            "タスク #{tid} の引き継ぎ本文を送れませんでした: {reason}",
+                            &[("tid", tid.to_string()), ("reason", tr(&reason.label()))],
+                        ));
+                    }
+                }
                 Err(r) => eff.warn(trf(
                     "📋 タスク #{tid} の再割り当てを断りました: {reason}",
                     &[("tid", tid.to_string()), ("reason", tr(&r.label()))],
@@ -504,7 +512,7 @@ pub fn redispatch_ready(
         };
 
         match co.redispatch(tid, &cands, reason, now) {
-            Ok(sid) => {
+            Ok((sid, outcome)) => {
                 st.escalated.remove(&tid);
                 eff.warn(trf(
                     "🔁 タスク #{tid} を {name} へ引き継ぎました ({reason})",
@@ -514,6 +522,12 @@ pub fn redispatch_ready(
                         ("reason", tr(reason.label())),
                     ],
                 ));
+                if let SendOutcome::Dropped { reason } = outcome {
+                    eff.warn(trf(
+                        "タスク #{tid} の引き継ぎ本文を送れませんでした: {reason}",
+                        &[("tid", tid.to_string()), ("reason", tr(&reason.label()))],
+                    ));
+                }
             }
             Err(AssignRefusal::PreviousHolderNotStopped { previous }) => {
                 // 順序が崩れている。回避せず、そのまま見せて止まる。

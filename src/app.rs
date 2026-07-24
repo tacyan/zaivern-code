@@ -547,6 +547,9 @@ pub struct ZaivernApp {
     /// 指揮官の出力から通知済みの指示ハッシュ (二重通知を防ぐ。有界)。
     /// 指揮官セッションは `super_agent_session` を使う。
     commander_seen: HashSet<u64>,
+    /// commander_seen の挿入順 (上限到達時に古い方から追い出すため)。
+    /// 丸ごと clear すると画面に残っている指示が全部再通知される。
+    commander_seen_order: std::collections::VecDeque<u64>,
 
     /// エージェントのタブをクリックして選び直したとき、次にアクティブ端末を
     /// 描くフレームでキーボードフォーカスを移すための予約フラグ。
@@ -850,6 +853,7 @@ impl ZaivernApp {
             super_agent_session: None,
             sup_last_diag: HashMap::new(),
             commander_seen: HashSet::new(),
+            commander_seen_order: std::collections::VecDeque::new(),
             term_focus_pending: false,
             cfg,
         };
@@ -8446,6 +8450,10 @@ impl ZaivernApp {
                     self.toast(format!("🎤 {e}"), false);
                     ended = true;
                 }
+                voice::Event::Warning(e) => {
+                    // stderr のノイズ等。見せるだけで録音は続ける
+                    self.toast(format!("🎤 {e}"), false);
+                }
                 voice::Event::Ended => ended = true,
             }
         }
@@ -9320,8 +9328,18 @@ impl ZaivernApp {
             .find(|s| s.id == cmd_id)
             .map(|s| crate::lockx::lock_ok(&s.parser).screen().contents())
             .unwrap_or_default();
-        if self.commander_seen.len() > 512 {
-            self.commander_seen.clear();
+        // 上限は古い方から追い出す (全消しすると画面に残っている @指示が
+        // もう一度全部通知されてしまう)
+        while self.commander_seen.len() > 512 {
+            match self.commander_seen_order.pop_front() {
+                Some(old) => {
+                    self.commander_seen.remove(&old);
+                }
+                None => {
+                    self.commander_seen.clear();
+                    break;
+                }
+            }
         }
         let titles: Vec<String> = self
             .agents
@@ -9334,6 +9352,7 @@ impl ZaivernApp {
             if !self.commander_seen.insert(d.hash) {
                 continue; // 既に通知済み (画面に残っているだけ)
             }
+            self.commander_seen_order.push_back(d.hash);
             // 宛先が実在しない @mention の誤爆は従来どおり黙って捨てる。
             let Some(text) = commander_notice(&d, &titles) else {
                 continue;
@@ -9364,6 +9383,7 @@ impl ZaivernApp {
         // 指名が変わったので、指揮の作業状態は sync 側で必ずやり直させる。
         self.super_agent_session = None;
         self.commander_seen.clear();
+        self.commander_seen_order.clear();
         self.sync_super_agent_session();
     }
 
@@ -9395,6 +9415,7 @@ impl ZaivernApp {
         if id != self.super_agent_session {
             self.super_agent_session = id;
             self.commander_seen.clear();
+            self.commander_seen_order.clear();
         }
     }
 

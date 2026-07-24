@@ -427,8 +427,10 @@ pub struct Delivery {
 fn sanitize_body(body: &str) -> String {
     let mut out = String::with_capacity(body.len().min(INJECT_BODY_MAX) + 8);
     let mut pending_break = false;
+    // 文字数は自前で数える (毎文字 out.chars().count() を呼ぶと O(n×上限))
+    let mut count = 0usize;
     for ch in body.chars() {
-        if out.chars().count() >= INJECT_BODY_MAX {
+        if count >= INJECT_BODY_MAX {
             out.push('…');
             break;
         }
@@ -442,10 +444,12 @@ fn sanitize_body(body: &str) -> String {
         if pending_break {
             if !out.is_empty() {
                 out.push_str(" / ");
+                count += 3;
             }
             pending_break = false;
         }
         out.push(ch);
+        count += 1;
     }
     out
 }
@@ -1228,6 +1232,12 @@ impl Coordinator {
         if s.chars().count() > CONTEXT_ITEM_MAX {
             s = s.chars().take(CONTEXT_ITEM_MAX).collect::<String>() + "…";
         }
+        // 同じメモの連続追加はしない。再割り当てが空振りし続けると同一の
+        // 「引き継ぎ」メモが 5 秒ごとに積まれ、前任者の本物の経過が
+        // CONTEXT_CAP から押し出されてしまう。
+        if t.context.last() == Some(&s) {
+            return;
+        }
         if t.context.len() >= CONTEXT_CAP {
             t.context.remove(0);
         }
@@ -1539,7 +1549,7 @@ impl Coordinator {
         candidates: &[SessionInfo],
         reason: ReassignReason,
         now: Instant,
-    ) -> Result<SessionId, AssignRefusal> {
+    ) -> Result<(SessionId, SendOutcome), AssignRefusal> {
         let previous = self.task(task_id).and_then(|t| t.assigned);
         let chosen = self.try_assign(task_id, candidates, now)?;
         if let Some(t) = self.task_mut(task_id) {
@@ -1553,9 +1563,10 @@ impl Coordinator {
                 },
             );
         }
-        // 引き継ぎ材料を新担当へ渡す。
-        self.queue_handoff(task_id, chosen, now);
-        Ok(chosen)
+        // 引き継ぎ材料を新担当へ渡す。Dropped (レート制限等) は呼び出し側が
+        // 警告できるよう結果ごと返す — 黙って握り潰すと新担当は何も知らされない。
+        let outcome = self.queue_handoff(task_id, chosen, now);
+        Ok((chosen, outcome))
     }
 
     /// ユーザーへ上げる。レート制限を通さずに直接積む(人を呼ぶ経路は塞がない)。
@@ -2210,7 +2221,7 @@ mod tests {
 
         c.note_exited(1, now); // 落ちた → 停止確認済み
         // 能力指定が無いので、空いている 3 が新担当になる(2 は作業中)。
-        let next = c
+        let (next, _) = c
             .redispatch(t, &cands(), ReassignReason::SessionDied, now)
             .expect("3 へ引き継ぐ");
         assert_eq!(next, 3);
