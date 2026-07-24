@@ -2730,6 +2730,106 @@ impl ZaivernApp {
 
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
+            Cmd::Save
+            | Cmd::SaveAs
+            | Cmd::CloseTab
+            | Cmd::OpenFileDialog
+            | Cmd::OpenRecentFolder(_)
+            | Cmd::OpenRecentFile(_)
+            | Cmd::ClearRecent
+            | Cmd::SaveAll
+            | Cmd::ToggleAutoSave
+            | Cmd::RevertFile
+            | Cmd::CloseAllTabs => self.apply_cmd_file(cmd, ctx),
+            Cmd::Undo
+            | Cmd::Redo
+            | Cmd::CutSelection
+            | Cmd::CopySelection
+            | Cmd::PasteClipboard
+            | Cmd::SelectAll
+            | Cmd::ToggleLineComment
+            | Cmd::DuplicateLine
+            | Cmd::MoveLineUp
+            | Cmd::MoveLineDown
+            | Cmd::OpenReplace => self.apply_cmd_edit(cmd, ctx),
+            Cmd::GlobalSearch
+            | Cmd::OpenCommandPalette
+            | Cmd::OpenFilePalette
+            | Cmd::ShowExplorer
+            | Cmd::ShowGitHubTab
+            | Cmd::ToggleProblems
+            | Cmd::ToggleFullScreen
+            | Cmd::NavBack
+            | Cmd::NavForward
+            | Cmd::NextTab
+            | Cmd::PrevTab
+            | Cmd::GoToDefinition
+            | Cmd::GoToBracket
+            | Cmd::GoToLine => self.apply_cmd_view_nav(cmd, ctx),
+            Cmd::RunActiveFile
+            | Cmd::RunBuildTask
+            | Cmd::RunSelection
+            | Cmd::NewTerminal
+            | Cmd::ShowShortcuts
+            | Cmd::ShowAbout
+            | Cmd::OpenInIde(_)
+            | Cmd::OpenFolderInIde(_)
+            | Cmd::NewFile
+            | Cmd::OpenFolder
+            | Cmd::AddFolder
+            | Cmd::AddFolderPath(_)
+            | Cmd::RemoveFolder(_) => self.apply_cmd_run_workspace(cmd, ctx),
+            Cmd::ToggleTerminal
+            | Cmd::ToggleCockpit
+            | Cmd::OpenAgentPicker
+            | Cmd::NewTask
+            | Cmd::SendAgentMessage
+            | Cmd::ToggleMdPreview
+            | Cmd::ToggleSidebar
+            | Cmd::OpenGitPanel
+            | Cmd::OpenFind
+            | Cmd::NewAgent(_)
+            | Cmd::FocusAgent(_)
+            | Cmd::RestartAgent
+            | Cmd::KillAgent => self.apply_cmd_agent(cmd, ctx),
+            Cmd::SetTheme(_)
+            | Cmd::OpenConfig
+            | Cmd::ReloadConfig
+            | Cmd::FontInc
+            | Cmd::FontDec
+            | Cmd::SendFileToAgent
+            | Cmd::RefreshTree
+            | Cmd::SetApproval(_)
+            | Cmd::TogglePet
+            | Cmd::CyclePermissionAll
+            | Cmd::SetPetImage
+            | Cmd::ResetPetImage
+            | Cmd::ResetPetPos
+            | Cmd::SetPetVariant(_)
+            | Cmd::SetPetScale(_)
+            | Cmd::TogglePetFreeRoam
+            | Cmd::TogglePetSleep
+            | Cmd::TogglePetSounds
+            | Cmd::TogglePetBubbles
+            | Cmd::TogglePetAutoYes
+            | Cmd::ToggleRemote => self.apply_cmd_settings(cmd, ctx),
+            Cmd::VoiceInput(_)
+            | Cmd::VoiceStop
+            | Cmd::SetVoiceTarget(_)
+            | Cmd::SetVoiceEngine(_)
+            | Cmd::SetVoiceLang(_)
+            | Cmd::SetVoiceKeyword(_)
+            | Cmd::NewPlugin
+            | Cmd::InstallPlugin
+            | Cmd::RescanPlugins
+            | Cmd::ShowPlugins
+            | Cmd::RunPlugin(_, _) => self.apply_cmd_voice_plugin(cmd, ctx),
+        }
+    }
+
+    /// `apply_cmd` のファイル/タブ操作カテゴリ (Cmd::Save 〜 Cmd::CloseAllTabs)。
+    fn apply_cmd_file(&mut self, cmd: Cmd, ctx: &egui::Context) {
+        match cmd {
             Cmd::Save => {
                 if self.save_active(false) {
                     self.persist_session();
@@ -2790,6 +2890,15 @@ impl ZaivernApp {
             }
             Cmd::RevertFile => self.revert_active(),
             Cmd::CloseAllTabs => self.close_all_tabs(),
+            _ => {}
+        }
+    }
+
+    /// `apply_cmd` の編集操作カテゴリ (Cmd::Undo 〜 Cmd::OpenReplace)。
+    // アーム本体は apply_cmd からの字句コピー (ガード化すると挙動境界が変わるため抑止)。
+    #[allow(clippy::collapsible_match)]
+    fn apply_cmd_edit(&mut self, cmd: Cmd, ctx: &egui::Context) {
+        match cmd {
             Cmd::Undo => {
                 self.push_editor_key(egui::Key::Z, egui::Modifiers::COMMAND, true);
             }
@@ -2818,6 +2927,15 @@ impl ZaivernApp {
                     self.find.replace_open = true;
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// `apply_cmd` の表示/パネル/ナビゲーションカテゴリ (Cmd::GlobalSearch 〜 Cmd::GoToLine)。
+    // アーム本体は apply_cmd からの字句コピー (ガード化すると挙動境界が変わるため抑止)。
+    #[allow(clippy::collapsible_match)]
+    fn apply_cmd_view_nav(&mut self, cmd: Cmd, ctx: &egui::Context) {
+        match cmd {
             Cmd::GlobalSearch => {
                 self.sidebar_open = true;
                 self.sidebar_tab = SidebarTab::Search;
@@ -2871,6 +2989,13 @@ impl ZaivernApp {
                     self.goto_input.clear();
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// `apply_cmd` の実行/IDE 連携/ワークスペースカテゴリ (Cmd::RunActiveFile 〜 Cmd::RemoveFolder)。
+    fn apply_cmd_run_workspace(&mut self, cmd: Cmd, ctx: &egui::Context) {
+        match cmd {
             Cmd::RunActiveFile => self.run_active_file(ctx),
             Cmd::RunBuildTask => self.run_build_task(ctx),
             Cmd::RunSelection => self.run_selection(ctx),
@@ -2947,6 +3072,13 @@ impl ZaivernApp {
                     }
                 }
             }
+            _ => {}
+        }
+    }
+
+    /// `apply_cmd` のエージェント/ターミナル/Cockpit カテゴリ (Cmd::ToggleTerminal 〜 Cmd::KillAgent)。
+    fn apply_cmd_agent(&mut self, cmd: Cmd, ctx: &egui::Context) {
+        match cmd {
             Cmd::ToggleTerminal => {
                 if self.agents.sessions.is_empty() && !self.agents.panel_open {
                     // 開くものがなければシェルを起動する
@@ -3023,6 +3155,13 @@ impl ZaivernApp {
                 let i = self.agents.active;
                 self.agents.remove(i);
             }
+            _ => {}
+        }
+    }
+
+    /// `apply_cmd` のテーマ/設定/ペットカテゴリ (Cmd::SetTheme 〜 Cmd::ToggleRemote)。
+    fn apply_cmd_settings(&mut self, cmd: Cmd, ctx: &egui::Context) {
+        match cmd {
             Cmd::SetTheme(name) => {
                 self.theme = resolve_theme(&name);
                 self.cfg.global_theme = name.clone();
@@ -3209,6 +3348,13 @@ impl ZaivernApp {
             Cmd::ToggleRemote => {
                 self.remote_open = !self.remote_open;
             }
+            _ => {}
+        }
+    }
+
+    /// `apply_cmd` の音声入力/プラグインカテゴリ (Cmd::VoiceInput 〜 Cmd::RunPlugin)。
+    fn apply_cmd_voice_plugin(&mut self, cmd: Cmd, ctx: &egui::Context) {
+        match cmd {
             Cmd::VoiceInput(target) => {
                 // 🎤 のトグル。録音中に押したら止める
                 if self.voice.session.is_some() {
@@ -3313,6 +3459,7 @@ impl ZaivernApp {
             Cmd::RunPlugin(pi, ci) => {
                 self.run_plugin_command(pi, ci, ctx);
             }
+            _ => {}
         }
     }
 
