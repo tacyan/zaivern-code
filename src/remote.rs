@@ -524,6 +524,154 @@ mod tests {
             assert!(p.contains("voiceFatal = false"));
         }
     }
+
+    // ─── Query の純粋ロジック ────────────────────────────────────────
+
+    /// 全 variant を代表値で 1 つずつ構築する (網羅テスト用)。
+    fn all_query_variants() -> Vec<Query> {
+        vec![
+            Query::State,
+            Query::File,
+            Query::Files,
+            Query::SetText {
+                text: "abc".into(),
+                index: 0,
+                save: false,
+            },
+            Query::Cmd("save".into(), 1),
+            Query::OpenFile("src/main.rs".into(), Some(10)),
+            Query::Notify("hello".into(), "info".into()),
+            Query::SetPanel {
+                plugin: "p".into(),
+                panel: "out".into(),
+                text: "t".into(),
+            },
+            Query::SetStatus("busy".into()),
+            Query::Prompt {
+                text: "fix it".into(),
+                agent: String::new(),
+                submit: false,
+            },
+            Query::Tab(2),
+            Query::Term,
+            Query::TermInput("ls".into(), false),
+            Query::VoiceSend {
+                text: "音声".into(),
+                id: -1,
+                submit: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn fire_and_forget_classification_covers_every_variant() {
+        // 期待値をワイルドカード無しの match で書く: variant を追加すると
+        // ここがコンパイルエラーになり、分類の見直しを強制できる
+        for q in all_query_variants() {
+            let expected = match &q {
+                // 現在の状態を読む要求 (+ 状態を返す必要がある操作) は応答を待つ
+                Query::State
+                | Query::File
+                | Query::Files
+                | Query::SetText { .. }
+                | Query::Tab(..)
+                | Query::Term
+                | Query::VoiceSend { .. } => false,
+                // 一方向の指示はキューに積んだ時点で成功 (macOS 凍結対策)
+                Query::Notify(..)
+                | Query::SetPanel { .. }
+                | Query::SetStatus(..)
+                | Query::Prompt { .. }
+                | Query::OpenFile(..)
+                | Query::Cmd(..)
+                | Query::TermInput(..) => true,
+            };
+            assert_eq!(q.is_fire_and_forget(), expected);
+        }
+    }
+
+    #[test]
+    fn state_reading_queries_wait_for_reply() {
+        // State/File/Files/Term は実際の値が必要なので即答してはいけない
+        assert!(!Query::State.is_fire_and_forget());
+        assert!(!Query::File.is_fire_and_forget());
+        assert!(!Query::Files.is_fire_and_forget());
+        assert!(!Query::Term.is_fire_and_forget());
+        assert!(!Query::Tab(0).is_fire_and_forget());
+    }
+
+    #[test]
+    fn one_way_commands_are_fire_and_forget() {
+        assert!(Query::Notify("n".into(), "warn".into()).is_fire_and_forget());
+        assert!(Query::SetStatus(String::new()).is_fire_and_forget());
+        assert!(Query::Cmd("build".into(), 0).is_fire_and_forget());
+        assert!(Query::SetPanel {
+            plugin: String::new(),
+            panel: "log".into(),
+            text: "x".into(),
+        }
+        .is_fire_and_forget());
+    }
+
+    #[test]
+    fn set_text_always_waits_even_with_save() {
+        // タブ不一致なら拒否される (誤上書き防止) ので、結果を返す必要がある
+        for save in [false, true] {
+            let q = Query::SetText {
+                text: "body".into(),
+                index: 1,
+                save,
+            };
+            assert!(!q.is_fire_and_forget());
+        }
+    }
+
+    #[test]
+    fn voice_send_always_waits() {
+        // 挿入のみ / 送信あり / ブロードキャストのどれでも応答を待つ
+        for (id, submit) in [(0i64, false), (3, true), (-1, false), (-1, true)] {
+            let q = Query::VoiceSend {
+                text: "テスト".into(),
+                id,
+                submit,
+            };
+            assert!(!q.is_fire_and_forget());
+        }
+    }
+
+    #[test]
+    fn prompt_is_fire_and_forget_regardless_of_flags() {
+        // agent 指定や submit の有無で分類が変わらないこと
+        for (agent, submit) in [("", false), ("", true), ("claude", false), ("claude", true)] {
+            let q = Query::Prompt {
+                text: "p".into(),
+                agent: agent.into(),
+                submit,
+            };
+            assert!(q.is_fire_and_forget());
+        }
+    }
+
+    #[test]
+    fn term_input_is_fire_and_forget_for_text_and_raw() {
+        // テキスト+Enter (raw=false) も制御バイト列 (raw=true) も片道
+        assert!(Query::TermInput("echo hi".into(), false).is_fire_and_forget());
+        assert!(Query::TermInput("\x03".into(), true).is_fire_and_forget());
+    }
+
+    #[test]
+    fn open_file_is_fire_and_forget_with_and_without_line() {
+        assert!(Query::OpenFile("a.rs".into(), None).is_fire_and_forget());
+        assert!(Query::OpenFile("a.rs".into(), Some(42)).is_fire_and_forget());
+    }
+
+    #[test]
+    fn ack_is_fixed_queued_json_for_all_variants() {
+        // ack は variant によらず固定の JSON (スマホ側 JS が queued を見る)
+        for q in all_query_variants() {
+            assert_eq!(q.ack(), r#"{"ok":true,"queued":true}"#);
+        }
+    }
 }
 
 // ─── スマホ用ページ (完全内蔵・依存ゼロ) ─────────────────────────────
