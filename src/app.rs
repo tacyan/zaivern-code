@@ -6895,311 +6895,336 @@ impl ZaivernApp {
         let mut items: Vec<Item> = Vec::new();
 
         if self.palette.is_command_mode() {
-            let mut cmds: Vec<(String, String, String, Cmd)> = vec![
-                ("💾".into(), tr("保存"), "⌘S".into(), Cmd::Save),
-                ("💾".into(), tr("名前を付けて保存"), "⌘⇧S".into(), Cmd::SaveAs),
-                ("📄".into(), tr("新規ファイル"), "⌘N".into(), Cmd::NewFile),
-                ("📂".into(), tr("フォルダを開く…"), String::new(), Cmd::OpenFolder),
-                ("📚".into(), tr("フォルダをワークスペースに追加"), String::new(), Cmd::AddFolder),
-                ("❌".into(), tr("タブを閉じる"), "⌘W".into(), Cmd::CloseTab),
-                ("🔍".into(), tr("ファイル内検索"), "⌘F".into(), Cmd::OpenFind),
-                ("🖥".into(), tr("ターミナル表示切替"), "⌘J".into(), Cmd::ToggleTerminal),
-                ("🎛".into(), tr("Cockpit 切替"), "⌘⇧C".into(), Cmd::ToggleCockpit),
-                (
-                    "➕".into(),
-                    tr("エージェントを追加 (対応 CLI の一覧から選ぶ)"),
-                    String::new(),
-                    Cmd::OpenAgentPicker,
-                ),
-                ("📋".into(), tr("タスクを作成してエージェントに割り当て"), String::new(), Cmd::NewTask),
-                ("📮".into(), tr("エージェントへメッセージを送る"), String::new(), Cmd::SendAgentMessage),
-                ("👁".into(), tr("Markdown/HTML プレビュー切替"), "⌘⇧V".into(), Cmd::ToggleMdPreview),
-                ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),
-                ("🌿".into(), tr("Git パネルを開く"), String::new(), Cmd::OpenGitPanel),
-                (
-                    "👾".into(),
-                    tr("現在のファイルをエージェントに送信 (@path)"),
-                    String::new(),
-                    Cmd::SendFileToAgent,
-                ),
-                ("⟳".into(), tr("アクティブなエージェントを再起動"), String::new(), Cmd::RestartAgent),
-                ("🗑".into(), tr("アクティブなエージェントを終了"), String::new(), Cmd::KillAgent),
-                ("⚙".into(), tr("設定 config.toml を開く"), String::new(), Cmd::OpenConfig),
-                ("🔄".into(), tr("設定を再読み込み"), String::new(), Cmd::ReloadConfig),
-                ("🔠".into(), tr("フォント拡大"), "⌘+".into(), Cmd::FontInc),
-                ("🔠".into(), tr("フォント縮小"), "⌘-".into(), Cmd::FontDec),
-                ("🌲".into(), tr("ファイルツリー再読み込み"), String::new(), Cmd::RefreshTree),
-                (
-                    "🛡".into(),
-                    tr("承認モード: 毎回ユーザー承認 (Claude/Codex/Antigravity)"),
-                    String::new(),
-                    Cmd::SetApproval("ask".into()),
-                ),
-                (
-                    "⚡".into(),
-                    tr("承認モード: 全自動 YES (Claude/Codex/Antigravity)"),
-                    String::new(),
-                    Cmd::SetApproval("auto".into()),
-                ),
-                (
-                    "👾".into(),
-                    tr("承認モード: Agent欄優先 (プリセットのコマンドどおり)"),
-                    String::new(),
-                    Cmd::SetApproval("agent".into()),
-                ),
-                ("🐾".into(), tr("ペット表示切替"), String::new(), Cmd::TogglePet),
-                (
-                    "📱".into(),
-                    tr("スマホリモート (QR コード表示)"),
-                    String::new(),
-                    Cmd::ToggleRemote,
-                ),
-                (
-                    "🎤".into(),
-                    tr("音声入力: 全エージェントの入力欄へ (送信は自分で Enter)"),
-                    String::new(),
-                    Cmd::VoiceInput(voice::Target::Broadcast),
-                ),
-                (
-                    "🛡".into(),
-                    tr("実行中の全エージェントの権限モードを切替"),
-                    String::new(),
-                    Cmd::CyclePermissionAll,
-                ),
-                ("🖼".into(), tr("ペット画像を変更…"), String::new(), Cmd::SetPetImage),
-                ("↺".into(), tr("ペット画像を既定に戻す"), String::new(), Cmd::ResetPetImage),
-                ("🐾".into(), tr("ペット位置を右下に戻す"), String::new(), Cmd::ResetPetPos),
-                // ── VS Code 準拠メニューバーのコマンド ──
-                ("📄".into(), tr("ファイルを開く…"), "⌘O".into(), Cmd::OpenFileDialog),
-                ("💾".into(), tr("すべて保存"), "⌥⌘S".into(), Cmd::SaveAll),
-                ("💾".into(), tr("自動保存の切替"), String::new(), Cmd::ToggleAutoSave),
-                ("↺".into(), tr("ファイルを元に戻す"), String::new(), Cmd::RevertFile),
-                ("🚪".into(), tr("すべてのエディターを閉じる"), String::new(), Cmd::CloseAllTabs),
-                ("🔎".into(), tr("ファイル間で検索"), "⇧⌘F".into(), Cmd::GlobalSearch),
-                ("⇄".into(), tr("置換"), "⌥⌘F".into(), Cmd::OpenReplace),
-                ("🧭".into(), tr("行/列へ移動…"), "⌃G".into(), Cmd::GoToLine),
-                ("🧭".into(), tr("定義へ移動"), "F12".into(), Cmd::GoToDefinition),
-                ("🧭".into(), tr("ブラケットへ移動"), "⇧⌘\\".into(), Cmd::GoToBracket),
-                ("⬅".into(), tr("戻る"), "⌃-".into(), Cmd::NavBack),
-                ("➡".into(), tr("進む"), "⌃⇧-".into(), Cmd::NavForward),
-                ("📑".into(), tr("次のエディター"), "⇧⌘]".into(), Cmd::NextTab),
-                ("📑".into(), tr("前のエディター"), "⇧⌘[".into(), Cmd::PrevTab),
-                ("🖥".into(), tr("新しいターミナル"), "⌃⇧`".into(), Cmd::NewTerminal),
-                ("▶".into(), tr("アクティブなファイルを実行"), String::new(), Cmd::RunActiveFile),
-                (
-                    "▶".into(),
-                    tr("選択したテキストをターミナルへ送る"),
-                    String::new(),
-                    Cmd::RunSelection,
-                ),
-                ("🔨".into(), tr("ビルド タスクの実行…"), "⇧⌘B".into(), Cmd::RunBuildTask),
-                ("⚠".into(), tr("問題パネルの切替"), "⇧⌘M".into(), Cmd::ToggleProblems),
-                ("🖥".into(), tr("フルスクリーンの切替"), "⌃⌘F".into(), Cmd::ToggleFullScreen),
-                ("🐙".into(), tr("GitHub パネルを開く"), String::new(), Cmd::ShowGitHubTab),
-                (
-                    "⌨".into(),
-                    tr("キーボード ショートカットのリファレンス"),
-                    String::new(),
-                    Cmd::ShowShortcuts,
-                ),
-                ("ℹ".into(), tr("バージョン情報"), String::new(), Cmd::ShowAbout),
-                ("➕".into(), tr("新規プラグインを作成…"), String::new(), Cmd::NewPlugin),
-                ("📦".into(), tr("プラグインをインストール… (.zvplug / .zip)"), String::new(), Cmd::InstallPlugin),
-                ("🔌".into(), tr("プラグインを表示"), String::new(), Cmd::ShowPlugins),
-                ("⟳".into(), tr("プラグインを再スキャン"), String::new(), Cmd::RescanPlugins),
-            ];
-            // 実際に検出できた外部 IDE だけを出す (検出は起動時にワーカーで走る)
-            for (icon, label, cmd) in panels::ide_palette_entries() {
-                cmds.push((icon, label, String::new(), cmd));
-            }
-            // 実行中のセッション毎に音声入力エントリを出す (パレットで「音声」検索用)
-            for s in self.agents.sessions.iter().take(20) {
-                cmds.push((
-                    "🎤".into(),
-                    trf(
-                        "音声入力: {icon} {title} の入力欄へ (送信は自分で Enter)",
-                        &[("icon", s.icon.clone()), ("title", s.title.clone())],
-                    ),
-                    String::new(),
-                    Cmd::VoiceInput(voice::Target::Session(s.id)),
-                ));
-            }
-            for t in theme::all() {
-                cmds.push((
-                    "🎨".into(),
-                    trf("テーマ: {label}", &[("label", t.label.clone())]),
-                    String::new(),
-                    Cmd::SetTheme(t.name.clone()),
-                ));
-            }
-            for (label, path) in self.custom_themes.iter().take(80) {
-                cmds.push((
-                    "🔌".into(),
-                    trf("テーマ (カスタム): {label}", &[("label", label.clone())]),
-                    String::new(),
-                    Cmd::SetTheme(path.clone()),
-                ));
-            }
-            for (pi, p) in self.plugins.iter().enumerate() {
-                for (ci, c) in p.commands.iter().enumerate() {
-                    cmds.push((
-                        c.icon.clone(),
-                        format!("{}: {}", p.name, c.title),
-                        c.keybind.clone().unwrap_or_default(),
-                        Cmd::RunPlugin(pi, ci),
-                    ));
-                }
-            }
-            // ルートが 2 つ以上のときだけ削除コマンドを出す
-            // (最後の 1 つは削除できない = roots は決して空にならない)
-            if self.roots.len() > 1 {
-                for r in &self.roots {
-                    cmds.push((
-                        "📂".into(),
-                        trf(
-                            "フォルダをワークスペースから削除: {name}",
-                            &[("name", root_name(r))],
-                        ),
-                        String::new(),
-                        Cmd::RemoveFolder(r.clone()),
-                    ));
-                }
-            }
-            for (i, p) in self.cfg.agents.iter().enumerate() {
-                cmds.push((
-                    p.icon.clone(),
-                    trf("エージェント起動: {name}", &[("name", p.name.clone())]),
-                    String::new(),
-                    Cmd::NewAgent(i),
-                ));
-            }
-            for (i, s) in self.agents.sessions.iter().enumerate() {
-                cmds.push((
-                    s.icon.clone(),
-                    trf("エージェントへ移動: {title}", &[("title", s.title.clone())]),
-                    String::new(),
-                    Cmd::FocusAgent(i),
-                ));
-            }
-            for (icon, label, detail, cmd) in cmds {
-                if let Some(score) = pq.score(&label) {
-                    items.push(Item {
-                        icon,
-                        label,
-                        detail,
-                        action: Action::Cmd(cmd),
-                        score,
-                    });
-                }
-            }
+            self.palette_items_command_mode(&pq, &mut items);
         } else if self.palette.is_agent_mode() {
-            // `@` — エージェントセッションへジャンプ / プリセット起動
-            for (i, s) in self.agents.sessions.iter().enumerate() {
-                let state = tr(if s.running() {
-                    if s.attention {
-                        "🔔 承認待ち"
-                    } else if s.rate_limited.is_some() {
-                        "⏳ レート制限"
-                    } else {
-                        "稼働中"
-                    }
-                } else {
-                    "終了"
-                });
-                let unread = if s.has_unread() { tr(" ◆未読") } else { String::new() };
-                if let Some(score) = pq.score(&s.title) {
-                    items.push(Item {
-                        icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
-                        label: s.title.clone(),
-                        detail: format!("{state}{unread} ・ {}", s.uptime()),
-                        action: Action::Cmd(Cmd::FocusAgent(i)),
-                        // 承認待ち・未読を上へ
-                        score: score
-                            + if s.attention { 40 } else { 0 }
-                            + if s.has_unread() { 20 } else { 0 },
-                    });
-                }
-            }
-            for (i, p) in self.cfg.agents.iter().enumerate() {
-                // 訳語のラベルに対して検索する (英語UIなら英語で当たるように)
-                let label = trf("起動: {name}", &[("name", p.name.clone())]);
-                if let Some(score) = pq.score(&label) {
-                    items.push(Item {
-                        icon: p.icon.clone(),
-                        label,
-                        detail: p.command.clone(),
-                        action: Action::Cmd(Cmd::NewAgent(i)),
-                        score: score - 50, // 既存セッションより下に出す
-                    });
-                }
-            }
+            self.palette_items_agent_mode(&pq, &mut items);
         } else if self.palette.is_root_mode() {
-            // `#` — ワークスペースルートと git worktree の横断
-            for r in &self.roots {
-                let label = trf(
-                    "フォルダを外す: {name}",
-                    &[("name", root_name(r).to_string())],
-                );
-                if self.roots.len() > 1 {
-                    if let Some(score) = pq.score(&label) {
-                        items.push(Item {
-                            icon: "📚".into(),
-                            label,
-                            detail: r.display().to_string(),
-                            action: Action::Cmd(Cmd::RemoveFolder(r.clone())),
-                            score: score - 30,
-                        });
-                    }
-                }
-            }
-            for (branch, path, added) in
-                self.palette_worktrees.as_deref().unwrap_or(&[])
-            {
-                if *added {
-                    continue; // 既にワークスペースにあるものは「外す」側で出る
-                }
-                let label = trf("worktree を開く: {branch}", &[("branch", branch.clone())]);
-                if let Some(score) = pq.score(&label) {
-                    items.push(Item {
-                        icon: "🌿".into(),
-                        label,
-                        detail: path.display().to_string(),
-                        action: Action::Cmd(Cmd::AddFolderPath(path.clone())),
-                        score,
-                    });
-                }
-            }
-            let add_label = tr("フォルダをワークスペースに追加…");
-            if let Some(score) = pq.score(&add_label) {
-                items.push(Item {
-                    icon: "📂".into(),
-                    label: add_label,
-                    detail: String::new(),
-                    action: Action::Cmd(Cmd::AddFolder),
-                    score: score - 60,
-                });
-            }
+            self.palette_items_root_mode(&pq, &mut items);
         } else {
-            for f in &self.file_index {
-                // マッチはルート相対パスに対して行い、単一ルート時と同じ
-                // あいまい検索の品質を保つ。表示 (detail) は曖昧回避済みラベル、
-                // 実際に開くのは絶対パス。
-                if let Some(score) = pq.score(&f.rel) {
-                    let name = f.rel.rsplit('/').next().unwrap_or(&f.rel).to_string();
-                    items.push(Item {
-                        icon: file_tree::icon_for(&name).to_string(),
-                        label: name,
-                        detail: f.label.clone(),
-                        action: Action::OpenFile(f.abs.clone()),
-                        score,
-                    });
-                }
-            }
+            self.palette_items_file_mode(&pq, &mut items);
         }
 
         items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.label.cmp(&b.label)));
         items.truncate(100);
         items
+    }
+
+    /// パレット: 組み込みコマンド定義 (icon, label, keybind, Cmd) の一覧。
+    fn palette_builtin_cmds(&self) -> Vec<(String, String, String, Cmd)> {
+        vec![
+            ("💾".into(), tr("保存"), "⌘S".into(), Cmd::Save),
+            ("💾".into(), tr("名前を付けて保存"), "⌘⇧S".into(), Cmd::SaveAs),
+            ("📄".into(), tr("新規ファイル"), "⌘N".into(), Cmd::NewFile),
+            ("📂".into(), tr("フォルダを開く…"), String::new(), Cmd::OpenFolder),
+            ("📚".into(), tr("フォルダをワークスペースに追加"), String::new(), Cmd::AddFolder),
+            ("❌".into(), tr("タブを閉じる"), "⌘W".into(), Cmd::CloseTab),
+            ("🔍".into(), tr("ファイル内検索"), "⌘F".into(), Cmd::OpenFind),
+            ("🖥".into(), tr("ターミナル表示切替"), "⌘J".into(), Cmd::ToggleTerminal),
+            ("🎛".into(), tr("Cockpit 切替"), "⌘⇧C".into(), Cmd::ToggleCockpit),
+            (
+                "➕".into(),
+                tr("エージェントを追加 (対応 CLI の一覧から選ぶ)"),
+                String::new(),
+                Cmd::OpenAgentPicker,
+            ),
+            ("📋".into(), tr("タスクを作成してエージェントに割り当て"), String::new(), Cmd::NewTask),
+            ("📮".into(), tr("エージェントへメッセージを送る"), String::new(), Cmd::SendAgentMessage),
+            ("👁".into(), tr("Markdown/HTML プレビュー切替"), "⌘⇧V".into(), Cmd::ToggleMdPreview),
+            ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),
+            ("🌿".into(), tr("Git パネルを開く"), String::new(), Cmd::OpenGitPanel),
+            (
+                "👾".into(),
+                tr("現在のファイルをエージェントに送信 (@path)"),
+                String::new(),
+                Cmd::SendFileToAgent,
+            ),
+            ("⟳".into(), tr("アクティブなエージェントを再起動"), String::new(), Cmd::RestartAgent),
+            ("🗑".into(), tr("アクティブなエージェントを終了"), String::new(), Cmd::KillAgent),
+            ("⚙".into(), tr("設定 config.toml を開く"), String::new(), Cmd::OpenConfig),
+            ("🔄".into(), tr("設定を再読み込み"), String::new(), Cmd::ReloadConfig),
+            ("🔠".into(), tr("フォント拡大"), "⌘+".into(), Cmd::FontInc),
+            ("🔠".into(), tr("フォント縮小"), "⌘-".into(), Cmd::FontDec),
+            ("🌲".into(), tr("ファイルツリー再読み込み"), String::new(), Cmd::RefreshTree),
+            (
+                "🛡".into(),
+                tr("承認モード: 毎回ユーザー承認 (Claude/Codex/Antigravity)"),
+                String::new(),
+                Cmd::SetApproval("ask".into()),
+            ),
+            (
+                "⚡".into(),
+                tr("承認モード: 全自動 YES (Claude/Codex/Antigravity)"),
+                String::new(),
+                Cmd::SetApproval("auto".into()),
+            ),
+            (
+                "👾".into(),
+                tr("承認モード: Agent欄優先 (プリセットのコマンドどおり)"),
+                String::new(),
+                Cmd::SetApproval("agent".into()),
+            ),
+            ("🐾".into(), tr("ペット表示切替"), String::new(), Cmd::TogglePet),
+            (
+                "📱".into(),
+                tr("スマホリモート (QR コード表示)"),
+                String::new(),
+                Cmd::ToggleRemote,
+            ),
+            (
+                "🎤".into(),
+                tr("音声入力: 全エージェントの入力欄へ (送信は自分で Enter)"),
+                String::new(),
+                Cmd::VoiceInput(voice::Target::Broadcast),
+            ),
+            (
+                "🛡".into(),
+                tr("実行中の全エージェントの権限モードを切替"),
+                String::new(),
+                Cmd::CyclePermissionAll,
+            ),
+            ("🖼".into(), tr("ペット画像を変更…"), String::new(), Cmd::SetPetImage),
+            ("↺".into(), tr("ペット画像を既定に戻す"), String::new(), Cmd::ResetPetImage),
+            ("🐾".into(), tr("ペット位置を右下に戻す"), String::new(), Cmd::ResetPetPos),
+            // ── VS Code 準拠メニューバーのコマンド ──
+            ("📄".into(), tr("ファイルを開く…"), "⌘O".into(), Cmd::OpenFileDialog),
+            ("💾".into(), tr("すべて保存"), "⌥⌘S".into(), Cmd::SaveAll),
+            ("💾".into(), tr("自動保存の切替"), String::new(), Cmd::ToggleAutoSave),
+            ("↺".into(), tr("ファイルを元に戻す"), String::new(), Cmd::RevertFile),
+            ("🚪".into(), tr("すべてのエディターを閉じる"), String::new(), Cmd::CloseAllTabs),
+            ("🔎".into(), tr("ファイル間で検索"), "⇧⌘F".into(), Cmd::GlobalSearch),
+            ("⇄".into(), tr("置換"), "⌥⌘F".into(), Cmd::OpenReplace),
+            ("🧭".into(), tr("行/列へ移動…"), "⌃G".into(), Cmd::GoToLine),
+            ("🧭".into(), tr("定義へ移動"), "F12".into(), Cmd::GoToDefinition),
+            ("🧭".into(), tr("ブラケットへ移動"), "⇧⌘\\".into(), Cmd::GoToBracket),
+            ("⬅".into(), tr("戻る"), "⌃-".into(), Cmd::NavBack),
+            ("➡".into(), tr("進む"), "⌃⇧-".into(), Cmd::NavForward),
+            ("📑".into(), tr("次のエディター"), "⇧⌘]".into(), Cmd::NextTab),
+            ("📑".into(), tr("前のエディター"), "⇧⌘[".into(), Cmd::PrevTab),
+            ("🖥".into(), tr("新しいターミナル"), "⌃⇧`".into(), Cmd::NewTerminal),
+            ("▶".into(), tr("アクティブなファイルを実行"), String::new(), Cmd::RunActiveFile),
+            (
+                "▶".into(),
+                tr("選択したテキストをターミナルへ送る"),
+                String::new(),
+                Cmd::RunSelection,
+            ),
+            ("🔨".into(), tr("ビルド タスクの実行…"), "⇧⌘B".into(), Cmd::RunBuildTask),
+            ("⚠".into(), tr("問題パネルの切替"), "⇧⌘M".into(), Cmd::ToggleProblems),
+            ("🖥".into(), tr("フルスクリーンの切替"), "⌃⌘F".into(), Cmd::ToggleFullScreen),
+            ("🐙".into(), tr("GitHub パネルを開く"), String::new(), Cmd::ShowGitHubTab),
+            (
+                "⌨".into(),
+                tr("キーボード ショートカットのリファレンス"),
+                String::new(),
+                Cmd::ShowShortcuts,
+            ),
+            ("ℹ".into(), tr("バージョン情報"), String::new(), Cmd::ShowAbout),
+            ("➕".into(), tr("新規プラグインを作成…"), String::new(), Cmd::NewPlugin),
+            ("📦".into(), tr("プラグインをインストール… (.zvplug / .zip)"), String::new(), Cmd::InstallPlugin),
+            ("🔌".into(), tr("プラグインを表示"), String::new(), Cmd::ShowPlugins),
+            ("⟳".into(), tr("プラグインを再スキャン"), String::new(), Cmd::RescanPlugins),
+        ]
+    }
+
+    /// パレット: コマンドモード (`>`) の候補を items へ積む。
+    fn palette_items_command_mode(&self, pq: &fuzzy::PreparedQuery, items: &mut Vec<Item>) {
+        let mut cmds: Vec<(String, String, String, Cmd)> = self.palette_builtin_cmds();
+        // 実際に検出できた外部 IDE だけを出す (検出は起動時にワーカーで走る)
+        for (icon, label, cmd) in panels::ide_palette_entries() {
+            cmds.push((icon, label, String::new(), cmd));
+        }
+        // 実行中のセッション毎に音声入力エントリを出す (パレットで「音声」検索用)
+        for s in self.agents.sessions.iter().take(20) {
+            cmds.push((
+                "🎤".into(),
+                trf(
+                    "音声入力: {icon} {title} の入力欄へ (送信は自分で Enter)",
+                    &[("icon", s.icon.clone()), ("title", s.title.clone())],
+                ),
+                String::new(),
+                Cmd::VoiceInput(voice::Target::Session(s.id)),
+            ));
+        }
+        for t in theme::all() {
+            cmds.push((
+                "🎨".into(),
+                trf("テーマ: {label}", &[("label", t.label.clone())]),
+                String::new(),
+                Cmd::SetTheme(t.name.clone()),
+            ));
+        }
+        for (label, path) in self.custom_themes.iter().take(80) {
+            cmds.push((
+                "🔌".into(),
+                trf("テーマ (カスタム): {label}", &[("label", label.clone())]),
+                String::new(),
+                Cmd::SetTheme(path.clone()),
+            ));
+        }
+        for (pi, p) in self.plugins.iter().enumerate() {
+            for (ci, c) in p.commands.iter().enumerate() {
+                cmds.push((
+                    c.icon.clone(),
+                    format!("{}: {}", p.name, c.title),
+                    c.keybind.clone().unwrap_or_default(),
+                    Cmd::RunPlugin(pi, ci),
+                ));
+            }
+        }
+        // ルートが 2 つ以上のときだけ削除コマンドを出す
+        // (最後の 1 つは削除できない = roots は決して空にならない)
+        if self.roots.len() > 1 {
+            for r in &self.roots {
+                cmds.push((
+                    "📂".into(),
+                    trf(
+                        "フォルダをワークスペースから削除: {name}",
+                        &[("name", root_name(r))],
+                    ),
+                    String::new(),
+                    Cmd::RemoveFolder(r.clone()),
+                ));
+            }
+        }
+        for (i, p) in self.cfg.agents.iter().enumerate() {
+            cmds.push((
+                p.icon.clone(),
+                trf("エージェント起動: {name}", &[("name", p.name.clone())]),
+                String::new(),
+                Cmd::NewAgent(i),
+            ));
+        }
+        for (i, s) in self.agents.sessions.iter().enumerate() {
+            cmds.push((
+                s.icon.clone(),
+                trf("エージェントへ移動: {title}", &[("title", s.title.clone())]),
+                String::new(),
+                Cmd::FocusAgent(i),
+            ));
+        }
+        for (icon, label, detail, cmd) in cmds {
+            if let Some(score) = pq.score(&label) {
+                items.push(Item {
+                    icon,
+                    label,
+                    detail,
+                    action: Action::Cmd(cmd),
+                    score,
+                });
+            }
+        }
+    }
+
+    /// パレット: `@` エージェントモードの候補を items へ積む。
+    fn palette_items_agent_mode(&self, pq: &fuzzy::PreparedQuery, items: &mut Vec<Item>) {
+        // `@` — エージェントセッションへジャンプ / プリセット起動
+        for (i, s) in self.agents.sessions.iter().enumerate() {
+            let state = tr(if s.running() {
+                if s.attention {
+                    "🔔 承認待ち"
+                } else if s.rate_limited.is_some() {
+                    "⏳ レート制限"
+                } else {
+                    "稼働中"
+                }
+            } else {
+                "終了"
+            });
+            let unread = if s.has_unread() { tr(" ◆未読") } else { String::new() };
+            if let Some(score) = pq.score(&s.title) {
+                items.push(Item {
+                    icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
+                    label: s.title.clone(),
+                    detail: format!("{state}{unread} ・ {}", s.uptime()),
+                    action: Action::Cmd(Cmd::FocusAgent(i)),
+                    // 承認待ち・未読を上へ
+                    score: score
+                        + if s.attention { 40 } else { 0 }
+                        + if s.has_unread() { 20 } else { 0 },
+                });
+            }
+        }
+        for (i, p) in self.cfg.agents.iter().enumerate() {
+            // 訳語のラベルに対して検索する (英語UIなら英語で当たるように)
+            let label = trf("起動: {name}", &[("name", p.name.clone())]);
+            if let Some(score) = pq.score(&label) {
+                items.push(Item {
+                    icon: p.icon.clone(),
+                    label,
+                    detail: p.command.clone(),
+                    action: Action::Cmd(Cmd::NewAgent(i)),
+                    score: score - 50, // 既存セッションより下に出す
+                });
+            }
+        }
+    }
+
+    /// パレット: `#` ルート / worktree モードの候補を items へ積む。
+    fn palette_items_root_mode(&self, pq: &fuzzy::PreparedQuery, items: &mut Vec<Item>) {
+        // `#` — ワークスペースルートと git worktree の横断
+        for r in &self.roots {
+            let label = trf(
+                "フォルダを外す: {name}",
+                &[("name", root_name(r).to_string())],
+            );
+            if self.roots.len() > 1 {
+                if let Some(score) = pq.score(&label) {
+                    items.push(Item {
+                        icon: "📚".into(),
+                        label,
+                        detail: r.display().to_string(),
+                        action: Action::Cmd(Cmd::RemoveFolder(r.clone())),
+                        score: score - 30,
+                    });
+                }
+            }
+        }
+        for (branch, path, added) in
+            self.palette_worktrees.as_deref().unwrap_or(&[])
+        {
+            if *added {
+                continue; // 既にワークスペースにあるものは「外す」側で出る
+            }
+            let label = trf("worktree を開く: {branch}", &[("branch", branch.clone())]);
+            if let Some(score) = pq.score(&label) {
+                items.push(Item {
+                    icon: "🌿".into(),
+                    label,
+                    detail: path.display().to_string(),
+                    action: Action::Cmd(Cmd::AddFolderPath(path.clone())),
+                    score,
+                });
+            }
+        }
+        let add_label = tr("フォルダをワークスペースに追加…");
+        if let Some(score) = pq.score(&add_label) {
+            items.push(Item {
+                icon: "📂".into(),
+                label: add_label,
+                detail: String::new(),
+                action: Action::Cmd(Cmd::AddFolder),
+                score: score - 60,
+            });
+        }
+    }
+
+    /// パレット: ファイル検索モードの候補を items へ積む。
+    fn palette_items_file_mode(&self, pq: &fuzzy::PreparedQuery, items: &mut Vec<Item>) {
+        for f in &self.file_index {
+            // マッチはルート相対パスに対して行い、単一ルート時と同じ
+            // あいまい検索の品質を保つ。表示 (detail) は曖昧回避済みラベル、
+            // 実際に開くのは絶対パス。
+            if let Some(score) = pq.score(&f.rel) {
+                let name = f.rel.rsplit('/').next().unwrap_or(&f.rel).to_string();
+                items.push(Item {
+                    icon: file_tree::icon_for(&name).to_string(),
+                    label: name,
+                    detail: f.label.clone(),
+                    action: Action::OpenFile(f.abs.clone()),
+                    score,
+                });
+            }
+        }
     }
 
     /// 各ルートの git worktree 一覧。パレットを開いている間だけキャッシュされる。
@@ -7984,387 +8009,454 @@ impl ZaivernApp {
 
     /// リモートからの問い合わせ 1 件に応答 JSON を返す。
     fn remote_reply(&mut self, q: &remote::Query, ctx: &egui::Context) -> String {
-        use serde_json::json;
         match q {
-            remote::Query::State => {
-                let ws = roots_label(&self.roots);
-                let tabs: Vec<_> = self
-                    .editor
-                    .buffers
-                    .iter()
-                    .map(|b| json!({"title": b.title, "dirty": b.dirty()}))
-                    .collect();
-                let (file, dirty) = match self.editor.active {
-                    Some(i) => (
-                        self.editor.buffers[i].title.clone(),
-                        self.editor.buffers[i].dirty(),
-                    ),
-                    None => (String::new(), false),
-                };
-                let agents: Vec<_> = self
-                    .agents
-                    .sessions
-                    .iter()
-                    .map(|s| {
-                        json!({
-                            "id": s.id, "title": s.title, "icon": s.icon,
-                            "running": s.running(), "attention": s.attention,
-                        })
-                    })
-                    .collect();
-                let presets: Vec<_> = self
-                    .cfg
-                    .agents
-                    .iter()
-                    .map(|p| json!({"name": p.name, "icon": p.icon}))
-                    .collect();
-                json!({
-                    "ok": true, "workspace": ws, "tabs": tabs,
-                    "active": self.editor.active, "file": file, "dirty": dirty,
-                    "cursor": [self.editor.cursor.0, self.editor.cursor.1],
-                    "agents": agents, "agent_active": self.agents.active,
-                    "presets": presets, "approval": self.cfg.approval_mode,
-                    // 音声入力ページ (スマホ) が参照する設定
-                    "voice": {"kw": self.cfg.voice_keyword, "lang": self.cfg.voice_lang},
-                })
-                .to_string()
-            }
-            remote::Query::File => match self.editor.active {
-                Some(i) => {
-                    let b = &self.editor.buffers[i];
-                    json!({
-                        "ok": true, "title": b.title, "text": b.text,
-                        "lang": b.lang, "dirty": b.dirty(), "index": i,
-                    })
-                    .to_string()
-                }
-                None => json!({"ok": false}).to_string(),
-            },
-            remote::Query::Files => {
-                // 全ルートの索引を表示ラベル (曖昧なときだけルート名付き) で返す。
-                // OpenFile ではこのラベルを索引で引き直して絶対パスに戻す。
-                let files: Vec<&String> =
-                    self.file_index.iter().take(4000).map(|f| &f.label).collect();
-                json!({"ok": true, "files": files}).to_string()
-            }
+            remote::Query::State => self.remote_reply_state(),
+            remote::Query::File => self.remote_reply_file(),
+            remote::Query::Files => self.remote_reply_files(),
             remote::Query::SetText { text, index, save } => {
-                let Some(active) = self.editor.active else {
-                    return json!({"ok": false, "error": "ファイルが開かれていません"})
-                        .to_string();
-                };
-                // スマホが編集していたタブと PC のアクティブタブが違えば拒否
-                // (別ファイルを誤って上書きしない)
-                if *index >= 0 && *index as usize != active {
-                    return json!({
-                        "ok": false,
-                        "error": "PC 側でタブが切り替わっています — 再読込してください",
-                    })
-                    .to_string();
-                }
-                // PR 差分などの読み取り専用タブはスマホ側からも書き換えさせない
-                if self.editor.buffers[active].kind.read_only() {
-                    return json!({
-                        "ok": false,
-                        "error": "このタブは読み取り専用です (PR 差分などは編集できません)",
-                    })
-                    .to_string();
-                }
-                let b = &mut self.editor.buffers[active];
-                b.text = text.clone();
-                b.cache = None;
-                b.gutter = None;
-                if !*save {
-                    return json!({"ok": true, "dirty": b.dirty()}).to_string();
-                }
-                // 保存も同一リクエストで原子的に行う。rfd ダイアログは開かない
-                let Some(path) = b.path.clone() else {
-                    return json!({
-                        "ok": false,
-                        "error": "名前のないファイルは PC 側で保存してください (⌘S)",
-                    })
-                    .to_string();
-                };
-                match std::fs::write(&path, &b.text) {
-                    Ok(()) => {
-                        b.saved_hash = hash_str(&b.text);
-                        b.disk_mtime = disk_mtime(&path);
-                        b.conflict_notified = None;
-                        self.tree.invalidate();
-                        self.toast(
-                            trf(
-                                "💾 保存しました (スマホから): {path}",
-                                &[("path", path.display().to_string())],
-                            ),
-                            true,
-                        );
-                        json!({"ok": true, "dirty": false}).to_string()
-                    }
-                    Err(e) => {
-                        json!({"ok": false, "error": format!("保存に失敗しました: {e}")})
-                            .to_string()
-                    }
-                }
+                self.remote_reply_set_text(text, *index, *save)
             }
-            remote::Query::OpenFile(rel, line) => {
-                // `..` を含む要求は入口で拒否する。
-                // canonicalize は「存在しないパス」で失敗し、その場合の
-                // フォールバック比較は `..` を解決しないまま前方一致してしまうため、
-                // 後段のチェックに任せずここで落とす。
-                if Path::new(rel)
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    return json!({"ok": false, "error": "ワークスペース外は開けません"})
-                        .to_string();
-                }
-                // 索引の表示ラベル → 絶対パス (マルチルートでも一意に定まる)。
-                // 索引に無ければ各ルートからの相対パスとして解決を試みる。
-                let p = self
-                    .file_index
-                    .iter()
-                    .find(|f| f.label == *rel)
-                    .map(|f| f.abs.clone())
-                    .or_else(|| {
-                        self.roots
-                            .iter()
-                            .map(|r| r.join(rel))
-                            .find(|c| c.is_file())
-                    })
-                    .unwrap_or_else(|| self.primary_root().join(rel));
-
-                // パストラバーサル防御 (セキュリティ上の要): canonicalize したうえで
-                // 「いずれかのルート配下」でなければ開かせない。ルートが増えても
-                // 判定は緩めず、各ルートについて同じ前方一致チェックを行う。
-                let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
-                let inside = self.roots.iter().any(|r| {
-                    let root = r.canonicalize().unwrap_or_else(|_| r.clone());
-                    canon.starts_with(&root)
-                });
-                if !inside {
-                    return json!({"ok": false, "error": "ワークスペース外は開けません"})
-                        .to_string();
-                }
-                match self.editor.open(&p, &self.highlighter) {
-                    Ok(reloaded) => {
-                        if reloaded {
-                            if let Some(i) = self.editor.active {
-                                self.queue_lsp_change(i);
-                            }
-                        }
-                        self.queue_hook(plugins::HookEvent::FileOpen, Some(p.clone()));
-                        self.persist_session();
-                        if let Some(n) = line {
-                            self.goto_line(*n);
-                        }
-                        json!({"ok": true}).to_string()
-                    }
-                    Err(e) => json!({"ok": false, "error": e}).to_string(),
-                }
-            }
+            remote::Query::OpenFile(rel, line) => self.remote_reply_open_file(rel, *line),
             // プラグイン / CLI からのトースト通知
-            remote::Query::Notify(message, level) => {
-                let msg = notify::truncate_chars(message.trim(), 200);
-                match level.trim() {
-                    "warn" => self.toast_warn(format!("🔌 {msg}")),
-                    "error" => self.toast(format!("🔌 {msg}"), false),
-                    _ => self.toast(format!("🔌 {msg}"), true),
-                }
-                json!({"ok": true}).to_string()
-            }
+            remote::Query::Notify(message, level) => self.remote_reply_notify(message, level),
             // プラグインパネルの本文を書き換える
             remote::Query::SetPanel {
                 plugin,
                 panel,
                 text,
-            } => {
-                // plugin が空なら、その panel id を持つ最初の有効プラグインへ送る
-                let target = if plugin.trim().is_empty() {
-                    self.plugins
-                        .iter()
-                        .find(|p| p.active() && p.panels.iter().any(|x| &x.id == panel))
-                        .map(|p| p.name.clone())
-                } else {
-                    Some(plugin.clone())
-                };
-                match target {
-                    Some(name) if self.set_plugin_panel(&name, panel, text.clone()) => {
-                        json!({"ok": true, "plugin": name}).to_string()
-                    }
-                    _ => json!({
-                        "ok": false,
-                        "error": format!("パネルが見つかりません: {panel}"),
-                    })
-                    .to_string(),
-                }
-            }
+            } => self.remote_reply_set_panel(plugin, panel, text),
             // ステータスバーへ任意の文字列を出す (空文字で消える)
-            remote::Query::SetStatus(text) => {
-                self.plugin_status = text.clone();
-                json!({"ok": true}).to_string()
-            }
+            remote::Query::SetStatus(text) => self.remote_reply_set_status(text),
             // エージェントの入力欄へ差し込む (submit=true のときだけ Enter)
             remote::Query::Prompt {
                 text,
                 agent,
                 submit,
-            } => {
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    return json!({"ok": false, "error": "テキストが空です"}).to_string();
-                }
-                if self.send_agent_prompt(Some(agent.as_str()), &text, *submit) {
-                    json!({"ok": true, "sent": 1}).to_string()
-                } else {
-                    json!({
-                        "ok": false,
-                        "error": "エージェントセッションが見つかりません",
-                    })
-                    .to_string()
-                }
-            }
-            remote::Query::Tab(i) => {
-                if *i < self.editor.buffers.len() {
-                    self.editor.active = Some(*i);
-                    self.find.last = None;
-                    json!({"ok": true}).to_string()
-                } else {
-                    json!({"ok": false, "error": "タブがありません"}).to_string()
-                }
-            }
-            remote::Query::Term => match self.agents.active_session() {
-                Some(s) => {
-                    let text = crate::lockx::lock_ok(&s.parser).screen().contents();
-                    json!({
-                        "ok": true, "title": s.title, "running": s.running(), "text": text,
-                    })
-                    .to_string()
-                }
-                None => json!({"ok": false}).to_string(),
-            },
+            } => self.remote_reply_prompt(text, agent, *submit),
+            remote::Query::Tab(i) => self.remote_reply_tab(*i),
+            remote::Query::Term => self.remote_reply_term(),
             remote::Query::VoiceSend { text, id, submit } => {
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    return json!({"ok": false, "error": "テキストが空です"}).to_string();
-                }
-                // submit=false は入力欄へ挿入するだけ (Enter は送らない)
-                let payload = if *submit {
-                    format!("{text}\r")
-                } else {
-                    text.clone()
-                };
-                let verb = if *submit { tr("送信") } else { tr("入力欄へ") };
-                if *id < 0 {
-                    // 全エージェントへブロードキャスト
-                    let n = self.agents.running_count();
-                    if n == 0 {
-                        return json!({"ok": false, "error": "実行中のセッションがありません"})
-                            .to_string();
-                    }
-                    for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
-                        // リモートからの手動送信もユーザーの応答扱い
-                        s.note_user_input();
-                        s.write_bytes(payload.as_bytes());
-                    }
-                    self.toast(
-                        trf(
-                            "🎤📣 {n} セッション {verb}: {text}",
-                            &[
-                                ("n", n.to_string()),
-                                ("verb", verb),
-                                ("text", text.to_string()),
-                            ],
-                        ),
-                        true,
-                    );
-                    json!({"ok": true, "sent": n}).to_string()
-                } else {
-                    // セッション id 指定 (インデックスではなく id — 閉じてもずれない)
-                    match self
-                        .agents
-                        .sessions
-                        .iter_mut()
-                        .find(|s| s.id == *id as u64)
-                    {
-                        Some(s) if s.running() => {
-                            s.note_user_input();
-                            s.write_bytes(payload.as_bytes());
-                            let title = s.title.clone();
-                            self.toast(format!("🎤 {title} {verb}: {text}"), true);
-                            json!({"ok": true, "sent": 1}).to_string()
-                        }
-                        Some(_) => json!({"ok": false, "error": "セッションが停止しています"})
-                            .to_string(),
-                        None => json!({
-                            "ok": false,
-                            "error": "セッションが見つかりません (閉じられた可能性)",
-                        })
-                        .to_string(),
-                    }
-                }
+                self.remote_reply_voice_send(text, *id, *submit)
             }
-            remote::Query::TermInput(payload, raw) => match self.agents.active_session() {
+            remote::Query::TermInput(payload, raw) => {
+                self.remote_reply_term_input(payload, *raw)
+            }
+            remote::Query::Cmd(name, arg) => self.remote_reply_cmd(name, *arg, ctx),
+        }
+    }
+
+    /// remote_reply: State — タブ・エージェント・カーソル等の全体状態。
+    fn remote_reply_state(&self) -> String {
+        use serde_json::json;
+        let ws = roots_label(&self.roots);
+        let tabs: Vec<_> = self
+            .editor
+            .buffers
+            .iter()
+            .map(|b| json!({"title": b.title, "dirty": b.dirty()}))
+            .collect();
+        let (file, dirty) = match self.editor.active {
+            Some(i) => (
+                self.editor.buffers[i].title.clone(),
+                self.editor.buffers[i].dirty(),
+            ),
+            None => (String::new(), false),
+        };
+        let agents: Vec<_> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| {
+                json!({
+                    "id": s.id, "title": s.title, "icon": s.icon,
+                    "running": s.running(), "attention": s.attention,
+                })
+            })
+            .collect();
+        let presets: Vec<_> = self
+            .cfg
+            .agents
+            .iter()
+            .map(|p| json!({"name": p.name, "icon": p.icon}))
+            .collect();
+        json!({
+            "ok": true, "workspace": ws, "tabs": tabs,
+            "active": self.editor.active, "file": file, "dirty": dirty,
+            "cursor": [self.editor.cursor.0, self.editor.cursor.1],
+            "agents": agents, "agent_active": self.agents.active,
+            "presets": presets, "approval": self.cfg.approval_mode,
+            // 音声入力ページ (スマホ) が参照する設定
+            "voice": {"kw": self.cfg.voice_keyword, "lang": self.cfg.voice_lang},
+        })
+        .to_string()
+    }
+
+    /// remote_reply: File — アクティブバッファの本文。
+    fn remote_reply_file(&self) -> String {
+        use serde_json::json;
+        match self.editor.active {
+            Some(i) => {
+                let b = &self.editor.buffers[i];
+                json!({
+                    "ok": true, "title": b.title, "text": b.text,
+                    "lang": b.lang, "dirty": b.dirty(), "index": i,
+                })
+                .to_string()
+            }
+            None => json!({"ok": false}).to_string(),
+        }
+    }
+
+    /// remote_reply: Files — ワークスペースのファイル一覧。
+    fn remote_reply_files(&self) -> String {
+        use serde_json::json;
+        // 全ルートの索引を表示ラベル (曖昧なときだけルート名付き) で返す。
+        // OpenFile ではこのラベルを索引で引き直して絶対パスに戻す。
+        let files: Vec<&String> =
+            self.file_index.iter().take(4000).map(|f| &f.label).collect();
+        json!({"ok": true, "files": files}).to_string()
+    }
+
+    /// remote_reply: SetText — バッファ本文を丸ごと置き換える (+必要なら保存)。
+    fn remote_reply_set_text(&mut self, text: &str, index: i64, save: bool) -> String {
+        use serde_json::json;
+        let Some(active) = self.editor.active else {
+            return json!({"ok": false, "error": "ファイルが開かれていません"})
+                .to_string();
+        };
+        // スマホが編集していたタブと PC のアクティブタブが違えば拒否
+        // (別ファイルを誤って上書きしない)
+        if index >= 0 && index as usize != active {
+            return json!({
+                "ok": false,
+                "error": "PC 側でタブが切り替わっています — 再読込してください",
+            })
+            .to_string();
+        }
+        // PR 差分などの読み取り専用タブはスマホ側からも書き換えさせない
+        if self.editor.buffers[active].kind.read_only() {
+            return json!({
+                "ok": false,
+                "error": "このタブは読み取り専用です (PR 差分などは編集できません)",
+            })
+            .to_string();
+        }
+        let b = &mut self.editor.buffers[active];
+        b.text = text.to_string();
+        b.cache = None;
+        b.gutter = None;
+        if !save {
+            return json!({"ok": true, "dirty": b.dirty()}).to_string();
+        }
+        // 保存も同一リクエストで原子的に行う。rfd ダイアログは開かない
+        let Some(path) = b.path.clone() else {
+            return json!({
+                "ok": false,
+                "error": "名前のないファイルは PC 側で保存してください (⌘S)",
+            })
+            .to_string();
+        };
+        match std::fs::write(&path, &b.text) {
+            Ok(()) => {
+                b.saved_hash = hash_str(&b.text);
+                b.disk_mtime = disk_mtime(&path);
+                b.conflict_notified = None;
+                self.tree.invalidate();
+                self.toast(
+                    trf(
+                        "💾 保存しました (スマホから): {path}",
+                        &[("path", path.display().to_string())],
+                    ),
+                    true,
+                );
+                json!({"ok": true, "dirty": false}).to_string()
+            }
+            Err(e) => {
+                json!({"ok": false, "error": format!("保存に失敗しました: {e}")})
+                    .to_string()
+            }
+        }
+    }
+
+    /// remote_reply: OpenFile — ワークスペース相対パスのファイルを開く。
+    fn remote_reply_open_file(&mut self, rel: &str, line: Option<usize>) -> String {
+        use serde_json::json;
+        // `..` を含む要求は入口で拒否する。
+        // canonicalize は「存在しないパス」で失敗し、その場合の
+        // フォールバック比較は `..` を解決しないまま前方一致してしまうため、
+        // 後段のチェックに任せずここで落とす。
+        if Path::new(rel)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return json!({"ok": false, "error": "ワークスペース外は開けません"})
+                .to_string();
+        }
+        // 索引の表示ラベル → 絶対パス (マルチルートでも一意に定まる)。
+        // 索引に無ければ各ルートからの相対パスとして解決を試みる。
+        let p = self
+            .file_index
+            .iter()
+            .find(|f| f.label == *rel)
+            .map(|f| f.abs.clone())
+            .or_else(|| {
+                self.roots
+                    .iter()
+                    .map(|r| r.join(rel))
+                    .find(|c| c.is_file())
+            })
+            .unwrap_or_else(|| self.primary_root().join(rel));
+
+        // パストラバーサル防御 (セキュリティ上の要): canonicalize したうえで
+        // 「いずれかのルート配下」でなければ開かせない。ルートが増えても
+        // 判定は緩めず、各ルートについて同じ前方一致チェックを行う。
+        let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+        let inside = self.roots.iter().any(|r| {
+            let root = r.canonicalize().unwrap_or_else(|_| r.clone());
+            canon.starts_with(&root)
+        });
+        if !inside {
+            return json!({"ok": false, "error": "ワークスペース外は開けません"})
+                .to_string();
+        }
+        match self.editor.open(&p, &self.highlighter) {
+            Ok(reloaded) => {
+                if reloaded {
+                    if let Some(i) = self.editor.active {
+                        self.queue_lsp_change(i);
+                    }
+                }
+                self.queue_hook(plugins::HookEvent::FileOpen, Some(p.clone()));
+                self.persist_session();
+                if let Some(n) = line {
+                    self.goto_line(n);
+                }
+                json!({"ok": true}).to_string()
+            }
+            Err(e) => json!({"ok": false, "error": e}).to_string(),
+        }
+    }
+
+    /// remote_reply: Notify — プラグイン / CLI からのトースト通知。
+    fn remote_reply_notify(&mut self, message: &str, level: &str) -> String {
+        use serde_json::json;
+        let msg = notify::truncate_chars(message.trim(), 200);
+        match level.trim() {
+            "warn" => self.toast_warn(format!("🔌 {msg}")),
+            "error" => self.toast(format!("🔌 {msg}"), false),
+            _ => self.toast(format!("🔌 {msg}"), true),
+        }
+        json!({"ok": true}).to_string()
+    }
+
+    /// remote_reply: SetPanel — プラグインパネルの本文を書き換える。
+    fn remote_reply_set_panel(&mut self, plugin: &str, panel: &str, text: &str) -> String {
+        use serde_json::json;
+        // plugin が空なら、その panel id を持つ最初の有効プラグインへ送る
+        let target = if plugin.trim().is_empty() {
+            self.plugins
+                .iter()
+                .find(|p| p.active() && p.panels.iter().any(|x| x.id == panel))
+                .map(|p| p.name.clone())
+        } else {
+            Some(plugin.to_string())
+        };
+        match target {
+            Some(name) if self.set_plugin_panel(&name, panel, text.to_string()) => {
+                json!({"ok": true, "plugin": name}).to_string()
+            }
+            _ => json!({
+                "ok": false,
+                "error": format!("パネルが見つかりません: {panel}"),
+            })
+            .to_string(),
+        }
+    }
+
+    /// remote_reply: SetStatus — ステータスバーへ任意の文字列を出す (空文字で消える)。
+    fn remote_reply_set_status(&mut self, text: &str) -> String {
+        use serde_json::json;
+        self.plugin_status = text.to_string();
+        json!({"ok": true}).to_string()
+    }
+
+    /// remote_reply: Prompt — エージェントの入力欄へ差し込む (submit=true のときだけ Enter)。
+    fn remote_reply_prompt(&mut self, text: &str, agent: &str, submit: bool) -> String {
+        use serde_json::json;
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return json!({"ok": false, "error": "テキストが空です"}).to_string();
+        }
+        if self.send_agent_prompt(Some(agent), &text, submit) {
+            json!({"ok": true, "sent": 1}).to_string()
+        } else {
+            json!({
+                "ok": false,
+                "error": "エージェントセッションが見つかりません",
+            })
+            .to_string()
+        }
+    }
+
+    /// remote_reply: Tab — タブ切替。
+    fn remote_reply_tab(&mut self, i: usize) -> String {
+        use serde_json::json;
+        if i < self.editor.buffers.len() {
+            self.editor.active = Some(i);
+            self.find.last = None;
+            json!({"ok": true}).to_string()
+        } else {
+            json!({"ok": false, "error": "タブがありません"}).to_string()
+        }
+    }
+
+    /// remote_reply: Term — アクティブなエージェントのターミナル画面テキスト。
+    fn remote_reply_term(&mut self) -> String {
+        use serde_json::json;
+        match self.agents.active_session() {
+            Some(s) => {
+                let text = crate::lockx::lock_ok(&s.parser).screen().contents();
+                json!({
+                    "ok": true, "title": s.title, "running": s.running(), "text": text,
+                })
+                .to_string()
+            }
+            None => json!({"ok": false}).to_string(),
+        }
+    }
+
+    /// remote_reply: VoiceSend — 音声入力ページからの送信 (id 負数はブロードキャスト)。
+    fn remote_reply_voice_send(&mut self, text: &str, id: i64, submit: bool) -> String {
+        use serde_json::json;
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return json!({"ok": false, "error": "テキストが空です"}).to_string();
+        }
+        // submit=false は入力欄へ挿入するだけ (Enter は送らない)
+        let payload = if submit {
+            format!("{text}\r")
+        } else {
+            text.clone()
+        };
+        let verb = if submit { tr("送信") } else { tr("入力欄へ") };
+        if id < 0 {
+            // 全エージェントへブロードキャスト
+            let n = self.agents.running_count();
+            if n == 0 {
+                return json!({"ok": false, "error": "実行中のセッションがありません"})
+                    .to_string();
+            }
+            for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
+                // リモートからの手動送信もユーザーの応答扱い
+                s.note_user_input();
+                s.write_bytes(payload.as_bytes());
+            }
+            self.toast(
+                trf(
+                    "🎤📣 {n} セッション {verb}: {text}",
+                    &[
+                        ("n", n.to_string()),
+                        ("verb", verb),
+                        ("text", text.to_string()),
+                    ],
+                ),
+                true,
+            );
+            json!({"ok": true, "sent": n}).to_string()
+        } else {
+            // セッション id 指定 (インデックスではなく id — 閉じてもずれない)
+            match self
+                .agents
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == id as u64)
+            {
                 Some(s) if s.running() => {
-                    // スマホの端末キー/入力欄 = 手入力。承認エピソードを解決する
                     s.note_user_input();
-                    if *raw {
-                        s.write_bytes(payload.as_bytes());
-                    } else {
-                        s.write_bytes(format!("{payload}\r").as_bytes());
-                    }
-                    json!({"ok": true}).to_string()
+                    s.write_bytes(payload.as_bytes());
+                    let title = s.title.clone();
+                    self.toast(format!("🎤 {title} {verb}: {text}"), true);
+                    json!({"ok": true, "sent": 1}).to_string()
                 }
-                _ => {
-                    json!({"ok": false, "error": "実行中のセッションがありません"}).to_string()
-                }
-            },
-            remote::Query::Cmd(name, arg) => {
-                // 無題バッファへの save はブロッキングな rfd ダイアログを
-                // PC 側に開いてしまうため、リモートからは拒否する
-                if name == "save" {
-                    let no_path = self
-                        .editor
-                        .active
-                        .map(|i| self.editor.buffers[i].path.is_none())
-                        .unwrap_or(true);
-                    if no_path {
-                        return json!({
-                            "ok": false,
-                            "error": "名前のないファイルは PC 側で保存してください (⌘S)",
-                        })
-                        .to_string();
-                    }
-                }
-                let cmd = match name.as_str() {
-                    "save" => Some(Cmd::Save),
-                    "new" => Some(Cmd::NewFile),
-                    "close_tab" => Some(Cmd::CloseTab),
-                    "terminal" => Some(Cmd::ToggleTerminal),
-                    "sidebar" => Some(Cmd::ToggleSidebar),
-                    "git" => Some(Cmd::OpenGitPanel),
-                    "cockpit" => Some(Cmd::ToggleCockpit),
-                    "new_task" => Some(Cmd::NewTask),
-                    "agent_message" => Some(Cmd::SendAgentMessage),
-                    "font_inc" => Some(Cmd::FontInc),
-                    "font_dec" => Some(Cmd::FontDec),
-                    "tree" => Some(Cmd::RefreshTree),
-                    "approval_auto" => Some(Cmd::SetApproval("auto".into())),
-                    "approval_ask" => Some(Cmd::SetApproval("ask".into())),
-                    "approval_agent" => Some(Cmd::SetApproval("agent".into())),
-                    "permission_cycle" => Some(Cmd::CyclePermissionAll),
-                    "agent_launch" => Some(Cmd::NewAgent((*arg).max(0) as usize)),
-                    "agent_focus" => Some(Cmd::FocusAgent((*arg).max(0) as usize)),
-                    "agent_restart" => Some(Cmd::RestartAgent),
-                    "agent_kill" => Some(Cmd::KillAgent),
-                    _ => None,
-                };
-                match cmd {
-                    Some(c) => {
-                        self.apply_cmd(c, ctx);
-                        json!({"ok": true}).to_string()
-                    }
-                    None => json!({"ok": false, "error": "unknown cmd"}).to_string(),
-                }
+                Some(_) => json!({"ok": false, "error": "セッションが停止しています"})
+                    .to_string(),
+                None => json!({
+                    "ok": false,
+                    "error": "セッションが見つかりません (閉じられた可能性)",
+                })
+                .to_string(),
             }
+        }
+    }
+
+    /// remote_reply: TermInput — アクティブなエージェントへ入力を送る。
+    fn remote_reply_term_input(&mut self, payload: &str, raw: bool) -> String {
+        use serde_json::json;
+        match self.agents.active_session() {
+            Some(s) if s.running() => {
+                // スマホの端末キー/入力欄 = 手入力。承認エピソードを解決する
+                s.note_user_input();
+                if raw {
+                    s.write_bytes(payload.as_bytes());
+                } else {
+                    s.write_bytes(format!("{payload}\r").as_bytes());
+                }
+                json!({"ok": true}).to_string()
+            }
+            _ => {
+                json!({"ok": false, "error": "実行中のセッションがありません"}).to_string()
+            }
+        }
+    }
+
+    /// remote_reply: Cmd — 名前指定コマンドの実行。
+    fn remote_reply_cmd(&mut self, name: &str, arg: i64, ctx: &egui::Context) -> String {
+        use serde_json::json;
+        // 無題バッファへの save はブロッキングな rfd ダイアログを
+        // PC 側に開いてしまうため、リモートからは拒否する
+        if name == "save" {
+            let no_path = self
+                .editor
+                .active
+                .map(|i| self.editor.buffers[i].path.is_none())
+                .unwrap_or(true);
+            if no_path {
+                return json!({
+                    "ok": false,
+                    "error": "名前のないファイルは PC 側で保存してください (⌘S)",
+                })
+                .to_string();
+            }
+        }
+        let cmd = match name {
+            "save" => Some(Cmd::Save),
+            "new" => Some(Cmd::NewFile),
+            "close_tab" => Some(Cmd::CloseTab),
+            "terminal" => Some(Cmd::ToggleTerminal),
+            "sidebar" => Some(Cmd::ToggleSidebar),
+            "git" => Some(Cmd::OpenGitPanel),
+            "cockpit" => Some(Cmd::ToggleCockpit),
+            "new_task" => Some(Cmd::NewTask),
+            "agent_message" => Some(Cmd::SendAgentMessage),
+            "font_inc" => Some(Cmd::FontInc),
+            "font_dec" => Some(Cmd::FontDec),
+            "tree" => Some(Cmd::RefreshTree),
+            "approval_auto" => Some(Cmd::SetApproval("auto".into())),
+            "approval_ask" => Some(Cmd::SetApproval("ask".into())),
+            "approval_agent" => Some(Cmd::SetApproval("agent".into())),
+            "permission_cycle" => Some(Cmd::CyclePermissionAll),
+            "agent_launch" => Some(Cmd::NewAgent(arg.max(0) as usize)),
+            "agent_focus" => Some(Cmd::FocusAgent(arg.max(0) as usize)),
+            "agent_restart" => Some(Cmd::RestartAgent),
+            "agent_kill" => Some(Cmd::KillAgent),
+            _ => None,
+        };
+        match cmd {
+            Some(c) => {
+                self.apply_cmd(c, ctx);
+                json!({"ok": true}).to_string()
+            }
+            None => json!({"ok": false, "error": "unknown cmd"}).to_string(),
         }
     }
 
