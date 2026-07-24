@@ -1076,6 +1076,22 @@ impl Session {
         std::mem::take(&mut self.user_typed)
     }
 
+    /// ユーザー自身の入力(キーボード・IME・ペースト・リモート端末キー・
+    /// ブロードキャスト等)がこのセッションへ入る直前に呼ぶ。
+    /// `user_typed` の印に加えて、いま画面に出ている承認プロンプトの
+    /// エピソードを「ユーザーが自分で応答した」として解決する。
+    ///
+    /// これが無いと、自動YESオフの手動運転では `answered_sig` が立つ経路が
+    /// バブルのボタンしか無い。プロンプト風テキスト(引用の "(y/n)" や
+    /// 「Do you want …?」の残り)が画面に見えている限り attention が
+    /// 立ちっぱなしになり、バブル/トーストの再出現に加えて coordinator が
+    /// WaitingApproval(注入禁止)のまま配達を保留し続け、エージェント間の
+    /// やり取りが止まって見える。
+    pub fn note_user_input(&mut self) {
+        self.user_typed = true;
+        self.resolve_attention();
+    }
+
     /// 文字列をそのままPTYへ書き込む(プログラム的な入力送信)。成功で true。
     ///
     /// キーボード入力と同じ write_bytes 経路を使うため、ターミナルウィジェットに
@@ -1620,6 +1636,64 @@ mod tests {
             assert!(
                 s.scan_attention(false).is_none(),
                 "拒否済みプロンプトを再検出した(バブル再出現バグ)"
+            );
+            assert!(!s.attention);
+        }
+        s.kill();
+    }
+
+    #[test]
+    fn manual_typing_resolves_attention_episode() {
+        use super::{Attention, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        // 自動YESオフの手動運転: ユーザーが端末へ直接応答したら、プロンプト風
+        // テキストが画面に残っていても承認待ちを引きずらない。引きずると
+        // coordinator が WaitingApproval のまま配達を保留し続け、エージェント間の
+        // やり取りが進まなくなる (2026-07-24 の手動運転バグ)。
+        let cmd = r#"stty -echo; sleep 2; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let spec = SpawnSpec {
+            title: "manual-answer".into(),
+            preset_name: "test".into(),
+            icon: "⌨".into(),
+            command: cmd.into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s =
+            Session::spawn(992, spec, eframe::egui::Context::default()).expect("PTY起動");
+
+        // 1) プロンプトが出る前の手入力は user_typed を立てるだけで、
+        //    後から出る本物のプロンプトの検知を抑止しない
+        s.note_user_input();
+        assert!(s.take_user_typed(), "手入力の印が立たなかった");
+
+        let mut detected = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(false), Some(Attention::NeedsApproval)) {
+                detected = true;
+                break;
+            }
+        }
+        assert!(detected, "手入力後に出た承認プロンプトが検知されなかった");
+        assert!(s.attention);
+
+        // 2) ユーザーが端末で直接応答した (terminal::draw のキーボード経路相当)。
+        //    子は入力を読まないのでプロンプトは画面に残ったままになる。
+        s.note_user_input();
+        s.write_bytes(b"y\r");
+        assert!(!s.attention, "手入力の応答後も承認待ちが残った");
+        assert!(s.take_user_typed());
+
+        // 3) 同じプロンプトが画面に残っていても、再検出して引きずらない
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                s.scan_attention(false).is_none(),
+                "手入力で応答済みのプロンプトを再検出した(承認待ち引きずりバグ)"
             );
             assert!(!s.attention);
         }
@@ -2241,8 +2315,10 @@ pub fn draw(
             }
         }
         if !out.is_empty() {
-            // 人が打った分は音声入力の書き込み追跡とずれるので印を立てる
-            session.user_typed = true;
+            // 人が打った分は音声入力の書き込み追跡とずれるので印を立てる。
+            // 承認プロンプトへの手入力応答もここで「応答済み」として解決する
+            // (自動YESオフの手動運転で attention を引きずらないため)。
+            session.note_user_input();
             session.write_bytes(&out);
             session.set_scroll(0);
         }

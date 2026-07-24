@@ -863,6 +863,8 @@ impl AgentManager {
         let payload = format!("{text}\r");
         for s in &mut self.sessions {
             if s.running() {
+                // Cockpit からの一斉送信もユーザーの手入力扱い
+                s.note_user_input();
                 s.write_bytes(payload.as_bytes());
             }
         }
