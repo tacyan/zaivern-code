@@ -5772,13 +5772,21 @@ impl ZaivernApp {
                 });
                 // キーボードショートカット・キー判定（入力欄がフォーカス中）
                 let trigger_submit = false;
-                if ui.memory(|m| m.has_focus(ui.make_persistent_id("broadcast-input"))) {
+                let broadcast_id = ui.make_persistent_id("broadcast-input");
+                if ui.memory(|m| m.has_focus(broadcast_id)) {
                     ui.input(|i| {
                         // Ctrl+A / Cmd+A 全選択
                         if i.modifiers.command || i.modifiers.ctrl {
                             if i.key_pressed(egui::Key::A) {
                                 self.agent_input_buf.set_text(&self.broadcast_input);
                                 self.agent_input_buf.select_all();
+                                let char_len = self.broadcast_input.chars().count();
+                                let mut st = egui::TextEdit::load_state(ui.ctx(), broadcast_id).unwrap_or_default();
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(char_len),
+                                )));
+                                st.store(ui.ctx(), broadcast_id);
                             } else if i.key_pressed(egui::Key::U) {
                                 self.agent_input_buf.set_text(&self.broadcast_input);
                                 self.agent_input_buf.delete_to_beginning();
