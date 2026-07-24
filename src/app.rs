@@ -5440,6 +5440,11 @@ impl ZaivernApp {
                     .inner_margin(egui::Margin::same(6.0)),
             )
             .show_animated(ctx, show, |ui| {
+                // egui のボトムパネルは「中身が実際に使った矩形」を次フレームの
+                // 高さとして保存するため、中身がパネル高さを埋め切らないと
+                // リサイズバーが毎フレームずり落ちていく (看板タブのチャート等)。
+                // 先に全高を消費してドラッグした高さを常に維持する。
+                ui.set_min_height(ui.available_height());
                 ui.horizontal(|ui| {
                     let controls_w = 150.0;
                     egui::ScrollArea::horizontal()

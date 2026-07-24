@@ -361,6 +361,11 @@ pub fn ui(
     egui::Frame::none()
         .inner_margin(egui::Margin::same(10.0))
         .show(ui, |ui| {
+            // ボトムパネルは「中身が実際に使った矩形」を次フレームの高さとして
+            // 保存する (egui 0.29) ので、中身が割り当てを埋め切らないと上端の
+            // リサイズバーが毎フレームずり落ちる。内部レイアウトの計算誤差に
+            // 依存しないよう、先に割り当てられた全高を消費しておく。
+            ui.set_min_height(ui.available_height());
             let wide = ui.available_width();
             let tall = ui.available_height();
             // 狭い画面では飾りを畳んで、看板本体に空間を譲る
@@ -1401,5 +1406,279 @@ mod tests {
         assert_eq!(fmt_age(30_000), "30秒前");
         assert_eq!(fmt_age(5 * 60_000), "5分前");
         assert_eq!(fmt_age(2 * 3_600_000), "2時間前");
+    }
+
+    // ── パネルリサイズ (ドラッグバー) ──
+
+    /// app.rs の「zv-terminal」パネル + 看板タブをヘッドレスで 1 フレーム描く。
+    /// 返り値はそのフレームでパネル中身に渡された高さ。
+    struct PanelHarness {
+        ctx: eframe::egui::Context,
+        st: KanbanState,
+        theme: crate::theme::Theme,
+        t: f64,
+        now_ms: u64,
+        /// 直近フレームのパネル上端 y (フレーム余白込み)
+        last_top: f32,
+    }
+
+    impl PanelHarness {
+        fn new() -> Self {
+            Self {
+                ctx: eframe::egui::Context::default(),
+                st: KanbanState::default(),
+                theme: crate::theme::all().remove(0),
+                t: 0.0,
+                now_ms: 0,
+                last_top: 0.0,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>, cards: &[Card]) -> f32 {
+            self.frame_sized(events, cards, egui::vec2(1600.0, 900.0))
+        }
+
+        /// 実アプリの構造 (上部バー/ステータスバー/タブバー/中央エディタ) を
+        /// 模したフレームを 1 枚描く。
+        fn frame_sized(
+            &mut self,
+            events: Vec<egui::Event>,
+            cards: &[Card],
+            screen: egui::Vec2,
+        ) -> f32 {
+            self.t += 1.0 / 60.0;
+            self.now_ms += 16;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+                time: Some(self.t),
+                events,
+                ..Default::default()
+            };
+            let mut panel_h = 0.0_f32;
+            let mut panel_top = 0.0_f32;
+            let st = &mut self.st;
+            let theme = &self.theme;
+            let now_ms = self.now_ms;
+            let _ = self.ctx.run(input, |ctx| {
+                egui::TopBottomPanel::top("zv-top").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("menu");
+                    });
+                });
+                egui::TopBottomPanel::bottom("zv-status").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("status");
+                    });
+                });
+                egui::TopBottomPanel::bottom("zv-terminal")
+                    .resizable(true)
+                    .default_height(300.0)
+                    .min_height(140.0)
+                    .frame(
+                        egui::Frame::none().inner_margin(egui::Margin::same(6.0)),
+                    )
+                    .show_animated(ctx, true, |ui| {
+                        panel_h = ui.max_rect().height();
+                        panel_top = ui.max_rect().top() - 6.0;
+                        // 実アプリ同様のタブバー (横スクロール + 右側コントロール)
+                        ui.horizontal(|ui| {
+                            egui::ScrollArea::horizontal()
+                                .id_salt("term-tabs")
+                                .max_width((ui.available_width() - 150.0).max(120.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let _ = ui.selectable_label(true, "🤖 Claude Code");
+                                        let _ = ui.selectable_label(true, "📋 看板");
+                                    });
+                                });
+                        });
+                        ui.add_space(4.0);
+                        let _ = super::ui(st, ui, theme, cards, &[], &[], now_ms);
+                    });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // エディタ/ターミナル相当: 全域が click_and_drag を持つ
+                    let size = ui.available_size();
+                    let _ = ui.allocate_response(size, egui::Sense::click_and_drag());
+                });
+            });
+            self.last_top = panel_top;
+            panel_h
+        }
+
+        /// バーを `from_y` から `to_y` までドラッグして離す。フレームごとの
+        /// パネル上端 y を返す (追従の観察用)。
+        fn drag_bar(&mut self, from_y: f32, to_y: f32, cards: &[Card]) -> Vec<f32> {
+            let mut tops = Vec::new();
+            let x = 800.0;
+            self.frame(vec![egui::Event::PointerMoved(egui::pos2(x, from_y))], cards);
+            self.frame(
+                vec![egui::Event::PointerButton {
+                    pos: egui::pos2(x, from_y),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                cards,
+            );
+            let step = if to_y < from_y { -25.0 } else { 25.0 };
+            let mut y = from_y;
+            while (y - to_y).abs() > 25.0 {
+                y += step;
+                self.frame(vec![egui::Event::PointerMoved(egui::pos2(x, y))], cards);
+                tops.push(self.last_top);
+            }
+            self.frame(vec![egui::Event::PointerMoved(egui::pos2(x, to_y))], cards);
+            tops.push(self.last_top);
+            self.frame(
+                vec![egui::Event::PointerButton {
+                    pos: egui::pos2(x, to_y),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                cards,
+            );
+            tops.push(self.last_top);
+            tops
+        }
+    }
+
+    /// パネル上端のバーを画面中央までドラッグしたら、その高さに留まること。
+    /// (中身がパネル高さより低いと egui が実コンテンツ矩形を次フレームの
+    ///  高さとして保存するため、バーがずり落ちるリグレッションを検知する)
+    #[test]
+    fn kanban_panel_keeps_dragged_height() {
+        let mut h = PanelHarness::new();
+        let cards = vec![card(Column::Ready, true)];
+        let none: Vec<egui::Event> = Vec::new();
+
+        for _ in 0..3 {
+            h.frame(none.clone(), &cards);
+        }
+        let start_top = h.last_top;
+        // バーをつかんで画面中央 (y=450) まで引き上げる
+        let tops = h.drag_bar(start_top, 450.0, &cards);
+        // 手を離した後も高さが維持されること
+        let mut after = Vec::new();
+        for _ in 0..8 {
+            h.frame(none.clone(), &cards);
+            after.push(h.last_top);
+        }
+        let released = *tops.last().unwrap();
+        assert!(
+            released < 470.0,
+            "ドラッグ中にバーが追従していない: start={start_top} tops={tops:?}"
+        );
+        let last = *after.last().unwrap();
+        assert!(
+            (released - last).abs() < 10.0,
+            "手を離すとバーがずり落ちる: released={released} after={after:?}"
+        );
+    }
+
+    /// 画面上端近くまで引き上げても維持されること (中央越え)。
+    #[test]
+    fn kanban_panel_keeps_height_near_top() {
+        let mut h = PanelHarness::new();
+        let cards = vec![card(Column::Ready, true)];
+        let none: Vec<egui::Event> = Vec::new();
+        for _ in 0..3 {
+            h.frame(none.clone(), &cards);
+        }
+        let tops = h.drag_bar(h.last_top, 60.0, &cards);
+        let mut after = Vec::new();
+        for _ in 0..8 {
+            h.frame(none.clone(), &cards);
+            after.push(h.last_top);
+        }
+        let released = *tops.last().unwrap();
+        let last = *after.last().unwrap();
+        assert!(
+            (released - last).abs() < 10.0,
+            "上端付近でずり落ちる: released={released} after={after:?} tops={tops:?}"
+        );
+    }
+
+    /// カードが 0 枚 (empty_ui) でもずり落ちないこと。
+    #[test]
+    fn kanban_panel_keeps_height_with_no_cards() {
+        let mut h = PanelHarness::new();
+        let cards: Vec<Card> = Vec::new();
+        let none: Vec<egui::Event> = Vec::new();
+        for _ in 0..3 {
+            h.frame(none.clone(), &cards);
+        }
+        let tops = h.drag_bar(h.last_top, 450.0, &cards);
+        let mut after = Vec::new();
+        for _ in 0..8 {
+            h.frame(none.clone(), &cards);
+            after.push(h.last_top);
+        }
+        let released = *tops.last().unwrap();
+        let last = *after.last().unwrap();
+        assert!(
+            (released - last).abs() < 10.0,
+            "カード0枚でずり落ちる: released={released} after={after:?} tops={tops:?}"
+        );
+    }
+
+    /// 下方向 (縮める) ドラッグも追従して維持されること。
+    #[test]
+    fn kanban_panel_shrinks_and_stays() {
+        let mut h = PanelHarness::new();
+        let cards = vec![card(Column::Ready, true)];
+        let none: Vec<egui::Event> = Vec::new();
+        for _ in 0..3 {
+            h.frame(none.clone(), &cards);
+        }
+        h.drag_bar(h.last_top, 400.0, &cards);
+        for _ in 0..3 {
+            h.frame(none.clone(), &cards);
+        }
+        // いったん上げてから 650 まで下げ直す
+        let tops = h.drag_bar(h.last_top, 650.0, &cards);
+        let mut after = Vec::new();
+        for _ in 0..8 {
+            h.frame(none.clone(), &cards);
+            after.push(h.last_top);
+        }
+        let released = *tops.last().unwrap();
+        let last = *after.last().unwrap();
+        assert!(
+            released > 600.0,
+            "縮めるドラッグが追従しない: tops={tops:?}"
+        );
+        assert!(
+            (released - last).abs() < 10.0,
+            "縮めた後に高さが跳ね戻る: released={released} after={after:?}"
+        );
+    }
+
+    /// ウィンドウ矩形が一時的に縮んでも (fullscreen_guard の遷移など)、
+    /// 戻ったときにパネル高さが失われないこと。
+    #[test]
+    fn kanban_panel_survives_screen_rect_wobble() {
+        let mut h = PanelHarness::new();
+        let cards = vec![card(Column::Ready, true)];
+        let none: Vec<egui::Event> = Vec::new();
+        for _ in 0..3 {
+            h.frame(none.clone(), &cards);
+        }
+        h.drag_bar(h.last_top, 450.0, &cards);
+        let before = h.last_top;
+        // 一時的に縦 600 に縮む → 900 に戻る
+        for _ in 0..3 {
+            h.frame_sized(none.clone(), &cards, egui::vec2(1600.0, 600.0));
+        }
+        let mut after = Vec::new();
+        for _ in 0..5 {
+            h.frame(none.clone(), &cards);
+            after.push(h.last_top);
+        }
+        let last = *after.last().unwrap();
+        assert!(
+            (before - last).abs() < 10.0,
+            "画面矩形の変動で高さが失われる: before={before} after={after:?}"
+        );
     }
 }
