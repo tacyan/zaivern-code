@@ -12,6 +12,12 @@ pub enum SlashCommand {
     Goal(String),
     /// /loop [count] [prompt] — 指定回数または条件付きループ指示
     Loop(usize, String),
+    /// /plan [prompt] — 詳細実行計画の策定指示
+    Plan(String),
+    /// /grill-me [prompt] — 対話型インタビューによる要求整理指示
+    GrillMe(String),
+    /// /learn [prompt] — ルール・知見の記憶保存指示
+    Learn(String),
     /// /clear — 入力欄クリア
     Clear,
     /// /help — スラッシュコマンドのヘルプ表示
@@ -40,6 +46,21 @@ pub const AVAILABLE_SLASH_COMMANDS: &[SlashCommandInfo] = &[
         name: "/loop",
         syntax: "/loop <回数> <指示テキスト>",
         description: "指定した回数分、指示タスクを自動ループ実行します。（デフォルト: 3回）",
+    },
+    SlashCommandInfo {
+        name: "/plan",
+        syntax: "/plan <設計・タスク概要>",
+        description: "複雑なタスクを実行前に詳細なステップ単位で計画・設計します。",
+    },
+    SlashCommandInfo {
+        name: "/grill-me",
+        syntax: "/grill-me <テーマ・要求>",
+        description: "AIからの質問形式インタビューで設計方針や未決定事項を掘り下げて決定します。",
+    },
+    SlashCommandInfo {
+        name: "/learn",
+        syntax: "/learn <学習させるルール・知見>",
+        description: "現在のセッションで得た重要な解決策やルールを次回以降のために記憶します。",
     },
     SlashCommandInfo {
         name: "/clear",
@@ -87,6 +108,9 @@ impl SlashCommandEngine {
                     SlashCommand::Loop(3, args.to_string())
                 }
             }
+            "/plan" => SlashCommand::Plan(args.to_string()),
+            "/grill-me" => SlashCommand::GrillMe(args.to_string()),
+            "/learn" => SlashCommand::Learn(args.to_string()),
             "/clear" => SlashCommand::Clear,
             "/help" => SlashCommand::Help,
             "/reset" => SlashCommand::Reset,
@@ -122,6 +146,27 @@ impl SlashCommandEngine {
                     format!("🔄 [Loop Mode] 以下のタスクを {count} 回繰り返し実行してください。")
                 } else {
                     format!("🔄 [Loop Mode] 以下のタスクを {count} 回繰り返し実行してください:\n{prompt}")
+                }
+            }
+            SlashCommand::Plan(prompt) => {
+                if prompt.is_empty() {
+                    "📋 [Plan Mode] 段階的で詳細な実行計画を作成してください。".to_string()
+                } else {
+                    format!("📋 [Plan Mode] 以下のタスクについて段階的で詳細な実行計画を作成してください:\n{prompt}")
+                }
+            }
+            SlashCommand::GrillMe(prompt) => {
+                if prompt.is_empty() {
+                    "🔥 [Grill-Me Mode] 設計方針や要件について質疑応答インタビューを開始してください。".to_string()
+                } else {
+                    format!("🔥 [Grill-Me Mode] 以下の件について質問形式で要件や設計を深掘りしてください:\n{prompt}")
+                }
+            }
+            SlashCommand::Learn(prompt) => {
+                if prompt.is_empty() {
+                    "🧠 [Learn Mode] 今回の解決策およびルールを記憶として記録してください。".to_string()
+                } else {
+                    format!("🧠 [Learn Mode] 以下のルールおよび知見を記録・永続記憶してください:\n{prompt}")
                 }
             }
             SlashCommand::Clear => String::new(),
@@ -445,6 +490,21 @@ mod tests {
             SlashCommand::Loop(3, "テストを実行".to_string())
         );
 
+        assert_eq!(
+            SlashCommandEngine::parse("/plan データベース高速化方針"),
+            SlashCommand::Plan("データベース高速化方針".to_string())
+        );
+
+        assert_eq!(
+            SlashCommandEngine::parse("/grill-me インメモリキャッシュ設計"),
+            SlashCommand::GrillMe("インメモリキャッシュ設計".to_string())
+        );
+
+        assert_eq!(
+            SlashCommandEngine::parse("/learn WALモード適用ノウハウ"),
+            SlashCommand::Learn("WALモード適用ノウハウ".to_string())
+        );
+
         assert_eq!(SlashCommandEngine::parse("/clear"), SlashCommand::Clear);
         assert_eq!(SlashCommandEngine::parse("/help"), SlashCommand::Help);
     }
@@ -452,11 +512,12 @@ mod tests {
     #[test]
     fn test_autocomplete() {
         let matches = SlashCommandEngine::autocomplete("/g");
-        assert_eq!(matches.len(), 1);
+        assert_eq!(matches.len(), 2); // /goal, /grill-me
         assert_eq!(matches[0].name, "/goal");
+        assert_eq!(matches[1].name, "/grill-me");
 
         let matches_all = SlashCommandEngine::autocomplete("/");
-        assert_eq!(matches_all.len(), 5);
+        assert_eq!(matches_all.len(), 8);
     }
 
     #[test]
