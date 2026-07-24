@@ -1680,7 +1680,8 @@ mod tests {
                       › 1. Yes, proceed (y)\n\
                         2. Yes, and don't ask again for commands that start with `cargo test`";
         let (bytes, _) = auto_yes_reply(screen).unwrap();
-        assert_eq!(bytes, b"y");
+        // 1c96ad8 で「y」から番号キー「1」(= Yes) へ変更
+        assert_eq!(bytes, b"1");
     }
 
     #[test]
@@ -1688,7 +1689,7 @@ mod tests {
         let screen = "Do you want to approve network access to \"crates.io\"?\n\
                       › 1. Yes\n  2. No";
         let (bytes, _) = auto_yes_reply(screen).unwrap();
-        assert_eq!(bytes, b"y");
+        assert_eq!(bytes, b"1");
     }
 
     #[test]
