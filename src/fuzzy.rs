@@ -72,8 +72,9 @@ pub fn score(query: &str, target: &str) -> Option<i32> {
         let q_len = fill_char_buf(query, &mut q_buf);
         score_impl(&q_buf[..q_len], target)
     } else {
-        let q: Vec<char> = query.to_lowercase().chars().collect();
-        score_impl(&q, target)
+        // 長大クエリはスタックバッファに載らないため、PreparedQuery のヒープ経路を共用する。
+        // (小文字化・score_impl 呼び出しとも従来の直接実装と完全に同一)
+        PreparedQuery::new(query).score(target)
     }
 }
 
@@ -120,7 +121,7 @@ fn score_impl(q: &[char], target: &str) -> Option<i32> {
 
         for ti in (0..t.len()).rev() {
             for qi in (0..q.len()).rev() {
-                for s in 0..6usize {
+                for (s, slot) in cur[qi].iter_mut().enumerate() {
                     let skip = next[qi][0];
                     let matched = if t[ti] == q[qi] {
                         let (streak_bonus, s2) = if s == 0 {
@@ -140,12 +141,10 @@ fn score_impl(q: &[char], target: &str) -> Option<i32> {
                     } else {
                         None
                     };
-                    cur[qi][s] = skip.max(matched);
+                    *slot = skip.max(matched);
                 }
             }
-            for qi in 0..q.len() {
-                next[qi] = cur[qi];
-            }
+            next[..q.len()].copy_from_slice(&cur[..q.len()]);
         }
 
         next[0][0].map(|best| best - (t.len() as i32) / 4)
@@ -156,7 +155,7 @@ fn score_impl(q: &[char], target: &str) -> Option<i32> {
 
         for ti in (0..t.len()).rev() {
             for qi in (0..q.len()).rev() {
-                for s in 0..6usize {
+                for (s, slot) in cur[qi].iter_mut().enumerate() {
                     let skip = next[qi][0];
                     let matched = if t[ti] == q[qi] {
                         let (streak_bonus, s2) = if s == 0 {
@@ -176,7 +175,7 @@ fn score_impl(q: &[char], target: &str) -> Option<i32> {
                     } else {
                         None
                     };
-                    cur[qi][s] = skip.max(matched);
+                    *slot = skip.max(matched);
                 }
             }
             std::mem::swap(&mut cur, &mut next);
@@ -473,10 +472,31 @@ mod tests {
 
     #[test]
     fn prepared_query_matches_identically_to_score() {
-        let q_str = "bc";
-        let target = "xbyy_bc";
-        let pq = PreparedQuery::new(q_str);
-        assert_eq!(pq.score(target), score(q_str, target));
-        assert_eq!(pq.score("abcd"), score(q_str, "abcd"));
+        // 全 (query, target) 組でスコアが完全一致すること = 順位も完全一致することを固定する
+        let targets = [
+            "xbyy_bc",
+            "abcd",
+            "no_match_here",
+            "",
+            "src/main.rs",
+            "日本語のターゲット文字列",
+        ];
+        for q_str in ["bc", "", "srcmain", "日本語", "zzz", "BC"] {
+            let pq = PreparedQuery::new(q_str);
+            for t in targets {
+                assert_eq!(pq.score(t), score(q_str, t), "q={q_str:?} t={t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_query_long_query_heap_path_matches_score() {
+        // MAX_STACK_Q 超のクエリ / MAX_STACK_T 超のターゲットでヒープ経路同士も一致する
+        let long_q = "a".repeat(MAX_STACK_Q + 8);
+        let long_t = "a".repeat(MAX_STACK_T + 16);
+        let pq = PreparedQuery::new(&long_q);
+        assert_eq!(pq.score(&long_t), score(&long_q, &long_t));
+        assert_eq!(pq.score("short"), score(&long_q, "short"));
+        assert_eq!(pq.score(""), score(&long_q, ""));
     }
 }
