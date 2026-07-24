@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// status --porcelain=v1 から得たファイル単位のステータス。
@@ -30,6 +31,13 @@ pub enum LineMark {
 
 const STATUS_CACHE_TTL: Duration = Duration::from_secs(2);
 const BRANCH_CACHE_TTL: Duration = Duration::from_secs(3);
+
+/// 共有の空行マーク。repo 外・非 repo のバッファで毎フレーム返す値なので、
+/// その都度 `Arc::new(Vec::new())` でアロケしないよう 1 つを使い回す。
+pub(crate) fn empty_line_marks() -> Arc<Vec<(usize, LineMark)>> {
+    static EMPTY: OnceLock<Arc<Vec<(usize, LineMark)>>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(Vec::new())))
+}
 
 /// `dir` が属する git リポジトリのトップレベルを返す(非 repo / git 不在なら None)。
 /// ルートがリポジトリのサブディレクトリでも正しいトップレベルが得られる。
@@ -58,7 +66,8 @@ pub struct Git {
     /// 最後に status を実行した時刻。None なら未実行。
     last_refresh: Option<Instant>,
     /// 相対パス → (text_hash, 行マーク) のキャッシュ。
-    marks_cache: HashMap<String, (u64, Vec<(usize, LineMark)>)>,
+    /// 値は Arc 共有: キャッシュヒット時に Vec を複製しない。
+    marks_cache: HashMap<String, (u64, Arc<Vec<(usize, LineMark)>>)>,
     /// ブランチ名の TTL キャッシュ (値, 取得時刻)。
     branch_cache: Option<(Option<String>, Instant)>,
 }
@@ -137,18 +146,20 @@ impl Git {
 
     /// 指定ファイルの 0-based 行番号 → LineMark。
     /// `text_hash` が前回と同一ならキャッシュを返し、git は再実行しない。
-    pub fn line_marks(&mut self, rel_path: &str, text_hash: u64) -> Vec<(usize, LineMark)> {
+    /// 戻りは Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製しない。
+    pub fn line_marks(&mut self, rel_path: &str, text_hash: u64) -> Arc<Vec<(usize, LineMark)>> {
         if let Some((hash, marks)) = self.marks_cache.get(rel_path) {
             if *hash == text_hash {
-                return marks.clone();
+                return Arc::clone(marks);
             }
         }
-        let marks = self
-            .run_git(&["diff", "--unified=0", "--", rel_path])
-            .map(|out| parse_hunk_marks(&out))
-            .unwrap_or_default();
+        let marks = Arc::new(
+            self.run_git(&["diff", "--unified=0", "--", rel_path])
+                .map(|out| parse_hunk_marks(&out))
+                .unwrap_or_default(),
+        );
         self.marks_cache
-            .insert(rel_path.to_string(), (text_hash, marks.clone()));
+            .insert(rel_path.to_string(), (text_hash, Arc::clone(&marks)));
         marks
     }
 
@@ -226,11 +237,8 @@ impl GitSet {
     }
 
     /// `abs` を含むルート(最長一致)。
-    fn root_for(&self, abs: &Path) -> Option<&PathBuf> {
-        self.roots
-            .iter()
-            .filter(|r| abs.starts_with(r))
-            .max_by_key(|r| r.as_os_str().len())
+    fn root_for(&self, abs: &Path) -> Option<&Path> {
+        crate::file_tree::root_for(&self.roots, abs)
     }
 
     /// `abs` → (repo トップレベル, repo からの相対パス)。
@@ -260,13 +268,13 @@ impl GitSet {
     }
 
     /// 絶対パスの行マーク。repo 外なら空。
-    pub fn line_marks(&mut self, abs: &Path, text_hash: u64) -> Vec<(usize, LineMark)> {
+    pub fn line_marks(&mut self, abs: &Path, text_hash: u64) -> Arc<Vec<(usize, LineMark)>> {
         let Some((top, rel)) = self.resolve(abs) else {
-            return Vec::new();
+            return empty_line_marks();
         };
         match self.repos.get_mut(&top) {
             Some(g) => g.line_marks(&rel, text_hash),
-            None => Vec::new(),
+            None => empty_line_marks(),
         }
     }
 

@@ -16,6 +16,19 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
+/// `p` を含むルート(最長一致)。どのルートにも属さなければ None。
+///
+/// FileTree / App / GitSet のルート解決が共有する唯一の実装。
+/// 同じ長さのルートが並んだ場合は `max_by_key` の仕様どおり
+/// 「後に並んだ方」が選ばれる(従来 3 実装と同一の挙動)。
+pub(crate) fn root_for<'a>(roots: &'a [PathBuf], p: &Path) -> Option<&'a Path> {
+    roots
+        .iter()
+        .filter(|r| p.starts_with(r))
+        .max_by_key(|r| r.as_os_str().len())
+        .map(|r| r.as_path())
+}
+
 /// 貼り付けの種類(コピー or 切り取りによる移動)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Transfer {
@@ -198,11 +211,7 @@ impl FileTree {
 
     /// `p` を含むルート(最長一致)。どのルートにも属さなければ None。
     pub fn root_for(&self, p: &Path) -> Option<&Path> {
-        self.roots
-            .iter()
-            .filter(|r| p.starts_with(r))
-            .max_by_key(|r| r.as_os_str().len())
-            .map(|r| r.as_path())
+        root_for(&self.roots, p)
     }
 
     pub fn invalidate(&mut self) {

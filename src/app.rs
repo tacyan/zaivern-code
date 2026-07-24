@@ -353,6 +353,11 @@ pub struct ZaivernApp {
     last_view_h: f32,
     /// エディタの垂直スクロール量(前フレーム値)
     last_scroll_y: f32,
+    /// アクティブバッファ本文のハッシュ (code_editor_ui が line_marks 用に毎フレーム更新)
+    last_text_hash: u64,
+    /// find バーのヒット数キャッシュ: (本文ハッシュ, query, ヒット数)。
+    /// 本文ハッシュは last_text_hash を使い回し、新たな全文走査はしない
+    find_count_cache: Option<(u64, String, usize)>,
     /// スマホリモートサーバ (起動失敗時は None + remote_err)
     remote: Option<remote::RemoteServer>,
     remote_err: Option<String>,
@@ -417,6 +422,10 @@ pub struct ZaivernApp {
     lsp_which_missing: HashMap<String, Instant>,
     /// アクティブバッファの診断件数 (エラー, 警告) — ステータスバー用
     diag_counts: (usize, usize),
+    /// アクティブバッファの診断キャッシュ:
+    /// (内容ハッシュ, 行→最悪 severity, エラー数, 警告数)。
+    /// (line, severity) 列が変わったときだけマップを作り直す
+    diag_cache: (u64, HashMap<usize, u8>, usize, usize),
     /// プラグインパネルの内容: (プラグイン名, パネルID) → 本文
     plugin_panels: HashMap<(String, String), String>,
     /// プラグインがステータスバーへ出した文字列(空なら非表示)
@@ -728,6 +737,8 @@ impl ZaivernApp {
             last_row_h: 18.0,
             last_view_h: 620.0,
             last_scroll_y: 0.0,
+            last_text_hash: 0,
+            find_count_cache: None,
             remote: None,
             remote_err: None,
             remote_open: false,
@@ -761,6 +772,8 @@ impl ZaivernApp {
             lsp_pending: HashMap::new(),
             lsp_which_missing: HashMap::new(),
             diag_counts: (0, 0),
+            // 初期キーは番兵 (u64::MAX): 最初の refresh で必ず作り直す
+            diag_cache: (u64::MAX, HashMap::new(), 0, 0),
             plugin_panels: HashMap::new(),
             plugin_status: String::new(),
             hook_last_run: HashMap::new(),
@@ -840,11 +853,7 @@ impl ZaivernApp {
 
     /// `p` を含むルート (最長一致)。どのルートにも属さなければ None。
     fn root_for(&self, p: &Path) -> Option<&Path> {
-        self.roots
-            .iter()
-            .filter(|r| p.starts_with(r))
-            .max_by_key(|r| r.as_os_str().len())
-            .map(|r| r.as_path())
+        file_tree::root_for(&self.roots, p)
     }
 
     /// ルート一覧を差し替え、ツリー / git / 索引 / タイトルを追随させる。
@@ -2009,21 +2018,28 @@ impl ZaivernApp {
         }
     }
 
-    /// アクティブバッファの診断: 行→最悪 severity のマップと (エラー数, 警告数)。
-    fn active_diagnostics(&self) -> (HashMap<usize, u8>, usize, usize) {
+    /// アクティブバッファの診断を `self.diag_cache` へ反映する。
+    /// 結果は diag_cache = (内容ハッシュ, 行→最悪 severity, エラー数, 警告数)。
+    /// (line, severity) 列のハッシュが前回と同じなら HashMap は作り直さない
+    /// (毎フレームのマップ構築アロケを避ける。既存の (hash, value) キャッシュと同じ流儀)。
+    fn refresh_active_diagnostics(&mut self) {
+        let diags = (|| {
+            let i = self.editor.active?;
+            let path = self.editor.buffers[i].path.as_ref()?;
+            let key = self.lsp_key_for(path, &self.editor.buffers[i].lang);
+            Some(self.lsp.get(&key)?.diagnostics(path))
+        })()
+        .unwrap_or_default();
+        let mut content = diags.len() as u64;
+        for d in &diags {
+            content = combine_hash(content, ((d.line as u64) << 8) | d.severity as u64);
+        }
+        if content == self.diag_cache.0 {
+            return;
+        }
         let mut by_line: HashMap<usize, u8> = HashMap::new();
         let (mut errs, mut warns) = (0usize, 0usize);
-        let Some(i) = self.editor.active else {
-            return (by_line, 0, 0);
-        };
-        let Some(path) = self.editor.buffers[i].path.as_ref() else {
-            return (by_line, 0, 0);
-        };
-        let key = self.lsp_key_for(path, &self.editor.buffers[i].lang);
-        let Some(client) = self.lsp.get(&key) else {
-            return (by_line, 0, 0);
-        };
-        for d in client.diagnostics(path) {
+        for d in &diags {
             match d.severity {
                 1 => errs += 1,
                 2 => warns += 1,
@@ -2034,7 +2050,7 @@ impl ZaivernApp {
                 *e = d.severity;
             }
         }
-        (by_line, errs, warns)
+        self.diag_cache = (content, by_line, errs, warns);
     }
 
     /// 現在のタブ構成などをワークスペース単位で保存する。
@@ -6201,11 +6217,26 @@ impl ZaivernApp {
                     }
                     if let Some(i) = self.editor.active {
                         if !self.find.query.is_empty() {
-                            let count = self.editor.buffers[i]
-                                .text
-                                .to_lowercase()
-                                .matches(&self.find.query.to_lowercase())
-                                .count();
+                            // 毎フレームの全文 to_lowercase を避ける:
+                            // code_editor_ui が line_marks 用に計算済みの本文ハッシュ
+                            // (last_text_hash) + query をキーにヒット数をキャッシュ
+                            let count = match &self.find_count_cache {
+                                Some((h, q, c))
+                                    if *h == self.last_text_hash && *q == self.find.query =>
+                                {
+                                    *c
+                                }
+                                _ => {
+                                    let c = self.editor.buffers[i]
+                                        .text
+                                        .to_lowercase()
+                                        .matches(&self.find.query.to_lowercase())
+                                        .count();
+                                    self.find_count_cache =
+                                        Some((self.last_text_hash, self.find.query.clone(), c));
+                                    c
+                                }
+                            };
                             ui.label(
                                 RichText::new(trf("{count} 件", &[("count", count.to_string())]))
                                     .color(theme.text_dim),
@@ -6246,9 +6277,12 @@ impl ZaivernApp {
             self.find_next();
         }
         if do_replace {
+            // 置換は本文を変えるので、次フレームのハッシュ更新を待たず即キャッシュ破棄
+            self.find_count_cache = None;
             self.replace_current();
         }
         if do_replace_all {
+            self.find_count_cache = None;
             self.replace_all_in_active();
         }
         if close {
@@ -6358,9 +6392,12 @@ impl ZaivernApp {
         self.gitinfo.refresh_if_stale();
         let abs = self.editor.buffers[active].path.clone();
         let text_hash = hash_str(&self.editor.buffers[active].text);
-        let marks: Vec<(usize, git::LineMark)> = match abs {
+        // find バーのヒット数キャッシュもこのハッシュを使い回す(再計算しない)
+        self.last_text_hash = text_hash;
+        // Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製されない
+        let marks = match abs {
             Some(p) => self.gitinfo.line_marks(&p, text_hash),
-            None => Vec::new(),
+            None => git::empty_line_marks(),
         };
 
         // LSP: この言語のサーバーを必要なら起動し did_open、診断を取得
@@ -6370,8 +6407,9 @@ impl ZaivernApp {
             let ctx = ui.ctx().clone();
             self.ensure_lsp(&ctx, &p, &lang_clone, active);
         }
-        let (diag_by_line, derr, dwarn) = self.active_diagnostics();
-        self.diag_counts = (derr, dwarn);
+        self.refresh_active_diagnostics();
+        self.diag_counts = (self.diag_cache.2, self.diag_cache.3);
+        let diag_by_line = &self.diag_cache.1;
 
         // スニペット Tab 展開: エディタにフォーカスがあり、選択が空で、
         // カーソル直前の単語が prefix に一致するときだけ Tab を横取りする
@@ -6393,8 +6431,56 @@ impl ZaivernApp {
                                 .and_then(|p| p.file_name())
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_default();
-                            let text = self.editor.buffers[active].text.clone();
-                            snippets::try_expand_at(&text, cursor_char, snips, &filename)
+                            // 全文 clone はしない: カーソル直前の単語だけを窓として
+                            // try_expand_at へ渡し、展開時に前後を張り合わせる。
+                            // prefix 単語は ASCII 英数字と _ のみなので、バイト後退で
+                            // 安全に単語頭を求められる (UTF-8 継続バイトは非 ASCII)。
+                            let text = &self.editor.buffers[active].text;
+                            // char index → byte index (try_expand_at 同様、末尾へクランプ)
+                            let mut cursor_chars = 0usize;
+                            let mut cursor_byte = text.len();
+                            for (b, _) in text.char_indices() {
+                                if cursor_chars == cursor_char {
+                                    cursor_byte = b;
+                                    break;
+                                }
+                                cursor_chars += 1;
+                            }
+                            let cursor_chars = cursor_chars.min(cursor_char);
+                            let bytes = text.as_bytes();
+                            let mut word_start = cursor_byte;
+                            while word_start > 0 {
+                                let c = bytes[word_start - 1];
+                                if c.is_ascii_alphanumeric() || c == b'_' {
+                                    word_start -= 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            // ASCII のみの単語なのでバイト数 = char 数
+                            let word_len = cursor_byte - word_start;
+                            if word_len == 0 {
+                                // 直前が単語でなければ従来どおり展開なし
+                                None
+                            } else {
+                                snippets::try_expand_at(
+                                    &text[word_start..cursor_byte],
+                                    word_len,
+                                    snips,
+                                    &filename,
+                                )
+                                .map(|(ins, rel)| {
+                                    let mut nt = String::with_capacity(
+                                        text.len() - word_len + ins.len(),
+                                    );
+                                    nt.push_str(&text[..word_start]);
+                                    nt.push_str(&ins);
+                                    nt.push_str(&text[cursor_byte..]);
+                                    // 窓は単語そのものなので窓内カーソル rel を
+                                    // 単語頭の絶対 char 位置に足せば従来と一致する
+                                    (nt, cursor_chars - word_len + rel)
+                                })
+                            }
                         }
                         None => None,
                     }
@@ -6426,13 +6512,13 @@ impl ZaivernApp {
         // 行番号ガター: git マークで行ごとに色分けした LayoutJob をキャッシュ
         let line_count = text.split('\n').count();
         let mut marks_hash: u64 = marks.len() as u64;
-        for (l, m) in &marks {
+        for (l, m) in marks.iter() {
             marks_hash = marks_hash
                 .wrapping_mul(31)
                 .wrapping_add(((*l as u64) << 1) | matches!(m, git::LineMark::Added) as u64);
         }
         let mut diag_hash: u64 = diag_by_line.len() as u64;
-        for (l, sev) in &diag_by_line {
+        for (l, sev) in diag_by_line {
             diag_hash = diag_hash
                 .wrapping_mul(37)
                 .wrapping_add((*l as u64) << 3 | *sev as u64);
