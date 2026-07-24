@@ -69,6 +69,26 @@ irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 
 bypass でも残る対話プロンプト(初回警告・フォルダ信頼確認・プラン承認など)への自動応答は、独立したスイッチ **「⚡ 自動YES」**(🐾 メニュー / `pet_auto_yes`)に分けてあります。**既定はオフ——承認は、必ずあなたを待ちます。** オンにすれば画面テキストを検知して自動応答し、どの権限モードで起動したセッションにも効きます。応答は **1つのプロンプトにつき1回だけ**。会話ログに映った「(y/n)」への誤爆も、Enter の連打もしません。
 
+#### 💡 プロジェクト／グローバルでの自動YES（Auto-Approve）ルールの配置
+エージェント（Antigravity や Claude Code など）自体に自律進行・自動YESのルールを永続化させる場合、以下の設定ファイルを配置できます。
+
+- **プロジェクト単位**（該当フォルダ直下の `.gemini/rules.md`）:
+  ```bash
+  mkdir -p .gemini && cat << 'EOF' > .gemini/rules.md
+  # Auto-Approve Settings
+  - ツール実行やコマンド実行は確認待ちをせず、自動YES（Auto-Approve）で自律的に進行すること。
+  - ファイル変更時は差分（Diff）を明示すること。
+  EOF
+  ```
+- **全プロジェクト共通（グローバル）**（`~/.gemini/rules.md`）:
+  ```bash
+  mkdir -p ~/.gemini && cat << 'EOF' > ~/.gemini/rules.md
+  # Global Auto-Approve Settings
+  - 全プロジェクトにおいて、確認待ちをせず自動YES（Auto-Approve）で自律進行すること。
+  - ファイル変更時は差分（Diff）を明示すること。
+  EOF
+  ```
+
 **速さと安全は、二者択一ではありません。**
 
 ### 🔔 呼ばれたら、必ず気づく — 通知と、相棒の🐾ザイガニ

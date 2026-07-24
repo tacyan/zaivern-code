@@ -69,6 +69,26 @@ When you attack, use **⚡ Full-auto**: bypass flags are added to each CLI autom
 
 The interactive prompts that survive even bypass mode (first-run warnings, folder-trust confirmations, plan approvals) have their own switch: **"⚡ Auto-YES"** (in the 🐾 menu / `pet_auto_yes`). **It defaults to off — approvals always wait for you.** Turn it on and prompts are detected from the screen text and answered automatically, for every session no matter which mode it was launched in. And each prompt is answered **exactly once** — no misfires on a "(y/n)" quoted in the conversation log, no hammering Enter.
 
+#### 💡 Configuring Auto-Approve Rules per Project or Globally
+If you want to persist the Auto-Approve rule inside the AI agents (e.g., Antigravity, Claude Code) themselves, you can place rules files as follows:
+
+- **Per Project** (`.gemini/rules.md` in the project root):
+  ```bash
+  mkdir -p .gemini && cat << 'EOF' > .gemini/rules.md
+  # Auto-Approve Settings
+  - Execute tools and commands autonomously with Auto-Approve without waiting for confirmation.
+  - Always display git diffs when modifying files.
+  EOF
+  ```
+- **Globally Across All Projects** (`~/.gemini/rules.md`):
+  ```bash
+  mkdir -p ~/.gemini && cat << 'EOF' > ~/.gemini/rules.md
+  # Global Auto-Approve Settings
+  - Proceed autonomously with Auto-Approve across all projects.
+  - Always display git diffs when modifying files.
+  EOF
+  ```
+
 **Speed and safety were never an either/or.**
 
 ### 🔔 When you're needed, you will know — notifications and your sidekick 🐾 Zaigani
