@@ -325,7 +325,40 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
     {
         return Some((b"y\r", "「y」"));
     }
+
+    // YESモードでは質問の種類を限定しない。既知CLIの承認文言に一致しなくても、
+    // 画面末尾の実際の入力待ちが質問文なら肯定して送信する。
+    //
+    // 画面全体に過去ログの質問が残るのは通常なので、末尾側の最後の非空行だけを見る。
+    // これにより会話履歴中の「?」への誤反応を抑えつつ、未知・将来版CLIの質問にも
+    // YESで進める。TUI固有の選択キーは上の専用判定を優先する。
+    if last_nonempty_line(text).is_some_and(is_question_line) {
+        return Some((b"y\r", "質問に自動「Yes」"));
+    }
     None
+}
+
+/// 末尾側の最後の非空行。CLIの入力待ちは通常ここに表示される。
+fn last_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().rev().map(str::trim).find(|line| !line.is_empty())
+}
+
+/// YESモードで肯定する一般的な質問行か。
+fn is_question_line(line: &str) -> bool {
+    let line = line.trim_end();
+    line.ends_with('?')
+        || line.ends_with('？')
+        || [
+            "しますか",
+            "できますか",
+            "よろしいですか",
+            "いいですか",
+            "どうしますか",
+            "続けますか",
+            "進めますか",
+        ]
+        .iter()
+        .any(|ending| line.ends_with(ending))
 }
 
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
@@ -392,7 +425,7 @@ pub fn prompt_signature(text: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let lines: Vec<&str> = text.lines().collect();
     for (i, line) in lines.iter().enumerate() {
-        if SIG_MARKS.iter().any(|m| line.contains(m)) {
+        if SIG_MARKS.iter().any(|m| line.contains(m)) || is_question_line(line) {
             if i > 0 {
                 lines[i - 1].trim_end().hash(&mut h);
             }
@@ -1404,6 +1437,25 @@ mod tests {
     }
 
     #[test]
+    fn any_final_question_sends_yes() {
+        for screen in [
+            "Which deployment strategy should be used?",
+            "このまま本番環境へデプロイしますか？",
+            "処理を続けますか",
+        ] {
+            let (bytes, desc) = auto_yes_reply(screen).unwrap();
+            assert_eq!(bytes, b"y\r", "screen={screen}");
+            assert!(desc.contains("Yes"), "screen={screen}");
+        }
+    }
+
+    #[test]
+    fn question_in_history_does_not_trigger_when_latest_line_is_not_question() {
+        let screen = "User: Shall I deploy this?\nAssistant: Build completed successfully.";
+        assert!(auto_yes_reply(screen).is_none());
+    }
+
+    #[test]
     fn codex_command_approval_sends_yes_shortcut() {
         let screen = "Would you like to run the following command?\n\
                       $ cargo test\n\
@@ -1757,6 +1809,17 @@ mod tests {
         // 直上のコマンドプレビューが違えば別のプロンプト(連続承認キューの区別)
         let other = a.replace("echo hi", "cargo test");
         assert_ne!(prompt_signature(a), prompt_signature(&other));
+    }
+
+    #[test]
+    fn generic_question_signature_is_keyed_by_question_content() {
+        use super::prompt_signature;
+
+        let first = "output\nChoose the production target?";
+        let same_with_history = "old output\noutput\nChoose the production target?";
+        let next = "output\nRun the database migration?";
+        assert_eq!(prompt_signature(first), prompt_signature(same_with_history));
+        assert_ne!(prompt_signature(first), prompt_signature(next));
     }
 
     #[test]
