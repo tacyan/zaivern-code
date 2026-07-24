@@ -52,8 +52,10 @@ pub struct Session {
     /// このセッションが bypass 権限フラグ付きで起動されたか(表示用)。
     pub launched_bypass: bool,
     last_scan: Instant,
-    /// 全自動YESの直近送信時刻(同じプロンプトへの連打防止)。
-    last_auto_reply: Option<Instant>,
+    /// 応答済みプロンプトの指紋 (prompt_signature)。自動YES送信・バブルの承認/拒否の
+    /// あとに立て、同じプロンプトが画面に残っていても二度目の応答・再検出をしない。
+    /// プロンプトが画面から消える、または別のプロンプトに変わったら下ろす。
+    answered_sig: Option<u64>,
     /// マウスドラッグによる文字選択: (開始セル, 終了セル)。(row, col) の画面表示座標。
     pub selection: Option<((u16, u16), (u16, u16))>,
     /// ドラッグ選択のアンカー(ドラッグ開始セル)。
@@ -238,6 +240,43 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         return Some((b"y\r", "「y」"));
     }
     None
+}
+
+/// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
+/// auto_yes_reply だけが分類する特殊プロンプトも含める。
+const SIG_MARKS: [&str; 10] = [
+    "Do you want",
+    "Would you like to proceed",
+    "❯ 1. Yes",
+    "1. Yes",
+    "(y/n)",
+    "[y/N]",
+    "[y/n]",
+    "Yes, I accept",
+    "trust the files in this folder",
+    "Bypass Permissions mode",
+];
+
+/// 画面に出ている承認プロンプトの「指紋」。
+///
+/// マーカーを含む行と、その直前の行のテキストだけをハッシュする。
+/// 直前行を含めるのは、Claude Code の連続承認キューのように
+/// 「Do you want to proceed? / ❯ 1. Yes」自体は同一でも、直上のコマンド
+/// プレビューが変わる = 別のプロンプト、を区別するため。行テキストのみで
+/// 位置は使わないので、スクロールや下部の出力追加では変わらない。
+pub fn prompt_signature(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if SIG_MARKS.iter().any(|m| line.contains(m)) {
+            if i > 0 {
+                lines[i - 1].trim_end().hash(&mut h);
+            }
+            line.trim_end().hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 // ── 端末問い合わせへの応答 (query / response) ────────────────────────────
@@ -811,7 +850,7 @@ impl Session {
             notified_exit: false,
             launched_bypass,
             last_scan: Instant::now(),
-            last_auto_reply: None,
+            answered_sig: None,
             selection: None,
             sel_anchor: None,
             copied_at: None,
@@ -878,6 +917,10 @@ impl Session {
     /// 画面内容から「ユーザーの承認待ち」を推定する(約1秒間隔)。
     /// auto_yes=true なら承認プロンプトへ自動でYESを送信し AutoReplied を返す。
     /// それ以外は、新たに承認待ちへ遷移したときだけ NeedsApproval を返す。
+    ///
+    /// 応答(自動YES・バブルの承認/拒否)済みのプロンプトは、画面に残っていても
+    /// 再送・再検出しない — 1プロンプトにつき応答は一回で完結する。
+    /// プロンプトが消えるか、指紋の異なる別プロンプトに変わったら再び対象になる。
     pub fn scan_attention(&mut self, auto_yes: bool) -> Option<Attention> {
         if self.last_scan.elapsed().as_millis() < 900 {
             return None;
@@ -913,24 +956,25 @@ impl Session {
             "[y/N]",
         ];
         let reply = auto_yes_reply(&text);
-        let waiting = reply.is_some() || PATTERNS.iter().any(|p| text.contains(p));
+        let present = reply.is_some() || PATTERNS.iter().any(|p| text.contains(p));
+        // 応答済みエピソードの追跡: プロンプトが画面から消えた、または指紋が
+        // 変わった(連続承認キューの次のダイアログ等)ら「応答済み」を下ろす。
+        let sig = if present { Some(prompt_signature(&text)) } else { None };
+        if self.answered_sig.is_some() && self.answered_sig != sig {
+            self.answered_sig = None;
+        }
+        let waiting = present && self.answered_sig.is_none();
         let newly = waiting && !self.attention;
         self.attention = waiting;
-        if auto_yes {
+        if auto_yes && waiting {
             if let Some((bytes, desc)) = reply {
-                // 直前の応答が効くまでの猶予を置き、同じプロンプトへ連打しない。
-                // プロンプトが画面に残っている限り2秒おきに再送する(取りこぼし対策)。
-                let ready = self
-                    .last_auto_reply
-                    .map(|t| t.elapsed().as_millis() >= 2000)
-                    .unwrap_or(true);
-                if ready {
-                    self.last_auto_reply = Some(Instant::now());
-                    self.write_bytes(bytes);
-                    self.attention = false;
-                    return Some(Attention::AutoReplied(desc));
-                }
-                return None;
+                // 同じプロンプトへは一度だけ送る。画面に残っていても再送しない
+                // (再送は Claude 側の入力欄への Enter/y 連打事故になる)。
+                // 指紋が変わって別のプロンプトが来たときだけ、また一度応答する。
+                self.answered_sig = sig;
+                self.write_bytes(bytes);
+                self.attention = false;
+                return Some(Attention::AutoReplied(desc));
             }
         }
         if newly {
@@ -1044,11 +1088,15 @@ impl Session {
         true
     }
 
-    /// 承認待ちフラグを解除する(バブルで応答した後に呼ぶ)。
+    /// 承認待ちフラグを解除する(バブルの承認/拒否や見張りの自動応答の後に呼ぶ)。
     ///
-    /// プロンプトがまだ画面に残っていれば次回の scan_attention で再検出される。
+    /// いま画面に出ているプロンプトの指紋を「応答済み」として記録するので、
+    /// 同じプロンプトが画面に残っていても再検出せず、バブルが何度も出ない。
+    /// プロンプトが消える・別のプロンプトに変わると、また検出対象へ戻る。
     pub fn resolve_attention(&mut self) {
         self.attention = false;
+        let text = self.parser.lock().unwrap().screen().contents();
+        self.answered_sig = Some(prompt_signature(&text));
     }
 
     /// バブルの「✔ 承認」で送るキー列を、いま画面に出ているプロンプトから決める。
@@ -1467,6 +1515,158 @@ mod tests {
             }
         }
         assert!(approved, "承認後に子プロセスが進まなかった");
+        s.kill();
+    }
+
+    // ── 応答の一回完結(エピソード方式) ────────────────────────────────
+
+    #[test]
+    fn prompt_signature_keyed_by_content_not_position() {
+        use super::prompt_signature;
+        let a = "cmd: echo hi\nDo you want to proceed?\n❯ 1. Yes\n  2. No";
+        // 上に古い出力が増えて行位置がずれても指紋は同じ(スクロール耐性)
+        let scrolled = format!("older output\nmore output\n{a}");
+        assert_eq!(prompt_signature(a), prompt_signature(&scrolled));
+        // プロンプトの下に無関係の出力が増えても同じ
+        let below = format!("{a}\nstreaming output…");
+        assert_eq!(prompt_signature(a), prompt_signature(&below));
+        // 直上のコマンドプレビューが違えば別のプロンプト(連続承認キューの区別)
+        let other = a.replace("echo hi", "cargo test");
+        assert_ne!(prompt_signature(a), prompt_signature(&other));
+    }
+
+    #[test]
+    fn auto_yes_replies_only_once_while_same_prompt_remains() {
+        use super::{Attention, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        // 入力を読まずにプロンプトを出しっぱなしにする子。TUI ダイアログ同様
+        // エコー無し (以前は画面に残っている限り2秒おきに再送 → Enter連打事故)。
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let spec = SpawnSpec {
+            title: "one-shot-auto".into(),
+            preset_name: "test".into(),
+            icon: "⚡".into(),
+            command: cmd.into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s =
+            Session::spawn(995, spec, eframe::egui::Context::default()).expect("PTY起動");
+
+        let mut replies = 0u32;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
+                replies += 1;
+                break;
+            }
+        }
+        assert_eq!(replies, 1, "自動YESが送られなかった");
+
+        // プロンプトは画面に残ったまま。4秒スキャンし続けても再送・再検出しない
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            match s.scan_attention(true) {
+                Some(Attention::AutoReplied(_)) => replies += 1,
+                Some(Attention::NeedsApproval) => panic!("応答済みプロンプトを再検出した"),
+                _ => {}
+            }
+        }
+        assert_eq!(replies, 1, "同じプロンプトへ自動YESが再送された(Enter連打バグ)");
+        assert!(!s.attention, "応答済みの間はバブル表示条件(attention)が立たない");
+        s.kill();
+    }
+
+    #[test]
+    fn resolve_attention_suppresses_same_prompt_redetection() {
+        use super::{Attention, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let spec = SpawnSpec {
+            title: "one-shot-deny".into(),
+            preset_name: "test".into(),
+            icon: "✖".into(),
+            command: cmd.into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s =
+            Session::spawn(994, spec, eframe::egui::Context::default()).expect("PTY起動");
+
+        let mut detected = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(false), Some(Attention::NeedsApproval)) {
+                detected = true;
+                break;
+            }
+        }
+        assert!(detected, "承認プロンプトが検知されなかった");
+
+        // バブルの「✖ 拒否」相当: Esc 送信 + resolve_attention
+        assert!(s.send_text("\u{1b}"));
+        s.resolve_attention();
+        assert!(!s.attention);
+
+        // プロンプトが画面に残っていても、バブルが再表示される条件へ戻らない
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                s.scan_attention(false).is_none(),
+                "拒否済みプロンプトを再検出した(バブル再出現バグ)"
+            );
+            assert!(!s.attention);
+        }
+        s.kill();
+    }
+
+    #[test]
+    fn next_prompt_with_different_signature_is_detected_again() {
+        use super::{Attention, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        // 連続承認キューを模す: 1つ目に応答済みでも、内容の異なる2つ目が
+        // 現れたら(1つ目が画面から消えていなくても)新規プロンプトとして検出する
+        let cmd = r#"stty -echo; printf 'cmd A\nDo you want to proceed? (y/n) '; sleep 4; printf '\ncmd B\nDo you want to proceed? (y/n) '; sleep 30"#;
+        let spec = SpawnSpec {
+            title: "queued-prompts".into(),
+            preset_name: "test".into(),
+            icon: "🔁".into(),
+            command: cmd.into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s =
+            Session::spawn(993, spec, eframe::egui::Context::default()).expect("PTY起動");
+
+        let mut detected = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(false), Some(Attention::NeedsApproval)) {
+                detected = true;
+                break;
+            }
+        }
+        assert!(detected, "1つ目のプロンプトが検知されなかった");
+        s.resolve_attention();
+
+        let mut redetected = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(false), Some(Attention::NeedsApproval)) {
+                redetected = true;
+                break;
+            }
+        }
+        assert!(redetected, "指紋の異なる2つ目のプロンプトが検知されなかった");
         s.kill();
     }
 
