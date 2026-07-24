@@ -299,7 +299,13 @@ impl FileTree {
         v
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, theme: &Theme, actions: &mut TreeActions) {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        gitinfo: &crate::git::GitSet,
+        actions: &mut TreeActions,
+    ) {
         self.menu_open = false;
         let ctx = ui.ctx().clone();
         // 描画前に可視行のスナップショットを取り、キーボード操作を先に処理する
@@ -311,7 +317,7 @@ impl FileTree {
         // 単一ルート時は従来どおりヘッダ無しで直下を描く(見た目を変えない)。
         if roots.len() <= 1 {
             let root = roots.into_iter().next().unwrap_or_else(|| PathBuf::from("."));
-            self.dir_ui(ui, &root, theme, actions, 0);
+            self.dir_ui(ui, &root, theme, gitinfo, actions, 0);
         } else {
             for root in &roots {
                 let name = root
@@ -320,13 +326,19 @@ impl FileTree {
                     .unwrap_or_else(|| root.to_string_lossy().to_string());
                 let sel = self.selected.as_deref() == Some(root.as_path());
                 let st = CollapsingState::load_with_default_open(&ctx, dir_state_id(root), true);
+                let (color, badge_text) = if let Some((st_type, count)) = gitinfo.dir_status(root) {
+                    let (c, b, _) = git_status_style(st_type, theme);
+                    (c, format!(" {b}•{count}"))
+                } else {
+                    (theme.text, String::new())
+                };
                 let hr = st.show_header(ui, |ui| {
                     ui.selectable_label(
                         sel,
-                        RichText::new(format!("📚 {name}")).color(theme.text).strong(),
+                        RichText::new(format!("📚 {name}{badge_text}")).color(color).strong(),
                     )
                 });
-                let (_, header, _) = hr.body(|ui| self.dir_ui(ui, root, theme, actions, 0));
+                let (_, header, _) = hr.body(|ui| self.dir_ui(ui, root, theme, gitinfo, actions, 0));
                 let resp = header.inner;
                 if resp.clicked() {
                     self.select(root);
@@ -807,16 +819,48 @@ impl FileTree {
                 done = true;
             }
         });
-        if !done {
-            self.edit = Some(es);
-        }
     }
+}
 
+/// FileStatus に対応する VS Code 風カラーとステータスバッジ
+fn git_status_style(status: crate::git::FileStatus, _theme: &Theme) -> (egui::Color32, &'static str, &'static str) {
+    use crate::git::FileStatus;
+    match status {
+        FileStatus::Modified => (
+            egui::Color32::from_rgb(229, 192, 123), // 薄いオレンジ/イエロー (VS Code #E5C07B)
+            "M",
+            "変更あり (Modified)",
+        ),
+        FileStatus::Added => (
+            egui::Color32::from_rgb(115, 201, 145), // 明るいグリーン (VS Code #73C991)
+            "A",
+            "追加済み (Added)",
+        ),
+        FileStatus::Untracked => (
+            egui::Color32::from_rgb(115, 201, 145), // 明るいグリーン (VS Code #73C991)
+            "U",
+            "未追跡 (Untracked)",
+        ),
+        FileStatus::Deleted => (
+            egui::Color32::from_rgb(224, 108, 117), // 赤 (VS Code #E06C75)
+            "D",
+            "削除済み (Deleted)",
+        ),
+        FileStatus::Renamed => (
+            egui::Color32::from_rgb(97, 175, 239), // シアン/ブルー (VS Code #61AFEF)
+            "R",
+            "名前変更 (Renamed)",
+        ),
+    }
+}
+
+impl FileTree {
     fn dir_ui(
         &mut self,
         ui: &mut egui::Ui,
         dir: &Path,
         theme: &Theme,
+        gitinfo: &crate::git::GitSet,
         actions: &mut TreeActions,
         depth: usize,
     ) {
@@ -837,11 +881,6 @@ impl FileTree {
             // 切り取り待ちの項目は薄く描く(VS Code と同じ合図)
             let cut_pending =
                 matches!(&self.clipboard, Some((p, true)) if p == &e.path);
-            let color = if cut_pending {
-                theme.text.gamma_multiply(0.5)
-            } else {
-                theme.text
-            };
             if e.is_dir {
                 let ctx = ui.ctx().clone();
                 let mut st =
@@ -851,11 +890,21 @@ impl FileTree {
                     st.set_open(true);
                     st.store(&ctx);
                 }
+
+                let (dir_color, dir_badge) = if cut_pending {
+                    (theme.text.gamma_multiply(0.5), String::new())
+                } else if let Some((st_type, count)) = gitinfo.dir_status(&e.path) {
+                    let (c, b, _) = git_status_style(st_type, theme);
+                    (c, format!(" {b}•{count}"))
+                } else {
+                    (theme.text, String::new())
+                };
+
                 let hr = st.show_header(ui, |ui| {
-                    ui.selectable_label(sel, RichText::new(format!("📁 {}", e.name)).color(color))
+                    ui.selectable_label(sel, RichText::new(format!("📁 {}{}", e.name, dir_badge)).color(dir_color))
                 });
                 let (_, header, _) =
-                    hr.body(|ui| self.dir_ui(ui, &e.path, theme, actions, depth + 1));
+                    hr.body(|ui| self.dir_ui(ui, &e.path, theme, gitinfo, actions, depth + 1));
                 let resp = header.inner;
                 if resp.clicked() {
                     // VS Code: フォルダのクリックは選択 + 開閉
@@ -891,8 +940,20 @@ impl FileTree {
                     }
                 });
             } else {
-                let label = format!("{} {}", icon_for(&e.name), e.name);
-                let resp = ui.selectable_label(sel, RichText::new(label).color(color));
+                let (file_color, file_badge, hint) = if cut_pending {
+                    (theme.text.gamma_multiply(0.5), String::new(), "")
+                } else if let Some(st_type) = gitinfo.file_status(&e.path) {
+                    let (c, b, h) = git_status_style(st_type, theme);
+                    (c, format!("  {b}"), h)
+                } else {
+                    (theme.text, String::new(), "")
+                };
+
+                let label = format!("{} {}{}", icon_for(&e.name), e.name, file_badge);
+                let mut resp = ui.selectable_label(sel, RichText::new(label).color(file_color));
+                if !hint.is_empty() {
+                    resp = resp.on_hover_text(hint);
+                }
                 // エージェントのターミナルへドラッグ&ドロップでパスを渡せる
                 // (クリック=開く はそのまま。ドラッグとクリックは egui が排他にする)
                 let resp = resp.interact(egui::Sense::click_and_drag());

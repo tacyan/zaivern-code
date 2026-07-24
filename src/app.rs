@@ -30,6 +30,7 @@ use crate::menu_bar;
 use crate::notify;
 use crate::github;
 use crate::ide;
+use crate::kanban;
 use crate::palette::{Action, Cmd, Item, Palette};
 use crate::panels;
 use crate::pet;
@@ -329,6 +330,11 @@ pub struct ZaivernApp {
     pending_prompts: Vec<(u64, Instant, String)>,
     highlighter: Highlighter,
     cockpit: bool,
+    /// フリート看板 (全エージェントを状態列で俯瞰・指揮するカンバン画面)。
+    /// Cockpit と同格の中央画面モードで、両方 true にはしない (切替時に他方を落とす)。
+    kanban: bool,
+    /// 看板画面の UI 状態 (ブロードキャスト/指示の入力バッファ等)
+    kanban_state: kanban::KanbanState,
     /// Markdown/HTML ファイルをレンダリング表示するモード (Cockpit の編集ペインでも有効)
     md_preview: bool,
     /// プレビューが参照するローカル画像のテクスチャキャッシュ
@@ -407,6 +413,7 @@ pub struct ZaivernApp {
     remote_open: bool,
     qr_tex: Option<egui::TextureHandle>,
     broadcast_input: String,
+    agent_input_buf: crate::agent_input::AgentInputBuffer,
     gitinfo: git::GitSet,
     /// Git サイドバー。単一 repo 表示なので常に primary ルートを見る。
     git_panel: git_panel::GitPanel,
@@ -737,6 +744,8 @@ impl ZaivernApp {
             pending_prompts: Vec::new(),
             highlighter: Highlighter::new(),
             cockpit: false,
+            kanban: false,
+            kanban_state: kanban::KanbanState::default(),
             md_preview: false,
             md_images: markdown::ImageCache::default(),
             md_pre_cache: None,
@@ -788,6 +797,7 @@ impl ZaivernApp {
             voice: VoiceState::default(),
             qr_tex: None,
             broadcast_input: String::new(),
+            agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
             pet_pos: match (cfg.pet_x, cfg.pet_y) {
                 (Some(x), Some(y)) => Some(egui::pos2(x, y)),
                 _ => None,
@@ -1468,10 +1478,14 @@ impl ZaivernApp {
     /// エージェントの入力欄へテキストを差し込む。`submit` が true のときだけ Enter を送る。
     /// `agent` が None ならアクティブなセッション、Some なら名前 (プリセット名/タイトル) で探す。
     fn send_agent_prompt(&mut self, agent: Option<&str>, text: &str, submit: bool) -> bool {
+        // スラッシュコマンド（/goal, /loop, /help 等）の高速パース・プロンプト展開
+        let parsed_cmd = crate::agent_input::SlashCommandEngine::parse(text);
+        let expanded_text = crate::agent_input::SlashCommandEngine::expand_command(&parsed_cmd);
+
         let payload = if submit {
-            format!("{text}\r")
+            format!("{expanded_text}\r")
         } else {
-            text.to_string()
+            expanded_text.clone()
         };
         let idx = match agent.map(str::trim).filter(|a| !a.is_empty()) {
             Some(name) => self.agents.sessions.iter().position(|s| {
@@ -1498,7 +1512,7 @@ impl ZaivernApp {
         self.agents.panel_open = true;
         let verb = if submit { tr("送信") } else { tr("入力欄へ") };
         self.toast(
-            format!("🔌 {title} {verb}: {}", notify::truncate_chars(text, 60)),
+            format!("🔌 {title} {verb}: {}", notify::truncate_chars(&expanded_text, 60)),
             true,
         );
         true
@@ -2781,6 +2795,7 @@ impl ZaivernApp {
             | Cmd::RemoveFolder(_) => self.apply_cmd_run_workspace(cmd, ctx),
             Cmd::ToggleTerminal
             | Cmd::ToggleCockpit
+            | Cmd::ToggleKanban
             | Cmd::OpenAgentPicker
             | Cmd::NewTask
             | Cmd::SendAgentMessage
@@ -3094,15 +3109,28 @@ impl ZaivernApp {
                 }
                 self.persist_session();
             }
-            Cmd::ToggleCockpit => self.cockpit = !self.cockpit,
+            Cmd::ToggleCockpit => {
+                self.cockpit = !self.cockpit;
+                if self.cockpit {
+                    self.kanban = false;
+                }
+            }
+            Cmd::ToggleKanban => {
+                self.kanban = !self.kanban;
+                if self.kanban {
+                    self.cockpit = false;
+                }
+            }
             Cmd::OpenAgentPicker => self.agent_picker.open(ctx),
             // フォームは Cockpit の中で描くので、一緒に開く。
             Cmd::NewTask => {
                 self.cockpit = true;
+                self.kanban = false;
                 self.orch.open_task_form();
             }
             Cmd::SendAgentMessage => {
                 self.cockpit = true;
+                self.kanban = false;
                 self.orch.open_msg_form();
             }
             Cmd::ToggleMdPreview => {
@@ -3689,6 +3717,9 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::ToggleCockpit)) {
             cmds.push(Cmd::ToggleCockpit);
         }
+        if consume(ctx, self.keys.get(BindAction::ToggleKanban)) {
+            cmds.push(Cmd::ToggleKanban);
+        }
         if consume(ctx, self.keys.get(BindAction::ToggleMdPreview)) {
             cmds.push(Cmd::ToggleMdPreview);
         }
@@ -4253,6 +4284,17 @@ impl ZaivernApp {
             cmds.push(Cmd::ToggleCockpit);
         }
 
+        let kanban =
+            ui.selectable_label(self.kanban, RichText::new(tr("📋 看板")));
+        if kanban
+            .on_hover_text(tr(
+                "フリート看板 — 全エージェントの状況を俯瞰 (⌘⇧K)",
+            ))
+            .clicked()
+        {
+            cmds.push(Cmd::ToggleKanban);
+        }
+
         ui.menu_button("👾 Agent ＋", |ui| {
             for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
                 if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
@@ -4261,6 +4303,17 @@ impl ZaivernApp {
                 }
             }
             ui.separator();
+            // エージェントと同じ場所から呼び出せる「指揮統制の看板」。
+            if ui
+                .button(tr("📋 フリート看板 — 全員の状況を俯瞰"))
+                .on_hover_text(tr(
+                    "エージェントをカンバン方式で指揮統制する画面を開く",
+                ))
+                .clicked()
+            {
+                cmds.push(Cmd::ToggleKanban);
+                ui.close_menu();
+            }
             if ui
                 .button(tr("➕ エージェントを追加…"))
                 .on_hover_text(tr("対応している CLI エージェントの一覧から選んで足す"))
@@ -4700,7 +4753,7 @@ impl ZaivernApp {
             .id_salt("zv-tree")
             .auto_shrink(false)
             .show(ui, |ui| {
-                self.tree.ui(ui, theme, actions);
+                self.tree.ui(ui, theme, &self.gitinfo, actions);
             });
     }
 
@@ -5692,6 +5745,14 @@ impl ZaivernApp {
                     self.cockpit = false;
                 }
                 if ui
+                    .button(tr("📋 看板"))
+                    .on_hover_text(tr("フリート看板へ切替"))
+                    .clicked()
+                {
+                    self.kanban = true;
+                    self.cockpit = false;
+                }
+                if ui
                     .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
                     .on_hover_text(tr(
                         "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
@@ -5709,16 +5770,47 @@ impl ZaivernApp {
                         }
                     }
                 });
+                // キーボードショートカット・キー判定（入力欄がフォーカス中）
+                let trigger_submit = false;
+                if ui.memory(|m| m.has_focus(ui.make_persistent_id("broadcast-input"))) {
+                    ui.input(|i| {
+                        // Ctrl+A / Cmd+A 全選択
+                        if i.modifiers.command || i.modifiers.ctrl {
+                            if i.key_pressed(egui::Key::A) {
+                                self.agent_input_buf.set_text(&self.broadcast_input);
+                                self.agent_input_buf.select_all();
+                            } else if i.key_pressed(egui::Key::U) {
+                                self.agent_input_buf.set_text(&self.broadcast_input);
+                                self.agent_input_buf.delete_to_beginning();
+                                self.broadcast_input = self.agent_input_buf.text().to_string();
+                            } else if i.key_pressed(egui::Key::K) {
+                                self.agent_input_buf.set_text(&self.broadcast_input);
+                                self.agent_input_buf.delete_to_end();
+                                self.broadcast_input = self.agent_input_buf.text().to_string();
+                            }
+                        } else if i.key_pressed(egui::Key::ArrowUp) {
+                            self.agent_input_buf.history_prev();
+                            self.broadcast_input = self.agent_input_buf.text().to_string();
+                        } else if i.key_pressed(egui::Key::ArrowDown) {
+                            self.agent_input_buf.history_next();
+                            self.broadcast_input = self.agent_input_buf.text().to_string();
+                        }
+                    });
+                }
+
                 let send = ui.button(tr("📣 送信"));
                 let input = ui.add(
                     egui::TextEdit::singleline(&mut self.broadcast_input)
+                        .id(ui.make_persistent_id("broadcast-input"))
                         .desired_width(300.0)
-                        .hint_text(tr("全エージェントへブロードキャスト…")),
+                        .hint_text(tr("全エージェントへブロードキャスト (/goal, /loop 支持)...")),
                 );
                 let enter = input.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (send.clicked() || enter) && !self.broadcast_input.trim().is_empty() {
-                    acts.broadcast = Some(self.broadcast_input.trim().to_string());
+                if (send.clicked() || enter || trigger_submit) && !self.broadcast_input.trim().is_empty() {
+                    self.agent_input_buf.set_text(&self.broadcast_input);
+                    let expanded = self.agent_input_buf.submit();
+                    acts.broadcast = Some(expanded);
                     self.broadcast_input.clear();
                 }
                 // 音声で全エージェントの入力欄へ入れる (送信は各自 Enter)
@@ -6304,6 +6396,167 @@ impl ZaivernApp {
         if super_changed {
             self.apply_super_agent();
             config::save_state(&self.cfg);
+        }
+    }
+
+    // ─── UI: フリート看板 (kanban) ──────────────────────────────────
+    //
+    // 判断と描画は kanban.rs 側。ここは「セッションをカードへ写す」
+    // 「返ってきた操作を実行する」だけ (orchestration と同じ橋渡し構造)。
+
+    fn kanban_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let theme = self.theme.clone();
+        let active = self.agents.active;
+        let cards: Vec<kanban::Card> = self
+            .agents
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let running = s.running();
+                let sup = self.supervisor.state_of(s.id);
+                let rate_limited = s.rate_limited.is_some();
+                // coordinator に割り当て中のタスクをカードのチップに出す
+                let task = self
+                    .coordinator
+                    .tasks()
+                    .iter()
+                    .find(|t| t.assigned == Some(s.id) && !t.state.is_terminal())
+                    .map(|t| t.title.clone());
+                kanban::Card {
+                    idx: i,
+                    id: s.id,
+                    icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
+                    title: s.title.clone(),
+                    active: i == active,
+                    column: kanban::column_for(running, s.attention, rate_limited, sup),
+                    state_label: tr(kanban::state_label(
+                        running,
+                        s.attention,
+                        rate_limited,
+                        sup,
+                    )),
+                    uptime: s.uptime(),
+                    unread: s.has_unread(),
+                    rate_limited: s.rate_limited.clone(),
+                    attention: s.attention && running,
+                    running,
+                    permission_badge: if s.is_permission_agent() {
+                        s.approval_badge()
+                    } else {
+                        ""
+                    },
+                    can_cycle: s.permission_switch_hint().is_some(),
+                    tail: s.screen_tail(120),
+                    task,
+                }
+            })
+            .collect();
+        let presets: Vec<(String, String)> = self
+            .cfg
+            .agents
+            .iter()
+            .map(|p| (p.icon.clone(), p.name.clone()))
+            .collect();
+
+        let acts = kanban::ui(&mut self.kanban_state, ui, &theme, &cards, &presets);
+
+        for act in acts {
+            match act {
+                kanban::KanbanAction::Launch(i) => self.launch_preset(i, ctx),
+                kanban::KanbanAction::Select(i) => {
+                    if i < self.agents.sessions.len() {
+                        self.agents.active = i;
+                    }
+                }
+                kanban::KanbanAction::Focus(i) => self.apply_cmd(Cmd::FocusAgent(i), ctx),
+                kanban::KanbanAction::Approve(i) => {
+                    // ペットの吹き出しと同じ手順: 画面のプロンプトに合った承認キーを
+                    // 優先する (Bypass 警告は Enter だと「No, exit」になるため)。
+                    let fallback = self.cfg.pet_approve_keys.clone();
+                    let sent = self.agents.sessions.get_mut(i).map(|s| {
+                        let keys = s.approve_reply().map(str::to_string).unwrap_or(fallback);
+                        let ok = s.send_text(&keys);
+                        if ok {
+                            s.resolve_attention();
+                        }
+                        (ok, s.title.clone())
+                    });
+                    if let Some((true, title)) = sent {
+                        self.toast(trf("✔ 承認を送信: {title}", &[("title", title)]), true);
+                    }
+                }
+                kanban::KanbanAction::Deny(i) => {
+                    let keys = self.cfg.pet_deny_keys.clone();
+                    let sent = self.agents.sessions.get_mut(i).map(|s| {
+                        let ok = s.send_text(&keys);
+                        if ok {
+                            s.resolve_attention();
+                        }
+                        (ok, s.title.clone())
+                    });
+                    if let Some((true, title)) = sent {
+                        self.toast(trf("✖ 拒否を送信: {title}", &[("title", title)]), true);
+                    }
+                }
+                kanban::KanbanAction::Restart(i) => {
+                    if let Err(e) = self.agents.restart(i, ctx) {
+                        self.toast(e, false);
+                    }
+                }
+                kanban::KanbanAction::Remove(i) => self.agents.remove(i),
+                kanban::KanbanAction::CyclePermission(i) => {
+                    match self.agents.cycle_permission(i) {
+                        Some(hint) => self.toast_warn(trf(
+                            "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）",
+                            &[("hint", hint.to_string())],
+                        )),
+                        None => {
+                            self.toast(tr("このセッションは権限モード切替に未対応です"), false)
+                        }
+                    }
+                }
+                kanban::KanbanAction::Send { idx, text } => {
+                    let sent = self.agents.sessions.get_mut(idx).map(|s| {
+                        // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)。
+                        s.note_user_input();
+                        let mut t = text.clone();
+                        t.push('\r');
+                        (s.send_text(&t), s.title.clone())
+                    });
+                    match sent {
+                        Some((true, title)) => {
+                            self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true)
+                        }
+                        Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
+                        None => {}
+                    }
+                }
+                kanban::KanbanAction::Broadcast(text) => {
+                    self.agents.broadcast(&text);
+                    self.toast(
+                        trf(
+                            "📣 {n} セッションへ送信しました",
+                            &[("n", self.agents.running_count().to_string())],
+                        ),
+                        true,
+                    );
+                }
+                kanban::KanbanAction::OpenCockpit => {
+                    self.cockpit = true;
+                    self.kanban = false;
+                }
+                kanban::KanbanAction::Close => self.kanban = false,
+            }
+        }
+
+        // ESC で閉じる (入力欄などにフォーカスが無いときだけ。
+        // フルスクリーン救出の ESC は handle_shortcuts 側が先に消費する)。
+        if self.kanban
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            && ctx.memory(|m| m.focused().is_none())
+        {
+            self.kanban = false;
         }
     }
 
@@ -7158,6 +7411,7 @@ impl ZaivernApp {
             ("🔍".into(), tr("ファイル内検索"), "⌘F".into(), Cmd::OpenFind),
             ("🖥".into(), tr("ターミナル表示切替"), "⌘J".into(), Cmd::ToggleTerminal),
             ("🎛".into(), tr("Cockpit 切替"), "⌘⇧C".into(), Cmd::ToggleCockpit),
+            ("📋".into(), tr("フリート看板 切替"), "⌘⇧K".into(), Cmd::ToggleKanban),
             (
                 "➕".into(),
                 tr("エージェントを追加 (対応 CLI の一覧から選ぶ)"),
@@ -8673,6 +8927,7 @@ impl ZaivernApp {
             "sidebar" => Some(Cmd::ToggleSidebar),
             "git" => Some(Cmd::OpenGitPanel),
             "cockpit" => Some(Cmd::ToggleCockpit),
+            "kanban" => Some(Cmd::ToggleKanban),
             "new_task" => Some(Cmd::NewTask),
             "agent_message" => Some(Cmd::SendAgentMessage),
             "font_inc" => Some(Cmd::FontInc),
@@ -9808,7 +10063,11 @@ impl eframe::App for ZaivernApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme_bg))
             .show(ctx, |ui| {
-                if self.cockpit {
+                if self.kanban {
+                    // 看板は横幅が命 (5 列) なので、編集ペインとは分割しない。
+                    let ctx = ui.ctx().clone();
+                    self.kanban_ui(ui, &ctx);
+                } else if self.cockpit {
                     let ctx = ui.ctx().clone();
                     // ファイルを開いていれば左に編集ペインを並べて出す。
                     // Cockpit との切り替え無しでファイルが見えるようにするため。
@@ -10344,6 +10603,7 @@ impl ZaivernApp {
             sidebar_open: self.sidebar_open,
             terminal_open: self.agents.panel_open,
             cockpit_open: self.cockpit,
+            kanban_open: self.kanban,
             problems_open: self.problems_open,
             fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
                 || self.fake_fullscreen.is_some(),
@@ -11132,6 +11392,7 @@ fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
         (tr("ターミナル切替"), format_shortcut(keys.get(BindAction::ToggleTerminal))),
         (tr("新しいターミナル"), format_shortcut(keys.get(BindAction::NewTerminal))),
         (tr("Cockpit 切替"), format_shortcut(keys.get(BindAction::ToggleCockpit))),
+        (tr("フリート看板 切替"), format_shortcut(keys.get(BindAction::ToggleKanban))),
         (tr("Markdown プレビュー"), format_shortcut(keys.get(BindAction::ToggleMdPreview))),
         (tr("エージェント起動"), format_shortcut(keys.get(BindAction::NewAgent))),
         (tr("ビルド タスクの実行"), format_shortcut(keys.get(BindAction::RunBuildTask))),

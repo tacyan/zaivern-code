@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_input;
 mod agent_picker;
 mod agents;
 mod app;
@@ -23,6 +24,7 @@ mod html;
 mod i18n;
 mod ide;
 mod jsonc;
+mod kanban;
 mod keybinds;
 mod lockx;
 mod lsp;

@@ -310,30 +310,30 @@ pub fn github_ui(
 /// gh が入っていないときの説明。責めない・慌てない文面にする。
 fn gh_missing_ui(ui: &mut egui::Ui, theme: &Theme) {
     ui.add_space(6.0);
-    ui.label(RichText::new(tr("🐙 GitHub 連携は利用できません")).strong());
+    ui.label(RichText::new(tr("🐙 GitHub 連携")).strong());
     ui.add_space(4.0);
     ui.label(
-        RichText::new(tr("GitHub CLI (gh) が見つかりませんでした。インストールすると、この場所に Pull Request と Issue の一覧が出ます。"))
+        RichText::new(tr("GitHub CLI (gh) がセットアップされると、PR や Issue の一覧、Git サポート機能がフル活用できます。"))
             .color(theme.text_dim)
             .size(11.5),
     );
     ui.add_space(6.0);
-    ui.label(RichText::new(tr("インストール:")).color(theme.text_dim).size(11.5));
+    ui.label(RichText::new(tr("セットアップ手順:")).color(theme.text_dim).size(11.5));
     ui.label(
-        RichText::new("  brew install gh   (macOS)")
+        RichText::new("  1. brew install gh   (macOS)")
             .monospace()
             .color(theme.text)
             .size(11.5),
     );
     ui.label(
-        RichText::new("  https://cli.github.com")
+        RichText::new("  2. gh auth login     (ターミナルでログイン認証)")
             .monospace()
-            .color(theme.text_dim)
+            .color(theme.accent)
             .size(11.5),
     );
     ui.add_space(6.0);
     ui.label(
-        RichText::new(tr("インストール後は gh auth login で認証し、Zaivern を再起動してください。"))
+        RichText::new(tr("`gh auth login` 完了後、再取得ボタン(⟳)を押すと Pull Request や Issue が読み込まれます。"))
             .color(theme.text_dim)
             .size(11.5),
     );

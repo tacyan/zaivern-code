@@ -16,6 +16,8 @@ pub enum Cmd {
     RemoveFolder(PathBuf),
     ToggleTerminal,
     ToggleCockpit,
+    /// フリート看板 (全エージェントを状態列で俯瞰・指揮するカンバン画面) 切替
+    ToggleKanban,
     /// タスク作成フォームを開く (Cockpit も一緒に開く)
     NewTask,
     /// エージェントへのメッセージ送信フォームを開く

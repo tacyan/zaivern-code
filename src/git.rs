@@ -142,6 +142,38 @@ impl Git {
         self.status_cache.get(rel_path).copied()
     }
 
+    /// 相対ディレクトリパス配下の主要なステータスと変更件数
+    pub fn dir_status(&self, rel_dir: &str) -> Option<(FileStatus, usize)> {
+        let prefix = if rel_dir.is_empty() {
+            String::new()
+        } else if rel_dir.ends_with('/') {
+            rel_dir.to_string()
+        } else {
+            format!("{rel_dir}/")
+        };
+
+        let mut count = 0;
+        let mut best: Option<FileStatus> = None;
+
+        for (path, status) in &self.status_cache {
+            if prefix.is_empty() || path.starts_with(&prefix) {
+                count += 1;
+                best = Some(match (best, status) {
+                    (None, s) => *s,
+                    (Some(FileStatus::Modified), _) => FileStatus::Modified,
+                    (_, FileStatus::Modified) => FileStatus::Modified,
+                    (Some(FileStatus::Added), _) => FileStatus::Added,
+                    (_, FileStatus::Added) => FileStatus::Added,
+                    (Some(FileStatus::Untracked), _) => FileStatus::Untracked,
+                    (_, FileStatus::Untracked) => FileStatus::Untracked,
+                    (Some(s), _) => s,
+                });
+            }
+        }
+
+        best.map(|s| (s, count))
+    }
+
     /// 変更ファイル数 (status のエントリ数)。
     pub fn dirty_count(&self) -> usize {
         self.status_cache.len()
@@ -263,6 +295,12 @@ impl GitSet {
     pub fn file_status(&self, abs: &Path) -> Option<FileStatus> {
         let (top, rel) = self.resolve(abs)?;
         self.repos.get(&top)?.file_status(&rel)
+    }
+
+    /// 絶対パスのディレクトリのステータスと変更件数 (refresh_if_stale 済み前提)。
+    pub fn dir_status(&self, abs: &Path) -> Option<(FileStatus, usize)> {
+        let (top, rel) = self.resolve(abs)?;
+        self.repos.get(&top)?.dir_status(&rel)
     }
 
     /// 全 repo の変更ファイル数の合計。

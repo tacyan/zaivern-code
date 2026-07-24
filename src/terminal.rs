@@ -226,6 +226,79 @@ impl LogSink {
 /// bypass 起動でも CLI エージェントは起動時/プラン承認などで対話プロンプトを出すため、
 /// これに答えないと「全自動なのに進まない」状態になる。
 pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
+    // ⚡ 最優先: Antigravity CLI (Google AGY) 専用の自動YESプロンプト超強化判定
+    if text.contains("Antigravity") || text.contains("AGY") || text.contains("antigravity") || text.contains("agy") {
+        // カーソル選択プロンプト（❯ 1 / ❯ Yes / ❯ Allow / ❯ はい / ❯ 許可 / ❯ Accept / ❯ Proceed）
+        if text.contains("❯ 1")
+            || text.contains("❯ Yes")
+            || text.contains("❯ Allow")
+            || text.contains("❯ はい")
+            || text.contains("❯ 許可")
+            || text.contains("❯ Accept")
+            || text.contains("❯ Proceed")
+            || text.contains("❯ Continue")
+        {
+            return Some((b"\r", "Antigravityのカーソル選択プロンプトに自動「Enter」"));
+        }
+
+        // 選択番号「1.」/「1)」/「[1]」/「(1)」の肯定選択肢
+        let has_num_one = text.contains("1. Yes")
+            || text.contains("1. Allow")
+            || text.contains("1. はい")
+            || text.contains("1. 許可")
+            || text.contains("1. Accept")
+            || text.contains("1. Proceed")
+            || text.contains("1. Continue")
+            || text.contains("1. Approve")
+            || text.contains("1) Yes")
+            || text.contains("1) Allow")
+            || text.contains("[1] Yes")
+            || text.contains("[1] Allow")
+            || text.contains("(1) Yes")
+            || text.contains("(1) Allow");
+        if has_num_one {
+            return Some((b"1", "Antigravityの選択プロンプトに自動「1」"));
+        }
+
+        // y/n テキスト形式
+        if text.contains("(y/n)")
+            || text.contains("[y/N]")
+            || text.contains("[y/n]")
+            || text.contains("(y/N)")
+            || text.contains("(Y/n)")
+            || text.contains("[Y/n]")
+            || text.contains("(yes/no)")
+            || text.contains("[yes/no]")
+            || text.contains("(y/n)?")
+            || text.contains("[y/N]?")
+        {
+            return Some((b"y\r", "Antigravityの(y/n)問い合わせに自動「y」"));
+        }
+
+        // 実行・許可・操作の全肯定キーワード
+        let has_action_kw = text.contains("Allow")
+            || text.contains("Approve")
+            || text.contains("Confirm")
+            || text.contains("Execute")
+            || text.contains("Run")
+            || text.contains("Proceed")
+            || text.contains("Accept")
+            || text.contains("許可")
+            || text.contains("承認")
+            || text.contains("実行")
+            || text.contains("適用")
+            || text.contains("続行")
+            || text.contains("保存");
+        if has_action_kw {
+            return Some((b"y\r", "Antigravityの承認画面に自動「y」"));
+        }
+
+        // Antigravity の表示で質問マーク「?」「？」が含まれる、または末尾に入力待ちがある場合
+        if text.contains('?') || text.contains('？') || recent_lines_has_question(text) {
+            return Some((b"y\r", "Antigravityの問いかけに自動「y」"));
+        }
+    }
+
     // 初回の bypass 警告: デフォルト選択が「1. No, exit」なので
     // Enter ではなく番号キー「2」で「Yes, I accept」を直接選ぶ。
     if text.contains("Bypass Permissions mode") && text.contains("Yes, I accept") {
@@ -248,6 +321,7 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         || text.contains("confirm")
         || text.contains("proceed")
         || text.contains("Allow")
+        || text.contains("Antigravity")
         || text.contains("実行しますか")
         || text.contains("許可しますか")
         || text.contains("続行しますか")
@@ -261,7 +335,8 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         || text.contains("Allow command")
         || text.contains("Allow tool")
         || text.contains("Allow action")
-        || text.contains("Allow file");
+        || text.contains("Allow file")
+        || text.contains("Antigravity:");
     if agent_approval && (text.contains("1. Yes") || text.contains("1. Allow") || text.contains("Yes, proceed") || text.contains("Yes, allow")) {
         return Some((b"y", "Codex/Antigravityの承認に「Yes」"));
     }
@@ -275,8 +350,14 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         || text.contains("❯ 1. 承認")
         || text.contains("❯ 1. Accept")
         || text.contains("❯ 1. Continue")
+        || text.contains("❯ Yes")
+        || text.contains("❯ Allow")
+        || text.contains("❯ はい")
+        || text.contains("❯ 許可")
+        || text.contains("❯ Continue")
+        || text.contains("❯ Proceed")
     {
-        return Some((b"\r", "「Yes/Allow/はい」"));
+        return Some((b"\r", "カーソル選択確認に「Enter」"));
     }
 
     // 質問コンテクストが存在し、かつ番号キー「1. Yes」または「1. Allow」「1. はい」がある場合は直接選ぶ
@@ -289,6 +370,9 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
             || text.contains("1. 承認")
             || text.contains("1. Accept")
             || text.contains("1. Continue")
+            || text.contains("1) Yes")
+            || text.contains("(1) Yes")
+            || text.contains("[1] Yes")
     ) {
         return Some((b"1", "「1. Yes/Allow/はい」"));
     }
@@ -305,15 +389,101 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         || text.contains("[Y/n/a]")
         || text.contains("(yes/no)")
         || text.contains("[yes/no]")
+        || text.contains("(y/N)?")
+        || text.contains("[Y/n]?")
     {
         return Some((b"y\r", "「y」"));
+    }
+
+    // YESモードでは質問の種類を限定しない。
+    // 画面最下部の直近2行（プロンプト行または直前行）が質問・確認文であれば自動でYesを送信。
+    if recent_lines_has_question(text) {
+        return Some((b"y\r", "質問・確認ダイアログに自動「Yes」"));
     }
     None
 }
 
+/// 画面末尾が質問文か、あるいはプロンプト入力待ち(>, $, :)で直前行が質問文であるか判定
+fn recent_lines_has_question(text: &str) -> bool {
+    let mut non_empty_lines = text.lines().rev().map(str::trim).filter(|line| !line.is_empty());
+    let Some(last) = non_empty_lines.next() else {
+        return false;
+    };
+
+    if is_question_line(last) {
+        return true;
+    }
+
+    // 最下行が入力プロンプト記号（">", "$", ":", "%" など）または選択指示行の場合
+    let is_prompt_symbol = last.ends_with('>')
+        || last.ends_with('$')
+        || last.ends_with(':')
+        || last.ends_with('%')
+        || last.contains("(1)")
+        || last.contains("[1]");
+
+    if is_prompt_symbol {
+        if let Some(prev) = non_empty_lines.next() {
+            return is_question_line(prev);
+        }
+    }
+
+    false
+}
+
+/// YESモードで肯定する一般的な質問行か。
+fn is_question_line(line: &str) -> bool {
+    let line = line.trim_end();
+    if line.ends_with('?')
+        || line.ends_with('？')
+        || line.contains("(y/n)")
+        || line.contains("[y/N]")
+        || line.contains("[y/n]")
+        || line.contains("(Y/n)")
+        || line.contains("(yes/no)")
+        || line.contains("[yes/no]")
+    {
+        return true;
+    }
+
+    let endings = [
+        "しますか",
+        "できますか",
+        "よろしいですか",
+        "いいですか",
+        "どうしますか",
+        "続けますか",
+        "進めますか",
+        "実行しますか",
+        "許可しますか",
+        "承認しますか",
+        "変更しますか",
+        "適用しますか",
+        "削除しますか",
+        "上書きしますか",
+        "保存しますか",
+        "送信しますか",
+        "を選びますか",
+        "Continue?",
+        "Proceed?",
+        "Confirm?",
+        "Approve?",
+        "Allow?",
+        "Overwrite?",
+    ];
+
+    endings.iter().any(|ending| line.ends_with(ending) || line.contains(ending))
+}
+
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
 /// auto_yes_reply だけが分類する特殊プロンプトも含める。
-const SIG_MARKS: [&str; 41] = [
+const SIG_MARKS: [&str; 47] = [
+    "Antigravity",
+    "Antigravity:",
+    "AGY:",
+    "Allow execute",
+    "Allow tool",
+    "Allow action",
     "Do you want",
     "Would you like to proceed",
     "Would you like to run",
@@ -369,7 +539,7 @@ pub fn prompt_signature(text: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let lines: Vec<&str> = text.lines().collect();
     for (i, line) in lines.iter().enumerate() {
-        if SIG_MARKS.iter().any(|m| line.contains(m)) {
+        if SIG_MARKS.iter().any(|m| line.contains(m)) || is_question_line(line) {
             if i > 0 {
                 lines[i - 1].trim_end().hash(&mut h);
             }
@@ -1287,6 +1457,15 @@ impl Session {
         self.set_scroll(n);
     }
 
+    /// ターミナル画面全体の文字列をすべて選択状態にする (Ctrl+A / Cmd+A)
+    pub fn select_all(&mut self) {
+        let p = self.parser.lock().unwrap();
+        let (rows, cols) = p.screen().size();
+        if rows > 0 && cols > 0 {
+            self.selection = Some(((0, 0), (rows.saturating_sub(1), cols.saturating_sub(1))));
+        }
+    }
+
     /// (代替画面か, アプリがマウス報告を有効にしているか, SGRエンコードか)。
     /// 代替画面(vim / less / Claude Code 等)にはスクロールバック履歴が無いため、
     /// ローカルスクロールではなくホイールをアプリへ転送する必要がある。
@@ -1330,11 +1509,64 @@ impl Session {
             format!("{}m{:02}s", s / 60, s % 60)
         }
     }
+
+    /// 看板カード用: 画面の「意味のある最後の 1 行」を `max` 文字までで返す。
+    /// 罫線だけの行 (入力枠の底辺など) や空行は飛ばす。無ければ空文字。
+    pub fn screen_tail(&self, max: usize) -> String {
+        let text = self.parser.lock().unwrap().screen().contents();
+        pick_tail_line(&text)
+            .map(|l| truncate_chars(l, max))
+            .unwrap_or_default()
+    }
+}
+
+/// 画面テキストから「内容のある最後の行」を選ぶ。英数字か仮名漢字を 1 文字でも
+/// 含む行だけを内容ありとみなす (罫線・入力枠だけの行は飛ばす)。
+fn pick_tail_line(text: &str) -> Option<&str> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && l.chars().any(char::is_alphanumeric))
+}
+
+/// `max` 文字を超える文字列を「…」付きで詰める (char 境界で安全に切る)。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+    t.push('…');
+    t
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.killer.kill();
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::{pick_tail_line, truncate_chars};
+
+    #[test]
+    fn tail_skips_border_and_blank_lines() {
+        let screen = "✻ テストを実行中…\n╭──────╮\n│ >    │\n╰──────╯\n\n";
+        assert_eq!(pick_tail_line(screen), Some("✻ テストを実行中…"));
+    }
+
+    #[test]
+    fn tail_prefers_last_content_line() {
+        let screen = "old line\n✔ cargo build finished\n";
+        assert_eq!(pick_tail_line(screen), Some("✔ cargo build finished"));
+        assert_eq!(pick_tail_line("╭──╮\n╰──╯"), None);
+    }
+
+    #[test]
+    fn truncate_is_char_safe() {
+        assert_eq!(truncate_chars("短い", 10), "短い");
+        // 5 文字上限 → 4 文字 + 「…」
+        assert_eq!(truncate_chars("あいうえおかき", 5), "あいうえ…");
     }
 }
 
@@ -1381,6 +1613,33 @@ mod tests {
     }
 
     #[test]
+    fn any_final_question_sends_yes() {
+        for screen in [
+            "Which deployment strategy should be used?",
+            "このまま本番環境へデプロイしますか？",
+            "処理を続けますか",
+        ] {
+            let (bytes, desc) = auto_yes_reply(screen).unwrap();
+            assert_eq!(bytes, b"y\r", "screen={screen}");
+            assert!(desc.contains("Yes"), "screen={screen}");
+        }
+    }
+
+    #[test]
+    fn question_in_history_does_not_trigger_when_latest_line_is_not_question() {
+        let screen = "User: Shall I deploy this?\nAssistant: Build completed successfully.";
+        assert!(auto_yes_reply(screen).is_none());
+    }
+
+    #[test]
+    fn multi_line_question_in_recent_lines_sends_yes() {
+        let screen = "Agent: 変更を適用しますか？ [y/N]\n  (1) Yes\n  (2) No\n> ";
+        let (bytes, desc) = auto_yes_reply(screen).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(desc.contains("y") || desc.contains("1") || desc.contains("Yes") || desc.contains("自動"));
+    }
+
+    #[test]
     fn codex_command_approval_sends_yes_shortcut() {
         let screen = "Would you like to run the following command?\n\
                       $ cargo test\n\
@@ -1396,6 +1655,36 @@ mod tests {
                       › 1. Yes\n  2. No";
         let (bytes, _) = auto_yes_reply(screen).unwrap();
         assert_eq!(bytes, b"y");
+    }
+
+    #[test]
+    fn antigravity_all_prompts_send_auto_yes() {
+        // (y/n) パターン
+        let (bytes, desc) = auto_yes_reply("Antigravity: Allow execute this command? (y/n) ").unwrap();
+        assert_eq!(bytes, b"y\r");
+        assert!(desc.contains("Antigravity"));
+
+        // 1. Allow パターン
+        let (bytes, _) = auto_yes_reply("Antigravity: Allow tool call?\n  1. Allow\n  2. Deny").unwrap();
+        assert_eq!(bytes, b"1");
+
+        // ❯ 1. Yes パターン
+        let (bytes, _) = auto_yes_reply("AGY: Confirm action\n  ❯ 1. Yes\n    2. No").unwrap();
+        assert_eq!(bytes, b"\r");
+
+        // 日本語プロンプトパターン
+        let (bytes, _) = auto_yes_reply("Antigravity: ツールを許可しますか？ [y/N]").unwrap();
+        assert_eq!(bytes, b"y\r");
+
+        // 追加された拡張プロンプトパターン
+        let (bytes, _) = auto_yes_reply("AGY: Proceed with file save?").unwrap();
+        assert_eq!(bytes, b"y\r");
+
+        let (bytes, _) = auto_yes_reply("antigravity: 変更を適用しますか？").unwrap();
+        assert_eq!(bytes, b"y\r");
+
+        let (bytes, _) = auto_yes_reply("Antigravity: Select option\n  1. Allow always\n  2. Deny").unwrap();
+        assert_eq!(bytes, b"1");
     }
 
     #[test]
@@ -1546,7 +1835,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    use super::{normalize_sel, selection_text, word_selection};
+    use super::{normalize_sel, selection_text, word_selection, Session};
 
     #[test]
     fn normalize_sel_orders_row_major() {
@@ -1562,6 +1851,23 @@ mod tests {
         p.process(b"hello world");
         assert_eq!(selection_text(p.screen(), ((0, 0), (0, 4))), "hello");
         assert_eq!(selection_text(p.screen(), ((0, 6), (0, 10))), "world");
+    }
+
+    #[test]
+    fn session_select_all_covers_entire_screen() {
+        let dir = std::env::current_dir().unwrap();
+        let spec = super::SpawnSpec {
+            title: "test".into(),
+            command: "echo hello".into(),
+            cwd: dir,
+            env: std::collections::HashMap::new(),
+            preset_name: String::new(),
+            icon: "💬".into(),
+            log_path: None,
+        };
+        let mut session = Session::spawn(9991, spec, eframe::egui::Context::default()).unwrap();
+        session.select_all();
+        assert!(session.selection.is_some());
     }
 
     #[test]
@@ -1714,6 +2020,17 @@ mod tests {
         // 直上のコマンドプレビューが違えば別のプロンプト(連続承認キューの区別)
         let other = a.replace("echo hi", "cargo test");
         assert_ne!(prompt_signature(a), prompt_signature(&other));
+    }
+
+    #[test]
+    fn generic_question_signature_is_keyed_by_question_content() {
+        use super::prompt_signature;
+
+        let first = "output\nChoose the production target?";
+        let same_with_history = "old output\noutput\nChoose the production target?";
+        let next = "output\nRun the database migration?";
+        assert_eq!(prompt_signature(first), prompt_signature(same_with_history));
+        assert_ne!(prompt_signature(first), prompt_signature(next));
     }
 
     #[test]
@@ -2845,12 +3162,23 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
                 }
             }
             egui::Event::Key {
+                key: egui::Key::A,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.mac_cmd || modifiers.command || (modifiers.ctrl && modifiers.shift) => {
+                session.select_all();
+            }
+            egui::Event::Key {
                 key,
                 pressed: true,
                 modifiers,
                 ..
             } => {
                 if modifiers.mac_cmd {
+                    if *key == egui::Key::A {
+                        session.select_all();
+                    }
                     continue;
                 }
                 // IME 変換中はキーを IME に任せる(Enter/矢印で確定・候補選択するため)

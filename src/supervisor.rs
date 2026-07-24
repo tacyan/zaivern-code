@@ -115,6 +115,12 @@ pub struct SupervisorConfig {
     pub llm_escalation: bool,
     /// LLM に渡す出力抜粋の最大文字数。
     pub llm_excerpt_chars: usize,
+
+    // --- ループエンジニアリング (一晩中自律改善ループ) ---
+    /// ループエンジニアリングによる一晩中自動改善＆フィードバックの有効化。
+    pub loop_engineering_enabled: bool,
+    /// 自律改善ループの判定＆指示生成間隔 (秒)。
+    pub loop_engineering_interval_secs: u64,
 }
 
 impl Default for SupervisorConfig {
@@ -167,6 +173,9 @@ impl Default for SupervisorConfig {
 
             llm_escalation: false,
             llm_excerpt_chars: 2000,
+
+            loop_engineering_enabled: true,
+            loop_engineering_interval_secs: 60,
         }
     }
 }
@@ -1243,6 +1252,7 @@ pub struct Supervisor {
     origin: Instant,
     monitors: HashMap<u64, SessionMonitor>,
     last_sample_ms: u64,
+    last_loop_engineering_ms: u64,
     diagnostician: Option<Arc<dyn Diagnostician>>,
     diag_tx: Sender<Diagnosis>,
     diag_rx: Receiver<Diagnosis>,
@@ -1256,6 +1266,7 @@ impl Supervisor {
             origin: Instant::now(),
             monitors: HashMap::new(),
             last_sample_ms: 0,
+            last_loop_engineering_ms: 0,
             diagnostician: None,
             diag_tx,
             diag_rx,
@@ -1326,7 +1337,52 @@ impl Supervisor {
         for snap in snaps {
             intents.extend(self.observe_one(snap, approval, now_ms));
         }
+
+        // Loop Engineering: 一晩中止まらずに自動改善・テスト・最適化を巡回させる自律ループ
+        if let Some(loop_intent) = self.evaluate_loop_engineering(snaps, now_ms) {
+            intents.push(loop_intent);
+        }
+
         intents
+    }
+
+    /// 一晩中動き続けて改善を繰り返す Loop Engineering (自律改善) の評価と指示自動生成。
+    pub fn evaluate_loop_engineering(
+        &mut self,
+        snaps: &[SessionSnapshot],
+        now_ms: u64,
+    ) -> Option<InterventionIntent> {
+        if !self.cfg.loop_engineering_enabled || snaps.is_empty() {
+            return None;
+        }
+
+        let interval_ms = self.cfg.loop_engineering_interval_secs * 1000;
+        if self.last_loop_engineering_ms > 0
+            && now_ms.saturating_sub(self.last_loop_engineering_ms) < interval_ms
+        {
+            return None;
+        }
+
+        // 全セッションが稼働中または承認待ち状態であり、自律的な次のループ指示が必要か診断
+        let all_waiting_or_idle = snaps.iter().all(|s| s.waiting_approval || !s.running);
+        if all_waiting_or_idle {
+            self.last_loop_engineering_ms = now_ms;
+            Some(InterventionIntent {
+                session_id: 0, // 全体宛 (@all)
+                session_title: "SuperAgent Broadcast".to_string(),
+                action: Intervention::Nudge,
+                anomaly: Anomaly::Stall,
+                reason: "一晩中自律改善ループの定期チェック".to_string(),
+                needs_confirmation: false,
+                payload: Some(
+                    "@all: 一晩中自律改善ループを続行中。現在の進捗とテスト結果をまとめ、次の最適化・リファクタリングを実施してください。"
+                        .to_string(),
+                ),
+                at_ms: now_ms,
+            })
+        } else {
+            None
+        }
     }
 
     fn observe_one(
@@ -2244,6 +2300,37 @@ mod tests {
         assert_eq!(back.stall_secs, c.stall_secs);
         assert!(!back.allow_auto_restart);
         assert!(!back.llm_escalation);
+        assert!(back.loop_engineering_enabled);
+        assert_eq!(back.loop_engineering_interval_secs, 60);
+    }
+
+    #[test]
+    fn loop_engineering_fires_nudge_on_idle_sessions() {
+        let mut c = cfg();
+        c.loop_engineering_enabled = true;
+        c.loop_engineering_interval_secs = 10;
+        c.sample_interval_ms = 0;
+        let mut sv = Supervisor::new(c);
+
+        let snaps = vec![snap(1, "idle prompt", true, true)];
+        let intents = sv.tick_ms(&snaps, Approval::Auto, 1_000);
+        let loop_intent = intents.iter().find(|i| {
+            i.payload
+                .as_deref()
+                .unwrap_or("")
+                .contains("一晩中自律改善ループ")
+        });
+        assert!(loop_intent.is_some(), "アイドルのセッションでループ指示が生成されるべき");
+
+        // インターバル内は再発火しないこと
+        let intents_soon = sv.tick_ms(&snaps, Approval::Auto, 5_000);
+        let loop_intent_soon = intents_soon.iter().find(|i| {
+            i.payload
+                .as_deref()
+                .unwrap_or("")
+                .contains("一晩中自律改善ループ")
+        });
+        assert!(loop_intent_soon.is_none(), "インターバル内は重複発生しないこと");
     }
 
     // ---------------- derive_state (状態導出の優先順位) ----------------
