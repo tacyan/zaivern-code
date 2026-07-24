@@ -973,6 +973,9 @@ impl ZaivernApp {
                 && !self.cfg.plugins.disabled.iter().any(|d| d == &p.name)
             {
                 self.cfg.plugins.disabled.push(p.name.clone());
+                if !self.cfg.global_plugins.disabled.contains(&p.name) {
+                    self.cfg.global_plugins.disabled.push(p.name.clone());
+                }
                 newly_disabled = true;
             }
         }
@@ -1597,6 +1600,7 @@ impl ZaivernApp {
                 }
                 A::SetSetting { key, value } => {
                     self.cfg.plugins.set_setting(plugin, &key, &value);
+                    self.cfg.global_plugins.set_setting(plugin, &key, &value);
                     if let Err(e) = config::save_plugins_section(&self.cfg) {
                         self.toast(trf("設定の保存に失敗: {e}", &[("e", e.to_string())]), false);
                     }
@@ -4624,6 +4628,7 @@ impl ZaivernApp {
         // 有効/無効の切り替えを保存し、登録内容を作り直す
         if let Some((name, enabled)) = pl.toggle {
             self.cfg.plugins.set_enabled(&name, enabled);
+            self.cfg.global_plugins.set_enabled(&name, enabled);
             if let Err(e) = config::save_plugins_section(&self.cfg) {
                 self.toast(
                     trf("設定の保存に失敗: {e}", &[("e", e)]),
@@ -4643,6 +4648,7 @@ impl ZaivernApp {
         // 設定値の変更を保存し、実行中のプラグインへも反映する
         if let Some((name, key, value)) = pl.setting {
             self.cfg.plugins.set_setting(&name, &key, &value);
+            self.cfg.global_plugins.set_setting(&name, &key, &value);
             if let Err(e) = config::save_plugins_section(&self.cfg) {
                 self.toast(trf("設定の保存に失敗: {e}", &[("e", e.to_string())]), false);
             }
@@ -10115,8 +10121,10 @@ impl eframe::App for ZaivernApp {
                             self.sound.play(SoundKind::Confirm);
                         }
                     }
-                    // OS 通知はペット導入前からの挙動なのでそのまま
-                    if !win_focused {
+                    // OS 通知も同じスロットリングに入れる。素通りさせると
+                    // プロンプト再検出のたびに通知センターが同文で埋まり、
+                    // 通知プロセスの起動も連発する
+                    if !throttled && !win_focused {
                         notify::notify(
                             "Zaivern Code",
                             &trf("🔔 {title} が承認待ちです", &[("title", title.clone())]),

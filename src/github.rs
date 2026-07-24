@@ -698,11 +698,14 @@ pub fn parse_branches(json: &str) -> Result<Vec<Branch>, String> {
 /// "2026-07-19T01:35:13Z" → "2026-07-19 01:35"。解釈できなければ入力をそのまま返す。
 pub fn humanize_utc(ts: &str) -> String {
     let b = ts.as_bytes();
+    // get() で char 境界も同時に検査する (バイト添字だと "0123456789Tあ…"
+    // のような不正入力で境界外パニックになる)
     if b.len() >= 16 && b[10] == b'T' {
-        format!("{} {}", &ts[..10], &ts[11..16])
-    } else {
-        ts.to_string()
+        if let (Some(date), Some(time)) = (ts.get(..10), ts.get(11..16)) {
+            return format!("{date} {time}");
+        }
     }
+    ts.to_string()
 }
 
 // ---------------------------------------------------------------------------

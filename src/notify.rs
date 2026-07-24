@@ -22,10 +22,10 @@ pub fn notify(title: &str, body: &str) {
             escape_applescript(&body),
             escape_applescript(title),
         );
-        let _ = Command::new("osascript").args(["-e", &script]).spawn();
+        spawn_and_reap(Command::new("osascript").args(["-e", &script]));
     } else if cfg!(target_os = "linux") {
         // notify-send が存在しなければ spawn が Err になるだけで、黙って何もしない。
-        let _ = Command::new("notify-send").args([title, &body]).spawn();
+        spawn_and_reap(Command::new("notify-send").args([title, &body]));
     } else if cfg!(target_os = "windows") {
         // ベストエフォート: PowerShell の WinRT トースト通知。
         // シングルクォート文字列に埋め込むため ' を '' に二重化する。
@@ -41,9 +41,27 @@ pub fn notify(title: &str, body: &str) {
             title = escape_powershell_single_quoted(title),
             body = escape_powershell_single_quoted(&body),
         );
-        let _ = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
-            .spawn();
+        spawn_and_reap(Command::new("powershell").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ]));
+    }
+}
+
+/// spawn した子を別スレッドで wait して回収する。Child を即 drop すると
+/// Unix では reap されず、通知 1 回ごとにゾンビが 1 個アプリ終了まで残る
+/// (長時間セッションでプロセス数上限に達すると PTY 起動まで失敗し得る)。
+fn spawn_and_reap(cmd: &mut Command) {
+    if let Ok(mut child) = cmd.spawn() {
+        let _ = std::thread::Builder::new()
+            .name("zv-notify-reap".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
     }
 }
 
@@ -81,7 +99,7 @@ pub fn webhook(url: &str, title: &str, body: &str) {
         cmd.args(["-H", &format!("X-Title: {}", sanitize_header(title)), "-d", &body]);
     }
     cmd.arg(url);
-    let _ = cmd.spawn();
+    spawn_and_reap(&mut cmd);
 }
 
 /// JSON 文字列リテラルへのエスケープ(純関数)。

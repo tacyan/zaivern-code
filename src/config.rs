@@ -23,6 +23,12 @@ pub struct Config {
     pub global_approval_mode: String,
     #[serde(skip)]
     pub global_show_pet: bool,
+    /// overlay を重ねる前のグローバルなプラグイン設定の控え。
+    /// save_plugins_section はこちらを書く — セッション中の値を書くと
+    /// プロジェクトの .zaivern.toml 由来の無効化・設定値がグローバル
+    /// config.toml へ漏れて永続化されてしまう。
+    #[serde(skip)]
+    pub global_plugins: PluginsConfig,
     /// ペット画像のフルパス(None なら内蔵ドット絵)
     pub pet_image: Option<String>,
     /// ペットの固定位置(None なら右下うろうろ)
@@ -185,6 +191,7 @@ impl Default for Config {
             global_theme: "zaivern-dark".into(),
             global_approval_mode: "ask".into(),
             global_show_pet: true,
+            global_plugins: PluginsConfig::default(),
             pet_image: None,
             pet_x: None,
             pet_y: None,
@@ -542,10 +549,27 @@ pub fn load(roots: &[PathBuf], with_state: bool) -> Config {
 
 /// `load()` の実体。テストから一時ディレクトリを差し込めるよう分離している。
 fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
-    let mut cfg: Config = std::fs::read_to_string(dir.join("config.toml"))
-        .ok()
-        .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut cfg: Config = match std::fs::read_to_string(dir.join("config.toml")) {
+        Ok(s) => match toml::from_str(&s) {
+            Ok(c) => c,
+            Err(e) => {
+                // 手書きの 1 文字ミスで全設定 (自作プリセット・キーバインド等)
+                // が黙って既定値に戻ると「全部消えた」ように見える。
+                // 原因を stderr に出し、復旧用に .broken へ控えてから既定値で
+                // 起動する (以後の保存で壊れたファイルが上書きされても戻せる)。
+                eprintln!("zaivern: config.toml のパースに失敗: {e}");
+                let _ = std::fs::copy(
+                    dir.join("config.toml"),
+                    dir.join("config.toml.broken"),
+                );
+                eprintln!(
+                    "zaivern: 壊れた config.toml を config.toml.broken に控えました"
+                );
+                Config::default()
+            }
+        },
+        Err(_) => Config::default(),
+    };
 
     if cfg.agents.is_empty() {
         cfg.agents = default_agents();
@@ -634,6 +658,7 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     cfg.global_theme = cfg.theme.clone();
     cfg.global_approval_mode = cfg.approval_mode.clone();
     cfg.global_show_pet = cfg.show_pet;
+    cfg.global_plugins = cfg.plugins.clone();
 
     for root in roots {
         apply_overlay(&mut cfg, root);
@@ -710,7 +735,9 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
 /// `[plugins]` と `[plugins.settings.*]` 以外の行は 1 行も触らないので、
 /// ユーザーのコメントや並び順は保たれる (区画内のコメントは失われる)。
 pub fn save_plugins_section(cfg: &Config) -> Result<(), String> {
-    save_plugins_config(&cfg.plugins)
+    // セッション中の値 (overlay 適用済み) ではなくグローバルの控えを書く。
+    // UI から変更したときは呼び出し側が控えも更新している。
+    save_plugins_config(&cfg.global_plugins)
 }
 
 /// `[[agents]]` ブロック 1 件分の TOML テキストを作る。
@@ -834,6 +861,21 @@ fn render_plugins_section(plugins: &PluginsConfig) -> String {
     }
 
     let quote = |s: &str| toml::Value::String(s.to_string()).to_string();
+    // TOML の裸キーとして安全な形か。マニフェスト由来の名前は検証済みだが、
+    // 手書き config.toml 由来の値 (空白や . 入り) を裸で書き戻すと
+    // 不正な TOML になり、次回起動でファイル全体が読めなくなる。
+    let bare_ok = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    let key_str = |s: &str| {
+        if bare_ok(s) {
+            s.to_string()
+        } else {
+            quote(s)
+        }
+    };
 
     let mut s = String::from("[plugins]\n");
     let items: Vec<String> = plugins.disabled.iter().map(|d| quote(d)).collect();
@@ -847,11 +889,11 @@ fn render_plugins_section(plugins: &PluginsConfig) -> String {
         if kv.is_empty() {
             continue;
         }
-        s.push_str(&format!("\n[plugins.settings.{name}]\n"));
+        s.push_str(&format!("\n[plugins.settings.{}]\n", key_str(name)));
         let mut keys: Vec<&String> = kv.keys().collect();
         keys.sort();
         for k in keys {
-            s.push_str(&format!("{k} = {}\n", quote(&kv[k])));
+            s.push_str(&format!("{} = {}\n", key_str(k), quote(&kv[k])));
         }
     }
     s
