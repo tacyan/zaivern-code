@@ -276,26 +276,8 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
             return Some((b"y\r", "Antigravityの(y/n)問い合わせに自動「y」"));
         }
 
-        // 実行・許可・操作の全肯定キーワード
-        let has_action_kw = text.contains("Allow")
-            || text.contains("Approve")
-            || text.contains("Confirm")
-            || text.contains("Execute")
-            || text.contains("Run")
-            || text.contains("Proceed")
-            || text.contains("Accept")
-            || text.contains("許可")
-            || text.contains("承認")
-            || text.contains("実行")
-            || text.contains("適用")
-            || text.contains("続行")
-            || text.contains("保存");
-        if has_action_kw {
-            return Some((b"y\r", "Antigravityの承認画面に自動「y」"));
-        }
-
-        // Antigravity の表示で質問マーク「?」「？」が含まれる、または末尾に入力待ちがある場合
-        if text.contains('?') || text.contains('？') || recent_lines_has_question(text) {
+        // 直近行が明確な質問・確認プロンプトである場合のみ自動YESを送る
+        if recent_lines_has_question(text) {
             return Some((b"y\r", "Antigravityの問いかけに自動「y」"));
         }
     }
@@ -432,7 +414,7 @@ fn recent_lines_has_question(text: &str) -> bool {
     false
 }
 
-/// YESモードで肯定する一般的な質問行か。
+/// YESモードで肯定する一般的な承認質問行か。
 fn is_question_line(line: &str) -> bool {
     let line = line.trim_end();
     if line.ends_with('?')
@@ -443,6 +425,8 @@ fn is_question_line(line: &str) -> bool {
         || line.contains("(Y/n)")
         || line.contains("(yes/no)")
         || line.contains("[yes/no]")
+        || line.contains("(y/N)")
+        || line.contains("[Y/n]")
     {
         return true;
     }
