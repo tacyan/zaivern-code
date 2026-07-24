@@ -7219,6 +7219,92 @@ impl ZaivernApp {
             }
         }
 
+        // 括弧・引用符の自動ペア (VS Code の autoClosingBrackets 相当):
+        // 開き括弧で自動閉じ/選択囲み、閉じ括弧でスキップ、
+        // 空ペアの間での Backspace は両方まとめて削除。
+        // IME 変換中の文字は Event::Ime で届くため、ここには掛からない。
+        if has_focus && !self.editor.buffers[active].kind.read_only() {
+            let sel = egui::TextEdit::load_state(ui.ctx(), ed_id_early)
+                .and_then(|st| st.cursor.char_range())
+                .map(|r| {
+                    let (a, b) = (r.primary.index, r.secondary.index);
+                    (a.min(b), a.max(b))
+                });
+            if let Some((sel_min, sel_max)) = sel {
+                let typed: Option<char> = ui.input(|i| {
+                    i.events.iter().find_map(|e| match e {
+                        egui::Event::Text(t) => {
+                            let mut cs = t.chars();
+                            match (cs.next(), cs.next()) {
+                                (Some(c), None) if "([{\"'`)]}".contains(c) => Some(c),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+                });
+                let edit = typed.and_then(|c| {
+                    editor_ops::pair_on_type(
+                        &self.editor.buffers[active].text,
+                        sel_min,
+                        sel_max,
+                        c,
+                    )
+                });
+                if let Some(edit) = edit {
+                    // 元の 1 文字 Text イベントは消費して TextEdit へ渡さない
+                    let c = typed.unwrap();
+                    ui.input_mut(|i| {
+                        let mut removed = false;
+                        i.events.retain(|e| {
+                            if removed {
+                                return true;
+                            }
+                            match e {
+                                egui::Event::Text(t)
+                                    if t.chars().eq(std::iter::once(c)) =>
+                                {
+                                    removed = true;
+                                    false
+                                }
+                                _ => true,
+                            }
+                        });
+                    });
+                    match edit {
+                        editor_ops::PairEdit::Insert { text: nt, cursor } => {
+                            self.editor.buffers[active].text = nt;
+                            self.editor.buffers[active].cache = None;
+                            pending_select = Some((cursor, cursor));
+                        }
+                        editor_ops::PairEdit::Surround { text: nt, select } => {
+                            self.editor.buffers[active].text = nt;
+                            self.editor.buffers[active].cache = None;
+                            pending_select = Some(select);
+                        }
+                        editor_ops::PairEdit::SkipOver { cursor } => {
+                            pending_select = Some((cursor, cursor));
+                        }
+                    }
+                } else if sel_min == sel_max
+                    && ui.input(|i| i.key_pressed(egui::Key::Backspace))
+                {
+                    if let Some((nt, cur)) = editor_ops::pair_on_backspace(
+                        &self.editor.buffers[active].text,
+                        sel_min,
+                    ) {
+                        if ui.input_mut(|i| {
+                            i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+                        }) {
+                            self.editor.buffers[active].text = nt;
+                            self.editor.buffers[active].cache = None;
+                            pending_select = Some((cur, cur));
+                        }
+                    }
+                }
+            }
+        }
+
         let hl = &self.highlighter;
         let buf = &mut self.editor.buffers[active];
         let Buffer {

@@ -154,6 +154,7 @@ Everything below is the manual for each instrument on the flight deck.
 - VS Code-grade file operations in the file tree: ➕ new file / 📂 new folder (inline input), ✏ rename (open tabs' paths and languages follow automatically), 🗑 delete (with confirmation dialog)
 - Right-click menu: open / new / rename / delete / "Send path to agent (@path)" / copy full path
 - In-file search (⌘F, hit count, jump-to-hit centered on screen)
+- Auto-closing brackets & quotes (auto-pair on open, surround the selection, skip over closers, Backspace deletes an empty pair at once)
 - VS Code-grade scrolling: fixed gutter, scrollBeyondLastLine, PageUp/PageDown
 - Fuzzy command palette (⌘P for files, ⌘⇧P for commands, **`@` for agents, `#` for git worktrees** — one box searches files, commands, sessions, and worktrees)
 - **Drag & drop**: drop a file-tree item, or any file/image from your OS, onto an agent's terminal and `@path` lands in its input field (nothing is submitted). Drop on the editor to open a tab; drop a folder to add it to the workspace

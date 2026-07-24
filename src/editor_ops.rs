@@ -285,6 +285,117 @@ fn is_bracket(c: char, pairs: &[(char, char)]) -> bool {
     pairs.iter().any(|&(o, cl)| c == o || c == cl)
 }
 
+/// 自動ペア対象 (括弧 + 引用符)。`<>` は比較演算子と衝突するため対象外。
+const AUTO_PAIRS: [(char, char); 6] = [
+    ('(', ')'),
+    ('[', ']'),
+    ('{', '}'),
+    ('"', '"'),
+    ('\'', '\''),
+    ('`', '`'),
+];
+
+/// 括弧・引用符の自動編集 (VS Code の autoClosingBrackets 相当)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairEdit {
+    /// 選択範囲を開き/閉じで囲む。新テキストと新しい選択範囲 (char)。
+    Surround { text: String, select: (usize, usize) },
+    /// 開き+閉じを挿入してカーソルをペアの間に置く。
+    Insert { text: String, cursor: usize },
+    /// 既にある閉じを飛び越える (重複挿入を避けてカーソルだけ右へ)。
+    SkipOver { cursor: usize },
+}
+
+/// 文字 `typed` を打った瞬間の自動ペア判定。該当しなければ None (通常入力)。
+/// `sel_min..sel_max` は現在の選択 (char)。空選択なら両者同値。
+pub fn pair_on_type(
+    text: &str,
+    sel_min: usize,
+    sel_max: usize,
+    typed: char,
+) -> Option<PairEdit> {
+    let closer_of = AUTO_PAIRS
+        .iter()
+        .find(|(o, _)| *o == typed)
+        .map(|(_, c)| *c);
+    let chars_len = text.chars().count();
+    let sel_min = sel_min.min(chars_len);
+    let sel_max = sel_max.min(chars_len);
+
+    if sel_min < sel_max {
+        // 選択あり: 開き (または引用符) を打ったら囲む
+        let close = closer_of?;
+        let a = char_to_byte(text, sel_min);
+        let b = char_to_byte(text, sel_max);
+        let mut nt = String::with_capacity(text.len() + 2);
+        nt.push_str(&text[..a]);
+        nt.push(typed);
+        nt.push_str(&text[a..b]);
+        nt.push(close);
+        nt.push_str(&text[b..]);
+        return Some(PairEdit::Surround {
+            text: nt,
+            select: (sel_min + 1, sel_max + 1),
+        });
+    }
+
+    let next = text.chars().nth(sel_max);
+    // スキップ: 閉じ文字を打ったが直後に同じ閉じ文字がもうある
+    let is_closer = AUTO_PAIRS.iter().any(|(_, c)| *c == typed);
+    if is_closer && next == Some(typed) {
+        return Some(PairEdit::SkipOver { cursor: sel_max + 1 });
+    }
+    let close = closer_of?;
+    // 引用符は単語や同じ引用符の直後では自動閉じしない (don't 等のアポストロフィ)
+    if typed == close {
+        let prev = sel_min
+            .checked_sub(1)
+            .and_then(|i| text.chars().nth(i));
+        if prev.is_some_and(|c| c.is_alphanumeric() || c == typed) {
+            return None;
+        }
+    }
+    // 直後が空白/行末/閉じ括弧のときだけ自動閉じ (既存コードへの割込を避ける)
+    let ok_next = match next {
+        None => true,
+        Some(c) if c.is_whitespace() => true,
+        Some(c) if AUTO_PAIRS.iter().any(|(_, cl)| *cl == c) => true,
+        _ => false,
+    };
+    if !ok_next {
+        return None;
+    }
+    let b = char_to_byte(text, sel_min);
+    let mut nt = String::with_capacity(text.len() + 2);
+    nt.push_str(&text[..b]);
+    nt.push(typed);
+    nt.push(close);
+    nt.push_str(&text[b..]);
+    Some(PairEdit::Insert {
+        text: nt,
+        cursor: sel_min + 1,
+    })
+}
+
+/// Backspace で空ペア `()` の間にいたら両方まとめて消す。
+/// 該当すれば (新テキスト, 新カーソル) を返す。
+pub fn pair_on_backspace(text: &str, cursor: usize) -> Option<(String, usize)> {
+    if cursor == 0 {
+        return None;
+    }
+    let prev = text.chars().nth(cursor - 1)?;
+    let next = text.chars().nth(cursor)?;
+    if !AUTO_PAIRS.iter().any(|(o, c)| *o == prev && *c == next) {
+        return None;
+    }
+    let a = char_to_byte(text, cursor - 1);
+    let b = char_to_byte(text, cursor + 1);
+    let mut nt = String::with_capacity(text.len().saturating_sub(2));
+    nt.push_str(&text[..a]);
+    nt.push_str(&text[b..]);
+    Some((nt, cursor - 1))
+}
+
 /// 大文字小文字を無視して `start_char` 以降 (見つからなければ先頭から) を検索。
 /// ヒットの char 位置を返す。app.rs の find_next と同じフォールバック規則。
 pub fn find_ci(text: &str, query: &str, start_char: usize) -> Option<usize> {
@@ -659,5 +770,106 @@ mod tests {
         assert_eq!(comment_prefix_for("CSS"), None);
         assert_eq!(comment_prefix_for("Markdown"), None);
         assert_eq!(comment_prefix_for("Plain Text"), None);
+    }
+
+    // ---- 括弧・引用符の自動ペア ----
+
+    #[test]
+    fn pair_insert_at_end_and_before_whitespace() {
+        // 行末 → 自動閉じ
+        assert_eq!(
+            pair_on_type("let x = ", 8, 8, '('),
+            Some(PairEdit::Insert {
+                text: "let x = ()".into(),
+                cursor: 9
+            })
+        );
+        // 直後が空白 → 自動閉じ
+        assert_eq!(
+            pair_on_type("f x", 1, 1, '('),
+            Some(PairEdit::Insert {
+                text: "f() x".into(),
+                cursor: 2
+            })
+        );
+        // 直後が英数字 → 割り込まない (通常入力)
+        assert_eq!(pair_on_type("fx", 1, 1, '('), None);
+        // 直後が閉じ括弧 → 自動閉じ (ネスト)
+        assert_eq!(
+            pair_on_type("f()", 2, 2, '['),
+            Some(PairEdit::Insert {
+                text: "f([])".into(),
+                cursor: 3
+            })
+        );
+    }
+
+    #[test]
+    fn pair_skip_over_existing_closer() {
+        assert_eq!(
+            pair_on_type("f()", 2, 2, ')'),
+            Some(PairEdit::SkipOver { cursor: 3 })
+        );
+        assert_eq!(
+            pair_on_type("s\"\"", 2, 2, '"'),
+            Some(PairEdit::SkipOver { cursor: 3 })
+        );
+    }
+
+    #[test]
+    fn pair_surround_selection() {
+        // "abc" の bc を選択して ( → a(bc)
+        assert_eq!(
+            pair_on_type("abc", 1, 3, '('),
+            Some(PairEdit::Surround {
+                text: "a(bc)".into(),
+                select: (2, 4)
+            })
+        );
+        // 引用符でも囲める。閉じ文字では囲まない
+        assert_eq!(
+            pair_on_type("abc", 0, 3, '"'),
+            Some(PairEdit::Surround {
+                text: "\"abc\"".into(),
+                select: (1, 4)
+            })
+        );
+        assert_eq!(pair_on_type("abc", 1, 3, ')'), None);
+    }
+
+    #[test]
+    fn pair_quote_not_after_word() {
+        // don't のアポストロフィ: 単語直後の引用符は自動閉じしない
+        assert_eq!(pair_on_type("don", 3, 3, '\''), None);
+        // 空白の後なら自動閉じ
+        assert_eq!(
+            pair_on_type("x ", 2, 2, '\''),
+            Some(PairEdit::Insert {
+                text: "x ''".into(),
+                cursor: 3
+            })
+        );
+    }
+
+    #[test]
+    fn pair_backspace_deletes_empty_pair() {
+        assert_eq!(pair_on_backspace("f()", 2), Some(("f".into(), 1)));
+        assert_eq!(pair_on_backspace("\"\"", 1), Some((String::new(), 0)));
+        // ペアでなければ通常の Backspace
+        assert_eq!(pair_on_backspace("f(x)", 2), None);
+        assert_eq!(pair_on_backspace("", 0), None);
+        // マルチバイト安全
+        assert_eq!(pair_on_backspace("あ()い", 2), Some(("あい".into(), 1)));
+    }
+
+    #[test]
+    fn pair_multibyte_selection_surround() {
+        assert_eq!(
+            pair_on_type("日本語", 0, 3, '('),
+            Some(PairEdit::Surround {
+                text: "(日本語)".into(),
+                select: (1, 4)
+            })
+        );
     }
 }
