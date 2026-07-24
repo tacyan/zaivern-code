@@ -11560,6 +11560,169 @@ mod tests {
         // 追跡を捨てた直後は区切りの空白も入らない
         assert!(!needs_space(v.last_char, Some('a')));
     }
+
+    // ── lsp_server_for: 言語ID → LSP 起動コマンド ──────────────────
+
+    #[test]
+    fn lsp_server_for_maps_known_languages() {
+        assert_eq!(lsp_server_for("rust"), Some("rust-analyzer"));
+        assert_eq!(
+            lsp_server_for("typescriptreact"),
+            Some("typescript-language-server --stdio")
+        );
+        assert_eq!(lsp_server_for("python"), Some("pyright-langserver --stdio"));
+        assert_eq!(lsp_server_for("go"), Some("gopls"));
+    }
+
+    #[test]
+    fn lsp_server_for_rejects_unknown_and_empty() {
+        assert_eq!(lsp_server_for("cobol"), None);
+        assert_eq!(lsp_server_for(""), None);
+    }
+
+    #[test]
+    fn lsp_server_for_is_case_sensitive() {
+        // 言語IDは小文字で届く前提。大文字は別物として弾く (現挙動の固定)
+        assert_eq!(lsp_server_for("Rust"), None);
+    }
+
+    // ── strip_trailing_keyword: 音声の合図キーワード除去 ─────────────
+
+    #[test]
+    fn strip_trailing_keyword_strips_exact_tail() {
+        assert_eq!(
+            strip_trailing_keyword("これを直して送信", "送信"),
+            Some("これを直して".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_trailing_keyword_trims_space_before_keyword() {
+        // キーワード直前の空白は本文に残さない
+        assert_eq!(
+            strip_trailing_keyword("fix the bug send", "send"),
+            Some("fix the bug".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_trailing_keyword_ignores_trailing_punctuation() {
+        // 音声認識が勝手に付ける末尾の句読点・記号は無視して判定する
+        assert_eq!(
+            strip_trailing_keyword("直して送信。", "送信"),
+            Some("直して".to_string())
+        );
+        assert_eq!(
+            strip_trailing_keyword("fix it send!? ", "send"),
+            Some("fix it".to_string())
+        );
+        // ただし本文側 (キーワードより前) の句読点はそのまま残る
+        assert_eq!(
+            strip_trailing_keyword("直して。送信", "送信"),
+            Some("直して。".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_trailing_keyword_requires_the_keyword_at_the_end() {
+        // キーワードが無い / 末尾以外に現れるだけなら合図ではない
+        assert_eq!(strip_trailing_keyword("こんにちは", "送信"), None);
+        assert_eq!(strip_trailing_keyword("送信して直す", "送信"), None);
+        assert_eq!(strip_trailing_keyword("", "送信"), None);
+    }
+
+    #[test]
+    fn strip_trailing_keyword_alone_yields_empty_text() {
+        // キーワードだけを言ったら本文は空 (空送信の扱いは呼び出し側の判断)
+        assert_eq!(strip_trailing_keyword("送信", "送信"), Some(String::new()));
+        assert_eq!(strip_trailing_keyword(" 送信。", "送信"), Some(String::new()));
+    }
+
+    // ── shortcut_reference: ショートカット一覧ダイアログの整合性 ─────
+
+    #[test]
+    fn shortcut_reference_rows_are_all_filled() {
+        let rows = shortcut_reference(&Keybinds::default());
+        assert!(!rows.is_empty());
+        for (label, shortcut) in &rows {
+            assert!(!label.is_empty(), "ラベルが空の行がある");
+            assert!(!shortcut.is_empty(), "{label}: ショートカット表記が空");
+        }
+    }
+
+    #[test]
+    fn shortcut_reference_labels_are_unique() {
+        // 同じラベルが 2 行あると、どちらのキーか読み分けられない
+        let rows = shortcut_reference(&Keybinds::default());
+        let mut seen = HashSet::new();
+        for (label, _) in &rows {
+            assert!(seen.insert(label.as_str()), "ラベル重複: {label}");
+        }
+    }
+
+    #[test]
+    fn shortcut_reference_covers_core_actions() {
+        let rows = shortcut_reference(&Keybinds::default());
+        let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
+        // バインドに追従する側 + egui TextEdit 内蔵の固定側の両方から拾う
+        for want in ["保存", "コマンド パレット", "検索", "コピー"] {
+            let want = tr(want);
+            assert!(labels.contains(&want.as_str()), "一覧に {want} が無い");
+        }
+    }
+
+    // ── resolve_theme: テーマ名 / テーマJSONパスの解決 ───────────────
+
+    #[test]
+    fn resolve_theme_builtin_names_match_theme_by_name() {
+        for want in theme::all() {
+            let got = resolve_theme(&want.name);
+            assert_eq!(got.name, want.name);
+            assert_eq!(got.label, want.label);
+            assert_eq!(got.dark, want.dark);
+            assert_eq!(got.bg, want.bg);
+        }
+    }
+
+    #[test]
+    fn resolve_theme_missing_json_path_falls_back_to_builtin_default() {
+        // 存在しない JSON パスは読み込み失敗 → ビルトイン名として解決を試み、
+        // 該当なしなので既定テーマに落ちる (起動不能にはならない)
+        let got = resolve_theme("/no/such/dir/zaivern-missing-theme.json");
+        assert_eq!(got.name, theme::by_name("そんな名前は無い").name);
+        assert_eq!(got.name, "zaivern-dark");
+    }
+
+    #[test]
+    fn resolve_theme_empty_name_is_the_default_theme() {
+        assert_eq!(resolve_theme("").name, "zaivern-dark");
+    }
+
+    // ── root_name: ルートの表示名 ────────────────────────────────
+
+    #[test]
+    fn root_name_returns_last_component() {
+        assert_eq!(root_name(Path::new("/a/b")), "b");
+        assert_eq!(root_name(Path::new("/deep/nested/dir")), "dir");
+    }
+
+    #[test]
+    fn root_name_ignores_a_trailing_slash() {
+        assert_eq!(root_name(Path::new("/a/b/")), "b");
+    }
+
+    #[test]
+    fn root_name_falls_back_to_the_full_path_for_root() {
+        // "/" や ".." にはフォルダ名が無いのでフルパス表示に落ちる
+        assert_eq!(root_name(Path::new("/")), "/");
+        assert_eq!(root_name(Path::new("..")), "..");
+    }
+
+    #[test]
+    fn root_name_works_for_relative_paths() {
+        assert_eq!(root_name(Path::new("src")), "src");
+        assert_eq!(root_name(Path::new("src/deep")), "deep");
+    }
 }
 
 // ─── セッション状態マッピングと確認ゲートのテスト ───────────────────
