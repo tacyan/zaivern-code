@@ -535,8 +535,18 @@ pub fn spec_for_command(command: &str) -> Option<&'static AgentSpec> {
 }
 
 /// 実行ファイル名(パス無し)からカタログ定義を引く。
+/// `antigravity` や `antigravity-cli` などのエイリアス名も正しく吸収する。
 pub fn spec_for_bin(bin: &str) -> Option<&'static AgentSpec> {
-    AGENT_CATALOG.iter().find(|s| s.bin == bin)
+    if let Some(spec) = AGENT_CATALOG.iter().find(|s| s.bin == bin) {
+        return Some(spec);
+    }
+    let normalized = match bin {
+        "antigravity" | "antigravity-cli" => "agy",
+        "claude-code" => "claude",
+        "gemini-cli" => "gemini",
+        _ => bin,
+    };
+    AGENT_CATALOG.iter().find(|s| s.bin == normalized)
 }
 
 /// コマンドの先頭トークンが承認モード対応 CLI なら (auto フラグ, 除去対象) を返す。
@@ -1018,6 +1028,8 @@ mod tests {
     fn catalog_lookup_by_bare_name() {
         assert_eq!(spec_for_command("claude").unwrap().label, "Claude Code");
         assert_eq!(spec_for_bin("kiro-cli").unwrap().label, "Kiro");
+        assert_eq!(spec_for_command("antigravity").unwrap().label, "Antigravity");
+        assert_eq!(spec_for_command("antigravity-cli").unwrap().label, "Antigravity");
     }
 
     #[test]

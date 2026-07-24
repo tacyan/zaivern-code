@@ -234,26 +234,77 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
     if text.contains("trust the files in this folder") {
         return Some((b"\r", "フォルダ信頼確認に「Yes」"));
     }
-    // Codex TUI の承認画面。Claude 系とは質問文と選択カーソルが異なるため、
-    // 明示的な承認文 + Yes 選択肢の組み合わせで判定し、ショートカット y を送る。
-    let codex_approval = text.contains("Would you like to run")
+    // Press Enter 系の確認プロンプト
+    if text.contains("Press Enter to continue") || text.contains("Press Enter to proceed") || text.contains("Press [Enter]") {
+        return Some((b"\r", "Enterで続行"));
+    }
+
+    let has_question_context = text.contains("Do you")
+        || text.contains("Would you")
+        || text.contains("Are you")
+        || text.contains("approval")
+        || text.contains("permission")
+        || text.contains("confirm")
+        || text.contains("proceed")
+        || text.contains("Allow")
+        || text.contains("実行しますか")
+        || text.contains("許可しますか")
+        || text.contains("続行しますか")
+        || text.contains("承認しますか");
+
+    // Codex / Antigravity CLI TUI の承認画面。質問文と選択肢の組み合わせ。
+    let agent_approval = text.contains("Would you like to run")
         || text.contains("needs your approval")
-        || text.contains("Do you want to approve network access");
-    if codex_approval && (text.contains("1. Yes") || text.contains("Yes, proceed")) {
-        return Some((b"y", "Codexの承認に「Yes」"));
+        || text.contains("Do you want to approve network access")
+        || text.contains("Do you want to execute")
+        || text.contains("Allow command")
+        || text.contains("Allow tool")
+        || text.contains("Allow action")
+        || text.contains("Allow file");
+    if agent_approval && (text.contains("1. Yes") || text.contains("1. Allow") || text.contains("Yes, proceed") || text.contains("Yes, allow")) {
+        return Some((b"y", "Codex/Antigravityの承認に「Yes」"));
     }
-    // 選択カーソルが Yes の上にある一般的な確認 → Enter で確定。
-    if text.contains("❯ 1. Yes") {
-        return Some((b"\r", "「Yes」"));
-    }
-    // カーソル位置に依らず番号キーで「1. Yes」を直接選ぶ。
-    // 誤爆防止のため質問文(Do you want / Would you like)がある場合のみ。
-    if (text.contains("Do you want") || text.contains("Would you like to proceed"))
-        && text.contains("1. Yes")
+
+    // 選択カーソルが Yes / Allow / はい / 許可 の上にある一般的な確認 → Enter で確定。
+    if text.contains("❯ 1. Yes")
+        || text.contains("❯ 1. Allow")
+        || text.contains("❯ 1. はい")
+        || text.contains("❯ 1. 許可")
+        || text.contains("❯ 1. 実行")
+        || text.contains("❯ 1. 承認")
+        || text.contains("❯ 1. Accept")
+        || text.contains("❯ 1. Continue")
     {
-        return Some((b"1", "「1. Yes」"));
+        return Some((b"\r", "「Yes/Allow/はい」"));
     }
-    if text.contains("(y/n)") || text.contains("[y/N]") || text.contains("[y/n]") {
+
+    // 質問コンテクストが存在し、かつ番号キー「1. Yes」または「1. Allow」「1. はい」がある場合は直接選ぶ
+    if has_question_context && (
+        text.contains("1. Yes")
+            || text.contains("1. Allow")
+            || text.contains("1. はい")
+            || text.contains("1. 許可")
+            || text.contains("1. 実行")
+            || text.contains("1. 承認")
+            || text.contains("1. Accept")
+            || text.contains("1. Continue")
+    ) {
+        return Some((b"1", "「1. Yes/Allow/はい」"));
+    }
+
+    // (y/n), [y/N], (はい/いいえ) 等のテキスト問い合わせ
+    if text.contains("(y/n)")
+        || text.contains("[y/N]")
+        || text.contains("[y/n]")
+        || text.contains("(Y/n)")
+        || text.contains("[Y/n]")
+        || text.contains("(y/N)")
+        || text.contains("(Y/N)")
+        || text.contains("[y/n/a]")
+        || text.contains("[Y/n/a]")
+        || text.contains("(yes/no)")
+        || text.contains("[yes/no]")
+    {
         return Some((b"y\r", "「y」"));
     }
     None
@@ -261,20 +312,48 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
 
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
 /// auto_yes_reply だけが分類する特殊プロンプトも含める。
-const SIG_MARKS: [&str; 13] = [
+const SIG_MARKS: [&str; 41] = [
     "Do you want",
     "Would you like to proceed",
     "Would you like to run",
     "needs your approval",
     "Do you want to approve network access",
+    "Do you approve",
+    "Do you allow",
+    "Are you sure",
+    "Confirm",
+    "Proceed",
     "❯ 1. Yes",
     "1. Yes",
+    "❯ 1. Allow",
+    "1. Allow",
+    "❯ 1. はい",
+    "1. はい",
+    "❯ 1. 許可",
+    "1. 許可",
+    "❯ 1. 実行",
+    "1. 実行",
+    "❯ 1. 承認",
+    "1. 承認",
     "(y/n)",
     "[y/N]",
     "[y/n]",
+    "(Y/n)",
+    "[Y/n]",
+    "(y/N)",
+    "(Y/N)",
+    "[y/n/a]",
+    "[Y/n/a]",
+    "(yes/no)",
+    "[yes/no]",
     "Yes, I accept",
+    "Yes, proceed",
+    "Yes, allow",
     "trust the files in this folder",
     "Bypass Permissions mode",
+    "Press Enter to continue",
+    "Press Enter to proceed",
+    "Press [Enter]",
 ];
 
 /// 画面に出ている承認プロンプトの「指紋」。
@@ -1324,6 +1403,24 @@ mod tests {
         assert!(auto_yes_reply("手順:\n1. Yes と入力\n2. 実行").is_none());
         assert!(auto_yes_reply("Codex needs your approval before deployment.").is_none());
         assert!(auto_yes_reply("ビルドが完了しました").is_none());
+    }
+
+    #[test]
+    fn antigravity_allow_and_japanese_prompts_send_yes() {
+        // Antigravity の Allow プロンプト
+        let screen1 = "Allow reading file src/main.rs?\n❯ 1. Allow\n  2. Deny";
+        let (bytes1, _) = auto_yes_reply(screen1).unwrap();
+        assert_eq!(bytes1, b"\r");
+
+        // 日本語プロンプト
+        let screen2 = "変更を実行しますか？\n  1. はい\n❯ 2. いいえ";
+        let (bytes2, _) = auto_yes_reply(screen2).unwrap();
+        assert_eq!(bytes2, b"1");
+
+        // Press Enter プロンプト
+        let screen3 = "Press Enter to continue";
+        let (bytes3, _) = auto_yes_reply(screen3).unwrap();
+        assert_eq!(bytes3, b"\r");
     }
 
     // ── レート制限の検知 ──────────────────────────────────────────────

@@ -13,9 +13,14 @@ const MAX_HIGHLIGHT_BYTES: usize = 400_000;
 /// highlighting so one huge line cannot freeze the UI.
 const MAX_HIGHLIGHT_LINE_BYTES: usize = 8_192;
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
+
 pub struct Highlighter {
     ps: SyntaxSet,
     ts: ThemeSet,
+    cache: Mutex<HashMap<u64, LayoutJob>>,
 }
 
 impl Highlighter {
@@ -23,6 +28,7 @@ impl Highlighter {
         Self {
             ps: SyntaxSet::load_defaults_newlines(),
             ts: ThemeSet::load_defaults(),
+            cache: Mutex::new(HashMap::with_capacity(256)),
         }
     }
 
@@ -66,6 +72,21 @@ impl Highlighter {
         font: FontId,
         fallback: Color32,
     ) -> LayoutJob {
+        // キャッシュキーのハッシュ計算
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        lang.hash(&mut hasher);
+        theme_name.hash(&mut hasher);
+        font.hash(&mut hasher);
+        fallback.hash(&mut hasher);
+        let key = hasher.finish();
+
+        if let Ok(guard) = self.cache.lock() {
+            if let Some(cached_job) = guard.get(&key) {
+                return cached_job.clone();
+            }
+        }
+
         let plain = |job: &mut LayoutJob| {
             job.append(
                 text,
@@ -88,11 +109,23 @@ impl Highlighter {
 
         if text.len() > MAX_HIGHLIGHT_BYTES || syntax.name == "Plain Text" {
             plain(&mut job);
+            if let Ok(mut guard) = self.cache.lock() {
+                if guard.len() >= 512 {
+                    guard.clear();
+                }
+                guard.insert(key, job.clone());
+            }
             return job;
         }
 
         let Some(theme) = self.ts.themes.get(theme_name) else {
             plain(&mut job);
+            if let Ok(mut guard) = self.cache.lock() {
+                if guard.len() >= 512 {
+                    guard.clear();
+                }
+                guard.insert(key, job.clone());
+            }
             return job;
         };
 
@@ -144,6 +177,14 @@ impl Highlighter {
                 }
             }
         }
+
+        if let Ok(mut guard) = self.cache.lock() {
+            if guard.len() >= 512 {
+                guard.clear();
+            }
+            guard.insert(key, job.clone());
+        }
+
         job
     }
 }
