@@ -7126,9 +7126,12 @@ impl ZaivernApp {
                 ^ (ui.ctx().pixels_per_point().to_bits() as u64).rotate_left(41)
         };
         let view_h = self.last_view_h;
-        let theme_bg = self.theme.bg;
+        // ガターは本文と別背景にして「打ち込める範囲」との境界を見せる
+        let theme_panel = self.theme.panel;
+        let theme_border = self.theme.border;
+        let theme_accent = self.theme.accent;
         // 現在行ハイライト用 (テキストの上に重ねるのでごく薄く)
-        let cur_line_hl = self.theme.text.gamma_multiply(0.045);
+        let cur_line_hl = self.theme.text.gamma_multiply(0.07);
 
         let mut pending_select = self.pending_select.take();
         let pending_scroll = self.pending_scroll.take();
@@ -7164,6 +7167,18 @@ impl ZaivernApp {
         // (一致しなければ Tab はそのまま TextEdit のタブ挿入に流す)。
         let ed_id_early = egui::Id::new(("zaivern-buffer", self.editor.buffers[active].id));
         let has_focus = ui.memory(|m| m.has_focus(ed_id_early));
+
+        // Ctrl+A 全選択: egui 標準の TextEdit は mac では Cmd+A のみ対応で、
+        // Ctrl+A は本文に届かず何も起きない (ブロードキャスト等の入力欄は
+        // 個別対応済みなので、エディタだけ効かない不一致になっていた)。
+        // 選択するのは TextEdit の中身 = 実際に文字を打ち込める本文だけ。
+        // 行番号ガターは別描画なので選択には含まれない。
+        if has_focus
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A))
+        {
+            let len = self.editor.buffers[active].text.chars().count();
+            pending_select = Some((0, len));
+        }
         let expand = if has_focus {
             let lang_id = snippets::lang_id_for(&lang_clone);
             match self.snippets_by_lang.get(lang_id) {
@@ -7555,13 +7570,13 @@ impl ZaivernApp {
         self.last_view_h = vis.height();
         self.last_scroll_y = inner.state.offset.y;
         let painter = ui.painter_at(vis);
+        let gutter_edge = vis.left() + gutter_w - 10.0;
+        // ガターは本文と別の背景色 + 境界線で塗り分け、文字を打ち込める
+        // 範囲 (境界線の右側) がひと目で分かるようにする
         painter.rect_filled(
-            egui::Rect::from_min_max(
-                vis.min,
-                egui::pos2(vis.left() + gutter_w - 10.0, vis.bottom()),
-            ),
+            egui::Rect::from_min_max(vis.min, egui::pos2(gutter_edge, vis.bottom())),
             0.0,
-            theme_bg,
+            theme_panel,
         );
         painter.galley(
             egui::pos2(
@@ -7571,6 +7586,22 @@ impl ZaivernApp {
             gutter_galley,
             theme_dim,
         );
+        painter.vline(
+            gutter_edge,
+            vis.y_range(),
+            egui::Stroke::new(1.0_f32, theme_border),
+        );
+        // フォーカスリング: エディタに入力フォーカスがあるときだけ、
+        // キー入力が入る本文エリアをアクセント色の枠で囲って明示する
+        if ui.memory(|m| m.has_focus(ed_id)) {
+            let text_area =
+                egui::Rect::from_min_max(egui::pos2(gutter_edge, vis.top()), vis.max);
+            painter.rect_stroke(
+                text_area.shrink(1.0),
+                0.0,
+                egui::Stroke::new(1.5_f32, theme_accent.gamma_multiply(0.65)),
+            );
+        }
 
         if let Some(c) = cursor_out {
             self.editor.cursor = c;
