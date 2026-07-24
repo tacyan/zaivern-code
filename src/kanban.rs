@@ -520,6 +520,10 @@ fn header_ui(
             if (send.clicked() || enter) && !st.broadcast_input.trim().is_empty() {
                 acts.push(KanbanAction::Broadcast(st.broadcast_input.trim().to_string()));
                 st.broadcast_input.clear();
+                // Enter 送信でフォーカスが外れるので戻し、連続入力できるようにする
+                if enter {
+                    input.request_focus();
+                }
             }
             ui.label(
                 RichText::new(trf("連続稼働 {t}", &[("t", fmt_uptime(now_ms))]))

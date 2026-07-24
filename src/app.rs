@@ -5838,7 +5838,7 @@ impl ZaivernApp {
                     egui::TextEdit::singleline(&mut self.broadcast_input)
                         .id(ui.make_persistent_id("broadcast-input"))
                         .desired_width(300.0)
-                        .hint_text(tr("全エージェントへブロードキャスト (/goal, /loop 支持)...")),
+                        .hint_text(tr("全エージェントへブロードキャスト (/goal, /loop 対応)...")),
                 );
                 let enter = input.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -5847,6 +5847,10 @@ impl ZaivernApp {
                     let expanded = self.agent_input_buf.submit();
                     acts.broadcast = Some(expanded);
                     self.broadcast_input.clear();
+                    // Enter 送信でフォーカスが外れるので戻し、連続入力できるようにする
+                    if enter {
+                        input.request_focus();
+                    }
                 }
                 // 音声で全エージェントの入力欄へ入れる (送信は各自 Enter)
                 let rec = self.voice.session.is_some();
