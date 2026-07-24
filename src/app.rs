@@ -6477,7 +6477,7 @@ impl ZaivernApp {
                         ""
                     },
                     can_cycle: s.permission_switch_hint().is_some(),
-                    // フル幅カードのライブプレビュー: 画面末尾の意味のある行を数行
+                    // カードの一言 + ホバープレビュー: 画面末尾の意味のある行を数行
                     tail_lines: s.screen_tail_lines(8, 220),
                     task,
                 }
@@ -6490,7 +6490,38 @@ impl ZaivernApp {
             .map(|p| (p.icon.clone(), p.name.clone()))
             .collect();
 
-        let acts = kanban::ui(&mut self.kanban_state, ui, &theme, &cards, &presets);
+        // アクティビティフィード: supervisor の状態遷移履歴を新しい順に混ぜる
+        let now_ms = self.supervisor.elapsed_ms();
+        let mut activity: Vec<kanban::ActivityEntry> = Vec::new();
+        for s in &self.agents.sessions {
+            let icon = if s.icon.is_empty() { "👾".to_string() } else { s.icon.clone() };
+            for t in self.supervisor.history_of(s.id).iter().rev().take(12) {
+                activity.push(kanban::ActivityEntry {
+                    age_ms: now_ms.saturating_sub(t.at_ms),
+                    icon: icon.clone(),
+                    title: s.title.clone(),
+                    text: trf(
+                        "が「{state}」になりました",
+                        &[("state", tr(t.to.label()))],
+                    ),
+                    detail: t.reason.clone(),
+                    // 遷移先状態の列色で塗る (フラグは関与させない)
+                    column: kanban::column_for(true, false, false, Some(t.to)),
+                });
+            }
+        }
+        activity.sort_by_key(|e| e.age_ms);
+        activity.truncate(60);
+
+        let acts = kanban::ui(
+            &mut self.kanban_state,
+            ui,
+            &theme,
+            &cards,
+            &presets,
+            &activity,
+            now_ms,
+        );
 
         for act in acts {
             match act {
