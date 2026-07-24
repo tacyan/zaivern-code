@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_input;
 mod agent_picker;
 mod agents;
 mod app;

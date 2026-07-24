@@ -359,6 +359,7 @@ pub struct ZaivernApp {
     remote_open: bool,
     qr_tex: Option<egui::TextureHandle>,
     broadcast_input: String,
+    agent_input_buf: crate::agent_input::AgentInputBuffer,
     gitinfo: git::GitSet,
     /// Git サイドバー。単一 repo 表示なので常に primary ルートを見る。
     git_panel: git_panel::GitPanel,
@@ -734,6 +735,7 @@ impl ZaivernApp {
             voice: VoiceState::default(),
             qr_tex: None,
             broadcast_input: String::new(),
+            agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
             pet_pos: match (cfg.pet_x, cfg.pet_y) {
                 (Some(x), Some(y)) => Some(egui::pos2(x, y)),
                 _ => None,
@@ -1414,10 +1416,14 @@ impl ZaivernApp {
     /// エージェントの入力欄へテキストを差し込む。`submit` が true のときだけ Enter を送る。
     /// `agent` が None ならアクティブなセッション、Some なら名前 (プリセット名/タイトル) で探す。
     fn send_agent_prompt(&mut self, agent: Option<&str>, text: &str, submit: bool) -> bool {
+        // スラッシュコマンド（/goal, /loop, /help 等）の高速パース・プロンプト展開
+        let parsed_cmd = crate::agent_input::SlashCommandEngine::parse(text);
+        let expanded_text = crate::agent_input::SlashCommandEngine::expand_command(&parsed_cmd);
+
         let payload = if submit {
-            format!("{text}\r")
+            format!("{expanded_text}\r")
         } else {
-            text.to_string()
+            expanded_text.clone()
         };
         let idx = match agent.map(str::trim).filter(|a| !a.is_empty()) {
             Some(name) => self.agents.sessions.iter().position(|s| {
@@ -1444,7 +1450,7 @@ impl ZaivernApp {
         self.agents.panel_open = true;
         let verb = if submit { tr("送信") } else { tr("入力欄へ") };
         self.toast(
-            format!("🔌 {title} {verb}: {}", notify::truncate_chars(text, 60)),
+            format!("🔌 {title} {verb}: {}", notify::truncate_chars(&expanded_text, 60)),
             true,
         );
         true
@@ -5322,15 +5328,47 @@ impl ZaivernApp {
                             }
                         });
                         let send = ui.button(tr("📣 送信"));
+
+                        // キーボードショートカット・キー判定（入力欄がフォーカス中）
+                        let trigger_submit = false;
+                        if ui.memory(|m| m.has_focus(ui.make_persistent_id("broadcast-input"))) {
+                            ui.input(|i| {
+                                // Ctrl+A / Cmd+A 全選択
+                                if i.modifiers.command || i.modifiers.ctrl {
+                                    if i.key_pressed(egui::Key::A) {
+                                        self.agent_input_buf.set_text(&self.broadcast_input);
+                                        self.agent_input_buf.select_all();
+                                    } else if i.key_pressed(egui::Key::U) {
+                                        self.agent_input_buf.set_text(&self.broadcast_input);
+                                        self.agent_input_buf.delete_to_beginning();
+                                        self.broadcast_input = self.agent_input_buf.text().to_string();
+                                    } else if i.key_pressed(egui::Key::K) {
+                                        self.agent_input_buf.set_text(&self.broadcast_input);
+                                        self.agent_input_buf.delete_to_end();
+                                        self.broadcast_input = self.agent_input_buf.text().to_string();
+                                    }
+                                } else if i.key_pressed(egui::Key::ArrowUp) {
+                                    self.agent_input_buf.history_prev();
+                                    self.broadcast_input = self.agent_input_buf.text().to_string();
+                                } else if i.key_pressed(egui::Key::ArrowDown) {
+                                    self.agent_input_buf.history_next();
+                                    self.broadcast_input = self.agent_input_buf.text().to_string();
+                                }
+                            });
+                        }
+
                         let input = ui.add(
                             egui::TextEdit::singleline(&mut self.broadcast_input)
+                                .id(ui.make_persistent_id("broadcast-input"))
                                 .desired_width(300.0)
-                                .hint_text(tr("全エージェントへブロードキャスト…")),
+                                .hint_text(tr("全エージェントへブロードキャスト (/goal, /loop 支持)...")),
                         );
                         let enter = input.lost_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if (send.clicked() || enter) && !self.broadcast_input.trim().is_empty() {
-                            broadcast = Some(self.broadcast_input.trim().to_string());
+                        if (send.clicked() || enter || trigger_submit) && !self.broadcast_input.trim().is_empty() {
+                            self.agent_input_buf.set_text(&self.broadcast_input);
+                            let expanded = self.agent_input_buf.submit();
+                            broadcast = Some(expanded);
                             self.broadcast_input.clear();
                         }
                         // 音声で全エージェントの入力欄へ入れる (送信は各自 Enter)

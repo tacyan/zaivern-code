@@ -292,8 +292,14 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         || text.contains("❯ 1. 承認")
         || text.contains("❯ 1. Accept")
         || text.contains("❯ 1. Continue")
+        || text.contains("❯ Yes")
+        || text.contains("❯ Allow")
+        || text.contains("❯ はい")
+        || text.contains("❯ 許可")
+        || text.contains("❯ Continue")
+        || text.contains("❯ Proceed")
     {
-        return Some((b"\r", "「Yes/Allow/はい」"));
+        return Some((b"\r", "カーソル選択確認に「Enter」"));
     }
 
     // 質問コンテクストが存在し、かつ番号キー「1. Yes」または「1. Allow」「1. はい」がある場合は直接選ぶ
@@ -306,6 +312,9 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
             || text.contains("1. 承認")
             || text.contains("1. Accept")
             || text.contains("1. Continue")
+            || text.contains("1) Yes")
+            || text.contains("(1) Yes")
+            || text.contains("[1] Yes")
     ) {
         return Some((b"1", "「1. Yes/Allow/はい」"));
     }
@@ -322,43 +331,90 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         || text.contains("[Y/n/a]")
         || text.contains("(yes/no)")
         || text.contains("[yes/no]")
+        || text.contains("(y/N)?")
+        || text.contains("[Y/n]?")
     {
         return Some((b"y\r", "「y」"));
     }
 
-    // YESモードでは質問の種類を限定しない。既知CLIの承認文言に一致しなくても、
-    // 画面末尾の実際の入力待ちが質問文なら肯定して送信する。
-    //
-    // 画面全体に過去ログの質問が残るのは通常なので、末尾側の最後の非空行だけを見る。
-    // これにより会話履歴中の「?」への誤反応を抑えつつ、未知・将来版CLIの質問にも
-    // YESで進める。TUI固有の選択キーは上の専用判定を優先する。
-    if last_nonempty_line(text).is_some_and(is_question_line) {
-        return Some((b"y\r", "質問に自動「Yes」"));
+    // YESモードでは質問の種類を限定しない。
+    // 画面最下部の直近2行（プロンプト行または直前行）が質問・確認文であれば自動でYesを送信。
+    if recent_lines_has_question(text) {
+        return Some((b"y\r", "質問・確認ダイアログに自動「Yes」"));
     }
     None
 }
 
-/// 末尾側の最後の非空行。CLIの入力待ちは通常ここに表示される。
-fn last_nonempty_line(text: &str) -> Option<&str> {
-    text.lines().rev().map(str::trim).find(|line| !line.is_empty())
+/// 画面末尾が質問文か、あるいはプロンプト入力待ち(>, $, :)で直前行が質問文であるか判定
+fn recent_lines_has_question(text: &str) -> bool {
+    let mut non_empty_lines = text.lines().rev().map(str::trim).filter(|line| !line.is_empty());
+    let Some(last) = non_empty_lines.next() else {
+        return false;
+    };
+
+    if is_question_line(last) {
+        return true;
+    }
+
+    // 最下行が入力プロンプト記号（">", "$", ":", "%" など）または選択指示行の場合
+    let is_prompt_symbol = last.ends_with('>')
+        || last.ends_with('$')
+        || last.ends_with(':')
+        || last.ends_with('%')
+        || last.contains("(1)")
+        || last.contains("[1]");
+
+    if is_prompt_symbol {
+        if let Some(prev) = non_empty_lines.next() {
+            return is_question_line(prev);
+        }
+    }
+
+    false
 }
 
 /// YESモードで肯定する一般的な質問行か。
 fn is_question_line(line: &str) -> bool {
     let line = line.trim_end();
-    line.ends_with('?')
+    if line.ends_with('?')
         || line.ends_with('？')
-        || [
-            "しますか",
-            "できますか",
-            "よろしいですか",
-            "いいですか",
-            "どうしますか",
-            "続けますか",
-            "進めますか",
-        ]
-        .iter()
-        .any(|ending| line.ends_with(ending))
+        || line.contains("(y/n)")
+        || line.contains("[y/N]")
+        || line.contains("[y/n]")
+        || line.contains("(Y/n)")
+        || line.contains("(yes/no)")
+        || line.contains("[yes/no]")
+    {
+        return true;
+    }
+
+    let endings = [
+        "しますか",
+        "できますか",
+        "よろしいですか",
+        "いいですか",
+        "どうしますか",
+        "続けますか",
+        "進めますか",
+        "実行しますか",
+        "許可しますか",
+        "承認しますか",
+        "変更しますか",
+        "適用しますか",
+        "削除しますか",
+        "上書きしますか",
+        "保存しますか",
+        "送信しますか",
+        "を選びますか",
+        "Continue?",
+        "Proceed?",
+        "Confirm?",
+        "Approve?",
+        "Allow?",
+        "Overwrite?",
+    ];
+
+    endings.iter().any(|ending| line.ends_with(ending) || line.contains(ending))
 }
 
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
@@ -1453,6 +1509,14 @@ mod tests {
     fn question_in_history_does_not_trigger_when_latest_line_is_not_question() {
         let screen = "User: Shall I deploy this?\nAssistant: Build completed successfully.";
         assert!(auto_yes_reply(screen).is_none());
+    }
+
+    #[test]
+    fn multi_line_question_in_recent_lines_sends_yes() {
+        let screen = "Agent: 変更を適用しますか？ [y/N]\n  (1) Yes\n  (2) No\n> ";
+        let (bytes, desc) = auto_yes_reply(screen).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(desc.contains("y") || desc.contains("1") || desc.contains("Yes") || desc.contains("自動"));
     }
 
     #[test]
