@@ -7,6 +7,7 @@ mod cli;
 mod commander;
 mod config;
 mod coordinator;
+mod desktop;
 mod diagnostician;
 mod diff;
 mod editor;
@@ -50,8 +51,7 @@ use eframe::egui;
 /// ウィンドウ/タスクバーアイコンとして 256px に縮小して使う。
 /// 失敗してもアイコン無しで起動を続ける。
 fn load_icon() -> Option<egui::IconData> {
-    const BYTES: &[u8] = include_bytes!("../assets/Zaivern.png");
-    let img = image::load_from_memory(BYTES).ok()?;
+    let img = image::load_from_memory(desktop::ICON_PNG).ok()?;
     let img = img.resize_exact(256, 256, image::imageops::FilterType::Lanczos3);
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
@@ -95,7 +95,10 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1480.0, 940.0])
         .with_min_inner_size([860.0, 560.0])
-        .with_title("Zaivern Code");
+        .with_title("Zaivern Code")
+        // Linux で .desktop (zaivern-code.desktop) と結び付ける ID。
+        // desktop.rs の Icon= / StartupWMClass= と一致させること。
+        .with_app_id("zaivern-code");
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }

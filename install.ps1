@@ -32,6 +32,15 @@ if (($userPath -split ";") -notcontains $dir) {
     Write-Host "[zaivern-code] PATH に $dir を追加しました (新しいターミナルから有効)" -ForegroundColor Yellow
 }
 
+# スタートメニューへ「Zaivern Code」を登録 (失敗しても続行)
+# zai.exe は GUI サブシステムなので Start-Process -Wait で完了を待つ
+try {
+    Start-Process -FilePath (Join-Path $dir "zai.exe") -ArgumentList "app","install" -Wait -WindowStyle Hidden
+    Write-Host "[zaivern-code] スタートメニューに「Zaivern Code」を登録しました (解除: zai app uninstall)" -ForegroundColor Cyan
+} catch {
+    Write-Host "[zaivern-code] スタートメニュー登録をスキップしました: $_" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "[zaivern-code] ✅ インストール完了: $dir\zai.exe ($tag)" -ForegroundColor Green
-Write-Host "[zaivern-code]    起動: zai [ワークスペースのパス]"
+Write-Host "[zaivern-code]    起動: zai [ワークスペースのパス] (スタートメニューの「Zaivern Code」でも起動できます)"

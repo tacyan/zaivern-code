@@ -49,6 +49,8 @@ irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 
 インストールが終わったら、開きたいプロジェクトのフォルダで `zai .` と打つだけ——そこがあなたの操縦席になります(`zai [ワークスペースのパス]` でも指定可)。**同じワンライナーをもう一度実行すれば、最新版へ更新されます。** 各 OS のビルド済みバイナリは [**Releases**](https://github.com/tacyan/zaivern-code/releases/latest) から直接ダウンロードもできます(macOS arm64/x86_64・Linux x86_64/arm64・Windows x86_64)。
 
+インストーラは同時に OS の**アプリ一覧にも「Zaivern Code」を登録**します——macOS は Launchpad / Spotlight、Linux はアプリメニュー、Windows はスタートメニューから、ターミナルを開かずに起動できます(ホームディレクトリがワークスペースになります)。手動での登録・解除は `zai app install` / `zai app uninstall`。
+
 ---
 
 ## 操縦席から見える景色
@@ -234,6 +236,8 @@ zai run "cargo test"               # ターミナルで実行
 zai status "デプロイ中"              # ステータスバーに表示
 zai plugin list                    # プラグイン一覧
 zai plugin new <名前>               # 雛形を作る
+zai app install                    # OS のアプリ一覧に登録(Launchpad/メニュー/スタートメニュー)
+zai app uninstall                  # アプリ登録を解除
 ```
 
 引数なしの `zai` や `zai .` は今までどおり GUI が起動します。
