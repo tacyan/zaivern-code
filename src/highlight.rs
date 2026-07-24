@@ -20,15 +20,24 @@ use std::sync::Mutex;
 pub struct Highlighter {
     ps: SyntaxSet,
     ts: ThemeSet,
-    cache: Mutex<HashMap<u64, LayoutJob>>,
+    /// key → LayoutJob と、その挿入順。キーは本文全体のハッシュを含むため
+    /// 1 打鍵ごとに新しいエントリが増える。上限到達で全消しすると次の
+    /// フレームに全再ハイライトのスパイクが出るので、古い方から 1 件ずつ
+    /// 追い出す。文書まるごとの LayoutJob を抱えるため上限は小さめ。
+    cache: Mutex<(HashMap<u64, LayoutJob>, std::collections::VecDeque<u64>)>,
 }
+
+const HL_CACHE_CAP: usize = 32;
 
 impl Highlighter {
     pub fn new() -> Self {
         Self {
             ps: SyntaxSet::load_defaults_newlines(),
             ts: ThemeSet::load_defaults(),
-            cache: Mutex::new(HashMap::with_capacity(256)),
+            cache: Mutex::new((
+                HashMap::with_capacity(HL_CACHE_CAP),
+                std::collections::VecDeque::with_capacity(HL_CACHE_CAP),
+            )),
         }
     }
 
@@ -82,7 +91,7 @@ impl Highlighter {
         let key = hasher.finish();
 
         if let Ok(guard) = self.cache.lock() {
-            if let Some(cached_job) = guard.get(&key) {
+            if let Some(cached_job) = guard.0.get(&key) {
                 return cached_job.clone();
             }
         }
@@ -109,23 +118,13 @@ impl Highlighter {
 
         if text.len() > MAX_HIGHLIGHT_BYTES || syntax.name == "Plain Text" {
             plain(&mut job);
-            if let Ok(mut guard) = self.cache.lock() {
-                if guard.len() >= 512 {
-                    guard.clear();
-                }
-                guard.insert(key, job.clone());
-            }
+            self.cache_put(key, &job);
             return job;
         }
 
         let Some(theme) = self.ts.themes.get(theme_name) else {
             plain(&mut job);
-            if let Ok(mut guard) = self.cache.lock() {
-                if guard.len() >= 512 {
-                    guard.clear();
-                }
-                guard.insert(key, job.clone());
-            }
+            self.cache_put(key, &job);
             return job;
         };
 
@@ -178,14 +177,31 @@ impl Highlighter {
             }
         }
 
-        if let Ok(mut guard) = self.cache.lock() {
-            if guard.len() >= 512 {
-                guard.clear();
-            }
-            guard.insert(key, job.clone());
-        }
+        self.cache_put(key, &job);
 
         job
+    }
+
+    /// キャッシュへ 1 件入れる。上限は古い方から追い出す (全消しすると
+    /// 次のフレームに全再ハイライトのスパイクが出るため)。
+    fn cache_put(&self, key: u64, job: &LayoutJob) {
+        if let Ok(mut guard) = self.cache.lock() {
+            let (map, order) = &mut *guard;
+            while map.len() >= HL_CACHE_CAP {
+                match order.pop_front() {
+                    Some(old) => {
+                        map.remove(&old);
+                    }
+                    None => {
+                        map.clear();
+                        break;
+                    }
+                }
+            }
+            if map.insert(key, job.clone()).is_none() {
+                order.push_back(key);
+            }
+        }
     }
 }
 
