@@ -211,7 +211,7 @@ struct Shared {
     /// initialize 応答を受信し initialized 通知を送信済み。
     /// これが立つまで他の通知・リクエストを送ってはならない (LSP 仕様)。
     init_done: AtomicBool,
-    diags: Mutex<HashMap<PathBuf, Vec<Diagnostic>>>,
+    diags: Mutex<HashMap<PathBuf, Arc<Vec<Diagnostic>>>>,
     pending: Mutex<HashMap<u64, Pending>>,
     completion: Mutex<Option<Vec<CompletionItem>>>,
     hover: Mutex<Option<HoverInfo>>,
@@ -280,6 +280,7 @@ impl LspClient {
     /// - サーバー側の対応がまちまち (rust-analyzer は複数ルートを 1 プロセスで
     ///   扱えるが、多くの軽量サーバーは最初の rootUri しか見ない)
     /// - 動的追加/削除の通知に対応していないサーバーでは無言で壊れる
+    ///
     /// ため、確実に正しく動く「ルート毎に 1 プロセス」を採用した。
     /// トレードオフはルート数 × 言語数だけプロセスが増えること
     /// (実際にはそのルートでファイルを開いた言語のぶんだけ遅延起動される)。
@@ -421,12 +422,11 @@ impl LspClient {
         );
     }
 
-    /// 受信スレッドが貯めた最新の publishDiagnostics (パスごと)
-    pub fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
-        lock_ok(&self.shared.diags)
-            .get(&canonical(path))
-            .cloned()
-            .unwrap_or_default()
+    /// 受信スレッドが貯めた最新の publishDiagnostics (パスごと)。
+    /// ヒット時は `Arc` の clone のみで中身の `Vec` は複製しない
+    /// (毎フレーム呼ばれるため。未受信のパスは None)。
+    pub fn diagnostics(&self, path: &Path) -> Option<Arc<Vec<Diagnostic>>> {
+        lock_ok(&self.shared.diags).get(&canonical(path)).cloned()
     }
 
     /// 非同期: 送信のみ。結果は poll_completion で取得。line/col は LSP (UTF-16) 座標。
@@ -617,12 +617,12 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, tx: &mpsc::Sender<Value>) {
                         *lock_ok(&shared.hover) = Some(HoverInfo { contents });
                     }
                 }
-                Some(Pending::Definition) => {
-                    if shared.latest_definition.load(Ordering::SeqCst) == id {
-                        *lock_ok(&shared.definition) = Some(parse_definition(&result));
-                    }
+                Some(Pending::Definition)
+                    if shared.latest_definition.load(Ordering::SeqCst) == id =>
+                {
+                    *lock_ok(&shared.definition) = Some(parse_definition(&result));
                 }
-                None => {}
+                Some(Pending::Definition) | None => {}
             }
         }
         (false, None) => {}
@@ -640,7 +640,7 @@ fn handle_publish_diagnostics(params: &Value, shared: &Arc<Shared>) {
         .and_then(|d| d.as_array())
         .map(|arr| arr.iter().filter_map(parse_diagnostic).collect())
         .unwrap_or_default();
-    lock_ok(&shared.diags).insert(path, diags);
+    lock_ok(&shared.diags).insert(path, Arc::new(diags));
 }
 
 /// textDocument/definition の結果から先頭 1 件を取り出す。
@@ -1019,7 +1019,10 @@ mod tests {
         client.did_open(&main_rs, "rust", &text);
         std::thread::sleep(Duration::from_secs(3));
         let diags = client.diagnostics(&main_rs); // panic しないこと
-        eprintln!("smoke: {} diagnostics after 3s", diags.len());
+        eprintln!(
+            "smoke: {} diagnostics after 3s",
+            diags.map_or(0, |d| d.len())
+        );
         client.shutdown();
         assert!(!client.is_alive());
     }

@@ -976,7 +976,7 @@ impl ZaivernApp {
                 }
             }
         }
-        themes.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        themes.sort_by_key(|a| a.0.to_lowercase());
         self.custom_themes = themes;
 
         // コマンドの keybind をパースしてキャッシュ (不正な文字列は無視)
@@ -2027,11 +2027,11 @@ impl ZaivernApp {
             let i = self.editor.active?;
             let path = self.editor.buffers[i].path.as_ref()?;
             let key = self.lsp_key_for(path, &self.editor.buffers[i].lang);
-            Some(self.lsp.get(&key)?.diagnostics(path))
-        })()
-        .unwrap_or_default();
+            self.lsp.get(&key)?.diagnostics(path)
+        })();
+        let diags: &[lsp::Diagnostic] = diags.as_deref().map_or(&[], |v| v.as_slice());
         let mut content = diags.len() as u64;
-        for d in &diags {
+        for d in diags {
             content = combine_hash(content, ((d.line as u64) << 8) | d.severity as u64);
         }
         if content == self.diag_cache.0 {
@@ -2039,7 +2039,7 @@ impl ZaivernApp {
         }
         let mut by_line: HashMap<usize, u8> = HashMap::new();
         let (mut errs, mut warns) = (0usize, 0usize);
-        for d in &diags {
+        for d in diags {
             match d.severity {
                 1 => errs += 1,
                 2 => warns += 1,
@@ -4692,7 +4692,7 @@ impl ZaivernApp {
                                                                         images: &mut md_images,
                                                                     };
                                                                 markdown::render(
-                                                                    ui, &theme, &hl, md_base,
+                                                                    ui, &theme, hl, md_base,
                                                                     t, &mut rctx,
                                                                 );
                                                             }
@@ -7609,10 +7609,7 @@ impl ZaivernApp {
         // 宛先が変わったら、前の入力欄に書いた文字はそのまま残して書き出しからやり直す
         // (別のセッションへ Backspace を送り込んでしまわないように)。
         let dest = self.resolve_voice_target();
-        let key = match dest {
-            Some(id) => id,
-            None => u64::MAX,
-        };
+        let key = dest.unwrap_or(u64::MAX);
         if self.voice.last_sent_to.is_some_and(|k| k != key) {
             self.voice.live.clear();
             self.voice.last_char = None;
@@ -7625,8 +7622,13 @@ impl ZaivernApp {
             Some(id) => self.take_typed_voice(id),
             None => {
                 let ids: Vec<u64> = self.agents.sessions.iter().map(|s| s.id).collect();
-                ids.into_iter()
-                    .fold(false, |acc, id| self.take_typed_voice(id) || acc)
+                // 全セッションの typed フラグを消費する必要があるので
+                // `any` (短絡評価) には書き換えないこと。
+                let mut any_typed = false;
+                for id in ids {
+                    any_typed |= self.take_typed_voice(id);
+                }
+                any_typed
             }
         };
         if typed {
@@ -10483,8 +10485,9 @@ impl ZaivernApp {
             let Some(path) = b.path.clone() else { continue };
             let key = self.lsp_key_for(&path, &b.lang);
             let Some(client) = self.lsp.get(&key) else { continue };
-            for d in client.diagnostics(&path) {
-                rows.push((path.clone(), b.title.clone(), d));
+            let Some(diags) = client.diagnostics(&path) else { continue };
+            for d in diags.iter() {
+                rows.push((path.clone(), b.title.clone(), d.clone()));
             }
         }
         rows.sort_by_key(|(_, _, d)| (d.severity, d.line));
@@ -11649,8 +11652,10 @@ mod super_agent_tests {
             supervisor::Intervention::Restart,
             supervisor::Intervention::Halt,
         ] {
-            let mut cfg = supervisor::SupervisorConfig::default();
-            cfg.llm_escalation = true;
+            let cfg = supervisor::SupervisorConfig {
+                llm_escalation: true,
+                ..Default::default()
+            };
             let mut sv = supervisor::Supervisor::new(cfg);
             // セッションを認識させる
             sv.tick(&[snap(1)], Approval::Auto);
@@ -11748,7 +11753,7 @@ mod super_agent_tests {
                         .auto_shrink(false)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                for i in 0..2usize {
+                                for (i, term_rect) in term_rects.iter_mut().enumerate() {
                                     let is_active = i == *active;
                                     let stroke = if is_active {
                                         egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(160, 100, 250))
@@ -11793,7 +11798,7 @@ mod super_agent_tests {
                                                 .inner
                                         },
                                     );
-                                    term_rects[i] = cell.inner;
+                                    *term_rect = cell.inner;
                                     if cell.response.clicked()
                                         || (cell.response.contains_pointer()
                                             && ui.input(|inp| inp.pointer.primary_pressed()))
