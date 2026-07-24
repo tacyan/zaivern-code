@@ -57,13 +57,17 @@ Once installed, just type `zai .` inside any project folder — that's your cock
 
 Click **🎛 Cockpit** in the toolbar (or press ⌘⇧C) and every running agent lines up in a grid. Each cell is not a decorative preview — it's a **live terminal you can type into directly**. Claude Code pushing the implementation forward, Codex repairing tests, Gemini CLI writing docs — the first time you watch five agents working at once on a single screen, expect goosebumps.
 
+And if you open a file while the Cockpit is up, the view splits — **editor on the left, Cockpit on the right** (drag the divider to resize; MD/HTML preview keeps working). Read the code without ever taking your eyes off the fleet.
+
 ### 📣 One order, everyone moves — Broadcast
 
 "Make sure the tests pass." "That approach is fine — continue." One input box, sent to every active session at the same instant. The nights of hopping between tabs pasting the same sentence are over as of today.
 
 ### 🛡 The reins stay in your hands — 3 permission modes
 
-When you attack, use **⚡ Full-auto**: bypass flags are added to each CLI automatically, and the interactive prompts that survive even bypass mode (first-run warnings, folder-trust confirmations, plan approvals) are detected from the screen text and answered automatically — a two-layer system. When you defend, use **🛡 Approve**: any bypass flags smuggled into a command are stripped automatically, failing safe. And **👾 Agent-first** respects whatever flags your preset says, verbatim. Switch with one click in the toolbar; push the change to already-running sessions in bulk.
+When you attack, use **⚡ Full-auto**: bypass flags are added to each CLI automatically. When you defend, use **🛡 Approve**: any bypass flags smuggled into a command are stripped automatically, failing safe. And **👾 Agent-first** respects whatever flags your preset says, verbatim. Switch with one click in the toolbar; push the change to already-running sessions in bulk.
+
+The interactive prompts that survive even bypass mode (first-run warnings, folder-trust confirmations, plan approvals) have their own switch: **"⚡ Auto-YES"** (in the 🐾 menu / `pet_auto_yes`). **It defaults to off — approvals always wait for you.** Turn it on and prompts are detected from the screen text and answered automatically, for every session no matter which mode it was launched in. And each prompt is answered **exactly once** — no misfires on a "(y/n)" quoted in the conversation log, no hammering Enter.
 
 **Speed and safety were never an either/or.**
 
@@ -154,7 +158,8 @@ Everything below is the manual for each instrument on the flight deck.
 ### 🐾 Desktop pet "Zaigani"
 - Blinks, follows your cursor with its eyes, wanders around; dozes off when idle → deep sleep (💤), startled hop when you come back
 - Agent-linked reactions: marching "⚙ n" while agents run (faster with more agents), grooving (🎵) at 3+, fidgeting on approval-wait, 🎉 on success / 💥 on failure
-- 💬 Approval bubble: ✔ Approve / ✖ Deny / Open with one click (keys sent to the PTY are customizable via `pet_approve_keys` / `pet_deny_keys`)
+- 💬 Approval bubble: ✔ Approve / ✖ Deny / Open with one click (keys sent to the PTY are customizable via `pet_approve_keys` / `pet_deny_keys`). One prompt, one answer — a prompt still lingering on screen won't re-summon the bubble or re-send the keys
+- ⚡ Auto-YES (off by default): one switch in the 🐾 menu flips approval prompts to automatic answers. While it's off, the final YES is always yours
 - Click to toggle the Cockpit (jumps to the waiting session if one exists), drag to reposition (auto-saved)
 - 🎭 4 looks (blocky / crab / cat / cloud) + swap in any image you like, 📏 3 sizes
 
@@ -269,7 +274,7 @@ Installed IDEs are detected automatically, and only those are offered. If your `
 Run several agents and sooner or later one goes quiet, repeats the same failure, or dies. This is the layer that notices and does something about it.
 
 - **Detection**: stalling (silence with no progress), looping (the same output over and over), a storm of errors, abnormal exit, an approval prompt left unattended, runaway output. Spinners and counters are correctly treated as *not* progress
-- **Intervention escalates**: record → notify → auto-approve → nudge → restart → stop. **Restart and stop always ask you first**, by default, because in-flight work gets lost either way. In 🛡 Approve mode, nothing above "notify" is ever done automatically
+- **The watchdog detects and notifies — nothing more**: it never auto-approves, nudges, restarts, or stops an agent on its own. Anomalies surface to you as badges, toasts, and notifications, and you decide the move. **There is no code path that silently types into an agent's input box**
 - **Reassignment**: a stalled task is handed to a different agent. An agent that already failed a task never gets it back. **The hand-off does not happen until the previous holder is confirmed stopped** — otherwise two agents edit the same files. When the retry budget is spent, it escalates to you instead of looping forever
 - **Inter-agent messaging**: a message is delivered only when the recipient is idle, because interrupting mid-generation corrupts its input. Hop limits, rate limits, and round-trip detection all apply, and any message that couldn't be delivered is recorded with the reason
 
@@ -284,18 +289,18 @@ Run several agents and sooner or later one goes quiet, repeats the same failure,
 
 There is no LLM guessing at which sentences look like they're addressed to someone. **Only the line-start marker counts — deterministic, on purpose.** And when an injected message is echoed back onto the screen, it does not get re-sent as a new message (get that wrong and messages multiply without end).
 
-### 💡 Super Agent — give the watchdog a brain
+### 💡 Super Agent (Commander) — give the watchdog a brain
 The supervision itself runs on Rust rules. You don't need an LLM to spot a stall or a loop, and **if the watchdog is an LLM, nobody is left to notice when the watchdog breaks.** So detection stays deterministic code.
 
-On top of that, you can ask an AI the one question code is bad at: *"okay, so what's the right move here?"* In the cockpit's **💡 Super Agent**, you just **pick which CLI agent supervises**.
+On top of that, you can hand the question code is bad at — *"okay, so what's the right move here?"* — to an AI. In the cockpit's **💡 Super Agent**, you just **name one of your running agents as the "commander"**. The commander writes `@target: instruction` on its screen (`@all:` for everyone) — and that is the entire protocol.
 
-- The default is **"none"**. Pick nothing and no LLM is ever queried
-- **Only agents that support non-interactive execution are selectable.** One that doesn't would open an interactive screen and never return, so it isn't offered in the first place
-- It receives **only redacted recent output**. API keys, GitHub tokens, email addresses, and home-directory paths are masked automatically
-- **The supervisor is itself supervised, like everyone else.** Exempt it and you've built a single point of failure
-- **It can still do normal work.** You don't have to burn a slot on supervision alone. It just won't be asked to diagnose its own stall — asking a frozen agent why it froze gets you nothing
-- **AI advice does not move the permission gate.** If it recommends a restart or a stop, you still confirm — even in ⚡ Full-auto mode
-- If the response can't be parsed, **nothing happens**. A watchdog that manufactures actions out of ambiguous answers is more dangerous than one that stays quiet
+- The default is **"none"**. Name nobody and no commanding ever happens
+- **Any running agent can be named**, and you can swap commanders mid-flight. The one exception is a plain shell — echoed command output is too easy to misread as a directive, so it isn't offered in the first place
+- A commander's directive reaches you as a **📮 notification**. **It is never written into any agent's input box automatically** — whether it actually goes out is your call (Cockpit broadcast, or typing it into a terminal yourself). Auto-injection existed once, and was removed: text flowing into a box you're typing in is not a feature
+- Notification bodies pass through **redaction and a length cap**. A line that can't be parsed does **nothing**. A watchdog that manufactures actions out of ambiguous answers is more dangerous than one that stays quiet
+- Destructive operations simply cannot be expressed. A commander has no way to restart or stop anyone
+- **The commander is itself supervised, like everyone else.** Exempt it and you've built a single point of failure
+- **The commander can keep doing normal work.** You don't have to burn a slot on supervision alone
 
 ### 💾 Session restore
 On restart, the previous tabs, active tab, and panel state are restored automatically per workspace (`~/.zaivern/sessions/`).
@@ -419,6 +424,7 @@ show_pet = true
 # pet_sleep = true         # sleeps when idle
 # pet_sounds = true        # sound effects
 # pet_bubbles = true       # approval bubble
+# pet_auto_yes = false     # auto-YES to approval prompts (off = you approve)
 # pet_approve_keys = "\r"    # keys sent to the PTY on approve (Enter)
 # pet_deny_keys = "\u001B"   # keys sent to the PTY on deny (ESC)
 
@@ -502,10 +508,11 @@ src/
 ├── diff.rs          Unified diff parser + inline diff view
 ├── ide.rs           Hand-off to external IDEs (open at the current line)
 ├── panels.rs        Rendering for the GitHub panel, PR diff tabs, IDE integration
-├── supervisor.rs    Agent supervision (stall/loop/abnormal-exit detection, escalating intervention)
+├── supervisor.rs    Agent supervision (stall/loop/abnormal-exit detection and notification)
 ├── coordinator.rs   Inter-agent messaging and task reassignment
 ├── orchestration.rs Task creation UI, hand-off driving, message send/receive assembly
-├── diagnostician.rs Supervising LLM (calls the chosen CLI agent non-interactively to diagnose)
+├── commander.rs     Commander (named Super Agent) directive parsing — `@target: instruction` → 📮 notification
+├── diagnostician.rs Legacy LLM diagnosis (no longer spawned; used to identify the commander session and for UI display)
 ├── markdown.rs      Markdown parsing and preview rendering
 ├── html.rs          HTML preview rendering
 ├── jsonc.rs         Reading JSON with comments (JSONC)
@@ -551,6 +558,9 @@ src/
 - [x] Super Agent (pick the supervising LLM from the UI, redaction, destructive actions always confirmed)
 - [x] Task creation from the cockpit and hand-off of stalled tasks
 - [x] Inter-agent messages (sent with a `[ZAI-TO:target]` line-start marker)
+- [x] Super Agent redesigned as the Commander (name any running agent; `@target: instruction` goes through you as a 📮 notification — no auto-injection into input boxes)
+- [x] Auto-YES unified into one switch (`pet_auto_yes`, off by default = you approve, independent of launch mode, one answer per prompt)
+- [x] Editor + Cockpit split view (read the code while commanding)
 - [ ] LSP completion & hover UI (foundation implemented; UI to come)
 - [ ] Plugin grammars (TextMate) & registry sharing
 - [ ] Split editor
