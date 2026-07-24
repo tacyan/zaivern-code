@@ -169,6 +169,11 @@ impl FileTree {
         self.scroll_to = None;
     }
 
+    /// 切り取り移動が成功したときに呼ぶ (アプリ側から)。
+    pub fn clear_clipboard(&mut self) {
+        self.clipboard = None;
+    }
+
     /// エクスプローラーへキーボードフォーカスを移す (VS Code: ⌘⇧E)。
     pub fn focus(&mut self) {
         self.focused = true;
@@ -723,9 +728,9 @@ impl FileTree {
             Ok(None) => {}
             Ok(Some((dest, kind))) => {
                 actions.transfer = Some((src, dest, kind));
-                if cut {
-                    self.clipboard = None;
-                }
+                // 切り取りのクリップボードはここでは消さない。移動の成否は
+                // アプリ側で判るため、成功時に clear_clipboard() を呼んで
+                // もらう (失敗時に切り取り内容が失われないように)。
             }
             Err(msg) => actions.notice = Some(msg),
         }
@@ -819,6 +824,12 @@ impl FileTree {
                 done = true;
             }
         });
+        // 未確定なら編集状態を書き戻す。これを忘れると入力欄が 1 フレームで
+        // 消え、ツリーからの新規作成・リネームが一切できなくなる
+        // (33c9fe6 のリファクタで消えた回帰の再修正)。
+        if !done {
+            self.edit = Some(es);
+        }
     }
 }
 
@@ -1157,12 +1168,26 @@ fn bump_copy_name(stem: &str) -> String {
 }
 
 /// ファイルは fs::copy、フォルダは再帰コピー。
+/// シンボリックリンクは辿らずスキップする (祖先を指すリンクがあると
+/// 無限再帰でスタックオーバーフローする)。深さも保険で制限する。
 pub fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if src.is_dir() {
+    copy_recursively_inner(src, dst, 0)
+}
+
+fn copy_recursively_inner(src: &Path, dst: &Path, depth: usize) -> std::io::Result<()> {
+    if depth > 64 {
+        return Err(std::io::Error::other("フォルダが深すぎます (>64)"));
+    }
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        // リンクはコピーしない (辿ると循環・意図しない大量コピーの危険)
+        return Ok(());
+    }
+    if meta.is_dir() {
         std::fs::create_dir_all(dst)?;
         for e in std::fs::read_dir(src)? {
             let e = e?;
-            copy_recursively(&e.path(), &dst.join(e.file_name()))?;
+            copy_recursively_inner(&e.path(), &dst.join(e.file_name()), depth + 1)?;
         }
         Ok(())
     } else {

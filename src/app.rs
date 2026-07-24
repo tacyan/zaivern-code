@@ -5370,7 +5370,19 @@ impl ZaivernApp {
             }
         }
         if let Some((from, to)) = actions.rename {
-            if to.exists() {
+            // 大文字小文字だけのリネーム: APFS/HFS+/NTFS は case-insensitive
+            // なので to.exists() が真になるが、これは同一ファイル。拒否せず
+            // fs::rename に任せる (case-only rename は OS 側が正しく扱う)。
+            let case_only = from.parent() == to.parent()
+                && from
+                    .file_name()
+                    .zip(to.file_name())
+                    .is_some_and(|(a, b)| {
+                        a != b
+                            && a.to_string_lossy().to_lowercase()
+                                == b.to_string_lossy().to_lowercase()
+                    });
+            if to.exists() && !case_only {
                 self.toast(
                     trf("既に存在します: {path}", &[("path", self.rel_label(&to))]),
                     false,
@@ -5405,6 +5417,8 @@ impl ZaivernApp {
                     if kind == file_tree::Transfer::Move {
                         self.retarget_buffers(&src, &dest);
                         self.persist_session();
+                        // 切り取りは移動が成功してからクリップボードを空にする
+                        self.tree.clear_clipboard();
                     }
                     self.tree.invalidate();
                     self.tree.select(&dest);
@@ -8232,7 +8246,15 @@ impl ZaivernApp {
 
         match decided {
             Some(true) => {
-                let res = if is_dir {
+                // シンボリックリンクはリンク自体を消す (is_dir はリンク先を
+                // 辿るため、ディレクトリへのリンクを remove_dir_all に渡すと
+                // "Not a directory" で必ず失敗する)
+                let is_symlink = std::fs::symlink_metadata(&path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                let res = if is_symlink {
+                    std::fs::remove_file(&path)
+                } else if is_dir {
                     std::fs::remove_dir_all(&path)
                 } else {
                     std::fs::remove_file(&path)
@@ -9296,7 +9318,7 @@ impl ZaivernApp {
             .sessions
             .iter()
             .find(|s| s.id == cmd_id)
-            .and_then(|s| s.parser.lock().ok().map(|p| p.screen().contents()))
+            .map(|s| crate::lockx::lock_ok(&s.parser).screen().contents())
             .unwrap_or_default();
         if self.commander_seen.len() > 512 {
             self.commander_seen.clear();
@@ -9746,11 +9768,7 @@ impl ZaivernApp {
                 .iter()
                 .filter(|s| s.running())
                 .map(|s| {
-                    let text = s
-                        .parser
-                        .lock()
-                        .map(|p| p.screen().contents())
-                        .unwrap_or_default();
+                    let text = crate::lockx::lock_ok(&s.parser).screen().contents();
                     (s.id, text)
                 })
                 .collect();

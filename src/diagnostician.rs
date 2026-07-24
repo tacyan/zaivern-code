@@ -324,14 +324,14 @@ impl CliDiagnostician {
     /// まさに固まっているので永久に返らない。ここに入れておけば必ず断る。
     #[allow(dead_code)]
     pub fn set_self_session(&self, id: Option<u64>) {
-        if let Ok(mut g) = self.self_session_id.lock() {
-            *g = id;
-        }
+        *crate::lockx::lock_ok(&self.self_session_id) = id;
     }
 
     /// 登録済みの自セッション ID。
+    /// poison 後も最後の値を返す (None に化けると「固まった当人へ診断を
+    /// 訊きに行く」自己診断ガードが素通りしてしまう)。
     pub fn self_session_id(&self) -> Option<u64> {
-        self.self_session_id.lock().ok().and_then(|g| *g)
+        *crate::lockx::lock_ok(&self.self_session_id)
     }
 
     /// 表示用の情報 (コマンド, 表示名)。
@@ -343,24 +343,20 @@ impl CliDiagnostician {
     /// 直近に診断を見送った理由。成功時は `None`。
     #[allow(dead_code)]
     pub fn last_error(&self) -> Option<String> {
-        self.last_error.lock().ok().and_then(|g| g.clone())
+        crate::lockx::lock_ok(&self.last_error).clone()
     }
 
     fn note_error(&self, msg: impl Into<String>) {
-        if let Ok(mut g) = self.last_error.lock() {
-            *g = Some(msg.into());
-        }
+        *crate::lockx::lock_ok(&self.last_error) = Some(msg.into());
     }
 
     fn clear_error(&self) {
-        if let Ok(mut g) = self.last_error.lock() {
-            *g = None;
-        }
+        *crate::lockx::lock_ok(&self.last_error) = None;
     }
 
     /// この異常が続いている秒数。初回は 0 秒として記録する。
     fn state_secs(&self, id: u64, anomaly: Anomaly) -> Option<u64> {
-        let mut g = self.state_since.lock().ok()?;
+        let mut g = crate::lockx::lock_ok(&self.state_since);
         // 有界化: 覚えすぎたら丸ごと捨てる (精度より上限を優先する)。
         if g.len() >= MAX_TRACKED_SESSIONS {
             g.clear();

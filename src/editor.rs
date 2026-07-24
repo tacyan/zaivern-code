@@ -144,6 +144,17 @@ impl Editor {
             return Ok(self.reload_from_disk(i));
         }
 
+        // 巨大ファイルの防壁: 読み込み自体が UI スレッドの同期 IO なので、
+        // 上限なしだと数百 MB のログをクリックした瞬間にフリーズする
+        const MAX_OPEN_BYTES: u64 = 50 * 1024 * 1024;
+        if let Ok(m) = std::fs::metadata(&canon) {
+            if m.len() > MAX_OPEN_BYTES {
+                return Err(format!(
+                    "ファイルが大きすぎます ({} MB > 50 MB)",
+                    m.len() / (1024 * 1024)
+                ));
+            }
+        }
         let text = std::fs::read_to_string(&canon)
             .map_err(|e| format!("開けませんでした: {e}"))?;
         let lang = hl.lang_for(Some(&canon), &text);

@@ -529,12 +529,11 @@ pub struct SessionSnapshot {
 impl SessionSnapshot {
     /// `crate::terminal::Session` から作る補助関数 (読み取りのみ)。
     pub fn from_session(s: &crate::terminal::Session, user_typed: bool) -> Self {
-        let screen_text = s
-            .parser
-            .lock()
-            .map(|p| p.screen().contents())
-            .unwrap_or_default();
-        let exit_code = s.exit_code.lock().ok().and_then(|c| *c);
+        // poison 後も最後の状態で読み続ける (lockx 規約)。素の lock() だと
+        // reader スレッド panic 後に screen_text が恒久的に "" になり、
+        // 偽 Stall 検出 → 健全なセッションの停止提案まで連鎖する。
+        let screen_text = crate::lockx::lock_ok(&s.parser).screen().contents();
+        let exit_code = *crate::lockx::lock_ok(&s.exit_code);
         Self {
             id: s.id,
             title: s.title.clone(),
@@ -1356,7 +1355,7 @@ impl Supervisor {
             return None;
         }
 
-        let interval_ms = self.cfg.loop_engineering_interval_secs * 1000;
+        let interval_ms = self.cfg.loop_engineering_interval_secs.saturating_mul(1000);
         if self.last_loop_engineering_ms > 0
             && now_ms.saturating_sub(self.last_loop_engineering_ms) < interval_ms
         {
