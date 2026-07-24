@@ -58,7 +58,12 @@ use eframe::egui;
 /// 失敗してもアイコン無しで起動を続ける。
 fn load_icon() -> Option<egui::IconData> {
     let img = image::load_from_memory(desktop::ICON_PNG).ok()?;
-    let img = img.resize_exact(256, 256, image::imageops::FilterType::Lanczos3);
+    let (w, h) = (img.width(), img.height());
+    let img = if w == 256 && h == 256 {
+        img
+    } else {
+        img.resize_exact(256, 256, image::imageops::FilterType::Triangle)
+    };
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
     Some(egui::IconData {

@@ -10223,6 +10223,49 @@ impl eframe::App for ZaivernApp {
 
             // 承認待ちの吹き出し(ペットより後に描いて頭上に重ねる)
             if self.cfg.pet_bubbles {
+                // 自動YES (`pet_auto_yes`) がオンの時、ペットからの承認が保留のまま 30秒以上経過していたら
+                // 「✔ 承認」ボタンを押したことと全く同じ動作を自動実行する。
+                if self.cfg.pet_auto_yes {
+                    let auto_approve_indices: Vec<usize> = self
+                        .agents
+                        .sessions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, s)| {
+                            if s.attention
+                                && s.running()
+                                && !self.pet_bubble_dismissed.contains(&s.id)
+                                && !self.pet_bubble_answered.contains_key(&s.id)
+                            {
+                                if let Some(since) = s.attention_since {
+                                    if since.elapsed().as_secs() >= 30 {
+                                        return Some(i);
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+
+                    for i in auto_approve_indices {
+                        let fallback = self.cfg.pet_approve_keys.clone();
+                        let sent = self.agents.sessions.get_mut(i).map(|s| {
+                            let ok = s.press_pet_approve_button(Some(&fallback));
+                            (ok, s.title.clone(), s.id)
+                        });
+                        if let Some((true, title, id)) = sent {
+                            self.pet_bubble_answered.insert(id, Instant::now());
+                            self.toast(
+                                trf(
+                                    "⚡ (自動YES: 30秒保留経過) ✔ 承認を自動送信: {title}",
+                                    &[("title", title)],
+                                ),
+                                true,
+                            );
+                        }
+                    }
+                }
+
                 let items: Vec<pet_bubble::BubbleItem> = self
                     .agents
                     .sessions

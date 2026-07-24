@@ -48,6 +48,8 @@ pub struct Session {
     pub preedit: String,
     /// CLI エージェントが承認待ち(プロンプト表示中)と推定される状態。
     pub attention: bool,
+    /// 承認待ち (attention == true) になった開始時刻。
+    pub attention_since: Option<Instant>,
     /// 終了通知を出したかどうか(多重通知の防止)。
     pub notified_exit: bool,
     /// このセッションが bypass 権限フラグ付きで起動されたか(表示用)。
@@ -276,9 +278,11 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
             return Some((b"y\r", "Antigravityの(y/n)問い合わせに自動「y」"));
         }
 
-        // 直近行が明確な質問・確認プロンプトである場合のみ自動YESを送る
+        // 明確な (y/n) が無い Antigravity 問いかけプロンプトに対しては、
+        // 入力欄へ誤って「y」という文字が打ち込まれるのを防ぐため、
+        // 安全に Enter (\r) を送信して確定する。
         if recent_lines_has_question(text) {
-            return Some((b"y\r", "Antigravityの問いかけに自動「y」"));
+            return Some((b"\r", "Antigravityの問いかけ・プロンプト確定に自動「Enter」"));
         }
     }
 
@@ -321,7 +325,7 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         || text.contains("Allow file")
         || text.contains("Antigravity:");
     if agent_approval && (text.contains("1. Yes") || text.contains("1. Allow") || text.contains("Yes, proceed") || text.contains("Yes, allow")) {
-        return Some((b"y", "Codex/Antigravityの承認に「Yes」"));
+        return Some((b"1", "Codex/Antigravityの承認に「1」"));
     }
 
     // 選択カーソルが Yes / Allow / はい / 許可 の上にある一般的な確認 → Enter で確定。
@@ -1102,6 +1106,7 @@ impl Session {
             scroll: 0,
             preedit: String::new(),
             attention: false,
+            attention_since: None,
             notified_exit: false,
             launched_bypass,
             last_scan: Instant::now(),
@@ -1225,6 +1230,11 @@ impl Session {
         let waiting = present && self.answered_sig.is_none();
         let newly = waiting && !self.attention;
         self.attention = waiting;
+        if newly {
+            self.attention_since = Some(Instant::now());
+        } else if !waiting {
+            self.attention_since = None;
+        }
         if auto_yes && waiting {
             if let Some((bytes, desc)) = reply {
                 // 同じプロンプトへは一度だけ送る。画面に残っていても再送しない
@@ -1391,6 +1401,7 @@ impl Session {
     /// プロンプトが消える・別のプロンプトに変わると、また検出対象へ戻る。
     pub fn resolve_attention(&mut self) {
         self.attention = false;
+        self.attention_since = None;
         let text = lock_ok(&self.parser).screen().contents();
         self.answered_sig = Some(prompt_signature(&text));
         // 手動 (バブル/手入力) で解決したエピソードは停滞ウォッチドッグの対象外。
@@ -1701,10 +1712,10 @@ mod tests {
 
         // 追加された拡張プロンプトパターン
         let (bytes, _) = auto_yes_reply("AGY: Proceed with file save?").unwrap();
-        assert_eq!(bytes, b"y\r");
+        assert_eq!(bytes, b"\r");
 
         let (bytes, _) = auto_yes_reply("antigravity: 変更を適用しますか？").unwrap();
-        assert_eq!(bytes, b"y\r");
+        assert_eq!(bytes, b"\r");
 
         let (bytes, _) = auto_yes_reply("Antigravity: Select option\n  1. Allow always\n  2. Deny").unwrap();
         assert_eq!(bytes, b"1");
@@ -4083,6 +4094,33 @@ printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
             got = sess.take_clipboard();
         }
         assert_eq!(got.as_deref(), Some("yanked"));
+        sess.kill();
+    }
+
+    /// 承認待ち発生時に attention_since が正常にセット・解除されるか。
+    #[test]
+    fn test_attention_since_tracking() {
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            command: "echo 'Do you want to proceed? (y/n)'; sleep 5".into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut sess = Session::spawn(4, spec, egui::Context::default()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while Instant::now() < deadline && !sess.attention {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            sess.scan_attention(false);
+        }
+        assert!(sess.attention);
+        assert!(sess.attention_since.is_some());
+
+        sess.resolve_attention();
+        assert!(!sess.attention);
+        assert!(sess.attention_since.is_none());
         sess.kill();
     }
 }
