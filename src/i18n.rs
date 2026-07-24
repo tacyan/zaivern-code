@@ -201,4 +201,156 @@ mod tests {
         assert!(load_dict(&root.join("nope")).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // ---- 同梱辞書 (組み込み言語) の整合性 ----------------------------------
+    //
+    // 組み込みの翻訳言語は english-mode プラグイン (en) の 1 つだけで、日本語は
+    // 「キーそのもの」が原文。よって「全言語のキー集合一致」は、ここでは
+    //   - 合成辞書が各ファイルの和集合と一致する (後勝ちで黙って消えるキーが
+    //     既知の例外以外に無い)
+    //   - キー (日本語原文) と訳 (英語) のプレースホルダ集合が一致する
+    // という形で固定する。
+
+    /// 同梱 english-mode 言語パックの辞書ディレクトリ。
+    fn builtin_en_lang_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/plugins/english-mode/lang")
+    }
+
+    /// `s` に含まれる `{name}` 形式 (trf が置換する形式) のプレースホルダ名を
+    /// 集める。名前は ASCII 英数字と `_` のみ (呼び出し側の args キーと同じ想定)。
+    fn placeholders(s: &str) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for part in s.split('{').skip(1) {
+            if let Some((name, _)) = part.split_once('}') {
+                if !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn 同梱英語辞書はキーも訳も空でない() {
+        let dict = load_dict(&builtin_en_lang_dir()).expect("同梱辞書が読める");
+        assert!(!dict.is_empty(), "同梱辞書が空");
+        let mut bad: Vec<&String> = dict
+            .iter()
+            .filter(|(k, v)| k.trim().is_empty() || v.trim().is_empty())
+            .map(|(k, _)| k)
+            .collect();
+        bad.sort();
+        assert!(bad.is_empty(), "キーまたは訳が空のエントリ: {bad:?}");
+    }
+
+    #[test]
+    fn 同梱英語辞書のプレースホルダはキーと訳で一致する() {
+        // まず検出器自体の健全性を固定 (壊れると下の検査が空振りする)
+        assert_eq!(
+            placeholders("{n} 件を {dir} へ ({e})"),
+            std::collections::BTreeSet::from([
+                "dir".to_string(),
+                "e".to_string(),
+                "n".to_string()
+            ])
+        );
+        assert!(placeholders("プレースホルダなし {不正} {a b}").is_empty());
+
+        let dict = load_dict(&builtin_en_lang_dir()).expect("同梱辞書が読める");
+        let mut with_ph = 0usize;
+        let mut bad = Vec::new();
+        for (k, v) in &dict {
+            let pk = placeholders(k);
+            let pv = placeholders(v);
+            if !pk.is_empty() {
+                with_ph += 1;
+            }
+            if pk != pv {
+                bad.push(format!("{k:?} -> {v:?} (原文 {pk:?} / 訳 {pv:?})"));
+            }
+        }
+        bad.sort();
+        assert!(
+            bad.is_empty(),
+            "キーと訳でプレースホルダが一致しないエントリ:\n{}",
+            bad.join("\n")
+        );
+        // 検査が空振りしていないこと (現在 200 件以上ある)
+        assert!(with_ph > 0, "プレースホルダ付きキーが 1 件も無い (検出の退化を疑う)");
+    }
+
+    #[test]
+    fn 同梱英語辞書のファイル間の重複キーは既知の例外のみ() {
+        // load_dict は後勝ちマージなので、複数ファイルに同じキーがあると先の訳が
+        // 黙って消える。現時点で存在する 7 件は現状のまま固定し (修正判断は別途)、
+        // **新規の**重複だけを検出する。既知の重複を解消した場合はこのリストから
+        // 消すだけでよい (リストは「あってもよい」であって「必須」ではない)。
+        const KNOWN_DUP_KEYS: &[&str] = &[
+            "エージェント起動",
+            "サイドバー切替",
+            "ファイル",
+            "実行",
+            "設定 config.toml を開く",
+            "設定を再読み込み",
+            "📣 全エージェントへブロードキャスト",
+        ];
+        let dir = builtin_en_lang_dir();
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("同梱辞書ディレクトリを読める")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        files.sort();
+        assert!(files.len() > 1, "辞書ファイルが複数枚ある前提のテスト");
+        // キー -> 最初に現れたファイル名
+        let mut seen: HashMap<String, String> = HashMap::new();
+        let mut new_dups = Vec::new();
+        for f in &files {
+            let one = load_dict_file(f).expect("各辞書ファイルが単体で読める");
+            let fname = f.file_name().unwrap().to_string_lossy().into_owned();
+            let mut keys: Vec<String> = one.into_keys().collect();
+            keys.sort();
+            for k in keys {
+                if let Some(prev) = seen.get(&k) {
+                    if !KNOWN_DUP_KEYS.contains(&k.as_str()) {
+                        new_dups.push(format!("{k:?} ({prev} と {fname})"));
+                    }
+                } else {
+                    seen.insert(k, fname.clone());
+                }
+            }
+        }
+        assert!(
+            new_dups.is_empty(),
+            "新規の重複キー (後勝ちで先の訳が消える):\n{}",
+            new_dups.join("\n")
+        );
+    }
+
+    #[test]
+    fn 同梱英語辞書を入れても未知キーは日本語のまま() {
+        let _g = GLOBAL.lock().unwrap();
+        let dict = load_dict(&builtin_en_lang_dir()).expect("同梱辞書が読める");
+        set_dict(Some(dict));
+        // 既知キーは訳される
+        assert_eq!(tr("設定"), "Settings");
+        // 未知キーは原文 (日本語) をそのまま返す = UI が壊れない
+        assert_eq!(tr("この文字列は辞書に存在しない"), "この文字列は辞書に存在しない");
+        set_dict(None);
+    }
+
+    #[test]
+    fn trfは未指定プレースホルダをそのまま残す() {
+        let _g = GLOBAL.lock().unwrap();
+        set_dict(None);
+        // 現挙動の固定: args に無い {b} は消えず残る (panic もしない)
+        assert_eq!(trf("{a} と {b}", &[("a", "X".to_string())]), "X と {b}");
+        // args が空ならテンプレートがそのまま返る
+        assert_eq!(trf("{n} 件", &[]), "{n} 件");
+        // テンプレートに無い args は無視される
+        assert_eq!(trf("固定文", &[("n", "9".to_string())]), "固定文");
+    }
 }
