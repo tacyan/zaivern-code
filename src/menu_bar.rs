@@ -645,4 +645,96 @@ mod tests {
         assert_eq!(build_task_for(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ─── shq (シェルクォート。安全性に関わるため網羅的に固定) ───
+
+    #[test]
+    fn shq_wraps_plain_path_in_single_quotes() {
+        assert_eq!(shq(Path::new("/a/b.py")), "'/a/b.py'");
+    }
+
+    #[test]
+    fn shq_preserves_spaces_inside_quotes() {
+        assert_eq!(shq(Path::new("/my dir/file name.txt")), "'/my dir/file name.txt'");
+    }
+
+    #[test]
+    fn shq_escapes_single_quote() {
+        // ' は '\'' に展開される (クォート終了 → エスケープ ' → クォート再開)
+        assert_eq!(shq(Path::new("/a/o'brien.py")), "'/a/o'\\''brien.py'");
+    }
+
+    #[test]
+    fn shq_escapes_multiple_single_quotes() {
+        assert_eq!(shq(Path::new("/a/'quoted'")), "'/a/'\\''quoted'\\'''");
+    }
+
+    #[test]
+    fn shq_keeps_shell_metacharacters_literal() {
+        // シングルクォート内では " $ ` \ はシェルに解釈されないのでそのまま
+        assert_eq!(
+            shq(Path::new("/a/he said \"hi\"/$HOME/`whoami`\\x.txt")),
+            "'/a/he said \"hi\"/$HOME/`whoami`\\x.txt'"
+        );
+    }
+
+    #[test]
+    fn shq_empty_path_is_empty_quotes() {
+        assert_eq!(shq(Path::new("")), "''");
+    }
+
+    #[test]
+    fn shq_japanese_path() {
+        assert_eq!(
+            shq(Path::new("/ユーザ/山田 太郎/日本語 ファイル.txt")),
+            "'/ユーザ/山田 太郎/日本語 ファイル.txt'"
+        );
+    }
+
+    // ─── display_path (メニュー表示用のホーム短縮) ───
+
+    #[test]
+    fn display_path_shortens_home_prefix() {
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                display_path(&home.join("proj").join("main.rs")),
+                format!("~{}proj{}main.rs", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR)
+            );
+            // ホームそのものは "~" になる
+            assert_eq!(display_path(&home), "~");
+        }
+    }
+
+    #[test]
+    fn display_path_outside_home_unchanged() {
+        assert_eq!(
+            display_path(Path::new("/zv-no-such-home/etc/hosts")),
+            "/zv-no-such-home/etc/hosts"
+        );
+    }
+
+    // ─── native_sc (ショートカット表記変換) ───
+
+    #[test]
+    fn native_sc_representative_specs() {
+        let cmd_c = native_sc("cmd+c");
+        let ctrl_shift_p = native_sc("ctrl+shift+p");
+        let alt_up = native_sc("alt+up");
+        if cfg!(target_os = "macos") {
+            assert_eq!(cmd_c, "⌘C");
+            assert_eq!(ctrl_shift_p, "⌃⇧P");
+            assert_eq!(alt_up, "⌥↑");
+        } else {
+            assert_eq!(cmd_c, "Ctrl+C");
+            assert_eq!(ctrl_shift_p, "Ctrl+Shift+P");
+            assert_eq!(alt_up, "Alt+↑");
+        }
+    }
+
+    #[test]
+    fn native_sc_invalid_spec_is_empty() {
+        assert_eq!(native_sc(""), "");
+        assert_eq!(native_sc("nosuchkey"), "");
+        assert_eq!(native_sc("badmod+c"), "");
+    }
 }
