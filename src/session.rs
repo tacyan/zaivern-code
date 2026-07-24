@@ -40,10 +40,7 @@ pub fn save(roots: &[PathBuf], data: &SessionData) {
 
 /// 既定の保存先ディレクトリ: `~/.zaivern/sessions`
 fn sessions_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".zaivern")
-        .join("sessions")
+    crate::config::zaivern_dir().join("sessions")
 }
 
 /// 内部: 既定ディレクトリ配下のセッションファイルパス。
@@ -86,9 +83,7 @@ fn roots_hash(roots: &[PathBuf]) -> String {
 /// ワークスペース単位で分けるので、同じプロジェクトを開き直せば前回のログが
 /// そのまま並ぶ (スクロールバック永続化)。
 pub fn term_log_dir(workspace: &Path) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".zaivern")
+    crate::config::zaivern_dir()
         .join("term_logs")
         .join(workspace_hash(workspace))
 }

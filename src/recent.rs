@@ -4,6 +4,7 @@
 //! `~/.zaivern/menu_state.toml` へ保存する。既存ファイルのフォーマットを
 //! 巻き込まないため、壊れていても黙って既定値に戻る。
 
+use crate::config::zaivern_dir;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -62,12 +63,6 @@ fn touch(list: &mut Vec<String>, p: &Path) {
 
 fn state_file(dir: &Path) -> PathBuf {
     dir.join("menu_state.toml")
-}
-
-fn zaivern_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".zaivern")
 }
 
 pub fn load() -> MenuState {

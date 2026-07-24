@@ -341,7 +341,9 @@ pub fn state_path() -> PathBuf {
     zaivern_dir().join("state.toml")
 }
 
-fn zaivern_dir() -> PathBuf {
+/// `~/.zaivern` の場所。home が取れない場合は `./.zaivern` にフォールバック。
+/// ディレクトリの作成 (create_dir_all) は行わない — 呼び出し側の責務。
+pub(crate) fn zaivern_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".zaivern")
@@ -1455,6 +1457,16 @@ mod tests {
         assert_eq!(c.parent(), s.parent(), "同じ ~/.zaivern に置かれる");
         assert!(c.parent().is_some_and(|p| p.ends_with(".zaivern")));
         assert!(c.is_absolute() || c.starts_with("."), "home 不明時は ./.zaivern");
+    }
+
+    #[test]
+    fn zaivern_dir_is_home_or_dot_fallback() {
+        let d = zaivern_dir();
+        assert!(d.ends_with(".zaivern"));
+        match dirs::home_dir() {
+            Some(h) => assert_eq!(d, h.join(".zaivern")),
+            None => assert_eq!(d, PathBuf::from(".").join(".zaivern")),
+        }
     }
 
     #[test]

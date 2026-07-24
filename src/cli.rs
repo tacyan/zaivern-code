@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::zaivern_dir;
+
 // ───────────────────────── インスタンスファイル ─────────────────────────
 
 /// 実行中インスタンスの接続情報 (`~/.zaivern/instance.json`)。
@@ -37,12 +39,6 @@ impl Instance {
             pid: std::process::id(),
         }
     }
-}
-
-fn zaivern_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".zaivern")
 }
 
 pub fn instance_path() -> PathBuf {
