@@ -2245,4 +2245,194 @@ mod tests {
         assert!(!back.allow_auto_restart);
         assert!(!back.llm_escalation);
     }
+
+    // ---------------- derive_state (状態導出の優先順位) ----------------
+
+    /// derive_state に渡す異常リストを作るテストヘルパ。
+    fn found(list: &[(Anomaly, &str)]) -> Vec<(Anomaly, String)> {
+        list.iter().map(|(a, r)| (*a, r.to_string())).collect()
+    }
+
+    #[test]
+    fn crash_anomaly_wins_over_exit_code() {
+        let c = cfg();
+        let mut s = snap(1, "", false, false);
+        s.exit_code = Some(0);
+        let f = found(&[(Anomaly::Crash, "作業中に落ちた")]);
+        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        assert_eq!(
+            st,
+            SessionState::Crashed,
+            "Crash 異常は exit_code より優先されるべき: {reason}"
+        );
+        // 同じ exit_code=0 でも Crash 異常が無ければ正常終了
+        let (st2, _) = derive_state(SessionState::Working, &s, &[], &[], &c, 10_000);
+        assert_eq!(st2, SessionState::Done);
+    }
+
+    #[test]
+    fn nonzero_exit_code_without_crash_is_errored() {
+        let c = cfg();
+        let mut s = snap(1, "", false, false);
+        s.exit_code = Some(3);
+        let (st, reason) = derive_state(SessionState::Working, &s, &[], &[], &c, 10_000);
+        assert_eq!(st, SessionState::Errored);
+        assert_eq!(reason, "終了コード 3");
+        // exit_code 無しの非 running は正常終了扱い
+        s.exit_code = None;
+        let (st2, _) = derive_state(SessionState::Working, &s, &[], &[], &c, 10_000);
+        assert_eq!(st2, SessionState::Done);
+    }
+
+    #[test]
+    fn waiting_approval_wins_over_loop_and_error_storm() {
+        let c = cfg();
+        let s = snap(1, "❯ 1. Yes", true, true);
+        let f = found(&[
+            (Anomaly::Looping, "ループ中"),
+            (Anomaly::ErrorStorm, "エラー多発"),
+        ]);
+        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        assert_eq!(
+            st,
+            SessionState::WaitingApproval,
+            "承認待ちは Loop/ErrorStorm より優先されるべき: {reason}"
+        );
+        assert_eq!(reason, "承認プロンプト検出");
+    }
+
+    #[test]
+    fn anomaly_priority_is_loop_then_storm_then_stall() {
+        let c = cfg();
+        let s = snap(1, "working", true, false);
+        // 3 つ同時なら Looping が勝つ (found の並び順には依存しない)
+        let f = found(&[
+            (Anomaly::Stall, "S"),
+            (Anomaly::ErrorStorm, "E"),
+            (Anomaly::Looping, "L"),
+        ]);
+        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        assert_eq!((st, reason.as_str()), (SessionState::Looping, "L"));
+        // Looping が無ければ ErrorStorm
+        let f = found(&[(Anomaly::Stall, "S"), (Anomaly::ErrorStorm, "E")]);
+        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        assert_eq!((st, reason.as_str()), (SessionState::Errored, "E"));
+        // Stall 単独なら Stalled
+        let f = found(&[(Anomaly::Stall, "S")]);
+        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        assert_eq!((st, reason.as_str()), (SessionState::Stalled, "S"));
+    }
+
+    #[test]
+    fn recent_progress_means_working() {
+        let c = cfg();
+        let s = snap(1, "step three", true, false);
+        let samples = samples_from(
+            &[(0, "step one"), (2_000, "step two"), (4_000, "step three")],
+            &c,
+            false,
+        );
+        let (st, reason) = derive_state(SessionState::Idle, &s, &samples, &[], &c, 5_000);
+        assert_eq!(st, SessionState::Working, "{reason}");
+    }
+
+    #[test]
+    fn stale_progress_means_idle() {
+        let c = cfg();
+        let s = snap(1, "step two", true, false);
+        // 進捗は 1 秒時点まで。既定の窓 (10 秒) の外なので待機扱いになる
+        let samples = samples_from(
+            &[
+                (0, "step one"),
+                (1_000, "step two"),
+                (20_000, "step two"),
+                (30_000, "step two"),
+            ],
+            &c,
+            false,
+        );
+        let (st, reason) = derive_state(SessionState::Working, &s, &samples, &[], &c, 30_000);
+        assert_eq!(st, SessionState::Idle, "{reason}");
+        // サンプルが無い場合も待機
+        let (st2, _) = derive_state(SessionState::Working, &s, &[], &[], &c, 30_000);
+        assert_eq!(st2, SessionState::Idle);
+    }
+
+    // ---------------- LLM 診断 → 意図 (intent_from_diagnosis) ----------------
+
+    fn diag(id: u64, anomaly: Anomaly, summary: &str, rec: Intervention) -> Diagnosis {
+        Diagnosis {
+            session_id: id,
+            anomaly,
+            summary: summary.into(),
+            recommended: rec,
+        }
+    }
+
+    #[test]
+    fn diagnosis_is_ignored_when_llm_escalation_off() {
+        let mut sv = Supervisor::new(cfg()); // 既定で llm_escalation=false
+        sv.tick_ms(&[snap(1, "working", true, false)], Approval::Auto, 0);
+        let d = diag(1, Anomaly::Stall, "止まっている", Intervention::Notify);
+        assert!(
+            sv.intent_from_diagnosis(&d, Approval::Auto).is_none(),
+            "llm_escalation=false のとき診断は意図になってはいけない"
+        );
+    }
+
+    #[test]
+    fn diagnosis_for_unknown_session_is_none() {
+        let mut c = cfg();
+        c.llm_escalation = true;
+        let mut sv = Supervisor::new(c);
+        sv.tick_ms(&[snap(1, "working", true, false)], Approval::Auto, 0);
+        let d = diag(99, Anomaly::Stall, "止まっている", Intervention::Notify);
+        assert!(
+            sv.intent_from_diagnosis(&d, Approval::Auto).is_none(),
+            "未登録セッション id の診断は無視されるべき"
+        );
+    }
+
+    #[test]
+    fn destructive_llm_recommendation_always_needs_confirmation() {
+        let mut c = cfg();
+        c.llm_escalation = true;
+        // 自動再起動・自動停止を明示的に許可していても、LLM 由来なら必ず確認
+        c.allow_auto_restart = true;
+        c.allow_auto_halt = true;
+        let mut sv = Supervisor::new(c);
+        sv.tick_ms(&[snap(1, "working", true, false)], Approval::Auto, 0);
+        for rec in [Intervention::Restart, Intervention::Halt] {
+            let d = diag(1, Anomaly::Crash, "再起動が必要", rec);
+            let i = sv
+                .intent_from_diagnosis(&d, Approval::Auto)
+                .expect("意図は作られるべき");
+            assert!(
+                i.needs_confirmation,
+                "LLM 由来の {} は設定に関わらず確認必須",
+                rec.label()
+            );
+        }
+    }
+
+    #[test]
+    fn diagnosis_summary_is_reflected_in_reason() {
+        let mut c = cfg();
+        c.llm_escalation = true;
+        let mut sv = Supervisor::new(c);
+        sv.tick_ms(&[snap(1, "working", true, false)], Approval::Auto, 0);
+        let d = diag(
+            1,
+            Anomaly::Looping,
+            "同じテストを 5 回やり直している",
+            Intervention::Notify,
+        );
+        let i = sv
+            .intent_from_diagnosis(&d, Approval::Ask)
+            .expect("Notify は Ask でも許可される");
+        assert_eq!(i.action, Intervention::Notify);
+        assert!(!i.needs_confirmation);
+        assert_eq!(i.reason, "AI 診断: 同じテストを 5 回やり直している");
+        assert_eq!(i.session_id, 1);
+    }
 }

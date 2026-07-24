@@ -786,4 +786,74 @@ mod tests {
         append_para(&mut q, "世界");
         assert_eq!(q, "こんにちは世界");
     }
+
+    #[test]
+    fn resolve_image_remote_and_data_urls_are_none() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "remote");
+        // dir があってもリモート/データ URL はローカル解決しない
+        assert_eq!(resolve_image(Some(&dir), "http://a.b/img.png"), None);
+        assert_eq!(resolve_image(Some(&dir), "https://a.b/img.png"), None);
+        assert_eq!(resolve_image(Some(&dir), "data:image/png;base64,AAAA"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_image_empty_url_is_none() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "empty");
+        assert_eq!(resolve_image(Some(&dir), ""), None);
+        // クエリ/フラグメントだけの URL も除去後に空になり None
+        assert_eq!(resolve_image(Some(&dir), "?q=1"), None);
+        assert_eq!(resolve_image(Some(&dir), "#frag"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_image_strips_query_and_fragment() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "query");
+        let img = dir.join("img.png");
+        std::fs::write(&img, b"png").expect("write test image");
+        assert_eq!(resolve_image(Some(&dir), "img.png?v=1"), Some(img.clone()));
+        assert_eq!(resolve_image(Some(&dir), "img.png#sec"), Some(img.clone()));
+        assert_eq!(resolve_image(Some(&dir), "img.png?v=1#sec"), Some(img));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_image_absolute_path_ignores_dir() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "abs");
+        let img = dir.join("abs.png");
+        std::fs::write(&img, b"png").expect("write test image");
+        let url = img.to_str().expect("utf-8 temp path");
+        // 絶対パスは dir と無関係に解決される (dir が別でも None でも同じ)
+        let other = crate::test_util::unique_temp_dir("zaivern-markdown-test", "abs-other");
+        assert_eq!(resolve_image(Some(&other), url), Some(img.clone()));
+        assert_eq!(resolve_image(None, url), Some(img));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn resolve_image_relative_needs_dir_and_existing_file() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "rel");
+        let img = dir.join("rel.png");
+        std::fs::write(&img, b"png").expect("write test image");
+        // dir がなければ相対パスは解決できない
+        assert_eq!(resolve_image(None, "rel.png"), None);
+        // dir 起点で実在すれば Some、しなければ None
+        assert_eq!(resolve_image(Some(&dir), "rel.png"), Some(img));
+        assert_eq!(resolve_image(Some(&dir), "missing.png"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_image_directory_is_not_a_file() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "dirpath");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("create sub dir");
+        // is_file 判定なのでディレクトリは None
+        assert_eq!(resolve_image(Some(&dir), "sub"), None);
+        let abs = sub.to_str().expect("utf-8 temp path");
+        assert_eq!(resolve_image(None, abs), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

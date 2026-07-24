@@ -637,3 +637,187 @@ fn draw_bubble(painter: &egui::Painter, rect: Rect, theme: &Theme, state: PetSta
         painter.galley(pos, galley, theme.text);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 全て「何も起きていない」状態の入力。各テストで必要なフィールドだけ上書きする。
+    fn base_input() -> PetInput {
+        PetInput {
+            working: 0,
+            attention: 0,
+            recent_success: false,
+            recent_error: false,
+            variant: PetVariant::Blocky,
+            scale: 1.0,
+            free_roam: false,
+            sleep_enabled: false,
+        }
+    }
+
+    /// resolve_state のショートハンド(rt はデフォルト、t=100.0)。
+    fn resolve(input: &PetInput, idle_for: f64, anchored: bool) -> PetState {
+        resolve_state(input, &PetRuntime::default(), 100.0, idle_for, anchored)
+    }
+
+    // ── resolve_state: 優先順位 ──
+
+    #[test]
+    fn recent_error_wins_over_everything() {
+        let mut input = base_input();
+        input.recent_error = true;
+        input.attention = 5;
+        input.recent_success = true;
+        input.working = 10;
+        input.sleep_enabled = true;
+        input.free_roam = true;
+        assert_eq!(resolve(&input, 1000.0, true), PetState::Error);
+    }
+
+    #[test]
+    fn attention_beats_success_and_working() {
+        let mut input = base_input();
+        input.attention = 1;
+        input.recent_success = true;
+        input.working = 10;
+        assert_eq!(resolve(&input, 0.0, false), PetState::Attention);
+    }
+
+    #[test]
+    fn happy_from_recent_success_or_happy_until() {
+        let mut input = base_input();
+        input.recent_success = true;
+        input.working = 10;
+        assert_eq!(resolve(&input, 0.0, false), PetState::Happy);
+
+        // recent_success が無くても t < happy_until なら Happy(Annoyed より優先)
+        let input = base_input();
+        let rt = PetRuntime {
+            happy_until: 200.0,
+            annoyed_until: 200.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_state(&input, &rt, 100.0, 0.0, false),
+            PetState::Happy
+        );
+    }
+
+    #[test]
+    fn annoyed_until_beats_working() {
+        let mut input = base_input();
+        input.working = 5;
+        let rt = PetRuntime {
+            annoyed_until: 200.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_state(&input, &rt, 100.0, 0.0, false),
+            PetState::Annoyed
+        );
+        // 期限切れ(t >= annoyed_until)なら通常の解決に戻る
+        assert_eq!(
+            resolve_state(&input, &rt, 200.0, 0.0, false),
+            PetState::Groove
+        );
+    }
+
+    #[test]
+    fn working_count_boundaries() {
+        let mut input = base_input();
+        input.working = 1;
+        assert_eq!(resolve(&input, 0.0, false), PetState::Working(1));
+        input.working = 2;
+        assert_eq!(resolve(&input, 0.0, false), PetState::Working(2));
+        // 3 以上で Groove
+        input.working = 3;
+        assert_eq!(resolve(&input, 0.0, false), PetState::Groove);
+        input.working = 100;
+        assert_eq!(resolve(&input, 0.0, false), PetState::Groove);
+    }
+
+    #[test]
+    fn working_beats_sleep() {
+        let mut input = base_input();
+        input.working = 1;
+        input.sleep_enabled = true;
+        assert_eq!(resolve(&input, SLEEP_AFTER * 10.0, false), PetState::Working(1));
+    }
+
+    #[test]
+    fn doze_and_sleep_thresholds() {
+        let mut input = base_input();
+        input.sleep_enabled = true;
+        // DOZE_AFTER 未満は眠らない
+        assert_eq!(resolve(&input, DOZE_AFTER - 0.001, false), PetState::Idle);
+        // DOZE_AFTER 以上 SLEEP_AFTER 未満は Dozing
+        assert_eq!(resolve(&input, DOZE_AFTER, false), PetState::Dozing);
+        assert_eq!(resolve(&input, SLEEP_AFTER - 0.001, false), PetState::Dozing);
+        // SLEEP_AFTER 以上は Sleeping
+        assert_eq!(resolve(&input, SLEEP_AFTER, false), PetState::Sleeping);
+    }
+
+    #[test]
+    fn sleep_disabled_never_dozes() {
+        let mut input = base_input();
+        input.sleep_enabled = false;
+        assert_eq!(resolve(&input, SLEEP_AFTER * 10.0, false), PetState::Idle);
+    }
+
+    #[test]
+    fn sleeping_beats_roam() {
+        let mut input = base_input();
+        input.sleep_enabled = true;
+        input.free_roam = true;
+        assert_eq!(resolve(&input, SLEEP_AFTER, true), PetState::Sleeping);
+    }
+
+    #[test]
+    fn roam_requires_anchored_and_free_roam() {
+        let mut input = base_input();
+        input.free_roam = true;
+        assert_eq!(resolve(&input, 0.0, true), PetState::Roam);
+        // アンカーモードでなければ Idle
+        assert_eq!(resolve(&input, 0.0, false), PetState::Idle);
+        // free_roam でなければ Idle
+        input.free_roam = false;
+        assert_eq!(resolve(&input, 0.0, true), PetState::Idle);
+    }
+
+    // ── PetVariant: from_name / name ──
+
+    #[test]
+    fn variant_name_roundtrip() {
+        // PetVariant は Debug 未導出のため assert! で比較する
+        for v in [
+            PetVariant::Blocky,
+            PetVariant::Crab,
+            PetVariant::Cat,
+            PetVariant::Cloud,
+        ] {
+            assert!(
+                PetVariant::from_name(v.name()) == v,
+                "roundtrip failed for {}",
+                v.name()
+            );
+        }
+        assert_eq!(PetVariant::Blocky.name(), "blocky");
+        assert_eq!(PetVariant::Crab.name(), "crab");
+        assert_eq!(PetVariant::Cat.name(), "cat");
+        assert_eq!(PetVariant::Cloud.name(), "cloud");
+    }
+
+    #[test]
+    fn variant_unknown_name_falls_back_to_blocky() {
+        for s in ["", "unknown", "Crab", "CAT", "blocky ", "dog"] {
+            assert!(
+                PetVariant::from_name(s) == PetVariant::Blocky,
+                "expected Blocky for {:?}",
+                s
+            );
+        }
+        // 既定文字列 "blocky" 自身も Blocky
+        assert!(PetVariant::from_name("blocky") == PetVariant::Blocky);
+    }
+}

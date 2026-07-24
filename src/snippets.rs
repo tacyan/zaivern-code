@@ -646,4 +646,103 @@ mod tests {
         assert!(v[0].body.contains("https://example.com")); // // inside string kept
         assert_eq!(v[0].description, "For loop");
     }
+
+    // ---- resolve_var ----
+
+    #[test]
+    fn resolve_var_filename_base_dotfile_kept_whole() {
+        // leading-dot file: rfind('.') == Some(0) => base kept as-is
+        assert_eq!(
+            resolve_var("TM_FILENAME_BASE", "/home/u/.bashrc"),
+            Some(".bashrc".to_string())
+        );
+        // no dot at all => base kept as-is
+        assert_eq!(
+            resolve_var("TM_FILENAME_BASE", "/tmp/Makefile"),
+            Some("Makefile".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_var_filename_base_strips_last_extension_only() {
+        assert_eq!(
+            resolve_var("TM_FILENAME_BASE", "/tmp/a.b.c"),
+            Some("a.b".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_var_directory_and_filepath() {
+        assert_eq!(
+            resolve_var("TM_DIRECTORY", "/tmp/dir/foo.rs"),
+            Some("/tmp/dir".to_string())
+        );
+        assert_eq!(
+            resolve_var("TM_FILEPATH", "/tmp/dir/foo.rs"),
+            Some("/tmp/dir/foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_var_comment_constants() {
+        assert_eq!(
+            resolve_var("BLOCK_COMMENT_START", "/tmp/a.rs"),
+            Some("/*".to_string())
+        );
+        assert_eq!(
+            resolve_var("BLOCK_COMMENT_END", "/tmp/a.rs"),
+            Some("*/".to_string())
+        );
+        assert_eq!(
+            resolve_var("LINE_COMMENT", "/tmp/a.rs"),
+            Some("//".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_var_unknown_is_none() {
+        assert_eq!(resolve_var("TM_NO_SUCH_VAR", "/tmp/a.rs"), None);
+        assert_eq!(resolve_var("", "/tmp/a.rs"), None);
+    }
+
+    #[test]
+    fn resolve_var_current_prefix_expands_empty() {
+        // date/time variables are unsupported: they resolve to "" (not None)
+        assert_eq!(
+            resolve_var("CURRENT_YEAR", "/tmp/a.rs"),
+            Some(String::new())
+        );
+        assert_eq!(
+            resolve_var("CURRENT_SECONDS_UNIX", "/tmp/a.rs"),
+            Some(String::new())
+        );
+    }
+
+    // ---- lang_id_for ----
+
+    #[test]
+    fn lang_id_for_common_languages() {
+        assert_eq!(lang_id_for("Rust"), "rust");
+        assert_eq!(lang_id_for("Python"), "python");
+        assert_eq!(lang_id_for("TypeScript"), "typescript");
+        assert_eq!(lang_id_for("C++"), "cpp");
+        assert_eq!(lang_id_for("C#"), "csharp");
+        assert_eq!(lang_id_for("Markdown"), "markdown");
+    }
+
+    #[test]
+    fn lang_id_for_alias_syntax_names() {
+        // multiple syntect names mapping to one language id
+        assert_eq!(lang_id_for("JavaScript (Babel)"), "javascript");
+        assert_eq!(lang_id_for("Bourne Again Shell (bash)"), "shellscript");
+        assert_eq!(lang_id_for("Shell-Unix-Generic"), "shellscript");
+        assert_eq!(lang_id_for("Vue Component"), "vue");
+    }
+
+    #[test]
+    fn lang_id_for_unknown_falls_back_to_plaintext() {
+        assert_eq!(lang_id_for("Zig"), "plaintext");
+        assert_eq!(lang_id_for(""), "plaintext");
+        assert_eq!(lang_id_for("rust"), "plaintext"); // case-sensitive: not "Rust"
+    }
 }
