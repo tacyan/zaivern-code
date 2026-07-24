@@ -531,4 +531,193 @@ mod tests {
             sc(Modifiers::ALT, Key::ArrowUp)
         );
     }
+
+    // ---- 整形方向 (format_shortcut) ----
+
+    #[test]
+    fn format_cmd_s() {
+        let f = format_shortcut(sc(Modifiers::COMMAND, Key::S));
+        if cfg!(target_os = "macos") {
+            assert_eq!(f, "⌘S");
+        } else {
+            assert_eq!(f, "Ctrl+S");
+        }
+    }
+
+    #[test]
+    fn format_modifier_order_is_ctrl_alt_shift_cmd() {
+        let all = Modifiers::CTRL
+            .plus(Modifiers::ALT)
+            .plus(Modifiers::SHIFT)
+            .plus(Modifiers::COMMAND);
+        let f = format_shortcut(sc(all, Key::S));
+        if cfg!(target_os = "macos") {
+            assert_eq!(f, "⌃⌥⇧⌘S");
+        } else {
+            // command と ctrl はどちらも "Ctrl" に集約され、重複しない
+            assert_eq!(f, "Ctrl+Alt+Shift+S");
+        }
+    }
+
+    #[test]
+    fn format_cmd_shift_p() {
+        let f = format_shortcut(sc(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::P));
+        if cfg!(target_os = "macos") {
+            assert_eq!(f, "⇧⌘P");
+        } else {
+            assert_eq!(f, "Ctrl+Shift+P");
+        }
+    }
+
+    #[test]
+    fn format_alt_arrow() {
+        let f = format_shortcut(sc(Modifiers::ALT, Key::ArrowUp));
+        if cfg!(target_os = "macos") {
+            assert_eq!(f, "⌥↑");
+        } else {
+            assert_eq!(f, "Alt+↑");
+        }
+    }
+
+    #[test]
+    fn format_unmodified_key_is_label_only() {
+        // 修飾キーなし → キーラベルのみ (両OS共通で区切り記号なし)
+        assert_eq!(format_shortcut(sc(Modifiers::NONE, Key::F12)), "F12");
+    }
+
+    // ---- キーラベル (key_label) ----
+
+    #[test]
+    fn key_label_letter_digit_fkey() {
+        // フォールバックの Key::name() 経由 (egui 0.29: "A" / "7" / "F12")
+        assert_eq!(key_label(Key::A), "A");
+        assert_eq!(key_label(Key::Num7), "7");
+        assert_eq!(key_label(Key::F12), "F12");
+    }
+
+    #[test]
+    fn key_label_arrows_and_special() {
+        assert_eq!(key_label(Key::ArrowUp), "↑");
+        assert_eq!(key_label(Key::ArrowDown), "↓");
+        assert_eq!(key_label(Key::ArrowLeft), "←");
+        assert_eq!(key_label(Key::ArrowRight), "→");
+        assert_eq!(key_label(Key::Enter), "↩");
+        assert_eq!(key_label(Key::Escape), "Esc");
+        assert_eq!(key_label(Key::Space), "Space");
+        assert_eq!(key_label(Key::Tab), "Tab");
+        assert_eq!(key_label(Key::Backtick), "`");
+        assert_eq!(key_label(Key::Backslash), "\\");
+    }
+
+    // ---- action_from_name ----
+
+    #[test]
+    fn action_from_name_known() {
+        assert_eq!(Keybinds::action_from_name("save"), Some(BindAction::Save));
+        assert_eq!(
+            Keybinds::action_from_name("palette_commands"),
+            Some(BindAction::PaletteCommands)
+        );
+        assert_eq!(
+            Keybinds::action_from_name("move_line_down"),
+            Some(BindAction::MoveLineDown)
+        );
+        assert_eq!(
+            Keybinds::action_from_name("toggle_fullscreen"),
+            Some(BindAction::ToggleFullScreen)
+        );
+        assert_eq!(
+            Keybinds::action_from_name("nav_back"),
+            Some(BindAction::NavBack)
+        );
+    }
+
+    #[test]
+    fn action_from_name_unknown_or_wrong_case() {
+        assert_eq!(Keybinds::action_from_name(""), None);
+        assert_eq!(Keybinds::action_from_name("bogus"), None);
+        // 大文字小文字は区別する (config 名は小文字固定)
+        assert_eq!(Keybinds::action_from_name("Save"), None);
+        // 前後空白もトリムしない
+        assert_eq!(Keybinds::action_from_name(" save"), None);
+    }
+
+    // ---- ラウンドトリップ (parse → format → parse) ----
+
+    #[test]
+    fn roundtrip_known_specs_parse_format_parse() {
+        // デフォルト群を網羅する既知表記の集合
+        let specs = [
+            "cmd+s",
+            "cmd+shift+s",
+            "cmd+w",
+            "cmd+p",
+            "cmd+shift+p",
+            "cmd+j",
+            "cmd+/",
+            "cmd+plus",
+            "cmd+minus",
+            "alt+up",
+            "alt+down",
+            "ctrl+g",
+            "ctrl+-",
+            "ctrl+shift+-",
+            "ctrl+shift+`",
+            "cmd+alt+s",
+            "cmd+alt+f",
+            "cmd+shift+]",
+            "cmd+shift+[",
+            "cmd+shift+\\",
+            "ctrl+cmd+f",
+            "f12",
+        ];
+        for s in specs {
+            let sc1 = parse_shortcut(s).unwrap_or_else(|| panic!("parse failed: {s}"));
+            // parse は安定 (同じ入力から同じ結果)
+            assert_eq!(parse_shortcut(s), Some(sc1));
+            let f1 = format_shortcut(sc1);
+            // format 出力は必ずキーラベルで終わる (両OS共通)
+            assert!(f1.ends_with(&key_label(sc1.logical_key)), "{s} -> {f1}");
+            // format が正規化した表記が再パース可能なら、再 parse → 再 format で固定点になる
+            // (macOS の記号表記や "↑" などパース不能な表記はここでは対象外)
+            if let Some(sc2) = parse_shortcut(&f1) {
+                let f2 = format_shortcut(sc2);
+                assert_eq!(f2, f1, "format unstable for {s}");
+                assert_eq!(parse_shortcut(&f2), Some(sc2), "reparse unstable for {s}");
+            }
+        }
+    }
+
+    #[test]
+    fn roundtrip_alias_specs_agree() {
+        // 別名表記は同じショートカットにパースされ、同じ表示に整形される
+        for (a, b) in [
+            ("cmd+/", "cmd+slash"),
+            ("ctrl+`", "ctrl+backtick"),
+            ("alt+up", "option+up"),
+            ("cmd+-", "cmd+minus"),
+            ("cmd+shift+[", "cmd+shift+openbracket"),
+            ("escape", "esc"),
+        ] {
+            let sa = parse_shortcut(a).unwrap_or_else(|| panic!("parse failed: {a}"));
+            let sb = parse_shortcut(b).unwrap_or_else(|| panic!("parse failed: {b}"));
+            assert_eq!(sa, sb, "{a} vs {b}");
+            assert_eq!(format_shortcut(sa), format_shortcut(sb), "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn roundtrip_all_default_shortcuts_format_stable() {
+        // 全デフォルトについて format が空でなくキーラベルで終わり、
+        // 再パース可能な表記なら format の固定点であること
+        for a in ALL_ACTIONS {
+            let sc1 = default_shortcut(a);
+            let f1 = format_shortcut(sc1);
+            assert!(!f1.is_empty(), "{a:?}");
+            assert!(f1.ends_with(&key_label(sc1.logical_key)), "{a:?} -> {f1}");
+            if let Some(sc2) = parse_shortcut(&f1) {
+                assert_eq!(format_shortcut(sc2), f1, "{a:?}");
+            }
+        }
+    }
 }
