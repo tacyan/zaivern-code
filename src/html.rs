@@ -339,23 +339,7 @@ impl Conv {
                     self.block_break();
                 }
             }
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                self.block_break();
-                if !tag.closing {
-                    let n = name[1..].parse::<usize>().unwrap_or(1);
-                    let quote = self.quote_depth;
-                    let s = self.sink();
-                    if quote > 0 && (s.is_empty() || s.ends_with('\n')) {
-                        for _ in 0..quote {
-                            s.push_str("> ");
-                        }
-                    }
-                    for _ in 0..n {
-                        s.push('#');
-                    }
-                    s.push(' ');
-                }
-            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => self.tag_heading(tag, name),
             "p" | "div" | "section" | "article" | "main" | "header" | "footer" | "aside"
             | "nav" | "center" | "figure" | "figcaption" | "address" | "dl" | "dt" | "dd" => {
                 self.block_break();
@@ -394,31 +378,7 @@ impl Conv {
                     self.lists.push(ListKind::Ol(0));
                 }
             }
-            "li" => {
-                if tag.closing {
-                    return;
-                }
-                self.newline();
-                let depth = self.lists.len().saturating_sub(1);
-                let marker = match self.lists.last_mut() {
-                    Some(ListKind::Ol(n)) => {
-                        *n += 1;
-                        format!("{n}. ")
-                    }
-                    _ => "- ".to_string(),
-                };
-                let quote = self.quote_depth;
-                let s = self.sink();
-                if quote > 0 && (s.is_empty() || s.ends_with('\n')) {
-                    for _ in 0..quote {
-                        s.push_str("> ");
-                    }
-                }
-                for _ in 0..depth {
-                    s.push_str("  ");
-                }
-                s.push_str(&marker);
-            }
+            "li" => self.tag_list_item(tag),
             "a" => {
                 if tag.closing {
                     if let Some(href) = self.links.pop().flatten() {
@@ -462,26 +422,7 @@ impl Conv {
                 }
             }
             "thead" | "tbody" | "tfoot" | "caption" | "colgroup" | "col" => {}
-            "tr" => {
-                if let Some(t) = &mut self.table {
-                    if tag.closing {
-                        if let Some(c) = t.cur_cell.take() {
-                            t.cur_row.push(c);
-                        }
-                        if !t.cur_row.is_empty() {
-                            if t.rows.is_empty() && t.row_is_th {
-                                t.header = true;
-                            }
-                            t.rows.push(std::mem::take(&mut t.cur_row));
-                        }
-                        t.row_is_th = false;
-                    } else {
-                        t.cur_row.clear();
-                        t.cur_cell = None;
-                        t.row_is_th = true;
-                    }
-                }
-            }
+            "tr" => self.tag_table_row(tag),
             "th" | "td" => {
                 if let Some(t) = &mut self.table {
                     if let Some(c) = t.cur_cell.take() {
@@ -495,34 +436,105 @@ impl Conv {
                     }
                 }
             }
-            "pre" => {
-                if tag.closing {
-                    self.pre = false;
-                    self.pre_lang_pending = false;
-                    let s = self.sink();
-                    if !s.ends_with('\n') {
-                        s.push('\n');
-                    }
-                    s.push_str("```");
-                    self.block_break();
-                } else {
-                    self.block_break();
-                    self.pre = true;
-                    // 言語は直後の <code class="language-x"> から拾う
-                    self.pre_lang_pending = true;
-                    self.sink().push_str("```");
-                    // <pre class="language-x"> にも対応
-                    if let Some(lang) = fence_lang(&tag.attrs) {
-                        self.sink().push_str(&lang);
-                        self.pre_lang_pending = false;
-                    }
-                    self.sink().push('\n');
-                }
-            }
+            "pre" => self.tag_pre(tag),
             _ => {
                 // 未知タグ: HTML モードでは捨てる (中身のテキストは流れてくる)。
                 // Markdown モードでは呼び出し側 (convert) が原文のまま出力する
             }
+        }
+    }
+
+    /// `tag()` から抽出: h1〜h6 の見出しタグを処理する。
+    fn tag_heading(&mut self, tag: &Tag, name: &str) {
+        self.block_break();
+        if !tag.closing {
+            let n = name[1..].parse::<usize>().unwrap_or(1);
+            let quote = self.quote_depth;
+            let s = self.sink();
+            if quote > 0 && (s.is_empty() || s.ends_with('\n')) {
+                for _ in 0..quote {
+                    s.push_str("> ");
+                }
+            }
+            for _ in 0..n {
+                s.push('#');
+            }
+            s.push(' ');
+        }
+    }
+
+    /// `tag()` から抽出: `<li>` を処理する (マーカーとインデントの出力)。
+    fn tag_list_item(&mut self, tag: &Tag) {
+        if tag.closing {
+            return;
+        }
+        self.newline();
+        let depth = self.lists.len().saturating_sub(1);
+        let marker = match self.lists.last_mut() {
+            Some(ListKind::Ol(n)) => {
+                *n += 1;
+                format!("{n}. ")
+            }
+            _ => "- ".to_string(),
+        };
+        let quote = self.quote_depth;
+        let s = self.sink();
+        if quote > 0 && (s.is_empty() || s.ends_with('\n')) {
+            for _ in 0..quote {
+                s.push_str("> ");
+            }
+        }
+        for _ in 0..depth {
+            s.push_str("  ");
+        }
+        s.push_str(&marker);
+    }
+
+    /// `tag()` から抽出: `<tr>` の開閉 (行バッファの確定/初期化) を処理する。
+    fn tag_table_row(&mut self, tag: &Tag) {
+        if let Some(t) = &mut self.table {
+            if tag.closing {
+                if let Some(c) = t.cur_cell.take() {
+                    t.cur_row.push(c);
+                }
+                if !t.cur_row.is_empty() {
+                    if t.rows.is_empty() && t.row_is_th {
+                        t.header = true;
+                    }
+                    t.rows.push(std::mem::take(&mut t.cur_row));
+                }
+                t.row_is_th = false;
+            } else {
+                t.cur_row.clear();
+                t.cur_cell = None;
+                t.row_is_th = true;
+            }
+        }
+    }
+
+    /// `tag()` から抽出: `<pre>` の開閉 (コードフェンスの開始/終了) を処理する。
+    fn tag_pre(&mut self, tag: &Tag) {
+        if tag.closing {
+            self.pre = false;
+            self.pre_lang_pending = false;
+            let s = self.sink();
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str("```");
+            self.block_break();
+        } else {
+            self.block_break();
+            self.pre = true;
+            // 言語は直後の <code class="language-x"> から拾う
+            self.pre_lang_pending = true;
+            self.sink().push_str("```");
+            // <pre class="language-x"> にも対応
+            if let Some(lang) = fence_lang(&tag.attrs) {
+                self.sink().push_str(&lang);
+                self.pre_lang_pending = false;
+            }
+            self.sink().push('\n');
         }
     }
 
@@ -927,5 +939,41 @@ mod tests {
     fn plain_markdown_passes_through() {
         let src = "# Title\n\n- item **bold**\n";
         assert_eq!(preprocess_markdown(src), src);
+    }
+
+    /// 抽出ヘルパー用の Tag を組み立てる (end は変換ループでのみ意味を持つ)。
+    fn test_tag(name: &str, closing: bool, attrs: &str) -> Tag {
+        Tag {
+            name: name.to_string(),
+            closing,
+            attrs: attrs.to_string(),
+            end: 0,
+        }
+    }
+
+    #[test]
+    fn extracted_heading_helper_emits_hashes() {
+        let mut c = Conv::new(Mode::Html);
+        c.tag_heading(&test_tag("h3", false, ""), "h3");
+        assert_eq!(c.out, "### ");
+    }
+
+    #[test]
+    fn extracted_list_item_helper_numbers_ordered() {
+        let mut c = Conv::new(Mode::Html);
+        c.lists.push(ListKind::Ol(0));
+        let li = test_tag("li", false, "");
+        c.tag_list_item(&li);
+        c.tag_list_item(&li);
+        assert_eq!(c.out, "1. \n2. ");
+    }
+
+    #[test]
+    fn extracted_pre_helper_opens_fence_with_lang() {
+        let mut c = Conv::new(Mode::Html);
+        c.tag_pre(&test_tag("pre", false, r#"class="language-rust""#));
+        assert!(c.pre);
+        assert!(!c.pre_lang_pending);
+        assert_eq!(c.out, "```rust\n");
     }
 }
