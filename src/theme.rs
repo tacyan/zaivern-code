@@ -228,3 +228,126 @@ pub fn apply(ctx: &egui::Context, t: &Theme) {
     ctx.set_style_of(egui::Theme::Dark, style.clone());
     ctx.set_style_of(egui::Theme::Light, style);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- all ----
+
+    #[test]
+    fn all_returns_three_builtin_themes_in_order() {
+        let names: Vec<String> = all().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["zaivern-dark", "zaivern-midnight", "zaivern-light"]);
+    }
+
+    #[test]
+    fn all_names_are_unique() {
+        let themes = all();
+        let mut names: Vec<&str> = themes.iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), themes.len(), "duplicate theme name in all()");
+    }
+
+    #[test]
+    fn all_labels_are_unique_and_non_empty() {
+        let themes = all();
+        let mut labels: Vec<&str> = themes.iter().map(|t| t.label.as_str()).collect();
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), themes.len(), "duplicate theme label in all()");
+    }
+
+    // ---- by_name ----
+
+    #[test]
+    fn by_name_resolves_every_theme_from_all() {
+        for t in all() {
+            let found = by_name(&t.name);
+            assert_eq!(found.name, t.name);
+            assert_eq!(found.label, t.label);
+            assert_eq!(found.dark, t.dark);
+            assert_eq!(found.bg, t.bg);
+            assert_eq!(found.syntect_theme, t.syntect_theme);
+        }
+    }
+
+    #[test]
+    fn by_name_known_names_return_expected_theme() {
+        assert_eq!(by_name("zaivern-dark").label, "Zaivern Dark");
+        assert_eq!(by_name("zaivern-midnight").label, "Zaivern Midnight");
+        assert_eq!(by_name("zaivern-light").label, "Zaivern Light");
+    }
+
+    #[test]
+    fn by_name_unknown_falls_back_to_zaivern_dark() {
+        assert_eq!(by_name("no-such-theme").name, "zaivern-dark");
+    }
+
+    #[test]
+    fn by_name_empty_string_falls_back_to_zaivern_dark() {
+        assert_eq!(by_name("").name, "zaivern-dark");
+    }
+
+    #[test]
+    fn by_name_is_case_sensitive() {
+        // 大文字違いは既知名に一致せず、フォールバック (zaivern-dark) になる。
+        assert_eq!(by_name("Zaivern-Light").name, "zaivern-dark");
+        assert_eq!(by_name("ZAIVERN-MIDNIGHT").name, "zaivern-dark");
+    }
+
+    // ---- テーマ構築関数 ----
+
+    #[test]
+    fn zaivern_dark_is_dark_with_expected_identity() {
+        let t = zaivern_dark();
+        assert_eq!(t.name, "zaivern-dark");
+        assert_eq!(t.label, "Zaivern Dark");
+        assert!(t.dark);
+        assert_eq!(t.syntect_theme, "base16-ocean.dark");
+    }
+
+    #[test]
+    fn zaivern_midnight_is_dark_with_expected_identity() {
+        let t = zaivern_midnight();
+        assert_eq!(t.name, "zaivern-midnight");
+        assert_eq!(t.label, "Zaivern Midnight");
+        assert!(t.dark);
+        assert_eq!(t.syntect_theme, "base16-mocha.dark");
+    }
+
+    #[test]
+    fn zaivern_light_is_the_only_light_theme() {
+        let t = zaivern_light();
+        assert_eq!(t.name, "zaivern-light");
+        assert_eq!(t.label, "Zaivern Light");
+        assert!(!t.dark);
+        assert_eq!(t.syntect_theme, "InspiredGitHub");
+        assert_eq!(all().iter().filter(|t| !t.dark).count(), 1);
+    }
+
+    #[test]
+    fn every_theme_has_readable_contrast_pairs() {
+        // 文字色と背景色が同一だと自明に壊れているので、その退行だけを検出する。
+        for t in all() {
+            assert_ne!(t.text, t.bg, "{}: text == bg", t.name);
+            assert_ne!(t.term_fg, t.term_bg, "{}: term_fg == term_bg", t.name);
+            assert_ne!(t.text, t.panel, "{}: text == panel", t.name);
+            assert_ne!(t.accent, t.bg, "{}: accent == bg", t.name);
+        }
+    }
+
+    #[test]
+    fn every_theme_ansi_normal_colors_are_distinct() {
+        // ANSI 0..=7 (通常色) は互いに異なるはず。8..=15 (明色) は
+        // 通常色の再利用を含む設計なので重複を許す。
+        for t in all() {
+            let mut normal: Vec<Color32> = t.ansi[..8].to_vec();
+            normal.sort_unstable_by_key(|c| (c.r(), c.g(), c.b(), c.a()));
+            normal.dedup();
+            assert_eq!(normal.len(), 8, "{}: duplicate ansi normal color", t.name);
+        }
+    }
+}
