@@ -123,14 +123,56 @@ fn parse_hunk_header(line: &str) -> Option<((usize, usize), (usize, usize))> {
 /// 末尾のタイムスタンプ (タブ区切り) は落とす。
 fn strip_side_prefix(rest: &str) -> String {
     let rest = rest.split('\t').next().unwrap_or(rest).trim_end();
-    let rest = rest.trim_matches('"');
+    let rest = unquote_git_path(rest);
     if rest == DEV_NULL {
         return DEV_NULL.to_string();
     }
     rest.strip_prefix("a/")
         .or_else(|| rest.strip_prefix("b/"))
-        .unwrap_or(rest)
+        .unwrap_or(&rest)
         .to_string()
+}
+
+/// git がクォートしたパス (`"a/\346\227\245..."`) を復号する。
+/// core.quotePath 既定では非 ASCII が 8 進エスケープになるため、
+/// 復号しないと日本語ファイル名の見出しが `\346...` のまま表示される。
+fn unquote_git_path(s: &str) -> String {
+    if !(s.len() >= 2 && s.starts_with('"') && s.ends_with('"')) {
+        return s.to_string();
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let mut it = inner.bytes().peekable();
+    while let Some(b) = it.next() {
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        match it.next() {
+            Some(b'n') => out.push(b'\n'),
+            Some(b't') => out.push(b'\t'),
+            Some(b'r') => out.push(b'\r'),
+            Some(b'\\') => out.push(b'\\'),
+            Some(b'"') => out.push(b'"'),
+            Some(d @ b'0'..=b'7') => {
+                // 最大 3 桁の 8 進エスケープ (バイト値)
+                let mut v = u32::from(d - b'0');
+                for _ in 0..2 {
+                    match it.peek() {
+                        Some(&n @ b'0'..=b'7') => {
+                            v = v * 8 + u32::from(n - b'0');
+                            it.next();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(v as u8);
+            }
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `diff --git a/x b/y` の残り部分から (old, new) を取り出す。
@@ -1053,5 +1095,23 @@ diff --git a/b b/b
                 assert!(delta > 120, "theme {} contrast too low: {}", t.name, delta);
             }
         }
+    }
+
+    #[test]
+    fn unquote_git_path_decodes_octal_and_escapes() {
+        // 日本語ファイル名 ("日本.txt" の UTF-8 8進エスケープ)
+        assert_eq!(
+            unquote_git_path("\"a/\\346\\227\\245\\346\\234\\254.txt\""),
+            "a/日本.txt"
+        );
+        // クォート無しはそのまま
+        assert_eq!(unquote_git_path("a/plain.txt"), "a/plain.txt");
+        // エスケープされた引用符とバックスラッシュ
+        assert_eq!(unquote_git_path("\"a/q\\\"x\\\\y\""), "a/q\"x\\y");
+        // strip_side_prefix 経由で a/ プレフィックスも落ちる
+        assert_eq!(
+            strip_side_prefix("\"a/\\346\\227\\245.txt\""),
+            "日.txt"
+        );
     }
 }

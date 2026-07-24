@@ -8008,10 +8008,17 @@ impl ZaivernApp {
                         }
 
                         let (down, up, enter, escape) = ctx.input(|i| {
+                            // IME イベントと同じフレームの Enter は変換確定なので
+                            // コマンド実行に使わない (Windows / Linux の IME 対策。
+                            // macOS は winit 側で確定 Enter が抑止される)
+                            let ime = i
+                                .events
+                                .iter()
+                                .any(|e| matches!(e, egui::Event::Ime(_)));
                             (
                                 i.key_pressed(egui::Key::ArrowDown),
                                 i.key_pressed(egui::Key::ArrowUp),
-                                i.key_pressed(egui::Key::Enter),
+                                i.key_pressed(egui::Key::Enter) && !ime,
                                 i.key_pressed(egui::Key::Escape),
                             )
                         });

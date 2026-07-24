@@ -10,8 +10,7 @@
 //! - 認証: 起動ごとにランダム生成されるトークン。QR の URL に埋め込まれ、
 //!   トークンなしの API アクセスは 401 で拒否する。
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc;
@@ -184,14 +183,14 @@ impl RemoteServer {
 
 /// 起動ごとのランダムトークン (10桁hex)。
 fn gen_token() -> String {
-    let mut h = DefaultHasher::new();
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        .hash(&mut h);
-    std::process::id().hash(&mut h);
-    format!("{:016x}", h.finish())[..10].to_string()
+    // RandomState は OS の乱数で鍵付けされた SipHash なので、鍵を知らない
+    // 相手には出力を予測できない。2 つ独立に作って 128bit 分を合成する
+    // (旧実装は DefaultHasher + 時刻 + PID で、オフライン列挙が可能だった)。
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    let a = RandomState::new().build_hasher().finish();
+    let b = RandomState::new().build_hasher().finish();
+    format!("{:016x}", a ^ b.rotate_left(17))
 }
 
 /// LAN 上での自分の IP アドレスを推定する (UDP connect トリック)。
@@ -292,6 +291,8 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
         .find_map(|kv| kv.strip_prefix("t="))
         .unwrap_or("");
     if hdr_token != token && q_token != token {
+        // 総当たりを減速させる (接続ごとスレッドなので他リクエストは塞がない)
+        std::thread::sleep(std::time::Duration::from_millis(250));
         return respond(&mut stream, 401, "application/json", br#"{"ok":false,"error":"unauthorized"}"#);
     }
 
@@ -1216,10 +1217,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_is_10_hex_chars() {
+    fn token_is_16_hex_chars_and_unpredictable() {
         let t = gen_token();
-        assert_eq!(t.len(), 10);
+        assert_eq!(t.len(), 16);
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+        // OS 乱数由来なので毎回変わる (固定シードなら等しくなり検出できる)
+        assert_ne!(gen_token(), gen_token());
     }
 
     #[test]
