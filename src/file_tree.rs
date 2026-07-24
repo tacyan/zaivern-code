@@ -460,6 +460,21 @@ impl FileTree {
                 .collect();
             (t, i.time)
         });
+        self.keys_navigate(ui, rows, sel_idx, &ctx, mac);
+        self.keys_open_rename(ui, actions, rows, sel_idx, &ctx, mac);
+        self.keys_clipboard_delete(ui, actions, rows, sel_idx, &ctx, mac);
+        self.keys_type_ahead(rows, sel_idx, &typed, now);
+    }
+
+    /// handle_keys のナビゲーション部 (list.focusUp/Down/First/Last, collapse/expand)。
+    fn keys_navigate(
+        &mut self,
+        ui: &mut egui::Ui,
+        rows: &[Row],
+        sel_idx: Option<usize>,
+        ctx: &egui::Context,
+        mac: bool,
+    ) {
         let pressed = |m: Modifiers, k: Key| ui.input_mut(|i| i.consume_key(m, k));
         let roots = self.roots.clone();
         let is_root = move |p: &Path| roots.iter().any(|r| r == p);
@@ -486,7 +501,7 @@ impl FileTree {
         if pressed(Modifiers::NONE, Key::ArrowLeft) || (mac && pressed(Modifiers::COMMAND, Key::ArrowUp)) {
             if let Some(r) = sel_idx.map(|i| &rows[i]) {
                 if r.is_dir && r.open {
-                    set_open(&ctx, &r.path, false);
+                    set_open(ctx, &r.path, false);
                 } else if let Some(p) = r.parent.clone() {
                     self.select(&p);
                 }
@@ -495,7 +510,7 @@ impl FileTree {
         if pressed(Modifiers::NONE, Key::ArrowRight) {
             if let Some(r) = sel_idx.map(|i| &rows[i]) {
                 if r.is_dir && !r.open {
-                    set_open(&ctx, &r.path, true);
+                    set_open(ctx, &r.path, true);
                 } else if r.is_dir && r.open {
                     let child = rows
                         .iter()
@@ -512,10 +527,25 @@ impl FileTree {
             for r in rows.iter().filter(|r| r.is_dir && r.open) {
                 // マルチルートのルート見出しは開いたままにする(VS Code と同じ)
                 if !is_root(&r.path) {
-                    set_open(&ctx, &r.path, false);
+                    set_open(ctx, &r.path, false);
                 }
             }
         }
+    }
+
+    /// handle_keys の開く/リネーム部 (renameFile, openAndPassFocus, list.toggleExpand)。
+    fn keys_open_rename(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut TreeActions,
+        rows: &[Row],
+        sel_idx: Option<usize>,
+        ctx: &egui::Context,
+        mac: bool,
+    ) {
+        let pressed = |m: Modifiers, k: Key| ui.input_mut(|i| i.consume_key(m, k));
+        let roots = self.roots.clone();
+        let is_root = move |p: &Path| roots.iter().any(|r| r == p);
 
         // ── 開く/リネーム (renameFile: F2 / mac Enter, openAndPassFocus: Enter / ⌘↓) ──
         let open_or_toggle = |r: &Row, actions: &mut TreeActions, ctx: &egui::Context| {
@@ -533,7 +563,7 @@ impl FileTree {
                         self.start_rename(r.path.clone());
                     }
                 } else {
-                    open_or_toggle(r, actions, &ctx);
+                    open_or_toggle(r, actions, ctx);
                 }
             }
         }
@@ -546,15 +576,30 @@ impl FileTree {
         }
         if mac && pressed(Modifiers::COMMAND, Key::ArrowDown) {
             if let Some(r) = sel_idx.map(|i| &rows[i]) {
-                open_or_toggle(r, actions, &ctx);
+                open_or_toggle(r, actions, ctx);
             }
         }
         // Space: ファイルはフォーカスを保ったまま開く / フォルダは開閉 (list.toggleExpand)
         if pressed(Modifiers::NONE, Key::Space) && self.type_buf.is_empty() {
             if let Some(r) = sel_idx.map(|i| &rows[i]) {
-                open_or_toggle(r, actions, &ctx);
+                open_or_toggle(r, actions, ctx);
             }
         }
+    }
+
+    /// handle_keys のクリップボード/パスコピー/削除部。
+    fn keys_clipboard_delete(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut TreeActions,
+        rows: &[Row],
+        sel_idx: Option<usize>,
+        ctx: &egui::Context,
+        mac: bool,
+    ) {
+        let pressed = |m: Modifiers, k: Key| ui.input_mut(|i| i.consume_key(m, k));
+        let roots = self.roots.clone();
+        let is_root = move |p: &Path| roots.iter().any(|r| r == p);
 
         // ── クリップボード (filesExplorer.copy/cut/paste) ──
         if pressed(Modifiers::COMMAND, Key::C) {
@@ -619,7 +664,10 @@ impl FileTree {
                 }
             }
         }
+    }
 
+    /// handle_keys のタイプアヘッド部: 文字入力で名前が前方一致する行へジャンプ。
+    fn keys_type_ahead(&mut self, rows: &[Row], sel_idx: Option<usize>, typed: &str, now: f64) {
         // ── タイプアヘッド: 文字入力で名前が前方一致する行へジャンプ ──
         let typed: String = typed.chars().filter(|c| !c.is_control()).collect();
         if !typed.trim().is_empty() {
