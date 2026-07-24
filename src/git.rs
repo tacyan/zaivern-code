@@ -59,9 +59,14 @@ pub fn discover_toplevel(dir: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
-/// marks_cache の値: (text_hash, 行マーク)。
+/// marks_cache の値: (text_hash, 取得時刻, 行マーク)。
 /// Arc 共有: キャッシュヒット時に Vec を複製しない。
-type MarksEntry = (u64, Arc<Vec<(usize, LineMark)>>);
+/// 取得時刻はタイプ中のデバウンス用 (毎キーストロークで git diff を
+/// 同期起動すると UI スレッドがヒッチするため)。
+type MarksEntry = (u64, Instant, Arc<Vec<(usize, LineMark)>>);
+
+/// タイプ中に行マークを取り直す最短間隔。
+const MARKS_DEBOUNCE: Duration = Duration::from_millis(400);
 
 pub struct Git {
     workspace: PathBuf,
@@ -132,8 +137,19 @@ impl Git {
         // 失敗時 (git 無し / 非 repo) も時刻は更新し、毎フレーム再実行しない。
         self.last_refresh = Some(Instant::now());
         match self.run_git(&["status", "--porcelain=v1"]) {
-            Some(out) => self.status_cache = parse_porcelain_status(&out),
-            None => self.status_cache.clear(),
+            Some(out) => {
+                let new_status = parse_porcelain_status(&out);
+                // コミット/チェックアウト/ステージ等で状態が変わったら、
+                // 本文ハッシュが同じでも行マークは古いので取り直させる
+                if new_status != self.status_cache {
+                    self.marks_cache.clear();
+                }
+                self.status_cache = new_status;
+            }
+            None => {
+                self.status_cache.clear();
+                self.marks_cache.clear();
+            }
         }
     }
 
@@ -183,8 +199,11 @@ impl Git {
     /// `text_hash` が前回と同一ならキャッシュを返し、git は再実行しない。
     /// 戻りは Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製しない。
     pub fn line_marks(&mut self, rel_path: &str, text_hash: u64) -> Arc<Vec<(usize, LineMark)>> {
-        if let Some((hash, marks)) = self.marks_cache.get(rel_path) {
-            if *hash == text_hash {
+        if let Some((hash, at, marks)) = self.marks_cache.get(rel_path) {
+            // タイプ中はデバウンス: ハッシュが変わっていても直近に取った
+            // マークをそのまま返し、git diff の同期起動を 400ms に 1 回へ
+            // 抑える (キーストロークごとのプロセス起動はヒッチになる)。
+            if *hash == text_hash || at.elapsed() < MARKS_DEBOUNCE {
                 return Arc::clone(marks);
             }
         }
@@ -194,7 +213,7 @@ impl Git {
                 .unwrap_or_default(),
         );
         self.marks_cache
-            .insert(rel_path.to_string(), (text_hash, Arc::clone(&marks)));
+            .insert(rel_path.to_string(), (text_hash, Instant::now(), Arc::clone(&marks)));
         marks
     }
 
