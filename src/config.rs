@@ -1730,7 +1730,7 @@ mod state_overlay_tests {
         )
         .expect("write .zaivern.toml");
 
-        let cfg = load_from_dir(&home, &[root.clone()], true);
+        let cfg = load_from_dir(&home, std::slice::from_ref(&root), true);
         // セッション中はプロジェクトの値が効く
         assert_eq!(cfg.theme, "project-theme");
         assert_eq!(cfg.approval_mode, "agent");
@@ -1757,7 +1757,7 @@ mod state_overlay_tests {
         std::fs::write(root.join(".zaivern.toml"), "theme = \"project-theme\"\n")
             .expect("write .zaivern.toml");
 
-        let mut cfg = load_from_dir(&home, &[root.clone()], true);
+        let mut cfg = load_from_dir(&home, std::slice::from_ref(&root), true);
         // UI からの変更相当 (Cmd::SetTheme / Cmd::TogglePet): 控えも一緒に更新する
         cfg.theme = "user-picked".into();
         cfg.global_theme = "user-picked".into();

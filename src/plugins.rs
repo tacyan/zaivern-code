@@ -1028,10 +1028,8 @@ pub fn slug(title: &str) -> String {
     for c in title.chars() {
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_lowercase());
-        } else if c == '_' || c == '-' || c.is_whitespace() {
-            if !out.ends_with('-') {
-                out.push('-');
-            }
+        } else if (c == '_' || c == '-' || c.is_whitespace()) && !out.ends_with('-') {
+            out.push('-');
         }
         // それ以外 (日本語など) は落とす
     }
@@ -2478,7 +2476,7 @@ default = true
         assert_eq!(p.settings[1].env_key(), "ZV_CFG_RETRIES");
 
         // ID 引きが効く
-        let list = vec![p];
+        let list = [p];
         assert!(list.find_command("v2plug", "fmt").is_some());
         assert!(list.find_command("v2plug", "nope").is_none());
         assert!(list.find_command("other", "fmt").is_none());

@@ -819,8 +819,10 @@ mod tests {
 
     #[test]
     fn empty_pr_list_is_not_an_error() {
-        let mut panel = GithubPanel::default();
-        panel.inflight = 1;
+        let mut panel = GithubPanel {
+            inflight: 1,
+            ..Default::default()
+        };
         let eff = apply_gh_outcome(&mut panel, GhOutcome::Prs(Vec::new()));
         assert!(matches!(eff, GhEffect::None));
         assert!(panel.last_error.is_none(), "空の一覧は失敗ではない");
@@ -829,8 +831,10 @@ mod tests {
 
     #[test]
     fn gh_error_is_recorded_and_toasted() {
-        let mut panel = GithubPanel::default();
-        panel.inflight = 1;
+        let mut panel = GithubPanel {
+            inflight: 1,
+            ..Default::default()
+        };
         let eff = apply_gh_outcome(
             &mut panel,
             GhOutcome::Error {
@@ -850,8 +854,10 @@ mod tests {
 
     #[test]
     fn diff_outcome_asks_for_a_non_file_tab() {
-        let mut panel = GithubPanel::default();
-        panel.pending_diff = Some(3);
+        let mut panel = GithubPanel {
+            pending_diff: Some(3),
+            ..Default::default()
+        };
         let eff = apply_gh_outcome(
             &mut panel,
             GhOutcome::Diff {
@@ -871,13 +877,15 @@ mod tests {
 
     #[test]
     fn reset_clears_lists_and_rearms_the_fetch() {
-        let mut panel = GithubPanel::default();
-        panel.prs = vec![PullRequest {
-            number: 1,
+        let mut panel = GithubPanel {
+            prs: vec![PullRequest {
+                number: 1,
+                ..Default::default()
+            }],
+            prs_requested: true,
+            last_error: Some("boom".into()),
             ..Default::default()
-        }];
-        panel.prs_requested = true;
-        panel.last_error = Some("boom".into());
+        };
         panel.reset();
         assert!(panel.prs.is_empty());
         assert!(!panel.prs_requested);

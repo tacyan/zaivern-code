@@ -751,7 +751,7 @@ impl Window {
     fn prune(&mut self, now: Instant, width: Duration) {
         while let Some(&front) = self.stamps.front() {
             // now より未来の記録は残す(テストで時刻を巻き戻した場合の保険)。
-            if now.checked_duration_since(front).map_or(false, |d| d > width) {
+            if now.checked_duration_since(front).is_some_and(|d| d > width) {
                 self.stamps.pop_front();
             } else {
                 break;
@@ -1372,10 +1372,7 @@ impl Coordinator {
         };
 
         // ── 確定 ──
-        let reason = match previous {
-            Some(_) => Some(ReassignReason::Manual),
-            None => None,
-        };
+        let reason = previous.map(|_| ReassignReason::Manual);
         if let Some(t) = self.task_mut(task_id) {
             t.assigned = Some(chosen);
             t.state = TaskState::Assigned;

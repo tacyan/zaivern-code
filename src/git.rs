@@ -59,6 +59,10 @@ pub fn discover_toplevel(dir: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
+/// marks_cache の値: (text_hash, 行マーク)。
+/// Arc 共有: キャッシュヒット時に Vec を複製しない。
+type MarksEntry = (u64, Arc<Vec<(usize, LineMark)>>);
+
 pub struct Git {
     workspace: PathBuf,
     /// 相対パス → ステータス (status --porcelain=v1 のパース結果)。
@@ -66,8 +70,7 @@ pub struct Git {
     /// 最後に status を実行した時刻。None なら未実行。
     last_refresh: Option<Instant>,
     /// 相対パス → (text_hash, 行マーク) のキャッシュ。
-    /// 値は Arc 共有: キャッシュヒット時に Vec を複製しない。
-    marks_cache: HashMap<String, (u64, Arc<Vec<(usize, LineMark)>>)>,
+    marks_cache: HashMap<String, MarksEntry>,
     /// ブランチ名の TTL キャッシュ (値, 取得時刻)。
     branch_cache: Option<(Option<String>, Instant)>,
 }

@@ -141,9 +141,7 @@ fn split_git_header(rest: &str) -> Option<(String, String)> {
         return Some((strip_side_prefix(a), strip_side_prefix(&b[1..])));
     }
     // フォールバック: 空白 2 分割。
-    let mut it = rest.splitn(2, ' ');
-    let a = it.next()?;
-    let b = it.next()?;
+    let (a, b) = rest.split_once(' ')?;
     Some((strip_side_prefix(a), strip_side_prefix(b)))
 }
 

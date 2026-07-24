@@ -1066,6 +1066,24 @@ fn dir_mtime(dir: &Path) -> Option<SystemTime> {
     std::fs::metadata(dir).and_then(|m| m.modified()).ok()
 }
 
+pub fn icon_for(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("");
+    match ext {
+        "rs" => "🐾",
+        "md" | "markdown" => "📝",
+        "toml" | "json" | "yaml" | "yml" | "ini" | "cfg" => "⚙️",
+        "js" | "jsx" | "ts" | "tsx" | "mjs" => "📜",
+        "py" => "🐍",
+        "go" => "🐹",
+        "html" | "htm" => "🌐",
+        "css" | "scss" | "sass" => "🎨",
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => "🖼",
+        "lock" => "🔒",
+        "sh" | "bash" | "zsh" | "fish" => "💲",
+        _ => "📄",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,23 +1288,5 @@ mod tests {
 
         assert!(t.refresh_if_changed(), "外部削除を検知する");
         assert!(t.entries(&dir).is_empty());
-    }
-}
-
-pub fn icon_for(name: &str) -> &'static str {
-    let ext = name.rsplit('.').next().unwrap_or("");
-    match ext {
-        "rs" => "🐾",
-        "md" | "markdown" => "📝",
-        "toml" | "json" | "yaml" | "yml" | "ini" | "cfg" => "⚙️",
-        "js" | "jsx" | "ts" | "tsx" | "mjs" => "📜",
-        "py" => "🐍",
-        "go" => "🐹",
-        "html" | "htm" => "🌐",
-        "css" | "scss" | "sass" => "🎨",
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => "🖼",
-        "lock" => "🔒",
-        "sh" | "bash" | "zsh" | "fish" => "💲",
-        _ => "📄",
     }
 }

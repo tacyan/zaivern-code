@@ -592,7 +592,7 @@ pub fn draw_cloud(painter: &Painter, rect: Rect, t: f64, state: PetState, p: &Dr
                 painter.add(Shape::line(
                     vec![
                         e + vec2(-2.0 * u, 0.8 * u),
-                        e + vec2(0.0, -1.0 * u),
+                        e + vec2(0.0, -u),
                         e + vec2(2.0 * u, 0.8 * u),
                     ],
                     Stroke::new(1.3 * u, INK),

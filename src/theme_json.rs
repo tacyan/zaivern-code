@@ -15,7 +15,7 @@ pub fn discover_user_themes() -> Vec<(String, String)> {
     if let Some(home) = dirs::home_dir() {
         scan_flat(&home.join(".zaivern").join("themes"), &mut out);
     }
-    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.sort_by_key(|a| a.0.to_lowercase());
     out.dedup_by(|a, b| a.1 == b.1);
     out
 }

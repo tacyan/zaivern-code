@@ -105,7 +105,7 @@ pub fn spawn(files: Vec<PathBuf>, query: String) -> Receiver<(Vec<Hit>, usize)> 
 
         let files_arc = Arc::new(files);
         let total_files = files_arc.len();
-        let chunk_size = (total_files + num_threads - 1) / num_threads;
+        let chunk_size = total_files.div_ceil(num_threads);
 
         let total_scanned = Arc::new(AtomicUsize::new(0));
         let global_hit_count = Arc::new(AtomicUsize::new(0));

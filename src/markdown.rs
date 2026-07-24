@@ -113,9 +113,9 @@ pub fn parse_inline(s: &str) -> Vec<Span> {
                 // snake_case を斜体にしないよう、単語境界でのみ効かせる
                 let prev = if i == 0 { None } else { chars.get(i - 1).copied() };
                 let boundary = if em {
-                    next.map_or(true, |n| !n.is_alphanumeric())
+                    next.is_none_or(|n| !n.is_alphanumeric())
                 } else {
-                    prev.map_or(true, |p| !p.is_alphanumeric())
+                    prev.is_none_or(|p| !p.is_alphanumeric())
                 };
                 if boundary {
                     flush(&mut out, &mut cur, strong, em, strike);

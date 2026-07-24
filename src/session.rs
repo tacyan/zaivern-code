@@ -123,7 +123,7 @@ pub fn list_term_logs(workspace: &Path) -> Vec<PathBuf> {
             Some((t, e.path()))
         })
         .collect();
-    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    logs.sort_by_key(|b| std::cmp::Reverse(b.0));
     logs.into_iter().map(|(_, p)| p).collect()
 }
 
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(roots_hash(&[a.clone(), b.clone(), a.clone()]), ab);
         // 集合が違えば別キー
         assert_ne!(roots_hash(&[a.clone(), b, c]), ab);
-        assert_ne!(roots_hash(&[a.clone()]), ab);
+        assert_ne!(roots_hash(std::slice::from_ref(&a)), ab);
         assert!(ab.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
