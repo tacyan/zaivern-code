@@ -6738,6 +6738,9 @@ impl ZaivernApp {
 
     fn palette_items(&self) -> Vec<Item> {
         let q = self.palette.query().to_string();
+        // クエリ前処理 (to_lowercase 等) は 1 回だけ。候補ごとの評価は
+        // PreparedQuery::score で行う (fuzzy::score と同値・パリティテスト固定済み)。
+        let pq = fuzzy::PreparedQuery::new(&q);
         let mut items: Vec<Item> = Vec::new();
 
         if self.palette.is_command_mode() {
@@ -6928,7 +6931,7 @@ impl ZaivernApp {
                 ));
             }
             for (icon, label, detail, cmd) in cmds {
-                if let Some(score) = fuzzy::score(&q, &label) {
+                if let Some(score) = pq.score(&label) {
                     items.push(Item {
                         icon,
                         label,
@@ -6953,7 +6956,7 @@ impl ZaivernApp {
                     "終了"
                 });
                 let unread = if s.has_unread() { tr(" ◆未読") } else { String::new() };
-                if let Some(score) = fuzzy::score(&q, &s.title) {
+                if let Some(score) = pq.score(&s.title) {
                     items.push(Item {
                         icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
                         label: s.title.clone(),
@@ -6969,7 +6972,7 @@ impl ZaivernApp {
             for (i, p) in self.cfg.agents.iter().enumerate() {
                 // 訳語のラベルに対して検索する (英語UIなら英語で当たるように)
                 let label = trf("起動: {name}", &[("name", p.name.clone())]);
-                if let Some(score) = fuzzy::score(&q, &label) {
+                if let Some(score) = pq.score(&label) {
                     items.push(Item {
                         icon: p.icon.clone(),
                         label,
@@ -6987,7 +6990,7 @@ impl ZaivernApp {
                     &[("name", root_name(r).to_string())],
                 );
                 if self.roots.len() > 1 {
-                    if let Some(score) = fuzzy::score(&q, &label) {
+                    if let Some(score) = pq.score(&label) {
                         items.push(Item {
                             icon: "📚".into(),
                             label,
@@ -7005,7 +7008,7 @@ impl ZaivernApp {
                     continue; // 既にワークスペースにあるものは「外す」側で出る
                 }
                 let label = trf("worktree を開く: {branch}", &[("branch", branch.clone())]);
-                if let Some(score) = fuzzy::score(&q, &label) {
+                if let Some(score) = pq.score(&label) {
                     items.push(Item {
                         icon: "🌿".into(),
                         label,
@@ -7016,7 +7019,7 @@ impl ZaivernApp {
                 }
             }
             let add_label = tr("フォルダをワークスペースに追加…");
-            if let Some(score) = fuzzy::score(&q, &add_label) {
+            if let Some(score) = pq.score(&add_label) {
                 items.push(Item {
                     icon: "📂".into(),
                     label: add_label,
@@ -7030,7 +7033,7 @@ impl ZaivernApp {
                 // マッチはルート相対パスに対して行い、単一ルート時と同じ
                 // あいまい検索の品質を保つ。表示 (detail) は曖昧回避済みラベル、
                 // 実際に開くのは絶対パス。
-                if let Some(score) = fuzzy::score(&q, &f.rel) {
+                if let Some(score) = pq.score(&f.rel) {
                     let name = f.rel.rsplit('/').next().unwrap_or(&f.rel).to_string();
                     items.push(Item {
                         icon: file_tree::icon_for(&name).to_string(),

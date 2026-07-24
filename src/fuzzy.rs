@@ -61,6 +61,9 @@ impl PreparedQuery {
 /// 貪欲な一回走査ではなく、DP で最良の割り付け (連続・境界ボーナスの合計が
 /// 最大になるマッチ位置の組) を選ぶ。O(query長 × target長)。
 /// 内部バッファのスタック化によりヒープ割当 0 (Zero-Allocation) で超高速に動作する。
+/// 呼び出し側のループは PreparedQuery を使うため、現在この直接形はテスト
+/// (PreparedQuery とのパリティ検証) からのみ参照される。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn score(query: &str, target: &str) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
