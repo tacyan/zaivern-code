@@ -728,203 +728,13 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
     }
 
     // パネルはコマンド/フックの出力先として参照されるので先に確定させる。
-    let mut panels: Vec<PluginPanel> = Vec::new();
-    for (i, p) in m.panels.into_iter().enumerate() {
-        let id = p.id.trim().to_lowercase();
-        if !valid_ident(&id) {
-            return Err(format!(
-                "panel[{i}].id が不正: {:?} (小文字英数と - _ のみ)",
-                p.id
-            ));
-        }
-        if panels.iter().any(|x: &PluginPanel| x.id == id) {
-            return Err(format!("panel[{i}].id が重複しています: {id:?}"));
-        }
-        let refresh = match p.refresh.trim() {
-            "" | "manual" => PanelRefresh::Manual,
-            "on_open" => PanelRefresh::OnOpen,
-            "interval" => PanelRefresh::Interval,
-            other => return Err(format!("panel[{i}].refresh が不正: {other:?}")),
-        };
-        let format = match p.format.trim() {
-            "" | "text" => PanelFormat::Text,
-            "markdown" => PanelFormat::Markdown,
-            other => return Err(format!("panel[{i}].format が不正: {other:?}")),
-        };
-        let interval_secs = if refresh == PanelRefresh::Interval {
-            let secs = p.interval_secs.unwrap_or(0);
-            if secs < MIN_INTERVAL_SECS {
-                return Err(format!(
-                    "panel[{i}]: refresh = \"interval\" には interval_secs = {MIN_INTERVAL_SECS} 以上が必要です"
-                ));
-            }
-            secs
-        } else {
-            0
-        };
-        if refresh != PanelRefresh::Manual && p.run.trim().is_empty() {
-            return Err(format!(
-                "panel[{i}]: refresh = {:?} には run が必要です",
-                p.refresh.trim()
-            ));
-        }
-        let title = if p.title.trim().is_empty() {
-            id.clone()
-        } else {
-            p.title.trim().to_string()
-        };
-        panels.push(PluginPanel {
-            id,
-            title,
-            icon: if p.icon.trim().is_empty() {
-                "📋".to_string()
-            } else {
-                p.icon.trim().to_string()
-            },
-            run: p.run.trim().to_string(),
-            refresh,
-            interval_secs,
-            format,
-            timeout_secs: p.timeout_secs.unwrap_or(30).clamp(1, 600),
-        });
-    }
+    let panels = parse_panels(m.panels)?;
 
-    let mut commands: Vec<PluginCommand> = Vec::new();
-    for (i, c) in m.commands.into_iter().enumerate() {
-        if c.title.trim().is_empty() || c.run.trim().is_empty() {
-            return Err(format!("command[{i}] に title / run が必要です"));
-        }
-        let input = match c.input.trim() {
-            "" | "none" => CmdInput::None,
-            "selection" => CmdInput::Selection,
-            "file" => CmdInput::File,
-            other => return Err(format!("command[{i}].input が不正: {other:?}")),
-        };
-        let sink = match CmdSink::parse(&c.output) {
-            Some(s) => s,
-            None => return Err(format!("command[{i}].output が不正: {:?}", c.output.trim())),
-        };
-        let output = sink.legacy();
-        // 保存時フックは「ファイル全体を整形して置き換える」動作に限定する
-        if c.on_save && (input != CmdInput::File || sink != CmdSink::Replace) {
-            return Err(format!(
-                "command[{i}]: on_save = true には input = \"file\", output = \"replace\" が必要です"
-            ));
-        }
-        let panel = check_panel_ref(&panels, sink, &c.panel, &format!("command[{i}]"))?;
-        let id = unique_id(&mut commands, &c.id, &c.title, i);
-        commands.push(PluginCommand {
-            id,
-            title: c.title.trim().to_string(),
-            icon: if c.icon.trim().is_empty() {
-                "🔌".to_string()
-            } else {
-                c.icon.trim().to_string()
-            },
-            run: c.run.trim().to_string(),
-            input,
-            output,
-            sink,
-            panel,
-            langs: c.langs.iter().map(|l| l.trim().to_lowercase()).collect(),
-            keybind: c.keybind.and_then(|k| {
-                let k = k.trim().to_string();
-                if k.is_empty() {
-                    None
-                } else {
-                    Some(k)
-                }
-            }),
-            on_save: c.on_save,
-            timeout_secs: c.timeout_secs.unwrap_or(30).clamp(1, 600),
-            event: None,
-        });
-    }
+    let commands = parse_commands(m.commands, &panels)?;
 
-    let mut hooks: Vec<PluginHook> = Vec::new();
-    for (i, h) in m.hooks.into_iter().enumerate() {
-        if h.run.trim().is_empty() {
-            return Err(format!("hook[{i}] に run が必要です"));
-        }
-        let Some(event) = HookEvent::parse(&h.event) else {
-            return Err(format!("hook[{i}].event が不正: {:?}", h.event.trim()));
-        };
-        let sink = match CmdSink::parse(if h.output.trim().is_empty() {
-            "silent"
-        } else {
-            &h.output
-        }) {
-            Some(s @ (CmdSink::Silent | CmdSink::Notify | CmdSink::Actions | CmdSink::Panel)) => s,
-            _ => {
-                return Err(format!(
-                    "hook[{i}].output が不正: {:?} (silent | notify | actions | panel)",
-                    h.output.trim()
-                ))
-            }
-        };
-        let interval_secs = if event == HookEvent::Interval {
-            let secs = h.interval_secs.unwrap_or(0);
-            if secs < MIN_INTERVAL_SECS {
-                return Err(format!(
-                    "hook[{i}]: event = \"interval\" には interval_secs = {MIN_INTERVAL_SECS} 以上が必要です"
-                ));
-            }
-            secs
-        } else {
-            0
-        };
-        let panel = check_panel_ref(&panels, sink, &h.panel, &format!("hook[{i}]"))?;
-        hooks.push(PluginHook {
-            event,
-            run: h.run.trim().to_string(),
-            interval_secs,
-            sink,
-            panel,
-            timeout_secs: h.timeout_secs.unwrap_or(30).clamp(1, 600),
-        });
-    }
+    let hooks = parse_hooks(m.hooks, &panels)?;
 
-    let mut settings: Vec<PluginSetting> = Vec::new();
-    for (i, s) in m.settings.into_iter().enumerate() {
-        let key = s.key.trim().to_string();
-        if !valid_ident(&key.to_lowercase()) {
-            return Err(format!(
-                "setting[{i}].key が不正: {:?} (英数と - _ のみ)",
-                s.key
-            ));
-        }
-        if settings.iter().any(|x: &PluginSetting| x.key == key) {
-            return Err(format!("setting[{i}].key が重複しています: {key:?}"));
-        }
-        let Some(kind) = SettingType::parse(&s.kind) else {
-            return Err(format!("setting[{i}].type が不正: {:?}", s.kind.trim()));
-        };
-        let default = match (&s.default, kind) {
-            (None, SettingType::Str) => String::new(),
-            (None, SettingType::Bool) => "false".to_string(),
-            (None, SettingType::Int) => "0".to_string(),
-            (Some(toml::Value::String(v)), SettingType::Str) => v.clone(),
-            (Some(toml::Value::Boolean(v)), SettingType::Bool) => v.to_string(),
-            (Some(toml::Value::Integer(v)), SettingType::Int) => v.to_string(),
-            (Some(v), _) => {
-                return Err(format!(
-                    "setting[{i}].default が type = {:?} と一致しません: {v}",
-                    kind.as_str()
-                ))
-            }
-        };
-        settings.push(PluginSetting {
-            key: key.clone(),
-            kind,
-            default,
-            label: if s.label.trim().is_empty() {
-                key
-            } else {
-                s.label.trim().to_string()
-            },
-            secret: s.secret,
-        });
-    }
+    let settings = parse_settings(m.settings)?;
 
     let themes = m
         .themes
@@ -998,6 +808,223 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
     };
     p.apply_settings(&HashMap::new()); // 既定値で初期化
     Ok(p)
+}
+
+/// `[[panel]]` 群を検証して PluginPanel に変換する（parse_manifest から抽出）。
+fn parse_panels(raw_panels: Vec<RawPanel>) -> Result<Vec<PluginPanel>, String> {
+    let mut panels: Vec<PluginPanel> = Vec::new();
+    for (i, p) in raw_panels.into_iter().enumerate() {
+        let id = p.id.trim().to_lowercase();
+        if !valid_ident(&id) {
+            return Err(format!(
+                "panel[{i}].id が不正: {:?} (小文字英数と - _ のみ)",
+                p.id
+            ));
+        }
+        if panels.iter().any(|x: &PluginPanel| x.id == id) {
+            return Err(format!("panel[{i}].id が重複しています: {id:?}"));
+        }
+        let refresh = match p.refresh.trim() {
+            "" | "manual" => PanelRefresh::Manual,
+            "on_open" => PanelRefresh::OnOpen,
+            "interval" => PanelRefresh::Interval,
+            other => return Err(format!("panel[{i}].refresh が不正: {other:?}")),
+        };
+        let format = match p.format.trim() {
+            "" | "text" => PanelFormat::Text,
+            "markdown" => PanelFormat::Markdown,
+            other => return Err(format!("panel[{i}].format が不正: {other:?}")),
+        };
+        let interval_secs = if refresh == PanelRefresh::Interval {
+            let secs = p.interval_secs.unwrap_or(0);
+            if secs < MIN_INTERVAL_SECS {
+                return Err(format!(
+                    "panel[{i}]: refresh = \"interval\" には interval_secs = {MIN_INTERVAL_SECS} 以上が必要です"
+                ));
+            }
+            secs
+        } else {
+            0
+        };
+        if refresh != PanelRefresh::Manual && p.run.trim().is_empty() {
+            return Err(format!(
+                "panel[{i}]: refresh = {:?} には run が必要です",
+                p.refresh.trim()
+            ));
+        }
+        let title = if p.title.trim().is_empty() {
+            id.clone()
+        } else {
+            p.title.trim().to_string()
+        };
+        panels.push(PluginPanel {
+            id,
+            title,
+            icon: if p.icon.trim().is_empty() {
+                "📋".to_string()
+            } else {
+                p.icon.trim().to_string()
+            },
+            run: p.run.trim().to_string(),
+            refresh,
+            interval_secs,
+            format,
+            timeout_secs: p.timeout_secs.unwrap_or(30).clamp(1, 600),
+        });
+    }
+    Ok(panels)
+}
+
+/// `[[command]]` 群を検証して PluginCommand に変換する（parse_manifest から抽出）。
+fn parse_commands(
+    raw_commands: Vec<RawCommand>,
+    panels: &[PluginPanel],
+) -> Result<Vec<PluginCommand>, String> {
+    let mut commands: Vec<PluginCommand> = Vec::new();
+    for (i, c) in raw_commands.into_iter().enumerate() {
+        if c.title.trim().is_empty() || c.run.trim().is_empty() {
+            return Err(format!("command[{i}] に title / run が必要です"));
+        }
+        let input = match c.input.trim() {
+            "" | "none" => CmdInput::None,
+            "selection" => CmdInput::Selection,
+            "file" => CmdInput::File,
+            other => return Err(format!("command[{i}].input が不正: {other:?}")),
+        };
+        let sink = match CmdSink::parse(&c.output) {
+            Some(s) => s,
+            None => return Err(format!("command[{i}].output が不正: {:?}", c.output.trim())),
+        };
+        let output = sink.legacy();
+        // 保存時フックは「ファイル全体を整形して置き換える」動作に限定する
+        if c.on_save && (input != CmdInput::File || sink != CmdSink::Replace) {
+            return Err(format!(
+                "command[{i}]: on_save = true には input = \"file\", output = \"replace\" が必要です"
+            ));
+        }
+        let panel = check_panel_ref(panels, sink, &c.panel, &format!("command[{i}]"))?;
+        let id = unique_id(&mut commands, &c.id, &c.title, i);
+        commands.push(PluginCommand {
+            id,
+            title: c.title.trim().to_string(),
+            icon: if c.icon.trim().is_empty() {
+                "🔌".to_string()
+            } else {
+                c.icon.trim().to_string()
+            },
+            run: c.run.trim().to_string(),
+            input,
+            output,
+            sink,
+            panel,
+            langs: c.langs.iter().map(|l| l.trim().to_lowercase()).collect(),
+            keybind: c.keybind.and_then(|k| {
+                let k = k.trim().to_string();
+                if k.is_empty() {
+                    None
+                } else {
+                    Some(k)
+                }
+            }),
+            on_save: c.on_save,
+            timeout_secs: c.timeout_secs.unwrap_or(30).clamp(1, 600),
+            event: None,
+        });
+    }
+    Ok(commands)
+}
+
+/// `[[hook]]` 群を検証して PluginHook に変換する（parse_manifest から抽出）。
+fn parse_hooks(raw_hooks: Vec<RawHook>, panels: &[PluginPanel]) -> Result<Vec<PluginHook>, String> {
+    let mut hooks: Vec<PluginHook> = Vec::new();
+    for (i, h) in raw_hooks.into_iter().enumerate() {
+        if h.run.trim().is_empty() {
+            return Err(format!("hook[{i}] に run が必要です"));
+        }
+        let Some(event) = HookEvent::parse(&h.event) else {
+            return Err(format!("hook[{i}].event が不正: {:?}", h.event.trim()));
+        };
+        let sink = match CmdSink::parse(if h.output.trim().is_empty() {
+            "silent"
+        } else {
+            &h.output
+        }) {
+            Some(s @ (CmdSink::Silent | CmdSink::Notify | CmdSink::Actions | CmdSink::Panel)) => s,
+            _ => {
+                return Err(format!(
+                    "hook[{i}].output が不正: {:?} (silent | notify | actions | panel)",
+                    h.output.trim()
+                ))
+            }
+        };
+        let interval_secs = if event == HookEvent::Interval {
+            let secs = h.interval_secs.unwrap_or(0);
+            if secs < MIN_INTERVAL_SECS {
+                return Err(format!(
+                    "hook[{i}]: event = \"interval\" には interval_secs = {MIN_INTERVAL_SECS} 以上が必要です"
+                ));
+            }
+            secs
+        } else {
+            0
+        };
+        let panel = check_panel_ref(panels, sink, &h.panel, &format!("hook[{i}]"))?;
+        hooks.push(PluginHook {
+            event,
+            run: h.run.trim().to_string(),
+            interval_secs,
+            sink,
+            panel,
+            timeout_secs: h.timeout_secs.unwrap_or(30).clamp(1, 600),
+        });
+    }
+    Ok(hooks)
+}
+
+/// `[[setting]]` 群を検証して PluginSetting に変換する（parse_manifest から抽出）。
+fn parse_settings(raw_settings: Vec<RawSetting>) -> Result<Vec<PluginSetting>, String> {
+    let mut settings: Vec<PluginSetting> = Vec::new();
+    for (i, s) in raw_settings.into_iter().enumerate() {
+        let key = s.key.trim().to_string();
+        if !valid_ident(&key.to_lowercase()) {
+            return Err(format!(
+                "setting[{i}].key が不正: {:?} (英数と - _ のみ)",
+                s.key
+            ));
+        }
+        if settings.iter().any(|x: &PluginSetting| x.key == key) {
+            return Err(format!("setting[{i}].key が重複しています: {key:?}"));
+        }
+        let Some(kind) = SettingType::parse(&s.kind) else {
+            return Err(format!("setting[{i}].type が不正: {:?}", s.kind.trim()));
+        };
+        let default = match (&s.default, kind) {
+            (None, SettingType::Str) => String::new(),
+            (None, SettingType::Bool) => "false".to_string(),
+            (None, SettingType::Int) => "0".to_string(),
+            (Some(toml::Value::String(v)), SettingType::Str) => v.clone(),
+            (Some(toml::Value::Boolean(v)), SettingType::Bool) => v.to_string(),
+            (Some(toml::Value::Integer(v)), SettingType::Int) => v.to_string(),
+            (Some(v), _) => {
+                return Err(format!(
+                    "setting[{i}].default が type = {:?} と一致しません: {v}",
+                    kind.as_str()
+                ))
+            }
+        };
+        settings.push(PluginSetting {
+            key: key.clone(),
+            kind,
+            default,
+            label: if s.label.trim().is_empty() {
+                key
+            } else {
+                s.label.trim().to_string()
+            },
+            secret: s.secret,
+        });
+    }
+    Ok(settings)
 }
 
 /// `output = "panel"` のときだけパネル参照を要求し、実在するIDか検証する。
@@ -2224,6 +2251,46 @@ input = "clipboard"
         assert_eq!(p.commands[0].output, CmdOutput::Notify);
         assert_eq!(p.commands[0].timeout_secs, 30);
         assert!(p.commands[0].lang_matches("rust"), "langs 空 = 全言語");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn parse_manifest_error_messages_are_stable() {
+        let d = temp_dir("errmsg");
+
+        // panel 段: refresh の不正値はメッセージごと固定
+        std::fs::write(
+            d.join("plugin.toml"),
+            "[plugin]\nname = \"bad\"\n[[panel]]\nid = \"p\"\nrefresh = \"often\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_manifest(&d).unwrap_err(),
+            "panel[0].refresh が不正: \"often\""
+        );
+
+        // command 段: title / run 欠落
+        std::fs::write(
+            d.join("plugin.toml"),
+            "[plugin]\nname = \"bad\"\n[[command]]\ntitle = \"\"\nrun = \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_manifest(&d).unwrap_err(),
+            "command[0] に title / run が必要です"
+        );
+
+        // hook 段: event の不正値
+        std::fs::write(
+            d.join("plugin.toml"),
+            "[plugin]\nname = \"bad\"\n[[hook]]\nevent = \"nope\"\nrun = \"true\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_manifest(&d).unwrap_err(),
+            "hook[0].event が不正: \"nope\""
+        );
+
         let _ = std::fs::remove_dir_all(&d);
     }
 
