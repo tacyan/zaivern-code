@@ -223,6 +223,152 @@ pub fn move_line(text: &str, cursor_char: usize, up: bool) -> (String, usize) {
     (new_text, new_cursor)
 }
 
+/// カーソル位置 (char) の括弧に対応する相手の括弧位置 (char) を返す。
+/// カーソル直後の文字、なければ直前の文字を括弧として解釈する (VS Code と同じ)。
+/// 文字列/コメントは考慮しない素朴なネスト数えだが、実用上は十分。
+pub fn matching_bracket(text: &str, cursor_char: usize) -> Option<usize> {
+    // `<>` は比較演算子と区別できないため対象にしない (VS Code も既定では対象外)
+    const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let cursor = cursor_char.min(chars.len());
+    // カーソル直後 → 直前の順で括弧を探す
+    let (pos, ch) = if cursor < chars.len() && is_bracket(chars[cursor], &PAIRS) {
+        (cursor, chars[cursor])
+    } else if cursor > 0 && is_bracket(chars[cursor - 1], &PAIRS) {
+        (cursor - 1, chars[cursor - 1])
+    } else {
+        return None;
+    };
+    let (open, close, forward) = PAIRS
+        .iter()
+        .find_map(|&(o, c)| {
+            if ch == o {
+                Some((o, c, true))
+            } else if ch == c {
+                Some((o, c, false))
+            } else {
+                None
+            }
+        })?;
+    let mut depth = 0i64;
+    if forward {
+        for (i, &c) in chars.iter().enumerate().skip(pos) {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+    } else {
+        for i in (0..=pos).rev() {
+            let c = chars[i];
+            if c == close {
+                depth += 1;
+            } else if c == open {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_bracket(c: char, pairs: &[(char, char)]) -> bool {
+    pairs.iter().any(|&(o, cl)| c == o || c == cl)
+}
+
+/// 大文字小文字を無視して `start_char` 以降 (見つからなければ先頭から) を検索。
+/// ヒットの char 位置を返す。app.rs の find_next と同じフォールバック規則。
+pub fn find_ci(text: &str, query: &str, start_char: usize) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+    let hay_lower = text.to_lowercase();
+    let needle_lower = query.to_lowercase();
+    let (hay, needle): (&str, &str) = if hay_lower.len() == text.len() {
+        (&hay_lower, &needle_lower)
+    } else {
+        (text, query)
+    };
+    let start_byte = char_to_byte(text, start_char);
+    let byte_pos = hay[start_byte.min(hay.len())..]
+        .find(needle)
+        .map(|p| p + start_byte)
+        .or_else(|| hay.find(needle))?;
+    Some(text[..byte_pos].chars().count())
+}
+
+/// 大文字小文字を無視した全置換。(新text, 置換件数)。
+/// query が空なら無変更。置換文字列に query を含んでも無限ループしない。
+pub fn replace_all_ci(text: &str, query: &str, rep: &str) -> (String, usize) {
+    if query.is_empty() {
+        return (text.to_string(), 0);
+    }
+    let hay_lower = text.to_lowercase();
+    let needle_lower = query.to_lowercase();
+    let (hay, needle): (&str, &str) = if hay_lower.len() == text.len() {
+        (&hay_lower, &needle_lower)
+    } else {
+        (text, query)
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut count = 0usize;
+    let mut byte = 0usize;
+    while let Some(p) = hay[byte..].find(needle) {
+        let at = byte + p;
+        out.push_str(&text[byte..at]);
+        out.push_str(rep);
+        count += 1;
+        byte = at + needle.len();
+    }
+    out.push_str(&text[byte..]);
+    (out, count)
+}
+
+/// char 位置の行番号 (0-based) を返す。スクロール計算用。
+pub fn line_of_char(text: &str, char_idx: usize) -> usize {
+    text.chars().take(char_idx).filter(|c| *c == '\n').count()
+}
+
+/// (行, 桁) [0-based, char 単位] を char インデックスへ変換する。
+/// 行・桁とも実在範囲へクランプする。
+pub fn char_index_at(text: &str, line: usize, col: usize) -> usize {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line = line.min(lines.len().saturating_sub(1));
+    let mut idx = 0usize;
+    for l in lines.iter().take(line) {
+        idx += l.chars().count() + 1;
+    }
+    idx + col.min(lines[line].chars().count())
+}
+
+/// 「行[:列]」形式 (1-based) をパースして 0-based の (行, 列) を返す。
+/// 例: "42" -> (41, 0) / "42:5" -> (41, 4)。数値でなければ None。
+pub fn parse_goto(s: &str) -> Option<(usize, usize)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (l, c) = match s.split_once([':', ',']) {
+        Some((l, c)) => (l.trim(), Some(c.trim())),
+        None => (s, None),
+    };
+    let line: usize = l.parse().ok()?;
+    let col: usize = match c {
+        Some("") | None => 1,
+        Some(c) => c.parse().ok()?,
+    };
+    Some((line.saturating_sub(1), col.saturating_sub(1)))
+}
+
 /// syntect の言語名から行コメントプレフィックスを返す。不明なら None。
 pub fn comment_prefix_for(lang: &str) -> Option<&'static str> {
     let l = lang.to_ascii_lowercase();
@@ -397,6 +543,99 @@ mod tests {
         let (t, c) = move_line("あい\nうえ\nお", 1, false);
         assert_eq!(t, "うえ\nあい\nお");
         assert_eq!(c, 4); // "うえ\n" = 3 chars + col 1
+    }
+
+    // ---- matching_bracket ----
+
+    #[test]
+    fn bracket_forward_and_backward() {
+        //            0123456789
+        let text = "fn f(a, b) {}";
+        assert_eq!(matching_bracket(text, 4), Some(9)); // カーソルが ( の直前
+        assert_eq!(matching_bracket(text, 10), Some(4)); // ) の直後 → 相手の (
+        assert_eq!(matching_bracket(text, 11), Some(12)); // { → }
+    }
+
+    #[test]
+    fn bracket_nested_pairs() {
+        let text = "((a)[b])";
+        assert_eq!(matching_bracket(text, 0), Some(7));
+        assert_eq!(matching_bracket(text, 1), Some(3));
+        assert_eq!(matching_bracket(text, 4), Some(6));
+    }
+
+    #[test]
+    fn bracket_none_when_not_on_bracket_or_unbalanced() {
+        assert_eq!(matching_bracket("abc", 1), None);
+        assert_eq!(matching_bracket("(abc", 0), None);
+        assert_eq!(matching_bracket("", 0), None);
+    }
+
+    #[test]
+    fn bracket_multibyte_safe() {
+        let text = "「(あ)」";
+        assert_eq!(matching_bracket(text, 1), Some(3));
+    }
+
+    // ---- find_ci / replace_all_ci ----
+
+    #[test]
+    fn find_ci_wraps_and_ignores_case() {
+        assert_eq!(find_ci("Hello World", "world", 0), Some(6));
+        // start 以降に無ければ先頭へ戻る
+        assert_eq!(find_ci("Hello World", "hello", 6), Some(0));
+        assert_eq!(find_ci("abc", "zzz", 0), None);
+        assert_eq!(find_ci("abc", "", 0), None);
+    }
+
+    #[test]
+    fn replace_all_ci_counts_and_replaces() {
+        let (t, n) = replace_all_ci("foo Foo FOO bar", "foo", "x");
+        assert_eq!(t, "x x x bar");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn replace_all_ci_rep_containing_query_terminates() {
+        let (t, n) = replace_all_ci("aaa", "a", "aa");
+        assert_eq!(t, "aaaaaa");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn replace_all_ci_japanese() {
+        let (t, n) = replace_all_ci("こんにちは世界。世界!", "世界", "World");
+        assert_eq!(t, "こんにちはWorld。World!");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn line_of_char_counts_newlines() {
+        assert_eq!(line_of_char("a\nb\nc", 0), 0);
+        assert_eq!(line_of_char("a\nb\nc", 2), 1);
+        assert_eq!(line_of_char("a\nb\nc", 4), 2);
+    }
+
+    // ---- char_index_at / parse_goto ----
+
+    #[test]
+    fn char_index_at_clamps_line_and_col() {
+        let text = "ab\nこんにちは\nxyz";
+        assert_eq!(char_index_at(text, 0, 0), 0);
+        assert_eq!(char_index_at(text, 1, 2), 5); // "ab\n" = 3 chars + 2
+        assert_eq!(char_index_at(text, 1, 99), 8); // 行末へクランプ
+        assert_eq!(char_index_at(text, 99, 0), 9); // 最終行へクランプ
+    }
+
+    #[test]
+    fn parse_goto_line_and_col() {
+        assert_eq!(parse_goto("42"), Some((41, 0)));
+        assert_eq!(parse_goto("42:5"), Some((41, 4)));
+        assert_eq!(parse_goto(" 7 , 3 "), Some((6, 2)));
+        assert_eq!(parse_goto("1:"), Some((0, 0)));
+        assert_eq!(parse_goto(""), None);
+        assert_eq!(parse_goto("abc"), None);
+        assert_eq!(parse_goto("0"), Some((0, 0))); // 0 は 1 行目扱い
     }
 
     // ---- comment_prefix_for ----

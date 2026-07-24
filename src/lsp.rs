@@ -194,6 +194,15 @@ enum Pending {
     Initialize,
     Completion,
     Hover,
+    Definition,
+}
+
+/// textDocument/definition の結果 (先頭の 1 件)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefinitionLoc {
+    pub path: PathBuf,
+    pub line: usize, // 0-based
+    pub col: usize,  // UTF-16 code unit
 }
 
 struct Shared {
@@ -205,8 +214,11 @@ struct Shared {
     pending: Mutex<HashMap<u64, Pending>>,
     completion: Mutex<Option<Vec<CompletionItem>>>,
     hover: Mutex<Option<HoverInfo>>,
+    /// 外側 Some = 応答受信済み。内側 None = 定義が見つからなかった。
+    definition: Mutex<Option<Option<DefinitionLoc>>>,
     latest_completion: AtomicU64,
     latest_hover: AtomicU64,
+    latest_definition: AtomicU64,
 }
 
 impl Shared {
@@ -218,8 +230,10 @@ impl Shared {
             pending: Mutex::new(HashMap::new()),
             completion: Mutex::new(None),
             hover: Mutex::new(None),
+            definition: Mutex::new(None),
             latest_completion: AtomicU64::new(0),
             latest_hover: AtomicU64::new(0),
+            latest_definition: AtomicU64::new(0),
         }
     }
 }
@@ -335,7 +349,8 @@ impl LspClient {
                     "synchronization": { "didSave": false },
                     "publishDiagnostics": { "relatedInformation": false },
                     "completion": { "completionItem": { "snippetSupport": false } },
-                    "hover": { "contentFormat": ["plaintext", "markdown"] }
+                    "hover": { "contentFormat": ["plaintext", "markdown"] },
+                    "definition": { "linkSupport": true }
                 }
             },
             "workspaceFolders": [{ "uri": root_uri, "name": root_name }]
@@ -460,6 +475,28 @@ impl LspClient {
 
     pub fn poll_hover(&self) -> Option<HoverInfo> {
         self.shared.hover.lock().unwrap().take()
+    }
+
+    /// 定義へ移動 (VS Code: F12)。応答は poll_definition で受け取る。
+    pub fn request_definition(&self, path: &Path, line: usize, col: usize) {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        *self.shared.definition.lock().unwrap() = None;
+        self.shared.latest_definition.store(id, Ordering::SeqCst);
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id, Pending::Definition);
+        let params = json!({
+            "textDocument": { "uri": path_to_uri(&canonical(path)) },
+            "position": { "line": line, "character": col }
+        });
+        self.request_raw(id, "textDocument/definition", params);
+    }
+
+    /// 外側 Some = 応答あり (一度で消費)。内側 None = 定義が見つからなかった。
+    pub fn poll_definition(&self) -> Option<Option<DefinitionLoc>> {
+        self.shared.definition.lock().unwrap().take()
     }
 
     /// shutdown/exit 送信 + kill。Drop でも kill される。
@@ -599,6 +636,11 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, tx: &mpsc::Sender<Value>) {
                         *shared.hover.lock().unwrap() = Some(HoverInfo { contents });
                     }
                 }
+                Some(Pending::Definition) => {
+                    if shared.latest_definition.load(Ordering::SeqCst) == id {
+                        *shared.definition.lock().unwrap() = Some(parse_definition(&result));
+                    }
+                }
                 None => {}
             }
         }
@@ -618,6 +660,34 @@ fn handle_publish_diagnostics(params: &Value, shared: &Arc<Shared>) {
         .map(|arr| arr.iter().filter_map(parse_diagnostic).collect())
         .unwrap_or_default();
     shared.diags.lock().unwrap().insert(path, diags);
+}
+
+/// textDocument/definition の結果から先頭 1 件を取り出す。
+/// 形式は Location | Location[] | LocationLink[] | null (LSP 仕様)。
+fn parse_definition(result: &Value) -> Option<DefinitionLoc> {
+    let first = if result.is_array() {
+        result.as_array()?.first()?
+    } else {
+        result
+    };
+    // LocationLink (targetUri + targetSelectionRange) を先に試す
+    let (uri, range) = if let Some(u) = first.get("targetUri").and_then(|u| u.as_str()) {
+        let r = first
+            .get("targetSelectionRange")
+            .or_else(|| first.get("targetRange"))?;
+        (u, r)
+    } else {
+        (
+            first.get("uri").and_then(|u| u.as_str())?,
+            first.get("range")?,
+        )
+    };
+    let start = range.get("start")?;
+    Some(DefinitionLoc {
+        path: uri_to_path(uri),
+        line: start.get("line").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+        col: start.get("character").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+    })
 }
 
 fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
@@ -707,6 +777,50 @@ fn hover_text(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- parse_definition ----
+
+    #[test]
+    fn parse_definition_single_location() {
+        let v = serde_json::json!({
+            "uri": "file:///a/b.rs",
+            "range": { "start": { "line": 3, "character": 7 }, "end": { "line": 3, "character": 9 } }
+        });
+        assert_eq!(
+            parse_definition(&v),
+            Some(DefinitionLoc { path: PathBuf::from("/a/b.rs"), line: 3, col: 7 })
+        );
+    }
+
+    #[test]
+    fn parse_definition_location_array_takes_first() {
+        let v = serde_json::json!([
+            { "uri": "file:///x.py", "range": { "start": { "line": 1, "character": 0 } } },
+            { "uri": "file:///y.py", "range": { "start": { "line": 9, "character": 9 } } }
+        ]);
+        let got = parse_definition(&v).unwrap();
+        assert_eq!(got.path, PathBuf::from("/x.py"));
+        assert_eq!((got.line, got.col), (1, 0));
+    }
+
+    #[test]
+    fn parse_definition_location_link_and_percent_decode() {
+        let v = serde_json::json!([{
+            "targetUri": "file:///dir%20name/f.ts",
+            "targetRange": { "start": { "line": 5, "character": 2 } },
+            "targetSelectionRange": { "start": { "line": 6, "character": 4 } }
+        }]);
+        let got = parse_definition(&v).unwrap();
+        // targetSelectionRange を優先し、%20 はデコードされる
+        assert_eq!(got.path, PathBuf::from("/dir name/f.ts"));
+        assert_eq!((got.line, got.col), (6, 4));
+    }
+
+    #[test]
+    fn parse_definition_null_or_empty_is_none() {
+        assert_eq!(parse_definition(&Value::Null), None);
+        assert_eq!(parse_definition(&serde_json::json!([])), None);
+    }
 
     // ---- encode / FrameDecoder ----
 
