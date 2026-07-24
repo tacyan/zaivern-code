@@ -311,6 +311,27 @@ pub struct ZaivernApp {
     /// キーボードショートカット一覧 / バージョン情報ダイアログ
     shortcuts_open: bool,
     about_open: bool,
+    /// 疑似フルスクリーン (枠なし最大化) 中なら復帰用の元ジオメトリ (outer 左上, inner サイズ)。
+    /// macOS のネイティブ全画面は縦オフセット配置のサブディスプレイでウィンドウが
+    /// モニタより大きく作られ、描画と当たり判定がずれて UI 全体が効かなくなる
+    /// (winit 0.30 の実測バグ)。その環境ではこちらの方式で全画面相当にする。
+    fake_fullscreen: Option<(egui::Pos2, egui::Vec2)>,
+    /// ネイティブ全画面が壊れると実測されたモニタサイズ (セッション内学習)。
+    /// 以後の全画面切替は最初から疑似フルスクリーンを使う。
+    broken_native_fs: Vec<egui::Vec2>,
+    /// 壊れたネイティブ全画面から脱出中 (解除完了を待って疑似フルスクリーンへ入る)。
+    fs_rescue_pending: bool,
+    /// 救出開始時点の壊れた inner_rect。解除アニメーションが終わって矩形が
+    /// ここから変化したことを「解除完了」の合図にする。
+    fs_rescue_from: Option<egui::Rect>,
+    /// 救出 (Fullscreen(false) 送信) を開始した時刻。長時間変化が無ければ
+    /// 解除コマンドが取りこぼされたと判断して諦める。
+    fs_rescue_at: Option<Instant>,
+    /// 解除後の矩形が変化してからの安定計測 (0.4 秒続いたら疑似フルスクリーンへ)。
+    fs_settle_since: Option<Instant>,
+    /// 全画面ジオメトリ不一致を最初に観測した時刻 (遷移アニメ中の揺れと区別するため
+    /// 0.5 秒持続してから壊れていると確定する)。
+    fs_broken_since: Option<Instant>,
     /// ファイル横断検索 (サイドバーの検索タブ)
     gsearch: GlobalSearchState,
     /// ナビゲーション履歴 (パス, カーソル char)。戻る/進む用
@@ -687,6 +708,13 @@ impl ZaivernApp {
             problems_open: false,
             shortcuts_open: false,
             about_open: false,
+            fake_fullscreen: None,
+            broken_native_fs: Vec::new(),
+            fs_rescue_pending: false,
+            fs_rescue_from: None,
+            fs_rescue_at: None,
+            fs_settle_since: None,
+            fs_broken_since: None,
             gsearch: GlobalSearchState::new(),
             nav_history: Vec::new(),
             nav_index: 0,
@@ -2753,7 +2781,22 @@ impl ZaivernApp {
             Cmd::ToggleProblems => self.problems_open = !self.problems_open,
             Cmd::ToggleFullScreen => {
                 let cur = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!cur));
+                if self.fake_fullscreen.is_some() {
+                    self.exit_fake_fullscreen(ctx);
+                } else if cur {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                } else {
+                    // このモニタでネイティブ全画面が壊れると学習済みなら最初から疑似で
+                    let mon = ctx.input(|i| i.viewport().monitor_size);
+                    let known_broken = mon.is_some_and(|m| {
+                        self.broken_native_fs.iter().any(|b| (*b - m).length() < 1.0)
+                    });
+                    if known_broken {
+                        self.enter_fake_fullscreen(ctx);
+                    } else {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    }
+                }
             }
             Cmd::NavBack => self.nav_go(-1),
             Cmd::NavForward => self.nav_go(1),
@@ -3223,6 +3266,131 @@ impl ZaivernApp {
         }
     }
 
+    // ─── フルスクリーン ─────────────────────────────────────────────
+    //
+    // macOS + winit 0.30 は「縦オフセット配置のサブディスプレイ」でネイティブ
+    // 全画面にすると、ウィンドウ/レイアウトをモニタ実寸より大きく作ってしまう
+    // (実測: 1080 の外部モニタで縦 1120 = メインとの配置差 40px ぶん過大)。
+    // 描画は画面に押し込まれ、当たり判定は素の座標のままなので、メニューも
+    // ファイルツリーも「見えている場所を押しても効かない」状態になる。
+    // フルスクリーン中のリサイズ命令は AppKit が拒否して全画面が解除される
+    // だけなので、その場では直せない。→ 検知したら全画面を抜け、枠なし最大化
+    // (疑似フルスクリーン) に切り替える。健全なディスプレイでは何もしない。
+
+    /// 毎フレーム: 壊れたネイティブ全画面 (ウィンドウがモニタより大きい) を
+    /// 検知したら解除し、解除が完了したフレームで疑似フルスクリーンへ入る。
+    fn fullscreen_guard(&mut self, ctx: &egui::Context) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let (fs, inner, mon) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.fullscreen.unwrap_or(false), v.inner_rect, v.monitor_size)
+        });
+        if fs {
+            let broken = match (inner, mon) {
+                (Some(r), Some(m)) => r.width() > m.x + 1.0 || r.height() > m.y + 1.0,
+                _ => false,
+            };
+            if !broken {
+                self.fs_broken_since = None;
+                return;
+            }
+            // 進入アニメーション (~1秒) の最中に Fullscreen(false) を送ると winit が
+            // 取りこぼし、「フラグは解除・実体は全画面のまま」で固まる (実測)。
+            // アニメが確実に終わる 1.5 秒までは判定を確定させない。
+            let since = *self.fs_broken_since.get_or_insert_with(Instant::now);
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            if since.elapsed().as_millis() >= 1500 && !self.fs_rescue_pending {
+                self.fs_rescue_pending = true;
+                self.fs_rescue_from = inner;
+                self.fs_rescue_at = Some(Instant::now());
+                self.fs_settle_since = None;
+                if let Some(m) = mon {
+                    if !self.broken_native_fs.iter().any(|b| (*b - m).length() < 1.0) {
+                        self.broken_native_fs.push(m);
+                    }
+                }
+                // 稀な環境依存の分岐なので、あとから追えるよう痕跡を残す
+                eprintln!(
+                    "zaivern: broken native fullscreen detected (window={:?} > monitor={:?}) — \
+                     switching to borderless maximize",
+                    inner.map(|r| r.size()),
+                    mon
+                );
+                self.toast(
+                    tr("このディスプレイのネイティブ全画面は表示がずれるため、\
+                        全画面相当の最大化へ切り替えます (ESC で元に戻せます)"),
+                    true,
+                );
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+        } else {
+            self.fs_broken_since = None;
+            if self.fs_rescue_pending {
+                // 全画面解除のアニメーション中に styleMask/zoom を触ると AppKit が
+                // NSException を投げてプロセスごと落ちる (実測)。fullscreen フラグは
+                // アニメより先に false になるので、「矩形が救出開始時の壊れた値から
+                // 実際に変化して 0.4 秒安定した」ことを解除完了の合図にする。
+                let moved = match (inner, self.fs_rescue_from) {
+                    (Some(now), Some(from)) => {
+                        (now.min - from.min).length() > 1.0
+                            || (now.size() - from.size()).length() > 1.0
+                    }
+                    _ => inner.is_some(),
+                };
+                if moved {
+                    let since = *self.fs_settle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed().as_millis() >= 400 {
+                        self.fs_rescue_pending = false;
+                        self.fs_rescue_from = None;
+                        self.fs_rescue_at = None;
+                        self.fs_settle_since = None;
+                        self.enter_fake_fullscreen(ctx);
+                    }
+                } else {
+                    self.fs_settle_since = None;
+                    // 解除コマンドが取りこぼされて実体が全画面のまま固まったら、
+                    // これ以上は触らず諦める (この状態で styleMask を触ると落ちる)。
+                    if self.fs_rescue_at.is_some_and(|at| at.elapsed().as_secs() >= 6) {
+                        eprintln!(
+                            "zaivern: fullscreen exit seems lost — giving up rescue \
+                             (use the green button / Mission Control to leave fullscreen)"
+                        );
+                        self.fs_rescue_pending = false;
+                        self.fs_rescue_from = None;
+                        self.fs_rescue_at = None;
+                    }
+                }
+                // 入力が無くても状態機械が進むようフレームを回し続ける
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    /// 疑似フルスクリーン: 現在ジオメトリを覚えてから枠を消して最大化する。
+    fn enter_fake_fullscreen(&mut self, ctx: &egui::Context) {
+        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        let restore = match (outer, inner) {
+            (Some(o), Some(inn)) => (o.min, inn.size()),
+            _ => (egui::pos2(80.0, 80.0), egui::vec2(1280.0, 860.0)),
+        };
+        self.fake_fullscreen = Some(restore);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+    }
+
+    /// 疑似フルスクリーンから復帰。Maximized(false) はゾーン前の枠を正しく
+    /// 戻さないことがある (実測: 幅が変わる) ので、覚えた位置/サイズを明示的に戻す。
+    fn exit_fake_fullscreen(&mut self, ctx: &egui::Context) {
+        if let Some((pos, size)) = self.fake_fullscreen.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
         let consume = |ctx: &egui::Context, sc: KeyboardShortcut| -> bool {
@@ -3383,6 +3551,24 @@ impl ZaivernApp {
             if pgdn {
                 pages.push(false);
             }
+        }
+
+        // ESC でフルスクリーン解除 (macOS 標準の感覚)。ESC を使う相手がいる間は
+        // 奪わない: パレット/検索/各小窓が開いている・メニュー等のポップアップが
+        // 出ている・エディタやターミナルにフォーカスがある (vim の ESC 等) とき。
+        // それらが閉じた/外れたあとの「素の ESC」だけがフルスクリーンを解除する。
+        if (ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
+            || self.fake_fullscreen.is_some())
+            && !self.palette.open
+            && !self.find.open
+            && !self.goto_open
+            && !self.shortcuts_open
+            && !self.about_open
+            && !self.remote_open
+            && ctx.memory(|m| m.focused().is_none() && !m.any_popup_open())
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            cmds.push(Cmd::ToggleFullScreen);
         }
 
         for c in cmds {
@@ -8761,6 +8947,8 @@ impl ZaivernApp {
 
 impl eframe::App for ZaivernApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 壊れたネイティブ全画面の検知と疑似フルスクリーンへの救出 (macOS)
+        self.fullscreen_guard(ctx);
         // 低頻度の定期フレームを必ず予約しておく。
         //
         // スマホリモートと CLI (`zai notify` など) からの要求は、UI スレッドが
@@ -9586,7 +9774,8 @@ impl ZaivernApp {
             terminal_open: self.agents.panel_open,
             cockpit_open: self.cockpit,
             problems_open: self.problems_open,
-            fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
+            fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
+                || self.fake_fullscreen.is_some(),
             auto_save: self.menu_state.auto_save,
             has_editor: self.editor.active.is_some(),
             has_file: active_path.is_some(),
@@ -11458,7 +11647,7 @@ mod super_agent_tests {
             ]
         };
 
-        let mut draw = |active: &mut usize, events: Vec<egui::Event>| -> Vec<Rect> {
+        let draw = |active: &mut usize, events: Vec<egui::Event>| -> Vec<Rect> {
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(980.0, 420.0))),
                 events,

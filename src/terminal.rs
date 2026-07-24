@@ -3,7 +3,7 @@ use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -56,6 +56,15 @@ pub struct Session {
     /// あとに立て、同じプロンプトが画面に残っていても二度目の応答・再検出をしない。
     /// プロンプトが画面から消える、または別のプロンプトに変わったら下ろす。
     answered_sig: Option<u64>,
+    /// 自動YESの停滞監視: 自動応答したのにプロンプトが固まったままのとき、
+    /// 「画面が意味的に変化していない時間」の起点。自動YESが送った応答にだけ立て、
+    /// ユーザーの手動応答 (resolve_attention 経由) では None に戻す — 手動運転中に
+    /// 勝手な再送をしないため。画面が変化するたびに現在時刻へ引き直す。
+    auto_stall_since: Option<Instant>,
+    /// 停滞監視の基準となる意味的画面ハッシュ (auto_stall_since とペア)。
+    auto_stall_hash: u64,
+    /// 自動YESの再送までの停滞時間。既定 30 秒 (テストで短縮する)。
+    auto_yes_resend_after: Duration,
     /// マウスドラッグによる文字選択: (開始セル, 終了セル)。(row, col) の画面表示座標。
     pub selection: Option<((u16, u16), (u16, u16))>,
     /// ドラッグ選択のアンカー(ドラッグ開始セル)。
@@ -862,6 +871,9 @@ impl Session {
             launched_bypass,
             last_scan: Instant::now(),
             answered_sig: None,
+            auto_stall_since: None,
+            auto_stall_hash: 0,
+            auto_yes_resend_after: Duration::from_secs(30),
             selection: None,
             sel_anchor: None,
             copied_at: None,
@@ -973,6 +985,7 @@ impl Session {
         let sig = if present { Some(prompt_signature(&text)) } else { None };
         if self.answered_sig.is_some() && self.answered_sig != sig {
             self.answered_sig = None;
+            self.auto_stall_since = None;
         }
         let waiting = present && self.answered_sig.is_none();
         let newly = waiting && !self.attention;
@@ -983,9 +996,30 @@ impl Session {
                 // (再送は Claude 側の入力欄への Enter/y 連打事故になる)。
                 // 指紋が変わって別のプロンプトが来たときだけ、また一度応答する。
                 self.answered_sig = sig;
+                self.auto_stall_since = Some(Instant::now());
+                self.auto_stall_hash = self.cur_hash;
                 self.write_bytes(bytes);
                 self.attention = false;
                 return Some(Attention::AutoReplied(desc));
+            }
+        }
+        // 自動YESの停滞ウォッチドッグ: 自動応答したのに同じプロンプトのまま
+        // 画面が 30 秒間まったく変化しない (= 応答が取りこぼされた) 場合だけ、
+        // もう一度だけ応答を送る。以後も停滞が続けば 30 秒おきに繰り返す。
+        // 出力が流れている間 (cur_hash が動く間) は「進んでいる」ので送らない —
+        // 応答済みプロンプトが画面に残っているだけの状態への連打事故を防ぐ。
+        if auto_yes && present && self.answered_sig == sig {
+            if let Some(since) = self.auto_stall_since {
+                if self.cur_hash != self.auto_stall_hash {
+                    self.auto_stall_hash = self.cur_hash;
+                    self.auto_stall_since = Some(Instant::now());
+                } else if since.elapsed() >= self.auto_yes_resend_after {
+                    if let Some((bytes, desc)) = reply {
+                        self.auto_stall_since = Some(Instant::now());
+                        self.write_bytes(bytes);
+                        return Some(Attention::AutoReplied(desc));
+                    }
+                }
             }
         }
         if newly {
@@ -1124,6 +1158,9 @@ impl Session {
         self.attention = false;
         let text = self.parser.lock().unwrap().screen().contents();
         self.answered_sig = Some(prompt_signature(&text));
+        // 手動 (バブル/手入力) で解決したエピソードは停滞ウォッチドッグの対象外。
+        // ユーザーが自分の意思で操作している最中に勝手な再送をしない。
+        self.auto_stall_since = None;
     }
 
     /// バブルの「✔ 承認」で送るキー列を、いま画面に出ているプロンプトから決める。
@@ -1623,6 +1660,63 @@ mod tests {
         }
         assert_eq!(replies, 1, "同じプロンプトへ自動YESが再送された(Enter連打バグ)");
         assert!(!s.attention, "応答済みの間はバブル表示条件(attention)が立たない");
+        s.kill();
+    }
+
+    #[test]
+    fn auto_yes_resends_after_stall_timeout() {
+        use super::{Attention, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        // 自動YESの応答 (y\r) を無視してプロンプトが固まったままの子。
+        // 「YESを送ったのに効かず 30 秒止まる」停滞を再現する (テストは 2 秒に短縮)。
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let spec = SpawnSpec {
+            title: "stall-resend".into(),
+            preset_name: "test".into(),
+            icon: "⏳".into(),
+            command: cmd.into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s =
+            Session::spawn(992, spec, eframe::egui::Context::default()).expect("PTY起動");
+        s.auto_yes_resend_after = Duration::from_secs(2);
+
+        // 1) 最初の自動YES
+        let mut first = false;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
+                first = true;
+                break;
+            }
+        }
+        assert!(first, "最初の自動YESが送られなかった");
+
+        // 2) 画面が固まったまま 2 秒経過 → ウォッチドッグが再送する
+        let mut resent = 0u32;
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
+                resent += 1;
+                break;
+            }
+        }
+        assert_eq!(resent, 1, "停滞 2 秒後に自動YESが再送されなかった");
+
+        // 3) 手動応答扱いにするとウォッチドッグは止まる
+        s.resolve_attention();
+        let mut after_manual = 0u32;
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
+            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
+                after_manual += 1;
+            }
+        }
+        assert_eq!(after_manual, 0, "手動応答後に勝手な再送をした");
         s.kill();
     }
 
