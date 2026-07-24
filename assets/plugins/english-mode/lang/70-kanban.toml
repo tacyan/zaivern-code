@@ -1,0 +1,37 @@
+# フリート看板 (kanban.rs / app.rs / menu_bar.rs)
+
+# ── 呼び出し (トップバー / Agent＋メニュー / パレット / 表示メニュー) ──
+"📋 看板" = "📋 Kanban"
+"フリート看板 — 全エージェントの状況を俯瞰 (⌘⇧K)" = "Fleet Kanban — bird's-eye view of every agent (⌘⇧K)"
+"📋 フリート看板 — 全員の状況を俯瞰" = "📋 Fleet Kanban — see what everyone is doing"
+"エージェントをカンバン方式で指揮統制する画面を開く" = "Open the kanban-style command & control board for all agents"
+"フリート看板 切替" = "Toggle Fleet Kanban"
+"フリート看板へ切替" = "Switch to Fleet Kanban"
+"✓ フリート看板" = "✓ Fleet Kanban"
+"フリート看板" = "Fleet Kanban"
+"Cockpit へ切替" = "Switch to Cockpit"
+
+# ── 看板本体 ──
+"カードは状態が変わると自動で列の間を移動します — ドラッグは不要です" = "Cards move between columns automatically as agent state changes — no dragging needed"
+"停滞・異常" = "Stalled / Trouble"
+"完了・終了" = "Done / Exited"
+"レート制限" = "rate limited"
+"起動中" = "starting"
+
+# ── 列見出しのホバー説明 ──
+"手が空いています — 指示を送るとすぐ動きます" = "Idle and ready — send an instruction and it starts right away"
+"いま出力が動いています" = "Actively producing output"
+"あなたの承認・入力を待って止まっています" = "Paused, waiting for your approval or input"
+"停滞・ループ・エラー多発・レート制限 — 様子を見てあげてください" = "Stalled, looping, error bursts, or rate limited — needs a look"
+"タスク完了、またはプロセスが終了しています" = "Task finished, or the process has exited"
+
+# ── カードの操作 ──
+"✅ 承認" = "✅ Approve"
+"❌ 拒否" = "❌ Deny"
+"画面のプロンプトに合った承認キーを送ります" = "Sends the approval keys matching the on-screen prompt"
+"このエージェントへ指示を送る" = "Send an instruction to this agent"
+"権限モード切替を送信" = "Send permission-mode switch"
+"指示を入力… (Enter で送信)" = "Type an instruction… (Enter to send)"
+"✏ 送信" = "✏ Send"
+"✏ 指示を送信: {title}" = "✏ Instruction sent: {title}"
+"セッションが終了しています" = "The session has exited"

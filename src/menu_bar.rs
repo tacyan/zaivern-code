@@ -15,6 +15,7 @@ pub struct MenuInfo {
     pub sidebar_open: bool,
     pub terminal_open: bool,
     pub cockpit_open: bool,
+    pub kanban_open: bool,
     pub problems_open: bool,
     pub fullscreen: bool,
     pub auto_save: bool,
@@ -268,6 +269,14 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             };
             if item(ui, &cp, &sc(keys, BindAction::ToggleCockpit), true) {
                 cmds.push(Cmd::ToggleCockpit);
+            }
+            let kb = if info.kanban_open {
+                tr("✓ フリート看板")
+            } else {
+                tr("フリート看板")
+            };
+            if item(ui, &kb, &sc(keys, BindAction::ToggleKanban), true) {
+                cmds.push(Cmd::ToggleKanban);
             }
             ui.separator();
             ui.menu_button(tr("配色テーマ"), |ui| {

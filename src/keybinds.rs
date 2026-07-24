@@ -21,6 +21,8 @@ pub enum BindAction {
     ToggleSidebar,
     Find,
     ToggleCockpit,
+    /// フリート看板 (エージェントのカンバン画面) 切替
+    ToggleKanban,
     ToggleMdPreview,
     NewAgent,
     FontInc,
@@ -62,7 +64,7 @@ pub enum BindAction {
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 34] = [
+const ALL_ACTIONS: [BindAction; 35] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -73,6 +75,7 @@ const ALL_ACTIONS: [BindAction; 34] = [
     BindAction::ToggleSidebar,
     BindAction::Find,
     BindAction::ToggleCockpit,
+    BindAction::ToggleKanban,
     BindAction::ToggleMdPreview,
     BindAction::NewAgent,
     BindAction::FontInc,
@@ -115,6 +118,7 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::ToggleSidebar => KeyboardShortcut::new(cmd, Key::B),
         BindAction::Find => KeyboardShortcut::new(cmd, Key::F),
         BindAction::ToggleCockpit => KeyboardShortcut::new(cmd_shift, Key::C),
+        BindAction::ToggleKanban => KeyboardShortcut::new(cmd_shift, Key::K),
         BindAction::ToggleMdPreview => KeyboardShortcut::new(cmd_shift, Key::V),
         BindAction::NewAgent => KeyboardShortcut::new(cmd_shift, Key::A),
         BindAction::FontInc => KeyboardShortcut::new(cmd, Key::Plus),
@@ -192,6 +196,7 @@ impl Keybinds {
             "toggle_sidebar" => ToggleSidebar,
             "find" => Find,
             "toggle_cockpit" => ToggleCockpit,
+            "toggle_kanban" => ToggleKanban,
             "toggle_md_preview" => ToggleMdPreview,
             "new_agent" => NewAgent,
             "font_inc" => FontInc,
