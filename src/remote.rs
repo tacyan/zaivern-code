@@ -254,7 +254,32 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
         return respond(&mut stream, 413, "text/plain", b"body too large");
     }
 
-    // ボディを読む
+    // ─── ルーティング (静的ページはボディ不要なので先に返す) ───
+    if path == "/" || path == "/index.html" {
+        return respond(&mut stream, 200, "text/html; charset=utf-8", PAGE.as_bytes());
+    }
+    if path == "/voice" {
+        // PC 用の音声入力ページ (Web Speech API — 127.0.0.1 で開くこと)
+        return respond(&mut stream, 200, "text/html; charset=utf-8", VOICE_PAGE.as_bytes());
+    }
+    if !path.starts_with("/api/") {
+        return respond(&mut stream, 404, "text/plain", b"not found");
+    }
+
+    // 認証: X-Token ヘッダ または ?t= クエリ。
+    // トークンはヘッダ解析の時点で分かるので、ボディを読む「前」に検証する
+    // (未認証の相手に最大 2MB のバッファリングを強制されないように)。
+    let q_token = query_str
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("t="))
+        .unwrap_or("");
+    if hdr_token != token && q_token != token {
+        // 総当たりを減速させる (接続ごとスレッドなので他リクエストは塞がない)
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        return respond(&mut stream, 401, "application/json", br#"{"ok":false,"error":"unauthorized"}"#);
+    }
+
+    // ボディを読む (認証済みのリクエストのみ)
     let mut body: Vec<u8> = buf[header_end + 4..].to_vec();
     while body.len() < content_len {
         match stream.read(&mut tmp) {
@@ -271,29 +296,6 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
             "application/json",
             br#"{"ok":false,"error":"incomplete body"}"#,
         );
-    }
-
-    // ─── ルーティング ───
-    if path == "/" || path == "/index.html" {
-        return respond(&mut stream, 200, "text/html; charset=utf-8", PAGE.as_bytes());
-    }
-    if path == "/voice" {
-        // PC 用の音声入力ページ (Web Speech API — 127.0.0.1 で開くこと)
-        return respond(&mut stream, 200, "text/html; charset=utf-8", VOICE_PAGE.as_bytes());
-    }
-    if !path.starts_with("/api/") {
-        return respond(&mut stream, 404, "text/plain", b"not found");
-    }
-
-    // 認証: X-Token ヘッダ または ?t= クエリ
-    let q_token = query_str
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("t="))
-        .unwrap_or("");
-    if hdr_token != token && q_token != token {
-        // 総当たりを減速させる (接続ごとスレッドなので他リクエストは塞がない)
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        return respond(&mut stream, 401, "application/json", br#"{"ok":false,"error":"unauthorized"}"#);
     }
 
     // POST のボディが JSON として読めない場合は 400 で弾く。
