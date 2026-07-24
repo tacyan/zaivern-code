@@ -93,6 +93,75 @@ pub enum Cmd {
 
     /// 検出済みの外部 IDE でワークスペース (primary ルート) を開く。
     OpenFolderInIde(String),
+
+    // ── VS Code 準拠メニューバー (menu_bar.rs) 用 ──────────────────
+    /// ファイルを開くダイアログ (VS Code: ⌘O)
+    OpenFileDialog,
+    /// 最近使ったフォルダをワークスペースとして開き直す
+    OpenRecentFolder(PathBuf),
+    /// 最近使ったファイルを開く
+    OpenRecentFile(PathBuf),
+    /// 最近使った項目の履歴をクリア
+    ClearRecent,
+    /// 開いている全タブを保存 (VS Code: ⌥⌘S)
+    SaveAll,
+    /// 自動保存 (afterDelay 方式) の切替
+    ToggleAutoSave,
+    /// アクティブなファイルをディスクの内容へ戻す (VS Code: Revert File)
+    RevertFile,
+    /// すべてのエディタタブを閉じる (未保存タブは確認を挟む)
+    CloseAllTabs,
+    /// エディタの編集操作 (フォーカス経由で egui TextEdit に委譲)
+    Undo,
+    Redo,
+    CutSelection,
+    CopySelection,
+    PasteClipboard,
+    SelectAll,
+    /// 行コメント切替 (メニューから。ショートカットは EditOp 経由)
+    ToggleLineComment,
+    /// 行を複製 / 行を上下に移動 (メニューから)
+    DuplicateLine,
+    MoveLineUp,
+    MoveLineDown,
+    /// 検索バーを置換モードで開く (VS Code: ⌥⌘F)
+    OpenReplace,
+    /// サイドバーの横断検索タブを開く (VS Code: ⇧⌘F)
+    GlobalSearch,
+    /// コマンドパレット / ファイルパレットを開く
+    OpenCommandPalette,
+    OpenFilePalette,
+    /// サイドバーの各タブを開く
+    ShowExplorer,
+    ShowGitHubTab,
+    /// 問題 (LSP 診断) パネルの表示切替 (VS Code: ⇧⌘M)
+    ToggleProblems,
+    /// フルスクリーン切替 (VS Code: ⌃⌘F)
+    ToggleFullScreen,
+    /// ナビゲーション履歴 (VS Code: ⌃- / ⌃⇧-)
+    NavBack,
+    NavForward,
+    /// タブ切替 (VS Code: ⇧⌘] / ⇧⌘[)
+    NextTab,
+    PrevTab,
+    /// 定義へ移動 (LSP。VS Code: F12)
+    GoToDefinition,
+    /// 対応する括弧へ移動 (VS Code: ⇧⌘\)
+    GoToBracket,
+    /// 行/列へ移動ダイアログ (VS Code: ⌃G)
+    GoToLine,
+    /// アクティブなファイルを新しいターミナルで実行
+    RunActiveFile,
+    /// ビルドタスク (cargo build / npm run build / make) を実行 (VS Code: ⇧⌘B)
+    RunBuildTask,
+    /// 選択テキストをアクティブなターミナルの入力欄へ送る (Enter は送らない)
+    RunSelection,
+    /// 新しいターミナル (Shell プリセット) を開く (VS Code: ⌃⇧`)
+    NewTerminal,
+    /// キーボードショートカット一覧ダイアログ
+    ShowShortcuts,
+    /// バージョン情報ダイアログ
+    ShowAbout,
 }
 
 #[derive(Clone)]

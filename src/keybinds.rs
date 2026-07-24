@@ -31,10 +31,38 @@ pub enum BindAction {
     MoveLineDown,
     /// エクスプローラー(ファイルツリー)へフォーカス (VS Code: ⌘⇧E / Ctrl+Shift+E)
     FocusExplorer,
+    /// ファイルを開くダイアログ (VS Code: ⌘O)
+    OpenFile,
+    /// すべて保存 (VS Code: ⌥⌘S)
+    SaveAll,
+    /// 行/列へ移動 (VS Code: ⌃G)
+    GoToLine,
+    /// 次/前のエディタタブ (VS Code: ⇧⌘] / ⇧⌘[)
+    NextTab,
+    PrevTab,
+    /// ファイル横断検索 (VS Code: ⇧⌘F)
+    GlobalSearch,
+    /// 置換 (VS Code: ⌥⌘F)
+    OpenReplace,
+    /// 新しいターミナル (VS Code: ⌃⇧`)
+    NewTerminal,
+    /// ナビゲーション 戻る/進む (VS Code: ⌃- / ⌃⇧-)
+    NavBack,
+    NavForward,
+    /// 定義へ移動 (VS Code: F12)
+    GoToDefinition,
+    /// 対応する括弧へ移動 (VS Code: ⇧⌘\)
+    GoToBracket,
+    /// ビルドタスクの実行 (VS Code: ⇧⌘B)
+    RunBuildTask,
+    /// 問題パネル (VS Code: ⇧⌘M)
+    ToggleProblems,
+    /// フルスクリーン (VS Code: ⌃⌘F)
+    ToggleFullScreen,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 19] = [
+const ALL_ACTIONS: [BindAction; 34] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -54,6 +82,21 @@ const ALL_ACTIONS: [BindAction; 19] = [
     BindAction::MoveLineUp,
     BindAction::MoveLineDown,
     BindAction::FocusExplorer,
+    BindAction::OpenFile,
+    BindAction::SaveAll,
+    BindAction::GoToLine,
+    BindAction::NextTab,
+    BindAction::PrevTab,
+    BindAction::GlobalSearch,
+    BindAction::OpenReplace,
+    BindAction::NewTerminal,
+    BindAction::NavBack,
+    BindAction::NavForward,
+    BindAction::GoToDefinition,
+    BindAction::GoToBracket,
+    BindAction::RunBuildTask,
+    BindAction::ToggleProblems,
+    BindAction::ToggleFullScreen,
 ];
 
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
@@ -81,6 +124,27 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::MoveLineUp => KeyboardShortcut::new(alt, Key::ArrowUp),
         BindAction::MoveLineDown => KeyboardShortcut::new(alt, Key::ArrowDown),
         BindAction::FocusExplorer => KeyboardShortcut::new(cmd_shift, Key::E),
+        BindAction::OpenFile => KeyboardShortcut::new(cmd, Key::O),
+        BindAction::SaveAll => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::S),
+        BindAction::GoToLine => KeyboardShortcut::new(Modifiers::CTRL, Key::G),
+        BindAction::NextTab => KeyboardShortcut::new(cmd_shift, Key::CloseBracket),
+        BindAction::PrevTab => KeyboardShortcut::new(cmd_shift, Key::OpenBracket),
+        BindAction::GlobalSearch => KeyboardShortcut::new(cmd_shift, Key::F),
+        BindAction::OpenReplace => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::F),
+        BindAction::NewTerminal => {
+            KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Backtick)
+        }
+        BindAction::NavBack => KeyboardShortcut::new(Modifiers::CTRL, Key::Minus),
+        BindAction::NavForward => {
+            KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Minus)
+        }
+        BindAction::GoToDefinition => KeyboardShortcut::new(Modifiers::NONE, Key::F12),
+        BindAction::GoToBracket => KeyboardShortcut::new(cmd_shift, Key::Backslash),
+        BindAction::RunBuildTask => KeyboardShortcut::new(cmd_shift, Key::B),
+        BindAction::ToggleProblems => KeyboardShortcut::new(cmd_shift, Key::M),
+        BindAction::ToggleFullScreen => {
+            KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::COMMAND), Key::F)
+        }
     }
 }
 
@@ -137,6 +201,21 @@ impl Keybinds {
             "move_line_up" => MoveLineUp,
             "move_line_down" => MoveLineDown,
             "focus_explorer" => FocusExplorer,
+            "open_file" => OpenFile,
+            "save_all" => SaveAll,
+            "goto_line" => GoToLine,
+            "next_tab" => NextTab,
+            "prev_tab" => PrevTab,
+            "global_search" => GlobalSearch,
+            "open_replace" => OpenReplace,
+            "new_terminal" => NewTerminal,
+            "nav_back" => NavBack,
+            "nav_forward" => NavForward,
+            "goto_definition" => GoToDefinition,
+            "goto_bracket" => GoToBracket,
+            "run_build_task" => RunBuildTask,
+            "toggle_problems" => ToggleProblems,
+            "toggle_fullscreen" => ToggleFullScreen,
             _ => return None,
         })
     }
@@ -223,6 +302,9 @@ fn key_from_name(name: &str) -> Option<Key> {
             ',' => Comma,
             '.' => Period,
             '-' => Minus,
+            '[' => OpenBracket,
+            ']' => CloseBracket,
+            '\\' => Backslash,
             _ => return None,
         });
     }
@@ -262,8 +344,79 @@ fn key_from_name(name: &str) -> Option<Key> {
         "slash" => Slash,
         "comma" => Comma,
         "period" => Period,
+        "openbracket" => OpenBracket,
+        "closebracket" => CloseBracket,
+        "backslash" => Backslash,
         _ => return None,
     })
+}
+
+/// ショートカットをメニュー表示用の文字列にする。
+/// macOS は VS Code と同じ記号表記 (⌃⌥⇧⌘ + キー)、他 OS は "Ctrl+Shift+P" 形式。
+pub fn format_shortcut(sc: KeyboardShortcut) -> String {
+    let mac = cfg!(target_os = "macos");
+    let key = key_label(sc.logical_key);
+    if mac {
+        let mut s = String::new();
+        if sc.modifiers.ctrl {
+            s.push('⌃');
+        }
+        if sc.modifiers.alt {
+            s.push('⌥');
+        }
+        if sc.modifiers.shift {
+            s.push('⇧');
+        }
+        if sc.modifiers.command || sc.modifiers.mac_cmd {
+            s.push('⌘');
+        }
+        s.push_str(&key);
+        s
+    } else {
+        let mut parts: Vec<&str> = Vec::new();
+        if sc.modifiers.command || sc.modifiers.ctrl {
+            parts.push("Ctrl");
+        }
+        if sc.modifiers.alt {
+            parts.push("Alt");
+        }
+        if sc.modifiers.shift {
+            parts.push("Shift");
+        }
+        let mut s = parts.join("+");
+        if !s.is_empty() {
+            s.push('+');
+        }
+        s.push_str(&key);
+        s
+    }
+}
+
+fn key_label(key: Key) -> String {
+    use Key::*;
+    match key {
+        ArrowUp => "↑".into(),
+        ArrowDown => "↓".into(),
+        ArrowLeft => "←".into(),
+        ArrowRight => "→".into(),
+        Enter => "↩".into(),
+        Escape => "Esc".into(),
+        Backtick => "`".into(),
+        Plus => "+".into(),
+        Minus => "-".into(),
+        Slash => "/".into(),
+        Comma => ",".into(),
+        Period => ".".into(),
+        OpenBracket => "[".into(),
+        CloseBracket => "]".into(),
+        Backslash => "\\".into(),
+        Space => "Space".into(),
+        Tab => "Tab".into(),
+        _ => {
+            // Key::name() は "A" や "F12" を返す
+            key.name().to_string()
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "zaivern-code"
-version = "0.3.7"
+version = "0.4.0"
 edition = "2021"
 description = "Zaivern Code — Rust-native AI cockpit editor (Zed × Cmux × AGI Cockpit)"
 license = "Apache-2.0"
@@ -20,8 +20,7 @@ serde_json = "1"
 toml = "0.8"
 dirs = "5"
 rfd = "0.15"
-# ico は `zai app install` の Windows ショートカットアイコン生成に使う
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 qrcode = { version = "0.14", default-features = false }
 
 [profile.release]

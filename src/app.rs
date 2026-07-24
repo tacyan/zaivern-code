@@ -15,6 +15,7 @@ use crate::orchestration;
 use crate::supervisor;
 use crate::editor::{combine_hash, disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
+use crate::file_search;
 use crate::file_tree::{self, FileTree, TreeActions};
 use crate::fuzzy;
 use crate::git;
@@ -25,6 +26,7 @@ use crate::i18n::{self, tr, trf};
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::lsp;
 use crate::markdown;
+use crate::menu_bar;
 use crate::notify;
 use crate::github;
 use crate::ide;
@@ -32,6 +34,7 @@ use crate::palette::{Action, Cmd, Item, Palette};
 use crate::panels;
 use crate::pet;
 use crate::pet_bubble;
+use crate::recent;
 use crate::remote;
 use crate::session;
 use crate::snippets::{self, Snippet};
@@ -45,6 +48,8 @@ use crate::voice;
 #[derive(PartialEq, Clone, Copy)]
 enum SidebarTab {
     Files,
+    /// ファイル横断検索 (VS Code: ⇧⌘F)
+    Search,
     Agents,
     Plugins,
     Git,
@@ -56,6 +61,7 @@ impl SidebarTab {
     fn as_key(self) -> &'static str {
         match self {
             SidebarTab::Files => "files",
+            SidebarTab::Search => "search",
             SidebarTab::Agents => "agents",
             SidebarTab::Plugins => "plugins",
             SidebarTab::Git => "git",
@@ -66,6 +72,7 @@ impl SidebarTab {
     /// セッションのキー文字列から復元する。未知/空なら既定の Files。
     fn from_key(s: &str) -> Self {
         match s {
+            "search" => SidebarTab::Search,
             "agents" => SidebarTab::Agents,
             "plugins" => SidebarTab::Plugins,
             "git" => SidebarTab::Git,
@@ -204,6 +211,36 @@ struct FindState {
     query: String,
     focus: bool,
     last: Option<usize>,
+    /// 置換行 (VS Code: ⌥⌘F) を表示するか
+    replace_open: bool,
+    replace: String,
+}
+
+/// ファイル横断検索 (サイドバーの検索タブ) の状態。
+struct GlobalSearchState {
+    query: String,
+    focus: bool,
+    running: bool,
+    results: Vec<file_search::Hit>,
+    /// 走査したファイル数 (結果の説明用)
+    scanned: usize,
+    rx: Option<mpsc::Receiver<(Vec<file_search::Hit>, usize)>>,
+    /// 一度でも検索したか (0 件表示と初期状態の区別)
+    searched: bool,
+}
+
+impl GlobalSearchState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            focus: false,
+            running: false,
+            results: Vec::new(),
+            scanned: 0,
+            rx: None,
+            searched: false,
+        }
+    }
 }
 
 /// キーバインド駆動のエディタ編集操作
@@ -262,6 +299,28 @@ pub struct ZaivernApp {
     /// カスタムテーマ (~/.zaivern/themes + プラグイン同梱): (表示名, JSONフルパス)
     custom_themes: Vec<(String, String)>,
     find: FindState,
+    /// メニューバー付随の永続状態 (最近使った項目・自動保存フラグ)
+    menu_state: recent::MenuState,
+    /// 自動保存 (afterDelay) の直近実行時刻
+    autosave_at: Option<Instant>,
+    /// 行/列へ移動ダイアログ (VS Code: ⌃G)
+    goto_open: bool,
+    goto_input: String,
+    /// 問題 (LSP 診断) パネル (VS Code: ⇧⌘M)
+    problems_open: bool,
+    /// キーボードショートカット一覧 / バージョン情報ダイアログ
+    shortcuts_open: bool,
+    about_open: bool,
+    /// ファイル横断検索 (サイドバーの検索タブ)
+    gsearch: GlobalSearchState,
+    /// ナビゲーション履歴 (パス, カーソル char)。戻る/進む用
+    nav_history: Vec<(PathBuf, usize)>,
+    nav_index: usize,
+    /// 次フレーム冒頭でエディタへ注入する egui イベント
+    /// (メニューの 元に戻す/切り取り/貼り付け などの実体)
+    pending_editor_events: Vec<egui::Event>,
+    /// 定義ジャンプ (F12) の応答待ち先 LSP
+    awaiting_definition: Option<LspKey>,
     toasts: Vec<Toast>,
     pending_close: Option<usize>,
     /// ファイルツリーからの削除確認待ち(対象パス)
@@ -618,7 +677,21 @@ impl ZaivernApp {
                 query: String::new(),
                 focus: false,
                 last: None,
+                replace_open: false,
+                replace: String::new(),
             },
+            menu_state: recent::load(),
+            autosave_at: None,
+            goto_open: false,
+            goto_input: String::new(),
+            problems_open: false,
+            shortcuts_open: false,
+            about_open: false,
+            gsearch: GlobalSearchState::new(),
+            nav_history: Vec::new(),
+            nav_index: 0,
+            pending_editor_events: Vec::new(),
+            awaiting_definition: None,
             toasts: Vec::new(),
             pending_close: None,
             pending_delete: None,
@@ -2168,6 +2241,8 @@ impl ZaivernApp {
                     }
                 }
                 self.queue_hook(plugins::HookEvent::FileOpen, Some(path.to_path_buf()));
+                // メニューバーの「最近使用した項目」へ記録
+                self.touch_recent_file(path);
                 self.persist_session()
             }
             Err(e) => self.toast(e, false),
@@ -2422,6 +2497,9 @@ impl ZaivernApp {
         }
         self.set_roots(roots, ctx);
         self.restore_session(ctx);
+        // メニューバーの「最近使用した項目」へ記録
+        self.menu_state.touch_folder(&dir);
+        recent::save(&self.menu_state);
         self.toast(
             trf("📂 {dir} を開きました", &[("dir", dir.display().to_string())]),
             true,
@@ -2584,6 +2662,117 @@ impl ZaivernApp {
                     self.request_close(i);
                 }
             }
+            // ── VS Code 準拠メニューバー (menu_bar.rs) ──────────────
+            Cmd::OpenFileDialog => {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_directory(self.primary_root())
+                    .pick_file()
+                {
+                    self.open_path(&p);
+                    self.touch_recent_file(&p);
+                }
+            }
+            Cmd::OpenRecentFolder(p) => {
+                self.open_workspace(p.clone(), ctx);
+                self.menu_state.touch_folder(&p);
+                recent::save(&self.menu_state);
+            }
+            Cmd::OpenRecentFile(p) => {
+                self.open_path(&p);
+                self.touch_recent_file(&p);
+            }
+            Cmd::ClearRecent => {
+                self.menu_state.clear_recent();
+                recent::save(&self.menu_state);
+                self.toast(tr("最近使用した項目をクリアしました"), true);
+            }
+            Cmd::SaveAll => self.save_all(ctx),
+            Cmd::ToggleAutoSave => {
+                self.menu_state.auto_save = !self.menu_state.auto_save;
+                recent::save(&self.menu_state);
+                self.toast(
+                    if self.menu_state.auto_save {
+                        tr("自動保存: オン (編集は数秒ごとに保存されます)")
+                    } else {
+                        tr("自動保存: オフ")
+                    },
+                    true,
+                );
+            }
+            Cmd::RevertFile => self.revert_active(),
+            Cmd::CloseAllTabs => self.close_all_tabs(),
+            Cmd::Undo => {
+                self.push_editor_key(egui::Key::Z, egui::Modifiers::COMMAND, true);
+            }
+            Cmd::Redo => {
+                self.push_editor_key(
+                    egui::Key::Z,
+                    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+                    true,
+                );
+            }
+            Cmd::CutSelection => self.push_editor_event(egui::Event::Cut, true),
+            Cmd::CopySelection => self.push_editor_event(egui::Event::Copy, false),
+            Cmd::PasteClipboard => match menu_bar::clipboard_text() {
+                Some(t) => self.push_editor_event(egui::Event::Paste(t), true),
+                None => self.toast(tr("クリップボードにテキストがありません"), false),
+            },
+            Cmd::SelectAll => self.select_all_active(ctx),
+            Cmd::ToggleLineComment => self.editor_op(ctx, EditOp::ToggleComment),
+            Cmd::DuplicateLine => self.editor_op(ctx, EditOp::Duplicate),
+            Cmd::MoveLineUp => self.editor_op(ctx, EditOp::Move(true)),
+            Cmd::MoveLineDown => self.editor_op(ctx, EditOp::Move(false)),
+            Cmd::OpenReplace => {
+                if self.editor.active.is_some() {
+                    self.find.open = true;
+                    self.find.focus = true;
+                    self.find.replace_open = true;
+                }
+            }
+            Cmd::GlobalSearch => {
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::Search;
+                self.gsearch.focus = true;
+            }
+            Cmd::OpenCommandPalette => self.palette.open_commands(),
+            Cmd::OpenFilePalette => self.palette.open_files(),
+            Cmd::ShowExplorer => {
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::Files;
+                ctx.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+                self.tree.focus();
+            }
+            Cmd::ShowGitHubTab => {
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::GitHub;
+            }
+            Cmd::ToggleProblems => self.problems_open = !self.problems_open,
+            Cmd::ToggleFullScreen => {
+                let cur = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!cur));
+            }
+            Cmd::NavBack => self.nav_go(-1),
+            Cmd::NavForward => self.nav_go(1),
+            Cmd::NextTab => self.cycle_tab(1),
+            Cmd::PrevTab => self.cycle_tab(-1),
+            Cmd::GoToDefinition => self.goto_definition(ctx),
+            Cmd::GoToBracket => self.goto_bracket(ctx),
+            Cmd::GoToLine => {
+                if self.editor.active.is_some() {
+                    self.goto_open = true;
+                    self.goto_input.clear();
+                }
+            }
+            Cmd::RunActiveFile => self.run_active_file(ctx),
+            Cmd::RunBuildTask => self.run_build_task(ctx),
+            Cmd::RunSelection => self.run_selection(ctx),
+            Cmd::NewTerminal => self.new_terminal(ctx),
+            Cmd::ShowShortcuts => self.shortcuts_open = true,
+            Cmd::ShowAbout => self.about_open = true,
             Cmd::OpenInIde(key) => {
                 let file = self
                     .editor
@@ -3049,11 +3238,48 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::PaletteFiles)) {
             self.palette.open_files();
         }
+        if consume(ctx, self.keys.get(BindAction::SaveAll)) {
+            cmds.push(Cmd::SaveAll);
+        }
         if consume(ctx, self.keys.get(BindAction::SaveAs)) {
             cmds.push(Cmd::SaveAs);
         }
         if consume(ctx, self.keys.get(BindAction::Save)) {
             cmds.push(Cmd::Save);
+        }
+        if consume(ctx, self.keys.get(BindAction::OpenFile)) {
+            cmds.push(Cmd::OpenFileDialog);
+        }
+        // ⇧⌘F (横断検索) / ⌥⌘F (置換) は ⌘F (検索) より修飾キーが多いので先に
+        if consume(ctx, self.keys.get(BindAction::GlobalSearch)) {
+            cmds.push(Cmd::GlobalSearch);
+        }
+        if consume(ctx, self.keys.get(BindAction::OpenReplace)) {
+            cmds.push(Cmd::OpenReplace);
+        }
+        if consume(ctx, self.keys.get(BindAction::NewTerminal)) {
+            cmds.push(Cmd::NewTerminal);
+        }
+        if consume(ctx, self.keys.get(BindAction::NextTab)) {
+            cmds.push(Cmd::NextTab);
+        }
+        if consume(ctx, self.keys.get(BindAction::PrevTab)) {
+            cmds.push(Cmd::PrevTab);
+        }
+        if consume(ctx, self.keys.get(BindAction::NavForward)) {
+            cmds.push(Cmd::NavForward);
+        }
+        if consume(ctx, self.keys.get(BindAction::NavBack)) {
+            cmds.push(Cmd::NavBack);
+        }
+        if consume(ctx, self.keys.get(BindAction::RunBuildTask)) {
+            cmds.push(Cmd::RunBuildTask);
+        }
+        if consume(ctx, self.keys.get(BindAction::ToggleProblems)) {
+            cmds.push(Cmd::ToggleProblems);
+        }
+        if consume(ctx, self.keys.get(BindAction::ToggleFullScreen)) {
+            cmds.push(Cmd::ToggleFullScreen);
         }
         if consume(ctx, self.keys.get(BindAction::CloseTab)) {
             cmds.push(Cmd::CloseTab);
@@ -3121,6 +3347,17 @@ impl ZaivernApp {
             .unwrap_or(false);
         let mut pages: Vec<bool> = Vec::new();
         if editor_focused {
+            // ⌃G (行移動)・F12 (定義)・⇧⌘\ (括弧) はエディタにフォーカスが
+            // あるときだけ奪う (ターミナルの ⌃G = BEL 等と衝突させない)
+            if consume(ctx, self.keys.get(BindAction::GoToLine)) {
+                cmds.push(Cmd::GoToLine);
+            }
+            if consume(ctx, self.keys.get(BindAction::GoToDefinition)) {
+                cmds.push(Cmd::GoToDefinition);
+            }
+            if consume(ctx, self.keys.get(BindAction::GoToBracket)) {
+                cmds.push(Cmd::GoToBracket);
+            }
             if consume(ctx, self.keys.get(BindAction::ToggleComment)) {
                 ops.push(EditOp::ToggleComment);
             }
@@ -3213,6 +3450,9 @@ impl ZaivernApp {
         let mut cmds: Vec<Cmd> = Vec::new();
         let branch = self.git_branch();
 
+        // VS Code 準拠メニューバーの表示状態スナップショット (描画用の読み取り専用)
+        let menu_info = self.build_menu_info(ctx);
+
         egui::TopBottomPanel::top("zv-top")
             .exact_height(42.0)
             .frame(
@@ -3230,41 +3470,10 @@ impl ZaivernApp {
                     );
                     ui.separator();
 
-                    let ws_name = roots_label(&self.roots);
-                    ui.menu_button(format!("📂 {ws_name}"), |ui| {
-                        if ui.button(tr("フォルダを開く…")).clicked() {
-                            cmds.push(Cmd::OpenFolder);
-                            ui.close_menu();
-                        }
-                        if ui.button(tr("フォルダをワークスペースに追加…")).clicked() {
-                            cmds.push(Cmd::AddFolder);
-                            ui.close_menu();
-                        }
-                        if self.roots.len() > 1 {
-                            ui.menu_button(tr("フォルダをワークスペースから削除"), |ui| {
-                                for r in &self.roots {
-                                    let name = root_name(r);
-                                    if ui.button(name).clicked() {
-                                        cmds.push(Cmd::RemoveFolder(r.clone()));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        }
-                        if ui.button(tr("ツリーを再読み込み")).clicked() {
-                            cmds.push(Cmd::RefreshTree);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button(tr("⚙ 設定 config.toml を開く")).clicked() {
-                            cmds.push(Cmd::OpenConfig);
-                            ui.close_menu();
-                        }
-                        if ui.button(tr("🔄 設定を再読み込み")).clicked() {
-                            cmds.push(Cmd::ReloadConfig);
-                            ui.close_menu();
-                        }
-                    });
+                    // VS Code と同じ 8 メニュー
+                    // (ファイル/編集/選択/表示/移動/実行/ターミナル/ヘルプ)
+                    let mut menu_cmds = menu_bar::ui(ui, &menu_info, &self.keys);
+                    cmds.append(&mut menu_cmds);
 
                     if let Some(b) = &branch {
                         ui.label(RichText::new(format!("🌿 {b}")).color(theme.text_dim));
@@ -3785,6 +3994,10 @@ impl ZaivernApp {
         let mut pl_setting: Option<(String, String, String)> = None;
         // パネルの手動更新要求 (プラグイン名, パネルID)
         let mut pl_panel_refresh: Option<(String, String)> = None;
+        // 検索タブ (VS Code: ⇧⌘F) のアクション。クロージャ内では記録だけして
+        // パネル描画後に self へ反映する
+        let mut gsearch_go = false;
+        let mut gsearch_jump: Option<(PathBuf, usize)> = None;
         // パネルの本文はクロージャの中では読むだけなので、先に借りをほどく
         let panel_texts = self.plugin_panels.clone();
         // Markdown パネルの描画に要るもの (画像キャッシュは借りて後で戻す)
@@ -3807,8 +4020,9 @@ impl ZaivernApp {
                     let narrow = ui.available_width() < 300.0;
                     let n_agents = self.agents.sessions.len();
                     let n_plugins = self.plugins.len();
-                    let tabs: [(SidebarTab, String, &str); 5] = [
+                    let tabs: [(SidebarTab, String, &str); 6] = [
                         (SidebarTab::Files, "📁".into(), "ファイル"),
+                        (SidebarTab::Search, "🔎".into(), "検索"),
                         (SidebarTab::Agents, format!("👾 {n_agents}"), "Agents"),
                         (SidebarTab::Plugins, format!("🔌 {n_plugins}"), "プラグイン"),
                         (SidebarTab::Git, "🌿".into(), "Git"),
@@ -3854,6 +4068,18 @@ impl ZaivernApp {
                             .show(ui, |ui| {
                                 self.tree.ui(ui, &theme, &mut actions);
                             });
+                    }
+                    SidebarTab::Search => {
+                        let (go, jump) = global_search_panel(
+                            ui,
+                            &theme,
+                            &mut self.gsearch,
+                            &self.file_index,
+                        );
+                        gsearch_go |= go;
+                        if jump.is_some() {
+                            gsearch_jump = jump;
+                        }
                     }
                     SidebarTab::Agents => {
                         egui::ScrollArea::vertical()
@@ -4372,6 +4598,14 @@ impl ZaivernApp {
         // パネルの手動更新
         if let Some((name, panel)) = pl_panel_refresh {
             self.refresh_panel(&name, &panel, ctx);
+        }
+
+        // 検索タブのアクション (横断検索の開始 / 結果へのジャンプ)
+        if gsearch_go {
+            self.start_global_search();
+        }
+        if let Some((path, line)) = gsearch_jump {
+            self.jump_to_lsp_pos(&path, line, 0);
         }
 
         if pl_new {
@@ -5743,12 +5977,23 @@ impl ZaivernApp {
         let theme = self.theme.clone();
         let mut do_find = false;
         let mut close = false;
+        let mut do_replace = false;
+        let mut do_replace_all = false;
 
         egui::Frame::none()
             .fill(theme.panel_alt)
             .inner_margin(egui::Margin::symmetric(8.0, 5.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    // 置換行の開閉 (VS Code の検索バー左端の ▸/▾ と同じ)
+                    let caret = if self.find.replace_open { "▾" } else { "▸" };
+                    if ui
+                        .button(caret)
+                        .on_hover_text(tr("置換行の表示切替 (⌥⌘F)"))
+                        .clicked()
+                    {
+                        self.find.replace_open = !self.find.replace_open;
+                    }
                     ui.label("🔍");
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.find.query)
@@ -5787,13 +6032,42 @@ impl ZaivernApp {
                         }
                     });
                 });
+                // 置換行 (VS Code: ⌥⌘F)
+                if self.find.replace_open {
+                    ui.horizontal(|ui| {
+                        ui.add_space(26.0);
+                        ui.label("⇄");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.find.replace)
+                                .desired_width(260.0)
+                                .hint_text(tr("置換…")),
+                        );
+                        if ui
+                            .button(tr("置換"))
+                            .on_hover_text(tr("いまのヒットを置換して次へ"))
+                            .clicked()
+                        {
+                            do_replace = true;
+                        }
+                        if ui.button(tr("すべて置換")).clicked() {
+                            do_replace_all = true;
+                        }
+                    });
+                }
             });
 
         if do_find {
             self.find_next();
         }
+        if do_replace {
+            self.replace_current();
+        }
+        if do_replace_all {
+            self.replace_all_in_active();
+        }
         if close {
             self.find.open = false;
+            self.find.replace_open = false;
         }
     }
 
@@ -6269,6 +6543,40 @@ impl ZaivernApp {
                 ("🖼".into(), tr("ペット画像を変更…"), String::new(), Cmd::SetPetImage),
                 ("↺".into(), tr("ペット画像を既定に戻す"), String::new(), Cmd::ResetPetImage),
                 ("🐾".into(), tr("ペット位置を右下に戻す"), String::new(), Cmd::ResetPetPos),
+                // ── VS Code 準拠メニューバーのコマンド ──
+                ("📄".into(), tr("ファイルを開く…"), "⌘O".into(), Cmd::OpenFileDialog),
+                ("💾".into(), tr("すべて保存"), "⌥⌘S".into(), Cmd::SaveAll),
+                ("💾".into(), tr("自動保存の切替"), String::new(), Cmd::ToggleAutoSave),
+                ("↺".into(), tr("ファイルを元に戻す"), String::new(), Cmd::RevertFile),
+                ("🚪".into(), tr("すべてのエディターを閉じる"), String::new(), Cmd::CloseAllTabs),
+                ("🔎".into(), tr("ファイル間で検索"), "⇧⌘F".into(), Cmd::GlobalSearch),
+                ("⇄".into(), tr("置換"), "⌥⌘F".into(), Cmd::OpenReplace),
+                ("🧭".into(), tr("行/列へ移動…"), "⌃G".into(), Cmd::GoToLine),
+                ("🧭".into(), tr("定義へ移動"), "F12".into(), Cmd::GoToDefinition),
+                ("🧭".into(), tr("ブラケットへ移動"), "⇧⌘\\".into(), Cmd::GoToBracket),
+                ("⬅".into(), tr("戻る"), "⌃-".into(), Cmd::NavBack),
+                ("➡".into(), tr("進む"), "⌃⇧-".into(), Cmd::NavForward),
+                ("📑".into(), tr("次のエディター"), "⇧⌘]".into(), Cmd::NextTab),
+                ("📑".into(), tr("前のエディター"), "⇧⌘[".into(), Cmd::PrevTab),
+                ("🖥".into(), tr("新しいターミナル"), "⌃⇧`".into(), Cmd::NewTerminal),
+                ("▶".into(), tr("アクティブなファイルを実行"), String::new(), Cmd::RunActiveFile),
+                (
+                    "▶".into(),
+                    tr("選択したテキストをターミナルへ送る"),
+                    String::new(),
+                    Cmd::RunSelection,
+                ),
+                ("🔨".into(), tr("ビルド タスクの実行…"), "⇧⌘B".into(), Cmd::RunBuildTask),
+                ("⚠".into(), tr("問題パネルの切替"), "⇧⌘M".into(), Cmd::ToggleProblems),
+                ("🖥".into(), tr("フルスクリーンの切替"), "⌃⌘F".into(), Cmd::ToggleFullScreen),
+                ("🐙".into(), tr("GitHub パネルを開く"), String::new(), Cmd::ShowGitHubTab),
+                (
+                    "⌨".into(),
+                    tr("キーボード ショートカットのリファレンス"),
+                    String::new(),
+                    Cmd::ShowShortcuts,
+                ),
+                ("ℹ".into(), tr("バージョン情報"), String::new(), Cmd::ShowAbout),
                 ("➕".into(), tr("新規プラグインを作成…"), String::new(), Cmd::NewPlugin),
                 ("📦".into(), tr("プラグインをインストール… (.zvplug / .zip)"), String::new(), Cmd::InstallPlugin),
                 ("🔌".into(), tr("プラグインを表示"), String::new(), Cmd::ShowPlugins),
@@ -8468,6 +8776,17 @@ impl eframe::App for ZaivernApp {
 
         self.handle_shortcuts(ctx);
 
+        // メニューバー経由のエディタ操作 (元に戻す/貼り付け等) を、パネル描画前に
+        // フォーカス復帰 + イベント注入で TextEdit へ届ける
+        self.flush_editor_events(ctx);
+        // 定義ジャンプ (F12) の LSP 応答と、ファイル横断検索の結果を取り込む
+        self.poll_definition_result();
+        self.poll_global_search();
+        // 自動保存 (メニュー: ファイル > 自動保存)
+        self.autosave_tick();
+        // メニュー関連の小窓 (行/列へ移動・問題・ショートカット一覧・バージョン情報)
+        self.menu_windows_ui(ctx);
+
         // スマホリモートからのリクエストを処理する
         self.poll_remote(ctx);
 
@@ -9216,6 +9535,955 @@ fn install_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+// ─── VS Code 準拠メニューバーの実処理 ──────────────────────────────
+//
+// メニュー UI (menu_bar.rs) が返す Cmd の実体。ここにまとめて置くのは
+// 並行セッションとの diff 衝突を app.rs 本体の impl から分離するため。
+impl ZaivernApp {
+    /// メニューバー描画用の表示状態スナップショットを作る。
+    fn build_menu_info(&self, ctx: &egui::Context) -> menu_bar::MenuInfo {
+        let active = self.editor.active.map(|i| &self.editor.buffers[i]);
+        let active_path = active.and_then(|b| b.path.clone());
+        let run_label = active_path.as_ref().and_then(|p| {
+            let root = self
+                .tree
+                .root_for(p)
+                .map(|r| r.to_path_buf())
+                .unwrap_or_else(|| self.primary_root().to_path_buf());
+            menu_bar::runner_for(p, &root).map(|_| {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                trf("{name} を実行", &[("name", name)])
+            })
+        });
+        let mut themes: Vec<(String, String, bool)> = theme::all()
+            .iter()
+            .map(|t| (t.name.clone(), t.label.clone(), t.name == self.cfg.theme))
+            .collect();
+        for (label, path) in self.custom_themes.iter().take(60) {
+            themes.push((path.clone(), format!("🔌 {label}"), self.cfg.theme == *path));
+        }
+        let plugin_commands: Vec<(usize, usize, String, String)> = self
+            .plugins
+            .iter()
+            .enumerate()
+            .flat_map(|(pi, p)| {
+                p.commands
+                    .iter()
+                    .enumerate()
+                    .map(move |(ci, c)| {
+                        (pi, ci, c.icon.clone(), format!("{}: {}", p.name, c.title))
+                    })
+            })
+            .take(40)
+            .collect();
+        menu_bar::MenuInfo {
+            sidebar_open: self.sidebar_open,
+            terminal_open: self.agents.panel_open,
+            cockpit_open: self.cockpit,
+            problems_open: self.problems_open,
+            fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
+            auto_save: self.menu_state.auto_save,
+            has_editor: self.editor.active.is_some(),
+            has_file: active_path.is_some(),
+            md_preview: self.md_preview,
+            roots: self.roots.clone(),
+            recent_folders: self.menu_state.folders(),
+            recent_files: self.menu_state.files(),
+            plugin_commands,
+            agent_presets: self
+                .cfg
+                .agents
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, p.icon.clone(), p.name.clone()))
+                .collect(),
+            themes,
+            build_task: menu_bar::build_task_for(self.primary_root()).map(|(l, _)| l),
+            run_label,
+        }
+    }
+
+    fn touch_recent_file(&mut self, p: &Path) {
+        self.menu_state.touch_file(p);
+        recent::save(&self.menu_state);
+    }
+
+    /// 開いている全タブを保存 (VS Code: すべて保存)。無題タブは対象外。
+    fn save_all(&mut self, ctx: &egui::Context) {
+        let mut saved = 0usize;
+        let mut untitled = 0usize;
+        let mut hooked: Vec<usize> = Vec::new();
+        for i in 0..self.editor.buffers.len() {
+            let b = &self.editor.buffers[i];
+            if b.kind.read_only() || !b.dirty() {
+                continue;
+            }
+            let Some(path) = b.path.clone() else {
+                untitled += 1;
+                continue;
+            };
+            let text = b.text.clone();
+            if std::fs::write(&path, &text).is_ok() {
+                let b = &mut self.editor.buffers[i];
+                b.saved_hash = hash_str(&text);
+                b.disk_mtime = disk_mtime(&path);
+                b.conflict_notified = None;
+                saved += 1;
+                hooked.push(i);
+            }
+        }
+        for i in hooked {
+            self.run_on_save_hooks(i, ctx);
+        }
+        if saved > 0 {
+            self.persist_session();
+            self.toast(
+                trf("💾 {n} 件のファイルを保存しました", &[("n", saved.to_string())]),
+                true,
+            );
+        }
+        if untitled > 0 {
+            self.toast(tr("無題のタブは「名前を付けて保存」で保存してください"), false);
+        }
+    }
+
+    /// 自動保存 (VS Code: afterDelay 相当)。2 秒ごとに、ファイルに紐付く
+    /// 未保存バッファを黙って書き出す。on_save フック (整形等) は入力中の
+    /// 割り込みになるため走らせない。
+    fn autosave_tick(&mut self) {
+        if !self.menu_state.auto_save {
+            return;
+        }
+        if self.autosave_at.map(|t| t.elapsed().as_millis() < 2000).unwrap_or(false) {
+            return;
+        }
+        self.autosave_at = Some(Instant::now());
+        let mut saved_any = false;
+        for b in &mut self.editor.buffers {
+            if b.kind.read_only() || !b.dirty() {
+                continue;
+            }
+            let Some(path) = b.path.clone() else { continue };
+            if std::fs::write(&path, &b.text).is_ok() {
+                b.saved_hash = hash_str(&b.text);
+                b.disk_mtime = disk_mtime(&path);
+                b.conflict_notified = None;
+                saved_any = true;
+            }
+        }
+        if saved_any {
+            self.persist_session();
+        }
+    }
+
+    /// アクティブなファイルをディスクの内容へ戻す (未保存の編集は破棄)。
+    fn revert_active(&mut self) {
+        let Some(i) = self.editor.active else { return };
+        let b = &mut self.editor.buffers[i];
+        let Some(path) = b.path.clone() else {
+            self.toast(tr("ファイルに紐付いていないタブは元に戻せません"), false);
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.toast(tr("ディスクから読み直せませんでした"), false);
+            return;
+        };
+        if text == b.text {
+            self.toast(tr("ディスクの内容と同じです"), true);
+            return;
+        }
+        b.text = text;
+        b.saved_hash = hash_str(&b.text);
+        b.disk_mtime = disk_mtime(&path);
+        b.conflict_notified = None;
+        b.cache = None;
+        b.gutter = None;
+        let title = b.title.clone();
+        self.queue_lsp_change(i);
+        self.toast(trf("↺ {title} をディスクの内容に戻しました", &[("title", title)]), true);
+    }
+
+    /// すべてのエディタタブを閉じる。未保存タブは確認ダイアログに回す。
+    fn close_all_tabs(&mut self) {
+        let mut kept_dirty = 0usize;
+        for i in (0..self.editor.buffers.len()).rev() {
+            if self.editor.buffers[i].dirty() && !self.editor.buffers[i].kind.read_only() {
+                kept_dirty += 1;
+                continue;
+            }
+            self.editor.close(i);
+        }
+        self.persist_session();
+        if kept_dirty > 0 {
+            // 1 件ずつ既存の確認ダイアログへ (最初の未保存タブを対象にする)
+            self.pending_close = self
+                .editor
+                .buffers
+                .iter()
+                .position(|b| b.dirty() && !b.kind.read_only());
+            self.toast(
+                trf(
+                    "未保存の {n} タブは確認してから閉じます",
+                    &[("n", kept_dirty.to_string())],
+                ),
+                false,
+            );
+        }
+    }
+
+    /// メニュー操作をエディタの egui TextEdit へ届ける。
+    /// メニュークリックでフォーカスが外れているため、直接イベントを送らず
+    /// 「次フレーム冒頭でフォーカス復帰 + イベント注入」のキューに積む。
+    fn push_editor_event(&mut self, ev: egui::Event, mutates: bool) {
+        let Some(i) = self.editor.active else { return };
+        if mutates && self.editor.buffers[i].kind.read_only() {
+            self.toast(tr("このタブは読み取り専用です"), false);
+            return;
+        }
+        self.pending_editor_events.push(ev);
+    }
+
+    fn push_editor_key(&mut self, key: egui::Key, modifiers: egui::Modifiers, mutates: bool) {
+        self.push_editor_event(
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+            mutates,
+        );
+    }
+
+    /// キューされたイベントをフレーム冒頭で注入する (update() から毎フレーム)。
+    /// TextEdit は同一フレーム内でフォーカスがあるときだけイベントを処理する。
+    fn flush_editor_events(&mut self, ctx: &egui::Context) {
+        if self.pending_editor_events.is_empty() {
+            return;
+        }
+        let Some(i) = self.editor.active else {
+            self.pending_editor_events.clear();
+            return;
+        };
+        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        ctx.memory_mut(|m| m.request_focus(ed_id));
+        for ev in std::mem::take(&mut self.pending_editor_events) {
+            ctx.input_mut(|inp| inp.events.push(ev));
+        }
+    }
+
+    fn select_all_active(&mut self, _ctx: &egui::Context) {
+        let Some(i) = self.editor.active else { return };
+        let len = self.editor.buffers[i].text.chars().count();
+        // pending_select は描画側でフォーカス復帰まで面倒を見てくれる
+        self.pending_select = Some((0, len));
+    }
+
+    /// アクティブなエディタのカーソル位置 (char)。TextEdit の状態から読む。
+    fn active_cursor_char(&self, ctx: &egui::Context) -> usize {
+        let Some(i) = self.editor.active else { return 0 };
+        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        egui::TextEdit::load_state(ctx, ed_id)
+            .and_then(|st| st.cursor.char_range())
+            .map(|r| r.primary.index)
+            .unwrap_or(0)
+    }
+
+    fn active_file_path(&self) -> Option<PathBuf> {
+        self.editor.active.and_then(|i| self.editor.buffers[i].path.clone())
+    }
+
+    // ── ナビゲーション履歴 (戻る / 進む) ──
+
+    fn nav_push(&mut self, path: PathBuf, cursor: usize) {
+        if self
+            .nav_history
+            .get(self.nav_index)
+            .map(|(p, c)| *p == path && c.abs_diff(cursor) < 5)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.nav_history.truncate(self.nav_index + 1);
+        self.nav_history.push((path, cursor));
+        if self.nav_history.len() > 100 {
+            self.nav_history.remove(0);
+        }
+        self.nav_index = self.nav_history.len() - 1;
+    }
+
+    fn nav_go(&mut self, delta: i64) {
+        if self.nav_history.is_empty() {
+            self.toast(tr("移動履歴がまだありません"), false);
+            return;
+        }
+        let target = self.nav_index as i64 + delta;
+        if target < 0 || target >= self.nav_history.len() as i64 {
+            return;
+        }
+        self.nav_index = target as usize;
+        let (path, cursor) = self.nav_history[self.nav_index].clone();
+        if self.active_file_path().as_deref() != Some(path.as_path()) {
+            if let Some(bi) = self
+                .editor
+                .buffers
+                .iter()
+                .position(|b| b.path.as_deref() == Some(path.as_path()))
+            {
+                self.editor.active = Some(bi);
+            } else {
+                self.open_path(&path);
+            }
+        }
+        self.jump_to_char(cursor, 0);
+    }
+
+    /// アクティブバッファ内の char 位置へ移動 (選択 + 画面中央へスクロール)。
+    fn jump_to_char(&mut self, pos: usize, len: usize) {
+        let Some(i) = self.editor.active else { return };
+        let text = &self.editor.buffers[i].text;
+        let max = text.chars().count();
+        let pos = pos.min(max);
+        self.pending_select = Some((pos, (pos + len).min(max)));
+        let line = editor_ops::line_of_char(text, pos);
+        self.pending_scroll =
+            Some((line as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
+    }
+
+    /// 履歴に積みながら別ファイルの LSP 位置へ移動する (定義ジャンプ・問題パネル)。
+    fn jump_to_lsp_pos(&mut self, path: &Path, line: usize, col: usize) {
+        // 現在位置を履歴へ (エディタのカーソルは (行, 桁) で保持されている)
+        if let (Some(cur), Some(i)) = (self.active_file_path(), self.editor.active) {
+            let (line0, col0) = self.editor.cursor;
+            let cur_char =
+                editor_ops::char_index_at(&self.editor.buffers[i].text, line0, col0);
+            self.nav_push(cur, cur_char);
+        }
+        if self.active_file_path().as_deref() != Some(path) {
+            self.open_path(path);
+        }
+        let Some(i) = self.editor.active else { return };
+        let ch = lsp::lsp_pos_to_char_index(&self.editor.buffers[i].text, line, col);
+        self.nav_push(path.to_path_buf(), ch);
+        self.jump_to_char(ch, 0);
+    }
+
+    fn cycle_tab(&mut self, dir: i64) {
+        let n = self.editor.buffers.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.editor.active.unwrap_or(0) as i64;
+        self.editor.active = Some((cur + dir).rem_euclid(n as i64) as usize);
+        self.persist_session();
+    }
+
+    // ── ジャンプ系 ──
+
+    fn goto_definition(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.editor.active else { return };
+        let b = &self.editor.buffers[i];
+        let Some(path) = b.path.clone() else {
+            self.toast(tr("ファイルに紐付いていないタブでは使えません"), false);
+            return;
+        };
+        let lang = b.lang.clone();
+        let text = b.text.clone();
+        let key = self.lsp_key_for(&path, &lang);
+        let Some(client) = self.lsp.get(&key) else {
+            self.toast(tr("この言語の LSP サーバーが起動していません"), false);
+            return;
+        };
+        if !client.is_ready() {
+            self.toast(tr("LSP サーバーの準備中です — 少し待ってからもう一度"), false);
+            return;
+        }
+        let cursor = self.active_cursor_char(ctx);
+        let (line, col) = lsp::char_index_to_lsp_pos(&text, cursor);
+        client.request_definition(&path, line, col);
+        self.awaiting_definition = Some(key);
+    }
+
+    /// F12 の応答を毎フレーム確認して、届いたらジャンプする。
+    fn poll_definition_result(&mut self) {
+        let Some(key) = self.awaiting_definition.clone() else { return };
+        let Some(client) = self.lsp.get(&key) else {
+            self.awaiting_definition = None;
+            return;
+        };
+        let Some(resp) = client.poll_definition() else { return };
+        self.awaiting_definition = None;
+        match resp {
+            Some(loc) => self.jump_to_lsp_pos(&loc.path.clone(), loc.line, loc.col),
+            None => self.toast(tr("定義が見つかりませんでした"), false),
+        }
+    }
+
+    fn goto_bracket(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.editor.active else { return };
+        let cur = self.active_cursor_char(ctx);
+        let text = self.editor.buffers[i].text.clone();
+        match editor_ops::matching_bracket(&text, cur) {
+            Some(pos) => self.jump_to_char(pos, 0),
+            None => self.toast(tr("対応する括弧が見つかりませんでした"), false),
+        }
+    }
+
+    // ── 実行 / ターミナル ──
+
+    /// 任意のシェルコマンドを新しいターミナルセッションとして起動する。
+    fn spawn_command_terminal(
+        &mut self,
+        name: String,
+        command: String,
+        cwd: &Path,
+        ctx: &egui::Context,
+    ) {
+        use crate::agents::Approval;
+        let preset = config::AgentPreset {
+            name: name.clone(),
+            command,
+            icon: "▶".into(),
+            cwd: Some(cwd.display().to_string()),
+            env: HashMap::new(),
+        };
+        match self
+            .agents
+            .launch(&preset, cwd, Approval::from_mode(&self.cfg.approval_mode), ctx)
+        {
+            Ok(()) => {
+                self.agents.panel_open = true;
+                self.toast(trf("▶ {name} を開始しました", &[("name", name)]), true);
+            }
+            Err(e) => self.toast(e, false),
+        }
+    }
+
+    fn run_active_file(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.editor.active else { return };
+        let Some(path) = self.editor.buffers[i].path.clone() else {
+            self.toast(tr("先にファイルとして保存してください (⌘S)"), false);
+            return;
+        };
+        if self.editor.buffers[i].dirty() {
+            self.save_active(false);
+        }
+        let root = self
+            .tree
+            .root_for(&path)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.primary_root().to_path_buf());
+        let Some(cmd) = menu_bar::runner_for(&path, &root) else {
+            self.toast(tr("この拡張子の実行コマンドには対応していません"), false);
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        self.spawn_command_terminal(trf("Run {name}", &[("name", name)]), cmd, &root, ctx);
+    }
+
+    fn run_build_task(&mut self, ctx: &egui::Context) {
+        let root = self.primary_root().to_path_buf();
+        let Some((label, cmd)) = menu_bar::build_task_for(&root) else {
+            self.toast(
+                tr("ビルドタスクを検出できませんでした (Cargo.toml / package.json / Makefile)"),
+                false,
+            );
+            return;
+        };
+        self.spawn_command_terminal(label, cmd, &root, ctx);
+    }
+
+    /// 選択テキスト (無ければカーソル行) をアクティブなターミナルの入力欄へ送る。
+    /// プロジェクト方針により Enter は送らない — 実行はユーザーが確定する。
+    fn run_selection(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.editor.active else { return };
+        let text = self.editor.buffers[i].text.clone();
+        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        let sel = egui::TextEdit::load_state(ctx, ed_id)
+            .and_then(|st| st.cursor.char_range())
+            .map(|r| {
+                let (a, b) = (r.primary.index, r.secondary.index);
+                (a.min(b), a.max(b))
+            })
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| {
+                let sb = editor_ops::char_to_byte(&text, a);
+                let eb = editor_ops::char_to_byte(&text, b);
+                text[sb..eb].to_string()
+            });
+        let payload = match sel {
+            Some(s) => s,
+            None => {
+                // 選択が無ければカーソル行 (VS Code: Run Selected Text と同じ流儀)
+                let cur = self.active_cursor_char(ctx);
+                let line = editor_ops::line_of_char(&text, cur);
+                text.split('\n').nth(line).unwrap_or("").to_string()
+            }
+        };
+        if payload.trim().is_empty() {
+            self.toast(tr("送るテキストがありません"), false);
+            return;
+        }
+        self.send_to_agent(payload);
+    }
+
+    fn new_terminal(&mut self, ctx: &egui::Context) {
+        match self
+            .cfg
+            .agents
+            .iter()
+            .position(|p| p.command.trim().is_empty())
+        {
+            Some(i) => {
+                self.launch_preset(i, ctx);
+                self.agents.panel_open = true;
+            }
+            None => {
+                let root = self.primary_root().to_path_buf();
+                self.spawn_command_terminal(tr("Shell"), String::new(), &root, ctx);
+            }
+        }
+    }
+
+    // ── ファイル横断検索 (サイドバー検索タブ) ──
+
+    fn start_global_search(&mut self) {
+        let q = self.gsearch.query.trim().to_string();
+        if q.is_empty() || self.gsearch.running {
+            return;
+        }
+        let files: Vec<PathBuf> = self.file_index.iter().map(|f| f.abs.clone()).collect();
+        self.gsearch.rx = Some(file_search::spawn(files, q));
+        self.gsearch.running = true;
+        self.gsearch.searched = true;
+        self.gsearch.results.clear();
+    }
+
+    fn poll_global_search(&mut self) {
+        let done = match &self.gsearch.rx {
+            Some(rx) => match rx.try_recv() {
+                Ok((hits, scanned)) => {
+                    self.gsearch.results = hits;
+                    self.gsearch.scanned = scanned;
+                    true
+                }
+                Err(mpsc::TryRecvError::Empty) => false,
+                Err(mpsc::TryRecvError::Disconnected) => true,
+            },
+            None => false,
+        };
+        if done {
+            self.gsearch.rx = None;
+            self.gsearch.running = false;
+        }
+    }
+
+    // (検索パネルの描画は free 関数 global_search_panel — サイドバーの
+    //  クロージャ内で self 全体を借りずに済ませるため)
+
+    // ── 置換 (検索バーの置換行) ──
+
+    /// いまのヒットを置換して次を検索する。ヒットが無ければまず検索する。
+    fn replace_current(&mut self) {
+        let Some(i) = self.editor.active else { return };
+        if self.find.query.is_empty() {
+            return;
+        }
+        if self.editor.buffers[i].kind.read_only() {
+            self.toast(tr("このタブは読み取り専用です"), false);
+            return;
+        }
+        let text = self.editor.buffers[i].text.clone();
+        let qn = self.find.query.chars().count();
+        let hit = self.find.last.filter(|c| {
+            let sb = editor_ops::char_to_byte(&text, *c);
+            let eb = editor_ops::char_to_byte(&text, *c + qn);
+            eb <= text.len()
+                && text[sb..eb].to_lowercase() == self.find.query.to_lowercase()
+        });
+        let Some(c) = hit else {
+            self.find_next();
+            return;
+        };
+        let sb = editor_ops::char_to_byte(&text, c);
+        let eb = editor_ops::char_to_byte(&text, c + qn);
+        let mut nt = String::with_capacity(text.len());
+        nt.push_str(&text[..sb]);
+        nt.push_str(&self.find.replace);
+        nt.push_str(&text[eb..]);
+        self.editor.buffers[i].text = nt;
+        // 置換文字列の直後から次のヒットを探す (置換結果に query を含んでも無限ループしない)
+        let rep_chars = self.find.replace.chars().count();
+        self.find.last = Some((c + rep_chars).saturating_sub(1));
+        self.queue_lsp_change(i);
+        self.find_next();
+    }
+
+    fn replace_all_in_active(&mut self) {
+        let Some(i) = self.editor.active else { return };
+        if self.find.query.is_empty() {
+            return;
+        }
+        if self.editor.buffers[i].kind.read_only() {
+            self.toast(tr("このタブは読み取り専用です"), false);
+            return;
+        }
+        let text = self.editor.buffers[i].text.clone();
+        let (nt, n) = editor_ops::replace_all_ci(&text, &self.find.query, &self.find.replace);
+        if n == 0 {
+            self.toast(tr("見つかりませんでした"), false);
+            return;
+        }
+        self.editor.buffers[i].text = nt;
+        self.find.last = None;
+        self.queue_lsp_change(i);
+        self.toast(trf("{n} 件置換しました", &[("n", n.to_string())]), true);
+    }
+
+    // ── メニュー関連の小窓 (行移動 / 問題 / ショートカット / バージョン情報) ──
+
+    fn menu_windows_ui(&mut self, ctx: &egui::Context) {
+        self.goto_line_window(ctx);
+        self.problems_window(ctx);
+        self.shortcuts_window(ctx);
+        self.about_window(ctx);
+    }
+
+    fn goto_line_window(&mut self, ctx: &egui::Context) {
+        if !self.goto_open {
+            return;
+        }
+        let mut go: Option<(usize, usize)> = None;
+        let mut close = false;
+        egui::Window::new(tr("行/列へ移動"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_TOP, [0.0, 90.0])
+            .show(ctx, |ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.goto_input)
+                        .desired_width(220.0)
+                        .hint_text(tr("行[:列] — 例 42:5")),
+                );
+                resp.request_focus();
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = editor_ops::parse_goto(&self.goto_input);
+                    close = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        if let Some((line, col)) = go {
+            if let Some(i) = self.editor.active {
+                let ch = editor_ops::char_index_at(&self.editor.buffers[i].text, line, col);
+                if let Some(p) = self.active_file_path() {
+                    self.nav_push(p, ch);
+                }
+                self.jump_to_char(ch, 0);
+            }
+        }
+        if close {
+            self.goto_open = false;
+        }
+    }
+
+    fn problems_window(&mut self, ctx: &egui::Context) {
+        if !self.problems_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        // 開いている全ファイルの診断を集める
+        let mut rows: Vec<(PathBuf, String, lsp::Diagnostic)> = Vec::new();
+        for b in &self.editor.buffers {
+            let Some(path) = b.path.clone() else { continue };
+            let key = self.lsp_key_for(&path, &b.lang);
+            let Some(client) = self.lsp.get(&key) else { continue };
+            for d in client.diagnostics(&path) {
+                rows.push((path.clone(), b.title.clone(), d));
+            }
+        }
+        rows.sort_by_key(|(_, _, d)| (d.severity, d.line));
+        let mut open = self.problems_open;
+        let mut jump: Option<(PathBuf, usize, usize)> = None;
+        egui::Window::new(tr("⚠ 問題"))
+            .open(&mut open)
+            .default_size([560.0, 300.0])
+            .show(ctx, |ui| {
+                if rows.is_empty() {
+                    ui.label(
+                        RichText::new(tr(
+                            "問題は検出されていません (LSP が有効なファイルのみ対象)",
+                        ))
+                        .color(theme.text_dim),
+                    );
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("zv-problems")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        for (path, title, d) in &rows {
+                            let icon = match d.severity {
+                                1 => "❌",
+                                2 => "⚠",
+                                _ => "ℹ",
+                            };
+                            let label = format!(
+                                "{icon} {title}:{}  {}",
+                                d.line + 1,
+                                d.message.lines().next().unwrap_or("")
+                            );
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new(label).size(12.5))
+                                        .frame(false)
+                                        .wrap_mode(egui::TextWrapMode::Truncate),
+                                )
+                                .clicked()
+                            {
+                                jump = Some((path.clone(), d.line, d.col));
+                            }
+                        }
+                    });
+            });
+        self.problems_open = open;
+        if let Some((path, line, col)) = jump {
+            self.jump_to_lsp_pos(&path, line, col);
+        }
+    }
+
+    fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let mut open = self.shortcuts_open;
+        let rows: Vec<(String, String)> = shortcut_reference(&self.keys);
+        egui::Window::new(tr("⌨ キーボード ショートカット"))
+            .open(&mut open)
+            .default_size([460.0, 420.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(tr(
+                        "config.toml の [keybindings] で上書きできます (action名 = \"cmd+shift+p\")",
+                    ))
+                    .size(11.5)
+                    .color(theme.text_dim),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("zv-shortcuts")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        egui::Grid::new("zv-shortcut-grid")
+                            .num_columns(2)
+                            .striped(true)
+                            .spacing([28.0, 5.0])
+                            .show(ui, |ui| {
+                                for (label, key) in &rows {
+                                    ui.label(label);
+                                    ui.label(RichText::new(key).monospace());
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+        self.shortcuts_open = open;
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let mut open = self.about_open;
+        egui::Window::new(tr("Zaivern Code について"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("⚡").size(42.0).color(theme.accent));
+                    ui.label(RichText::new("Zaivern Code").size(20.0).strong());
+                    ui.label(
+                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .color(theme.text_dim),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(tr(
+                            "Rust製 AI-Native エディタ — Zed の速度 × Cmux の並列エージェント × AGI Cockpit の操縦席",
+                        ))
+                        .size(12.0)
+                        .color(theme.text_dim),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!("egui 0.29 / rustc {}", rustc_version()))
+                            .size(11.0)
+                            .color(theme.text_dim),
+                    );
+                });
+            });
+        self.about_open = open;
+    }
+}
+
+/// ショートカット一覧 (ダイアログ表示用)。実際のバインド (上書き込み) に追従する。
+fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
+    use crate::keybinds::format_shortcut;
+    let mut rows: Vec<(String, String)> = vec![
+        (tr("コマンド パレット"), format_shortcut(keys.get(BindAction::PaletteCommands))),
+        (tr("ファイルへ移動"), format_shortcut(keys.get(BindAction::PaletteFiles))),
+        (tr("保存"), format_shortcut(keys.get(BindAction::Save))),
+        (tr("名前を付けて保存"), format_shortcut(keys.get(BindAction::SaveAs))),
+        (tr("すべて保存"), format_shortcut(keys.get(BindAction::SaveAll))),
+        (tr("新規ファイル"), format_shortcut(keys.get(BindAction::NewFile))),
+        (tr("ファイルを開く"), format_shortcut(keys.get(BindAction::OpenFile))),
+        (tr("タブを閉じる"), format_shortcut(keys.get(BindAction::CloseTab))),
+        (tr("検索"), format_shortcut(keys.get(BindAction::Find))),
+        (tr("置換"), format_shortcut(keys.get(BindAction::OpenReplace))),
+        (tr("ファイル間で検索"), format_shortcut(keys.get(BindAction::GlobalSearch))),
+        (tr("行コメントの切り替え"), format_shortcut(keys.get(BindAction::ToggleComment))),
+        (tr("行を複製"), format_shortcut(keys.get(BindAction::DuplicateLine))),
+        (tr("行を上へ移動"), format_shortcut(keys.get(BindAction::MoveLineUp))),
+        (tr("行を下へ移動"), format_shortcut(keys.get(BindAction::MoveLineDown))),
+        (tr("行/列へ移動"), format_shortcut(keys.get(BindAction::GoToLine))),
+        (tr("定義へ移動"), format_shortcut(keys.get(BindAction::GoToDefinition))),
+        (tr("ブラケットへ移動"), format_shortcut(keys.get(BindAction::GoToBracket))),
+        (tr("戻る"), format_shortcut(keys.get(BindAction::NavBack))),
+        (tr("進む"), format_shortcut(keys.get(BindAction::NavForward))),
+        (tr("次のエディター"), format_shortcut(keys.get(BindAction::NextTab))),
+        (tr("前のエディター"), format_shortcut(keys.get(BindAction::PrevTab))),
+        (tr("エクスプローラー"), format_shortcut(keys.get(BindAction::FocusExplorer))),
+        (tr("サイドバー切替"), format_shortcut(keys.get(BindAction::ToggleSidebar))),
+        (tr("ターミナル切替"), format_shortcut(keys.get(BindAction::ToggleTerminal))),
+        (tr("新しいターミナル"), format_shortcut(keys.get(BindAction::NewTerminal))),
+        (tr("Cockpit 切替"), format_shortcut(keys.get(BindAction::ToggleCockpit))),
+        (tr("Markdown プレビュー"), format_shortcut(keys.get(BindAction::ToggleMdPreview))),
+        (tr("エージェント起動"), format_shortcut(keys.get(BindAction::NewAgent))),
+        (tr("ビルド タスクの実行"), format_shortcut(keys.get(BindAction::RunBuildTask))),
+        (tr("問題パネル"), format_shortcut(keys.get(BindAction::ToggleProblems))),
+        (tr("フルスクリーン"), format_shortcut(keys.get(BindAction::ToggleFullScreen))),
+        (tr("フォント拡大"), format_shortcut(keys.get(BindAction::FontInc))),
+        (tr("フォント縮小"), format_shortcut(keys.get(BindAction::FontDec))),
+    ];
+    // egui TextEdit 内蔵 (バインド変更不可) のもの
+    for (label, spec) in [
+        (tr("元に戻す"), "cmd+z"),
+        (tr("やり直し"), "cmd+shift+z"),
+        (tr("切り取り"), "cmd+x"),
+        (tr("コピー"), "cmd+c"),
+        (tr("貼り付け"), "cmd+v"),
+        (tr("すべて選択"), "cmd+a"),
+    ] {
+        if let Some(sc) = parse_shortcut(spec) {
+            rows.push((label, format_shortcut(sc)));
+        }
+    }
+    rows
+}
+
+/// About ダイアログ用のビルド環境表示 (取得できなければ "unknown")。
+fn rustc_version() -> &'static str {
+    option_env!("ZV_RUSTC_VERSION").unwrap_or("1.88+")
+}
+
+/// サイドバーの「検索」タブ本体。self 全体を借りない free 関数にして、
+/// サイドバー描画クロージャ内の他フィールド借用と両立させる。
+/// 返り値: (検索開始要求, ジャンプ先 (パス, 0-based 行))。
+fn global_search_panel(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    gsearch: &mut GlobalSearchState,
+    file_index: &[IndexedFile],
+) -> (bool, Option<(PathBuf, usize)>) {
+    let mut go = false;
+    ui.horizontal(|ui| {
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut gsearch.query)
+                .desired_width((ui.available_width() - 34.0).max(80.0))
+                .hint_text(tr("ワークスペース全体を検索…")),
+        );
+        if gsearch.focus {
+            resp.request_focus();
+            gsearch.focus = false;
+        }
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            go = true;
+        }
+        if ui.button("🔎").on_hover_text(tr("検索 (Enter)")).clicked() {
+            go = true;
+        }
+    });
+    if gsearch.running {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new(tr("検索中…")).color(theme.text_dim));
+        });
+    } else if gsearch.searched {
+        let n = gsearch.results.len();
+        let capped = if n >= file_search::MAX_HITS {
+            tr(" (上限で打ち切り)")
+        } else {
+            String::new()
+        };
+        ui.label(
+            RichText::new(trf(
+                "{n} 件ヒット / {m} ファイル走査{capped}",
+                &[
+                    ("n", n.to_string()),
+                    ("m", gsearch.scanned.to_string()),
+                    ("capped", capped),
+                ],
+            ))
+            .size(11.5)
+            .color(theme.text_dim),
+        );
+    }
+    ui.separator();
+    let mut jump: Option<(PathBuf, usize)> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("zv-gsearch")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            let mut last_file: Option<&Path> = None;
+            for hit in &gsearch.results {
+                if last_file != Some(hit.path.as_path()) {
+                    last_file = Some(hit.path.as_path());
+                    let rel = file_index
+                        .iter()
+                        .find(|f| f.abs == hit.path)
+                        .map(|f| f.label.clone())
+                        .unwrap_or_else(|| hit.path.display().to_string());
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("📄 {rel}")).strong());
+                }
+                let row = format!("{:>5}  {}", hit.line + 1, hit.text);
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(row).size(12.0))
+                            .frame(false)
+                            .wrap_mode(egui::TextWrapMode::Truncate),
+                    )
+                    .clicked()
+                {
+                    jump = Some((hit.path.clone(), hit.line));
+                }
+            }
+        });
+    (go, jump)
 }
 
 #[cfg(test)]
