@@ -3716,7 +3716,20 @@ impl ZaivernApp {
             self.tree.focus();
         }
         if consume(ctx, self.keys.get(BindAction::Find)) {
-            cmds.push(Cmd::OpenFind);
+            // 端末フォーカス中の Cmd+F は端末内検索 (前フレームで terminal::draw が
+            // 残したフォーカス中セッションIDで振り分ける)。それ以外はエディタ検索。
+            let term_sid: Option<u64> =
+                ctx.data(|d| d.get_temp(egui::Id::new("zv-focused-terminal")));
+            let routed = term_sid
+                .and_then(|sid| self.agents.sessions.iter_mut().find(|s| s.id == sid))
+                .map(|s| {
+                    s.search.open = true;
+                    s.search.focus_pending = true;
+                })
+                .is_some();
+            if !routed {
+                cmds.push(Cmd::OpenFind);
+            }
         }
         if consume(ctx, self.keys.get(BindAction::ToggleCockpit)) {
             cmds.push(Cmd::ToggleCockpit);

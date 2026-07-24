@@ -24,6 +24,25 @@ pub struct SpawnSpec {
     pub log_path: Option<PathBuf>,
 }
 
+/// 端末内検索 (Cmd+F) の UI 状態。クエリと直近ヒットを覚えるだけで、
+/// 検索そのものはナビゲーション操作のたびにスクロールバック全文へかけ直す
+/// (端末は常に流れるので、キャッシュより都度検索の方が正確)。
+#[derive(Default)]
+pub struct SearchUi {
+    /// 検索バーを表示中か。
+    pub open: bool,
+    /// 検索クエリ (大文字小文字は区別しない)。
+    pub query: String,
+    /// 直近ヒットの絶対行 (0 = スクロールバック最古行)。次/前の起点。
+    pub hit_line: Option<usize>,
+    /// 直近検索のヒット行数 (UI 表示用)。
+    pub total: usize,
+    /// 現在何件目か (1-based、0 は未確定。UI 表示用)。
+    pub index: usize,
+    /// 次のフレームで検索バーの入力欄へフォーカスを移す (開いた直後用)。
+    pub focus_pending: bool,
+}
+
 pub struct Session {
     /// セッション毎に一意な安定ID(呼び出し側が採番)。sessions の index は
     /// 削除で前へ詰まるため、バブル却下記録などの識別にはこちらを使う。
@@ -73,6 +92,8 @@ pub struct Session {
     pub selection: Option<((u16, u16), (u16, u16))>,
     /// ドラッグ選択のアンカー(ドラッグ開始セル)。
     sel_anchor: Option<(u16, u16)>,
+    /// 端末内検索 (Cmd+F) の状態。スクロールバック全体を対象にする。
+    pub search: SearchUi,
     /// コピー完了フィードバックの表示開始時刻。
     copied_at: Option<Instant>,
     /// ユーザーがキーボードから直接この端末へ文字を送ったか。
@@ -1116,6 +1137,7 @@ impl Session {
             auto_yes_resend_after: Duration::from_secs(30),
             selection: None,
             sel_anchor: None,
+            search: SearchUi::default(),
             copied_at: None,
             user_typed: false,
             cursor_shape,
@@ -1479,6 +1501,38 @@ impl Session {
         if rows > 0 && cols > 0 {
             self.selection = Some(((0, 0), (rows.saturating_sub(1), cols.saturating_sub(1))));
         }
+    }
+
+    /// 端末内検索: 次 (forward=true, 新しい方=下) / 前 (古い方=上) のヒットへ。
+    /// スクロールバック全体を検索し、ヒット行が見えるようスクロールする。
+    /// ヒットがあれば true。`search` の hit_line / total / index を更新する。
+    pub fn search_step(&mut self, forward: bool) -> bool {
+        let (lines, rows) = {
+            let mut p = lock_ok(&self.parser);
+            let rows = p.screen().size().0 as usize;
+            (all_terminal_lines(&mut p), rows)
+        };
+        let hits = line_hits(&lines, &self.search.query);
+        self.search.total = hits.len();
+        if hits.is_empty() {
+            self.search.hit_line = None;
+            self.search.index = 0;
+            return false;
+        }
+        let pos = match (self.search.hit_line, forward) {
+            // 初回は一番新しいヒットから (端末は下から上へ探すのが自然)
+            (None, _) => hits.len() - 1,
+            (Some(cur), true) => hits.iter().position(|&h| h > cur).unwrap_or(0),
+            (Some(cur), false) => hits
+                .iter()
+                .rposition(|&h| h < cur)
+                .unwrap_or(hits.len() - 1),
+        };
+        let hit = hits[pos];
+        self.search.hit_line = Some(hit);
+        self.search.index = pos + 1;
+        self.set_scroll(search_scroll_target(hit, lines.len(), rows));
+        true
     }
 
     /// (代替画面か, アプリがマウス報告を有効にしているか, SGRエンコードか)。
@@ -1871,9 +1925,107 @@ mod tests {
     }
 
     use super::{
-        key_bytes, mac_agent_input_bytes, normalize_sel, selection_text, word_selection,
-        Session,
+        all_terminal_lines, key_bytes, line_hits, mac_agent_input_bytes, normalize_sel,
+        search_scroll_target, selection_text, word_selection, Session,
     };
+
+    #[test]
+    fn all_terminal_lines_covers_scrollback_and_screen() {
+        let mut p = vt100::Parser::new(5, 20, 100);
+        for i in 0..30 {
+            p.process(format!("line{:03}\r\n", i).as_bytes());
+        }
+        let lines = all_terminal_lines(&mut p);
+        assert!(lines.len() >= 30, "30行全部が取れる: {}", lines.len());
+        for (i, l) in lines.iter().take(30).enumerate() {
+            assert_eq!(l, &format!("line{:03}", i));
+        }
+        // 呼び出し後は scrollback 位置が元 (0) に戻っている
+        assert_eq!(p.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn deep_scrollback_read_does_not_panic() {
+        // vt100 0.15.2 素のままだと offset > 画面行数 で減算オーバーフロー
+        // panic していた (vendor/vt100 パッチの回帰テスト)。
+        let mut p = vt100::Parser::new(5, 20, 100);
+        for i in 0..40 {
+            p.process(format!("deep{:03}\r\n", i).as_bytes());
+        }
+        p.set_scrollback(30); // 画面 5 行を大きく超えて戻る
+        let contents = p.screen().contents();
+        // 一番上の可視行は 30 行戻った位置の行になる
+        assert!(
+            contents.lines().next().unwrap_or("").starts_with("deep"),
+            "深いスクロールバックでも読める: {contents:?}"
+        );
+        assert_eq!(p.screen().rows(0, 20).count(), 5, "可視行数は画面行数のまま");
+        p.set_scrollback(0);
+    }
+
+    #[test]
+    fn line_hits_is_case_insensitive_and_skips_empty_query() {
+        let lines = vec![
+            "Error: build failed".to_string(),
+            "ok".to_string(),
+            "  ERROR again".to_string(),
+        ];
+        assert_eq!(line_hits(&lines, "error"), vec![0, 2]);
+        assert_eq!(line_hits(&lines, "ERROR"), vec![0, 2]);
+        assert_eq!(line_hits(&lines, ""), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn search_scroll_target_centers_hit() {
+        // total 100 行 / 画面 10 行 → 最大戻り量 90
+        assert_eq!(search_scroll_target(0, 100, 10), 90); // 最古行 → 一番上まで戻る
+        assert_eq!(search_scroll_target(99, 100, 10), 0); // 最新行 → 戻らない
+        assert_eq!(search_scroll_target(50, 100, 10), 45); // 中央寄せ
+        assert_eq!(search_scroll_target(5, 8, 10), 0); // 画面に収まる量なら戻らない
+    }
+
+    #[test]
+    fn session_search_step_finds_and_navigates_hits() {
+        let dir = std::env::current_dir().unwrap();
+        let spec = super::SpawnSpec {
+            title: "test".into(),
+            command: "echo search-test".into(),
+            cwd: dir,
+            env: std::collections::HashMap::new(),
+            preset_name: String::new(),
+            icon: "💬".into(),
+            log_path: None,
+        };
+        let mut session =
+            Session::spawn(9992, spec, eframe::egui::Context::default()).unwrap();
+        // 画面 30 行を超える出力を直接パーサへ流し込み、スクロールバックを作る
+        {
+            let mut p = session.parser.lock().unwrap();
+            for i in 0..80 {
+                let tag = if i % 10 == 5 { "NEEDLE" } else { "hay" };
+                p.process(format!("row{:03} {}\r\n", i, tag).as_bytes());
+            }
+        }
+        session.search.query = "needle".to_string();
+        // 初回 = 一番新しいヒット (row075)
+        assert!(session.search_step(false));
+        assert_eq!(session.search.total, 8);
+        assert_eq!(session.search.index, 8);
+        let first_hit = session.search.hit_line.unwrap();
+        // 前 (古い方) へ → row065 のはず (絶対行も戻り量も増える)
+        assert!(session.search_step(false));
+        assert_eq!(session.search.index, 7);
+        assert!(session.search.hit_line.unwrap() < first_hit);
+        // 次 (新しい方) へ戻る
+        assert!(session.search_step(true));
+        assert_eq!(session.search.index, 8);
+        assert_eq!(session.search.hit_line.unwrap(), first_hit);
+        // ヒットしないクエリは false で状態リセット
+        session.search.query = "no-such-text".to_string();
+        assert!(!session.search_step(true));
+        assert_eq!(session.search.total, 0);
+        assert_eq!(session.search.index, 0);
+    }
 
     fn mac_command() -> egui::Modifiers {
         egui::Modifiers {
@@ -3069,6 +3221,198 @@ fn mac_agent_input_bytes(key: egui::Key, m: egui::Modifiers) -> Option<&'static 
     }
 }
 
+/// 端末内検索バー (Cmd+F)。端末の右上に浮かせて表示する。
+fn terminal_search_bar_ui(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    theme: &Theme,
+    rect: egui::Rect,
+) {
+    let area_id = egui::Id::new(("zv-term-search", session.id));
+    let pos = egui::pos2((rect.right() - 330.0).max(rect.left() + 4.0), rect.top() + 6.0);
+    egui::Area::new(area_id)
+        .fixed_pos(pos)
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let te = ui.add(
+                        egui::TextEdit::singleline(&mut session.search.query)
+                            .desired_width(150.0)
+                            .hint_text(tr("端末内を検索…")),
+                    );
+                    if session.search.focus_pending {
+                        te.request_focus();
+                        session.search.focus_pending = false;
+                    }
+                    let (enter, shift) = ui.input(|i| {
+                        (i.key_pressed(egui::Key::Enter), i.modifiers.shift)
+                    });
+                    if te.lost_focus() && enter {
+                        // Enter = 前 (古い方) へ / Shift+Enter = 次 (新しい方) へ
+                        session.search_step(shift);
+                        te.request_focus();
+                    } else if te.changed() {
+                        // 打つたびに検索し直す (起点は最新ヒットへリセット)
+                        session.search.hit_line = None;
+                        session.search_step(false);
+                    }
+                    let count = if session.search.total > 0 {
+                        format!("{}/{}", session.search.index, session.search.total)
+                    } else if session.search.query.is_empty() {
+                        String::new()
+                    } else {
+                        tr("0件")
+                    };
+                    ui.label(egui::RichText::new(count).size(11.0).color(theme.text_dim));
+                    if ui
+                        .small_button("▲")
+                        .on_hover_text(tr("前 (古い方) へ (Enter)"))
+                        .clicked()
+                    {
+                        session.search_step(false);
+                    }
+                    if ui
+                        .small_button("▼")
+                        .on_hover_text(tr("次 (新しい方) へ (Shift+Enter)"))
+                        .clicked()
+                    {
+                        session.search_step(true);
+                    }
+                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if ui.small_button("✕").clicked() || esc {
+                        session.search.open = false;
+                        session.search.hit_line = None;
+                        session.search.index = 0;
+                        session.search.total = 0;
+                        session.set_scroll(0);
+                    }
+                });
+            });
+        });
+}
+
+/// 表示中画面の検索ヒットに半透明ハイライトを重ねる。
+/// ワイド文字 (CJK 等) は 2 セル幅として扱う。
+fn paint_search_highlights(
+    painter: &egui::Painter,
+    session: &Session,
+    theme: &Theme,
+    rect: egui::Rect,
+    padding: f32,
+    cell_w: f32,
+    cell_h: f32,
+) {
+    let q: Vec<char> = session
+        .search
+        .query
+        .chars()
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if q.is_empty() {
+        return;
+    }
+    let p = lock_ok(&session.parser);
+    let screen = p.screen();
+    let (rows, cols) = screen.size();
+    let fill = theme.warn.gamma_multiply(0.30);
+    let stroke = egui::Stroke::new(1.0_f32, theme.warn.gamma_multiply(0.75));
+    for row in 0..rows {
+        // 行の小文字化文字列と「文字 → (セル列, セル幅)」対応表を作る
+        let mut chars: Vec<char> = Vec::new();
+        let mut colmap: Vec<(u16, u16)> = Vec::new();
+        for col in 0..cols {
+            let Some(cell) = screen.cell(row, col) else { continue };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let w = if cell.is_wide() { 2 } else { 1 };
+            let s = cell.contents();
+            if s.is_empty() {
+                chars.push(' ');
+                colmap.push((col, 1));
+            } else {
+                for ch in s.chars().flat_map(|c| c.to_lowercase()) {
+                    chars.push(ch);
+                    colmap.push((col, w));
+                }
+            }
+        }
+        if chars.len() < q.len() {
+            continue;
+        }
+        let mut i = 0;
+        while i + q.len() <= chars.len() {
+            if chars[i..i + q.len()] == q[..] {
+                let (c0, _) = colmap[i];
+                let (c1, w1) = colmap[i + q.len() - 1];
+                let x0 = rect.min.x + padding + f32::from(c0) * cell_w;
+                let x1 = rect.min.x + padding + f32::from(c1 + w1) * cell_w;
+                let y0 = rect.min.y + padding + f32::from(row) * cell_h;
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(x0, y0),
+                    egui::pos2(x1.min(rect.max.x), (y0 + cell_h).min(rect.max.y)),
+                );
+                painter.rect(r, 2.0, fill, stroke);
+                i += q.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// スクロールバック全体 + 現在画面の全行を絶対行順 (最古が先頭) で取り出す。
+/// 呼び出し中だけ scrollback 位置を動かし、終わったら必ず元の位置へ戻す。
+fn all_terminal_lines(p: &mut vt100::Parser) -> Vec<String> {
+    let saved = p.screen().scrollback();
+    p.set_scrollback(usize::MAX);
+    let top = p.screen().scrollback();
+    let (rows, cols) = p.screen().size();
+    if rows == 0 {
+        p.set_scrollback(saved);
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(top + rows as usize);
+    loop {
+        // 窓の先頭が「次に読みたい絶対行」に来るよう戻り量を選ぶ
+        let o = top.saturating_sub(lines.len());
+        p.set_scrollback(o);
+        let start = top - p.screen().scrollback();
+        for (r, row) in p.screen().rows(0, cols).enumerate() {
+            if start + r == lines.len() {
+                lines.push(row);
+            }
+        }
+        if o == 0 {
+            break;
+        }
+    }
+    p.set_scrollback(saved);
+    lines
+}
+
+/// query を含む行番号を列挙する (大文字小文字は区別しない)。
+fn line_hits(lines: &[String], query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// ヒット行が画面中央あたりに来る scrollback 量を計算する。
+fn search_scroll_target(hit: usize, total_lines: usize, rows: usize) -> usize {
+    let top = total_lines.saturating_sub(rows); // 最大の戻り量
+    let want_start = hit.saturating_sub(rows / 2); // 窓の先頭に置きたい絶対行
+    top.saturating_sub(want_start.min(top))
+}
+
 fn ansi_color(theme: &Theme, i: u8) -> egui::Color32 {
     if i < 16 {
         theme.ansi[i as usize]
@@ -3651,6 +3995,16 @@ pub fn draw(
         session.set_scroll(0);
     }
 
+    // Cmd+F ルーティング用に「どの端末がフォーカス中か」を egui 一時データへ
+    // 残す。app 側のグローバルショートカット処理は (パネル描画より先に走るので)
+    // 前フレームのこの値を読んで、エディタ検索か端末内検索かを振り分ける。
+    let focus_flag = egui::Id::new("zv-focused-terminal");
+    if focused {
+        ui.data_mut(|d| d.insert_temp(focus_flag, session.id));
+    } else if ui.data(|d| d.get_temp::<u64>(focus_flag)) == Some(session.id) {
+        ui.data_mut(|d| d.remove::<u64>(focus_flag));
+    }
+
     if focused {
         forward_keyboard_input(ui, session, response.id);
     } else if !session.preedit.is_empty() {
@@ -3667,6 +4021,14 @@ pub fn draw(
     draw_screen(
         ui, &painter, session, theme, &font_id, rect, padding, cell_w, cell_h, focused,
     );
+
+    // 端末内検索 (Cmd+F): 表示中画面のヒットをハイライトし、バーを浮かせる
+    if session.search.open && !session.search.query.is_empty() {
+        paint_search_highlights(&painter, session, theme, rect, padding, cell_w, cell_h);
+    }
+    if interactive && session.search.open {
+        terminal_search_bar_ui(ui, session, theme, rect);
+    }
 
     // 履歴表示中だけ「⤓ 一番下へ」ボタンを出す。一番下(scroll == 0)なら何も表示しない。
     if session.scroll > 0 {

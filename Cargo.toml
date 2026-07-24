@@ -28,3 +28,9 @@ qrcode = { version = "0.14", default-features = false }
 opt-level = 3
 lto = "thin"
 strip = "symbols"
+
+# vt100 0.15.2 の visible_rows は scrollback offset が画面行数を超えると
+# debug ビルドで減算オーバーフロー panic する (release は wrap で偶然動く)。
+# 修正版をベンダリングして差し替える (vendor/vt100/src/grid.rs 参照)。
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
