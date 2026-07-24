@@ -711,6 +711,7 @@ pub fn merged_env(
 /// セッション ID ごとに環境変数を安全に分離・アイソレートしたマップを生成する。
 /// `CLAUDE_CONFIG_DIR` が未指定の場合、`~/.claude-sessions/session-{session_id}` を自動割り当てし、
 /// 複数 Claude インスタンスの同時起動時のファイルロック衝突を回避する。
+#[allow(dead_code)]
 pub fn isolated_env_for_session(
     command: &str,
     session_id: u64,
