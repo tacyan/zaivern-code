@@ -861,7 +861,7 @@ impl AgentManager {
             } else if !s.notified_exit {
                 s.notified_exit = true;
                 s.attention = false;
-                let code = s.exit_code.lock().unwrap().unwrap_or(0);
+                let code = crate::lockx::lock_ok(&s.exit_code).unwrap_or(0);
                 events.push(SessionEvent::Exited(s.title.clone(), code));
             }
         }

@@ -7991,7 +7991,7 @@ impl ZaivernApp {
             }
             remote::Query::Term => match self.agents.active_session() {
                 Some(s) => {
-                    let text = s.parser.lock().unwrap().screen().contents();
+                    let text = crate::lockx::lock_ok(&s.parser).screen().contents();
                     json!({
                         "ok": true, "title": s.title, "running": s.running(), "text": text,
                     })

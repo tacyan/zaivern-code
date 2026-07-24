@@ -9,6 +9,7 @@ use eframe::egui;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 use crate::i18n::{tr, trf};
+use crate::lockx::lock_ok;
 use crate::theme::Theme;
 
 pub struct SpawnSpec {
@@ -866,7 +867,7 @@ impl Session {
                             // 先に vt100 へ流してから走査する。CSI 6n はアプリが
                             // 「ここまで描いた」直後に送って返事を待つものなので、
                             // チャンクを反映し終えたカーソル位置が正解になる。
-                            parser.lock().unwrap().process(&buf[..n]);
+                            lock_ok(&parser).process(&buf[..n]);
                             let mut reply: Vec<u8> = Vec::new();
                             for ev in scanner.scan(&buf[..n]) {
                                 match ev {
@@ -874,7 +875,7 @@ impl Session {
                                     TermEvent::CursorReport | TermEvent::ExtCursorReport => {
                                         let ext = matches!(ev, TermEvent::ExtCursorReport);
                                         let (r, c) = {
-                                            let p = parser.lock().unwrap();
+                                            let p = lock_ok(&parser);
                                             p.screen().cursor_position()
                                         };
                                         reply.extend_from_slice(&cursor_report(r, c, ext));
@@ -886,7 +887,7 @@ impl Session {
                                         focus_reports.store(on, Ordering::Relaxed);
                                     }
                                     TermEvent::Clipboard(s) => {
-                                        *clipboard_pending.lock().unwrap() = Some(s);
+                                        *lock_ok(&clipboard_pending) = Some(s);
                                     }
                                     TermEvent::ColorQuery(ps) => {
                                         let rgb = if ps == 10 { &report_fg } else { &report_bg }
@@ -896,7 +897,7 @@ impl Session {
                                 }
                             }
                             if !reply.is_empty() {
-                                let mut w = writer.lock().unwrap();
+                                let mut w = lock_ok(&writer);
                                 let _ = w.write_all(&reply);
                                 let _ = w.flush();
                             }
@@ -913,7 +914,7 @@ impl Session {
             let exited = exited.clone();
             std::thread::spawn(move || {
                 if let Ok(status) = child.wait() {
-                    *exit_code.lock().unwrap() = Some(status.exit_code());
+                    *lock_ok(&exit_code) = Some(status.exit_code());
                 }
                 exited.store(true, Ordering::SeqCst);
                 ctx.request_repaint();
@@ -1028,7 +1029,7 @@ impl Session {
             return None;
         }
         self.last_scan = Instant::now();
-        let text = self.parser.lock().unwrap().screen().contents();
+        let text = lock_ok(&self.parser).screen().contents();
         // 未読判定用: 意味的な画面ハッシュを更新する (スピナー等の揺れは無視)。
         self.cur_hash = semantic_hash(&text);
         // レート制限の「継続 / 解除」の追跡。新規検知の確定は末尾で行う
@@ -1143,7 +1144,7 @@ impl Session {
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        let mut w = self.writer.lock().unwrap();
+        let mut w = lock_ok(&self.writer);
         let _ = w.write_all(bytes);
         let _ = w.flush();
     }
@@ -1180,7 +1181,7 @@ impl Session {
     /// 呼び出し側が `ui.output_mut(|o| o.copied_text = s)` 等へ流す想定。
     #[allow(dead_code)] // TODO(app.rs 連携): egui のクリップボードへ流すまで未使用
     pub fn take_clipboard(&mut self) -> Option<String> {
-        self.clipboard_pending.lock().unwrap().take()
+        lock_ok(&self.clipboard_pending).take()
     }
 
     /// OSC 10/11 の色問い合わせに返す前景/背景色を設定する。
@@ -1235,7 +1236,7 @@ impl Session {
     /// プロンプトが消える・別のプロンプトに変わると、また検出対象へ戻る。
     pub fn resolve_attention(&mut self) {
         self.attention = false;
-        let text = self.parser.lock().unwrap().screen().contents();
+        let text = lock_ok(&self.parser).screen().contents();
         self.answered_sig = Some(prompt_signature(&text));
         // 手動 (バブル/手入力) で解決したエピソードは停滞ウォッチドッグの対象外。
         // ユーザーが自分の意思で操作している最中に勝手な再送をしない。
@@ -1248,7 +1249,7 @@ impl Session {
     /// 「1. No, exit」のプロンプトへ Enter を送るとセッションが終了してしまうため、
     /// 番号キー「2」などプロンプトに合った承認キーを返す。分類不能なら None。
     pub fn approve_reply(&self) -> Option<&'static str> {
-        let text = self.parser.lock().unwrap().screen().contents();
+        let text = lock_ok(&self.parser).screen().contents();
         let (bytes, _) = auto_yes_reply(&text)?;
         std::str::from_utf8(bytes).ok()
     }
@@ -1264,7 +1265,7 @@ impl Session {
             pixel_width: 0,
             pixel_height: 0,
         });
-        self.parser.lock().unwrap().set_size(rows, cols);
+        lock_ok(&self.parser).set_size(rows, cols);
     }
 
     pub fn kill(&mut self) {
@@ -1278,7 +1279,7 @@ impl Session {
             self.sel_anchor = None;
         }
         self.scroll = n;
-        self.parser.lock().unwrap().set_scrollback(n);
+        lock_ok(&self.parser).set_scrollback(n);
     }
 
     pub fn adjust_scroll(&mut self, delta: i64) {
@@ -1290,7 +1291,7 @@ impl Session {
     /// 代替画面(vim / less / Claude Code 等)にはスクロールバック履歴が無いため、
     /// ローカルスクロールではなくホイールをアプリへ転送する必要がある。
     pub fn wheel_modes(&self) -> (bool, bool, bool) {
-        let p = self.parser.lock().unwrap();
+        let p = lock_ok(&self.parser);
         let s = p.screen();
         let mouse_on = !matches!(
             s.mouse_protocol_mode(),
@@ -2422,7 +2423,7 @@ fn copy_selection(ui: &egui::Ui, session: &mut Session) {
         return;
     };
     let text = {
-        let p = session.parser.lock().unwrap();
+        let p = lock_ok(&session.parser);
         selection_text(p.screen(), sel)
     };
     if !text.is_empty() {
@@ -2540,7 +2541,7 @@ pub fn draw(
             if let Some(pos) = response.interact_pointer_pos() {
                 let (r, c) = to_cell(pos);
                 session.selection = {
-                    let p = session.parser.lock().unwrap();
+                    let p = lock_ok(&session.parser);
                     word_selection(p.screen(), r, c)
                 };
             }
@@ -2573,7 +2574,7 @@ pub fn draw(
         });
         let events = ui.input(|i| i.events.clone());
         let (app_cursor, bracketed) = {
-            let p = session.parser.lock().unwrap();
+            let p = lock_ok(&session.parser);
             let s = p.screen();
             (s.application_cursor(), s.bracketed_paste())
         };
@@ -2702,7 +2703,7 @@ pub fn draw(
 
     let sel_norm = session.selection.map(normalize_sel);
     {
-        let parser = session.parser.lock().unwrap();
+        let parser = lock_ok(&session.parser);
         let screen = parser.screen();
         let (rows, cols) = screen.size();
         let origin = rect.min + egui::vec2(padding, padding);
@@ -2882,7 +2883,7 @@ pub fn draw(
     }
 
     if !session.running() {
-        let code = session.exit_code.lock().unwrap().unwrap_or(0);
+        let code = lock_ok(&session.exit_code).unwrap_or(0);
         painter.text(
             egui::pos2(rect.max.x - 8.0, rect.max.y - 6.0),
             egui::Align2::RIGHT_BOTTOM,
@@ -2904,7 +2905,7 @@ pub fn draw(
                 ui.close_menu();
             }
             if ui.button(tr("📄 画面全体をコピー")).clicked() {
-                let text = session.parser.lock().unwrap().screen().contents();
+                let text = lock_ok(&session.parser).screen().contents();
                 ui.ctx().copy_text(text);
                 session.copied_at = Some(Instant::now());
                 ui.close_menu();

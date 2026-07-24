@@ -24,6 +24,7 @@ mod i18n;
 mod ide;
 mod jsonc;
 mod keybinds;
+mod lockx;
 mod lsp;
 mod markdown;
 mod menu_bar;

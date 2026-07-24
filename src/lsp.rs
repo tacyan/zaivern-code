@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use crate::lockx::lock_ok;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -356,12 +357,7 @@ impl LspClient {
             "workspaceFolders": [{ "uri": root_uri, "name": root_name }]
         });
         let id = client.next_id.fetch_add(1, Ordering::SeqCst);
-        client
-            .shared
-            .pending
-            .lock()
-            .unwrap()
-            .insert(id, Pending::Initialize);
+        lock_ok(&client.shared.pending).insert(id, Pending::Initialize);
         send_json(
             &client.tx,
             json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":init_params}),
@@ -384,7 +380,7 @@ impl LspClient {
 
     pub fn did_open(&self, path: &Path, language_id: &str, text: &str) {
         let p = canonical(path);
-        self.versions.lock().unwrap().insert(p.clone(), 1);
+        lock_ok(&self.versions).insert(p.clone(), 1);
         self.notify(
             "textDocument/didOpen",
             json!({
@@ -402,7 +398,7 @@ impl LspClient {
     pub fn did_change(&self, path: &Path, text: &str) {
         let p = canonical(path);
         let version = {
-            let mut versions = self.versions.lock().unwrap();
+            let mut versions = lock_ok(&self.versions);
             let v = versions.entry(p.clone()).or_insert(1);
             *v += 1;
             *v
@@ -418,7 +414,7 @@ impl LspClient {
 
     pub fn did_close(&self, path: &Path) {
         let p = canonical(path);
-        self.versions.lock().unwrap().remove(&p);
+        lock_ok(&self.versions).remove(&p);
         self.notify(
             "textDocument/didClose",
             json!({ "textDocument": { "uri": path_to_uri(&p) } }),
@@ -427,10 +423,7 @@ impl LspClient {
 
     /// 受信スレッドが貯めた最新の publishDiagnostics (パスごと)
     pub fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
-        self.shared
-            .diags
-            .lock()
-            .unwrap()
+        lock_ok(&self.shared.diags)
             .get(&canonical(path))
             .cloned()
             .unwrap_or_default()
@@ -439,13 +432,9 @@ impl LspClient {
     /// 非同期: 送信のみ。結果は poll_completion で取得。line/col は LSP (UTF-16) 座標。
     pub fn request_completion(&self, path: &Path, line: usize, col: usize) {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        *self.shared.completion.lock().unwrap() = None;
+        *lock_ok(&self.shared.completion) = None;
         self.shared.latest_completion.store(id, Ordering::SeqCst);
-        self.shared
-            .pending
-            .lock()
-            .unwrap()
-            .insert(id, Pending::Completion);
+        lock_ok(&self.shared.pending).insert(id, Pending::Completion);
         let params = json!({
             "textDocument": { "uri": path_to_uri(&canonical(path)) },
             "position": { "line": line, "character": col }
@@ -454,18 +443,14 @@ impl LspClient {
     }
 
     pub fn poll_completion(&self) -> Option<Vec<CompletionItem>> {
-        self.shared.completion.lock().unwrap().take()
+        lock_ok(&self.shared.completion).take()
     }
 
     pub fn request_hover(&self, path: &Path, line: usize, col: usize) {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        *self.shared.hover.lock().unwrap() = None;
+        *lock_ok(&self.shared.hover) = None;
         self.shared.latest_hover.store(id, Ordering::SeqCst);
-        self.shared
-            .pending
-            .lock()
-            .unwrap()
-            .insert(id, Pending::Hover);
+        lock_ok(&self.shared.pending).insert(id, Pending::Hover);
         let params = json!({
             "textDocument": { "uri": path_to_uri(&canonical(path)) },
             "position": { "line": line, "character": col }
@@ -474,19 +459,15 @@ impl LspClient {
     }
 
     pub fn poll_hover(&self) -> Option<HoverInfo> {
-        self.shared.hover.lock().unwrap().take()
+        lock_ok(&self.shared.hover).take()
     }
 
     /// 定義へ移動 (VS Code: F12)。応答は poll_definition で受け取る。
     pub fn request_definition(&self, path: &Path, line: usize, col: usize) {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        *self.shared.definition.lock().unwrap() = None;
+        *lock_ok(&self.shared.definition) = None;
         self.shared.latest_definition.store(id, Ordering::SeqCst);
-        self.shared
-            .pending
-            .lock()
-            .unwrap()
-            .insert(id, Pending::Definition);
+        lock_ok(&self.shared.pending).insert(id, Pending::Definition);
         let params = json!({
             "textDocument": { "uri": path_to_uri(&canonical(path)) },
             "position": { "line": line, "character": col }
@@ -496,7 +477,7 @@ impl LspClient {
 
     /// 外側 Some = 応答あり (一度で消費)。内側 None = 定義が見つからなかった。
     pub fn poll_definition(&self) -> Option<Option<DefinitionLoc>> {
-        self.shared.definition.lock().unwrap().take()
+        lock_ok(&self.shared.definition).take()
     }
 
     /// shutdown/exit 送信 + kill。Drop でも kill される。
@@ -610,7 +591,7 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, tx: &mpsc::Sender<Value>) {
                 Some(id) => id,
                 None => return,
             };
-            let kind = shared.pending.lock().unwrap().remove(&id);
+            let kind = lock_ok(&shared.pending).remove(&id);
             let result = v.get("result").cloned().unwrap_or(Value::Null);
             match kind {
                 Some(Pending::Initialize) => {
@@ -624,7 +605,7 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, tx: &mpsc::Sender<Value>) {
                 }
                 Some(Pending::Completion) => {
                     if shared.latest_completion.load(Ordering::SeqCst) == id {
-                        *shared.completion.lock().unwrap() = Some(parse_completions(&result));
+                        *lock_ok(&shared.completion) = Some(parse_completions(&result));
                     }
                 }
                 Some(Pending::Hover) => {
@@ -633,12 +614,12 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, tx: &mpsc::Sender<Value>) {
                             .get("contents")
                             .map(hover_text)
                             .unwrap_or_default();
-                        *shared.hover.lock().unwrap() = Some(HoverInfo { contents });
+                        *lock_ok(&shared.hover) = Some(HoverInfo { contents });
                     }
                 }
                 Some(Pending::Definition) => {
                     if shared.latest_definition.load(Ordering::SeqCst) == id {
-                        *shared.definition.lock().unwrap() = Some(parse_definition(&result));
+                        *lock_ok(&shared.definition) = Some(parse_definition(&result));
                     }
                 }
                 None => {}
@@ -659,7 +640,7 @@ fn handle_publish_diagnostics(params: &Value, shared: &Arc<Shared>) {
         .and_then(|d| d.as_array())
         .map(|arr| arr.iter().filter_map(parse_diagnostic).collect())
         .unwrap_or_default();
-    shared.diags.lock().unwrap().insert(path, diags);
+    lock_ok(&shared.diags).insert(path, diags);
 }
 
 /// textDocument/definition の結果から先頭 1 件を取り出す。
