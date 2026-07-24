@@ -1871,26 +1871,78 @@ mod tests {
     }
 
     use super::{
-        mac_agent_input_bytes, normalize_sel, selection_text, word_selection, Session,
+        key_bytes, mac_agent_input_bytes, normalize_sel, selection_text, word_selection,
+        Session,
     };
 
-    #[test]
-    fn mac_command_a_is_forwarded_to_agent_input_as_select_all() {
-        let command = egui::Modifiers {
+    fn mac_command() -> egui::Modifiers {
+        egui::Modifiers {
             alt: false,
             ctrl: false,
             shift: false,
             mac_cmd: true,
             command: true,
-        };
-        assert_eq!(
-            mac_agent_input_bytes(egui::Key::A, command),
-            Some(b"\x01".as_slice())
-        );
-        assert_eq!(mac_agent_input_bytes(egui::Key::C, command), None);
+        }
+    }
+
+    #[test]
+    fn mac_command_a_is_not_forwarded_to_pty() {
+        // ⌘A は PTY へ送らずローカル全選択で扱う (Ctrl+A を送っても
+        // CLI 側では行頭移動になるだけで全選択にならないため)
+        assert_eq!(mac_agent_input_bytes(egui::Key::A, mac_command()), None);
+        assert_eq!(mac_agent_input_bytes(egui::Key::C, mac_command()), None);
         assert_eq!(
             mac_agent_input_bytes(egui::Key::A, egui::Modifiers::CTRL),
             None
+        );
+    }
+
+    #[test]
+    fn mac_command_line_editing_maps_to_readline_bytes() {
+        // ⌘← / ⌘→ / ⌘⌫ = 行頭 / 行末 / 行頭まで削除
+        assert_eq!(
+            mac_agent_input_bytes(egui::Key::ArrowLeft, mac_command()),
+            Some(b"\x01".as_slice())
+        );
+        assert_eq!(
+            mac_agent_input_bytes(egui::Key::ArrowRight, mac_command()),
+            Some(b"\x05".as_slice())
+        );
+        assert_eq!(
+            mac_agent_input_bytes(egui::Key::Backspace, mac_command()),
+            Some(b"\x15".as_slice())
+        );
+        // Command なしでは何も返さない
+        assert_eq!(
+            mac_agent_input_bytes(egui::Key::ArrowLeft, egui::Modifiers::ALT),
+            None
+        );
+    }
+
+    #[test]
+    fn option_word_keys_map_to_readline_escapes() {
+        // ⌥← / ⌥→ = 単語移動、⌥⌫ = 単語削除 (readline ESC シーケンス)
+        let alt = egui::Modifiers::ALT;
+        assert_eq!(
+            key_bytes(egui::Key::ArrowLeft, alt, false),
+            Some(b"\x1bb".to_vec())
+        );
+        assert_eq!(
+            key_bytes(egui::Key::ArrowRight, alt, false),
+            Some(b"\x1bf".to_vec())
+        );
+        assert_eq!(
+            key_bytes(egui::Key::Backspace, alt, false),
+            Some(vec![0x1b, 0x7f])
+        );
+        // 修飾なしは従来どおり
+        assert_eq!(
+            key_bytes(egui::Key::ArrowLeft, egui::Modifiers::NONE, false),
+            Some(b"\x1b[D".to_vec())
+        );
+        assert_eq!(
+            key_bytes(egui::Key::Backspace, egui::Modifiers::NONE, false),
+            Some(vec![0x7f])
         );
     }
 
@@ -2947,12 +2999,32 @@ fn key_bytes(key: egui::Key, m: egui::Modifiers, app_cursor: bool) -> Option<Vec
                 b"\t".to_vec()
             }
         }
-        K::Backspace => vec![0x7f],
+        // ⌥⌫ = 直前の単語を削除 (readline: ESC DEL = backward-kill-word)
+        K::Backspace => {
+            if m.alt {
+                vec![0x1b, 0x7f]
+            } else {
+                vec![0x7f]
+            }
+        }
         K::Escape => vec![0x1b],
         K::ArrowUp => arrow(b'A'),
         K::ArrowDown => arrow(b'B'),
-        K::ArrowRight => arrow(b'C'),
-        K::ArrowLeft => arrow(b'D'),
+        // ⌥←/⌥→ = 単語単位の移動 (readline: ESC b / ESC f)
+        K::ArrowRight => {
+            if m.alt {
+                b"\x1bf".to_vec()
+            } else {
+                arrow(b'C')
+            }
+        }
+        K::ArrowLeft => {
+            if m.alt {
+                b"\x1bb".to_vec()
+            } else {
+                arrow(b'D')
+            }
+        }
         K::Home => b"\x1b[H".to_vec(),
         K::End => b"\x1b[F".to_vec(),
         K::PageUp => b"\x1b[5~".to_vec(),
@@ -2974,14 +3046,20 @@ fn key_bytes(key: egui::Key, m: egui::Modifiers, app_cursor: bool) -> Option<Vec
     Some(b)
 }
 
-/// macOS の標準編集ショートカットを、エージェント側の入力欄が受け取る
-/// Control キーへ変換する。Command 系を一括転送するとアプリ全体の
-/// ショートカットまで PTY に漏れるため、対応対象を明示的に限定する。
+/// macOS の標準編集ショートカットを、エージェント側の入力欄 (readline 系
+/// CLI) が理解する Control / ESC シーケンスへ変換する。Command 系を一括
+/// 転送するとアプリ全体のショートカットまで PTY に漏れるため、対応対象を
+/// 明示的に限定する。⌘A はここでは扱わない (PTY へ送らずローカル全選択)。
 fn mac_agent_input_bytes(key: egui::Key, m: egui::Modifiers) -> Option<&'static [u8]> {
-    if m.mac_cmd && key == egui::Key::A {
-        Some(b"\x01")
-    } else {
-        None
+    use egui::Key as K;
+    if !m.mac_cmd {
+        return None;
+    }
+    match key {
+        K::ArrowLeft => Some(b"\x01"),  // ⌘← = 行頭 (Ctrl+A)
+        K::ArrowRight => Some(b"\x05"), // ⌘→ = 行末 (Ctrl+E)
+        K::Backspace => Some(b"\x15"),  // ⌘⌫ = 行頭まで削除 (Ctrl+U)
+        _ => None,
     }
 }
 
@@ -3197,6 +3275,7 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
     };
     let mut out: Vec<u8> = Vec::new();
     let mut want_copy = false;
+    let mut want_select_all = false;
     for ev in &events {
         match ev {
             // ⌘C: 選択範囲をクリップボードへ(選択が無ければ何もしない)。
@@ -3237,7 +3316,13 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
                 ..
             } => {
                 if modifiers.mac_cmd {
-                    if let Some(b) = mac_agent_input_bytes(*key, *modifiers) {
+                    // ⌘A: Terminal.app と同じく、PTY へは送らずローカルで
+                    // 表示中の画面全体を選択する (⌘C でそのままコピーできる)。
+                    // CLI 側へ Ctrl+A を送っても「行頭移動」になるだけで
+                    // 全選択にはならない。
+                    if *key == egui::Key::A {
+                        want_select_all = true;
+                    } else if let Some(b) = mac_agent_input_bytes(*key, *modifiers) {
                         out.extend_from_slice(b);
                     }
                     continue;
@@ -3260,6 +3345,9 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
         session.note_user_input();
         session.write_bytes(&out);
         session.set_scroll(0);
+    }
+    if want_select_all {
+        session.select_all();
     }
     if want_copy {
         copy_selection(ui, session);
