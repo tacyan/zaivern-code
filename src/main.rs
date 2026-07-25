@@ -51,6 +51,7 @@ mod supervisor;
 mod terminal;
 #[cfg(test)]
 mod test_util;
+mod textenc;
 mod theme;
 mod theme_json;
 mod voice;

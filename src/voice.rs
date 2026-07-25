@@ -200,9 +200,12 @@ fn probe_powershell_recognizers() -> Vec<String> {
     c.args([
         "-NoProfile",
         "-Command",
-        "Add-Type -AssemblyName System.Speech; \
-         [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers() \
-         | % { $_.Culture.Name }",
+        &format!(
+            "{}Add-Type -AssemblyName System.Speech; \
+             [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers() \
+             | % {{ $_.Culture.Name }}",
+            crate::textenc::PS_UTF8_PRELUDE
+        ),
     ]);
     #[cfg(windows)]
     {
@@ -212,7 +215,7 @@ fn probe_powershell_recognizers() -> Vec<String> {
     let Ok(out) = c.output() else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout)
+    crate::textenc::decode_output(&out.stdout)
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -326,7 +329,7 @@ pub fn start(
     std::thread::Builder::new()
         .name("zv-voice-out".into())
         .spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            for line in decoded_lines(stdout) {
                 if let Some(ev) = parse_line(&line) {
                     if t.send(ev).is_err() {
                         return;
@@ -347,7 +350,7 @@ pub fn start(
             .name("zv-voice-err".into())
             .spawn(move || {
                 let mut first = true;
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                for line in decoded_lines(stderr) {
                     if first && !line.trim().is_empty() {
                         first = false;
                         // stderr は警告どまり: 認識が本当に死んだなら stdout の
@@ -363,6 +366,24 @@ pub fn start(
         child,
         rx,
         stopping: false,
+    })
+}
+
+/// 子プロセスの出力を 1 行ずつ文字列で返す。
+///
+/// `BufRead::lines()` を使わないのは、あれが UTF-8 でない行を `Err` にするため。
+/// `map_while(Result::ok)` と組み合わせると**最初の 1 行で読み取りが黙って終わる**
+/// ので、日本語を返す認識コマンドを `voice_command` に設定した Windows ユーザーには
+/// 「一言目で音声入力が止まる」としか見えない。バイトで区切って textenc に渡せば、
+/// UTF-8 でも OS のコードページでも同じように読める。
+fn decoded_lines<R: std::io::Read>(r: R) -> impl Iterator<Item = String> {
+    let mut br = BufReader::new(r);
+    std::iter::from_fn(move || {
+        let mut buf = Vec::new();
+        match br.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(crate::textenc::decode_output(&buf)),
+        }
     })
 }
 
@@ -444,7 +465,7 @@ pub fn ensure_mac_helper() -> Result<PathBuf, String> {
             )
         })?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+        let err = crate::textenc::decode_output(&out.stderr);
         let tail: Vec<&str> = err.lines().rev().take(4).collect();
         return Err(format!(
             "音声ヘルパーのビルドに失敗しました: {}",
@@ -471,9 +492,8 @@ pub fn ensure_powershell_helper() -> Result<PathBuf, String> {
 
     std::fs::create_dir_all(&dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
     // PowerShell 5.1 は BOM が無いと UTF-8 の .ps1 を誤読する (日本語が化ける)
-    let mut bytes = String::from("\u{feff}");
-    bytes.push_str(HELPER_PS1);
-    std::fs::write(&src, bytes).map_err(|e| format!("音声スクリプトを書けません: {e}"))?;
+    std::fs::write(&src, crate::textenc::ps_script_bytes(HELPER_PS1))
+        .map_err(|e| format!("音声スクリプトを書けません: {e}"))?;
     let _ = std::fs::write(&stamp, want);
     Ok(src)
 }
@@ -828,6 +848,45 @@ mod tests {
         assert!(matches!(parse_line("E だめ"), Some(Event::Error(t)) if t == "だめ"));
         assert!(parse_line("").is_none());
         assert!(parse_line("P ").is_none());
+    }
+
+    /// 行の読み取りは UTF-8 でも OS のコードページでも止まらないこと。
+    ///
+    /// `BufRead::lines()` は UTF-8 でない行を `Err` にするため、素直に書くと
+    /// 日本語を返す認識コマンドで**一言目から先が丸ごと届かなくなる**
+    /// (画面上は「反応しない」としか見えない)。
+    #[test]
+    fn decoded_lines_reads_utf8_and_legacy_alike() {
+        let utf8 = "F こんにちは\nF さようなら\n".as_bytes().to_vec();
+        let got: Vec<String> = decoded_lines(std::io::Cursor::new(utf8))
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        assert_eq!(got, vec!["F こんにちは", "F さようなら"]);
+
+        // この環境の既定コードページで書かれた行 (バイト列は OS から作る)
+        #[cfg(windows)]
+        {
+            let body = "F 音声の行\n";
+            let (raw, enc) = crate::textenc::encode_bytes(
+                body,
+                crate::textenc::Encoding::Ansi(crate::textenc::os_ansi_code_page()),
+            );
+            if enc.is_legacy() {
+                let got: Vec<String> = decoded_lines(std::io::Cursor::new(raw))
+                    .map(|l| l.trim_end().to_string())
+                    .collect();
+                assert_eq!(got, vec!["F 音声の行"], "コードページの行が読めていない");
+            }
+        }
+    }
+
+    /// 最終行に改行が無くても取りこぼさないこと (プロセスが途中で終わった場合)。
+    #[test]
+    fn decoded_lines_keeps_the_last_unterminated_line() {
+        let raw = "F ほげ".as_bytes().to_vec();
+        let got: Vec<String> = decoded_lines(std::io::Cursor::new(raw)).collect();
+        assert_eq!(got, vec!["F ほげ"]);
+        assert_eq!(decoded_lines(std::io::Cursor::new(Vec::new())).count(), 0);
     }
 
     #[test]

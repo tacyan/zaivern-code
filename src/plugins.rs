@@ -1827,7 +1827,7 @@ pub fn export(plugin: &Plugin, dest_dir: &Path) -> Result<PathBuf, String> {
         Ok(out) if out.status.success() => Ok(dest),
         Ok(out) => Err(format!(
             "zip / ditto の両方でエクスポートに失敗: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            crate::textenc::decode_output(&out.stderr).trim()
         )),
         Err(e) => Err(format!("zip / ditto を起動できません: {e}")),
     }
@@ -1903,7 +1903,7 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(format!(
             "unzip / tar の両方で解凍に失敗: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            crate::textenc::decode_output(&out.stderr).trim()
         )),
         Err(e) => Err(format!("unzip / tar を起動できません: {e}")),
     }
@@ -2076,7 +2076,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = r.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
+        crate::textenc::decode_output(&buf)
     })
 }
 

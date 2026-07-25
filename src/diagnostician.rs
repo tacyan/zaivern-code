@@ -456,8 +456,9 @@ fn spawn_capped_reader<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinH
                 Err(_) => break,
             }
         }
-        // 打ち切りで壊れた UTF-8 が末尾に残りうるので lossy で受ける。
-        String::from_utf8_lossy(&buf).to_string()
+        // 打ち切りで壊れた UTF-8 が末尾に残りうる。textenc は「末尾が切れている
+        // だけ」をコードページ違いと区別するので、頭の読める分はそのまま残る。
+        crate::textenc::decode_output(&buf)
     })
 }
 

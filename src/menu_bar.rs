@@ -572,8 +572,15 @@ pub fn clipboard_text() -> Option<String> {
     let out = crate::procx::hidden_command("pbpaste").output().ok()?;
     // procx: powershell のコンソール窓を貼り付けのたびに点滅させない
     #[cfg(target_os = "windows")]
+    // 出力を UTF-8 に固定してから読む。コンソールのコードページ任せだと、
+    // そのコードページに無い文字 (CP932 での絵文字・ハングル等) が PowerShell 側で
+    // 「?」に潰されてしまい、こちらでどう復号しても元に戻せない。
     let out = crate::procx::hidden_command("powershell")
-        .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("{}Get-Clipboard -Raw", crate::textenc::PS_UTF8_PRELUDE),
+        ])
         .output()
         .ok()?;
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -587,7 +594,9 @@ pub fn clipboard_text() -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    // Windows の Get-Clipboard はコンソールのコードページで返る。UTF-8 として
+    // 読むと日本語をコピペした瞬間に化けるので textenc へ通す。
+    let s = crate::textenc::decode_output(&out.stdout);
     if s.is_empty() {
         None
     } else {

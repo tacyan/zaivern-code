@@ -68,6 +68,13 @@ pub struct Buffer {
     pub text: String,
     pub saved_hash: u64,
     pub lang: String,
+    /// 読み込んだときの文字コード。保存で元の形へ戻すために持つ。
+    ///
+    /// 日本語圏のソース・ログ・CSV は今も CP932 (Shift_JIS) が現役で、
+    /// UTF-8 決め打ちだと**開くことすらできない** (`read_to_string` が失敗する)。
+    /// 開けるようにするだけでは足りない: 保存で勝手に UTF-8 へ変えると、
+    /// そのファイルを読む他のツール (Excel・既存のバッチ) が壊れる。
+    pub encoding: crate::textenc::Encoding,
     /// (cache key, 本文 galley) — recomputed only when text/theme/font change.
     /// 折り返し無効(wrap.max_width = INFINITY)なので galley は wrap 幅に依存せず、
     /// フレーム跨ぎで使い回せる。
@@ -86,6 +93,20 @@ pub struct Buffer {
 impl Buffer {
     pub fn dirty(&self) -> bool {
         hash_str(&self.text) != self.saved_hash
+    }
+
+    /// 本文を**読み込んだときと同じ文字コードで**ディスクへ書く。
+    ///
+    /// 元の符号化で表せない文字 (CP932 のファイルに絵文字を足した等) があるときは
+    /// 文字を落とさず UTF-8 で書き、`Ok(true)` を返す (呼び出し側が知らせる)。
+    /// バッファの `encoding` もそのとき UTF-8 へ更新するので、
+    /// 次の保存からは変換を試みない。
+    pub fn write_to(&mut self, path: &Path) -> std::io::Result<bool> {
+        let (bytes, used) = crate::textenc::encode_bytes(&self.text, self.encoding);
+        std::fs::write(path, bytes)?;
+        let promoted = used != self.encoding;
+        self.encoding = used;
+        Ok(promoted)
     }
 }
 
@@ -121,6 +142,8 @@ impl Editor {
             text: String::new(),
             saved_hash: hash_str(""),
             lang: "Plain Text".into(),
+            // 新規ファイルは UTF-8 で作る (既定)
+            encoding: crate::textenc::Encoding::Utf8,
             cache: None,
             gutter: None,
             disk_mtime: None,
@@ -157,8 +180,10 @@ impl Editor {
                 ));
             }
         }
-        let text = std::fs::read_to_string(&canon)
-            .map_err(|e| format!("開けませんでした: {e}"))?;
+        // UTF-8 決め打ちで読むと CP932 (Shift_JIS) のファイルが開けないので、
+        // バイト列で読んで textenc に判定させる (BOM / UTF-16 もここで拾う)。
+        let raw = std::fs::read(&canon).map_err(|e| format!("開けませんでした: {e}"))?;
+        let (text, encoding) = crate::textenc::decode_bytes(&raw);
         let lang = hl.lang_for(Some(&canon), &text);
         let title = canon
             .file_name()
@@ -176,6 +201,7 @@ impl Editor {
             saved_hash: hash_str(&text),
             text,
             lang,
+            encoding,
             cache: None,
             gutter: None,
             disk_mtime: mtime,
@@ -213,6 +239,8 @@ impl Editor {
             saved_hash: hash_str(&text),
             text,
             lang: "Diff".into(),
+            // 読み取り専用タブ (PR 差分など) は保存経路を通らない
+            encoding: crate::textenc::Encoding::Utf8,
             cache: None,
             gutter: None,
             disk_mtime: None,
@@ -230,10 +258,13 @@ impl Editor {
             return false;
         };
         let m = disk_mtime(&path);
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(raw) = std::fs::read(&path) else {
             b.disk_mtime = m;
             return false;
         };
+        // エージェントが書き換えた結果で符号化が変わることもあるので、毎回判定する
+        let (text, encoding) = crate::textenc::decode_bytes(&raw);
+        b.encoding = encoding;
         if text == b.text {
             // 内容は同じ(自前の保存・touch 等)。保存済み扱いに同期するだけ
             b.disk_mtime = m;
@@ -394,6 +425,104 @@ mod tests {
         assert_eq!(ed.open(&path, &hl), Ok(true));
         assert_eq!(ed.buffers.len(), 1);
         assert_eq!(ed.buffers[0].text, "new");
+    }
+
+    /// UTF-8 のファイルは今までどおり (符号化の判定が既定を変えていないこと)。
+    #[test]
+    fn utf8_file_stays_utf8_on_save() {
+        let dir = unique_temp_dir("zaivern-editor-test", "utf8");
+        let (mut ed, path, _hl) = open_one(&dir, "a.md", "日本語の本文");
+        assert_eq!(ed.buffers[0].encoding, crate::textenc::Encoding::Utf8);
+        assert_eq!(ed.buffers[0].text, "日本語の本文");
+
+        ed.buffers[0].text.push_str("と追記");
+        assert!(!ed.buffers[0].write_to(&path).expect("save"), "格上げは起きない");
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            "日本語の本文と追記".as_bytes(),
+            "UTF-8 のまま書かれること"
+        );
+    }
+
+    /// BOM 付き UTF-8 (Excel の CSV など) は BOM を保ったまま保存する。
+    /// BOM を落とすと、そのファイルを読む他のツールが文字化けする側になる。
+    #[test]
+    fn bom_is_preserved_across_open_and_save() {
+        let dir = unique_temp_dir("zaivern-editor-test", "bom");
+        let path = dir.join("data.csv");
+        let mut raw = vec![0xEF, 0xBB, 0xBF];
+        raw.extend_from_slice("列,値\n名前,太郎\n".as_bytes());
+        std::fs::write(&path, &raw).expect("write bom file");
+
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+        assert_eq!(ed.buffers[0].encoding, crate::textenc::Encoding::Utf8Bom);
+        assert!(!ed.buffers[0].text.starts_with('\u{feff}'), "BOM は本文に混ぜない");
+
+        assert!(!ed.buffers[0].write_to(&path).expect("save"));
+        assert_eq!(std::fs::read(&path).expect("read back"), raw);
+    }
+
+    /// **この環境の ANSI コードページ**で書かれたファイル (日本語 Windows なら
+    /// Shift_JIS) を開いて保存しても、バイト列が変わらないこと。
+    /// UTF-8 決め打ちの頃は、そもそも開けずに「開けませんでした」で終わっていた。
+    #[cfg(windows)]
+    #[test]
+    fn legacy_encoded_file_opens_and_saves_unchanged() {
+        let dir = unique_temp_dir("zaivern-editor-test", "legacy");
+        let path = dir.join("legacy.txt");
+        let body = "日本語のログ";
+        // 素材は OS のコードページ変換で作る (バイト列を書き下さない)
+        let (raw, enc) = crate::textenc::encode_bytes(body, crate::textenc::Encoding::Ansi(
+            crate::textenc::os_ansi_code_page(),
+        ));
+        if !enc.is_legacy() {
+            return; // この環境の ANSI では表せない = 試験対象外
+        }
+        std::fs::write(&path, &raw).expect("write legacy file");
+
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false), "UTF-8 でなくても開けること");
+        assert_eq!(ed.buffers[0].text, body, "文字化けせず読めること");
+        assert_eq!(ed.buffers[0].encoding, enc);
+
+        assert!(!ed.buffers[0].write_to(&path).expect("save"));
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            raw,
+            "保存で勝手に UTF-8 へ変えない (他ツールが読めなくなる)"
+        );
+    }
+
+    /// 元の符号化で表せない文字を足したら、文字を落とさず UTF-8 で保存する。
+    #[cfg(windows)]
+    #[test]
+    fn adding_unrepresentable_text_promotes_to_utf8() {
+        let dir = unique_temp_dir("zaivern-editor-test", "promote");
+        let path = dir.join("legacy.txt");
+        let (raw, enc) = crate::textenc::encode_bytes(
+            "本文",
+            crate::textenc::Encoding::Ansi(crate::textenc::os_ansi_code_page()),
+        );
+        if !enc.is_legacy() {
+            return;
+        }
+        std::fs::write(&path, &raw).expect("write legacy file");
+
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+        ed.buffers[0].text.push_str(" 🚀");
+
+        assert!(ed.buffers[0].write_to(&path).expect("save"), "格上げを知らせる");
+        assert_eq!(ed.buffers[0].encoding, crate::textenc::Encoding::Utf8);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "本文 🚀",
+            "絵文字を落として保存してはいけない"
+        );
     }
 
     #[test]

@@ -1440,8 +1440,8 @@ impl ZaivernApp {
                             // 保存時フック由来なら整形結果をそのままファイルへ書き戻す
                             if r.resave {
                                 if let Some(path) = b.path.clone() {
-                                    match std::fs::write(&path, &b.text) {
-                                        Ok(()) => {
+                                    match b.write_to(&path) {
+                                        Ok(_) => {
                                             b.saved_hash = hash_str(&b.text);
                                             b.disk_mtime = disk_mtime(&path);
                                             b.conflict_notified = None;
@@ -2552,8 +2552,12 @@ impl ZaivernApp {
         };
 
         let text = self.editor.buffers[i].text.clone();
-        match std::fs::write(&path, &text) {
-            Ok(()) => {
+        // 読み込んだときの文字コードで書き戻す (CP932 のファイルを勝手に UTF-8 に
+        // しない)。元の符号化で表せない文字が入っていたときだけ UTF-8 へ格上げし、
+        // 黙って変えたことにならないよう知らせる。
+        let was = self.editor.buffers[i].encoding;
+        match self.editor.buffers[i].write_to(&path) {
+            Ok(promoted) => {
                 let lang = self.highlighter.lang_for(Some(&path), &text);
                 let b = &mut self.editor.buffers[i];
                 b.title = path
@@ -2567,10 +2571,20 @@ impl ZaivernApp {
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 self.tree.invalidate();
-                self.toast(
-                    trf("💾 保存しました: {path}", &[("path", path.display().to_string())]),
-                    true,
-                );
+                if promoted {
+                    self.toast_warn(trf(
+                        "💾 保存しました: {path}\n\u{3000}{from} では表せない文字があるため UTF-8 で保存しました",
+                        &[
+                            ("path", path.display().to_string()),
+                            ("from", was.label()),
+                        ],
+                    ));
+                } else {
+                    self.toast(
+                        trf("💾 保存しました: {path}", &[("path", path.display().to_string())]),
+                        true,
+                    );
+                }
                 true
             }
             Err(e) => {
@@ -2694,9 +2708,9 @@ impl ZaivernApp {
                 .output()
                 .map_err(|e| e.to_string())?;
             if out.status.success() {
-                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                Ok(crate::textenc::decode_output(&out.stdout).trim().to_string())
             } else {
-                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+                Err(crate::textenc::decode_output(&out.stderr).trim().to_string())
             }
         };
         let repo = match git(&["rev-parse", "--show-toplevel"]) {
@@ -4557,6 +4571,21 @@ impl ZaivernApp {
                         if let Some(i) = self.editor.active {
                             ui.label(dim(format!("Ln {ln}, Col {col}")));
                             ui.label(dim(self.editor.buffers[i].lang.clone()));
+                            // UTF-8 以外のときだけ文字コードを出す。
+                            // 「なぜ日本語が読めているのか」「保存でどう書かれるのか」が
+                            // ここを見れば分かる (既定の UTF-8 では邪魔しない)。
+                            let enc = self.editor.buffers[i].encoding;
+                            if enc.is_legacy() {
+                                ui.label(
+                                    RichText::new(enc.label())
+                                        .size(11.5)
+                                        .color(theme.warn),
+                                )
+                                .on_hover_text(tr(
+                                    "この文字コードのまま保存します\n\u{3000}\
+                                     (表せない文字を足したときだけ UTF-8 で保存します)",
+                                ));
+                            }
                         }
                         // LSP 診断件数
                         let (derr, dwarn) = self.diag_counts;
@@ -5859,7 +5888,9 @@ impl ZaivernApp {
         };
         let mut raw = old;
         raw.extend_from_slice(&cur);
-        let text = String::from_utf8_lossy(&raw);
+        // 端末の生ログ。UTF-8 が基本だが、コードページ 932 のまま動く古いツールの
+        // 出力が混ざることがあるので textenc へ通す (末尾が切れていても頭は読める)。
+        let text = crate::textenc::decode_output(&raw);
         let clean: String = supervisor::strip_ansi(&text)
             .chars()
             .filter(|c| *c != '\r' && (*c >= ' ' || *c == '\n' || *c == '\t'))
@@ -8125,7 +8156,7 @@ impl ZaivernApp {
             if !o.status.success() {
                 continue;
             }
-            let text = String::from_utf8_lossy(&o.stdout);
+            let text = crate::textenc::decode_output(&o.stdout);
             let mut path: Option<PathBuf> = None;
             let mut branch = String::new();
             for line in text.lines().chain(std::iter::once("")) {
@@ -8998,6 +9029,9 @@ impl ZaivernApp {
                 json!({
                     "ok": true, "title": b.title, "text": b.text,
                     "lang": b.lang, "dirty": b.dirty(), "index": i,
+                    // UTF-8 以外のときだけ中身が入る (PC 側のステータスバーと同じ)。
+                    // スマホからも「このファイルは何で保存されるのか」が見える。
+                    "encoding": b.encoding.label(),
                 })
                 .to_string()
             }
@@ -9054,20 +9088,38 @@ impl ZaivernApp {
             })
             .to_string();
         };
-        match std::fs::write(&path, &b.text) {
-            Ok(()) => {
+        // 元の符号化で表せない文字が入っていれば UTF-8 へ格上げされる。
+        // 黙って変えるとスマホ側は何も分からないので、返事にも入れて知らせる。
+        let was = b.encoding;
+        match b.write_to(&path) {
+            Ok(promoted) => {
                 b.saved_hash = hash_str(&b.text);
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
+                let enc = b.encoding.label();
                 self.tree.invalidate();
-                self.toast(
-                    trf(
-                        "💾 保存しました (スマホから): {path}",
-                        &[("path", path.display().to_string())],
-                    ),
-                    true,
-                );
-                json!({"ok": true, "dirty": false}).to_string()
+                if promoted {
+                    self.toast_warn(trf(
+                        "💾 保存しました (スマホから): {path}\n\u{3000}{from} では表せない文字があるため UTF-8 で保存しました",
+                        &[
+                            ("path", path.display().to_string()),
+                            ("from", was.label()),
+                        ],
+                    ));
+                } else {
+                    self.toast(
+                        trf(
+                            "💾 保存しました (スマホから): {path}",
+                            &[("path", path.display().to_string())],
+                        ),
+                        true,
+                    );
+                }
+                json!({
+                    "ok": true, "dirty": false,
+                    "promoted": promoted, "was": was.label(), "encoding": enc,
+                })
+                .to_string()
             }
             Err(e) => {
                 json!({"ok": false, "error": format!("保存に失敗しました: {e}")})
@@ -11341,7 +11393,7 @@ impl ZaivernApp {
                 continue;
             };
             let text = b.text.clone();
-            if std::fs::write(&path, &text).is_ok() {
+            if self.editor.buffers[i].write_to(&path).is_ok() {
                 let b = &mut self.editor.buffers[i];
                 b.saved_hash = hash_str(&text);
                 b.disk_mtime = disk_mtime(&path);
@@ -11382,7 +11434,7 @@ impl ZaivernApp {
                 continue;
             }
             let Some(path) = b.path.clone() else { continue };
-            if std::fs::write(&path, &b.text).is_ok() {
+            if b.write_to(&path).is_ok() {
                 b.saved_hash = hash_str(&b.text);
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
@@ -11402,14 +11454,19 @@ impl ZaivernApp {
             self.toast(tr("ファイルに紐付いていないタブは元に戻せません"), false);
             return;
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        // 開くときと同じ経路で読む。UTF-8 決め打ちだと CP932 のファイルだけ
+        // 「読み直せませんでした」になり、元に戻す操作そのものが使えなくなる。
+        let Ok(raw) = std::fs::read(&path) else {
             self.toast(tr("ディスクから読み直せませんでした"), false);
             return;
         };
+        let (text, encoding) = crate::textenc::decode_bytes(&raw);
         if text == b.text {
             self.toast(tr("ディスクの内容と同じです"), true);
             return;
         }
+        // ディスク側の符号化に合わせ直す (次の保存で元の形へ書き戻せるように)
+        b.encoding = encoding;
         b.text = text;
         b.saved_hash = hash_str(&b.text);
         b.disk_mtime = disk_mtime(&path);

@@ -230,7 +230,7 @@ pub fn check_auth() -> Result<(), String> {
     {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
-            let stderr = trim_stderr(&String::from_utf8_lossy(&out.stderr));
+            let stderr = trim_stderr(&crate::textenc::decode_output(&out.stderr));
             Err(msg_not_authenticated(&stderr))
         }
         Err(e) => Err(trf("gh を起動できません: {e}", &[("e", e.to_string())])),
@@ -412,7 +412,7 @@ fn spawn_reader<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<S
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = r.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
+        crate::textenc::decode_output(&buf)
     })
 }
 

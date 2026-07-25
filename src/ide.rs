@@ -604,9 +604,9 @@ fn version_line(bin_path: &str) -> Option<String> {
         .stdin(Stdio::null())
         .output()
         .ok()?;
-    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    let mut text = crate::textenc::decode_output(&out.stdout);
     if text.trim().is_empty() {
-        text = String::from_utf8_lossy(&out.stderr).to_string();
+        text = crate::textenc::decode_output(&out.stderr);
     }
     let first = text.lines().next()?.trim().to_string();
     if first.is_empty() {

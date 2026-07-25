@@ -142,7 +142,9 @@ pub fn spawn(files: Vec<PathBuf>, query: String) -> Receiver<(Vec<Hit>, usize)> 
                     if bytes.contains(&0) {
                         continue; // バイナリ
                     }
-                    let text = String::from_utf8_lossy(&bytes);
+                    // CP932 (Shift_JIS) のファイルも検索対象にする。lossy のままだと
+                    // 日本語の行が置換文字の列になり、絶対にヒットしない。
+                    let text = crate::textenc::decode_bytes(&bytes).0;
                     scanned_ref.fetch_add(1, Ordering::Relaxed);
 
                     for (n, line) in text.lines().enumerate() {

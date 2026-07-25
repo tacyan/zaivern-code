@@ -78,7 +78,44 @@ impl Grid {
         for row in &mut self.rows {
             row.resize(size.cols, crate::cell::Cell::default());
         }
-        self.rows.resize(usize::from(size.rows), self.new_row());
+
+        // zaivern patch: 行数が減るとき、元実装は `Vec::resize` で**末尾から**
+        // 行を捨てていた。末尾はカーソルのある側 — つまり TUI がいま描いている
+        // 内容そのものなので、画面を縮めた瞬間に本文が消える。しかも増やし直しても
+        // 空行が足されるだけで戻らない (子プロセスは差分描画しかしないため、
+        // 消えた行を二度と送ってこない)。Cockpit でファイルを開いてペインが
+        // 縮むと、その端末だけが黒いまま戻らなくなる原因がこれ。
+        //
+        // 実端末と同じく「あふれた分は上から履歴へ送る」に直す。まずカーソルより
+        // 下の余白を落とし、それでも足りない分だけ先頭から送り出す
+        // (こうするとカーソル行とその上は必ず残る)。
+        let old_rows = self.rows.len();
+        let new_rows = usize::from(size.rows);
+        if !self.rows.is_empty() && new_rows < old_rows {
+            let below_cursor =
+                old_rows.saturating_sub(usize::from(self.pos.row) + 1);
+            let from_top = (old_rows - new_rows).saturating_sub(below_cursor);
+            for _ in 0..from_top {
+                let removed = self.rows.remove(0);
+                // 代替画面 (scrollback_len == 0) には履歴が無いので捨てるだけ。
+                // それでもカーソル行が残る点が元実装との違い。
+                if self.scrollback_len > 0 {
+                    self.scrollback.push_back(removed);
+                    while self.scrollback.len() > self.scrollback_len {
+                        self.scrollback.pop_front();
+                    }
+                    if self.scrollback_offset > 0 {
+                        self.scrollback_offset =
+                            self.scrollback.len().min(self.scrollback_offset + 1);
+                    }
+                }
+            }
+            self.pos.row = self
+                .pos
+                .row
+                .saturating_sub(u16::try_from(from_top).unwrap_or(u16::MAX));
+        }
+        self.rows.resize(new_rows, self.new_row());
 
         if self.scroll_bottom >= size.rows {
             self.scroll_bottom = size.rows - 1;

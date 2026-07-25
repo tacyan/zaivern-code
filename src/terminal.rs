@@ -3242,6 +3242,98 @@ mod tests {
 /// PTY で走らせるコマンドを組む。`cwd` は [`crate::pathx::launch_dir`] を通した
 /// 素の実在ディレクトリであること (Windows では `\\?\` 付きだと cmd.exe が
 /// カレントディレクトリを捨てて `C:\Windows` で起動してしまう)。
+/// Windows: 起動するコマンド文字列を載せる環境変数の名前。
+///
+/// コマンドを**コマンドラインに書かない**ためにある (理由は
+/// [`windows_shell_args`] を参照)。
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_CMD_ENV: &str = "ZAIVERN_CMD";
+
+/// Windows で `cmd.exe` に渡す引数列。**コードページを UTF-8 (65001) に上げてから**
+/// [`WINDOWS_CMD_ENV`] に入れたコマンドを起動する。
+///
+/// # なぜコードページを上げるのか
+///
+/// ConPTY の擬似コンソールは OS の OEM コードページ (日本語 Windows なら 932) で
+/// 始まる。コンソールへ **UTF-8 のバイト列を直接書く**プログラム — git for Windows・
+/// Go 製の CLI・MSYS 系ツールなど — の出力はその OEM として解釈されてから画面に
+/// 落ちるので、日本語が軒並み化ける。エージェントの返答も進捗も読めなくなるが、
+/// 原因は画面のどこにも出ない。`chcp 65001` を先に通せばコンソール自体が UTF-8 に
+/// なり、以後そのセッションで起動する子プロセスにも効く。
+///
+/// # なぜコマンドを環境変数で渡すのか
+///
+/// `cmd.exe /C <コマンド>` と直接並べると、コマンドは 2 つの流儀で二重に解釈される:
+/// `CommandBuilder` は C ランタイムの規則で `"` を `\"` へ逃がすが、**cmd は
+/// `\"` を知らない**。そのため引用符を含むコマンド (空白入りのパス、
+/// `--flag "日本語の指示"` など) がそのまま壊れる — ユーザー名やインストール先に
+/// 空白があるだけで起動に失敗する。
+///
+/// 環境変数なら値はコマンドラインを経由しない (Windows の環境ブロックは UTF-16 で
+/// 渡る) ので、引用符・空白・日本語を含む任意のコマンドがそのまま届く。
+/// cmd は `%VAR%` の展開を `&` による分割よりも**先**に行うため、
+/// `npm run build && claude` のような複合コマンドも構造を保ったまま実行される。
+///
+/// # 実装メモ
+///
+/// - 繋ぎは `&&` ではなく **`&`**。`chcp` が使えない環境でもエージェントの起動
+///   そのものは続けたい (化けても起動しないより良い)。
+/// - `>nul 2>nul` で「現在のコード ページ: 65001」の 1 行を隠す。
+/// - コマンド無し (素のシェル) は `/K`。`/C` だと chcp 直後に cmd が終了して
+///   端末が即座に閉じる。
+// Windows 以外では使わないが、規則そのものはテストで固定しておく。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_shell_args(has_command: bool) -> Vec<String> {
+    const CHCP: &str = "chcp 65001 >nul 2>nul";
+    if has_command {
+        vec!["/C".to_string(), format!("{CHCP} & %{WINDOWS_CMD_ENV}%")]
+    } else {
+        vec!["/K".to_string(), CHCP.to_string()]
+    }
+}
+
+/// Windows のコマンド文字列に含まれる `%NAME%` を先に解決する。
+///
+/// コマンドを環境変数経由で渡すと、cmd の展開は 1 回しか走らない
+/// (変数の**値の中**にある `%NAME%` はもう展開されない)。
+/// プリセットに `%USERPROFILE%\bin\tool.exe` と書いていた人がいるので、
+/// 直接並べていた頃と同じ結果になるよう、ここで自分で解決しておく。
+///
+/// 見つからない名前は cmd と同じく**そのまま残す** (`50%` のような素の `%` も壊さない)。
+/// 探す順はプリセットの env → プロセスの env (プリセットで上書きできるようにする)。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn expand_windows_env_refs(command: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut rest = command;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        // 変数名は次の `%` まで。改行や `%` を挟まないものだけを名前として扱う。
+        match after.find('%') {
+            Some(end) if end > 0 && !after[..end].contains('\n') => {
+                let name = &after[..end];
+                match lookup(name) {
+                    Some(v) => out.push_str(&v),
+                    // 未定義ならそのまま (cmd も残す)
+                    None => {
+                        out.push('%');
+                        out.push_str(name);
+                        out.push('%');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            // 閉じが無い / `%%` → 素の `%` として残す
+            _ => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn build_command(command: &str, cwd: &Path, env: &HashMap<String, String>) -> CommandBuilder {
     #[cfg(not(windows))]
     let mut cmd = {
@@ -3259,9 +3351,8 @@ fn build_command(command: &str, cwd: &Path, env: &HashMap<String, String>) -> Co
     let mut cmd = {
         let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
         let mut c = CommandBuilder::new(shell);
-        if !command.trim().is_empty() {
-            c.arg("/C");
-            c.arg(command);
+        for a in windows_shell_args(!command.trim().is_empty()) {
+            c.arg(a);
         }
         c
     };
@@ -3277,6 +3368,21 @@ fn build_command(command: &str, cwd: &Path, env: &HashMap<String, String>) -> Co
     cmd.env("ZAIVERN", "1");
     for (k, v) in env {
         cmd.env(k, v);
+    }
+    // 起動するコマンドは最後に載せる (プリセットの env に同名があっても、
+    // 実際に走るのは選ばれたエージェントのコマンドであること)。
+    // 値はコマンドラインを通らないので、引用符・空白・日本語のまま届く。
+    #[cfg(windows)]
+    {
+        let command = command.trim();
+        if !command.is_empty() {
+            let expanded = expand_windows_env_refs(command, &|name: &str| {
+                env.get(name)
+                    .cloned()
+                    .or_else(|| std::env::var(name).ok())
+            });
+            cmd.env(WINDOWS_CMD_ENV, expanded);
+        }
     }
     cmd
 }
@@ -4507,6 +4613,131 @@ pub fn draw(
 }
 
 #[cfg(test)]
+mod shell_args_tests {
+    use super::*;
+
+    /// エージェントは「コードページを上げてから」起動する。
+    /// この前置きが外れると、日本語 Windows で出力が化けて読めなくなる。
+    /// コマンド自体は環境変数から読むので、コマンドラインには載らない。
+    #[test]
+    fn command_runs_after_switching_to_utf8() {
+        let args = windows_shell_args(true);
+        assert_eq!(args[0], "/C");
+        assert_eq!(args[1], "chcp 65001 >nul 2>nul & %ZAIVERN_CMD%");
+    }
+
+    /// 繋ぎは `&`。`&&` にすると chcp が使えない環境でエージェントが起動しなくなる。
+    #[test]
+    fn chcp_failure_must_not_block_the_agent() {
+        let args = windows_shell_args(true);
+        assert!(args[1].contains(" & %"), "実際: {}", args[1]);
+        assert!(!args[1].contains("&& %"), "&& だと起動できない環境が出る");
+    }
+
+    /// 素のシェルは `/K` — `/C` だと chcp 直後に cmd が終わって端末が即閉じる。
+    #[test]
+    fn plain_shell_keeps_running() {
+        assert_eq!(windows_shell_args(false), vec!["/K", "chcp 65001 >nul 2>nul"]);
+    }
+
+    /// `%NAME%` は自分で解決する (環境変数経由では cmd が二度目の展開をしないため)。
+    /// 定義済みの名前だけを置き換え、未定義はそのまま残す。
+    #[test]
+    fn env_refs_are_expanded_from_the_lookup() {
+        let look = |n: &str| match n {
+            "HOMEDIR" => Some(r"C:\Users\山田 太郎".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            expand_windows_env_refs(r"%HOMEDIR%\bin\tool.exe --x", &look),
+            r"C:\Users\山田 太郎\bin\tool.exe --x"
+        );
+        assert_eq!(
+            expand_windows_env_refs("%NOPE% --x", &look),
+            "%NOPE% --x",
+            "未定義の名前は cmd と同じくそのまま残す"
+        );
+    }
+
+    /// `%` を含むだけの文字列を壊さないこと (`echo 50%` など)。
+    #[test]
+    fn stray_percent_signs_survive() {
+        let none = |_: &str| None;
+        assert_eq!(expand_windows_env_refs("echo 50%", &none), "echo 50%");
+        assert_eq!(expand_windows_env_refs("echo %%", &none), "echo %%");
+        assert_eq!(expand_windows_env_refs("", &none), "");
+        assert_eq!(
+            expand_windows_env_refs("claude --p \"率 100%\"", &none),
+            "claude --p \"率 100%\""
+        );
+    }
+
+    /// 引用符・空白を含むコマンドは一切加工しない (cmd が読む形をそのまま保つ)。
+    #[test]
+    fn quotes_and_spaces_are_left_untouched() {
+        let none = |_: &str| None;
+        let cmd = r#""C:\Program Files\zai\gemini.cmd" --flag "日本語の指示""#;
+        assert_eq!(expand_windows_env_refs(cmd, &none), cmd);
+    }
+}
+
+/// ConPTY を実際に開いて、UTF-8 のバイト列が化けずに画面へ出ることを確かめる。
+///
+/// `type` はファイルの中身を**そのままコンソールへ書く**ので、コードページが
+/// OEM (日本語 Windows なら 932) のままだと UTF-8 の日本語がそこで壊れる —
+/// ユーザーが報告した「メッセージが文字化けする」と同じ経路を踏む回帰テスト。
+///
+/// 置き場所は OS の一時ディレクトリで、**名前に空白と日本語を含める**。
+/// 引用符付きのパスをコマンドラインに直接並べていた頃はここで起動に失敗していた
+/// (`\"` を cmd が解釈できない) ので、その再発もこのテストで捕まる。
+#[cfg(test)]
+#[cfg(windows)]
+mod pty_utf8_tests {
+    use super::*;
+
+    #[test]
+    fn utf8_output_reaches_the_screen_unmangled() {
+        let dir = std::env::temp_dir().join(format!("zaivern cp テスト {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("出力 sample.txt");
+        let body = "進捗: 日本語のメッセージが化けないこと";
+        std::fs::write(&path, body.as_bytes()).unwrap();
+
+        let spec = SpawnSpec {
+            title: "cp".into(),
+            preset_name: "cp".into(),
+            icon: "cp".into(),
+            // エージェントと同じ条件にするため、chcp の**後に起動する別プロセス**へ
+            // 書かせる。cmd の内蔵コマンド (type / echo) は自分の起動時に読んだ
+            // コードページを使い続けるので、内蔵のままでは検証にならない。
+            // 空白と日本語を含むパスを引用符付きで渡すので、
+            // コマンドラインの二重解釈が戻れば起動に失敗して落ちる。
+            command: format!("cmd /C type \"{}\"", path.display()),
+            cwd: dir.clone(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut sess = Session::spawn(9001, spec, egui::Context::default()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        let mut screen = String::new();
+        while Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            screen = lock_ok(&sess.parser).screen().contents();
+            if screen.contains(body) || screen.contains('\u{fffd}') {
+                break;
+            }
+        }
+        sess.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            screen.contains(body),
+            "UTF-8 の出力が化けている / 起動できていない:\n{screen}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod query_tests {
     use super::*;
 
@@ -4959,5 +5190,118 @@ printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
         assert!(!sess.attention);
         assert!(sess.attention_since.is_none());
         sess.kill();
+    }
+}
+
+
+/// 画面を縮めたときに「いま描かれている内容」が消えないこと。
+///
+/// Cockpit でファイルを開くと編集ペインが割り込んでミニターミナルの行数が減る。
+/// vt100 の元実装はそこで**末尾から**行を捨てるため、TUI (Claude Code 等) が
+/// 描いていた本文が丸ごと消え、ペインを戻しても空行が入るだけで復元しない
+/// — その端末だけが黒いまま戻らなくなる。実端末と同じく上から履歴へ送ること。
+#[cfg(test)]
+mod resize_tests {
+    /// `rows` 行を書いた画面を作る (最終行にカーソルが乗った状態)。
+    fn filled(rows: u16, cols: u16, scrollback: usize) -> vt100::Parser {
+        let mut p = vt100::Parser::new(rows, cols, scrollback);
+        for i in 0..rows {
+            p.process(format!("line{i}").as_bytes());
+            if i + 1 < rows {
+                p.process(b"\r\n");
+            }
+        }
+        p
+    }
+
+    fn lines(p: &vt100::Parser) -> Vec<String> {
+        p.screen()
+            .contents()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// 縮めても直近の行 (カーソル側) が残ること。元実装はここで line9 を捨てていた。
+    #[test]
+    fn shrinking_keeps_the_newest_lines() {
+        let mut p = filled(10, 40, 100);
+        p.set_size(6, 40);
+        let got = lines(&p);
+        assert!(
+            got.contains(&"line9".to_string()),
+            "最新行が消えている: {got:?}"
+        );
+        assert!(
+            !got.contains(&"line0".to_string()),
+            "あふれた分は上から捨てる: {got:?}"
+        );
+    }
+
+    /// 代替画面 (TUI) でも同じ。履歴が無いぶん、消えると本当に戻らない。
+    #[test]
+    fn alternate_screen_keeps_the_newest_lines() {
+        let mut p = vt100::Parser::new(10, 40, 100);
+        p.process(b"\x1b[?1049h");
+        for i in 0..10 {
+            p.process(format!("alt{i}").as_bytes());
+            if i + 1 < 10 {
+                p.process(b"\r\n");
+            }
+        }
+        p.set_size(5, 40);
+        let got = lines(&p);
+        assert!(
+            got.contains(&"alt9".to_string()),
+            "TUI が描いた手前の内容が消えている: {got:?}"
+        );
+    }
+
+    /// 上から送った行は履歴に入るので、スクロールで遡れば読める
+    /// (通常画面では「消える」のではなく「上へ流れる」が正しい)。
+    #[test]
+    fn overflow_goes_into_the_scrollback() {
+        let mut p = filled(10, 40, 100);
+        p.set_size(6, 40);
+        p.set_scrollback(4);
+        let got = lines(&p);
+        assert!(
+            got.contains(&"line0".to_string()),
+            "あふれた行が履歴に残っていない: {got:?}"
+        );
+    }
+
+    /// カーソルは画面内に残ること (外に出ると次の出力が描かれない)。
+    #[test]
+    fn cursor_stays_on_screen() {
+        let mut p = filled(10, 40, 100);
+        p.set_size(4, 40);
+        let (row, _col) = p.screen().cursor_position();
+        assert!(row < 4, "カーソルが画面外: row={row}");
+    }
+
+    /// 縮めてから戻す往復で、残っていた内容が壊れないこと。
+    #[test]
+    fn shrink_then_grow_does_not_lose_more() {
+        let mut p = filled(10, 40, 100);
+        p.set_size(6, 40);
+        p.set_size(10, 40);
+        let got = lines(&p);
+        assert!(
+            got.contains(&"line9".to_string()),
+            "往復で内容が失われた: {got:?}"
+        );
+    }
+
+    /// 幅だけ変える・広げるだけ、は今までどおり内容を保つこと。
+    #[test]
+    fn widening_and_growing_keep_everything() {
+        let mut p = filled(5, 40, 100);
+        p.set_size(5, 80);
+        p.set_size(8, 80);
+        let got = lines(&p);
+        for i in 0..5 {
+            assert!(got.contains(&format!("line{i}")), "line{i} が消えた: {got:?}");
+        }
     }
 }

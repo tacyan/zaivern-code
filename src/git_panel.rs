@@ -198,14 +198,14 @@ fn run_git(ws: &Path, args: &[&str]) -> Result<String, RunErr> {
     }
     let out = c.output().map_err(|e| RunErr::Spawn(e.to_string()))?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let err = crate::textenc::decode_output(&out.stderr).trim().to_string();
         return Err(RunErr::Failed(if err.is_empty() {
             trf("git {args} が失敗しました", &[("args", args.join(" "))])
         } else {
             err
         }));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(crate::textenc::decode_output(&out.stdout))
 }
 
 /// ワークスペースの git 情報をまとめて集める (バックグラウンドスレッドで呼ぶ)。

@@ -347,8 +347,16 @@ fn windows_paths() -> Result<(PathBuf, PathBuf), String> {
 fn run_powershell(script: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // 失敗時のメッセージはそのままユーザーに見せる。出力を UTF-8 に固定して
+    // おかないと、日本語のエラー (「アクセスが拒否されました」等) が化けて
+    // 何が起きたのか分からなくなる。
     let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("{}{script}", crate::textenc::PS_UTF8_PRELUDE),
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("powershell を実行できません: {e}"))?;
@@ -357,7 +365,7 @@ fn run_powershell(script: &str) -> Result<(), String> {
     } else {
         Err(format!(
             "ショートカットの作成に失敗しました: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            crate::textenc::decode_output(&out.stderr).trim()
         ))
     }
 }

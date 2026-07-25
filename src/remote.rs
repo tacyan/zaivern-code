@@ -667,7 +667,10 @@ async function loadFile() {
     const f = await api('/api/file');
     if (!f.ok) { $('ta').value = ''; $('meta').textContent = ''; taTab = -1; return; }
     $('ta').value = f.text;
-    $('meta').textContent = f.title + '  ·  ' + f.lang;
+    // 文字コードは UTF-8 以外のときだけ出す (PC 側のステータスバーと同じ扱い)。
+    // 保存でどう書かれるかがスマホからも分かるようにするため。
+    $('meta').textContent =
+      f.title + '  ·  ' + f.lang + (f.encoding ? '  ·  ' + f.encoding : '');
     taTab = (f.index === undefined || f.index === null) ? -1 : f.index;
     dirty = false;
   } catch (e) {}
@@ -680,7 +683,14 @@ $('save').onclick = async () => {
     const r = await api('/api/text', {text: $('ta').value, index: taTab, save: true});
     if (r.ok) {
       dirty = false;
-      toast('PC 側で保存しました ✅');
+      // 元の文字コードで表せない文字を足すと UTF-8 へ切り替わる。
+      // 黙って変わると「他のツールで読めなくなった」原因が分からないので必ず伝える
+      if (r.promoted) {
+        toast(r.was + ' では表せない文字があるため UTF-8 で保存しました');
+        loadFile();
+      } else {
+        toast('PC 側で保存しました ✅');
+      }
     } else {
       toast(r.error || '保存に失敗しました');
     }
@@ -1254,6 +1264,17 @@ mod tests {
         // JS 側のエスケープが実制御文字に化けていないこと
         assert!(PAGE.contains("\\u001b"));
         assert!(!PAGE.contains('\u{1b}'));
+    }
+
+    /// スマホからも「このファイルが何で保存されるか」が見えること。
+    /// UTF-8 以外のファイルを開いたまま保存すると、表せない文字があったときだけ
+    /// UTF-8 へ切り替わる — 黙って変わると他ツールが読めなくなる原因が
+    /// スマホ側から分からなくなるので、必ず知らせる作りであることを固定する。
+    #[test]
+    fn page_shows_the_file_encoding() {
+        assert!(PAGE.contains("f.encoding"), "文字コードを表示していない");
+        assert!(PAGE.contains("r.promoted"), "UTF-8 への格上げを伝えていない");
+        assert!(PAGE.contains("UTF-8 で保存しました"));
     }
 
     #[test]

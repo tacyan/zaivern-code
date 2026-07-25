@@ -272,13 +272,21 @@ fn script_path(name: &str) -> Result<PathBuf, String> {
 #[cfg(windows)]
 fn run_ps(script: &str) -> Result<(bool, String, String), String> {
     let out = crate::procx::hidden_command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("{}{script}", crate::textenc::PS_UTF8_PRELUDE),
+        ])
         .output()
         .map_err(|e| format!("powershell を実行できません: {e}"))?;
+    // PowerShell はコンソールのコードページ (日本語 Windows なら CP932) で
+    // 書いてくるので、UTF-8 として読むと日本語のエラーが化ける。
+    // 化けるだけでなく「キャンセル」の照合まで外れるため textenc へ通す。
     Ok((
         out.status.success(),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
+        crate::textenc::decode_output(&out.stdout),
+        crate::textenc::decode_output(&out.stderr),
     ))
 }
 
@@ -301,7 +309,12 @@ fn check_now() -> Result<Report, String> {
 #[cfg(windows)]
 fn run_elevated(file: &str, script: &str) -> Result<(), String> {
     let path = script_path(file)?;
-    std::fs::write(&path, script).map_err(|e| format!("{} を書けません: {e}", path.display()))?;
+    // **BOM 付き UTF-8 で書く。** Windows PowerShell 5.1 は BOM の無い .ps1 を
+    // ANSI (日本語 Windows なら CP932) として読むため、実行ファイルのパスに
+    // 日本語が入っている環境 (`C:\Users\たろう\…`) では規則のパスが壊れ、
+    // 「許可したのにスマホから繋がらない」が再発する。
+    std::fs::write(&path, crate::textenc::ps_script_bytes(script))
+        .map_err(|e| format!("{} を書けません: {e}", path.display()))?;
     let outer = elevate_script(&path.to_string_lossy());
     let res = run_ps(&outer);
     // 平文のスクリプトを残さない (失敗しても消す)
