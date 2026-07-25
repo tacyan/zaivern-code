@@ -297,7 +297,7 @@ pub fn start(
             let line = command.replace("{lang}", lang);
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             let mut c = if cfg!(target_os = "windows") {
-                let mut c = Command::new("cmd");
+                let mut c = crate::procx::hidden_command("cmd");
                 c.arg("/C").arg(&line);
                 c
             } else {

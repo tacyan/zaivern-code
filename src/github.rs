@@ -13,7 +13,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -202,18 +202,23 @@ pub fn reset_gh_cache() {
 }
 
 fn probe_gh() -> bool {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let via_shell = Command::new(&shell)
-        .arg("-lc")
-        .arg("command -v gh")
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false);
-    if via_shell {
-        return true;
+    // Windows に $SHELL は無いので、ログインシェル経由の確認は unix だけ行う。
+    // (GUI アプリからコンソールアプリを起動しても窓が出ないよう procx を使う)
+    #[cfg(unix)]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let via_shell = crate::procx::hidden_command(&shell)
+            .arg("-lc")
+            .arg("command -v gh")
+            .output()
+            .map(|o| o.status.success() && !o.stdout.is_empty())
+            .unwrap_or(false);
+        if via_shell {
+            return true;
+        }
     }
-    // ログインシェルが使えない環境向けのフォールバック。
-    Command::new("gh")
+    // ログインシェルが使えない環境向けのフォールバック (Windows はこちらだけ)。
+    crate::procx::hidden_command("gh")
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -229,7 +234,7 @@ pub fn check_auth() -> Result<(), String> {
     if !gh_available() {
         return Err(msg_gh_missing());
     }
-    match Command::new("gh")
+    match crate::procx::hidden_command("gh")
         .args(["auth", "status"])
         .stdin(Stdio::null())
         .output()
@@ -365,7 +370,7 @@ fn clamp_limit(limit: usize) -> usize {
 ///
 /// `gh` には `git -C` に相当するオプションがないため `current_dir` で指定する。
 fn capture(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let mut child = Command::new("gh")
+    let mut child = crate::procx::hidden_command("gh")
         .args(args)
         .current_dir(root)
         // 対話プロンプト・ページャ・色を確実に無効化する (パイプ越しでも保険)。

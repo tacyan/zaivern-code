@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -1804,7 +1804,7 @@ pub fn export(plugin: &Plugin, dest_dir: &Path) -> Result<PathBuf, String> {
         std::fs::remove_file(&dest).map_err(|e| format!("既存ファイルを削除できません: {e}"))?;
     }
 
-    let zip = Command::new("zip")
+    let zip = crate::procx::hidden_command("zip")
         .arg("-r")
         .arg("-q")
         .arg(&dest)
@@ -1817,7 +1817,7 @@ pub fn export(plugin: &Plugin, dest_dir: &Path) -> Result<PathBuf, String> {
         }
     }
     // macOS 標準の ditto へフォールバック
-    let ditto = Command::new("ditto")
+    let ditto = crate::procx::hidden_command("ditto")
         .arg("-c")
         .arg("-k")
         .arg(&plugin.dir)
@@ -1881,7 +1881,7 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<(), String> {
 
 /// unzip -o、失敗時 tar -xf (bsdtar) フォールバック。
 fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
-    let unzip = Command::new("unzip")
+    let unzip = crate::procx::hidden_command("unzip")
         .arg("-o")
         .arg("-q")
         .arg(archive)
@@ -1893,7 +1893,7 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
             return Ok(());
         }
     }
-    let tar = Command::new("tar")
+    let tar = crate::procx::hidden_command("tar")
         .arg("-xf")
         .arg(archive)
         .arg("-C")
@@ -1988,7 +1988,7 @@ fn run_blocking(req: &RunRequest) -> RunOutcome {
         resave: req.resave,
     };
 
-    let mut cmd = Command::new(&shell);
+    let mut cmd = crate::procx::hidden_command(&shell);
     cmd.arg("-lc")
         .arg(&req.command.run)
         .current_dir(&req.workdir)
@@ -2101,7 +2101,7 @@ mod tests {
     }
 
     fn cmd_available(name: &str, arg: &str) -> bool {
-        Command::new(name)
+        std::process::Command::new(name)
             .arg(arg)
             .output()
             .map(|o| o.status.success())

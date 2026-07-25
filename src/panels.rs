@@ -47,6 +47,14 @@ pub enum GhTab {
 /// GitHub パネルの状態。app.rs が 1 フィールドだけ持つ。
 #[derive(Default)]
 pub struct GithubPanel {
+    /// ユーザーが明示的に GitHub 連携を有効にしたか。
+    ///
+    /// false の間は gh を一切起動しない (存在確認すらしない)。
+    /// 起動直後にセッション復元でこのタブが選ばれていただけで
+    /// gh/git が走り出すのを防ぐ番人。メニューの「GitHub」からの表示、
+    /// またはパネル内の「読み込む」ボタンで true になる。
+    /// セッションには保存しない = 毎起動でユーザーの明示操作が要る。
+    pub active: bool,
     /// 対象にしているワークスペースルートの添字 (マルチルート対応)。
     pub root_idx: usize,
     pub tab: GhTab,
@@ -174,6 +182,13 @@ pub fn github_ui(
     presets: &[(String, String)],
     actions: &mut GithubActions,
 ) {
+    // 明示的に有効化されるまでは gh を一切叩かない (存在確認も含む)。
+    // 起動直後にセッション復元でこのタブが出ているだけの状態で
+    // gh/git のプロセスが走り出すのを防ぐ。
+    if !panel.active {
+        gh_inactive_ui(ui, theme, panel);
+        return;
+    }
     // gh が無ければパネルごと無効。壊れた UI を出すより黙って説明する。
     if !github::gh_available() {
         gh_missing_ui(ui, theme);
@@ -304,6 +319,23 @@ pub fn github_ui(
                 true,
             ));
         }
+    }
+}
+
+/// まだ GitHub 連携を有効化していないときの案内。
+/// メニューの「GitHub」またはこのボタンを押したときだけ連携が動き出す。
+fn gh_inactive_ui(ui: &mut egui::Ui, theme: &Theme, panel: &mut GithubPanel) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(tr("🐙 GitHub 連携")).strong());
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(tr("GitHub 連携はまだ読み込まれていません。下のボタンを押すと gh (GitHub CLI) を使って PR / Issue の一覧を取得します。"))
+            .color(theme.text_dim)
+            .size(11.5),
+    );
+    ui.add_space(8.0);
+    if ui.button(tr("🐙 GitHub 連携を読み込む")).clicked() {
+        panel.active = true;
     }
 }
 
@@ -776,10 +808,32 @@ mod tests {
     // ── gh が無いときはパネルを無効化 ───────────────────────────────
 
     #[test]
+    fn panel_never_requests_until_user_activates_it() {
+        // 起動直後 (active = false) は gh の有無に関わらず一切投げない。
+        let ctx = egui::Context::default();
+        let mut panel = GithubPanel::default();
+        let mut actions = GithubActions::default();
+        let theme = crate::theme::by_name("dark");
+        let roots = vec![PathBuf::from(".")];
+
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                github_ui(ui, &theme, &mut panel, &roots, &[], &mut actions);
+            });
+        });
+
+        assert!(actions.requests.is_empty(), "有効化前に gh を叩いてはいけない");
+        assert!(panel.last_error.is_none());
+    }
+
+    #[test]
     fn panel_issues_no_request_when_gh_is_unavailable() {
         // gh_available() は環境依存なので、gh の有無で期待値を分ける。
         let ctx = egui::Context::default();
-        let mut panel = GithubPanel::default();
+        let mut panel = GithubPanel {
+            active: true, // 明示的に有効化された後の挙動を見る
+            ..Default::default()
+        };
         let mut actions = GithubActions::default();
         let theme = crate::theme::by_name("dark");
         let roots = vec![PathBuf::from(".")];

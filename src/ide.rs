@@ -597,7 +597,7 @@ fn which_path(bin: &str) -> Option<String> {
         return None;
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let out = Command::new(shell)
+    let out = crate::procx::hidden_command(shell)
         .arg("-lc")
         .arg(format!("command -v {bin}"))
         .stdin(Stdio::null())
@@ -617,7 +617,7 @@ fn which_path(bin: &str) -> Option<String> {
 
 /// `<bin> --version` の 1 行目を取る。出さないツールもあるので None を許す。
 fn version_line(bin_path: &str) -> Option<String> {
-    let out = Command::new(bin_path)
+    let out = crate::procx::hidden_command(bin_path)
         .arg("--version")
         .stdin(Stdio::null())
         .output()
@@ -762,6 +762,13 @@ fn open_url(url: &str) -> Result<(), String> {
 /// - stdin/stdout/stderr は null に落とす (エディタの出力を汚さない)。
 /// - 待たないがゾンビも残さない: 別スレッドで `wait` だけさせて回収する。
 fn spawn_detached(cmd: &mut Command) -> Result<(), std::io::Error> {
+    // Windows: GUI アプリからコンソールアプリを起動しても窓を出さない
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     let child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())

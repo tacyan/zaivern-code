@@ -569,14 +569,15 @@ pub fn build_task_for(root: &Path) -> Option<(String, String)> {
 /// egui はクリップボード読み出し API を持たないため、OS コマンドへシェルアウトする。
 pub fn clipboard_text() -> Option<String> {
     #[cfg(target_os = "macos")]
-    let out = std::process::Command::new("pbpaste").output().ok()?;
+    let out = crate::procx::hidden_command("pbpaste").output().ok()?;
+    // procx: powershell のコンソール窓を貼り付けのたびに点滅させない
     #[cfg(target_os = "windows")]
-    let out = std::process::Command::new("powershell")
+    let out = crate::procx::hidden_command("powershell")
         .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
         .output()
         .ok()?;
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let out = std::process::Command::new("sh")
+    let out = crate::procx::hidden_command("sh")
         .args([
             "-c",
             "command -v wl-paste >/dev/null && wl-paste --no-newline || xclip -selection clipboard -o",

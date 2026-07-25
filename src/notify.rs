@@ -56,6 +56,14 @@ pub fn notify(title: &str, body: &str) {
 /// Unix では reap されず、通知 1 回ごとにゾンビが 1 個アプリ終了まで残る
 /// (長時間セッションでプロセス数上限に達すると PTY 起動まで失敗し得る)。
 fn spawn_and_reap(cmd: &mut Command) {
+    // Windows: GUI アプリからコンソールアプリを起動しても窓を出さない
+    // (powershell の -WindowStyle Hidden だけでは一瞬窓が出る)
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     if let Ok(mut child) = cmd.spawn() {
         let _ = std::thread::Builder::new()
             .name("zv-notify-reap".into())

@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -42,7 +41,7 @@ pub(crate) fn empty_line_marks() -> Arc<Vec<(usize, LineMark)>> {
 /// `dir` が属する git リポジトリのトップレベルを返す(非 repo / git 不在なら None)。
 /// ルートがリポジトリのサブディレクトリでも正しいトップレベルが得られる。
 pub fn discover_toplevel(dir: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
+    let out = crate::procx::hidden_command("git")
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--show-toplevel"])
@@ -219,7 +218,7 @@ impl Git {
 
     /// `git -C <workspace> <args>` を実行。git 不在・非 repo・失敗時は None。
     fn run_git(&self, args: &[&str]) -> Option<String> {
-        let out = Command::new("git")
+        let out = crate::procx::hidden_command("git")
             .arg("-C")
             .arg(&self.workspace)
             .args(args)
@@ -442,6 +441,7 @@ pub fn parse_hunk_marks(diff_output: &str) -> Vec<(usize, LineMark)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn added_only_hunk() {

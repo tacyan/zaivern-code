@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -373,7 +373,7 @@ impl CliDiagnostician {
     /// `github.rs::capture` と同じ作法: stdin は null、stdout/stderr は
     /// 読み取りスレッドで読み切り、期限を過ぎたら kill して wait する。
     fn run(&self, prompt: &str) -> Result<String, String> {
-        let mut cmd = Command::new(&self.program);
+        let mut cmd = crate::procx::hidden_command(&self.program);
         cmd.args(&self.args);
         cmd.arg(prompt);
         if let Some(dir) = &self.cwd {

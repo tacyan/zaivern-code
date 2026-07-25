@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -290,7 +290,7 @@ impl LspClient {
         ctx: eframe::egui::Context,
     ) -> Result<Self, String> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let mut child = Command::new(&shell)
+        let mut child = crate::procx::hidden_command(&shell)
             .arg("-lc")
             .arg(server_cmd)
             .current_dir(root)
@@ -989,6 +989,7 @@ mod tests {
 
     #[test]
     fn smoke_rust_analyzer() {
+        use std::process::Command;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         // which だけでは rustup シム (実体未インストール) を誤検出するため実行可否まで確認
         let found = Command::new(&shell)

@@ -2635,7 +2635,7 @@ impl ZaivernApp {
             return;
         };
         let git = |args: &[&str]| -> Result<String, String> {
-            let out = std::process::Command::new("git")
+            let out = crate::procx::hidden_command("git")
                 .arg("-C")
                 .arg(root)
                 .args(args)
@@ -2981,6 +2981,9 @@ impl ZaivernApp {
             Cmd::ShowGitHubTab => {
                 self.sidebar_open = true;
                 self.sidebar_tab = SidebarTab::GitHub;
+                // メニューからの明示操作なので、ここで初めて GitHub 連携を有効化する。
+                // (起動時のセッション復元でタブが出ているだけでは gh は動かさない)
+                self.github.active = true;
             }
             Cmd::ToggleProblems => self.problems_open = !self.problems_open,
             Cmd::ToggleFullScreen => {
@@ -4636,7 +4639,9 @@ impl ZaivernApp {
                         );
                     }
                     SidebarTab::Git => {
-                        egui::ScrollArea::vertical()
+                        // both: 長いパス名でサイドバーが横に突き破るのを防ぐ
+                        // (sidebar_files_ui の zv-tree と同じ理由)
+                        egui::ScrollArea::both()
                             .id_salt("zv-git")
                             .auto_shrink(false)
                             .show(ui, |ui| {
@@ -4644,7 +4649,8 @@ impl ZaivernApp {
                             });
                     }
                     SidebarTab::GitHub => {
-                        egui::ScrollArea::vertical()
+                        // both: 長い PR/Issue タイトルでの横突き破り防止 (zv-tree と同じ理由)
+                        egui::ScrollArea::both()
                             .id_salt("zv-github")
                             .auto_shrink(false)
                             .show(ui, |ui| {
@@ -4832,7 +4838,12 @@ impl ZaivernApp {
                 },
             );
         });
-        egui::ScrollArea::vertical()
+        // 横スクロールも許可する: 長いファイル名 (Windows のホームにある
+        // NTUSER.DAT{...}.regtrans-ms 等) が縦専用スクロールだと収まらず、
+        // サイドバーの「中身の矩形」がパネル幅を突き破って伸びてしまう。
+        // egui の SidePanel は中身の矩形で次パネルの開始位置を決めるため、
+        // 突き破った分だけ中央領域が右へ押され、間が未描画 (真っ黒) になる。
+        egui::ScrollArea::both()
             .id_salt("zv-tree")
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -8034,7 +8045,7 @@ impl ZaivernApp {
         let mut out: Vec<(String, PathBuf, bool)> = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
         for root in &self.roots {
-            let Ok(o) = std::process::Command::new("git")
+            let Ok(o) = crate::procx::hidden_command("git")
                 .arg("-C")
                 .arg(root)
                 .args(["worktree", "list", "--porcelain"])
@@ -10808,8 +10819,9 @@ fn open_external(target: &str) {
     let _ = std::process::Command::new("open").arg(target).spawn();
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    // procx: `cmd` のコンソール窓を一瞬でも出さずにブラウザだけ開く
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
+    let _ = crate::procx::hidden_command("cmd")
         .args(["/C", "start", "", target])
         .spawn();
 }
@@ -10868,15 +10880,29 @@ fn which(bin: &str) -> bool {
     if bin.is_empty() {
         return false;
     }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    std::process::Command::new(shell)
-        .arg("-lc")
-        .arg(format!("command -v {bin}"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // Windows に $SHELL は無いので `where` で探す (窓は procx が抑止する)。
+    #[cfg(windows)]
+    {
+        crate::procx::hidden_command("where")
+            .arg(bin)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        crate::procx::hidden_command(shell)
+            .arg("-lc")
+            .arg(format!("command -v {bin}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 }
 
 /// テーマ名を解決する。VS Code テーマJSONへのパスならそれを読み込み、

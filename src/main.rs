@@ -38,6 +38,7 @@ mod pet;
 mod pet_bubble;
 mod pet_variants;
 mod plugins;
+mod procx;
 mod recent;
 mod remote;
 mod sound;
