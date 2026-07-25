@@ -3513,6 +3513,12 @@ impl ZaivernApp {
             }
             Cmd::ToggleRemote => {
                 self.remote_open = !self.remote_open;
+                // 開くたびに調べ直す。1 度きりだと、別の Wi-Fi へ移った後や
+                // 規則を外部で消された後も「✅ 許可済み」のまま固まり、
+                // 画面と実態がずれる (= 許可したのに繋がらない、に見える)。
+                if self.remote_open {
+                    self.fw.recheck();
+                }
             }
             _ => {}
         }
@@ -9456,6 +9462,9 @@ impl ZaivernApp {
         let mut open = self.remote_open;
         let mut copy = false;
         let mut open_voice = false;
+        // 「スマホから届いているのか」— 規則をいくら読んでも分からない事実。
+        // これが無いと、真っ白な画面を前に PC 側で何も判断できない。
+        let reach = self.remote.as_ref().map(|r| r.reach());
 
         // Windows の受信許可。ここが無いと「QR は読めるのにスマホからだけ
         // 何も起きない」になるので、繋がる前提として真っ先に見せる
@@ -9469,6 +9478,11 @@ impl ZaivernApp {
         let mut fw_revoke = false;
         let mut fw_recheck = false;
         let mut fw_copy_cmd = false;
+        let mut fw_unblock = false;
+        let mut fw_copy_exe = false;
+        // 別のファイアウォール製品 (ノートン等) の名前と、そこへ登録する exe パス
+        let fw_other = if fw_check { self.fw.other_firewall() } else { String::new() };
+        let fw_exe = if fw_check { self.fw.exe() } else { String::new() };
 
         egui::Window::new(tr("📱 スマホリモート"))
             .open(&mut open)
@@ -9501,13 +9515,20 @@ impl ZaivernApp {
                                                 firewall::Busy::Revoke => {
                                                     "🛡 受信許可を取り消しています…"
                                                 }
+                                                firewall::Busy::Unblock => {
+                                                    "🛡 受信の全ブロックを解除しています (管理者の確認に応答してください)…"
+                                                }
                                             }))
                                             .size(11.5)
                                             .color(theme.text_dim),
                                         );
                                     }
-                                    // 許可されていない = スマホからは絶対に繋がらない
-                                    (Some(r), None) if !r.allowed || r.blocked => {
+                                    // 繋がらない原因がある = スマホからは絶対に繋がらない。
+                                    // 「規則が無い」だけでなく「規則はあるのに効いていない」
+                                    // (プロファイル不一致 / 受信全ブロック) もここに出す —
+                                    // 出さないと「許可済みなのに繋がらない」で手が止まる。
+                                    (Some(r), None) if !r.problems().is_empty() => {
+                                        let problems = r.problems();
                                         egui::Frame::none()
                                             .fill(theme.panel_alt)
                                             .stroke(egui::Stroke::new(1.0_f32, theme.warn))
@@ -9515,26 +9536,55 @@ impl ZaivernApp {
                                             .inner_margin(egui::Margin::same(8.0))
                                             .show(ui, |ui| {
                                                 ui.vertical(|ui| {
-                                                    ui.label(
-                                                        RichText::new(tr(
-                                                            "⚠ Windows のファイアウォールが受信をブロックしています",
-                                                        ))
-                                                        .size(12.0)
-                                                        .strong()
-                                                        .color(theme.warn),
-                                                    );
-                                                    ui.label(
-                                                        RichText::new(tr(
-                                                            "PC は待ち受けていますが、スマホからの接続は Windows 側で\n\
-                                                             落とされます (QR を読んでも真っ白 / 繋がらない)。",
-                                                        ))
-                                                        .size(11.0)
-                                                        .color(theme.text_dim),
-                                                    );
-                                                    if r.blocked {
+                                                    for (i, p) in problems.iter().enumerate() {
+                                                        if i > 0 {
+                                                            ui.add_space(4.0);
+                                                        }
                                                         ui.label(
-                                                            RichText::new(tr(
-                                                                "※ この実行ファイルを拒否する規則が残っています (許可時に削除します)",
+                                                            RichText::new(tr(p.headline()))
+                                                                .size(12.0)
+                                                                .strong()
+                                                                .color(theme.warn),
+                                                        );
+                                                        // 別製品は名指しで出す。「別のファイアウォール」
+                                                        // とだけ言われても、どこを開けば良いのか分からない。
+                                                        if *p == firewall::Problem::OtherFirewall
+                                                            && !fw_other.is_empty()
+                                                        {
+                                                            ui.label(
+                                                                RichText::new(&fw_other)
+                                                                    .size(11.5)
+                                                                    .strong()
+                                                                    .color(theme.warn),
+                                                            );
+                                                        }
+                                                        ui.label(
+                                                            RichText::new(tr(p.detail()))
+                                                                .size(11.0)
+                                                                .color(theme.text_dim),
+                                                        );
+                                                    }
+                                                    // 種別と規則のプロファイルを並べて出す。
+                                                    // 不一致はこの 2 つを見ないと納得できない。
+                                                    let net = r.network_label();
+                                                    if !net.is_empty() {
+                                                        ui.label(
+                                                            RichText::new(trf(
+                                                                "※ いまのネットワーク: {net}{rule}",
+                                                                &[
+                                                                    ("net", net),
+                                                                    (
+                                                                        "rule",
+                                                                        if r.profiles.is_empty() {
+                                                                            String::new()
+                                                                        } else {
+                                                                            trf(
+                                                                                " / 規則のプロファイル: {profiles}",
+                                                                                &[("profiles", r.profiles.clone())],
+                                                                            )
+                                                                        },
+                                                                    ),
+                                                                ],
                                                             ))
                                                             .size(10.5)
                                                             .color(theme.text_dim),
@@ -9550,20 +9600,46 @@ impl ZaivernApp {
                                                             .color(theme.text_dim),
                                                         );
                                                     }
-                                                    ui.horizontal(|ui| {
-                                                        if ui
-                                                            .button(tr("🛡 受信を許可する (管理者)"))
-                                                            .on_hover_text(trf(
-                                                                "この実行ファイルの TCP {from}-{to} だけを許可します。\n\
-                                                                 管理者の確認 (UAC) が 1 回出ます。",
-                                                                &[
-                                                                    ("from", firewall::PORT_FROM.to_string()),
-                                                                    ("to", firewall::PORT_TO.to_string()),
-                                                                ],
-                                                            ))
-                                                            .clicked()
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        // 受信全ブロックが立っている間は規則を作っても
+                                                        // 無視されるので、解除を先に並べる。
+                                                        if problems.contains(&firewall::Problem::StrictInbound)
+                                                            && ui
+                                                                .button(tr("🛡 受信の全ブロックを解除 (管理者)"))
+                                                                .on_hover_text(tr(
+                                                                    "使用中のネットワークの「すべての受信接続をブロックする」を外します\n\
+                                                                     (他のプロファイルの設定は変えません)。管理者の確認 (UAC) が出ます。",
+                                                                ))
+                                                                .clicked()
+                                                        {
+                                                            fw_unblock = true;
+                                                        }
+                                                        if r.fixable_by_allow()
+                                                            && ui
+                                                                .button(tr("🛡 受信を許可する (管理者)"))
+                                                                .on_hover_text(trf(
+                                                                    "この実行ファイルの TCP {from}-{to} だけを、\n\
+                                                                     いま繋いでいるネットワークに合わせて許可します。\n\
+                                                                     管理者の確認 (UAC) が 1 回出ます。",
+                                                                    &[
+                                                                        ("from", firewall::PORT_FROM.to_string()),
+                                                                        ("to", firewall::PORT_TO.to_string()),
+                                                                    ],
+                                                                ))
+                                                                .clicked()
                                                         {
                                                             fw_allow = true;
+                                                        }
+                                                        // 別製品への登録は exe パスを求められる。
+                                                        // 手で打たせない (打ち間違えると許可されない)。
+                                                        if problems
+                                                            .contains(&firewall::Problem::OtherFirewall)
+                                                            && ui
+                                                                .button(tr("📋 exe のパスをコピー"))
+                                                                .on_hover_text(&fw_exe)
+                                                                .clicked()
+                                                        {
+                                                            fw_copy_exe = true;
                                                         }
                                                         if ui.button(tr("⟳ 再確認")).clicked() {
                                                             fw_recheck = true;
@@ -9579,32 +9655,48 @@ impl ZaivernApp {
                                                 });
                                             });
                                     }
-                                    // 許可済み
+                                    // 繋がる状態 (許可済み、またはファイアウォールが無効)
                                     (Some(r), None) => {
                                         ui.horizontal(|ui| {
                                             ui.label(
-                                                RichText::new(trf(
-                                                    "✅ ファイアウォール許可済み ({profiles})",
-                                                    &[(
-                                                        "profiles",
-                                                        if r.profiles.is_empty() {
-                                                            "-".to_string()
-                                                        } else {
-                                                            r.profiles.clone()
-                                                        },
-                                                    )],
-                                                ))
+                                                RichText::new(if r.allowed {
+                                                    trf(
+                                                        "✅ ファイアウォール許可済み ({profiles})",
+                                                        &[(
+                                                            "profiles",
+                                                            if r.profiles.is_empty() {
+                                                                "-".to_string()
+                                                            } else {
+                                                                r.profiles.clone()
+                                                            },
+                                                        )],
+                                                    )
+                                                } else {
+                                                    // 規則は無いが Windows も受信を検査していない。
+                                                    // 「許可済み」と書くと嘘になるので分ける。
+                                                    tr("✅ 受信はブロックされていません (ファイアウォールが無効)")
+                                                })
                                                 .size(11.0)
                                                 .color(theme.ok),
                                             );
+                                            if r.allowed
+                                                && ui
+                                                    .small_button(tr("取り消す"))
+                                                    .on_hover_text(tr(
+                                                        "受信許可の規則を削除します (スマホからは繋がらなくなります)",
+                                                    ))
+                                                    .clicked()
+                                            {
+                                                fw_revoke = true;
+                                            }
                                             if ui
-                                                .small_button(tr("取り消す"))
+                                                .small_button(tr("⟳"))
                                                 .on_hover_text(tr(
-                                                    "受信許可の規則を削除します (スマホからは繋がらなくなります)",
+                                                    "受信許可を再確認します (別の Wi-Fi へ移った後はここで確認)",
                                                 ))
                                                 .clicked()
                                             {
-                                                fw_revoke = true;
+                                                fw_recheck = true;
                                             }
                                         });
                                     }
@@ -9613,6 +9705,44 @@ impl ZaivernApp {
                                 }
                                 if let Some(e) = &fw_error {
                                     ui.label(RichText::new(e).size(10.5).color(theme.err));
+                                }
+                            }
+                            // ── スマホからの接続が実際に届いたか ──
+                            // 規則を読んで分かるのは建前だけ。ここが 0 件のままなら
+                            // パケットが PC まで来ていない (ファイアウォール / 別セグメント /
+                            // ルータのクライアント分離)、1 件でもあれば届いてはいる、と
+                            // 切り分けられる。「真っ白で、繋がっているのかも分からない」を
+                            // PC 側から潰すための表示。
+                            if let Some(re) = &reach {
+                                ui.add_space(6.0);
+                                if re.hits == 0 {
+                                    ui.label(
+                                        RichText::new(tr(
+                                            "📶 まだスマホからの接続はありません\n\u{3000}\
+                                             スマホが真っ白なままなら、通信が PC まで届いていません\n\u{3000}\
+                                             (ファイアウォール / スマホが同じ Wi-Fi でない / \
+                                             ルータのプライバシーセパレータ)",
+                                        ))
+                                        .size(11.0)
+                                        .color(theme.text_dim),
+                                    );
+                                } else {
+                                    let ago = re
+                                        .last_at
+                                        .map(|t| t.elapsed().as_secs())
+                                        .unwrap_or(0);
+                                    ui.label(
+                                        RichText::new(trf(
+                                            "📶 スマホから接続あり: {ip} ({ago} 秒前 / 計 {n} 回)",
+                                            &[
+                                                ("ip", re.last_ip.clone().unwrap_or_default()),
+                                                ("ago", ago.to_string()),
+                                                ("n", re.hits.to_string()),
+                                            ],
+                                        ))
+                                        .size(11.0)
+                                        .color(theme.ok),
+                                    );
                                 }
                             }
                             ui.add_space(8.0);
@@ -9680,6 +9810,9 @@ impl ZaivernApp {
         if fw_allow {
             self.fw.allow();
         }
+        if fw_unblock {
+            self.fw.unblock();
+        }
         if fw_revoke {
             self.fw.revoke();
         }
@@ -9690,6 +9823,13 @@ impl ZaivernApp {
             ctx.copy_text(fw_manual);
             self.toast(
                 tr("コマンドをコピーしました (管理者の PowerShell で実行してください)"),
+                true,
+            );
+        }
+        if fw_copy_exe {
+            ctx.copy_text(fw_exe);
+            self.toast(
+                tr("exe のパスをコピーしました (お使いのファイアウォール製品で受信を許可してください)"),
                 true,
             );
         }

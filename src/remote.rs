@@ -13,7 +13,7 @@
 use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -119,12 +119,33 @@ impl Request {
     }
 }
 
+/// LAN の相手 (= スマホ) から実際に接続が届いたか。
+///
+/// 「許可したのにスマホは真っ白なまま」で詰まるのは、**届いていないのか
+/// 届いた上で失敗しているのかが PC 側から見えない**からである。ファイアウォールの
+/// 規則をいくら読んでも「実際に通ったか」は分からない (規則があっても
+/// ルータのクライアント分離や別セグメントなら届かない)。
+///
+/// そこで accept した時点の相手アドレスだけを記録する。ここが 0 件のままなら
+/// **パケットが PC まで来ていない** = 規則やネットワーク経路の問題、
+/// 1 件でもあれば **届いてはいる** = 以降はアプリ側の問題、と切り分けられる。
+#[derive(Clone, Debug, Default)]
+pub struct Reach {
+    /// LAN 側 (ループバック以外) から accept した接続の数。
+    pub hits: u64,
+    /// 直近の接続元アドレス (表示用)。
+    pub last_ip: Option<String>,
+    /// 直近の接続を受けた時刻。
+    pub last_at: Option<Instant>,
+}
+
 pub struct RemoteServer {
     pub port: u16,
     pub token: String,
     /// トークンなしのベース URL (例: http://192.168.1.10:8899/)
     pub url: String,
     rx: mpsc::Receiver<Request>,
+    reach: Arc<Mutex<Reach>>,
 }
 
 /// 待ち受けに使うポートの範囲 (両端を含む)。
@@ -153,8 +174,10 @@ impl RemoteServer {
         let token = gen_token();
         let url = format!("http://{}:{}/", lan_ip(), port);
         let (tx, rx) = mpsc::channel::<Request>();
+        let reach = Arc::new(Mutex::new(Reach::default()));
 
         let tok = token.clone();
+        let reach_srv = Arc::clone(&reach);
         std::thread::Builder::new()
             .name("zv-remote-accept".into())
             .spawn(move || {
@@ -165,6 +188,16 @@ impl RemoteServer {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                         continue;
                     };
+                    // 「スマホから届いたか」はここでしか分からない。
+                    if let Ok(peer) = stream.peer_addr() {
+                        if counts_as_remote(&peer) {
+                            if let Ok(mut r) = reach_srv.lock() {
+                                r.hits += 1;
+                                r.last_ip = Some(peer.ip().to_string());
+                                r.last_at = Some(Instant::now());
+                            }
+                        }
+                    }
                     let tx = tx.clone();
                     let ctx = ctx.clone();
                     let tok = tok.clone();
@@ -181,12 +214,19 @@ impl RemoteServer {
             token,
             url,
             rx,
+            reach,
         })
     }
 
     /// UI スレッドから毎フレーム呼ぶ。溜まっているリクエストを取り出す。
     pub fn poll(&self) -> Vec<Request> {
         self.rx.try_iter().collect()
+    }
+
+    /// LAN 側から実際に接続が届いたか ([`Reach`])。
+    /// 毒された Mutex でも UI を落とさないよう、取れなければ既定値を返す。
+    pub fn reach(&self) -> Reach {
+        self.reach.lock().map(|r| r.clone()).unwrap_or_default()
     }
 }
 
@@ -200,6 +240,15 @@ fn gen_token() -> String {
     let a = RandomState::new().build_hasher().finish();
     let b = RandomState::new().build_hasher().finish();
     format!("{:016x}", a ^ b.rotate_left(17))
+}
+
+/// この接続を「LAN の相手 (= スマホ) から届いた」と数えるか。
+///
+/// ループバックは PC 自身 — 🎤 の音声ページや動作確認のブラウザがそれに当たる。
+/// これを数えると **スマホからは 1 度も届いていないのに「届いています」と表示** して
+/// しまい、切り分けの役に立たないどころか誤誘導になる。
+fn counts_as_remote(peer: &std::net::SocketAddr) -> bool {
+    !peer.ip().is_loopback()
 }
 
 /// LAN 上での自分の IP アドレスを推定する (UDP connect トリック)。
@@ -1238,6 +1287,27 @@ setInterval(poll, 2500);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「スマホから届いているのか分からない」を潰すための判定。
+    /// PC 自身のアクセスを数えると、届いていないのに「届いた」と出てしまう。
+    #[test]
+    fn only_lan_peers_count_as_the_phone() {
+        let p = |s: &str| s.parse::<std::net::SocketAddr>().expect("addr");
+        assert!(counts_as_remote(&p("192.168.1.23:51000")), "同じ Wi-Fi のスマホ");
+        assert!(counts_as_remote(&p("10.0.0.5:51000")));
+        assert!(!counts_as_remote(&p("127.0.0.1:51000")), "PC 自身は数えない");
+        assert!(!counts_as_remote(&p("[::1]:51000")), "IPv6 のループバックも同じ");
+    }
+
+    #[test]
+    fn a_fresh_server_has_not_been_reached_yet() {
+        // 既定は「まだ届いていない」。ここが真になっていると、繋がっていないのに
+        // 画面が「接続あり」と言い張る。
+        let r = Reach::default();
+        assert_eq!(r.hits, 0);
+        assert!(r.last_ip.is_none());
+        assert!(r.last_at.is_none());
+    }
 
     #[test]
     fn token_is_16_hex_chars_and_unpredictable() {

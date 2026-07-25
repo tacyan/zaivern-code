@@ -234,9 +234,11 @@ Zaivern Code — CLI 制御チャネル
   zai app uninstall                     登録を解除
 
 ファイアウォール (Windows のみ — 📱 スマホリモートの受信許可):
-  zai firewall status                   受信許可の有無を表示
+  zai firewall status                   受信許可の状態と、繋がらない原因を表示
   zai firewall allow                    受信を許可 (TCP 8899-8919・管理者の確認あり)
   zai firewall revoke                   受信許可を取り消す
+  zai firewall unblock                  「すべての受信接続をブロックする」を解除
+                                        (この設定が入っていると許可規則は無視されます)
 
 その他:
   zai --help | -h                       このヘルプ
@@ -569,6 +571,7 @@ mod tests {
             "zai firewall status",
             "zai firewall allow",
             "zai firewall revoke",
+            "zai firewall unblock",
             "--help",
             "--version",
         ] {
