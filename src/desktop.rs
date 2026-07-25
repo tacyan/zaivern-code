@@ -60,18 +60,9 @@ pub fn run(args: &[String]) -> i32 {
 fn resolve_bin() -> Result<PathBuf, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("自分の実行ファイルの場所を特定できません: {e}"))?;
-    let exe = exe.canonicalize().unwrap_or(exe);
-    Ok(strip_verbatim(exe))
-}
-
-/// Windows の canonicalize が付ける `\\?\` 接頭辞を外す
-/// (.lnk の TargetPath 等に渡すと表示・解決が崩れるため)。他 OS では素通し。
-fn strip_verbatim(p: PathBuf) -> PathBuf {
-    let s = p.to_string_lossy();
-    match s.strip_prefix(r"\\?\") {
-        Some(rest) => PathBuf::from(rest),
-        None => p,
-    }
+    // `\\?\` 付きのまま .lnk の TargetPath 等へ渡すと表示・解決が崩れるので、
+    // 素のパスに直す (pathx に一本化してある)。
+    Ok(crate::pathx::plain(exe.canonicalize().unwrap_or(exe)))
 }
 
 fn home_dir() -> Result<PathBuf, String> {

@@ -132,7 +132,9 @@ impl Editor {
     /// Open a file (or focus it if already open).
     /// 既に開いていたタブをディスクから読み直したときだけ Ok(true)。
     pub fn open(&mut self, path: &Path, hl: &Highlighter) -> Result<bool, String> {
-        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // ルート (file_tree::normalize_roots) と同じ形に揃える。素のパスに
+        // しておかないと Windows で「どのルートのファイルか」の前方一致が外れる。
+        let canon = crate::pathx::canonical(path);
         if let Some(i) = self
             .buffers
             .iter()

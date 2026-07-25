@@ -34,6 +34,7 @@ mod notify;
 mod orchestration;
 mod palette;
 mod panels;
+mod pathx;
 mod pet;
 mod pet_bubble;
 mod pet_variants;

@@ -80,6 +80,9 @@ struct EditState {
 /// - ディレクトリでないものは黙って捨てる。
 /// - 比較・保持ともに canonicalize 済みパスを使う(シンボリックリンク差と
 ///   `..` を吸収する)。canonicalize できない場合は入力パスのまま使う。
+/// - Windows の `\\?\` 接頭辞は落として素のパスにする ([`crate::pathx`])。
+///   ルートはそのままエージェント/ターミナルの作業ディレクトリになるため、
+///   verbatim 形式のまま渡すと `cmd.exe` が `C:\Windows` へ落ちてしまう。
 /// - 既に採用済みルートと同一、またはその配下(ネスト)なら捨てる
 ///   — 親ルートのツリーから辿れるので二重に並べない。
 /// - 逆に新しいルートが採用済みルートの祖先なら、広い方を採用して
@@ -90,7 +93,7 @@ pub fn normalize_roots(input: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf>
         if !p.is_dir() {
             continue;
         }
-        let c = p.canonicalize().unwrap_or(p);
+        let c = crate::pathx::canonical(&p);
         if out.iter().any(|r| c.starts_with(r)) {
             continue; // 同一 or 既存ルート配下 → 既に見えている
         }
@@ -1232,9 +1235,10 @@ mod tests {
         *m = m.map(|x| x - Duration::from_secs(2));
     }
 
-    /// canonicalize 後の比較用（macOS の /tmp → /private/tmp 等を吸収）。
+    /// 正規化後の比較用（macOS の /tmp → /private/tmp 等を吸収）。
+    /// `normalize_roots` と同じ正規化 (Windows の `\\?\` 除去まで) を使う。
     fn canon(p: &Path) -> PathBuf {
-        p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+        crate::pathx::canonical(p)
     }
 
     #[test]
@@ -1276,6 +1280,27 @@ mod tests {
             vec![canon(&parent), canon(&other)],
             "祖先が勝ち、位置は最初に現れた場所を保つ"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DoD: ルートはそのままエージェント / ターミナルの作業ディレクトリになる。
+    /// Windows の `\\?\` 付きパスを渡すと cmd.exe がカレントディレクトリを捨てて
+    /// `C:\Windows` で起動してしまうため、ルートには残していけない。
+    #[test]
+    fn normalize_roots_returns_plain_paths() {
+        let dir = unique_temp_dir("zaivern-tree-test", "norm-plain");
+        let a = dir.join("a");
+        std::fs::create_dir_all(&a).expect("mkdir a");
+
+        for root in normalize_roots(vec![a.clone()]) {
+            assert!(
+                !root.to_string_lossy().starts_with(r"\\?\"),
+                "ルートは素のパス: {}",
+                root.display()
+            );
+            assert!(root.is_dir(), "指しているものは変わらない: {}", root.display());
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

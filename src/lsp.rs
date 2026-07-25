@@ -182,8 +182,11 @@ fn uri_to_path(uri: &str) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// URI の素材にするパス。エディタのバッファ側 (`editor::Editor::open`) と
+/// 同じ形 (Windows なら `\\?\` を外した素のパス) に揃えないと、
+/// サーバーへ送った URI と手元のパスが一致しなくなる。
 fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    crate::pathx::canonical(path)
 }
 
 // ---------------------------------------------------------------------------

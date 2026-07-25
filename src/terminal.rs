@@ -987,7 +987,13 @@ impl Session {
             })
             .map_err(|e| trf("PTYを開けませんでした: {e}", &[("e", e.to_string())]))?;
 
-        let cmd = build_command(&spec.command, &spec.cwd, &spec.env);
+        // 作業ディレクトリは PTY へ渡す前に「素の実在ディレクトリ」へ直す。
+        // Windows の `\\?\` 付きパスを渡すと cmd.exe が受け付けず、
+        // 黙って C:\Windows で起動してしまう (pathx の説明を参照)。
+        // 直した cwd はセッションにもそのまま持たせる (@パスの相対表示が
+        // 実際の起動先と食い違わないようにするため)。
+        let cwd = crate::pathx::launch_dir(&spec.cwd);
+        let cmd = build_command(&spec.command, &cwd, &spec.env);
         let mut child = pair
             .slave
             .spawn_command(cmd)
@@ -1117,7 +1123,7 @@ impl Session {
             preset_name: spec.preset_name,
             icon: spec.icon,
             command: spec.command,
-            cwd: spec.cwd,
+            cwd,
             env: spec.env,
             parser,
             writer,
@@ -2038,6 +2044,56 @@ mod tests {
         assert!(!session.search_step(true));
         assert_eq!(session.search.total, 0);
         assert_eq!(session.search.index, 0);
+    }
+
+    /// DoD: セッションは**指定したフォルダで実際に**起動する。
+    ///
+    /// アプリが持つルートは canonicalize 済みで、Windows ではそれが `\\?\C:\…`
+    /// (verbatim 形式) になる。これをそのまま PTY へ渡すと cmd.exe が
+    /// 「UNC paths are not supported」と言ってカレントディレクトリを捨て、
+    /// エージェントが `C:\Windows` で動き出す。素のパスへ直す処理の回帰テスト。
+    #[test]
+    fn session_starts_in_the_requested_directory() {
+        use std::time::Duration;
+        let dir = crate::test_util::unique_temp_dir("zaivern-term-test", "cwd");
+        // アプリ内部で持つ形 (canonicalize 済み) をそのまま渡す
+        let asked = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        let command = if cfg!(windows) { "cd" } else { "pwd" };
+        let spec = super::SpawnSpec {
+            title: "cwd".into(),
+            command: command.into(),
+            cwd: asked.clone(),
+            env: std::collections::HashMap::new(),
+            preset_name: String::new(),
+            icon: "💬".into(),
+            log_path: None,
+        };
+        let mut session =
+            Session::spawn(9993, spec, eframe::egui::Context::default()).expect("PTY起動");
+
+        // 覚えている cwd も素のパス (@パス補完の相対表示が起動先と揃う)
+        let want = crate::pathx::plain(asked);
+        assert_eq!(session.cwd, want, "セッションの cwd は素のパス");
+
+        // 実際にその場所で走ったか、子プロセスの出力で確かめる。
+        // 端末幅で折り返されても比較できるよう、空白を落として突き合わせる。
+        let squeeze = |s: &str| -> String { s.split_whitespace().collect() };
+        let expected = squeeze(&want.to_string_lossy());
+        let mut screen = String::new();
+        for _ in 0..100 {
+            screen = session.parser.lock().unwrap().screen().contents();
+            if squeeze(&screen).contains(&expected) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            squeeze(&screen).contains(&expected),
+            "起動先が {} でない (画面: {screen:?})",
+            want.display()
+        );
+        session.kill();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn mac_command() -> egui::Modifiers {
@@ -3183,6 +3239,9 @@ mod tests {
     }
 }
 
+/// PTY で走らせるコマンドを組む。`cwd` は [`crate::pathx::launch_dir`] を通した
+/// 素の実在ディレクトリであること (Windows では `\\?\` 付きだと cmd.exe が
+/// カレントディレクトリを捨てて `C:\Windows` で起動してしまう)。
 fn build_command(command: &str, cwd: &Path, env: &HashMap<String, String>) -> CommandBuilder {
     #[cfg(not(windows))]
     let mut cmd = {

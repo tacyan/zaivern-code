@@ -33,6 +33,7 @@ use crate::ide;
 use crate::kanban;
 use crate::palette::{Action, Cmd, Item, Palette};
 use crate::panels;
+use crate::pathx;
 use crate::pet;
 use crate::pet_bubble;
 use crate::recent;
@@ -316,6 +317,14 @@ pub struct ZaivernApp {
     theme: Theme,
     /// ワークスペースのルート一覧。**常に 1 件以上**。`roots[0]` が primary。
     roots: Vec<PathBuf>,
+    /// 「いま作業しているフォルダ」。これ以降に起動するエージェント / ターミナルの
+    /// 作業ディレクトリになる (`agent_cwd`)。`None` なら primary ルート。
+    ///
+    /// 起動引数のフォルダ (`zai .`) を初期値に、フォルダを開く / ワークスペースへ
+    /// 追加する / そのフォルダのファイルを開く、のたびに追随する。
+    /// **既に走っているセッションは動かさない** — 起動済みプロセスの cwd は
+    /// 変えられないので、追随するのは「それ以降の起動」だけ。
+    agent_root: Option<PathBuf>,
     tree: FileTree,
     editor: Editor,
     agents: AgentManager,
@@ -739,6 +748,10 @@ impl ZaivernApp {
             ext_check_at: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
             theme,
+            // 起動引数で指定されたフォルダ (`zai .` / `zai <dir>`) を作業フォルダの
+            // 初期値にする。セッション復元でルートが増えても、ユーザーが
+            // 「ここで開いた」フォルダでエージェントが起動するようにするため。
+            agent_root: roots.first().cloned(),
             roots,
             editor: Editor::new(),
             agents: AgentManager::new(),
@@ -893,6 +906,22 @@ impl ZaivernApp {
         self.roots.first().map(|p| p.as_path()).unwrap_or(Path::new("."))
     }
 
+    /// これから起動するエージェント / ターミナル / ビルドタスクの作業フォルダ。
+    /// 直近に開いた・選んだフォルダ (`agent_root`) を優先し、無ければ primary ルート。
+    fn agent_cwd(&self) -> PathBuf {
+        agent_cwd_from(&self.roots, self.agent_root.as_deref())
+    }
+
+    /// `path` を含むルートを作業フォルダとして覚える (次回以降の起動先になる)。
+    /// どのルートにも属さないパス (`~/.zaivern/config.toml` など) では何もしない
+    /// — 設定ファイルを開いただけでエージェントの起動先が飛ぶのを避ける。
+    fn track_agent_root(&mut self, path: &Path) {
+        let canon = pathx::canonical(path);
+        if let Some(root) = self.root_for(&canon) {
+            self.agent_root = Some(root.to_path_buf());
+        }
+    }
+
     /// トースト等の表示用: 所属ルートからの相対パス。
     /// 複数ルートのときはどのフォルダの話か分かるようルート名を前置する。
     /// どのルートにも属さなければ絶対パスのまま。
@@ -939,6 +968,15 @@ impl ZaivernApp {
         self.cfg = config::load(&self.roots, true);
         self.tree.show_hidden = self.cfg.show_hidden_files;
         self.rebuild_index();
+        // CLI (`zai open <file>`) が見る接続情報も新しいワークスペースへ更新する。
+        // 起動時に書いたままだと、フォルダを開き直した後の相対パス解決が
+        // 前のワークスペース基準になってしまう。
+        if let Some(s) = &self.remote {
+            let ws = self.primary_root().to_string_lossy().to_string();
+            if let Err(e) = cli::write_instance_file(s.port, &s.token, &ws) {
+                eprintln!("インスタンス情報の更新に失敗しました: {e}");
+            }
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(workspace_title(&self.roots)));
     }
 
@@ -1829,8 +1867,8 @@ impl ZaivernApp {
             cwd: cwd.map(|s| s.to_string()),
             env: HashMap::new(),
         };
-        // self.agents を可変で借りる前にルートを取り出しておく
-        let root = self.primary_root().to_path_buf();
+        // self.agents を可変で借りる前に作業フォルダを取り出しておく
+        let root = self.agent_cwd();
         match self
             .agents
             .launch(&preset, &root, crate::agents::Approval::Agent, ctx)
@@ -2162,8 +2200,8 @@ impl ZaivernApp {
         let saved = file_tree::normalize_roots(
             sess.roots.iter().map(PathBuf::from).collect::<Vec<_>>(),
         );
-        if saved.len() > self.roots.len() && self.roots.iter().all(|r| saved.contains(r)) {
-            self.apply_roots(saved, ctx);
+        if let Some(wider) = restored_roots(&self.roots, saved) {
+            self.apply_roots(wider, ctx);
         }
         let base = self.editor.buffers.len();
         for f in &sess.open_files {
@@ -2352,6 +2390,9 @@ impl ZaivernApp {
                     }
                 }
                 self.queue_hook(plugins::HookEvent::FileOpen, Some(path.to_path_buf()));
+                // 開いたファイルのルートを作業フォルダにする。マルチルートで
+                // 別フォルダのファイルへ移ったら、次のエージェントもそちらで起動する。
+                self.track_agent_root(path);
                 // メニューバーの「最近使用した項目」へ記録
                 self.touch_recent_file(path);
                 self.persist_session()
@@ -2436,7 +2477,8 @@ impl ZaivernApp {
         } else {
             tr("（既定モード）")
         };
-        let cwd = self.primary_root().to_path_buf();
+        // 起動先は「いま作業しているフォルダ」(直近に開いたフォルダ) にする
+        let cwd = self.agent_cwd();
         match self.agents.launch(&p, &cwd, approval, ctx) {
             Ok(()) => {
                 if is_agent_cli && is_bypass {
@@ -2607,6 +2649,10 @@ impl ZaivernApp {
             return;
         }
         self.set_roots(roots, ctx);
+        // 開き直したフォルダを作業フォルダにする (以降のエージェントはここで起動する)。
+        // 正規化後のルートを使う: ダイアログや引数のパスは `..` やシンボリックリンクを
+        // 含みうるので、ルートと同じ表記に揃えないと後の前方一致が外れる。
+        self.agent_root = self.roots.first().cloned();
         self.restore_session(ctx);
         // メニューバーの「最近使用した項目」へ記録
         self.menu_state.touch_folder(&dir);
@@ -2727,6 +2773,9 @@ impl ZaivernApp {
 
     /// フォルダをワークスペースへ追加する (AddFolder ダイアログと
     /// `#` パレットの worktree 追加が共有する本体)。
+    ///
+    /// 追加したフォルダは以降のエージェント起動先になる (Issue 着手フローで作った
+    /// worktree で、そのままエージェントを動かせるようにするため)。
     fn add_folder_to_workspace(&mut self, dir: PathBuf, ctx: &egui::Context) {
         let before = self.roots.len();
         let mut next = self.roots.clone();
@@ -2748,6 +2797,8 @@ impl ZaivernApp {
                 true,
             );
         }
+        // 既に含まれていた場合も、そのフォルダを選んだ意思は同じなので追随させる
+        self.track_agent_root(&dir);
     }
 
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
@@ -10687,6 +10738,46 @@ fn workspace_title(roots: &[PathBuf]) -> String {
     format!("Zaivern Code — {}", roots_label(roots))
 }
 
+/// 保存セッションのルート一覧 (`saved`) を復元すべきか判定し、適用する順に並べ替える。
+/// 復元しない (現在のルートの方が広い / 別ワークスペース) なら `None`。
+///
+/// 復元するのは「保存された構成が現在のルートをすべて含み、かつより広い」ときだけ。
+/// そのうえで**いま開いたフォルダを先頭 (primary) に戻す**: 保存順のまま適用すると
+/// `zai B` で開いたのに A が primary になり、エージェントの起動先も Git パネルも
+/// ユーザーが指定していないフォルダを向いてしまう。
+fn restored_roots(current: &[PathBuf], mut saved: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
+    if saved.len() <= current.len() || !current.iter().all(|r| saved.contains(r)) {
+        return None;
+    }
+    if let Some(primary) = current.first() {
+        if let Some(pos) = saved.iter().position(|r| r == primary) {
+            let head = saved.remove(pos);
+            saved.insert(0, head);
+        }
+    }
+    Some(saved)
+}
+
+/// エージェント / ターミナルを起動する作業フォルダを決める
+/// (`ZaivernApp::agent_cwd` の本体。UI 抜きで検証できるよう切り出してある)。
+///
+/// `chosen` = 直近にユーザーが開いた・選んだフォルダ。次の 2 条件を満たすときだけ
+/// 採用し、外れたら primary ルートへ落とす:
+/// - ディレクトリとして実在する (worktree を消した後などを弾く)
+/// - いずれかのルート配下にある (ワークスペースから外したフォルダを弾く)
+fn agent_cwd_from(roots: &[PathBuf], chosen: Option<&Path>) -> PathBuf {
+    let primary = || {
+        roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    match chosen {
+        Some(c) if c.is_dir() && roots.iter().any(|r| c.starts_with(r)) => c.to_path_buf(),
+        _ => primary(),
+    }
+}
+
 /// `.git` がファイルのとき、その中身 (`gitdir: <path>`) から実際の git ディレクトリを取り出す。
 /// 相対パスは workspace 基準で解決する。
 #[allow(dead_code)]
@@ -11022,7 +11113,7 @@ impl ZaivernApp {
                 .map(|(i, p)| (i, p.icon.clone(), p.name.clone()))
                 .collect(),
             themes,
-            build_task: menu_bar::build_task_for(self.primary_root()).map(|(l, _)| l),
+            build_task: menu_bar::build_task_for(&self.agent_cwd()).map(|(l, _)| l),
             run_label,
         }
     }
@@ -11410,7 +11501,8 @@ impl ZaivernApp {
     }
 
     fn run_build_task(&mut self, ctx: &egui::Context) {
-        let root = self.primary_root().to_path_buf();
+        // 検出もビルドも作業フォルダ基準 (メニューのラベルと同じ判定にする)
+        let root = self.agent_cwd();
         let Some((label, cmd)) = menu_bar::build_task_for(&root) else {
             self.toast(
                 tr("ビルドタスクを検出できませんでした (Cargo.toml / package.json / Makefile)"),
@@ -11467,7 +11559,7 @@ impl ZaivernApp {
                 self.agents.panel_open = true;
             }
             None => {
-                let root = self.primary_root().to_path_buf();
+                let root = self.agent_cwd();
                 self.spawn_command_terminal(tr("Shell"), String::new(), &root, ctx);
             }
         }
@@ -11917,6 +12009,57 @@ mod tests {
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir -p");
         std::fs::write(path, body).expect("write file");
+    }
+
+    /// DoD: エージェントは「直近に開いたフォルダ」で起動する。
+    /// 起動引数のフォルダ (`zai .`) も、あとから開き直したフォルダも同じ扱い。
+    #[test]
+    fn agent_cwd_follows_the_folder_you_opened() {
+        let base = unique_temp_dir("zaivern-app-test", "agent-cwd");
+        let a = base.join("alpha");
+        let b = base.join("beta");
+        std::fs::create_dir_all(a.join("src")).expect("mkdir a");
+        std::fs::create_dir_all(&b).expect("mkdir b");
+        let roots = file_tree::normalize_roots(vec![a.clone(), b.clone()]);
+        assert_eq!(roots.len(), 2, "別ツリーの 2 ルート");
+        let (a, b) = (roots[0].clone(), roots[1].clone());
+
+        // 未指定なら従来どおり primary ルート
+        assert_eq!(agent_cwd_from(&roots, None), a);
+        // 開いたフォルダ (= ルート) がそのまま起動先になる
+        assert_eq!(agent_cwd_from(&roots, Some(&b)), b);
+        // ルート配下のサブフォルダも有効 (そのフォルダで起動する)
+        let sub = a.join("src");
+        assert_eq!(agent_cwd_from(&roots, Some(&sub)), sub);
+        // ワークスペースから外したフォルダは採用しない (primary へ落とす)
+        assert_eq!(agent_cwd_from(&roots[..1], Some(&b)), a);
+        // 消えたフォルダも採用しない — 存在しない cwd では起動できない
+        std::fs::remove_dir_all(&b).expect("rmdir b");
+        assert_eq!(agent_cwd_from(&roots, Some(&b)), a);
+        // ルートが空でも "." に落ちて起動先を必ず 1 つ返す
+        assert_eq!(agent_cwd_from(&[], None), PathBuf::from("."));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// DoD: `zai <フォルダ>` で開いたフォルダは、セッション復元でルートが増えても
+    /// primary のまま = エージェントの起動先のまま。
+    #[test]
+    fn restoring_a_wider_workspace_keeps_the_launched_folder_primary() {
+        let a = PathBuf::from("/ws/alpha");
+        let b = PathBuf::from("/ws/beta");
+        let c = PathBuf::from("/ws/gamma");
+
+        // `zai beta` 起動 + 保存構成 [alpha, beta] → beta を先頭に戻して復元する
+        let restored = restored_roots(std::slice::from_ref(&b), vec![a.clone(), b.clone()])
+            .expect("より広い構成は復元する");
+        assert_eq!(restored, vec![b.clone(), a.clone()], "開いたフォルダが primary");
+
+        // 現在のルートを含まない保存構成は別ワークスペース扱いで復元しない
+        assert!(restored_roots(std::slice::from_ref(&c), vec![a.clone(), b.clone()]).is_none());
+        // 同じ広さ / より狭い保存構成も触らない
+        assert!(restored_roots(std::slice::from_ref(&b), vec![b.clone()]).is_none());
+        assert!(restored_roots(&[b.clone(), a.clone()], vec![a.clone(), b.clone()]).is_none());
     }
 
     /// DoD: 2 つのルートに同じ相対パス (`src/main.rs`) があっても、
