@@ -2514,6 +2514,20 @@ impl ZaivernApp {
         }
     }
 
+    /// エージェントを閉じる共通口 (✕ ボタン・看板・パレット・リモートすべてここ)。
+    ///
+    /// 後始末そのものは [`crate::terminal::reap`] が別スレッドで持っていくので、
+    /// ここは UI 側の後片付けだけを見る。閉じた端末が持っていたキーボード
+    /// フォーカスは egui ごと消えてしまうため、残ったセッションへ渡し直す
+    /// (渡さないと入力の行き先が無くなり、「閉じたら操作を受け付けなくなった」
+    /// ように見える)。
+    fn close_agent(&mut self, i: usize) {
+        self.agents.remove(i);
+        if !self.agents.sessions.is_empty() {
+            self.term_focus_pending = true;
+        }
+    }
+
     fn send_to_agent(&mut self, text: String) {
         if let Some(s) = self.agents.active_session() {
             s.note_user_input();
@@ -3319,7 +3333,7 @@ impl ZaivernApp {
             }
             Cmd::KillAgent => {
                 let i = self.agents.active;
-                self.agents.remove(i);
+                self.close_agent(i);
             }
             _ => {}
         }
@@ -4910,7 +4924,7 @@ impl ZaivernApp {
             }
         }
         if let Some(i) = remove {
-            self.agents.remove(i);
+            self.close_agent(i);
         }
     }
 
@@ -5834,7 +5848,13 @@ impl ZaivernApp {
 
                 let font = self.cfg.terminal_font_size;
                 let want_focus = self.term_focus_pending;
-                self.term_focus_pending = false;
+                // 予約を下ろすのは、この後で実際に端末を描くときだけ。
+                // 「📋 看板」タブ表示中やセッションが 0 件の間に消してしまうと、
+                // タブ切替やエージェントを閉じた直後のフォーカス要求が握り潰され、
+                // どこにも入力が届かなくなる。
+                if !self.kanban && !self.agents.sessions.is_empty() {
+                    self.term_focus_pending = false;
+                }
                 if self.kanban {
                     // 「📋 看板」タブ: 端末の代わりにフリート看板を敷き詰める
                     let ctx = ui.ctx().clone();
@@ -5874,7 +5894,7 @@ impl ZaivernApp {
             }
         }
         if let Some(i) = remove {
-            self.agents.remove(i);
+            self.close_agent(i);
         }
         if let Some(p) = open_log {
             self.open_term_log(&p);
@@ -6579,7 +6599,7 @@ impl ZaivernApp {
             }
         }
         if let Some(i) = acts.remove {
-            self.agents.remove(i);
+            self.close_agent(i);
         }
         // タスク作成 / メッセージ送信のフォームと、押されたボタンの適用。
         let prev_task_target = self.orch.target;
@@ -6782,7 +6802,7 @@ impl ZaivernApp {
                         self.toast(e, false);
                     }
                 }
-                kanban::KanbanAction::Remove(i) => self.agents.remove(i),
+                kanban::KanbanAction::Remove(i) => self.close_agent(i),
                 kanban::KanbanAction::CyclePermission(i) => {
                     match self.agents.cycle_permission(i) {
                         Some(hint) => self.toast_warn(trf(
@@ -11085,9 +11105,16 @@ impl eframe::App for ZaivernApp {
         }
     }
 
-    /// 終了時に、CLI 向けの接続情報ファイルを片付ける。
+    /// 終了時の後始末: CLI 向けの接続情報ファイルと、走らせたままのエージェント。
+    ///
+    /// セッションをそのまま drop させると ConPTY を閉じる待ちで終了処理が止まり、
+    /// ウィンドウが閉じないまま残る。エージェントを落として PTY は OS に任せる
+    /// ([`crate::terminal::abandon`] の説明を参照)。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         cli::remove_instance_file();
+        for s in std::mem::take(&mut self.agents.sessions) {
+            crate::terminal::abandon(s);
+        }
     }
 }
 

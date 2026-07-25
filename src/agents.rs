@@ -840,7 +840,10 @@ impl AgentManager {
             },
             ctx.clone(),
         )?;
-        self.sessions[i] = session;
+        // 代入で古いセッションをその場で drop すると、UI スレッドが ConPTY の
+        // 後始末で止まる。取り出して reap へ渡す (crate::terminal::reap を参照)。
+        let old = std::mem::replace(&mut self.sessions[i], session);
+        crate::terminal::reap(old);
         self.active = i;
         Ok(())
     }
@@ -849,7 +852,10 @@ impl AgentManager {
         if i >= self.sessions.len() {
             return;
         }
-        self.sessions.remove(i);
+        // 取り除いたセッションは**この場で drop しない**。ConPTY を閉じる
+        // Drop は UI スレッドを止め得るので、後始末ごと reap に預ける
+        // (crate::terminal::reap の説明を参照)。
+        crate::terminal::reap(self.sessions.remove(i));
         // active より左を閉じたら、フォーカス中セッションが左へ1つ詰まるので
         // active も詰める(でないとキーボード/リモート入力が隣のセッションへ流れる)。
         // i == active が最右のときは下のクランプが左隣へ寄せる(従来挙動のまま)。
@@ -1394,9 +1400,9 @@ mod tests {
             m
         }
 
-        /// app.rs の閉じる経路と同じく、殺してから取り除く。
+        /// app.rs の閉じる経路と同じ。`remove` が終了と後始末まで持っていくので
+        /// (crate::terminal::reap)、呼び出し側は index を渡すだけでよい。
         fn close(m: &mut AgentManager, i: usize) {
-            m.sessions[i].kill();
             m.remove(i);
         }
 

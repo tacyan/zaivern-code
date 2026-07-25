@@ -46,6 +46,40 @@ pub struct SearchUi {
     pub current_vis: Option<(usize, u16)>,
 }
 
+/// PTY への書き込み口。**積むだけで、実際に書くのは専用スレッド**。
+///
+/// 以前はここで直接 `write_all` していた。PTY の入力パイプは子が読まなくなると
+/// 詰まり、そのまま書き手を止める。書き手は UI スレッド (キー入力・一斉送信・
+/// 音声・スマホ・調停レイヤの配達) なので、固まりかけたエージェントが 1 本あると
+/// アプリ全体が止まった。しかも共有ロックを掴んだまま止まるため、読取スレッドの
+/// 返事 (CSI 6n など) まで巻き添えになっていた。
+///
+/// 書き込みを待ち行列へ逃がせば、詰まるのは捨てて構わない writer スレッドだけで済む。
+#[derive(Clone)]
+struct PtyWriter {
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// まだ書けていないバイト数。青天井に溜め込まないための目安。
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PtyWriter {
+    /// 待ち行列の上限。これを超えたら子はもう入力を読んでいないので、
+    /// 積んでもメモリを食うだけで届かない。人が打つ量からは遠く離してある。
+    const MAX_QUEUED: usize = 1 << 20; // 1 MiB
+
+    fn send(&self, bytes: &[u8]) {
+        use std::sync::atomic::Ordering as O;
+        if self.queued.load(O::Relaxed) > Self::MAX_QUEUED {
+            return;
+        }
+        self.queued.fetch_add(bytes.len(), O::Relaxed);
+        if self.tx.send(bytes.to_vec()).is_err() {
+            // writer スレッドが終わっている (PTY が閉じた)。数え戻しておく。
+            self.queued.fetch_sub(bytes.len(), O::Relaxed);
+        }
+    }
+}
+
 pub struct Session {
     /// セッション毎に一意な安定ID(呼び出し側が採番)。sessions の index は
     /// 削除で前へ詰まるため、バブル却下記録などの識別にはこちらを使う。
@@ -58,9 +92,13 @@ pub struct Session {
     pub env: HashMap<String, String>,
     pub parser: Arc<Mutex<vt100::Parser>>,
     /// PTY への書き込み口。問い合わせへの返事を読取スレッドからも書くため共有する。
-    writer: Arc<Mutex<Box<dyn IoWrite + Send>>>,
+    writer: PtyWriter,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// PTY に直接ぶら下がっている子 (cmd.exe / ログインシェル) の PID。
+    /// エージェント本体はその**孫**なので、畳むときはここを起点に
+    /// プロセスツリーごと落とす ([`kill_tree_command`] の説明を参照)。
+    child_pid: Option<u32>,
     pub exited: Arc<AtomicBool>,
     pub exit_code: Arc<Mutex<Option<u32>>>,
     pub started: Instant,
@@ -999,6 +1037,8 @@ impl Session {
             .spawn_command(cmd)
             .map_err(|e| trf("起動に失敗しました: {e}", &[("e", e.to_string())]))?;
         let killer = child.clone_killer();
+        // child はこの後 wait 用スレッドへ渡してしまうので、PID は今のうちに取る。
+        let child_pid = child.process_id();
         drop(pair.slave);
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 5000)));
@@ -1010,8 +1050,25 @@ impl Session {
             .try_clone_reader()
             .map_err(|e| e.to_string())?;
 
-        let writer: Arc<Mutex<Box<dyn IoWrite + Send>>> =
-            Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| e.to_string())?));
+        // PTY への書き込みは専用スレッドに任せる (PtyWriter の説明を参照)。
+        // 送り手 (UI スレッド / 読取スレッド) が全員居なくなると recv が切れて畳まれる。
+        let writer = {
+            let mut w = pair.master.take_writer().map_err(|e| e.to_string())?;
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = queued.clone();
+            std::thread::spawn(move || {
+                while let Ok(chunk) = rx.recv() {
+                    let n = chunk.len();
+                    let ok = w.write_all(&chunk).is_ok() && w.flush().is_ok();
+                    counter.fetch_sub(n, Ordering::Relaxed);
+                    if !ok {
+                        break; // PTY が閉じた。以降の入力は届かない。
+                    }
+                }
+            });
+            PtyWriter { tx, queued }
+        };
         let cursor_shape = Arc::new(AtomicU8::new(CursorShape::Block.to_u8()));
         let focus_reports = Arc::new(AtomicBool::new(false));
         let clipboard_pending: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -1086,9 +1143,7 @@ impl Session {
                                 }
                             }
                             if !reply.is_empty() {
-                                let mut w = lock_ok(&writer);
-                                let _ = w.write_all(&reply);
-                                let _ = w.flush();
+                                writer.send(&reply);
                             }
                             ctx.request_repaint();
                         }
@@ -1129,6 +1184,7 @@ impl Session {
             writer,
             master: pair.master,
             killer,
+            child_pid,
             exited,
             exit_code,
             started: Instant::now(),
@@ -1339,10 +1395,13 @@ impl Session {
         !self.exited.load(Ordering::SeqCst)
     }
 
+    /// PTY へ入力を送る。待ち行列へ積むだけなので**ここでは待たされない**。
+    ///
+    /// 直接書くと、子が標準入力を読まなくなった (固まった / 落ちかけている)
+    /// ときにパイプが詰まって呼び出し側ごと止まる。呼び出し側は UI スレッドなので
+    /// アプリ全体が固まる ([`PtyWriter`] の説明を参照)。
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        let mut w = lock_ok(&self.writer);
-        let _ = w.write_all(bytes);
-        let _ = w.flush();
+        self.writer.send(bytes);
     }
 
     /// アプリが DECSCUSR で指定した現在のカーソル形状。
@@ -1484,8 +1543,19 @@ impl Session {
         lock_ok(&self.parser).set_size(rows, cols);
     }
 
+    /// エージェントを終了させる。孫まで落とすが**待たない**ので、
+    /// UI スレッドから呼んでよい。セッション自体は一覧に残る。
+    ///
+    /// 順序が肝: 先に `killer.kill()` で根 (シェル) を落とすと、
+    /// `taskkill /T` が根を見つけられず木を辿れなくなり、**孫だけが取り残される**。
+    /// 木を落としてから、取りこぼしの保険として根を撃つ。
     pub fn kill(&mut self) {
-        let _ = self.killer.kill();
+        let pid = self.child_pid;
+        let mut killer = self.killer.clone_killer();
+        std::thread::spawn(move || {
+            kill_tree_blocking(pid);
+            let _ = killer.kill();
+        });
     }
 
     pub fn set_scroll(&mut self, n: usize) {
@@ -1636,6 +1706,96 @@ impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.killer.kill();
     }
+}
+
+/// プロセス**ツリー**を落とすコマンドを組み立てる。
+///
+/// PTY に直接ぶら下がっているのは `cmd.exe` (Windows) / ログインシェル (unix) で、
+/// エージェント本体 (`claude` → node.exe など) はその**孫**。portable-pty の
+/// killer は直接の子だけを TerminateProcess するので、孫は生き残り、
+/// PTY に繋がったまま走り続ける。
+///
+/// Windows ではこれが致命的になる。生き残ったクライアントがいる限り
+/// `ClosePseudoConsole` (= master の Drop) が返ってこないためで、
+/// UI スレッドでセッションを drop するとウィンドウごと固まって戻らない。
+/// ([`reap`] の説明も参照)
+fn kill_tree_command(pid: u32) -> std::process::Command {
+    #[cfg(windows)]
+    // /T = 子孫ごと、/F = 強制。PATH は要らない (System32 にある)。
+    let mut c = {
+        let mut c = crate::procx::hidden_command_raw("taskkill");
+        c.args(["/T", "/F", "/PID", &pid.to_string()]);
+        c
+    };
+    #[cfg(not(windows))]
+    // portable-pty の unix 実装は子を setsid するので、子はプロセスグループの
+    // リーダーになっている。`-PID` でグループごと落とせる。
+    let mut c = {
+        let mut c = crate::procx::hidden_command_raw("kill");
+        c.args(["-KILL", &format!("-{pid}")]);
+        c
+    };
+    // 「〜を終了しました」の報告はどこへも出さない。ターミナルから `zai` を
+    // 起動していると、閉じるたびにこの出力が混ざる。
+    c.stdout(std::process::Stdio::null());
+    c.stderr(std::process::Stdio::null());
+    c
+}
+
+/// ツリーを落として、落ち切るまで待つ。**UI スレッドから呼んではいけない**。
+/// 木を辿れた (= 根がまだ生きていた) なら true。
+fn kill_tree_blocking(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else { return false };
+    match kill_tree_command(pid).spawn() {
+        Ok(mut child) => child.wait().map(|s| s.success()).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// セッションを畳む。**閉じる操作はすべてここを通すこと**。
+///
+/// `Session` を drop すると master (ConPTY) が閉じる。Windows の
+/// `ClosePseudoConsole` は「PTY に繋がっているクライアントが全部消えて、
+/// 残りの出力を吐き切る」まで戻ってこない。エージェントを走らせたまま
+/// UI スレッドで drop すると、`App::update` の途中で止まったきり
+/// 画面が更新されなくなる — 「エージェントを2つ以上動かしている最中に
+/// 片方を閉じるとアプリが固まって戻らない」の正体がこれ。
+///
+/// そこでセッションを別スレッドへ持ち出し、**プロセスツリーを落とし切ってから**
+/// drop する。ツリーが消えていれば `ClosePseudoConsole` はすぐ返るし、
+/// 万一返らなくても止まるのは捨てるスレッドだけで、UI は動き続ける。
+pub fn reap(session: Session) {
+    std::thread::spawn(move || {
+        let mut session = session;
+        // 木が先。根を先に落とすと taskkill が木を辿れず孫が残る
+        // ([`Session::kill`] の説明を参照)。
+        kill_tree_blocking(session.child_pid);
+        let _ = session.killer.kill();
+        // ここでようやく ConPTY を閉じる (この時点なら待たされない)。
+        drop(session);
+    });
+}
+
+/// アプリ終了時にセッションを手放す。
+///
+/// [`reap`] と違って別スレッドに預けない — プロセスが消えるとスレッドも道連れに
+/// なるため、終了処理の途中で消える可能性のある場所に後始末を残せない。
+/// エージェントを落とすコマンドだけ先に**独立したプロセスとして**起こし、
+/// PTY のハンドルは OS に回収させる (drop すると `ClosePseudoConsole` で
+/// 終了処理そのものが止まり、ウィンドウが閉じないまま残る)。
+pub fn abandon(session: Session) {
+    let mut session = session;
+    // `/T /F` は根ごと落とすので、これ 1 本でよい。待たない — この子プロセスは
+    // 自分より長生きしてよいし、根を先に撃つと木を辿れなくなる
+    // ([`Session::kill`] の説明を参照)。
+    let started = session
+        .child_pid
+        .is_some_and(|pid| kill_tree_command(pid).spawn().is_ok());
+    if !started {
+        // taskkill / kill を起こせなかったときの保険。
+        let _ = session.killer.kill();
+    }
+    std::mem::forget(session);
 }
 
 #[cfg(test)]
@@ -4610,6 +4770,273 @@ pub fn draw(
     }
 
     response
+}
+
+/// セッションを畳む経路 ([`reap`] / [`abandon`] / [`Session::kill`]) の取り決め。
+///
+/// 実体は「別スレッドへ持ち出してから ConPTY を閉じる」ことなので、
+/// 効いているかどうかはコンパイル時の `Send` 境界と、組み立てるコマンドで見る。
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+
+    /// `reap` / `abandon` はセッションを別スレッドへ渡す。渡せなくなったら
+    /// ConPTY の後始末が UI スレッドへ戻り、閉じた瞬間にアプリが固まる。
+    #[test]
+    fn session_can_leave_the_ui_thread() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Session>();
+    }
+
+    /// 直接の子だけでなく**子孫まで**落とすこと。PTY にぶら下がるのは
+    /// cmd.exe / ログインシェルで、エージェント本体はその孫。孫が残ると
+    /// Windows では `ClosePseudoConsole` が返らなくなる。
+    #[test]
+    fn kill_reaches_the_whole_tree() {
+        let cmd = kill_tree_command(4321);
+        let prog = cmd.get_program().to_string_lossy().into_owned();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        #[cfg(windows)]
+        {
+            assert_eq!(prog, "taskkill");
+            assert!(args.contains(&"/T".to_string()), "子孫を含めない: {args:?}");
+            assert!(args.contains(&"/F".to_string()), "強制終了でない: {args:?}");
+            assert_eq!(args.last().map(String::as_str), Some("4321"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(prog, "kill");
+            // 先頭の `-` がプロセスグループ指定。これが無いと孫が残る。
+            assert_eq!(args, vec!["-KILL".to_string(), "-4321".to_string()]);
+        }
+    }
+
+    /// PID が取れなかったセッションでも、畳む処理が止まらないこと。
+    #[test]
+    fn missing_pid_is_not_fatal() {
+        assert!(!kill_tree_blocking(None));
+    }
+}
+
+/// PTY への書き込みが呼び出し側 (UI スレッド) を止めないことの取り決め。
+#[cfg(test)]
+mod pty_writer_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 受け手が一切読まない writer を模して、送り側だけを見る。
+    fn stalled_writer() -> (PtyWriter, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        (PtyWriter { tx, queued }, rx)
+    }
+
+    /// 子が入力を一切読まなくても、書き込みは即座に返ること。
+    /// ここで待たされると `App::update` の途中で画面が止まる。
+    #[test]
+    fn writing_to_a_stalled_child_does_not_block() {
+        let (w, _rx) = stalled_writer();
+        let t = Instant::now();
+        for _ in 0..1000 {
+            w.send(b"hello\r");
+        }
+        let took = t.elapsed();
+        assert!(
+            took < Duration::from_millis(200),
+            "読まれない PTY への書き込みが呼び出し側を待たせた ({took:?})"
+        );
+    }
+
+    /// 届かない入力を無制限に溜め込まないこと。上限を超えたら捨てる
+    /// (子が読んでいない以上、積んでもメモリを食うだけで届かない)。
+    #[test]
+    fn the_backlog_is_capped() {
+        let (w, _rx) = stalled_writer();
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..64 {
+            w.send(&chunk);
+        }
+        let queued = w.queued.load(Ordering::Relaxed);
+        assert!(
+            queued <= PtyWriter::MAX_QUEUED + chunk.len(),
+            "待ち行列が上限を超えて育った: {queued}"
+        );
+    }
+
+    /// 実 PTY で、書いた入力が本当に子へ届くこと。
+    /// 書き込みを非同期にした分、ここが壊れると無音で入力が消える。
+    #[test]
+    fn input_reaches_the_child_through_the_queue() {
+        let spec = SpawnSpec {
+            title: "w".into(),
+            preset_name: "w".into(),
+            icon: "w".into(),
+            command: String::new(), // 素のシェル
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s = Session::spawn(1, spec, egui::Context::default()).unwrap();
+        // シェルが入力を受け付けるようになるまで待ってから打つ
+        std::thread::sleep(Duration::from_millis(1500));
+        s.write_bytes(b"echo ZAIVERNPING\r");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = false;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            if lock_ok(&s.parser).screen().contents().contains("ZAIVERNPING") {
+                seen = true;
+                break;
+            }
+        }
+        reap(s);
+        assert!(seen, "待ち行列越しの入力が子へ届かなかった");
+    }
+
+    /// writer スレッドが畳まれた後に書いても、数えた分が残らないこと
+    /// (残ると上限に張り付いて、再開しても以後の入力が捨てられ続ける)。
+    #[test]
+    fn counter_is_restored_when_the_writer_is_gone() {
+        let (w, rx) = stalled_writer();
+        drop(rx);
+        w.send(b"gone");
+        assert_eq!(w.queued.load(Ordering::Relaxed), 0);
+    }
+}
+
+/// バグ本体の回帰テスト: 「動いているエージェントを閉じるとアプリが固まって戻らない」。
+///
+/// 実 PTY で**孫プロセス**を持つセッションを起こして閉じる。孫を作るのが肝で、
+/// PTY に直接ぶら下がるのはシェルであり、エージェント本体はその下にいる。
+/// 以前は孫が生き残って PTY に繋がったままになり、`ClosePseudoConsole`
+/// (= master の Drop) が UI スレッドで返らなくなっていた。
+#[cfg(test)]
+mod reap_pty_tests {
+    use super::*;
+
+    /// 孫プロセスが「生きている間ずっとファイルへ書き足す」セッションを起こす。
+    /// 戻り値は (セッション, 監視するファイル)。
+    fn spawn_with_a_noisy_grandchild(tag: &str) -> (Session, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("zaivern-reap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join(format!("{tag}.txt"));
+        let _ = std::fs::remove_file(&probe);
+        let p = probe.display().to_string();
+
+        // シェルがそのまま exec してしまわないよう、必ず「シェルの子」を起こす。
+        #[cfg(windows)]
+        let command = format!(
+            "powershell -NoProfile -Command \"while($true){{ Add-Content -LiteralPath '{p}' -Value 'x'; Start-Sleep -Milliseconds 100 }}\""
+        );
+        #[cfg(not(windows))]
+        let command = format!("/bin/sh -c 'while true; do echo x >> {p}; sleep 0.1; done'");
+
+        let spec = SpawnSpec {
+            title: "reap".into(),
+            preset_name: "reap".into(),
+            icon: "r".into(),
+            command,
+            cwd: dir,
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let session = Session::spawn(1, spec, egui::Context::default()).unwrap();
+        (session, probe)
+    }
+
+    /// `probe` が育ち始めるまで待つ。育たなければ None (環境が実行できていない)。
+    fn wait_until_growing(probe: &Path) -> Option<u64> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+            if let Ok(m) = std::fs::metadata(probe) {
+                if m.len() > 0 {
+                    return Some(m.len());
+                }
+            }
+        }
+        None
+    }
+
+    fn len_of(probe: &Path) -> u64 {
+        std::fs::metadata(probe).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// 閉じる操作そのものが呼び出し側 (UI スレッド) を待たせないこと。
+    /// ここが待たされると `App::update` の途中で画面が止まり、二度と戻らない。
+    #[test]
+    fn closing_a_running_agent_returns_immediately() {
+        let (session, probe) = spawn_with_a_noisy_grandchild("nonblock");
+        if wait_until_growing(&probe).is_none() {
+            // 孫を起こせない環境。ここで落としても得るものが無いので見送る。
+            reap(session);
+            return;
+        }
+        let t = Instant::now();
+        reap(session);
+        let took = t.elapsed();
+        assert!(
+            took < Duration::from_millis(300),
+            "閉じる操作が呼び出し側を待たせた ({took:?})。UI スレッドならここで固まる"
+        );
+    }
+
+    /// 木を辿るのは根 (シェル) が**生きているうち**でなければならない。
+    /// 先に根を落としてしまうと `taskkill /T` は根を見つけられず、
+    /// 孫がそのまま取り残される (= PTY を掴んだままになる)。
+    #[test]
+    fn the_tree_is_walked_while_the_root_is_still_alive() {
+        let (mut session, probe) = spawn_with_a_noisy_grandchild("order");
+        if wait_until_growing(&probe).is_none() {
+            reap(session);
+            return;
+        }
+        // 根が生きている状態なら木を辿れる。
+        assert!(
+            kill_tree_blocking(session.child_pid),
+            "生きているセッションの木を辿れなかった"
+        );
+        // 根を落とした後は、同じ PID を渡しても辿れない — だから順序が要る。
+        let _ = session.killer.kill();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !kill_tree_blocking(session.child_pid),
+            "根が消えた後に木を辿れてしまった (この前提が崩れたら kill の順序を見直すこと)"
+        );
+        reap(session);
+    }
+
+    /// 閉じたら**孫まで**止まること。孫が残ると PTY を掴んだままになり、
+    /// 次に閉じるときの `ClosePseudoConsole` が返らなくなる
+    /// (エージェントが裏で走り続けてトークンを食う問題でもある)。
+    #[test]
+    fn closing_a_running_agent_stops_the_whole_tree() {
+        let (session, probe) = spawn_with_a_noisy_grandchild("tree");
+        if wait_until_growing(&probe).is_none() {
+            reap(session);
+            return;
+        }
+        reap(session);
+
+        // 落ち切るまでの猶予。taskkill / kill は別プロセスなので少し待つ。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let quiet = loop {
+            let before = len_of(&probe);
+            std::thread::sleep(Duration::from_millis(500));
+            if len_of(&probe) == before {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+        };
+        assert!(quiet, "閉じたのに孫プロセスが書き続けている: {}", probe.display());
+    }
 }
 
 #[cfg(test)]
