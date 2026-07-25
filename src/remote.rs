@@ -127,19 +127,28 @@ pub struct RemoteServer {
     rx: mpsc::Receiver<Request>,
 }
 
+/// 待ち受けに使うポートの範囲 (両端を含む)。
+///
+/// Windows の受信許可規則もこの範囲で作るので、
+/// [`crate::firewall::PORT_FROM`] / [`crate::firewall::PORT_TO`] と必ず一致させること
+/// (広げてもファイアウォール側を直さないと、その分は Windows で繋がらない)。
+pub const PORT_FROM: u16 = 8899;
+pub const PORT_TO: u16 = 8919;
+
 impl RemoteServer {
     /// サーバを起動する。8899 から順に空きポートを探す。
     pub fn start(ctx: egui::Context) -> Result<Self, String> {
         let mut listener = None;
         let mut port = 0u16;
-        for p in 8899..8920u16 {
+        for p in PORT_FROM..=PORT_TO {
             if let Ok(l) = TcpListener::bind(("0.0.0.0", p)) {
                 listener = Some(l);
                 port = p;
                 break;
             }
         }
-        let listener = listener.ok_or("空きポートがありません (8899-8919)")?;
+        let listener = listener
+            .ok_or_else(|| format!("空きポートがありません ({PORT_FROM}-{PORT_TO})"))?;
 
         let token = gen_token();
         let url = format!("http://{}:{}/", lan_ip(), port);
@@ -694,7 +703,9 @@ function renderFiles() {
   if (!hit.length) { el.innerHTML = '<div class="empty">該当なし</div>'; return; }
   hit.forEach(f => {
     const d = document.createElement('div');
-    const i = f.lastIndexOf('/');
+    // Windows のパスは `src\app.rs` と区切りが `\` で来る。
+    // `/` だけを見ていると全体がファイル名として出てフォルダ行が空になる
+    const i = Math.max(f.lastIndexOf('/'), f.lastIndexOf('\\'));
     d.innerHTML = '<span></span><br><span class="dir"></span>';
     d.children[0].textContent = i >= 0 ? f.slice(i + 1) : f;
     d.children[2].textContent = i >= 0 ? f.slice(0, i) : '';

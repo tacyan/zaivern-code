@@ -82,6 +82,40 @@ function Register-App($exe) {
     }
 }
 
+$fwRule = "Zaivern Code (Mobile Remote)"
+
+# 📱 スマホリモートの受信許可。
+# Windows は既定で受信をブロックするため、規則が無いとスマホから接続できない
+# (PC 側は待ち受けていて QR も正しいのに、スマホからだけ何も起きない)。
+# 規則の作成には管理者権限が必要なので:
+#   - すでに管理者で実行しているならこの場で作る (UAC は出ない)
+#   - そうでなければ勝手に昇格せず、案内だけ出す
+#     (アプリの 📱 画面のボタン、または `zai firewall allow` から作れる)
+function Register-Firewall($exe) {
+    try {
+        if (Get-NetFirewallRule -DisplayName $fwRule -ErrorAction SilentlyContinue) {
+            Say "📱 スマホリモートの受信は許可済みです (取り消し: zai firewall revoke)"
+            return
+        }
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $admin = (New-Object Security.Principal.WindowsPrincipal $id).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+        if (-not $admin) {
+            Warn "📱 スマホリモートには受信許可が必要です (Windows は既定で受信をブロックします)"
+            Warn "   許可の仕方: アプリの 📱 画面のボタン、または管理者で zai firewall allow"
+            return
+        }
+        Start-Process -FilePath $exe -ArgumentList "firewall", "allow" -Wait -WindowStyle Hidden
+        if (Get-NetFirewallRule -DisplayName $fwRule -ErrorAction SilentlyContinue) {
+            Say "📱 スマホリモートの受信を許可しました (TCP 8899-8919 / 取り消し: zai firewall revoke)"
+        } else {
+            Warn "📱 受信許可を作成できませんでした — アプリの 📱 画面のボタンから許可してください"
+        }
+    } catch {
+        Warn "ファイアウォールの確認をスキップしました: $_"
+    }
+}
+
 function Show-Done($verb, $exe, $tag) {
     Write-Host ""
     Write-Host "[zaivern-code] ✅ ${verb}完了: $exe $tag" -ForegroundColor Green
@@ -124,6 +158,7 @@ function Install-Prebuilt {
 
     Add-UserPath $installDir
     Register-App $exe
+    Register-Firewall $exe
     Show-Done $verb $exe "($tag)"
     return $true
 }
@@ -175,6 +210,7 @@ function Install-FromSource {
     Sync-Stale $exe $cargoBin
     Add-UserPath $cargoBin
     Register-App $exe
+    Register-Firewall $exe
     Show-Done "インストール" $exe ""
     return $true
 }

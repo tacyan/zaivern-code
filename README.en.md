@@ -103,6 +103,8 @@ You're not staring at cold logs — **a companion taps you on the shoulder.** De
 
 Tap 📱 in the top bar, scan the QR code, and any phone on the same Wi-Fi becomes your remote control. From the sofa, from the balcony, while the coffee brews — approvals, new instructions, file edits, progress checks. **While the agents are working, there is no reason left for you to be chained to a desk.** (Per-launch random token auth, LAN only.)
 
+**On Windows this needs one permission, once.** Windows blocks all inbound connections by default, so without a rule your phone's connection is dropped by the OS — the PC is listening, the QR is correct, and yet nothing happens on the phone. Nothing on screen told you why, so the story used to end at "phone remote doesn't work on Windows". Now the 📱 panel checks the inbound rule itself and, if it is missing, says so and offers a **"🛡 Allow inbound" button** (one administrator prompt). It allows **only this executable on TCP 8899-8919**, and you can revoke it from the same panel. From a terminal: `zai firewall status` / `zai firewall allow` / `zai firewall revoke`.
+
 ### 🎤 Just speak — one mic button, nothing else
 
 **Press 🎤. That's it.** Everything you say flows into your agent's input box and keeps flowing — no key to hold down, no shortcut to memorize, no browser window on the side. It runs until you press the **⏹ right next to it**.
@@ -260,6 +262,9 @@ zai plugin list                    # list plugins
 zai plugin new <name>              # scaffold one
 zai app install                    # register in the OS app list (Launchpad / menu / Start Menu)
 zai app uninstall                  # remove that registration
+zai firewall status                # check the 📱 inbound rule (Windows)
+zai firewall allow                 # allow 📱 inbound (TCP 8899-8919, admin)
+zai firewall revoke                # remove the inbound rule
 ```
 
 Bare `zai` and `zai .` still launch the GUI, exactly as before.
@@ -334,6 +339,7 @@ On restart, the previous tabs, active tab, and panel state are restored automati
 - **What you can do**: view/edit/save open files, switch tabs, search & open workspace files, view agent terminals, send instructions, approve (Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y buttons), and run commands (save, new file, Cockpit, font ±, approval-mode switch, and more)
 - **How it works**: a tiny built-in HTTP server (port 8899, auto-fallback to 8900–8919 if busy). Pure `std::net` — zero extra crates
 - **Security**: authenticated with a random token generated per launch (embedded in the QR URL). Tokenless API access gets a 401. LAN only
+- **Windows inbound rule**: Windows blocks inbound by default, so without a rule the phone cannot connect. The 📱 panel checks this itself and offers "🛡 Allow inbound (administrator)" when it is missing. The rule it creates is scoped to **this `zai.exe` + TCP 8899-8919**, with the Domain/Private profiles — plus **Public only when the network you are on is classified as Public** (home Wi-Fi is often classified that way, and leaving Public out would not fix anything). That fact is stated in the panel, so don't use 📱 on public Wi-Fi. Any **block rule** for the executable (created if you once hit "Cancel" on the Windows prompt) **is removed when allowing**, since Windows lets block win over allow. Revoke from the panel or with `zai firewall revoke`. The installer creates the rule on the spot when it is running elevated, and otherwise only prints guidance (it never elevates on its own)
 
 ---
 
@@ -558,8 +564,10 @@ src/
 ├── cli.rs           `zai` subcommands (the control channel for driving the app from outside)
 ├── lsp.rs           Minimal LSP client (stdio JSON-RPC, diagnostics)
 ├── terminal.rs      PTY sessions + vt100 rendering + approval-prompt detection/auto-reply
+├── shellenv.rs      PATH resolution for child processes + OS-independent `which`
 ├── agents.rs        Session management (launch/restart/destroy/broadcast/permission modes)
 ├── remote.rs        Phone remote (built-in HTTP server, QR code, token auth)
+├── firewall.rs      Windows inbound rule (what 📱 needs: check / allow / revoke)
 ├── voice.rs         Voice input (records until stopped, inserts without sending, auto-picks mac/Windows/browser)
 ├── session.rs       Per-workspace session restore
 ├── notify.rs        OS-native notifications

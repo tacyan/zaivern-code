@@ -17,6 +17,7 @@ use crate::editor::{combine_hash, disk_mtime, hash_str, Buffer, Editor, External
 use crate::editor_ops;
 use crate::file_search;
 use crate::file_tree::{self, FileTree, TreeActions};
+use crate::firewall;
 use crate::fuzzy;
 use crate::git;
 use crate::git_panel;
@@ -39,6 +40,7 @@ use crate::pet_bubble;
 use crate::recent;
 use crate::remote;
 use crate::session;
+use crate::shellenv;
 use crate::snippets::{self, Snippet};
 use crate::sound::{self, SoundKind};
 use crate::terminal;
@@ -420,6 +422,9 @@ pub struct ZaivernApp {
     remote: Option<remote::RemoteServer>,
     remote_err: Option<String>,
     remote_open: bool,
+    /// Windows の受信許可 (これが無いとスマホからは繋がらない)。
+    /// 他 OS では常に「確認不要」なので何も表示しない。
+    fw: firewall::FirewallUi,
     qr_tex: Option<egui::TextureHandle>,
     broadcast_input: String,
     agent_input_buf: crate::agent_input::AgentInputBuffer,
@@ -810,6 +815,7 @@ impl ZaivernApp {
             remote: None,
             remote_err: None,
             remote_open: false,
+            fw: firewall::FirewallUi::default(),
             voice: VoiceState::default(),
             qr_tex: None,
             broadcast_input: String::new(),
@@ -2049,8 +2055,8 @@ impl ZaivernApp {
         let key: LspKey = (lang_id.clone(), root.clone());
         if !self.lsp.contains_key(&key) {
             let bin = server_cmd.split_whitespace().next().unwrap_or("");
-            // which() は $SHELL -lc のサブプロセスを起動する。ここは毎フレーム通るので、
-            // 「見つからなかった」結果を短時間だけ覚えて spawn 連発を防ぐ。
+            // ここは毎フレーム通るので、「見つからなかった」結果を短時間だけ覚えて
+            // PATH の走査を繰り返さないようにする。
             let now = Instant::now();
             if which_result_is_fresh(self.lsp_which_missing.get(bin).copied(), now, WHICH_MISS_TTL)
             {
@@ -4111,16 +4117,28 @@ impl ZaivernApp {
         theme: &Theme,
         cmds: &mut Vec<Cmd>,
     ) {
-        // スマホリモート (QR コード表示)
+        // スマホリモート (QR コード表示)。
+        // Windows で受信が許可されていないと分かっているときは ⚠ を添える
+        // (📱 を開かないと理由が分からない、という状態を作らないため)
+        let blocked = self.fw.needs_allow();
+        let mut icon = RichText::new(if blocked { "📱⚠" } else { "📱" });
+        if blocked {
+            icon = icon.color(theme.warn);
+        }
         if ui
-            .selectable_label(self.remote_open, "📱")
-            .on_hover_text(tr(
-                "スマホから操作 — QR コードを表示\n\
-                 同じ Wi-Fi のスマホで読み取るだけで、編集・保存・\n\
-                 エージェント操作(Claude の承認も)ができます\n\
-                 🎤 音声入力: PC は Cockpit 各タブの 🎤 /\n\
-                 ブロードキャスト欄の 🎤、スマホは「エージェント」タブ",
-            ))
+            .selectable_label(self.remote_open, icon)
+            .on_hover_text(if blocked {
+                tr("⚠ Windows のファイアウォールが受信をブロックしています\n\u{3000}\
+                    押して開く画面のボタンで許可できます (それまでスマホからは繋がりません)")
+            } else {
+                tr(
+                    "スマホから操作 — QR コードを表示\n\
+                     同じ Wi-Fi のスマホで読み取るだけで、編集・保存・\n\
+                     エージェント操作(Claude の承認も)ができます\n\
+                     🎤 音声入力: PC は Cockpit 各タブの 🎤 /\n\
+                     ブロードキャスト欄の 🎤、スマホは「エージェント」タブ",
+                )
+            })
             .clicked()
         {
             cmds.push(Cmd::ToggleRemote);
@@ -9387,6 +9405,19 @@ impl ZaivernApp {
         let mut copy = false;
         let mut open_voice = false;
 
+        // Windows の受信許可。ここが無いと「QR は読めるのにスマホからだけ
+        // 何も起きない」になるので、繋がる前提として真っ先に見せる
+        self.fw.ensure_checked();
+        let fw_check = firewall::applicable();
+        let fw_busy = self.fw.busy();
+        let fw_report = self.fw.report().cloned();
+        let fw_error = self.fw.error.clone();
+        let fw_manual = if fw_check { self.fw.manual() } else { String::new() };
+        let mut fw_allow = false;
+        let mut fw_revoke = false;
+        let mut fw_recheck = false;
+        let mut fw_copy_cmd = false;
+
         egui::Window::new(tr("📱 スマホリモート"))
             .open(&mut open)
             .collapsible(false)
@@ -9401,6 +9432,137 @@ impl ZaivernApp {
                                 RichText::new(tr("同じ Wi-Fi のスマホで QR を読み取るだけで接続"))
                                     .color(theme.text),
                             );
+                            // ── Windows: 受信許可の状態と、その場で直せるボタン ──
+                            if fw_check {
+                                ui.add_space(6.0);
+                                match (&fw_report, fw_busy) {
+                                    // 確認中 / 適用中
+                                    (_, Some(b)) => {
+                                        ui.label(
+                                            RichText::new(tr(match b {
+                                                firewall::Busy::Check => {
+                                                    "🛡 Windows の受信許可を確認中…"
+                                                }
+                                                firewall::Busy::Allow => {
+                                                    "🛡 受信を許可しています (管理者の確認に応答してください)…"
+                                                }
+                                                firewall::Busy::Revoke => {
+                                                    "🛡 受信許可を取り消しています…"
+                                                }
+                                            }))
+                                            .size(11.5)
+                                            .color(theme.text_dim),
+                                        );
+                                    }
+                                    // 許可されていない = スマホからは絶対に繋がらない
+                                    (Some(r), None) if !r.allowed || r.blocked => {
+                                        egui::Frame::none()
+                                            .fill(theme.panel_alt)
+                                            .stroke(egui::Stroke::new(1.0_f32, theme.warn))
+                                            .rounding(egui::Rounding::same(6.0))
+                                            .inner_margin(egui::Margin::same(8.0))
+                                            .show(ui, |ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        RichText::new(tr(
+                                                            "⚠ Windows のファイアウォールが受信をブロックしています",
+                                                        ))
+                                                        .size(12.0)
+                                                        .strong()
+                                                        .color(theme.warn),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(tr(
+                                                            "PC は待ち受けていますが、スマホからの接続は Windows 側で\n\
+                                                             落とされます (QR を読んでも真っ白 / 繋がらない)。",
+                                                        ))
+                                                        .size(11.0)
+                                                        .color(theme.text_dim),
+                                                    );
+                                                    if r.blocked {
+                                                        ui.label(
+                                                            RichText::new(tr(
+                                                                "※ この実行ファイルを拒否する規則が残っています (許可時に削除します)",
+                                                            ))
+                                                            .size(10.5)
+                                                            .color(theme.text_dim),
+                                                        );
+                                                    }
+                                                    if r.on_public_network() {
+                                                        ui.label(
+                                                            RichText::new(tr(
+                                                                "※ このネットワークは「パブリック」に分類されています。\n\u{3000}\
+                                                                 許可には Public プロファイルも含めます — 公共 Wi-Fi では 📱 を使わないでください。",
+                                                            ))
+                                                            .size(10.5)
+                                                            .color(theme.text_dim),
+                                                        );
+                                                    }
+                                                    ui.horizontal(|ui| {
+                                                        if ui
+                                                            .button(tr("🛡 受信を許可する (管理者)"))
+                                                            .on_hover_text(trf(
+                                                                "この実行ファイルの TCP {from}-{to} だけを許可します。\n\
+                                                                 管理者の確認 (UAC) が 1 回出ます。",
+                                                                &[
+                                                                    ("from", firewall::PORT_FROM.to_string()),
+                                                                    ("to", firewall::PORT_TO.to_string()),
+                                                                ],
+                                                            ))
+                                                            .clicked()
+                                                        {
+                                                            fw_allow = true;
+                                                        }
+                                                        if ui.button(tr("⟳ 再確認")).clicked() {
+                                                            fw_recheck = true;
+                                                        }
+                                                        if ui
+                                                            .button(tr("📋 コマンドをコピー"))
+                                                            .on_hover_text(fw_manual.clone())
+                                                            .clicked()
+                                                        {
+                                                            fw_copy_cmd = true;
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                    }
+                                    // 許可済み
+                                    (Some(r), None) => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(trf(
+                                                    "✅ ファイアウォール許可済み ({profiles})",
+                                                    &[(
+                                                        "profiles",
+                                                        if r.profiles.is_empty() {
+                                                            "-".to_string()
+                                                        } else {
+                                                            r.profiles.clone()
+                                                        },
+                                                    )],
+                                                ))
+                                                .size(11.0)
+                                                .color(theme.ok),
+                                            );
+                                            if ui
+                                                .small_button(tr("取り消す"))
+                                                .on_hover_text(tr(
+                                                    "受信許可の規則を削除します (スマホからは繋がらなくなります)",
+                                                ))
+                                                .clicked()
+                                            {
+                                                fw_revoke = true;
+                                            }
+                                        });
+                                    }
+                                    // まだ結果が無い (起動直後)
+                                    (None, None) => {}
+                                }
+                                if let Some(e) = &fw_error {
+                                    ui.label(RichText::new(e).size(10.5).color(theme.err));
+                                }
+                            }
                             ui.add_space(8.0);
                             if let Some(tex) = &qr_tex {
                                 ui.add(
@@ -9461,6 +9623,23 @@ impl ZaivernApp {
                 ctx.copy_text(u);
             }
             self.toast(tr("URL をコピーしました"), true);
+        }
+        // ファイアウォール操作 (結果は poll で拾ってトーストにする)
+        if fw_allow {
+            self.fw.allow();
+        }
+        if fw_revoke {
+            self.fw.revoke();
+        }
+        if fw_recheck {
+            self.fw.recheck();
+        }
+        if fw_copy_cmd {
+            ctx.copy_text(fw_manual);
+            self.toast(
+                tr("コマンドをコピーしました (管理者の PowerShell で実行してください)"),
+                true,
+            );
         }
     }
 
@@ -10201,6 +10380,18 @@ impl eframe::App for ZaivernApp {
 
         // スマホリモートからのリクエストを処理する
         self.poll_remote(ctx);
+
+        // ファイアウォール操作 (別スレッド) の結果を取り込む。
+        // UAC の確認中に 📱 ウィンドウを閉じられても結果は拾えるよう、
+        // ウィンドウの描画とは切り離してここで回す
+        if self.fw.poll() {
+            if let Some(msg) = self.fw.done.take() {
+                self.toast(tr(&msg), true);
+            }
+            if let Some(err) = self.fw.error.clone() {
+                self.toast_warn(format!("🛡 {err}"));
+            }
+        }
 
         // プラグインコマンドの実行結果をエディタへ反映する
         self.process_plugin_results(ctx);
@@ -10966,34 +11157,13 @@ fn which_result_is_fresh(last_checked: Option<Instant>, now: Instant, ttl: Durat
     }
 }
 
-/// コマンドが PATH 上に存在するか($SHELL -lc 経由で which)。
+/// コマンドが PATH 上に存在するか。
+///
+/// 実体の探索は [`shellenv::which`] に任せる (OS ごとの分岐と、GUI 起動で
+/// 痩せた PATH の補い方はあちらに集約してある)。サブプロセスを起こさないので
+/// 毎フレーム呼んでも安全だが、TTL キャッシュはそのまま残してある。
 fn which(bin: &str) -> bool {
-    if bin.is_empty() {
-        return false;
-    }
-    // Windows に $SHELL は無いので `where` で探す (窓は procx が抑止する)。
-    #[cfg(windows)]
-    {
-        crate::procx::hidden_command("where")
-            .arg(bin)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        crate::procx::hidden_command(shell)
-            .arg("-lc")
-            .arg(format!("command -v {bin}"))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
+    shellenv::has(bin)
 }
 
 /// テーマ名を解決する。VS Code テーマJSONへのパスならそれを読み込み、
@@ -11005,6 +11175,25 @@ fn resolve_theme(name: &str) -> Theme {
         }
     }
     theme::by_name(name)
+}
+
+/// フォント候補を先頭から試し、最初に読めたものを `name` として登録し、
+/// Proportional / Monospace 両方の末尾へフォールバックとして積む。
+/// 末尾に積むので、既存フォントが持つ字はそのまま。持たない字だけが拾われる。
+fn push_fallback_font(fonts: &mut egui::FontDefinitions, name: &str, candidates: &[&str]) -> bool {
+    for p in candidates {
+        let Ok(bytes) = std::fs::read(p) else { continue };
+        fonts
+            .font_data
+            .insert(name.to_owned(), egui::FontData::from_owned(bytes));
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            if let Some(list) = fonts.families.get_mut(&fam) {
+                list.push(name.to_owned());
+            }
+        }
+        return true;
+    }
+    false
 }
 
 fn install_fonts(ctx: &egui::Context) {
@@ -11029,19 +11218,33 @@ fn install_fonts(ctx: &egui::Context) {
             "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
         ]
     };
-    for p in candidates {
-        if let Ok(bytes) = std::fs::read(p) {
-            fonts
-                .font_data
-                .insert("cjk".into(), egui::FontData::from_owned(bytes));
-            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                if let Some(list) = fonts.families.get_mut(&fam) {
-                    list.push("cjk".into());
-                }
-            }
-            break;
-        }
-    }
+    push_fallback_font(&mut fonts, "cjk", &candidates);
+
+    // 記号フォント。egui 同梱の Ubuntu-Light / NotoEmoji / emoji-icon-font にも
+    // 日本語フォントにも無い記号 (✕ ✗ ⌫ ⌥ ⌃ ❯ ▸ ▾ 罫線 点字スピナー など) は、
+    // これを積まないと豆腐 (□) になる。「✕ 閉じる」が読めなくなるのが典型例。
+    let symbols: Vec<&str> = if cfg!(target_os = "macos") {
+        vec![
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Supplemental/Symbol.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ]
+    } else if cfg!(target_os = "windows") {
+        vec![
+            "C:/Windows/Fonts/seguisym.ttf",
+            "C:/Windows/Fonts/segoeui.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+    } else {
+        vec![
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        ]
+    };
+    push_fallback_font(&mut fonts, "symbols", &symbols);
+
     ctx.set_fonts(fonts);
 }
 
@@ -13405,6 +13608,41 @@ mod glyph_tests {
             missing.is_empty(),
             "フォントに無い記号が UI で使われている(豆腐になる): [{missing}]"
         );
+    }
+
+    /// 絵文字ではない「記号」も豆腐になる。
+    ///
+    /// egui 同梱の Ubuntu-Light / NotoEmoji にも、フォールバックに積む日本語
+    /// フォント (Yu Gothic / ヒラギノ) にも無い字がここに集まっている:
+    /// 閉じるの ✕、キーヒントの ⌘ ⌥ ⌃ ⇧ ⌫、ツリーの ▸ ▾、プロンプトの ❯、
+    /// 罫線、点字スピナー。`install_fonts` が記号フォントを積まないと
+    /// 「✕ 閉じる」が「□ 閉じる」になり、押せるボタンだと分からなくなる。
+    ///
+    /// ターミナルは Monospace で描くので、両方の族で見る。
+    #[test]
+    fn ui_glyph_symbols_have_glyphs() {
+        // すべて src/ か assets/ に実在する記号だけを並べる (未使用の字は入れない)。
+        const SYMBOLS: &str = "✕✗✓✔⌫⌥⌃⇧⌘❯▸▾▲▼◆◇◎●○★⇄⇩→➡⟳⏱⏳─│╭╮╰╯┌┐└┘├┤┬┴┼\
+                               ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏±×÷·»‹›※–—…‣";
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
+        for fid in [
+            egui::FontId::proportional(14.0),
+            egui::FontId::monospace(14.0),
+        ] {
+            let missing: String = ctx.fonts(|f| {
+                SYMBOLS
+                    .chars()
+                    .filter(|c| !f.has_glyphs(&fid, &c.to_string()))
+                    .collect()
+            });
+            assert!(
+                missing.is_empty(),
+                "{:?} に無い記号が UI で使われている(豆腐になる): [{missing}]",
+                fid.family
+            );
+        }
     }
 
     /// カタログの 29 エージェントのアイコンは「エージェントを追加」ピッカーに

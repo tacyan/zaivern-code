@@ -11,13 +11,25 @@
 //!
 //! 注意: ユーザーに見せる目的のプロセス (自分自身の新ウィンドウ起動や
 //! ブラウザ起動など GUI アプリ) には不要だが、付けても無害。
+//!
+//! あわせて子プロセスの `PATH` を [`crate::shellenv::user_path`] へ差し替える。
+//! GUI アプリ (macOS の `.app` / Windows のショートカット) はユーザーのシェルの
+//! PATH を継承しないため、素の `Command` では `gh` も `claude` も見つからない。
 
 use std::ffi::OsStr;
 use std::process::Command;
 
-/// コンソール窓を出さない `Command` を作る。
+/// コンソール窓を出さず、ユーザーの PATH が通った `Command` を作る。
 /// 以後は普通の `Command` として `arg` / `output` / `spawn` すればよい。
 pub fn hidden_command(program: impl AsRef<OsStr>) -> Command {
+    let mut c = hidden_command_raw(program);
+    crate::shellenv::apply_path(&mut c);
+    c
+}
+
+/// PATH を差し替えない版。**PATH の解決そのもの** (`shellenv`) から使う。
+/// 通常のコマンド実行では [`hidden_command`] を使うこと。
+pub fn hidden_command_raw(program: impl AsRef<OsStr>) -> Command {
     #[allow(unused_mut)]
     let mut c = Command::new(program);
     #[cfg(windows)]

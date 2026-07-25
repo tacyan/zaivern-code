@@ -8,8 +8,8 @@
 //!   純関数として切り出し、ユニットテストで argv を厳密に検証する。
 //!   プロセス起動 (`launch`) と検出 (`detect_installed`) だけが副作用を持つ。
 //! - 検出は必ずワーカースレッドで行う (`detect_async`)。UI スレッドを止めない。
-//!   GUI アプリはログインシェルの PATH を継承しないので、
-//!   src/app.rs の `which` と同じ手口で `$SHELL -lc 'command -v <bin>'` を使う。
+//!   GUI アプリはログインシェルの PATH を継承しないので、探索は
+//!   [`crate::shellenv::which`] に任せる (OS ごとの補正はあちらに集約)。
 //! - 結果はキャッシュする。毎フレーム shell out するのは論外。
 //!
 //! # 行番号・列番号の契約 (重要)
@@ -588,31 +588,13 @@ pub fn cached() -> Option<Vec<DetectedIde>> {
     cache().lock().ok().and_then(|c| c.clone())
 }
 
-/// `$SHELL -lc 'command -v <bin>'` で実行ファイルの絶対パスを得る。
+/// 実行ファイルの絶対パスを得る。
 ///
 /// GUI アプリはログインシェルの PATH を継承しないため、素の `Command` では
-/// `/usr/local/bin` などが見えない。src/app.rs の `which` と同じ手口。
+/// `/usr/local/bin` などが見えない。その補正込みの探索は
+/// [`crate::shellenv::which`] に集約してある (Windows でも同じに動く)。
 fn which_path(bin: &str) -> Option<String> {
-    if bin.is_empty() {
-        return None;
-    }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let out = crate::procx::hidden_command(shell)
-        .arg("-lc")
-        .arg(format!("command -v {bin}"))
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if p.is_empty() {
-        None
-    } else {
-        Some(p)
-    }
+    crate::shellenv::which(bin).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// `<bin> --version` の 1 行目を取る。出さないツールもあるので None を許す。

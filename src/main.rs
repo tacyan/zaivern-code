@@ -15,6 +15,7 @@ mod editor;
 mod editor_ops;
 mod file_search;
 mod file_tree;
+mod firewall;
 mod fuzzy;
 mod git;
 mod git_panel;
@@ -44,6 +45,7 @@ mod recent;
 mod remote;
 mod sound;
 mod session;
+mod shellenv;
 mod snippets;
 mod supervisor;
 mod terminal;
@@ -82,6 +84,11 @@ fn main() -> eframe::Result<()> {
     if let Some(code) = cli::try_run_cli(&args) {
         std::process::exit(code);
     }
+
+    // 子プロセスへ渡す PATH の解決を先に走らせておく。macOS の `.app` 起動では
+    // ログインシェルへ問い合わせる必要があり (数百 ms)、エージェントを起動した
+    // その瞬間にやると UI が固まって見えるため、ここで温めておく。
+    shellenv::warm_up();
 
     // 引数はマルチルートワークスペースとして解釈する: `zai dirA dirB dirC`。
     // ディレクトリはルートに、ファイルは起動後に開くタブになる。

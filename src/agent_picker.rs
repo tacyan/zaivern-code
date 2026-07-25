@@ -64,10 +64,10 @@ impl Installed {
     }
 }
 
-/// シェルへそのまま埋め込んで安全な実行ファイル名か。
+/// 実行ファイル名として扱ってよい文字列か。
 ///
-/// カタログは静的なので現状すべて安全だが、将来 `;` を含む bin が足された時に
-/// ログインシェルへ素通しするのは避けたいので、組み立て前に必ず通す。
+/// カタログは静的なので現状すべて安全だが、将来 `;` や `/` を含む bin が足された時に
+/// PATH 検索へ素通しするのは避けたいので、引く前に必ず通す。
 fn is_shell_safe(bin: &str) -> bool {
     !bin.is_empty()
         && bin
@@ -75,46 +75,28 @@ fn is_shell_safe(bin: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// カタログ全件をまとめて `command -v` するシェルスクリプトを組み立てる。
-///
-/// GUI アプリはログインシェルの PATH を継承しないので `$SHELL -lc` 越しに引く
-/// (`github::gh_available` や app.rs の `which` と同じ流儀)。ただし 1 件 1 プロセスだと
-/// ログインシェルの起動コストを約 30 回払うことになるため、ループはスクリプト側に
-/// 畳んでプロセスは 1 つに抑える。
-fn probe_script(bins: &[&str]) -> String {
-    let mut s = String::from("for b in");
-    for b in bins {
-        s.push(' ');
-        s.push_str(b);
-    }
-    s.push_str("; do command -v \"$b\" >/dev/null 2>&1 && echo \"$b\"; done");
-    s
-}
-
-/// スクリプトの出力 (見つかった bin が 1 行ずつ) をカタログの項目へ戻す。
-/// カタログに無い名前は捨てる。
-fn parse_probe_output(stdout: &str) -> HashSet<&'static str> {
-    stdout
-        .lines()
-        .filter_map(|line| crate::agents::spec_for_bin(line.trim()).map(|s| s.bin))
-        .collect()
-}
-
 /// 実際に PATH を引く。**必ずワーカースレッドから呼ぶこと。**
+///
+/// 検索は [`crate::shellenv::which`] に任せる。以前は `$SHELL -lc 'command -v …'`
+/// でシェルに引かせていたが、
+/// - Windows には `$SHELL` が無く `/bin/sh` の起動に失敗するので、常に「1 つも
+///   入っていない」表示になっていた
+/// - macOS ではログインシェルが `.zshrc` を読まないため、nvm や `~/.local/bin`
+///   に入れた CLI が見つからなかった
+///
+/// shellenv はその両方を吸収した PATH を自前で走査するので、サブプロセスも要らない。
 fn probe_blocking() -> Installed {
-    let bins: Vec<&'static str> = AGENT_CATALOG
+    probe_with(crate::shellenv::has)
+}
+
+/// [`probe_blocking`] の本体 (PATH 検索を差し替えられる形にして単体テストする)。
+fn probe_with(found_on_path: impl Fn(&str) -> bool) -> Installed {
+    let found = AGENT_CATALOG
         .iter()
         .map(|s| s.bin)
         .filter(|b| is_shell_safe(b))
+        .filter(|b| found_on_path(b))
         .collect();
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let found = std::process::Command::new(shell)
-        .arg("-lc")
-        .arg(probe_script(&bins))
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|o| parse_probe_output(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default();
     Installed { found, done: true }
 }
 
@@ -680,13 +662,15 @@ mod tests {
     fn probe_targets_the_binary_not_the_subcommand() {
         // `codex exec` / `acli rovodev run` / `goose run -t` のようなサブコマンド型でも、
         // PATH を引くのは先頭の実行ファイル名でなければならない。
-        let script = probe_script(&["codex", "acli", "goose"]);
-        for bin in ["codex", "acli", "goose"] {
-            assert!(script.contains(&format!(" {bin}")), "{bin} を探していない");
-        }
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        probe_with(|b| {
+            asked.lock().expect("lock").push(b.to_string());
+            false
+        });
+        let asked = asked.into_inner().expect("into_inner");
         for sub in ["exec", "rovodev", "run", "-t"] {
             assert!(
-                !script.contains(&format!(" {sub};")) && !script.contains(&format!(" {sub} ")),
+                !asked.iter().any(|a| a == sub),
                 "サブコマンド {sub} を実行ファイル名として探している"
             );
         }
@@ -700,15 +684,28 @@ mod tests {
         }
     }
 
+    /// DoD: カタログ全件が検出対象になる (1 件でも漏れると
+    /// 「入れてあるのに未インストール表示」になる)。
     #[test]
-    fn probe_script_covers_every_catalog_bin() {
-        let bins: Vec<&str> = AGENT_CATALOG.iter().map(|s| s.bin).collect();
-        let script = probe_script(&bins);
-        for b in &bins {
-            assert!(script.contains(&format!(" {b}")), "{b} が検出対象から漏れた");
+    fn probe_covers_every_catalog_bin() {
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let all = probe_with(|b| {
+            asked.lock().expect("lock").push(b.to_string());
+            true
+        });
+        let asked = asked.into_inner().expect("into_inner");
+        for spec in AGENT_CATALOG {
+            assert!(
+                asked.iter().any(|a| a == spec.bin),
+                "{} が検出対象から漏れた",
+                spec.bin
+            );
+            assert!(all.is_installed(spec.bin), "{} が結果に入らない", spec.bin);
         }
-        assert!(script.starts_with("for b in "));
-        assert!(script.contains("command -v"));
+        // 見つからなければ 1 件も立たない (未検出との区別は done が持つ)
+        let none = probe_with(|_| false);
+        assert_eq!(none.count(), 0);
+        assert!(none.done());
     }
 
     #[test]
@@ -725,15 +722,14 @@ mod tests {
         assert!(is_shell_safe("cursor-agent"));
     }
 
+    /// カタログに無い名前は結果に入らない (`is_installed` はカタログの bin だけを見る)。
     #[test]
-    fn parse_probe_output_keeps_only_catalog_bins() {
-        let found = parse_probe_output("claude\ncodex\n\n  cursor-agent  \nnot-an-agent\n");
-        assert_eq!(found.len(), 3);
+    fn probe_keeps_only_catalog_bins() {
+        let found = probe_with(|b| ["claude", "codex", "cursor-agent"].contains(&b));
         for b in ["claude", "codex", "cursor-agent"] {
-            assert!(found.contains(b));
+            assert!(found.is_installed(b), "{b} が検出されていない");
         }
-        assert!(!found.contains("not-an-agent"));
-        assert!(parse_probe_output("").is_empty());
+        assert!(!found.is_installed("not-an-agent"));
     }
 
     #[test]

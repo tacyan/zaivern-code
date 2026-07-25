@@ -3266,6 +3266,12 @@ fn build_command(command: &str, cwd: &Path, env: &HashMap<String, String>) -> Co
         c
     };
     cmd.cwd(cwd);
+    // ユーザーのシェルが持つ PATH を渡す。macOS の `.app` 起動では PATH が
+    // launchd の最小構成になっており、しかも `-lc` のログインシェルは
+    // `.zshrc` / `.bashrc` を読まないので、これが無いと `claude` などが
+    // command not found になる (shellenv の説明を参照)。
+    // プリセット側の env は後で当てるので、ユーザーが PATH を書いていればそちらが勝つ。
+    cmd.env("PATH", crate::shellenv::user_path());
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("ZAIVERN", "1");

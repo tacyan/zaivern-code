@@ -1969,7 +1969,8 @@ pub fn run_async(req: RunRequest, tx: Sender<RunOutcome>, ctx: egui::Context) {
 }
 
 fn run_blocking(req: &RunRequest) -> RunOutcome {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    // シェルの選び方は OS で違う (Windows に `$SHELL` は無い) ので shellenv に任せる。
+    let shell = crate::shellenv::shell_program().to_string_lossy().into_owned();
     let fail = |msg: String| RunOutcome {
         plugin: req.plugin.clone(),
         command_id: req.command.id.clone(),
@@ -1988,10 +1989,8 @@ fn run_blocking(req: &RunRequest) -> RunOutcome {
         resave: req.resave,
     };
 
-    let mut cmd = crate::procx::hidden_command(&shell);
-    cmd.arg("-lc")
-        .arg(&req.command.run)
-        .current_dir(&req.workdir)
+    let mut cmd = crate::shellenv::shell_command(&req.command.run);
+    cmd.current_dir(&req.workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

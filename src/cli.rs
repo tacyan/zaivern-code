@@ -197,6 +197,7 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "state"
             | "plugin"
             | "app"
+            | "firewall"
             | "--help"
             | "-h"
             | "--version"
@@ -232,6 +233,11 @@ Zaivern Code — CLI 制御チャネル
   zai app install                       Launchpad / アプリメニュー / スタートメニューへ登録
   zai app uninstall                     登録を解除
 
+ファイアウォール (Windows のみ — 📱 スマホリモートの受信許可):
+  zai firewall status                   受信許可の有無を表示
+  zai firewall allow                    受信を許可 (TCP 8899-8919・管理者の確認あり)
+  zai firewall revoke                   受信許可を取り消す
+
 その他:
   zai --help | -h                       このヘルプ
   zai --version | -V                    バージョン
@@ -249,7 +255,11 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
     let rest = &args[1..];
     // "app" はプロジェクトによくあるディレクトリ名。単独指定で ./app が実在するなら
     // ワークスペース指定として GUI 起動に譲る (登録は `zai app install` と明示する)。
-    if first == "app" && rest.is_empty() && std::path::Path::new("app").is_dir() {
+    // "firewall" も同じ扱い (副作用のある操作はサブコマンドを明示させる)。
+    if rest.is_empty()
+        && matches!(first.as_str(), "app" | "firewall")
+        && std::path::Path::new(first).is_dir()
+    {
         return None;
     }
     Some(match first.as_str() {
@@ -263,6 +273,7 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         }
         "plugin" => run_plugin(rest),
         "app" => crate::desktop::run(rest),
+        "firewall" => crate::firewall::run(rest),
         other => match run_remote(other, rest) {
             Ok(out) => {
                 if !out.is_empty() {
@@ -516,7 +527,7 @@ mod tests {
     fn every_spec_subcommand_is_recognized() {
         for a in [
             "open", "notify", "prompt", "run", "panel", "status", "state", "plugin", "app",
-            "--help", "-h", "--version", "-V",
+            "firewall", "--help", "-h", "--version", "-V",
         ] {
             assert!(is_cli_subcommand(a), "{a} は CLI サブコマンドであるべき");
         }
@@ -555,6 +566,9 @@ mod tests {
             "zai plugin disable",
             "zai app install",
             "zai app uninstall",
+            "zai firewall status",
+            "zai firewall allow",
+            "zai firewall revoke",
             "--help",
             "--version",
         ] {

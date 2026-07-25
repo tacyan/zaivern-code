@@ -184,7 +184,7 @@ static GH_PRESENT: AtomicU8 = AtomicU8::new(0);
 /// `gh` が PATH 上にあるか。結果はプロセス内でキャッシュする (毎フレーム呼ばれても安全)。
 ///
 /// GUI アプリはログインシェルの PATH を継承しないことがあるため、
-/// `$SHELL -lc 'command -v gh'` で確認する (src/app.rs の `which` と同じ手口)。
+/// 探索は [`crate::shellenv`] が補正した PATH の上で行う。
 pub fn gh_available() -> bool {
     match GH_PRESENT.load(Ordering::Relaxed) {
         1 => return true,
@@ -202,22 +202,11 @@ pub fn reset_gh_cache() {
 }
 
 fn probe_gh() -> bool {
-    // Windows に $SHELL は無いので、ログインシェル経由の確認は unix だけ行う。
-    // (GUI アプリからコンソールアプリを起動しても窓が出ないよう procx を使う)
-    #[cfg(unix)]
-    {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let via_shell = crate::procx::hidden_command(&shell)
-            .arg("-lc")
-            .arg("command -v gh")
-            .output()
-            .map(|o| o.status.success() && !o.stdout.is_empty())
-            .unwrap_or(false);
-        if via_shell {
-            return true;
-        }
+    if crate::shellenv::has("gh") {
+        return true;
     }
-    // ログインシェルが使えない環境向けのフォールバック (Windows はこちらだけ)。
+    // PATH で見つからなくても実行はできる場合がある (シム / エイリアス経由など)。
+    // 実際に起動できるかまで確かめてから「無い」と結論する。
     crate::procx::hidden_command("gh")
         .arg("--version")
         .stdin(Stdio::null())

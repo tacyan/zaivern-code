@@ -269,7 +269,8 @@ fn writer_loop<W: Write>(mut stdin: W, rx: mpsc::Receiver<Value>, shared: Arc<Sh
 }
 
 impl LspClient {
-    /// server_cmd は $SHELL -lc 経由で起動 (PATH 解決のため)。initialize は送信だけして
+    /// server_cmd は [`crate::shellenv::shell_command`] 経由で起動する
+    /// (引数付きのコマンド行をそのまま扱うため。PATH の補正も込み)。initialize は送信だけして
     /// すぐ返る (UI スレッドをブロックしない)。応答は受信スレッドが処理して is_ready が
     /// true になるので、呼び出し側はそれまで通知・リクエストを送らないこと。
     ///
@@ -292,10 +293,10 @@ impl LspClient {
         root: &Path,
         ctx: eframe::egui::Context,
     ) -> Result<Self, String> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let mut child = crate::procx::hidden_command(&shell)
-            .arg("-lc")
-            .arg(server_cmd)
+        // シェル経由で起動する (`typescript-language-server --stdio` のように
+        // 引数付きのコマンド行をそのまま扱えるため)。呼び出し規約は OS で違うので
+        // shellenv に任せる — Windows で `-lc` を渡すと cmd.exe が何も実行しない。
+        let mut child = crate::shellenv::shell_command(server_cmd)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
