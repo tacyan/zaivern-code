@@ -41,7 +41,7 @@ Zaivern Code was born to eliminate this friction of command. See every agent at 
 curl -fsSL https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.sh | sh
 ```
 
-**Windows** — PowerShell:
+**Windows** — PowerShell (same behavior: prebuilt binary, or builds from source — installing Rust via rustup if needed):
 
 ```powershell
 irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex

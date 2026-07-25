@@ -41,7 +41,7 @@ Zaivern Code は、この「指揮の摩擦」を消すために生まれまし�
 curl -fsSL https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.sh | sh
 ```
 
-**Windows** — PowerShell:
+**Windows** — PowerShell(同じ挙動: ビルド済みバイナリを自動取得し、取れなければソースからビルド。Rust が無ければ rustup ごと導入):
 
 ```powershell
 irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
