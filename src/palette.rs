@@ -8,6 +8,10 @@ pub enum Cmd {
     NewFile,
     /// ワークスペースを「置き換える」(従来どおり)
     OpenFolder,
+    /// 別プロセスとして新しいウィンドウを開く (VS Code: ⇧⌘N)
+    NewWindow,
+    /// フォルダを選び、新しいウィンドウ (別プロセス) でそのフォルダを開く
+    NewWindowFolder,
     /// フォルダをワークスペースに追加する (マルチルート)
     AddFolder,
     /// 指定パスをワークスペースに追加する (`#` パレットの git worktree 追加)

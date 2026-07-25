@@ -85,11 +85,18 @@ fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         if item(ui, &tr("新しいテキスト ファイル"), &sc(keys, BindAction::NewFile), true) {
             cmds.push(Cmd::NewFile);
         }
+        if item(ui, &tr("新しいウィンドウ"), &sc(keys, BindAction::NewWindow), true) {
+            cmds.push(Cmd::NewWindow);
+        }
+        ui.separator();
         if item(ui, &tr("ファイルを開く…"), &sc(keys, BindAction::OpenFile), true) {
             cmds.push(Cmd::OpenFileDialog);
         }
         if item(ui, &tr("フォルダーを開く…"), "", true) {
             cmds.push(Cmd::OpenFolder);
+        }
+        if item(ui, &tr("新しいウィンドウでフォルダーを開く…"), "", true) {
+            cmds.push(Cmd::NewWindowFolder);
         }
         ui.menu_button(tr("最近使用した項目を開く"), |ui| {
             ui.set_min_width(320.0);

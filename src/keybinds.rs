@@ -15,6 +15,8 @@ pub enum BindAction {
     SaveAs,
     CloseTab,
     NewFile,
+    /// 新しいウィンドウ (別プロセス) を開く (VS Code: ⇧⌘N)
+    NewWindow,
     PaletteFiles,
     PaletteCommands,
     ToggleTerminal,
@@ -64,11 +66,12 @@ pub enum BindAction {
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 35] = [
+const ALL_ACTIONS: [BindAction; 36] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
     BindAction::NewFile,
+    BindAction::NewWindow,
     BindAction::PaletteFiles,
     BindAction::PaletteCommands,
     BindAction::ToggleTerminal,
@@ -112,6 +115,7 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::SaveAs => KeyboardShortcut::new(cmd_shift, Key::S),
         BindAction::CloseTab => KeyboardShortcut::new(cmd, Key::W),
         BindAction::NewFile => KeyboardShortcut::new(cmd, Key::N),
+        BindAction::NewWindow => KeyboardShortcut::new(cmd_shift, Key::N),
         BindAction::PaletteFiles => KeyboardShortcut::new(cmd, Key::P),
         BindAction::PaletteCommands => KeyboardShortcut::new(cmd_shift, Key::P),
         BindAction::ToggleTerminal => KeyboardShortcut::new(cmd, Key::J),
@@ -190,6 +194,7 @@ impl Keybinds {
             "save_as" => SaveAs,
             "close_tab" => CloseTab,
             "new_file" => NewFile,
+            "new_window" => NewWindow,
             "palette_files" => PaletteFiles,
             "palette_commands" => PaletteCommands,
             "toggle_terminal" => ToggleTerminal,

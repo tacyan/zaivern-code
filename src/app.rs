@@ -2797,6 +2797,8 @@ impl ZaivernApp {
             | Cmd::OpenInIde(_)
             | Cmd::OpenFolderInIde(_)
             | Cmd::NewFile
+            | Cmd::NewWindow
+            | Cmd::NewWindowFolder
             | Cmd::OpenFolder
             | Cmd::AddFolder
             | Cmd::AddFolderPath(_)
@@ -3045,6 +3047,15 @@ impl ZaivernApp {
                 }
             }
             Cmd::NewFile => self.editor.new_untitled(),
+            Cmd::NewWindow => self.spawn_new_window(None),
+            Cmd::NewWindowFolder => {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_directory(self.primary_root())
+                    .pick_folder()
+                {
+                    self.spawn_new_window(Some(dir));
+                }
+            }
             Cmd::OpenFolder => {
                 if let Some(dir) = rfd::FileDialog::new()
                     .set_directory(self.primary_root())
@@ -3096,6 +3107,47 @@ impl ZaivernApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 自分自身の実行ファイルを別プロセスとして起動し、新しいウィンドウを開く。
+    /// `dir` 指定ありならそのフォルダをワークスペースルートに、無指定なら
+    /// ホームディレクトリを開く (ルートは空にできない仕様のため)。
+    fn spawn_new_window(&mut self, dir: Option<PathBuf>) {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                self.toast(
+                    trf("実行ファイルの場所を取得できません: {err}", &[("err", e.to_string())]),
+                    false,
+                );
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(exe);
+        // 新プロセスは引数のフォルダをルートにする (main.rs の起動引数解釈)。
+        // カレントディレクトリも合わせておくと、引数パスが消えていた場合の
+        // フォールバック先も同じ場所になる。
+        let root = dir.clone().or_else(dirs::home_dir);
+        if let Some(d) = &root {
+            cmd.arg(d);
+            cmd.current_dir(d);
+        }
+        match cmd.spawn() {
+            Ok(_) => match &dir {
+                Some(d) => self.toast(
+                    trf(
+                        "🪟 {dir} を新しいウィンドウで開きました",
+                        &[("dir", d.display().to_string())],
+                    ),
+                    true,
+                ),
+                None => self.toast(tr("🪟 新しいウィンドウを開きました"), true),
+            },
+            Err(e) => self.toast(
+                trf("新しいウィンドウを開けません: {err}", &[("err", e.to_string())]),
+                false,
+            ),
         }
     }
 
@@ -3699,6 +3751,10 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.get(BindAction::CloseTab)) {
             cmds.push(Cmd::CloseTab);
+        }
+        // ⇧⌘N (新しいウィンドウ) は ⌘N (新規ファイル) より修飾キーが多いので先に
+        if consume(ctx, self.keys.get(BindAction::NewWindow)) {
+            cmds.push(Cmd::NewWindow);
         }
         if consume(ctx, self.keys.get(BindAction::NewFile)) {
             cmds.push(Cmd::NewFile);
@@ -7650,7 +7706,14 @@ impl ZaivernApp {
             ("💾".into(), tr("保存"), "⌘S".into(), Cmd::Save),
             ("💾".into(), tr("名前を付けて保存"), "⌘⇧S".into(), Cmd::SaveAs),
             ("📄".into(), tr("新規ファイル"), "⌘N".into(), Cmd::NewFile),
+            ("🪟".into(), tr("新しいウィンドウ"), "⌘⇧N".into(), Cmd::NewWindow),
             ("📂".into(), tr("フォルダを開く…"), String::new(), Cmd::OpenFolder),
+            (
+                "🪟".into(),
+                tr("新しいウィンドウでフォルダーを開く…"),
+                String::new(),
+                Cmd::NewWindowFolder,
+            ),
             ("📚".into(), tr("フォルダをワークスペースに追加"), String::new(), Cmd::AddFolder),
             ("❌".into(), tr("タブを閉じる"), "⌘W".into(), Cmd::CloseTab),
             ("🔍".into(), tr("ファイル内検索"), "⌘F".into(), Cmd::OpenFind),
@@ -11681,6 +11744,7 @@ fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
         (tr("名前を付けて保存"), format_shortcut(keys.get(BindAction::SaveAs))),
         (tr("すべて保存"), format_shortcut(keys.get(BindAction::SaveAll))),
         (tr("新規ファイル"), format_shortcut(keys.get(BindAction::NewFile))),
+        (tr("新しいウィンドウ"), format_shortcut(keys.get(BindAction::NewWindow))),
         (tr("ファイルを開く"), format_shortcut(keys.get(BindAction::OpenFile))),
         (tr("タブを閉じる"), format_shortcut(keys.get(BindAction::CloseTab))),
         (tr("検索"), format_shortcut(keys.get(BindAction::Find))),
