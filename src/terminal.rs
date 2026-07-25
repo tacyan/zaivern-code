@@ -1935,8 +1935,8 @@ mod tests {
     }
 
     use super::{
-        all_terminal_lines, key_bytes, line_hits, mac_agent_input_bytes, normalize_sel,
-        search_scroll_target, selection_text, word_selection, Session,
+        all_terminal_lines, input_area_selection, key_bytes, line_hits, mac_agent_input_bytes,
+        normalize_sel, search_scroll_target, selection_text, word_selection, Session,
     };
 
     #[test]
@@ -2158,6 +2158,77 @@ mod tests {
             selection_text(p.screen(), ((1, 5), (0, 6))),
             "world\nsecond"
         );
+    }
+
+    #[test]
+    fn input_area_selection_claude_style_box() {
+        // Claude Code 風: 上下罫線に挟まれた「› 本文」行
+        let mut p = vt100::Parser::new(8, 30, 0);
+        p.process(b"agent output\r\n");
+        p.process("\x1b[3;1H------------------------------".as_bytes());
+        p.process("\x1b[4;1H\u{203a} hello world".as_bytes());
+        p.process("\x1b[5;1H------------------------------".as_bytes());
+        p.process(b"\x1b[4;14H"); // カーソルは入力行の末尾
+        let (sel, text) = input_area_selection(p.screen()).expect("入力欄が検出できる");
+        assert_eq!(text, "hello world");
+        assert_eq!(sel.0, (3, 2), "選択はマーカー直後から");
+        assert_eq!(sel.1, (3, 12), "選択は本文の右端まで");
+    }
+
+    #[test]
+    fn input_area_selection_multiline_input() {
+        // 複数行入力: 2行目はマーカー幅ぶんインデントされる (Claude Code 方式)
+        let mut p = vt100::Parser::new(8, 30, 0);
+        p.process("\x1b[2;1H──────────".as_bytes());
+        p.process("\x1b[3;1H\u{203a} 一行目の本文".as_bytes());
+        p.process("\x1b[4;1H  二行目の本文".as_bytes());
+        p.process("\x1b[5;1H──────────".as_bytes());
+        p.process(b"\x1b[4;16H"); // カーソルは2行目側
+        let (sel, text) = input_area_selection(p.screen()).expect("複数行でも検出できる");
+        assert_eq!(text, "一行目の本文\n二行目の本文");
+        assert_eq!((sel.0).0, 2);
+        assert_eq!((sel.1).0, 3);
+    }
+
+    #[test]
+    fn input_area_selection_gemini_style_side_borders() {
+        // Gemini CLI 風: │ で囲まれた箱の中の「> 本文」
+        let mut p = vt100::Parser::new(6, 20, 0);
+        p.process("\x1b[2;1H\u{256d}──────────\u{256e}".as_bytes());
+        p.process("\x1b[3;1H\u{2502} > draft  \u{2502}".as_bytes());
+        p.process("\x1b[4;1H\u{2570}──────────\u{256f}".as_bytes());
+        p.process(b"\x1b[3;10H");
+        let (_, text) = input_area_selection(p.screen()).expect("枠付きでも検出できる");
+        assert_eq!(text, "draft");
+    }
+
+    #[test]
+    fn input_area_selection_shell_dollar_prompt() {
+        let mut p = vt100::Parser::new(6, 30, 0);
+        p.process(b"$ cargo build");
+        let (_, text) = input_area_selection(p.screen()).expect("$ プロンプトも対象");
+        assert_eq!(text, "cargo build");
+    }
+
+    #[test]
+    fn input_area_selection_none_on_plain_output() {
+        // マーカーの無い普通の出力画面では None → Ctrl+A は従来通り PTY へ
+        let mut p = vt100::Parser::new(6, 20, 0);
+        p.process(b"compiling foo\r\nfinished");
+        assert!(input_area_selection(p.screen()).is_none());
+        // zsh 既定風のプロンプト (マーカーが行頭に無い) も対象外
+        let mut p2 = vt100::Parser::new(6, 40, 0);
+        p2.process(b"tacyan@Mac dev % ls -la");
+        assert!(input_area_selection(p2.screen()).is_none());
+    }
+
+    #[test]
+    fn input_area_selection_empty_input_returns_none() {
+        // 入力欄はあるが本文が空 → コピーするものが無いので None
+        let mut p = vt100::Parser::new(6, 20, 0);
+        p.process("\x1b[3;1H\u{203a} ".as_bytes());
+        p.process(b"\x1b[3;3H");
+        assert!(input_area_selection(p.screen()).is_none());
     }
 
     #[test]
@@ -3549,6 +3620,191 @@ fn word_selection(screen: &vt100::Screen, r: u16, c: u16) -> Option<((u16, u16),
     Some(((r, c0), (r, c1)))
 }
 
+/// CLI エージェント (Claude Code / Codex / Gemini 等) が画面下部に描く
+/// プロンプト入力欄を推定する (Ctrl+A の「入力中テキストだけ選択」用)。
+/// カーソル行から上へ遡ってマーカー行 (任意の左枠 │ の後に › ❯ ▸ ▶ ▌ > $ %
+/// が来る行) を探し、そこから下へ空行・罫線行・次のマーカー行にぶつかる
+/// までを入力欄とみなす。特定ツールの画面構造には依存せず見た目だけで
+/// 判定するので、新しい CLI でもマーカーが一般的なら動く。
+/// 戻り値は (選択範囲, 枠・マーカーを除いた入力テキスト)。入力が空なら None。
+type InputAreaSel = (((u16, u16), (u16, u16)), String);
+
+fn input_area_selection(screen: &vt100::Screen) -> Option<InputAreaSel> {
+    let (rows, cols) = screen.size();
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    let (cur_r, _) = screen.cursor_position();
+    let cur_r = cur_r.min(rows - 1);
+    let row_chars = |r: u16| -> Vec<char> {
+        let mut line: Vec<char> = Vec::new();
+        for c in 0..cols {
+            let Some(cell) = screen.cell(r, c) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let t = cell.contents();
+            if t.is_empty() {
+                line.push(' ');
+            } else {
+                line.extend(t.chars());
+            }
+        }
+        while line.last() == Some(&' ') {
+            line.pop();
+        }
+        line
+    };
+    let is_side = |ch: char| matches!(ch, '│' | '┃' | '║');
+    let is_rule = |ch: char| {
+        matches!(
+            ch,
+            '─' | '━'
+                | '═'
+                | '╌'
+                | '┄'
+                | '┈'
+                | '╍'
+                | '┅'
+                | '┉'
+                | '-'
+                | '–'
+                | '—'
+                | '╭'
+                | '╮'
+                | '╰'
+                | '╯'
+                | '┌'
+                | '┐'
+                | '└'
+                | '┘'
+                | '├'
+                | '┤'
+                | '┬'
+                | '┴'
+                | '┼'
+        )
+    };
+    // 罫線・枠だけの行 = 入力欄の上下境界
+    let is_border_row = |cs: &[char]| {
+        let mut n = 0usize;
+        for &ch in cs {
+            if ch == ' ' {
+                continue;
+            }
+            if is_rule(ch) || is_side(ch) {
+                n += 1;
+            } else {
+                return false;
+            }
+        }
+        n >= 2
+    };
+    // 行頭 (任意の左枠+空白の後) のプロンプトマーカー。本文開始の文字位置を返す。
+    // ">>" や "$HOME" のような本文を誤検出しないよう、マーカーの直後は
+    // 空白か行末に限る。
+    let marker_body_col = |cs: &[char]| -> Option<usize> {
+        let mut i = 0;
+        while i < cs.len() && cs[i] == ' ' {
+            i += 1;
+        }
+        if i < cs.len() && is_side(cs[i]) {
+            i += 1;
+            while i < cs.len() && cs[i] == ' ' {
+                i += 1;
+            }
+        }
+        if i >= cs.len() || !matches!(cs[i], '›' | '❯' | '▸' | '▶' | '▌' | '>' | '$' | '%') {
+            return None;
+        }
+        if i + 1 < cs.len() && cs[i + 1] != ' ' {
+            return None;
+        }
+        Some(i + 2)
+    };
+    // カーソル行から上へマーカー行を探す (途中に空行・罫線があれば入力欄ではない)
+    let mut marker: Option<(u16, usize)> = None;
+    let low = cur_r.saturating_sub(40);
+    for r in (low..=cur_r).rev() {
+        let cs = row_chars(r);
+        if let Some(col) = marker_body_col(&cs) {
+            marker = Some((r, col));
+            break;
+        }
+        if cs.is_empty() || is_border_row(&cs) {
+            break;
+        }
+    }
+    let (m_row, body_col) = marker?;
+    // マーカー行から下へ続く本文行 (折返し・複数行入力)
+    let mut bottom = m_row;
+    for r in m_row + 1..rows {
+        let cs = row_chars(r);
+        if cs.is_empty() || is_border_row(&cs) || marker_body_col(&cs).is_some() {
+            break;
+        }
+        bottom = r;
+    }
+    let mut text = String::new();
+    for r in m_row..=bottom {
+        let mut cs = row_chars(r);
+        // 右枠を除去
+        if cs.last().copied().is_some_and(is_side) {
+            cs.pop();
+            while cs.last() == Some(&' ') {
+                cs.pop();
+            }
+        }
+        // マーカー行は本文開始位置から。折返し行は左枠と、マーカー幅ぶんの
+        // インデント (Claude Code は折返しを本文開始列に揃える) を飛ばす。
+        let start = if r == m_row {
+            body_col.min(cs.len())
+        } else {
+            let mut i = 0;
+            if cs.first().copied().is_some_and(is_side) {
+                i = 1;
+            }
+            while i < cs.len() && cs[i] == ' ' && i < body_col {
+                i += 1;
+            }
+            i
+        };
+        if r > m_row && !screen.row_wrapped(r - 1) {
+            // 端末が折返した行は改行を挟まず連結、それ以外は見た目通り改行
+            text.push('\n');
+        }
+        text.extend(cs[start..].iter());
+    }
+    let text = text.trim_matches('\n').trim_end().to_string();
+    if text.trim().is_empty() {
+        return None;
+    }
+    // 選択範囲の見た目: マーカー直後 〜 最終行の右端 (右枠・空白は除く)
+    let mut end_col = 0u16;
+    for c in 0..cols {
+        if let Some(cell) = screen.cell(bottom, c) {
+            if cell.is_wide_continuation() || !cell.contents().trim().is_empty() {
+                end_col = c;
+            }
+        }
+    }
+    while end_col > 0 {
+        let t = screen
+            .cell(bottom, end_col)
+            .map(|c| c.contents())
+            .unwrap_or_default();
+        if t.trim().is_empty() || t.chars().next().is_some_and(is_side) {
+            end_col -= 1;
+        } else {
+            break;
+        }
+    }
+    let start_col = (body_col as u16).min(cols - 1);
+    Some((((m_row, start_col), (bottom, end_col)), text))
+}
+
 /// 選択範囲をクリップボードへコピーし、フィードバック表示を開始する。
 fn copy_selection(ui: &egui::Ui, session: &mut Session) {
     let Some(sel) = session.selection else {
@@ -3651,6 +3907,7 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
     let mut out: Vec<u8> = Vec::new();
     let mut want_copy = false;
     let mut want_select_all = false;
+    let mut input_select: Option<InputAreaSel> = None;
     for ev in &events {
         match ev {
             // ⌘C: 選択範囲をクリップボードへ(選択が無ければ何もしない)。
@@ -3706,6 +3963,27 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
                 if !session.preedit.is_empty() {
                     continue;
                 }
+                // Ctrl+A: 画面から CLI の入力欄 (› ❯ > 等のプロンプト行) を
+                // 検出できたら PTY へ \x01 を送らず、いま打ち込んでいる本文
+                // だけを選択してクリップボードへコピーする (音声入力した文を
+                // そのまま使い回すため)。Claude Code / Codex / Gemini など
+                // ツールを問わず見た目で判定し、検出できない画面 (素の
+                // シェル等) では従来通り行頭移動として送る。
+                if *key == egui::Key::A
+                    && modifiers.ctrl
+                    && !modifiers.alt
+                    && !modifiers.shift
+                    && session.scroll == 0
+                {
+                    let found = {
+                        let p = lock_ok(&session.parser);
+                        input_area_selection(p.screen())
+                    };
+                    if let Some(f) = found {
+                        input_select = Some(f);
+                        continue;
+                    }
+                }
                 if let Some(b) = key_bytes(*key, *modifiers, app_cursor) {
                     out.extend_from_slice(&b);
                 }
@@ -3723,6 +4001,13 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
     }
     if want_select_all {
         session.select_all();
+    }
+    if let Some((sel, text)) = input_select {
+        // Ctrl+A の入力欄選択: 選択表示 + 即コピー (⌘C を待たない)
+        session.selection = Some(sel);
+        session.sel_anchor = None;
+        ui.ctx().copy_text(text);
+        session.copied_at = Some(Instant::now());
     }
     if want_copy {
         copy_selection(ui, session);
