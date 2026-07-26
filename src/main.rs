@@ -66,13 +66,19 @@ use eframe::egui;
 /// アプリアイコン(assets/Zaivern.png をバイナリに埋め込む)。
 /// ウィンドウ/タスクバーアイコンとして 256px に縮小して使う。
 /// 失敗してもアイコン無しで起動を続ける。
+///
+/// 縮小フィルタは Lanczos3。Windows はここで渡した 1 枚から
+/// タイトルバー(16px)・タスクバー(24/32px)・Alt+Tab(48px 以上) を
+/// その場で作るため、元画像がボケているとどの寸法でもガタつく。
+/// Triangle(双一次)は縮小率が大きいほどエッジが甘くなるので、
+/// 起動時 1 回だけのコストと引き換えに品質側を取る。
 fn load_icon() -> Option<egui::IconData> {
     let img = image::load_from_memory(desktop::ICON_PNG).ok()?;
     let (w, h) = (img.width(), img.height());
     let img = if w == 256 && h == 256 {
         img
     } else {
-        img.resize_exact(256, 256, image::imageops::FilterType::Triangle)
+        img.resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
     };
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
@@ -220,6 +226,25 @@ fn utc_stamp(secs: u64) -> String {
     let mth = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(mth <= 2);
     format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::load_icon;
+
+    #[test]
+    fn load_icon_yields_a_full_256px_rgba_image() {
+        // Windows はこの 1 枚から各寸法のアイコンを生成する。
+        // サイズ/バッファ長がズレるとタスクバーで崩れるので、そこだけ固定する。
+        let icon = load_icon().expect("埋め込みアイコンを読めない");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        // 全面透明・全面単色ではない (縮小フィルタ変更でのつぶれ検出)。
+        assert!(
+            icon.rgba.chunks_exact(4).any(|p| p[3] > 0),
+            "アイコンが完全に透明になっている"
+        );
+    }
 }
 
 #[cfg(test)]
