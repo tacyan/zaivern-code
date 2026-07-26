@@ -642,6 +642,19 @@ pub fn place_callout(target: Option<Rect>, screen: Rect, card: Vec2) -> Placemen
 /// 対象を「くり抜いた」暗幕を、4 枚の矩形で表す。
 ///
 /// `target` が無ければ画面全体 1 枚。対象が画面外なら普通に全面が暗くなる。
+/// 暗幕の濃さ。
+///
+/// 既定のテーマは既に暗いので、そこへ濃い黒を重ねると説明中だけ画面が
+/// ほとんど読めなくなる (実際に「説明する時に暗くなる」と指摘を受けた)。
+/// 焦点はリングと吹き出しで示し、暗幕は「周囲を少し落とす」程度に留める。
+pub fn dim_alpha(dark_theme: bool) -> u8 {
+    if dark_theme {
+        56
+    } else {
+        96
+    }
+}
+
 pub fn dim_rects(target: Option<Rect>, screen: Rect) -> Vec<Rect> {
     let Some(t) = target.map(|t| t.intersect(screen)).filter(|t| t.is_positive()) else {
         return vec![screen];
@@ -981,7 +994,7 @@ impl Tutorial {
             return act;
         }
 
-        self.paint_dim(ctx, target, screen);
+        self.paint_dim(ctx, theme, target, screen);
         if let Some(t) = target {
             self.paint_ring(ctx, theme, t, now);
         }
@@ -996,12 +1009,12 @@ impl Tutorial {
 
     /// 暗幕。`interactable` な Area ではなく素の painter なので、背面のクリックは
     /// そのまま通る (= ツアー中でもアプリを触れる)。
-    fn paint_dim(&self, ctx: &egui::Context, target: Option<Rect>, screen: Rect) {
+    fn paint_dim(&self, ctx: &egui::Context, theme: &crate::theme::Theme, target: Option<Rect>, screen: Rect) {
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             Id::new("zv-tutorial-dim"),
         ));
-        let dim = Color32::from_black_alpha(150);
+        let dim = Color32::from_black_alpha(dim_alpha(theme.dark));
         for r in dim_rects(target, screen) {
             p.rect_filled(r, Rounding::ZERO, dim);
         }
@@ -1022,7 +1035,7 @@ impl Tutorial {
         p.rect_stroke(
             ring.expand(3.0),
             rounding,
-            Stroke::new(2.0_f32, theme.accent.gamma_multiply(0.25 + pulse * 0.25)),
+            Stroke::new(2.5_f32, theme.accent.gamma_multiply(0.45 + pulse * 0.35)),
         );
         p.rect_stroke(ring, rounding, Stroke::new(2.0_f32, theme.accent));
     }
@@ -1503,6 +1516,16 @@ mod tests {
     // ── 暗幕のくり抜き ──
 
     #[test]
+    /// 暗幕はテーマに応じて薄くする。
+    ///
+    /// 既定のダークテーマに濃い黒を重ねると説明中だけ画面が読めなくなる。
+    #[test]
+    fn 暗幕はダークテーマでは薄い() {
+        assert!(dim_alpha(true) < dim_alpha(false), "暗いテーマほど薄く");
+        assert!(dim_alpha(true) <= 80, "ダークテーマで濃すぎない");
+        assert!(dim_alpha(false) <= 128, "ライトテーマでも真っ暗にはしない");
+    }
+
     fn dim_rects_punch_a_hole_and_never_cover_the_target() {
         let screen = rect(0.0, 0.0, 1000.0, 600.0);
         let t = rect(200.0, 100.0, 300.0, 200.0);
