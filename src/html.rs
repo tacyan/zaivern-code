@@ -33,12 +33,113 @@ fn entity(name: &str) -> Option<String> {
         return char::from_u32(cp).map(|c| c.to_string());
     }
     let s = match name {
-        "amp" => "&",
-        "lt" => "<",
-        "gt" => ">",
-        "quot" => "\"",
+        "amp" | "AMP" => "&",
+        "lt" | "LT" => "<",
+        "gt" | "GT" => ">",
+        "quot" | "QUOT" => "\"",
         "apos" => "'",
-        "nbsp" => " ",
+        // 実体としての nbsp は「折り返さない空白」。通常の空白に潰さない
+        "nbsp" => "\u{00A0}",
+        "ensp" => "\u{2002}",
+        "emsp" => "\u{2003}",
+        "thinsp" => "\u{2009}",
+        "zwnj" => "\u{200C}",
+        "zwj" => "\u{200D}",
+        "shy" => "\u{00AD}",
+        "lsaquo" => "‹",
+        "rsaquo" => "›",
+        "sbquo" => "‚",
+        "bdquo" => "„",
+        "dagger" => "†",
+        "Dagger" => "‡",
+        "permil" => "‰",
+        "prime" => "′",
+        "Prime" => "″",
+        "euro" => "€",
+        "pound" => "£",
+        "yen" => "¥",
+        "cent" => "¢",
+        "curren" => "¤",
+        "frac12" => "½",
+        "frac14" => "¼",
+        "frac34" => "¾",
+        "sup1" => "¹",
+        "sup2" => "²",
+        "sup3" => "³",
+        "micro" => "µ",
+        "not" => "¬",
+        "iexcl" => "¡",
+        "iquest" => "¿",
+        "brvbar" => "¦",
+        "uml" => "¨",
+        "ordf" => "ª",
+        "ordm" => "º",
+        "acute" => "´",
+        "cedil" => "¸",
+        "macr" => "¯",
+        "sup" => "⊃",
+        "sub" => "⊂",
+        "ne" => "≠",
+        "le" => "≤",
+        "ge" => "≥",
+        "asymp" => "≈",
+        "equiv" => "≡",
+        "infin" => "∞",
+        "radic" => "√",
+        "sum" => "∑",
+        "prod" => "∏",
+        "int" => "∫",
+        "part" => "∂",
+        "nabla" => "∇",
+        "isin" => "∈",
+        "notin" => "∉",
+        "cap" => "∩",
+        "cup" => "∪",
+        "and" => "∧",
+        "or" => "∨",
+        "forall" => "∀",
+        "exist" => "∃",
+        "empty" => "∅",
+        "alpha" => "α",
+        "beta" => "β",
+        "gamma" => "γ",
+        "delta" => "δ",
+        "epsilon" => "ε",
+        "theta" => "θ",
+        "lambda" => "λ",
+        "mu" => "μ",
+        "pi" => "π",
+        "sigma" => "σ",
+        "tau" => "τ",
+        "phi" => "φ",
+        "omega" => "ω",
+        "Delta" => "Δ",
+        "Sigma" => "Σ",
+        "Omega" => "Ω",
+        "Alpha" => "Α",
+        "Beta" => "Β",
+        "Gamma" => "Γ",
+        "Lambda" => "Λ",
+        "Pi" => "Π",
+        "Phi" => "Φ",
+        "lArr" => "⇐",
+        "rArr" => "⇒",
+        "hArr" => "⇔",
+        "crarr" => "↵",
+        "spades" => "♠",
+        "clubs" => "♣",
+        "diams" => "♦",
+        "loz" => "◊",
+        "oline" => "‾",
+        "frasl" => "⁄",
+        "minus" => "−",
+        "lowast" => "∗",
+        "there4" => "∴",
+        "ang" => "∠",
+        "perp" => "⊥",
+        "sim" => "∼",
+        "cong" => "≅",
+        "prop" => "∝",
         "copy" => "©",
         "reg" => "®",
         "trade" => "™",
@@ -75,8 +176,7 @@ fn entity(name: &str) -> Option<String> {
 }
 
 /// テキスト中の文字実体参照をすべて解決する。未知の参照はそのまま残す。
-/// (変換器は entity() を直接使う。単体でも使えるよう公開ユーティリティとして残す)
-#[allow(dead_code)]
+/// (変換ループは entity() を直接使う。属性値の復号にはこちらを使う)
 pub fn decode_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
@@ -189,6 +289,51 @@ fn attr(attrs: &str, name: &str) -> Option<String> {
     None
 }
 
+/// 属性値を取り出して実体参照も解決する (`src="a&amp;b.png"` 対策)。
+fn attr_text(attrs: &str, name: &str) -> Option<String> {
+    attr(attrs, name).map(|v| decode_entities(&v))
+}
+
+/// `style="font-weight:bold"` 等から Markdown の装飾記号を作る。
+/// 返り値は (開き, 閉じ)。装飾なしなら両方空。
+fn style_marks(attrs: &str) -> (String, String) {
+    let Some(style) = attr(attrs, "style") else {
+        return (String::new(), String::new());
+    };
+    let s = style.to_ascii_lowercase().replace(' ', "");
+    let mut open = String::new();
+    if s.contains("font-weight:bold")
+        || s.contains("font-weight:600")
+        || s.contains("font-weight:700")
+        || s.contains("font-weight:800")
+        || s.contains("font-weight:900")
+    {
+        open.push_str("**");
+    }
+    if s.contains("font-style:italic") || s.contains("font-style:oblique") {
+        open.push('*');
+    }
+    if s.contains("line-through") {
+        open.push_str("~~");
+    }
+    let close: String = {
+        // 閉じ記号は開いた順の逆順
+        let mut parts: Vec<&str> = Vec::new();
+        if open.starts_with("**") {
+            parts.push("**");
+        }
+        if open.contains('*') && open.trim_start_matches("**").starts_with('*') {
+            parts.push("*");
+        }
+        if open.ends_with("~~") {
+            parts.push("~~");
+        }
+        parts.reverse();
+        parts.concat()
+    };
+    (open, close)
+}
+
 // ─── 変換器 ─────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
@@ -211,6 +356,9 @@ struct TableState {
     cur_row: Vec<String>,
     cur_cell: Option<String>,
     row_is_th: bool,
+    /// `<caption>` の本文 (テーブルの直前に見出しとして出す)
+    caption: String,
+    in_caption: bool,
 }
 
 struct Conv {
@@ -222,6 +370,10 @@ struct Conv {
     pre: bool,
     pre_lang_pending: bool,
     table: Option<TableState>,
+    /// `<table>` の入れ子の深さ (内側のテーブルは外側のセルへ平坦化する)
+    table_depth: usize,
+    /// `<span style>` 等で開いた装飾の閉じ記号スタック
+    spans: Vec<String>,
 }
 
 impl Conv {
@@ -235,12 +387,17 @@ impl Conv {
             pre: false,
             pre_lang_pending: false,
             table: None,
+            table_depth: 0,
+            spans: Vec::new(),
         }
     }
 
-    /// 出力先 (テーブルセル内ならセルバッファ)。
+    /// 出力先 (テーブルのキャプション内 → セル内 → 本文 の順)。
     fn sink(&mut self) -> &mut String {
         if let Some(t) = &mut self.table {
+            if t.in_caption {
+                return &mut t.caption;
+            }
             if let Some(c) = &mut t.cur_cell {
                 return c;
             }
@@ -250,7 +407,9 @@ impl Conv {
 
     /// テーブルのセル外にいる (セル間の空白などは捨てる)。
     fn in_table_gap(&self) -> bool {
-        self.table.as_ref().is_some_and(|t| t.cur_cell.is_none())
+        self.table
+            .as_ref()
+            .is_some_and(|t| t.cur_cell.is_none() && !t.in_caption)
     }
 
     /// テキストを 1 文字書く。行頭なら引用プレフィックスを付ける。
@@ -341,8 +500,81 @@ impl Conv {
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => self.tag_heading(tag, name),
             "p" | "div" | "section" | "article" | "main" | "header" | "footer" | "aside"
-            | "nav" | "center" | "figure" | "figcaption" | "address" | "dl" | "dt" | "dd" => {
+            | "nav" | "center" | "figure" | "figcaption" | "address" | "dl" | "form"
+            | "fieldset" | "hgroup" | "dialog" | "search" | "noscript" | "html" | "body" => {
                 self.block_break();
+            }
+            // 定義リスト: 用語は太字、説明は 1 段下げ
+            "dt" => {
+                if tag.closing {
+                    self.push_str("**");
+                    self.newline();
+                } else {
+                    self.block_break();
+                    self.push_str("**");
+                }
+            }
+            "dd" => {
+                if tag.closing {
+                    self.newline();
+                } else {
+                    self.newline();
+                    self.push_str("  ");
+                }
+            }
+            // インライン装飾のうち Markdown に無いものは素通し (中身は残る)。
+            // style 属性に太字/斜体/打消しが書かれていれば拾う
+            "span" | "font" | "small" | "u" | "ins" | "mark" | "abbr" | "bdi" | "bdo" | "q"
+            | "time" | "data" | "output" | "ruby" | "rt" | "rp" | "big" => {
+                if tag.closing {
+                    if let Some(close) = self.spans.pop() {
+                        self.push_str(&close);
+                    }
+                } else {
+                    let (open, close) = style_marks(&tag.attrs);
+                    self.push_str(&open);
+                    self.spans.push(close);
+                }
+            }
+            "sup" => self.push_str(if tag.closing { ")" } else { "^(" }),
+            "sub" => self.push_str(if tag.closing { ")" } else { "_(" }),
+            // チェックボックスはタスクリスト記法へ (li 直後なら `- [x]` になる)
+            "input" => {
+                if tag.closing {
+                    return;
+                }
+                let ty = attr(&tag.attrs, "type").unwrap_or_default().to_ascii_lowercase();
+                if ty == "checkbox" || ty == "radio" {
+                    let done = attr(&tag.attrs, "checked").is_some()
+                        || tag.attrs.to_ascii_lowercase().split_whitespace().any(|w| w == "checked");
+                    let in_list = {
+                        let s = self.sink();
+                        s.ends_with("- ") || s.ends_with("* ") || s.ends_with("+ ")
+                    };
+                    if in_list {
+                        self.push_str(if done { "[x] " } else { "[ ] " });
+                    } else {
+                        self.push_str(if done { "☑ " } else { "☐ " });
+                    }
+                }
+            }
+            // 再生できないメディアは「ここに何があるか」をリンクで残す
+            "video" | "audio" | "embed" | "object" | "iframe" => {
+                if tag.closing {
+                    return;
+                }
+                let src = attr_text(&tag.attrs, "src")
+                    .or_else(|| attr_text(&tag.attrs, "data"))
+                    .unwrap_or_default();
+                if src.is_empty() {
+                    return;
+                }
+                let icon = match name {
+                    "audio" => "🔊",
+                    "video" => "🎬",
+                    _ => "🔗",
+                };
+                self.push_str(&format!("[{icon} {src}]({src})"));
             }
             "blockquote" => {
                 self.block_break();
@@ -385,7 +617,7 @@ impl Conv {
                         self.push_str(&format!("]({href})"));
                     }
                 } else {
-                    let href = attr(&tag.attrs, "href").filter(|h| !h.is_empty());
+                    let href = attr_text(&tag.attrs, "href").filter(|h| !h.is_empty());
                     if href.is_some() {
                         self.push_str("[");
                     }
@@ -396,12 +628,28 @@ impl Conv {
                 if tag.closing {
                     return;
                 }
-                let src = attr(&tag.attrs, "src").unwrap_or_default();
-                if src.is_empty() {
+                // src が空なら data-src / srcset の先頭を代わりに使う (遅延読込対策)
+                let src = attr_text(&tag.attrs, "src")
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| attr_text(&tag.attrs, "data-src"))
+                    .or_else(|| {
+                        attr_text(&tag.attrs, "srcset").and_then(|s| {
+                            s.split(',')
+                                .next()
+                                .and_then(|p| p.split_whitespace().next())
+                                .map(|p| p.to_string())
+                        })
+                    })
+                    .unwrap_or_default();
+                if src.trim().is_empty() {
                     return;
                 }
-                let alt = attr(&tag.attrs, "alt").unwrap_or_default();
-                self.push_str(&format!("![{alt}]({src})"));
+                let alt = attr_text(&tag.attrs, "alt")
+                    .or_else(|| attr_text(&tag.attrs, "title"))
+                    .unwrap_or_default();
+                // alt の `[` `]` は画像記法を壊すので丸括弧へ置き換える
+                let alt = alt.replace('[', "(").replace(']', ")").replace('\n', " ");
+                self.push_str(&format!("![{alt}]({})", src.trim()));
             }
             "details" => self.block_break(),
             "summary" => {
@@ -413,17 +661,30 @@ impl Conv {
                     self.block_break();
                 }
             }
+            // 入れ子テーブルは外側の表を壊さないよう「内側は無視」して平坦化する
             "table" => {
                 if tag.closing {
-                    self.emit_table();
+                    self.table_depth = self.table_depth.saturating_sub(1);
+                    if self.table_depth == 0 {
+                        self.emit_table();
+                    }
                 } else {
-                    self.block_break();
-                    self.table = Some(TableState::default());
+                    if self.table_depth == 0 {
+                        self.block_break();
+                        self.table = Some(TableState::default());
+                    }
+                    self.table_depth += 1;
                 }
             }
-            "thead" | "tbody" | "tfoot" | "caption" | "colgroup" | "col" => {}
-            "tr" => self.tag_table_row(tag),
-            "th" | "td" => {
+            "caption" => {
+                if let Some(t) = &mut self.table {
+                    t.in_caption = !tag.closing;
+                }
+            }
+            "thead" | "tbody" | "tfoot" | "colgroup" | "col" => {}
+            "tr" if self.table_depth <= 1 => self.tag_table_row(tag),
+            "tr" => {}
+            "th" | "td" if self.table_depth <= 1 => {
                 if let Some(t) = &mut self.table {
                     if let Some(c) = t.cur_cell.take() {
                         t.cur_row.push(c);
@@ -435,6 +696,10 @@ impl Conv {
                         }
                     }
                 }
+            }
+            "th" | "td" => {
+                // 内側テーブルのセル区切りは空白 1 個に落とす
+                self.push_char(' ');
             }
             "pre" => self.tag_pre(tag),
             _ => {
@@ -541,11 +806,18 @@ impl Conv {
     /// 溜めたテーブルを Markdown テーブルとして書き出す。
     fn emit_table(&mut self) {
         let Some(mut t) = self.table.take() else { return };
+        t.in_caption = false;
         if let Some(c) = t.cur_cell.take() {
             t.cur_row.push(c);
         }
         if !t.cur_row.is_empty() {
             t.rows.push(std::mem::take(&mut t.cur_row));
+        }
+        let caption = t.caption.trim().replace('\n', " ");
+        if !caption.is_empty() {
+            self.block_break();
+            self.push_str(&format!("**{caption}**"));
+            self.newline();
         }
         if t.rows.is_empty() {
             return;
@@ -593,6 +865,10 @@ fn fence_lang(attrs: &str) -> Option<String> {
 
 /// 変換対象として扱うタグか。Markdown モードでは未知タグを原文のまま残すため、
 /// この判定に漏れたもの (`Vec<String>` の型パラメータ等) は変換されない。
+///
+/// 標準 HTML の要素名はできるだけ網羅する。tag() に処理が無いものは
+/// 「何も出さない = 中身のテキストだけ残る」に落ちるので、生のマークアップが
+/// ユーザーの目に触れることはない。
 fn is_known_tag(name: &str) -> bool {
     matches!(
         name,
@@ -606,7 +882,24 @@ fn is_known_tag(name: &str) -> bool {
             | "tr" | "th" | "td" | "pre"
             | "span" | "small" | "sub" | "sup" | "u" | "ins" | "mark" | "abbr" | "font"
             | "picture" | "source" | "video" | "audio" | "input" | "label" | "button"
+            // 構造・フォーム・その他の標準要素 (処理は無く、中身だけ残す)
+            | "html" | "body" | "form" | "fieldset" | "legend" | "textarea" | "select"
+            | "optgroup" | "datalist" | "hgroup" | "menu" | "dialog" | "search"
+            | "progress" | "meter" | "output" | "time" | "data" | "ruby" | "rt" | "rp"
+            | "rb" | "rtc" | "bdi" | "bdo" | "wbr" | "area" | "track" | "embed" | "object"
+            | "param" | "noscript" | "slot" | "base" | "link" | "meta" | "title" | "q"
+            | "big" | "marquee" | "nobr" | "blink" | "acronym" | "basefont" | "noframes"
+            | "iframe"
     )
+}
+
+/// Markdown モードで `<…>` をタグとして扱ってよいか。
+///
+/// `Vec<Option<T>>` のようなジェネリクスは「タグ名らしき語 + 属性部に `<`」
+/// という形になる。属性部に `<` を含むものはタグとみなさないことで、
+/// コード片を壊さずに本物の HTML だけを変換できる。
+fn looks_like_markup(tag: &Tag) -> bool {
+    !tag.attrs.contains('<') && is_known_tag(&tag.name)
 }
 
 /// script / style / head 等、中身ごと捨てるタグの終了位置を探す。
@@ -633,7 +926,12 @@ fn skip_until_close(chars: &[char], from: usize, name: &str) -> usize {
 }
 
 /// 共通の変換ループ。
+///
+/// 入力は描画側と同じ上限で切り詰める。10MB の HTML を毎回丸ごと
+/// `Vec<char>` に展開すると UI スレッドが止まるため。
 fn convert(text: &str, mode: Mode) -> String {
+    let orig_len = text.len();
+    let (text, truncated) = crate::markdown::cap_input(text);
     let chars: Vec<char> = text.chars().collect();
     let mut conv = Conv::new(mode);
     let mut i = 0;
@@ -722,10 +1020,10 @@ fn convert(text: &str, mode: Mode) -> String {
             if let Some(tag) = read_tag(&chars, i) {
                 // Markdown モードの未知タグは原文のまま残す (Vec<String> 等の誤爆防止)
                 if mode == Mode::Markdown
-                    && !is_known_tag(&tag.name)
+                    && !looks_like_markup(&tag)
                     && !matches!(
                         tag.name.as_str(),
-                        "script" | "style" | "head" | "svg" | "iframe" | "canvas" | "template"
+                        "script" | "style" | "head" | "svg" | "canvas" | "template"
                     )
                 {
                     let raw: String = chars[i..tag.end].iter().collect();
@@ -734,11 +1032,11 @@ fn convert(text: &str, mode: Mode) -> String {
                     i = tag.end;
                     continue;
                 }
-                // 中身ごと捨てるタグ
+                // 中身ごと捨てるタグ (描画できない/意味のないものだけ)
                 if !tag.closing
                     && matches!(
                         tag.name.as_str(),
-                        "script" | "style" | "head" | "svg" | "iframe" | "canvas" | "template"
+                        "script" | "style" | "head" | "svg" | "canvas" | "template"
                     )
                 {
                     i = skip_until_close(&chars, tag.end, &tag.name);
@@ -805,17 +1103,32 @@ fn convert(text: &str, mode: Mode) -> String {
         i += 1;
     }
 
-    // 閉じ忘れのテーブルを流す
+    // 閉じ忘れの装飾/テーブルを流す (壊れた HTML でも出力が途切れないように)
+    while let Some(close) = conv.spans.pop() {
+        conv.push_str(&close);
+    }
+    conv.table_depth = 0;
     conv.emit_table();
-    conv.out.trim_end().to_string()
+    let mut out = conv.out.trim_end().to_string();
+    if truncated {
+        out.push_str("\n\n");
+        out.push_str(&crate::markdown::truncation_note(text.len(), orig_len));
+    }
+    out
 }
 
 /// Markdown 中の埋め込み HTML を Markdown 相当へ変換する。
 /// HTML を含まないテキストは (コメント除去と実体参照解決を除き) そのまま通る。
 pub fn preprocess_markdown(text: &str) -> String {
+    let (capped, truncated) = crate::markdown::cap_input(text);
     // HTML の気配が無ければ何もしない (毎フレーム呼ばれても軽いように)
-    if !text.contains('<') && !text.contains('&') {
-        return text.to_string();
+    if !capped.contains('<') && !capped.contains('&') {
+        let mut out = capped.to_string();
+        if truncated {
+            out.push_str("\n\n");
+            out.push_str(&crate::markdown::truncation_note(capped.len(), text.len()));
+        }
+        return out;
     }
     convert(text, Mode::Markdown)
 }
@@ -975,5 +1288,324 @@ mod tests {
         assert!(c.pre);
         assert!(!c.pre_lang_pending);
         assert_eq!(c.out, "```rust\n");
+    }
+
+    // ─── タグ別の変換表 ─────────────────────────────────────────────
+
+    /// Markdown 中に埋め込まれた HTML タグを 1 つずつ確認する。
+    /// (入力, 出力に含まれるべき文字列, 出力に含まれてはいけない文字列)
+    #[test]
+    fn embedded_html_tag_table() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("<p>段落</p>", &["段落"], &["<p>", "</p>"]),
+            ("<div>ブロック</div>", &["ブロック"], &["<div>"]),
+            ("<b>太字</b>", &["**太字**"], &["<b>"]),
+            ("<strong>強</strong>", &["**強**"], &["<strong>"]),
+            ("<i>斜</i>", &["*斜*"], &["<i>"]),
+            ("<em>強調</em>", &["*強調*"], &["<em>"]),
+            ("<code>x=1</code>", &["`x=1`"], &["<code>"]),
+            ("<del>消</del>", &["~~消~~"], &["<del>"]),
+            ("行1<br>行2", &["行1", "行2"], &["<br>"]),
+            ("<hr>", &["---"], &["<hr>"]),
+            ("<h1>見出し</h1>", &["# 見出し"], &["<h1>"]),
+            ("<h6>小</h6>", &["###### 小"], &["<h6>"]),
+            ("<blockquote>引用</blockquote>", &["> 引用"], &["<blockquote>"]),
+            ("<ul><li>一</li><li>二</li></ul>", &["- 一", "- 二"], &["<li>"]),
+            ("<ol><li>甲</li><li>乙</li></ol>", &["1. 甲", "2. 乙"], &["<ol>"]),
+            (
+                r#"<a href="https://a.b">サイト</a>"#,
+                &["[サイト](https://a.b)"],
+                &["<a href"],
+            ),
+            (
+                r#"<img src="a.png" alt="図">"#,
+                &["![図](a.png)"],
+                &["<img"],
+            ),
+            (
+                "<details><summary>開く</summary>中身</details>",
+                &["▶ **開く**", "中身"],
+                &["<details>", "<summary>"],
+            ),
+            (
+                "<table><tr><th>A</th></tr><tr><td>1</td></tr></table>",
+                &["| A |", "| --- |", "| 1 |"],
+                &["<table>", "<td>"],
+            ),
+            (
+                "<pre><code>let x;</code></pre>",
+                &["```", "let x;"],
+                &["<pre>", "<code>"],
+            ),
+            (
+                r#"<span style="font-weight:bold">濃い</span>"#,
+                &["**濃い**"],
+                &["<span"],
+            ),
+            (
+                r#"<span style="font-style:italic">斜め</span>"#,
+                &["*斜め*"],
+                &["<span"],
+            ),
+            (r#"<span class="x">素</span>"#, &["素"], &["<span", "class"]),
+            ("<dl><dt>語</dt><dd>説明</dd></dl>", &["**語**", "説明"], &["<dl>"]),
+            ("<sup>2</sup>", &["^(2)"], &["<sup>"]),
+            ("<sub>i</sub>", &["_(i)"], &["<sub>"]),
+            (
+                r#"<video src="v.mp4"></video>"#,
+                &["🎬", "(v.mp4)"],
+                &["<video"],
+            ),
+            (
+                r#"<iframe src="https://a.b/e"></iframe>"#,
+                &["https://a.b/e"],
+                &["<iframe"],
+            ),
+            // 未知の (=対応していない) タグは中身のテキストだけ残す
+            ("<marquee>流れる</marquee>", &["流れる"], &["<marquee>"]),
+            ("<form><label>名前</label></form>", &["名前"], &["<form>", "<label>"]),
+            ("<body><p>本文</p></body>", &["本文"], &["<body>"]),
+        ];
+        for (src, want, unwanted) in cases {
+            let md = preprocess_markdown(src);
+            for w in *want {
+                assert!(md.contains(w), "{src:?} → {md:?} に {w:?} が無い");
+            }
+            for u in *unwanted {
+                assert!(!md.contains(u), "{src:?} → {md:?} に {u:?} が残っている");
+            }
+        }
+    }
+
+    #[test]
+    fn inline_html_inside_paragraph() {
+        // 段落の途中の HTML が周囲の Markdown を壊さない
+        let md = preprocess_markdown("**強調** と <b>太字</b> と *斜体*");
+        assert!(md.contains("**強調**") && md.contains("**太字**") && md.contains("*斜体*"));
+        let md = preprocess_markdown("テキスト<br>続き");
+        assert!(md.starts_with("テキスト  \n続き"), "{md:?}");
+        let md = preprocess_markdown(r#"文中に <img src="x.png" width="200"> がある"#);
+        assert!(md.contains("文中に ![](x.png) がある"), "{md:?}");
+        // 見出し行の中のインライン HTML
+        let md = preprocess_markdown("## <code>fn</code> の話");
+        assert!(md.contains("## `fn` の話"), "{md:?}");
+        // リスト項目の中のインライン HTML
+        let md = preprocess_markdown("- <b>項目</b> の説明");
+        assert!(md.contains("- **項目** の説明"), "{md:?}");
+    }
+
+    #[test]
+    fn checkbox_becomes_task_list() {
+        let md = html_to_md(
+            "<ul><li><input type=\"checkbox\" checked> 済</li>\
+             <li><input type=\"checkbox\"> 未</li></ul>",
+        );
+        assert!(md.contains("- [x] 済"), "{md:?}");
+        assert!(md.contains("- [ ] 未"), "{md:?}");
+        // リスト外のチェックボックスは記号で表す
+        let md = html_to_md("<p><input type=\"checkbox\" checked> 単体</p>");
+        assert!(md.contains("☑"), "{md:?}");
+    }
+
+    // ─── 文字実体参照 ───────────────────────────────────────────────
+
+    #[test]
+    fn entity_decode_table() {
+        let cases: &[(&str, &str)] = &[
+            ("&amp;", "&"),
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&#39;", "'"),
+            ("&apos;", "'"),
+            ("&nbsp;", "\u{00A0}"),
+            ("&#x3042;", "あ"),
+            ("&#X3042;", "あ"),
+            ("&#12354;", "あ"),
+            ("&#x1F600;", "😀"),
+            ("&copy;", "©"),
+            ("&mdash;", "—"),
+            ("&yen;", "¥"),
+            ("&alpha;", "α"),
+            // 未知・不正はそのまま残す (壊さない)
+            ("&notanentity;", "&notanentity;"),
+            ("&#xZZZZ;", "&#xZZZZ;"),
+            ("&#99999999;", "&#99999999;"),
+            ("&", "&"),
+            ("&;", "&;"),
+            ("a & b", "a & b"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(&decode_entities(src), want, "src={src:?}");
+        }
+        // Markdown / HTML どちらの経路でも解決される
+        assert!(preprocess_markdown("A &amp; B &#x3042;").contains("A & B あ"));
+        assert!(html_to_md("<p>A &amp; B &#x3042;</p>").contains("A & B あ"));
+        // インラインコード/フェンス内の実体参照は触らない
+        assert!(preprocess_markdown("`&amp;`").contains("`&amp;`"));
+        assert!(preprocess_markdown("```\n&amp;\n```").contains("&amp;"));
+    }
+
+    #[test]
+    fn entities_in_attributes_are_decoded() {
+        let md = preprocess_markdown(r#"<img src="a&amp;b.png" alt="X &amp; Y">"#);
+        assert!(md.contains("![X & Y](a&b.png)"), "{md:?}");
+        let md = preprocess_markdown(r#"<a href="?x=1&amp;y=2">L</a>"#);
+        assert!(md.contains("[L](?x=1&y=2)"), "{md:?}");
+    }
+
+    // ─── 壊れた HTML への耐性 ───────────────────────────────────────
+
+    #[test]
+    fn malformed_html_degrades_without_panic() {
+        let cases = [
+            "<b>閉じ忘れ",
+            "</b>いきなり閉じ",
+            "<div><p>入れ子違い</div></p>",
+            "<table><tr><td>閉じ忘れ",
+            "<ul><li>a<li>b",
+            "<a href=\"x\">リンク",
+            "<span style=\"font-weight:bold\">濃い",
+            "<img src=",
+            "<<<>>>",
+            "<b<i>x</i>",
+            "< b >空白",
+            "<!-- 閉じないコメント",
+            "<pre>閉じない",
+        ];
+        for src in cases {
+            let md = preprocess_markdown(src);
+            let html = html_to_md(src);
+            // 生のタグを丸ごと吐き出さないこと (`<b>` が残らない)
+            assert!(!md.contains("<b>"), "{src:?} → {md:?}");
+            assert!(!html.contains("<b>"), "{src:?} → {html:?}");
+        }
+        // 未閉じの装飾は変換の最後に閉じられる
+        let md = preprocess_markdown(r#"<span style="font-style:italic">斜め"#);
+        assert!(md.starts_with('*') && md.ends_with('*'), "{md:?}");
+    }
+
+    #[test]
+    fn generics_are_not_mistaken_for_tags() {
+        for src in [
+            "Vec<String>",
+            "Result<T, E>",
+            "Vec<Option<T>>",
+            "HashMap<K, V>",
+            "Box<dyn Error>",
+            "a < b && c > d",
+        ] {
+            let md = preprocess_markdown(src);
+            assert_eq!(md, src, "{src:?} は原文のまま残すべき");
+        }
+    }
+
+    #[test]
+    fn nested_table_flattens_into_outer_cell() {
+        let md = html_to_md(
+            "<table><tr><td>外<table><tr><td>内</td></tr></table></td><td>右</td></tr></table>",
+        );
+        // 外側の表が壊れず、内側はセル内のテキストとして残る
+        assert!(md.contains("外"), "{md:?}");
+        assert!(md.contains("内"), "{md:?}");
+        assert!(md.contains("右"), "{md:?}");
+        assert!(md.lines().filter(|l| l.contains("---")).count() <= 1, "{md:?}");
+    }
+
+    #[test]
+    fn table_caption_becomes_heading_line() {
+        let md = html_to_md("<table><caption>売上</caption><tr><td>1</td></tr></table>");
+        assert!(md.contains("**売上**"), "{md:?}");
+        assert!(md.contains("| 1 |"), "{md:?}");
+    }
+
+    #[test]
+    fn crlf_html_is_handled() {
+        let md = html_to_md("<h1>題</h1>\r\n<p>本文</p>\r\n");
+        assert!(md.contains("# 題"), "{md:?}");
+        assert!(md.contains("本文"), "{md:?}");
+    }
+
+    /// 実際の README にありがちな混在文書を通しで変換し、
+    /// 生のマークアップが 1 つも残らないことを確認する。
+    #[test]
+    fn real_world_readme_leaves_no_raw_markup() {
+        let src = r#"---
+title: サンプル
+---
+
+# プロジェクト <img src="logo.png" alt="ロゴ" width="20">
+
+<p align="center">
+  <a href="https://ci.example/badge"><img src="badge.svg" alt="CI"></a>
+</p>
+
+説明文です。<br>2 行目&nbsp;です。
+
+<details>
+<summary>詳しく</summary>
+
+| 名前 | 値 |
+|:-----|---:|
+| a    |  1 |
+
+- [x] 済んだ
+- [ ] これから
+  - ネスト
+
+</details>
+
+<table>
+  <tr><th>キー</th><th>説明</th></tr>
+  <tr><td><code>--fast</code></td><td>速くする &amp; 省メモリ</td></tr>
+</table>
+
+```rust
+let v: Vec<Option<String>> = vec![];
+```
+
+普通の `Vec<String>` は壊さない。
+"#;
+        let md = preprocess_markdown(src);
+        for raw in [
+            "<p", "</p>", "<a href", "<img", "<details>", "<summary>", "<table>", "<tr>",
+            "<th>", "<td>", "&nbsp;", "&amp;",
+        ] {
+            assert!(!md.contains(raw), "{raw:?} が残っている:\n{md}");
+        }
+        // 中身は保たれている
+        for want in [
+            "# プロジェクト",
+            "![ロゴ](logo.png)",
+            "[![CI](badge.svg)](https://ci.example/badge)",
+            "▶ **詳しく**",
+            "| 名前 | 値 |",
+            "- [x] 済んだ",
+            "| `--fast` |",
+            "省メモリ",
+        ] {
+            assert!(md.contains(want), "{want:?} が無い:\n{md}");
+        }
+        // フェンス内と本文のジェネリクスは無傷
+        assert!(md.contains("Vec<Option<String>>"), "{md}");
+        assert!(md.contains("`Vec<String>`"), "{md}");
+        // フロントマターはそのまま残り、描画側で畳まれる
+        let (fm, _) = crate::markdown::split_front_matter(&md);
+        assert_eq!(fm.map(|s| s.trim()), Some("title: サンプル"));
+    }
+
+    // ─── 巨大入力 ───────────────────────────────────────────────────
+
+    #[test]
+    fn huge_input_is_capped_with_notice() {
+        let big = format!("<p>{}</p>", "あ".repeat(4_000_000)); // 12MB 超
+        assert!(big.len() > 10 * 1024 * 1024);
+        let md = html_to_md(&big);
+        assert!(md.len() < crate::markdown::MAX_PREVIEW_BYTES + 4096, "len={}", md.len());
+        assert!(md.contains("⚠") || md.contains("KB"), "{}", &md[md.len() - 200..]);
+        // HTML を含まない巨大 Markdown も同じ経路で切り詰められる
+        let plain = "行\n".repeat(400_000);
+        let out = preprocess_markdown(&plain);
+        assert!(out.len() < crate::markdown::MAX_PREVIEW_BYTES + 4096);
     }
 }
