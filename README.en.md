@@ -55,6 +55,22 @@ On first launch a **26-step guided tour** walks you through the cockpit, highlig
 
 ---
 
+## 🆕 v0.5.0 — pick the shape of your command post
+
+A large update after fifteen 0.4.x patches ([release notes](https://github.com/tacyan/zaivern-code/releases/latest)).
+
+- **Vertical agent deck** (`⌘⇧L`) — running agents only, in a single column. Together with the Cockpit and the board, you can pick the shape that fits the moment. **Terminal splits** landed too.
+- **The board now has 8 lanes** — thinking / editing / running / verifying are all visible, so you never have to guess whether an agent is working or stuck. The live pane goes fullscreen.
+- **Branch switching and cross-branch sessions** — switch from the toolbar; a branch held by another worktree, an in-progress merge, or uncommitted changes stop the switch with the reason spelled out (**no `git stash`** — the stash stack is shared across worktrees). Sessions list across branches.
+- **The editor reaches VS Code parity** — full LSP, multiple carets / block selection, folding / guides / sticky headers, regex and glob bulk replace, Emmet, images / PDF / CSV / huge files, and a Markdown preview that renders Mermaid diagrams and TeX math.
+- **Paste images straight in** — `⌘V` / `Ctrl+V`, in every composer in the Cockpit and the deck.
+- **Idle CPU 0.70% → 0.13%** (0.03% unfocused). Repaints are damage-driven only.
+
+**Quality**: CI **green on macOS, Windows and Linux**, **all 2182 tests passing**, **0 build warnings and 0 errors**.
+This release also cures a fatal Linux bug where `kill` could take down every one of your processes, the Windows Cockpit freeze, terminal tiles that stayed black, and the Japanese IME's confirm-Enter leaking through to the agent.
+
+---
+
 ## The view from the cockpit
 
 ### 🎛 See the whole fleet — Agent Cockpit
@@ -778,7 +794,11 @@ src/
 - [x] Unified approval queue (9 kinds, 4 scope levels, audit log, privilege always manual)
 - [x] First-run guided tour (26 steps), a per-agent multiline composer, auto-answered numbered menus / surveys
 - [x] Discoverable as "Zaivern" in the OS process list (all 3 OSes) + 0.13% idle CPU
-- [ ] `zai status --pid-only` (implemented; CLI wiring to come)
+- [x] `zai status --pid-only`
+- [x] Vertical agent deck (cmux-style, running agents only, `⌘⇧L`) + terminal splits
+- [x] Branch switching from the toolbar (refuses with a reason on in-progress operations, branches held by another worktree, or uncommitted changes — never uses `git stash`)
+- [x] Repository-wide session list (folds by branch across worktrees)
+- [x] Command palette reorganized (8 groups, best-match ordering, recents)
 - [ ] Plugin grammars (TextMate) & registry sharing
 - [ ] Split editor
 
