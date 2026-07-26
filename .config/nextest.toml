@@ -1,0 +1,29 @@
+# nextest 設定 — CI 用プロファイル。
+#
+# 背景: terminal:: (実PTY) テストは長寿命の cargo test プロセス内で
+# ログインシェルの孫プロセス (sleep / while-true) をリークさせ、
+# Linux ランナーのハートビート喪失を引き起こしていた。
+# nextest はテストごとにプロセスを分離し、slow-timeout 到達時に
+# プロセスグループごと kill するため、孤児が stdout パイプを
+# 掴み続けることがない。
+#
+# 実行例: cargo nextest run --profile ci -E 'not test(/^terminal::/)'
+
+[profile.ci]
+# 60 秒応答なし × 2 回 (= 120 秒) でプロセスグループごと terminate。
+# SIGTERM 後 5 秒待って SIGKILL。
+slow-timeout = { period = "60s", terminate-after = 2, grace-period = "5s" }
+# テスト終了後、子プロセスが標準出力ハンドルを 1 秒以上握っていたらリーク扱い。
+leak-timeout = "1s"
+# 失敗したテストの出力は失敗時に即表示し、最後にもまとめて再表示。
+failure-output = "immediate-final"
+
+[test-groups]
+# 実PTYテストは同時実行するとシェル起動が競合しフレーキーになるため直列化。
+pty = { max-threads = 1 }
+
+[[profile.ci.overrides]]
+filter = 'test(/^terminal::/)'
+test-group = "pty"
+# 実シェル起動を伴うため通常テストより長めに許容 (120 秒 × 2 回)。
+slow-timeout = { period = "120s", terminate-after = 2, grace-period = "5s" }
