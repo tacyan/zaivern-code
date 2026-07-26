@@ -56,6 +56,11 @@ pub enum BufferKind {
     /// `path` は `Some` (外部変更の mtime 監視で再デコードするため) だが、
     /// `read_only()` が真なので保存・編集の経路には乗らない。
     Image,
+    /// PDF ビューア。抽出したテキストを `text` に持つ**普通の本文タブ**なので、
+    /// 検索・折り返し・コピーがそのまま効く。`path` は `Some` (mtime 監視で
+    /// 再抽出するため) だが、`read_only()` が真なので抽出結果が元の PDF へ
+    /// 書き戻されることはない。
+    Pdf,
 }
 
 impl BufferKind {
@@ -97,6 +102,9 @@ pub struct Buffer {
     pub conflict_notified: Option<SystemTime>,
     /// 画像タブ (`BufferKind::Image`) のデコード済みピクセル。それ以外は None。
     pub image: Option<ImageDoc>,
+    /// PDF タブ (`BufferKind::Pdf`) の抽出待ち。Some の間は本文が
+    /// 「読み込み中…」で、`Editor::poll_pdf_jobs` が完成本文へ差し替える。
+    pub pdf_job: Option<PdfJob>,
 }
 
 /// 画像タブのデコード結果。
@@ -207,6 +215,200 @@ pub const IMAGE_ZOOM_MAX: f32 = 32.0;
 /// 画像ビューア: ズームの段階変更 (dir=+1 拡大 / -1 縮小)。1.25 倍刻み。
 pub fn image_zoom_step(cur: f32, dir: i32) -> f32 {
     (cur * 1.25f32.powi(dir)).clamp(IMAGE_ZOOM_MIN, IMAGE_ZOOM_MAX)
+}
+
+// ─── PDF ビューア (テキスト抽出) ──────────────────────────────────
+//
+// PDF は「読み取り専用のテキストタブ」として開く。専用のレンダラを足さない
+// 代わりに、検索・折り返し・コピー・テーマといった本文タブの機能を丸ごと
+// そのまま使える (`BufferKind::Pdf` は `read_only()` が真なので、保存・
+// 編集・置換の経路には乗らない)。
+//
+// 抽出は pdf-extract (MIT / 純 Rust / lopdf ベース) で行う。ネイティブ
+// ライブラリも実行時ダウンロードも要らないので、素の `cargo build` だけで
+// macOS / Windows / Linux のどれでも同じように動く。
+
+/// PDF ビューアで開く拡張子 (小文字)。
+pub const PDF_EXTS: &[&str] = &["pdf"];
+
+/// 拡張子から PDF ビューアで開くべきパスか判定する (大文字小文字は無視)。
+pub fn is_pdf_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            PDF_EXTS.iter().any(|x| *x == e)
+        })
+        .unwrap_or(false)
+}
+
+/// テキスト抽出を試みる上限バイト数。
+///
+/// pdf-extract の抽出コストはページ数とフォント数に比例し、数十 MB 級の
+/// スキャン PDF では秒単位になりうる。UI スレッドを止めないための防壁。
+/// `MAX_OPEN_BYTES` (50 MB) より小さくしておくことで、「開けないファイル」
+/// ではなく「開けるが抽出だけ諦めるタブ」として出せる。
+pub const PDF_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// `Editor::open` が読み込みを拒否する上限。巨大ログのクリックで
+/// 同期 IO がフリーズするのを防ぐ。
+pub const MAX_OPEN_BYTES: u64 = 50 * 1024 * 1024;
+
+/// PDF からページ単位のテキストを取り出す。
+///
+/// pdf-extract は壊れた / 暗号化された PDF に対して `panic!` することが
+/// あるため (フォント解析まわり)、`catch_unwind` で必ず握り潰す。
+/// app.rs のフレームガードと同じ流儀で、panic は落ちずにメッセージへ落とす。
+pub fn extract_pdf_pages(raw: &[u8]) -> Result<Vec<String>, String> {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem_by_pages(raw)
+    }));
+    match caught {
+        Ok(Ok(pages)) => Ok(pages),
+        Ok(Err(e)) => Err(e.to_string()),
+        // panic の詳細は panic フック (main.rs) が ~/.zaivern/panic.log へ残す
+        Err(_) => Err("内部エラー (詳細: ~/.zaivern/panic.log)".into()),
+    }
+}
+
+/// 抽出したページ群を、ヘッダ + ページ区切り付きの本文へ組み立てる。
+fn pdf_render_pages(header: &str, pages: &[String]) -> String {
+    let total = pages.len();
+    let mut out = String::with_capacity(header.len() + pages.iter().map(|p| p.len() + 32).sum::<usize>());
+    out.push_str(header);
+    for (i, page) in pages.iter().enumerate() {
+        out.push_str(&format!("\n── ページ {} / {} ──\n\n", i + 1, total));
+        let body = page.trim_matches(|c: char| c == '\n' || c == '\r');
+        if body.trim().is_empty() {
+            out.push_str("(このページにテキストはありません)\n");
+        } else {
+            out.push_str(body);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// PDF タブの本文を組み立てる。**絶対に panic しない**: 抽出に失敗しても
+/// 壊れていても、読める日本語のメッセージが入ったテキストを返す。
+///
+/// `file_bytes` はディスク上のサイズ (ヘッダ表示と上限判定に使う)。
+pub fn pdf_buffer_text(name: &str, raw: &[u8], file_bytes: u64) -> String {
+    let size = human_bytes(file_bytes);
+    if file_bytes > PDF_MAX_BYTES {
+        return format!(
+            "📄 {name}\n{size} · 読み取り専用\n\n\
+             ⚠ PDF が大きすぎるためテキスト抽出を省略しました \
+             ({size} > {})。\n外部のビューアで開いてください。\n",
+            human_bytes(PDF_MAX_BYTES)
+        );
+    }
+    match extract_pdf_pages(raw) {
+        Ok(pages) if !pages.is_empty() && pages.iter().any(|p| !p.trim().is_empty()) => {
+            let header = format!(
+                "📄 {name}\n{} ページ · {size} · 読み取り専用\n",
+                pages.len()
+            );
+            pdf_render_pages(&header, &pages)
+        }
+        // ページはあるが全ページ空 = スキャン画像だけの PDF
+        Ok(pages) => format!(
+            "📄 {name}\n{} ページ · {size} · 読み取り専用\n\n\
+             ⚠ この PDF はテキストを抽出できません（画像PDFの可能性があります）\n",
+            pages.len()
+        ),
+        Err(e) => format!(
+            "📄 {name}\n{size} · 読み取り専用\n\n\
+             ⚠ この PDF はテキストを抽出できません（画像PDFの可能性があります）\n\
+             詳細: {e}\n"
+        ),
+    }
+}
+
+/// 抽出完了を待つ本文 (ワーカーへ預けたときのプレースホルダ)。
+pub fn pdf_loading_text(name: &str, file_bytes: u64) -> String {
+    format!(
+        "📄 {name}\n{} · 読み取り専用\n\n⏳ 読み込み中… (テキストを抽出しています)\n",
+        human_bytes(file_bytes)
+    )
+}
+
+/// 同期で抽出完了を待つ上限。
+///
+/// 実測 (macOS / release / 実ファイル 22 本): 中央値 ≈ 33 ms、
+/// 8 割は 250 ms 未満で終わる。一方 139 ページ・11 MB のテキスト主体 PDF は
+/// **6.2 秒**かかった。全部同期にすると後者でウィンドウが数秒固まるので、
+/// この予算内に終わらなければワーカーへ預けて「読み込み中…」を出す。
+pub const PDF_SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// バックグラウンドで走らせている PDF 抽出の受け口。
+///
+/// ワーカー側は必ず 1 回だけ本文を送る (panic も `pdf_buffer_text` の内側で
+/// 握り潰されてメッセージになる)。タブを閉じて受け口ごと落ちても、
+/// 送信が失敗するだけでスレッドは静かに終わる。
+pub struct PdfJob {
+    rx: std::sync::mpsc::Receiver<String>,
+    /// 表示用のファイル名 (スレッドが消えたときのエラー本文に使う)。
+    name: String,
+    file_bytes: u64,
+}
+
+impl PdfJob {
+    /// テスト専用: 任意のチャネルから待ち状態を作る (遅い PDF を用意せずに
+    /// 「読み込み中 → 完成」の差し替えを検証するため)。
+    #[cfg(test)]
+    pub fn for_test(rx: std::sync::mpsc::Receiver<String>, name: &str, file_bytes: u64) -> Self {
+        Self {
+            rx,
+            name: name.to_string(),
+            file_bytes,
+        }
+    }
+
+    /// 完了していれば本文を取り出す。まだなら None (UI は待たない)。
+    pub fn take(&self) -> Option<String> {
+        match self.rx.try_recv() {
+            Ok(text) => Some(text),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            // 送信側が結果を送らずに消えた (通常は起こらない)。
+            // 永久に「読み込み中…」で固まらないよう、必ず終わらせる。
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(format!(
+                "📄 {}\n{} · 読み取り専用\n\n\
+                 ⚠ この PDF はテキストを抽出できません（画像PDFの可能性があります）\n\
+                 詳細: 抽出処理が中断されました\n",
+                self.name,
+                human_bytes(self.file_bytes)
+            )),
+        }
+    }
+}
+
+/// PDF タブの本文を用意する。`PDF_SYNC_BUDGET` 内に終われば完成した本文を、
+/// 間に合わなければ「読み込み中…」と、後で差し替えるための `PdfJob` を返す。
+pub fn start_pdf_extraction(name: &str, raw: Vec<u8>, file_bytes: u64) -> (String, Option<PdfJob>) {
+    // 上限超えはスレッドを起こす前に打ち切る (数十 MB を move しない)
+    if file_bytes > PDF_MAX_BYTES {
+        return (pdf_buffer_text(name, &[], file_bytes), None);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let name_owned = name.to_string();
+    let worker_name = name_owned.clone();
+    std::thread::spawn(move || {
+        let text = pdf_buffer_text(&worker_name, &raw, file_bytes);
+        // 受け口が落ちていれば送信は失敗する。それで正しい (タブを閉じた後)
+        let _ = tx.send(text);
+    });
+    match rx.recv_timeout(PDF_SYNC_BUDGET) {
+        Ok(text) => (text, None),
+        Err(_) => (
+            pdf_loading_text(name, file_bytes),
+            Some(PdfJob {
+                rx,
+                name: name_owned,
+                file_bytes,
+            }),
+        ),
+    }
 }
 
 /// エディタ本文の折り返し幅: ON なら利用可能幅、OFF なら無限 (横スクロール)。
@@ -361,6 +563,7 @@ impl Editor {
             disk_mtime: None,
             conflict_notified: None,
             image: None,
+            pdf_job: None,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -384,7 +587,6 @@ impl Editor {
 
         // 巨大ファイルの防壁: 読み込み自体が UI スレッドの同期 IO なので、
         // 上限なしだと数百 MB のログをクリックした瞬間にフリーズする
-        const MAX_OPEN_BYTES: u64 = 50 * 1024 * 1024;
         if let Ok(m) = std::fs::metadata(&canon) {
             if m.len() > MAX_OPEN_BYTES {
                 return Err(format!(
@@ -424,6 +626,46 @@ impl Editor {
                 disk_mtime: mtime,
                 conflict_notified: None,
                 image: Some(doc),
+                pdf_job: None,
+            });
+            self.active = Some(self.buffers.len() - 1);
+            return Ok(false);
+        }
+        // PDF は抽出したテキストを読み取り専用タブに載せる。バイナリを
+        // textenc に流すと文字化けが本文になってしまうため、画像と同じく
+        // 拡張子で先に振り分ける。抽出失敗・暗号化・破損でも panic せず、
+        // 「読めない理由」を本文にしてタブは必ず開く。
+        if is_pdf_path(&canon) {
+            let title = canon
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "???".into());
+            let id = self.next_id;
+            self.next_id += 1;
+            let mtime = disk_mtime(&canon);
+            // 小さい PDF は 250ms 以内に終わるのでそのまま本文が入る。
+            // 間に合わない大物はワーカーへ預け、「読み込み中…」を出しておく
+            // (`poll_pdf_jobs` が完成本文へ差し替える)。
+            let file_bytes = raw.len() as u64;
+            let (text, job) = start_pdf_extraction(&title, raw, file_bytes);
+            self.buffers.push(Buffer {
+                id,
+                path: Some(canon),
+                kind: BufferKind::Pdf,
+                title,
+                // saved_hash を本文と一致させて dirty() を常に false にする。
+                // read_only() との二重の防御で、抽出テキストが元の PDF へ
+                // 書き戻されることはない。
+                saved_hash: hash_str(&text),
+                text,
+                lang: "Plain Text".into(),
+                encoding: crate::textenc::Encoding::Utf8,
+                cache: None,
+                gutter: None,
+                disk_mtime: mtime,
+                conflict_notified: None,
+                image: None,
+                pdf_job: job,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -452,6 +694,7 @@ impl Editor {
             disk_mtime: mtime,
             conflict_notified: None,
             image: None,
+            pdf_job: None,
         });
         self.active = Some(self.buffers.len() - 1);
         Ok(false)
@@ -492,6 +735,7 @@ impl Editor {
             disk_mtime: None,
             conflict_notified: None,
             image: None,
+            pdf_job: None,
         });
         self.active = Some(self.buffers.len() - 1);
         id
@@ -516,6 +760,26 @@ impl Editor {
                 return false;
             }
             b.image = Some(decode_image_doc(&raw, raw.len() as u64));
+            b.disk_mtime = m;
+            b.conflict_notified = None;
+            return true;
+        }
+        // PDF タブも同じく再抽出する。dirty() にならないよう saved_hash を
+        // 本文へ合わせ直すのを忘れないこと (合わせないと「未保存の変更あり」
+        // 扱いになり、終了時に保存を促されてしまう)。
+        if b.kind == BufferKind::Pdf {
+            if m == b.disk_mtime {
+                return false;
+            }
+            let file_bytes = raw.len() as u64;
+            let (text, job) = start_pdf_extraction(&b.title, raw, file_bytes);
+            b.saved_hash = hash_str(&text);
+            b.text = text;
+            // 走っていた古い抽出は捨てる (受け口を落とせばワーカーの送信は
+            // 失敗するだけ)。差し替え後の本文を古い結果で上書きしない
+            b.pdf_job = job;
+            b.cache = None;
+            b.gutter = None;
             b.disk_mtime = m;
             b.conflict_notified = None;
             return true;
@@ -546,9 +810,38 @@ impl Editor {
         true
     }
 
+    /// 終わったバックグラウンド PDF 抽出の結果を本文へ差し替える。
+    /// 差し替えたら true (呼び出し側の再描画判断用)。待ちはしない。
+    ///
+    /// 呼び口は `check_external` (app.rs が約 1 秒ごとに叩く)。egui は
+    /// 250ms ごとの再描画予約が入っているので、抽出完了から遅くとも
+    /// 1 秒強で「読み込み中…」が本文へ変わる。
+    pub fn poll_pdf_jobs(&mut self) -> bool {
+        let mut changed = false;
+        for b in &mut self.buffers {
+            if b.kind != BufferKind::Pdf {
+                continue;
+            }
+            let Some(text) = b.pdf_job.as_ref().and_then(|j| j.take()) else {
+                continue;
+            };
+            // 読み取り専用タブなので dirty にしない (saved_hash も合わせる)
+            b.saved_hash = hash_str(&text);
+            b.text = text;
+            b.pdf_job = None;
+            b.cache = None;
+            b.gutter = None;
+            changed = true;
+        }
+        changed
+    }
+
     /// 全バッファの外部変更を確認する。クリーンなバッファは自動で読み直し、
     /// 未保存の編集と競合したバッファは一度だけ Conflict を報告する。
     pub fn check_external(&mut self) -> Vec<ExternalEvent> {
+        // 走り終わった PDF 抽出をここで拾う (専用のポーリングを app.rs へ
+        // 足さずに済むよう、既存の 1 秒ポーリングへ相乗りする)
+        self.poll_pdf_jobs();
         let mut events = Vec::new();
         for i in 0..self.buffers.len() {
             let Some(path) = self.buffers[i].path.clone() else {
@@ -901,6 +1194,243 @@ mod tests {
         assert!((image_zoom_step(1.25, -1) - 1.0).abs() < 1e-6);
         assert_eq!(image_zoom_step(IMAGE_ZOOM_MAX, 1), IMAGE_ZOOM_MAX);
         assert_eq!(image_zoom_step(IMAGE_ZOOM_MIN, -1), IMAGE_ZOOM_MIN);
+    }
+
+    // ─── PDF ビューア ────────────────────────────────────────────
+
+    /// 依存なしで最小の有効な PDF を組み立てる (1 ページ 1 行の Helvetica)。
+    /// xref のオフセットを実バイト位置から作るので、ページ数を変えても壊れない。
+    fn make_pdf(pages: &[&str]) -> Vec<u8> {
+        let n = pages.len();
+        let font_id = 3 + 2 * n;
+        let mut objs: Vec<String> = Vec::new();
+        objs.push("<< /Type /Catalog /Pages 2 0 R >>".into());
+        let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 3 + 2 * i)).collect();
+        objs.push(format!(
+            "<< /Type /Pages /Kids [{}] /Count {n} >>",
+            kids.join(" ")
+        ));
+        for (i, body) in pages.iter().enumerate() {
+            let content_id = 4 + 2 * i;
+            objs.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>"
+            ));
+            let stream = format!("BT /F1 24 Tf 72 700 Td ({body}) Tj ET\n");
+            objs.push(format!(
+                "<< /Length {} >>\nstream\n{stream}endstream",
+                stream.len()
+            ));
+        }
+        objs.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into());
+
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<usize> = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref_off = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", objs.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n",
+                objs.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    fn write_pdf(path: &Path, pages: &[&str]) {
+        std::fs::write(path, make_pdf(pages)).expect("write pdf");
+    }
+
+    #[test]
+    fn pdf_extension_routing_table() {
+        for name in ["a.pdf", "a.PDF", "a.Pdf", "dir.d/報告書.pDf"] {
+            assert!(is_pdf_path(Path::new(name)), "{name} は PDF として開く");
+        }
+        // 拡張子が違う・無い・紛らわしいものはテキスト/画像のまま
+        for name in ["a.pd", "a.pdfx", "a.png", "a.txt", "pdf", ".pdf.txt", "Makefile"] {
+            assert!(!is_pdf_path(Path::new(name)), "{name} は PDF 扱いしない");
+        }
+        // 画像経路と食い合わない
+        assert!(!is_image_path(Path::new("a.pdf")));
+    }
+
+    #[test]
+    fn open_pdf_becomes_readonly_text_buffer() {
+        let dir = unique_temp_dir("zaivern-editor-test", "pdf-open");
+        let path = dir.join("hello.pdf");
+        write_pdf(&path, &["Hello Zaivern"]);
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+        let b = &ed.buffers[0];
+        assert_eq!(b.kind, BufferKind::Pdf);
+        assert!(b.kind.read_only(), "PDF タブは読み取り専用");
+        assert!(!b.dirty(), "開いた直後に dirty にならない");
+        assert!(b.text.contains("Hello Zaivern"), "本文: {}", b.text);
+        assert!(b.text.contains("hello.pdf"), "ヘッダにファイル名");
+        assert!(b.text.contains("1 ページ"), "ヘッダにページ数");
+        assert!(b.text.contains("── ページ 1 / 1 ──"), "ページ区切り");
+    }
+
+    #[test]
+    fn open_multipage_pdf_numbers_every_page() {
+        let dir = unique_temp_dir("zaivern-editor-test", "pdf-pages");
+        let path = dir.join("multi.pdf");
+        write_pdf(&path, &["Page One", "Page Two", "Page Three"]);
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+        let t = &ed.buffers[0].text;
+        assert!(t.contains("3 ページ"), "ページ総数: {t}");
+        for i in 1..=3 {
+            assert!(t.contains(&format!("── ページ {i} / 3 ──")), "区切り {i}: {t}");
+        }
+        for body in ["Page One", "Page Two", "Page Three"] {
+            assert!(t.contains(body), "{body} が本文にある");
+        }
+        // ページ順が保たれている
+        let (a, b) = (t.find("Page One").unwrap(), t.find("Page Three").unwrap());
+        assert!(a < b, "ページ順");
+    }
+
+    #[test]
+    fn corrupt_pdf_opens_with_readable_message() {
+        let dir = unique_temp_dir("zaivern-editor-test", "pdf-corrupt");
+        let path = dir.join("broken.pdf");
+        // %PDF ヘッダだけ本物でオブジェクトはでたらめ (暗号化/破損の代表)
+        let mut junk = b"%PDF-1.7\n".to_vec();
+        junk.extend((0u16..4096).map(|i| (i.wrapping_mul(7) ^ 0x5a) as u8));
+        std::fs::write(&path, &junk).expect("write");
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false), "壊れた PDF でも panic せず開ける");
+        let b = &ed.buffers[0];
+        assert_eq!(b.kind, BufferKind::Pdf);
+        assert!(!b.dirty(), "壊れた PDF でも dirty にならない");
+        assert!(
+            b.text.contains("テキストを抽出できません"),
+            "読める説明が入る: {}",
+            b.text
+        );
+        // バイナリの文字化けを本文に流し込んでいない
+        assert!(!b.text.contains('\u{fffd}'), "置換文字を含まない");
+    }
+
+    #[test]
+    fn empty_and_garbage_bytes_never_panic() {
+        // 空・テキスト・NUL 混じり — どれもメッセージ入りの本文になるだけ
+        for raw in [&b""[..], b"not a pdf at all", b"\x00\x01\x02\xff\xfe"] {
+            let t = pdf_buffer_text("x.pdf", raw, raw.len() as u64);
+            assert!(t.contains("x.pdf"), "ヘッダは必ず付く");
+            assert!(t.contains("テキストを抽出できません"), "説明が入る: {t}");
+        }
+    }
+
+    #[test]
+    fn pdf_size_cap_skips_extraction() {
+        // 上限超えは抽出せず、理由を本文にする (中身は読まないので raw は空でよい)
+        let t = pdf_buffer_text("huge.pdf", b"", PDF_MAX_BYTES + 1);
+        assert!(t.contains("大きすぎる"), "上限超えの説明: {t}");
+        assert!(t.contains("huge.pdf"));
+        assert!(!t.contains("── ページ"), "ページ本文は組み立てない");
+        // 上限ちょうどは通常経路 (抽出を試みる)
+        let t = pdf_buffer_text("edge.pdf", b"", PDF_MAX_BYTES);
+        assert!(!t.contains("大きすぎる"), "境界値は抽出を試みる: {t}");
+        // open() の 50 MB 制限より小さくないと、この分岐へ到達できない
+        assert!(PDF_MAX_BYTES < MAX_OPEN_BYTES, "抽出上限は読み込み上限より小さい");
+    }
+
+    #[test]
+    fn pdf_external_change_reextracts_and_stays_clean() {
+        let dir = unique_temp_dir("zaivern-editor-test", "pdf-reload");
+        let path = dir.join("doc.pdf");
+        write_pdf(&path, &["Before Edit"]);
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+        assert!(ed.buffers[0].text.contains("Before Edit"));
+
+        write_pdf(&path, &["After Edit", "Second Page"]);
+        bump_mtime(&path);
+        let events = ed.check_external();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ExternalEvent::Reloaded { .. }));
+        let b = &ed.buffers[0];
+        assert!(b.text.contains("After Edit"), "再抽出される: {}", b.text);
+        assert!(b.text.contains("2 ページ"), "ページ数も更新される");
+        assert!(!b.dirty(), "再抽出しても dirty にならない");
+    }
+
+    #[test]
+    fn small_pdf_finishes_inside_sync_budget() {
+        // 実測: 実ファイル 22 本の中央値 ≈ 33 ms。小さい PDF は同期で
+        // 終わるので「読み込み中…」を経由しない (ジョブは残らない)
+        let raw = make_pdf(&["Fast Path"]);
+        let n = raw.len() as u64;
+        let t = std::time::Instant::now();
+        let (text, job) = start_pdf_extraction("fast.pdf", raw, n);
+        assert!(t.elapsed() < PDF_SYNC_BUDGET * 2, "同期予算の範囲で戻る");
+        assert!(job.is_none(), "小さい PDF は待ちにならない");
+        assert!(text.contains("Fast Path"), "本文が入っている: {text}");
+        assert!(!text.contains("読み込み中"), "プレースホルダのままにしない");
+    }
+
+    #[test]
+    fn pending_pdf_shows_placeholder_then_fills_in() {
+        // 遅い PDF の代わりにチャネルを直接握って「読み込み中 → 完成」を再現
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut ed = Editor::new();
+        ed.open_virtual("slow.pdf".into(), String::new(), BufferKind::Pdf);
+        let placeholder = pdf_loading_text("slow.pdf", 1234);
+        {
+            let b = &mut ed.buffers[0];
+            b.saved_hash = hash_str(&placeholder);
+            b.text = placeholder;
+            b.pdf_job = Some(PdfJob::for_test(rx, "slow.pdf", 1234));
+        }
+        assert!(ed.buffers[0].text.contains("読み込み中"), "まずは待ち表示");
+        assert!(!ed.poll_pdf_jobs(), "未完了なら本文を触らない");
+        assert!(!ed.buffers[0].dirty(), "待っている間も dirty にならない");
+
+        tx.send("📄 slow.pdf\n1 ページ · 1.2 KB · 読み取り専用\n\n本文だよ\n".into())
+            .expect("send");
+        assert!(ed.poll_pdf_jobs(), "完了したら差し替える");
+        let b = &ed.buffers[0];
+        assert!(b.text.contains("本文だよ"), "完成本文へ差し替わる: {}", b.text);
+        assert!(!b.text.contains("読み込み中"));
+        assert!(!b.dirty(), "差し替え後も dirty にならない");
+        assert!(b.pdf_job.is_none(), "ジョブは畳まれる");
+        assert!(!ed.poll_pdf_jobs(), "二度目は何もしない");
+    }
+
+    #[test]
+    fn dropped_pdf_worker_never_hangs_on_placeholder() {
+        // ワーカーが結果を送らずに消えても「読み込み中…」で固まらない
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        drop(tx);
+        let job = PdfJob::for_test(rx, "gone.pdf", 4096);
+        let text = job.take().expect("必ず終わらせる");
+        assert!(text.contains("gone.pdf"));
+        assert!(text.contains("テキストを抽出できません"), "{text}");
+    }
+
+    #[test]
+    fn pdf_page_rendering_marks_empty_pages() {
+        // 抽出できたページが空でも「無い」ことが分かるようにする
+        let out = pdf_render_pages("H\n", &["a".into(), "   ".into()]);
+        assert!(out.starts_with("H\n"));
+        assert!(out.contains("── ページ 1 / 2 ──"));
+        assert!(out.contains("── ページ 2 / 2 ──"));
+        assert!(out.contains("(このページにテキストはありません)"));
     }
 
     #[test]

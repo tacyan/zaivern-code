@@ -27,6 +27,14 @@ qrcode = { version = "0.14", default-features = false }
 # egui-winit も arboard を使うが image-data feature なしのため直接依存する。
 # wayland-data-control は Linux (Wayland) 専用で他 OS のビルドには影響しない。
 arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
+# PDF タブのテキスト抽出 (editor.rs の BufferKind::Pdf)。
+# ライセンス MIT / 純 Rust (lopdf ベース)。ネイティブライブラリも
+# 実行時ダウンロードも要らないので、素の `cargo build` だけで
+# macOS / Windows / Linux が通る。
+#   * mupdf は AGPL-3.0 で本プロジェクト (Apache-2.0) と両立しない
+#   * pdfium-render は OS ごとの prebuilt libpdfium が要る
+# のでいずれも採らない。
+pdf-extract = "0.12"
 
 # セッション破棄時のプロセス**グループ**への killpg (procx::kill_tree)。
 # portable-pty は子を setsid するため pgid == pid で、グループごと落とせば
