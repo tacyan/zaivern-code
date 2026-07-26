@@ -24,6 +24,7 @@ mod highlight;
 mod html;
 mod i18n;
 mod ide;
+mod instances;
 mod jsonc;
 mod kanban;
 mod keybinds;
@@ -83,6 +84,10 @@ fn main() -> eframe::Result<()> {
     // どこで落ちても追えるよう、panic は必ず ~/.zaivern/panic.log にも残す。
     install_panic_log();
 
+    // ps/top で見つけやすいプロセス名にする (Linux のみ実効。他 OS は
+    // 実行ファイル名がそのままアクティビティモニタ等に出る)。
+    instances::set_process_name();
+
     // サブコマンド指定なら CLI として処理して終了する。
     // 引数なし / パス指定のときは None が返り、そのまま GUI 起動へ進む。
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -117,6 +122,11 @@ fn main() -> eframe::Result<()> {
         roots.push(std::path::PathBuf::from("."));
     }
 
+    // 実行中インスタンスとして登録する (~/.zaivern/instances/<pid>.json)。
+    // `zai status` やスクリプトがどの OS でも「アプリが起動しているか」を
+    // 検知できる経路になる。書けなくても起動は止めない (fail-soft)。
+    let instance_guard = instances::register_current(&roots);
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1480.0, 940.0])
         .with_min_inner_size([860.0, 560.0])
@@ -133,11 +143,15 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Zaivern Code",
         options,
         Box::new(move |cc| Ok(Box::new(app::ZaivernApp::new(cc, roots, files)))),
-    )
+    );
+    // 正常終了: 自分のレジストリファイルを消す。panic の巻き戻しでも
+    // RegistryGuard の Drop が同じ後始末をする (残骸はスキャン時にも掃除される)。
+    drop(instance_guard);
+    result
 }
 
 /// panic の詳細を `~/.zaivern/panic.log` へ追記するフックを仕込む。

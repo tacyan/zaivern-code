@@ -223,6 +223,10 @@ Zaivern Code — CLI 制御チャネル
   zai status <テキスト>                 ステータスバーの表示を変える
   zai state                             実行中インスタンスの状態を JSON で出力
 
+実行検知 (どの OS でもスクリプトから起動を確認できます):
+  zai status                            実行中の Zaivern Code を一覧 (終了コード: 0=あり 1=なし)
+  zai status --json                     一覧を JSON で出力
+
 プラグイン (エディタが起動していなくても使えます):
   zai plugin list                       導入済みプラグインを一覧表示
   zai plugin new <名前>                 雛形を作成してパスを表示
@@ -273,6 +277,11 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
             println!("Zaivern Code {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
+        // テキスト付きは従来どおりステータスバー更新 (下の run_remote へ落ちる)。
+        "status" if status_list_mode(rest).is_some() => {
+            run_status_list(&crate::instances::instances_dir(), status_list_mode(rest) == Some(true))
+        }
         "plugin" => run_plugin(rest),
         "app" => crate::desktop::run(rest),
         "firewall" => crate::firewall::run(rest),
@@ -289,6 +298,39 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
             }
         },
     })
+}
+
+// ───────────────────────── status: 実行検知 (インスタンス不要) ─────────────────────────
+
+/// `zai status` を「実行中インスタンスの一覧表示」として扱うか。
+/// `Some(json)` = レジストリ一覧 (ローカルで完結)、`None` = 従来の
+/// ステータスバー更新 (テキスト付き — 実行中のエディタへリモート送信)。
+fn status_list_mode(args: &[String]) -> Option<bool> {
+    match args {
+        [] => Some(false),
+        [flag] if flag == "--json" => Some(true),
+        _ => None,
+    }
+}
+
+/// レジストリ (`~/.zaivern/instances`) を走査して一覧を出す。
+/// 終了コード: 0 = 1 つ以上実行中、1 = なし (スクリプト/CI から使える)。
+fn run_status_list(dir: &std::path::Path, json: bool) -> i32 {
+    let entries = crate::instances::scan_and_prune(dir);
+    if json {
+        println!("{}", crate::instances::render_json(&entries));
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        println!("{}", crate::instances::render_table(&entries, now));
+    }
+    if entries.is_empty() {
+        1
+    } else {
+        0
+    }
 }
 
 // ───────────────────────── 引数ヘルパ ─────────────────────────
@@ -621,6 +663,43 @@ mod tests {
     #[test]
     fn pid_zero_is_not_alive() {
         assert!(!pid_alive(0));
+    }
+
+    // ── status: 実行検知 ──
+
+    #[test]
+    fn status_list_mode_classification() {
+        // 引数なし = 一覧 (テーブル)、--json のみ = 一覧 (JSON)
+        assert_eq!(status_list_mode(&[]), Some(false));
+        assert_eq!(status_list_mode(&v(&["--json"])), Some(true));
+        // テキスト付きは従来のステータスバー更新 (リモート) のまま
+        assert_eq!(status_list_mode(&v(&["hello"])), None);
+        assert_eq!(status_list_mode(&v(&["--json", "x"])), None);
+        assert_eq!(status_list_mode(&v(&["ビルド中…"])), None);
+    }
+
+    #[test]
+    fn status_list_empty_dir_exits_one() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-cli-test", "status-empty");
+        assert_eq!(run_status_list(&dir, false), 1, "実行中なし = 終了コード 1");
+        assert_eq!(run_status_list(&dir, true), 1);
+        // 存在しないディレクトリでも落ちずに 1
+        assert_eq!(run_status_list(&dir.join("ghost"), false), 1);
+    }
+
+    #[test]
+    fn status_list_running_instance_exits_zero() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-cli-test", "status-alive");
+        let _guard = crate::instances::register_in(&dir, &[std::path::PathBuf::from("/ws")])
+            .expect("register");
+        assert_eq!(run_status_list(&dir, false), 0, "実行中あり = 終了コード 0");
+        assert_eq!(run_status_list(&dir, true), 0);
+    }
+
+    #[test]
+    fn help_lists_status_detection() {
+        assert!(HELP.contains("zai status --json"));
+        assert!(HELP.contains("実行検知"));
     }
 
     // ── 引数ヘルパ ──
