@@ -948,7 +948,11 @@ mod vscode_git_colors {
 
 /// FileStatus に対応する VS Code 風カラー (テーマの明暗で切替) と
 /// ステータスバッジ文字・ホバー説明。
-fn git_status_style(
+///
+/// ダーク/ライトで別の色を返すので、どちらのテーマでもバッジと
+/// フォルダの淡色が背景から浮く (git_panel の PR レビュー表示でも同じ関数を使い、
+/// ツリーとレビューで色の意味がずれないようにしている)。
+pub(crate) fn git_status_style(
     status: crate::git::FileStatus,
     theme: &Theme,
 ) -> (egui::Color32, &'static str, &'static str) {
@@ -1027,17 +1031,35 @@ impl FileTree {
                     st.store(&ctx);
                 }
 
-                let (dir_color, dir_badge) = if cut_pending {
-                    (theme.text.gamma_multiply(0.5), String::new())
+                // 折りたたんだままでも「下で何か変わった」が分かるよう、
+                // 配下の変更件数を常にバッジに出す (深さは問わない)。
+                let (dir_color, dir_badge, dir_hint) = if cut_pending {
+                    (theme.text.gamma_multiply(0.5), String::new(), String::new())
                 } else if let Some((st_type, count)) = gitinfo.dir_status(&e.path) {
-                    let (c, b, _) = git_status_style(st_type, theme);
-                    (c, format!(" {b}•{count}"))
+                    let (c, b, h) = git_status_style(st_type, theme);
+                    (
+                        c,
+                        format!(" {b}•{count}"),
+                        format!(
+                            "{}\n{}",
+                            trf("配下に {n} 件の変更", &[("n", count.to_string())]),
+                            tr(h)
+                        ),
+                    )
                 } else {
-                    (theme.text, String::new())
+                    (theme.text, String::new(), String::new())
                 };
 
                 let hr = st.show_header(ui, |ui| {
-                    ui.selectable_label(sel, RichText::new(format!("📁 {}{}", e.name, dir_badge)).color(dir_color))
+                    let r = ui.selectable_label(
+                        sel,
+                        RichText::new(format!("📁 {}{}", e.name, dir_badge)).color(dir_color),
+                    );
+                    if dir_hint.is_empty() {
+                        r
+                    } else {
+                        r.on_hover_text(&dir_hint)
+                    }
                 });
                 let (_, header, _) =
                     hr.body(|ui| self.dir_ui(ui, &e.path, theme, gitinfo, actions, depth + 1));
@@ -1733,5 +1755,49 @@ mod tests {
         // バッジは VS Code 同様の 1 文字
         assert_eq!(git_status_style(FileStatus::Conflicted, &dark).1, "C");
         assert_eq!(git_status_style(FileStatus::Untracked, &dark).1, "U");
+    }
+
+    /// 全ステータス × 全テーマで、色がパネル背景から十分に浮くこと。
+    /// (ライトテーマで明るい緑を使うと消える、といった事故を止める)
+    #[test]
+    fn git_status_colors_are_legible_in_every_theme() {
+        use crate::git::FileStatus;
+        // sRGB の相対輝度 (WCAG)。
+        let lum = |c: egui::Color32| {
+            let f = |v: u8| {
+                let s = v as f32 / 255.0;
+                if s <= 0.03928 {
+                    s / 12.92
+                } else {
+                    ((s + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+        };
+        let contrast = |a: egui::Color32, b: egui::Color32| {
+            let (x, y) = (lum(a), lum(b));
+            let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+            (hi + 0.05) / (lo + 0.05)
+        };
+        let statuses = [
+            FileStatus::Modified,
+            FileStatus::Added,
+            FileStatus::Untracked,
+            FileStatus::Deleted,
+            FileStatus::Renamed,
+            FileStatus::Conflicted,
+        ];
+        for theme in crate::theme::all() {
+            for st in statuses {
+                let (c, badge, hint) = git_status_style(st, &theme);
+                assert!(!badge.is_empty() && !hint.is_empty(), "{st:?} のバッジ/説明");
+                let ratio = contrast(c, theme.panel);
+                assert!(
+                    ratio >= 3.0,
+                    "{} テーマの {st:?} が背景に埋もれる (コントラスト比 {ratio:.2})",
+                    theme.name
+                );
+            }
+        }
     }
 }

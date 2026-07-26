@@ -238,9 +238,21 @@ impl Git {
 
     /// 相対ディレクトリパス配下の代表ステータスと変更件数。
     /// スキャン時に事前集計した dir_cache の O(1) 参照 (描画毎の全走査をしない)。
+    ///
+    /// サブモジュールは外側 repo の status に「ディレクトリ 1 エントリ」
+    /// (` M sub`) として出るため dir_cache には入らない。その場合だけ
+    /// ファイル側のエントリへフォールバックし、フォルダ行にも色を出す。
+    /// 中身のパス (`sub/x.rs`) は外側の status に一切現れないので、
+    /// 内側リポジトリの変更が外側に誤って染み出すことはない。
     pub fn dir_status(&self, rel_dir: &str) -> Option<(FileStatus, usize)> {
         let key = rel_dir.trim_end_matches('/');
-        self.dir_cache.get(key).copied()
+        if let Some(v) = self.dir_cache.get(key) {
+            return Some(*v);
+        }
+        if key.is_empty() {
+            return None;
+        }
+        self.status_cache.get(key).map(|s| (*s, 1))
     }
 
     /// 相対ディレクトリ直下の「git 上は削除済み」ファイル名 (幽霊行表示用)。
@@ -469,16 +481,47 @@ fn effective_status(x: char, y: char) -> Option<FileStatus> {
     None
 }
 
+/// `status --porcelain=v1 -z` のパース結果。
+#[derive(Default, Debug, PartialEq, Eq)]
+struct ParsedStatus {
+    /// 相対パス → 実効ステータス (ツリーに実体がある側)。
+    files: HashMap<String, FileStatus>,
+    /// リネーム/コピーの (旧パス, 新パス)。旧パスはツリーに実体が無いが、
+    /// 「ここから何かが動いた」を見せるため旧側の親フォルダも色付ける材料にする。
+    renames: Vec<(String, String)>,
+}
+
+/// 祖先ディレクトリ集計を辿る最大深さ (病的に深いパスでのメモリ暴走止め)。
+/// file_tree 側の描画上限 (depth 24) より十分深い。
+const MAX_DIR_DEPTH: usize = 64;
+
+/// `path` の祖先ディレクトリを浅い順に返す ("" = repo ルートを必ず含む)。
+/// 末尾 `/` 付き (ネストした未追跡 repo の `?? inner/` 形) も、
+/// そのディレクトリ自身が最後の要素として得られる。
+fn ancestor_dirs(path: &str) -> Vec<&str> {
+    let mut v = vec![""];
+    let mut idx = 0;
+    while let Some(pos) = path[idx..].find('/') {
+        idx += pos;
+        if v.len() >= MAX_DIR_DEPTH {
+            break;
+        }
+        v.push(&path[..idx]);
+        idx += 1;
+    }
+    v
+}
+
 /// `status --porcelain=v1 -z` の出力をパースする。
 ///
 /// NUL 区切りなのでパスの引用・エスケープが無く、リネームは
-/// `XY <new>\0<old>\0` の 2 トークン組で届く (旧パスは読み捨てる)。
+/// `XY <new>\0<old>\0` の 2 トークン組で届く。
 /// `cap` 件を超えたら打ち切り、取り込めた分だけ返す (巨大 repo の劣化運転)。
-fn parse_porcelain_z(output: &str, cap: usize) -> HashMap<String, FileStatus> {
-    let mut map = HashMap::new();
+fn parse_porcelain_z(output: &str, cap: usize) -> ParsedStatus {
+    let mut out = ParsedStatus::default();
     let mut tokens = output.split('\0');
     while let Some(tok) = tokens.next() {
-        if map.len() >= cap {
+        if out.files.len() >= cap {
             break;
         }
         let mut chars = tok.chars();
@@ -489,37 +532,60 @@ fn parse_porcelain_z(output: &str, cap: usize) -> HashMap<String, FileStatus> {
         if path.is_empty() {
             continue;
         }
-        // リネーム/コピーは次のトークンが旧パス。ここで消費して読み捨てる。
-        if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
-            let _ = tokens.next();
-        }
+        // リネーム/コピーは次のトークンが旧パス。ここで消費する。
+        let orig = if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
+            tokens.next().filter(|s| !s.is_empty()).map(str::to_string)
+        } else {
+            None
+        };
         if let Some(status) = effective_status(x, y) {
-            map.insert(path.to_string(), status);
+            if let Some(o) = orig {
+                if o != path {
+                    out.renames.push((o, path.to_string()));
+                }
+            }
+            out.files.insert(path.to_string(), status);
         }
     }
-    map
+    out
 }
 
 /// 変更ファイル群から祖先ディレクトリの集計を導出する。
 ///
 /// キーは相対ディレクトリ ("" = repo ルート)。値は (代表ステータス, 件数)。
 /// VS Code 同様、配下が単一種ならその色、混在なら Modified の色調で塗る。
-fn derive_dir_status(files: &HashMap<String, FileStatus>) -> HashMap<String, (FileStatus, usize)> {
+///
+/// **深さは問わない**: `a/b/c/d/e/f/g.rs` の 1 変更で `a` … `a/b/c/d/e/f` と
+/// ルート `""` の全てに色と件数が乗る (折りたたんだままでも「下で何か
+/// 変わった」が見える)。スキャン 1 回につき 1 度だけ計算し、描画側は
+/// このマップを O(1) で引くだけ (毎フレームのツリー走査をしない)。
+///
+/// リネームは旧パス側の親も色付けるが、**新パスと共有する祖先では
+/// 件数を二重に数えない** (ルートの件数が変更ファイル数と食い違わないように)。
+fn derive_dir_status(
+    files: &HashMap<String, FileStatus>,
+    renames: &[(String, String)],
+) -> HashMap<String, (FileStatus, usize)> {
     let mut dirs: HashMap<String, (FileStatus, usize)> = HashMap::new();
-    for (path, st) in files {
-        let mut bump = |dir: &str| {
-            let e = dirs.entry(dir.to_string()).or_insert((*st, 0));
+    let mut bump = |dir: &str, st: FileStatus, count: bool| {
+        let e = dirs.entry(dir.to_string()).or_insert((st, 0));
+        if count {
             e.1 += 1;
-            if e.0 != *st {
-                e.0 = FileStatus::Modified;
-            }
-        };
-        bump("");
-        let mut idx = 0;
-        while let Some(pos) = path[idx..].find('/') {
-            idx += pos;
-            bump(&path[..idx]);
-            idx += 1;
+        }
+        if e.0 != st {
+            e.0 = FileStatus::Modified;
+        }
+    };
+    for (path, st) in files {
+        for d in ancestor_dirs(path) {
+            bump(d, *st, true);
+        }
+    }
+    for (old, new) in renames {
+        let shared: Vec<&str> = ancestor_dirs(new);
+        for d in ancestor_dirs(old) {
+            // 新パスと共有する祖先は既に新パス側で 1 件数えている。
+            bump(d, FileStatus::Renamed, !shared.contains(&d));
         }
     }
     dirs
@@ -555,9 +621,10 @@ fn scan_status(workspace: &Path) -> Option<StatusSnapshot> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let files = parse_porcelain_z(&text, MAX_STATUS_ENTRIES);
-    let dirs = derive_dir_status(&files);
-    let deleted_by_dir = derive_deleted_by_dir(&files);
+    let parsed = parse_porcelain_z(&text, MAX_STATUS_ENTRIES);
+    let dirs = derive_dir_status(&parsed.files, &parsed.renames);
+    let deleted_by_dir = derive_deleted_by_dir(&parsed.files);
+    let files = parsed.files;
     Some(StatusSnapshot {
         files,
         dirs,
@@ -701,19 +768,7 @@ index 1234567..89abcde 100644
 
     /// `git init` した使い捨てリポジトリを作る。git が無い環境では None。
     fn temp_repo(tag: &str) -> Option<PathBuf> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "zaivern-git-test-{}-{}-{}-{}",
-            tag,
-            std::process::id(),
-            nanos,
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
+        let dir = crate::test_util::unique_temp_dir("zaivern-git-test", tag);
         std::fs::create_dir_all(&dir).expect("create temp repo dir");
         let ok = Command::new("git")
             .arg("-C")
@@ -781,6 +836,71 @@ index 1234567..89abcde 100644
         std::fs::remove_dir_all(&repo).ok();
     }
 
+    /// マルチルート: 各ルートが独立に集計され、どのルートにも属さない
+    /// パスは無視される (別ワークスペースの色が混ざらない)。
+    #[test]
+    fn multi_root_workspaces_stay_isolated() {
+        let (Some(r1), Some(r2)) = (temp_repo("multi-a"), temp_repo("multi-b")) else {
+            return;
+        };
+        // 未追跡ディレクトリは status が `?? deep/` と畳んで報告するため、
+        // 「深い階層の 1 ファイルだけ変更」を作るには一度コミットしておく。
+        let commit = |dir: &PathBuf, name: &str, body: &str| {
+            std::fs::create_dir_all(dir.join("deep/one/two")).expect("mkdir");
+            std::fs::write(dir.join("deep/one/two").join(name), "base\n").expect("seed");
+            let git = |args: &[&str]| {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(["-c", "user.name=zv", "-c", "user.email=zv@example.com"])
+                    .args(args)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            };
+            git(&["add", "-A"]);
+            git(&["commit", "--quiet", "-m", "seed"]);
+            std::fs::write(dir.join("deep/one/two").join(name), body).expect("modify");
+        };
+        commit(&r1, "a.rs", "a changed\n");
+        commit(&r2, "b.rs", "b changed\n");
+
+        let c1 = crate::pathx::canonical(&r1);
+        let c2 = crate::pathx::canonical(&r2);
+        let mut set = GitSet::new(vec![c1.clone(), c2.clone()]);
+        assert_eq!(set.repo_count(), 2, "別 repo は別々に持つ");
+
+        // 同期的にスキャンを取り込む (バックグラウンドの完了を待つ)
+        for _ in 0..200 {
+            set.refresh_if_stale();
+            if set.dirty_count() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            set.file_status(&c1.join("deep/one/two/a.rs")),
+            Some(FileStatus::Modified)
+        );
+        assert_eq!(
+            set.file_status(&c2.join("deep/one/two/b.rs")),
+            Some(FileStatus::Modified)
+        );
+        // ルート 1 の集計にルート 2 のファイルは入らない
+        assert_eq!(set.file_status(&c1.join("deep/one/two/b.rs")), None);
+        assert_eq!(set.dir_status(&c1.join("deep/one")).map(|d| d.1), Some(1));
+        assert_eq!(set.dir_status(&c2.join("deep/one")).map(|d| d.1), Some(1));
+        // どのルートにも属さないパスは完全に無視する
+        let outside = crate::pathx::canonical(&std::env::temp_dir()).join("zv-not-a-root/x.rs");
+        assert_eq!(set.file_status(&outside), None);
+        assert_eq!(set.dir_status(&outside), None);
+        assert!(set.deleted_names_in(&outside).is_empty());
+
+        std::fs::remove_dir_all(&r1).ok();
+        std::fs::remove_dir_all(&r2).ok();
+    }
+
     #[test]
     fn non_repo_root_yields_no_repo() {
         let dir = std::env::temp_dir().join(format!(
@@ -809,7 +929,13 @@ index 1234567..89abcde 100644
         let out = " M src/app.rs\0A  src/new.rs\0?? notes.txt\0 D gone.rs\0\
                    R  renamed.rs\0old.rs\0UU conflict.rs\0AM both.rs\0MD gone2.rs\0\
                    !! target/ignored.rs\0";
-        let map = parse_porcelain_z(out, MAX_STATUS_ENTRIES);
+        let parsed = parse_porcelain_z(out, MAX_STATUS_ENTRIES);
+        assert_eq!(
+            parsed.renames,
+            vec![("old.rs".to_string(), "renamed.rs".to_string())],
+            "リネームは (旧, 新) の組で取り出す"
+        );
+        let map = parsed.files;
         assert_eq!(map.get("src/app.rs"), Some(&FileStatus::Modified));
         assert_eq!(map.get("src/new.rs"), Some(&FileStatus::Added));
         assert_eq!(map.get("notes.txt"), Some(&FileStatus::Untracked));
@@ -827,13 +953,13 @@ index 1234567..89abcde 100644
     fn parse_porcelain_z_handles_spaces_and_cap() {
         // NUL 区切りなのでスペース入りパスも引用なしでそのまま届く
         let out = "?? my notes.txt\0 M dir with space/a.rs\0?? c.rs\0";
-        let map = parse_porcelain_z(out, MAX_STATUS_ENTRIES);
+        let map = parse_porcelain_z(out, MAX_STATUS_ENTRIES).files;
         assert_eq!(map.get("my notes.txt"), Some(&FileStatus::Untracked));
         assert_eq!(map.get("dir with space/a.rs"), Some(&FileStatus::Modified));
 
         // cap 超過は打ち切り、取り込めた分だけ返す (劣化運転)
         let capped = parse_porcelain_z(out, 2);
-        assert_eq!(capped.len(), 2);
+        assert_eq!(capped.files.len(), 2);
     }
 
     #[test]
@@ -882,7 +1008,7 @@ index 1234567..89abcde 100644
         files.insert("a/b/d.rs".to_string(), FileStatus::Added);
         files.insert("a/x.rs".to_string(), FileStatus::Added);
         files.insert("top.rs".to_string(), FileStatus::Added);
-        let dirs = derive_dir_status(&files);
+        let dirs = derive_dir_status(&files, &[]);
         // 混在 (M + A) は Modified の色調に寄せる (VS Code 挙動)
         assert_eq!(dirs.get("a/b"), Some(&(FileStatus::Modified, 2)));
         assert_eq!(dirs.get("a"), Some(&(FileStatus::Modified, 3)));
@@ -893,9 +1019,131 @@ index 1234567..89abcde 100644
         let mut only_added = HashMap::new();
         only_added.insert("pkg/one.rs".to_string(), FileStatus::Added);
         only_added.insert("pkg/two.rs".to_string(), FileStatus::Added);
-        let dirs = derive_dir_status(&only_added);
+        let dirs = derive_dir_status(&only_added, &[]);
         assert_eq!(dirs.get("pkg"), Some(&(FileStatus::Added, 2)));
         assert_eq!(dirs.get(""), Some(&(FileStatus::Added, 2)));
+    }
+
+    // ── 深い階層 / 折りたたみ / リネーム / 削除 / 上限 ────────────────
+
+    /// 6 階層より深い 1 変更でも、**ルートまでの全祖先**に色と件数が乗る。
+    /// (折りたたんだフォルダ行も dir_status を引くだけなので、
+    ///  展開しなくても「下で何か変わった」がバッジで見える)
+    #[test]
+    fn deep_hierarchy_tints_every_ancestor_up_to_root() {
+        let deep = "a/b/c/d/e/f/g/deep.rs";
+        let mut files = HashMap::new();
+        files.insert(deep.to_string(), FileStatus::Modified);
+        let dirs = derive_dir_status(&files, &[]);
+
+        for anc in ["", "a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e", "a/b/c/d/e/f", "a/b/c/d/e/f/g"] {
+            assert_eq!(
+                dirs.get(anc),
+                Some(&(FileStatus::Modified, 1)),
+                "祖先 {anc:?} も色付く"
+            );
+        }
+        assert_eq!(dirs.len(), 8, "ファイル自身はディレクトリに含めない");
+        assert!(!dirs.contains_key(deep));
+    }
+
+    /// 折りたたんだままのフォルダ行が読む API (`Git::dir_status`) が、
+    /// 深い階層でも代表ステータスと件数を返すこと。
+    #[test]
+    fn collapsed_folder_sees_status_and_count_without_expanding() {
+        let mut g = Git::new(PathBuf::from("/nowhere"));
+        let mut files = HashMap::new();
+        files.insert("src/deep/one/two/three/x.rs".to_string(), FileStatus::Added);
+        files.insert("src/deep/one/two/three/y.rs".to_string(), FileStatus::Added);
+        files.insert("src/other.rs".to_string(), FileStatus::Modified);
+        g.dir_cache = derive_dir_status(&files, &[]);
+        g.status_cache = files;
+
+        // 一番浅い折りたたみ行 (src) からでも配下 3 件が見える
+        assert_eq!(g.dir_status("src"), Some((FileStatus::Modified, 3)));
+        // 中間層は 2 件・単一種なので Added のまま
+        assert_eq!(g.dir_status("src/deep"), Some((FileStatus::Added, 2)));
+        assert_eq!(g.dir_status("src/deep/one/two/three"), Some((FileStatus::Added, 2)));
+        // 末尾スラッシュ付きでも同じキーに解決する
+        assert_eq!(g.dir_status("src/deep/"), Some((FileStatus::Added, 2)));
+        assert_eq!(g.dir_status("vendor"), None);
+    }
+
+    /// リネームは旧側の親も色付く。共有する祖先では二重に数えない。
+    #[test]
+    fn rename_tints_both_parent_chains_without_double_counting() {
+        let parsed = parse_porcelain_z("R  new/deep/dst.rs\0old/deep/src.rs\0", MAX_STATUS_ENTRIES);
+        let dirs = derive_dir_status(&parsed.files, &parsed.renames);
+
+        for anc in ["new", "new/deep"] {
+            assert_eq!(dirs.get(anc), Some(&(FileStatus::Renamed, 1)), "新側 {anc}");
+        }
+        for anc in ["old", "old/deep"] {
+            assert_eq!(dirs.get(anc), Some(&(FileStatus::Renamed, 1)), "旧側 {anc}");
+        }
+        // 共有する祖先 (ルート) はリネーム 1 件ぶんだけ
+        assert_eq!(dirs.get(""), Some(&(FileStatus::Renamed, 1)));
+    }
+
+    /// 削除はワークツリーから消えていても親を色付ける。
+    #[test]
+    fn delete_tints_parent_chain_even_though_file_is_gone() {
+        let parsed = parse_porcelain_z(" D a/b/c/d/e/f/gone.rs\0", MAX_STATUS_ENTRIES);
+        let dirs = derive_dir_status(&parsed.files, &parsed.renames);
+        for anc in ["", "a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e", "a/b/c/d/e/f"] {
+            assert_eq!(dirs.get(anc), Some(&(FileStatus::Deleted, 1)), "{anc}");
+        }
+        // 幽霊行 (消えたファイル名) も親ディレクトリから引ける
+        let ghosts = derive_deleted_by_dir(&parsed.files);
+        assert_eq!(ghosts.get("a/b/c/d/e/f").map(Vec::as_slice), Some(&["gone.rs".to_string()][..]));
+    }
+
+    /// サブモジュール / ネストした repo の扱い。
+    /// - 外側の status には「サブモジュールのディレクトリ 1 エントリ」しか出ない
+    ///   → 内側の個別ファイルが外側に誤って割り当てられない
+    /// - それでもフォルダ行には色が出る (file エントリへのフォールバック)
+    #[test]
+    fn nested_repo_and_submodule_do_not_leak_into_outer_repo() {
+        // ` M sub` = サブモジュールの HEAD 移動、`?? nested/` = ネストした未追跡 repo
+        let parsed = parse_porcelain_z(" M sub\0?? nested/\0 M src/app.rs\0", MAX_STATUS_ENTRIES);
+        let mut g = Git::new(PathBuf::from("/nowhere"));
+        g.dir_cache = derive_dir_status(&parsed.files, &parsed.renames);
+        g.status_cache = parsed.files;
+
+        // サブモジュール行は色が出る (件数 1)
+        assert_eq!(g.dir_status("sub"), Some((FileStatus::Modified, 1)));
+        // ネストした未追跡 repo も同じ
+        assert_eq!(g.dir_status("nested"), Some((FileStatus::Untracked, 1)));
+        // 中身は外側の status に無い → 誤った色付けをしない
+        assert_eq!(g.file_status("sub/lib/inner.rs"), None);
+        assert_eq!(g.dir_status("sub/lib"), None);
+        assert_eq!(g.file_status("nested/x.rs"), None);
+        assert_eq!(g.dir_status("nested/x"), None);
+    }
+
+    /// 1 万件クラスの変更でも上限で頭打ちにし、祖先集計が破綻しない。
+    /// (祖先マップはスキャン 1 回につき 1 度だけ組み立てる = 描画は O(1) 参照)
+    #[test]
+    fn ten_thousand_changes_stay_within_caps() {
+        let mut raw = String::new();
+        for i in 0..12_000 {
+            raw.push_str(&format!(" M pkg{}/mod{}/file{}.rs\0", i % 40, i % 400, i));
+        }
+        let parsed = parse_porcelain_z(&raw, MAX_STATUS_ENTRIES);
+        assert_eq!(parsed.files.len(), MAX_STATUS_ENTRIES, "上限で打ち切る");
+        let dirs = derive_dir_status(&parsed.files, &parsed.renames);
+        // ルートは取り込めた件数ぶん、ディレクトリ数はパス空間ぶんで抑えられる
+        assert_eq!(dirs.get("").map(|d| d.1), Some(MAX_STATUS_ENTRIES));
+        assert!(dirs.len() <= 1 + 40 + 400, "ディレクトリ集計が爆発しない: {}", dirs.len());
+    }
+
+    /// 病的に深いパスでも祖先の展開を打ち切る (メモリ暴走止め)。
+    #[test]
+    fn pathological_depth_is_capped() {
+        let deep: String = (0..500).map(|i| format!("d{i}/")).collect::<String>() + "x.rs";
+        let ancs = ancestor_dirs(&deep);
+        assert_eq!(ancs.len(), MAX_DIR_DEPTH);
+        assert_eq!(ancs[0], "");
     }
 
     #[test]

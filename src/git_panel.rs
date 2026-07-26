@@ -1,8 +1,12 @@
 //! Git パネル (左サイドバー用)。
 //!
 //! ブランチ / worktree / 変更ファイルを一覧し、**安全で取り消せる操作だけ**を提供する。
-//! commit / push / ブランチ削除 / worktree 削除 / stage / reset / merge / rebase は
-//! 意図的にスコープ外。
+//! commit / push / ブランチ削除 / worktree 削除 / merge / rebase は意図的にスコープ外。
+//!
+//! 同じファイルに [`ReviewPanel`] (GitHub の "Files changed" 風の
+//! ローカル変更レビュー) も同居している。そちらは stage / unstage /
+//! 変更の破棄を持つが、破棄だけは race パネルと同じ **2 段確認**を必須にしている。
+//! app.rs 側の配線は `ReviewPanel` の直前のコメントに書いてある。
 //!
 //! 設計上の要点:
 //! - 一覧の取得 (`git branch` 等) は TTL 付きキャッシュ + バックグラウンド収集。
@@ -35,6 +39,12 @@ pub struct GitActions {
     pub open_path: Option<PathBuf>,
     /// 画面に出したいメッセージ (本文, 成功なら true)
     pub toast: Option<(String, bool)>,
+    /// このファイルをエディタで開いてほしい (レビュー画面の「エディタで開く」)。
+    /// `open_path` (ワークスペースを切り替える) とは別物なので混ぜないこと。
+    pub open_file: Option<PathBuf>,
+    /// エージェントへ追いプロンプトとして流したいレビュー内容
+    /// (レビュー画面のインラインコメント → 「エージェントに送る」)。
+    pub review_prompt: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1110,985 @@ fn change_color(c: &ChangeEntry, theme: &Theme) -> egui::Color32 {
 }
 
 // ---------------------------------------------------------------------------
+// PR 風のローカル変更レビュー (GitHub の "Files changed" 相当)
+// ---------------------------------------------------------------------------
+//
+// # app.rs 側に必要な配線 (このファイルだけでは画面に出ない)
+//
+// 1. 状態を 1 つ持つ:   `review: git_panel::ReviewPanel`
+//    - 生成:            `git_panel::ReviewPanel::new(workspace.clone())`
+//    - ws 切替時:       `self.review.set_workspace(ws.clone());`
+// 2. タブ / パネルの登録 (**これが無いと表示されない**):
+//    中央タブか右パネルの描画で 1 行、
+//    `self.review.ui(ui, &theme, &mut git_actions);`
+//    既存の `GitActions` をそのまま使い回せる。
+// 3. `GitActions` に足した 2 フィールドを既存の処理へ流す:
+//    - `open_file`     → エディタでそのパスを開く (`open_path` とは別物)
+//    - `review_prompt` → `agent_input` へ追いプロンプトとして渡す
+// 4. 任意: コマンドパレット / メニュー / キーバインドから
+//    `ReviewPanel::invalidate()` を叩けば次フレームで再収集する。
+//
+// git 実行とファイル読みは全てバックグラウンドスレッド + mpsc。
+// `ui()` はキャッシュを読むだけで、UI スレッドから git を起動しない。
+
+/// 比較のベース。既定は「作業ツリー vs HEAD」。
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum ReviewBase {
+    /// 作業ツリー全体 vs HEAD (ステージ済み + 未ステージ + 未追跡)
+    #[default]
+    Head,
+    /// ステージ済みだけ (index vs HEAD)
+    Staged,
+    /// 未ステージだけ (作業ツリー vs index)
+    Unstaged,
+    /// 任意のブランチ / コミット (`main`, `origin/main`, SHA, `HEAD~3` …)
+    Rev(String),
+}
+
+impl ReviewBase {
+    pub fn label(&self) -> String {
+        match self {
+            ReviewBase::Head => tr("作業ツリー vs HEAD"),
+            ReviewBase::Staged => tr("ステージ済み (index) vs HEAD"),
+            ReviewBase::Unstaged => tr("未ステージ (作業ツリー vs index)"),
+            ReviewBase::Rev(r) => trf("作業ツリー vs {r}", &[("r", r.clone())]),
+        }
+    }
+
+    /// 未追跡ファイルを合成 diff として足すベースか。
+    /// index との比較 (Staged) には未追跡は含まれない。
+    pub fn includes_untracked(&self) -> bool {
+        !matches!(self, ReviewBase::Staged)
+    }
+}
+
+/// 文脈行数の選択。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ContextLines {
+    #[default]
+    Three,
+    Ten,
+    /// ファイル全体 (git に十分大きい値を渡す)
+    All,
+}
+
+impl ContextLines {
+    pub fn value(self) -> u32 {
+        match self {
+            ContextLines::Three => 3,
+            ContextLines::Ten => 10,
+            ContextLines::All => 100_000,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ContextLines::Three => "3",
+            ContextLines::Ten => "10",
+            ContextLines::All => "全部",
+        }
+    }
+}
+
+/// レビュー全体の diff テキスト上限 (これを超えたら行境界で打ち切る)。
+const MAX_REVIEW_DIFF_BYTES: usize = 1_500_000;
+/// 未追跡ファイル 1 本を合成 diff にするときの読み込み上限。
+const MAX_UNTRACKED_BYTES: usize = 128 * 1024;
+/// レビューの再収集 TTL。
+const REVIEW_TTL: Duration = Duration::from_secs(5);
+
+/// リビジョン入力の検証。`validate_branch_name` より緩い
+/// (`HEAD~3` / `a..b` / `origin/main` を通す) が、
+/// **空と `-` 始まり (git のオプションと誤認) と制御文字は必ず弾く**。
+pub fn validate_rev(input: &str) -> Result<String, String> {
+    let n = input.trim();
+    if n.is_empty() {
+        return Err(tr("比較先のブランチ / コミットを入力してください"));
+    }
+    if n.starts_with('-') {
+        return Err(tr("名前を - で始めることはできません"));
+    }
+    if n.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(tr("名前に空白や制御文字は使えません"));
+    }
+    Ok(n.to_string())
+}
+
+/// `git diff` の引数表。純関数なのでテストで表として検証する。
+///
+/// `--no-color` は `run_git` の `-c color.ui=false` と二重の保険。
+/// `-M` はリネーム検出を明示 (古い git でも同じ結果になるように)。
+pub fn review_diff_args(base: &ReviewBase, ctx: ContextLines, ignore_ws: bool) -> Vec<String> {
+    let mut a: Vec<String> = vec!["diff".into(), "--no-color".into(), "-M".into()];
+    a.push(format!("--unified={}", ctx.value()));
+    if ignore_ws {
+        a.push("--ignore-all-space".into());
+    }
+    match base {
+        ReviewBase::Head => a.push("HEAD".into()),
+        ReviewBase::Staged => a.push("--cached".into()),
+        ReviewBase::Unstaged => {}
+        ReviewBase::Rev(r) => a.push(r.clone()),
+    }
+    a
+}
+
+/// `git add` の引数表。`--` でパスとオプションを必ず切り離す。
+pub fn stage_args(path: &str) -> Vec<String> {
+    vec!["add".into(), "--".into(), path.to_string()]
+}
+
+/// `git restore --staged` の引数表 (index から下ろす)。
+pub fn unstage_args(path: &str) -> Vec<String> {
+    vec![
+        "restore".into(),
+        "--staged".into(),
+        "--".into(),
+        path.to_string(),
+    ]
+}
+
+/// 「変更を破棄」の引数表。未追跡はファイルごと消すしかないので
+/// `git clean -f`、追跡済みは作業ツリーだけ巻き戻す `git restore --worktree`。
+/// **どちらも取り消せない**ので UI 側は 2 段確認を必須にすること。
+pub fn discard_args(path: &str, untracked: bool) -> Vec<String> {
+    if untracked {
+        vec!["clean".into(), "-f".into(), "--".into(), path.to_string()]
+    } else {
+        vec![
+            "restore".into(),
+            "--worktree".into(),
+            "--".into(),
+            path.to_string(),
+        ]
+    }
+}
+
+/// diff の 1 ファイル + git からしか分からない付随状態。
+#[derive(Clone, Debug)]
+pub struct ReviewFile {
+    pub diff: crate::diff::FileDiff,
+    /// ツリーと同じ色分けに使う実効ステータス。
+    pub status: crate::git::FileStatus,
+    /// index に載っているか (アンステージ可能か)。
+    pub staged: bool,
+    pub untracked: bool,
+    /// git に渡す repo 相対パス (リネームなら新パス)。
+    pub path: String,
+}
+
+/// 1 回の収集結果。UI スレッドはこれを読むだけ。
+#[derive(Clone, Debug, Default)]
+pub struct ReviewData {
+    pub toplevel: PathBuf,
+    pub files: Vec<ReviewFile>,
+    /// 上限に当たって diff を途中で切ったか。
+    pub truncated: bool,
+    /// git が失敗した理由 (リビジョン名の打ち間違いなど)。
+    pub error: Option<String>,
+}
+
+/// 見出しの「N ファイル変更 · +X −Y」。
+pub fn review_summary(files: &[ReviewFile]) -> (usize, usize, usize) {
+    let adds = files.iter().map(|f| f.diff.additions).sum();
+    let dels = files.iter().map(|f| f.diff.deletions).sum();
+    (files.len(), adds, dels)
+}
+
+/// diff から実効ステータスを決める (ツリーの色と意味を揃えるため)。
+pub fn review_file_status(
+    f: &crate::diff::FileDiff,
+    untracked: bool,
+) -> crate::git::FileStatus {
+    use crate::git::FileStatus;
+    if untracked {
+        return FileStatus::Untracked;
+    }
+    if f.is_rename {
+        return FileStatus::Renamed;
+    }
+    if f.old_path.is_empty() || f.old_path == "/dev/null" {
+        return FileStatus::Added;
+    }
+    if f.new_path.is_empty() || f.new_path == "/dev/null" {
+        return FileStatus::Deleted;
+    }
+    FileStatus::Modified
+}
+
+/// git に渡せる実パス (`display_path` はリネームを "旧 → 新" と書くので使えない)。
+pub fn review_path(f: &crate::diff::FileDiff) -> String {
+    if !f.new_path.is_empty() && f.new_path != "/dev/null" {
+        f.new_path.clone()
+    } else {
+        f.old_path.clone()
+    }
+}
+
+/// ファイル一覧をディレクトリごとにまとめる。
+/// 戻りは (ディレクトリ, 元の添字) をディレクトリ名順・パス順に並べたもの。
+/// "" はリポジトリ直下。
+pub fn group_by_dir(paths: &[String]) -> Vec<(String, Vec<usize>)> {
+    let mut map: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, p) in paths.iter().enumerate() {
+        let dir = p.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        map.entry(dir.to_string()).or_default().push(i);
+    }
+    for v in map.values_mut() {
+        v.sort_by(|a, b| paths[*a].cmp(&paths[*b]));
+    }
+    map.into_iter().collect()
+}
+
+/// 次/前の変更へ。端では止まる (回り込まない)。
+pub fn move_selection(cur: Option<usize>, len: usize, delta: i32) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let last = len - 1;
+    Some(match cur {
+        None => {
+            if delta >= 0 {
+                0
+            } else {
+                last
+            }
+        }
+        Some(i) => {
+            if delta >= 0 {
+                (i + delta as usize).min(last)
+            } else {
+                i.saturating_sub(delta.unsigned_abs() as usize)
+            }
+        }
+    })
+}
+
+/// NUL を含むならバイナリ扱い (git 自身と同じ経験則)。
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8000).any(|b| *b == 0)
+}
+
+/// 未追跡ファイルを「全行追加」の unified diff に仕立てる。
+///
+/// git は untracked を `diff` に出さないので、レビュー画面では合成する。
+/// バイナリは中身を出さず `Binary files ...` 行だけにして、
+/// diff レンダラ側に「バイナリファイル」と描かせる。
+/// `max_bytes` を超えるものは行境界で切り、末尾に省略行を足す
+/// (ハンクの宣言行数と実際の行数は必ず一致させる)。
+fn synth_untracked_diff(path: &str, bytes: &[u8], max_bytes: usize) -> String {
+    let head = format!("diff --git a/{path} b/{path}\nnew file mode 100644\n");
+    if looks_binary(bytes) {
+        return format!("{head}Binary files /dev/null and b/{path} differ\n");
+    }
+    let truncated = bytes.len() > max_bytes;
+    let capped = &bytes[..bytes.len().min(max_bytes)];
+    let text = String::from_utf8_lossy(capped);
+    // CRLF の \r は diff 本文に残さない (行末が化けて見えるため)。
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .collect();
+    if truncated {
+        lines.pop(); // 途中で切れた最終行は捨てる
+        lines.push("… (大きいため以降を省略)".to_string());
+    }
+    if lines.is_empty() {
+        // 空ファイル: ハンク無しでも「追加された」ことは伝わる
+        return format!("{head}--- /dev/null\n+++ b/{path}\n");
+    }
+    let mut s = format!(
+        "{head}--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n",
+        lines.len()
+    );
+    for l in &lines {
+        s.push('+');
+        s.push_str(l);
+        s.push('\n');
+    }
+    s
+}
+
+/// diff テキストを行境界で上限まで切る。戻りは (本文, 切ったか)。
+fn cap_diff_text(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut out = String::with_capacity(max_bytes + 64);
+    for line in text.lines() {
+        if out.len() + line.len() + 1 > max_bytes {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    (out, true)
+}
+
+/// NUL 区切りの `--name-only -z` / `ls-files -z` 出力をパスの集合にする。
+fn parse_nul_paths(out: &str) -> Vec<String> {
+    out.split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// レビュー用データの収集。**バックグラウンドスレッドから呼ぶこと**
+/// (git を数回起動し、未追跡ファイルを読む)。
+fn collect_review(ws: &Path, base: &ReviewBase, ctx: ContextLines, ignore_ws: bool) -> ReviewData {
+    let toplevel = run_git(ws, &["rev-parse", "--show-toplevel"])
+        .map(|s| PathBuf::from(s.trim()))
+        .unwrap_or_else(|_| ws.to_path_buf());
+
+    let args = review_diff_args(base, ctx, ignore_ws);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut text = match run_git(ws, &argv) {
+        Ok(s) => s,
+        Err(e) => {
+            return ReviewData {
+                toplevel,
+                error: Some(e.text().to_string()),
+                ..Default::default()
+            }
+        }
+    };
+
+    // index に載っているパス (アンステージ可否の判定に使う)
+    let staged: Vec<String> = run_git(ws, &["diff", "--cached", "--name-only", "-z"])
+        .map(|s| parse_nul_paths(&s))
+        .unwrap_or_default();
+
+    // 未追跡は git diff に出ないので合成して足す
+    let mut untracked: Vec<String> = Vec::new();
+    if base.includes_untracked() {
+        untracked = run_git(ws, &["ls-files", "--others", "--exclude-standard", "-z"])
+            .map(|s| parse_nul_paths(&s))
+            .unwrap_or_default();
+        for p in &untracked {
+            if text.len() > MAX_REVIEW_DIFF_BYTES {
+                break;
+            }
+            let bytes = std::fs::read(toplevel.join(p)).unwrap_or_default();
+            text.push_str(&synth_untracked_diff(p, &bytes, MAX_UNTRACKED_BYTES));
+        }
+    }
+
+    let (text, truncated) = cap_diff_text(&text, MAX_REVIEW_DIFF_BYTES);
+    let mut files: Vec<ReviewFile> = crate::diff::parse_unified(&text)
+        .into_iter()
+        .map(|d| {
+            let path = review_path(&d);
+            let untracked = untracked.iter().any(|u| *u == path);
+            ReviewFile {
+                status: review_file_status(&d, untracked),
+                staged: staged.iter().any(|s| *s == path),
+                untracked,
+                path,
+                diff: d,
+            }
+        })
+        .collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    ReviewData {
+        toplevel,
+        files,
+        truncated,
+        error: None,
+    }
+}
+
+/// レビュー画面の変更系ジョブ。
+enum ReviewJob {
+    Stage(String),
+    Unstage(String),
+    Discard { path: String, untracked: bool },
+}
+
+/// PR 風のローカル変更レビュー画面。
+///
+/// 左 = 変更ファイル一覧 (ディレクトリごと・ツリーと同じ色とバッジ・`+N −M`)、
+/// 右 = 既存の diff レンダラ (`diff::diff_ui_with_actions`) による unified diff。
+/// diff の描画をレンダラに任せているので、今夜入ったインラインレビュー
+/// コメント (行クリック → コメント → まとめてエージェントへ) がそのまま効く。
+pub struct ReviewPanel {
+    workspace: PathBuf,
+    base: ReviewBase,
+    rev_input: String,
+    ctx_lines: ContextLines,
+    ignore_ws: bool,
+    data: ReviewData,
+    loaded: bool,
+    last_refresh: Option<Instant>,
+    pending: Option<Receiver<ReviewData>>,
+    job: Option<Receiver<(String, bool)>>,
+    job_label: String,
+    selected: Option<usize>,
+    /// 次のフレームでこのファイルの diff までスクロールする。
+    scroll_to: Option<usize>,
+    /// 畳んであるファイル (パス)。巨大 diff を描かないための実質的な間引きでもある。
+    collapsed: std::collections::HashSet<String>,
+    /// 「変更を破棄」の 2 段確認 (race パネルの [破棄] と同じ流儀)。
+    confirm_discard: Option<String>,
+    /// ファイルごとのインラインコメント。パスを鍵にするので、
+    /// 再収集して添字がずれてもコメントは付いたまま。
+    comments: std::collections::HashMap<String, crate::diff::DiffCommentStore>,
+    /// 一覧をクリックしたか (キーボード操作を横取りしないための足枷)。
+    list_focused: bool,
+}
+
+impl ReviewPanel {
+    pub fn new(workspace: PathBuf) -> Self {
+        Self {
+            workspace,
+            base: ReviewBase::default(),
+            rev_input: String::new(),
+            ctx_lines: ContextLines::default(),
+            ignore_ws: false,
+            data: ReviewData::default(),
+            loaded: false,
+            last_refresh: None,
+            pending: None,
+            job: None,
+            job_label: String::new(),
+            selected: None,
+            scroll_to: None,
+            collapsed: std::collections::HashSet::new(),
+            confirm_discard: None,
+            comments: std::collections::HashMap::new(),
+            list_focused: false,
+        }
+    }
+
+    pub fn set_workspace(&mut self, ws: PathBuf) {
+        if self.workspace != ws {
+            self.workspace = ws;
+            // 旧ワークスペース向けの飛行中の収集は受信口ごと捨てる
+            // (旧 repo の結果でステージ/破棄を撃たせない)。
+            self.pending = None;
+            self.data = ReviewData::default();
+            self.loaded = false;
+            self.selected = None;
+            self.confirm_discard = None;
+            self.comments.clear();
+            self.invalidate();
+        }
+    }
+
+    /// 次フレームで収集し直す。
+    pub fn invalidate(&mut self) {
+        self.last_refresh = None;
+    }
+
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// 比較ベースを外から指定する (コマンドパレット等の配線用)。
+    pub fn set_base(&mut self, base: ReviewBase) {
+        if self.base != base {
+            self.base = base;
+            self.selected = None;
+            self.invalidate();
+        }
+    }
+
+    /// 毎フレーム呼ぶ。git は一切ここでは起動しない (キャッシュを読むだけ)。
+    pub fn ui(&mut self, ui: &mut egui::Ui, theme: &Theme, actions: &mut GitActions) {
+        let ctx = ui.ctx().clone();
+        self.poll(actions);
+        self.maybe_refresh(&ctx);
+
+        self.toolbar_ui(ui, theme);
+        self.summary_ui(ui, theme);
+
+        if let Some(err) = self.data.error.clone() {
+            ui.label(RichText::new(err).color(theme.err).small());
+            return;
+        }
+        if !self.loaded {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.label(RichText::new(tr("差分を集めています…")).color(theme.text_dim).small());
+            });
+            return;
+        }
+        if self.data.files.is_empty() {
+            ui.label(
+                RichText::new(tr("このベースとの差分はありません"))
+                    .color(theme.text_dim)
+                    .small(),
+            );
+            return;
+        }
+        if self.data.truncated {
+            ui.label(
+                RichText::new(tr("差分が大きいため一部のみ表示"))
+                    .color(theme.warn)
+                    .small(),
+            )
+            .on_hover_text(tr(
+                "上限を超えた分は読み込んでいません。文脈行を減らすか、ベースを絞ってください",
+            ));
+        }
+
+        self.handle_keys(ui);
+
+        let mut job: Option<ReviewJob> = None;
+        // 幅が狭いときは縦積み (左サイドバーに置かれても潰れない)。
+        let wide = ui.available_width() >= 640.0;
+        if wide {
+            let list_w = (ui.available_width() * 0.32).clamp(200.0, 380.0);
+            let h = ui.available_height();
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(list_w, h),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("zv-review-list")
+                            .show(ui, |ui| self.file_list_ui(ui, theme, &mut job, actions));
+                    },
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("zv-review-diff")
+                    .show(ui, |ui| self.diff_pane_ui(ui, theme, actions));
+            });
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("zv-review-stacked")
+                .show(ui, |ui| {
+                    self.file_list_ui(ui, theme, &mut job, actions);
+                    ui.separator();
+                    self.diff_pane_ui(ui, theme, actions);
+                });
+        }
+
+        if let Some(j) = job {
+            self.spawn_review_job(&ctx, j, actions);
+        }
+    }
+
+    // -- 各パーツ -----------------------------------------------------------
+
+    fn toolbar_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(tr("変更レビュー")).strong().color(theme.text));
+            if self.pending.is_some() {
+                ui.add(egui::Spinner::new().size(11.0));
+            }
+            ui.label(RichText::new(tr("比較:")).color(theme.text_dim).small());
+            let mut next = self.base.clone();
+            egui::ComboBox::from_id_salt("zv-review-base")
+                .selected_text(self.base.label())
+                .show_ui(ui, |ui| {
+                    for b in [ReviewBase::Head, ReviewBase::Staged, ReviewBase::Unstaged] {
+                        let label = b.label();
+                        ui.selectable_value(&mut next, b, label);
+                    }
+                    let rev = ReviewBase::Rev(self.rev_input.clone());
+                    ui.selectable_value(&mut next, rev, tr("ブランチ / コミットを指定…"));
+                });
+            if next != self.base {
+                self.base = next;
+                self.selected = None;
+                changed = true;
+            }
+            if matches!(self.base, ReviewBase::Rev(_)) {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.rev_input)
+                        .desired_width(150.0)
+                        .hint_text("main / origin/main / HEAD~3"),
+                );
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    match validate_rev(&self.rev_input) {
+                        Ok(rev) => {
+                            self.base = ReviewBase::Rev(rev);
+                            changed = true;
+                        }
+                        Err(e) => {
+                            ui.label(RichText::new(e).color(theme.err).small());
+                        }
+                    }
+                }
+            }
+            ui.separator();
+            ui.label(RichText::new(tr("文脈:")).color(theme.text_dim).small());
+            for c in [ContextLines::Three, ContextLines::Ten, ContextLines::All] {
+                if ui
+                    .selectable_label(self.ctx_lines == c, tr(c.label()))
+                    .clicked()
+                    && self.ctx_lines != c
+                {
+                    self.ctx_lines = c;
+                    changed = true;
+                }
+            }
+            if ui
+                .selectable_label(self.ignore_ws, tr("空白無視"))
+                .on_hover_text(tr("インデントだけの変更を差分から外す (--ignore-all-space)"))
+                .clicked()
+            {
+                self.ignore_ws = !self.ignore_ws;
+                changed = true;
+            }
+            if ui.button(tr("再読み込み")).clicked() {
+                changed = true;
+            }
+        });
+        if changed {
+            self.invalidate();
+        }
+    }
+
+    fn summary_ui(&self, ui: &mut egui::Ui, theme: &Theme) {
+        let (n, adds, dels) = review_summary(&self.data.files);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(trf("{n} ファイル変更", &[("n", n.to_string())]))
+                    .color(theme.text)
+                    .strong(),
+            );
+            ui.label(RichText::new("·").color(theme.text_dim));
+            ui.label(RichText::new(format!("+{adds}")).color(theme.ok).monospace());
+            ui.label(RichText::new(format!("−{dels}")).color(theme.err).monospace());
+        });
+    }
+
+    fn file_list_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        job: &mut Option<ReviewJob>,
+        actions: &mut GitActions,
+    ) {
+        let paths: Vec<String> = self.data.files.iter().map(|f| f.path.clone()).collect();
+        for (dir, idxs) in group_by_dir(&paths) {
+            let title = if dir.is_empty() {
+                tr("(リポジトリ直下)")
+            } else {
+                dir.clone()
+            };
+            ui.label(RichText::new(title).color(theme.text_dim).small());
+            for i in idxs {
+                let (status, path, adds, dels, staged, untracked) = {
+                    let f = &self.data.files[i];
+                    (
+                        f.status,
+                        f.path.clone(),
+                        f.diff.additions,
+                        f.diff.deletions,
+                        f.staged,
+                        f.untracked,
+                    )
+                };
+                let (color, badge, hint) = crate::file_tree::git_status_style(status, theme);
+                let name = path.rsplit_once('/').map(|(_, n)| n).unwrap_or(&path);
+                ui.horizontal(|ui| {
+                    let sel = self.selected == Some(i);
+                    let label = format!("{badge}  {name}");
+                    let resp = ui
+                        .selectable_label(sel, RichText::new(label).color(color))
+                        .on_hover_text(format!("{path}\n{}", tr(hint)));
+                    if resp.clicked() {
+                        self.selected = Some(i);
+                        self.scroll_to = Some(i);
+                        self.list_focused = true;
+                        self.confirm_discard = None;
+                    }
+                    ui.label(RichText::new(format!("+{adds}")).color(theme.ok).small());
+                    ui.label(RichText::new(format!("−{dels}")).color(theme.err).small());
+                    if staged {
+                        ui.label(
+                            RichText::new(tr("済"))
+                                .color(theme.accent)
+                                .small(),
+                        )
+                        .on_hover_text(tr("ステージ済み"));
+                    }
+                });
+                if self.selected == Some(i) {
+                    self.file_actions_ui(ui, theme, &path, staged, untracked, job, actions);
+                }
+            }
+        }
+    }
+
+    /// 選択中ファイルの操作行。破棄だけ 2 段確認。
+    #[allow(clippy::too_many_arguments)]
+    fn file_actions_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        path: &str,
+        staged: bool,
+        untracked: bool,
+        job: &mut Option<ReviewJob>,
+        actions: &mut GitActions,
+    ) {
+        let busy = self.job.is_some();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new(tr("ステージ")).small())
+                .clicked()
+            {
+                *job = Some(ReviewJob::Stage(path.to_string()));
+            }
+            if ui
+                .add_enabled(!busy && staged, egui::Button::new(tr("アンステージ")).small())
+                .clicked()
+            {
+                *job = Some(ReviewJob::Unstage(path.to_string()));
+            }
+            // [変更を破棄] — 1 度目は警告に変わるだけ (race パネルと同じ 2 段)
+            if self.confirm_discard.as_deref() == Some(path) {
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(RichText::new(tr("⚠ 本当に破棄")).color(theme.err))
+                            .small(),
+                    )
+                    .on_hover_text(tr("この操作は取り消せません"))
+                    .clicked()
+                {
+                    *job = Some(ReviewJob::Discard {
+                        path: path.to_string(),
+                        untracked,
+                    });
+                    self.confirm_discard = None;
+                }
+            } else if ui
+                .add_enabled(!busy, egui::Button::new(tr("変更を破棄")).small())
+                .on_hover_text(tr("もう一度押すと確定します (取り消せません)"))
+                .clicked()
+            {
+                self.confirm_discard = Some(path.to_string());
+            }
+            if ui.button(RichText::new(tr("エディタで開く")).small()).clicked() {
+                actions.open_file = Some(self.data.toplevel.join(path));
+            }
+        });
+    }
+
+    fn diff_pane_ui(&mut self, ui: &mut egui::Ui, theme: &Theme, actions: &mut GitActions) {
+        let scroll_to = self.scroll_to.take();
+        let mut prompt: Option<String> = None;
+        for i in 0..self.data.files.len() {
+            let path = self.data.files[i].path.clone();
+            let collapsed = self.collapsed.contains(&path);
+            let block = ui.scope(|ui| {
+                ui.horizontal(|ui| {
+                    let arrow = if collapsed { "▶" } else { "▼" };
+                    if ui.small_button(arrow).clicked() {
+                        if collapsed {
+                            self.collapsed.remove(&path);
+                        } else {
+                            self.collapsed.insert(path.clone());
+                        }
+                    }
+                    let (color, badge, _) =
+                        crate::file_tree::git_status_style(self.data.files[i].status, theme);
+                    ui.label(RichText::new(badge).color(color).monospace());
+                    if self.selected == Some(i) {
+                        ui.label(RichText::new("◀").color(theme.accent).small());
+                    }
+                    // 畳んでいる間は diff レンダラの見出しが出ないので、
+                    // パスと増減はこちらで出す (何を畳んだか分かるように)。
+                    if collapsed {
+                        let f = &self.data.files[i];
+                        ui.label(RichText::new(&f.path).color(theme.text).monospace());
+                        ui.label(
+                            RichText::new(format!("+{}", f.diff.additions))
+                                .color(theme.ok)
+                                .small(),
+                        );
+                        ui.label(
+                            RichText::new(format!("−{}", f.diff.deletions))
+                                .color(theme.err)
+                                .small(),
+                        );
+                    }
+                });
+                if !collapsed {
+                    // 既存の diff レンダラをそのまま使う。構文色も、
+                    // 行クリックのインラインレビューコメントもこれで効く。
+                    let store = self.comments.entry(path.clone()).or_default();
+                    let action = crate::diff::diff_ui_with_actions(
+                        ui,
+                        theme,
+                        std::slice::from_ref(&self.data.files[i].diff),
+                        store,
+                    );
+                    if let crate::diff::DiffAction::SendToAgent(p) = action {
+                        prompt = Some(p);
+                    }
+                }
+            });
+            if scroll_to == Some(i) {
+                ui.scroll_to_rect(block.response.rect, Some(egui::Align::TOP));
+            }
+            ui.add_space(4.0);
+        }
+        if let Some(p) = prompt {
+            actions.review_prompt = Some(p);
+        }
+    }
+
+    /// n / p / ↓ / ↑ で次・前の変更へ。
+    ///
+    /// 横取り防止のため 3 つ揃ったときだけ効かせる:
+    /// 一覧を一度クリックしている / ポインタがこのパネル上にある /
+    /// テキスト入力にフォーカスが無い。エディタで打鍵中に奪わない。
+    fn handle_keys(&mut self, ui: &mut egui::Ui) {
+        if !self.list_focused
+            || !ui.ui_contains_pointer()
+            || ui.memory(|m| m.focused().is_some())
+        {
+            return;
+        }
+        let len = self.data.files.len();
+        let delta = ui.input(|i| {
+            let next = i.key_pressed(egui::Key::N) || i.key_pressed(egui::Key::ArrowDown);
+            let prev = i.key_pressed(egui::Key::P) || i.key_pressed(egui::Key::ArrowUp);
+            match (next, prev) {
+                (true, false) => 1,
+                (false, true) => -1,
+                _ => 0,
+            }
+        });
+        if delta != 0 {
+            let next = move_selection(self.selected, len, delta);
+            if next != self.selected {
+                self.selected = next;
+                self.scroll_to = next;
+                self.confirm_discard = None;
+            }
+        }
+    }
+
+    // -- ジョブ管理 ---------------------------------------------------------
+
+    fn poll(&mut self, actions: &mut GitActions) {
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok(data) => {
+                    self.data = data;
+                    self.loaded = true;
+                    self.pending = None;
+                    // 選択が範囲外になったら外す
+                    if self.selected.is_some_and(|i| i >= self.data.files.len()) {
+                        self.selected = None;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.pending = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.job {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    actions.toast = Some(msg);
+                    self.job = None;
+                    self.job_label.clear();
+                    self.invalidate();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.job = None;
+                    self.job_label.clear();
+                    self.invalidate();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn maybe_refresh(&mut self, ctx: &egui::Context) {
+        if self.pending.is_some() {
+            return;
+        }
+        if let Some(t) = self.last_refresh {
+            if t.elapsed() < REVIEW_TTL {
+                return;
+            }
+        }
+        self.last_refresh = Some(Instant::now());
+        let (tx, rx) = mpsc::channel();
+        let ws = self.workspace.clone();
+        let base = self.base.clone();
+        let cl = self.ctx_lines;
+        let iw = self.ignore_ws;
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-git-review".into())
+            .spawn(move || {
+                let data = collect_review(&ws, &base, cl, iw);
+                let _ = tx.send(data);
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.pending = Some(rx),
+            Err(e) => {
+                self.loaded = true;
+                self.data.error = Some(trf(
+                    "差分を取得できません: {e}",
+                    &[("e", e.to_string())],
+                ));
+            }
+        }
+    }
+
+    fn spawn_review_job(&mut self, ctx: &egui::Context, job: ReviewJob, actions: &mut GitActions) {
+        if self.job.is_some() {
+            return;
+        }
+        let (label, args) = match job {
+            ReviewJob::Stage(p) => (trf("ステージ {p}", &[("p", p.clone())]), stage_args(&p)),
+            ReviewJob::Unstage(p) => (
+                trf("アンステージ {p}", &[("p", p.clone())]),
+                unstage_args(&p),
+            ),
+            ReviewJob::Discard { path, untracked } => (
+                trf("破棄 {p}", &[("p", path.clone())]),
+                discard_args(&path, untracked),
+            ),
+        };
+        let (tx, rx) = mpsc::channel();
+        let ws = self.workspace.clone();
+        let ctx2 = ctx.clone();
+        let label2 = label.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-git-review-job".into())
+            .spawn(move || {
+                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                let msg = match run_git(&ws, &argv) {
+                    Ok(_) => (trf("{label2} 完了", &[("label2", label2.clone())]), true),
+                    Err(e) => (
+                        trf(
+                            "{label2} 失敗: {e}",
+                            &[("label2", label2.clone()), ("e", e.text().to_string())],
+                        ),
+                        false,
+                    ),
+                };
+                let _ = tx.send(msg);
+                ctx2.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.job = Some(rx);
+                self.job_label = label;
+            }
+            Err(e) => {
+                actions.toast =
+                    Some((trf("git を起動できません: {e}", &[("e", e.to_string())]), false));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // テスト (git を起動しない純粋なパース / 検証のみ)
 // ---------------------------------------------------------------------------
 
@@ -1352,5 +2341,417 @@ bare
             default_worktree_base(Path::new("/repo")),
             PathBuf::from("/repo-worktrees")
         );
+    }
+
+    // ── PR 風レビュー: 純関数 (git を起動しない) ─────────────────────
+
+    #[test]
+    fn review_diff_args_table() {
+        let three = ContextLines::Three;
+        assert_eq!(
+            review_diff_args(&ReviewBase::Head, three, false),
+            vec!["diff", "--no-color", "-M", "--unified=3", "HEAD"]
+        );
+        assert_eq!(
+            review_diff_args(&ReviewBase::Staged, three, false),
+            vec!["diff", "--no-color", "-M", "--unified=3", "--cached"]
+        );
+        assert_eq!(
+            review_diff_args(&ReviewBase::Unstaged, three, false),
+            vec!["diff", "--no-color", "-M", "--unified=3"]
+        );
+        assert_eq!(
+            review_diff_args(&ReviewBase::Rev("origin/main".into()), ContextLines::Ten, true),
+            vec![
+                "diff",
+                "--no-color",
+                "-M",
+                "--unified=10",
+                "--ignore-all-space",
+                "origin/main"
+            ]
+        );
+        // 「全部」は git に十分大きい文脈行数を渡す
+        assert!(review_diff_args(&ReviewBase::Head, ContextLines::All, false)
+            .contains(&"--unified=100000".to_string()));
+        // 未追跡の合成対象は index 比較のときだけ外れる
+        assert!(ReviewBase::Head.includes_untracked());
+        assert!(ReviewBase::Unstaged.includes_untracked());
+        assert!(!ReviewBase::Staged.includes_untracked());
+    }
+
+    #[test]
+    fn stage_unstage_discard_arg_tables() {
+        assert_eq!(stage_args("src/a.rs"), vec!["add", "--", "src/a.rs"]);
+        assert_eq!(
+            unstage_args("src/a.rs"),
+            vec!["restore", "--staged", "--", "src/a.rs"]
+        );
+        assert_eq!(
+            discard_args("src/a.rs", false),
+            vec!["restore", "--worktree", "--", "src/a.rs"]
+        );
+        assert_eq!(
+            discard_args("new.txt", true),
+            vec!["clean", "-f", "--", "new.txt"]
+        );
+        // `--` を必ず挟むので、- 始まりのパスでもオプション扱いされない
+        for args in [
+            stage_args("-weird.rs"),
+            unstage_args("-weird.rs"),
+            discard_args("-weird.rs", false),
+            discard_args("-weird.rs", true),
+        ] {
+            let dd = args.iter().position(|a| a == "--").expect("-- が要る");
+            assert_eq!(args.last().map(String::as_str), Some("-weird.rs"));
+            assert_eq!(dd, args.len() - 2, "-- の直後がパス: {args:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rev_allows_revisions_but_rejects_options() {
+        for ok in ["main", "origin/main", "HEAD~3", "a1b2c3d", "v1.0..HEAD"] {
+            assert_eq!(validate_rev(ok).as_deref(), Ok(ok), "{ok}");
+        }
+        assert!(validate_rev("").is_err());
+        assert!(validate_rev("   ").is_err());
+        assert!(validate_rev("--upload-pack=evil").is_err());
+        assert!(validate_rev("a b").is_err());
+        assert!(validate_rev("a\nb").is_err());
+        // 前後の空白は落として受ける
+        assert_eq!(validate_rev("  main  ").as_deref(), Ok("main"));
+    }
+
+    #[test]
+    fn move_selection_clamps_at_both_ends() {
+        assert_eq!(move_selection(None, 0, 1), None, "空なら選べない");
+        assert_eq!(move_selection(None, 3, 1), Some(0));
+        assert_eq!(move_selection(None, 3, -1), Some(2));
+        assert_eq!(move_selection(Some(0), 3, 1), Some(1));
+        assert_eq!(move_selection(Some(2), 3, 1), Some(2), "末尾で止まる");
+        assert_eq!(move_selection(Some(0), 3, -1), Some(0), "先頭で止まる");
+    }
+
+    #[test]
+    fn group_by_dir_sorts_and_keeps_root_bucket() {
+        let paths: Vec<String> = ["src/b.rs", "a.txt", "src/a.rs", "src/deep/z.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let g = group_by_dir(&paths);
+        assert_eq!(g[0].0, "", "ルート直下が先頭");
+        assert_eq!(g[0].1, vec![1]);
+        assert_eq!(g[1].0, "src");
+        assert_eq!(g[1].1, vec![2, 0], "ディレクトリ内はパス順");
+        assert_eq!(g[2].0, "src/deep");
+    }
+
+    /// 未追跡ファイルの合成 diff: 本文・バイナリ・CRLF・日本語・上限。
+    #[test]
+    fn synth_untracked_diff_covers_text_binary_crlf_and_japanese() {
+        // 通常のテキスト → 全行追加のハンク
+        let d = synth_untracked_diff("new.rs", b"one\ntwo\n", MAX_UNTRACKED_BYTES);
+        assert!(d.contains("new file mode 100644"), "{d}");
+        assert!(d.contains("--- /dev/null"));
+        assert!(d.contains("@@ -0,0 +1,2 @@"));
+        let f = &crate::diff::parse_unified(&d)[0];
+        assert_eq!(f.additions, 2);
+        assert_eq!(f.new_path, "new.rs");
+        assert!(!f.is_binary);
+
+        // CRLF は \r を落として本文だけにする
+        let d = synth_untracked_diff("crlf.txt", b"a\r\nb\r\n", MAX_UNTRACKED_BYTES);
+        let f = &crate::diff::parse_unified(&d)[0];
+        let bodies: Vec<&str> = f.hunks[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(bodies, vec!["a", "b"], "\\r が残らない");
+
+        // 日本語のパスと中身
+        let d = synth_untracked_diff(
+            "ドキュメント/説明.md",
+            "# 見出し\n本文です\n".as_bytes(),
+            MAX_UNTRACKED_BYTES,
+        );
+        let f = &crate::diff::parse_unified(&d)[0];
+        assert_eq!(f.new_path, "ドキュメント/説明.md");
+        assert_eq!(f.hunks[0].lines[0].text, "# 見出し");
+
+        // バイナリは中身を出さない
+        let d = synth_untracked_diff("logo.png", b"\x89PNG\x00\x01\x02", MAX_UNTRACKED_BYTES);
+        let f = &crate::diff::parse_unified(&d)[0];
+        assert!(f.is_binary, "バイナリ判定: {d}");
+        assert!(f.hunks.is_empty(), "本文は出さない");
+
+        // 空ファイルはハンク無しでも壊れない
+        let f = crate::diff::parse_unified(&synth_untracked_diff("empty", b"", 100));
+        assert_eq!(f.len(), 1);
+        assert!(f[0].hunks.is_empty());
+
+        // 上限超過: 宣言行数と実際の行数が一致したまま省略行が入る
+        let big: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let d = synth_untracked_diff("big.txt", big.as_bytes(), 200);
+        let f = &crate::diff::parse_unified(&d)[0];
+        assert_eq!(
+            f.additions,
+            f.hunks[0].lines.len(),
+            "ハンク宣言と実行数が一致 (パースが壊れない)"
+        );
+        assert!(
+            f.hunks[0].lines.last().expect("行").text.contains("省略"),
+            "省略が明示される"
+        );
+    }
+
+    #[test]
+    fn cap_diff_text_cuts_on_line_boundary() {
+        let text = "aaaa\nbbbb\ncccc\n";
+        let (out, cut) = cap_diff_text(text, 1000);
+        assert!(!cut);
+        assert_eq!(out, text);
+
+        let (out, cut) = cap_diff_text(text, 6);
+        assert!(cut, "上限超過を伝える");
+        assert_eq!(out, "aaaa\n", "行の途中では切らない");
+    }
+
+    #[test]
+    fn review_summary_and_status_mapping() {
+        use crate::git::FileStatus;
+        let mk = |path: &str, adds: usize, dels: usize, untracked: bool| {
+            let mut d = crate::diff::parse_unified(&format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,{dels} +1,{adds} @@\n{}{}",
+                "-x\n".repeat(dels),
+                "+y\n".repeat(adds)
+            ))
+            .remove(0);
+            d.additions = adds;
+            d.deletions = dels;
+            ReviewFile {
+                status: review_file_status(&d, untracked),
+                staged: false,
+                untracked,
+                path: review_path(&d),
+                diff: d,
+            }
+        };
+        let files = vec![mk("a.rs", 3, 1, false), mk("b.rs", 10, 4, true)];
+        assert_eq!(review_summary(&files), (2, 13, 5));
+        assert_eq!(review_summary(&[]), (0, 0, 0));
+        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[1].status, FileStatus::Untracked, "未追跡が最優先");
+
+        // 追加 / 削除 / リネームの判定
+        let added = &crate::diff::parse_unified(
+            "diff --git a/n.rs b/n.rs\nnew file mode 100644\n--- /dev/null\n+++ b/n.rs\n@@ -0,0 +1,1 @@\n+x\n",
+        )[0];
+        assert_eq!(review_file_status(added, false), FileStatus::Added);
+        assert_eq!(review_path(added), "n.rs");
+
+        let removed = &crate::diff::parse_unified(
+            "diff --git a/g.rs b/g.rs\ndeleted file mode 100644\n--- a/g.rs\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-x\n",
+        )[0];
+        assert_eq!(review_file_status(removed, false), FileStatus::Deleted);
+        assert_eq!(review_path(removed), "g.rs", "消えたファイルは旧パスで扱う");
+
+        let renamed = &crate::diff::parse_unified(
+            "diff --git a/old.rs b/new.rs\nsimilarity index 95%\nrename from old.rs\nrename to new.rs\n",
+        )[0];
+        assert_eq!(review_file_status(renamed, false), FileStatus::Renamed);
+        assert_eq!(review_path(renamed), "new.rs", "リネームは新パスで操作する");
+    }
+
+    // ── PR 風レビュー: 実 git フィクスチャ ───────────────────────────
+
+    /// `git init` + 初回コミット済みの使い捨て repo。git が無ければ None。
+    fn review_repo(tag: &str) -> Option<PathBuf> {
+        let dir = crate::test_util::unique_temp_dir("zaivern-review-test", tag);
+        std::fs::create_dir_all(&dir).ok()?;
+        if !git_ok(&dir, &["init", "--quiet"]) {
+            std::fs::remove_dir_all(&dir).ok();
+            return None;
+        }
+        std::fs::write(dir.join("keep.rs"), "fn main() {}\n").ok()?;
+        std::fs::create_dir_all(dir.join("src/deep")).ok()?;
+        std::fs::write(dir.join("src/deep/mod.rs"), "// one\n// two\n").ok()?;
+        git_ok(&dir, &["add", "-A"]);
+        git_commit(&dir, "init");
+        Some(dir)
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn git_commit(dir: &Path, msg: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=zv", "-c", "user.email=zv@example.com"])
+            .args(["commit", "--quiet", "-m", msg])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// ステージ済み / 未ステージ / 未追跡 / バイナリ / リネーム / 日本語 / CRLF が
+    /// 1 回の収集で全部そろい、ベースを切り替えると集合が変わること。
+    #[test]
+    fn collect_review_covers_all_change_kinds_and_bases() {
+        let Some(repo) = review_repo("kinds") else {
+            return; // git が無い環境ではスキップ
+        };
+        // リネーム元を先にコミットしておく (後続の編集を巻き込まないため)
+        std::fs::write(repo.join("moved-src.txt"), "aaa\nbbb\nccc\n").expect("seed");
+        git_ok(&repo, &["add", "-A"]);
+        git_commit(&repo, "seed rename src");
+        // リネーム (index 上)
+        git_ok(&repo, &["mv", "moved-src.txt", "moved-dst.txt"]);
+        // 未ステージの変更
+        std::fs::write(repo.join("keep.rs"), "fn main() { changed(); }\n").expect("modify");
+        // ステージ済みの変更
+        std::fs::write(repo.join("src/deep/mod.rs"), "// one\n// two\n// three\n").expect("stage");
+        git_ok(&repo, &["add", "--", "src/deep/mod.rs"]);
+        // 未追跡: 通常テキスト / 日本語パス / CRLF / バイナリ
+        std::fs::write(repo.join("untracked.txt"), "new file\n").expect("untracked");
+        std::fs::write(repo.join("日本語ファイル.md"), "# 見出し\n本文\n").expect("ja");
+        std::fs::write(repo.join("crlf.txt"), "a\r\nb\r\n").expect("crlf");
+        std::fs::write(repo.join("blob.bin"), [0u8, 1, 2, 3, 0, 9]).expect("bin");
+
+        let head = collect_review(&repo, &ReviewBase::Head, ContextLines::Three, false);
+        assert!(head.error.is_none(), "{:?}", head.error);
+        let names: Vec<&str> = head.files.iter().map(|f| f.path.as_str()).collect();
+        for want in [
+            "keep.rs",
+            "src/deep/mod.rs",
+            "untracked.txt",
+            "日本語ファイル.md",
+            "crlf.txt",
+            "blob.bin",
+            "moved-dst.txt",
+        ] {
+            assert!(names.contains(&want), "HEAD 比較に {want} が出る: {names:?}");
+        }
+        let by = |p: &str| head.files.iter().find(|f| f.path == p).expect(p);
+        assert!(by("blob.bin").diff.is_binary, "バイナリは中身を出さない");
+        assert!(by("blob.bin").untracked);
+        assert_eq!(by("blob.bin").status, crate::git::FileStatus::Untracked);
+        assert!(by("src/deep/mod.rs").staged, "index に載っている");
+        assert!(!by("keep.rs").staged, "未ステージ");
+        assert_eq!(
+            by("日本語ファイル.md").diff.hunks[0].lines[0].text,
+            "# 見出し"
+        );
+        let crlf = by("crlf.txt");
+        assert!(
+            crlf.diff.hunks[0].lines.iter().all(|l| !l.text.contains('\r')),
+            "CRLF の \\r を持ち込まない"
+        );
+        // 合計は各ファイルの +/- の総和
+        let (n, adds, dels) = review_summary(&head.files);
+        assert_eq!(n, head.files.len());
+        assert_eq!(adds, head.files.iter().map(|f| f.diff.additions).sum::<usize>());
+        assert_eq!(dels, head.files.iter().map(|f| f.diff.deletions).sum::<usize>());
+
+        // ステージ済みだけ: 未追跡も未ステージ変更も出ない
+        let staged = collect_review(&repo, &ReviewBase::Staged, ContextLines::Three, false);
+        let sn: Vec<&str> = staged.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(sn.contains(&"src/deep/mod.rs"), "{sn:?}");
+        assert!(!sn.contains(&"untracked.txt"), "未追跡は index に無い: {sn:?}");
+        assert!(!sn.contains(&"keep.rs"), "未ステージは出ない: {sn:?}");
+
+        // 未ステージだけ: index に上げた分は出ない
+        let unstaged = collect_review(&repo, &ReviewBase::Unstaged, ContextLines::Three, false);
+        let un: Vec<&str> = unstaged.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(un.contains(&"keep.rs"), "{un:?}");
+        assert!(!un.contains(&"src/deep/mod.rs"), "{un:?}");
+        assert!(un.contains(&"untracked.txt"), "未追跡は作業ツリー側: {un:?}");
+
+        // 任意リビジョン: HEAD~1 と比べると seed コミットの分も差分に出る
+        let rev = collect_review(
+            &repo,
+            &ReviewBase::Rev("HEAD~1".into()),
+            ContextLines::Three,
+            false,
+        );
+        let rn: Vec<&str> = rev.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(rev.error.is_none(), "{:?}", rev.error);
+        assert!(rn.contains(&"moved-dst.txt") || rn.contains(&"moved-src.txt"), "{rn:?}");
+
+        // 存在しないリビジョンは静かにエラー文言を返す (panic しない)
+        let bad = collect_review(
+            &repo,
+            &ReviewBase::Rev("no-such-rev-xyz".into()),
+            ContextLines::Three,
+            false,
+        );
+        assert!(bad.error.is_some());
+        assert!(bad.files.is_empty());
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// ステージ → アンステージ → 破棄を実フィクスチャで撃ち、
+    /// 引数表どおりに状態が変わることを確かめる (安全な使い捨て repo 内のみ)。
+    #[test]
+    fn stage_unstage_discard_change_real_state() {
+        let Some(repo) = review_repo("mutate") else {
+            return;
+        };
+        std::fs::write(repo.join("keep.rs"), "fn main() { edited(); }\n").expect("edit");
+        std::fs::write(repo.join("junk.txt"), "throwaway\n").expect("untracked");
+
+        let run = |args: &[String]| {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_git(&repo, &argv).map(|_| ()).map_err(|e| e.text().to_string())
+        };
+
+        // ステージ → Staged ベースに出る
+        run(&stage_args("keep.rs")).expect("stage");
+        let staged = collect_review(&repo, &ReviewBase::Staged, ContextLines::Three, false);
+        assert!(staged.files.iter().any(|f| f.path == "keep.rs"));
+
+        // アンステージ → Staged ベースから消える
+        run(&unstage_args("keep.rs")).expect("unstage");
+        let staged = collect_review(&repo, &ReviewBase::Staged, ContextLines::Three, false);
+        assert!(!staged.files.iter().any(|f| f.path == "keep.rs"), "index から下りた");
+
+        // 破棄 (追跡済み) → 中身が HEAD に戻る
+        run(&discard_args("keep.rs", false)).expect("discard tracked");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("keep.rs")).expect("read"),
+            "fn main() {}\n",
+            "作業ツリーが HEAD に戻る"
+        );
+
+        // 破棄 (未追跡) → ファイルごと消える
+        run(&discard_args("junk.txt", true)).expect("discard untracked");
+        assert!(!repo.join("junk.txt").exists(), "未追跡ファイルは消える");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// レビュー画面のインラインコメントは既存の diff レンダラのストアを
+    /// そのまま使う。パスを鍵にしているので、再収集で添字がずれても
+    /// コメントが迷子にならない。
+    #[test]
+    fn inline_comments_survive_recollection_by_path_key() {
+        use crate::diff::{CommentAnchor, CommentSide, DiffCommentStore};
+        let mut comments: std::collections::HashMap<String, DiffCommentStore> =
+            std::collections::HashMap::new();
+        let store = comments.entry("src/deep/mod.rs".to_string()).or_default();
+        let anchor = CommentAnchor::new("src/deep/mod.rs", CommentSide::New, 3);
+        store.add(anchor.clone(), "// three", "ここは const にしたい");
+        assert_eq!(store.actionable_len(), 1);
+        assert!(store.prompt().contains("ここは const にしたい"));
+
+        // 収集し直してファイルの並びが変わっても、パス鍵なので同じ位置に残る
+        let store = comments.get("src/deep/mod.rs").expect("パス鍵で引ける");
+        assert_eq!(store.at(&anchor).len(), 1);
+        assert_eq!(store.badge(&anchor), Some((1, false)));
     }
 }
