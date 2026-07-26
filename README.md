@@ -373,6 +373,27 @@ cargo build --release
 
 macOS / Windows / Linux で同一コードのままビルドできます(Linux は要 `libgtk-3-dev` 等の rfd 依存)。
 
+### テスト
+
+```bash
+cargo test        # macOS / Windows はこれで全件
+```
+
+Linux の CI では 1 点だけ注意があります(2026-07 実測):
+
+```bash
+# GitHub Actions のホステッド Linux ランナー (2コア/7GB) では
+# terminal:: の実PTYテスト群 (シェルを実際に起動する e2e) が
+# リソース枯渇でランナープロセスごと落とすため、除外して回す
+cargo test -- --skip terminal::
+```
+
+`--skip terminal::` を付ければ残り全モジュール(約1000件)は Linux でも緑になります。
+実 PTY テスト自体は macOS / Windows(および十分なリソースのある Linux 実機)で検証済みです。
+ランナーごと死ぬとログもアーティファクトも残らないため、原因調査ではステップを
+モジュール群ごとに分割し「どのステップで死んだか」で位置を特定しました
+(ステップの完了記録だけはサーバー側に残ります)。
+
 ---
 
 ## キーバインド

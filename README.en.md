@@ -374,6 +374,27 @@ cargo build --release
 
 The same code builds on macOS / Windows / Linux (Linux needs rfd dependencies such as `libgtk-3-dev`).
 
+### Tests
+
+```bash
+cargo test        # runs everything on macOS / Windows
+```
+
+One caveat for Linux CI (measured 2026-07):
+
+```bash
+# On GitHub Actions hosted Linux runners (2 cores / 7 GB) the terminal::
+# real-PTY test suite (e2e tests that spawn actual shells) exhausts the
+# runner's resources and kills the runner process itself — skip it there
+cargo test -- --skip terminal::
+```
+
+With `--skip terminal::` the remaining ~1000 tests are green on Linux as well.
+The real-PTY tests themselves are verified on macOS / Windows (and on Linux
+machines with adequate resources). Because a dying runner leaves no logs or
+artifacts, the culprit was located by splitting the run into per-module steps —
+step completion records survive on the server even when the runner dies.
+
 ---
 
 ## Keybindings
