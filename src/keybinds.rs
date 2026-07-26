@@ -88,10 +88,12 @@ pub enum BindAction {
     LspRename,
     /// ドキュメントの整形 (VS Code: ⇧⌥F)
     LspFormat,
+    /// 次の出現を選択してキャレットを増やす (VS Code: ⌘D)
+    SelectNextOccurrence,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 46] = [
+const ALL_ACTIONS: [BindAction; 47] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -138,6 +140,7 @@ const ALL_ACTIONS: [BindAction; 46] = [
     BindAction::LspSymbols,
     BindAction::LspRename,
     BindAction::LspFormat,
+    BindAction::SelectNextOccurrence,
 ];
 
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
@@ -207,6 +210,8 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::LspFormat => {
             KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F)
         }
+        // VS Code と同じ ⌘D。⇧⌘D (行の複製) とは別で、既存の割り当てとは重ならない
+        BindAction::SelectNextOccurrence => KeyboardShortcut::new(cmd, Key::D),
     }
 }
 
@@ -290,6 +295,7 @@ impl Keybinds {
             "lsp_symbols" => LspSymbols,
             "lsp_rename" => LspRename,
             "lsp_format" => LspFormat,
+            "select_next_occurrence" => SelectNextOccurrence,
             _ => return None,
         })
     }
@@ -809,7 +815,7 @@ mod tests {
             "nav_forward", "goto_definition", "goto_bracket", "run_build_task",
             "toggle_problems", "toggle_fullscreen", "toggle_fold", "unfold_all",
             "toggle_bookmark", "reopen_closed_tab", "lsp_completion", "lsp_references",
-            "lsp_symbols", "lsp_rename", "lsp_format",
+            "lsp_symbols", "lsp_rename", "lsp_format", "select_next_occurrence",
         ];
         assert_eq!(names.len(), ALL_ACTIONS.len(), "名前表とアクション一覧の数が合わない");
         let mut resolved: Vec<BindAction> =

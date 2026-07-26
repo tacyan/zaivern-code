@@ -1274,6 +1274,316 @@ pub fn agent_composer_ui(
     composer_action(buf, press)
 }
 
+// ---------------------------------------------------------------------------
+// 統合承認キューのパネル (engine: crate::agents::approvals)
+// ---------------------------------------------------------------------------
+
+/// キー 1 打 → 承認コマンド。**UI もテストもここだけを通る**。
+///
+/// 割り当ては `approvals` モジュール doc の「描画契約」に従う:
+/// `Y` 承認 / `A` 同種を全部承認 / `⇧A` 常に許可 / `N` 拒否 / `⇧N` 常に拒否。
+/// 他のキーは `None` — パネルは何も食べないので、下の端末へそのまま流れる。
+pub fn approval_key_command(
+    key: egui::Key,
+    shift: bool,
+) -> Option<crate::agents::approvals::Command> {
+    use crate::agents::approvals::Command;
+    match (key, shift) {
+        (egui::Key::Y, _) => Some(Command::Approve),
+        (egui::Key::A, false) => Some(Command::ApproveAllOfKind),
+        (egui::Key::A, true) => Some(Command::ApproveKindForAgentAlways),
+        (egui::Key::N, false) => Some(Command::Deny),
+        (egui::Key::N, true) => Some(Command::DenyKindForAgentAlways),
+        _ => None,
+    }
+}
+
+/// 承認要求 1 件の要約行に添える経過時間 (「3 分前」)。
+///
+/// `now` も引数で受けるので、時計に依存せずテストできる。
+pub fn approval_age_label(created_at: u64, now: u64) -> String {
+    let secs = now.saturating_sub(created_at);
+    if secs < 60 {
+        trf("{n} 秒前", &[("n", secs.to_string())])
+    } else if secs < 3600 {
+        trf("{n} 分前", &[("n", (secs / 60).to_string())])
+    } else {
+        trf("{n} 時間前", &[("n", (secs / 3600).to_string())])
+    }
+}
+
+/// 承認パネルの描画結果。app.rs が描画後にまとめて実行する。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApprovalsOutcome {
+    /// `(要求 ID, コマンド)` を順に `ApprovalQueue::apply` へ渡す。
+    pub commands: Vec<(u64, crate::agents::approvals::Command)>,
+    /// 監査ログを読み直してほしい (タブを開いた / 「更新」を押した)。
+    pub reload_audit: bool,
+}
+
+/// **統合承認キューのパネル**。承認待ちを 1 行ずつ出し、キーとボタンで捌く。
+///
+/// - 引数はすべて借り物で、この関数は**何も実行しない** ([`ApprovalsOutcome`] を返すだけ)。
+///   PTY への送信も config への永続化も app.rs の仕事 (承認の副作用を
+///   描画コードに混ぜない = テストできる形を保つため)。
+/// - 監査ログは `audit` が `Some` のときだけ描く。**読み込みはここではしない**
+///   (毎フレーム I/O を避けるため、app.rs が控えを渡す)。
+pub fn approvals_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    queue: &crate::agents::approvals::ApprovalQueue,
+    expanded: &mut std::collections::HashSet<u64>,
+    show_audit: &mut bool,
+    audit: Option<&[crate::agents::approvals::AuditEntry]>,
+    now_secs: u64,
+) -> ApprovalsOutcome {
+    use crate::agents::approvals::Command;
+    let mut out = ApprovalsOutcome::default();
+
+    ui.horizontal(|ui| {
+        let n = queue.pending_len();
+        ui.label(
+            RichText::new(trf("🛡 承認待ち: {n} 件", &[("n", n.to_string())]))
+                .strong()
+                .color(if n > 0 { theme.warn } else { theme.text_dim }),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let was = *show_audit;
+            if ui
+                .selectable_label(was, tr("📜 監査ログ"))
+                .on_hover_text(tr(
+                    "この Zaivern が下した判断の記録 (~/.zaivern/approvals.jsonl の末尾)",
+                ))
+                .clicked()
+            {
+                *show_audit = !was;
+                // 開いた瞬間だけ読み直す (閉じている間は 1 バイトも読まない)
+                out.reload_audit = *show_audit;
+            }
+            if *show_audit && ui.small_button("⟳").on_hover_text(tr("読み直す")).clicked() {
+                out.reload_audit = true;
+            }
+        });
+    });
+    ui.separator();
+
+    if *show_audit {
+        audit_ui(ui, theme, audit);
+        return out;
+    }
+
+    // ── キー操作は「いちばん古い 1 件」に効く (キューの順に捌ける) ──
+    //
+    // **どこかに文字入力のフォーカスがある間は一切触らない**。本文エディタや
+    // 検索欄で「y」と打っただけで承認が飛ぶ、という事故を防ぐための歯止め。
+    let typing = ui.ctx().memory(|m| m.focused().is_some());
+    let head = queue.pending().next().map(|r| r.id);
+    if let (Some(id), false) = (head, typing) {
+        // 拾ったキーは**取り除く** (二重に効かないように)。
+        let mut pressed: Vec<(egui::Key, bool)> = Vec::new();
+        ui.input_mut(|i| {
+            i.events.retain(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if !modifiers.command && !modifiers.ctrl && !modifiers.alt => {
+                    if approval_key_command(*key, modifiers.shift).is_some() {
+                        pressed.push((*key, modifiers.shift));
+                        false
+                    } else {
+                        true
+                    }
+                }
+                _ => true,
+            });
+        });
+        for (key, shift) in pressed {
+            if let Some(cmd) = approval_key_command(key, shift) {
+                out.commands.push((id, cmd));
+            }
+        }
+    }
+
+    if queue.pending_len() == 0 {
+        ui.vertical_centered(|ui| {
+            ui.add_space(18.0);
+            ui.label(
+                RichText::new(tr(
+                    "承認待ちはありません — エージェントが許可を求めるとここに並びます",
+                ))
+                .color(theme.text_dim),
+            );
+        });
+        return out;
+    }
+
+    ui.label(
+        RichText::new(tr(
+            "Y=承認 / A=この種別を全て承認 / ⇧A=このエージェントの この種別を常に許可 / N=拒否 / ⇧N=常に拒否",
+        ))
+        .size(11.0)
+        .color(theme.text_dim),
+    );
+    ui.add_space(2.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt("zv-approvals")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            for (i, req) in queue.pending().enumerate() {
+                let head = i == 0;
+                egui::Frame::none()
+                    .fill(if head { theme.panel_alt } else { theme.bg })
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        if head { theme.warn } else { theme.border },
+                    ))
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(req.kind.icon()).size(15.0));
+                            ui.label(
+                                RichText::new(tr(req.kind.label()))
+                                    .strong()
+                                    .color(theme.text),
+                            );
+                            ui.label(
+                                RichText::new(format!("👾 {}", req.agent_bin))
+                                    .size(11.0)
+                                    .color(theme.text_dim),
+                            );
+                            ui.label(
+                                RichText::new(approval_age_label(req.created_at, now_secs))
+                                    .size(11.0)
+                                    .color(theme.text_dim),
+                            );
+                            if req.never_auto {
+                                ui.label(
+                                    RichText::new(tr("⛔ 権限昇格 — 常に許可にはできません"))
+                                        .size(11.0)
+                                        .color(theme.err),
+                                );
+                            }
+                        });
+                        ui.label(RichText::new(&req.summary).color(theme.text));
+
+                        let open = expanded.contains(&req.id);
+                        if ui
+                            .small_button(if open { tr("▾ 詳細") } else { tr("▸ 詳細") })
+                            .clicked()
+                        {
+                            if open {
+                                expanded.remove(&req.id);
+                            } else {
+                                expanded.insert(req.id);
+                            }
+                        }
+                        if open {
+                            if !req.detail.trim().is_empty() {
+                                ui.label(
+                                    RichText::new(&req.detail).size(11.5).color(theme.text_dim),
+                                );
+                            }
+                            if !req.raw_prompt_excerpt.trim().is_empty() {
+                                ui.label(
+                                    RichText::new(tr("画面の抜粋:"))
+                                        .size(11.0)
+                                        .color(theme.text_dim),
+                                );
+                                ui.label(
+                                    RichText::new(&req.raw_prompt_excerpt)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(theme.text_dim),
+                                );
+                            }
+                        }
+
+                        ui.horizontal_wrapped(|ui| {
+                            let mut btn = |ui: &mut egui::Ui, label: String, tip: &str, c: Command| {
+                                if ui.small_button(label).on_hover_text(tip).clicked() {
+                                    out.commands.push((req.id, c));
+                                }
+                            };
+                            btn(ui, tr("✔ 承認 (Y)"), &tr("この 1 件だけ許可します"), Command::Approve);
+                            btn(
+                                ui,
+                                tr("✔✔ 同種を全て (A)"),
+                                &tr("いま待っている同じ種別をまとめて承認します"),
+                                Command::ApproveAllOfKind,
+                            );
+                            btn(
+                                ui,
+                                tr("🛡 常に許可 (⇧A)"),
+                                &tr(
+                                    "以後このエージェントのこの種別を自動で許可します (config.toml に残ります)",
+                                ),
+                                Command::ApproveKindForAgentAlways,
+                            );
+                            btn(ui, tr("✖ 拒否 (N)"), &tr("この 1 件を断ります"), Command::Deny);
+                            btn(
+                                ui,
+                                tr("⛔ 常に拒否 (⇧N)"),
+                                &tr(
+                                    "以後このエージェントのこの種別を自動で断ります (config.toml に残ります)",
+                                ),
+                                Command::DenyKindForAgentAlways,
+                            );
+                        });
+                    });
+                ui.add_space(4.0);
+            }
+        });
+
+    out
+}
+
+/// 監査ログ (末尾から新しい順) の表示。読み込みは呼び出し側の仕事。
+fn audit_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    audit: Option<&[crate::agents::approvals::AuditEntry]>,
+) {
+    let Some(rows) = audit else {
+        ui.label(RichText::new(tr("読み込み中…")).color(theme.text_dim));
+        return;
+    };
+    if rows.is_empty() {
+        ui.vertical_centered(|ui| {
+            ui.add_space(18.0);
+            ui.label(
+                RichText::new(tr("まだ記録がありません — 承認/拒否すると 1 行ずつ残ります"))
+                    .color(theme.text_dim),
+            );
+        });
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("zv-approvals-audit")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            // 末尾 = 新しい。読む人には新しい方が上のほうが早い。
+            for e in rows.iter().rev() {
+                ui.horizontal(|ui| {
+                    let allow = e.decision.starts_with("allow");
+                    ui.label(
+                        RichText::new(if allow { "✔" } else { "✖" })
+                            .color(if allow { theme.ok } else { theme.err }),
+                    );
+                    ui.label(
+                        RichText::new(format!("{} / {} / {}", e.agent, e.kind, e.source))
+                            .size(11.0)
+                            .color(theme.text_dim),
+                    );
+                    ui.label(RichText::new(&e.summary).size(11.5).color(theme.text));
+                });
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1844,5 +2154,54 @@ mod tests {
             ComposerAction::SendTo(11, src.to_string()),
             "改行も末尾の 1 行も 1 文字違わず届く"
         );
+    }
+
+    // ── 統合承認キューのパネル ─────────────────────────────────
+
+    /// 経過時間の表示は 秒 → 分 → 時 で切り替わる (時計に依存しない)。
+    #[test]
+    fn 承認要求の経過時間は単位が切り替わる() {
+        // tr/trf は辞書が無ければ原文のままなので、数字と単位だけ見る
+        assert!(approval_age_label(100, 130).contains("30"));
+        assert!(approval_age_label(100, 130).contains("秒"));
+        assert!(approval_age_label(0, 90).contains("分"));
+        assert!(approval_age_label(0, 7200).contains("時間"));
+        // 時計が巻き戻っても負にならない (0 秒前)
+        assert!(approval_age_label(500, 100).contains("0"));
+    }
+
+    /// パネルは自分では何も実行しない — 依頼を積んで返すだけ。
+    /// (PTY への送信も config への保存も app.rs 側の仕事)
+    #[test]
+    fn 承認パネルは副作用を持たない() {
+        let src = include_str!("panels.rs");
+        let body = src.split("pub fn approvals_ui(").nth(1).expect("パネルがある");
+        let head = &body[..body.find("\n/// ").unwrap_or(body.len())];
+        for forbidden in ["std::fs::", "send_text", "read_audit_tail", "save_state"] {
+            assert!(
+                !head.contains(forbidden),
+                "描画関数が {forbidden} を直接呼んでいる (毎フレーム副作用になる)"
+            );
+        }
+        assert!(head.contains("ApprovalsOutcome"), "依頼を返していない");
+    }
+
+    /// 文字入力中は承認キーを**一切**拾わない。
+    /// エディタで「y」と打っただけで承認が飛ぶ、という事故の歯止め。
+    #[test]
+    fn 入力中は承認キーを拾わない() {
+        let src = include_str!("panels.rs");
+        let body = src.split("pub fn approvals_ui(").nth(1).expect("パネルがある");
+        let head = &body[..body.find("\n/// ").unwrap_or(body.len())];
+        assert!(
+            head.contains("let typing = ui.ctx().memory(|m| m.focused().is_some());"),
+            "フォーカスの有無を見ていない"
+        );
+        assert!(
+            head.contains("if let (Some(id), false) = (head, typing)"),
+            "入力中でも拾ってしまう"
+        );
+        // 拾ったキーは取り除く (下の層で二重に効かない)
+        assert!(head.contains("i.events.retain("), "キーを消費していない");
     }
 }

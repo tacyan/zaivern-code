@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
 
 use crate::agent_picker::{self, AgentPicker};
-use crate::agents::{AgentManager, SessionEvent};
+use crate::agents::{self, AgentManager, SessionEvent};
 use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
@@ -49,6 +49,7 @@ use crate::terminal;
 use crate::theme::{self, Theme};
 use crate::plugins;
 use crate::theme_json;
+use crate::tutorial::{self, AnchorId};
 use crate::voice;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -560,6 +561,10 @@ struct CockpitActions {
     cycle: Option<usize>,
     cycle_all: bool,
     broadcast: Option<String>,
+    /// **1 体だけ**へ送る `(セッション ID, 本文)`。
+    /// コンポーザで宛先を指名したとき。全員へは飛ばさない
+    /// (「レビューのプロンプトが全エージェントへ漏れる」問題の元栓)。
+    send_to: Option<(u64, String)>,
     voice: Option<u64>,
     voice_all: bool,
     voice_stop: bool,
@@ -1016,6 +1021,36 @@ impl FrameGuard {
         self.policy = FramePanicPolicy::default();
         self.quarantined.clear();
         self.banner = None;
+    }
+
+    /// **1 つの部分ビューだけ**隔離を解く (プレースホルダの「再試行」)。
+    ///
+    /// 頻度の記憶も同時に捨てる。残したままだと「再試行 → 1 回 panic →
+    /// 即また隔離」となり、押しても何も直らないように見えるため。
+    /// 最後の 1 つを解いたらバナーも消す (もう隔離は残っていない)。
+    fn unquarantine(&mut self, sv: &Subview) {
+        self.quarantined.remove(sv);
+        self.policy.streak = 0;
+        self.policy.recent.clear();
+        self.policy.clean = 0;
+        if self.quarantined.is_empty() {
+            self.banner = None;
+        }
+    }
+
+    /// 消えたセッションの隔離指定を捨てる。
+    ///
+    /// ID が再利用されたとき、新しいタイルがいきなり隔離状態 (= 黒いまま)
+    /// で現れるのを防ぐ。`alive` に無い `Subview::Session` だけを外し、
+    /// パネルの隔離 (`Subview::Panel`) はそのまま残す。
+    fn forget_sessions(&mut self, alive: &HashSet<u64>) {
+        self.quarantined.retain(|sv| match sv {
+            Subview::Session(id) => alive.contains(id),
+            Subview::Panel(_) => true,
+        });
+        if self.quarantined.is_empty() {
+            self.banner = None;
+        }
     }
 }
 
@@ -1602,11 +1637,8 @@ pub struct ZaivernApp {
     /// 他 OS では常に「確認不要」なので何も表示しない。
     fw: firewall::FirewallUi,
     qr_tex: Option<egui::TextureHandle>,
-    broadcast_input: String,
+    /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
-    /// 次フレームで一斉送信欄へフォーカスを戻す (差分ビューのレビューコメント
-    /// 流し込みが立てる)。egui のフォーカス要求は描画中にしか出せないため。
-    broadcast_focus: bool,
     /// プラン使用量の監視 (集約・枯渇予測)。読み取りはこの中で TTL 付きの
     /// バックグラウンドスレッドへ逃がされるので、毎フレーム触ってよい。
     quota: coordinator::QuotaWatch,
@@ -1815,6 +1847,41 @@ pub struct ZaivernApp {
     /// 描くフレームでキーボードフォーカスを移すための予約フラグ。
     /// これが無いと、タブを押しても端末をもう一度クリックするまで入力が移らない。
     term_focus_pending: bool,
+
+    // ── 初回起動ガイドツアー (crate::tutorial) ────────────────────
+    /// ツアーの状態。描画は毎フレーム最後の `overlay` 1 本だけ。
+    tutorial: tutorial::Tutorial,
+    /// `autostart()` を撃ったか。egui の Context が要るので `new()` では呼べず、
+    /// 最初の `update_impl` で 1 回だけ呼ぶ (何度も呼ぶと位置が 0 へ戻る)。
+    tutorial_autostarted: bool,
+
+    // ── 統合承認キューのパネル (crate::agents::approvals) ─────────
+    /// ボトムパネルを「承認キュー」表示に切り替えているか
+    /// (「📋 看板」と同じ流儀で、端末の代わりに敷き詰める)。
+    approvals_view: bool,
+    /// 承認キューの中で監査ログ (`approvals.jsonl` の末尾) を見ているか。
+    approvals_audit: bool,
+    /// 監査ログの読み込み結果と、読んだ時刻。**毎フレーム読まない**ための控え。
+    /// `None` なら次の描画で 1 回だけ読む。
+    approvals_audit_cache: Option<Vec<agents::approvals::AuditEntry>>,
+    /// 折りたたみを開いている承認要求の ID (詳細 / 生プロンプト抜粋)。
+    approvals_expanded: HashSet<u64>,
+
+    // ── 複数キャレット (crate::editor_ops::MultiSel) ────────────────
+    /// `(バッファ ID, 選択集合)`。**タブごとに 1 つ**で、タブを切り替えると
+    /// 捨てる (別のファイルのバイト位置を持ち越すと本文を壊すため)。
+    multi_sel: Option<(u64, editor_ops::MultiSel)>,
+    /// 上下にキャレットを伸ばすときの sticky column (表示桁)。
+    /// 途中に短い行があっても押し始めた桁へ戻るために持つ。
+    multi_sticky_col: Option<usize>,
+    /// 矩形選択の始点 `(バッファ ID, 行, 表示桁)`。「開始」で置き、「確定」で使う。
+    column_anchor: Option<(u64, usize, usize)>,
+
+    // ── 符号化を指定して開き直す / 保存する ─────────────────────────
+    /// 符号化ピッカー。`Some(true)` なら保存用、`Some(false)` なら開き直し用。
+    enc_picker: Option<bool>,
+    /// ピッカーの絞り込み文字列。
+    enc_filter: String,
 }
 
 /// 指揮官に選べないセッションの理由。選べるなら `None`。
@@ -2098,9 +2165,7 @@ impl ZaivernApp {
             fw: firewall::FirewallUi::default(),
             voice: VoiceState::default(),
             qr_tex: None,
-            broadcast_input: String::new(),
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
-            broadcast_focus: false,
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             save_trim_trailing: false,
@@ -2163,6 +2228,17 @@ impl ZaivernApp {
             commander_seen: HashSet::new(),
             commander_seen_order: std::collections::VecDeque::new(),
             term_focus_pending: false,
+            tutorial: tutorial::Tutorial::new(),
+            tutorial_autostarted: false,
+            approvals_view: false,
+            approvals_audit: false,
+            approvals_audit_cache: None,
+            approvals_expanded: HashSet::new(),
+            multi_sel: None,
+            multi_sticky_col: None,
+            column_anchor: None,
+            enc_picker: None,
+            enc_filter: String::new(),
             cfg,
         };
         // 設定で指名されている指揮官を反映する (居なければ起動を待つだけ)。
@@ -3662,6 +3738,194 @@ impl ZaivernApp {
         self.pending_select = Some(new_sel);
     }
 
+    // ─── 複数キャレット (editor_ops::MultiSel) ──────────────────────
+
+    /// アクティブバッファの `(index, id, egui の選択範囲 (char))` を取る。
+    fn active_buffer_selection(&self, ctx: &egui::Context) -> Option<(usize, u64, usize, usize)> {
+        let i = self.editor.active?;
+        let id = self.editor.buffers.get(i)?.id;
+        let ed_id = egui::Id::new(("zaivern-buffer", id));
+        let (a, b) = egui::TextEdit::load_state(ctx, ed_id)
+            .and_then(|st| st.cursor.char_range())
+            .map(|r| (r.primary.index, r.secondary.index))
+            .unwrap_or((0, 0));
+        Some((i, id, a.min(b), a.max(b)))
+    }
+
+    /// いまの複数キャレット集合。無ければ egui の単一選択を種にして作る。
+    ///
+    /// タブが切り替わっていたら (バッファ ID が違う) 前の集合は**捨てる** —
+    /// 別のファイルのバイト位置をそのまま当てると本文を壊すため。
+    fn multi_seed(&mut self, buf_id: u64, text: &str, start: usize, end: usize) -> editor_ops::MultiSel {
+        match &self.multi_sel {
+            Some((id, sel)) if *id == buf_id && !sel.is_empty() => sel.clone(),
+            _ => editor_ops::MultiSel::from_char_ranges(text, [start..end]),
+        }
+    }
+
+    /// 複数キャレットの結果を反映する (キャレットの見た目は 1 本だけ)。
+    ///
+    /// `to_first` が真なら先頭のキャレットへ寄せる (上へ伸ばすコマンド用)。
+    fn commit_multi(&mut self, buf_id: u64, sel: editor_ops::MultiSel, to_first: bool) {
+        let Some(i) = self.editor.active else { return };
+        let text = self.editor.buffers[i].text.clone();
+        let n = sel.len();
+        let r = if to_first {
+            sel.carets().first().cloned().unwrap_or(0..0)
+        } else {
+            sel.to_single_selection()
+        };
+        // バイト範囲 → char 範囲 (egui のキャレットは char 添字)
+        let cs = text[..r.start.min(text.len())].chars().count();
+        let ce = cs + text[r.start.min(text.len())..r.end.min(text.len())].chars().count();
+        self.pending_select = Some((cs, ce));
+        self.multi_sel = Some((buf_id, sel));
+        if n > 1 {
+            self.toast(
+                trf(
+                    "✏ キャレット {n} 本 (編集コマンドは全箇所へ 1 回の取り消しで効きます)",
+                    &[("n", n.to_string())],
+                ),
+                true,
+            );
+        }
+    }
+
+    /// パレットから来た複数キャレット系コマンドを処理する。
+    fn apply_cmd_multi_cursor(&mut self, cmd: Cmd, ctx: &egui::Context) {
+        let tw = crate::highlight::DEFAULT_TAB_WIDTH;
+        let Some((i, buf_id, start, end)) = self.active_buffer_selection(ctx) else {
+            self.toast(tr("先にファイルを開いてください"), false);
+            return;
+        };
+        let text = self.editor.buffers[i].text.clone();
+
+        match cmd {
+            Cmd::ClearMultiCursor => {
+                self.multi_sel = None;
+                self.multi_sticky_col = None;
+                self.column_anchor = None;
+                self.toast(tr("✏ 複数キャレットを解除しました"), true);
+            }
+            Cmd::AddCursorAbove | Cmd::AddCursorBelow => {
+                let up = matches!(cmd, Cmd::AddCursorAbove);
+                let seed = self.multi_seed(buf_id, &text, start, end);
+                // sticky column: 押し始めの桁を覚えて、短い行を跨いでも戻る
+                if self.multi_sticky_col.is_none() {
+                    let anchor = if up {
+                        seed.carets().first().map(|r| r.start)
+                    } else {
+                        seed.carets().last().map(|r| r.end)
+                    };
+                    self.multi_sticky_col =
+                        anchor.map(|b| editor_ops::visual_column_of(&text, b, tw));
+                }
+                let col = self.multi_sticky_col;
+                let next = if up {
+                    editor_ops::add_cursor_above_at(&text, &seed, tw, col)
+                } else {
+                    editor_ops::add_cursor_below_at(&text, &seed, tw, col)
+                };
+                if next.len() == seed.len() {
+                    self.toast(tr("これ以上キャレットを増やせません"), false);
+                    return;
+                }
+                self.commit_multi(buf_id, next, up);
+            }
+            Cmd::SelectAllOccurrences | Cmd::SelectNextOccurrence => {
+                let needle: String = text
+                    .chars()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                    .collect();
+                if needle.trim().is_empty() {
+                    self.toast(tr("先に語を選択してください (選択が空です)"), false);
+                    return;
+                }
+                // 一致規則は「ファイル間で検索」と同じ設定をそのまま使う
+                let opts = editor_ops::MatchOpts {
+                    case_sensitive: self.gsearch.case_sensitive,
+                    whole_word: self.gsearch.whole_word,
+                    regex: false,
+                };
+                let next = if matches!(cmd, Cmd::SelectAllOccurrences) {
+                    editor_ops::select_all_occurrences(&text, &needle, opts)
+                } else {
+                    let seed = self.multi_seed(buf_id, &text, start, end);
+                    editor_ops::select_next_occurrence(&text, &seed, &needle, opts)
+                };
+                if next.is_empty() {
+                    self.toast(tr("見つかりませんでした"), false);
+                    return;
+                }
+                self.multi_sticky_col = None;
+                self.commit_multi(buf_id, next, false);
+            }
+            Cmd::MultiPaste => {
+                let Some(ins) = menu_bar::clipboard_text() else {
+                    self.toast(tr("クリップボードにテキストがありません"), false);
+                    return;
+                };
+                let seed = self.multi_seed(buf_id, &text, start, end);
+                if seed.is_empty() {
+                    self.toast(tr("キャレットがありません"), false);
+                    return;
+                }
+                // **1 回だけ**本文を差し替える = egui の取り消しも 1 段。
+                let (new_text, sel, n) = multi_batch_insert(&text, &seed, &ins);
+                let b = &mut self.editor.buffers[i];
+                b.text = new_text;
+                b.cache = None;
+                b.gutter = None;
+                self.fold_view = None;
+                self.queue_lsp_change(i);
+                self.commit_multi(buf_id, sel, false);
+                self.toast(
+                    trf(
+                        "✏ {n} 箇所へ貼り付けました (⌘Z 一回で戻ります)",
+                        &[("n", n.to_string())],
+                    ),
+                    true,
+                );
+            }
+            Cmd::ColumnSelectStart => {
+                let (line, col) = char_index_to_line_col(&text, start, tw);
+                self.column_anchor = Some((buf_id, line, col));
+                self.toast(
+                    trf(
+                        "◇ 矩形選択の始点: {line} 行 {col} 桁 — もう一方の角へ移動して「矩形選択の確定」",
+                        &[
+                            ("line", (line + 1).to_string()),
+                            ("col", (col + 1).to_string()),
+                        ],
+                    ),
+                    true,
+                );
+            }
+            Cmd::ColumnSelectFinish => {
+                let Some((aid, al, ac)) = self.column_anchor else {
+                    self.toast(tr("先に「矩形選択の開始」を実行してください"), false);
+                    return;
+                };
+                if aid != buf_id {
+                    self.column_anchor = None;
+                    self.toast(tr("矩形選択の始点は別のタブのものでした — やり直してください"), false);
+                    return;
+                }
+                let (hl, hc) = char_index_to_line_col(&text, end, tw);
+                let sel = editor_ops::column_selection(&text, al, ac, hl, hc, tw);
+                self.column_anchor = None;
+                self.multi_sticky_col = None;
+                if sel.is_empty() {
+                    self.toast(tr("矩形が空です"), false);
+                    return;
+                }
+                self.commit_multi(buf_id, sel, false);
+            }
+            _ => {}
+        }
+    }
+
     fn toast(&mut self, msg: impl Into<String>, ok: bool) {
         self.push_toast(msg, if ok { 0 } else { 2 });
     }
@@ -4033,12 +4297,10 @@ impl ZaivernApp {
         if !self.agent_input_buf.append_prompt_for(target, &prompt) {
             return;
         }
-        self.broadcast_input = self.agent_input_buf.text().to_string();
         // 入力欄が見えていないと「押したのに何も起きない」ので開く
         self.cockpit = true;
         self.kanban = false;
         self.agents.panel_open = true;
-        self.broadcast_focus = true;
         self.toast(
             tr("レビューコメントを入力欄へ入れました (内容を確かめてから送信してください)"),
             true,
@@ -4315,6 +4577,209 @@ impl ZaivernApp {
                 self.toast(trf("保存に失敗しました: {e}", &[("e", e.to_string())]), false);
                 false
             }
+        }
+    }
+
+    // ─── 符号化を指定して開き直す / 保存する (crate::textenc) ────────
+
+    /// パレットから来た符号化コマンドを処理する。
+    fn apply_cmd_encoding(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::ReopenWithEncoding(None) => self.open_encoding_picker(false),
+            Cmd::SaveWithEncoding(None) => self.open_encoding_picker(true),
+            Cmd::ReopenWithEncoding(Some(id)) => self.reopen_with_encoding(&id),
+            Cmd::SaveWithEncoding(Some(id)) => self.save_with_encoding(&id),
+            _ => {}
+        }
+    }
+
+    /// 符号化ピッカーを開く (`for_save` が真なら保存用)。
+    fn open_encoding_picker(&mut self, for_save: bool) {
+        if self.editor.active.is_none() {
+            self.toast(tr("先にファイルを開いてください"), false);
+            return;
+        }
+        self.enc_picker = Some(for_save);
+        self.enc_filter.clear();
+    }
+
+    /// **指定した符号化で開き直す**。自動判定は使わない。
+    ///
+    /// 化けた箇所があれば件数を添えて警告する — 黙って壊れた本文を見せない。
+    fn reopen_with_encoding(&mut self, id: &str) {
+        let Some(i) = self.editor.active else {
+            self.toast(tr("先にファイルを開いてください"), false);
+            return;
+        };
+        let Some(enc) = crate::textenc::encoding_by_name(id) else {
+            self.toast(trf("この環境では使えない符号化です: {id}", &[("id", id.to_string())]), false);
+            return;
+        };
+        let Some(path) = self.editor.buffers[i].path.clone() else {
+            self.toast(tr("保存されていないタブは開き直せません"), false);
+            return;
+        };
+        // 未保存の変更があるときは黙って捨てない (開き直し = ディスクの再読込)
+        if self.editor.buffers[i].dirty() {
+            self.toast(
+                tr("未保存の変更があります — 保存するか元に戻してから開き直してください"),
+                false,
+            );
+            return;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.toast(trf("読み込めません: {e}", &[("e", e.to_string())]), false);
+                return;
+            }
+        };
+        let rep = crate::textenc::reopen_with_report(&bytes, enc);
+        let lossy = rep.lossy();
+        let n = rep.replacements;
+        let label = rep.format.label();
+        {
+            let b = &mut self.editor.buffers[i];
+            b.text = rep.text;
+            b.encoding = rep.format.encoding;
+            b.saved_hash = hash_str(&b.text);
+            b.cache = None;
+            b.gutter = None;
+            b.disk_mtime = disk_mtime(&path);
+            b.conflict_notified = None;
+        }
+        self.multi_sel = None;
+        self.column_anchor = None;
+        self.le_cache = None;
+        self.queue_lsp_change(i);
+        if lossy {
+            self.toast_warn(trf(
+                "⚠ {label} で開き直しましたが {n} 箇所が化けています — 別の符号化を試してください",
+                &[("label", label), ("n", n.to_string())],
+            ));
+        } else {
+            self.toast(trf("{label} で開き直しました", &[("label", label)]), true);
+        }
+    }
+
+    /// **指定した符号化で保存する**。表せない文字があれば保存せずに知らせ、
+    /// その文字までキャレットを飛ばす (どこを直せばいいか分かる形で断る)。
+    fn save_with_encoding(&mut self, id: &str) {
+        let Some(i) = self.editor.active else {
+            self.toast(tr("先にファイルを開いてください"), false);
+            return;
+        };
+        let Some(enc) = crate::textenc::encoding_by_name(id) else {
+            self.toast(trf("この環境では使えない符号化です: {id}", &[("id", id.to_string())]), false);
+            return;
+        };
+        let Some(path) = self.editor.buffers[i].path.clone() else {
+            self.toast(tr("先に名前を付けて保存してください"), false);
+            return;
+        };
+        self.apply_save_cleanup(i);
+        let text = self.editor.buffers[i].text.clone();
+        let ending = crate::textenc::detect_line_ending(&text);
+        match crate::textenc::save_with(&text, enc, ending) {
+            Ok(bytes) => match std::fs::write(&path, &bytes) {
+                Ok(()) => {
+                    let b = &mut self.editor.buffers[i];
+                    b.encoding = enc;
+                    b.saved_hash = hash_str(&text);
+                    b.disk_mtime = disk_mtime(&path);
+                    b.conflict_notified = None;
+                    self.tree.invalidate();
+                    self.le_cache = None;
+                    self.toast(
+                        trf(
+                            "💾 {enc} で保存しました: {path}",
+                            &[("enc", enc.name()), ("path", path.display().to_string())],
+                        ),
+                        true,
+                    );
+                }
+                Err(e) => {
+                    self.toast(trf("保存に失敗しました: {e}", &[("e", e.to_string())]), false)
+                }
+            },
+            Err(issue) => {
+                // 保存できない文字へキャレットを移す。char 添字なのでそのまま渡せる。
+                if let Some(ix) = issue.char_index() {
+                    self.pending_select = Some((ix, ix + 1));
+                }
+                self.toast_warn(issue.message());
+            }
+        }
+    }
+
+    /// 符号化ピッカーの小窓。**実測で使えるものだけ**を並べる。
+    fn encoding_picker_ui(&mut self, ctx: &egui::Context) {
+        let Some(for_save) = self.enc_picker else { return };
+        let theme = self.theme.clone();
+        let mut open = true;
+        let mut chosen: Option<String> = None;
+        let title = if for_save {
+            tr("エンコーディングを指定して保存")
+        } else {
+            tr("エンコーディングを指定して開き直す")
+        };
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(
+                    RichText::new(tr(
+                        "この一覧は「この PC で本当に往復できる」符号化だけです (実測)",
+                    ))
+                    .size(11.5)
+                    .color(theme.text_dim),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.enc_filter)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(tr("絞り込み (utf, sjis, cp932 …)")),
+                );
+                ui.separator();
+                let q = self.enc_filter.trim().to_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt("zv-enc-picker")
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for info in crate::textenc::supported_encodings() {
+                            if !q.is_empty()
+                                && !info.id.to_lowercase().contains(&q)
+                                && !info.label.to_lowercase().contains(&q)
+                                && !info.aliases.iter().any(|a| a.contains(&q))
+                            {
+                                continue;
+                            }
+                            // 日本語を往復できる符号化の目印。絵文字の国旗は
+                            // 同梱フォントに字が無い (豆腐) ので仮名を使う。
+                            let mark = if info.japanese { "あ" } else { "　" };
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 24.0],
+                                    egui::Button::new(format!("{mark} {}", info.label)),
+                                )
+                                .clicked()
+                            {
+                                chosen = Some(info.id.clone());
+                            }
+                        }
+                    });
+            });
+        if let Some(id) = chosen {
+            self.enc_picker = None;
+            if for_save {
+                self.save_with_encoding(&id);
+            } else {
+                self.reopen_with_encoding(&id);
+            }
+        } else if !open {
+            self.enc_picker = None;
         }
     }
 
@@ -6061,6 +6526,26 @@ impl ZaivernApp {
             | Cmd::RescanPlugins
             | Cmd::ShowPlugins
             | Cmd::RunPlugin(_, _) => self.apply_cmd_voice_plugin(cmd, ctx),
+            // ── 第 3 次配線 ──
+            Cmd::RestartTutorial => self.tutorial.restart(),
+            Cmd::OpenApprovals => self.open_approvals_panel(),
+            Cmd::OpenApprovalAudit => {
+                self.open_approvals_panel();
+                self.approvals_audit = true;
+                // 控えを捨てて、次の描画後に 1 回だけ読み直させる
+                self.approvals_audit_cache = None;
+            }
+            Cmd::AddCursorAbove
+            | Cmd::AddCursorBelow
+            | Cmd::SelectAllOccurrences
+            | Cmd::SelectNextOccurrence
+            | Cmd::ColumnSelectStart
+            | Cmd::ColumnSelectFinish
+            | Cmd::ClearMultiCursor
+            | Cmd::MultiPaste => self.apply_cmd_multi_cursor(cmd, ctx),
+            Cmd::ReopenWithEncoding(_) | Cmd::SaveWithEncoding(_) => {
+                self.apply_cmd_encoding(cmd)
+            }
         }
     }
 
@@ -7157,6 +7642,10 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::LspFormat)) {
             cmds.push(Cmd::LspFormat);
         }
+        // ⌘D: 次の出現を選択 (⇧⌘D の行複製より修飾キーが少ないので後に見る)
+        if consume(ctx, self.keys.get(BindAction::SelectNextOccurrence)) {
+            cmds.push(Cmd::SelectNextOccurrence);
+        }
         if consume(ctx, self.keys.get(BindAction::CloseTab)) {
             cmds.push(Cmd::CloseTab);
         }
@@ -7367,7 +7856,7 @@ impl ZaivernApp {
         // VS Code 準拠メニューバーの表示状態スナップショット (描画用の読み取り専用)
         let menu_info = self.build_menu_info(ctx);
 
-        egui::TopBottomPanel::top("zv-top")
+        let bar = egui::TopBottomPanel::top("zv-top")
             .exact_height(42.0)
             .frame(
                 egui::Frame::none()
@@ -7386,6 +7875,8 @@ impl ZaivernApp {
                     });
                 });
             });
+        // ガイドツアーへ「ツールバーはここ」と申告する (非表示なら申告しないだけ)
+        tutorial::anchor(ctx, AnchorId::Toolbar, bar.response.rect);
 
         for c in cmds {
             self.apply_cmd(c, ctx);
@@ -7412,7 +7903,10 @@ impl ZaivernApp {
 
         // VS Code と同じ 8 メニュー
         // (ファイル/編集/選択/表示/移動/実行/ターミナル/ヘルプ)
-        let mut menu_cmds = menu_bar::ui(ui, menu_info, &self.keys);
+        // menu_bar::ui は Vec<Cmd> しか返さないので、矩形は scope で測る。
+        let menus = ui.scope(|ui| menu_bar::ui(ui, menu_info, &self.keys));
+        tutorial::anchor(ui.ctx(), AnchorId::MenuBar, menus.response.rect);
+        let mut menu_cmds = menus.inner;
         cmds.append(&mut menu_cmds);
 
         if let Some(b) = branch {
@@ -7422,7 +7916,7 @@ impl ZaivernApp {
 
     /// トップバー: 🎨 テーマ選択メニュー (プラグインのカスタムテーマ含む)。
     fn top_bar_theme_menu(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
-        ui.menu_button("🎨", |ui| {
+        let menu = ui.menu_button("🎨", |ui| {
             for t in theme::all() {
                 let sel = t.name == self.cfg.theme;
                 if ui.selectable_label(sel, t.label.clone()).clicked() {
@@ -7453,9 +7947,10 @@ impl ZaivernApp {
                     },
                 );
             }
-        })
-        .response
-        .on_hover_text(tr("テーマ（プラグインのカスタムテーマも使えます）"));
+        });
+        tutorial::anchor(ui.ctx(), AnchorId::ThemeMenu, menu.response.rect);
+        menu.response
+            .on_hover_text(tr("テーマ（プラグインのカスタムテーマも使えます）"));
     }
 
     /// トップバー: 📱 スマホリモートと 🎤 音声入力まわり。
@@ -7473,8 +7968,9 @@ impl ZaivernApp {
         if blocked {
             icon = icon.color(theme.warn);
         }
-        if ui
-            .selectable_label(self.remote_open, icon)
+        let remote_btn = ui.selectable_label(self.remote_open, icon);
+        tutorial::anchor(ui.ctx(), AnchorId::RemoteButton, remote_btn.rect);
+        if remote_btn
             .on_hover_text(if blocked {
                 tr("⚠ Windows のファイアウォールが受信をブロックしています\n\u{3000}\
                     押して開く画面のボタンで許可できます (それまでスマホからは繋がりません)")
@@ -7503,12 +7999,13 @@ impl ZaivernApp {
         {
             cmds.push(Cmd::VoiceStop);
         }
-        if ui
-            .selectable_label(
-                rec,
-                RichText::new(if rec { "🔴" } else { "🎤" })
-                    .color(if rec { theme.err } else { theme.text }),
-            )
+        let voice_btn = ui.selectable_label(
+            rec,
+            RichText::new(if rec { "🔴" } else { "🎤" })
+                .color(if rec { theme.err } else { theme.text }),
+        );
+        tutorial::anchor(ui.ctx(), AnchorId::VoiceButton, voice_btn.rect);
+        if voice_btn
             .on_hover_text(if rec {
                 tr("録音中 — もう一度押すと止まります")
             } else {
@@ -7764,8 +8261,9 @@ impl ZaivernApp {
             ),
             _ => (RichText::new(tr("🛡 既定:承認")).color(theme.ok), "auto", false),
         };
-        if ui
-            .selectable_label(highlight, ap_label)
+        let perm_btn = ui.selectable_label(highlight, ap_label);
+        tutorial::anchor(ui.ctx(), AnchorId::PermissionMode, perm_btn.rect);
+        if perm_btn
             .on_hover_text(tr(
                 "「次に起動する」エージェント (Claude/Codex/Antigravity) の既定権限モード\n\
                  🛡 承認 = 操作のたびに許可が必要（bypass フラグを除去）\n\
@@ -7781,12 +8279,14 @@ impl ZaivernApp {
 
         let cockpit =
             ui.selectable_label(self.cockpit, RichText::new("🎛 Cockpit"));
+        tutorial::anchor(ui.ctx(), AnchorId::CockpitButton, cockpit.rect);
         if cockpit.on_hover_text(tr("全エージェント一覧 (⌘⇧C)")).clicked() {
             cmds.push(Cmd::ToggleCockpit);
         }
 
         let kanban =
             ui.selectable_label(self.kanban, RichText::new(tr("📋 看板")));
+        tutorial::anchor(ui.ctx(), AnchorId::KanbanButton, kanban.rect);
         if kanban
             .on_hover_text(tr(
                 "フリート看板 — 全エージェントの状況を俯瞰 (⌘⇧K)",
@@ -7796,7 +8296,7 @@ impl ZaivernApp {
             cmds.push(Cmd::ToggleKanban);
         }
 
-        ui.menu_button("👾 Agent ＋", |ui| {
+        let new_agent = ui.menu_button("👾 Agent ＋", |ui| {
             for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
                 if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
                     cmds.push(Cmd::NewAgent(i));
@@ -7823,9 +8323,11 @@ impl ZaivernApp {
                 cmds.push(Cmd::OpenAgentPicker);
                 ui.close_menu();
             }
-        })
-        .response
-        .on_hover_text(tr("エージェントを起動 (⌘⇧A)"));
+        });
+        tutorial::anchor(ui.ctx(), AnchorId::NewAgentButton, new_agent.response.rect);
+        new_agent
+            .response
+            .on_hover_text(tr("エージェントを起動 (⌘⇧A)"));
 
         if ui
             .button("🔍")
@@ -7860,8 +8362,11 @@ impl ZaivernApp {
         let (quota_sev, quota_tip) = self.quota_status();
         let fmt_label = self.text_format_label();
         let mut convert_eol: Option<crate::textenc::LineEnding> = None;
+        // 統合承認キューの待ち件数バッジ (押すとボトムパネルの承認ビューを開く)
+        let approvals_pending = self.agents.approvals.pending_len();
+        let mut open_approvals = false;
 
-        egui::TopBottomPanel::bottom("zv-status")
+        let bar = egui::TopBottomPanel::bottom("zv-status")
             .exact_height(26.0)
             .frame(
                 egui::Frame::none()
@@ -7892,6 +8397,24 @@ impl ZaivernApp {
                             .size(11.5)
                             .color(theme.ok),
                         );
+                    }
+
+                    // 承認待ちバッジ — 0 件のときは 1 ピクセルも出さない
+                    // (「何も起きていないのに赤い印がある」を作らないため)
+                    if approvals_pending > 0
+                        && ui
+                            .button(
+                                RichText::new(format!("🛡 {approvals_pending}"))
+                                    .size(11.5)
+                                    .color(theme.warn)
+                                    .strong(),
+                            )
+                            .on_hover_text(tr(
+                                "承認待ちの要求があります — 押すと承認キューを開きます",
+                            ))
+                            .clicked()
+                    {
+                        open_approvals = true;
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -8005,7 +8528,11 @@ impl ZaivernApp {
                     });
                 });
             });
+        tutorial::anchor(ctx, AnchorId::StatusBar, bar.response.rect);
 
+        if open_approvals {
+            self.open_approvals_panel();
+        }
         if toggle_cockpit {
             self.cockpit = !self.cockpit;
         }
@@ -8132,7 +8659,7 @@ impl ZaivernApp {
                 // 幅 180〜440px のサイドバーへ入れるとパネル外へはみ出し、
                 // 最後のタブだけが見えて残りが押し出される。
                 // 幅が狭いときはラベルを絵文字だけに縮め、名称はホバーで出す。
-                ui.horizontal_wrapped(|ui| {
+                let strip = ui.horizontal_wrapped(|ui| {
                     let narrow = ui.available_width() < 300.0;
                     let n_agents = self.agents.sessions.len();
                     let n_plugins = self.plugins.len();
@@ -8156,8 +8683,10 @@ impl ZaivernApp {
                             .on_hover_text(name);
                     }
                 });
+                let strip_rect = strip.response.rect;
                 ui.separator();
 
+                let body = ui.scope(|ui| {
                 match self.sidebar_tab {
                     SidebarTab::Files => {
                         self.sidebar_files_ui(
@@ -8253,6 +8782,29 @@ impl ZaivernApp {
                                 );
                             });
                     }
+                }
+                });
+                // ガイドツアーのアンカー: 「いま見えているタブ」だけ申告する。
+                // タブ本体が細いとき (空の一覧) でも押す場所が分かるよう、
+                // タブ列そのものを併せた矩形を渡す。
+                let tab_rect = strip_rect.union(body.response.rect);
+                let id = match self.sidebar_tab {
+                    SidebarTab::Files => Some(AnchorId::FileTree),
+                    SidebarTab::Search => Some(AnchorId::SearchTab),
+                    SidebarTab::Sessions => Some(AnchorId::SessionsTab),
+                    SidebarTab::Plugins => Some(AnchorId::PluginsTab),
+                    SidebarTab::Git => Some(AnchorId::GitTab),
+                    SidebarTab::GitHub => Some(AnchorId::GitHubTab),
+                    // Agents タブに対応する手順は無い (ツアーは Cockpit で説明する)
+                    SidebarTab::Agents => None,
+                };
+                if let Some(id) = id {
+                    tutorial::anchor(ui.ctx(), id, tab_rect);
+                }
+                // 「変更をレビュー」サブタブも差分ビューの一種。差分タブを
+                // 開いていなくても手順が空振りしないよう、ここでも申告する。
+                if self.sidebar_tab == SidebarTab::Git && self.git_sub_review {
+                    tutorial::anchor(ui.ctx(), AnchorId::DiffView, body.response.rect);
                 }
             });
 
@@ -9158,8 +9710,11 @@ impl ZaivernApp {
         let mut remove: Option<usize> = None;
         let mut cycle: Option<usize> = None;
         let mut open_log: Option<PathBuf> = None;
+        // 承認キューのキー操作は描画後にまとめて実行する (描画中に
+        // self.agents を可変で借りると、端末描画と衝突するため)。
+        let mut approval_cmds: Vec<(u64, agents::approvals::Command)> = Vec::new();
 
-        egui::TopBottomPanel::bottom("zv-terminal")
+        let panel = egui::TopBottomPanel::bottom("zv-terminal")
             .resizable(true)
             .default_height(300.0)
             .min_height(140.0)
@@ -9285,6 +9840,37 @@ impl ZaivernApp {
                             .clicked()
                         {
                             self.kanban = !self.kanban;
+                            if self.kanban {
+                                self.approvals_view = false;
+                            }
+                        }
+                        // 承認タブ: 統合承認キュー。待ち件数を数字で添える
+                        // (0 件でもタブ自体は出す — どこにあるか分からなくなるため)
+                        let n_pending = self.agents.approvals.pending_len();
+                        let ap_label = if n_pending > 0 {
+                            format!("{} {n_pending}", tr("🛡 承認"))
+                        } else {
+                            tr("🛡 承認")
+                        };
+                        let ap_btn = ui.selectable_label(
+                            self.approvals_view,
+                            RichText::new(ap_label).color(if n_pending > 0 {
+                                theme.warn
+                            } else {
+                                theme.text
+                            }),
+                        );
+                        if ap_btn
+                            .on_hover_text(tr(
+                                "統合承認キュー — 全エージェントの承認要求を 1 本にまとめて捌きます\n\
+                                 Y=承認 / A=この種別を全て承認 / ⇧A=常に許可 / N=拒否 / ⇧N=常に拒否",
+                            ))
+                            .clicked()
+                        {
+                            self.approvals_view = !self.approvals_view;
+                            if self.approvals_view {
+                                self.kanban = false;
+                            }
                         }
                         ui.menu_button("📜", |ui| {
                             ui.label(
@@ -9359,10 +9945,27 @@ impl ZaivernApp {
                 // 「📋 看板」タブ表示中やセッションが 0 件の間に消してしまうと、
                 // タブ切替やエージェントを閉じた直後のフォーカス要求が握り潰され、
                 // どこにも入力が届かなくなる。
-                if !self.kanban && !self.agents.sessions.is_empty() {
+                if !self.kanban && !self.approvals_view && !self.agents.sessions.is_empty() {
                     self.term_focus_pending = false;
                 }
-                if self.kanban {
+                if self.approvals_view {
+                    // 「🛡 承認」タブ: 端末の代わりに統合承認キューを敷き詰める。
+                    // フィールドを別々に借りる (agents は読み取り、表示状態は可変)。
+                    let out = panels::approvals_ui(
+                        ui,
+                        &theme,
+                        &self.agents.approvals,
+                        &mut self.approvals_expanded,
+                        &mut self.approvals_audit,
+                        self.approvals_audit_cache.as_deref(),
+                        now_epoch_secs(),
+                    );
+                    approval_cmds = out.commands;
+                    if out.reload_audit {
+                        // 描画中に I/O はしない。控えを捨てて、描画後に読み直す。
+                        self.approvals_audit_cache = None;
+                    }
+                } else if self.kanban {
                     // 「📋 看板」タブ: 端末の代わりにフリート看板を敷き詰める
                     let ctx = ui.ctx().clone();
                     self.kanban_ui(ui, &ctx);
@@ -9382,6 +9985,20 @@ impl ZaivernApp {
                     });
                 }
             });
+        if let Some(p) = &panel {
+            tutorial::anchor(ctx, AnchorId::TerminalPanel, p.response.rect);
+        }
+
+        // 承認キューの実行 (描画後)。ここで初めて self を丸ごと可変で使える。
+        for (id, cmd) in approval_cmds {
+            self.resolve_approval(id, cmd);
+        }
+        // 監査ログの読み込みも描画の外で 1 回だけ (毎フレーム I/O にしない)。
+        if self.approvals_view && self.approvals_audit && self.approvals_audit_cache.is_none() {
+            let dir = self.agents.approvals.log_dir();
+            self.approvals_audit_cache =
+                Some(agents::approvals::read_audit_tail(&dir, APPROVAL_AUDIT_TAIL));
+        }
 
         if let Some(i) = launch {
             self.launch_preset(i, ctx);
@@ -9441,6 +10058,117 @@ impl ZaivernApp {
             b.gutter = None;
         }
         self.cockpit = false;
+    }
+
+    // ─── 統合承認キュー (パネルの外側の実行部) ─────────────────────
+
+    /// ボトムパネルを開いて「🛡 承認」ビューへ切り替える
+    /// (ステータスバーのバッジ・パレットコマンドの共通の入口)。
+    fn open_approvals_panel(&mut self) {
+        self.agents.panel_open = true;
+        self.cockpit = false;
+        self.kanban = false;
+        self.approvals_view = true;
+    }
+
+    /// 承認パネルで押された 1 コマンドを実行する。
+    ///
+    /// 3 つの副作用をここ 1 か所に集める:
+    /// 1. `Resolution.replies` を持ち主の PTY セッションへ流す
+    /// 2. `Resolution.policy` を config.toml の `[[approval_policies]]` へ残し、
+    ///    エンジンへ配り直す
+    /// 3. `refused_always` (権限昇格) を**はっきり伝える** — どんなポリシーでも
+    ///    自動承認にはできない、という約束が破られていないことを利用者に見せる
+    fn resolve_approval(&mut self, id: u64, cmd: agents::approvals::Command) {
+        let res = self.agents.approvals.apply(id, cmd);
+        let (approve_keys, deny_keys) = agents::approvals::reply_keys();
+        let mut sent = 0usize;
+        let mut lost = 0usize;
+        for (sid, action) in &res.replies {
+            let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == *sid) else {
+                lost += 1;
+                continue;
+            };
+            let ok = match action {
+                agents::approvals::ReplyAction::None => false,
+                agents::approvals::ReplyAction::Approve => {
+                    s.press_pet_approve_button(Some(&approve_keys))
+                }
+                agents::approvals::ReplyAction::Deny => {
+                    let ok = s.send_text(&deny_keys);
+                    if ok {
+                        s.resolve_attention();
+                    }
+                    ok
+                }
+            };
+            if ok {
+                sent += 1;
+            } else {
+                lost += 1;
+            }
+        }
+        // 消えた要求の折りたたみ状態は残さない (ID は使い回されないが、無限に貯めない)
+        self.approvals_expanded
+            .retain(|k| self.agents.approvals.get(*k).is_some());
+        // 監査ログの控えは古くなった
+        self.approvals_audit_cache = None;
+
+        if let Some(p) = res.policy.clone() {
+            self.persist_approval_policy(&p);
+        }
+        if res.refused_always {
+            self.toast_warn(tr(
+                "⛔ 権限昇格は「常に許可」にできません — この 1 件だけ承認しました",
+            ));
+        }
+        if sent > 0 {
+            self.toast(
+                trf("🛡 {n} 件の応答を送信しました", &[("n", sent.to_string())]),
+                true,
+            );
+        }
+        if lost > 0 {
+            self.toast_warn(trf(
+                "⚠ {n} 件は届きませんでした (セッションが終了しています)",
+                &[("n", lost.to_string())],
+            ));
+        }
+    }
+
+    /// 生成されたポリシーを config.toml の `[[approval_policies]]` へ残す。
+    ///
+    /// `append_agent_preset` と同じ流儀 — **既存の行は 1 文字も触らず**末尾へ
+    /// 1 ブロック足すだけなので、利用者の手書きコメントも並び順も残る。
+    /// 書けなくてもアプリは止めない (このセッションの間は効いている)。
+    fn persist_approval_policy(&mut self, p: &agents::approvals::Policy) {
+        let (scope, target) = p.scope.to_toml();
+        let entry = config::ApprovalPolicy {
+            kind: p.kind.as_str().to_string(),
+            scope: scope.to_string(),
+            target,
+            decision: p.decision.as_str().to_string(),
+        };
+        // 同じ内容が既にあれば足さない (押すたびに config.toml が伸びない)
+        if !self.cfg.approval_policies.contains(&entry) {
+            self.cfg.approval_policies.push(entry.clone());
+            if let Err(e) = append_approval_policy(&entry) {
+                self.toast_warn(trf("承認ポリシーを保存できません: {e}", &[("e", e)]));
+            }
+        }
+        // エンジンへ配り直す (次の要求から効く)
+        config::publish_approval_policies(&self.cfg);
+        self.toast(
+            trf(
+                "🛡 ポリシーを保存: {kind} / {scope} → {decision}",
+                &[
+                    ("kind", tr(p.kind.label())),
+                    ("scope", scope.to_string()),
+                    ("decision", p.decision.as_str().to_string()),
+                ],
+            ),
+            true,
+        );
     }
 
     // ─── UI: cockpit ────────────────────────────────────────────────
@@ -9554,68 +10282,6 @@ impl ZaivernApp {
                         }
                     }
                 });
-                // キーボードショートカット・キー判定（入力欄がフォーカス中）
-                let trigger_submit = false;
-                let broadcast_id = ui.make_persistent_id("broadcast-input");
-                if ui.memory(|m| m.has_focus(broadcast_id)) {
-                    ui.input(|i| {
-                        // Ctrl+A / Cmd+A 全選択
-                        if i.modifiers.command || i.modifiers.ctrl {
-                            if i.key_pressed(egui::Key::A) {
-                                self.agent_input_buf.set_text(&self.broadcast_input);
-                                self.agent_input_buf.select_all();
-                                let char_len = self.broadcast_input.chars().count();
-                                let mut st = egui::TextEdit::load_state(ui.ctx(), broadcast_id).unwrap_or_default();
-                                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                                    egui::text::CCursor::new(0),
-                                    egui::text::CCursor::new(char_len),
-                                )));
-                                st.store(ui.ctx(), broadcast_id);
-                            } else if i.key_pressed(egui::Key::U) {
-                                self.agent_input_buf.set_text(&self.broadcast_input);
-                                self.agent_input_buf.delete_to_beginning();
-                                self.broadcast_input = self.agent_input_buf.text().to_string();
-                            } else if i.key_pressed(egui::Key::K) {
-                                self.agent_input_buf.set_text(&self.broadcast_input);
-                                self.agent_input_buf.delete_to_end();
-                                self.broadcast_input = self.agent_input_buf.text().to_string();
-                            }
-                        } else if i.key_pressed(egui::Key::ArrowUp) {
-                            self.agent_input_buf.history_prev();
-                            self.broadcast_input = self.agent_input_buf.text().to_string();
-                        } else if i.key_pressed(egui::Key::ArrowDown) {
-                            self.agent_input_buf.history_next();
-                            self.broadcast_input = self.agent_input_buf.text().to_string();
-                        }
-                    });
-                }
-
-                let send = ui.button(tr("📣 送信"));
-                let input = ui.add(
-                    egui::TextEdit::singleline(&mut self.broadcast_input)
-                        .id(ui.make_persistent_id("broadcast-input"))
-                        .desired_width(300.0)
-                        .hint_text(tr("全エージェントへブロードキャスト (/goal, /loop 対応)...")),
-                );
-                // 差分ビューから流し込んだ直後は入力欄へフォーカスを寄せる
-                // (どこへ入ったのか分からないまま置き去りにしない)
-                if self.broadcast_focus {
-                    input.request_focus();
-                    self.broadcast_focus = false;
-                }
-                let enter = input.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (send.clicked() || enter || trigger_submit) && !self.broadcast_input.trim().is_empty() {
-                    self.agent_input_buf.set_text(&self.broadcast_input);
-                    let expanded = self.agent_input_buf.submit();
-                    acts.broadcast = Some(expanded);
-                    self.broadcast_input.clear();
-                }
-                // Enter でフォーカスが外れるので戻し、連続入力できるようにする
-                // (空入力の Enter でも戻す — 戻さないと入力欄が死んだように見える)
-                if enter {
-                    input.request_focus();
-                }
                 // 音声で全エージェントの入力欄へ入れる (送信は各自 Enter)
                 let rec = self.voice.session.is_some();
                 if rec
@@ -9641,6 +10307,33 @@ impl ZaivernApp {
                     acts.voice_all = true;
                 }
             });
+
+            // ── エージェント宛てコンポーザ (複数行・宛先つき) ──
+            //
+            // 1 行のブロードキャスト欄を置き換えたもの。**宛先を選べる**のが要点で、
+            // 「1 体に向けたレビュー指示が全エージェントへ飛ぶ」漏れをここで止める。
+            // 下書きは宛先ごとに分かれて残るので、切り替えても書きかけが消えない。
+            let target: Option<(u64, String)> = self
+                .agents
+                .sessions
+                .get(self.agents.active)
+                .map(|s| (s.id, format!("{} {}", s.icon, s.title)));
+            let composer = panels::agent_composer_ui(
+                ui,
+                theme,
+                &mut self.agent_input_buf,
+                target.as_ref().map(|(id, t)| (*id, t.as_str())),
+            );
+            match composer {
+                panels::ComposerAction::Send(t) => acts.broadcast = Some(t),
+                panels::ComposerAction::SendTo(id, t) => acts.send_to = Some((id, t)),
+                panels::ComposerAction::Cancel => {
+                    // 入力欄からフォーカスを外すだけ (下書きは消さない)。
+                    // ID を当てにせず egui のテキスト入力そのものを畳む。
+                    ui.memory_mut(|m| m.stop_text_input());
+                }
+                panels::ComposerAction::None => {}
+            }
         });
     }
 
@@ -10115,6 +10808,26 @@ impl ZaivernApp {
                 true,
             );
         }
+        // 宛先を指名した送信は**その 1 体だけ**へ届ける (broadcast は通らない)
+        if let Some((id, text)) = acts.send_to {
+            let sent = self
+                .agents
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .map(|s| {
+                    // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)
+                    s.note_user_input();
+                    (s.send_text(&format!("{text}\r")), s.title.clone())
+                });
+            match sent {
+                Some((true, title)) => {
+                    self.toast(trf("✏ 送信: {title}", &[("title", title)]), true)
+                }
+                Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
+                None => self.toast(tr("宛先のセッションが見つかりません"), false),
+            }
+        }
         if acts.voice_stop {
             self.stop_voice();
         }
@@ -10457,7 +11170,7 @@ impl ZaivernApp {
         if !self.editor.buffers.is_empty() {
             let mut close_req: Option<usize> = None;
             let mut activate: Option<usize> = None;
-            egui::Frame::none()
+            let tabs = egui::Frame::none()
                 .fill(theme.panel_alt)
                 .inner_margin(egui::Margin {
                     left: 6.0,
@@ -10545,6 +11258,7 @@ impl ZaivernApp {
                             });
                         });
                 });
+            tutorial::anchor(ui.ctx(), AnchorId::EditorTabs, tabs.response.rect);
             if let Some(i) = activate {
                 self.editor.active = Some(i);
                 self.find.last = None;
@@ -10572,13 +11286,19 @@ impl ZaivernApp {
             }
             if let crate::editor::BufferKind::PrDiff { number } = self.editor.buffers[i].kind {
                 let b = &self.editor.buffers[i];
-                panels::pr_diff_ui(ui, &theme, number, b.id, &b.text, &mut self.github);
+                let view = ui.scope(|ui| {
+                    panels::pr_diff_ui(ui, &theme, number, b.id, &b.text, &mut self.github)
+                });
+                tutorial::anchor(ui.ctx(), AnchorId::DiffView, view.response.rect);
                 return;
             }
             // レース差分タブも同じく読み取り専用の専用ビュー (race.rs)
             if let crate::editor::BufferKind::RaceDiff { slot } = self.editor.buffers[i].kind {
                 let b = &self.editor.buffers[i];
-                race::race_diff_ui(ui, &theme, slot, b.id, &b.text, &mut self.race);
+                let view = ui.scope(|ui| {
+                    race::race_diff_ui(ui, &theme, slot, b.id, &b.text, &mut self.race)
+                });
+                tutorial::anchor(ui.ctx(), AnchorId::DiffView, view.response.rect);
                 return;
             }
         }
@@ -10723,7 +11443,7 @@ impl ZaivernApp {
         let mut do_replace = false;
         let mut do_replace_all = false;
 
-        egui::Frame::none()
+        let bar = egui::Frame::none()
             .fill(theme.panel_alt)
             .inner_margin(egui::Margin::symmetric(8.0, 5.0))
             .show(ui, |ui| {
@@ -10813,6 +11533,7 @@ impl ZaivernApp {
                     });
                 }
             });
+        tutorial::anchor(ui.ctx(), AnchorId::EditorFind, bar.response.rect);
 
         if do_find {
             self.find_next();
@@ -11660,6 +12381,8 @@ impl ZaivernApp {
                     .layouter(&mut layouter)
                     .show(ui);
                 changed_flag = output.response.changed();
+                // ガイドツアーの「エディタ本文」はこの矩形
+                tutorial::anchor(ui.ctx(), AnchorId::EditorBody, output.response.rect);
                 // 本文が実際に描かれた y 原点。ScrollArea はホイールの
                 // オフセットを配置後に適用するため、state.offset ではなく
                 // これを使わないとガターが 1 フレームずれて「泳ぐ」
@@ -12252,9 +12975,11 @@ impl ZaivernApp {
             ("🚪".into(), tr("すべてのエディターを閉じる"), String::new(), Cmd::CloseAllTabs),
             ("🔎".into(), tr("ファイル間で検索"), "⇧⌘F".into(), Cmd::GlobalSearch),
             ("⇄".into(), tr("置換"), "⌥⌘F".into(), Cmd::OpenReplace),
-            ("🧭".into(), tr("行/列へ移動…"), "⌃G".into(), Cmd::GoToLine),
-            ("🧭".into(), tr("定義へ移動"), "F12".into(), Cmd::GoToDefinition),
-            ("🧭".into(), tr("ブラケットへ移動"), "⇧⌘\\".into(), Cmd::GoToBracket),
+            // 🧭 は同梱フォントに字が無く豆腐(□)になるため「→」を使う
+            // (glyph_tests::ui_glyph_symbols_have_glyphs が担保している字)。
+            ("→".into(), tr("行/列へ移動…"), "⌃G".into(), Cmd::GoToLine),
+            ("→".into(), tr("定義へ移動"), "F12".into(), Cmd::GoToDefinition),
+            ("→".into(), tr("ブラケットへ移動"), "⇧⌘\\".into(), Cmd::GoToBracket),
             ("⬅".into(), tr("戻る"), "⌃-".into(), Cmd::NavBack),
             ("➡".into(), tr("進む"), "⌃⇧-".into(), Cmd::NavForward),
             ("📑".into(), tr("次のエディター"), "⇧⌘]".into(), Cmd::NextTab),
@@ -12428,6 +13153,55 @@ impl ZaivernApp {
                 tr("改行コードを変換: CR (旧 Mac)"),
                 String::new(),
                 Cmd::ConvertLineEnding(crate::textenc::LineEnding::Cr),
+            ),
+            // ── 第 3 次配線: ガイドツアー / 承認キュー / 複数キャレット / 符号化 ──
+            ("💡".into(), tr("チュートリアルを再開"), String::new(), Cmd::RestartTutorial),
+            ("🛡".into(), tr("承認キューを開く"), String::new(), Cmd::OpenApprovals),
+            (
+                "📜".into(),
+                tr("承認の監査ログを開く"),
+                String::new(),
+                Cmd::OpenApprovalAudit,
+            ),
+            ("✏".into(), tr("カーソルを上に追加"), String::new(), Cmd::AddCursorAbove),
+            ("✏".into(), tr("カーソルを下に追加"), String::new(), Cmd::AddCursorBelow),
+            (
+                "✏".into(),
+                tr("全ての出現を選択"),
+                String::new(),
+                Cmd::SelectAllOccurrences,
+            ),
+            (
+                "✏".into(),
+                tr("次の出現を選択"),
+                fmt_key(BindAction::SelectNextOccurrence),
+                Cmd::SelectNextOccurrence,
+            ),
+            ("◇".into(), tr("矩形選択の開始"), String::new(), Cmd::ColumnSelectStart),
+            ("◇".into(), tr("矩形選択の確定"), String::new(), Cmd::ColumnSelectFinish),
+            (
+                "✏".into(),
+                tr("複数カーソルを解除"),
+                String::new(),
+                Cmd::ClearMultiCursor,
+            ),
+            (
+                "✏".into(),
+                tr("全キャレットへ貼り付け (取り消しは 1 回)"),
+                String::new(),
+                Cmd::MultiPaste,
+            ),
+            (
+                "📝".into(),
+                tr("エンコーディングを指定して開き直す"),
+                String::new(),
+                Cmd::ReopenWithEncoding(None),
+            ),
+            (
+                "📝".into(),
+                tr("エンコーディングを指定して保存"),
+                String::new(),
+                Cmd::SaveWithEncoding(None),
             ),
         ]
     }
@@ -12724,6 +13498,7 @@ impl ZaivernApp {
                                 .font(FontId::proportional(16.0))
                                 .desired_width(f32::INFINITY),
                         );
+                        tutorial::anchor(ctx, AnchorId::CommandPalette, resp.rect);
                         if self.palette.just_opened {
                             resp.request_focus();
                             self.palette.just_opened = false;
@@ -14452,6 +15227,15 @@ impl ZaivernApp {
         let live: HashSet<u64> = self.agents.sessions.iter().map(|s| s.id).collect();
 
         let gone: Vec<u64> = self.known_sessions.difference(&live).copied().collect();
+        // コンポーザの宛先別下書きも一緒に掃く。消えたエージェント宛ての
+        // 書きかけを残すと、次に同じ ID が振られたときに他人の下書きが出る。
+        if !gone.is_empty() {
+            let ids: Vec<u64> = live.iter().copied().collect();
+            self.agent_input_buf.retain_agents(&ids);
+        }
+        // 隔離集合も掃く。残すと ID が再利用されたとき、新しいタイルが
+        // いきなり隔離状態 (= 黒いまま) で現れる。
+        self.frame_guard.forget_sessions(&live);
         for id in gone {
             self.supervisor.forget(id);
             self.coordinator.unregister_session(id);
@@ -15034,9 +15818,16 @@ impl ZaivernApp {
     // ── フレームガード: 部分ビューの隔離と警告バナー ──────────────────
 
     /// 部分ビューを「いま描いている場所」の印付きで描く。
-    /// 隔離中なら描かない (理由は上部のバナーが説明している)。
-    fn guarded_view(&mut self, sv: Subview, draw: impl FnOnce(&mut Self)) {
+    ///
+    /// 隔離中は**必ず代わりの説明を描く**。かつては何も描かずに `return`
+    /// していたが、パネルごと消えると egui はその矩形に何も塗らないので、
+    /// 直前のフレームの内容かウィンドウ背景がそのまま残る = 「黒い空間」に
+    /// なる (Windows の Cockpit で「ファイルを開く / ウィンドウを閉じると
+    /// 元の場所が黒く残る」と報告された不具合の直接原因)。
+    /// しかも何が起きたのか一切分からない。
+    fn guarded_view(&mut self, sv: Subview, ctx: &egui::Context, draw: impl FnOnce(&mut Self)) {
         if self.frame_guard.is_quarantined(&sv) {
+            self.quarantined_panel_ui(&sv, ctx);
             return;
         }
         draw_subview(sv, || draw(self));
@@ -15052,19 +15843,71 @@ impl ZaivernApp {
     ) {
         if self.frame_guard.is_quarantined(&sv) {
             let (err, dim) = (self.theme.err, self.theme.text_dim);
-            Self::quarantine_placeholder_ui(ui, &sv.label(), err, dim);
+            if Self::quarantine_placeholder_ui(ui, &sv.label(), err, dim) {
+                self.frame_guard.unquarantine(&sv);
+            }
             return;
         }
         draw_subview(sv, || draw(self, ui));
     }
 
-    /// 隔離した領域の代わりに出す説明。
+    /// 隔離されたパネルの代わりを、**同じ場所・同じ大きさ**で描く。
+    ///
+    /// パネルの id は生きているときと同じものを使う — 変えるとリサイズ幅の
+    /// 記憶が失われ、隔離が解けた瞬間に既定幅へ戻ってしまう。
+    fn quarantined_panel_ui(&mut self, sv: &Subview, ctx: &egui::Context) {
+        let (err, dim) = (self.theme.err, self.theme.text_dim);
+        let label = sv.label();
+        let mut retry = false;
+        match sv {
+            Subview::Panel("sidebar") => {
+                let open = self.sidebar_open;
+                egui::SidePanel::left("zv-side")
+                    .resizable(true)
+                    .default_width(255.0)
+                    .width_range(180.0..=440.0)
+                    .show_animated(ctx, open, |ui| {
+                        retry = Self::quarantine_placeholder_ui(ui, &label, err, dim);
+                    });
+            }
+            Subview::Panel("terminal") => {
+                let open = self.agents.panel_open && !self.cockpit;
+                egui::TopBottomPanel::bottom("zv-terminal")
+                    .resizable(true)
+                    .default_height(300.0)
+                    .min_height(140.0)
+                    .show_animated(ctx, open, |ui| {
+                        // ボトムパネルは中身が高さを埋め切らないとリサイズバーが
+                        // 毎フレームずり落ちる (生きているときと同じ手当て)。
+                        ui.set_min_height(ui.available_height());
+                        retry = Self::quarantine_placeholder_ui(ui, &label, err, dim);
+                    });
+            }
+            // 中央に敷かれる領域 (エディタ / Cockpit) は guarded_ui 側が
+            // その場の Ui へ描く。ここへ来るのは想定外の Subview だけなので、
+            // 画面を黒くしないよう中央パネルで受ける。
+            _ => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    retry = Self::quarantine_placeholder_ui(ui, &label, err, dim);
+                });
+            }
+        }
+        if retry {
+            self.frame_guard.unquarantine(sv);
+        }
+    }
+
+    /// 隔離した領域の代わりに出す説明。「再試行」が押されたら `true`。
+    ///
+    /// 復帰手段をここに置くのが要点 — バナーは 1 度閉じると二度と出ないので、
+    /// バナーにしか再試行が無いとそのタイルは永久に死んだままになる。
     fn quarantine_placeholder_ui(
         ui: &mut egui::Ui,
         label: &str,
         err: Color32,
         dim: Color32,
-    ) {
+    ) -> bool {
+        let mut retry = false;
         ui.vertical_centered(|ui| {
             ui.add_space(24.0);
             ui.label(RichText::new("⚠").size(28.0).color(err));
@@ -15083,7 +15926,16 @@ impl ZaivernApp {
                 .size(11.5)
                 .color(dim),
             );
+            ui.add_space(8.0);
+            if ui
+                .button(tr("⟳ ここだけ再試行"))
+                .on_hover_text(tr("この領域の隔離だけを解いて描画をやり直します"))
+                .clicked()
+            {
+                retry = true;
+            }
         });
+        retry
     }
 
     /// 内部エラーの警告バナー (画面最上部)。隔離が起きたときだけ出る。
@@ -15541,8 +16393,8 @@ impl ZaivernApp {
         self.lsp_rename_window(ctx);
         // 大きな領域は「いま描いている場所」の印を付けて描く。フレームが
         // panic したときに犯人を特定して、そこだけ隔離できるようにするため。
-        self.guarded_view(Subview::Panel("sidebar"), |me| me.sidebar(ctx));
-        self.guarded_view(Subview::Panel("terminal"), |me| me.terminal_panel(ctx));
+        self.guarded_view(Subview::Panel("sidebar"), ctx, |me| me.sidebar(ctx));
+        self.guarded_view(Subview::Panel("terminal"), ctx, |me| me.terminal_panel(ctx));
 
         let theme_bg = self.theme.bg;
         egui::CentralPanel::default()
@@ -15630,6 +16482,7 @@ impl ZaivernApp {
         self.lsp_hover_popup(ctx);
 
         self.palette_ui(ctx);
+        self.encoding_picker_ui(ctx);
         self.new_plugin_ui(ctx);
         self.close_confirm_ui(ctx);
         self.delete_confirm_ui(ctx);
@@ -15666,6 +16519,11 @@ impl ZaivernApp {
                 self.pet_tex.as_ref(),
                 &mut self.pet_rt,
             );
+            // ペットの矩形は egui が Area の実測として持っている。
+            // 大きさを app.rs 側で決め打ちしない (pet.rs の寸法と二重管理にしない)。
+            if let Some(rect) = ctx.memory(|m| m.area_rect(egui::Id::new("zv-pet"))) {
+                tutorial::anchor(ctx, AnchorId::Pet, rect);
+            }
             if r.drag_released {
                 // ドラッグ後の位置を保存する
                 if let Some(p) = self.pet_pos {
@@ -15799,10 +16657,84 @@ impl ZaivernApp {
             }
         }
 
+        // ── 初回起動ガイドツアー ──
+        // **すべての UI を描き終わったあと**に 1 回だけ。アンカーの申告は
+        // 上のパネル描画で済んでいるので、ここで初めて全部が揃う。
+        //
+        // アイドル CPU との関係: `Tutorial::overlay` は**表示中だけ** 30fps を
+        // 自前で予約する。その予約は直後の `schedule_idle_repaint` から
+        // `IdleSignals::animating` として見えるので、二重予約にはならない
+        // (`idle_repaint_ms` は animating のとき `None` を返す)。
+        // 非表示のときは 1 本も予約しないので、完全アイドルの 0fps は保たれる。
+        self.tutorial_tick(ctx);
+
         // フレームの最後に、次の定期フレームだけをまとめて予約する。
         // ここより上で誰かが予約していれば egui は最短を採るので、
         // このポリシーは「他に誰も予約していないときの下限」を決める役になる。
         self.schedule_idle_repaint(ctx);
+    }
+
+    /// ガイドツアーの 1 フレーム: 初回だけ自動開始し、オーバーレイを描き、
+    /// 返ってきた依頼を自分の状態で実行する。
+    fn tutorial_tick(&mut self, ctx: &egui::Context) {
+        // 自動開始は**一度だけ**。ここで撃つのは Context が要るため
+        // (`ZaivernApp::new` の時点ではフレームが始まっていない)。
+        if !self.tutorial_autostarted {
+            self.tutorial_autostarted = true;
+            if self.tutorial.autostart() {
+                // 開始フレームは必ず 1 枚描く (アイドルからでも立ち上がる)
+                ctx.request_repaint();
+            }
+        }
+        let theme = self.theme.clone();
+        if let Some(act) = self.tutorial.overlay(ctx, &theme) {
+            self.apply_tutorial_action(act, ctx);
+        }
+    }
+
+    /// ツアーからの「これを開いておいて」を実行する。
+    ///
+    /// 実行できなくても構わない設計 (アンカーが現れなければツアー側が
+    /// 数秒で自動的に次へ送る) なので、ここでは失敗を握り潰さず**必ず試す**。
+    fn apply_tutorial_action(&mut self, act: tutorial::TutorialAction, ctx: &egui::Context) {
+        use tutorial::{SidebarTarget, TutorialAction as TA};
+        match act {
+            TA::OpenSidebar(t) => {
+                self.sidebar_open = true;
+                self.sidebar_tab = sidebar_tab_for(t);
+            }
+            TA::ShowTerminalPanel => {
+                self.agents.panel_open = true;
+                self.cockpit = false;
+                self.kanban = false;
+                self.approvals_view = false;
+            }
+            TA::ShowCockpit => {
+                self.cockpit = true;
+                self.kanban = false;
+            }
+            TA::ShowKanban => {
+                self.kanban = true;
+                self.cockpit = false;
+                self.agents.panel_open = true;
+                self.approvals_view = false;
+            }
+            TA::OpenPalette => self.palette.open_commands(),
+            TA::OpenRaceForm => {
+                self.cockpit = true;
+                self.kanban = false;
+                self.race.form_open = true;
+            }
+            TA::ShowRemoteQr => {
+                // 切替ではなく「開く」。既に開いていたら閉じてしまうと、
+                // 説明しようとした画面が消えて手順が空振りする。
+                if !self.remote_open {
+                    self.apply_cmd(Cmd::ToggleRemote, ctx);
+                }
+            }
+        }
+        // 依頼を実行した結果を次のフレームで見せる (アイドルでも 1 枚回す)
+        ctx.request_repaint();
     }
 
     /// いまの状態から [`idle_repaint_ms`] の材料を組み立てて予約する。
@@ -15876,6 +16808,107 @@ fn idle_trace(s: IdleSignals) {
         n as f32 / secs,
         idle_repaint_ms(s)
     );
+}
+
+/// 承認の監査ログを画面に出す件数 (末尾から。全部は読まない)。
+const APPROVAL_AUDIT_TAIL: usize = 200;
+
+/// ツアーの「このタブを開いて」→ サイドバーのタブ。純関数なのでテストできる。
+///
+/// `tutorial::SidebarTarget` は app.rs の private な [`SidebarTab`] を見られない
+/// ので別の型になっている。ここが**唯一の対応表**。
+fn sidebar_tab_for(t: tutorial::SidebarTarget) -> SidebarTab {
+    use tutorial::SidebarTarget as S;
+    match t {
+        S::Files => SidebarTab::Files,
+        S::Search => SidebarTab::Search,
+        S::Agents => SidebarTab::Agents,
+        S::Sessions => SidebarTab::Sessions,
+        S::Plugins => SidebarTab::Plugins,
+        S::Git => SidebarTab::Git,
+        S::GitHub => SidebarTab::GitHub,
+    }
+}
+
+/// 複数キャレットへの**一括挿入 1 回分**。`(新しい本文, 新しい選択, 箇所数)`。
+///
+/// `editor_ops::insert_at_all` が後ろから前へ当てるので位置ずれは起きない。
+/// 呼び出し側は返った本文を **1 回だけ** `Buffer::text` へ入れること —
+/// egui の取り消しは本文まるごとのスナップショットなので、1 回の差し替えが
+/// そのまま「1 段の取り消し」になる (VS Code も複数キャレットの編集を 1 段にする)。
+fn multi_batch_insert(
+    text: &str,
+    sel: &editor_ops::MultiSel,
+    ins: &str,
+) -> (String, editor_ops::MultiSel, usize) {
+    let n = sel.len();
+    let (out, next) = editor_ops::insert_at_all(text, sel, ins);
+    (out, next, n)
+}
+
+/// char 添字 → `(行 0 起点, タブ展開後の表示桁 0 起点)`。
+///
+/// 矩形選択は「行 × 表示桁」で長方形を作る ([`editor_ops::column_selection`])
+/// ので、egui の char キャレットをこの座標系へ移す必要がある。
+/// 添字が本文より後ろなら末尾へクランプする (壊れた値でも落ちない)。
+fn char_index_to_line_col(text: &str, char_index: usize, tab_width: usize) -> (usize, usize) {
+    let tw = tab_width.max(1);
+    let (mut line, mut col) = (0usize, 0usize);
+    for (n, ch) in text.chars().enumerate() {
+        if n >= char_index {
+            break;
+        }
+        match ch {
+            '\n' => {
+                line += 1;
+                col = 0;
+            }
+            // タブは次の tab_width の倍数まで進む (エディタの表示と同じ勘定)
+            '\t' => col = (col / tw + 1) * tw,
+            // CR は表示桁を進めない (CRLF の途中に桁を作らない)
+            '\r' => {}
+            _ => col += 1,
+        }
+    }
+    (line, col)
+}
+
+/// UNIX エポック秒。時計が壊れている環境でも 0 を返して落ちない。
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `[[approval_policies]]` を 1 件、config.toml の末尾へ書き足す。
+///
+/// TOML の組み立ては `toml::Value` へ通す (パスやエージェント名に `"` や `\`
+/// が入っていても壊れた config.toml を書かないため — `config::append_agent_preset`
+/// と同じ理由・同じ流儀)。
+fn append_approval_policy(p: &config::ApprovalPolicy) -> Result<(), String> {
+    let path = config::config_path();
+    config::ensure_default();
+    let mut raw = std::fs::read_to_string(&path).unwrap_or_default();
+    if !raw.is_empty() && !raw.ends_with('\n') {
+        raw.push('\n');
+    }
+    raw.push_str(&render_approval_policy(p));
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, raw).map_err(|e| format!("config.toml を書けません: {e}"))
+}
+
+/// `[[approval_policies]]` ブロック 1 件分の TOML テキスト (書き出しは決定的)。
+fn render_approval_policy(p: &config::ApprovalPolicy) -> String {
+    let kv = |k: &str, v: &str| format!("{k} = {}\n", toml::Value::String(v.to_string()));
+    let mut s = String::from("\n[[approval_policies]]\n");
+    s.push_str(&kv("kind", &p.kind));
+    s.push_str(&kv("scope", &p.scope));
+    s.push_str(&kv("target", &p.target));
+    s.push_str(&kv("decision", &p.decision));
+    s
 }
 
 /// ルートの表示名(フォルダ名。取れなければフルパス)。
@@ -20092,6 +21125,20 @@ mod wave2_tests {
             "Cmd::LspRename",
             "Cmd::LspFormat",
             "Cmd::ToggleFormatOnSave",
+            // ── 第 3 次配線 ──
+            "Cmd::RestartTutorial",
+            "Cmd::OpenApprovals",
+            "Cmd::OpenApprovalAudit",
+            "Cmd::AddCursorAbove",
+            "Cmd::AddCursorBelow",
+            "Cmd::SelectAllOccurrences",
+            "Cmd::SelectNextOccurrence",
+            "Cmd::ColumnSelectStart",
+            "Cmd::ColumnSelectFinish",
+            "Cmd::ClearMultiCursor",
+            "Cmd::MultiPaste",
+            "Cmd::ReopenWithEncoding",
+            "Cmd::SaveWithEncoding",
         ] {
             assert!(list.contains(c), "{c} がコマンドパレットに無い");
             assert!(router.contains(c), "{c} のディスパッチが無い");
@@ -20816,5 +21863,604 @@ mod ui_wiring_tests {
         assert!(!b.append_prompt("   \n  "));
         assert!(b.append_prompt("直して"));
         assert_eq!(b.text(), "直して");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  第 3 次配線のテスト
+//  (ガイドツアー / 統合承認キュー / コンポーザ / 複数キャレット / 符号化)
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tutorial_wiring_tests {
+    use super::*;
+
+    /// ツアーが光らせようとする**すべての** `AnchorId` について、
+    /// app.rs のどこかで `tutorial::anchor(..)` を呼んでいること。
+    ///
+    /// 手順表に新しいアンカーを足したのに UI 側の申告を忘れると、
+    /// その手順は 4 秒フォールバック表示されてから勝手に飛ぶ (= 説明が消える)。
+    /// 変種名は `Debug` から取るので、名前を変えてもこのテストは追随する。
+    #[test]
+    fn 手順表の全アンカーがapp_rsで申告されている() {
+        let src = include_str!("app.rs");
+        let mut missing: Vec<String> = Vec::new();
+        for step in crate::tutorial::STEPS {
+            let Some(id) = step.anchor else { continue };
+            let needle = format!("AnchorId::{id:?}");
+            if !src.contains(&needle) {
+                missing.push(format!("{} ({needle})", step.id));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "アンカーを申告していない手順がある: {missing:?}"
+        );
+    }
+
+    /// 手順表が要求する依頼はすべて `apply_tutorial_action` に届く。
+    ///
+    /// `match` は網羅なのでコンパイラも守ってくれるが、
+    /// 「腕はあるが中身が空」を防ぐため、変種ごとに本体の目印も見る。
+    #[test]
+    fn 手順表の全依頼にルーティングがある() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn apply_tutorial_action(")
+            .nth(1)
+            .expect("ルーティング関数がある");
+        for step in crate::tutorial::STEPS {
+            let Some(act) = step.pre_action else { continue };
+            let name = format!("{act:?}");
+            // 変種名だけ取り出す (`OpenSidebar(Files)` → `OpenSidebar`)
+            let variant = name.split('(').next().unwrap_or(&name).to_string();
+            assert!(
+                body.contains(&format!("TA::{variant}")),
+                "{} の依頼 {variant} を実行していない",
+                step.id
+            );
+        }
+    }
+
+    /// サイドバーの依頼はすべて実在するタブに落ちる (対応表の網羅)。
+    #[test]
+    fn サイドバーの依頼がタブへ一意に対応する() {
+        use crate::tutorial::SidebarTarget as S;
+        let pairs = [
+            (S::Files, SidebarTab::Files),
+            (S::Search, SidebarTab::Search),
+            (S::Agents, SidebarTab::Agents),
+            (S::Sessions, SidebarTab::Sessions),
+            (S::Plugins, SidebarTab::Plugins),
+            (S::Git, SidebarTab::Git),
+            (S::GitHub, SidebarTab::GitHub),
+        ];
+        for (t, want) in pairs {
+            assert!(sidebar_tab_for(t) == want, "{t:?} の対応が違う");
+        }
+    }
+
+    /// 自動開始は**一度だけ**。2 回目は false で、位置も勝手に戻らない。
+    #[test]
+    fn 自動開始は一度だけ() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-tutorial", "autostart-once");
+        let mut t = crate::tutorial::Tutorial::in_dir(dir.clone());
+        assert!(t.autostart(), "初回は開始する");
+        assert!(t.active());
+        // 見終わる (= 既読フラグが立つ)
+        t.skip();
+        // 新しいインスタンス = 次回起動。もう出ない。
+        let mut t2 = crate::tutorial::Tutorial::in_dir(dir.clone());
+        assert!(!t2.autostart(), "2 度目は自動開始しない");
+        assert!(!t2.active());
+        // 「チュートリアルを再開」だけは既読でも開く
+        t2.restart();
+        assert!(t2.active() && t2.index() == 0);
+    }
+
+    /// ツアーは `tutorial_autostarted` で 1 回に絞ってから呼ぶ
+    /// (毎フレーム `autostart()` を呼ぶと位置が 0 に戻り続けて操作できない)。
+    #[test]
+    fn 自動開始の呼び出しはフラグで守られている() {
+        let src = include_str!("app.rs");
+        let body = src.split("fn tutorial_tick(").nth(1).expect("tutorial_tick がある");
+        let head = &body[..body.find("fn ").unwrap_or(body.len())];
+        assert!(head.contains("if !self.tutorial_autostarted"));
+        assert!(head.contains("self.tutorial_autostarted = true;"));
+        assert!(head.contains("self.tutorial.overlay(ctx, &theme)"));
+    }
+
+    /// オーバーレイはアイドル判定の**前**に呼ぶ。
+    ///
+    /// 逆順だと `IdleSignals::animating` にツアーの 30fps 予約が乗らず、
+    /// 「アニメ中なのに寝る」= リングがカクつく。ここが逆になったら気付けるように。
+    #[test]
+    fn ツアーはアイドル判定より先に描く() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {")
+            .nth(1)
+            .expect("update_impl がある");
+        let tick = body.find("self.tutorial_tick(ctx);").expect("ツアーを描いている");
+        let idle = body
+            .find("self.schedule_idle_repaint(ctx);")
+            .expect("アイドル予約がある");
+        assert!(tick < idle, "ツアーはアイドル予約より先でなければならない");
+    }
+}
+
+#[cfg(test)]
+mod approval_panel_tests {
+    use super::*;
+    use crate::agents::approvals::{
+        ApprovalKind, ApprovalQueue, Command, Decision, Policy, ReplyAction, Scope, Verdict,
+    };
+
+    fn queue() -> ApprovalQueue {
+        let dir =
+            crate::test_util::unique_temp_dir("zaivern-approvals", "panel");
+        ApprovalQueue::in_dir(dir)
+    }
+
+    /// キー 1 打 → コマンドの対応 (承認パネルの操作の要)。
+    #[test]
+    fn キーが承認コマンドへ正しく割り当たる() {
+        use egui::Key;
+        let k = panels::approval_key_command;
+        assert_eq!(k(Key::Y, false), Some(Command::Approve));
+        assert_eq!(k(Key::Y, true), Some(Command::Approve));
+        assert_eq!(k(Key::A, false), Some(Command::ApproveAllOfKind));
+        assert_eq!(k(Key::A, true), Some(Command::ApproveKindForAgentAlways));
+        assert_eq!(k(Key::N, false), Some(Command::Deny));
+        assert_eq!(k(Key::N, true), Some(Command::DenyKindForAgentAlways));
+        // 割り当てていないキーは食べない (下の端末へそのまま流れる)
+        assert_eq!(k(Key::J, false), None);
+        assert_eq!(k(Key::Escape, false), None);
+    }
+
+    /// 承認の応答は**その要求を出したセッションだけ**へ向く。
+    /// (全員へ撒くと、別のエージェントに勝手な YES を撃つ事故になる)
+    #[test]
+    fn 応答の宛先は要求元のセッションだけ() {
+        let mut q = queue();
+        let Verdict::Queued { id } =
+            q.intake(7, Some("claude"), "Do you want to create foo.txt?", 111)
+        else {
+            panic!("積まれるはず");
+        };
+        // 別のセッションにも待ちを作る
+        let _ = q.intake(9, Some("codex"), "Do you want to create bar.txt?", 222);
+
+        let res = q.apply(id, Command::Approve);
+        assert_eq!(res.replies.len(), 1, "1 件だけに応える");
+        assert_eq!(res.replies[0].0, 7, "宛先はセッション 7");
+        assert_eq!(res.replies[0].1, ReplyAction::Approve);
+        assert_eq!(q.pending_len(), 1, "もう一方は残る");
+    }
+
+    /// 応答は「セッション ID 一致」で配る — 番号 (index) では配らない。
+    /// index はセッションを閉じるとずれ、他人に YES を撃ってしまう。
+    #[test]
+    fn 応答の配達はidで引く() {
+        let src = include_str!("app.rs");
+        let body = src.split("fn resolve_approval(").nth(1).expect("実行部がある");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(
+            head.contains("self.agents.sessions.iter_mut().find(|s| s.id == *sid)"),
+            "セッション ID で引いていない"
+        );
+        assert!(head.contains("press_pet_approve_button"), "承認キーの経路が無い");
+        assert!(head.contains("resolve_attention"), "拒否後の後始末が無い");
+    }
+
+    /// 生成されたポリシーは config.toml の `[[approval_policies]]` として
+    /// **読み戻せる形**で書かれる (書けても読めなければ意味がない)。
+    #[test]
+    fn ポリシーはconfig_tomlへ往復できる形で書かれる() {
+        let p = Policy {
+            kind: ApprovalKind::FileWrite,
+            scope: Scope::Agent("cl\"aude".into()),
+            decision: Decision::AllowAlways,
+        };
+        let (scope, target) = p.scope.to_toml();
+        let entry = config::ApprovalPolicy {
+            kind: p.kind.as_str().to_string(),
+            scope: scope.to_string(),
+            target,
+            decision: p.decision.as_str().to_string(),
+        };
+        let toml_text = render_approval_policy(&entry);
+        // 引用符入りの名前でも壊れた TOML にならない
+        let cfg: config::Config = toml::from_str(&toml_text).expect("読み戻せる TOML");
+        assert_eq!(cfg.approval_policies.len(), 1);
+        let back = config::approval_policies_from_config(&cfg);
+        assert_eq!(back.len(), 1, "エンジンの Policy へ戻せる");
+        assert_eq!(back[0], p, "往復して同じポリシーになる");
+    }
+
+    /// 権限昇格は「常に許可」にできない。UI はそれを**黙って握り潰さない**。
+    #[test]
+    fn 権限昇格の常に許可は断られてui_が伝える() {
+        let mut q = queue();
+        // sudo を含む文面は privilege (never_auto) として分類される
+        let Verdict::Queued { id } = q.intake(3, Some("claude"), "Run sudo rm -rf /tmp/x ?", 42)
+        else {
+            panic!("積まれるはず");
+        };
+        assert!(q.get(id).map(|r| r.never_auto).unwrap_or(false), "権限昇格として分類される");
+
+        let res = q.apply(id, Command::ApproveKindForAgentAlways);
+        assert!(res.refused_always, "常に許可は断られる");
+        assert!(res.policy.is_none(), "ポリシーは作られない");
+        assert_eq!(res.replies.len(), 1, "この 1 件だけは承認される");
+
+        // app.rs がその事実を必ず画面へ出していること
+        let src = include_str!("app.rs");
+        let body = src.split("fn resolve_approval(").nth(1).expect("実行部がある");
+        assert!(body.contains("if res.refused_always"), "refused_always を見ていない");
+        assert!(
+            body.contains("権限昇格は「常に許可」にできません"),
+            "利用者へ伝える文言が無い"
+        );
+    }
+
+    /// 監査ログは**描画中に読まない**。控えが無いときだけ描画の外で 1 回読む。
+    #[test]
+    fn 監査ログは毎フレーム読まない() {
+        let src = include_str!("app.rs");
+        let body = src.split("fn terminal_panel(").nth(1).expect("パネルがある");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(
+            head.contains("self.approvals_audit_cache.is_none()"),
+            "控えの有無を見ずに読み直している"
+        );
+        assert!(head.contains("read_audit_tail"), "監査ログの読み口が無い");
+        // 読み込みはパネルのクロージャの**外**にある = 描画中の I/O ではない
+        let show = head.find(".show_animated(ctx, show,").expect("パネル描画がある");
+        let read = head.find("read_audit_tail").expect("読み口がある");
+        assert!(read > show, "描画クロージャの中で読んでいる可能性がある");
+    }
+}
+
+#[cfg(test)]
+mod composer_wiring_tests {
+    use super::*;
+    use crate::agent_input::{AgentInputBuffer, ComposerTarget};
+
+    /// 全員宛てと 1 体宛てが**別の経路**へ落ちる。
+    /// ここが混ざると「レビュー指示が全エージェントへ漏れる」に戻る。
+    #[test]
+    fn 全員宛てと指名宛てで経路が分かれる() {
+        let src = include_str!("app.rs");
+        let head = src
+            .split("let composer = panels::agent_composer_ui(")
+            .nth(1)
+            .expect("コンポーザを呼んでいる");
+        let arm = &head[..head.find("\n    /// ").unwrap_or(head.len())];
+        assert!(
+            arm.contains("panels::ComposerAction::Send(t) => acts.broadcast = Some(t)"),
+            "全員宛てが broadcast へ行っていない"
+        );
+        assert!(
+            arm.contains("panels::ComposerAction::SendTo(id, t) => acts.send_to = Some((id, t))"),
+            "指名宛てが send_to へ行っていない"
+        );
+        // 指名宛ての実行部は broadcast を通らない
+        let apply = src
+            .split("if let Some((id, text)) = acts.send_to {")
+            .nth(1)
+            .expect("send_to の実行部がある");
+        let apply = &apply[..apply.find("if acts.voice_stop").unwrap_or(apply.len())];
+        assert!(apply.contains("find(|s| s.id == id)"), "ID で 1 体を引いていない");
+        assert!(!apply.contains("broadcast"), "指名宛てが一斉送信へ落ちている");
+    }
+
+    /// 死んだエージェントの下書きは掃かれる。
+    /// (ID は再利用されないが、残しておくと際限なく貯まる)
+    #[test]
+    fn 消えたエージェントの下書きは掃かれる() {
+        let mut b = AgentInputBuffer::new();
+        b.set_draft_for(ComposerTarget::Agent(1), "1 番への指示");
+        b.set_draft_for(ComposerTarget::Agent(2), "2 番への指示");
+        b.set_draft_for(ComposerTarget::Broadcast, "全員へ");
+        assert_eq!(b.draft_for(ComposerTarget::Agent(2)), "2 番への指示");
+
+        // 2 番が死んだ
+        b.retain_agents(&[1]);
+        assert_eq!(b.draft_for(ComposerTarget::Agent(1)), "1 番への指示", "生きている方は残る");
+        assert_eq!(b.draft_for(ComposerTarget::Agent(2)), "", "死んだ方は消える");
+        assert_eq!(b.draft_for(ComposerTarget::Broadcast), "全員へ", "全員宛ては消さない");
+    }
+
+    /// 掃除はセッションの増減を拾う 1 か所 (`reconcile_sessions`) で走る。
+    #[test]
+    fn 下書きの掃除はセッション増減の場所で走る() {
+        let src = include_str!("app.rs");
+        let body = src.split("fn reconcile_sessions(&mut self) {").nth(1).expect("あるはず");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(head.contains("self.agent_input_buf.retain_agents(&ids)"));
+    }
+}
+
+#[cfg(test)]
+mod multi_cursor_wiring_tests {
+    use super::*;
+    use crate::editor_ops::MultiSel;
+
+    /// 複数キャレットへの一括挿入は **1 回の本文差し替え**で終わる
+    /// = egui の取り消しスタックにも 1 段しか積まれない。
+    #[test]
+    fn 一括挿入は一度の差し替えで期待した本文になる() {
+        let text = "aaa\nbbb\nccc\n";
+        // 各行の先頭 (0, 4, 8) に空キャレットを立てる
+        let sel = MultiSel::in_text(text, [0..0, 4..4, 8..8]);
+        let (out, next, n) = multi_batch_insert(text, &sel, "// ");
+        assert_eq!(out, "// aaa\n// bbb\n// ccc\n");
+        assert_eq!(n, 3, "3 箇所へ入った");
+        assert_eq!(next.len(), 3, "キャレットは 3 本のまま");
+        // 挿入後の位置は挿入文字列の直後 (= そこにタイプした形)
+        assert_eq!(next.carets()[0], 3..3);
+    }
+
+    /// 選択のある複数キャレットでは、選択内容を残したまま手前へ入る。
+    #[test]
+    fn 選択つきキャレットでも選択内容は消えない() {
+        let text = "foo bar foo";
+        let sel = MultiSel::in_text(text, [0..3, 8..11]);
+        let (out, _next, n) = multi_batch_insert(text, &sel, "<");
+        assert_eq!(out, "<foo bar <foo");
+        assert_eq!(n, 2);
+    }
+
+    /// 本文への書き込みは **1 か所だけ**。
+    /// 途中で複数回代入すると取り消しが 1 段では戻らなくなる。
+    #[test]
+    fn 一括編集の本文書き込みは一度だけ() {
+        let src = include_str!("app.rs");
+        let body = src.split("Cmd::MultiPaste => {").nth(1).expect("MultiPaste の腕がある");
+        let arm = &body[..body.find("Cmd::ColumnSelectStart =>").unwrap_or(body.len())];
+        assert_eq!(
+            arm.matches("b.text = ").count(),
+            1,
+            "本文を 2 回以上書き換えている (取り消しが 1 段で戻らない)"
+        );
+        assert!(arm.contains("multi_batch_insert("), "一括編集を通っていない");
+    }
+
+    /// char 添字 → (行, 表示桁)。矩形選択の座標変換。
+    #[test]
+    fn 表示桁はタブを展開して数える() {
+        let tw = 4;
+        // "\tab" → タブは 0→4 桁へ、'a' が 4 桁目
+        assert_eq!(char_index_to_line_col("\tab", 0, tw), (0, 0));
+        assert_eq!(char_index_to_line_col("\tab", 1, tw), (0, 4));
+        assert_eq!(char_index_to_line_col("\tab", 2, tw), (0, 5));
+        // 改行で行が進み桁は 0 へ
+        assert_eq!(char_index_to_line_col("ab\ncd", 3, tw), (1, 0));
+        assert_eq!(char_index_to_line_col("ab\ncd", 5, tw), (1, 2));
+        // CR は桁を進めない (CRLF の途中に桁を作らない)
+        assert_eq!(char_index_to_line_col("ab\r\ncd", 4, tw), (1, 0));
+        // 範囲外はクランプ (壊れた値でも落ちない)
+        assert_eq!(char_index_to_line_col("ab", 99, tw), (0, 2));
+    }
+}
+
+#[cfg(test)]
+mod encoding_wiring_tests {
+    use super::*;
+
+    /// ピッカーは**実測で使えるものだけ**を並べる。
+    /// 決め打ちの表を出すと、選んだのに保存できない項目が混ざる。
+    #[test]
+    fn ピッカーは使える符号化しか並べない() {
+        let src = include_str!("app.rs");
+        let body = src.split("fn encoding_picker_ui(").nth(1).expect("ピッカーがある");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(
+            head.contains("crate::textenc::supported_encodings()"),
+            "実測の一覧を使っていない"
+        );
+        // 並んだ項目はすべて名前から引き直せる (= 選択がそのまま通る)
+        for info in crate::textenc::supported_encodings() {
+            assert_eq!(
+                crate::textenc::encoding_by_name(&info.id),
+                Some(info.enc),
+                "{} を id から引けない",
+                info.id
+            );
+            assert!(crate::textenc::is_supported(info.enc), "{} が使えない", info.id);
+        }
+    }
+
+    /// 化けた開き直しは**件数付きで警告**する (黙って壊れた本文を見せない)。
+    #[test]
+    fn 化けた開き直しは件数付きで警告する() {
+        // UTF-8 として不正なバイト列 (CP932 の「あ」)
+        let bytes = [0x82u8, 0xA0];
+        let rep = crate::textenc::reopen_with_report(&bytes, crate::textenc::Encoding::Utf8);
+        assert!(rep.lossy(), "UTF-8 では読めないので化ける");
+        assert!(rep.replacements > 0, "化けた箇所を数えている");
+
+        let src = include_str!("app.rs");
+        let body = src.split("fn reopen_with_encoding(").nth(1).expect("開き直しがある");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(head.contains("rep.lossy()"), "化けたかどうかを見ていない");
+        assert!(head.contains("rep.replacements"), "件数を出していない");
+        assert!(head.contains("箇所が化けています"), "警告の文言が無い");
+    }
+
+    /// 保存できない文字があったら、保存せずに**その文字へキャレットを飛ばす**。
+    #[test]
+    fn 保存失敗はキャレットを問題の文字へ飛ばす() {
+        use crate::textenc::{Encoding, LineEnding};
+        // ASCII しか通らない符号化が実測一覧にあるとは限らないので、
+        // 「表せない文字」を確実に作れる CP932 系が使える環境でだけ本体を見る。
+        if let Some(enc) = crate::textenc::encoding_by_name("cp932") {
+            // 𠮟 (U+20B9F) は CP932 に無い
+            let text = "abc𠮟def";
+            let issue = crate::textenc::save_with(text, enc, LineEnding::Lf)
+                .expect_err("表せない文字があるので断られる");
+            assert_eq!(issue.char_index(), Some(3), "4 文字目 (0 起点で 3)");
+            assert!(!issue.message().is_empty(), "説明文が出せる");
+        } else {
+            // 変換表が無い環境: Unsupported を返し、位置は無い
+            let issue = crate::textenc::save_with("abc", Encoding::Ansi(932), LineEnding::Lf)
+                .expect_err("この環境では使えない");
+            assert_eq!(issue.char_index(), None);
+        }
+
+        let src = include_str!("app.rs");
+        let body = src.split("fn save_with_encoding(").nth(1).expect("保存がある");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(
+            head.contains("if let Some(ix) = issue.char_index()"),
+            "問題の文字位置を使っていない"
+        );
+        assert!(
+            head.contains("self.pending_select = Some((ix, ix + 1));"),
+            "キャレットを飛ばしていない"
+        );
+        assert!(head.contains("issue.message()"), "理由を出していない");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  フレームガード: 隔離された領域が「黒い空間」にならないこと
+//  (Windows の Cockpit で報告された不具合の回帰テスト)
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod quarantine_hole_tests {
+    use super::*;
+
+    /// 隔離されたパネルは**何も描かずに return しない**。
+    ///
+    /// パネルごと消すと egui はその矩形へ何も塗らず、直前のフレームの
+    /// ピクセル (= ウィンドウ背景 = 黒) が残り続ける。しかも利用者には
+    /// 何が起きたのか分からない。ここが `return;` に戻ったら気付けるように。
+    #[test]
+    fn 隔離されたパネルは代わりの説明を描く() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn guarded_view(&mut self, sv: Subview, ctx: &egui::Context, draw:")
+            .nth(1)
+            .expect("guarded_view がある");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(
+            head.contains("self.quarantined_panel_ui(&sv, ctx);"),
+            "隔離時に代わりの描画をしていない (黒い空間になる)"
+        );
+        // guarded_ui 側も同じ約束
+        let ui_body = src.split("fn guarded_ui(").nth(1).expect("guarded_ui がある");
+        let ui_head = &ui_body[..ui_body.find("\n    /// ").unwrap_or(ui_body.len())];
+        assert!(ui_head.contains("quarantine_placeholder_ui"));
+    }
+
+    /// 代わりの描画は**生きているときと同じパネル id** を使う。
+    /// id を変えるとリサイズ幅の記憶が失われ、復帰した瞬間に既定幅へ戻る。
+    #[test]
+    fn 代わりのパネルは同じidを使う() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn quarantined_panel_ui(")
+            .nth(1)
+            .expect("代わりの描画がある");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(head.contains("SidePanel::left(\"zv-side\")"), "サイドバーの id が違う");
+        assert!(
+            head.contains("TopBottomPanel::bottom(\"zv-terminal\")"),
+            "ターミナルパネルの id が違う"
+        );
+        // 想定外の Subview でも画面を黒くしない受け皿がある
+        assert!(head.contains("CentralPanel::default()"));
+    }
+
+    /// プレースホルダには復帰手段 (再試行) がある。
+    /// バナーは 1 度閉じると出ないので、ここに無いと永久に死んだままになる。
+    #[test]
+    fn プレースホルダから再試行できる() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn quarantine_placeholder_ui(")
+            .nth(1)
+            .expect("プレースホルダがある");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(head.contains("-> bool"), "押されたことを返していない");
+        assert!(head.contains("ここだけ再試行"), "再試行ボタンが無い");
+        // 押したら「その Subview だけ」解除する
+        for f in ["fn guarded_ui(", "fn quarantined_panel_ui("] {
+            let b = src.split(f).nth(1).expect("あるはず");
+            let h = &b[..b.find("\n    /// ").unwrap_or(b.len())];
+            assert!(h.contains("unquarantine("), "{f} が個別解除を呼んでいない");
+        }
+    }
+
+    /// 個別解除は「その 1 つだけ」外し、頻度の記憶もまっさらにする。
+    /// 記憶が残ると「再試行 → 1 回 panic → 即また隔離」で直らないように見える。
+    #[test]
+    fn 個別解除はその一つだけを外して記憶も消す() {
+        let mut g = FrameGuard::default();
+        g.quarantined.insert(Subview::Panel("sidebar"));
+        g.quarantined.insert(Subview::Session(7));
+        g.banner = Some("dummy".into());
+        // panic の記憶を積んでおく
+        g.policy.streak = 2;
+        g.policy.recent = vec![1, 2, 3];
+        g.policy.clean = 0;
+
+        g.unquarantine(&Subview::Panel("sidebar"));
+        assert!(!g.is_quarantined(&Subview::Panel("sidebar")), "外れていない");
+        assert!(g.is_quarantined(&Subview::Session(7)), "他まで外している");
+        assert_eq!(g.policy.streak, 0, "連続カウンタが残っている");
+        assert!(g.policy.recent.is_empty(), "時間窓の記憶が残っている");
+        assert!(g.banner.is_some(), "まだ隔離が残っているのでバナーは消さない");
+
+        // 最後の 1 つを外したらバナーも消える
+        g.unquarantine(&Subview::Session(7));
+        assert!(g.quarantined.is_empty());
+        assert!(g.banner.is_none(), "隔離が空なのにバナーが残っている");
+    }
+
+    /// 消えたセッションの隔離は掃く。
+    /// 残すと ID が再利用されたとき、新しいタイルがいきなり黒く出る。
+    #[test]
+    fn 消えたセッションの隔離は掃かれる() {
+        let mut g = FrameGuard::default();
+        g.quarantined.insert(Subview::Session(1));
+        g.quarantined.insert(Subview::Session(2));
+        g.quarantined.insert(Subview::Panel("editor"));
+
+        let alive: HashSet<u64> = [2u64].into_iter().collect();
+        g.forget_sessions(&alive);
+
+        assert!(!g.is_quarantined(&Subview::Session(1)), "消えたセッションが残っている");
+        assert!(g.is_quarantined(&Subview::Session(2)), "生きている方まで外している");
+        assert!(
+            g.is_quarantined(&Subview::Panel("editor")),
+            "パネルの隔離まで外している"
+        );
+
+        // 全部消えたらバナーも消す
+        g.banner = Some("dummy".into());
+        g.quarantined.clear();
+        g.quarantined.insert(Subview::Session(9));
+        g.forget_sessions(&HashSet::new());
+        assert!(g.quarantined.is_empty());
+        assert!(g.banner.is_none());
+    }
+
+    /// 掃除はセッションの増減を拾う 1 か所 (`reconcile_sessions`) で走る。
+    #[test]
+    fn 隔離の掃除はセッション増減の場所で走る() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn reconcile_sessions(&mut self) {")
+            .nth(1)
+            .expect("あるはず");
+        let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
+        assert!(
+            head.contains("self.frame_guard.forget_sessions(&live);"),
+            "隔離集合を掃いていない"
+        );
     }
 }

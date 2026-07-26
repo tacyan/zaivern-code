@@ -240,6 +240,34 @@ pub enum Cmd {
     LspFormat,
     /// 保存時に自動で整形するかを切り替える
     ToggleFormatOnSave,
+
+    // ── 第 3 次配線: ガイドツアー / 承認キュー / 複数キャレット / 符号化 ──
+    /// 初回起動ガイドツアーを最初から見直す
+    RestartTutorial,
+    /// 統合承認キューのパネルを開く
+    OpenApprovals,
+    /// 承認の監査ログ (approvals.jsonl の末尾) を開く
+    OpenApprovalAudit,
+    /// キャレットを 1 つ上の行に増やす
+    AddCursorAbove,
+    /// キャレットを 1 つ下の行に増やす
+    AddCursorBelow,
+    /// 選択語の出現を全部選ぶ
+    SelectAllOccurrences,
+    /// 選択語の次の出現を 1 つ足す (VS Code の ⌘D)
+    SelectNextOccurrence,
+    /// 矩形 (列) 選択を開始する — いまのキャレットを角に据える
+    ColumnSelectStart,
+    /// 矩形 (列) 選択を確定する — いまのキャレットまでを長方形にする
+    ColumnSelectFinish,
+    /// 複数キャレットを解除して 1 本に戻す
+    ClearMultiCursor,
+    /// 全キャレットへクリップボードを貼り付ける (1 回の取り消しで戻る)
+    MultiPaste,
+    /// 符号化を選んで開き直す (`None` ならピッカーを開く)
+    ReopenWithEncoding(Option<String>),
+    /// 符号化を選んで保存する (`None` ならピッカーを開く)
+    SaveWithEncoding(Option<String>),
 }
 
 #[derive(Clone)]

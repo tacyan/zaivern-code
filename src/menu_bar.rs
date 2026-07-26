@@ -612,6 +612,10 @@ fn terminal_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut
 fn help_menu(ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
     ui.menu_button(tr("ヘルプ"), |ui| {
         ui.set_min_width(300.0);
+        // 初回起動ガイドツアー。「もう一度見たい」を探す場所はここ以外に無い。
+        if item(ui, &tr("チュートリアルを再開"), "", true) {
+            cmds.push(Cmd::RestartTutorial);
+        }
         if item(ui, &tr("キーボード ショートカットのリファレンス"), "", true) {
             cmds.push(Cmd::ShowShortcuts);
         }
