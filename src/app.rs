@@ -1932,8 +1932,19 @@ pub struct ZaivernApp {
     /// セッションタブに出すフォルダ一覧。`sidebar_folders` は `is_dir()` を叩くので
     /// 毎フレームは作り直さず、元になる「ルート + MRU」が変わったときだけ作り直す。
     sess_folders: Vec<PathBuf>,
-    /// `sess_folders` を作った元 (ルート + MRU)。変化検知用。
+    /// `sess_folders` を作った元 (ルート + MRU + worktree)。変化検知用。
     sess_folders_src: Vec<PathBuf>,
+    /// いま開いているリポジトリの worktree 一覧 (ブランチをまたいでも会話を
+    /// 見せるための材料)。git は裏で叩き、届いたら貼る。
+    repo_worktrees: Vec<PathBuf>,
+    /// `repo_worktrees` を取ったルートと取得時刻 (TTL 再取得用)。
+    repo_worktrees_at: Option<(PathBuf, Instant)>,
+    /// 取得中フラグ (同じルートへ二重に投げない)。
+    repo_worktrees_pending: bool,
+    repo_worktrees_tx: mpsc::Sender<(PathBuf, Vec<PathBuf>)>,
+    repo_worktrees_rx: mpsc::Receiver<(PathBuf, Vec<PathBuf>)>,
+    /// ツールバーのブランチボタン (一覧・切り替え。git は全て裏で回す)。
+    branch_nav: git::BranchNav,
     file_index: Vec<IndexedFile>,
     index_at: Option<Instant>,
     /// カスタムテーマ (~/.zaivern/themes + プラグイン同梱): (表示名, JSONフルパス)
@@ -2437,6 +2448,9 @@ impl ZaivernApp {
         }
         // デッキの副題 (ブランチ) を裏で解決するための口。
         let (deck_branch_tx, deck_branch_rx) = mpsc::channel();
+        // リポジトリの worktree 一覧 (セッション一覧をブランチ横断にする材料)。
+        let (repo_worktrees_tx, repo_worktrees_rx) = mpsc::channel();
+        let primary_root = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
         let mut app = Self {
             tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
             gitinfo: git::GitSet::new(roots.clone()),
@@ -2505,6 +2519,12 @@ impl ZaivernApp {
             sidebar_sessions: session_picker::SidebarState::default(),
             sess_folders: Vec::new(),
             sess_folders_src: Vec::new(),
+            repo_worktrees: Vec::new(),
+            repo_worktrees_at: None,
+            repo_worktrees_pending: false,
+            repo_worktrees_tx,
+            repo_worktrees_rx,
+            branch_nav: git::BranchNav::new(primary_root.clone()),
             file_index: Vec::new(),
             index_at: None,
             custom_themes: Vec::new(),
@@ -2725,6 +2745,12 @@ impl ZaivernApp {
         // サイドバーとステータスバーのブランチ表示が食い違わないようにする。
         self.git_panel.set_workspace(self.primary_root().to_path_buf());
         self.review.set_workspace(self.primary_root().to_path_buf());
+        // ブランチピッカーも新しいリポジトリへ。旧 repo の一覧が残っていると、
+        // そこに無いブランチへの切り替えを発行できてしまう。
+        self.branch_nav.set_repo(self.primary_root().to_path_buf());
+        // 別リポジトリを開いたら worktree 一覧も引き継がない
+        self.repo_worktrees.clear();
+        self.repo_worktrees_at = None;
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
         self.tree.show_hidden = self.cfg.show_hidden_files;
@@ -4665,8 +4691,19 @@ impl ZaivernApp {
         // 変化の判定には **fs を叩かない** 生の値だけを使う。
         // `MenuState::folders()` は is_dir() を叩くので、ここでは呼ばない
         // (呼ぶのは「変わった」と分かった後の 1 回だけ)。
+        let repo_wide = self.cfg.sessions_repo_wide;
+        // worktree 一覧はセッションタブを **見ているときだけ** 取り直す。
+        // 誰も見ていない一覧のために git を起動しない (アイドルのコストは 0)。
+        if repo_wide && self.sidebar_open && self.sidebar_tab == SidebarTab::Sessions {
+            self.poll_repo_worktrees();
+        }
         let mut src: Vec<PathBuf> = self.roots.clone();
         src.extend(self.menu_state.recent_folders.iter().map(PathBuf::from));
+        // 表示範囲そのものが変わったときも作り直す (fs を叩かない目印を混ぜる)。
+        src.push(PathBuf::from(if repo_wide { "\u{0}repo" } else { "\u{0}folder" }));
+        if repo_wide {
+            src.extend(self.repo_worktrees.iter().cloned());
+        }
         if src == self.sess_folders_src {
             return;
         }
@@ -4676,10 +4713,147 @@ impl ZaivernApp {
             .iter()
             .map(PathBuf::from)
             .collect();
-        self.sess_folders = session_picker::sidebar_folders(&self.roots, &mru);
+        self.sess_folders = if repo_wide {
+            session_picker::repo_sidebar_folders(
+                &self.primary_root().to_path_buf(),
+                &self.roots,
+                &self.repo_worktrees,
+                &mru,
+            )
+        } else {
+            session_picker::sidebar_folders(&self.roots, &mru)
+        };
         self.sess_folders_src = src;
         // 対象フォルダが変わった = 走査結果のキャッシュはもう当たらない
         self.sidebar_sessions.invalidate();
+    }
+
+    /// いま開いているリポジトリの worktree 一覧を裏で取り直す。
+    ///
+    /// `git worktree list` はプロセス起動なので **UI スレッドでは回さない**。
+    /// 届くまでは空 (= 従来どおりこのフォルダだけ) で描き、届いたら増える。
+    fn poll_repo_worktrees(&mut self) {
+        /// worktree の増減はそう頻繁ではないので長めでよい。
+        const TTL: Duration = Duration::from_secs(30);
+        while let Ok((root, list)) = self.repo_worktrees_rx.try_recv() {
+            self.repo_worktrees_pending = false;
+            // 別のフォルダへ移った後に届いた古い結果は捨てる。
+            if root == *self.primary_root() {
+                self.repo_worktrees = list;
+                self.repo_worktrees_at = Some((root, Instant::now()));
+            }
+        }
+        let root = self.primary_root().to_path_buf();
+        let fresh = matches!(
+            &self.repo_worktrees_at,
+            Some((r, at)) if *r == root && at.elapsed() < TTL
+        );
+        if fresh || self.repo_worktrees_pending {
+            return;
+        }
+        // ルートが変わったら、前のリポジトリの worktree を引きずらない。
+        if self.repo_worktrees_at.as_ref().is_some_and(|(r, _)| *r != root) {
+            self.repo_worktrees.clear();
+            self.repo_worktrees_at = None;
+        }
+        self.repo_worktrees_pending = true;
+        let tx = self.repo_worktrees_tx.clone();
+        // 「同じリポジトリか」は開いているルートと MRU にも当てる。worktree
+        // 一覧に出ない (サブディレクトリを開いている等) フォルダも拾うため。
+        let mut candidates: Vec<PathBuf> = self.roots.clone();
+        candidates.extend(self.menu_state.recent_folders.iter().map(PathBuf::from));
+        let spawned = std::thread::Builder::new()
+            .name("zv-worktrees".into())
+            .spawn(move || {
+                let fam = git::scan_repo_family(&root, &candidates);
+                let mut list = fam.worktrees;
+                for r in fam.related {
+                    if !list.contains(&r) {
+                        list.push(r);
+                    }
+                }
+                let _ = tx.send((root, list));
+            });
+        if spawned.is_err() {
+            self.repo_worktrees_pending = false;
+        }
+    }
+
+    /// 「💬 セッション」タブ。
+    ///
+    /// 一覧そのものは `panels::sessions_sidebar_ui` が描く。ここが足すのは
+    /// - 表示範囲の切り替え (`このフォルダのみ` / リポジトリ全体)
+    /// - ブランチの索引: どの worktree がどのブランチで何件か。畳んだ
+    ///   グループの件数もここで分かり、押せば開閉できる。
+    fn sidebar_sessions_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+    ) -> session_picker::SidebarAction {
+        let repo_wide = self.cfg.sessions_repo_wide;
+        let folders = self.sess_folders.clone();
+        let current = self.primary_root().to_path_buf();
+
+        ui.horizontal(|ui| {
+            let mut only_here = !repo_wide;
+            let hit = ui
+                .checkbox(
+                    &mut only_here,
+                    RichText::new(tr("このフォルダのみ")).size(11.0),
+                )
+                .on_hover_text(tr(
+                    "オフ: 同じリポジトリの全ブランチ (worktree) の会話をまとめて出します",
+                ));
+            if hit.changed() {
+                self.cfg.sessions_repo_wide = !only_here;
+                config::save_state(&self.cfg);
+                // 次のフレームでフォルダ一覧を作り直させる
+                self.sess_folders_src.clear();
+                self.sidebar_sessions.invalidate();
+            }
+        });
+
+        if repo_wide && folders.len() > 1 {
+            // ブランチ名は deck と同じ TTL キャッシュ (git は裏で回る)。
+            let mut branches: HashMap<PathBuf, String> = HashMap::new();
+            for f in &folders {
+                let b = self.deck_branch_of(f);
+                branches.insert(f.clone(), b);
+            }
+            let counts: HashMap<PathBuf, usize> = folders
+                .iter()
+                .map(|f| (f.clone(), self.sidebar_sessions.sessions_for(f).len()))
+                .collect();
+            let groups = session_picker::folder_groups(&folders, &current, &branches, &counts);
+            let mut toggle: Option<PathBuf> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 3.0);
+                for g in &groups {
+                    let open = !self.sidebar_sessions.is_collapsed(&g.folder);
+                    let color = if g.current { theme.accent } else { theme.text_dim };
+                    let text = format!("🌿 {} {}", g.label(), g.count);
+                    let hit = ui
+                        .add(
+                            egui::Button::new(RichText::new(text).size(10.5).color(color))
+                                .frame(open),
+                        )
+                        .on_hover_text(g.folder.display().to_string());
+                    if hit.clicked() {
+                        toggle = Some(g.folder.clone());
+                    }
+                }
+            });
+            if let Some(f) = toggle {
+                self.sidebar_sessions.toggle_collapsed(&f);
+            }
+            ui.add_space(2.0);
+            ui.separator();
+            // 既定は「いまのブランチのグループだけ開く」(一度きり)。
+            self.sidebar_sessions
+                .apply_default_collapse(&folders, &current);
+        }
+
+        panels::sessions_sidebar_ui(ui, theme, &mut self.sidebar_sessions, &folders)
     }
 
     /// 差分ビュー (PR 差分・レース差分) の「エージェントに送る」で組み立てられた
@@ -8311,15 +8485,33 @@ impl ZaivernApp {
         // ガイドツアーへ「ツールバーはここ」と申告する (非表示なら申告しないだけ)
         tutorial::anchor(ctx, AnchorId::Toolbar, bar.response.rect);
 
+        // ブランチ切り替え: 走り終わったジョブの回収 → 新しい要求の実行。
+        // (メニューを閉じていてもジョブは走り続けるので毎フレーム見る)
+        if let Some((msg, ok)) = self.branch_nav.poll_job() {
+            self.toast(msg, ok);
+            if ok {
+                self.after_branch_switch();
+            }
+        }
+        if let Some(target) = self.branch_nav.take_request() {
+            self.begin_branch_switch(target, ctx);
+        }
+        if self.branch_nav.take_review_request() {
+            // 「変更をレビュー」= Git タブのレビューサブタブを開くだけ。
+            self.sidebar_open = true;
+            self.sidebar_tab = SidebarTab::Git;
+            self.git_sub_review = true;
+        }
+
         for c in cmds {
             self.apply_cmd(c, ctx);
         }
     }
 
-    /// トップバー左側: ロゴ・VS Code 準拠メニューバー・ブランチ表示。
+    /// トップバー左側: ロゴ・VS Code 準拠メニューバー・ブランチ切り替え。
     /// ボタン類は cmds に記録だけして呼び出し側で self へ反映する。
     fn top_bar_left(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         theme: &Theme,
         menu_info: &menu_bar::MenuInfo,
@@ -8343,8 +8535,242 @@ impl ZaivernApp {
         cmds.append(&mut menu_cmds);
 
         if let Some(b) = branch {
-            ui.label(RichText::new(format!("🌿 {b}")).color(theme.text_dim));
+            self.branch_button(ui, theme, b);
         }
+    }
+
+    /// トップバー: 🌿 ブランチボタン (押すと切り替えピッカーが開く)。
+    ///
+    /// git は **1 本も UI スレッドで動かさない**。開いている間だけ
+    /// [`git::BranchNav`] が裏で一覧を取り、選んだ先は
+    /// [`git::BranchSnapshot::plan_switch`] の判断を通してから別スレッドで実行する。
+    fn branch_button(&mut self, ui: &mut egui::Ui, theme: &Theme, current: &str) {
+        let busy = self.branch_nav.busy();
+        let label = if busy {
+            format!("🌿 {current} …")
+        } else {
+            format!("🌿 {current} ▾")
+        };
+        let color = if busy { theme.warn } else { theme.text_dim };
+        let menu = ui.menu_button(RichText::new(label).color(color), |ui| {
+            self.branch_menu_ui(ui, theme);
+        });
+        let open = menu.inner.is_some();
+        self.branch_nav.set_open(open);
+        menu.response.on_hover_text(if busy {
+            trf(
+                "{b} へ切り替え中…",
+                &[("b", self.branch_nav.job_label().to_string())],
+            )
+        } else {
+            tr("ブランチを切り替え")
+        });
+    }
+
+    /// ブランチピッカーの中身 (ローカル → 区切り → リモート追跡)。
+    fn branch_menu_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.set_min_width(300.0);
+        let ctx = ui.ctx().clone();
+        // 開いている間だけ収集する (閉じていれば git は 1 本も起動しない)。
+        self.branch_nav.ensure_fresh(&ctx);
+
+        let want_focus = self.branch_nav.take_focus_request();
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut self.branch_nav.filter)
+                .desired_width(f32::INFINITY)
+                .hint_text(tr("ブランチを絞り込み")),
+        );
+        if want_focus {
+            edit.request_focus();
+        }
+
+        // 直近の拒否理由 (汚れている / マージ中 / 別 worktree)。
+        if let Some(block) = self.branch_nav.block.clone() {
+            ui.add_space(2.0);
+            ui.label(RichText::new(block.message()).color(theme.warn).size(11.0));
+            if block.offers_review()
+                && ui
+                    .button(RichText::new(tr("変更をレビュー")).size(11.0))
+                    .clicked()
+            {
+                self.branch_nav.request_review();
+                ui.close_menu();
+            }
+        }
+
+        let Some(snap) = self.branch_nav.snapshot() else {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(tr("読み込み中…"))
+                    .color(theme.text_dim)
+                    .size(11.0),
+            );
+            return;
+        };
+
+        // 押す前に分かるように、切り替えを止める条件は先に出しておく。
+        let note = |ui: &mut egui::Ui, s: String| {
+            ui.label(RichText::new(s).color(theme.text_dim).size(10.5));
+        };
+        if let Some(what) = &snap.in_progress {
+            note(
+                ui,
+                trf("{what}の途中です", &[("what", what.clone())]),
+            );
+        } else if snap.dirty_total > 0 {
+            note(
+                ui,
+                trf(
+                    "未コミットの変更が {n} 件あります (切り替えは止めます)",
+                    &[("n", snap.dirty_total.to_string())],
+                ),
+            );
+        }
+        if let Some(d) = &snap.detached {
+            note(ui, d.clone());
+        }
+        ui.separator();
+
+        let filter = self.branch_nav.filter.clone();
+        let mut chosen: Option<git::SwitchTarget> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("zv-branch-pick")
+            .max_height(320.0)
+            .show(ui, |ui| {
+                let mut shown = 0usize;
+                for b in &snap.local {
+                    if !git::matches_filter(&b.name, &filter) {
+                        continue;
+                    }
+                    shown += 1;
+                    let held = b.other_worktree || snap.holders.iter().any(|(n, _)| *n == b.name);
+                    let mark = if b.current {
+                        "●"
+                    } else if held {
+                        "⧉"
+                    } else {
+                        " "
+                    };
+                    let color = if b.current {
+                        theme.accent
+                    } else if held {
+                        theme.text_dim
+                    } else {
+                        theme.text
+                    };
+                    let row = ui.add(
+                        egui::Button::new(
+                            RichText::new(format!("{mark} {}", b.name))
+                                .size(11.5)
+                                .color(color),
+                        )
+                        .frame(false),
+                    );
+                    let row = if held {
+                        row.on_hover_text(tr("別の作業ツリーで開かれています"))
+                    } else {
+                        row
+                    };
+                    if row.clicked() && !b.current {
+                        chosen = Some(git::SwitchTarget::Local(b.name.clone()));
+                    }
+                }
+
+                let remotes: Vec<&String> = snap
+                    .remote
+                    .iter()
+                    .filter(|r| git::matches_filter(r, &filter))
+                    .collect();
+                if !remotes.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(tr("リモート追跡 (選ぶと追跡ブランチを作ります)"))
+                            .color(theme.text_dim)
+                            .size(10.0),
+                    );
+                    for r in remotes {
+                        shown += 1;
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("  {r}")).size(11.5).color(theme.text),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            chosen = Some(git::SwitchTarget::Remote(r.clone()));
+                        }
+                    }
+                }
+
+                if shown == 0 {
+                    ui.label(
+                        RichText::new(tr("一致するブランチがありません"))
+                            .color(theme.text_dim)
+                            .size(11.0),
+                    );
+                }
+            });
+
+        // 上限で切ったことは黙らない (「無い」と「出していない」を区別する)。
+        let cut = snap.local_total.saturating_sub(snap.local.len())
+            + snap.remote_total.saturating_sub(snap.remote.len());
+        if cut > 0 {
+            ui.label(
+                RichText::new(trf(
+                    "最近の {n} 件だけ出しています (ほか {cut} 件は絞り込みで探してください)",
+                    &[
+                        ("n", git::BRANCH_LIST_CAP.to_string()),
+                        ("cut", cut.to_string()),
+                    ],
+                ))
+                .color(theme.text_dim)
+                .size(10.0),
+            );
+        }
+
+        if let Some(t) = chosen {
+            self.branch_nav.select(t);
+            // 断られたときはメニューを開いたままにして理由を読ませる。
+            if self.branch_nav.block.is_none() {
+                ui.close_menu();
+            }
+        }
+    }
+
+    /// ブランチ切り替えを開始する (判断は git.rs の純関数に任せる)。
+    fn begin_branch_switch(&mut self, target: git::SwitchTarget, ctx: &egui::Context) {
+        let Some(snap) = self.branch_nav.snapshot() else {
+            return;
+        };
+        let label = match &target {
+            git::SwitchTarget::Local(n) => n.clone(),
+            git::SwitchTarget::Remote(r) => r.clone(),
+        };
+        match snap.plan_switch(&target) {
+            Ok(argv) => self.branch_nav.start_switch(argv, label, ctx),
+            Err(block) => {
+                self.toast(block.message(), false);
+                self.branch_nav.block = Some(block);
+            }
+        }
+    }
+
+    /// 切り替えが成功した後に「ブランチに依存しているもの」を作り直す。
+    /// どれも次のフレームで自前のバックグラウンド経路が走るだけで、
+    /// ここで git を叩くことはない。
+    fn after_branch_switch(&mut self) {
+        self.gitinfo.request_refresh(); // ファイルツリーの status 装飾
+        self.gitinfo.invalidate_branch(); // ツールバーのブランチ名
+        self.tree.invalidate(); // ファイルの中身が入れ替わる
+        self.git_panel.invalidate();
+        self.review.invalidate();
+        self.branch_nav.invalidate();
+        // ブランチが変われば worktree 構成もセッション一覧も見直す
+        self.repo_worktrees_at = None;
+        self.sess_folders_src.clear();
+        self.sidebar_sessions.invalidate();
     }
 
     /// トップバー: 🎨 テーマ選択メニュー (プラグインのカスタムテーマ含む)。
@@ -9207,12 +9633,7 @@ impl ZaivernApp {
                     }
                     SidebarTab::Sessions => {
                         // フォルダ一覧は is_dir() を叩くので、元が変わった時だけ作り直す
-                        sess_action = panels::sessions_sidebar_ui(
-                            ui,
-                            &theme,
-                            &mut self.sidebar_sessions,
-                            &self.sess_folders,
-                        );
+                        sess_action = self.sidebar_sessions_ui(ui, &theme);
                     }
                     SidebarTab::Plugins => {
                         self.sidebar_plugins_ui(
@@ -9950,6 +10371,13 @@ impl ZaivernApp {
                                     egui::TextEdit::singleline(
                                         &mut v,
                                     )
+                                    // ID は設定キーから作る。省くと egui は
+                                    // **並び順から自動採番**するので、設定が
+                                    // 増減するとカーソルが別の欄へ移る。
+                                    .id_salt((
+                                        "zv-plset-val",
+                                        &s.key,
+                                    ))
                                     .password(s.secret)
                                     .desired_width(f32::INFINITY);
                                 if ui.add(te).changed() {
@@ -22815,6 +23243,92 @@ mod ui_wiring_tests {
         assert_eq!(
             session_sidebar_effect(&A::CloseFolder(dir.clone()), &presets),
             SessionSidebarEffect::RemoveRoot(dir)
+        );
+    }
+
+    /// 別の worktree (= 別ブランチ) の会話を再開したら、**その worktree** で起動する。
+    /// いま開いているフォルダで再開すると、相対パスの指示が全部ずれる。
+    #[test]
+    fn 別ブランチの会話はその作業ツリーで再開する() {
+        use session_picker::SidebarAction as A;
+        let presets = vec![preset("Claude Code", "claude")];
+        // いま開いているのは main の worktree、会話は night の worktree のもの
+        let night = "/ws/repo/.claude/worktrees/night-2026-07-26";
+        let s = past("claude", "sess-night", night);
+        match session_sidebar_effect(&A::Resume(s), &presets) {
+            SessionSidebarEffect::Launch { cwd, command, .. } => {
+                assert_eq!(
+                    cwd,
+                    PathBuf::from(night),
+                    "起動 cwd は会話が走っていた worktree",
+                );
+                assert!(command.contains("sess-night"));
+            }
+            other => panic!("再開が起動へ落ちていない: {other:?}"),
+        }
+
+        // 起動経路がその cwd をプリセットへ差し替えていることも固定する
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        assert!(
+            src.contains("p.cwd = Some(cwd.display().to_string());"),
+            "launch_preset_with が渡された cwd を使っていない",
+        );
+        assert!(
+            src.contains("self.launch_preset_with(preset, command, &cwd, ctx);"),
+            "SessionSidebarEffect::Launch の cwd が起動へ渡っていない",
+        );
+    }
+
+    /// ブランチ表示は「押せるピッカー」であること (UI から到達できる)。
+    #[test]
+    fn ブランチ表示はピッカーとして配線されている() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        for needle in [
+            // ツールバーのブランチがボタンになっている
+            "self.branch_button(ui, theme, b);",
+            "let menu = ui.menu_button(RichText::new(label).color(color), |ui| {",
+            // 開いている間だけ収集する = 閉じていれば git を起動しない
+            "self.branch_nav.ensure_fresh(&ctx);",
+            // 選択 → 判断 → 実行、の 3 段が繋がっている
+            "self.branch_nav.select(t);",
+            "if let Some(target) = self.branch_nav.take_request() {",
+            "match snap.plan_switch(&target) {",
+            "Ok(argv) => self.branch_nav.start_switch(argv, label, ctx),",
+            // 断られたら「変更をレビュー」へ行ける
+            "if self.branch_nav.take_review_request() {",
+            "self.git_sub_review = true;",
+            // 成功後に依存物を作り直す
+            "self.after_branch_switch();",
+        ] {
+            assert!(src.contains(needle), "ブランチ切り替えの配線が無い: {needle}");
+        }
+        // stash は絶対に使わない (worktree 間で共有されるため)
+        assert!(
+            !src.contains("\"stash\""),
+            "ブランチ切り替えで git stash を使ってはいけない",
+        );
+    }
+
+    /// セッションタブの表示範囲トグルと、ブランチ索引の配線。
+    #[test]
+    fn セッション一覧はリポジトリ全体を出せる() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        for needle in [
+            "sess_action = self.sidebar_sessions_ui(ui, &theme);",
+            "tr(\"このフォルダのみ\")",
+            "self.cfg.sessions_repo_wide = !only_here;",
+            "config::save_state(&self.cfg);",
+            // リポジトリの同一性は --git-common-dir 由来のキーで見る
+            "let fam = git::scan_repo_family(&root, &candidates);",
+            "session_picker::repo_sidebar_folders(",
+            "session_picker::folder_groups(&folders, &current, &branches, &counts);",
+            ".apply_default_collapse(&folders, &current);",
+        ] {
+            assert!(src.contains(needle), "セッション一覧の配線が無い: {needle}");
+        }
+        assert!(
+            config::Config::default().sessions_repo_wide,
+            "既定はリポジトリ全体 (ブランチを切り替えても会話が消えない)",
         );
     }
 

@@ -16,6 +16,13 @@ pub struct Config {
 
     /// 空白文字の可視化 (スペース「·」/ タブ「→」)。既定はオフ。
     pub show_whitespace: bool,
+
+    /// セッションサイドバーに **リポジトリ全体** (同じ repo の worktree すべて)
+    /// の会話を出すか。既定はオン。オフにすると従来どおり
+    /// 「このフォルダのみ」になる。
+    /// ブランチごとに worktree を分けていると、オフでは切り替えた瞬間に
+    /// それまでの会話が一覧から消える。
+    pub sessions_repo_wide: bool,
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
@@ -217,6 +224,7 @@ impl Default for Config {
             show_hidden_files: true,
             word_wrap: false,
             show_whitespace: false,
+            sessions_repo_wide: true,
             approval_mode: "ask".into(),
             restore_agents: true,
             show_pet: true,
@@ -426,6 +434,8 @@ struct UiState {
     show_pet: Option<bool>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
+    /// セッションサイドバーの表示範囲 (リポジトリ全体 / このフォルダのみ)。
+    sessions_repo_wide: Option<bool>,
     pet_image: Option<String>,
     pet_x: Option<f32>,
     pet_y: Option<f32>,
@@ -815,6 +825,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.show_whitespace {
                     cfg.show_whitespace = v;
                 }
+                if let Some(v) = st.sessions_repo_wide {
+                    cfg.sessions_repo_wide = v;
+                }
                 if st.pet_image.is_some() {
                     cfg.pet_image = st.pet_image;
                 }
@@ -1175,6 +1188,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         show_pet: Some(cfg.global_show_pet),
         word_wrap: Some(cfg.global_word_wrap),
         show_whitespace: Some(cfg.global_show_whitespace),
+        sessions_repo_wide: Some(cfg.sessions_repo_wide),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -1753,6 +1767,7 @@ command = "agy"
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
+            sessions_repo_wide: Some(false),
             pet_image: Some("/tmp/p.png".into()),
             pet_x: Some(10.0),
             pet_y: Some(20.5),
@@ -1782,6 +1797,7 @@ command = "agy"
         assert_eq!(back.show_pet, Some(false));
         assert_eq!(back.word_wrap, Some(true));
         assert_eq!(back.show_whitespace, Some(true));
+        assert_eq!(back.sessions_repo_wide, Some(false));
         assert_eq!(back.pet_image, Some("/tmp/p.png".to_string()));
         assert_eq!(back.pet_x, Some(10.0));
         assert_eq!(back.pet_y, Some(20.5));
@@ -2353,6 +2369,33 @@ mod state_overlay_tests {
         assert!(loaded.show_whitespace, "空白表示が state.toml から復元される");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// セッション一覧の「このフォルダのみ」は state.toml に残る。
+    /// 既定は **リポジトリ全体** (ブランチを切り替えても会話が消えない側)。
+    #[test]
+    fn セッション一覧の表示範囲はstateへ永続化される() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "sessions-scope");
+        let mut cfg = Config::default();
+        assert!(cfg.sessions_repo_wide, "既定はリポジトリ全体");
+
+        cfg.sessions_repo_wide = false; // 「このフォルダのみ」
+        save_state_to_dir(&home, &cfg);
+        assert!(
+            !load_from_dir(&home, &[], true).sessions_repo_wide,
+            "「このフォルダのみ」が復元される"
+        );
+
+        cfg.sessions_repo_wide = true;
+        save_state_to_dir(&home, &cfg);
+        assert!(load_from_dir(&home, &[], true).sessions_repo_wide);
+
+        // state.toml がまだ無い環境 (初回起動) でも既定はリポジトリ全体
+        let fresh = crate::test_util::unique_temp_dir("zaivern-config-test", "sessions-fresh");
+        assert!(load_from_dir(&fresh, &[], true).sessions_repo_wide);
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&fresh);
     }
 
     #[test]

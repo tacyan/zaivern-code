@@ -13,6 +13,10 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use eframe::egui;
+
+use crate::i18n::{tr, trf};
+
 /// status --porcelain=v1 から得たファイル単位の実効ステータス。
 /// index 列と worktree 列を 1 つに畳んだもの (VS Code のツリー装飾と同じ粒度)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -162,6 +166,12 @@ impl Git {
             });
         self.branch_cache = Some((name.clone(), Instant::now()));
         name
+    }
+
+    /// ブランチ名の TTL キャッシュを捨てる (checkout 直後など、
+    /// 次の描画で必ず新しい名前を出したいとき)。
+    pub fn invalidate_branch(&mut self) {
+        self.branch_cache = None;
     }
 
     /// 2 秒 TTL で status スキャンを回す (呼び出しは毎フレームでも安全)。
@@ -443,6 +453,13 @@ impl GitSet {
         self.repos.get_mut(&top)?.branch()
     }
 
+    /// 全 repo のブランチ名キャッシュを捨てる (checkout 直後など)。
+    pub fn invalidate_branch(&mut self) {
+        for g in self.repos.values_mut() {
+            g.invalidate_branch();
+        }
+    }
+
     /// repo の数(ステータスバー等で「複数リポジトリ」表示に使う)。
     pub fn repo_count(&self) -> usize {
         self.repos.len()
@@ -687,6 +704,672 @@ pub fn parse_hunk_marks(diff_output: &str) -> Vec<(usize, LineMark)> {
         }
     }
     marks
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  ブランチ切り替え (ツールバーのブランチボタン)
+//
+//  【方針】
+//  - git は **1 度も UI スレッドで実行しない**。収集も切り替えもスレッド +
+//    チャネル + TTL キャッシュ (このファイルの status スキャンと同じ形)。
+//  - 収集はポップアップを開いている間だけ。閉じているフレームでは git を
+//    1 本も起動しない (アイドル時のコストをゼロに保つ)。
+//  - パースは git_panel.rs の既存パーサ (`parse_branch_list` /
+//    `parse_worktree_porcelain` / `validate_branch_name`) をそのまま使う。
+//    同じ出力の第 2 実装を持たない。
+//  - **stash は絶対に使わない**。stash スタックは worktree 間で共有され、
+//    別の worktree で作業している人の退避と混ざるため (CLAUDE.md)。
+// ═════════════════════════════════════════════════════════════════════
+
+/// 一覧に載せるブランチ数の上限 (ローカル / リモート追跡それぞれ)。
+/// 超えた分は落とし、UI 側に「上限で切った」旨を出す。
+pub const BRANCH_LIST_CAP: usize = 50;
+/// 「変更があるので切り替えない」と伝えるときに名前を挙げるファイル数。
+pub const DIRTY_NAMES_SHOWN: usize = 3;
+/// 拒否メッセージ用に集める変更ファイル数の上限 (全件は数えるが名前は持たない)。
+const DIRTY_SCAN_CAP: usize = 2_000;
+/// ブランチ一覧スナップショットの TTL。
+const BRANCH_NAV_TTL: Duration = Duration::from_secs(5);
+/// `git switch` が入ったバージョン (2.23)。これ未満は `git checkout` を使う。
+const SWITCH_SINCE: (u32, u32) = (2, 23);
+
+/// 切り替え先。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SwitchTarget {
+    /// ローカルブランチへ切り替える。
+    Local(String),
+    /// リモート追跡ブランチ (`origin/foo`) から追跡ローカルブランチを作る。
+    Remote(String),
+}
+
+/// 切り替えを断る理由。**断ったときは何も変更しない** (stash もしない)。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SwitchBlock {
+    /// すでにそのブランチに居る。
+    AlreadyOn(String),
+    /// 作業ツリーに未コミットの変更がある。
+    Dirty { names: Vec<String>, total: usize },
+    /// マージ / リベース等の途中。
+    InProgress(String),
+    /// 別の worktree がそのブランチを持っている (git は必ず拒否する)。
+    OtherWorktree { branch: String, path: PathBuf },
+    /// ブランチ名として受け付けられない。
+    BadName(String),
+}
+
+impl SwitchBlock {
+    /// ユーザーに出す説明文。
+    pub fn message(&self) -> String {
+        match self {
+            SwitchBlock::AlreadyOn(b) => {
+                trf("すでに {b} に居ます", &[("b", b.clone())])
+            }
+            SwitchBlock::Dirty { names, total } => {
+                let head = names.join(", ");
+                let rest = total.saturating_sub(names.len());
+                if rest > 0 {
+                    trf(
+                        "未コミットの変更があるので切り替えません: {head} ほか {rest} 件",
+                        &[("head", head), ("rest", rest.to_string())],
+                    )
+                } else {
+                    trf(
+                        "未コミットの変更があるので切り替えません: {head}",
+                        &[("head", head)],
+                    )
+                }
+            }
+            SwitchBlock::InProgress(what) => trf(
+                "{what}のため切り替えません (先に完了か中止をしてください)",
+                &[("what", what.clone())],
+            ),
+            SwitchBlock::OtherWorktree { branch, path } => trf(
+                "{b} は別の作業ツリーで開かれています: {p}",
+                &[("b", branch.clone()), ("p", path.display().to_string())],
+            ),
+            SwitchBlock::BadName(n) => {
+                trf("ブランチ名として使えません: {n}", &[("n", n.clone())])
+            }
+        }
+    }
+
+    /// 「変更をレビュー」への導線を出すべき拒否か。
+    pub fn offers_review(&self) -> bool {
+        matches!(self, SwitchBlock::Dirty { .. })
+    }
+}
+
+/// リモート追跡ブランチ名 (`origin/feature/x`) → 作るローカル名 (`feature/x`)。
+/// リモート名だけ・`origin/HEAD` は対象外 (None)。
+pub fn local_branch_for_remote(remote_ref: &str) -> Option<String> {
+    let (_remote, rest) = remote_ref.split_once('/')?;
+    if rest.is_empty() || rest == "HEAD" {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// `git --version` の出力から (major, minor) を取り出す。
+pub fn parse_git_version(out: &str) -> Option<(u32, u32)> {
+    // "git version 2.39.3 (Apple Git-145)" / "git version 2.45.1.windows.1"
+    let tail = out.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut it = tail.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next().unwrap_or("0");
+    let minor = minor
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    Some((major, minor))
+}
+
+/// この git が `git switch` を持っているか (2.23+)。判別できなければ false =
+/// 昔からある `git checkout` を使う (「推測しない」)。
+pub fn supports_switch(version_out: &str) -> bool {
+    match parse_git_version(version_out) {
+        Some(v) => v >= SWITCH_SINCE,
+        None => false,
+    }
+}
+
+/// 切り替えコマンドの引数列。`git -C <repo>` の後ろに続く部分だけを返す。
+pub fn switch_argv(target: &SwitchTarget, supports_switch: bool) -> Vec<String> {
+    match target {
+        SwitchTarget::Local(n) => {
+            if supports_switch {
+                vec!["switch".into(), n.clone()]
+            } else {
+                vec!["checkout".into(), n.clone()]
+            }
+        }
+        SwitchTarget::Remote(r) => {
+            let local = local_branch_for_remote(r).unwrap_or_else(|| r.clone());
+            if supports_switch {
+                // 追跡ローカルブランチを git に作らせる (名前はリモート側から導出)。
+                vec!["switch".into(), "--track".into(), r.clone()]
+            } else {
+                vec![
+                    "checkout".into(),
+                    "-b".into(),
+                    local,
+                    "--track".into(),
+                    r.clone(),
+                ]
+            }
+        }
+    }
+}
+
+/// `git worktree list --porcelain` から「**自分以外の** worktree が持っている
+/// ブランチ」の表を作る。ここに載っているブランチへは git が必ず切り替えを拒む。
+pub fn worktree_holders(porcelain: &str, current_top: &Path) -> Vec<(String, PathBuf)> {
+    let here = crate::pathx::canonical(current_top);
+    crate::git_panel::parse_worktree_porcelain(porcelain)
+        .into_iter()
+        .filter(|w| !w.bare && !w.detached)
+        .filter_map(|w| w.branch.clone().map(|b| (b, w.path)))
+        .filter(|(_, p)| crate::pathx::canonical(p) != here)
+        .collect()
+}
+
+/// マージ / リベース等の途中かどうか。`git_dir` は **その worktree の**
+/// git ディレクトリ (`rev-parse --git-dir`。共有の common-dir ではない)。
+pub fn in_progress_label(git_dir: &Path) -> Option<String> {
+    // 目印ファイル → 表示名。git のドキュメントにある名前をそのまま使う。
+    const TABLE: &[(&str, &str)] = &[
+        ("rebase-merge", "リベース"),
+        ("rebase-apply", "リベース"),
+        ("MERGE_HEAD", "マージ"),
+        ("CHERRY_PICK_HEAD", "チェリーピック"),
+        ("REVERT_HEAD", "リバート"),
+        ("BISECT_LOG", "二分探索"),
+    ];
+    TABLE
+        .iter()
+        .find(|(f, _)| git_dir.join(f).exists())
+        .map(|(_, label)| tr(label))
+}
+
+/// 絞り込み (部分一致・ASCII の大文字小文字は無視)。空文字は素通し。
+pub fn matches_filter(name: &str, filter: &str) -> bool {
+    let f = filter.trim();
+    if f.is_empty() {
+        return true;
+    }
+    name.to_lowercase().contains(&f.to_lowercase())
+}
+
+/// ブランチ切り替えの判断に要る 1 回ぶんの収集結果。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct BranchSnapshot {
+    /// 現在のブランチ (detached なら None)。
+    pub head: Option<String>,
+    /// detached HEAD のときの表示 ("HEAD detached at abc1234" 等)。
+    pub detached: Option<String>,
+    /// ローカルブランチ (最終コミットの新しい順)。
+    pub local: Vec<crate::git_panel::BranchEntry>,
+    /// リモート追跡ブランチ (`origin/…`。同じく新しい順)。
+    pub remote: Vec<String>,
+    /// 上限で切る前の件数。`local.len()` より大きければ切られている。
+    pub local_total: usize,
+    pub remote_total: usize,
+    /// 未コミットの変更ファイル (追跡対象のみ。名前は先頭数件)。
+    pub dirty: Vec<String>,
+    pub dirty_total: usize,
+    /// マージ / リベース等の途中ならその表示名。
+    pub in_progress: Option<String>,
+    /// `git switch` が使えるか (使えなければ `git checkout`)。
+    pub supports_switch: bool,
+    /// ブランチ名 → それを開いている **別の** worktree のパス。
+    pub holders: Vec<(String, PathBuf)>,
+}
+
+impl BranchSnapshot {
+    /// 切り替えて良いかを決める **純関数**。
+    ///
+    /// 通れば `git -C <repo>` に続く引数列、駄目なら理由を返す。
+    /// 未追跡ファイル (`??`) は git の切り替えで失われないので数に入れない
+    /// — 入れると「ビルド生成物があるだけで一生切り替えられない」になる。
+    pub fn plan_switch(&self, target: &SwitchTarget) -> Result<Vec<String>, SwitchBlock> {
+        let raw = match target {
+            SwitchTarget::Local(n) => n.clone(),
+            SwitchTarget::Remote(r) => {
+                local_branch_for_remote(r).ok_or_else(|| SwitchBlock::BadName(r.clone()))?
+            }
+        };
+        let name = crate::git_panel::validate_branch_name(&raw).map_err(SwitchBlock::BadName)?;
+        if self.head.as_deref() == Some(name.as_str()) {
+            return Err(SwitchBlock::AlreadyOn(name));
+        }
+        if let Some(what) = &self.in_progress {
+            return Err(SwitchBlock::InProgress(what.clone()));
+        }
+        if let Some((_, path)) = self.holders.iter().find(|(b, _)| *b == name) {
+            return Err(SwitchBlock::OtherWorktree {
+                branch: name,
+                path: path.clone(),
+            });
+        }
+        if !self.dirty.is_empty() {
+            return Err(SwitchBlock::Dirty {
+                names: self.dirty.iter().take(DIRTY_NAMES_SHOWN).cloned().collect(),
+                total: self.dirty_total,
+            });
+        }
+        // 追跡ブランチを作ろうとしている先に同名のローカルがもう在るなら、
+        // 作成ではなく素の切り替えにする (`--track` は既存名では失敗する)。
+        let effective = match target {
+            SwitchTarget::Remote(_) if self.local.iter().any(|b| b.name == name) => {
+                SwitchTarget::Local(name)
+            }
+            other => other.clone(),
+        };
+        Ok(switch_argv(&effective, self.supports_switch))
+    }
+}
+
+/// ツールバーのブランチボタンが持つ状態。
+///
+/// UI は「開いている間だけ」[`BranchNav::ensure_fresh`] を呼ぶ。閉じている
+/// フレームでは git を 1 本も起動しない。
+pub struct BranchNav {
+    repo: PathBuf,
+    snap: Option<Arc<BranchSnapshot>>,
+    last: Option<Instant>,
+    pending: Option<Receiver<Option<BranchSnapshot>>>,
+    /// 走行中の切り替えジョブ (同時に 1 つだけ)。
+    job: Option<Receiver<Result<String, String>>>,
+    job_label: String,
+    /// 絞り込み入力。
+    pub filter: String,
+    /// 直近の拒否理由 (ポップアップに出す)。
+    pub block: Option<SwitchBlock>,
+    /// UI が選んだ切り替え先。呼び出し側 (app.rs) が毎フレーム take する。
+    request: Option<SwitchTarget>,
+    /// 「変更をレビュー」が押された。
+    review_requested: bool,
+    /// ポップアップが開いているか (開閉のエッジ検出用)。
+    was_open: bool,
+    /// 絞り込み入力へフォーカスを移したい。
+    focus_wanted: bool,
+}
+
+impl BranchNav {
+    pub fn new(repo: PathBuf) -> Self {
+        Self {
+            repo,
+            snap: None,
+            last: None,
+            pending: None,
+            job: None,
+            job_label: String::new(),
+            filter: String::new(),
+            block: None,
+            request: None,
+            review_requested: false,
+            was_open: false,
+            focus_wanted: false,
+        }
+    }
+
+    /// ワークスペースが変わったら一覧を捨てる (旧 repo のブランチへ
+    /// 切り替えを発行できてしまわないように、飛行中の収集も受信口ごと捨てる)。
+    pub fn set_repo(&mut self, repo: PathBuf) {
+        if self.repo == repo {
+            return;
+        }
+        self.repo = repo;
+        self.snap = None;
+        self.last = None;
+        self.pending = None;
+        self.filter.clear();
+        self.block = None;
+    }
+
+    pub fn repo(&self) -> &Path {
+        &self.repo
+    }
+
+    /// 収集結果 (無ければ None)。Arc なので描画中に clone しても複製されない。
+    pub fn snapshot(&self) -> Option<Arc<BranchSnapshot>> {
+        self.snap.clone()
+    }
+
+    /// 収集中か。
+    pub fn loading(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// 切り替えジョブが走行中か。
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    pub fn job_label(&self) -> &str {
+        &self.job_label
+    }
+
+    /// ポップアップの開閉を伝える。開いた瞬間だけ絞り込みと拒否表示を素に戻し、
+    /// 入力欄へフォーカスを要求する (開いている間ずっと奪わない)。
+    pub fn set_open(&mut self, open: bool) {
+        if open == self.was_open {
+            return;
+        }
+        self.was_open = open;
+        if open {
+            self.filter.clear();
+            self.block = None;
+            self.focus_wanted = true;
+        }
+    }
+
+    /// 「入力欄へフォーカスを移したい」を 1 回だけ受け取る。
+    pub fn take_focus_request(&mut self) -> bool {
+        std::mem::take(&mut self.focus_wanted)
+    }
+
+    /// UI からの選択。判断は [`BranchSnapshot::plan_switch`] に任せ、
+    /// ここでは「実行を要求した」か「拒否理由を出した」かだけを記録する。
+    pub fn select(&mut self, target: SwitchTarget) {
+        let Some(snap) = self.snap.clone() else {
+            return;
+        };
+        match snap.plan_switch(&target) {
+            Ok(_) => {
+                self.block = None;
+                self.request = Some(target);
+            }
+            Err(b) => self.block = Some(b),
+        }
+    }
+
+    /// 拒否メッセージの「変更をレビュー」。
+    pub fn request_review(&mut self) {
+        self.review_requested = true;
+    }
+
+    pub fn take_review_request(&mut self) -> bool {
+        std::mem::take(&mut self.review_requested)
+    }
+
+    pub fn take_request(&mut self) -> Option<SwitchTarget> {
+        self.request.take()
+    }
+
+    /// TTL 切れなら収集をバックグラウンドで仕込む。**開いている間だけ呼ぶこと**。
+    pub fn ensure_fresh(&mut self, ctx: &egui::Context) {
+        self.poll_scan();
+        if self.pending.is_some() || self.job.is_some() {
+            return;
+        }
+        if let Some(t) = self.last {
+            if t.elapsed() < BRANCH_NAV_TTL {
+                return;
+            }
+        }
+        self.spawn_scan(ctx);
+    }
+
+    /// 収集を今すぐ取り直させる (切り替え完了後など)。
+    pub fn invalidate(&mut self) {
+        self.last = None;
+    }
+
+    fn poll_scan(&mut self) {
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok(snap) => {
+                    self.snap = snap.map(Arc::new);
+                    self.pending = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.pending = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn spawn_scan(&mut self, ctx: &egui::Context) {
+        // 失敗しても時刻は進める (毎フレーム spawn を試みない)。
+        self.last = Some(Instant::now());
+        let (tx, rx) = mpsc::channel();
+        let repo = self.repo.clone();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-git-branches".into())
+            .spawn(move || {
+                let _ = tx.send(scan_branches(&repo));
+                ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.pending = Some(rx);
+        }
+    }
+
+    /// 実際の切り替えを走らせる。**UI スレッドでは git を動かさない**。
+    pub fn start_switch(&mut self, argv: Vec<String>, label: String, ctx: &egui::Context) {
+        if self.job.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let repo = self.repo.clone();
+        let ctx2 = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-git-switch".into())
+            .spawn(move || {
+                let _ = tx.send(run_git_at(&repo, &argv));
+                ctx2.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.job = Some(rx);
+            self.job_label = label;
+        }
+    }
+
+    /// 完了した切り替えジョブを回収する。`Some((メッセージ, 成功か))`。
+    pub fn poll_job(&mut self) -> Option<(String, bool)> {
+        let rx = self.job.as_ref()?;
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.job = None;
+                return None;
+            }
+            Err(mpsc::TryRecvError::Empty) => return None,
+        };
+        self.job = None;
+        let label = std::mem::take(&mut self.job_label);
+        self.last = None; // 一覧は必ず取り直す
+        Some(match res {
+            Ok(_) => (
+                trf("🌿 {label} に切り替えました", &[("label", label)]),
+                true,
+            ),
+            // git の拒否理由は加工せずそのまま見せる。
+            Err(e) => (
+                trf(
+                    "切り替えに失敗しました ({label}): {e}",
+                    &[("label", label), ("e", e)],
+                ),
+                false,
+            ),
+        })
+    }
+}
+
+/// `git -C <dir> <args>` を同期実行して stdout を返す。失敗は stderr の文言。
+/// 呼ぶ側がスレッドを用意すること。
+fn run_git_at(dir: &Path, args: &[String]) -> Result<String, String> {
+    let out = crate::procx::hidden_command("git")
+        // color.ui=always / core.quotepath=true な設定でも素の UTF-8 を得る
+        // (ブランチ名の日本語がエスケープされるとパースも表示も壊れる)。
+        .args(["-c", "color.ui=false", "-c", "core.quotepath=false", "-C"])
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let err = crate::textenc::decode_output(&out.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            trf("git {args} が失敗しました", &[("args", args.join(" "))])
+        } else {
+            err
+        });
+    }
+    Ok(crate::textenc::decode_output(&out.stdout))
+}
+
+fn git_text(dir: &Path, args: &[&str]) -> Option<String> {
+    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    run_git_at(dir, &owned).ok()
+}
+
+/// worktree をまたいでも同じ値になる **リポジトリの識別キー**。
+///
+/// `--git-common-dir` は本体 worktree でもリンク worktree でも同じ
+/// (共有の `.git`) を指すので、「同じリポジトリか」の判定に使える。
+/// `--path-format=absolute` は git 2.31+ なので、無い場合は相対パスを
+/// `dir` 基準で絶対化する。どちらも駄目なら `--git-dir` へ落とす。
+pub fn repo_key(dir: &Path) -> Option<PathBuf> {
+    let abs = |raw: String| -> Option<PathBuf> {
+        let t = raw.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(t);
+        let p = if p.is_absolute() { p } else { dir.join(p) };
+        Some(crate::pathx::canonical(&p))
+    };
+    for args in [
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"][..],
+        &["rev-parse", "--git-common-dir"][..],
+        &["rev-parse", "--path-format=absolute", "--git-dir"][..],
+        &["rev-parse", "--git-dir"][..],
+    ] {
+        if let Some(v) = git_text(dir, args).and_then(abs) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 「同じリポジトリに属するフォルダ」の集合。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct RepoFamily {
+    /// このリポジトリの worktree (bare は除く。本体とリンク先の両方)。
+    pub worktrees: Vec<PathBuf>,
+    /// 候補フォルダのうち、識別キーが一致したもの (順は入力のまま)。
+    /// worktree のサブディレクトリを開いている場合もここで拾える。
+    pub related: Vec<PathBuf>,
+}
+
+/// `repo` と同じリポジトリに属するフォルダを集める (**バックグラウンド専用**)。
+///
+/// 判定は [`repo_key`] (= `--git-common-dir`) の一致。worktree ごとに
+/// `.git` の実体は違っても common-dir は共有なので、ブランチごとに
+/// フォルダを分けていても「同じリポジトリ」と分かる。
+pub fn scan_repo_family(repo: &Path, candidates: &[PathBuf]) -> RepoFamily {
+    let Some(key) = repo_key(repo) else {
+        return RepoFamily::default();
+    };
+    let worktrees = worktree_paths(repo);
+    let related = candidates
+        .iter()
+        .map(|c| crate::pathx::canonical(c))
+        .filter(|c| !worktrees.contains(c))
+        .filter(|c| repo_key(c).as_ref() == Some(&key))
+        .collect();
+    RepoFamily { worktrees, related }
+}
+
+/// リポジトリに属する worktree のパス一覧 (bare は除く)。
+pub fn worktree_paths(dir: &Path) -> Vec<PathBuf> {
+    let Some(out) = git_text(dir, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    crate::git_panel::parse_worktree_porcelain(&out)
+        .into_iter()
+        .filter(|w| !w.bare)
+        .map(|w| crate::pathx::canonical(&w.path))
+        .collect()
+}
+
+/// ブランチ切り替えに要る情報を 1 回で集める (バックグラウンドスレッド専用)。
+fn scan_branches(repo: &Path) -> Option<BranchSnapshot> {
+    let toplevel = git_text(repo, &["rev-parse", "--show-toplevel"])
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())?;
+
+    // 最終コミットの新しい順。`for-each-ref` ではなく `branch --all` を使うのは、
+    // 同じ ref 走査に加えて `*` (この worktree の HEAD) と `+` (別 worktree で
+    // 使用中) のマーカーが同時に得られ、既存パーサをそのまま使えるため。
+    // `--sort` は git 2.7+ なので、受け付けなければ素の一覧へ落とす。
+    let raw = git_text(repo, &["branch", "--all", "--sort=-committerdate"])
+        .or_else(|| git_text(repo, &["branch", "--all"]))
+        .unwrap_or_default();
+    let list = crate::git_panel::parse_branch_list(&raw);
+
+    let (head, detached) = match list.head.clone() {
+        Some(crate::git_panel::HeadState::OnBranch(b)) => (Some(b), None),
+        Some(crate::git_panel::HeadState::Detached(d)) => (None, Some(d)),
+        _ => (None, None),
+    };
+
+    let local_total = list.local.len();
+    let remote_total = list.remote.len();
+    let mut local = list.local;
+    local.truncate(BRANCH_LIST_CAP);
+    let mut remote = list.remote;
+    remote.truncate(BRANCH_LIST_CAP);
+
+    // 未コミットの変更 (追跡対象のみ)。名前は表示ぶんだけ持つ。
+    let status = git_text(repo, &["status", "--porcelain=v1", "-z"]).unwrap_or_default();
+    let parsed = parse_porcelain_z(&status, DIRTY_SCAN_CAP);
+    let mut dirty: Vec<String> = parsed
+        .files
+        .into_iter()
+        .filter(|(_, s)| *s != FileStatus::Untracked)
+        .map(|(p, _)| p)
+        .collect();
+    dirty.sort();
+    let dirty_total = dirty.len();
+    dirty.truncate(DIRTY_NAMES_SHOWN);
+
+    let holders = git_text(repo, &["worktree", "list", "--porcelain"])
+        .map(|s| worktree_holders(&s, &toplevel))
+        .unwrap_or_default();
+
+    // この worktree 固有の git ディレクトリ (MERGE_HEAD 等はここに置かれる)。
+    let git_dir = git_text(repo, &["rev-parse", "--path-format=absolute", "--git-dir"])
+        .or_else(|| git_text(repo, &["rev-parse", "--git-dir"]))
+        .map(|s| {
+            let p = PathBuf::from(s.trim());
+            if p.is_absolute() {
+                p
+            } else {
+                repo.join(p)
+            }
+        });
+    let in_progress = git_dir.as_deref().and_then(in_progress_label);
+
+    let supports = git_text(repo, &["--version"])
+        .map(|v| supports_switch(&v))
+        .unwrap_or(false);
+
+    Some(BranchSnapshot {
+        head,
+        detached,
+        local,
+        remote,
+        local_total,
+        remote_total,
+        dirty,
+        dirty_total,
+        in_progress,
+        supports_switch: supports,
+        holders,
+    })
 }
 
 #[cfg(test)]
@@ -1237,5 +1920,402 @@ index 1234567..89abcde 100644
         assert_eq!(g.dir_status(""), Some((FileStatus::Untracked, 1)));
 
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ══════════════ ブランチ切り替え ══════════════
+
+    /// `git --version` の表記ゆれ (Apple / Windows / 開発版) を吸収する。
+    #[test]
+    fn git_version_parse_table() {
+        let table: &[(&str, Option<(u32, u32)>, bool)] = &[
+            ("git version 2.39.3 (Apple Git-145)\n", Some((2, 39)), true),
+            ("git version 2.45.1.windows.1\n", Some((2, 45)), true),
+            ("git version 2.23.0", Some((2, 23)), true),
+            ("git version 2.22.0", Some((2, 22)), false),
+            ("git version 1.9.5", Some((1, 9)), false),
+            ("git version 3", Some((3, 0)), true),
+            ("", None, false),
+            ("なにか壊れた出力", None, false),
+        ];
+        for (raw, want, sw) in table {
+            assert_eq!(parse_git_version(raw), *want, "版数: {raw:?}");
+            assert_eq!(supports_switch(raw), *sw, "switch 可否: {raw:?}");
+        }
+    }
+
+    /// リモート追跡名 → 作られるローカル名。
+    #[test]
+    fn local_branch_for_remote_table() {
+        let table: &[(&str, Option<&str>)] = &[
+            ("origin/main", Some("main")),
+            ("origin/feature/login-v2", Some("feature/login-v2")),
+            ("upstream/日本語ブランチ", Some("日本語ブランチ")),
+            ("origin/HEAD", None),
+            ("origin/", None),
+            ("origin", None),
+        ];
+        for (raw, want) in table {
+            assert_eq!(
+                local_branch_for_remote(raw).as_deref(),
+                *want,
+                "入力: {raw}"
+            );
+        }
+    }
+
+    /// 切り替えコマンドの引数表 (**実行はしない**)。
+    /// git 2.23+ は `switch`、それ未満は `checkout` へ落ちる。
+    #[test]
+    fn switch_argv_table() {
+        let local = SwitchTarget::Local("feature/login-v2".into());
+        assert_eq!(
+            switch_argv(&local, true),
+            vec!["switch".to_string(), "feature/login-v2".to_string()]
+        );
+        assert_eq!(
+            switch_argv(&local, false),
+            vec!["checkout".to_string(), "feature/login-v2".to_string()]
+        );
+
+        let remote = SwitchTarget::Remote("origin/feature/login-v2".into());
+        assert_eq!(
+            switch_argv(&remote, true),
+            vec![
+                "switch".to_string(),
+                "--track".to_string(),
+                "origin/feature/login-v2".to_string()
+            ],
+            "新しい git は --track だけでローカル名を導出する"
+        );
+        assert_eq!(
+            switch_argv(&remote, false),
+            vec![
+                "checkout".to_string(),
+                "-b".to_string(),
+                "feature/login-v2".to_string(),
+                "--track".to_string(),
+                "origin/feature/login-v2".to_string()
+            ],
+            "古い git は -b <local> --track <remote>"
+        );
+
+        // 日本語のリモート追跡ブランチでもローカル名の導出が壊れない
+        assert_eq!(
+            switch_argv(&SwitchTarget::Remote("origin/機能/検索".into()), false),
+            vec![
+                "checkout".to_string(),
+                "-b".to_string(),
+                "機能/検索".to_string(),
+                "--track".to_string(),
+                "origin/機能/検索".to_string()
+            ]
+        );
+    }
+
+    /// `git branch --all` のパース: detached / `/` 入り / 非 ASCII / 別 worktree。
+    #[test]
+    fn branch_list_parsing_covers_detached_slash_and_unicode() {
+        use crate::git_panel::HeadState;
+        let raw = "\
+* (HEAD detached at abc1234)
+  feature/login-v2
++ night/2026-07-26
+  日本語ブランチ
+  main
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/feature/login-v2
+  remotes/origin/日本語ブランチ
+";
+        let list = crate::git_panel::parse_branch_list(raw);
+        assert_eq!(
+            list.head,
+            Some(HeadState::Detached("HEAD detached at abc1234".into())),
+            "detached HEAD は分離状態として拾う"
+        );
+        let names: Vec<&str> = list.local.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["feature/login-v2", "night/2026-07-26", "日本語ブランチ", "main"],
+            "`/` 入りも非 ASCII も出力順のまま残る"
+        );
+        assert!(
+            list.local.iter().find(|b| b.name == "night/2026-07-26").unwrap().other_worktree,
+            "`+` は別 worktree で使用中",
+        );
+        assert!(!list.local.iter().any(|b| b.current), "detached なので current は無い");
+        assert_eq!(
+            list.remote,
+            vec!["origin/feature/login-v2", "origin/日本語ブランチ"],
+            "origin/HEAD -> … のシンボリック行は出さない"
+        );
+    }
+
+    /// `git worktree list --porcelain` から「別の作業ツリーが持っているブランチ」を割る。
+    #[test]
+    fn worktree_holders_detects_branch_checked_out_elsewhere() {
+        let here = std::env::temp_dir().join("zv-wt-main");
+        let other = std::env::temp_dir().join("zv-wt-night");
+        let porcelain = format!(
+            "worktree {main}\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/main\n\
+             \nworktree {night}\nHEAD 2222222222222222222222222222222222222222\nbranch refs/heads/night/2026-07-26\n\
+             \nworktree {det}\nHEAD 3333333333333333333333333333333333333333\ndetached\n\
+             \nworktree {bare}\nbare\n\n",
+            main = here.display(),
+            night = other.display(),
+            det = std::env::temp_dir().join("zv-wt-detached").display(),
+            bare = std::env::temp_dir().join("zv-wt-bare").display(),
+        );
+
+        let holders = worktree_holders(&porcelain, &here);
+        assert_eq!(
+            holders,
+            vec![("night/2026-07-26".to_string(), other.clone())],
+            "自分自身・detached・bare は除き、他 worktree のブランチだけが残る"
+        );
+
+        let snap = BranchSnapshot {
+            head: Some("main".into()),
+            holders,
+            supports_switch: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            snap.plan_switch(&SwitchTarget::Local("night/2026-07-26".into())),
+            Err(SwitchBlock::OtherWorktree {
+                branch: "night/2026-07-26".into(),
+                path: other,
+            }),
+            "git が拒否する前にこちらで止め、どの作業ツリーが持っているか言う"
+        );
+    }
+
+    /// 作業ツリーが汚れているときは切り替えない (stash も**しない**)。
+    /// 未追跡ファイルだけなら切り替えて構わない (git は失わない)。
+    #[test]
+    fn dirty_tree_refuses_and_untracked_only_does_not() {
+        let dirty = BranchSnapshot {
+            head: Some("main".into()),
+            dirty: vec!["src/app.rs".into(), "src/git.rs".into(), "README.md".into()],
+            dirty_total: 7,
+            supports_switch: true,
+            ..Default::default()
+        };
+        let err = dirty
+            .plan_switch(&SwitchTarget::Local("feature/x".into()))
+            .expect_err("汚れていたら断る");
+        match &err {
+            SwitchBlock::Dirty { names, total } => {
+                assert_eq!(names.len(), DIRTY_NAMES_SHOWN);
+                assert_eq!(*total, 7);
+            }
+            other => panic!("Dirty を期待: {other:?}"),
+        }
+        assert!(err.offers_review(), "「変更をレビュー」への導線を出す");
+        let msg = err.message();
+        assert!(msg.contains("src/app.rs"), "変更ファイル名を挙げる: {msg}");
+        assert!(!msg.contains("stash"), "stash は提案しない: {msg}");
+
+        // 未追跡だけ = dirty には入らない → 素通し
+        let clean = BranchSnapshot {
+            head: Some("main".into()),
+            supports_switch: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            clean.plan_switch(&SwitchTarget::Local("feature/x".into())),
+            Ok(vec!["switch".to_string(), "feature/x".to_string()])
+        );
+    }
+
+    /// マージ / リベース途中は断る。
+    #[test]
+    fn mid_merge_refuses_switch() {
+        let snap = BranchSnapshot {
+            head: Some("main".into()),
+            in_progress: Some("マージ".into()),
+            supports_switch: true,
+            ..Default::default()
+        };
+        let err = snap
+            .plan_switch(&SwitchTarget::Local("feature/x".into()))
+            .expect_err("マージ中は断る");
+        assert_eq!(err, SwitchBlock::InProgress("マージ".into()));
+        assert!(!err.offers_review());
+    }
+
+    /// 途中状態の目印ファイル → 表示名。
+    #[test]
+    fn in_progress_label_reads_git_dir_markers() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-git-test", "inprogress");
+        assert_eq!(in_progress_label(&dir), None, "何も無ければ None");
+
+        std::fs::write(dir.join("MERGE_HEAD"), "abc\n").expect("write MERGE_HEAD");
+        assert!(in_progress_label(&dir).is_some(), "マージ中を検出");
+        std::fs::remove_file(dir.join("MERGE_HEAD")).ok();
+
+        std::fs::create_dir_all(dir.join("rebase-merge")).expect("mkdir rebase-merge");
+        assert!(in_progress_label(&dir).is_some(), "リベース中を検出");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// すでに居るブランチ / 不正な名前は実行しない。
+    #[test]
+    fn already_on_and_bad_names_are_refused() {
+        let snap = BranchSnapshot {
+            head: Some("main".into()),
+            supports_switch: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            snap.plan_switch(&SwitchTarget::Local("main".into())),
+            Err(SwitchBlock::AlreadyOn("main".into()))
+        );
+        assert!(matches!(
+            snap.plan_switch(&SwitchTarget::Local("--force".into())),
+            Err(SwitchBlock::BadName(_))
+        ));
+        assert!(matches!(
+            snap.plan_switch(&SwitchTarget::Remote("origin".into())),
+            Err(SwitchBlock::BadName(_))
+        ));
+    }
+
+    /// 同名のローカルがもう在るリモート追跡ブランチは、作成ではなく素の切り替え。
+    #[test]
+    fn remote_target_falls_back_to_plain_switch_when_local_exists() {
+        let snap = BranchSnapshot {
+            head: Some("main".into()),
+            local: vec![crate::git_panel::BranchEntry {
+                name: "feature/x".into(),
+                current: false,
+                other_worktree: false,
+            }],
+            supports_switch: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            snap.plan_switch(&SwitchTarget::Remote("origin/feature/x".into())),
+            Ok(vec!["switch".to_string(), "feature/x".to_string()]),
+            "--track は既存名では失敗するので素の switch にする"
+        );
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_substring() {
+        assert!(matches_filter("feature/Login-V2", "login"));
+        assert!(matches_filter("日本語ブランチ", "ブランチ"));
+        assert!(matches_filter("main", "  "), "空欄は素通し");
+        assert!(!matches_filter("main", "night"));
+    }
+
+    /// 実リポジトリでの収集。作業ツリーが汚れていることも拾う。
+    #[test]
+    fn scan_branches_real_fixture() {
+        let Some(repo) = temp_repo("scanbranch") else {
+            return;
+        };
+        commit_something(&repo, "a.txt", "one\n");
+        let snap = scan_branches(&repo).expect("収集できる");
+        assert!(snap.head.is_some(), "ブランチ名が取れる: {snap:?}");
+        assert!(snap.dirty.is_empty(), "コミット直後は綺麗");
+        assert!(snap.in_progress.is_none());
+        assert!(snap.holders.is_empty(), "worktree は 1 つだけ");
+
+        std::fs::write(repo.join("a.txt"), "two\n").expect("dirty it");
+        let snap = scan_branches(&repo).expect("収集できる");
+        assert_eq!(snap.dirty, vec!["a.txt".to_string()]);
+        assert_eq!(snap.dirty_total, 1);
+        assert!(
+            snap.plan_switch(&SwitchTarget::Local("whatever".into())).is_err(),
+            "汚れていれば切り替えない"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// リポジトリ識別キー: 同じ repo の 2 つの worktree は同じ値、別 repo は別の値。
+    #[test]
+    fn repo_key_is_shared_across_worktrees() {
+        let Some(repo) = temp_repo("repokey-a") else {
+            return;
+        };
+        commit_something(&repo, "a.txt", "one\n");
+        let Some(other) = temp_repo("repokey-b") else {
+            std::fs::remove_dir_all(&repo).ok();
+            return;
+        };
+        commit_something(&other, "b.txt", "one\n");
+
+        let wt = repo.join("wt-second");
+        let added = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-b", "second"])
+            .arg(&wt)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        let key_main = repo_key(&repo).expect("本体の識別キー");
+        assert_eq!(
+            repo_key(&repo.join("sub-not-exist").parent().unwrap()),
+            Some(key_main.clone()),
+            "同じディレクトリなら当然同じ"
+        );
+        assert_ne!(
+            repo_key(&other),
+            Some(key_main.clone()),
+            "別リポジトリは別のキー"
+        );
+
+        if added {
+            assert_eq!(
+                repo_key(&wt),
+                Some(key_main.clone()),
+                "リンク worktree でも同じリポジトリとして同じキーになる"
+            );
+            let paths = worktree_paths(&wt);
+            assert!(
+                paths.len() >= 2,
+                "worktree 一覧は本体とリンク先の両方を含む: {paths:?}"
+            );
+            assert!(paths.contains(&crate::pathx::canonical(&wt)));
+
+            // 候補フォルダの仕分け: 同じ repo のサブディレクトリは拾い、
+            // 別 repo は落とす (セッション一覧がよそのリポジトリへ漏れない)。
+            let sub = repo.join("sub");
+            std::fs::create_dir_all(&sub).expect("mkdir sub");
+            let fam = scan_repo_family(
+                &wt,
+                &[sub.clone(), other.clone(), std::env::temp_dir().join("zv-nope")],
+            );
+            assert!(fam.worktrees.contains(&crate::pathx::canonical(&wt)));
+            assert_eq!(
+                fam.related,
+                vec![crate::pathx::canonical(&sub)],
+                "同じ repo のサブディレクトリだけが関連フォルダになる"
+            );
+        }
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&other).ok();
+    }
+
+    /// テスト用: 1 コミット作る (worktree 追加には最低 1 コミット要る)。
+    fn commit_something(repo: &Path, name: &str, body: &str) {
+        std::fs::write(repo.join(name), body).expect("write file");
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("git run");
+        };
+        run(&["config", "user.email", "zaivern@example.invalid"]);
+        run(&["config", "user.name", "zaivern test"]);
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "test"]);
     }
 }
