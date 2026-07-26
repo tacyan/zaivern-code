@@ -37,6 +37,7 @@ use crate::panels;
 use crate::pathx;
 use crate::pet;
 use crate::pet_bubble;
+use crate::race;
 use crate::recent;
 use crate::remote;
 use crate::session;
@@ -339,6 +340,9 @@ pub struct ZaivernApp {
     /// (セッションid, 積んだ時刻, 本文)。Issue 着手フローが積む。
     /// 起動直後の信頼確認プロンプト等へ流れ込まないよう、配達を遅らせる。
     pending_prompts: Vec<(u64, Instant, String)>,
+    /// 🏁 プロンプトレース (1 プロンプトを複数エージェントに並走させる) の
+    /// ダッシュボード状態。描画・git 操作の実体は race.rs。
+    race: race::RacePanel,
     highlighter: Highlighter,
     cockpit: bool,
     /// フリート看板 (全エージェントを状態列で俯瞰・指揮するカンバン画面)。
@@ -775,6 +779,7 @@ impl ZaivernApp {
             palette: Palette::new(),
             palette_worktrees: None,
             pending_prompts: Vec::new(),
+            race: race::RacePanel::new(),
             highlighter: Highlighter::new(),
             cockpit: false,
             kanban: false,
@@ -2904,6 +2909,132 @@ impl ZaivernApp {
         );
     }
 
+    /// 🏁 プロンプトレース開始ワンフロー:
+    /// racer ごとの worktree 作成 → エージェント起動 → プロンプトの配達予約。
+    /// (Issue 着手フローと同じ部品 — worktree / launch / pending_prompts — の組み合わせ。
+    /// worktree の作成・検証は race.rs 側。)
+    fn start_race_flow(&mut self, prompt: &str, preset_indices: &[usize], ctx: &egui::Context) {
+        let root = self
+            .agent_root
+            .clone()
+            .unwrap_or_else(|| self.primary_root().to_path_buf());
+        let pairs: Vec<(String, String)> = preset_indices
+            .iter()
+            .filter_map(|&i| self.cfg.agents.get(i))
+            .map(|p| (p.icon.clone(), p.name.clone()))
+            .collect();
+        if pairs.len() != preset_indices.len() {
+            self.toast(tr("選択したプリセットが見つかりません (設定が変わりました)"), false);
+            return;
+        }
+        let mut race = match race::start_race(&root, prompt, &pairs) {
+            Ok(r) => r,
+            Err(e) => {
+                self.toast(e, false);
+                return;
+            }
+        };
+        let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
+        for (slot, &pi) in preset_indices.iter().enumerate() {
+            let Some(preset) = self.cfg.agents.get(pi).cloned() else {
+                continue;
+            };
+            let racer = &mut race.racers[slot];
+            // worktree を作業ディレクトリにして起動する (Issue 着手フローと同じ)
+            let mut p = preset;
+            p.cwd = Some(racer.dir.to_string_lossy().into_owned());
+            let dir = racer.dir.clone();
+            match self.agents.launch(&p, &dir, approval, ctx) {
+                Ok(()) => {
+                    racer.session_id = self.agents.sessions.last().map(|s| s.id);
+                    racer.status = race::RacerStatus::Running;
+                    // 起動直後のプロンプトへ流れ込まないよう、Idle を待つ配達機構へ積む
+                    if let Some(sid) = racer.session_id {
+                        self.pending_prompts.push((
+                            sid,
+                            Instant::now(),
+                            race::build_race_prompt(prompt, &racer.branch),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    racer.status = race::RacerStatus::Error(e.clone());
+                    self.toast(e, false);
+                }
+            }
+        }
+        let n = race.racers.len();
+        self.race.begin(race);
+        self.git_panel.invalidate();
+        self.toast(
+            trf(
+                "🏁 レース開始 — {n} 体が並走中 (準備でき次第プロンプトを配達します)",
+                &[("n", n.to_string())],
+            ),
+            true,
+        );
+    }
+
+    /// レースダッシュボードの操作 (race.rs の RaceAction) を反映する。
+    fn apply_race_actions(&mut self, acts: Vec<race::RaceAction>, ctx: &egui::Context) {
+        for act in acts {
+            match act {
+                race::RaceAction::Start { prompt, preset_indices } => {
+                    self.start_race_flow(&prompt, &preset_indices, ctx);
+                }
+                race::RaceAction::Focus(idx) => {
+                    let pos = self.race.session_of(idx).and_then(|sid| {
+                        self.agents.sessions.iter().position(|s| s.id == sid)
+                    });
+                    if let Some(pos) = pos {
+                        self.agents.active = pos;
+                        self.agents.panel_open = true;
+                        self.cockpit = false;
+                    } else {
+                        self.toast(tr("この racer のセッションは閉じられています"), false);
+                    }
+                }
+                race::RaceAction::OpenDiff(idx) => match self.race.full_diff(idx) {
+                    Ok((title, text)) => {
+                        let id = self.editor.open_virtual(
+                            title,
+                            text,
+                            crate::editor::BufferKind::RaceDiff { slot: idx },
+                        );
+                        // 同じタブを使い回すので、古いパース結果は捨てる
+                        self.race.drop_diff_cache(id);
+                        self.cockpit = false;
+                    }
+                    Err(e) => self.toast(e, false),
+                },
+                race::RaceAction::Adopt(idx) => match self.race.adopt(idx) {
+                    Ok(msg) => {
+                        self.toast(msg, true);
+                        self.git_panel.invalidate();
+                    }
+                    Err(e) => self.toast(e, false),
+                },
+                race::RaceAction::Discard { idx, force } => {
+                    // 走行中/終了済みのセッションが残っていれば先にタブごと閉じる
+                    // (Windows では生きたシェルが worktree を掴んで削除を妨げるため)
+                    if let Some(pos) = self.race.session_of(idx).and_then(|sid| {
+                        self.agents.sessions.iter().position(|s| s.id == sid)
+                    }) {
+                        self.close_agent(pos);
+                    }
+                    match self.race.discard(idx, force) {
+                        Ok(msg) => {
+                            self.toast(msg, true);
+                            self.git_panel.invalidate();
+                        }
+                        Err(e) => self.toast(e, false),
+                    }
+                }
+                race::RaceAction::Close => self.race.close(),
+            }
+        }
+    }
+
     /// フォルダをワークスペースへ追加する (AddFolder ダイアログと
     /// `#` パレットの worktree 追加が共有する本体)。
     ///
@@ -2992,6 +3123,7 @@ impl ZaivernApp {
             | Cmd::ToggleKanban
             | Cmd::OpenAgentPicker
             | Cmd::NewTask
+            | Cmd::OpenRace
             | Cmd::SendAgentMessage
             | Cmd::ToggleMdPreview
             | Cmd::ToggleSidebar
@@ -3395,6 +3527,12 @@ impl ZaivernApp {
                 self.cockpit = true;
                 self.kanban = false;
                 self.orch.open_task_form();
+            }
+            // レースのフォームも Cockpit の中で描くので、一緒に開く。
+            Cmd::OpenRace => {
+                self.cockpit = true;
+                self.kanban = false;
+                self.race.form_open = true;
             }
             Cmd::SendAgentMessage => {
                 self.cockpit = true;
@@ -6104,6 +6242,20 @@ impl ZaivernApp {
         let mut acts = CockpitActions::default();
         let mut orch_acts: Vec<orchestration::OrchAction> = Vec::new();
         let orch_rows = self.orch_rows();
+        // 🏁 レースセクションが使うスナップショット (クロージャ内の借用衝突を避ける)
+        let mut race_acts: Vec<race::RaceAction> = Vec::new();
+        let race_presets: Vec<(String, String)> = self
+            .cfg
+            .agents
+            .iter()
+            .map(|p| (p.icon.clone(), p.name.clone()))
+            .collect();
+        let race_sessions: Vec<(u64, bool)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| (s.id, s.running()))
+            .collect();
 
         egui::Frame::none()
             .inner_margin(egui::Margin::same(12.0))
@@ -6121,6 +6273,11 @@ impl ZaivernApp {
                     &orchestration::bus_status(&self.coordinator, &orch_rows),
                 );
 
+                // 🏁 プロンプトレース (描画は race.rs。押された操作は描画後に反映)
+                ui.add_space(8.0);
+                race_acts =
+                    race::race_section(&mut self.race, ui, &theme, &race_presets, &race_sessions);
+
                 self.cockpit_super_agent_ui(ui, &theme, &mut acts);
                 ui.add_space(8.0);
 
@@ -6128,6 +6285,7 @@ impl ZaivernApp {
             });
 
         self.apply_cockpit_actions(ctx, &theme, &orch_rows, acts, orch_acts);
+        self.apply_race_actions(race_acts, ctx);
     }
 
     /// Cockpit のヘッダー行 (タイトル・稼働数・閉じる/全切替・Agent 起動・
@@ -7139,6 +7297,12 @@ impl ZaivernApp {
                 panels::pr_diff_ui(ui, &theme, number, b.id, &b.text, &mut self.github);
                 return;
             }
+            // レース差分タブも同じく読み取り専用の専用ビュー (race.rs)
+            if let crate::editor::BufferKind::RaceDiff { slot } = self.editor.buffers[i].kind {
+                let b = &self.editor.buffers[i];
+                race::race_diff_ui(ui, &theme, slot, b.id, &b.text, &mut self.race);
+                return;
+            }
         }
         // Markdown / HTML ファイルは 編集/プレビュー の切替バーを出す
         // (Cockpit の編集ペインに出ているときも同様に切り替えられる)
@@ -8024,6 +8188,12 @@ impl ZaivernApp {
                 Cmd::OpenAgentPicker,
             ),
             ("📋".into(), tr("タスクを作成してエージェントに割り当て"), String::new(), Cmd::NewTask),
+            (
+                "🏁".into(),
+                tr("プロンプトレース (1 プロンプトを複数エージェントで並走)"),
+                String::new(),
+                Cmd::OpenRace,
+            ),
             ("📮".into(), tr("エージェントへメッセージを送る"), String::new(), Cmd::SendAgentMessage),
             ("👁".into(), tr("Markdown/HTML プレビュー切替"), "⌘⇧V".into(), Cmd::ToggleMdPreview),
             ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),

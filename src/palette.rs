@@ -24,6 +24,8 @@ pub enum Cmd {
     ToggleKanban,
     /// タスク作成フォームを開く (Cockpit も一緒に開く)
     NewTask,
+    /// プロンプトレースの開始フォームを開く (Cockpit も一緒に開く)
+    OpenRace,
     /// エージェントへのメッセージ送信フォームを開く
     SendAgentMessage,
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替

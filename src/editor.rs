@@ -50,6 +50,8 @@ pub enum BufferKind {
     File,
     /// GitHub の Pull Request 差分ビュー。
     PrDiff { number: u64 },
+    /// プロンプトレースの racer 差分ビュー (slot = racer の添字)。
+    RaceDiff { slot: usize },
 }
 
 impl BufferKind {
