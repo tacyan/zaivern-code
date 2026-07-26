@@ -3,10 +3,10 @@
 //!
 //! ダッシュボード構成 (Autonomous Ops Console):
 //! - ヘッダー: 稼働数チップ + 連続稼働時間 + ブロードキャスト + レイアウト切替
-//! - KPI タイル: 稼働中 / 作業中 / 要対応 / 完了 (ミニスパークライン付き)
+//! - KPI タイル: 待機 / 作業中 / 要対応 / 完了 (= レーンそのもの。合計 = 総数)
 //! - 左レール: エージェント一覧 — アバター + 状態 + 「いま何をしているか」一言
-//! - 中央: 8 レーン (待機/思考中/編集中/実行中/検証中/承認待ち/停滞・異常/完了)。
-//!   カードは [`classify`] の判定が変われば勝手にレーンを移動する — ドラッグ不要。
+//! - 中央: **4 レーン (待機 / 作業中 / 要対応 / 完了)**。
+//!   カードは [`Read::lane`] の判定が変われば勝手にレーンを移動する — ドラッグ不要。
 //!   着地したカードは短時間ハイライトするので、目で追える。
 //! - 右レール: アクティビティフィード (状態遷移の実況、LIVE)
 //! - ライブペイン: 選択中カードの**本物の端末**を横 (or 縦モードでは下) に出す。
@@ -18,12 +18,18 @@
 //! カードは全幅。`LayoutMode::Auto` なら [`use_vertical`] が窓の縦横比で選ぶ。
 //! 選択は egui の永続メモリに持つ (config.rs は他所有のため触らない)。
 //!
-//! ## 状態の出どころ (重要)
+//! ## 状態の出どころ (重要 — CLAUDE.md 原則 #4)
 //! 画面のテキストを読んだだけの推定を「事実」として扱わない。
 //! [`classify`] は強い信号から順に見て、必ず出どころ ([`Source`]) を添えて返す:
 //! プロセス生死 → 承認プロンプト検出 (terminal.rs) → レート制限検出 (terminal.rs)
 //! → 見張りの状態判定 (supervisor.rs) → 最後の手段として画面末尾の表引き。
-//! 画面推定のときだけ UI に「推定」と出す。
+//! 画面推定のときだけ UI に「推定」(≈) と出す。
+//!
+//! さらに**確信度の床**を敷いてある ([`Read::lane`]): 画面推定だけの判定は
+//! 「作業中」までしか動かせない。人を呼ぶ「要対応」と、終わったと言い切る「完了」は
+//! 必ず画面より上の段 (プロセス / プロンプト / 上限 / 見張り) の裏付けを要求する。
+//! 細かい作業内容 (編集中: src/foo.rs 等) は捨てずにカードの 1 行として出す
+//! — 情報は残し、**レーンの配置だけ**を動かさない。
 //!
 //! ## 負荷
 //! アイドル時にコストを払わない設計:
@@ -49,41 +55,37 @@ use crate::theme::Theme;
 // 列 (状態から一意に決まる)
 // ---------------------------------------------------------------------------
 
-/// カンバンのレーン。カードは [`classify`] の判定に従って自動で移動する。
+/// カンバンのレーン。カードは [`Read::lane`] の判定に従って自動で移動する。
 ///
-/// 粒度を細かくするほどカードはよく動き、「いま何をしているか」が一目で分かる。
+/// **レーンは「人が次に何をすべきか」で分ける。**「いま何をしているか」の細かさ
+/// (思考中 / 編集中 / 実行中 / 検証中) はレーンではなくカードの 1 行で出す
+/// ([`Activity`] / [`status_line`])。以前は 8 本あったが、真ん中の 4 本は
+/// どれも「動いている」の言い換えでしかなく、カードが絶えず往復するわりに
+/// ユーザーの行動は変わらなかった。4 本にしたことで移動は激減している。
+///
 /// 動きすぎるとちらつくので、移動には [`Column::hold_ms`] のヒステリシスを掛ける。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Column {
-    /// 手が空いている (指示を受けられる)
+    /// 手が空いている (指示を受けられる) — 待機
     Ready,
-    /// 考えている・調べている (出力は動くが編集も実行もしていない)
-    Thinking,
-    /// ファイルを書き換えている
-    Editing,
-    /// コマンドを走らせている
-    Running,
-    /// テスト・ビルド・lint を回している
-    Verifying,
-    /// ユーザーの承認/入力待ちで止まっている
-    Approval,
-    /// 停滞・ループ・エラー多発・レート制限
-    Trouble,
+    /// 動いている (思考・編集・実行・検証をまとめる) — 作業中
+    Working,
+    /// **人の手が要る** — 承認待ち・レート制限・停滞/ループ/異常。この画面の存在理由。
+    Attention,
     /// 完了、またはプロセス終了
     Done,
 }
 
 /// 表示順 (横モードでは左 → 右、縦モードでは上 → 下)。
-pub const COLUMNS: [Column; 8] = [
+pub const COLUMNS: [Column; 4] = [
     Column::Ready,
-    Column::Thinking,
-    Column::Editing,
-    Column::Running,
-    Column::Verifying,
-    Column::Approval,
-    Column::Trouble,
+    Column::Working,
+    Column::Attention,
     Column::Done,
 ];
+
+/// レーン本数。幾何 (最小幅など) はここから導くので、本数を変えれば追随する。
+pub const LANES: usize = COLUMNS.len();
 
 /// レーン移動のヒステリシス既定値 (ms)。この時間だけ同じ判定が続かないと動かない。
 const LANE_HOLD_MS: u64 = 400;
@@ -96,13 +98,9 @@ impl Column {
     pub fn title(self) -> &'static str {
         match self {
             Column::Ready => "待機",
-            Column::Thinking => "思考中",
-            Column::Editing => "編集中",
-            Column::Running => "実行中",
-            Column::Verifying => "検証中",
-            Column::Approval => "承認待ち",
-            Column::Trouble => "停滞・異常",
-            Column::Done => "完了・終了",
+            Column::Working => "作業中",
+            Column::Attention => "要対応",
+            Column::Done => "完了",
         }
     }
 
@@ -110,12 +108,8 @@ impl Column {
     pub fn icon(self) -> &'static str {
         match self {
             Column::Ready => "💤",
-            Column::Thinking => "🧠",
-            Column::Editing => "✎",
-            Column::Running => "▶",
-            Column::Verifying => "🧪",
-            Column::Approval => "⏸",
-            Column::Trouble => "⚠",
+            Column::Working => "▶",
+            Column::Attention => "⚠",
             Column::Done => "✔",
         }
     }
@@ -124,12 +118,12 @@ impl Column {
     fn hint(self) -> &'static str {
         match self {
             Column::Ready => "手が空いています — 指示を送るとすぐ動きます",
-            Column::Thinking => "考えている・調べている (編集も実行もしていない)",
-            Column::Editing => "ファイルを書き換えています",
-            Column::Running => "コマンドを走らせています",
-            Column::Verifying => "テスト・ビルド・lint を回しています",
-            Column::Approval => "あなたの承認・入力を待って止まっています",
-            Column::Trouble => "停滞・ループ・エラー多発・レート制限 — 様子を見てあげてください",
+            Column::Working => {
+                "動いています (思考・編集・実行・検証)。細かい中身はカードの 1 行に出ます"
+            }
+            Column::Attention => {
+                "あなたの手が要ります — 承認待ち・レート制限・停滞/異常。ここを空にするのが仕事です"
+            }
             Column::Done => "タスク完了、またはプロセスが終了しています",
         }
     }
@@ -139,25 +133,33 @@ impl Column {
     fn color(self, th: &Theme) -> Color32 {
         match self {
             Column::Ready => th.accent_soft,
-            // ansi の明色は 8..16。テーマごとに定義されているのでここでも安全に使える。
-            Column::Thinking => th.ansi[13],
-            Column::Editing => th.accent,
-            Column::Running => th.ok,
-            Column::Verifying => th.ansi[14],
-            Column::Approval => th.warn,
-            Column::Trouble => th.err,
+            Column::Working => th.ok,
+            // 要対応はこの画面の主役。テーマで一番強い色を使う。
+            Column::Attention => th.err,
             Column::Done => th.text_dim,
         }
     }
 
+    /// **視線を最優先で引くレーンか。** 枠線・帯・見出しの強調に使う。
+    ///
+    /// 「要対応」は人が動かないと止まったままのカードだけが入る。
+    /// ここが空なら見なくてよい画面 — だから 1 本だけ声を大きくする。
+    pub fn loud(self) -> bool {
+        matches!(self, Column::Attention)
+    }
+
     /// このレーンへ移るまでに判定が続く必要のある時間 (ms)。
     ///
-    /// 「承認待ち・異常・終了」は人がすぐ気づくべき強い信号なので待たせない。
-    /// それ以外 (思考↔編集↔実行↔検証) は往復しやすいのでヒステリシスを掛ける。
+    /// 4 レーンになってヒステリシスの出番はかなり減った (思考↔編集↔実行↔検証の
+    /// 往復はすべて「作業中」の内側に収まり、レーンは動かない)。残る往復は
+    /// 待機 ↔ 作業中 だけなので、そこにだけ [`LANE_HOLD_MS`] を掛ける。
+    ///
+    /// 「要対応・完了」は人がすぐ気づくべき強い信号 (かつ [`Read::lane`] が
+    /// 画面推定だけでは入れない) なので 0 = 即時。
     pub fn hold_ms(self) -> u64 {
         match self {
-            Column::Approval | Column::Trouble | Column::Done => 0,
-            _ => LANE_HOLD_MS,
+            Column::Attention | Column::Done => 0,
+            Column::Ready | Column::Working => LANE_HOLD_MS,
         }
     }
 }
@@ -208,16 +210,24 @@ impl Activity {
         }
     }
 
-    /// このアクティビティが属するレーン。
+    /// このアクティビティが属するレーン (**確信度の床を掛ける前**の素の対応)。
+    ///
+    /// 実際の配置は [`Read::lane`] を使うこと — 画面推定だけの判定を
+    /// 「要対応」「完了」へ落とさない床がそこに入っている。
+    ///
+    /// 8 → 4 の対応表:
+    /// - 起動中 / 待機 → 待機
+    /// - 思考中 / 編集中 / 実行中 / 検証中 → 作業中 (どれも「動いている」の言い換え)
+    /// - 承認待ち / レート制限中 / 停滞・異常 → 要対応 (人が動かないと進まない)
+    /// - 終了 → 完了
     pub fn column(self) -> Column {
         match self {
             Activity::Starting | Activity::Idle => Column::Ready,
-            Activity::Thinking => Column::Thinking,
-            Activity::Editing => Column::Editing,
-            Activity::Running => Column::Running,
-            Activity::Verifying => Column::Verifying,
-            Activity::Approval => Column::Approval,
-            Activity::RateLimited | Activity::Stalled => Column::Trouble,
+            Activity::Thinking
+            | Activity::Editing
+            | Activity::Running
+            | Activity::Verifying => Column::Working,
+            Activity::Approval | Activity::RateLimited | Activity::Stalled => Column::Attention,
             Activity::Exited => Column::Done,
         }
     }
@@ -262,6 +272,33 @@ impl Source {
     pub fn is_guess(self) -> bool {
         matches!(self, Source::Screen)
     }
+
+    /// **信号の段位** (小さいほど強い)。CLAUDE.md 原則 #4 の優先順位そのもの:
+    /// 構造化プロトコル > ベンダー提供フック > 状態ファイル > 画面スクレイプ。
+    ///
+    /// レーンの判断はこの段位で足切りする ([`Read::lane`])。
+    pub const fn rung(self) -> u8 {
+        match self {
+            Source::Process => 0,
+            Source::Prompt => 1,
+            Source::RateLimit => 2,
+            Source::Supervisor => 3,
+            Source::Screen => 4,
+        }
+    }
+}
+
+/// 画面推定 ([`Source::Screen`]) だけでは入れない一番弱い段位。
+///
+/// これより弱い出どころで「要対応」「完了」を名乗らせない。
+const STRONG_RUNG: u8 = Source::Supervisor.rung();
+
+/// **画面テキストだけで入ってはいけないレーンか** (純関数)。
+///
+/// 「要対応」は人を呼ぶ = 誤報のコストが高い。「完了」は見なくてよいと言い切る =
+/// 見落としのコストが高い。どちらも画面の文字列一致で決めてよい判断ではない。
+pub fn needs_strong_signal(col: Column) -> bool {
+    matches!(col, Column::Attention | Column::Done)
 }
 
 /// [`classify`] の結果。
@@ -271,6 +308,41 @@ pub struct Read {
     pub source: Source,
     /// 補足 (編集中のファイル・実行中のコマンド・異常の理由など)。無ければ空。
     pub detail: String,
+}
+
+impl Read {
+    /// **実際に置くレーン** — [`Activity::column`] に確信度の床を掛けたもの。
+    ///
+    /// 画面末尾の表引きしか根拠が無い判定は、どれだけ「承認待ちっぽい」文字列でも
+    /// 「作業中」までしか動かさない。人を呼ぶ (要対応) / 見切りをつける (完了) には
+    /// [`STRONG_RUNG`] 以上 — プロセス生死・プロンプト検出・上限検出・見張り — が要る。
+    pub fn lane(&self) -> Column {
+        let col = self.activity.column();
+        if needs_strong_signal(col) && self.source.rung() > STRONG_RUNG {
+            // 画面の文字列だけで人を呼ばない。動いてはいるので「作業中」に置く。
+            Column::Working
+        } else {
+            col
+        }
+    }
+
+    /// 要対応レーンに置いた根拠 (ホバーに出す 1 行)。純関数なので表テストできる。
+    pub fn reason(&self) -> String {
+        let act = tr(self.activity.label());
+        let src = tr(self.source.label());
+        let d = self.detail.trim();
+        if d.is_empty() {
+            trf(
+                "{act} — 出どころ: {src}",
+                &[("act", act), ("src", src)],
+            )
+        } else {
+            trf(
+                "{act} — 出どころ: {src} / {detail}",
+                &[("act", act), ("src", src), ("detail", d.to_string())],
+            )
+        }
+    }
 }
 
 /// 画面テキストから拾う補足の種類。
@@ -585,16 +657,14 @@ pub fn classify(
 /// 優先順位は app.rs `coordinator_state` と同じ
 /// (終了 > 承認待ち > レート制限 > supervisor 判定)。順序を揃えておかないと、
 /// 看板の見た目と coordinator の配達判断が食い違って混乱する。
-/// 画面テキストを渡さない版なので、作業中は「思考中」レーンに落ちる。
+/// 確信度の床 ([`Read::lane`]) もここで通す。
 pub fn column_for(
     running: bool,
     attention: bool,
     rate_limited: bool,
     sup: Option<supervisor::SessionState>,
 ) -> Column {
-    classify(running, attention, rate_limited, sup, &[])
-        .activity
-        .column()
+    classify(running, attention, rate_limited, sup, &[]).lane()
 }
 
 /// カードに出す状態ラベル (tr のキーになる日本語原文)。優先順位は [`classify`] と同じ。
@@ -617,7 +687,11 @@ pub fn state_label(
 ///
 /// - 判定が現在のレーンと同じなら何もしない (候補は取り下げ)
 /// - 違うレーンの判定が [`Column::hold_ms`] 以上続いたら初めて移動
-/// - 承認待ち・異常・終了は `hold_ms == 0` なので即座に動く
+/// - 要対応・完了は `hold_ms == 0` なので即座に動く
+///
+/// 4 レーンになってこの機械の仕事は「待機 ↔ 作業中」の一往復だけになった
+/// (出力が一瞬途切れただけで「待機」へ落とさない)。それでも消さないのは、
+/// 判定が 1 サンプル揺れただけでカードが飛ぶのを**構造的に不可能**にするため。
 #[derive(Clone, Copy, Debug)]
 pub struct LaneTracker {
     lane: Column,
@@ -782,7 +856,10 @@ pub const LANE_MAX_W: f32 = 300.0;
 /// 空レーンを畳んだときの幅 (見出しの帯だけ)。
 pub const LANE_EMPTY_W: f32 = 96.0;
 /// 横モードを選ぶのに要る看板の幅。これを割ると縦モードへ落とす。
-pub const BOARD_MIN_W: f32 = 900.0;
+///
+/// **本数から導く** (直書きしない)。8 本のころは 900px 要ったが、4 本なら
+/// 624px で全レーンが読める幅に並ぶ — 同じ窓でも横モードで見られる範囲が広がった。
+pub const BOARD_MIN_W: f32 = LANE_MIN_W * LANES as f32 + space::SM * (LANES as f32 - 1.0);
 /// 右のアクティビティフィードの幅。
 pub const FEED_W: f32 = 240.0;
 /// 左レールの幅。
@@ -804,7 +881,7 @@ pub fn board_width(avail_w: f32, live_open: bool, split: f32) -> f32 {
 
 /// 縦モードで描くべきか (**純関数**)。
 ///
-/// 自動判定: 8 レーンを横に並べると 1 レーン [`LANE_MIN_W`] 必要なので、
+/// 自動判定: [`LANES`] 本を横に並べると 1 レーン [`LANE_MIN_W`] 必要なので、
 /// **看板に残る幅**が足りないか、縦長 (高さが幅の 0.95 倍超) なら縦に積む。
 ///
 /// ライブペインを開くと看板の取り分はその 6 割前後まで落ちるので、
@@ -971,8 +1048,9 @@ pub fn main_rects(area: Rect, vertical: bool, live_open: bool, split: f32) -> Ma
 /// **レーン幅の割り付け** (純関数)。
 ///
 /// 空のレーンは見出しの帯だけに畳んで [`LANE_EMPTY_W`] に固定し、浮いた幅を
-/// 中身のあるレーンへ配る。8 本すべてを均等に割ると 1 本 90px を切って
-/// カードが読めなくなり、下限で止めると右端の 2〜3 本が画面外へ落ちていた。
+/// 中身のあるレーンへ配る。8 本のころは均等割りだと 1 本 90px を切って
+/// カードが読めず、下限で止めると右端の 2〜3 本が画面外へ落ちていた。
+/// 4 本になっても規則は同じ (本数に依存しない) — 空レーンを畳む価値は残る。
 ///
 /// 不変条件: 返す幅の総和 (+ レーン間の間隔) は `avail` を超えない
 /// — ただし空レーンだけでも入らないほど狭い窓では、横スクロールに任せる
@@ -1127,21 +1205,51 @@ pub fn now_line(tail: &[String]) -> Option<&str> {
     tail.iter().rev().map(|l| l.trim()).find(|l| !l.is_empty())
 }
 
-/// 列ごとの人数の集計。KPI タイルとスループット履歴のデータ点になる。
+/// レーンごとの人数の集計。KPI タイルとスループット履歴のデータ点になる。
+///
+/// **不変条件**: `ready + working + attention + done == total`。
+/// KPI タイルはこの 4 つをそのまま出すので、二重計上が起きない
+/// (以前は「稼働中」タイルが他の 3 つと重なって、合計が総数を超えていた)。
+/// `running` は**レーンではなくプロセスの生死**なので合計には入れない
+/// — ヘッダーのチップだけで使う。
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Tally {
     pub total: usize,
+    /// 生きているプロセスの数 (レーン集計とは別の軸)
     pub running: usize,
     pub ready: usize,
     /// 思考中 + 編集中 + 実行中 + 検証中 (KPI とスループット折れ線が使う)
     pub working: usize,
-    pub thinking: usize,
-    pub editing: usize,
-    pub exec: usize,
-    pub verifying: usize,
-    pub approval: usize,
-    pub trouble: usize,
+    /// 承認待ち + レート制限 + 停滞・異常
+    pub attention: usize,
     pub done: usize,
+}
+
+impl Tally {
+    /// レーンと人数の対 (表示順)。KPI タイルとテストが同じ 1 つの表を見る。
+    pub fn lanes(&self) -> [(Column, usize); LANES] {
+        [
+            (Column::Ready, self.ready),
+            (Column::Working, self.working),
+            (Column::Attention, self.attention),
+            (Column::Done, self.done),
+        ]
+    }
+
+    /// レーン人数の合計 (= `total` のはず)。二重計上の検出に使う。
+    pub fn lane_sum(&self) -> usize {
+        self.lanes().iter().map(|(_, n)| *n).sum()
+    }
+
+    /// 1 本ぶんの人数 (履歴からスパークラインを組むときに使う)。
+    pub fn lane_count(&self, col: Column) -> usize {
+        match col {
+            Column::Ready => self.ready,
+            Column::Working => self.working,
+            Column::Attention => self.attention,
+            Column::Done => self.done,
+        }
+    }
 }
 
 /// カード一覧から列集計を作る純関数 (カード自身の素の列を使う)。
@@ -1163,29 +1271,20 @@ pub fn tally_lanes(cards: &[Card], lanes: &[Column]) -> Tally {
         if c.running {
             t.running += 1;
         }
+        // 1 枚のカードはちょうど 1 本のレーンにだけ数える (二重計上しない)。
         match lanes.get(i).copied().unwrap_or(c.column) {
             Column::Ready => t.ready += 1,
-            Column::Thinking => {
-                t.thinking += 1;
-                t.working += 1;
-            }
-            Column::Editing => {
-                t.editing += 1;
-                t.working += 1;
-            }
-            Column::Running => {
-                t.exec += 1;
-                t.working += 1;
-            }
-            Column::Verifying => {
-                t.verifying += 1;
-                t.working += 1;
-            }
-            Column::Approval => t.approval += 1,
-            Column::Trouble => t.trouble += 1,
+            Column::Working => t.working += 1,
+            Column::Attention => t.attention += 1,
             Column::Done => t.done += 1,
         }
     }
+    // 不変条件: レーンの合計 = 総数 (二重計上も取りこぼしも無い)。
+    debug_assert_eq!(
+        t.lane_sum(),
+        t.total,
+        "レーン集計が総数と合わない (二重計上か取りこぼし)"
+    );
     t
 }
 
@@ -1247,7 +1346,7 @@ pub struct Track {
 impl Track {
     fn new(read: &Read, now_ms: u64) -> Self {
         Self {
-            lane: LaneTracker::new(read.activity.column(), now_ms),
+            lane: LaneTracker::new(read.lane(), now_ms),
             activity: read.activity,
             since_ms: now_ms,
             source: read.source,
@@ -1267,6 +1366,20 @@ impl Track {
     /// 直近 30 秒の出力の勢い (古い → 新しい)。
     pub fn pulse_series(&self, now_ms: u64) -> Vec<f32> {
         bucket_series(&self.pulse, now_ms, PULSE_WINDOW_MS, PULSE_BUCKETS)
+    }
+
+    /// いまの判定を [`Read`] として組み直す (根拠の文言を 1 か所で作るため)。
+    fn read(&self) -> Read {
+        Read {
+            activity: self.activity,
+            source: self.source,
+            detail: self.detail.clone(),
+        }
+    }
+
+    /// このカードを**いまのレーンへ入れた根拠** (ホバーで出す 1 行)。
+    pub fn reason(&self) -> String {
+        self.read().reason()
     }
 
     /// 直近 3 秒に新しい出力があったか (LIVE 表示・サンプリング速度の判断)。
@@ -1432,7 +1545,8 @@ impl KanbanState {
                 _ => {}
             }
 
-            track.lane.step(read.activity.column(), now_ms);
+            // **確信度の床を通したレーン**へ寄せる (画面推定だけで要対応/完了にしない)。
+            track.lane.step(read.lane(), now_ms);
             lanes.push(track.lane.lane());
             if track.lane.land_glow(now_ms) > 0.0 {
                 animating = true;
@@ -1996,12 +2110,9 @@ fn header_ui(
             theme.ok,
             &trf("{n} 稼働中", &[("n", t.running.to_string())]),
         );
-        // レーン別の内訳 (0 のレーンは出さない — 動いているものだけ目に入る)
-        for (col, n) in [
-            (Column::Editing, t.editing),
-            (Column::Running, t.exec),
-            (Column::Verifying, t.verifying),
-        ] {
+        // レーン別の内訳 (0 のレーンは出さない — いま意味のある数だけ目に入る)。
+        // 「稼働中」はレーンではなくプロセスの生死なので、上のチップとは別の軸。
+        for (col, n) in [(Column::Working, t.working), (Column::Attention, t.attention)] {
             if n > 0 {
                 chip(
                     ui,
@@ -2009,20 +2120,6 @@ fn header_ui(
                     &format!("{} {} {}", col.icon(), tr(col.title()), n),
                 );
             }
-        }
-        if t.approval > 0 {
-            chip(
-                ui,
-                theme.warn,
-                &trf("承認待ち {n}", &[("n", t.approval.to_string())]),
-            );
-        }
-        if t.trouble > 0 {
-            chip(
-                ui,
-                theme.err,
-                &trf("要注意 {n}", &[("n", t.trouble.to_string())]),
-            );
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2195,43 +2292,53 @@ fn empty_ui(
 // KPI タイル
 // ---------------------------------------------------------------------------
 
+/// KPI タイル = **4 レーンそのもの**。合計は必ず総数に一致する
+/// ([`Tally::lane_sum`])。以前は「稼働中」タイルが他と重なっていて、
+/// 4 枚の数字を足すと総数を超えていた (二重計上)。
+/// 「稼働中」はレーンではないのでヘッダーのチップへ移した。
 fn kpi_ui(ui: &mut egui::Ui, theme: &Theme, st: &KanbanState, t: &Tally) {
     let gap = space::SM;
     // 狭い窓では 4 枚を 1 列ずつ潰さず**段に折る**。下限で止めると
-    // 右端の「完了・終了」が画面外へ落ちて数字が見えなくなる。
-    let (cols, tile_w) = kpi_grid(ui.available_width(), 4);
-    let tiles: [(&str, usize, Color32, fn(&Tally) -> usize); 4] = [
-        ("稼働中", t.running, theme.accent, |t| t.running),
-        ("作業中", t.working, theme.ok, |t| t.working),
-        ("要対応", t.approval + t.trouble, theme.warn, |t| {
-            t.approval + t.trouble
-        }),
-        ("完了・終了", t.done, theme.text_dim, |t| t.done),
-    ];
+    // 右端の「完了」が画面外へ落ちて数字が見えなくなる。
+    let (cols, tile_w) = kpi_grid(ui.available_width(), LANES);
+    let tiles = t.lanes();
     let inner_pad = space::SM + 1.0;
     for chunk in tiles.chunks(cols.max(1)) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
-            for (label, value, color, pick) in chunk {
+            for (col, value) in chunk {
+                let color = col.color(theme);
+                // 要対応だけは 0 でないとき枠を強くする — ここが空かどうかが要点。
+                let hot = col.loud() && *value > 0;
                 egui::Frame::none()
-                    .fill(theme.panel)
-                    .stroke(Stroke::new(1.0_f32, theme.border))
+                    .fill(if hot {
+                        theme.panel.lerp_to_gamma(color, 0.12)
+                    } else {
+                        theme.panel
+                    })
+                    .stroke(Stroke::new(
+                        if hot { 1.5_f32 } else { 1.0_f32 },
+                        if hot { color } else { theme.border },
+                    ))
                     .rounding(egui::Rounding::same(8.0))
                     .inner_margin(egui::Margin::same(inner_pad))
                     .show(ui, |ui| {
                         ui.set_width((tile_w - inner_pad * 2.0).max(1.0));
+                        let label = col.title();
                         ui.horizontal(|ui| {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(tr(label)).size(11.0).color(theme.text_dim),
+                                    RichText::new(format!("{} {}", col.icon(), tr(label)))
+                                        .size(11.0)
+                                        .color(if hot { color } else { theme.text_dim }),
                                 )
                                 .truncate(),
                             )
-                            .on_hover_text(tr(label));
+                            .on_hover_text(tr(col.hint()));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.label(RichText::new("●").size(9.0).color(*color));
+                                    ui.label(RichText::new("●").size(9.0).color(color));
                                 },
                             );
                         });
@@ -2239,15 +2346,18 @@ fn kpi_ui(ui: &mut egui::Ui, theme: &Theme, st: &KanbanState, t: &Tally) {
                             RichText::new(value.to_string())
                                 .size(21.0)
                                 .strong()
-                                .color(theme.text),
+                                .color(if hot { color } else { theme.text }),
                         );
-                        let values: Vec<f32> =
-                            st.samples.iter().map(|s| pick(&s.tally) as f32).collect();
-                        sparkline(ui, 14.0, *color, &values);
+                        let values: Vec<f32> = st
+                            .samples
+                            .iter()
+                            .map(|s| s.tally.lane_count(*col) as f32)
+                            .collect();
+                        sparkline(ui, 14.0, color, &values);
                     });
             }
         });
-        if cols < 4 {
+        if cols < LANES {
             ui.add_space(space::XS);
         }
     }
@@ -2482,7 +2592,7 @@ fn board_ui(
 /// 縦モード: レーンを縦に積み、カードは全幅の 1 列。
 ///
 /// 細く高い窓 (サブディスプレイの縦置き・スマホからのリモート) では、
-/// 8 本を横に並べると 1 本 40px しか取れず読めない。縦に積めばカードが全幅を
+/// [`LANES`] 本を横に並べても 1 本が読める幅に届かない。縦に積めばカードが全幅を
 /// 使えるので、状態文・最後のファイル・最後のコマンド・勢いのグラフが
 /// 1 枚に収まる。空のレーンは帯だけに畳んで、視線が要点に届くようにする。
 #[allow(clippy::too_many_arguments)]
@@ -2533,10 +2643,25 @@ fn board_vertical_ui(
 }
 
 /// 縦モードのレーン帯 (色 + 絵文字 + 名前 + 件数)。
+///
+/// 中身のある「要対応」だけ帯を濃くして、縦に積んでも目に飛び込むようにする。
 fn lane_header_ui(ui: &mut egui::Ui, theme: &Theme, col: Column, count: usize) {
     let color = col.color(theme);
+    let hot = col.loud() && count > 0;
+    let alpha = if count == 0 {
+        0.06
+    } else if hot {
+        0.30
+    } else {
+        0.16
+    };
     egui::Frame::none()
-        .fill(color.gamma_multiply(if count == 0 { 0.06 } else { 0.16 }))
+        .fill(color.gamma_multiply(alpha))
+        .stroke(if hot {
+            Stroke::new(1.0_f32, color)
+        } else {
+            Stroke::NONE
+        })
         .rounding(egui::Rounding::same(5.0))
         .inner_margin(egui::Margin::symmetric(7.0, 3.0))
         .show(ui, |ui| {
@@ -2579,7 +2704,10 @@ fn column_ui(
 ) {
     let color = col.color(theme);
     let empty = members.is_empty();
-    // **空のレーンは見出しだけに畳む。** 高さを丸ごと取ると、5 本の空カラムが
+    // 中身のある「要対応」だけは枠も背景も強くする。この画面の存在理由なので、
+    // 目を走らせずに気づけること自体が仕様。
+    let hot = col.loud() && !empty;
+    // **空のレーンは見出しだけに畳む。** 高さを丸ごと取ると、空カラムが
     // 窓の底まで伸びて「読むところが無い縦線」が並ぶ (実際に起きた)。
     let pad = space::XS + 3.0;
     ui.allocate_ui_with_layout(
@@ -2587,8 +2715,17 @@ fn column_ui(
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
             egui::Frame::none()
-                .fill(if empty { theme.panel_alt } else { theme.panel })
-                .stroke(Stroke::new(1.0_f32, theme.border))
+                .fill(if empty {
+                    theme.panel_alt
+                } else if hot {
+                    theme.panel.lerp_to_gamma(color, 0.10)
+                } else {
+                    theme.panel
+                })
+                .stroke(Stroke::new(
+                    if hot { 1.5_f32 } else { 1.0_f32 },
+                    if hot { color } else { theme.border },
+                ))
                 .rounding(egui::Rounding::same(8.0))
                 .inner_margin(egui::Margin::same(pad))
                 .show(ui, |ui| {
@@ -2601,9 +2738,15 @@ fn column_ui(
                         ui.add(
                             egui::Label::new(
                                 RichText::new(tr(col.title()))
-                                    .size(12.0)
+                                    .size(if hot { 12.5 } else { 12.0 })
                                     .strong()
-                                    .color(if empty { theme.text_dim } else { theme.text }),
+                                    .color(if empty {
+                                        theme.text_dim
+                                    } else if hot {
+                                        color
+                                    } else {
+                                        theme.text
+                                    }),
                             )
                             .truncate(),
                         )
@@ -2624,11 +2767,13 @@ fn column_ui(
                         // 帯だけで終わり — 高さも幅も予約しない。
                         return;
                     }
-                    // 見出し下の色帯 (列の識別)
-                    let (line, _) = ui
-                        .allocate_exact_size(egui::vec2(ui.available_width(), 2.0), egui::Sense::hover());
+                    // 見出し下の色帯 (列の識別)。要対応は太く・濃く。
+                    let (line, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), if hot { 3.0 } else { 2.0 }),
+                        egui::Sense::hover(),
+                    );
                     ui.painter()
-                        .rect_filled(line, 1.0_f32, color.gamma_multiply(0.6));
+                        .rect_filled(line, 1.0_f32, color.gamma_multiply(if hot { 1.0 } else { 0.6 }));
                     ui.add_space(space::XS);
 
                     egui::ScrollArea::vertical()
@@ -2778,18 +2923,22 @@ fn card_ui(
                                 )
                                 .on_hover_text(tr("この状態が続いている時間"));
                             }
-                            // 画面テキストからの推定は必ず「推定」と断る
+                            // 画面テキストからの推定は必ず「推定」(≈) と断る。
+                            // 要対応に居るカードは「**何がここへ入れたか**」まで見せる。
                             if let Some(s) = source {
                                 let mark = if s.is_guess() { "≈" } else { "✓" };
+                                let why = match (&track, lane) {
+                                    (Some(t), Column::Attention) => {
+                                        trf("要対応の理由: {why}", &[("why", t.reason())])
+                                    }
+                                    _ => trf("判定の出どころ: {src}", &[("src", tr(s.label()))]),
+                                };
                                 ui.label(
                                     RichText::new(mark)
                                         .size(9.0)
                                         .color(if s.is_guess() { theme.warn } else { theme.text_dim }),
                                 )
-                                .on_hover_text(trf(
-                                    "判定の出どころ: {src}",
-                                    &[("src", tr(s.label()))],
-                                ));
+                                .on_hover_text(why);
                             }
                             if let Some(line) = &c.rate_limited {
                                 ui.label(RichText::new("⏳").size(10.0).color(theme.warn))
@@ -2803,6 +2952,25 @@ fn card_ui(
                                     .on_hover_text(tr("最後に見てから新しい出力があります"));
                             }
                         });
+
+                        // ── 細かい作業内容の 1 行 (例: 「編集中: src/foo.rs」) ──
+                        //
+                        // レーンを 4 本に減らした代わりに、**粒度はここへ移した**。
+                        // 情報は落とさず、カードの位置だけを動かさない
+                        // (レーンが動くたびに視線が飛ぶのがいちばんの雑音だった)。
+                        if let Some(t) = &track {
+                            if !t.detail.trim().is_empty() {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(status_line(t))
+                                            .size(10.5)
+                                            .color(theme.text),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(t.reason());
+                            }
+                        }
 
                         if let Some(task) = &c.task {
                             ui.add(
@@ -3172,6 +3340,36 @@ mod tests {
     use super::*;
     use crate::supervisor::SessionState as S;
 
+    /// **8 → 4 の対応表**。以前レーンだった 8 状態が、どの 1 本に畳まれるか。
+    /// ここが仕様書 — 粒度を戻したくなったらまずこの表を疑うこと。
+    #[test]
+    fn 旧八レーンは四レーンへ畳まれる() {
+        let table: &[(Activity, Column)] = &[
+            // 待機 (指示を受けられる)
+            (Activity::Starting, Column::Ready),
+            (Activity::Idle, Column::Ready),
+            // 作業中 (旧: 思考中 / 編集中 / 実行中 / 検証中 — どれも「動いている」)
+            (Activity::Thinking, Column::Working),
+            (Activity::Editing, Column::Working),
+            (Activity::Running, Column::Working),
+            (Activity::Verifying, Column::Working),
+            // 要対応 (旧: 承認待ち / 停滞・異常 — 人が動かないと進まない)
+            (Activity::Approval, Column::Attention),
+            (Activity::RateLimited, Column::Attention),
+            (Activity::Stalled, Column::Attention),
+            // 完了
+            (Activity::Exited, Column::Done),
+        ];
+        for (act, want) in table {
+            assert_eq!(act.column(), *want, "{act:?} の行き先");
+        }
+        // 表が全アクティビティを覆っていること (増えたら落ちる)
+        assert_eq!(table.len(), 10, "Activity を増やしたら表も足すこと");
+        // 4 本しか無い
+        assert_eq!(COLUMNS.len(), 4);
+        assert_eq!(LANES, 4);
+    }
+
     #[test]
     fn exited_always_lands_in_done() {
         // 終了は他のどのフラグより強い (attention が残っていても Done)
@@ -3184,32 +3382,32 @@ mod tests {
     fn attention_beats_rate_limit_and_supervisor() {
         assert_eq!(
             column_for(true, true, true, Some(S::Working)),
-            Column::Approval
+            Column::Attention
         );
     }
 
     #[test]
-    fn rate_limit_is_trouble() {
+    fn rate_limit_is_attention() {
         assert_eq!(
             column_for(true, false, true, Some(S::Working)),
-            Column::Trouble
+            Column::Attention
         );
     }
 
     #[test]
     fn supervisor_states_map_to_columns() {
-        // 画面テキストを渡さない版なので「作業中」は思考中レーンに落ちる
+        // 画面テキストを渡さない版でも「動いている」は作業中レーン
         assert_eq!(
             column_for(true, false, false, Some(S::Working)),
-            Column::Thinking
+            Column::Working
         );
         assert_eq!(column_for(true, false, false, Some(S::Idle)), Column::Ready);
         assert_eq!(
             column_for(true, false, false, Some(S::WaitingApproval)),
-            Column::Approval
+            Column::Attention
         );
         for s in [S::Stalled, S::Looping, S::Errored, S::Crashed] {
-            assert_eq!(column_for(true, false, false, Some(s)), Column::Trouble);
+            assert_eq!(column_for(true, false, false, Some(s)), Column::Attention);
         }
         assert_eq!(column_for(true, false, false, Some(S::Done)), Column::Done);
         // 起動直後 (未観測) は待機扱い
@@ -3218,11 +3416,79 @@ mod tests {
 
     #[test]
     fn state_label_follows_same_priority() {
+        // ラベル (= 細かいアクティビティ) はレーンを畳んでも粒度を保つ
         assert_eq!(state_label(false, false, false, Some(S::Working)), "終了");
         assert_eq!(state_label(true, true, false, None), "承認待ち");
         assert_eq!(state_label(true, false, true, None), "レート制限中");
         assert_eq!(state_label(true, false, false, Some(S::Working)), "思考中");
         assert_eq!(state_label(true, false, false, None), "起動中");
+    }
+
+    // ── 確信度の床 (信号の段位) ──
+
+    /// **画面テキストだけの判定は「要対応」「完了」へ入れない。**
+    /// 構造化信号 (生死 / プロンプト / 上限 / 見張り) なら入れる。
+    #[test]
+    fn 画面推定だけでは要対応にも完了にも入れない() {
+        // (アクティビティ, 出どころ, 期待レーン)
+        let table: &[(Activity, Source, Column)] = &[
+            // 画面推定で「承認待ち」「終了」を名乗っても作業中止まり
+            (Activity::Approval, Source::Screen, Column::Working),
+            (Activity::Stalled, Source::Screen, Column::Working),
+            (Activity::RateLimited, Source::Screen, Column::Working),
+            (Activity::Exited, Source::Screen, Column::Working),
+            // 同じアクティビティでも、上の段の裏付けがあれば入れる
+            (Activity::Approval, Source::Prompt, Column::Attention),
+            (Activity::Approval, Source::Supervisor, Column::Attention),
+            (Activity::RateLimited, Source::RateLimit, Column::Attention),
+            (Activity::Stalled, Source::Supervisor, Column::Attention),
+            (Activity::Exited, Source::Process, Column::Done),
+            (Activity::Exited, Source::Supervisor, Column::Done),
+            // 作業中・待機は画面推定でも動かしてよい (誤っても人を呼ばない)
+            (Activity::Editing, Source::Screen, Column::Working),
+            (Activity::Verifying, Source::Screen, Column::Working),
+            (Activity::Idle, Source::Supervisor, Column::Ready),
+        ];
+        for (activity, source, want) in table {
+            let r = Read {
+                activity: *activity,
+                source: *source,
+                detail: String::new(),
+            };
+            assert_eq!(r.lane(), *want, "{activity:?} / {source:?}");
+        }
+        // 段位の順序そのもの (原則 #4: 構造化 > フック > 状態 > 画面)
+        assert!(Source::Process.rung() < Source::Prompt.rung());
+        assert!(Source::Prompt.rung() < Source::RateLimit.rung());
+        assert!(Source::RateLimit.rung() < Source::Supervisor.rung());
+        assert!(Source::Supervisor.rung() < Source::Screen.rung());
+        assert_eq!(Source::Supervisor.rung(), STRONG_RUNG);
+        assert!(needs_strong_signal(Column::Attention));
+        assert!(needs_strong_signal(Column::Done));
+        assert!(!needs_strong_signal(Column::Working));
+        assert!(!needs_strong_signal(Column::Ready));
+    }
+
+    /// 要対応のカードは「何がここへ入れたか」を必ず言える。
+    #[test]
+    fn 要対応の根拠は必ず読める() {
+        let r = Read {
+            activity: Activity::Approval,
+            source: Source::Prompt,
+            detail: "Do you want to proceed?".into(),
+        };
+        let why = r.reason();
+        assert!(why.contains("承認待ち"), "{why}");
+        assert!(why.contains("プロンプト検出"), "{why}");
+        assert!(why.contains("Do you want to proceed?"), "{why}");
+        // 補足が無くても出どころは必ず出る
+        let r = Read {
+            activity: Activity::Stalled,
+            source: Source::Supervisor,
+            detail: String::new(),
+        };
+        let why = r.reason();
+        assert!(why.contains("停滞") && why.contains("見張り"), "{why}");
     }
 
     // ── アクティビティ分類 (表引き) ──
@@ -3362,42 +3628,84 @@ mod tests {
             (Activity::Thinking, Source::Supervisor)
         );
         assert!(!r.source.is_guess());
-        // 異常系はすべて停滞レーン
+        // 異常系はすべて要対応レーン (見張り = 画面より上の段なので入れる)
         for s in [S::Stalled, S::Looping, S::Errored, S::Crashed] {
             let r = classify(true, false, false, Some(s), &editing);
             assert_eq!(r.activity, Activity::Stalled);
-            assert_eq!(r.activity.column(), Column::Trouble);
+            assert_eq!(r.lane(), Column::Attention);
+        }
+    }
+
+    /// 画面推定の判定は **SCREEN_RULES 側が何を返しても** 作業中で頭打ちになる。
+    /// (規則表に「承認待ち」を足されても、勝手に人を呼ばない安全弁)
+    #[test]
+    fn 画面由来の分類はレーンを作業中で頭打ちにする() {
+        for (a, _, _) in SCREEN_RULES.iter().map(|r| (r.activity, r.needles, r.pick)) {
+            let r = Read {
+                activity: a,
+                source: Source::Screen,
+                detail: String::new(),
+            };
+            assert!(
+                matches!(r.lane(), Column::Working | Column::Ready),
+                "画面規則 {a:?} が {:?} へ入ろうとした",
+                r.lane()
+            );
         }
     }
 
     // ── レーン移動のデバウンス ──
 
+    /// 旧 8 レーンでいちばん暴れた系列 (編集↔実行↔検証の往復) は、
+    /// **4 レーンではそもそもレーンをまたがない**。1 度も動かないことを固定する。
+    #[test]
+    fn 作業中の中の往復ではカードが動かない() {
+        let acts = [
+            Activity::Thinking,
+            Activity::Editing,
+            Activity::Running,
+            Activity::Verifying,
+        ];
+        let mut lt = LaneTracker::new(Column::Working, 0);
+        for (i, a) in acts.iter().cycle().take(40).enumerate() {
+            let want = Read {
+                activity: *a,
+                source: Source::Screen,
+                detail: String::new(),
+            }
+            .lane();
+            let moved = lt.step(want, i as u64 * 100);
+            assert!(!moved, "t={} ({a:?}) で動いてはいけない", i * 100);
+            assert_eq!(lt.lane(), Column::Working);
+        }
+    }
+
     #[test]
     fn lane_does_not_flicker_below_hold_threshold() {
-        let mut lt = LaneTracker::new(Column::Editing, 0);
-        // 100ms ごとに編集↔実行が往復しても、しきい値 (400ms) 未満なので動かない
+        let mut lt = LaneTracker::new(Column::Working, 0);
+        // 100ms ごとに 待機↔作業中 が往復しても、しきい値 (400ms) 未満なので動かない
         let seq: [(u64, Column); 6] = [
-            (100, Column::Running),
-            (200, Column::Editing),
-            (300, Column::Running),
-            (400, Column::Editing),
-            (500, Column::Running),
-            (600, Column::Editing),
+            (100, Column::Ready),
+            (200, Column::Working),
+            (300, Column::Ready),
+            (400, Column::Working),
+            (500, Column::Ready),
+            (600, Column::Working),
         ];
         for (t, want) in seq {
             let moved = lt.step(want, t);
             assert!(!moved, "t={t} で動いてはいけない");
-            assert_eq!(lt.lane(), Column::Editing);
+            assert_eq!(lt.lane(), Column::Working);
         }
     }
 
     #[test]
     fn lane_moves_promptly_once_state_holds() {
-        let mut lt = LaneTracker::new(Column::Editing, 0);
-        assert!(!lt.step(Column::Running, 1_000)); // 候補として登録
-        assert!(!lt.step(Column::Running, 1_300)); // まだ 300ms
-        assert!(lt.step(Column::Running, 1_400)); // 400ms 到達 → 移動
-        assert_eq!(lt.lane(), Column::Running);
+        let mut lt = LaneTracker::new(Column::Working, 0);
+        assert!(!lt.step(Column::Ready, 1_000)); // 候補として登録
+        assert!(!lt.step(Column::Ready, 1_300)); // まだ 300ms
+        assert!(lt.step(Column::Ready, 1_400)); // 400ms 到達 → 移動
+        assert_eq!(lt.lane(), Column::Ready);
         assert_eq!(lt.landed_ms(), 1_400);
         // 着地ハイライトは時間で減衰し、やがて消える
         assert!(lt.land_glow(1_400) > 0.9);
@@ -3407,26 +3715,59 @@ mod tests {
 
     #[test]
     fn strong_signals_move_without_waiting() {
-        // 承認待ち・異常・終了は hold_ms == 0 なので即座に動く
-        for col in [Column::Approval, Column::Trouble, Column::Done] {
-            let mut lt = LaneTracker::new(Column::Running, 0);
-            assert!(lt.step(col, 10), "{col:?} は即移動のはず");
-            assert_eq!(lt.lane(), col);
+        // 要対応・完了は hold_ms == 0 なので即座に動く (人を待たせない)
+        for col in [Column::Attention, Column::Done] {
+            for from in [Column::Ready, Column::Working] {
+                let mut lt = LaneTracker::new(from, 0);
+                assert!(lt.step(col, 10), "{from:?} → {col:?} は即移動のはず");
+                assert_eq!(lt.lane(), col);
+            }
         }
-        assert_eq!(Column::Approval.hold_ms(), 0);
-        assert_eq!(Column::Thinking.hold_ms(), LANE_HOLD_MS);
+        assert_eq!(Column::Attention.hold_ms(), 0);
+        assert_eq!(Column::Done.hold_ms(), 0);
+        assert_eq!(Column::Working.hold_ms(), LANE_HOLD_MS);
+        assert_eq!(Column::Ready.hold_ms(), LANE_HOLD_MS);
     }
 
     #[test]
     fn lane_cancels_pending_when_state_returns() {
-        let mut lt = LaneTracker::new(Column::Editing, 0);
-        assert!(!lt.step(Column::Verifying, 100));
-        // 元に戻ったら候補は取り下げ → その後 Verifying が来ても 0 から数え直す
-        assert!(!lt.step(Column::Editing, 200));
-        assert!(!lt.step(Column::Verifying, 300));
-        assert!(!lt.step(Column::Verifying, 600)); // 300ms しか経っていない
-        assert!(lt.step(Column::Verifying, 700));
-        assert_eq!(lt.lane(), Column::Verifying);
+        let mut lt = LaneTracker::new(Column::Working, 0);
+        assert!(!lt.step(Column::Ready, 100));
+        // 元に戻ったら候補は取り下げ → その後 Ready が来ても 0 から数え直す
+        assert!(!lt.step(Column::Working, 200));
+        assert!(!lt.step(Column::Ready, 300));
+        assert!(!lt.step(Column::Ready, 600)); // 300ms しか経っていない
+        assert!(lt.step(Column::Ready, 700));
+        assert_eq!(lt.lane(), Column::Ready);
+    }
+
+    /// **どんな順序で判定が来てもちらつかない** — 移動には必ず
+    /// 「同じ判定が hold_ms 続く」か「hold_ms == 0 の強い信号」が要る。
+    #[test]
+    fn どの系列でも一サンプルではレーンが飛ばない() {
+        let lanes = [
+            Column::Ready,
+            Column::Working,
+            Column::Attention,
+            Column::Done,
+        ];
+        for start in lanes {
+            for want in lanes {
+                let mut lt = LaneTracker::new(start, 0);
+                // 1 サンプルだけ違う判定が来ても、弱いレーンへは動かない
+                let moved = lt.step(want, 10);
+                if want == start {
+                    assert!(!moved);
+                } else if want.hold_ms() == 0 {
+                    assert!(moved, "{start:?} → {want:?} は即時のはず");
+                } else {
+                    assert!(!moved, "{start:?} → {want:?} が 1 サンプルで飛んだ");
+                    // 直後に元へ戻れば候補は取り下げ = 何も起きない
+                    assert!(!lt.step(start, 20));
+                    assert_eq!(lt.lane(), start);
+                }
+            }
+        }
     }
 
     // ── 選択の安定性 ──
@@ -3435,14 +3776,14 @@ mod tests {
     fn selection_survives_reorder_and_insert() {
         let cards = vec![
             card_id(10, Column::Ready),
-            card_id(20, Column::Running),
+            card_id(20, Column::Working),
             card_id(30, Column::Done),
         ];
         assert_eq!(resolve_selection(Some(20), 1, &cards), Some((20, 1)));
         // 並べ替え: 位置は変わっても同じ ID が選ばれたまま
         let reordered = vec![
             card_id(30, Column::Done),
-            card_id(20, Column::Editing),
+            card_id(20, Column::Working),
             card_id(10, Column::Ready),
         ];
         assert_eq!(resolve_selection(Some(20), 1, &reordered), Some((20, 1)));
@@ -3450,7 +3791,7 @@ mod tests {
         let inserted = vec![
             card_id(99, Column::Ready),
             card_id(10, Column::Ready),
-            card_id(20, Column::Running),
+            card_id(20, Column::Working),
         ];
         assert_eq!(resolve_selection(Some(20), 1, &inserted), Some((20, 2)));
     }
@@ -3487,8 +3828,10 @@ mod tests {
         let s = 0.38_f32;
         // 広い横長 → 横
         assert!(!use_vertical(LayoutMode::Auto, 1600.0, 700.0, false, s));
-        // 細い → 縦
-        assert!(use_vertical(LayoutMode::Auto, 700.0, 500.0, false, s));
+        // 4 レーンになったので、8 本時代は縦へ落ちていた 700px でも横で読める
+        assert!(!use_vertical(LayoutMode::Auto, 700.0, 500.0, false, s));
+        // 本当に細ければ縦 (BOARD_MIN_W を割る)
+        assert!(use_vertical(LayoutMode::Auto, 500.0, 400.0, false, s));
         // 縦長 (サブディスプレイ縦置き) → 縦
         assert!(use_vertical(LayoutMode::Auto, 1000.0, 1400.0, false, s));
         // 手動指定は窓の形に関係なく従う
@@ -3504,17 +3847,18 @@ mod tests {
 
     /// **ライブペインを開いたら、看板の取り分で縦横を選び直す。**
     ///
-    /// 起きていた不具合: 端末を出すと看板が半分の幅になり、8 レーンのうち
-    /// 「承認」が半分隠れて「完了・終了」が画面外へ落ちた。看板に残る幅で
+    /// 起きていた不具合: 端末を出すと看板が半分の幅になり、レーンのうち
+    /// 「承認」が半分隠れて「完了」が画面外へ落ちた。看板に残る幅で
     /// 判定すれば、同じ窓でも縦モードへ切り替わって全レーンが読める。
     #[test]
     fn ライブペインを開くと縦モードへ落ちる() {
         let s = 0.38_f32;
-        // 1600x700: 閉じていれば横。開けば看板は ~960 → 横のまま
+        // 1600x700: 閉じていれば横。開けば看板は ~970 → 4 本なら横のまま
         assert!(!use_vertical(LayoutMode::Auto, 1600.0, 700.0, false, s));
-        // 1400x700: 開くと看板は ~840 (< BOARD_MIN_W) → 縦へ
-        assert!(!use_vertical(LayoutMode::Auto, 1400.0, 700.0, false, s));
-        assert!(use_vertical(LayoutMode::Auto, 1400.0, 700.0, true, s));
+        assert!(!use_vertical(LayoutMode::Auto, 1600.0, 700.0, true, s));
+        // 1000x600: 開くと看板は ~600 (< BOARD_MIN_W) → 縦へ
+        assert!(!use_vertical(LayoutMode::Auto, 1000.0, 600.0, false, s));
+        assert!(use_vertical(LayoutMode::Auto, 1000.0, 600.0, true, s));
         // 取り分を広げるほど早く縦へ落ちる
         assert!(use_vertical(LayoutMode::Auto, 1600.0, 700.0, true, 0.7));
     }
@@ -3585,7 +3929,7 @@ mod tests {
         assert!(!st.sample_due(500));
         assert!(st.sample_due(1_000));
         // 動き出したら ~6.7Hz
-        let mut c = card_id(1, Column::Running);
+        let mut c = card_id(1, Column::Working);
         c.sup = Some(S::Working);
         c.tail_lines = vec!["⏺ Bash(cargo build)".to_string()];
         st.update_tracks(&[c], 1_000, true);
@@ -3623,24 +3967,39 @@ mod tests {
             c.tail_lines = vec![tail.to_string()];
             c
         };
-        // 編集で着地
+        // 編集で作業中レーンへ着地
         st.update_tracks(&[mk("⏺ Update(src/a.rs)")], 0, true);
         st.update_tracks(&[mk("⏺ Update(src/a.rs)")], 500, true);
-        assert_eq!(st.track(7).unwrap().lane.lane(), Column::Editing);
+        assert_eq!(st.track(7).unwrap().lane.lane(), Column::Working);
         assert_eq!(st.track(7).unwrap().last_file, "src/a.rs");
-        // 一瞬だけ実行が見えても動かない (400ms 未満)
-        let lanes = st.update_tracks(&[mk("⏺ Bash(git status)")], 600, true);
-        assert_eq!(lanes, vec![Column::Editing]);
-        // 続けば移動し、コマンドも覚える
-        let lanes = st.update_tracks(&[mk("⏺ Bash(git status)")], 1_100, true);
-        assert_eq!(lanes, vec![Column::Running]);
+        // **編集 → 実行 → 検証 と細かい中身が変わってもレーンは動かない。**
+        // (8 レーンのころはここでカードが 2 回飛んでいた = 視覚的な雑音)
+        for (t, tail) in [
+            (600_u64, "⏺ Bash(git status)"),
+            (1_100, "⏺ Bash(cargo test)"),
+            (1_600, "⏺ Update(src/b.rs)"),
+        ] {
+            let lanes = st.update_tracks(&[mk(tail)], t, true);
+            assert_eq!(lanes, vec![Column::Working], "t={t} でレーンが動いた");
+        }
         let t = st.track(7).unwrap();
-        assert_eq!(t.last_cmd, "git status");
-        // 編集で覚えたファイルは消えない (別レーンでも文脈として残す)
-        assert_eq!(t.last_file, "src/a.rs");
-        // 経過タイマーはレーン移動ではなく「アクティビティが変わった時点」から数える
-        // (実行が見えたのは t=600、レーン移動はその 500ms 後)
-        assert_eq!(t.elapsed_ms(1_100), 500);
+        // 細かい中身は消えず、カードの 1 行 (状態文) として読める
+        assert_eq!(t.activity, Activity::Editing);
+        assert_eq!(t.last_cmd, "cargo test");
+        assert_eq!(t.last_file, "src/b.rs");
+        assert_eq!(status_line(t), "編集中: src/b.rs");
+        // 経過タイマーは「アクティビティが変わった時点」から数える (t=1_600 で編集へ)
+        assert_eq!(t.elapsed_ms(2_000), 400);
+        // 見張りが「動いていない」と言い続ければ、400ms 後に待機へ落ちる
+        let idle = || {
+            let mut c = card_id(7, Column::Ready);
+            c.sup = Some(S::Idle);
+            c
+        };
+        let lanes = st.update_tracks(&[idle()], 1_700, true);
+        assert_eq!(lanes, vec![Column::Working], "1 サンプルでは落ちない");
+        let lanes = st.update_tracks(&[idle()], 2_200, true);
+        assert_eq!(lanes, vec![Column::Ready]);
     }
 
     #[test]
@@ -3666,14 +4025,83 @@ mod tests {
             card_id(2, Column::Ready),
             card_id(3, Column::Ready),
         ];
-        let lanes = [Column::Editing, Column::Verifying, Column::Approval];
+        let lanes = [Column::Working, Column::Working, Column::Attention];
         let t = tally_lanes(&cards, &lanes);
         assert_eq!(t.total, 3);
-        assert_eq!(t.editing, 1);
-        assert_eq!(t.verifying, 1);
         assert_eq!(t.working, 2, "思考/編集/実行/検証はまとめて作業中");
-        assert_eq!(t.approval, 1);
+        assert_eq!(t.attention, 1);
         assert_eq!(t.ready, 0);
+        assert_eq!(t.lane_sum(), t.total, "レーンの合計 = 総数");
+    }
+
+    /// **サマリー (KPI) タイルの合計 = 総数。二重計上しない。**
+    /// 以前は「稼働中」タイルが他の 3 枚と重なり、4 枚を足すと総数を超えていた。
+    #[test]
+    fn サマリータイルの合計は総数に一致する() {
+        let combos: &[&[Column]] = &[
+            &[],
+            &[Column::Ready],
+            &[Column::Working, Column::Working, Column::Working],
+            &[Column::Attention, Column::Done],
+            &[
+                Column::Ready,
+                Column::Working,
+                Column::Attention,
+                Column::Done,
+                Column::Working,
+                Column::Attention,
+            ],
+        ];
+        for lanes in combos {
+            let cards: Vec<Card> = lanes
+                .iter()
+                .enumerate()
+                .map(|(i, col)| card_id(i as u64 + 1, *col))
+                .collect();
+            let t = tally_lanes(&cards, lanes);
+            assert_eq!(t.total, lanes.len());
+            assert_eq!(t.lane_sum(), t.total, "{lanes:?}: タイルの合計が総数と違う");
+            // タイルは 4 枚 = レーンそのもの (稼働中は別軸なので混ぜない)
+            assert_eq!(t.lanes().len(), LANES);
+            for (col, n) in t.lanes() {
+                assert_eq!(
+                    n,
+                    lanes.iter().filter(|c| **c == col).count(),
+                    "{col:?} の枚数"
+                );
+            }
+        }
+    }
+
+    /// カードの 1 行 (detail line) は**細かいアクティビティを保つ**。
+    /// レーンが 4 本になっても「いま何をしているか」は失われない。
+    #[test]
+    fn カードの一行は細かい作業内容を保つ() {
+        let cases: &[(Activity, &str, &str)] = &[
+            (Activity::Editing, "src/foo.rs", "編集中: src/foo.rs"),
+            (Activity::Running, "git status", "実行中: git status"),
+            (Activity::Verifying, "cargo test", "検証中: cargo test"),
+            (Activity::Thinking, "", "思考中"),
+            (Activity::Approval, "続けますか?", "承認待ち: 続けますか?"),
+            (Activity::Stalled, "停滞", "停滞・異常: 停滞"),
+            (Activity::RateLimited, "", "レート制限中"),
+            (Activity::Idle, "", "待機"),
+            (Activity::Starting, "", "起動中"),
+            (Activity::Exited, "", "終了"),
+        ];
+        for (activity, detail, want) in cases {
+            let read = Read {
+                activity: *activity,
+                source: Source::Supervisor,
+                detail: (*detail).to_string(),
+            };
+            let track = Track::new(&read, 0);
+            let mut track = track;
+            track.detail = read.detail.clone();
+            assert_eq!(status_line(&track), *want, "{activity:?}");
+            // レーンは 4 本のどれか — 粒度はレーンではなく行が持つ
+            assert!(COLUMNS.contains(&read.lane()));
+        }
     }
 
     // ── ダッシュボード用の純関数 ──
@@ -3711,21 +4139,20 @@ mod tests {
     #[test]
     fn tally_counts_columns_and_running() {
         let cards = vec![
-            card(Column::Editing, true),
-            card(Column::Running, true),
-            card(Column::Approval, true),
+            card(Column::Working, true),
+            card(Column::Working, true),
+            card(Column::Attention, true),
             card(Column::Done, false),
         ];
         let t = tally(&cards);
         assert_eq!(t.total, 4);
+        // 稼働中はレーンではなくプロセスの生死 (合計には入れない別軸)
         assert_eq!(t.running, 3);
         assert_eq!(t.working, 2);
-        assert_eq!(t.editing, 1);
-        assert_eq!(t.exec, 1);
-        assert_eq!(t.approval, 1);
+        assert_eq!(t.attention, 1);
         assert_eq!(t.done, 1);
         assert_eq!(t.ready, 0);
-        assert_eq!(t.trouble, 0);
+        assert_eq!(t.lane_sum(), t.total);
     }
 
     #[test]
@@ -4148,11 +4575,11 @@ mod geometry_tests {
     #[test]
     fn レーン幅は可用幅を超えない() {
         for avail in [400.0_f32, 700.0, 900.0, 1200.0, 1600.0, 2400.0] {
-            for filled in 0..=8usize {
-                let counts: Vec<usize> = (0..8).map(|i| usize::from(i < filled)).collect();
+            for filled in 0..=LANES {
+                let counts: Vec<usize> = (0..LANES).map(|i| usize::from(i < filled)).collect();
                 let w = lane_widths(avail, &counts);
-                assert_eq!(w.len(), 8);
-                let total: f32 = w.iter().sum::<f32>() + space::SM * 7.0;
+                assert_eq!(w.len(), LANES);
+                let total: f32 = w.iter().sum::<f32>() + space::SM * (LANES as f32 - 1.0);
                 // 中身のあるレーンが下限に張り付くほど狭いときだけ横スクロールへ逃がす
                 let at_min = w
                     .iter()
@@ -4175,29 +4602,29 @@ mod geometry_tests {
         }
     }
 
-    /// 1 体だけ動いている 1400x900: 空 7 本を畳めば全 8 レーンが 1 画面に入る。
+    /// 1 体だけ動いている 1400x900: 空レーンを畳めば全レーンが 1 画面に入る。
     #[test]
     fn 一体だけでも全レーンが一画面に入る() {
-        let mut counts = [0usize; 8];
-        counts[3] = 1;
+        let mut counts = [0usize; LANES];
+        counts[1] = 1;
         let w = lane_widths(1400.0, &counts);
-        let total: f32 = w.iter().sum::<f32>() + space::SM * 7.0;
+        let total: f32 = w.iter().sum::<f32>() + space::SM * (LANES as f32 - 1.0);
         assert!(total <= 1400.5, "総幅 {total}");
-        assert!(w[3] > LANE_MIN_W, "中身のあるレーンは広く取る: {}", w[3]);
+        assert!(w[1] > LANE_MIN_W, "中身のあるレーンは広く取る: {}", w[1]);
     }
 
-    /// **KPI タイル**: 総幅は可用幅を超えない (右端で「完了・終了」を切らない)。
+    /// **KPI タイル**: 総幅は可用幅を超えない (右端で「完了」を切らない)。
     #[test]
     fn KPIタイルは可用幅を超えない() {
         for avail in [280.0_f32, 400.0, 560.0, 900.0, 1400.0, 2400.0] {
-            let (cols, w) = kpi_grid(avail, 4);
-            assert!(cols >= 1 && cols <= 4);
+            let (cols, w) = kpi_grid(avail, LANES);
+            assert!((1..=LANES).contains(&cols));
             let total = w * cols as f32 + space::SM * (cols as f32 - 1.0);
             assert!(total <= avail + 0.5, "avail={avail}: 総幅 {total}");
         }
         // 狭ければ折る / 広ければ 1 段
-        assert_eq!(kpi_grid(1400.0, 4).0, 4);
-        assert!(kpi_grid(400.0, 4).0 < 4);
+        assert_eq!(kpi_grid(1400.0, LANES).0, LANES);
+        assert!(kpi_grid(400.0, LANES).0 < LANES);
     }
 
     /// ブロードキャスト欄は残り幅から取り、入らなければ出さない。
@@ -4227,23 +4654,111 @@ mod geometry_tests {
 
     /// 900x700 の窓: 端末を開いても看板は縦モードへ落ちて全レーンが読める。
     ///
-    /// ここが横のままだと、看板の取り分が ~540px しか無く 8 レーンが並ばない
-    /// (スクリーンショットの「承認が半分隠れ、完了・終了が画面外」)。
+    /// ここが横のままだと、看板の取り分が ~540px しか無くレーンが並ばない
+    /// (スクリーンショットの「承認が半分隠れ、完了が画面外」)。
     #[test]
     fn 九百七百の窓では起動しても看板が読める() {
         let s = 0.38_f32;
-        // 閉じていれば横のまま (空レーンを畳めば 900px に 8 本入る)
+        // 閉じていれば横のまま (4 本なら 900px に余裕で入る)
         assert!(!use_vertical(LayoutMode::Auto, 900.0, 700.0, false, s));
-        let mut counts = [0usize; 8];
-        counts[3] = 1;
+        let mut counts = [0usize; LANES];
+        counts[1] = 1;
         let w = lane_widths(900.0, &counts);
-        let total: f32 = w.iter().sum::<f32>() + space::SM * 7.0;
-        assert!(total <= 900.5, "900px に 8 レーンが入らない: {total}");
-        // 開いたら縦へ落ちる
+        let total: f32 = w.iter().sum::<f32>() + space::SM * (LANES as f32 - 1.0);
+        assert!(total <= 900.5, "900px に {LANES} レーンが入らない: {total}");
+        // 開いたら縦へ落ちる (看板の取り分が BOARD_MIN_W を割る)
         assert!(use_vertical(LayoutMode::Auto, 900.0, 700.0, true, s));
         let area = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0));
         let r = main_rects(area, true, true, s);
         assert_eq!(r.board.width(), area.width(), "縦モードの看板は全幅");
         assert!(r.board.height() > 0.0 && r.live.expect("開いている").height() > 0.0);
+    }
+
+    /// **4 レーンの幾何**: どの窓幅でも全レーンが領域内に収まり、重ならない。
+    /// 900x700 を含む代表的な窓で、レーンの矩形を実際に積んで確かめる。
+    #[test]
+    fn 全レーンの矩形は領域内に収まり重ならない() {
+        // 中身の入り方をいろいろ変える (空レーンの畳みが効いているか)
+        let patterns: &[[usize; LANES]] = &[
+            [0, 0, 0, 0],
+            [1, 0, 0, 0],
+            [0, 3, 0, 0],
+            [0, 0, 1, 0],
+            [2, 5, 1, 3],
+            [9, 9, 9, 9],
+        ];
+        for area in areas() {
+            let r = main_rects(area, false, false, 0.38);
+            let avail = r.board.width();
+            for counts in patterns {
+                let w = lane_widths(avail, counts);
+                assert_eq!(w.len(), LANES);
+                // 空レーンは帯だけ / 中身のあるレーンは読める幅
+                for (x, c) in w.iter().zip(counts) {
+                    assert!(*x > 0.0);
+                    if *c == 0 {
+                        assert!(*x <= LANE_EMPTY_W + 0.01, "空レーンが畳まれていない: {x}");
+                    }
+                }
+                // 左から順に積んだ矩形が重ならず、板の中に収まる
+                let mut x = r.board.left();
+                let mut rects: Vec<Rect> = Vec::with_capacity(LANES);
+                for lw in &w {
+                    rects.push(Rect::from_min_size(
+                        egui::pos2(x, r.board.top()),
+                        egui::vec2(*lw, r.board.height()),
+                    ));
+                    x += lw + space::SM;
+                }
+                for i in 0..rects.len() {
+                    assert!(
+                        rects[i].top() >= area.top() - 0.01
+                            && rects[i].bottom() <= area.bottom() + 0.01,
+                        "area={area:?}: レーン {i} が縦に溢れた"
+                    );
+                    for j in (i + 1)..rects.len() {
+                        assert!(!overlaps(rects[i], rects[j]), "レーン {i} と {j} が重なった");
+                    }
+                }
+                // 中身のあるレーンが下限に張り付いていなければ、右端も板の中
+                let at_min = w
+                    .iter()
+                    .zip(counts)
+                    .any(|(x, c)| *c > 0 && (*x - LANE_MIN_W).abs() < 0.01);
+                if !at_min {
+                    let right = rects.last().expect("LANES > 0").right();
+                    assert!(
+                        right <= r.board.right() + 0.5,
+                        "area={area:?} counts={counts:?}: 右端 {right} が板 {} を越えた",
+                        r.board.right()
+                    );
+                }
+            }
+        }
+    }
+
+    /// 横モードの敷居は**本数から導く** — 4 本になったぶん狭い窓でも横で読める。
+    #[test]
+    fn 横モードの敷居はレーン本数から導く() {
+        assert!(
+            (BOARD_MIN_W - (LANE_MIN_W * LANES as f32 + space::SM * (LANES as f32 - 1.0))).abs()
+                < 0.01
+        );
+        // 敷居ちょうどの幅に LANES 本が下限幅で並ぶ
+        let counts = vec![1usize; LANES];
+        let w = lane_widths(BOARD_MIN_W, &counts);
+        for x in &w {
+            assert!(*x >= LANE_MIN_W - 0.01, "敷居幅で下限を割った: {x}");
+        }
+        // 8 本時代の 900px を割る窓でも、いまは横で読める
+        assert!(!use_vertical(LayoutMode::Auto, 800.0, 500.0, false, 0.38));
+        // それより狭ければ縦へ落とす
+        assert!(use_vertical(
+            LayoutMode::Auto,
+            BOARD_MIN_W - 1.0,
+            400.0,
+            false,
+            0.38
+        ));
     }
 }

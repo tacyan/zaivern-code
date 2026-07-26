@@ -19,12 +19,19 @@
 "レート制限" = "rate limited"
 "起動中" = "starting"
 
-# ── 列見出しのホバー説明 ──
+# ── 列見出しのホバー説明 (4 レーン: 待機 / 作業中 / 要対応 / 完了) ──
 "手が空いています — 指示を送るとすぐ動きます" = "Idle and ready — send an instruction and it starts right away"
 "いま出力が動いています" = "Actively producing output"
+"動いています (思考・編集・実行・検証)。細かい中身はカードの 1 行に出ます" = "Working (thinking, editing, running, verifying). The fine-grained detail shows on the card"
+"あなたの手が要ります — 承認待ち・レート制限・停滞/異常。ここを空にするのが仕事です" = "Needs you — approval, rate limit, or a stall/error. Keeping this lane empty is the job"
 "あなたの承認・入力を待って止まっています" = "Paused, waiting for your approval or input"
 "停滞・ループ・エラー多発・レート制限 — 様子を見てあげてください" = "Stalled, looping, error bursts, or rate limited — needs a look"
 "タスク完了、またはプロセスが終了しています" = "Task finished, or the process has exited"
+
+# ── 判定の根拠 (要対応レーンに入れた信号を必ず言えるようにする) ──
+"要対応の理由: {why}" = "Why it needs you: {why}"
+"{act} — 出どころ: {src}" = "{act} — signal: {src}"
+"{act} — 出どころ: {src} / {detail}" = "{act} — signal: {src} / {detail}"
 
 # ── カードの操作 ──
 "✅ 承認" = "✅ Approve"
