@@ -1550,6 +1550,12 @@ impl Session {
     /// `taskkill /T` が根を見つけられず木を辿れなくなり、**孫だけが取り残される**。
     /// 木を落としてから、取りこぼしの保険として根を撃つ。
     pub fn kill(&mut self) {
+        // 終了済みなら何もしない。wait 済みの child_pid は OS に返却されており、
+        // 無関係なプロセス (グループ) に再利用され得る — そこへ kill -KILL /
+        // taskkill /T /F を撃つとユーザーの別ジョブを巻き添えにする。
+        if self.exited.load(Ordering::SeqCst) {
+            return;
+        }
         let pid = self.child_pid;
         let mut killer = self.killer.clone_killer();
         std::thread::spawn(move || {
@@ -1767,10 +1773,17 @@ fn kill_tree_blocking(pid: Option<u32>) -> bool {
 pub fn reap(session: Session) {
     std::thread::spawn(move || {
         let mut session = session;
-        // 木が先。根を先に落とすと taskkill が木を辿れず孫が残る
-        // ([`Session::kill`] の説明を参照)。
-        kill_tree_blocking(session.child_pid);
-        let _ = session.killer.kill();
+        // 既に終了したセッション (「終了しました」のタブを ✕ で閉じる等) には
+        // kill を撃たない。child_pid は wait 済みで OS に返却されており、
+        // 長時間稼働中なら**無関係なプロセス (グループ) に再利用され得る** —
+        // そこへ kill -KILL / taskkill /T /F を撃つとユーザーの別ジョブを
+        // 巻き添えにする。
+        if !session.exited.load(Ordering::SeqCst) {
+            // 木が先。根を先に落とすと taskkill が木を辿れず孫が残る
+            // ([`Session::kill`] の説明を参照)。
+            kill_tree_blocking(session.child_pid);
+            let _ = session.killer.kill();
+        }
         // ここでようやく ConPTY を閉じる (この時点なら待たされない)。
         drop(session);
     });
@@ -1785,15 +1798,19 @@ pub fn reap(session: Session) {
 /// 終了処理そのものが止まり、ウィンドウが閉じないまま残る)。
 pub fn abandon(session: Session) {
     let mut session = session;
-    // `/T /F` は根ごと落とすので、これ 1 本でよい。待たない — この子プロセスは
-    // 自分より長生きしてよいし、根を先に撃つと木を辿れなくなる
-    // ([`Session::kill`] の説明を参照)。
-    let started = session
-        .child_pid
-        .is_some_and(|pid| kill_tree_command(pid).spawn().is_ok());
-    if !started {
-        // taskkill / kill を起こせなかったときの保険。
-        let _ = session.killer.kill();
+    // 終了済みセッションには撃たない (reap と同じ理由: wait 済みの PID は
+    // 無関係なプロセスに再利用され得る)。
+    if !session.exited.load(Ordering::SeqCst) {
+        // `/T /F` は根ごと落とすので、これ 1 本でよい。待たない — この子プロセスは
+        // 自分より長生きしてよいし、根を先に撃つと木を辿れなくなる
+        // ([`Session::kill`] の説明を参照)。
+        let started = session
+            .child_pid
+            .is_some_and(|pid| kill_tree_command(pid).spawn().is_ok());
+        if !started {
+            // taskkill / kill を起こせなかったときの保険。
+            let _ = session.killer.kill();
+        }
     }
     std::mem::forget(session);
 }
