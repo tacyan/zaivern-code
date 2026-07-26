@@ -7599,6 +7599,10 @@ impl ZaivernApp {
     fn kanban_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let theme = self.theme.clone();
         let active = self.agents.active;
+        // PTY 画面の読み直し (parser のロック) は看板が「今」と言ったフレームだけ。
+        // 看板を開けっぱなしでもアイドル時のコストがゼロに近くなる。
+        let now_ms = self.supervisor.elapsed_ms();
+        let fresh_tail = self.kanban_state.sample_due(now_ms);
         let cards: Vec<kanban::Card> = self
             .agents
             .sessions
@@ -7633,14 +7637,21 @@ impl ZaivernApp {
                     rate_limited: s.rate_limited.clone(),
                     attention: s.attention && running,
                     running,
+                    sup,
                     permission_badge: if s.is_permission_agent() {
                         s.approval_badge()
                     } else {
                         ""
                     },
                     can_cycle: s.permission_switch_hint().is_some(),
-                    // カードの一言 + ホバープレビュー: 画面末尾の意味のある行を数行
-                    tail_lines: s.screen_tail_lines(8, 220),
+                    // カードの一言 + ホバープレビュー + アクティビティ分類の材料。
+                    // サンプリング周期のフレームだけ実際に PTY を読む
+                    // (それ以外は空 = kanban 側が前回ぶんを使い回す)。
+                    tail_lines: if fresh_tail {
+                        s.screen_tail_lines(10, 180)
+                    } else {
+                        Vec::new()
+                    },
                     task,
                 }
             })
@@ -7653,7 +7664,6 @@ impl ZaivernApp {
             .collect();
 
         // アクティビティフィード: supervisor の状態遷移履歴を新しい順に混ぜる
-        let now_ms = self.supervisor.elapsed_ms();
         let mut activity: Vec<kanban::ActivityEntry> = Vec::new();
         for s in &self.agents.sessions {
             let icon = if s.icon.is_empty() { "👾".to_string() } else { s.icon.clone() };
@@ -7675,14 +7685,41 @@ impl ZaivernApp {
         activity.sort_by_key(|e| e.age_ms);
         activity.truncate(60);
 
+        // ライブペイン: 端末描画は Cockpit と同じ道 (`terminal::draw`) をそのまま使う。
+        // 看板側は矩形を用意して呼ぶだけ — 端末を再実装しない。
+        // 借用は分けて取る (kanban_state と agents.sessions は別フィールド)。
+        let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
+        let dead: std::collections::HashSet<u64> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| self.frame_guard.is_quarantined(&Subview::Session(*id)))
+            .collect();
+        let kanban_state = &mut self.kanban_state;
+        let sessions = &mut self.agents.sessions;
+        let live_theme = theme.clone();
+        let mut live = |ui: &mut egui::Ui, idx: usize| -> Option<egui::Response> {
+            let s = sessions.get_mut(idx)?;
+            let sid = s.id;
+            if dead.contains(&sid) {
+                return None;
+            }
+            // 1 枚が壊れてもフレーム全体を捨てないための印 (Cockpit と同じ)
+            Some(draw_subview(Subview::Session(sid), || {
+                terminal::draw(ui, s, &live_theme, mini_font, true, true, false)
+            }))
+        };
         let acts = kanban::ui(
-            &mut self.kanban_state,
+            kanban_state,
             ui,
             &theme,
             &cards,
             &presets,
             &activity,
             now_ms,
+            fresh_tail,
+            &mut live,
         );
 
         for act in acts {

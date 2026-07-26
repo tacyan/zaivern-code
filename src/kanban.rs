@@ -2,19 +2,42 @@
 //! ターミナルパネル右端の「📋 看板」タブから、パネル内のビューとして開く。
 //!
 //! ダッシュボード構成 (Autonomous Ops Console):
-//! - ヘッダー: 稼働数チップ + 連続稼働時間 + ブロードキャスト
+//! - ヘッダー: 稼働数チップ + 連続稼働時間 + ブロードキャスト + レイアウト切替
 //! - KPI タイル: 稼働中 / 作業中 / 要対応 / 完了 (ミニスパークライン付き)
 //! - 左レール: エージェント一覧 — アバター + 状態 + 「いま何をしているか」一言
-//! - 中央: 状態カラム (待機 / 作業中 / 承認待ち / 停滞・異常 / 完了) の看板。
-//!   カードは supervisor の判定が変われば勝手に列を移動する — ドラッグ不要。
-//!   各カードに割り当てタスクと画面末尾の一言 (ライブ) を出し、
-//!   ホバーで末尾数行のライブプレビューを見せる。
+//! - 中央: 8 レーン (待機/思考中/編集中/実行中/検証中/承認待ち/停滞・異常/完了)。
+//!   カードは [`classify`] の判定が変われば勝手にレーンを移動する — ドラッグ不要。
+//!   着地したカードは短時間ハイライトするので、目で追える。
 //! - 右レール: アクティビティフィード (状態遷移の実況、LIVE)
+//! - ライブペイン: 選択中カードの**本物の端末**を横 (or 縦モードでは下) に出す。
+//!   端末描画は再実装せず、app.rs が渡すクロージャ (中身は `terminal::draw`) を呼ぶ。
 //! - 下部: 処理スループットの折れ線 (作業中エージェント数の推移)
+//!
+//! ## レイアウト
+//! 横モード (広い窓) = レーンを横に並べる。縦モード (細く高い窓) = レーンを縦に積み、
+//! カードは全幅。`LayoutMode::Auto` なら [`use_vertical`] が窓の縦横比で選ぶ。
+//! 選択は egui の永続メモリに持つ (config.rs は他所有のため触らない)。
+//!
+//! ## 状態の出どころ (重要)
+//! 画面のテキストを読んだだけの推定を「事実」として扱わない。
+//! [`classify`] は強い信号から順に見て、必ず出どころ ([`Source`]) を添えて返す:
+//! プロセス生死 → 承認プロンプト検出 (terminal.rs) → レート制限検出 (terminal.rs)
+//! → 見張りの状態判定 (supervisor.rs) → 最後の手段として画面末尾の表引き。
+//! 画面推定のときだけ UI に「推定」と出す。
+//!
+//! ## 負荷
+//! アイドル時にコストを払わない設計:
+//! - PTY 画面の読み直し (`screen_tail_lines`) は [`KanbanState::sample_due`] が
+//!   真を返したフレームだけ。動いている間 ~6.7Hz、静かなら 1Hz。
+//! - 再描画要求も無条件ではなく [`KanbanState::next_repaint_ms`] が決める
+//!   (着地アニメ中 33ms / 稼働中 150ms / 静か 1s / 全員終了 2s)。
+//! - 新しい出力が来たときは terminal.rs の読取スレッドが `request_repaint` する。
 //!
 //! 作法は orchestration.rs と同じ: 判断と描画はこのモジュール、
 //! 副作用 (PTY への書き込み・起動・再起動…) は `KanbanAction` で app.rs へ返す。
 //! ここでは Session を直接借りない (app.rs が `Card` へ写して渡す)。
+
+use std::collections::HashMap;
 
 use eframe::egui::{self, Color32, Pos2, RichText, Stroke};
 
@@ -26,13 +49,22 @@ use crate::theme::Theme;
 // 列 (状態から一意に決まる)
 // ---------------------------------------------------------------------------
 
-/// カンバンの列。セッションの状態から [`column_for`] で一意に決まる。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// カンバンのレーン。カードは [`classify`] の判定に従って自動で移動する。
+///
+/// 粒度を細かくするほどカードはよく動き、「いま何をしているか」が一目で分かる。
+/// 動きすぎるとちらつくので、移動には [`Column::hold_ms`] のヒステリシスを掛ける。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Column {
     /// 手が空いている (指示を受けられる)
     Ready,
-    /// 出力が動いている
-    Working,
+    /// 考えている・調べている (出力は動くが編集も実行もしていない)
+    Thinking,
+    /// ファイルを書き換えている
+    Editing,
+    /// コマンドを走らせている
+    Running,
+    /// テスト・ビルド・lint を回している
+    Verifying,
     /// ユーザーの承認/入力待ちで止まっている
     Approval,
     /// 停滞・ループ・エラー多発・レート制限
@@ -41,24 +73,50 @@ pub enum Column {
     Done,
 }
 
-/// 表示順 (左 → 右)。
-pub const COLUMNS: [Column; 5] = [
+/// 表示順 (横モードでは左 → 右、縦モードでは上 → 下)。
+pub const COLUMNS: [Column; 8] = [
     Column::Ready,
-    Column::Working,
+    Column::Thinking,
+    Column::Editing,
+    Column::Running,
+    Column::Verifying,
     Column::Approval,
     Column::Trouble,
     Column::Done,
 ];
+
+/// レーン移動のヒステリシス既定値 (ms)。この時間だけ同じ判定が続かないと動かない。
+const LANE_HOLD_MS: u64 = 400;
+
+/// 「新しいレーンへ着地した」ハイライトの寿命 (ms)。
+const LAND_HIGHLIGHT_MS: u64 = 900;
 
 impl Column {
     /// 列見出し (tr のキーになる日本語原文)。
     pub fn title(self) -> &'static str {
         match self {
             Column::Ready => "待機",
-            Column::Working => "作業中",
+            Column::Thinking => "思考中",
+            Column::Editing => "編集中",
+            Column::Running => "実行中",
+            Column::Verifying => "検証中",
             Column::Approval => "承認待ち",
             Column::Trouble => "停滞・異常",
             Column::Done => "完了・終了",
+        }
+    }
+
+    /// 列見出しの絵文字 (縦モードのレーン帯でも使う)。
+    pub fn icon(self) -> &'static str {
+        match self {
+            Column::Ready => "💤",
+            Column::Thinking => "🧠",
+            Column::Editing => "✎",
+            Column::Running => "▶",
+            Column::Verifying => "🧪",
+            Column::Approval => "⏸",
+            Column::Trouble => "⚠",
+            Column::Done => "✔",
         }
     }
 
@@ -66,7 +124,10 @@ impl Column {
     fn hint(self) -> &'static str {
         match self {
             Column::Ready => "手が空いています — 指示を送るとすぐ動きます",
-            Column::Working => "いま出力が動いています",
+            Column::Thinking => "考えている・調べている (編集も実行もしていない)",
+            Column::Editing => "ファイルを書き換えています",
+            Column::Running => "コマンドを走らせています",
+            Column::Verifying => "テスト・ビルド・lint を回しています",
             Column::Approval => "あなたの承認・入力を待って止まっています",
             Column::Trouble => "停滞・ループ・エラー多発・レート制限 — 様子を見てあげてください",
             Column::Done => "タスク完了、またはプロセスが終了しています",
@@ -74,14 +135,448 @@ impl Column {
     }
 
     /// 列のアクセント色。カードの状態ドット・チップも同じ色を使う。
+    /// 色はすべて theme.rs 由来 (リテラルを書かない)。
     fn color(self, th: &Theme) -> Color32 {
         match self {
-            Column::Ready => th.accent,
-            Column::Working => th.ok,
+            Column::Ready => th.accent_soft,
+            // ansi の明色は 8..16。テーマごとに定義されているのでここでも安全に使える。
+            Column::Thinking => th.ansi[13],
+            Column::Editing => th.accent,
+            Column::Running => th.ok,
+            Column::Verifying => th.ansi[14],
             Column::Approval => th.warn,
             Column::Trouble => th.err,
             Column::Done => th.text_dim,
         }
+    }
+
+    /// このレーンへ移るまでに判定が続く必要のある時間 (ms)。
+    ///
+    /// 「承認待ち・異常・終了」は人がすぐ気づくべき強い信号なので待たせない。
+    /// それ以外 (思考↔編集↔実行↔検証) は往復しやすいのでヒステリシスを掛ける。
+    pub fn hold_ms(self) -> u64 {
+        match self {
+            Column::Approval | Column::Trouble | Column::Done => 0,
+            _ => LANE_HOLD_MS,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// アクティビティ分類 — 「いま何をしているか」と、その**出どころ**
+// ---------------------------------------------------------------------------
+
+/// カードの現在の作業内容。レーンより細かい (`Trouble` レーンは 2 種類を束ねる)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Activity {
+    /// 起動直後でまだ一度も観測できていない
+    Starting,
+    /// 生きているが動いていない
+    Idle,
+    /// 考えている・読んでいる・調べている
+    Thinking,
+    /// ファイルを編集している
+    Editing,
+    /// コマンドを実行している
+    Running,
+    /// テスト・ビルド・lint
+    Verifying,
+    /// 承認/入力待ち
+    Approval,
+    /// レート制限・使用上限
+    RateLimited,
+    /// 停滞・ループ・エラー・クラッシュ
+    Stalled,
+    /// 終了
+    Exited,
+}
+
+impl Activity {
+    /// カードに出すラベル (tr のキーになる日本語原文)。
+    pub fn label(self) -> &'static str {
+        match self {
+            Activity::Starting => "起動中",
+            Activity::Idle => "待機",
+            Activity::Thinking => "思考中",
+            Activity::Editing => "編集中",
+            Activity::Running => "実行中",
+            Activity::Verifying => "検証中",
+            Activity::Approval => "承認待ち",
+            Activity::RateLimited => "レート制限中",
+            Activity::Stalled => "停滞・異常",
+            Activity::Exited => "終了",
+        }
+    }
+
+    /// このアクティビティが属するレーン。
+    pub fn column(self) -> Column {
+        match self {
+            Activity::Starting | Activity::Idle => Column::Ready,
+            Activity::Thinking => Column::Thinking,
+            Activity::Editing => Column::Editing,
+            Activity::Running => Column::Running,
+            Activity::Verifying => Column::Verifying,
+            Activity::Approval => Column::Approval,
+            Activity::RateLimited | Activity::Stalled => Column::Trouble,
+            Activity::Exited => Column::Done,
+        }
+    }
+
+    /// 「出力が動いているはず」= 速いサンプリングを回す価値があるか。
+    pub fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Activity::Thinking | Activity::Editing | Activity::Running | Activity::Verifying
+        )
+    }
+}
+
+/// 判定の**出どころ**。画面推定を事実として扱わないために必ず持ち回る。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    /// プロセスの生死 (最強)
+    Process,
+    /// terminal.rs の承認プロンプト検出
+    Prompt,
+    /// terminal.rs のレート制限検出
+    RateLimit,
+    /// supervisor.rs の状態判定 (ハッシュ列の時系列)
+    Supervisor,
+    /// 画面末尾テキストの表引き (**推定**)
+    Screen,
+}
+
+impl Source {
+    /// UI に出す短い名前 (tr のキー)。
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Process => "プロセス",
+            Source::Prompt => "プロンプト検出",
+            Source::RateLimit => "上限検出",
+            Source::Supervisor => "見張り",
+            Source::Screen => "画面推定",
+        }
+    }
+
+    /// 画面テキストからの推定か (UI で「推定」と断るために使う)。
+    pub fn is_guess(self) -> bool {
+        matches!(self, Source::Screen)
+    }
+}
+
+/// [`classify`] の結果。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Read {
+    pub activity: Activity,
+    pub source: Source,
+    /// 補足 (編集中のファイル・実行中のコマンド・異常の理由など)。無ければ空。
+    pub detail: String,
+}
+
+/// 画面テキストから拾う補足の種類。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pick {
+    /// 補足を拾わない
+    Nothing,
+    /// ファイルパスらしいトークン
+    Path,
+    /// コマンドらしい文字列 (括弧の中 → 無ければ語の後ろ)
+    Command,
+}
+
+/// 画面末尾テキストを分類する 1 行の規則。
+pub struct ScreenRule {
+    pub activity: Activity,
+    /// 小文字化した行にこのいずれかが**語として**現れればマッチ
+    pub needles: &'static [&'static str],
+    pub pick: Pick,
+}
+
+/// ベンダー CLI の出力 → アクティビティの表。**ここだけ直せば追随できる**。
+///
+/// 上から順に試し、最初に当たった規則を採る。順序に意味がある:
+/// - 編集が最優先 — `Writing tests/mod.rs` は「テストを書いている」であって
+///   「テストを回している」ではない。パス中の語に引っ張られないようにする。
+/// - 次に検証 — `Bash(cargo test)` は実行でもあるが、人が知りたいのは「検証中」。
+/// - 最後に実行 → 思考。
+///
+/// 語の一致は境界付き ([`contains_word`]) なので "latest" が "test" に当たらない。
+/// 日本語 CLI 出力・ANSI 装飾付きの行もそのまま食わせてよい
+/// ([`classify_screen`] が前処理する)。
+pub const SCREEN_RULES: &[ScreenRule] = &[
+    ScreenRule {
+        activity: Activity::Editing,
+        needles: &[
+            "edit",
+            "editing",
+            "multiedit",
+            "notebookedit",
+            "str_replace",
+            "write",
+            "writing",
+            "update",
+            "updating",
+            "patch",
+            "apply_patch",
+            "applying",
+            "編集",
+            "書き込み",
+            "書き換え",
+            "作成中",
+        ],
+        pick: Pick::Path,
+    },
+    ScreenRule {
+        activity: Activity::Verifying,
+        needles: &[
+            "test",
+            "tests",
+            "pytest",
+            "jest",
+            "lint",
+            "clippy",
+            "typecheck",
+            "type-check",
+            "tsc",
+            "compiling",
+            "building",
+            "build",
+            "テスト",
+            "検証",
+            "ビルド",
+            "コンパイル",
+        ],
+        pick: Pick::Command,
+    },
+    ScreenRule {
+        activity: Activity::Running,
+        needles: &[
+            "bash",
+            "shell",
+            "run",
+            "running",
+            "exec",
+            "executing",
+            "run_command",
+            "実行中",
+            "コマンド実行",
+            "起動中",
+        ],
+        pick: Pick::Command,
+    },
+    ScreenRule {
+        activity: Activity::Thinking,
+        needles: &[
+            "thinking",
+            "pondering",
+            "planning",
+            "analyzing",
+            "reading",
+            "read",
+            "search",
+            "searching",
+            "grep",
+            "glob",
+            "fetch",
+            "esc to interrupt",
+            "思考",
+            "考え中",
+            "分析中",
+            "調査中",
+            "検索中",
+            "読み込み",
+            "計画",
+        ],
+        pick: Pick::Nothing,
+    },
+];
+
+/// `needle` が `hay` に**語として**含まれるか (前後が ASCII 英数字でない)。
+///
+/// 単純な `contains` だと "latest" が "test" に当たってしまう。日本語の語は
+/// 前後が ASCII 英数字になりにくいので、この境界判定でそのまま扱える。
+pub fn contains_word(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = hay.as_bytes();
+    let nb = needle.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(needle) {
+        let at = from + rel;
+        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+        let end = at + nb.len();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        // 次の候補へ (UTF-8 境界は find が保証する開始位置 + 1 バイトずつ進める)
+        from = at + 1;
+        while from < hay.len() && !hay.is_char_boundary(from) {
+            from += 1;
+        }
+        if from >= hay.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// トークンがファイルパスらしいか。拡張子の一覧は持たない (OS 非依存)。
+pub fn looks_like_path(tok: &str) -> bool {
+    let t = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.' && c != '_' && c != '-');
+    if t.len() < 3 || t.contains(char::is_whitespace) {
+        return false;
+    }
+    if !t.chars().any(char::is_alphanumeric) {
+        return false;
+    }
+    if t.contains('/') || t.contains('\\') {
+        return true;
+    }
+    // "foo.rs" 形式: 最後の '.' の前後に中身があり、拡張子が短い英数字
+    match t.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 8
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// 行から「コマンドらしい文字列」を拾う。括弧の中を最優先。
+pub fn pick_command(line: &str) -> String {
+    if let Some(open) = line.find('(') {
+        if let Some(close) = line[open + 1..].find(')') {
+            let inner = line[open + 1..open + 1 + close].trim();
+            if !inner.is_empty() {
+                return inner.to_string();
+            }
+        }
+    }
+    // 括弧が無ければ「見出し: 本体」形式を試し、それも無ければ装飾を落とした行
+    let body = line
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && !is_cjk(c))
+        .trim();
+    for sep in [": ", "：", ":"] {
+        if let Some((_, rest)) = body.split_once(sep) {
+            let rest = rest.trim();
+            // Windows パスの "C:\\..." のような切れ方は捨てる
+            if !rest.is_empty() && !rest.starts_with('\\') {
+                return rest.to_string();
+            }
+        }
+    }
+    body.to_string()
+}
+
+/// 行から「ファイルパスらしいトークン」を拾う。見つからなければコマンド扱い。
+pub fn pick_path(line: &str) -> String {
+    let inner = pick_command(line);
+    for tok in inner.split_whitespace() {
+        let t = tok.trim_matches(|c: char| "\"'`,;:()[]{}".contains(c));
+        if looks_like_path(t) {
+            return t.to_string();
+        }
+    }
+    for tok in line.split_whitespace() {
+        let t = tok.trim_matches(|c: char| "\"'`,;:()[]{}".contains(c));
+        if looks_like_path(t) {
+            return t.to_string();
+        }
+    }
+    inner
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xff00..=0xffef)
+}
+
+/// 表示用に 1 行を整える: ANSI を落とし、行頭の飾り (`⏺ · │ ● ✱` 等) を削る。
+pub fn clean_line(line: &str) -> String {
+    let no_ansi = supervisor::strip_ansi(line);
+    no_ansi
+        .trim()
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && !is_cjk(c) && c != '/' && c != '.')
+        .trim()
+        .to_string()
+}
+
+/// 画面末尾テキストの表引き (**純関数**)。新しい行から順に見て最初に当たった規則を返す。
+///
+/// これは推定であって事実ではない。呼び出し側は必ず [`Source::Screen`] を添えること。
+pub fn classify_screen(tail: &[String]) -> Option<(Activity, String)> {
+    for raw in tail.iter().rev() {
+        let line = clean_line(raw);
+        if line.is_empty() {
+            continue;
+        }
+        let low = line.to_lowercase();
+        for rule in SCREEN_RULES {
+            if rule.needles.iter().any(|n| contains_word(&low, n)) {
+                let detail = match rule.pick {
+                    Pick::Nothing => String::new(),
+                    Pick::Path => pick_path(&line),
+                    Pick::Command => pick_command(&line),
+                };
+                return Some((rule.activity, detail));
+            }
+        }
+    }
+    None
+}
+
+/// セッションの各種信号から「いま何をしているか」を決める **純関数**。
+///
+/// 強い信号から順に見る (弱い推定に上書きさせない):
+/// 1. プロセス生死 — `running == false` なら他を見ずに終了
+/// 2. 承認プロンプト検出 (terminal.rs `scan_attention`)
+/// 3. レート制限検出 (terminal.rs `detect_rate_limit`)
+/// 4. supervisor の異常判定 (停滞・ループ・エラー・クラッシュ)
+/// 5. supervisor が「動いていない」と言うなら待機 (画面の残骸に釣られない)
+/// 6. supervisor が「動いている」と言うときだけ、画面末尾で中身を推定
+pub fn classify(
+    running: bool,
+    attention: bool,
+    rate_limited: bool,
+    sup: Option<supervisor::SessionState>,
+    tail: &[String],
+) -> Read {
+    use supervisor::SessionState as S;
+    let read = |activity, source, detail: String| Read {
+        activity,
+        source,
+        detail,
+    };
+    if !running {
+        return read(Activity::Exited, Source::Process, String::new());
+    }
+    if attention {
+        let d = now_line(tail).map(clean_line).unwrap_or_default();
+        return read(Activity::Approval, Source::Prompt, d);
+    }
+    if rate_limited {
+        return read(Activity::RateLimited, Source::RateLimit, String::new());
+    }
+    match sup {
+        Some(S::WaitingApproval) => read(Activity::Approval, Source::Supervisor, String::new()),
+        Some(S::Stalled) | Some(S::Looping) | Some(S::Errored) | Some(S::Crashed) => {
+            let s = sup.expect("matched Some");
+            read(Activity::Stalled, Source::Supervisor, tr(s.label()))
+        }
+        Some(S::Done) => read(Activity::Exited, Source::Supervisor, String::new()),
+        // 「生きているが動いていない」— 画面に残っている過去のコマンド行に
+        // 釣られて「実行中」と言わない。これが構造化信号を優先する意味。
+        Some(S::Idle) => read(Activity::Idle, Source::Supervisor, String::new()),
+        Some(S::Working) => match classify_screen(tail) {
+            Some((a, detail)) => read(a, Source::Screen, detail),
+            // 進捗はあるが中身が読めない → 「思考中」(見張り由来と明示)
+            None => read(Activity::Thinking, Source::Supervisor, String::new()),
+        },
+        // まだ一度も観測していない起動直後
+        None => read(Activity::Starting, Source::Process, String::new()),
     }
 }
 
@@ -90,56 +585,236 @@ impl Column {
 /// 優先順位は app.rs `coordinator_state` と同じ
 /// (終了 > 承認待ち > レート制限 > supervisor 判定)。順序を揃えておかないと、
 /// 看板の見た目と coordinator の配達判断が食い違って混乱する。
+/// 画面テキストを渡さない版なので、作業中は「思考中」レーンに落ちる。
 pub fn column_for(
     running: bool,
     attention: bool,
     rate_limited: bool,
     sup: Option<supervisor::SessionState>,
 ) -> Column {
-    use supervisor::SessionState as S;
-    if !running {
-        return Column::Done;
-    }
-    if attention {
-        return Column::Approval;
-    }
-    if rate_limited {
-        return Column::Trouble;
-    }
-    match sup {
-        Some(S::Working) => Column::Working,
-        Some(S::WaitingApproval) => Column::Approval,
-        Some(S::Idle) => Column::Ready,
-        Some(S::Stalled) | Some(S::Looping) | Some(S::Errored) | Some(S::Crashed) => {
-            Column::Trouble
-        }
-        Some(S::Done) => Column::Done,
-        // まだ一度も観測していない起動直後は待機扱い (すぐ Working へ動く)
-        None => Column::Ready,
-    }
+    classify(running, attention, rate_limited, sup, &[])
+        .activity
+        .column()
 }
 
-/// カードに出す状態ラベル (tr のキーになる日本語原文)。優先順位は [`column_for`] と同じ。
+/// カードに出す状態ラベル (tr のキーになる日本語原文)。優先順位は [`classify`] と同じ。
 pub fn state_label(
     running: bool,
     attention: bool,
     rate_limited: bool,
     sup: Option<supervisor::SessionState>,
 ) -> &'static str {
-    if !running {
-        return "終了";
+    classify(running, attention, rate_limited, sup, &[])
+        .activity
+        .label()
+}
+
+// ---------------------------------------------------------------------------
+// レーン移動ポリシー (デバウンス)
+// ---------------------------------------------------------------------------
+
+/// 1 枚のカードのレーン位置を、ちらつかせずに動かす状態機械。
+///
+/// - 判定が現在のレーンと同じなら何もしない (候補は取り下げ)
+/// - 違うレーンの判定が [`Column::hold_ms`] 以上続いたら初めて移動
+/// - 承認待ち・異常・終了は `hold_ms == 0` なので即座に動く
+#[derive(Clone, Copy, Debug)]
+pub struct LaneTracker {
+    lane: Column,
+    /// 候補レーンと、その候補が続き始めた時刻
+    pending: Option<(Column, u64)>,
+    /// 現在のレーンへ着地した時刻 (ハイライト用)
+    landed_ms: u64,
+}
+
+impl LaneTracker {
+    pub fn new(lane: Column, now_ms: u64) -> Self {
+        Self {
+            lane,
+            pending: None,
+            landed_ms: now_ms,
+        }
     }
-    if attention {
-        return "承認待ち";
+
+    pub fn lane(&self) -> Column {
+        self.lane
     }
-    if rate_limited {
-        return "レート制限";
+
+    /// 現在のレーンへ着地した時刻 (テスト・デバッグ用)。
+    #[allow(dead_code)]
+    pub fn landed_ms(&self) -> u64 {
+        self.landed_ms
     }
-    match sup {
-        Some(s) => s.label(),
-        None => "起動中",
+
+    /// 着地ハイライトの強さ (1.0 → 0.0)。0.0 なら描かなくてよい。
+    pub fn land_glow(&self, now_ms: u64) -> f32 {
+        let age = now_ms.saturating_sub(self.landed_ms);
+        if age >= LAND_HIGHLIGHT_MS {
+            return 0.0;
+        }
+        1.0 - age as f32 / LAND_HIGHLIGHT_MS as f32
+    }
+
+    /// 望ましいレーン `want` を与えて 1 ステップ進める。移動したら true。
+    pub fn step(&mut self, want: Column, now_ms: u64) -> bool {
+        if want == self.lane {
+            self.pending = None;
+            return false;
+        }
+        let hold = want.hold_ms();
+        match self.pending {
+            Some((c, since)) if c == want => {
+                if now_ms.saturating_sub(since) >= hold {
+                    self.lane = want;
+                    self.landed_ms = now_ms;
+                    self.pending = None;
+                    return true;
+                }
+            }
+            _ => {
+                if hold == 0 {
+                    self.lane = want;
+                    self.landed_ms = now_ms;
+                    self.pending = None;
+                    return true;
+                }
+                self.pending = Some((want, now_ms));
+            }
+        }
+        false
     }
 }
+
+// ---------------------------------------------------------------------------
+// 出力の勢い (スパークライン用の純粋な算術)
+// ---------------------------------------------------------------------------
+
+/// 前回サンプルに無かった行の文字数の合計 = このサンプルで「新しく出た量」。
+///
+/// 生バイト数は取れないので画面末尾の差分で代用する。スクロールしただけの行は
+/// `prev` に居るので数えない (スピナーだけが回っている間は 0 に近づく)。
+pub fn tail_delta(prev: &[String], cur: &[String]) -> u64 {
+    cur.iter()
+        .filter(|l| !prev.iter().any(|p| p == *l))
+        .map(|l| l.chars().count() as u64)
+        .sum()
+}
+
+/// `(時刻, 量)` の列を直近 `window_ms` の `n` バケツへ畳む (古い → 新しい)。
+///
+/// 窓の外の点は無視する。`n == 0` なら空。純粋な算術なので表テストできる。
+pub fn bucket_series(samples: &[(u64, u64)], now_ms: u64, window_ms: u64, n: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; n];
+    if n == 0 || window_ms == 0 {
+        return out;
+    }
+    let from = now_ms.saturating_sub(window_ms);
+    let span = window_ms as f64 / n as f64;
+    for (t, v) in samples {
+        if *t < from || *t > now_ms {
+            continue;
+        }
+        let idx = (((*t - from) as f64) / span) as usize;
+        let idx = idx.min(n - 1);
+        out[idx] += *v as f32;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// レイアウト (横 / 縦)
+// ---------------------------------------------------------------------------
+
+/// 看板の並べ方。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LayoutMode {
+    /// 窓の縦横比で自動 ([`use_vertical`])
+    #[default]
+    Auto,
+    /// レーンを横に並べる (従来)
+    Horizontal,
+    /// レーンを縦に積む (細く高い窓向け)
+    Vertical,
+}
+
+impl LayoutMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutMode::Auto => "自動",
+            LayoutMode::Horizontal => "横",
+            LayoutMode::Vertical => "縦",
+        }
+    }
+
+    /// 永続メモリ用の数値表現。
+    pub fn to_u8(self) -> u8 {
+        match self {
+            LayoutMode::Auto => 0,
+            LayoutMode::Horizontal => 1,
+            LayoutMode::Vertical => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => LayoutMode::Horizontal,
+            2 => LayoutMode::Vertical,
+            _ => LayoutMode::Auto,
+        }
+    }
+}
+
+/// 縦モードで描くべきか (**純関数**)。
+///
+/// 自動判定: 8 レーンを横に並べると 1 レーン ~150px 必要なので、
+/// 幅が足りない (< 900px) か、縦長 (高さが幅の 0.95 倍超) なら縦に積む。
+/// 縦モードはレーン帯 + 全幅カードなので、細長い窓でも 1 行に情報が収まる。
+pub fn use_vertical(mode: LayoutMode, w: f32, h: f32) -> bool {
+    match mode {
+        LayoutMode::Horizontal => false,
+        LayoutMode::Vertical => true,
+        LayoutMode::Auto => w < 900.0 || h > w * 0.95,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 選択 (セッション ID で持つ — カードが動いても消えない)
+// ---------------------------------------------------------------------------
+
+/// 選択中の ID をカード一覧に照らして解決する **純関数**。
+///
+/// - ID がまだ居れば、その ID と現在位置を返す
+/// - 居なくなったら、消える前に居た位置 (`last_pos`) の近くへ寄せる
+/// - カードが 1 枚も無ければ None
+pub fn resolve_selection(sel: Option<u64>, last_pos: usize, cards: &[Card]) -> Option<(u64, usize)> {
+    if cards.is_empty() {
+        return None;
+    }
+    if let Some(id) = sel {
+        if let Some(pos) = cards.iter().position(|c| c.id == id) {
+            return Some((id, pos));
+        }
+    }
+    let pos = last_pos.min(cards.len() - 1);
+    Some((cards[pos].id, pos))
+}
+
+/// 上下キーで選択を動かす **純関数**。`order` は画面上の並び (レーン順)。
+pub fn move_selection(order: &[u64], cur: Option<u64>, delta: i32) -> Option<u64> {
+    if order.is_empty() {
+        return None;
+    }
+    let at = cur
+        .and_then(|id| order.iter().position(|x| *x == id))
+        .map(|p| p as i32);
+    let next = match at {
+        Some(p) => (p + delta).rem_euclid(order.len() as i32),
+        None if delta >= 0 => 0,
+        None => order.len() as i32 - 1,
+    };
+    Some(order[next as usize])
+}
+
 
 // ---------------------------------------------------------------------------
 // カード / 集計 / アクティビティ / UI 状態 / アクション
@@ -162,12 +837,16 @@ pub struct Card {
     pub rate_limited: Option<String>,
     pub attention: bool,
     pub running: bool,
+    /// 見張り (supervisor.rs) の判定。[`classify`] が画面推定より優先して使う。
+    pub sup: Option<supervisor::SessionState>,
     /// ⚡/🛡 (権限モード対応エージェントのみ、他は "")
     pub permission_badge: &'static str,
     /// 権限モード切替キーを送れるか
     pub can_cycle: bool,
-    /// 画面末尾の「意味のある行」たち (時系列順)。最終行が「いま何をしているか」の
-    /// 一言になり、全行はホバーのライブプレビューに出す。
+    /// 画面末尾の「意味のある行」たち (時系列順)。
+    ///
+    /// **サンプリングしたフレームだけ中身が入る** ([`KanbanState::sample_due`])。
+    /// 空のフレームでは [`KanbanState`] が前回ぶんを使うので、カードはちらつかない。
     pub tail_lines: Vec<String>,
     /// coordinator に割り当て中のタスク名
     pub task: Option<String>,
@@ -184,25 +863,54 @@ pub struct Tally {
     pub total: usize,
     pub running: usize,
     pub ready: usize,
+    /// 思考中 + 編集中 + 実行中 + 検証中 (KPI とスループット折れ線が使う)
     pub working: usize,
+    pub thinking: usize,
+    pub editing: usize,
+    pub exec: usize,
+    pub verifying: usize,
     pub approval: usize,
     pub trouble: usize,
     pub done: usize,
 }
 
-/// カード一覧から列集計を作る純関数。
+/// カード一覧から列集計を作る純関数 (カード自身の素の列を使う)。
+/// 実描画は [`tally_lanes`] (デバウンス後のレーン) を使うので、こちらは
+/// 「素の判定だけ見たい」テスト・外部呼び出し向け。
+#[allow(dead_code)]
 pub fn tally(cards: &[Card]) -> Tally {
+    let lanes: Vec<Column> = cards.iter().map(|c| c.column).collect();
+    tally_lanes(cards, &lanes)
+}
+
+/// デバウンス後の実表示レーン (`lanes[i]` が `cards[i]` のレーン) で集計する純関数。
+pub fn tally_lanes(cards: &[Card], lanes: &[Column]) -> Tally {
     let mut t = Tally {
         total: cards.len(),
         ..Tally::default()
     };
-    for c in cards {
+    for (i, c) in cards.iter().enumerate() {
         if c.running {
             t.running += 1;
         }
-        match c.column {
+        match lanes.get(i).copied().unwrap_or(c.column) {
             Column::Ready => t.ready += 1,
-            Column::Working => t.working += 1,
+            Column::Thinking => {
+                t.thinking += 1;
+                t.working += 1;
+            }
+            Column::Editing => {
+                t.editing += 1;
+                t.working += 1;
+            }
+            Column::Running => {
+                t.exec += 1;
+                t.working += 1;
+            }
+            Column::Verifying => {
+                t.verifying += 1;
+                t.working += 1;
+            }
             Column::Approval => t.approval += 1,
             Column::Trouble => t.trouble += 1,
             Column::Done => t.done += 1,
@@ -238,6 +946,67 @@ const SAMPLE_MS: u64 = 2_000;
 /// 履歴の上限 (240 点 × 2 秒 = 約 8 分ぶんのウィンドウ)。
 const MAX_SAMPLES: usize = 240;
 
+/// 動いているエージェントが居るときの PTY 画面サンプリング間隔 (≈6.7Hz)。
+const FAST_SAMPLE_MS: u64 = 150;
+/// 誰も動いていないときのサンプリング間隔 (1Hz)。
+const SLOW_SAMPLE_MS: u64 = 1_000;
+/// 全員終了しているときの再描画間隔 (実質何もしない)。
+const ASLEEP_REPAINT_MS: u64 = 2_000;
+/// 出力の勢いスパークラインの窓 (30 秒) とバケツ数。
+const PULSE_WINDOW_MS: u64 = 30_000;
+const PULSE_BUCKETS: usize = 30;
+
+/// 1 セッションぶんの追跡状態 (レーン位置・アクティビティ・出力の勢い)。
+#[derive(Clone, Debug)]
+pub struct Track {
+    lane: LaneTracker,
+    /// いまのアクティビティと、それが始まった時刻 (経過タイマー)
+    activity: Activity,
+    since_ms: u64,
+    source: Source,
+    detail: String,
+    /// 直近に触ったファイル / 走らせたコマンド (分かった時点で更新)
+    last_file: String,
+    last_cmd: String,
+    /// 最後にサンプルした画面末尾 (カードの一言・ホバープレビューの元)
+    tail: Vec<String>,
+    /// 出力の勢い `(時刻, 新規文字数)`
+    pulse: Vec<(u64, u64)>,
+}
+
+impl Track {
+    fn new(read: &Read, now_ms: u64) -> Self {
+        Self {
+            lane: LaneTracker::new(read.activity.column(), now_ms),
+            activity: read.activity,
+            since_ms: now_ms,
+            source: read.source,
+            detail: read.detail.clone(),
+            last_file: String::new(),
+            last_cmd: String::new(),
+            tail: Vec::new(),
+            pulse: Vec::new(),
+        }
+    }
+
+    /// 現在のアクティビティが続いている時間 (ms)。
+    pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.since_ms)
+    }
+
+    /// 直近 30 秒の出力の勢い (古い → 新しい)。
+    pub fn pulse_series(&self, now_ms: u64) -> Vec<f32> {
+        bucket_series(&self.pulse, now_ms, PULSE_WINDOW_MS, PULSE_BUCKETS)
+    }
+
+    /// 直近 3 秒に新しい出力があったか (LIVE 表示・サンプリング速度の判断)。
+    fn recently_noisy(&self, now_ms: u64) -> bool {
+        self.pulse
+            .iter()
+            .any(|(t, v)| *v > 0 && now_ms.saturating_sub(*t) <= 3_000)
+    }
+}
+
 /// 看板画面の UI 状態 (app.rs が保持する)。
 #[derive(Default)]
 pub struct KanbanState {
@@ -249,6 +1018,32 @@ pub struct KanbanState {
     prompt_focus: bool,
     /// スループット/スパークラインの履歴
     samples: Vec<Sample>,
+    /// セッション id → 追跡状態
+    tracks: HashMap<u64, Track>,
+    /// 選択中カード (**セッション id**。レーン移動でも消えない)
+    selected: Option<u64>,
+    /// 選択カードが最後に居た並び順の位置 (消えたときの寄せ先)
+    sel_pos: usize,
+    /// ライブペインを**閉じている**か (既定は開く = 選んだら中身が見える)
+    live_closed: bool,
+    /// 次のフレームでライブペインへフォーカスを移す (Enter)
+    live_focus_req: bool,
+    /// 前フレームのライブペインの egui Id (Esc を board へ返すために覚える)
+    live_id: Option<egui::Id>,
+    /// レイアウト (None = 永続メモリから未読込)
+    layout: Option<LayoutMode>,
+    layout_dirty: bool,
+    /// ライブペインの取り分 (0.2..0.7)。None = 永続メモリから未読込
+    split: Option<f32>,
+    split_dirty: bool,
+    /// 最後に PTY 画面をサンプルした時刻
+    last_sample_ms: Option<u64>,
+    /// 直近のサンプルで「動いている」と判定したか (サンプリング速度に効く)
+    busy: bool,
+    /// 稼働中のセッションが 1 つでもあるか (居なければ寝る)
+    any_running: bool,
+    /// 着地アニメーションが走っているか (走っている間だけ高頻度描画)
+    animating: bool,
 }
 
 impl KanbanState {
@@ -262,6 +1057,143 @@ impl KanbanState {
             let drop = self.samples.len() - MAX_SAMPLES;
             self.samples.drain(..drop);
         }
+    }
+
+    /// **PTY 画面を読み直してよいフレームか。**
+    ///
+    /// app.rs はこれが false のあいだ `screen_tail_lines` を呼ばない
+    /// (= 看板を開けっぱなしでも毎フレーム parser をロックしない)。
+    /// 動いている間だけ速く回し、静かなら 1 秒に 1 回で足りる。
+    pub fn sample_due(&mut self, now_ms: u64) -> bool {
+        let interval = if self.busy {
+            FAST_SAMPLE_MS
+        } else {
+            SLOW_SAMPLE_MS
+        };
+        match self.last_sample_ms {
+            Some(last) if now_ms.saturating_sub(last) < interval => false,
+            _ => {
+                self.last_sample_ms = Some(now_ms);
+                true
+            }
+        }
+    }
+
+    /// 次に再描画を要求するまでの ms。無条件の再描画をしないための唯一の窓口。
+    pub fn next_repaint_ms(&self) -> u64 {
+        if self.animating {
+            33
+        } else if self.busy {
+            FAST_SAMPLE_MS
+        } else if self.any_running {
+            SLOW_SAMPLE_MS
+        } else {
+            ASLEEP_REPAINT_MS
+        }
+    }
+
+    /// 追跡状態を 1 ステップ進める。`fresh` が true のフレームだけ
+    /// `cards[..].tail_lines` に新しい画面が入っている。
+    ///
+    /// 戻り値は `lanes[i]` = `cards[i]` の**表示**レーン (デバウンス済み)。
+    pub fn update_tracks(&mut self, cards: &[Card], now_ms: u64, fresh: bool) -> Vec<Column> {
+        let mut lanes = Vec::with_capacity(cards.len());
+        let mut busy = false;
+        let mut animating = false;
+        let mut any_running = false;
+        for c in cards {
+            if c.running {
+                any_running = true;
+            }
+            // 画面が来ていないフレームは、前回サンプルした画面で判定する
+            // (構造化信号 — 生死・承認・レート制限 — は毎フレーム最新)。
+            // `Read` は所有値なので、ここで tracks の借用は閉じる (複製しない)。
+            let rl = c.rate_limited.is_some();
+            let read = if fresh {
+                classify(c.running, c.attention, rl, c.sup, &c.tail_lines)
+            } else {
+                match self.tracks.get(&c.id) {
+                    Some(t) => classify(c.running, c.attention, rl, c.sup, &t.tail),
+                    None => classify(c.running, c.attention, rl, c.sup, &[]),
+                }
+            };
+
+            let track = self
+                .tracks
+                .entry(c.id)
+                .or_insert_with(|| Track::new(&read, now_ms));
+
+            if fresh {
+                let delta = tail_delta(&track.tail, &c.tail_lines);
+                track.pulse.push((now_ms, delta));
+                let from = now_ms.saturating_sub(PULSE_WINDOW_MS);
+                track.pulse.retain(|(t, _)| *t >= from);
+                track.tail = c.tail_lines.clone();
+            }
+
+            if track.activity != read.activity {
+                track.activity = read.activity;
+                track.since_ms = now_ms;
+            }
+            track.source = read.source;
+            track.detail = read.detail.clone();
+            match read.activity {
+                Activity::Editing if !read.detail.is_empty() => {
+                    track.last_file = read.detail.clone();
+                }
+                Activity::Running | Activity::Verifying if !read.detail.is_empty() => {
+                    track.last_cmd = read.detail.clone();
+                }
+                _ => {}
+            }
+
+            track.lane.step(read.activity.column(), now_ms);
+            lanes.push(track.lane.lane());
+            if track.lane.land_glow(now_ms) > 0.0 {
+                animating = true;
+            }
+            if read.activity.is_busy() || track.recently_noisy(now_ms) {
+                busy = true;
+            }
+        }
+        // 消えたセッションの追跡は捨てる (無限に太らせない)
+        self.tracks.retain(|id, _| cards.iter().any(|c| c.id == *id));
+        self.busy = busy;
+        self.animating = animating;
+        self.any_running = any_running;
+        lanes
+    }
+
+    /// 選択中のセッション id (テスト・app.rs 用)。
+    #[allow(dead_code)]
+    pub fn selected(&self) -> Option<u64> {
+        self.selected
+    }
+
+    /// 選択をカード一覧に照らして解決し、位置を覚え直す。
+    fn sync_selection(&mut self, cards: &[Card]) -> Option<u64> {
+        // 初回はアクティブ (紫枠) のカードを選んでおく — 開いた瞬間に
+        // 「いま見ているエージェント」の中身が出る方が迷わない。
+        if self.selected.is_none() {
+            self.selected = cards.iter().find(|c| c.active).map(|c| c.id);
+        }
+        match resolve_selection(self.selected, self.sel_pos, cards) {
+            Some((id, pos)) => {
+                self.selected = Some(id);
+                self.sel_pos = pos;
+                Some(id)
+            }
+            None => {
+                self.selected = None;
+                None
+            }
+        }
+    }
+
+    /// 追跡状態の参照 (テスト用。描画側は `tracks` を直接見る)。
+    #[allow(dead_code)]
+    pub fn track(&self, id: u64) -> Option<&Track> {
+        self.tracks.get(&id)
     }
 }
 
@@ -320,27 +1252,50 @@ pub fn fmt_age(ms: u64) -> String {
     }
 }
 
-/// エージェントごとの安定したアバター色 (参考画像と同系の 6 色パレット)。
-fn avatar_color(id: u64) -> Color32 {
-    const PALETTE: [Color32; 6] = [
-        Color32::from_rgb(0x3b, 0x82, 0xf6), // 青
-        Color32::from_rgb(0xf5, 0x9e, 0x0b), // 橙
-        Color32::from_rgb(0xec, 0x48, 0x99), // 桃
-        Color32::from_rgb(0x10, 0xb9, 0x81), // 緑
-        Color32::from_rgb(0x8b, 0x5c, 0xf6), // 紫
-        Color32::from_rgb(0x06, 0xb6, 0xd4), // 水
-    ];
-    PALETTE[(id % PALETTE.len() as u64) as usize]
+/// 現在のアクティビティの経過時間 (例: `0:07` / `2:31` / `1:04:00`)。
+pub fn fmt_elapsed(ms: u64) -> String {
+    let s = ms / 1000;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// エージェントごとの安定したアバター色。テーマの ANSI 明色 (8..16) から選ぶので
+/// テーマを変えれば追随する (リテラルを持たない)。
+fn avatar_color(theme: &Theme, id: u64) -> Color32 {
+    // 9,10,11,13,14,12 = 赤/緑/黄/紫/水/青の明色。灰 (8,15) は避ける。
+    const SLOTS: [usize; 6] = [9, 10, 11, 13, 14, 12];
+    theme.ansi[SLOTS[(id % SLOTS.len() as u64) as usize]]
 }
 
 // ---------------------------------------------------------------------------
 // 描画
 // ---------------------------------------------------------------------------
 
+/// 永続メモリのキー (config.rs は他所有なので egui の memory に持つ)。
+fn layout_id() -> egui::Id {
+    egui::Id::new("zv-kanban-layout-mode")
+}
+
+fn split_id() -> egui::Id {
+    egui::Id::new("zv-kanban-live-split")
+}
+
+/// ライブペインへ選択カードの端末を描くためのコールバック。
+///
+/// app.rs が `terminal::draw` を呼ぶだけの実装を渡す。看板側は端末を再実装しない。
+/// 返り値の `Response` があればフォーカス移動 (Enter/Esc) に使う。
+pub type LiveDraw<'a> = &'a mut dyn FnMut(&mut egui::Ui, usize) -> Option<egui::Response>;
+
 /// 看板画面を描き、押された操作を返す。
 ///
 /// `now_ms` は supervisor の経過時計 (アプリ起動からの ms)。連続稼働表示・
 /// アクティビティの相対時刻・スループット履歴のサンプリングを全部この 1 本で賄う。
+/// `fresh_tail` は「このフレームの `cards[..].tail_lines` が新しいか」
+/// (app.rs が [`KanbanState::sample_due`] で決める)。
+#[allow(clippy::too_many_arguments)]
 pub fn ui(
     st: &mut KanbanState,
     ui: &mut egui::Ui,
@@ -349,14 +1304,38 @@ pub fn ui(
     presets: &[(String, String)],
     activity: &[ActivityEntry],
     now_ms: u64,
+    fresh_tail: bool,
+    live: LiveDraw<'_>,
 ) -> Vec<KanbanAction> {
     let mut acts: Vec<KanbanAction> = Vec::new();
-    let t = tally(cards);
+
+    // 永続メモリ (レイアウト・分割比) の読み込み / 書き戻し
+    let ctx = ui.ctx().clone();
+    if st.layout.is_none() {
+        let v = ctx.data_mut(|d| *d.get_persisted_mut_or(layout_id(), 0_u8));
+        st.layout = Some(LayoutMode::from_u8(v));
+    }
+    if st.layout_dirty {
+        let v = st.layout.unwrap_or_default().to_u8();
+        ctx.data_mut(|d| d.insert_persisted(layout_id(), v));
+        st.layout_dirty = false;
+    }
+    if st.split.is_none() {
+        let v = ctx.data_mut(|d| *d.get_persisted_mut_or(split_id(), 0.38_f32));
+        st.split = Some(v.clamp(0.2, 0.7));
+    }
+    if st.split_dirty {
+        let v = st.split.unwrap_or(0.38);
+        ctx.data_mut(|d| d.insert_persisted(split_id(), v));
+        st.split_dirty = false;
+    }
+
+    let lanes = st.update_tracks(cards, now_ms, fresh_tail);
+    let t = tally_lanes(cards, &lanes);
     st.record_sample(now_ms, t);
-    // ダッシュボードは「見ているだけで動く」のが売りなので、
-    // 出力が止まっていても時計・LIVE ドット・チャートを進め続ける。
+    // 無条件の再描画はしない。動きがあるときだけ速く回す (アイドル時は 1〜2 秒)。
     ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(300));
+        .request_repaint_after(std::time::Duration::from_millis(st.next_repaint_ms()));
 
     egui::Frame::none()
         .inner_margin(egui::Margin::same(10.0))
@@ -368,18 +1347,31 @@ pub fn ui(
             ui.set_min_height(ui.available_height());
             let wide = ui.available_width();
             let tall = ui.available_height();
-            // 狭い画面では飾りを畳んで、看板本体に空間を譲る
-            let show_rail = wide >= 1000.0;
-            let show_feed = wide >= 780.0;
-            let show_kpi = tall >= 340.0;
-            let show_chart = tall >= 430.0;
+            let vertical = use_vertical(st.layout.unwrap_or_default(), wide, tall);
+            let show_kpi = tall >= 360.0;
+            let show_chart = !vertical && tall >= 470.0;
 
-            header_ui(st, ui, theme, &t, presets, now_ms, &mut acts);
+            header_ui(st, ui, theme, &t, presets, now_ms, vertical, &mut acts);
 
             if cards.is_empty() {
                 empty_ui(ui, theme, presets, &mut acts);
                 return;
             }
+
+            // 画面上の並び (レーン順 → レーン内はカード順) — 上下キーの移動順
+            let order: Vec<u64> = COLUMNS
+                .iter()
+                .flat_map(|col| {
+                    cards
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| lanes.get(*i).copied() == Some(*col))
+                        .map(|(_, c)| c.id)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            keyboard_ui(st, ui, &order, &mut acts, cards);
+            let selected = st.sync_selection(cards);
 
             if show_kpi {
                 kpi_ui(ui, theme, st, &t);
@@ -387,31 +1379,84 @@ pub fn ui(
             }
 
             let chart_h = if show_chart { 96.0 } else { 0.0 };
-            let main_h = (ui.available_height()
-                - chart_h
-                - if show_chart { 8.0 } else { 0.0 })
-            .max(160.0);
+            let main_h = (ui.available_height() - chart_h - if show_chart { 8.0 } else { 0.0 })
+                .max(160.0);
+
+            let live_on = !st.live_closed && selected.is_some();
+            // 飾り (左レール / 右フィード) は看板の幅を食う。ライブペインを
+            // 開いているときは看板が主役なので、よほど広くない限り畳む。
+            // 左レールは看板と情報が重なるので、畳む優先度が高い。
+            let show_rail = !vertical && wide >= if live_on { 1800.0 } else { 1200.0 };
+            let show_feed = !vertical && wide >= if live_on { 1450.0 } else { 1000.0 };
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), main_h),
-                egui::Layout::left_to_right(egui::Align::Min),
+                if vertical {
+                    egui::Layout::top_down(egui::Align::Min)
+                } else {
+                    egui::Layout::left_to_right(egui::Align::Min)
+                },
                 |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    if show_rail {
-                        rail_ui(ui, theme, cards, main_h, &mut acts);
-                    }
-                    let feed_w = if show_feed { 250.0 } else { 0.0 };
-                    let board_w = (ui.available_width()
-                        - if show_feed { feed_w + 8.0 } else { 0.0 })
-                    .max(200.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(board_w, main_h),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            board_ui(st, ui, theme, cards, main_h, &mut acts);
-                        },
-                    );
-                    if show_feed {
-                        feed_ui(ui, theme, activity, feed_w, main_h, now_ms);
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                    if vertical {
+                        // 縦モード: 看板 (上) / ライブペイン (下)。
+                        let frac = st.split.unwrap_or(0.38);
+                        let live_h = if live_on {
+                            (main_h * frac).clamp(150.0, main_h * 0.7)
+                        } else {
+                            0.0
+                        };
+                        // 8(間隔) + 4(バー) + 8(間隔) を引いてから看板へ渡す
+                        let board_h = (main_h - live_h - if live_on { 20.0 } else { 0.0 }).max(120.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), board_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                board_vertical_ui(
+                                    st, ui, theme, cards, &lanes, board_h, now_ms, &mut acts,
+                                );
+                            },
+                        );
+                        if live_on {
+                            splitter_ui(st, ui, theme, false, main_h);
+                            live_pane_ui(
+                                st, ui, theme, cards, &lanes, selected, live_h, now_ms, live,
+                                &mut acts,
+                            );
+                        }
+                    } else {
+                        // 横モード: レール / 看板 / ライブペイン / フィード
+                        if show_rail {
+                            rail_ui(st, ui, theme, cards, &lanes, main_h, now_ms, &mut acts);
+                        }
+                        let feed_w = if show_feed { 240.0 } else { 0.0 };
+                        let rest = (ui.available_width() - if show_feed { feed_w + 8.0 } else { 0.0 })
+                            .max(200.0);
+                        let frac = st.split.unwrap_or(0.38);
+                        let live_w = if live_on {
+                            (rest * frac).clamp(240.0, rest * 0.7)
+                        } else {
+                            0.0
+                        };
+                        let board_w = (rest - live_w - if live_on { 20.0 } else { 0.0 }).max(180.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(board_w, main_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                board_ui(
+                                    st, ui, theme, cards, &lanes, main_h, now_ms, &mut acts,
+                                );
+                            },
+                        );
+                        if live_on {
+                            splitter_ui(st, ui, theme, true, rest);
+                            live_pane_ui(
+                                st, ui, theme, cards, &lanes, selected, main_h, now_ms, live,
+                                &mut acts,
+                            );
+                        }
+                        if show_feed {
+                            feed_ui(ui, theme, activity, feed_w, main_h, now_ms);
+                        }
                     }
                 },
             );
@@ -423,6 +1468,186 @@ pub fn ui(
         });
 
     acts
+}
+
+/// キーボード操作。テキスト入力中とライブペインにフォーカスがある間は
+/// 選択移動を奪わない (端末へ打った文字が選択を動かしたら事故になる)。
+fn keyboard_ui(
+    st: &mut KanbanState,
+    ui: &mut egui::Ui,
+    order: &[u64],
+    acts: &mut Vec<KanbanAction>,
+    cards: &[Card],
+) {
+    let focus = ui.ctx().memory(|m| m.focused());
+    let live_focused = focus.is_some() && focus == st.live_id;
+
+    if live_focused {
+        // Esc で看板へ戻る。端末が同じ Esc を PTY へ流さないよう先に取り上げる。
+        let esc = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if esc {
+            if let Some(id) = st.live_id {
+                ui.ctx().memory_mut(|m| m.surrender_focus(id));
+            }
+        }
+        return;
+    }
+    if focus.is_some() {
+        return; // ブロードキャスト欄・指示欄などを打っている
+    }
+
+    let (up, down, enter) = ui.input(|i| {
+        (
+            i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::K),
+            i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::J),
+            i.key_pressed(egui::Key::Enter),
+        )
+    });
+    let delta = i32::from(down) - i32::from(up);
+    if delta != 0 {
+        if let Some(id) = move_selection(order, st.selected, delta) {
+            st.selected = Some(id);
+            st.live_closed = false;
+            if let Some(c) = cards.iter().find(|c| c.id == id) {
+                acts.push(KanbanAction::Select(c.idx));
+            }
+        }
+    }
+    if enter && st.selected.is_some() {
+        st.live_closed = false;
+        st.live_focus_req = true;
+    }
+}
+
+/// 看板とライブペインの間のドラッグバー。
+fn splitter_ui(st: &mut KanbanState, ui: &mut egui::Ui, theme: &Theme, horizontal: bool, span: f32) {
+    let size = if horizontal {
+        egui::vec2(4.0, ui.available_height())
+    } else {
+        egui::vec2(ui.available_width(), 4.0)
+    };
+    let resp = ui.allocate_response(size, egui::Sense::drag());
+    let hot = resp.hovered() || resp.dragged();
+    ui.painter().rect_filled(
+        resp.rect,
+        2.0,
+        if hot { theme.accent } else { theme.border },
+    );
+    resp.clone().on_hover_cursor(if horizontal {
+        egui::CursorIcon::ResizeHorizontal
+    } else {
+        egui::CursorIcon::ResizeVertical
+    });
+    if resp.dragged() && span > 1.0 {
+        let d = resp.drag_delta();
+        // 看板が左/上なので、バーを進める方向はライブペインを縮める方向
+        let delta = if horizontal { -d.x } else { -d.y } / span;
+        let next = (st.split.unwrap_or(0.38) + delta).clamp(0.2, 0.7);
+        st.split = Some(next);
+        st.split_dirty = true;
+    }
+}
+
+/// 選択中エージェントのライブ端末 (cmux 風)。端末描画は app.rs のクロージャに任せる。
+#[allow(clippy::too_many_arguments)]
+fn live_pane_ui(
+    st: &mut KanbanState,
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    cards: &[Card],
+    lanes: &[Column],
+    selected: Option<u64>,
+    height: f32,
+    now_ms: u64,
+    live: LiveDraw<'_>,
+    acts: &mut Vec<KanbanAction>,
+) {
+    let Some(id) = selected else { return };
+    let Some((i, c)) = cards.iter().enumerate().find(|(_, c)| c.id == id) else {
+        return;
+    };
+    let lane = lanes.get(i).copied().unwrap_or(c.column);
+    let color = lane.color(theme);
+    let w = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::Frame::none()
+                .fill(theme.panel)
+                .stroke(Stroke::new(1.0_f32, theme.accent))
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::same(8.0))
+                .show(ui, |ui| {
+                    ui.set_width(w - 16.0);
+                    ui.set_min_height(height - 16.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("●").size(10.0).color(color));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{} {}", c.icon, c.title))
+                                    .size(12.5)
+                                    .strong()
+                                    .color(theme.text),
+                            )
+                            .truncate(),
+                        );
+                        if let Some(tr_) = st.tracks.get(&id) {
+                            chip(ui, color, &tr(tr_.activity.label()));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text(tr("ライブ表示を閉じる"))
+                                .clicked()
+                            {
+                                st.live_closed = true;
+                            }
+                            if ui
+                                .small_button("🔍")
+                                .on_hover_text(tr("下部パネルにフォーカス"))
+                                .clicked()
+                            {
+                                acts.push(KanbanAction::Focus(i));
+                            }
+                            ui.label(
+                                RichText::new(tr("↑↓/jk: 選択 / Enter: 入力 / Esc: 看板へ戻る"))
+                                    .size(9.5)
+                                    .color(theme.text_dim),
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                    let inner_h = (ui.available_height()).max(60.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), inner_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let resp = live(ui, i);
+                            match resp {
+                                Some(r) => {
+                                    st.live_id = Some(r.id);
+                                    if st.live_focus_req {
+                                        r.request_focus();
+                                        st.live_focus_req = false;
+                                    }
+                                }
+                                None => {
+                                    st.live_id = None;
+                                    st.live_focus_req = false;
+                                    ui.label(
+                                        RichText::new(tr("この端末はいま表示できません"))
+                                            .size(11.0)
+                                            .color(theme.text_dim),
+                                    );
+                                }
+                            }
+                        },
+                    );
+                    let _ = now_ms;
+                });
+        },
+    );
 }
 
 /// 角丸チップ (稼働数バッジなど)。
@@ -447,6 +1672,7 @@ fn live_dot(ui: &mut egui::Ui, theme: &Theme, now_ms: u64) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn header_ui(
     st: &mut KanbanState,
     ui: &mut egui::Ui,
@@ -454,6 +1680,7 @@ fn header_ui(
     t: &Tally,
     presets: &[(String, String)],
     now_ms: u64,
+    vertical: bool,
     acts: &mut Vec<KanbanAction>,
 ) {
     ui.horizontal(|ui| {
@@ -476,6 +1703,20 @@ fn header_ui(
             theme.ok,
             &trf("{n} 稼働中", &[("n", t.running.to_string())]),
         );
+        // レーン別の内訳 (0 のレーンは出さない — 動いているものだけ目に入る)
+        for (col, n) in [
+            (Column::Editing, t.editing),
+            (Column::Running, t.exec),
+            (Column::Verifying, t.verifying),
+        ] {
+            if n > 0 {
+                chip(
+                    ui,
+                    col.color(theme),
+                    &format!("{} {} {}", col.icon(), tr(col.title()), n),
+                );
+            }
+        }
         if t.approval > 0 {
             chip(
                 ui,
@@ -495,6 +1736,32 @@ fn header_ui(
             if ui.button(tr("✕ 閉じる")).clicked() {
                 acts.push(KanbanAction::Close);
             }
+            // レイアウト切替 (自動 / 横 / 縦)。選択は egui の永続メモリへ。
+            let mode = st.layout.unwrap_or_default();
+            let icon = match mode {
+                LayoutMode::Auto => "🖥",
+                LayoutMode::Horizontal => "▤",
+                LayoutMode::Vertical => "▥",
+            };
+            ui.menu_button(format!("{icon} {}", tr(mode.label())), |ui| {
+                for m in [
+                    LayoutMode::Auto,
+                    LayoutMode::Horizontal,
+                    LayoutMode::Vertical,
+                ] {
+                    if ui.selectable_label(mode == m, tr(m.label())).clicked() {
+                        st.layout = Some(m);
+                        st.layout_dirty = true;
+                        ui.close_menu();
+                    }
+                }
+            })
+            .response
+            .on_hover_text(if vertical {
+                tr("いまは縦モード — レーンを縦に積み、カードは全幅で出します")
+            } else {
+                tr("いまは横モード — レーンを横に並べます")
+            });
             if ui
                 .button("🎛 Cockpit")
                 .on_hover_text(tr("Cockpit へ切替"))
@@ -646,11 +1913,15 @@ fn sparkline(ui: &mut egui::Ui, height: f32, color: Color32, values: &[f32]) {
 // 左レール: エージェント一覧
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn rail_ui(
+    st: &mut KanbanState,
     ui: &mut egui::Ui,
     theme: &Theme,
     cards: &[Card],
+    lanes: &[Column],
     height: f32,
+    now_ms: u64,
     acts: &mut Vec<KanbanAction>,
 ) {
     let w = 208.0;
@@ -677,8 +1948,9 @@ fn rail_ui(
                         .id_salt("kanban-rail")
                         .auto_shrink(false)
                         .show(ui, |ui| {
-                            for c in cards {
-                                rail_entry_ui(ui, theme, c, acts);
+                            for (i, c) in cards.iter().enumerate() {
+                                let lane = lanes.get(i).copied().unwrap_or(c.column);
+                                rail_entry_ui(st, ui, theme, c, lane, now_ms, acts);
                                 ui.add_space(4.0);
                             }
                         });
@@ -687,12 +1959,26 @@ fn rail_ui(
     );
 }
 
-fn rail_entry_ui(ui: &mut egui::Ui, theme: &Theme, c: &Card, acts: &mut Vec<KanbanAction>) {
-    let col_color = c.column.color(theme);
-    let stroke = if c.active {
+fn rail_entry_ui(
+    st: &mut KanbanState,
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    c: &Card,
+    lane: Column,
+    now_ms: u64,
+    acts: &mut Vec<KanbanAction>,
+) {
+    let col_color = lane.color(theme);
+    let stroke = if st.selected == Some(c.id) {
         Stroke::new(1.5_f32, theme.accent)
+    } else if c.active {
+        Stroke::new(1.0_f32, theme.accent_soft)
     } else {
         Stroke::new(1.0_f32, Color32::TRANSPARENT)
+    };
+    let (act_label, doing) = match st.tracks.get(&c.id) {
+        Some(t) => (tr(t.activity.label()), status_line(t)),
+        None => (c.state_label.clone(), String::new()),
     };
     let cell = ui.scope_builder(
         egui::UiBuilder::new()
@@ -707,76 +1993,96 @@ fn rail_entry_ui(ui: &mut egui::Ui, theme: &Theme, c: &Card, acts: &mut Vec<Kanb
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        // アバター: エージェント色の円 + アイコン
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(22.0, 22.0),
-                            egui::Sense::hover(),
-                        );
-                        let color = avatar_color(c.id);
+                        // アバター (円 + 絵文字)
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                        let color = avatar_color(theme, c.id);
                         ui.painter().circle_filled(rect.center(), 11.0, color);
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
                             &c.icon,
                             egui::FontId::proportional(12.0),
-                            Color32::WHITE,
+                            theme.term_bg,
                         );
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&c.title)
-                                        .size(12.0)
-                                        .strong()
-                                        .color(theme.text),
+                                    RichText::new(&c.title).size(12.0).strong().color(theme.text),
                                 )
                                 .truncate(),
                             );
-                            ui.label(
-                                RichText::new(&c.state_label)
-                                    .size(10.0)
-                                    .strong()
-                                    .color(col_color),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(&act_label)
+                                        .size(10.0)
+                                        .strong()
+                                        .color(col_color),
+                                );
+                                if let Some(t) = st.tracks.get(&c.id) {
+                                    ui.label(
+                                        RichText::new(fmt_elapsed(t.elapsed_ms(now_ms)))
+                                            .size(9.5)
+                                            .color(theme.text_dim),
+                                    );
+                                }
+                            });
                         });
                     });
-                    // 「いま何をしているか」一言 (タスク優先、無ければ画面末尾)
-                    let doing = c
-                        .task
-                        .as_deref()
-                        .or_else(|| now_line(&c.tail_lines))
-                        .unwrap_or("");
+
+                    let doing = if doing.is_empty() {
+                        c.task.clone().unwrap_or_default()
+                    } else {
+                        doing
+                    };
                     if !doing.is_empty() {
                         ui.add(
-                            egui::Label::new(
-                                RichText::new(doing).size(10.0).color(theme.text_dim),
-                            )
-                            .truncate(),
+                            egui::Label::new(RichText::new(doing).size(10.0).color(theme.text_dim))
+                                .truncate(),
                         );
                     }
                 });
         },
     );
     if cell.response.clicked() {
+        st.selected = Some(c.id);
+        st.live_closed = false;
         acts.push(KanbanAction::Select(c.idx));
     }
 }
 
 // ---------------------------------------------------------------------------
-// 中央: 看板カラム
+// 看板本体
 // ---------------------------------------------------------------------------
 
+/// カードの 1 行状態文 (「いま何をしているか」)。追跡状態から組み立てる純関数。
+pub fn status_line(t: &Track) -> String {
+    let label = tr(t.activity.label());
+    let detail = t.detail.trim();
+    if detail.is_empty() {
+        label
+    } else {
+        format!("{label}: {detail}")
+    }
+}
+
+/// 横モード: レーンを横に並べる。
+#[allow(clippy::too_many_arguments)]
 fn board_ui(
     st: &mut KanbanState,
     ui: &mut egui::Ui,
     theme: &Theme,
     cards: &[Card],
+    lanes: &[Column],
     height: f32,
+    now_ms: u64,
     acts: &mut Vec<KanbanAction>,
 ) {
     let gap = 8.0;
     let n = COLUMNS.len() as f32;
-    let col_w = ((ui.available_width() - gap * (n - 1.0)) / n).clamp(172.0, 340.0);
+    // 8 レーンぶん。入り切らないときは横スクロールで見せる。
+    let col_w = ((ui.available_width() - gap * (n - 1.0)) / n).clamp(150.0, 300.0);
     egui::ScrollArea::horizontal()
         .id_salt("kanban-board-h")
         .auto_shrink(false)
@@ -784,15 +2090,104 @@ fn board_ui(
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = gap;
                 for col in COLUMNS {
-                    let members: Vec<&Card> =
-                        cards.iter().filter(|c| c.column == col).collect();
-                    column_ui(st, ui, theme, col, &members, col_w, height, acts);
+                    let members: Vec<&Card> = cards
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, c)| lanes.get(*i).copied().unwrap_or(c.column) == col)
+                        .map(|(_, c)| c)
+                        .collect();
+                    column_ui(st, ui, theme, col, &members, col_w, height, now_ms, acts);
                 }
             });
         });
 }
 
-/// 状態カラム 1 本: 色付き見出し + 件数 + 所属カード (縦スクロール)。
+/// 縦モード: レーンを縦に積み、カードは全幅の 1 列。
+///
+/// 細く高い窓 (サブディスプレイの縦置き・スマホからのリモート) では、
+/// 8 本を横に並べると 1 本 40px しか取れず読めない。縦に積めばカードが全幅を
+/// 使えるので、状態文・最後のファイル・最後のコマンド・勢いのグラフが
+/// 1 枚に収まる。空のレーンは帯だけに畳んで、視線が要点に届くようにする。
+#[allow(clippy::too_many_arguments)]
+fn board_vertical_ui(
+    st: &mut KanbanState,
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    cards: &[Card],
+    lanes: &[Column],
+    height: f32,
+    now_ms: u64,
+    acts: &mut Vec<KanbanAction>,
+) {
+    let w = ui.available_width();
+    egui::Frame::none()
+        .fill(theme.panel)
+        .stroke(Stroke::new(1.0_f32, theme.border))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::same(7.0))
+        .show(ui, |ui| {
+            ui.set_width(w - 14.0);
+            ui.set_min_height(height - 14.0);
+            egui::ScrollArea::vertical()
+                .id_salt("kanban-board-v")
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    for col in COLUMNS {
+                        let members: Vec<&Card> = cards
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, c)| lanes.get(*i).copied().unwrap_or(c.column) == col)
+                            .map(|(_, c)| c)
+                            .collect();
+                        lane_header_ui(ui, theme, col, members.len());
+                        if members.is_empty() {
+                            ui.add_space(3.0);
+                            continue;
+                        }
+                        ui.add_space(4.0);
+                        for c in members {
+                            card_ui(st, ui, theme, c, col, now_ms, true, acts);
+                            ui.add_space(5.0);
+                        }
+                        ui.add_space(4.0);
+                    }
+                });
+        });
+}
+
+/// 縦モードのレーン帯 (色 + 絵文字 + 名前 + 件数)。
+fn lane_header_ui(ui: &mut egui::Ui, theme: &Theme, col: Column, count: usize) {
+    let color = col.color(theme);
+    egui::Frame::none()
+        .fill(color.gamma_multiply(if count == 0 { 0.06 } else { 0.16 }))
+        .rounding(egui::Rounding::same(5.0))
+        .inner_margin(egui::Margin::symmetric(7.0, 3.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width() - 14.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(col.icon()).size(11.0).color(color));
+                ui.label(
+                    RichText::new(tr(col.title()))
+                        .size(11.5)
+                        .strong()
+                        .color(if count == 0 { theme.text_dim } else { color }),
+                )
+                .on_hover_text(tr(col.hint()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(if count == 0 {
+                            "—".to_string()
+                        } else {
+                            count.to_string()
+                        })
+                        .size(10.5)
+                        .color(theme.text_dim),
+                    );
+                });
+            });
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn column_ui(
     st: &mut KanbanState,
@@ -802,6 +2197,7 @@ fn column_ui(
     members: &[&Card],
     width: f32,
     height: f32,
+    now_ms: u64,
     acts: &mut Vec<KanbanAction>,
 ) {
     let color = col.color(theme);
@@ -818,40 +2214,34 @@ fn column_ui(
                     ui.set_width(width - 14.0);
                     ui.set_min_height(height - 14.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("●").size(10.0).color(color));
-                        ui.label(
-                            RichText::new(tr(col.title()))
-                                .size(12.5)
-                                .strong()
-                                .color(theme.text),
+                        ui.label(RichText::new(col.icon()).size(10.0).color(color));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(tr(col.title()))
+                                    .size(12.0)
+                                    .strong()
+                                    .color(theme.text),
+                            )
+                            .truncate(),
                         )
                         .on_hover_text(tr(col.hint()));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(members.len().to_string())
-                                        .size(11.0)
-                                        .color(theme.text_dim),
-                                );
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(members.len().to_string())
+                                    .size(11.0)
+                                    .color(theme.text_dim),
+                            );
+                        });
                     });
-                    // レーンカラーの下線 (どの状態かが遠目にも分かる)
-                    let (line, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 2.0),
-                        egui::Sense::hover(),
-                    );
+                    // 見出し下の色帯 (列の識別)
+                    let (line, _) = ui
+                        .allocate_exact_size(egui::vec2(ui.available_width(), 2.0), egui::Sense::hover());
                     ui.painter()
                         .rect_filled(line, 1.0_f32, color.gamma_multiply(0.6));
                     ui.add_space(6.0);
 
                     if members.is_empty() {
-                        ui.label(
-                            RichText::new(tr("— なし —"))
-                                .size(10.5)
-                                .color(theme.text_dim),
-                        );
+                        ui.label(RichText::new(tr("— なし —")).size(10.5).color(theme.text_dim));
                         return;
                     }
                     egui::ScrollArea::vertical()
@@ -859,7 +2249,7 @@ fn column_ui(
                         .auto_shrink(false)
                         .show(ui, |ui| {
                             for c in members {
-                                card_ui(st, ui, theme, c, acts);
+                                card_ui(st, ui, theme, c, col, now_ms, false, acts);
                                 ui.add_space(6.0);
                             }
                         });
@@ -868,28 +2258,83 @@ fn column_ui(
     );
 }
 
+/// 出力の勢いバー (直近 30 秒)。折れ線より棒の方が「呼吸している」感じが出る。
+fn pulse_bars(ui: &mut egui::Ui, height: f32, color: Color32, values: &[f32]) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    if values.is_empty() {
+        return;
+    }
+    let painter = ui.painter();
+    let max = values.iter().cloned().fold(1.0_f32, f32::max);
+    let n = values.len() as f32;
+    let bw = (rect.width() / n).max(1.0);
+    for (i, v) in values.iter().enumerate() {
+        let h = (rect.height() * (v / max)).max(if *v > 0.0 { 1.5 } else { 0.0 });
+        if h <= 0.0 {
+            continue;
+        }
+        let x = rect.left() + bw * i as f32;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x, rect.bottom() - h),
+            egui::pos2(x + (bw - 1.0).max(1.0), rect.bottom()),
+        );
+        // 新しいバケツほど濃く = 「いま」が目に入る
+        let a = 0.35 + 0.65 * (i as f32 / n);
+        painter.rect_filled(bar, 0.0, color.gamma_multiply(a));
+    }
+    painter.line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        Stroke::new(1.0_f32, color.gamma_multiply(0.25)),
+    );
+}
+
+/// 1 枚のカード。`wide` は縦モード (全幅) かどうか。
+#[allow(clippy::too_many_arguments)]
 fn card_ui(
     st: &mut KanbanState,
     ui: &mut egui::Ui,
     theme: &Theme,
     c: &Card,
+    lane: Column,
+    now_ms: u64,
+    wide: bool,
     acts: &mut Vec<KanbanAction>,
 ) {
-    let color = c.column.color(theme);
-    let stroke = if c.active {
-        Stroke::new(1.5_f32, theme.accent)
+    let color = lane.color(theme);
+    let selected = st.selected == Some(c.id);
+    // 着地ハイライト: 新しいレーンへ来た直後だけ枠が光って目を引く
+    let glow = st
+        .tracks
+        .get(&c.id)
+        .map(|t| t.lane.land_glow(now_ms))
+        .unwrap_or(0.0);
+    let stroke = if selected {
+        Stroke::new(2.0_f32, theme.accent)
+    } else if glow > 0.0 {
+        Stroke::new(1.0 + glow, color.gamma_multiply(0.4 + 0.6 * glow))
+    } else if c.active {
+        Stroke::new(1.5_f32, theme.accent_soft)
     } else {
         Stroke::new(1.0_f32, theme.border)
     };
-    // 余白クリックでも選択できるように、コンテナの判定を子より先に登録する
-    // (cockpit のセルと同じ作法。描画後の ui.interact だと子のクリックを奪う)。
+    let fill = if glow > 0.0 {
+        theme.panel_alt.lerp_to_gamma(color, 0.18 * glow)
+    } else {
+        theme.panel_alt
+    };
+
+    let track = st.tracks.get(&c.id).cloned();
+    // 👁 ボタンでライブ表示を閉じたか。閉じた直後に外側のクリック判定が
+    // 開き直してしまうのを防ぐため、内側から持ち帰る。
     let cell = ui.scope_builder(
         egui::UiBuilder::new()
             .id_salt(("kanban-card", c.id))
             .sense(egui::Sense::click()),
         |ui| {
+            let mut eye_toggled = false;
             egui::Frame::none()
-                .fill(theme.panel_alt)
+                .fill(fill)
                 .stroke(stroke)
                 .rounding(egui::Rounding::same(7.0))
                 .inner_margin(egui::Margin::same(7.0))
@@ -897,7 +2342,8 @@ fn card_ui(
                     ui.vertical(|ui| {
                         ui.set_width(ui.available_width());
                         ui.spacing_mut().item_spacing.y = 3.0;
-                        // 1 段目: 状態ドット + アイコン + 名前 / 右端: 稼働時間
+
+                        // ── 1 行目: 名前と稼働時間 ──
                         ui.horizontal(|ui| {
                             let dot = if c.running { "●" } else { "○" };
                             ui.label(RichText::new(dot).size(10.0).color(color));
@@ -913,31 +2359,51 @@ fn card_ui(
                                 )
                                 .truncate(),
                             );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(&c.uptime)
-                                            .size(9.5)
-                                            .color(theme.text_dim),
-                                    );
-                                },
-                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(&c.uptime).size(9.5).color(theme.text_dim));
+                            });
                         });
-                        // 2 段目: 状態チップ + ⏳ + 未読
+
+                        // ── 2 行目: 状態チップ + 経過 + 出どころ ──
                         ui.horizontal(|ui| {
+                            let (label, elapsed, source) = match &track {
+                                Some(t) => (
+                                    tr(t.activity.label()),
+                                    fmt_elapsed(t.elapsed_ms(now_ms)),
+                                    Some(t.source),
+                                ),
+                                None => (c.state_label.clone(), String::new(), None),
+                            };
                             egui::Frame::none()
                                 .fill(color.gamma_multiply(0.16))
                                 .rounding(egui::Rounding::same(5.0))
                                 .inner_margin(egui::Margin::symmetric(6.0, 1.0))
                                 .show(ui, |ui| {
                                     ui.label(
-                                        RichText::new(&c.state_label)
-                                            .size(10.0)
-                                            .strong()
-                                            .color(color),
+                                        RichText::new(&label).size(10.0).strong().color(color),
                                     );
                                 });
+                            if !elapsed.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("⏱ {elapsed}"))
+                                        .size(9.5)
+                                        .color(theme.text_dim),
+                                )
+                                .on_hover_text(tr("この状態が続いている時間"));
+                            }
+                            // 画面テキストからの推定は必ず「推定」と断る
+                            if let Some(s) = source {
+                                let mark = if s.is_guess() { "≈" } else { "✓" };
+                                ui.label(
+                                    RichText::new(mark)
+                                        .size(9.0)
+                                        .color(if s.is_guess() { theme.warn } else { theme.text_dim }),
+                                )
+                                .on_hover_text(trf(
+                                    "判定の出どころ: {src}",
+                                    &[("src", tr(s.label()))],
+                                ));
+                            }
                             if let Some(line) = &c.rate_limited {
                                 ui.label(RichText::new("⏳").size(10.0).color(theme.warn))
                                     .on_hover_text(trf(
@@ -950,21 +2416,48 @@ fn card_ui(
                                     .on_hover_text(tr("最後に見てから新しい出力があります"));
                             }
                         });
-                        // 3 段目: 📋 割り当てタスク = 何を実装させているか
+
                         if let Some(task) = &c.task {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(format!("📋 {task}"))
-                                        .size(11.0)
-                                        .color(theme.text),
+                                    RichText::new(format!("📋 {task}")).size(11.0).color(theme.text),
                                 )
                                 .truncate(),
                             )
                             .on_hover_text(task);
                         }
-                        // 4 段目: 「いま何をしているか」一言 (画面末尾のライブ行)。
-                        // ホバーで末尾数行のライブプレビューを出す。
-                        let doing = now_line(&c.tail_lines).unwrap_or("");
+
+                        // ── 直近の作業内容 (ファイル / コマンド) ──
+                        if let Some(t) = &track {
+                            if !t.last_file.is_empty() {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("✎ {}", t.last_file))
+                                            .size(10.0)
+                                            .monospace()
+                                            .color(theme.accent),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(tr("直近に触ったファイル (画面からの推定)"));
+                            }
+                            if !t.last_cmd.is_empty() {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("▸ {}", t.last_cmd))
+                                            .size(10.0)
+                                            .monospace()
+                                            .color(theme.ok),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(tr("直近のコマンド (画面からの推定)"));
+                            }
+                        }
+
+                        // ── 画面末尾の一言 (ホバーで数行のライブプレビュー) ──
+                        let tail: &[String] = track.as_ref().map(|t| &t.tail[..]).unwrap_or(&[]);
+                        let doing = now_line(tail).unwrap_or("");
                         let doing_label = if doing.is_empty() {
                             RichText::new(tr("まだ出力がありません"))
                                 .size(10.5)
@@ -976,27 +2469,30 @@ fn card_ui(
                                 .color(theme.text_dim)
                         };
                         let resp = ui.add(egui::Label::new(doing_label).truncate());
-                        if !c.tail_lines.is_empty() {
+                        if !tail.is_empty() {
                             resp.on_hover_ui(|ui| {
                                 ui.set_max_width(460.0);
-                                for line in &c.tail_lines {
+                                for line in tail {
                                     ui.label(
-                                        RichText::new(line)
-                                            .size(11.0)
-                                            .monospace()
-                                            .color(theme.text),
+                                        RichText::new(line).size(11.0).monospace().color(theme.text),
                                     );
                                 }
                             });
                         }
-                        // 承認待ちだけに出る目立つ操作列
+
+                        // ── 出力の勢い (直近 30 秒) ──
+                        if let Some(t) = &track {
+                            let series = t.pulse_series(now_ms);
+                            if series.iter().any(|v| *v > 0.0) || c.running {
+                                pulse_bars(ui, if wide { 16.0 } else { 12.0 }, color, &series);
+                            }
+                        }
+
                         if c.attention {
                             ui.horizontal(|ui| {
                                 if ui
                                     .button(RichText::new(tr("✅ 承認")).color(theme.ok))
-                                    .on_hover_text(tr(
-                                        "画面のプロンプトに合った承認キーを送ります",
-                                    ))
+                                    .on_hover_text(tr("画面のプロンプトに合った承認キーを送ります"))
                                     .clicked()
                                 {
                                     acts.push(KanbanAction::Approve(c.idx));
@@ -1009,8 +2505,17 @@ fn card_ui(
                                 }
                             });
                         }
-                        // 操作列
+
                         ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(selected, "👁")
+                                .on_hover_text(tr("このエージェントのライブ画面を開く"))
+                                .clicked()
+                            {
+                                st.selected = Some(c.id);
+                                st.live_closed = selected && !st.live_closed;
+                                eye_toggled = true;
+                            }
                             if ui
                                 .small_button("🔍")
                                 .on_hover_text(tr("下部パネルにフォーカス"))
@@ -1040,39 +2545,24 @@ fn card_ui(
                             {
                                 acts.push(KanbanAction::CyclePermission(c.idx));
                             }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .small_button("✕")
-                                        .on_hover_text(tr("閉じる"))
-                                        .clicked()
-                                    {
-                                        acts.push(KanbanAction::Remove(c.idx));
-                                    }
-                                    if ui
-                                        .small_button("⟳")
-                                        .on_hover_text(tr("再起動"))
-                                        .clicked()
-                                    {
-                                        acts.push(KanbanAction::Restart(c.idx));
-                                    }
-                                },
-                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("✕").on_hover_text(tr("閉じる")).clicked() {
+                                    acts.push(KanbanAction::Remove(c.idx));
+                                }
+                                if ui.small_button("⟳").on_hover_text(tr("再起動")).clicked() {
+                                    acts.push(KanbanAction::Restart(c.idx));
+                                }
+                            });
                         });
-                        // ✏ 指示入力欄 (開いているカードだけ)
+
                         if st.prompt_for == Some(c.id) {
                             ui.horizontal(|ui| {
                                 let input = ui.add(
                                     egui::TextEdit::singleline(&mut st.prompt_input)
-                                        // ID を明示して固定する: 自動 ID は列と
-                                        // 並び順に依存するため、入力中に他カードが
-                                        // 状態遷移するとフォーカスと IME 変換中
-                                        // テキストが消えてしまう
+                                        // カードが列を移動しても入力欄が生き残るよう
+                                        // セッション id で Id を固定する
                                         .id(egui::Id::new(("kanban-prompt", c.id)))
-                                        .desired_width(
-                                            (ui.available_width() - 56.0).max(80.0),
-                                        )
+                                        .desired_width((ui.available_width() - 56.0).max(80.0))
                                         .hint_text(tr("指示を入力… (Enter で送信)")),
                                 );
                                 if st.prompt_focus {
@@ -1091,20 +2581,22 @@ fn card_ui(
                                     st.prompt_input.clear();
                                     st.prompt_for = None;
                                 } else if enter {
-                                    // 空入力の Enter ではフォーカスを戻す
-                                    // (欄は開いたままなので打ち直せるように)
+                                    // 空 Enter は閉じずにフォーカスを戻す
                                     input.request_focus();
                                 }
                             });
                         }
                     });
                 });
+            eye_toggled
         },
     );
-    if cell.response.clicked()
-        || (cell.response.contains_pointer()
-            && ui.input(|i| i.pointer.primary_pressed()))
+    if !cell.inner
+        && (cell.response.clicked()
+            || (cell.response.contains_pointer() && ui.input(|i| i.pointer.primary_pressed())))
     {
+        st.selected = Some(c.id);
+        st.live_closed = false;
         acts.push(KanbanAction::Select(c.idx));
     }
 }
@@ -1310,7 +2802,11 @@ mod tests {
 
     #[test]
     fn supervisor_states_map_to_columns() {
-        assert_eq!(column_for(true, false, false, Some(S::Working)), Column::Working);
+        // 画面テキストを渡さない版なので「作業中」は思考中レーンに落ちる
+        assert_eq!(
+            column_for(true, false, false, Some(S::Working)),
+            Column::Thinking
+        );
         assert_eq!(column_for(true, false, false, Some(S::Idle)), Column::Ready);
         assert_eq!(
             column_for(true, false, false, Some(S::WaitingApproval)),
@@ -1328,9 +2824,436 @@ mod tests {
     fn state_label_follows_same_priority() {
         assert_eq!(state_label(false, false, false, Some(S::Working)), "終了");
         assert_eq!(state_label(true, true, false, None), "承認待ち");
-        assert_eq!(state_label(true, false, true, None), "レート制限");
-        assert_eq!(state_label(true, false, false, Some(S::Working)), "作業中");
+        assert_eq!(state_label(true, false, true, None), "レート制限中");
+        assert_eq!(state_label(true, false, false, Some(S::Working)), "思考中");
         assert_eq!(state_label(true, false, false, None), "起動中");
+    }
+
+    // ── アクティビティ分類 (表引き) ──
+
+    #[test]
+    fn contains_word_respects_ascii_boundaries() {
+        assert!(contains_word("cargo test --lib", "test"));
+        assert!(contains_word("bash(cargo test)", "test"));
+        // "latest" の中の "test" には当たらない
+        assert!(!contains_word("the latest build", "test"));
+        assert!(!contains_word("tests/foo.rs", "test"));
+        assert!(contains_word("tests/foo.rs", "tests"));
+        // 日本語は前後が ASCII 英数字にならないのでそのまま通る
+        assert!(contains_word("テストを実行中です", "テスト"));
+        assert!(!contains_word("", "test"));
+        assert!(!contains_word("test", ""));
+    }
+
+    #[test]
+    fn looks_like_path_accepts_any_os_shape() {
+        assert!(looks_like_path("src/kanban.rs"));
+        assert!(looks_like_path("C:\\work\\a.rs"));
+        assert!(looks_like_path("foo.rs"));
+        assert!(looks_like_path("./a/b"));
+        assert!(!looks_like_path("cargo"));
+        assert!(!looks_like_path("a.b c"));
+        assert!(!looks_like_path("--"));
+        // 拡張子が長すぎる (文中の句点など) は拾わない
+        assert!(!looks_like_path("foo.verylongextension"));
+    }
+
+    #[test]
+    fn pick_command_prefers_parens_then_colon() {
+        assert_eq!(pick_command("⏺ Bash(cargo test --lib)"), "cargo test --lib");
+        assert_eq!(pick_command("Running: npm install"), "npm install");
+        assert_eq!(pick_command("コマンド実行： ls -la"), "ls -la");
+        // 括弧もコロンも無ければ装飾だけ落として行全体
+        assert_eq!(pick_command("● Compiling foo"), "Compiling foo");
+        // Windows パスのドライブコロンで切らない
+        assert_eq!(
+            pick_command("Writing C:\\work\\a.rs"),
+            "Writing C:\\work\\a.rs"
+        );
+    }
+
+    /// PTY 末尾テキスト → アクティビティ の表テスト。
+    /// ベンダー CLI の表示が変わったら `SCREEN_RULES` だけ直せばよい。
+    #[test]
+    fn classify_screen_table() {
+        let cases: &[(&str, Option<Activity>, &str)] = &[
+            // 編集系
+            ("⏺ Update(src/kanban.rs)", Some(Activity::Editing), "src/kanban.rs"),
+            ("Edit(src/app.rs)", Some(Activity::Editing), "src/app.rs"),
+            ("● Writing tests/mod.rs", Some(Activity::Editing), "tests/mod.rs"),
+            ("apply_patch to lib/x.py", Some(Activity::Editing), "lib/x.py"),
+            ("ファイルを編集中: src/foo.rs", Some(Activity::Editing), "src/foo.rs"),
+            // パスに "tests" が入っていても「テストを回している」ではない
+            ("⏺ Update(tests/mod.rs)", Some(Activity::Editing), "tests/mod.rs"),
+            // 検証系 (実行より優先 — 人が知りたいのは「検証中」)
+            ("⏺ Bash(cargo test --lib)", Some(Activity::Verifying), "cargo test --lib"),
+            ("Compiling zaivern-code v0.4.15", Some(Activity::Verifying), ""),
+            ("テストを実行しています", Some(Activity::Verifying), ""),
+            // 実行系
+            ("⏺ Bash(git status)", Some(Activity::Running), "git status"),
+            ("Running: npm install", Some(Activity::Running), "npm install"),
+            ("コマンド実行: ls -la", Some(Activity::Running), "ls -la"),
+            // 思考系
+            ("✻ Thinking… (esc to interrupt)", Some(Activity::Thinking), ""),
+            ("調査中です…", Some(Activity::Thinking), ""),
+            ("Searching for foo", Some(Activity::Thinking), ""),
+            // 当たらない / 空
+            ("", None, ""),
+            ("   ", None, ""),
+            ("╭──────────────╮", None, ""),
+            ("こんにちは", None, ""),
+        ];
+        for (line, want, want_detail) in cases {
+            let tail = vec![line.to_string()];
+            let got = classify_screen(&tail);
+            match want {
+                Some(a) => {
+                    let (ga, gd) = got.unwrap_or_else(|| panic!("分類されない: {line:?}"));
+                    assert_eq!(ga, *a, "行 {line:?}");
+                    if !want_detail.is_empty() {
+                        assert_eq!(gd, *want_detail, "行 {line:?} の詳細");
+                    }
+                }
+                None => assert!(got.is_none(), "誤検知: {line:?} → {got:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_screen_strips_ansi_and_reads_newest_line() {
+        // ANSI 装飾つき + 新しい行が勝つ
+        let tail = vec![
+            "\u{1b}[32m⏺ Bash(git status)\u{1b}[0m".to_string(),
+            "\u{1b}[1m⏺ Update(src/theme.rs)\u{1b}[0m".to_string(),
+        ];
+        assert_eq!(
+            classify_screen(&tail),
+            Some((Activity::Editing, "src/theme.rs".to_string()))
+        );
+        // 空行は読み飛ばして、その手前の行で判定する
+        let tail = vec!["⏺ Bash(cargo build)".to_string(), "".to_string()];
+        assert_eq!(
+            classify_screen(&tail).map(|(a, _)| a),
+            Some(Activity::Verifying)
+        );
+    }
+
+    #[test]
+    fn classify_prefers_structured_signals_over_screen() {
+        let editing = vec!["⏺ Update(src/a.rs)".to_string()];
+        // 終了 > すべて
+        let r = classify(false, true, true, Some(S::Working), &editing);
+        assert_eq!((r.activity, r.source), (Activity::Exited, Source::Process));
+        // 承認プロンプト検出 > レート制限 > 見張り > 画面
+        let r = classify(true, true, true, Some(S::Working), &editing);
+        assert_eq!((r.activity, r.source), (Activity::Approval, Source::Prompt));
+        let r = classify(true, false, true, Some(S::Working), &editing);
+        assert_eq!(
+            (r.activity, r.source),
+            (Activity::RateLimited, Source::RateLimit)
+        );
+        // 見張りが「動いていない」と言うなら、画面の残骸に釣られない
+        let r = classify(true, false, false, Some(S::Idle), &editing);
+        assert_eq!((r.activity, r.source), (Activity::Idle, Source::Supervisor));
+        // 見張りが「動いている」と言うときだけ画面推定を採り、出どころを明示する
+        let r = classify(true, false, false, Some(S::Working), &editing);
+        assert_eq!((r.activity, r.source), (Activity::Editing, Source::Screen));
+        assert!(r.source.is_guess());
+        // 動いているが中身が読めない → 思考中 (見張り由来 = 推定ではない)
+        let r = classify(true, false, false, Some(S::Working), &[]);
+        assert_eq!(
+            (r.activity, r.source),
+            (Activity::Thinking, Source::Supervisor)
+        );
+        assert!(!r.source.is_guess());
+        // 異常系はすべて停滞レーン
+        for s in [S::Stalled, S::Looping, S::Errored, S::Crashed] {
+            let r = classify(true, false, false, Some(s), &editing);
+            assert_eq!(r.activity, Activity::Stalled);
+            assert_eq!(r.activity.column(), Column::Trouble);
+        }
+    }
+
+    // ── レーン移動のデバウンス ──
+
+    #[test]
+    fn lane_does_not_flicker_below_hold_threshold() {
+        let mut lt = LaneTracker::new(Column::Editing, 0);
+        // 100ms ごとに編集↔実行が往復しても、しきい値 (400ms) 未満なので動かない
+        let seq: [(u64, Column); 6] = [
+            (100, Column::Running),
+            (200, Column::Editing),
+            (300, Column::Running),
+            (400, Column::Editing),
+            (500, Column::Running),
+            (600, Column::Editing),
+        ];
+        for (t, want) in seq {
+            let moved = lt.step(want, t);
+            assert!(!moved, "t={t} で動いてはいけない");
+            assert_eq!(lt.lane(), Column::Editing);
+        }
+    }
+
+    #[test]
+    fn lane_moves_promptly_once_state_holds() {
+        let mut lt = LaneTracker::new(Column::Editing, 0);
+        assert!(!lt.step(Column::Running, 1_000)); // 候補として登録
+        assert!(!lt.step(Column::Running, 1_300)); // まだ 300ms
+        assert!(lt.step(Column::Running, 1_400)); // 400ms 到達 → 移動
+        assert_eq!(lt.lane(), Column::Running);
+        assert_eq!(lt.landed_ms(), 1_400);
+        // 着地ハイライトは時間で減衰し、やがて消える
+        assert!(lt.land_glow(1_400) > 0.9);
+        assert!(lt.land_glow(1_850) > 0.0);
+        assert_eq!(lt.land_glow(2_400), 0.0);
+    }
+
+    #[test]
+    fn strong_signals_move_without_waiting() {
+        // 承認待ち・異常・終了は hold_ms == 0 なので即座に動く
+        for col in [Column::Approval, Column::Trouble, Column::Done] {
+            let mut lt = LaneTracker::new(Column::Running, 0);
+            assert!(lt.step(col, 10), "{col:?} は即移動のはず");
+            assert_eq!(lt.lane(), col);
+        }
+        assert_eq!(Column::Approval.hold_ms(), 0);
+        assert_eq!(Column::Thinking.hold_ms(), LANE_HOLD_MS);
+    }
+
+    #[test]
+    fn lane_cancels_pending_when_state_returns() {
+        let mut lt = LaneTracker::new(Column::Editing, 0);
+        assert!(!lt.step(Column::Verifying, 100));
+        // 元に戻ったら候補は取り下げ → その後 Verifying が来ても 0 から数え直す
+        assert!(!lt.step(Column::Editing, 200));
+        assert!(!lt.step(Column::Verifying, 300));
+        assert!(!lt.step(Column::Verifying, 600)); // 300ms しか経っていない
+        assert!(lt.step(Column::Verifying, 700));
+        assert_eq!(lt.lane(), Column::Verifying);
+    }
+
+    // ── 選択の安定性 ──
+
+    #[test]
+    fn selection_survives_reorder_and_insert() {
+        let cards = vec![
+            card_id(10, Column::Ready),
+            card_id(20, Column::Running),
+            card_id(30, Column::Done),
+        ];
+        assert_eq!(resolve_selection(Some(20), 1, &cards), Some((20, 1)));
+        // 並べ替え: 位置は変わっても同じ ID が選ばれたまま
+        let reordered = vec![
+            card_id(30, Column::Done),
+            card_id(20, Column::Editing),
+            card_id(10, Column::Ready),
+        ];
+        assert_eq!(resolve_selection(Some(20), 1, &reordered), Some((20, 1)));
+        // 挿入で後ろへずれても追随する
+        let inserted = vec![
+            card_id(99, Column::Ready),
+            card_id(10, Column::Ready),
+            card_id(20, Column::Running),
+        ];
+        assert_eq!(resolve_selection(Some(20), 1, &inserted), Some((20, 2)));
+    }
+
+    #[test]
+    fn selection_falls_back_when_card_removed() {
+        let cards = vec![card_id(10, Column::Ready), card_id(30, Column::Done)];
+        // 20 が消えた → 直前に居た位置 (1) のカードへ寄せる
+        assert_eq!(resolve_selection(Some(20), 1, &cards), Some((30, 1)));
+        // 位置が範囲外なら末尾へ丸める
+        assert_eq!(resolve_selection(Some(20), 9, &cards), Some((30, 1)));
+        // 1 枚も無ければ選択なし
+        assert_eq!(resolve_selection(Some(20), 0, &[]), None);
+    }
+
+    #[test]
+    fn move_selection_wraps_and_handles_empty() {
+        let order = [10_u64, 20, 30];
+        assert_eq!(move_selection(&order, Some(10), 1), Some(20));
+        assert_eq!(move_selection(&order, Some(30), 1), Some(10)); // 折り返し
+        assert_eq!(move_selection(&order, Some(10), -1), Some(30));
+        // 未選択なら端から
+        assert_eq!(move_selection(&order, None, 1), Some(10));
+        assert_eq!(move_selection(&order, None, -1), Some(30));
+        // 消えた ID を持っていても壊れない
+        assert_eq!(move_selection(&order, Some(99), 1), Some(10));
+        assert_eq!(move_selection(&[], Some(10), 1), None);
+    }
+
+    // ── レイアウト判定 ──
+
+    #[test]
+    fn layout_auto_picks_vertical_for_tall_or_narrow() {
+        // 広い横長 → 横
+        assert!(!use_vertical(LayoutMode::Auto, 1600.0, 700.0));
+        // 細い → 縦
+        assert!(use_vertical(LayoutMode::Auto, 700.0, 500.0));
+        // 縦長 (サブディスプレイ縦置き) → 縦
+        assert!(use_vertical(LayoutMode::Auto, 1000.0, 1400.0));
+        // 手動指定は窓の形に関係なく従う
+        assert!(!use_vertical(LayoutMode::Horizontal, 400.0, 1400.0));
+        assert!(use_vertical(LayoutMode::Vertical, 2000.0, 300.0));
+    }
+
+    #[test]
+    fn layout_mode_round_trips_through_persisted_u8() {
+        for m in [
+            LayoutMode::Auto,
+            LayoutMode::Horizontal,
+            LayoutMode::Vertical,
+        ] {
+            assert_eq!(LayoutMode::from_u8(m.to_u8()), m);
+        }
+        // 未知の値は既定 (自動) へ倒す
+        assert_eq!(LayoutMode::from_u8(200), LayoutMode::Auto);
+    }
+
+    // ── 経過時間 / 出力の勢い ──
+
+    #[test]
+    fn fmt_elapsed_formats_minutes_and_hours() {
+        assert_eq!(fmt_elapsed(0), "0:00");
+        assert_eq!(fmt_elapsed(7_400), "0:07");
+        assert_eq!(fmt_elapsed(151_000), "2:31");
+        assert_eq!(fmt_elapsed(3_840_000), "1:04:00");
+    }
+
+    #[test]
+    fn tail_delta_counts_only_new_lines() {
+        let prev = vec!["abc".to_string(), "de".to_string()];
+        // 同じ行は数えない (スクロールしただけ)
+        assert_eq!(tail_delta(&prev, &prev), 0);
+        // 新しい行の文字数だけ
+        let cur = vec!["de".to_string(), "hello".to_string()];
+        assert_eq!(tail_delta(&prev, &cur), 5);
+        // 全部新しい
+        assert_eq!(tail_delta(&[], &cur), 7);
+        // マルチバイトは文字数で数える
+        assert_eq!(tail_delta(&[], &["あいう".to_string()]), 3);
+        assert_eq!(tail_delta(&prev, &[]), 0);
+    }
+
+    #[test]
+    fn bucket_series_splits_window_into_buckets() {
+        // 窓 1000ms / 4 バケツ = 250ms 刻み。now=1000 なら窓は [0, 1000]
+        let samples = [(0_u64, 1_u64), (300, 2), (600, 4), (900, 8)];
+        let got = bucket_series(&samples, 1_000, 1_000, 4);
+        assert_eq!(got, vec![1.0, 2.0, 4.0, 8.0]);
+        // 窓の外 (古すぎる / 未来) は無視
+        let samples = [(0_u64, 5_u64), (2_000, 7)];
+        assert_eq!(bucket_series(&samples, 1_500, 1_000, 2), vec![0.0, 0.0]);
+        // 同じバケツに落ちる点は足し合わせる
+        let samples = [(510_u64, 1_u64), (590, 2)];
+        assert_eq!(bucket_series(&samples, 1_000, 1_000, 2), vec![0.0, 3.0]);
+        // 端の点 (now ちょうど) は最後のバケツへ丸める
+        assert_eq!(bucket_series(&[(1_000, 9)], 1_000, 1_000, 4)[3], 9.0);
+        assert!(bucket_series(&[(0, 1)], 1_000, 1_000, 0).is_empty());
+    }
+
+    // ── 追跡状態 (サンプリング周期・レーン集計) ──
+
+    #[test]
+    fn sample_due_is_slow_while_idle_and_fast_while_busy() {
+        let mut st = KanbanState::default();
+        // 初回は必ずサンプルする
+        assert!(st.sample_due(0));
+        // 静かなら 1 秒に 1 回
+        assert!(!st.sample_due(500));
+        assert!(st.sample_due(1_000));
+        // 動き出したら ~6.7Hz
+        let mut c = card_id(1, Column::Running);
+        c.sup = Some(S::Working);
+        c.tail_lines = vec!["⏺ Bash(cargo build)".to_string()];
+        st.update_tracks(&[c], 1_000, true);
+        assert!(!st.sample_due(1_100));
+        assert!(st.sample_due(1_200));
+        assert_eq!(st.next_repaint_ms(), 33, "着地アニメ中は高頻度");
+    }
+
+    #[test]
+    fn idle_board_sleeps_and_drops_dead_tracks() {
+        let mut st = KanbanState::default();
+        let mut a = card_id(1, Column::Done);
+        a.running = false;
+        let lanes = st.update_tracks(&[a], 0, true);
+        assert_eq!(lanes, vec![Column::Done]);
+        // 誰も動いていない → 2 秒に 1 回でよい
+        assert!(!st.busy);
+        assert!(!st.any_running);
+        // 着地アニメが切れたら寝る
+        let mut a = card_id(1, Column::Done);
+        a.running = false;
+        st.update_tracks(&[a], 5_000, true);
+        assert_eq!(st.next_repaint_ms(), ASLEEP_REPAINT_MS);
+        // カードが消えたら追跡も捨てる
+        st.update_tracks(&[], 6_000, true);
+        assert!(st.track(1).is_none());
+    }
+
+    #[test]
+    fn tracks_debounce_lane_and_keep_last_file_and_command() {
+        let mut st = KanbanState::default();
+        let mk = |tail: &str| {
+            let mut c = card_id(7, Column::Ready);
+            c.sup = Some(S::Working);
+            c.tail_lines = vec![tail.to_string()];
+            c
+        };
+        // 編集で着地
+        st.update_tracks(&[mk("⏺ Update(src/a.rs)")], 0, true);
+        st.update_tracks(&[mk("⏺ Update(src/a.rs)")], 500, true);
+        assert_eq!(st.track(7).unwrap().lane.lane(), Column::Editing);
+        assert_eq!(st.track(7).unwrap().last_file, "src/a.rs");
+        // 一瞬だけ実行が見えても動かない (400ms 未満)
+        let lanes = st.update_tracks(&[mk("⏺ Bash(git status)")], 600, true);
+        assert_eq!(lanes, vec![Column::Editing]);
+        // 続けば移動し、コマンドも覚える
+        let lanes = st.update_tracks(&[mk("⏺ Bash(git status)")], 1_100, true);
+        assert_eq!(lanes, vec![Column::Running]);
+        let t = st.track(7).unwrap();
+        assert_eq!(t.last_cmd, "git status");
+        // 編集で覚えたファイルは消えない (別レーンでも文脈として残す)
+        assert_eq!(t.last_file, "src/a.rs");
+        // 経過タイマーはレーン移動ではなく「アクティビティが変わった時点」から数える
+        // (実行が見えたのは t=600、レーン移動はその 500ms 後)
+        assert_eq!(t.elapsed_ms(1_100), 500);
+    }
+
+    #[test]
+    fn stale_frames_reuse_last_sampled_screen() {
+        let mut st = KanbanState::default();
+        let mut c = card_id(3, Column::Ready);
+        c.sup = Some(S::Working);
+        c.tail_lines = vec!["⏺ Bash(cargo test)".to_string()];
+        st.update_tracks(&[c], 0, true);
+        assert_eq!(st.track(3).unwrap().activity, Activity::Verifying);
+        // 画面を渡さないフレーム (fresh=false) でも前回ぶんで同じ判定になる
+        let mut c = card_id(3, Column::Ready);
+        c.sup = Some(S::Working);
+        st.update_tracks(&[c], 100, false);
+        assert_eq!(st.track(3).unwrap().activity, Activity::Verifying);
+        assert_eq!(st.track(3).unwrap().elapsed_ms(100), 100, "状態は継続");
+    }
+
+    #[test]
+    fn tally_lanes_uses_debounced_lanes() {
+        let cards = vec![
+            card_id(1, Column::Ready),
+            card_id(2, Column::Ready),
+            card_id(3, Column::Ready),
+        ];
+        let lanes = [Column::Editing, Column::Verifying, Column::Approval];
+        let t = tally_lanes(&cards, &lanes);
+        assert_eq!(t.total, 3);
+        assert_eq!(t.editing, 1);
+        assert_eq!(t.verifying, 1);
+        assert_eq!(t.working, 2, "思考/編集/実行/検証はまとめて作業中");
+        assert_eq!(t.approval, 1);
+        assert_eq!(t.ready, 0);
     }
 
     // ── ダッシュボード用の純関数 ──
@@ -1349,6 +3272,7 @@ mod tests {
             rate_limited: None,
             attention: false,
             running,
+            sup: None,
             permission_badge: "",
             can_cycle: false,
             tail_lines: Vec::new(),
@@ -1356,11 +3280,19 @@ mod tests {
         }
     }
 
+    /// id を指定したカード (選択安定性のテスト用)。
+    fn card_id(id: u64, column: Column) -> Card {
+        Card {
+            id,
+            ..card(column, true)
+        }
+    }
+
     #[test]
     fn tally_counts_columns_and_running() {
         let cards = vec![
-            card(Column::Working, true),
-            card(Column::Working, true),
+            card(Column::Editing, true),
+            card(Column::Running, true),
             card(Column::Approval, true),
             card(Column::Done, false),
         ];
@@ -1368,6 +3300,8 @@ mod tests {
         assert_eq!(t.total, 4);
         assert_eq!(t.running, 3);
         assert_eq!(t.working, 2);
+        assert_eq!(t.editing, 1);
+        assert_eq!(t.exec, 1);
         assert_eq!(t.approval, 1);
         assert_eq!(t.done, 1);
         assert_eq!(t.ready, 0);
@@ -1508,7 +3442,10 @@ mod tests {
                                 });
                         });
                         ui.add_space(4.0);
-                        let _ = super::ui(st, ui, theme, cards, &[], &[], now_ms);
+                        let mut live = |_: &mut egui::Ui, _: usize| None;
+                        let _ = super::ui(
+                            st, ui, theme, cards, &[], &[], now_ms, true, &mut live,
+                        );
                     });
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // エディタ/ターミナル相当: 全域が click_and_drag を持つ
