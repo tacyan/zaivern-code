@@ -260,9 +260,16 @@ pub struct AgentInputBuffer {
     /// 非アクティブな送信先の下書き置き場 (アクティブ分は `text` が保持する)。
     /// 空文字は積まない — 使われなかったエージェント分でメモリを食わないように。
     drafts: HashMap<ComposerTarget, String>,
-    /// ユーザーが自分でブロードキャストを選んだか。
-    /// true の間は `sync_target` がアクティブエージェントへ勝手に引き戻さない。
-    broadcast_pinned: bool,
+    /// ユーザーが**自分で選んだ**送信先。`sync_target` はこれを踏み潰さない。
+    ///
+    /// 以前は「全員宛てを選んだか」の bool しか持っていなかったため、チップで
+    /// 1 体を名指ししても次のフレームの追従がアクティブなエージェント
+    /// (= 起動順で一番最後) へ引き戻していた。指名も同じように守る。
+    pinned: Option<ComposerTarget>,
+    /// 直近の `sync_target` で見たアクティブなエージェント。
+    /// 「ユーザーがアクティブを動かした」のか「同じ状態を描き直しただけ」なのかは
+    /// これでしか区別できない。
+    last_active: Option<u64>,
 }
 
 impl Default for AgentInputBuffer {
@@ -285,7 +292,8 @@ impl AgentInputBuffer {
             max_undo_depth: 100,
             target: ComposerTarget::Broadcast,
             drafts: HashMap::new(),
-            broadcast_pinned: false,
+            pinned: None,
+            last_active: None,
         }
     }
 
@@ -320,34 +328,44 @@ impl AgentInputBuffer {
         self.redo_stack.clear();
     }
 
-    /// 「全員宛て」をユーザーが明示的に選んだ状態にする / 解除する
-    pub fn pin_broadcast(&mut self, pinned: bool) {
-        self.broadcast_pinned = pinned;
-    }
-
-    /// 全員宛てがピン留めされているか
-    #[allow(dead_code)]
-    pub fn broadcast_pinned(&self) -> bool {
-        self.broadcast_pinned
+    /// **ユーザーが自分で選んだ送信先**にする (チップを押した等)。
+    ///
+    /// `set_target` との違いはピン留めだけ — こちらで決めた宛先は
+    /// [`sync_target`](Self::sync_target) の追従に踏み潰されない。
+    pub fn pick_target(&mut self, t: ComposerTarget) {
+        self.pinned = Some(t);
+        self.set_target(t);
     }
 
     /// アクティブなエージェントに送信先を追従させる。
     ///
-    /// - `active = Some(id)`: 既定でそのエージェント宛て。ただしユーザーが自分で
-    ///   全員宛てを選んでいる (ピン留め) 間はそれを尊重する。
+    /// - `active = Some(id)`: 既定でそのエージェント宛て。ただし**ユーザーが自分で
+    ///   選んだ宛先 (ピン留め) は踏み潰さない**:
+    ///   - 全員宛ては「モード」なので、アクティブが動いても外れない。
+    ///   - 1 体の名指しは、ユーザーが**アクティブを動かすまで**守る
+    ///     (動かしたらそちらが新しい意思なので追従する)。
     /// - `active = None`: 宛先にできるエージェントがいないので全員宛てへ戻す。
     ///
     /// 切り替えが起きたら true。
     pub fn sync_target(&mut self, active: Option<u64>) -> bool {
+        // 「同じ状態を描き直しただけ」か「アクティブが実際に動いた」か。
+        // UI は毎フレームここを通るので、この区別が無いと指名が 1 フレームで消える。
+        let moved = self.last_active != active;
+        self.last_active = active;
         let want = match active {
-            None => ComposerTarget::Broadcast,
-            Some(id) => {
-                if self.broadcast_pinned && self.target.is_broadcast() {
-                    ComposerTarget::Broadcast
-                } else {
+            None => {
+                // 宛先にできる相手が居ない — ユーザーの選択も意味を失う
+                self.pinned = None;
+                ComposerTarget::Broadcast
+            }
+            Some(id) => match self.pinned {
+                Some(ComposerTarget::Broadcast) => ComposerTarget::Broadcast,
+                Some(t @ ComposerTarget::Agent(_)) if !moved => t,
+                _ => {
+                    self.pinned = None;
                     ComposerTarget::Agent(id)
                 }
-            }
+            },
         };
         if want == self.target {
             return false;
@@ -429,6 +447,10 @@ impl AgentInputBuffer {
     pub fn forget_agent(&mut self, id: u64) {
         let t = ComposerTarget::Agent(id);
         self.drafts.remove(&t);
+        if self.pinned == Some(t) {
+            // 消えた相手へのピン留めを残すと、以降の追従が二度と効かなくなる
+            self.pinned = None;
+        }
         if self.target == t {
             // 退避させずに捨てる (set_target だと空を書き戻してしまう)
             self.text.clear();
@@ -937,19 +959,59 @@ mod tests {
         assert_eq!(b.target(), ComposerTarget::Agent(8));
 
         // ユーザーが自分で全員宛てを選んだら、アクティブが変わっても戻されない
-        b.pin_broadcast(true);
-        b.set_target(BC);
+        b.pick_target(BC);
         assert!(!b.sync_target(Some(9)));
         assert_eq!(b.target(), BC);
 
-        // ピンを外せばまた追従する
-        b.pin_broadcast(false);
-        assert!(b.sync_target(Some(9)));
+        // 自分で 1 体を指名し直せば、そちらが新しい意思になる
+        b.pick_target(ComposerTarget::Agent(9));
+        assert!(!b.sync_target(Some(9)));
         assert_eq!(b.target(), ComposerTarget::Agent(9));
 
         // 宛先にできるエージェントが居なくなったら全員宛てへ
         assert!(b.sync_target(None));
         assert_eq!(b.target(), BC);
+    }
+
+    /// **選んだ宛先が「アクティブ = 一番最後のエージェント」へ引き戻されない。**
+    ///
+    /// UI は毎フレーム `sync_target` を通る。追従がレベルトリガのままだと、
+    /// チップで選んだ相手が次のフレームでアクティブへ戻され、
+    /// 「どれを押しても最後が選ばれる」ように見えていた。
+    #[test]
+    fn 選んだ宛先は毎フレームの追従で踏み潰されない() {
+        let mut b = AgentInputBuffer::new();
+        // アクティブは起動順で最後 (agents.rs: active = sessions.len() - 1)
+        let last = 4;
+        b.sync_target(Some(last));
+        assert_eq!(b.target(), ComposerTarget::Agent(last));
+
+        // 先頭のエージェントを名指しする
+        b.pick_target(A1);
+        for frame in 0..5 {
+            assert!(!b.sync_target(Some(last)), "{frame}: 追従が指名を上書きした");
+            assert_eq!(b.target(), A1, "{frame} フレーム後に最後へ戻された");
+        }
+
+        // ユーザーがアクティブを動かしたら (タイルを押した等) そちらへ追従する
+        assert!(b.sync_target(Some(2)));
+        assert_eq!(b.target(), A2, "アクティブの切り替えに追従しなくなった");
+    }
+
+    /// ピン留めした相手が消えたら、ピンも一緒に落とす。
+    /// 残すと以降の追従が二度と効かず、無関係な相手へ送り続けることになる。
+    #[test]
+    fn 消えたエージェントへのピン留めは残らない() {
+        let mut b = AgentInputBuffer::new();
+        b.sync_target(Some(1));
+        b.pick_target(A2);
+        assert_eq!(b.target(), A2);
+
+        // 2 番が畳まれた → 全員宛てへ戻り、ピンも消える
+        b.retain_agents(&[1]);
+        assert_eq!(b.target(), BC, "消えた相手を宛先にしたままにしてはいけない");
+        assert!(b.sync_target(Some(1)), "ピンが残って追従が効かない");
+        assert_eq!(b.target(), A1);
     }
 
     #[test]

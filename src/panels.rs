@@ -1410,15 +1410,11 @@ pub fn agent_composer_inline_ui(
                 ))
                 .clicked()
             {
+                // どちらもユーザーの明示的な指定なので、次のフレームの追従で
+                // 踏み潰されないよう pick_target で確定させる。
                 match (bcast, target) {
-                    (true, Some((id, _))) => {
-                        buf.pin_broadcast(false);
-                        buf.set_target(ComposerTarget::Agent(id));
-                    }
-                    _ => {
-                        buf.pin_broadcast(true);
-                        buf.set_target(ComposerTarget::Broadcast);
-                    }
+                    (true, Some((id, _))) => buf.pick_target(ComposerTarget::Agent(id)),
+                    _ => buf.pick_target(ComposerTarget::Broadcast),
                 }
             }
 
@@ -1541,8 +1537,7 @@ pub fn composer_target_chips(
                     .on_hover_text(tr("起動中のすべてのエージェントへ送ります"))
                     .clicked()
                 {
-                    buf.pin_broadcast(true);
-                    buf.set_target(ComposerTarget::Broadcast);
+                    buf.pick_target(ComposerTarget::Broadcast);
                 }
                 for (id, label) in targets {
                     let sel = buf.target() == ComposerTarget::Agent(*id);
@@ -1561,8 +1556,9 @@ pub fn composer_target_chips(
                         })
                         .inner;
                     if clicked {
-                        buf.pin_broadcast(false);
-                        buf.set_target(ComposerTarget::Agent(*id));
+                        // 明示的な指名。次のフレームの `sync_target` が
+                        // アクティブ (= 起動順で最後) へ引き戻さないよう確定させる。
+                        buf.pick_target(ComposerTarget::Agent(*id));
                     }
                 }
                 let others = buf.pending_draft_count();
@@ -2777,8 +2773,7 @@ mod tests {
                     assert_ne!(b.target(), ComposerTarget::Agent(*id));
                 }
                 // 明示的に全員宛てを選ぶとピン留めされ、追従で戻されない
-                b.pin_broadcast(true);
-                b.set_target(ComposerTarget::Broadcast);
+                b.pick_target(ComposerTarget::Broadcast);
                 b.sync_target(Some(1));
                 assert!(b.target().is_broadcast(), "n={n}: ピン留めが尊重されない");
             }
@@ -2815,12 +2810,11 @@ mod tests {
     #[test]
     fn 宛先の追従はピン留めを尊重する() {
         let mut b = AgentInputBuffer::new();
-        b.pin_broadcast(true);
-        b.set_target(ComposerTarget::Broadcast);
+        b.pick_target(ComposerTarget::Broadcast);
         b.sync_target(Some(9));
         assert!(b.target().is_broadcast(), "Cockpit のピン留めが壊れた");
-        // ピン留めを外せば追従が効き、宛先指名の送信になる
-        b.pin_broadcast(false);
+        // 自分で 1 体を指名し直せば、そちらが新しいピン留めになる
+        b.pick_target(ComposerTarget::Agent(9));
         b.sync_target(Some(9));
         assert_eq!(b.target(), ComposerTarget::Agent(9));
         // 空は送らない → 中身があれば必ず SendTo (Send にはならない)
@@ -2831,6 +2825,137 @@ mod tests {
             ComposerAction::SendTo(9, "これを見て".into()),
             "1 体宛ての送信が一斉送信へ落ちた"
         );
+    }
+
+    // ── 宛先チップを「本物のクリック」で押す (ヘッドレス) ─────────
+
+    /// ヘッドレス描画用の入力。画面サイズを固定して幾何を再現可能にする。
+    fn probe_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// Cockpit の 1 フレームぶん。**app.rs と同じ順序**で描く
+    /// (ヘッダーの 1 行帯 → その下の宛先チップ)。
+    fn cockpit_frame(
+        ctx: &egui::Context,
+        buf: &mut AgentInputBuffer,
+        active: (u64, &str),
+        targets: &[(u64, String)],
+        input: egui::RawInput,
+    ) {
+        let theme = crate::theme::by_name("dark");
+        let mut expand = false;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = agent_composer_inline_ui(ui, &theme, buf, Some(active), &mut expand);
+                composer_target_chips(ui, &theme, buf, targets);
+            });
+        });
+    }
+
+    /// 押下 → 解放の 2 フレームで本物のクリックを 1 回入れる。
+    /// egui の当たり判定は**前フレームの矩形**に対して走るのでフレームを分ける。
+    fn cockpit_click(
+        ctx: &egui::Context,
+        buf: &mut AgentInputBuffer,
+        active: (u64, &str),
+        targets: &[(u64, String)],
+        pos: egui::Pos2,
+    ) {
+        let btn = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let down = vec![egui::Event::PointerMoved(pos), btn(true)];
+        cockpit_frame(ctx, buf, active, targets, probe_input(down));
+        cockpit_frame(ctx, buf, active, targets, probe_input(vec![btn(false)]));
+    }
+
+    /// `want` のチップが実際に載っている座標を総当たりで探す。
+    /// egui の内部 ID 採番には一切依存せず、「押した結果」だけで判定する。
+    fn find_chip(
+        ctx: &egui::Context,
+        active: (u64, &str),
+        targets: &[(u64, String)],
+        want: u64,
+    ) -> egui::Pos2 {
+        assert_ne!(want, active.0, "アクティブと同じ ID では探せない");
+        let mut y = 4.0;
+        while y < 90.0 {
+            let mut x = 4.0;
+            while x < 560.0 {
+                let pos = egui::pos2(x, y);
+                let mut probe = AgentInputBuffer::new();
+                cockpit_click(ctx, &mut probe, active, targets, pos);
+                if probe.target() == ComposerTarget::Agent(want) {
+                    return pos;
+                }
+                x += 5.0;
+            }
+            y += 5.0;
+        }
+        panic!("宛先チップ (id={want}) が画面上に見つからない");
+    }
+
+    /// **選んだ宛先が、次のフレームで「一番最後のエージェント」へ戻されない。**
+    ///
+    /// Cockpit は毎フレーム `agent_composer_inline_ui` (= `sync_target`) →
+    /// 宛先チップ、の順で描く。アクティブなエージェントは起動のたび
+    /// `agents.rs` で `sessions.len() - 1` (= 一番最後) になるので、追従が
+    /// ユーザーの指名を踏み潰すと「どれを押しても最後が選ばれる」に見える。
+    #[test]
+    fn 宛先チップで選んだエージェントが追従で最後へ戻らない() {
+        // 同名のエージェントを混ぜる (同じ種類を複製起動したときの実際の並び)
+        let names: Vec<String> = ["👾 Claude", "🤖 Codex", "👾 Claude", "👾 Claude"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let targets: Vec<(u64, String)> = (1..=names.len() as u64)
+            .zip(disambiguate_labels(&names))
+            .collect();
+        // アクティブは常に「最後」= agents.rs の `active = sessions.len() - 1`
+        let (last_id, last_label) = targets.last().cloned().expect("空でない");
+        let active = (last_id, last_label.as_str());
+        let want = targets[1].0; // 真ん中 (2 番目) を選ぶ
+
+        let ctx = egui::Context::default();
+        let mut buf = AgentInputBuffer::new();
+        cockpit_frame(&ctx, &mut buf, active, &targets, probe_input(vec![]));
+        assert_eq!(
+            buf.target(),
+            ComposerTarget::Agent(last_id),
+            "既定はアクティブ (= 最後) のはず"
+        );
+
+        let pos = find_chip(&ctx, active, &targets, want);
+
+        let mut buf = AgentInputBuffer::new();
+        cockpit_frame(&ctx, &mut buf, active, &targets, probe_input(vec![]));
+        cockpit_click(&ctx, &mut buf, active, &targets, pos);
+        assert_eq!(
+            buf.target(),
+            ComposerTarget::Agent(want),
+            "クリックそのものが効いていない"
+        );
+
+        // ── 本題: 次のフレーム (アクティブは最後のまま) ──
+        for frame in 0..3 {
+            cockpit_frame(&ctx, &mut buf, active, &targets, probe_input(vec![]));
+            assert_eq!(
+                buf.target(),
+                ComposerTarget::Agent(want),
+                "{frame} フレーム後に宛先がアクティブ (= 最後のエージェント) へ引き戻された"
+            );
+        }
     }
 
     // ── 統合承認キューのパネル ─────────────────────────────────

@@ -1782,6 +1782,12 @@ impl KanbanState {
         let mut busy = false;
         let mut animating = false;
         let mut any_running = false;
+        // 追跡がまだ空 = 看板を開いた最初のフレーム。ここでは全カードが
+        // 「初めて見るカード」なので、**起動の合図として扱ってはいけない**。
+        let first_fill = self.tracks.is_empty();
+        // このフレームで初めて現れたカード。ループの中で選択を書き換えると
+        // 最後の 1 枚が必ず勝ってしまうので、数え終わってから決める。
+        let mut arrived: Vec<u64> = Vec::new();
         for c in cards {
             if c.running {
                 any_running = true;
@@ -1806,13 +1812,8 @@ impl KanbanState {
                 }
             };
 
-            // 初めて見るカード = いま起動したエージェント。
-            // **画面は組み替えず**、選択とスクロールだけで「これが始まった」を示す。
-            // (端末を勝手に開くと看板が半分に潰れ、どこを見ればよいか分からなくなる)
-            let fresh_card = !self.tracks.contains_key(&c.id);
-            if fresh_card {
-                self.selected = Some(c.id);
-                self.scroll_to_sel = true;
+            if !self.tracks.contains_key(&c.id) {
+                arrived.push(c.id);
             }
             let track = self
                 .tracks
@@ -1860,6 +1861,17 @@ impl KanbanState {
             if read.activity.is_busy() || track.recently_noisy(now_ms) {
                 busy = true;
             }
+        }
+        // 新しく起動したエージェントは、**画面を組み替えず**選択とスクロールだけで
+        // 「これが始まった」を示す (端末を勝手に開くと看板が半分に潰れる)。
+        //
+        // 示すのは **1 体だけ増えたとき** に限る。初回の総取り込みや、ワークスペース
+        // 復元でまとめて現れたときにも書き換えていたため、ループの最後 =
+        // 起動順で一番最後のエージェントが必ず選ばれ、ユーザーがどれを選んでも
+        // そこへ吸われていた。誰の意思でもない選択は動かさない方が驚きが少ない。
+        if !first_fill && arrived.len() == 1 {
+            self.selected = Some(arrived[0]);
+            self.scroll_to_sel = true;
         }
         // 消えたセッションの追跡は捨てる (無限に太らせない)
         self.tracks.retain(|id, _| cards.iter().any(|c| c.id == *id));
@@ -4466,6 +4478,42 @@ mod tests {
         // カードが消えたら追跡も捨てる
         st.update_tracks(&[], 6_000, true);
         assert!(st.track(1).is_none());
+    }
+
+    /// **看板を開いただけで「一番最後のエージェント」が選ばれない。**
+    ///
+    /// 追跡が空の初回フレームは全カードが「初めて見るカード」になる。
+    /// ここで 1 枚ずつ選択を書き換えると、ループの最後 = 起動順で最後の
+    /// エージェントが必ず選ばれ、ユーザーの選択も毎回そこへ吸われる。
+    #[test]
+    fn 初回の取り込みは選択を最後のカードへ奪わない() {
+        // 同名のエージェントを複製起動した並び (id だけが違う)
+        let deal = |ids: &[u64]| -> Vec<Card> {
+            ids.iter().map(|id| card_id(*id, Column::Running)).collect()
+        };
+        let mut st = KanbanState::default();
+
+        st.update_tracks(&deal(&[1, 2, 3, 4]), 0, true);
+        assert_eq!(
+            st.selected(),
+            None,
+            "看板を開いた初回に、最後のカードが勝手に選ばれている"
+        );
+
+        // ユーザーが真ん中を選ぶ → 描き直しても動かない
+        st.selected = Some(2);
+        for frame in 0..3 {
+            st.update_tracks(&deal(&[1, 2, 3, 4]), 100 * frame + 100, true);
+            assert_eq!(st.selected(), Some(2), "{frame}: 選択が最後へ移った");
+        }
+
+        // 本当に「いま起動した」1 体だけは、これまで通り選択とスクロールで示す
+        st.update_tracks(&deal(&[1, 2, 3, 4, 9]), 1_000, true);
+        assert_eq!(st.selected(), Some(9), "新しく起動した 1 体を示さなくなった");
+
+        // 一度に複数増えたとき (ワークスペース復元) はどれも奪わない
+        st.update_tracks(&deal(&[1, 2, 3, 4, 9, 10, 11]), 2_000, true);
+        assert_eq!(st.selected(), Some(9), "まとめて増えたときに最後が選ばれた");
     }
 
     #[test]
