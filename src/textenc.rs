@@ -597,6 +597,609 @@ fn console_code_page() -> u32 {
     0
 }
 
+// ═════════════ 符号化を明示して開き直す / 保存する (エンコーディングピッカー) ═════════════
+//
+// [`decode_bytes`] は「開いた瞬間に自動判定し、保存で元へ戻す」経路で、
+// 判定が当たっている限りこれで足りる。当たらなかったときの逃げ道が無いのが問題だった:
+//
+//   * 判定が外れた (CP932 のファイルが偶然 UTF-8 として妥当だった等)
+//   * わざと別の符号化で保存したい (相手のツールが CP932 しか読めない等)
+//
+// ここはその 2 つだけを担当する。[`reopen_with`] は**判定を一切見ない**で復号し、
+// [`save_with`] は**要求された符号化から絶対に勝手に乗り換えない**
+// ([`encode_bytes`] は変換できない文字があると黙って UTF-8 へ格上げする。
+// 保存経路としては正しい保険だが、ユーザーが明示的に選んだときにそれをやると
+// 「CP932 で保存したはずが UTF-8 になっていた」という別の事故になる)。
+
+/// UTF-8 の BOM。
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// 「この実行環境が本当に読み書きできる」符号化 1 件ぶんの説明。
+///
+/// 一覧は**実測**で作る ([`supported_encodings`])。表に載っているものは
+/// すべて往復 (保存 → 開き直しで完全一致) が確認済み。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodingInfo {
+    /// この項目が指す符号化。そのまま [`reopen_with`] / [`save_with`] へ渡せる。
+    pub enc: Encoding,
+    /// 安定した識別子 (設定ファイルやコマンドの引数に使う)。例: `"utf-8"` `"cp932"`。
+    pub id: String,
+    /// 画面に出す名前。例: `"CP932 (Shift_JIS)"`。
+    pub label: String,
+    /// 別名。ユーザーが「sjis」「shift-jis」と打っても引けるようにする。
+    pub aliases: Vec<&'static str>,
+    /// 日本語 (かな・漢字) を往復できるか。ASCII しか通らない符号化と区別する。
+    pub japanese: bool,
+}
+
+/// 往復検査に使う見本。ASCII は全候補、日本語は通る候補だけが `japanese: true` になる。
+const PROBE_ASCII: &str = "Aa1 -_/ ok\n";
+const PROBE_JA: &str = "日本語のテキスト かな カナ 漢字\n";
+/// Latin-1 / 西欧コードページ用。ASCII だけだと「日本語が通らないこと」しか分からないので、
+/// その符号化らしい文字も 1 度試す (通らなければ ASCII 判定のまま表に載る)。
+const PROBE_LATIN: &str = "café naïve ÿ\n";
+
+/// 候補表。**番号と別名だけ**を持ち、使えるかどうかは一切決め打ちしない
+/// (実際に往復できたものだけが [`supported_encodings`] に載る)。
+/// OS 既定のコードページは実行時に足す (どの言語環境でもその環境の既定が並ぶ)。
+fn encoding_candidates() -> Vec<(Encoding, &'static str, &'static [&'static str])> {
+    let mut v: Vec<(Encoding, &'static str, &'static [&'static str])> = vec![
+        (Encoding::Utf8, "utf-8", &["utf8", "u8"]),
+        (Encoding::Utf8Bom, "utf-8-bom", &["utf8bom", "utf-8 bom", "bom"]),
+        (Encoding::Utf16Le, "utf-16le", &["utf16le", "utf-16 le", "ucs-2le"]),
+        (Encoding::Utf16Be, "utf-16be", &["utf16be", "utf-16 be", "ucs-2be"]),
+        (
+            Encoding::Ansi(CP_932),
+            "cp932",
+            &["shift_jis", "shift-jis", "sjis", "ms932", "windows-31j"],
+        ),
+        (Encoding::Ansi(CP_EUC_JP), "cp51932", &["euc-jp", "eucjp"]),
+        (Encoding::Ansi(CP_EUC_JP_X0212), "cp20932", &["euc-jp-x0212"]),
+        (
+            Encoding::Ansi(CP_ISO2022JP),
+            "cp50220",
+            &["iso-2022-jp", "jis", "iso2022jp"],
+        ),
+        (Encoding::Ansi(CP_ISO2022JP_ALLOW1B), "cp50221", &["iso-2022-jp-1"]),
+        (
+            Encoding::Ansi(CP_LATIN1),
+            "cp28591",
+            &["latin-1", "latin1", "iso-8859-1"],
+        ),
+        (Encoding::Ansi(1252), "cp1252", &["windows-1252"]),
+    ];
+    let os = os_ansi_code_page();
+    if os != 0 && !v.iter().any(|(e, _, _)| *e == Encoding::Ansi(os)) {
+        // 表に無い言語環境 (例: 中国語 936 / 韓国語 949) でもその環境の既定は必ず出す。
+        // `id` は空にしておき、組み立て時に `cp<番号>` を作る。
+        v.push((Encoding::Ansi(os), "", &[]));
+    }
+    v
+}
+
+/// EUC-JP (IE 系)。
+const CP_EUC_JP: u32 = 51932;
+/// EUC-JP (JIS X 0212 込み)。
+const CP_EUC_JP_X0212: u32 = 20932;
+/// ISO-2022-JP。
+const CP_ISO2022JP: u32 = 50220;
+/// ISO-2022-JP (半角カナを 1B 経由で通す版)。
+const CP_ISO2022JP_ALLOW1B: u32 = 50221;
+/// ISO-8859-1 (Latin-1)。
+const CP_LATIN1: u32 = 28591;
+
+/// **この実行環境が実際に読み書きできる**符号化の一覧。
+///
+/// 表は決め打ちではなく、候補ごとに「[`save_with`] して [`reopen_with`] したら
+/// 元の文字列に戻るか」を実測して作る。だから:
+///
+/// * Windows 以外では ANSI コードページ変換 (`WideCharToMultiByte`) が無いので、
+///   UTF-8 / UTF-8 BOM / UTF-16 LE / UTF-16 BE だけが並ぶ。
+/// * Windows では OS が持っているコードページだけが並ぶ
+///   (ISO-2022-JP のように `WC_NO_BEST_FIT_CHARS` を受け付けない符号化は
+///   「保存できない」ので**載らない** — 表に出す以上は必ず保存できる)。
+/// * 表に無い言語環境でも、その環境の既定コードページは自動で加わる。
+///
+/// 初回呼び出しで 1 度だけ実測し、以後は使い回す。
+pub fn supported_encodings() -> &'static [EncodingInfo] {
+    static TABLE: std::sync::OnceLock<Vec<EncodingInfo>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut out: Vec<EncodingInfo> = Vec::new();
+        for (enc, id, aliases) in encoding_candidates() {
+            if !round_trips(enc, PROBE_ASCII) {
+                continue;
+            }
+            if out.iter().any(|i| i.enc == enc) {
+                continue;
+            }
+            let latin = round_trips(enc, PROBE_LATIN);
+            let japanese = round_trips(enc, PROBE_JA);
+            let _ = latin; // ラテン系の可否は今のところ表に出さない (判定だけ通す)
+            let id = if id.is_empty() {
+                match enc {
+                    Encoding::Ansi(cp) => format!("cp{cp}"),
+                    other => other.name().to_lowercase(),
+                }
+            } else {
+                id.to_string()
+            };
+            out.push(EncodingInfo {
+                enc,
+                id,
+                label: enc.name(),
+                aliases: aliases.to_vec(),
+                japanese,
+            });
+        }
+        out
+    })
+}
+
+/// `enc` がこの環境で本当に使えるか ([`supported_encodings`] に載っているか)。
+pub fn is_supported(enc: Encoding) -> bool {
+    supported_encodings().iter().any(|i| i.enc == enc)
+}
+
+/// 名前・別名・識別子から符号化を引く (大文字小文字とハイフン/アンダースコアは無視)。
+/// 使えない符号化は引けない (`None`)。
+pub fn encoding_by_name(name: &str) -> Option<Encoding> {
+    let key = normalize_enc_key(name);
+    supported_encodings()
+        .iter()
+        .find(|i| {
+            normalize_enc_key(&i.id) == key
+                || normalize_enc_key(&i.label) == key
+                || i.aliases.iter().any(|a| normalize_enc_key(a) == key)
+        })
+        .map(|i| i.enc)
+}
+
+fn normalize_enc_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' ' | '(' | ')'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// 保存 → 開き直しで完全一致するか。[`supported_encodings`] の実測本体。
+fn round_trips(enc: Encoding, sample: &str) -> bool {
+    match save_with(sample, enc, LineEnding::Lf) {
+        Ok(bytes) => {
+            let r = reopen_with_report(&bytes, enc);
+            r.replacements == 0 && r.text == sample
+        }
+        Err(_) => false,
+    }
+}
+
+/// [`reopen_with_report`] の結果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reopened {
+    /// 復号した本文。
+    pub text: String,
+    /// 指定した符号化 + 本文から数え直した改行コード。
+    pub format: TextFormat,
+    /// 置換文字 U+FFFD の個数 = **化けた箇所の数**。
+    ///
+    /// 元のバイト列に本物の U+FFFD が入っていた場合もここに数える
+    /// (安全側の誤検知 — 「化けているかも」と余計に警告するだけで、
+    /// 化けているのに黙っていることは無い)。
+    pub replacements: usize,
+}
+
+impl Reopened {
+    /// 1 文字でも化けたか。UI はこれを見て「この符号化では読めていません」と出せる。
+    pub fn lossy(&self) -> bool {
+        self.replacements > 0
+    }
+}
+
+/// **自動判定を無視して** `enc` で開き直す (「エンコーディングを指定して開き直す」)。
+///
+/// BOM の扱い:
+/// * `Utf8` / `Utf8Bom` — 先頭に UTF-8 BOM があれば剥がす (本文に U+FEFF が
+///   見えないようにする)。返す [`TextFormat`] は**要求どおりの符号化**なので、
+///   `Utf8` を選べば保存時に BOM が落ち、`Utf8Bom` を選べば付く。
+/// * `Utf16Le` / `Utf16Be` — 一致する向きの BOM だけ剥がす。
+///   向きを間違えて選ぶと本文が化けるので、[`Reopened::lossy`] で気付ける。
+///
+/// 化けた箇所の数は [`Reopened::replacements`]。
+pub fn reopen_with_report(bytes: &[u8], enc: Encoding) -> Reopened {
+    let text = decode_exact(bytes, enc);
+    let replacements = text.chars().filter(|c| *c == '\u{FFFD}').count();
+    let line_ending = detect_line_ending(&text);
+    Reopened {
+        text,
+        format: TextFormat {
+            encoding: enc,
+            line_ending,
+        },
+        replacements,
+    }
+}
+
+/// [`reopen_with_report`] の簡易版。化け具合を見ないなら (テスト・内部利用) こちら。
+pub fn reopen_with(bytes: &[u8], enc: Encoding) -> (String, TextFormat) {
+    let r = reopen_with_report(bytes, enc);
+    (r.text, r.format)
+}
+
+/// 判定を一切せず `enc` として復号する。
+fn decode_exact(bytes: &[u8], enc: Encoding) -> String {
+    match enc {
+        Encoding::Utf8 | Encoding::Utf8Bom => {
+            let body = bytes.strip_prefix(&UTF8_BOM).unwrap_or(bytes);
+            String::from_utf8_lossy(body).into_owned()
+        }
+        Encoding::Utf16Le => decode_utf16(bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes), true),
+        Encoding::Utf16Be => decode_utf16(bytes.strip_prefix(&[0xFE, 0xFF]).unwrap_or(bytes), false),
+        Encoding::Ansi(cp) => decode_ansi_or_lossy(bytes, cp),
+    }
+}
+
+/// [`save_with`] が保存を**断った**理由。UI はこれをそのまま文にできる。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EncodeIssue {
+    /// その符号化に無い文字が本文にある。位置は**元の本文**基準
+    /// (改行コードを揃える前) なので、そのままキャレットを飛ばせる。
+    Unrepresentable {
+        enc: Encoding,
+        /// 保存できない最初の文字。
+        ch: char,
+        /// 本文先頭からの文字数 (0 起点)。
+        char_index: usize,
+        /// 本文先頭からのバイト位置 (0 起点)。
+        byte_index: usize,
+        /// 行番号 (1 起点)。
+        line: usize,
+        /// 行内の文字位置 (1 起点)。
+        column: usize,
+    },
+    /// この実行環境にはその符号化への変換表が無い
+    /// (Windows 以外での CP932、`WC_NO_BEST_FIT_CHARS` を受け付けない ISO-2022-JP 等)。
+    /// 本文の中身とは無関係に保存できない。
+    Unsupported { enc: Encoding },
+}
+
+impl EncodeIssue {
+    pub fn encoding(&self) -> Encoding {
+        match self {
+            EncodeIssue::Unrepresentable { enc, .. } | EncodeIssue::Unsupported { enc } => *enc,
+        }
+    }
+
+    /// 保存できない最初の文字 (環境側の理由なら `None`)。
+    pub fn ch(&self) -> Option<char> {
+        match self {
+            EncodeIssue::Unrepresentable { ch, .. } => Some(*ch),
+            EncodeIssue::Unsupported { .. } => None,
+        }
+    }
+
+    /// 保存できない最初の文字の位置 (文字数, 0 起点)。
+    pub fn char_index(&self) -> Option<usize> {
+        match self {
+            EncodeIssue::Unrepresentable { char_index, .. } => Some(*char_index),
+            EncodeIssue::Unsupported { .. } => None,
+        }
+    }
+
+    /// そのまま出せる説明文。
+    /// 例: 「この文字は CP932 (Shift_JIS) で保存できません: 「𠮟」(12行目 3文字目)」
+    pub fn message(&self) -> String {
+        match self {
+            EncodeIssue::Unrepresentable {
+                enc,
+                ch,
+                line,
+                column,
+                ..
+            } => format!(
+                "この文字は {} で保存できません: 「{ch}」({line}行目 {column}文字目)",
+                enc.name()
+            ),
+            EncodeIssue::Unsupported { enc } => format!(
+                "この環境では {} で保存できません (変換表がありません)",
+                enc.name()
+            ),
+        }
+    }
+}
+
+/// **符号化と改行コードを明示して**バイト列にする (「エンコーディングを指定して保存」)。
+///
+/// [`encode_bytes`] との決定的な違いは、**要求された符号化から絶対に乗り換えない**こと。
+/// 変換できない文字が 1 つでもあれば [`EncodeIssue`] を返して保存自体を断る
+/// (`encode_bytes` は黙って UTF-8 へ格上げする。自動保存経路では本文を守るために
+/// それが正しいが、ユーザーが符号化を選んだ場面でやると「選んだはずの符号化に
+/// なっていない」という別の事故になる)。
+///
+/// 改行は `ending` へ揃えてから符号化する ([`normalize_to`] は冪等・無損失)。
+/// [`LineEnding::Mixed`] を渡すと最多の様式へ寄る。
+pub fn save_with(text: &str, enc: Encoding, ending: LineEnding) -> Result<Vec<u8>, EncodeIssue> {
+    let body = normalize_to(text, ending);
+    match enc {
+        Encoding::Utf8 => Ok(body.into_bytes()),
+        Encoding::Utf8Bom => {
+            let mut out = UTF8_BOM.to_vec();
+            out.extend_from_slice(body.as_bytes());
+            Ok(out)
+        }
+        // UTF-16 は Unicode 全体を表現できるので失敗しない
+        Encoding::Utf16Le => Ok(encode_utf16(&body, true)),
+        Encoding::Utf16Be => Ok(encode_utf16(&body, false)),
+        Encoding::Ansi(cp) => match encode_ansi(&body, cp) {
+            Some(bytes) => Ok(bytes),
+            // 位置は**元の本文**で数える。改行コードの正規化は CR/LF しか触らず、
+            // CR/LF はどのコードページでも表現できるので、駄目な文字の集合は変わらない。
+            None => Err(first_encode_failure(text, cp)),
+        },
+    }
+}
+
+/// 本文全体の変換が失敗したときに、**最初に**引っかかった文字を特定する。
+/// 失敗経路でしか呼ばないので 1 文字ずつ試して構わない。
+fn first_encode_failure(text: &str, cp: u32) -> EncodeIssue {
+    let enc = Encoding::Ansi(cp);
+    // ASCII 1 文字すら通らない = 変換表そのものが無い環境
+    if encode_ansi("A", cp).is_none() {
+        return EncodeIssue::Unsupported { enc };
+    }
+    // 1 文字ずつなら全部通るのに全体では失敗する = 文字の問題ではない
+    // (状態を持つ符号化など)。中身のせいにしない。
+    first_unencodable(text, enc, |c| encode_ansi(&c.to_string(), cp).is_some())
+        .unwrap_or(EncodeIssue::Unsupported { enc })
+}
+
+/// 「その符号化で書ける文字か」を判定する `ok` を使って、最初に書けない文字を探す。
+///
+/// 位置の数え方 (文字数・バイト位置・行・桁) をここ 1 か所に閉じ込めてあるので、
+/// OS の変換表が無い環境でも `ok` を差し替えれば同じ計算を検査できる。
+fn first_unencodable<F>(text: &str, enc: Encoding, ok: F) -> Option<EncodeIssue>
+where
+    F: Fn(char) -> bool,
+{
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for (char_index, (byte_index, ch)) in text.char_indices().enumerate() {
+        if !ok(ch) {
+            return Some(EncodeIssue::Unrepresentable {
+                enc,
+                ch,
+                char_index,
+                byte_index,
+                line,
+                column,
+            });
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    None
+}
+
+// ───────────────────── 符号化の推定 (候補を confidence 付きで返す) ─────────────────────
+
+/// バイト列がどの符号化かを**候補ごとの確からしさ付き**で返す。降順に整列。
+///
+/// [`decode_bytes`] は「1 つ選んで開く」ためのもので、外れたときに何も言えない。
+/// こちらは「UTF-8 として開いたが CP932 かもしれない」という UI を作るための材料。
+///
+/// 判定はバイト列の**構造だけ**を見る (OS の変換表を使わないので、どの環境でも
+/// 同じ答えになる)。復号できるかどうかは別問題なので、UI は [`is_supported`] で
+/// 絞ってから並べること。
+///
+/// 目安:
+/// * `1.0` — BOM がある (疑う余地なし)
+/// * `0.9` 以上 — その符号化としてしか読めない並び
+/// * `0.5` 前後 — ASCII だけ等、どの符号化でも読めるので決め手が無い
+/// * 返らない — その符号化としては壊れている
+pub fn detect_all(bytes: &[u8]) -> Vec<(Encoding, f32)> {
+    let mut out: Vec<(Encoding, f32)> = Vec::new();
+    let mut push = |enc: Encoding, score: f32| {
+        if score > 0.0 {
+            out.push((enc, score));
+        }
+    };
+
+    // BOM は決定的。付いていたら本体を剥がして残りの候補を採点する。
+    let (body, bom) = if let Some(rest) = bytes.strip_prefix(&UTF8_BOM) {
+        (rest, Some(Encoding::Utf8Bom))
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        (rest, Some(Encoding::Utf16Le))
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        (rest, Some(Encoding::Utf16Be))
+    } else {
+        (bytes, None)
+    };
+    if let Some(enc) = bom {
+        push(enc, 1.0);
+    }
+    // BOM が確定しているときは他の候補を「参考」まで下げる (誤って上に来ない)
+    let damp = if bom.is_some() { 0.3 } else { 1.0 };
+    // NUL バイトはバイト指向の符号化ではまず現れない (UTF-16 の署名のようなもの)。
+    // 「ASCII + NUL」の並びは UTF-8 としても妥当なので、これを効かせないと
+    // BOM 無し UTF-16 が UTF-8 に負ける。
+    let byte_damp = damp * if body.contains(&0) { 0.3 } else { 1.0 };
+
+    if bom != Some(Encoding::Utf8Bom) {
+        push(Encoding::Utf8, score_utf8(body) * byte_damp);
+    }
+    if bom.is_none() {
+        push(Encoding::Utf16Le, score_utf16(body, true));
+        push(Encoding::Utf16Be, score_utf16(body, false));
+    }
+    push(Encoding::Ansi(CP_932), score_sjis(body) * byte_damp);
+    push(
+        Encoding::Ansi(preferred_cp(&[CP_EUC_JP, CP_EUC_JP_X0212])),
+        score_euc_jp(body) * byte_damp,
+    );
+    push(
+        Encoding::Ansi(preferred_cp(&[CP_ISO2022JP, CP_ISO2022JP_ALLOW1B])),
+        score_iso2022jp(body) * byte_damp,
+    );
+    // OS 既定のコードページ (単バイト系ならこれが正解のことが多い)
+    let os = os_ansi_code_page();
+    if os != 0 && os != CP_932 {
+        push(Encoding::Ansi(os), score_single_byte(body) * byte_damp);
+    }
+
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out.dedup_by(|a, b| a.0 == b.0);
+    out
+}
+
+/// 同じ符号化に複数のコードページ番号があるとき、**この環境で使える方**を選ぶ。
+/// どれも使えなければ先頭 (代表的な番号) を返す — 推定結果としては正しく、
+/// 使えるかどうかは [`is_supported`] で分かる。
+fn preferred_cp(cands: &[u32]) -> u32 {
+    cands
+        .iter()
+        .copied()
+        .find(|cp| is_supported(Encoding::Ansi(*cp)))
+        .unwrap_or(cands[0])
+}
+
+fn score_utf8(b: &[u8]) -> f32 {
+    if std::str::from_utf8(b).is_err() {
+        return 0.0;
+    }
+    // 多バイト列が 1 つでもあれば「UTF-8 としてしか読めない」に近い。
+    // ASCII だけなら他の符号化でも読めるので決め手にはならない。
+    if b.iter().any(|c| *c >= 0x80) {
+        1.0
+    } else {
+        0.9
+    }
+}
+
+/// BOM 無し UTF-16 の見当。ASCII 文字が「片方が 0x00」の組で並ぶ性質を使う。
+fn score_utf16(b: &[u8], little: bool) -> f32 {
+    if b.len() < 4 || !b.len().is_multiple_of(2) {
+        return 0.0;
+    }
+    let pairs = b.len() / 2;
+    let hits = b
+        .chunks_exact(2)
+        .filter(|c| {
+            let (zero, other) = if little { (c[1], c[0]) } else { (c[0], c[1]) };
+            zero == 0 && (other == b'\n' || other == b'\r' || other == b'\t' || other >= 0x20)
+        })
+        .count();
+    let ratio = hits as f32 / pairs as f32;
+    if ratio >= 0.8 {
+        0.85
+    } else if ratio >= 0.5 {
+        0.45
+    } else {
+        0.0
+    }
+}
+
+/// Shift_JIS / CP932 の見当。1 バイトでも構造が壊れていたら 0。
+fn score_sjis(b: &[u8]) -> f32 {
+    let is_lead = |c: u8| (0x81..=0x9F).contains(&c) || (0xE0..=0xFC).contains(&c);
+    let is_trail = |c: u8| (0x40..=0x7E).contains(&c) || (0x80..=0xFC).contains(&c);
+    let mut i = 0;
+    let mut double = 0usize; // 2 バイト文字の数 (強い証拠)
+    let mut kana = 0usize; // 半角カナ (弱い証拠 — 実ファイルでは稀)
+    while i < b.len() {
+        let c = b[i];
+        if c < 0x80 {
+            i += 1;
+        } else if (0xA1..=0xDF).contains(&c) {
+            kana += 1;
+            i += 1;
+        } else if is_lead(c) && b.get(i + 1).copied().is_some_and(is_trail) {
+            double += 1;
+            i += 2;
+        } else {
+            return 0.0;
+        }
+    }
+    non_ascii_score(double, kana)
+}
+
+/// EUC-JP の見当。
+fn score_euc_jp(b: &[u8]) -> f32 {
+    let is_ku = |c: u8| (0xA1..=0xFE).contains(&c);
+    let mut i = 0;
+    let mut double = 0usize;
+    let mut kana = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c < 0x80 {
+            i += 1;
+        } else if c == 0x8E {
+            // 半角カナ (SS2)
+            match b.get(i + 1) {
+                Some(t) if (0xA1..=0xDF).contains(t) => {
+                    kana += 1;
+                    i += 2;
+                }
+                _ => return 0.0,
+            }
+        } else if c == 0x8F {
+            // JIS X 0212 (SS3)
+            match (b.get(i + 1), b.get(i + 2)) {
+                (Some(a), Some(t)) if is_ku(*a) && is_ku(*t) => {
+                    double += 1;
+                    i += 3;
+                }
+                _ => return 0.0,
+            }
+        } else if is_ku(c) && b.get(i + 1).copied().is_some_and(is_ku) {
+            double += 1;
+            i += 2;
+        } else {
+            return 0.0;
+        }
+    }
+    non_ascii_score(double, kana)
+}
+
+/// ISO-2022-JP の見当。8 ビット目が立っていたら即 0、エスケープがあれば強い証拠。
+fn score_iso2022jp(b: &[u8]) -> f32 {
+    if b.iter().any(|c| *c >= 0x80) {
+        return 0.0;
+    }
+    let esc = b.windows(3).any(|w| {
+        w[0] == 0x1B && matches!((w[1], w[2]), (b'$', b'B') | (b'$', b'@') | (b'(', b'B') | (b'(', b'J'))
+    });
+    if esc {
+        0.95
+    } else {
+        // ASCII のみ = ISO-2022-JP としても読めるが決め手が無い
+        0.4
+    }
+}
+
+/// 単バイトコードページ (Latin-1 系など) の見当。並びの制約が無いので常に「読める」。
+/// ASCII 域外があるほど「UTF-8 ではない」証拠にはなるが、どのコードページかは決められない。
+fn score_single_byte(b: &[u8]) -> f32 {
+    if b.iter().any(|c| *c >= 0x80) {
+        0.45
+    } else {
+        0.4
+    }
+}
+
+/// 2 バイト文字と半角カナの内訳から点をつける。
+/// 半角カナだけの並びは (実ファイルでは稀なので) 決め手として弱く扱う。
+fn non_ascii_score(double: usize, kana: usize) -> f32 {
+    if double == 0 && kana == 0 {
+        return 0.5; // ASCII のみ — 壊れてはいないが証拠も無い
+    }
+    if double == 0 {
+        return 0.6; // 半角カナだけ — ありうるが弱い
+    }
+    0.95
+}
+
 #[cfg(windows)]
 mod win {
     /// 変換できない文字を見つけたら失敗させるフラグ (`WC_ERR_INVALID_CHARS` 相当)。
@@ -1942,4 +2545,332 @@ mod tests {
             }
         }
     }
+
+    // ═══════════ エンコーディングピッカー ═══════════
+
+    /// 「日本語」を各符号化のバイト列で書き下したもの。
+    /// 復号表を持たない環境でも判定器 (バイト列の構造だけ見る) を検査できるようにする。
+    const NIHONGO_CP932: &[u8] = &[0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA];
+    const NIHONGO_EUCJP: &[u8] = &[0xC6, 0xFC, 0xCB, 0xDC, 0xB8, 0xEC];
+
+    /// **表に載っている符号化はすべて本当に往復する** — 表の正直さの検査。
+    ///
+    /// [`supported_encodings`] 自身も往復で作るが、こちらは**別の見本**で
+    /// 確かめる (見本 1 つに合わせた表になっていないこと)。
+    #[test]
+    fn every_listed_encoding_really_round_trips() {
+        let ascii = "line one\nline two\ttabbed\n";
+        let ja = "吾輩は猫である。名前はまだ無い。\nカタカナも かなも 漢字も\n";
+        for info in supported_encodings() {
+            let r = save_with(ascii, info.enc, LineEnding::Lf)
+                .unwrap_or_else(|e| panic!("{}: ASCII すら保存できない: {}", info.id, e.message()));
+            let back = reopen_with_report(&r, info.enc);
+            assert_eq!(back.text, ascii, "{}: ASCII の往復が壊れた", info.id);
+            assert_eq!(back.replacements, 0, "{}: ASCII で化けた", info.id);
+            assert_eq!(back.format.encoding, info.enc, "{}: 符号化が変わった", info.id);
+
+            if info.japanese {
+                let bytes = save_with(ja, info.enc, LineEnding::Lf)
+                    .unwrap_or_else(|e| panic!("{}: 日本語可のはずが {}", info.id, e.message()));
+                let back = reopen_with_report(&bytes, info.enc);
+                assert_eq!(back.text, ja, "{}: 日本語の往復が壊れた", info.id);
+                assert_eq!(back.replacements, 0, "{}: 日本語で化けた", info.id);
+            }
+        }
+    }
+
+    /// Unicode 系 4 種は変換表を OS に頼らない (純 Rust) ので、どの環境でも必ず載る。
+    #[test]
+    fn unicode_encodings_are_available_everywhere() {
+        for enc in [
+            Encoding::Utf8,
+            Encoding::Utf8Bom,
+            Encoding::Utf16Le,
+            Encoding::Utf16Be,
+        ] {
+            assert!(is_supported(enc), "{} が表に無い", enc.name());
+            let info = supported_encodings().iter().find(|i| i.enc == enc).unwrap();
+            assert!(info.japanese, "{} は日本語を通せるはず", enc.name());
+        }
+    }
+
+    /// ANSI コードページはこの環境で実際に変換できたときだけ載る
+    /// (Windows 以外では 1 つも載らないのが正しい)。
+    #[test]
+    fn ansi_encodings_are_listed_only_when_the_os_can_convert() {
+        let ansi: Vec<u32> = supported_encodings()
+            .iter()
+            .filter_map(|i| match i.enc {
+                Encoding::Ansi(cp) => Some(cp),
+                _ => None,
+            })
+            .collect();
+        if cfg!(windows) {
+            // 何が載るかは OS 次第 (言語環境を決め打ちしない)。載ったものは
+            // every_listed_encoding_really_round_trips が往復を保証している。
+            return;
+        }
+        assert!(
+            ansi.is_empty(),
+            "変換表を持たない環境なのに ANSI が載っている: {ansi:?}"
+        );
+        assert_eq!(supported_encodings().len(), 4, "Unicode 系 4 種だけのはず");
+        assert!(!is_supported(Encoding::Ansi(CP_932)));
+    }
+
+    #[test]
+    fn encoding_table_ids_are_unique_and_resolvable() {
+        let mut ids: Vec<&str> = supported_encodings().iter().map(|i| i.id.as_str()).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "識別子が重複している");
+        for info in supported_encodings() {
+            assert_eq!(encoding_by_name(&info.id), Some(info.enc), "id で引けない");
+            assert_eq!(encoding_by_name(&info.label), Some(info.enc), "label で引けない");
+            for a in &info.aliases {
+                assert_eq!(encoding_by_name(a), Some(info.enc), "別名 {a} で引けない");
+            }
+        }
+    }
+
+    #[test]
+    fn encoding_by_name_ignores_case_and_separators() {
+        assert_eq!(encoding_by_name("UTF-8"), Some(Encoding::Utf8));
+        assert_eq!(encoding_by_name("utf8"), Some(Encoding::Utf8));
+        assert_eq!(encoding_by_name("UTF_16 le"), Some(Encoding::Utf16Le));
+        assert_eq!(encoding_by_name("存在しない"), None);
+        // 使えない符号化は引けない (UI が選べないようにする)
+        if !cfg!(windows) {
+            assert_eq!(encoding_by_name("sjis"), None);
+        }
+    }
+
+    // ──────────── 開き直す ────────────
+
+    #[test]
+    fn reopen_with_ignores_detection_and_reports_lossy() {
+        // CP932 の「日本語」を UTF-8 として開くと 6 バイトすべてが化ける
+        let r = reopen_with_report(NIHONGO_CP932, Encoding::Utf8);
+        assert!(r.lossy(), "化けたのに lossy でない");
+        // 6 バイト中 0x7B だけは ASCII '{' として素通りするので化けるのは 5 バイト
+        assert_eq!(r.replacements, 5, "不正バイトの数だけ U+FFFD が出る");
+        assert!(r.text.contains('{'), "たまたま ASCII だったバイトは残る: {:?}", r.text);
+        assert_eq!(r.format.encoding, Encoding::Utf8, "要求した符号化を報告する");
+    }
+
+    #[test]
+    fn reopen_with_clean_input_reports_no_replacement() {
+        let bytes = save_with("日本語\n", Encoding::Utf8, LineEnding::Lf).unwrap();
+        let r = reopen_with_report(&bytes, Encoding::Utf8);
+        assert!(!r.lossy());
+        assert_eq!(r.replacements, 0);
+        assert_eq!(r.text, "日本語\n");
+    }
+
+    #[test]
+    fn reopen_with_strips_the_bom_but_keeps_the_requested_encoding() {
+        let bytes = save_with("あ", Encoding::Utf8Bom, LineEnding::Lf).unwrap();
+        // BOM 付きのバイト列を「UTF-8 (BOM なし)」で開き直す
+        let (text, fmt) = reopen_with(&bytes, Encoding::Utf8);
+        assert_eq!(text, "あ", "U+FEFF が本文に残らない");
+        assert_eq!(fmt.encoding, Encoding::Utf8, "保存すると BOM が落ちる状態になる");
+        // BOM 付きとして開けば当然そのまま
+        assert_eq!(reopen_with(&bytes, Encoding::Utf8Bom).0, "あ");
+    }
+
+    #[test]
+    fn reopen_with_wrong_utf16_endianness_is_visibly_broken() {
+        let bytes = save_with("AB\n", Encoding::Utf16Le, LineEnding::Lf).unwrap();
+        let (good, _) = reopen_with(&bytes, Encoding::Utf16Le);
+        assert_eq!(good, "AB\n");
+        let (bad, fmt) = reopen_with(&bytes, Encoding::Utf16Be);
+        assert_ne!(bad, "AB\n", "向きを間違えたのに同じ本文が出た");
+        assert_eq!(fmt.encoding, Encoding::Utf16Be);
+    }
+
+    #[test]
+    fn reopen_with_reports_the_line_ending_of_the_decoded_text() {
+        let bytes = save_with("a\nb\n", Encoding::Utf8, LineEnding::Crlf).unwrap();
+        assert_eq!(bytes, b"a\r\nb\r\n");
+        let (_, fmt) = reopen_with(&bytes, Encoding::Utf8);
+        assert_eq!(fmt.line_ending, LineEnding::Crlf);
+    }
+
+    // ──────────── 指定して保存する ────────────
+
+    #[test]
+    fn save_with_applies_the_requested_line_ending() {
+        assert_eq!(save_with("a\r\nb", Encoding::Utf8, LineEnding::Lf).unwrap(), b"a\nb");
+        assert_eq!(
+            save_with("a\nb", Encoding::Utf8, LineEnding::Crlf).unwrap(),
+            b"a\r\nb"
+        );
+        assert_eq!(save_with("a\nb", Encoding::Utf8, LineEnding::Cr).unwrap(), b"a\rb");
+    }
+
+    /// **回帰テスト**: `encode_bytes` は変換できない文字があると黙って UTF-8 へ
+    /// 格上げする。`save_with` は絶対にそれをしない。
+    #[test]
+    fn save_with_never_silently_changes_the_encoding() {
+        let text = "𠮟る 🐧 と\n";
+        for info in supported_encodings() {
+            match save_with(text, info.enc, LineEnding::Lf) {
+                // 書けたなら、**同じ符号化で**開き直して一致しなければならない。
+                // 黙って UTF-8 になっていたらここで落ちる。
+                Ok(bytes) => {
+                    let back = reopen_with_report(&bytes, info.enc);
+                    assert_eq!(back.text, text, "{}: 別の符号化で書かれている", info.id);
+                    assert_eq!(back.replacements, 0, "{}: 書いた本文が化けている", info.id);
+                }
+                // 書けないなら断る。UTF-8 へ逃げない。
+                Err(e) => assert_eq!(e.encoding(), info.enc, "{}: 別の符号化の話をしている", info.id),
+            }
+        }
+        // CP932 に無い文字は、どの環境でも「保存できた」ことにならない
+        let r = save_with(text, Encoding::Ansi(CP_932), LineEnding::Lf);
+        assert!(r.is_err(), "CP932 で書けないはずの本文が Ok になった");
+        assert_eq!(r.unwrap_err().encoding(), Encoding::Ansi(CP_932));
+        // 旧経路 (encode_bytes) は今も UTF-8 へ格上げする — 挙動の違いを明文化する
+        assert_eq!(encode_bytes(text, Encoding::Ansi(CP_932)).1, Encoding::Utf8);
+    }
+
+    /// 変換できない文字の**特定**は OS の変換表と無関係な計算なので、
+    /// 判定関数を差し替えて (= 変換表が無い環境でも) 検査する。
+    #[test]
+    fn encode_issue_names_the_first_offending_character() {
+        let text = "一行目\n二行目\nあいう𠮟えお\n";
+        let issue = first_unencodable(text, Encoding::Ansi(CP_932), |c| c != '𠮟')
+            .expect("見つからないはずがない");
+        match &issue {
+            EncodeIssue::Unrepresentable {
+                ch,
+                char_index,
+                byte_index,
+                line,
+                column,
+                enc,
+            } => {
+                assert_eq!(*ch, '𠮟');
+                assert_eq!(*char_index, 11, "「一行目\\n二行目\\nあいう」= 11 文字");
+                assert_eq!(*byte_index, 29, "3文字×3バイト + 改行 の 2 行 + 3 文字 = 29 バイト");
+                assert_eq!(*line, 3);
+                assert_eq!(*column, 4);
+                assert_eq!(*enc, Encoding::Ansi(CP_932));
+            }
+            other => panic!("想定外: {other:?}"),
+        }
+        assert_eq!(issue.ch(), Some('𠮟'));
+        assert_eq!(issue.char_index(), Some(11));
+        let msg = issue.message();
+        assert!(msg.contains('𠮟'), "文字が入っていない: {msg}");
+        assert!(msg.contains("3行目"), "行番号が入っていない: {msg}");
+        assert!(msg.contains("Shift_JIS"), "符号化の名前が入っていない: {msg}");
+        // 全部書けるなら None
+        assert!(first_unencodable("abc", Encoding::Utf8, |_| true).is_none());
+    }
+
+    #[test]
+    fn encode_issue_message_is_readable_for_unsupported_environments() {
+        let issue = EncodeIssue::Unsupported {
+            enc: Encoding::Ansi(CP_932),
+        };
+        assert_eq!(issue.ch(), None);
+        assert_eq!(issue.char_index(), None);
+        assert!(issue.message().contains("CP932"), "{}", issue.message());
+    }
+
+    /// Windows 以外では ANSI 変換表が無いので、**中身のせいにせず**環境の問題だと言う。
+    #[test]
+    fn save_with_ansi_without_a_conversion_table_reports_unsupported() {
+        if cfg!(windows) {
+            return;
+        }
+        let err = save_with("ASCII only", Encoding::Ansi(CP_932), LineEnding::Lf).unwrap_err();
+        assert!(
+            matches!(err, EncodeIssue::Unsupported { .. }),
+            "ASCII が書けないのは文字のせいではない: {err:?}"
+        );
+    }
+
+    // ──────────── 推定 ────────────
+
+    #[test]
+    fn detect_all_is_sorted_and_scored() {
+        for sample in [
+            &b"plain ascii\n"[..],
+            "日本語\n".as_bytes(),
+            NIHONGO_CP932,
+            NIHONGO_EUCJP,
+            &[],
+        ] {
+            let got = detect_all(sample);
+            for w in got.windows(2) {
+                assert!(w[0].1 >= w[1].1, "降順に並んでいない: {got:?}");
+            }
+            for (enc, score) in &got {
+                assert!(*score > 0.0 && *score <= 1.0, "点数の範囲外: {enc:?} {score}");
+            }
+        }
+    }
+
+    #[test]
+    fn detect_all_ranks_utf8_cp932_and_eucjp() {
+        // UTF-8 の日本語 → UTF-8 が 1 位
+        let utf8 = detect_all("日本語です\n".as_bytes());
+        assert_eq!(utf8[0].0, Encoding::Utf8);
+        assert_eq!(utf8[0].1, 1.0);
+
+        // CP932 の「日本語」→ CP932 が 1 位、UTF-8 は候補にすら出ない
+        let sjis = detect_all(NIHONGO_CP932);
+        assert_eq!(sjis[0].0, Encoding::Ansi(CP_932), "候補: {sjis:?}");
+        assert!(
+            !sjis.iter().any(|(e, _)| *e == Encoding::Utf8),
+            "UTF-8 として読めないのに候補に出た: {sjis:?}"
+        );
+
+        // EUC-JP の「日本語」→ EUC-JP が 1 位 (CP932 としては構造が壊れている)
+        let euc = detect_all(NIHONGO_EUCJP);
+        assert!(
+            matches!(euc[0].0, Encoding::Ansi(cp) if cp == CP_EUC_JP || cp == CP_EUC_JP_X0212),
+            "EUC-JP が 1 位でない: {euc:?}"
+        );
+        assert!(
+            !euc.iter().any(|(e, _)| *e == Encoding::Ansi(CP_932)),
+            "CP932 として壊れているのに候補に出た: {euc:?}"
+        );
+    }
+
+    #[test]
+    fn detect_all_trusts_the_bom_absolutely() {
+        for enc in [Encoding::Utf8Bom, Encoding::Utf16Le, Encoding::Utf16Be] {
+            let bytes = save_with("日本語\n", enc, LineEnding::Lf).unwrap();
+            let got = detect_all(&bytes);
+            assert_eq!(got[0].0, enc, "BOM を見落とした: {got:?}");
+            assert_eq!(got[0].1, 1.0);
+        }
+    }
+
+    #[test]
+    fn detect_all_ascii_prefers_utf8_but_keeps_alternatives() {
+        let got = detect_all(b"hello world\n");
+        assert_eq!(got[0].0, Encoding::Utf8, "{got:?}");
+        assert!(got[0].1 < 1.0, "ASCII だけなので断定はしない: {got:?}");
+        assert!(got.len() > 1, "「代わりに X で開く」候補が無い: {got:?}");
+    }
+
+    #[test]
+    fn detect_all_finds_utf16_without_a_bom() {
+        let with_bom = save_with("hello world", Encoding::Utf16Le, LineEnding::Lf).unwrap();
+        let got = detect_all(&with_bom[2..]); // BOM を剥がして渡す
+        assert_eq!(got[0].0, Encoding::Utf16Le, "{got:?}");
+    }
+
+    #[test]
+    fn detect_all_agrees_with_decode_bytes_on_utf8() {
+        let bytes = "日本語\r\nです\r\n".as_bytes();
+        assert_eq!(decode_bytes(bytes).1, Encoding::Utf8);
+        assert_eq!(detect_all(bytes)[0].0, Encoding::Utf8);
+    }
 }
+

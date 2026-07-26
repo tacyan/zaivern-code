@@ -721,7 +721,485 @@ fn snap_char_boundary(s: &str, byte: usize) -> usize {
     byte
 }
 
+// ═══════════════ マルチカーソル / 矩形選択エンジン ═══════════════
+//
+// # なぜ「エンジンだけ」なのか
+//
+// 本文の編集面は `egui::TextEdit::multiline` で、**キャレットは 1 本しか持てない**
+// (egui 0.29 の `TextEditState` は `CCursorRange` を 1 つだけ覚える)。
+// つまり「N 本のキャレットが同時に点滅し、タイプすると N 箇所へ同時に入る」
+// という VS Code の見た目は、egui を差し替えるまで実現できない。
+//
+// そこで**選択集合の計算と一括編集だけ**をここに置く。UI は 1 本のキャレットの
+// ままでも、コマンド 1 回 = [`MultiSel`] を組み立てて一括編集を 1 回、という形で
+// 今すぐ価値を出せる (「全ての出現を選択 → まとめて置換」「矩形選択 → 各行の先頭へ挿入」)。
+//
+// # UI 側の採用手順 (このモジュールを使う側がやること)
+//
+// 1. `Buffer` に `multi: MultiSel` を 1 本持つ (既存の単一選択とは別に持つ)。
+// 2. コマンド発火時、egui の `CCursorRange` (= **char** インデックス) から
+//    [`MultiSel::from_char_ranges`] で種を作る。
+//    ```ignore
+//    let seed = MultiSel::from_char_ranges(&buf.text, [ccur.primary.index..ccur.secondary.index]);
+//    let sel = editor_ops::add_cursor_below(&buf.text, &seed, tab_width);
+//    ```
+// 3. 編集は [`apply_edit_to_all`] 系を 1 回呼ぶ。返る `String` を `buf.text` へ入れ、
+//    undo スタックへは**その 1 回ぶん**を積む (VS Code も複数キャレットの編集を
+//    1 undo にまとめる)。
+// 4. キャレットの復帰は [`MultiSel::to_single_selection_chars`] で char 範囲に
+//    直して `TextEditState::cursor.set_char_range(..)` に戻す。
+//
+// # 今の UI で「できないこと」と回避策
+//
+// | できないこと | 理由 | 今できる代替 |
+// |---|---|---|
+// | N 本のキャレットが同時に点滅する | `TextEdit` が `CCursorRange` を 1 つしか持たない | [`MultiSel::to_single_selection`] で 1 本だけ表示 |
+// | タイプした 1 文字が N 箇所へ同時に入る | キー入力は egui が単一キャレットへ適用する | コマンド (例:「選択箇所へ入力」) から [`insert_at_all`] を呼ぶ |
+// | N 個の選択ハイライトが出る | 同上 | `TextEditOutput.galley` を使い、UI 側で `to_char_ranges` の各範囲の矩形を**自前で塗る**ことは可能 (描画だけなら egui 改造不要) |
+// | キャレットごとの undo | undo は本文まるごと | 一括編集を 1 undo として積む |
+//
+// つまり「描画の足し込み (自前で矩形とキャレットを塗る)」までは今の egui でも到達でき、
+// 「入力の分配」だけが `TextEdit` を自前実装に置き換えるまで残る。
+
+use std::ops::Range;
+
+/// 複数キャレット (と、その選択範囲) の集合。
+///
+/// 中身は**バイト範囲**で、常に次の不変条件を保つ (すべての生成・編集の後で成立):
+///
+/// 1. `start <= end`
+/// 2. 開始位置の昇順に整列
+/// 3. 重なりなし — 重なった範囲は 1 つに融合する
+/// 4. 端点は必ず UTF-8 の文字境界 (本文を渡す生成関数を通した場合)
+///
+/// 隣接するだけ (前の `end` == 次の `start`) の**空でない**範囲は融合しない。
+/// VS Code も `[0,3)` と `[3,6)` を別々のキャレットとして扱う。
+/// ただし片方が空キャレットの場合は融合する (範囲の端に居る空キャレットは
+/// その範囲のキャレットと同じ位置を指しているだけなので、残すと二重になる)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MultiSel {
+    carets: Vec<Range<usize>>,
+}
+
+impl MultiSel {
+    /// バイト範囲から作る。整列・融合は自動 (文字境界の検査はしない)。
+    /// 本文が手元にあるなら [`MultiSel::in_text`] を使うこと。
+    pub fn new(ranges: impl IntoIterator<Item = Range<usize>>) -> Self {
+        let mut s = Self {
+            carets: ranges.into_iter().collect(),
+        };
+        s.normalize();
+        s
+    }
+
+    /// 本文に対して作る。本文長へクランプし、端点を文字境界へ寄せてから整列・融合する。
+    /// 開始は手前へ、終了は後ろへ寄せる (寄せて範囲が消えないように)。
+    pub fn in_text(text: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> Self {
+        let carets = ranges
+            .into_iter()
+            .map(|r| {
+                let (lo, hi) = if r.start <= r.end {
+                    (r.start, r.end)
+                } else {
+                    (r.end, r.start)
+                };
+                snap_char_boundary(text, lo)..snap_boundary_up(text, hi)
+            })
+            .collect::<Vec<_>>();
+        Self::new(carets)
+    }
+
+    /// egui 側の **char** インデックス範囲から作る (`CCursorRange` はこちら)。
+    pub fn from_char_ranges(text: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> Self {
+        Self::in_text(
+            text,
+            ranges
+                .into_iter()
+                .map(|r| char_to_byte(text, r.start.min(r.end))..char_to_byte(text, r.end.max(r.start))),
+        )
+    }
+
+    /// 整列済みのバイト範囲。
+    pub fn carets(&self) -> &[Range<usize>] {
+        &self.carets
+    }
+
+    pub fn len(&self) -> usize {
+        self.carets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.carets.is_empty()
+    }
+
+    /// この範囲がそのまま含まれているか (⌘D が同じ場所を二度拾わないための判定)。
+    pub fn contains_range(&self, r: &Range<usize>) -> bool {
+        self.carets.iter().any(|c| c == r)
+    }
+
+    /// 単一キャレットの UI へ返す 1 本。**最後 (最も後ろ) の範囲**を返す。
+    ///
+    /// [`add_cursor_below`] / [`select_next_occurrence`] は新しいキャレットが
+    /// 後ろに付くのでこれで「増えた側」が見える。[`add_cursor_above`] のように
+    /// 前へ伸びるコマンドでは `carets().first()` を使うとよい。
+    /// 空集合のときは `0..0`。
+    pub fn to_single_selection(&self) -> Range<usize> {
+        self.carets.last().cloned().unwrap_or(0..0)
+    }
+
+    /// 全範囲を char インデックスへ直す (egui へ戻す用)。
+    pub fn to_char_ranges(&self, text: &str) -> Vec<Range<usize>> {
+        self.carets
+            .iter()
+            .map(|r| byte_to_char(text, r.start)..byte_to_char(text, r.end))
+            .collect()
+    }
+
+    /// [`to_single_selection`] の char インデックス版。
+    pub fn to_single_selection_chars(&self, text: &str) -> Range<usize> {
+        let r = self.to_single_selection();
+        byte_to_char(text, r.start)..byte_to_char(text, r.end)
+    }
+
+    /// 各範囲が指す本文。空キャレットは空文字列になる。
+    pub fn slices<'a>(&self, text: &'a str) -> Vec<&'a str> {
+        self.carets
+            .iter()
+            .map(|r| &text[r.start.min(text.len())..r.end.min(text.len())])
+            .collect()
+    }
+
+    /// 不変条件を回復する。生成・編集のたびに必ず通す。
+    fn normalize(&mut self) {
+        for r in self.carets.iter_mut() {
+            if r.start > r.end {
+                *r = r.end..r.start;
+            }
+        }
+        self.carets
+            .sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+        let mut out: Vec<Range<usize>> = Vec::with_capacity(self.carets.len());
+        for r in std::mem::take(&mut self.carets) {
+            match out.last_mut() {
+                // 重なっている / 片方が空キャレットで端点が一致 → 融合
+                Some(p)
+                    if r.start < p.end
+                        || (r.start == p.end && (r.start == r.end || p.start == p.end)) =>
+                {
+                    p.end = p.end.max(r.end);
+                }
+                _ => out.push(r),
+            }
+        }
+        self.carets = out;
+    }
+}
+
+/// バイト位置を文字境界まで**後ろへ**寄せる ([`snap_char_boundary`] の逆向き)。
+fn snap_boundary_up(s: &str, byte: usize) -> usize {
+    let mut byte = byte.min(s.len());
+    while byte < s.len() && !s.is_char_boundary(byte) {
+        byte += 1;
+    }
+    byte
+}
+
+/// 行内のバイト位置 `byte` (行頭からの相対) の**表示桁** (0 起点)。
+///
+/// タブは次の `tab_width` の倍数まで進む。**タブ以外は全て 1 桁**として数える
+/// (VS Code の「桁」の定義。全角文字を 2 桁と数えないので、日本語の行でも
+/// 「上下のカーソル追加」が文字数どおりに並ぶ)。
+fn visual_col_in_line(line: &str, byte: usize, tab_width: usize) -> usize {
+    let tw = tab_width.max(1);
+    let mut col = 0usize;
+    for (b, c) in line.char_indices() {
+        if b >= byte {
+            break;
+        }
+        col += if c == '\t' { tw - (col % tw) } else { 1 };
+    }
+    col
+}
+
+/// 表示桁 `col` に当たる行内バイト位置 (行頭からの相対)。
+///
+/// - 行がその桁まで届かない → 行末を返す (短い行では行末に寄る = VS Code と同じ)。
+/// - タブの途中に当たった → 近い方の端へ丸める (タブを割らない)。
+fn byte_at_visual_col(line: &str, col: usize, tab_width: usize) -> usize {
+    let tw = tab_width.max(1);
+    let mut cur = 0usize;
+    for (b, c) in line.char_indices() {
+        if col <= cur {
+            return b;
+        }
+        let next = cur + if c == '\t' { tw - (cur % tw) } else { 1 };
+        if col < next {
+            // 文字の途中 (タブの内側) — 近い端へ寄せる
+            return if col - cur <= next - col {
+                b
+            } else {
+                b + c.len_utf8()
+            };
+        }
+        cur = next;
+    }
+    line.len()
+}
+
+/// バイト位置を含む行のインデックス。`segs` は [`line_segments`] の結果。
+fn line_index_of_byte(segs: &[(usize, usize, usize)], byte: usize) -> usize {
+    segs.partition_point(|(s, _, _)| *s <= byte)
+        .saturating_sub(1)
+}
+
+/// 各キャレットの**真上**の行に、同じ表示桁のキャレットを足す (VS Code の
+/// 「カーソルを上に追加」)。
+///
+/// VS Code と同じく「既存のキャレット全部 + それぞれの 1 行上」を集合として返す。
+/// 重複は [`MultiSel`] の融合規則で消えるので、繰り返し呼ぶと上へ 1 行ずつ伸びる。
+/// 最上行のキャレットからは何も増えない。桁は**タブ展開後の表示桁**で保つので、
+/// タブ幅の違う行へ移っても見た目の位置が揃う。短い行では行末に寄る。
+///
+/// 空集合を渡すと空集合が返る (UI は現在のキャレットを必ず種にすること)。
+///
+/// **sticky column について**: 短い行を通り抜けたあとも元の桁へ戻る VS Code の
+/// 挙動が要るなら、押し始めの桁を [`visual_column_of`] で取って
+/// [`add_cursor_above_at`] へ渡し続けること (VS Code もカーソル状態として
+/// 桁を覚えている。純関数のこちらでは覚えようがない)。
+pub fn add_cursor_above(text: &str, sel: &MultiSel, tab_width: usize) -> MultiSel {
+    add_cursor_vertical(text, sel, tab_width, true, None)
+}
+
+/// [`add_cursor_above`] の下向き。最終行のキャレットからは何も増えない。
+pub fn add_cursor_below(text: &str, sel: &MultiSel, tab_width: usize) -> MultiSel {
+    add_cursor_vertical(text, sel, tab_width, false, None)
+}
+
+/// sticky column を明示する [`add_cursor_above`]。
+/// `desired_col` が `Some` なら、途中に短い行があってもその桁へ戻る。
+pub fn add_cursor_above_at(
+    text: &str,
+    sel: &MultiSel,
+    tab_width: usize,
+    desired_col: Option<usize>,
+) -> MultiSel {
+    add_cursor_vertical(text, sel, tab_width, true, desired_col)
+}
+
+/// sticky column を明示する [`add_cursor_below`]。
+pub fn add_cursor_below_at(
+    text: &str,
+    sel: &MultiSel,
+    tab_width: usize,
+    desired_col: Option<usize>,
+) -> MultiSel {
+    add_cursor_vertical(text, sel, tab_width, false, desired_col)
+}
+
+/// 本文のバイト位置 `byte` の**表示桁** (0 起点)。sticky column の種を取るのに使う。
+pub fn visual_column_of(text: &str, byte: usize, tab_width: usize) -> usize {
+    let (ls, le) = line_bounds(text, byte);
+    visual_col_in_line(&text[ls..le], byte.min(le).saturating_sub(ls), tab_width)
+}
+
+fn add_cursor_vertical(
+    text: &str,
+    sel: &MultiSel,
+    tab_width: usize,
+    up: bool,
+    desired_col: Option<usize>,
+) -> MultiSel {
+    if sel.is_empty() {
+        return sel.clone();
+    }
+    let segs = line_segments(text);
+    let mut out: Vec<Range<usize>> = sel.carets().to_vec();
+    for r in sel.carets() {
+        // 上へ伸ばすときは範囲の上端、下へ伸ばすときは下端を基準にする
+        let anchor = if up { r.start } else { r.end };
+        let li = line_index_of_byte(&segs, anchor);
+        let target = if up {
+            li.checked_sub(1)
+        } else {
+            (li + 1 < segs.len()).then_some(li + 1)
+        };
+        let Some(ti) = target else { continue };
+        let (ls, le, _) = segs[li];
+        let col = desired_col
+            .unwrap_or_else(|| visual_col_in_line(&text[ls..le], anchor.saturating_sub(ls), tab_width));
+        let (ts, te, _) = segs[ti];
+        let b = ts + byte_at_visual_col(&text[ts..te], col, tab_width);
+        out.push(b..b);
+    }
+    MultiSel::in_text(text, out)
+}
+
+/// 検索語の当て方。[`select_all_occurrences`] / [`select_next_occurrence`] 共通。
+///
+/// 実体は `file_search::Matcher` に委譲する (「ファイル間で検索」と**同じ**
+/// 一致規則 — 大文字小文字の畳み込みも単語境界の定義も 1 か所しかない)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatchOpts {
+    pub case_sensitive: bool,
+    /// 前後が単語文字でない箇所だけ拾う (`file_search` と同じ定義)。
+    pub whole_word: bool,
+    /// `needle` を正規表現として解釈する。
+    /// **注意**: 本文全体を 1 つの入力として当てるので `^` / `$` は
+    /// 「バッファの先頭 / 末尾」であって行頭 / 行末ではない (`(?m)` を付ければ行単位になる)。
+    pub regex: bool,
+}
+
+fn compile_matcher(needle: &str, opts: MatchOpts) -> Option<crate::file_search::Matcher> {
+    let so = crate::file_search::SearchOptions {
+        query: needle.to_string(),
+        case_sensitive: opts.case_sensitive,
+        whole_word: opts.whole_word,
+        regex: opts.regex,
+        ..crate::file_search::SearchOptions::default()
+    };
+    crate::file_search::Matcher::compile(&so).ok()
+}
+
+/// 本文中の `needle` の出現を**全部**選択する (VS Code の「全ての出現を選択」)。
+///
+/// 一致しない / パターンが壊れているときは空集合。
+pub fn select_all_occurrences(text: &str, needle: &str, opts: MatchOpts) -> MultiSel {
+    let Some(m) = compile_matcher(needle, opts) else {
+        return MultiSel::default();
+    };
+    MultiSel::in_text(text, m.find_all(text).into_iter().map(|(s, e)| s..e))
+}
+
+/// `sel` に「次の出現」を 1 つだけ足す (VS Code の ⌘D)。
+///
+/// - 探し始めるのは**最後のキャレットの終端**。そこから後ろに無ければ先頭へ回り込む。
+/// - 既に集合に入っている範囲は飛ばす。全部入っていれば `sel` をそのまま返す
+///   (押し続けても増えなくなる = VS Code と同じ止まり方)。
+pub fn select_next_occurrence(text: &str, sel: &MultiSel, needle: &str, opts: MatchOpts) -> MultiSel {
+    let Some(m) = compile_matcher(needle, opts) else {
+        return sel.clone();
+    };
+    let all: Vec<Range<usize>> = m.find_all(text).into_iter().map(|(s, e)| s..e).collect();
+    if all.is_empty() {
+        return sel.clone();
+    }
+    let from = sel.carets().last().map(|r| r.end).unwrap_or(0);
+    // from 以降 → 先頭から、の順に「まだ選ばれていない出現」を探す
+    let next = all
+        .iter()
+        .find(|r| r.start >= from && !sel.contains_range(r))
+        .or_else(|| all.iter().find(|r| !sel.contains_range(r)));
+    match next {
+        Some(r) => MultiSel::in_text(text, sel.carets().iter().cloned().chain([r.clone()])),
+        None => sel.clone(),
+    }
+}
+
+/// 矩形 (列) 選択。行 × 表示桁の長方形を、行ごとの範囲の集合に変換する。
+///
+/// - 行・桁は 0 起点。順序は問わない (逆向きに指定しても同じ矩形になる)。
+/// - 桁は**タブ展開後の表示桁**。タブの途中に辺が来たら近い端へ丸める
+///   (タブを割ったバイト位置は作らない)。
+/// - 矩形より短い行は**行末の空キャレット**になる (VS Code と同じ。行を飛ばさないので
+///   「各行の同じ桁に挿入」が短い行でも効く)。
+/// - 幅 0 の矩形は各行の空キャレット = 「複数行の先頭にカーソルを立てる」になる。
+/// - 行番号は本文の行数へクランプする。
+pub fn column_selection(
+    text: &str,
+    anchor_line: usize,
+    anchor_col: usize,
+    head_line: usize,
+    head_col: usize,
+    tab_width: usize,
+) -> MultiSel {
+    let segs = line_segments(text);
+    let last = segs.len() - 1;
+    let (lo_line, hi_line) = if anchor_line <= head_line {
+        (anchor_line, head_line)
+    } else {
+        (head_line, anchor_line)
+    };
+    let (lo_line, hi_line) = (lo_line.min(last), hi_line.min(last));
+    let (lo_col, hi_col) = if anchor_col <= head_col {
+        (anchor_col, head_col)
+    } else {
+        (head_col, anchor_col)
+    };
+    let mut out = Vec::with_capacity(hi_line - lo_line + 1);
+    for (ls, le, _) in segs[lo_line..=hi_line].iter().copied() {
+        let line = &text[ls..le];
+        let s = ls + byte_at_visual_col(line, lo_col, tab_width);
+        let e = ls + byte_at_visual_col(line, hi_col, tab_width);
+        out.push(s..e);
+    }
+    MultiSel::in_text(text, out)
+}
+
+/// 全キャレットの範囲を `f` の返す文字列で置き換える。**後ろから前へ**適用する。
+///
+/// 後ろから当てるので、まだ適用していない (= より手前の) 範囲のバイト位置が
+/// ずれない。`f` には**編集前**の本文の当該範囲がそのまま渡る (空キャレットなら `""`)。
+///
+/// 返る [`MultiSel`] は**編集後の本文**に対する範囲で、挿入した文字列を覆う。
+/// 不変条件 (整列・重なりなし・文字境界) は再び成立する。
+pub fn apply_edit_to_all<F>(text: &str, sel: &MultiSel, mut f: F) -> (String, MultiSel)
+where
+    F: FnMut(&str) -> String,
+{
+    let reps: Vec<(Range<usize>, String)> = sel
+        .carets()
+        .iter()
+        .map(|r| {
+            let (s, e) = (r.start.min(text.len()), r.end.min(text.len()));
+            (s..e, f(&text[s..e]))
+        })
+        .collect();
+    let mut out = text.to_string();
+    // ── 後ろから前へ。前の範囲のバイト位置は一切動かない ──
+    for (r, new) in reps.iter().rev() {
+        out.replace_range(r.clone(), new);
+    }
+    // 新しい範囲は前から累積差分で求める (置換後の本文に対する位置)
+    let mut delta: isize = 0;
+    let mut carets = Vec::with_capacity(reps.len());
+    for (r, new) in reps.iter() {
+        let start = (r.start as isize + delta) as usize;
+        carets.push(start..start + new.len());
+        delta += new.len() as isize - (r.end - r.start) as isize;
+    }
+    let sel = MultiSel::new(carets);
+    (out, sel)
+}
+
+/// 全キャレットの**手前**に `ins` を挿入する (既存の選択内容は消さない)。
+///
+/// 返る範囲は挿入文字列を含まない = 元の選択内容がそのまま選ばれたまま後ろへずれる。
+/// 空キャレットなら挿入直後の空キャレットになる (「そこにタイプした」形)。
+pub fn insert_at_all(text: &str, sel: &MultiSel, ins: &str) -> (String, MultiSel) {
+    let (out, moved) = apply_edit_to_all(text, sel, |old| format!("{ins}{old}"));
+    let carets = moved
+        .carets()
+        .iter()
+        .map(|r| (r.start + ins.len())..r.end)
+        .collect::<Vec<_>>();
+    (out, MultiSel::new(carets))
+}
+
+/// 全キャレットの選択内容を消す。空キャレットは何も消さない
+/// (Backspace 相当が要るなら [`apply_edit_to_all`] で範囲を作ってから呼ぶ)。
+pub fn delete_at_all(text: &str, sel: &MultiSel) -> (String, MultiSel) {
+    apply_edit_to_all(text, sel, |_| String::new())
+}
+
+/// 全キャレットの選択内容を `rep` に置き換える (「全ての出現を選択 → まとめて置換」)。
+pub fn replace_all_ranges(text: &str, sel: &MultiSel, rep: &str) -> (String, MultiSel) {
+    apply_edit_to_all(text, sel, |_| rep.to_string())
+}
+
 #[cfg(test)]
+// `MultiSel` は範囲の**集合**を受け取るので、要素 1 つの配列リテラル `[a..b]` は
+// 意図どおり (clippy はベクタ初期化との取り違えを疑って警告するが、ここでは誤検知)。
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
@@ -1344,5 +1822,445 @@ mod tests {
         let caret = adjust_char_index_after_cleanup(original, &cleaned, 8);
         assert_eq!(caret, 6, "行1(2文字)+改行+行2(2文字) の直後");
         assert!(cleaned.is_char_boundary(char_to_byte(&cleaned, caret)));
+    }
+
+    // ──────────────── MultiSel: 不変条件 ────────────────
+
+    /// [`MultiSel`] の不変条件をすべて検査する。生成・編集の**あと**で必ず通す。
+    fn assert_invariants(text: &str, sel: &MultiSel, what: &str) {
+        let cs = sel.carets();
+        for (i, r) in cs.iter().enumerate() {
+            assert!(r.start <= r.end, "{what}: 逆順の範囲 {r:?}");
+            assert!(r.end <= text.len(), "{what}: 本文長を超える {r:?}");
+            assert!(
+                text.is_char_boundary(r.start) && text.is_char_boundary(r.end),
+                "{what}: 文字境界でない {r:?}"
+            );
+            if i > 0 {
+                let p = &cs[i - 1];
+                assert!(p.start <= r.start, "{what}: 未整列 {p:?} {r:?}");
+                assert!(p.end <= r.start, "{what}: 重なり {p:?} {r:?}");
+                // 端点が一致するのは「両方とも空でない」ときだけ (融合規則)
+                if p.end == r.start {
+                    assert!(
+                        p.start < p.end && r.start < r.end,
+                        "{what}: 空キャレットが融合されていない {p:?} {r:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multisel_sorts_and_merges_overlaps() {
+        let text = "abcdefghij";
+        let sel = MultiSel::in_text(text, [6..9, 0..3, 2..5]);
+        // 0..3 と 2..5 は重なるので 0..5 に融合、6..9 は独立
+        assert_eq!(sel.carets(), &[0..5, 6..9]);
+        assert_invariants(text, &sel, "重なりの融合");
+    }
+
+    #[test]
+    fn multisel_keeps_adjacent_nonempty_ranges_apart() {
+        let text = "abcdefghij";
+        let sel = MultiSel::in_text(text, [3..6, 0..3]);
+        assert_eq!(sel.carets(), &[0..3, 3..6], "隣接するだけの範囲は別キャレット");
+        assert_invariants(text, &sel, "隣接");
+    }
+
+    #[test]
+    fn multisel_absorbs_empty_caret_at_range_edge() {
+        let text = "abcdefghij";
+        assert_eq!(MultiSel::in_text(text, [0..3, 3..3]).carets(), &[0..3]);
+        assert_eq!(MultiSel::in_text(text, [3..3, 3..6]).carets(), &[3..6]);
+        assert_eq!(MultiSel::in_text(text, [3..3, 3..3]).carets(), &[3..3]);
+    }
+
+    #[test]
+    fn multisel_reversed_range_is_normalized() {
+        let text = "abcdefghij";
+        // 逆順の範囲 (アンカーがヘッドより後ろ) も同じ選択として扱う
+        let backwards = Range { start: 5, end: 2 };
+        assert_eq!(MultiSel::in_text(text, [backwards]).carets(), &[2..5]);
+    }
+
+    #[test]
+    fn multisel_snaps_to_char_boundaries_in_japanese() {
+        let text = "日本語";
+        // 1,2,4,5 は多バイト文字の途中。start は手前へ、end は後ろへ寄る
+        let sel = MultiSel::in_text(text, [1..5]);
+        assert_eq!(sel.carets(), &[0..6], "「日本」を覆う範囲へ寄る");
+        assert_invariants(text, &sel, "文字境界");
+    }
+
+    #[test]
+    fn multisel_char_range_round_trip() {
+        let text = "あいうえお";
+        let sel = MultiSel::from_char_ranges(text, [1..3]);
+        assert_eq!(sel.carets(), &[3..9], "char 1..3 = byte 3..9");
+        assert_eq!(sel.to_char_ranges(text), vec![1..3]);
+        assert_eq!(sel.slices(text), vec!["いう"]);
+        assert_eq!(sel.to_single_selection_chars(text), 1..3);
+    }
+
+    #[test]
+    fn multisel_single_selection_fallback() {
+        let text = "aXbXc";
+        let sel = MultiSel::in_text(text, [1..2, 3..4]);
+        assert_eq!(sel.to_single_selection(), 3..4, "最後の範囲");
+        assert_eq!(MultiSel::default().to_single_selection(), 0..0, "空なら 0..0");
+    }
+
+    // ──────────────── カーソルを上/下に追加 ────────────────
+
+    const RAGGED: &str = "abcdef\nab\nabcdefgh\n";
+
+    #[test]
+    fn add_cursor_below_clamps_on_short_line() {
+        let sel = MultiSel::in_text(RAGGED, [4..4]); // 1行目の桁4
+        let got = add_cursor_below(RAGGED, &sel, 4);
+        // 2行目 "ab" は桁4まで無いので行末 (byte 9) に寄る
+        assert_eq!(got.carets(), &[4..4, 9..9]);
+        assert_invariants(RAGGED, &got, "下に追加");
+    }
+
+    #[test]
+    fn add_cursor_below_grows_by_one_each_press() {
+        let mut sel = MultiSel::in_text(RAGGED, [4..4]);
+        for expect in [2, 3, 4] {
+            sel = add_cursor_below(RAGGED, &sel, 4);
+            assert_eq!(sel.len(), expect, "押すたびに 1 本ずつ増える");
+            assert_invariants(RAGGED, &sel, "連打");
+        }
+        // 最終行まで来たらそれ以上増えない
+        let last = add_cursor_below(RAGGED, &sel, 4);
+        assert_eq!(last.len(), 4, "最終行の先には行が無い");
+    }
+
+    #[test]
+    fn add_cursor_below_sticky_column_returns_to_original() {
+        let sel = MultiSel::in_text(RAGGED, [4..4]);
+        let col = visual_column_of(RAGGED, 4, 4);
+        assert_eq!(col, 4);
+        let step1 = add_cursor_below_at(RAGGED, &sel, 4, Some(col));
+        let step2 = add_cursor_below_at(RAGGED, &step1, 4, Some(col));
+        // 3行目 "abcdefgh" は桁4まであるので byte 10+4 = 14 へ戻る
+        assert_eq!(step2.carets(), &[4..4, 9..9, 14..14]);
+        // sticky を渡さないと短い行の桁 (2) を引き継いでしまう
+        let naive = add_cursor_below(RAGGED, &step1, 4);
+        assert_eq!(naive.carets(), &[4..4, 9..9, 12..12]);
+    }
+
+    #[test]
+    fn add_cursor_above_extends_upward() {
+        let sel = MultiSel::in_text(RAGGED, [12..12]); // 3行目の桁2
+        let got = add_cursor_above(RAGGED, &sel, 4);
+        assert_eq!(got.carets(), &[9..9, 12..12], "2行目 'ab' の桁2 = 行末");
+        let up2 = add_cursor_above(RAGGED, &got, 4);
+        assert_eq!(up2.carets(), &[2..2, 9..9, 12..12]);
+        assert_invariants(RAGGED, &up2, "上に追加");
+        // 最上行より上は無い
+        assert_eq!(add_cursor_above(RAGGED, &up2, 4).len(), 3);
+    }
+
+    #[test]
+    fn add_cursor_preserves_visual_column_across_tabs() {
+        let text = "\tab\nxxxxxxxxxxxx\n";
+        // 1行目: '\t' が桁0→4、'a'=4、'b'=5、行末=6
+        assert_eq!(visual_column_of(text, 3, 4), 6);
+        let sel = MultiSel::in_text(text, [3..3]);
+        let got = add_cursor_below(text, &sel, 4);
+        assert_eq!(got.carets(), &[3..3, 10..10], "2行目の桁6 = byte 4+6");
+        // タブ幅が変われば着地点も変わる (決め打ちしていない)
+        assert_eq!(visual_column_of(text, 3, 8), 10);
+        let got8 = add_cursor_below(text, &sel, 8);
+        assert_eq!(got8.carets(), &[3..3, 14..14], "2行目の桁10 = byte 4+10");
+    }
+
+    #[test]
+    fn add_cursor_on_empty_selection_is_noop() {
+        let sel = MultiSel::default();
+        assert!(add_cursor_below(RAGGED, &sel, 4).is_empty());
+        assert!(add_cursor_above(RAGGED, &sel, 4).is_empty());
+    }
+
+    #[test]
+    fn add_cursor_below_with_japanese_lines() {
+        let text = "日本語です\nあい\n漢字かな文字\n";
+        let sel = MultiSel::from_char_ranges(text, [3..3]); // 1行目の桁3
+        let got = add_cursor_below(text, &sel, 4);
+        assert_invariants(text, &got, "日本語の下に追加");
+        // 2行目 "あい" は 2 文字しかないので行末へ
+        let cols: Vec<usize> = got.to_char_ranges(text).iter().map(|r| r.start).collect();
+        assert_eq!(cols, vec![3, 8], "char 8 = 「日本語です\\nあい」の直後");
+    }
+
+    // ──────────────── 矩形選択 ────────────────
+
+    #[test]
+    fn column_selection_short_lines_get_empty_caret_at_eol() {
+        let text = "abcdef\nab\nabcdefgh";
+        let sel = column_selection(text, 0, 2, 2, 5, 4);
+        assert_eq!(
+            sel.carets(),
+            &[2..5, 9..9, 12..15],
+            "短い2行目は行末の空キャレット"
+        );
+        assert_invariants(text, &sel, "矩形");
+    }
+
+    #[test]
+    fn column_selection_is_direction_independent() {
+        let text = "abcdef\nab\nabcdefgh";
+        let a = column_selection(text, 0, 2, 2, 5, 4);
+        let b = column_selection(text, 2, 5, 0, 2, 4);
+        let c = column_selection(text, 2, 2, 0, 5, 4);
+        assert_eq!(a, b);
+        assert_eq!(a, c, "桁の順序も問わない");
+    }
+
+    #[test]
+    fn column_selection_zero_width_is_one_caret_per_line() {
+        let text = "abcdef\nab\nabcdefgh";
+        let sel = column_selection(text, 0, 3, 2, 3, 4);
+        assert_eq!(sel.carets(), &[3..3, 9..9, 13..13]);
+        assert!(sel.slices(text).iter().all(|s| s.is_empty()));
+    }
+
+    #[test]
+    fn column_selection_rounds_inside_tabs() {
+        let text = "\tab\nxxxx";
+        // 桁2 はタブ (桁0..4) の内側 — 手前寄りなのでタブの前へ丸める
+        assert_eq!(column_selection(text, 0, 2, 0, 2, 4).carets(), &[0..0]);
+        // 桁3 は後ろ寄りなのでタブの後ろへ
+        assert_eq!(column_selection(text, 0, 3, 0, 3, 4).carets(), &[1..1]);
+        // タブを割ったバイト位置は絶対に作らない
+        let sel = column_selection(text, 0, 1, 1, 3, 4);
+        assert_invariants(text, &sel, "タブの丸め");
+        assert_eq!(sel.carets(), &[0..1, 5..7], "1行目はタブ1文字、2行目は桁1..3");
+    }
+
+    #[test]
+    fn column_selection_clamps_line_numbers() {
+        let text = "ab\ncd";
+        let sel = column_selection(text, 0, 0, 99, 2, 4);
+        assert_eq!(sel.carets(), &[0..2, 3..5], "本文の行数へクランプ");
+    }
+
+    #[test]
+    fn column_selection_over_japanese_uses_character_columns() {
+        let text = "あいうえお\nかきくけこ";
+        let sel = column_selection(text, 0, 1, 1, 3, 4);
+        assert_eq!(sel.slices(text), vec!["いう", "きく"], "全角も1桁と数える");
+        assert_invariants(text, &sel, "日本語の矩形");
+    }
+
+    // ──────────────── 一括編集 (後ろから前へ) ────────────────
+
+    #[test]
+    fn apply_edit_back_to_front_with_adjacent_ranges() {
+        let text = "aaabbbccc";
+        let sel = MultiSel::in_text(text, [0..3, 3..6, 6..9]); // 隣接3本
+        let (out, new) = apply_edit_to_all(text, &sel, |s| format!("[{s}]"));
+        assert_eq!(out, "[aaa][bbb][ccc]");
+        assert_eq!(new.carets(), &[0..5, 5..10, 10..15]);
+        assert_invariants(&out, &new, "隣接の一括編集");
+        assert_eq!(new.slices(&out), vec!["[aaa]", "[bbb]", "[ccc]"]);
+    }
+
+    #[test]
+    fn apply_edit_sees_pre_edit_text_for_every_caret() {
+        let text = "one two three";
+        let sel = MultiSel::in_text(text, [0..3, 4..7, 8..13]);
+        let mut seen = Vec::new();
+        let (out, _) = apply_edit_to_all(text, &sel, |s| {
+            seen.push(s.to_string());
+            s.to_uppercase()
+        });
+        assert_eq!(seen, vec!["one", "two", "three"], "編集前の本文が渡る");
+        assert_eq!(out, "ONE TWO THREE");
+    }
+
+    #[test]
+    fn apply_edit_shrinking_ranges_keeps_offsets_valid() {
+        let text = "xxxx-yyyy-zzzz";
+        let sel = MultiSel::in_text(text, [0..4, 5..9, 10..14]);
+        let (out, new) = apply_edit_to_all(text, &sel, |_| "-".to_string());
+        assert_eq!(out, "-----", "3 つの塊が 1 文字ずつに縮む");
+        assert_eq!(new.carets(), &[0..1, 2..3, 4..5]);
+        assert_invariants(&out, &new, "縮む編集");
+    }
+
+    #[test]
+    fn batch_edits_are_char_boundary_safe_in_japanese() {
+        let text = "日本語です\n日本語でした\n";
+        let sel = select_all_occurrences(text, "日本語", MatchOpts::default());
+        assert_eq!(sel.len(), 2);
+        assert_invariants(text, &sel, "日本語の全出現");
+        let (out, new) = replace_all_ranges(text, &sel, "にほんご");
+        assert_eq!(out, "にほんごです\nにほんごでした\n");
+        assert_invariants(&out, &new, "日本語の一括置換");
+        assert_eq!(new.slices(&out), vec!["にほんご", "にほんご"]);
+        // 後ろから当てているので 2 番目の範囲も正しい位置を指したまま
+        assert_eq!(&out[new.carets()[1].clone()], "にほんご");
+    }
+
+    #[test]
+    fn insert_at_all_keeps_the_selected_text_selected() {
+        let text = "あ\nい\nう";
+        let sel = column_selection(text, 0, 0, 2, 1, 4);
+        let (out, new) = insert_at_all(text, &sel, "# ");
+        assert_eq!(out, "# あ\n# い\n# う");
+        assert_eq!(new.slices(&out), vec!["あ", "い", "う"], "選択内容は残る");
+        assert_invariants(&out, &new, "一括挿入");
+    }
+
+    #[test]
+    fn insert_at_all_on_empty_carets_lands_after_the_text() {
+        let text = "ab\ncd";
+        let sel = column_selection(text, 0, 0, 1, 0, 4);
+        let (out, new) = insert_at_all(text, &sel, "→");
+        assert_eq!(out, "→ab\n→cd");
+        assert_eq!(new.carets(), &[3..3, 9..9], "挿入した文字列の直後");
+        assert_invariants(&out, &new, "空キャレットへ挿入");
+    }
+
+    #[test]
+    fn delete_at_all_removes_every_range() {
+        let text = "日本語A日本語B日本語";
+        let sel = select_all_occurrences(text, "日本語", MatchOpts::default());
+        let (out, new) = delete_at_all(text, &sel);
+        assert_eq!(out, "AB");
+        assert_eq!(new.carets(), &[0..0, 1..1, 2..2]);
+        assert_invariants(&out, &new, "一括削除");
+    }
+
+    #[test]
+    fn edits_on_empty_selection_change_nothing() {
+        let text = "そのまま";
+        let sel = MultiSel::default();
+        assert_eq!(replace_all_ranges(text, &sel, "x").0, text);
+        assert_eq!(delete_at_all(text, &sel).0, text);
+        assert_eq!(insert_at_all(text, &sel, "x").0, text);
+    }
+
+    // ──────────────── 出現の選択 ────────────────
+
+    #[test]
+    fn select_all_occurrences_respects_case_and_whole_word() {
+        let text = "foo Foo foobar foo";
+        let ci = select_all_occurrences(text, "foo", MatchOpts::default());
+        assert_eq!(ci.len(), 4, "既定は大文字小文字を無視・部分一致");
+        let cs = select_all_occurrences(
+            text,
+            "foo",
+            MatchOpts {
+                case_sensitive: true,
+                ..MatchOpts::default()
+            },
+        );
+        assert_eq!(cs.slices(text), vec!["foo", "foo", "foo"]);
+        let ww = select_all_occurrences(
+            text,
+            "foo",
+            MatchOpts {
+                whole_word: true,
+                ..MatchOpts::default()
+            },
+        );
+        assert_eq!(ww.len(), 3, "foobar は単語として一致しない");
+        assert_invariants(text, &ww, "単語単位");
+    }
+
+    #[test]
+    fn select_all_occurrences_handles_no_match_and_bad_regex() {
+        let text = "abc";
+        assert!(select_all_occurrences(text, "zzz", MatchOpts::default()).is_empty());
+        assert!(select_all_occurrences(text, "", MatchOpts::default()).is_empty());
+        let bad = MatchOpts {
+            regex: true,
+            ..MatchOpts::default()
+        };
+        assert!(select_all_occurrences(text, "(", bad).is_empty(), "壊れた正規表現でも落ちない");
+    }
+
+    #[test]
+    fn select_next_occurrence_cmd_d_sequence() {
+        let text = "let a = 1;\nlet b = 2;\nlet c = 3;";
+        let opts = MatchOpts::default();
+        // 1 回目: 先頭の出現を掴む
+        let mut sel = select_next_occurrence(text, &MultiSel::default(), "let", opts);
+        assert_eq!(sel.carets(), &[0..3]);
+        // 2 回目・3 回目で下へ 1 つずつ増える
+        sel = select_next_occurrence(text, &sel, "let", opts);
+        assert_eq!(sel.len(), 2);
+        sel = select_next_occurrence(text, &sel, "let", opts);
+        assert_eq!(sel.slices(text), vec!["let", "let", "let"]);
+        assert_invariants(text, &sel, "⌘D 連打");
+        // 4 回目: もう増えない (全部選び終わっている)
+        let done = select_next_occurrence(text, &sel, "let", opts);
+        assert_eq!(done, sel, "全部選んだら押しても変わらない");
+    }
+
+    #[test]
+    fn select_next_occurrence_wraps_around() {
+        let text = "x a x b x";
+        let opts = MatchOpts::default();
+        // 最後の出現から始めると先頭へ回り込む
+        let sel = MultiSel::in_text(text, [8..9]);
+        let got = select_next_occurrence(text, &sel, "x", opts);
+        assert_eq!(got.carets(), &[0..1, 8..9], "先頭へ回り込んだ");
+    }
+
+    #[test]
+    fn select_next_occurrence_with_no_match_is_noop() {
+        let text = "abc";
+        let sel = MultiSel::in_text(text, [0..1]);
+        assert_eq!(select_next_occurrence(text, &sel, "zzz", MatchOpts::default()), sel);
+    }
+
+    #[test]
+    fn select_next_occurrence_japanese() {
+        let text = "犬と猫と犬と鳥と犬";
+        let opts = MatchOpts::default();
+        let mut sel = MultiSel::default();
+        for n in 1..=3 {
+            sel = select_next_occurrence(text, &sel, "犬", opts);
+            assert_eq!(sel.len(), n);
+            assert_invariants(text, &sel, "日本語の⌘D");
+        }
+        assert_eq!(sel.carets(), &[0..3, 12..15, 24..27]);
+        let (out, _) = replace_all_ranges(text, &sel, "🐕");
+        assert_eq!(out, "🐕と猫と🐕と鳥と🐕");
+    }
+
+    #[test]
+    fn multisel_invariants_hold_after_every_constructor() {
+        let texts = [
+            "",
+            "a",
+            "a\n",
+            "日本語\nかな\n",
+            "\tタブ\tab\n短\nxxxxxxxxxx\n",
+            "one\r\ntwo\r\n",
+        ];
+        for text in texts {
+            for tab in [1usize, 4, 8] {
+                let seed = MultiSel::in_text(text, [0..0]);
+                for sel in [
+                    MultiSel::in_text(text, [0..text.len(), 1..2, text.len()..text.len()]),
+                    add_cursor_below(text, &seed, tab),
+                    add_cursor_above(text, &MultiSel::in_text(text, [text.len()..text.len()]), tab),
+                    column_selection(text, 0, 0, 5, 3, tab),
+                    column_selection(text, 3, 7, 0, 0, tab),
+                    select_all_occurrences(text, "a", MatchOpts::default()),
+                    select_next_occurrence(text, &seed, "n", MatchOpts::default()),
+                ] {
+                    assert_invariants(text, &sel, &format!("{text:?} tab={tab}"));
+                    let (out, after) = apply_edit_to_all(text, &sel, |s| format!("<{s}>"));
+                    assert_invariants(&out, &after, &format!("編集後 {text:?} tab={tab}"));
+                }
+            }
+        }
     }
 }
