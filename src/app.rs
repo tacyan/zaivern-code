@@ -32,7 +32,7 @@ use crate::notify;
 use crate::github;
 use crate::ide;
 use crate::kanban;
-use crate::palette::{Action, Cmd, Item, Palette};
+use crate::palette::{Action, Cmd, Item, Palette, Results};
 use crate::panels::{self, space};
 use crate::pathx;
 use crate::pet;
@@ -14502,7 +14502,7 @@ impl ZaivernApp {
 
     // ─── UI: palette ────────────────────────────────────────────────
 
-    fn palette_items(&self) -> Vec<Item> {
+    fn palette_items(&self) -> Results {
         let q = self.palette.query().to_string();
         // クエリ前処理 (to_lowercase 等) は 1 回だけ。候補ごとの評価は
         // PreparedQuery::score で行う (fuzzy::score と同値・パリティテスト固定済み)。
@@ -14519,9 +14519,9 @@ impl ZaivernApp {
             self.palette_items_file_mode(&pq, &mut items);
         }
 
-        items.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.label.cmp(&b.label)));
-        items.truncate(100);
-        items
+        // 並べ替え・件数の頭打ち・グループ分け・空/不一致の見せ方は
+        // すべて palette 側の純粋関数に任せる (テーブルテストで固定済み)。
+        self.palette.results(items)
     }
 
     /// パレット: 組み込みコマンド定義 (icon, label, keybind, Cmd) の一覧。
@@ -15127,8 +15127,8 @@ impl ZaivernApp {
             self.palette_worktrees = Some(self.list_git_worktrees());
         }
         let theme = self.theme.clone();
-        let items = self.palette_items();
-        let mut execute: Option<Action> = None;
+        let results = self.palette_items();
+        let mut execute: Option<Item> = None;
         let mut close = false;
 
         egui::Area::new(egui::Id::new("zv-palette"))
@@ -15184,20 +15184,13 @@ impl ZaivernApp {
                         if escape {
                             close = true;
                         }
-                        let len = items.len();
-                        if len > 0 {
-                            if down {
-                                self.palette.selected = (self.palette.selected + 1) % len;
-                            }
-                            if up {
-                                self.palette.selected =
-                                    (self.palette.selected + len - 1) % len;
-                            }
-                            self.palette.selected = self.palette.selected.min(len - 1);
-                        }
+                        // 見出しは選べない。↑↓ は見出しを飛び越して端で折り返す。
+                        self.palette.selected =
+                            results.step(self.palette.selected, down, up);
                         if enter && !close {
-                            if let Some(it) = items.get(self.palette.selected) {
-                                execute = Some(it.action.clone());
+                            if let Some(it) = results.selected_item(self.palette.selected)
+                            {
+                                execute = Some(it.clone());
                             }
                             close = true;
                         }
@@ -15210,51 +15203,17 @@ impl ZaivernApp {
                             .id_salt("palette-list")
                             .max_height(420.0)
                             .show(ui, |ui| {
-                                for (i, it) in items.iter().enumerate() {
-                                    let selected = i == self.palette.selected;
-                                    let fill = if selected {
-                                        theme.accent_soft
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    };
-                                    let fr = egui::Frame::none()
-                                        .fill(fill)
-                                        .rounding(egui::Rounding::same(6.0))
-                                        .inner_margin(egui::Margin::symmetric(8.0, 5.0))
-                                        .show(ui, |ui| {
-                                            ui.set_width(ui.available_width());
-                                            ui.horizontal(|ui| {
-                                                ui.label(&it.icon);
-                                                ui.label(
-                                                    RichText::new(&it.label)
-                                                        .color(theme.text),
-                                                );
-                                                if !it.detail.is_empty() {
-                                                    ui.label(
-                                                        RichText::new(&it.detail)
-                                                            .size(11.5)
-                                                            .color(theme.text_dim),
-                                                    );
-                                                }
-                                            });
-                                        });
-                                    let r = ui.interact(
-                                        fr.response.rect,
-                                        egui::Id::new(("pal-item", i)),
-                                        egui::Sense::click(),
-                                    );
-                                    if r.clicked() {
-                                        execute = Some(it.action.clone());
-                                        close = true;
-                                    }
-                                    if selected && (down || up) {
-                                        r.scroll_to_me(None);
-                                    }
-                                }
-                                if items.is_empty() {
-                                    ui.label(
-                                        RichText::new(tr("該当なし")).color(theme.text_dim),
-                                    );
+                                // 行の描き方 (見出し / 候補 / 空・不一致の案内) は
+                                // palette 側の 1 本にまとめてある。ここは繋ぐだけ。
+                                if let Some(it) = crate::palette::list_ui(
+                                    ui,
+                                    &theme,
+                                    &results,
+                                    self.palette.selected,
+                                    down || up,
+                                ) {
+                                    execute = Some(it);
+                                    close = true;
                                 }
                             });
                     });
@@ -15264,8 +15223,10 @@ impl ZaivernApp {
             self.palette.close();
             self.palette_worktrees = None;
         }
-        if let Some(a) = execute {
-            self.run_action(a, ctx);
+        if let Some(it) = execute {
+            // 使った実績を憶えて次回の並びに効かせる (よく使う操作が上がる)。
+            self.palette.note_used(&it);
+            self.run_action(it.action, ctx);
         }
     }
 
