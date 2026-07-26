@@ -193,6 +193,53 @@ pub enum Cmd {
     ToggleFinalNewlineOnSave,
     /// アクティブなファイルの改行コードを揃える
     ConvertLineEnding(crate::textenc::LineEnding),
+
+    // ── PR 風のローカル変更レビュー (git_panel::ReviewPanel) ───────
+    /// サイドバーの Git タブを「変更をレビュー」サブタブで開く
+    OpenReview,
+    /// レビューの比較ベースを変える。値は "head" | "staged" | "unstaged"
+    /// (任意リビジョンはレビュー画面のツールバーから入力する)
+    SetReviewBase(String),
+
+    // ── 折りたたみ (highlight.rs の構造解析 + editor::FoldState) ────
+    /// カーソル行の折りたたみを切り替える
+    ToggleFold,
+    /// すべて折りたたむ
+    FoldAll,
+    /// すべて展開する
+    UnfoldAll,
+    /// 深さ N (1 始まり) までを折りたたむ
+    FoldLevel(usize),
+
+    // ── ブックマーク / 閉じたタブ (editor::Bookmarks / ClosedTabs) ──
+    /// カーソル行のブックマークを切り替える
+    ToggleBookmark,
+    /// 次のブックマークへ
+    NextBookmark,
+    /// 前のブックマークへ
+    PrevBookmark,
+    /// このファイルのブックマークをすべて解除
+    ClearBookmarks,
+    /// 直前に閉じたタブを開き直す
+    ReopenClosedTab,
+
+    // ── CSV/TSV テーブル表示 (editor::TableView) ────────────────────
+    /// 表形式ファイルをグリッド表示 / 素のテキスト表示で切り替える
+    ToggleTableView,
+
+    // ── LSP (lsp.rs) ───────────────────────────────────────────────
+    /// 補完候補を明示的に出す
+    LspCompletion,
+    /// 参照を検索してパネルに一覧する
+    LspReferences,
+    /// ドキュメントシンボルの一覧を開く
+    LspSymbols,
+    /// カーソル位置のシンボルをリネームする
+    LspRename,
+    /// ドキュメント全体を整形する
+    LspFormat,
+    /// 保存時に自動で整形するかを切り替える
+    ToggleFormatOnSave,
 }
 
 #[derive(Clone)]

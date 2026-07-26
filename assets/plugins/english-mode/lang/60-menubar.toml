@@ -170,3 +170,7 @@
 "✓ 保存時に最終行へ改行を入れる" = "✓ Insert Final Newline on Save"
 "セッション (過去の会話)" = "Sessions (Past Conversations)"
 "プラン使用量" = "Plan Usage"
+
+# 表示 > 折りたたみ
+"折りたたみ" = "Folding"
+"レベル {n} で折りたたむ" = "Fold Level {n}"

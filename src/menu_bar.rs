@@ -290,6 +290,7 @@ fn selection_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mu
 }
 
 fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<Cmd>) {
+    let ed = info.has_editor;
     ui.menu_button(tr("表示"), |ui| {
         ui.set_min_width(300.0);
         if item(ui, &tr("コマンド パレット…"), &sc(keys, BindAction::PaletteCommands), true) {
@@ -429,6 +430,31 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         if item(ui, &md, &sc(keys, BindAction::ToggleMdPreview), info.has_editor) {
             cmds.push(Cmd::ToggleMdPreview);
         }
+        ui.separator();
+        // 折りたたみ (VS Code: 表示 > 折りたたみ)。段数指定は
+        // 2 打鍵のコードが要るのでメニューとパレット専用にしてある。
+        ui.menu_button(tr("折りたたみ"), |ui| {
+            ui.set_min_width(280.0);
+            if item(ui, &tr("折りたたみ切替"), &sc(keys, BindAction::ToggleFold), ed) {
+                cmds.push(Cmd::ToggleFold);
+            }
+            if item(ui, &tr("すべて折りたたむ"), "", ed) {
+                cmds.push(Cmd::FoldAll);
+            }
+            if item(ui, &tr("すべて展開する"), &sc(keys, BindAction::UnfoldAll), ed) {
+                cmds.push(Cmd::UnfoldAll);
+            }
+            ui.separator();
+            for n in 1..=3usize {
+                let label = trf("レベル {n} で折りたたむ", &[("n", n.to_string())]);
+                if item(ui, &label, "", ed) {
+                    cmds.push(Cmd::FoldLevel(n));
+                }
+            }
+        });
+        if item(ui, &tr("テーブル表示の切替 (CSV / TSV)"), "", ed) {
+            cmds.push(Cmd::ToggleTableView);
+        }
     });
 }
 
@@ -459,6 +485,25 @@ fn go_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<C
         }
         if item(ui, &tr("ブラケットへ移動"), &sc(keys, BindAction::GoToBracket), ed) {
             cmds.push(Cmd::GoToBracket);
+        }
+        if item(ui, &tr("シンボルにジャンプ"), &sc(keys, BindAction::LspSymbols), info.has_file) {
+            cmds.push(Cmd::LspSymbols);
+        }
+        if item(ui, &tr("参照を検索"), &sc(keys, BindAction::LspReferences), info.has_file) {
+            cmds.push(Cmd::LspReferences);
+        }
+        ui.separator();
+        if item(ui, &tr("ブックマーク切替"), &sc(keys, BindAction::ToggleBookmark), ed) {
+            cmds.push(Cmd::ToggleBookmark);
+        }
+        if item(ui, &tr("次のブックマークへ"), "", ed) {
+            cmds.push(Cmd::NextBookmark);
+        }
+        if item(ui, &tr("前のブックマークへ"), "", ed) {
+            cmds.push(Cmd::PrevBookmark);
+        }
+        if item(ui, &tr("ブックマークをすべて解除"), "", ed) {
+            cmds.push(Cmd::ClearBookmarks);
         }
         ui.separator();
         if item(ui, &tr("行/列へ移動…"), &sc(keys, BindAction::GoToLine), ed) {

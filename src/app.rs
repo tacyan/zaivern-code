@@ -1019,6 +1019,453 @@ impl FrameGuard {
     }
 }
 
+// ===========================================================================
+// 折りたたみ表示 (code folding) の純関数層
+//
+// 本文エディタは `egui::TextEdit` が `Buffer::text` を直接書き換える作りなので、
+// 「畳んだ行を描かない」を実現するには **TextEdit に渡す文字列そのもの**から
+// 隠す行を落とすしかない。galley だけ間引くと egui のキャレット添字 (CCursor)
+// が本文とずれ、選択・貼り付け・削除がまとめて壊れる。
+//
+// そこで
+//   1. 原文から隠す行を取り除いた「表示テキスト」を作り  ([`build_fold_view`])
+//   2. TextEdit にはそれを編集させ
+//   3. 変わったら共通接頭辞 / 接尾辞で差分区間を求め、原文の対応区間へ
+//      差し戻す                                            ([`splice_fold_edit`])
+// という往復にする。表示 → 原文の添字変換は「取り除いた区間の長さを足す」
+// だけの単調写像 ([`fold_display_to_source`]) なので、キャレットも選択も
+// 表示テキスト側で完結し、egui 側の状態に手を入れる必要がない。
+// ===========================================================================
+
+/// 補完ポップアップに一度に並べる最大行数 (超えた分はスクロールで出す)。
+const MAX_COMPLETION_ROWS: usize = 60;
+/// 補完ポップアップの見た目 (幅 / 高さ)。
+const COMPLETION_POPUP_W: f32 = 520.0;
+const COMPLETION_POPUP_H: f32 = 240.0;
+/// ホバーをマウス位置からどれだけ下にずらすか。
+const HOVER_OFFSET_Y: f32 = 18.0;
+const HOVER_POPUP_W: f32 = 560.0;
+const HOVER_POPUP_H: f32 = 320.0;
+/// 参照 / シンボル一覧の小窓の大きさ。
+const REF_WINDOW_W: f32 = 420.0;
+const REF_WINDOW_H: f32 = 360.0;
+/// シンボル一覧に並べる最大件数。
+const MAX_SYMBOL_ROWS: usize = 300;
+/// リネーム入力を画面上端からどれだけ下に置くか。
+const RENAME_WINDOW_Y: f32 = 120.0;
+/// スティッキーヘッダの最大段数 (VS Code の既定と同じ 3 段)。
+const STICKY_MAX_ROWS: usize = 3;
+/// ガターの右端に確保する、折りたたみ記号 ▸ / ▾ の桁幅。
+const FOLD_MARKER_W: f32 = 12.0;
+/// テーブル表示で 1 列に見せる最大文字数 (長いセルは畳んで横幅を守る)。
+const TABLE_CELL_CHARS: usize = 40;
+
+/// 折りたたみ表示の 1 バッファぶんのキャッシュ。
+///
+/// 表示テキストを毎フレーム作り直さないための控え。`prev` は差し戻しの
+/// 基準 (直前フレームの表示テキスト) で、編集を検出したらキャッシュごと
+/// 捨てて次フレームに作り直す。
+struct FoldView {
+    /// どのバッファのものか (`Buffer::id`)
+    buf: u64,
+    /// 原文ハッシュ + 畳んだ行集合から作る鍵。ずれたら作り直す。
+    key: u64,
+    /// TextEdit に渡す表示テキスト
+    text: String,
+    /// 差分区間を求めるための、編集前の表示テキスト
+    prev: String,
+    /// 表示行 i に対応する原文の行番号 (0 始まり)
+    lines: Vec<usize>,
+    /// 原文から取り除いた文字区間 (char 単位・昇順・非重複)
+    cut: Vec<(usize, usize)>,
+}
+
+/// 原文と「隠す行の区間 (両端含む・0 始まり)」から表示テキストを作る。
+///
+/// 戻り値は `(表示テキスト, 表示行→原文行, 取り除いた char 区間)`。
+/// 隠す区間が本文の末尾まで届くときは直前の改行ごと落とし、余分な空行が
+/// 残らないようにする。
+fn build_fold_view(
+    src: &str,
+    hidden: &[(usize, usize)],
+) -> (String, Vec<usize>, Vec<(usize, usize)>) {
+    // 行頭の char オフセット表
+    let mut starts: Vec<usize> = vec![0];
+    let mut total = 0usize;
+    for ch in src.chars() {
+        total += 1;
+        if ch == '\n' {
+            starts.push(total);
+        }
+    }
+    let line_count = starts.len();
+
+    let mut cut: Vec<(usize, usize)> = Vec::with_capacity(hidden.len());
+    for &(a, b) in hidden {
+        if a >= line_count {
+            continue;
+        }
+        let b = b.min(line_count - 1);
+        if b < a {
+            continue;
+        }
+        let (cs, ce) = if b + 1 < line_count {
+            (starts[a], starts[b + 1])
+        } else {
+            (starts[a].saturating_sub(1), total)
+        };
+        if ce > cs {
+            cut.push((cs, ce));
+        }
+    }
+    cut.sort_unstable();
+    // 重なりを併合 (hidden_spans は併合済みだが、外から来ても壊れないように)
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(cut.len());
+    for (s, e) in cut {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+
+    let mut text = String::with_capacity(src.len());
+    let mut lines: Vec<usize> = Vec::with_capacity(line_count);
+    let mut ci = 0usize;
+    let mut cut_i = 0usize;
+    let mut line = 0usize;
+    let mut at_line_start = true;
+    for ch in src.chars() {
+        while cut_i < merged.len() && ci >= merged[cut_i].1 {
+            cut_i += 1;
+        }
+        let cutting = cut_i < merged.len() && ci >= merged[cut_i].0;
+        if !cutting {
+            if at_line_start {
+                lines.push(line);
+                at_line_start = false;
+            }
+            text.push(ch);
+        }
+        if ch == '\n' {
+            line += 1;
+            at_line_start = true;
+        }
+        ci += 1;
+    }
+    // 末尾が改行で終わっているときだけ「最後の空の表示行」を数える。
+    // 末尾まで畳んだ場合は表示テキストが改行で終わらないので、ここで
+    // 数えてしまうと存在しない行がガターに生えてしまう。
+    if at_line_start && (text.is_empty() || text.ends_with('\n')) {
+        lines.push(line.min(line_count.saturating_sub(1)));
+    }
+    (text, lines, merged)
+}
+
+/// 表示テキストの char 添字 → 原文の char 添字。
+///
+/// 取り除いた区間を通過するたびにその長さを足すだけの単調写像。
+fn fold_display_to_source(cut: &[(usize, usize)], d: usize) -> usize {
+    let mut s = d;
+    for &(cs, ce) in cut {
+        if s >= cs {
+            s += ce - cs;
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+/// 原文の char 添字 → 表示テキストの char 添字。
+///
+/// [`fold_display_to_source`] の逆写像。隠れている位置は、その折りたたみの
+/// 直前の可視位置へ丸める (畳んだ中へキャレットを置かないため)。
+fn fold_source_to_display(cut: &[(usize, usize)], s: usize) -> usize {
+    let mut d = s;
+    for &(cs, ce) in cut {
+        if s >= ce {
+            d -= ce - cs;
+        } else if s > cs {
+            d -= s - cs;
+            break;
+        } else {
+            break;
+        }
+    }
+    d
+}
+
+/// 表示テキストの編集から「編集が始まった原文の行」と「増減した行数」を返す。
+///
+/// `FoldState::shift_lines` / `Bookmarks::shift_lines` にそのまま渡すための値。
+fn fold_edit_shift(
+    src: &str,
+    next: &str,
+    cut: &[(usize, usize)],
+    old: &str,
+    new: &str,
+) -> (usize, isize) {
+    let o: Vec<char> = old.chars().collect();
+    let n: Vec<char> = new.chars().collect();
+    let mut p = 0usize;
+    while p < o.len() && p < n.len() && o[p] == n[p] {
+        p += 1;
+    }
+    let a = fold_display_to_source(cut, p);
+    let at = src.chars().take(a).filter(|c| *c == '\n').count();
+    let delta = next.split('\n').count() as isize - src.split('\n').count() as isize;
+    (at, delta)
+}
+
+/// 表示テキストへの編集を原文へ差し戻す。
+///
+/// `old` / `new` の共通接頭辞・接尾辞の外側だけを「変わった区間」とみなし、
+/// [`fold_display_to_source`] で原文の区間へ写して置き換える。
+/// 畳んだ行を跨いで選択して打ち込んだときは、その行も一緒に消える
+/// (VS Code の折りたたみと同じ挙動)。
+fn splice_fold_edit(src: &str, cut: &[(usize, usize)], old: &str, new: &str) -> String {
+    let o: Vec<char> = old.chars().collect();
+    let n: Vec<char> = new.chars().collect();
+    let mut p = 0usize;
+    while p < o.len() && p < n.len() && o[p] == n[p] {
+        p += 1;
+    }
+    let mut suf = 0usize;
+    while suf < o.len() - p && suf < n.len() - p && o[o.len() - 1 - suf] == n[n.len() - 1 - suf] {
+        suf += 1;
+    }
+    let sc: Vec<char> = src.chars().collect();
+    let a = fold_display_to_source(cut, p).min(sc.len());
+    let b = fold_display_to_source(cut, o.len() - suf).min(sc.len());
+    let b = b.max(a);
+    let mut out = String::with_capacity(src.len() + new.len());
+    out.extend(sc[..a].iter());
+    out.extend(n[p..n.len() - suf].iter());
+    out.extend(sc[b..].iter());
+    out
+}
+
+/// 本文 galley の視覚行から「表示行の先頭になっている視覚行」を拾う。
+///
+/// 入力は視覚行ごとの「その行が改行で終わるか」。戻り値は
+/// `(視覚行の添字, その行が何番目の表示行か)` の並び。折り返し ON では
+/// 1 つの表示行が複数の視覚行になるので、行番号やガターの印は
+/// **先頭の視覚行だけ**に出す必要がある。
+fn row_line_starts(ends_with_newline: &[bool]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(ends_with_newline.len());
+    let mut line = 0usize;
+    let mut at_start = true;
+    for (i, nl) in ends_with_newline.iter().enumerate() {
+        if at_start {
+            out.push((i, line));
+        }
+        if *nl {
+            line += 1;
+            at_start = true;
+        } else {
+            at_start = false;
+        }
+    }
+    out
+}
+
+/// ガターのクリック位置から、折りたたみを開閉すべき原文行を求める。
+///
+/// `rows` は `(原文行, y の上端, y の下端)`。`fold_x` より右を押したときだけ
+/// 反応する (左はブックマークの列)。折りたためない行は無視する。
+fn fold_click_line(
+    rows: &[(usize, f32, f32)],
+    marks: &HashMap<usize, bool>,
+    fold_x: f32,
+    p: egui::Pos2,
+) -> Option<usize> {
+    if p.x < fold_x {
+        return None;
+    }
+    rows.iter()
+        .find(|(src, y0, y1)| marks.contains_key(src) && p.y >= *y0 && p.y < *y1)
+        .map(|(src, ..)| *src)
+}
+
+/// ブックマーク系コマンドの効果。戻り値はジャンプ先の行 (0 始まり)。
+///
+/// 切替 / 全解除は `None` を返す (その場から動かない)。次 / 前は端で
+/// 折り返す ([`crate::editor::Bookmarks`] の契約どおり)。
+fn bookmark_cmd_target(
+    cmd: &Cmd,
+    marks: &mut crate::editor::Bookmarks,
+    line: usize,
+) -> Option<usize> {
+    match cmd {
+        Cmd::ToggleBookmark => {
+            marks.toggle(line);
+            None
+        }
+        Cmd::NextBookmark => marks.next_after(line),
+        Cmd::PrevBookmark => marks.prev_before(line),
+        Cmd::ClearBookmarks => {
+            marks.clear_all();
+            None
+        }
+        _ => None,
+    }
+}
+
+/// テーブル表示コマンドで何をすべきか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableToggle {
+    /// 表として読み直す
+    Build,
+    /// 素のテキストへ戻す
+    Drop,
+    /// CSV / TSV ではないので何もしない
+    NotTable,
+}
+
+/// テーブル表示の切替判定。表示中なら必ず解除できる (拡張子を問わない)。
+fn table_toggle_decision(is_table_path: bool, showing_table: bool) -> TableToggle {
+    if showing_table {
+        TableToggle::Drop
+    } else if is_table_path {
+        TableToggle::Build
+    } else {
+        TableToggle::NotTable
+    }
+}
+
+/// 巨大ファイルの帯に並べる「効いている制限」の一覧。
+///
+/// editor.rs は意図的に旗しか返さないので、文言はここで組み立てる。
+fn large_file_reasons(read_only: bool, highlight_off: bool) -> Vec<String> {
+    let mut v = Vec::new();
+    if read_only {
+        v.push(tr("読み取り専用"));
+    }
+    if highlight_off {
+        v.push(tr("強調表示と折りたたみを停止"));
+    }
+    v
+}
+
+/// 本文エディタが編集する対象。
+///
+/// egui 0.29 の `TextEdit` に「読み取り専用」は無いが、`TextBuffer` を
+/// `is_mutable() == false` で実装すると **選択とコピーはできるまま編集だけ
+/// 止まる**。巨大ファイル / 差分タブと、折りたたみ中の一時テキストを、
+/// 同じ `TextEdit` 呼び出しで扱うための薄い包み。
+enum EditTarget<'a> {
+    /// 通常編集 (原文そのもの、または折りたたみ表示テキスト)
+    Rw(&'a mut String),
+    /// 読み取り専用 (巨大ファイル・差分タブ)
+    Ro(&'a str),
+}
+
+impl EditTarget<'_> {
+    fn set(&mut self, s: String) {
+        if let EditTarget::Rw(t) = self {
+            **t = s;
+        }
+    }
+}
+
+impl egui::TextBuffer for EditTarget<'_> {
+    fn is_mutable(&self) -> bool {
+        matches!(self, EditTarget::Rw(_))
+    }
+    fn as_str(&self) -> &str {
+        match self {
+            EditTarget::Rw(t) => t.as_str(),
+            EditTarget::Ro(t) => t,
+        }
+    }
+    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
+        match self {
+            EditTarget::Rw(t) => <String as egui::TextBuffer>::insert_text(t, text, char_index),
+            EditTarget::Ro(_) => 0,
+        }
+    }
+    fn delete_char_range(&mut self, char_range: std::ops::Range<usize>) {
+        if let EditTarget::Rw(t) = self {
+            <String as egui::TextBuffer>::delete_char_range(t, char_range);
+        }
+    }
+}
+
+/// リネーム (LSP textDocument/rename) の進行状態。
+///
+/// prepareRename → 名前の入力 → rename → WorkspaceEdit の適用、の 4 段。
+struct RenameFlow {
+    key: LspKey,
+    path: PathBuf,
+    pos: lsp::Position,
+    /// prepareRename の応答待ち
+    preparing: bool,
+    /// 名前の入力欄を出しているか
+    open: bool,
+    name: String,
+    focus: bool,
+    /// rename の応答待ち
+    applying: bool,
+}
+
+/// LSP の CompletionItemKind → 一覧に出す短い種別ラベル。
+///
+/// 絵文字は環境によって豆腐 (□) になるので、フォント非依存の英字で出す。
+fn completion_kind_label(kind: u8) -> &'static str {
+    match kind {
+        2 | 3 => "fn",
+        4 => "new",
+        5 | 10 => "fld",
+        6 => "var",
+        7 | 22 => "type",
+        8 => "trait",
+        9 => "mod",
+        12 | 21 => "const",
+        13 | 20 => "enum",
+        14 => "kw",
+        15 => "snip",
+        17 => "file",
+        19 => "dir",
+        24 => "op",
+        25 => "T",
+        _ => "·",
+    }
+}
+
+/// LSP の SymbolKind → 一覧に出す短い種別ラベル。
+fn symbol_kind_label(kind: u8) -> &'static str {
+    match kind {
+        1 => "file",
+        2 | 3 => "mod",
+        4 => "pkg",
+        5 => "class",
+        6 => "method",
+        7 => "prop",
+        8 => "field",
+        9 => "new",
+        10 => "enum",
+        11 => "trait",
+        12 => "fn",
+        13 => "var",
+        14 => "const",
+        23 => "struct",
+        26 => "T",
+        _ => "·",
+    }
+}
+
+/// シンボル木を「深さつきの並び」へ平らにする (quick-open 風の一覧用)。
+fn flatten_symbols(
+    nodes: &[lsp::SymbolNode],
+    depth: usize,
+    out: &mut Vec<(usize, String, u8, lsp::Position)>,
+) {
+    for n in nodes {
+        out.push((depth, n.name.clone(), n.kind, n.selection_range.start));
+        flatten_symbols(&n.children, depth + 1, out);
+    }
+}
+
 pub struct ZaivernApp {
     cfg: Config,
     theme: Theme,
@@ -1178,6 +1625,54 @@ pub struct ZaivernApp {
     gitinfo: git::GitSet,
     /// Git サイドバー。単一 repo 表示なので常に primary ルートを見る。
     git_panel: git_panel::GitPanel,
+    /// PR 風のローカル変更レビュー。Git サイドバーのサブタブとして出す。
+    review: git_panel::ReviewPanel,
+    /// Git サイドバーのサブタブ: true = 「変更をレビュー」/ false = 「変更」
+    git_sub_review: bool,
+    /// 折りたたみ表示のキャッシュ (毎フレーム本文を作り直さないため)。
+    /// 詳細は [`FoldView`] を参照。
+    fold_view: Option<FoldView>,
+    /// スティッキーヘッダのキャッシュ (鍵 = 本文ハッシュ + 最上部の可視行)。
+    /// `highlight::sticky_headers` は本文全走査なのでスクロール中に毎フレーム
+    /// 呼ばない。
+    sticky_cache: Option<(u64, Vec<(usize, String)>)>,
+    /// インデントガイドのキャッシュ。
+    /// 鍵 = 本文ハッシュ + タブ幅 + キャレット行 (強調ガイドが行に依存するため)。
+    /// 値 = (鍵, 行ごとの桁リスト, 強調するガイド)。
+    #[allow(clippy::type_complexity)]
+    guide_cache: Option<(u64, Vec<(usize, Vec<usize>)>, Option<crate::highlight::ActiveGuide>)>,
+    /// 補完ポップアップの状態 (デバウンス + 候補 + 選択)。
+    lsp_completion: lsp::CompletionState,
+    /// 補完を要求したバッファ id (別のタブへ移ったら候補を捨てるため)
+    lsp_completion_buf: Option<u64>,
+    /// ホバーポップアップの状態
+    lsp_hover: lsp::HoverState,
+    /// ホバー要求の飛行中 ID (HoverState は内部の ID を公開していないので控える)
+    lsp_hover_flight: Option<u64>,
+    /// ホバーを出す画面位置 (マウス位置)
+    lsp_hover_pos: Option<egui::Pos2>,
+    /// 本文描画中に求めた「マウス下の文書位置」。次フレームの
+    /// `lsp_completion_tick` が拾ってホバーのデバウンスに流す。
+    hover_doc_pos: Option<lsp::Position>,
+    /// キャレット直下の画面位置 (補完ポップアップの基準)
+    caret_screen: Option<egui::Pos2>,
+    /// 「参照を検索」の結果と表示状態
+    lsp_refs: Vec<lsp::ReferenceGroup>,
+    lsp_refs_open: bool,
+    lsp_refs_busy: bool,
+    /// 「シンボルにジャンプ」の結果と表示状態
+    lsp_symbols: Vec<lsp::SymbolNode>,
+    lsp_symbols_open: bool,
+    lsp_symbols_busy: bool,
+    lsp_symbols_query: String,
+    lsp_symbols_path: Option<PathBuf>,
+    /// リネームの進行状態
+    lsp_rename: Option<RenameFlow>,
+    /// 整形の要求元 (バッファ id, 整形後に保存するか)
+    lsp_format_buf: Option<(u64, bool)>,
+    /// 保存時に LSP で整形するか。config.rs は別担当なのでここでは
+    /// セッション内の切替のみ (既定は OFF = 何も変えない)。
+    format_on_save: bool,
     /// 外部変更チェックの直近実行時刻(約1秒スロットリング)
     ext_check_at: Option<Instant>,
     keys: Keybinds,
@@ -1501,6 +1996,31 @@ impl ZaivernApp {
             git_panel: git_panel::GitPanel::new(
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
             ),
+            review: git_panel::ReviewPanel::new(
+                roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
+            ),
+            git_sub_review: false,
+            fold_view: None,
+            sticky_cache: None,
+            guide_cache: None,
+            lsp_completion: lsp::CompletionState::new(),
+            lsp_completion_buf: None,
+            lsp_hover: lsp::HoverState::new(),
+            lsp_hover_flight: None,
+            hover_doc_pos: None,
+            caret_screen: None,
+            lsp_hover_pos: None,
+            lsp_refs: Vec::new(),
+            lsp_refs_open: false,
+            lsp_refs_busy: false,
+            lsp_symbols: Vec::new(),
+            lsp_symbols_open: false,
+            lsp_symbols_busy: false,
+            lsp_symbols_query: String::new(),
+            lsp_symbols_path: None,
+            lsp_rename: None,
+            lsp_format_buf: None,
+            format_on_save: false,
             ext_check_at: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
             theme,
@@ -1739,6 +2259,7 @@ impl ZaivernApp {
         // Git パネルは単一 repo 表示。GitSet と同じ「primary ルート」を見せることで、
         // サイドバーとステータスバーのブランチ表示が食い違わないようにする。
         self.git_panel.set_workspace(self.primary_root().to_path_buf());
+        self.review.set_workspace(self.primary_root().to_path_buf());
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
         self.tree.show_hidden = self.cfg.show_hidden_files;
@@ -3502,7 +4023,14 @@ impl ZaivernApp {
     /// **送信はしない** — 入れるだけで、送るかどうかはユーザーが決める
     /// (プロジェクト方針: 入力欄への自動書き込みで Enter は撃たない)。
     fn take_review_prompt(&mut self, prompt: String) {
-        if !self.agent_input_buf.append_prompt(&prompt) {
+        // 差分を見ていたエージェント宛ての下書きへ入れる (居なければ全員宛て)。
+        // 宛先ごとに下書きが分かれるので、レビュー文が全エージェントへ飛ばない。
+        let target = match self.agents.active_session() {
+            Some(s) => crate::agent_input::ComposerTarget::Agent(s.id),
+            None => crate::agent_input::ComposerTarget::Broadcast,
+        };
+        self.agent_input_buf.set_target(target);
+        if !self.agent_input_buf.append_prompt_for(target, &prompt) {
             return;
         }
         self.broadcast_input = self.agent_input_buf.text().to_string();
@@ -3666,8 +4194,22 @@ impl ZaivernApp {
         };
         // PR 差分などの非ファイルタブは保存できない。ここで止めないと
         // 「名前を付けて保存」ダイアログが開いて差分がファイルとして書き出される。
-        if self.editor.buffers[i].kind.read_only() {
+        if self.editor.buffers[i].read_only() {
             self.toast(tr("このタブは読み取り専用です (保存できません)"), false);
+            return false;
+        }
+        // 保存時の整形: LSP へ投げて、応答が届いてから本文へ当てて保存する
+        // (UI スレッドは待たない)。整形要求が飛行中なら二重に投げない。
+        // 「保存して閉じる」やフック付きの保存は先送りしない
+        // (この関数の戻り値で追加動作を決めている呼び出し元があるため)。
+        if self.format_on_save
+            && !as_new
+            && !close_after
+            && !run_hooks
+            && self.lsp_format_buf.is_none()
+            && self.editor.buffers[i].path.is_some()
+            && self.lsp_format_document(true)
+        {
             return false;
         }
         let (need_dialog, cur_path, buffer_id) = {
@@ -4128,6 +4670,7 @@ impl ZaivernApp {
         let n = race.racers.len();
         self.race.begin(race);
         self.git_panel.invalidate();
+        self.review.invalidate();
         self.toast(
             trf(
                 "🏁 レース開始 — {n} 体が並走中 (準備でき次第プロンプトを配達します)",
@@ -4173,6 +4716,7 @@ impl ZaivernApp {
                     Ok(msg) => {
                         self.toast(msg, true);
                         self.git_panel.invalidate();
+                        self.review.invalidate();
                     }
                     Err(e) => self.toast(e, false),
                 },
@@ -4188,6 +4732,7 @@ impl ZaivernApp {
                         Ok(msg) => {
                             self.toast(msg, true);
                             self.git_panel.invalidate();
+                            self.review.invalidate();
                         }
                         Err(e) => self.toast(e, false),
                     }
@@ -4227,8 +4772,1186 @@ impl ZaivernApp {
         self.track_agent_root(&dir);
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // 第 2 次配線: レビュー / 折りたたみ / ブックマーク / テーブル / LSP
+    // ═══════════════════════════════════════════════════════════════
+
+    /// パレット・キーバインドから来る「エディタまわりの追加機能」をさばく。
+    fn apply_cmd_editor_extras(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::OpenReview => self.open_review_panel(),
+            Cmd::SetReviewBase(ref kind) => {
+                let base = match kind.as_str() {
+                    "staged" => git_panel::ReviewBase::Staged,
+                    "unstaged" => git_panel::ReviewBase::Unstaged,
+                    _ => git_panel::ReviewBase::Head,
+                };
+                let label = base.label();
+                self.review.set_base(base);
+                self.open_review_panel();
+                self.toast(trf("レビューの比較: {b}", &[("b", label)]), true);
+            }
+            Cmd::ToggleFold | Cmd::FoldAll | Cmd::UnfoldAll | Cmd::FoldLevel(_) => {
+                self.apply_fold_cmd(&cmd)
+            }
+            Cmd::ToggleBookmark
+            | Cmd::NextBookmark
+            | Cmd::PrevBookmark
+            | Cmd::ClearBookmarks => self.apply_bookmark_cmd(&cmd),
+            Cmd::ReopenClosedTab => self.reopen_closed_tab(),
+            Cmd::ToggleTableView => self.toggle_table_view(),
+            Cmd::LspCompletion => {
+                // パレット経由だとフォーカスが本文から外れている。
+                // キャレットを置き直して本文へ戻してから候補を出す
+                // (pending_select の経路が request_focus までやる)。
+                if let Some(i) = self.editor.active {
+                    let (ln, col) = self.editor.cursor;
+                    let c = editor_ops::char_index_at(
+                        &self.editor.buffers[i].text,
+                        ln.saturating_sub(1),
+                        col.saturating_sub(1),
+                    );
+                    self.pending_select = Some((c, c));
+                }
+                let w = self.word_before_caret();
+                self.lsp_completion.invoke(&w, Instant::now());
+            }
+            Cmd::LspReferences => self.lsp_find_references(),
+            Cmd::LspSymbols => self.lsp_document_symbols(),
+            Cmd::LspRename => self.lsp_start_rename(),
+            Cmd::LspFormat => {
+                if !self.lsp_format_document(false) {
+                    self.toast_warn(tr("整形できるサーバーが動いていません"));
+                }
+            }
+            Cmd::ToggleFormatOnSave => {
+                self.format_on_save = !self.format_on_save;
+                let msg = if self.format_on_save {
+                    tr("保存時に整形する: ON")
+                } else {
+                    tr("保存時に整形する: OFF")
+                };
+                self.toast(msg, true);
+            }
+            _ => {}
+        }
+    }
+
+    // ── A: PR 風のローカル変更レビュー ───────────────────────────
+
+    /// 「変更をレビュー」を開く (サイドバー → Git タブ → レビューサブタブ)。
+    fn open_review_panel(&mut self) {
+        self.sidebar_open = true;
+        self.sidebar_tab = SidebarTab::Git;
+        self.git_sub_review = true;
+        self.review.invalidate();
+        self.persist_session();
+    }
+
+    // ── B/C 共通のキャレット操作 ─────────────────────────────────
+
+    /// キャレット行 (0 始まり)。`Editor::cursor` は 1 始まりで持っている。
+    fn caret_line0(&self) -> usize {
+        self.editor.cursor.0.saturating_sub(1)
+    }
+
+    /// 指定行 (0 始まり) を隠している折りたたみを開く。ジャンプの前に呼ぶ。
+    fn reveal_line(&mut self, i: usize, line0: usize) {
+        let b = &mut self.editor.buffers[i];
+        if !b.folds.is_line_hidden(line0) {
+            return;
+        }
+        let starts: Vec<usize> = b
+            .folds
+            .ranges()
+            .iter()
+            .filter(|r| r.hides(line0))
+            .map(|r| r.start_line)
+            .collect();
+        for s in starts {
+            b.folds.unfold(s);
+        }
+        b.gutter = None;
+        self.fold_view = None;
+    }
+
+    // ── B: 折りたたみ ────────────────────────────────────────────
+
+    /// 折りたたみ系のコマンド。行番号は 0 始まりで扱う。
+    fn apply_fold_cmd(&mut self, cmd: &Cmd) {
+        let Some(i) = self.editor.active else {
+            return;
+        };
+        let line = self.caret_line0();
+        let b = &mut self.editor.buffers[i];
+        b.refresh_folds();
+        let mut warn: Option<String> = None;
+        match cmd {
+            Cmd::ToggleFold => {
+                if !b.folds.toggle_fold(line) {
+                    warn = Some(tr("この行には折りたためる範囲がありません"));
+                }
+            }
+            Cmd::FoldAll => b.folds.fold_all(),
+            Cmd::UnfoldAll => b.folds.unfold_all(),
+            Cmd::FoldLevel(n) => b.folds.fold_level(*n),
+            _ => {}
+        }
+        b.gutter = None;
+        self.fold_view = None;
+        if let Some(w) = warn {
+            self.toast_warn(w);
+        }
+    }
+
+    // ── C: ブックマーク / 閉じたタブ ─────────────────────────────
+
+    /// ブックマーク系のコマンド。
+    fn apply_bookmark_cmd(&mut self, cmd: &Cmd) {
+        let Some(i) = self.editor.active else {
+            return;
+        };
+        let line = self.caret_line0();
+        let target = bookmark_cmd_target(cmd, &mut self.editor.buffers[i].bookmarks, line);
+        self.editor.buffers[i].gutter = None;
+        match target {
+            Some(l) => {
+                self.reveal_line(i, l);
+                self.goto_line(l + 1);
+            }
+            None if matches!(cmd, Cmd::NextBookmark | Cmd::PrevBookmark) => {
+                self.toast_warn(tr("このファイルにはブックマークがありません"))
+            }
+            None => {}
+        }
+    }
+
+    /// 直前に閉じたタブを開き直す (VS Code: ⇧⌘T)。
+    fn reopen_closed_tab(&mut self) {
+        let Some(t) = self.editor.closed_tabs.pop_closed() else {
+            self.toast_warn(tr("開き直せるタブがありません"));
+            return;
+        };
+        if !t.path.exists() {
+            self.toast_warn(trf(
+                "{path} はもう存在しません",
+                &[("path", t.path.display().to_string())],
+            ));
+            return;
+        }
+        self.open_path(&t.path);
+        // 閉じた時点のキャレット位置 (1 始まり) とスクロールへ戻す
+        self.goto_line(t.cursor.0);
+        if t.scroll > 0.0 {
+            self.pending_scroll = Some(t.scroll);
+        }
+    }
+
+    // ── D: CSV / TSV のテーブル表示 ──────────────────────────────
+
+    /// 表形式ファイルのグリッド表示 ⇄ 素のテキスト表示を切り替える。
+    fn toggle_table_view(&mut self) {
+        let Some(i) = self.editor.active else {
+            return;
+        };
+        let is_table = self.editor.buffers[i]
+            .path
+            .as_deref()
+            .map(crate::editor::is_table_path)
+            .unwrap_or(false);
+        let showing = self.editor.buffers[i].table.is_some();
+        match table_toggle_decision(is_table, showing) {
+            TableToggle::Drop => self.editor.buffers[i].drop_table(),
+            TableToggle::Build => {
+                self.editor.buffers[i].build_table();
+            }
+            TableToggle::NotTable => {
+                self.toast_warn(tr("このファイルは CSV / TSV ではありません"))
+            }
+        }
+    }
+
+    // ── E: LSP ───────────────────────────────────────────────────
+
+    /// アクティブなバッファに紐づく、起動済み LSP クライアントの鍵とパス。
+    fn active_lsp_target(&self) -> Option<(LspKey, PathBuf)> {
+        let i = self.editor.active?;
+        let b = &self.editor.buffers[i];
+        let p = b.path.clone()?;
+        let key = self.lsp_key_for(&p, &b.lang);
+        self.lsp.contains_key(&key).then_some((key, p))
+    }
+
+    /// キャレット位置を LSP の Position (UTF-16 桁) にする。
+    fn caret_lsp_pos(&self) -> Option<lsp::Position> {
+        let i = self.editor.active?;
+        let t = &self.editor.buffers[i].text;
+        let (ln, col) = self.editor.cursor;
+        let ci = editor_ops::char_index_at(t, ln.saturating_sub(1), col.saturating_sub(1));
+        let byte = editor_ops::char_to_byte(t, ci);
+        Some(lsp::byte_index_to_lsp_pos(t, byte))
+    }
+
+    /// キャレットの直前にある識別子 (補完の絞り込みキー)。
+    fn word_before_caret(&self) -> String {
+        let Some(i) = self.editor.active else {
+            return String::new();
+        };
+        let t = &self.editor.buffers[i].text;
+        let (ln, col) = self.editor.cursor;
+        let line = t.split('\n').nth(ln.saturating_sub(1)).unwrap_or("");
+        let chars: Vec<char> = line.chars().collect();
+        let c = col.saturating_sub(1).min(chars.len());
+        let mut s = c;
+        while s > 0 && lsp::is_identifier_char(chars[s - 1]) {
+            s -= 1;
+        }
+        chars[s..c].iter().collect()
+    }
+
+    /// キャレット位置の識別子まるごと (リネームの初期値)。
+    fn word_at_caret(&self) -> String {
+        let Some(i) = self.editor.active else {
+            return String::new();
+        };
+        let t = &self.editor.buffers[i].text;
+        let (ln, col) = self.editor.cursor;
+        let line = t.split('\n').nth(ln.saturating_sub(1)).unwrap_or("");
+        let chars: Vec<char> = line.chars().collect();
+        let c = col.saturating_sub(1).min(chars.len());
+        let mut s = c;
+        while s > 0 && lsp::is_identifier_char(chars[s - 1]) {
+            s -= 1;
+        }
+        let mut e = c;
+        while e < chars.len() && lsp::is_identifier_char(chars[e]) {
+            e += 1;
+        }
+        chars[s..e].iter().collect()
+    }
+
+    /// 「参照を検索」。結果はパネルに一覧する。
+    fn lsp_find_references(&mut self) {
+        let (Some((key, path)), Some(pos)) = (self.active_lsp_target(), self.caret_lsp_pos())
+        else {
+            self.toast_warn(tr("この言語の LSP サーバーが動いていません"));
+            return;
+        };
+        let Some(c) = self.lsp.get(&key) else {
+            return;
+        };
+        if !c.caps().references {
+            self.toast_warn(tr("このサーバーは参照の検索に対応していません"));
+            return;
+        }
+        if c.request_references(&path, pos, true).is_sent() {
+            self.lsp_refs.clear();
+            self.lsp_refs_busy = true;
+            self.lsp_refs_open = true;
+        }
+    }
+
+    /// 「シンボルにジャンプ」。ドキュメントシンボルを quick-open 風に出す。
+    fn lsp_document_symbols(&mut self) {
+        let Some((key, path)) = self.active_lsp_target() else {
+            self.toast_warn(tr("この言語の LSP サーバーが動いていません"));
+            return;
+        };
+        let Some(c) = self.lsp.get(&key) else {
+            return;
+        };
+        if !c.caps().document_symbol {
+            self.toast_warn(tr("このサーバーはシンボル一覧に対応していません"));
+            return;
+        }
+        if c.request_document_symbols(&path).is_sent() {
+            self.lsp_symbols.clear();
+            self.lsp_symbols_busy = true;
+            self.lsp_symbols_open = true;
+            self.lsp_symbols_query.clear();
+            self.lsp_symbols_path = Some(path);
+        }
+    }
+
+    /// 「リネーム」。prepareRename に対応していれば可否を先に尋ねる。
+    fn lsp_start_rename(&mut self) {
+        let (Some((key, path)), Some(pos)) = (self.active_lsp_target(), self.caret_lsp_pos())
+        else {
+            self.toast_warn(tr("この言語の LSP サーバーが動いていません"));
+            return;
+        };
+        let caps = match self.lsp.get(&key) {
+            Some(c) => c.caps(),
+            None => return,
+        };
+        if !caps.rename {
+            self.toast_warn(tr("このサーバーはリネームに対応していません"));
+            return;
+        }
+        let name = self.word_at_caret();
+        let sent_prepare = caps.prepare_rename
+            && self
+                .lsp
+                .get(&key)
+                .map(|c| c.request_prepare_rename(&path, pos).is_sent())
+                .unwrap_or(false);
+        self.lsp_rename = Some(RenameFlow {
+            key,
+            path,
+            pos,
+            preparing: sent_prepare,
+            open: !sent_prepare,
+            focus: !sent_prepare,
+            name,
+            applying: false,
+        });
+    }
+
+    /// 「ドキュメントを整形」。`save_after` が true なら結果の適用後に保存する。
+    /// 送れたら true (サーバーが無い / 非対応なら false)。
+    fn lsp_format_document(&mut self, save_after: bool) -> bool {
+        let Some(i) = self.editor.active else {
+            return false;
+        };
+        let Some((key, path)) = self.active_lsp_target() else {
+            return false;
+        };
+        let Some(c) = self.lsp.get(&key) else {
+            return false;
+        };
+        if !c.caps().formatting {
+            return false;
+        }
+        // 保存時クリーンアップの設定と食い違わせない
+        let opts = lsp::FormatOptions {
+            trim_trailing_whitespace: self.save_trim_trailing,
+            insert_final_newline: self.save_final_newline,
+            ..Default::default()
+        };
+        if c.request_formatting(&path, &opts).is_sent() {
+            self.lsp_format_buf = Some((self.editor.buffers[i].id, save_after));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 補完候補を確定して本文へ差し込む (`additionalTextEdits` も一緒に当てる)。
+    /// 実際に本文が変わったら true。
+    fn accept_completion(&mut self) -> bool {
+        let Some(i) = self.editor.active else {
+            return false;
+        };
+        let Some(pos) = self.caret_lsp_pos() else {
+            return false;
+        };
+        // サーバーが textEdit を寄こさなかったときの既定の置換範囲 =
+        // 「キャレット直前の識別子」〜キャレット
+        let word_u16 = self.word_before_caret().encode_utf16().count();
+        let fallback = lsp::Range::new(
+            lsp::Position::new(pos.line, pos.character.saturating_sub(word_u16)),
+            pos,
+        );
+        let Some(edits) = self.lsp_completion.accept(fallback) else {
+            return false;
+        };
+        self.lsp_completion.dismiss();
+        if edits.is_empty() {
+            return false;
+        }
+        let before = self.editor.buffers[i].text.clone();
+        let after = lsp::apply_text_edits(&before, &edits);
+        if after == before {
+            return false;
+        }
+        // キャレットは「キャレット行の編集」の直後へ。手前に当たった
+        // additionalTextEdits (import 追加など) のぶんだけずらす。
+        let main = edits
+            .iter()
+            .find(|e| e.range.start.line == pos.line)
+            .cloned();
+        if let Some(m) = main {
+            let mut shift: isize = 0;
+            for e in &edits {
+                let earlier = (e.range.start.line, e.range.start.character)
+                    < (m.range.start.line, m.range.start.character);
+                if earlier {
+                    let (bs, be) = lsp::range_to_byte_span(&before, &e.range);
+                    shift += e.new_text.chars().count() as isize
+                        - before[bs..be].chars().count() as isize;
+                }
+            }
+            let bs = lsp::lsp_pos_to_byte_index(&before, m.range.start);
+            let base = before[..bs].chars().count() as isize + shift;
+            let ci = (base.max(0) as usize) + m.new_text.chars().count();
+            self.pending_select = Some((ci, ci));
+        }
+        let b = &mut self.editor.buffers[i];
+        b.text = after;
+        b.cache = None;
+        b.gutter = None;
+        self.fold_view = None;
+        self.queue_lsp_change(i);
+        true
+    }
+
+    /// rename が返した WorkspaceEdit を適用する。
+    ///
+    /// 開いていないファイルもタブとして開いてから書き換え、**未保存のまま**
+    /// 残す。勝手にディスクへ書かないのはこのエディタの一貫した方針
+    /// (取り消しはタブを閉じるだけで済む)。ファイルの作成 / 削除 / 改名を
+    /// 含む編集は適用せずに知らせる。
+    fn apply_workspace_edit(&mut self, plan: lsp::WorkspaceEditPlan) {
+        if plan.is_empty() {
+            self.toast_warn(tr("変更はありませんでした"));
+            return;
+        }
+        let total = plan.edit_count();
+        let mut files = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for fe in &plan.files {
+            let idx = match self.editor.buffers.iter().position(|b| {
+                b.path.as_deref() == Some(fe.path.as_path())
+            }) {
+                Some(i) => Some(i),
+                None => match self.editor.open(&fe.path, &self.highlighter) {
+                    Ok(_) => self.editor.active,
+                    Err(e) => {
+                        failed.push(e);
+                        None
+                    }
+                },
+            };
+            let Some(i) = idx else { continue };
+            let b = &mut self.editor.buffers[i];
+            let next = lsp::apply_file_edits(&b.text, fe);
+            if next != b.text {
+                b.text = next;
+                b.cache = None;
+                b.gutter = None;
+                files += 1;
+            }
+            self.queue_lsp_change(i);
+        }
+        self.fold_view = None;
+        for e in failed {
+            self.toast_warn(e);
+        }
+        if plan.has_resource_ops {
+            self.toast_warn(tr(
+                "ファイルの作成 / 削除 / 改名を含む変更は適用していません",
+            ));
+        }
+        self.toast(
+            trf(
+                "✏ {files} ファイル / {edits} 箇所を書き換えました (未保存)",
+                &[
+                    ("files", files.to_string()),
+                    ("edits", total.to_string()),
+                ],
+            ),
+            true,
+        );
+    }
+
+    /// LSP の応答を毎フレーム回収する。
+    ///
+    /// `sweep_timeouts` は**必ず毎フレーム**呼ぶ。返らないリクエストの席を
+    /// 空けないと、以降の要求が「飛行中」のまま詰まって黙って効かなくなる。
+    fn poll_lsp(&mut self) {
+        let mut completion: Option<lsp::CompletionList> = None;
+        let mut hover: Option<lsp::HoverInfo> = None;
+        let mut refs: Option<Vec<lsp::ReferenceGroup>> = None;
+        let mut syms: Option<Vec<lsp::SymbolNode>> = None;
+        let mut prepare: Option<Option<lsp::Range>> = None;
+        let mut plan: Option<lsp::WorkspaceEditPlan> = None;
+        let mut fmt: Option<Vec<lsp::TextEdit>> = None;
+        for c in self.lsp.values() {
+            c.sweep_timeouts(lsp::REQUEST_TIMEOUT);
+            if let Some(v) = c.poll_completion() {
+                completion = Some(v);
+            }
+            if let Some(v) = c.poll_hover() {
+                hover = Some(v);
+            }
+            if let Some(v) = c.poll_references() {
+                refs = Some(v);
+            }
+            if let Some(v) = c.poll_document_symbols() {
+                syms = Some(v);
+            }
+            if let Some(v) = c.poll_prepare_rename() {
+                prepare = Some(v);
+            }
+            if let Some(v) = c.poll_rename() {
+                plan = Some(v);
+            }
+            if let Some(v) = c.poll_formatting() {
+                fmt = Some(v);
+            }
+        }
+
+        if let (Some(list), Some(id)) = (completion, self.lsp_completion.in_flight()) {
+            self.lsp_completion.apply_response(id, list);
+            if self.lsp_completion.is_open() {
+                let w = self.word_before_caret();
+                self.lsp_completion.set_filter(&w);
+            }
+        }
+        if let Some(info) = hover {
+            // HoverState は要求 ID で新旧を見分ける。飛行中でなければ捨てる。
+            if let Some(id) = self.lsp_hover_flight {
+                self.lsp_hover.apply_response(id, info);
+            }
+        }
+        if let Some(groups) = refs {
+            self.lsp_refs = groups;
+            self.lsp_refs_busy = false;
+            if self.lsp_refs.is_empty() {
+                self.toast_warn(tr("参照は見つかりませんでした"));
+                self.lsp_refs_open = false;
+            }
+        }
+        if let Some(nodes) = syms {
+            self.lsp_symbols = nodes;
+            self.lsp_symbols_busy = false;
+            if self.lsp_symbols.is_empty() {
+                self.toast_warn(tr("シンボルは見つかりませんでした"));
+                self.lsp_symbols_open = false;
+            }
+        }
+        if let Some(range) = prepare {
+            if let Some(f) = self.lsp_rename.as_mut() {
+                f.preparing = false;
+                match range {
+                    Some(_) => {
+                        f.open = true;
+                        f.focus = true;
+                    }
+                    None => {
+                        self.lsp_rename = None;
+                        self.toast_warn(tr("ここではリネームできません"));
+                    }
+                }
+            }
+        }
+        if let Some(p) = plan {
+            if self.lsp_rename.take().is_some() {
+                self.apply_workspace_edit(p);
+            }
+        }
+        if let Some(edits) = fmt {
+            self.apply_format_result(edits);
+        }
+    }
+
+    /// 整形の結果を本文へ当てる (必要なら続けて保存する)。
+    fn apply_format_result(&mut self, edits: Vec<lsp::TextEdit>) {
+        let Some((buf_id, save_after)) = self.lsp_format_buf.take() else {
+            return;
+        };
+        let Some(i) = self.editor.buffers.iter().position(|b| b.id == buf_id) else {
+            return;
+        };
+        if !edits.is_empty() {
+            let before = self.editor.buffers[i].text.clone();
+            let after = lsp::apply_text_edits(&before, &edits);
+            if after != before {
+                let b = &mut self.editor.buffers[i];
+                b.text = after;
+                b.cache = None;
+                b.gutter = None;
+                self.fold_view = None;
+                self.queue_lsp_change(i);
+            }
+        }
+        if save_after {
+            if let Some(p) = self.editor.buffers[i].path.clone() {
+                self.save_buffer_to(i, p);
+            }
+        } else if edits.is_empty() {
+            self.toast(tr("整形の必要はありませんでした"), true);
+        } else {
+            self.toast(tr("✏ 整形しました"), true);
+        }
+    }
+
+    // ── E: LSP の UI (ポップアップ / 一覧 / リネーム入力) ─────────
+
+    /// 補完のトリガ検出 → デバウンス → 要求、とポップアップのキー操作。
+    ///
+    /// **本文の TextEdit より先に**呼ぶこと。Enter / Tab / Esc / 矢印は
+    /// ポップアップが開いている間だけ横取りする (閉じているときは素通し)。
+    fn lsp_completion_tick(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.editor.active else {
+            self.lsp_completion.dismiss();
+            self.lsp_hover.dismiss();
+            return;
+        };
+        let buf_id = self.editor.buffers[i].id;
+        let ed_id = egui::Id::new(("zaivern-buffer", buf_id));
+        let focused = ctx.memory(|m| m.has_focus(ed_id));
+
+        // 開いているタブが変わったら候補は捨てる (別ファイルの候補を出さない)
+        if self.lsp_completion_buf != Some(buf_id) {
+            self.lsp_completion.dismiss();
+            self.lsp_hover.dismiss();
+            self.lsp_completion_buf = Some(buf_id);
+        }
+
+        // ポップアップのキー操作 (開いているときだけ横取りする)
+        if self.lsp_completion.is_open() {
+            let (esc, up, down, accept) = ctx.input_mut(|inp| {
+                (
+                    inp.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                    inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    inp.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                        || inp.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
+                )
+            });
+            if esc {
+                self.lsp_completion.dismiss();
+            } else if up {
+                self.lsp_completion.select_prev();
+            } else if down {
+                self.lsp_completion.select_next();
+            } else if accept {
+                self.accept_completion();
+            }
+        }
+
+        if !focused {
+            if self.lsp_completion.is_open() {
+                self.lsp_completion.dismiss();
+            }
+            return;
+        }
+
+        let Some((key, path)) = self.active_lsp_target() else {
+            return;
+        };
+        let caps = match self.lsp.get(&key) {
+            Some(c) => c.caps(),
+            None => return,
+        };
+        let now = Instant::now();
+
+        // 打鍵の検出 (Text イベント = 実際に本文へ入った文字)
+        if caps.completion {
+            let (typed, backspace) = ctx.input(|inp| {
+                let mut typed: Vec<char> = Vec::new();
+                for e in &inp.events {
+                    if let egui::Event::Text(s) = e {
+                        typed.extend(s.chars());
+                    }
+                }
+                (typed, inp.key_pressed(egui::Key::Backspace))
+            });
+            for ch in typed {
+                self.lsp_completion.on_typed(ch, &caps, now);
+            }
+            if backspace {
+                self.lsp_completion.on_backspace(now);
+            }
+            // ⌃Space = 明示的に呼び出す
+            if ctx.input_mut(|inp| inp.consume_shortcut(&self.keys.get(BindAction::LspCompletion)))
+            {
+                let w = self.word_before_caret();
+                self.lsp_completion.invoke(&w, now);
+            }
+            if self.lsp_completion.is_open() {
+                let w = self.word_before_caret();
+                self.lsp_completion.set_filter(&w);
+            }
+            if let Some(trigger) = self
+                .lsp_completion
+                .due_request(now, lsp::COMPLETION_DEBOUNCE)
+            {
+                if let Some(pos) = self.caret_lsp_pos() {
+                    let ch = match trigger {
+                        lsp::CompletionTrigger::TriggerChar(c) => Some(c),
+                        lsp::CompletionTrigger::Invoked => None,
+                    };
+                    if let Some(c) = self.lsp.get(&key) {
+                        let st = c.request_completion_at(&path, pos, ch);
+                        self.lsp_completion.mark_sent(st, pos);
+                    }
+                }
+            }
+        }
+
+        // ホバー: マウスが本文の上で静止したら要求する
+        if caps.hover {
+            if let Some(pos) = self.hover_doc_pos.take() {
+                self.lsp_hover.on_move(pos, now);
+            }
+            if let Some(pos) = self.lsp_hover.due_request(now, lsp::HOVER_DEBOUNCE) {
+                if let Some(c) = self.lsp.get(&key) {
+                    let st = c.request_hover_at(&path, pos);
+                    self.lsp_hover_flight = st.id();
+                    self.lsp_hover.mark_sent(st);
+                }
+            }
+        }
+    }
+
+    /// 補完ポップアップ。キャレットの下に候補一覧を出す。
+    fn lsp_completion_popup(&mut self, ctx: &egui::Context) {
+        if !self.lsp_completion.is_open() || self.lsp_completion.is_empty() {
+            return;
+        }
+        let Some(anchor) = self.caret_screen else {
+            return;
+        };
+        let theme = self.theme.clone();
+        let sel = self.lsp_completion.selected_index();
+        let items: Vec<(String, String, String, bool, bool)> = self
+            .lsp_completion
+            .visible()
+            .iter()
+            .take(MAX_COMPLETION_ROWS)
+            .map(|it| {
+                (
+                    completion_kind_label(it.kind).to_string(),
+                    it.label.clone(),
+                    it.detail.clone(),
+                    it.deprecated,
+                    !it.additional_text_edits.is_empty(),
+                )
+            })
+            .collect();
+        let mut clicked: Option<usize> = None;
+        egui::Area::new(egui::Id::new("zv-lsp-completion"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(anchor)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(theme.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, theme.border))
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(4.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(COMPLETION_POPUP_W);
+                        egui::ScrollArea::vertical()
+                            .max_height(COMPLETION_POPUP_H)
+                            .show(ui, |ui| {
+                                for (n, (kind, label, detail, deprecated, extra)) in
+                                    items.iter().enumerate()
+                                {
+                                    let on = n == sel;
+                                    let mut job = egui::text::LayoutJob::default();
+                                    let dim = egui::TextFormat {
+                                        color: theme.text_dim,
+                                        ..Default::default()
+                                    };
+                                    let strong = egui::TextFormat {
+                                        color: if *deprecated {
+                                            theme.text_dim
+                                        } else {
+                                            theme.text
+                                        },
+                                        ..Default::default()
+                                    };
+                                    job.append(&format!("{kind:<5} "), 0.0, dim.clone());
+                                    job.append(label, 0.0, strong);
+                                    if *extra {
+                                        job.append(" +", 0.0, dim.clone());
+                                    }
+                                    if !detail.is_empty() {
+                                        job.append(&format!("  {detail}"), 0.0, dim);
+                                    }
+                                    if ui.selectable_label(on, job).clicked() {
+                                        clicked = Some(n);
+                                    }
+                                }
+                            });
+                    });
+            });
+        if let Some(n) = clicked {
+            while self.lsp_completion.selected_index() < n {
+                self.lsp_completion.select_next();
+            }
+            while self.lsp_completion.selected_index() > n {
+                self.lsp_completion.select_prev();
+            }
+            self.accept_completion();
+        }
+    }
+
+    /// ホバーポップアップ。本文は markdown なので既存のレンダラで描く。
+    fn lsp_hover_popup(&mut self, ctx: &egui::Context) {
+        let Some(info) = self.lsp_hover.shown() else {
+            return;
+        };
+        let Some(at) = self.lsp_hover_pos else {
+            return;
+        };
+        let body = info.contents.clone();
+        let theme = self.theme.clone();
+        let base = self.cfg.editor_font_size;
+        let mut images = std::mem::take(&mut self.md_images);
+        let hl = &self.highlighter;
+        egui::Area::new(egui::Id::new("zv-lsp-hover"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(at + egui::vec2(0.0, HOVER_OFFSET_Y))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(theme.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, theme.border))
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(HOVER_POPUP_W);
+                        egui::ScrollArea::vertical()
+                            .max_height(HOVER_POPUP_H)
+                            .show(ui, |ui| {
+                                let mut rctx = markdown::RenderCtx {
+                                    dir: None,
+                                    images: &mut images,
+                                };
+                                markdown::render(ui, &theme, hl, base, &body, &mut rctx);
+                            });
+                    });
+            });
+        self.md_images = images;
+    }
+
+    /// 「参照を検索」の結果一覧。行をクリックするとそこへ飛ぶ。
+    fn lsp_refs_window(&mut self, ctx: &egui::Context) {
+        if !self.lsp_refs_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let root = self.primary_root().to_path_buf();
+        let busy = self.lsp_refs_busy;
+        let groups: Vec<(PathBuf, Vec<lsp::Range>)> = self
+            .lsp_refs
+            .iter()
+            .map(|g| (g.path.clone(), g.locations.clone()))
+            .collect();
+        let total: usize = groups.iter().map(|(_, l)| l.len()).sum();
+        let mut open = true;
+        let mut jump: Option<(PathBuf, usize, usize)> = None;
+        egui::Window::new(tr("参照を検索"))
+            .open(&mut open)
+            .default_width(REF_WINDOW_W)
+            .show(ctx, |ui| {
+                if busy {
+                    ui.label(RichText::new(tr("検索中…")).color(theme.text_dim).small());
+                    return;
+                }
+                ui.label(
+                    RichText::new(trf(
+                        "{n} 件",
+                        &[("n", total.to_string())],
+                    ))
+                    .color(theme.text_dim)
+                    .small(),
+                );
+                egui::ScrollArea::vertical()
+                    .max_height(REF_WINDOW_H)
+                    .show(ui, |ui| {
+                        for (path, locs) in &groups {
+                            let rel = path.strip_prefix(&root).unwrap_or(path);
+                            ui.label(
+                                RichText::new(rel.display().to_string())
+                                    .color(theme.accent)
+                                    .small(),
+                            );
+                            for r in locs {
+                                let label = trf(
+                                    "  {line} 行 {col} 桁",
+                                    &[
+                                        ("line", (r.start.line + 1).to_string()),
+                                        ("col", (r.start.character + 1).to_string()),
+                                    ],
+                                );
+                                if ui
+                                    .selectable_label(false, RichText::new(label).small())
+                                    .clicked()
+                                {
+                                    jump =
+                                        Some((path.clone(), r.start.line, r.start.character));
+                                }
+                            }
+                        }
+                    });
+            });
+        self.lsp_refs_open = open;
+        if let Some((p, l, c)) = jump {
+            self.jump_to_lsp_pos(&p, l, c);
+        }
+    }
+
+    /// 「シンボルにジャンプ」。quick-open 風の絞り込み一覧。
+    fn lsp_symbols_window(&mut self, ctx: &egui::Context) {
+        if !self.lsp_symbols_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let busy = self.lsp_symbols_busy;
+        let path = self.lsp_symbols_path.clone();
+        let mut flat: Vec<(usize, String, u8, lsp::Position)> = Vec::new();
+        flatten_symbols(&self.lsp_symbols, 0, &mut flat);
+        let mut query = std::mem::take(&mut self.lsp_symbols_query);
+        let mut open = true;
+        let mut jump: Option<lsp::Position> = None;
+        egui::Window::new(tr("シンボルにジャンプ"))
+            .open(&mut open)
+            .default_width(REF_WINDOW_W)
+            .show(ctx, |ui| {
+                if busy {
+                    ui.label(RichText::new(tr("読み込み中…")).color(theme.text_dim).small());
+                    return;
+                }
+                ui.text_edit_singleline(&mut query);
+                let pq = fuzzy::PreparedQuery::new(query.trim());
+                let mut rows: Vec<(i32, usize)> = flat
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(n, (_, name, _, _))| pq.score(name).map(|s| (s, n)))
+                    .collect();
+                rows.sort_by(|a, b| b.0.cmp(&a.0));
+                egui::ScrollArea::vertical()
+                    .max_height(REF_WINDOW_H)
+                    .show(ui, |ui| {
+                        for (_, n) in rows.iter().take(MAX_SYMBOL_ROWS) {
+                            let (depth, name, kind, pos) = &flat[*n];
+                            let label = format!(
+                                "{}{:<7}{}",
+                                "  ".repeat(*depth),
+                                symbol_kind_label(*kind),
+                                name
+                            );
+                            if ui
+                                .selectable_label(false, RichText::new(label).small())
+                                .clicked()
+                            {
+                                jump = Some(*pos);
+                            }
+                        }
+                    });
+            });
+        self.lsp_symbols_query = query;
+        self.lsp_symbols_open = open;
+        if let (Some(p), Some(pos)) = (path, jump) {
+            self.jump_to_lsp_pos(&p, pos.line, pos.character);
+            self.lsp_symbols_open = false;
+        }
+    }
+
+    /// リネームの名前入力。Enter で確定、Esc で取り消し。
+    fn lsp_rename_window(&mut self, ctx: &egui::Context) {
+        let Some(f) = self.lsp_rename.as_ref() else {
+            return;
+        };
+        if f.preparing {
+            return;
+        }
+        if !f.open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let applying = f.applying;
+        let mut name = f.name.clone();
+        let focus = f.focus;
+        let mut cancel = false;
+        let mut submit = false;
+        egui::Window::new(tr("リネーム"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_TOP, egui::vec2(0.0, RENAME_WINDOW_Y))
+            .show(ctx, |ui| {
+                if applying {
+                    ui.label(RichText::new(tr("適用中…")).color(theme.text_dim).small());
+                    return;
+                }
+                let r = ui.text_edit_singleline(&mut name);
+                if focus {
+                    r.request_focus();
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(tr("変更")).clicked() {
+                        submit = true;
+                    }
+                    if ui.button(tr("取り消し")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if cancel {
+            self.lsp_rename = None;
+            return;
+        }
+        let Some(f) = self.lsp_rename.as_mut() else {
+            return;
+        };
+        f.name = name;
+        f.focus = false;
+        if !submit || f.applying {
+            return;
+        }
+        let (key, path, pos, new_name) = (f.key.clone(), f.path.clone(), f.pos, f.name.clone());
+        if new_name.trim().is_empty() {
+            self.toast_warn(tr("新しい名前を入力してください"));
+            return;
+        }
+        let sent = self
+            .lsp
+            .get(&key)
+            .map(|c| c.request_rename(&path, pos, new_name.trim()).is_sent())
+            .unwrap_or(false);
+        if sent {
+            if let Some(f) = self.lsp_rename.as_mut() {
+                f.applying = true;
+            }
+        } else {
+            self.lsp_rename = None;
+            self.toast_warn(tr("リネームを要求できませんでした"));
+        }
+    }
+
+    // ── D: テーブル表示 / 巨大ファイルの帯 ───────────────────────
+
+    /// CSV / TSV を表として描く。ヘッダ行は上に固定する。
+    ///
+    /// `editor::parse_table` が返すのは**ラグド (行ごとに列数が違う)** な表なので、
+    /// 足りないセルは空欄で埋めて列を揃える。打ち切られていたらその旨を出す。
+    fn table_view_ui(&mut self, ui: &mut egui::Ui, i: usize) {
+        let theme = self.theme.clone();
+        let mut close = false;
+        let Some(t) = self.editor.buffers[i].table.as_ref() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(trf(
+                    "📊 {rows} 行 × {cols} 列",
+                    &[
+                        ("rows", t.rows.len().to_string()),
+                        ("cols", t.columns.to_string()),
+                    ],
+                ))
+                .color(theme.text_dim)
+                .small(),
+            );
+            if t.truncated {
+                ui.label(
+                    RichText::new(trf(
+                        "⚠ 先頭 {n} 行だけ読み込んでいます",
+                        &[("n", crate::editor::TABLE_MAX_ROWS.to_string())],
+                    ))
+                    .color(theme.warn)
+                    .small(),
+                );
+            }
+            if ui.button(RichText::new(tr("テキストとして表示")).small()).clicked() {
+                close = true;
+            }
+        });
+        ui.separator();
+        let cols = t.columns.max(1);
+        let cell = |row: &[String], n: usize| -> String {
+            let v = row.get(n).map(String::as_str).unwrap_or("");
+            if v.chars().count() > TABLE_CELL_CHARS {
+                let head: String = v.chars().take(TABLE_CELL_CHARS).collect();
+                format!("{head}…")
+            } else {
+                v.to_string()
+            }
+        };
+        egui::ScrollArea::both()
+            .id_salt(("zv-table", self.editor.buffers[i].id))
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                egui::Grid::new("zv-table-grid")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for n in 0..cols {
+                            ui.label(
+                                RichText::new(cell(&t.headers, n))
+                                    .monospace()
+                                    .strong()
+                                    .color(theme.accent),
+                            );
+                        }
+                        ui.end_row();
+                        for row in &t.rows {
+                            for n in 0..cols {
+                                ui.label(
+                                    RichText::new(cell(row, n))
+                                        .monospace()
+                                        .color(theme.text),
+                                );
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if close {
+            self.editor.buffers[i].drop_table();
+        }
+    }
+
+    /// 巨大ファイルで効いている制限を本文の上に帯で出す。
+    ///
+    /// 文言は `trf` でここで組み立てる (editor.rs は意図的に旗だけ返す)。
+    fn large_file_banner_ui(&mut self, ui: &mut egui::Ui, bytes: u64) {
+        let theme = self.theme.clone();
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        let Some(i) = self.editor.active else {
+            return;
+        };
+        let ro = self.editor.buffers[i].read_only();
+        let hl_off = !self.editor.buffers[i].highlight_enabled();
+        let why = large_file_reasons(ro, hl_off);
+        egui::Frame::none()
+            .fill(theme.panel_alt)
+            .stroke(egui::Stroke::new(1.0_f32, theme.warn))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(trf(
+                        "⚠ 大きなファイル ({size} MB): {why}",
+                        &[
+                            ("size", format!("{mb:.1}")),
+                            ("why", why.join(" / ")),
+                        ],
+                    ))
+                    .color(theme.warn)
+                    .small(),
+                );
+            });
+    }
+
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
+            // 折りたたみ / ブックマーク / テーブル表示 / レビュー / LSP
+            Cmd::OpenReview
+            | Cmd::SetReviewBase(_)
+            | Cmd::ToggleFold
+            | Cmd::FoldAll
+            | Cmd::UnfoldAll
+            | Cmd::FoldLevel(_)
+            | Cmd::ToggleBookmark
+            | Cmd::NextBookmark
+            | Cmd::PrevBookmark
+            | Cmd::ClearBookmarks
+            | Cmd::ReopenClosedTab
+            | Cmd::ToggleTableView
+            | Cmd::LspCompletion
+            | Cmd::LspReferences
+            | Cmd::LspSymbols
+            | Cmd::LspRename
+            | Cmd::LspFormat
+            | Cmd::ToggleFormatOnSave => self.apply_cmd_editor_extras(cmd),
             Cmd::Save
             | Cmd::SaveAs
             | Cmd::CloseTab
@@ -5408,6 +7131,32 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::ToggleFullScreen)) {
             cmds.push(Cmd::ToggleFullScreen);
         }
+        // ── 第 2 次配線 ──────────────────────────────────────────
+        // ⇧⌘T は ⌘T を持っていないので順序の縛りはない。
+        if consume(ctx, self.keys.get(BindAction::ReopenClosedTab)) {
+            cmds.push(Cmd::ReopenClosedTab);
+        }
+        if consume(ctx, self.keys.get(BindAction::ToggleFold)) {
+            cmds.push(Cmd::ToggleFold);
+        }
+        if consume(ctx, self.keys.get(BindAction::UnfoldAll)) {
+            cmds.push(Cmd::UnfoldAll);
+        }
+        if consume(ctx, self.keys.get(BindAction::ToggleBookmark)) {
+            cmds.push(Cmd::ToggleBookmark);
+        }
+        if consume(ctx, self.keys.get(BindAction::LspReferences)) {
+            cmds.push(Cmd::LspReferences);
+        }
+        if consume(ctx, self.keys.get(BindAction::LspSymbols)) {
+            cmds.push(Cmd::LspSymbols);
+        }
+        if consume(ctx, self.keys.get(BindAction::LspRename)) {
+            cmds.push(Cmd::LspRename);
+        }
+        if consume(ctx, self.keys.get(BindAction::LspFormat)) {
+            cmds.push(Cmd::LspFormat);
+        }
         if consume(ctx, self.keys.get(BindAction::CloseTab)) {
             cmds.push(Cmd::CloseTab);
         }
@@ -6161,6 +7910,23 @@ impl ZaivernApp {
                         if let Some(i) = self.editor.active {
                             ui.label(dim(format!("Ln {ln}, Col {col}")));
                             ui.label(dim(self.editor.buffers[i].lang.clone()));
+                            // 読み取り専用 (巨大ファイル / 差分タブ) は必ず見せる。
+                            // 打っても入らない理由が分からないのが一番困るため。
+                            if self.editor.buffers[i].read_only() {
+                                ui.label(
+                                    RichText::new(tr("🔒 読み取り専用"))
+                                        .size(11.5)
+                                        .color(theme.warn),
+                                );
+                            }
+                            // ブックマーク件数 (0 件のときは出さない)
+                            let bm = self.editor.buffers[i].bookmarks.len();
+                            if bm > 0 {
+                                ui.label(dim(format!("◆ {bm}")));
+                            }
+                            if self.format_on_save {
+                                ui.label(dim(tr("🛠 保存時に整形")));
+                            }
                             // 「UTF-8 / CRLF」— 何で読んだか & 何で保存されるか。
                             // 押すと改行コードの変換メニューが出る (VS Code と同じ位置)。
                             if let Some(label) = &fmt_label {
@@ -6442,13 +8208,33 @@ impl ZaivernApp {
                         );
                     }
                     SidebarTab::Git => {
+                        // サブタブ: 「変更」(従来の Git パネル) と
+                        // 「変更をレビュー」(PR 風のローカルレビュー)。
+                        // レビューは左に変更ファイル・右に diff の 2 ペインなので
+                        // サイドバーを広げて使う想定 (幅はユーザーが決める)。
+                        ui.horizontal(|ui| {
+                            for (on_review, label) in
+                                [(false, tr("変更")), (true, tr("変更をレビュー"))]
+                            {
+                                let sel = self.git_sub_review == on_review;
+                                if ui.selectable_label(sel, RichText::new(label).small()).clicked()
+                                {
+                                    self.git_sub_review = on_review;
+                                }
+                            }
+                        });
+                        ui.separator();
                         // both: 長いパス名でサイドバーが横に突き破るのを防ぐ
                         // (sidebar_files_ui の zv-tree と同じ理由)
                         egui::ScrollArea::both()
                             .id_salt("zv-git")
                             .auto_shrink(false)
                             .show(ui, |ui| {
-                                self.git_panel.ui(ui, &theme, &mut git_actions);
+                                if self.git_sub_review {
+                                    self.review.ui(ui, &theme, &mut git_actions);
+                                } else {
+                                    self.git_panel.ui(ui, &theme, &mut git_actions);
+                                }
                             });
                     }
                     SidebarTab::GitHub => {
@@ -6486,6 +8272,15 @@ impl ZaivernApp {
         }
         if let Some(dir) = git_actions.open_path {
             self.open_workspace(dir, ctx);
+        }
+        // レビュー画面の「エディタで開く」。open_path (ワークスペース切替) とは別物。
+        if let Some(file) = git_actions.open_file {
+            self.open_path(&file);
+        }
+        // レビュー画面のインラインコメント → エージェントの入力欄へ。
+        // 差分ビューの「エージェントに送る」と同じ経路 (送信はしない)。
+        if let Some(prompt) = git_actions.review_prompt {
+            self.take_review_prompt(prompt);
         }
 
         self.md_images = md_images;
@@ -9404,7 +11199,8 @@ impl ZaivernApp {
         }
         self.refresh_active_diagnostics();
         self.diag_counts = (self.diag_cache.2, self.diag_cache.3);
-        let diag_by_line = &self.diag_cache.1;
+        // diag_cache の借用は、可変借用が要る第 2 次配線の準備が済んでから取る
+        // (この束縛を上げると self を可変に触れなくなる)。
 
         // スニペット Tab 展開: エディタにフォーカスがあり、選択が空で、
         // カーソル直前の単語が prefix に一致するときだけ Tab を横取りする
@@ -9423,7 +11219,13 @@ impl ZaivernApp {
             let len = self.editor.buffers[active].text.chars().count();
             pending_select = Some((0, len));
         }
-        let expand = if has_focus {
+        // 折りたたみ中は TextEdit に「表示テキスト」を編集させるので、その
+        // キャレット添字は原文の添字と一致しない。**原文の添字を前提にする
+        // 補助機能** (スニペット展開・自動ペア) はこのフレームだけ止める。
+        // 打ち込み自体と、⌃A / 検索ジャンプのような `pending_select` 経由の
+        // 移動は写像しているので影響しない。
+        let folds_closed = !self.editor.buffers[active].folds.folded().is_empty();
+        let expand = if has_focus && !folds_closed {
             let lang_id = snippets::lang_id_for(&lang_clone);
             match self.snippets_by_lang.get(lang_id) {
                 Some(snips) if !snips.is_empty() => {
@@ -9509,7 +11311,7 @@ impl ZaivernApp {
         // 開き括弧で自動閉じ/選択囲み、閉じ括弧でスキップ、
         // 空ペアの間での Backspace は両方まとめて削除。
         // IME 変換中の文字は Event::Ime で届くため、ここには掛からない。
-        if has_focus && !self.editor.buffers[active].kind.read_only() {
+        if has_focus && !folds_closed && !self.editor.buffers[active].read_only() {
             let sel = egui::TextEdit::load_state(ui.ctx(), ed_id_early)
                 .and_then(|st| st.cursor.char_range())
                 .map(|r| {
@@ -9591,6 +11393,145 @@ impl ZaivernApp {
             }
         }
 
+        // ── 第 2 次配線: 表 / 巨大ファイル / 折りたたみ / ガイド ────────
+        // 表形式ファイルはグリッドで描いて終わり (本文 TextEdit は出さない)
+        if self.editor.buffers[active].table.is_some() {
+            self.table_view_ui(ui, active);
+            return;
+        }
+        // 巨大ファイルの帯 (読み取り専用 / 強調表示オフの理由を必ず見せる)
+        let banner_bytes = self.editor.buffers[active].large_file_banner();
+        if let Some(bytes) = banner_bytes {
+            self.large_file_banner_ui(ui, bytes);
+        }
+        // 構造解析 (折りたたみ / ガイド / スティッキー) は本文全走査なので、
+        // 強調表示を切っている巨大ファイルでは丸ごと止める。
+        let structure_on = self.editor.buffers[active].highlight_enabled();
+        let read_only = self.editor.buffers[active].read_only();
+        if structure_on {
+            self.editor.buffers[active].refresh_folds();
+        }
+        // ジャンプ先が畳んだ中にあるなら、先にその折りたたみを開く
+        let has_folds = structure_on && !self.editor.buffers[active].folds.folded().is_empty();
+        if has_folds {
+            if let Some((sel, _)) = pending_select {
+                let line0 = self.editor.buffers[active]
+                    .text
+                    .chars()
+                    .take(sel)
+                    .filter(|c| *c == '\n')
+                    .count();
+                self.reveal_line(active, line0);
+            }
+        }
+        let hidden_spans = if structure_on {
+            self.editor.buffers[active].folds.hidden_spans()
+        } else {
+            Vec::new()
+        };
+        // ガターに出す印: 折りたたみ (行 → 畳んでいるか) とブックマーク
+        let fold_marks: HashMap<usize, bool> = if structure_on {
+            let f = &self.editor.buffers[active].folds;
+            f.ranges()
+                .iter()
+                .map(|r| (r.start_line, f.is_folded(r.start_line)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        let bookmark_lines: HashSet<usize> =
+            self.editor.buffers[active].bookmarks.iter().collect();
+
+        // インデントガイド (鍵にキャレット行を含める = 強調ガイドが行依存のため)
+        let tab_w = crate::highlight::DEFAULT_TAB_WIDTH;
+        let caret_line0 = self.editor.cursor.0.saturating_sub(1);
+        let mut guide_cache = self.guide_cache.take();
+        if structure_on {
+            let gkey = [tab_w as u64, caret_line0 as u64]
+                .into_iter()
+                .fold(text_hash, combine_hash);
+            if guide_cache.as_ref().map(|(k, ..)| *k) != Some(gkey) {
+                let t = &self.editor.buffers[active].text;
+                guide_cache = Some((
+                    gkey,
+                    crate::highlight::indent_guides(t, tab_w),
+                    crate::highlight::active_guide(t, tab_w, caret_line0),
+                ));
+            }
+        } else {
+            guide_cache = None;
+        }
+
+        // 折りたたみ表示テキスト (キャッシュ。無効なら作り直す)
+        let fold_key = hidden_spans.iter().fold(text_hash, |acc, (s0, e0)| {
+            combine_hash(combine_hash(acc, *s0 as u64), *e0 as u64)
+        });
+        let buf_id_now = self.editor.buffers[active].id;
+        let mut fv = self
+            .fold_view
+            .take()
+            .filter(|v| v.buf == buf_id_now && v.key == fold_key);
+        if hidden_spans.is_empty() {
+            fv = None;
+        } else if fv.is_none() {
+            let (t, lines, cut) =
+                build_fold_view(&self.editor.buffers[active].text, &hidden_spans);
+            fv = Some(FoldView {
+                buf: buf_id_now,
+                key: fold_key,
+                prev: t.clone(),
+                text: t,
+                lines,
+                cut,
+            });
+        }
+        // 予約済みの選択は原文の添字なので、表示テキストの添字へ写す
+        if let (Some(v), Some((sa0, sb0))) = (fv.as_ref(), pending_select) {
+            pending_select = Some((
+                fold_source_to_display(&v.cut, sa0),
+                fold_source_to_display(&v.cut, sb0),
+            ));
+        }
+        let (mut disp_text, disp_prev, disp_lines, disp_cut) = match fv {
+            Some(v) => (Some(v.text), v.prev, v.lines, v.cut),
+            None => (None, String::new(), Vec::new(), Vec::new()),
+        };
+
+        // スティッキーヘッダ (前フレームのスクロール量から最上部の可視行を推定)
+        let mut sticky_cache = self.sticky_cache.take();
+        let top_disp_line = if row_h > 0.0 {
+            (self.last_scroll_y / row_h).floor().max(0.0) as usize
+        } else {
+            0
+        };
+        let top_src_line = if disp_lines.is_empty() {
+            top_disp_line
+        } else {
+            disp_lines
+                .get(top_disp_line)
+                .copied()
+                .unwrap_or(top_disp_line)
+        };
+        if structure_on {
+            let skey = [top_src_line as u64, hash_str(&lang_clone)]
+                .into_iter()
+                .fold(text_hash, combine_hash);
+            if sticky_cache.as_ref().map(|(k, _)| *k) != Some(skey) {
+                sticky_cache = Some((
+                    skey,
+                    crate::highlight::sticky_headers(
+                        &self.editor.buffers[active].text,
+                        &lang_clone,
+                        top_src_line,
+                        STICKY_MAX_ROWS,
+                    ),
+                ));
+            }
+        } else {
+            sticky_cache = None;
+        }
+
+        let diag_by_line = &self.diag_cache.1;
         let hl = &self.highlighter;
         let buf = &mut self.editor.buffers[active];
         let Buffer {
@@ -9620,7 +11561,10 @@ impl ZaivernApp {
         // galley の視覚行の並びが要るため)。幅は桁数から先に確定できる
         // (等幅フォントなので数字幅 × 桁数で galley と同じ幅になる)。
         let gutter_digits = line_count.to_string().len().max(3);
-        let gutter_w = ui.fonts(|f| f.glyph_width(&font, '0')) * gutter_digits as f32 + 22.0;
+        // 右端に「折りたたみ ▸/▾」と「ブックマーク ◆」の 2 桁を確保する
+        let marker_w = if structure_on { FOLD_MARKER_W * 2.0 } else { 0.0 };
+        let gutter_w =
+            ui.fonts(|f| f.glyph_width(&font, '0')) * gutter_digits as f32 + 22.0 + marker_w;
 
         let ed_id = egui::Id::new(("zaivern-buffer", *id));
         // 折り返し OFF: highlight::layout_job が wrap.max_width = INFINITY を設定
@@ -9689,13 +11633,24 @@ impl ZaivernApp {
             let mut cursor_out: Option<(usize, usize)> = None;
             let mut changed_flag = false;
             let mut text_top: Option<f32> = None;
+            let mut text_left: Option<f32> = None;
+            let mut caret_at: Option<egui::Pos2> = None;
+            let mut hover_hit: Option<(usize, egui::Pos2)> = None;
+            // 編集対象: 折りたたみ中は表示テキスト、読み取り専用なら
+            // is_mutable() == false の包み (選択とコピーは残る)
+            let mut target = match (read_only, disp_text.as_mut()) {
+                (false, Some(d)) => EditTarget::Rw(d),
+                (false, None) => EditTarget::Rw(&mut *text),
+                (true, Some(d)) => EditTarget::Ro(&*d),
+                (true, None) => EditTarget::Ro(&*text),
+            };
             ui.horizontal_top(|ui| {
                 // ガターぶんの余白だけ空けて本文を置く
                 // (ガター自体はスクロール確定後に上から固定描画する)
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(gutter_w);
 
-                let output = egui::TextEdit::multiline(text)
+                let output = egui::TextEdit::multiline(&mut target)
                     .id(ed_id)
                     .font(font.clone())
                     .code_editor()
@@ -9709,6 +11664,24 @@ impl ZaivernApp {
                 // オフセットを配置後に適用するため、state.offset ではなく
                 // これを使わないとガターが 1 フレームずれて「泳ぐ」
                 text_top = Some(output.response.rect.top());
+                text_left = Some(output.response.rect.left());
+                // 補完ポップアップの基準 = キャレット行の左下
+                if let Some(cr) = output.cursor_range {
+                    let r = output.galley.pos_from_cursor(&cr.primary);
+                    caret_at = Some(egui::pos2(
+                        output.galley_pos.x + r.min.x,
+                        output.galley_pos.y + r.max.y,
+                    ));
+                }
+                // ホバー: マウス下の文字位置 (表示テキストの char 添字)
+                if let Some(p) = ui.ctx().pointer_hover_pos() {
+                    if output.response.rect.contains(p) {
+                        let c = output
+                            .galley
+                            .cursor_from_pos(p - output.galley_pos);
+                        hover_hit = Some((c.ccursor.index, p));
+                    }
+                }
 
                 // 現在行ハイライト (VS Code 相当)。選択中は出さない。
                 // テキスト描画の後に重ねるため、文字を邪魔しない極薄の帯にする。
@@ -9735,7 +11708,7 @@ impl ZaivernApp {
                     let idx = cr.primary.ccursor.index;
                     let mut line = 1usize;
                     let mut col = 1usize;
-                    for ch in text.chars().take(idx) {
+                    for ch in egui::TextBuffer::as_str(&target).chars().take(idx) {
                         if ch == '\n' {
                             line += 1;
                             col = 1;
@@ -9743,6 +11716,11 @@ impl ZaivernApp {
                             col += 1;
                         }
                     }
+                    // 折りたたみ中は「表示行」を数えているので原文行へ写す
+                    let line = match disp_lines.get(line - 1) {
+                        Some(src) => src + 1,
+                        None => line,
+                    };
                     cursor_out = Some((line, col));
                 }
 
@@ -9752,11 +11730,13 @@ impl ZaivernApp {
                 {
                     if let Some(cr) = output.cursor_range {
                         let cursor = cr.primary.ccursor.index;
-                        if let Some((new_text, new_cursor)) =
-                            editor_ops::auto_indent_after_newline(text, cursor)
-                        {
+                        let indented = editor_ops::auto_indent_after_newline(
+                            egui::TextBuffer::as_str(&target),
+                            cursor,
+                        );
+                        if let Some((new_text, new_cursor)) = indented {
                             // cache はキーが text ハッシュなので書き換えだけで無効化される
-                            *text = new_text;
+                            target.set(new_text);
                             let mut st = egui::TextEdit::load_state(ui.ctx(), ed_id)
                                 .unwrap_or_default();
                             st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
@@ -9771,10 +11751,17 @@ impl ZaivernApp {
             if past_end > 0.0 {
                 ui.add_space(past_end);
             }
-            (cursor_out, changed_flag, text_top)
+            (
+                cursor_out,
+                changed_flag,
+                text_top,
+                text_left,
+                caret_at,
+                hover_hit,
+            )
         });
 
-        let (cursor_out, changed, text_top) = inner.inner;
+        let (cursor_out, changed, text_top, text_left, caret_at, hover_hit) = inner.inner;
 
         // 行番号ガター: git マークで行ごとに色分けした galley をキャッシュ。
         // 折り返し OFF は論理行と 1:1。ON は本文 galley の視覚行に合わせ、
@@ -9784,6 +11771,19 @@ impl ZaivernApp {
         // ラスタライズ側の font_gen と、折り返し ON では本文キー (= 折り返しの
         // 並びが変わったら作り直すため) も含める。
         let body_key = cache.as_ref().map(|(k, _)| *k).unwrap_or(0);
+        // 表示行 → 原文行。折りたたみが無ければ恒等。
+        let disp_count = if disp_lines.is_empty() {
+            line_count
+        } else {
+            disp_lines.len()
+        };
+        let src_of_disp = |d: usize| -> usize {
+            if disp_lines.is_empty() {
+                d
+            } else {
+                disp_lines.get(d).copied().unwrap_or(d)
+            }
+        };
         let gutter_key = [
             marks_hash,
             diag_hash,
@@ -9792,6 +11792,7 @@ impl ZaivernApp {
             hash_str(&syntect_theme),
             word_wrap as u64,
             if word_wrap { body_key } else { 0 },
+            fold_key,
         ]
         .into_iter()
         .fold(line_count as u64, combine_hash);
@@ -9827,8 +11828,9 @@ impl ZaivernApp {
                     let mut line = 0usize;
                     let mut at_line_start = true;
                     for (ri, row) in rows.iter().enumerate() {
+                        let src = src_of_disp(line);
                         let num = if at_line_start {
-                            format!("{:>width$}", line + 1)
+                            format!("{:>width$}", src + 1)
                         } else {
                             String::new() // 折り返しの継続行は空欄
                         };
@@ -9837,7 +11839,7 @@ impl ZaivernApp {
                         } else {
                             num
                         };
-                        append(&mut job, &s, color_of(line));
+                        append(&mut job, &s, color_of(src));
                         if row.ends_with_newline {
                             line += 1;
                             at_line_start = true;
@@ -9847,13 +11849,14 @@ impl ZaivernApp {
                     }
                 }
             } else {
-                for n in 0..line_count {
-                    let s = if n + 1 < line_count {
-                        format!("{:>width$}\n", n + 1)
+                for n in 0..disp_count {
+                    let src = src_of_disp(n);
+                    let s = if n + 1 < disp_count {
+                        format!("{:>width$}\n", src + 1)
                     } else {
-                        format!("{:>width$}", n + 1)
+                        format!("{:>width$}", src + 1)
                     };
-                    append(&mut job, &s, color_of(n));
+                    append(&mut job, &s, color_of(src));
                 }
             }
             *gutter = Some((gutter_key, ui.fonts(|f| f.layout_job(job))));
@@ -9902,12 +11905,214 @@ impl ZaivernApp {
             );
         }
 
+        // ═══ 第 2 次配線: ガターの印 / インデントガイド / スティッキー ═══
+        //
+        // 本文 galley の**視覚行**を辿って「表示行の先頭行」だけを拾う。
+        // 折り返し ON でも OFF でも同じ経路で正しい y が出る。
+        let top_y = text_top.unwrap_or(vis.top() - inner.state.offset.y);
+        let mut row_lines: Vec<(usize, f32, f32)> = Vec::new();
+        if structure_on {
+            if let Some((_, g)) = cache.as_ref() {
+                let nl: Vec<bool> = g.rows.iter().map(|r| r.ends_with_newline).collect();
+                for (ri, dl) in row_line_starts(&nl) {
+                    let row = &g.rows[ri];
+                    let y0 = top_y + row.rect.top();
+                    let y1 = top_y + row.rect.bottom();
+                    // 画面外の行は描かない (巨大ファイルでも O(可視行))
+                    if y1 >= vis.top() && y0 <= vis.bottom() {
+                        row_lines.push((src_of_disp(dl), y0, y1));
+                    }
+                }
+            }
+        }
+
+        // インデントガイド: 桁位置に縦線を引き、キャレットのブロックだけ強調する
+        if let (Some((_, guides, active_g)), Some(tl)) = (guide_cache.as_ref(), text_left) {
+            let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
+            let dim = theme_border;
+            let hot = theme_accent;
+            for (src, y0, y1) in &row_lines {
+                let Some((_, cols)) = guides.get(*src) else {
+                    continue;
+                };
+                for c in cols {
+                    let x = tl + *c as f32 * char_w + 0.5;
+                    if x < gutter_edge {
+                        continue;
+                    }
+                    if x > vis.right() {
+                        break;
+                    }
+                    let on = active_g
+                        .map(|g| g.column == *c && *src >= g.start_line && *src <= g.end_line)
+                        .unwrap_or(false);
+                    painter.vline(
+                        x,
+                        egui::Rangef::new(*y0, *y1),
+                        egui::Stroke::new(1.0_f32, if on { hot } else { dim }),
+                    );
+                }
+            }
+        }
+
+        // ガターの印: 折りたたみ ▸ / ▾ とブックマーク ◆
+        let fold_x = gutter_edge - FOLD_MARKER_W;
+        let mark_x = gutter_edge - FOLD_MARKER_W * 2.0;
+        let mut toggle_line: Option<usize> = None;
+        if structure_on {
+            let hit = ui
+                .interact(
+                    egui::Rect::from_min_max(
+                        egui::pos2(mark_x, vis.top()),
+                        egui::pos2(gutter_edge, vis.bottom()),
+                    ),
+                    ed_id.with("fold-gutter"),
+                    egui::Sense::click(),
+                )
+                .interact_pointer_pos();
+            for (src, y0, _) in &row_lines {
+                if bookmark_lines.contains(src) {
+                    painter.text(
+                        egui::pos2(mark_x, *y0),
+                        Align2::LEFT_TOP,
+                        "◆",
+                        font.clone(),
+                        theme_accent,
+                    );
+                }
+                if let Some(folded) = fold_marks.get(src) {
+                    painter.text(
+                        egui::pos2(fold_x, *y0),
+                        Align2::LEFT_TOP,
+                        if *folded { "▸" } else { "▾" },
+                        font.clone(),
+                        theme_dim,
+                    );
+                }
+            }
+            if let Some(p) = hit {
+                toggle_line = fold_click_line(&row_lines, &fold_marks, fold_x, p);
+            }
+        }
+
+        // スティッキーヘッダ: 上端に「いま居る文脈」を貼り付ける
+        let sticky: Vec<(usize, String)> = sticky_cache
+            .as_ref()
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let mut sticky_jump: Option<usize> = None;
+        if !sticky.is_empty() {
+            let h = row_h * sticky.len() as f32;
+            let r = egui::Rect::from_min_max(
+                egui::pos2(gutter_edge, vis.top()),
+                egui::pos2(vis.right(), vis.top() + h),
+            );
+            painter.rect_filled(r, 0.0, theme_panel);
+            painter.hline(
+                r.x_range(),
+                r.bottom(),
+                egui::Stroke::new(1.0_f32, theme_border),
+            );
+            for (n, (line, body)) in sticky.iter().enumerate() {
+                let y = vis.top() + row_h * n as f32;
+                painter.text(
+                    egui::pos2(gutter_edge + 8.0, y),
+                    Align2::LEFT_TOP,
+                    body,
+                    font.clone(),
+                    theme_text,
+                );
+                let row_r = egui::Rect::from_min_max(
+                    egui::pos2(gutter_edge, y),
+                    egui::pos2(vis.right(), y + row_h),
+                );
+                if ui
+                    .interact(
+                        row_r,
+                        ed_id.with(("sticky", n)),
+                        egui::Sense::click(),
+                    )
+                    .clicked()
+                {
+                    sticky_jump = Some(*line);
+                }
+            }
+        }
+
         if let Some(c) = cursor_out {
             self.editor.cursor = c;
         }
 
+        // 折りたたみ表示への編集を原文へ差し戻す。
+        // 表示テキストは原文から隠す行を抜いたものなので、共通接頭辞 /
+        // 接尾辞の外側を原文の対応区間へ写して置き換えるだけで足りる。
+        // ホバー位置の写像に使うので、FoldView へ戻す前に控えておく
+        let hover_cut = disp_cut.clone();
+        let disp_cut_len = disp_cut.len();
+        let mut spliced = false;
+        if let Some(d) = disp_text {
+            if d != disp_prev {
+                let src = self.editor.buffers[active].text.clone();
+                let next = splice_fold_edit(&src, &disp_cut, &disp_prev, &d);
+                let (at, delta) = fold_edit_shift(&src, &next, &disp_cut, &disp_prev, &d);
+                let b = &mut self.editor.buffers[active];
+                if delta != 0 {
+                    b.folds.shift_lines(at, delta);
+                    b.bookmarks.shift_lines(at, delta);
+                }
+                b.text = next;
+                b.cache = None;
+                b.gutter = None;
+                // 表示テキストは次フレームで作り直す
+                self.fold_view = None;
+                spliced = true;
+            } else {
+                self.fold_view = Some(FoldView {
+                    buf: buf_id_now,
+                    key: fold_key,
+                    text: d,
+                    prev: disp_prev,
+                    lines: disp_lines,
+                    cut: disp_cut,
+                });
+            }
+        }
+        self.guide_cache = guide_cache;
+        self.sticky_cache = sticky_cache;
+
+        // ガターのクリックで折りたたみを開閉、スティッキーのクリックでジャンプ
+        if let Some(l) = toggle_line {
+            let b = &mut self.editor.buffers[active];
+            b.folds.toggle_fold(l);
+            b.gutter = None;
+            self.fold_view = None;
+        }
+        if let Some(l) = sticky_jump {
+            self.goto_line(l + 1);
+        }
+
+        // 補完 / ホバーの基準位置を控える (ポップアップは中央パネルの後に描く)
+        self.caret_screen = caret_at;
+        match hover_hit {
+            Some((idx, p)) => {
+                self.lsp_hover_pos = Some(p);
+                let src_idx = if disp_cut_len == 0 {
+                    idx
+                } else {
+                    fold_display_to_source(&hover_cut, idx)
+                };
+                let t = &self.editor.buffers[active].text;
+                let byte = editor_ops::char_to_byte(t, src_idx.min(t.chars().count()));
+                self.hover_doc_pos = Some(lsp::byte_index_to_lsp_pos(t, byte));
+            }
+            None => {
+                self.lsp_hover_pos = None;
+                self.lsp_hover.dismiss();
+            }
+        }
+
         // LSP: テキストが変わったらデバウンスして did_change を予約
-        if changed {
+        if changed || spliced {
             if let (Some(p), lang) = (path_clone.clone(), lang_clone.clone()) {
                 let key = self.lsp_key_for(&p, &lang);
                 if self.lsp.contains_key(&key) {
@@ -9945,6 +12150,10 @@ impl ZaivernApp {
 
     /// パレット: 組み込みコマンド定義 (icon, label, keybind, Cmd) の一覧。
     fn palette_builtin_cmds(&self) -> Vec<(String, String, String, Cmd)> {
+        // 実際に効いているキーバインドをそのまま出す (config で上書きされていても
+        // パレットの表示とズレない)
+        let fmt_key =
+            |a: BindAction| crate::keybinds::format_shortcut(self.keys.get(a));
         vec![
             ("💾".into(), tr("保存"), "⌘S".into(), Cmd::Save),
             ("💾".into(), tr("名前を付けて保存"), "⌘⇧S".into(), Cmd::SaveAs),
@@ -10060,6 +12269,84 @@ impl ZaivernApp {
             ),
             ("🔨".into(), tr("ビルド タスクの実行…"), "⇧⌘B".into(), Cmd::RunBuildTask),
             ("⚠".into(), tr("問題パネルの切替"), "⇧⌘M".into(), Cmd::ToggleProblems),
+            // ── 第 2 次配線: レビュー / 折りたたみ / ブックマーク / 表 / LSP ──
+            ("🔎".into(), tr("変更をレビュー (PR 風のローカルレビュー)"), String::new(), Cmd::OpenReview),
+            (
+                "🔎".into(),
+                tr("レビューの比較: 作業ツリー vs HEAD"),
+                String::new(),
+                Cmd::SetReviewBase("head".into()),
+            ),
+            (
+                "🔎".into(),
+                tr("レビューの比較: ステージ済みだけ"),
+                String::new(),
+                Cmd::SetReviewBase("staged".into()),
+            ),
+            (
+                "🔎".into(),
+                tr("レビューの比較: 未ステージだけ"),
+                String::new(),
+                Cmd::SetReviewBase("unstaged".into()),
+            ),
+            (
+                "▾".into(),
+                tr("折りたたみ切替"),
+                fmt_key(BindAction::ToggleFold),
+                Cmd::ToggleFold,
+            ),
+            ("▸".into(), tr("すべて折りたたむ"), String::new(), Cmd::FoldAll),
+            (
+                "▾".into(),
+                tr("すべて展開する"),
+                fmt_key(BindAction::UnfoldAll),
+                Cmd::UnfoldAll,
+            ),
+            ("▸".into(), tr("レベル 1 で折りたたむ"), String::new(), Cmd::FoldLevel(1)),
+            ("▸".into(), tr("レベル 2 で折りたたむ"), String::new(), Cmd::FoldLevel(2)),
+            ("▸".into(), tr("レベル 3 で折りたたむ"), String::new(), Cmd::FoldLevel(3)),
+            (
+                "◆".into(),
+                tr("ブックマーク切替"),
+                fmt_key(BindAction::ToggleBookmark),
+                Cmd::ToggleBookmark,
+            ),
+            ("◆".into(), tr("次のブックマークへ"), String::new(), Cmd::NextBookmark),
+            ("◆".into(), tr("前のブックマークへ"), String::new(), Cmd::PrevBookmark),
+            ("◆".into(), tr("ブックマークをすべて解除"), String::new(), Cmd::ClearBookmarks),
+            (
+                "📑".into(),
+                tr("閉じたタブを開き直す"),
+                fmt_key(BindAction::ReopenClosedTab),
+                Cmd::ReopenClosedTab,
+            ),
+            ("📊".into(), tr("テーブル表示の切替 (CSV / TSV)"), String::new(), Cmd::ToggleTableView),
+            (
+                "💡".into(),
+                tr("補完候補を出す"),
+                fmt_key(BindAction::LspCompletion),
+                Cmd::LspCompletion,
+            ),
+            (
+                "🔍".into(),
+                tr("参照を検索"),
+                fmt_key(BindAction::LspReferences),
+                Cmd::LspReferences,
+            ),
+            (
+                "🔗".into(),
+                tr("シンボルにジャンプ"),
+                fmt_key(BindAction::LspSymbols),
+                Cmd::LspSymbols,
+            ),
+            ("✏".into(), tr("リネーム"), fmt_key(BindAction::LspRename), Cmd::LspRename),
+            (
+                "🛠".into(),
+                tr("ドキュメントを整形"),
+                fmt_key(BindAction::LspFormat),
+                Cmd::LspFormat,
+            ),
+            ("🛠".into(), tr("保存時に整形するかの切替"), String::new(), Cmd::ToggleFormatOnSave),
             ("🖥".into(), tr("フルスクリーンの切替"), "⌃⌘F".into(), Cmd::ToggleFullScreen),
             ("🐙".into(), tr("GitHub パネルを開く"), String::new(), Cmd::ShowGitHubTab),
             (
@@ -12955,6 +15242,12 @@ impl ZaivernApp {
         self.flush_editor_events(ctx);
         // 定義ジャンプ (F12) の LSP 応答と、ファイル横断検索の結果を取り込む
         self.poll_definition_result();
+        // LSP: 応答の回収 (sweep_timeouts は毎フレーム) と補完のデバウンス。
+        // どちらもチャネルを覗くだけで、UI スレッドでは I/O をしない。
+        self.poll_lsp();
+        // 補完ポップアップのキー (Enter/Tab/Esc/矢印) は本文 TextEdit より先に
+        // 消費する必要があるので、パネル描画前のここで処理する。
+        self.lsp_completion_tick(ctx);
         self.poll_global_search();
         // セッションタブに出すフォルダ一覧 (is_dir を叩くので変化時だけ作り直す)
         self.refresh_session_folders();
@@ -13240,6 +15533,11 @@ impl ZaivernApp {
 
         self.top_bar(ctx);
         self.status_bar(ctx);
+        // LSP の小窓 (参照一覧・シンボル一覧・リネーム入力)。
+        // ポップアップ (補完 / ホバー) は本文の上に重ねたいので中央パネルの後。
+        self.lsp_refs_window(ctx);
+        self.lsp_symbols_window(ctx);
+        self.lsp_rename_window(ctx);
         // 大きな領域は「いま描いている場所」の印を付けて描く。フレームが
         // panic したときに犯人を特定して、そこだけ隔離できるようにするため。
         self.guarded_view(Subview::Panel("sidebar"), |me| me.sidebar(ctx));
@@ -13325,6 +15623,10 @@ impl ZaivernApp {
                         });
                 });
         }
+
+        // 本文の上に重ねる LSP のポップアップ (中央パネルより後に描く)
+        self.lsp_completion_popup(ctx);
+        self.lsp_hover_popup(ctx);
 
         self.palette_ui(ctx);
         self.new_plugin_ui(ctx);
@@ -16795,6 +19097,728 @@ mod super_agent_tests {
     }
 }
 
+/// 第 2 次配線 (レビュー / 折りたたみ / ブックマーク / 表 / LSP) の配線テスト。
+///
+/// このファイルの他のテストと同じく **アプリ本体は組み立てない**。
+/// 画面に出る手前の「判断」を純関数へ切り出してあるので、そこを固定する。
+#[cfg(test)]
+mod wave2_tests {
+    use super::*;
+    use crate::editor::{Bookmarks, ClosedTab, ClosedTabs, FoldState};
+
+    // ── B: 折りたたみ ────────────────────────────────────────────
+
+    /// ガターの ▸/▾ を押すと、その行の折りたたみ状態が反転する。
+    /// (押した位置 → 行の解決 → FoldState の更新、までを通しで見る)
+    #[test]
+    fn ガターのクリックで折りたたみが開閉する() {
+        let text = "fn a() {\n    let x = 1;\n    let y = 2;\n}\nfn b() {}\n";
+        let mut folds = FoldState::default();
+        assert!(folds.refresh(text, "Rust"), "初回は必ず計算する");
+        assert!(folds.is_foldable(0), "1 行目は畳める");
+
+        // 行 0 が y 10..20、行 1 が y 20..30 に描かれているとする
+        let rows = vec![(0usize, 10.0_f32, 20.0_f32), (1usize, 20.0_f32, 30.0_f32)];
+        let marks: HashMap<usize, bool> = folds
+            .ranges()
+            .iter()
+            .map(|r| (r.start_line, folds.is_folded(r.start_line)))
+            .collect();
+        let fold_x = 40.0_f32;
+
+        // ▸ の桁より左 (ブックマークの列) は反応しない
+        assert_eq!(
+            fold_click_line(&rows, &marks, fold_x, egui::pos2(30.0, 15.0)),
+            None
+        );
+        // 畳めない行を押しても反応しない
+        assert_eq!(
+            fold_click_line(&rows, &marks, fold_x, egui::pos2(45.0, 25.0)),
+            None
+        );
+        // 畳める行の ▸ を押すとその行が返る
+        let hit = fold_click_line(&rows, &marks, fold_x, egui::pos2(45.0, 15.0));
+        assert_eq!(hit, Some(0));
+
+        assert!(!folds.is_folded(0));
+        assert!(folds.toggle_fold(hit.expect("行が取れる")));
+        assert!(folds.is_folded(0), "クリックで畳まれる");
+        assert!(folds.toggle_fold(0));
+        assert!(!folds.is_folded(0), "もう一度押すと開く");
+    }
+
+    /// 畳んだ範囲の行は表示テキストに現れず、キャレット添字が原文へ正しく写る。
+    #[test]
+    fn 畳んだ行は描かれずキャレットが原文へ写る() {
+        let src = "a\nHIDE1\nHIDE2\nb\n";
+        // 行 1..=2 を隠す (行 0 がヘッダ)
+        let (disp, lines, cut) = build_fold_view(src, &[(1, 2)]);
+        assert_eq!(disp, "a\nb\n", "隠した行は 1 文字も残さない");
+        assert!(!disp.contains("HIDE"));
+        // 表示行 → 原文行
+        assert_eq!(lines, vec![0, 3, 4]);
+
+        // 表示の "b" (添字 2) は原文の "b" (添字 14) を指す
+        let src_b = src.chars().position(|c| c == 'b').expect("b がある");
+        assert_eq!(fold_display_to_source(&cut, 2), src_b);
+        // 逆写像も一致する
+        assert_eq!(fold_source_to_display(&cut, src_b), 2);
+        // 隠れている位置は折りたたみの直前へ丸める (畳んだ中に入らない)
+        let hidden_idx = src.find("HIDE2").expect("ある");
+        assert_eq!(fold_source_to_display(&cut, hidden_idx), 2);
+
+        // 行頭は写像の両側で一致する (キャレットが行をまたいでもズレない)
+        for d in 0..=disp.chars().count() {
+            let s = fold_display_to_source(&cut, d);
+            assert!(s <= src.chars().count());
+        }
+    }
+
+    /// 表示テキストへの編集は、隠した行を保ったまま原文へ差し戻る。
+    #[test]
+    fn 折りたたみ中の編集が原文へ差し戻る() {
+        let src = "a\nHIDE1\nHIDE2\nb\n";
+        let (disp, _, cut) = build_fold_view(src, &[(1, 2)]);
+        assert_eq!(disp, "a\nb\n");
+
+        // 可視行 "b" の後ろに "X" を打つ
+        let edited = "a\nbX\n";
+        let next = splice_fold_edit(src, &cut, &disp, edited);
+        assert_eq!(next, "a\nHIDE1\nHIDE2\nbX\n", "隠した行は消えない");
+        let (at, delta) = fold_edit_shift(src, &next, &cut, &disp, edited);
+        assert_eq!(delta, 0, "行数は変わっていない");
+        assert_eq!(at, 3, "編集は原文 4 行目 (0 始まりで 3)");
+
+        // 行を増やす編集では delta が正になる (畳んだ状態を追随させるため)
+        let edited2 = "a\nb\n\n";
+        let next2 = splice_fold_edit(src, &cut, &disp, edited2);
+        let (_, delta2) = fold_edit_shift(src, &next2, &cut, &disp, edited2);
+        assert_eq!(delta2, 1);
+
+        // 何も変えなければ原文はそのまま (無編集フレームで壊さない)
+        assert_eq!(splice_fold_edit(src, &cut, &disp, &disp), src);
+    }
+
+    /// 末尾まで畳むときは手前の改行ごと落とし、空行を残さない。
+    #[test]
+    fn 末尾まで畳んでも空行が残らない() {
+        let src = "head\nx\ny";
+        let (disp, lines, cut) = build_fold_view(src, &[(1, 2)]);
+        assert_eq!(disp, "head");
+        assert_eq!(lines, vec![0]);
+        assert_eq!(cut.len(), 1);
+        // 差し戻しても原文が保たれる
+        assert_eq!(splice_fold_edit(src, &cut, &disp, &disp), src);
+    }
+
+    /// 折りたたみが無いときは表示テキスト = 原文 (恒等)。
+    #[test]
+    fn 折りたたみ無しでは表示テキストが原文と同じ() {
+        let src = "a\nb\nc\n";
+        let (disp, lines, cut) = build_fold_view(src, &[]);
+        assert_eq!(disp, src);
+        assert_eq!(lines, vec![0, 1, 2, 3]);
+        assert!(cut.is_empty());
+        for d in 0..=src.chars().count() {
+            assert_eq!(fold_display_to_source(&cut, d), d);
+            assert_eq!(fold_source_to_display(&cut, d), d);
+        }
+    }
+
+    /// 折り返し ON でも、行番号・印は「表示行の先頭の視覚行」だけに出る。
+    #[test]
+    fn 視覚行から表示行の先頭だけを拾う() {
+        // 行 0 が 2 行に折り返し、行 1 は折り返し無し、行 2 が 3 行に折り返し
+        let nl = [false, true, true, false, false, true];
+        let got = row_line_starts(&nl);
+        assert_eq!(got, vec![(0, 0), (2, 1), (3, 2)]);
+        // 折り返し無しなら恒等
+        let flat = [true, true, true];
+        assert_eq!(row_line_starts(&flat), vec![(0, 0), (1, 1), (2, 2)]);
+    }
+
+    // ── B: インデントガイド / スティッキー ────────────────────────
+
+    /// インデントガイドと強調ガイドが、描画側が使う形で出てくる。
+    #[test]
+    fn インデントガイドと強調ガイドが描画へ流れる() {
+        let text = "fn a() {\n    if x {\n        y();\n    }\n}\n";
+        let tw = crate::highlight::DEFAULT_TAB_WIDTH;
+        let guides = crate::highlight::indent_guides(text, tw);
+        // 契約: 行数ぶんの要素があり、v[i].0 == i
+        assert_eq!(guides.len(), text.split('\n').count());
+        for (i, (n, _)) in guides.iter().enumerate() {
+            assert_eq!(*n, i);
+        }
+        // 一番深い行 (y(); = 行 2) には 2 本の縦線が要る
+        assert_eq!(guides[2].1, vec![0, tw]);
+        // 一番外側の行には縦線が無い
+        assert!(guides[0].1.is_empty());
+
+        // 強調ガイド: キャレットが if の中にいるとき、その桁が返る
+        let ag = crate::highlight::active_guide(text, tw, 2).expect("囲むブロックがある");
+        assert_eq!(ag.column, tw);
+        assert!(ag.start_line <= 2 && 2 <= ag.end_line);
+        // 描画側の判定 (この行のこの桁を強調するか) と噛み合う
+        let on = guides[2].1.contains(&ag.column)
+            && ag.start_line <= 2
+            && 2 <= ag.end_line;
+        assert!(on, "強調する桁がガイドの桁集合に含まれている");
+    }
+
+    /// スティッキーヘッダが「上端に貼る行」を外側から順に返す。
+    #[test]
+    fn スティッキーヘッダが上端の文脈を返す() {
+        let text = "fn outer() {\n    if x {\n        a();\n        b();\n    }\n}\n";
+        // 3 行目 (a();) が最上部に見えているとき
+        let heads =
+            crate::highlight::sticky_headers(text, "Rust", 2, STICKY_MAX_ROWS);
+        assert!(!heads.is_empty(), "囲んでいるブロックのヘッダが出る");
+        assert!(heads.len() <= STICKY_MAX_ROWS);
+        // 外側から順 (行番号が昇順)
+        let mut prev = 0usize;
+        for (n, _) in &heads {
+            assert!(*n >= prev);
+            prev = *n;
+        }
+        assert_eq!(heads[0].0, 0, "一番外側は fn outer の行");
+        // 先頭が見えているときは何も貼らない
+        assert!(crate::highlight::sticky_headers(text, "Rust", 0, STICKY_MAX_ROWS).is_empty());
+    }
+
+    // ── C: ブックマーク / 閉じたタブ ─────────────────────────────
+
+    /// ブックマークのコマンドがそれぞれの効果になる。
+    #[test]
+    fn ブックマークのコマンドが状態とジャンプ先に効く() {
+        let mut m = Bookmarks::default();
+        // 切替: その場から動かず、印だけ付く
+        assert_eq!(bookmark_cmd_target(&Cmd::ToggleBookmark, &mut m, 3), None);
+        assert!(m.is_marked(3));
+        assert_eq!(bookmark_cmd_target(&Cmd::ToggleBookmark, &mut m, 10), None);
+        assert!(m.is_marked(10));
+
+        // 次 / 前: 端では折り返す
+        assert_eq!(bookmark_cmd_target(&Cmd::NextBookmark, &mut m, 3), Some(10));
+        assert_eq!(bookmark_cmd_target(&Cmd::NextBookmark, &mut m, 10), Some(3));
+        assert_eq!(bookmark_cmd_target(&Cmd::PrevBookmark, &mut m, 10), Some(3));
+        assert_eq!(bookmark_cmd_target(&Cmd::PrevBookmark, &mut m, 3), Some(10));
+
+        // もう一度切替で外れる
+        assert_eq!(bookmark_cmd_target(&Cmd::ToggleBookmark, &mut m, 3), None);
+        assert!(!m.is_marked(3));
+
+        // 全解除
+        assert_eq!(bookmark_cmd_target(&Cmd::ClearBookmarks, &mut m, 0), None);
+        assert!(m.is_empty());
+        // 空なら次 / 前は行き先なし (呼び出し側が「ありません」を出す)
+        assert_eq!(bookmark_cmd_target(&Cmd::NextBookmark, &mut m, 0), None);
+
+        // 関係ないコマンドは何もしない
+        assert_eq!(bookmark_cmd_target(&Cmd::Save, &mut m, 0), None);
+        assert!(m.is_empty());
+    }
+
+    /// 「閉じたタブを開き直す」は最後に閉じたものから順に返る。
+    #[test]
+    fn 閉じたタブを新しい順に開き直せる() {
+        let mut ct = ClosedTabs::default();
+        assert!(ct.pop_closed().is_none(), "何も閉じていなければ何も返らない");
+        for (n, name) in ["a.rs", "b.rs"].iter().enumerate() {
+            ct.push_closed(ClosedTab {
+                path: PathBuf::from(name),
+                title: (*name).into(),
+                cursor: (n + 5, 2),
+                scroll: 12.0,
+            });
+        }
+        let t = ct.pop_closed().expect("直前に閉じたもの");
+        assert_eq!(t.path, PathBuf::from("b.rs"));
+        // 復元に使う値がそのまま乗っている (goto_line は 1 始まり)
+        assert_eq!(t.cursor, (6, 2));
+        assert!(t.scroll > 0.0);
+        assert_eq!(ct.pop_closed().map(|t| t.path), Some(PathBuf::from("a.rs")));
+        assert!(ct.pop_closed().is_none());
+    }
+
+    // ── D: テーブル表示 / 巨大ファイル ───────────────────────────
+
+    /// テーブル表示の切替判定。
+    #[test]
+    fn テーブル表示の切替判定() {
+        let table: [(bool, bool, TableToggle); 4] = [
+            // (CSV/TSV か, 表を出しているか, 期待)
+            (true, false, TableToggle::Build),
+            (true, true, TableToggle::Drop),
+            // 拡張子が違っても、出しているものは必ず解除できる
+            (false, true, TableToggle::Drop),
+            (false, false, TableToggle::NotTable),
+        ];
+        for (is_table, showing, want) in table {
+            assert_eq!(
+                table_toggle_decision(is_table, showing),
+                want,
+                "is_table={is_table} showing={showing}"
+            );
+        }
+        // 判定に使う拡張子は editor.rs の表と揃っている
+        assert!(crate::editor::is_table_path(Path::new("a/b.csv")));
+        assert!(crate::editor::is_table_path(Path::new("a/b.TSV")));
+        assert!(!crate::editor::is_table_path(Path::new("a/b.rs")));
+    }
+
+    /// 表のパース結果が、グリッド描画が期待する形になっている。
+    #[test]
+    fn 表のパース結果がグリッドの形になる() {
+        let t = crate::editor::parse_table("a,b,c\n1,2\n3,4,5,6\n", 100);
+        assert_eq!(t.headers, vec!["a", "b", "c"]);
+        assert_eq!(t.rows.len(), 2);
+        // ラグド: 列数は最大値で、足りないセルは描画側が空欄で埋める
+        assert_eq!(t.columns, 4);
+        assert!(!t.truncated);
+        assert!(t.rows[0].get(2).is_none(), "短い行は短いまま返る");
+
+        // 上限を超えたら truncated で知らせる (画面に注意書きを出す)
+        let many: String = (0..10).map(|n| format!("{n},x\n")).collect();
+        let cut = crate::editor::parse_table(&many, 3);
+        assert!(cut.truncated);
+        assert_eq!(cut.rows.len(), 3);
+    }
+
+    /// 巨大ファイルの旗が、そのまま画面の状態になる。
+    #[test]
+    fn 巨大ファイルの旗が画面の状態になる() {
+        use crate::editor::{open_decision, OpenDecision, HEAVY_FILE_BYTES, LARGE_FILE_BYTES};
+
+        // 普通の大きさ: 制限なし = 帯も出ない
+        let OpenDecision::Open(small) = open_decision(1024) else {
+            panic!("開けるはず");
+        };
+        assert!(!small.active && !small.read_only && small.highlight);
+        assert!(large_file_reasons(small.read_only, !small.highlight).is_empty());
+
+        // 重いファイル: 強調表示だけ止まる (編集はできる)
+        let OpenDecision::Open(heavy) = open_decision(HEAVY_FILE_BYTES + 1) else {
+            panic!("開けるはず");
+        };
+        assert!(heavy.active && !heavy.read_only && !heavy.highlight);
+        let why = large_file_reasons(heavy.read_only, !heavy.highlight);
+        assert_eq!(why, vec![tr("強調表示と折りたたみを停止")]);
+
+        // 巨大ファイル: 読み取り専用にもなる
+        let OpenDecision::Open(big) = open_decision(LARGE_FILE_BYTES + 1) else {
+            panic!("開けるはず");
+        };
+        assert!(big.active && big.read_only && !big.highlight);
+        assert_eq!(
+            large_file_reasons(big.read_only, !big.highlight),
+            vec![tr("読み取り専用"), tr("強調表示と折りたたみを停止")]
+        );
+    }
+
+    /// 読み取り専用の包みは編集を捨て、選択のための本文は返す。
+    #[test]
+    fn 読み取り専用の包みは編集を受け付けない() {
+        use egui::TextBuffer;
+        let src = String::from("abc");
+        let mut ro = EditTarget::Ro(&src);
+        assert!(!ro.is_mutable());
+        assert_eq!(ro.insert_text("X", 0), 0);
+        ro.delete_char_range(0..1);
+        ro.set("zzz".into());
+        assert_eq!(ro.as_str(), "abc", "読み取り専用は 1 文字も変わらない");
+
+        let mut rw_src = String::from("abc");
+        let mut rw = EditTarget::Rw(&mut rw_src);
+        assert!(rw.is_mutable());
+        rw.insert_text("X", 0);
+        assert_eq!(rw.as_str(), "Xabc");
+        rw.set("zzz".into());
+        assert_eq!(rw.as_str(), "zzz");
+    }
+
+    // ── E: LSP ───────────────────────────────────────────────────
+
+    fn item(label: &str, insert: &str, kind: u8) -> lsp::CompletionItem {
+        lsp::CompletionItem {
+            label: label.into(),
+            insert_text: insert.into(),
+            detail: String::new(),
+            documentation: String::new(),
+            kind,
+            text_edit: None,
+            additional_text_edits: Vec::new(),
+            sort_text: None,
+            filter_text: None,
+            preselect: false,
+            is_snippet: false,
+            deprecated: false,
+        }
+    }
+
+    /// 補完の確定が本文へ当たる (サーバーは立てず、応答を合成する)。
+    #[test]
+    fn 補完の確定が本文と追加編集を当てる() {
+        let mut st = lsp::CompletionState::new();
+        let now = Instant::now();
+        st.invoke("pri", now);
+        let anchor = lsp::Position::new(2, 3);
+        st.mark_sent(lsp::RequestStatus::Sent(1), anchor);
+
+        // textEdit と additionalTextEdits (import 追加) 付きの候補を合成する
+        let mut main = item("println!", "println!", 3);
+        main.text_edit = Some(lsp::TextEdit::new(
+            lsp::Range::new(lsp::Position::new(2, 0), lsp::Position::new(2, 3)),
+            "println!",
+        ));
+        main.additional_text_edits = vec![lsp::TextEdit::new(
+            lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0)),
+            "use std::fmt;\n",
+        )];
+        assert!(st.apply_response(
+            1,
+            lsp::CompletionList {
+                is_incomplete: false,
+                items: vec![main, item("print", "print", 3)],
+            }
+        ));
+        assert!(st.is_open());
+        assert_eq!(st.len(), 2, "どちらの候補も pri で絞り込みを通る");
+        // 並び順はサーバー / sortText 次第なので仮定しない。矢印で狙った候補まで進む。
+        for _ in 0..st.len() {
+            if st.selected().map(|i| i.label.as_str()) == Some("println!") {
+                break;
+            }
+            st.select_next();
+        }
+        assert_eq!(st.selected().map(|i| i.label.clone()), Some("println!".into()));
+
+        let fallback = lsp::Range::new(lsp::Position::new(2, 0), anchor);
+        let edits = st.accept(fallback).expect("確定できる");
+        assert_eq!(edits.len(), 2, "追加編集も一緒に返る");
+
+        let before = "mod m;\n\npri\n";
+        let after = lsp::apply_text_edits(before, &edits);
+        assert_eq!(after, "use std::fmt;\nmod m;\n\nprintln!\n");
+
+        // 矢印で選び直すと当てる編集も変わる
+        st.select_next();
+        assert_eq!(st.selected().map(|i| i.label.clone()), Some("print".into()));
+        assert!(
+            st.selected().map(|i| i.text_edit.is_none()).unwrap_or(false),
+            "こちらは textEdit を持たない候補"
+        );
+        let edits2 = st.accept(fallback).expect("確定できる");
+        assert_eq!(
+            lsp::apply_text_edits(before, &edits2),
+            "mod m;\n\nprint\n",
+            "textEdit の無い候補は既定の範囲に差し込む"
+        );
+
+        // Esc 相当で閉じたら何も確定しない
+        st.dismiss();
+        assert!(!st.is_open());
+        assert!(st.accept(fallback).is_none());
+    }
+
+    /// 補完の kind は必ずフォント非依存のラベルになる (豆腐にしない)。
+    #[test]
+    fn 補完とシンボルの種別ラベルは英字だけ() {
+        for k in 0u8..=30 {
+            for s in [completion_kind_label(k), symbol_kind_label(k)] {
+                assert!(!s.is_empty());
+                assert!(
+                    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '·'),
+                    "kind={k} label={s}"
+                );
+            }
+        }
+    }
+
+    /// 参照の一覧がファイルごとにまとまる (パネルの並びと同じ形)。
+    #[test]
+    fn 参照の一覧がファイルごとにまとまる() {
+        let r = |l: usize| lsp::Range::new(lsp::Position::new(l, 0), lsp::Position::new(l, 4));
+        let locs = vec![
+            lsp::Location { path: PathBuf::from("/w/b.rs"), range: r(9) },
+            lsp::Location { path: PathBuf::from("/w/a.rs"), range: r(3) },
+            lsp::Location { path: PathBuf::from("/w/a.rs"), range: r(1) },
+        ];
+        let groups = lsp::group_locations(locs);
+        assert_eq!(groups.len(), 2);
+        let total: usize = groups.iter().map(|g| g.locations.len()).sum();
+        assert_eq!(total, 3);
+        let a = groups
+            .iter()
+            .find(|g| g.path == PathBuf::from("/w/a.rs"))
+            .expect("a.rs の組がある");
+        assert_eq!(a.locations.len(), 2);
+        // 空の応答は空の一覧 (呼び出し側が「見つかりません」を出す)
+        assert!(lsp::group_locations(Vec::new()).is_empty());
+    }
+
+    /// シンボル木が quick-open 用の平らな並びになる (深さつき・先行順)。
+    #[test]
+    fn シンボル一覧が深さつきで平らになる() {
+        let node = |name: &str, kind: u8, line: usize, children: Vec<lsp::SymbolNode>| {
+            lsp::SymbolNode {
+                name: name.into(),
+                detail: String::new(),
+                kind,
+                range: lsp::Range::new(
+                    lsp::Position::new(line, 0),
+                    lsp::Position::new(line + 5, 0),
+                ),
+                selection_range: lsp::Range::new(
+                    lsp::Position::new(line, 3),
+                    lsp::Position::new(line, 8),
+                ),
+                deprecated: false,
+                children,
+            }
+        };
+        let tree = vec![
+            node("Foo", 23, 10, vec![node("bar", 6, 12, vec![]), node("baz", 6, 14, vec![])]),
+            node("top", 12, 30, vec![]),
+        ];
+        let mut flat = Vec::new();
+        flatten_symbols(&tree, 0, &mut flat);
+        assert_eq!(flat.len(), 4);
+        let names: Vec<&str> = flat.iter().map(|(_, n, ..)| n.as_str()).collect();
+        assert_eq!(names, vec!["Foo", "bar", "baz", "top"], "先行順で平らになる");
+        assert_eq!(flat.iter().map(|(d, ..)| *d).collect::<Vec<_>>(), vec![0, 1, 1, 0]);
+        // ジャンプ先は selection_range の先頭 (名前の位置)
+        assert_eq!(flat[1].3, lsp::Position::new(12, 3));
+        assert_eq!(symbol_kind_label(flat[0].2), "struct");
+        assert!(flatten_symbols_is_empty_for_empty_tree());
+    }
+
+    fn flatten_symbols_is_empty_for_empty_tree() -> bool {
+        let mut v = Vec::new();
+        flatten_symbols(&[], 0, &mut v);
+        v.is_empty()
+    }
+
+    /// リネームの WorkspaceEdit が 1 ファイルぶんずつ当たる。
+    #[test]
+    fn リネームの編集がファイルごとに当たる() {
+        let fe = lsp::FileEdits {
+            path: PathBuf::from("/w/a.rs"),
+            // 契約: 降順に並んでいる (後ろから当てる)
+            edits: vec![
+                lsp::TextEdit::new(
+                    lsp::Range::new(lsp::Position::new(2, 4), lsp::Position::new(2, 7)),
+                    "neu",
+                ),
+                lsp::TextEdit::new(
+                    lsp::Range::new(lsp::Position::new(0, 3), lsp::Position::new(0, 6)),
+                    "neu",
+                ),
+            ],
+        };
+        let before = "fn old() {}\n\n    old();\n";
+        assert_eq!(
+            lsp::apply_file_edits(before, &fe),
+            "fn neu() {}\n\n    neu();\n"
+        );
+        let plan = lsp::WorkspaceEditPlan {
+            files: vec![fe],
+            has_resource_ops: false,
+        };
+        assert!(!plan.is_empty());
+        assert_eq!(plan.edit_count(), 2);
+        // 空の計画は「変更はありませんでした」の側へ落ちる
+        assert!(lsp::WorkspaceEditPlan {
+            files: Vec::new(),
+            has_resource_ops: false,
+        }
+        .is_empty());
+    }
+
+    /// 整形の結果を本文へ当てる経路 (poll_formatting → apply_text_edits)。
+    #[test]
+    fn 整形の結果が本文へ当たる() {
+        let edits = vec![lsp::TextEdit::new(
+            lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 5)),
+            "fn ",
+        )];
+        assert_eq!(lsp::apply_text_edits("fn   a() {}\n", &edits), "fn a() {}\n");
+        // 空の応答は「整形の必要はありませんでした」= 本文を触らない
+        let none: Vec<lsp::TextEdit> = Vec::new();
+        assert_eq!(lsp::apply_text_edits("x\n", &none), "x\n");
+    }
+
+    /// `sweep_timeouts` を毎フレーム呼んでいること、そのフレーム経路が
+    /// `update` に繋がっていることをソースで固定する。
+    ///
+    /// LSP クライアントは実プロセスを起こすためテストから触れない。ここが
+    /// 抜けると「返らないリクエストの席が埋まったまま、以後の要求が黙って
+    /// 効かなくなる」という**気付けない壊れ方**をするので、配線そのものを守る。
+    #[test]
+    fn sweep_timeouts_を毎フレーム呼んでいる() {
+        let src = include_str!("app.rs");
+        let poll = src
+            .split("fn poll_lsp(&mut self) {")
+            .nth(1)
+            .expect("poll_lsp がある");
+        let loop_body = poll
+            .split("for c in self.lsp.values() {")
+            .nth(1)
+            .expect("全クライアントを回している");
+        assert!(
+            loop_body
+                .split("}\n")
+                .next()
+                .expect("ループ本体")
+                .contains("c.sweep_timeouts(lsp::REQUEST_TIMEOUT);"),
+            "sweep_timeouts はクライアントごとに毎フレーム呼ぶ"
+        );
+        // 応答の取りこぼしが無いこと (全 poll_* を回している)
+        for m in [
+            "poll_completion()",
+            "poll_hover()",
+            "poll_references()",
+            "poll_document_symbols()",
+            "poll_prepare_rename()",
+            "poll_rename()",
+            "poll_formatting()",
+        ] {
+            assert!(poll.contains(m), "{m} を回収していない");
+        }
+        // update から毎フレーム呼ばれている
+        let update = src
+            .split("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {")
+            .nth(1)
+            .expect("update がある");
+        assert!(update.contains("self.poll_lsp();"), "update から呼んでいない");
+        assert!(
+            update.contains("self.lsp_completion_tick(ctx);"),
+            "補完のデバウンスが update から呼ばれていない"
+        );
+    }
+
+    /// 折りたたみ → 編集 → 差し戻し → 畳んだ状態の追随、を一周させる。
+    ///
+    /// 「畳んだまま上の行を編集したら、下の折りたたみが 1 行ずれる」という
+    /// 一番壊れやすい経路を固定する。
+    #[test]
+    fn 畳んだまま編集しても折りたたみが追随する() {
+        let mut text = String::from(
+            "fn a() {\n    x();\n}\nfn b() {\n    y();\n    z();\n}\n",
+        );
+        let mut folds = FoldState::default();
+        folds.refresh(&text, "Rust");
+        // 2 つ目の関数 (行 3 から) を畳む
+        assert!(folds.toggle_fold(3), "行 3 は畳める");
+        let hidden = folds.hidden_spans();
+        assert_eq!(hidden, vec![(4, 6)]);
+
+        let (disp, lines, cut) = build_fold_view(&text, &hidden);
+        assert!(!disp.contains("y();") && !disp.contains("z();"));
+        assert!(disp.contains("fn b() {"), "ヘッダ行は残る");
+        assert_eq!(lines, vec![0, 1, 2, 3, 7]);
+
+        // 1 つ目の関数の中に 1 行足す (畳んだ範囲より上)
+        let edited = disp.replacen("    x();\n", "    x();\n    w();\n", 1);
+        let next = splice_fold_edit(&text, &cut, &disp, &edited);
+        assert!(next.contains("    w();"), "編集が原文へ入る");
+        assert!(next.contains("    y();"), "畳んだ中身は消えない");
+
+        let (at, delta) = fold_edit_shift(&text, &next, &cut, &disp, &edited);
+        assert_eq!(delta, 1);
+        folds.shift_lines(at, delta);
+        text = next;
+        folds.refresh(&text, "Rust");
+        // 畳んだ関数は 1 行下がっても畳まれたまま
+        assert!(folds.is_folded(4), "畳んだ状態が編集を跨いで残る");
+        assert_eq!(folds.hidden_spans(), vec![(5, 7)]);
+    }
+
+    /// 折りたたみ中は、原文の添字を前提にする補助機能を止めている。
+    ///
+    /// これを外すと、表示テキストのキャレット添字で原文を書き換えて
+    /// **本文が壊れる**。ソースで固定しておく。
+    #[test]
+    fn 折りたたみ中は添字前提の補助機能を止めている() {
+        let src = include_str!("app.rs");
+        assert!(
+            src.contains("let folds_closed = !self.editor.buffers[active].folds.folded().is_empty();"),
+            "折りたたみ中かの判定が無い"
+        );
+        assert!(
+            src.contains("let expand = if has_focus && !folds_closed {"),
+            "スニペット展開を止めていない"
+        );
+        assert!(
+            src.contains("if has_focus && !folds_closed && !self.editor.buffers[active].read_only() {"),
+            "自動ペアを止めていない / 読み取り専用を見ていない"
+        );
+    }
+
+    /// レビュー画面が返す 2 つの追加要求を app 側で受けていること。
+    #[test]
+    fn レビュー画面の要求を受けている() {
+        let src = include_str!("app.rs");
+        assert!(
+            src.contains("if let Some(file) = git_actions.open_file {"),
+            "open_file をエディタで開いていない"
+        );
+        assert!(
+            src.contains("if let Some(prompt) = git_actions.review_prompt {"),
+            "review_prompt を入力欄へ流していない"
+        );
+        assert!(
+            src.contains("self.review.ui(ui, &theme, &mut git_actions);"),
+            "ReviewPanel を描いていない (描かないと画面に出ない)"
+        );
+        assert!(
+            src.contains("self.review.set_workspace("),
+            "ワークスペース切替に追随していない"
+        );
+        // 比較ベースの切替がコマンドから届く
+        for k in ["\"staged\" => git_panel::ReviewBase::Staged", "\"unstaged\" => git_panel::ReviewBase::Unstaged"] {
+            assert!(src.contains(k), "{k} が無い");
+        }
+    }
+
+    /// 新しいコマンドがすべてパレットに並び、ディスパッチ先がある。
+    #[test]
+    fn 新しいコマンドがパレットから届く() {
+        let src = include_str!("app.rs");
+        let list = src
+            .split("fn palette_builtin_cmds(&self) -> Vec<(String, String, String, Cmd)> {")
+            .nth(1)
+            .expect("パレットの一覧がある");
+        let router = src
+            .split("fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("ディスパッチがある");
+        for c in [
+            "Cmd::OpenReview",
+            "Cmd::SetReviewBase",
+            "Cmd::ToggleFold",
+            "Cmd::FoldAll",
+            "Cmd::UnfoldAll",
+            "Cmd::FoldLevel",
+            "Cmd::ToggleBookmark",
+            "Cmd::NextBookmark",
+            "Cmd::PrevBookmark",
+            "Cmd::ClearBookmarks",
+            "Cmd::ReopenClosedTab",
+            "Cmd::ToggleTableView",
+            "Cmd::LspCompletion",
+            "Cmd::LspReferences",
+            "Cmd::LspSymbols",
+            "Cmd::LspRename",
+            "Cmd::LspFormat",
+            "Cmd::ToggleFormatOnSave",
+        ] {
+            assert!(list.contains(c), "{c} がコマンドパレットに無い");
+            assert!(router.contains(c), "{c} のディスパッチが無い");
+        }
+    }
+}
+
 #[cfg(test)]
 mod glyph_tests {
     /// UI で使う記号が、実際のフォント構成で描画できることを保証する。
@@ -16808,7 +19832,7 @@ mod glyph_tests {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
         const UI_SYMBOLS: &str = "📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
-                                  💬📊⛔🔁·↩▸▾🔎\
+                                  💬📊⛔🔁·↩▸▾🔎◆\
                                   🔍📡🖱📦🍚🌀🔷🔶🕊👷🐦🅰🌊⌘➡🔩🌙🎏🎐🐉💠";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);

@@ -65,10 +65,33 @@ pub enum BindAction {
     ToggleFullScreen,
     /// ワークスペース全体の置換 (VS Code: ⇧⌘H)
     GlobalReplace,
+    /// カーソル行の折りたたみ切替 (VS Code Mac の「折りたたみ」= ⌥⌘[)
+    ///
+    /// VS Code の ⌘K ⌘0 / ⌘K ⌘J のような **2 打鍵のコード (chord)** は
+    /// この解決テーブルが 1 つの [`KeyboardShortcut`] しか持てないため
+    /// 表現できない。単打で空いている ⌥⌘[ / ⌥⌘] を割り当て、
+    /// 段数指定の折りたたみはコマンドパレット専用にしてある。
+    ToggleFold,
+    /// すべて展開 (VS Code Mac の「展開」= ⌥⌘])
+    UnfoldAll,
+    /// カーソル行のブックマーク切替
+    ToggleBookmark,
+    /// 直前に閉じたタブを開き直す (VS Code: ⇧⌘T)
+    ReopenClosedTab,
+    /// 補完候補を出す (VS Code: ⌃Space)
+    LspCompletion,
+    /// 参照を検索 (VS Code: ⇧F12)
+    LspReferences,
+    /// シンボルにジャンプ (VS Code: ⇧⌘O)
+    LspSymbols,
+    /// リネーム (VS Code: F2)
+    LspRename,
+    /// ドキュメントの整形 (VS Code: ⇧⌥F)
+    LspFormat,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 37] = [
+const ALL_ACTIONS: [BindAction; 46] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -106,6 +129,15 @@ const ALL_ACTIONS: [BindAction; 37] = [
     BindAction::ToggleProblems,
     BindAction::ToggleFullScreen,
     BindAction::GlobalReplace,
+    BindAction::ToggleFold,
+    BindAction::UnfoldAll,
+    BindAction::ToggleBookmark,
+    BindAction::ReopenClosedTab,
+    BindAction::LspCompletion,
+    BindAction::LspReferences,
+    BindAction::LspSymbols,
+    BindAction::LspRename,
+    BindAction::LspFormat,
 ];
 
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
@@ -157,6 +189,23 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::ToggleProblems => KeyboardShortcut::new(cmd_shift, Key::M),
         BindAction::ToggleFullScreen => {
             KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::COMMAND), Key::F)
+        }
+        // ⌥⌘[ / ⌥⌘] は VS Code (mac) の折りたたみ / 展開と同じ。
+        // 既存の ⌥⌘ 割り当ては S (すべて保存) と F (置換) だけなので空いている。
+        BindAction::ToggleFold => {
+            KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::OpenBracket)
+        }
+        BindAction::UnfoldAll => {
+            KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::CloseBracket)
+        }
+        BindAction::ToggleBookmark => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::B),
+        BindAction::ReopenClosedTab => KeyboardShortcut::new(cmd_shift, Key::T),
+        BindAction::LspCompletion => KeyboardShortcut::new(Modifiers::CTRL, Key::Space),
+        BindAction::LspReferences => KeyboardShortcut::new(Modifiers::SHIFT, Key::F12),
+        BindAction::LspSymbols => KeyboardShortcut::new(cmd_shift, Key::O),
+        BindAction::LspRename => KeyboardShortcut::new(Modifiers::NONE, Key::F2),
+        BindAction::LspFormat => {
+            KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F)
         }
     }
 }
@@ -232,6 +281,15 @@ impl Keybinds {
             "run_build_task" => RunBuildTask,
             "toggle_problems" => ToggleProblems,
             "toggle_fullscreen" => ToggleFullScreen,
+            "toggle_fold" => ToggleFold,
+            "unfold_all" => UnfoldAll,
+            "toggle_bookmark" => ToggleBookmark,
+            "reopen_closed_tab" => ReopenClosedTab,
+            "lsp_completion" => LspCompletion,
+            "lsp_references" => LspReferences,
+            "lsp_symbols" => LspSymbols,
+            "lsp_rename" => LspRename,
+            "lsp_format" => LspFormat,
             _ => return None,
         })
     }
@@ -720,6 +778,49 @@ mod tests {
             assert_eq!(sa, sb, "{a} vs {b}");
             assert_eq!(format_shortcut(sa), format_shortcut(sb), "{a} vs {b}");
         }
+    }
+
+    /// 既定のショートカットは全アクションで重複しない。
+    /// 「空いている打鍵に割り当てた」という主張をここで固定する
+    /// (新しいバインドを足したとき、既存を黙って奪っていないか検出する)。
+    #[test]
+    fn default_shortcuts_are_unique() {
+        let mut seen: HashMap<String, BindAction> = HashMap::new();
+        for a in ALL_ACTIONS {
+            let sc = default_shortcut(a);
+            let key = format!("{:?}+{:?}", sc.modifiers, sc.logical_key);
+            if let Some(prev) = seen.insert(key.clone(), a) {
+                panic!("ショートカット衝突: {key} を {prev:?} と {a:?} が共有している");
+            }
+        }
+        assert_eq!(seen.len(), ALL_ACTIONS.len());
+    }
+
+    /// `action_from_name` は全アクションを名前で引ける (config からの上書き経路)。
+    #[test]
+    fn every_action_has_a_config_name() {
+        let names = [
+            "save", "save_as", "close_tab", "new_file", "new_window", "palette_files",
+            "palette_commands", "toggle_terminal", "toggle_sidebar", "find", "toggle_cockpit",
+            "toggle_kanban", "toggle_md_preview", "new_agent", "font_inc", "font_dec",
+            "toggle_comment", "duplicate_line", "move_line_up", "move_line_down",
+            "focus_explorer", "open_file", "save_all", "goto_line", "next_tab", "prev_tab",
+            "global_search", "global_replace", "open_replace", "new_terminal", "nav_back",
+            "nav_forward", "goto_definition", "goto_bracket", "run_build_task",
+            "toggle_problems", "toggle_fullscreen", "toggle_fold", "unfold_all",
+            "toggle_bookmark", "reopen_closed_tab", "lsp_completion", "lsp_references",
+            "lsp_symbols", "lsp_rename", "lsp_format",
+        ];
+        assert_eq!(names.len(), ALL_ACTIONS.len(), "名前表とアクション一覧の数が合わない");
+        let mut resolved: Vec<BindAction> =
+            names.iter().map(|n| Keybinds::action_from_name(n).unwrap()).collect();
+        for a in ALL_ACTIONS {
+            let i = resolved.iter().position(|r| *r == a).unwrap_or_else(|| {
+                panic!("{a:?} を引ける config 名が無い")
+            });
+            resolved.remove(i);
+        }
+        assert!(resolved.is_empty());
     }
 
     #[test]
