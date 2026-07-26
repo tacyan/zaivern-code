@@ -79,6 +79,10 @@ pub struct AgentSpec {
     pub switch_keys: &'static str,
     /// 権限モード切替ボタンの説明。`switch_keys` と必ず対で埋める。未確認は ""。
     pub switch_hint: &'static str,
+    /// 前回の会話を再開して起動するための指定。フラグ型 (`claude --continue`) と
+    /// サブコマンド型 (`codex resume --last` — bin の直後に挟む) の両方がある。
+    /// 再開機能を実機確認できていない CLI は "" (復元時は素の再起動になる)。
+    pub resume_flag: &'static str,
 }
 
 impl AgentSpec {
@@ -122,6 +126,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "\x1b[Z",
         switch_hint: "権限モード切替 (Shift+Tab)",
+        resume_flag: "--continue",
     },
     AgentSpec {
         bin: "codex",
@@ -140,6 +145,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "`-p` は `--print` ではなく `--profile`。非対話実行は `codex exec` を使う",
         switch_keys: "/permissions\r",
         switch_hint: "権限モード切替 (/permissions)",
+        resume_flag: "resume --last",
     },
     AgentSpec {
         bin: "grok",
@@ -154,6 +160,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "同名バイナリの別製品が存在し、名前では判別できない",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "cursor-agent",
@@ -168,6 +175,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "全自動は `-f` のみ。`--yolo` は受け付けない",
         switch_keys: "\x1b[Z",
         switch_hint: "権限モード切替 (Shift+Tab)",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "copilot",
@@ -182,6 +190,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "opencode",
@@ -196,6 +205,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "mimo",
@@ -210,6 +220,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "amp",
@@ -224,6 +235,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "モデル指定フラグは無い(設定側で指定)",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "openclaude",
@@ -238,6 +250,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "スコープ無しの npm パッケージ `openclaude` は別物",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     // Antigravity CLI (Google)。全自動フラグは claude と同名。自動承認環境変数も完全サポート。
     AgentSpec {
@@ -259,6 +272,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "\x1b[Z",
         switch_hint: "権限モード切替 (Shift+Tab)",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "pi",
@@ -273,6 +287,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "omp",
@@ -287,6 +302,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "hermes",
@@ -301,6 +317,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "非対話実行は `-p` ではなく `-z`",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "devin",
@@ -315,6 +332,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "全自動は 2 トークン形式の `--permission-mode bypass`",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "goose",
@@ -329,6 +347,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "一括自動承認フラグが無く、環境変数 `GOOSE_MODE=auto` や設定ファイル側で指定する",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "auggie",
@@ -343,6 +362,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "一括自動承認フラグが無く、ツール単位の許可を設定ファイル側で指定する",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "autohand",
@@ -357,6 +377,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "crush",
@@ -371,6 +392,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "`crush run` は既定で自動承認し `--yolo` を受け付けない",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "cline",
@@ -385,6 +407,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "cmd",
@@ -399,6 +422,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "cn",
@@ -413,6 +437,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "droid",
@@ -427,6 +452,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "`--auto` は値が必須(`low|medium|high`)。全自動は `--skip-permissions-unsafe`",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "kilo",
@@ -441,6 +467,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "kimi",
@@ -455,6 +482,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "スコープ無しの npm パッケージ `kimi` は別物",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "kiro-cli",
@@ -469,6 +497,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "`kiro` は IDE 本体、エージェントは `kiro-cli`",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "vibe",
@@ -483,6 +512,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "モデルは設定ファイル専用でフラグ指定できない",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "qwen",
@@ -497,6 +527,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "旧版は `--yolo`、現行は `--approval-mode=yolo`",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "acli",
@@ -511,6 +542,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "エージェントは `acli rovodev run` サブコマンド",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
     AgentSpec {
         bin: "aider",
@@ -525,6 +557,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "`-m` は model ではなく message",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     },
 ];
 
@@ -669,6 +702,38 @@ pub fn apply_approval(command: &str, approval: Approval) -> String {
         parts.push(auto_flag);
     }
     parts.join(" ")
+}
+
+/// セッション復元時、コマンドへ「前回の会話を再開する」指定を足す。
+///
+/// claude はフラグ型 (`claude --continue`)、codex はサブコマンド型
+/// (`codex resume --last` — 実行ファイル名の直後に挟まないとサブコマンドとして
+/// 解釈されない)。再開機能を確認できていない CLI は `resume_flag` が "" なので
+/// 素のまま返す (誤ったフラグで起動に失敗するより、会話が新規になる方がまし)。
+/// 復元経路でのみ使うこと — 通常の起動に付けると意図しない再開になる。
+pub fn apply_resume(command: &str, spec: &AgentSpec) -> String {
+    if spec.resume_flag.is_empty() {
+        return command.to_string();
+    }
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.is_empty() {
+        return command.to_string();
+    }
+    let resume: Vec<&str> = spec.resume_flag.split_whitespace().collect();
+    // 既に再開指定が入っているなら二重に付けない
+    if tokens.iter().any(|t| *t == resume[0]) {
+        return command.to_string();
+    }
+    if resume[0].starts_with('-') {
+        // フラグ型: 末尾に付けるだけでよい
+        return format!("{} {}", command.trim(), spec.resume_flag);
+    }
+    // サブコマンド型: 実行ファイル名の直後に挟む (末尾では引数扱いされてしまう)
+    let mut out: Vec<&str> = Vec::with_capacity(tokens.len() + resume.len());
+    out.push(tokens[0]);
+    out.extend(resume.iter());
+    out.extend(tokens[1..].iter());
+    out.join(" ")
 }
 
 /// 起動時にプロセスへ渡す環境変数を組み立てる。
@@ -819,6 +884,29 @@ impl AgentManager {
         Ok(())
     }
 
+    /// 保存済みセッション記録 (チャット履歴のフォルダ別保存) からの復元起動。
+    ///
+    /// `launch` と違い、タイトル・コマンド・ログの書き出し先は呼び出し側
+    /// (セッション記録) が決める — 特にログは**前回と同じファイル**へ追記させ、
+    /// 再起動をまたいで 1 本の履歴になるようにする。`replay` (前回ログの末尾) を
+    /// 先に vt100 へ流し込み、旧スクロールバックが見える状態にしてから
+    /// エージェントの新しい出力を受ける。
+    pub fn launch_restored(
+        &mut self,
+        spec: SpawnSpec,
+        replay: &[u8],
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let session = Session::spawn(id, spec, ctx.clone())?;
+        session.preload_scrollback(replay);
+        self.sessions.push(session);
+        self.active = self.sessions.len() - 1;
+        self.panel_open = true;
+        Ok(())
+    }
+
     pub fn restart(&mut self, i: usize, ctx: &egui::Context) -> Result<(), String> {
         let Some(old) = self.sessions.get_mut(i) else {
             return Ok(());
@@ -954,7 +1042,10 @@ impl AgentManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_approval, env_enables_auto, isolated_env_for_session, merged_env, Approval};
+    use super::{
+        apply_approval, apply_resume, env_enables_auto, isolated_env_for_session, merged_env,
+        Approval,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -1008,6 +1099,51 @@ mod tests {
         assert_eq!(
             apply_approval("claude --dangerously-skip-permissions", Approval::Auto),
             "claude --dangerously-skip-permissions"
+        );
+    }
+
+    // ── apply_resume (セッション復元時の会話再開) ──────────────────
+
+    #[test]
+    fn resume_claude_appends_continue_flag() {
+        let spec = spec_for_bin("claude").expect("claude はカタログにある");
+        assert_eq!(apply_resume("claude", spec), "claude --continue");
+        // 引数付きでも末尾に足すだけでよい
+        assert_eq!(
+            apply_resume("claude --dangerously-skip-permissions", spec),
+            "claude --dangerously-skip-permissions --continue"
+        );
+    }
+
+    #[test]
+    fn resume_codex_inserts_subcommand_after_bin() {
+        let spec = spec_for_bin("codex").expect("codex はカタログにある");
+        assert_eq!(apply_resume("codex", spec), "codex resume --last");
+        // サブコマンドは bin の直後 — 末尾に付けると resume の引数にならない
+        assert_eq!(
+            apply_resume("codex --dangerously-bypass-approvals-and-sandbox", spec),
+            "codex resume --last --dangerously-bypass-approvals-and-sandbox"
+        );
+    }
+
+    #[test]
+    fn resume_unsupported_cli_returns_command_unchanged() {
+        // 再開機能を確認できていない CLI (resume_flag = "") は素のまま
+        for bin in ["goose", "qwen", "aider"] {
+            let spec = spec_for_bin(bin).expect("カタログにある");
+            assert_eq!(spec.resume_flag, "", "{bin} は再開未確認のはず");
+            assert_eq!(apply_resume(bin, spec), bin);
+        }
+    }
+
+    #[test]
+    fn resume_does_not_double_add() {
+        let claude = spec_for_bin("claude").unwrap();
+        assert_eq!(apply_resume("claude --continue", claude), "claude --continue");
+        let codex = spec_for_bin("codex").unwrap();
+        assert_eq!(
+            apply_resume("codex resume --last", codex),
+            "codex resume --last"
         );
     }
 

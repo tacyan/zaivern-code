@@ -566,6 +566,7 @@ mod tests {
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     };
 
     const SPEC_SUB: AgentSpec = AgentSpec {
@@ -581,6 +582,7 @@ mod tests {
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     };
 
     const SPEC_SUB_MULTI: AgentSpec = AgentSpec {
@@ -596,6 +598,7 @@ mod tests {
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     };
 
     const SPEC_EMPTY: AgentSpec = AgentSpec {
@@ -611,6 +614,7 @@ mod tests {
         note: "",
         switch_keys: "",
         switch_hint: "",
+        resume_flag: "",
     };
 
     // --- 応答解析: 正常系 ---

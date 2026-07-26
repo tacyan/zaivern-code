@@ -12,6 +12,10 @@ pub struct Config {
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
+    /// フォルダを開き直したとき、前回のエージェントタブを復元して会話を再開するか。
+    /// true (既定) なら前回スクロールバックを再生し、対応 CLI (claude / codex) は
+    /// 再開指定付きで起動する。false なら何もしない (タブも作らない)。
+    pub restore_agents: bool,
     pub show_pet: bool,
     /// state.toml へ書き戻すグローバル値の控え (プロジェクト overlay 適用前)。
     /// save_state はこちらを書くので、.zaivern.toml のプロジェクト値が
@@ -187,6 +191,7 @@ impl Default for Config {
             terminal_font_size: 13.0,
             show_hidden_files: true,
             approval_mode: "ask".into(),
+            restore_agents: true,
             show_pet: true,
             global_theme: "zaivern-dark".into(),
             global_approval_mode: "ask".into(),
@@ -382,6 +387,11 @@ show_hidden_files = true
 #             「(全自動)」プリセットと通常プリセットを使い分けたい場合はこれ）
 # ツールバーの 🛡/⚡/👾 ボタンでも切替できます
 approval_mode = "ask"
+
+# フォルダを開き直したとき、前回のエージェントタブを復元して会話を再開する
+# (前回のスクロールバックが見える状態で、claude は --continue /
+#  codex は resume --last 付きで起動。false にすると復元しない)
+# restore_agents = true
 
 # デスクトップペット (🐾) の表示
 show_pet = true

@@ -2199,6 +2199,26 @@ impl ZaivernApp {
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect(),
+            // 走らせているエージェントタブの記録 (チャット履歴のフォルダ別保存)。
+            // 終了済みは復元しても意味が無いので残さない。
+            agents: self
+                .agents
+                .sessions
+                .iter()
+                .filter(|s| !s.exited.load(std::sync::atomic::Ordering::SeqCst))
+                .map(|s| session::AgentSessionRec {
+                    preset_name: s.preset_name.clone(),
+                    title: s.title.clone(),
+                    icon: s.icon.clone(),
+                    command: s.command.clone(),
+                    cwd: s.cwd.to_string_lossy().into_owned(),
+                    log_file: s
+                        .log_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                })
+                .collect(),
         };
         session::save(&self.roots, &data);
         // マルチルート時は primary ルート単独のキーでも保存しておく。
@@ -2238,6 +2258,84 @@ impl ZaivernApp {
         self.sidebar_open = sess.sidebar_open;
         self.sidebar_tab = SidebarTab::from_key(&sess.sidebar_tab);
         self.agents.panel_open = sess.panel_open;
+        // 前回走らせていたエージェントタブの復元 (チャット履歴の再開)。
+        // restore_agents = false なら何もしない (タブも作らない)。
+        if self.cfg.restore_agents && !sess.agents.is_empty() {
+            self.restore_agent_sessions(&sess.agents, ctx);
+        }
+    }
+
+    /// 保存済みエージェント記録からターミナルタブを復元する。
+    ///
+    /// 1. 前回の生ログ末尾を新しい vt100 パーサへ再生し、旧スクロールバックを
+    ///    見える状態にする (区切りバナー付き — terminal::RESTORE_BANNER)
+    /// 2. 実際にログが残っている場合だけ、対応 CLI (claude / codex) へ
+    ///    再開指定を足して会話を継続する
+    /// 3. ログは前回と同じファイルへ追記する (再起動をまたいで 1 本の履歴になる)
+    fn restore_agent_sessions(&mut self, recs: &[session::AgentSessionRec], ctx: &egui::Context) {
+        use crate::agents::{apply_resume, merged_env, spec_for_command, Approval};
+        let approval = Approval::from_mode(&self.cfg.approval_mode);
+        let mut restored = 0usize;
+        for rec in recs {
+            // 素のシェルには再開する会話が無いので復元しない
+            if rec.command.trim().is_empty() {
+                continue;
+            }
+            let log_path = (!rec.log_file.is_empty()).then(|| PathBuf::from(&rec.log_file));
+            // 既に同じログへ書いている生きたタブがあれば二重復元しない
+            // (エージェントを残したまま同じフォルダを開き直した場合など)
+            if let Some(lp) = &log_path {
+                if self
+                    .agents
+                    .sessions
+                    .iter()
+                    .any(|s| s.log_path.as_deref() == Some(lp.as_path()))
+                {
+                    continue;
+                }
+            }
+            // ログが実在するときだけ再開指定を足す — ログが消えたフォルダで
+            // `--continue` しても再開する会話が無く、CLI 側の挙動が不定になる
+            let replay = log_path
+                .as_ref()
+                .map(|p| session::read_term_log_tail(p, session::REPLAY_TAIL_CAP))
+                .unwrap_or_default();
+            let command = match spec_for_command(&rec.command) {
+                Some(spec) if !replay.is_empty() => apply_resume(&rec.command, spec),
+                _ => rec.command.clone(),
+            };
+            // env はセッションファイルへ保存しない (シークレットになり得る) ので、
+            // プリセット名で現在の設定から引き直す。プリセットが消えていたら
+            // 自動承認まわりの既定 env だけで起動する。
+            let env = match self.cfg.agents.iter().find(|p| p.name == rec.preset_name) {
+                Some(p) => merged_env(&p.command, approval, &p.env),
+                None => merged_env(&rec.command, approval, &HashMap::new()),
+            };
+            let cwd = PathBuf::from(&rec.cwd);
+            let cwd = if cwd.is_dir() { cwd } else { self.agent_cwd() };
+            let spec = crate::terminal::SpawnSpec {
+                title: rec.title.clone(),
+                preset_name: rec.preset_name.clone(),
+                icon: rec.icon.clone(),
+                command,
+                cwd,
+                env,
+                log_path,
+            };
+            match self.agents.launch_restored(spec, &replay, ctx) {
+                Ok(()) => restored += 1,
+                Err(e) => self.toast(e, false),
+            }
+        }
+        if restored > 0 {
+            self.toast(
+                trf(
+                    "🔄 前回のエージェント {n} 本を再開しました",
+                    &[("n", restored.to_string())],
+                ),
+                true,
+            );
+        }
     }
 
     /// アクティブバッファへ editor_ops の編集操作を適用する。
@@ -10660,6 +10758,9 @@ impl eframe::App for ZaivernApp {
     /// ウィンドウが閉じないまま残る。エージェントを落として PTY は OS に任せる
     /// ([`crate::terminal::abandon`] の説明を参照)。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 終わる前にセッションを保存する — エージェントタブの記録はここでしか
+        // 確実に残せない (走らせたまま閉じても、次回開けば会話を再開できる)。
+        self.persist_session();
         cli::remove_instance_file();
         for s in std::mem::take(&mut self.agents.sessions) {
             crate::terminal::abandon(s);

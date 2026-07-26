@@ -26,6 +26,31 @@ pub struct SessionData {
     /// ワークスペースのルート一覧(絶対パス)。再起動時に全フォルダを復元する。
     /// 旧形式(単一ルート)のファイルでは空 — その場合は起動時のルートを使う。
     pub roots: Vec<String>,
+    /// 走らせていたエージェントタブの記録 (チャット履歴のフォルダ別保存)。
+    /// フォルダを開き直したときに、タブ + 前回スクロールバックを復元し、
+    /// 対応 CLI (claude / codex) は会話を再開する。旧ファイルには無いので空。
+    /// TOML の制約 (テーブル配列は単純値の後) があるため必ず最後のフィールドに置く。
+    pub agents: Vec<AgentSessionRec>,
+}
+
+/// 復元用に保存するエージェントセッション 1 本分の記録。
+///
+/// env は保存しない — プリセットの env にはシークレットが入り得るので、
+/// 復元時に `preset_name` で現在の設定から引き直す (config.rs 側が真実源)。
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AgentSessionRec {
+    /// 起動元プリセット名 (復元時に env を再構成するための照合キー)。
+    pub preset_name: String,
+    /// タブのタイトル ("Claude Code #2" など)。
+    pub title: String,
+    pub icon: String,
+    /// 実際に起動したコマンド (承認モード適用済み)。復元時はこれに再開指定を足す。
+    pub command: String,
+    /// 起動ディレクトリ (絶対パス)。消えていたら現在の作業フォルダで代替する。
+    pub cwd: String,
+    /// 生ログの書き出し先 (絶対パス)。復元後も同じファイルへ追記する。
+    pub log_file: String,
 }
 
 /// `~/.zaivern/sessions/<ルート集合ハッシュhex>.toml` から読む。無ければ None。
@@ -97,6 +122,33 @@ pub fn term_log_path(workspace: &Path, session_id: u64, title: &str) -> PathBuf 
         .take(40)
         .collect();
     term_log_dir(workspace).join(format!("{safe}-{session_id}.log"))
+}
+
+/// セッション復元時にスクロールバックへ流し込む前回ログの上限バイト数。
+/// vt100 のスクロールバックは 5000 行なので、これで十分に埋まる
+/// (ログ全量 (最大 8MB) を流すと起動が重くなるだけで見える行は増えない)。
+pub const REPLAY_TAIL_CAP: usize = 1024 * 1024;
+
+/// 前回ログの末尾を読み出す (復元時のスクロールバック再生用)。
+///
+/// `open_term_log` と同じく `.log.old` (ローテート退避分) → `.log` の順で繋ぎ、
+/// 後ろ `cap` バイトへ切り詰める。切り口がエスケープ列や UTF-8 の途中に
+/// かからないよう、次の改行まで進めてから切る。ログが無ければ空。
+pub fn read_term_log_tail(path: &Path, cap: usize) -> Vec<u8> {
+    let mut raw = std::fs::read(path.with_extension("log.old")).unwrap_or_default();
+    if let Ok(cur) = std::fs::read(path) {
+        raw.extend_from_slice(&cur);
+    }
+    if raw.len() > cap {
+        let from = raw.len() - cap;
+        let cut = raw[from..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| from + i + 1)
+            .unwrap_or(from);
+        raw.drain(..cut);
+    }
+    raw
 }
 
 /// 古いターミナルログの掃除。新しい方から `keep` 本を残して削除する
@@ -283,6 +335,84 @@ mod tests {
         assert_eq!(loaded.sidebar_tab, "");
         assert!(loaded.sidebar_open);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agents_roundtrip_and_old_file_without_agents_still_loads() {
+        let dir = unique_temp_dir("zaivern-session-test", "agents");
+        let workspace = dir.join("ws-agents");
+        let roots = std::slice::from_ref(&workspace);
+
+        let data = SessionData {
+            open_files: vec!["/p/main.rs".into()],
+            agents: vec![
+                AgentSessionRec {
+                    preset_name: "Claude Code".into(),
+                    title: "Claude Code".into(),
+                    icon: "👾".into(),
+                    command: "claude --dangerously-skip-permissions".into(),
+                    cwd: "/p".into(),
+                    log_file: "/logs/Claude_Code-1.log".into(),
+                },
+                AgentSessionRec {
+                    preset_name: "Codex".into(),
+                    title: "Codex #2".into(),
+                    icon: "💡".into(),
+                    command: "codex".into(),
+                    cwd: "/p/サブ".into(),
+                    log_file: "/logs/Codex__2-2.log".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        save_to(&dir, roots, &data);
+        let loaded = load_from(&dir, roots).expect("session should load");
+        assert_eq!(loaded.agents.len(), 2);
+        assert_eq!(loaded.agents[0].preset_name, "Claude Code");
+        assert_eq!(loaded.agents[0].command, "claude --dangerously-skip-permissions");
+        assert_eq!(loaded.agents[1].title, "Codex #2");
+        assert_eq!(loaded.agents[1].cwd, "/p/サブ");
+        assert_eq!(loaded.agents[1].log_file, "/logs/Codex__2-2.log");
+        // open_files などの既存フィールドと共存できる (テーブル配列は最後)
+        assert_eq!(loaded.open_files, vec!["/p/main.rs"]);
+
+        // 旧バージョンのセッション ([[agents]] 無し) も読めること
+        let old = "open_files = [\"/a.rs\"]\nsidebar_open = true\npanel_open = false\n";
+        std::fs::write(session_file_in(&dir, roots), old).expect("write old session");
+        let loaded = load_from(&dir, roots).expect("old session should still load");
+        assert!(loaded.agents.is_empty(), "旧ファイルでは空の agents になる");
+        assert_eq!(loaded.open_files, vec!["/a.rs"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_term_log_tail_concats_old_then_current() {
+        let dir = unique_temp_dir("zaivern-termlog-test", "tail-concat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a-1.log");
+        std::fs::write(log.with_extension("log.old"), b"old-part\n").unwrap();
+        std::fs::write(&log, b"new-part\n").unwrap();
+        // .old が先、本体が後 (時系列順)
+        assert_eq!(read_term_log_tail(&log, 1024), b"old-part\nnew-part\n");
+        // ログが無ければ空 (復元側はこれで resume を諦める)
+        assert!(read_term_log_tail(&dir.join("ghost.log"), 1024).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_term_log_tail_caps_at_line_boundary() {
+        let dir = unique_temp_dir("zaivern-termlog-test", "tail-cap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("b-1.log");
+        std::fs::write(&log, b"line-one\nline-two\nline-three\n").unwrap();
+        // cap 位置が行の途中なら、次の改行まで捨ててから返す
+        let tail = read_term_log_tail(&log, 14); // "-two\nline-three\n" の途中
+        assert_eq!(tail, b"line-three\n");
+        // cap がファイルより大きければ全量そのまま
+        let all = read_term_log_tail(&log, 4096);
+        assert_eq!(all, b"line-one\nline-two\nline-three\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1012,7 +1012,27 @@ fn base64_decode(src: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// セッション復元時、再生した前回スクロールバックの末尾へ入れる区切りバナー。
+/// 先頭で代替画面 (?1049) とスクロール領域・文字属性を平常へ戻す — 前回ログが
+/// TUI の途中で切れていても、バナーと今回の出力が壊れずに描かれるようにする。
+/// `ESC[r` はカーソルをホームへ戻してしまうので、`ESC[999;1H` で最下行へ
+/// 移してから書く (再生した最終行の**後ろ**にバナーが並ぶ)。
+pub const RESTORE_BANNER: &str = "\x1b[?1049l\x1b[r\x1b[0m\x1b[999;1H\r\n\x1b[2m── 前回のセッションここまで / 再開します ──\x1b[0m\r\n";
+
 impl Session {
+    /// 前回セッションの生ログ (PTY 生バイト列) を vt100 パーサへ流し込み、
+    /// 旧スクロールバックを見える状態にする。末尾に [`RESTORE_BANNER`] を足して
+    /// 「どこからが今回か」を分かるようにする。spawn 直後 (エージェントの最初の
+    /// 出力が届く前) に呼ぶ想定 — 読取スレッドとはパーサのロックで排他される。
+    pub fn preload_scrollback(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut p = lock_ok(&self.parser);
+        p.process(bytes);
+        p.process(RESTORE_BANNER.as_bytes());
+    }
+
     pub fn spawn(id: u64, spec: SpawnSpec, ctx: egui::Context) -> Result<Self, String> {
         let (rows, cols) = (30u16, 110u16);
         let pty = native_pty_system();
@@ -2135,6 +2155,46 @@ mod tests {
         }
         // 呼び出し後は scrollback 位置が元 (0) に戻っている
         assert_eq!(p.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn replayed_log_bytes_rebuild_scrollback_with_banner() {
+        // セッション復元の心臓部: 生ログのバイト列を process へ流すだけで
+        // 前回のスクロールバックが再構成される (PTY 不要・in-process)。
+        let mut p = vt100::Parser::new(5, 60, 100);
+        for i in 0..12 {
+            p.process(format!("\x1b[1m前回の出力 {:02}\x1b[0m\r\n", i).as_bytes());
+        }
+        p.process(super::RESTORE_BANNER.as_bytes());
+        let lines = all_terminal_lines(&mut p);
+        assert!(
+            lines.iter().any(|l| l.contains("前回の出力 00")),
+            "画面外へ流れた行もスクロールバックに残る: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("前回のセッションここまで")),
+            "区切りバナーが最後に見える: {lines:?}"
+        );
+        // バナーは前回分の後 (= ここから下が今回のライブ出力になる)
+        let old = lines.iter().position(|l| l.contains("前回の出力 11")).unwrap();
+        let banner = lines
+            .iter()
+            .position(|l| l.contains("前回のセッションここまで"))
+            .unwrap();
+        assert!(banner > old, "バナーは再生分の末尾: old={old} banner={banner}");
+    }
+
+    #[test]
+    fn replay_banner_recovers_from_alternate_screen_log() {
+        // 前回ログが代替画面 (?1049h) の途中で切れていても、バナー先頭の
+        // ?1049l で平常へ戻り、以降の出力が普通のグリッドへ描かれる。
+        let mut p = vt100::Parser::new(5, 60, 100);
+        p.process(b"scrollback-line\r\n\x1b[?1049h\x1b[2JTUI!");
+        p.process(super::RESTORE_BANNER.as_bytes());
+        assert!(!p.screen().alternate_screen(), "代替画面から抜けている");
+        p.process(b"live-output\r\n");
+        let lines = all_terminal_lines(&mut p);
+        assert!(lines.iter().any(|l| l.contains("live-output")), "{lines:?}");
     }
 
     #[test]
