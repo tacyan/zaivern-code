@@ -52,6 +52,14 @@ use crate::theme_json;
 use crate::tutorial::{self, AnchorId};
 use crate::voice;
 
+/// エージェントデッキ (縦 1 本のエージェント管理画面)。
+///
+/// main.rs は他所有なので `mod deck;` を足せない。coordinator.rs が quota.rs を
+/// 抱えているのと同じ流儀で、ここから実体を読み込む
+/// (呼び出し側は `crate::app::deck::…` で参照できる)。
+#[path = "deck.rs"]
+pub mod deck;
+
 #[derive(PartialEq, Clone, Copy)]
 enum SidebarTab {
     Files,
@@ -496,6 +504,71 @@ fn session_sidebar_effect(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cockpit のレイアウト計算 (純関数)
+//
+// 「割り当てられた領域に必ず収まる」ことを egui を起こさずに固定するため、
+// 幾何だけを切り出してある。ここが崩れると右端でボタンが切れたり、
+// 見出しの下に何百 px もの空白が残ったりする (どちらも実際に起きた)。
+// ---------------------------------------------------------------------------
+
+/// タイル同士の間隔。
+const GRID_SPACING: f32 = 10.0;
+/// 2 列に割るのに要る最小幅。これ未満は 1 列 (エディタと分割したときなど)。
+const GRID_TWO_COL_W: f32 = 640.0;
+/// タイルの最低高さ。
+const GRID_MIN_CELL_H: f32 = 150.0;
+/// 見出し行を「アイコンだけ」に縮退させる幅のしきい値。
+const COCKPIT_HEADER_COMPACT_W: f32 = 820.0;
+
+/// Cockpit の見出し行を縮退させるか (純関数)。
+fn cockpit_header_compact(avail_w: f32) -> bool {
+    avail_w < COCKPIT_HEADER_COMPACT_W
+}
+
+/// 空状態カードを利用可能領域の**中央**へ置くための上詰め (純関数)。
+///
+/// 固定割合 (旧実装の `available_height() * 0.25`) だと、上のセクションの高さが
+/// 変わるたびにカードが上下し、見出しとの間に空白が残る。
+fn empty_state_top_pad(avail_h: f32, content_h: f32) -> f32 {
+    ((avail_h - content_h) * 0.5).max(0.0)
+}
+
+/// 空状態の起動ボタン幅 (純関数)。狭い窓でも右端からはみ出さない。
+fn empty_state_button_width(avail_w: f32) -> f32 {
+    (avail_w - 24.0).clamp(120.0, 280.0)
+}
+
+/// タイル格子の寸法。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GridMetrics {
+    cols: usize,
+    rows: usize,
+    cell_w: f32,
+    cell_h: f32,
+}
+
+/// 与えられた領域に n 枚のタイルを敷くときの寸法 (純関数)。
+///
+/// 不変条件: **総幅は `avail.x` を超えない**。超えると右端のタイルが切れる。
+fn cockpit_grid_metrics(avail: egui::Vec2, n: usize) -> GridMetrics {
+    let cols = if n <= 1 || avail.x < GRID_TWO_COL_W {
+        1
+    } else {
+        2
+    };
+    let rows = n.div_ceil(cols).max(1);
+    let cell_w = ((avail.x - GRID_SPACING * (cols as f32 - 1.0)) / cols as f32 - 4.0).max(1.0);
+    let cell_h = (((avail.y - GRID_SPACING * (rows as f32 - 1.0)) / rows as f32) - 4.0)
+        .max(GRID_MIN_CELL_H);
+    GridMetrics {
+        cols,
+        rows,
+        cell_w,
+        cell_h,
+    }
+}
+
 /// 保存前クリーンアップの本体 (純関数)。
 ///
 /// 返り値が `None` なら本文が 1 バイトも変わっていない = 書き込みも undo 積みも
@@ -904,6 +977,7 @@ impl Subview {
             Subview::Session(id) => trf("エージェント #{id} の画面", &[("id", id.to_string())]),
             Subview::Panel("editor") => tr("エディタ"),
             Subview::Panel("cockpit") => tr("コックピット"),
+            Subview::Panel("deck") => tr("エージェントデッキ"),
             Subview::Panel("sidebar") => tr("サイドバー"),
             Subview::Panel("terminal") => tr("ターミナルパネル"),
             Subview::Panel(other) => (*other).to_string(),
@@ -1536,6 +1610,11 @@ pub struct ZaivernApp {
     kanban: bool,
     /// 看板画面の UI 状態 (ブロードキャスト/指示の入力バッファ等)
     kanban_state: kanban::KanbanState,
+    /// エージェントデッキ (縦 1 本でエージェントを管理する画面)。
+    /// Cockpit / 看板と同格の中央画面モードで、3 つ同時には出さない。
+    deck: bool,
+    /// デッキ画面の UI 状態 (選択・レイアウト・フィルタ・追跡)
+    deck_state: deck::DeckState,
     /// Markdown/HTML ファイルをレンダリング表示するモード (Cockpit の編集ペインでも有効)
     md_preview: bool,
     /// プレビューが参照するローカル画像のテクスチャキャッシュ
@@ -2103,9 +2182,11 @@ impl ZaivernApp {
             pending_prompts: Vec::new(),
             race: race::RacePanel::new(),
             highlighter: Highlighter::new(),
-            cockpit: false,
+            cockpit: true, // TEMP-SHOT
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
+            deck: false,
+            deck_state: deck::DeckState::default(),
             md_preview: false,
             md_images: markdown::ImageCache::default(),
             md_pre_cache: None,
@@ -6480,6 +6561,7 @@ impl ZaivernApp {
             Cmd::ToggleTerminal
             | Cmd::ToggleCockpit
             | Cmd::ToggleKanban
+            | Cmd::ToggleDeck
             | Cmd::OpenAgentPicker
             | Cmd::NewTask
             | Cmd::OpenRace
@@ -6977,14 +7059,24 @@ impl ZaivernApp {
                 self.cockpit = !self.cockpit;
                 if self.cockpit {
                     self.kanban = false;
+                    self.deck = false;
                 }
             }
             Cmd::ToggleKanban => {
                 self.kanban = !self.kanban;
                 if self.kanban {
                     self.cockpit = false;
+                    self.deck = false;
                     // 看板はターミナルパネル内のタブなので、パネルごと出す
                     self.agents.panel_open = true;
+                }
+            }
+            // エージェントデッキは Cockpit と同格の中央画面。3 つ同時には出さない。
+            Cmd::ToggleDeck => {
+                self.deck = !self.deck;
+                if self.deck {
+                    self.cockpit = false;
+                    self.kanban = false;
                 }
             }
             Cmd::OpenAgentPicker => self.agent_picker.open(ctx),
@@ -7697,6 +7789,9 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.get(BindAction::ToggleKanban)) {
             cmds.push(Cmd::ToggleKanban);
+        }
+        if consume(ctx, self.keys.get(BindAction::ToggleDeck)) {
+            cmds.push(Cmd::ToggleDeck);
         }
         if consume(ctx, self.keys.get(BindAction::ToggleMdPreview)) {
             cmds.push(Cmd::ToggleMdPreview);
@@ -9704,7 +9799,9 @@ impl ZaivernApp {
 
     fn terminal_panel(&mut self, ctx: &egui::Context) {
         let theme = self.theme.clone();
-        let show = self.agents.panel_open && !self.cockpit;
+        // デッキ表示中も畳む: 同じ端末を 2 か所で描かせない (egui の Id が衝突する)
+        // うえ、デッキは端末を全高で見せる画面なので下部パネルは邪魔になる。
+        let show = self.agents.panel_open && !self.cockpit && !self.deck;
         let mut launch: Option<usize> = None;
         let mut restart: Option<usize> = None;
         let mut remove: Option<usize> = None;
@@ -10233,29 +10330,40 @@ impl ZaivernApp {
         theme: &Theme,
         acts: &mut CockpitActions,
     ) {
+        // 幅が足りないとき (エディタと分割している / 窓が狭い) は、
+        // 文字を落としてアイコンだけにする。右端で切れて押せなくなるのを防ぐ。
+        let compact = cockpit_header_compact(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("🎛 Agent Cockpit")
-                    .size(20.0)
+                RichText::new(if compact { "🎛" } else { "🎛 Agent Cockpit" })
+                    .size(if compact { 16.0 } else { 20.0 })
                     .strong()
                     .color(theme.accent),
             );
             let running = self.agents.running_count();
             let total = self.agents.sessions.len();
             ui.label(
-                RichText::new(trf(
-                    "{running} 稼働中 / {total} セッション",
-                    &[("running", running.to_string()), ("total", total.to_string())],
-                ))
+                RichText::new(if compact {
+                    format!("{running}/{total}")
+                } else {
+                    trf(
+                        "{running} 稼働中 / {total} セッション",
+                        &[("running", running.to_string()), ("total", total.to_string())],
+                    )
+                })
                 .color(theme.text_dim),
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(tr("✕ 閉じる")).clicked() {
+                if ui
+                    .button(if compact { "✕".to_string() } else { tr("✕ 閉じる") })
+                    .on_hover_text(tr("Cockpit を閉じる"))
+                    .clicked()
+                {
                     self.cockpit = false;
                 }
                 if ui
-                    .button(tr("📋 看板"))
+                    .button(if compact { "📋".to_string() } else { tr("📋 看板") })
                     .on_hover_text(tr("フリート看板へ切替"))
                     .clicked()
                 {
@@ -10265,7 +10373,10 @@ impl ZaivernApp {
                     self.agents.panel_open = true;
                 }
                 if ui
-                    .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
+                    .button(
+                        RichText::new(if compact { "🛡".to_string() } else { tr("🛡 全切替") })
+                            .color(theme.ok),
+                    )
                     .on_hover_text(tr(
                         "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
                          Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
@@ -10274,7 +10385,7 @@ impl ZaivernApp {
                 {
                     acts.cycle_all = true;
                 }
-                ui.menu_button("＋ Agent", |ui| {
+                ui.menu_button(if compact { "＋" } else { "＋ Agent" }, |ui| {
                     for (i, p) in self.cfg.agents.iter().enumerate() {
                         if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
                             acts.launch = Some(i);
@@ -10307,34 +10418,38 @@ impl ZaivernApp {
                     acts.voice_all = true;
                 }
             });
-
-            // ── エージェント宛てコンポーザ (複数行・宛先つき) ──
-            //
-            // 1 行のブロードキャスト欄を置き換えたもの。**宛先を選べる**のが要点で、
-            // 「1 体に向けたレビュー指示が全エージェントへ飛ぶ」漏れをここで止める。
-            // 下書きは宛先ごとに分かれて残るので、切り替えても書きかけが消えない。
-            let target: Option<(u64, String)> = self
-                .agents
-                .sessions
-                .get(self.agents.active)
-                .map(|s| (s.id, format!("{} {}", s.icon, s.title)));
-            let composer = panels::agent_composer_ui(
-                ui,
-                theme,
-                &mut self.agent_input_buf,
-                target.as_ref().map(|(id, t)| (*id, t.as_str())),
-            );
-            match composer {
-                panels::ComposerAction::Send(t) => acts.broadcast = Some(t),
-                panels::ComposerAction::SendTo(id, t) => acts.send_to = Some((id, t)),
-                panels::ComposerAction::Cancel => {
-                    // 入力欄からフォーカスを外すだけ (下書きは消さない)。
-                    // ID を当てにせず egui のテキスト入力そのものを畳む。
-                    ui.memory_mut(|m| m.stop_text_input());
-                }
-                panels::ComposerAction::None => {}
-            }
         });
+
+        // ── エージェント宛てコンポーザ (複数行・宛先つき) ──
+        //
+        // 1 行のブロードキャスト欄を置き換えたもの。**宛先を選べる**のが要点で、
+        // 「1 体に向けたレビュー指示が全エージェントへ飛ぶ」漏れをここで止める。
+        // 下書きは宛先ごとに分かれて残るので、切り替えても書きかけが消えない。
+        //
+        // **見出し行 (`ui.horizontal`) の外に置く。** 中に入れると複数行の
+        // テキスト欄が横並びの 1 行に押し込まれ、右端の細い帯へ折り返されて
+        // 見出しの下に数百 px の空白ができる (ボタンも右端で切れる)。
+        let target: Option<(u64, String)> = self
+            .agents
+            .sessions
+            .get(self.agents.active)
+            .map(|s| (s.id, format!("{} {}", s.icon, s.title)));
+        let composer = panels::agent_composer_ui(
+            ui,
+            theme,
+            &mut self.agent_input_buf,
+            target.as_ref().map(|(id, t)| (*id, t.as_str())),
+        );
+        match composer {
+            panels::ComposerAction::Send(t) => acts.broadcast = Some(t),
+            panels::ComposerAction::SendTo(id, t) => acts.send_to = Some((id, t)),
+            panels::ComposerAction::Cancel => {
+                // 入力欄からフォーカスを外すだけ (下書きは消さない)。
+                // ID を当てにせず egui のテキスト入力そのものを畳む。
+                ui.memory_mut(|m| m.stop_text_input());
+            }
+            panels::ComposerAction::None => {}
+        }
     }
 
     /// Cockpit: 監視役 LLM (スーパーエージェント) の選択セクション。
@@ -10543,8 +10658,15 @@ impl ZaivernApp {
     ) {
         let n = self.agents.sessions.len();
         if n == 0 {
+            // 空状態は**利用可能領域の中央**に 1 枚だけ置く。固定割合 (0.25) で
+            // 押し下げると、上のセクションが短い日ほど下へ落ちて上に空白が残る。
+            let presets: Vec<config::AgentPreset> = self.cfg.agents.clone();
+            let avail_h = ui.available_height();
+            let btn_h = 34.0 + 4.0;
+            let content_h = 52.0 + 22.0 + 18.0 + 12.0 + btn_h * presets.len() as f32;
+            let btn_w = empty_state_button_width(ui.available_width());
             ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() * 0.25);
+                ui.add_space(empty_state_top_pad(avail_h, content_h));
                 ui.label(RichText::new("🎛").size(52.0));
                 ui.label(
                     RichText::new(tr("エージェントがまだいません"))
@@ -10556,10 +10678,10 @@ impl ZaivernApp {
                         .color(theme.text_dim),
                 );
                 ui.add_space(12.0);
-                for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
+                for (i, p) in presets.into_iter().enumerate() {
                     if ui
                         .add_sized(
-                            [280.0, 34.0],
+                            [btn_w, 34.0],
                             egui::Button::new(format!("{} {}", p.icon, p.name)),
                         )
                         .clicked()
@@ -10571,14 +10693,9 @@ impl ZaivernApp {
             return;
         }
 
-        let spacing = 10.0;
         let avail = ui.available_size();
-        // 編集ペインとの分割で幅が狭いときは 1 列に落とす
-        let cols = if n <= 1 || avail.x < 640.0 { 1 } else { 2 };
-        let rows = n.div_ceil(cols);
-        let cell_w = (avail.x - spacing * (cols as f32 - 1.0)) / cols as f32 - 4.0;
-        let cell_h = (((avail.y - spacing * (rows as f32 - 1.0)) / rows as f32) - 4.0)
-            .max(150.0);
+        let g = cockpit_grid_metrics(avail, n);
+        let (cols, rows, cell_w, cell_h) = (g.cols, g.rows, g.cell_w, g.cell_h);
         let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
 
         egui::ScrollArea::vertical()
@@ -11160,6 +11277,258 @@ impl ZaivernApp {
         {
             self.kanban = false;
         }
+    }
+
+    // ─── UI: エージェントデッキ (deck) ──────────────────────────────
+    //
+    // 看板と同じ橋渡し構造: ここは「材料を写す」「返ってきた操作を実行する」だけ。
+    // 判断と描画は deck.rs 側にある。
+
+    /// デッキに並べる過去の会話 (稼働中と重複するものは deck 側が落とす)。
+    ///
+    /// 走査そのものはサイドバーと同じ [`session_picker::SidebarState`] が
+    /// 別スレッドへ逃がしている (TTL 付き)。ここはキャッシュを読むだけ。
+    fn deck_past_rows(&mut self) -> (Vec<deck::PastRow>, bool) {
+        self.refresh_session_folders();
+        self.sidebar_sessions.refresh_if_stale(&self.sess_folders);
+        let now = std::time::SystemTime::now();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut out: Vec<session_picker::PastSession> = Vec::new();
+        for f in &self.sess_folders {
+            for s in self.sidebar_sessions.sessions_for(f) {
+                if seen.insert((s.agent_bin.clone(), s.id.clone())) {
+                    out.push(s.clone());
+                }
+            }
+        }
+        // 新しい順。件数はデッキの縦リストが破綻しない範囲で切る。
+        out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
+        out.truncate(session_picker::MAX_RESULTS);
+        let rows = out
+            .into_iter()
+            .map(|s| deck::PastRow {
+                age: session_picker::relative_age(now, s.modified),
+                mark: panels::agent_mark(&s.agent_bin),
+                session: s,
+            })
+            .collect();
+        (rows, self.sidebar_sessions.loading())
+    }
+
+    fn deck_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let theme = self.theme.clone();
+        let active = self.agents.active;
+        let now_ms = self.supervisor.elapsed_ms();
+        // PTY 画面の読み直しはデッキが「今」と言ったフレームだけ (看板と同じ作法)。
+        let fresh_tail = self.deck_state.sample_due(now_ms);
+        let (past, scanning) = self.deck_past_rows();
+
+        let live: Vec<deck::LiveRow> = self
+            .agents
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let id = s.id;
+                deck::LiveRow {
+                    idx: i,
+                    id,
+                    icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
+                    title: s.title.clone(),
+                    cwd: s.cwd.clone(),
+                    command: s.command.clone(),
+                    running: s.running(),
+                    attention: s.attention && s.running(),
+                    unread: s.has_unread(),
+                    rate_limited: s.rate_limited.is_some(),
+                    approvals: self
+                        .agents
+                        .approvals
+                        .pending()
+                        .filter(|r| r.agent_session_id == id)
+                        .count(),
+                    sup: self.supervisor.state_of(id),
+                    active: i == active,
+                    uptime: s.uptime(),
+                    tail_lines: if fresh_tail {
+                        s.screen_tail_lines(10, 180)
+                    } else {
+                        Vec::new()
+                    },
+                }
+            })
+            .collect();
+        let launchers: Vec<deck::LauncherRow> = self
+            .cfg
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(i, p)| deck::LauncherRow {
+                idx: i,
+                icon: p.icon.clone(),
+                name: p.name.clone(),
+            })
+            .collect();
+        // 使用量の助言 (最も深刻なものだけ。無ければ出さない)。
+        let quota = {
+            let a = self.quota.worst_advice(std::time::SystemTime::now());
+            let msg = a.message();
+            (!msg.is_empty()).then(|| (msg.to_string(), a.severity()))
+        };
+
+        // ライブ端末は Cockpit / 看板とまったく同じ道 (`terminal::draw`) を通す。
+        let mini_font = (self.cfg.terminal_font_size - 2.0).clamp(8.0, 16.0);
+        let dead: HashSet<u64> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| self.frame_guard.is_quarantined(&Subview::Session(*id)))
+            .collect();
+        let sessions = &mut self.agents.sessions;
+        let live_theme = theme.clone();
+        let mut draw = |ui: &mut egui::Ui, id: u64| -> Option<egui::Response> {
+            let s = sessions.iter_mut().find(|s| s.id == id)?;
+            if dead.contains(&id) {
+                return None;
+            }
+            // 1 枚が壊れてもフレーム全体を捨てないための印 (Cockpit と同じ)
+            Some(draw_subview(Subview::Session(id), || {
+                terminal::draw(ui, s, &live_theme, mini_font, true, true, false)
+            }))
+        };
+        let acts = deck::ui(
+            &mut self.deck_state,
+            ui,
+            &theme,
+            &live,
+            &past,
+            &launchers,
+            quota,
+            now_ms,
+            fresh_tail,
+            scanning,
+            &mut self.agent_input_buf,
+            &mut draw,
+        );
+
+        for act in acts {
+            match act {
+                deck::DeckAction::Select(i) => {
+                    if i < self.agents.sessions.len() {
+                        self.agents.active = i;
+                    }
+                }
+                deck::DeckAction::Launch(i) => self.launch_preset(i, ctx),
+                deck::DeckAction::Resume(s) => {
+                    // 再開はサイドバーとまったく同じ純関数を通す (判断を二重に持たない)
+                    self.apply_session_sidebar(session_picker::SidebarAction::Resume(*s), ctx);
+                }
+                deck::DeckAction::Rename { id, title } => {
+                    if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == id) {
+                        s.title = title;
+                    }
+                    self.persist_session();
+                }
+                deck::DeckAction::Duplicate(i) => self.duplicate_agent(i, ctx),
+                deck::DeckAction::Stop(i) => self.close_agent(i),
+                deck::DeckAction::Restart(i) => {
+                    if let Err(e) = self.agents.restart(i, ctx) {
+                        self.toast(e, false);
+                    }
+                }
+                deck::DeckAction::Reorder { from, to } => self.reorder_agent(from, to),
+                deck::DeckAction::Send { id, text } => {
+                    let sent = self.agents.sessions.iter_mut().find(|s| s.id == id).map(|s| {
+                        // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)
+                        s.note_user_input();
+                        let mut t = text.clone();
+                        t.push('\r');
+                        (s.send_text(&t), s.title.clone())
+                    });
+                    match sent {
+                        Some((true, title)) => {
+                            self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true)
+                        }
+                        Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
+                        None => {}
+                    }
+                }
+                deck::DeckAction::Broadcast(text) => {
+                    self.agents.broadcast(&text);
+                    self.toast(
+                        trf(
+                            "📣 {n} セッションへ送信しました",
+                            &[("n", self.agents.running_count().to_string())],
+                        ),
+                        true,
+                    );
+                }
+                deck::DeckAction::Close => self.deck = false,
+            }
+        }
+
+        // ESC で閉じる (入力欄・端末にフォーカスが無いときだけ)。
+        if self.deck
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            && ctx.memory(|m| m.focused().is_none())
+        {
+            self.deck = false;
+        }
+    }
+
+    /// セッション `i` と同じプリセット・同じ作業ディレクトリでもう 1 本起こす。
+    ///
+    /// 起動コマンドは**プリセットの素の値**を使う。走っているセッションの
+    /// コマンドをそのまま複製すると `--resume <id>` が付いたままになり、
+    /// 「同じ会話を 2 枚開く」事故になるため。
+    fn duplicate_agent(&mut self, i: usize, ctx: &egui::Context) {
+        let Some(s) = self.agents.sessions.get(i) else {
+            return;
+        };
+        let (preset_name, cwd, command) = (s.preset_name.clone(), s.cwd.clone(), s.command.clone());
+        let idx = self
+            .cfg
+            .agents
+            .iter()
+            .position(|p| p.name == preset_name)
+            .or_else(|| {
+                // プリセット名が変わっていても、同じ CLI のプリセットがあれば拾う
+                let bin = agents::spec_for_command(&command).map(|sp| sp.bin)?;
+                self.cfg
+                    .agents
+                    .iter()
+                    .position(|p| agents::spec_for_command(&p.command).is_some_and(|x| x.bin == bin))
+            });
+        match idx {
+            Some(n) => {
+                let cmd = self.cfg.agents[n].command.clone();
+                self.launch_preset_with(n, cmd, &cwd, ctx);
+            }
+            None => self.toast(
+                trf(
+                    "複製できません: {name} のプリセットが見つかりません",
+                    &[("name", preset_name)],
+                ),
+                false,
+            ),
+        }
+    }
+
+    /// セッションの並び替え (デッキの ⌥↑ / ⌥↓)。アクティブの指し先も付け替える。
+    fn reorder_agent(&mut self, from: usize, to: usize) {
+        let n = self.agents.sessions.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        self.agents.sessions.swap(from, to);
+        // 紫枠 (アクティブ) は「同じセッション」を指し続ける
+        if self.agents.active == from {
+            self.agents.active = to;
+        } else if self.agents.active == to {
+            self.agents.active = from;
+        }
+        self.persist_session();
     }
 
     // ─── UI: editor ─────────────────────────────────────────────────
@@ -12895,6 +13264,12 @@ impl ZaivernApp {
             ("🖥".into(), tr("ターミナル表示切替"), "⌘J".into(), Cmd::ToggleTerminal),
             ("🎛".into(), tr("Cockpit 切替"), "⌘⇧C".into(), Cmd::ToggleCockpit),
             ("📋".into(), tr("フリート看板 切替"), "⌘⇧K".into(), Cmd::ToggleKanban),
+            (
+                deck::DECK_ICON.into(),
+                tr("エージェントデッキ"),
+                "⌥⌘D".into(),
+                Cmd::ToggleDeck,
+            ),
             (
                 "➕".into(),
                 tr("エージェントを追加 (対応 CLI の一覧から選ぶ)"),
@@ -14660,6 +15035,7 @@ impl ZaivernApp {
             "git" => Some(Cmd::OpenGitPanel),
             "cockpit" => Some(Cmd::ToggleCockpit),
             "kanban" => Some(Cmd::ToggleKanban),
+            "deck" => Some(Cmd::ToggleDeck),
             "new_task" => Some(Cmd::NewTask),
             "agent_message" => Some(Cmd::SendAgentMessage),
             "font_inc" => Some(Cmd::FontInc),
@@ -16354,7 +16730,7 @@ impl ZaivernApp {
         // 表示中のアクティブセッションを既読にする。未読 (◆) は
         // 「見ていない間に意味的な出力が変わった」セッションだけに残る。
         // 看板タブ表示中はパネルに端末が見えていないので既読にしない。
-        if (self.agents.panel_open && !self.kanban) || self.cockpit {
+        if (self.agents.panel_open && !self.kanban && !self.deck) || self.cockpit || self.deck {
             let active = self.agents.active;
             if let Some(s) = self.agents.sessions.get_mut(active) {
                 s.mark_read();
@@ -16402,7 +16778,13 @@ impl ZaivernApp {
             .show(ctx, |ui| {
                 // 看板はここではなくターミナルパネル内の「📋 看板」タブで描く
                 // (terminal_panel 参照)。エディタと同時に見えるようにするため。
-                if self.cockpit {
+                //
+                // デッキは選択したセッションの端末を**全高**で見せる画面なので、
+                // Cockpit と同じ中央パネル全面に描く (下部端末パネルは畳む)。
+                if self.deck {
+                    let ctx = ui.ctx().clone();
+                    self.guarded_ui(Subview::Panel("deck"), ui, |me, ui| me.deck_ui(ui, &ctx));
+                } else if self.cockpit {
                     let ctx = ui.ctx().clone();
                     // ファイルを開いていれば左に編集ペインを並べて出す。
                     // Cockpit との切り替え無しでファイルが見えるようにするため。
@@ -17348,6 +17730,7 @@ impl ZaivernApp {
             terminal_open: self.agents.panel_open,
             cockpit_open: self.cockpit,
             kanban_open: self.kanban,
+            deck_open: self.deck,
             problems_open: self.problems_open,
             fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
                 || self.fake_fullscreen.is_some(),
@@ -18288,6 +18671,7 @@ fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
         (tr("新しいターミナル"), format_shortcut(keys.get(BindAction::NewTerminal))),
         (tr("Cockpit 切替"), format_shortcut(keys.get(BindAction::ToggleCockpit))),
         (tr("フリート看板 切替"), format_shortcut(keys.get(BindAction::ToggleKanban))),
+        (tr("エージェントデッキ 切替"), format_shortcut(keys.get(BindAction::ToggleDeck))),
         (tr("Markdown プレビュー"), format_shortcut(keys.get(BindAction::ToggleMdPreview))),
         (tr("エージェント起動"), format_shortcut(keys.get(BindAction::NewAgent))),
         (tr("ビルド タスクの実行"), format_shortcut(keys.get(BindAction::RunBuildTask))),
@@ -21139,6 +21523,8 @@ mod wave2_tests {
             "Cmd::MultiPaste",
             "Cmd::ReopenWithEncoding",
             "Cmd::SaveWithEncoding",
+            // ── エージェントデッキ ──
+            "Cmd::ToggleDeck",
         ] {
             assert!(list.contains(c), "{c} がコマンドパレットに無い");
             assert!(router.contains(c), "{c} のディスパッチが無い");
@@ -21159,7 +21545,7 @@ mod glyph_tests {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
         const UI_SYMBOLS: &str = "📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
-                                  💬📊⛔🔁·↩▸▾🔎◆\
+                                  💬📊⛔🔁·↩▸▾🔎◆📇\
                                   🔍📡🖱📦🍚🌀🔷🔶🕊👷🐦🅰🌊⌘➡🔩🌙🎏🎐🐉💠";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);
@@ -21986,6 +22372,154 @@ mod tutorial_wiring_tests {
             .find("self.schedule_idle_repaint(ctx);")
             .expect("アイドル予約がある");
         assert!(tick < idle, "ツアーはアイドル予約より先でなければならない");
+    }
+}
+
+/// Cockpit のレイアウト計算。
+///
+/// 実際に壊れていた 3 点を数値で固定する:
+/// ① 見出しの下に数百 px の空白ができる (複数行コンポーザを横並びの見出し行へ
+///    入れていたため、右端の細い帯に折り返されて行の高さが膨らんでいた)
+/// ② 空状態の案内が画面のかなり下に落ちる (固定割合で押し下げていた)
+/// ③ 右端でボタン・タイルが切れる
+#[cfg(test)]
+mod cockpit_layout_tests {
+    use super::*;
+
+    /// タイルの総幅は、どんな幅・枚数でも割り当てを超えない。
+    #[test]
+    fn グリッドは可用幅からはみ出さない() {
+        for w in [320.0_f32, 480.0, 639.0, 640.0, 900.0, 1440.0, 2560.0] {
+            for h in [200.0_f32, 600.0, 1200.0] {
+                for n in 1..=9usize {
+                    let g = cockpit_grid_metrics(egui::vec2(w, h), n);
+                    let total = g.cell_w * g.cols as f32
+                        + GRID_SPACING * (g.cols as f32 - 1.0);
+                    assert!(
+                        total <= w,
+                        "w={w} h={h} n={n}: 総幅 {total} が可用幅 {w} を超えた"
+                    );
+                    assert!(g.cell_w > 0.0 && g.cell_h >= GRID_MIN_CELL_H);
+                    assert!(g.cols * g.rows >= n, "全部のタイルが載らない");
+                }
+            }
+        }
+    }
+
+    /// 狭いときは 1 列へ落ちる (2 列のままだとタイルが潰れて中身が読めない)。
+    #[test]
+    fn 狭い窓では一列に落ちる() {
+        assert_eq!(cockpit_grid_metrics(egui::vec2(639.0, 800.0), 4).cols, 1);
+        assert_eq!(cockpit_grid_metrics(egui::vec2(640.0, 800.0), 4).cols, 2);
+        // 1 枚しかないときは幅があっても 1 列 (半分空けない)
+        assert_eq!(cockpit_grid_metrics(egui::vec2(1600.0, 800.0), 1).cols, 1);
+    }
+
+    /// 空状態は可用領域の中央に来る (上に巨大な空白を残さない)。
+    #[test]
+    fn 空状態は中央に置かれる() {
+        // 高さ 700 に 200 の中身 → 上下に 250 ずつ
+        assert_eq!(empty_state_top_pad(700.0, 200.0), 250.0);
+        // 中身の方が高ければ押し下げない (先頭から描いてスクロールに任せる)
+        assert_eq!(empty_state_top_pad(180.0, 400.0), 0.0);
+        // 旧実装 (可用高の 25% 固定) との違い: 中身が小さいほど深く中央へ寄る
+        assert!(empty_state_top_pad(1000.0, 100.0) > 1000.0 * 0.25);
+    }
+
+    /// 空状態のボタンは可用幅に収まる。
+    #[test]
+    fn 空状態のボタンは可用幅に収まる() {
+        for w in [140.0_f32, 200.0, 400.0, 1200.0] {
+            let b = empty_state_button_width(w);
+            assert!(b <= w.max(120.0), "w={w}: ボタン幅 {b} がはみ出す");
+        }
+        assert_eq!(empty_state_button_width(1200.0), 280.0, "広くても広げすぎない");
+        assert_eq!(empty_state_button_width(100.0), 120.0, "下限は保つ");
+    }
+
+    /// 見出し行は狭いときアイコンだけに縮退する。
+    #[test]
+    fn 見出しは狭いとアイコンだけになる() {
+        assert!(cockpit_header_compact(600.0));
+        assert!(cockpit_header_compact(COCKPIT_HEADER_COMPACT_W - 1.0));
+        assert!(!cockpit_header_compact(COCKPIT_HEADER_COMPACT_W));
+        assert!(!cockpit_header_compact(1600.0));
+    }
+
+    /// コンポーザは見出し行 (`ui.horizontal`) の**外**で描く。
+    ///
+    /// 中に入れると複数行のテキスト欄が横並びに押し込まれ、右端の細い帯へ
+    /// 折り返されて見出しの下に数百 px の空白ができる (実際に起きた不具合)。
+    #[test]
+    fn コンポーザは見出し行の外で描く() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn cockpit_header_ui(")
+            .nth(1)
+            .expect("cockpit_header_ui がある");
+        let head = &body[..body.find("\n    /// Cockpit: 監視役").unwrap_or(body.len())];
+        let close = head
+            .find("\n        });\n")
+            .expect("見出し行 (ui.horizontal) を閉じている");
+        let composer = head
+            .find("panels::agent_composer_ui(")
+            .expect("コンポーザを描いている");
+        assert!(
+            close < composer,
+            "コンポーザが見出しの ui.horizontal の中にある (行の高さが膨らむ)"
+        );
+    }
+}
+
+/// エージェントデッキの配線 (ソースを読む回帰テスト)。
+///
+/// デッキは端末を**自前で全高に描く**画面なので、下部ターミナルパネルと
+/// 同時に出すと同じセッションを 1 フレームで 2 回描いてしまう (egui の Id 衝突)。
+/// また、無条件の `request_repaint` を入れるとアイドル時の CPU が跳ねる。
+/// どちらも見た目には出にくいので、ソースの形で固定する。
+#[cfg(test)]
+mod deck_wiring_tests {
+    /// デッキ表示中は下部ターミナルパネルを畳む。
+    #[test]
+    fn デッキ表示中は端末パネルを出さない() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn terminal_panel(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("terminal_panel がある");
+        let head = &body[..body.find("let panel =").unwrap_or(body.len())];
+        assert!(
+            head.contains("!self.cockpit && !self.deck"),
+            "デッキを開いている間も端末パネルが出る配線になっている"
+        );
+    }
+
+    /// デッキの端末描画は Cockpit / 看板と同じ隔離印を通す。
+    #[test]
+    fn デッキの端末描画はフレームガードを通す() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn deck_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("deck_ui がある");
+        let head = &body[..body.find("for act in acts {").unwrap_or(body.len())];
+        assert!(head.contains("draw_subview(Subview::Session(id)"));
+        assert!(head.contains("terminal::draw("));
+        // PTY の読み直しはサンプリング周期のフレームだけ
+        assert!(head.contains("self.deck_state.sample_due(now_ms)"));
+        assert!(head.contains("if fresh_tail {"));
+    }
+
+    /// deck.rs は無条件の `request_repaint` を持たない
+    /// (予約は `deck_repaint_ms` が `Some` を返したときだけ)。
+    #[test]
+    fn デッキは無条件の再描画予約を持たない() {
+        let src = include_str!("deck.rs");
+        assert!(
+            !src.contains("request_repaint()"),
+            "deck.rs に無条件の request_repaint がある (アイドル時の CPU が跳ねる)"
+        );
+        assert!(src.contains("if let Some(ms) = deck_repaint_ms("));
     }
 }
 

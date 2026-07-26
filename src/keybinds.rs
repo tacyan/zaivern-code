@@ -25,6 +25,8 @@ pub enum BindAction {
     ToggleCockpit,
     /// フリート看板 (エージェントのカンバン画面) 切替
     ToggleKanban,
+    /// エージェントデッキ (縦 1 本のエージェント管理画面) 切替
+    ToggleDeck,
     ToggleMdPreview,
     NewAgent,
     FontInc,
@@ -93,7 +95,7 @@ pub enum BindAction {
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 47] = [
+const ALL_ACTIONS: [BindAction; 48] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -106,6 +108,7 @@ const ALL_ACTIONS: [BindAction; 47] = [
     BindAction::Find,
     BindAction::ToggleCockpit,
     BindAction::ToggleKanban,
+    BindAction::ToggleDeck,
     BindAction::ToggleMdPreview,
     BindAction::NewAgent,
     BindAction::FontInc,
@@ -161,6 +164,9 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::Find => KeyboardShortcut::new(cmd, Key::F),
         BindAction::ToggleCockpit => KeyboardShortcut::new(cmd_shift, Key::C),
         BindAction::ToggleKanban => KeyboardShortcut::new(cmd_shift, Key::K),
+        // ⌥⌘D = デッキ (Deck)。⇧⌘D は「行を複製」に埋まっているので ⌥ 側を使う。
+        // ⌥⌘ 系の既存割り当ては S / F / [ / ] / B だけなので衝突しない。
+        BindAction::ToggleDeck => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::D),
         BindAction::ToggleMdPreview => KeyboardShortcut::new(cmd_shift, Key::V),
         BindAction::NewAgent => KeyboardShortcut::new(cmd_shift, Key::A),
         BindAction::FontInc => KeyboardShortcut::new(cmd, Key::Plus),
@@ -261,6 +267,7 @@ impl Keybinds {
             "find" => Find,
             "toggle_cockpit" => ToggleCockpit,
             "toggle_kanban" => ToggleKanban,
+            "toggle_deck" => ToggleDeck,
             "toggle_md_preview" => ToggleMdPreview,
             "new_agent" => NewAgent,
             "font_inc" => FontInc,
@@ -808,7 +815,8 @@ mod tests {
         let names = [
             "save", "save_as", "close_tab", "new_file", "new_window", "palette_files",
             "palette_commands", "toggle_terminal", "toggle_sidebar", "find", "toggle_cockpit",
-            "toggle_kanban", "toggle_md_preview", "new_agent", "font_inc", "font_dec",
+            "toggle_kanban", "toggle_deck", "toggle_md_preview", "new_agent", "font_inc",
+            "font_dec",
             "toggle_comment", "duplicate_line", "move_line_up", "move_line_down",
             "focus_explorer", "open_file", "save_all", "goto_line", "next_tab", "prev_tab",
             "global_search", "global_replace", "open_replace", "new_terminal", "nav_back",

@@ -6363,7 +6363,9 @@ pub fn draw(
             .rect_stroke(rect, 6.0, egui::Stroke::new(2.0_f32, theme.accent));
     }
 
-    let padding = 6.0;
+    // 分割レイアウト側の [`apply_sizes`] と同じ値を使う (ずれると
+    // 「描いた矩形と PTY のグリッド」が食い違う)。
+    let padding = TERM_PADDING;
     if allow_resize {
         let cols = ((rect.width() - padding * 2.0) / cell_w).floor() as u16;
         let rows = ((rect.height() - padding * 2.0) / cell_h).floor() as u16;
@@ -8504,5 +8506,1505 @@ mod cjk_tests {
         );
         assert!(plan.out.is_empty());
         assert_eq!(plan.input_select, Some(found));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 端末の分割 (Terminal Splits) — orca / tmux / Ghostty 相当
+//
+// 1 枚のタイル (Cockpit のセル・下部パネル・エディタ横) の中で、端末ペインを
+// 何段でも入れ子に分割できるようにするためのモデル。
+//
+// 設計方針:
+//   * ここは **純粋なデータ構造** — Session も PTY も egui の状態も持たない。
+//     セッションは [`SessionId`] (= `Session::id`) でしか触らない。新しい
+//     ペインを作るのは呼び出し側で、モデルは「どこに置くか」だけを決める。
+//   * 幾何は [`SplitLayout::rects`] が唯一の真実源。描画・リサイズ・方向
+//     フォーカスはすべてこの矩形を見る (ズレようがない)。
+//   * 保存は実行時 ID ではなく **安定キー** (文字列) で行う → [`SplitLayoutRec`]。
+//     復元時に解決できないリーフは黙って落とし、親を畳む (panic しない)。
+// ════════════════════════════════════════════════════════════════════════
+
+/// リーフが指すセッション。`Session::id` と同じ値を入れる。
+pub type SessionId = u64;
+
+/// 分割の向き。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum SplitDir {
+    /// 子を**左右**に並べる (境界線は縦)。「右に分割」。
+    Horizontal,
+    /// 子を**上下**に並べる (境界線は横)。「下に分割」。
+    Vertical,
+}
+
+/// 方向キーによるフォーカス移動の向き。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FocusDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// 分割比の下限 (と 1-下限 が上限)。これ以上は潰せない。
+pub const MIN_RATIO: f32 = 0.05;
+/// ガタードラッグで確保するペインの最小ピクセル幅/高さ。
+pub const MIN_PANE_PX: f32 = 48.0;
+/// 既定のガター (仕切り) 幅。
+pub const GUTTER: f32 = 6.0;
+/// 端末の内側余白。`draw` と [`apply_sizes`] で同じ値を使う (ずれると
+/// 「描いた矩形と PTY のグリッドが食い違う」事故になる)。
+pub const TERM_PADDING: f32 = 6.0;
+
+/// 分割木のノード。
+#[derive(Clone, Debug, PartialEq)]
+pub enum SplitNode {
+    /// 端末 1 枚。
+    Leaf(SessionId),
+    /// 2 分割。`ratio` は **ガターを除いた領域のうち `a` が取る割合**。
+    Split {
+        dir: SplitDir,
+        ratio: f32,
+        a: Box<SplitNode>,
+        b: Box<SplitNode>,
+    },
+}
+
+/// ルートからノードへの経路。`false` = `a` 側、`true` = `b` 側。
+pub type SplitPath = Vec<bool>;
+
+/// 描画可能なガター 1 本ぶんの情報。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gutter {
+    /// この分割ノードへの経路 ([`SplitLayout::drag_gutter`] に渡す)。
+    pub path: SplitPath,
+    pub dir: SplitDir,
+    /// 仕切りの帯そのもの (当たり判定・描画用)。
+    pub rect: egui::Rect,
+    /// この分割が占める領域全体 (ドラッグ量 → 比率の換算に使う)。
+    pub span: egui::Rect,
+}
+
+fn clamp_ratio(r: f32) -> f32 {
+    if !r.is_finite() {
+        return 0.5;
+    }
+    r.clamp(MIN_RATIO, 1.0 - MIN_RATIO)
+}
+
+/// ピクセル最小幅も考慮した比率クランプ。領域が狭すぎるときは中央固定。
+fn clamp_ratio_px(r: f32, avail_px: f32) -> f32 {
+    let lo = MIN_RATIO.max(if avail_px > 0.0 {
+        MIN_PANE_PX / avail_px
+    } else {
+        MIN_RATIO
+    });
+    let hi = 1.0 - lo;
+    if lo >= hi {
+        return 0.5;
+    }
+    if !r.is_finite() {
+        return 0.5;
+    }
+    r.clamp(lo, hi)
+}
+
+/// 1 つの分割を (a の矩形, ガター帯, b の矩形) に割る。
+///
+/// 3 つは**必ず `area` の内側**で、互いに重ならず、隙間なく `area` を埋める。
+/// 端数は `a` 側を floor して `b` に寄せる — 同じ入力なら常に同じ出力になる。
+fn split_area(area: egui::Rect, dir: SplitDir, ratio: f32, gutter: f32) -> (egui::Rect, egui::Rect, egui::Rect) {
+    let g = gutter.max(0.0);
+    match dir {
+        SplitDir::Horizontal => {
+            let total = area.width().max(0.0);
+            let avail = (total - g).max(0.0);
+            let gw = total - avail; // = min(g, total)
+            let a_w = (avail * ratio).floor().clamp(0.0, avail);
+            let x0 = area.min.x;
+            let a = egui::Rect::from_min_max(
+                egui::pos2(x0, area.min.y),
+                egui::pos2(x0 + a_w, area.max.y),
+            );
+            let gr = egui::Rect::from_min_max(
+                egui::pos2(a.max.x, area.min.y),
+                egui::pos2((a.max.x + gw).min(area.max.x), area.max.y),
+            );
+            let b = egui::Rect::from_min_max(
+                egui::pos2(gr.max.x, area.min.y),
+                egui::pos2(area.max.x, area.max.y),
+            );
+            (a, gr, b)
+        }
+        SplitDir::Vertical => {
+            let total = area.height().max(0.0);
+            let avail = (total - g).max(0.0);
+            let gh = total - avail;
+            let a_h = (avail * ratio).floor().clamp(0.0, avail);
+            let y0 = area.min.y;
+            let a = egui::Rect::from_min_max(
+                egui::pos2(area.min.x, y0),
+                egui::pos2(area.max.x, y0 + a_h),
+            );
+            let gr = egui::Rect::from_min_max(
+                egui::pos2(area.min.x, a.max.y),
+                egui::pos2(area.max.x, (a.max.y + gh).min(area.max.y)),
+            );
+            let b = egui::Rect::from_min_max(
+                egui::pos2(area.min.x, gr.max.y),
+                egui::pos2(area.max.x, area.max.y),
+            );
+            (a, gr, b)
+        }
+    }
+}
+
+impl SplitNode {
+    fn leaves_into(&self, out: &mut Vec<SessionId>) {
+        match self {
+            SplitNode::Leaf(id) => out.push(*id),
+            SplitNode::Split { a, b, .. } => {
+                a.leaves_into(out);
+                b.leaves_into(out);
+            }
+        }
+    }
+
+    /// 木に含まれるリーフを**左上から右下の順**で並べる (in-order)。
+    pub fn leaves(&self) -> Vec<SessionId> {
+        let mut v = Vec::new();
+        self.leaves_into(&mut v);
+        v
+    }
+
+    /// リーフ数。
+    pub fn leaf_count(&self) -> usize {
+        match self {
+            SplitNode::Leaf(_) => 1,
+            SplitNode::Split { a, b, .. } => a.leaf_count() + b.leaf_count(),
+        }
+    }
+
+    /// このセッションを含むか。
+    pub fn contains(&self, id: SessionId) -> bool {
+        match self {
+            SplitNode::Leaf(x) => *x == id,
+            SplitNode::Split { a, b, .. } => a.contains(id) || b.contains(id),
+        }
+    }
+
+    fn first_leaf(&self) -> SessionId {
+        match self {
+            SplitNode::Leaf(x) => *x,
+            SplitNode::Split { a, .. } => a.first_leaf(),
+        }
+    }
+
+    fn find_path(&self, id: SessionId, path: &mut SplitPath) -> bool {
+        match self {
+            SplitNode::Leaf(x) => *x == id,
+            SplitNode::Split { a, b, .. } => {
+                path.push(false);
+                if a.find_path(id, path) {
+                    return true;
+                }
+                path.pop();
+                path.push(true);
+                if b.find_path(id, path) {
+                    return true;
+                }
+                path.pop();
+                false
+            }
+        }
+    }
+
+    fn at_path_mut(&mut self, path: &[bool]) -> Option<&mut SplitNode> {
+        match path.split_first() {
+            None => Some(self),
+            Some((step, rest)) => match self {
+                SplitNode::Leaf(_) => None,
+                SplitNode::Split { a, b, .. } => {
+                    if *step {
+                        b.at_path_mut(rest)
+                    } else {
+                        a.at_path_mut(rest)
+                    }
+                }
+            },
+        }
+    }
+
+    fn replace_leaf(&mut self, id: SessionId, node: SplitNode) -> bool {
+        match self {
+            SplitNode::Leaf(x) if *x == id => {
+                *self = node;
+                true
+            }
+            SplitNode::Leaf(_) => false,
+            SplitNode::Split { a, b, .. } => {
+                if a.contains(id) {
+                    a.replace_leaf(id, node)
+                } else if b.contains(id) {
+                    b.replace_leaf(id, node)
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn rects_into(&self, area: egui::Rect, gutter: f32, out: &mut Vec<(SessionId, egui::Rect)>) {
+        match self {
+            SplitNode::Leaf(id) => out.push((*id, area)),
+            SplitNode::Split { dir, ratio, a, b } => {
+                let (ra, _, rb) = split_area(area, *dir, *ratio, gutter);
+                a.rects_into(ra, gutter, out);
+                b.rects_into(rb, gutter, out);
+            }
+        }
+    }
+
+    fn gutters_into(
+        &self,
+        area: egui::Rect,
+        gutter: f32,
+        path: &mut SplitPath,
+        out: &mut Vec<Gutter>,
+    ) {
+        if let SplitNode::Split { dir, ratio, a, b } = self {
+            let (ra, gr, rb) = split_area(area, *dir, *ratio, gutter);
+            out.push(Gutter {
+                path: path.clone(),
+                dir: *dir,
+                rect: gr,
+                span: area,
+            });
+            path.push(false);
+            a.gutters_into(ra, gutter, path, out);
+            path.pop();
+            path.push(true);
+            b.gutters_into(rb, gutter, path, out);
+            path.pop();
+        }
+    }
+
+    /// 全ての分割比を「両側のリーフ数に比例」させる = 面積が均等になる。
+    fn equalize(&mut self) -> usize {
+        match self {
+            SplitNode::Leaf(_) => 1,
+            SplitNode::Split { ratio, a, b, .. } => {
+                let na = a.equalize();
+                let nb = b.equalize();
+                *ratio = clamp_ratio(na as f32 / (na + nb) as f32);
+                na + nb
+            }
+        }
+    }
+
+    fn swap_ids(&mut self, x: SessionId, y: SessionId) {
+        match self {
+            SplitNode::Leaf(id) => {
+                if *id == x {
+                    *id = y;
+                } else if *id == y {
+                    *id = x;
+                }
+            }
+            SplitNode::Split { a, b, .. } => {
+                a.swap_ids(x, y);
+                b.swap_ids(x, y);
+            }
+        }
+    }
+}
+
+/// 指定リーフを消し、親を畳む。畳んだ地点の兄弟の先頭リーフを `fallback` に残す
+/// (閉じたペインがフォーカス中だったとき、そこへフォーカスを移すため)。
+fn remove_leaf(node: SplitNode, id: SessionId, fallback: &mut Option<SessionId>) -> Option<SplitNode> {
+    match node {
+        SplitNode::Leaf(x) if x == id => None,
+        SplitNode::Leaf(x) => Some(SplitNode::Leaf(x)),
+        SplitNode::Split { dir, ratio, a, b } => {
+            if a.contains(id) {
+                match remove_leaf(*a, id, fallback) {
+                    Some(a2) => Some(SplitNode::Split {
+                        dir,
+                        ratio,
+                        a: Box::new(a2),
+                        b,
+                    }),
+                    None => {
+                        *fallback = Some(b.first_leaf());
+                        Some(*b)
+                    }
+                }
+            } else if b.contains(id) {
+                match remove_leaf(*b, id, fallback) {
+                    Some(b2) => Some(SplitNode::Split {
+                        dir,
+                        ratio,
+                        a,
+                        b: Box::new(b2),
+                    }),
+                    None => {
+                        *fallback = Some(a.first_leaf());
+                        Some(*a)
+                    }
+                }
+            } else {
+                Some(SplitNode::Split { dir, ratio, a, b })
+            }
+        }
+    }
+}
+
+/// 条件を満たさないリーフを落として木を畳む (復元時の自己修復)。
+fn retain_node(node: SplitNode, keep: &mut dyn FnMut(SessionId) -> bool) -> Option<SplitNode> {
+    match node {
+        SplitNode::Leaf(x) => keep(x).then_some(SplitNode::Leaf(x)),
+        SplitNode::Split { dir, ratio, a, b } => {
+            let a2 = retain_node(*a, keep);
+            let b2 = retain_node(*b, keep);
+            match (a2, b2) {
+                (Some(x), Some(y)) => Some(SplitNode::Split {
+                    dir,
+                    ratio: clamp_ratio(ratio),
+                    a: Box::new(x),
+                    b: Box::new(y),
+                }),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/// 1 タイル分の分割レイアウト。
+///
+/// フィールドは非公開 — 「空の分割」「木に居ないセッションへのフォーカス」
+/// といった壊れた状態を作らせないため、操作は全てメソッド経由にする。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SplitLayout {
+    root: Option<SplitNode>,
+    focus: Option<SessionId>,
+    zoomed: bool,
+}
+
+impl SplitLayout {
+    /// 空のレイアウト (ペイン 0 枚)。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 端末 1 枚だけのレイアウト。
+    pub fn single(id: SessionId) -> Self {
+        Self {
+            root: Some(SplitNode::Leaf(id)),
+            focus: Some(id),
+            zoomed: false,
+        }
+    }
+
+    pub fn root(&self) -> Option<&SplitNode> {
+        self.root.as_ref()
+    }
+    pub fn focus(&self) -> Option<SessionId> {
+        self.focus
+    }
+    pub fn zoomed(&self) -> bool {
+        self.zoomed
+    }
+    /// ペイン数。
+    pub fn len(&self) -> usize {
+        self.root.as_ref().map_or(0, |r| r.leaf_count())
+    }
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none()
+    }
+    pub fn contains(&self, id: SessionId) -> bool {
+        self.root.as_ref().is_some_and(|r| r.contains(id))
+    }
+    /// 左上から右下の順のリーフ一覧。
+    pub fn leaves(&self) -> Vec<SessionId> {
+        self.root.as_ref().map(|r| r.leaves()).unwrap_or_default()
+    }
+
+    /// 木に居るセッションだけフォーカスできる。
+    pub fn set_focus(&mut self, id: SessionId) -> bool {
+        if self.contains(id) {
+            self.focus = Some(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// フォーカス中のペインを分割し、新しいリーフ `new_id` を隣に置く。
+    ///
+    /// セッションを起こすのは呼び出し側 — ここは木を組み替えるだけ。
+    /// 木が空なら `new_id` が最初のペインになる。既に居る ID は拒否する。
+    pub fn split_focused(&mut self, dir: SplitDir, new_id: SessionId) -> bool {
+        if self.contains(new_id) {
+            return false;
+        }
+        let Some(root) = self.root.as_mut() else {
+            self.root = Some(SplitNode::Leaf(new_id));
+            self.focus = Some(new_id);
+            return true;
+        };
+        // フォーカスが行方不明なら先頭ペインを分割する (無操作にはしない)。
+        let target = match self.focus {
+            Some(f) if root.contains(f) => f,
+            _ => root.first_leaf(),
+        };
+        let node = SplitNode::Split {
+            dir,
+            ratio: 0.5,
+            a: Box::new(SplitNode::Leaf(target)),
+            b: Box::new(SplitNode::Leaf(new_id)),
+        };
+        if !root.replace_leaf(target, node) {
+            return false;
+        }
+        self.focus = Some(new_id);
+        // 新しいペインを開いたらズームは解除 (見えないペインを増やさない)。
+        self.zoomed = false;
+        true
+    }
+
+    /// ペインを閉じる。親は畳まれ、兄弟が親の矩形をそのまま受け取る。
+    pub fn close_leaf(&mut self, id: SessionId) -> bool {
+        let Some(root) = self.root.take() else {
+            return false;
+        };
+        if !root.contains(id) {
+            self.root = Some(root);
+            return false;
+        }
+        let mut fallback = None;
+        self.root = remove_leaf(root, id, &mut fallback);
+        match &self.root {
+            None => {
+                self.focus = None;
+                self.zoomed = false;
+            }
+            Some(r) => {
+                if self.focus == Some(id) || !self.focus.is_some_and(|f| r.contains(f)) {
+                    self.focus = Some(fallback.unwrap_or_else(|| r.first_leaf()));
+                }
+            }
+        }
+        true
+    }
+
+    /// in-order の次のペインへ (端で折り返す)。
+    pub fn focus_next(&mut self) -> bool {
+        self.cycle(1)
+    }
+    /// in-order の前のペインへ (端で折り返す)。
+    pub fn focus_prev(&mut self) -> bool {
+        self.cycle(-1)
+    }
+
+    fn cycle(&mut self, step: isize) -> bool {
+        let ls = self.leaves();
+        if ls.is_empty() {
+            return false;
+        }
+        let cur = self
+            .focus
+            .and_then(|f| ls.iter().position(|x| *x == f))
+            .unwrap_or(0) as isize;
+        let n = ls.len() as isize;
+        let next = ((cur + step) % n + n) % n;
+        self.focus = Some(ls[next as usize]);
+        true
+    }
+
+    /// 幾何的な隣のペインへフォーカスを移す (VS Code / tmux と同じ判定)。
+    ///
+    /// 判定は「その向きに居る候補のうち **最も近い** もの、その中で
+    /// **フォーカス辺との重なりが最大** のもの」。端では何もせず false。
+    /// ズーム中でも**分割前の幾何**で判定するので、移った先がズーム表示になる。
+    pub fn focus_dir(&mut self, dir: FocusDir, area: egui::Rect, gutter: f32) -> bool {
+        let rects = self.rects_unzoomed(area, gutter);
+        if rects.is_empty() {
+            return false;
+        }
+        let Some(cur) = self.focus.filter(|f| self.contains(*f)) else {
+            self.focus = Some(rects[0].0);
+            return true;
+        };
+        let Some(cur_rect) = rects.iter().find(|(id, _)| *id == cur).map(|(_, r)| *r) else {
+            return false;
+        };
+        match dir_pick(cur_rect, &rects, cur, dir) {
+            Some(id) => {
+                self.focus = Some(id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// フォーカス中ペインを囲む分割の比率を動かす。`delta` は比率 (0.05 = 5%)。
+    /// 正なら**フォーカス中のペインが広がる**。最小サイズでクランプする。
+    pub fn resize_focused(&mut self, delta: f32) -> bool {
+        let Some(f) = self.focus else { return false };
+        let Some(root) = self.root.as_mut() else {
+            return false;
+        };
+        let mut path = SplitPath::new();
+        if !root.find_path(f, &mut path) || path.is_empty() {
+            return false;
+        }
+        let on_b = *path.last().unwrap();
+        path.pop(); // 親 (分割ノード) へ
+        let Some(SplitNode::Split { ratio, .. }) = root.at_path_mut(&path) else {
+            return false;
+        };
+        let before = *ratio;
+        let next = clamp_ratio(if on_b { before - delta } else { before + delta });
+        *ratio = next;
+        (next - before).abs() > f32::EPSILON
+    }
+
+    /// ガターのドラッグを比率に反映する。`span_px` はその分割が占める長さ。
+    pub fn drag_gutter(&mut self, path: &[bool], delta_px: f32, span_px: f32, gutter: f32) -> bool {
+        let Some(root) = self.root.as_mut() else {
+            return false;
+        };
+        let Some(SplitNode::Split { ratio, .. }) = root.at_path_mut(path) else {
+            return false;
+        };
+        let avail = (span_px - gutter.max(0.0)).max(1.0);
+        let before = *ratio;
+        let next = clamp_ratio_px(before + delta_px / avail, avail);
+        *ratio = next;
+        (next - before).abs() > f32::EPSILON
+    }
+
+    /// 経路の分割比 (テスト・保存用)。
+    pub fn ratio_at(&self, path: &[bool]) -> Option<f32> {
+        let mut node = self.root.as_ref()?;
+        for step in path {
+            match node {
+                SplitNode::Split { a, b, .. } => node = if *step { b } else { a },
+                SplitNode::Leaf(_) => return None,
+            }
+        }
+        match node {
+            SplitNode::Split { ratio, .. } => Some(*ratio),
+            SplitNode::Leaf(_) => None,
+        }
+    }
+
+    /// 全ペインを等面積にする。
+    pub fn equalize(&mut self) {
+        if let Some(r) = self.root.as_mut() {
+            r.equalize();
+        }
+    }
+
+    /// 2 つのペインの位置を入れ替える。
+    pub fn swap(&mut self, a: SessionId, b: SessionId) -> bool {
+        if a == b || !self.contains(a) || !self.contains(b) {
+            return false;
+        }
+        if let Some(r) = self.root.as_mut() {
+            r.swap_ids(a, b);
+        }
+        true
+    }
+
+    /// ズームのトグル。戻り値は**トグル後**の状態。
+    /// ズーム中は [`Self::rects`] がフォーカス中ペイン 1 枚だけを返す。
+    pub fn zoom_focused(&mut self) -> bool {
+        if self.focus.is_none_or(|f| !self.contains(f)) {
+            self.zoomed = false;
+            return false;
+        }
+        self.zoomed = !self.zoomed;
+        self.zoomed
+    }
+
+    /// 生きていないセッションのリーフを落として木を畳む。戻り値は変化したか。
+    pub fn heal(&mut self, alive: &mut dyn FnMut(SessionId) -> bool) -> bool {
+        let Some(root) = self.root.take() else {
+            return false;
+        };
+        let before = root.clone();
+        self.root = retain_node(root, alive);
+        let changed = self.root.as_ref() != Some(&before);
+        match &self.root {
+            None => {
+                self.focus = None;
+                self.zoomed = false;
+            }
+            Some(r) => {
+                if self.focus.is_none_or(|f| !r.contains(f)) {
+                    self.focus = Some(r.first_leaf());
+                }
+            }
+        }
+        changed
+    }
+
+    /// **描画する**ペインの矩形。ズーム中はフォーカス中の 1 枚だけ。
+    ///
+    /// 不変条件: 返る矩形はすべて `area` の内側で、互いに重ならない。
+    pub fn rects(&self, area: egui::Rect, gutter: f32) -> Vec<(SessionId, egui::Rect)> {
+        if self.zoomed {
+            if let Some(f) = self.focus.filter(|f| self.contains(*f)) {
+                return vec![(f, area)];
+            }
+        }
+        self.rects_unzoomed(area, gutter)
+    }
+
+    /// ズームを無視した本来の幾何 (方向フォーカスの判定に使う)。
+    pub fn rects_unzoomed(&self, area: egui::Rect, gutter: f32) -> Vec<(SessionId, egui::Rect)> {
+        let mut out = Vec::new();
+        if let Some(r) = &self.root {
+            r.rects_into(area, gutter, &mut out);
+        }
+        out
+    }
+
+    /// ドラッグ可能な仕切り一覧。ズーム中は空 (仕切りは見えない)。
+    pub fn gutters(&self, area: egui::Rect, gutter: f32) -> Vec<Gutter> {
+        let mut out = Vec::new();
+        if self.zoomed && self.focus.is_some_and(|f| self.contains(f)) {
+            return out;
+        }
+        if let Some(r) = &self.root {
+            let mut path = SplitPath::new();
+            r.gutters_into(area, gutter, &mut path, &mut out);
+        }
+        out
+    }
+
+    /// 保存用の形へ落とす。キーを引けないリーフは落として木を畳む。
+    pub fn to_rec(&self, key_of: &mut dyn FnMut(SessionId) -> Option<String>) -> SplitLayoutRec {
+        let mut rec = SplitLayoutRec {
+            nodes: Vec::new(),
+            focus: String::new(),
+            zoomed: self.zoomed,
+        };
+        let Some(root) = self.root.clone() else {
+            return rec;
+        };
+        // キーを引けないリーフを先に落としてから書き出す (穴あきの木を保存しない)。
+        let mut keys: Vec<(SessionId, String)> = Vec::new();
+        let healed = retain_node(root, &mut |id| match key_of(id) {
+            Some(k) => {
+                keys.push((id, k));
+                true
+            }
+            None => false,
+        });
+        let Some(healed) = healed else { return rec };
+        let key = |id: SessionId| -> String {
+            keys.iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, k)| k.clone())
+                .unwrap_or_default()
+        };
+        encode_node(&healed, &key, &mut rec.nodes);
+        if let Some(f) = self.focus.filter(|f| healed.contains(*f)) {
+            rec.focus = key(f);
+        }
+        rec
+    }
+}
+
+/// トークン列 (先行順) へ書き出す。
+fn encode_node(node: &SplitNode, key: &dyn Fn(SessionId) -> String, out: &mut Vec<String>) {
+    match node {
+        SplitNode::Leaf(id) => out.push(format!("L:{}", key(*id))),
+        SplitNode::Split { dir, ratio, a, b } => {
+            let tag = match dir {
+                SplitDir::Horizontal => 'H',
+                SplitDir::Vertical => 'V',
+            };
+            out.push(format!("{tag}:{:.6}", clamp_ratio(*ratio)));
+            encode_node(a, key, out);
+            encode_node(b, key, out);
+        }
+    }
+}
+
+/// 復元途中の木 (まだ実行時 ID に解決していない)。
+enum KeyNode {
+    Leaf(String),
+    Split {
+        dir: SplitDir,
+        ratio: f32,
+        a: Box<KeyNode>,
+        b: Box<KeyNode>,
+    },
+}
+
+fn decode_node(toks: &[String], i: &mut usize) -> Option<KeyNode> {
+    let t = toks.get(*i)?;
+    *i += 1;
+    if let Some(k) = t.strip_prefix("L:") {
+        return Some(KeyNode::Leaf(k.to_string()));
+    }
+    let dir = if t.starts_with("H:") {
+        SplitDir::Horizontal
+    } else if t.starts_with("V:") {
+        SplitDir::Vertical
+    } else {
+        return None;
+    };
+    let ratio = clamp_ratio(t[2..].parse::<f32>().ok()?);
+    let a = decode_node(toks, i)?;
+    let b = decode_node(toks, i)?;
+    Some(KeyNode::Split {
+        dir,
+        ratio,
+        a: Box::new(a),
+        b: Box::new(b),
+    })
+}
+
+/// 安定キー → 実行時 ID。引けないリーフ・重複したリーフは落として畳む。
+fn key_to_node(
+    k: &KeyNode,
+    id_of: &mut dyn FnMut(&str) -> Option<SessionId>,
+    seen: &mut Vec<SessionId>,
+) -> Option<SplitNode> {
+    match k {
+        KeyNode::Leaf(s) => {
+            let id = id_of(s)?;
+            if seen.contains(&id) {
+                return None;
+            }
+            seen.push(id);
+            Some(SplitNode::Leaf(id))
+        }
+        KeyNode::Split { dir, ratio, a, b } => {
+            let a2 = key_to_node(a, id_of, seen);
+            let b2 = key_to_node(b, id_of, seen);
+            match (a2, b2) {
+                (Some(x), Some(y)) => Some(SplitNode::Split {
+                    dir: *dir,
+                    ratio: clamp_ratio(*ratio),
+                    a: Box::new(x),
+                    b: Box::new(y),
+                }),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/// 保存用の分割レイアウト。
+///
+/// 実行時 ID (`Session::id`) は再起動で変わるので、リーフは**安定キー**の
+/// 文字列で書く。木は先行順のトークン列に潰してあるので TOML でも JSON でも
+/// そのまま往復できる (再帰 enum を TOML に書くときの罠を踏まない)。
+///
+/// トークンの形:
+///   * `"L:<キー>"`        — リーフ。`L:` 以降は全部キー (`:` を含んでよい)。
+///   * `"H:<比率>"`        — 左右分割。続く 2 ノードが a, b。
+///   * `"V:<比率>"`        — 上下分割。
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SplitLayoutRec {
+    pub nodes: Vec<String>,
+    /// フォーカス中リーフの安定キー (空 = 無し)。
+    pub focus: String,
+    pub zoomed: bool,
+}
+
+impl SplitLayoutRec {
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// 実行時の形へ戻す。キーを引けないセッションのリーフは落として親を畳む
+    /// (壊れた保存ファイルでも panic せず、残ったペインだけで開き直す)。
+    pub fn to_layout(&self, id_of: &mut dyn FnMut(&str) -> Option<SessionId>) -> SplitLayout {
+        let mut i = 0usize;
+        let Some(kn) = decode_node(&self.nodes, &mut i) else {
+            return SplitLayout::new();
+        };
+        // 余分なトークンが付いていたら壊れた記録として捨てる。
+        if i != self.nodes.len() {
+            return SplitLayout::new();
+        }
+        let mut seen = Vec::new();
+        let Some(root) = key_to_node(&kn, id_of, &mut seen) else {
+            return SplitLayout::new();
+        };
+        let focus = if self.focus.is_empty() {
+            None
+        } else {
+            id_of(&self.focus).filter(|f| root.contains(*f))
+        };
+        let focus = Some(focus.unwrap_or_else(|| root.first_leaf()));
+        SplitLayout {
+            root: Some(root),
+            focus,
+            zoomed: self.zoomed && focus.is_some(),
+        }
+    }
+}
+
+fn overlap(a0: f32, a1: f32, b0: f32, b1: f32) -> f32 {
+    (a1.min(b1) - a0.max(b0)).max(0.0)
+}
+
+/// 幾何的な隣を選ぶ。近い順 → 重なりが大きい順 → 上/左が先 → ID 順 (決定的)。
+fn dir_pick(
+    cur: egui::Rect,
+    rects: &[(SessionId, egui::Rect)],
+    cur_id: SessionId,
+    dir: FocusDir,
+) -> Option<SessionId> {
+    const EPS: f32 = 0.5;
+    // (id, 隙間, 重なり, 垂直方向の開始座標)
+    let mut scored: Vec<(SessionId, f32, f32, f32)> = Vec::new();
+    for (id, r) in rects {
+        if *id == cur_id {
+            continue;
+        }
+        let (gap, ov, perp) = match dir {
+            FocusDir::Left => (
+                cur.min.x - r.max.x,
+                overlap(cur.min.y, cur.max.y, r.min.y, r.max.y),
+                r.min.y,
+            ),
+            FocusDir::Right => (
+                r.min.x - cur.max.x,
+                overlap(cur.min.y, cur.max.y, r.min.y, r.max.y),
+                r.min.y,
+            ),
+            FocusDir::Up => (
+                cur.min.y - r.max.y,
+                overlap(cur.min.x, cur.max.x, r.min.x, r.max.x),
+                r.min.x,
+            ),
+            FocusDir::Down => (
+                r.min.y - cur.max.y,
+                overlap(cur.min.x, cur.max.x, r.min.x, r.max.x),
+                r.min.x,
+            ),
+        };
+        if gap < -EPS || ov <= 0.0 {
+            continue;
+        }
+        scored.push((*id, gap.max(0.0), ov, perp));
+    }
+    if scored.is_empty() {
+        return None;
+    }
+    let min_gap = scored.iter().fold(f32::INFINITY, |m, s| m.min(s.1));
+    scored.retain(|s| s.1 <= min_gap + EPS);
+    scored.sort_by(|x, y| {
+        y.2.partial_cmp(&x.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(x.3.partial_cmp(&y.3).unwrap_or(std::cmp::Ordering::Equal))
+            .then(x.0.cmp(&y.0))
+    });
+    scored.first().map(|s| s.0)
+}
+
+/// 見えているペインそれぞれに「新しい矩形での行数・桁数」を通知する。
+///
+/// モデルは `Session` を知らないので、実際の [`Session::resize`] は
+/// `emit` の中で呼んでもらう。`resize` は既存のコアレッサ経由なので、
+/// UI スレッドが ConPTY の同期 RPC を待つことは無い。
+///
+/// `area` は `draw_split` に渡すのと同じ矩形、`cell_w`/`cell_h` は端末フォントの
+/// 1 セルの大きさ。ズーム中は表示中の 1 枚にしか通知しない (隠れたペインは
+/// 描かれないので、サイズを変える必要が無い)。
+pub fn apply_sizes(
+    layout: &SplitLayout,
+    area: egui::Rect,
+    gutter: f32,
+    cell_w: f32,
+    cell_h: f32,
+    emit: &mut dyn FnMut(SessionId, u16, u16),
+) {
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return;
+    }
+    for (id, r) in layout.rects(area, gutter) {
+        let cols = ((r.width() - TERM_PADDING * 2.0) / cell_w).floor().max(1.0) as u16;
+        let rows = ((r.height() - TERM_PADDING * 2.0) / cell_h).floor().max(1.0) as u16;
+        emit(id, rows, cols);
+    }
+}
+
+/// 分割レイアウトを描く。
+///
+/// ペインの中身は呼び出し側が `leaf` で描く (Cockpit なら
+/// `terminal::draw` をそのまま呼べばよい)。この関数がやるのは
+/// 「矩形の割り当て」「仕切りの描画とドラッグ」「クリックでのフォーカス移動」
+/// の 3 つだけ。
+///
+/// 戻り値 `true` = レイアウトが変わった → 呼び出し側は [`apply_sizes`] を
+/// 撃ち直すこと。
+///
+/// 再描画は要求しない (ドラッグ中は egui が自前でフレームを回す)。
+/// アイドル時のゼロ再描画を壊さないため、ここから `request_repaint` は呼ばない。
+pub fn draw_split(
+    ui: &mut egui::Ui,
+    layout: &mut SplitLayout,
+    area: egui::Rect,
+    gutter: f32,
+    theme: &Theme,
+    leaf: &mut dyn FnMut(&mut egui::Ui, egui::Rect, SessionId, bool),
+) -> bool {
+    let mut changed = false;
+    let rects = layout.rects(area, gutter);
+    if rects.is_empty() {
+        return false;
+    }
+
+    // クリックしたペインへフォーカスを移す。イベントは**消費しない**ので、
+    // 同じクリックは端末側 (選択・カーソル移動) にもそのまま届く。
+    let press = ui.input(|i| {
+        if i.pointer.button_pressed(egui::PointerButton::Primary) {
+            i.pointer.interact_pos()
+        } else {
+            None
+        }
+    });
+    if let Some(p) = press {
+        if let Some((id, _)) = rects.iter().find(|(_, r)| r.contains(p)) {
+            if layout.focus() != Some(*id) && layout.set_focus(*id) {
+                changed = true;
+            }
+        }
+    }
+
+    let focus = layout.focus();
+    for (id, r) in &rects {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(*r)
+                .id_salt(("zv-split-pane", *id))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        leaf(&mut child, *r, *id, focus == Some(*id));
+    }
+
+    // ── 仕切り (ドラッグでリサイズ / ダブルクリックで均等化) ──
+    for g in layout.gutters(area, gutter) {
+        // 帯そのものは細いので、掴める範囲だけ少し広げる。
+        let hit = match g.dir {
+            SplitDir::Horizontal => g.rect.expand2(egui::vec2(2.0, 0.0)),
+            SplitDir::Vertical => g.rect.expand2(egui::vec2(0.0, 2.0)),
+        };
+        let id = ui.id().with(("zv-split-gutter", g.path.as_slice()));
+        let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
+        let hot = resp.hovered() || resp.dragged();
+        if hot {
+            ui.ctx().set_cursor_icon(match g.dir {
+                SplitDir::Horizontal => egui::CursorIcon::ResizeHorizontal,
+                SplitDir::Vertical => egui::CursorIcon::ResizeVertical,
+            });
+        }
+        if resp.double_clicked() {
+            layout.equalize();
+            changed = true;
+        } else if resp.dragged() {
+            let d = resp.drag_delta();
+            let (delta, span) = match g.dir {
+                SplitDir::Horizontal => (d.x, g.span.width()),
+                SplitDir::Vertical => (d.y, g.span.height()),
+            };
+            if delta != 0.0 && layout.drag_gutter(&g.path, delta, span, gutter) {
+                changed = true;
+            }
+        }
+        let col = if hot { theme.accent } else { theme.border };
+        let bar = match g.dir {
+            SplitDir::Horizontal => g.rect.shrink2(egui::vec2(g.rect.width() * 0.3, 2.0)),
+            SplitDir::Vertical => g.rect.shrink2(egui::vec2(2.0, g.rect.height() * 0.3)),
+        };
+        ui.painter().rect_filled(bar, 1.0, col);
+    }
+
+    changed
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))
+    }
+
+    /// 1 → 右に 2 → 下に 3 (3 は 2 の下) の 3 ペイン。
+    fn three() -> SplitLayout {
+        let mut l = SplitLayout::single(1);
+        assert!(l.split_focused(SplitDir::Horizontal, 2));
+        assert!(l.split_focused(SplitDir::Vertical, 3));
+        l
+    }
+
+    /// 田の字 4 ペイン: 左列 = 1(上)/3(下)、右列 = 2(上)/4(下)。
+    fn quad() -> SplitLayout {
+        let mut l = SplitLayout::single(1);
+        l.split_focused(SplitDir::Horizontal, 2); // 1 | 2
+        l.set_focus(1);
+        l.split_focused(SplitDir::Vertical, 3); // 左列 1/3
+        l.set_focus(2);
+        l.split_focused(SplitDir::Vertical, 4); // 右列 2/4
+        l.set_focus(1);
+        l
+    }
+
+    /// 壊れた木を作っていないかの共通チェック。
+    fn assert_invariants(l: &SplitLayout, what: &str) {
+        let ls = l.leaves();
+        let mut sorted = ls.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ls.len(), "{what}: リーフが重複している");
+        assert_eq!(ls.len(), l.len(), "{what}: leaf_count がズレている");
+        match l.focus() {
+            Some(f) => assert!(ls.contains(&f), "{what}: 木に居ないペインへフォーカス"),
+            None => assert!(ls.is_empty(), "{what}: ペインがあるのにフォーカス無し"),
+        }
+        // 分割比は必ず [MIN, 1-MIN]。
+        fn walk(n: &SplitNode, what: &str) {
+            if let SplitNode::Split { ratio, a, b, .. } = n {
+                assert!(
+                    (MIN_RATIO..=1.0 - MIN_RATIO).contains(ratio),
+                    "{what}: 比率が範囲外 {ratio}"
+                );
+                walk(a, what);
+                walk(b, what);
+            }
+        }
+        if let Some(r) = l.root() {
+            walk(r, what);
+        }
+    }
+
+    #[test]
+    fn split_close_invariants_table() {
+        // (操作列, 期待するペイン, 期待するフォーカス)
+        type Op = (&'static str, u64);
+        let cases: &[(&str, &[Op], &[u64], Option<u64>)] = &[
+            ("空から 1 枚", &[("h", 1)], &[1], Some(1)),
+            ("右に 2 枚", &[("h", 1), ("h", 2)], &[1, 2], Some(2)),
+            (
+                "縦横まぜて 3 枚",
+                &[("h", 1), ("h", 2), ("v", 3)],
+                &[1, 2, 3],
+                Some(3),
+            ),
+            (
+                "重複 ID は拒否",
+                &[("h", 1), ("h", 2), ("h", 2)],
+                &[1, 2],
+                Some(2),
+            ),
+            (
+                "閉じて親が畳まれる",
+                &[("h", 1), ("h", 2), ("v", 3), ("x", 3)],
+                &[1, 2],
+                Some(2),
+            ),
+            (
+                "全部閉じたら空",
+                &[("h", 1), ("h", 2), ("x", 1), ("x", 2)],
+                &[],
+                None,
+            ),
+            (
+                "居ないペインを閉じても無害",
+                &[("h", 1), ("x", 99)],
+                &[1],
+                Some(1),
+            ),
+        ];
+        for (name, ops, want_leaves, want_focus) in cases {
+            let mut l = SplitLayout::new();
+            for (op, id) in *ops {
+                match *op {
+                    "h" => {
+                        l.split_focused(SplitDir::Horizontal, *id);
+                    }
+                    "v" => {
+                        l.split_focused(SplitDir::Vertical, *id);
+                    }
+                    "x" => {
+                        l.close_leaf(*id);
+                    }
+                    _ => unreachable!(),
+                }
+                assert_invariants(&l, name);
+            }
+            assert_eq!(&l.leaves(), want_leaves, "{name}: ペイン一覧");
+            assert_eq!(l.focus(), *want_focus, "{name}: フォーカス");
+        }
+    }
+
+    #[test]
+    fn close_focused_moves_focus_to_sibling() {
+        let mut l = quad();
+        l.set_focus(3);
+        assert!(l.close_leaf(3));
+        // 3 の兄弟は 1 → そこへ移る
+        assert_eq!(l.focus(), Some(1));
+        assert_eq!(l.leaves(), vec![1, 2, 4]);
+        assert_invariants(&l, "兄弟へフォーカス");
+    }
+
+    #[test]
+    fn close_unfocused_keeps_focus() {
+        let mut l = quad(); // focus = 1
+        assert!(l.close_leaf(4));
+        assert_eq!(l.focus(), Some(1));
+        assert_eq!(l.leaves(), vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn rects_stay_inside_and_never_overlap() {
+        let areas = [
+            rect(0.0, 0.0, 800.0, 600.0),
+            rect(12.5, 7.25, 333.0, 199.0),
+            rect(-40.0, -10.0, 1000.0, 61.0),
+            rect(0.0, 0.0, 20.0, 20.0), // ガターより狭い極小
+        ];
+        let gutters = [0.0, 6.0, 13.0];
+        let layouts: [(&str, SplitLayout); 3] =
+            [("1枚", SplitLayout::single(7)), ("3枚", three()), ("田の字", quad())];
+        for (name, l) in &layouts {
+            for a in areas {
+                for g in gutters {
+                    let rs = l.rects(a, g);
+                    assert_eq!(rs.len(), l.len(), "{name}: 枚数");
+                    for (id, r) in &rs {
+                        assert!(
+                            r.min.x >= a.min.x - 0.01
+                                && r.min.y >= a.min.y - 0.01
+                                && r.max.x <= a.max.x + 0.01
+                                && r.max.y <= a.max.y + 0.01,
+                            "{name}: #{id} が領域外 {r:?} ⊄ {a:?}"
+                        );
+                        assert!(r.width() >= 0.0 && r.height() >= 0.0, "{name}: 負のサイズ");
+                    }
+                    for i in 0..rs.len() {
+                        for j in (i + 1)..rs.len() {
+                            let (x, y) = (rs[i].1, rs[j].1);
+                            let ov = overlap(x.min.x, x.max.x, y.min.x, y.max.x)
+                                * overlap(x.min.y, x.max.y, y.min.y, y.max.y);
+                            assert!(ov <= 0.01, "{name}: #{} と #{} が重なる", rs[i].0, rs[j].0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rects_are_deterministic() {
+        let l = quad();
+        let a = rect(3.5, 11.25, 777.0, 401.0);
+        assert_eq!(l.rects(a, 6.0), l.rects(a, 6.0));
+        assert_eq!(quad().rects(a, 6.0), l.rects(a, 6.0));
+    }
+
+    #[test]
+    fn gutter_is_accounted_in_geometry() {
+        let l = {
+            let mut l = SplitLayout::single(1);
+            l.split_focused(SplitDir::Horizontal, 2);
+            l
+        };
+        let a = rect(0.0, 0.0, 106.0, 50.0);
+        let rs = l.rects(a, 6.0);
+        // 使える幅は 100 → 50/50、間に 6px の仕切り。
+        assert_eq!(rs[0].1.width(), 50.0);
+        assert_eq!(rs[1].1.width(), 50.0);
+        assert_eq!(rs[1].1.min.x - rs[0].1.max.x, 6.0);
+        let gs = l.gutters(a, 6.0);
+        assert_eq!(gs.len(), 1);
+        assert_eq!(gs[0].rect.width(), 6.0);
+        assert!(gs[0].path.is_empty(), "ルートの分割は空経路");
+    }
+
+    #[test]
+    fn focus_dir_on_quad_table() {
+        // 田の字: 左上=1 右上=2 左下=3 右下=4
+        let a = rect(0.0, 0.0, 400.0, 400.0);
+        let cases: &[(u64, FocusDir, Option<u64>)] = &[
+            (1, FocusDir::Right, Some(2)),
+            (1, FocusDir::Down, Some(3)),
+            (1, FocusDir::Left, None),
+            (1, FocusDir::Up, None),
+            (2, FocusDir::Left, Some(1)),
+            (2, FocusDir::Down, Some(4)),
+            (2, FocusDir::Right, None),
+            (2, FocusDir::Up, None),
+            (3, FocusDir::Up, Some(1)),
+            (3, FocusDir::Right, Some(4)),
+            (3, FocusDir::Left, None),
+            (3, FocusDir::Down, None),
+            (4, FocusDir::Up, Some(2)),
+            (4, FocusDir::Left, Some(3)),
+            (4, FocusDir::Right, None),
+            (4, FocusDir::Down, None),
+        ];
+        for (from, dir, want) in cases {
+            let mut l = quad();
+            assert!(l.set_focus(*from));
+            let moved = l.focus_dir(*dir, a, 6.0);
+            match want {
+                Some(w) => {
+                    assert!(moved, "{from} から {dir:?} は動くはず");
+                    assert_eq!(l.focus(), Some(*w), "{from} から {dir:?}");
+                }
+                None => {
+                    assert!(!moved, "{from} から {dir:?} は端なので動かない");
+                    assert_eq!(l.focus(), Some(*from));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn focus_dir_prefers_nearest_column_over_widest_overlap() {
+        // 3 列: 1 | (2 上 / 3 下) | 4。1 から Right は「隣の列」の 2 が正解で、
+        // 重なりが大きい 4 (全高) に飛んではいけない。
+        let mut l = SplitLayout::single(1);
+        l.split_focused(SplitDir::Horizontal, 9); // 1 | 9
+        l.split_focused(SplitDir::Horizontal, 4); // 1 | (9 | 4)
+        l.set_focus(9);
+        l.split_focused(SplitDir::Vertical, 3); // 中列を 9/3 に
+        l.set_focus(1);
+        assert!(l.focus_dir(FocusDir::Right, rect(0.0, 0.0, 900.0, 300.0), 6.0));
+        assert_eq!(l.focus(), Some(9), "隣の列の上側へ");
+    }
+
+    #[test]
+    fn focus_next_prev_wraps() {
+        let mut l = quad();
+        let order = l.leaves();
+        assert_eq!(order, vec![1, 3, 2, 4]);
+        l.set_focus(4);
+        assert!(l.focus_next());
+        assert_eq!(l.focus(), Some(1), "端で折り返す");
+        assert!(l.focus_prev());
+        assert_eq!(l.focus(), Some(4));
+    }
+
+    #[test]
+    fn resize_focused_clamps_table() {
+        // (フォーカス, デルタ列, 期待比率)
+        let cases: &[(u64, &[f32], f32)] = &[
+            (2, &[0.1], 0.4),                 // b 側 → 広がると ratio は減る
+            (1, &[0.1], 0.6),                 // a 側 → 増える
+            (1, &[10.0], 1.0 - MIN_RATIO),    // 上限クランプ
+            (1, &[-10.0], MIN_RATIO),         // 下限クランプ
+            (2, &[10.0], MIN_RATIO),          // b 側の上限 = a の下限
+            (1, &[0.1, 0.1, -0.2], 0.5),      // 往復
+        ];
+        for (focus, deltas, want) in cases {
+            let mut l = SplitLayout::single(1);
+            l.split_focused(SplitDir::Horizontal, 2);
+            assert!(l.set_focus(*focus));
+            for d in *deltas {
+                l.resize_focused(*d);
+            }
+            let got = l.ratio_at(&[]).expect("ルートは分割ノード");
+            assert!(
+                (got - want).abs() < 1e-5,
+                "focus={focus} deltas={deltas:?}: {got} != {want}"
+            );
+            assert_invariants(&l, "リサイズ後");
+        }
+    }
+
+    #[test]
+    fn drag_gutter_respects_min_pane_px() {
+        let mut l = SplitLayout::single(1);
+        l.split_focused(SplitDir::Horizontal, 2);
+        // 200px の領域 (使える幅 194) を思い切り左へ引く → 48px 未満にはしない
+        l.drag_gutter(&[], -1000.0, 200.0, 6.0);
+        let r = l.ratio_at(&[]).unwrap();
+        assert!(r * 194.0 >= MIN_PANE_PX - 0.5, "左ペインが潰れた: {r}");
+        l.drag_gutter(&[], 1000.0, 200.0, 6.0);
+        let r = l.ratio_at(&[]).unwrap();
+        assert!((1.0 - r) * 194.0 >= MIN_PANE_PX - 0.5, "右ペインが潰れた: {r}");
+    }
+
+    #[test]
+    fn zoom_shows_only_focus_and_restores_geometry() {
+        let a = rect(0.0, 0.0, 400.0, 400.0);
+        let mut l = quad();
+        l.set_focus(4);
+        let before = l.rects(a, 6.0);
+        assert_eq!(before.len(), 4);
+
+        assert!(l.zoom_focused(), "ズーム ON");
+        let zoomed = l.rects(a, 6.0);
+        assert_eq!(zoomed, vec![(4, a)], "ズーム中は 1 枚が全面");
+        assert!(l.gutters(a, 6.0).is_empty(), "ズーム中は仕切りを出さない");
+
+        assert!(!l.zoom_focused(), "ズーム OFF");
+        assert_eq!(l.rects(a, 6.0), before, "元の幾何に戻る");
+
+        // ズーム中に分割したら自動で解除される (見えないペインを作らない)
+        l.zoom_focused();
+        l.split_focused(SplitDir::Vertical, 5);
+        assert!(!l.zoomed());
+        assert_eq!(l.rects(a, 6.0).len(), 5);
+    }
+
+    #[test]
+    fn equalize_makes_equal_areas() {
+        let a = rect(0.0, 0.0, 600.0, 600.0);
+        let mut l = three(); // 1 | (2 / 3)
+        l.drag_gutter(&[], 200.0, 600.0, 0.0);
+        l.equalize();
+        let rs = l.rects(a, 0.0);
+        // 左 1 枚 : 右 2 枚 → 1/3 : 2/3
+        assert!((rs[0].1.width() - 200.0).abs() <= 1.0, "{:?}", rs[0].1);
+        assert!((rs[1].1.width() - 400.0).abs() <= 1.0, "{:?}", rs[1].1);
+        let areas: Vec<f32> = rs.iter().map(|(_, r)| r.width() * r.height()).collect();
+        for w in &areas {
+            assert!((w - areas[0]).abs() <= 600.0, "面積が揃わない {areas:?}");
+        }
+        assert_invariants(&l, "均等化後");
+    }
+
+    #[test]
+    fn swap_exchanges_panes() {
+        let a = rect(0.0, 0.0, 400.0, 400.0);
+        let mut l = quad();
+        let before = l.rects(a, 6.0);
+        assert!(l.swap(1, 4));
+        let after = l.rects(a, 6.0);
+        assert_eq!(before[0].1, after[0].1, "矩形は動かない");
+        assert_eq!(after[0].0, 4);
+        assert_eq!(after[3].0, 1);
+        assert!(!l.swap(1, 1), "同じ ID は入れ替えない");
+        assert!(!l.swap(1, 99), "居ない ID は入れ替えない");
+        assert_invariants(&l, "入れ替え後");
+    }
+
+    #[test]
+    fn serde_round_trip_and_heal() {
+        let mut l = quad();
+        l.set_focus(3);
+        l.drag_gutter(&[], 40.0, 400.0, 6.0);
+        let key = |id: SessionId| Some(format!("/logs/agent-{id}.log"));
+        let rec = l.to_rec(&mut |id| key(id));
+
+        // TOML で往復しても壊れない (実際の保存経路と同じ形式)。
+        let toml_s = toml::to_string(&rec).expect("TOML へ書ける");
+        let back: SplitLayoutRec = toml::from_str(&toml_s).expect("TOML から読める");
+        assert_eq!(back, rec);
+
+        let ids = |k: &str| -> Option<SessionId> {
+            k.rsplit_once("agent-")
+                .and_then(|(_, r)| r.strip_suffix(".log"))
+                .and_then(|n| n.parse().ok())
+        };
+        let restored = back.to_layout(&mut |k| ids(k));
+        assert_eq!(restored.leaves(), l.leaves());
+        assert_eq!(restored.focus(), Some(3));
+        assert!((restored.ratio_at(&[]).unwrap() - l.ratio_at(&[]).unwrap()).abs() < 1e-4);
+        assert_invariants(&restored, "復元後");
+
+        // セッションが 1 本消えていたら、そのリーフを落として親を畳む。
+        let healed = back.to_layout(&mut |k| ids(k).filter(|id| *id != 3));
+        assert_eq!(healed.leaves(), vec![1, 2, 4], "3 だけ消えて畳まれる");
+        assert_eq!(healed.focus(), Some(1), "消えたフォーカスは先頭へ");
+        assert_invariants(&healed, "自己修復後");
+
+        // 全滅・壊れた記録でも panic しない。
+        assert!(back.to_layout(&mut |_| None).is_empty());
+        let broken = SplitLayoutRec {
+            nodes: vec!["H:0.5".into(), "L:/logs/agent-1.log".into()], // b が足りない
+            focus: String::new(),
+            zoomed: false,
+        };
+        assert!(broken.to_layout(&mut |k| ids(k)).is_empty());
+        assert!(SplitLayoutRec::default().to_layout(&mut |k| ids(k)).is_empty());
+    }
+
+    #[test]
+    fn to_rec_drops_leaves_without_a_stable_key() {
+        let l = quad();
+        let rec = l.to_rec(&mut |id| (id != 2).then(|| format!("k{id}")));
+        let back = rec.to_layout(&mut |k| k.strip_prefix('k').and_then(|n| n.parse().ok()));
+        assert_eq!(back.leaves(), vec![1, 3, 4]);
+        assert_invariants(&back, "キー欠けの保存");
+    }
+
+    #[test]
+    fn heal_drops_dead_sessions() {
+        let mut l = quad();
+        l.set_focus(2);
+        let alive = [1u64, 4];
+        assert!(l.heal(&mut |id| alive.contains(&id)));
+        assert_eq!(l.leaves(), vec![1, 4]);
+        assert_eq!(l.focus(), Some(1));
+        assert!(!l.heal(&mut |id| alive.contains(&id)), "2 度目は変化なし");
+        assert!(l.heal(&mut |_| false));
+        assert!(l.is_empty());
+        assert_eq!(l.focus(), None);
+    }
+
+    #[test]
+    fn apply_sizes_emits_one_call_per_visible_leaf() {
+        let a = rect(0.0, 0.0, 812.0, 612.0);
+        let (cw, ch) = (8.0, 16.0);
+        let mut l = SplitLayout::single(1);
+        l.split_focused(SplitDir::Horizontal, 2); // 使える幅 806 → 403 / 403
+
+        let mut got: Vec<(SessionId, u16, u16)> = Vec::new();
+        apply_sizes(&l, a, 6.0, cw, ch, &mut |id, r, c| got.push((id, r, c)));
+        // cols = floor((403 - 12) / 8) = 48、rows = floor((612 - 12) / 16) = 37
+        assert_eq!(got, vec![(1, 37, 48), (2, 37, 48)]);
+
+        // 上下分割: 使える高さ 606 → 303 / 303、rows = floor((303-12)/16) = 18
+        let mut l2 = SplitLayout::single(1);
+        l2.split_focused(SplitDir::Vertical, 2);
+        let mut got2: Vec<(SessionId, u16, u16)> = Vec::new();
+        apply_sizes(&l2, a, 6.0, cw, ch, &mut |id, r, c| got2.push((id, r, c)));
+        assert_eq!(got2, vec![(1, 18, 100), (2, 18, 100)]);
+
+        // ズーム中は見えている 1 枚だけ (全面サイズ)。
+        l2.set_focus(2);
+        l2.zoom_focused();
+        let mut got3: Vec<(SessionId, u16, u16)> = Vec::new();
+        apply_sizes(&l2, a, 6.0, cw, ch, &mut |id, r, c| got3.push((id, r, c)));
+        assert_eq!(got3, vec![(2, 37, 100)]);
+
+        // セル幅 0 の異常系では 1 件も出さない (0 除算で NaN を配らない)。
+        let mut none: Vec<(SessionId, u16, u16)> = Vec::new();
+        apply_sizes(&l2, a, 6.0, 0.0, ch, &mut |id, r, c| none.push((id, r, c)));
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn empty_layout_is_harmless() {
+        let mut l = SplitLayout::new();
+        let a = rect(0.0, 0.0, 100.0, 100.0);
+        assert!(l.rects(a, 6.0).is_empty());
+        assert!(l.gutters(a, 6.0).is_empty());
+        assert!(!l.focus_next());
+        assert!(!l.focus_dir(FocusDir::Left, a, 6.0));
+        assert!(!l.resize_focused(0.1));
+        assert!(!l.zoom_focused());
+        assert!(!l.close_leaf(1));
+        assert!(!l.set_focus(1));
+        l.equalize();
+        assert!(l.is_empty());
     }
 }

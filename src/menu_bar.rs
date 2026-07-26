@@ -17,6 +17,8 @@ pub struct MenuInfo {
     pub terminal_open: bool,
     pub cockpit_open: bool,
     pub kanban_open: bool,
+    /// エージェントデッキ (縦 1 本のエージェント管理画面) を開いているか
+    pub deck_open: bool,
     pub problems_open: bool,
     pub fullscreen: bool,
     pub auto_save: bool,
@@ -339,6 +341,14 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             };
             if item(ui, &kb, &sc(keys, BindAction::ToggleKanban), true) {
                 cmds.push(Cmd::ToggleKanban);
+            }
+            let dk = if info.deck_open {
+                tr("✓ エージェントデッキ")
+            } else {
+                tr("エージェントデッキ")
+            };
+            if item(ui, &dk, &sc(keys, BindAction::ToggleDeck), true) {
+                cmds.push(Cmd::ToggleDeck);
             }
             ui.separator();
             ui.menu_button(tr("配色テーマ"), |ui| {

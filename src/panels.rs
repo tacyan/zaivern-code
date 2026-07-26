@@ -955,7 +955,7 @@ fn session_row_ui(
 }
 
 /// エージェントの見分けマーク。カタログのアイコン、無ければ bin の頭文字。
-fn agent_mark(bin: &str) -> String {
+pub fn agent_mark(bin: &str) -> String {
     match crate::agents::spec_for_bin(bin) {
         Some(spec) if !spec.icon.is_empty() => spec.icon.to_string(),
         _ => bin

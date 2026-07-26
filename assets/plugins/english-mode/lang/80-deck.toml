@@ -1,0 +1,69 @@
+# エージェントデッキ (deck.rs / app.rs / menu_bar.rs)
+#
+# 「稼働中 / ローカルのセッション / 新規」を縦 1 本に並べて鍵盤だけで回す画面。
+# 既に他ファイルにあるキー (稼働中 / 作業中 / 待機 / 該当なし …) はここに書かない
+# (辞書は後勝ちマージなので、重複させると先の訳が黙って消える)。
+
+# ── 呼び出し (パレット / メニュー / ショートカット一覧 / 隔離表示) ──
+"エージェントデッキ" = "Agent Deck"
+"✓ エージェントデッキ" = "✓ Agent Deck"
+"エージェントデッキ 切替" = "Toggle Agent Deck"
+
+# ── ヘッダー ──
+"稼働中 {n}" = "{n} running"
+"承認待ち {n}" = "{n} awaiting approval"
+"作業中 {n}" = "{n} working"
+"使用量の見立て (coordinator::QuotaWatch)" = "Usage outlook (coordinator::QuotaWatch)"
+"デッキを閉じる (Esc)" = "Close the deck (Esc)"
+"表示を切り替える (1画面 → 2分割 → 積み上げ)" = "Cycle the view (single → split → stacked)"
+"同時に映すセッションを増やす" = "Show one more session at a time"
+"同時に映すセッションを減らす" = "Show one fewer session at a time"
+
+# ── レイアウト ──
+"1画面 (選択のみ)" = "Single (selection only)"
+"2分割" = "Split"
+"積み上げ" = "Stacked"
+
+# ── フィルタ ──
+"すべて" = "All"
+"要対応" = "Needs you"
+"絞り込み (/ でここへ)" = "Filter (press / to jump here)"
+"絞り込みを消す" = "Clear the filter"
+
+# ── セクション見出し ──
+"ローカルのセッション" = "Local sessions"
+"新規" = "New"
+"いま動いているセッション — Enter でその端末へ入ります" = "Sessions running right now — press Enter to step into the terminal"
+"この PC に残っている過去の会話 — Enter で再開します" = "Past conversations stored on this machine — press Enter to resume"
+"起動プリセット — Enter で新しいエージェントを起こします" = "Launch presets — press Enter to start a new agent"
+
+# ── 一覧の行 ──
+"承認待ちがあります" = "Approval requests are waiting"
+"入力・承認を待っています" = "Waiting for your input or approval"
+"{src}: {detail}" = "{src}: {detail}"
+"推定" = "guess"
+"もう一度 x で停止します" = "Press x again to stop"
+"（要約なし）" = "(no summary)"
+"再開" = "Resume"
+"この会話を続きから開きます" = "Reopen this conversation where it left off"
+"起動" = "Launch"
+"このプリセットで新しく起こします" = "Start a new agent from this preset"
+
+# ── 判定の出どころ (kanban::Source) ──
+"プロセス" = "process"
+"プロンプト検出" = "prompt detection"
+"上限検出" = "limit detection"
+"見張り" = "supervisor"
+"画面推定" = "screen guess"
+
+# ── 端末ペイン ──
+"このセッションを閉じる (x を 2 回)" = "Close this session (press x twice)"
+"再起動 (s)" = "Restart (s)"
+"複製 (d) — 同じプリセットと作業ディレクトリ" = "Duplicate (d) — same preset and working directory"
+"↑↓/jk: 選択 / Enter: 端末へ / Esc: 一覧へ戻る" = "↑↓/jk: select / Enter: terminal / Esc: back to the list"
+"この端末はいま表示できません" = "This terminal cannot be shown right now"
+"まだセッションがありません — 「新規」から n で起こせます" = "No sessions yet — press n under “New” to start one"
+"一覧から選ぶと、ここにその端末が出ます" = "Pick a row on the left and its terminal appears here"
+
+# ── 複製 ──
+"複製できません: {name} のプリセットが見つかりません" = "Cannot duplicate: no preset found for {name}"

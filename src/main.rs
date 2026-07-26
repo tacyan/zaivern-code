@@ -8,6 +8,7 @@ mod cli;
 mod commander;
 mod config;
 mod coordinator;
+mod deck;
 mod desktop;
 mod diagnostician;
 mod diff;
