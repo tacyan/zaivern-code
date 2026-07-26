@@ -838,18 +838,56 @@ mod tests {
         }
     }
 
+    /// OS を問わず動く「ACTION/WHY の 2 行を出すだけ」の診断役。
+    /// Windows の cmd echo は CRLF を出すが、parse_response は行ごとに trim
+    /// するので問題ない。WHY 本文はコンソールのコードページに依存しないよう
+    /// ASCII で渡すこと。
+    fn fake_reply(action: &str, why: &str, timeout_secs: u64) -> CliDiagnostician {
+        if cfg!(windows) {
+            raw(
+                "cmd",
+                &["/C", &format!("echo ACTION: {action}& echo WHY: {why}")],
+                timeout_secs,
+            )
+        } else {
+            raw(
+                "/bin/sh",
+                &["-c", &format!("printf 'ACTION: {action}\\nWHY: {why}\\n'")],
+                timeout_secs,
+            )
+        }
+    }
+
+    /// OS を問わず `secs` 秒待つだけの診断役 (タイムアウト系テスト用)。
+    /// Windows の ping は 1 発ごとに約 1 秒待つ (n+1 発 ≒ n 秒)。出力は
+    /// stdout/stderr とも NUL へ捨てる — パイプの書き手を孤児の ping に
+    /// 残すと、cmd を kill しても EOF が来ず読み取り側が待ち続ける。
+    fn fake_sleeper(secs: u64, timeout_secs: u64) -> CliDiagnostician {
+        if cfg!(windows) {
+            raw(
+                "cmd",
+                &[
+                    "/C",
+                    &format!("ping -n {} 127.0.0.1 > NUL 2>&1", secs + 1),
+                ],
+                timeout_secs,
+            )
+        } else {
+            raw("/bin/sh", &["-c", &format!("sleep {secs}")], timeout_secs)
+        }
+    }
+
     #[test]
     fn e2e_destructive_response_is_clamped_and_flagged() {
         // 暴走に対して halt を勧める応答 → halt のまま返るが確認必須の印が付く。
-        let d = raw("/bin/sh", &["-c", "printf 'ACTION: halt\\nWHY: 出力が止まらない\\n'; :"], 10);
-        // /bin/sh -c <script> <prompt> の形になるので prompt は $0 に入る (無害)。
+        let d = fake_reply("halt", "output never stops", 10);
         let out = d.diagnose(&req(Anomaly::Runaway, "loop loop loop")).unwrap();
         assert_eq!(out.recommended, Intervention::Halt);
         assert!(out.summary.contains("確認が必要"), "{}", out.summary);
         assert!(requires_confirmation(out.recommended));
 
         // 停滞に対して restart を勧める応答 → nudge へ引き下げ。
-        let d2 = raw("/bin/sh", &["-c", "printf 'ACTION: restart\\nWHY: 反応が無い\\n'"], 10);
+        let d2 = fake_reply("restart", "no response", 10);
         let out2 = d2.diagnose(&req(Anomaly::Stall, "...")).unwrap();
         assert_eq!(out2.recommended, Intervention::Nudge);
         assert!(out2.summary.contains("引き下げ"), "{}", out2.summary);
@@ -860,7 +898,7 @@ mod tests {
     #[test]
     fn refuses_to_diagnose_itself() {
         // 実行したら 30 秒固まるコマンドを設定しておく。ガードが効けば起動されない。
-        let d = raw("/bin/sh", &["-c", "sleep 30"], 60);
+        let d = fake_sleeper(30, 60);
         d.set_self_session(Some(7));
         assert_eq!(d.self_session_id(), Some(7));
 
@@ -873,7 +911,7 @@ mod tests {
         assert!(d.last_error().unwrap().contains("診断役自身"));
 
         // 別セッションなら通常どおり動く。
-        let d2 = raw("/bin/sh", &["-c", "printf 'ACTION: notify\\nWHY: 通知だけ\\n'"], 10);
+        let d2 = fake_reply("notify", "notify only", 10);
         d2.set_self_session(Some(999));
         assert!(d2.diagnose(&req(Anomaly::Stall, "x")).is_some());
     }
@@ -882,7 +920,11 @@ mod tests {
 
     #[test]
     fn nonzero_exit_yields_none_with_reason() {
-        let d = raw("/bin/sh", &["-c", "echo 'boom' >&2; exit 3"], 10);
+        let d = if cfg!(windows) {
+            raw("cmd", &["/C", "echo boom 1>&2 & exit 3"], 10)
+        } else {
+            raw("/bin/sh", &["-c", "echo 'boom' >&2; exit 3"], 10)
+        };
         assert!(d.diagnose(&req(Anomaly::Stall, "x")).is_none());
         let e = d.last_error().unwrap();
         assert!(e.contains("異常終了"), "{e}");
@@ -898,7 +940,7 @@ mod tests {
 
     #[test]
     fn hard_timeout_kills_child() {
-        let d = raw("/bin/sh", &["-c", "sleep 60"], 5);
+        let d = fake_sleeper(60, 5);
         let t0 = Instant::now();
         assert!(d.diagnose(&req(Anomaly::Stall, "x")).is_none());
         let took = t0.elapsed();
@@ -909,7 +951,16 @@ mod tests {
     #[test]
     fn huge_response_is_bounded_and_rejected() {
         // 大量出力でもバッファは MAX_RESPONSE_BYTES で止まり、形式不一致で None。
-        let d = raw("/bin/sh", &["-c", "yes ぐるぐる | head -c 2000000"], 30);
+        let d = if cfg!(windows) {
+            // 'guruguru' (8 文字) × 25 万 = 2,000,000 文字を 1 行で吐く
+            raw(
+                "powershell",
+                &["-NoProfile", "-Command", "'guruguru' * 250000"],
+                30,
+            )
+        } else {
+            raw("/bin/sh", &["-c", "yes ぐるぐる | head -c 2000000"], 30)
+        };
         assert!(d.diagnose(&req(Anomaly::Runaway, "x")).is_none());
         assert!(d.last_error().unwrap().contains("形式"));
     }

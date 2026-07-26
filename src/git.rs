@@ -55,7 +55,10 @@ pub fn discover_toplevel(dir: &Path) -> Option<PathBuf> {
     if s.is_empty() {
         return None;
     }
-    Some(PathBuf::from(s))
+    // アプリ内の正規形 (pathx::canonical = plain 形) に揃える。Windows では
+    // git が `C:/Users/RUNNER~1/...` (スラッシュ + 8.3 短縮名) を返すことが
+    // あり、canonicalize 済みのルートと strip_prefix で突き合わせられない。
+    Some(crate::pathx::canonical(&PathBuf::from(s)))
 }
 
 /// marks_cache の値: (text_hash, 取得時刻, 行マーク)。
@@ -299,7 +302,13 @@ impl GitSet {
         let root = self.root_for(abs)?;
         let top = self.toplevels.get(root)?.clone()?;
         let rel = abs.strip_prefix(&top).ok()?;
-        Some((top, rel.to_string_lossy().to_string()))
+        let mut rel = rel.to_string_lossy().to_string();
+        // git の status/diff はパスを / 区切りで報告する。照合キーになる
+        // 相対パスは Windows でも / に正規化して持つ。
+        if cfg!(windows) {
+            rel = rel.replace('\\', "/");
+        }
+        Some((top, rel))
     }
 
     /// 全 repo の status を TTL 付きで更新する。
@@ -553,20 +562,23 @@ index 1234567..89abcde 100644
         let sub = repo.join("crates").join("inner");
         std::fs::create_dir_all(&sub).expect("mkdir sub");
 
-        let canon_repo = repo.canonicalize().expect("canonicalize repo");
+        // アプリの正規形 (pathx::canonical = plain 形) で統一する。素の
+        // canonicalize は Windows で `\\?\` verbatim を返し、製品コードが
+        // 持ち回る形 (normalize_roots も pathx::canonical) と食い違う。
+        let canon_repo = crate::pathx::canonical(&repo);
         assert_eq!(
-            discover_toplevel(&sub).map(|p| p.canonicalize().unwrap()),
+            discover_toplevel(&sub).map(|p| crate::pathx::canonical(&p)),
             Some(canon_repo.clone()),
             "サブディレクトリからでも repo トップレベルが取れる",
         );
 
         // サブディレクトリをルートにしても、repo トップレベル基準で解決される
-        let mut set = GitSet::new(vec![sub.canonicalize().expect("canonicalize sub")]);
+        let mut set = GitSet::new(vec![crate::pathx::canonical(&sub)]);
         assert_eq!(set.repo_count(), 1);
         let (top, rel) = set
-            .resolve(&sub.canonicalize().unwrap().join("lib.rs"))
+            .resolve(&crate::pathx::canonical(&sub).join("lib.rs"))
             .expect("resolve should find the repo");
-        assert_eq!(top.canonicalize().unwrap(), canon_repo);
+        assert_eq!(crate::pathx::canonical(&top), canon_repo);
         assert_eq!(rel, "crates/inner/lib.rs", "repo 相対パスになる");
 
         // ブランチ名は rev-parse 経由で取れる(worktree/submodule 対応)

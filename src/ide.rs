@@ -838,42 +838,60 @@ mod tests {
     }
 
     /// テスト内では絶対パスだけを使い、cwd 依存を排除する。
+    /// "/tmp/a.rs" は Windows では絶対にならず (ドライブが無い)、absolutize が
+    /// カレントドライブを継ぎ足して期待値とずれるため、C: を前置して
+    /// どの OS でも「真に絶対」なパスにする。
     fn p(s: &str) -> PathBuf {
-        PathBuf::from(s)
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{s}"))
+        } else {
+            PathBuf::from(s)
+        }
+    }
+
+    /// `p()` が argv に載るときの文字列 (期待値の組み立て用)。
+    fn ps(s: &str) -> String {
+        p(s).to_string_lossy().into_owned()
+    }
+
+    /// `p()` が URL に載るときの文字列 (url_for は先頭の / を落とす)。
+    fn purl(s: &str) -> String {
+        let a = ps(s);
+        a.strip_prefix('/').unwrap_or(&a).to_string()
     }
 
     #[test]
     fn goto_colon_vscode_family() {
         let args = build_open_file_args(spec("vscode"), &p("/tmp/a.rs"), 42, 5);
-        assert_eq!(args, vec!["-g", "/tmp/a.rs:42:5"]);
+        assert_eq!(args, vec!["-g".to_string(), format!("{}:42:5", ps("/tmp/a.rs"))]);
         // フォークも同じ形
         for key in ["cursor", "trae", "kiro", "vscode-insiders"] {
             let a = build_open_file_args(spec(key), &p("/tmp/a.rs"), 7, 3);
-            assert_eq!(a, vec!["-g", "/tmp/a.rs:7:3"], "{key}");
+            assert_eq!(a, vec!["-g".to_string(), format!("{}:7:3", ps("/tmp/a.rs"))], "{key}");
         }
     }
 
     #[test]
     fn goto_space_colon_windsurf() {
         let args = build_open_file_args(spec("windsurf"), &p("/tmp/a.rs"), 10, 2);
-        assert_eq!(args, vec!["--goto", "/tmp/a.rs:10:2"]);
+        assert_eq!(args, vec!["--goto".to_string(), format!("{}:10:2", ps("/tmp/a.rs"))]);
     }
 
     #[test]
     fn goto_equals_fleet() {
         let args = build_open_file_args(spec("fleet"), &p("/tmp/a.rs"), 10, 5);
-        assert_eq!(args, vec!["--goto=/tmp/a.rs:10:5"]);
+        assert_eq!(args, vec![format!("--goto={}:10:5", ps("/tmp/a.rs"))]);
     }
 
     #[test]
     fn bare_colon_zed_and_sublime() {
         assert_eq!(
             build_open_file_args(spec("zed"), &p("/tmp/a.rs"), 12, 9),
-            vec!["/tmp/a.rs:12:9"]
+            vec![format!("{}:12:9", ps("/tmp/a.rs"))]
         );
         assert_eq!(
             build_open_file_args(spec("sublime"), &p("/tmp/a.rs"), 12, 9),
-            vec!["/tmp/a.rs:12:9"]
+            vec![format!("{}:12:9", ps("/tmp/a.rs"))]
         );
     }
 
@@ -882,12 +900,28 @@ mod tests {
         let args = build_open_file_args(spec("intellij"), &p("/src/main.rs"), 42, 5);
         assert_eq!(
             args,
-            vec!["--line", "42", "--column", "5", "/src/main.rs"],
+            vec![
+                "--line".to_string(),
+                "42".to_string(),
+                "--column".to_string(),
+                "5".to_string(),
+                ps("/src/main.rs"),
+            ],
             "JetBrains は --line と --column を別々に取り、パスは最後"
         );
         for key in ["pycharm", "webstorm", "rustrover", "goland"] {
             let a = build_open_file_args(spec(key), &p("/src/main.rs"), 1, 1);
-            assert_eq!(a, vec!["--line", "1", "--column", "1", "/src/main.rs"], "{key}");
+            assert_eq!(
+                a,
+                vec![
+                    "--line".to_string(),
+                    "1".to_string(),
+                    "--column".to_string(),
+                    "1".to_string(),
+                    ps("/src/main.rs"),
+                ],
+                "{key}"
+            );
         }
     }
 
@@ -896,7 +930,7 @@ mod tests {
         let args = build_open_file_args(spec("xcode"), &p("/src/App.swift"), 99, 40);
         assert_eq!(
             args,
-            vec!["--line", "99", "/src/App.swift"],
+            vec!["--line".to_string(), "99".to_string(), ps("/src/App.swift")],
             "xed は列を受け付けないので col は捨てる"
         );
         assert!(!args.iter().any(|a| a == "--column"));
@@ -906,19 +940,19 @@ mod tests {
     #[test]
     fn line_only_android_studio() {
         let args = build_open_file_args(spec("android-studio"), &p("/src/Main.kt"), 8, 2);
-        assert_eq!(args, vec!["--line", "8", "/src/Main.kt"]);
+        assert_eq!(args, vec!["--line".to_string(), "8".to_string(), ps("/src/Main.kt")]);
     }
 
     #[test]
     fn plus_line_neovide_has_separator_and_no_column() {
         let args = build_open_file_args(spec("neovide"), &p("/tmp/a.rs"), 33, 7);
-        assert_eq!(args, vec!["--", "+33", "/tmp/a.rs"]);
+        assert_eq!(args, vec!["--".to_string(), "+33".to_string(), ps("/tmp/a.rs")]);
     }
 
     #[test]
     fn plus_line_col_emacs() {
         let args = build_open_file_args(spec("emacs"), &p("/tmp/a.rs"), 33, 7);
-        assert_eq!(args, vec!["-c", "+33:7", "/tmp/a.rs"]);
+        assert_eq!(args, vec!["-c".to_string(), "+33:7".to_string(), ps("/tmp/a.rs")]);
     }
 
     #[test]
@@ -926,22 +960,31 @@ mod tests {
         let path = p("/Users/me/My Projects/hello world.rs");
         let args = build_open_file_args(spec("cursor"), &path, 3, 4);
         assert_eq!(args.len(), 2, "クォート不要: シェルを経由しないので 1 要素のまま");
-        assert_eq!(args[1], "/Users/me/My Projects/hello world.rs:3:4");
+        assert_eq!(args[1], format!("{}:3:4", ps("/Users/me/My Projects/hello world.rs")));
 
         let jb = build_open_file_args(spec("intellij"), &path, 3, 4);
-        assert_eq!(jb.last().unwrap(), "/Users/me/My Projects/hello world.rs");
+        assert_eq!(jb.last().unwrap(), &ps("/Users/me/My Projects/hello world.rs"));
 
         let folder = build_open_folder_args(spec("zed"), &p("/Users/me/My Projects"), false);
-        assert_eq!(folder, vec!["/Users/me/My Projects"]);
+        assert_eq!(folder, vec![ps("/Users/me/My Projects")]);
     }
 
     #[test]
     fn zero_based_input_is_clamped_to_one() {
         // 契約は 1 始まり。0 は呼び出し側のバグだが 1 に丸めて事故を防ぐ。
         let args = build_open_file_args(spec("cursor"), &p("/tmp/a.rs"), 0, 0);
-        assert_eq!(args, vec!["-g", "/tmp/a.rs:1:1"]);
+        assert_eq!(args, vec!["-g".to_string(), format!("{}:1:1", ps("/tmp/a.rs"))]);
         let jb = build_open_file_args(spec("intellij"), &p("/tmp/a.rs"), 0, 0);
-        assert_eq!(jb, vec!["--line", "1", "--column", "1", "/tmp/a.rs"]);
+        assert_eq!(
+            jb,
+            vec![
+                "--line".to_string(),
+                "1".to_string(),
+                "--column".to_string(),
+                "1".to_string(),
+                ps("/tmp/a.rs"),
+            ]
+        );
     }
 
     #[test]
@@ -959,20 +1002,20 @@ mod tests {
     fn folder_args_plain_and_add() {
         assert_eq!(
             build_open_folder_args(spec("vscode"), &p("/work/proj"), false),
-            vec!["/work/proj"]
+            vec![ps("/work/proj")]
         );
         assert_eq!(
             build_open_folder_args(spec("vscode"), &p("/work/proj"), true),
-            vec!["-a", "/work/proj"]
+            vec!["-a".to_string(), ps("/work/proj")]
         );
         assert_eq!(
             build_open_folder_args(spec("zed"), &p("/work/proj"), true),
-            vec!["--add", "/work/proj"]
+            vec!["--add".to_string(), ps("/work/proj")]
         );
         // Xcode はフォルダに -p が要る。追加フラグは無いので add は無視される。
         assert_eq!(
             build_open_folder_args(spec("xcode"), &p("/work/proj"), true),
-            vec!["-p", "/work/proj"]
+            vec!["-p".to_string(), ps("/work/proj")]
         );
     }
 
@@ -980,15 +1023,15 @@ mod tests {
     fn url_scheme_fallback() {
         assert_eq!(
             url_for(spec("vscode"), &p("/tmp/a.rs"), 4, 2).unwrap(),
-            "vscode://file/tmp/a.rs:4:2"
+            format!("vscode://file/{}:4:2", purl("/tmp/a.rs"))
         );
         assert_eq!(
             url_for(spec("vscode-insiders"), &p("/tmp/a.rs"), 4, 2).unwrap(),
-            "vscode-insiders://file/tmp/a.rs:4:2"
+            format!("vscode-insiders://file/{}:4:2", purl("/tmp/a.rs"))
         );
         assert_eq!(
             url_for(spec("antigravity"), &p("/tmp/a.rs"), 4, 2).unwrap(),
-            "antigravity://file/tmp/a.rs:4:2"
+            format!("antigravity://file/{}:4:2", purl("/tmp/a.rs"))
         );
         // スキームを持たない IDE は None
         assert!(url_for(spec("sublime"), &p("/tmp/a.rs"), 1, 1).is_none());
@@ -998,7 +1041,13 @@ mod tests {
     #[test]
     fn url_percent_encodes_spaces() {
         let url = url_for(spec("cursor"), &p("/Users/me/My Projects/a b.rs"), 1, 1).unwrap();
-        assert_eq!(url, "cursor://file/Users/me/My%20Projects/a%20b.rs:1:1");
+        assert_eq!(
+            url,
+            format!(
+                "cursor://file/{}:1:1",
+                purl("/Users/me/My Projects/a b.rs").replace(' ', "%20")
+            )
+        );
         assert!(!url.contains(' '));
     }
 

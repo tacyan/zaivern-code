@@ -460,8 +460,16 @@ mod tests {
     /// 同じテストがそのまま意味を持つ (バイト列を書き下すと日本語専用になる)。
     #[cfg(windows)]
     fn legacy_fixture() -> Option<(&'static str, Vec<u8>, u32)> {
-        let cp = super::ansi_code_page();
-        // 各言語環境で「その ANSI にあり ASCII でない」候補を順に試す
+        legacy_fixture_for(super::ansi_code_page())
+    }
+
+    /// 指定コードページで「ASCII でない文字を含む素材」を組み立てる。
+    /// decode_output は console (OEM) を、decode_bytes は ANSI を使うので、
+    /// テストごとに検証対象と同じコードページで素材を作ること
+    /// (西欧 Windows では ANSI=1252 / OEM=437 と食い違う)。
+    #[cfg(windows)]
+    fn legacy_fixture_for(cp: u32) -> Option<(&'static str, Vec<u8>, u32)> {
+        // 各言語環境で「そのコードページにあり ASCII でない」候補を順に試す
         for probe in ["日本語", "中文字", "한국어", "Grüße", "Ünicode"] {
             if let Some(bytes) = super::win::encode(probe, cp) {
                 if bytes != probe.as_bytes() {
@@ -517,8 +525,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn legacy_output_is_decoded_not_mangled() {
-        let Some((text, bytes, _cp)) = legacy_fixture() else {
-            return; // この環境の ANSI では試せる文字が無い (US-ASCII 環境など)
+        // decode_output は console (OEM) コードページで読み直すので素材も同じで作る
+        let Some((text, bytes, _cp)) = legacy_fixture_for(super::console_code_page()) else {
+            return; // この環境のコードページでは試せる文字が無い (US-ASCII 環境など)
         };
         let s = decode_output(&bytes);
         assert_eq!(s, text, "OS のコードページで返る出力は読めなければならない");

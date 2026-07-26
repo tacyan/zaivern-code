@@ -2348,11 +2348,17 @@ fn build_file_index(roots: &[PathBuf]) -> Vec<IndexedFile> {
                         }
                     } else if name != ".DS_Store" {
                         let abs = e.path();
-                        let rel = abs
+                        let mut rel = abs
                             .strip_prefix(root)
                             .unwrap_or(&abs)
                             .to_string_lossy()
                             .to_string();
+                        // 索引の相対パスは Windows でも / 区切りに正規化する。
+                        // ファイル名抽出 (rsplit('/')) やあいまい検索の入力・
+                        // ラベル表示を OS 間で一致させるため (abs はネイティブのまま)。
+                        if cfg!(windows) {
+                            rel = rel.replace('\\', "/");
+                        }
                         out.push(IndexedFile {
                             abs,
                             label: format!("{root_name}/{rel}"),

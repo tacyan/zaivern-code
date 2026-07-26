@@ -2836,7 +2836,10 @@ run = "c"
         assert_eq!(get("ZV_PLUGIN_DIR"), a.dir.display().to_string());
         assert_eq!(get("ZV_API"), "2");
         assert!(!get("ZV_BIN").is_empty());
-        assert!(get("ZV_PLUGIN_DATA").ends_with("plugin-data/alpha"));
+        // Windows は \ 区切りで返るので / に寄せてから比較する
+        assert!(get("ZV_PLUGIN_DATA")
+            .replace('\\', "/")
+            .ends_with("plugin-data/alpha"));
         assert_eq!(get("ZV_SELECTION"), "sel");
         assert_eq!(get("ZV_LINE"), "1", "0 は 1 に丸める");
         assert_eq!(get("ZV_COLUMN"), "7");
@@ -2964,9 +2967,23 @@ run = "c"
 
     #[test]
     fn run_reports_failure_and_timeout() {
+        // コマンドは OS のシェル (unix: $SHELL -c / Windows: cmd /C) で走るので
+        // 構文もそれぞれに合わせる (cmd は `;` を区切りとして解さない)。
+        let fail_cmd = if cfg!(windows) {
+            "echo boom 1>&2 & exit 3"
+        } else {
+            "echo boom >&2; exit 3"
+        };
+        // ping の出力は stdout/stderr とも NUL へ。パイプの書き手を残すと、
+        // cmd を kill しても孤児の ping が EOF を塞いで読み取りが 30 秒待つ。
+        let sleep_cmd = if cfg!(windows) {
+            "ping -n 31 127.0.0.1 > NUL 2>&1"
+        } else {
+            "sleep 30"
+        };
         let out = run_sync(RunRequest {
             plugin: "p".into(),
-            command: basic_cmd("echo boom >&2; exit 3", 10),
+            command: basic_cmd(fail_cmd, 10),
             stdin_text: String::new(),
             envs: Vec::new(),
             workdir: std::env::temp_dir(),
@@ -2980,7 +2997,7 @@ run = "c"
         let started = Instant::now();
         let out = run_sync(RunRequest {
             plugin: "p".into(),
-            command: basic_cmd("sleep 30", 1),
+            command: basic_cmd(sleep_cmd, 1),
             stdin_text: String::new(),
             envs: Vec::new(),
             workdir: std::env::temp_dir(),

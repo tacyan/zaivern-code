@@ -2473,6 +2473,9 @@ mod tests {
         assert_eq!(word_selection(p.screen(), 0, 3), None);
     }
 
+    // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
+    // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
     #[test]
     fn pet_bubble_approve_flow_e2e() {
         use super::{Attention, Session, SpawnSpec};
@@ -2530,6 +2533,9 @@ mod tests {
         s.kill();
     }
 
+    // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
+    // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
     #[test]
     fn pet_bubble_approve_flow_antigravity() {
         use super::{Attention, Session, SpawnSpec};
@@ -2615,6 +2621,9 @@ mod tests {
         assert_ne!(prompt_signature(first), prompt_signature(next));
     }
 
+    // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
+    // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
     #[test]
     fn auto_yes_replies_only_once_while_same_prompt_remains() {
         use super::{Attention, Session, SpawnSpec};
@@ -2660,6 +2669,9 @@ mod tests {
         s.kill();
     }
 
+    // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
+    // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
     #[test]
     fn auto_yes_presses_pet_approve_after_stall_timeout() {
         use super::{Attention, Session, SpawnSpec};
@@ -2718,6 +2730,9 @@ mod tests {
         s.kill();
     }
 
+    // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
+    // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
     #[test]
     fn auto_yes_visible_choice_is_received_by_child_process() {
         use super::{Attention, Session, SpawnSpec};
@@ -2774,6 +2789,9 @@ mod tests {
         s.kill();
     }
 
+    // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
+    // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
     #[test]
     fn disabled_auto_yes_leaves_visible_choice_waiting() {
         use super::{Attention, Session, SpawnSpec};
@@ -2815,6 +2833,9 @@ mod tests {
         s.kill();
     }
 
+    // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
+    // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
     #[test]
     fn resolve_attention_suppresses_same_prompt_redetection() {
         use super::{Attention, Session, SpawnSpec};
@@ -2861,6 +2882,9 @@ mod tests {
         s.kill();
     }
 
+    // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
+    // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
     #[test]
     fn manual_typing_resolves_attention_episode() {
         use super::{Attention, Session, SpawnSpec};
@@ -2919,6 +2943,9 @@ mod tests {
         s.kill();
     }
 
+    // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
+    // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
     #[test]
     fn next_prompt_with_different_signature_is_detected_again() {
         use super::{Attention, Session, SpawnSpec};
