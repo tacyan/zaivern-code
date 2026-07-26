@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -7,7 +8,7 @@ use std::sync::Arc;
 
 use eframe::egui::Galley;
 
-use crate::highlight::Highlighter;
+use crate::highlight::{fold_ranges, FoldRange, Highlighter};
 
 pub fn hash_str(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
@@ -105,6 +106,15 @@ pub struct Buffer {
     /// PDF タブ (`BufferKind::Pdf`) の抽出待ち。Some の間は本文が
     /// 「読み込み中…」で、`Editor::poll_pdf_jobs` が完成本文へ差し替える。
     pub pdf_job: Option<PdfJob>,
+    /// 折りたたみ状態。本文を書き換えたら `refresh_folds()` を呼ぶ。
+    pub folds: FoldState,
+    /// 行ブックマーク。行の増減時は `bookmarks.shift_lines()` を呼ぶ。
+    #[allow(dead_code)]
+    pub bookmarks: Bookmarks,
+    /// 巨大ファイルモードの制限 (通常のファイルでは既定値 = 無制限)。
+    pub large: LargeFileMode,
+    /// CSV/TSV のテーブル表示。`None` の間は普通のテキストとして描く。
+    pub table: Option<TableView>,
 }
 
 /// 画像タブのデコード結果。
@@ -246,13 +256,102 @@ pub fn is_pdf_path(path: &Path) -> bool {
 ///
 /// pdf-extract の抽出コストはページ数とフォント数に比例し、数十 MB 級の
 /// スキャン PDF では秒単位になりうる。UI スレッドを止めないための防壁。
-/// `MAX_OPEN_BYTES` (50 MB) より小さくしておくことで、「開けないファイル」
+/// `MAX_OPEN_BYTES` より小さくしておくことで、「開けないファイル」
 /// ではなく「開けるが抽出だけ諦めるタブ」として出せる。
 pub const PDF_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-/// `Editor::open` が読み込みを拒否する上限。巨大ログのクリックで
-/// 同期 IO がフリーズするのを防ぐ。
-pub const MAX_OPEN_BYTES: u64 = 50 * 1024 * 1024;
+// ---------------------------------------------------------------------------
+// 巨大ファイルモード
+//
+// 以前は 50 MB を超えるファイルを**開くこと自体を断って**いた。しかし
+// 「大きいログを見たい」は正当な用途で、断られると外部エディタを開く羽目になる。
+// そこで段階を付け、大きいファイルは**読み取り専用 + ハイライト無効**で開く。
+// 本当に開けない (メモリが持たない) 大きさだけを [`MAX_OPEN_BYTES`] で断る。
+// ---------------------------------------------------------------------------
+
+/// この大きさ以上はシンタックスハイライトを止める (編集は可能)。
+///
+/// syntect は 1 文書ぶんの `LayoutJob` を作るため、数 MB を超えると
+/// 1 打鍵ごとの再ハイライトが目に見えて重くなる。
+pub const HEAVY_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// この大きさ以上は読み取り専用で開く (巨大ファイルモード)。
+///
+/// `TextEdit::multiline` は編集のたびに文字列全体を作り直すので、
+/// この規模で編集を許すと 1 打鍵が数百 ms になる。閲覧はできる。
+pub const LARGE_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// `Editor::open` が読み込みを拒否する上限。ここを超えるとメモリ上に
+/// 載せた時点で破綻するため、素直に断る。
+pub const MAX_OPEN_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 大きさの段。`(この大きさ以上, ハイライトする, 編集できる)` を
+/// **大きい順**に並べる。最初に一致した段が採用される。
+///
+/// 閾値を増やしたいときはこの表に 1 行足すだけでよい (関数側は触らない)。
+const LARGE_FILE_TIERS: &[(u64, bool, bool)] = &[
+    (LARGE_FILE_BYTES, false, false),
+    (HEAVY_FILE_BYTES, false, true),
+    (0, true, true),
+];
+
+/// 巨大ファイルモードの状態。UI (app.rs) はこれを見てバナーを出す。
+///
+/// 文言は i18n を持つ app.rs 側で `trf!` を使って組み立てる。ここでは
+/// 「何がどう制限されているか」だけを渡す (この層は文字列を持たない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LargeFileMode {
+    /// 何らかの制限がかかっているか (バナーを出すべきか)。
+    pub active: bool,
+    /// 編集を禁止するか。
+    pub read_only: bool,
+    /// シンタックスハイライトを行うか (false なら素のテキストで描く)。
+    pub highlight: bool,
+    /// 判定に使ったファイルサイズ (バナーに出す)。
+    pub bytes: u64,
+}
+
+impl Default for LargeFileMode {
+    fn default() -> Self {
+        Self {
+            active: false,
+            read_only: false,
+            highlight: true,
+            bytes: 0,
+        }
+    }
+}
+
+/// サイズから決まる開き方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenDecision {
+    /// 開ける (制限の有無は [`LargeFileMode`] を見る)。
+    Open(LargeFileMode),
+    /// 大きすぎて開けない。
+    Refuse { bytes: u64, limit: u64 },
+}
+
+/// ファイルサイズから開き方を決める純関数。
+pub fn open_decision(bytes: u64) -> OpenDecision {
+    if bytes > MAX_OPEN_BYTES {
+        return OpenDecision::Refuse {
+            bytes,
+            limit: MAX_OPEN_BYTES,
+        };
+    }
+    let tier = LARGE_FILE_TIERS
+        .iter()
+        .find(|(min, _, _)| bytes >= *min)
+        .copied()
+        .unwrap_or((0, true, true));
+    let (_, highlight, editable) = tier;
+    OpenDecision::Open(LargeFileMode {
+        active: !highlight || !editable,
+        read_only: !editable,
+        highlight,
+        bytes,
+    })
+}
 
 /// PDF からページ単位のテキストを取り出す。
 ///
@@ -504,9 +603,591 @@ pub fn whitespace_layout_job(
     out
 }
 
+// ===========================================================================
+// 行番号の付け替え (折りたたみ・ブックマークの編集耐性)
+// ===========================================================================
+
+/// 行の挿入 / 削除に追随して行番号を付け替える。
+///
+/// `at` 行目に `delta` 行が挿入された (`delta > 0`) / 削除された
+/// (`delta < 0`) ときの、`line` の新しい位置を返す。削除された行そのものは
+/// `None` (印が消える)。`at` より前の行は動かない。
+pub fn remap_line(line: usize, at: usize, delta: isize) -> Option<usize> {
+    if line < at {
+        return Some(line);
+    }
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Equal => Some(line),
+        std::cmp::Ordering::Greater => Some(line + delta as usize),
+        std::cmp::Ordering::Less => {
+            let removed = delta.unsigned_abs();
+            if line < at + removed {
+                None
+            } else {
+                Some(line - removed)
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// 折りたたみ状態 (バッファごと)
+// ===========================================================================
+
+/// ガターに出す折りたたみの印。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldMarker {
+    /// 畳める範囲の先頭で、いまは開いている (▼)。
+    Open,
+    /// 畳んである (▶)。
+    Closed,
+}
+
+/// バッファ 1 個ぶんの折りたたみ状態。
+///
+/// **契約**: 本文を書き換えたら必ず [`FoldState::refresh`] を呼ぶこと
+/// (中で本文ハッシュを見て、変わったときだけ再計算する)。再計算のたびに、
+/// 「もう範囲の先頭ではなくなった」畳みは自動的に捨てられる。
+/// 行の挿入 / 削除が分かっているときは、先に [`FoldState::shift_lines`] を
+/// 呼ぶと畳んだ状態が編集を跨いで生き残る。
+#[derive(Default)]
+pub struct FoldState {
+    /// 畳んである範囲の開始行 (0 始まり)。
+    folded: HashSet<usize>,
+    /// 直近に計算した範囲 (開始行の昇順)。
+    ranges: Vec<FoldRange>,
+    /// `ranges` を計算した本文 + 言語のハッシュ。
+    hash: Option<u64>,
+}
+
+#[allow(dead_code)]
+impl FoldState {
+    /// 本文が変わっていれば範囲を計算し直す。再計算したら `true`。
+    ///
+    /// 再計算後、「開始行がもう範囲の先頭ではない」畳みは捨てる
+    /// (行がずれて別のコードを隠してしまうより、開いた方が安全)。
+    pub fn refresh(&mut self, text: &str, lang: &str) -> bool {
+        let key = combine_hash(hash_str(text), hash_str(lang));
+        if self.hash == Some(key) {
+            return false;
+        }
+        self.hash = Some(key);
+        self.ranges = fold_ranges(text, lang);
+        if !self.folded.is_empty() {
+            let starts: HashSet<usize> = self.ranges.iter().map(|r| r.start_line).collect();
+            self.folded.retain(|l| starts.contains(l));
+        }
+        true
+    }
+
+    /// 直近に計算した範囲 (開始行の昇順)。
+    pub fn ranges(&self) -> &[FoldRange] {
+        &self.ranges
+    }
+
+    /// 畳んである範囲の開始行の集合。
+    pub fn folded(&self) -> &HashSet<usize> {
+        &self.folded
+    }
+
+    /// この行から始まる範囲。
+    pub fn range_at(&self, line: usize) -> Option<FoldRange> {
+        self.ranges.iter().copied().find(|r| r.start_line == line)
+    }
+
+    /// この行が畳める行か (ガターに ▼ を出すか)。
+    pub fn is_foldable(&self, line: usize) -> bool {
+        self.ranges.iter().any(|r| r.start_line == line)
+    }
+
+    /// この行が畳んであるか。
+    pub fn is_folded(&self, line: usize) -> bool {
+        self.folded.contains(&line)
+    }
+
+    /// ガターの印。畳めない行は `None`。
+    pub fn marker(&self, line: usize) -> Option<FoldMarker> {
+        if !self.is_foldable(line) {
+            return None;
+        }
+        Some(if self.is_folded(line) {
+            FoldMarker::Closed
+        } else {
+            FoldMarker::Open
+        })
+    }
+
+    /// 折りたたみを切り替える。切り替わったら `true`
+    /// (畳めない行を渡したときは何もせず `false`)。
+    pub fn toggle_fold(&mut self, line: usize) -> bool {
+        if !self.is_foldable(line) {
+            return false;
+        }
+        if !self.folded.remove(&line) {
+            self.folded.insert(line);
+        }
+        true
+    }
+
+    /// 畳む (すでに畳んであれば何もしない)。
+    pub fn fold(&mut self, line: usize) -> bool {
+        self.is_foldable(line) && self.folded.insert(line)
+    }
+
+    /// 開く。
+    pub fn unfold(&mut self, line: usize) -> bool {
+        self.folded.remove(&line)
+    }
+
+    /// すべて畳む。
+    pub fn fold_all(&mut self) {
+        self.folded = self.ranges.iter().map(|r| r.start_line).collect();
+    }
+
+    /// すべて開く。
+    pub fn unfold_all(&mut self) {
+        self.folded.clear();
+    }
+
+    /// 入れ子の深さ `level` (1 始まり = いちばん外側) の範囲だけを畳んだ
+    /// 状態にする。VS Code の「レベル N まで折りたたむ」相当。
+    pub fn fold_level(&mut self, level: usize) {
+        self.folded.clear();
+        if level == 0 {
+            return;
+        }
+        for (r, d) in self.ranges_with_depth() {
+            if d == level {
+                self.folded.insert(r.start_line);
+            }
+        }
+    }
+
+    /// 各範囲の入れ子の深さ (1 始まり)。範囲は開始行の昇順。
+    pub fn ranges_with_depth(&self) -> Vec<(FoldRange, usize)> {
+        let mut stack: Vec<FoldRange> = Vec::new();
+        let mut out = Vec::with_capacity(self.ranges.len());
+        for r in self.ranges.iter().copied() {
+            while stack.last().is_some_and(|t| t.end_line < r.start_line) {
+                stack.pop();
+            }
+            out.push((r, stack.len() + 1));
+            stack.push(r);
+        }
+        out
+    }
+
+    /// 畳んだ結果この行が隠れるか。
+    pub fn is_line_hidden(&self, line: usize) -> bool {
+        self.folded
+            .iter()
+            .filter_map(|s| self.range_at(*s))
+            .any(|r| r.hides(line))
+    }
+
+    /// 隠れている行の区間 `(先頭, 末尾)` を、重なりをまとめて昇順で返す。
+    /// 行を舐めて描く側はこれを使うと O(行数) で済む。
+    pub fn hidden_spans(&self) -> Vec<(usize, usize)> {
+        let mut v: Vec<(usize, usize)> = self
+            .folded
+            .iter()
+            .filter_map(|s| self.range_at(*s))
+            .map(|r| (r.start_line + 1, r.end_line))
+            .collect();
+        v.sort_unstable();
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+        for (s, e) in v {
+            match out.last_mut() {
+                Some(last) if s <= last.1 + 1 => last.1 = last.1.max(e),
+                _ => out.push((s, e)),
+            }
+        }
+        out
+    }
+
+    /// `line` 以降で最初に表示される行。全部隠れていれば行数を返す。
+    pub fn first_visible_from(&self, line: usize, line_count: usize) -> usize {
+        let mut l = line;
+        while l < line_count && self.is_line_hidden(l) {
+            l += 1;
+        }
+        l
+    }
+
+    /// 行の挿入 / 削除に合わせて畳んだ位置をずらす
+    /// ([`remap_line`] と同じ規約)。範囲キャッシュは無効化する。
+    pub fn shift_lines(&mut self, at: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        self.folded = self
+            .folded
+            .iter()
+            .filter_map(|l| remap_line(*l, at, delta))
+            .collect();
+        self.hash = None;
+    }
+}
+
+// ===========================================================================
+// ブックマーク (バッファごと)
+// ===========================================================================
+
+/// 行ブックマーク。`BTreeSet` なので next / prev が順序どおりに取れる。
+#[derive(Default)]
+pub struct Bookmarks {
+    lines: BTreeSet<usize>,
+}
+
+#[allow(dead_code)]
+impl Bookmarks {
+    /// 印を付け外しする。付いたら `true`。
+    pub fn toggle(&mut self, line: usize) -> bool {
+        if self.lines.remove(&line) {
+            false
+        } else {
+            self.lines.insert(line);
+            true
+        }
+    }
+
+    pub fn is_marked(&self, line: usize) -> bool {
+        self.lines.contains(&line)
+    }
+
+    pub fn clear_all(&mut self) {
+        self.lines.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// 昇順のイテレータ。
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.lines.iter().copied()
+    }
+
+    /// `line` より後の最初の印。無ければ先頭へ回り込む。
+    pub fn next_after(&self, line: usize) -> Option<usize> {
+        self.lines
+            .range(line + 1..)
+            .next()
+            .or_else(|| self.lines.iter().next())
+            .copied()
+    }
+
+    /// `line` より前の最後の印。無ければ末尾へ回り込む。
+    pub fn prev_before(&self, line: usize) -> Option<usize> {
+        self.lines
+            .range(..line)
+            .next_back()
+            .or_else(|| self.lines.iter().next_back())
+            .copied()
+    }
+
+    /// 行の挿入 / 削除に合わせて印をずらす ([`remap_line`] と同じ規約)。
+    /// 削除された行の印は消える。
+    pub fn shift_lines(&mut self, at: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        self.lines = self
+            .lines
+            .iter()
+            .filter_map(|l| remap_line(*l, at, delta))
+            .collect();
+    }
+}
+
+// ===========================================================================
+// 閉じたタブを開き直す
+// ===========================================================================
+
+/// 閉じたタブの記録 (Ctrl+Shift+T で開き直すのに要るものだけ)。
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub struct ClosedTab {
+    pub path: PathBuf,
+    pub title: String,
+    /// 閉じた時点のキャレット位置 (行, 桁) — 1 始まり。
+    pub cursor: (usize, usize),
+    /// 閉じた時点のスクロール量 (px)。分からなければ 0.0。
+    pub scroll: f32,
+}
+
+/// 閉じたタブの履歴上限。
+pub const CLOSED_TABS_CAP: usize = 20;
+
+/// 直近に閉じたタブの LRU。新しいものが先頭。
+///
+/// 同じパスを二度閉じたときは古い記録を捨てて 1 件にまとめる
+/// (履歴が同じファイルで埋まらないように)。
+pub struct ClosedTabs {
+    items: VecDeque<ClosedTab>,
+    cap: usize,
+}
+
+impl Default for ClosedTabs {
+    fn default() -> Self {
+        Self::with_capacity(CLOSED_TABS_CAP)
+    }
+}
+
+#[allow(dead_code)]
+impl ClosedTabs {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// 閉じたタブを積む。上限を超えたら**いちばん古いもの**を捨てる。
+    pub fn push_closed(&mut self, tab: ClosedTab) {
+        self.items.retain(|t| t.path != tab.path);
+        self.items.push_front(tab);
+        while self.items.len() > self.cap {
+            self.items.pop_back();
+        }
+    }
+
+    /// いちばん最近閉じたタブを取り出す (履歴からは消える)。
+    pub fn pop_closed(&mut self) -> Option<ClosedTab> {
+        self.items.pop_front()
+    }
+
+    /// 取り出さずに覗く。
+    pub fn peek(&self) -> Option<&ClosedTab> {
+        self.items.front()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+}
+
+// ===========================================================================
+// CSV / TSV のテーブル表示
+// ===========================================================================
+
+/// テーブル表示の対象にする拡張子 (小文字)。
+pub const TABLE_EXTS: &[&str] = &["csv", "tsv", "tab"];
+
+/// 区切り文字の候補。**上にあるものほど優先** (同点のときの決着用)。
+pub const TABLE_DELIMITERS: &[char] = &[',', '\t', ';'];
+
+/// テーブル表示で読む行数の上限。数十万行の CSV でも UI を止めない。
+pub const TABLE_MAX_ROWS: usize = 50_000;
+
+/// 区切り文字の推定で覗くバイト数。
+const TABLE_SNIFF_BYTES: usize = 64 * 1024;
+
+/// 表として解釈した結果。UI はこれをそのままグリッドに流し込める。
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub struct TableView {
+    /// 実際に使った区切り文字。
+    pub delimiter: char,
+    /// 先頭行 (見出し)。空ファイルなら空。
+    pub headers: Vec<String>,
+    /// 見出しを除いたデータ行。**行ごとに列数が違いうる** (ragged)。
+    pub rows: Vec<Vec<String>>,
+    /// 全行を通じた最大列数。UI はこの数だけ列を用意し、足りない
+    /// セルは空として描く (添字アクセスで panic させないため)。
+    pub columns: usize,
+    /// 行数上限で打ち切ったか。
+    pub truncated: bool,
+}
+
+/// 先頭の BOM (U+FEFF) を落とす。Excel が書く CSV には必ず付いてくる。
+pub fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
+
+/// 拡張子がテーブル表示の対象か。
+#[allow(dead_code)]
+pub fn is_table_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            TABLE_EXTS.iter().any(|x| *x == e)
+        })
+        .unwrap_or(false)
+}
+
+/// 区切り文字を推定する。
+///
+/// 候補ごとに先頭を実際に解析して、「見出しと同じ列数の行がどれだけ続くか」
+/// で採点する。引用の中の区切り文字は解析器が食べるので数に入らない。
+/// どれも表に見えなければ `,` を返す。
+pub fn detect_delimiter(text: &str) -> char {
+    let s = strip_bom(text);
+    let head = s
+        .char_indices()
+        .find(|(i, _)| *i >= TABLE_SNIFF_BYTES)
+        .map(|(i, _)| &s[..i])
+        .unwrap_or(s);
+    let mut best = (0usize, TABLE_DELIMITERS[0]);
+    for d in TABLE_DELIMITERS.iter().copied() {
+        let t = parse_table_with(head, d, 20);
+        if t.headers.len() < 2 {
+            continue;
+        }
+        let consistent = t
+            .rows
+            .iter()
+            .filter(|r| r.len() == t.headers.len())
+            .count();
+        let score = consistent * 1000 + t.headers.len();
+        if score > best.0 {
+            best = (score, d);
+        }
+    }
+    best.1
+}
+
+/// 区切り文字を推定してから表として解析する。
+pub fn parse_table(text: &str, max_rows: usize) -> TableView {
+    parse_table_with(text, detect_delimiter(text), max_rows)
+}
+
+/// 区切り文字を指定して表として解析する (RFC 4180 準拠 + 寛容)。
+///
+/// - 引用フィールド `"..."` の中の区切り文字・改行はそのまま中身になる。
+/// - 引用の中の `""` は `"` 1 文字。
+/// - 行末は LF / CRLF のどちらでもよい。
+/// - 列数が揃っていなくてもそのまま返す (**絶対に panic しない**)。
+/// - `max_rows` はデータ行 (見出しを除く) の上限。
+pub fn parse_table_with(text: &str, delimiter: char, max_rows: usize) -> TableView {
+    let s = strip_bom(text);
+    let cap = max_rows.saturating_add(1);
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut rec: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut truncated = false;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if in_quotes {
+            if c == '"' {
+                if it.peek() == Some(&'"') {
+                    it.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        if c == '"' {
+            in_quotes = true;
+            continue;
+        }
+        if c == delimiter {
+            rec.push(std::mem::take(&mut field));
+            continue;
+        }
+        if c == '\n' || c == '\r' {
+            if c == '\r' && it.peek() == Some(&'\n') {
+                it.next();
+            }
+            rec.push(std::mem::take(&mut field));
+            // 空行 (フィールド 1 個で中身なし) は行として数えない
+            if !(rec.len() == 1 && rec[0].is_empty()) {
+                records.push(std::mem::take(&mut rec));
+            } else {
+                rec.clear();
+            }
+            if records.len() >= cap {
+                truncated = it.peek().is_some();
+                break;
+            }
+            continue;
+        }
+        field.push(c);
+    }
+    if !field.is_empty() || !rec.is_empty() {
+        rec.push(field);
+        if !(rec.len() == 1 && rec[0].is_empty()) {
+            records.push(rec);
+        }
+    }
+    let mut iter = records.into_iter();
+    let headers = iter.next().unwrap_or_default();
+    let rows: Vec<Vec<String>> = iter.collect();
+    let columns = rows
+        .iter()
+        .map(|r| r.len())
+        .chain(std::iter::once(headers.len()))
+        .max()
+        .unwrap_or(0);
+    TableView {
+        delimiter,
+        headers,
+        rows,
+        columns,
+        truncated,
+    }
+}
+
 impl Buffer {
     pub fn dirty(&self) -> bool {
         hash_str(&self.text) != self.saved_hash
+    }
+
+    /// このタブが読み取り専用か。種類 (画像 / PDF / 差分) と
+#[allow(dead_code)]
+    /// 巨大ファイルモードの**どちらか**が読み取り専用ならそう扱う。
+    pub fn read_only(&self) -> bool {
+        self.kind.read_only() || self.large.read_only
+    }
+
+    /// シンタックスハイライトを行ってよいか (巨大ファイルでは false)。
+#[allow(dead_code)]
+    pub fn highlight_enabled(&self) -> bool {
+        self.large.highlight
+    }
+
+    /// 巨大ファイルのバナーを出すべきならそのサイズ。
+#[allow(dead_code)]
+    pub fn large_file_banner(&self) -> Option<u64> {
+        self.large.active.then_some(self.large.bytes)
+    }
+
+    /// 折りたたみ範囲を本文に追随させる。再計算したら `true`。
+#[allow(dead_code)]
+    pub fn refresh_folds(&mut self) -> bool {
+        let (text, lang) = (&self.text, &self.lang);
+        self.folds.refresh(text, lang)
+    }
+
+    /// 本文を表として解析して `table` に載せる (テーブル表示の ON)。
+#[allow(dead_code)]
+    pub fn build_table(&mut self) -> &TableView {
+        let t = parse_table(&self.text, TABLE_MAX_ROWS);
+        self.table.insert(t)
+    }
+
+    /// テーブル表示を降ろす。
+#[allow(dead_code)]
+    pub fn drop_table(&mut self) {
+        self.table = None;
     }
 
     /// 本文を**読み込んだときと同じ文字コードで**ディスクへ書く。
@@ -531,6 +1212,8 @@ pub struct Editor {
     /// (line, col) of the active buffer's cursor, 1-based.
     pub cursor: (usize, usize),
     untitled_count: u64,
+    /// 直近に閉じたタブ (Ctrl+Shift+T で開き直す)。
+    pub closed_tabs: ClosedTabs,
 }
 
 impl Editor {
@@ -541,6 +1224,7 @@ impl Editor {
             next_id: 1,
             cursor: (1, 1),
             untitled_count: 0,
+            closed_tabs: ClosedTabs::default(),
         }
     }
 
@@ -564,6 +1248,10 @@ impl Editor {
             conflict_notified: None,
             image: None,
             pdf_job: None,
+            folds: FoldState::default(),
+            bookmarks: Bookmarks::default(),
+            large: LargeFileMode::default(),
+            table: None,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -585,14 +1273,20 @@ impl Editor {
             return Ok(self.reload_from_disk(i));
         }
 
-        // 巨大ファイルの防壁: 読み込み自体が UI スレッドの同期 IO なので、
-        // 上限なしだと数百 MB のログをクリックした瞬間にフリーズする
+        // 巨大ファイルの扱い: 読み込みは UI スレッドの同期 IO なので、
+        // 大きいものは「読み取り専用 + ハイライト無効」に落として開き、
+        // メモリに載らない規模だけを断る (`open_decision` が決める)。
+        let mut large = LargeFileMode::default();
         if let Ok(m) = std::fs::metadata(&canon) {
-            if m.len() > MAX_OPEN_BYTES {
-                return Err(format!(
-                    "ファイルが大きすぎます ({} MB > 50 MB)",
-                    m.len() / (1024 * 1024)
-                ));
+            match open_decision(m.len()) {
+                OpenDecision::Refuse { bytes, limit } => {
+                    return Err(format!(
+                        "ファイルが大きすぎます ({} > {})",
+                        human_bytes(bytes),
+                        human_bytes(limit)
+                    ));
+                }
+                OpenDecision::Open(mode) => large = mode,
             }
         }
         // UTF-8 決め打ちで読むと CP932 (Shift_JIS) のファイルが開けないので、
@@ -627,6 +1321,10 @@ impl Editor {
                 conflict_notified: None,
                 image: Some(doc),
                 pdf_job: None,
+                folds: FoldState::default(),
+                bookmarks: Bookmarks::default(),
+                large: LargeFileMode::default(),
+                table: None,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -666,6 +1364,10 @@ impl Editor {
                 conflict_notified: None,
                 image: None,
                 pdf_job: job,
+                folds: FoldState::default(),
+                bookmarks: Bookmarks::default(),
+                large: LargeFileMode::default(),
+                table: None,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -695,6 +1397,10 @@ impl Editor {
             conflict_notified: None,
             image: None,
             pdf_job: None,
+            folds: FoldState::default(),
+            bookmarks: Bookmarks::default(),
+            large,
+            table: None,
         });
         self.active = Some(self.buffers.len() - 1);
         Ok(false)
@@ -736,6 +1442,10 @@ impl Editor {
             conflict_notified: None,
             image: None,
             pdf_job: None,
+            folds: FoldState::default(),
+            bookmarks: Bookmarks::default(),
+            large: LargeFileMode::default(),
+            table: None,
         });
         self.active = Some(self.buffers.len() - 1);
         id
@@ -872,8 +1582,32 @@ impl Editor {
     }
 
     pub fn close(&mut self, i: usize) {
+        self.close_with(i, 0.0);
+    }
+
+    /// スクロール位置も覚えてタブを閉じる (開き直したときに元の場所へ戻る)。
+    ///
+    /// ファイルに紐づかないタブ (untitled / PR 差分など) は本文を保持できない
+    /// ため履歴に積まない。閉じたタブは `closed_tabs.pop_closed()` で取り出す。
+    pub fn close_with(&mut self, i: usize, scroll: f32) {
         if i >= self.buffers.len() {
             return;
+        }
+        let cursor = if self.active == Some(i) {
+            self.cursor
+        } else {
+            (1, 1)
+        };
+        if let Some(b) = self.buffers.get(i) {
+            if let Some(path) = b.path.clone() {
+                let tab = ClosedTab {
+                    path,
+                    title: b.title.clone(),
+                    cursor,
+                    scroll,
+                };
+                self.closed_tabs.push_closed(tab);
+            }
         }
         self.buffers.remove(i);
         self.active = if self.buffers.is_empty() {
@@ -1504,5 +2238,441 @@ mod tests {
         let out = whitespace_layout_job(job, Color32::GRAY);
         assert_eq!(out.text, "abc\ndef", "空白が無ければ本文はそのまま");
         assert_eq!(out.sections.len(), 1);
+    }
+
+    // =======================================================================
+    // 行番号の付け替え
+    // =======================================================================
+
+    #[test]
+    fn remap_line_table() {
+        // (行, 挿入/削除位置, 増減, 期待)
+        let cases: &[(usize, usize, isize, Option<usize>)] = &[
+            (5, 3, 0, Some(5)),
+            (2, 3, 2, Some(2)),
+            (3, 3, 2, Some(5)),
+            (5, 3, 2, Some(7)),
+            (2, 3, -2, Some(2)),
+            (3, 3, -2, None),
+            (4, 3, -2, None),
+            (5, 3, -2, Some(3)),
+            (0, 0, 1, Some(1)),
+            (0, 0, -1, None),
+        ];
+        for (line, at, delta, want) in cases.iter().copied() {
+            assert_eq!(
+                remap_line(line, at, delta),
+                want,
+                "line={line} at={at} delta={delta}"
+            );
+        }
+    }
+
+    // =======================================================================
+    // 折りたたみ状態
+    // =======================================================================
+
+    const RS_NESTED: &str = "\
+mod m {
+    fn f() {
+        1;
+    }
+}
+fn g() {
+    2;
+}
+";
+
+    fn folded_sorted(fs: &FoldState) -> Vec<usize> {
+        let mut v: Vec<usize> = fs.folded().iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn fold_state_toggle_and_hidden_lines() {
+        let mut fs = FoldState::default();
+        assert!(fs.refresh(RS_NESTED, "Rust"), "初回は計算する");
+        assert!(!fs.refresh(RS_NESTED, "Rust"), "本文が同じなら再計算しない");
+        assert!(fs.is_foldable(0) && fs.is_foldable(1) && fs.is_foldable(5));
+        assert!(!fs.is_foldable(2), "中身の行は畳めない");
+        assert_eq!(fs.marker(2), None);
+        assert_eq!(fs.marker(0), Some(FoldMarker::Open));
+        assert!(fs.toggle_fold(0), "畳める行は切り替わる");
+        assert_eq!(fs.marker(0), Some(FoldMarker::Closed));
+        assert!(!fs.toggle_fold(2), "畳めない行では何も起きない");
+        for (line, hidden) in [(0, false), (1, true), (3, true), (4, true), (5, false)] {
+            assert_eq!(fs.is_line_hidden(line), hidden, "line={line}");
+        }
+        assert!(fs.toggle_fold(0), "もう一度で開く");
+        assert!(!fs.is_line_hidden(1));
+    }
+
+    #[test]
+    fn fold_state_all_level_and_spans() {
+        let mut fs = FoldState::default();
+        fs.refresh(RS_NESTED, "Rust");
+        fs.fold_all();
+        assert_eq!(folded_sorted(&fs), vec![0, 1, 5], "畳める範囲すべて");
+        fs.unfold_all();
+        assert!(fs.folded().is_empty());
+        fs.fold_level(1);
+        assert_eq!(folded_sorted(&fs), vec![0, 5], "レベル 1 は外側だけ");
+        fs.fold_level(2);
+        assert_eq!(folded_sorted(&fs), vec![1], "レベル 2 は内側だけ");
+        fs.fold_level(9);
+        assert!(fs.folded().is_empty(), "存在しない深さなら空");
+        // 入れ子を両方畳んだときの隠れ行はひと続きにまとまる
+        fs.fold_all();
+        assert_eq!(fs.hidden_spans(), vec![(1, 4), (6, 7)]);
+        assert_eq!(fs.first_visible_from(1, 8), 5, "隠れた先の最初の可視行");
+        assert_eq!(fs.first_visible_from(0, 8), 0);
+    }
+
+    #[test]
+    fn fold_state_survives_an_edit() {
+        let mut fs = FoldState::default();
+        let text = "fn a() {\n    1;\n}\nfn b() {\n    2;\n}\n";
+        fs.refresh(text, "Rust");
+        assert!(fs.fold(3), "fn b を畳む");
+        // 先頭に 1 行挿入 → 畳んだ位置もひとつ下へずれる
+        let edited = format!("use std::io;\n{text}");
+        fs.shift_lines(0, 1);
+        assert!(fs.refresh(&edited, "Rust"), "本文が変われば再計算する");
+        assert!(fs.is_folded(4), "ずれた先でも畳んだまま: {:?}", folded_sorted(&fs));
+        assert_eq!(fs.range_at(4).map(|r| r.end_line), Some(6));
+        // 挿入した行を消して元に戻す
+        fs.shift_lines(0, -1);
+        fs.refresh(text, "Rust");
+        assert!(fs.is_folded(3), "戻したら元の行に畳みが残る");
+    }
+
+    #[test]
+    fn fold_state_drops_folds_that_no_longer_open_a_range() {
+        let mut fs = FoldState::default();
+        let text = "fn a() {\n    1;\n}\nfn b() {\n    2;\n}\n";
+        fs.refresh(text, "Rust");
+        fs.fold(0);
+        fs.fold(3);
+        // fn b を 1 行にまとめた → fn b の範囲だけが消える
+        let edited = "fn a() {\n    1;\n}\nfn b() { 2; }\n";
+        fs.refresh(edited, "Rust");
+        assert_eq!(
+            folded_sorted(&fs),
+            vec![0],
+            "範囲の先頭のままの畳みだけ生き残る"
+        );
+        // 行がずれたのに shift_lines を呼ばなければ、畳みは残らず開く
+        fs.fold_all();
+        let shifted = format!("use std::io;\n{text}");
+        fs.refresh(&shifted, "Rust");
+        assert!(
+            fs.folded().is_empty(),
+            "行がずれたら安全側 (開く) に倒す: {:?}",
+            folded_sorted(&fs)
+        );
+        // 関数ごと消えたら畳みも消える
+        fs.refresh("fn a() {}\n", "Rust");
+        assert!(fs.folded().is_empty(), "範囲が無くなれば畳みも消える");
+    }
+
+    // =======================================================================
+    // ブックマーク
+    // =======================================================================
+
+    #[test]
+    fn bookmarks_toggle_and_navigation_wraps() {
+        let mut b = Bookmarks::default();
+        assert!(b.is_empty());
+        assert_eq!(b.next_after(0), None, "空なら移動先は無い");
+        assert!(b.toggle(10));
+        assert!(b.toggle(3));
+        assert!(b.toggle(7));
+        assert!(!b.toggle(3), "二度目は外れる");
+        assert_eq!(b.len(), 2);
+        assert!(b.is_marked(7) && !b.is_marked(3));
+        assert_eq!(b.iter().collect::<Vec<_>>(), vec![7, 10]);
+        assert_eq!(b.next_after(0), Some(7));
+        assert_eq!(b.next_after(7), Some(10));
+        assert_eq!(b.next_after(10), Some(7), "末尾の次は先頭へ回り込む");
+        assert_eq!(b.prev_before(10), Some(7));
+        assert_eq!(b.prev_before(7), Some(10), "先頭の前は末尾へ回り込む");
+        b.clear_all();
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn bookmarks_remap_across_inserted_and_deleted_lines() {
+        let marks = |b: &Bookmarks| b.iter().collect::<Vec<_>>();
+        let mut b = Bookmarks::default();
+        for l in [2, 5, 9] {
+            b.toggle(l);
+        }
+        // 3 行目に 2 行挿入
+        b.shift_lines(3, 2);
+        assert_eq!(marks(&b), vec![2, 7, 11], "挿入位置より後だけ下がる");
+        // 6..8 の 2 行を削除 (印の載った 7 行目が消える)
+        b.shift_lines(6, -2);
+        assert_eq!(marks(&b), vec![2, 9], "消えた行の印は落ちる");
+        // 先頭に 1 行足す
+        b.shift_lines(0, 1);
+        assert_eq!(marks(&b), vec![3, 10]);
+        // 増減 0 なら何も起きない
+        b.shift_lines(0, 0);
+        assert_eq!(marks(&b), vec![3, 10]);
+    }
+
+    // =======================================================================
+    // 閉じたタブ
+    // =======================================================================
+
+    fn closed(name: &str) -> ClosedTab {
+        ClosedTab {
+            path: PathBuf::from(format!("/tmp/{name}.rs")),
+            title: name.into(),
+            cursor: (1, 1),
+            scroll: 0.0,
+        }
+    }
+
+    #[test]
+    fn closed_tabs_lru_is_bounded_and_ordered() {
+        let mut c = ClosedTabs::with_capacity(3);
+        assert!(c.pop_closed().is_none(), "空なら取り出せない");
+        for n in ["a", "b", "c", "d"] {
+            c.push_closed(closed(n));
+        }
+        assert_eq!(c.len(), 3, "上限を超えたら古いものを捨てる");
+        assert_eq!(c.peek().map(|t| t.title.clone()), Some("d".to_string()));
+        let order: Vec<String> = std::iter::from_fn(|| c.pop_closed())
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(order, vec!["d", "c", "b"], "新しいものから出てくる");
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn closed_tabs_dedupe_same_path() {
+        let mut c = ClosedTabs::with_capacity(5);
+        c.push_closed(closed("a"));
+        c.push_closed(closed("b"));
+        c.push_closed(closed("a"));
+        assert_eq!(c.len(), 2, "同じパスは 1 件にまとまる");
+        assert_eq!(c.pop_closed().map(|t| t.title), Some("a".to_string()));
+        assert_eq!(c.pop_closed().map(|t| t.title), Some("b".to_string()));
+        c.push_closed(closed("z"));
+        c.clear();
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn closing_a_file_tab_records_it_for_reopen() {
+        let dir = unique_temp_dir("zaivern-editor-test", "closed-tab");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "hello\n").unwrap();
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        ed.open(&f, &hl).unwrap();
+        ed.cursor = (3, 4);
+        ed.close_with(0, 120.0);
+        let t = ed.closed_tabs.pop_closed().expect("記録されている");
+        assert_eq!(t.path, crate::pathx::canonical(&f));
+        assert_eq!(t.cursor, (3, 4), "キャレット位置も覚える");
+        assert_eq!(t.scroll, 120.0, "スクロール位置も覚える");
+        // ファイルに紐づかないタブは積まない
+        ed.new_untitled();
+        ed.close(0);
+        assert!(ed.closed_tabs.is_empty(), "untitled は開き直せないので積まない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =======================================================================
+    // CSV / TSV
+    // =======================================================================
+
+    #[test]
+    fn csv_quoted_fields_with_delimiters_newlines_and_escapes() {
+        let text = "name,note,n\r\n\
+                    a,\"x,y\",1\r\n\
+                    b,\"1 行目\n2 行目\",2\r\n\
+                    c,\"言った \"\"やあ\"\" と\",3\r\n";
+        let t = parse_table(text, TABLE_MAX_ROWS);
+        assert_eq!(t.delimiter, ',');
+        assert_eq!(t.headers, vec!["name", "note", "n"]);
+        assert_eq!(t.rows.len(), 3);
+        assert_eq!(t.rows[0][1], "x,y", "引用の中の区切り文字は中身");
+        assert_eq!(t.rows[1][1], "1 行目\n2 行目", "引用の中の改行も中身");
+        assert_eq!(t.rows[2][1], "言った \"やあ\" と", "\"\" は \" 1 文字");
+        assert_eq!(t.columns, 3);
+        assert!(!t.truncated);
+    }
+
+    #[test]
+    fn csv_ragged_rows_never_panic() {
+        let text = "a,b,c\n1,2\n3,4,5,6\n\n7,8,9\n";
+        let t = parse_table(text, TABLE_MAX_ROWS);
+        assert_eq!(t.headers.len(), 3);
+        assert_eq!(t.rows.len(), 3, "空行は行として数えない");
+        assert_eq!(t.rows[0], vec!["1", "2"]);
+        assert_eq!(t.rows[1], vec!["3", "4", "5", "6"]);
+        assert_eq!(t.columns, 4, "列数は最大値");
+        // 壊れた入力でも落ちない
+        for s in [
+            "",
+            "\n",
+            "\"",
+            "\"未終端,a\n",
+            ",,,\n",
+            "\u{feff}",
+            "a\r\n\r\nb\r\n",
+        ] {
+            let _ = parse_table(s, TABLE_MAX_ROWS);
+        }
+    }
+
+    #[test]
+    fn csv_delimiter_detection_table() {
+        // (説明, 本文, 期待する区切り文字)
+        let cases: &[(&str, &str, char)] = &[
+            ("コンマ", "a,b,c\n1,2,3\n", ','),
+            ("タブ", "a\tb\tc\n1\t2\t3\n", '\t'),
+            ("セミコロン", "a;b;c\n1;2;3\n", ';'),
+            (
+                "セミコロン区切りでフィールドにコンマ",
+                "name;desc\nx;\"1,234\"\ny;\"5,678\"\n",
+                ';',
+            ),
+            ("BOM 付き", "\u{feff}a,b\n1,2\n", ','),
+            ("表に見えない", "ただの文章です\n改行があるだけ\n", ','),
+        ];
+        for (name, text, want) in cases.iter().copied() {
+            assert_eq!(detect_delimiter(text), want, "{name}");
+        }
+        let t = parse_table("\u{feff}a,b\n1,2\n", TABLE_MAX_ROWS);
+        assert_eq!(t.headers, vec!["a", "b"], "BOM は見出しに混ざらない");
+        let tsv = parse_table("a\tb\n1\t2\n", TABLE_MAX_ROWS);
+        assert_eq!(tsv.delimiter, '\t');
+        assert_eq!(tsv.rows[0], vec!["1", "2"]);
+    }
+
+    #[test]
+    fn csv_row_cap_truncates_huge_files() {
+        let mut s = String::from("a,b\n");
+        for i in 0..200_000 {
+            s.push_str(&format!("{i},x\n"));
+        }
+        let t = parse_table(&s, TABLE_MAX_ROWS);
+        assert_eq!(t.rows.len(), TABLE_MAX_ROWS, "上限で打ち切る");
+        assert!(t.truncated, "打ち切ったことを伝える");
+        assert_eq!(t.headers, vec!["a", "b"]);
+        // ちょうど上限ぴったりなら truncated は立たない
+        let small = "h1,h2\n".to_string() + &"1,2\n".repeat(5);
+        let t2 = parse_table(&small, 5);
+        assert_eq!(t2.rows.len(), 5);
+        assert!(!t2.truncated);
+        let t3 = parse_table(&small, 4);
+        assert_eq!(t3.rows.len(), 4);
+        assert!(t3.truncated);
+    }
+
+    #[test]
+    fn table_paths_are_recognised_case_insensitively() {
+        for p in ["a.csv", "b.TSV", "c.Tab"] {
+            assert!(is_table_path(Path::new(p)), "{p}");
+        }
+        for p in ["a.rs", "b.txt", "noext"] {
+            assert!(!is_table_path(Path::new(p)), "{p}");
+        }
+    }
+
+    // =======================================================================
+    // 巨大ファイルモード
+    // =======================================================================
+
+    #[test]
+    fn large_file_decision_table() {
+        // (バイト数, 開ける, バナー, 読み取り専用, ハイライト)
+        let cases: &[(u64, bool, bool, bool, bool)] = &[
+            (0, true, false, false, true),
+            (1024, true, false, false, true),
+            (HEAVY_FILE_BYTES - 1, true, false, false, true),
+            (HEAVY_FILE_BYTES, true, true, false, false),
+            (LARGE_FILE_BYTES - 1, true, true, false, false),
+            (LARGE_FILE_BYTES, true, true, true, false),
+            (MAX_OPEN_BYTES, true, true, true, false),
+            (MAX_OPEN_BYTES + 1, false, false, false, false),
+        ];
+        for (bytes, open, active, ro, hl) in cases.iter().copied() {
+            match open_decision(bytes) {
+                OpenDecision::Open(m) => {
+                    assert!(open, "{bytes} は開けないはず");
+                    assert_eq!(m.active, active, "{bytes}: バナー");
+                    assert_eq!(m.read_only, ro, "{bytes}: 読み取り専用");
+                    assert_eq!(m.highlight, hl, "{bytes}: ハイライト");
+                    assert_eq!(m.bytes, bytes);
+                }
+                OpenDecision::Refuse { bytes: b, limit } => {
+                    assert!(!open, "{bytes} は開けるはず");
+                    assert_eq!(b, bytes);
+                    assert_eq!(limit, MAX_OPEN_BYTES);
+                }
+            }
+        }
+        assert!(
+            HEAVY_FILE_BYTES < LARGE_FILE_BYTES && LARGE_FILE_BYTES < MAX_OPEN_BYTES,
+            "閾値は小さい順"
+        );
+        assert!(PDF_MAX_BYTES < MAX_OPEN_BYTES);
+    }
+
+    #[test]
+    fn large_file_mode_flags_reach_the_buffer() {
+        let dir = unique_temp_dir("zaivern-editor-test", "large-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("small.txt");
+        std::fs::write(&f, "hello\n").unwrap();
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        ed.open(&f, &hl).unwrap();
+        let b = &ed.buffers[0];
+        assert!(!b.read_only(), "普通のファイルは編集できる");
+        assert!(b.highlight_enabled());
+        assert_eq!(b.large_file_banner(), None, "バナーは出さない");
+        // 巨大ファイル扱いに差し替えると、種類が File でも読み取り専用になる
+        let b = &mut ed.buffers[0];
+        b.large = LargeFileMode {
+            active: true,
+            read_only: true,
+            highlight: false,
+            bytes: LARGE_FILE_BYTES,
+        };
+        assert!(b.read_only(), "巨大ファイルモードは編集させない");
+        assert!(!b.highlight_enabled());
+        assert_eq!(b.large_file_banner(), Some(LARGE_FILE_BYTES));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn buffer_folds_and_table_helpers() {
+        let dir = unique_temp_dir("zaivern-editor-test", "buffer-structure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.rs");
+        std::fs::write(&f, "fn a() {\n    1;\n}\n").unwrap();
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        ed.open(&f, &hl).unwrap();
+        let b = &mut ed.buffers[0];
+        assert!(b.refresh_folds(), "開いた直後は計算する");
+        assert!(!b.refresh_folds(), "本文が変わらなければ再計算しない");
+        assert!(b.folds.is_foldable(0));
+        assert!(b.bookmarks.is_empty());
+        b.text = "x,y\n1,2\n".into();
+        let t = b.build_table();
+        assert_eq!(t.headers, vec!["x", "y"]);
+        assert!(b.table.is_some());
+        b.drop_table();
+        assert!(b.table.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
