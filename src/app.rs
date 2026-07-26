@@ -752,6 +752,146 @@ struct PluginActions {
     panel_refresh: Option<(String, String)>,
 }
 
+// ── 端末分割の判断を純関数へ切り出す ────────────────────────────────
+// UI から呼ぶ側 (`ZaivernApp`) は eframe の CreationContext 無しには作れない
+// ため、テストできる形は「状態 → 状態」の純関数だけ。app.rs の作法どおり
+// 判断はここへ出し、メソッド側は self との受け渡しに徹する。
+
+/// 新しいペインで起動するプリセットの添字。
+///
+/// * 親と同じ → 見つからなければ素のシェル → それも無ければ先頭
+/// * シェル指定 → 素のシェル (コマンドが空のプリセット) → 無ければ先頭
+///
+/// 「1 つも登録が無い」ときだけ `None` (呼び出し側がトーストを出す)。
+fn split_preset_index(
+    agents: &[config::AgentPreset],
+    parent: &str,
+    preset: terminal::PanePreset,
+) -> Option<usize> {
+    if agents.is_empty() {
+        return None;
+    }
+    let shell = agents.iter().position(|p| p.command.trim().is_empty());
+    match preset {
+        terminal::PanePreset::SameAsParent => {
+            agents.iter().position(|p| p.name == parent).or(shell)
+        }
+        terminal::PanePreset::Shell => shell,
+    }
+    .or(Some(0))
+}
+
+/// 分割レイアウト表を整える (消えたペインを落とす → 1 枚は畳む → キーを揃える)。
+///
+/// キーは常に木の**先頭リーフ** — 先頭ペインを閉じてもタイルが迷子にならない。
+fn normalize_split_map(
+    splits: HashMap<u64, terminal::SplitLayout>,
+    live: &HashSet<u64>,
+) -> HashMap<u64, terminal::SplitLayout> {
+    let mut next: HashMap<u64, terminal::SplitLayout> = HashMap::new();
+    for (_, mut layout) in splits {
+        layout.heal(&mut |id| live.contains(&id));
+        // ペイン 1 枚 (または 0 枚) の分割は保持しない
+        // = 分割していないタイルと完全に同じ描画経路へ戻す。
+        if layout.len() < 2 {
+            continue;
+        }
+        let key = layout.leaves()[0];
+        next.insert(key, layout);
+    }
+    next
+}
+
+/// Cockpit のグリッドに**タイルとして**並べるセッションの添字。
+/// 分割の子ペインは親タイルの中に描かれるので外す。
+/// 分割が 1 つも無ければ `0..ids.len()` そのまま。
+fn split_tile_indices(ids: &[u64], splits: &HashMap<u64, terminal::SplitLayout>) -> Vec<usize> {
+    if splits.is_empty() {
+        return (0..ids.len()).collect();
+    }
+    let mut child: HashSet<u64> = HashSet::new();
+    for (tile, layout) in splits {
+        for id in layout.leaves() {
+            if id != *tile {
+                child.insert(id);
+            }
+        }
+    }
+    (0..ids.len()).filter(|i| !child.contains(&ids[*i])).collect()
+}
+
+/// 保存された分割行を実行時のレイアウト表へ戻す。
+/// 引けなかったリーフ (復元されなかったセッション) は黙って落ちる。
+fn split_map_from_lines(
+    lines: &[String],
+    id_of: &mut dyn FnMut(&str) -> Option<u64>,
+) -> HashMap<u64, terminal::SplitLayout> {
+    let mut out: HashMap<u64, terminal::SplitLayout> = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let rec = terminal::SplitLayoutRec::from_line(line);
+        if rec.is_empty() {
+            continue;
+        }
+        let layout = rec.to_layout(id_of);
+        if layout.len() >= 2 {
+            out.insert(layout.leaves()[0], layout);
+        }
+    }
+    out
+}
+
+/// 端末分割の操作キーを 1 つだけ取り出し、そのキーイベントを**消費**する。
+///
+/// 端末より先に呼ぶこと。`terminal::split_key_action` に当たらないキー
+/// (`Ctrl+C` / `Ctrl+D` / 素の文字など) は 1 つも触らないので、
+/// 今までどおり PTY へ届く。
+///
+/// 押下と離上の両方を落とすのは、離上だけが端末へ流れて修飾キーの状態が
+/// ちぐはぐになるのを避けるため。`Ctrl+Alt` は配列によっては AltGr なので、
+/// **消費したキーと同じ 1 文字**の `Text` イベントだけ道連れにする
+/// (それ以外の文字入力・IME は一切触らない)。
+fn take_split_key(ctx: &egui::Context) -> Option<terminal::SplitAction> {
+    let mac = cfg!(target_os = "macos");
+    let mut found: Option<terminal::SplitAction> = None;
+    let mut letter: Option<char> = None;
+    ctx.input_mut(|i| {
+        i.events.retain(|e| {
+            if let egui::Event::Key {
+                key,
+                pressed,
+                modifiers,
+                ..
+            } = e
+            {
+                if terminal::split_key_action(*key, modifiers, mac).is_some() {
+                    if *pressed && found.is_none() {
+                        found = terminal::split_key_action(*key, modifiers, mac);
+                        let n = key.name();
+                        if n.chars().count() == 1 {
+                            letter = n.chars().next().map(|c| c.to_ascii_lowercase());
+                        }
+                    }
+                    return false;
+                }
+            }
+            true
+        });
+        if let Some(c) = letter {
+            i.events.retain(|e| match e {
+                egui::Event::Text(t) => {
+                    !(t.chars().count() == 1
+                        && t.chars().next().map(|x| x.to_ascii_lowercase()) == Some(c))
+                }
+                _ => true,
+            });
+        }
+    });
+    found
+}
+
 /// Cockpit で押されたボタン類。クロージャの中では記録だけして、
 /// パネル描画後に self へ反映する (PluginActions と同じ流儀)。
 #[derive(Default)]
@@ -777,6 +917,9 @@ struct CockpitActions {
     /// 指名は (コマンド, セッションタイトル)。両方空 = なし。
     super_pick: Option<(String, String)>,
     super_enabled: Option<bool>,
+    /// 端末分割の操作 `(タイルのキー, 操作)`。キー入力とヘッダの ⊞ / ✕ が積む。
+    /// セッションの起動・後始末を伴うので、描画クロージャの外で適用する。
+    split: Vec<(u64, terminal::SplitAction)>,
 }
 
 /// キーバインド駆動のエディタ編集操作
@@ -1723,6 +1866,17 @@ pub struct ZaivernApp {
     tree: FileTree,
     editor: Editor,
     agents: AgentManager,
+    /// Cockpit のタイル 1 枚ぶんの端末分割レイアウト。
+    ///
+    /// キーは**タイルの先頭ペイン**のセッション ID。ペインが 1 枚に戻った
+    /// レイアウトはここから消す — 「分割していないタイル」は今日と 1 px も
+    /// 変わらない経路 (`terminal::draw` 直呼び) を通したいため。
+    /// 正規化はすべて [`ZaivernApp::normalize_splits`] が行う。
+    splits: HashMap<u64, terminal::SplitLayout>,
+    /// 各タイルを最後に描いた矩形。方向フォーカス (`focus_dir`) は幾何で
+    /// 隣を選ぶので、描画後に適用されるキー操作にも矩形が要る。
+    /// 描画時に書き、`splits` から消えたタイルは一緒に落とす。
+    split_rect: HashMap<u64, egui::Rect>,
     palette: Palette,
     /// `#` パレット用の git worktree キャッシュ (branch, path, 追加済みか)。
     /// パレットを開いている間だけ保持し、閉じると破棄する
@@ -2325,6 +2479,8 @@ impl ZaivernApp {
             roots,
             editor: Editor::new(),
             agents: AgentManager::new(),
+            splits: HashMap::new(),
+            split_rect: HashMap::new(),
             palette: Palette::new(),
             palette_worktrees: None,
             pending_prompts: Vec::new(),
@@ -3802,6 +3958,8 @@ impl ZaivernApp {
                         .as_ref()
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default(),
+                    // 分割しているタイルだけが中身を持つ (他は空文字)。
+                    split: self.split_line_for(s.id),
                 })
                 .collect(),
         };
@@ -3920,6 +4078,16 @@ impl ZaivernApp {
                 ),
                 true,
             );
+        }
+        // 端末分割の復元は**全部起こし終えてから**。リーフはログのパスで
+        // 引くので、復元されなかったペイン (素のシェル等) は黙って落ちる。
+        let lines: Vec<String> = recs
+            .iter()
+            .map(|r| r.split.clone())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !lines.is_empty() {
+            self.restore_splits(&lines);
         }
     }
 
@@ -4658,6 +4826,9 @@ impl ZaivernApp {
     /// ように見える)。
     fn close_agent(&mut self, i: usize) {
         self.agents.remove(i);
+        // 閉じたセッションが分割ペインだったら、木からも外して畳む
+        // (残り 1 枚になったタイルは分割なしの描画へ戻る)。
+        self.normalize_splits();
         if !self.agents.sessions.is_empty() {
             self.term_focus_pending = true;
         }
@@ -11043,7 +11214,13 @@ impl ZaivernApp {
     }
 
     fn cockpit_grid_ui(&mut self, ui: &mut egui::Ui, theme: &Theme, acts: &mut CockpitActions) {
-        let n = self.agents.sessions.len();
+        // 分割レイアウトの正規化 (毎フレーム): 消えたセッションのリーフを落とし、
+        // フォーカスを隣へ移し、1 枚に戻ったタイルは分割そのものを畳む。
+        self.normalize_splits();
+        // 分割の**子ペイン**はタイルとしては並べない (親タイルの中に描かれる)。
+        // 分割が 1 つも無ければこの集合は空で、以降の並びは今日と完全に同じ。
+        let tiles = self.cockpit_tiles();
+        let n = tiles.len();
         if n == 0 {
             self.cockpit_empty_state_ui(ui, theme, acts);
             return;
@@ -11061,11 +11238,17 @@ impl ZaivernApp {
                 for row in 0..rows {
                     ui.horizontal(|ui| {
                         for col in 0..cols {
-                            let i = row * cols + col;
-                            if i >= n {
+                            let Some(&i) = tiles.get(row * cols + col) else {
                                 continue;
-                            }
-                            let active = i == self.agents.active;
+                            };
+                            // 分割タイルは「中のどれかがアクティブ」なら
+                            // アクティブ扱いにする (紫枠がタイルから消えない)。
+                            let active = i == self.agents.active
+                                || self.active_id().is_some_and(|a| {
+                                    self.splits
+                                        .get(&self.agents.sessions[i].id)
+                                        .is_some_and(|l| l.contains(a))
+                                });
                             let stroke = if active {
                                 egui::Stroke::new(2.0_f32, theme.accent)
                             } else {
@@ -11104,6 +11287,10 @@ impl ZaivernApp {
                                         .is_quarantined(&Subview::Session(sid));
                                     let (err_col, dim_col) =
                                         (self.theme.err, self.theme.text_dim);
+                                    // ヘッダの間だけセッションを可変で借りる。
+                                    // ここでスコープを閉じないと、分割タイルの
+                                    // 描画 (複数セッションを触る) と衝突する。
+                                    {
                                     let s = &mut self.agents.sessions[i];
                                     ui.horizontal(|ui| {
                                         let dot = if s.running() {
@@ -11212,9 +11399,61 @@ impl ZaivernApp {
                                                     acts.voice = Some(sid);
                                                     acts.select = Some(i);
                                                 }
+                                                // 端末分割への入口 (これが無いと
+                                                // 分割はキーを知らない人に届かない)。
+                                                // 分割中はペイン数を出す — 「今
+                                                // 何枚あるか」が枠線だけでは分から
+                                                // ないため。ズーム中は ⤢ を添える。
+                                                let split_label = match self
+                                                    .splits
+                                                    .get(&sid)
+                                                    .filter(|l| !l.is_empty())
+                                                {
+                                                    Some(l) if l.zoomed() => {
+                                                        format!("⊞{}⤢", l.len())
+                                                    }
+                                                    Some(l) => format!("⊞{}", l.len()),
+                                                    None => "⊞".to_string(),
+                                                };
+                                                // 狭いタイルでは畳む (ボタン列が
+                                                // 見切れない)。キー操作は残る。
+                                                if ui.available_width() >= 26.0
+                                                    && ui
+                                                    .small_button(split_label)
+                                                    .on_hover_text(tr(
+                                                        "このタイルを右へ分割\n\
+                                                         分割中は各ペインのヘッダに ⤢ (拡大) と ✕ (閉じる) が出ます。\n\
+                                                         キーは ⌘⌥⇧→ 右へ分割 / ⌘⌥⇧↓ 下へ分割 / ⌘⌥N シェル /\n\
+                                                         ⌘⌥W 閉じる / ⌘⌥←↑↓→ 移動 / ⌘⌥Z 拡大 / ⌘⌥E 等分 /\n\
+                                                         ⌘⌥⇧H ⌘⌥⇧L 幅調整 (Windows・Linux は ⌘ の代わりに Ctrl)",
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    acts.split.push((
+                                                        sid,
+                                                        terminal::SplitAction::SplitWith {
+                                                            dir: terminal::SplitDir::Horizontal,
+                                                            preset:
+                                                                terminal::PanePreset::SameAsParent,
+                                                        },
+                                                    ));
+                                                }
                                             },
                                         );
                                     });
+                                    }
+                                    // 分割の操作キーは**アクティブなタイルだけ**が
+                                    // 受ける。端末より先に食うので、消費したキーは
+                                    // PTY へ流れない (Ctrl+C / Ctrl+D は
+                                    // split_key_action が None を返すため素通り)。
+                                    // まだ分割していないタイルでも受けること —
+                                    // 受けないと「⊞ を 1 回押すまでキーが効かない」
+                                    // という説明のつかない状態になる。
+                                    if active && !tile_dead {
+                                        if let Some(a) = take_split_key(ui.ctx()) {
+                                            acts.split.push((sid, a));
+                                        }
+                                    }
                                     // 隔離中のタイルは描かない。1 枚が壊れている
                                     // だけでフレーム全体を捨てると、他のエージェント
                                     // まで固まって見えてしまうため、ここだけ外す。
@@ -11225,7 +11464,12 @@ impl ZaivernApp {
                                             err_col,
                                             dim_col,
                                         );
+                                    } else if self.splits.contains_key(&sid) {
+                                        self.cockpit_split_tile_ui(
+                                            ui, sid, mini_font, theme, acts,
+                                        );
                                     } else {
+                                    let s = &mut self.agents.sessions[i];
                                     let term = draw_subview(Subview::Session(sid), || {
                                         terminal::draw(
                                             ui, s, theme, mini_font, true, true, false,
@@ -11259,6 +11503,279 @@ impl ZaivernApp {
                     });
                 }
             });
+    }
+
+    // ── 端末分割 (Cockpit タイルの中の分割ペイン) ────────────────────────
+    //
+    // モデルは `terminal.rs` の [`terminal::SplitLayout`] (純粋なデータ構造)。
+    // ここはその「所有者」として、セッションの起動・後始末・保存とだけ繋ぐ。
+
+    /// いまアクティブなセッションの ID。
+    fn active_id(&self) -> Option<u64> {
+        self.agents.sessions.get(self.agents.active).map(|s| s.id)
+    }
+
+    /// Cockpit のグリッドに**タイルとして**並べるセッションの添字。
+    ///
+    /// 分割の子ペインは親タイルの中に描かれるので、ここからは外す。
+    /// 分割が 1 つも無ければ `0..len` そのまま — 今日と 1 枚も変わらない。
+    fn cockpit_tiles(&self) -> Vec<usize> {
+        let ids: Vec<u64> = self.agents.sessions.iter().map(|s| s.id).collect();
+        split_tile_indices(&ids, &self.splits)
+    }
+
+    /// 分割レイアウトを整える (毎フレーム + セッションを閉じた直後)。
+    ///
+    /// 1. 消えたセッションのリーフを落とし、フォーカスを最も近い生存ペインへ移す
+    /// 2. 1 枚に戻ったタイルは分割そのものを畳む (= 今日と同じ描画経路へ戻す)
+    /// 3. タイルのキーを木の**先頭リーフ**へ揃える (先頭を閉じても迷子にならない)
+    fn normalize_splits(&mut self) {
+        if self.splits.is_empty() {
+            self.split_rect.clear();
+            return;
+        }
+        let live: HashSet<u64> = self.agents.sessions.iter().map(|s| s.id).collect();
+        self.splits = normalize_split_map(std::mem::take(&mut self.splits), &live);
+        self.split_rect.retain(|k, _| self.splits.contains_key(k));
+    }
+
+    /// 分割タイル 1 枚を描く (ペインが 2 枚以上のときだけ通る経路)。
+    #[allow(clippy::too_many_arguments)]
+    fn cockpit_split_tile_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        sid: u64,
+        mini_font: f32,
+        theme: &Theme,
+        acts: &mut CockpitActions,
+    ) {
+        let (_, area) = ui.allocate_space(ui.available_size());
+        self.split_rect.insert(sid, area);
+
+        // ヘッダの中身と隔離状態は**先に**作る。`chrome` と `leaf` の 2 つの
+        // クロージャが同時にセッション列を可変で借りられないため。
+        let leaves = self.splits.get(&sid).map(|l| l.leaves()).unwrap_or_default();
+        let panes: Vec<(u64, terminal::PaneChrome, bool)> = leaves
+            .iter()
+            .map(|pid| {
+                let dead = self.frame_guard.is_quarantined(&Subview::Session(*pid));
+                let c = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == *pid)
+                    .map(|s| terminal::PaneChrome {
+                        icon: s.icon.clone(),
+                        title: s.title.clone(),
+                        dot: Some(if !s.running() {
+                            theme.err
+                        } else if s.attention {
+                            theme.warn
+                        } else {
+                            theme.ok
+                        }),
+                    })
+                    .unwrap_or_default();
+                (*pid, c, dead)
+            })
+            .collect();
+
+        let (err_col, dim_col) = (self.theme.err, self.theme.text_dim);
+        let sessions = &mut self.agents.sessions;
+        let Some(layout) = self.splits.get_mut(&sid) else {
+            return;
+        };
+        let out = terminal::draw_split(
+            ui,
+            layout,
+            area,
+            terminal::GUTTER,
+            theme,
+            &mut |pid| {
+                panes
+                    .iter()
+                    .find(|(x, _, _)| *x == pid)
+                    .map(|(_, c, _)| c.clone())
+                    .unwrap_or_default()
+            },
+            &mut |ui, _body, pid, _focused| {
+                if panes.iter().any(|(x, _, dead)| *x == pid && *dead) {
+                    Self::quarantine_placeholder_ui(
+                        ui,
+                        &Subview::Session(pid).label(),
+                        err_col,
+                        dim_col,
+                    );
+                    return;
+                }
+                let Some(s) = sessions.iter_mut().find(|s| s.id == pid) else {
+                    return;
+                };
+                draw_subview(Subview::Session(pid), || {
+                    terminal::draw(ui, s, theme, mini_font, true, true, false);
+                });
+            },
+        );
+
+        // ヘッダの ✕ は「そのペイン」を閉じる。フォーカスを移してから
+        // ClosePane を積むことで、閉じる対象を 1 本の経路に統一する。
+        if let Some(pid) = out.close {
+            if let Some(l) = self.splits.get_mut(&sid) {
+                l.set_focus(pid);
+            }
+            acts.split.push((sid, terminal::SplitAction::ClosePane));
+        }
+        if out.changed {
+            // 新しい矩形を既存のコアレッサ経由で PTY へ流す。
+            // ここで同期 resize を呼ぶと UI スレッドが ConPTY を待つ。
+            let (_, cw, ch) = terminal::cell_metrics(ui, mini_font);
+            if let Some(l) = self.splits.get(&sid) {
+                let focus = l.focus();
+                terminal::apply_sizes(l, area, terminal::GUTTER, cw, ch, &mut |pid, r, c| {
+                    if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == pid) {
+                        s.resize(r, c);
+                    }
+                });
+                // クリックでフォーカスが移ったペインへ紫枠も追従させる。
+                if let Some(f) = focus {
+                    if let Some(ix) = self.agents.sessions.iter().position(|s| s.id == f) {
+                        acts.select = Some(ix);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 分割操作 1 つを適用する (セッションの起動・後始末を伴うので描画後)。
+    fn apply_split_action(
+        &mut self,
+        tile: u64,
+        action: terminal::SplitAction,
+        ctx: &egui::Context,
+    ) {
+        use terminal::SplitAction;
+        // 操作対象は「そのタイルのフォーカス中ペイン」。分割がまだ無いタイル
+        // (⊞ の初回) はタイル自身が対象。
+        let focused = self
+            .splits
+            .get(&tile)
+            .and_then(|l| l.focus())
+            .unwrap_or(tile);
+        match action {
+            SplitAction::SplitWith { dir, preset } => {
+                let Some(parent) = self.agents.sessions.iter().find(|s| s.id == focused) else {
+                    return;
+                };
+                let (cwd, parent_preset) = (parent.cwd.clone(), parent.preset_name.clone());
+                let Some(ix) = split_preset_index(&self.cfg.agents, &parent_preset, preset) else {
+                    self.toast(tr("起動できるエージェントの登録がありません"), false);
+                    return;
+                };
+                let command = self.cfg.agents[ix].command.clone();
+                let before = self.agents.sessions.len();
+                // 分割はタイルの中で完結する操作なので、下部パネルを勝手に
+                // 開かない (「画面が突然変わらない」)。起動側の副作用だけ戻す。
+                let panel_was = self.agents.panel_open;
+                self.launch_preset_with(ix, command, &cwd, ctx);
+                self.agents.panel_open = panel_was;
+                if self.agents.sessions.len() == before {
+                    return; // 起動に失敗した (トーストは launch 側が出す)
+                }
+                let Some(new_id) = self.agents.sessions.last().map(|s| s.id) else {
+                    return;
+                };
+                let layout = self
+                    .splits
+                    .entry(tile)
+                    .or_insert_with(|| terminal::SplitLayout::single(tile));
+                layout.set_focus(focused);
+                layout.split_focused(dir, new_id);
+                self.normalize_splits();
+                self.persist_session();
+            }
+            SplitAction::ClosePane => {
+                // 先に木から外してフォーカスを兄弟へ渡してから reap する。
+                if let Some(l) = self.splits.get_mut(&tile) {
+                    l.close_leaf(focused);
+                }
+                if let Some(ix) = self.agents.sessions.iter().position(|s| s.id == focused) {
+                    self.close_agent(ix);
+                }
+                self.normalize_splits();
+                self.persist_session();
+            }
+            SplitAction::Focus(dir) => {
+                let area = self.split_rect.get(&tile).copied();
+                if let (Some(area), Some(l)) = (area, self.splits.get_mut(&tile)) {
+                    if l.focus_dir(dir, area, terminal::GUTTER) {
+                        if let Some(f) = l.focus() {
+                            if let Some(ix) =
+                                self.agents.sessions.iter().position(|s| s.id == f)
+                            {
+                                self.agents.active = ix;
+                            }
+                        }
+                    }
+                }
+            }
+            SplitAction::Zoom => {
+                if let Some(l) = self.splits.get_mut(&tile) {
+                    l.zoom_focused();
+                }
+            }
+            SplitAction::Equalize => {
+                if let Some(l) = self.splits.get_mut(&tile) {
+                    l.equalize();
+                }
+            }
+            SplitAction::Resize { grow } => {
+                if let Some(l) = self.splits.get_mut(&tile) {
+                    let step = if grow {
+                        terminal::RESIZE_STEP
+                    } else {
+                        -terminal::RESIZE_STEP
+                    };
+                    l.resize_focused(step);
+                }
+            }
+        }
+    }
+
+    /// 保存用: タイル `sid` の分割を 1 行の文字列にする (リーフ = 生ログのパス)。
+    /// 分割していないタイルは空文字 — 既存のセッションファイルと同じ形のまま。
+    fn split_line_for(&self, sid: u64) -> String {
+        let Some(layout) = self.splits.get(&sid) else {
+            return String::new();
+        };
+        layout
+            .to_rec(&mut |id| {
+                self.agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .and_then(|s| s.log_path.as_ref())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .filter(|k| !k.is_empty())
+            })
+            .to_line()
+    }
+
+    /// 復元: 保存された分割行を、いま起きているセッションへ張り直す。
+    /// 引けなかったリーフ (復元されなかったシェル等) は黙って落ちる。
+    fn restore_splits(&mut self, lines: &[String]) {
+        let sessions = &self.agents.sessions;
+        let found = split_map_from_lines(lines, &mut |key| {
+            sessions
+                .iter()
+                .find(|s| {
+                    s.log_path
+                        .as_ref()
+                        .is_some_and(|p| p.to_string_lossy() == key)
+                })
+                .map(|s| s.id)
+        });
+        self.splits.extend(found);
+        self.normalize_splits();
     }
 
     /// Cockpit 描画後に、記録されたアクションを self へ反映する
@@ -11340,6 +11857,10 @@ impl ZaivernApp {
         }
         if let Some(i) = acts.remove {
             self.close_agent(i);
+        }
+        // 端末分割 (キー / ⊞ / ペインヘッダの ✕・⤢) の適用。
+        for (tile, action) in acts.split {
+            self.apply_split_action(tile, action, ctx);
         }
         // タスク作成 / メッセージ送信のフォームと、押されたボタンの適用。
         let prev_task_target = self.orch.target;
@@ -12586,8 +13107,17 @@ impl ZaivernApp {
         let theme_text = self.theme.text;
         let theme_dim = self.theme.text_dim;
         let syntect_theme = self.theme.syntect_theme.clone();
-        let font = FontId::monospace(self.cfg.editor_font_size);
-        let row_h = ui.fonts(|f| f.row_height(&font));
+        // 端末と同じ理由で行高を物理ピクセルの整数へ揃える (theme::snap_len)。
+        // 行高が小数だと N 行目の y が丸められる位置が行ごとに変わり、
+        // ガター番号・本文・スティッキーヘッダの縦位置が 1px ずつずれる。
+        let ppp = ui.ctx().pixels_per_point();
+        let font = FontId::monospace(crate::theme::snap_font_size(
+            self.cfg.editor_font_size,
+            ppp,
+        ));
+        let row_h = ui
+            .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
+            .max(1.0 / ppp);
         self.last_row_h = row_h;
         // galley をフレーム跨ぎでキャッシュするためのフォント世代キー。
         // egui は pixels_per_point 変更時とフォントアトラス逼迫時(fill_ratio > 0.8)に
@@ -17939,8 +18469,13 @@ fn resolve_theme(name: &str) -> Theme {
 }
 
 /// フォント候補を先頭から試し、最初に読めたものを `name` として登録し、
-/// Proportional / Monospace 両方の末尾へフォールバックとして積む。
-/// 末尾に積むので、既存フォントが持つ字はそのまま。持たない字だけが拾われる。
+/// Proportional / Monospace 両方の **主フォントのすぐ後ろ** へ積む。
+///
+/// 末尾に積んではいけない: egui 同梱の `NotoEmoji-Regular` (`FontTweak.scale`
+/// 0.81) と `emoji-icon-font` (0.90) が既に列に居るため、`✓ ✕ ▸` や罫線が
+/// **縮小された絵文字フォント**で解決され、本文の中で 1 文字だけ小さく
+/// 沈んで見える (= 「文字がガタガタ」の主因のひとつ)。主フォントの直後に
+/// 差し込めば、主フォントが持たない字だけを等倍の実フォントが拾う。
 /// 読めた候補のパスを返す (呼び出し側が二重読み込みを避けるため)。
 fn push_fallback_font<'a>(
     fonts: &mut egui::FontDefinitions,
@@ -17954,7 +18489,9 @@ fn push_fallback_font<'a>(
             .insert(name.to_owned(), egui::FontData::from_owned(bytes));
         for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             if let Some(list) = fonts.families.get_mut(&fam) {
-                list.push(name.to_owned());
+                // 主フォント (index 0) の直後。列が空でも panic しないよう clamp。
+                let at = list.len().min(1);
+                list.insert(at, name.to_owned());
             }
         }
         return Some(p);
@@ -17962,16 +18499,20 @@ fn push_fallback_font<'a>(
     None
 }
 
-/// 読めた候補を **全部** `name0, name1, …` として末尾へ積む版。
+/// 読めた候補を **全部** `name0, name1, …` として積む版。
 /// 記号はフォントごとに持っている字がバラバラで、しかも OS の版で変わる
 /// (macOS 26 では Apple Symbols / Arial Unicode から ❯ U+276F が消えた、実測)。
 /// 1 本目で止めるとどこかの環境で豆腐が出るので、和集合を取る。
 /// `skip` は既に別名で積んだ実体 (同じ 20MB 級ファイルを二重に読まないため)。
+///
+/// `start_at` は挿入開始位置 — [`push_fallback_font`] と同じ理由で、egui 同梱の
+/// 縮小絵文字フォントより **前** へ入れる。候補どうしの優先順は呼ばれた順のまま。
 fn push_fallback_fonts_all(
     fonts: &mut egui::FontDefinitions,
     name: &str,
     candidates: &[&str],
     skip: Option<&str>,
+    start_at: usize,
 ) -> usize {
     let mut n = 0;
     for p in candidates {
@@ -17985,7 +18526,7 @@ fn push_fallback_fonts_all(
             .insert(key.clone(), egui::FontData::from_owned(bytes));
         for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             if let Some(list) = fonts.families.get_mut(&fam) {
-                list.push(key.clone());
+                list.insert((start_at + n).min(list.len()), key.clone());
             }
         }
         n += 1;
@@ -18044,7 +18585,28 @@ fn install_fonts(ctx: &egui::Context) {
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
         ]
     };
-    push_fallback_fonts_all(&mut fonts, "symbols", &symbols, cjk_loaded);
+    // 主フォント (0) と、読めていれば CJK (1) の後ろから記号を積む。
+    push_fallback_fonts_all(
+        &mut fonts,
+        "symbols",
+        &symbols,
+        cjk_loaded,
+        1 + usize::from(cjk_loaded.is_some()),
+    );
+
+    // ── Windows: 本文の Proportional を OS の日本語フェイスそのものにする ──
+    // epaint はフェイスごとに ascent が違う値で行内へ置くため、ラテンと日本語が
+    // **別フェイス**だと同じ行に 2 つのベースラインが生まれ、「あ」と「a」が
+    // 上下にずれて並ぶ (Windows の Yu Gothic × Ubuntu-Light で顕著)。
+    // 日本語フェイスはラテンも持っているので、先頭へ回せば 1 フェイスで揃う。
+    // Monospace は触らない — 桁の等幅性のほうが優先される。
+    #[cfg(target_os = "windows")]
+    if fonts.font_data.contains_key("cjk") {
+        if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            list.retain(|n| n != "cjk");
+            list.insert(0, "cjk".to_owned());
+        }
+    }
 
     ctx.set_fonts(fonts);
 }
@@ -21944,7 +22506,8 @@ mod glyph_tests {
     fn ui_glyph_symbols_have_glyphs() {
         // すべて src/ か assets/ に実在する記号だけを並べる (未使用の字は入れない)。
         const SYMBOLS: &str = "✕✗✓✔⌫⌥⌃⇧⌘❯▸▾▲▼◆◇◎●○★⇄⇩→➡⟳⏱⏳─│╭╮╰╯┌┐└┘├┤┬┴┼\
-                               ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏±×÷·»‹›※–—…‣";
+                               ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏±×÷·»‹›※–—…‣\
+                               ⊞⤢";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);
         let _ = ctx.run(Default::default(), |_| {});
@@ -23581,6 +24144,476 @@ mod quarantine_hole_tests {
         assert!(
             head.contains("self.frame_guard.forget_sessions(&live);"),
             "隔離集合を掃いていない"
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 端末分割の配線 (Cockpit のタイル ↔ terminal::SplitLayout)
+// ════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod split_wiring_tests {
+    use super::*;
+    use crate::terminal::{FocusDir, PanePreset, SplitAction, SplitDir, SplitLayout};
+
+    fn preset(name: &str, command: &str) -> config::AgentPreset {
+        config::AgentPreset {
+            name: name.to_string(),
+            command: command.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 右へ 2 回分割した木 (1 | 2 | 3)。フォーカスは最後に開いた 3。
+    fn tile(ids: &[u64]) -> SplitLayout {
+        let mut l = SplitLayout::single(ids[0]);
+        for id in &ids[1..] {
+            assert!(l.split_focused(SplitDir::Horizontal, *id));
+        }
+        l
+    }
+
+    fn map(layouts: Vec<SplitLayout>) -> HashMap<u64, SplitLayout> {
+        layouts
+            .into_iter()
+            .map(|l| (l.leaves()[0], l))
+            .collect()
+    }
+
+    // ── 新しいペインで起動するプリセットの決め方 ────────────────────
+
+    #[test]
+    fn split_preset_index_table() {
+        let agents = vec![
+            preset("Claude Code", "claude"),
+            preset("シェル", ""),
+            preset("Codex", "codex"),
+        ];
+        // 親と同じ → 名前で引ける
+        assert_eq!(
+            split_preset_index(&agents, "Codex", PanePreset::SameAsParent),
+            Some(2)
+        );
+        // 親のプリセットが消えていたら素のシェルへ (勝手に別の CLI を起こさない)
+        assert_eq!(
+            split_preset_index(&agents, "消えたプリセット", PanePreset::SameAsParent),
+            Some(1)
+        );
+        // シェル指定は常に素のシェル
+        assert_eq!(split_preset_index(&agents, "Codex", PanePreset::Shell), Some(1));
+
+        // 素のシェルが登録されていない構成でも動く (先頭で代替する)
+        let no_shell = vec![preset("Claude Code", "claude")];
+        assert_eq!(
+            split_preset_index(&no_shell, "Codex", PanePreset::SameAsParent),
+            Some(0)
+        );
+        assert_eq!(split_preset_index(&no_shell, "x", PanePreset::Shell), Some(0));
+
+        // 1 つも登録が無ければ None (呼び出し側がトーストを出す)
+        assert_eq!(split_preset_index(&[], "x", PanePreset::Shell), None);
+    }
+
+    // ── レイアウト表の正規化 ────────────────────────────────────────
+
+    #[test]
+    fn normalize_drops_dead_panes_and_collapses_single() {
+        let live: HashSet<u64> = [1, 2, 4, 5].into_iter().collect();
+        // 3 は死んでいる → 木から落ちる。7/8 のうち 8 が死ぬので 1 枚 → 畳む。
+        let m = map(vec![tile(&[1, 2, 3]), tile(&[4, 5]), tile(&[7, 8])]);
+        let live2: HashSet<u64> = [1, 2, 4, 5, 7].into_iter().collect();
+        let out = normalize_split_map(m, &live2);
+        assert_eq!(out.len(), 2, "1 枚に戻ったタイルは表から消える");
+        assert_eq!(out[&1].leaves(), vec![1, 2]);
+        assert_eq!(out[&4].leaves(), vec![4, 5]);
+        assert!(!out.contains_key(&7));
+        let _ = live;
+    }
+
+    /// 先頭ペインを閉じてもタイルが迷子にならない (キーが付け替わる)。
+    #[test]
+    fn normalize_rekeys_when_first_pane_dies() {
+        let m = map(vec![tile(&[1, 2, 3])]);
+        let live: HashSet<u64> = [2, 3].into_iter().collect();
+        let out = normalize_split_map(m, &live);
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key(&2), "キーが先頭リーフへ付け替わる: {:?}", out.keys());
+        assert_eq!(out[&2].leaves(), vec![2, 3]);
+        // フォーカスは生き残ったペインの中にある
+        assert!(out[&2].focus().is_some_and(|f| f == 2 || f == 3));
+    }
+
+    /// セッションが全滅したら表は空 (空タイルは「閉じたエージェント」と同じ)。
+    #[test]
+    fn normalize_empties_when_all_panes_gone() {
+        let out = normalize_split_map(map(vec![tile(&[1, 2])]), &HashSet::new());
+        assert!(out.is_empty());
+    }
+
+    // ── グリッドに並べるタイル ──────────────────────────────────────
+
+    #[test]
+    fn tiles_exclude_child_panes_and_are_identity_without_splits() {
+        let ids = vec![10, 11, 12, 13];
+        // 分割ゼロ → 今日とまったく同じ並び
+        assert_eq!(split_tile_indices(&ids, &HashMap::new()), vec![0, 1, 2, 3]);
+        // 11 と 13 が 10 のタイルの子ペイン
+        let m = map(vec![tile(&[10, 11, 13])]);
+        assert_eq!(split_tile_indices(&ids, &m), vec![0, 2]);
+    }
+
+    // ── 保存と復元 ──────────────────────────────────────────────────
+
+    /// 保存 → 復元の往復。**復元されなかったセッション**のリーフは黙って落ち、
+    /// 残りだけで開き直す (壊れた保存ファイルでも panic しない)。
+    #[test]
+    fn persist_round_trip_drops_missing_sessions() {
+        let mut l = tile(&[1, 2, 3]);
+        assert!(l.zoom_focused());
+        let keys: HashMap<u64, &str> = [(1, "/logs/a.log"), (2, "/logs/b.log"), (3, "/logs/c.log")]
+            .into_iter()
+            .collect();
+        let line = l
+            .to_rec(&mut |id| keys.get(&id).map(|s| s.to_string()))
+            .to_line();
+        assert!(!line.is_empty());
+
+        // 1) 全部戻る
+        let back = split_map_from_lines(&[line.clone()], &mut |k| {
+            keys.iter().find(|(_, v)| **v == k).map(|(id, _)| *id)
+        });
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[&1].leaves(), vec![1, 2, 3]);
+        assert!(back[&1].zoomed(), "ズーム状態も戻る");
+
+        // 2) 2 番が復元されなかった (素のシェル等) → そのリーフだけ落ちる
+        let partial = split_map_from_lines(&[line.clone()], &mut |k| match k {
+            "/logs/a.log" => Some(1),
+            "/logs/c.log" => Some(3),
+            _ => None,
+        });
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[&1].leaves(), vec![1, 3]);
+
+        // 3) 1 本しか戻らなければ分割は成立しない → 表に入れない
+        let one = split_map_from_lines(&[line.clone()], &mut |k| (k == "/logs/a.log").then_some(1));
+        assert!(one.is_empty());
+
+        // 4) 空行・壊れた行は無視する (panic しない)
+        assert!(split_map_from_lines(&[String::new()], &mut |_| Some(1)).is_empty());
+        assert!(split_map_from_lines(&["ごみ".to_string()], &mut |_| Some(1)).is_empty());
+    }
+
+    /// 分割していないタイルの保存は**空文字** = 既存のセッションファイルと同形。
+    #[test]
+    fn undivided_tile_persists_as_empty_string() {
+        let l = SplitLayout::single(1);
+        let line = l.to_rec(&mut |_| Some("/logs/a.log".into())).to_line();
+        assert_eq!(
+            split_map_from_lines(&[line], &mut |_| Some(1)).len(),
+            0,
+            "1 枚は分割として保存しない"
+        );
+    }
+
+    // ── キーの振り分け ──────────────────────────────────────────────
+
+    fn run_keys(events: Vec<egui::Event>) -> (Option<SplitAction>, Vec<egui::Event>) {
+        let ctx = egui::Context::default();
+        let mut got = None;
+        let mut left = Vec::new();
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                got = take_split_key(ctx);
+                left = ctx.input(|i| i.events.clone());
+            },
+        );
+        (got, left)
+    }
+
+    fn key(k: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn split_mods(shift: bool) -> egui::Modifiers {
+        if cfg!(target_os = "macos") {
+            egui::Modifiers {
+                alt: true,
+                ctrl: false,
+                shift,
+                mac_cmd: true,
+                command: true,
+            }
+        } else {
+            egui::Modifiers {
+                alt: true,
+                ctrl: true,
+                shift,
+                mac_cmd: false,
+                command: true,
+            }
+        }
+    }
+
+    /// 分割の和音は端末へ流さない (押下も離上も、同じ文字の Text も)。
+    #[test]
+    fn split_chords_are_consumed_before_the_pty() {
+        let m = split_mods(false);
+        let (got, left) = run_keys(vec![
+            key(egui::Key::W, true, m),
+            egui::Event::Text("w".into()),
+            key(egui::Key::W, false, m),
+        ]);
+        assert_eq!(got, Some(SplitAction::ClosePane));
+        assert!(left.is_empty(), "端末へ漏れた: {left:?}");
+
+        // Shift 付き (分割・幅調整) も同じ
+        let ms = split_mods(true);
+        let (got, left) = run_keys(vec![key(egui::Key::ArrowRight, true, ms)]);
+        assert_eq!(
+            got,
+            Some(SplitAction::SplitWith {
+                dir: SplitDir::Horizontal,
+                preset: PanePreset::SameAsParent
+            })
+        );
+        assert!(left.is_empty());
+        let (got, _) = run_keys(vec![key(egui::Key::L, true, ms)]);
+        assert_eq!(got, Some(SplitAction::Resize { grow: true }));
+        let (got, _) = run_keys(vec![key(egui::Key::J, true, split_mods(true))]);
+        assert_eq!(got, None, "表に無い Shift 和音は端末のもの");
+    }
+
+    /// **回帰の要**: `Ctrl+C` / `Ctrl+D` は必ず PTY へ届く。
+    /// ここを奪うとシェルもエージェントも中断できなくなる。
+    #[test]
+    fn ctrl_c_and_ctrl_d_still_reach_the_pty() {
+        let ctrl = egui::Modifiers {
+            alt: false,
+            ctrl: true,
+            shift: false,
+            mac_cmd: false,
+            command: true,
+        };
+        for k in [egui::Key::C, egui::Key::D, egui::Key::W, egui::Key::Z] {
+            let (got, left) = run_keys(vec![key(k, true, ctrl)]);
+            assert_eq!(got, None, "{k:?} を分割が奪った");
+            assert_eq!(left.len(), 1, "{k:?} のイベントが消えた");
+        }
+        // 素の文字入力も一切触らない
+        let (got, left) = run_keys(vec![
+            key(egui::Key::W, true, egui::Modifiers::NONE),
+            egui::Event::Text("w".into()),
+        ]);
+        assert_eq!(got, None);
+        assert_eq!(left.len(), 2);
+        // 日本語の確定文字も落とさない
+        let (_, left) = run_keys(vec![egui::Event::Text("あ".into())]);
+        assert_eq!(left.len(), 1);
+    }
+
+    // ── フォーカス / ズーム / 等分 (ディスパッチャが呼ぶモデル操作) ──
+
+    /// `apply_split_action` が各アクションで呼ぶモデル操作を、同じ順序で辿る。
+    /// (`ZaivernApp` は eframe の CreationContext 無しには作れないため、
+    ///  ここではセッション起動を伴わない全アクションを直接確かめる)
+    #[test]
+    fn dispatcher_actions_move_focus_zoom_and_equalize() {
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 300.0));
+        let mut l = tile(&[1, 2, 3]);
+        assert_eq!(l.focus(), Some(3));
+
+        // Focus: 幾何的な隣へ
+        assert!(l.focus_dir(FocusDir::Left, area, terminal::GUTTER));
+        assert_eq!(l.focus(), Some(2));
+
+        // Resize: フォーカス中ペインが広がる / 狭まる
+        let before = l.rects(area, terminal::GUTTER);
+        assert!(l.resize_focused(terminal::RESIZE_STEP));
+        let after = l.rects(area, terminal::GUTTER);
+        assert_ne!(before, after, "幅が動いていない");
+
+        // Equalize: 面積が揃う
+        l.equalize();
+        let rs = l.rects(area, terminal::GUTTER);
+        let w0 = rs[0].1.width();
+        // 差はガター 1 本ぶん以内 (仕切りの本数がペインごとに違うため)
+        for (id, r) in &rs {
+            assert!(
+                (r.width() - w0).abs() <= terminal::GUTTER + 1.0,
+                "ペイン {id} の幅が揃わない ({rs:?})"
+            );
+        }
+
+        // Zoom: 見えるのはフォーカス中の 1 枚だけ / もう一度で戻る
+        assert!(l.zoom_focused());
+        assert_eq!(l.rects(area, terminal::GUTTER), vec![(2, area)]);
+        assert!(!l.zoom_focused());
+        assert_eq!(l.rects(area, terminal::GUTTER).len(), 3);
+
+        // ClosePane: 先に木から外してから reap する (フォーカスは兄弟へ)
+        assert!(l.close_leaf(2));
+        assert_eq!(l.leaves(), vec![1, 3]);
+        assert!(l.focus().is_some_and(|f| f == 1 || f == 3));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 文字のガタつき対策 (フォント列の順序 / 物理ピクセルへのスナップ)
+// ════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod crisp_text_tests {
+    use super::*;
+
+    /// egui 同梱の「縮小された」絵文字フォント。
+    /// `FontTweak.scale` が 0.81 / 0.90 なので、ここで `✓ ✕ ▸` や罫線が
+    /// 解決されると本文の中で 1 文字だけ小さく沈む。
+    const SHRUNKEN: [&str; 2] = ["NotoEmoji-Regular", "emoji-icon-font"];
+
+    fn dummy_font(dir: &Path, name: &str) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, b"not-a-real-font").expect("書けるはず");
+        p.to_string_lossy().into_owned()
+    }
+
+    /// **回帰の要**: 自前のフォールバックは主フォントの直後 —
+    /// egui 同梱の縮小絵文字フォントより**前**に入る。
+    #[test]
+    fn fallback_faces_are_inserted_before_the_shrunken_emoji_fonts() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-font-test", "order");
+        let cjk = dummy_font(&dir, "cjk.ttf");
+        let s1 = dummy_font(&dir, "sym1.ttf");
+        let s2 = dummy_font(&dir, "sym2.ttf");
+
+        let mut fonts = egui::FontDefinitions::default();
+        // 素の egui は縮小絵文字フォントを列に持っている (前提が崩れたら気付く)
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let list = &fonts.families[&fam];
+            assert!(
+                SHRUNKEN.iter().any(|n| list.iter().any(|x| x == n)),
+                "{fam:?} に同梱絵文字フォントが居ない: {list:?}"
+            );
+        }
+
+        let loaded = push_fallback_font(&mut fonts, "cjk", &[cjk.as_str()]);
+        assert_eq!(loaded, Some(cjk.as_str()));
+        let n = push_fallback_fonts_all(
+            &mut fonts,
+            "symbols",
+            &[s1.as_str(), s2.as_str()],
+            loaded,
+            1 + usize::from(loaded.is_some()),
+        );
+        assert_eq!(n, 2);
+
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let list = &fonts.families[&fam];
+            assert_eq!(list[1], "cjk", "{fam:?}: CJK が主フォントの直後にない {list:?}");
+            assert_eq!(list[2], "symbols0", "{fam:?}: 記号の順序が崩れた {list:?}");
+            assert_eq!(list[3], "symbols1", "{fam:?}: 記号の順序が崩れた {list:?}");
+            for shrunken in SHRUNKEN {
+                if let Some(at) = list.iter().position(|x| x == shrunken) {
+                    assert!(at > 3, "{fam:?}: {shrunken} が自前フォントより前 {list:?}");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 候補が 1 つも読めなくても列を壊さない (フォントの無い環境で起動不能にしない)。
+    #[test]
+    fn missing_fallback_candidates_leave_the_list_intact() {
+        let mut fonts = egui::FontDefinitions::default();
+        let before = fonts.families.clone();
+        let dir = crate::test_util::unique_temp_dir("zaivern-font-test", "missing");
+        let nope = dir.join("いない.ttf").to_string_lossy().into_owned();
+        assert_eq!(push_fallback_font(&mut fonts, "cjk", &[nope.as_str()]), None);
+        assert_eq!(
+            push_fallback_fonts_all(&mut fonts, "symbols", &[nope.as_str()], None, 1),
+            0
+        );
+        assert_eq!(fonts.families, before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows では本文 (Proportional) の主フェイスを OS の日本語フェイスに
+    /// する。ラテンと日本語が別フェイスだと、epaint はフェイスごとの ascent で
+    /// 置くため同じ行に 2 本のベースラインができて上下にずれる。
+    /// 実機でしか走らない分岐なので、ソースで固定する。
+    #[test]
+    fn windows_body_face_is_the_os_japanese_face() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn install_fonts(ctx: &egui::Context) {")
+            .nth(1)
+            .expect("install_fonts があるはず");
+        let head = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            head.contains("#[cfg(target_os = \"windows\")]"),
+            "Windows 分岐が消えた"
+        );
+        assert!(
+            head.contains("list.insert(0, \"cjk\".to_owned());"),
+            "Proportional の先頭へ CJK を回していない"
+        );
+        assert!(
+            !head.contains("FontFamily::Monospace)"),
+            "Monospace まで入れ替えている (桁の等幅性が壊れる)"
+        );
+    }
+
+    /// エディタの行高も物理ピクセルの整数へ揃える (端末と同じ理由)。
+    /// 行高が小数だと行ごとに丸めがずれ、ガター番号と本文が 1px 単位で踊る。
+    #[test]
+    fn editor_row_height_is_snapped() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .nth(1)
+            .expect("code_editor_ui があるはず");
+        let head = &body[..body.find("self.last_row_h = row_h;").unwrap_or(body.len())];
+        assert!(
+            head.contains("crate::theme::snap_font_size("),
+            "エディタのフォントサイズがスナップされていない"
+        );
+        assert!(
+            head.contains("crate::theme::snap_len("),
+            "エディタの行高がスナップされていない"
+        );
+
+        // 実際の丸め結果が物理ピクセル整数になることも確かめる。
+        for ppp in [1.0_f32, 1.25, 1.5, 2.0] {
+            for size in [11.0_f32, 12.5, 14.0] {
+                let s = crate::theme::snap_font_size(size, ppp);
+                let px = s * ppp;
+                assert!((px - px.round()).abs() < 1e-3, "{size} @ppp {ppp} → {px}px");
+            }
+        }
+    }
+
+    /// 端末の描画とセル寸法の計算は 1 か所 (`terminal::cell_metrics`) に
+    /// まとめる。ここが分かれると「描いた矩形と PTY のグリッド」がずれる。
+    #[test]
+    fn terminal_cell_metrics_have_one_source() {
+        let src = &include_str!("terminal.rs").replace("\r\n", "\n");
+        assert_eq!(
+            src.matches("f.glyph_width(&font_id, 'M')").count(),
+            1,
+            "セル幅の計算が 2 か所以上ある"
+        );
+        assert!(
+            src.contains("let (font_id, cell_w, cell_h) = cell_metrics(ui, font_size);"),
+            "draw が cell_metrics を通っていない"
         );
     }
 }

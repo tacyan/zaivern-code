@@ -6306,6 +6306,29 @@ fn draw_screen(
     }
 }
 
+/// 端末 1 セルの寸法と、実際に描くのに使うフォント。
+///
+/// ── セルを物理ピクセルの整数へ揃える ──────────────────────────────
+/// 桁位置は `origin.x + col * cell_w` で決まる。`cell_w` が小数のままだと
+/// epaint は galley の位置だけを丸めるため、桁の間隔が 8/8/7/8 px と揺れて
+/// 文字がガタガタに見える (100% 表示 = ppp 1.0 の Windows で最悪化する)。
+/// フォントサイズも幅も高さも `theme::snap_*` で丸めてから使う。
+/// 丸め結果が 0 になると桁数計算がゼロ除算になるので 1 物理ピクセルで底打ちする。
+///
+/// [`draw`] と [`apply_sizes`] の呼び出し側が**同じ値**を使えるように、
+/// 計算はここ 1 箇所だけに置く (ずれると描いた矩形と PTY のグリッドが食い違う)。
+pub fn cell_metrics(ui: &egui::Ui, font_size: f32) -> (egui::FontId, f32, f32) {
+    let ppp = ui.ctx().pixels_per_point();
+    let font_id = egui::FontId::monospace(crate::theme::snap_font_size(font_size, ppp));
+    let (w, h) = ui.fonts(|f| {
+        (
+            crate::theme::snap_len(f.glyph_width(&font_id, 'M'), ppp).max(1.0 / ppp),
+            crate::theme::snap_len(f.row_height(&font_id), ppp).max(1.0 / ppp),
+        )
+    });
+    (font_id, w, h)
+}
+
 /// Render a terminal session. `interactive` forwards keyboard input on focus,
 /// `allow_resize` lets this view drive the PTY size.
 /// `hover_scroll`: ホバーだけでホイールを履歴スクロールに使うか。
@@ -6320,8 +6343,7 @@ pub fn draw(
     allow_resize: bool,
     hover_scroll: bool,
 ) -> egui::Response {
-    let font_id = egui::FontId::monospace(font_size);
-    let (cell_w, cell_h) = ui.fonts(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
+    let (font_id, cell_w, cell_h) = cell_metrics(ui, font_size);
 
     let avail = ui.available_size();
     let desired = egui::vec2(avail.x.max(120.0), avail.y.max(50.0));
@@ -8613,7 +8635,14 @@ pub enum SplitAction {
     Zoom,
     /// 全ペインを等面積にする。
     Equalize,
+    /// フォーカス中ペインを広げる (`grow`) / 狭める。マウスでガターを
+    /// 掴めない状況 (キーボードのみ) のための同等操作。
+    Resize { grow: bool },
 }
+
+/// キーボードでのリサイズ 1 回ぶんの比率。
+/// 10 回で端から端まで動く程度 — 細かすぎると操作感が悪く、粗いと行き過ぎる。
+pub const RESIZE_STEP: f32 = 0.05;
 
 /// 分割操作の修飾キー (macOS = Cmd+Option / Windows・Linux = Ctrl+Alt) か。
 ///
@@ -8641,6 +8670,7 @@ fn is_split_chord(m: &egui::Modifiers, mac: bool) -> bool {
 /// |---|---|
 /// | `Shift+→` | 右に分割 (親と同じエージェント) |
 /// | `Shift+↓` | 下に分割 (同上) |
+/// | `Shift+H` / `Shift+L` | フォーカス中ペインを狭める / 広げる |
 /// | `N` | 右に分割してシェルを開く |
 /// | `W` | ペインを閉じる |
 /// | `←` `→` `↑` `↓` / `H` `J` `K` `L` | フォーカス移動 |
@@ -8669,6 +8699,9 @@ pub fn split_key_action(
                 dir: SplitDir::Vertical,
                 preset: PanePreset::SameAsParent,
             }),
+            // 移動 (H / L) と同じ指で、押しっぱなしにできる幅調整。
+            K::H => Some(SplitAction::Resize { grow: false }),
+            K::L => Some(SplitAction::Resize { grow: true }),
             _ => None,
         };
     }
@@ -8947,21 +8980,6 @@ impl SplitNode {
         }
     }
 
-    fn swap_ids(&mut self, x: SessionId, y: SessionId) {
-        match self {
-            SplitNode::Leaf(id) => {
-                if *id == x {
-                    *id = y;
-                } else if *id == y {
-                    *id = x;
-                }
-            }
-            SplitNode::Split { a, b, .. } => {
-                a.swap_ids(x, y);
-                b.swap_ids(x, y);
-            }
-        }
-    }
 }
 
 /// 指定リーフを消し、親を畳む。畳んだ地点の兄弟の先頭リーフを `fallback` に残す
@@ -9051,6 +9069,9 @@ impl SplitLayout {
         }
     }
 
+    /// 木そのもの。**テスト専用** — 本番の描画・保存は `rects` / `to_rec` を
+    /// 通す (木を直接読ませると幾何の真実源が 2 つになる)。
+    #[cfg(test)]
     pub fn root(&self) -> Option<&SplitNode> {
         self.root.as_ref()
     }
@@ -9143,29 +9164,6 @@ impl SplitLayout {
         true
     }
 
-    /// in-order の次のペインへ (端で折り返す)。
-    pub fn focus_next(&mut self) -> bool {
-        self.cycle(1)
-    }
-    /// in-order の前のペインへ (端で折り返す)。
-    pub fn focus_prev(&mut self) -> bool {
-        self.cycle(-1)
-    }
-
-    fn cycle(&mut self, step: isize) -> bool {
-        let ls = self.leaves();
-        if ls.is_empty() {
-            return false;
-        }
-        let cur = self
-            .focus
-            .and_then(|f| ls.iter().position(|x| *x == f))
-            .unwrap_or(0) as isize;
-        let n = ls.len() as isize;
-        let next = ((cur + step) % n + n) % n;
-        self.focus = Some(ls[next as usize]);
-        true
-    }
 
     /// 幾何的な隣のペインへフォーカスを移す (VS Code / tmux と同じ判定)。
     ///
@@ -9230,7 +9228,8 @@ impl SplitLayout {
         (next - before).abs() > f32::EPSILON
     }
 
-    /// 経路の分割比 (テスト・保存用)。
+    /// 経路の分割比。**テスト専用** — 保存は [`Self::to_rec`] が木ごと書き出す。
+    #[cfg(test)]
     pub fn ratio_at(&self, path: &[bool]) -> Option<f32> {
         let mut node = self.root.as_ref()?;
         for step in path {
@@ -9266,16 +9265,6 @@ impl SplitLayout {
         changed
     }
 
-    /// 2 つのペインの位置を入れ替える。
-    pub fn swap(&mut self, a: SessionId, b: SessionId) -> bool {
-        if a == b || !self.contains(a) || !self.contains(b) {
-            return false;
-        }
-        if let Some(r) = self.root.as_mut() {
-            r.swap_ids(a, b);
-        }
-        true
-    }
 
     /// ズームのトグル。戻り値は**トグル後**の状態。
     /// ズーム中は [`Self::rects`] がフォーカス中ペイン 1 枚だけを返す。
@@ -10157,17 +10146,6 @@ mod split_tests {
         assert_eq!(l.focus(), Some(9), "隣の列の上側へ");
     }
 
-    #[test]
-    fn focus_next_prev_wraps() {
-        let mut l = quad();
-        let order = l.leaves();
-        assert_eq!(order, vec![1, 3, 2, 4]);
-        l.set_focus(4);
-        assert!(l.focus_next());
-        assert_eq!(l.focus(), Some(1), "端で折り返す");
-        assert!(l.focus_prev());
-        assert_eq!(l.focus(), Some(4));
-    }
 
     #[test]
     fn resize_focused_clamps_table() {
@@ -10249,20 +10227,6 @@ mod split_tests {
         assert_invariants(&l, "均等化後");
     }
 
-    #[test]
-    fn swap_exchanges_panes() {
-        let a = rect(0.0, 0.0, 400.0, 400.0);
-        let mut l = quad();
-        let before = l.rects(a, 6.0);
-        assert!(l.swap(1, 4));
-        let after = l.rects(a, 6.0);
-        assert_eq!(before[0].1, after[0].1, "矩形は動かない");
-        assert_eq!(after[0].0, 4);
-        assert_eq!(after[3].0, 1);
-        assert!(!l.swap(1, 1), "同じ ID は入れ替えない");
-        assert!(!l.swap(1, 99), "居ない ID は入れ替えない");
-        assert_invariants(&l, "入れ替え後");
-    }
 
     #[test]
     fn serde_round_trip_and_heal() {
@@ -10379,7 +10343,6 @@ mod split_tests {
         let a = rect(0.0, 0.0, 100.0, 100.0);
         assert!(l.rects(a, 6.0).is_empty());
         assert!(l.gutters(a, 6.0).is_empty());
-        assert!(!l.focus_next());
         assert!(!l.focus_dir(FocusDir::Left, a, 6.0));
         assert!(!l.resize_focused(0.1));
         assert!(!l.zoom_focused());
@@ -10447,6 +10410,9 @@ mod split_tests {
             (K::J, false, SplitAction::Focus(FocusDir::Down)),
             (K::K, false, SplitAction::Focus(FocusDir::Up)),
             (K::L, false, SplitAction::Focus(FocusDir::Right)),
+            // Shift+H / Shift+L = キーボードでの幅調整 (ガタードラッグ相当)
+            (K::H, true, SplitAction::Resize { grow: false }),
+            (K::L, true, SplitAction::Resize { grow: true }),
         ];
         for (key, shift, want) in table {
             assert_eq!(
@@ -10844,5 +10810,66 @@ mod split_tests {
         assert!(!l.equalize_at(&[true]));
         assert!(!l.equalize_at(&[false]), "リーフを指す経路は無視する");
         assert!(!SplitLayout::new().equalize_at(&[]));
+    }
+
+    /// **回帰の要**: ペイン 1 枚のタイルは、分割機能を入れる前と
+    /// 行数・桁数が 1 つも変わらない。
+    ///
+    /// ヘッダぶんを削ったり、ガターを差し引いたりした瞬間に
+    /// 「Cockpit のミニターミナルが 1 行狭くなった」という形で表に出る。
+    #[test]
+    fn single_pane_tile_geometry_is_identical_to_undivided() {
+        // 端数の出る不揃いなサイズで試す (割り切れる数だと事故を見逃す)。
+        let cases: &[(f32, f32, f32, f32)] = &[
+            (803.0, 457.0, 8.0, 17.0),
+            (320.5, 199.5, 7.0, 15.0),
+            (1201.0, 33.0, 9.0, 19.0),
+        ];
+        for (w, h, cw, ch) in cases {
+            let a = rect(11.0, 23.0, *w, *h);
+            // ヘッダは 1 枚のときに 1 px も取らない。
+            assert_eq!(pane_body(a, false), a, "1 枚でヘッダを取った");
+
+            let l = SplitLayout::single(7);
+            let mut got: Vec<(SessionId, u16, u16)> = Vec::new();
+            apply_sizes(&l, a, GUTTER, *cw, *ch, &mut |id, r, c| got.push((id, r, c)));
+
+            // `draw` が allow_resize でやっている計算そのもの。
+            let cols = ((a.width() - TERM_PADDING * 2.0) / cw).floor().max(1.0) as u16;
+            let rows = ((a.height() - TERM_PADDING * 2.0) / ch).floor().max(1.0) as u16;
+            assert_eq!(got, vec![(7, rows, cols)], "{w}x{h} で桁数/行数が変わった");
+        }
+    }
+
+    /// 端末セルが**物理ピクセルの整数**に着地する (文字のガタつき対策)。
+    ///
+    /// 100% 表示 (ppp 1.0、Windows に多い) と 125% / 150% / 200% で確かめる。
+    /// ここが小数に戻ると `origin.x + col * cell_w` の丸めが桁ごとに揺れ、
+    /// 桁間隔が 8/8/7/8 px になって「文字がガタガタ」に見える。
+    #[test]
+    fn cell_metrics_land_on_whole_device_pixels() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        for ppp in [1.0_f32, 1.25, 1.5, 2.0] {
+            ctx.set_pixels_per_point(ppp);
+            let _ = ctx.run(Default::default(), |_| {});
+            for size in [8.0_f32, 10.5, 12.0, 13.3, 14.0] {
+                let mut got = (egui::FontId::monospace(size), 0.0_f32, 0.0_f32);
+                let _ = ctx.run(Default::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        got = cell_metrics(ui, size);
+                    });
+                });
+                let (font, cw, ch) = got;
+                for (what, v) in [("フォント", font.size), ("幅", cw), ("高さ", ch)] {
+                    let px = v * ppp;
+                    assert!(
+                        (px - px.round()).abs() < 1e-3,
+                        "{what}が物理ピクセル整数でない: {v} @ppp {ppp} (= {px}px, size {size})"
+                    );
+                    assert!(px >= 1.0, "{what}が 0 px になった @ppp {ppp}");
+                }
+            }
+        }
     }
 }

@@ -51,6 +51,13 @@ pub struct AgentSessionRec {
     pub cwd: String,
     /// 生ログの書き出し先 (絶対パス)。復元後も同じファイルへ追記する。
     pub log_file: String,
+    /// このタイルの端末分割レイアウト ([`crate::terminal::SplitLayoutRec::to_line`])。
+    ///
+    /// **必ずプレーンな文字列 1 本**にしておく: TOML はテーブル / 配列を
+    /// 単純値より後ろにしか置けないため、ここへ構造体や `Vec` を足すと
+    /// 既存フィールドの並び順に依存した壊れ方をする。空 = 分割なし。
+    /// リーフはセッション ID ではなく**生ログのパス**で指す (再起動で ID は変わる)。
+    pub split: String,
 }
 
 /// `~/.zaivern/sessions/<ルート集合ハッシュhex>.toml` から読む。無ければ None。
@@ -354,6 +361,8 @@ mod tests {
                     command: "claude --dangerously-skip-permissions".into(),
                     cwd: "/p".into(),
                     log_file: "/logs/Claude_Code-1.log".into(),
+                    // 分割レイアウト (リーフ = 生ログのパス)。
+                    split: String::new(),
                 },
                 AgentSessionRec {
                     preset_name: "Codex".into(),
@@ -362,6 +371,7 @@ mod tests {
                     command: "codex".into(),
                     cwd: "/p/サブ".into(),
                     log_file: "/logs/Codex__2-2.log".into(),
+                    split: String::new(),
                 },
             ],
             ..Default::default()
