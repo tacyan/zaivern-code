@@ -76,6 +76,11 @@ jobs:
       - name: Tests (実PTY 以外の全て)
         run: cargo nextest run --locked --no-fail-fast --profile ci -E 'not test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
 
+      # vendor/vt100 はワークスペースメンバーではないため、明示的に走らせないと
+      # 敵対的入力テスト (hostile.rs) が一切実行されない。
+      - name: vendored vt100 tests
+        run: cargo test --manifest-path vendor/vt100/Cargo.toml
+
   # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
   # 表示名: "pty (ubuntu-latest)" など。
   pty:

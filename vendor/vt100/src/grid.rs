@@ -23,7 +23,7 @@ impl Grid {
             saved_pos: Pos::default(),
             rows: vec![],
             scroll_top: 0,
-            scroll_bottom: size.rows - 1,
+            scroll_bottom: size.rows.saturating_sub(1),
             origin_mode: false,
             saved_origin_mode: false,
             scrollback: std::collections::VecDeque::new(),
@@ -54,7 +54,7 @@ impl Grid {
             row.clear(crate::attrs::Attrs::default());
         }
         self.scroll_top = 0;
-        self.scroll_bottom = self.size.rows - 1;
+        self.scroll_bottom = self.size.rows.saturating_sub(1);
         self.origin_mode = false;
         self.saved_origin_mode = false;
     }
@@ -70,8 +70,8 @@ impl Grid {
             }
         }
 
-        if self.scroll_bottom == self.size.rows - 1 {
-            self.scroll_bottom = size.rows - 1;
+        if self.scroll_bottom == self.size.rows.saturating_sub(1) {
+            self.scroll_bottom = size.rows.saturating_sub(1);
         }
 
         self.size = size;
@@ -123,7 +123,7 @@ impl Grid {
         self.rows.resize(new_rows, self.new_row());
 
         if self.scroll_bottom >= size.rows {
-            self.scroll_bottom = size.rows - 1;
+            self.scroll_bottom = size.rows.saturating_sub(1);
         }
         if self.scroll_bottom < self.scroll_top {
             self.scroll_top = 0;
@@ -209,10 +209,12 @@ impl Grid {
         self.drawing_rows_mut().nth(usize::from(row))
     }
 
-    pub fn current_row_mut(&mut self) -> &mut crate::row::Row {
+    /// zaivern patch: 元実装は `unwrap()` だった。「カーソル行は必ず存在する」
+    /// という不変条件は 0 行グリッドや行未確保の状態で普通に破れ、破れたときに
+    /// 死ぬのは PTY 読取スレッド — その端末は二度と更新されず、parser の Mutex も
+    /// poison してタイルが黒いまま戻らなくなる。Option にして呼び出し側で諦める。
+    pub fn current_row_mut(&mut self) -> Option<&mut crate::row::Row> {
         self.drawing_row_mut(self.pos.row)
-            // we assume self.pos.row is always valid
-            .unwrap()
     }
 
     pub fn visible_cell(&self, pos: Pos) -> Option<&crate::cell::Cell> {
@@ -351,25 +353,21 @@ impl Grid {
         if prev_pos != Some(self.pos) && self.pos.col >= self.size.cols {
             let mut pos = Pos {
                 row: self.pos.row,
-                col: self.size.cols - 1,
+                col: self.size.cols.saturating_sub(1),
             };
+            // zaivern patch: 元実装は「最終列の升は必ずある / 全角の左半分も
+            // 必ずある」と決め打って unwrap + `cols - 2` していた。1 桁端末では
+            // `cols - 2` が桁溢れし、行が未確保なら unwrap が None を踏む。
+            // どちらも描画中 (UI スレッド) の panic になるため Option で扱う。
             if self
                 .drawing_cell(pos)
-                // we assume self.pos.row is always valid, and self.size.cols
-                // - 1 is always a valid column
-                .unwrap()
-                .is_wide_continuation()
+                .is_some_and(crate::cell::Cell::is_wide_continuation)
             {
-                pos.col = self.size.cols - 2;
+                pos.col = self.size.cols.saturating_sub(2);
             }
-            let cell =
-                // we assume self.pos.row is always valid, and self.size.cols
-                // - 2 must be a valid column because self.size.cols - 1 is
-                // always valid and we just checked that the cell at
-                // self.size.cols - 1 is a wide continuation character, which
-                // means that the first half of the wide character must be
-                // before it
-                self.drawing_cell(pos).unwrap();
+            let Some(cell) = self.drawing_cell(pos) else {
+                return;
+            };
             if cell.has_contents() {
                 if let Some(prev_pos) = prev_pos {
                     crate::term::MoveFromTo::new(prev_pos, pos)
@@ -392,28 +390,17 @@ impl Grid {
                 let mut found = false;
                 for i in (0..self.pos.row).rev() {
                     pos.row = i;
-                    pos.col = self.size.cols - 1;
+                    pos.col = self.size.cols.saturating_sub(1);
+                    // zaivern patch: 上と同じ理由で Option 扱いにする。
                     if self
                         .drawing_cell(pos)
-                        // i is always less than self.pos.row, which we assume
-                        // to be always valid, so it must also be valid.
-                        // self.size.cols - 1 is always a valid col.
-                        .unwrap()
-                        .is_wide_continuation()
+                        .is_some_and(crate::cell::Cell::is_wide_continuation)
                     {
-                        pos.col = self.size.cols - 2;
+                        pos.col = self.size.cols.saturating_sub(2);
                     }
-                    let cell = self
-                        .drawing_cell(pos)
-                        // i is always less than self.pos.row, which we assume
-                        // to be always valid, so it must also be valid.
-                        // self.size.cols - 2 is valid because self.size.cols
-                        // - 1 is always valid, and col gets set to
-                        // self.size.cols - 2 when the cell at self.size.cols
-                        // - 1 is a wide continuation character, meaning that
-                        // the first half of the wide character must be before
-                        // it
-                        .unwrap();
+                    let Some(cell) = self.drawing_cell(pos) else {
+                        continue;
+                    };
                     if cell.has_contents() {
                         if let Some(prev_pos) = prev_pos {
                             if prev_pos.row != i
@@ -461,7 +448,7 @@ impl Grid {
                 if !found {
                     pos = Pos {
                         row: self.pos.row,
-                        col: self.size.cols - 1,
+                        col: self.size.cols.saturating_sub(1),
                     };
                     if let Some(prev_pos) = prev_pos {
                         crate::term::MoveFromTo::new(prev_pos, pos)
@@ -472,11 +459,10 @@ impl Grid {
                     contents.push(b' ');
                     // we know that the cell has no contents, but it still may
                     // have drawing attributes (background color, etc)
-                    let end_cell = self
-                        .drawing_cell(pos)
-                        // we assume self.pos.row is always valid, and
-                        // self.size.cols - 1 is always a valid column
-                        .unwrap();
+                    // zaivern patch: 升が無ければ末尾の再描画は諦める。
+                    let Some(end_cell) = self.drawing_cell(pos) else {
+                        return;
+                    };
                     end_cell
                         .attrs()
                         .write_escape_code_diff(contents, &prev_attrs);
@@ -521,13 +507,15 @@ impl Grid {
     }
 
     pub fn erase_row(&mut self, attrs: crate::attrs::Attrs) {
-        self.current_row_mut().clear(attrs);
+        if let Some(row) = self.current_row_mut() {
+            row.clear(attrs);
+        }
     }
 
     pub fn erase_row_forward(&mut self, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
-        let row = self.current_row_mut();
+        let Some(row) = self.current_row_mut() else { return };
         for col in pos.col..size.cols {
             row.erase(col, attrs);
         }
@@ -536,31 +524,46 @@ impl Grid {
     pub fn erase_row_backward(&mut self, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
-        let row = self.current_row_mut();
-        for col in 0..=pos.col.min(size.cols - 1) {
+        let Some(row) = self.current_row_mut() else { return };
+        for col in 0..=pos.col.min(size.cols.saturating_sub(1)) {
             row.erase(col, attrs);
         }
     }
 
+    /// zaivern patch: **繰り返し回数を「意味のある上限」で頭打ちにする**。
+    ///
+    /// CSI の引数は 65535 まで取れる。元実装はその回数だけ素朴に回すため、
+    /// 例えば `CSI 65535 @` (ICH) は 200 桁の行に対して 65535 回の
+    /// `Vec::insert` (各 O(cols)) を回し、**1 個のエスケープで数秒**かかっていた。
+    /// これは PTY 読取スレッドが parser の Mutex を握ったまま起きるので、
+    /// 同じフレームで描画しようとした UI スレッドがその間ずっと待たされる
+    /// = **アプリ全体が固まる**。タイルを閉じた直後など、端末が縮んで TUI が
+    /// 全画面を描き直すときに実際に踏み得る。
+    ///
+    /// 上限を超えた繰り返しは結果を変えない (対象領域はすべて空白になり切る/
+    /// あふれた分は最後に切り捨てられる) ので、頭打ちにしても描画は同じ。
     pub fn insert_cells(&mut self, count: u16) {
         let size = self.size;
         let pos = self.pos;
+        // 行の残り桁数を超えて挿入しても、末尾の truncate で消えるだけ。
+        let count = count.min(size.cols.saturating_sub(pos.col));
         let wide = pos.col < size.cols
             && self
                 .drawing_cell(pos)
-                // we assume self.pos.row is always valid, and we know we are
-                // not off the end of a row because we just checked pos.col <
-                // size.cols
-                .unwrap()
-                .is_wide_continuation();
-        let row = self.current_row_mut();
+                .is_some_and(crate::cell::Cell::is_wide_continuation);
+        let Some(row) = self.current_row_mut() else { return };
         for _ in 0..count {
+            // zaivern patch: 升が無ければ全角フラグの付け外しは飛ばす。
             if wide {
-                row.get_mut(pos.col).unwrap().set_wide_continuation(false);
+                if let Some(c) = row.get_mut(pos.col) {
+                    c.set_wide_continuation(false);
+                }
             }
             row.insert(pos.col, crate::cell::Cell::default());
             if wide {
-                row.get_mut(pos.col).unwrap().set_wide_continuation(true);
+                if let Some(c) = row.get_mut(pos.col) {
+                    c.set_wide_continuation(true);
+                }
             }
         }
         row.truncate(size.cols);
@@ -569,8 +572,10 @@ impl Grid {
     pub fn delete_cells(&mut self, count: u16) {
         let size = self.size;
         let pos = self.pos;
-        let row = self.current_row_mut();
-        for _ in 0..(count.min(size.cols - pos.col)) {
+        let Some(row) = self.current_row_mut() else { return };
+        // zaivern patch: 折返し待ち (pos.col == cols) や縮小直後は
+        // `cols - pos.col` が桁溢れする。
+        for _ in 0..(count.min(size.cols.saturating_sub(pos.col))) {
             row.remove(pos.col);
         }
         row.resize(size.cols, crate::cell::Cell::default());
@@ -579,14 +584,24 @@ impl Grid {
     pub fn erase_cells(&mut self, count: u16, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
-        let row = self.current_row_mut();
+        let Some(row) = self.current_row_mut() else { return };
         for col in pos.col..((pos.col.saturating_add(count)).min(size.cols)) {
             row.erase(col, attrs);
         }
     }
 
     pub fn insert_lines(&mut self, count: u16) {
+        // 領域が全部空行になり切ったら、それ以上回しても結果は同じ。
+        let count = count.min(
+            self.scroll_bottom
+                .saturating_sub(self.pos.row)
+                .saturating_add(1),
+        );
         for _ in 0..count {
+            // zaivern patch: 0 行グリッドや領域外の scroll_bottom で範囲外になる
+            if usize::from(self.scroll_bottom) >= self.rows.len() {
+                return;
+            }
             self.rows.remove(usize::from(self.scroll_bottom));
             self.rows.insert(usize::from(self.pos.row), self.new_row());
             // self.scroll_bottom is maintained to always be a valid row
@@ -595,7 +610,16 @@ impl Grid {
     }
 
     pub fn delete_lines(&mut self, count: u16) {
-        for _ in 0..(count.min(self.size.rows - self.pos.row)) {
+        // zaivern patch: `rows - pos.row` は縮小直後に桁溢れする。
+        // 併せて「領域を空にし切る回数」で頭打ちにする (insert_cells の説明を参照)。
+        let count = count
+            .min(self.size.rows.saturating_sub(self.pos.row))
+            .min(
+                self.scroll_bottom
+                    .saturating_sub(self.pos.row)
+                    .saturating_add(1),
+            );
+        for _ in 0..count {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             self.rows.remove(usize::from(self.pos.row));
@@ -603,7 +627,9 @@ impl Grid {
     }
 
     pub fn scroll_up(&mut self, count: u16) {
-        for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
+        // zaivern patch: `rows - scroll_top` は縮小直後に桁溢れする。
+        let count = count.min(self.size.rows.saturating_sub(self.scroll_top));
+        for _ in 0..count {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
@@ -621,7 +647,17 @@ impl Grid {
     }
 
     pub fn scroll_down(&mut self, count: u16) {
+        // zaivern patch: 領域を空にし切る回数で頭打ち (insert_cells の説明を参照)。
+        let count = count.min(
+            self.scroll_bottom
+                .saturating_sub(self.scroll_top)
+                .saturating_add(1),
+        );
         for _ in 0..count {
+            // zaivern patch: 0 行グリッドや領域外の scroll_bottom で範囲外になる
+            if usize::from(self.scroll_bottom) >= self.rows.len() {
+                return;
+            }
             self.rows.remove(usize::from(self.scroll_bottom));
             self.rows
                 .insert(usize::from(self.scroll_top), self.new_row());
@@ -631,13 +667,13 @@ impl Grid {
     }
 
     pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
-        let bottom = bottom.min(self.size().rows - 1);
+        let bottom = bottom.min(self.size().rows.saturating_sub(1));
         if top < bottom {
             self.scroll_top = top;
             self.scroll_bottom = bottom;
         } else {
             self.scroll_top = 0;
-            self.scroll_bottom = self.size().rows - 1;
+            self.scroll_bottom = self.size().rows.saturating_sub(1);
         }
         self.pos.row = self.scroll_top;
         self.pos.col = 0;
@@ -648,7 +684,7 @@ impl Grid {
     }
 
     fn scroll_region_active(&self) -> bool {
-        self.scroll_top != 0 || self.scroll_bottom != self.size.rows - 1
+        self.scroll_top != 0 || self.scroll_bottom != self.size.rows.saturating_sub(1)
     }
 
     pub fn set_origin_mode(&mut self, mode: bool) {
@@ -724,18 +760,22 @@ impl Grid {
     }
 
     pub fn col_wrap(&mut self, width: u16, wrap: bool) {
-        if self.pos.col > self.size.cols - width {
+        if self.pos.col > self.size.cols.saturating_sub(width) {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
+            // zaivern patch: 行数より多くスクロールし得る (1 行の端末や、
+            // 縮小直後にカーソルがスクロール領域の外にいる場合) ため、
+            // 引き算は飽和させる。debug では桁溢れ panic、release では
+            // 65535 行目という嘘の行番号になって直後の unwrap が死ぬ。
+            prev_pos.row = prev_pos.row.saturating_sub(scrolled);
             let new_pos = self.pos;
-            self.drawing_row_mut(prev_pos.row)
-                // we assume self.pos.row is always valid, and so prev_pos.row
-                // must be valid because it is always less than or equal to
-                // self.pos.row
-                .unwrap()
-                .wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            // zaivern patch: 行が確保される前 (allocate_rows 前) や範囲外だと
+            // None が返る。ここで unwrap すると PTY 読取スレッドだけが落ちて
+            // 端末が黒いまま固まるので、折返しフラグを諦めるだけにする。
+            if let Some(row) = self.drawing_row_mut(prev_pos.row) {
+                row.wrap(wrap && prev_pos.row.saturating_add(1) == new_pos.row);
+            }
         }
     }
 
@@ -753,7 +793,7 @@ impl Grid {
         let bottom = if limit_to_scroll_region {
             self.scroll_bottom
         } else {
-            self.size.rows - 1
+            self.size.rows.saturating_sub(1)
         };
         if self.pos.row > bottom {
             let rows = self.pos.row - bottom;
@@ -765,14 +805,14 @@ impl Grid {
     }
 
     fn row_clamp(&mut self) {
-        if self.pos.row > self.size.rows - 1 {
-            self.pos.row = self.size.rows - 1;
+        if self.pos.row > self.size.rows.saturating_sub(1) {
+            self.pos.row = self.size.rows.saturating_sub(1);
         }
     }
 
     fn col_clamp(&mut self) {
-        if self.pos.col > self.size.cols - 1 {
-            self.pos.col = self.size.cols - 1;
+        if self.pos.col > self.size.cols.saturating_sub(1) {
+            self.pos.col = self.size.cols.saturating_sub(1);
         }
     }
 }

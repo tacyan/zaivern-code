@@ -52,11 +52,23 @@ impl Row {
         self.wrapped = false;
     }
 
+    // zaivern patch: 以下 4 つの関数は「升は必ず在る / 全角の相方も必ず在る」と
+    // 決め打って添字アクセスしていた。行の升はリサイズで**右から**切り捨てられる
+    // ため、全角の左半分だけが最終列に残った行が普通に作れてしまう。
+    // その状態で書き込みや消去が来ると添字が範囲外になり (release でも panic)、
+    // PTY 読取スレッドが死ぬ → 端末が更新されない → parser の Mutex が poison
+    // → そのタイルが黒いまま戻らない、という実際の事故につながっていた。
+    // 添字は Option 経由にして、無ければ黙って諦める。
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
-        let wide = self.cells[usize::from(i)].is_wide();
+        let Some(cell) = self.cells.get_mut(usize::from(i)) else {
+            return;
+        };
+        let wide = cell.is_wide();
         self.clear_wide(i);
-        self.cells[usize::from(i)].clear(attrs);
-        if i == self.cols() - if wide { 2 } else { 1 } {
+        if let Some(cell) = self.cells.get_mut(usize::from(i)) {
+            cell.clear(attrs);
+        }
+        if i == self.cols().saturating_sub(if wide { 2 } else { 1 }) {
             self.wrapped = false;
         }
     }
@@ -64,7 +76,10 @@ impl Row {
     pub fn truncate(&mut self, len: u16) {
         self.cells.truncate(usize::from(len));
         self.wrapped = false;
-        let last_cell = &mut self.cells[usize::from(len) - 1];
+        // len == 0 だと `len - 1` が桁溢れし、そもそも触る升も無い。
+        let Some(last_cell) = self.cells.last_mut() else {
+            return;
+        };
         if last_cell.is_wide() {
             last_cell.clear(*last_cell.attrs());
         }
@@ -84,12 +99,19 @@ impl Row {
     }
 
     pub fn clear_wide(&mut self, col: u16) {
-        let cell = &self.cells[usize::from(col)];
-        let other = if cell.is_wide() {
-            &mut self.cells[usize::from(col + 1)]
+        let Some(cell) = self.cells.get(usize::from(col)) else {
+            return;
+        };
+        // 相方の列。全角の左半分なら右隣、右半分なら左隣。
+        // どちらも「行を縮めた / 0 列目だった」で存在しないことがある。
+        let other_col = if cell.is_wide() {
+            usize::from(col).checked_add(1)
         } else if cell.is_wide_continuation() {
-            &mut self.cells[usize::from(col - 1)]
+            usize::from(col).checked_sub(1)
         } else {
+            return;
+        };
+        let Some(other) = other_col.and_then(|c| self.cells.get_mut(c)) else {
             return;
         };
         other.clear(*other.attrs());
@@ -150,7 +172,9 @@ impl Row {
         let mut prev_pos = prev_pos.unwrap_or_else(|| {
             if wrapping {
                 crate::grid::Pos {
-                    row: row - 1,
+                    // zaivern patch: 先頭行が「折返し継続」扱いになると
+                    // row == 0 で桁溢れする
+                    row: row.saturating_sub(1),
                     col: self.cols(),
                 }
             } else {
@@ -440,17 +464,19 @@ impl Row {
         // drawing the next line can just start writing and be wrapped.
         if (!self.wrapped && prev.wrapped) || (!prev.wrapped && self.wrapped)
         {
-            let end_pos = if self.cells[usize::from(self.cols() - 1)]
-                .is_wide_continuation()
-            {
+            let last_is_continuation = self
+                .cells
+                .last()
+                .is_some_and(crate::cell::Cell::is_wide_continuation);
+            let end_pos = if last_is_continuation {
                 crate::grid::Pos {
                     row,
-                    col: self.cols() - 2,
+                    col: self.cols().saturating_sub(2),
                 }
             } else {
                 crate::grid::Pos {
                     row,
-                    col: self.cols() - 1,
+                    col: self.cols().saturating_sub(1),
                 }
             };
             crate::term::MoveFromTo::new(prev_pos, end_pos)

@@ -812,6 +812,15 @@ impl Screen {
     fn text(&mut self, c: char) {
         let pos = self.grid().pos();
         let size = self.grid().size();
+        // zaivern patch: 0 行 / 0 桁のグリッドには置ける升が 1 つも無い。
+        // 元実装はこの前提を書かずに `size.cols - 1` や `drawing_cell().unwrap()`
+        // を踏むため、桁溢れ (debug では panic) と None の unwrap で
+        // **PTY 読取スレッドだけが死ぬ**。そのスレッドが死ぬと端末は更新を止め、
+        // さらに parser の Mutex が poison するのでタイルが黒いまま戻らない。
+        // 描ける升が無いなら何もしないのが正しい。
+        if size.rows == 0 || size.cols == 0 {
+            return;
+        }
         let attrs = self.attrs;
 
         let width = c.width();
@@ -834,18 +843,20 @@ impl Screen {
         // (xterm handles this by introducing the concept of triple width
         // cells, which i really don't want to do).
         let mut wrap = false;
-        if pos.col > size.cols - width {
-            let last_cell = self
-                .grid()
-                .drawing_cell(crate::grid::Pos {
-                    row: pos.row,
-                    col: size.cols - 1,
-                })
-                // pos.row is valid, since it comes directly from
-                // self.grid().pos() which we assume to always have a valid
-                // row value. size.cols - 1 is also always a valid column.
-                .unwrap();
-            if last_cell.has_contents() || last_cell.is_wide_continuation() {
+        // zaivern patch: 全角 (width == 2) を 1 桁の端末へ書くと `cols - width` が
+        // 桁溢れする。debug では panic、release では 65534 に化けて折返し判定が
+        // 死ぬ。飽和差なら「最終列」を正しく指し、幅が入り切らない端末でも
+        // 素直に折り返す。
+        if pos.col > size.cols.saturating_sub(width) {
+            // zaivern patch: 行が未確保 / 範囲外だと None。unwrap すると
+            // 読取スレッドが死ぬので「折返さない」に倒す。
+            let last_cell = self.grid().drawing_cell(crate::grid::Pos {
+                row: pos.row,
+                col: size.cols.saturating_sub(1),
+            });
+            if last_cell.is_some_and(|c| {
+                c.has_contents() || c.is_wide_continuation()
+            }) {
                 wrap = true;
             }
         }
@@ -854,193 +865,139 @@ impl Screen {
 
         if width == 0 {
             if pos.col > 0 {
-                let mut prev_cell = self
-                    .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
+                // zaivern patch: 合成先の升が無ければ諦める (unwrap しない)。
+                let prev_is_continuation = self
+                    .grid()
+                    .drawing_cell(crate::grid::Pos {
                         row: pos.row,
                         col: pos.col - 1,
                     })
-                    // pos.row is valid, since it comes directly from
-                    // self.grid().pos() which we assume to always have a
-                    // valid row value. pos.col - 1 is valid because we just
-                    // checked for pos.col > 0.
-                    .unwrap();
-                if prev_cell.is_wide_continuation() {
-                    prev_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row,
-                            col: pos.col - 2,
-                        })
-                        // pos.row is valid, since it comes directly from
-                        // self.grid().pos() which we assume to always have a
-                        // valid row value. we know pos.col - 2 is valid
-                        // because the cell at pos.col - 1 is a wide
-                        // continuation character, which means there must be
-                        // the first half of the wide character before it.
-                        .unwrap();
-                }
-                prev_cell.append(c);
-            } else if pos.row > 0 {
-                let prev_row = self
-                    .grid()
-                    .drawing_row(pos.row - 1)
-                    // pos.row is valid, since it comes directly from
-                    // self.grid().pos() which we assume to always have a
-                    // valid row value. pos.row - 1 is valid because we just
-                    // checked for pos.row > 0.
-                    .unwrap();
-                if prev_row.wrapped() {
-                    let mut prev_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(crate::grid::Pos {
-                            row: pos.row - 1,
-                            col: size.cols - 1,
-                        })
-                        // pos.row is valid, since it comes directly from
-                        // self.grid().pos() which we assume to always have a
-                        // valid row value. pos.row - 1 is valid because we
-                        // just checked for pos.row > 0. col of size.cols - 1
-                        // is always valid.
-                        .unwrap();
-                    if prev_cell.is_wide_continuation() {
-                        prev_cell = self
-                            .grid_mut()
-                            .drawing_cell_mut(crate::grid::Pos {
-                                row: pos.row - 1,
-                                col: size.cols - 2,
-                            })
-                            // pos.row is valid, since it comes directly from
-                            // self.grid().pos() which we assume to always
-                            // have a valid row value. pos.row - 1 is valid
-                            // because we just checked for pos.row > 0. col of
-                            // size.cols - 2 is valid because the cell at
-                            // size.cols - 1 is a wide continuation character,
-                            // so it must have the first half of the wide
-                            // character before it.
-                            .unwrap();
-                    }
+                    .is_some_and(crate::cell::Cell::is_wide_continuation);
+                let target = crate::grid::Pos {
+                    row: pos.row,
+                    // 左隣が全角の右半分なら、その左半分へ合成する。
+                    // 0/1 桁目でも桁溢れしないよう飽和差にする。
+                    col: if prev_is_continuation {
+                        pos.col.saturating_sub(2)
+                    } else {
+                        pos.col - 1
+                    },
+                };
+                if let Some(prev_cell) = self.grid_mut().drawing_cell_mut(target)
+                {
                     prev_cell.append(c);
+                }
+            } else if pos.row > 0 {
+                // zaivern patch: 行が未確保 / 範囲外だと None。unwrap すると
+                // 読取スレッドが死ぬので、合成を諦めるだけにする。
+                let Some(prev_row) = self.grid().drawing_row(pos.row - 1)
+                else {
+                    return;
+                };
+                if prev_row.wrapped() {
+                    // zaivern patch: 上と同じ。升が無ければ合成を諦める。
+                    let last_is_continuation = self
+                        .grid()
+                        .drawing_cell(crate::grid::Pos {
+                            row: pos.row - 1,
+                            col: size.cols.saturating_sub(1),
+                        })
+                        .is_some_and(crate::cell::Cell::is_wide_continuation);
+                    let target = crate::grid::Pos {
+                        row: pos.row - 1,
+                        col: if last_is_continuation {
+                            size.cols.saturating_sub(2)
+                        } else {
+                            size.cols.saturating_sub(1)
+                        },
+                    };
+                    if let Some(prev_cell) =
+                        self.grid_mut().drawing_cell_mut(target)
+                    {
+                        prev_cell.append(c);
+                    }
                 }
             }
         } else {
-            if self
-                .grid()
-                .drawing_cell(pos)
-                // pos.row is valid because we assume self.grid().pos() to
-                // always have a valid row value. pos.col is valid because we
-                // called col_wrap() immediately before this, which ensures
-                // that self.grid().pos().col has a valid value.
-                .unwrap()
-                .is_wide_continuation()
-            {
-                let prev_cell = self
-                    .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
+            // zaivern patch: ここから下の元実装は「wide なら右隣の升が必ずある /
+            // wide continuation なら左隣が必ずある」と決め打って unwrap していた。
+            // その不変条件はリサイズで簡単に壊れる — 行を縮めると升は**右から**
+            // 切り捨てられるので、全角の左半分だけが最終列に残った行ができる
+            // (例: 80 桁で 40〜41 桁に居た全角を 41 桁へ縮める)。
+            // その升へ書いた瞬間に `drawing_cell_mut(col + 1)` が None になり、
+            // PTY 読取スレッドが panic して端末が固まり、parser の Mutex が
+            // poison してタイルが黒いまま戻らなくなる (実際の事故報告と一致)。
+            // 升が無ければ「半端になった全角」を諦めて 1 桁として書く。
+            let cell_is = |screen: &Self, p: crate::grid::Pos| {
+                screen
+                    .grid()
+                    .drawing_cell(p)
+                    .map_or((false, false), |c| {
+                        (c.is_wide(), c.is_wide_continuation())
+                    })
+            };
+
+            let (_, was_continuation) = cell_is(self, pos);
+            if was_continuation && pos.col > 0 {
+                // 左半分を消す。範囲外なら何もしない。
+                if let Some(prev_cell) =
+                    self.grid_mut().drawing_cell_mut(crate::grid::Pos {
                         row: pos.row,
                         col: pos.col - 1,
                     })
-                    // pos.row is valid because we assume self.grid().pos() to
-                    // always have a valid row value. pos.col is valid because
-                    // we called col_wrap() immediately before this, which
-                    // ensures that self.grid().pos().col has a valid value.
-                    // pos.col - 1 is valid because the cell at pos.col is a
-                    // wide continuation character, so it must have the first
-                    // half of the wide character before it.
-                    .unwrap();
-                prev_cell.clear(attrs);
+                {
+                    prev_cell.clear(attrs);
+                }
             }
 
-            if self
-                .grid()
-                .drawing_cell(pos)
-                // pos.row is valid because we assume self.grid().pos() to
-                // always have a valid row value. pos.col is valid because we
-                // called col_wrap() immediately before this, which ensures
-                // that self.grid().pos().col has a valid value.
-                .unwrap()
-                .is_wide()
-            {
-                let next_cell = self
-                    .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
+            let (was_wide, _) = cell_is(self, pos);
+            if was_wide {
+                // 右半分を空白へ戻す。切り捨て済みなら何もしない。
+                if let Some(next_cell) =
+                    self.grid_mut().drawing_cell_mut(crate::grid::Pos {
                         row: pos.row,
-                        col: pos.col + 1,
+                        col: pos.col.saturating_add(1),
                     })
-                    // pos.row is valid because we assume self.grid().pos() to
-                    // always have a valid row value. pos.col is valid because
-                    // we called col_wrap() immediately before this, which
-                    // ensures that self.grid().pos().col has a valid value.
-                    // pos.col + 1 is valid because the cell at pos.col is a
-                    // wide character, so it must have the second half of the
-                    // wide character after it.
-                    .unwrap();
-                next_cell.set(' ', attrs);
+                {
+                    next_cell.set(' ', attrs);
+                }
             }
 
-            let cell = self
-                .grid_mut()
-                .drawing_cell_mut(pos)
-                // pos.row is valid because we assume self.grid().pos() to
-                // always have a valid row value. pos.col is valid because we
-                // called col_wrap() immediately before this, which ensures
-                // that self.grid().pos().col has a valid value.
-                .unwrap();
+            let Some(cell) = self.grid_mut().drawing_cell_mut(pos) else {
+                // 書く升そのものが無い (0 桁など)。何もしないのが正しい。
+                return;
+            };
             cell.set(c, attrs);
             self.grid_mut().col_inc(1);
             if width > 1 {
                 let pos = self.grid().pos();
-                if self
-                    .grid()
-                    .drawing_cell(pos)
-                    // pos.row is valid because we assume self.grid().pos() to
-                    // always have a valid row value. pos.col is valid because
-                    // we called col_wrap() earlier, which ensures that
-                    // self.grid().pos().col has a valid value. this is true
-                    // even though we just called col_inc, because this branch
-                    // only happens if width > 1, and col_wrap takes width
-                    // into account.
-                    .unwrap()
-                    .is_wide()
-                {
+                // 全角の右半分を置く升が無い = 端末が細すぎて入り切らない。
+                // 左半分だけ置いて幅 1 扱いにする (panic するより表示が崩れる方がよい)。
+                if self.grid().drawing_cell(pos).is_none() {
+                    return;
+                }
+                let (next_is_wide, _) = cell_is(self, pos);
+                if next_is_wide {
                     let next_next_pos = crate::grid::Pos {
                         row: pos.row,
-                        col: pos.col + 1,
+                        col: pos.col.saturating_add(1),
                     };
-                    let next_next_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(next_next_pos)
-                        // pos.row is valid because we assume
-                        // self.grid().pos() to always have a valid row value.
-                        // pos.col is valid because we called col_wrap()
-                        // earlier, which ensures that self.grid().pos().col
-                        // has a valid value. this is true even though we just
-                        // called col_inc, because this branch only happens if
-                        // width > 1, and col_wrap takes width into account.
-                        // pos.col + 1 is valid because the cell at pos.col is
-                        // wide, and so it must have the second half of the
-                        // wide character after it.
-                        .unwrap();
-                    next_next_cell.clear(attrs);
-                    if next_next_pos.col == size.cols - 1 {
-                        self.grid_mut()
-                            .drawing_row_mut(pos.row)
-                            // we assume self.grid().pos().row is always valid
-                            .unwrap()
-                            .wrap(false);
+                    if let Some(next_next_cell) =
+                        self.grid_mut().drawing_cell_mut(next_next_pos)
+                    {
+                        next_next_cell.clear(attrs);
+                    }
+                    if next_next_pos.col == size.cols.saturating_sub(1) {
+                        if let Some(row) = self.grid_mut().drawing_row_mut(pos.row)
+                        {
+                            row.wrap(false);
+                        }
                     }
                 }
-                let next_cell = self
-                    .grid_mut()
-                    .drawing_cell_mut(pos)
-                    // pos.row is valid because we assume self.grid().pos() to
-                    // always have a valid row value. pos.col is valid because
-                    // we called col_wrap() earlier, which ensures that
-                    // self.grid().pos().col has a valid value. this is true
-                    // even though we just called col_inc, because this branch
-                    // only happens if width > 1, and col_wrap takes width
-                    // into account.
-                    .unwrap();
+                let Some(next_cell) = self.grid_mut().drawing_cell_mut(pos)
+                else {
+                    return;
+                };
                 next_cell.clear(crate::attrs::Attrs::default());
                 next_cell.set_wide_continuation(true);
                 self.grid_mut().col_inc(1);
@@ -1527,7 +1484,11 @@ impl Screen {
 
     // CSI r
     fn decstbm(&mut self, (top, bottom): (u16, u16)) {
-        self.grid_mut().set_scroll_region(top - 1, bottom - 1);
+        // zaivern patch: canonicalize_params_decstbm は bottom == 0 のとき
+        // 画面行数を代入するが、0 行のグリッドではそれも 0 で、`bottom - 1` が
+        // 桁溢れする (debug は panic)。飽和差にしておく。
+        self.grid_mut()
+            .set_scroll_region(top.saturating_sub(1), bottom.saturating_sub(1));
     }
 
     // osc codes
