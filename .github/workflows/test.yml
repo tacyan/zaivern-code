@@ -69,7 +69,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - name: Non-terminal tests
-        run: cargo nextest run --locked --profile ci -E 'not test(/^terminal::/)'
+        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'not test(/^terminal::/)'
 
   # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
   # 表示名: "pty (ubuntu-latest)" など。
@@ -100,4 +100,4 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - name: Terminal (real PTY) tests
-        run: cargo nextest run --locked --profile ci -E 'test(/^terminal::/)'
+        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'test(/^terminal::/)'
