@@ -356,6 +356,10 @@ pub struct ZaivernApp {
     md_images: markdown::ImageCache,
     /// プレビュー用の変換結果キャッシュ (バッファ id, テキストハッシュ, 変換後 Markdown)
     md_pre_cache: Option<(u64, u64, String)>,
+    /// 画像ビューアの明示ズーム (バッファ id → 倍率)。エントリ無し = フィット表示
+    img_zoom: HashMap<u64, f32>,
+    /// 透過画像用の市松模様テクスチャ ((色ペア) が変わったら作り直す)
+    checker_tex: Option<((egui::Color32, egui::Color32), egui::TextureHandle)>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
     file_index: Vec<IndexedFile>,
@@ -787,6 +791,8 @@ impl ZaivernApp {
             md_preview: false,
             md_images: markdown::ImageCache::default(),
             md_pre_cache: None,
+            img_zoom: HashMap::new(),
+            checker_tex: None,
             sidebar_open: true,
             sidebar_tab: SidebarTab::Files,
             file_index: Vec::new(),
@@ -3153,7 +3159,9 @@ impl ZaivernApp {
             | Cmd::TogglePetSounds
             | Cmd::TogglePetBubbles
             | Cmd::TogglePetAutoYes
-            | Cmd::ToggleRemote => self.apply_cmd_settings(cmd, ctx),
+            | Cmd::ToggleRemote
+            | Cmd::ToggleWordWrap
+            | Cmd::ToggleShowWhitespace => self.apply_cmd_settings(cmd, ctx),
             Cmd::VoiceInput(_)
             | Cmd::VoiceStop
             | Cmd::SetVoiceTarget(_)
@@ -3689,6 +3697,40 @@ impl ZaivernApp {
                 if self.agents.running_count() > 0 {
                     self.toast(tr("実行中のセッションは各行の 🛡 ボタン（または 🛡 全切替）で切替できます"), true);
                 }
+            }
+            Cmd::ToggleWordWrap => {
+                self.cfg.word_wrap = !self.cfg.word_wrap;
+                self.cfg.global_word_wrap = self.cfg.word_wrap;
+                // galley は折り返し設定込みでキャッシュしているため作り直す
+                for b in &mut self.editor.buffers {
+                    b.cache = None;
+                    b.gutter = None;
+                }
+                config::save_state(&self.cfg);
+                self.toast(
+                    if self.cfg.word_wrap {
+                        tr("↩ 折り返し: オン (長い行をエディタ幅で折り返します)")
+                    } else {
+                        tr("↩ 折り返し: オフ (横スクロールに戻ります)")
+                    },
+                    true,
+                );
+            }
+            Cmd::ToggleShowWhitespace => {
+                self.cfg.show_whitespace = !self.cfg.show_whitespace;
+                self.cfg.global_show_whitespace = self.cfg.show_whitespace;
+                for b in &mut self.editor.buffers {
+                    b.cache = None;
+                }
+                config::save_state(&self.cfg);
+                self.toast(
+                    if self.cfg.show_whitespace {
+                        tr("· 空白文字の表示: オン (スペース=· / タブ=→)")
+                    } else {
+                        tr("· 空白文字の表示: オフ")
+                    },
+                    true,
+                );
             }
             Cmd::TogglePet => {
                 self.cfg.show_pet = !self.cfg.show_pet;
@@ -5259,6 +5301,9 @@ impl ZaivernApp {
         // サイドバーの「中身の矩形」がパネル幅を突き破って伸びてしまう。
         // egui の SidePanel は中身の矩形で次パネルの開始位置を決めるため、
         // 突き破った分だけ中央領域が右へ押され、間が未描画 (真っ黒) になる。
+        // アクティブファイル追従 (VS Code の explorer.autoReveal): ツリーへ通知
+        let active = self.active_file_path();
+        self.tree.set_active_file(active.as_deref());
         egui::ScrollArea::both()
             .id_salt("zv-tree")
             .auto_shrink(false)
@@ -7292,6 +7337,11 @@ impl ZaivernApp {
         // PR 差分タブはファイルではないので、専用の読み取り専用ビューを出して終わる
         // (TextEdit を一切出さないので、編集も保存も原理的に起きない)
         if let Some(i) = self.editor.active {
+            // 画像タブも専用ビューア (TextEdit を通らない読み取り専用表示)
+            if self.editor.buffers[i].kind == crate::editor::BufferKind::Image {
+                self.image_viewer_ui(ui, i);
+                return;
+            }
             if let crate::editor::BufferKind::PrDiff { number } = self.editor.buffers[i].kind {
                 let b = &self.editor.buffers[i];
                 panels::pr_diff_ui(ui, &theme, number, b.id, &b.text, &mut self.github);
@@ -7621,10 +7671,249 @@ impl ZaivernApp {
         }
     }
 
+    /// テーマ色 2 色の市松模様テクスチャ (透過画像の背景用)。
+    /// 128px 角を敷き詰めるので 1 フレームの描画クアッド数は高々数百で済む。
+    /// 色はテーマ由来 (固定の 16 進数は持たない)。テーマが変われば作り直す。
+    fn checker_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        let c1 = self.theme.panel;
+        let c2 = self.theme.panel_alt;
+        if let Some(((a, b), tex)) = &self.checker_tex {
+            if *a == c1 && *b == c2 {
+                return tex.clone();
+            }
+        }
+        const TILE: usize = 16; // 1 マスのピクセル数
+        const SIDE: usize = TILE * 8;
+        let mut img = egui::ColorImage::new([SIDE, SIDE], c1);
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                if ((x / TILE) + (y / TILE)) % 2 == 1 {
+                    img.pixels[y * SIDE + x] = c2;
+                }
+            }
+        }
+        let tex = ctx.load_texture("zv-img-checker", img, egui::TextureOptions::NEAREST);
+        self.checker_tex = Some(((c1, c2), tex.clone()));
+        tex
+    }
+
+    /// 画像タブのビューア (読み取り専用)。
+    /// 市松模様の背景に中央寄せで描く。既定はウィンドウへのフィット表示で、
+    /// − / ＋ / 100% / フィット ボタンと Ctrl(⌘)+スクロール (ピンチ) でズームできる。
+    /// 壊れた画像はエラーメッセージだけを出す (文字化けテキストは出さない)。
+    fn image_viewer_ui(&mut self, ui: &mut egui::Ui, i: usize) {
+        let theme_text = self.theme.text;
+        let theme_dim = self.theme.text_dim;
+        let theme_warn = self.theme.warn;
+        let theme_panel_alt = self.theme.panel_alt;
+        let checker = self.checker_texture(ui.ctx());
+
+        // ピクセル→テクスチャの遅延アップロード (ctx が要るので初回描画で行う)。
+        // 外部変更で再デコードされると ImageDoc ごと差し替わり texture が None に
+        // 戻るため、次のフレームで自動的に新しい絵へ載せ替わる。
+        let b = &mut self.editor.buffers[i];
+        let id = b.id;
+        let title = b.title.clone();
+        let Some(doc) = b.image.as_mut() else {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new(tr("画像を読み込めませんでした")).color(theme_dim));
+            });
+            return;
+        };
+        if doc.error.is_none() && doc.texture.is_none() && doc.size[0] > 0 {
+            let color = egui::ColorImage::from_rgba_unmultiplied(doc.size, &doc.rgba);
+            doc.texture = Some(ui.ctx().load_texture(
+                format!("zv-img:{id}"),
+                color,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        let tex = doc.texture.clone();
+        let error = doc.error.clone();
+        let orig = doc.orig_size;
+        let shown = doc.size;
+        let file_bytes = doc.file_bytes;
+
+        let total = ui.available_size();
+        let bar_h = 30.0;
+        let canvas = egui::vec2(total.x, (total.y - bar_h).max(40.0));
+        let img_w = shown[0] as f32;
+        let img_h = shown[1] as f32;
+        // フィット倍率は周囲に少し余白を残して求める
+        let fit = crate::editor::image_fit_scale(
+            img_w,
+            img_h,
+            (canvas.x - 16.0).max(1.0),
+            (canvas.y - 16.0).max(1.0),
+        );
+        let is_fit = !self.img_zoom.contains_key(&id);
+        let scale = self.img_zoom.get(&id).copied().unwrap_or(fit);
+        // Some(Some(z)) = 明示ズームへ / Some(None) = フィットへ戻す
+        let mut new_zoom: Option<Option<f32>> = None;
+
+        ui.allocate_ui(canvas, |ui| {
+            ui.set_min_size(canvas);
+            if let Some(err) = &error {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new(trf(
+                            "⚠ 画像を表示できません: {err}",
+                            &[("err", err.clone())],
+                        ))
+                        .color(theme_warn),
+                    );
+                });
+                return;
+            }
+            let Some(tex) = tex else { return };
+            egui::ScrollArea::both()
+                .id_salt(("image-view", id))
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    let disp = egui::vec2(img_w * scale, img_h * scale);
+                    // 画像が表示域より小さいときに中央へ寄るよう、コンテンツは
+                    // 最低でも表示域いっぱいに取る (大きいときはスクロールでパン)
+                    let content =
+                        egui::vec2(disp.x.max(canvas.x - 16.0), disp.y.max(canvas.y - 16.0));
+                    let (rect, resp) = ui.allocate_exact_size(content, egui::Sense::hover());
+                    let img_rect = egui::Rect::from_center_size(rect.center(), disp);
+
+                    // 透過部分が分かるように市松模様を画像の下へ敷く。
+                    // 敷くのは可視範囲だけ (巨大ズームでクアッドが溢れないように)。
+                    let vis = img_rect.intersect(ui.clip_rect());
+                    if vis.is_positive() {
+                        let p = ui.painter().with_clip_rect(vis);
+                        let uv = egui::Rect::from_min_max(
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(1.0, 1.0),
+                        );
+                        // 模様は画像の左上に揃える (パンしても模様が泳がない)
+                        let t = 128.0;
+                        let mut y =
+                            img_rect.top() + ((vis.top() - img_rect.top()) / t).floor() * t;
+                        while y < vis.bottom() {
+                            let mut x = img_rect.left()
+                                + ((vis.left() - img_rect.left()) / t).floor() * t;
+                            while x < vis.right() {
+                                p.image(
+                                    checker.id(),
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(x, y),
+                                        egui::vec2(t, t),
+                                    ),
+                                    uv,
+                                    egui::Color32::WHITE,
+                                );
+                                x += t;
+                            }
+                            y += t;
+                        }
+                        p.image(tex.id(), img_rect, uv, egui::Color32::WHITE);
+                    }
+
+                    // Ctrl(⌘)+スクロール / ピンチでズーム (egui が zoom_delta に集約する)
+                    if resp.hovered() {
+                        let zd = ui.input(|inp| inp.zoom_delta());
+                        if (zd - 1.0).abs() > f32::EPSILON {
+                            new_zoom = Some(Some((scale * zd).clamp(
+                                crate::editor::IMAGE_ZOOM_MIN,
+                                crate::editor::IMAGE_ZOOM_MAX,
+                            )));
+                        }
+                    }
+                });
+        });
+
+        // ステータス行: 寸法・ファイルサイズ・ズーム操作 (読み取り専用の明示付き)
+        egui::Frame::none()
+            .fill(theme_panel_alt)
+            .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("🖼 {title}")).size(11.5).color(theme_dim));
+                    if error.is_none() {
+                        let mut meta = format!(
+                            "{}×{} px · {}",
+                            orig.0,
+                            orig.1,
+                            crate::editor::human_bytes(file_bytes)
+                        );
+                        if (shown[0] as u32, shown[1] as u32) != orig {
+                            // GPU 上限対策で縮小表示している場合はその旨も出す
+                            meta.push_str(&trf(
+                                " (表示は {w}×{h} に縮小)",
+                                &[("w", shown[0].to_string()), ("h", shown[1].to_string())],
+                            ));
+                        }
+                        ui.label(RichText::new(meta).size(11.5).color(theme_text));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if error.is_none() {
+                            ui.label(
+                                RichText::new(format!("{:.0}%", scale * 100.0))
+                                    .size(11.5)
+                                    .color(theme_text),
+                            );
+                            let f = ui.selectable_label(
+                                is_fit,
+                                RichText::new(tr("フィット")).size(11.5),
+                            );
+                            if f.on_hover_text(tr("ウィンドウの大きさに合わせる")).clicked() {
+                                new_zoom = Some(None);
+                            }
+                            if ui
+                                .button(RichText::new("100%").size(11.5))
+                                .on_hover_text(tr("等倍で表示"))
+                                .clicked()
+                            {
+                                new_zoom = Some(Some(1.0));
+                            }
+                            if ui
+                                .button(RichText::new("＋").size(11.5))
+                                .on_hover_text(tr("拡大 (Ctrl/⌘+スクロールでも)"))
+                                .clicked()
+                            {
+                                new_zoom =
+                                    Some(Some(crate::editor::image_zoom_step(scale, 1)));
+                            }
+                            if ui
+                                .button(RichText::new("−").size(11.5))
+                                .on_hover_text(tr("縮小 (Ctrl/⌘+スクロールでも)"))
+                                .clicked()
+                            {
+                                new_zoom =
+                                    Some(Some(crate::editor::image_zoom_step(scale, -1)));
+                            }
+                            ui.separator();
+                        }
+                        ui.label(
+                            RichText::new(tr("読み取り専用")).size(11.0).color(theme_dim),
+                        );
+                    });
+                });
+            });
+
+        match new_zoom {
+            Some(Some(z)) => {
+                self.img_zoom.insert(id, z);
+            }
+            Some(None) => {
+                self.img_zoom.remove(&id);
+            }
+            None => {}
+        }
+    }
+
     fn code_editor_ui(&mut self, ui: &mut egui::Ui) {
         let Some(active) = self.editor.active else {
             return;
         };
+        // 画像タブが紛れ込んでも TextEdit を出さない (二重の防御。
+        // 通常はタブ描画の分岐で先に image_viewer_ui へ振られる)
+        if self.editor.buffers[active].kind == crate::editor::BufferKind::Image {
+            self.image_viewer_ui(ui, active);
+            return;
+        }
         let theme_text = self.theme.text;
         let theme_dim = self.theme.text_dim;
         let syntect_theme = self.theme.syntect_theme.clone();
@@ -7649,6 +7938,11 @@ impl ZaivernApp {
         let theme_accent = self.theme.accent;
         // 現在行ハイライト用 (テキストの上に重ねるのでごく薄く)
         let cur_line_hl = self.theme.text.gamma_multiply(0.07);
+        // 折り返しと空白可視化 (コマンド/メニューで切替、config に永続化)
+        let word_wrap = self.cfg.word_wrap;
+        let show_ws = self.cfg.show_whitespace;
+        // 空白グリフの色: テーマの薄文字をさらに落とす (テーマ準拠・固定色なし)
+        let ws_color = theme_dim.gamma_multiply(0.55);
 
         let mut pending_select = self.pending_select.take();
         let pending_scroll = self.pending_scroll.take();
@@ -7889,62 +8183,27 @@ impl ZaivernApp {
                 .wrapping_mul(37)
                 .wrapping_add((*l as u64) << 3 | *sev as u64);
         }
-        // galley までキャッシュするので、キーには LayoutJob の内容(行数/マーク/診断/
-        // フォントサイズ/テーマ)に加えてラスタライズ側の font_gen も含める。
-        // font family は常に Monospace 固定なので font.size のみで足りる。
-        let gutter_key = [
-            marks_hash,
-            diag_hash,
-            font.size.to_bits() as u64,
-            font_gen,
-            hash_str(&syntect_theme),
-        ]
-        .into_iter()
-        .fold(line_count as u64, combine_hash);
-        if gutter.as_ref().map(|(k, _)| *k) != Some(gutter_key) {
-            let width = line_count.to_string().len().max(3);
-            let mark_map: HashMap<usize, git::LineMark> = marks.iter().cloned().collect();
-            let mut job = egui::text::LayoutJob::default();
-            job.wrap.max_width = f32::INFINITY;
-            for n in 0..line_count {
-                // 診断色(エラー/警告)を git マークより優先する
-                let color = match diag_by_line.get(&n) {
-                    Some(1) => theme_err,
-                    Some(2) => theme_warn,
-                    _ => match mark_map.get(&n) {
-                        Some(git::LineMark::Added) => theme_ok,
-                        Some(git::LineMark::Modified) => theme_warn,
-                        None => theme_dim,
-                    },
-                };
-                let s = if n + 1 < line_count {
-                    format!("{:>width$}\n", n + 1)
-                } else {
-                    format!("{:>width$}", n + 1)
-                };
-                job.append(
-                    &s,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: font.clone(),
-                        color,
-                        ..Default::default()
-                    },
-                );
-            }
-            *gutter = Some((gutter_key, ui.fonts(|f| f.layout_job(job))));
-        }
+        // ガターの galley 化は ScrollArea 描画の後に行う (折り返し ON では本文
+        // galley の視覚行の並びが要るため)。幅は桁数から先に確定できる
+        // (等幅フォントなので数字幅 × 桁数で galley と同じ幅になる)。
+        let gutter_digits = line_count.to_string().len().max(3);
+        let gutter_w = ui.fonts(|f| f.glyph_width(&font, '0')) * gutter_digits as f32 + 22.0;
 
         let ed_id = egui::Id::new(("zaivern-buffer", *id));
-        // wrap 幅(_wrap)を無視してよい理由: highlight::layout_job は常に
-        // wrap.max_width = f32::INFINITY を設定する(横スクロールのため折り返さない)。
-        // よって galley は wrap 幅に依存せず、フレーム跨ぎで使い回せる。
-        let mut layouter = |ui: &egui::Ui, t: &str, _wrap: f32| {
+        // 折り返し OFF: highlight::layout_job が wrap.max_width = INFINITY を設定
+        // する (横スクロールのため折り返さない) ので galley は wrap 幅に依存しない。
+        // 折り返し ON: TextEdit から渡る利用可能幅で折り返す。キャッシュキーに
+        // 折り返し幅と空白可視化の有無も混ぜてあるので、条件が変わらない限り
+        // フレーム跨ぎで使い回せる。
+        let mut layouter = |ui: &egui::Ui, t: &str, wrap_w: f32| {
+            let max_w = crate::editor::wrap_max_width(word_wrap, wrap_w);
             let key = [
                 hash_str(lang.as_str()),
                 hash_str(&syntect_theme),
                 font.size.to_bits() as u64,
                 font_gen,
+                (word_wrap as u64) | ((show_ws as u64) << 1),
+                max_w.to_bits() as u64,
             ]
             .into_iter()
             .fold(hash_str(t), combine_hash);
@@ -7953,7 +8212,13 @@ impl ZaivernApp {
                 // LayoutJob のコピーも egui 側の job ハッシュ計算も起きない。
                 Some((k, g)) if *k == key => g.clone(),
                 _ => {
-                    let j = hl.layout_job(t, lang, &syntect_theme, font.clone(), theme_text);
+                    let mut j =
+                        hl.layout_job(t, lang, &syntect_theme, font.clone(), theme_text);
+                    if show_ws {
+                        // スペース→「·」/ タブ→「→」(char 数は変えない)
+                        j = crate::editor::whitespace_layout_job(j, ws_color);
+                    }
+                    j.wrap.max_width = max_w;
                     let g = ui.fonts(|f| f.layout_job(j));
                     *cache = Some((key, g.clone()));
                     g
@@ -7961,18 +8226,14 @@ impl ZaivernApp {
             }
         };
 
-        // ガター(行番号)は VS Code 同様、水平スクロールでは動かない固定表示。
-        // 本文の上に後描きするため、幅と galley を先に確定しておく。
-        let gutter_galley = match gutter.as_ref() {
-            // Arc の参照カウント増加だけ。LayoutJob のコピーも再レイアウトも起きない。
-            Some((_, g)) => g.clone(),
-            None => ui.fonts(|f| f.layout_job(Default::default())),
-        };
-        let gutter_w = gutter_galley.size().x + 22.0;
-
-        let mut sa = egui::ScrollArea::both()
-            .id_salt(("editor-scroll", *id))
-            .auto_shrink(false);
+        // 折り返し ON では横スクロールは不要 (幅は常に表示域に収まる)
+        let mut sa = if word_wrap {
+            egui::ScrollArea::vertical()
+        } else {
+            egui::ScrollArea::both()
+        }
+        .id_salt(("editor-scroll", *id))
+        .auto_shrink(false);
         if let Some(y) = pending_scroll {
             sa = sa.vertical_scroll_offset(y);
         }
@@ -8081,6 +8342,94 @@ impl ZaivernApp {
         });
 
         let (cursor_out, changed, text_top) = inner.inner;
+
+        // 行番号ガター: git マークで行ごとに色分けした galley をキャッシュ。
+        // 折り返し OFF は論理行と 1:1。ON は本文 galley の視覚行に合わせ、
+        // 折り返しの継続行には空行を挟む (行番号は行頭の視覚行にだけ出す)。
+        // 本文 galley は直前の sa.show 内の layouter で必ず作られている。
+        // キーには LayoutJob の内容(行数/マーク/診断/フォントサイズ/テーマ)に加え
+        // ラスタライズ側の font_gen と、折り返し ON では本文キー (= 折り返しの
+        // 並びが変わったら作り直すため) も含める。
+        let body_key = cache.as_ref().map(|(k, _)| *k).unwrap_or(0);
+        let gutter_key = [
+            marks_hash,
+            diag_hash,
+            font.size.to_bits() as u64,
+            font_gen,
+            hash_str(&syntect_theme),
+            word_wrap as u64,
+            if word_wrap { body_key } else { 0 },
+        ]
+        .into_iter()
+        .fold(line_count as u64, combine_hash);
+        if gutter.as_ref().map(|(k, _)| *k) != Some(gutter_key) {
+            let width = gutter_digits;
+            let mark_map: HashMap<usize, git::LineMark> = marks.iter().cloned().collect();
+            // 診断色(エラー/警告)を git マークより優先する
+            let color_of = |n: usize| match diag_by_line.get(&n) {
+                Some(1) => theme_err,
+                Some(2) => theme_warn,
+                _ => match mark_map.get(&n) {
+                    Some(git::LineMark::Added) => theme_ok,
+                    Some(git::LineMark::Modified) => theme_warn,
+                    None => theme_dim,
+                },
+            };
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = f32::INFINITY;
+            let append = |job: &mut egui::text::LayoutJob, s: &str, color| {
+                job.append(
+                    s,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font.clone(),
+                        color,
+                        ..Default::default()
+                    },
+                );
+            };
+            if word_wrap {
+                if let Some((_, g)) = cache.as_ref() {
+                    let rows = &g.rows;
+                    let mut line = 0usize;
+                    let mut at_line_start = true;
+                    for (ri, row) in rows.iter().enumerate() {
+                        let num = if at_line_start {
+                            format!("{:>width$}", line + 1)
+                        } else {
+                            String::new() // 折り返しの継続行は空欄
+                        };
+                        let s = if ri + 1 < rows.len() {
+                            format!("{num}\n")
+                        } else {
+                            num
+                        };
+                        append(&mut job, &s, color_of(line));
+                        if row.ends_with_newline {
+                            line += 1;
+                            at_line_start = true;
+                        } else {
+                            at_line_start = false;
+                        }
+                    }
+                }
+            } else {
+                for n in 0..line_count {
+                    let s = if n + 1 < line_count {
+                        format!("{:>width$}\n", n + 1)
+                    } else {
+                        format!("{:>width$}", n + 1)
+                    };
+                    append(&mut job, &s, color_of(n));
+                }
+            }
+            *gutter = Some((gutter_key, ui.fonts(|f| f.layout_job(job))));
+        }
+        // Arc の参照カウント増加だけ。LayoutJob のコピーも再レイアウトも起きない。
+        let gutter_galley = match gutter.as_ref() {
+            Some((_, g)) => g.clone(),
+            None => ui.fonts(|f| f.layout_job(Default::default())),
+        };
 
         // ガターを固定描画: 垂直スクロールには追従し、水平スクロールでは動かない
         let vis = inner.inner_rect;
@@ -8196,6 +8545,8 @@ impl ZaivernApp {
             ),
             ("📮".into(), tr("エージェントへメッセージを送る"), String::new(), Cmd::SendAgentMessage),
             ("👁".into(), tr("Markdown/HTML プレビュー切替"), "⌘⇧V".into(), Cmd::ToggleMdPreview),
+            ("↩".into(), tr("折り返し切替"), String::new(), Cmd::ToggleWordWrap),
+            ("·".into(), tr("空白文字表示切替"), String::new(), Cmd::ToggleShowWhitespace),
             ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),
             ("🌿".into(), tr("Git パネルを開く"), String::new(), Cmd::OpenGitPanel),
             (
@@ -11929,6 +12280,8 @@ impl ZaivernApp {
             fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
                 || self.fake_fullscreen.is_some(),
             auto_save: self.menu_state.auto_save,
+            word_wrap: self.cfg.word_wrap,
+            show_whitespace: self.cfg.show_whitespace,
             has_editor: self.editor.active.is_some(),
             has_file: active_path.is_some(),
             md_preview: self.md_preview,

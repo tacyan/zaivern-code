@@ -31,6 +31,10 @@ pub enum Cmd {
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替
     ToggleMdPreview,
     ToggleSidebar,
+    /// エディタ本文の折り返しを切り替える (config へ永続化)
+    ToggleWordWrap,
+    /// 空白文字 (スペース「·」/ タブ「→」) の可視化を切り替える (config へ永続化)
+    ToggleShowWhitespace,
     /// サイドバーを Git タブで開く
     OpenGitPanel,
     OpenFind,

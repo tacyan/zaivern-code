@@ -19,6 +19,10 @@ pub struct MenuInfo {
     pub problems_open: bool,
     pub fullscreen: bool,
     pub auto_save: bool,
+    /// エディタ本文の折り返し (表示メニューのチェック状態)
+    pub word_wrap: bool,
+    /// 空白文字の可視化 (表示メニューのチェック状態)
+    pub show_whitespace: bool,
     /// アクティブなエディタタブがあるか (編集系メニューの有効/無効)
     pub has_editor: bool,
     /// アクティブなタブがファイル (path 持ち) か
@@ -340,6 +344,24 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         };
         if item(ui, &term, &sc(keys, BindAction::ToggleTerminal), true) {
             cmds.push(Cmd::ToggleTerminal);
+        }
+        ui.separator();
+        // エディタの表示オプション (VS Code: 表示 > 折り返しの切り替え 相当)
+        let ww = if info.word_wrap {
+            tr("✓ 折り返し")
+        } else {
+            tr("折り返し")
+        };
+        if item(ui, &ww, "", true) {
+            cmds.push(Cmd::ToggleWordWrap);
+        }
+        let ws = if info.show_whitespace {
+            tr("✓ 空白文字を表示")
+        } else {
+            tr("空白文字を表示")
+        };
+        if item(ui, &ws, "", true) {
+            cmds.push(Cmd::ToggleShowWhitespace);
         }
         ui.separator();
         let md = if info.md_preview {

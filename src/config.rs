@@ -9,6 +9,12 @@ pub struct Config {
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
     pub show_hidden_files: bool,
+
+    /// エディタ本文の折り返し (VS Code の Word Wrap 相当)。既定はオフ。
+    pub word_wrap: bool,
+
+    /// 空白文字の可視化 (スペース「·」/ タブ「→」)。既定はオフ。
+    pub show_whitespace: bool,
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
@@ -27,6 +33,10 @@ pub struct Config {
     pub global_approval_mode: String,
     #[serde(skip)]
     pub global_show_pet: bool,
+    #[serde(skip)]
+    pub global_word_wrap: bool,
+    #[serde(skip)]
+    pub global_show_whitespace: bool,
     /// overlay を重ねる前のグローバルなプラグイン設定の控え。
     /// save_plugins_section はこちらを書く — セッション中の値を書くと
     /// プロジェクトの .zaivern.toml 由来の無効化・設定値がグローバル
@@ -190,12 +200,16 @@ impl Default for Config {
             editor_font_size: 15.0,
             terminal_font_size: 13.0,
             show_hidden_files: true,
+            word_wrap: false,
+            show_whitespace: false,
             approval_mode: "ask".into(),
             restore_agents: true,
             show_pet: true,
             global_theme: "zaivern-dark".into(),
             global_approval_mode: "ask".into(),
             global_show_pet: true,
+            global_word_wrap: false,
+            global_show_whitespace: false,
             global_plugins: PluginsConfig::default(),
             pet_image: None,
             pet_x: None,
@@ -306,6 +320,8 @@ struct Overlay {
     editor_font_size: Option<f32>,
     terminal_font_size: Option<f32>,
     show_hidden_files: Option<bool>,
+    word_wrap: Option<bool>,
+    show_whitespace: Option<bool>,
     approval_mode: Option<String>,
     show_pet: Option<bool>,
     agents: Vec<AgentPreset>,
@@ -322,6 +338,8 @@ struct UiState {
     theme: Option<String>,
     approval_mode: Option<String>,
     show_pet: Option<bool>,
+    word_wrap: Option<bool>,
+    show_whitespace: Option<bool>,
     pet_image: Option<String>,
     pet_x: Option<f32>,
     pet_y: Option<f32>,
@@ -379,6 +397,11 @@ theme = "zaivern-dark"
 editor_font_size = 15.0
 terminal_font_size = 13.0
 show_hidden_files = true
+
+# エディタ本文の折り返しと空白文字 (·/→) の可視化
+# (表示メニュー・コマンドパレットの「折り返し切替」「空白文字表示切替」でも変更できます)
+# word_wrap = false
+# show_whitespace = false
 
 # 既定の権限モード (claude / codex / agy に自動適用)
 #   "ask"   = 毎回ユーザー承認が必要（安全・デフォルト）
@@ -597,6 +620,12 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(p) = st.show_pet {
                     cfg.show_pet = p;
                 }
+                if let Some(v) = st.word_wrap {
+                    cfg.word_wrap = v;
+                }
+                if let Some(v) = st.show_whitespace {
+                    cfg.show_whitespace = v;
+                }
                 if st.pet_image.is_some() {
                     cfg.pet_image = st.pet_image;
                 }
@@ -668,6 +697,8 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     cfg.global_theme = cfg.theme.clone();
     cfg.global_approval_mode = cfg.approval_mode.clone();
     cfg.global_show_pet = cfg.show_pet;
+    cfg.global_word_wrap = cfg.word_wrap;
+    cfg.global_show_whitespace = cfg.show_whitespace;
     cfg.global_plugins = cfg.plugins.clone();
 
     for root in roots {
@@ -709,6 +740,12 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
             }
             if let Some(v) = o.show_hidden_files {
                 cfg.show_hidden_files = v;
+            }
+            if let Some(v) = o.word_wrap {
+                cfg.word_wrap = v;
+            }
+            if let Some(v) = o.show_whitespace {
+                cfg.show_whitespace = v;
             }
             if let Some(v) = o.approval_mode {
                 cfg.approval_mode = v;
@@ -925,6 +962,8 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         theme: Some(cfg.global_theme.clone()),
         approval_mode: Some(cfg.global_approval_mode.clone()),
         show_pet: Some(cfg.global_show_pet),
+        word_wrap: Some(cfg.global_word_wrap),
+        show_whitespace: Some(cfg.global_show_whitespace),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -1405,6 +1444,8 @@ mod tests {
             theme: Some("zaivern-light".into()),
             approval_mode: Some("auto".into()),
             show_pet: Some(false),
+            word_wrap: Some(true),
+            show_whitespace: Some(true),
             pet_image: Some("/tmp/p.png".into()),
             pet_x: Some(10.0),
             pet_y: Some(20.5),
@@ -1432,6 +1473,8 @@ mod tests {
         assert_eq!(back.theme, Some("zaivern-light".to_string()));
         assert_eq!(back.approval_mode, Some("auto".to_string()));
         assert_eq!(back.show_pet, Some(false));
+        assert_eq!(back.word_wrap, Some(true));
+        assert_eq!(back.show_whitespace, Some(true));
         assert_eq!(back.pet_image, Some("/tmp/p.png".to_string()));
         assert_eq!(back.pet_x, Some(10.0));
         assert_eq!(back.pet_y, Some(20.5));
@@ -1799,6 +1842,47 @@ mod state_overlay_tests {
         assert_eq!(st.theme.as_deref(), Some("global-theme"));
         assert_eq!(st.approval_mode.as_deref(), Some("auto"));
         assert_eq!(st.show_pet, Some(false));
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 折り返しと空白表示はstateへ永続化される() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "wrap-ws-home");
+        let mut cfg = Config::default();
+        assert!(!cfg.word_wrap && !cfg.show_whitespace, "既定はどちらもオフ");
+
+        // UI からの切替相当 (Cmd::ToggleWordWrap 等): 控えも一緒に更新する
+        cfg.word_wrap = true;
+        cfg.global_word_wrap = true;
+        cfg.show_whitespace = true;
+        cfg.global_show_whitespace = true;
+        save_state_to_dir(&home, &cfg);
+
+        let loaded = load_from_dir(&home, &[], true);
+        assert!(loaded.word_wrap, "折り返しが state.toml から復元される");
+        assert!(loaded.show_whitespace, "空白表示が state.toml から復元される");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn 折り返しはプロジェクトoverlayでも上書きできる() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "wrap-ov-home");
+        let root = crate::test_util::unique_temp_dir("zaivern-config-test", "wrap-ov-root");
+        std::fs::write(root.join(".zaivern.toml"), "word_wrap = true\nshow_whitespace = true\n")
+            .expect("write .zaivern.toml");
+
+        let cfg = load_from_dir(&home, std::slice::from_ref(&root), true);
+        assert!(cfg.word_wrap && cfg.show_whitespace, "プロジェクト値が効く");
+        // グローバルの控えは overlay 適用前の値のまま → state.toml へ漏れない
+        assert!(!cfg.global_word_wrap && !cfg.global_show_whitespace);
+        save_state_to_dir(&home, &cfg);
+        let raw = std::fs::read_to_string(home.join("state.toml")).expect("re-read");
+        let st: UiState = toml::from_str(&raw).expect("parse");
+        assert_eq!(st.word_wrap, Some(false));
+        assert_eq!(st.show_whitespace, Some(false));
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&root);

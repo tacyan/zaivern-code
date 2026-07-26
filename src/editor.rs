@@ -52,6 +52,10 @@ pub enum BufferKind {
     PrDiff { number: u64 },
     /// プロンプトレースの racer 差分ビュー (slot = racer の添字)。
     RaceDiff { slot: usize },
+    /// 画像ビューア (png/jpg 等)。ピクセルは `Buffer::image` に持つ。
+    /// `path` は `Some` (外部変更の mtime 監視で再デコードするため) だが、
+    /// `read_only()` が真なので保存・編集の経路には乗らない。
+    Image,
 }
 
 impl BufferKind {
@@ -78,8 +82,9 @@ pub struct Buffer {
     /// そのファイルを読む他のツール (Excel・既存のバッチ) が壊れる。
     pub encoding: crate::textenc::Encoding,
     /// (cache key, 本文 galley) — recomputed only when text/theme/font change.
-    /// 折り返し無効(wrap.max_width = INFINITY)なので galley は wrap 幅に依存せず、
-    /// フレーム跨ぎで使い回せる。
+    /// キーには折り返し設定と折り返し幅・空白可視化の有無も含まれるため、
+    /// それらが変わらない限りフレーム跨ぎで使い回せる
+    /// (折り返し無効時は wrap.max_width = INFINITY で幅に依存しない)。
     pub cache: Option<(u64, Arc<Galley>)>,
     /// (cache key, gutter galley) — 行番号 + git 差分マーク色。
     /// galley 化まで済ませて持つので、毎フレームの LayoutJob コピーが要らない。
@@ -90,6 +95,211 @@ pub struct Buffer {
     pub disk_mtime: Option<SystemTime>,
     /// 警告済みの外部変更 mtime(同じ競合を連続通知しないため)。
     pub conflict_notified: Option<SystemTime>,
+    /// 画像タブ (`BufferKind::Image`) のデコード済みピクセル。それ以外は None。
+    pub image: Option<ImageDoc>,
+}
+
+/// 画像タブのデコード結果。
+///
+/// デコードは `Editor::open` 時 (egui の ctx が不要)、GPU テクスチャ化は
+/// 初回描画時 (ctx が必要) の二段構え。markdown.rs のインライン画像
+/// (`load_image_texture`) と同じ流儀。
+pub struct ImageDoc {
+    /// RGBA8 ピクセル列 (縮小適用済み)。デコード失敗時は空。
+    pub rgba: Vec<u8>,
+    /// `rgba` の実サイズ [幅, 高さ] (縮小後)。
+    pub size: [usize; 2],
+    /// 元画像のピクセルサイズ (ステータス行の表示用)。
+    pub orig_size: (u32, u32),
+    /// ディスク上のファイルサイズ (バイト)。
+    pub file_bytes: u64,
+    /// デコード失敗時の説明。Some のときビューアはエラー表示になる
+    /// (バイナリをテキストとして文字化け表示するより「読めない」と明示する)。
+    pub error: Option<String>,
+    /// 遅延生成の GPU テクスチャ (初回描画でアップロードし、以後使い回す)。
+    pub texture: Option<eframe::egui::TextureHandle>,
+}
+
+/// 画像ビューアで開く拡張子 (小文字)。Cargo.toml の image クレートの
+/// feature (png/jpeg/gif/webp/ico) に bmp を足した集合。bmp は feature 無効で
+/// デコードに失敗するが、テキスト経路でバイナリの文字化けを見せるより
+/// 画像タブで「表示できません」と伝える方が親切なのでここへ回す。
+pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "ico", "bmp"];
+
+/// 拡張子から画像ビューアで開くべきパスか判定する (大文字小文字は無視)。
+pub fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            IMAGE_EXTS.iter().any(|x| *x == e)
+        })
+        .unwrap_or(false)
+}
+
+/// GPU テクスチャに安全な最大辺長。egui/wgpu はバックエンドの上限
+/// (8192 が下限のことが多い) を超えるテクスチャでエラーになるため、
+/// 超える画像は縮小してから載せる。
+pub const MAX_TEXTURE_SIDE: u32 = 8192;
+
+/// 縮小が必要なら縮小後サイズ (アスペクト比維持) を返す。不要なら None。
+pub fn image_downscale(w: u32, h: u32, max_side: u32) -> Option<(u32, u32)> {
+    let longest = w.max(h);
+    if longest <= max_side || longest == 0 {
+        return None;
+    }
+    let scale = max_side as f64 / longest as f64;
+    let nw = ((w as f64 * scale).round() as u32).clamp(1, max_side);
+    let nh = ((h as f64 * scale).round() as u32).clamp(1, max_side);
+    Some((nw, nh))
+}
+
+/// バイト列を画像としてデコードする。失敗しても panic せず `error` 入りで返す。
+/// アニメーション GIF は最初のフレームのみの静止表示 (今夜はこれで十分)。
+pub fn decode_image_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
+    match image::load_from_memory(raw) {
+        Ok(img) => {
+            let mut rgba = img.to_rgba8();
+            let orig = rgba.dimensions();
+            if let Some((nw, nh)) = image_downscale(orig.0, orig.1, MAX_TEXTURE_SIDE) {
+                // 巨大画像は GPU 上限超えの描画エラーを避けるため縮小して載せる
+                rgba = image::imageops::resize(
+                    &rgba,
+                    nw,
+                    nh,
+                    image::imageops::FilterType::Triangle,
+                );
+            }
+            let (w, h) = rgba.dimensions();
+            ImageDoc {
+                rgba: rgba.into_raw(),
+                size: [w as usize, h as usize],
+                orig_size: orig,
+                file_bytes,
+                error: None,
+                texture: None,
+            }
+        }
+        Err(e) => ImageDoc {
+            rgba: Vec::new(),
+            size: [0, 0],
+            orig_size: (0, 0),
+            file_bytes,
+            error: Some(e.to_string()),
+            texture: None,
+        },
+    }
+}
+
+/// 画像ビューア: 表示領域へ収まる「フィット」倍率。等倍を上限にする
+/// (小さい画像を無理に引き伸ばさない)。
+pub fn image_fit_scale(img_w: f32, img_h: f32, avail_w: f32, avail_h: f32) -> f32 {
+    if img_w <= 0.0 || img_h <= 0.0 || avail_w <= 0.0 || avail_h <= 0.0 {
+        return 1.0;
+    }
+    (avail_w / img_w).min(avail_h / img_h).min(1.0)
+}
+
+/// 画像ビューアのズーム下限/上限。
+pub const IMAGE_ZOOM_MIN: f32 = 0.05;
+pub const IMAGE_ZOOM_MAX: f32 = 32.0;
+
+/// 画像ビューア: ズームの段階変更 (dir=+1 拡大 / -1 縮小)。1.25 倍刻み。
+pub fn image_zoom_step(cur: f32, dir: i32) -> f32 {
+    (cur * 1.25f32.powi(dir)).clamp(IMAGE_ZOOM_MIN, IMAGE_ZOOM_MAX)
+}
+
+/// エディタ本文の折り返し幅: ON なら利用可能幅、OFF なら無限 (横スクロール)。
+pub fn wrap_max_width(word_wrap: bool, avail: f32) -> f32 {
+    if word_wrap {
+        avail
+    } else {
+        f32::INFINITY
+    }
+}
+
+/// バイト数の人向け表示 (画像ビューアのステータス行用)。
+pub fn human_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = n as f64;
+    if f < K {
+        format!("{n} B")
+    } else if f < K * K {
+        format!("{:.1} KB", f / K)
+    } else {
+        format!("{:.1} MB", f / (K * K))
+    }
+}
+
+/// 空白文字の可視化: スペースを「·」、タブを「→」へ置き換えた LayoutJob を返す。
+///
+/// TextEdit のカーソルは char 単位で galley と対応付くため、**1 文字は必ず
+/// 1 文字へ**置き換える (バイト数は変わってよいが char 数は変えてはいけない)。
+/// 置き換えた文字は dim 色の専用セクションに割り、非空白部分は元の
+/// ハイライト色のまま残す。
+/// 注: タブは通常タブストップ幅へ展開されるが、置換後は「→」1 グリフ幅に
+/// なるため、表示切替でタブ由来の桁位置は変わり得る (既知のトレードオフ)。
+pub fn whitespace_layout_job(
+    job: eframe::egui::text::LayoutJob,
+    dim: eframe::egui::Color32,
+) -> eframe::egui::text::LayoutJob {
+    use eframe::egui::text::LayoutSection;
+    let mut text = String::with_capacity(job.text.len() + 16);
+    let mut sections: Vec<LayoutSection> = Vec::with_capacity(job.sections.len() * 2);
+    for sec in &job.sections {
+        let src = &job.text[sec.byte_range.clone()];
+        // leading_space は最初のサブセクションだけが引き継ぐ
+        let mut leading = sec.leading_space;
+        let mut run_start = text.len();
+        let mut run_ws: Option<bool> = None;
+        let flush = |sections: &mut Vec<LayoutSection>,
+                         start: usize,
+                         end: usize,
+                         ws: bool,
+                         leading: &mut f32| {
+            if end > start {
+                let mut format = sec.format.clone();
+                if ws {
+                    format.color = dim;
+                }
+                sections.push(LayoutSection {
+                    leading_space: std::mem::take(leading),
+                    byte_range: start..end,
+                    format,
+                });
+            }
+        };
+        for ch in src.chars() {
+            let is_ws = ch == ' ' || ch == '\t';
+            if run_ws != Some(is_ws) {
+                flush(
+                    &mut sections,
+                    run_start,
+                    text.len(),
+                    run_ws == Some(true),
+                    &mut leading,
+                );
+                run_start = text.len();
+                run_ws = Some(is_ws);
+            }
+            text.push(match ch {
+                ' ' => '·',
+                '\t' => '→',
+                _ => ch,
+            });
+        }
+        flush(
+            &mut sections,
+            run_start,
+            text.len(),
+            run_ws == Some(true),
+            &mut leading,
+        );
+    }
+    let mut out = job;
+    out.text = text;
+    out.sections = sections;
+    out
 }
 
 impl Buffer {
@@ -150,6 +360,7 @@ impl Editor {
             gutter: None,
             disk_mtime: None,
             conflict_notified: None,
+            image: None,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -185,6 +396,38 @@ impl Editor {
         // UTF-8 決め打ちで読むと CP932 (Shift_JIS) のファイルが開けないので、
         // バイト列で読んで textenc に判定させる (BOM / UTF-16 もここで拾う)。
         let raw = std::fs::read(&canon).map_err(|e| format!("開けませんでした: {e}"))?;
+        // 画像は拡張子で振り分けてビューアタブにする (テキストとしてデコード
+        // するとバイナリの文字化けが表示されてしまう)。壊れた画像でも
+        // panic せず、error 入りの ImageDoc としてタブに出す。
+        if is_image_path(&canon) {
+            let title = canon
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "???".into());
+            let id = self.next_id;
+            self.next_id += 1;
+            let mtime = disk_mtime(&canon);
+            let doc = decode_image_doc(&raw, raw.len() as u64);
+            self.buffers.push(Buffer {
+                id,
+                path: Some(canon),
+                kind: BufferKind::Image,
+                title,
+                // 本文は空にする: dirty() が常に false になり、保存・自動保存・
+                // 検索のどの経路でも画像タブは素通りされる
+                text: String::new(),
+                saved_hash: hash_str(""),
+                lang: "Plain Text".into(),
+                encoding: crate::textenc::Encoding::Utf8,
+                cache: None,
+                gutter: None,
+                disk_mtime: mtime,
+                conflict_notified: None,
+                image: Some(doc),
+            });
+            self.active = Some(self.buffers.len() - 1);
+            return Ok(false);
+        }
         let (text, encoding) = crate::textenc::decode_bytes(&raw);
         let lang = hl.lang_for(Some(&canon), &text);
         let title = canon
@@ -208,6 +451,7 @@ impl Editor {
             gutter: None,
             disk_mtime: mtime,
             conflict_notified: None,
+            image: None,
         });
         self.active = Some(self.buffers.len() - 1);
         Ok(false)
@@ -247,6 +491,7 @@ impl Editor {
             gutter: None,
             disk_mtime: None,
             conflict_notified: None,
+            image: None,
         });
         self.active = Some(self.buffers.len() - 1);
         id
@@ -264,6 +509,17 @@ impl Editor {
             b.disk_mtime = m;
             return false;
         };
+        // 画像タブはピクセルを再デコードする (テキスト経路に流すと文字化けする)。
+        // mtime が同じなら再デコードもしない (ツリーで再クリックしただけ等)。
+        if b.kind == BufferKind::Image {
+            if m == b.disk_mtime {
+                return false;
+            }
+            b.image = Some(decode_image_doc(&raw, raw.len() as u64));
+            b.disk_mtime = m;
+            b.conflict_notified = None;
+            return true;
+        }
         // エージェントが書き換えた結果で符号化が変わることもあるので、毎回判定する
         let (text, encoding) = crate::textenc::decode_bytes(&raw);
         if text == b.text {
@@ -539,5 +795,184 @@ mod tests {
         bump_mtime(&path);
         assert!(ed.check_external().is_empty());
         assert_eq!(ed.buffers[0].text, "same");
+    }
+
+    // ─── 画像ビューア ───────────────────────────────────────────
+
+    /// 単色の小さな PNG をディスクへ書く (image クレート同梱の png エンコーダ)。
+    fn write_png(path: &Path, w: u32, h: u32) {
+        image::RgbaImage::from_pixel(w, h, image::Rgba([255, 0, 0, 255]))
+            .save(path)
+            .expect("write png");
+    }
+
+    #[test]
+    fn image_extension_routing_table() {
+        // 画像として開く拡張子 (大文字小文字は問わない)
+        for name in [
+            "a.png", "a.PNG", "a.jpg", "a.JPEG", "a.jpeg", "a.gif", "a.webp", "a.ico",
+            "a.bmp", "dir.d/photo.Png",
+        ] {
+            assert!(is_image_path(Path::new(name)), "{name} は画像として開く");
+        }
+        // テキストとして開く拡張子・拡張子なし・隠しファイル
+        for name in ["a.rs", "a.txt", "a.md", "a.svg", "Makefile", ".png", "png"] {
+            assert!(!is_image_path(Path::new(name)), "{name} は画像扱いしない");
+        }
+    }
+
+    #[test]
+    fn open_png_becomes_image_buffer() {
+        let dir = unique_temp_dir("zaivern-editor-test", "img-open");
+        let path = dir.join("pic.png");
+        write_png(&path, 3, 2);
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+        let b = &ed.buffers[0];
+        assert_eq!(b.kind, BufferKind::Image);
+        assert!(b.kind.read_only(), "画像タブは読み取り専用");
+        assert!(b.text.is_empty() && !b.dirty(), "本文は空で dirty にならない");
+        let doc = b.image.as_ref().expect("decoded image");
+        assert_eq!(doc.error, None);
+        assert_eq!(doc.orig_size, (3, 2));
+        assert_eq!(doc.size, [3, 2]);
+        assert_eq!(doc.rgba.len(), 3 * 2 * 4);
+    }
+
+    #[test]
+    fn corrupt_image_opens_with_error_not_garbage() {
+        let dir = unique_temp_dir("zaivern-editor-test", "img-corrupt");
+        let path = dir.join("broken.png");
+        std::fs::write(&path, b"\x89PNG not really a png\x00\x01\x02").expect("write");
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false), "壊れた画像でも開ける (panic しない)");
+        let b = &ed.buffers[0];
+        assert_eq!(b.kind, BufferKind::Image);
+        assert!(b.image.as_ref().expect("doc").error.is_some(), "読めない旨を持つ");
+        assert!(b.text.is_empty(), "文字化けテキストを本文に入れない");
+    }
+
+    #[test]
+    fn image_external_change_redecodes_pixels() {
+        let dir = unique_temp_dir("zaivern-editor-test", "img-reload");
+        let path = dir.join("pic.png");
+        write_png(&path, 2, 2);
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+
+        write_png(&path, 5, 4);
+        bump_mtime(&path);
+        let events = ed.check_external();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ExternalEvent::Reloaded { .. }));
+        let doc = ed.buffers[0].image.as_ref().expect("redecoded");
+        assert_eq!(doc.orig_size, (5, 4), "外部変更でピクセルを再デコードする");
+    }
+
+    #[test]
+    fn image_downscale_cap_decision() {
+        // 上限以内はそのまま (縮小しない)
+        assert_eq!(image_downscale(8192, 8192, 8192), None);
+        assert_eq!(image_downscale(100, 50, 8192), None);
+        assert_eq!(image_downscale(0, 0, 8192), None);
+        // 上限超えはアスペクト比を保って縮小
+        assert_eq!(image_downscale(10000, 5000, 8192), Some((8192, 4096)));
+        assert_eq!(image_downscale(5000, 10000, 8192), Some((4096, 8192)));
+        // 極端な縦横比でも 1px 未満にならない
+        let (nw, nh) = image_downscale(100_000, 2, 8192).expect("resize");
+        assert_eq!((nw, nh), (8192, 1));
+    }
+
+    #[test]
+    fn image_fit_and_zoom_math() {
+        // 大きい画像は収まる倍率へ縮小
+        assert_eq!(image_fit_scale(400.0, 100.0, 200.0, 200.0), 0.5);
+        assert_eq!(image_fit_scale(100.0, 400.0, 200.0, 200.0), 0.5);
+        // 小さい画像は引き伸ばさない (等倍が上限)
+        assert_eq!(image_fit_scale(100.0, 50.0, 200.0, 200.0), 1.0);
+        // 不正入力でも 0 やNaN を返さない
+        assert_eq!(image_fit_scale(0.0, 0.0, 200.0, 200.0), 1.0);
+
+        // 段階ズームは 1.25 倍刻みで、上下限にクランプされる
+        assert!((image_zoom_step(1.0, 1) - 1.25).abs() < 1e-6);
+        assert!((image_zoom_step(1.25, -1) - 1.0).abs() < 1e-6);
+        assert_eq!(image_zoom_step(IMAGE_ZOOM_MAX, 1), IMAGE_ZOOM_MAX);
+        assert_eq!(image_zoom_step(IMAGE_ZOOM_MIN, -1), IMAGE_ZOOM_MIN);
+    }
+
+    #[test]
+    fn human_bytes_units() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2048), "2.0 KB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 + 512 * 1024), "3.5 MB");
+    }
+
+    // ─── 折り返し・空白可視化 ──────────────────────────────────
+
+    #[test]
+    fn wrap_flag_selects_max_width() {
+        assert_eq!(wrap_max_width(true, 640.0), 640.0);
+        assert!(wrap_max_width(false, 640.0).is_infinite());
+    }
+
+    #[test]
+    fn whitespace_transform_replaces_spaces_and_tabs() {
+        use eframe::egui::text::{LayoutJob, LayoutSection, TextFormat};
+        use eframe::egui::Color32;
+        let src = "ab cd\te\n  f";
+        let mut job = LayoutJob::default();
+        // syntect layouter と同じく、連続する複数セクションで全文を覆う
+        let fmt_a = TextFormat {
+            color: Color32::RED,
+            ..Default::default()
+        };
+        let fmt_b = TextFormat {
+            color: Color32::GREEN,
+            ..Default::default()
+        };
+        job.text = src.into();
+        job.sections = vec![
+            LayoutSection { leading_space: 0.0, byte_range: 0..5, format: fmt_a.clone() },
+            LayoutSection { leading_space: 0.0, byte_range: 5..src.len(), format: fmt_b.clone() },
+        ];
+
+        let dim = Color32::GRAY;
+        let out = whitespace_layout_job(job, dim);
+        // スペース→「·」、タブ→「→」。改行はそのまま
+        assert_eq!(out.text, "ab·cd→e\n··f");
+        // char 数は変えない (カーソル位置が galley とずれる)
+        assert_eq!(out.text.chars().count(), src.chars().count());
+        // セクションは全文を隙間なく覆い、空白 run だけが dim 色になる
+        let mut covered = 0usize;
+        for sec in &out.sections {
+            assert_eq!(sec.byte_range.start, covered, "隙間なく連続");
+            covered = sec.byte_range.end;
+            let s = &out.text[sec.byte_range.clone()];
+            if s.chars().all(|c| c == '·' || c == '→') {
+                assert_eq!(sec.format.color, dim, "空白 run は dim 色: {s:?}");
+            } else {
+                assert_ne!(sec.format.color, dim, "非空白 run は元の色: {s:?}");
+            }
+        }
+        assert_eq!(covered, out.text.len(), "全文を覆う");
+    }
+
+    #[test]
+    fn whitespace_transform_plain_text_unchanged() {
+        use eframe::egui::text::{LayoutJob, LayoutSection, TextFormat};
+        use eframe::egui::Color32;
+        let mut job = LayoutJob::default();
+        job.text = "abc\ndef".into();
+        job.sections = vec![LayoutSection {
+            leading_space: 0.0,
+            byte_range: 0..7,
+            format: TextFormat::default(),
+        }];
+        let out = whitespace_layout_job(job, Color32::GRAY);
+        assert_eq!(out.text, "abc\ndef", "空白が無ければ本文はそのまま");
+        assert_eq!(out.sections.len(), 1);
     }
 }
