@@ -76,6 +76,7 @@ use std::sync::mpsc;
 pub const RULE_NAME: &str = "Zaivern Code (Mobile Remote)";
 
 /// 規則の説明文 (Windows のファイアウォール画面に出る)。
+#[cfg(any(windows, test))]
 const RULE_DESC: &str = "Zaivern Code phone remote (LAN only, token required)";
 
 /// 許可するポート範囲。`remote::RemoteServer::start` の探索範囲と揃える。
@@ -280,6 +281,9 @@ impl Report {
 // ───────────────────────── スクリプト生成 (純関数) ─────────────────────────
 
 /// PowerShell の単一引用符文字列用エスケープ (`'` → `''`)。
+// Windows 専用 — 呼び出し元は全て #[cfg(windows)] 側にある。
+// テストは全 OS で走るので `test` も通す (ここを外すと macOS/Linux で dead_code になる)。
+#[cfg(any(windows, test))]
 fn ps_quote(s: &str) -> String {
     s.replace('\'', "''")
 }
@@ -293,6 +297,7 @@ fn ps_quote(s: &str) -> String {
 /// `net`(接続数) / `on`(ファイアウォールが有効な数) / `strict`(「すべての受信接続を
 /// ブロックする」が入っている数)。これが無いと「許可済みなのに繋がらない」の
 /// 原因が画面のどこにも出ない。
+#[cfg(any(windows, test))]
 pub fn check_script(exe: &str) -> String {
     let exe = ps_quote(exe);
     let name = ps_quote(RULE_NAME);
@@ -338,6 +343,7 @@ pub fn check_script(exe: &str) -> String {
 /// - この実行ファイルを名指しで拒否している受信規則も消す
 ///   (Windows の警告ダイアログで「キャンセル」を押すと作られる。
 ///   拒否は許可より優先されるので、残っていると許可しても通らない)
+#[cfg(any(windows, test))]
 pub fn allow_script(exe: &str, profiles: &str) -> String {
     let exe_q = ps_quote(exe);
     let name = ps_quote(RULE_NAME);
@@ -363,6 +369,7 @@ pub fn allow_script(exe: &str, profiles: &str) -> String {
 }
 
 /// 受信規則を消すスクリプト (**管理者で実行する側**)。
+#[cfg(any(windows, test))]
 pub fn revoke_script() -> String {
     let name = ps_quote(RULE_NAME);
     format!(
@@ -379,6 +386,7 @@ pub fn revoke_script() -> String {
 /// 規則を作り直しても症状は変わらない。触るのは
 /// **いま繋いでいるネットワークのプロファイルだけ** — 使っていない
 /// プロファイル (例: 外出先の Public) の設定まで緩めない。
+#[cfg(any(windows, test))]
 pub fn unblock_script() -> String {
     "$ErrorActionPreference = 'Stop'\n\
      $names = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {\n\
@@ -397,6 +405,7 @@ pub fn unblock_script() -> String {
 /// UAC で「いいえ」を押すと `Start-Process` が例外を投げる。その文言は
 /// 言語ごとに違う (日本語なら「操作は…取り消されました」) ので、
 /// **文字列照合ではなく終了コード** [`CANCELLED`] で伝える。
+#[cfg(any(windows, test))]
 pub fn elevate_script(script_path: &str) -> String {
     let p = ps_quote(script_path);
     format!(
@@ -414,6 +423,7 @@ pub fn elevate_script(script_path: &str) -> String {
 }
 
 /// UAC の確認を断ったときの終了コード (Windows の `ERROR_CANCELLED`)。
+#[cfg(any(windows, test))]
 pub const CANCELLED: i32 = 1223;
 
 /// 管理者スクリプトを `try/catch` で包み、失敗した理由をログへ落とす。
@@ -421,6 +431,7 @@ pub const CANCELLED: i32 = 1223;
 /// 昇格した側の標準エラーはこちらへ返ってこない。包まずに実行すると
 /// 「ファイアウォール設定の変更に失敗しました」しか出せず、
 /// 直しようが無くなる (元のバグと同じ「原因が画面に出ない」形)。
+#[cfg(any(windows, test))]
 pub fn with_error_log(script: &str, log_path: &str) -> String {
     let log = ps_quote(log_path);
     format!(
@@ -476,6 +487,7 @@ pub fn manual_command(exe: &str, profiles: &str) -> String {
 }
 
 /// [`check_script`] の出力を読む。`ZVFW …` 行が無ければ `None`。
+#[cfg(any(windows, test))]
 pub fn parse_report(out: &str) -> Option<Report> {
     let line = out.lines().rev().find(|l| l.trim_start().starts_with("ZVFW "))?;
     let mut r = Report::default();
@@ -692,6 +704,7 @@ fn unblock_now() -> Result<Report, String> {
 /// 規則の有無だけを見て「✅ 許可済み」と出すのが元のバグだった。
 /// 規則があっても [`Report::problems`] が空でなければスマホからは繋がらないので、
 /// そちらを主役にする。
+#[cfg(any(windows, test))]
 pub fn status_text(r: Report) -> String {
     let problems = r.problems();
     if problems.is_empty() {

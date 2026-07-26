@@ -8,7 +8,6 @@
 //!
 //! | 関数 | 用途 |
 //! |------|------|
-//! | [`spawn`] | 従来通りの「大文字小文字を無視した部分文字列検索」。既存の呼び出し元互換 |
 //! | [`spawn_with_options`] | [`SearchOptions`] 付きの非同期検索。パターン不正なら `Err` |
 //! | [`search_with_options`] | 同期検索。結果はファイル順で決定的 ([`SearchOutcome`]) |
 //! | [`replace_all`] | 一括置換。既定は**ドライラン** ([`ReplaceReport`]) |
@@ -112,7 +111,9 @@ impl Default for SearchOptions {
 }
 
 impl SearchOptions {
-    /// 従来通りの部分一致検索。
+    /// 部分一致検索の [`SearchOptions`] を組み立てる。
+    /// 本番の呼び出し元は UI 側で各項目を組み立てるので、ここはテスト専用。
+    #[cfg(test)]
     pub fn literal(query: impl Into<String>) -> Self {
         Self { query: query.into(), ..Self::default() }
     }
@@ -673,21 +674,6 @@ pub fn spawn_with_options(
     Ok(rx)
 }
 
-/// 大文字小文字を無視した検索 (従来 API)。`files` は絶対パスの一覧。
-/// CPU並列ワーカースレッドによりミリ秒単位の爆速検索を行う。
-pub fn spawn(files: Vec<PathBuf>, query: String) -> Receiver<(Vec<Hit>, usize)> {
-    let opts = SearchOptions::literal(query);
-    match spawn_with_options(files, opts) {
-        Ok(rx) => rx,
-        // 文字列検索はコンパイルに失敗しないが、型のために空を返す道を用意する
-        Err(_) => {
-            let (tx, rx) = channel();
-            let _ = tx.send((Vec::new(), 0));
-            rx
-        }
-    }
-}
-
 /// 行テキストを表示用に短くする (先頭空白を落とし、長すぎる行を切る)。
 fn snippet(line: &str) -> String {
     let t = line.trim();
@@ -926,7 +912,8 @@ mod tests {
     }
 
     fn collect(files: Vec<PathBuf>, q: &str) -> (Vec<Hit>, usize) {
-        spawn(files, q.to_string())
+        spawn_with_options(files, SearchOptions::literal(q))
+            .expect("リテラル検索はコンパイルに失敗しない")
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("search thread result")
     }

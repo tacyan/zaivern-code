@@ -918,8 +918,9 @@ impl MainRects {
     }
 }
 
+#[cfg(test)]
 impl MainRects {
-    /// 実際に置いた矩形を順に返す (テスト用)。
+    /// 実際に置いた矩形を順に返す (不変条件テスト専用の検査補助)。
     pub fn all(&self) -> Vec<Rect> {
         [
             self.rail,
@@ -4615,7 +4616,7 @@ mod geometry_tests {
 
     /// **KPI タイル**: 総幅は可用幅を超えない (右端で「完了」を切らない)。
     #[test]
-    fn KPIタイルは可用幅を超えない() {
+    fn kpiタイルは可用幅を超えない() {
         for avail in [280.0_f32, 400.0, 560.0, 900.0, 1400.0, 2400.0] {
             let (cols, w) = kpi_grid(avail, LANES);
             assert!((1..=LANES).contains(&cols));

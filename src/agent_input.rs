@@ -198,14 +198,6 @@ pub enum ComposerTarget {
 }
 
 impl ComposerTarget {
-    /// 指名先のセッション ID (ブロードキャストなら None)
-    pub fn agent_id(self) -> Option<u64> {
-        match self {
-            Self::Agent(id) => Some(id),
-            Self::Broadcast => None,
-        }
-    }
-
     /// 全員宛てか
     pub fn is_broadcast(self) -> bool {
         matches!(self, Self::Broadcast)
@@ -364,7 +356,9 @@ impl AgentInputBuffer {
         true
     }
 
-    /// 指定した送信先の下書きを覗く (アクティブでも退避中でも同じように読める)
+    /// 指定した送信先の下書きを覗く (アクティブでも退避中でも同じように読める)。
+    /// 本番の描画経路は `text()` を読むので、これは下書き退避を検証するテスト専用。
+    #[cfg(test)]
     pub fn draft_for(&self, t: ComposerTarget) -> &str {
         if t == self.target {
             &self.text
@@ -378,6 +372,10 @@ impl AgentInputBuffer {
     /// 差分レビューのプロンプトのように「この 1 体に宛てた文章」を、
     /// いまユーザーが別のエージェント宛てに書いている手を止めずに置いておくための口。
     /// 書きかけを残したいなら [`Self::append_prompt_for`] を使う。
+    ///
+    /// 本番の流し込みは追記側 ([`Self::append_prompt_for`]) を使っているため、
+    /// いまの利用者は panels.rs / app.rs / 本モジュールのテストだけ。
+    #[cfg(test)]
     pub fn set_draft_for(&mut self, t: ComposerTarget, text: impl Into<String>) {
         if t == self.target {
             self.set_text(text);
@@ -486,15 +484,6 @@ impl AgentInputBuffer {
         self.selection
     }
 
-    /// **Ctrl+A / Cmd+A**: 全選択
-    pub fn select_all(&mut self) {
-        let len = self.text.chars().count();
-        if len > 0 {
-            self.selection = Some((0, len));
-            self.cursor = len;
-        }
-    }
-
     /// 選択解除
     #[allow(dead_code)]
     pub fn clear_selection(&mut self) {
@@ -534,36 +523,6 @@ impl AgentInputBuffer {
         }
     }
 
-    /// **Ctrl+U**: カーソル位置から行頭まで削除
-    pub fn delete_to_beginning(&mut self) {
-        if self.delete_selection() {
-            return;
-        }
-        if self.cursor == 0 {
-            return;
-        }
-        self.push_undo_state();
-        let chars: Vec<char> = self.text.chars().collect();
-        let remaining: String = chars[self.cursor..].iter().collect();
-        self.text = remaining;
-        self.cursor = 0;
-    }
-
-    /// **Ctrl+K**: カーソル位置から行末まで削除
-    pub fn delete_to_end(&mut self) {
-        if self.delete_selection() {
-            return;
-        }
-        let total_chars = self.text.chars().count();
-        if self.cursor >= total_chars {
-            return;
-        }
-        self.push_undo_state();
-        let chars: Vec<char> = self.text.chars().collect();
-        let kept: String = chars[..self.cursor].iter().collect();
-        self.text = kept;
-    }
-
     /// **Ctrl+W / Alt+Backspace**: カーソル前の単語を削除
     #[allow(dead_code)]
     pub fn delete_word_before(&mut self) {
@@ -594,6 +553,10 @@ impl AgentInputBuffer {
     }
 
     /// **Up Arrow**: 前のプロンプト履歴を参照
+    // 配線待ち: panels.rs の `agent_composer_inline_ui` (1 行帯) で ↑/↓ を
+    // `ComposerPress` に足して呼ぶ。履歴自体は `submit()` が本番で積んでいる。
+    // 複数行フォーム側は ↑/↓ が行移動に要るので繋がない。
+    #[allow(dead_code)]
     pub fn history_prev(&mut self) {
         if self.history.is_empty() {
             return;
@@ -620,6 +583,10 @@ impl AgentInputBuffer {
     }
 
     /// **Down Arrow**: 次のプロンプト履歴（または入力中のドラフト）を参照
+    // 配線待ち: panels.rs の `agent_composer_inline_ui` (1 行帯) で ↑/↓ を
+    // `ComposerPress` に足して呼ぶ。履歴自体は `submit()` が本番で積んでいる。
+    // 複数行フォーム側は ↑/↓ が行移動に要るので繋がない。
+    #[allow(dead_code)]
     pub fn history_next(&mut self) {
         if let Some(idx) = self.history_idx {
             if idx + 1 < self.history.len() {
@@ -781,16 +748,6 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_input_buffer_select_all() {
-        let mut buf = AgentInputBuffer::new();
-        buf.set_text("Hello World");
-        buf.select_all();
-
-        assert_eq!(buf.selection(), Some((0, 11)));
-        assert_eq!(buf.get_selected_text(), Some("Hello World".to_string()));
-    }
-
-    #[test]
     fn test_agent_input_buffer_shortcuts() {
         let mut buf = AgentInputBuffer::new();
         buf.set_text("Hello Amazing World");
@@ -799,16 +756,6 @@ mod tests {
         // Ctrl+W: delete word before
         buf.delete_word_before();
         assert_eq!(buf.text(), "Hello  World");
-
-        // Ctrl+U: delete to beginning
-        buf.delete_to_beginning();
-        assert_eq!(buf.text(), " World");
-
-        // Ctrl+K: delete to end
-        buf.set_text("Testing 1 2 3");
-        buf.cursor = 7;
-        buf.delete_to_end();
-        assert_eq!(buf.text(), "Testing");
     }
 
     #[test]
