@@ -604,7 +604,7 @@ fn top_bar_density(bar_w: f32) -> TopBarDensity {
 
 /// 1 行帯コンポーザをヘッダー行へ畳み込むのに要る最小の残り幅 (px)。
 ///
-/// 内訳: 宛先チップ ~70 + 入力欄の下限 80 + 送信/⤢ ~92 + 間隔。これを
+/// 内訳: 宛先チップ ~70 + 入力欄の下限 80 + 送信/▾ ~92 + 間隔。これを
 /// 割ると入力欄が潰れて押せなくなるので、その場合だけ独立した行へ落とす。
 const COMPOSER_INLINE_MIN_W: f32 = 260.0;
 
@@ -10751,7 +10751,7 @@ impl ZaivernApp {
         // 文字を落としてアイコンだけにする。右端で切れて押せなくなるのを防ぐ。
         let compact = cockpit_header_compact(ui.available_width());
 
-        // コンポーザの姿 (1 行帯 / 複数行フォーム)。⤢ を押したかどうかだけ憶えて
+        // コンポーザの姿 (1 行帯 / 複数行フォーム)。▾ を押したかどうかだけ憶えて
         // おき、実際の判定は本文込みで panels 側の純粋関数に任せる。
         let expand_id = ui.make_persistent_id("cockpit_composer_expand");
         let mut expand = ui.memory(|m| m.data.get_temp::<bool>(expand_id).unwrap_or(false));
@@ -11403,14 +11403,14 @@ impl ZaivernApp {
                                                 // 分割はキーを知らない人に届かない)。
                                                 // 分割中はペイン数を出す — 「今
                                                 // 何枚あるか」が枠線だけでは分から
-                                                // ないため。ズーム中は ⤢ を添える。
+                                                // ないため。ズーム中は ◎ を添える。
                                                 let split_label = match self
                                                     .splits
                                                     .get(&sid)
                                                     .filter(|l| !l.is_empty())
                                                 {
                                                     Some(l) if l.zoomed() => {
-                                                        format!("⊞{}⤢", l.len())
+                                                        format!("⊞{}◎", l.len())
                                                     }
                                                     Some(l) => format!("⊞{}", l.len()),
                                                     None => "⊞".to_string(),
@@ -11422,7 +11422,7 @@ impl ZaivernApp {
                                                     .small_button(split_label)
                                                     .on_hover_text(tr(
                                                         "このタイルを右へ分割\n\
-                                                         分割中は各ペインのヘッダに ⤢ (拡大) と ✕ (閉じる) が出ます。\n\
+                                                         分割中は各ペインのヘッダに ◎ (拡大) と ✕ (閉じる) が出ます。\n\
                                                          キーは ⌘⌥⇧→ 右へ分割 / ⌘⌥⇧↓ 下へ分割 / ⌘⌥N シェル /\n\
                                                          ⌘⌥W 閉じる / ⌘⌥←↑↓→ 移動 / ⌘⌥Z 拡大 / ⌘⌥E 等分 /\n\
                                                          ⌘⌥⇧H ⌘⌥⇧L 幅調整 (Windows・Linux は ⌘ の代わりに Ctrl)",
@@ -11858,7 +11858,7 @@ impl ZaivernApp {
         if let Some(i) = acts.remove {
             self.close_agent(i);
         }
-        // 端末分割 (キー / ⊞ / ペインヘッダの ✕・⤢) の適用。
+        // 端末分割 (キー / ⊞ / ペインヘッダの ✕・◎) の適用。
         for (tile, action) in acts.split {
             self.apply_split_action(tile, action, ctx);
         }
@@ -22507,7 +22507,7 @@ mod glyph_tests {
         // すべて src/ か assets/ に実在する記号だけを並べる (未使用の字は入れない)。
         const SYMBOLS: &str = "✕✗✓✔⌫⌥⌃⇧⌘❯▸▾▲▼◆◇◎●○★⇄⇩→➡⟳⏱⏳─│╭╮╰╯┌┐└┘├┤┬┴┼\
                                ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏±×÷·»‹›※–—…‣\
-                               ⊞⤢";
+                               ⊞";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);
         let _ = ctx.run(Default::default(), |_| {});

@@ -8578,7 +8578,7 @@ pub const GUTTER: f32 = 6.0;
 /// 「描いた矩形と PTY のグリッドが食い違う」事故になる)。
 pub const TERM_PADDING: f32 = 6.0;
 
-/// ペインヘッダ (アイコン・題名・活動ランプ・✕/⤢) の高さ。
+/// ペインヘッダ (アイコン・題名・活動ランプ・✕/◎) の高さ。
 ///
 /// **ペインが 2 枚以上あるときだけ**確保する。1 枚のタイルは今日と 1 px も
 /// 変わらない見た目のままにする ([`pane_body`] がその判定を持つ)。
@@ -9666,7 +9666,7 @@ pub fn apply_sizes(
 /// 「矩形の割り当て」「ペインヘッダ」「仕切りの描画とドラッグ」
 /// 「クリックでのフォーカス移動」だけ。
 ///
-/// ヘッダ (アイコン・題名・活動ランプ・⤢・✕) は **ペインが 2 枚以上のときだけ**
+/// ヘッダ (アイコン・題名・活動ランプ・◎・✕) は **ペインが 2 枚以上のときだけ**
 /// 出る。1 枚のタイルは今日とまったく同じ見た目のまま (`chrome` も呼ばれない)。
 ///
 /// 戻り値の [`SplitDraw::changed`] が true = レイアウトが変わった →
@@ -9711,7 +9711,7 @@ pub fn draw_split(
 
     let focus = layout.focus();
     // ヘッダを出すかは**タイルのペイン数**で決める。ズーム中も出す
-    // (出さないとズームを戻す ⤢ が消えてしまう)。`apply_sizes` と同じ条件。
+    // (出さないとズームを戻す ◎ が消えてしまう)。`apply_sizes` と同じ条件。
     let multi = layout.len() > 1;
     let mut zoom_req = false;
     for (id, r) in &rects {
@@ -9724,7 +9724,7 @@ pub fn draw_split(
                 out.close = Some(*id);
             }
             if hit_zoom {
-                // フォーカスを移してからズームする (別ペインの ⤢ でも直感どおり)。
+                // フォーカスを移してからズームする (別ペインの ◎ でも直感どおり)。
                 layout.set_focus(*id);
                 zoom_req = true;
             }
@@ -9803,7 +9803,7 @@ pub fn draw_split(
     out
 }
 
-/// ペイン 1 枚のヘッダを描く。戻り値は `(✕ が押されたか, ⤢ が押されたか)`。
+/// ペイン 1 枚のヘッダを描く。戻り値は `(✕ が押されたか, ◎ が押されたか)`。
 ///
 /// 幅は `head` そのまま。題名はクリップ矩形で切るだけなので、
 /// どんな長さ・どんな言語 (CJK 含む) でもヘッダからはみ出さない。
@@ -9834,7 +9834,7 @@ fn pane_header_ui(
     let zoom_r = egui::Rect::from_min_size(egui::pos2(head.max.x - bh * 2.0, head.min.y), btn);
     let font = egui::FontId::proportional((bh * 0.62).max(7.0));
 
-    // 活動ランプ (⤢ の左)。色は呼び出し側 = Theme 由来。
+    // 活動ランプ (◎ の左)。色は呼び出し側 = Theme 由来。
     let mut text_right = zoom_r.min.x - 2.0;
     if let Some(dot) = c.dot {
         let cx = text_right - bh * 0.35;
@@ -9863,7 +9863,7 @@ fn pane_header_ui(
         );
     }
 
-    // ⤢ / ✕。`ui.interact` は本体 (body) と重ならない位置なので、
+    // ◎ / ✕。`ui.interact` は本体 (body) と重ならない位置なので、
     // 端末側のクリックを奪わない。
     let mut hit = (false, false);
     if head.width() > bh * 2.5 {
@@ -9873,7 +9873,7 @@ fn pane_header_ui(
         let close = ui
             .interact(close_r, ui.id().with(("zv-pane-close", id)), egui::Sense::click())
             .on_hover_text(tr("このペインを閉じる"));
-        for (r, resp, glyph) in [(zoom_r, &zoom, "⤢"), (close_r, &close, "✕")] {
+        for (r, resp, glyph) in [(zoom_r, &zoom, "◎"), (close_r, &close, "✕")] {
             let col = if resp.hovered() {
                 theme.accent
             } else {
@@ -10316,7 +10316,7 @@ mod split_tests {
         assert_eq!(got2, vec![(1, 17, 100), (2, 17, 100)]);
 
         // ズーム中は見えている 1 枚だけ (全面サイズ)。ヘッダは残る
-        // (⤢ が消えるとズームを戻せなくなるため) → rows = floor((612-18-12)/16) = 36
+        // (◎ が消えるとズームを戻せなくなるため) → rows = floor((612-18-12)/16) = 36
         l2.set_focus(2);
         l2.zoom_focused();
         let mut got3: Vec<(SessionId, u16, u16)> = Vec::new();

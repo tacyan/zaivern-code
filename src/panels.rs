@@ -1290,7 +1290,7 @@ pub fn should_collapse(text: &str) -> bool {
 /// 居座っていたのを畳んだもの — 空欄はエージェントのタイルに譲る。
 /// 展開するのは**書き手が複数行を必要としていることが確定した**ときだけ:
 ///
-/// - `forced`: ユーザーが ⤢ を押して自分で開いた
+/// - `forced`: ユーザーが ▾ を押して自分で開いた
 /// - 本文が改行を含む (貼り付け・⌥Enter で 2 行目に入った)
 ///
 /// フォーカスだけでは開かない。1 文字打つたびに下の端末が上下に跳ねるため。
@@ -1362,14 +1362,14 @@ pub fn composer_action(buf: &mut AgentInputBuffer, press: ComposerPress) -> Comp
 /// イベントに一切手を出さないので、ターミナル側のキーを横取りしない。
 /// **1 行帯モードのコンポーザ** — Cockpit ヘッダー行に埋め込む用。
 ///
-/// `[宛先チップ] [1 行入力] [送信] [⤢]` を必ず左→右で並べる。親が
+/// `[宛先チップ] [1 行入力] [送信] [▾]` を必ず左→右で並べる。親が
 /// `right_to_left` でも順序が反転しないよう、自前で領域を取り直している。
 ///
 /// Enter で送信 (1 行欄なので改行の出番がない)。⌥Enter や貼り付けで本文に
 /// 改行が入ると [`composer_wants_expand`] が真になり、次のフレームで
 /// 呼び出し側が複数行フォームへ切り替える。
 ///
-/// `expand` はユーザーが ⤢ を押したかどうか (呼び出し側が永続化する)。
+/// `expand` はユーザーが ▾ を押したかどうか (呼び出し側が永続化する)。
 pub fn agent_composer_inline_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -1476,7 +1476,7 @@ pub fn agent_composer_inline_ui(
                 press = ComposerPress::Send;
             }
             if ui
-                .small_button("⤢")
+                .small_button("▾")
                 .on_hover_text(tr("複数行の入力欄を開く"))
                 .clicked()
             {
@@ -1594,7 +1594,7 @@ impl ComposerScope {
 ///
 /// - `target`: いま宛先にできるエージェント `(セッション ID, 表示名)`。
 /// - `targets`: 宛先チップに並べる全エージェント (`Fixed` では見ない)。
-/// - `expand`: ユーザーが ⤢ で自分から開いたか (`Choosable` だけが使う)。
+/// - `expand`: ユーザーが ▾ で自分から開いたか (`Choosable` だけが使う)。
 ///
 /// 背の高さは本文から毎フレーム決まる ([`composer_rows`]) — 空なら 1 行、
 /// 折り返し/改行で伸び、消せば戻る。
