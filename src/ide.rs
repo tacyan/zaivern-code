@@ -510,7 +510,10 @@ fn percent_encode_path(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         let c = *b as char;
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '/') {
+        // `:` は RFC 3986 の path 内で合法 (pchar) なので符号化しない。
+        // Windows のドライブ (`C:/…`) を `%3A` にすると VS Code 系が
+        // `vscode://file/C:/…` の既定形と一致せずパスを解釈し損ねる。
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '/' | ':') {
             out.push(c);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -840,9 +843,10 @@ mod tests {
     /// テスト内では絶対パスだけを使い、cwd 依存を排除する。
     /// "/tmp/a.rs" は Windows では絶対にならず (ドライブが無い)、absolutize が
     /// カレントドライブを継ぎ足して期待値とずれるため、C: を前置して
-    /// どの OS でも「真に絶対」なパスにする。
+    /// どの OS でも「真に絶対」なパスにする。相対パス ("src/main.rs" 等) は
+    /// そのまま返す (前置すると「ドライブ相対」という別物になってしまう)。
     fn p(s: &str) -> PathBuf {
-        if cfg!(windows) {
+        if cfg!(windows) && s.starts_with('/') {
             PathBuf::from(format!("C:{s}"))
         } else {
             PathBuf::from(s)

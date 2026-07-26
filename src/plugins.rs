@@ -2974,10 +2974,12 @@ run = "c"
         } else {
             "echo boom >&2; exit 3"
         };
-        // ping の出力は stdout/stderr とも NUL へ。パイプの書き手を残すと、
-        // cmd を kill しても孤児の ping が EOF を塞いで読み取りが 30 秒待つ。
+        // Windows は cmd ビルトインだけで時間を潰す (rem のビジーループ)。
+        // ping 等の外部コマンドを使うと、孫がパイプの書き込みハンドルを継承した
+        // まま生き残り (リダイレクトしても**ハンドルの継承**は防げない)、cmd を
+        // kill しても EOF が来ず run_blocking の read join が孫の寿命まで待つ。
         let sleep_cmd = if cfg!(windows) {
-            "ping -n 31 127.0.0.1 > NUL 2>&1"
+            "for /L %i in (1,1,2000000000) do @rem"
         } else {
             "sleep 30"
         };

@@ -858,21 +858,40 @@ mod tests {
         }
     }
 
+    /// Windows 用: 一時 .ps1 を書いて `powershell -File` で走らせる診断役。
+    ///
+    /// cmd /C だと diagnose が末尾に付けるプロンプト引数がコマンド行へ連結され
+    /// 構文を壊す。-File のスクリプト引数なら (パラメータを取らない限り)
+    /// 黙って無視される。powershell 自身が直接の子なので、タイムアウトの
+    /// kill で確実に止まり、孫がパイプを塞ぐこともない。
+    #[cfg(windows)]
+    fn ps1_diag(name: &str, script: &str, timeout_secs: u64) -> CliDiagnostician {
+        let path = std::env::temp_dir().join(format!(
+            "zv-diag-test-{}-{name}.ps1",
+            std::process::id()
+        ));
+        std::fs::write(&path, script).expect("write ps1");
+        raw(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &path.to_string_lossy(),
+            ],
+            timeout_secs,
+        )
+    }
+
     /// OS を問わず `secs` 秒待つだけの診断役 (タイムアウト系テスト用)。
-    /// Windows の ping は 1 発ごとに約 1 秒待つ (n+1 発 ≒ n 秒)。出力は
-    /// stdout/stderr とも NUL へ捨てる — パイプの書き手を孤児の ping に
-    /// 残すと、cmd を kill しても EOF が来ず読み取り側が待ち続ける。
     fn fake_sleeper(secs: u64, timeout_secs: u64) -> CliDiagnostician {
-        if cfg!(windows) {
-            raw(
-                "cmd",
-                &[
-                    "/C",
-                    &format!("ping -n {} 127.0.0.1 > NUL 2>&1", secs + 1),
-                ],
-                timeout_secs,
-            )
-        } else {
+        #[cfg(windows)]
+        {
+            ps1_diag("sleep", &format!("Start-Sleep {secs}\n"), timeout_secs)
+        }
+        #[cfg(not(windows))]
+        {
             raw("/bin/sh", &["-c", &format!("sleep {secs}")], timeout_secs)
         }
     }
@@ -951,16 +970,11 @@ mod tests {
     #[test]
     fn huge_response_is_bounded_and_rejected() {
         // 大量出力でもバッファは MAX_RESPONSE_BYTES で止まり、形式不一致で None。
-        let d = if cfg!(windows) {
-            // 'guruguru' (8 文字) × 25 万 = 2,000,000 文字を 1 行で吐く
-            raw(
-                "powershell",
-                &["-NoProfile", "-Command", "'guruguru' * 250000"],
-                30,
-            )
-        } else {
-            raw("/bin/sh", &["-c", "yes ぐるぐる | head -c 2000000"], 30)
-        };
+        #[cfg(windows)]
+        // 'guruguru' (8 文字) × 25 万 = 2,000,000 文字を 1 行で吐く
+        let d = ps1_diag("huge", "'guruguru' * 250000\n", 30);
+        #[cfg(not(windows))]
+        let d = raw("/bin/sh", &["-c", "yes ぐるぐる | head -c 2000000"], 30);
         assert!(d.diagnose(&req(Anomaly::Runaway, "x")).is_none());
         assert!(d.last_error().unwrap().contains("形式"));
     }
