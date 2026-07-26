@@ -1860,6 +1860,10 @@ pub struct ZaivernApp {
     qr_tex: Option<egui::TextureHandle>,
     /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
+    /// デッキ下端のコンポーザ。**Cockpit とは別の器**にしてある —
+    /// デッキは宛先を選択中の 1 体に固定するので、器を共有すると Cockpit 側の
+    /// 「全員宛てのピン留め」を毎回踏み潰してしまう (下書きも宛先ごとに独立)。
+    deck_input_buf: crate::agent_input::AgentInputBuffer,
     /// プラン使用量の監視 (集約・枯渇予測)。読み取りはこの中で TTL 付きの
     /// バックグラウンドスレッドへ逃がされるので、毎フレーム触ってよい。
     quota: coordinator::QuotaWatch,
@@ -2396,6 +2400,7 @@ impl ZaivernApp {
             voice: VoiceState::default(),
             qr_tex: None,
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
+            deck_input_buf: crate::agent_input::AgentInputBuffer::new(),
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             save_trim_trailing: false,
@@ -10586,11 +10591,19 @@ impl ZaivernApp {
             .get(self.agents.active)
             .map(|s| (s.id, format!("{} {}", s.icon, s.title)));
         // 宛先チップは**全エージェント**を横一列で出す (入力欄の下)。
+        // 複製して同名が並んだときは #1 #2 … を足して必ず見分けられるようにする。
+        let names: Vec<String> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| format!("{} {}", s.icon, s.title))
+            .collect();
         let targets: Vec<(u64, String)> = self
             .agents
             .sessions
             .iter()
-            .map(|s| (s.id, format!("{} {}", s.icon, s.title)))
+            .map(|s| s.id)
+            .zip(panels::disambiguate_labels(&names))
             .collect();
         // ヘッダー行に埋め込めたか。埋め込めなかった分だけ下に別行で出す。
         let mut inline_done = false;
@@ -10708,14 +10721,22 @@ impl ZaivernApp {
         // 複数行フォームだけは**見出し行の外**に出す。中に入れると複数行の
         // テキスト欄が横並びの 1 行に押し込まれ、右端の細い帯へ折り返されて
         // 見出しの下に数百 px の空白ができる (ボタンも右端で切れる)。
+        // 1 行帯をヘッダーに畳み込めたときも、**エージェントが 2 体以上いれば
+        // 宛先チップは出す** — 「複数起動したのに横に並んで選べない」を潰す。
+        // 1 体以下なら選ぶ余地がないので 1 行も使わない。
+        if inline_done && targets.len() >= 2 {
+            panels::composer_target_chips(ui, theme, &mut self.agent_input_buf, &targets);
+        }
+
         if !inline_done {
             composer = if expanded {
-                panels::agent_composer_expanded_ui(
+                panels::agent_composer_ui(
                     ui,
                     theme,
                     &mut self.agent_input_buf,
                     target.as_ref().map(|(id, t)| (*id, t.as_str())),
                     &targets,
+                    panels::ComposerScope::Choosable,
                     &mut expand,
                 )
             } else {
@@ -11747,6 +11768,7 @@ impl ZaivernApp {
             now_ms,
             fresh_tail,
             scanning,
+            &mut self.deck_input_buf,
             &mut draw,
         );
 
@@ -11772,6 +11794,27 @@ impl ZaivernApp {
                     }
                 }
                 deck::DeckAction::Reorder { from, to } => self.reorder_agent(from, to),
+                // 下端の入力欄からの送信。**ID 指名の 1 体だけ**へ届ける
+                // (Cockpit の acts.send_to とまったく同じ扱い)。
+                deck::DeckAction::Send { id, text } => {
+                    let sent = self
+                        .agents
+                        .sessions
+                        .iter_mut()
+                        .find(|s| s.id == id)
+                        .map(|s| {
+                            // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)
+                            s.note_user_input();
+                            (s.send_text(&format!("{text}\r")), s.title.clone())
+                        });
+                    match sent {
+                        Some((true, title)) => {
+                            self.toast(trf("✏ 送信: {title}", &[("title", title)]), true)
+                        }
+                        Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
+                        None => self.toast(tr("宛先のセッションが見つかりません"), false),
+                    }
+                }
                 deck::DeckAction::Close => self.deck = false,
             }
         }

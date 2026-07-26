@@ -1147,6 +1147,135 @@ pub fn composer_stats(text: &str) -> (usize, usize) {
     (text.chars().count(), text.split('\n').count())
 }
 
+// ── 背の高さ (空欄は 1 行・伸びたら伸びる・消したら戻る) ────────────────
+//
+// 「空の入力欄が 130px 居座る」が Cockpit への一番強い不満だった。高さを
+// **本文から毎フレーム計算し直す純関数**にして、状態を持たせないことで
+// 「伸びたまま戻らない」も同時に潰す。
+
+/// 下端コンポーザが伸びられる上限行数。これ以上は中でスクロールする。
+pub const COMPOSER_MAX_ROWS: usize = 8;
+
+/// 1 行に収まる文字数の見積り。
+///
+/// `char_w` は呼び出し側が `ui.fonts` から**実測**した 1 文字の幅。固定値を
+/// 書かないので DPI・フォント設定・ズームにそのまま追従する。0 は「折り返し
+/// を数えない」を意味する。
+pub fn wrap_cols(width: f32, char_w: f32) -> usize {
+    if !(char_w > 0.0) || !(width > 0.0) {
+        return 0;
+    }
+    (width / char_w).floor().max(1.0) as usize
+}
+
+/// 本文が要求する**行数** (1 行始まり・上限つき)。
+///
+/// - 空文字は必ず 1 — 空欄が余計な高さを取らない。
+/// - `cols` は 1 行に入る文字数 ([`wrap_cols`])。0 なら折り返しを数えない。
+/// - 改行でも折り返しでも伸び、消せば 1 行へ戻る (状態を持たない)。
+pub fn composer_rows(text: &str, cols: usize, max_rows: usize) -> usize {
+    let max = max_rows.max(1);
+    if text.is_empty() {
+        return 1;
+    }
+    let mut n = 0usize;
+    for seg in text.split('\n') {
+        let len = seg.chars().count();
+        n += if cols == 0 { 1 } else { len.div_ceil(cols).max(1) };
+        if n >= max {
+            return max;
+        }
+    }
+    n.clamp(1, max)
+}
+
+// ── クリップボード画像の貼り付け ────────────────────────────────────
+//
+// 端末 (`terminal.rs`) では前からできていたが、テキストのコンポーザに
+// フォーカスがあると効かなかった。保存・命名・間引きは端末側の実装を
+// **そのまま呼ぶ** (二重実装を作らない)。
+
+/// クリップボード画像を本文へ差し込むときの表記 — `@パス ` (末尾に半角空白)。
+///
+/// 端末側の貼り付けとまったく同じ形。ファイル名は
+/// `terminal::save_clipboard_png` が空白なしの ASCII で作るので、
+/// シェルクオートなしでも CLI 側でパスが分断されない。
+pub fn image_mention(path: &Path) -> String {
+    format!("@{} ", path.display())
+}
+
+/// 取れた画像を本文へ差し込む**純関数** (UI から切り出した本体)。
+///
+/// `png` が `None` — 画像が無い / クリップボードに文字が載っている /
+/// クリップボード初期化・保存に失敗した — のときは `None` を返し、
+/// 呼び出し側は**本文を 1 文字も触らない** (= 通常の貼り付けのまま)。
+pub fn apply_image_paste(text: &str, caret: usize, png: Option<&Path>) -> Option<(String, usize)> {
+    let p = png?;
+    Some(insert_at_caret(text, caret, &image_mention(p)))
+}
+
+/// キャレット位置へ差し込む純関数 (char 単位・日本語でも壊れない)。
+/// 返り値は `(新しい本文, 差し込んだ直後のキャレット位置)`。
+pub fn insert_at_caret(text: &str, caret: usize, insert: &str) -> (String, usize) {
+    let n = text.chars().count();
+    let at = caret.min(n);
+    let mut out: String = text.chars().take(at).collect();
+    out.push_str(insert);
+    out.extend(text.chars().skip(at));
+    (out, at + insert.chars().count())
+}
+
+/// **コンポーザにフォーカスがある間の ⌘V / Ctrl+V 画像貼り付け。**
+///
+/// - クリップボードに触るのは**その打鍵があったフレームだけ** (アイドルで 0 回)。
+/// - egui-winit 0.29 はペーストコードの**押下**を飲み込むので、端末側と同じく
+///   **リリース**で拾う。
+/// - クリップボードに文字が載っているときは [`crate::terminal::clipboard_image_to_png`]
+///   が `None` を返すため、egui 標準の Paste (= 文字の貼り付け) がそのまま効く。
+/// - 初期化失敗・画像なし・保存失敗はすべて `None` に潰れる。パニックもせず、
+///   UI スレッドを止めもしない (失敗したら通常の貼り付けのまま)。
+///
+/// 宛先が 1 体でも全員宛てでも同じ経路 — 挿すのは**本文**なので区別しない。
+fn composer_image_paste(ui: &mut egui::Ui, buf: &mut AgentInputBuffer, te_id: egui::Id) -> bool {
+    if !ui.memory(|m| m.has_focus(te_id)) {
+        return false;
+    }
+    let mac = on_mac();
+    let chord = ui.input(|i| {
+        i.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Key {
+                    key,
+                    pressed: false,
+                    modifiers,
+                    ..
+                } if crate::terminal::is_image_paste_chord_on(*key, *modifiers, mac)
+            )
+        })
+    });
+    if !chord {
+        return false;
+    }
+    let mut st = egui::TextEdit::load_state(ui.ctx(), te_id).unwrap_or_default();
+    let caret = st
+        .cursor
+        .char_range()
+        .map(|r| r.primary.index)
+        .unwrap_or_else(|| buf.text().chars().count());
+    // クリップボードへ触るのはここ 1 行だけ (この打鍵のフレームのみ)。
+    let png = crate::terminal::clipboard_image_to_png();
+    let Some((text, at)) = apply_image_paste(buf.text(), caret, png.as_deref()) else {
+        return false;
+    };
+    buf.set_text(text);
+    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+        egui::text::CCursor::new(at),
+    )));
+    st.store(ui.ctx(), te_id);
+    true
+}
+
 /// 折りたたみ表示に切り替える閾値。
 ///
 /// 複数行で、かつ長いものだけ畳む。1 行の長文はそのまま見えた方が速い。
@@ -1253,6 +1382,10 @@ pub fn agent_composer_inline_ui(
     let te_id = ui.make_persistent_id("agent_composer_text");
     let mut press = ComposerPress::None;
 
+    // ⌘V / Ctrl+V の画像貼り付け (本文へ `@パス ` を挿す)。文字が載っている
+    // ときは何もせず、egui 標準の貼り付けに任せる。
+    composer_image_paste(ui, buf, te_id);
+
     // 親のレイアウト方向に依存しないよう、残り幅をまとめて確保してから左→右で描く。
     let avail = ui.available_width();
     let row_h = ui.spacing().interact_size.y;
@@ -1356,6 +1489,30 @@ pub fn agent_composer_inline_ui(
     act
 }
 
+/// 宛先チップの表示名を**必ず見分けられる形**にする (純関数)。
+///
+/// エージェントを複製すると同じ名前が並ぶ (「👾 Claude Code」が 3 つ)。
+/// 同名が 2 つ以上あるグループにだけ `#1 #2 …` を足す — 1 つしかない名前は
+/// そのまま (使わない番号で画面をうるさくしない)。
+pub fn disambiguate_labels(labels: &[String]) -> Vec<String> {
+    let mut count: HashMap<&str, usize> = HashMap::new();
+    for l in labels {
+        *count.entry(l.as_str()).or_insert(0) += 1;
+    }
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    labels
+        .iter()
+        .map(|l| {
+            if count.get(l.as_str()).copied().unwrap_or(0) < 2 {
+                return l.clone();
+            }
+            let n = seen.entry(l.as_str()).or_insert(0);
+            *n += 1;
+            format!("{l} #{n}")
+        })
+        .collect()
+}
+
 /// **宛先チップの並び** — 入力欄の**下**に横一列で置く。
 ///
 /// エージェントが増えたらチップが増えるだけなので、選ぶのに 1 行しか使わない
@@ -1415,32 +1572,60 @@ pub fn composer_target_chips(
         });
 }
 
+/// 宛先の自由度。**同じコンポーザを 2 つの画面で使い分けるための唯一のつまみ**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerScope {
+    /// Cockpit: 起動中の全エージェント + 全員宛てから選べる (チップ行を出す)。
+    Choosable,
+    /// デッキ: 宛先は**選択中の 1 体に固定**。チップ行も全員宛ての導線も出さない。
+    /// デッキの役目は「選んだ 1 体と向き合う」ことなので、ここで一斉送信が
+    /// できてしまうと役割が壊れる。
+    Fixed,
+}
+
+impl ComposerScope {
+    /// 宛先チップ行を描くか。
+    pub fn shows_chips(self) -> bool {
+        self == ComposerScope::Choosable
+    }
+}
+
+/// **エージェント宛てコンポーザの実体 (これ 1 本)**。
+///
+/// - `target`: いま宛先にできるエージェント `(セッション ID, 表示名)`。
+/// - `targets`: 宛先チップに並べる全エージェント (`Fixed` では見ない)。
+/// - `expand`: ユーザーが ⤢ で自分から開いたか (`Choosable` だけが使う)。
+///
+/// 背の高さは本文から毎フレーム決まる ([`composer_rows`]) — 空なら 1 行、
+/// 折り返し/改行で伸び、消せば戻る。
+///
+/// キー入力は**テキスト欄にフォーカスがあるときだけ**触るので、フォーカスが
+/// 無い間はターミナルにもデッキの絞り込みにも一切手を出さない。
 pub fn agent_composer_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     buf: &mut AgentInputBuffer,
     target: Option<(u64, &str)>,
     targets: &[(u64, String)],
-) -> ComposerAction {
-    let mut ignored = true;
-    agent_composer_expanded_ui(ui, theme, buf, target, targets, &mut ignored)
-}
-
-/// 複数行フォーム。`expand` を false にすると呼び出し側が 1 行帯へ畳む。
-pub fn agent_composer_expanded_ui(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    buf: &mut AgentInputBuffer,
-    target: Option<(u64, &str)>,
-    targets: &[(u64, String)],
+    scope: ComposerScope,
     expand: &mut bool,
 ) -> ComposerAction {
-    // 宛先をアクティブなエージェントに追従させる
-    buf.sync_target(target.map(|(id, _)| id));
+    match (scope, target) {
+        // デッキ: ピン留めを見ずに選択中の 1 体へ固定する (全員宛てへは行かない)
+        (ComposerScope::Fixed, Some((id, _))) => buf.set_target(ComposerTarget::Agent(id)),
+        // Cockpit: 宛先をアクティブなエージェントに追従させる
+        _ => {
+            buf.sync_target(target.map(|(id, _)| id));
+        }
+    }
 
     // 送信先が変わっても入力欄の同一性 (= フォーカス) は保つので ID は固定
     let te_id = ui.make_persistent_id("agent_composer_text");
     let focused = ui.memory(|m| m.has_focus(te_id));
+
+    // ⌘V / Ctrl+V の画像貼り付け (本文へ `@パス ` を挿す)。宛先が 1 体でも
+    // 全員宛てでも同じ — 挿す先は本文なので区別しない。
+    composer_image_paste(ui, buf, te_id);
 
     let mut press = ComposerPress::None;
     if focused {
@@ -1495,20 +1680,36 @@ pub fn agent_composer_expanded_ui(
         });
     }
 
+    // 宛先固定 (デッキ) では「誰に書いているか」を 1 行の小さな印で出す。
+    // チップ行は出さない = ここから全員宛てへは行けない。
+    if !scope.shows_chips() {
+        ui.label(
+            RichText::new(inline_target_label(buf.target(), target.map(|(_, n)| n)))
+                .size(11.0)
+                .color(theme.accent),
+        );
+    }
+
     if !collapsed {
+        // 背の高さは本文が決める: 空なら 1 行、折り返し/改行で伸び、消せば戻る。
+        // 固定 px を書かないので DPI・フォント設定・ズームに追従する。
+        let font = egui::FontId::proportional(13.0);
+        let (char_w, row_h) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
+        let cols = wrap_cols(ui.available_width(), char_w.max(1.0));
+        let rows = composer_rows(buf.text(), cols, COMPOSER_MAX_ROWS);
         let mut text = buf.text().to_string();
         let changed = egui::ScrollArea::vertical()
             .id_salt("agent_composer_scroll")
-            .max_height(168.0)
+            .max_height(row_h.max(1.0) * (COMPOSER_MAX_ROWS + 1) as f32)
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut text)
                         .id(te_id)
                         .hint_text(tr("エージェントへの指示…"))
-                        .desired_rows(3)
+                        .desired_rows(rows)
                         .desired_width(f32::INFINITY)
-                        .font(egui::FontId::proportional(13.0)),
+                        .font(font.clone()),
                 )
                 .changed()
             })
@@ -1519,28 +1720,32 @@ pub fn agent_composer_expanded_ui(
     }
 
     // ── 宛先チップ (入力欄の**下**) ───────────────────────────
-    composer_target_chips(ui, theme, buf, targets);
-    if buf.target().is_broadcast() && !targets.is_empty() {
-        // 誤爆が一番痛いので、全員宛てのときだけ明示的に注意を出す
-        ui.label(
-            RichText::new(tr("⚠ 起動中のすべてのエージェントへ送られます"))
-                .color(theme.warn)
-                .size(10.5),
-        );
+    if scope.shows_chips() {
+        composer_target_chips(ui, theme, buf, targets);
+        if buf.target().is_broadcast() && !targets.is_empty() {
+            // 誤爆が一番痛いので、全員宛てのときだけ明示的に注意を出す
+            ui.label(
+                RichText::new(tr("⚠ 起動中のすべてのエージェントへ送られます"))
+                    .color(theme.warn)
+                    .size(10.5),
+            );
+        }
     }
 
     // ── カウンタ + ボタン ─────────────────────────────────────
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let (chars, lines) = composer_stats(buf.text());
-        ui.label(
-            RichText::new(trf(
-                "{c} 文字 / {l} 行",
-                &[("c", chars.to_string()), ("l", lines.to_string())],
-            ))
-            .color(theme.text_dim)
-            .size(10.5),
-        );
+        if scope.shows_chips() {
+            let (chars, lines) = composer_stats(buf.text());
+            ui.label(
+                RichText::new(trf(
+                    "{c} 文字 / {l} 行",
+                    &[("c", chars.to_string()), ("l", lines.to_string())],
+                ))
+                .color(theme.text_dim)
+                .size(10.5),
+            );
+        }
         ui.label(
             RichText::new(send_hint(on_mac()))
                 .color(theme.text_dim)
@@ -1553,15 +1758,18 @@ pub fn agent_composer_expanded_ui(
         {
             press = ComposerPress::Send;
         }
-        if ui.small_button(tr("閉じる")).clicked() {
-            press = ComposerPress::Cancel;
-        }
-        if ui
-            .small_button("⤡")
-            .on_hover_text(tr("1 行の入力欄に畳む (下書きは残ります)"))
-            .clicked()
-        {
-            *expand = false;
+        // 「閉じる」「1 行へ畳む」は Cockpit 専用 — デッキの下端欄は畳まない。
+        if scope.shows_chips() {
+            if ui.small_button(tr("閉じる")).clicked() {
+                press = ComposerPress::Cancel;
+            }
+            if ui
+                .small_button("⤡")
+                .on_hover_text(tr("1 行の入力欄に畳む (下書きは残ります)"))
+                .clicked()
+            {
+                *expand = false;
+            }
         }
     });
 
@@ -2447,6 +2655,239 @@ mod tests {
             composer_action(&mut b, ComposerPress::Send),
             ComposerAction::SendTo(11, src.to_string()),
             "改行も末尾の 1 行も 1 文字違わず届く"
+        );
+    }
+
+    // ── 背の高さ (空欄は 1 行・伸びたら伸びる・消したら戻る) ──────
+
+    #[test]
+    fn 空のコンポーザは一行しか場所を取らない() {
+        // 折り返し幅がいくつでも、宛先が何でも、空なら必ず 1 行
+        for cols in [0usize, 1, 10, 200] {
+            assert_eq!(composer_rows("", cols, COMPOSER_MAX_ROWS), 1, "cols={cols}");
+        }
+    }
+
+    #[test]
+    fn 折り返しと改行で伸びて消せば戻る() {
+        let cols = 10;
+        // 1 行に収まる
+        assert_eq!(composer_rows("あいうえお", cols, COMPOSER_MAX_ROWS), 1);
+        // 折り返し: 25 文字 / 10 桁 = 3 行
+        let long = "0123456789012345678901234";
+        assert_eq!(composer_rows(long, cols, COMPOSER_MAX_ROWS), 3);
+        // 改行: 空行も 1 行として数える
+        assert_eq!(composer_rows("a\n\nb", cols, COMPOSER_MAX_ROWS), 3);
+        // 上限で頭打ち (これ以上は中でスクロールする)
+        let huge = "x".repeat(cols * (COMPOSER_MAX_ROWS + 20));
+        assert_eq!(composer_rows(&huge, cols, COMPOSER_MAX_ROWS), COMPOSER_MAX_ROWS);
+        // 消したら 1 行へ戻る (状態を持たないので必ず戻る)
+        assert_eq!(composer_rows("", cols, COMPOSER_MAX_ROWS), 1);
+    }
+
+    #[test]
+    fn 折り返し桁数は実測した文字幅から出る() {
+        // 固定 px を書かないので、フォント/DPI が変われば桁数も変わる
+        assert_eq!(wrap_cols(100.0, 10.0), 10);
+        assert_eq!(wrap_cols(100.0, 20.0), 5);
+        // 病的な入力でも 0 除算やパニックにしない
+        assert_eq!(wrap_cols(100.0, 0.0), 0);
+        assert_eq!(wrap_cols(0.0, 10.0), 0);
+        assert_eq!(wrap_cols(f32::NAN, 10.0), 0);
+        // 幅が 1 文字未満でも最低 1 桁 (0 桁だと行数計算が壊れる)
+        assert_eq!(wrap_cols(3.0, 10.0), 1);
+    }
+
+    // ── クリップボード画像の貼り付け ────────────────────────────
+
+    /// 画像ペーストのコードは端末と同じ判定を**共有**している
+    /// (ここで独自の判定を持つと、端末とコンポーザで挙動がずれる)。
+    #[test]
+    fn 画像ペーストのコードはひと組だけ() {
+        use crate::terminal::is_image_paste_chord_on as chord;
+        // (mac, ctrl, cmd, shift, alt, key, 画像ペーストか)
+        let cases: &[(bool, bool, bool, bool, bool, egui::Key, bool)] = &[
+            (true, false, true, false, false, egui::Key::V, true), // ⌘V
+            (true, true, false, false, false, egui::Key::V, false), // 端末の生ペースト
+            (true, false, true, true, false, egui::Key::V, false), // ⌘⇧V は対象外
+            (true, false, true, false, true, egui::Key::V, false), // ⌥ 併用も対象外
+            (true, false, true, false, false, egui::Key::C, false), // V 以外
+            (false, true, false, false, false, egui::Key::V, true), // Ctrl+V
+            (false, false, true, false, false, egui::Key::V, false), // Win キー相当は無関係
+            (false, true, false, true, false, egui::Key::V, false), // Ctrl+⇧V は端末流
+        ];
+        for &(mac, ctrl, cmd, shift, alt, key, want) in cases {
+            let m = mods(mac, ctrl, cmd, shift, alt);
+            assert_eq!(
+                chord(key, m, mac),
+                want,
+                "mac={mac} ctrl={ctrl} cmd={cmd} shift={shift} alt={alt} key={key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 画像はキャレット位置に半角空白つきで挿さる() {
+        let dir = std::env::temp_dir().join("zaivern-clip");
+        let png = dir.join("clip-1700000000000-42-0.png");
+        let mention = image_mention(&png);
+        assert!(mention.starts_with('@'), "先頭は @ で始まる: {mention}");
+        assert!(mention.ends_with(' '), "末尾に半角空白が要る: {mention}");
+        // ファイル名は空白なしの ASCII (シェルクオートなしで分断されない)
+        let name = png.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.is_ascii() && !name.contains(' '), "名前が ASCII 無空白でない: {name}");
+
+        // キャレットの前後がそのまま残る (日本語でも文字境界で割れない)
+        let (out, at) = insert_at_caret("これを直して", 3, &mention);
+        assert_eq!(out, format!("これを{mention}直して"));
+        assert_eq!(out.chars().nth(at), Some('直'), "キャレットは挿入直後に来る");
+        // 端 (先頭 / 末尾 / 範囲外) でも壊れない
+        assert_eq!(insert_at_caret("ab", 0, "@x ").0, "@x ab");
+        assert_eq!(insert_at_caret("ab", 2, "@x ").0, "ab@x ");
+        assert_eq!(insert_at_caret("ab", 999, "@x ").0, "ab@x ", "範囲外は末尾に寄せる");
+        assert_eq!(insert_at_caret("", 0, "@x ").0, "@x ");
+    }
+
+    /// クリップボードが使えない環境 (ヘッドレス・画像なし・保存失敗) と、
+    /// **文字が載っている**場合は `None` — 本文は 1 文字も変わらず、
+    /// egui 標準の文字貼り付けがそのまま効く。
+    #[test]
+    fn 画像が取れなければ本文は一文字も変わらない() {
+        // 文字クリップボード / 画像なし / 初期化失敗 はすべてこの None に集約される
+        assert_eq!(apply_image_paste("そのまま", 2, None), None);
+        // 取れたときだけ差し込まれる
+        let p = std::env::temp_dir().join("zaivern-clip").join("clip-1-2-3.png");
+        let (out, _) = apply_image_paste("そのまま", 2, Some(&p)).expect("取れたら挿さる");
+        assert!(out.starts_with("その@"), "キャレット位置に挿さっていない: {out}");
+    }
+
+    /// 宛先が「全員宛て」でも挿入経路は同じ — 挿すのは本文なので区別しない。
+    /// (画像ファイルは 1 つ。送信時に同じ本文が全員へ渡る)
+    #[test]
+    fn 画像の挿入は全員宛てでも一体宛てでも同じ() {
+        let mention = image_mention(std::path::Path::new("/tmp/zaivern-clip/clip-1-2-3.png"));
+        for target in [ComposerTarget::Broadcast, ComposerTarget::Agent(7)] {
+            let mut b = AgentInputBuffer::new();
+            b.set_target(target);
+            b.set_text("これを見て");
+            let (out, _) = insert_at_caret(b.text(), b.text().chars().count(), &mention);
+            b.set_text(out);
+            assert!(b.text().contains(&mention), "target={target:?} で挿さっていない");
+            // 全員宛てのまま送れば全員へ同じ本文が渡る
+            let act = composer_action(&mut b, ComposerPress::Send);
+            match (target, act) {
+                (ComposerTarget::Broadcast, ComposerAction::Send(t)) => {
+                    assert!(t.contains(&mention))
+                }
+                (ComposerTarget::Agent(id), ComposerAction::SendTo(to, t)) => {
+                    assert_eq!(id, to);
+                    assert!(t.contains(&mention));
+                }
+                (t, a) => panic!("宛先 {t:?} が経路 {a:?} へ落ちた"),
+            }
+        }
+    }
+
+    // ── 宛先チップ (複数エージェントを横に並べて選ぶ) ─────────────
+
+    /// チップ行に出る要素は「📢 全員 + 起動中の全エージェント」。
+    /// 0 / 1 / 5 体のどれでも同じ規則で、選択中の 1 つだけが selected になる。
+    #[test]
+    fn 宛先チップは全員と全エージェントを並べる() {
+        for n in [0usize, 1, 5] {
+            let targets: Vec<(u64, String)> =
+                (0..n).map(|i| (i as u64 + 1, format!("エージェント{i}"))).collect();
+            let mut b = AgentInputBuffer::new();
+            b.sync_target(targets.first().map(|(id, _)| *id));
+            // 並ぶチップの数 = 全員 1 個 + エージェント n 個
+            assert_eq!(targets.len() + 1, n + 1);
+            if n == 0 {
+                // 宛先がいなければ全員宛てへ戻る (誰もいない所へ指名しない)
+                assert!(b.target().is_broadcast(), "n={n}");
+            } else {
+                // 選択中は 1 つだけ = アクティブなエージェント
+                assert_eq!(b.target(), ComposerTarget::Agent(1), "n={n}");
+                for (id, _) in targets.iter().skip(1) {
+                    assert_ne!(b.target(), ComposerTarget::Agent(*id));
+                }
+                // 明示的に全員宛てを選ぶとピン留めされ、追従で戻されない
+                b.pin_broadcast(true);
+                b.set_target(ComposerTarget::Broadcast);
+                b.sync_target(Some(1));
+                assert!(b.target().is_broadcast(), "n={n}: ピン留めが尊重されない");
+            }
+        }
+    }
+
+    /// 複製して同名が並んでも、チップは必ず見分けられる。
+    #[test]
+    fn 同名の宛先チップは番号で見分けられる() {
+        let names: Vec<String> = ["👾 Claude Code", "🤖 Codex", "👾 Claude Code", "👾 Claude Code"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = disambiguate_labels(&names);
+        assert_eq!(
+            out,
+            vec![
+                "👾 Claude Code #1",
+                "🤖 Codex",
+                "👾 Claude Code #2",
+                "👾 Claude Code #3"
+            ]
+        );
+        // 全部が一意 = 1 つも番号を足さない (使わない番号で画面をうるさくしない)
+        let uniq: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(disambiguate_labels(&uniq), uniq);
+        assert!(disambiguate_labels(&[]).is_empty());
+        // 出てきた名前はすべて異なる
+        let set: std::collections::HashSet<&String> = out.iter().collect();
+        assert_eq!(set.len(), out.len(), "同名が残っている");
+    }
+
+    /// デッキ (`Fixed`) はチップ行を持たない = 全員宛てへ行く道が無い。
+    #[test]
+    fn 宛先固定のコンポーザはチップ行を持たない() {
+        assert!(ComposerScope::Choosable.shows_chips());
+        assert!(!ComposerScope::Fixed.shows_chips());
+    }
+
+    /// `Fixed` は Cockpit 側のピン留め (全員宛て) を踏み越えて 1 体へ向く。
+    /// ここが崩れるとデッキから一斉送信が飛ぶ。
+    #[test]
+    fn 宛先固定はピン留めを踏み越えて一体へ向く() {
+        let mut b = AgentInputBuffer::new();
+        b.pin_broadcast(true);
+        b.set_target(ComposerTarget::Broadcast);
+        // Choosable (Cockpit) の追従はピン留めを尊重する
+        b.sync_target(Some(9));
+        assert!(b.target().is_broadcast(), "Cockpit のピン留めが壊れた");
+        // Fixed (デッキ) は無条件に選択中の 1 体へ
+        b.set_target(ComposerTarget::Agent(9));
+        assert_eq!(b.target(), ComposerTarget::Agent(9));
+        // 空は送らない → 中身があれば必ず SendTo (Send にはならない)
+        assert_eq!(composer_action(&mut b, ComposerPress::Send), ComposerAction::None);
+        b.set_text("これを見て");
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::Send),
+            ComposerAction::SendTo(9, "これを見て".into()),
+            "デッキからの送信が一斉送信へ落ちた"
+        );
+    }
+
+    /// デッキ側の宛先固定は**ソース上でも**分岐が 1 本だけ。
+    #[test]
+    fn 宛先固定の分岐はソース上でも一本だけ() {
+        let src = include_str!("panels.rs");
+        let body = src.split("mod tests {").next().expect("本体がある");
+        let head = body
+            .split("pub fn agent_composer_ui(")
+            .nth(1)
+            .expect("定義がある");
+        let head = &head[..head.find("let te_id").unwrap_or(head.len())];
+        assert!(
+            head.contains("buf.set_target(ComposerTarget::Agent(id))"),
+            "Fixed が選択中の 1 体へ固定されていない"
         );
     }
 

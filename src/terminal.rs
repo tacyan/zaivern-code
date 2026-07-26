@@ -5718,7 +5718,7 @@ fn prune_clip_pngs(dir: &Path, keep: usize) {
 ///
 /// OS 判定は引数で受ける (両分岐をどの環境でもテストできるようにする)。
 /// 実行時の値は [`InputCaps::mac`] 経由で `cfg!(target_os = "macos")` が入る。
-fn is_image_paste_chord_on(key: egui::Key, m: egui::Modifiers, mac: bool) -> bool {
+pub(crate) fn is_image_paste_chord_on(key: egui::Key, m: egui::Modifiers, mac: bool) -> bool {
     if key != egui::Key::V || m.shift || m.alt {
         return false;
     }
@@ -5735,7 +5735,7 @@ fn is_image_paste_chord_on(key: egui::Key, m: egui::Modifiers, mac: bool) -> boo
 /// - クリップボード初期化失敗 (ヘッドレス CI 等) や画像なし・保存失敗も
 ///   None で握りつぶし、従来の挙動へフォールバックする。
 /// 呼び出しはキー入力時だけに限定する (起動時にクリップボードへ触らない)。
-fn clipboard_image_to_png() -> Option<PathBuf> {
+pub(crate) fn clipboard_image_to_png() -> Option<PathBuf> {
     let mut cb = arboard::Clipboard::new().ok()?;
     if cb.get_text().map(|t| !t.is_empty()).unwrap_or(false) {
         return None;
