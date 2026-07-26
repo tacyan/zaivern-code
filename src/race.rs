@@ -1061,6 +1061,15 @@ fn status_badge(s: &RacerStatus, theme: &Theme) -> (String, egui::Color32) {
 
 /// Cockpit 内のレースセクション。押された操作は Vec で返し、反映は app.rs が行う。
 /// `presets` は (アイコン, 名前)、`sessions` は (セッション id, 走行中か)。
+/// レースが**何も抱えていない**か (走行中でもフォームを開いてもいない)。
+///
+/// 真なら Cockpit はこのセクションを 1 ピクセルも描かない。見出しだけの行が
+/// 常駐して 24px を食い、その分だけエージェントのタイルが痩せるため。
+/// 起動口は「タスクとメッセージ」の行に間借りする。
+pub fn is_idle(panel: &RacePanel) -> bool {
+    panel.race.is_none() && !panel.form_open
+}
+
 pub fn race_section(
     panel: &mut RacePanel,
     ui: &mut egui::Ui,

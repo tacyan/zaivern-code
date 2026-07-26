@@ -81,3 +81,6 @@ $RECYCLE.BIN/
 
 # === App artifacts (拡張の実体は ~/.zaivern/ 配下。手元に落とした .vsix はコミットしない) ===
 *.vsix
+
+# 実機確認用のスクリーンショット (作業成果物ではない)
+screenshots/

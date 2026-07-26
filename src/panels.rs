@@ -29,6 +29,102 @@ use crate::palette::Cmd;
 use crate::session_picker::{self, PastSession, SidebarAction, SidebarState};
 use crate::theme::Theme;
 
+/// **間隔スケール** — パネル系の描画が使う唯一の目盛り。
+///
+/// 基準は 4px の倍数。呼び出しごとに 7 とか 13 とかを直に書くと、
+/// 画面ごとにリズムがずれて「詰まっている所」と「間延びした所」が同居する。
+/// 新しい余白が要るときは**この段だけから選ぶ**こと。
+///
+/// 論理 px (egui のポイント) なので DPI には依らない。
+pub mod space {
+    /// 4 — 密着した要素どうし (アイコンと文字)
+    pub const XS: f32 = 4.0;
+    /// 8 — 既定の項目間隔
+    pub const SM: f32 = 8.0;
+    /// 12 — セクション内の区切り / カードの内側余白
+    pub const MD: f32 = 12.0;
+    /// 16 — セクション間
+    pub const LG: f32 = 16.0;
+    /// 24 — 画面の外周
+    pub const XL: f32 = 24.0;
+}
+
+// ---------------------------------------------------------------------------
+// 空状態カードの幾何 (純関数) — Cockpit と看板で共有する
+// ---------------------------------------------------------------------------
+
+/// 空状態カードの寸法。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EmptyCard {
+    /// 起動ボタンの列数
+    pub cols: usize,
+    /// 起動ボタンの行数
+    pub rows: usize,
+    /// 起動ボタン 1 個の幅
+    pub btn_w: f32,
+    /// カードの矩形。**必ず** `avail` の中に収まる
+    pub card: egui::Rect,
+    /// 中身がカードに収まらず縦スクロールが要るか
+    pub scroll: bool,
+}
+
+/// 空状態カードの見出し部の高さ (アイコン + 見出し + 説明 + 行間)。
+/// 実測値: 52pt のアイコンは行高 70 前後まで伸びる。
+pub const EMPTY_HEAD_H: f32 = 70.0 + 26.0 + 20.0;
+/// 起動ボタンの高さ。
+pub const EMPTY_BTN_H: f32 = 34.0;
+/// 起動ボタンの最小幅 (これを割ると「Claude Code (全自動)」が読めない)。
+pub const EMPTY_BTN_MIN_W: f32 = 150.0;
+/// カードの最大幅 (広い窓でボタンを間延びさせない)。
+pub const EMPTY_CARD_MAX_W: f32 = 560.0;
+
+/// **空状態カードのレイアウト** (純関数)。
+///
+/// 不変条件:
+/// - 返す `card` は必ず `avail` の中 (下へ突き抜けてボタンが押せなくならない)
+/// - `cols * rows >= presets` (起動口を 1 つも隠さない)
+/// - カードは利用可能領域の中央。高さが足りないときは上詰め + `scroll`
+///
+/// 旧実装 (可用高の 25% を上詰め / 概算の中身高で中央寄せ) は、上のセクションの
+/// 高さが変わるたびにカードが上下し、低い窓では起動ボタンが下端を突き抜けて
+/// 押せなかった。中央寄せは**矩形で**決める。
+pub fn empty_card(avail: egui::Rect, presets: usize) -> EmptyCard {
+    let n = presets.max(1);
+    let pad = space::MD;
+    let card_w = (avail.width() - space::LG * 2.0)
+        .clamp(EMPTY_BTN_MIN_W + pad * 2.0, EMPTY_CARD_MAX_W)
+        .min(avail.width().max(1.0));
+    let inner_w = (card_w - pad * 2.0).max(EMPTY_BTN_MIN_W);
+    // 幅に入る最大列数
+    let max_cols =
+        (((inner_w + space::SM) / (EMPTY_BTN_MIN_W + space::SM)).floor() as usize).max(1);
+    let inner_h = (avail.height() - pad * 2.0).max(0.0);
+    // 高さが足りるいちばん少ない列数を選ぶ (1 列が読みやすいので優先)
+    let mut cols = max_cols;
+    for c in 1..=max_cols {
+        let r = n.div_ceil(c);
+        let need = EMPTY_HEAD_H + space::MD + r as f32 * (EMPTY_BTN_H + space::SM) - space::SM;
+        if need <= inner_h {
+            cols = c;
+            break;
+        }
+    }
+    let rows = n.div_ceil(cols);
+    let btn_w = (inner_w - space::SM * (cols as f32 - 1.0)) / cols as f32;
+    let content_h = EMPTY_HEAD_H + space::MD + rows as f32 * (EMPTY_BTN_H + space::SM) - space::SM;
+    let want_h = content_h + pad * 2.0;
+    let card_h = want_h.min(avail.height());
+    let x = avail.left() + (avail.width() - card_w) * 0.5;
+    let y = avail.top() + ((avail.height() - card_h) * 0.5).max(0.0);
+    EmptyCard {
+        cols,
+        rows,
+        btn_w,
+        card: egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(card_w, card_h)),
+        scroll: want_h > avail.height(),
+    }
+}
+
 /// 一覧の取得件数上限 (gh 側でも clamp される)。
 const LIST_LIMIT: usize = 50;
 
@@ -1059,6 +1155,29 @@ pub fn should_collapse(text: &str) -> bool {
     lines > 1 && (lines > 12 || chars > 600)
 }
 
+/// コンポーザを**背の高い複数行フォーム**として描くか (純粋関数・テスト対象)。
+///
+/// 既定は「1 行の細い帯」。Cockpit のヘッダー直下に常時 130px 級の空欄が
+/// 居座っていたのを畳んだもの — 空欄はエージェントのタイルに譲る。
+/// 展開するのは**書き手が複数行を必要としていることが確定した**ときだけ:
+///
+/// - `forced`: ユーザーが ⤢ を押して自分で開いた
+/// - 本文が改行を含む (貼り付け・⌥Enter で 2 行目に入った)
+///
+/// フォーカスだけでは開かない。1 文字打つたびに下の端末が上下に跳ねるため。
+pub fn composer_wants_expand(text: &str, forced: bool) -> bool {
+    forced || text.contains('\n')
+}
+
+/// 1 行帯モードで出す宛先ラベル (短い)。全員宛ては誤爆が痛いので明示する。
+pub fn inline_target_label(target: ComposerTarget, agent: Option<&str>) -> String {
+    match (target, agent) {
+        (ComposerTarget::Broadcast, _) => tr("📢 全員"),
+        (ComposerTarget::Agent(_), Some(name)) => format!("▸ {name}"),
+        (ComposerTarget::Agent(_), None) => tr("▸ 選択中"),
+    }
+}
+
 /// 折りたたみ中に出す 1 行サマリ。先頭の中身 + 残りの分量。
 pub fn collapsed_summary(text: &str) -> String {
     let (chars, lines) = composer_stats(text);
@@ -1112,11 +1231,209 @@ pub fn composer_action(buf: &mut AgentInputBuffer, press: ComposerPress) -> Comp
 ///
 /// キー入力は**テキスト欄にフォーカスがあるときだけ**触る。フォーカスが無い間は
 /// イベントに一切手を出さないので、ターミナル側のキーを横取りしない。
+/// **1 行帯モードのコンポーザ** — Cockpit ヘッダー行に埋め込む用。
+///
+/// `[宛先チップ] [1 行入力] [送信] [⤢]` を必ず左→右で並べる。親が
+/// `right_to_left` でも順序が反転しないよう、自前で領域を取り直している。
+///
+/// Enter で送信 (1 行欄なので改行の出番がない)。⌥Enter や貼り付けで本文に
+/// 改行が入ると [`composer_wants_expand`] が真になり、次のフレームで
+/// 呼び出し側が複数行フォームへ切り替える。
+///
+/// `expand` はユーザーが ⤢ を押したかどうか (呼び出し側が永続化する)。
+pub fn agent_composer_inline_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    buf: &mut AgentInputBuffer,
+    target: Option<(u64, &str)>,
+    expand: &mut bool,
+) -> ComposerAction {
+    buf.sync_target(target.map(|(id, _)| id));
+
+    let te_id = ui.make_persistent_id("agent_composer_text");
+    let mut press = ComposerPress::None;
+
+    // 親のレイアウト方向に依存しないよう、残り幅をまとめて確保してから左→右で描く。
+    let avail = ui.available_width();
+    let row_h = ui.spacing().interact_size.y;
+    let mut act = ComposerAction::None;
+    ui.allocate_ui_with_layout(
+        egui::vec2(avail, row_h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+
+            // 宛先チップ: 押すと全員宛て ⇄ 選択中エージェントを往復する。
+            let t = buf.target();
+            let chip = inline_target_label(t, target.map(|(_, n)| n));
+            let bcast = t.is_broadcast();
+            let chip_txt =
+                RichText::new(chip)
+                    .size(11.5)
+                    .color(if bcast { theme.warn } else { theme.accent });
+            if ui
+                .selectable_label(bcast, chip_txt)
+                .on_hover_text(tr(
+                    "送信先を切り替えます (全員宛て ⇄ 選択中のエージェント)。\n\
+                     下書きは送信先ごとに分かれて残ります",
+                ))
+                .clicked()
+            {
+                match (bcast, target) {
+                    (true, Some((id, _))) => {
+                        buf.pin_broadcast(false);
+                        buf.set_target(ComposerTarget::Agent(id));
+                    }
+                    _ => {
+                        buf.pin_broadcast(true);
+                        buf.set_target(ComposerTarget::Broadcast);
+                    }
+                }
+            }
+
+            // 右端の 2 ボタン分を残して入力欄に配分する (右端で切れないように)。
+            let reserved = 92.0;
+            let te_w = (ui.available_width() - reserved).max(80.0);
+            let mut text = buf.text().to_string();
+            let r = ui.add_sized(
+                [te_w, row_h],
+                egui::TextEdit::singleline(&mut text)
+                    .id(te_id)
+                    .hint_text(tr("エージェントへの指示… (Enter で送信)"))
+                    .font(egui::FontId::proportional(12.5)),
+            );
+            if r.changed() {
+                buf.set_text(text);
+            }
+            // Enter 送信。lost_focus + Enter は egui の定石 (IME 確定と両立する)。
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                press = ComposerPress::Send;
+            }
+            if r.has_focus() {
+                let mac = on_mac();
+                let chord = ui.input_mut(|i| {
+                    let mut hit = false;
+                    i.events.retain(|e| {
+                        if let egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } = e
+                        {
+                            if is_send_chord(mac, modifiers, *key) {
+                                hit = true;
+                                return false;
+                            }
+                        }
+                        true
+                    });
+                    hit
+                });
+                if chord {
+                    press = ComposerPress::Send;
+                }
+            }
+
+            let can_send = !buf.text().trim().is_empty();
+            if ui
+                .add_enabled(can_send, egui::Button::new(tr("送信")).small())
+                .clicked()
+            {
+                press = ComposerPress::Send;
+            }
+            if ui
+                .small_button("⤢")
+                .on_hover_text(tr("複数行の入力欄を開く"))
+                .clicked()
+            {
+                *expand = true;
+            }
+
+            act = composer_action(buf, press);
+        },
+    );
+    act
+}
+
+/// **宛先チップの並び** — 入力欄の**下**に横一列で置く。
+///
+/// エージェントが増えたらチップが増えるだけなので、選ぶのに 1 行しか使わない
+/// (旧実装は入力欄の**上**に「送信先 …」の帯を専有していた)。幅に入らない
+/// ぶんは**横スクロール**へ逃がす — 折り返しで背が伸びるのも、右端で見切れる
+/// のも避けるため。
+///
+/// `targets` は `(セッション ID, 表示名)`。並び順はそのまま出す。
+pub fn composer_target_chips(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    buf: &mut AgentInputBuffer,
+    targets: &[(u64, String)],
+) {
+    egui::ScrollArea::horizontal()
+        .id_salt("agent_composer_targets")
+        .auto_shrink([false, true])
+        .max_width(ui.available_width())
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::XS + 2.0;
+                let bsel = buf.target().is_broadcast();
+                let btxt = RichText::new(tr("📢 全員"))
+                    .size(11.5)
+                    .color(if bsel { theme.warn } else { theme.text_dim });
+                if ui
+                    .selectable_label(bsel, btxt)
+                    .on_hover_text(tr("起動中のすべてのエージェントへ送ります"))
+                    .clicked()
+                {
+                    buf.pin_broadcast(true);
+                    buf.set_target(ComposerTarget::Broadcast);
+                }
+                for (id, label) in targets {
+                    let sel = buf.target() == ComposerTarget::Agent(*id);
+                    let txt = RichText::new(label)
+                        .size(11.5)
+                        .color(if sel { theme.accent } else { theme.text_dim });
+                    if ui
+                        .selectable_label(sel, txt)
+                        .on_hover_text(label)
+                        .clicked()
+                    {
+                        buf.pin_broadcast(false);
+                        buf.set_target(ComposerTarget::Agent(*id));
+                    }
+                }
+                let others = buf.pending_draft_count();
+                if others > 0 {
+                    ui.label(
+                        RichText::new(trf("他 {n} 件の下書き", &[("n", others.to_string())]))
+                            .color(theme.text_dim)
+                            .size(10.5),
+                    );
+                }
+            });
+        });
+}
+
 pub fn agent_composer_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     buf: &mut AgentInputBuffer,
     target: Option<(u64, &str)>,
+    targets: &[(u64, String)],
+) -> ComposerAction {
+    let mut ignored = true;
+    agent_composer_expanded_ui(ui, theme, buf, target, targets, &mut ignored)
+}
+
+/// 複数行フォーム。`expand` を false にすると呼び出し側が 1 行帯へ畳む。
+pub fn agent_composer_expanded_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    buf: &mut AgentInputBuffer,
+    target: Option<(u64, &str)>,
+    targets: &[(u64, String)],
+    expand: &mut bool,
 ) -> ComposerAction {
     // 宛先をアクティブなエージェントに追従させる
     buf.sync_target(target.map(|(id, _)| id));
@@ -1154,51 +1471,10 @@ pub fn agent_composer_ui(
         });
     }
 
-    // ── 宛先セレクタ ──────────────────────────────────────────
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        ui.label(RichText::new(tr("送信先")).color(theme.text_dim).size(11.0));
-
-        if let Some((id, label)) = target {
-            let sel = buf.target() == ComposerTarget::Agent(id);
-            let txt = RichText::new(format!("▸ {label}"))
-                .size(11.5)
-                .color(if sel { theme.accent } else { theme.text_dim });
-            if ui.selectable_label(sel, txt).clicked() {
-                buf.pin_broadcast(false);
-                buf.set_target(ComposerTarget::Agent(id));
-            }
-        }
-
-        let bsel = buf.target().is_broadcast();
-        let btxt = RichText::new(tr("📢 全エージェント"))
-            .size(11.5)
-            .color(if bsel { theme.warn } else { theme.text_dim });
-        if ui.selectable_label(bsel, btxt).clicked() {
-            buf.pin_broadcast(true);
-            buf.set_target(ComposerTarget::Broadcast);
-        }
-
-        let others = buf.pending_draft_count();
-        if others > 0 {
-            ui.label(
-                RichText::new(trf("他 {n} 件の下書き", &[("n", others.to_string())]))
-                    .color(theme.text_dim)
-                    .size(10.5),
-            );
-        }
-    });
-
-    if buf.target().is_broadcast() && target.is_some() {
-        // 誤爆が一番痛いので、全員宛てのときだけ明示的に注意を出す
-        ui.label(
-            RichText::new(tr("⚠ 起動中のすべてのエージェントへ送られます"))
-                .color(theme.warn)
-                .size(10.5),
-        );
-    }
-
     // ── 本文 (長い貼り付けは畳む) ─────────────────────────────
+    // **宛先セレクタは入力欄の下**へ移した (下の「カウンタ + 宛先」行)。
+    // 上に置くと、エージェントが増えるたびに入力欄の上へ 1 行専有し、
+    // 「書く場所」が下へ押し下げられていた。
     let long = should_collapse(buf.text());
     let collapse_id = ui.make_persistent_id(("agent_composer_collapsed", buf.target()));
     let mut collapsed = long && ui.memory(|m| m.data.get_temp::<bool>(collapse_id).unwrap_or(true));
@@ -1242,6 +1518,17 @@ pub fn agent_composer_ui(
         }
     }
 
+    // ── 宛先チップ (入力欄の**下**) ───────────────────────────
+    composer_target_chips(ui, theme, buf, targets);
+    if buf.target().is_broadcast() && !targets.is_empty() {
+        // 誤爆が一番痛いので、全員宛てのときだけ明示的に注意を出す
+        ui.label(
+            RichText::new(tr("⚠ 起動中のすべてのエージェントへ送られます"))
+                .color(theme.warn)
+                .size(10.5),
+        );
+    }
+
     // ── カウンタ + ボタン ─────────────────────────────────────
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
@@ -1268,6 +1555,13 @@ pub fn agent_composer_ui(
         }
         if ui.small_button(tr("閉じる")).clicked() {
             press = ComposerPress::Cancel;
+        }
+        if ui
+            .small_button("⤡")
+            .on_hover_text(tr("1 行の入力欄に畳む (下書きは残ります)"))
+            .clicked()
+        {
+            *expand = false;
         }
     });
 
@@ -2174,8 +2468,11 @@ mod tests {
     /// (PTY への送信も config への保存も app.rs 側の仕事)
     #[test]
     fn 承認パネルは副作用を持たない() {
-        let src = include_str!("panels.rs");
-        let body = src.split("pub fn approvals_ui(").nth(1).expect("パネルがある");
+        let src = &include_str!("panels.rs").replace("\r\n", "\n");
+        let body = src
+            .split("pub fn approvals_ui(")
+            .nth(1)
+            .expect("パネルがある");
         let head = &body[..body.find("\n/// ").unwrap_or(body.len())];
         for forbidden in ["std::fs::", "send_text", "read_audit_tail", "save_state"] {
             assert!(
@@ -2190,8 +2487,11 @@ mod tests {
     /// エディタで「y」と打っただけで承認が飛ぶ、という事故の歯止め。
     #[test]
     fn 入力中は承認キーを拾わない() {
-        let src = include_str!("panels.rs");
-        let body = src.split("pub fn approvals_ui(").nth(1).expect("パネルがある");
+        let src = &include_str!("panels.rs").replace("\r\n", "\n");
+        let body = src
+            .split("pub fn approvals_ui(")
+            .nth(1)
+            .expect("パネルがある");
         let head = &body[..body.find("\n/// ").unwrap_or(body.len())];
         assert!(
             head.contains("let typing = ui.ctx().memory(|m| m.focused().is_some());"),

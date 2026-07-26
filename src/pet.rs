@@ -5,7 +5,7 @@
 //! 見た目はブロック調(サーモン色)のほか、Crab/Cat/Cloud(pet_variants)と
 //! ユーザー画像に差し替え可能。
 
-use eframe::egui::{self, Align2, Color32, Pos2, Rect, TextureHandle, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, TextureHandle, Vec2};
 
 use crate::theme::Theme;
 
@@ -151,6 +151,41 @@ pub struct PetResponse {
 const BOX_W: f32 = 66.0;
 const BOX_H: f32 = 62.0;
 
+/// 画面端との最小すき間 (ペットの拡大率に比例)。
+///
+/// ボックスの外へ数 px はみ出す部位 (耳・そわそわの横揺れ・影) があるので、
+/// 枠ぴったりに寄せると絵が切れる。`space::SM` 相当を基準にして倍率を掛ける。
+const EDGE_MARGIN: f32 = crate::panels::space::SM;
+
+/// 右下アンカー時の既定オフセット (右へ `-x`、下へ `-y`)。
+const ANCHOR_X: f32 = 24.0;
+const ANCHOR_Y: f32 = 30.0;
+
+/// **ペットの描画枠を求める純関数。**
+///
+/// `want` が `Some` ならその左上を希望位置に、`None` なら右下アンカー
+/// (`roam_x` はうろうろの位相ぶんの左シフト、0 以上) を希望位置にする。
+///
+/// 返り値は**必ず** `viewport` を `margin` だけ内側へ狭めた矩形に収まる
+/// (ビューポートの方が狭ければ左上へ寄せる)。窓を縮めても、前回ドラッグした
+/// 位置を憶えていても、サブディスプレイから本ディスプレイへ移しても、
+/// ペットが画面外へ消えないための唯一の関門。
+pub fn pet_rect(viewport: Rect, size: Vec2, want: Option<Pos2>, roam_x: f32, margin: f32) -> Rect {
+    let desired = want.unwrap_or_else(|| {
+        egui::pos2(
+            viewport.right() - ANCHOR_X - roam_x.max(0.0) - size.x,
+            viewport.bottom() - ANCHOR_Y - size.y,
+        )
+    });
+    // 収まる範囲。ビューポートが箱より狭いときは min > max になるので、
+    // 先に max を min 側へ丸めて「左上に寄せる」を選ぶ。
+    let min = viewport.min + Vec2::splat(margin);
+    let max_x = (viewport.right() - margin - size.x).max(min.x);
+    let max_y = (viewport.bottom() - margin - size.y).max(min.y);
+    let p = egui::pos2(desired.x.clamp(min.x, max_x), desired.y.clamp(min.y, max_y));
+    Rect::from_min_size(p, size)
+}
+
 // ── 睡眠/リアクションの時間定数(秒)──
 const DOZE_AFTER: f64 = 20.0;
 const SLEEP_AFTER: f64 = 60.0;
@@ -265,22 +300,28 @@ pub fn draw(
     let flip_x = rt.flip_x;
 
     // ── 配置: Some = 固定位置 / None = 右下アンカー(free_roam で位相うろうろ)──
+    //
+    // **`Area::anchor` は使わない。** アンカーは egui 内部で画面矩形から解決
+    // されるので、こちら側でクランプが効かず、窓を縮めた瞬間にペットが端から
+    // はみ出す。位置は毎フレーム [`pet_rect`] で自前に決めてビューポート内へ
+    // 収め、`current_pos` で渡す (ドラッグで憶えた位置も同じ関門を通る)。
     let box_size = egui::vec2(BOX_W * scale, BOX_H * scale);
-    let id = egui::Id::new("zv-pet");
-    let area = match *pos {
-        Some(p) => egui::Area::new(id).order(egui::Order::Foreground).current_pos(p),
-        None => {
-            let x_off = if input.free_roam {
-                -(24.0 + ((rt.roam_phase.sin() as f32) * 0.5 + 0.5) * 130.0)
-            } else {
-                // free_roam OFF: 定位置でそっと弾むだけ
-                -90.0
-            };
-            egui::Area::new(id)
-                .order(egui::Order::Foreground)
-                .anchor(Align2::RIGHT_BOTTOM, egui::vec2(x_off, -30.0))
-        }
+    let roam_x = if input.free_roam {
+        ((rt.roam_phase.sin() as f32) * 0.5 + 0.5) * 130.0 * scale
+    } else {
+        // free_roam OFF: 定位置でそっと弾むだけ
+        66.0 * scale
     };
+    let viewport = ctx.screen_rect();
+    let placed = pet_rect(viewport, box_size, *pos, roam_x, EDGE_MARGIN * scale);
+    // 憶えている位置も画面内へ引き戻す (窓を縮めたまま次回起動しても迷子にしない)。
+    if pos.is_some() {
+        *pos = Some(placed.min);
+    }
+    let id = egui::Id::new("zv-pet");
+    let area = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .current_pos(placed.min);
 
     let inner = area
         .show(ctx, |ui| {
@@ -894,5 +935,113 @@ mod tests {
         let doze = repaint_ms(PetState::Dozing, true).expect("Dozing は動く");
         let idle = repaint_ms(PetState::Idle, true).expect("Idle は動く");
         assert!(doze > idle, "Dozing {doze}ms は Idle {idle}ms より粗いはず");
+    }
+}
+
+/// ペットの配置 (画面外へ出さない)。
+///
+/// 実際に起きていた不具合: 右下アンカーのまま窓を狭めると、ペットが右端で
+/// 半分切れる。ドラッグして憶えた位置は、次に狭い窓で開くと完全に画面外へ出る。
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    /// 代表的なビューポート (狭い / 普通 / 広い / 箱より小さい)。
+    fn viewports() -> Vec<Rect> {
+        [
+            (900.0_f32, 700.0_f32),
+            (1400.0, 900.0),
+            (1720.0, 1148.0),
+            (2560.0, 1440.0),
+            (320.0, 240.0),
+            // 箱 (66x62) より小さい極端な窓
+            (50.0, 40.0),
+        ]
+        .into_iter()
+        .map(|(w, h)| Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h)))
+        .collect()
+    }
+
+    /// どの倍率・どの位置指定でも、ペットの矩形はビューポートの中に入る。
+    #[test]
+    fn ペットは常にビューポート内に収まる() {
+        for vp in viewports() {
+            for scale in [0.25_f32, 1.0, 2.0, 4.0] {
+                let size = egui::vec2(BOX_W * scale, BOX_H * scale);
+                let margin = EDGE_MARGIN * scale;
+                // 憶えている位置の候補: 画面内 / 右外 / 下外 / 左上外 / 遠方
+                let wants = [
+                    None,
+                    Some(egui::pos2(10.0, 10.0)),
+                    Some(egui::pos2(vp.right() + 500.0, vp.bottom() + 500.0)),
+                    Some(egui::pos2(-800.0, -800.0)),
+                    Some(egui::pos2(vp.right() - 1.0, vp.bottom() - 1.0)),
+                ];
+                for want in wants {
+                    for roam_x in [0.0_f32, 65.0, 130.0] {
+                        let r = pet_rect(vp, size, want, roam_x, margin);
+                        assert_eq!(r.size(), size, "箱の大きさは変えない");
+                        // 収まる余地があるときは、余白ぶんも含めて内側に居る。
+                        let fits = vp.width() >= size.x + margin * 2.0
+                            && vp.height() >= size.y + margin * 2.0;
+                        if fits {
+                            assert!(
+                                r.left() >= vp.left() + margin - 0.01
+                                    && r.right() <= vp.right() - margin + 0.01
+                                    && r.top() >= vp.top() + margin - 0.01
+                                    && r.bottom() <= vp.bottom() - margin + 0.01,
+                                "vp={vp:?} scale={scale} want={want:?}: {r:?} がはみ出した"
+                            );
+                        } else {
+                            // 箱の方が大きい窓では左上に寄せる (右下へ逃がさない)
+                            assert!(r.left() >= vp.left() - 0.01 && r.top() >= vp.top() - 0.01);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// アンカー既定は右下寄り。うろうろの位相ぶんだけ左へ動く。
+    #[test]
+    fn アンカーは右下でうろうろは左へ動く() {
+        let vp = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
+        let size = egui::vec2(BOX_W, BOX_H);
+        let a = pet_rect(vp, size, None, 0.0, EDGE_MARGIN);
+        let b = pet_rect(vp, size, None, 130.0, EDGE_MARGIN);
+        assert!(b.left() < a.left(), "うろうろで左へ動く");
+        assert!(a.right() < vp.right(), "右端に触れない");
+        assert!(a.bottom() < vp.bottom(), "下端に触れない");
+    }
+
+    /// 窓を狭めると、憶えている位置ごと画面内へ引き戻される。
+    #[test]
+    fn 狭い窓では憶えた位置ごと引き戻される() {
+        let wide = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        let size = egui::vec2(BOX_W, BOX_H);
+        // 広い窓の右下でドラッグして憶えた位置
+        let dragged = pet_rect(
+            wide,
+            size,
+            Some(egui::pos2(1500.0, 900.0)),
+            0.0,
+            EDGE_MARGIN,
+        )
+        .min;
+        let narrow = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0));
+        let r = pet_rect(narrow, size, Some(dragged), 0.0, EDGE_MARGIN);
+        assert!(r.right() <= narrow.right() - EDGE_MARGIN + 0.01, "{r:?}");
+        assert!(r.bottom() <= narrow.bottom() - EDGE_MARGIN + 0.01, "{r:?}");
+    }
+
+    /// 原点がずれたビューポート (マルチディスプレイ) でも中に入る。
+    #[test]
+    fn 原点がずれた画面でも中に入る() {
+        let vp = Rect::from_min_size(egui::pos2(-1920.0, 70.0), egui::vec2(1200.0, 800.0));
+        let size = egui::vec2(BOX_W, BOX_H);
+        let r = pet_rect(vp, size, None, 0.0, EDGE_MARGIN);
+        assert!(vp.contains_rect(r), "vp={vp:?} r={r:?}");
+        let r2 = pet_rect(vp, size, Some(egui::pos2(0.0, 0.0)), 0.0, EDGE_MARGIN);
+        assert!(vp.contains_rect(r2), "vp={vp:?} r2={r2:?}");
     }
 }

@@ -893,7 +893,7 @@ mod tests {
     /// これが消えると Windows で「Zaivern」検索が効かなくなる。
     #[test]
     fn windows_version_resource_declares_expected_fields() {
-        let src = include_str!("../build.rs");
+        let src = &include_str!("../build.rs").replace("\r\n", "\n");
         for needle in [
             r#"("FileDescription", "Zaivern Code")"#,
             r#"("ProductName", "Zaivern Code")"#,

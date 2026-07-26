@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 
-use eframe::egui::{self, Color32, Pos2, RichText, Stroke};
+use eframe::egui::{self, Color32, Pos2, Rect, RichText, Stroke};
 
 use crate::i18n::{tr, trf};
 use crate::supervisor;
@@ -764,17 +764,287 @@ impl LayoutMode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 幾何 (純関数)
+//
+// 「割り当てられた領域に必ず収まる」ことを egui を起こさずに固定するため、
+// 寸法の判断だけをここへ切り出してある。ここが崩れると、レーンやライブペインが
+// 右端から落ちて読めなくなる (実際に起きた)。間隔は panels::space の一本の
+// 目盛りだけを使う。
+// ---------------------------------------------------------------------------
+
+use crate::panels::space;
+
+/// レーン 1 本を読める最小幅 (カードのタイトルと状態文が入る)。
+pub const LANE_MIN_W: f32 = 150.0;
+/// レーンを読める幅で描ける上限 (広い窓で間延びさせない)。
+pub const LANE_MAX_W: f32 = 300.0;
+/// 空レーンを畳んだときの幅 (見出しの帯だけ)。
+pub const LANE_EMPTY_W: f32 = 96.0;
+/// 横モードを選ぶのに要る看板の幅。これを割ると縦モードへ落とす。
+pub const BOARD_MIN_W: f32 = 900.0;
+/// 右のアクティビティフィードの幅。
+pub const FEED_W: f32 = 240.0;
+/// 左レールの幅。
+pub const RAIL_W: f32 = 210.0;
+/// 分割バーの太さ。
+pub const SPLIT_BAR: f32 = 4.0;
+
+/// ライブペインを開いたときに看板へ残る幅 (**純関数**)。
+///
+/// `split` はライブペインの取り分 (0.2..0.7)。飾り (レール・フィード) は
+/// [`main_rects`] が同じ規則で外すので、ここでは看板とライブの取り合いだけ見る。
+pub fn board_width(avail_w: f32, live_open: bool, split: f32) -> f32 {
+    if !live_open {
+        return avail_w.max(0.0);
+    }
+    let live = (avail_w * split.clamp(0.2, 0.7)).clamp(240.0_f32.min(avail_w), avail_w * 0.7);
+    (avail_w - live - space::SM * 2.0 - SPLIT_BAR).max(0.0)
+}
+
 /// 縦モードで描くべきか (**純関数**)。
 ///
-/// 自動判定: 8 レーンを横に並べると 1 レーン ~150px 必要なので、
-/// 幅が足りない (< 900px) か、縦長 (高さが幅の 0.95 倍超) なら縦に積む。
-/// 縦モードはレーン帯 + 全幅カードなので、細長い窓でも 1 行に情報が収まる。
-pub fn use_vertical(mode: LayoutMode, w: f32, h: f32) -> bool {
+/// 自動判定: 8 レーンを横に並べると 1 レーン [`LANE_MIN_W`] 必要なので、
+/// **看板に残る幅**が足りないか、縦長 (高さが幅の 0.95 倍超) なら縦に積む。
+///
+/// ライブペインを開くと看板の取り分はその 6 割前後まで落ちるので、
+/// 同じ窓でも縦へ切り替わる — これが「端末を出したらレーンが画面外へ落ちる」
+/// を防ぐ唯一の仕掛け。飾りを畳むだけでは足りない。
+pub fn use_vertical(mode: LayoutMode, w: f32, h: f32, live_open: bool, split: f32) -> bool {
     match mode {
         LayoutMode::Horizontal => false,
         LayoutMode::Vertical => true,
-        LayoutMode::Auto => w < 900.0 || h > w * 0.95,
+        LayoutMode::Auto => board_width(w, live_open, split) < BOARD_MIN_W || h > w * 0.95,
     }
+}
+
+/// 主要域 (レール / 看板 / 分割バー / ライブ / フィード) の矩形。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MainRects {
+    pub rail: Option<Rect>,
+    pub board: Rect,
+    pub splitter: Option<Rect>,
+    pub live: Option<Rect>,
+    pub feed: Option<Rect>,
+}
+
+impl MainRects {
+    /// 看板だけを置いた状態 (飾りもライブペインも無し)。
+    fn only_board(board: Rect) -> Self {
+        Self {
+            rail: None,
+            board,
+            splitter: None,
+            live: None,
+            feed: None,
+        }
+    }
+}
+
+impl MainRects {
+    /// 実際に置いた矩形を順に返す (テスト用)。
+    pub fn all(&self) -> Vec<Rect> {
+        [
+            self.rail,
+            Some(self.board),
+            self.splitter,
+            self.live,
+            self.feed,
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// **主要域の割り付け** (純関数)。
+///
+/// 不変条件 (テストで固定):
+/// - すべての矩形は `area` の中
+/// - 矩形どうしは重ならない
+///
+/// 横モードは `[レール] 看板 [バー ライブ] [フィード]`、
+/// 縦モードは `看板` を上、`バー ライブ` を下へ積む。
+/// 飾り (レール・フィード) はライブペインを開いている間は畳む
+/// — 看板が主役の画面で、装飾に幅を食わせない。
+pub fn main_rects(area: Rect, vertical: bool, live_open: bool, split: f32) -> MainRects {
+    let frac = split.clamp(0.2, 0.7);
+    if vertical {
+        let live_h = if live_open {
+            (area.height() * frac).clamp(150.0_f32.min(area.height()), area.height() * 0.7)
+        } else {
+            0.0
+        };
+        let gap = if live_open {
+            space::SM * 2.0 + SPLIT_BAR
+        } else {
+            0.0
+        };
+        let board_h = (area.height() - live_h - gap).max(0.0);
+        let board = Rect::from_min_size(area.min, egui::vec2(area.width(), board_h));
+        if !live_open {
+            return MainRects::only_board(board);
+        }
+        let sy = board.bottom() + space::SM;
+        let splitter = Rect::from_min_size(
+            egui::pos2(area.left(), sy),
+            egui::vec2(area.width(), SPLIT_BAR),
+        );
+        let ly = splitter.bottom() + space::SM;
+        let live = Rect::from_min_max(
+            egui::pos2(area.left(), ly),
+            egui::pos2(area.right(), area.bottom()),
+        );
+        MainRects {
+            rail: None,
+            board,
+            splitter: Some(splitter),
+            live: Some(live),
+            feed: None,
+        }
+    } else {
+        // 飾りは「開いていないとき」かつ「十分広いとき」だけ。
+        let show_rail = !live_open && area.width() >= 1200.0;
+        let show_feed = !live_open && area.width() >= 1000.0;
+        let mut x = area.left();
+        let rail = show_rail.then(|| {
+            let r =
+                Rect::from_min_size(egui::pos2(x, area.top()), egui::vec2(RAIL_W, area.height()));
+            x = r.right() + space::SM;
+            r
+        });
+        let right = if show_feed {
+            area.right() - FEED_W - space::SM
+        } else {
+            area.right()
+        };
+        let feed = show_feed.then(|| {
+            Rect::from_min_max(
+                egui::pos2(area.right() - FEED_W, area.top()),
+                egui::pos2(area.right(), area.bottom()),
+            )
+        });
+        let rest = (right - x).max(0.0);
+        let live_w = if live_open {
+            (rest * frac).clamp(240.0_f32.min(rest), rest * 0.7)
+        } else {
+            0.0
+        };
+        let gap = if live_open {
+            space::SM * 2.0 + SPLIT_BAR
+        } else {
+            0.0
+        };
+        let board_w = (rest - live_w - gap).max(0.0);
+        let board = Rect::from_min_size(
+            egui::pos2(x, area.top()),
+            egui::vec2(board_w, area.height()),
+        );
+        if !live_open {
+            return MainRects {
+                rail,
+                board,
+                splitter: None,
+                live: None,
+                feed,
+            };
+        }
+        let sx = board.right() + space::SM;
+        let splitter = Rect::from_min_size(
+            egui::pos2(sx, area.top()),
+            egui::vec2(SPLIT_BAR, area.height()),
+        );
+        let live = Rect::from_min_max(
+            egui::pos2(splitter.right() + space::SM, area.top()),
+            egui::pos2(right, area.bottom()),
+        );
+        MainRects {
+            rail,
+            board,
+            splitter: Some(splitter),
+            live: Some(live),
+            feed,
+        }
+    }
+}
+
+/// **レーン幅の割り付け** (純関数)。
+///
+/// 空のレーンは見出しの帯だけに畳んで [`LANE_EMPTY_W`] に固定し、浮いた幅を
+/// 中身のあるレーンへ配る。8 本すべてを均等に割ると 1 本 90px を切って
+/// カードが読めなくなり、下限で止めると右端の 2〜3 本が画面外へ落ちていた。
+///
+/// 不変条件: 返す幅の総和 (+ レーン間の間隔) は `avail` を超えない
+/// — ただし空レーンだけでも入らないほど狭い窓では、横スクロールに任せる
+/// (それ以上潰すと帯の文字が読めないため)。
+pub fn lane_widths(avail: f32, counts: &[usize]) -> Vec<f32> {
+    let n = counts.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let gaps = space::SM * (n as f32 - 1.0);
+    let full = counts.iter().filter(|c| **c > 0).count();
+    let empty = n - full;
+    let usable = (avail - gaps).max(0.0);
+    if full == 0 {
+        // 全部空 = 帯だけ。均等に割って (上限 LANE_EMPTY_W) 収める。
+        let w = (usable / n as f32).min(LANE_EMPTY_W).max(1.0);
+        return vec![w; n];
+    }
+    // 空レーンは帯の幅で固定。極端に狭い窓では均等割りまで縮める。
+    let empty_w = LANE_EMPTY_W.min((usable / n as f32).max(1.0));
+    let left = (usable - empty_w * empty as f32).max(0.0);
+    let full_w = (left / full as f32).clamp(LANE_MIN_W, LANE_MAX_W);
+    counts
+        .iter()
+        .map(|c| if *c > 0 { full_w } else { empty_w })
+        .collect()
+}
+
+/// 見出し行を「アイコンだけ」に縮退させる幅のしきい値。
+pub const HEADER_COMPACT_W: f32 = 1000.0;
+
+/// 見出し行を縮退させるか (純関数)。
+///
+/// 狭い窓でラベル付きのまま並べると、右端の「＋ Agent」「✕ 閉じる」が
+/// 画面外へ押し出されて押せなくなる。
+pub fn header_compact(avail_w: f32) -> bool {
+    avail_w < HEADER_COMPACT_W
+}
+
+/// ブロードキャスト入力欄の幅 (純関数)。
+///
+/// 残り幅から取り、入り切らないときは 0 (= 欄を出さない。📣 ボタンは残るので
+/// 機能は失われない)。固定 220px だと狭い窓で右端が切れていた。
+pub fn broadcast_input_width(remaining: f32) -> f32 {
+    const MIN: f32 = 120.0;
+    const MAX: f32 = 260.0;
+    // 「連続稼働 …」など残りの表示にも席を残す
+    let usable = remaining - space::SM * 2.0;
+    if usable < MIN {
+        0.0
+    } else {
+        usable.min(MAX)
+    }
+}
+
+/// **KPI タイルの段組み** (純関数)。返り値は `(列数, タイル幅)`。
+///
+/// 狭い窓で幅を下限で止めると右端のタイル (「完了・終了」) が画面外へ落ちる。
+/// 落とすくらいなら 2 段に折る。
+pub fn kpi_grid(avail: f32, n: usize) -> (usize, f32) {
+    const MIN_W: f32 = 120.0;
+    let n = n.max(1);
+    let mut cols = n;
+    while cols > 1 {
+        let w = (avail - space::SM * (cols as f32 - 1.0)) / cols as f32;
+        if w >= MIN_W {
+            break;
+        }
+        cols -= 1;
+    }
+    let w = ((avail - space::SM * (cols as f32 - 1.0)) / cols as f32).max(1.0);
+    (cols, w)
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,10 +1294,17 @@ pub struct KanbanState {
     selected: Option<u64>,
     /// 選択カードが最後に居た並び順の位置 (消えたときの寄せ先)
     sel_pos: usize,
-    /// ライブペインを**閉じている**か (既定は開く = 選んだら中身が見える)
-    live_closed: bool,
+    /// ライブペイン (端末) を**開いている**か。
+    ///
+    /// 既定は閉じる。以前は「選択があれば開く」だったので、看板から 1 体
+    /// 起動しただけで端末が半分の幅を占め、レーンが画面外へ落ちていた
+    /// (「起動したら画面が組み替わってどこを見ればいいか分からない」)。
+    /// 開くのは**明示的な操作のときだけ** — Enter / 👁 / カードのダブルクリック。
+    live_open: bool,
     /// 次のフレームでライブペインへフォーカスを移す (Enter)
     live_focus_req: bool,
+    /// 新しく現れたカードへスクロールして知らせる (起動直後の 1 フレーム)
+    scroll_to_sel: bool,
     /// 前フレームのライブペインの egui Id (Esc を board へ返すために覚える)
     live_id: Option<egui::Id>,
     /// レイアウト (None = 永続メモリから未読込)
@@ -1118,6 +1395,14 @@ impl KanbanState {
                 }
             };
 
+            // 初めて見るカード = いま起動したエージェント。
+            // **画面は組み替えず**、選択とスクロールだけで「これが始まった」を示す。
+            // (端末を勝手に開くと看板が半分に潰れ、どこを見ればよいか分からなくなる)
+            let fresh_card = !self.tracks.contains_key(&c.id);
+            if fresh_card {
+                self.selected = Some(c.id);
+                self.scroll_to_sel = true;
+            }
             let track = self
                 .tracks
                 .entry(c.id)
@@ -1347,9 +1632,13 @@ pub fn ui(
             ui.set_min_height(ui.available_height());
             let wide = ui.available_width();
             let tall = ui.available_height();
-            let vertical = use_vertical(st.layout.unwrap_or_default(), wide, tall);
+            let split = st.split.unwrap_or(0.38);
+            // ライブペインの開閉は**見せ方そのもの**を変える (開いていれば看板の
+            // 取り分が減るので縦モードへ落とす)。判定は純関数側で一元化する。
+            let live_on = st.live_open && !cards.is_empty();
+            let vertical = use_vertical(st.layout.unwrap_or_default(), wide, tall, live_on, split);
             let show_kpi = tall >= 360.0;
-            let show_chart = !vertical && tall >= 470.0;
+            let show_chart = !vertical && !live_on && tall >= 470.0;
 
             header_ui(st, ui, theme, &t, presets, now_ms, vertical, &mut acts);
 
@@ -1375,94 +1664,88 @@ pub fn ui(
 
             if show_kpi {
                 kpi_ui(ui, theme, st, &t);
-                ui.add_space(8.0);
+                ui.add_space(space::SM);
             }
 
-            let chart_h = if show_chart { 96.0 } else { 0.0 };
-            let main_h = (ui.available_height() - chart_h - if show_chart { 8.0 } else { 0.0 })
-                .max(160.0);
-
-            let live_on = !st.live_closed && selected.is_some();
-            // 飾り (左レール / 右フィード) は看板の幅を食う。ライブペインを
-            // 開いているときは看板が主役なので、よほど広くない限り畳む。
-            // 左レールは看板と情報が重なるので、畳む優先度が高い。
-            let show_rail = !vertical && wide >= if live_on { 1800.0 } else { 1200.0 };
-            let show_feed = !vertical && wide >= if live_on { 1450.0 } else { 1000.0 };
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), main_h),
-                if vertical {
-                    egui::Layout::top_down(egui::Align::Min)
-                } else {
-                    egui::Layout::left_to_right(egui::Align::Min)
-                },
-                |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    if vertical {
-                        // 縦モード: 看板 (上) / ライブペイン (下)。
-                        let frac = st.split.unwrap_or(0.38);
-                        let live_h = if live_on {
-                            (main_h * frac).clamp(150.0, main_h * 0.7)
-                        } else {
-                            0.0
-                        };
-                        // 8(間隔) + 4(バー) + 8(間隔) を引いてから看板へ渡す
-                        let board_h = (main_h - live_h - if live_on { 20.0 } else { 0.0 }).max(120.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), board_h),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                board_vertical_ui(
-                                    st, ui, theme, cards, &lanes, board_h, now_ms, &mut acts,
-                                );
-                            },
-                        );
-                        if live_on {
-                            splitter_ui(st, ui, theme, false, main_h);
-                            live_pane_ui(
-                                st, ui, theme, cards, &lanes, selected, live_h, now_ms, live,
-                                &mut acts,
-                            );
-                        }
-                    } else {
-                        // 横モード: レール / 看板 / ライブペイン / フィード
-                        if show_rail {
-                            rail_ui(st, ui, theme, cards, &lanes, main_h, now_ms, &mut acts);
-                        }
-                        let feed_w = if show_feed { 240.0 } else { 0.0 };
-                        let rest = (ui.available_width() - if show_feed { feed_w + 8.0 } else { 0.0 })
-                            .max(200.0);
-                        let frac = st.split.unwrap_or(0.38);
-                        let live_w = if live_on {
-                            (rest * frac).clamp(240.0, rest * 0.7)
-                        } else {
-                            0.0
-                        };
-                        let board_w = (rest - live_w - if live_on { 20.0 } else { 0.0 }).max(180.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(board_w, main_h),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                board_ui(
-                                    st, ui, theme, cards, &lanes, main_h, now_ms, &mut acts,
-                                );
-                            },
-                        );
-                        if live_on {
-                            splitter_ui(st, ui, theme, true, rest);
-                            live_pane_ui(
-                                st, ui, theme, cards, &lanes, selected, main_h, now_ms, live,
-                                &mut acts,
-                            );
-                        }
-                        if show_feed {
-                            feed_ui(ui, theme, activity, feed_w, main_h, now_ms);
-                        }
-                    }
-                },
+            let chart_h = if show_chart { 96.0 + space::SM } else { 0.0 };
+            let area = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+            let main = Rect::from_min_max(
+                area.min,
+                egui::pos2(area.right(), (area.bottom() - chart_h).max(area.top())),
             );
+            // **矩形はすべて純関数が決める** (main_rects)。egui のレイアウトに
+            // 引き算を任せると、飾りの幅ぶんライブペインが右へはみ出して
+            // 端末の行が切れる (実際に起きた)。
+            let r = main_rects(main, vertical, live_on, split);
+            let main_h = main.height();
+
+            if let Some(rr) = r.rail {
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rr), |ui| {
+                    rail_ui(st, ui, theme, cards, &lanes, rr.height(), now_ms, &mut acts);
+                });
+            }
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(r.board), |ui| {
+                if vertical {
+                    board_vertical_ui(
+                        st,
+                        ui,
+                        theme,
+                        cards,
+                        &lanes,
+                        r.board.height(),
+                        now_ms,
+                        &mut acts,
+                    );
+                } else {
+                    board_ui(
+                        st,
+                        ui,
+                        theme,
+                        cards,
+                        &lanes,
+                        r.board.height(),
+                        now_ms,
+                        &mut acts,
+                    );
+                }
+            });
+            if let Some(sr) = r.splitter {
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(sr), |ui| {
+                    splitter_ui(
+                        st,
+                        ui,
+                        theme,
+                        !vertical,
+                        if vertical { main_h } else { main.width() },
+                    );
+                });
+            }
+            if let Some(lr) = r.live {
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(lr), |ui| {
+                    live_pane_ui(
+                        st,
+                        ui,
+                        theme,
+                        cards,
+                        &lanes,
+                        selected,
+                        lr.size(),
+                        now_ms,
+                        live,
+                        &mut acts,
+                    );
+                });
+            }
+            if let Some(fr) = r.feed {
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(fr), |ui| {
+                    feed_ui(ui, theme, activity, fr.width(), fr.height(), now_ms);
+                });
+            }
+            // 割り当てた領域を消費して、下のチャートを主要域の下から描く。
+            ui.advance_cursor_after_rect(main);
 
             if show_chart {
-                ui.add_space(8.0);
+                ui.add_space(space::SM);
                 chart_ui(ui, theme, st);
             }
         });
@@ -1506,15 +1789,18 @@ fn keyboard_ui(
     let delta = i32::from(down) - i32::from(up);
     if delta != 0 {
         if let Some(id) = move_selection(order, st.selected, delta) {
+            // 選択の移動では**ライブペインを開かない**。開くと画面が組み替わり、
+            // 上下キーで見比べているあいだ看板がずっと半分に潰れる。
             st.selected = Some(id);
-            st.live_closed = false;
+            st.scroll_to_sel = true;
             if let Some(c) = cards.iter().find(|c| c.id == id) {
                 acts.push(KanbanAction::Select(c.idx));
             }
         }
     }
+    // Enter = 「この端末を開いて入力する」という明示的な操作。ここだけが開く。
     if enter && st.selected.is_some() {
-        st.live_closed = false;
+        st.live_open = true;
         st.live_focus_req = true;
     }
 }
@@ -1557,7 +1843,7 @@ fn live_pane_ui(
     cards: &[Card],
     lanes: &[Column],
     selected: Option<u64>,
-    height: f32,
+    size: egui::Vec2,
     now_ms: u64,
     live: LiveDraw<'_>,
     acts: &mut Vec<KanbanAction>,
@@ -1568,7 +1854,9 @@ fn live_pane_ui(
     };
     let lane = lanes.get(i).copied().unwrap_or(c.column);
     let color = lane.color(theme);
-    let w = ui.available_width();
+    // 幅は**呼び出し側が決めた割り当て**をそのまま使う。`available_width` を
+    // 見ると飾りの取り分まで飲み込んで右へはみ出す (端末の行が切れる)。
+    let (w, height) = (size.x, size.y);
     ui.allocate_ui_with_layout(
         egui::vec2(w, height),
         egui::Layout::top_down(egui::Align::Min),
@@ -1577,10 +1865,10 @@ fn live_pane_ui(
                 .fill(theme.panel)
                 .stroke(Stroke::new(1.0_f32, theme.accent))
                 .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::same(8.0))
+                .inner_margin(egui::Margin::same(space::SM))
                 .show(ui, |ui| {
-                    ui.set_width(w - 16.0);
-                    ui.set_min_height(height - 16.0);
+                    ui.set_width(w - space::SM * 2.0);
+                    ui.set_min_height(height - space::SM * 2.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("●").size(10.0).color(color));
                         ui.add(
@@ -1601,7 +1889,7 @@ fn live_pane_ui(
                                 .on_hover_text(tr("ライブ表示を閉じる"))
                                 .clicked()
                             {
-                                st.live_closed = true;
+                                st.live_open = false;
                             }
                             if ui
                                 .small_button("🔍")
@@ -1683,21 +1971,26 @@ fn header_ui(
     vertical: bool,
     acts: &mut Vec<KanbanAction>,
 ) {
+    // 狭い窓では文字を落としてアイコンだけにする。右端でボタンが切れて
+    // 押せなくなる (「＋ Agent」「✕ 閉じる」が見えない) のを防ぐ。
+    let compact = header_compact(ui.available_width());
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("📋 FLEET KANBAN")
-                .size(17.0)
+            RichText::new(if compact { "📋" } else { "📋 FLEET KANBAN" })
+                .size(if compact { 15.0 } else { 17.0 })
                 .strong()
                 .color(theme.text),
         )
         .on_hover_text(tr(
             "カードは状態が変わると自動でレーンを移動します — ドラッグは不要です",
         ));
-        ui.label(
-            RichText::new("Autonomous Ops Console")
-                .size(11.0)
-                .color(theme.text_dim),
-        );
+        if !compact {
+            ui.label(
+                RichText::new("Autonomous Ops Console")
+                    .size(11.0)
+                    .color(theme.text_dim),
+            );
+        }
         chip(
             ui,
             theme.ok,
@@ -1743,7 +2036,12 @@ fn header_ui(
                 LayoutMode::Horizontal => "▤",
                 LayoutMode::Vertical => "▥",
             };
-            ui.menu_button(format!("{icon} {}", tr(mode.label())), |ui| {
+            let mode_label = if compact {
+                icon.to_string()
+            } else {
+                format!("{icon} {}", tr(mode.label()))
+            };
+            ui.menu_button(mode_label, |ui| {
                 for m in [
                     LayoutMode::Auto,
                     LayoutMode::Horizontal,
@@ -1763,28 +2061,39 @@ fn header_ui(
                 tr("いまは横モード — レーンを横に並べます")
             });
             if ui
-                .button("🎛 Cockpit")
+                .button(if compact { "🎛" } else { "🎛 Cockpit" })
                 .on_hover_text(tr("Cockpit へ切替"))
                 .clicked()
             {
                 acts.push(KanbanAction::OpenCockpit);
             }
-            ui.menu_button("＋ Agent", |ui| {
+            ui.menu_button(if compact { "＋" } else { "＋ Agent" }, |ui| {
                 for (i, (icon, name)) in presets.iter().enumerate() {
                     if ui.button(format!("{icon} {name}")).clicked() {
                         acts.push(KanbanAction::Launch(i));
                         ui.close_menu();
                     }
                 }
+            })
+            .response
+            .on_hover_text(tr("エージェントを起動"));
+            let send = ui
+                .button(if compact { "📣" } else { "📣 送信" })
+                .on_hover_text(tr("全エージェントへブロードキャスト"));
+            // 入力欄は**残り幅から**取る。固定 220px だと右端で切れて、
+            // 「連続稼働」やボタンが画面外へ落ちる。
+            let input_w = broadcast_input_width(ui.available_width());
+            let input = (input_w > 0.0).then(|| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut st.broadcast_input)
+                        .id(egui::Id::new("kanban-broadcast-input"))
+                        .desired_width(input_w)
+                        .hint_text(tr("全エージェントへブロードキャスト…")),
+                )
             });
-            let send = ui.button(tr("📣 送信"));
-            let input = ui.add(
-                egui::TextEdit::singleline(&mut st.broadcast_input)
-                    .id(egui::Id::new("kanban-broadcast-input"))
-                    .desired_width(220.0)
-                    .hint_text(tr("全エージェントへブロードキャスト…")),
-            );
-            let enter = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let enter = input
+                .as_ref()
+                .is_some_and(|i| i.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if (send.clicked() || enter) && !st.broadcast_input.trim().is_empty() {
                 acts.push(KanbanAction::Broadcast(st.broadcast_input.trim().to_string()));
                 st.broadcast_input.clear();
@@ -1792,45 +2101,93 @@ fn header_ui(
             // Enter でフォーカスが外れるので戻し、連続入力できるようにする
             // (空入力の Enter でも戻す — 戻さないと入力欄が死んだように見える)
             if enter {
-                input.request_focus();
+                if let Some(i) = input.as_ref() {
+                    i.request_focus();
+                }
             }
-            ui.label(
-                RichText::new(trf("連続稼働 {t}", &[("t", fmt_uptime(now_ms))]))
-                    .size(11.0)
-                    .color(theme.text_dim),
-            );
+            if !compact {
+                ui.label(
+                    RichText::new(trf("連続稼働 {t}", &[("t", fmt_uptime(now_ms))]))
+                        .size(11.0)
+                        .color(theme.text_dim),
+                );
+            }
         });
     });
-    ui.add_space(8.0);
+    ui.add_space(space::SM);
 }
 
+/// 空状態 — **カード 1 枚を利用可能領域の中央に**。
+///
+/// 旧実装は可用高の 25% を上詰めしていたので、窓の高さが変わるたびに位置が
+/// 上下し、低い窓では起動ボタンが下端を突き抜けて押せなかった。
 fn empty_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     presets: &[(String, String)],
     acts: &mut Vec<KanbanAction>,
 ) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(ui.available_height() * 0.25);
-        ui.label(RichText::new("📋").size(52.0));
-        ui.label(
-            RichText::new(tr("エージェントがまだいません"))
-                .size(18.0)
-                .color(theme.text),
-        );
-        ui.label(
-            RichText::new(tr("プリセットから並列セッションを起動しましょう"))
-                .color(theme.text_dim),
-        );
-        ui.add_space(12.0);
-        for (i, (icon, name)) in presets.iter().enumerate() {
-            if ui
-                .add_sized([280.0, 34.0], egui::Button::new(format!("{icon} {name}")))
-                .clicked()
-            {
-                acts.push(KanbanAction::Launch(i));
-            }
-        }
+    // 見えている範囲で中央寄せする (clip_rect と交差させないと下へ突き抜ける)。
+    let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    let l = crate::panels::empty_card(avail, presets.len());
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(l.card), |ui| {
+        egui::Frame::none()
+            .fill(theme.panel)
+            .stroke(Stroke::new(1.0_f32, theme.border))
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::same(space::MD))
+            .show(ui, |ui| {
+                ui.set_width(l.card.width() - space::MD * 2.0);
+                let mut body = |ui: &mut egui::Ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("📋").size(52.0));
+                        ui.label(
+                            RichText::new(tr("エージェントがまだいません"))
+                                .size(18.0)
+                                .color(theme.text),
+                        );
+                        ui.label(
+                            RichText::new(tr("プリセットから並列セッションを起動しましょう"))
+                                .color(theme.text_dim),
+                        );
+                    });
+                    ui.add_space(space::MD);
+                    for row in 0..l.rows {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = space::SM;
+                            let used = l.btn_w * l.cols as f32 + space::SM * (l.cols as f32 - 1.0);
+                            ui.add_space(((ui.available_width() - used) * 0.5).max(0.0));
+                            for col in 0..l.cols {
+                                let i = row * l.cols + col;
+                                let Some((icon, name)) = presets.get(i) else {
+                                    break;
+                                };
+                                let label = format!("{icon} {name}");
+                                if ui
+                                    .add_sized(
+                                        [l.btn_w, crate::panels::EMPTY_BTN_H],
+                                        egui::Button::new(RichText::new(&label).size(13.0))
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                    )
+                                    .on_hover_text(&label)
+                                    .clicked()
+                                {
+                                    acts.push(KanbanAction::Launch(i));
+                                }
+                            }
+                        });
+                        ui.add_space(space::SM);
+                    }
+                };
+                if l.scroll {
+                    egui::ScrollArea::vertical()
+                        .id_salt("kanban-empty-state")
+                        .auto_shrink([false, false])
+                        .show(ui, &mut body);
+                } else {
+                    body(ui);
+                }
+            });
     });
 }
 
@@ -1839,8 +2196,10 @@ fn empty_ui(
 // ---------------------------------------------------------------------------
 
 fn kpi_ui(ui: &mut egui::Ui, theme: &Theme, st: &KanbanState, t: &Tally) {
-    let gap = 8.0;
-    let tile_w = ((ui.available_width() - gap * 3.0) / 4.0).max(120.0);
+    let gap = space::SM;
+    // 狭い窓では 4 枚を 1 列ずつ潰さず**段に折る**。下限で止めると
+    // 右端の「完了・終了」が画面外へ落ちて数字が見えなくなる。
+    let (cols, tile_w) = kpi_grid(ui.available_width(), 4);
     let tiles: [(&str, usize, Color32, fn(&Tally) -> usize); 4] = [
         ("稼働中", t.running, theme.accent, |t| t.running),
         ("作業中", t.working, theme.ok, |t| t.working),
@@ -1849,37 +2208,49 @@ fn kpi_ui(ui: &mut egui::Ui, theme: &Theme, st: &KanbanState, t: &Tally) {
         }),
         ("完了・終了", t.done, theme.text_dim, |t| t.done),
     ];
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for (label, value, color, pick) in tiles {
-            egui::Frame::none()
-                .fill(theme.panel)
-                .stroke(Stroke::new(1.0_f32, theme.border))
-                .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::same(9.0))
-                .show(ui, |ui| {
-                    ui.set_width(tile_w - 18.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(tr(label)).size(11.0).color(theme.text_dim));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(RichText::new("●").size(9.0).color(color));
-                            },
+    let inner_pad = space::SM + 1.0;
+    for chunk in tiles.chunks(cols.max(1)) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (label, value, color, pick) in chunk {
+                egui::Frame::none()
+                    .fill(theme.panel)
+                    .stroke(Stroke::new(1.0_f32, theme.border))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::same(inner_pad))
+                    .show(ui, |ui| {
+                        ui.set_width((tile_w - inner_pad * 2.0).max(1.0));
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(tr(label)).size(11.0).color(theme.text_dim),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(tr(label));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(RichText::new("●").size(9.0).color(*color));
+                                },
+                            );
+                        });
+                        ui.label(
+                            RichText::new(value.to_string())
+                                .size(21.0)
+                                .strong()
+                                .color(theme.text),
                         );
+                        let values: Vec<f32> =
+                            st.samples.iter().map(|s| pick(&s.tally) as f32).collect();
+                        sparkline(ui, 14.0, *color, &values);
                     });
-                    ui.label(
-                        RichText::new(value.to_string())
-                            .size(21.0)
-                            .strong()
-                            .color(theme.text),
-                    );
-                    let values: Vec<f32> =
-                        st.samples.iter().map(|s| pick(&s.tally) as f32).collect();
-                    sparkline(ui, 14.0, color, &values);
-                });
+            }
+        });
+        if cols < 4 {
+            ui.add_space(space::XS);
         }
-    });
+    }
 }
 
 /// 小さな折れ線 (KPI タイルの足元)。データが 1 点以下ならベースラインだけ描く。
@@ -2046,8 +2417,8 @@ fn rail_entry_ui(
         },
     );
     if cell.response.clicked() {
+        // 単なる選択。ライブペインは開かない (画面を組み替えない)。
         st.selected = Some(c.id);
-        st.live_closed = false;
         acts.push(KanbanAction::Select(c.idx));
     }
 }
@@ -2079,24 +2450,30 @@ fn board_ui(
     now_ms: u64,
     acts: &mut Vec<KanbanAction>,
 ) {
-    let gap = 8.0;
-    let n = COLUMNS.len() as f32;
-    // 8 レーンぶん。入り切らないときは横スクロールで見せる。
-    let col_w = ((ui.available_width() - gap * (n - 1.0)) / n).clamp(150.0, 300.0);
+    let members: Vec<Vec<&Card>> = COLUMNS
+        .iter()
+        .map(|col| {
+            cards
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| lanes.get(*i).copied().unwrap_or(c.column) == *col)
+                .map(|(_, c)| c)
+                .collect()
+        })
+        .collect();
+    let counts: Vec<usize> = members.iter().map(Vec::len).collect();
+    // 空レーンは帯だけに畳み、浮いた幅を中身のあるレーンへ配る。
+    // 均等割りのままだと 8 本が下限で止まり、右端の 2〜3 本が画面外へ落ちる。
+    let widths = lane_widths(ui.available_width(), &counts);
     egui::ScrollArea::horizontal()
         .id_salt("kanban-board-h")
         .auto_shrink(false)
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                for col in COLUMNS {
-                    let members: Vec<&Card> = cards
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, c)| lanes.get(*i).copied().unwrap_or(c.column) == col)
-                        .map(|(_, c)| c)
-                        .collect();
-                    column_ui(st, ui, theme, col, &members, col_w, height, now_ms, acts);
+                ui.spacing_mut().item_spacing.x = space::SM;
+                for (i, col) in COLUMNS.into_iter().enumerate() {
+                    let w = widths.get(i).copied().unwrap_or(LANE_MIN_W);
+                    column_ui(st, ui, theme, col, &members[i], w, height, now_ms, acts);
                 }
             });
         });
@@ -2201,18 +2578,24 @@ fn column_ui(
     acts: &mut Vec<KanbanAction>,
 ) {
     let color = col.color(theme);
+    let empty = members.is_empty();
+    // **空のレーンは見出しだけに畳む。** 高さを丸ごと取ると、5 本の空カラムが
+    // 窓の底まで伸びて「読むところが無い縦線」が並ぶ (実際に起きた)。
+    let pad = space::XS + 3.0;
     ui.allocate_ui_with_layout(
-        egui::vec2(width, height),
+        egui::vec2(width, if empty { 0.0 } else { height }),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
             egui::Frame::none()
-                .fill(theme.panel)
+                .fill(if empty { theme.panel_alt } else { theme.panel })
                 .stroke(Stroke::new(1.0_f32, theme.border))
                 .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::same(7.0))
+                .inner_margin(egui::Margin::same(pad))
                 .show(ui, |ui| {
-                    ui.set_width(width - 14.0);
-                    ui.set_min_height(height - 14.0);
+                    ui.set_width(width - pad * 2.0);
+                    if !empty {
+                        ui.set_min_height(height - pad * 2.0);
+                    }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(col.icon()).size(10.0).color(color));
                         ui.add(
@@ -2220,37 +2603,41 @@ fn column_ui(
                                 RichText::new(tr(col.title()))
                                     .size(12.0)
                                     .strong()
-                                    .color(theme.text),
+                                    .color(if empty { theme.text_dim } else { theme.text }),
                             )
                             .truncate(),
                         )
                         .on_hover_text(tr(col.hint()));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
-                                RichText::new(members.len().to_string())
-                                    .size(11.0)
-                                    .color(theme.text_dim),
+                                RichText::new(if empty {
+                                    "—".to_string()
+                                } else {
+                                    members.len().to_string()
+                                })
+                                .size(11.0)
+                                .color(theme.text_dim),
                             );
                         });
                     });
+                    if empty {
+                        // 帯だけで終わり — 高さも幅も予約しない。
+                        return;
+                    }
                     // 見出し下の色帯 (列の識別)
                     let (line, _) = ui
                         .allocate_exact_size(egui::vec2(ui.available_width(), 2.0), egui::Sense::hover());
                     ui.painter()
                         .rect_filled(line, 1.0_f32, color.gamma_multiply(0.6));
-                    ui.add_space(6.0);
+                    ui.add_space(space::XS);
 
-                    if members.is_empty() {
-                        ui.label(RichText::new(tr("— なし —")).size(10.5).color(theme.text_dim));
-                        return;
-                    }
                     egui::ScrollArea::vertical()
                         .id_salt(("kanban-col", col.title()))
                         .auto_shrink(false)
                         .show(ui, |ui| {
                             for c in members {
                                 card_ui(st, ui, theme, c, col, now_ms, false, acts);
-                                ui.add_space(6.0);
+                                ui.add_space(space::XS);
                             }
                         });
                 });
@@ -2512,8 +2899,11 @@ fn card_ui(
                                 .on_hover_text(tr("このエージェントのライブ画面を開く"))
                                 .clicked()
                             {
+                                // 👁 は明示的な操作なので、ここは開いてよい。
+                                // 同じカードの 👁 をもう一度押したら閉じる。
+                                let same = st.selected == Some(c.id);
                                 st.selected = Some(c.id);
-                                st.live_closed = selected && !st.live_closed;
+                                st.live_open = !(same && st.live_open);
                                 eye_toggled = true;
                             }
                             if ui
@@ -2591,12 +2981,18 @@ fn card_ui(
             eye_toggled
         },
     );
+    // 起動直後 / キー移動で選んだカードを視界へ入れる。**これが「何が始まったか」を
+    // 示す唯一の手段** — 端末を勝手に開いて画面を組み替えることはしない。
+    if selected && st.scroll_to_sel {
+        cell.response.scroll_to_me(Some(egui::Align::Center));
+        st.scroll_to_sel = false;
+    }
     if !cell.inner
         && (cell.response.clicked()
             || (cell.response.contains_pointer() && ui.input(|i| i.pointer.primary_pressed())))
     {
+        // 単なる選択。ライブペインは開かない (画面を組み替えない)。
         st.selected = Some(c.id);
-        st.live_closed = false;
         acts.push(KanbanAction::Select(c.idx));
     }
 }
@@ -3088,15 +3484,39 @@ mod tests {
 
     #[test]
     fn layout_auto_picks_vertical_for_tall_or_narrow() {
+        let s = 0.38_f32;
         // 広い横長 → 横
-        assert!(!use_vertical(LayoutMode::Auto, 1600.0, 700.0));
+        assert!(!use_vertical(LayoutMode::Auto, 1600.0, 700.0, false, s));
         // 細い → 縦
-        assert!(use_vertical(LayoutMode::Auto, 700.0, 500.0));
+        assert!(use_vertical(LayoutMode::Auto, 700.0, 500.0, false, s));
         // 縦長 (サブディスプレイ縦置き) → 縦
-        assert!(use_vertical(LayoutMode::Auto, 1000.0, 1400.0));
+        assert!(use_vertical(LayoutMode::Auto, 1000.0, 1400.0, false, s));
         // 手動指定は窓の形に関係なく従う
-        assert!(!use_vertical(LayoutMode::Horizontal, 400.0, 1400.0));
-        assert!(use_vertical(LayoutMode::Vertical, 2000.0, 300.0));
+        assert!(!use_vertical(
+            LayoutMode::Horizontal,
+            400.0,
+            1400.0,
+            false,
+            s
+        ));
+        assert!(use_vertical(LayoutMode::Vertical, 2000.0, 300.0, false, s));
+    }
+
+    /// **ライブペインを開いたら、看板の取り分で縦横を選び直す。**
+    ///
+    /// 起きていた不具合: 端末を出すと看板が半分の幅になり、8 レーンのうち
+    /// 「承認」が半分隠れて「完了・終了」が画面外へ落ちた。看板に残る幅で
+    /// 判定すれば、同じ窓でも縦モードへ切り替わって全レーンが読める。
+    #[test]
+    fn ライブペインを開くと縦モードへ落ちる() {
+        let s = 0.38_f32;
+        // 1600x700: 閉じていれば横。開けば看板は ~960 → 横のまま
+        assert!(!use_vertical(LayoutMode::Auto, 1600.0, 700.0, false, s));
+        // 1400x700: 開くと看板は ~840 (< BOARD_MIN_W) → 縦へ
+        assert!(!use_vertical(LayoutMode::Auto, 1400.0, 700.0, false, s));
+        assert!(use_vertical(LayoutMode::Auto, 1400.0, 700.0, true, s));
+        // 取り分を広げるほど早く縦へ落ちる
+        assert!(use_vertical(LayoutMode::Auto, 1600.0, 700.0, true, 0.7));
     }
 
     #[test]
@@ -3632,5 +4052,198 @@ mod tests {
             (before - last).abs() < 10.0,
             "画面矩形の変動で高さが失われる: before={before} after={after:?}"
         );
+    }
+}
+
+/// 看板の幾何 (純関数)。**スクリーンショットで確認した不具合を数値で固定する**:
+///
+/// ① 1 体起動しただけで端末が半分の幅を占め、「承認」が半分隠れて
+///    「完了・終了」が画面外へ落ちた (= 起動が画面を組み替えていた)
+/// ② 空のレーンが 5 本、窓の底まで伸びていた
+/// ③ ライブペインが右端で切れて端末の行が途中で欠けた
+/// ④ 上の KPI タイルが右端で切れた
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    /// 代表的な窓 (900x700 と極端に低い窓を含む)。
+    fn areas() -> Vec<Rect> {
+        [
+            (600.0_f32, 400.0_f32),
+            (900.0, 700.0),
+            (1200.0, 300.0), // 極端に低い窓
+            (1400.0, 900.0),
+            (1720.0, 1148.0),
+            (2560.0, 1440.0),
+        ]
+        .into_iter()
+        .map(|(w, h)| Rect::from_min_size(egui::pos2(10.0, 24.0), egui::vec2(w, h)))
+        .collect()
+    }
+
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.intersects(b) && a.intersect(b).area() > 0.01
+    }
+
+    /// **主要域の矩形は領域内に収まり、互いに重ならない。**
+    #[test]
+    fn 主要域の矩形は領域内で重ならない() {
+        for area in areas() {
+            for vertical in [false, true] {
+                for live in [false, true] {
+                    for split in [0.2_f32, 0.38, 0.7] {
+                        let r = main_rects(area, vertical, live, split);
+                        let all = r.all();
+                        for rect in &all {
+                            assert!(
+                                rect.left() >= area.left() - 0.01
+                                    && rect.right() <= area.right() + 0.01
+                                    && rect.top() >= area.top() - 0.01
+                                    && rect.bottom() <= area.bottom() + 0.01,
+                                "area={area:?} v={vertical} live={live} s={split}: \
+                                 {rect:?} が領域外"
+                            );
+                            assert!(rect.width() >= 0.0 && rect.height() >= 0.0);
+                        }
+                        for i in 0..all.len() {
+                            for j in (i + 1)..all.len() {
+                                assert!(
+                                    !overlaps(all[i], all[j]),
+                                    "area={area:?} v={vertical} live={live}: \
+                                     {:?} と {:?} が重なった",
+                                    all[i],
+                                    all[j]
+                                );
+                            }
+                        }
+                        assert_eq!(r.live.is_some(), live, "ライブペインの有無が食い違う");
+                        // ライブペインを開いている間は飾りを畳む (看板の幅を守る)
+                        if live {
+                            assert!(r.rail.is_none() && r.feed.is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// ライブペインは**割り当てられた幅ぴったり**。
+    /// フィードの取り分まで飲み込むと右端で端末の行が切れる (実際に起きた)。
+    #[test]
+    fn ライブペインはフィードの幅を食わない() {
+        let area = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2000.0, 900.0));
+        let r = main_rects(area, false, true, 0.38);
+        let live = r.live.expect("開いている");
+        assert!(live.right() <= area.right() + 0.01);
+        // 飾りが畳まれているので、看板 + バー + ライブで領域を使い切る
+        let used = r.board.width() + SPLIT_BAR + live.width() + space::SM * 2.0;
+        assert!(
+            (used - area.width()).abs() < 0.5,
+            "used={used} area={}",
+            area.width()
+        );
+    }
+
+    /// **レーン幅**: 空レーンは帯だけに畳み、総幅は可用幅を超えない。
+    #[test]
+    fn レーン幅は可用幅を超えない() {
+        for avail in [400.0_f32, 700.0, 900.0, 1200.0, 1600.0, 2400.0] {
+            for filled in 0..=8usize {
+                let counts: Vec<usize> = (0..8).map(|i| usize::from(i < filled)).collect();
+                let w = lane_widths(avail, &counts);
+                assert_eq!(w.len(), 8);
+                let total: f32 = w.iter().sum::<f32>() + space::SM * 7.0;
+                // 中身のあるレーンが下限に張り付くほど狭いときだけ横スクロールへ逃がす
+                let at_min = w
+                    .iter()
+                    .zip(&counts)
+                    .any(|(x, c)| *c > 0 && (*x - LANE_MIN_W).abs() < 0.01);
+                if !at_min {
+                    assert!(
+                        total <= avail + 0.5,
+                        "avail={avail} filled={filled}: 総幅 {total} がはみ出した ({w:?})"
+                    );
+                }
+                for (x, c) in w.iter().zip(&counts) {
+                    if *c == 0 {
+                        assert!(*x <= LANE_EMPTY_W + 0.01, "空レーンが畳まれていない: {x}");
+                    } else {
+                        assert!(*x >= LANE_MIN_W - 0.01 && *x <= LANE_MAX_W + 0.01);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 1 体だけ動いている 1400x900: 空 7 本を畳めば全 8 レーンが 1 画面に入る。
+    #[test]
+    fn 一体だけでも全レーンが一画面に入る() {
+        let mut counts = [0usize; 8];
+        counts[3] = 1;
+        let w = lane_widths(1400.0, &counts);
+        let total: f32 = w.iter().sum::<f32>() + space::SM * 7.0;
+        assert!(total <= 1400.5, "総幅 {total}");
+        assert!(w[3] > LANE_MIN_W, "中身のあるレーンは広く取る: {}", w[3]);
+    }
+
+    /// **KPI タイル**: 総幅は可用幅を超えない (右端で「完了・終了」を切らない)。
+    #[test]
+    fn KPIタイルは可用幅を超えない() {
+        for avail in [280.0_f32, 400.0, 560.0, 900.0, 1400.0, 2400.0] {
+            let (cols, w) = kpi_grid(avail, 4);
+            assert!(cols >= 1 && cols <= 4);
+            let total = w * cols as f32 + space::SM * (cols as f32 - 1.0);
+            assert!(total <= avail + 0.5, "avail={avail}: 総幅 {total}");
+        }
+        // 狭ければ折る / 広ければ 1 段
+        assert_eq!(kpi_grid(1400.0, 4).0, 4);
+        assert!(kpi_grid(400.0, 4).0 < 4);
+    }
+
+    /// ブロードキャスト欄は残り幅から取り、入らなければ出さない。
+    #[test]
+    fn ブロードキャスト欄は残り幅に従う() {
+        assert_eq!(broadcast_input_width(0.0), 0.0);
+        assert_eq!(broadcast_input_width(100.0), 0.0);
+        assert!(broadcast_input_width(200.0) > 0.0);
+        assert!(
+            broadcast_input_width(2000.0) <= 260.0,
+            "広くても広げすぎない"
+        );
+        for r in [0.0_f32, 50.0, 136.0, 300.0, 1000.0] {
+            let w = broadcast_input_width(r);
+            assert!(w == 0.0 || w <= r, "r={r}: {w} が残り幅を超えた");
+        }
+    }
+
+    /// 見出しは狭いとアイコンだけに縮退する。
+    #[test]
+    fn 見出しは狭いとアイコンだけになる() {
+        assert!(header_compact(700.0));
+        assert!(header_compact(HEADER_COMPACT_W - 1.0));
+        assert!(!header_compact(HEADER_COMPACT_W));
+        assert!(!header_compact(1920.0));
+    }
+
+    /// 900x700 の窓: 端末を開いても看板は縦モードへ落ちて全レーンが読める。
+    ///
+    /// ここが横のままだと、看板の取り分が ~540px しか無く 8 レーンが並ばない
+    /// (スクリーンショットの「承認が半分隠れ、完了・終了が画面外」)。
+    #[test]
+    fn 九百七百の窓では起動しても看板が読める() {
+        let s = 0.38_f32;
+        // 閉じていれば横のまま (空レーンを畳めば 900px に 8 本入る)
+        assert!(!use_vertical(LayoutMode::Auto, 900.0, 700.0, false, s));
+        let mut counts = [0usize; 8];
+        counts[3] = 1;
+        let w = lane_widths(900.0, &counts);
+        let total: f32 = w.iter().sum::<f32>() + space::SM * 7.0;
+        assert!(total <= 900.5, "900px に 8 レーンが入らない: {total}");
+        // 開いたら縦へ落ちる
+        assert!(use_vertical(LayoutMode::Auto, 900.0, 700.0, true, s));
+        let area = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0));
+        let r = main_rects(area, true, true, s);
+        assert_eq!(r.board.width(), area.width(), "縦モードの看板は全幅");
+        assert!(r.board.height() > 0.0 && r.live.expect("開いている").height() > 0.0);
     }
 }

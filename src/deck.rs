@@ -1859,11 +1859,17 @@ fn pane_ui(
                 .and_then(RowKey::live_id)
                 .and_then(|id| live.iter().find(|l| l.id == id))
                 .map(|l| (l.id, format!("{} {}", l.icon, l.title)));
+            // 宛先チップは入力欄の下に横一列で出す (全ライブセッション)。
+            let targets: Vec<(u64, String)> = live
+                .iter()
+                .map(|l| (l.id, format!("{} {}", l.icon, l.title)))
+                .collect();
             match crate::panels::agent_composer_ui(
                 ui,
                 theme,
                 composer,
                 target.as_ref().map(|(id, t)| (*id, t.as_str())),
+                &targets,
             ) {
                 crate::panels::ComposerAction::SendTo(id, text) => {
                     acts.push(DeckAction::Send { id, text })

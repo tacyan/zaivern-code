@@ -33,7 +33,7 @@ use crate::github;
 use crate::ide;
 use crate::kanban;
 use crate::palette::{Action, Cmd, Item, Palette};
-use crate::panels;
+use crate::panels::{self, space};
 use crate::pathx;
 use crate::pet;
 use crate::pet_bubble;
@@ -52,13 +52,10 @@ use crate::theme_json;
 use crate::tutorial::{self, AnchorId};
 use crate::voice;
 
-/// エージェントデッキ (縦 1 本のエージェント管理画面)。
-///
-/// main.rs は他所有なので `mod deck;` を足せない。coordinator.rs が quota.rs を
-/// 抱えているのと同じ流儀で、ここから実体を読み込む
-/// (呼び出し側は `crate::app::deck::…` で参照できる)。
-#[path = "deck.rs"]
-pub mod deck;
+// エージェントデッキ (縦 1 本のエージェント管理画面) は main.rs が
+// `mod deck;` で登録している。ここで `#[path]` 付きの二重登録をすると
+// 型が 2 組できてしまい、片方に入れた状態がもう片方から見えなくなる。
+use crate::deck;
 
 #[derive(PartialEq, Clone, Copy)]
 enum SidebarTab {
@@ -521,22 +518,157 @@ const GRID_MIN_CELL_H: f32 = 150.0;
 /// 見出し行を「アイコンだけ」に縮退させる幅のしきい値。
 const COCKPIT_HEADER_COMPACT_W: f32 = 820.0;
 
+/// **中央に描くビュー。** 同時に 2 つは描かない。
+///
+/// 実際に起きていた不具合: Cockpit のヘッダーで「📋 看板」を押すと、その
+/// フレームの**途中で** `cockpit=false / kanban=true` になり、既に描き始めて
+/// いた Cockpit のタイルと、あとから出てくる看板が**重なって**描かれた。
+/// 独立した bool を 3 本持つ限りこの種の重なりは構造的に起こり得るので、
+/// 「今フレーム何を描くか」は必ずこの 1 個の値へ畳んでから使う。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum CenterView {
+    /// 通常のエディタ
+    #[default]
+    Editor,
+    /// 🎛 Agent Cockpit
+    Cockpit,
+    /// 📋 フリート看板 (下部ターミナルパネル内のタブ)
+    Kanban,
+    /// 🗂 エージェントデッキ
+    Deck,
+}
+
+/// 3 本のフラグから「今フレーム描くビュー」を 1 つ決める (純関数)。
+///
+/// 優先順は デッキ > Cockpit > 看板 > エディタ。フラグが複数立っていても
+/// 返り値は必ず 1 つなので、2 つのビューが重なって描かれることはない。
+fn center_view(cockpit: bool, kanban: bool, deck: bool) -> CenterView {
+    if deck {
+        CenterView::Deck
+    } else if cockpit {
+        CenterView::Cockpit
+    } else if kanban {
+        CenterView::Kanban
+    } else {
+        CenterView::Editor
+    }
+}
+
 /// Cockpit の見出し行を縮退させるか (純関数)。
 fn cockpit_header_compact(avail_w: f32) -> bool {
     avail_w < COCKPIT_HEADER_COMPACT_W
 }
 
-/// 空状態カードを利用可能領域の**中央**へ置くための上詰め (純関数)。
-///
-/// 固定割合 (旧実装の `available_height() * 0.25`) だと、上のセクションの高さが
-/// 変わるたびにカードが上下し、見出しとの間に空白が残る。
-fn empty_state_top_pad(avail_h: f32, content_h: f32) -> f32 {
-    ((avail_h - content_h) * 0.5).max(0.0)
+/// トップバー左側 (ロゴ + VS Code 準拠の 8 メニュー + ブランチ) のおおよその幅。
+/// 右側のボタン群がここへ食い込むと、メニューの文字と重なって両方読めなくなる。
+const TOP_BAR_LEFT_W: f32 = 620.0;
+/// 右側ボタン群をラベル付きで並べるのに要る幅。
+const TOP_BAR_RIGHT_W: f32 = 470.0;
+
+/// アイコンだけに縮めた右側ボタン群の幅。
+const TOP_BAR_RIGHT_ICON_W: f32 = 430.0;
+
+/// トップバー右側の密度。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopBarDensity {
+    /// ラベル付き
+    Full,
+    /// アイコンだけ
+    Compact,
+    /// アイコンだけ + 装飾系 (テーマ/リモート/音声/ペット) を「⋯」へ畳む
+    Overflow,
 }
 
-/// 空状態の起動ボタン幅 (純関数)。狭い窓でも右端からはみ出さない。
-fn empty_state_button_width(avail_w: f32) -> f32 {
-    (avail_w - 24.0).clamp(120.0, 280.0)
+impl TopBarDensity {
+    /// ボタンの文字を落とすか。
+    fn compact(self) -> bool {
+        self != TopBarDensity::Full
+    }
+}
+
+/// トップバー右側の密度を決める (純関数)。
+///
+/// 実際に起きていた不具合: 900px 幅で「実行 / ターミナル / ヘルプ」の上に
+/// 「看板」「Cockpit」「既定:承認」が**重なって**描かれ、どちらも読めない。
+/// egui の `right_to_left` は残り幅が足りなくても縮めてくれないので、
+/// 入る形かどうかをこちらで決める。
+fn top_bar_density(bar_w: f32) -> TopBarDensity {
+    if bar_w >= TOP_BAR_LEFT_W + TOP_BAR_RIGHT_W {
+        TopBarDensity::Full
+    } else if bar_w >= TOP_BAR_LEFT_W + TOP_BAR_RIGHT_ICON_W {
+        TopBarDensity::Compact
+    } else {
+        TopBarDensity::Overflow
+    }
+}
+
+/// 1 行帯コンポーザをヘッダー行へ畳み込むのに要る最小の残り幅 (px)。
+///
+/// 内訳: 宛先チップ ~70 + 入力欄の下限 80 + 送信/⤢ ~92 + 間隔。これを
+/// 割ると入力欄が潰れて押せなくなるので、その場合だけ独立した行へ落とす。
+const COMPOSER_INLINE_MIN_W: f32 = 260.0;
+
+/// コンポーザを見出し行へ畳み込むか (純関数)。
+///
+/// 複数行フォーム (`expanded`) は**絶対に**畳み込まない — 横並びの 1 行へ
+/// 押し込むと右端の細い帯に折り返され、見出しの下に数百 px の空白ができる
+/// (実際に起きた不具合)。1 行帯でも残り幅が入力欄の下限を割るなら別行へ落とす。
+fn composer_fits_header(expanded: bool, remaining_w: f32) -> bool {
+    !expanded && remaining_w >= COMPOSER_INLINE_MIN_W
+}
+
+/// 見出し帯の内訳 (純関数の結果)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeaderLayout {
+    /// タイトル・状態・右寄せボタン群 (+ 畳み込めたときはコンポーザ) の行
+    row: egui::Rect,
+    /// 畳み込めなかったコンポーザの行。畳み込めたときは `None` = 1 行で済む
+    composer: Option<egui::Rect>,
+}
+
+impl HeaderLayout {
+    /// 見出し帯が実際に使う高さ。
+    fn height(&self) -> f32 {
+        self.composer
+            .map_or(self.row.height(), |c| c.bottom() - self.row.top())
+    }
+}
+
+/// 見出し帯の矩形を決める (純関数)。
+///
+/// 密度の目標: **エージェントが居てコンポーザが未フォーカスなら 1 行**。
+/// - `remaining_w`: 右寄せボタン群を置いたあとにコンポーザへ回せる幅 (実測値)
+/// - `row_h`: 1 行の高さ (egui の `interact_size.y` 相当)
+/// - `form_h`: 複数行フォームを開いたときの高さ
+///
+/// 不変条件: `row` と `composer` は重ならず、どちらも `avail` の中。
+fn cockpit_header_layout(
+    avail: egui::Rect,
+    expanded: bool,
+    remaining_w: f32,
+    row_h: f32,
+    form_h: f32,
+) -> HeaderLayout {
+    let row = egui::Rect::from_min_size(
+        avail.min,
+        egui::vec2(avail.width(), row_h.min(avail.height())),
+    );
+    if composer_fits_header(expanded, remaining_w) {
+        // 1 行に畳み込めた = 見出し帯は行高そのまま
+        return HeaderLayout {
+            row,
+            composer: None,
+        };
+    }
+    let top = (row.bottom() + crate::panels::space::XS).min(avail.bottom());
+    let h = form_h.min((avail.bottom() - top).max(0.0));
+    HeaderLayout {
+        row,
+        composer: Some(egui::Rect::from_min_size(
+            egui::pos2(avail.left(), top),
+            egui::vec2(avail.width(), h),
+        )),
+    }
 }
 
 /// タイル格子の寸法。
@@ -1605,6 +1737,9 @@ pub struct ZaivernApp {
     race: race::RacePanel,
     highlighter: Highlighter,
     cockpit: bool,
+    /// **このフレームで描く中央ビュー** (毎フレーム [`center_view`] で畳む)。
+    /// 描画の分岐はフラグではなく必ずこれを見る。
+    center: CenterView,
     /// フリート看板 (全エージェントを状態列で俯瞰・指揮するカンバン画面)。
     /// Cockpit と同格の中央画面モードで、両方 true にはしない (切替時に他方を落とす)。
     kanban: bool,
@@ -2182,7 +2317,8 @@ impl ZaivernApp {
             pending_prompts: Vec::new(),
             race: race::RacePanel::new(),
             highlighter: Highlighter::new(),
-            cockpit: true, // TEMP-SHOT
+            cockpit: false,
+            center: CenterView::Editor,
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
             deck: false,
@@ -7959,14 +8095,29 @@ impl ZaivernApp {
                     .inner_margin(egui::Margin::symmetric(10.0, 6.0)),
             )
             .show(ctx, |ui| {
+                // 幅が足りないときは右側を縮退させる。縮退しないと右側が
+                // メニューバーの上に重なって両方読めなくなる。
+                let density = top_bar_density(ui.available_width());
                 ui.horizontal_centered(|ui| {
                     self.top_bar_left(ui, &theme, &menu_info, &branch, &mut cmds);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.top_bar_theme_menu(ui, &mut cmds);
-                        self.top_bar_remote_and_voice(ui, &theme, &mut cmds);
-                        self.top_bar_pet_menu(ui, &mut cmds);
-                        self.top_bar_agent_controls(ui, &theme, &mut cmds);
+                        if density == TopBarDensity::Overflow {
+                            // 装飾系 (テーマ / リモート / 音声 / ペット) は 1 つの
+                            // 「⋯」へ畳む。エージェント操作だけは常に表に残す。
+                            ui.menu_button("⋯", |ui| {
+                                self.top_bar_theme_menu(ui, &mut cmds);
+                                self.top_bar_remote_and_voice(ui, &theme, &mut cmds);
+                                self.top_bar_pet_menu(ui, &mut cmds);
+                            })
+                            .response
+                            .on_hover_text(tr("テーマ・スマホリモート・音声・ペット"));
+                        } else {
+                            self.top_bar_theme_menu(ui, &mut cmds);
+                            self.top_bar_remote_and_voice(ui, &theme, &mut cmds);
+                            self.top_bar_pet_menu(ui, &mut cmds);
+                        }
+                        self.top_bar_agent_controls(ui, &theme, density, &mut cmds);
                     });
                 });
             });
@@ -8326,12 +8477,21 @@ impl ZaivernApp {
         &mut self,
         ui: &mut egui::Ui,
         theme: &Theme,
+        density: TopBarDensity,
         cmds: &mut Vec<Cmd>,
     ) {
+        let compact = density.compact();
         // 実行中の対応エージェントを一括で権限モード切替
         if self.agents.running_count() > 0
             && ui
-                .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
+                .button(
+                    RichText::new(if compact {
+                        "🛡".to_string()
+                    } else {
+                        tr("🛡 全切替")
+                    })
+                    .color(theme.ok),
+                )
                 .on_hover_text(tr(
                     "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
                      Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
@@ -8341,7 +8501,9 @@ impl ZaivernApp {
             cmds.push(Cmd::CyclePermissionAll);
         }
 
-        // 承認モード切替(次回起動の既定)。クリックで 承認→全自動→Agent優先 を順送り
+        // 承認モード切替(次回起動の既定)。クリックで 承認→全自動→Agent優先 を順送り。
+        // **いちばん狭いときは出さない** — 重なって読めないより出さない方が事故が
+        // 少ない (⌘P のコマンドパレットから同じ切替ができる)。
         let mode = self.cfg.approval_mode.as_str();
         let (ap_label, next_mode, highlight) = match mode {
             "auto" => (
@@ -8356,9 +8518,21 @@ impl ZaivernApp {
             ),
             _ => (RichText::new(tr("🛡 既定:承認")).color(theme.ok), "auto", false),
         };
-        let perm_btn = ui.selectable_label(highlight, ap_label);
-        tutorial::anchor(ui.ctx(), AnchorId::PermissionMode, perm_btn.rect);
-        if perm_btn
+        if density != TopBarDensity::Overflow {
+            // 狭いときは絵文字だけ残す (色と絵文字でモードは判別できる)
+            let ap_label = if compact {
+                let icon: String = ap_label.text().chars().take(1).collect();
+                RichText::new(icon).color(match mode {
+                    "auto" => theme.warn,
+                    "agent" => theme.ok,
+                    _ => theme.ok,
+                })
+            } else {
+                ap_label
+            };
+            let perm_btn = ui.selectable_label(highlight, ap_label);
+            tutorial::anchor(ui.ctx(), AnchorId::PermissionMode, perm_btn.rect);
+            if perm_btn
             .on_hover_text(tr(
                 "「次に起動する」エージェント (Claude/Codex/Antigravity) の既定権限モード\n\
                  🛡 承認 = 操作のたびに許可が必要（bypass フラグを除去）\n\
@@ -8371,16 +8545,25 @@ impl ZaivernApp {
         {
             cmds.push(Cmd::SetApproval(next_mode.into()));
         }
+        }
 
-        let cockpit =
-            ui.selectable_label(self.cockpit, RichText::new("🎛 Cockpit"));
+        let cockpit = ui.selectable_label(
+            self.cockpit,
+            RichText::new(if compact { "🎛" } else { "🎛 Cockpit" }),
+        );
         tutorial::anchor(ui.ctx(), AnchorId::CockpitButton, cockpit.rect);
         if cockpit.on_hover_text(tr("全エージェント一覧 (⌘⇧C)")).clicked() {
             cmds.push(Cmd::ToggleCockpit);
         }
 
-        let kanban =
-            ui.selectable_label(self.kanban, RichText::new(tr("📋 看板")));
+        let kanban = ui.selectable_label(
+            self.kanban,
+            RichText::new(if compact {
+                "📋".to_string()
+            } else {
+                tr("📋 看板")
+            }),
+        );
         tutorial::anchor(ui.ctx(), AnchorId::KanbanButton, kanban.rect);
         if kanban
             .on_hover_text(tr(
@@ -8391,7 +8574,7 @@ impl ZaivernApp {
             cmds.push(Cmd::ToggleKanban);
         }
 
-        let new_agent = ui.menu_button("👾 Agent ＋", |ui| {
+        let new_agent = ui.menu_button(if compact { "👾＋" } else { "👾 Agent ＋" }, |ui| {
             for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
                 if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
                     cmds.push(Cmd::NewAgent(i));
@@ -8435,12 +8618,14 @@ impl ZaivernApp {
         let running = self.agents.running_count();
         if running > 0 {
             ui.label(
-                RichText::new(trf(
-                    "● {running} 稼働中",
-                    &[("running", running.to_string())],
-                ))
+                RichText::new(if compact {
+                    format!("●{running}")
+                } else {
+                    trf("● {running} 稼働中", &[("running", running.to_string())])
+                })
                 .color(theme.ok),
-            );
+            )
+            .on_hover_text(trf("{n} 稼働中", &[("n", running.to_string())]));
         }
     }
 
@@ -9801,7 +9986,10 @@ impl ZaivernApp {
         let theme = self.theme.clone();
         // デッキ表示中も畳む: 同じ端末を 2 か所で描かせない (egui の Id が衝突する)
         // うえ、デッキは端末を全高で見せる画面なので下部パネルは邪魔になる。
-        let show = self.agents.panel_open && !self.cockpit && !self.deck;
+        // 中央ビューが Cockpit / デッキのときは畳む (同じ端末を 2 か所で
+        // 描かせない = egui の Id 衝突と絵の重なりを構造的に防ぐ)。
+        let show = self.agents.panel_open
+            && matches!(self.center, CenterView::Kanban | CenterView::Editor);
         let mut launch: Option<usize> = None;
         let mut restart: Option<usize> = None;
         let mut remove: Option<usize> = None;
@@ -10291,29 +10479,49 @@ impl ZaivernApp {
             .map(|s| (s.id, s.running()))
             .collect();
 
+        // 上の見出し帯は「エージェントのタイルに譲る」方針で詰める。
+        // 余白 12 + 8×3 = 36px を 8 + 4×3 = 20px へ。
         egui::Frame::none()
-            .inner_margin(egui::Margin::same(12.0))
+            .inner_margin(egui::Margin::same(space::SM))
             .show(ui, |ui| {
                 self.cockpit_header_ui(ui, &theme, &mut acts);
-                ui.add_space(8.0);
+                ui.add_space(space::XS);
 
-                // 調停レイヤ (タスク一覧・作成・メッセージ送信)。描画は orchestration 側。
-                orch_acts = orchestration::cockpit_section(
-                    &mut self.orch,
-                    ui,
-                    &theme,
-                    self.coordinator.tasks(),
-                    &orch_rows,
-                    &orchestration::bus_status(&self.coordinator, &orch_rows),
-                );
-
-                // 🏁 プロンプトレース (描画は race.rs。押された操作は描画後に反映)
-                ui.add_space(8.0);
-                race_acts =
-                    race::race_section(&mut self.race, ui, &theme, &race_presets, &race_sessions);
+                // ── 常設をやめたセクション ────────────────────────────
+                //
+                // 「◇ タスクとメッセージ」と「🏁 プロンプトレース」は、
+                // **見出しだけの行が常駐して縦を食う**わりに、ほぼ常に 0 件
+                // だった。Cockpit の主役はエージェントのタイルなので、常設表示
+                // から外し、**開いているときだけ**描く。
+                //
+                // 機能は消していない — どちらもコマンドパレット
+                // (⌘⇧P →「📮 エージェントへメッセージ」「🏁 プロンプトレース」)
+                // から開ける。開くとフォームがここに現れる。
+                if self.orch.form_open || self.orch.msg_open {
+                    orch_acts = orchestration::cockpit_section(
+                        &mut self.orch,
+                        ui,
+                        &theme,
+                        self.coordinator.tasks(),
+                        &orch_rows,
+                        &orchestration::bus_status(&self.coordinator, &orch_rows),
+                        None,
+                    );
+                    ui.add_space(space::XS);
+                }
+                if !race::is_idle(&self.race) {
+                    race_acts = race::race_section(
+                        &mut self.race,
+                        ui,
+                        &theme,
+                        &race_presets,
+                        &race_sessions,
+                    );
+                    ui.add_space(space::XS);
+                }
 
                 self.cockpit_super_agent_ui(ui, &theme, &mut acts);
-                ui.add_space(8.0);
+                ui.add_space(space::XS);
 
                 self.cockpit_grid_ui(ui, &theme, &mut acts);
             });
@@ -10333,6 +10541,28 @@ impl ZaivernApp {
         // 幅が足りないとき (エディタと分割している / 窓が狭い) は、
         // 文字を落としてアイコンだけにする。右端で切れて押せなくなるのを防ぐ。
         let compact = cockpit_header_compact(ui.available_width());
+
+        // コンポーザの姿 (1 行帯 / 複数行フォーム)。⤢ を押したかどうかだけ憶えて
+        // おき、実際の判定は本文込みで panels 側の純粋関数に任せる。
+        let expand_id = ui.make_persistent_id("cockpit_composer_expand");
+        let mut expand = ui.memory(|m| m.data.get_temp::<bool>(expand_id).unwrap_or(false));
+        let expanded = panels::composer_wants_expand(self.agent_input_buf.text(), expand);
+        let target: Option<(u64, String)> = self
+            .agents
+            .sessions
+            .get(self.agents.active)
+            .map(|s| (s.id, format!("{} {}", s.icon, s.title)));
+        // 宛先チップは**全エージェント**を横一列で出す (入力欄の下)。
+        let targets: Vec<(u64, String)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| (s.id, format!("{} {}", s.icon, s.title)))
+            .collect();
+        // ヘッダー行に埋め込めたか。埋め込めなかった分だけ下に別行で出す。
+        let mut inline_done = false;
+        let mut composer = panels::ComposerAction::None;
+
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(if compact { "🎛" } else { "🎛 Agent Cockpit" })
@@ -10417,29 +10647,56 @@ impl ZaivernApp {
                 {
                     acts.voice_all = true;
                 }
+
+                // 1 行帯のコンポーザは**ヘッダー行の余りに畳み込む**。
+                // ここが右端まで詰まっているときだけ下に別行で出す (下記)。
+                // 複数行フォームは背が高いので決してこの行には入れない
+                // (横並びの 1 行に押し込まれ、見出しの下に数百 px の空白ができる)。
+                if composer_fits_header(expanded, ui.available_width()) {
+                    composer = panels::agent_composer_inline_ui(
+                        ui,
+                        theme,
+                        &mut self.agent_input_buf,
+                        target.as_ref().map(|(id, t)| (*id, t.as_str())),
+                        &mut expand,
+                    );
+                    inline_done = true;
+                }
             });
         });
 
-        // ── エージェント宛てコンポーザ (複数行・宛先つき) ──
+        // ── エージェント宛てコンポーザ (宛先つき) ──
         //
         // 1 行のブロードキャスト欄を置き換えたもの。**宛先を選べる**のが要点で、
         // 「1 体に向けたレビュー指示が全エージェントへ飛ぶ」漏れをここで止める。
         // 下書きは宛先ごとに分かれて残るので、切り替えても書きかけが消えない。
         //
-        // **見出し行 (`ui.horizontal`) の外に置く。** 中に入れると複数行の
+        // 既定は 1 行帯で、ヘッダー行の余白に畳み込む (上の `inline_done`)。
+        // 複数行フォームだけは**見出し行の外**に出す。中に入れると複数行の
         // テキスト欄が横並びの 1 行に押し込まれ、右端の細い帯へ折り返されて
         // 見出しの下に数百 px の空白ができる (ボタンも右端で切れる)。
-        let target: Option<(u64, String)> = self
-            .agents
-            .sessions
-            .get(self.agents.active)
-            .map(|s| (s.id, format!("{} {}", s.icon, s.title)));
-        let composer = panels::agent_composer_ui(
-            ui,
-            theme,
-            &mut self.agent_input_buf,
-            target.as_ref().map(|(id, t)| (*id, t.as_str())),
-        );
+        if !inline_done {
+            composer = if expanded {
+                panels::agent_composer_expanded_ui(
+                    ui,
+                    theme,
+                    &mut self.agent_input_buf,
+                    target.as_ref().map(|(id, t)| (*id, t.as_str())),
+                    &targets,
+                    &mut expand,
+                )
+            } else {
+                // ヘッダーが詰まっていた場合の逃げ場 (窓が狭いとき)。
+                panels::agent_composer_inline_ui(
+                    ui,
+                    theme,
+                    &mut self.agent_input_buf,
+                    target.as_ref().map(|(id, t)| (*id, t.as_str())),
+                    &mut expand,
+                )
+            };
+        }
+        ui.memory_mut(|m| m.data.insert_temp(expand_id, expand));
         match composer {
             panels::ComposerAction::Send(t) => acts.broadcast = Some(t),
             panels::ComposerAction::SendTo(id, t) => acts.send_to = Some((id, t)),
@@ -10650,46 +10907,91 @@ impl ZaivernApp {
 
     /// Cockpit: セッションのグリッド描画 (空のときはプリセット起動の案内)。
     /// 押されたボタンは acts に記録だけして呼び出し側で反映する。
-    fn cockpit_grid_ui(
+    /// Cockpit の空状態 — **カード 1 枚を利用可能領域の中央に置く**。
+    ///
+    /// 旧実装は `vertical_centered` + 概算の上詰めで、上のセクションの高さが
+    /// 変わるたびにカードが上下し、狭い窓では起動ボタンが下端を突き抜けて
+    /// 押せなくなっていた。矩形は [`panels::empty_card`] が決め (可用領域に
+    /// 必ず収まる)、ここはその中を描くだけにしてある。
+    fn cockpit_empty_state_ui(
         &mut self,
         ui: &mut egui::Ui,
         theme: &Theme,
         acts: &mut CockpitActions,
     ) {
+        let presets: Vec<config::AgentPreset> = self.cfg.agents.clone();
+        // **見えている範囲**で中央寄せする。`available_rect_before_wrap` だけだと
+        // 親の割り当てが画面より高いときにカードが下へ突き抜けて切れる
+        // (下端のボタンが押せない)。clip_rect と交差させて実際の可視域に収める。
+        let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        let l = panels::empty_card(avail, presets.len());
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(l.card), |ui| {
+            egui::Frame::none()
+                .fill(theme.panel_alt)
+                .stroke(egui::Stroke::new(1.0_f32, theme.border))
+                .rounding(egui::Rounding::same(10.0))
+                .inner_margin(egui::Margin::same(space::MD))
+                .show(ui, |ui| {
+                    ui.set_width(l.card.width() - space::MD * 2.0);
+                    let mut body = |ui: &mut egui::Ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("🎛").size(52.0));
+                            ui.label(
+                                RichText::new(tr("エージェントがまだいません"))
+                                    .size(18.0)
+                                    .color(theme.text),
+                            );
+                            ui.label(
+                                RichText::new(tr("プリセットから並列セッションを起動しましょう"))
+                                    .color(theme.text_dim),
+                            );
+                        });
+                        ui.add_space(space::MD);
+                        // 起動ボタンは幅に応じて段組みする (縦に伸ばして下端を
+                        // 突き抜けさせない)。行ごとに中央寄せ。
+                        for row in 0..l.rows {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = space::SM;
+                                let used =
+                                    l.btn_w * l.cols as f32 + space::SM * (l.cols as f32 - 1.0);
+                                ui.add_space(((ui.available_width() - used) * 0.5).max(0.0));
+                                for col in 0..l.cols {
+                                    let i = row * l.cols + col;
+                                    let Some(p) = presets.get(i) else { break };
+                                    let label = format!("{} {}", p.icon, p.name);
+                                    if ui
+                                        .add_sized(
+                                            [l.btn_w, panels::EMPTY_BTN_H],
+                                            egui::Button::new(RichText::new(&label).size(13.0))
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                        .on_hover_text(&label)
+                                        .clicked()
+                                    {
+                                        acts.launch = Some(i);
+                                    }
+                                }
+                            });
+                            ui.add_space(space::SM);
+                        }
+                    };
+                    if l.scroll {
+                        // どうしても入らない窓では、はみ出させずにスクロールへ逃がす
+                        egui::ScrollArea::vertical()
+                            .id_salt("cockpit-empty-state")
+                            .auto_shrink([false, false])
+                            .show(ui, body);
+                    } else {
+                        body(ui);
+                    }
+                });
+        });
+    }
+
+    fn cockpit_grid_ui(&mut self, ui: &mut egui::Ui, theme: &Theme, acts: &mut CockpitActions) {
         let n = self.agents.sessions.len();
         if n == 0 {
-            // 空状態は**利用可能領域の中央**に 1 枚だけ置く。固定割合 (0.25) で
-            // 押し下げると、上のセクションが短い日ほど下へ落ちて上に空白が残る。
-            let presets: Vec<config::AgentPreset> = self.cfg.agents.clone();
-            let avail_h = ui.available_height();
-            let btn_h = 34.0 + 4.0;
-            let content_h = 52.0 + 22.0 + 18.0 + 12.0 + btn_h * presets.len() as f32;
-            let btn_w = empty_state_button_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                ui.add_space(empty_state_top_pad(avail_h, content_h));
-                ui.label(RichText::new("🎛").size(52.0));
-                ui.label(
-                    RichText::new(tr("エージェントがまだいません"))
-                        .size(18.0)
-                        .color(theme.text),
-                );
-                ui.label(
-                    RichText::new(tr("プリセットから並列セッションを起動しましょう"))
-                        .color(theme.text_dim),
-                );
-                ui.add_space(12.0);
-                for (i, p) in presets.into_iter().enumerate() {
-                    if ui
-                        .add_sized(
-                            [btn_w, 34.0],
-                            egui::Button::new(format!("{} {}", p.icon, p.name)),
-                        )
-                        .clicked()
-                    {
-                        acts.launch = Some(i);
-                    }
-                }
-            });
+            self.cockpit_empty_state_ui(ui, theme, acts);
             return;
         }
 
@@ -16460,6 +16762,12 @@ impl ZaivernApp {
         // 永続 UI 設定 (検索オプション・保存時クリーンアップ) は最初のフレームで読む
         self.load_prefs_once(ctx);
 
+        // **このフレームで描く中央ビューをここで 1 つに畳む。**
+        // 以降の描画判断はすべて `self.center` を見る。描画中にフラグが
+        // 変わっても今フレームの絵は変わらないので、2 つのビューが重なって
+        // 描かれることがない (切り替えは次のフレームから効く)。
+        self.center = center_view(self.cockpit, self.kanban, self.deck);
+
         // 音声入力が先。押している間だけ録音するキーは他所へ渡さない
         // (ターミナルが PTY へ転送してしまうため)
         self.poll_voice(ctx);
@@ -16781,10 +17089,13 @@ impl ZaivernApp {
                 //
                 // デッキは選択したセッションの端末を**全高**で見せる画面なので、
                 // Cockpit と同じ中央パネル全面に描く (下部端末パネルは畳む)。
-                if self.deck {
+                // **ここで見るのは `self.center` だけ。** 生のフラグを見ると、
+                // 描画中に押された「看板」でフラグが変わり、同じフレームに
+                // 2 つのビューが描かれて重なる (実際に起きた不具合)。
+                if self.center == CenterView::Deck {
                     let ctx = ui.ctx().clone();
                     self.guarded_ui(Subview::Panel("deck"), ui, |me, ui| me.deck_ui(ui, &ctx));
-                } else if self.cockpit {
+                } else if self.center == CenterView::Cockpit {
                     let ctx = ui.ctx().clone();
                     // ファイルを開いていれば左に編集ペインを並べて出す。
                     // Cockpit との切り替え無しでファイルが見えるようにするため。
@@ -21353,7 +21664,7 @@ mod wave2_tests {
     /// 効かなくなる」という**気付けない壊れ方**をするので、配線そのものを守る。
     #[test]
     fn sweep_timeouts_を毎フレーム呼んでいる() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let poll = src
             .split("fn poll_lsp(&mut self) {")
             .nth(1)
@@ -21437,7 +21748,7 @@ mod wave2_tests {
     /// **本文が壊れる**。ソースで固定しておく。
     #[test]
     fn 折りたたみ中は添字前提の補助機能を止めている() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         assert!(
             src.contains("let folds_closed = !self.editor.buffers[active].folds.folded().is_empty();"),
             "折りたたみ中かの判定が無い"
@@ -21455,7 +21766,7 @@ mod wave2_tests {
     /// レビュー画面が返す 2 つの追加要求を app 側で受けていること。
     #[test]
     fn レビュー画面の要求を受けている() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         assert!(
             src.contains("if let Some(file) = git_actions.open_file {"),
             "open_file をエディタで開いていない"
@@ -21481,7 +21792,7 @@ mod wave2_tests {
     /// 新しいコマンドがすべてパレットに並び、ディスパッチ先がある。
     #[test]
     fn 新しいコマンドがパレットから届く() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let list = src
             .split("fn palette_builtin_cmds(&self) -> Vec<(String, String, String, Cmd)> {")
             .nth(1)
@@ -22269,7 +22580,7 @@ mod tutorial_wiring_tests {
     /// 変種名は `Debug` から取るので、名前を変えてもこのテストは追随する。
     #[test]
     fn 手順表の全アンカーがapp_rsで申告されている() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let mut missing: Vec<String> = Vec::new();
         for step in crate::tutorial::STEPS {
             let Some(id) = step.anchor else { continue };
@@ -22290,7 +22601,7 @@ mod tutorial_wiring_tests {
     /// 「腕はあるが中身が空」を防ぐため、変種ごとに本体の目印も見る。
     #[test]
     fn 手順表の全依頼にルーティングがある() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let body = src
             .split("fn apply_tutorial_action(")
             .nth(1)
@@ -22348,8 +22659,11 @@ mod tutorial_wiring_tests {
     /// (毎フレーム `autostart()` を呼ぶと位置が 0 に戻り続けて操作できない)。
     #[test]
     fn 自動開始の呼び出しはフラグで守られている() {
-        let src = include_str!("app.rs");
-        let body = src.split("fn tutorial_tick(").nth(1).expect("tutorial_tick がある");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn tutorial_tick(")
+            .nth(1)
+            .expect("tutorial_tick がある");
         let head = &body[..body.find("fn ").unwrap_or(body.len())];
         assert!(head.contains("if !self.tutorial_autostarted"));
         assert!(head.contains("self.tutorial_autostarted = true;"));
@@ -22362,7 +22676,7 @@ mod tutorial_wiring_tests {
     /// 「アニメ中なのに寝る」= リングがカクつく。ここが逆になったら気付けるように。
     #[test]
     fn ツアーはアイドル判定より先に描く() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let body = src
             .split("fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {")
             .nth(1)
@@ -22415,26 +22729,185 @@ mod cockpit_layout_tests {
         assert_eq!(cockpit_grid_metrics(egui::vec2(1600.0, 800.0), 1).cols, 1);
     }
 
-    /// 空状態は可用領域の中央に来る (上に巨大な空白を残さない)。
-    #[test]
-    fn 空状態は中央に置かれる() {
-        // 高さ 700 に 200 の中身 → 上下に 250 ずつ
-        assert_eq!(empty_state_top_pad(700.0, 200.0), 250.0);
-        // 中身の方が高ければ押し下げない (先頭から描いてスクロールに任せる)
-        assert_eq!(empty_state_top_pad(180.0, 400.0), 0.0);
-        // 旧実装 (可用高の 25% 固定) との違い: 中身が小さいほど深く中央へ寄る
-        assert!(empty_state_top_pad(1000.0, 100.0) > 1000.0 * 0.25);
+    /// 代表的な窓 (900x700 と極端に低い窓を含む)。
+    fn areas() -> Vec<egui::Rect> {
+        [
+            (320.0_f32, 240.0_f32),
+            (480.0, 320.0),
+            (900.0, 700.0),
+            (900.0, 180.0), // 極端に低い窓
+            (1400.0, 900.0),
+            (1720.0, 1148.0),
+            (2560.0, 1440.0),
+        ]
+        .into_iter()
+        .map(|(w, h)| egui::Rect::from_min_size(egui::pos2(12.0, 40.0), egui::vec2(w, h)))
+        .collect()
     }
 
-    /// 空状態のボタンは可用幅に収まる。
+    /// 空状態カードは**必ず可用領域の中**に収まる。
+    ///
+    /// 旧実装は概算の上詰めで押し下げていたため、狭い窓では起動ボタンが下端を
+    /// 突き抜けて押せなくなっていた (スクリーンショットで確認済みの不具合)。
     #[test]
-    fn 空状態のボタンは可用幅に収まる() {
-        for w in [140.0_f32, 200.0, 400.0, 1200.0] {
-            let b = empty_state_button_width(w);
-            assert!(b <= w.max(120.0), "w={w}: ボタン幅 {b} がはみ出す");
+    fn 空状態カードは可用領域からはみ出さない() {
+        for avail in areas() {
+            for n in 1..=12usize {
+                let l = panels::empty_card(avail, n);
+                assert!(
+                    l.card.left() >= avail.left() - 0.01
+                        && l.card.right() <= avail.right() + 0.01
+                        && l.card.top() >= avail.top() - 0.01
+                        && l.card.bottom() <= avail.bottom() + 0.01,
+                    "avail={avail:?} n={n}: カード {:?} がはみ出した",
+                    l.card
+                );
+                assert!(l.cols * l.rows >= n, "起動口が隠れる (cols*rows < {n})");
+                // ボタンの総幅はカードの内側に収まる
+                let used =
+                    l.btn_w * l.cols as f32 + crate::panels::space::SM * (l.cols as f32 - 1.0);
+                assert!(
+                    used <= l.card.width() - crate::panels::space::MD * 2.0 + 0.01,
+                    "avail={avail:?} n={n}: ボタン列 {used} がカード幅を超えた"
+                );
+                assert!(l.btn_w > 0.0);
+            }
         }
-        assert_eq!(empty_state_button_width(1200.0), 280.0, "広くても広げすぎない");
-        assert_eq!(empty_state_button_width(100.0), 120.0, "下限は保つ");
+    }
+
+    /// 高さが足りるときは中央、足りないときは上詰め + スクロール。
+    #[test]
+    fn 空状態は中央に置かれスクロールへ逃げる() {
+        let avail = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
+        let l = panels::empty_card(avail, 7);
+        assert!(!l.scroll, "1400x900 なら 7 個は収まる");
+        let top = l.card.top() - avail.top();
+        let bottom = avail.bottom() - l.card.bottom();
+        assert!(
+            (top - bottom).abs() < 1.0,
+            "上下の余白が揃っていない: {top} / {bottom}"
+        );
+        // 低い窓: カードは可用高いっぱい + スクロール
+        let low = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 180.0));
+        let l2 = panels::empty_card(low, 7);
+        assert!(l2.scroll, "入り切らないならスクロールへ逃がす");
+        assert!(l2.card.height() <= low.height() + 0.01);
+        assert_eq!(l2.card.top(), low.top(), "入り切らないときは上詰め");
+    }
+
+    /// 幅が足りないときはボタンを段組みして、縦の伸びを抑える。
+    #[test]
+    fn 空状態のボタンは幅に応じて段組みする() {
+        let narrow = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 900.0));
+        assert_eq!(panels::empty_card(narrow, 7).cols, 1, "狭ければ 1 列");
+        // 低くて広い窓では列を増やして高さを稼ぐ
+        let wide_low = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 320.0));
+        let l = panels::empty_card(wide_low, 7);
+        assert!(
+            l.cols >= 2,
+            "低い窓では段組みして縦を詰める (cols={})",
+            l.cols
+        );
+    }
+
+    /// トップバー右側は、左のメニューバーと重なる前にアイコンだけへ縮退する。
+    ///
+    /// 900px 幅で「実行 / ターミナル / ヘルプ」の上に「看板」「Cockpit」
+    /// 「既定:承認」が重なって描かれていた (どちらも読めない)。
+    #[test]
+    fn トップバーは狭いとアイコンだけになる() {
+        // 900px: メニューバー + アイコン列でも入らないので装飾系を「⋯」へ畳む
+        assert_eq!(top_bar_density(900.0), TopBarDensity::Overflow);
+        assert!(top_bar_density(900.0).compact());
+        assert_eq!(
+            top_bar_density(TOP_BAR_LEFT_W + TOP_BAR_RIGHT_ICON_W),
+            TopBarDensity::Compact
+        );
+        assert_eq!(
+            top_bar_density(TOP_BAR_LEFT_W + TOP_BAR_RIGHT_W - 1.0),
+            TopBarDensity::Compact
+        );
+        assert_eq!(
+            top_bar_density(TOP_BAR_LEFT_W + TOP_BAR_RIGHT_W),
+            TopBarDensity::Full
+        );
+        assert_eq!(top_bar_density(1400.0), TopBarDensity::Full, "1400px はそのまま");
+        assert!(!top_bar_density(2560.0).compact());
+        // 幅が広がるほど密度が下がることはない (単調)
+        let order = |d: TopBarDensity| match d {
+            TopBarDensity::Overflow => 0,
+            TopBarDensity::Compact => 1,
+            TopBarDensity::Full => 2,
+        };
+        let mut prev = 0;
+        for w in [0.0_f32, 400.0, 800.0, 1000.0, 1049.0, 1050.0, 1200.0, 2000.0] {
+            let cur = order(top_bar_density(w));
+            assert!(cur >= prev, "w={w}: 幅が広いのに密度が下がった");
+            prev = cur;
+        }
+    }
+
+    /// **中央ビューは常に 1 つだけ。**
+    ///
+    /// 実際に起きていた不具合: Cockpit のヘッダーで「📋 看板」を押すと、その
+    /// フレームの途中でフラグが変わり、Cockpit のタイルと看板が重なって描かれた。
+    /// フラグの組み合わせがどうであれ、描くビューは 1 つに畳む。
+    #[test]
+    fn 中央ビューは常に一つだけ() {
+        // 単独
+        assert_eq!(center_view(false, false, false), CenterView::Editor);
+        assert_eq!(center_view(true, false, false), CenterView::Cockpit);
+        assert_eq!(center_view(false, true, false), CenterView::Kanban);
+        assert_eq!(center_view(false, false, true), CenterView::Deck);
+        // 競合してもいずれか 1 つ (デッキ > Cockpit > 看板 > エディタ)
+        assert_eq!(center_view(true, true, false), CenterView::Cockpit);
+        assert_eq!(center_view(true, true, true), CenterView::Deck);
+        assert_eq!(center_view(false, true, true), CenterView::Deck);
+        assert_eq!(center_view(true, false, true), CenterView::Deck);
+        // 全 8 通りで必ず 1 つの値になる (= 重ねようがない)
+        for c in [false, true] {
+            for k in [false, true] {
+                for d in [false, true] {
+                    let v = center_view(c, k, d);
+                    let hits = [
+                        v == CenterView::Editor,
+                        v == CenterView::Cockpit,
+                        v == CenterView::Kanban,
+                        v == CenterView::Deck,
+                    ];
+                    assert_eq!(hits.iter().filter(|x| **x).count(), 1, "c={c} k={k} d={d}");
+                }
+            }
+        }
+    }
+
+    /// 中央ビューの分岐は**生のフラグではなく `self.center`** を見る。
+    ///
+    /// 生のフラグを見ると、描画中に押された「看板」でフラグが変わり、
+    /// 同じフレームに 2 つのビューが描かれて重なる。
+    #[test]
+    fn 中央ビューの分岐はスナップショットを見る() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        // フレーム冒頭で 1 回だけ畳んでいる
+        let upd = src
+            .split("fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {")
+            .nth(1)
+            .expect("update_impl がある");
+        assert!(
+            upd.contains("self.center = center_view(self.cockpit, self.kanban, self.deck);"),
+            "フレーム冒頭で中央ビューを 1 つに畳んでいない"
+        );
+        // 中央パネルの分岐がスナップショットを見ている
+        assert!(
+            src.contains("if self.center == CenterView::Deck {")
+                && src.contains("} else if self.center == CenterView::Cockpit {"),
+            "中央パネルの分岐が生のフラグを見ている"
+        );
+        // 下部端末パネル (看板のホスト) も同じ値で判断している
+        assert!(
+            src.contains("matches!(self.center, CenterView::Kanban | CenterView::Editor)"),
+            "端末パネルの表示判定が生のフラグを見ている"
+        );
     }
 
     /// 見出し行は狭いときアイコンだけに縮退する。
@@ -22446,28 +22919,55 @@ mod cockpit_layout_tests {
         assert!(!cockpit_header_compact(1600.0));
     }
 
-    /// コンポーザは見出し行 (`ui.horizontal`) の**外**で描く。
+    /// **複数行フォームは決して見出し行へ畳み込まない。**
     ///
-    /// 中に入れると複数行のテキスト欄が横並びに押し込まれ、右端の細い帯へ
-    /// 折り返されて見出しの下に数百 px の空白ができる (実際に起きた不具合)。
+    /// 畳み込むと横並びの 1 行に押し込まれ、右端の細い帯へ折り返されて
+    /// 見出しの下に数百 px の空白ができる (実際に起きた不具合)。
+    /// 1 行帯は残り幅が足りる限り畳み込む — 密度の目標は「見出しは 1 行」。
     #[test]
-    fn コンポーザは見出し行の外で描く() {
-        let src = include_str!("app.rs");
-        let body = src
-            .split("fn cockpit_header_ui(")
-            .nth(1)
-            .expect("cockpit_header_ui がある");
-        let head = &body[..body.find("\n    /// Cockpit: 監視役").unwrap_or(body.len())];
-        let close = head
-            .find("\n        });\n")
-            .expect("見出し行 (ui.horizontal) を閉じている");
-        let composer = head
-            .find("panels::agent_composer_ui(")
-            .expect("コンポーザを描いている");
-        assert!(
-            close < composer,
-            "コンポーザが見出しの ui.horizontal の中にある (行の高さが膨らむ)"
-        );
+    fn 複数行フォームは見出し行へ畳み込まない() {
+        for w in [
+            0.0_f32,
+            100.0,
+            COMPOSER_INLINE_MIN_W - 1.0,
+            COMPOSER_INLINE_MIN_W,
+            1200.0,
+        ] {
+            assert!(!composer_fits_header(true, w), "w={w}: 複数行を畳み込んだ");
+        }
+        assert!(!composer_fits_header(false, COMPOSER_INLINE_MIN_W - 1.0));
+        assert!(composer_fits_header(false, COMPOSER_INLINE_MIN_W));
+        assert!(composer_fits_header(false, 1200.0));
+    }
+
+    /// 見出し帯の矩形: 行とコンポーザは重ならず、どちらも可用領域の中。
+    /// 畳み込めたときは見出し帯の高さが**行高そのまま** (密度の目標)。
+    #[test]
+    fn 見出し帯の矩形は重ならず領域内に収まる() {
+        let row_h = 24.0_f32;
+        let form_h = 168.0_f32;
+        for avail in areas() {
+            for expanded in [false, true] {
+                for remaining in [0.0_f32, 120.0, 300.0, 900.0] {
+                    let l = cockpit_header_layout(avail, expanded, remaining, row_h, form_h);
+                    assert!(avail.contains_rect(l.row), "行 {:?} が領域外", l.row);
+                    if let Some(c) = l.composer {
+                        assert!(avail.contains_rect(c), "コンポーザ {c:?} が領域外");
+                        assert!(
+                            c.top() >= l.row.bottom(),
+                            "コンポーザが見出し行と重なっている"
+                        );
+                    } else {
+                        assert!(!expanded, "複数行フォームなのに畳み込まれた");
+                        assert_eq!(
+                            l.height(),
+                            row_h.min(avail.height()),
+                            "1 行に収まっていない"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -22482,14 +22982,16 @@ mod deck_wiring_tests {
     /// デッキ表示中は下部ターミナルパネルを畳む。
     #[test]
     fn デッキ表示中は端末パネルを出さない() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let body = src
             .split("fn terminal_panel(&mut self, ctx: &egui::Context) {")
             .nth(1)
             .expect("terminal_panel がある");
         let head = &body[..body.find("let panel =").unwrap_or(body.len())];
+        // 生のフラグではなく**このフレームの中央ビュー**で判断する。
+        // Kanban と Editor のときだけ出す = デッキ/Cockpit では畳む。
         assert!(
-            head.contains("!self.cockpit && !self.deck"),
+            head.contains("matches!(self.center, CenterView::Kanban | CenterView::Editor)"),
             "デッキを開いている間も端末パネルが出る配線になっている"
         );
     }
@@ -22497,7 +22999,7 @@ mod deck_wiring_tests {
     /// デッキの端末描画は Cockpit / 看板と同じ隔離印を通す。
     #[test]
     fn デッキの端末描画はフレームガードを通す() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let body = src
             .split("fn deck_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {")
             .nth(1)
@@ -22514,7 +23016,7 @@ mod deck_wiring_tests {
     /// (予約は `deck_repaint_ms` が `Some` を返したときだけ)。
     #[test]
     fn デッキは無条件の再描画予約を持たない() {
-        let src = include_str!("deck.rs");
+        let src = &include_str!("deck.rs").replace("\r\n", "\n");
         assert!(
             !src.contains("request_repaint()"),
             "deck.rs に無条件の request_repaint がある (アイドル時の CPU が跳ねる)"
@@ -22576,8 +23078,11 @@ mod approval_panel_tests {
     /// index はセッションを閉じるとずれ、他人に YES を撃ってしまう。
     #[test]
     fn 応答の配達はidで引く() {
-        let src = include_str!("app.rs");
-        let body = src.split("fn resolve_approval(").nth(1).expect("実行部がある");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn resolve_approval(")
+            .nth(1)
+            .expect("実行部がある");
         let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
         assert!(
             head.contains("self.agents.sessions.iter_mut().find(|s| s.id == *sid)"),
@@ -22629,9 +23134,15 @@ mod approval_panel_tests {
         assert_eq!(res.replies.len(), 1, "この 1 件だけは承認される");
 
         // app.rs がその事実を必ず画面へ出していること
-        let src = include_str!("app.rs");
-        let body = src.split("fn resolve_approval(").nth(1).expect("実行部がある");
-        assert!(body.contains("if res.refused_always"), "refused_always を見ていない");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn resolve_approval(")
+            .nth(1)
+            .expect("実行部がある");
+        assert!(
+            body.contains("if res.refused_always"),
+            "refused_always を見ていない"
+        );
         assert!(
             body.contains("権限昇格は「常に許可」にできません"),
             "利用者へ伝える文言が無い"
@@ -22641,8 +23152,11 @@ mod approval_panel_tests {
     /// 監査ログは**描画中に読まない**。控えが無いときだけ描画の外で 1 回読む。
     #[test]
     fn 監査ログは毎フレーム読まない() {
-        let src = include_str!("app.rs");
-        let body = src.split("fn terminal_panel(").nth(1).expect("パネルがある");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn terminal_panel(")
+            .nth(1)
+            .expect("パネルがある");
         let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
         assert!(
             head.contains("self.approvals_audit_cache.is_none()"),
@@ -22665,7 +23179,7 @@ mod composer_wiring_tests {
     /// ここが混ざると「レビュー指示が全エージェントへ漏れる」に戻る。
     #[test]
     fn 全員宛てと指名宛てで経路が分かれる() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let head = src
             .split("let composer = panels::agent_composer_ui(")
             .nth(1)
@@ -22709,8 +23223,11 @@ mod composer_wiring_tests {
     /// 掃除はセッションの増減を拾う 1 か所 (`reconcile_sessions`) で走る。
     #[test]
     fn 下書きの掃除はセッション増減の場所で走る() {
-        let src = include_str!("app.rs");
-        let body = src.split("fn reconcile_sessions(&mut self) {").nth(1).expect("あるはず");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn reconcile_sessions(&mut self) {")
+            .nth(1)
+            .expect("あるはず");
         let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
         assert!(head.contains("self.agent_input_buf.retain_agents(&ids)"));
     }
@@ -22750,8 +23267,11 @@ mod multi_cursor_wiring_tests {
     /// 途中で複数回代入すると取り消しが 1 段では戻らなくなる。
     #[test]
     fn 一括編集の本文書き込みは一度だけ() {
-        let src = include_str!("app.rs");
-        let body = src.split("Cmd::MultiPaste => {").nth(1).expect("MultiPaste の腕がある");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("Cmd::MultiPaste => {")
+            .nth(1)
+            .expect("MultiPaste の腕がある");
         let arm = &body[..body.find("Cmd::ColumnSelectStart =>").unwrap_or(body.len())];
         assert_eq!(
             arm.matches("b.text = ").count(),
@@ -22787,8 +23307,11 @@ mod encoding_wiring_tests {
     /// 決め打ちの表を出すと、選んだのに保存できない項目が混ざる。
     #[test]
     fn ピッカーは使える符号化しか並べない() {
-        let src = include_str!("app.rs");
-        let body = src.split("fn encoding_picker_ui(").nth(1).expect("ピッカーがある");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn encoding_picker_ui(")
+            .nth(1)
+            .expect("ピッカーがある");
         let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
         assert!(
             head.contains("crate::textenc::supported_encodings()"),
@@ -22815,8 +23338,11 @@ mod encoding_wiring_tests {
         assert!(rep.lossy(), "UTF-8 では読めないので化ける");
         assert!(rep.replacements > 0, "化けた箇所を数えている");
 
-        let src = include_str!("app.rs");
-        let body = src.split("fn reopen_with_encoding(").nth(1).expect("開き直しがある");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn reopen_with_encoding(")
+            .nth(1)
+            .expect("開き直しがある");
         let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
         assert!(head.contains("rep.lossy()"), "化けたかどうかを見ていない");
         assert!(head.contains("rep.replacements"), "件数を出していない");
@@ -22843,8 +23369,11 @@ mod encoding_wiring_tests {
             assert_eq!(issue.char_index(), None);
         }
 
-        let src = include_str!("app.rs");
-        let body = src.split("fn save_with_encoding(").nth(1).expect("保存がある");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn save_with_encoding(")
+            .nth(1)
+            .expect("保存がある");
         let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
         assert!(
             head.contains("if let Some(ix) = issue.char_index()"),
@@ -22874,7 +23403,7 @@ mod quarantine_hole_tests {
     /// 何が起きたのか分からない。ここが `return;` に戻ったら気付けるように。
     #[test]
     fn 隔離されたパネルは代わりの説明を描く() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let body = src
             .split("fn guarded_view(&mut self, sv: Subview, ctx: &egui::Context, draw:")
             .nth(1)
@@ -22894,7 +23423,7 @@ mod quarantine_hole_tests {
     /// id を変えるとリサイズ幅の記憶が失われ、復帰した瞬間に既定幅へ戻る。
     #[test]
     fn 代わりのパネルは同じidを使う() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let body = src
             .split("fn quarantined_panel_ui(")
             .nth(1)
@@ -22913,7 +23442,7 @@ mod quarantine_hole_tests {
     /// バナーは 1 度閉じると出ないので、ここに無いと永久に死んだままになる。
     #[test]
     fn プレースホルダから再試行できる() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let body = src
             .split("fn quarantine_placeholder_ui(")
             .nth(1)
@@ -22986,7 +23515,7 @@ mod quarantine_hole_tests {
     /// 掃除はセッションの増減を拾う 1 か所 (`reconcile_sessions`) で走る。
     #[test]
     fn 隔離の掃除はセッション増減の場所で走る() {
-        let src = include_str!("app.rs");
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
         let body = src
             .split("fn reconcile_sessions(&mut self) {")
             .nth(1)

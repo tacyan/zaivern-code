@@ -733,6 +733,11 @@ fn state_badge(state: TaskState, theme: &Theme) -> (&'static str, egui::Color32)
 }
 
 /// Cockpit に差し込む調停セクション。押されたボタンを [`OrchAction`] で返す。
+/// Cockpit の「タスクとメッセージ」行。
+///
+/// `race_slot` に `Some` が来たときは、この行の右側にプロンプトレースの
+/// 起動口を間借りさせ、押されたら `true` を書き戻す。レースが暇なときに
+/// 見出しだけの行を 1 本消すための相席で、レースが動き出せば `None` になる。
 pub fn cockpit_section(
     st: &mut OrchState,
     ui: &mut egui::Ui,
@@ -740,6 +745,7 @@ pub fn cockpit_section(
     tasks: &[Task],
     rows: &[SessionRow],
     bus: &BusStatus,
+    race_slot: Option<&mut bool>,
 ) -> Vec<OrchAction> {
     let mut acts: Vec<OrchAction> = Vec::new();
 
@@ -802,6 +808,18 @@ pub fn cockpit_section(
                 st.msg_target = MsgTarget::Broadcast;
                 st.msg_body.clear();
                 st.msg_open = true;
+            }
+            // レースが暇なときだけ、その起動口をこの行に相席させる。
+            if let Some(open) = race_slot {
+                if ui
+                    .button(tr("🏁 新しいレース…"))
+                    .on_hover_text(tr(
+                        "1 つのプロンプトを複数エージェントに並走させ、勝った実装を採用します",
+                    ))
+                    .clicked()
+                {
+                    *open = true;
+                }
             }
         });
     });
