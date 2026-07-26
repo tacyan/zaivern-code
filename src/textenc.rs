@@ -79,6 +79,15 @@ impl Encoding {
     pub fn is_legacy(&self) -> bool {
         !matches!(self, Encoding::Utf8)
     }
+
+    /// 省略しない名前。[`label`](Self::label) は既定を空文字にするので、
+    /// 「UTF-8 / CRLF」のように**必ず何か書きたい**場所ではこちらを使う。
+    pub fn name(&self) -> String {
+        match self {
+            Encoding::Utf8 => "UTF-8".to_string(),
+            other => other.label(),
+        }
+    }
 }
 
 /// Windows の ANSI コードページのうち、番号だけでは伝わりにくいものの通称。
@@ -159,6 +168,260 @@ pub fn encode_bytes(text: &str, enc: Encoding) -> (Vec<u8>, Encoding) {
             None => (text.as_bytes().to_vec(), Encoding::Utf8),
         },
     }
+}
+
+// ───────────────────────── 改行コード ─────────────────────────
+//
+// # なぜここにあるか
+//
+// 「そのバイト列をどう文字にしたか」と「その本文の改行がどれか」は、
+// どちらもファイルを開いた瞬間に決まり、保存で元へ戻すために持ち回る情報。
+// 同じ場所に置いておくと [`TextFormat`] 一つでステータスバーに
+// 「UTF-8 / CRLF」と出せる。
+//
+// # 現状の保持方針 (2026-07 時点) と推奨
+//
+// **現状**: [`decode_bytes`] は CR を落とさない。src/editor.rs の open / reload は
+// その文字列をそのまま `Buffer.text` に入れ、保存 (`Buffer::write_to`) も
+// [`encode_bytes`] へそのまま渡す。つまり **CRLF のファイルは `\r` が本文に乗ったまま**
+// 編集される (行末に見えない `\r` が 1 文字ぶら下がる)。
+// このモジュールからその方針を勝手に変えることはしない。
+//
+// **推奨** (editor.rs 側を触れる担当への申し送り):
+//
+// 1. 読み込み: `let le = detect_line_ending(&text);` を `Buffer` に覚え、
+//    本文は `normalize_to(&text, LineEnding::Lf)` にして LF だけを持つ。
+//    こうすると検索・桁数・折り返し・`trim_end` が `\r` を気にしなくて済む。
+// 2. 保存: `normalize_to(&buf.text, buf.line_ending)` を [`encode_bytes`] へ渡す。
+//    元が CRLF のファイルは CRLF のまま書き戻る (差分が全行になる事故を防ぐ)。
+// 3. 混在 ([`LineEnding::Mixed`]) は保存時に最多の様式へ寄せる
+//    ([`LineEnding::as_str`] が最多を返す) か、ユーザーに選ばせる。
+//
+// どちらの方針でもこのモジュールの関数は安全に使える:
+// [`normalize_to`] は冪等で、既に統一済みの本文を渡しても何も増やさない。
+
+/// 本文に現れた改行の内訳。混在ファイルの状況をそのまま持つので、
+/// ステータスバーに「LF が 3 行だけ混ざっている」と出せる。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LineEndingCounts {
+    /// 単独の `\n`。
+    pub lf: usize,
+    /// `\r\n` の組。
+    pub crlf: usize,
+    /// 単独の `\r` (古い Mac / 壊れたツールの出力)。
+    pub cr: usize,
+}
+
+impl LineEndingCounts {
+    /// 改行の総数 = 行数 - 1 (最終行に改行が無い場合)。
+    pub fn total(&self) -> usize {
+        self.lf + self.crlf + self.cr
+    }
+
+    /// 最も多い様式。同数のときは CRLF → LF → CR の順で決める
+    /// (見えない `\r` が本文に残るほうが実害が大きいので、まず CRLF を疑わせる)。
+    /// 改行が 1 つも無ければ既定の [`LineEnding::Lf`] — 判定材料が無いときに
+    /// OS を見て決めると、同じファイルが環境ごとに違う様式で保存されてしまう。
+    pub fn dominant(&self) -> LineEnding {
+        if self.total() == 0 {
+            return LineEnding::Lf;
+        }
+        let max = self.crlf.max(self.lf).max(self.cr);
+        if self.crlf == max {
+            LineEnding::Crlf
+        } else if self.lf == max {
+            LineEnding::Lf
+        } else {
+            LineEnding::Cr
+        }
+    }
+
+    /// 少数派の合計行数 = 統一すれば書き換わる行数。0 なら混在していない。
+    pub fn strays(&self) -> usize {
+        let dom = match self.dominant() {
+            LineEnding::Crlf => self.crlf,
+            LineEnding::Cr => self.cr,
+            _ => self.lf,
+        };
+        self.total() - dom
+    }
+}
+
+/// 改行コード。混在は「内訳ごと」持つ ([`LineEndingCounts`]) ので、
+/// UI は最多の様式と少数派の行数の両方を出せる。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LineEnding {
+    /// `\n` — Unix / 既定。
+    #[default]
+    Lf,
+    /// `\r\n` — Windows。
+    Crlf,
+    /// `\r` — 古い Mac。今も稀に流れてくる。
+    Cr,
+    /// 1 つのファイルに複数の様式。中身は内訳。
+    Mixed(LineEndingCounts),
+}
+
+impl LineEnding {
+    /// 書き出すときの実際の文字列。混在は最多の様式へ寄せる。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LineEnding::Lf => "\n",
+            LineEnding::Crlf => "\r\n",
+            LineEnding::Cr => "\r",
+            LineEnding::Mixed(c) => c.dominant().as_str(),
+        }
+    }
+
+    /// 混在なら最多の様式、そうでなければ自分自身。変換先を決めるときに使う。
+    pub fn dominant(&self) -> LineEnding {
+        match self {
+            LineEnding::Mixed(c) => c.dominant(),
+            other => *other,
+        }
+    }
+
+    /// 混在しているか (UI が注意を促すかどうかの判断に使う)。
+    pub fn is_mixed(&self) -> bool {
+        matches!(self, LineEnding::Mixed(_))
+    }
+
+    /// ステータスバー向けの名前。混在は「CRLF (LF 3行混在)」のように内訳を添える。
+    pub fn label(&self) -> String {
+        match self {
+            LineEnding::Lf => "LF".to_string(),
+            LineEnding::Crlf => "CRLF".to_string(),
+            LineEnding::Cr => "CR".to_string(),
+            LineEnding::Mixed(c) => {
+                let dom = c.dominant();
+                let strays: Vec<String> = [
+                    (LineEnding::Crlf, c.crlf),
+                    (LineEnding::Lf, c.lf),
+                    (LineEnding::Cr, c.cr),
+                ]
+                .iter()
+                .filter(|(kind, n)| *n > 0 && *kind != dom)
+                .map(|(kind, n)| format!("{} {n}行", kind.label()))
+                .collect();
+                if strays.is_empty() {
+                    dom.label()
+                } else {
+                    format!("{} ({}混在)", dom.label(), strays.join(", "))
+                }
+            }
+        }
+    }
+}
+
+/// 本文の改行を数える。構文は一切見ない — **実際の CR / LF バイトだけ**を数える。
+///
+/// つまりソースコードの文字列リテラルの中に本物の CR LF が入っていれば、
+/// それも 1 行として数える (エディタから見れば実際にそこで行が変わるため。
+/// 逆に `"\\r\\n"` のようなエスケープ表記の 2 文字は改行バイトではないので数えない)。
+/// CR / LF のバイト値は UTF-8 の多バイト列の途中には決して現れないので、
+/// バイト走査でも日本語のファイルを壊さない。
+pub fn count_line_endings(text: &str) -> LineEndingCounts {
+    let mut c = LineEndingCounts::default();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\r' => {
+                if b.get(i + 1) == Some(&b'\n') {
+                    c.crlf += 1;
+                    i += 2;
+                } else {
+                    c.cr += 1;
+                    i += 1;
+                }
+            }
+            b'\n' => {
+                c.lf += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    c
+}
+
+/// 本文の改行コードを判定する。
+///
+/// - 空文字列 / 改行の無い 1 行だけの本文 → [`LineEnding::Lf`]
+///   (材料が無いときは環境に依存しない既定を返す)。
+/// - 1 種類しか出てこない → その様式。
+/// - 2 種類以上 → [`LineEnding::Mixed`] に**内訳ごと**返す。
+///   UI は `label()` で「CRLF (LF 3行混在)」と出せる。
+pub fn detect_line_ending(text: &str) -> LineEnding {
+    let counts = count_line_endings(text);
+    if counts.strays() > 0 {
+        LineEnding::Mixed(counts)
+    } else {
+        counts.dominant()
+    }
+}
+
+/// 改行を `target` へ揃える。本文の他の文字は一切変えない (無損失)。
+///
+/// - `\r\n` を二重にしない (`\r` と `\n` を別々に数えない)。
+/// - 単独の `\r` も 1 つの改行として扱う。
+/// - 既に揃っている本文を渡しても内容は変わらない (冪等)。
+/// - `target` が [`LineEnding::Mixed`] のときは最多の様式へ揃える。
+pub fn normalize_to(text: &str, target: LineEnding) -> String {
+    let eol = target.as_str();
+    let b = text.as_bytes();
+    // 最悪 (LF → CRLF) でも 1 改行につき 1 バイトしか増えない
+    let mut out = String::with_capacity(text.len() + count_line_endings(text).total());
+    let mut i = 0;
+    let mut last = 0;
+    while i < b.len() {
+        let skip = match b[i] {
+            b'\r' if b.get(i + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // 切る位置は必ず CR/LF の直前 = 文字境界
+        out.push_str(&text[last..i]);
+        out.push_str(eol);
+        i += skip;
+        last = i;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// ファイルを開いたときに決まる「読み方」一式。保存時に元へ戻すために持ち回る。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextFormat {
+    pub encoding: Encoding,
+    pub line_ending: LineEnding,
+}
+
+impl TextFormat {
+    /// ステータスバー 1 行ぶん。例: 「UTF-8 / CRLF」「CP932 (Shift_JIS) / LF」。
+    pub fn label(&self) -> String {
+        format!("{} / {}", self.encoding.name(), self.line_ending.label())
+    }
+}
+
+/// [`decode_bytes`] + [`detect_line_ending`]。開く経路はこれ 1 本で足りる。
+///
+/// 返す本文は**変換していない** (CR は落とさない) ので、現状の
+/// 「生のまま持つ」方針のまま差し替えられる。LF 正規化へ移るときは
+/// 呼び出し側で `normalize_to(&text, LineEnding::Lf)` を挟む。
+pub fn decode_with_format(bytes: &[u8]) -> (String, TextFormat) {
+    let (text, encoding) = decode_bytes(bytes);
+    let line_ending = detect_line_ending(&text);
+    (
+        text,
+        TextFormat {
+            encoding,
+            line_ending,
+        },
+    )
 }
 
 // ───────────────────────── PowerShell 連携 ─────────────────────────
@@ -571,5 +834,133 @@ mod tests {
         assert!(matches!(enc, Encoding::Ansi(_)));
         // 保存経路も落ちないこと
         let _ = encode_bytes(&s, enc);
+    }
+
+    // ───────────────────────── 改行コード ─────────────────────────
+
+    #[test]
+    fn detect_lf_only() {
+        assert_eq!(detect_line_ending("a\nb\nc\n"), LineEnding::Lf);
+        assert_eq!(detect_line_ending("\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::Lf.label(), "LF");
+        assert_eq!(LineEnding::Lf.as_str(), "\n");
+    }
+
+    #[test]
+    fn detect_crlf_only() {
+        assert_eq!(detect_line_ending("a\r\nb\r\n"), LineEnding::Crlf);
+        // \r と \n を別々に数えない = 混在扱いにしない
+        assert!(!detect_line_ending("a\r\nb\r\n").is_mixed());
+        assert_eq!(LineEnding::Crlf.as_str(), "\r\n");
+    }
+
+    #[test]
+    fn detect_cr_only() {
+        assert_eq!(detect_line_ending("a\rb\rc"), LineEnding::Cr);
+        assert_eq!(LineEnding::Cr.label(), "CR");
+    }
+
+    #[test]
+    fn detect_empty_and_single_line_default_to_lf() {
+        // 材料が無いときは OS を見ずに既定を返す (環境で結果が変わらないこと)
+        assert_eq!(detect_line_ending(""), LineEnding::Lf);
+        assert_eq!(detect_line_ending("改行の無い一行"), LineEnding::Lf);
+        assert_eq!(count_line_endings("").total(), 0);
+    }
+
+    #[test]
+    fn detect_mixed_reports_the_dominant_style_and_strays() {
+        // CRLF が 5 行、LF が 3 行 → 「CRLF (LF 3行混在)」
+        let text = "a\r\nb\r\nc\r\nd\r\ne\r\nf\ng\nh\n";
+        let le = detect_line_ending(text);
+        let LineEnding::Mixed(c) = le else {
+            panic!("混在と判定されるべき: {le:?}");
+        };
+        assert_eq!((c.crlf, c.lf, c.cr), (5, 3, 0));
+        assert_eq!(c.dominant(), LineEnding::Crlf);
+        assert_eq!(c.strays(), 3, "統一すれば書き換わる行数");
+        assert_eq!(le.label(), "CRLF (LF 3行混在)");
+        assert_eq!(le.as_str(), "\r\n", "保存は最多の様式へ寄せる");
+    }
+
+    #[test]
+    fn mixed_label_lists_every_stray_kind() {
+        let le = detect_line_ending("a\nb\nc\nd\r\ne\rf");
+        assert_eq!(le.label(), "LF (CRLF 1行, CR 1行混在)");
+        assert_eq!(le.dominant(), LineEnding::Lf);
+    }
+
+    /// 文字列リテラルの中に**本物の** CR LF が入っていても 1 行として数える。
+    /// エディタから見れば実際にそこで行が変わるため (構文は見ない)。
+    #[test]
+    fn real_crlf_inside_a_string_literal_still_counts() {
+        let text = "let s = \"head\r\ntail\";\n";
+        let c = count_line_endings(text);
+        assert_eq!((c.crlf, c.lf), (1, 1), "リテラル内の実 CRLF も 1 行");
+        assert!(detect_line_ending(text).is_mixed());
+        // エスケープ表記 (バックスラッシュ + r) は改行バイトではないので数えない
+        let escaped = "let s = \"head\\r\\ntail\";\n";
+        assert_eq!(count_line_endings(escaped).crlf, 0);
+        assert_eq!(detect_line_ending(escaped), LineEnding::Lf);
+    }
+
+    #[test]
+    fn normalize_covers_every_pair_of_conversions() {
+        let cases = [
+            ("a\nb\nc", "a\r\nb\r\nc", "a\rb\rc"), // (LF, CRLF, CR) の同じ本文
+        ];
+        for (lf, crlf, cr) in cases {
+            for src in [lf, crlf, cr] {
+                assert_eq!(normalize_to(src, LineEnding::Lf), lf, "{src:?} → LF");
+                assert_eq!(normalize_to(src, LineEnding::Crlf), crlf, "{src:?} → CRLF");
+                assert_eq!(normalize_to(src, LineEnding::Cr), cr, "{src:?} → CR");
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_is_idempotent_and_never_doubles_crlf() {
+        let once = normalize_to("a\r\nb\n", LineEnding::Crlf);
+        assert_eq!(once, "a\r\nb\r\n");
+        assert_eq!(normalize_to(&once, LineEnding::Crlf), once, "冪等");
+        assert!(!once.contains("\r\r"), "\\r を増やしてはいけない");
+        assert!(!once.contains("\n\n"));
+    }
+
+    #[test]
+    fn normalize_handles_lone_cr_and_missing_final_newline() {
+        assert_eq!(normalize_to("a\rb", LineEnding::Lf), "a\nb");
+        assert_eq!(normalize_to("a\r", LineEnding::Crlf), "a\r\n");
+        // 末尾に改行が無い本文は末尾に何も足さない
+        assert_eq!(normalize_to("末尾に改行なし", LineEnding::Crlf), "末尾に改行なし");
+        assert_eq!(normalize_to("", LineEnding::Crlf), "");
+    }
+
+    #[test]
+    fn normalize_keeps_multibyte_text_intact() {
+        let src = "日本語\r\n🚀 絵文字\nおわり";
+        assert_eq!(normalize_to(&normalize_to(src, LineEnding::Lf), LineEnding::Crlf), "日本語\r\n🚀 絵文字\r\nおわり");
+    }
+
+    #[test]
+    fn normalize_to_mixed_uses_the_dominant_style() {
+        let mixed = detect_line_ending("a\r\nb\r\nc\n");
+        assert_eq!(normalize_to("x\ny\n", mixed), "x\r\ny\r\n");
+    }
+
+    /// 符号化と改行を 1 つにして「UTF-8 / CRLF」と出せること。
+    #[test]
+    fn decode_with_format_reports_encoding_and_line_ending() {
+        let (text, fmt) = decode_with_format(b"a\r\nb\r\n");
+        assert_eq!(text, "a\r\nb\r\n", "CR は落とさない (現状の方針を変えない)");
+        assert_eq!(fmt.encoding, Encoding::Utf8);
+        assert_eq!(fmt.line_ending, LineEnding::Crlf);
+        assert_eq!(fmt.label(), "UTF-8 / CRLF");
+
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice("あ\n".as_bytes());
+        let (_, fmt) = decode_with_format(&bom);
+        assert_eq!(fmt.label(), "UTF-8 BOM / LF");
+        assert_eq!(Encoding::Ansi(932).name(), "CP932 (Shift_JIS)");
     }
 }

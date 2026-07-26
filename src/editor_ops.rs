@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+use crate::textenc::{detect_line_ending, normalize_to, LineEnding};
+
 /// char インデックス -> バイトインデックス変換。範囲外は文字列末尾にクランプ。
 pub fn char_to_byte(s: &str, char_idx: usize) -> usize {
     s.char_indices()
@@ -519,6 +521,206 @@ pub fn comment_prefix_for(lang: &str) -> Option<&'static str> {
     }
 }
 
+// ───────────────────── 保存時のクリーンアップ ─────────────────────
+//
+// 「行末の空白を落とす」「最終行に改行を入れる」は、他のエディタでは保存時の
+// 既定になっていることが多い。差分に無意味な空白変更が混ざらなくなるため。
+//
+// # UI 側の配線 (このモジュールからは触れないので申し送り)
+//
+// ```ignore
+// // 保存直前 — editor.rs の Buffer::write_to を呼ぶ前に挟む
+// let opts = SaveCleanup {
+//     trim_trailing: cfg.trim_trailing_whitespace,   // 設定 (既定 false = 今までどおり)
+//     final_newline: cfg.insert_final_newline,
+//     target_ending: Some(buf.line_ending),          // 開いたときに覚えた改行コード
+// };
+// let (cleaned, changed) = apply_save_cleanup_checked(&buf.text, &opts);
+// if changed {
+//     // カーソル・選択範囲は行末が削れたぶんずれるので必ず付け替える
+//     cursor = adjust_char_index_after_cleanup(&buf.text, &cleaned, cursor);
+//     sel_end = adjust_char_index_after_cleanup(&buf.text, &cleaned, sel_end);
+//     buf.text = cleaned;   // dirty 判定・undo スタックもここで更新する
+// }
+// ```
+//
+// `changed` が false のときは本文が 1 バイトも変わっていないので、
+// 書き込みも undo 積みもカーソル付け替えも丸ごと省ける。
+
+/// 行の切れ目。`(本文開始, 本文終了, 改行を含む終了)` のバイト位置。
+///
+/// LF / CRLF / CR のどれでも 1 行として切る (CR だけのファイルも 1 行ずつ扱える)。
+/// 最終行は改行が無くても 1 行と数える — 本文が `"a\n"` なら
+/// 「`a`」と「空の最終行」の 2 行。エディタの見た目と行数が一致する。
+fn line_segments(text: &str) -> Vec<(usize, usize, usize)> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let skip = match b[i] {
+            b'\r' if b.get(i + 1) == Some(&b'\n') => 2,
+            b'\r' | b'\n' => 1,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        out.push((start, i, i + skip));
+        i += skip;
+        start = i;
+    }
+    out.push((start, b.len(), b.len()));
+    out
+}
+
+/// 行末で落としてよい空白か。
+///
+/// **全角スペース U+3000 と NBSP U+00A0 は落とさない。** 日本語の本文では
+/// 字下げ・体裁として意図して置かれる有意な文字で、保存のたびに消えると
+/// 書いた内容が変わってしまう (半角スペースやタブと違い「見た目に効く文字」)。
+/// `\r` `\n` も対象外 — 改行は本文ではなく行の区切りなので絶対に削らない。
+fn is_trimmable_space(c: char) -> bool {
+    c.is_whitespace() && !matches!(c, '\u{3000}' | '\u{00a0}' | '\r' | '\n')
+}
+
+/// 各行の行末の空白 (半角スペース・タブ等) を落とす。
+///
+/// - 改行は LF / CRLF / CR のどれでもそのまま残す (CRLF の `\r` を食わない)。
+/// - 行数は絶対に変えない — 改行を消さないので、空白だけの行は「空の行」になるだけ。
+/// - 落とすものが無ければ入力と同一の文字列を返す。
+pub fn trim_trailing_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (s, e, seg_end) in line_segments(text) {
+        out.push_str(text[s..e].trim_end_matches(is_trimmable_space));
+        out.push_str(&text[e..seg_end]);
+    }
+    out
+}
+
+/// 最終行に改行が無ければ足す。
+///
+/// - 既に改行で終わっていれば何もしない (空行を増やさない)。
+/// - 空の本文には足さない — 何も書いていないファイルを 1 行のファイルにしない。
+/// - 空白だけの本文には足す (「1 行書いてある」ので他の行と同じ扱い)。
+/// - `ending` が [`LineEnding::Mixed`] のときは最多の様式を使う。
+pub fn ensure_final_newline(text: &str, ending: LineEnding) -> String {
+    if text.is_empty() || text.ends_with('\n') || text.ends_with('\r') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push_str(text);
+    out.push_str(ending.as_str());
+    out
+}
+
+/// 保存時に本文へかける整形。すべて既定は「何もしない」。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SaveCleanup {
+    /// 行末の空白を落とす。
+    pub trim_trailing: bool,
+    /// 最終行に改行を入れる。
+    pub final_newline: bool,
+    /// 改行コードを揃える。`None` なら本文の改行には触らない。
+    pub target_ending: Option<LineEnding>,
+}
+
+impl SaveCleanup {
+    /// 何も仕事が無い設定か (呼び出し側が丸ごと省けるようにする)。
+    pub fn is_noop(&self) -> bool {
+        !self.trim_trailing && !self.final_newline && self.target_ending.is_none()
+    }
+}
+
+/// [`SaveCleanup`] を順に適用する。適用順は固定:
+///
+/// 1. 行末の空白を落とす
+/// 2. 改行コードを揃える (`target_ending` があるとき)
+/// 3. 最終行に改行を入れる
+///
+/// この順でないと、1 で行末が空白だけになった行を 3 が数え違えたり、
+/// 3 が足した改行を 2 が揃え忘れたりする。
+pub fn apply_save_cleanup(text: &str, opts: &SaveCleanup) -> String {
+    apply_save_cleanup_checked(text, opts).0
+}
+
+/// [`apply_save_cleanup`] に「変わったか」を添えた版。
+///
+/// `changed == false` なら本文は 1 バイトも変わっていないので、
+/// 書き込み・undo 積み・カーソル付け替えをまとめて省ける。
+pub fn apply_save_cleanup_checked(text: &str, opts: &SaveCleanup) -> (String, bool) {
+    if opts.is_noop() {
+        return (text.to_string(), false);
+    }
+    let mut out = if opts.trim_trailing {
+        trim_trailing_whitespace(text)
+    } else {
+        text.to_string()
+    };
+    if let Some(target) = opts.target_ending {
+        out = normalize_to(&out, target);
+    }
+    if opts.final_newline {
+        // 変換先が指定されていなければ、その本文で一番多い改行に合わせる
+        let ending = opts
+            .target_ending
+            .unwrap_or_else(|| detect_line_ending(&out));
+        out = ensure_final_newline(&out, ending);
+    }
+    let changed = out != text;
+    (out, changed)
+}
+
+/// 整形前の**バイト**位置を、整形後の同じ「見た目の位置」へ付け替える。
+///
+/// 行末の空白が消えると後続の文字位置が全部ずれるので、これを通さないと
+/// カーソルが別の行の途中へ飛ぶ。方針は「行と桁を保つ」:
+///
+/// - 行の途中 → 同じ行の同じ桁。
+/// - 消えた空白の中にいた → その行の新しい行末 (ユーザーが見ていた場所に一番近い)。
+/// - 改行の途中 (CRLF の `\r` と `\n` の間) → 変換後の改行の中の同じ位置。
+/// - 行が減った (整形後のほうが行数が少ない) → 最後の行へ寄せる。
+///
+/// 返り値は必ず文字境界 — 多バイト文字 (日本語) の途中は返さない。
+pub fn adjust_offset_after_cleanup(original: &str, cleaned: &str, offset: usize) -> usize {
+    if original == cleaned {
+        return snap_char_boundary(cleaned, offset);
+    }
+    let offset = offset.min(original.len());
+    let src = line_segments(original);
+    let dst = line_segments(cleaned);
+    // offset を含む行 = 行頭が offset 以下である最後の行
+    let i = src.iter().rposition(|&(s, _, _)| s <= offset).unwrap_or(0);
+    let (s, e, _) = src[i];
+    let (ds, de, dseg_end) = dst[i.min(dst.len() - 1)];
+    let mapped = if offset <= e {
+        // 本文の中 (行末より後ろ = 削られた空白の中なら行末へ寄せる)
+        ds + (offset - s).min(de - ds)
+    } else {
+        // 改行バイトの途中
+        de + (offset - e).min(dseg_end - de)
+    };
+    snap_char_boundary(cleaned, mapped)
+}
+
+/// [`adjust_offset_after_cleanup`] の char インデックス版。
+///
+/// このモジュールの他の関数と egui の `CCursor` は char 単位なので、
+/// UI から呼ぶときはこちらを使う (バイト版はファイル入出力側向け)。
+pub fn adjust_char_index_after_cleanup(original: &str, cleaned: &str, char_idx: usize) -> usize {
+    let byte = char_to_byte(original, char_idx);
+    byte_to_char(cleaned, adjust_offset_after_cleanup(original, cleaned, byte))
+}
+
+/// バイト位置を文字境界まで手前へ寄せる (多バイト文字を割らないため)。
+fn snap_char_boundary(s: &str, byte: usize) -> usize {
+    let mut byte = byte.min(s.len());
+    while byte > 0 && !s.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,5 +1121,228 @@ mod tests {
                 select: (1, 4)
             })
         );
+    }
+
+    // ---- trim_trailing_whitespace ----
+
+    #[test]
+    fn trim_removes_spaces_and_tabs_at_line_end() {
+        assert_eq!(trim_trailing_whitespace("a  \nb\t\t\nc   "), "a\nb\nc");
+        // 行頭・行中の空白は触らない
+        assert_eq!(trim_trailing_whitespace("    let x = 1;  \n"), "    let x = 1;\n");
+    }
+
+    #[test]
+    fn trim_keeps_crlf_and_cr_intact() {
+        assert_eq!(trim_trailing_whitespace("a  \r\nb\t\r\n"), "a\r\nb\r\n");
+        // CR だけのファイルも 1 行ずつ扱える (\r を本文と間違えて消さない)
+        assert_eq!(trim_trailing_whitespace("a  \rb \r"), "a\rb\r");
+    }
+
+    #[test]
+    fn trim_empties_whitespace_only_lines_without_changing_line_count() {
+        let text = "a\n   \n\t\nb";
+        let got = trim_trailing_whitespace(text);
+        assert_eq!(got, "a\n\n\nb");
+        assert_eq!(
+            got.matches('\n').count(),
+            text.matches('\n').count(),
+            "改行を消してはいけない = 行数が変わらない"
+        );
+        // 末尾の「改行なしの空白だけの行」も空行として残る (行数は 2 のまま)
+        let tail = trim_trailing_whitespace("a\n   ");
+        assert_eq!(tail, "a\n");
+        assert_eq!(tail.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn trim_returns_an_identical_string_when_nothing_to_do() {
+        let text = "fn main() {\n    println!();\n}\n";
+        assert_eq!(trim_trailing_whitespace(text), text);
+        assert_eq!(trim_trailing_whitespace(""), "");
+        assert_eq!(trim_trailing_whitespace("\n\n"), "\n\n");
+    }
+
+    /// 全角スペース U+3000 は**落とさない**。日本語の本文では字下げや体裁として
+    /// 意図して置かれる有意な文字で、保存のたびに消えると書いた内容が変わる。
+    #[test]
+    fn trim_keeps_ideographic_space_and_nbsp() {
+        let text = "日本語　\n次の行　";
+        assert_eq!(trim_trailing_whitespace(text), text, "全角スペースは残す");
+        assert_eq!(trim_trailing_whitespace("x\u{a0}\n"), "x\u{a0}\n", "NBSP も残す");
+        // 全角スペースの後ろに付いた半角だけが落ちる
+        assert_eq!(trim_trailing_whitespace("日本語　  \t\n"), "日本語　\n");
+    }
+
+    // ---- ensure_final_newline ----
+
+    #[test]
+    fn ensure_final_newline_adds_only_when_missing() {
+        assert_eq!(ensure_final_newline("a", LineEnding::Lf), "a\n");
+        assert_eq!(ensure_final_newline("a\n", LineEnding::Lf), "a\n", "二重にしない");
+        assert_eq!(ensure_final_newline("a\r\n", LineEnding::Crlf), "a\r\n");
+        assert_eq!(ensure_final_newline("a\r", LineEnding::Cr), "a\r");
+        assert_eq!(ensure_final_newline("", LineEnding::Lf), "", "空のファイルは空のまま");
+        // 空白だけの本文は「1 行書いてある」ので他の行と同じ扱い
+        assert_eq!(ensure_final_newline("   ", LineEnding::Lf), "   \n");
+        assert_eq!(ensure_final_newline("日本語", LineEnding::Crlf), "日本語\r\n");
+        // 混在は最多の様式で足す
+        let mixed = crate::textenc::detect_line_ending("a\r\nb\r\nc\n");
+        assert_eq!(ensure_final_newline("x", mixed), "x\r\n");
+    }
+
+    // ---- apply_save_cleanup ----
+
+    #[test]
+    fn save_cleanup_composes_trim_ending_and_final_newline() {
+        let opts = SaveCleanup {
+            trim_trailing: true,
+            final_newline: true,
+            target_ending: Some(LineEnding::Crlf),
+        };
+        let (out, changed) = apply_save_cleanup_checked("a  \nb\t", &opts);
+        assert_eq!(out, "a\r\nb\r\n");
+        assert!(changed);
+        assert_eq!(apply_save_cleanup("a  \nb\t", &opts), out, "短い版も同じ結果");
+    }
+
+    #[test]
+    fn save_cleanup_changed_flag_is_exact() {
+        let all = SaveCleanup {
+            trim_trailing: true,
+            final_newline: true,
+            target_ending: None,
+        };
+        // 既に整っている本文は 1 バイトも変わらない
+        let (out, changed) = apply_save_cleanup_checked("a\nb\n", &all);
+        assert_eq!(out, "a\nb\n");
+        assert!(!changed, "変わっていないなら書き込みを省けること");
+        // 何もしない設定は本文を素通しする
+        let noop = SaveCleanup::default();
+        assert!(noop.is_noop());
+        let (out, changed) = apply_save_cleanup_checked("a  \n", &noop);
+        assert_eq!(out, "a  \n");
+        assert!(!changed);
+        // 空の本文は最終改行を足さないので変化なし
+        assert_eq!(apply_save_cleanup_checked("", &all), (String::new(), false));
+    }
+
+    #[test]
+    fn save_cleanup_final_newline_follows_the_existing_ending() {
+        let opts = SaveCleanup {
+            trim_trailing: false,
+            final_newline: true,
+            target_ending: None,
+        };
+        // 変換先を指定しなければ、その本文で一番多い改行に合わせる
+        assert_eq!(apply_save_cleanup("a\r\nb", &opts), "a\r\nb\r\n");
+        assert_eq!(apply_save_cleanup("a\nb", &opts), "a\nb\n");
+        // 改行コードだけ揃える (本文には触らない)
+        let only_ending = SaveCleanup {
+            trim_trailing: false,
+            final_newline: false,
+            target_ending: Some(LineEnding::Lf),
+        };
+        assert_eq!(apply_save_cleanup("a\r\nb  \r\n", &only_ending), "a\nb  \n");
+    }
+
+    // ---- adjust_offset_after_cleanup ----
+
+    #[test]
+    fn adjust_offset_keeps_the_caret_where_the_user_sees_it() {
+        let original = "abc   \ndef  \nghi";
+        let cleaned = trim_trailing_whitespace(original);
+        assert_eq!(cleaned, "abc\ndef\nghi");
+        // (整形前 byte, 期待する整形後 byte, 説明)
+        let cases = [
+            (0, 0, "行頭"),
+            (2, 2, "削られる前の位置はそのまま"),
+            (3, 3, "削られる空白の直前 = 新しい行末"),
+            (5, 3, "削られた空白の中 → 行末へ寄せる"),
+            (6, 3, "改行の直前"),
+            (7, 4, "次の行の行頭 (前の行が縮んだぶんずれる)"),
+            (13, 8, "最終行の行頭"),
+            (16, 11, "EOF は EOF のまま"),
+        ];
+        for (before, after, why) in cases {
+            assert_eq!(
+                adjust_offset_after_cleanup(original, &cleaned, before),
+                after,
+                "{why}"
+            );
+        }
+        // 範囲外を渡しても落ちない
+        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 999), cleaned.len());
+    }
+
+    #[test]
+    fn adjust_offset_is_multibyte_safe() {
+        let original = "日本語  \nあ";
+        let cleaned = trim_trailing_whitespace(original);
+        assert_eq!(cleaned, "日本語\nあ");
+        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 3), 3, "日と本の間");
+        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 9), 9, "語の直後");
+        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 10), 9, "空白の中");
+        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 12), 10, "次の行の行頭");
+        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 15), 13, "EOF");
+        // どのバイト位置から呼んでも多バイト文字の途中には落ちない
+        for off in 0..=original.len() {
+            let got = adjust_offset_after_cleanup(original, &cleaned, off);
+            assert!(
+                cleaned.is_char_boundary(got),
+                "byte {off} → {got} が文字境界でない"
+            );
+        }
+    }
+
+    #[test]
+    fn adjust_offset_handles_line_ending_changes() {
+        // CRLF → 行末の空白だけ消える: \r と \n の間にいてもそこへ付け替わる
+        let original = "a  \r\nb";
+        let cleaned = trim_trailing_whitespace(original);
+        assert_eq!(cleaned, "a\r\nb");
+        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 4), 2, "\\r と \\n の間");
+        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 5), 3, "次の行の行頭");
+        // LF → CRLF で位置が増える向きも追随する
+        let cleaned = normalize_to("a\nb", LineEnding::Crlf);
+        assert_eq!(adjust_offset_after_cleanup("a\nb", &cleaned, 2), 3);
+        // 最終改行を足した場合、カーソルは足した改行の手前に残る
+        let cleaned = ensure_final_newline("a", LineEnding::Lf);
+        assert_eq!(adjust_offset_after_cleanup("a", &cleaned, 1), 1);
+        // 何も変わっていなければ位置も変わらない
+        assert_eq!(adjust_offset_after_cleanup("a b", "a b", 2), 2);
+    }
+
+    #[test]
+    fn adjust_char_index_matches_the_byte_version() {
+        let original = "日本語  \nあ";
+        let cleaned = trim_trailing_whitespace(original);
+        // char 4 = 2 つ目の半角スペース → 削られたので行末 (char 3) へ
+        assert_eq!(adjust_char_index_after_cleanup(original, &cleaned, 4), 3);
+        assert_eq!(adjust_char_index_after_cleanup(original, &cleaned, 2), 2);
+        assert_eq!(adjust_char_index_after_cleanup(original, &cleaned, 6), 4, "次の行の行頭");
+        assert_eq!(
+            adjust_char_index_after_cleanup(original, &cleaned, 99),
+            cleaned.chars().count(),
+            "範囲外は末尾へ"
+        );
+    }
+
+    /// 保存経路をひととおり通す: 整形して、カーソルを付け替えて、結果が壊れないこと。
+    #[test]
+    fn save_cleanup_and_caret_adjust_work_together() {
+        let original = "行1  \n行2\t\t\n";
+        let opts = SaveCleanup {
+            trim_trailing: true,
+            final_newline: true,
+            target_ending: Some(LineEnding::Crlf),
+        };
+        let (cleaned, changed) = apply_save_cleanup_checked(original, &opts);
+        assert!(changed);
+        assert_eq!(cleaned, "行1\r\n行2\r\n");
+        // 「行2」の \t の上にいたカーソルは行2の行末へ
+        let caret = adjust_char_index_after_cleanup(original, &cleaned, 8);
+        assert_eq!(caret, 6, "行1(2文字)+改行+行2(2文字) の直後");
+        assert!(cleaned.is_char_boundary(char_to_byte(&cleaned, caret)));
     }
 }
