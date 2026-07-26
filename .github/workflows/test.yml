@@ -1,13 +1,23 @@
-# 3-OS テストワークフロー。
+# 3-OS テストワークフロー — 5分予算設計。
+#
+# ■ 設計目標: 全テストが CI で 5 分以内 (wall-clock) に完了する。
+#   - OS ごとに「fast (terminal:: 以外)」「pty (terminal:: のみ)」の 2 ジョブへ分割し
+#     並列実行する。wall-clock は 2 ジョブの max であり sum ではない。
+#   - 同一 OS の 2 ジョブは rust-cache の shared-key で同じキャッシュを共有する
+#     (shared-key は自動のジョブ名ベースキーを置き換え、複数ジョブ間で安定 —
+#     両ジョブは同じ RUSTFLAGS / プロファイルでビルドするため成果物は完全に再利用可能)。
+#   - ハング時のコストは nextest の slow-timeout (terminate-after=1) で
+#     グローバル ~65 秒 / terminal:: ~50 秒に抑える (.config/nextest.toml)。
+#   - ジョブレベルの timeout-minutes は 10/12 分 — ランナーが固まっても
+#     30 分ではなく数分で表面化する。
+# ■ 唯一の例外: Cargo.lock 変更直後の初回 run はキャッシュ再構築のため
+#   フルビルドとなり 5 分を超えうる (デバッグ情報を落として最小化済み)。
 #
 # Linux で cargo test を直接使わない理由: terminal:: (実PTY) テストが
 # 単一の長寿命 cargo test プロセス内でプロセスツリーをリークし、
 # ランナーのハートビート喪失 (突然死) を引き起こすため。
 # cargo-nextest はテストごとにプロセスを分離し、slow-timeout 到達時に
 # プロセスグループごと kill する (.config/nextest.toml の profile.ci 参照)。
-#
-# ステップを「非 terminal」「terminal (実PTY)」に分けているのは、
-# 万一ランナーが死んだ場合にどちらが原因か即座に切り分けるため。
 name: Test
 
 on:
@@ -23,26 +33,30 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # デバッグ情報を落としてビルド時間とキャッシュサイズを削減。
+  # 注意: 両ジョブで同一 RUSTFLAGS であること (キャッシュ共有の前提)。
   RUSTFLAGS: -C debuginfo=0
 
 jobs:
-  test:
+  # terminal:: 以外の全テスト。表示名: "fast (ubuntu-latest)" など。
+  fast:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     # nextest の slow-timeout が効かない事態への最終防壁。
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # 依存クレートのビルド結果をコミット間で使い回す (release.yml と同方針)。
-      # これが無いと毎回フルビルドで待ち時間が数倍になる。
+      # 依存クレートのビルド結果をコミット間・fast/pty ジョブ間で使い回す。
+      # shared-key はジョブ名ベースの自動キーを置き換えるため、
+      # 同一 OS の fast と pty が同じキャッシュを読み書きする。
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: test-${{ matrix.os }}
           cache-on-failure: true
 
       # release.yml で実績のある eframe/egui 0.29 + rfd (GTK3) 向けパッケージ一覧。
@@ -57,6 +71,33 @@ jobs:
       - name: Non-terminal tests
         run: cargo nextest run --locked --profile ci -E 'not test(/^terminal::/)'
 
-      # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
+  # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
+  # 表示名: "pty (ubuntu-latest)" など。
+  pty:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # 直列実行のためわずかに長めの防壁 (それでも旧 30 分の半分以下)。
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - uses: taiki-e/install-action@nextest
+
       - name: Terminal (real PTY) tests
         run: cargo nextest run --locked --profile ci -E 'test(/^terminal::/)'

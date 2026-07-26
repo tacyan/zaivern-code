@@ -10,9 +10,9 @@
 # 実行例: cargo nextest run --profile ci -E 'not test(/^terminal::/)'
 
 [profile.ci]
-# 60 秒応答なし × 2 回 (= 120 秒) でプロセスグループごと terminate。
-# SIGTERM 後 5 秒待って SIGKILL。
-slow-timeout = { period = "60s", terminate-after = 2, grace-period = "5s" }
+# 60 秒応答なしでプロセスグループごと terminate (SIGTERM 後 5 秒待って SIGKILL)。
+# terminate-after = 1: ハング 1 件のコストは ~65 秒。CI 5 分予算の要。
+slow-timeout = { period = "60s", terminate-after = 1, grace-period = "5s" }
 # テスト終了後、子プロセスが標準出力ハンドルを 1 秒以上握っていたらリーク扱い。
 leak-timeout = "1s"
 # 失敗したテストの出力は失敗時に即表示し、最後にもまとめて再表示。
@@ -25,5 +25,6 @@ pty = { max-threads = 1 }
 [[profile.ci.overrides]]
 filter = 'test(/^terminal::/)'
 test-group = "pty"
-# 実シェル起動を伴うため通常テストより長めに許容 (120 秒 × 2 回)。
-slow-timeout = { period = "120s", terminate-after = 2, grace-period = "5s" }
+# 実シェル起動を伴うが keep-alive スリープは 5-10 秒に短縮済みのため 45 秒で十分。
+# ハング 1 件のコストは ≤50 秒 (旧設定の 4 分から短縮)。
+slow-timeout = { period = "45s", terminate-after = 1, grace-period = "5s" }
