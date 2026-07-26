@@ -49,7 +49,9 @@ irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 
 Once installed, just type `zai .` inside any project folder — that's your cockpit (`zai [workspace path]` also works). **Run the same one-liner again at any time to update to the latest version.** Prebuilt binaries for every OS are also available directly from [**Releases**](https://github.com/tacyan/zaivern-code/releases/latest) (macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64).
 
-The installer also **registers "Zaivern Code" in your OS app list** — launch it without a terminal from Launchpad / Spotlight on macOS, the application menu on Linux, or the Start Menu on Windows (your home directory becomes the workspace). Register or remove manually with `zai app install` / `zai app uninstall`.
+The installer also **registers "Zaivern Code" in your OS app list** — launch it without a terminal from Launchpad / Spotlight on macOS, the application menu on Linux, or the Start Menu on Windows (your home directory becomes the workspace). Register or remove manually with `zai app install` / `zai app uninstall`. It also shows up as **"Zaivern"** in the OS process list (Activity Monitor / `pgrep -i zaivern` on macOS, Task Manager on Windows, `ps` on Linux).
+
+On first launch a **26-step guided tour** walks you through the cockpit, highlighting each instrument where it actually lives (about two minutes). Esc or Skip gets you out at any point, and "Restart tutorial" in the 💡 menu or the command palette brings it back.
 
 ---
 
@@ -140,6 +142,7 @@ Even in an era where AI writes 90% of the code, the last 10% — the architectur
 ## Why Rust — a heavy cockpit is no cockpit at all
 
 - **No Electron. No Node.** A single native binary with GPU rendering via egui. Instant startup; idle memory lighter than one browser tab
+- **Watching costs no CPU.** Unconditional repainting is gone; each frame is requested only when the actual state needs one. Measured over a 30-second window on a release build: **0.13% focused, 0.03% unfocused**. Launch with `ZV_IDLE_TRACE=1` and it prints the real fps and the reason for each decision every second
 - **A real PTY terminal** (portable-pty + vt100). Claude Code's full-screen TUI runs as-is. 256-color / TrueColor, bracketed paste, scrollback — plus the unglamorous compatibility work: terminal queries (device attributes, cursor position, background colour) are actually *answered*, because a query left hanging either freezes the TUI waiting for a reply or dumps raw escape text into its input box. Cursor-shape changes, focus in/out reporting, and OSC 52 clipboard writes are handled too
 - **One codebase for macOS / Windows / Linux.** Child processes are killed automatically on exit — no orphan processes left behind
 - Lineage: **Zed's speed × Cmux's parallel agents × AGI Cockpit's pilot-seat UX**
@@ -163,6 +166,12 @@ Everything below is the manual for each instrument on the flight deck.
 - **🖼 Image viewer**: `png` / `jpg` / `jpeg` / `gif` / `webp` / `ico` open as a tab. Fit-to-window by default; `−` / `＋` / `100%` buttons and Ctrl(⌘)+scroll take it from 0.05x to 32x. Transparency is drawn as a checkerboard, and the footer shows `width×height px · file size` (and says so explicitly when the image was downscaled to stay inside the GPU texture limit). Read-only. Animated GIFs show the first frame
 - **📄 Open a PDF in the editor**: text is extracted with [pdf-extract](https://crates.io/crates/pdf-extract) and shown as a **read-only** tab with `── page i / N ──` separators. ⌘F find-in-file works on it as usual. Extraction runs on a worker thread: anything finishing within 250 ms appears immediately, slower files show `⏳ loading…` and fill in afterwards — the UI never blocks. PDFs over 32 MB are not extracted and say so
 - **↩ Word wrap / · whitespace rendering**: toggle from the View menu or the command palette (spaces render as `·`, tabs as `→`). The starting value comes from `word_wrap` / `show_whitespace` in `config.toml` (both default `false`), overridable per project in `.zaivern.toml`
+- **📐 Folding, indent guides, sticky headers, 🔖 bookmarks**: **⌥⌘[** toggles the fold at the cursor, **⌥⌘]** unfolds everything (fold-by-level lives in the command palette). Nesting guides and the parent headers pinned to the top of the viewport (up to 3, same as VS Code) are always drawn. **⌥⌘B** bookmarks a line and the palette jumps to the next / previous one; **⇧⌘T** reopens the tab you just closed
+- **✏ Multiple carets / column selection**: **⌘D** selects the next occurrence and adds a caret. The palette has "add cursor above / below", "start → finish column selection", and "paste into every caret" — which undoes in a single step
+- **✂️ Snippets and Emmet**: VS Code syntax (`$1`, `${1:default}`, `${TM_FILENAME}`, `${1|a,b|}` choices, mirrors) expands on Tab. Drop your own `*.json` / `*.code-snippets` (JSONC allowed) into `~/.zaivern/snippets/`. In HTML / JSX-family files, Emmet abbreviations like `ul>li*3` and `div.cls#id` expand too
+- **🔤 Encodings and line endings**: "Reopen with encoding" / "Save with encoding" from the command palette. The list only offers encodings this build **actually round-trips**, measured at startup rather than assumed. Line endings convert to LF / CRLF / CR, and a mixed file reports the breakdown. "Trim trailing whitespace" and "Insert final newline" on save are View-menu toggles (off by default)
+- **📊 CSV / TSV table view and large files**: `.csv` / `.tsv` render as a table via "Toggle table view". Past 4 MB, highlighting and folding switch off; past 50 MB the file opens read-only (the banner spells out which limits are in effect); files over 512 MB are not opened
+- **👁 Markdown / HTML preview** (**⌘⇧V**): GFM tables, task lists, footnotes and autolinks, collapsed front matter, raw HTML tags, and local / `data:` images. **```mermaid fences render as diagrams** (`graph` / `flowchart` / `sequenceDiagram`; unsupported kinds say so), and `$…$` / `$$…$$` TeX math is typeset — **both in pure Rust, with no added dependencies**
 - Git branch display, automatic Japanese UI font fallback
 
 ### 👾 Multi-agent
@@ -178,6 +187,9 @@ Everything below is the manual for each instrument on the flight deck.
 - **Account/profile switching**: put `CLAUDE_CONFIG_DIR` / `CODEX_HOME` etc. in a preset's `env` to run **the same CLI under different accounts (subscriptions) in parallel** (a leading `~/` in values expands to your home directory)
 - **📜 Persistent terminal logs**: each session's raw output is kept under `~/.zaivern/term_logs/` (4 MB rotation, newest 40 files), and the 📜 menu on the terminal panel reopens last session's log — "how far did it get last night?" survives a restart
 - **💬 Chat history saved per folder, and resumed**: reopen a folder and **your agent tabs come back**. The previous scrollback (up to the last 1 MB) is replayed into the terminal, a `── 前回のセッションここまで / 再開します ──` divider is drawn, and the live session picks up from there. **claude is relaunched with `--continue` and codex with `resume --last`**, so the conversation on the CLI side continues too (agents with no resume flag simply start fresh). A toast confirms how many sessions came back. Set `restore_agents = false` in `config.toml` to switch the whole thing off — no tabs are recreated at all. **Environment variables are deliberately not persisted** (they can hold secrets); they are re-read from the matching preset in your current config
+- **✉ A multiline composer per agent**: the input box under the Cockpit is addressed to one agent, and **Enter inserts a newline — ⌘ (Ctrl on Windows / Linux) + Enter sends**. Drafts are kept per recipient, so a half-written review no longer flies off to everyone the moment you press Enter
+- **📂 Past-session sidebar / 📊 plan usage**: pick a session claude or codex left behind and **resume it in that folder** (`--continue` / `resume` are added for you). The status bar carries a usage estimate; click it for the breakdown (per account, measured values marked apart from projections, plus a run-out estimate). The tally is computed entirely offline
+- **🔢 Numbered menus and surveys don't stall you**: prompts like `1. Yes` or `Select an option [1-3]:` are detected and answered automatically (skip → affirmative → most-positive end of a rating scale). The fact that it answered is recorded as "auto-answered the survey: n" in the session events and the audit log. Meaningful open choices and privilege escalation are never auto-answered — they surface as pending approvals instead
 - **📋 Paste a clipboard image straight in**: press **⌘V** (**Ctrl+V** on Windows / Linux) in an agent terminal. If the clipboard holds an image it is written as a PNG into `zaivern-clip/` in your temp directory and `@path` lands in the input box — **nothing is submitted**. If the clipboard holds text, normal text paste wins as before, so nothing you already do changes. Saved PNGs are pruned automatically to the newest 24
 
 ### 📋 Fleet board — eight lanes, everyone's "right now"
@@ -301,6 +313,8 @@ Bare `zai` and `zai .` still launch the GUI, exactly as before. **Launched with 
 ### 🔤 Language servers (LSP)
 If `rust-analyzer` / `typescript-language-server` / `pyright-langserver` / `gopls` is on your PATH it starts automatically and shows diagnostics (errors/warnings). The line-number gutter turns red/yellow, and the status bar shows `⛔count ⚠count`. Editing works normally even without any server installed.
 
+Diagnostics are not all of it — **the usual VS Code keys are wired up**: **⌃Space** completion, hover for types and docs, **⇧F12** find references, **⇧⌘O** go to symbol, **F2** rename (edits spanning several files are applied together), **⇧⌥F** format document. Turn on "🛠 Format on save" in the toolbar and every save formats first (off by default). When a server doesn't implement a capability, it says "this server doesn't support …" rather than silently doing nothing.
+
 Setup examples: `rustup component add rust-analyzer` / `npm i -g typescript-language-server typescript` / `npm i -g pyright` / `go install golang.org/x/tools/gopls@latest`
 
 ### ⌨️ Japanese input (IME)
@@ -332,12 +346,18 @@ A PR diff opens as a read-only tab rendered in the inline diff view, with added 
 
 **⚡ Start on an issue in one click.** Pick an agent from an issue's "⚡ 着手" (start) menu and Zaivern will (1) create a dedicated git worktree next to the repo (branch `wt/issue-N`, same convention as the worktrees plugin), (2) add it to the workspace, (3) launch the agent with that directory as its working dir, and (4) drop a kick-off instruction into its input field once the session has settled. **You still press Enter** — so you can edit the instruction before it runs.
 
+### 🔎 Review your changes — read them like a PR before you open one
+"Review changes" in the Git panel (or "Review changes (PR-style local review)" in the command palette) puts **your not-yet-pushed local changes** into the same shape as a GitHub PR.
+
+- Changed files list on the left, grouped by directory, with the same colors and badges as the tree, `+N −M`, and "N files changed · +X −Y" on top. Click to jump to that diff, `n` / `p` to step between files. Compare against **working tree vs HEAD / staged only / unstaged only / any revision** — untracked files are synthesized as all-additions, binaries show no content, and oversized diffs are truncated and say so
+- Per file: stage, unstage, **discard (two-step confirm)**, open in the editor. Whitespace-insensitive mode and 3 / 10 / full context lines are toggles. git runs on a dedicated thread behind a 5-second cache, so a big diff never costs you frames
+
 ### 💬 Inline review comments on a diff
-In a PR diff tab or a race diff tab, **click a line and write a comment right there**.
+In a PR diff tab, a race diff tab, or the PR-style review above, **click a line and write a comment right there**.
 
 - A comment is anchored to "file + old/new side + line number", so re-parsing the diff or scrolling past it (the view is virtualized) never loses its place
 - Per thread: resolve, un-resolve, edit, delete. The toolbar reads "レビューコメント n 件 (未解決 m 件)" — n comments, m unresolved
-- Unresolved comments **collapse into a single prompt**: a `以下のレビューコメントに対応してください:` header followed by `@path:line` (marked `(削除行)` for removed lines), the quoted line, and your text — ordered by file, then by line. `コピー` hands it to an agent's input box as-is. **Resolved threads drop out automatically**, so you never re-send a note you already dealt with
+- Unresolved comments **collapse into a single prompt**: a `以下のレビューコメントに対応してください:` header followed by `@path:line` (marked `(削除行)` for removed lines), the quoted line, and your text — ordered by file, then by line. `コピー` copies it out, or **"send to agent" drops it into the composer draft** for whichever agent you were reviewing for — **it only fills the box, it never presses Enter**. **Resolved threads drop out automatically**, so you never re-send a note you already dealt with
 
 ### 🧭 Open in an external IDE
 Send the file you're editing to another editor **with your cursor line intact**. VS Code / Cursor / Zed / Trae / Kiro / Sublime / the JetBrains family / Xcode / Fleet / Neovide / Emacs are supported.
@@ -363,6 +383,13 @@ Run several agents and sooner or later one goes quiet, repeats the same failure,
 
 There is no LLM guessing at which sentences look like they're addressed to someone. **Only the line-start marker counts — deterministic, on purpose.** And when an injected message is echoed back onto the screen, it does not get re-sent as a new message (get that wrong and messages multiply without end).
 
+### 🛡 Unified approval queue — every "may I?" in one line
+With five agents running, approval prompts scatter across five terminals. This folds them into one queue: the **"🛡 Approvals" tab** in the panel (with a pending-count badge; "Open approval queue" in the command palette gets there too).
+
+- Requests are classified into nine kinds: read / write / delete / shell command / network / git operation / package install / **privilege escalation** / other. The queue is fully keyboard-drivable
+- **Policies** declare "this kind, in this scope, is always allowed / always denied". Scopes are `global`, `agent`, `session`, `path`, and **the more specific one wins** (a rule on `/repo/src/secret` overrides one on `/repo`). Put them in `[[approval_policies]]` in `config.toml` and they apply from startup. **Privilege escalation, though, can never be auto-approved** — writing `allow_always` for it is rejected and you get a one-time approval instead
+- Every decision lands in an append-only audit log at `~/.zaivern/approvals.jsonl` (kind plus the first 160 characters of the target — never the full command or anything pasted into it). The panel can read the tail
+
 ### 💡 Super Agent (Commander) — give the watchdog a brain
 The supervision itself runs on Rust rules. You don't need an LLM to spot a stall or a loop, and **if the watchdog is an LLM, nobody is left to notice when the watchdog breaks.** So detection stays deterministic code.
 
@@ -385,6 +412,7 @@ On restart, the previous tabs, active tab, and panel state are restored automati
 - A panic while painting **does not take the app down with it**. If the same place breaks 3 times inside a 10-second window, **only that piece is dropped from rendering** and everything else keeps running. A banner appears at the top saying rendering was stopped for that area, with `閉じる` to dismiss and `再試行` to lift the quarantine and try painting it again; the dropped area shows a placeholder in its place. Details land in `~/.zaivern/panic.log` (rotated to `panic.log.old`)
 - **Quarantines decay.** After 300 clean frames with an empty window the memory resets, so running for hours never means slowly losing features to one incident long ago. It gives up only on 3 consecutive panics, or after more than 3 quarantines
 - **The Windows Cockpit freeze was closed off from three sides**: (1) ConPTY resize requests are coalesced — **the same size must hold for 2 frames before one request is sent**, and a dedicated thread keeps only the latest value so the UI thread never waits on it; (2) file dialogs run on a worker thread, so the UI keeps painting while one is open (macOS stays synchronous — NSOpenPanel is main-thread-only); (3) the panic quarantine above. **Save-as holds a buffer ID, not a tab index**, so reordering tabs while the dialog is open can't redirect the write to a different file
+- **The "black tile" terminal was fixed at the source.** Panics in the vt100 parser (scroll regions, tab stops, line operations) and runaway `CSI <huge number>` repeat parameters are now clamped — the patches live in `vendor/vt100` and are pinned by a hostile-input test suite. A tile that still breaks is quarantined on its own with a "⚠ retry" banner, **never left as an empty black rectangle**. Closed alongside it: plugin timeouts now kill the whole process tree (a stray grandchild used to freeze the editor), the IME confirm-Enter that leaked through to the agent, and corruption when saving in non-UTF-8 encodings such as CP932
 
 ### 📱 Phone Remote in detail
 - **What you can do**: view/edit/save open files, switch tabs, search & open workspace files, view agent terminals, send instructions, approve (Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y buttons), and run commands (save, new file, Cockpit, font ±, approval-mode switch, and more)
@@ -472,7 +500,11 @@ The split isn't about Linux disliking PTYs. On GitHub's hosted Linux runner (2 c
 | ⌘N / ⌘W | New file / Close tab |
 | ⌘F | Find in file |
 | ⌘/ | Toggle line comment |
-| ⌘⇧D | Duplicate line |
+| ⌘⇧D / ⌘D | Duplicate line / Select next occurrence, add caret |
+| ⌥⌘[ / ⌥⌘] / ⌥⌘B | Toggle fold / Unfold all / Toggle bookmark |
+| ⇧⌘T / ⌘⇧V / ⇧⌘H | Reopen closed tab / Markdown・HTML preview / Replace across workspace |
+| ⌃Space / ⇧F12 / ⇧⌘O | LSP: completion / find references / go to symbol |
+| F2 / ⇧⌥F | LSP: rename / format document |
 | ⌥↑ / ⌥↓ | Move line up / down |
 | PageUp / PageDown | Cursor + scroll by one screen |
 | Enter | Auto-indent (previous line's indent, extra level after `{ ( [ :`) |
@@ -567,6 +599,21 @@ show_pet = true
 # pet_approve_keys = "\r"    # keys sent to the PTY on approve (Enter)
 # pet_deny_keys = "\u001B"   # keys sent to the PTY on deny (ESC)
 
+# ── Unified approval queue policies (empty by default = you are asked) ──
+# [[approval_policies]]
+# kind = "file_read"         # file_read/file_write/file_delete/shell_command/
+#                            # network_access/git_operation/package_install/
+#                            # privilege (always manual)/other
+# scope = "agent"            # "global"|"agent"|"session"|"path" — most specific wins
+# target = "claude"          # what the scope refers to (empty for global)
+# decision = "allow_always"  # "ask"|"allow_once"|"allow_always"|"deny_always"
+
+# ── Extra auto-YES rules (evaluated before the bundled table) ──
+# When a CLI rewords its approval prompt, fix it here without rebuilding
+# [[auto_yes_rules]]
+# pattern = "Do you want to proceed?"  # on a match, reply is sent to the PTY
+# reply = "\r"                         # agent = "" (default) means all agents
+
 # ── AI agent presets (add as many as you like) ──
 [[agents]]
 name = "Claude Code"
@@ -636,7 +683,7 @@ src/
 ├── editor.rs        Buffer & tab management
 ├── editor_ops.rs    Pure text-editing operations (multibyte-safe)
 ├── highlight.rs     syntect → egui LayoutJob conversion (hash-cached)
-├── snippets.rs      VS Code-compatible snippet parsing & Tab expansion
+├── snippets.rs      VS Code-compatible snippet parsing & Tab expansion + Emmet
 ├── file_tree.rs     Lazy-loading file tree (multi-root) + context menu
 ├── fuzzy.rs         Fuzzy-match scoring
 ├── palette.rs       Command palette state & action definitions
@@ -650,6 +697,8 @@ src/
 ├── kanban.rs        Fleet board (8 state lanes, card actions, live terminal pane)
 ├── race.rs          Prompt fan-out race (parallel worktrees, adopt/discard, collision detection)
 ├── instances.rs     Registry of running instances (the detection behind zai status)
+├── approvals.rs     Unified approval queue (classification, policy resolution, audit log)
+├── tutorial.rs      First-run guided tour (26 steps, highlights each target in place)
 ├── supervisor.rs    Agent supervision (stall/loop/abnormal-exit detection and notification)
 ├── coordinator.rs   Inter-agent messaging and task reassignment
 ├── orchestration.rs Task creation UI, hand-off driving, message send/receive assembly
@@ -659,7 +708,7 @@ src/
 ├── html.rs          HTML preview rendering
 ├── jsonc.rs         Reading JSON with comments (JSONC)
 ├── cli.rs           `zai` subcommands (the control channel for driving the app from outside)
-├── lsp.rs           Minimal LSP client (stdio JSON-RPC, diagnostics)
+├── lsp.rs           LSP client (diagnostics, completion, hover, references, rename, format, symbols)
 ├── terminal.rs      PTY sessions + vt100 rendering + approval-prompt detection/auto-reply
 ├── shellenv.rs      PATH resolution for child processes + OS-independent `which`
 ├── agents.rs        Session management (launch/restart/destroy/broadcast/permission modes)
@@ -717,11 +766,19 @@ src/
 - [x] Reopen the previous folder on launch (`--no-restore` / `ZAIVERN_NO_RESTORE` to disable)
 - [x] Paint-panic quarantine with self-recovery + the Windows freeze fixed (ConPTY resize coalescing, off-thread file dialogs)
 - [x] CI moved to 6 parallel jobs (3 OSes × fast/pty) on cargo-nextest with a `ci` profile
-- [ ] LSP completion & hover UI (foundation implemented; UI to come)
-- [ ] Project-wide search upgrades — regex, globs, whole-word, dry-run bulk replace (engine implemented; UI wiring to come)
-- [ ] Cross-agent usage aggregation and exhaustion forecasting (offline engine implemented; panel to come)
-- [ ] Listing and resuming past sessions (reading claude / codex session stores is implemented; UI to come)
-- [ ] Line-ending detection/conversion + save-time cleanup (the pure functions exist; wiring into the save path to come)
+- [x] LSP up to VS Code parity (completion, hover, references, rename, format, symbols, format-on-save)
+- [x] Project-wide search upgrades — regex, globs, whole-word, dry-run bulk replace (⇧⌘H)
+- [x] Cross-agent usage aggregation and exhaustion forecasting (status bar + detail panel)
+- [x] Listing and resuming past sessions (pick one from the sidebar, resume in that folder)
+- [x] Line-ending detection/conversion + save-time cleanup (trailing whitespace, final newline)
+- [x] Folding, guides, sticky headers, bookmarks, reopen-closed-tab, multiple carets / column selection
+- [x] CSV / TSV table view and large-file mode + reopen and save with a chosen encoding
+- [x] VS Code-compatible snippets + Emmet (`~/.zaivern/snippets/`), and a real-document Markdown preview (GFM, raw HTML, images) + Mermaid diagrams and TeX math
+- [x] PR-style local review panel (compare-target switching, stage/discard, deep git tree coloring)
+- [x] Unified approval queue (9 kinds, 4 scope levels, audit log, privilege always manual)
+- [x] First-run guided tour (26 steps), a per-agent multiline composer, auto-answered numbered menus / surveys
+- [x] Discoverable as "Zaivern" in the OS process list (all 3 OSes) + 0.13% idle CPU
+- [ ] `zai status --pid-only` (implemented; CLI wiring to come)
 - [ ] Plugin grammars (TextMate) & registry sharing
 - [ ] Split editor
 
