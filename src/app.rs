@@ -500,6 +500,9 @@ pub struct ZaivernApp {
     panel_last_run: HashMap<(String, String), Instant>,
     /// startup フックを起動済みか(初回フレーム後に一度だけ走らせる)
     startup_hooks_done: bool,
+    /// 連続してフレームが panic した回数 (update のパニックガード用)。
+    /// 1 フレーム完走するたびに 0 へ戻る。
+    frame_panics: u32,
     /// 直近に観測した git ブランチ名(git_change フックの検知用)
     hook_git_branch: Option<String>,
     /// 起動待ちのフック(egui の Context が要るので update で消化する)
@@ -854,6 +857,7 @@ impl ZaivernApp {
             hook_last_run: HashMap::new(),
             panel_last_run: HashMap::new(),
             startup_hooks_done: false,
+            frame_panics: 0,
             hook_git_branch: None,
             pending_hooks: Vec::new(),
             plugins_tab_was_open: false,
@@ -10561,7 +10565,55 @@ impl ZaivernApp {
 }
 
 impl eframe::App for ZaivernApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // フレーム内の panic をアプリごと道連れにしない。winit/eframe は
+        // update 中の panic を捕まえるとイベントループごと終了するため、
+        // 利用者には「作業中にいきなり落ちた」に見える (実行中のエージェント
+        // も全部道連れ)。ここで捕捉して「1 フレーム捨てる」に格下げする。
+        // 詳細は panic フック (main.rs) が ~/.zaivern/panic.log へ残す。
+        // 連続で panic し続けるなら本当に壊れているので、3 回で従来どおり
+        // 落とす (poison された Mutex 等による永久パニック嵐を避ける)。
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.update_impl(ctx, frame);
+        }));
+        match ok {
+            Ok(()) => self.frame_panics = 0,
+            Err(payload) => {
+                self.frame_panics += 1;
+                if self.frame_panics >= 3 {
+                    std::panic::resume_unwind(payload);
+                }
+                eprintln!(
+                    "zaivern: frame panicked ({}/3) — skipping this frame \
+                     (details: ~/.zaivern/panic.log)",
+                    self.frame_panics
+                );
+                self.toast_warn(tr(
+                    "⚠ 内部エラーが起きました。継続します (詳細: ~/.zaivern/panic.log)",
+                ));
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// 終了時の後始末: CLI 向けの接続情報ファイルと、走らせたままのエージェント。
+    ///
+    /// セッションをそのまま drop させると ConPTY を閉じる待ちで終了処理が止まり、
+    /// ウィンドウが閉じないまま残る。エージェントを落として PTY は OS に任せる
+    /// ([`crate::terminal::abandon`] の説明を参照)。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        cli::remove_instance_file();
+        for s in std::mem::take(&mut self.agents.sessions) {
+            crate::terminal::abandon(s);
+        }
+    }
+}
+
+impl ZaivernApp {
+    /// 1 フレーム分の実処理 ([`eframe::App::update`] の本体)。
+    /// 呼び出し側のパニックガードが囲うので、ここからの panic は
+    /// アプリ終了ではなく「フレームのスキップ」になる。
+    fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 壊れたネイティブ全画面の検知と疑似フルスクリーンへの救出 (macOS)
         self.fullscreen_guard(ctx);
         // 低頻度の定期フレームを必ず予約しておく。
@@ -11105,19 +11157,7 @@ impl eframe::App for ZaivernApp {
         }
     }
 
-    /// 終了時の後始末: CLI 向けの接続情報ファイルと、走らせたままのエージェント。
-    ///
-    /// セッションをそのまま drop させると ConPTY を閉じる待ちで終了処理が止まり、
-    /// ウィンドウが閉じないまま残る。エージェントを落として PTY は OS に任せる
-    /// ([`crate::terminal::abandon`] の説明を参照)。
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        cli::remove_instance_file();
-        for s in std::mem::take(&mut self.agents.sessions) {
-            crate::terminal::abandon(s);
-        }
-    }
 }
-
 
 /// ルートの表示名(フォルダ名。取れなければフルパス)。
 fn root_name(root: &Path) -> String {
@@ -11399,7 +11439,12 @@ fn resolve_theme(name: &str) -> Theme {
 /// フォント候補を先頭から試し、最初に読めたものを `name` として登録し、
 /// Proportional / Monospace 両方の末尾へフォールバックとして積む。
 /// 末尾に積むので、既存フォントが持つ字はそのまま。持たない字だけが拾われる。
-fn push_fallback_font(fonts: &mut egui::FontDefinitions, name: &str, candidates: &[&str]) -> bool {
+/// 読めた候補のパスを返す (呼び出し側が二重読み込みを避けるため)。
+fn push_fallback_font<'a>(
+    fonts: &mut egui::FontDefinitions,
+    name: &str,
+    candidates: &[&'a str],
+) -> Option<&'a str> {
     for p in candidates {
         let Ok(bytes) = std::fs::read(p) else { continue };
         fonts
@@ -11410,9 +11455,40 @@ fn push_fallback_font(fonts: &mut egui::FontDefinitions, name: &str, candidates:
                 list.push(name.to_owned());
             }
         }
-        return true;
+        return Some(p);
     }
-    false
+    None
+}
+
+/// 読めた候補を **全部** `name0, name1, …` として末尾へ積む版。
+/// 記号はフォントごとに持っている字がバラバラで、しかも OS の版で変わる
+/// (macOS 26 では Apple Symbols / Arial Unicode から ❯ U+276F が消えた、実測)。
+/// 1 本目で止めるとどこかの環境で豆腐が出るので、和集合を取る。
+/// `skip` は既に別名で積んだ実体 (同じ 20MB 級ファイルを二重に読まないため)。
+fn push_fallback_fonts_all(
+    fonts: &mut egui::FontDefinitions,
+    name: &str,
+    candidates: &[&str],
+    skip: Option<&str>,
+) -> usize {
+    let mut n = 0;
+    for p in candidates {
+        if Some(*p) == skip {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(p) else { continue };
+        let key = format!("{name}{n}");
+        fonts
+            .font_data
+            .insert(key.clone(), egui::FontData::from_owned(bytes));
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            if let Some(list) = fonts.families.get_mut(&fam) {
+                list.push(key.clone());
+            }
+        }
+        n += 1;
+    }
+    n
 }
 
 fn install_fonts(ctx: &egui::Context) {
@@ -11437,20 +11513,24 @@ fn install_fonts(ctx: &egui::Context) {
             "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
         ]
     };
-    push_fallback_font(&mut fonts, "cjk", &candidates);
+    let cjk_loaded = push_fallback_font(&mut fonts, "cjk", &candidates);
 
     // 記号フォント。egui 同梱の Ubuntu-Light / NotoEmoji / emoji-icon-font にも
     // 日本語フォントにも無い記号 (✕ ✗ ⌫ ⌥ ⌃ ❯ ▸ ▾ 罫線 点字スピナー など) は、
     // これを積まないと豆腐 (□) になる。「✕ 閉じる」が読めなくなるのが典型例。
+    // 1 本では足りない: macOS 26 で Apple Symbols から ❯ が消えた (Menlo にはある)
+    // ように、OS 更新でグリフ構成が変わるので、読めた候補は全部積んで和を取る。
     let symbols: Vec<&str> = if cfg!(target_os = "macos") {
         vec![
             "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Menlo.ttc",
             "/System/Library/Fonts/Supplemental/Symbol.ttf",
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         ]
     } else if cfg!(target_os = "windows") {
         vec![
             "C:/Windows/Fonts/seguisym.ttf",
+            "C:/Windows/Fonts/consola.ttf",
             "C:/Windows/Fonts/segoeui.ttf",
             "C:/Windows/Fonts/arial.ttf",
         ]
@@ -11462,7 +11542,7 @@ fn install_fonts(ctx: &egui::Context) {
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
         ]
     };
-    push_fallback_font(&mut fonts, "symbols", &symbols);
+    push_fallback_fonts_all(&mut fonts, "symbols", &symbols, cjk_loaded);
 
     ctx.set_fonts(fonts);
 }

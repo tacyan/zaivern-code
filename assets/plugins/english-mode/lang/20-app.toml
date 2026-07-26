@@ -407,3 +407,4 @@
 "⚠ Windows のファイアウォールが受信をブロックしています\n\u3000押して開く画面のボタンで許可できます (それまでスマホからは繋がりません)" = "⚠ Windows Firewall is blocking inbound connections\n\u3000Click to open the panel and allow it (until then, your phone cannot connect)"
 "🛡 ファイアウォールで受信を許可しました" = "🛡 Inbound connections are now allowed"
 "🛡 受信許可を取り消しました" = "🛡 The inbound rule has been removed"
+"⚠ 内部エラーが起きました。継続します (詳細: ~/.zaivern/panic.log)" = "⚠ An internal error occurred. Continuing (details: ~/.zaivern/panic.log)"

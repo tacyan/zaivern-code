@@ -79,6 +79,9 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    // どこで落ちても追えるよう、panic は必ず ~/.zaivern/panic.log にも残す。
+    install_panic_log();
+
     // サブコマンド指定なら CLI として処理して終了する。
     // 引数なし / パス指定のときは None が返り、そのまま GUI 起動へ進む。
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -134,4 +137,75 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Ok(Box::new(app::ZaivernApp::new(cc, roots, files)))),
     )
+}
+
+/// panic の詳細を `~/.zaivern/panic.log` へ追記するフックを仕込む。
+///
+/// GUI 起動 (ダブルクリック / Dock) では stderr がどこにも繋がっておらず、
+/// 「アプリがいきなり落ちた」の原因が二度と追えなくなる。既定フックの前段で
+/// メッセージとバックトレースをファイルへ残す。app.rs のフレームガードが
+/// 捕捉して継続した panic も (フックは unwind より先に走るので) ここに残る。
+fn install_panic_log() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let entry = format!(
+            "=== panic v{} at {} (epoch {secs}) ===\n{info}\n{bt}\n\n",
+            env!("CARGO_PKG_VERSION"),
+            utc_stamp(secs),
+        );
+        let dir = config::zaivern_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("panic.log");
+        // 肥大したら .old へローテート (term_logs と同じ流儀)
+        let too_big = std::fs::metadata(&path).is_ok_and(|m| m.len() > 1_000_000);
+        if too_big {
+            let _ = std::fs::rename(&path, dir.join("panic.log.old"));
+        }
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(entry.as_bytes());
+        }
+        default_hook(info);
+    }));
+}
+
+/// epoch 秒 → `YYYY-MM-DD HH:MM:SS UTC`。
+/// panic フック内で使うので、依存クレートに頼らない最小実装
+/// (civil_from_days アルゴリズム)。
+fn utc_stamp(secs: u64) -> String {
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(mth <= 2);
+    format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
+#[cfg(test)]
+mod panic_log_tests {
+    use super::utc_stamp;
+
+    #[test]
+    fn utc_stamp_formats_known_moments() {
+        assert_eq!(utc_stamp(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc_stamp(86_399), "1970-01-01 23:59:59 UTC");
+        // 10 億秒 = 2001-09-09 01:46:40 UTC (よく知られた節目)
+        assert_eq!(utc_stamp(1_000_000_000), "2001-09-09 01:46:40 UTC");
+        // うるう年の 2/29 をまたぐ境界: 2024-02-29 00:00:00 UTC
+        assert_eq!(utc_stamp(1_709_164_800), "2024-02-29 00:00:00 UTC");
+    }
 }
