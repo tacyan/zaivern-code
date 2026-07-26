@@ -11,10 +11,17 @@
 //!   - .ico は image クレート (ico feature) でエンコードする
 //!   - Windows の .lnk は powershell (WScript.Shell) へのシェルアウトで作る
 //!
-//! どの OS でもショートカットの実体は「インストール済みバイナリへの参照」なので、
-//! インストーラが同じ場所へ上書き更新すれば登録し直しは不要。
+//! macOS だけは「参照」ではなく **バンドルの実体そのものをバイナリにする**:
+//! `Contents/MacOS/Zaivern` をハードリンク (→ symlink → コピー) で置き、
+//! `CFBundleExecutable` をそれに向ける。カーネルはこの basename を
+//! プロセス名 (p_comm) にするので、アクティビティモニタ / `ps` / `pgrep -i zaivern`
+//! から「Zaivern」で見つけられる。ランチャースクリプトを噛ませていた頃は
+//! `zai` としか出なかった。実体の更新には `zai app install` の再実行が要るが、
+//! install.sh が更新のたびに呼ぶので運用上は自動で追従する。
+//! Linux / Windows のショートカットは従来どおりインストール済みバイナリへの参照。
 //! アプリとして起動されたとき (Finder / メニュー / スタートメニュー) は
-//! 作業ディレクトリが `/` や system32 になるため、ホームを既定ワークスペースにする。
+//! 作業ディレクトリが `/` や system32 になるため、ホームを既定ワークスペースにする
+//! (macOS は [`normalize_app_launch_cwd`]、他 OS はショートカット側の指定)。
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +30,15 @@ pub const ICON_PNG: &[u8] = include_bytes!("../assets/Zaivern.png");
 
 /// OS に表示するアプリ名。
 pub const APP_NAME: &str = "Zaivern Code";
+
+/// macOS の `.app` が持つ実行ファイル名 (= `Contents/MacOS/<これ>`)。
+///
+/// カーネルはこの basename をそのままプロセス名 (p_comm) にするため、
+/// アクティビティモニタ / `ps -o comm=` / `pgrep -i zaivern` で見つかる名前は
+/// **ここで決まる**。以前はランチャースクリプト `zai` を挟んでいたので
+/// `zai` としか出ず「Zaivern」で検索しても引っかからなかった。
+/// CLI 名の `zai` は PATH 上のバイナリ名であり、これとは無関係に不変。
+pub const MACOS_EXEC_NAME: &str = "Zaivern";
 
 // ───────────────────────── サブコマンド入口 ─────────────────────────
 
@@ -121,7 +137,8 @@ fn ico_bytes(png: &[u8]) -> Result<Vec<u8>, String> {
 
 // ───────────────────────── 登録内容の生成 (純関数) ─────────────────────────
 
-/// macOS の Info.plist。CFBundleExecutable はランチャースクリプト "zai"。
+/// macOS の Info.plist。CFBundleExecutable はバンドル内の実体 [`MACOS_EXEC_NAME`]
+/// (ランチャースクリプトではない) — プロセス一覧に出る名前がこれで決まる。
 #[allow(dead_code)]
 fn info_plist(version: &str) -> String {
     format!(
@@ -134,7 +151,7 @@ fn info_plist(version: &str) -> String {
     <key>CFBundleIdentifier</key><string>io.github.tacyan.zaivern-code</string>
     <key>CFBundleVersion</key><string>{version}</string>
     <key>CFBundleShortVersionString</key><string>{version}</string>
-    <key>CFBundleExecutable</key><string>zai</string>
+    <key>CFBundleExecutable</key><string>{MACOS_EXEC_NAME}</string>
     <key>CFBundleIconFile</key><string>Zaivern</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
@@ -147,21 +164,135 @@ fn info_plist(version: &str) -> String {
     )
 }
 
-/// macOS のランチャースクリプト。実体バイナリへ exec するだけの薄い殻。
-/// バイナリを更新しても .app を作り直す必要が無いよう、コピーではなく参照にする。
+// ───── macOS: バンドル内実行ファイルの用意 (ランチャースクリプトの置き換え) ─────
+
+/// `Contents/MacOS/Zaivern` をどう用意したか。診断メッセージとテスト用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // 実行時に使うのは macOS のみ (テストは全 OS で走る)
+enum LinkKind {
+    /// ハードリンク。同一 inode なので p_comm が "Zaivern" になり、
+    /// 実体を消しても .app 側は生き残る (最良)。
+    Hard,
+    /// シンボリックリンク。別ファイルシステムへ跨ぐときの次善。
+    /// カーネルはリンク先の basename を p_comm にするため表示名は `zai` に戻る。
+    Symlink,
+    /// 実コピー。最後の砦 (バイナリ更新時は再インストールが要る)。
+    Copy,
+}
+
 #[allow(dead_code)]
-fn launcher_script(bin: &Path) -> String {
-    format!(
-        "#!/bin/sh\n\
-         # {APP_NAME} ランチャー (`zai app install` が自動生成)\n\
-         # Finder 起動は作業ディレクトリが / になるため、ホームを既定ワークスペースにする。\n\
-         BIN=\"{}\"\n\
-         [ -x \"$BIN\" ] || BIN=\"$(command -v zai || true)\"\n\
-         [ -n \"$BIN\" ] || exit 127\n\
-         cd \"$HOME\" || true\n\
-         exec \"$BIN\" \"$@\"\n",
-        bin.display()
-    )
+impl LinkKind {
+    fn label(self) -> &'static str {
+        match self {
+            LinkKind::Hard => "ハードリンク",
+            LinkKind::Symlink => "シンボリックリンク",
+            LinkKind::Copy => "コピー",
+        }
+    }
+}
+
+/// `src` を `dst` へ「ハードリンク → シンボリックリンク → コピー」の順で用意する。
+///
+/// fs 操作を注入できるようにしてあるのは、各段の失敗 (別ファイルシステム・
+/// symlink 不可な環境) をテストから再現するため。
+/// 既存の `dst` (旧レイアウトのランチャースクリプトや古いリンク) は必ず
+/// 取り除いてから張り直すので、再インストールで最新のバイナリを指し直せる。
+#[allow(dead_code)]
+fn place_executable_with<H, S, C>(
+    src: &Path,
+    dst: &Path,
+    hard: H,
+    sym: S,
+    copy: C,
+) -> Result<LinkKind, String>
+where
+    H: Fn(&Path, &Path) -> std::io::Result<()>,
+    S: Fn(&Path, &Path) -> std::io::Result<()>,
+    C: Fn(&Path, &Path) -> std::io::Result<()>,
+{
+    // バンドル内のバイナリ自身から `zai app install` した場合、src == dst になる。
+    // 消してから張り直すと自分自身が消えるので、その場合は何もしない。
+    if same_path(src, dst) {
+        return Ok(LinkKind::Hard);
+    }
+    if std::fs::symlink_metadata(dst).is_ok() {
+        std::fs::remove_file(dst)
+            .map_err(|e| format!("{} を置き換えられません: {e}", dst.display()))?;
+    }
+    // 段は**必ず遅延評価**する。配列リテラルに並べると 3 つとも実行され、
+    // ハードリンク成功後に copy(src, dst) が「同じ実体へのコピー」になって
+    // 本体バイナリを 0 バイトに切り詰めてしまう (実機で踏んだ)。
+    let mut why: Vec<String> = Vec::new();
+    macro_rules! step {
+        ($kind:expr, $f:expr) => {
+            match $f(src, dst) {
+                Ok(()) => return Ok($kind),
+                Err(e) => why.push(format!("{}: {e}", LinkKind::label($kind))),
+            }
+        };
+    }
+    step!(LinkKind::Hard, hard);
+    step!(LinkKind::Symlink, sym);
+    step!(LinkKind::Copy, copy);
+    Err(format!(
+        "{} を用意できません — {}",
+        dst.display(),
+        why.join(" / ")
+    ))
+}
+
+/// 2 つのパスが同じ場所を指すか (存在しない側は素のパス比較にフォールバック)。
+#[allow(dead_code)]
+fn same_path(a: &Path, b: &Path) -> bool {
+    let ca = a.canonicalize().unwrap_or_else(|_| a.to_path_buf());
+    let cb = b.canonicalize().unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
+}
+
+/// `.app` から起動されたときにホームへ移るべきか判定する純関数。
+///
+/// Finder / Launchpad / Spotlight から起動されたプロセスの作業ディレクトリは
+/// 必ず `/` になる。そのまま起動するとファイルツリーのルートが `/` になって
+/// しまうため、以前はランチャースクリプトが `cd "$HOME"` していた。
+/// スクリプトを廃してバイナリ自身をバンドルの実体にしたので、その代わりを
+/// ここで判定する。ターミナルから `zai` を叩く経路は cwd が `/` でない
+/// ので一切影響を受けない。
+#[allow(dead_code)]
+fn app_launch_cwd_fix(exe: &Path, cwd: &Path, home: &Path) -> Option<PathBuf> {
+    let in_bundle = exe
+        .parent()
+        .map(|p| p.ends_with("Contents/MacOS"))
+        .unwrap_or(false)
+        && exe.components().any(|c| {
+            std::path::Path::new(c.as_os_str())
+                .extension()
+                .map(|e| e == "app")
+                .unwrap_or(false)
+        });
+    let root = Path::new("/");
+    if in_bundle && cwd == root && home.is_absolute() && home != root {
+        Some(home.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// 起動直後に呼ぶ (main → `instances::set_process_name` 経由)。
+/// `.app` 経由の起動なら作業ディレクトリをホームにする。それ以外は何もしない。
+pub fn normalize_app_launch_cwd() {
+    #[cfg(target_os = "macos")]
+    {
+        let (Ok(exe), Ok(cwd), Some(home)) = (
+            std::env::current_exe(),
+            std::env::current_dir(),
+            dirs::home_dir(),
+        ) else {
+            return;
+        };
+        if let Some(to) = app_launch_cwd_fix(&exe, &cwd, &home) {
+            let _ = std::env::set_current_dir(to);
+        }
+    }
 }
 
 /// Linux の .desktop エントリ。Icon 名と StartupWMClass は
@@ -219,30 +350,61 @@ fn app_bundle_path() -> Result<PathBuf, String> {
     Ok(home_dir()?.join("Applications").join(format!("{APP_NAME}.app")))
 }
 
-#[cfg(target_os = "macos")]
-fn install() -> Result<String, String> {
-    use std::os::unix::fs::PermissionsExt;
-    let bin = resolve_bin()?;
-    let app = app_bundle_path()?;
+/// `.app` 一式を `app` へ書き出す。テストから fake root と偽の配置関数を
+/// 渡せるよう cfg を持たせない (OS 依存部は `place` の中だけ)。
+#[allow(dead_code)]
+fn write_bundle(
+    app: &Path,
+    bin: &Path,
+    version: &str,
+    place: impl Fn(&Path, &Path) -> Result<LinkKind, String>,
+) -> Result<LinkKind, String> {
     let macos_dir = app.join("Contents/MacOS");
     let res_dir = app.join("Contents/Resources");
     std::fs::create_dir_all(&macos_dir)
         .and_then(|_| std::fs::create_dir_all(&res_dir))
         .map_err(|e| format!("{} を作成できません: {e}", app.display()))?;
-    std::fs::write(
-        app.join("Contents/Info.plist"),
-        info_plist(env!("CARGO_PKG_VERSION")),
-    )
-    .map_err(|e| format!("Info.plist を書けません: {e}"))?;
-    let launcher = macos_dir.join("zai");
-    std::fs::write(&launcher, launcher_script(&bin))
-        .map_err(|e| format!("ランチャーを書けません: {e}"))?;
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("実行権限を付与できません: {e}"))?;
+    std::fs::write(app.join("Contents/Info.plist"), info_plist(version))
+        .map_err(|e| format!("Info.plist を書けません: {e}"))?;
+    // 旧レイアウト (Contents/MacOS/zai のランチャースクリプト) の後始末。
+    // 残しておくとバンドル内に使われない殻が居座るだけなので必ず消す。
+    let legacy = macos_dir.join("zai");
+    if std::fs::symlink_metadata(&legacy).is_ok() {
+        let _ = std::fs::remove_file(&legacy);
+    }
+    // バンドルの実体そのものをバイナリにする = プロセス名が "Zaivern" になる。
+    let exe = macos_dir.join(MACOS_EXEC_NAME);
+    let kind = place(bin, &exe)?;
+    // コピー経路では元の実行権限が落ちることがあるので明示的に付け直す。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
+    }
     // アイコンは失敗しても登録自体は続行する
     if let Ok(icns) = icns_bytes(ICON_PNG) {
         let _ = std::fs::write(res_dir.join("Zaivern.icns"), icns);
     }
+    Ok(kind)
+}
+
+/// `.app` を丸ごと削除する。`Contents/MacOS/Zaivern` はハードリンク or
+/// シンボリックリンクなので、消しても PATH 上の `zai` 本体は無傷。
+/// 戻り値は「消すものがあったか」。
+#[allow(dead_code)]
+fn remove_bundle(app: &Path) -> Result<bool, String> {
+    if std::fs::symlink_metadata(app).is_err() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(app).map_err(|e| format!("{} を削除できません: {e}", app.display()))?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn install() -> Result<String, String> {
+    let bin = resolve_bin()?;
+    let app = app_bundle_path()?;
+    let kind = write_bundle(&app, &bin, env!("CARGO_PKG_VERSION"), place_executable)?;
     // Launch Services へ即時登録 (失敗しても Launchpad の次回スキャンで拾われる)
     let _ = std::process::Command::new(LSREGISTER)
         .args(["-f", &app.to_string_lossy()])
@@ -250,18 +412,30 @@ fn install() -> Result<String, String> {
         .stderr(std::process::Stdio::null())
         .status();
     Ok(format!(
-        "✅ アプリとして登録しました: {}\n   Launchpad / Spotlight から「{APP_NAME}」で起動できます。",
-        app.display()
+        "✅ アプリとして登録しました: {} ({})\n   Launchpad / Spotlight から「{APP_NAME}」で起動でき、\n   アクティビティモニタ / `pgrep -i zaivern` には「{MACOS_EXEC_NAME}」で出ます。",
+        app.display(),
+        kind.label()
     ))
+}
+
+/// 実 fs でのハードリンク → シンボリックリンク → コピー。
+#[cfg(target_os = "macos")]
+fn place_executable(src: &Path, dst: &Path) -> Result<LinkKind, String> {
+    place_executable_with(
+        src,
+        dst,
+        |s: &Path, d: &Path| std::fs::hard_link(s, d),
+        |s: &Path, d: &Path| std::os::unix::fs::symlink(s, d),
+        |s: &Path, d: &Path| std::fs::copy(s, d).map(|_| ()),
+    )
 }
 
 #[cfg(target_os = "macos")]
 fn uninstall() -> Result<String, String> {
     let app = app_bundle_path()?;
-    if !app.exists() {
+    if !remove_bundle(&app)? {
         return Ok("アプリ登録は見つかりませんでした (何もしていません)。".into());
     }
-    std::fs::remove_dir_all(&app).map_err(|e| format!("{} を削除できません: {e}", app.display()))?;
     let _ = std::process::Command::new(LSREGISTER)
         .args(["-u", &app.to_string_lossy()])
         .stdout(std::process::Stdio::null())
@@ -462,7 +636,7 @@ mod tests {
     fn info_plist_has_required_keys() {
         let p = info_plist("9.9.9");
         for needle in [
-            "<key>CFBundleExecutable</key><string>zai</string>",
+            "<key>CFBundleExecutable</key><string>Zaivern</string>",
             "<key>CFBundleIconFile</key><string>Zaivern</string>",
             "<key>CFBundlePackageType</key><string>APPL</string>",
             "<string>9.9.9</string>",
@@ -473,13 +647,198 @@ mod tests {
     }
 
     #[test]
-    fn launcher_script_execs_recorded_binary_from_home() {
-        let s = launcher_script(Path::new("/opt/bin/zai"));
-        assert!(s.starts_with("#!/bin/sh\n"));
-        assert!(s.contains("BIN=\"/opt/bin/zai\""));
-        assert!(s.contains("cd \"$HOME\""), "Finder 起動 (cwd=/) の対策");
-        assert!(s.contains("exec \"$BIN\" \"$@\""));
-        assert!(s.contains("command -v zai"), "実体が消えても PATH から拾う");
+    fn info_plist_executable_is_not_a_launcher_script() {
+        // 退行防止: ここが "zai" に戻るとプロセス一覧が再び `zai` になる。
+        let p = info_plist("1.2.3");
+        assert!(!p.contains("<key>CFBundleExecutable</key><string>zai</string>"));
+        assert_eq!(MACOS_EXEC_NAME, "Zaivern");
+    }
+
+    // ── ハードリンク → シンボリックリンク → コピー のフォールバック連鎖 ──
+
+    /// 常に成功する偽の fs 操作 (中身は目印テキスト)。
+    fn ok_with(tag: &'static str) -> impl Fn(&Path, &Path) -> std::io::Result<()> {
+        move |_s: &Path, d: &Path| std::fs::write(d, tag)
+    }
+
+    /// 常に失敗する偽の fs 操作。
+    fn fail() -> impl Fn(&Path, &Path) -> std::io::Result<()> {
+        |_s: &Path, _d: &Path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::CrossesDevices,
+                "別ファイルシステム",
+            ))
+        }
+    }
+
+    fn chain_case(dir: &Path, name: &str, hard_ok: bool, sym_ok: bool, copy_ok: bool) -> Result<LinkKind, String> {
+        let src = dir.join(format!("{name}-src"));
+        std::fs::write(&src, "binary").unwrap();
+        let dst = dir.join(name);
+        let h: Box<dyn Fn(&Path, &Path) -> std::io::Result<()>> =
+            if hard_ok { Box::new(ok_with("hard")) } else { Box::new(fail()) };
+        let s: Box<dyn Fn(&Path, &Path) -> std::io::Result<()>> =
+            if sym_ok { Box::new(ok_with("sym")) } else { Box::new(fail()) };
+        let c: Box<dyn Fn(&Path, &Path) -> std::io::Result<()>> =
+            if copy_ok { Box::new(ok_with("copy")) } else { Box::new(fail()) };
+        place_executable_with(&src, &dst, h, s, c)
+    }
+
+    #[test]
+    fn place_executable_falls_back_hard_then_symlink_then_copy() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-desktop-test", "chain");
+        for (hard, sym, copy, want) in [
+            (true, true, true, Ok(LinkKind::Hard)),
+            (false, true, true, Ok(LinkKind::Symlink)),
+            (false, false, true, Ok(LinkKind::Copy)),
+        ] {
+            let name = format!("exe-{hard}-{sym}-{copy}");
+            assert_eq!(chain_case(&dir, &name, hard, sym, copy), want);
+            assert!(dir.join(&name).exists(), "{name} が用意されること");
+        }
+    }
+
+    #[test]
+    fn place_executable_stops_at_the_first_success() {
+        // 退行防止: 3 段を配列リテラルに並べると全部実行されてしまい、
+        // ハードリンク成功後の copy(src, dst) が「同じ実体へのコピー」に
+        // なって**本体バイナリを 0 バイトに切り詰める**。実機で踏んだ事故。
+        use std::cell::Cell;
+        let dir = crate::test_util::unique_temp_dir("zaivern-desktop-test", "lazy");
+        let src = dir.join("real");
+        std::fs::write(&src, "binary").unwrap();
+        let dst = dir.join("Zaivern");
+        let (sym_called, copy_called) = (Cell::new(false), Cell::new(false));
+        let kind = place_executable_with(
+            &src,
+            &dst,
+            |s: &Path, d: &Path| std::fs::hard_link(s, d),
+            |_s: &Path, _d: &Path| {
+                sym_called.set(true);
+                Ok(())
+            },
+            |_s: &Path, _d: &Path| {
+                copy_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("配置");
+        assert_eq!(kind, LinkKind::Hard);
+        assert!(!sym_called.get(), "成功後にシンボリックリンクを試さないこと");
+        assert!(!copy_called.get(), "成功後にコピーを試さないこと");
+        // ハードリンク先も元も中身が生きていること (切り詰め事故の直接検知)
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), "binary");
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "binary");
+    }
+
+    #[test]
+    fn place_executable_reports_all_failures() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-desktop-test", "chain-fail");
+        let err = chain_case(&dir, "exe-none", false, false, false).unwrap_err();
+        for needle in ["ハードリンク", "シンボリックリンク", "コピー", "exe-none"] {
+            assert!(err.contains(needle), "失敗理由に {needle} が無い: {err}");
+        }
+        assert!(!dir.join("exe-none").exists(), "全滅なら何も残さない");
+    }
+
+    #[test]
+    fn place_executable_replaces_stale_launcher_script() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-desktop-test", "stale");
+        let dst = dir.join("Zaivern");
+        std::fs::write(&dst, "#!/bin/sh\nexec zai\n").unwrap(); // 旧レイアウトの残骸
+        let src = dir.join("real");
+        std::fs::write(&src, "binary").unwrap();
+        let kind = place_executable_with(&src, &dst, ok_with("hard"), fail(), fail()).unwrap();
+        assert_eq!(kind, LinkKind::Hard);
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "hard", "張り直されること");
+    }
+
+    #[test]
+    fn place_executable_is_noop_when_src_is_dst() {
+        // バンドル内バイナリから `zai app install` した場合に自分を消さないこと。
+        let dir = crate::test_util::unique_temp_dir("zaivern-desktop-test", "self");
+        let p = dir.join("Zaivern");
+        std::fs::write(&p, "binary").unwrap();
+        assert_eq!(place_executable_with(&p, &p, fail(), fail(), fail()), Ok(LinkKind::Hard));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "binary", "自分自身は無傷");
+    }
+
+    // ── バンドル一式のレイアウト: 作った物と、uninstall が全部消すこと ──
+
+    #[test]
+    fn bundle_layout_roundtrip_and_uninstall_cleans_up() {
+        let root = crate::test_util::unique_temp_dir("zaivern-desktop-test", "bundle");
+        let bin = root.join("bin/zai");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "ELF-ish").unwrap();
+        let app = root.join(format!("{APP_NAME}.app"));
+        // 旧レイアウトからの移行も同時に確かめる: ランチャースクリプトを置いておく。
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(app.join("Contents/MacOS/zai"), "#!/bin/sh\nexec zai\n").unwrap();
+
+        let kind = write_bundle(&app, &bin, "9.9.9", |s, d| {
+            std::fs::hard_link(s, d).map(|_| LinkKind::Hard).map_err(|e| e.to_string())
+        })
+        .expect("bundle");
+        assert_eq!(kind, LinkKind::Hard);
+
+        let plist = app.join("Contents/Info.plist");
+        let exe = app.join("Contents/MacOS").join(MACOS_EXEC_NAME);
+        let icns = app.join("Contents/Resources/Zaivern.icns");
+        assert!(plist.exists(), "Info.plist");
+        assert!(exe.exists(), "Contents/MacOS/Zaivern が実体であること");
+        assert!(icns.exists(), "アイコン");
+        assert!(
+            !app.join("Contents/MacOS/zai").exists(),
+            "旧ランチャースクリプトは消えること"
+        );
+        let text = std::fs::read_to_string(&plist).unwrap();
+        assert!(text.contains("<key>CFBundleExecutable</key><string>Zaivern</string>"));
+        assert!(text.contains("<string>9.9.9</string>"));
+        assert!(text.contains(APP_NAME));
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "ELF-ish", "中身は本体と同じ");
+
+        // uninstall は .app 配下を全部消し、リンク元のバイナリには触らない。
+        assert!(remove_bundle(&app).expect("uninstall"), "消す物があった");
+        assert!(!app.exists(), ".app が丸ごと消えること");
+        assert!(bin.exists(), "リンク元の zai 本体は残ること");
+        assert!(!remove_bundle(&app).expect("再 uninstall"), "2 回目は何もしない");
+    }
+
+    // ── .app 起動時の作業ディレクトリ補正 (ランチャーの `cd $HOME` の代替) ──
+
+    #[test]
+    fn app_launch_cwd_fix_only_for_bundle_launched_from_root() {
+        let home = Path::new("/Users/u");
+        let bundled = Path::new("/Users/u/Applications/Zaivern Code.app/Contents/MacOS/Zaivern");
+        assert_eq!(
+            app_launch_cwd_fix(bundled, Path::new("/"), home),
+            Some(home.to_path_buf()),
+            "Finder 起動 (cwd=/) はホームへ"
+        );
+        assert_eq!(
+            app_launch_cwd_fix(bundled, Path::new("/Users/u/proj"), home),
+            None,
+            "ターミナルからバンドル実体を叩いた場合は cwd を触らない"
+        );
+        assert_eq!(
+            app_launch_cwd_fix(Path::new("/usr/local/bin/zai"), Path::new("/"), home),
+            None,
+            "PATH 上の CLI は対象外 (`cd /` して `zai` を叩く自由を奪わない)"
+        );
+        assert_eq!(
+            app_launch_cwd_fix(bundled, Path::new("/"), Path::new("/")),
+            None,
+            "ホームが / なら補正しない"
+        );
+    }
+
+    #[test]
+    fn normalize_app_launch_cwd_does_not_move_test_process() {
+        // テストプロセスの exe はバンドル内ではないので cwd は動かないこと。
+        let before = std::env::current_dir().expect("cwd");
+        normalize_app_launch_cwd();
+        assert_eq!(std::env::current_dir().expect("cwd"), before);
     }
 
     #[test]
@@ -488,6 +847,9 @@ mod tests {
         for needle in [
             "[Desktop Entry]",
             "Type=Application",
+            // アプリメニューで「Zaivern」を検索して見つかる導線。
+            // APP_NAME を経由せずリテラルでも固定しておく (退行防止)。
+            "Name=Zaivern Code",
             &format!("Name={APP_NAME}"),
             "Exec=/home/u/.local/bin/zai %F",
             "Icon=zaivern-code",
@@ -516,6 +878,40 @@ mod tests {
     fn ps_quote_doubles_single_quotes() {
         assert_eq!(ps_quote("a'b"), "a''b");
         assert_eq!(ps_quote("plain"), "plain");
+    }
+
+    // ── Windows: build.rs が埋める版情報リソースの契約 ──
+
+    /// build.rs は cargo test の対象外 (ビルドスクリプト内の #[test] は走らない)
+    /// ので、埋め込む内容の契約だけはソースを取り込んでここで固定する。
+    /// タスクマネージャーの「説明」列に出るのは FileDescription なので、
+    /// これが消えると Windows で「Zaivern」検索が効かなくなる。
+    #[test]
+    fn windows_version_resource_declares_expected_fields() {
+        let src = include_str!("../build.rs");
+        for needle in [
+            r#"("FileDescription", "Zaivern Code")"#,
+            r#"("ProductName", "Zaivern Code")"#,
+            r#"("CompanyName", "#,
+            r#"("OriginalFilename", "zai.exe")"#, // CLI 名は変えない
+            "CARGO_PKG_VERSION",
+            "FileVersion",
+            "ProductVersion",
+            "assets/Zaivern.ico",
+            "cfg(windows)", // 他 OS のビルドに影響させない
+        ] {
+            assert!(src.contains(needle), "build.rs に {needle} が無い");
+        }
+        // rc.exe が無い環境でビルドを壊さない (warning へ落とす) こと。
+        assert!(src.contains("cargo:warning="), "リソース失敗は fail-soft");
+    }
+
+    #[test]
+    fn windows_icon_asset_is_a_valid_multi_size_ico() {
+        let ico = include_bytes!("../assets/Zaivern.ico");
+        assert_eq!(&ico[..4], &[0, 0, 1, 0], "ICONDIR (reserved=0, type=1)");
+        let count = u16::from_le_bytes([ico[4], ico[5]]);
+        assert!(count >= 2, "複数サイズを持つこと: {count}");
     }
 
     // ── ディスパッチ ──

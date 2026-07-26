@@ -327,12 +327,17 @@ fn tasklist_image(pid: u32) -> Option<String> {
 
 // ───────────────────────── プロセス名 ─────────────────────────
 
-/// ps/top で見つけやすいプロセス名を設定する。
+/// 起動直後のプロセス整形 — どの OS でも「Zaivern」で見つかる状態にする。
 ///
-/// Linux のみ prctl(PR_SET_NAME) で comm を "zaivern-code" にする
-/// (comm は 15 文字上限、12 文字なので収まる)。macOS / Windows では
-/// 実行ファイル名がそのままアクティビティモニタ / タスクマネージャーに
-/// 出るため何もしない (レジストリ + `zai status` が検知経路)。
+/// - **Linux**: prctl(PR_SET_NAME) で comm を "zaivern-code" にする
+///   (comm は 15 文字上限、12 文字なので収まる)。`ps` / `top` / `pgrep zaivern`。
+/// - **macOS**: プロセス名は実行ファイルの basename で決まるので、
+///   `zai app install` が作る `.app` の実体を `Contents/MacOS/Zaivern` に
+///   している ([`crate::desktop::MACOS_EXEC_NAME`])。ここではその `.app`
+///   起動時 (cwd=`/`) の作業ディレクトリだけ直す — 旧ランチャースクリプトの
+///   `cd "$HOME"` の代替。ターミナルの `zai` は一切影響を受けない。
+/// - **Windows**: `zai.exe` のまま出るが、build.rs が埋める版情報リソースで
+///   タスクマネージャーの「説明」列に "Zaivern Code" が出る。
 pub fn set_process_name() {
     #[cfg(target_os = "linux")]
     {
@@ -342,6 +347,7 @@ pub fn set_process_name() {
             }
         }
     }
+    crate::desktop::normalize_app_launch_cwd();
 }
 
 // ───────────────────────── 表示 (純粋関数) ─────────────────────────
@@ -401,6 +407,22 @@ pub fn render_table(entries: &[InstanceEntry], now_epoch: u64) -> String {
 /// `zai status --json` 用。エントリ配列をそのまま JSON にする (機械可読)。
 pub fn render_json(entries: &[InstanceEntry]) -> String {
     serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// `zai status --pid-only` 用。PID だけを 1 行 1 つで返す。
+///
+/// `zai status --pid-only | xargs kill` のようにテーブルを解析させずに
+/// パイプへ流すための形式。空 (実行中なし) なら**空文字列**を返し、
+/// 呼び出し側は何も print せず終了コード 1 にする — `xargs` に空行を
+/// 渡さないため (空行を渡すと kill が引数無しでエラーになる)。
+// cli.rs が `--pid-only` を配線したら allow は外してよい (現状はテストのみ利用)。
+#[allow(dead_code)]
+pub fn render_pids(entries: &[InstanceEntry]) -> String {
+    entries
+        .iter()
+        .map(|e| e.pid.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ───────────────────────── テスト ─────────────────────────
@@ -581,6 +603,28 @@ mod tests {
     #[test]
     fn render_json_empty_is_array() {
         assert_eq!(render_json(&[]), "[]");
+    }
+
+    #[test]
+    fn render_pids_is_one_per_line() {
+        let mk = |pid| InstanceEntry {
+            pid,
+            start_signature: 0,
+            exe: String::new(),
+            version: "1.0.0".into(),
+            workspace_roots: vec![],
+            launched_epoch: 1,
+        };
+        assert_eq!(render_pids(&[mk(11)]), "11");
+        assert_eq!(render_pids(&[mk(11), mk(2222), mk(3)]), "11\n2222\n3");
+        // 末尾に改行を足さない = 呼び出し側の println! でちょうど 1 行 1 PID。
+        assert!(!render_pids(&[mk(11)]).ends_with('\n'));
+    }
+
+    #[test]
+    fn render_pids_empty_is_empty_string() {
+        // 空行を出すと `xargs kill` が引数無しで走ってしまうので、空は空のまま。
+        assert_eq!(render_pids(&[]), "");
     }
 
     #[test]
