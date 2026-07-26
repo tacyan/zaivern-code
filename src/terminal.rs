@@ -2002,9 +2002,19 @@ fn kill_tree_command(pid: u32) -> std::process::Command {
     #[cfg(not(windows))]
     // portable-pty の unix 実装は子を setsid するので、子はプロセスグループの
     // リーダーになっている。`-PID` でグループごと落とせる。
+    //
+    // **`--` は必須**。ここを省くと Linux (procps-ng の /usr/bin/kill) では
+    // `-1234` が「まとめ書きした短オプション」として getopt に食われ、
+    // 残った先頭 1 桁だけが PID として渡る:
+    //   `kill -KILL -213` → `kill(-2, SIGKILL)`   (無関係なグループ 2)
+    //   `kill -KILL -193` → `kill(-1, SIGKILL)`   (**シグナルを送れる全プロセス**)
+    // しかも終了コードは常に 0 なので、呼び出し側は成功したと誤認する。
+    // 「Linux ランナーが突然死ぬ」の正体がこれ (pid の先頭が 1 なら全滅)。
+    // `--` を挟めば `kill(-1234, SIGKILL)` と正しく解釈され、相手が居なければ
+    // 終了コード 1 が返る。macOS / BSD の kill も `--` を受け付けるので共通。
     let mut c = {
         let mut c = crate::procx::hidden_command_raw("kill");
-        c.args(["-KILL", &format!("-{pid}")]);
+        c.args(["-KILL", "--", &format!("-{pid}")]);
         c
     };
     // 「〜を終了しました」の報告はどこへも出さない。ターミナルから `zai` を
@@ -5415,7 +5425,15 @@ mod reap_tests {
         {
             assert_eq!(prog, "kill");
             // 先頭の `-` がプロセスグループ指定。これが無いと孫が残る。
-            assert_eq!(args, vec!["-KILL".to_string(), "-4321".to_string()]);
+            // `--` を落とすと Linux の procps-ng kill が `-4321` を短オプションの
+            // まとめ書きと解釈し、`kill(-4, SIGKILL)` = 無関係なグループへ撃つ
+            // (先頭が 1 の PID なら `kill(-1, …)` で全プロセス道連れ)。
+            // しかも終了コードは 0 なので誰も気付けない。回帰防止にここで固定する。
+            assert_eq!(
+                args,
+                vec!["-KILL".to_string(), "--".to_string(), "-4321".to_string()],
+                "`--` が無いと Linux で kill が別のプロセスグループを撃つ"
+            );
         }
     }
 
@@ -5622,12 +5640,28 @@ mod reap_pty_tests {
             kill_tree_blocking(session.child_pid),
             "生きているセッションの木を辿れなかった"
         );
-        // 根を落とした後は、同じ PID を渡しても辿れない — だから順序が要る。
+        // 木が消えた後は、同じ PID を渡しても辿れない — だから順序が要る。
+        //
+        // 消えるまでは待つ (固定 sleep にしない)。上の一撃で木は全員 SIGKILL
+        // されているが、実際に「居なくなる」のは wait/reap が済んでからで、
+        // 混んだ CI では孤児の引き取り (init への再ペアレント) が数百 ms 遅れる。
+        // ゾンビもプロセスグループの一員なので、その間は辿れて当然。
         let _ = session.killer.kill();
-        std::thread::sleep(Duration::from_millis(500));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut unreachable = false;
+        while Instant::now() < deadline {
+            if !kill_tree_blocking(session.child_pid) {
+                unreachable = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(
-            !kill_tree_blocking(session.child_pid),
-            "根が消えた後に木を辿れてしまった (この前提が崩れたら kill の順序を見直すこと)"
+            unreachable,
+            "木が消えた後も辿れてしまう (pid={:?})。\
+             kill が到達性を正直に報告していない — Linux なら `kill -KILL -- -PID` の \
+             `--` が落ちて別グループを撃っている可能性が高い (kill_tree_command 参照)",
+            session.child_pid
         );
         reap(session);
     }
