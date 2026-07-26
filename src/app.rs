@@ -15219,15 +15219,16 @@ impl ZaivernApp {
         // 内部エラーの警告バナーは**最初に**描く。フレームの途中で panic しても
         // ここまでは描き終わっているので、崩れた画面でも理由が読める。
         self.frame_error_banner_ui(ctx);
-        // 低頻度の定期フレームを必ず予約しておく。
+        // 定期フレームの予約は**フレームの最後**で [`idle_repaint_ms`] が決める。
         //
-        // スマホリモートと CLI (`zai notify` など) からの要求は、UI スレッドが
-        // フレームを回した時にしか処理できない。ウィンドウが背面や非表示だと
-        // OS 側で更新が抑制され、request_repaint だけでは十数秒フレームが
-        // 来ないことがあり、要求が取りこぼされる。
-        // 4fps 相当なら負荷はごくわずかで、外部からの操作が常に届くようになる。
-        ctx.request_repaint_after(std::time::Duration::from_millis(250));
-
+        // かつてはここで無条件に 4fps を予約していた。理由は「スマホリモートと
+        // CLI (`zai notify` など) の要求は UI スレッドがフレームを回した時にしか
+        // 処理できず、背面や非表示だと request_repaint 1 回では取りこぼす」から
+        // だったが、その心配は [`crate::remote`] 側で解決済み — HTTP を受けた
+        // スレッドが応答を受け取るまで 150ms 間隔で `request_repaint` を撃ち
+        // 続ける (`remote.rs` の待機ループ)。一方向の指示も積んだ直後に 1 回
+        // 起こす。よって「誰も何もしていないのに 4fps で回す」理由は無い。
+        //
         // 永続 UI 設定 (検索オプション・保存時クリーンアップ) は最初のフレームで読む
         self.load_prefs_once(ctx);
 
@@ -15797,8 +15798,84 @@ impl ZaivernApp {
                 }
             }
         }
+
+        // フレームの最後に、次の定期フレームだけをまとめて予約する。
+        // ここより上で誰かが予約していれば egui は最短を採るので、
+        // このポリシーは「他に誰も予約していないときの下限」を決める役になる。
+        self.schedule_idle_repaint(ctx);
     }
 
+    /// いまの状態から [`idle_repaint_ms`] の材料を組み立てて予約する。
+    ///
+    /// 「別スレッドが結果を届けたら起こす」経路 (PTY リーダ / LSP / git /
+    /// リモート HTTP / プラグイン / gh / 音声 / 見張り) は各所で
+    /// `request_repaint` を撃っているので、ここでは数えない。
+    /// 逆に**自前で起こさない**待ち (OS ファイルダイアログ・ファイアウォール
+    /// 操作・横断検索・定義ジャンプ) は `awaiting` として拾う。
+    fn schedule_idle_repaint(&self, ctx: &egui::Context) {
+        use plugins::PluginList;
+        let (focused, minimized, had_input) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.focused.unwrap_or(true),
+                v.minimized.unwrap_or(false),
+                !i.events.is_empty() || i.pointer.is_moving(),
+            )
+        });
+        let awaiting = self.dialogs.busy()
+            || self.fw.busy().is_some()
+            || self.gsearch.rx.is_some()
+            || self.awaiting_definition.is_some();
+        // 外部での書き換えを見張る対象: 開いているフォルダか、
+        // ディスク上のファイルに紐付いたタブ (`check_external_changes` の対象)
+        let watching_files = !self.roots.is_empty()
+            || self.editor.buffers.iter().any(|b| b.path.is_some());
+        let timers_due = self.menu_state.auto_save
+            || !self.plugins.active_hooks(plugins::HookEvent::Interval).is_empty();
+        let signals = IdleSignals {
+            had_input,
+            animating: ctx.has_requested_repaint(),
+            awaiting,
+            agents_running: self.agents.running_count() > 0,
+            watching_files,
+            timers_due,
+            focused,
+            visible: !minimized,
+        };
+        if let Some(ms) = idle_repaint_ms(signals) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+        }
+        // ZV_IDLE_TRACE=1 のときだけ、1 秒ごとに実フレーム数と判断材料を出す。
+        // 「アイドルで何枚描いたか」を実測するための計測窓 (既定では無効)。
+        idle_trace(signals);
+    }
+}
+
+/// アイドル計測用のトレース。`ZV_IDLE_TRACE=1` のときだけ働く。
+/// 1 秒間に実際に回ったフレーム数と、その判断材料を stderr へ 1 行出す。
+fn idle_trace(s: IdleSignals) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("ZV_IDLE_TRACE").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    static WINDOW: OnceLock<std::sync::Mutex<Instant>> = OnceLock::new();
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+    let w = WINDOW.get_or_init(|| std::sync::Mutex::new(Instant::now()));
+    let Ok(mut at) = w.lock() else { return };
+    if at.elapsed() < Duration::from_secs(1) {
+        return;
+    }
+    let n = FRAMES.swap(0, Ordering::Relaxed);
+    let secs = at.elapsed().as_secs_f32();
+    *at = Instant::now();
+    eprintln!(
+        "zv-idle: {:.1} fps ({n} frames / {secs:.2}s) next={:?} {s:?}",
+        n as f32 / secs,
+        idle_repaint_ms(s)
+    );
 }
 
 /// ルートの表示名(フォルダ名。取れなければフルパス)。
@@ -17451,6 +17528,209 @@ fn global_search_panel(
             }
         });
     (go, jump, replace_ev)
+}
+
+// ─── アイドル時の再描画ポリシー ─────────────────────────────────────
+//
+// 「何も起きていないのにフレームを回さない」ための唯一の窓口。
+// ここに載っていない理由で定期フレームを予約しない。
+//
+// 予約が要る理由は 4 つしか無い:
+//   (a) 実入力 — egui が自分で起こすのでここでは何もしない
+//   (b) 別スレッドが新しいデータを届けた — 届けた側が `request_repaint` する
+//       (PTY リーダ / LSP / git / リモート HTTP / 音声 は実際にそうしている)
+//   (c) 本当に動いているアニメーション — 持ち主が自分の刻みで予約する
+//   (d) ユーザーに**見える**期限 or 落とせない家事 — それがこの関数
+
+/// フォルダ/ファイルの外部変更を取り込む刻み (フォーカスあり)。
+///
+/// `check_external_changes` 自身は 1 秒のゲートを持つので、実際の確認は
+/// 「2 秒に 1 回」になる。実測でこの 1 フレームが約 3.3ms — 1 秒刻みだと
+/// アイドルで 0.33%/コアかかり、目標 (0.3%) を割れない。2 秒刻みなら 0.17%。
+/// 外部で書き換えられたファイルの取り込みが最悪 2 秒遅れるだけで、
+/// ウィンドウにフォーカスが戻った瞬間は入力イベントでフレームが回るため、
+/// 「他のエディタで直してから戻る」体験は変わらない。
+const IDLE_HOUSEKEEP_MS: u64 = 2000;
+/// 同上・背面に回っているとき。見ていない画面の鮮度は落として良い。
+const IDLE_BACKGROUND_MS: u64 = 6000;
+/// 同上・最小化されているとき。描いても誰も見ていない。
+const IDLE_HIDDEN_MS: u64 = 10_000;
+/// エージェントが走っている間の刻み (フォーカスあり)。
+/// 出力が無くても状態機械 (承認待ち検出・見張り) を進めるために要る。
+const IDLE_AGENT_MS: u64 = 250;
+/// 同上・背面。通知は届くが、画面の更新頻度は落とす。
+const IDLE_AGENT_BACKGROUND_MS: u64 = 1500;
+/// UI スレッドの応答待ちがあるときの刻み。選ばれた瞬間に反応する速さ。
+const IDLE_AWAITING_MS: u64 = 50;
+
+/// [`idle_repaint_ms`] の入力。フレーム終わりの実状態から組み立てる。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdleSignals {
+    /// このフレームに実入力 (キー・ポインタ・スクロール等) があった
+    pub had_input: bool,
+    /// このフレームで誰かが既に再描画を予約した = アニメーションが飛んでいる
+    pub animating: bool,
+    /// UI スレッドの応答を待っている処理がある (ファイルダイアログ等)
+    pub awaiting: bool,
+    /// 走っているエージェントが 1 本以上ある
+    pub agents_running: bool,
+    /// 外部での書き換えを見張る対象がある (開いているファイル / フォルダ)
+    pub watching_files: bool,
+    /// 期限を持つ家事がある (自動保存・interval プラグイン)
+    pub timers_due: bool,
+    /// ウィンドウがフォーカスされている
+    pub focused: bool,
+    /// ウィンドウが見えている (最小化されていない)
+    pub visible: bool,
+}
+
+/// 次に定期フレームを予約するまでの ms。`None` なら**予約しない** = 完全に寝る。
+///
+/// アニメーションが飛んでいる (`animating`) ときは、その持ち主が自分の刻みで
+/// 予約済み。egui は複数の `request_repaint_after` の**最短**を採るので、
+/// ここでさらに粗い予約を足しても意味が無い — `None` を返す。
+/// ただし応答待ち (`awaiting`) はどのアニメより短い刻みが要るので先に見る。
+pub fn idle_repaint_ms(s: IdleSignals) -> Option<u64> {
+    // ① UI スレッドの返事を待っている — いちばん短く回す
+    if s.awaiting {
+        return Some(IDLE_AWAITING_MS);
+    }
+    // ② アニメーションの持ち主に任せる
+    if s.animating {
+        return None;
+    }
+    // ③ エージェントが走っている — 出力が無くても状態機械を進める
+    if s.agents_running {
+        return Some(if s.focused || s.had_input {
+            IDLE_AGENT_MS
+        } else {
+            IDLE_AGENT_BACKGROUND_MS
+        });
+    }
+    // ④ ここから下は「何も起きていない」。落とせない家事が無ければ 1 枚も描かない
+    if !(s.watching_files || s.timers_due) {
+        return None;
+    }
+    Some(if !s.visible {
+        IDLE_HIDDEN_MS
+    } else if s.focused || s.had_input {
+        IDLE_HOUSEKEEP_MS
+    } else {
+        IDLE_BACKGROUND_MS
+    })
+}
+
+#[cfg(test)]
+mod idle_repaint_tests {
+    use super::*;
+
+    /// 画面が見えていてフォーカスもあるが、何も起きていない既定形。
+    fn idle() -> IdleSignals {
+        IdleSignals {
+            focused: true,
+            visible: true,
+            ..Default::default()
+        }
+    }
+
+    /// 回帰テスト: 完全なアイドル (入力なし / アニメなし / エージェントなし /
+    /// 家事なし) では**1 フレームも予約しない**。ここが Some に戻ったら
+    /// アイドル時の CPU が跳ねる。
+    #[test]
+    fn fully_idle_asks_for_nothing() {
+        assert_eq!(idle_repaint_ms(idle()), None);
+    }
+
+    /// 入力があっても、追加の予約はしない (egui が入力で起こす)。
+    #[test]
+    fn input_alone_does_not_schedule() {
+        let s = IdleSignals { had_input: true, ..idle() };
+        assert_eq!(idle_repaint_ms(s), None);
+    }
+
+    /// アニメーションが飛んでいるときは持ち主に任せる。
+    #[test]
+    fn animation_is_left_to_its_owner() {
+        let s = IdleSignals { animating: true, ..idle() };
+        assert_eq!(idle_repaint_ms(s), None);
+        // 家事があってもアニメの刻みの方が細かいので任せる
+        let s = IdleSignals { animating: true, watching_files: true, ..idle() };
+        assert_eq!(idle_repaint_ms(s), None);
+    }
+
+    /// 応答待ちはアニメより優先。取りこぼすと選んだファイルが開かない。
+    #[test]
+    fn awaiting_wins_over_animation() {
+        let s = IdleSignals { awaiting: true, animating: true, ..idle() };
+        assert_eq!(idle_repaint_ms(s), Some(IDLE_AWAITING_MS));
+    }
+
+    /// エージェントが走っている間は、出力が無くても状態機械を進める。
+    #[test]
+    fn running_agents_keep_ticking() {
+        let s = IdleSignals { agents_running: true, ..idle() };
+        assert_eq!(idle_repaint_ms(s), Some(IDLE_AGENT_MS));
+        // 背面ではもっと緩める (通知は別スレッドから届く)
+        let s = IdleSignals { focused: false, ..s };
+        assert_eq!(idle_repaint_ms(s), Some(IDLE_AGENT_BACKGROUND_MS));
+        // フォーカス情報が取れない環境でも、直前に入力があれば前景扱い
+        let s = IdleSignals { had_input: true, ..s };
+        assert_eq!(idle_repaint_ms(s), Some(IDLE_AGENT_MS));
+    }
+
+    /// 家事 (外部変更の取り込み) があるときだけ、低頻度で回す。
+    #[test]
+    fn housekeeping_backs_off_with_visibility() {
+        let s = IdleSignals { watching_files: true, ..idle() };
+        assert_eq!(idle_repaint_ms(s), Some(IDLE_HOUSEKEEP_MS));
+        let s = IdleSignals { focused: false, ..s };
+        assert_eq!(idle_repaint_ms(s), Some(IDLE_BACKGROUND_MS));
+        let s = IdleSignals { visible: false, ..s };
+        assert_eq!(idle_repaint_ms(s), Some(IDLE_HIDDEN_MS));
+        // タイマ (自動保存・interval プラグイン) だけでも同じ扱い
+        let s = IdleSignals { timers_due: true, ..idle() };
+        assert_eq!(idle_repaint_ms(s), Some(IDLE_HOUSEKEEP_MS));
+    }
+
+    /// 優先順位: 応答待ち > アニメ > エージェント > 家事。
+    #[test]
+    fn priority_order_is_stable() {
+        let all = IdleSignals {
+            had_input: true,
+            animating: true,
+            awaiting: true,
+            agents_running: true,
+            watching_files: true,
+            timers_due: true,
+            focused: true,
+            visible: true,
+        };
+        assert_eq!(idle_repaint_ms(all), Some(IDLE_AWAITING_MS));
+        assert_eq!(idle_repaint_ms(IdleSignals { awaiting: false, ..all }), None);
+        assert_eq!(
+            idle_repaint_ms(IdleSignals { awaiting: false, animating: false, ..all }),
+            Some(IDLE_AGENT_MS)
+        );
+        assert_eq!(
+            idle_repaint_ms(IdleSignals {
+                awaiting: false,
+                animating: false,
+                agents_running: false,
+                ..all
+            }),
+            Some(IDLE_HOUSEKEEP_MS)
+        );
+    }
+
+    /// 予約は必ず「粗い方が緩い」向きに並んでいる (逆転すると背面の方が重くなる)。
+    #[test]
+    fn intervals_are_monotonic() {
+        assert!(IDLE_AWAITING_MS < IDLE_AGENT_MS);
+        assert!(IDLE_AGENT_MS < IDLE_AGENT_BACKGROUND_MS);
+        assert!(IDLE_AGENT_BACKGROUND_MS <= IDLE_HOUSEKEEP_MS);
+        assert!(IDLE_HOUSEKEEP_MS < IDLE_BACKGROUND_MS);
+        assert!(IDLE_BACKGROUND_MS < IDLE_HIDDEN_MS);
+    }
 }
 
 #[cfg(test)]

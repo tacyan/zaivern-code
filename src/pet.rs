@@ -219,8 +219,13 @@ pub fn draw(
     }
 
     // ── 状態ごとのアニメパラメータ ──
+    //
+    // 熟睡 (Sleeping) だけは時刻に依存しない**静止画**にする。
+    // ±0.6px の上下は目で追えないのに、そのために 5fps でフレームを回し続けて
+    // いた (アイドル時の CPU の主因)。止めれば「何も起きていないときは 1 枚も
+    // 描かない」が成立し、ポインタが動いた瞬間に起床ホップで動き出す。
     let (bob, wave, leg_t): (f64, f64, f64) = match state {
-        PetState::Sleeping => ((t * 1.2).sin() * 0.6, 0.0, 0.0),
+        PetState::Sleeping => (0.0, 0.0, 0.0),
         PetState::Dozing => ((t * 1.6).sin() * 1.2, (t * 1.0).sin() * 0.6, 0.0),
         PetState::Idle => {
             // ときどき耳をぴょこぴょこ動かす
@@ -365,9 +370,11 @@ pub fn draw(
         "ザイガニ 🐾 — クリック: Cockpit/承認待ちへ / ダブルクリック: ご機嫌 / ドラッグ: 移動\n(🐾 メニューで表示・見た目・画像変更)",
     );
 
-    // 熟睡中は再描画間隔を緩めて省電力
-    let repaint_ms = if state == PetState::Sleeping { 200 } else { 60 };
-    ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
+    // 再描画は「本当に絵が変わるとき」だけ要求する。
+    let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+    if let Some(ms) = repaint_ms(state, focused) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+    }
 
     PetResponse {
         clicked,
@@ -375,6 +382,22 @@ pub fn draw(
         drag_released,
         double_clicked,
         bubble_anchor: Some(anchor),
+    }
+}
+
+/// 状態ごとの再描画間隔 (ms)。`None` は「絵が変わらないので予約しない」。
+///
+/// 熟睡中の絵は時刻に依存しない静止画なので、1 枚も描き直さない。
+/// ポインタが動けば egui が入力でフレームを起こし、そのフレームで起床ホップに
+/// 移るため、寝たまま反応しなくなることはない。
+/// 背面 (フォーカスなし) では、動いていても刻みを粗くする — 進捗は伝わるが
+/// 見ていない画面を 16fps で描く理由は無い。
+fn repaint_ms(state: PetState, focused: bool) -> Option<u64> {
+    match state {
+        PetState::Sleeping => None,
+        // うとうとはゆっくりした上下だけ。10fps で十分になめらか
+        PetState::Dozing => Some(if focused { 100 } else { 200 }),
+        _ => Some(if focused { 60 } else { 150 }),
     }
 }
 
@@ -480,9 +503,12 @@ fn draw_blocky(painter: &egui::Painter, rect: Rect, t: f64, state: PetState, p: 
     let leg_h = 9.0 * s;
     let ground_h = 5.0 * s;
 
-    // 熟睡中はゆっくり呼吸(ボディ高さがふくらむ/しぼむ)
+    // 熟睡中はほんの少しふくらんだ姿で固定する。
+    // ここを時刻依存にすると「熟睡中は再描画しない」(下の repaint 判定) と
+    // 噛み合わず、別の理由でフレームが来た瞬間だけ呼吸が飛ぶ。
+    // 静止させれば、いつ描いても同じ絵になる。
     if state == PetState::Sleeping {
-        body_h *= 1.0 + ((t * 1.3).sin() as f32) * 0.05;
+        body_h *= 1.03;
     }
 
     let ground_top = rect.max.y - ground_h;
@@ -819,5 +845,54 @@ mod tests {
         }
         // 既定文字列 "blocky" 自身も Blocky
         assert!(PetVariant::from_name("blocky") == PetVariant::Blocky);
+    }
+
+    // ── 再描画ポリシー ────────────────────────────────────────────
+
+    /// 回帰テスト: 熟睡中は 1 枚も描き直さない。
+    /// ここが Some に戻るとアイドル時に常時フレームが回る。
+    #[test]
+    fn sleeping_never_asks_for_a_frame() {
+        assert_eq!(repaint_ms(PetState::Sleeping, true), None);
+        assert_eq!(repaint_ms(PetState::Sleeping, false), None);
+    }
+
+    /// 動いている状態は必ず予約する (止まって見えたらバグ)。
+    #[test]
+    fn moving_states_keep_animating() {
+        for st in [
+            PetState::Idle,
+            PetState::Dozing,
+            PetState::Roam,
+            PetState::Working(1),
+            PetState::Groove,
+            PetState::Happy,
+            PetState::Annoyed,
+            PetState::Attention,
+            PetState::Error,
+        ] {
+            assert!(
+                repaint_ms(st, true).is_some(),
+                "{st:?} は前景で動き続けるはず"
+            );
+        }
+    }
+
+    /// 背面では刻みを粗くする。ただし止めはしない (進捗が伝わらなくなる)。
+    #[test]
+    fn unfocused_backs_off_but_keeps_moving() {
+        for st in [PetState::Working(2), PetState::Attention, PetState::Dozing] {
+            let fg = repaint_ms(st, true).expect("前景では予約する");
+            let bg = repaint_ms(st, false).expect("背面でも止めない");
+            assert!(bg > fg, "{st:?}: 背面 {bg}ms は前景 {fg}ms より粗いはず");
+        }
+    }
+
+    /// うとうと (Dozing) は通常アニメより粗くてよい (ゆっくりした上下だけ)。
+    #[test]
+    fn dozing_is_cheaper_than_full_animation() {
+        let doze = repaint_ms(PetState::Dozing, true).expect("Dozing は動く");
+        let idle = repaint_ms(PetState::Idle, true).expect("Idle は動く");
+        assert!(doze > idle, "Dozing {doze}ms は Idle {idle}ms より粗いはず");
     }
 }
