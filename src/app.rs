@@ -41,6 +41,7 @@ use crate::race;
 use crate::recent;
 use crate::remote;
 use crate::session;
+use crate::session_picker;
 use crate::shellenv;
 use crate::snippets::{self, Snippet};
 use crate::sound::{self, SoundKind};
@@ -56,6 +57,8 @@ enum SidebarTab {
     /// ファイル横断検索 (VS Code: ⇧⌘F)
     Search,
     Agents,
+    /// フォルダごとの過去の会話 (session_picker / panels::sessions_sidebar_ui)
+    Sessions,
     Plugins,
     Git,
     GitHub,
@@ -68,6 +71,7 @@ impl SidebarTab {
             SidebarTab::Files => "files",
             SidebarTab::Search => "search",
             SidebarTab::Agents => "agents",
+            SidebarTab::Sessions => "sessions",
             SidebarTab::Plugins => "plugins",
             SidebarTab::Git => "git",
             SidebarTab::GitHub => "github",
@@ -75,10 +79,12 @@ impl SidebarTab {
     }
 
     /// セッションのキー文字列から復元する。未知/空なら既定の Files。
+    /// 新しいタブを足しても**古い保存値はそのまま読める** (未知だけが Files へ落ちる)。
     fn from_key(s: &str) -> Self {
         match s {
             "search" => SidebarTab::Search,
             "agents" => SidebarTab::Agents,
+            "sessions" => SidebarTab::Sessions,
             "plugins" => SidebarTab::Plugins,
             "git" => SidebarTab::Git,
             "github" => SidebarTab::GitHub,
@@ -221,17 +227,106 @@ struct FindState {
     replace: String,
 }
 
+/// 置換フローの段階。**ドライラン → 確認 → 実行**の 3 段でしか進まない。
+///
+/// 「置換」を押しただけでは 1 バイトも書かない (`dry_run: true` で数えるだけ)。
+/// 数えた結果を出してユーザーが「実行」を押したときだけ本番の書き込みへ進む。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum ReplacePhase {
+    /// 何も進行していない。
+    #[default]
+    Idle,
+    /// ドライラン中 / 本番実行中 (バックグラウンドスレッドの待ち)。
+    Running,
+    /// ドライランが終わり、ユーザーの確認待ち。
+    Confirm { files: usize, hits: usize },
+    /// 本番の置換が終わった。
+    Done { files: usize, hits: usize },
+}
+
+/// 置換フローを進める出来事。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReplaceEvent {
+    /// 「置換」ボタン — ドライランを投げる。
+    Start,
+    /// ドライランの結果が届いた。
+    DryRunDone { files: usize, hits: usize },
+    /// 「実行」ボタン — 本番の置換を投げる。
+    Confirm,
+    /// 本番の置換の結果が届いた。
+    ExecuteDone { files: usize, hits: usize },
+    /// 「やめる」ボタン / 検索条件の変更。
+    Cancel,
+    /// 置換が失敗した (正規表現エラーなど)。
+    Failed,
+}
+
+impl ReplacePhase {
+    /// 状態遷移 (純関数)。想定外の順序の出来事は**現状維持**にして、
+    /// 取りこぼしたメッセージで勝手に書き込みへ進まないようにする。
+    fn next(&self, ev: &ReplaceEvent) -> ReplacePhase {
+        match (self, ev) {
+            // 確認待ち中に新しくドライランを投げ直すのも許す (条件を直した場合)
+            (ReplacePhase::Idle, ReplaceEvent::Start)
+            | (ReplacePhase::Confirm { .. }, ReplaceEvent::Start)
+            | (ReplacePhase::Done { .. }, ReplaceEvent::Start) => ReplacePhase::Running,
+            // 0 件なら確認を出さずに畳む (押しても何も起きない確認ボタンを出さない)
+            (ReplacePhase::Running, ReplaceEvent::DryRunDone { hits: 0, .. }) => {
+                ReplacePhase::Done { files: 0, hits: 0 }
+            }
+            (ReplacePhase::Running, ReplaceEvent::DryRunDone { files, hits }) => {
+                ReplacePhase::Confirm { files: *files, hits: *hits }
+            }
+            (ReplacePhase::Confirm { .. }, ReplaceEvent::Confirm) => ReplacePhase::Running,
+            (ReplacePhase::Running, ReplaceEvent::ExecuteDone { files, hits }) => {
+                ReplacePhase::Done { files: *files, hits: *hits }
+            }
+            (_, ReplaceEvent::Cancel) | (_, ReplaceEvent::Failed) => ReplacePhase::Idle,
+            // 未確認のまま実行要求が来ても書き込みへは進めない
+            _ => self.clone(),
+        }
+    }
+
+    /// いま画面を止めて待っているか。
+    fn busy(&self) -> bool {
+        matches!(self, ReplacePhase::Running)
+    }
+}
+
+/// 置換ワーカーからの戻り。
+type ReplaceMsg = Result<file_search::ReplaceReport, String>;
+
 /// ファイル横断検索 (サイドバーの検索タブ) の状態。
 struct GlobalSearchState {
     query: String,
     focus: bool,
     running: bool,
     results: Vec<file_search::Hit>,
+    /// 表示用スニペット (`Hit.text`) の中のマッチ範囲 (バイト)。
+    /// `Hit.col` / `Hit.len` は**元の行**基準なので、検索が終わった時点で
+    /// 1 度だけスニペットへ当て直して覚える (毎フレームの再計算をしない)。
+    marks: Vec<Vec<(usize, usize)>>,
     /// 走査したファイル数 (結果の説明用)
     scanned: usize,
     rx: Option<mpsc::Receiver<(Vec<file_search::Hit>, usize)>>,
     /// 一度でも検索したか (0 件表示と初期状態の区別)
     searched: bool,
+    // ── 検索オプション (egui memory へ永続化) ──
+    case_sensitive: bool,
+    whole_word: bool,
+    regex: bool,
+    /// 対象を絞る glob (カンマ / 空白区切り。例 `*.rs, src/**`)
+    include_globs: String,
+    /// 除外する glob (include より強い)
+    exclude_globs: String,
+    // ── 置換 ──
+    /// 置換行を出すか (VS Code の ▸ と同じ)
+    replace_open: bool,
+    replace: String,
+    phase: ReplacePhase,
+    replace_rx: Option<mpsc::Receiver<ReplaceMsg>>,
+    /// パターンのコンパイルエラー。赤字でその場に出す (黙って literal に落とさない)。
+    error: Option<String>,
 }
 
 impl GlobalSearchState {
@@ -241,11 +336,194 @@ impl GlobalSearchState {
             focus: false,
             running: false,
             results: Vec::new(),
+            marks: Vec::new(),
             scanned: 0,
             rx: None,
             searched: false,
+            case_sensitive: false,
+            whole_word: false,
+            regex: false,
+            include_globs: String::new(),
+            exclude_globs: String::new(),
+            replace_open: false,
+            replace: String::new(),
+            phase: ReplacePhase::Idle,
+            replace_rx: None,
+            error: None,
         }
     }
+
+    /// 画面の状態を検索エンジンの [`file_search::SearchOptions`] へ写す。
+    ///
+    /// glob 欄はカンマ・空白・改行のどれで区切っても同じに読む
+    /// (「`*.rs, *.toml`」と打っても「`*.rs *.toml`」と打っても同じ)。
+    fn options(&self, root: Option<PathBuf>) -> file_search::SearchOptions {
+        file_search::SearchOptions {
+            query: self.query.trim().to_string(),
+            case_sensitive: self.case_sensitive,
+            whole_word: self.whole_word,
+            regex: self.regex,
+            include_globs: split_globs(&self.include_globs),
+            exclude_globs: split_globs(&self.exclude_globs),
+            root,
+            ..file_search::SearchOptions::default()
+        }
+    }
+}
+
+// ─────────────────── プラン使用量の表示ルール ───────────────────
+//
+// 表示は次の 3 つを**必ず**守る (推測を数字で出さないため):
+//
+// 1. `used_fraction` が `None` の行に数字を出さない (「不明」と描く)
+// 2. `confidence` が Measured 以外なら「推定」と明示する
+// 3. `Projection::InsufficientData` は「データ不足」— 決して「0 分」と描かない
+
+/// 使用率 1 行の表示文字列。
+fn quota_usage_label(u: &crate::coordinator::quota::AccountUsage) -> String {
+    let Some(f) = u.used_fraction else {
+        // 数字が無いのだから数字は出さない (0% と書くと「まだ使っていない」に見える)
+        return tr("不明");
+    };
+    let pct = (f.clamp(0.0, 1.0) * 100.0).round() as u32;
+    if u.confidence == crate::coordinator::quota::Confidence::Measured {
+        trf("{pct}%", &[("pct", pct.to_string())])
+    } else {
+        trf("{pct}% (推定)", &[("pct", pct.to_string())])
+    }
+}
+
+/// 枯渇予測 1 行の表示文字列。
+fn quota_projection_label(p: crate::coordinator::quota::Projection) -> String {
+    use crate::coordinator::quota::Projection;
+    match p {
+        // 材料不足を「あと 0 分」と描かない
+        Projection::InsufficientData => tr("データ不足"),
+        Projection::NotBurning => tr("消費なし"),
+        Projection::Exhaustion(d) => trf(
+            "約 {mins} 分で枯渇 (推定)",
+            &[("mins", (d.as_secs().div_ceil(60)).to_string())],
+        ),
+        Projection::ResetFirst(d) => trf(
+            "約 {mins} 分でリセット",
+            &[("mins", (d.as_secs().div_ceil(60)).to_string())],
+        ),
+    }
+}
+
+/// 深刻さ (0/1/2) → ステータスバーの絵文字。
+fn quota_severity_icon(severity: u8) -> &'static str {
+    match severity {
+        0 => "○",
+        1 => "◇",
+        _ => "●",
+    }
+}
+
+/// セッションサイドバーの押しごたえを「実際に何をするか」へ落としたもの。
+///
+/// 起動やファイラ起動といった副作用の**手前**で切って純関数にしてあるので、
+/// テストからプロセスを起こさずに対応表を固定できる。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionSidebarEffect {
+    /// 何もしない (対応するプリセットが無い等)。理由はトーストに出す。
+    Nothing(Option<String>),
+    /// このコマンドをこの作業ディレクトリで起動する。
+    Launch {
+        /// 元になったプリセットの index (アイコン・env を引くのに使う)
+        preset: usize,
+        command: String,
+        cwd: PathBuf,
+    },
+    /// OS のファイラで開く。
+    Reveal(PathBuf),
+    /// ワークスペースのルートから外す。
+    RemoveRoot(PathBuf),
+}
+
+/// `bin` (実行ファイル名) に対応するプリセットを探す。
+///
+/// 完全一致 (`spec_for_command` が末尾要素で照合するので絶対パス指定でも当たる) を
+/// 先に見て、無ければ諦める。名前の前方一致のような曖昧な照合はしない —
+/// 別の CLI を再開コマンドで起動してしまうため。
+fn preset_for_bin(presets: &[config::AgentPreset], bin: &str) -> Option<usize> {
+    presets.iter().position(|p| {
+        crate::agents::spec_for_command(&p.command).is_some_and(|s| s.bin == bin)
+    })
+}
+
+/// 「新しい会話」に使うプリセット。カタログ既知の CLI を優先し、
+/// 無ければ先頭 (素のシェルしか登録していない構成でも動くようにする)。
+fn preset_for_new_conversation(presets: &[config::AgentPreset]) -> Option<usize> {
+    presets
+        .iter()
+        .position(|p| crate::agents::spec_for_command(&p.command).is_some())
+        .or(if presets.is_empty() { None } else { Some(0) })
+}
+
+/// [`session_picker::SidebarAction`] → [`SessionSidebarEffect`] (純関数)。
+fn session_sidebar_effect(
+    action: &session_picker::SidebarAction,
+    presets: &[config::AgentPreset],
+) -> SessionSidebarEffect {
+    use session_picker::SidebarAction as A;
+    match action {
+        A::None => SessionSidebarEffect::Nothing(None),
+        A::Resume(s) => match preset_for_bin(presets, &s.agent_bin) {
+            Some(i) => SessionSidebarEffect::Launch {
+                preset: i,
+                command: session_picker::resume_command(&presets[i].command, s),
+                // 会話が走っていたフォルダで再開する (別の場所で再開すると
+                // 相対パスの指示が全部ずれる)
+                cwd: s.cwd.clone(),
+            },
+            None => SessionSidebarEffect::Nothing(Some(trf(
+                "{bin} のプリセットが見つかりません (設定で追加してください)",
+                &[("bin", s.agent_bin.clone())],
+            ))),
+        },
+        A::NewConversation(dir) => match preset_for_new_conversation(presets) {
+            Some(i) => SessionSidebarEffect::Launch {
+                preset: i,
+                command: presets[i].command.clone(),
+                cwd: dir.clone(),
+            },
+            None => SessionSidebarEffect::Nothing(Some(tr("エージェントのプリセットがありません"))),
+        },
+        A::RevealFolder(dir) => SessionSidebarEffect::Reveal(dir.clone()),
+        A::CloseFolder(dir) => SessionSidebarEffect::RemoveRoot(dir.clone()),
+    }
+}
+
+/// 保存前クリーンアップの本体 (純関数)。
+///
+/// 返り値が `None` なら本文が 1 バイトも変わっていない = 書き込みも undo 積みも
+/// カーソル付け替えも省ける。`Some((本文, 選択範囲))` の選択範囲は
+/// [`editor_ops::adjust_char_index_after_cleanup`] で付け替え済み
+/// (行末が削れたぶんずれたカーソルが別の行へ飛ばないようにするため)。
+fn save_cleanup_edit(
+    text: &str,
+    sel: (usize, usize),
+    opts: &editor_ops::SaveCleanup,
+) -> Option<(String, (usize, usize))> {
+    let (cleaned, changed) = editor_ops::apply_save_cleanup_checked(text, opts);
+    if !changed {
+        return None;
+    }
+    let s = editor_ops::adjust_char_index_after_cleanup(text, &cleaned, sel.0);
+    let e = editor_ops::adjust_char_index_after_cleanup(text, &cleaned, sel.1);
+    Some((cleaned, (s, e)))
+}
+
+/// glob 欄 1 本を個々のパターンへ割る。区切りはカンマ・空白・改行のどれでもよい。
+/// 空の断片は落とすので、末尾のカンマや二重空白があっても空パターンにならない
+/// (空パターンは「何にも一致しない」ので、混ざると結果が黙って 0 件になる)。
+fn split_globs(s: &str) -> Vec<String> {
+    s.split([',', ' ', '\t', '\n', '\r'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// プラグインタブで押されたボタン類。クロージャの中では記録だけして、
@@ -296,6 +574,8 @@ enum EditOp {
     ToggleComment,
     Duplicate,
     Move(bool),
+    /// 本文の改行コードを揃える (ステータスバー / パレット / 編集メニュー)。
+    NormalizeEol(crate::textenc::LineEnding),
 }
 
 /// LSP サーバーのキー: (言語ID, ルート)。ルート毎に 1 プロセス起動する
@@ -786,6 +1066,14 @@ pub struct ZaivernApp {
     checker_tex: Option<((egui::Color32, egui::Color32), egui::TextureHandle)>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
+    /// 「セッション」タブ (フォルダごとの過去の会話) の表示状態 + 走査キャッシュ。
+    /// 走査はこの中でバックグラウンドスレッドへ逃がされる。
+    sidebar_sessions: session_picker::SidebarState,
+    /// セッションタブに出すフォルダ一覧。`sidebar_folders` は `is_dir()` を叩くので
+    /// 毎フレームは作り直さず、元になる「ルート + MRU」が変わったときだけ作り直す。
+    sess_folders: Vec<PathBuf>,
+    /// `sess_folders` を作った元 (ルート + MRU)。変化検知用。
+    sess_folders_src: Vec<PathBuf>,
     file_index: Vec<IndexedFile>,
     index_at: Option<Instant>,
     /// カスタムテーマ (~/.zaivern/themes + プラグイン同梱): (表示名, JSONフルパス)
@@ -869,6 +1157,24 @@ pub struct ZaivernApp {
     qr_tex: Option<egui::TextureHandle>,
     broadcast_input: String,
     agent_input_buf: crate::agent_input::AgentInputBuffer,
+    /// 次フレームで一斉送信欄へフォーカスを戻す (差分ビューのレビューコメント
+    /// 流し込みが立てる)。egui のフォーカス要求は描画中にしか出せないため。
+    broadcast_focus: bool,
+    /// プラン使用量の監視 (集約・枯渇予測)。読み取りはこの中で TTL 付きの
+    /// バックグラウンドスレッドへ逃がされるので、毎フレーム触ってよい。
+    quota: coordinator::QuotaWatch,
+    /// 使用量の詳細ウィンドウ (ステータスバーの表示をクリック / パレット)
+    quota_open: bool,
+    /// 保存時に行末の空白を落とす (egui memory へ永続化。将来は config.toml へ)
+    save_trim_trailing: bool,
+    /// 保存時に最終行へ改行を入れる (同上)
+    save_final_newline: bool,
+    /// egui memory から永続設定を読み終えたか (最初のフレームで 1 度だけ)
+    prefs_loaded: bool,
+    /// ステータスバー用の改行コード判定キャッシュ
+    /// (バッファ id, 本文バイト長, 判定時刻, 判定結果)。
+    /// 判定は本文全走査なので、同じ長さのまま短時間に何度も数え直さない。
+    le_cache: Option<(u64, usize, Instant, crate::textenc::LineEnding)>,
     gitinfo: git::GitSet,
     /// Git サイドバー。単一 repo 表示なので常に primary ルートを見る。
     git_panel: git_panel::GitPanel,
@@ -1220,6 +1526,9 @@ impl ZaivernApp {
             checker_tex: None,
             sidebar_open: true,
             sidebar_tab: SidebarTab::Files,
+            sidebar_sessions: session_picker::SidebarState::default(),
+            sess_folders: Vec::new(),
+            sess_folders_src: Vec::new(),
             file_index: Vec::new(),
             index_at: None,
             custom_themes: Vec::new(),
@@ -1271,6 +1580,13 @@ impl ZaivernApp {
             qr_tex: None,
             broadcast_input: String::new(),
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
+            broadcast_focus: false,
+            quota: coordinator::QuotaWatch::new(),
+            quota_open: false,
+            save_trim_trailing: false,
+            save_final_newline: false,
+            prefs_loaded: false,
+            le_cache: None,
             pet_pos: match (cfg.pet_x, cfg.pet_y) {
                 (Some(x), Some(y)) => Some(egui::pos2(x, y)),
                 _ => None,
@@ -2809,6 +3125,13 @@ impl ZaivernApp {
                 let (t, c) = editor_ops::move_line(&buf.text, end, up);
                 (t, (c, c))
             }
+            EditOp::NormalizeEol(target) => {
+                let t = crate::textenc::normalize_to(&buf.text, target);
+                // CRLF ⇄ LF で本文の長さが変わるので、選択範囲は必ず付け替える
+                let s = editor_ops::adjust_char_index_after_cleanup(&buf.text, &t, start);
+                let e = editor_ops::adjust_char_index_after_cleanup(&buf.text, &t, end);
+                (t, (s, e))
+            }
         };
         if new_text != buf.text {
             buf.text = new_text;
@@ -3012,14 +3335,246 @@ impl ZaivernApp {
         }
     }
 
+    // ── 永続する UI 設定 (egui memory) ──
+    //
+    // config.toml ではなく egui の永続メモリに置いてある。config.rs は別担当が
+    // 触っている最中なので、そちらが空いたら config.toml へ移すこと
+    // (移すときはこの 4 つ: 検索の Aa / Ab| / .*、保存時の 2 つ)。
+
+    fn search_prefs_id() -> egui::Id {
+        egui::Id::new("zv-search-prefs")
+    }
+
+    fn editor_prefs_id() -> egui::Id {
+        egui::Id::new("zv-editor-prefs")
+    }
+
+    /// 起動後の最初のフレームで永続設定を読む (ctx はここでしか手に入らない)。
+    fn load_prefs_once(&mut self, ctx: &egui::Context) {
+        if self.prefs_loaded {
+            return;
+        }
+        self.prefs_loaded = true;
+        // (大文字小文字, 単語単位, 正規表現)
+        let (c, w, r) = ctx.data_mut(|d| {
+            *d.get_persisted_mut_or(Self::search_prefs_id(), (false, false, false))
+        });
+        self.gsearch.case_sensitive = c;
+        self.gsearch.whole_word = w;
+        self.gsearch.regex = r;
+        // (末尾空白を除去, 最終行に改行)
+        let (t, n) =
+            ctx.data_mut(|d| *d.get_persisted_mut_or(Self::editor_prefs_id(), (false, false)));
+        self.save_trim_trailing = t;
+        self.save_final_newline = n;
+    }
+
+    fn save_search_prefs(&self, ctx: &egui::Context) {
+        let v = (
+            self.gsearch.case_sensitive,
+            self.gsearch.whole_word,
+            self.gsearch.regex,
+        );
+        ctx.data_mut(|d| d.insert_persisted(Self::search_prefs_id(), v));
+    }
+
+    fn save_editor_prefs(&self, ctx: &egui::Context) {
+        let v = (self.save_trim_trailing, self.save_final_newline);
+        ctx.data_mut(|d| d.insert_persisted(Self::editor_prefs_id(), v));
+    }
+
+    /// プラン使用量を 1 フレームぶん進める。
+    ///
+    /// 走行本数を渡してから [`coordinator::QuotaWatch::refresh_if_stale`] を呼ぶ。
+    /// 読み取りは TTL 付きでバックグラウンドスレッドへ逃げるので、
+    /// UI スレッドはこのフレームでファイルにもネットワークにも触らない。
+    fn quota_tick(&mut self) {
+        // bin 名 → いま走っている本数。素のシェルは枠を食わないので数えない
+        let mut by_bin: Vec<(String, usize)> = Vec::new();
+        for s in self.agents.sessions.iter().filter(|s| s.running()) {
+            let Some(spec) = crate::agents::spec_for_command(&s.command) else {
+                continue;
+            };
+            match by_bin.iter_mut().find(|(b, _)| b == spec.bin) {
+                Some((_, n)) => *n += 1,
+                None => by_bin.push((spec.bin.to_string(), 1)),
+            }
+        }
+        self.quota.set_running(by_bin);
+        self.quota.refresh_if_stale();
+    }
+
+    /// 使用量の詳細ウィンドウ (ステータスバーのクリック / パレットから開く)。
+    fn quota_window_ui(&mut self, ctx: &egui::Context) {
+        if !self.quota_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let now = std::time::SystemTime::now();
+        let accounts = self.quota.accounts(now);
+        let advice = self.quota.advice(now);
+        let mut open = self.quota_open;
+        egui::Window::new(tr("📊 プラン使用量"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                if accounts.is_empty() {
+                    ui.label(
+                        RichText::new(tr(
+                            "使用量を報告する CLI が見つかりません (対応 CLI を起動すると出ます)",
+                        ))
+                        .color(theme.text_dim),
+                    );
+                    return;
+                }
+                for u in &accounts {
+                    let sev = advice
+                        .iter()
+                        .find(|(a, _)| *a == u.account)
+                        .map(|(_, a)| a.severity())
+                        .unwrap_or(0);
+                    ui.horizontal(|ui| {
+                        ui.label(quota_severity_icon(sev));
+                        ui.label(RichText::new(u.account.clone()).strong());
+                        ui.label(
+                            RichText::new(quota_usage_label(u))
+                                .color(if sev >= 2 { theme.err } else { theme.text }),
+                        );
+                    });
+                    ui.label(
+                        RichText::new(trf(
+                            "　{agents} / {n} 本並列 / {proj}",
+                            &[
+                                ("agents", u.agents.join(", ")),
+                                ("n", u.running_agents.to_string()),
+                                ("proj", quota_projection_label(u.projection)),
+                            ],
+                        ))
+                        .size(11.5)
+                        .color(theme.text_dim),
+                    );
+                    if let Some((_, a)) = advice.iter().find(|(a, _)| *a == u.account) {
+                        let msg = a.message();
+                        if !msg.is_empty() {
+                            ui.label(
+                                RichText::new(format!("　⚠ {msg}"))
+                                    .size(11.5)
+                                    .color(if a.severity() >= 2 { theme.err } else { theme.warn }),
+                            );
+                        }
+                    }
+                    ui.separator();
+                }
+            });
+        self.quota_open = open;
+    }
+
+    /// セッションタブのフォルダ一覧を必要なときだけ作り直す。
+    ///
+    /// [`session_picker::sidebar_folders`] は `is_dir()` を叩く = ファイルシステムに
+    /// 触るので、毎フレームは呼ばない。元になる「開いているルート + MRU」が
+    /// 変わったときだけ作り直す (走査そのものは SidebarState 側がスレッドへ逃がす)。
+    fn refresh_session_folders(&mut self) {
+        // 変化の判定には **fs を叩かない** 生の値だけを使う。
+        // `MenuState::folders()` は is_dir() を叩くので、ここでは呼ばない
+        // (呼ぶのは「変わった」と分かった後の 1 回だけ)。
+        let mut src: Vec<PathBuf> = self.roots.clone();
+        src.extend(self.menu_state.recent_folders.iter().map(PathBuf::from));
+        if src == self.sess_folders_src {
+            return;
+        }
+        let mru: Vec<PathBuf> = self
+            .menu_state
+            .recent_folders
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        self.sess_folders = session_picker::sidebar_folders(&self.roots, &mru);
+        self.sess_folders_src = src;
+        // 対象フォルダが変わった = 走査結果のキャッシュはもう当たらない
+        self.sidebar_sessions.invalidate();
+    }
+
+    /// 差分ビュー (PR 差分・レース差分) の「エージェントに送る」で組み立てられた
+    /// レビュープロンプトを入力欄へ流し込む。
+    ///
+    /// **送信はしない** — 入れるだけで、送るかどうかはユーザーが決める
+    /// (プロジェクト方針: 入力欄への自動書き込みで Enter は撃たない)。
+    fn take_review_prompt(&mut self, prompt: String) {
+        if !self.agent_input_buf.append_prompt(&prompt) {
+            return;
+        }
+        self.broadcast_input = self.agent_input_buf.text().to_string();
+        // 入力欄が見えていないと「押したのに何も起きない」ので開く
+        self.cockpit = true;
+        self.kanban = false;
+        self.agents.panel_open = true;
+        self.broadcast_focus = true;
+        self.toast(
+            tr("レビューコメントを入力欄へ入れました (内容を確かめてから送信してください)"),
+            true,
+        );
+    }
+
+    /// セッションサイドバー (「💬 セッション」タブ) で押されたものを実行する。
+    ///
+    /// 判断そのものは純関数 [`session_sidebar_effect`] 側にあり、ここは
+    /// 「決まったこと」を通常の起動経路へ流すだけ。
+    fn apply_session_sidebar(
+        &mut self,
+        action: session_picker::SidebarAction,
+        ctx: &egui::Context,
+    ) {
+        match session_sidebar_effect(&action, &self.cfg.agents) {
+            SessionSidebarEffect::Nothing(msg) => {
+                if let Some(m) = msg {
+                    self.toast(m, false);
+                }
+            }
+            SessionSidebarEffect::Launch { preset, command, cwd } => {
+                self.launch_preset_with(preset, command, &cwd, ctx);
+            }
+            SessionSidebarEffect::Reveal(dir) => {
+                open_external(&dir.display().to_string());
+            }
+            SessionSidebarEffect::RemoveRoot(dir) => {
+                // 「フォルダをワークスペースから削除」と同じ口を通す
+                // (最後の 1 つは削除できない、という判断もそちらに揃う)
+                self.apply_cmd(Cmd::RemoveFolder(dir), ctx);
+            }
+        }
+    }
+
     fn launch_preset(&mut self, i: usize, ctx: &egui::Context) {
+        let cmd = self.cfg.agents.get(i).map(|p| p.command.clone());
+        let Some(cmd) = cmd else { return };
+        let cwd = self.agent_cwd();
+        self.launch_preset_with(i, cmd, &cwd, ctx);
+    }
+
+    /// プリセット `i` を「コマンドと作業ディレクトリだけ差し替えて」起動する。
+    ///
+    /// 過去セッションの再開 (`--resume <id>` 付き) と、フォルダを指定した新規会話が
+    /// これを通る。承認モードの判定・トーストは通常の起動とまったく同じ
+    /// (再開だけ全自動判定が違う、といったズレを作らないため)。
+    fn launch_preset_with(
+        &mut self,
+        i: usize,
+        command: String,
+        cwd: &Path,
+        ctx: &egui::Context,
+    ) {
         use crate::agents::{
             apply_approval, command_is_bypass, env_enables_auto, merged_env, spec_for_command,
             Approval,
         };
-        let Some(p) = self.cfg.agents.get(i).cloned() else {
+        let Some(mut p) = self.cfg.agents.get(i).cloned() else {
             return;
         };
+        // 再開・フォルダ指定はコマンドと cwd だけ差し替える (名前・アイコン・env は据え置き)
+        p.command = command;
+        p.cwd = Some(cwd.display().to_string());
         let approval = Approval::from_mode(&self.cfg.approval_mode);
         // 実際に起動されるコマンドで bypass かどうかを判定する
         // (Agent優先モードではプリセットのフラグがそのまま効く)
@@ -3040,9 +3595,7 @@ impl ZaivernApp {
         } else {
             tr("（既定モード）")
         };
-        // 起動先は「いま作業しているフォルダ」(直近に開いたフォルダ) にする
-        let cwd = self.agent_cwd();
-        match self.agents.launch(&p, &cwd, approval, ctx) {
+        match self.agents.launch(&p, cwd, approval, ctx) {
             Ok(()) => {
                 if is_agent_cli && is_bypass {
                     self.toast_warn(trf(
@@ -3140,8 +3693,46 @@ impl ZaivernApp {
         self.save_buffer_to(i, path)
     }
 
+    /// 保存直前のクリーンアップ (末尾空白の除去 / 最終行の改行) を本文へかける。
+    ///
+    /// 本文が 1 バイトも変わらないときは何もしない (`changed == false` なら
+    /// undo 積みもカーソル付け替えも丸ごと省ける)。改行コードには触らない —
+    /// 揃えるのは明示的な「改行コードを変換」だけで、保存が勝手に全行を
+    /// 書き換えて差分を爆発させることがないようにする。
+    fn apply_save_cleanup(&mut self, i: usize) {
+        let opts = editor_ops::SaveCleanup {
+            trim_trailing: self.save_trim_trailing,
+            final_newline: self.save_final_newline,
+            target_ending: None,
+        };
+        if opts.is_noop() {
+            return;
+        }
+        let before = self.editor.buffers[i].text.clone();
+        // 予約済みの選択があればそれを、無ければステータスバーと同じ (行, 桁) を使う
+        // (editor.cursor は 1-based で持っている)。
+        let sel = self.pending_select.unwrap_or_else(|| {
+            let (ln, col) = self.editor.cursor;
+            let c = editor_ops::char_index_at(
+                &before,
+                ln.saturating_sub(1),
+                col.saturating_sub(1),
+            );
+            (c, c)
+        });
+        let Some((cleaned, sel)) = save_cleanup_edit(&before, sel, &opts) else {
+            return;
+        };
+        self.pending_select = Some(sel);
+        let b = &mut self.editor.buffers[i];
+        b.text = cleaned;
+        b.cache = None;
+        b.gutter = None;
+    }
+
     /// バッファ `i` を `path` へ書き出して後始末する。成功したら true。
     fn save_buffer_to(&mut self, i: usize, path: PathBuf) -> bool {
+        self.apply_save_cleanup(i);
         let text = self.editor.buffers[i].text.clone();
         // 読み込んだときの文字コードで書き戻す (CP932 のファイルを勝手に UTF-8 に
         // しない)。元の符号化で表せない文字が入っていたときだけ UTF-8 へ格上げし、
@@ -3661,6 +4252,15 @@ impl ZaivernApp {
             | Cmd::MoveLineDown
             | Cmd::OpenReplace => self.apply_cmd_edit(cmd, ctx),
             Cmd::GlobalSearch
+            | Cmd::GlobalReplace
+            | Cmd::ToggleSearchCase
+            | Cmd::ToggleSearchWholeWord
+            | Cmd::ToggleSearchRegex
+            | Cmd::ShowSessions
+            | Cmd::ShowQuota
+            | Cmd::ToggleTrimTrailingOnSave
+            | Cmd::ToggleFinalNewlineOnSave
+            | Cmd::ConvertLineEnding(_)
             | Cmd::OpenCommandPalette
             | Cmd::OpenFilePalette
             | Cmd::ShowExplorer
@@ -3855,6 +4455,90 @@ impl ZaivernApp {
                 self.sidebar_open = true;
                 self.sidebar_tab = SidebarTab::Search;
                 self.gsearch.focus = true;
+            }
+            Cmd::GlobalReplace => {
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::Search;
+                self.gsearch.replace_open = true;
+                self.gsearch.focus = true;
+            }
+            Cmd::ToggleSearchCase
+            | Cmd::ToggleSearchWholeWord
+            | Cmd::ToggleSearchRegex => {
+                let (flag, on_label, off_label) = match cmd {
+                    Cmd::ToggleSearchCase => (
+                        &mut self.gsearch.case_sensitive,
+                        "検索: 大文字と小文字を区別します",
+                        "検索: 大文字と小文字を区別しません",
+                    ),
+                    Cmd::ToggleSearchWholeWord => (
+                        &mut self.gsearch.whole_word,
+                        "検索: 単語単位で探します",
+                        "検索: 単語単位をやめました",
+                    ),
+                    _ => (
+                        &mut self.gsearch.regex,
+                        "検索: 正規表現として探します",
+                        "検索: 正規表現をやめました",
+                    ),
+                };
+                *flag = !*flag;
+                let msg = if *flag { on_label } else { off_label };
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::Search;
+                // 条件が変わったので確認待ちの置換件数は捨てる
+                self.gsearch.phase = self.gsearch.phase.next(&ReplaceEvent::Cancel);
+                self.toast(tr(msg), true);
+                self.save_search_prefs(ctx);
+                if !self.gsearch.query.trim().is_empty() {
+                    self.start_global_search();
+                }
+            }
+            Cmd::ShowSessions => {
+                self.sidebar_open = true;
+                self.sidebar_tab = SidebarTab::Sessions;
+                // タブを開いた瞬間に最新へ (走査自体はバックグラウンド)
+                self.sidebar_sessions.invalidate();
+            }
+            Cmd::ShowQuota => {
+                self.quota.force_refresh();
+                self.quota_open = true;
+            }
+            Cmd::ToggleTrimTrailingOnSave => {
+                self.save_trim_trailing = !self.save_trim_trailing;
+                self.save_editor_prefs(ctx);
+                self.toast(
+                    tr(if self.save_trim_trailing {
+                        "保存時に行末の空白を落とします"
+                    } else {
+                        "保存時に行末の空白を落としません"
+                    }),
+                    true,
+                );
+            }
+            Cmd::ToggleFinalNewlineOnSave => {
+                self.save_final_newline = !self.save_final_newline;
+                self.save_editor_prefs(ctx);
+                self.toast(
+                    tr(if self.save_final_newline {
+                        "保存時に最終行へ改行を入れます"
+                    } else {
+                        "保存時に最終行へ改行を入れません"
+                    }),
+                    true,
+                );
+            }
+            Cmd::ConvertLineEnding(le) => {
+                if self.editor.active.is_none() {
+                    self.toast(tr("先にファイルを開いてください"), false);
+                } else {
+                    self.editor_op(ctx, EditOp::NormalizeEol(le));
+                    self.le_cache = None;
+                    self.toast(
+                        trf("改行コードを {le} に揃えました", &[("le", le.label())]),
+                        true,
+                    );
+                }
             }
             Cmd::OpenCommandPalette => self.palette.open_commands(),
             Cmd::OpenFilePalette => self.palette.open_files(),
@@ -4694,6 +5378,9 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::GlobalSearch)) {
             cmds.push(Cmd::GlobalSearch);
         }
+        if consume(ctx, self.keys.get(BindAction::GlobalReplace)) {
+            cmds.push(Cmd::GlobalReplace);
+        }
         if consume(ctx, self.keys.get(BindAction::OpenReplace)) {
             cmds.push(Cmd::OpenReplace);
         }
@@ -5419,6 +6106,11 @@ impl ZaivernApp {
         self.gitinfo.refresh_if_stale();
         let dirty = self.gitinfo.dirty_count();
         let mut toggle_cockpit = false;
+        let mut open_quota = false;
+        // クロージャ内で self を再度借りないよう、要るものは先に取り出す
+        let (quota_sev, quota_tip) = self.quota_status();
+        let fmt_label = self.text_format_label();
+        let mut convert_eol: Option<crate::textenc::LineEnding> = None;
 
         egui::TopBottomPanel::bottom("zv-status")
             .exact_height(26.0)
@@ -5469,18 +6161,28 @@ impl ZaivernApp {
                         if let Some(i) = self.editor.active {
                             ui.label(dim(format!("Ln {ln}, Col {col}")));
                             ui.label(dim(self.editor.buffers[i].lang.clone()));
-                            // UTF-8 以外のときだけ文字コードを出す。
-                            // 「なぜ日本語が読めているのか」「保存でどう書かれるのか」が
-                            // ここを見れば分かる (既定の UTF-8 では邪魔しない)。
-                            let enc = self.editor.buffers[i].encoding;
-                            if enc.is_legacy() {
-                                ui.label(
-                                    RichText::new(enc.label())
-                                        .size(11.5)
-                                        .color(theme.warn),
-                                )
+                            // 「UTF-8 / CRLF」— 何で読んだか & 何で保存されるか。
+                            // 押すと改行コードの変換メニューが出る (VS Code と同じ位置)。
+                            if let Some(label) = &fmt_label {
+                                let enc = self.editor.buffers[i].encoding;
+                                let color = if enc.is_legacy() { theme.warn } else { theme.text_dim };
+                                ui.menu_button(RichText::new(label.clone()).size(11.5).color(color), |ui| {
+                                    ui.set_min_width(200.0);
+                                    ui.label(RichText::new(tr("改行コードを変換")).strong());
+                                    for (le, name) in [
+                                        (crate::textenc::LineEnding::Lf, "LF (Unix)"),
+                                        (crate::textenc::LineEnding::Crlf, "CRLF (Windows)"),
+                                        (crate::textenc::LineEnding::Cr, "CR (旧 Mac)"),
+                                    ] {
+                                        if ui.button(tr(name)).clicked() {
+                                            convert_eol = Some(le);
+                                            ui.close_menu();
+                                        }
+                                    }
+                                })
+                                .response
                                 .on_hover_text(tr(
-                                    "この文字コードのまま保存します\n\u{3000}\
+                                    "この文字コード・改行コードのまま保存します\n\u{3000}\
                                      (表せない文字を足したときだけ UTF-8 で保存します)",
                                 ));
                             }
@@ -5496,6 +6198,24 @@ impl ZaivernApp {
                             ui.label(
                                 RichText::new(format!("⚠ {dwarn}")).size(11.5).color(theme.warn),
                             );
+                        }
+                        // プラン使用量 (最も深刻な助言の色。押すと明細)
+                        if let Some(sev) = quota_sev {
+                            let r = ui.add(
+                                egui::Label::new(
+                                    RichText::new(quota_severity_icon(sev))
+                                        .size(11.5)
+                                        .color(match sev {
+                                            0 => theme.text_dim,
+                                            1 => theme.warn,
+                                            _ => theme.err,
+                                        }),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text(quota_tip.clone()).clicked() {
+                                open_quota = true;
+                            }
                         }
                         let total = self.agents.sessions.len();
                         let running = self.agents.running_count();
@@ -5522,6 +6242,78 @@ impl ZaivernApp {
 
         if toggle_cockpit {
             self.cockpit = !self.cockpit;
+        }
+        if open_quota {
+            self.quota_open = true;
+        }
+        if let Some(le) = convert_eol {
+            self.editor_op(ctx, EditOp::NormalizeEol(le));
+        }
+        self.quota_window_ui(ctx);
+    }
+
+    /// ステータスバー用のプラン使用量サマリ。
+    /// 返り値: (最悪の深刻さ。アカウントが 1 件も無ければ None, ツールチップ本文)。
+    fn quota_status(&self) -> (Option<u8>, String) {
+        let now = std::time::SystemTime::now();
+        let accounts = self.quota.accounts(now);
+        if accounts.is_empty() {
+            return (None, String::new());
+        }
+        let advice = self.quota.advice(now);
+        let worst = self.quota.worst_advice(now).severity();
+        let mut lines: Vec<String> = vec![tr("プラン使用量 (クリックで明細)")];
+        for u in &accounts {
+            lines.push(trf(
+                "{account}: {used} / {proj}",
+                &[
+                    ("account", u.account.clone()),
+                    ("used", quota_usage_label(u)),
+                    ("proj", quota_projection_label(u.projection)),
+                ],
+            ));
+        }
+        for (_, a) in advice.iter().filter(|(_, a)| a.severity() > 0) {
+            lines.push(format!("⚠ {}", a.message()));
+        }
+        (Some(worst), lines.join("\n"))
+    }
+
+    /// ステータスバーの「UTF-8 / CRLF」表示。エディタタブが無ければ None。
+    ///
+    /// 改行の集計は本文の全走査なので、同じバッファ・同じ長さのうちは
+    /// [`LE_RECOUNT`] 間隔でしか数え直さない (毎フレーム走査しない)。
+    fn text_format_label(&mut self) -> Option<String> {
+        /// 改行コードを数え直す最短間隔。
+        const LE_RECOUNT: Duration = Duration::from_millis(400);
+        let i = self.editor.active?;
+        let b = self.editor.buffers.get(i)?;
+        let (id, len) = (b.id, b.text.len());
+        let stale = match &self.le_cache {
+            Some((cid, clen, at, _)) => *cid != id || *clen != len || at.elapsed() >= LE_RECOUNT,
+            None => true,
+        };
+        if stale {
+            let le = crate::textenc::detect_line_ending(&b.text);
+            self.le_cache = Some((id, len, Instant::now(), le));
+        }
+        let le = self.le_cache.as_ref().map(|(_, _, _, l)| *l)?;
+        let enc = self.editor.buffers[i].encoding;
+        // 混在しているときは LineEnding::label が内訳 (「CRLF (LF 3行混在)」) まで返す
+        Some(format!("{} / {}", enc.name(), le.label()))
+    }
+
+    /// アクティブバッファの改行コード (キャッシュがあればそれ。無ければ数え直す)。
+    fn active_line_ending(&self) -> crate::textenc::LineEnding {
+        let Some(i) = self.editor.active else {
+            return crate::textenc::LineEnding::Lf;
+        };
+        let Some(b) = self.editor.buffers.get(i) else {
+            return crate::textenc::LineEnding::Lf;
+        };
+        match &self.le_cache {
+            Some((cid, clen, _, le)) if *cid == b.id && *clen == b.text.len() => *le,
+            _ => crate::textenc::detect_line_ending(&b.text),
         }
     }
 
@@ -5554,6 +6346,10 @@ impl ZaivernApp {
         // パネル描画後に self へ反映する
         let mut gsearch_go = false;
         let mut gsearch_jump: Option<(PathBuf, usize)> = None;
+        // 置換フローの進み (ドライラン要求 / 実行の確認 / 取りやめ)
+        let mut gsearch_replace: Option<ReplaceEvent> = None;
+        // セッションタブで押されたもの。実行 (エージェント起動など) は描画後
+        let mut sess_action = session_picker::SidebarAction::None;
         // パネルの本文はクロージャの中では読むだけなので、先に借りをほどく
         let panel_texts = self.plugin_panels.clone();
         // Markdown パネルの描画に要るもの (画像キャッシュは借りて後で戻す)
@@ -5574,10 +6370,11 @@ impl ZaivernApp {
                     let narrow = ui.available_width() < 300.0;
                     let n_agents = self.agents.sessions.len();
                     let n_plugins = self.plugins.len();
-                    let tabs: [(SidebarTab, String, &str); 6] = [
+                    let tabs: [(SidebarTab, String, &str); 7] = [
                         (SidebarTab::Files, "📁".into(), "ファイル"),
                         (SidebarTab::Search, "🔎".into(), "検索"),
                         (SidebarTab::Agents, format!("👾 {n_agents}"), "Agents"),
+                        (SidebarTab::Sessions, "💬".into(), "セッション"),
                         (SidebarTab::Plugins, format!("🔌 {n_plugins}"), "プラグイン"),
                         (SidebarTab::Git, "🌿".into(), "Git"),
                         (SidebarTab::GitHub, "🐙".into(), "GitHub"),
@@ -5612,6 +6409,7 @@ impl ZaivernApp {
                             &theme,
                             &mut gsearch_go,
                             &mut gsearch_jump,
+                            &mut gsearch_replace,
                         );
                     }
                     SidebarTab::Agents => {
@@ -5623,6 +6421,15 @@ impl ZaivernApp {
                             &mut restart,
                             &mut remove,
                             &mut cycle,
+                        );
+                    }
+                    SidebarTab::Sessions => {
+                        // フォルダ一覧は is_dir() を叩くので、元が変わった時だけ作り直す
+                        sess_action = panels::sessions_sidebar_ui(
+                            ui,
+                            &theme,
+                            &mut self.sidebar_sessions,
+                            &self.sess_folders,
                         );
                     }
                     SidebarTab::Plugins => {
@@ -5721,12 +6528,19 @@ impl ZaivernApp {
             self.refresh_panel(&name, &panel, ctx);
         }
 
-        // 検索タブのアクション (横断検索の開始 / 結果へのジャンプ)
+        // 検索タブのアクション (横断検索の開始 / 結果へのジャンプ / 置換)
         if gsearch_go {
             self.start_global_search();
         }
         if let Some((path, line)) = gsearch_jump {
             self.jump_to_lsp_pos(&path, line, 0);
+        }
+        if let Some(ev) = gsearch_replace {
+            self.advance_replace(ev);
+        }
+        // セッションタブのアクション (再開 / 新規会話 / フォルダを開く / 閉じる)
+        if sess_action != session_picker::SidebarAction::None {
+            self.apply_session_sidebar(sess_action, ctx);
         }
 
         if pl.new_plugin {
@@ -5858,11 +6672,28 @@ impl ZaivernApp {
         theme: &Theme,
         go: &mut bool,
         jump: &mut Option<(PathBuf, usize)>,
+        replace: &mut Option<ReplaceEvent>,
     ) {
-        let (g, j) = global_search_panel(ui, theme, &mut self.gsearch, &self.file_index);
+        let before = (
+            self.gsearch.case_sensitive,
+            self.gsearch.whole_word,
+            self.gsearch.regex,
+        );
+        let (g, j, r) = global_search_panel(ui, theme, &mut self.gsearch, &self.file_index);
+        let after = (
+            self.gsearch.case_sensitive,
+            self.gsearch.whole_word,
+            self.gsearch.regex,
+        );
+        if before != after {
+            self.save_search_prefs(ui.ctx());
+        }
         *go |= g;
         if j.is_some() {
             *jump = j;
+        }
+        if r.is_some() {
+            *replace = r;
         }
     }
 
@@ -6971,6 +7802,12 @@ impl ZaivernApp {
                         .desired_width(300.0)
                         .hint_text(tr("全エージェントへブロードキャスト (/goal, /loop 対応)...")),
                 );
+                // 差分ビューから流し込んだ直後は入力欄へフォーカスを寄せる
+                // (どこへ入ったのか分からないまま置き去りにしない)
+                if self.broadcast_focus {
+                    input.request_focus();
+                    self.broadcast_focus = false;
+                }
                 let enter = input.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if (send.clicked() || enter || trigger_submit) && !self.broadcast_input.trim().is_empty() {
@@ -9236,6 +10073,75 @@ impl ZaivernApp {
             ("📦".into(), tr("プラグインをインストール… (.zvplug / .zip)"), String::new(), Cmd::InstallPlugin),
             ("🔌".into(), tr("プラグインを表示"), String::new(), Cmd::ShowPlugins),
             ("⟳".into(), tr("プラグインを再スキャン"), String::new(), Cmd::RescanPlugins),
+            // ── 横断検索のオプション ──
+            (
+                "⇄".into(),
+                tr("ファイル間で置換…"),
+                crate::keybinds::format_shortcut(self.keys.get(BindAction::GlobalReplace)),
+                Cmd::GlobalReplace,
+            ),
+            (
+                "Aa".into(),
+                tr("検索: 大文字と小文字を区別する (切替)"),
+                String::new(),
+                Cmd::ToggleSearchCase,
+            ),
+            (
+                "Ab|".into(),
+                tr("検索: 単語単位で検索する (切替)"),
+                String::new(),
+                Cmd::ToggleSearchWholeWord,
+            ),
+            (
+                ".*".into(),
+                tr("検索: 正規表現を使用する (切替)"),
+                String::new(),
+                Cmd::ToggleSearchRegex,
+            ),
+            // ── セッション / 使用量 ──
+            (
+                "💬".into(),
+                tr("セッション: 過去の会話を表示"),
+                String::new(),
+                Cmd::ShowSessions,
+            ),
+            (
+                "📊".into(),
+                tr("プラン使用量と枯渇予測を表示"),
+                String::new(),
+                Cmd::ShowQuota,
+            ),
+            // ── 保存時のクリーンアップ / 改行コード ──
+            (
+                "·".into(),
+                tr("保存時に末尾空白を除去 (切替)"),
+                String::new(),
+                Cmd::ToggleTrimTrailingOnSave,
+            ),
+            (
+                "↩".into(),
+                tr("保存時に最終行へ改行を入れる (切替)"),
+                String::new(),
+                Cmd::ToggleFinalNewlineOnSave,
+            ),
+            (
+                "↩".into(),
+                tr("改行コードを変換: LF (Unix)"),
+                String::new(),
+                Cmd::ConvertLineEnding(crate::textenc::LineEnding::Lf),
+            ),
+            (
+                "↩".into(),
+                tr("改行コードを変換: CRLF (Windows)"),
+                String::new(),
+                Cmd::ConvertLineEnding(crate::textenc::LineEnding::Crlf),
+            ),
+            (
+                "↩".into(),
+                tr("改行コードを変換: CR (旧 Mac)"),
+                String::new(),
+                Cmd::ConvertLineEnding(crate::textenc::LineEnding::Cr),
+            ),
         ]
     }
 
@@ -12035,6 +12941,9 @@ impl ZaivernApp {
         // 4fps 相当なら負荷はごくわずかで、外部からの操作が常に届くようになる。
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
 
+        // 永続 UI 設定 (検索オプション・保存時クリーンアップ) は最初のフレームで読む
+        self.load_prefs_once(ctx);
+
         // 音声入力が先。押している間だけ録音するキーは他所へ渡さない
         // (ターミナルが PTY へ転送してしまうため)
         self.poll_voice(ctx);
@@ -12047,6 +12956,12 @@ impl ZaivernApp {
         // 定義ジャンプ (F12) の LSP 応答と、ファイル横断検索の結果を取り込む
         self.poll_definition_result();
         self.poll_global_search();
+        // セッションタブに出すフォルダ一覧 (is_dir を叩くので変化時だけ作り直す)
+        self.refresh_session_folders();
+        // 差分ビューの「エージェントに送る」を拾って入力欄へ流し込む
+        if let Some(p) = crate::diff::take_pending_review_prompt(ctx) {
+            self.take_review_prompt(p);
+        }
         // 別スレッドで開いているファイルダイアログの結果を取り込む
         self.poll_dialogs(ctx);
         // 自動保存 (メニュー: ファイル > 自動保存)
@@ -12321,6 +13236,7 @@ impl ZaivernApp {
         self.terminal_hooks(ctx, win_focused);
         self.supervise(ctx, win_focused);
         self.coordinate(win_focused);
+        self.quota_tick();
 
         self.top_bar(ctx);
         self.status_bar(ctx);
@@ -13041,6 +13957,12 @@ impl ZaivernApp {
                 .map(|(i, p)| (i, p.icon.clone(), p.name.clone()))
                 .collect(),
             themes,
+            line_ending: self
+                .editor
+                .active
+                .map(|_| self.active_line_ending().label()),
+            trim_trailing_on_save: self.save_trim_trailing,
+            final_newline_on_save: self.save_final_newline,
             build_task: menu_bar::build_task_for(&self.agent_cwd()).map(|(l, _)| l),
             run_label,
         }
@@ -13501,15 +14423,28 @@ impl ZaivernApp {
     // ── ファイル横断検索 (サイドバー検索タブ) ──
 
     fn start_global_search(&mut self) {
-        let q = self.gsearch.query.trim().to_string();
-        if q.is_empty() || self.gsearch.running {
+        if self.gsearch.query.trim().is_empty() || self.gsearch.running {
             return;
         }
+        let opts = self.gsearch.options(Some(self.primary_root().to_path_buf()));
         let files: Vec<PathBuf> = self.file_index.iter().map(|f| f.abs.clone()).collect();
-        self.gsearch.rx = Some(file_search::spawn(files, q));
-        self.gsearch.running = true;
-        self.gsearch.searched = true;
-        self.gsearch.results.clear();
+        // 正規表現のコンパイルは spawn_with_options が**同期で**返すので、
+        // 壊れたパターンはここで赤字にする (literal に落として黙って別の結果を出さない)
+        match file_search::spawn_with_options(files, opts) {
+            Ok(rx) => {
+                self.gsearch.error = None;
+                self.gsearch.rx = Some(rx);
+                self.gsearch.running = true;
+                self.gsearch.searched = true;
+                self.gsearch.results.clear();
+                self.gsearch.marks.clear();
+            }
+            Err(e) => {
+                self.gsearch.error = Some(tr(&e.to_string()));
+                self.gsearch.rx = None;
+                self.gsearch.running = false;
+            }
+        }
     }
 
     fn poll_global_search(&mut self) {
@@ -13528,6 +14463,128 @@ impl ZaivernApp {
         if done {
             self.gsearch.rx = None;
             self.gsearch.running = false;
+            self.recompute_search_marks();
+        }
+        self.poll_global_replace();
+    }
+
+    /// 表示用スニペットの中のマッチ範囲を数え直す (検索が終わった直後に 1 度だけ)。
+    ///
+    /// `Hit.col` / `Hit.len` は**元の行**のバイト位置なので、そのままでは
+    /// 先頭空白を落としたスニペットへは当たらない。元の行を読み直すのは
+    /// ディスクアクセスなので、同じ条件のマッチャをスニペットへ当て直す。
+    /// `len` は「1 マッチの長さ」の検算に使う (食い違ったら強調しない)。
+    fn recompute_search_marks(&mut self) {
+        self.gsearch.marks.clear();
+        if self.gsearch.results.is_empty() {
+            return;
+        }
+        let opts = self.gsearch.options(Some(self.primary_root().to_path_buf()));
+        let Ok(m) = file_search::Matcher::compile(&opts) else {
+            return;
+        };
+        self.gsearch.marks = self
+            .gsearch
+            .results
+            .iter()
+            .map(|h| {
+                let all = m.find_all(&h.text);
+                // スニペット側で 1 つも当たらない (行が切り詰められた等) なら素で描く
+                if all.iter().any(|(s, e)| e - s == h.len) {
+                    all
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+    }
+
+    // ── ワークスペース一括置換 (検索タブ) ──
+
+    /// 置換フローを 1 歩進める。**書き込みは Confirm を経た後にしか起きない**。
+    fn advance_replace(&mut self, ev: ReplaceEvent) {
+        let next = self.gsearch.phase.next(&ev);
+        // 状態が進まなかった (順序外の出来事) なら何も起こさない
+        if next == self.gsearch.phase && !matches!(ev, ReplaceEvent::Cancel) {
+            return;
+        }
+        let dry = match ev {
+            ReplaceEvent::Start => true,
+            ReplaceEvent::Confirm => false,
+            _ => {
+                self.gsearch.phase = next;
+                if matches!(ev, ReplaceEvent::Cancel) {
+                    self.gsearch.replace_rx = None;
+                }
+                return;
+            }
+        };
+        let req = file_search::ReplaceRequest {
+            options: self.gsearch.options(Some(self.primary_root().to_path_buf())),
+            replacement: self.gsearch.replace.clone(),
+            dry_run: dry,
+        };
+        let files: Vec<PathBuf> = self.file_index.iter().map(|f| f.abs.clone()).collect();
+        let (tx, rx) = mpsc::channel::<ReplaceMsg>();
+        // 走査も書き込みもワーカースレッドで (UI スレッドはファイルに触らない)
+        let spawned = std::thread::Builder::new()
+            .name("zv-replace".into())
+            .spawn(move || {
+                let _ = tx.send(file_search::replace_all(&files, &req).map_err(|e| e.to_string()));
+            });
+        if spawned.is_err() {
+            self.toast(tr("置換ワーカーを起動できませんでした"), false);
+            return;
+        }
+        self.gsearch.error = None;
+        self.gsearch.replace_rx = Some(rx);
+        self.gsearch.phase = next;
+    }
+
+    /// 置換ワーカーの結果を取り込む (毎フレーム。届いていなければ即戻る)。
+    fn poll_global_replace(&mut self) {
+        let msg = match &self.gsearch.replace_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(m) => Some(m),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(tr("置換が中断されました"))),
+            },
+            None => return,
+        };
+        self.gsearch.replace_rx = None;
+        let Some(msg) = msg else { return };
+        match msg {
+            Ok(rep) => {
+                let (files, hits) = (rep.files_changed, rep.replacements);
+                let ev = if rep.dry_run {
+                    ReplaceEvent::DryRunDone { files, hits }
+                } else {
+                    ReplaceEvent::ExecuteDone { files, hits }
+                };
+                self.gsearch.phase = self.gsearch.phase.next(&ev);
+                if !rep.dry_run {
+                    for e in rep.errors.iter().take(3) {
+                        self.toast_warn(format!("{}: {}", e.path.display(), e.message));
+                    }
+                    if hits > 0 {
+                        self.toast(
+                            trf(
+                                "🔁 {files} ファイル / {hits} 箇所を置換しました",
+                                &[("files", files.to_string()), ("hits", hits.to_string())],
+                            ),
+                            true,
+                        );
+                        // 開いているタブは既存の外部変更ウォッチャ
+                        // (Editor::check_external) が拾って読み直す。
+                        // ここでは結果一覧だけ最新の中身へ合わせ直す。
+                        self.start_global_search();
+                    }
+                }
+            }
+            Err(e) => {
+                self.gsearch.phase = self.gsearch.phase.next(&ReplaceEvent::Failed);
+                self.gsearch.error = Some(tr(&e));
+            }
         }
     }
 
@@ -13801,6 +14858,7 @@ fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
         (tr("検索"), format_shortcut(keys.get(BindAction::Find))),
         (tr("置換"), format_shortcut(keys.get(BindAction::OpenReplace))),
         (tr("ファイル間で検索"), format_shortcut(keys.get(BindAction::GlobalSearch))),
+        (tr("ファイル間で置換"), format_shortcut(keys.get(BindAction::GlobalReplace))),
         (tr("行コメントの切り替え"), format_shortcut(keys.get(BindAction::ToggleComment))),
         (tr("行を複製"), format_shortcut(keys.get(BindAction::DuplicateLine))),
         (tr("行を上へ移動"), format_shortcut(keys.get(BindAction::MoveLineUp))),
@@ -13847,17 +14905,70 @@ fn rustc_version() -> &'static str {
     option_env!("ZV_RUSTC_VERSION").unwrap_or("1.88+")
 }
 
+/// 検索結果 1 行を「行番号 + 本文 (マッチだけ強調)」の 1 枚のレイアウトにする。
+///
+/// `marks` は**スニペット (`Hit.text`) の中の**バイト範囲。範囲が本文の外や
+/// 文字境界の外を指していても描画は落とさない (壊れた範囲は無視して素で描く)。
+fn search_row_job(
+    theme: &Theme,
+    line_no: usize,
+    text: &str,
+    marks: &[(usize, usize)],
+    font: FontId,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let dim = egui::TextFormat {
+        font_id: font.clone(),
+        color: theme.text_dim,
+        ..Default::default()
+    };
+    let plain = egui::TextFormat {
+        font_id: font.clone(),
+        color: theme.text,
+        ..Default::default()
+    };
+    let hot = egui::TextFormat {
+        font_id: font,
+        color: theme.bg,
+        background: theme.accent,
+        ..Default::default()
+    };
+    job.append(&format!("{:>5}  ", line_no), 0.0, dim);
+    let mut at = 0usize;
+    for &(s, e) in marks {
+        if s < at || e <= s || e > text.len() || !text.is_char_boundary(s) || !text.is_char_boundary(e)
+        {
+            continue;
+        }
+        job.append(&text[at..s], 0.0, plain.clone());
+        job.append(&text[s..e], 0.0, hot.clone());
+        at = e;
+    }
+    job.append(&text[at..], 0.0, plain);
+    job
+}
+
 /// サイドバーの「検索」タブ本体。self 全体を借りない free 関数にして、
 /// サイドバー描画クロージャ内の他フィールド借用と両立させる。
-/// 返り値: (検索開始要求, ジャンプ先 (パス, 0-based 行))。
+/// 返り値: (検索開始要求, ジャンプ先 (パス, 0-based 行), 置換フローの進み)。
 fn global_search_panel(
     ui: &mut egui::Ui,
     theme: &Theme,
     gsearch: &mut GlobalSearchState,
     file_index: &[IndexedFile],
-) -> (bool, Option<(PathBuf, usize)>) {
+) -> (bool, Option<(PathBuf, usize)>, Option<ReplaceEvent>) {
     let mut go = false;
+    let mut replace_ev: Option<ReplaceEvent> = None;
     ui.horizontal(|ui| {
+        // ▸/▾ で置換行の開閉 (VS Code と同じ位置・同じ意味)
+        let arrow = if gsearch.replace_open { "▾" } else { "▸" };
+        if ui
+            .add(egui::Button::new(arrow).frame(false))
+            .on_hover_text(tr("置換行の表示切替"))
+            .clicked()
+        {
+            gsearch.replace_open = !gsearch.replace_open;
+        }
         let resp = ui.add(
             egui::TextEdit::singleline(&mut gsearch.query)
                 .desired_width((ui.available_width() - 34.0).max(80.0))
@@ -13874,7 +14985,111 @@ fn global_search_panel(
             go = true;
         }
     });
-    if gsearch.running {
+    // 検索オプション。押した瞬間に検索し直す (VS Code と同じ即時反映)
+    ui.horizontal(|ui| {
+        let mut changed = false;
+        let toggles: [(&mut bool, &str, &str); 3] = [
+            (&mut gsearch.case_sensitive, "Aa", "大文字と小文字を区別する"),
+            (&mut gsearch.whole_word, "Ab|", "単語単位で検索する"),
+            (&mut gsearch.regex, ".*", "正規表現として検索する"),
+        ];
+        for (flag, label, hint) in toggles {
+            if ui
+                .selectable_label(*flag, label)
+                .on_hover_text(tr(hint))
+                .clicked()
+            {
+                *flag = !*flag;
+                changed = true;
+            }
+        }
+        if changed {
+            // 条件が変わったら、確認待ちの置換件数は当てにならないので捨てる
+            gsearch.phase = gsearch.phase.next(&ReplaceEvent::Cancel);
+            if !gsearch.query.trim().is_empty() {
+                go = true;
+            }
+        }
+    });
+    // 対象を絞る glob。2 本を横に並べるとどちらも狭くなるので縦に積む
+    let glob_w = (ui.available_width() - 12.0).max(80.0);
+    let inc = ui.add(
+        egui::TextEdit::singleline(&mut gsearch.include_globs)
+            .desired_width(glob_w)
+            .hint_text(tr("含めるファイル (例: *.rs, src/**)")),
+    );
+    let exc = ui.add(
+        egui::TextEdit::singleline(&mut gsearch.exclude_globs)
+            .desired_width(glob_w)
+            .hint_text(tr("除外するファイル (例: target/**)")),
+    );
+    for r in [&inc, &exc] {
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            go = true;
+        }
+    }
+    if gsearch.replace_open {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut gsearch.replace)
+                    .desired_width((ui.available_width() - 76.0).max(70.0))
+                    .hint_text(tr("置換後の文字列")),
+            );
+            let can = !gsearch.query.trim().is_empty() && !gsearch.phase.busy();
+            if ui
+                .add_enabled(can, egui::Button::new(tr("置換")))
+                .on_hover_text(tr("まず件数だけ数えます (この時点では 1 バイトも書きません)"))
+                .clicked()
+            {
+                replace_ev = Some(ReplaceEvent::Start);
+            }
+        });
+        match &gsearch.phase {
+            ReplacePhase::Running => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(tr("置換を数えています…")).size(11.5).color(theme.text_dim));
+                });
+            }
+            ReplacePhase::Confirm { files, hits } => {
+                ui.label(
+                    RichText::new(trf(
+                        "{files} ファイル / {hits} 箇所を置換します",
+                        &[("files", files.to_string()), ("hits", hits.to_string())],
+                    ))
+                    .size(11.5)
+                    .color(theme.warn),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new(tr("実行")).color(theme.err).strong())
+                        .clicked()
+                    {
+                        replace_ev = Some(ReplaceEvent::Confirm);
+                    }
+                    if ui.button(tr("やめる")).clicked() {
+                        replace_ev = Some(ReplaceEvent::Cancel);
+                    }
+                });
+            }
+            ReplacePhase::Done { files, hits } => {
+                let msg = if *hits == 0 {
+                    tr("置換対象は見つかりませんでした")
+                } else {
+                    trf(
+                        "{files} ファイル / {hits} 箇所を置換しました",
+                        &[("files", files.to_string()), ("hits", hits.to_string())],
+                    )
+                };
+                ui.label(RichText::new(msg).size(11.5).color(theme.ok));
+            }
+            ReplacePhase::Idle => {}
+        }
+    }
+    // パターンが壊れているときは黙って literal に落とさず、その場で赤く出す
+    if let Some(e) = &gsearch.error {
+        ui.label(RichText::new(format!("⛔ {e}")).size(11.5).color(theme.err));
+    } else if gsearch.running {
         ui.horizontal(|ui| {
             ui.spinner();
             ui.label(RichText::new(tr("検索中…")).color(theme.text_dim));
@@ -13901,12 +15116,13 @@ fn global_search_panel(
     }
     ui.separator();
     let mut jump: Option<(PathBuf, usize)> = None;
+    let font = FontId::monospace(12.0);
     egui::ScrollArea::vertical()
         .id_salt("zv-gsearch")
         .auto_shrink(false)
         .show(ui, |ui| {
             let mut last_file: Option<&Path> = None;
-            for hit in &gsearch.results {
+            for (i, hit) in gsearch.results.iter().enumerate() {
                 if last_file != Some(hit.path.as_path()) {
                     last_file = Some(hit.path.as_path());
                     let rel = file_index
@@ -13917,10 +15133,12 @@ fn global_search_panel(
                     ui.add_space(4.0);
                     ui.label(RichText::new(format!("📄 {rel}")).strong());
                 }
-                let row = format!("{:>5}  {}", hit.line + 1, hit.text);
+                let empty: Vec<(usize, usize)> = Vec::new();
+                let marks = gsearch.marks.get(i).unwrap_or(&empty);
+                let job = search_row_job(theme, hit.line + 1, &hit.text, marks, font.clone());
                 if ui
                     .add(
-                        egui::Button::new(RichText::new(row).size(12.0))
+                        egui::Button::new(job)
                             .frame(false)
                             .wrap_mode(egui::TextWrapMode::Truncate),
                     )
@@ -13930,7 +15148,7 @@ fn global_search_panel(
                 }
             }
         });
-    (go, jump)
+    (go, jump, replace_ev)
 }
 
 #[cfg(test)]
@@ -15590,6 +16808,7 @@ mod glyph_tests {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
         const UI_SYMBOLS: &str = "📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
+                                  💬📊⛔🔁·↩▸▾🔎\
                                   🔍📡🖱📦🍚🌀🔷🔶🕊👷🐦🅰🌊⌘➡🔩🌙🎏🎐🐉💠";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);
@@ -15662,5 +16881,636 @@ mod glyph_tests {
             missing.is_empty(),
             "カタログのアイコンが豆腐になる: {missing:?}"
         );
+    }
+}
+
+// ─── 今夜 UI へ配線した 5 機能の「配線そのもの」を固定するテスト ──────────
+//
+// エンジン側の振る舞いは各モジュールのテストが見ているので、ここは
+// **UI が engine をどう呼ぶか**だけを見る (実際の起動やファイル書き込みはしない)。
+#[cfg(test)]
+mod ui_wiring_tests {
+    use super::*;
+    use crate::coordinator::quota;
+    use crate::textenc::LineEnding;
+
+    // ── GAP1: 検索オプション → SearchOptions の対応表 ──────────────
+
+    fn gs(f: impl FnOnce(&mut GlobalSearchState)) -> GlobalSearchState {
+        let mut s = GlobalSearchState::new();
+        s.query = "needle".into();
+        f(&mut s);
+        s
+    }
+
+    #[test]
+    fn 検索オプションはそのまま_search_options_へ写る() {
+        // (状態を作る手, 期待する (大小区別, 単語単位, 正規表現))
+        let table: [(fn(&mut GlobalSearchState), (bool, bool, bool)); 5] = [
+            (|_| {}, (false, false, false)),
+            (|s| s.case_sensitive = true, (true, false, false)),
+            (|s| s.whole_word = true, (false, true, false)),
+            (|s| s.regex = true, (false, false, true)),
+            (
+                |s| {
+                    s.case_sensitive = true;
+                    s.whole_word = true;
+                    s.regex = true;
+                },
+                (true, true, true),
+            ),
+        ];
+        for (setup, want) in table {
+            let o = gs(setup).options(None);
+            assert_eq!(
+                (o.case_sensitive, o.whole_word, o.regex),
+                want,
+                "トグルの写し漏れ"
+            );
+            assert_eq!(o.query, "needle");
+        }
+    }
+
+    #[test]
+    fn glob欄はカンマでも空白でも同じに割れる() {
+        for src in ["*.rs, *.toml", "*.rs *.toml", " *.rs ,, *.toml , ", "*.rs\n*.toml"] {
+            assert_eq!(split_globs(src), vec!["*.rs", "*.toml"], "区切り: {src:?}");
+        }
+        assert!(split_globs("  ,  ").is_empty(), "空パターンを作らない");
+    }
+
+    #[test]
+    fn glob欄は_include_と_exclude_へ別々に載る() {
+        let o = gs(|s| {
+            s.include_globs = "src/**".into();
+            s.exclude_globs = "target/**, *.lock".into();
+        })
+        .options(Some(PathBuf::from("/ws")));
+        assert_eq!(o.include_globs, vec!["src/**"]);
+        assert_eq!(o.exclude_globs, vec!["target/**", "*.lock"]);
+        assert_eq!(o.root, Some(PathBuf::from("/ws")), "glob の基準はワークスペース");
+    }
+
+    #[test]
+    fn 検索の既定値は従来の挙動を壊さない() {
+        let o = GlobalSearchState::new().options(None);
+        let d = file_search::SearchOptions::default();
+        assert_eq!(o.max_results, d.max_results);
+        assert_eq!(o.max_file_bytes, d.max_file_bytes);
+        assert_eq!(o.follow_symlinks, d.follow_symlinks);
+        assert!(!o.case_sensitive && !o.whole_word && !o.regex);
+    }
+
+    #[test]
+    fn 壊れた正規表現はその場でエラーになる() {
+        // spawn_with_options が同期で Err を返す = UI が黙って literal に落ちない
+        let o = gs(|s| {
+            s.query = "(".into();
+            s.regex = true;
+        })
+        .options(None);
+        assert!(
+            file_search::spawn_with_options(Vec::new(), o).is_err(),
+            "閉じ括弧の無いパターンはコンパイルで弾かれる"
+        );
+        // 正規表現 OFF なら同じ文字列でも普通に検索できる (エラーにしない)
+        let lit = gs(|s| s.query = "(".into()).options(None);
+        assert!(file_search::spawn_with_options(Vec::new(), lit).is_ok());
+    }
+
+    // ── GAP1: 置換の確認フロー (ドライラン → 確認 → 実行) ──────────
+
+    fn run(evs: &[ReplaceEvent]) -> ReplacePhase {
+        evs.iter().fold(ReplacePhase::Idle, |p, e| p.next(e))
+    }
+
+    #[test]
+    fn 置換は必ずドライランと確認を通ってから実行される() {
+        use ReplaceEvent::*;
+        assert_eq!(run(&[Start]), ReplacePhase::Running);
+        assert_eq!(
+            run(&[Start, DryRunDone { files: 3, hits: 7 }]),
+            ReplacePhase::Confirm { files: 3, hits: 7 },
+            "数えた結果は確認待ちとして出す"
+        );
+        assert_eq!(
+            run(&[Start, DryRunDone { files: 3, hits: 7 }, Confirm]),
+            ReplacePhase::Running
+        );
+        assert_eq!(
+            run(&[
+                Start,
+                DryRunDone { files: 3, hits: 7 },
+                Confirm,
+                ExecuteDone { files: 3, hits: 7 },
+            ]),
+            ReplacePhase::Done { files: 3, hits: 7 }
+        );
+    }
+
+    #[test]
+    fn 確認を飛ばした実行要求は無視される() {
+        use ReplaceEvent::*;
+        assert_eq!(run(&[Confirm]), ReplacePhase::Idle);
+        assert_eq!(
+            run(&[Start, Confirm]),
+            ReplacePhase::Running,
+            "ドライラン待ちのまま。実行要求では状態が動かない"
+        );
+        assert_eq!(
+            run(&[
+                Start,
+                DryRunDone { files: 1, hits: 1 },
+                ExecuteDone { files: 1, hits: 1 },
+            ]),
+            ReplacePhase::Confirm { files: 1, hits: 1 },
+            "確認を経ていない完了報告で Done にしない"
+        );
+    }
+
+    #[test]
+    fn やめるとどの段階からも_idle_へ戻る() {
+        use ReplaceEvent::*;
+        for prefix in [
+            vec![Start],
+            vec![Start, DryRunDone { files: 2, hits: 5 }],
+            vec![Start, DryRunDone { files: 2, hits: 5 }, Confirm],
+        ] {
+            let mut evs = prefix.clone();
+            evs.push(Cancel);
+            assert_eq!(run(&evs), ReplacePhase::Idle, "やめる: {prefix:?}");
+        }
+        assert_eq!(run(&[Start, Failed]), ReplacePhase::Idle);
+    }
+
+    #[test]
+    fn ゼロ件のドライランは確認を出さずに畳む() {
+        use ReplaceEvent::*;
+        assert_eq!(
+            run(&[Start, DryRunDone { files: 0, hits: 0 }]),
+            ReplacePhase::Done { files: 0, hits: 0 },
+            "押しても何も起きない「実行」ボタンを出さない"
+        );
+    }
+
+    #[test]
+    fn 確認待ちから条件を直して数え直せる() {
+        use ReplaceEvent::*;
+        assert_eq!(
+            run(&[Start, DryRunDone { files: 2, hits: 4 }, Start]),
+            ReplacePhase::Running
+        );
+    }
+
+    #[test]
+    fn 置換要求の既定はドライラン() {
+        // 「置換」を押した時点では 1 バイトも書かない、をエンジン側の既定で担保する
+        assert!(file_search::ReplaceRequest::default().dry_run);
+    }
+
+    // ── GAP2: サイドバータブの保存と復元 ──────────────────────────
+
+    #[test]
+    fn サイドバータブは往復して同じものに戻る() {
+        for t in [
+            SidebarTab::Files,
+            SidebarTab::Search,
+            SidebarTab::Agents,
+            SidebarTab::Sessions,
+            SidebarTab::Plugins,
+            SidebarTab::Git,
+            SidebarTab::GitHub,
+        ] {
+            assert!(
+                SidebarTab::from_key(t.as_key()) == t,
+                "往復で変わった: {}",
+                t.as_key()
+            );
+        }
+    }
+
+    #[test]
+    fn 新タブを足しても古い保存値はそのまま読める() {
+        // セッションタブが無かった頃に保存された値
+        for (old, want) in [
+            ("files", SidebarTab::Files),
+            ("search", SidebarTab::Search),
+            ("agents", SidebarTab::Agents),
+            ("plugins", SidebarTab::Plugins),
+            ("git", SidebarTab::Git),
+            ("github", SidebarTab::GitHub),
+        ] {
+            assert!(SidebarTab::from_key(old) == want, "旧値 {old:?} が読めない");
+        }
+        // 未知 / 空 (フィールドごと無いもっと古いセッション) は既定へ落ちる
+        assert!(SidebarTab::from_key("") == SidebarTab::Files);
+        assert!(SidebarTab::from_key("unknown-tab") == SidebarTab::Files);
+        assert!(SidebarTab::from_key("sessions") == SidebarTab::Sessions);
+    }
+
+    // ── GAP2: SidebarAction の対応表 ──────────────────────────────
+
+    fn preset(name: &str, cmd: &str) -> config::AgentPreset {
+        config::AgentPreset {
+            name: name.into(),
+            command: cmd.into(),
+            icon: "👾".into(),
+            cwd: None,
+            env: HashMap::new(),
+        }
+    }
+
+    fn past(bin: &str, id: &str, cwd: &str) -> session_picker::PastSession {
+        session_picker::PastSession {
+            id: id.into(),
+            agent_bin: bin.into(),
+            started: std::time::UNIX_EPOCH,
+            modified: std::time::UNIX_EPOCH,
+            summary: "…".into(),
+            cwd: PathBuf::from(cwd),
+        }
+    }
+
+    #[test]
+    fn サイドバーの操作は意図した効果へ落ちる() {
+        use session_picker::SidebarAction as A;
+        // 素のシェルを先に置いても、新規会話はカタログ既知の CLI を選ぶ
+        let presets = vec![preset("Shell", ""), preset("Claude Code", "claude")];
+        let dir = PathBuf::from("/ws/proj");
+
+        assert_eq!(
+            session_sidebar_effect(&A::None, &presets),
+            SessionSidebarEffect::Nothing(None)
+        );
+
+        // 再開: 会話が走っていたフォルダで、再開指定付きのコマンド
+        let s = past("claude", "abc-123", "/ws/other");
+        match session_sidebar_effect(&A::Resume(s.clone()), &presets) {
+            SessionSidebarEffect::Launch { preset, command, cwd } => {
+                assert_eq!(preset, 1, "claude のプリセットを選ぶ");
+                assert_eq!(command, session_picker::resume_command("claude", &s));
+                assert!(command.contains("abc-123"), "再開 ID が乗る: {command}");
+                assert_eq!(cwd, PathBuf::from("/ws/other"), "cwd は会話のフォルダ");
+            }
+            other => panic!("再開が起動へ落ちていない: {other:?}"),
+        }
+
+        // 新規会話: 指定フォルダで、プリセットのコマンドそのまま
+        assert_eq!(
+            session_sidebar_effect(&A::NewConversation(dir.clone()), &presets),
+            SessionSidebarEffect::Launch {
+                preset: 1,
+                command: "claude".into(),
+                cwd: dir.clone(),
+            }
+        );
+
+        assert_eq!(
+            session_sidebar_effect(&A::RevealFolder(dir.clone()), &presets),
+            SessionSidebarEffect::Reveal(dir.clone())
+        );
+        assert_eq!(
+            session_sidebar_effect(&A::CloseFolder(dir.clone()), &presets),
+            SessionSidebarEffect::RemoveRoot(dir)
+        );
+    }
+
+    #[test]
+    fn 対応するプリセットが無ければ別の_cli_を起動しない() {
+        use session_picker::SidebarAction as A;
+        let presets = vec![preset("Claude Code", "claude")];
+        match session_sidebar_effect(&A::Resume(past("codex", "x", "/ws")), &presets) {
+            SessionSidebarEffect::Nothing(Some(msg)) => {
+                assert!(msg.contains("codex"), "どの CLI が無いか言う: {msg}")
+            }
+            other => panic!("別の CLI で起動してはいけない: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn プリセットが空なら新規会話も起きない() {
+        use session_picker::SidebarAction as A;
+        let e = session_sidebar_effect(&A::NewConversation(PathBuf::from("/ws")), &[]);
+        assert!(matches!(e, SessionSidebarEffect::Nothing(Some(_))));
+    }
+
+    #[test]
+    fn 既知の_cli_が無ければ先頭プリセットで新規会話を始める() {
+        use session_picker::SidebarAction as A;
+        let presets = vec![preset("Shell", ""), preset("bash", "bash")];
+        assert_eq!(
+            session_sidebar_effect(&A::NewConversation(PathBuf::from("/ws")), &presets),
+            SessionSidebarEffect::Launch {
+                preset: 0,
+                command: String::new(),
+                cwd: PathBuf::from("/ws"),
+            }
+        );
+    }
+
+    // ── GAP3: 使用量表示のルール ──────────────────────────────────
+
+    fn usage(used: Option<f32>, conf: quota::Confidence) -> quota::AccountUsage {
+        quota::AccountUsage {
+            account: "acct".into(),
+            agents: vec!["claude".into()],
+            used_fraction: used,
+            confidence: conf,
+            resets_at: None,
+            running_agents: 1,
+            events: Vec::new(),
+            projection: quota::Projection::InsufficientData,
+        }
+    }
+
+    #[test]
+    fn 使用率が不明な行には数字を出さない() {
+        let s = quota_usage_label(&usage(None, quota::Confidence::Unknown));
+        assert_eq!(s, tr("不明"));
+        assert!(
+            !s.chars().any(|c| c.is_ascii_digit()),
+            "測っていない枠に数字を出すと「まだ使っていない」に見える: {s}"
+        );
+    }
+
+    #[test]
+    fn 実測以外の使用率には推定と明記する() {
+        let measured = quota_usage_label(&usage(Some(0.42), quota::Confidence::Measured));
+        assert!(measured.contains("42"), "{measured}");
+        assert!(!measured.contains("推定"), "実測に推定と書かない: {measured}");
+        for c in [quota::Confidence::Estimated, quota::Confidence::Unknown] {
+            let s = quota_usage_label(&usage(Some(0.42), c));
+            assert!(s.contains("42") && s.contains("推定"), "{c:?}: {s}");
+        }
+    }
+
+    #[test]
+    fn 材料不足の予測はデータ不足と描く() {
+        let s = quota_projection_label(quota::Projection::InsufficientData);
+        assert_eq!(s, tr("データ不足"));
+        assert!(!s.contains('0'), "「0 分」と誤読させない: {s}");
+        assert!(!s.contains('分'), "時間として描かない: {s}");
+    }
+
+    #[test]
+    fn 枯渇予測は分で描き推定と明記する() {
+        // 90 秒 → 切り上げて 2 分
+        let s = quota_projection_label(quota::Projection::Exhaustion(Duration::from_secs(90)));
+        assert!(s.contains('2') && s.contains("推定"), "{s}");
+        let r = quota_projection_label(quota::Projection::ResetFirst(Duration::from_secs(600)));
+        assert!(r.contains("10"), "{r}");
+        assert_eq!(
+            quota_projection_label(quota::Projection::NotBurning),
+            tr("消費なし")
+        );
+    }
+
+    #[test]
+    fn 深刻さは色分けの記号へ落ちる() {
+        // 色だけに頼らず形でも区別する (○ 余裕 / ◇ 注意 / ● 危険)
+        assert_eq!(quota_severity_icon(0), "○");
+        assert_eq!(quota_severity_icon(1), "◇");
+        assert_eq!(quota_severity_icon(2), "●");
+        // Advice::severity() が返すのは 0/1/2 だけだが、増えても落ちない
+        assert_eq!(quota_severity_icon(9), "●");
+    }
+
+    #[test]
+    fn 使用量ウォッチは毎フレーム呼んでよい() {
+        // refresh_if_stale は TTL 内なら即戻る (UI スレッドから毎フレーム呼ぶ前提)
+        let mut w = coordinator::QuotaWatch::new();
+        w.set_running(vec![("claude".into(), 2)]);
+        assert_eq!(w.running_total(), 2);
+        for _ in 0..100 {
+            w.refresh_if_stale();
+        }
+        assert_eq!(w.running_total(), 2, "走行本数の付け替えは何度呼んでも同じ");
+    }
+
+    // ── GAP4: 保存時クリーンアップとカーソル ──────────────────────
+
+    #[test]
+    fn 何も設定していなければ保存で本文を触らない() {
+        let opts = editor_ops::SaveCleanup::default();
+        assert!(opts.is_noop());
+        assert!(save_cleanup_edit("a  \nb", (0, 0), &opts).is_none());
+    }
+
+    #[test]
+    fn 末尾空白を落とすとカーソルが行末へ寄る() {
+        let opts = editor_ops::SaveCleanup {
+            trim_trailing: true,
+            final_newline: false,
+            target_ending: None,
+        };
+        //           0123456 789
+        let text = "abc   \ndef\n";
+        // カーソルが「消える空白の中」(char 5) にいる
+        let (out, (s, e)) = save_cleanup_edit(text, (5, 5), &opts).expect("本文が変わる");
+        assert_eq!(out, "abc\ndef\n");
+        assert_eq!((s, e), (3, 3), "消えた空白の中にいたら新しい行末へ寄せる");
+        // 2 行目のカーソルは同じ行・同じ桁のまま (行がずれない)
+        let (_, (s2, _)) = save_cleanup_edit(text, (8, 8), &opts).expect("本文が変わる");
+        assert_eq!(s2, 5, "2 行目の 2 文字目 (d|ef) のまま");
+    }
+
+    #[test]
+    fn 最終行の改行はカーソルを動かさない() {
+        let opts = editor_ops::SaveCleanup {
+            trim_trailing: false,
+            final_newline: true,
+            target_ending: None,
+        };
+        let (out, sel) = save_cleanup_edit("abc", (2, 2), &opts).expect("改行が足される");
+        assert_eq!(out, "abc\n");
+        assert_eq!(sel, (2, 2));
+        // 既に改行で終わっていれば何もしない (空行を増やさない)
+        assert!(save_cleanup_edit("abc\n", (2, 2), &opts).is_none());
+    }
+
+    #[test]
+    fn 日本語の途中でカーソルを割らない() {
+        let opts = editor_ops::SaveCleanup {
+            trim_trailing: true,
+            final_newline: true,
+            target_ending: None,
+        };
+        let text = "日本語   \nあいう";
+        let (out, (s, e)) = save_cleanup_edit(text, (6, 6), &opts).expect("本文が変わる");
+        assert_eq!(out, "日本語\nあいう\n");
+        assert!(s <= e && e <= out.chars().count(), "範囲が本文の外へ出ない");
+        // char → byte 変換が文字境界で成立する (割れていれば別の値になる)
+        let b = editor_ops::char_to_byte(&out, e);
+        assert!(out.is_char_boundary(b), "多バイト文字の途中を指した");
+    }
+
+    #[test]
+    fn 選択範囲は両端とも付け替える() {
+        let opts = editor_ops::SaveCleanup {
+            trim_trailing: true,
+            final_newline: false,
+            target_ending: None,
+        };
+        let text = "aa  \nbb  \n";
+        let (out, (s, e)) = save_cleanup_edit(text, (4, 9), &opts).expect("本文が変わる");
+        assert_eq!(out, "aa\nbb\n");
+        assert!(s < e && e <= out.chars().count(), "選択が潰れない: ({s}, {e})");
+    }
+
+    // ── GAP4: 改行コードの変換 ────────────────────────────────────
+
+    #[test]
+    fn 改行コードの変換はカーソルを保つ() {
+        // 変換は editor_op(EditOp::NormalizeEol) が normalize_to +
+        // adjust_char_index_after_cleanup を通す。その組み合わせを固定する。
+        let text = "one\ntwo\nthree";
+        let out = crate::textenc::normalize_to(text, LineEnding::Crlf);
+        assert_eq!(out, "one\r\ntwo\r\nthree");
+        // "two" の先頭 (char 4) は CRLF 化後 char 5
+        let moved = editor_ops::adjust_char_index_after_cleanup(text, &out, 4);
+        let b = editor_ops::char_to_byte(&out, moved);
+        assert_eq!(&out[b..b + 3], "two");
+        // 戻せば元の本文・元の位置
+        let back = crate::textenc::normalize_to(&out, LineEnding::Lf);
+        assert_eq!(back, text);
+        assert_eq!(
+            editor_ops::adjust_char_index_after_cleanup(&out, &back, moved),
+            4
+        );
+    }
+
+    #[test]
+    fn ステータスバーの表記は文字コードと改行を並べる() {
+        // 「UTF-8 / CRLF」の形。混在は内訳付き
+        assert_eq!(crate::textenc::detect_line_ending("a\r\nb\r\n").label(), "CRLF");
+        assert_eq!(crate::textenc::detect_line_ending("a\nb\n").label(), "LF");
+        let mixed = crate::textenc::detect_line_ending("a\r\nb\nc\n").label();
+        assert!(mixed.contains("LF") && mixed.contains("混在"), "内訳を出す: {mixed}");
+    }
+
+    // ── GAP5: レビューコメントの受け取りは 1 回だけ ────────────────
+
+    /// 描画結果 (シェイプ) から `needle` を含むテキストの矩形を探す。
+    /// ボタンの id を知らなくても「そのボタンを押す」ことができる。
+    fn text_rect(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Rect> {
+        fn walk(sh: &egui::Shape, needle: &str, out: &mut Option<egui::Rect>) {
+            match sh {
+                egui::Shape::Text(t) => {
+                    if out.is_none() && t.galley.job.text.contains(needle) {
+                        *out = Some(egui::Rect::from_min_size(t.pos, t.galley.size()));
+                    }
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, needle, out)),
+                _ => {}
+            }
+        }
+        let mut out = None;
+        for c in shapes {
+            walk(&c.shape, needle, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn レビューコメントの受け取りは一度きり() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        let files = crate::diff::parse_unified(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        );
+        assert!(!files.is_empty(), "前提: 差分がパースできる");
+
+        // 「エージェントに送る」が押せる状態のコメントストア
+        let mut store = crate::diff::DiffCommentStore::default();
+        store.add(
+            crate::diff::CommentAnchor::new("a.rs", crate::diff::CommentSide::New, 1),
+            "new",
+            "ここを直して",
+        );
+        assert!(!store.prompt().is_empty(), "前提: 追いプロンプトが作れる");
+
+        // panels.rs / race.rs と同じ呼び方 (diff_ui) を再現する。
+        // ストアは diff_ui が自分で読む場所へ毎フレーム置き直す。
+        let draw = |events: Vec<egui::Event>| -> Vec<egui::epaint::ClippedShape> {
+            let raw = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let store = store.clone();
+            ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let id = ui.id().with("zv-diff-comments");
+                    ui.data_mut(|d| d.insert_temp(id, store.clone()));
+                    crate::diff::diff_ui(ui, &theme, &files);
+                });
+            })
+            .shapes
+        };
+        let click = |at: egui::Pos2, pressed: bool| -> Vec<egui::Event> {
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+
+        // 1 フレーム描いてボタンの位置を得る
+        let shapes = draw(Vec::new());
+        let btn = text_rect(&shapes, &tr("エージェントに送る"))
+            .expect("「エージェントに送る」ボタンが描かれている");
+
+        // 押していないうちは何も積まれない (誤爆しない)
+        assert!(
+            crate::diff::take_pending_review_prompt(&ctx).is_none(),
+            "押していないのにプロンプトが積まれた"
+        );
+
+        // 押して離す = diff_ui が ctx へ 1 件積む
+        let _ = draw(click(btn.center(), true));
+        let _ = draw(click(btn.center(), false));
+
+        let first = crate::diff::take_pending_review_prompt(&ctx)
+            .expect("押したらプロンプトが積まれる");
+        assert!(first.contains("ここを直して"), "コメント本文が入る: {first}");
+        assert!(first.contains("a.rs"), "対象ファイルが入る: {first}");
+
+        // 2 回目以降は取れない = 毎フレーム拾っても入力欄へ二重に入らない
+        for _ in 0..3 {
+            assert!(
+                crate::diff::take_pending_review_prompt(&ctx).is_none(),
+                "同じレビューコメントを 2 回受け取ってはいけない"
+            );
+        }
+
+        // 受け取り側 (入力欄) も 1 回ぶんだけ増える
+        let mut buf = crate::agent_input::AgentInputBuffer::new();
+        assert!(buf.append_prompt(&first));
+        let after_one = buf.text().to_string();
+        for _ in 0..3 {
+            if let Some(p) = crate::diff::take_pending_review_prompt(&ctx) {
+                buf.append_prompt(&p);
+            }
+        }
+        assert_eq!(buf.text(), after_one, "追いプロンプトが増殖していない");
+    }
+
+    #[test]
+    fn 空のプロンプトは入力欄へ入れない() {
+        // take_pending_review_prompt は空文字を弾く (空の追いプロンプトを作らない)
+        let ctx = egui::Context::default();
+        assert!(crate::diff::take_pending_review_prompt(&ctx).is_none());
+        // AgentInputBuffer 側も空は拒否する = 二重の歯止め
+        let mut b = crate::agent_input::AgentInputBuffer::new();
+        assert!(!b.append_prompt("   \n  "));
+        assert!(b.append_prompt("直して"));
+        assert_eq!(b.text(), "直して");
     }
 }

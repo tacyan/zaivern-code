@@ -5,9 +5,10 @@
 //! 選ばれた操作を `Cmd` として返す。実処理はすべて app.rs の `apply_cmd` が担う。
 //! ショートカット表記は実際のキーバインド (config.toml の上書き込み) に追従する。
 
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use crate::keybinds::{format_shortcut, BindAction, Keybinds};
 use crate::palette::Cmd;
+use crate::textenc::LineEnding;
 use std::path::{Path, PathBuf};
 
 /// メニューの表示状態スナップショット。描画のためだけの読み取り専用情報。
@@ -38,6 +39,12 @@ pub struct MenuInfo {
     pub agent_presets: Vec<(usize, String, String)>,
     /// (テーマ name, ラベル, 選択中か)。カスタムテーマも同じ形で混ぜる
     pub themes: Vec<(String, String, bool)>,
+    /// アクティブなタブの改行コード表示 (例 "CRLF")。タブが無ければ None
+    pub line_ending: Option<String>,
+    /// 保存時に行末の空白を落とす (編集メニューのチェック状態)
+    pub trim_trailing_on_save: bool,
+    /// 保存時に最終行へ改行を入れる (同上)
+    pub final_newline_on_save: bool,
     /// ビルドタスクのラベル (検出できたときだけ Some。例 "cargo build")
     pub build_task: Option<String>,
     /// アクティブファイルの実行コマンドラベル (例 "python3 main.py")
@@ -212,9 +219,52 @@ fn edit_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         if item(ui, &tr("ファイル間で検索"), &sc(keys, BindAction::GlobalSearch), true) {
             cmds.push(Cmd::GlobalSearch);
         }
+        if item(ui, &tr("ファイル間で置換"), &sc(keys, BindAction::GlobalReplace), true) {
+            cmds.push(Cmd::GlobalReplace);
+        }
         ui.separator();
         if item(ui, &tr("行コメントの切り替え"), &sc(keys, BindAction::ToggleComment), ed) {
             cmds.push(Cmd::ToggleLineComment);
+        }
+        ui.separator();
+        // 改行コード: いまの様式をラベルに出し、押した先へ揃える
+        ui.menu_button(
+            trf(
+                "改行コードを変換 (現在: {le})",
+                &[("le", info.line_ending.clone().unwrap_or_else(|| tr("なし")))],
+            ),
+            |ui| {
+                ui.set_min_width(240.0);
+                for (le, label) in [
+                    (LineEnding::Lf, "LF (Unix)"),
+                    (LineEnding::Crlf, "CRLF (Windows)"),
+                    (LineEnding::Cr, "CR (旧 Mac)"),
+                ] {
+                    if item(ui, &tr(label), "", ed) {
+                        cmds.push(Cmd::ConvertLineEnding(le));
+                        ui.close_menu();
+                    }
+                }
+            },
+        );
+        ui.separator();
+        // 保存時のクリーンアップ。いまは egui memory に持っている
+        // (config.toml へ移すのは config.rs 側の担当が空いてから)
+        let trim = if info.trim_trailing_on_save {
+            tr("✓ 保存時に末尾空白を除去")
+        } else {
+            tr("保存時に末尾空白を除去")
+        };
+        if item(ui, &trim, "", true) {
+            cmds.push(Cmd::ToggleTrimTrailingOnSave);
+        }
+        let fnl = if info.final_newline_on_save {
+            tr("✓ 保存時に最終行へ改行を入れる")
+        } else {
+            tr("保存時に最終行へ改行を入れる")
+        };
+        if item(ui, &fnl, "", true) {
+            cmds.push(Cmd::ToggleFinalNewlineOnSave);
         }
     });
 }
@@ -319,6 +369,9 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         if item(ui, &tr("検索"), &sc(keys, BindAction::GlobalSearch), true) {
             cmds.push(Cmd::GlobalSearch);
         }
+        if item(ui, &tr("セッション (過去の会話)"), "", true) {
+            cmds.push(Cmd::ShowSessions);
+        }
         if item(ui, &tr("ソース管理"), "", true) {
             cmds.push(Cmd::OpenGitPanel);
         }
@@ -327,6 +380,10 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         }
         if item(ui, &tr("拡張機能 (プラグイン)"), "", true) {
             cmds.push(Cmd::ShowPlugins);
+        }
+        ui.separator();
+        if item(ui, &tr("プラン使用量"), "", true) {
+            cmds.push(Cmd::ShowQuota);
         }
         ui.separator();
         let prob = if info.problems_open {

@@ -174,6 +174,25 @@ pub enum Cmd {
     ShowShortcuts,
     /// バージョン情報ダイアログ
     ShowAbout,
+    // ── 横断検索のオプション (サイドバーの検索タブと同じ状態を切り替える) ──
+    /// 大文字小文字を区別する
+    ToggleSearchCase,
+    /// 単語単位で検索する
+    ToggleSearchWholeWord,
+    /// 正規表現として検索する
+    ToggleSearchRegex,
+    /// 検索タブを置換行を開いた状態で表示する (VS Code: ⇧⌘H)
+    GlobalReplace,
+    /// サイドバーの「セッション」タブ (フォルダごとの過去の会話) を開く
+    ShowSessions,
+    /// プラン使用量・枯渇予測のウィンドウを開く
+    ShowQuota,
+    /// 保存時に行末の空白を落とす (切替)
+    ToggleTrimTrailingOnSave,
+    /// 保存時に最終行へ改行を入れる (切替)
+    ToggleFinalNewlineOnSave,
+    /// アクティブなファイルの改行コードを揃える
+    ConvertLineEnding(crate::textenc::LineEnding),
 }
 
 #[derive(Clone)]

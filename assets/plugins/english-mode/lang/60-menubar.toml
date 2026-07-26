@@ -157,3 +157,16 @@
 "問題パネルの切替" = "Toggle Problems Panel"
 "フルスクリーンの切替" = "Toggle Full Screen"
 "GitHub パネルを開く" = "Open GitHub Panel"
+
+# ── 編集 / 表示メニュー: ファイル間の置換・改行コード・保存時のクリーンアップ ──
+"ファイル間で置換" = "Replace in Files"
+"改行コードを変換 (現在: {le})" = "Convert Line Endings (current: {le})"
+"LF (Unix)" = "LF (Unix)"
+"CRLF (Windows)" = "CRLF (Windows)"
+"CR (旧 Mac)" = "CR (Classic Mac)"
+"保存時に末尾空白を除去" = "Trim Trailing Whitespace on Save"
+"✓ 保存時に末尾空白を除去" = "✓ Trim Trailing Whitespace on Save"
+"保存時に最終行へ改行を入れる" = "Insert Final Newline on Save"
+"✓ 保存時に最終行へ改行を入れる" = "✓ Insert Final Newline on Save"
+"セッション (過去の会話)" = "Sessions (Past Conversations)"
+"プラン使用量" = "Plan Usage"

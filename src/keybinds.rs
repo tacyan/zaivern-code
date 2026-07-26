@@ -63,10 +63,12 @@ pub enum BindAction {
     ToggleProblems,
     /// フルスクリーン (VS Code: ⌃⌘F)
     ToggleFullScreen,
+    /// ワークスペース全体の置換 (VS Code: ⇧⌘H)
+    GlobalReplace,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 36] = [
+const ALL_ACTIONS: [BindAction; 37] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -103,6 +105,7 @@ const ALL_ACTIONS: [BindAction; 36] = [
     BindAction::RunBuildTask,
     BindAction::ToggleProblems,
     BindAction::ToggleFullScreen,
+    BindAction::GlobalReplace,
 ];
 
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
@@ -138,6 +141,8 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::NextTab => KeyboardShortcut::new(cmd_shift, Key::CloseBracket),
         BindAction::PrevTab => KeyboardShortcut::new(cmd_shift, Key::OpenBracket),
         BindAction::GlobalSearch => KeyboardShortcut::new(cmd_shift, Key::F),
+        // VS Code の「ファイル間で置換」と同じ ⇧⌘H。既存の割り当てとは重ならない
+        BindAction::GlobalReplace => KeyboardShortcut::new(cmd_shift, Key::H),
         BindAction::OpenReplace => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::F),
         BindAction::NewTerminal => {
             KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Backtick)
@@ -217,6 +222,7 @@ impl Keybinds {
             "next_tab" => NextTab,
             "prev_tab" => PrevTab,
             "global_search" => GlobalSearch,
+            "global_replace" => GlobalReplace,
             "open_replace" => OpenReplace,
             "new_terminal" => NewTerminal,
             "nav_back" => NavBack,
