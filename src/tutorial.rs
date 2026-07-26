@@ -91,6 +91,8 @@ pub enum AnchorId {
     CockpitButton,
     /// フリート看板ボタン
     KanbanButton,
+    /// ツールバーの「デッキ」ボタン (縦 1 本のエージェント管理)。
+    DeckButton,
     /// サイドバーのセッション (過去の会話) タブ
     SessionsTab,
     /// サイドバーの Git タブ
@@ -130,6 +132,7 @@ impl AnchorId {
             PermissionMode => "permission_mode",
             CockpitButton => "cockpit_button",
             KanbanButton => "kanban_button",
+            DeckButton => "deck_button",
             SessionsTab => "sessions_tab",
             GitTab => "git_tab",
             GitHubTab => "github_tab",
@@ -159,6 +162,7 @@ pub const ALL_ANCHORS: &[AnchorId] = &[
     AnchorId::PermissionMode,
     AnchorId::CockpitButton,
     AnchorId::KanbanButton,
+    AnchorId::DeckButton,
     AnchorId::SessionsTab,
     AnchorId::GitTab,
     AnchorId::GitHubTab,
@@ -239,6 +243,8 @@ pub enum TutorialAction {
     ShowCockpit,
     /// フリート看板を開く
     ShowKanban,
+    /// エージェントデッキ (縦 1 本) を開く
+    ShowDeck,
     /// コマンドパレットを開く (コマンドモード)
     OpenPalette,
     /// プロンプトレースの開始フォームを開く
@@ -411,6 +417,15 @@ pub const STEPS: &[Step] = &[
         body: "走っている全エージェントがライブ端末のグリッドで並び、上の入力欄から全員へ一斉送信できます。\n停滞・ループ・異常終了は見張りが検知してあなたへ上げます (勝手に打ち込みはしません)。\n「💡 スーパーエージェント」で 1 体を指揮官に指名することもできます。",
         hint: Some("⌘⇧C"),
         pre_action: Some(TutorialAction::ShowCockpit),
+    },
+    Step {
+        id: "deck",
+        chapter: Chapter::Agents,
+        anchor: Some(AnchorId::DeckButton),
+        title: "エージェントデッキ",
+        body: "稼働中・過去のセッション・新規起動を縦 1 本にまとめた画面です。\n↑↓ で選ぶと右 (狭い画面では下) にその端末が出ます。\n積み上げモードにすると複数のセッションを上下に同時表示できます。",
+        hint: None,
+        pre_action: Some(TutorialAction::ShowDeck),
     },
     Step {
         id: "kanban",

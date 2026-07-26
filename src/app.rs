@@ -8574,6 +8574,26 @@ impl ZaivernApp {
             cmds.push(Cmd::ToggleKanban);
         }
 
+        // エージェントデッキ (縦 1 本)。Cockpit=格子 / 看板=レーン と並べて
+        // 「もう 1 つの見方」として同じ場所から選べるようにする。
+        let deck = ui.selectable_label(
+            self.deck,
+            RichText::new(if compact {
+                "▤".to_string()
+            } else {
+                tr("▤ デッキ")
+            }),
+        );
+        tutorial::anchor(ui.ctx(), AnchorId::DeckButton, deck.rect);
+        if deck
+            .on_hover_text(tr(
+                "エージェントデッキ — 稼働中と過去のセッションを縦 1 本で管理",
+            ))
+            .clicked()
+        {
+            cmds.push(Cmd::ToggleDeck);
+        }
+
         let new_agent = ui.menu_button(if compact { "👾＋" } else { "👾 Agent ＋" }, |ui| {
             for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
                 if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
@@ -17409,6 +17429,14 @@ impl ZaivernApp {
             TA::ShowKanban => {
                 self.kanban = true;
                 self.cockpit = false;
+                self.deck = false;
+                self.agents.panel_open = true;
+                self.approvals_view = false;
+            }
+            TA::ShowDeck => {
+                self.deck = true;
+                self.cockpit = false;
+                self.kanban = false;
                 self.agents.panel_open = true;
                 self.approvals_view = false;
             }
