@@ -70,6 +70,10 @@ pub struct SupervisorConfig {
     pub error_min_count: u32,
     /// 1 秒あたりの新規エラー行数のしきい値。
     pub error_rate_per_sec: f32,
+    /// 窓内の新規行のうちエラー行が占める割合の下限 (0.0..=1.0)。
+    /// 画面の語を数えるだけでは正常な作業を嵐と誤認するので、
+    /// 「エラーでない出力＝進捗が出ていない」ことの裏取りに使う。
+    pub error_share_min: f32,
     /// エラー判定パターン (小文字化した正規化行に対する部分一致)。多言語対応のためデータ駆動。
     pub error_patterns: Vec<String>,
     /// エラー判定から除外するパターン ("0 errors" 等の誤爆防止)。
@@ -146,8 +150,10 @@ impl Default for SupervisorConfig {
             loop_block_lines: 4,
 
             error_window_secs: 60,
-            error_min_count: 12,
+            // 画面の語だけを根拠に人を呼ばない。数も割合も揃って初めて嵐とする。
+            error_min_count: 20,
             error_rate_per_sec: 0.5,
+            error_share_min: 0.5,
             error_patterns: default_error_patterns(),
             error_exclude_patterns: default_error_excludes(),
 
@@ -186,6 +192,8 @@ pub fn default_error_patterns() -> Vec<String> {
         "error",
         "fatal",
         "panic",
+        // 語境界で見るので活用形は個別に持つ (Rust の "thread ... panicked at ...")。
+        "panicked",
         "traceback",
         "exception",
         "failed",
@@ -559,6 +567,9 @@ pub struct Sample {
     pub block_hash: u64,
     /// 前回サンプル以降に新しく現れたエラー行数。
     pub new_error_lines: u32,
+    /// 前回サンプル以降に新しく現れた行数 (エラー行を含む)。
+    /// 「出力のうちどれだけがエラーか」= 進捗の裏取りに使う。
+    pub new_lines: u32,
     /// 前回サンプル以降の出力バイト数 (推定可)。
     pub bytes_delta: u64,
     /// この時点で承認待ちだったか。
@@ -681,15 +692,134 @@ pub fn normalize_line(line: &str, keep_digits: bool) -> String {
     out
 }
 
+/// 語を構成する文字か (ASCII 英数字と `_`)。
+/// UTF-8 の継続バイト (>= 0x80) は語構成文字ではないので、CJK の語は
+/// そのまま「前後が境界」と判定できる。
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// 複合語の**末尾**として現れたエラー語 ("ValueError:" 等) を認めてよい直後の文字。
+/// `(` や `=` は「コードを書いている」側なので入れない (`handleError(` を拾わない)。
+const COMPOUND_TAIL_OK: &[u8] = b" \t:;,.)]}\"'";
+
+/// パス的トークンを置き換える標識。語境界として働き、かつ隣接語が偶然
+/// つながって多語パターン ("no such file") に当たるのも防ぐ。
+const PATH_TOKEN_MARK: &str = "/";
+
+/// `needle` が `hay` に**エラー語として**含まれるか。
+///
+/// 単純な `contains` だと `errorlevel` / `error_handling` / `errors.rs` が
+/// `error` に当たり、正常な作業がエラー扱いされる (これが誤検出の主因だった)。
+/// 一方で `ValueError:` や `NullPointerException` は本物の診断行なので落とせない。
+/// そこで:
+///
+/// - 前後が語構成文字でなければ一致 (`error: boom` / `エラー:`)。
+/// - 直前が英字の**複合語末尾**は、直後が [`COMPOUND_TAIL_OK`] のときだけ一致
+///   (`valueerror:` は拾い、`handleerror(` は拾わない)。
+/// - 直後が語構成文字なら常に不一致 (`errorlevel` / `error_handling` / `errors`)。
+///
+/// 境界規則そのものは [`crate::kanban::contains_word`] と同じ考え方だが、
+/// kanban が supervisor を呼ぶ側なので逆向きの依存を作らないよう独立に持つ。
+/// 両者が食い違わないことはテスト `語境界の規則は_kanban_と一致する` で固定する。
+fn contains_error_word(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() || hay.is_empty() {
+        return false;
+    }
+    let b = hay.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(needle) {
+        let at = from + rel;
+        let end = at + needle.len();
+        let after = b.get(end).copied();
+        let after_ok = after.map(|c| !is_word_byte(c)).unwrap_or(true);
+        if after_ok {
+            match at.checked_sub(1).map(|i| b[i]) {
+                None => return true,
+                Some(c) if !is_word_byte(c) => return true,
+                // 複合語の末尾 (ValueError / NullPointerException)
+                Some(c) if c.is_ascii_alphabetic() => {
+                    if after.map(|n| COMPOUND_TAIL_OK.contains(&n)).unwrap_or(true) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        from = at + 1;
+        while from < hay.len() && !hay.is_char_boundary(from) {
+            from += 1;
+        }
+        if from >= hay.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// トークンがファイル / ディレクトリのパスらしいか。
+/// 拡張子の一覧は持たない (OS・言語非依存)。`/` と `\` の両方を見るので
+/// どの OS のログでも同じ判定になる。
+///
+/// [`crate::kanban::looks_like_path`] と同じ規則 (依存の向きを増やさないため写し)。
+fn is_path_token(tok: &str) -> bool {
+    let t = tok.trim_matches(|c: char| {
+        !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.' && c != '_' && c != '-'
+    });
+    if t.len() < 3 || t.contains(char::is_whitespace) {
+        return false;
+    }
+    if !t.chars().any(char::is_alphanumeric) {
+        return false;
+    }
+    if t.contains('/') || t.contains('\\') {
+        return true;
+    }
+    // "foo.rs" 形式: 最後の '.' の前後に中身があり、拡張子が短い英数字
+    match t.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 8
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// パスらしいトークンを標識に置き換えた行を返す。
+///
+/// 「行にパスが含まれるなら無視」ではない点が肝。本物のエラー行はたいてい
+/// パスも一緒に出す (`error[e#]: ... --> src/main.rs:#:#`) ので、
+/// **エラー語自身がパスの一部**のときだけ落とす。
+fn mask_path_tokens(normalized: &str) -> String {
+    let mut out = String::with_capacity(normalized.len());
+    for tok in normalized.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        if is_path_token(tok) {
+            out.push_str(PATH_TOKEN_MARK);
+        } else {
+            out.push_str(tok);
+        }
+    }
+    out
+}
+
 /// エラーっぽい行か。パターンはデータ駆動 (英語決め打ちにしない)。
+///
+/// 画面の文字を数えるだけなので、**語境界**と**パス除外**を通さないと
+/// `Read(src/error_handling.rs)` のような正常な作業行まで数えてしまう。
 pub fn is_error_line(normalized: &str, cfg: &SupervisorConfig) -> bool {
     if normalized.is_empty() {
         return false;
     }
+    let masked = mask_path_tokens(normalized);
     let hit = cfg
         .error_patterns
         .iter()
-        .any(|p| normalized.contains(p.as_str()));
+        .any(|p| contains_error_word(&masked, p.as_str()));
     if !hit {
         return false;
     }
@@ -699,12 +829,12 @@ pub fn is_error_line(normalized: &str, cfg: &SupervisorConfig) -> bool {
     let starts_with_error = cfg
         .error_patterns
         .iter()
-        .any(|p| normalized.starts_with(p.as_str()));
+        .any(|p| masked.starts_with(p.as_str()));
     if !starts_with_error
         && cfg
             .error_exclude_patterns
             .iter()
-            .any(|p| normalized.contains(p.as_str()))
+            .any(|p| masked.contains(p.as_str()))
     {
         return false;
     }
@@ -869,7 +999,17 @@ pub fn detect_loop(samples: &[Sample], cfg: &SupervisorConfig, now_ms: u64) -> O
     }
 }
 
-/// **エラー嵐**: 新規エラー行の発生率がしきい値を超えた。
+/// **エラー嵐**: 新規エラー行の発生率がしきい値を超え、かつ
+/// **エラー以外の進捗が出ていない**。
+///
+/// 画面のエラー語だけを数えると、テストの `FAILED` 行や引用された診断を読んでいる
+/// だけの正常なエージェントまで「エラー多発」になる (実際になった)。そこで
+/// kanban 側と同じく裏取りを要求する: 窓内の新規行のうちエラー行が
+/// `error_share_min` 以上を占めていること。
+///
+/// 「意味的な進捗 (`content_hash` の変化) が無いこと」を条件にはできない。
+/// エラーが噴き出している間は画面が変わり続けるので、それでは本物の嵐まで
+/// 消えてしまう。**エラーでない新規行が出ているか**が、ここでの進捗の定義。
 pub fn detect_error_storm(
     samples: &[Sample],
     cfg: &SupervisorConfig,
@@ -892,16 +1032,23 @@ pub fn detect_error_storm(
         return None;
     }
     let rate = total as f32 / (span_ms as f32 / 1000.0);
-    if rate >= cfg.error_rate_per_sec {
-        Some(format!(
-            "エラー行が {:.1} 行/秒 (直近 {} 秒で {} 行) 出ています",
-            rate,
-            span_ms / 1000,
-            total
-        ))
-    } else {
-        None
+    if rate < cfg.error_rate_per_sec {
+        return None;
     }
+    // エラー行は新規行の部分集合なので、行数が取れていない (0 の) サンプル列でも
+    // total で下駄を履かせれば「割合 1.0」= 従来どおりの判定に落ちる。
+    let new_total: u32 = win.iter().map(|s| s.new_lines).sum::<u32>().max(total);
+    let share = total as f32 / new_total.max(1) as f32;
+    if share < cfg.error_share_min.clamp(0.0, 1.0) {
+        return None; // エラー以外の出力が進んでいる = まだ仕事は流れている
+    }
+    Some(format!(
+        "エラー行が {:.1} 行/秒 (直近 {} 秒で {} 行 / 新規 {} 行) 出ています",
+        rate,
+        span_ms / 1000,
+        total,
+        new_total
+    ))
 }
 
 /// **異常終了**: 作業中 / 承認待ちのままプロセスが落ちた。
@@ -1404,6 +1551,13 @@ impl Supervisor {
             .iter()
             .filter(|h| !mon.seen_lines.contains(*h))
             .count() as u32;
+        // 新規行の総数 (エラー嵐の裏取り = 「エラー以外の進捗」の有無に使う)。
+        // `note_lines` より前に数える必要がある。
+        let new_lines = a
+            .line_hashes
+            .iter()
+            .filter(|h| !mon.seen_lines.contains(*h))
+            .count() as u64;
         let bytes_delta = match (snap.total_output_bytes, mon.last_bytes_total) {
             (Some(t), Some(p)) => t.saturating_sub(p),
             (Some(t), None) => {
@@ -1412,11 +1566,6 @@ impl Supervisor {
             }
             _ => {
                 // PTY のバイト数が無いときは「新しく現れた行数 × 平均行長」で推定する
-                let new_lines = a
-                    .line_hashes
-                    .iter()
-                    .filter(|h| !mon.seen_lines.contains(*h))
-                    .count() as u64;
                 let avg = if a.line_hashes.is_empty() {
                     0
                 } else {
@@ -1449,6 +1598,7 @@ impl Supervisor {
             volatile_hash: a.volatile_hash,
             block_hash: a.block_hash,
             new_error_lines: new_errors,
+            new_lines: new_lines.min(u32::MAX as u64) as u32,
             bytes_delta,
             waiting: snap.waiting_approval,
         });
@@ -1793,6 +1943,7 @@ mod tests {
                 volatile_hash: a.volatile_hash,
                 block_hash: a.block_hash,
                 new_error_lines: new_err,
+                new_lines: new_lines as u32,
                 bytes_delta: new_lines * avg,
                 waiting,
             });
@@ -2022,6 +2173,178 @@ mod tests {
         assert!(!is_error_line(&normalize_line("build finished: 0 errors", false), &c));
         assert!(!is_error_line(&normalize_line("no errors found", false), &c));
         assert!(is_error_line(&normalize_line("error: boom", false), &c));
+    }
+
+    // ---------------- 誤検出 (画面の語だけで「エラー多発」にしない) ----------------
+
+    /// 正常に働いているエージェントの画面行を「エラー行」にしない。
+    /// どれも語の**部分一致**では当たってしまうものばかり。
+    #[test]
+    fn 作業中の画面行はエラー行にならない() {
+        let c = cfg();
+        let benign = [
+            "⏺ Read(src/error_handling.rs)",
+            "⏺ Update(src/errors.rs)",
+            "⏺ Bash(cat logs/error.log)",
+            "  running target/debug/deps/error_tests-1a2b3c",
+            "if %errorlevel% neq 0 goto done",
+            r"opening C:\work\zai\src\errors.rs",
+            "編集: src/エラー処理.rs",
+            "  failure_count = 0 のままにする",
+            "  handleError(err) を呼ぶ実装に変える",
+            "test kanban::tests::lane_moves ... ok",
+        ];
+        for line in benign {
+            let n = normalize_line(line, false);
+            assert!(
+                !is_error_line(&n, &c),
+                "正常な作業行をエラー扱いした: {line} → {n}"
+            );
+        }
+    }
+
+    /// 逆に、本物の診断行は落とさない。**パスを一緒に出す**のが普通なので、
+    /// 「パスを含む行は無視」にしてはいけない。
+    #[test]
+    fn 本物の診断行はパスを含んでも検出する() {
+        let c = cfg();
+        let real = [
+            "error[E0308]: mismatched types --> src/main.rs:12:5",
+            "error: could not compile `zai` (bin \"zai\") due to 1 previous error",
+            "thread 'main' panicked at src/terminal.rs:42:9: index out of bounds",
+            "Traceback (most recent call last):",
+            "ValueError: invalid literal for int() with base 10: 'x'",
+            "Exception in thread \"main\" java.lang.NullPointerException",
+            "FAILED tests/test_api.py::test_login",
+            "/usr/bin/env: 'python': No such file or directory",
+            "bash: zai: command not found",
+            "エラー: モジュール auth の読み込みに失敗",
+            r"C:\work> zai.exe : fatal: 権限がありません",
+        ];
+        for line in real {
+            let n = normalize_line(line, false);
+            assert!(
+                is_error_line(&n, &c),
+                "本物のエラー行を取りこぼした: {line} → {n}"
+            );
+        }
+    }
+
+    /// 語境界の考え方は kanban 側と同じ。違うのは意図した 2 点だけ
+    /// (識別子の `_` を境界に含める / 複合語の末尾を認める)。
+    #[test]
+    fn 語境界の規則はkanbanと揃っている() {
+        for (hay, needle) in [
+            ("error: boom", "error"),
+            ("build failed", "failed"),
+            ("エラー: 失敗しました", "エラー"),
+        ] {
+            assert!(contains_error_word(hay, needle), "{hay} / {needle}");
+            assert!(crate::kanban::contains_word(hay, needle), "{hay} / {needle}");
+        }
+        // 部分一致では当たるが語としては当たらない
+        assert!(!contains_error_word("errorlevel neq #", "error"));
+        assert!(!crate::kanban::contains_word("errorlevel neq #", "error"));
+        // supervisor だけの上乗せ: 識別子の `_` も語構成文字として扱う
+        assert!(!contains_error_word("error_handling を読む", "error"));
+        // supervisor だけの上乗せ: 複合語の**末尾**は診断行なので拾う
+        assert!(contains_error_word("valueerror: bad input", "error"));
+        assert!(!contains_error_word("handleerror(err)", "error"));
+    }
+
+    /// **再発防止の本命**: テストの失敗行が混ざっていても、エラー以外の出力が
+    /// 流れている間は「嵐」にしない (行数と発生率だけでは足りない)。
+    #[test]
+    fn エラー以外の出力が流れている間は嵐ではない() {
+        let c = cfg();
+        // 毎秒 10 行進み、そのうち 1 行が FAILED。30 秒で 30 エラー行 (1.0 行/秒)。
+        let mut body = String::new();
+        let mut screens: Vec<(u64, String)> = Vec::new();
+        for i in 0..30u64 {
+            for j in 0..10u64 {
+                // 末尾を数字で終えない (正規化で "# failed" になり集計行の除外に当たる)
+                let verdict = if j == 3 { "FAILED" } else { "ok" };
+                body.push_str(&format!("test suite::case_{i}_{j}::run ... {verdict}\n"));
+            }
+            screens.push((i * 1_000, body.clone()));
+        }
+        let refs: Vec<(u64, &str)> = screens.iter().map(|(t, s)| (*t, s.as_str())).collect();
+        let s = samples_from(&refs, &c, false);
+        let total: u32 = s.iter().map(|x| x.new_error_lines).sum();
+        assert!(
+            total >= c.error_min_count,
+            "前提: 行数と発生率のしきい値は超えている ({total} 行)"
+        );
+        assert!(
+            detect_error_storm(&s, &c, 29_000).is_none(),
+            "エラー以外の進捗が出ている間は嵐にしてはいけない"
+        );
+        // 裏取りを外せば従来どおり発火する = 止めているのは割合の条件だと示す
+        let mut loose = cfg();
+        loose.error_share_min = 0.0;
+        assert!(detect_error_storm(&s, &loose, 29_000).is_some());
+    }
+
+    /// 逆に、出力がエラーで埋まっているなら本物として検出する。
+    #[test]
+    fn 出力がエラーで埋まっていれば嵐として検出する() {
+        let c = cfg();
+        let mut body = String::new();
+        let mut screens: Vec<(u64, String)> = Vec::new();
+        for i in 0..30u64 {
+            body.push_str(&format!(
+                "thread 'worker-{i}' panicked at src/pool.rs:{i}:7: send on closed channel\n"
+            ));
+            screens.push((i * 1_000, body.clone()));
+        }
+        let refs: Vec<(u64, &str)> = screens.iter().map(|(t, s)| (*t, s.as_str())).collect();
+        let s = samples_from(&refs, &c, false);
+        assert!(
+            detect_error_storm(&s, &c, 29_000).is_some(),
+            "本物のパニック連発は検出できなければならない"
+        );
+    }
+
+    /// はしご (通知 / nudge) まで通した回帰テスト。
+    /// エラー語を含むパスを触り続けるだけのエージェントに介入してはいけない。
+    #[test]
+    fn エラー語を含むファイルを編集するだけでは介入しない() {
+        let mut c = cfg();
+        c.loop_engineering_enabled = false; // ここでは見張りの判定だけを見る
+        let mut sv = Supervisor::new(c);
+        let mut body = String::new();
+        let mut intents = Vec::new();
+        for i in 0..40u64 {
+            // 行ごとに別語にする (数字は正規化で潰れ、同じ画面 = ループ扱いになる)
+            let tag = format!(
+                "{}{}",
+                (b'a' + (i / 26) as u8) as char,
+                (b'a' + (i % 26) as u8) as char
+            );
+            let line = match i % 4 {
+                0 => format!("⏺ Read(src/error_handling.rs) — 区間 {tag}"),
+                1 => format!("⏺ Update(src/errors.rs) — hunk {tag}"),
+                2 => format!("⏺ Grep(src/error_codes.rs) — 一致 {tag}"),
+                _ => format!("test kanban::tests::case_{tag} ... ok"),
+            };
+            body.push_str(&line);
+            body.push('\n');
+            intents.extend(sv.tick_ms(&[snap(1, &body, true, false)], Approval::Auto, i * 1_000));
+        }
+        assert_eq!(
+            sv.state_of(1),
+            Some(SessionState::Working),
+            "作業中のエージェントを異常扱いしてはいけない"
+        );
+        let storm: Vec<_> = intents
+            .iter()
+            .filter(|i| i.anomaly == Anomaly::ErrorStorm)
+            .collect();
+        assert!(
+            storm.is_empty(),
+            "通知/介入まで昇ってしまった: {:?}",
+            storm.iter().map(|i| i.reason.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
