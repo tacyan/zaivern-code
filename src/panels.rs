@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use eframe::egui::{self, RichText};
 
@@ -24,6 +25,7 @@ use crate::github::{self, GhOutcome, GhRequest, Issue, PullRequest, RepoInfo};
 use crate::i18n::{tr, trf};
 use crate::ide;
 use crate::palette::Cmd;
+use crate::session_picker::{self, PastSession, SidebarAction, SidebarState};
 use crate::theme::Theme;
 
 /// 一覧の取得件数上限 (gh 側でも clamp される)。
@@ -704,6 +706,265 @@ pub fn open_in_ide(
     }
 }
 
+// ═══════════════════════ セッションサイドバー ═══════════════════════
+//
+// 形: フォルダを見出しにして、その下に過去の AI 会話を新しい順で並べる。
+//
+//   📁 zaivern-code                              ⋮  ＋
+//    ● 👾 ガター描画のちらつきを直したい            2日
+//      🚀 セッション一覧のサイドバーを作る          4日
+//      すべて表示 (34)
+//
+// 【設計】
+// - 走査は session_picker::SidebarState がバックグラウンドで回す。ここは
+//   キャッシュを読んで描くだけで、フレーム内でファイルシステムに触らない。
+// - 行左の点は **未読ではない**。どの保存先も既読/未読を持たないため、
+//   「24 時間以内に更新された会話」を意味する (ツールチップでもそう説明する)。
+// - エージェントのアイコンは agents.rs のカタログから引く (直書きしない)。
+
+/// セッションサイドバー本体。押された操作を 1 つだけ返す。
+///
+/// # 配線契約 (app.rs 側)
+///
+/// - 置き場所: 左サイドバーの **「セッション」タブ** の中身。
+///   タブを開いていないフレームでは呼ばないこと (呼ばなければ走査も走らない)。
+/// - `folders`: `session_picker::sidebar_folders(&open_roots, &menu_state.folders())` の結果。
+///   すなわち **開いているルートが先、その後ろに MRU (重複除去・実在するものだけ)**。
+/// - [`SidebarAction::Resume`] は `session_picker::resume_command(&preset_command, &s)` で
+///   コマンドを組み立ててから、通常のエージェント起動経路
+///   (`agents::merged_env` → `terminal::SpawnSpec`、cwd は `s.cwd`) へ渡す。
+/// - [`SidebarAction::NewConversation`] はそのフォルダを cwd にして素のプリセットを起動する。
+// app.rs への配線は後続ウェーブ (app.rs は別エージェントが編集中のため触らない)。
+#[allow(dead_code)]
+pub fn sessions_sidebar_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    state: &mut SidebarState,
+    folders: &[PathBuf],
+) -> SidebarAction {
+    // 完了した走査の取り込みと、必要なら次の走査の起動 (どちらも UI を止めない)。
+    state.refresh_if_stale(folders);
+
+    if folders.is_empty() {
+        empty_state(ui, theme, false, &tr("フォルダが開かれていません"));
+        return SidebarAction::None;
+    }
+
+    let now = SystemTime::now();
+    let mut action = SidebarAction::None;
+    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+    if state.scroll > 0.0 {
+        scroll = scroll.vertical_scroll_offset(state.scroll);
+    }
+    let out = scroll.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for folder in folders {
+            let act = folder_group_ui(ui, theme, state, folder, now);
+            if act != SidebarAction::None && action == SidebarAction::None {
+                action = act;
+            }
+            ui.add_space(6.0);
+        }
+        if state.loading() && state.is_empty() {
+            empty_state(ui, theme, true, "");
+        }
+    });
+    state.scroll = out.state.offset.y;
+    // 折りたたみ / 「すべて表示」は内部状態なので呼び出し側へは返さない。
+    action
+}
+
+/// フォルダ 1 つぶん (見出し + セッション行 + 「すべて表示」)。
+fn folder_group_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    state: &mut SidebarState,
+    folder: &Path,
+    now: SystemTime,
+) -> SidebarAction {
+    let mut action = SidebarAction::None;
+    let mut toggle_collapse = false;
+    let mut toggle_show_all = false;
+    let collapsed = state.is_collapsed(folder);
+    let (rows, hidden) = state.visible_sessions(folder);
+    let total = state.sessions_for(folder).len();
+
+    // ── 見出し行 ──────────────────────────────────────────────
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let arrow = if collapsed { "▸" } else { "▾" };
+        let head = format!("{arrow} 📁 {}", root_label(folder));
+        let title = ui.add(
+            egui::Label::new(RichText::new(head).color(theme.text).size(12.0).strong())
+                .truncate()
+                .selectable(false)
+                .sense(egui::Sense::click()),
+        );
+        if title.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if title
+            .on_hover_text(folder.display().to_string())
+            .clicked()
+        {
+            toggle_collapse = true;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new(RichText::new("＋").size(12.0)).frame(false))
+                .on_hover_text(tr("新しい会話"))
+                .clicked()
+            {
+                action = SidebarAction::NewConversation(folder.to_path_buf());
+            }
+            ui.menu_button(RichText::new("⋮").size(12.0), |ui| {
+                if ui.button(tr("フォルダを表示")).clicked() {
+                    action = SidebarAction::RevealFolder(folder.to_path_buf());
+                    ui.close_menu();
+                }
+                if ui.button(tr("一覧から外す")).clicked() {
+                    action = SidebarAction::CloseFolder(folder.to_path_buf());
+                    ui.close_menu();
+                }
+                ui.separator();
+                let label = if collapsed {
+                    tr("展開する")
+                } else {
+                    tr("折りたたむ")
+                };
+                if ui.button(label).clicked() {
+                    toggle_collapse = true;
+                    ui.close_menu();
+                }
+            });
+        });
+    });
+
+    // ── セッション行 ──────────────────────────────────────────
+    if !collapsed {
+        if rows.is_empty() {
+            ui.indent(("zv-sess-empty", folder), |ui| {
+                let msg = if state.loading() {
+                    tr("読み込み中…")
+                } else {
+                    tr("過去の会話はまだありません")
+                };
+                ui.label(RichText::new(msg).color(theme.text_dim).size(10.5));
+            });
+        }
+        for (i, s) in rows.iter().enumerate() {
+            if session_row_ui(ui, theme, s, now, (folder, i)) && action == SidebarAction::None {
+                action = SidebarAction::Resume(s.clone());
+            }
+        }
+        if hidden > 0 || state.is_show_all(folder) {
+            let label = if state.is_show_all(folder) {
+                tr("折りたたむ")
+            } else {
+                trf("すべて表示 ({n})", &[("n", total.to_string())])
+            };
+            ui.indent(("zv-sess-more", folder), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(label).color(theme.accent).size(11.0))
+                            .frame(false),
+                    )
+                    .clicked()
+                {
+                    toggle_show_all = true;
+                }
+            });
+        }
+    }
+
+    if toggle_collapse {
+        state.toggle_collapsed(folder);
+    }
+    if toggle_show_all {
+        state.toggle_show_all(folder);
+    }
+    action
+}
+
+/// セッション 1 行。クリックされたら true。
+fn session_row_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    s: &PastSession,
+    now: SystemTime,
+    key: (&Path, usize),
+) -> bool {
+    let fresh = session_picker::is_fresh(now, s);
+    let age = session_picker::relative_age(now, s.modified);
+    let title = if s.summary.is_empty() {
+        tr("(要約なし)")
+    } else {
+        s.summary.clone()
+    };
+    let resp = egui::Frame::none()
+        .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+        .rounding(5.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let dot = if fresh { "●" } else { " " };
+                ui.add(
+                    egui::Label::new(RichText::new(dot).color(theme.accent).size(8.0))
+                        .selectable(false),
+                );
+                ui.add(
+                    egui::Label::new(RichText::new(agent_mark(&s.agent_bin)).size(11.0))
+                        .selectable(false),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&age).color(theme.text_dim).size(10.5))
+                            .selectable(false),
+                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&title).color(theme.text).size(11.5),
+                            )
+                            .truncate()
+                            .selectable(false),
+                        );
+                    });
+                });
+            });
+        })
+        .response;
+    let hit = ui.interact(
+        resp.rect,
+        ui.id().with(("zv-sess-row", key.0, key.1)),
+        egui::Sense::click(),
+    );
+    if hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let hover = if fresh {
+        trf(
+            "{title}\nクリックで再開 (● = 24 時間以内に更新)",
+            &[("title", title.clone())],
+        )
+    } else {
+        trf("{title}\nクリックで再開", &[("title", title.clone())])
+    };
+    hit.on_hover_text(hover).clicked()
+}
+
+/// エージェントの見分けマーク。カタログのアイコン、無ければ bin の頭文字。
+fn agent_mark(bin: &str) -> String {
+    match crate::agents::spec_for_bin(bin) {
+        Some(spec) if !spec.icon.is_empty() => spec.icon.to_string(),
+        _ => bin
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "?".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,6 +1335,31 @@ mod tests {
                 "未検出の IDE が項目に混ざっている: {label}"
             );
         }
+    }
+
+    // ── セッションサイドバー ─────────────────────────────────────
+
+    #[test]
+    fn agent_mark_comes_from_catalog_not_literals() {
+        // カタログに載っている bin はアイコンをそのまま使う
+        for bin in ["claude", "codex", "agy"] {
+            let spec = crate::agents::spec_for_bin(bin).expect("カタログに無い");
+            assert_eq!(agent_mark(bin), spec.icon);
+            assert!(!agent_mark(bin).is_empty());
+        }
+        // 3 エージェントが並んでも見分けが付く (アイコンが衝突していない)
+        let marks: Vec<String> = ["claude", "codex", "agy"].iter().map(|b| agent_mark(b)).collect();
+        let uniq: std::collections::HashSet<&String> = marks.iter().collect();
+        assert_eq!(uniq.len(), marks.len(), "アイコンが重複している: {marks:?}");
+        // 未知の bin は頭文字へフォールバック
+        assert_eq!(agent_mark("zzz-unknown"), "Z");
+        assert_eq!(agent_mark(""), "?");
+    }
+
+    #[test]
+    fn folder_header_label_is_the_folder_name() {
+        assert_eq!(root_label(Path::new("/Users/me/dev/zaivern-code")), "zaivern-code");
+        assert_eq!(root_label(Path::new("/")), "/");
     }
 
     #[test]
