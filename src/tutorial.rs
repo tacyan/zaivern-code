@@ -1515,7 +1515,6 @@ mod tests {
 
     // ── 暗幕のくり抜き ──
 
-    #[test]
     /// 暗幕はテーマに応じて薄くする。
     ///
     /// 既定のダークテーマに濃い黒を重ねると説明中だけ画面が読めなくなる。
@@ -1526,6 +1525,7 @@ mod tests {
         assert!(dim_alpha(false) <= 128, "ライトテーマでも真っ暗にはしない");
     }
 
+    #[test]
     fn dim_rects_punch_a_hole_and_never_cover_the_target() {
         let screen = rect(0.0, 0.0, 1000.0, 600.0);
         let t = rect(200.0, 100.0, 300.0, 200.0);

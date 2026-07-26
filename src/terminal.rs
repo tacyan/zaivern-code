@@ -8556,6 +8556,151 @@ pub const GUTTER: f32 = 6.0;
 /// 「描いた矩形と PTY のグリッドが食い違う」事故になる)。
 pub const TERM_PADDING: f32 = 6.0;
 
+/// ペインヘッダ (アイコン・題名・活動ランプ・✕/⤢) の高さ。
+///
+/// **ペインが 2 枚以上あるときだけ**確保する。1 枚のタイルは今日と 1 px も
+/// 変わらない見た目のままにする ([`pane_body`] がその判定を持つ)。
+pub const PANE_HEADER_H: f32 = 18.0;
+/// フォーカス中ペインを囲む枠の太さ。細い輪 — 太枠にすると端末が狭く見える。
+pub const FOCUS_RING: f32 = 1.5;
+/// 非フォーカスのペインに掛ける「かすませ」の濃さ (背景色の α)。
+pub const DIM_ALPHA: u8 = 26;
+
+/// ペインヘッダの中身。呼び出し側 (Session を持っている側) が供給する。
+///
+/// モデルは `Session` を知らないので、アイコンも題名も活動ランプの色も
+/// ここで受け取る。色は必ず `Theme` から渡すこと (直書き禁止)。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PaneChrome {
+    /// エージェントのアイコン (絵文字 1 文字を想定。空でもよい)。
+    pub icon: String,
+    /// ペインの題名。長ければヘッダ内でクリップされる。
+    pub title: String,
+    /// 活動ランプの色。`None` なら描かない (静止中)。
+    pub dot: Option<egui::Color32>,
+}
+
+/// [`draw_split`] の結果。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SplitDraw {
+    /// 幾何かフォーカスが変わった → 呼び出し側は [`apply_sizes`] を撃ち直す。
+    pub changed: bool,
+    /// ヘッダの ✕ が押されたペイン。**モデルは何もしない** — セッションの
+    /// 後始末 (reap) と [`SplitLayout::close_leaf`] は呼び出し側の仕事。
+    pub close: Option<SessionId>,
+}
+
+/// 新しいペインで何を起こすかの指示。モデルは何も起動しない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PanePreset {
+    /// 親ペインと**同じプリセット**のエージェントを、**親と同じ cwd** で。
+    SameAsParent,
+    /// 素のシェルを親と同じ cwd で。
+    Shell,
+}
+
+/// キー入力から決まる分割操作。純関数 [`split_key_action`] が返す。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SplitAction {
+    /// 新しいセッションを起こして `dir` 方向へ分割する。
+    /// 起動するのは呼び出し側 — モデルは置き場所しか決めない。
+    SplitWith { dir: SplitDir, preset: PanePreset },
+    /// フォーカス中のペインを閉じる。
+    ClosePane,
+    /// 幾何的な隣へフォーカスを移す。
+    Focus(FocusDir),
+    /// フォーカス中ペインのズームをトグルする。
+    Zoom,
+    /// 全ペインを等面積にする。
+    Equalize,
+}
+
+/// 分割操作の修飾キー (macOS = Cmd+Option / Windows・Linux = Ctrl+Alt) か。
+///
+/// * macOS では **Ctrl は絶対に奪わない** — `Ctrl+C` / `Ctrl+D` は端末のもの。
+/// * Windows / Linux では **Cmd 相当は Ctrl** なので `Ctrl+Alt` を見る。
+///   単独 `Ctrl+文字` も奪わない (同上)。
+fn is_split_chord(m: &egui::Modifiers, mac: bool) -> bool {
+    if !m.alt {
+        return false;
+    }
+    if mac {
+        m.mac_cmd && !m.ctrl
+    } else {
+        m.ctrl && !m.mac_cmd
+    }
+}
+
+/// **キー → 分割操作** の決定表 (純関数・副作用なし)。
+///
+/// 修飾は macOS が `Cmd+Option`、Windows / Linux が `Ctrl+Alt`。
+/// この一族は `keybinds.rs` の既定表と 1 つも衝突しない (`W` `Z` `E` `N`
+/// `H` `J` `K` `L` と矢印は `cmd+alt` / `ctrl+alt` で未使用)。
+///
+/// | キー | 操作 |
+/// |---|---|
+/// | `Shift+→` | 右に分割 (親と同じエージェント) |
+/// | `Shift+↓` | 下に分割 (同上) |
+/// | `N` | 右に分割してシェルを開く |
+/// | `W` | ペインを閉じる |
+/// | `←` `→` `↑` `↓` / `H` `J` `K` `L` | フォーカス移動 |
+/// | `Z` | ズーム |
+/// | `E` | 等分 |
+///
+/// これ以外 (素の文字・`Ctrl+文字`・`Alt+矢印` など) は `None` を返し、
+/// 入力はそのまま端末へ流れる。
+pub fn split_key_action(
+    key: egui::Key,
+    mods: &egui::Modifiers,
+    mac: bool,
+) -> Option<SplitAction> {
+    if !is_split_chord(mods, mac) {
+        return None;
+    }
+    use egui::Key as K;
+    if mods.shift {
+        // Shift + 矢印 = 「新しいペインを置く向き」を指す。
+        return match key {
+            K::ArrowRight => Some(SplitAction::SplitWith {
+                dir: SplitDir::Horizontal,
+                preset: PanePreset::SameAsParent,
+            }),
+            K::ArrowDown => Some(SplitAction::SplitWith {
+                dir: SplitDir::Vertical,
+                preset: PanePreset::SameAsParent,
+            }),
+            _ => None,
+        };
+    }
+    match key {
+        K::N => Some(SplitAction::SplitWith {
+            dir: SplitDir::Horizontal,
+            preset: PanePreset::Shell,
+        }),
+        K::W => Some(SplitAction::ClosePane),
+        K::Z => Some(SplitAction::Zoom),
+        K::E => Some(SplitAction::Equalize),
+        K::ArrowLeft | K::H => Some(SplitAction::Focus(FocusDir::Left)),
+        K::ArrowDown | K::J => Some(SplitAction::Focus(FocusDir::Down)),
+        K::ArrowUp | K::K => Some(SplitAction::Focus(FocusDir::Up)),
+        K::ArrowRight | K::L => Some(SplitAction::Focus(FocusDir::Right)),
+        _ => None,
+    }
+}
+
+/// ペイン矩形から**端末本体**の矩形を切り出す。
+///
+/// `multi` (= ペインが 2 枚以上) のときだけヘッダぶんを上から削る。
+/// 1 枚のときは受け取った矩形をそのまま返す — 既存の見た目を 1 px も変えない。
+/// 極端に低いペインでヘッダが本体を食い潰さないよう半分で頭打ちにする。
+pub fn pane_body(pane: egui::Rect, multi: bool) -> egui::Rect {
+    if !multi {
+        return pane;
+    }
+    let h = PANE_HEADER_H.min((pane.height() * 0.5).max(0.0));
+    egui::Rect::from_min_max(egui::pos2(pane.min.x, pane.min.y + h), pane.max)
+}
+
 /// 分割木のノード。
 #[derive(Clone, Debug, PartialEq)]
 pub enum SplitNode {
@@ -9107,6 +9252,20 @@ impl SplitLayout {
         }
     }
 
+    /// **その仕切りだけ**を 50:50 に戻す (orca のガター ダブルクリック相当 —
+    /// 掴んだ 1 本の左右/上下だけが揃い、他の分割は動かない)。
+    pub fn equalize_at(&mut self, path: &[bool]) -> bool {
+        let Some(root) = self.root.as_mut() else {
+            return false;
+        };
+        let Some(SplitNode::Split { ratio, .. }) = root.at_path_mut(path) else {
+            return false;
+        };
+        let changed = (*ratio - 0.5).abs() > f32::EPSILON;
+        *ratio = 0.5;
+        changed
+    }
+
     /// 2 つのペインの位置を入れ替える。
     pub fn swap(&mut self, a: SessionId, b: SessionId) -> bool {
         if a == b || !self.contains(a) || !self.contains(b) {
@@ -9130,11 +9289,21 @@ impl SplitLayout {
     }
 
     /// 生きていないセッションのリーフを落として木を畳む。戻り値は変化したか。
+    ///
+    /// フォーカス中のペインが死んだときは、**元の並び順で最も近い**生存ペイン
+    /// (直後 → 直前の順) へフォーカスを移す。先頭に飛ばすと、4 枚並べていて
+    /// 3 枚目が落ちただけで視線が左上へ吹っ飛ぶため。
     pub fn heal(&mut self, alive: &mut dyn FnMut(SessionId) -> bool) -> bool {
         let Some(root) = self.root.take() else {
             return false;
         };
         let before = root.clone();
+        // 畳む前の並びとフォーカス位置を覚えておく (近い順の探索に使う)。
+        let order = before.leaves();
+        let at = self
+            .focus
+            .and_then(|f| order.iter().position(|x| *x == f))
+            .unwrap_or(0);
         self.root = retain_node(root, alive);
         let changed = self.root.as_ref() != Some(&before);
         match &self.root {
@@ -9144,7 +9313,7 @@ impl SplitLayout {
             }
             Some(r) => {
                 if self.focus.is_none_or(|f| !r.contains(f)) {
-                    self.focus = Some(r.first_leaf());
+                    self.focus = Some(nearest_survivor(&order, at, r));
                 }
             }
         }
@@ -9321,9 +9490,43 @@ pub struct SplitLayoutRec {
     pub zoomed: bool,
 }
 
+/// [`SplitLayoutRec::to_line`] のフィールド区切り (ASCII Unit Separator)。
+/// パス・プリセット名・題名のどれにも現れ得ない制御文字を使う。
+const REC_FS: char = '\u{1f}';
+/// 同・ノード列の区切り (ASCII Record Separator)。
+const REC_RS: char = '\u{1e}';
+
 impl SplitLayoutRec {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// 1 行の文字列へ潰す。保存側 (`session.rs`) に**単純な `Vec<String>` を
+    /// 1 本足すだけ**で済ませるための形 — TOML のテーブル配列の順序制約
+    /// (配列は単純値より後) を踏まない。
+    pub fn to_line(&self) -> String {
+        if self.nodes.is_empty() {
+            return String::new();
+        }
+        format!(
+            "{}{REC_FS}{}{REC_FS}{}",
+            u8::from(self.zoomed),
+            self.focus,
+            self.nodes.join(&REC_RS.to_string())
+        )
+    }
+
+    /// [`Self::to_line`] の逆。壊れていれば空 (= 分割なし) を返す。
+    pub fn from_line(line: &str) -> Self {
+        let mut it = line.splitn(3, REC_FS);
+        let (Some(z), Some(focus), Some(nodes)) = (it.next(), it.next(), it.next()) else {
+            return Self::default();
+        };
+        Self {
+            nodes: nodes.split(REC_RS).map(str::to_string).collect(),
+            focus: focus.to_string(),
+            zoomed: z == "1",
+        }
     }
 
     /// 実行時の形へ戻す。キーを引けないセッションのリーフは落として親を畳む
@@ -9353,6 +9556,24 @@ impl SplitLayoutRec {
             zoomed: self.zoomed && focus.is_some(),
         }
     }
+}
+
+/// 元の並び `order` の `at` 番目から、生き残ったリーフを外側へ探す
+/// (直後 → 直前 → …)。1 つも見つからなければ木の先頭を返す。
+fn nearest_survivor(order: &[SessionId], at: usize, alive: &SplitNode) -> SessionId {
+    for step in 1..=order.len() {
+        if let Some(id) = order.get(at + step) {
+            if alive.contains(*id) {
+                return *id;
+            }
+        }
+        if let Some(id) = at.checked_sub(step).and_then(|i| order.get(i)) {
+            if alive.contains(*id) {
+                return *id;
+            }
+        }
+    }
+    alive.first_leaf()
 }
 
 fn overlap(a0: f32, a1: f32, b0: f32, b1: f32) -> f32 {
@@ -9434,9 +9655,17 @@ pub fn apply_sizes(
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return;
     }
+    // ヘッダを出す条件は `draw_split` と同じ (ズーム中も出す)。ここがズレると
+    // 「描いた矩形と PTY のグリッド」が食い違い、最終行が隠れる。
+    let multi = layout.len() > 1;
     for (id, r) in layout.rects(area, gutter) {
-        let cols = ((r.width() - TERM_PADDING * 2.0) / cell_w).floor().max(1.0) as u16;
-        let rows = ((r.height() - TERM_PADDING * 2.0) / cell_h).floor().max(1.0) as u16;
+        let body = pane_body(r, multi);
+        let cols = ((body.width() - TERM_PADDING * 2.0) / cell_w)
+            .floor()
+            .max(1.0) as u16;
+        let rows = ((body.height() - TERM_PADDING * 2.0) / cell_h)
+            .floor()
+            .max(1.0) as u16;
         emit(id, rows, cols);
     }
 }
@@ -9445,26 +9674,33 @@ pub fn apply_sizes(
 ///
 /// ペインの中身は呼び出し側が `leaf` で描く (Cockpit なら
 /// `terminal::draw` をそのまま呼べばよい)。この関数がやるのは
-/// 「矩形の割り当て」「仕切りの描画とドラッグ」「クリックでのフォーカス移動」
-/// の 3 つだけ。
+/// 「矩形の割り当て」「ペインヘッダ」「仕切りの描画とドラッグ」
+/// 「クリックでのフォーカス移動」だけ。
 ///
-/// 戻り値 `true` = レイアウトが変わった → 呼び出し側は [`apply_sizes`] を
-/// 撃ち直すこと。
+/// ヘッダ (アイコン・題名・活動ランプ・⤢・✕) は **ペインが 2 枚以上のときだけ**
+/// 出る。1 枚のタイルは今日とまったく同じ見た目のまま (`chrome` も呼ばれない)。
+///
+/// 戻り値の [`SplitDraw::changed`] が true = レイアウトが変わった →
+/// 呼び出し側は [`apply_sizes`] を撃ち直すこと。
 ///
 /// 再描画は要求しない (ドラッグ中は egui が自前でフレームを回す)。
 /// アイドル時のゼロ再描画を壊さないため、ここから `request_repaint` は呼ばない。
+/// 仕切りのドラッグも比率を書き換えるだけ — PTY への resize は呼び出し側が
+/// [`apply_sizes`] → 既存のコアレッサ経由で出すので、ConPTY を叩き続けない。
 pub fn draw_split(
     ui: &mut egui::Ui,
     layout: &mut SplitLayout,
     area: egui::Rect,
     gutter: f32,
     theme: &Theme,
+    chrome: &mut dyn FnMut(SessionId) -> PaneChrome,
     leaf: &mut dyn FnMut(&mut egui::Ui, egui::Rect, SessionId, bool),
-) -> bool {
-    let mut changed = false;
+) -> SplitDraw {
+    let mut out = SplitDraw::default();
+    let changed = &mut out.changed;
     let rects = layout.rects(area, gutter);
     if rects.is_empty() {
-        return false;
+        return out;
     }
 
     // クリックしたペインへフォーカスを移す。イベントは**消費しない**ので、
@@ -9479,20 +9715,61 @@ pub fn draw_split(
     if let Some(p) = press {
         if let Some((id, _)) = rects.iter().find(|(_, r)| r.contains(p)) {
             if layout.focus() != Some(*id) && layout.set_focus(*id) {
-                changed = true;
+                *changed = true;
             }
         }
     }
 
     let focus = layout.focus();
+    // ヘッダを出すかは**タイルのペイン数**で決める。ズーム中も出す
+    // (出さないとズームを戻す ⤢ が消えてしまう)。`apply_sizes` と同じ条件。
+    let multi = layout.len() > 1;
+    let mut zoom_req = false;
     for (id, r) in &rects {
+        let body = pane_body(*r, multi);
+        let is_focus = focus == Some(*id);
+        if multi {
+            let head = egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, body.min.y));
+            let (hit_close, hit_zoom) = pane_header_ui(ui, head, *id, is_focus, theme, chrome);
+            if hit_close {
+                out.close = Some(*id);
+            }
+            if hit_zoom {
+                // フォーカスを移してからズームする (別ペインの ⤢ でも直感どおり)。
+                layout.set_focus(*id);
+                zoom_req = true;
+            }
+        }
         let mut child = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(*r)
+                .max_rect(body)
                 .id_salt(("zv-split-pane", *id))
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
-        leaf(&mut child, *r, *id, focus == Some(*id));
+        leaf(&mut child, body, *id, is_focus);
+        if multi {
+            // フォーカスの合図は「細い輪 + 非フォーカスを少しかすませる」。
+            // 太枠にすると端末が狭く見えるので、あくまで静かに。
+            if is_focus {
+                ui.painter().rect_stroke(
+                    r.shrink(FOCUS_RING * 0.5),
+                    4.0,
+                    egui::Stroke::new(FOCUS_RING, theme.accent),
+                );
+            } else {
+                let veil = egui::Color32::from_rgba_unmultiplied(
+                    theme.bg.r(),
+                    theme.bg.g(),
+                    theme.bg.b(),
+                    DIM_ALPHA,
+                );
+                ui.painter().rect_filled(*r, 4.0, veil);
+            }
+        }
+    }
+    if zoom_req {
+        layout.zoom_focused();
+        *changed = true;
     }
 
     // ── 仕切り (ドラッグでリサイズ / ダブルクリックで均等化) ──
@@ -9512,8 +9789,10 @@ pub fn draw_split(
             });
         }
         if resp.double_clicked() {
-            layout.equalize();
-            changed = true;
+            // 掴んだ 1 本だけを 50:50 に戻す (他の分割は動かさない)。
+            if layout.equalize_at(&g.path) {
+                *changed = true;
+            }
         } else if resp.dragged() {
             let d = resp.drag_delta();
             let (delta, span) = match g.dir {
@@ -9521,7 +9800,7 @@ pub fn draw_split(
                 SplitDir::Vertical => (d.y, g.span.height()),
             };
             if delta != 0.0 && layout.drag_gutter(&g.path, delta, span, gutter) {
-                changed = true;
+                *changed = true;
             }
         }
         let col = if hot { theme.accent } else { theme.border };
@@ -9532,7 +9811,96 @@ pub fn draw_split(
         ui.painter().rect_filled(bar, 1.0, col);
     }
 
-    changed
+    out
+}
+
+/// ペイン 1 枚のヘッダを描く。戻り値は `(✕ が押されたか, ⤢ が押されたか)`。
+///
+/// 幅は `head` そのまま。題名はクリップ矩形で切るだけなので、
+/// どんな長さ・どんな言語 (CJK 含む) でもヘッダからはみ出さない。
+fn pane_header_ui(
+    ui: &mut egui::Ui,
+    head: egui::Rect,
+    id: SessionId,
+    is_focus: bool,
+    theme: &Theme,
+    chrome: &mut dyn FnMut(SessionId) -> PaneChrome,
+) -> (bool, bool) {
+    if head.height() <= 1.0 || head.width() <= 1.0 {
+        return (false, false);
+    }
+    let c = chrome(id);
+    let p = ui.painter();
+    p.rect_filled(head, 0.0, theme.panel_alt);
+    // 下端に 1 本だけ罫を引いて端末本体と切り離す。
+    p.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(head.min.x, head.max.y - 1.0), head.max),
+        0.0,
+        theme.border,
+    );
+
+    let bh = head.height();
+    let btn = egui::vec2(bh, bh);
+    let close_r = egui::Rect::from_min_size(egui::pos2(head.max.x - bh, head.min.y), btn);
+    let zoom_r = egui::Rect::from_min_size(egui::pos2(head.max.x - bh * 2.0, head.min.y), btn);
+    let font = egui::FontId::proportional((bh * 0.62).max(7.0));
+
+    // 活動ランプ (⤢ の左)。色は呼び出し側 = Theme 由来。
+    let mut text_right = zoom_r.min.x - 2.0;
+    if let Some(dot) = c.dot {
+        let cx = text_right - bh * 0.35;
+        ui.painter()
+            .circle_filled(egui::pos2(cx, head.center().y), (bh * 0.16).max(1.5), dot);
+        text_right = cx - bh * 0.35;
+    }
+
+    // アイコン + 題名。はみ出しはクリップで落とす。
+    let label = if c.icon.is_empty() {
+        c.title.clone()
+    } else {
+        format!("{} {}", c.icon, c.title)
+    };
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(head.min.x + 4.0, head.min.y),
+        egui::pos2(text_right.max(head.min.x + 4.0), head.max.y),
+    );
+    if text_rect.width() > 1.0 && !label.is_empty() {
+        ui.painter().with_clip_rect(text_rect).text(
+            egui::pos2(text_rect.min.x, head.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font.clone(),
+            if is_focus { theme.text } else { theme.text_dim },
+        );
+    }
+
+    // ⤢ / ✕。`ui.interact` は本体 (body) と重ならない位置なので、
+    // 端末側のクリックを奪わない。
+    let mut hit = (false, false);
+    if head.width() > bh * 2.5 {
+        let zoom = ui
+            .interact(zoom_r, ui.id().with(("zv-pane-zoom", id)), egui::Sense::click())
+            .on_hover_text(tr("このペインだけを大きく表示 (もう一度で戻す)"));
+        let close = ui
+            .interact(close_r, ui.id().with(("zv-pane-close", id)), egui::Sense::click())
+            .on_hover_text(tr("このペインを閉じる"));
+        for (r, resp, glyph) in [(zoom_r, &zoom, "⤢"), (close_r, &close, "✕")] {
+            let col = if resp.hovered() {
+                theme.accent
+            } else {
+                theme.text_dim
+            };
+            ui.painter().text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                font.clone(),
+                col,
+            );
+        }
+        hit = (close.clicked(), zoom.clicked());
+    }
+    hit
 }
 
 #[cfg(test)]
@@ -9953,7 +10321,9 @@ mod split_tests {
         let alive = [1u64, 4];
         assert!(l.heal(&mut |id| alive.contains(&id)));
         assert_eq!(l.leaves(), vec![1, 4]);
-        assert_eq!(l.focus(), Some(1));
+        // 元の並びは [1,3,2,4]。死んだ 2 の**直後**の生存ペインは 4。
+        // (先頭 1 へ飛ばすと、視線が関係ない左上へ吹っ飛ぶ)
+        assert_eq!(l.focus(), Some(4));
         assert!(!l.heal(&mut |id| alive.contains(&id)), "2 度目は変化なし");
         assert!(l.heal(&mut |_| false));
         assert!(l.is_empty());
@@ -9969,22 +10339,33 @@ mod split_tests {
 
         let mut got: Vec<(SessionId, u16, u16)> = Vec::new();
         apply_sizes(&l, a, 6.0, cw, ch, &mut |id, r, c| got.push((id, r, c)));
-        // cols = floor((403 - 12) / 8) = 48、rows = floor((612 - 12) / 16) = 37
-        assert_eq!(got, vec![(1, 37, 48), (2, 37, 48)]);
+        // 2 枚あるのでヘッダ (18) が乗る。
+        // cols = floor((403 - 12) / 8) = 48、rows = floor((612 - 18 - 12) / 16) = 36
+        assert_eq!(got, vec![(1, 36, 48), (2, 36, 48)]);
 
-        // 上下分割: 使える高さ 606 → 303 / 303、rows = floor((303-12)/16) = 18
+        // 上下分割: 使える高さ 606 → 303 / 303、
+        // rows = floor((303 - 18 - 12) / 16) = 17
         let mut l2 = SplitLayout::single(1);
         l2.split_focused(SplitDir::Vertical, 2);
         let mut got2: Vec<(SessionId, u16, u16)> = Vec::new();
         apply_sizes(&l2, a, 6.0, cw, ch, &mut |id, r, c| got2.push((id, r, c)));
-        assert_eq!(got2, vec![(1, 18, 100), (2, 18, 100)]);
+        assert_eq!(got2, vec![(1, 17, 100), (2, 17, 100)]);
 
-        // ズーム中は見えている 1 枚だけ (全面サイズ)。
+        // ズーム中は見えている 1 枚だけ (全面サイズ)。ヘッダは残る
+        // (⤢ が消えるとズームを戻せなくなるため) → rows = floor((612-18-12)/16) = 36
         l2.set_focus(2);
         l2.zoom_focused();
         let mut got3: Vec<(SessionId, u16, u16)> = Vec::new();
         apply_sizes(&l2, a, 6.0, cw, ch, &mut |id, r, c| got3.push((id, r, c)));
-        assert_eq!(got3, vec![(2, 37, 100)]);
+        assert_eq!(got3, vec![(2, 36, 100)]);
+
+        // 1 枚だけのタイルはヘッダを取らない = 今日とまったく同じ寸法。
+        // rows = floor((612 - 12) / 16) = 37、cols = floor((812 - 12) / 8) = 100
+        let mut solo: Vec<(SessionId, u16, u16)> = Vec::new();
+        apply_sizes(&SplitLayout::single(9), a, 6.0, cw, ch, &mut |id, r, c| {
+            solo.push((id, r, c))
+        });
+        assert_eq!(solo, vec![(9, 37, 100)]);
 
         // セル幅 0 の異常系では 1 件も出さない (0 除算で NaN を配らない)。
         let mut none: Vec<(SessionId, u16, u16)> = Vec::new();
@@ -10006,5 +10387,462 @@ mod split_tests {
         assert!(!l.set_focus(1));
         l.equalize();
         assert!(l.is_empty());
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // キーの決定表 (split_key_action)
+    // ────────────────────────────────────────────────────────────────
+
+    /// macOS の Cmd+Option。
+    fn mac_mod(shift: bool) -> egui::Modifiers {
+        egui::Modifiers {
+            alt: true,
+            ctrl: false,
+            shift,
+            mac_cmd: true,
+            command: true,
+        }
+    }
+    /// Windows / Linux の Ctrl+Alt。
+    fn win_mod(shift: bool) -> egui::Modifiers {
+        egui::Modifiers {
+            alt: true,
+            ctrl: true,
+            shift,
+            mac_cmd: false,
+            command: true,
+        }
+    }
+
+    const SPLIT_R: SplitAction = SplitAction::SplitWith {
+        dir: SplitDir::Horizontal,
+        preset: PanePreset::SameAsParent,
+    };
+    const SPLIT_D: SplitAction = SplitAction::SplitWith {
+        dir: SplitDir::Vertical,
+        preset: PanePreset::SameAsParent,
+    };
+    const SPLIT_SHELL: SplitAction = SplitAction::SplitWith {
+        dir: SplitDir::Horizontal,
+        preset: PanePreset::Shell,
+    };
+
+    /// 同じ表が macOS (Cmd+Option) でも Windows/Linux (Ctrl+Alt) でも成立する。
+    #[test]
+    fn split_key_action_table_both_platforms() {
+        use egui::Key as K;
+        // (キー, Shift, 期待するアクション)
+        let table: &[(egui::Key, bool, SplitAction)] = &[
+            (K::ArrowRight, true, SPLIT_R),
+            (K::ArrowDown, true, SPLIT_D),
+            (K::N, false, SPLIT_SHELL),
+            (K::W, false, SplitAction::ClosePane),
+            (K::Z, false, SplitAction::Zoom),
+            (K::E, false, SplitAction::Equalize),
+            (K::ArrowLeft, false, SplitAction::Focus(FocusDir::Left)),
+            (K::ArrowRight, false, SplitAction::Focus(FocusDir::Right)),
+            (K::ArrowUp, false, SplitAction::Focus(FocusDir::Up)),
+            (K::ArrowDown, false, SplitAction::Focus(FocusDir::Down)),
+            (K::H, false, SplitAction::Focus(FocusDir::Left)),
+            (K::J, false, SplitAction::Focus(FocusDir::Down)),
+            (K::K, false, SplitAction::Focus(FocusDir::Up)),
+            (K::L, false, SplitAction::Focus(FocusDir::Right)),
+        ];
+        for (key, shift, want) in table {
+            assert_eq!(
+                split_key_action(*key, &mac_mod(*shift), true),
+                Some(*want),
+                "macOS: {key:?} shift={shift}"
+            );
+            assert_eq!(
+                split_key_action(*key, &win_mod(*shift), false),
+                Some(*want),
+                "Windows/Linux: {key:?} shift={shift}"
+            );
+        }
+    }
+
+    /// **奪ってはいけない**打鍵。ここが false になると端末に文字が打てなくなる。
+    #[test]
+    fn split_key_action_never_steals_terminal_input() {
+        use egui::Key as K;
+        let none = egui::Modifiers::NONE;
+        let ctrl_only = egui::Modifiers {
+            alt: false,
+            ctrl: true,
+            shift: false,
+            mac_cmd: false,
+            command: true,
+        };
+        let alt_only = egui::Modifiers {
+            alt: true,
+            ctrl: false,
+            shift: false,
+            mac_cmd: false,
+            command: false,
+        };
+        // (キー, 修飾, mac か)
+        let never: &[(egui::Key, egui::Modifiers, bool)] = &[
+            // 素の文字・矢印は当然すべて端末へ
+            (K::W, none, true),
+            (K::Z, none, false),
+            (K::ArrowRight, none, true),
+            // Ctrl+C / Ctrl+D — macOS で奪ったらシェルが操作不能になる
+            (K::C, ctrl_only, true),
+            (K::D, ctrl_only, true),
+            (K::W, ctrl_only, true),
+            // Windows/Linux でも単独 Ctrl+文字 は端末のもの
+            (K::W, ctrl_only, false),
+            (K::E, ctrl_only, false),
+            // Alt 単独 = readline の Meta (Alt+B / Alt+F など)
+            (K::H, alt_only, true),
+            (K::L, alt_only, false),
+            // Alt+矢印 は keybinds.rs の MoveLineUp/Down
+            (K::ArrowUp, alt_only, true),
+            (K::ArrowDown, alt_only, false),
+            // macOS で Ctrl+Alt は端末のもの (Cmd が要る)
+            (K::Z, win_mod(false), true),
+            // Windows で Cmd(=mac_cmd)+Alt は来ない
+            (K::Z, mac_mod(false), false),
+            // 表に無いキーは Shift 有無に関わらず素通し
+            (K::Q, mac_mod(false), true),
+            (K::Q, win_mod(false), false),
+            (K::Z, mac_mod(true), true),
+            (K::W, win_mod(true), false),
+            (K::ArrowLeft, mac_mod(true), true),
+            (K::ArrowUp, win_mod(true), false),
+        ];
+        for (key, mods, mac) in never {
+            assert_eq!(
+                split_key_action(*key, mods, *mac),
+                None,
+                "奪ってはいけない: {key:?} {mods:?} mac={mac}"
+            );
+        }
+    }
+
+    /// `keybinds.rs` の既定表と 1 つも衝突しない (端末フォーカス中に
+    /// グローバルショートカットを覆い隠さない)。
+    #[test]
+    fn split_chords_do_not_shadow_global_shortcuts() {
+        use egui::Key as K;
+        // 分割が使うキー
+        let ours = [
+            K::N,
+            K::W,
+            K::Z,
+            K::E,
+            K::H,
+            K::J,
+            K::K,
+            K::L,
+            K::ArrowLeft,
+            K::ArrowRight,
+            K::ArrowUp,
+            K::ArrowDown,
+        ];
+        // `cmd+alt` / `ctrl+alt` を既に使っている既定ショートカットのキー
+        let taken = [
+            K::D,            // toggle_deck
+            K::S,            // save_all
+            K::F,            // open_replace
+            K::B,            // toggle_bookmark
+            K::OpenBracket,  // move_tab_left
+            K::CloseBracket, // move_tab_right
+        ];
+        for k in ours {
+            assert!(!taken.contains(&k), "{k:?} は cmd+alt で既に使われている");
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // ペインヘッダぶんの幾何
+    // ────────────────────────────────────────────────────────────────
+
+    /// ヘッダは 2 枚以上のときだけ乗る。本体は必ず領域の内側で重ならない。
+    #[test]
+    fn pane_body_accounts_chrome_only_when_multi() {
+        let a = rect(10.0, 20.0, 800.0, 600.0);
+
+        // 1 枚 = 今日とまったく同じ (1 px も削らない)
+        let solo = SplitLayout::single(1);
+        let rs = solo.rects(a, GUTTER);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(pane_body(rs[0].1, solo.len() > 1), rs[0].1);
+        assert_eq!(rs[0].1, a);
+
+        // 4 枚 = すべてにヘッダ
+        let q = quad();
+        let rs = q.rects(a, GUTTER);
+        assert_eq!(rs.len(), 4);
+        let bodies: Vec<egui::Rect> = rs.iter().map(|(_, r)| pane_body(*r, true)).collect();
+        for (i, (b, (_, full))) in bodies.iter().zip(rs.iter()).enumerate() {
+            assert!(a.contains_rect(*b), "本体 {i} が領域からはみ出した");
+            assert!(
+                (b.min.y - full.min.y - PANE_HEADER_H).abs() < 0.01,
+                "本体 {i} のヘッダ高が違う"
+            );
+            assert_eq!(b.min.x, full.min.x);
+            assert_eq!(b.max, full.max);
+            assert!(b.height() > 0.0 && b.width() > 0.0);
+        }
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                let x = bodies[i].intersect(bodies[j]);
+                assert!(
+                    x.width() <= 0.01 || x.height() <= 0.01,
+                    "本体 {i} と {j} が重なった"
+                );
+            }
+        }
+
+        // 極端に低いペインでもヘッダが本体を食い潰さない
+        let tiny = rect(0.0, 0.0, 100.0, 10.0);
+        let b = pane_body(tiny, true);
+        assert!(b.height() > 0.0 && b.height() <= tiny.height());
+        assert!(tiny.contains_rect(b));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // フォーカス移動 (3 枚 / 4 枚 × 全方向)
+    // ────────────────────────────────────────────────────────────────
+
+    /// 3 ペイン (左 = 1 / 右上 = 2 / 右下 = 3) を全方向でなぞる。
+    #[test]
+    fn focus_dir_on_three_pane_table() {
+        let a = rect(0.0, 0.0, 800.0, 600.0);
+        // (開始, 向き, 期待する行き先。None = 端で動かない)
+        let table: &[(SessionId, FocusDir, Option<SessionId>)] = &[
+            (1, FocusDir::Right, Some(2)),
+            (1, FocusDir::Left, None),
+            (1, FocusDir::Up, None),
+            (1, FocusDir::Down, None),
+            (2, FocusDir::Left, Some(1)),
+            (2, FocusDir::Down, Some(3)),
+            (2, FocusDir::Up, None),
+            (2, FocusDir::Right, None),
+            (3, FocusDir::Left, Some(1)),
+            (3, FocusDir::Up, Some(2)),
+            (3, FocusDir::Down, None),
+            (3, FocusDir::Right, None),
+        ];
+        for (from, dir, want) in table {
+            let mut l = three();
+            assert!(l.set_focus(*from));
+            let moved = l.focus_dir(*dir, a, GUTTER);
+            match want {
+                Some(w) => {
+                    assert!(moved, "{from} から {dir:?} へ動かなかった");
+                    assert_eq!(l.focus(), Some(*w), "{from} から {dir:?}");
+                }
+                None => {
+                    assert!(!moved, "{from} から {dir:?} は端のはずが動いた");
+                    assert_eq!(l.focus(), Some(*from));
+                }
+            }
+        }
+    }
+
+    /// 田の字 4 枚を全方向でなぞる (往復して元へ戻ることも見る)。
+    #[test]
+    fn focus_dir_on_quad_round_trips() {
+        let a = rect(0.0, 0.0, 800.0, 600.0);
+        // 左列 1(上)/3(下)、右列 2(上)/4(下)
+        let pairs: &[(SessionId, FocusDir, SessionId, FocusDir)] = &[
+            (1, FocusDir::Right, 2, FocusDir::Left),
+            (1, FocusDir::Down, 3, FocusDir::Up),
+            (2, FocusDir::Down, 4, FocusDir::Up),
+            (3, FocusDir::Right, 4, FocusDir::Left),
+        ];
+        for (from, go, to, back) in pairs {
+            let mut l = quad();
+            assert!(l.set_focus(*from));
+            assert!(l.focus_dir(*go, a, GUTTER), "{from} → {go:?}");
+            assert_eq!(l.focus(), Some(*to));
+            assert!(l.focus_dir(*back, a, GUTTER), "{to} → {back:?}");
+            assert_eq!(l.focus(), Some(*from), "{from} へ戻らなかった");
+        }
+        // 四隅の外向きは端で止まる
+        for (id, dir) in [
+            (1u64, FocusDir::Left),
+            (1, FocusDir::Up),
+            (2, FocusDir::Right),
+            (2, FocusDir::Up),
+            (3, FocusDir::Left),
+            (3, FocusDir::Down),
+            (4, FocusDir::Right),
+            (4, FocusDir::Down),
+        ] {
+            let mut l = quad();
+            assert!(l.set_focus(id));
+            assert!(!l.focus_dir(dir, a, GUTTER), "{id} の {dir:?} は端のはず");
+            assert_eq!(l.focus(), Some(id));
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 寿命 (プロセス終了で木が畳まれる)
+    // ────────────────────────────────────────────────────────────────
+
+    /// フォーカス中のペインが終了したら、**並び順で最も近い**生存ペインへ移る。
+    #[test]
+    fn exit_heals_tree_and_moves_focus_to_nearest() {
+        let a = rect(0.0, 0.0, 800.0, 600.0);
+        // 3 枚目 (in-order の真ん中の次) が死んだら 4 枚目へ
+        let mut l = quad();
+        assert_eq!(l.leaves(), vec![1, 3, 2, 4]);
+        assert!(l.set_focus(2));
+        assert!(l.heal(&mut |id| id != 2));
+        assert_eq!(l.focus(), Some(4), "2 の直後の生存ペインへ移るはず");
+        assert_eq!(l.len(), 3);
+        assert!(!l.contains(2));
+        assert_invariants(&l, "1 枚落ちた後");
+        // 幾何は生き残った 3 枚で領域を埋め直す (兄弟が場所を継ぐ)
+        let rs = l.rects(a, GUTTER);
+        assert_eq!(rs.len(), 3);
+        for (_, r) in &rs {
+            assert!(a.contains_rect(*r));
+        }
+
+        // 末尾が死んだら直前へ
+        let mut l = quad();
+        assert!(l.set_focus(4));
+        assert!(l.heal(&mut |id| id != 4));
+        assert_eq!(l.focus(), Some(2), "末尾が死んだら直前の生存ペインへ");
+
+        // フォーカスしていないペインが死んでもフォーカスは動かない
+        let mut l = quad();
+        assert!(l.set_focus(1));
+        assert!(l.heal(&mut |id| id != 3));
+        assert_eq!(l.focus(), Some(1));
+
+        // 全滅したら空になり、ズームも解ける (タイルは「閉じたエージェント」扱い)
+        let mut l = quad();
+        l.zoom_focused();
+        assert!(l.heal(&mut |_| false));
+        assert!(l.is_empty());
+        assert_eq!(l.focus(), None);
+        assert!(!l.zoomed());
+        assert!(l.rects(a, GUTTER).is_empty());
+    }
+
+    /// 最後の 1 枚を閉じるとタイルは空になる (= 閉じたエージェントと同じ)。
+    #[test]
+    fn closing_the_last_pane_empties_the_tile() {
+        let mut l = SplitLayout::single(7);
+        assert!(l.close_leaf(7));
+        assert!(l.is_empty());
+        assert_eq!(l.focus(), None);
+        assert_eq!(l.len(), 0);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 保存と復元 (1 行表現)
+    // ────────────────────────────────────────────────────────────────
+
+    /// 1 行に潰して往復できる。復元時に**居ないセッションのリーフは黙って落ちる**。
+    #[test]
+    fn to_line_round_trip_drops_missing_sessions() {
+        let mut l = quad();
+        assert!(l.set_focus(3));
+        // 安定キー = ログのパス相当 (`:` や空白を含んでも壊れないこと)
+        let key_of = |id: SessionId| Some(format!("/var/log s/zai:{id}.log"));
+        let line = l.to_rec(&mut |id| key_of(id)).to_line();
+        assert!(!line.is_empty());
+
+        // 素直な往復
+        let back = SplitLayoutRec::from_line(&line);
+        assert_eq!(back, l.to_rec(&mut |id| key_of(id)));
+        let mut ids: Vec<(String, SessionId)> =
+            (1..=4).map(|i| (key_of(i).unwrap(), i)).collect();
+        let restored = back.to_layout(&mut |k| {
+            ids.iter().find(|(s, _)| s == k).map(|(_, i)| *i)
+        });
+        assert_eq!(restored.leaves(), l.leaves());
+        assert_eq!(restored.focus(), Some(3));
+        assert_invariants(&restored, "往復後");
+
+        // セッション 3 が消えていた場合 — 落として親を畳み、panic しない
+        ids.retain(|(_, i)| *i != 3);
+        let healed = SplitLayoutRec::from_line(&line).to_layout(&mut |k| {
+            ids.iter().find(|(s, _)| s == k).map(|(_, i)| *i)
+        });
+        assert_eq!(healed.len(), 3);
+        assert!(!healed.contains(3));
+        assert!(healed.focus().is_some_and(|f| healed.contains(f)));
+        assert_invariants(&healed, "欠けたセッションを落とした後");
+
+        // 全部消えていたら空 (分割なし) に戻る
+        let gone = SplitLayoutRec::from_line(&line).to_layout(&mut |_| None);
+        assert!(gone.is_empty());
+
+        // 壊れた行・空行でも panic せず空を返す
+        for bad in ["", "ごみ", "1\u{1f}x", "\u{1f}\u{1f}"] {
+            let r = SplitLayoutRec::from_line(bad);
+            assert!(r.to_layout(&mut |_| Some(1)).len() <= 1);
+        }
+        // 分割していないレイアウトは空行になる (保存領域を汚さない)
+        assert!(SplitLayout::new().to_rec(&mut |_| None).to_line().is_empty());
+    }
+
+    /// ズームの状態も 1 行に乗る。
+    #[test]
+    fn to_line_carries_zoom_flag() {
+        let mut l = three();
+        l.set_focus(2);
+        assert!(l.zoom_focused());
+        let line = l.to_rec(&mut |id| Some(id.to_string())).to_line();
+        let back = SplitLayoutRec::from_line(&line);
+        assert!(back.zoomed);
+        let restored = back.to_layout(&mut |k| k.parse::<SessionId>().ok());
+        assert!(restored.zoomed());
+        assert_eq!(restored.focus(), Some(2));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // ガター
+    // ────────────────────────────────────────────────────────────────
+
+    /// ドラッグは最小ペイン幅でクランプされ、行き過ぎても比率が壊れない。
+    #[test]
+    fn gutter_drag_clamps_at_both_ends() {
+        let span = 400.0_f32;
+        let avail = span - GUTTER;
+        for push in [-10_000.0_f32, -span, -1.0, 1.0, span, 10_000.0] {
+            let mut l = SplitLayout::single(1);
+            l.split_focused(SplitDir::Horizontal, 2);
+            l.drag_gutter(&[], push, span, GUTTER);
+            let r = l.ratio_at(&[]).unwrap();
+            let lo = MIN_RATIO.max(MIN_PANE_PX / avail);
+            assert!(
+                r >= lo - 1e-4 && r <= 1.0 - lo + 1e-4,
+                "比率 {r} が最小ペイン幅を割った (push={push})"
+            );
+            // どちらのペインも MIN_PANE_PX を下回らない
+            let rs = l.rects(rect(0.0, 0.0, span, 100.0), GUTTER);
+            for (id, rr) in rs {
+                assert!(rr.width() >= MIN_PANE_PX - 1.0, "ペイン {id} が潰れた");
+            }
+        }
+    }
+
+    /// ダブルクリック相当 (`equalize_at`) は**掴んだ 1 本だけ**を 50:50 に戻す。
+    #[test]
+    fn equalize_at_only_touches_that_divider() {
+        let mut l = three(); // ルート = 左右分割、その b 側が上下分割
+        l.drag_gutter(&[], 60.0, 400.0, GUTTER);
+        l.drag_gutter(&[true], 40.0, 300.0, GUTTER);
+        let outer = l.ratio_at(&[]).unwrap();
+        let inner = l.ratio_at(&[true]).unwrap();
+        assert!((outer - 0.5).abs() > 0.01 && (inner - 0.5).abs() > 0.01);
+
+        assert!(l.equalize_at(&[true]));
+        assert!((l.ratio_at(&[true]).unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(l.ratio_at(&[]).unwrap(), outer, "他の仕切りは動かさない");
+
+        // 既に 50:50 なら変化なし / 存在しない経路は false
+        assert!(!l.equalize_at(&[true]));
+        assert!(!l.equalize_at(&[false]), "リーフを指す経路は無視する");
+        assert!(!SplitLayout::new().equalize_at(&[]));
     }
 }
