@@ -141,6 +141,17 @@ pub struct FileTree {
     type_at: f64,
     /// 今フレーム、行のコンテキストメニューが開いていたか(フォーカス維持用)。
     menu_open: bool,
+    /// エディタから通知された現在のアクティブファイル (VS Code の追従表示)。
+    active_file: Option<PathBuf>,
+    /// 次の描画で reveal (祖先フォルダ展開 + 選択 + スクロール) するパス。
+    pending_reveal: Option<PathBuf>,
+    /// アクティブファイル追従の ON/OFF。None = egui 永続メモリから未ロード。
+    /// config.rs には触れない設計: トグル状態は egui の永続メモリに保存する。
+    auto_reveal: Option<bool>,
+    /// auto_reveal がトグルされ、永続メモリへ書き戻しが必要。
+    auto_reveal_dirty: bool,
+    /// 前フレームのウィンドウフォーカス (復帰の立ち上がりで git 再スキャン要求)。
+    window_focused: bool,
 }
 
 impl FileTree {
@@ -159,6 +170,11 @@ impl FileTree {
             type_buf: String::new(),
             type_at: 0.0,
             menu_open: false,
+            active_file: None,
+            pending_reveal: None,
+            auto_reveal: None,
+            auto_reveal_dirty: false,
+            window_focused: true,
         }
     }
 
@@ -170,6 +186,38 @@ impl FileTree {
         self.selected = None;
         self.clipboard = None;
         self.scroll_to = None;
+        // アクティブファイルは次の set_active_file で改めて reveal し直す
+        self.active_file = None;
+        self.pending_reveal = None;
+    }
+
+    /// エディタ側のアクティブファイルをツリーへ通知する (毎フレーム呼んでよい)。
+    /// パスが変わったときだけ 1 回 reveal を予約する (追従 OFF なら描画時に捨てる)。
+    pub fn set_active_file(&mut self, path: Option<&Path>) {
+        if self.active_file.as_deref() == path {
+            return;
+        }
+        self.active_file = path.map(Path::to_path_buf);
+        if let Some(p) = path {
+            if self.root_for(p).is_some() {
+                self.pending_reveal = Some(p.to_path_buf());
+            }
+        }
+    }
+
+    /// アクティブファイル追従が有効か (未ロード時は既定 ON)。
+    pub fn auto_reveal(&self) -> bool {
+        self.auto_reveal.unwrap_or(true)
+    }
+
+    /// アクティブファイル追従の ON/OFF (次の描画で egui 永続メモリへ保存)。
+    /// ON へ切り替えた瞬間に現在のアクティブファイルを reveal する。
+    pub fn set_auto_reveal(&mut self, on: bool) {
+        self.auto_reveal = Some(on);
+        self.auto_reveal_dirty = true;
+        if on {
+            self.pending_reveal = self.active_file.clone();
+        }
     }
 
     /// 切り取り移動が成功したときに呼ぶ (アプリ側から)。
@@ -316,6 +364,40 @@ impl FileTree {
     ) {
         self.menu_open = false;
         let ctx = ui.ctx().clone();
+
+        // アクティブファイル追従トグル: egui 永続メモリと同期する
+        // (config.rs に触れないため、開閉状態と同じ保存先を使う)。
+        if self.auto_reveal.is_none() {
+            let v = ctx.data_mut(|d| *d.get_persisted_mut_or(auto_reveal_id(), true));
+            self.auto_reveal = Some(v);
+        }
+        if self.auto_reveal_dirty {
+            let v = self.auto_reveal();
+            ctx.data_mut(|d| d.insert_persisted(auto_reveal_id(), v));
+            self.auto_reveal_dirty = false;
+        }
+
+        // ウィンドウフォーカス復帰の立ち上がりで git status の再スキャンを要求
+        // (外部での commit / checkout / 編集をすぐ反映する。VS Code と同じ契機)。
+        let focused_now = ctx.input(|i| i.focused);
+        if focused_now && !self.window_focused {
+            gitinfo.request_refresh();
+        }
+        self.window_focused = focused_now;
+
+        // アクティブファイル追従 (VS Code の explorer.autoReveal):
+        // 祖先フォルダを展開してから行を選択し、可視位置までスクロールする。
+        // 展開は visible_rows より前に行い、同フレームのキー操作にも反映する。
+        if let Some(target) = self.pending_reveal.take() {
+            if self.auto_reveal() {
+                for anc in reveal_ancestors(&self.roots, &target) {
+                    set_open(&ctx, &anc, true);
+                }
+                self.selected = Some(target.clone());
+                self.scroll_to = Some(target);
+            }
+        }
+
         // 描画前に可視行のスナップショットを取り、キーボード操作を先に処理する
         // (選択の移動・開閉が同じフレームの描画へ反映される)。
         let rows = self.visible_rows(&ctx);
@@ -375,6 +457,8 @@ impl FileTree {
                     if menu_btn(ui, tr("📋 フルパスをコピー"), h("⌥⌘C", "Shift+Alt+C")) {
                         ui.ctx().copy_text(root.to_string_lossy().to_string());
                     }
+                    ui.separator();
+                    self.auto_reveal_menu(ui);
                 });
             }
         }
@@ -836,34 +920,72 @@ impl FileTree {
     }
 }
 
-/// FileStatus に対応する VS Code 風カラーとステータスバッジ
-fn git_status_style(status: crate::git::FileStatus, _theme: &Theme) -> (egui::Color32, &'static str, &'static str) {
+/// VS Code の `gitDecoration.*ResourceForeground` 既定色を写した定数。
+/// ダーク系テーマ / ライト系テーマで別の色を使う (テーマの `dark` で選択)。
+/// 出典: VS Code 既定テーマの Theme Color リファレンス。
+mod vscode_git_colors {
+    use eframe::egui::Color32;
+
+    // gitDecoration.modifiedResourceForeground
+    pub const DARK_MODIFIED: Color32 = Color32::from_rgb(0xE2, 0xC0, 0x8D);
+    pub const LIGHT_MODIFIED: Color32 = Color32::from_rgb(0x89, 0x55, 0x03);
+    // gitDecoration.addedResourceForeground
+    pub const DARK_ADDED: Color32 = Color32::from_rgb(0x81, 0xB8, 0x8B);
+    pub const LIGHT_ADDED: Color32 = Color32::from_rgb(0x58, 0x7C, 0x0C);
+    // gitDecoration.untrackedResourceForeground
+    pub const DARK_UNTRACKED: Color32 = Color32::from_rgb(0x73, 0xC9, 0x91);
+    pub const LIGHT_UNTRACKED: Color32 = Color32::from_rgb(0x00, 0x71, 0x00);
+    // gitDecoration.deletedResourceForeground
+    pub const DARK_DELETED: Color32 = Color32::from_rgb(0xC7, 0x4E, 0x39);
+    pub const LIGHT_DELETED: Color32 = Color32::from_rgb(0xAD, 0x07, 0x07);
+    // gitDecoration.renamedResourceForeground (VS Code は untracked と同系の緑)
+    pub const DARK_RENAMED: Color32 = Color32::from_rgb(0x73, 0xC9, 0x91);
+    pub const LIGHT_RENAMED: Color32 = Color32::from_rgb(0x00, 0x71, 0x00);
+    // gitDecoration.conflictingResourceForeground
+    pub const DARK_CONFLICTING: Color32 = Color32::from_rgb(0xE4, 0x67, 0x6B);
+    pub const LIGHT_CONFLICTING: Color32 = Color32::from_rgb(0xAD, 0x07, 0x07);
+}
+
+/// FileStatus に対応する VS Code 風カラー (テーマの明暗で切替) と
+/// ステータスバッジ文字・ホバー説明。
+fn git_status_style(
+    status: crate::git::FileStatus,
+    theme: &Theme,
+) -> (egui::Color32, &'static str, &'static str) {
     use crate::git::FileStatus;
+    use vscode_git_colors as gc;
+    let dark = theme.dark;
+    let pick = |d: egui::Color32, l: egui::Color32| if dark { d } else { l };
     match status {
         FileStatus::Modified => (
-            egui::Color32::from_rgb(229, 192, 123), // 薄いオレンジ/イエロー (VS Code #E5C07B)
+            pick(gc::DARK_MODIFIED, gc::LIGHT_MODIFIED),
             "M",
             "変更あり (Modified)",
         ),
         FileStatus::Added => (
-            egui::Color32::from_rgb(115, 201, 145), // 明るいグリーン (VS Code #73C991)
+            pick(gc::DARK_ADDED, gc::LIGHT_ADDED),
             "A",
             "追加済み (Added)",
         ),
         FileStatus::Untracked => (
-            egui::Color32::from_rgb(115, 201, 145), // 明るいグリーン (VS Code #73C991)
+            pick(gc::DARK_UNTRACKED, gc::LIGHT_UNTRACKED),
             "U",
             "未追跡 (Untracked)",
         ),
         FileStatus::Deleted => (
-            egui::Color32::from_rgb(224, 108, 117), // 赤 (VS Code #E06C75)
+            pick(gc::DARK_DELETED, gc::LIGHT_DELETED),
             "D",
             "削除済み (Deleted)",
         ),
         FileStatus::Renamed => (
-            egui::Color32::from_rgb(97, 175, 239), // シアン/ブルー (VS Code #61AFEF)
+            pick(gc::DARK_RENAMED, gc::LIGHT_RENAMED),
             "R",
             "名前変更 (Renamed)",
+        ),
+        FileStatus::Conflicted => (
+            pick(gc::DARK_CONFLICTING, gc::LIGHT_CONFLICTING),
+            "C",
+            "コンフリクト (Conflicted)",
         ),
     }
 }
@@ -952,6 +1074,8 @@ impl FileTree {
                     if menu_btn(ui, tr("🗑 削除…"), h("⌘⌫", "Delete")) {
                         actions.delete = Some(e.path.clone());
                     }
+                    ui.separator();
+                    self.auto_reveal_menu(ui);
                 });
             } else {
                 let (file_color, file_badge, hint) = if cut_pending {
@@ -1005,8 +1129,41 @@ impl FileTree {
                     if menu_btn(ui, tr("🗑 削除…"), h("⌘⌫", "Delete")) {
                         actions.delete = Some(e.path.clone());
                     }
+                    ui.separator();
+                    self.auto_reveal_menu(ui);
                 });
             }
+        }
+        self.deleted_ghost_rows(ui, dir, theme, gitinfo);
+    }
+
+    /// git 上は削除済みで fs には存在しないファイルを、VS Code のように
+    /// 打ち消し線付きの幽霊行として表示する (表示のみ・クリック不可)。
+    /// スキャン時に整理済みの「ディレクトリ → 削除ファイル名」の O(1) 参照なので安い。
+    fn deleted_ghost_rows(
+        &self,
+        ui: &mut egui::Ui,
+        dir: &Path,
+        theme: &Theme,
+        gitinfo: &crate::git::GitSet,
+    ) {
+        let names = gitinfo.deleted_names_in(dir);
+        if names.is_empty() {
+            return;
+        }
+        let (color, badge, hint) = git_status_style(crate::git::FileStatus::Deleted, theme);
+        for name in names {
+            if !self.show_hidden && name.starts_with('.') {
+                continue;
+            }
+            // まれに同名ファイルが再作成済み (D + ?? など) の場合は実体行を優先
+            if dir.join(name).exists() {
+                continue;
+            }
+            let text = RichText::new(format!("{} {}  {}", icon_for(name), name, badge))
+                .color(color)
+                .strikethrough();
+            ui.label(text).on_hover_text(tr(hint));
         }
     }
 
@@ -1030,6 +1187,20 @@ impl FileTree {
         if menu_btn_enabled(ui, can_paste, tr("📋 貼り付け"), h("⌘V", "Ctrl+V")) {
             self.paste_into(paste_dir, actions);
             self.focused = true;
+        }
+    }
+
+    /// アクティブファイル追従のトグル (VS Code: explorer.autoReveal 相当)。
+    /// 状態は egui の永続メモリに保存する (ui() 冒頭で書き戻し)。
+    fn auto_reveal_menu(&mut self, ui: &mut egui::Ui) {
+        let on = self.auto_reveal();
+        let label = if on {
+            tr("🎯 アクティブファイル追従: ON")
+        } else {
+            tr("🎯 アクティブファイル追従: OFF")
+        };
+        if menu_btn(ui, label, "") {
+            self.set_auto_reveal(!on);
         }
     }
 
@@ -1095,6 +1266,31 @@ fn set_open(ctx: &egui::Context, path: &Path, open: bool) {
 fn toggle_open(ctx: &egui::Context, path: &Path, default: bool) {
     let now = is_open(ctx, path, default);
     set_open(ctx, path, !now);
+}
+
+/// アクティブファイル追従トグルの egui 永続メモリキー。
+fn auto_reveal_id() -> egui::Id {
+    egui::Id::new("zv-tree-auto-reveal")
+}
+
+/// `path` を見えるようにするため展開すべき祖先ディレクトリ一覧
+/// (所属ルート含む・ルート側から順・`path` 自身は含まない)。
+/// どのルートにも属さなければ空 = reveal しない。
+pub(crate) fn reveal_ancestors(roots: &[PathBuf], path: &Path) -> Vec<PathBuf> {
+    let Some(root) = root_for(roots, path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cur = path.parent();
+    while let Some(d) = cur {
+        out.push(d.to_path_buf());
+        if d == root {
+            break;
+        }
+        cur = d.parent();
+    }
+    out.reverse();
+    out
 }
 
 /// 貼り付けの実行計画。`Ok(None)` は何もしない(同じ場所への切り取り貼り付け等)。
@@ -1455,5 +1651,87 @@ mod tests {
 
         assert!(t.refresh_if_changed(), "外部削除を検知する");
         assert!(t.entries(&dir).is_empty());
+    }
+
+    #[test]
+    fn reveal_ancestors_expands_root_to_parent() {
+        // 純粋なパス計算なので fs 不要
+        let root = PathBuf::from("/ws/project");
+        let roots = vec![root.clone()];
+        let file = root.join("src").join("deep").join("mod.rs");
+        assert_eq!(
+            reveal_ancestors(&roots, &file),
+            vec![root.clone(), root.join("src"), root.join("src").join("deep")],
+            "ルート → 親 の順で、対象自身は含まない"
+        );
+        // ルート直下のファイルはルートだけ
+        assert_eq!(reveal_ancestors(&roots, &root.join("main.rs")), vec![root.clone()]);
+    }
+
+    #[test]
+    fn reveal_ancestors_outside_roots_is_empty() {
+        let roots = vec![PathBuf::from("/ws/a"), PathBuf::from("/ws/b")];
+        assert!(reveal_ancestors(&roots, &PathBuf::from("/etc/hosts")).is_empty());
+        // マルチルートでは所属ルート (最長一致) 側の祖先だけを返す
+        let f = PathBuf::from("/ws/b/x/y.rs");
+        assert_eq!(
+            reveal_ancestors(&roots, &f),
+            vec![PathBuf::from("/ws/b"), PathBuf::from("/ws/b/x")]
+        );
+    }
+
+    #[test]
+    fn set_active_file_queues_reveal_only_on_change() {
+        let dir = unique_temp_dir("zaivern-tree-test", "reveal");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let f = sub.join("a.rs");
+        std::fs::write(&f, "x").expect("write");
+
+        let mut t = FileTree::new(vec![dir.clone()], false);
+        t.set_active_file(Some(&f));
+        assert_eq!(t.pending_reveal.as_deref(), Some(f.as_path()));
+
+        // 同じパスの再通知では再予約しない (毎フレーム呼ばれる前提)
+        t.pending_reveal = None;
+        t.set_active_file(Some(&f));
+        assert!(t.pending_reveal.is_none());
+
+        // ルート外のパスは reveal 対象にしない
+        t.set_active_file(Some(Path::new("/no/such/root.rs")));
+        assert!(t.pending_reveal.is_none());
+
+        // OFF → ON でアクティブファイルを reveal し直す
+        t.set_active_file(Some(&f));
+        t.pending_reveal = None;
+        t.set_auto_reveal(false);
+        assert!(t.pending_reveal.is_none());
+        t.set_auto_reveal(true);
+        assert_eq!(t.pending_reveal.as_deref(), Some(f.as_path()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_status_style_follows_theme_darkness() {
+        use crate::git::FileStatus;
+        let dark = crate::theme::by_name("zaivern-dark");
+        let light = crate::theme::by_name("zaivern-light");
+        for st in [
+            FileStatus::Modified,
+            FileStatus::Added,
+            FileStatus::Untracked,
+            FileStatus::Deleted,
+            FileStatus::Renamed,
+            FileStatus::Conflicted,
+        ] {
+            let (dc, db, _) = git_status_style(st, &dark);
+            let (lc, lb, _) = git_status_style(st, &light);
+            assert_eq!(db, lb, "バッジ文字はテーマ非依存");
+            assert_ne!(dc, lc, "ダーク/ライトで色を切り替える: {st:?}");
+        }
+        // バッジは VS Code 同様の 1 文字
+        assert_eq!(git_status_style(FileStatus::Conflicted, &dark).1, "C");
+        assert_eq!(git_status_style(FileStatus::Untracked, &dark).1, "U");
     }
 }
