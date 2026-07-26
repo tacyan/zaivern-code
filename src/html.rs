@@ -992,6 +992,24 @@ fn convert(text: &str, mode: Mode) -> String {
                 i += 1;
                 continue;
             }
+            // 数式区切りの中も原文コピー。`$a < b$` の `<` を勝手にタグと読んだり
+            // `a & b` を実体参照として潰したりしないため。
+            // 誤検出で本文を丸ごと飲み込まないよう、走査は行内に限る。
+            if c == '$' || c == '\\' {
+                let eol = chars[i..]
+                    .iter()
+                    .position(|&x| x == '\n')
+                    .map_or(chars.len(), |k| i + k);
+                if let Some((_, _, end)) = crate::markdown::math::read_at(&chars[..eol], i) {
+                    conv.push_char(c);
+                    for &cc in &chars[i + 1..end] {
+                        conv.sink().push(cc);
+                    }
+                    at_line_start = false;
+                    i = end;
+                    continue;
+                }
+            }
         }
 
         if c == '<' {
@@ -1150,6 +1168,33 @@ mod tests {
         assert!(is_html("Page.HTM", "Plain Text"));
         assert!(is_html("untitled", "HTML"));
         assert!(!is_html("README.md", "Markdown"));
+    }
+
+    /// 数式と mermaid フェンスは HTML 前処理を素通りしなければならない。
+    /// ここが壊れると、プレビュー側がどれだけ頑張っても式が読めなくなる。
+    #[test]
+    fn math_and_mermaid_survive_preprocess() {
+        for src in [
+            "行内の $x^2 + y^2 = z^2$ です",
+            "不等式 $a < b$ と $x > y$",
+            "行列 $\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}$",
+            "別行立て\n\n$$\\frac{1}{2}$$\n",
+            "括弧形式 \\(x < y\\) と \\[a & b\\]",
+            "```mermaid\ngraph TD\n  A[<b>太字</b>] --> B & C\n```",
+            "```mermaid\nsequenceDiagram\n  A->>B: a & b\n```",
+        ] {
+            assert_eq!(preprocess_markdown(src), src, "前処理で書き換わった: {src}");
+        }
+    }
+
+    /// 数式の保護が本文の HTML 変換を止めてしまわないこと。
+    #[test]
+    fn math_protection_does_not_swallow_the_document() {
+        // 閉じない `$` の後ろでも HTML はきちんと変換される
+        let out = preprocess_markdown("値段は $5 です\n<b>太字</b>\n");
+        assert!(out.contains("**太字**"), "{out}");
+        // 通貨表記は数式にならないのでそのまま
+        assert!(out.contains("$5"), "{out}");
     }
 
     #[test]
