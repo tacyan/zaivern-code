@@ -1913,20 +1913,19 @@ fn pick_tail_lines(text: &str, rows: usize, max: usize) -> Vec<String> {
             !t.is_empty() && t.chars().any(char::is_alphanumeric)
         })
         .take(rows)
-        .map(|l| truncate_chars(l, max))
+        .map(|l| truncate_cols(l, max))
         .collect();
     lines.reverse();
     lines
 }
 
-/// `max` 文字を超える文字列を「…」付きで詰める (char 境界で安全に切る)。
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
-    t.push('…');
-    t
+/// `max` **桁**を超える行を「…」付きで詰める。
+///
+/// 文字数ではなく表示桁数で数える: 「日本語の行だけタイルから 2 倍はみ出す」
+/// のを防ぐため。全角文字の途中では切らない
+/// ([`crate::textenc::truncate_to_width`] が桁数の唯一の出どころ)。
+fn truncate_cols(s: &str, max: usize) -> String {
+    crate::textenc::truncate_to_width(s, max)
 }
 
 /// kill を撃ってよい相手を判定する純関数 (Drop の木殺しが使う)。
@@ -2085,7 +2084,7 @@ pub fn abandon(session: Session) {
 
 #[cfg(test)]
 mod tail_tests {
-    use super::truncate_chars;
+    use super::truncate_cols;
 
     #[test]
     fn tail_skips_border_and_blank_lines() {
@@ -2095,9 +2094,11 @@ mod tail_tests {
 
     #[test]
     fn truncate_is_char_safe() {
-        assert_eq!(truncate_chars("短い", 10), "短い");
-        // 5 文字上限 → 4 文字 + 「…」
-        assert_eq!(truncate_chars("あいうえおかき", 5), "あいうえ…");
+        assert_eq!(truncate_cols("短い", 10), "短い");
+        // 5 **桁**上限 → 全角 2 文字 (4 桁) + 「…」(1 桁)。
+        // 文字数で切ると全角 4 文字 = 8 桁になり、枠を倍はみ出していた。
+        assert_eq!(truncate_cols("あいうえおかき", 5), "あい…");
+        assert_eq!(truncate_cols("ｱｲｳｴｵｶｷ", 5), "ｱｲｳｴ…", "半角カナは 1 桁");
     }
 
     #[test]
@@ -4434,7 +4435,7 @@ fn paint_search_highlights(
             if cell.is_wide_continuation() {
                 continue;
             }
-            let w = if cell.is_wide() { 2 } else { 1 };
+            let w = cell_draw_cols(screen, row, col);
             let s = cell.contents();
             if s.is_empty() {
                 chars.push(' ');
@@ -4977,11 +4978,9 @@ fn prune_clip_pngs(dir: &Path, keep: usize) {
 
 /// V + そのOSの「ペースト修飾」(macOS: ⌘ / それ以外: Ctrl) だけの組み合わせか。
 /// Ctrl+Shift+V (端末流の生ペースト) や Alt 併用は対象外にして既存挙動を守る。
-fn is_image_paste_chord(key: egui::Key, m: egui::Modifiers) -> bool {
-    is_image_paste_chord_on(key, m, cfg!(target_os = "macos"))
-}
-
-/// OS 判定を引数で受ける実体 (両分岐をどの環境でもテストできるようにする)。
+///
+/// OS 判定は引数で受ける (両分岐をどの環境でもテストできるようにする)。
+/// 実行時の値は [`InputCaps::mac`] 経由で `cfg!(target_os = "macos")` が入る。
 fn is_image_paste_chord_on(key: egui::Key, m: egui::Modifiers, mac: bool) -> bool {
     if key != egui::Key::V || m.shift || m.alt {
         return false;
@@ -5008,6 +5007,211 @@ fn clipboard_image_to_png() -> Option<PathBuf> {
     save_clipboard_png(img.width, img.height, &img.bytes, &clip_image_dir()).ok()
 }
 
+/// 1 フレーム分の入力を翻訳した結果。
+///
+/// PTY へ書くバイト列は **1 本にまとめる**。イベントごとに書き分けると
+/// 「あ」の 3 バイトが別々の write に割れて子プロセスへ届き、
+/// UTF-8 の途中で切れた列を読んだ CLI が化けることがある。
+#[derive(Default, Debug, PartialEq, Eq)]
+struct InputPlan {
+    /// PTY へ 1 回で書き出すバイト列。
+    out: Vec<u8>,
+    /// 選択範囲をクリップボードへ。
+    copy: bool,
+    /// 画面全体を選択。
+    select_all: bool,
+    /// CLI の入力欄だけを選択してコピー。
+    input_select: Option<InputAreaSel>,
+}
+
+/// 翻訳に必要な端末の状態 (画面ロックを持ち込まずに済むよう値で渡す)。
+#[derive(Clone, Copy, Debug)]
+struct InputCaps {
+    /// DECCKM (アプリケーションカーソルキー) が有効か。
+    app_cursor: bool,
+    /// ブラケットペーストが有効か。
+    bracketed: bool,
+    /// 画面末尾を見ているか (履歴スクロール中は Ctrl+A の入力欄選択を使わない)。
+    at_bottom: bool,
+    /// macOS か (⌘ 系のキー割り当てを両分岐ともテストできるよう引数で受ける)。
+    mac: bool,
+}
+
+/// このフレームで IME の変換が「終わった」か。
+///
+/// 変換の確定・取り消しに使った Enter / Escape は **IME への操作**であって
+/// 端末への入力ではない。素通しすると
+///   * 日本語を確定した瞬間に CLI へ送信されてしまう (確定 Enter が改行になる)
+///   * 変換を取り消した Escape が TUI のモードを抜けてしまう
+/// という、日本語入力では毎回起きる事故になる。
+///
+/// egui-winit は環境によって並びが違う (Windows は Commit の前後に
+/// Enabled/Disabled を出し、macOS は Disabled を出さない) ので、
+/// **順序に依存せずフレーム単位で**判定する。
+fn ime_ended_in_frame(events: &[egui::Event], composing_at_start: bool) -> bool {
+    let mut ended = false;
+    for ev in events {
+        if let egui::Event::Ime(ime) = ev {
+            match ime {
+                egui::ImeEvent::Commit(_) => return true,
+                // 未確定文字列が空になった = 確定 or 取り消しで変換が閉じた
+                egui::ImeEvent::Preedit(t) if t.is_empty() && composing_at_start => ended = true,
+                egui::ImeEvent::Disabled if composing_at_start => ended = true,
+                _ => {}
+            }
+        }
+    }
+    ended
+}
+
+/// キーボード/IME/ペースト入力を PTY 向けのバイト列へ翻訳する純関数。
+///
+/// 端末にもクリップボードにも触らないので、IME の並び (未確定 → 更新 → 確定)
+/// をテストからそのまま流し込める。副作用が要る 2 つだけ関数で受け取る:
+/// `input_area` (画面から CLI の入力欄を探す) と `paste_image`
+/// (クリップボードの画像を保存して `@パス` を作る)。
+///
+/// IME の規則:
+/// 1. **未確定文字列 (preedit) は PTY へ送らない。** 画面にオーバーレイ表示するだけ。
+///    途中経過を送ると、ハングルは初声だけが送られて音節が分裂し、日本語は
+///    未変換のかなが混ざる。
+/// 2. **確定文字列 (Commit) だけを送る。** 1 フレーム 1 回の書き込みに束ねる。
+/// 3. 変換中に届いた `Text` は無視する (IME が処理中の生キーが漏れたもの)。
+/// 4. 確定と**同じ文字列**が同フレームで `Text` としても届く環境がある。
+///    そのまま流すと CJK が二重に入る (Windows の一部 IME で起きる) ので落とす。
+/// 5. 変換が終わったフレームの Enter / Escape は IME への操作なので送らない。
+///    次のフレームの Enter は通常どおり送る (確定 → 送信 の 2 打鍵は成立する)。
+fn translate_input<A, P>(
+    events: &[egui::Event],
+    preedit: &mut String,
+    caps: InputCaps,
+    mut input_area: A,
+    mut paste_image: P,
+) -> InputPlan
+where
+    A: FnMut() -> Option<InputAreaSel>,
+    P: FnMut() -> Option<String>,
+{
+    let mut plan = InputPlan::default();
+    let ime_ended = ime_ended_in_frame(events, !preedit.is_empty());
+    // 確定した文字列 (同フレームの Text 重複を落とすため覚えておく)
+    let mut committed: Vec<String> = Vec::new();
+
+    for ev in events {
+        match ev {
+            // ⌘C: 選択範囲をクリップボードへ(選択が無ければ何もしない)。
+            // Ctrl+C は Key イベントとしてそのまま PTY へ届く(SIGINT)。
+            egui::Event::Copy => {
+                plan.copy = true;
+            }
+            egui::Event::Text(t) => {
+                // 規則 3: 変換中の生テキストは IME に任せる
+                if !preedit.is_empty() {
+                    continue;
+                }
+                // 規則 4: 確定文字列の二重入力を落とす
+                if let Some(i) = committed.iter().position(|c| c == t) {
+                    committed.remove(i);
+                    continue;
+                }
+                plan.out.extend_from_slice(t.as_bytes());
+            }
+            // IME(日本語入力など): 変換確定文字列を PTY へ送り、
+            // 変換中の未確定文字列はオーバーレイ表示用に保持する。
+            egui::Event::Ime(ime) => match ime {
+                egui::ImeEvent::Commit(t) => {
+                    preedit.clear();
+                    if !t.is_empty() {
+                        plan.out.extend_from_slice(t.as_bytes());
+                        committed.push(t.clone());
+                    }
+                }
+                egui::ImeEvent::Preedit(t) => {
+                    preedit.clear();
+                    preedit.push_str(t);
+                }
+                egui::ImeEvent::Enabled | egui::ImeEvent::Disabled => {
+                    preedit.clear();
+                }
+            },
+            egui::Event::Paste(t) => {
+                if caps.bracketed {
+                    plan.out.extend_from_slice(b"\x1b[200~");
+                }
+                plan.out.extend_from_slice(t.as_bytes());
+                if caps.bracketed {
+                    plan.out.extend_from_slice(b"\x1b[201~");
+                }
+            }
+            // ⌘V / Ctrl+V で画像を貼る: egui-winit はクリップボードに
+            // テキストが無いと Paste イベントを出さず、押下キーイベントも
+            // 飲み込む (リリースだけ届く) ため、V のキーリリースで画像を
+            // 拾う。画像は PNG 保存して @パス を挿入するだけで Enter は
+            // 送らない (ドラッグ&ドロップ挿入と同じ振る舞い)。画像なし・
+            // 保存失敗時は何もせず従来の挙動のまま。
+            egui::Event::Key {
+                key,
+                pressed: false,
+                modifiers,
+                ..
+            } if is_image_paste_chord_on(*key, *modifiers, caps.mac) => {
+                if let Some(text) = paste_image() {
+                    plan.out.extend_from_slice(text.as_bytes());
+                }
+            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
+                if modifiers.mac_cmd {
+                    // ⌘A: Terminal.app と同じく、PTY へは送らずローカルで
+                    // 表示中の画面全体を選択する (⌘C でそのままコピーできる)。
+                    // CLI 側へ Ctrl+A を送っても「行頭移動」になるだけで
+                    // 全選択にはならない。
+                    if *key == egui::Key::A {
+                        plan.select_all = true;
+                    } else if let Some(b) = mac_agent_input_bytes(*key, *modifiers) {
+                        plan.out.extend_from_slice(b);
+                    }
+                    continue;
+                }
+                // IME 変換中はキーを IME に任せる(Enter/矢印で確定・候補選択するため)
+                if !preedit.is_empty() {
+                    continue;
+                }
+                // 規則 5: 変換を閉じた Enter / Escape は端末へ送らない
+                if ime_ended && matches!(*key, egui::Key::Enter | egui::Key::Escape) {
+                    continue;
+                }
+                // Ctrl+A: 画面から CLI の入力欄 (› ❯ > 等のプロンプト行) を
+                // 検出できたら PTY へ \x01 を送らず、いま打ち込んでいる本文
+                // だけを選択してクリップボードへコピーする (音声入力した文を
+                // そのまま使い回すため)。Claude Code / Codex / Gemini など
+                // ツールを問わず見た目で判定し、検出できない画面 (素の
+                // シェル等) では従来通り行頭移動として送る。
+                if *key == egui::Key::A
+                    && modifiers.ctrl
+                    && !modifiers.alt
+                    && !modifiers.shift
+                    && caps.at_bottom
+                {
+                    if let Some(f) = input_area() {
+                        plan.input_select = Some(f);
+                        continue;
+                    }
+                }
+                if let Some(b) = key_bytes(*key, *modifiers, caps.app_cursor) {
+                    plan.out.extend_from_slice(&b);
+                }
+            }
+            _ => {}
+        }
+    }
+    plan
+}
+
 /// フォーカス中のキーボード/IME/ペースト入力を PTY へ転送する。
 fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: egui::Id) {
     ui.memory_mut(|m| {
@@ -5027,110 +5231,29 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
         let s = p.screen();
         (s.application_cursor(), s.bracketed_paste())
     };
-    let mut out: Vec<u8> = Vec::new();
-    let mut want_copy = false;
-    let mut want_select_all = false;
-    let mut input_select: Option<InputAreaSel> = None;
-    for ev in &events {
-        match ev {
-            // ⌘C: 選択範囲をクリップボードへ(選択が無ければ何もしない)。
-            // Ctrl+C は Key イベントとしてそのまま PTY へ届く(SIGINT)。
-            egui::Event::Copy => {
-                want_copy = true;
-            }
-            egui::Event::Text(t) => {
-                out.extend_from_slice(t.as_bytes());
-            }
-            // IME(日本語入力など): 変換確定文字列を PTY へ送り、
-            // 変換中の未確定文字列はオーバーレイ表示用に保持する。
-            egui::Event::Ime(ime) => match ime {
-                egui::ImeEvent::Commit(t) => {
-                    out.extend_from_slice(t.as_bytes());
-                    session.preedit.clear();
-                }
-                egui::ImeEvent::Preedit(t) => {
-                    session.preedit = t.clone();
-                }
-                egui::ImeEvent::Enabled | egui::ImeEvent::Disabled => {
-                    session.preedit.clear();
-                }
-            },
-            egui::Event::Paste(t) => {
-                if bracketed {
-                    out.extend_from_slice(b"\x1b[200~");
-                }
-                out.extend_from_slice(t.as_bytes());
-                if bracketed {
-                    out.extend_from_slice(b"\x1b[201~");
-                }
-            }
-            // ⌘V / Ctrl+V で画像を貼る: egui-winit はクリップボードに
-            // テキストが無いと Paste イベントを出さず、押下キーイベントも
-            // 飲み込む (リリースだけ届く) ため、V のキーリリースで画像を
-            // 拾う。画像は PNG 保存して @パス を挿入するだけで Enter は
-            // 送らない (ドラッグ&ドロップ挿入と同じ振る舞い)。画像なし・
-            // 保存失敗時は何もせず従来の挙動のまま。
-            egui::Event::Key {
-                key,
-                pressed: false,
-                modifiers,
-                ..
-            } if is_image_paste_chord(*key, *modifiers) => {
-                if let Some(png) = clipboard_image_to_png() {
-                    let text = format!("@{} ", prompt_path(&png, &session.cwd));
-                    out.extend_from_slice(text.as_bytes());
-                }
-            }
-            egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } => {
-                if modifiers.mac_cmd {
-                    // ⌘A: Terminal.app と同じく、PTY へは送らずローカルで
-                    // 表示中の画面全体を選択する (⌘C でそのままコピーできる)。
-                    // CLI 側へ Ctrl+A を送っても「行頭移動」になるだけで
-                    // 全選択にはならない。
-                    if *key == egui::Key::A {
-                        want_select_all = true;
-                    } else if let Some(b) = mac_agent_input_bytes(*key, *modifiers) {
-                        out.extend_from_slice(b);
-                    }
-                    continue;
-                }
-                // IME 変換中はキーを IME に任せる(Enter/矢印で確定・候補選択するため)
-                if !session.preedit.is_empty() {
-                    continue;
-                }
-                // Ctrl+A: 画面から CLI の入力欄 (› ❯ > 等のプロンプト行) を
-                // 検出できたら PTY へ \x01 を送らず、いま打ち込んでいる本文
-                // だけを選択してクリップボードへコピーする (音声入力した文を
-                // そのまま使い回すため)。Claude Code / Codex / Gemini など
-                // ツールを問わず見た目で判定し、検出できない画面 (素の
-                // シェル等) では従来通り行頭移動として送る。
-                if *key == egui::Key::A
-                    && modifiers.ctrl
-                    && !modifiers.alt
-                    && !modifiers.shift
-                    && session.scroll == 0
-                {
-                    let found = {
-                        let p = lock_ok(&session.parser);
-                        input_area_selection(p.screen())
-                    };
-                    if let Some(f) = found {
-                        input_select = Some(f);
-                        continue;
-                    }
-                }
-                if let Some(b) = key_bytes(*key, *modifiers, app_cursor) {
-                    out.extend_from_slice(&b);
-                }
-            }
-            _ => {}
-        }
-    }
+    let caps = InputCaps {
+        app_cursor,
+        bracketed,
+        at_bottom: session.scroll == 0,
+        mac: cfg!(target_os = "macos"),
+    };
+    // 純関数側へ渡す副作用 2 つ。呼ばれたときだけ画面ロック/クリップボードに触る。
+    let parser = session.parser.clone();
+    let cwd = session.cwd.clone();
+    let InputPlan {
+        out,
+        copy: want_copy,
+        select_all: want_select_all,
+        input_select,
+    } = translate_input(
+        &events,
+        &mut session.preedit,
+        caps,
+        || input_area_selection(lock_ok(&parser).screen()),
+        || {
+            clipboard_image_to_png().map(|png| format!("@{} ", prompt_path(&png, &cwd)))
+        },
+    );
     if !out.is_empty() {
         // 人が打った分は音声入力の書き込み追跡とずれるので印を立てる。
         // 承認プロンプトへの手入力応答もここで「応答済み」として解決する
@@ -5212,6 +5335,56 @@ fn handle_wheel_scroll(
     }
 }
 
+/// セル `(row, col)` を描くときに実際に使ってよい桁数を決める純関数。
+///
+/// 普段は「全角 = 2 桁 / それ以外 = 1 桁」。ただし**全角の右半分が失われた
+/// セルが残ることがある**: 端末を狭めると、右端に入り切らなくなった全角が
+/// 継続セルを失ったまま最終列に居残り、そのあと広げると行の途中に居座る
+/// (vt100 のリサイズは行を組み直さない)。そのまま 2 桁で描くと、
+///   * 最終列なら 背景・下線・カーソルが端末の枠から半桁はみ出し、
+///   * 行の途中なら 右隣のセルの文字とグリフが重なる (二重に見える)。
+///
+/// どちらも「置き場がある桁数まで詰める」ことで防ぐ。`right_free` は
+/// 右隣が継続セル (= 自分の右半分) か空セルであること。
+fn draw_cols(wide: bool, col: u16, cols: u16, right_free: bool) -> u16 {
+    if wide && col + 1 < cols && right_free {
+        2
+    } else {
+        1
+    }
+}
+
+/// [`draw_cols`] を画面の実状態から呼ぶ。
+fn cell_draw_cols(screen: &vt100::Screen, row: u16, col: u16) -> u16 {
+    let (_, cols) = screen.size();
+    let wide = screen.cell(row, col).is_some_and(|c| c.is_wide());
+    let right_free = col
+        .checked_add(1)
+        .and_then(|n| screen.cell(row, n))
+        .is_some_and(|n| n.is_wide_continuation() || !n.has_contents());
+    draw_cols(wide, col, cols, right_free)
+}
+
+/// カーソルが占めるセル範囲 `(開始列, 桁数)`。
+///
+/// 全角文字の上にカーソルがあるとき 1 桁で描くと「文字の左半分だけ反転する」
+/// ので、日本語を打っている間ずっと壊れて見える。**グリッドが 2 セル取って
+/// いるならカーソルも 2 セル**にして、描画とセルの持ち方を一致させる。
+///
+/// 継続セル (全角の右半分) を指している場合は左半分まで戻す。アプリが
+/// `CUP` / `DECRC` で右半分を直接指定することは正常に起こり得るため、
+/// そこを「1 桁の別文字」として描かない。
+fn cursor_span(screen: &vt100::Screen, row: u16, col: u16) -> (u16, u16) {
+    match screen.cell(row, col) {
+        Some(c) if c.is_wide() => (col, cell_draw_cols(screen, row, col)),
+        Some(c) if c.is_wide_continuation() => {
+            let left = col.saturating_sub(1);
+            (left, cell_draw_cols(screen, row, left))
+        }
+        _ => (col, 1),
+    }
+}
+
 /// 画面グリッド(文字セル・選択ハイライト)、カーソル、IME オーバーレイの描画。
 #[allow(clippy::too_many_arguments)]
 fn draw_screen(
@@ -5248,7 +5421,7 @@ fn draw_screen(
             if x >= rect.max.x {
                 continue;
             }
-            let w = if cell.is_wide() { cell_w * 2.0 } else { cell_w };
+            let w = cell_w * f32::from(cell_draw_cols(screen, r, cix));
             let cell_rect =
                 egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, cell_h));
 
@@ -5295,12 +5468,13 @@ fn draw_screen(
     }
 
     let (cr, cc) = screen.cursor_position();
+    let (cur_col, cur_cells) = cursor_span(screen, cr, cc);
     let cursor_rect = egui::Rect::from_min_size(
         egui::pos2(
-            origin.x + cc as f32 * cell_w,
-            origin.y + cr as f32 * cell_h,
+            origin.x + f32::from(cur_col) * cell_w,
+            origin.y + f32::from(cr) * cell_h,
         ),
-        egui::vec2(cell_w, cell_h),
+        egui::vec2(cell_w * f32::from(cur_cells), cell_h),
     );
 
     if session.scroll == 0 && !screen.hide_cursor() {
@@ -5339,7 +5513,21 @@ fn draw_screen(
 
     if focused {
         // IME を有効化し、変換候補ウィンドウをカーソル位置に出す
-        // (これが無いと日本語入力イベントが届かない)
+        // (これが無いと日本語入力イベントが届かない)。
+        //
+        // egui-winit は `PlatformOutput::ime` が `Some` のときだけ
+        // `Window::set_ime_allowed(true)` を呼び、その矩形を
+        // `set_ime_cursor_area` に流す。つまりここを出すこと自体が
+        // 「この端末は IME を受け付ける」の宣言になっている。
+        //
+        // 矩形は [`cursor_span`] で求めた**全角なら 2 桁ぶん**のカーソル矩形。
+        // 1 桁で渡すと、全角を打っている最中の候補ウィンドウが半桁ずれる。
+        //
+        // 注意 (Linux): egui-winit 0.29 は Linux で IME イベントを丸ごと
+        // 無視する (upstream egui#5008 の回避)。したがって Linux では
+        // 未確定文字列のオーバーレイは出ず、確定文字列は `Event::Text` として
+        // 届く経路になる — [`translate_input`] は Text も通常入力として
+        // 扱うので、そのままでも文字は端末へ入る。
         ui.ctx().output_mut(|o| {
             o.mutable_text_under_cursor = true;
             o.ime = Some(egui::output::IMEOutput {
@@ -5348,14 +5536,25 @@ fn draw_screen(
             });
         });
 
-        // IME 変換中の未確定文字列をカーソル位置にオーバーレイ表示
+        // IME 変換中の未確定文字列をカーソル位置にオーバーレイ表示。
+        //
+        // 幅は「確定したらグリッドで何桁になるか」で測る (文字数で測ると
+        // 日本語が枠の 2 倍はみ出す)。等幅フォントでも合成文字や絵文字は
+        // グリフ送りが桁数と一致しないので、桁数とグリフ幅の**広いほう**を
+        // 場所取りに使い、端末の右端を越えるぶんだけ左へ寄せる
+        // (寄せないと隣のパネルの上に未確定文字列が流れ出す)。
         if !session.preedit.is_empty() {
             let galley = painter.layout_no_wrap(
                 session.preedit.clone(),
                 font_id.clone(),
                 theme.term_fg,
             );
-            let pos = cursor_rect.min;
+            let want = (crate::textenc::str_width(&session.preedit) as f32 * cell_w)
+                .max(galley.size().x);
+            let left = rect.min.x + padding;
+            let right = rect.max.x - padding;
+            let x = cursor_rect.min.x.min((right - want).max(left));
+            let pos = egui::pos2(x, cursor_rect.min.y);
             let bg = egui::Rect::from_min_size(pos, galley.size()).expand(1.0);
             painter.rect_filled(bg, 2.0, theme.accent.gamma_multiply(0.35));
             painter.galley(pos, galley, theme.term_fg);
@@ -6891,5 +7090,678 @@ mod pty_resize_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         s.kill();
+    }
+}
+
+/// CJK / IME まわりの正しさ。
+///
+/// 日本語・ハングル・中国語の入力と表示は、CI で人が打って確かめられない。
+/// そこで「vt100 の実物へ書き込んで読み返す」「イベント列を純関数へ流す」
+/// の 2 通りで、手で試すのと同じことを機械にやらせる。
+#[cfg(test)]
+mod cjk_tests {
+    use super::{
+        cursor_span, ime_ended_in_frame, selection_text, translate_input, word_selection,
+        InputCaps, InputPlan,
+    };
+    use eframe::egui;
+
+    // ───────────────────────── グリッド (vt100 実物) ─────────────────────────
+
+    fn parser(rows: u16, cols: u16) -> vt100::Parser {
+        vt100::Parser::new(rows, cols, 100)
+    }
+
+    /// 1 行ぶんを「継続セルを飛ばした見た目の文字列」として読む。
+    fn row_text(p: &vt100::Parser, row: u16) -> String {
+        let screen = p.screen();
+        let (_, cols) = screen.size();
+        let mut out = String::new();
+        for c in 0..cols {
+            let Some(cell) = screen.cell(row, c) else { continue };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let t = cell.contents();
+            out.push_str(if t.is_empty() { " " } else { &t });
+        }
+        out.trim_end().to_string()
+    }
+
+    /// 全角文字は「左半分 = 本体 / 右半分 = 継続セル」の対で並ぶこと。
+    ///
+    /// **必ず守られる不変条件**は「継続セルの左は必ず全角」のほう。ここが崩れると
+    /// 描画側 (`is_wide_continuation()` を読み飛ばす) が 1 桁ずれる。
+    ///
+    /// 逆向き (全角の右に継続セルがある) は**常には成り立たない**: 端末を狭めると、
+    /// 右端に入り切らなくなった全角が継続セルを失って最終列に残る。これは
+    /// [`super::draw_cols`] が描画時に 1 桁へ詰めて吸収する契約なので、
+    /// 「行の途中で対が崩れていないこと」だけを検査する。
+    fn assert_no_split_glyph(p: &vt100::Parser, what: &str) {
+        let screen = p.screen();
+        let (rows, cols) = screen.size();
+        for r in 0..rows {
+            for c in 0..cols {
+                let Some(cell) = screen.cell(r, c) else { continue };
+                if cell.is_wide() && c + 1 < cols {
+                    let next = screen.cell(r, c + 1).expect("右隣のセル");
+                    assert!(
+                        next.is_wide_continuation() || !next.has_contents(),
+                        "{what}: 全角の右隣に別の文字が入り込んでいる ({r},{c})"
+                    );
+                }
+                if cell.is_wide_continuation() {
+                    assert!(c > 0, "{what}: 継続セルが行頭にある ({r},{c})");
+                    let prev = screen.cell(r, c - 1).expect("左隣のセル");
+                    assert!(
+                        prev.is_wide(),
+                        "{what}: 継続セルの左が全角でない ({r},{c})"
+                    );
+                }
+                // どこにあっても、描画に使う桁数は画面の右端を越えない
+                let w = super::cell_draw_cols(screen, r, c);
+                assert!(
+                    c + w <= cols,
+                    "{what}: 描画桁が画面をはみ出す ({r},{c}) w={w} cols={cols}"
+                );
+            }
+        }
+    }
+
+    /// 右端に入り切らない全角は**1 文字まるごと**次行へ送られること。
+    /// 半分だけ置いて折り返すと「文字が縦に割れる」= CJK 端末の典型的な壊れ方。
+    #[test]
+    fn wide_char_wraps_as_one_unit_at_the_right_edge() {
+        // 奇数桁の端末: 全角は 1 桁だけ余った状態にぶつかる
+        for cols in [5u16, 7, 9] {
+            let mut p = parser(3, cols);
+            p.process("あいうえお".as_bytes());
+            assert_no_split_glyph(&p, &format!("{cols} 桁で折返し"));
+            // 全部の文字がどこかに残っている (欠落しない)
+            let all: String = (0..3).map(|r| row_text(&p, r)).collect();
+            for ch in "あいうえお".chars() {
+                assert!(all.contains(ch), "{cols} 桁: {ch} が消えた ({all:?})");
+            }
+        }
+    }
+
+    /// 半角と全角が混ざって右端をまたぐ場合も割れないこと。
+    #[test]
+    fn mixed_width_wrap_keeps_wide_chars_intact() {
+        let mut p = parser(4, 6);
+        p.process("ab日本語cd".as_bytes());
+        assert_no_split_glyph(&p, "半角全角の混在");
+        let joined: String = (0..4).map(|r| row_text(&p, r)).collect();
+        for ch in "日本語".chars() {
+            assert!(joined.contains(ch), "{ch} が消えた ({joined:?})");
+        }
+    }
+
+    /// 幅 1 の端末へ全角を書いても panic せず、無限ループにもならないこと
+    /// (`vendor/vt100` の桁溢れ修正が効いていることの回帰テスト)。
+    #[test]
+    fn wide_char_on_a_one_column_terminal_does_not_panic() {
+        for cols in [1u16, 2] {
+            let mut p = parser(3, cols);
+            p.process("あい漢字".as_bytes());
+            assert_no_split_glyph(&p, &format!("{cols} 桁"));
+        }
+    }
+
+    /// 全角の**左半分**を半角で上書きしたら、右半分 (継続セル) も消えること。
+    /// 消し残すと前の字の右半分が画面に居座る = Windows で報告される
+    /// 「CJK が二重に見える」の典型。
+    #[test]
+    fn overwriting_the_left_half_of_a_wide_cell_clears_both_halves() {
+        let mut p = parser(1, 10);
+        p.process("日本".as_bytes());
+        assert_eq!(row_text(&p, 0), "日本");
+        // 行頭へ戻って半角 1 文字を書く
+        p.process(b"\r");
+        p.process(b"x");
+        assert_no_split_glyph(&p, "左半分の上書き");
+        let screen = p.screen();
+        assert_eq!(screen.cell(0, 0).unwrap().contents(), "x");
+        assert!(
+            !screen.cell(0, 1).unwrap().is_wide_continuation(),
+            "右半分が継続セルのまま残っている (二重描画の原因)"
+        );
+        assert!(
+            screen.cell(0, 1).unwrap().contents().trim().is_empty(),
+            "右半分は空白でなければならない: {:?}",
+            screen.cell(0, 1).unwrap().contents()
+        );
+        assert_eq!(row_text(&p, 0), "x 本", "残るのは 2 文字目だけ");
+    }
+
+    /// 全角の**右半分**へ直接書き込んだら、左半分も消えること。
+    #[test]
+    fn overwriting_the_right_half_of_a_wide_cell_clears_the_left_half() {
+        let mut p = parser(1, 10);
+        p.process("日本".as_bytes());
+        // CUP で 2 桁目 (= 「日」の右半分) へ移動して半角を書く
+        p.process(b"\x1b[1;2H");
+        p.process(b"z");
+        assert_no_split_glyph(&p, "右半分の上書き");
+        let screen = p.screen();
+        assert_eq!(screen.cell(0, 1).unwrap().contents(), "z");
+        assert!(
+            !screen.cell(0, 0).unwrap().is_wide(),
+            "左半分が全角のまま残っている (半分だけの字が描かれる)"
+        );
+        assert_eq!(row_text(&p, 0), " z本");
+    }
+
+    /// 全角を全角で上書きしても対が崩れないこと。
+    #[test]
+    fn overwriting_a_wide_cell_with_another_wide_char_is_clean() {
+        let mut p = parser(1, 10);
+        p.process("日本語".as_bytes());
+        p.process(b"\r");
+        p.process("한글".as_bytes());
+        assert_no_split_glyph(&p, "全角を全角で上書き");
+        assert_eq!(row_text(&p, 0), "한글語");
+    }
+
+    /// 全角が乗った画面を広げたり狭めたりしても、割れない・落ちないこと。
+    /// (debug ビルドで走るので、`vendor/vt100` の減算オーバーフローも捕まる)
+    #[test]
+    fn resize_with_wide_chars_never_splits_or_panics() {
+        let mut p = parser(6, 20);
+        p.process("日本語のテキスト\r\n한국어 텍스트\r\n中文文本\r\nascii mixed 日本\r\n".as_bytes());
+        // 狭める → 広げる → 極端に狭める → 戻す
+        for (rows, cols) in [
+            (6u16, 9u16),
+            (6, 3),
+            (6, 1),
+            (6, 40),
+            (2, 5),
+            (10, 21),
+            (6, 20),
+        ] {
+            p.set_size(rows, cols);
+            assert_no_split_glyph(&p, &format!("{rows}x{cols} へリサイズ"));
+            // 読み出しでも落ちないこと (描画が舐める経路と同じ)
+            let screen = p.screen();
+            let (r, c) = screen.size();
+            assert_eq!((r, c), (rows, cols));
+            for row in 0..r {
+                let _ = row_text(&p, row);
+                // 最終列に取り残された全角は 1 桁へ詰めて描く (枠からはみ出させない)
+                assert_eq!(
+                    super::cell_draw_cols(screen, row, c.saturating_sub(1)),
+                    1,
+                    "{rows}x{cols}: 最終列を 2 桁で描こうとしている"
+                );
+            }
+            let _ = screen.contents();
+        }
+    }
+
+    /// スクロールバックへ全角が流れても、読み出しで割れない・落ちないこと。
+    #[test]
+    fn wide_chars_in_scrollback_survive_reading() {
+        let mut p = parser(3, 8);
+        for i in 0..40 {
+            p.process(format!("行{i:02} 日本語\r\n").as_bytes());
+        }
+        for back in [0usize, 1, 5, 20, 100] {
+            p.set_scrollback(back);
+            assert_no_split_glyph(&p, &format!("scrollback={back}"));
+            let _ = p.screen().contents();
+        }
+        p.set_scrollback(0);
+    }
+
+    // ───────────────────────── カーソル / 選択 ─────────────────────────
+
+    /// 全角の上のカーソルは 2 桁ぶんになること (左半分だけ反転させない)。
+    #[test]
+    fn cursor_covers_both_halves_of_a_wide_cell() {
+        let mut p = parser(1, 10);
+        p.process("あA".as_bytes());
+        let screen = p.screen();
+        // 全角の左半分 → 2 桁
+        assert_eq!(cursor_span(screen, 0, 0), (0, 2), "全角の上は 2 桁");
+        // 全角の右半分 (継続セル) → 左半分へ戻して 2 桁
+        assert_eq!(cursor_span(screen, 0, 1), (0, 2), "継続セルは左半分へ戻す");
+        // 半角の上 → 1 桁
+        assert_eq!(cursor_span(screen, 0, 2), (2, 1), "半角の上は 1 桁");
+        // 空セル・画面外 → 1 桁 (落ちない)
+        assert_eq!(cursor_span(screen, 0, 9), (9, 1));
+        assert_eq!(cursor_span(screen, 0, 99), (99, 1));
+        assert_eq!(cursor_span(screen, 9, 0), (0, 1));
+    }
+
+    /// 描画桁を決める規則の表 (`wide × 位置 × 右隣の空き`)。
+    #[test]
+    fn draw_cols_policy_table() {
+        // (全角か, 列, 桁数, 右隣が空いているか, 期待)
+        let table: &[(bool, u16, u16, bool, u16, &str)] = &[
+            (false, 0, 10, true, 1, "半角は常に 1 桁"),
+            (false, 9, 10, true, 1, "半角 (最終列)"),
+            (true, 0, 10, true, 2, "全角 + 右に空きあり"),
+            (true, 8, 10, true, 2, "全角 (最終列のひとつ手前)"),
+            (true, 9, 10, true, 1, "全角が最終列 = 置き場が無いので 1 桁"),
+            (true, 0, 1, true, 1, "1 桁の端末"),
+            (true, 0, 10, false, 1, "右隣に別の文字 = 重なるので 1 桁"),
+        ];
+        for &(wide, col, cols, right_free, want, what) in table {
+            assert_eq!(
+                super::draw_cols(wide, col, cols, right_free),
+                want,
+                "{what}"
+            );
+        }
+    }
+
+    /// 実画面から桁数を引く経路 (継続セル・空セル・画面外) の確認。
+    #[test]
+    fn cell_draw_cols_reads_the_real_screen() {
+        let mut p = parser(1, 6);
+        p.process("日本x".as_bytes());
+        let screen = p.screen();
+        assert_eq!(super::cell_draw_cols(screen, 0, 0), 2, "「日」");
+        assert_eq!(super::cell_draw_cols(screen, 0, 1), 1, "継続セル自体は 1 桁");
+        assert_eq!(super::cell_draw_cols(screen, 0, 2), 2, "「本」");
+        assert_eq!(super::cell_draw_cols(screen, 0, 4), 1, "半角 x");
+        assert_eq!(super::cell_draw_cols(screen, 0, 5), 1, "空セル");
+        assert_eq!(super::cell_draw_cols(screen, 0, 99), 1, "画面外でも落ちない");
+        assert_eq!(super::cell_draw_cols(screen, 0, u16::MAX), 1, "桁が振り切れても落ちない");
+    }
+
+    /// 実際にカーソルが全角の上にあるとき 2 桁になること (`CUP` で置いた場合も)。
+    #[test]
+    fn cursor_span_follows_the_real_cursor_position() {
+        let mut p = parser(2, 10);
+        p.process("日本語".as_bytes());
+        p.process(b"\x1b[1;3H"); // 「本」の左半分
+        let (r, c) = p.screen().cursor_position();
+        assert_eq!(cursor_span(p.screen(), r, c), (2, 2));
+        p.process(b"\x1b[1;4H"); // 「本」の右半分
+        let (r, c) = p.screen().cursor_position();
+        assert_eq!(cursor_span(p.screen(), r, c), (2, 2), "右半分でも左から 2 桁");
+    }
+
+    /// 選択範囲のコピーが全角を欠かさない・二重にしないこと。
+    /// 継続セルの上で範囲が切れても、文字は 1 回だけ入る。
+    #[test]
+    fn selection_of_wide_chars_is_not_duplicated_or_split() {
+        let mut p = parser(2, 12);
+        p.process("日本語abc".as_bytes());
+        let screen = p.screen();
+        // 全画面
+        assert_eq!(selection_text(screen, ((0, 0), (0, 11))), "日本語abc");
+        // 「日本」だけ (継続セル 3 で切る)
+        assert_eq!(selection_text(screen, ((0, 0), (0, 3))), "日本");
+        // 継続セルから始める (「本」の右半分から) → 半分の字は入らない
+        assert_eq!(selection_text(screen, ((0, 3), (0, 5))), "語");
+        // 1 セルだけ: 全角の左半分
+        assert_eq!(selection_text(screen, ((0, 0), (0, 0))), "日");
+        // 1 セルだけ: 全角の右半分 (継続セル) → 空
+        assert_eq!(selection_text(screen, ((0, 1), (0, 1))), "");
+    }
+
+    /// ダブルクリックの語選択が全角の途中で切れないこと。
+    #[test]
+    fn word_selection_spans_whole_wide_chars() {
+        let mut p = parser(1, 20);
+        p.process("ab 日本語です cd".as_bytes());
+        let screen = p.screen();
+        // 「日本語です」は 3..=12 桁 (全角 5 文字 = 10 セル)
+        let want = Some(((0, 3), (0, 12)));
+        for c in 3..=12 {
+            assert_eq!(word_selection(screen, 0, c), want, "col={c} から広げた語");
+        }
+        // 空白の上は None
+        assert_eq!(word_selection(screen, 0, 2), None);
+    }
+
+    // ───────────────────────── IME 入力 ─────────────────────────
+
+    fn caps() -> InputCaps {
+        InputCaps {
+            app_cursor: false,
+            bracketed: false,
+            at_bottom: true,
+            mac: false,
+        }
+    }
+
+    fn preedit(s: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Preedit(s.to_string()))
+    }
+
+    fn commit(s: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Commit(s.to_string()))
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// テスト用の実行: 副作用 2 つは「何も起きない」にして純粋に回す。
+    fn run(events: &[egui::Event], state: &mut String) -> InputPlan {
+        translate_input(events, state, caps(), || None, || None)
+    }
+
+    fn out_str(plan: &InputPlan) -> String {
+        String::from_utf8(plan.out.clone()).expect("PTY へ送るのは常に妥当な UTF-8")
+    }
+
+    /// 未確定 → 更新 → 確定 で、**確定文字列が 1 回だけ**送られること。
+    /// 途中経過は 1 バイトも送らない (送るとハングルが分裂し、日本語は
+    /// 未変換のかなが混ざる)。
+    #[test]
+    fn preedit_is_never_sent_and_commit_is_sent_once() {
+        let mut state = String::new();
+        // フレーム 1〜3: 変換中 (「にほんご」→「日本語」)
+        for step in ["に", "にほ", "にほん", "にほんご", "日本語"] {
+            let plan = run(&[preedit(step)], &mut state);
+            assert!(plan.out.is_empty(), "未確定 {step:?} が PTY へ漏れた");
+            assert_eq!(state, step, "オーバーレイ表示用に保持する");
+        }
+        // フレーム 4: 確定
+        let plan = run(&[preedit(""), commit("日本語")], &mut state);
+        assert_eq!(out_str(&plan), "日本語", "確定文字列だけが 1 回送られる");
+        assert!(state.is_empty(), "確定したら未確定文字列は消える");
+    }
+
+    /// ハングルの多打鍵合成 (ㅎ → 하 → 한 → 한글) が途中で送られないこと。
+    /// 競合製品で「音節が分裂して入る」と報告されている経路そのもの。
+    #[test]
+    fn hangul_multi_keystroke_composition_is_not_split() {
+        let mut state = String::new();
+        for step in ["ㅎ", "하", "한", "한ㄱ", "한그", "한글"] {
+            let plan = run(&[preedit(step)], &mut state);
+            assert!(plan.out.is_empty(), "未確定 {step:?} が漏れた");
+        }
+        let plan = run(&[preedit(""), commit("한글")], &mut state);
+        assert_eq!(out_str(&plan), "한글");
+        // 1 回の書き込みにまとまっている = 音節が write 境界で割れない
+        assert_eq!(plan.out.len(), "한글".len());
+    }
+
+    /// 変換を取り消した (未確定が空になっただけ) フレームは 1 バイトも送らない。
+    /// 取り消しに使った Escape も端末へ送らない (TUI のモードが抜けてしまう)。
+    #[test]
+    fn cancelled_preedit_writes_nothing_and_swallows_escape() {
+        let mut state = String::new();
+        run(&[preedit("にほん")], &mut state);
+        assert_eq!(state, "にほん");
+        let plan = run(
+            &[preedit(""), egui::Event::Ime(egui::ImeEvent::Disabled), key(egui::Key::Escape)],
+            &mut state,
+        );
+        assert!(plan.out.is_empty(), "取り消しで何かが送られた: {:?}", plan.out);
+        assert!(state.is_empty());
+        // 変換していないときの Escape は従来どおり通る
+        let plan = run(&[key(egui::Key::Escape)], &mut state);
+        assert_eq!(plan.out, b"\x1b", "素の Escape は端末へ送る");
+    }
+
+    /// 確定に使った Enter は「送信」ではないこと。
+    /// 確定と同じフレームの Enter は飲み、**次のフレーム**の Enter は送る
+    /// (日本語入力の「変換確定 → もう一度 Enter で送信」が成立する)。
+    #[test]
+    fn commit_enter_confirms_without_submitting_but_the_next_enter_submits() {
+        let mut state = String::new();
+        run(&[preedit("にほんご")], &mut state);
+        // Windows 系の並び: Preedit("") → Commit → Disabled → Enter キー
+        let plan = run(
+            &[
+                preedit(""),
+                commit("日本語"),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                key(egui::Key::Enter),
+            ],
+            &mut state,
+        );
+        assert_eq!(out_str(&plan), "日本語", "確定 Enter で改行を送ってはいけない");
+        // 次のフレームの Enter は素通し = 送信できる
+        let plan = run(&[key(egui::Key::Enter)], &mut state);
+        assert_eq!(plan.out, b"\r", "2 打鍵目の Enter は送信として届く");
+    }
+
+    /// キーが確定より**先**に並ぶ環境でも同じ結果になること
+    /// (egui-winit のイベント順は OS ごとに違う)。
+    #[test]
+    fn enter_before_commit_in_the_same_frame_is_also_swallowed() {
+        let mut state = String::new();
+        run(&[preedit("かんじ")], &mut state);
+        let plan = run(&[key(egui::Key::Enter), preedit(""), commit("漢字")], &mut state);
+        assert_eq!(out_str(&plan), "漢字", "並び順に関係なく確定 Enter は飲む");
+    }
+
+    /// 確定と**同じ文字列**が `Text` としても届く環境で二重入力しないこと
+    /// (Windows の一部 IME で報告される「CJK が 2 回入る」)。
+    #[test]
+    fn commit_echoed_as_text_does_not_duplicate() {
+        let mut state = String::new();
+        let plan = run(
+            &[commit("日本語"), egui::Event::Text("日本語".into())],
+            &mut state,
+        );
+        assert_eq!(out_str(&plan), "日本語", "1 回だけ送る");
+        // 逆順 (Text が先) でも同じ
+        let mut state = String::new();
+        let plan = run(
+            &[egui::Event::Text("日本語".into()), commit("日本語")],
+            &mut state,
+        );
+        assert_eq!(out_str(&plan), "日本語日本語", "先行 Text は素の入力として扱う");
+    }
+
+    /// 別々の文字を確定した直後に、たまたま同じ文字を打鍵した場合は落とさない。
+    /// (重複排除は「確定 1 件につき最大 1 件」まで)
+    #[test]
+    fn dedupe_only_cancels_one_echo_per_commit() {
+        let mut state = String::new();
+        let plan = run(
+            &[
+                commit("あ"),
+                egui::Event::Text("あ".into()), // エコー → 落とす
+                egui::Event::Text("あ".into()), // 実際の打鍵 → 通す
+            ],
+            &mut state,
+        );
+        assert_eq!(out_str(&plan), "ああ");
+    }
+
+    /// 変換中に届いた生テキストは無視されること (未確定のかなが漏れない)。
+    #[test]
+    fn text_events_during_composition_are_ignored() {
+        let mut state = String::new();
+        let plan = run(
+            &[preedit("に"), egui::Event::Text("n".into()), preedit("にほ")],
+            &mut state,
+        );
+        assert!(plan.out.is_empty(), "変換中の生テキストが漏れた: {:?}", plan.out);
+        assert_eq!(state, "にほ");
+    }
+
+    /// 変換中のキー (Enter / 矢印 / Escape) は IME に渡し、端末へは送らないこと。
+    #[test]
+    fn keys_during_composition_go_to_the_ime() {
+        let mut state = String::new();
+        run(&[preedit("へんかん")], &mut state);
+        for k in [
+            egui::Key::Enter,
+            egui::Key::ArrowDown,
+            egui::Key::ArrowUp,
+            egui::Key::Space,
+            egui::Key::Escape,
+            egui::Key::Tab,
+        ] {
+            let plan = run(&[key(k)], &mut state);
+            assert!(plan.out.is_empty(), "変換中の {k:?} が端末へ漏れた");
+        }
+    }
+
+    /// 空の確定 (変換を確定せずに閉じた) は 1 バイトも送らないこと。
+    #[test]
+    fn empty_commit_writes_nothing() {
+        let mut state = String::from("にほん");
+        let plan = run(&[commit("")], &mut state);
+        assert!(plan.out.is_empty());
+        assert!(state.is_empty());
+    }
+
+    /// 確定文字列は**1 回の書き込み**にまとまること
+    /// (イベントごとに書き分けるとマルチバイトが write 境界で割れる)。
+    #[test]
+    fn a_frame_produces_exactly_one_write_payload() {
+        let mut state = String::new();
+        let plan = run(
+            &[
+                commit("あ"),
+                egui::Event::Text("b".into()),
+                commit("う"),
+                egui::Event::Text("え".into()),
+            ],
+            &mut state,
+        );
+        assert_eq!(out_str(&plan), "あbうえ", "順序どおり 1 本に連結される");
+        assert_eq!(
+            std::str::from_utf8(&plan.out).map(str::to_string),
+            Ok("あbうえ".to_string()),
+            "書き込む列は常に文字境界で閉じている"
+        );
+    }
+
+    /// ブラケットペーストでマルチバイトが分断されないこと。
+    /// 前後の印と本文が 1 本のバイト列に収まり、文字が印をまたがない。
+    #[test]
+    fn bracketed_paste_keeps_multibyte_text_in_one_write() {
+        let text = "日本語の貼り付け 한글 中文 🚀";
+        for bracketed in [false, true] {
+            let mut state = String::new();
+            let plan = translate_input(
+                &[egui::Event::Paste(text.into())],
+                &mut state,
+                InputCaps { bracketed, ..caps() },
+                || None,
+                || None,
+            );
+            let s = out_str(&plan);
+            if bracketed {
+                assert_eq!(s, format!("\x1b[200~{text}\x1b[201~"));
+                // 本文の前後だけに印があり、本文の内側では切れていない
+                assert_eq!(s.matches("\x1b[200~").count(), 1);
+                assert_eq!(s.matches("\x1b[201~").count(), 1);
+            } else {
+                assert_eq!(s, text);
+            }
+            assert!(s.contains(text), "本文が欠けた: {s:?}");
+        }
+    }
+
+    /// クリップボード画像の `@パス` 挿入がマルチバイトのパスでも壊れないこと。
+    #[test]
+    fn image_paste_inserts_a_multibyte_path_in_one_write() {
+        let inserted = "@画像/スクリーンショット 001.png ";
+        let mut state = String::new();
+        let plan = translate_input(
+            &[egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            &mut state,
+            caps(),
+            || None,
+            || Some(inserted.to_string()),
+        );
+        assert_eq!(out_str(&plan), inserted);
+        // Enter は送らない (勝手に送信しない)
+        assert!(!plan.out.contains(&b'\r'));
+    }
+
+    /// 変換中に画面外へフォーカスが移った等で IME が無効化されたら、
+    /// 未確定文字列は消えて何も送られないこと。
+    #[test]
+    fn ime_disabled_clears_the_preedit_without_writing() {
+        let mut state = String::from("にほん");
+        let plan = run(&[egui::Event::Ime(egui::ImeEvent::Disabled)], &mut state);
+        assert!(plan.out.is_empty());
+        assert!(state.is_empty());
+        let mut state = String::from("にほん");
+        let plan = run(&[egui::Event::Ime(egui::ImeEvent::Enabled)], &mut state);
+        assert!(plan.out.is_empty());
+        assert!(state.is_empty());
+    }
+
+    /// 「このフレームで変換が終わったか」の判定表。
+    #[test]
+    fn ime_frame_end_detection_table() {
+        let cases: &[(&str, Vec<egui::Event>, bool, bool)] = &[
+            ("確定あり", vec![commit("あ")], false, true),
+            ("確定あり(変換中から)", vec![preedit(""), commit("あ")], true, true),
+            ("未確定が空になった", vec![preedit("")], true, true),
+            ("変換していないのに空の未確定", vec![preedit("")], false, false),
+            ("変換継続", vec![preedit("にほ")], true, false),
+            ("無効化(変換中)", vec![egui::Event::Ime(egui::ImeEvent::Disabled)], true, true),
+            ("無効化(非変換)", vec![egui::Event::Ime(egui::ImeEvent::Disabled)], false, false),
+            ("IME 無関係", vec![key(egui::Key::Enter)], false, false),
+        ];
+        for (what, events, composing, want) in cases {
+            assert_eq!(
+                ime_ended_in_frame(events, *composing),
+                *want,
+                "{what} (変換中={composing})"
+            );
+        }
+    }
+
+    /// IME を通さない通常入力の経路が壊れていないこと (退行よけ)。
+    #[test]
+    fn plain_typing_still_reaches_the_pty() {
+        let mut state = String::new();
+        let plan = run(
+            &[
+                egui::Event::Text("echo ".into()),
+                egui::Event::Text("日本語".into()),
+                key(egui::Key::Enter),
+            ],
+            &mut state,
+        );
+        assert_eq!(out_str(&plan), "echo 日本語\r");
+        assert!(!plan.copy && !plan.select_all && plan.input_select.is_none());
+    }
+
+    /// Ctrl+A の入力欄選択が使えるとき・使えないときの分岐。
+    #[test]
+    fn ctrl_a_falls_back_to_the_pty_when_no_input_area_is_found() {
+        let ctrl_a = egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        // 入力欄が見つからない → 従来どおり \x01 (行頭移動)
+        let mut state = String::new();
+        let plan = translate_input(&[ctrl_a.clone()], &mut state, caps(), || None, || None);
+        assert_eq!(plan.out, b"\x01");
+        // 見つかった → PTY へは送らずローカル選択
+        let found = (((0u16, 0u16), (0u16, 4u16)), "日本語です".to_string());
+        let mut state = String::new();
+        let plan = translate_input(
+            &[ctrl_a],
+            &mut state,
+            caps(),
+            || Some(found.clone()),
+            || None,
+        );
+        assert!(plan.out.is_empty());
+        assert_eq!(plan.input_select, Some(found));
     }
 }
