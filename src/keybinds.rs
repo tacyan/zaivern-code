@@ -166,7 +166,10 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::ToggleKanban => KeyboardShortcut::new(cmd_shift, Key::K),
         // ⌥⌘D = デッキ (Deck)。⇧⌘D は「行を複製」に埋まっているので ⌥ 側を使う。
         // ⌥⌘ 系の既存割り当ては S / F / [ / ] / B だけなので衝突しない。
-        BindAction::ToggleDeck => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::D),
+        // macOS の ⌘⌥D は OS の「Dock を自動的に隠す」に予約されており、
+        // アプリまでイベントが届かない (実機で確認: 押すと Dock が消えるだけ)。
+        // 全 OS で挙動を揃えるため ⌘⌥E を既定にする。
+        BindAction::ToggleDeck => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::E),
         BindAction::ToggleMdPreview => KeyboardShortcut::new(cmd_shift, Key::V),
         BindAction::NewAgent => KeyboardShortcut::new(cmd_shift, Key::A),
         BindAction::FontInc => KeyboardShortcut::new(cmd, Key::Plus),
