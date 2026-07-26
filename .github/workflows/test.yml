@@ -64,12 +64,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
+          # 50MB 超の debug バイナリはリンクが支配的。lld があれば数十秒縮む。
+          # 見つからない場合は既定のリンカのまま (ビルドを壊さない)。
+          if command -v ld.lld >/dev/null 2>&1; then
+            echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+          fi
 
       - uses: taiki-e/install-action@nextest
 
-      - name: Non-terminal tests
-        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'not test(/^terminal::/)'
+      - name: Tests (実PTY 以外の全て)
+        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'not test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
 
   # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
   # 表示名: "pty (ubuntu-latest)" など。
@@ -95,9 +100,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
+          # 50MB 超の debug バイナリはリンクが支配的。lld があれば数十秒縮む。
+          # 見つからない場合は既定のリンカのまま (ビルドを壊さない)。
+          if command -v ld.lld >/dev/null 2>&1; then
+            echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+          fi
 
       - uses: taiki-e/install-action@nextest
 
       - name: Terminal (real PTY) tests
-        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'test(/^terminal::/)'
+        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
