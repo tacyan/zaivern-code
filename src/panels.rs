@@ -45,8 +45,6 @@ pub mod space {
     pub const MD: f32 = 12.0;
     /// 16 — セクション間
     pub const LG: f32 = 16.0;
-    /// 24 — 画面の外周
-    pub const XL: f32 = 24.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1551,11 +1549,15 @@ pub fn composer_target_chips(
                     let txt = RichText::new(label)
                         .size(11.5)
                         .color(if sel { theme.accent } else { theme.text_dim });
-                    if ui
-                        .selectable_label(sel, txt)
-                        .on_hover_text(label)
-                        .clicked()
-                    {
+                    // ID はセッション id から作る。selectable_label はラベル文字列から
+                    // 自動生成するため、同名のエージェントが並ぶと ID が衝突し、
+                    // どれを押しても最後の 1 つが選ばれてしまう (実際に起きた)。
+                    let clicked = ui
+                        .push_id(*id, |ui| {
+                            ui.selectable_label(sel, txt).on_hover_text(label).clicked()
+                        })
+                        .inner;
+                    if clicked {
                         buf.pin_broadcast(false);
                         buf.set_target(ComposerTarget::Agent(*id));
                     }

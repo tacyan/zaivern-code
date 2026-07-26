@@ -619,6 +619,7 @@ fn composer_fits_header(expanded: bool, remaining_w: f32) -> bool {
 
 /// 見出し帯の内訳 (純関数の結果)。
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(test)]
 struct HeaderLayout {
     /// タイトル・状態・右寄せボタン群 (+ 畳み込めたときはコンポーザ) の行
     row: egui::Rect,
@@ -626,6 +627,7 @@ struct HeaderLayout {
     composer: Option<egui::Rect>,
 }
 
+#[cfg(test)]
 impl HeaderLayout {
     /// 見出し帯が実際に使う高さ。
     fn height(&self) -> f32 {
@@ -642,6 +644,7 @@ impl HeaderLayout {
 /// - `form_h`: 複数行フォームを開いたときの高さ
 ///
 /// 不変条件: `row` と `composer` は重ならず、どちらも `avail` の中。
+#[cfg(test)]
 fn cockpit_header_layout(
     avail: egui::Rect,
     expanded: bool,
@@ -17941,7 +17944,7 @@ impl ZaivernApp {
     /// 実行できなくても構わない設計 (アンカーが現れなければツアー側が
     /// 数秒で自動的に次へ送る) なので、ここでは失敗を握り潰さず**必ず試す**。
     fn apply_tutorial_action(&mut self, act: tutorial::TutorialAction, ctx: &egui::Context) {
-        use tutorial::{SidebarTarget, TutorialAction as TA};
+        use tutorial::TutorialAction as TA;
         match act {
             TA::OpenSidebar(t) => {
                 self.sidebar_open = true;
@@ -23764,7 +23767,6 @@ mod approval_panel_tests {
 
 #[cfg(test)]
 mod composer_wiring_tests {
-    use super::*;
     use crate::agent_input::{AgentInputBuffer, ComposerTarget};
 
     /// 全員宛てと 1 体宛てが**別の経路**へ落ちる。
@@ -23893,7 +23895,6 @@ mod multi_cursor_wiring_tests {
 
 #[cfg(test)]
 mod encoding_wiring_tests {
-    use super::*;
 
     /// ピッカーは**実測で使えるものだけ**を並べる。
     /// 決め打ちの表を出すと、選んだのに保存できない項目が混ざる。
