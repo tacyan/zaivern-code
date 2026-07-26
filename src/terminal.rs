@@ -2138,8 +2138,9 @@ mod tests {
     }
 
     use super::{
-        all_terminal_lines, input_area_selection, key_bytes, line_hits, mac_agent_input_bytes,
-        normalize_sel, search_scroll_target, selection_text, word_selection, Session,
+        all_terminal_lines, input_area_selection, is_image_paste_chord_on, key_bytes, line_hits,
+        mac_agent_input_bytes, normalize_sel, prune_clip_pngs, save_clipboard_png,
+        search_scroll_target, selection_text, word_selection, Session, CLIP_PNG_KEEP,
     };
 
     #[test]
@@ -2356,6 +2357,107 @@ mod tests {
             shift: false,
             mac_cmd: true,
             command: true,
+        }
+    }
+
+    #[test]
+    fn save_clipboard_png_roundtrip_and_ascii_name() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-term-test", "clip-roundtrip");
+        // 3x2 の RGBA バッファ (左上だけ不透明の赤)
+        let (w, h) = (3usize, 2usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        rgba[0] = 255;
+        rgba[3] = 255;
+        let path = save_clipboard_png(w, h, &rgba, &dir).unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.is_ascii() && !name.contains(' '),
+            "空白なし ASCII 名: {name}"
+        );
+        assert!(name.starts_with("clip-") && name.ends_with(".png"), "{name}");
+        // image クレートで読み戻して寸法と画素が一致する
+        let img = image::open(&path).unwrap().to_rgba8();
+        assert_eq!((img.width(), img.height()), (3, 2));
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_clipboard_png_rejects_degenerate_input() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-term-test", "clip-degenerate");
+        // ゼロサイズは拒否
+        assert!(save_clipboard_png(0, 0, &[], &dir).is_err());
+        assert!(save_clipboard_png(0, 5, &[], &dir).is_err());
+        assert!(save_clipboard_png(5, 0, &[], &dir).is_err());
+        // バッファ長の不一致は panic せず Err
+        assert!(save_clipboard_png(2, 2, &[0u8; 15], &dir).is_err());
+        assert!(save_clipboard_png(2, 2, &[0u8; 17], &dir).is_err());
+        // 乗算あふれも Err
+        assert!(save_clipboard_png(usize::MAX, 2, &[0u8; 4], &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_clipboard_png_prunes_old_files() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-term-test", "clip-prune");
+        // 自前の命名に合わないファイルは間引き対象外
+        std::fs::write(dir.join("note.txt"), b"keep").unwrap();
+        std::fs::write(dir.join("unrelated.png"), b"keep").unwrap();
+        let rgba = [0u8; 4];
+        let mut last = None;
+        for _ in 0..CLIP_PNG_KEEP + 3 {
+            last = Some(save_clipboard_png(1, 1, &rgba, &dir).unwrap());
+        }
+        let count_clips = |dir: &std::path::Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.starts_with("clip-") && n.ends_with(".png")
+                })
+                .count()
+        };
+        assert_eq!(count_clips(&dir), CLIP_PNG_KEEP, "保存上限で古い分が消える");
+        assert!(last.unwrap().exists(), "直近の保存分は残る");
+        assert!(dir.join("note.txt").exists());
+        assert!(dir.join("unrelated.png").exists());
+        // keep を明示しても縮む
+        prune_clip_pngs(&dir, 2);
+        assert_eq!(count_clips(&dir), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_paste_chord_per_os_table() {
+        // (mac?, ctrl, shift, alt, mac_cmd, key, expect)
+        let cases = [
+            // macOS: ⌘V だけが対象
+            (true, false, false, false, true, egui::Key::V, true),
+            (true, true, false, false, false, egui::Key::V, false), // Ctrl+V は対象外
+            (true, false, true, false, true, egui::Key::V, false),  // ⌘⇧V
+            (true, false, false, true, true, egui::Key::V, false),  // ⌘⌥V
+            (true, false, false, false, true, egui::Key::C, false), // ⌘C
+            // Windows/Linux: Ctrl+V だけが対象
+            (false, true, false, false, false, egui::Key::V, true),
+            (false, true, true, false, false, egui::Key::V, false), // Ctrl+Shift+V は素通し
+            (false, true, false, true, false, egui::Key::V, false), // Ctrl+Alt+V
+            (false, false, false, false, true, egui::Key::V, false), // ⌘ 相当のみ
+            (false, true, false, false, false, egui::Key::B, false),
+        ];
+        for (mac, ctrl, shift, alt, mac_cmd, key, expect) in cases {
+            let m = egui::Modifiers {
+                alt,
+                ctrl,
+                shift,
+                mac_cmd,
+                command: ctrl || mac_cmd,
+            };
+            assert_eq!(
+                is_image_paste_chord_on(key, m, mac),
+                expect,
+                "mac={mac} ctrl={ctrl} shift={shift} alt={alt} cmd={mac_cmd} key={key:?}"
+            );
         }
     }
 
@@ -4336,6 +4438,113 @@ fn handle_mouse_selection(
     }
 }
 
+/// クリップボード画像の保存先 (OS の一時ディレクトリ配下)。
+fn clip_image_dir() -> PathBuf {
+    std::env::temp_dir().join("zaivern-clip")
+}
+
+/// クリップボード画像の保存上限。超えた分は古い順に間引く。
+const CLIP_PNG_KEEP: usize = 24;
+
+/// RGBA8 バッファを PNG として dir へ保存し、そのパスを返す。
+/// ファイル名は空白なしの ASCII に限定する (prompt_path はシェルクオート
+/// をしないため、空白入りだと CLI 側でパスが分断される)。
+/// 保存のついでに古い clip-*.png を CLIP_PNG_KEEP 件まで間引く。
+fn save_clipboard_png(w: usize, h: usize, rgba: &[u8], dir: &Path) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    // ゼロサイズ・長さ不一致 (乗算あふれ含む) は panic せずエラーで返す
+    let expect = w.checked_mul(h).and_then(|n| n.checked_mul(4));
+    if w == 0 || h == 0 || expect != Some(rgba.len()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("クリップボード画像が不正: {}x{} bytes={}", w, h, rgba.len()),
+        ));
+    }
+    let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba.to_vec())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "RGBA バッファを画像化できない"))?;
+    std::fs::create_dir_all(dir)?;
+    // タイムスタンプ+PID+連番で衝突しない名前を作る (すべて ASCII)
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!(
+        "clip-{}-{}-{}.png",
+        ms,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    img.save_with_format(&path, image::ImageFormat::Png)
+        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+    prune_clip_pngs(dir, CLIP_PNG_KEEP);
+    Ok(path)
+}
+
+/// dir 内の clip-*.png を新しい方から keep 件だけ残して削除する (best-effort)。
+/// 自前の命名に合うファイルだけを対象にし、他のファイルには触らない。
+fn prune_clip_pngs(dir: &Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, usize, PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let name = p.file_name()?.to_str()?;
+            if !(name.starts_with("clip-") && name.ends_with(".png")) {
+                return None;
+            }
+            let t = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            // 更新時刻→名前長→名前の順 (連番は桁数込みで数値順になる)
+            Some((t, name.len(), p))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort();
+    for (_, _, p) in files.iter().take(files.len() - keep) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// V + そのOSの「ペースト修飾」(macOS: ⌘ / それ以外: Ctrl) だけの組み合わせか。
+/// Ctrl+Shift+V (端末流の生ペースト) や Alt 併用は対象外にして既存挙動を守る。
+fn is_image_paste_chord(key: egui::Key, m: egui::Modifiers) -> bool {
+    is_image_paste_chord_on(key, m, cfg!(target_os = "macos"))
+}
+
+/// OS 判定を引数で受ける実体 (両分岐をどの環境でもテストできるようにする)。
+fn is_image_paste_chord_on(key: egui::Key, m: egui::Modifiers, mac: bool) -> bool {
+    if key != egui::Key::V || m.shift || m.alt {
+        return false;
+    }
+    if mac {
+        m.mac_cmd && !m.ctrl
+    } else {
+        m.ctrl && !m.mac_cmd
+    }
+}
+
+/// クリップボードの画像を PNG 保存してパスを返す薄いアダプタ。
+/// - テキストも載っている場合は egui-winit の Paste イベントに任せて None
+///   (二重貼り防止。egui-winit はテキストが取れたときだけ Paste を出す)。
+/// - クリップボード初期化失敗 (ヘッドレス CI 等) や画像なし・保存失敗も
+///   None で握りつぶし、従来の挙動へフォールバックする。
+/// 呼び出しはキー入力時だけに限定する (起動時にクリップボードへ触らない)。
+fn clipboard_image_to_png() -> Option<PathBuf> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    if cb.get_text().map(|t| !t.is_empty()).unwrap_or(false) {
+        return None;
+    }
+    let img = cb.get_image().ok()?;
+    save_clipboard_png(img.width, img.height, &img.bytes, &clip_image_dir()).ok()
+}
+
 /// フォーカス中のキーボード/IME/ペースト入力を PTY へ転送する。
 fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: egui::Id) {
     ui.memory_mut(|m| {
@@ -4390,6 +4599,23 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
                 out.extend_from_slice(t.as_bytes());
                 if bracketed {
                     out.extend_from_slice(b"\x1b[201~");
+                }
+            }
+            // ⌘V / Ctrl+V で画像を貼る: egui-winit はクリップボードに
+            // テキストが無いと Paste イベントを出さず、押下キーイベントも
+            // 飲み込む (リリースだけ届く) ため、V のキーリリースで画像を
+            // 拾う。画像は PNG 保存して @パス を挿入するだけで Enter は
+            // 送らない (ドラッグ&ドロップ挿入と同じ振る舞い)。画像なし・
+            // 保存失敗時は何もせず従来の挙動のまま。
+            egui::Event::Key {
+                key,
+                pressed: false,
+                modifiers,
+                ..
+            } if is_image_paste_chord(*key, *modifiers) => {
+                if let Some(png) = clipboard_image_to_png() {
+                    let text = format!("@{} ", prompt_path(&png, &session.cwd));
+                    out.extend_from_slice(text.as_bytes());
                 }
             }
             egui::Event::Key {

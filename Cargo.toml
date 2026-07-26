@@ -23,6 +23,10 @@ rfd = "0.15"
 # ico は `zai app install` の Windows ショートカットアイコン生成に使う
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
 qrcode = { version = "0.14", default-features = false }
+# クリップボードの画像取得 (⌘V/Ctrl+V で画像を PNG 保存してパス挿入)。
+# egui-winit も arboard を使うが image-data feature なしのため直接依存する。
+# wayland-data-control は Linux (Wayland) 専用で他 OS のビルドには影響しない。
+arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 
 [profile.release]
 opt-level = 3
