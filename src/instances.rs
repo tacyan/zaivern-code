@@ -415,7 +415,7 @@ pub fn render_json(entries: &[InstanceEntry]) -> String {
 /// パイプへ流すための形式。空 (実行中なし) なら**空文字列**を返し、
 /// 呼び出し側は何も print せず終了コード 1 にする — `xargs` に空行を
 /// 渡さないため (空行を渡すと kill が引数無しでエラーになる)。
-// cli.rs が `--pid-only` を配線したら allow は外してよい (現状はテストのみ利用)。
+
 #[allow(dead_code)]
 pub fn render_pids(entries: &[InstanceEntry]) -> String {
     entries

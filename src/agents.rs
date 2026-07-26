@@ -2443,9 +2443,18 @@ mod tests {
         assert_eq!(apply_approval("vibe --yolo", Approval::Ask), "vibe");
         assert_eq!(apply_approval("qwen --yolo", Approval::Ask), "qwen");
         assert_eq!(apply_approval("omp --auto-approve", Approval::Ask), "omp");
+        // `cmd` は Windows のシェルと衝突するため、その環境ではエイリアスを
+        // 張らない (= エージェントとして解決しないので素通し)。
+        #[cfg(not(windows))]
         assert_eq!(
             apply_approval("cmd --dangerously-skip-permissions", Approval::Ask),
             "cmd"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            apply_approval("cmd --dangerously-skip-permissions", Approval::Ask),
+            "cmd --dangerously-skip-permissions",
+            "Windows では cmd をエージェント扱いしないので引数を触らない"
         );
         assert_eq!(
             apply_approval("devin --permission-mode bypass -p hi", Approval::Ask),
