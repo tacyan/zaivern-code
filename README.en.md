@@ -160,6 +160,9 @@ Everything below is the manual for each instrument on the flight deck.
 - VS Code-grade scrolling: fixed gutter, scrollBeyondLastLine, PageUp/PageDown
 - Fuzzy command palette (⌘P for files, ⌘⇧P for commands, **`@` for agents, `#` for git worktrees** — one box searches files, commands, sessions, and worktrees)
 - **Drag & drop**: drop a file-tree item, or any file/image from your OS, onto an agent's terminal and `@path` lands in its input field (nothing is submitted). Drop on the editor to open a tab; drop a folder to add it to the workspace
+- **🖼 Image viewer**: `png` / `jpg` / `jpeg` / `gif` / `webp` / `ico` open as a tab. Fit-to-window by default; `−` / `＋` / `100%` buttons and Ctrl(⌘)+scroll take it from 0.05x to 32x. Transparency is drawn as a checkerboard, and the footer shows `width×height px · file size` (and says so explicitly when the image was downscaled to stay inside the GPU texture limit). Read-only. Animated GIFs show the first frame
+- **📄 Open a PDF in the editor**: text is extracted with [pdf-extract](https://crates.io/crates/pdf-extract) and shown as a **read-only** tab with `── page i / N ──` separators. ⌘F find-in-file works on it as usual. Extraction runs on a worker thread: anything finishing within 250 ms appears immediately, slower files show `⏳ loading…` and fill in afterwards — the UI never blocks. PDFs over 32 MB are not extracted and say so
+- **↩ Word wrap / · whitespace rendering**: toggle from the View menu or the command palette (spaces render as `·`, tabs as `→`). The starting value comes from `word_wrap` / `show_whitespace` in `config.toml` (both default `false`), overridable per project in `.zaivern.toml`
 - Git branch display, automatic Japanese UI font fallback
 
 ### 👾 Multi-agent
@@ -174,6 +177,28 @@ Everything below is the manual for each instrument on the flight deck.
 - **Rate-limit detection (⏳)**: warnings like `usage limit reached` are detected on screen and surfaced as a badge + notification. **A rate-limited session is never assigned new tasks**; it rejoins automatically once the limit clears
 - **Account/profile switching**: put `CLAUDE_CONFIG_DIR` / `CODEX_HOME` etc. in a preset's `env` to run **the same CLI under different accounts (subscriptions) in parallel** (a leading `~/` in values expands to your home directory)
 - **📜 Persistent terminal logs**: each session's raw output is kept under `~/.zaivern/term_logs/` (4 MB rotation, newest 40 files), and the 📜 menu on the terminal panel reopens last session's log — "how far did it get last night?" survives a restart
+- **💬 Chat history saved per folder, and resumed**: reopen a folder and **your agent tabs come back**. The previous scrollback (up to the last 1 MB) is replayed into the terminal, a `── 前回のセッションここまで / 再開します ──` divider is drawn, and the live session picks up from there. **claude is relaunched with `--continue` and codex with `resume --last`**, so the conversation on the CLI side continues too (agents with no resume flag simply start fresh). A toast confirms how many sessions came back. Set `restore_agents = false` in `config.toml` to switch the whole thing off — no tabs are recreated at all. **Environment variables are deliberately not persisted** (they can hold secrets); they are re-read from the matching preset in your current config
+- **📋 Paste a clipboard image straight in**: press **⌘V** (**Ctrl+V** on Windows / Linux) in an agent terminal. If the clipboard holds an image it is written as a PNG into `zaivern-clip/` in your temp directory and `@path` lands in the input box — **nothing is submitted**. If the clipboard holds text, normal text paste wins as before, so nothing you already do changes. Saved PNGs are pruned automatically to the newest 24
+
+### 📋 Fleet board — eight lanes, everyone's "right now"
+**⌘⇧K** (the "フリート看板" menu item, or the "📋 看板" tab at the top). Every running agent becomes a card, sorted into the lane matching its state, under KPI tiles for running / working / needs-you / done.
+
+- Eight lanes: **idle / thinking / editing / running / verifying / waiting for approval / stalled-or-broken / finished**. A card must hold a new state for 400 ms before it moves (approval, stalls, and completion move instantly), and it glows briefly when it lands
+- Each card carries: an activity chip, how long the current state has lasted, the file it touched most recently, the last command, the newest output line, and an output pulse for the last 30 seconds
+- **Guesses are never dressed up as facts.** Classification walks down from the strongest signal: is the process alive → approval-prompt detection → rate-limit detection → the supervisor's own verdict → screen text. Anything read off the screen is marked `≈`, anything with hard evidence `✓`, and hovering shows you which. When the supervisor says a session is idle, stale screen text is not allowed to claim it's still running
+- Approve ✅ / deny ❌, send an instruction, switch permission mode, restart, or kill — straight from the card. The box at the top broadcasts to everyone
+- **Vertical mode** (auto / horizontal / vertical from the menu; your choice is remembered). Select a card and its terminal goes live underneath: ↑↓ / j / k to move, Enter to type into it, Esc back to the board
+- Watching costs nothing: PTY sampling runs at 150 ms while output flows and 1 s when it doesn't, and repaint requests relax from 33 ms during animation to 1 s at rest and 2 s once every agent has exited
+
+### 🏁 Prompt fan-out race — one instruction, N agents, side by side
+Open it from the command palette: **"🏁 プロンプトレース (1 プロンプトを複数エージェントで並走)"**. The point isn't which agent is fastest — it's being able to pick the best answer afterwards.
+
+- Write one prompt, choose **2 to 4** presets. Each racer gets its **own work tree** via `git worktree add -b race/<slug>-<i>` (created next to the repo as `<repo>-race-<slug>-<i>`), the agent launches with that directory as its cwd, and the prompt is delivered there
+- A race **refuses to start** on a dirty work tree or a detached HEAD. If a worktree fails to be created partway through, the ones already created are rolled back before it stops
+- The dashboard lists each racer's state (preparing / 🏃 running / ⏹ finished / ✅ adopted / 🗑 discarded) alongside its ± diff stat, refreshed every 4 seconds **on a background thread** — git never runs on the UI thread. `Diff` opens a read-only diff tab
+- **Adopt** is `git merge --no-edit`; on conflict it simply `merge --abort`s — nothing is forced. **Discard** is `git worktree remove` + `git branch -D`, leaving nothing behind
+- **You find out about collisions while they race, not at review time.** The set of files each racer has touched (uncommitted *and* committed) is compared on the same 4-second cycle; two or more racers touching the same file surfaces a `⚠ N ファイルが2体以上で競合` summary plus a per-row `⚠ 衝突 a.rs, b.rs …` badge. No overlap and you get `✓ 単独`
+- Adopting a second racer whose files overlap one you already adopted **stops for a confirmation** instead of merging quietly. Click again and it proceeds — the guard is there to make you notice, not to forbid you
 
 ### 🔔 Notifications + sounds
 - Approval-wait, success (✅), and failure (❌ + exit code) announced via popup + OS-native sounds (can be turned off)
@@ -258,6 +283,8 @@ zai notify "build is green"        # raise a notification
 zai prompt "write tests for this"  # drop text into the agent's input box (does not send)
 zai run "cargo test"               # run it in the terminal
 zai status "deploying"             # show it in the status bar
+zai status                         # list running Zaivern instances (PID / version / uptime / workspace)
+zai status --json                  # the same list as JSON
 zai plugin list                    # list plugins
 zai plugin new <name>              # scaffold one
 zai app install                    # register in the OS app list (Launchpad / menu / Start Menu)
@@ -267,7 +294,9 @@ zai firewall allow                 # allow 📱 inbound (TCP 8899-8919, admin)
 zai firewall revoke                # remove the inbound rule
 ```
 
-Bare `zai` and `zai .` still launch the GUI, exactly as before.
+Bare `zai` and `zai .` still launch the GUI, exactly as before. **Launched with no folder argument, Zaivern reopens the folder you had last time** — it walks the most-recently-used list in `~/.zaivern/menu_state.toml` and takes the first entry that still exists on disk. Want the current directory every time? Pass `zai --no-restore`, or set `ZAIVERN_NO_RESTORE=1`.
+
+**Detecting a running instance.** With no arguments, `zai status` / `zai status --json` reads the registry at `~/.zaivern/instances/<pid>.json` and **lists the Zaivern Code instances running right now**. Exit code is **0** when at least one is alive and **1** when none is, so a shell can branch on it directly: `zai status >/dev/null || zai .`. Liveness is checked per OS (Linux `/proc`, macOS `kill(pid, 0)`, Windows `tasklist`) and **matched against a start-time signature so a recycled PID never counts as alive**. `zai status "..."` with a string is unchanged — that still writes to the status bar.
 
 ### 🔤 Language servers (LSP)
 If `rust-analyzer` / `typescript-language-server` / `pyright-langserver` / `gopls` is on your PATH it starts automatically and shows diagnostics (errors/warnings). The line-number gutter turns red/yellow, and the status bar shows `⛔count ⚠count`. Editing works normally even without any server installed.
@@ -279,6 +308,14 @@ Type Japanese directly inside the terminal. Uncommitted composition text is over
 
 ### 🌿 Git line gutter
 In a git repository, line numbers are color-coded by diff (green = added, yellow = modified). The status bar shows the branch name + changed-file count (±N).
+
+### 🌳 Git status in the file tree, and follow-the-active-file
+The tree tells you where the work is happening, too.
+
+- Changed files carry a colour-coded badge: `M` modified / `A` added / `U` untracked / `D` deleted / `R` renamed / `C` conflicted
+- **Ancestor folders are tinted as well**, with a count — `📁 src  M•3` tells you there are 3 changes under it without expanding anything (the colour follows the most severe status below)
+- Status comes from `git status --porcelain` refreshed on a **background thread** every 2 seconds. git is never called on the UI thread, so a big repository doesn't cost you frames
+- **🎯 Follow the active file** (on by default): switch tabs in the editor and the tree expands and scrolls to that file. Right-click a workspace root → "🎯 アクティブファイル追従: ON / OFF" to toggle it; the choice persists across restarts
 
 ### 📚 Multi-folder workspace
 Open several folders at once. List them as arguments — `zai frontend backend shared` — or add one later from the command palette's "Add folder to workspace".
@@ -294,6 +331,13 @@ List pull requests and issues, read a PR's diff, and switch branches — all thr
 A PR diff opens as a read-only tab rendered in the inline diff view, with added and removed lines colour-coded.
 
 **⚡ Start on an issue in one click.** Pick an agent from an issue's "⚡ 着手" (start) menu and Zaivern will (1) create a dedicated git worktree next to the repo (branch `wt/issue-N`, same convention as the worktrees plugin), (2) add it to the workspace, (3) launch the agent with that directory as its working dir, and (4) drop a kick-off instruction into its input field once the session has settled. **You still press Enter** — so you can edit the instruction before it runs.
+
+### 💬 Inline review comments on a diff
+In a PR diff tab or a race diff tab, **click a line and write a comment right there**.
+
+- A comment is anchored to "file + old/new side + line number", so re-parsing the diff or scrolling past it (the view is virtualized) never loses its place
+- Per thread: resolve, un-resolve, edit, delete. The toolbar reads "レビューコメント n 件 (未解決 m 件)" — n comments, m unresolved
+- Unresolved comments **collapse into a single prompt**: a `以下のレビューコメントに対応してください:` header followed by `@path:line` (marked `(削除行)` for removed lines), the quoted line, and your text — ordered by file, then by line. `コピー` hands it to an agent's input box as-is. **Resolved threads drop out automatically**, so you never re-send a note you already dealt with
 
 ### 🧭 Open in an external IDE
 Send the file you're editing to another editor **with your cursor line intact**. VS Code / Cursor / Zed / Trae / Kiro / Sublime / the JetBrains family / Xcode / Fleet / Neovide / Emacs are supported.
@@ -333,7 +377,14 @@ On top of that, you can hand the question code is bad at — *"okay, so what's t
 - **The commander can keep doing normal work.** You don't have to burn a slot on supervision alone
 
 ### 💾 Session restore
-On restart, the previous tabs, active tab, and panel state are restored automatically per workspace (`~/.zaivern/sessions/`).
+On restart, the previous tabs, active tab, and panel state are restored automatically per workspace (`~/.zaivern/sessions/`). Agent tabs come back too — scrollback and all — while `restore_agents` (default `true`) is on.
+
+**The folder comes back as well.** Start `zai` with no folder argument and it walks the most-recently-used list in `~/.zaivern/menu_state.toml` and reopens **the first entry that still exists**. To always start in the current directory instead, use `zai --no-restore` or `ZAIVERN_NO_RESTORE=1`.
+
+### 🧯 Recovering from internal errors (and the Windows freeze, fixed at the root)
+- A panic while painting **does not take the app down with it**. If the same place breaks 3 times inside a 10-second window, **only that piece is dropped from rendering** and everything else keeps running. A banner appears at the top saying rendering was stopped for that area, with `閉じる` to dismiss and `再試行` to lift the quarantine and try painting it again; the dropped area shows a placeholder in its place. Details land in `~/.zaivern/panic.log` (rotated to `panic.log.old`)
+- **Quarantines decay.** After 300 clean frames with an empty window the memory resets, so running for hours never means slowly losing features to one incident long ago. It gives up only on 3 consecutive panics, or after more than 3 quarantines
+- **The Windows Cockpit freeze was closed off from three sides**: (1) ConPTY resize requests are coalesced — **the same size must hold for 2 frames before one request is sent**, and a dedicated thread keeps only the latest value so the UI thread never waits on it; (2) file dialogs run on a worker thread, so the UI keeps painting while one is open (macOS stays synchronous — NSOpenPanel is main-thread-only); (3) the panic quarantine above. **Save-as holds a buffer ID, not a tab index**, so reordering tabs while the dialog is open can't redirect the write to a different file
 
 ### 📱 Phone Remote in detail
 - **What you can do**: view/edit/save open files, switch tabs, search & open workspace files, view agent terminals, send instructions, approve (Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y buttons), and run commands (save, new file, Cockpit, font ±, approval-mode switch, and more)
@@ -377,23 +428,33 @@ The same code builds on macOS / Windows / Linux (Linux needs rfd dependencies su
 ### Tests
 
 ```bash
-cargo test        # runs everything on macOS / Windows
+cargo test        # everything, locally, on macOS / Windows / a real Linux box
 ```
 
-One caveat for Linux CI (measured 2026-07):
+To reproduce the CI run on your own machine, use [cargo-nextest](https://nexte.st/):
 
 ```bash
-# On GitHub Actions hosted Linux runners (2 cores / 7 GB) the terminal::
-# real-PTY test suite (e2e tests that spawn actual shells) exhausts the
-# runner's resources and kills the runner process itself — skip it there
-cargo test -- --skip terminal::
+cargo install cargo-nextest --locked
+cargo nextest run --locked --no-fail-fast --profile ci
 ```
 
-With `--skip terminal::` the remaining ~1000 tests are green on Linux as well.
-The real-PTY tests themselves are verified on macOS / Windows (and on Linux
-machines with adequate resources). Because a dying runner leaves no logs or
-artifacts, the culprit was located by splitting the run into per-module steps —
-step completion records survive on the server even when the runner dies.
+The `ci` profile lives in `.config/nextest.toml`: it terminates any test after 60 s (45 s for the real-PTY ones) and prints failures immediately *and* again in a final summary. The **real-PTY tests** — the four modules that spawn actual shells, `terminal::pty_tests` / `pty_writer_tests` / `reap_pty_tests` / `pty_resize_tests` — form a `pty` test group that is **serialized onto a single thread**.
+
+GitHub Actions runs **6 jobs in parallel: 3 OSes × `fast` / `pty`**, splitting those two groups into separate jobs.
+
+```bash
+# fast: everything except the real-PTY tests (parallel)
+cargo nextest run --locked --no-fail-fast --profile ci \
+  -E 'not test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
+
+# pty: only the real-PTY tests (serialized)
+cargo nextest run --locked --no-fail-fast --profile ci \
+  -E 'test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
+```
+
+The split isn't about Linux disliking PTYs. On GitHub's hosted Linux runner (2 cores / 7 GB), spawning real PTYs in parallel exhausts the box and **kills the runner process itself, leaving no logs and no artifacts**. Only those four modules are serialized (18 tests on Linux / macOS, 12 on Windows where `pty_tests` is Unix-only); the rest of `terminal::` runs in parallel in the `fast` job. `--no-fail-fast` is there so a single run surfaces *every* failure rather than the first one.
+
+> This section used to tell you to run `cargo test -- --skip terminal::` on Linux. **That advice is obsolete.**
 
 ---
 
@@ -402,6 +463,7 @@ step completion records survive on the server even when the runner dies.
 | Key | Action |
 |---|---|
 | ⌘⇧C | **Toggle Agent Cockpit** |
+| ⌘⇧K | **Toggle the fleet board** |
 | ⌘⇧A | **Launch agent (preset #1)** |
 | ⌘J or ⌘\` | Toggle terminal/agent panel |
 | ⌘P (Ctrl+P) | Fuzzy-find and open a file |
@@ -431,6 +493,7 @@ When an agent terminal has focus, the standard Mac editing keys just work.
 | ⌘⌫ | Delete to the start of the line |
 | ⌥← / ⌥→ | Move by word |
 | ⌥⌫ | Delete the previous word |
+| ⌘V | **Save the clipboard image as a PNG and drop `@path` into the input box** (plain text still pastes as text) |
 
 ### File tree (same defaults as VS Code's Explorer)
 
@@ -455,7 +518,7 @@ Pasting onto an existing name auto-renames the VS Code way: `file copy.ts` → `
 
 On Windows / Linux, read ⌘ as Ctrl. Inside the terminal, control keys like Ctrl+C, arrows, Tab, and Esc go straight to the PTY (Shift/Option+Enter is sent as a newline, supporting Claude Code's multi-line input).
 
-Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `close_tab` `new_file` `palette_files` `palette_commands` `toggle_terminal` `toggle_sidebar` `find` `toggle_cockpit` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
+Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
 
 ---
 
@@ -470,6 +533,16 @@ theme = "zaivern-dark"
 editor_font_size = 15.0
 terminal_font_size = 13.0
 show_hidden_files = true
+
+# Word wrap and whitespace rendering (·/→) in the editor body
+# (also toggleable from the View menu and the command palette)
+# word_wrap = false
+# show_whitespace = false
+
+# When you reopen a folder, restore the previous agent tabs and pick the
+# conversation back up (previous scrollback is replayed, then claude is
+# relaunched with --continue and codex with resume --last; false = don't restore)
+# restore_agents = true
 
 # Default permission mode (auto-applied to all 29 agents in the catalog)
 #   "ask"   = user approval required every time (safe, default)
@@ -574,6 +647,9 @@ src/
 ├── diff.rs          Unified diff parser + inline diff view
 ├── ide.rs           Hand-off to external IDEs (open at the current line)
 ├── panels.rs        Rendering for the GitHub panel, PR diff tabs, IDE integration
+├── kanban.rs        Fleet board (8 state lanes, card actions, live terminal pane)
+├── race.rs          Prompt fan-out race (parallel worktrees, adopt/discard, collision detection)
+├── instances.rs     Registry of running instances (the detection behind zai status)
 ├── supervisor.rs    Agent supervision (stall/loop/abnormal-exit detection and notification)
 ├── coordinator.rs   Inter-agent messaging and task reassignment
 ├── orchestration.rs Task creation UI, hand-off driving, message send/receive assembly
@@ -629,7 +705,23 @@ src/
 - [x] Super Agent redesigned as the Commander (name any running agent; `@target: instruction` goes through you as a 📮 notification — no auto-injection into input boxes)
 - [x] Auto-YES unified into one switch (`pet_auto_yes`, off by default = you approve, independent of launch mode, one answer per prompt)
 - [x] Editor + Cockpit split view (read the code while commanding)
+- [x] Chat history saved per folder and resumed (scrollback replay + claude `--continue` / codex `resume --last`)
+- [x] Clipboard image paste (⌘V / Ctrl+V saves a PNG and inserts `@path`)
+- [x] Image viewer (png/jpg/gif/webp/ico, zoom & fit, transparency checkerboard) and read-only PDF text
+- [x] Word-wrap / whitespace toggles (`word_wrap` / `show_whitespace`)
+- [x] Git status in the file tree (M/A/U/D/R/C, tinted ancestors) and follow-the-active-file
+- [x] Fleet board rebuilt (8 lanes, vertical mode, live terminal on selection, facts marked apart from guesses)
+- [x] Prompt fan-out race (one prompt across N agents, adopt/discard, collisions caught while racing)
+- [x] Inline review comments on diffs (resolve tracking + one assembled prompt)
+- [x] Running-instance detection (`zai status` / `zai status --json`, branch on the exit code)
+- [x] Reopen the previous folder on launch (`--no-restore` / `ZAIVERN_NO_RESTORE` to disable)
+- [x] Paint-panic quarantine with self-recovery + the Windows freeze fixed (ConPTY resize coalescing, off-thread file dialogs)
+- [x] CI moved to 6 parallel jobs (3 OSes × fast/pty) on cargo-nextest with a `ci` profile
 - [ ] LSP completion & hover UI (foundation implemented; UI to come)
+- [ ] Project-wide search upgrades — regex, globs, whole-word, dry-run bulk replace (engine implemented; UI wiring to come)
+- [ ] Cross-agent usage aggregation and exhaustion forecasting (offline engine implemented; panel to come)
+- [ ] Listing and resuming past sessions (reading claude / codex session stores is implemented; UI to come)
+- [ ] Line-ending detection/conversion + save-time cleanup (the pure functions exist; wiring into the save path to come)
 - [ ] Plugin grammars (TextMate) & registry sharing
 - [ ] Split editor
 
