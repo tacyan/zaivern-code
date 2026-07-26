@@ -12,9 +12,11 @@
 //!
 //! ## 設計の方針
 //!
-//! - このモジュールは **他モジュールへ一切依存しない**(`use crate::…` が無い)。
+//! - 調停の中核 (`Coordinator`) は **他モジュールへ一切依存しない**。
 //!   セッションの状態や承認モードは呼び出し側が自前の型へ変換して渡す。
 //!   監督レイヤ(supervisor)とも型を共有しないので、どちらが先に出来ても壊れない。
+//!   例外は末尾のクォータ監視 (`quota` 子モジュール + [`QuotaWatch`]) だけで、
+//!   ここは i18n とレート制限検知 (terminal) を再利用する。
 //! - **スレッドを使わない**。全て同期的な純メモリ操作で、1 フレーム分の呼び出しは
 //!   セッション数・キュー長に対して線形かつ上限付き。UI スレッドを塞がない。
 //! - **メモリは全て有界**。リングバッファ・窓の刈り取り・履歴の上限を徹底する。
@@ -1589,6 +1591,241 @@ impl Coordinator {
     }
 }
 
+// ── クォータ監視 (プラン枠の横断集約 + 枯渇予測) ──────────────────────
+//
+// ここから下だけが例外的に別モジュール (`quota`) を使う。コアの
+// `Coordinator` は従来どおり他モジュールへ依存しない。
+//
+// `quota` は `#[path]` でこのモジュールの子として取り込む。main.rs を
+// 触らずに配線できるようにするためで、**main.rs へ `mod quota;` を足す
+// 必要は無い** (足すなら下の 1 行を消し、`quota::` を `crate::quota::`
+// へ書き換えること。二重登録は型が別物になる)。
+
+/// プラン使用量の読み取り・集約・助言 (詳細はモジュール doc)。
+#[path = "quota.rs"]
+pub mod quota;
+
+use std::sync::mpsc::{self, Receiver};
+use std::time::SystemTime;
+
+/// ベンダーファイルを読み直す間隔。ファイルの更新はターン単位なので
+/// 短くしすぎない (UI は毎フレーム [`QuotaWatch::refresh_if_stale`] を呼べる)。
+pub const QUOTA_TTL: Duration = Duration::from_secs(20);
+
+/// 保持する観測イベントの上限 (メモリを有界に保つ)。
+pub const QUOTA_EVENT_CAP: usize = 256;
+
+/// クォータの背景監視。
+///
+/// **UI スレッドではファイルを触らない**。git.rs / git_panel.rs と同じく
+/// 「TTL 切れ → バックグラウンドスレッド起動 → チャネルで受け取る」形。
+///
+/// ## 描画契約 (パネル側が使う API)
+///
+/// 1. 毎フレーム [`QuotaWatch::refresh_if_stale`] を呼ぶ (安価。TTL 内は即戻る)。
+/// 2. 走行本数を [`QuotaWatch::set_running`] で渡す (bin 名 → 本数)。
+/// 3. 表示は [`QuotaWatch::accounts`] の [`quota::AccountUsage`] を 1 行 1 アカウントで。
+///    - `used_fraction` が `None` の行に数字を出さない (「不明」と描く)
+///    - `confidence` が [`quota::Confidence::Measured`] 以外なら「推定」と明示する
+///    - `projection` は [`quota::Projection::InsufficientData`] のとき
+///      「データ不足」と描き、決して 0 分などと描かない
+/// 4. 助言は [`QuotaWatch::advice`] / [`QuotaWatch::worst_advice`]。
+///    `severity()` 0/1/2 で色分けし、`message()` をそのまま出す。
+///    **自動で止めない**。止めるかどうかは人が決める。
+/// 5. セッションの出力から上限警告を拾ったら [`QuotaWatch::note_rate_limited`]
+///    (agents.rs の `SessionEvent::RateLimited` をそのまま流せる)。
+pub struct QuotaWatch {
+    pending: Option<Receiver<Vec<quota::QuotaSnapshot>>>,
+    snapshots: Vec<quota::QuotaSnapshot>,
+    events: Vec<quota::RateLimitEvent>,
+    history: quota::BurnHistory,
+    running: Vec<(String, usize)>,
+    policy: quota::Policy,
+    last_refresh: Option<Instant>,
+    /// 取り込みに成功した回数 (テスト・診断用)。
+    applied: u64,
+}
+
+impl Default for QuotaWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QuotaWatch {
+    pub fn new() -> Self {
+        Self {
+            pending: None,
+            snapshots: Vec::new(),
+            events: Vec::new(),
+            history: quota::BurnHistory::new(),
+            running: Vec::new(),
+            policy: quota::Policy::default(),
+            last_refresh: None,
+            applied: 0,
+        }
+    }
+
+    /// しきい値を差し替える (設定から)。
+    pub fn set_policy(&mut self, policy: quota::Policy) {
+        self.policy = policy;
+    }
+
+    pub fn policy(&self) -> &quota::Policy {
+        &self.policy
+    }
+
+    /// 走行本数 (bin 名 → 本数) を更新する。
+    pub fn set_running(&mut self, running: Vec<(String, usize)>) {
+        self.running = running;
+    }
+
+    /// この枠で走っている合計本数。
+    pub fn running_total(&self) -> usize {
+        self.running.iter().map(|(_, n)| *n).sum()
+    }
+
+    /// 上限警告を 1 件記録する (検知済みの行を渡す)。
+    pub fn note_rate_limited(&mut self, agent: &str, line: &str, at: SystemTime) {
+        self.push_event(quota::RateLimitEvent {
+            agent: agent.to_string(),
+            at,
+            line: line.to_string(),
+        });
+    }
+
+    /// 端末出力から上限警告を拾って記録する (検知は terminal.rs の再利用)。
+    /// 拾えたら true。
+    pub fn note_output(&mut self, agent: &str, text: &str, at: SystemTime) -> bool {
+        match quota::observe_output(agent, text, at) {
+            Some(e) => {
+                self.push_event(e);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn push_event(&mut self, e: quota::RateLimitEvent) {
+        self.events.push(e);
+        if self.events.len() > QUOTA_EVENT_CAP {
+            let cut = self.events.len() - QUOTA_EVENT_CAP;
+            self.events.drain(..cut);
+        }
+        quota::merge_observed(&mut self.snapshots, &self.events);
+    }
+
+    /// TTL 切れならバックグラウンドで読み直す (毎フレーム呼んで安全)。
+    pub fn refresh_if_stale(&mut self) {
+        self.refresh(false);
+    }
+
+    /// TTL を無視して読み直す (ウィンドウのフォーカス復帰など)。
+    pub fn force_refresh(&mut self) {
+        self.refresh(true);
+    }
+
+    fn refresh(&mut self, force: bool) {
+        // 1) 完了した読み取りがあれば取り込む
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok(snaps) => {
+                    self.apply(snaps, SystemTime::now());
+                    self.pending = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.pending = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.pending.is_some() {
+            return;
+        }
+        if !force {
+            if let Some(t) = self.last_refresh {
+                if t.elapsed() < QUOTA_TTL {
+                    return;
+                }
+            }
+        }
+        // 失敗時も時刻は更新し、毎フレーム再起動しない。
+        self.last_refresh = Some(Instant::now());
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("zv-quota".into())
+            .spawn(move || {
+                let _ = tx.send(quota::snapshot_all());
+            });
+        if spawned.is_ok() {
+            self.pending = Some(rx);
+        }
+    }
+
+    /// 読み取り結果の取り込み (時刻を注入できるのでテスト可能)。
+    pub fn apply(&mut self, mut snaps: Vec<quota::QuotaSnapshot>, now: SystemTime) {
+        quota::merge_observed(&mut snaps, &self.events);
+        // 使用率の観測点を履歴へ積む (燃焼速度の材料)。測定時刻が分かれば
+        // それを使い、無ければ取り込み時刻で代用する。
+        for u in quota::aggregate(&snaps, &self.running) {
+            if let Some(f) = u.used_fraction {
+                let at = snaps
+                    .iter()
+                    .filter(|s| s.account == u.account)
+                    .filter_map(|s| s.measured_at)
+                    .max()
+                    .unwrap_or(now);
+                self.history.record(&u.account, at, f);
+            }
+        }
+        self.snapshots = snaps;
+        self.applied += 1;
+    }
+
+    /// 最新のスナップショット (エージェント単位)。
+    pub fn snapshots(&self) -> &[quota::QuotaSnapshot] {
+        &self.snapshots
+    }
+
+    /// 取り込み回数。
+    pub fn applied(&self) -> u64 {
+        self.applied
+    }
+
+    /// 観測した上限イベント (時刻昇順)。
+    pub fn events(&self) -> &[quota::RateLimitEvent] {
+        &self.events
+    }
+
+    /// アカウント単位の集約 + 枯渇予測。
+    pub fn accounts(&self, now: SystemTime) -> Vec<quota::AccountUsage> {
+        let mut out = quota::aggregate(&self.snapshots, &self.running);
+        for u in out.iter_mut() {
+            let burn = self.history.rate(&u.account, now);
+            quota::attach_projection(u, burn.as_ref(), now);
+        }
+        out
+    }
+
+    /// アカウントごとの助言。
+    pub fn advice(&self, now: SystemTime) -> Vec<(String, quota::Advice)> {
+        self.accounts(now)
+            .into_iter()
+            .map(|u| {
+                let a = quota::advise(&u, u.running_agents, &self.policy, now);
+                (u.account, a)
+            })
+            .collect()
+    }
+
+    /// 最も深刻な助言 (無ければ [`quota::Advice::Ok`])。ステータスバー向け。
+    pub fn worst_advice(&self, now: SystemTime) -> quota::Advice {
+        self.advice(now)
+            .into_iter()
+            .map(|(_, a)| a)
+            .max_by_key(|a| a.severity())
+            .unwrap_or(quota::Advice::Ok)
+    }
+}
+
 // ── テスト ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2420,5 +2657,106 @@ mod tests {
         assert_eq!(c.drop_count(DropKind::UnknownTarget), 1);
         let last = c.drop_log().last().expect("記録が残る");
         assert_eq!(last.reason, DropReason::UnknownTarget);
+    }
+
+    // ── クォータ監視 ────────────────────────────────────────────────
+
+    fn st(epoch: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(epoch)
+    }
+
+    fn qsnap(agent: &str, account: &str, used: f32, at: SystemTime) -> quota::QuotaSnapshot {
+        quota::QuotaSnapshot {
+            agent: agent.into(),
+            label: agent.into(),
+            account: account.into(),
+            used_fraction: Some(used),
+            resets_at: None,
+            window: None,
+            plan: None,
+            observed_events: Vec::new(),
+            source: quota::SourceKind::Vendor,
+            measured_at: Some(at),
+        }
+    }
+
+    /// 取り込みを重ねると燃焼速度が貯まり、枯渇予測が出る。
+    #[test]
+    fn quota_watch_projects_after_two_samples() {
+        let mut w = QuotaWatch::new();
+        w.set_running(vec![("codex".to_string(), 2)]);
+        w.apply(vec![qsnap("codex", "openai", 0.10, st(0))], st(0));
+        // 1 点だけでは材料不足 (推測を出さない)
+        let acc = w.accounts(st(0));
+        assert_eq!(acc.len(), 1);
+        assert_eq!(acc[0].projection, quota::Projection::InsufficientData);
+        assert_eq!(acc[0].running_agents, 2);
+
+        w.apply(vec![qsnap("codex", "openai", 0.40, st(600))], st(600));
+        let acc = w.accounts(st(600));
+        // 0.3/600s = 0.0005/s、残り 0.6 → 1200 秒
+        assert_eq!(
+            acc[0].projection,
+            quota::Projection::Exhaustion(Duration::from_secs(1200))
+        );
+        assert_eq!(acc[0].confidence, quota::Confidence::Measured);
+        assert_eq!(w.applied(), 2);
+    }
+
+    /// 観測した上限イベントはスナップショットへ合流し、助言は Stop になる。
+    #[test]
+    fn quota_watch_events_drive_stop_advice() {
+        let mut w = QuotaWatch::new();
+        w.apply(vec![qsnap("codex", "openai", 0.10, st(0))], st(0));
+        w.note_rate_limited("codex", "usage limit reached", st(100));
+        assert_eq!(w.events().len(), 1);
+        assert!(!w.snapshots()[0].observed_events.is_empty(), "合流している");
+        let advice = w.advice(st(200));
+        assert_eq!(advice.len(), 1);
+        assert_eq!(advice[0].0, "openai");
+        assert_eq!(w.worst_advice(st(200)).severity(), 2, "Stop");
+        // 余裕がある間は黙る
+        let mut calm = QuotaWatch::new();
+        calm.apply(vec![qsnap("codex", "openai", 0.05, st(0))], st(0));
+        assert_eq!(calm.worst_advice(st(0)), quota::Advice::Ok);
+    }
+
+    /// 端末出力からの検知は terminal.rs の判定をそのまま使う。
+    #[test]
+    fn quota_watch_note_output_uses_shared_detector() {
+        let mut w = QuotaWatch::new();
+        assert!(w.note_output("claude", "5-hour limit reached ∙ resets 3am\n", st(1)));
+        assert!(!w.note_output("claude", "ふつうの出力\n", st(2)));
+        assert_eq!(w.events().len(), 1);
+    }
+
+    /// イベントは上限付きで、古いものから捨てる。
+    #[test]
+    fn quota_watch_events_are_bounded() {
+        let mut w = QuotaWatch::new();
+        for i in 0..(QUOTA_EVENT_CAP as u64 + 20) {
+            w.note_rate_limited("codex", "usage limit reached", st(i));
+        }
+        assert_eq!(w.events().len(), QUOTA_EVENT_CAP);
+        assert_eq!(w.events()[0].at, st(20), "古いものから捨てる");
+    }
+
+    /// 背景スレッド + チャネルで読み取れる (UI スレッドは触らない)。
+    /// TTL 内の再呼び出しでは新しいスキャンを始めない。
+    #[test]
+    fn quota_watch_background_refresh_lands() {
+        let mut w = QuotaWatch::new();
+        w.force_refresh();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while w.applied() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            w.refresh_if_stale(); // TTL 内なので取り込みだけ行う
+        }
+        assert_eq!(w.applied(), 1, "背景スキャンが 1 回だけ取り込まれる");
+        assert_eq!(
+            w.snapshots().len(),
+            quota::AGENT_QUOTAS.len(),
+            "記述子の数だけ行が出る"
+        );
     }
 }
