@@ -1,5 +1,8 @@
 # === Rust / Cargo ===
 /target/
+# ベンダリングしたクレートのビルド成果物 (誤コミット防止)
+vendor/*/target/
+**/target/
 **/*.rs.bk
 *.pdb
 # Cargo.lock はバイナリクレートのためコミットする（ignore しない）
