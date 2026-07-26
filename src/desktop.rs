@@ -807,6 +807,11 @@ mod tests {
 
     // ── .app 起動時の作業ディレクトリ補正 (ランチャーの `cd $HOME` の代替) ──
 
+    // macOS 限定。Windows では `/Users/u` のような先頭スラッシュのパスは
+    // ドライブ文字が無いため `is_absolute()` が false になり、この関数の
+    // 前提 (Unix の絶対パス) が成立しない。判定対象が .app バンドルなので
+    // そもそも macOS でしか通らない経路。
+    #[cfg(target_os = "macos")]
     #[test]
     fn app_launch_cwd_fix_only_for_bundle_launched_from_root() {
         let home = Path::new("/Users/u");
