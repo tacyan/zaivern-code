@@ -444,64 +444,38 @@ impl LogSink {
 ///
 /// bypass 起動でも CLI エージェントは起動時/プラン承認などで対話プロンプトを出すため、
 /// これに答えないと「全自動なのに進まない」状態になる。
+///
+/// エージェントが判らない文脈 (分類ヘルパ) 用。判っているなら
+/// [`auto_yes_reply_for`] へ `bin` 名を渡すと、他 CLI 用のルールを弾ける。
+#[allow(dead_code)]
 pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
-    // ⚡ 最優先: Antigravity CLI (Google AGY) 専用の自動YESプロンプト超強化判定
-    if text.contains("Antigravity") || text.contains("AGY") || text.contains("antigravity") || text.contains("agy") {
-        // カーソル選択プロンプト（❯ 1 / ❯ Yes / ❯ Allow / ❯ はい / ❯ 許可 / ❯ Accept / ❯ Proceed）
-        if text.contains("❯ 1")
-            || text.contains("❯ Yes")
-            || text.contains("❯ Allow")
-            || text.contains("❯ はい")
-            || text.contains("❯ 許可")
-            || text.contains("❯ Accept")
-            || text.contains("❯ Proceed")
-            || text.contains("❯ Continue")
-        {
-            return Some((b"\r", "Antigravityのカーソル選択プロンプトに自動「Enter」"));
-        }
+    auto_yes_reply_for(text, None)
+}
 
-        // 選択番号「1.」/「1)」/「[1]」/「(1)」の肯定選択肢
-        let has_num_one = text.contains("1. Yes")
-            || text.contains("1. Allow")
-            || text.contains("1. はい")
-            || text.contains("1. 許可")
-            || text.contains("1. Accept")
-            || text.contains("1. Proceed")
-            || text.contains("1. Continue")
-            || text.contains("1. Approve")
-            || text.contains("1) Yes")
-            || text.contains("1) Allow")
-            || text.contains("[1] Yes")
-            || text.contains("[1] Allow")
-            || text.contains("(1) Yes")
-            || text.contains("(1) Allow");
-        if has_num_one {
-            return Some((b"1", "Antigravityの選択プロンプトに自動「1」"));
-        }
-
-        // y/n テキスト形式
-        if text.contains("(y/n)")
-            || text.contains("[y/N]")
-            || text.contains("[y/n]")
-            || text.contains("(y/N)")
-            || text.contains("(Y/n)")
-            || text.contains("[Y/n]")
-            || text.contains("(yes/no)")
-            || text.contains("[yes/no]")
-            || text.contains("(y/n)?")
-            || text.contains("[y/N]?")
-        {
-            return Some((b"y\r", "Antigravityの(y/n)問い合わせに自動「y」"));
-        }
-
-        // 明確な (y/n) が無い Antigravity 問いかけプロンプトに対しては、
-        // 入力欄へ誤って「y」という文字が打ち込まれるのを防ぐため、
-        // 安全に Enter (\r) を送信して確定する。
-        if recent_lines_has_question(text) {
-            return Some((b"\r", "Antigravityの問いかけ・プロンプト確定に自動「Enter」"));
-        }
+/// [`auto_yes_reply`] のエージェント指定版。
+///
+/// 判定は 2 段構え:
+/// 1. **カタログの応答表** (`agents::PROMPT_RULES` + ユーザー定義ルール)。
+///    CLI ごとの実際の文言と送るキーは全部そこにデータとして載っている。
+/// 2. 表に無い場合の **汎用ヒューリスティック** (以下)。「1. Yes」「(y/n)」
+///    「Press Enter」など、CLI をまたいで通用する形だけを見る。
+pub fn auto_yes_reply_for(
+    text: &str,
+    agent: Option<&str>,
+) -> Option<(&'static [u8], &'static str)> {
+    // 管理者権限昇格など「自動で押してはいけない」画面ではここで打ち切る。
+    if crate::agents::prompt_never_answer(text) {
+        return None;
     }
-
+    // カタログの応答表が最優先 (ユーザー定義ルール → 組み込みルールの順)。
+    if let Some(hit) = crate::agents::prompt_rule_reply(text, agent) {
+        return Some(hit);
+    }
+    // 以降は CLI をまたいで通用する汎用の形だけを見る。
+    // (Antigravity 固有の文言は agents.rs の応答表に移した — 以前はここに
+    //  画面が "agy"/"Antigravity" を含むかだけで発火する巨大な直書き判定が
+    //  あったが、実物の agy は矢印キー選択 UI で "1. Yes" も "(y/n)" も
+    //  出さないため、どの分岐にも当たらず自動YESが素通りしていた。)
     // 初回の bypass 警告: デフォルト選択が「1. No, exit」なので
     // Enter ではなく番号キー「2」で「Yes, I accept」を直接選ぶ。
     if text.contains("Bypass Permissions mode") && text.contains("Yes, I accept") {
@@ -744,7 +718,11 @@ pub fn prompt_signature(text: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let lines: Vec<&str> = text.lines().collect();
     for (i, line) in lines.iter().enumerate() {
-        if SIG_MARKS.iter().any(|m| line.contains(m)) || is_question_line(line) {
+        // 目印は固定表 + 応答表 (agents.rs) の needles。表に足したパターンは
+        // 指紋にも自動で効くので、片方だけ更新して取りこぼす事故が起きない。
+        let marked = SIG_MARKS.iter().any(|m| line.contains(m))
+            || crate::agents::prompt_sig_marks().any(|m| line.contains(m));
+        if marked || is_question_line(line) {
             if i > 0 {
                 lines[i - 1].trim_end().hash(&mut h);
             }
@@ -1421,6 +1399,13 @@ impl Session {
         self.spec().is_some()
     }
 
+    /// このセッションのエージェント名 (`agy` / `claude` …)。カタログ外なら None。
+    /// 別名 (`antigravity` / `antigravity-cli`) はカタログ側で正規化されるので、
+    /// ここでは常に正規の `bin` 名が返る。
+    pub fn agent_bin(&self) -> Option<&'static str> {
+        self.spec().map(|s| s.bin)
+    }
+
     /// 実行中セッションへ送れる権限モード切替のキー列。
     /// 実機で確認できていない CLI では None(誤ったキーを送らない)。
     pub fn permission_switch_keys(&self) -> Option<&'static [u8]> {
@@ -1481,7 +1466,9 @@ impl Session {
             "(y/n)",
             "[y/N]",
         ];
-        let reply = auto_yes_reply(&text);
+        // 応答表の絞り込みに使うため、このセッションのエージェント名を渡す。
+        // (Antigravity 用のルールが claude のセッションへ流れ込まない)
+        let reply = auto_yes_reply_for(&text, self.agent_bin());
         let present = reply.is_some() || PATTERNS.iter().any(|p| text.contains(p));
         // 応答済みエピソードの追跡: プロンプトが画面から消えた、または指紋が
         // 変わった(連続承認キューの次のダイアログ等)ら「応答済み」を下ろす。
@@ -1682,7 +1669,7 @@ impl Session {
     /// 番号キー「2」などプロンプトに合った承認キーを返す。分類不能なら None。
     pub fn approve_reply(&self) -> Option<&'static str> {
         let text = lock_ok(&self.parser).screen().contents();
-        let (bytes, _) = auto_yes_reply(&text)?;
+        let (bytes, _) = auto_yes_reply_for(&text, self.agent_bin())?;
         std::str::from_utf8(bytes).ok()
     }
 
@@ -2134,7 +2121,7 @@ mod tail_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::auto_yes_reply;
+    use super::{auto_yes_reply, auto_yes_reply_for};
 
     #[test]
     fn bypass_warning_selects_accept() {
@@ -2220,34 +2207,215 @@ mod tests {
         assert_eq!(bytes, b"1");
     }
 
+    // ── Antigravity (agy) の承認プロンプト ────────────────────────────
+    //
+    // 旧テスト `antigravity_all_prompts_send_auto_yes` を差し替えたもの。
+    // 旧テストが並べていた "Antigravity: Allow tool call?" 等の文面は、
+    // 実物の agy が一度も出さない**推測**だった。実際の agy は
+    //   Allow access to this file?
+    //   Requesting permission for:
+    //     …
+    //     Yes, allow access
+    //     No, deny access
+    //   [Use arrow keys to navigate, Enter to select]
+    // という矢印キー選択 UI で、「1. Yes」も「(y/n)」も出さない。
+    // そのため旧実装のどの分岐にも当たらず自動YESが素通りしていた
+    // (= ユーザー報告「.gemini の設定を入れないと動かない」の原因)。
+    // 以下の文面はインストール済み `agy` バイナリに埋め込まれた実物である。
+
+    /// 実物の agy の承認メニューを組み立てる (選択 UI のフッタ付き)。
+    fn agy_menu(head: &str, yes: &str, no: &str) -> String {
+        format!(
+            "{head}\nRequesting permission for:\n  /tmp/work/src/main.rs\n\n  {yes}\n  {no}\n\n\
+             [Use arrow keys to navigate, Enter to select]"
+        )
+    }
+
     #[test]
-    fn antigravity_all_prompts_send_auto_yes() {
-        // (y/n) パターン
-        let (bytes, desc) = auto_yes_reply("Antigravity: Allow execute this command? (y/n) ").unwrap();
+    fn antigravity_real_prompts_are_confirmed_with_enter() {
+        // (見出し, 肯定選択肢, 否定選択肢) — すべて agy 本体から採取した実文言。
+        let cases = [
+            ("Allow access to this file?", "Yes, allow access", "No, deny access"),
+            (
+                "Allow creation of this file?",
+                "Yes, allow creation",
+                "No, deny creation",
+            ),
+            (
+                "Accept this file edit?",
+                "Yes, accept this change",
+                "No, reject this change",
+            ),
+        ];
+        for (head, yes, no) in cases {
+            let screen = agy_menu(head, yes, no);
+            let (bytes, desc) = auto_yes_reply_for(&screen, Some("agy")).unwrap_or_else(|| {
+                panic!("agy の承認プロンプトが分類できない: {head}");
+            });
+            // agy 自身が "Enter to select" と案内しており、肯定側が先頭 (既定選択)。
+            assert_eq!(bytes, b"\r", "head={head}");
+            assert!(desc.contains("Antigravity"), "head={head} desc={desc}");
+        }
+    }
+
+    #[test]
+    fn antigravity_permission_and_trust_prompts_are_answered() {
+        // コマンド実行などの汎用権限要求 (「常に許可」ではなく一回だけ許可を選ぶ)。
+        let screen = agy_menu(
+            "Requesting permission to run a command",
+            "Yes, grant permission for 'git status'",
+            "No, deny and always deny for 'git status' in this conversation",
+        );
+        let (bytes, _) = auto_yes_reply_for(&screen, Some("agy")).unwrap();
+        assert_eq!(bytes, b"\r");
+
+        // 起動直後のフォルダ信頼確認。
+        let trust = agy_menu(
+            "Do you trust this folder?",
+            "Yes, I trust this folder",
+            "No, exit",
+        );
+        let (bytes, _) = auto_yes_reply_for(&trust, Some("agy")).unwrap();
+        assert_eq!(bytes, b"\r");
+    }
+
+    #[test]
+    fn antigravity_future_menus_are_covered_by_the_select_hint_rule() {
+        // CLI 側の更新で見出しも選択肢の文言も変わった想定。選択 UI のフッタは
+        // ウィジェット共通なので、総取りルールが効き続ける (再ビルド不要の保険)。
+        let screen = agy_menu(
+            "Allow the agent to open a browser tab?",
+            "Yes, allow browsing just this once",
+            "No, keep me offline",
+        );
+        let (bytes, _) = auto_yes_reply_for(&screen, Some("agy")).unwrap();
+        assert_eq!(bytes, b"\r");
+    }
+
+    #[test]
+    fn antigravity_rules_do_not_fire_for_other_agents() {
+        // agy 専用ルールは、エージェントが判っている他 CLI のタブへは適用しない。
+        let screen = agy_menu(
+            "Allow access to this file?",
+            "Yes, allow access",
+            "No, deny access",
+        );
+        // claude のセッションでは agy ルールが外れる。汎用側にも一致しないこと
+        // (見出しが "?" で終わるが、画面末尾はフッタ行なので質問扱いにならない)。
+        assert!(
+            auto_yes_reply_for(&screen, Some("claude")).is_none(),
+            "agy 専用ルールが claude のタブへ漏れている"
+        );
+        // エージェント不明のときは全ルールを見るので従来通り答えられる。
+        assert!(auto_yes_reply_for(&screen, None).is_some());
+    }
+
+    #[test]
+    fn antigravity_prose_mentioning_yes_is_not_a_prompt() {
+        // 承認プロンプトではない普通の出力。"Yes" や "allow" を含んでいても、
+        // 見出しと肯定選択肢が揃っていないので発火しない。
+        for screen in [
+            "I will now check whether the config says yes to telemetry.",
+            "Docs: answer \"Yes, allow access\" when the CLI asks you.",
+            "Allow access to this file? — この質問には後で答えます\n作業を続行中…",
+        ] {
+            assert!(
+                auto_yes_reply_for(screen, Some("agy")).is_none(),
+                "誤爆した: {screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_escalation_is_never_auto_answered() {
+        // 自動YESは「エージェントのツール承認」を代行するものであって、
+        // OS の管理者権限昇格まで肩代わりしない。ここだけは必ずユーザーに残す。
+        let screen = agy_menu(
+            "Requesting permission for a one-time admin escalation. \
+             Administrator privileges are required to set up sandboxing.",
+            "Yes, grant permission for sudo",
+            "No, deny",
+        );
+        assert!(
+            auto_yes_reply_for(&screen, Some("agy")).is_none(),
+            "管理者権限昇格に自動でYESを送ってはいけない"
+        );
+        assert!(auto_yes_reply_for(&screen, None).is_none());
+    }
+
+    #[test]
+    fn user_defined_rules_extend_and_override_the_builtin_table() {
+        use crate::agents::{prompt_rule_reply_with, PromptRule};
+
+        // config.toml の [[auto_yes_rules]] 相当。再ビルドなしで表を足せる。
+        // プロセス共有のレジストリではなく引数でルールを渡す — 並列に走る
+        // 他のテストの画面へ、このルールが漏れないようにするため。
+        let extend = [PromptRule {
+            agent: "",
+            needles: &["Continue with this plan?"],
+            avoid: &[],
+            reply: b"y\r",
+            desc: "ユーザー定義ルール",
+        }];
+        let screen = "Continue with this plan?\n  [1] go  [2] stop";
+        let (bytes, desc) = prompt_rule_reply_with(&extend, screen, Some("agy")).unwrap();
         assert_eq!(bytes, b"y\r");
-        assert!(desc.contains("Antigravity"));
+        assert!(desc.contains("ユーザー定義"), "desc={desc}");
 
-        // 1. Allow パターン
-        let (bytes, _) = auto_yes_reply("Antigravity: Allow tool call?\n  1. Allow\n  2. Deny").unwrap();
-        assert_eq!(bytes, b"1");
+        // ユーザールールは組み込み表より先に評価される = 上書きできる。
+        let over = [PromptRule {
+            agent: "agy",
+            needles: &["Allow access to this file?"],
+            avoid: &[],
+            reply: b"2",
+            desc: "ユーザー定義ルール",
+        }];
+        let menu = agy_menu(
+            "Allow access to this file?",
+            "Yes, allow access",
+            "No, deny access",
+        );
+        assert_eq!(
+            prompt_rule_reply_with(&over, &menu, Some("agy")).map(|(b, _)| b),
+            Some(&b"2"[..]),
+            "ユーザールールが組み込みを上書きしていない"
+        );
+        // 同じ画面でも、ルール無しなら組み込み表の Enter に戻る。
+        assert_eq!(
+            prompt_rule_reply_with(&[], &menu, Some("agy")).map(|(b, _)| b),
+            Some(&b"\r"[..])
+        );
+        // agent 指定は効く: 別 CLI のタブへは流れない。
+        assert!(prompt_rule_reply_with(&over, &menu, Some("claude")).is_none());
+        // 管理者権限昇格ガードはユーザールールより強い (押し切れない)。
+        let sudo = agy_menu(
+            "Requesting permission for a one-time admin escalation",
+            "Yes, allow access",
+            "No, deny",
+        );
+        assert!(prompt_rule_reply_with(&over, &sudo, Some("agy")).is_none());
+    }
 
-        // ❯ 1. Yes パターン
-        let (bytes, _) = auto_yes_reply("AGY: Confirm action\n  ❯ 1. Yes\n    2. No").unwrap();
-        assert_eq!(bytes, b"\r");
+    #[test]
+    fn config_rules_reach_the_reply_engine_through_the_registry() {
+        // config.toml → agents::set_user_prompt_rules → auto_yes_reply の配線確認。
+        // 他テストの画面に一致しないよう、目印にテスト専用の合言葉を使う。
+        const SENTINEL: &str = "ZAIVERN-TEST-SENTINEL-PROMPT";
+        let mut cfg = crate::config::Config::default();
+        assert!(cfg.auto_yes_rules.is_empty(), "既定はユーザールール無し");
+        cfg.auto_yes_rules.push(crate::config::AutoYesRule {
+            pattern: SENTINEL.into(),
+            reply: "y\r".into(),
+            agent: String::new(),
+        });
+        crate::config::publish_auto_yes_rules(&cfg);
+        let (bytes, _) = auto_yes_reply_for(SENTINEL, Some("agy")).unwrap();
+        assert_eq!(bytes, b"y\r", "config のルールが応答エンジンへ届いていない");
 
-        // 日本語プロンプトパターン
-        let (bytes, _) = auto_yes_reply("Antigravity: ツールを許可しますか？ [y/N]").unwrap();
-        assert_eq!(bytes, b"y\r");
-
-        // 追加された拡張プロンプトパターン
-        let (bytes, _) = auto_yes_reply("AGY: Proceed with file save?").unwrap();
-        assert_eq!(bytes, b"\r");
-
-        let (bytes, _) = auto_yes_reply("antigravity: 変更を適用しますか？").unwrap();
-        assert_eq!(bytes, b"\r");
-
-        let (bytes, _) = auto_yes_reply("Antigravity: Select option\n  1. Allow always\n  2. Deny").unwrap();
-        assert_eq!(bytes, b"1");
+        // 空にすれば消える (設定を消して読み直したときに残らない)。
+        cfg.auto_yes_rules.clear();
+        crate::config::publish_auto_yes_rules(&cfg);
+        assert!(auto_yes_reply_for(SENTINEL, Some("agy")).is_none());
     }
 
     #[test]
@@ -3777,6 +3945,39 @@ mod tests {
         assert!(s.is_permission_agent());
         assert_eq!(s.permission_switch_keys(), Some(&b"/permissions\r"[..]));
         s.kill();
+    }
+
+    /// セッションから応答表への配線。別名で起動しても `agy` のルールが効くこと。
+    ///
+    /// `scan_attention` / `approve_reply` はここで得た `bin` 名で応答表を
+    /// 絞り込むので、別名が正規化されないと Antigravity 用ルールが
+    /// 丸ごと外れて自動YESが素通りする (今回の不具合そのもの)。
+    #[test]
+    fn antigravity_aliases_route_to_the_agy_prompt_rules() {
+        for (i, cmd) in [
+            "agy --dangerously-skip-permissions",
+            "antigravity",
+            "antigravity-cli --model gemini-3-pro",
+            "/usr/local/bin/antigravity",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut s = probe_session(9300 + i as u64, cmd);
+            assert_eq!(s.agent_bin(), Some("agy"), "{cmd} が agy に正規化されない");
+            // 実物の agy の承認メニューに対し、このセッションで Enter が選ばれる。
+            let screen = agy_menu(
+                "Allow access to this file?",
+                "Yes, allow access",
+                "No, deny access",
+            );
+            assert_eq!(
+                auto_yes_reply_for(&screen, s.agent_bin()).map(|(b, _)| b),
+                Some(&b"\r"[..]),
+                "{cmd}: Antigravity の承認プロンプトに応答できない"
+            );
+            s.kill();
+        }
     }
 
     /// カタログに載った新しい CLI も権限エージェントとして認識される。

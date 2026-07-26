@@ -66,6 +66,13 @@ pub struct Config {
     pub pet_approve_keys: String,
     /// 拒否時に PTY へ送るキー (既定は ESC)
     pub pet_deny_keys: String,
+    /// 自動YESの追加ルール (ユーザー定義)。
+    ///
+    /// CLI 側が承認プロンプトの文言を変えると、同梱の応答表 (src/agents.rs) が
+    /// 一致しなくなり自動YESが素通りする。そのとき**再ビルドせずに**
+    /// config.toml だけで直せるようにするための逃げ道。
+    /// 組み込みの表より先に評価されるので、既定の判断を上書きもできる。
+    pub auto_yes_rules: Vec<AutoYesRule>,
     /// 音声認識エンジン: "auto" | "mac" | "powershell" | "browser" | "command" | "off"
     /// auto = macOS は内蔵、voice_command 設定済みならそれ、Windows は標準の
     /// 音声認識、残りはブラウザの /voice ページ (src/voice.rs の resolve_engine)
@@ -223,6 +230,7 @@ impl Default for Config {
             pet_auto_yes: false,
             pet_approve_keys: "\r".into(),
             pet_deny_keys: "\u{1b}".into(),
+            auto_yes_rules: Vec::new(),
             voice_engine: "auto".into(),
             voice_target: "active".into(),
             voice_lang: "ja-JP".into(),
@@ -234,6 +242,37 @@ impl Default for Config {
             supervisor: crate::supervisor::SupervisorConfig::default(),
             super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),
+        }
+    }
+}
+
+/// 自動YESのユーザー定義ルール 1 件 (`[[auto_yes_rules]]`)。
+///
+/// ```toml
+/// [[auto_yes_rules]]
+/// pattern = "Allow access to this file?"   # 画面に出る目印
+/// reply   = "\r"                            # PTY へ送るキー ("\r"=Enter)
+/// agent   = "agy"                           # 省略/空なら全エージェント
+/// ```
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(default)]
+pub struct AutoYesRule {
+    /// 画面に含まれていたら一致とみなす文字列。空の行は無視される。
+    pub pattern: String,
+    /// 一致したとき PTY へ送るキー列。TOML のエスケープがそのまま使える
+    /// (`"\r"` = Enter / `"y\r"` = y と Enter / `"1"` = 番号キー)。
+    pub reply: String,
+    /// 対象エージェントの実行ファイル名 (`agy` / `claude` …)。
+    /// 空なら全エージェント。別名で書いても正規化されないので正規名で書く。
+    pub agent: String,
+}
+
+impl Default for AutoYesRule {
+    fn default() -> Self {
+        Self {
+            pattern: String::new(),
+            reply: "\r".into(),
+            agent: String::new(),
         }
     }
 }
@@ -437,6 +476,28 @@ show_pet = true
 # pet_auto_yes = false    # 承認プロンプトへ自動でYES (オフ=ユーザー承認必須)
 # pet_approve_keys = "\r"    # 承認時にPTYへ送るキー (Enter)
 # pet_deny_keys = "\u001B"   # 拒否時にPTYへ送るキー (ESC)
+
+# ── 自動YESの追加ルール ──────────────
+# 自動YES は、CLI ごとの承認プロンプトの文言を Zaivern 内部の表と突き合わせて
+# 「どのキーを送れば YES になるか」を決めています。CLI 側の更新で文言が変わると
+# 表に当たらなくなり、自動YES が素通りします。そのときは Zaivern を入れ直さなくても
+# ここへ自分のルールを足せば直せます (組み込みの表より先に評価されます)。
+#
+# 画面に pattern が含まれていたら reply のキー列を送ります。
+#   reply = "\r"    Enter (矢印キー選択メニューの確定。既定)
+#   reply = "y\r"   y と Enter ((y/n) 形式)
+#   reply = "1"     番号キー (「1. Yes」形式で、カーソルが Yes に無いとき)
+#   agent = "agy"   そのエージェントのタブだけに効かせる (省略すると全部)
+#                   agy=Antigravity / claude / codex / gemini … (実行ファイル名)
+#
+# [[auto_yes_rules]]
+# pattern = "Allow access to this file?"
+# reply = "\r"
+# agent = "agy"
+#
+# [[auto_yes_rules]]
+# pattern = "Continue with this plan?"
+# reply = "y\r"
 
 # ── 音声入力 (🎤) ──────────────
 # 🎤 を押すと録音が始まり、⏹ を押すまで話した内容がエージェントの入力欄へ
@@ -721,7 +782,20 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     // 何も起きない (request_diagnosis が no-op になる) ため、UI の見え方と
     // 実挙動がずれないようここで一本化する。
     cfg.supervisor.llm_escalation = cfg.super_agent.active_command().is_some();
+    // 自動YESのユーザー定義ルールを応答エンジンへ渡す。
+    // ここで配るので、設定を読み直せば再起動なしで反映される。
+    publish_auto_yes_rules(&cfg);
     cfg
+}
+
+/// `[[auto_yes_rules]]` を自動YESの応答エンジン (src/agents.rs) へ登録する。
+pub fn publish_auto_yes_rules(cfg: &Config) {
+    let rules: Vec<(String, String, String)> = cfg
+        .auto_yes_rules
+        .iter()
+        .map(|r| (r.pattern.clone(), r.reply.clone(), r.agent.clone()))
+        .collect();
+    crate::agents::set_user_prompt_rules(&rules);
 }
 
 /// `<root>/.zaivern.toml` を 1 枚 `cfg` に重ねる。無ければ何もしない。
@@ -1803,6 +1877,62 @@ mod plugins_config_tests {
         let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定 config.toml が壊れている");
         assert!(cfg.plugins.is_enabled("worktrees"));
         assert!(!cfg.agents.is_empty());
+    }
+
+    // ---- 自動YESのユーザー定義ルール ([[auto_yes_rules]]) ----
+
+    #[test]
+    fn 自動yesルールが書いて読んで往復する() {
+        let src = r#"
+theme = "dark"
+
+[[auto_yes_rules]]
+pattern = "Allow access to this file?"
+reply = "\r"
+agent = "agy"
+
+[[auto_yes_rules]]
+pattern = "Continue with this plan?"
+reply = "y\r"
+"#;
+        let cfg: Config = toml::from_str(src).expect("auto_yes_rules が読めない");
+        assert_eq!(cfg.auto_yes_rules.len(), 2);
+        assert_eq!(cfg.auto_yes_rules[0].pattern, "Allow access to this file?");
+        assert_eq!(cfg.auto_yes_rules[0].reply, "\r", "TOML のエスケープが効く");
+        assert_eq!(cfg.auto_yes_rules[0].agent, "agy");
+        // agent 省略時は「全エージェント」を表す空文字。
+        assert_eq!(cfg.auto_yes_rules[1].reply, "y\r");
+        assert_eq!(cfg.auto_yes_rules[1].agent, "");
+
+        // 書き戻して読み直しても同じ (シリアライズ側の欠落よけ)。
+        let out = toml::to_string(&cfg).expect("書き戻せない");
+        let back: Config = toml::from_str(&out).expect("書き戻したものが読めない");
+        assert_eq!(back.auto_yes_rules, cfg.auto_yes_rules);
+    }
+
+    #[test]
+    fn キーの無い古い設定ファイルもそのまま読める() {
+        // 既存ユーザーの config.toml には auto_yes_rules が無い。
+        // 追加したキーのせいで設定全体が既定へ戻る事故を防ぐ。
+        let old = "theme = \"dark\"\npet_auto_yes = true\n";
+        let cfg: Config = toml::from_str(old).expect("古い設定が読めなくなった");
+        assert_eq!(cfg.theme, "dark");
+        assert!(cfg.pet_auto_yes, "既存のキーが読めている");
+        assert!(cfg.auto_yes_rules.is_empty(), "未指定なら空 (既定の表だけ使う)");
+    }
+
+    #[test]
+    fn 既定テンプレートの自動yesルール例はコメントアウトされている() {
+        // 例をそのまま有効にすると、書いた覚えの無いルールが効いてしまう。
+        assert!(
+            DEFAULT_CONFIG.contains("# [[auto_yes_rules]]"),
+            "DEFAULT_CONFIG に auto_yes_rules の記入例が無い"
+        );
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定 config.toml が壊れている");
+        assert!(
+            cfg.auto_yes_rules.is_empty(),
+            "記入例が有効になっている (コメントアウトのはず)"
+        );
     }
 }
 

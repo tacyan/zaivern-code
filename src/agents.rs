@@ -605,6 +605,255 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
     },
 ];
 
+// ══════════════════════════════════════════════════════════════════════
+//  自動YES: プロンプト応答表 (データ)
+// ══════════════════════════════════════════════════════════════════════
+//
+// 「画面にこの文言が出ていたら、この キー列 を PTY へ送る」という対応表。
+// **ここだけがエージェント固有の知識**で、判定ロジック (terminal.rs の
+// auto_yes_reply) は表を上から順に見るだけ。CLI 側が文言を変えても
+// 表の 1 行を直せば済む(ロジックには一切リテラルを置かない)。
+//
+// ユーザーは config.toml の `[[auto_yes_rules]]` で自分のルールを足せる
+// (再コンパイル不要)。ユーザールールは常にこの組み込み表より先に評価される。
+
+/// 自動YESの応答ルール 1 件。
+#[derive(Clone, Copy)]
+pub struct PromptRule {
+    /// 対象エージェント(カタログの `bin` 名)。`""` は全エージェント共通。
+    /// セッションのエージェントが判っているときだけ絞り込みに使う。
+    pub agent: &'static str,
+    /// 画面に**すべて**含まれていたら一致(AND 条件)。
+    /// 単語 1 個で決めず、「見出し」+「肯定選択肢」のように 2 つ以上を
+    /// 組み合わせることで、本文中にたまたま "yes" が出ただけの行で
+    /// 誤爆しないようにする。
+    pub needles: &'static [&'static str],
+    /// 1 つでも画面に含まれていたら**不一致**にする除外語。
+    pub avoid: &'static [&'static str],
+    /// 一致したとき PTY へ送るキー列。
+    pub reply: &'static [u8],
+    /// UI 通知に出す説明。
+    pub desc: &'static str,
+}
+
+/// Antigravity CLI (`agy`) の選択 UI が必ず出すフッタ。
+/// この 1 行があれば「矢印キーで選ぶ承認メニューが開いている」と断定できる。
+/// 実機バイナリに埋め込まれた文言をそのまま使っている。
+const AGY_SELECT_HINT: &str = "[Use arrow keys to navigate, Enter to select]";
+
+/// 組み込みのプロンプト応答表。**上から順に**評価し、最初に一致したものを使う。
+///
+/// ## Antigravity (`agy`) の実測メモ
+/// 文言と UI の形は、インストール済み `agy` 本体 (Go バイナリ) に埋め込まれた
+/// 文字列から採取した実物である。判ったこと:
+///
+/// - 承認 UI は **矢印キー + Enter** 方式 (`[Use arrow keys to navigate, Enter to select]`)。
+///   番号キーによる選択でも `(y/n)` でもないため、Zaivern が他 CLI 向けに持っていた
+///   「1. Yes」「(y/n)」パターンはどれも一致せず、**自動YESが素通りしていた**。
+///   これがユーザー報告「`.gemini` の設定を入れないと自動YESが動かない」の正体。
+/// - 肯定側の選択肢は必ず `Yes, ...` で始まり、リストの**先頭(既定選択)**にある。
+///   よって確定キーは Enter (`\r`)。CLI 自身が "Enter to select" と案内している。
+/// - `--dangerously-skip-permissions` は本物のフラグ (`agy --help` で確認)。
+///   バイナリにも "dangerously-skip-permissions set, auto-approving all tool
+///   permissions" の文字列がある。ただしこれが効くのはツール権限だけで、
+///   フォルダ信頼確認などの起動時プロンプトは別途出るため、この表が要る。
+pub static PROMPT_RULES: &[PromptRule] = &[
+    // ── Antigravity CLI (agy) ───────────────────────────────────────
+    // ファイル読み取り許可。見出し + 肯定選択肢の両方が出ていることを要求する。
+    PromptRule {
+        agent: "agy",
+        needles: &["Allow access to this file?", "Yes, allow access"],
+        avoid: &[],
+        reply: b"\r",
+        desc: "Antigravity のファイル参照許可に Enter",
+    },
+    // ファイル新規作成の許可。
+    PromptRule {
+        agent: "agy",
+        needles: &["Allow creation of this file?", "Yes, allow creation"],
+        avoid: &[],
+        reply: b"\r",
+        desc: "Antigravity のファイル作成許可に Enter",
+    },
+    // 編集内容のレビュー (差分の受け入れ)。
+    PromptRule {
+        agent: "agy",
+        needles: &["Accept this file edit?", "Yes, accept this change"],
+        avoid: &[],
+        reply: b"\r",
+        desc: "Antigravity の編集受け入れに Enter",
+    },
+    // フォルダ信頼確認 (起動直後)。肯定が既定選択。
+    PromptRule {
+        agent: "agy",
+        needles: &["Yes, I trust this folder"],
+        avoid: &[],
+        reply: b"\r",
+        desc: "Antigravity のフォルダ信頼確認に Enter",
+    },
+    // コマンド実行などの汎用権限要求。`Persist to settings.json` 付きの
+    // 「常に許可」ではなく、先頭の一回だけ許可を選ぶ。
+    PromptRule {
+        agent: "agy",
+        needles: &["Requesting permission", "Yes, grant permission for"],
+        avoid: &[],
+        reply: b"\r",
+        desc: "Antigravity の権限要求に Enter",
+    },
+    PromptRule {
+        agent: "agy",
+        needles: &["Requesting permission", "Yes, approve"],
+        avoid: &[],
+        reply: b"\r",
+        desc: "Antigravity の承認要求に Enter",
+    },
+    // 上のどれにも当たらない **将来の** 承認メニュー用の総取りルール。
+    // 選択 UI のフッタが出ていて、肯定選択肢 (`Yes, `) が画面にあるときだけ。
+    // 文言が変わってもフッタは選択ウィジェット共通なので、この 1 行が効き続ける。
+    PromptRule {
+        agent: "agy",
+        needles: &[AGY_SELECT_HINT, "Yes, "],
+        avoid: &[],
+        reply: b"\r",
+        desc: "Antigravity の選択メニューに Enter",
+    },
+];
+
+/// **絶対に自動応答しない**画面の目印。
+///
+/// 自動YESは「エージェントのツール承認を代わりに押す」機能であって、
+/// OS の管理者権限昇格まで肩代わりするものではない。ここに載る語が画面に
+/// あるときは、組み込み表もユーザールールも汎用ヒューリスティックも
+/// すべて黙り、ユーザー本人の判断に委ねる。
+///
+/// NOTE: 既存の汎用ヒューリスティック側には元々この種のガードが無く、
+/// 「Overwrite? (y/n)」や「削除しますか」にも YES を返す設計だった
+/// (= 全自動YESはユーザーが明示的にオンにする「全部はい」モード)。
+/// その挙動は変えていない — ここで止めるのは管理者権限昇格だけ。
+pub static PROMPT_NEVER: &[&str] = &[
+    // agy: sudo によるサンドボックス初期設定。実測文言。
+    "one-time admin escalation",
+    "Administrator privileges are required",
+];
+
+/// ユーザー定義ルール (config.toml の `[[auto_yes_rules]]`)。
+///
+/// 登録時に `&'static` へリークして持つ。応答キーは `&'static [u8]` で
+/// 扱えた方が呼び出し側 (承認バブルの `approve_reply` など) が単純になるうえ、
+/// ルール数はユーザーが手で書く数しかなく、同じ内容なら再登録もしないため
+/// リーク量は実質的に固定である。
+static USER_RULES: std::sync::OnceLock<std::sync::RwLock<&'static [PromptRule]>> =
+    std::sync::OnceLock::new();
+
+fn user_rules_cell() -> &'static std::sync::RwLock<&'static [PromptRule]> {
+    USER_RULES.get_or_init(|| std::sync::RwLock::new(&[]))
+}
+
+/// いま有効なユーザー定義ルール。
+pub fn user_prompt_rules() -> &'static [PromptRule] {
+    user_rules_cell()
+        .read()
+        .map(|g| *g)
+        .unwrap_or(&[])
+}
+
+/// config.toml のユーザー定義ルールを取り込む(設定読み込みのたびに呼ぶ)。
+///
+/// `(pattern, reply, agent)` の 3 つ組で受け取る。`agent` が空なら全エージェント。
+/// `pattern` か `reply` が空の行は無視する(書きかけの設定で暴発させない)。
+/// 中身が前回と同じなら何もしない — 設定の読み直しでリークを積み増さないため。
+pub fn set_user_prompt_rules(rules: &[(String, String, String)]) {
+    let cell = user_rules_cell();
+    let cur = cell.read().map(|g| *g).unwrap_or(&[]);
+    let wanted: Vec<(&str, &str, &str)> = rules
+        .iter()
+        .map(|(p, r, a)| (p.as_str(), r.as_str(), a.as_str()))
+        .filter(|(p, r, _)| !p.is_empty() && !r.is_empty())
+        .collect();
+    let same = cur.len() == wanted.len()
+        && cur.iter().zip(&wanted).all(|(c, w)| {
+            c.needles.first().copied() == Some(w.0)
+                && c.reply == w.1.as_bytes()
+                && c.agent == w.2
+        });
+    if same {
+        return;
+    }
+    let built: Vec<PromptRule> = wanted
+        .iter()
+        .map(|(p, r, a)| PromptRule {
+            agent: Box::leak(a.to_string().into_boxed_str()),
+            needles: Box::leak(vec![&*Box::leak(p.to_string().into_boxed_str())].into_boxed_slice()),
+            avoid: &[],
+            reply: Box::leak(r.to_string().into_boxed_str()).as_bytes(),
+            desc: Box::leak(format!("ユーザー定義ルール「{p}」").into_boxed_str()),
+        })
+        .collect();
+    if let Ok(mut g) = cell.write() {
+        *g = Box::leak(built.into_boxed_slice());
+    }
+}
+
+/// 画面が「自動応答してはいけない」種類か。
+pub fn prompt_never_answer(text: &str) -> bool {
+    PROMPT_NEVER.iter().any(|m| text.contains(m))
+}
+
+/// 1 件のルールが画面に一致するか。
+fn rule_matches(rule: &PromptRule, text: &str, agent: Option<&str>) -> bool {
+    // エージェント絞り込み: セッションのエージェントが判っていて、かつ
+    // ルールが別のエージェント専用なら対象外。判らないときは全ルールを見る
+    // (カタログ外から呼ばれる分類ヘルパ用。needles が具体的なので誤爆しない)。
+    if !rule.agent.is_empty() {
+        if let Some(a) = agent {
+            if a != rule.agent {
+                return false;
+            }
+        }
+    }
+    if rule.needles.is_empty() {
+        return false;
+    }
+    rule.needles.iter().all(|n| text.contains(n)) && !rule.avoid.iter().any(|n| text.contains(n))
+}
+
+/// 応答表から、画面に合う応答キーと説明を引く。
+/// ユーザー定義ルールを先に見るので、組み込みの判断を上書きできる。
+pub fn prompt_rule_reply(
+    text: &str,
+    agent: Option<&str>,
+) -> Option<(&'static [u8], &'static str)> {
+    prompt_rule_reply_with(user_prompt_rules(), text, agent)
+}
+
+/// [`prompt_rule_reply`] の本体。ユーザー定義ルールを引数で受け取る。
+///
+/// プロセス全体で共有するレジストリを触らずに済むので、テストが並列に
+/// 走っても互いのルールが混ざらない (レジストリ経由だと 1 本のテストが
+/// 登録したルールが同時実行中の別テストの画面に一致してしまう)。
+pub fn prompt_rule_reply_with(
+    user: &[PromptRule],
+    text: &str,
+    agent: Option<&str>,
+) -> Option<(&'static [u8], &'static str)> {
+    if prompt_never_answer(text) {
+        return None;
+    }
+    user.iter()
+        .chain(PROMPT_RULES.iter())
+        .find(|r| rule_matches(r, text, agent))
+        .map(|r| (r.reply, r.desc))
+}
+
+/// プロンプト指紋 (terminal.rs) が「承認プロンプトの行」を見分けるための目印。
+/// 応答表の needles をそのまま流用する — 表に足せば指紋にも自動で効く。
+pub fn prompt_sig_marks() -> impl Iterator<Item = &'static str> {
+    user_prompt_rules()
+        .iter()
+        .chain(PROMPT_RULES.iter())
+        .flat_map(|r| r.needles.iter().copied())
+}
+
 /// パス付きでも実行ファイル名だけを取り出す(`/usr/local/bin/claude` → `claude`)。
 fn basename(token: &str) -> &str {
     token.rsplit(['/', '\\']).next().unwrap_or(token)
@@ -1393,6 +1642,89 @@ mod tests {
             apply_approval("agy --dangerously-skip-permissions", Approval::Ask),
             "agy"
         );
+    }
+
+    /// Antigravity は別名で書いても同じ定義に解決され、Auto ではどの起動経路でも
+    /// 自動承認フラグと `auto_env` が実際にプロセスへ渡ること。
+    ///
+    /// 経路は 2 つある:
+    /// - 新規起動 `AgentManager::launch` … `apply_approval` + `merged_env`
+    /// - 復元起動 `AgentManager::launch_restored` … セッション記録に残った
+    ///   「起動時のコマンド」(= すでに `apply_approval` 済み) に `apply_resume`
+    ///   を足し、env は `merged_env` で引き直す (app.rs のフォルダ復元処理)。
+    ///   復元で承認フラグが落ちると、再開したタブだけ自動YESが効かなくなる。
+    #[test]
+    fn antigravity_aliases_share_one_spec_and_keep_auto_flag_on_every_launch_path() {
+        use std::collections::HashMap;
+
+        let canonical = super::spec_for_bin("agy").unwrap();
+        for name in ["agy", "antigravity", "antigravity-cli"] {
+            let spec = super::spec_for_bin(name)
+                .unwrap_or_else(|| panic!("{name} がカタログに解決されない"));
+            assert!(
+                std::ptr::eq(spec, canonical),
+                "{name} が agy と同じ定義に解決されない"
+            );
+            // パス付き / 引数付きでも同じ (実際のプリセットの書き方)。
+            let cmd = format!("/opt/bin/{name} --model gemini-3-pro");
+            assert!(
+                std::ptr::eq(super::spec_for_command(&cmd).unwrap(), canonical),
+                "{cmd} が解決されない"
+            );
+
+            // ① 新規起動: フラグが付き、auto_env が入る。
+            let launched = apply_approval(name, Approval::Auto);
+            assert_eq!(
+                launched,
+                format!("{name} --dangerously-skip-permissions"),
+                "{name}: Auto で自動承認フラグが付かない"
+            );
+            let env = merged_env(name, Approval::Auto, &HashMap::new());
+            for (k, v) in canonical.auto_env {
+                assert_eq!(env.get(*k).map(String::as_str), Some(*v), "{name}: {k}");
+            }
+            assert!(
+                super::env_enables_auto(name, &env),
+                "{name}: env だけでも全自動と判定できること"
+            );
+
+            // ② 復元起動: 記録された起動時コマンド (フラグ入り) から組み立て直す。
+            let restored_cmd = match super::spec_for_command(&launched) {
+                Some(s) => super::apply_resume(&launched, s),
+                None => launched.clone(),
+            };
+            assert!(
+                restored_cmd.contains("--dangerously-skip-permissions"),
+                "{name}: 復元経路で自動承認フラグが落ちている ({restored_cmd})"
+            );
+            let restored_env = merged_env(&restored_cmd, Approval::Auto, &HashMap::new());
+            for (k, v) in canonical.auto_env {
+                assert_eq!(
+                    restored_env.get(*k).map(String::as_str),
+                    Some(*v),
+                    "{name}: 復元経路で {k} が渡っていない"
+                );
+            }
+
+            // Ask では逆に、フラグも env も一切足さない (事故防止)。
+            assert_eq!(apply_approval(&launched, Approval::Ask), name.to_string());
+            assert!(merged_env(name, Approval::Ask, &HashMap::new()).is_empty());
+        }
+    }
+
+    /// 応答表そのものの健全性 — データを足すときの事故よけ。
+    #[test]
+    fn prompt_rules_are_well_formed_and_target_known_agents() {
+        for r in super::PROMPT_RULES {
+            assert!(!r.needles.is_empty(), "needles が空: {}", r.desc);
+            assert!(!r.reply.is_empty(), "reply が空: {}", r.desc);
+            assert!(!r.desc.is_empty(), "desc が空");
+            assert!(
+                r.agent.is_empty() || super::spec_for_bin(r.agent).is_some(),
+                "カタログに無いエージェント名: {}",
+                r.agent
+            );
+        }
     }
 
     // ---- カタログ (AgentSpec) ----
