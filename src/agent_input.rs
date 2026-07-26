@@ -3,6 +3,7 @@
 //! 神レベルの超高速パフォーマンス（100万PV/s超高負荷環境基準）で設計された、
 //! エージェント入力欄の高度編集・Undo/Redo・プロンプト履歴・スラッシュコマンド補完モジュール。
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 
 /// スラッシュコマンド定義
@@ -183,11 +184,68 @@ impl SlashCommandEngine {
     }
 }
 
+/// メッセージの送信先。
+///
+/// 従来の入力欄は「全エージェントへ一斉送信 (ブロードキャスト)」の 1 本しか
+/// 持っていなかったため、差分レビューのプロンプトのように**特定の 1 体に宛てたい**
+/// 文章まで全員に飛んでいた。送信先を型で区別して、下書きも送信先ごとに分ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComposerTarget {
+    /// 全エージェントへ一斉送信 (従来の `broadcast_input` に相当)
+    Broadcast,
+    /// セッション ID で指名した 1 体だけへ送信
+    Agent(u64),
+}
+
+impl ComposerTarget {
+    /// 指名先のセッション ID (ブロードキャストなら None)
+    pub fn agent_id(self) -> Option<u64> {
+        match self {
+            Self::Agent(id) => Some(id),
+            Self::Broadcast => None,
+        }
+    }
+
+    /// 全員宛てか
+    pub fn is_broadcast(self) -> bool {
+        matches!(self, Self::Broadcast)
+    }
+}
+
+/// 下書きへの追記ロジック本体。
+///
+/// 書きかけを捨てず、空行 1 つを挟んで後ろへ継ぎ足す。追記できたら true。
+/// `append_prompt` / `append_prompt_for` の両方がここを通るので、
+/// アクティブな送信先でも退避中の送信先でも結果は完全に同じになる。
+fn append_into(dst: &mut String, add: &str) -> bool {
+    let add = add.trim();
+    if add.is_empty() {
+        return false;
+    }
+    if !dst.trim().is_empty() {
+        // 末尾の改行を 1 本にそろえてから空行区切りで連結する。
+        while dst.ends_with('\n') || dst.ends_with('\r') {
+            dst.pop();
+        }
+        dst.push_str("\n\n");
+    } else {
+        dst.clear();
+    }
+    dst.push_str(add);
+    true
+}
+
 /// 超高速・省メモリなエージェント入力バッファ管理構造体。
 /// Ctrl+A, Ctrl+U, Ctrl+K, Undo/Redo, プロンプト履歴検索をサポート。
+///
+/// **送信先ごとの下書き**: `text` は「いまアクティブな送信先 (`target`) の下書き」で、
+/// それ以外の送信先の書きかけは `drafts` に退避される。`set_target` で行き来しても
+/// 各エージェント宛ての文章は消えない。プロンプト履歴 (`history`) は
+/// 送信先をまたいで 1 本を共有する — 「さっき打った指示」を別のエージェントへ
+/// 使い回せる方が実用的なため。
 #[derive(Debug, Clone)]
 pub struct AgentInputBuffer {
-    /// 現在の入力テキスト
+    /// 現在の入力テキスト (= `target` の下書き)
     text: String,
     /// カーソル位置（文字インデックス）
     cursor: usize,
@@ -205,6 +263,14 @@ pub struct AgentInputBuffer {
     redo_stack: VecDeque<(String, usize)>,
     /// 最大Undo保持件数
     max_undo_depth: usize,
+    /// いま編集中の送信先。`text` はこの送信先の下書き。
+    target: ComposerTarget,
+    /// 非アクティブな送信先の下書き置き場 (アクティブ分は `text` が保持する)。
+    /// 空文字は積まない — 使われなかったエージェント分でメモリを食わないように。
+    drafts: HashMap<ComposerTarget, String>,
+    /// ユーザーが自分でブロードキャストを選んだか。
+    /// true の間は `sync_target` がアクティブエージェントへ勝手に引き戻さない。
+    broadcast_pinned: bool,
 }
 
 impl Default for AgentInputBuffer {
@@ -225,6 +291,170 @@ impl AgentInputBuffer {
             undo_stack: VecDeque::with_capacity(100),
             redo_stack: VecDeque::with_capacity(100),
             max_undo_depth: 100,
+            target: ComposerTarget::Broadcast,
+            drafts: HashMap::new(),
+            broadcast_pinned: false,
+        }
+    }
+
+    // ── 送信先ごとの下書き ───────────────────────────────────────────
+
+    /// いまアクティブな送信先
+    pub fn target(&self) -> ComposerTarget {
+        self.target
+    }
+
+    /// 送信先を切り替える。
+    ///
+    /// いまの下書きを退避してから、行き先の下書きを引っぱり出す。
+    /// Undo 履歴は繋がらない (別の宛先の別の文章なので) ため捨てる。
+    pub fn set_target(&mut self, t: ComposerTarget) {
+        if self.target == t {
+            return;
+        }
+        let cur = std::mem::take(&mut self.text);
+        if cur.is_empty() {
+            self.drafts.remove(&self.target);
+        } else {
+            self.drafts.insert(self.target, cur);
+        }
+        self.text = self.drafts.remove(&t).unwrap_or_default();
+        self.target = t;
+        self.cursor = self.text.chars().count();
+        self.selection = None;
+        self.history_idx = None;
+        self.saved_draft.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    /// 「全員宛て」をユーザーが明示的に選んだ状態にする / 解除する
+    pub fn pin_broadcast(&mut self, pinned: bool) {
+        self.broadcast_pinned = pinned;
+    }
+
+    /// 全員宛てがピン留めされているか
+    #[allow(dead_code)]
+    pub fn broadcast_pinned(&self) -> bool {
+        self.broadcast_pinned
+    }
+
+    /// アクティブなエージェントに送信先を追従させる。
+    ///
+    /// - `active = Some(id)`: 既定でそのエージェント宛て。ただしユーザーが自分で
+    ///   全員宛てを選んでいる (ピン留め) 間はそれを尊重する。
+    /// - `active = None`: 宛先にできるエージェントがいないので全員宛てへ戻す。
+    ///
+    /// 切り替えが起きたら true。
+    pub fn sync_target(&mut self, active: Option<u64>) -> bool {
+        let want = match active {
+            None => ComposerTarget::Broadcast,
+            Some(id) => {
+                if self.broadcast_pinned && self.target.is_broadcast() {
+                    ComposerTarget::Broadcast
+                } else {
+                    ComposerTarget::Agent(id)
+                }
+            }
+        };
+        if want == self.target {
+            return false;
+        }
+        self.set_target(want);
+        true
+    }
+
+    /// 指定した送信先の下書きを覗く (アクティブでも退避中でも同じように読める)
+    pub fn draft_for(&self, t: ComposerTarget) -> &str {
+        if t == self.target {
+            &self.text
+        } else {
+            self.drafts.get(&t).map(String::as_str).unwrap_or("")
+        }
+    }
+
+    /// 指定した送信先の下書きを**置き換える** (送信先は切り替えない)。
+    ///
+    /// 差分レビューのプロンプトのように「この 1 体に宛てた文章」を、
+    /// いまユーザーが別のエージェント宛てに書いている手を止めずに置いておくための口。
+    /// 書きかけを残したいなら [`Self::append_prompt_for`] を使う。
+    pub fn set_draft_for(&mut self, t: ComposerTarget, text: impl Into<String>) {
+        if t == self.target {
+            self.set_text(text);
+            return;
+        }
+        let s = text.into();
+        if s.is_empty() {
+            self.drafts.remove(&t);
+        } else {
+            self.drafts.insert(t, s);
+        }
+    }
+
+    /// 指定した送信先の下書きへ**追記**する ([`Self::append_prompt`] の宛先指定版)。
+    ///
+    /// アクティブな送信先なら `append_prompt` と完全に同じ (Undo 1 回で戻せる)。
+    pub fn append_prompt_for(&mut self, t: ComposerTarget, prompt: &str) -> bool {
+        if t == self.target {
+            return self.append_prompt(prompt);
+        }
+        let slot = self.drafts.entry(t).or_default();
+        let ok = append_into(slot, prompt);
+        if !ok && slot.is_empty() {
+            // 空プロンプトで空の枠だけ作ってしまわない
+            self.drafts.remove(&t);
+        }
+        ok
+    }
+
+    /// 指定した送信先の下書きを取り出して空にする
+    #[allow(dead_code)]
+    pub fn take_draft(&mut self, t: ComposerTarget) -> String {
+        if t == self.target {
+            let s = self.text.clone();
+            self.clear();
+            s
+        } else {
+            self.drafts.remove(&t).unwrap_or_default()
+        }
+    }
+
+    /// アクティブでない送信先に残っている下書きの数 (UI のバッジ用)
+    pub fn pending_draft_count(&self) -> usize {
+        self.drafts.values().filter(|s| !s.trim().is_empty()).count()
+    }
+
+    /// エージェントが畳まれたら、その宛先の下書きも捨てる。
+    ///
+    /// 消えた相手宛ての文章を残しても送り先がないうえ、ID が再利用されると
+    /// 無関係なエージェントへ他人宛ての文章が出てしまう。
+    pub fn forget_agent(&mut self, id: u64) {
+        let t = ComposerTarget::Agent(id);
+        self.drafts.remove(&t);
+        if self.target == t {
+            // 退避させずに捨てる (set_target だと空を書き戻してしまう)
+            self.text.clear();
+            self.target = ComposerTarget::Broadcast;
+            self.text = self.drafts.remove(&ComposerTarget::Broadcast).unwrap_or_default();
+            self.cursor = self.text.chars().count();
+            self.selection = None;
+            self.history_idx = None;
+            self.saved_draft.clear();
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+        }
+    }
+
+    /// 生きているセッション ID だけを残し、消えた分の下書きを掃除する
+    pub fn retain_agents(&mut self, alive: &[u64]) {
+        self.drafts.retain(|k, _| match k {
+            ComposerTarget::Broadcast => true,
+            ComposerTarget::Agent(id) => alive.contains(id),
+        });
+        if let ComposerTarget::Agent(id) = self.target {
+            if !alive.contains(&id) {
+                self.forget_agent(id);
+            }
         }
     }
 
@@ -433,36 +663,28 @@ impl AgentInputBuffer {
     /// 書きかけの下書きは捨てず、空行 1 つを挟んで後ろに継ぎ足す。Undo 1 回で
     /// 元に戻せるので、誤って流し込んでも取り返しがつく。追記できたら true。
     ///
-    /// 呼び出し側 (app.rs) の想定配線:
+    /// 呼び出し側 (app.rs) の想定配線 — **宛先込み**で入れるのが正解:
     /// ```text
     /// if let Some(p) = crate::diff::take_pending_review_prompt(ctx) {
-    ///     self.agent_input_buf.append_prompt(&p);
+    ///     let t = self.review_target();  // 差分を見ていたエージェント (無ければアクティブ)
+    ///     self.agent_input_buf.append_prompt_for(t, &p);
     /// }
     /// ```
-    /// そのまま送信まで通したい場合は `append_prompt` の後に `submit()` の
-    /// 戻り値をエージェントの stdin へ書けばよい (送信経路は agents.rs 側)。
+    /// 宛先を指定しないこの関数はアクティブな送信先へ入る。
+    /// そのまま送信まで通したい場合は `submit()` の戻り値をエージェントの
+    /// stdin へ書けばよい (送信経路は agents.rs 側)。
     // app.rs 側の配線待ち。配線されるまで未使用でも警告にしない。
     #[allow(dead_code)]
     pub fn append_prompt(&mut self, prompt: &str) -> bool {
-        let add = prompt.trim();
-        if add.is_empty() {
+        if prompt.trim().is_empty() {
             return false;
         }
         self.push_undo_state();
-        if !self.text.trim().is_empty() {
-            // 末尾の改行を 1 本にそろえてから空行区切りで連結する。
-            while self.text.ends_with('\n') || self.text.ends_with('\r') {
-                self.text.pop();
-            }
-            self.text.push_str("\n\n");
-        } else {
-            self.text.clear();
-        }
-        self.text.push_str(add);
+        let ok = append_into(&mut self.text, prompt);
         self.cursor = self.text.chars().count();
         self.selection = None;
         self.history_idx = None;
-        true
+        ok
     }
 
     /// クリア
@@ -679,5 +901,185 @@ mod tests {
         assert_eq!(b.text(), "元の下書き\n\n追いプロンプト");
         b.undo();
         assert_eq!(b.text(), "元の下書き", "Undo 1 回で流し込み前に戻る");
+    }
+
+    // ---- 送信先ごとの下書き ----
+
+    const A1: ComposerTarget = ComposerTarget::Agent(1);
+    const A2: ComposerTarget = ComposerTarget::Agent(2);
+    const BC: ComposerTarget = ComposerTarget::Broadcast;
+
+    #[test]
+    fn drafts_are_isolated_per_target_and_persist_across_switches() {
+        let mut b = AgentInputBuffer::new();
+
+        // 3 つの宛先へ別々の下書きを書く (書く → 切り替える → 書く)
+        b.set_text("全員へ: リリース準備");
+        b.set_target(A1);
+        b.set_text("claude へ: このテストを直して");
+        b.set_target(A2);
+        b.set_text("codex へ: ドキュメントを更新");
+
+        // 行ったり来たりしても混ざらない・消えない
+        for _ in 0..3 {
+            b.set_target(BC);
+            assert_eq!(b.text(), "全員へ: リリース準備");
+            b.set_target(A1);
+            assert_eq!(b.text(), "claude へ: このテストを直して");
+            b.set_target(A2);
+            assert_eq!(b.text(), "codex へ: ドキュメントを更新");
+        }
+
+        // アクティブでも退避中でも同じ口から読める
+        assert_eq!(b.draft_for(A2), "codex へ: ドキュメントを更新");
+        assert_eq!(b.draft_for(A1), "claude へ: このテストを直して");
+        assert_eq!(b.draft_for(BC), "全員へ: リリース準備");
+        assert_eq!(b.draft_for(ComposerTarget::Agent(999)), "", "未使用の宛先は空");
+        assert_eq!(b.target(), A2);
+        assert_eq!(b.pending_draft_count(), 2, "アクティブ以外の下書きが 2 件");
+    }
+
+    #[test]
+    fn removing_an_agent_drops_its_draft() {
+        let mut b = AgentInputBuffer::new();
+        b.set_text("全員へ");
+        b.set_target(A1);
+        b.set_text("1 番へ");
+        b.set_target(A2);
+        b.set_text("2 番へ");
+
+        // 退避中のエージェントが畳まれた場合
+        b.forget_agent(1);
+        assert_eq!(b.draft_for(A1), "", "畳まれた 1 番の下書きは消える");
+        assert_eq!(b.text(), "2 番へ", "アクティブな 2 番はそのまま");
+
+        // アクティブなエージェント自身が畳まれた場合 → 全員宛てへ退避
+        b.forget_agent(2);
+        assert_eq!(b.target(), BC);
+        assert_eq!(b.text(), "全員へ", "全員宛ての下書きが戻ってくる");
+        assert_eq!(b.draft_for(A2), "");
+        assert_eq!(b.pending_draft_count(), 0);
+    }
+
+    #[test]
+    fn retain_agents_sweeps_dead_sessions() {
+        let mut b = AgentInputBuffer::new();
+        b.set_target(A1);
+        b.set_text("1 番へ");
+        b.set_target(A2);
+        b.set_text("2 番へ");
+        b.set_target(ComposerTarget::Agent(3));
+        b.set_text("3 番へ");
+
+        b.retain_agents(&[2]);
+        assert_eq!(b.draft_for(A1), "", "1 番は生きていないので消える");
+        assert_eq!(b.draft_for(A2), "2 番へ", "2 番だけ残る");
+        assert_eq!(b.target(), BC, "アクティブだった 3 番が消えたら全員宛てへ戻る");
+        assert_eq!(b.text(), "");
+    }
+
+    #[test]
+    fn sync_target_follows_active_agent_but_respects_pinned_broadcast() {
+        let mut b = AgentInputBuffer::new();
+
+        assert!(b.sync_target(Some(7)), "既定は指名 (全員宛てではない)");
+        assert_eq!(b.target(), ComposerTarget::Agent(7));
+        assert!(!b.sync_target(Some(7)), "同じ宛先なら切り替えない");
+
+        assert!(b.sync_target(Some(8)), "アクティブが変われば追従する");
+        assert_eq!(b.target(), ComposerTarget::Agent(8));
+
+        // ユーザーが自分で全員宛てを選んだら、アクティブが変わっても戻されない
+        b.pin_broadcast(true);
+        b.set_target(BC);
+        assert!(!b.sync_target(Some(9)));
+        assert_eq!(b.target(), BC);
+
+        // ピンを外せばまた追従する
+        b.pin_broadcast(false);
+        assert!(b.sync_target(Some(9)));
+        assert_eq!(b.target(), ComposerTarget::Agent(9));
+
+        // 宛先にできるエージェントが居なくなったら全員宛てへ
+        assert!(b.sync_target(None));
+        assert_eq!(b.target(), BC);
+    }
+
+    #[test]
+    fn set_draft_for_stashes_without_stealing_the_active_target() {
+        let mut b = AgentInputBuffer::new();
+        b.set_target(A1);
+        b.set_text("1 番に書きかけ");
+
+        // レビュープロンプトを別のエージェント宛てに置く
+        b.set_draft_for(A2, "以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x");
+        assert_eq!(b.target(), A1, "送信先は勝手に変わらない");
+        assert_eq!(b.text(), "1 番に書きかけ", "書きかけを奪われない");
+        assert_eq!(b.draft_for(A2), "以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x");
+
+        // アクティブな宛先を指定した場合は set_text と同じ (Undo で戻せる)
+        b.set_draft_for(A1, "上書き");
+        assert_eq!(b.text(), "上書き");
+        b.undo();
+        assert_eq!(b.text(), "1 番に書きかけ");
+
+        // 空文字を入れたら枠ごと消える
+        b.set_draft_for(A2, "");
+        assert_eq!(b.draft_for(A2), "");
+        assert_eq!(b.pending_draft_count(), 0);
+    }
+
+    #[test]
+    fn append_prompt_for_matches_append_prompt_on_any_target() {
+        // アクティブでない宛先へ追記しても、アクティブ側と同じ結果になる
+        let mut stashed = AgentInputBuffer::new();
+        stashed.set_target(A1);
+        stashed.set_draft_for(A2, "書きかけ\n\n\n");
+        assert!(stashed.append_prompt_for(A2, "@a.rs:1\n> x\n直して"));
+        assert_eq!(stashed.draft_for(A2), "書きかけ\n\n@a.rs:1\n> x\n直して");
+
+        let mut active = AgentInputBuffer::new();
+        active.set_target(A2);
+        active.set_text("書きかけ\n\n\n");
+        assert!(active.append_prompt_for(A2, "@a.rs:1\n> x\n直して"));
+        assert_eq!(active.text(), stashed.draft_for(A2), "宛先がどこでも結果は同じ");
+
+        // 空プロンプトは無視され、空の枠も作らない
+        let mut b = AgentInputBuffer::new();
+        assert!(!b.append_prompt_for(A1, "  \n "));
+        assert_eq!(b.pending_draft_count(), 0);
+        assert_eq!(b.draft_for(A1), "");
+    }
+
+    #[test]
+    fn take_draft_empties_only_that_target() {
+        let mut b = AgentInputBuffer::new();
+        b.set_text("全員へ");
+        b.set_target(A1);
+        b.set_text("1 番へ");
+
+        assert_eq!(b.take_draft(BC), "全員へ");
+        assert_eq!(b.draft_for(BC), "");
+        assert_eq!(b.text(), "1 番へ", "アクティブは無傷");
+
+        assert_eq!(b.take_draft(A1), "1 番へ");
+        assert_eq!(b.text(), "", "アクティブを取り出したら空になる");
+    }
+
+    #[test]
+    fn multiline_japanese_prompt_with_trailing_newline_round_trips() {
+        let src = "以下のレビューコメントに対応してください:\n\n@src/app.rs:42\n> ここ、境界値がずれていませんか？\n直してテストも足してください。\n";
+        let mut b = AgentInputBuffer::new();
+        b.set_target(A1);
+        b.set_draft_for(A2, src);
+
+        // 退避 → 復帰でも 1 文字も変わらない
+        assert_eq!(b.draft_for(A2), src);
+        b.set_target(A2);
+        assert_eq!(b.text(), src, "送信先を切り替えても末尾の改行まで保たれる");
+
+        // 送信 (submit) を通しても素通しで返る
+        assert_eq!(b.submit(), src, "スラッシュコマンドでない本文はそのまま");
+        assert_eq!(b.text(), "", "送信後は下書きが空になる");
     }
 }

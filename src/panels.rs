@@ -20,6 +20,7 @@ use std::time::SystemTime;
 
 use eframe::egui::{self, RichText};
 
+use crate::agent_input::{AgentInputBuffer, ComposerTarget};
 use crate::diff::{self, FileDiff};
 use crate::github::{self, GhOutcome, GhRequest, Issue, PullRequest, RepoInfo};
 use crate::i18n::{tr, trf};
@@ -965,6 +966,314 @@ fn agent_mark(bin: &str) -> String {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  エージェント宛て複数行コンポーザ
+//
+//  1 行の入力欄では、差分レビューのように改行を含む長い指示がまともに書けず、
+//  しかも全員宛て (ブロードキャスト) にしか流せなかった。ここでは
+//   ・Enter は改行、⌘ (macOS) / Ctrl (Windows・Linux) + Enter で送信
+//   ・宛先を「このエージェント」か「全員」から選べる
+//   ・宛先ごとに下書きが残る (エージェントを行き来しても消えない)
+//  を満たす部品を用意する。判定はすべて純粋関数に切り出してテストする。
+// ══════════════════════════════════════════════════════════════════════
+
+/// コンポーザで押された操作。UI からもテストからも同じ経路を通すために型にする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerPress {
+    /// 何も押されていない
+    None,
+    /// 送信 (ボタン or ⌘/Ctrl+Enter)
+    Send,
+    /// 取消 (ボタン or Esc)。下書きは**消さない**
+    Cancel,
+}
+
+/// コンポーザが呼び出し側へ返す行動。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerAction {
+    /// 何も起きていない
+    None,
+    /// 全エージェントへ一斉送信
+    Send(String),
+    /// セッション ID で指名した 1 体へ送信
+    SendTo(u64, String),
+    /// 閉じたい (下書きは残っている)
+    Cancel,
+}
+
+/// このビルドが動いている OS が macOS か。
+/// `cfg!` はコンパイル時に決まるので分岐コストはゼロ。判定本体
+/// ([`is_send_chord`]) は引数で受け取るので 3 OS 分をテストできる。
+fn on_mac() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// **送信コード判定** (純粋関数)。
+///
+/// - macOS: `⌘ + Enter`
+/// - Windows / Linux: `Ctrl + Enter`
+///
+/// Enter 単体は改行なので送信しない。Shift / Alt が乗っている場合も送信しない
+/// (`Shift+Enter` を改行として使う指が多く、誤送信は取り返しがつかないため)。
+/// macOS で `Ctrl+Enter` を送信にしないのは、ターミナル側が Ctrl 系を
+/// 制御文字として使うため — OS ごとの修飾キーの役割を混ぜない。
+pub fn is_send_chord(mac: bool, m: &egui::Modifiers, key: egui::Key) -> bool {
+    if key != egui::Key::Enter {
+        return false;
+    }
+    if m.shift || m.alt {
+        return false;
+    }
+    if mac {
+        m.mac_cmd && !m.ctrl
+    } else {
+        m.ctrl && !m.mac_cmd
+    }
+}
+
+/// 送信キーの案内文 (OS で書き分ける)
+pub fn send_hint(mac: bool) -> String {
+    if mac {
+        tr("⌘+Enter で送信 / Enter で改行")
+    } else {
+        tr("Ctrl+Enter で送信 / Enter で改行")
+    }
+}
+
+/// 下書きの文字数と行数。
+///
+/// 行数は改行で割った数 — 末尾が改行なら「カーソルが乗っている次の行」も
+/// 数えるので、見たままの行数と一致する。空文字は 0 行。
+pub fn composer_stats(text: &str) -> (usize, usize) {
+    if text.is_empty() {
+        return (0, 0);
+    }
+    (text.chars().count(), text.split('\n').count())
+}
+
+/// 折りたたみ表示に切り替える閾値。
+///
+/// 複数行で、かつ長いものだけ畳む。1 行の長文はそのまま見えた方が速い。
+pub fn should_collapse(text: &str) -> bool {
+    let (chars, lines) = composer_stats(text);
+    lines > 1 && (lines > 12 || chars > 600)
+}
+
+/// 折りたたみ中に出す 1 行サマリ。先頭の中身 + 残りの分量。
+pub fn collapsed_summary(text: &str) -> String {
+    let (chars, lines) = composer_stats(text);
+    let head = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    // 文字境界で切る (日本語が壊れないよう chars() で数える)
+    let mut shown: String = head.chars().take(40).collect();
+    if head.chars().count() > 40 {
+        shown.push('…');
+    }
+    trf(
+        "{head}  — 全 {lines} 行 / {chars} 文字",
+        &[
+            ("head", shown),
+            ("lines", lines.to_string()),
+            ("chars", chars.to_string()),
+        ],
+    )
+}
+
+/// コンポーザの状態遷移 (純粋な部分)。
+///
+/// - `Send`: 下書きをスラッシュコマンド展開込みで取り出し、その宛先の下書きを空にする。
+///   中身が空 (または `/clear` のように展開結果が空) なら何も送らない。
+/// - `Cancel`: 下書きには**触らない** — 閉じても書きかけは残る。
+pub fn composer_action(buf: &mut AgentInputBuffer, press: ComposerPress) -> ComposerAction {
+    match press {
+        ComposerPress::None => ComposerAction::None,
+        ComposerPress::Cancel => ComposerAction::Cancel,
+        ComposerPress::Send => {
+            if buf.text().trim().is_empty() {
+                return ComposerAction::None;
+            }
+            let target = buf.target();
+            let out = buf.submit();
+            if out.is_empty() {
+                return ComposerAction::None;
+            }
+            match target {
+                ComposerTarget::Broadcast => ComposerAction::Send(out),
+                ComposerTarget::Agent(id) => ComposerAction::SendTo(id, out),
+            }
+        }
+    }
+}
+
+/// **エージェント宛て複数行コンポーザ**。
+///
+/// `target` には「いま宛先にできるエージェント」を `(セッション ID, 表示名)` で渡す。
+/// 渡されていればそのエージェント宛てが既定 (ユーザーが自分で全員宛てを選んだ場合は
+/// その選択を尊重する)。`None` なら全員宛てのみ。
+///
+/// キー入力は**テキスト欄にフォーカスがあるときだけ**触る。フォーカスが無い間は
+/// イベントに一切手を出さないので、ターミナル側のキーを横取りしない。
+pub fn agent_composer_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    buf: &mut AgentInputBuffer,
+    target: Option<(u64, &str)>,
+) -> ComposerAction {
+    // 宛先をアクティブなエージェントに追従させる
+    buf.sync_target(target.map(|(id, _)| id));
+
+    // 送信先が変わっても入力欄の同一性 (= フォーカス) は保つので ID は固定
+    let te_id = ui.make_persistent_id("agent_composer_text");
+    let focused = ui.memory(|m| m.has_focus(te_id));
+
+    let mut press = ComposerPress::None;
+    if focused {
+        let mac = on_mac();
+        ui.input_mut(|i| {
+            // 送信コードは TextEdit に届く前に抜き取る (改行が入ってしまわないように)
+            let mut hit = false;
+            i.events.retain(|e| {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = e
+                {
+                    if is_send_chord(mac, modifiers, *key) {
+                        hit = true;
+                        return false;
+                    }
+                }
+                true
+            });
+            if hit {
+                press = ComposerPress::Send;
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                press = ComposerPress::Cancel;
+            }
+        });
+    }
+
+    // ── 宛先セレクタ ──────────────────────────────────────────
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new(tr("送信先")).color(theme.text_dim).size(11.0));
+
+        if let Some((id, label)) = target {
+            let sel = buf.target() == ComposerTarget::Agent(id);
+            let txt = RichText::new(format!("▸ {label}"))
+                .size(11.5)
+                .color(if sel { theme.accent } else { theme.text_dim });
+            if ui.selectable_label(sel, txt).clicked() {
+                buf.pin_broadcast(false);
+                buf.set_target(ComposerTarget::Agent(id));
+            }
+        }
+
+        let bsel = buf.target().is_broadcast();
+        let btxt = RichText::new(tr("📢 全エージェント"))
+            .size(11.5)
+            .color(if bsel { theme.warn } else { theme.text_dim });
+        if ui.selectable_label(bsel, btxt).clicked() {
+            buf.pin_broadcast(true);
+            buf.set_target(ComposerTarget::Broadcast);
+        }
+
+        let others = buf.pending_draft_count();
+        if others > 0 {
+            ui.label(
+                RichText::new(trf("他 {n} 件の下書き", &[("n", others.to_string())]))
+                    .color(theme.text_dim)
+                    .size(10.5),
+            );
+        }
+    });
+
+    if buf.target().is_broadcast() && target.is_some() {
+        // 誤爆が一番痛いので、全員宛てのときだけ明示的に注意を出す
+        ui.label(
+            RichText::new(tr("⚠ 起動中のすべてのエージェントへ送られます"))
+                .color(theme.warn)
+                .size(10.5),
+        );
+    }
+
+    // ── 本文 (長い貼り付けは畳む) ─────────────────────────────
+    let long = should_collapse(buf.text());
+    let collapse_id = ui.make_persistent_id(("agent_composer_collapsed", buf.target()));
+    let mut collapsed = long && ui.memory(|m| m.data.get_temp::<bool>(collapse_id).unwrap_or(true));
+
+    if long {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let label = if collapsed { tr("▸ 展開") } else { tr("▾ 折りたたむ") };
+            if ui.small_button(label).clicked() {
+                collapsed = !collapsed;
+                ui.memory_mut(|m| m.data.insert_temp(collapse_id, collapsed));
+            }
+            ui.label(
+                RichText::new(collapsed_summary(buf.text()))
+                    .color(theme.text_dim)
+                    .size(11.0),
+            );
+        });
+    }
+
+    if !collapsed {
+        let mut text = buf.text().to_string();
+        let changed = egui::ScrollArea::vertical()
+            .id_salt("agent_composer_scroll")
+            .max_height(168.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .id(te_id)
+                        .hint_text(tr("エージェントへの指示…"))
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::FontId::proportional(13.0)),
+                )
+                .changed()
+            })
+            .inner;
+        if changed {
+            buf.set_text(text);
+        }
+    }
+
+    // ── カウンタ + ボタン ─────────────────────────────────────
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (chars, lines) = composer_stats(buf.text());
+        ui.label(
+            RichText::new(trf(
+                "{c} 文字 / {l} 行",
+                &[("c", chars.to_string()), ("l", lines.to_string())],
+            ))
+            .color(theme.text_dim)
+            .size(10.5),
+        );
+        ui.label(
+            RichText::new(send_hint(on_mac()))
+                .color(theme.text_dim)
+                .size(10.5),
+        );
+        let can_send = !buf.text().trim().is_empty();
+        if ui
+            .add_enabled(can_send, egui::Button::new(tr("送信")).small())
+            .clicked()
+        {
+            press = ComposerPress::Send;
+        }
+        if ui.small_button(tr("閉じる")).clicked() {
+            press = ComposerPress::Cancel;
+        }
+    });
+
+    composer_action(buf, press)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1371,5 +1680,169 @@ mod tests {
         let err = open_in_ide("cursor", None, (1, 1), Path::new("/tmp"), false)
             .expect_err("パスが無ければ開けない");
         assert!(err.contains("保存済み"));
+    }
+
+    // ── 複数行コンポーザ ─────────────────────────────────────
+
+    /// 修飾キーの組み立て。`command` は egui と同じ規則
+    /// (macOS では ⌘、それ以外では Ctrl と連動) で埋める。
+    fn mods(mac: bool, ctrl: bool, cmd: bool, shift: bool, alt: bool) -> egui::Modifiers {
+        egui::Modifiers {
+            alt,
+            ctrl,
+            shift,
+            mac_cmd: mac && cmd,
+            command: if mac { mac && cmd } else { ctrl },
+        }
+    }
+
+    #[test]
+    fn send_chord_is_cmd_enter_on_mac_and_ctrl_enter_elsewhere() {
+        // (mac, ctrl, cmd, shift, alt, key, 送信するか)
+        let cases: &[(bool, bool, bool, bool, bool, egui::Key, bool)] = &[
+            // --- macOS: ⌘+Enter だけが送信 ---
+            (true, false, true, false, false, egui::Key::Enter, true),
+            (true, false, false, false, false, egui::Key::Enter, false), // Enter 単体 = 改行
+            (true, true, false, false, false, egui::Key::Enter, false), // Ctrl は端末側の役目
+            (true, false, true, true, false, egui::Key::Enter, false),  // ⌘+Shift は誤爆防止で無効
+            (true, false, true, false, true, egui::Key::Enter, false),  // ⌘+Alt も無効
+            (true, true, true, false, false, egui::Key::Enter, false),  // Ctrl 同時押しは無効
+            (true, false, true, false, false, egui::Key::A, false),     // Enter 以外は無関係
+            // --- Windows / Linux: Ctrl+Enter だけが送信 ---
+            (false, true, false, false, false, egui::Key::Enter, true),
+            (false, false, false, false, false, egui::Key::Enter, false), // Enter 単体 = 改行
+            (false, true, false, true, false, egui::Key::Enter, false),   // Ctrl+Shift は無効
+            (false, true, false, false, true, egui::Key::Enter, false),   // Ctrl+Alt は無効
+            (false, false, false, true, false, egui::Key::Enter, false),  // Shift+Enter = 改行
+            (false, true, false, false, false, egui::Key::Escape, false),
+        ];
+        for &(mac, ctrl, cmd, shift, alt, key, want) in cases {
+            let m = mods(mac, ctrl, cmd, shift, alt);
+            assert_eq!(
+                is_send_chord(mac, &m, key),
+                want,
+                "mac={mac} ctrl={ctrl} cmd={cmd} shift={shift} alt={alt} key={key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn send_hint_names_the_key_of_the_running_os() {
+        assert!(send_hint(true).contains('⌘'));
+        assert!(send_hint(false).contains("Ctrl"));
+        // どちらの OS でも「Enter は改行」だと分かる
+        assert!(send_hint(true).contains("改行") && send_hint(false).contains("改行"));
+    }
+
+    #[test]
+    fn composer_stats_counts_visible_lines_and_chars() {
+        assert_eq!(composer_stats(""), (0, 0));
+        assert_eq!(composer_stats("あいう"), (3, 1));
+        assert_eq!(composer_stats("あ\nい"), (3, 2));
+        // 末尾の改行はカーソルが乗る行として数える (見たままに合わせる)
+        assert_eq!(composer_stats("あ\n"), (2, 2));
+    }
+
+    #[test]
+    fn only_long_multiline_drafts_collapse() {
+        assert!(!should_collapse(""));
+        assert!(!should_collapse(&"あ".repeat(900)), "1 行なら長くても畳まない");
+        assert!(!should_collapse("1\n2\n3"), "数行なら畳まない");
+        assert!(should_collapse(&"行\n".repeat(20)), "行数が多ければ畳む");
+        let wide = format!("見出し\n{}", "あ".repeat(700));
+        assert!(should_collapse(&wide), "複数行かつ長文なら畳む");
+    }
+
+    #[test]
+    fn collapsed_summary_shows_head_and_size_without_breaking_japanese() {
+        let text = format!("レビュー対応のお願い\n{}", "あ".repeat(700));
+        let s = collapsed_summary(&text);
+        assert!(s.contains("レビュー対応のお願い"));
+        assert!(s.contains("2 行"), "全体の行数が出る: {s}");
+        assert!(s.contains("711 文字"), "全体の文字数が出る: {s}");
+
+        // 先頭行が長いときは 40 文字で省略 (バイト境界で割らない)
+        let long_head = format!("{}\nx", "漢".repeat(80));
+        let s2 = collapsed_summary(&long_head);
+        assert!(s2.contains('…'));
+        assert!(s2.starts_with(&"漢".repeat(40)));
+
+        // 空行から始まっていても最初の中身を拾う
+        assert!(collapsed_summary("\n\n本文です\nx").contains("本文です"));
+    }
+
+    #[test]
+    fn composer_send_returns_text_and_clears_only_that_draft() {
+        let mut b = AgentInputBuffer::new();
+        b.set_target(ComposerTarget::Broadcast);
+        b.set_text("全員へ: 進捗を教えて");
+        b.set_target(ComposerTarget::Agent(7));
+        b.set_text("7 番へ: この関数を直して");
+
+        // 何も押さなければ何も起きない
+        assert_eq!(composer_action(&mut b, ComposerPress::None), ComposerAction::None);
+        assert_eq!(b.text(), "7 番へ: この関数を直して");
+
+        // 送信 → 宛先つきで返り、その宛先の下書きだけ空になる
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::Send),
+            ComposerAction::SendTo(7, "7 番へ: この関数を直して".to_string())
+        );
+        assert_eq!(b.text(), "");
+        assert_eq!(
+            b.draft_for(ComposerTarget::Broadcast),
+            "全員へ: 進捗を教えて",
+            "他の宛先の下書きは巻き添えにならない"
+        );
+
+        // 全員宛てに切り替えて送ると Send になる
+        b.set_target(ComposerTarget::Broadcast);
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::Send),
+            ComposerAction::Send("全員へ: 進捗を教えて".to_string())
+        );
+        assert_eq!(b.text(), "");
+    }
+
+    #[test]
+    fn composer_cancel_keeps_the_draft() {
+        let mut b = AgentInputBuffer::new();
+        b.set_target(ComposerTarget::Agent(3));
+        b.set_text("書きかけ\n途中まで");
+
+        assert_eq!(composer_action(&mut b, ComposerPress::Cancel), ComposerAction::Cancel);
+        assert_eq!(b.text(), "書きかけ\n途中まで", "取消では下書きを消さない");
+
+        // 閉じて別のエージェントを触ってから戻ってきても残っている
+        b.set_target(ComposerTarget::Agent(4));
+        b.set_text("別件");
+        b.set_target(ComposerTarget::Agent(3));
+        assert_eq!(b.text(), "書きかけ\n途中まで");
+    }
+
+    #[test]
+    fn composer_send_ignores_blank_and_swallowing_slash_commands() {
+        let mut b = AgentInputBuffer::new();
+        b.set_text("   \n  ");
+        assert_eq!(composer_action(&mut b, ComposerPress::Send), ComposerAction::None);
+
+        // /clear は展開結果が空なので送らない (下書きだけ消える)
+        b.set_text("/clear");
+        assert_eq!(composer_action(&mut b, ComposerPress::Send), ComposerAction::None);
+        assert_eq!(b.text(), "");
+    }
+
+    #[test]
+    fn composer_send_round_trips_multiline_japanese_with_trailing_newline() {
+        let src = "以下のレビューコメントに対応してください:\n\n@src/app.rs:42\n> 境界値がずれています\n直してテストも足してください。\n";
+        let mut b = AgentInputBuffer::new();
+        // レビュー対象のエージェント宛てに置く → その宛先へそのまま飛ぶ
+        b.set_draft_for(ComposerTarget::Agent(11), src);
+        b.set_target(ComposerTarget::Agent(11));
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::Send),
+            ComposerAction::SendTo(11, src.to_string()),
+            "改行も末尾の 1 行も 1 文字違わず届く"
+        );
     }
 }
