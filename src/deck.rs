@@ -53,10 +53,8 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::agent_input::AgentInputBuffer;
 use crate::i18n::tr;
 use crate::kanban::{self, Activity};
-use crate::panels;
 use crate::supervisor;
 use crate::theme::Theme;
 
@@ -474,9 +472,6 @@ pub enum DeckAction {
     Restart(usize),
     /// 並べ替え (from → to)
     Reorder { from: usize, to: usize },
-    /// **下端の入力欄から、選択中の 1 体へ指示を送る。**
-    /// 宛先は必ずセッション ID 指名 — デッキから一斉送信する道は作らない。
-    Send { id: u64, text: String },
     /// デッキを閉じる
     Close,
 }
@@ -488,7 +483,7 @@ pub enum KeyOwner {
     Deck,
     /// 端末 (PTY) — Esc / ⇧Tab だけデッキが横取りして一覧へ返す
     Terminal,
-    /// テキスト入力 (下端のコンポーザ / 名前変更欄) — デッキは**一切**触らない
+    /// テキスト入力 (レールの名前変更欄) — デッキは**一切**触らない
     TextInput,
 }
 
@@ -506,9 +501,10 @@ impl KeyOwner {
 
 /// フォーカス中の egui Id から所有者を決める。
 ///
-/// 下端のコンポーザに文字を打っている間に「a」でレールが動いたり、絞り込みが
+/// 名前変更欄に文字を打っている間に「a」でレールが動いたり、絞り込みが
 /// 効き始めたりしないための唯一の歯止め。端末の Id は前フレームに描いた分を
-/// `term_ids` で覚えてある。
+/// `term_ids` で覚えてある。**端末にフォーカスがあるときは打鍵をそのまま
+/// PTY へ通す** (デッキは cmux と同じで「画面いっぱいがエージェント」)。
 pub fn key_owner(focus: Option<egui::Id>, term_ids: &[egui::Id]) -> KeyOwner {
     match focus {
         None => KeyOwner::Deck,
@@ -973,7 +969,6 @@ pub fn ui(
     now_ms: u64,
     fresh_tail: bool,
     scanning: bool,
-    buf: &mut AgentInputBuffer,
     draw: LiveDraw<'_>,
 ) -> Vec<DeckAction> {
     let mut acts: Vec<DeckAction> = Vec::new();
@@ -1032,8 +1027,8 @@ pub fn ui(
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
             if !show_rail {
                 pane_ui(
-                    st, ui, theme, &rows, live, selected, &views, full_w, full_h, launchers, buf,
-                    draw, &mut acts,
+                    st, ui, theme, &rows, live, selected, &views, full_w, full_h, launchers, draw,
+                    &mut acts,
                 );
             } else if beside {
                 let rail_w = rail_width(full_w, st.rail_frac(), unit);
@@ -1047,8 +1042,8 @@ pub fn ui(
                 let thin = splitter_ui(st, ui, theme, true, full_w, unit);
                 let rest = (full_w - rail_w - thin).max(unit * 6.0);
                 pane_ui(
-                    st, ui, theme, &rows, live, selected, &views, rest, full_h, launchers, buf,
-                    draw, &mut acts,
+                    st, ui, theme, &rows, live, selected, &views, rest, full_h, launchers, draw,
+                    &mut acts,
                 );
             } else {
                 // 細い窓: 一覧を上、端末を下に積む
@@ -1063,8 +1058,8 @@ pub fn ui(
                 );
                 let rest = (full_h - rail_h).max(unit * 6.0);
                 pane_ui(
-                    st, ui, theme, &rows, live, selected, &views, full_w, rest, launchers, buf,
-                    draw, &mut acts,
+                    st, ui, theme, &rows, live, selected, &views, full_w, rest, launchers, draw,
+                    &mut acts,
                 );
             }
         },
@@ -1368,7 +1363,6 @@ fn pane_ui(
     width: f32,
     height: f32,
     launchers: &[LauncherRow],
-    buf: &mut AgentInputBuffer,
     draw: LiveDraw<'_>,
     acts: &mut Vec<DeckAction>,
 ) {
@@ -1383,11 +1377,9 @@ fn pane_ui(
                 st, ui, theme, selected, views, launchers, width, head_h, unit, acts,
             );
 
-            // 下端のコンポーザに要る分だけ先に取り分け、残り全部を端末へ渡す。
-            // 高さは本文から決まる ([`composer_reserve`]) ので、空なら 1 行分
-            // しか減らない = 「空欄が居座る」形にならない。
-            let comp_h = composer_reserve(ui, live, selected, buf, width, unit);
-            let body_h = (height - head_h - comp_h).max(unit * 3.0);
+            // 細いヘッダーを引いた**残り全部**が端末。取り分ける帯は 1 つも無い
+            // (cmux と同じで、打った字はそのまま端末へ行く = ペイン全体がエージェント)。
+            let body_h = pane_body_h(height, head_h, unit);
             ui.allocate_ui_with_layout(
                 egui::vec2(width, body_h),
                 egui::Layout::top_down(egui::Align::Min),
@@ -1398,50 +1390,16 @@ fn pane_ui(
                     );
                 },
             );
-            if comp_h > 0.0 {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(width, comp_h),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        composer_ui(ui, theme, live, selected, buf, width, unit, acts);
-                    },
-                );
-            }
         },
     );
 }
 
-/// 下端コンポーザに取り分ける高さ。**0.0 なら入力欄そのものを出さない**。
+/// 端末に渡す高さ **純関数** — ヘッダー以外は 1 px も取り分けない。
 ///
-/// 固定 px は 1 つも書かない: 本文の行数 ([`panels::composer_rows`]) ×
-/// 実測した行高 + 宛先の印 1 行 + ボタン 1 行 (どちらも egui の style から)。
-/// 空欄なら 1 行分だけ。折り返し / 改行で伸び、消せば戻る。
-fn composer_reserve(
-    ui: &egui::Ui,
-    live: &[LiveRow],
-    selected: Option<u64>,
-    buf: &AgentInputBuffer,
-    width: f32,
-    unit: f32,
-) -> f32 {
-    if selected.and_then(|id| live.iter().find(|l| l.id == id)).is_none() {
-        return 0.0;
-    }
-    let pad = unit * 0.35;
-    let font = egui::FontId::proportional(13.0);
-    let (char_w, row_h) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
-    let inner_w = (width - pad * 4.0).max(unit);
-    let cols = panels::wrap_cols(inner_w, char_w.max(1.0));
-    let rows = panels::composer_rows(buf.text(), cols, panels::COMPOSER_MAX_ROWS);
-    let btn_h = ui.spacing().interact_size.y;
-    let gap = ui.spacing().item_spacing.y;
-    // 宛先の印 + 本文 + 送信行 (+ 長文を畳んでいるときの 1 行)
-    let extra = if panels::should_collapse(buf.text()) {
-        btn_h + gap
-    } else {
-        0.0
-    };
-    row_h.max(1.0) * rows as f32 + unit + btn_h + extra + gap * 4.0 + pad * 2.0
+/// 下端の入力欄を消したので、ここから引くのはヘッダーだけ。極端に低い窓でも
+/// 3 行は残す (負の高さを egui へ渡さないため)。
+pub fn pane_body_h(height: f32, head_h: f32, unit: f32) -> f32 {
+    (height - head_h).max(unit * 3.0)
 }
 
 /// 端末の積み上げ本体 (ペインの残り全部を使う)。
@@ -1505,64 +1463,6 @@ fn term_stack_ui(
         }
     }
     st.focus_term_req = false;
-}
-
-/// **端末ペインの下端に張り付く入力欄** — 宛先は選択中の 1 体だけ。
-///
-/// レールではなく端末の下に置くのは、「見ている端末に向かって書く」動きを
-/// そのまま形にするため。宛先チップも全員宛ての導線も持たない
-/// ([`panels::ComposerScope::Fixed`]) ので、ここから一斉送信は起こらない。
-///
-/// 空のときは 1 行分しか場所を取らず、折り返し / 改行で伸び、消せば戻る
-/// (高さの判断は `panels::composer_rows`)。
-///
-/// キー: Enter = 改行 / ⌘ (Ctrl) + Enter = 送信 / Esc = 一覧へフォーカスを返す。
-/// ⌘V / Ctrl+V でクリップボードの画像を `@パス ` として本文へ挿せる。
-#[allow(clippy::too_many_arguments)]
-fn composer_ui(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    live: &[LiveRow],
-    selected: Option<u64>,
-    buf: &mut AgentInputBuffer,
-    width: f32,
-    unit: f32,
-    acts: &mut Vec<DeckAction>,
-) {
-    // 宛先がいなければ入力欄そのものを出さない (空欄を置いておかない)。
-    let Some(l) = selected.and_then(|id| live.iter().find(|l| l.id == id)) else {
-        return;
-    };
-    let (id, name) = (l.id, l.title.clone());
-    let pad = unit * 0.35;
-    // Cockpit と違い「1 行帯へ畳む」姿を持たないので、展開フラグは常に false。
-    let mut never_expand = false;
-    egui::Frame::none()
-        .fill(theme.panel)
-        .inner_margin(egui::Margin::symmetric(pad, pad * 0.6))
-        .show(ui, |ui| {
-            ui.set_width((width - pad * 2.0).max(unit));
-            let act = panels::agent_composer_ui(
-                ui,
-                theme,
-                buf,
-                Some((id, name.as_str())),
-                &[],
-                panels::ComposerScope::Fixed,
-                &mut never_expand,
-            );
-            match act {
-                panels::ComposerAction::SendTo(to, text) => {
-                    acts.push(DeckAction::Send { id: to, text });
-                }
-                panels::ComposerAction::Cancel => {
-                    // Esc: 入力欄から手を離してレールへ戻す (下書きは残る)
-                    ui.memory_mut(|m| m.stop_text_input());
-                }
-                // Fixed は必ず 1 体宛て — 一斉送信は起こらない
-                panels::ComposerAction::Send(_) | panels::ComposerAction::None => {}
-            }
-        });
 }
 
 /// 上端の細い帯 — 選んでいるものの名前と場所 + 小さなアイコンだけ。
@@ -1753,7 +1653,8 @@ fn empty_pane_ui(ui: &mut egui::Ui, theme: &Theme, width: f32, height: f32) {
     );
 }
 
-/// キーボード操作。端末・入力欄にフォーカスがある間は打鍵を奪わない。
+/// キーボード操作。端末・名前変更欄にフォーカスがある間は打鍵を奪わない
+/// (端末が持っているときは Esc / ⇧Tab 以外そのまま PTY へ流れる)。
 ///
 /// 素の文字は**見えない絞り込み**へ流れる。ライフサイクルは ⌥ 付き。
 fn keyboard_ui(
@@ -1779,8 +1680,8 @@ fn keyboard_ui(
         }
         return;
     }
-    // 下端のコンポーザ / 名前変更欄を打っている間は**キーに一切触らない**。
-    // ここを緩めると「指示を書いている最中に j でレールが動く」に戻る。
+    // 名前変更欄を打っている間は**キーに一切触らない**。
+    // ここを緩めると「名前を書いている最中に j でレールが動く」に戻る。
     if !owner.deck_navigates() {
         return;
     }
@@ -2404,18 +2305,18 @@ mod tests {
         assert_eq!(st.sync_selection(&rows, &l), Some(2));
     }
 
-    // ── 下端コンポーザとフォーカスの調停 ─────────────────────────
+    // ── フォーカスの調停 ─────────────────────────────────────────
 
-    /// コンポーザに打っている間、デッキはキーを 1 つも見ない。
+    /// 名前変更欄に打っている間、デッキはキーを 1 つも見ない。
     /// (書いている最中に「j」でレールが動く / 文字が絞り込みへ流れる、を防ぐ)
     #[test]
-    fn コンポーザに書いている間はデッキがキーを見ない() {
+    fn 名前変更欄に書いている間はデッキがキーを見ない() {
         let term = egui::Id::new("term-1");
-        let composer = egui::Id::new("deck-composer");
+        let rename = egui::Id::new("deck-rename-1");
         let terms = [term];
 
-        // コンポーザにフォーカス → デッキは絞り込みも移動もしない
-        let owner = key_owner(Some(composer), &terms);
+        // 名前変更欄にフォーカス → デッキは絞り込みも移動もしない
+        let owner = key_owner(Some(rename), &terms);
         assert_eq!(owner, KeyOwner::TextInput);
         assert!(!owner.deck_filters(), "打鍵が絞り込みへ漏れている");
         assert!(!owner.deck_navigates(), "↑↓ がレールへ漏れている");
@@ -2430,8 +2331,8 @@ mod tests {
         if owner.deck_navigates() {
             sel = move_selection(&rows, sel, 1);
         }
-        assert_eq!(query, "", "コンポーザ入力が絞り込みへ流れた");
-        assert_eq!(sel, Some(2), "コンポーザ入力でレールが動いた");
+        assert_eq!(query, "", "名前変更の入力が絞り込みへ流れた");
+        assert_eq!(sel, Some(2), "名前変更の入力でレールが動いた");
 
         // フォーカスが外れたら元どおり効く
         let owner = key_owner(None, &terms);
@@ -2445,33 +2346,29 @@ mod tests {
         assert_eq!(query, "a");
         assert_eq!(sel, Some(3));
 
-        // 端末は別扱い (Esc/⇧Tab だけデッキが横取りする)
-        assert_eq!(key_owner(Some(term), &terms), KeyOwner::Terminal);
-        assert!(!key_owner(Some(term), &terms).deck_filters());
+        // 端末にフォーカスがあるときは打鍵をデッキが一切見ない
+        // (= そのまま PTY へ流れる。Esc/⇧Tab だけ横取りして一覧へ返す)
+        let term_owner = key_owner(Some(term), &terms);
+        assert_eq!(term_owner, KeyOwner::Terminal);
+        assert!(!term_owner.deck_filters(), "端末への打鍵が絞り込みへ漏れた");
+        assert!(!term_owner.deck_navigates(), "端末への打鍵がレールへ漏れた");
     }
 
-    /// デッキからの送信は**必ず ID 指名の 1 体**。一斉送信の型を持たない。
+    /// **端末はヘッダー以外の全高**を使う (取り分ける帯を作らない)。
     #[test]
-    fn デッキの送信は選択中の一体だけへ行く() {
-        let act = DeckAction::Send {
-            id: 42,
-            text: "この画像を見て @/tmp/zaivern-clip/clip-1-2-3.png".into(),
-        };
-        match act {
-            DeckAction::Send { id, ref text } => {
-                assert_eq!(id, 42, "宛先が選択中のセッション ID でない");
-                assert!(text.contains('@'), "画像パスが本文に乗っていない");
-            }
-            other => panic!("送信が別の経路へ落ちた: {other:?}"),
+    fn 端末はヘッダーを除く全高を使う() {
+        // 窓が高くても低くても、引かれるのはヘッダーの分だけ
+        let unit = 16.0;
+        let head = unit * 1.7;
+        for h in [700.0_f32, 300.0, 1200.0] {
+            assert_eq!(
+                pane_body_h(h, head, unit),
+                h - head,
+                "端末以外に帯を取り分けている (h={h})"
+            );
         }
-        // DeckAction に「全員宛て」は存在しない — 型として作らないのが歯止め
-        let src = include_str!("deck.rs");
-        let head = src.split("pub enum DeckAction {").nth(1).expect("定義がある");
-        let head = &head[..head.find('}').unwrap_or(head.len())];
-        assert!(
-            !head.contains("Broadcast"),
-            "DeckAction に一斉送信が生えている — デッキは 1 体と向き合う場所"
-        );
+        // 極端に低い窓でも 3 行は残す (負の高さを egui へ渡さない)
+        assert_eq!(pane_body_h(10.0, head, unit), unit * 3.0);
     }
 
     /// **看板・サイドバーとの被りを二度と作らないための番人。**
@@ -2496,12 +2393,15 @@ mod tests {
             ("fmt_elapsed", "経過時間"),
             ("approvals", "承認バッジ"),
             ("activity_color", "状態の色分け"),
-            // **入力欄そのものは禁止しない** (デッキから指示が打てないのは欠陥
-            // だった)。禁じるのは「全員宛ての導線」— 宛先チップ行と
-            // Choosable スコープ。デッキは選択中の 1 体と向き合う場所で、
-            // 一斉送信は Cockpit の担当。
+            // **入力欄そのものを禁じる**。デッキは cmux と同じで
+            // 「打った字はそのまま端末へ」= ペイン全体がエージェント。
+            // 下端に入力欄を置くと端末の高さを削り、二重の入力口ができる
+            // (指示欄は Cockpit の担当)。
+            ("agent_composer_ui", "下端の入力欄 (Cockpit の担当)"),
+            ("agent_composer_inline_ui", "1 行の入力欄 (Cockpit の担当)"),
+            ("ComposerScope", "コンポーザのスコープ"),
+            ("AgentInputBuffer", "入力欄の下書き入れ"),
             ("composer_target_chips", "宛先チップ行 (Cockpit の担当)"),
-            ("ComposerScope::Choosable", "全員宛てを選べるコンポーザ"),
             ("PastSession", "過去セッション行 (サイドバーの担当)"),
             ("session_picker", "過去セッションの走査"),
             ("再開", "再開導線 (サイドバーの担当)"),
@@ -2511,10 +2411,10 @@ mod tests {
                 "デッキに {why} ({banned}) が戻っている — レールは稼働中エージェントだけ"
             );
         }
-        // 逆向きの番人: 下端の入力欄は**必ず宛先固定**で描かれていること。
+        // 逆向きの番人: 端末へ渡す高さはヘッダーを引くだけ (帯を取り分けない)。
         assert!(
-            body.contains("panels::ComposerScope::Fixed"),
-            "デッキのコンポーザが宛先固定でなくなっている (全員宛てが漏れる)"
+            body.contains("pane_body_h(height, head_h, unit)"),
+            "端末の高さが「全高 − ヘッダー」でなくなっている"
         );
     }
 }

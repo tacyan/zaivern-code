@@ -2014,10 +2014,6 @@ pub struct ZaivernApp {
     qr_tex: Option<egui::TextureHandle>,
     /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
-    /// デッキ下端のコンポーザ。**Cockpit とは別の器**にしてある —
-    /// デッキは宛先を選択中の 1 体に固定するので、器を共有すると Cockpit 側の
-    /// 「全員宛てのピン留め」を毎回踏み潰してしまう (下書きも宛先ごとに独立)。
-    deck_input_buf: crate::agent_input::AgentInputBuffer,
     /// プラン使用量の監視 (集約・枯渇予測)。読み取りはこの中で TTL 付きの
     /// バックグラウンドスレッドへ逃がされるので、毎フレーム触ってよい。
     quota: coordinator::QuotaWatch,
@@ -2556,7 +2552,6 @@ impl ZaivernApp {
             voice: VoiceState::default(),
             qr_tex: None,
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
-            deck_input_buf: crate::agent_input::AgentInputBuffer::new(),
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             save_trim_trailing: false,
@@ -10907,7 +10902,6 @@ impl ZaivernApp {
                     &mut self.agent_input_buf,
                     target.as_ref().map(|(id, t)| (*id, t.as_str())),
                     &targets,
-                    panels::ComposerScope::Choosable,
                     &mut expand,
                 )
             } else {
@@ -12289,7 +12283,6 @@ impl ZaivernApp {
             now_ms,
             fresh_tail,
             scanning,
-            &mut self.deck_input_buf,
             &mut draw,
         );
 
@@ -12315,27 +12308,6 @@ impl ZaivernApp {
                     }
                 }
                 deck::DeckAction::Reorder { from, to } => self.reorder_agent(from, to),
-                // 下端の入力欄からの送信。**ID 指名の 1 体だけ**へ届ける
-                // (Cockpit の acts.send_to とまったく同じ扱い)。
-                deck::DeckAction::Send { id, text } => {
-                    let sent = self
-                        .agents
-                        .sessions
-                        .iter_mut()
-                        .find(|s| s.id == id)
-                        .map(|s| {
-                            // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)
-                            s.note_user_input();
-                            (s.send_text(&format!("{text}\r")), s.title.clone())
-                        });
-                    match sent {
-                        Some((true, title)) => {
-                            self.toast(trf("✏ 送信: {title}", &[("title", title)]), true)
-                        }
-                        Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
-                        None => self.toast(tr("宛先のセッションが見つかりません"), false),
-                    }
-                }
                 deck::DeckAction::Close => self.deck = false,
             }
         }

@@ -1572,52 +1572,30 @@ pub fn composer_target_chips(
         });
 }
 
-/// 宛先の自由度。**同じコンポーザを 2 つの画面で使い分けるための唯一のつまみ**。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComposerScope {
-    /// Cockpit: 起動中の全エージェント + 全員宛てから選べる (チップ行を出す)。
-    Choosable,
-    /// デッキ: 宛先は**選択中の 1 体に固定**。チップ行も全員宛ての導線も出さない。
-    /// デッキの役目は「選んだ 1 体と向き合う」ことなので、ここで一斉送信が
-    /// できてしまうと役割が壊れる。
-    Fixed,
-}
-
-impl ComposerScope {
-    /// 宛先チップ行を描くか。
-    pub fn shows_chips(self) -> bool {
-        self == ComposerScope::Choosable
-    }
-}
-
-/// **エージェント宛てコンポーザの実体 (これ 1 本)**。
+/// **エージェント宛てコンポーザの実体 (これ 1 本)**。Cockpit 専用。
 ///
 /// - `target`: いま宛先にできるエージェント `(セッション ID, 表示名)`。
-/// - `targets`: 宛先チップに並べる全エージェント (`Fixed` では見ない)。
-/// - `expand`: ユーザーが ▾ で自分から開いたか (`Choosable` だけが使う)。
+/// - `targets`: 宛先チップに並べる全エージェント。
+/// - `expand`: ユーザーが ▾ で自分から開いたか。
 ///
 /// 背の高さは本文から毎フレーム決まる ([`composer_rows`]) — 空なら 1 行、
 /// 折り返し/改行で伸び、消せば戻る。
 ///
 /// キー入力は**テキスト欄にフォーカスがあるときだけ**触るので、フォーカスが
-/// 無い間はターミナルにもデッキの絞り込みにも一切手を出さない。
+/// 無い間はターミナルにも一切手を出さない。
+///
+/// **デッキは使わない** — あちらは cmux と同じで、打った字がそのまま端末へ行く
+/// (入力欄を置くと端末の高さを削り、入力口が二重になる)。
 pub fn agent_composer_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     buf: &mut AgentInputBuffer,
     target: Option<(u64, &str)>,
     targets: &[(u64, String)],
-    scope: ComposerScope,
     expand: &mut bool,
 ) -> ComposerAction {
-    match (scope, target) {
-        // デッキ: ピン留めを見ずに選択中の 1 体へ固定する (全員宛てへは行かない)
-        (ComposerScope::Fixed, Some((id, _))) => buf.set_target(ComposerTarget::Agent(id)),
-        // Cockpit: 宛先をアクティブなエージェントに追従させる
-        _ => {
-            buf.sync_target(target.map(|(id, _)| id));
-        }
-    }
+    // 宛先をアクティブなエージェントに追従させる (ピン留めは尊重する)
+    buf.sync_target(target.map(|(id, _)| id));
 
     // 送信先が変わっても入力欄の同一性 (= フォーカス) は保つので ID は固定
     let te_id = ui.make_persistent_id("agent_composer_text");
@@ -1680,16 +1658,6 @@ pub fn agent_composer_ui(
         });
     }
 
-    // 宛先固定 (デッキ) では「誰に書いているか」を 1 行の小さな印で出す。
-    // チップ行は出さない = ここから全員宛てへは行けない。
-    if !scope.shows_chips() {
-        ui.label(
-            RichText::new(inline_target_label(buf.target(), target.map(|(_, n)| n)))
-                .size(11.0)
-                .color(theme.accent),
-        );
-    }
-
     if !collapsed {
         // 背の高さは本文が決める: 空なら 1 行、折り返し/改行で伸び、消せば戻る。
         // 固定 px を書かないので DPI・フォント設定・ズームに追従する。
@@ -1720,32 +1688,28 @@ pub fn agent_composer_ui(
     }
 
     // ── 宛先チップ (入力欄の**下**) ───────────────────────────
-    if scope.shows_chips() {
-        composer_target_chips(ui, theme, buf, targets);
-        if buf.target().is_broadcast() && !targets.is_empty() {
-            // 誤爆が一番痛いので、全員宛てのときだけ明示的に注意を出す
-            ui.label(
-                RichText::new(tr("⚠ 起動中のすべてのエージェントへ送られます"))
-                    .color(theme.warn)
-                    .size(10.5),
-            );
-        }
+    composer_target_chips(ui, theme, buf, targets);
+    if buf.target().is_broadcast() && !targets.is_empty() {
+        // 誤爆が一番痛いので、全員宛てのときだけ明示的に注意を出す
+        ui.label(
+            RichText::new(tr("⚠ 起動中のすべてのエージェントへ送られます"))
+                .color(theme.warn)
+                .size(10.5),
+        );
     }
 
     // ── カウンタ + ボタン ─────────────────────────────────────
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        if scope.shows_chips() {
-            let (chars, lines) = composer_stats(buf.text());
-            ui.label(
-                RichText::new(trf(
-                    "{c} 文字 / {l} 行",
-                    &[("c", chars.to_string()), ("l", lines.to_string())],
-                ))
-                .color(theme.text_dim)
-                .size(10.5),
-            );
-        }
+        let (chars, lines) = composer_stats(buf.text());
+        ui.label(
+            RichText::new(trf(
+                "{c} 文字 / {l} 行",
+                &[("c", chars.to_string()), ("l", lines.to_string())],
+            ))
+            .color(theme.text_dim)
+            .size(10.5),
+        );
         ui.label(
             RichText::new(send_hint(on_mac()))
                 .color(theme.text_dim)
@@ -1758,18 +1722,15 @@ pub fn agent_composer_ui(
         {
             press = ComposerPress::Send;
         }
-        // 「閉じる」「1 行へ畳む」は Cockpit 専用 — デッキの下端欄は畳まない。
-        if scope.shows_chips() {
-            if ui.small_button(tr("閉じる")).clicked() {
-                press = ComposerPress::Cancel;
-            }
-            if ui
-                .small_button("⤡")
-                .on_hover_text(tr("1 行の入力欄に畳む (下書きは残ります)"))
-                .clicked()
-            {
-                *expand = false;
-            }
+        if ui.small_button(tr("閉じる")).clicked() {
+            press = ComposerPress::Cancel;
+        }
+        if ui
+            .small_button("⤡")
+            .on_hover_text(tr("1 行の入力欄に畳む (下書きは残ります)"))
+            .clicked()
+        {
+            *expand = false;
         }
     });
 
@@ -2845,25 +2806,17 @@ mod tests {
         assert_eq!(set.len(), out.len(), "同名が残っている");
     }
 
-    /// デッキ (`Fixed`) はチップ行を持たない = 全員宛てへ行く道が無い。
+    /// Cockpit のコンポーザは**ピン留め (全員宛て) を追従で踏み潰さない**。
     #[test]
-    fn 宛先固定のコンポーザはチップ行を持たない() {
-        assert!(ComposerScope::Choosable.shows_chips());
-        assert!(!ComposerScope::Fixed.shows_chips());
-    }
-
-    /// `Fixed` は Cockpit 側のピン留め (全員宛て) を踏み越えて 1 体へ向く。
-    /// ここが崩れるとデッキから一斉送信が飛ぶ。
-    #[test]
-    fn 宛先固定はピン留めを踏み越えて一体へ向く() {
+    fn 宛先の追従はピン留めを尊重する() {
         let mut b = AgentInputBuffer::new();
         b.pin_broadcast(true);
         b.set_target(ComposerTarget::Broadcast);
-        // Choosable (Cockpit) の追従はピン留めを尊重する
         b.sync_target(Some(9));
         assert!(b.target().is_broadcast(), "Cockpit のピン留めが壊れた");
-        // Fixed (デッキ) は無条件に選択中の 1 体へ
-        b.set_target(ComposerTarget::Agent(9));
+        // ピン留めを外せば追従が効き、宛先指名の送信になる
+        b.pin_broadcast(false);
+        b.sync_target(Some(9));
         assert_eq!(b.target(), ComposerTarget::Agent(9));
         // 空は送らない → 中身があれば必ず SendTo (Send にはならない)
         assert_eq!(composer_action(&mut b, ComposerPress::Send), ComposerAction::None);
@@ -2871,23 +2824,7 @@ mod tests {
         assert_eq!(
             composer_action(&mut b, ComposerPress::Send),
             ComposerAction::SendTo(9, "これを見て".into()),
-            "デッキからの送信が一斉送信へ落ちた"
-        );
-    }
-
-    /// デッキ側の宛先固定は**ソース上でも**分岐が 1 本だけ。
-    #[test]
-    fn 宛先固定の分岐はソース上でも一本だけ() {
-        let src = include_str!("panels.rs");
-        let body = src.split("mod tests {").next().expect("本体がある");
-        let head = body
-            .split("pub fn agent_composer_ui(")
-            .nth(1)
-            .expect("定義がある");
-        let head = &head[..head.find("let te_id").unwrap_or(head.len())];
-        assert!(
-            head.contains("buf.set_target(ComposerTarget::Agent(id))"),
-            "Fixed が選択中の 1 体へ固定されていない"
+            "1 体宛ての送信が一斉送信へ落ちた"
         );
     }
 
