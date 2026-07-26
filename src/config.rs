@@ -555,6 +555,7 @@ show_pet = true
 #   reply = "\r"    Enter (矢印キー選択メニューの確定。既定)
 #   reply = "y\r"   y と Enter ((y/n) 形式)
 #   reply = "1"     番号キー (「1. Yes」形式で、カーソルが Yes に無いとき)
+#   reply = "3\r"   番号 + Enter (「番号を入力してください」形式のメニュー)
 #   agent = "agy"   そのエージェントのタブだけに効かせる (省略すると全部)
 #                   agy=Antigravity / claude / codex / gemini … (実行ファイル名)
 #
@@ -566,6 +567,14 @@ show_pet = true
 # [[auto_yes_rules]]
 # pattern = "Continue with this plan?"
 # reply = "y\r"
+#
+# 番号入力メニュー (アンケート等) の既定の選び方を上書きしたいとき。
+# 組み込みは「スキップ肢 → 肯定肢 → (評点しか無ければ) 肯定側の端」の順に
+# 選びますが、この行があればそちらが優先されます。
+#
+# [[auto_yes_rules]]
+# pattern = "How would you rate"
+# reply = "3\r"
 
 # ── 承認ポリシー (統合承認キュー) ──────────────
 # すべてのエージェントの承認要求を 1 本のキューへ集め、種別ごとに
@@ -2049,6 +2058,28 @@ reply = "y\r"
         assert!(
             cfg.auto_yes_rules.is_empty(),
             "記入例が有効になっている (コメントアウトのはず)"
+        );
+    }
+
+    #[test]
+    fn 番号入力メニューのユーザールールが書ける() {
+        // 「アンケートを数字で入力しないと進まない」画面の選び方を、
+        // 再ビルド無しで config.toml から上書きできること。
+        let src = r#"
+theme = "dark"
+
+[[auto_yes_rules]]
+pattern = "How would you rate"
+reply = "3\r"
+"#;
+        let cfg: Config = toml::from_str(src).expect("番号メニューのルールが読めない");
+        assert_eq!(cfg.auto_yes_rules.len(), 1);
+        assert_eq!(cfg.auto_yes_rules[0].reply, "3\r", "番号 + Enter が書けない");
+        assert!(cfg.auto_yes_rules[0].agent.is_empty(), "省略時は全エージェント");
+        // 記入例が既定 config.toml に載っていること (ユーザーが真似できる)
+        assert!(
+            DEFAULT_CONFIG.contains("reply = \"3\\r\""),
+            "DEFAULT_CONFIG に番号入力メニューの記入例が無い"
         );
     }
 

@@ -145,6 +145,12 @@ impl ResizeDebounce {
     fn pending(&self) -> bool {
         !self.shipped && self.last.is_some()
     }
+
+    /// 送信に失敗した (PTY のロックが取れなかった) ことにして、同じサイズを
+    /// 次フレームでもう一度送らせる。`pending()` が再び立つので draw も回る。
+    fn retry(&mut self) {
+        self.shipped = false;
+    }
 }
 
 /// 「最新の 1 サイズ」だけを持つ受け渡し箱。
@@ -248,6 +254,11 @@ pub struct Session {
     resize_debounce: ResizeDebounce,
     /// リサイズを実際に撃つワーカー。初回のリサイズ確定時に遅延起動する。
     resizer: Option<ResizeCoalescer>,
+    /// ワーカーの起動に失敗した (スレッドを作れなかった)。以後は再試行しない。
+    resizer_spawn_failed: bool,
+    /// パーサを作り直したときに一度だけ出すお知らせ (スクロールバック消失の告知)。
+    /// UI が読み取ったら None に戻す。
+    pub parser_rebuilt_notice: Option<String>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// PTY に直接ぶら下がっている子 (cmd.exe / ログインシェル) の PID。
     /// エージェント本体はその**孫**なので、畳むときはここを起点に
@@ -471,6 +482,12 @@ pub fn auto_yes_reply_for(
     if let Some(hit) = crate::agents::prompt_rule_reply(text, agent) {
         return Some(hit);
     }
+    // 「1. …/2. … 番号を入力してください」型。**数字 + Enter** が要る画面は
+    // 他のどの分岐にも当たらず素通りしていた (ユーザー報告のアンケート停止)。
+    // 語彙は agents.rs の MENU_* 表、判定は numbered_menu_reply に閉じている。
+    if let Some(hit) = numbered_menu_reply(text) {
+        return Some(hit);
+    }
     // 以降は CLI をまたいで通用する汎用の形だけを見る。
     // (Antigravity 固有の文言は agents.rs の応答表に移した — 以前はここに
     //  画面が "agy"/"Antigravity" を含むかだけで発火する巨大な直書き判定が
@@ -654,6 +671,291 @@ fn is_question_line(line: &str) -> bool {
     endings.iter().any(|ending| line.ends_with(ending) || line.contains(ending))
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  番号入力メニュー(アンケート/選択式プロンプト)への自動応答
+// ══════════════════════════════════════════════════════════════════════
+//
+// CLI が「1. …/2. …」と選択肢を並べ、**数字を打って Enter** しないと先へ
+// 進まない画面。矢印キー UI ((y/n) でもない) なのでこれまでの分岐に一つも
+// 当たらず、自動YESをオンにしていてもセッションが止まっていた。
+//
+// ここにあるのは「行の形」を読む純粋な構文解析だけで、どの語が肯定/見送り/
+// アンケートかという知識はすべて agents.rs の表 (MENU_* ) にある。
+
+/// 番号メニューの選択肢 1 件。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuOption {
+    /// 行頭の番号 (1 始まり)。
+    pub num: u8,
+    /// 番号と区切り記号を除いた本文。
+    pub label: String,
+}
+
+/// 行頭に付く選択カーソル / 箇条書き記号。番号を読む前に落とす。
+const MENU_LEAD_MARKS: &[char] = &[
+    '❯', '>', '▶', '➤', '›', '»', '*', '•', '·', '-', '(', '[', '│', '|', '　',
+];
+/// 番号と本文の区切り記号。
+const MENU_SEPS: &[char] = &['.', ')', ']', ':', '-', '、', '．', '：', '。'];
+
+/// 番号キー + Enter。応答は `&'static [u8]` で返す約束なので表にしておく。
+const MENU_KEYS: [&[u8]; 9] = [
+    b"1\r", b"2\r", b"3\r", b"4\r", b"5\r", b"6\r", b"7\r", b"8\r", b"9\r",
+];
+/// 肯定肢を選んだときの説明 (UI 通知用)。
+const MENU_DESC_ALLOW: [&str; 9] = [
+    "番号メニューの承認肢「1」",
+    "番号メニューの承認肢「2」",
+    "番号メニューの承認肢「3」",
+    "番号メニューの承認肢「4」",
+    "番号メニューの承認肢「5」",
+    "番号メニューの承認肢「6」",
+    "番号メニューの承認肢「7」",
+    "番号メニューの承認肢「8」",
+    "番号メニューの承認肢「9」",
+];
+/// 見送り肢を選んだときの説明 (UI 通知用)。
+const MENU_DESC_SKIP: [&str; 9] = [
+    "アンケート/選択をスキップ「1」",
+    "アンケート/選択をスキップ「2」",
+    "アンケート/選択をスキップ「3」",
+    "アンケート/選択をスキップ「4」",
+    "アンケート/選択をスキップ「5」",
+    "アンケート/選択をスキップ「6」",
+    "アンケート/選択をスキップ「7」",
+    "アンケート/選択をスキップ「8」",
+    "アンケート/選択をスキップ「9」",
+];
+/// 評点しか無いアンケートに自動で答えたときの説明 (UI 通知用)。
+/// **勝手に答えた事実を隠さない**ため、選んだ番号を必ず文面に出す。
+const MENU_DESC_RATING: [&str; 9] = [
+    "アンケートに自動で回答しました: 1",
+    "アンケートに自動で回答しました: 2",
+    "アンケートに自動で回答しました: 3",
+    "アンケートに自動で回答しました: 4",
+    "アンケートに自動で回答しました: 5",
+    "アンケートに自動で回答しました: 6",
+    "アンケートに自動で回答しました: 7",
+    "アンケートに自動で回答しました: 8",
+    "アンケートに自動で回答しました: 9",
+];
+
+/// 番号メニューで何を選んだかの区分 (UI 説明文の出し分け用)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuPick {
+    /// 承認・肯定の選択肢。
+    Affirm,
+    /// 見送り・スキップの選択肢。
+    Skip,
+    /// 評点しか無い尺度で選んだ「最も肯定的な端」。
+    Rating,
+}
+
+/// 1 行を `(番号, 本文)` に分解する。**純関数**(番号メニュー判定の中核)。
+///
+/// 対応する形: `1. Yes` / `1) Yes` / `[1] Yes` / `1 - Yes`
+/// (先頭のカーソル記号 `❯` や字下げ、ANSI エスケープが付いていてもよい)。
+pub fn parse_option_line(line: &str) -> Option<MenuOption> {
+    let plain = crate::supervisor::strip_ansi(line);
+    let head = plain
+        .trim()
+        .trim_start_matches(|c: char| MENU_LEAD_MARKS.contains(&c) || c.is_whitespace());
+    let digits: String = head.chars().take_while(char::is_ascii_digit).collect();
+    // 3 桁以上は年号や時刻の可能性が高い。選択肢の番号としては見ない。
+    if digits.is_empty() || digits.len() > 2 {
+        return None;
+    }
+    let num: u8 = digits.parse().ok()?;
+    if num == 0 {
+        return None;
+    }
+    // 番号の直後は区切り記号 (空白を挟んでもよい)。無ければ選択肢ではない。
+    let mut rest = head[digits.len()..].trim_start().chars();
+    if !MENU_SEPS.contains(&rest.next()?) {
+        return None;
+    }
+    let label = rest.as_str().trim();
+    if label.is_empty() {
+        return None;
+    }
+    Some(MenuOption {
+        num,
+        label: label.to_string(),
+    })
+}
+
+/// 画面から番号メニューの選択肢列を取り出す。**純関数**。
+///
+/// 1 から始まり 1 ずつ増える連番だけを採用する。選択肢の間に空行や説明行が
+/// 挟まっていても続きとして読む。同じ画面に連番が複数あるときは
+/// **最後(画面の下)**のものを採る — プロンプトは常に画面末尾にあるため。
+pub fn parse_numbered_options(text: &str) -> Vec<MenuOption> {
+    let mut best: Vec<MenuOption> = Vec::new();
+    let mut cur: Vec<MenuOption> = Vec::new();
+    let flush = |cur: &mut Vec<MenuOption>, best: &mut Vec<MenuOption>| {
+        if cur.len() >= 2 {
+            *best = std::mem::take(cur);
+        }
+        cur.clear();
+    };
+    for line in text.lines() {
+        let Some(opt) = parse_option_line(line) else {
+            continue; // 空行・説明行は読み飛ばす
+        };
+        if opt.num as usize == cur.len() + 1 {
+            cur.push(opt);
+        } else if opt.num == 1 {
+            // 別の連番が始まった
+            flush(&mut cur, &mut best);
+            cur.push(opt);
+        } else {
+            // 番号が飛んだ = 選択肢ではない
+            flush(&mut cur, &mut best);
+        }
+    }
+    flush(&mut cur, &mut best);
+    best
+}
+
+/// 「番号を入力しろ」と言っている行があるか。
+/// 選択肢の行そのものは除いて見る (`2. Rate 1-5 stars` の "1-5" で誤爆しない)。
+fn menu_number_hint(text: &str) -> bool {
+    text.lines()
+        .filter(|l| parse_option_line(l).is_none())
+        .any(|l| {
+            let lc = crate::supervisor::strip_ansi(l).to_lowercase();
+            crate::agents::MENU_NUMBER_HINTS.iter().any(|h| lc.contains(h))
+                || crate::agents::MENU_RANGE_OPENERS.iter().any(|o| {
+                    lc.split(o)
+                        .skip(1)
+                        .any(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+                })
+        })
+}
+
+/// 画面が「番号入力を待っている選択式プロンプト」なら選択肢を返す。**純関数**。
+///
+/// 応答できるかどうかとは無関係の**検出**専用。答えが決まらない画面でも
+/// Some を返すので、scan_attention はこれを見て「承認待ち」を灯せる
+/// (= 誰も答えられずセッションが黙って止まる事故を防ぐ)。
+pub fn numbered_menu_prompt(text: &str) -> Option<Vec<MenuOption>> {
+    let opts = parse_numbered_options(text);
+    if opts.len() < 2 || !menu_number_hint(text) {
+        return None;
+    }
+    Some(opts)
+}
+
+/// 小文字化済みラベルが表のどれかを含むか。
+fn label_hit(label_lc: &str, table: &[&str]) -> bool {
+    table.iter().any(|n| label_lc.contains(n))
+}
+
+/// 承認・肯定の選択肢か (打ち消し語があれば肯定とみなさない)。
+fn menu_is_affirm(label_lc: &str) -> bool {
+    !label_hit(label_lc, crate::agents::MENU_NEGATIONS)
+        && label_hit(label_lc, crate::agents::MENU_AFFIRM)
+}
+
+/// 見送り(スキップ/あとで)の選択肢か。
+fn menu_is_skip(label_lc: &str) -> bool {
+    if label_hit(label_lc, crate::agents::MENU_SKIP) {
+        return true;
+    }
+    let bare = label_lc.trim_matches(|c: char| c.is_whitespace() || ".!。、,".contains(c));
+    crate::agents::MENU_SKIP_EXACT.iter().any(|n| bare == *n)
+}
+
+/// 評点しか無い尺度から「最も肯定的な端」を選ぶ。**純関数**。
+///
+/// 1. 肯定端の語 (`MENU_RATING_BEST`) が当たればそれ。
+/// 2. 否定端の語 (`MENU_RATING_WORST`) が当たったら、その反対側の端。
+/// 3. ラベルが数字だけの尺度なら一番大きい数字。
+/// 4. どれも判らなければ最後の選択肢 (既定)。
+fn menu_rating_pick(labels: &[(u8, String)]) -> Option<u8> {
+    if labels.len() < 2 {
+        return None;
+    }
+    if let Some((n, _)) = labels
+        .iter()
+        .find(|(_, l)| label_hit(l, crate::agents::MENU_RATING_BEST))
+    {
+        return Some(*n);
+    }
+    if let Some(pos) = labels
+        .iter()
+        .position(|(_, l)| label_hit(l, crate::agents::MENU_RATING_WORST))
+    {
+        // 否定端が前半にあるなら肯定端は末尾、後半にあるなら先頭。
+        let last = labels.len() - 1;
+        let idx = if pos * 2 < last { last } else { 0 };
+        return Some(labels[idx].0);
+    }
+    // 「1. 1 / 2. 2 …」のように本文まで数字だけの尺度。
+    let nums: Option<Vec<u32>> = labels
+        .iter()
+        .map(|(_, l)| l.trim().parse::<u32>().ok())
+        .collect();
+    if let Some(nums) = nums {
+        let best = nums.iter().enumerate().max_by_key(|(_, v)| **v)?.0;
+        return Some(labels[best].0);
+    }
+    labels.last().map(|(n, _)| *n)
+}
+
+/// 番号メニューへの応答。答えを決められないときは **None**(人間に委ねる)。
+///
+/// 決め方は agents.rs の表だけで決まる:
+/// 1. 見送り肢 (スキップ/あとで/回答しない) があればそれ。
+/// 2. アンケート以外なら肯定肢 (yes/allow/続行/許可)。
+/// 3. アンケートで見送り肢も無い(評点しか無い)場合も**必ず答える** —
+///    肯定側の端を選び、選んだ番号を説明文に残す。止まる方が害が大きい、
+///    というユーザーの判断。自由入力の質問はここに来ないので従来どおり人へ。
+pub fn numbered_menu_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
+    // 管理者権限昇格など「自動で押してはいけない」画面は番号メニューでも撃たない。
+    if crate::agents::prompt_never_answer(text) {
+        return None;
+    }
+    let lc_all = crate::supervisor::strip_ansi(text).to_lowercase();
+    // 矢印キーで選ぶ UI に数字を送らない (Enter 確定の CLI が別途処理する)。
+    if crate::agents::MENU_ARROW_HINTS.iter().any(|h| lc_all.contains(h)) {
+        return None;
+    }
+    let opts = numbered_menu_prompt(text)?;
+    let labels: Vec<(u8, String)> = opts
+        .iter()
+        .map(|o| (o.num, o.label.to_lowercase()))
+        .collect();
+    let survey = crate::agents::MENU_SURVEY_MARKS
+        .iter()
+        .any(|m| lc_all.contains(m));
+    let find = |f: &dyn Fn(&str) -> bool, kind: MenuPick| {
+        labels
+            .iter()
+            .find(|(_, l)| f(l))
+            .map(|(n, _)| (*n, kind))
+    };
+    let picked = if survey {
+        // アンケート/評価: ① 見送り肢 → ② それも無ければ肯定側の端。
+        // 肯定肢 (「はい、回答します」) は選ばない — 意見の代筆になるため。
+        find(&menu_is_skip, MenuPick::Skip)
+            .or_else(|| menu_rating_pick(&labels).map(|n| (n, MenuPick::Rating)))
+    } else {
+        // 承認など: ① 肯定肢 → ② 見送り肢。
+        // ここで見送りを先に見ると「No, and don't ask again」を選んでしまう。
+        find(&menu_is_affirm, MenuPick::Affirm).or_else(|| find(&menu_is_skip, MenuPick::Skip))
+    };
+    let (num, kind) = picked?;
+    let idx = usize::from(num).checked_sub(1)?;
+    let key = *MENU_KEYS.get(idx)?;
+    let desc = match kind {
+        MenuPick::Affirm => MENU_DESC_ALLOW[idx],
+        MenuPick::Skip => MENU_DESC_SKIP[idx],
+        MenuPick::Rating => MENU_DESC_RATING[idx],
+    };
+    Some((key, desc))
+}
+
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
 /// auto_yes_reply だけが分類する特殊プロンプトも含める。
 const SIG_MARKS: [&str; 47] = [
@@ -720,8 +1022,11 @@ pub fn prompt_signature(text: &str) -> u64 {
     for (i, line) in lines.iter().enumerate() {
         // 目印は固定表 + 応答表 (agents.rs) の needles。表に足したパターンは
         // 指紋にも自動で効くので、片方だけ更新して取りこぼす事故が起きない。
+        // 番号メニューの選択肢行も指紋に含める。選択肢だけが差し替わる
+        // 連続プロンプト (アンケートの次の設問など) を別物として区別できる。
         let marked = SIG_MARKS.iter().any(|m| line.contains(m))
-            || crate::agents::prompt_sig_marks().any(|m| line.contains(m));
+            || crate::agents::prompt_sig_marks().any(|m| line.contains(m))
+            || parse_option_line(line).is_some();
         if marked || is_question_line(line) {
             if i > 0 {
                 lines[i - 1].trim_end().hash(&mut h);
@@ -1151,6 +1456,11 @@ fn base64_decode(src: &[u8]) -> Option<Vec<u8>> {
 /// 移してから書く (再生した最終行の**後ろ**にバナーが並ぶ)。
 pub const RESTORE_BANNER: &str = "\x1b[?1049l\x1b[r\x1b[0m\x1b[999;1H\r\n\x1b[2m── 前回のセッションここまで / 再開します ──\x1b[0m\r\n";
 
+/// パーサを作り直したときに、新しい画面の先頭へ流す 1 行のお知らせ。
+/// 「黒いまま何も出ない」を絶対に作らないための最低限の手掛かり。
+pub const PARSER_REBUILT_BANNER: &str =
+    "\x1b[0m\x1b[2m── 端末の描画状態を作り直しました / これより前の履歴は失われています ──\x1b[0m\r\n";
+
 impl Session {
     /// 前回セッションの生ログ (PTY 生バイト列) を vt100 パーサへ流し込み、
     /// 旧スクロールバックを見える状態にする。末尾に [`RESTORE_BANNER`] を足して
@@ -1337,6 +1647,8 @@ impl Session {
             master: Arc::new(Mutex::new(pair.master)),
             resize_debounce: ResizeDebounce::settled((rows, cols)),
             resizer: None,
+            resizer_spawn_failed: false,
+            parser_rebuilt_notice: None,
             killer,
             child_pid,
             exited,
@@ -1469,7 +1781,12 @@ impl Session {
         // 応答表の絞り込みに使うため、このセッションのエージェント名を渡す。
         // (Antigravity 用のルールが claude のセッションへ流れ込まない)
         let reply = auto_yes_reply_for(&text, self.agent_bin());
-        let present = reply.is_some() || PATTERNS.iter().any(|p| text.contains(p));
+        // 番号入力メニューは PATTERNS のどれにも当たらない形なので別に見る。
+        // 答えが決まらない画面 (評点しか無いアンケート等) でもここで検知され、
+        // 「承認待ち」として看板/承認 UI に出る = 黙って止まったままにならない。
+        let present = reply.is_some()
+            || PATTERNS.iter().any(|p| text.contains(p))
+            || numbered_menu_prompt(&text).is_some();
         // 応答済みエピソードの追跡: プロンプトが画面から消えた、または指紋が
         // 変わった(連続承認キューの次のダイアログ等)ら「応答済み」を下ろす。
         let sig = if present { Some(prompt_signature(&text)) } else { None };
@@ -1715,7 +2032,9 @@ impl Session {
 
     /// 安定したサイズをワーカーへ渡す (無ければ遅延起動)。待たない。
     fn ship_resize(&mut self, rows: u16, cols: u16) {
-        if self.resizer.is_none() {
+        // ワーカーを一度も起こせなかった環境では毎回 spawn を試さない
+        // (失敗するたびにスレッド生成のコストを払い、UI が引っかかる)。
+        if self.resizer.is_none() && !self.resizer_spawn_failed {
             let weak: Weak<Mutex<Box<dyn MasterPty + Send>>> = Arc::downgrade(&self.master);
             self.resizer = ResizeCoalescer::start(
                 format!("zv-pty-resize-{}", self.id),
@@ -1733,19 +2052,28 @@ impl Session {
                     true
                 },
             );
+            self.resizer_spawn_failed = self.resizer.is_none();
         }
         match &self.resizer {
             Some(r) => r.request(rows, cols),
-            // ワーカーを起こせない環境 (スレッド枯渇など) では従来どおり同期適用。
-            // 詰まり得るが、サイズを取りこぼすよりはよい。
-            None => {
-                let _ = lock_ok(&self.master).resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-            }
+            // ワーカーを起こせない環境 (スレッド枯渇など) の代替経路。
+            // ここでも **待たない**: master のロックが取れなければ次フレームへ回す。
+            // 待つと UI スレッドが ConPTY の同期 RPC (ResizePseudoConsole) に
+            // 巻き込まれ、Windows で「ファイルを開いた/ウィンドウを閉じた瞬間に
+            // 黒いまま固まる」事故になる。
+            None => match crate::lockx::try_lock_ok(&self.master) {
+                Some(m) => {
+                    let _ = m.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
+                // 取れなかった = 誰かが RPC 中。送信済みフラグを下ろして
+                // 次フレームに再送させる (サイズを取りこぼさない)。
+                None => self.resize_debounce.retry(),
+            },
         }
     }
 
@@ -1753,6 +2081,30 @@ impl Session {
     /// draw はこれが立っている間 request_repaint し、安定カウントを完走させる。
     pub fn resize_pending(&self) -> bool {
         self.resize_debounce.pending()
+    }
+
+    /// UI スレッドが毎フレーム最初に呼ぶ「パーサの健康診断」。
+    ///
+    /// 読み取りスレッドが panic すると parser の Mutex は poison する。
+    /// そのまま `lock_ok` で読み続けると、壊れかけのグリッドを描き続けるか、
+    /// 描画側が二次パニックして**画面が真っ黒のまま**になる。
+    /// ここで一度だけ作り直し、失われた履歴はバナー 1 行で必ず告知する
+    /// (黙って捨てるとユーザーには「勝手に履歴が消えた」としか見えない)。
+    pub fn ensure_parser_healthy(&mut self) {
+        let (rows, cols) = self.size;
+        let (mut p, rebuilt) = crate::lockx::lock_rebuilding(&self.parser, |p| {
+            *p = vt100::Parser::new(rows, cols, 5000);
+        });
+        if !rebuilt {
+            return;
+        }
+        // 作り直した画面の先頭にお知らせを流す。端末の中身として残るので
+        // 1 フレームで消えず、スクロールしても追える。
+        p.process(PARSER_REBUILT_BANNER.as_bytes());
+        drop(p);
+        self.parser_rebuilt_notice = Some(tr(
+            "端末の描画状態を作り直しました(これより前の履歴は失われています)",
+        ));
     }
 
     /// PTY が現在認識しているサイズ (テストの突き合わせ用)。
@@ -2443,6 +2795,323 @@ mod tests {
         let screen3 = "Press Enter to continue";
         let (bytes3, _) = auto_yes_reply(screen3).unwrap();
         assert_eq!(bytes3, b"\r");
+    }
+
+    // ── 番号入力メニュー (アンケート / 選択式プロンプト) ──────────────
+    //
+    // ユーザー報告「アンケートを数字で入力しないと進まなくなっていた」の回帰テスト。
+    // 画面の形は実物の CLI が出す並び (質問 → 選択肢 → 入力を促す行) に合わせている。
+
+    use super::{numbered_menu_prompt, parse_numbered_options, parse_option_line, MenuOption};
+
+    fn opt(num: u8, label: &str) -> MenuOption {
+        MenuOption {
+            num,
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn option_line_parser_reads_every_numbering_style() {
+        // (入力行, 期待する (番号, 本文))
+        let table: &[(&str, Option<(u8, &str)>)] = &[
+            ("1. Yes", Some((1, "Yes"))),
+            ("2) No", Some((2, "No"))),
+            ("[3] Maybe", Some((3, "Maybe"))),
+            ("4 - Skip", Some((4, "Skip"))),
+            ("  ❯ 1. Yes, allow access", Some((1, "Yes, allow access"))),
+            ("\x1b[1m1.\x1b[0m とても満足", Some((1, "とても満足"))),
+            ("5、回答しない", Some((5, "回答しない"))),
+            // 本文に数字が入っていても番号は行頭のものだけ
+            ("2. Rate 1-5 stars", Some((2, "Rate 1-5 stars"))),
+            // 選択肢ではないもの
+            ("手順:", None),
+            ("2024-01-01 build finished", None),
+            ("1.", None),           // 本文が無い
+            ("0. zero", None),      // 0 始まりは選択肢ではない
+            ("100. too many", None), // 3 桁は年号や連番ログの可能性
+            ("Enter a number (1-5): ", None),
+        ];
+        for (line, want) in table {
+            let got = parse_option_line(line).map(|o| (o.num, o.label));
+            let got = got.as_ref().map(|(n, l)| (*n, l.as_str()));
+            assert_eq!(got, *want, "line={line:?}");
+        }
+    }
+
+    #[test]
+    fn option_list_survives_blank_lines_and_takes_the_last_run() {
+        // 選択肢の間に空行や飾り行が入る CLI がある
+        let screen = "古い手順:\n1. これは本文\n2. これも本文\n\
+                      \n質問です\n\n  1. はい\n\n  2. いいえ\n\n  3. あとで\n";
+        assert_eq!(
+            parse_numbered_options(screen),
+            vec![opt(1, "はい"), opt(2, "いいえ"), opt(3, "あとで")],
+            "画面下の連番 (= 実際のプロンプト) を採らなかった"
+        );
+    }
+
+    #[test]
+    fn numbered_menu_needs_an_explicit_number_prompt() {
+        // 「番号を打て」と言っていない番号リストはメニューではない (誤爆防止)
+        let table: &[(&str, bool)] = &[
+            ("手順:\n1. Yes と入力\n2. 実行", false),
+            ("ログ: 処理に 1-3 秒かかりました\n1. 前処理\n2. 本処理", false),
+            // 「(1-5)」が選択肢の本文の中にあるだけ → メニュー扱いしない
+            ("結果一覧\n1. Rate on a scale (1-5)\n2. Skip it", false),
+            ("好きな番号は?\n1. one\n2. two\nEnter a number (1-2): ", true),
+            ("Choose an option:\n1) one\n2) two", true),
+            ("どれにしますか\n1. これ\n2. あれ\n番号を入力してください: ", true),
+            ("Pick:\n[1] one\n[2] two\nSelect an option [1-2]: ", true),
+            ("Pick:\n1 - one\n2 - two\nChoose 1-2", true),
+        ];
+        for (screen, want) in table {
+            assert_eq!(
+                numbered_menu_prompt(screen).is_some(),
+                *want,
+                "screen={screen:?}"
+            );
+        }
+        // 誤爆しない = 自動応答もしない
+        assert!(auto_yes_reply("手順:\n1. Yes と入力\n2. 実行").is_none());
+    }
+
+    #[test]
+    fn numbered_menu_prefers_allow_then_skip() {
+        // (画面, 送るキー列, 説明に含まれる語)
+        let table: &[(&str, &[u8], &str)] = &[
+            // 承認系: 肯定肢を選ぶ
+            (
+                "Allow this command to run?\n\
+                 1. No, cancel\n2. Yes, allow this once\n3. Yes, and don't ask again\n\
+                 Enter a number (1-3): ",
+                b"2\r",
+                "承認肢",
+            ),
+            // アンケート: スキップ肢がある → 評点ではなくスキップ
+            (
+                "How would you rate your experience with this CLI?\n\
+                 1. Very satisfied\n2. Neutral\n3. Very dissatisfied\n4. Skip this survey\n\
+                 Enter a number (1-4): ",
+                b"4\r",
+                "スキップ",
+            ),
+            // 日本語アンケート + スキップ
+            (
+                "アンケートにご協力ください。満足度はいかがですか?\n\
+                 1) とても満足\n2) 普通\n3) 不満\n4) 回答しない\n\
+                 番号を入力してください: ",
+                b"4\r",
+                "スキップ",
+            ),
+            // 英日混在: 肯定肢が日本語
+            (
+                "Allow file write?\n1. Cancel\n2. はい、許可します\nEnter a number (1-2): ",
+                b"2\r",
+                "承認肢",
+            ),
+            // 承認系でも肯定肢が無ければ見送り肢 (更新の催促などを黙って畳む)
+            (
+                "Update available. Install now?\n1. Not now\n2. Install\n\
+                 Enter your choice (1-2): ",
+                b"1\r",
+                "スキップ",
+            ),
+        ];
+        for (screen, want, desc_part) in table {
+            let (bytes, desc) = auto_yes_reply(screen).unwrap_or_else(|| {
+                panic!("番号メニューに応答しなかった:\n{screen}");
+            });
+            assert_eq!(bytes, *want, "screen={screen}");
+            assert!(desc.contains(desc_part), "desc={desc} screen={screen}");
+        }
+    }
+
+    #[test]
+    fn rating_only_survey_answers_the_positive_end_and_says_so() {
+        // 評点しか無い尺度でも止めない (止まる方が害が大きい、というユーザーの判断)。
+        // ただし「勝手に答えた」ことが判る説明を必ず返す。
+        let table: &[(&str, &[u8])] = &[
+            // 降順 (1 が最も肯定的)
+            (
+                "How satisfied are you with Zaivern?\n\
+                 1. Very satisfied\n2. Satisfied\n3. Neutral\n4. Dissatisfied\n5. Very dissatisfied\n\
+                 Enter a number (1-5): ",
+                b"1\r",
+            ),
+            // 昇順 (5 が最も肯定的)
+            (
+                "How likely are you to recommend us?\n\
+                 1. Very unlikely\n2. Unlikely\n3. Neutral\n4. Likely\n5. Very likely\n\
+                 Enter a number (1-5): ",
+                b"5\r",
+            ),
+            // 否定端しか語で判らない → 反対側の端
+            (
+                "満足度の評価にご協力ください\n\
+                 1. 全く思わない\n2. あまり\n3. どちらとも\n4. まあまあ\n5. そう思う\n\
+                 番号を入力してください: ",
+                b"5\r",
+            ),
+            // ラベルが数字だけの尺度 → 一番大きい数字
+            (
+                "Rate this session (survey)\n1. 1\n2. 2\n3. 3\nEnter a number (1-3): ",
+                b"3\r",
+            ),
+            // 語で向きが判らない → 既定は最後の選択肢
+            (
+                "アンケート: 今回の評価を選んでください\n1. A\n2. B\n3. C\n番号を入力: ",
+                b"3\r",
+            ),
+        ];
+        for (screen, want) in table {
+            let (bytes, desc) = auto_yes_reply(screen)
+                .unwrap_or_else(|| panic!("評点アンケートに答えなかった:\n{screen}"));
+            assert_eq!(bytes, *want, "screen={screen}");
+            assert!(
+                desc.contains("自動で回答しました"),
+                "自動回答の事実が説明に出ていない: desc={desc}"
+            );
+            // 説明には選んだ番号がそのまま出る (UI で「5」と判る)
+            let picked = String::from_utf8_lossy(want).trim_end().to_string();
+            assert!(desc.ends_with(&picked), "desc={desc} picked={picked}");
+        }
+    }
+
+    #[test]
+    fn free_form_choice_menus_are_left_to_the_human() {
+        // 肯定でも見送りでもアンケートでもない「どれを使う?」は人が決める。
+        // ただし承認待ちとしては検知される (scan_attention 側のテストを参照)。
+        let screen = "Which model do you want to use?\n\
+                      1. opus\n2. sonnet\n3. haiku\nEnter a number (1-3): ";
+        assert!(auto_yes_reply(screen).is_none(), "自由選択に勝手に答えた");
+        assert!(
+            numbered_menu_prompt(screen).is_some(),
+            "承認待ちとして検知できる形になっていない"
+        );
+    }
+
+    #[test]
+    fn never_guard_beats_a_numbered_menu() {
+        // 管理者権限昇格は番号メニューの形をしていても絶対に自動応答しない。
+        let screen = "Administrator privileges are required to continue.\n\
+                      1. Yes, allow\n2. No\nEnter a number (1-2): ";
+        assert!(auto_yes_reply(screen).is_none(), "権限昇格に自動応答した");
+        assert!(auto_yes_reply_for(screen, Some("agy")).is_none());
+        // 検知自体はされる = 人が判断できるよう承認待ちには出る
+        assert!(numbered_menu_prompt(screen).is_some());
+    }
+
+    #[test]
+    fn arrow_key_selector_gets_enter_not_a_digit() {
+        // Antigravity のような矢印キー UI へ数字を撃つと入力欄が汚れる。
+        let screen = "Allow access to this file?\n\
+                      1. Yes, allow access\n2. No\n\
+                      [Use arrow keys to navigate, Enter to select]";
+        let (bytes, _) = auto_yes_reply_for(screen, Some("agy")).unwrap();
+        assert_eq!(bytes, b"\r", "矢印キー UI に数字を送った");
+        // 「番号を入力」の文言が混ざっていても数字は送らない
+        let mixed = format!("{screen}\nEnter a number (1-2): ");
+        assert_eq!(
+            auto_yes_reply_for(&mixed, Some("agy")).map(|(b, _)| b),
+            Some(&b"\r"[..])
+        );
+        // カタログに載っていない CLI でも、矢印ヒントがあれば数字は送らない
+        let unknown = "Pick one\n1. Yes, continue\n2. No\n\
+                       Use arrow keys to move, then Enter\nEnter a number (1-2): ";
+        assert!(
+            auto_yes_reply_for(unknown, Some("claude")).map(|(b, _)| b) != Some(&b"1\r"[..]),
+            "矢印キー UI に番号を送った"
+        );
+    }
+
+    #[test]
+    fn numbered_menu_end_to_end_per_agent_bin() {
+        // (エージェント bin, 画面, 送るバイト列)
+        let table: &[(&str, &str, &[u8])] = &[
+            (
+                "claude",
+                "Do you want to make this edit to config.toml?\n\
+                 1. Yes\n2. Yes, and don't ask again\n3. No\n\
+                 Enter a number (1-3): ",
+                b"1\r",
+            ),
+            (
+                "codex",
+                "Codex needs your approval to run `cargo test`.\n\
+                 1. No, cancel\n2. Yes, proceed\n\
+                 Select an option [1-2]: ",
+                b"2\r",
+            ),
+            (
+                "gemini",
+                "Help us improve Gemini CLI! Take a short survey?\n\
+                 1. Take the survey\n2. Maybe later\n\
+                 Enter a number (1-2): ",
+                b"2\r",
+            ),
+            (
+                "cursor-agent",
+                "How would you rate this session?\n\
+                 1. Excellent\n2. Good\n3. Bad\n\
+                 Enter a number (1-3): ",
+                b"1\r",
+            ),
+            (
+                "agy",
+                "Allow creation of this file?\n1. Yes, allow creation\n2. No\n\
+                 Enter a number (1-2): ",
+                b"\r", // 応答表 (矢印キー UI) が最優先
+            ),
+        ];
+        for (bin, screen, want) in table {
+            let got = auto_yes_reply_for(screen, Some(bin)).map(|(b, _)| b);
+            assert_eq!(got, Some(*want), "bin={bin} screen={screen}");
+        }
+    }
+
+    #[test]
+    fn user_rule_overrides_the_built_in_menu_choice() {
+        use crate::agents::{prompt_rule_reply_with, PromptRule};
+        let screen = "How would you rate this CLI?\n\
+                      1. Great\n2. Fine\n3. Bad\n4. Skip\n\
+                      Enter a number (1-4): ";
+        // 組み込みの選び方ではスキップ肢
+        assert_eq!(auto_yes_reply(screen).map(|(b, _)| b), Some(&b"4\r"[..]));
+        // config.toml の [[auto_yes_rules]] で「3 を送る」に上書きできる。
+        // (auto_yes_reply_for はユーザールール → 番号メニューの順に見るので、
+        //  ここで一致すれば番号メニューの判断には進まない)
+        let user = [PromptRule {
+            agent: "",
+            needles: &["How would you rate this CLI?"],
+            avoid: &[],
+            reply: b"3\r",
+            desc: "テスト用ユーザールール",
+        }];
+        assert_eq!(
+            prompt_rule_reply_with(&user, screen, Some("claude")).map(|(b, _)| b),
+            Some(&b"3\r"[..]),
+            "ユーザー定義ルールが番号メニューより優先されない"
+        );
+    }
+
+    #[test]
+    fn resize_debounce_retry_ships_the_same_size_again() {
+        // T1: PTY のロックが取れずに送れなかったとき、次フレームで送り直す。
+        let mut d = super::ResizeDebounce::default();
+        let mut shipped = None;
+        for _ in 0..super::RESIZE_STABLE_FRAMES {
+            shipped = d.on_request((30, 100));
+        }
+        assert_eq!(shipped, Some((30, 100)), "安定後に送信サイズが出ない");
+        assert!(!d.pending(), "送信済みなのに保留が残っている");
+        d.retry();
+        assert!(d.pending(), "retry 後に保留が立たない (draw が回らず止まる)");
+        assert_eq!(
+            d.on_request((30, 100)),
+            Some((30, 100)),
+            "retry 後に同じサイズを送り直さなかった"
+        );
     }
 
     // ── レート制限の検知 ──────────────────────────────────────────────
@@ -3597,6 +4266,74 @@ mod tests {
             }
         }
         assert!(redetected, "指紋の異なる2つ目のプロンプトが検知されなかった");
+        s.kill();
+    }
+
+    // ── 番号メニューの取りこぼし防止 / パーサ復旧 (セッション経由) ──────
+
+    /// 答えの決まらない番号メニューでも「承認待ち」として看板に出る。
+    /// ここが抜けると、自動YESが答えられない画面で**黙って止まる**。
+    #[cfg(unix)]
+    #[test]
+    fn unanswerable_numbered_menu_surfaces_as_needs_approval() {
+        use super::Attention;
+        use std::time::Duration;
+
+        let mut s = spawn_prompt_session(9401, "sleep 5");
+        // 子の出力待ちに依存せず、画面を直接組み立てて判定だけを見る。
+        let menu = "Which model do you want to use?\r\n\
+                    1. opus\r\n2. sonnet\r\n3. haiku\r\nEnter a number (1-3): ";
+        s.parser.lock().unwrap().process(menu.as_bytes());
+        // scan_attention は 900ms のスロットルがある
+        std::thread::sleep(Duration::from_millis(1_000));
+        // 自動YESオンでも答えは決まらない → 承認待ちとして上がること
+        assert!(
+            matches!(s.scan_attention(true), Some(Attention::NeedsApproval)),
+            "答えられない番号メニューが承認待ちにならなかった"
+        );
+        assert!(s.attention, "承認待ちフラグが立っていない");
+        let screen = s.parser.lock().unwrap().screen().contents();
+        assert!(
+            screen.contains("Enter a number (1-3)"),
+            "勝手に応答して画面が進んでしまった: {screen}"
+        );
+        s.kill();
+    }
+
+    /// T2: パーサの Mutex が poison しても、作り直して**必ず何か描ける**状態に戻す。
+    /// 黙って真っ黒のままにせず、履歴が消えたことを 1 行のバナーで知らせる。
+    #[cfg(unix)]
+    #[test]
+    fn poisoned_parser_is_rebuilt_once_with_a_notice() {
+        let mut s = spawn_prompt_session(9402, "sleep 5");
+        let p = s.parser.clone();
+        // 別スレッドがパーサを握ったまま panic した状況を作る。
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // テスト出力を汚さない
+        let _ = std::thread::spawn(move || {
+            let _g = crate::lockx::lock_ok(&p);
+            panic!("poison the parser");
+        })
+        .join();
+        std::panic::set_hook(prev);
+        assert!(s.parser.is_poisoned(), "前提: パーサが poison していない");
+
+        s.ensure_parser_healthy();
+        assert!(
+            s.parser_rebuilt_notice.is_some(),
+            "作り直しを黙って行った (ユーザーに知らせていない)"
+        );
+        let screen = s.parser.lock().unwrap().screen().contents();
+        assert!(
+            screen.contains("履歴は失われています"),
+            "作り直しのバナーが画面に出ていない: {screen}"
+        );
+        assert!(!s.parser.is_poisoned(), "毒が落ちていない (毎フレーム作り直す)");
+
+        // 2 回目は何も起きない (バナーの連発・履歴の再消失をしない)。
+        s.parser_rebuilt_notice = None;
+        s.ensure_parser_healthy();
+        assert!(s.parser_rebuilt_notice.is_none(), "健康なのに作り直した");
         s.kill();
     }
 
@@ -5672,6 +6409,10 @@ pub fn draw(
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 6.0, theme.term_bg);
+
+    // 描く前にパーサの健康診断。poison していたらここで作り直す
+    // (壊れたグリッドを読んで描画側が落ち、以後ずっと真っ黒…を防ぐ)。
+    session.ensure_parser_healthy();
 
     draw_screen(
         ui, &painter, session, theme, &font_id, rect, padding, cell_w, cell_h, focused,

@@ -748,6 +748,216 @@ pub static PROMPT_NEVER: &[&str] = &[
     "Administrator privileges are required",
 ];
 
+// ══════════════════════════════════════════════════════════════════════
+//  番号入力メニュー(アンケート/選択式プロンプト)の語彙表 (データ)
+// ══════════════════════════════════════════════════════════════════════
+//
+// 「1. Yes / 2. No … 番号を入力してください」のように **数字 + Enter** を
+// 要求してくる画面用。ユーザー報告「アンケートを数字で入力しないと進まなく
+// なっていた」の対策で、CLI が出す番号メニューに自動で答えるために使う。
+//
+// 判定ロジック (terminal.rs の `numbered_menu_reply`) はこの表を引くだけで、
+// CLI 固有の文言をロジック側に一切持たない。照合は **小文字化した部分一致**
+// (日本語はそのまま)。表に 1 行足せば再コンパイルだけで新しい CLI に効く。
+
+/// 「番号を打て」と言っている行の目印。
+/// **これが画面に無ければ番号メニューとみなさない** — 出力中のただの箇条書き
+/// (手順書の「1. …」など) へ数字を撃ち込まないための最重要ガード。
+pub static MENU_NUMBER_HINTS: &[&str] = &[
+    "enter a number",
+    "enter the number",
+    "enter a choice",
+    "enter your choice",
+    "enter selection",
+    "enter 1",
+    "type a number",
+    "type the number",
+    "select an option",
+    "select a number",
+    "select one",
+    "select 1",
+    "choose an option",
+    "choose a number",
+    "choose one",
+    "choose 1",
+    "pick a number",
+    "pick an option",
+    "your choice",
+    "your selection",
+    "番号を入力",
+    "番号でお答え",
+    "番号でご回答",
+    "番号をお選び",
+    "番号を選ん",
+    "数字を入力",
+    "数字でお答え",
+    "いずれかの番号",
+];
+
+/// `(1-5)` `[1-3]` のような**範囲の書き方**。開始記号の直後が数字のときだけ
+/// 範囲とみなす (本文中の "1-2 秒" のような書きぶりでは発火しない)。
+pub static MENU_RANGE_OPENERS: &[&str] = &["(1-", "[1-", "(1〜", "[1〜", "(1～", "[1～"];
+
+/// **矢印キーで選ぶ** UI の目印。これがある画面へは数字を送らない
+/// (Antigravity のように Enter で確定する UI に数字を撃つと入力欄が汚れる)。
+pub static MENU_ARROW_HINTS: &[&str] = &[
+    // AGY_SELECT_HINT の中核部分。小文字化して照合する。
+    "arrow keys to navigate",
+    "use arrow keys",
+    "use the arrow keys",
+    "↑/↓",
+    "↑↓",
+    "j/k to move",
+    "矢印キー",
+    "カーソルキー",
+    "上下キー",
+];
+
+/// 選択肢が「承認・肯定」を表す語 (部分一致)。
+pub static MENU_AFFIRM: &[&str] = &[
+    "yes",
+    "allow",
+    "approve",
+    "accept",
+    "continue",
+    "proceed",
+    "grant",
+    "permit",
+    "はい",
+    "許可",
+    "続行",
+    "承認",
+    "受け入れ",
+    "実行する",
+];
+
+/// 肯定語を含んでいても**打ち消す**語。`Don't continue` / `No, exit` 対策。
+pub static MENU_NEGATIONS: &[&str] = &[
+    "don't",
+    "do not",
+    "never",
+    "no,",
+    "no ",
+    "not ",
+    "cancel",
+    "exit",
+    "quit",
+    "abort",
+    "reject",
+    "deny",
+    "しない",
+    "やめ",
+    "中止",
+    "キャンセル",
+    "終了",
+    "拒否",
+];
+
+/// 選択肢が「見送り・スキップ」を表す語 (部分一致)。
+/// アンケートや意見を聞く画面では、意見を代筆せずここを選ぶ。
+pub static MENU_SKIP: &[&str] = &[
+    "skip",
+    "not now",
+    "maybe later",
+    "ask me later",
+    "remind me later",
+    "no thanks",
+    "no, thanks",
+    "dismiss",
+    "don't ask",
+    "do not ask",
+    "not interested",
+    "スキップ",
+    "あとで",
+    "後で",
+    "今はしない",
+    "回答しない",
+    "答えない",
+    "聞かない",
+    "興味がない",
+];
+
+/// 短すぎて部分一致だと誤爆する見送り語。**完全一致**でだけ採用する
+/// (`no` を部分一致にすると `not now` 以外の無関係な語まで拾う)。
+pub static MENU_SKIP_EXACT: &[&str] = &["no", "n", "later", "いいえ", "不要", "パス"];
+
+/// 評価尺度の**最も肯定的な端**を表す語。スキップ肢も肯定肢も無い
+/// 「1〜5 の評点しか無い」アンケートで、どれを選ぶかを決めるのに使う。
+/// 尺度が昇順でも降順でもここが当たった選択肢を選ぶので端を取り違えない。
+/// 打ち消し語 (`dissatisfied` / `not ...`) を含む語はここに入れないこと。
+pub static MENU_RATING_BEST: &[&str] = &[
+    "very satisfied",
+    "extremely satisfied",
+    "completely satisfied",
+    "highly satisfied",
+    "very likely",
+    "extremely likely",
+    "very good",
+    "excellent",
+    "strongly agree",
+    "very helpful",
+    "very useful",
+    "love it",
+    "とても満足",
+    "非常に満足",
+    "大変満足",
+    "大変良い",
+    "とても良い",
+    "非常に良い",
+    "とても役立",
+    "そう思う",
+    "最高",
+];
+
+/// 評価尺度で**最も否定的な端**を表す語。`MENU_RATING_BEST` が当たらない
+/// ときの向き推定に使う (否定端が先頭なら肯定端は末尾、という判断)。
+pub static MENU_RATING_WORST: &[&str] = &[
+    "very dissatisfied",
+    "extremely dissatisfied",
+    "not at all",
+    "very unlikely",
+    "very poor",
+    "poor",
+    "terrible",
+    "strongly disagree",
+    "not satisfied",
+    "very bad",
+    "とても不満",
+    "非常に不満",
+    "大変不満",
+    "全く",
+    "まったく",
+    "とても悪い",
+    "非常に悪い",
+    "最低",
+];
+
+/// 画面が**アンケート/評価/感想**を聞いていると判る目印。
+/// これが出ている画面では、まず見送り肢を選ぶ
+/// (= ユーザーに成り代わって意見を書かない)。見送り肢が無いときだけ
+/// `MENU_RATING_BEST` / `MENU_RATING_WORST` で肯定側の端を選んで先へ進める
+/// — 止まったままにする方が害が大きい、というユーザーの判断による。
+pub static MENU_SURVEY_MARKS: &[&str] = &[
+    "survey",
+    "questionnaire",
+    "feedback",
+    "rate ",
+    "rating",
+    "how would you",
+    "how likely",
+    "how satisfied",
+    "satisfaction",
+    "satisfied",
+    "recommend",
+    "opinion",
+    "アンケート",
+    "評価",
+    "満足度",
+    "ご意見",
+    "ご感想",
+    "おすすめ度",
+];
+
 /// ユーザー定義ルール (config.toml の `[[auto_yes_rules]]`)。
 ///
 /// 登録時に `&'static` へリークして持つ。応答キーは `&'static [u8]` で
@@ -1817,6 +2027,42 @@ mod tests {
                 "カタログに無いエージェント名: {}",
                 r.agent
             );
+        }
+    }
+
+    #[test]
+    fn 番号メニューの語彙表は小文字で書かれている() {
+        // 照合側は画面を小文字化してから contains する。表に大文字が
+        // 紛れ込むと**そのルールが永久に一致しない**ので機械的に止める。
+        let tables: &[(&str, &[&str])] = &[
+            ("MENU_NUMBER_HINTS", super::MENU_NUMBER_HINTS),
+            ("MENU_ARROW_HINTS", super::MENU_ARROW_HINTS),
+            ("MENU_AFFIRM", super::MENU_AFFIRM),
+            ("MENU_NEGATIONS", super::MENU_NEGATIONS),
+            ("MENU_SKIP", super::MENU_SKIP),
+            ("MENU_SKIP_EXACT", super::MENU_SKIP_EXACT),
+            ("MENU_SURVEY_MARKS", super::MENU_SURVEY_MARKS),
+            ("MENU_RATING_BEST", super::MENU_RATING_BEST),
+            ("MENU_RATING_WORST", super::MENU_RATING_WORST),
+        ];
+        for (name, table) in tables {
+            for w in *table {
+                assert!(!w.is_empty(), "{name} に空の語がある");
+                assert_eq!(*w, w.to_lowercase(), "{name} に大文字が混ざっている: {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn 評価の肯定端と否定端が食い違わない() {
+        // 「very dissatisfied」が肯定端に化けると最悪の評点を送ってしまう。
+        for best in super::MENU_RATING_BEST {
+            for worst in super::MENU_RATING_WORST {
+                assert!(
+                    !worst.contains(best),
+                    "否定端「{worst}」が肯定端「{best}」を含む (取り違える)"
+                );
+            }
         }
     }
 
