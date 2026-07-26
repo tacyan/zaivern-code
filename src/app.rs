@@ -315,6 +315,430 @@ struct IndexedFile {
     label: String,
 }
 
+// ── ネイティブファイルダイアログのジョブ化 ────────────────────────────
+//
+// rfd の同期 API を UI スレッド (= eframe の `update` の中) で呼ぶと、winit の
+// イベントループの**内側**で OS のモーダルメッセージループが回りはじめる。
+// Windows ではこれが親ウィンドウを持たないモーダルループになるため、
+//   * ダイアログが開いている間 eframe のウィンドウが一切再描画されない
+//     (真っ白 / 描きかけのまま固まる)
+//   * エージェント (PTY) のリーダースレッドが撃ち続ける `request_repaint` が
+//     再入で wndproc へ届き、egui 内部の RefCell が二重借用で panic しうる
+// という形で「エージェントを消す/ファイルを開くと画面が崩れて固まる」になる。
+// エージェントが多いほど repaint の圧が上がるので再現しやすい。
+//
+// 対策はダイアログを UI スレッドから追い出すこと。ワーカースレッドで開いて
+// 結果をチャネルで受け取り、次のフレームで適用する。UI スレッドは 1 フレームも
+// 止まらないので、ダイアログ中もエージェントの出力が流れ続ける。
+
+/// ダイアログの開き方。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DialogMode {
+    PickFile,
+    PickFolder,
+    SaveFile,
+}
+
+/// ダイアログの組み立て材料。
+///
+/// ワーカースレッドへ送るので `Send` な素材だけを持つ (`rfd::FileDialog` 自体は
+/// 親ウィンドウハンドルを抱えうるので、組み立ては向こう側でやる)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DialogSpec {
+    mode: DialogMode,
+    /// 最初に表示するディレクトリ (None なら OS 既定)
+    directory: Option<PathBuf>,
+    /// 拡張子フィルタ: (表示名, 拡張子の並び)
+    filter: Option<(String, Vec<String>)>,
+}
+
+impl DialogSpec {
+    fn new(mode: DialogMode) -> Self {
+        Self {
+            mode,
+            directory: None,
+            filter: None,
+        }
+    }
+    fn pick_file() -> Self {
+        Self::new(DialogMode::PickFile)
+    }
+    fn pick_folder() -> Self {
+        Self::new(DialogMode::PickFolder)
+    }
+    fn save_file() -> Self {
+        Self::new(DialogMode::SaveFile)
+    }
+    fn directory(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.directory = Some(dir.into());
+        self
+    }
+    fn filter(mut self, name: impl Into<String>, exts: &[&str]) -> Self {
+        self.filter = Some((
+            name.into(),
+            exts.iter().map(|e| (*e).to_string()).collect(),
+        ));
+        self
+    }
+}
+
+/// 実際にネイティブダイアログを開く。**呼んだスレッドをブロックする**。
+fn run_file_dialog(spec: &DialogSpec) -> Option<PathBuf> {
+    let mut d = rfd::FileDialog::new();
+    if let Some(dir) = &spec.directory {
+        d = d.set_directory(dir);
+    }
+    if let Some((name, exts)) = &spec.filter {
+        d = d.add_filter(name.clone(), exts);
+    }
+    match spec.mode {
+        DialogMode::PickFile => d.pick_file(),
+        DialogMode::PickFolder => d.pick_folder(),
+        DialogMode::SaveFile => d.save_file(),
+    }
+}
+
+/// ダイアログの用途を表すキー。**同じ用途の二重オープンを防ぐ**ために使う。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum DialogKind {
+    OpenFile,
+    NewWindowFolder,
+    OpenFolder,
+    AddFolder,
+    PetImage,
+    InstallPlugin,
+    SaveAs,
+}
+
+/// ダイアログの用途 + 結果を適用するのに必要な情報。
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum DialogPurpose {
+    /// ファイルを開く (メニュー: ファイル > 開く)
+    OpenFile,
+    /// 新しいウィンドウでフォルダを開く
+    NewWindowFolder,
+    /// ワークスペースのフォルダを開き直す
+    OpenFolder,
+    /// ワークスペースへフォルダを追加する
+    AddFolder,
+    /// ペット画像を選ぶ
+    PetImage,
+    /// プラグイン (.zvplug / .zip) を選んで入れる
+    InstallPlugin,
+    /// 名前を付けて保存。
+    ///
+    /// ダイアログが返るまでにタブの並びは変わりうるので、添字ではなく
+    /// **バッファ ID** で対象を指す。`close_after` / `run_hooks` は
+    /// 保存が終わったあとの追加動作 (呼び出し元が同期時にやることの控え)。
+    SaveAs {
+        buffer_id: u64,
+        close_after: bool,
+        run_hooks: bool,
+    },
+}
+
+impl DialogPurpose {
+    fn kind(&self) -> DialogKind {
+        match self {
+            DialogPurpose::OpenFile => DialogKind::OpenFile,
+            DialogPurpose::NewWindowFolder => DialogKind::NewWindowFolder,
+            DialogPurpose::OpenFolder => DialogKind::OpenFolder,
+            DialogPurpose::AddFolder => DialogKind::AddFolder,
+            DialogPurpose::PetImage => DialogKind::PetImage,
+            DialogPurpose::InstallPlugin => DialogKind::InstallPlugin,
+            DialogPurpose::SaveAs { .. } => DialogKind::SaveAs,
+        }
+    }
+}
+
+/// ワーカースレッドから返る結果。`path` が None ならキャンセル。
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct DialogOutcome {
+    purpose: DialogPurpose,
+    path: Option<PathBuf>,
+}
+
+/// 実行中のダイアログジョブ。
+///
+/// 状態遷移: `begin` (受理) → 実行中 (同じ用途の `begin` は None) →
+/// `poll` で結果を取り出す → 待ちが解けて idle へ戻る。
+/// キャンセルも「`path` が None の結果」として同じ道を通るので、
+/// 待ちが解けたまま何も起きない = 従来どおりの挙動になる。
+struct DialogJobs {
+    in_flight: HashSet<DialogKind>,
+    tx: mpsc::Sender<DialogOutcome>,
+    rx: mpsc::Receiver<DialogOutcome>,
+}
+
+impl DialogJobs {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            in_flight: HashSet::new(),
+            tx,
+            rx,
+        }
+    }
+
+    /// 受理したら結果送信用の口を返す。同じ用途が実行中なら None (無視する)。
+    fn begin(&mut self, kind: DialogKind) -> Option<mpsc::Sender<DialogOutcome>> {
+        if !self.in_flight.insert(kind) {
+            return None;
+        }
+        Some(self.tx.clone())
+    }
+
+    /// 届いた結果を 1 件取り出し、その用途を待ち状態から外す。
+    fn poll(&mut self) -> Option<DialogOutcome> {
+        let out = self.rx.try_recv().ok()?;
+        self.in_flight.remove(&out.purpose.kind());
+        Some(out)
+    }
+
+    /// 何かのダイアログが開いているか (開いている間は少し速く回す)。
+    fn busy(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+}
+
+impl Default for DialogJobs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── フレームガード (update の panic ポリシー) ──────────────────────────
+//
+// `update` 中の panic をアプリごと落とさず握り潰すのは正しい。ただし
+// 「1 フレーム完走したらカウンタを 0 に戻す」だけだと、**たまに成功する**
+// panic (panic → ok → panic → ok …) を永久に描き続けてしまう。画面は
+// 半分だけ組み立てられた状態で固まり、クラッシュもしない
+// = 利用者から見た「画面が崩れて動かなくなる」。
+//
+// そこで時間窓で panic の頻度を見て、収まらないなら段階的に手を打つ:
+// 継続 → (犯人の部分ビューを隔離 + 画面に警告) → それでも駄目なら従来どおり中止。
+
+/// 1 フレームの結果。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameOutcome {
+    Ok,
+    Panic,
+}
+
+/// フレームガードの判断。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameGuardAction {
+    /// そのまま継続する (このフレームを捨てるだけ)
+    Continue,
+    /// 壊れている部分ビューを描画から外し、画面に警告を出す
+    Quarantine,
+    /// 手に負えない — 従来どおり落とす (最後の手段)
+    Abort,
+}
+
+/// panic の頻度を見る時間窓 (ミリ秒)。
+const FRAME_PANIC_WINDOW_MS: u64 = 10_000;
+/// 時間窓の中でこの回数に達したら隔離へ上げる。
+const FRAME_PANIC_QUARANTINE_AT: usize = 3;
+/// 隔離をこの回数繰り返しても収まらなければ諦める。
+const FRAME_PANIC_MAX_QUARANTINES: u32 = 3;
+/// **連続**でこの回数 panic したら即座に諦める (従来からの挙動)。
+const FRAME_PANIC_ABORT_STREAK: u32 = 3;
+/// これだけ連続で完走したら健全とみなし、隔離回数の記憶も捨てる。
+const FRAME_CLEAN_STREAK_RESET: u32 = 300;
+
+/// panic の頻度から次の一手を決める状態機械。
+///
+/// 時刻を引数で受け取るだけの純粋な部品なので、テストから決定的に叩ける
+/// (`frame_panic_policy_*` を参照)。
+#[derive(Debug, Default, Clone)]
+struct FramePanicPolicy {
+    /// 時間窓に残っている panic の発生時刻 (ms)
+    recent: Vec<u64>,
+    /// 連続 panic 回数 (1 フレーム完走で 0)
+    streak: u32,
+    /// 連続で完走したフレーム数
+    clean: u32,
+    /// これまでに出した隔離指示の回数
+    quarantines: u32,
+}
+
+impl FramePanicPolicy {
+    /// 1 フレーム分の結果を記録して、次の一手を返す。
+    fn record(&mut self, outcome: FrameOutcome, now_ms: u64) -> FrameGuardAction {
+        // 時間窓から出た panic は忘れる (= カウンタの減衰)。
+        // 「完走したら即 0」ではないので、ちらつく panic も取りこぼさない。
+        let floor = now_ms.saturating_sub(FRAME_PANIC_WINDOW_MS);
+        self.recent.retain(|t| *t >= floor);
+        match outcome {
+            FrameOutcome::Ok => {
+                self.streak = 0;
+                self.clean = self.clean.saturating_add(1);
+                // 十分に落ち着いたら完全に忘れる (何時間も動かしたときに
+                // 無関係な panic が積み上がって落ちるのを防ぐ)
+                if self.recent.is_empty() && self.clean >= FRAME_CLEAN_STREAK_RESET {
+                    self.quarantines = 0;
+                }
+                FrameGuardAction::Continue
+            }
+            FrameOutcome::Panic => {
+                self.clean = 0;
+                self.streak = self.streak.saturating_add(1);
+                self.recent.push(now_ms);
+                if self.streak >= FRAME_PANIC_ABORT_STREAK {
+                    return FrameGuardAction::Abort;
+                }
+                if self.recent.len() >= FRAME_PANIC_QUARANTINE_AT {
+                    // 隔離するので、効いたかどうかを測り直す
+                    self.recent.clear();
+                    self.quarantines = self.quarantines.saturating_add(1);
+                    if self.quarantines > FRAME_PANIC_MAX_QUARANTINES {
+                        return FrameGuardAction::Abort;
+                    }
+                    return FrameGuardAction::Quarantine;
+                }
+                FrameGuardAction::Continue
+            }
+        }
+    }
+}
+
+/// panic の犯人を指す単位 (隔離できる粒度)。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum Subview {
+    /// Cockpit のエージェントタイル (セッション ID)
+    Session(u64),
+    /// 名前付きの領域 (エディタ・サイドバー等)
+    Panel(&'static str),
+}
+
+impl Subview {
+    /// 利用者へ見せる名前。
+    fn label(&self) -> String {
+        match self {
+            Subview::Session(id) => trf("エージェント #{id} の画面", &[("id", id.to_string())]),
+            Subview::Panel("editor") => tr("エディタ"),
+            Subview::Panel("cockpit") => tr("コックピット"),
+            Subview::Panel("sidebar") => tr("サイドバー"),
+            Subview::Panel("terminal") => tr("ターミナルパネル"),
+            Subview::Panel(other) => (*other).to_string(),
+        }
+    }
+}
+
+thread_local! {
+    /// いま描いている部分ビュー。panic すると後片付けが飛ばされて印が残るので、
+    /// `catch_unwind` の側から「どこが壊れたか」を読み取れる。**UI スレッド専用**。
+    static DRAWING_SUBVIEW: std::cell::RefCell<Option<Subview>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 部分ビューに印を付けて描く。panic したら印を残したままにする (犯人の特定用)。
+///
+/// 入れ子にできる: 内側が無事に終われば外側の印へ戻すので、タイルを描き終えた
+/// あとにコックピット側で panic しても「コックピット」として拾える。
+fn draw_subview<R>(sv: Subview, f: impl FnOnce() -> R) -> R {
+    let prev = DRAWING_SUBVIEW.with(|c| c.borrow_mut().replace(sv));
+    let out = f();
+    DRAWING_SUBVIEW.with(|c| *c.borrow_mut() = prev);
+    out
+}
+
+/// 残っている印を取り出して消す。
+fn take_drawing_subview() -> Option<Subview> {
+    DRAWING_SUBVIEW.with(|c| c.borrow_mut().take())
+}
+
+/// panic のペイロードから人が読めるメッセージを取り出す。
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    tr("原因不明の内部エラー")
+}
+
+/// panic のメッセージからモジュール名を拾って犯人を推測する。
+///
+/// 印 (`DRAWING_SUBVIEW`) が取れなかったときの保険。`src/terminal.rs:...` の
+/// ような位置情報がメッセージに混ざっていれば、そこから領域を割り出す。
+fn subview_from_panic_message(msg: &str) -> Option<Subview> {
+    /// モジュール名 → 隔離できる領域
+    const MAP: &[(&str, &str)] = &[
+        ("terminal", "terminal"),
+        ("editor", "editor"),
+        ("file_tree", "sidebar"),
+        ("git_panel", "sidebar"),
+        ("agents", "cockpit"),
+    ];
+    for (module, panel) in MAP {
+        // 位置情報の形 (`src/foo.rs` / `foo.rs:12:3`) のときだけ採る。
+        // ただのメッセージ中の単語で誤爆しないようにするため。
+        if msg.contains(&format!("src/{module}.rs")) || msg.contains(&format!("{module}.rs:")) {
+            return Some(Subview::Panel(panel));
+        }
+    }
+    None
+}
+
+/// フレームガードの状態: 頻度ポリシー + 隔離中の領域 + 画面に出す警告。
+#[derive(Debug)]
+struct FrameGuard {
+    policy: FramePanicPolicy,
+    /// 描画から外している部分ビュー
+    quarantined: HashSet<Subview>,
+    /// 画面上部に出す警告 (None なら出さない)
+    banner: Option<String>,
+    /// 単調時計の原点 (テストしやすいよう ms を引数で回すため)
+    epoch: Instant,
+}
+
+impl Default for FrameGuard {
+    fn default() -> Self {
+        Self {
+            policy: FramePanicPolicy::default(),
+            quarantined: HashSet::new(),
+            banner: None,
+            epoch: Instant::now(),
+        }
+    }
+}
+
+impl FrameGuard {
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// 1 フレームの結果を食わせ、判断を返す。隔離なら犯人を隔離リストへ入れる。
+    fn observe(
+        &mut self,
+        outcome: FrameOutcome,
+        culprit: Option<Subview>,
+        now_ms: u64,
+    ) -> FrameGuardAction {
+        let act = self.policy.record(outcome, now_ms);
+        if act == FrameGuardAction::Quarantine {
+            if let Some(sv) = culprit {
+                self.quarantined.insert(sv);
+            }
+        }
+        act
+    }
+
+    fn is_quarantined(&self, sv: &Subview) -> bool {
+        self.quarantined.contains(sv)
+    }
+
+    /// 利用者が「再試行」を押したとき: 隔離を解いて頻度の記憶もまっさらにする。
+    fn reset(&mut self) {
+        self.policy = FramePanicPolicy::default();
+        self.quarantined.clear();
+        self.banner = None;
+    }
+}
+
 pub struct ZaivernApp {
     cfg: Config,
     theme: Theme,
@@ -517,9 +941,10 @@ pub struct ZaivernApp {
     panel_last_run: HashMap<(String, String), Instant>,
     /// startup フックを起動済みか(初回フレーム後に一度だけ走らせる)
     startup_hooks_done: bool,
-    /// 連続してフレームが panic した回数 (update のパニックガード用)。
-    /// 1 フレーム完走するたびに 0 へ戻る。
-    frame_panics: u32,
+    /// フレームの panic を見張る番人 (頻度ポリシー・隔離・警告バナー)。
+    frame_guard: FrameGuard,
+    /// ネイティブファイルダイアログの実行中ジョブ (UI スレッドを止めないため)。
+    dialogs: DialogJobs,
     /// 直近に観測した git ブランチ名(git_change フックの検知用)
     hook_git_branch: Option<String>,
     /// 起動待ちのフック(egui の Context が要るので update で消化する)
@@ -880,7 +1305,8 @@ impl ZaivernApp {
             hook_last_run: HashMap::new(),
             panel_last_run: HashMap::new(),
             startup_hooks_done: false,
-            frame_panics: 0,
+            frame_guard: FrameGuard::default(),
+            dialogs: DialogJobs::default(),
             hook_git_branch: None,
             pending_hooks: Vec::new(),
             plugins_tab_was_open: false,
@@ -2671,6 +3097,17 @@ impl ZaivernApp {
     }
 
     fn save_active(&mut self, as_new: bool) -> bool {
+        self.save_active_with(as_new, false, false)
+    }
+
+    /// `save_active` に「保存後の追加動作」を添えた版。
+    ///
+    /// `close_after` / `run_hooks` は、保存先を尋ねるダイアログが**別スレッド**へ
+    /// 回されたときのための控え。その場合このフレームでは何も保存していないので
+    /// `false` を返し、結果が届いた時点で `apply_dialog_result` が同じ追加動作を行う。
+    /// 同期でダイアログを開く macOS では従来どおり呼び出し元が追加動作をやるため、
+    /// 二重には走らない (`request_dialog` の説明を参照)。
+    fn save_active_with(&mut self, as_new: bool, close_after: bool, run_hooks: bool) -> bool {
         let Some(i) = self.editor.active else {
             return false;
         };
@@ -2680,22 +3117,31 @@ impl ZaivernApp {
             self.toast(tr("このタブは読み取り専用です (保存できません)"), false);
             return false;
         }
-        let (need_dialog, cur_path) = {
+        let (need_dialog, cur_path, buffer_id) = {
             let b = &self.editor.buffers[i];
-            (as_new || b.path.is_none(), b.path.clone())
+            (as_new || b.path.is_none(), b.path.clone(), b.id)
         };
         let path = if need_dialog {
-            match rfd::FileDialog::new()
-                .set_directory(self.primary_root())
-                .save_file()
-            {
+            let dir = self.primary_root().to_path_buf();
+            let purpose = DialogPurpose::SaveAs {
+                buffer_id,
+                close_after,
+                run_hooks,
+            };
+            match self.request_dialog(purpose, DialogSpec::save_file().directory(dir)) {
+                // その場で選ばれた (macOS の同期パス)
                 Some(p) => p,
+                // キャンセル、または別スレッドで進行中 — どちらも今は何もしない
                 None => return false,
             }
         } else {
             cur_path.unwrap()
         };
+        self.save_buffer_to(i, path)
+    }
 
+    /// バッファ `i` を `path` へ書き出して後始末する。成功したら true。
+    fn save_buffer_to(&mut self, i: usize, path: PathBuf) -> bool {
         let text = self.editor.buffers[i].text.clone();
         // 読み込んだときの文字コードで書き戻す (CP932 のファイルを勝手に UTF-8 に
         // しない)。元の符号化で表せない文字が入っていたときだけ UTF-8 へ格上げし、
@@ -2735,6 +3181,125 @@ impl ZaivernApp {
             Err(e) => {
                 self.toast(trf("保存に失敗しました: {e}", &[("e", e.to_string())]), false);
                 false
+            }
+        }
+    }
+
+    /// ネイティブのファイルダイアログを要求する。
+    ///
+    /// 返り値が `Some(path)` になるのは **macOS だけ** (その場で開いて待つ)。
+    /// Windows / Linux では常に `None` を返し、結果は後続フレームの
+    /// `poll_dialogs` → `apply_dialog_result` へ届く。
+    ///
+    /// なぜ OS で分けるか:
+    /// * **Windows / Linux**: UI スレッドで同期ダイアログを開くと、winit の
+    ///   イベントループの内側で OS のモーダルループが回る。エージェント (PTY) の
+    ///   リーダースレッドが撃つ `request_repaint` が再入で届き、ウィンドウが
+    ///   再描画されないまま固まる (画面が崩れて操作不能)。スレッドへ逃がす。
+    /// * **macOS**: AppKit のパネル (NSOpenPanel/NSSavePanel) はメインスレッド
+    ///   専用で、別スレッドから開くと落ちる。そもそもこの固まり方をしないので、
+    ///   従来どおり同期で開く。
+    fn request_dialog(&mut self, purpose: DialogPurpose, spec: DialogSpec) -> Option<PathBuf> {
+        if cfg!(target_os = "macos") {
+            return run_file_dialog(&spec);
+        }
+        let Some(tx) = self.dialogs.begin(purpose.kind()) else {
+            // 同じ用途のダイアログがもう開いている — 二重には開かない
+            return None;
+        };
+        std::thread::spawn(move || {
+            let path = run_file_dialog(&spec);
+            // 受け手が消えていても (ウィンドウを閉じた等) 落ちないよう握り潰す
+            let _ = tx.send(DialogOutcome { purpose, path });
+        });
+        None
+    }
+
+    /// ダイアログを要求し、その場で結果が返った場合 (macOS) はすぐ適用する。
+    fn ask_dialog(&mut self, purpose: DialogPurpose, spec: DialogSpec, ctx: &egui::Context) {
+        if let Some(p) = self.request_dialog(purpose.clone(), spec) {
+            self.apply_dialog_result(purpose, p, ctx);
+        }
+    }
+
+    /// 別スレッドのダイアログから返ってきた結果を取り込む。
+    fn poll_dialogs(&mut self, ctx: &egui::Context) {
+        while let Some(out) = self.dialogs.poll() {
+            // キャンセル (path=None) は従来どおり「何もしない」
+            if let Some(p) = out.path {
+                self.apply_dialog_result(out.purpose, p, ctx);
+            }
+        }
+        if self.dialogs.busy() {
+            // 待っている間は少し速く回して、選ばれた瞬間に反応できるようにする
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    /// ダイアログでパスが選ばれたときの処理。
+    /// 同期で開く macOS も、スレッドから返る Windows/Linux も同じここを通る。
+    fn apply_dialog_result(&mut self, purpose: DialogPurpose, path: PathBuf, ctx: &egui::Context) {
+        match purpose {
+            DialogPurpose::OpenFile => {
+                self.open_path(&path);
+                self.touch_recent_file(&path);
+            }
+            DialogPurpose::NewWindowFolder => self.spawn_new_window(Some(path)),
+            DialogPurpose::OpenFolder => self.open_workspace(path, ctx),
+            DialogPurpose::AddFolder => self.add_folder_to_workspace(path, ctx),
+            DialogPurpose::PetImage => match load_pet_texture(ctx, &path) {
+                Some(tex) => {
+                    self.pet_tex = Some(tex);
+                    self.cfg.pet_image = Some(path.to_string_lossy().to_string());
+                    self.cfg.show_pet = true;
+                    self.cfg.global_show_pet = true;
+                    config::save_state(&self.cfg);
+                    self.toast(tr("🖼 ペット画像を変更しました"), true);
+                }
+                None => self.toast(tr("画像を読み込めませんでした"), false),
+            },
+            DialogPurpose::InstallPlugin => match plugins::install(&path) {
+                Ok(p) => {
+                    let msg = trf(
+                        "📦 {name} v{version} をインストールしました(コマンド{commands} / テーマ{themes} / スニペット{snippets})",
+                        &[
+                            ("name", p.name.clone()),
+                            ("version", p.version.clone()),
+                            ("commands", p.commands.len().to_string()),
+                            ("themes", p.themes.len().to_string()),
+                            ("snippets", p.snippet_files.len().to_string()),
+                        ],
+                    );
+                    self.rebuild_plugins();
+                    self.sidebar_open = true;
+                    self.sidebar_tab = SidebarTab::Plugins;
+                    self.toast(msg, true);
+                }
+                Err(e) => self.toast(
+                    trf("インストール失敗: {e}", &[("e", e.to_string())]),
+                    false,
+                ),
+            },
+            DialogPurpose::SaveAs {
+                buffer_id,
+                close_after,
+                run_hooks,
+            } => {
+                // ダイアログを開いている間にタブが閉じられている可能性がある
+                let Some(i) = self.editor.buffers.iter().position(|b| b.id == buffer_id) else {
+                    self.toast(tr("保存先のタブが見つかりません (閉じられました)"), false);
+                    return;
+                };
+                if self.save_buffer_to(i, path) {
+                    self.persist_session();
+                    if run_hooks {
+                        self.run_on_save_hooks(i, ctx);
+                    }
+                    if close_after {
+                        self.editor.close(i);
+                        self.persist_session();
+                    }
+                }
             }
         }
     }
@@ -3180,7 +3745,9 @@ impl ZaivernApp {
     fn apply_cmd_file(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
             Cmd::Save => {
-                if self.save_active(false) {
+                // 保存先を尋ねる場合 (未保存の新規タブ) はダイアログが別スレッドへ
+                // 回るので、保存後の追加動作をフラグで預けておく
+                if self.save_active_with(false, false, true) {
                     self.persist_session();
                     if let Some(i) = self.editor.active {
                         self.run_on_save_hooks(i, ctx);
@@ -3188,7 +3755,7 @@ impl ZaivernApp {
                 }
             }
             Cmd::SaveAs => {
-                if self.save_active(true) {
+                if self.save_active_with(true, false, true) {
                     self.persist_session();
                     if let Some(i) = self.editor.active {
                         self.run_on_save_hooks(i, ctx);
@@ -3202,13 +3769,12 @@ impl ZaivernApp {
             }
             // ── VS Code 準拠メニューバー (menu_bar.rs) ──────────────
             Cmd::OpenFileDialog => {
-                if let Some(p) = rfd::FileDialog::new()
-                    .set_directory(self.primary_root())
-                    .pick_file()
-                {
-                    self.open_path(&p);
-                    self.touch_recent_file(&p);
-                }
+                let dir = self.primary_root().to_path_buf();
+                self.ask_dialog(
+                    DialogPurpose::OpenFile,
+                    DialogSpec::pick_file().directory(dir),
+                    ctx,
+                );
             }
             Cmd::OpenRecentFolder(p) => {
                 self.open_workspace(p.clone(), ctx);
@@ -3395,28 +3961,28 @@ impl ZaivernApp {
             Cmd::NewFile => self.editor.new_untitled(),
             Cmd::NewWindow => self.spawn_new_window(None),
             Cmd::NewWindowFolder => {
-                if let Some(dir) = rfd::FileDialog::new()
-                    .set_directory(self.primary_root())
-                    .pick_folder()
-                {
-                    self.spawn_new_window(Some(dir));
-                }
+                let dir = self.primary_root().to_path_buf();
+                self.ask_dialog(
+                    DialogPurpose::NewWindowFolder,
+                    DialogSpec::pick_folder().directory(dir),
+                    ctx,
+                );
             }
             Cmd::OpenFolder => {
-                if let Some(dir) = rfd::FileDialog::new()
-                    .set_directory(self.primary_root())
-                    .pick_folder()
-                {
-                    self.open_workspace(dir, ctx);
-                }
+                let dir = self.primary_root().to_path_buf();
+                self.ask_dialog(
+                    DialogPurpose::OpenFolder,
+                    DialogSpec::pick_folder().directory(dir),
+                    ctx,
+                );
             }
             Cmd::AddFolder => {
-                if let Some(dir) = rfd::FileDialog::new()
-                    .set_directory(self.primary_root())
-                    .pick_folder()
-                {
-                    self.add_folder_to_workspace(dir, ctx);
-                }
+                let dir = self.primary_root().to_path_buf();
+                self.ask_dialog(
+                    DialogPurpose::AddFolder,
+                    DialogSpec::pick_folder().directory(dir),
+                    ctx,
+                );
             }
             Cmd::AddFolderPath(dir) => {
                 if dir.is_dir() {
@@ -3757,22 +4323,12 @@ impl ZaivernApp {
                 }
             }
             Cmd::SetPetImage => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(tr("画像"), &["png", "jpg", "jpeg", "gif", "webp"])
-                    .pick_file()
-                {
-                    match load_pet_texture(ctx, &path) {
-                        Some(tex) => {
-                            self.pet_tex = Some(tex);
-                            self.cfg.pet_image = Some(path.to_string_lossy().to_string());
-                            self.cfg.show_pet = true;
-                            self.cfg.global_show_pet = true;
-                            config::save_state(&self.cfg);
-                            self.toast(tr("🖼 ペット画像を変更しました"), true);
-                        }
-                        None => self.toast(tr("画像を読み込めませんでした"), false),
-                    }
-                }
+                self.ask_dialog(
+                    DialogPurpose::PetImage,
+                    DialogSpec::pick_file()
+                        .filter(tr("画像"), &["png", "jpg", "jpeg", "gif", "webp"]),
+                    ctx,
+                );
             }
             Cmd::ResetPetImage => {
                 self.pet_tex = None;
@@ -3901,30 +4457,12 @@ impl ZaivernApp {
                 }
             }
             Cmd::InstallPlugin => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter(tr("Zaivern プラグイン"), &["zvplug", "zip"])
-                    .pick_file()
-                {
-                    match plugins::install(&path) {
-                        Ok(p) => {
-                            let msg = trf(
-                                "📦 {name} v{version} をインストールしました(コマンド{commands} / テーマ{themes} / スニペット{snippets})",
-                                &[
-                                    ("name", p.name.clone()),
-                                    ("version", p.version.clone()),
-                                    ("commands", p.commands.len().to_string()),
-                                    ("themes", p.themes.len().to_string()),
-                                    ("snippets", p.snippet_files.len().to_string()),
-                                ],
-                            );
-                            self.rebuild_plugins();
-                            self.sidebar_open = true;
-                            self.sidebar_tab = SidebarTab::Plugins;
-                            self.toast(msg, true);
-                        }
-                        Err(e) => self.toast(trf("インストール失敗: {e}", &[("e", e.to_string())]), false),
-                    }
-                }
+                self.ask_dialog(
+                    DialogPurpose::InstallPlugin,
+                    DialogSpec::pick_file()
+                        .filter(tr("Zaivern プラグイン"), &["zvplug", "zip"]),
+                    ctx,
+                );
             }
             Cmd::RescanPlugins => {
                 self.rebuild_plugins();
@@ -6760,8 +7298,15 @@ impl ZaivernApp {
                                     ui.vertical(|ui| {
                                     ui.set_width(cell_w - 18.0);
                                     ui.set_height(cell_h - 18.0);
+                                    // このタイルが隔離中かは、セッションを可変で
+                                    // 借りる前に確かめておく (借用の都合)。
+                                    let sid = self.agents.sessions[i].id;
+                                    let tile_dead = self
+                                        .frame_guard
+                                        .is_quarantined(&Subview::Session(sid));
+                                    let (err_col, dim_col) =
+                                        (self.theme.err, self.theme.text_dim);
                                     let s = &mut self.agents.sessions[i];
-                                    let sid = s.id;
                                     ui.horizontal(|ui| {
                                         let dot = if s.running() {
                                             if s.attention {
@@ -6872,9 +7417,22 @@ impl ZaivernApp {
                                             },
                                         );
                                     });
-                                    let term = terminal::draw(
-                                        ui, s, theme, mini_font, true, true, false,
-                                    );
+                                    // 隔離中のタイルは描かない。1 枚が壊れている
+                                    // だけでフレーム全体を捨てると、他のエージェント
+                                    // まで固まって見えてしまうため、ここだけ外す。
+                                    if tile_dead {
+                                        Self::quarantine_placeholder_ui(
+                                            ui,
+                                            &Subview::Session(sid).label(),
+                                            err_col,
+                                            dim_col,
+                                        );
+                                    } else {
+                                    let term = draw_subview(Subview::Session(sid), || {
+                                        terminal::draw(
+                                            ui, s, theme, mini_font, true, true, false,
+                                        )
+                                    });
                                     // ミニターミナルをクリックして入力を始めた
                                     // セッションへ、アクティブ (紫枠) を追従させる。
                                     if term.clicked()
@@ -6882,6 +7440,7 @@ impl ZaivernApp {
                                         || term.gained_focus()
                                     {
                                         acts.select = Some(i);
+                                    }
                                     }
                                     });
                                 });
@@ -9085,7 +9644,9 @@ impl ZaivernApp {
         match decided {
             Some(0) => {
                 self.editor.active = Some(i);
-                if self.save_active(false) {
+                // 保存先を尋ねる (未保存タブ) 場合はダイアログが別スレッドへ回るので、
+                // 「保存できたら閉じる」を控えとして預ける
+                if self.save_active_with(false, true, false) {
                     self.editor.close(i);
                 }
                 self.pending_close = None;
@@ -11239,6 +11800,100 @@ impl ZaivernApp {
         let carried = self.typed_voice.remove(&id).unwrap_or(false);
         live || carried
     }
+
+    // ── フレームガード: 部分ビューの隔離と警告バナー ──────────────────
+
+    /// 部分ビューを「いま描いている場所」の印付きで描く。
+    /// 隔離中なら描かない (理由は上部のバナーが説明している)。
+    fn guarded_view(&mut self, sv: Subview, draw: impl FnOnce(&mut Self)) {
+        if self.frame_guard.is_quarantined(&sv) {
+            return;
+        }
+        draw_subview(sv, || draw(self));
+    }
+
+    /// `guarded_view` の `Ui` 版。隔離中は代わりに説明を出す
+    /// (領域が確保されているので、真っ黒な穴を残さないため)。
+    fn guarded_ui(
+        &mut self,
+        sv: Subview,
+        ui: &mut egui::Ui,
+        draw: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
+        if self.frame_guard.is_quarantined(&sv) {
+            let (err, dim) = (self.theme.err, self.theme.text_dim);
+            Self::quarantine_placeholder_ui(ui, &sv.label(), err, dim);
+            return;
+        }
+        draw_subview(sv, || draw(self, ui));
+    }
+
+    /// 隔離した領域の代わりに出す説明。
+    fn quarantine_placeholder_ui(
+        ui: &mut egui::Ui,
+        label: &str,
+        err: Color32,
+        dim: Color32,
+    ) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(24.0);
+            ui.label(RichText::new("⚠").size(28.0).color(err));
+            ui.label(
+                RichText::new(trf(
+                    "{where} の表示を停止しました",
+                    &[("where", label.to_string())],
+                ))
+                .color(err),
+            );
+            ui.label(
+                RichText::new(tr(
+                    "内部エラーが繰り返し起きたため描画から外しています。\n\
+                     詳細は ~/.zaivern/panic.log を見てください。",
+                ))
+                .size(11.5)
+                .color(dim),
+            );
+        });
+    }
+
+    /// 内部エラーの警告バナー (画面最上部)。隔離が起きたときだけ出る。
+    fn frame_error_banner_ui(&mut self, ctx: &egui::Context) {
+        let Some(msg) = self.frame_guard.banner.clone() else {
+            return;
+        };
+        let (bg, fg) = (self.theme.panel_alt, self.theme.err);
+        let mut retry = false;
+        let mut dismiss = false;
+        egui::TopBottomPanel::top("zv-frame-error")
+            .frame(
+                egui::Frame::none()
+                    .fill(bg)
+                    .inner_margin(egui::Margin::symmetric(10.0, 6.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(msg).color(fg).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button(tr("閉じる")).clicked() {
+                            dismiss = true;
+                        }
+                        if ui
+                            .small_button(tr("再試行"))
+                            .on_hover_text(tr("隔離を解いて描画をやり直します"))
+                            .clicked()
+                        {
+                            retry = true;
+                        }
+                    });
+                });
+            });
+        if retry {
+            self.frame_guard.reset();
+        } else if dismiss {
+            // 隔離はそのまま (解くと崩れが戻るため)。表示だけ引っ込める
+            self.frame_guard.banner = None;
+        }
+    }
 }
 
 impl eframe::App for ZaivernApp {
@@ -11248,26 +11903,61 @@ impl eframe::App for ZaivernApp {
         // 利用者には「作業中にいきなり落ちた」に見える (実行中のエージェント
         // も全部道連れ)。ここで捕捉して「1 フレーム捨てる」に格下げする。
         // 詳細は panic フック (main.rs) が ~/.zaivern/panic.log へ残す。
-        // 連続で panic し続けるなら本当に壊れているので、3 回で従来どおり
-        // 落とす (poison された Mutex 等による永久パニック嵐を避ける)。
+        //
+        // ただし「捨てて続ける」だけでは足りない。**たまに成功する** panic
+        // (panic → ok → panic → ok …) は、以前の「完走したらカウンタを 0」
+        // では永久に検知できず、半分だけ組み立てた画面を延々と描き続けた
+        // (= 画面が崩れて操作できない、しかも落ちない)。
+        // いまは時間窓で頻度を見て、収まらなければ犯人の部分ビューを隔離し、
+        // それでも駄目なら最後の手段として従来どおり落とす (`FramePanicPolicy`)。
+        let _ = take_drawing_subview(); // 前フレームの印が残っていたら捨てる
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.update_impl(ctx, frame);
         }));
+        let now_ms = self.frame_guard.now_ms();
         match ok {
-            Ok(()) => self.frame_panics = 0,
+            Ok(()) => {
+                let _ = take_drawing_subview();
+                self.frame_guard.observe(FrameOutcome::Ok, None, now_ms);
+            }
             Err(payload) => {
-                self.frame_panics += 1;
-                if self.frame_panics >= 3 {
-                    std::panic::resume_unwind(payload);
-                }
+                let msg = panic_message(&*payload);
+                // 犯人はまず「描いている途中の印」から。取れなければ
+                // panic メッセージに混ざった位置情報から推測する。
+                let culprit =
+                    take_drawing_subview().or_else(|| subview_from_panic_message(&msg));
+                let action =
+                    self.frame_guard
+                        .observe(FrameOutcome::Panic, culprit.clone(), now_ms);
                 eprintln!(
-                    "zaivern: frame panicked ({}/3) — skipping this frame \
-                     (details: ~/.zaivern/panic.log)",
-                    self.frame_panics
+                    "zaivern: frame panicked ({action:?}, culprit={culprit:?}) — {msg} \
+                     (details: ~/.zaivern/panic.log)"
                 );
-                self.toast_warn(tr(
-                    "⚠ 内部エラーが起きました。継続します (詳細: ~/.zaivern/panic.log)",
-                ));
+                match action {
+                    FrameGuardAction::Abort => std::panic::resume_unwind(payload),
+                    FrameGuardAction::Quarantine => {
+                        let where_ = culprit
+                            .as_ref()
+                            .map(|c| c.label())
+                            .unwrap_or_else(|| tr("不明な場所"));
+                        let banner = if culprit.is_some() {
+                            trf(
+                                "⚠ {where} で内部エラーが繰り返し起きています。\
+                                 壊れた部分の描画を止めました (詳細: ~/.zaivern/panic.log)",
+                                &[("where", where_)],
+                            )
+                        } else {
+                            tr("⚠ 内部エラーが繰り返し起きています。原因の場所を特定できませんでした (詳細: ~/.zaivern/panic.log)")
+                        };
+                        self.toast_warn(banner.clone());
+                        self.frame_guard.banner = Some(banner);
+                    }
+                    FrameGuardAction::Continue => {
+                        self.toast_warn(tr(
+                            "⚠ 内部エラーが起きました。継続します (詳細: ~/.zaivern/panic.log)",
+                        ));
+                    }
+                }
                 ctx.request_repaint();
             }
         }
@@ -11296,6 +11986,9 @@ impl ZaivernApp {
     fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 壊れたネイティブ全画面の検知と疑似フルスクリーンへの救出 (macOS)
         self.fullscreen_guard(ctx);
+        // 内部エラーの警告バナーは**最初に**描く。フレームの途中で panic しても
+        // ここまでは描き終わっているので、崩れた画面でも理由が読める。
+        self.frame_error_banner_ui(ctx);
         // 低頻度の定期フレームを必ず予約しておく。
         //
         // スマホリモートと CLI (`zai notify` など) からの要求は、UI スレッドが
@@ -11317,6 +12010,8 @@ impl ZaivernApp {
         // 定義ジャンプ (F12) の LSP 応答と、ファイル横断検索の結果を取り込む
         self.poll_definition_result();
         self.poll_global_search();
+        // 別スレッドで開いているファイルダイアログの結果を取り込む
+        self.poll_dialogs(ctx);
         // 自動保存 (メニュー: ファイル > 自動保存)
         self.autosave_tick();
         // メニュー関連の小窓 (行/列へ移動・問題・ショートカット一覧・バージョン情報)
@@ -11592,8 +12287,10 @@ impl ZaivernApp {
 
         self.top_bar(ctx);
         self.status_bar(ctx);
-        self.sidebar(ctx);
-        self.terminal_panel(ctx);
+        // 大きな領域は「いま描いている場所」の印を付けて描く。フレームが
+        // panic したときに犯人を特定して、そこだけ隔離できるようにするため。
+        self.guarded_view(Subview::Panel("sidebar"), |me| me.sidebar(ctx));
+        self.guarded_view(Subview::Panel("terminal"), |me| me.terminal_panel(ctx));
 
         let theme_bg = self.theme.bg;
         egui::CentralPanel::default()
@@ -11606,7 +12303,9 @@ impl ZaivernApp {
                     // ファイルを開いていれば左に編集ペインを並べて出す。
                     // Cockpit との切り替え無しでファイルが見えるようにするため。
                     if self.editor.buffers.is_empty() {
-                        self.cockpit_ui(ui, &ctx);
+                        self.guarded_ui(Subview::Panel("cockpit"), ui, |me, ui| {
+                            me.cockpit_ui(ui, &ctx)
+                        });
                     } else {
                         let avail = ui.available_width();
                         egui::SidePanel::left("cockpit-editor-split")
@@ -11615,13 +12314,21 @@ impl ZaivernApp {
                             .default_width((avail * 0.42).max(280.0))
                             .min_width(220.0)
                             .max_width(avail * 0.75)
-                            .show_inside(ui, |ui| self.editor_area(ui));
+                            .show_inside(ui, |ui| {
+                                self.guarded_ui(Subview::Panel("editor"), ui, |me, ui| {
+                                    me.editor_area(ui)
+                                })
+                            });
                         egui::CentralPanel::default()
                             .frame(egui::Frame::none().fill(theme_bg))
-                            .show_inside(ui, |ui| self.cockpit_ui(ui, &ctx));
+                            .show_inside(ui, |ui| {
+                                self.guarded_ui(Subview::Panel("cockpit"), ui, |me, ui| {
+                                    me.cockpit_ui(ui, &ctx)
+                                })
+                            });
                     }
                 } else {
-                    self.editor_area(ui);
+                    self.guarded_ui(Subview::Panel("editor"), ui, |me, ui| me.editor_area(ui));
                 }
             });
 
@@ -13198,6 +13905,273 @@ mod tests {
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir -p");
         std::fs::write(path, body).expect("write file");
+    }
+
+    // ── フレームガードの panic ポリシー ────────────────────────────
+
+    use FrameGuardAction::{Abort, Continue, Quarantine};
+    use FrameOutcome::{Ok as F_OK, Panic as F_PANIC};
+
+    /// フレーム結果の並びを `step_ms` 間隔で流し込み、判断の並びを得る。
+    fn run_policy(seq: &[FrameOutcome], step_ms: u64) -> Vec<FrameGuardAction> {
+        let mut p = FramePanicPolicy::default();
+        seq.iter()
+            .enumerate()
+            .map(|(i, o)| p.record(*o, i as u64 * step_ms))
+            .collect()
+    }
+
+    /// 「panic / ok」を `pairs` 組ならべる (今日の実装が永久ループする形)。
+    fn flapping(pairs: usize) -> Vec<FrameOutcome> {
+        (0..pairs).flat_map(|_| [F_PANIC, F_OK]).collect()
+    }
+
+    /// DoD: フレームの panic ポリシーは表で決まる。
+    ///
+    /// とくに **panic → ok → panic → ok …** (たまに成功する panic) が
+    /// 永久に「半分だけ描いた画面」を作り続けないこと。
+    /// 旧実装は 1 フレーム完走するたびにカウンタが 0 に戻るため、
+    /// この形を永久に検知できなかった。
+    #[test]
+    fn frame_panic_policy_table() {
+        // (名前, 入力, フレーム間隔 ms, 期待する判断の並び)
+        let table: Vec<(&str, Vec<FrameOutcome>, u64, Vec<FrameGuardAction>)> = vec![
+            (
+                "健全: 完走だけならいつまでも継続",
+                vec![F_OK; 1000],
+                16,
+                vec![Continue; 1000],
+            ),
+            (
+                "単発 panic は隔離まで上げない",
+                vec![F_OK, F_PANIC, F_OK, F_OK],
+                16,
+                vec![Continue, Continue, Continue, Continue],
+            ),
+            (
+                "3 連続 panic は従来どおり即中止",
+                vec![F_PANIC, F_PANIC, F_PANIC, F_OK],
+                16,
+                vec![Continue, Continue, Abort, Continue],
+            ),
+            (
+                "2 連続で止まれば中止しない",
+                vec![F_PANIC, F_PANIC, F_OK, F_OK],
+                16,
+                vec![Continue, Continue, Continue, Continue],
+            ),
+            (
+                "時間窓を跨いだ panic は減衰して数えない (数時間動かしても落ちない)",
+                vec![F_PANIC, F_OK, F_PANIC, F_OK, F_PANIC, F_OK],
+                60_000,
+                vec![Continue; 6],
+            ),
+            (
+                "ちらつく panic: 3 回目で隔離へ上げる",
+                flapping(3),
+                16,
+                vec![Continue, Continue, Continue, Continue, Quarantine, Continue],
+            ),
+        ];
+        for (name, seq, step, want) in table {
+            assert_eq!(run_policy(&seq, step), want, "{name}");
+        }
+    }
+
+    /// DoD: 隔離しても収まらないちらつき panic は、最後の手段として中止へ落ちる
+    /// = 崩れた画面を延々と描き続けることは絶対にない。
+    #[test]
+    fn frame_panic_policy_flapping_eventually_aborts() {
+        let seq = flapping(40);
+        let got = run_policy(&seq, 16);
+        let first_q = got.iter().position(|a| *a == Quarantine);
+        assert_eq!(first_q, Some(4), "3 回目の panic (添字 4) で隔離へ上げる");
+        let abort = got.iter().position(|a| *a == Abort).expect("いつかは中止する");
+        // 隔離 3 回 (= panic 9 回) までは粘り、その先で諦める
+        assert!(
+            (18..=24).contains(&abort),
+            "隔離を {} 回試してから中止する想定 (中止位置={abort})",
+            FRAME_PANIC_MAX_QUARANTINES
+        );
+        assert_eq!(
+            got.iter().filter(|a| **a == Quarantine).count(),
+            FRAME_PANIC_MAX_QUARANTINES as usize,
+            "中止までに出す隔離の回数は上限どおり"
+        );
+    }
+
+    /// DoD: 長く安定したら隔離回数の記憶も捨てる (無関係な panic の積み上げで
+    /// ある日いきなり落ちる、を防ぐ)。
+    #[test]
+    fn frame_panic_policy_forgets_after_long_calm() {
+        let mut p = FramePanicPolicy::default();
+        // ちらつきで隔離まで上げる
+        for i in 0..5 {
+            p.record(if i % 2 == 0 { F_PANIC } else { F_OK }, i as u64 * 16);
+        }
+        assert_eq!(p.quarantines, 1);
+        // 十分に長く完走し続ける
+        let base = 100_000;
+        for i in 0..FRAME_CLEAN_STREAK_RESET {
+            p.record(F_OK, base + i as u64 * 16);
+        }
+        assert_eq!(p.quarantines, 0, "落ち着いたら隔離の記憶は捨てる");
+        assert!(p.recent.is_empty(), "時間窓の panic も消えている");
+    }
+
+    /// DoD: 印が取れないときは panic メッセージの位置情報から犯人を推測する。
+    #[test]
+    fn panic_message_attribution() {
+        assert_eq!(
+            subview_from_panic_message("index out of bounds at src/terminal.rs:42:9"),
+            Some(Subview::Panel("terminal"))
+        );
+        assert_eq!(
+            subview_from_panic_message("file_tree.rs:7:1: unwrap on None"),
+            Some(Subview::Panel("sidebar"))
+        );
+        // ただの単語では誤爆しない (位置情報の形のときだけ拾う)
+        assert_eq!(subview_from_panic_message("terminal is busy"), None);
+        assert_eq!(subview_from_panic_message(""), None);
+    }
+
+    /// DoD: 印 (パンくず) は panic すると残り、完走すると消える。
+    #[test]
+    fn drawing_subview_breadcrumb_survives_panic() {
+        let _ = take_drawing_subview();
+        // 完走したら消える
+        draw_subview(Subview::Panel("editor"), || {});
+        assert_eq!(take_drawing_subview(), None);
+        // panic したら残る = 犯人が分かる
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            draw_subview(Subview::Session(7), || panic!("boom"));
+        }));
+        assert!(r.is_err());
+        assert_eq!(take_drawing_subview(), Some(Subview::Session(7)));
+        assert_eq!(take_drawing_subview(), None, "取り出したら消える");
+
+        // 入れ子: 内側が無事なら外側の印へ戻る (タイルの後にコックピットで
+        // 壊れたら「コックピット」として拾えること)
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            draw_subview(Subview::Panel("cockpit"), || {
+                draw_subview(Subview::Session(1), || {});
+                panic!("after the tile");
+            });
+        }));
+        assert!(r.is_err());
+        assert_eq!(take_drawing_subview(), Some(Subview::Panel("cockpit")));
+    }
+
+    /// DoD: 隔離の判断が出たときだけ、犯人が隔離リストへ入る。
+    #[test]
+    fn frame_guard_quarantines_only_the_culprit() {
+        let mut g = FrameGuard::default();
+        let victim = Subview::Session(3);
+        let other = Subview::Session(4);
+        // ちらつき: 3 回目の panic で隔離
+        let mut act = FrameGuardAction::Continue;
+        for i in 0..5u64 {
+            let outcome = if i % 2 == 0 { F_PANIC } else { F_OK };
+            act = g.observe(outcome, Some(victim.clone()), i * 16);
+        }
+        assert_eq!(act, Quarantine);
+        assert!(g.is_quarantined(&victim), "犯人だけ描画から外す");
+        assert!(!g.is_quarantined(&other), "巻き添えにしない");
+        // 「再試行」で元へ戻る
+        g.reset();
+        assert!(!g.is_quarantined(&victim));
+        assert!(g.banner.is_none());
+    }
+
+    // ── ファイルダイアログのジョブ ─────────────────────────────────
+
+    /// DoD: ダイアログのジョブは 要求 → 実行中 (同じ用途の再要求は無視) →
+    /// 結果を適用 → idle、と一巡する。本物のダイアログは開かない。
+    #[test]
+    fn dialog_job_state_machine() {
+        let mut jobs = DialogJobs::new();
+        assert!(jobs.poll().is_none(), "idle では取り出すものが無い");
+        assert!(!jobs.busy());
+
+        // 要求 → 受理
+        let tx = jobs.begin(DialogKind::OpenFile).expect("最初の要求は受理される");
+        assert!(jobs.busy());
+        // 実行中: 同じ用途の再要求は無視 (二重に開かない)
+        assert!(
+            jobs.begin(DialogKind::OpenFile).is_none(),
+            "同じ用途の二重オープンは無視する"
+        );
+        // 別の用途は同時に開ける
+        let tx2 = jobs.begin(DialogKind::OpenFolder).expect("別用途は独立");
+
+        // 結果が届く → 取り出せて、その用途だけ待ちが解ける
+        tx.send(DialogOutcome {
+            purpose: DialogPurpose::OpenFile,
+            path: Some(PathBuf::from("/tmp/zv/a.txt")),
+        })
+        .expect("送信できる");
+        let out = jobs.poll().expect("結果が届く");
+        assert_eq!(out.purpose, DialogPurpose::OpenFile);
+        assert_eq!(out.path.as_deref(), Some(Path::new("/tmp/zv/a.txt")));
+        assert!(jobs.busy(), "もう一方はまだ開いている");
+        assert!(
+            jobs.begin(DialogKind::OpenFile).is_some(),
+            "受け取ったら同じ用途をまた開ける"
+        );
+
+        // キャンセル (path=None) — 待ちは解けるが、適用すべきパスは無い
+        tx2.send(DialogOutcome {
+            purpose: DialogPurpose::OpenFolder,
+            path: None,
+        })
+        .expect("送信できる");
+        let cancelled = jobs.poll().expect("キャンセルも結果として届く");
+        assert_eq!(cancelled.path, None, "キャンセルは何も適用しない");
+        assert!(
+            jobs.begin(DialogKind::OpenFolder).is_some(),
+            "キャンセル後も次を開ける"
+        );
+    }
+
+    /// DoD: 「名前を付けて保存」は添字ではなくバッファ ID を運ぶ
+    /// (ダイアログが開いている間にタブの並びが変わっても、正しいタブへ保存する)。
+    #[test]
+    fn save_as_dialog_carries_buffer_identity_and_follow_ups() {
+        let purpose = DialogPurpose::SaveAs {
+            buffer_id: 42,
+            close_after: true,
+            run_hooks: false,
+        };
+        assert_eq!(purpose.kind(), DialogKind::SaveAs);
+        // 用途キーは同じなので、保存ダイアログは常に 1 枚しか開かない
+        let other = DialogPurpose::SaveAs {
+            buffer_id: 7,
+            close_after: false,
+            run_hooks: true,
+        };
+        assert_eq!(other.kind(), purpose.kind());
+        let mut jobs = DialogJobs::new();
+        assert!(jobs.begin(purpose.kind()).is_some());
+        assert!(jobs.begin(other.kind()).is_none(), "保存ダイアログは 1 枚まで");
+    }
+
+    /// DoD: ダイアログの組み立て材料はスレッドへ送れる (Send) 素材だけを持つ。
+    #[test]
+    fn dialog_spec_is_sendable_and_builds_what_was_asked() {
+        fn assert_send<T: Send>(_: &T) {}
+        let spec = DialogSpec::pick_file()
+            .directory(PathBuf::from("/tmp/zv"))
+            .filter("画像", &["png", "webp"]);
+        assert_send(&spec);
+        assert_eq!(spec.mode, DialogMode::PickFile);
+        assert_eq!(spec.directory.as_deref(), Some(Path::new("/tmp/zv")));
+        assert_eq!(
+            spec.filter,
+            Some(("画像".to_string(), vec!["png".to_string(), "webp".to_string()]))
+        );
+        assert_eq!(DialogSpec::pick_folder().mode, DialogMode::PickFolder);
+        assert_eq!(DialogSpec::save_file().mode, DialogMode::SaveFile);
+        assert_send(&DialogPurpose::OpenFile);
     }
 
     /// DoD: エージェントは「直近に開いたフォルダ」で起動する。
