@@ -182,7 +182,16 @@ pub fn build_invocation(command: &str, spec: &AgentSpec) -> Result<(String, Vec<
         .next()
         .ok_or_else(|| "コマンドが空です".to_string())?
         .to_string();
-    let user_args: Vec<String> = toks.map(|s| s.to_string()).collect();
+    let mut user_args: Vec<String> = toks.map(|s| s.to_string()).collect();
+
+    // 対話 TUI 用の起動形 (`acli rovodev run` の `rovodev run` など) は、
+    // ヘッドレス形が同じサブコマンドを自前で置くので二重に付けてはいけない。
+    // 何を落とすかはカタログのデータ (`AgentSpec::launch_args`) だけが知っている。
+    let launch: Vec<&str> = spec.launch_args().split_whitespace().collect();
+    if !launch.is_empty() && user_args.len() >= launch.len() && user_args[..launch.len()] == launch[..]
+    {
+        user_args.drain(..launch.len());
+    }
 
     let headless = spec.headless.trim();
     if headless.is_empty() {
@@ -741,12 +750,26 @@ mod tests {
 
     #[test]
     fn real_catalog_agents_all_build() {
-        // カタログ全 CLI がヘッドレス形を持ち、組み立てに成功すること。
+        // ヘッドレス形を持つ CLI は必ず組み立てに成功すること。
+        // ヘッドレス実行フラグを持たない CLI (codebuff 等) は、フラグを捏造せず
+        // `headless: ""` のままなので、診断役の候補からは外れる (Err になる)。
         for spec in crate::agents::AGENT_CATALOG {
+            if spec.headless.trim().is_empty() {
+                assert!(
+                    build_invocation(spec.bin, spec).is_err(),
+                    "{}: ヘッドレス未対応なのに組み立てが通った",
+                    spec.bin
+                );
+                continue;
+            }
             let (p, a) = build_invocation(spec.bin, spec).expect(spec.bin);
             assert_eq!(p, spec.bin);
             assert!(!a.is_empty(), "{}: 引数が空", spec.bin);
             assert_ne!(a[0], spec.bin, "{}: 実行ファイル名が引数に残っている", spec.bin);
+            // 対話用の起動形 (`acli rovodev run` 等) から作っても、
+            // サブコマンドが二重に並ばないこと。
+            let (p2, a2) = build_invocation(&spec.launch_command(), spec).expect(spec.bin);
+            assert_eq!((p2, &a2), (p, &a), "{}: 起動形からだと引数が変わる", spec.bin);
         }
     }
 

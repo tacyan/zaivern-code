@@ -124,7 +124,41 @@ impl AgentSpec {
     pub fn resume_id_flag(&self) -> &'static str {
         session_entry(self.bin).map(|e| e.2).unwrap_or("")
     }
+
+    /// ID 指定再開はできるのに保存先を列挙できない理由。該当しなければ ""。
+    #[allow(dead_code)] // 一覧が空のときの説明文として UI へ出す予定
+    pub fn no_store_reason(&self) -> &'static str {
+        session_entry(self.bin).map(|e| e.3).unwrap_or("")
+    }
+
+    /// 実行ファイル名の直後に必ず要る引数 (`kiro-cli chat --tui` の `chat --tui` 等)。
+    /// 不要な CLI では ""。
+    pub fn launch_args(&self) -> &'static str {
+        launch_args_for(self.bin)
+    }
+
+    /// そのまま端末へ打てる起動コマンド。`launch_args` が無ければ `bin` と同じ。
+    pub fn launch_command(&self) -> String {
+        let args = self.launch_args();
+        if args.is_empty() {
+            self.bin.to_string()
+        } else {
+            format!("{} {args}", self.bin)
+        }
+    }
 }
+
+/// 「フラグ + 値」の 2 トークンで自動承認になる指定の表。
+///
+/// `--permission-mode bypassPermissions` のように値まで見ないと bypass か判定できない
+/// ものをここへ集める。`--flag=値` の 1 トークン形も同じ表から導く
+/// (ロジック側にフラグ名や値のリテラルを一切置かないため)。
+const TWO_TOKEN_BYPASS: &[(&str, &[&str])] = &[
+    // claude / devin / ante (`--permission-mode yolo`) / (orca 版) grok
+    ("--permission-mode", &["bypassPermissions", "bypass", "yolo"]),
+    // gemini / qwen — `--approval-mode yolo` (実機 `gemini --help` で確認)
+    ("--approval-mode", &["yolo"]),
+];
 
 /// 過去セッションの保存先の種類。列挙器 (session_picker.rs) がこの値で分岐する。
 ///
@@ -148,26 +182,119 @@ pub enum SessionStore {
 /// 増やすとそれらが一斉にコンパイルエラーになる。ここでは bin をキーにした別テーブルで
 /// 保持し、参照は必ず `AgentSpec::session_store()` / `resume_id_flag()` 経由にする
 /// (エージェント固有の知識をコード中へ直書きしないという原則は保たれる)。
-const SESSION_STORES: &[(&str, SessionStore, &str)] = &[
-    // claude: フラグ型。`claude --resume <id>`
-    ("claude", SessionStore::ClaudeProjects, "--resume"),
-    // codex: サブコマンド型。`codex resume <id>` (bin の直後に挟む)
-    ("codex", SessionStore::CodexRollouts, "resume"),
+/// 4 つ目の要素は「保存先を列挙できないのに ID 指定再開だけ持つ理由」。
+/// `SessionStore::None` と ID 指定再開が同居するときは **必ず** 埋める
+/// (テスト `resume_id_without_store_has_a_reason` が空を落とす)。
+const SESSION_STORES: &[(&str, SessionStore, &str, &str)] = &[
+    // claude: フラグ型。`claude --resume <id>` — 実機 `claude --help` で確認
+    ("claude", SessionStore::ClaudeProjects, "--resume", ""),
+    // codex: サブコマンド型。`codex resume <id>` (bin の直後に挟む) — 実機 `codex resume --help` で確認
+    ("codex", SessionStore::CodexRollouts, "resume", ""),
+    // agy (Antigravity): `agy --conversation <ID>` — 実機 `agy --help` で確認。
+    ("agy", SessionStore::None, "--conversation", "会話は Antigravity のプロジェクト側に保存され、ローカルの一覧可能なファイル群として公開されていない"),
+    // droid: `droid --resume [sessionId]` — 実機 `droid --help` で確認。
+    ("droid", SessionStore::None, "--resume", "セッションは `droid search` 経由でしか引けず、一覧可能な transcript ディレクトリが公開されていない"),
+    // cursor-agent: `cursor-agent --resume [chatId]` — 実機 `cursor-agent --help` で確認。
+    ("cursor-agent", SessionStore::None, "--resume", "チャットはクラウド側に保存され、ローカルに一覧可能な transcript が無い"),
+    // ante: `ante --resume <SESSION_ID>` — 出典 https://ante.run/reference/cli-reference
+    ("ante", SessionStore::None, "--resume", "保存先は ~/.ante/sessions/<id>/ だが、session_picker がまだこの形式を読めない"),
+    // acli (Rovo Dev): `acli rovodev run --restore <UUID>`
+    // 出典 https://support.atlassian.com/rovo/docs/manage-sessions-in-rovo-dev-cli/
+    ("acli", SessionStore::None, "--restore", "保存先は ~/.rovodev/sessions/ だが、session_picker がまだこの形式を読めない"),
+    // codebuff: `codebuff --continue [conversation-id]`
+    // 出典 CodebuffAI/codebuff cli/src/cli-args.ts
+    ("codebuff", SessionStore::None, "--continue", "保存先は ~/.config/manicode/projects/ 配下で公式ドキュメントに記載が無く、形式が保証されない"),
 ];
 
-fn session_entry(bin: &str) -> Option<&'static (&'static str, SessionStore, &'static str)> {
+fn session_entry(bin: &str) -> Option<&'static (&'static str, SessionStore, &'static str, &'static str)>
+{
     SESSION_STORES.iter().find(|e| e.0 == bin)
 }
+
+/// 実行ファイル名だけでは起動できない CLI の「bin の直後に必ず要る引数」。
+///
+/// orca (`src/shared/tui-agent-config.ts` の `launchCmd`) と同じ考え方で、
+/// エージェント固有の起動形をここのデータだけに置く。`AgentSpec` のフィールドに
+/// しないのは `SESSION_STORES` と同じ理由 (他モジュールに構造体リテラルがある)。
+const LAUNCH_ARGS: &[(&str, &str)] = &[
+    // kiro-cli: 素の `kiro-cli` は CLI シェル。エージェント TUI は `chat --tui`
+    // (`--trust-all-tools` も `chat` 側に付く)。出典: orca tui-agent-config.ts
+    ("kiro-cli", "chat --tui"),
+    // hermes: 素の `hermes` は旧 REPL。全画面エージェント UI は `--tui`。
+    // 出典: orca tui-agent-config.ts
+    ("hermes", "--tui"),
+    // acli: Atlassian CLI 本体。Rovo Dev エージェントは `rovodev run` サブコマンド。
+    ("acli", "rovodev run"),
+];
+
+/// `bin` → 起動時に必ず添える引数。無ければ ""。
+pub fn launch_args_for(bin: &str) -> &'static str {
+    LAUNCH_ARGS
+        .iter()
+        .find(|e| e.0 == bin)
+        .map(|e| e.1)
+        .unwrap_or("")
+}
+
+/// 初回起動時に config.toml へ書き出す「おすすめプリセット」の並び (bin 名)。
+///
+/// ここに無い CLI が使えないわけではない — エージェントピッカーは
+/// [`AGENT_CATALOG`] 全件を出すので、いつでもプリセットに追加できる。
+/// 既定を短く保つのは、初回のプルダウンが 60 行になるのを避けるため。
+/// **この機で `--help` を実行して全項目を確認できた CLI だけ**を並べている。
+pub const DEFAULT_PRESET_BINS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "agy",
+    "cursor-agent",
+    "droid",
+];
+
+/// 実行ファイル名の別名表。
+///
+/// orca の `TuiAgent` ID / `detectCmdAliases` と、実際に PATH へ入る実行ファイル名の
+/// ズレを吸収する。**ロジック側に別名を直書きしない**ための表。
+///
+/// `windows_safe = false` の別名は Windows では解決しない —
+/// `cmd` は Windows 組み込みシェル (cmd.exe) と衝突するため
+/// (出典: orca tui-agent-config.ts の command-code コメント)。
+///
+/// 【意図的に入れていない別名】
+/// - `kiro` → `kiro-cli`: `kiro` は IDE 本体の実行ファイルで、エージェントではない。
+/// - `continue` → `cn`: `continue` は bash/zsh の予約語で、実行ファイルとして解決しない
+///   (出典: orca tui-agent-config.ts の continue コメント)。
+const AGENT_ALIASES: &[(&str, &str, bool)] = &[
+    ("antigravity", "agy", true),
+    ("antigravity-cli", "agy", true),
+    ("claude-code", "claude", true),
+    ("gemini-cli", "gemini", true),
+    ("mimo-code", "mimo", true),      // orca の TuiAgent ID
+    ("qwen-code", "qwen", true),      // orca の TuiAgent ID
+    ("mistral-vibe", "vibe", true),   // orca detectCmdAliases
+    ("cursor", "cursor-agent", true), // orca の TuiAgent ID
+    ("aug", "auggie", true),          // orca の TuiAgent ID
+    ("cb", "codebuff", true),         // npm codebuff が同梱する短縮 bin
+    // orca は `rovo` という単独実行ファイルを想定しているが、実在が確認できない
+    // (npm/PyPI/Homebrew いずれにも無い)。実体の `acli rovodev run` へ寄せる。
+    ("rovo", "acli", true),
+    ("rovodev", "acli", true),
+    ("cmd", "command-code", false),   // Windows の cmd.exe と衝突するため除外
+];
 
 /// 承認モードを自動適用できる CLI カタログ。
 ///
 /// `claude` の `--permission-mode bypassPermissions` と `devin` の
 /// `--permission-mode bypass` は 2 トークン形式のため `apply_approval` 側で別処理する。
 ///
-/// 【意図的に除外している CLI】
-/// - Codebuff: ヘッドレス実行モードが無く、一括自動承認の仕組みも一切無い。
-///   プリセットとして登録しても承認モード(Auto/Ask)を適用できず壊れた項目にしかならないため、
-///   「親切心で」追加しないこと。
+/// 一括自動承認フラグを持たない CLI (goose / auggie / crush / codebuff …) も
+/// 載せてよい。`auto_flag` を空にしておけば「全自動」プリセットは作られず、
+/// `apply_approval` も書き換えないので壊れた項目にはならない。
+/// **やってはいけないのはフラグの捏造** — 出典の無いフラグは空のままにする。
+///
+/// 【意図的に除外している起動形】
+/// - orca の `claude-agent-teams` (= `orca claude-teams`): orca 本体が提供する
+///   ラッパーであって独立した CLI ではないため、Zaivern からは扱わない。
 pub const AGENT_CATALOG: &[AgentSpec] = &[
     AgentSpec {
         bin: "claude",
@@ -203,6 +330,26 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         switch_hint: "権限モード切替 (/permissions)",
         resume_flag: "resume --last",
     },
+    // Gemini CLI (Google)。**この機の `gemini --help` 実行結果から全項目を確認済み**。
+    // `--approval-mode yolo` (2 トークン) は TWO_TOKEN_BYPASS 表で除去される。
+    // `--resume` は「"latest" か番号」を取り、セッション ID は取らない (だから
+    // resume_id_flag は空 — orca は `gemini --resume <id>` を使うが、この機の
+    // gemini 0.52 の help とは食い違うため採用しない)。
+    AgentSpec {
+        bin: "gemini",
+        label: "Gemini CLI",
+        icon: "✨",
+        auto_flag: "--yolo",
+        auto_env: &[],
+        strip: &["--yolo", "-y", "--approval-mode=yolo"],
+        headless: "-p",
+        model_flag: "-m",
+        install: "npm i -g @google/gemini-cli",
+        note: "`--approval-mode` は default|auto_edit|yolo|plan。全自動は `--yolo`",
+        switch_keys: "",
+        switch_hint: "",
+        resume_flag: "--resume latest",
+    },
     AgentSpec {
         bin: "grok",
         label: "Grok",
@@ -231,6 +378,8 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "全自動は `-f` のみ。`--yolo` は受け付けない",
         switch_keys: "\x1b[Z",
         switch_hint: "権限モード切替 (Shift+Tab)",
+        // 実機 help の `--resume [chatId]` は ID 省略時の挙動が不明なため、
+        // 直前再開 (resume_flag) には使わず、ID 指定再開 (SESSION_STORES) だけに使う。
         resume_flag: "",
     },
     AgentSpec {
@@ -328,7 +477,8 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "",
         switch_keys: "\x1b[Z",
         switch_hint: "権限モード切替 (Shift+Tab)",
-        resume_flag: "",
+        // 実機 `agy --help`: `--continue` (`-c`) = 直前の会話を継続。
+        resume_flag: "--continue",
     },
     AgentSpec {
         bin: "pi",
@@ -465,8 +615,12 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         switch_hint: "",
         resume_flag: "",
     },
+    // bin は `cmd` ではなく `command-code`。`cmd` は Windows 組み込みシェル
+    // (cmd.exe) と衝突し、`cmd /c ...` を Command Code と誤認するため
+    // (出典: orca src/shared/tui-agent-config.ts の command-code コメント)。
+    // 非 Windows では別名 `cmd` として引き続き解決する (AGENT_ALIASES)。
     AgentSpec {
-        bin: "cmd",
+        bin: "command-code",
         label: "Command Code",
         icon: "⌘",
         auto_flag: "--yolo",
@@ -475,7 +629,7 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         headless: "-p",
         model_flag: "-m",
         install: "npm i -g command-code",
-        note: "",
+        note: "短縮名 `cmd` は Windows の cmd.exe と衝突するため `command-code` で起動する",
         switch_keys: "",
         switch_hint: "",
         resume_flag: "",
@@ -508,7 +662,8 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         note: "`--auto` は値が必須(`low|medium|high`)。全自動は `--skip-permissions-unsafe`",
         switch_keys: "",
         switch_hint: "",
-        resume_flag: "",
+        // 実機 `droid --help`: `-r, --resume [sessionId]` は ID 省略で直近セッションを再開。
+        resume_flag: "--resume",
     },
     AgentSpec {
         bin: "kilo",
@@ -585,6 +740,11 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         switch_hint: "",
         resume_flag: "",
     },
+    // Rovo Dev (Atlassian)。orca は `rovo` という単独実行ファイルを起動しようとするが、
+    // npm / PyPI / Homebrew のいずれにも `rovo` は存在せず (2026-07 時点で確認)、
+    // 実体は ACLI 拡張の `acli rovodev run`。こちらを正とする。
+    // 出典: https://support.atlassian.com/rovo/docs/rovo-dev-cli-commands/
+    //       https://developer.atlassian.com/cloud/acli/guides/install-macos/
     AgentSpec {
         bin: "acli",
         label: "Rovo Dev",
@@ -594,11 +754,74 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         strip: &["--yolo"],
         headless: "acli rovodev run",
         model_flag: "",
-        install: "Atlassian `acli` を入れて `acli rovodev auth login`",
-        note: "エージェントは `acli rovodev run` サブコマンド",
+        install: "brew tap atlassian/homebrew-acli && brew install acli",
+        note: "エージェントは `acli rovodev run`。初回は `acli rovodev auth login` が要る。モデルは ~/.rovodev/config.yml 側",
+        switch_keys: "",
+        switch_hint: "",
+        // `--restore` は値なしで直近セッションを復元 (公式ドキュメント)
+        resume_flag: "--restore",
+    },
+    // Ante (Antigma Labs)。単独バイナリ配布 (npm の `ante` は無関係の空パッケージ)。
+    // 出典: https://ante.run/reference/cli-reference / https://ante.run/start/quickstart
+    AgentSpec {
+        bin: "ante",
+        label: "Ante",
+        icon: "🃏",
+        auto_flag: "--yolo",
+        auto_env: &[],
+        strip: &["--yolo", "--permission-mode=yolo"],
+        headless: "-p",
+        model_flag: "-m",
+        install: "curl -fsSL https://ante.run/install.sh | bash",
+        note: "`--permission-mode` は strict|auto|yolo。`-p` は 1 回実行して終了する",
+        switch_keys: "",
+        switch_hint: "",
+        // 直前セッションの再開は TUI の `/resume` だけで、起動フラグは未確認 (だから空)。
+        // ID 指定再開 `--resume <SESSION_ID>` は SESSION_STORES 側にある。
+        resume_flag: "",
+    },
+    // OpenClaw (OpenClaw Foundation)。チャットアプリとエージェントをつなぐゲートウェイで、
+    // 起動フラグ形式の一括自動承認は無い (`openclaw exec-policy preset yolo` で設定する)。
+    // 出典: https://github.com/openclaw/openclaw/blob/main/docs/cli/approvals.md
+    //       https://github.com/openclaw/openclaw/blob/main/docs/cli/agent.md
+    //       https://registry.npmjs.org/openclaw/latest (bin: openclaw)
+    AgentSpec {
+        bin: "openclaw",
+        label: "OpenClaw",
+        icon: "🐾",
+        auto_flag: "",
+        auto_env: &[],
+        strip: &[],
+        headless: "openclaw agent exec",
+        model_flag: "",
+        install: "npm i -g openclaw@latest",
+        note: "自動承認は起動フラグではなく `openclaw exec-policy preset yolo`。`--model` は `agent exec` サブコマンド側",
         switch_keys: "",
         switch_hint: "",
         resume_flag: "",
+    },
+    // ── ここから下は orca (stablyai/orca) が起動対象にしている CLI のうち、
+    //    Zaivern に無かったもの。出典は各エントリのコメント参照。
+    //
+    // Codebuff: 一括自動承認フラグを orca も持っていない
+    // (orca src/shared/tui-agent-permissions.ts の YOLO_TUI_AGENT_ARGS に無い)。
+    // フラグを捏造しないので auto_flag は空 = 「全自動」プリセットは作られない。
+    // bin / インストール先は npm registry (registry.npmjs.org/codebuff, bin: codebuff|cb) で確認。
+    AgentSpec {
+        bin: "codebuff",
+        label: "Codebuff",
+        icon: "🔨",
+        auto_flag: "",
+        auto_env: &[],
+        strip: &[],
+        headless: "",
+        model_flag: "",
+        install: "npm i -g codebuff",
+        note: "一括自動承認フラグもヘッドレス実行フラグも無い。モデルではなく `--agent <id>` で切り替える",
+        switch_keys: "",
+        switch_hint: "",
+        // `--continue [conversation-id]` — 出典: CodebuffAI/codebuff cli/src/cli-args.ts
+        resume_flag: "--continue",
     },
     AgentSpec {
         bin: "aider",
@@ -1094,12 +1317,11 @@ pub fn spec_for_bin(bin: &str) -> Option<&'static AgentSpec> {
     if let Some(spec) = AGENT_CATALOG.iter().find(|s| s.bin == bin) {
         return Some(spec);
     }
-    let normalized = match bin {
-        "antigravity" | "antigravity-cli" => "agy",
-        "claude-code" => "claude",
-        "gemini-cli" => "gemini",
-        _ => bin,
-    };
+    let normalized = AGENT_ALIASES
+        .iter()
+        .find(|(alias, _, windows_safe)| *alias == bin && (*windows_safe || !cfg!(windows)))
+        .map(|(_, target, _)| *target)
+        .unwrap_or(bin);
     AGENT_CATALOG.iter().find(|s| s.bin == normalized)
 }
 
@@ -1108,9 +1330,23 @@ fn known_agent(command: &str) -> Option<(&'static str, &'static [&'static str])>
     spec_for_command(command).map(|s| (s.auto_flag, s.strip))
 }
 
-/// `--permission-mode <値>` の値が bypass 系か。
-fn is_bypass_permission_mode(value: &str) -> bool {
-    value.eq_ignore_ascii_case("bypassPermissions") || value.eq_ignore_ascii_case("bypass")
+/// `--permission-mode <値>` のような 2 トークン指定が bypass 系か。
+/// 判定は `TWO_TOKEN_BYPASS` の表からのみ導く。
+fn is_bypass_two_token(flag: &str, value: &str) -> bool {
+    TWO_TOKEN_BYPASS
+        .iter()
+        .any(|(f, values)| *f == flag && values.iter().any(|v| v.eq_ignore_ascii_case(value)))
+}
+
+/// `--permission-mode=bypassPermissions` のような `=` 区切り 1 トークン形が bypass 系か。
+fn is_bypass_joined(token: &str) -> bool {
+    TWO_TOKEN_BYPASS.iter().any(|(flag, values)| {
+        token
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(|v| values.iter().any(|allowed| allowed.eq_ignore_ascii_case(v)))
+            .unwrap_or(false)
+    })
 }
 
 /// カタログ由来の bypass フラグ集合にトークンが含まれるか。
@@ -1130,22 +1366,25 @@ fn token_is_bypass_flag(token: &str, head_spec: Option<&'static AgentSpec>) -> b
 }
 
 /// コマンド文字列が bypass 権限フラグを含むか(表示用の判定)。
-/// 判定はカタログの `auto_flag` / `strip` の和集合から導出し、加えて
-/// `--permission-mode bypassPermissions` / `--permission-mode bypass` を特別扱いする。
+/// 判定はカタログの `auto_flag` / `strip` の和集合と `TWO_TOKEN_BYPASS` の表から
+/// のみ導出する(フラグ名をロジックへ直書きしない)。
 pub fn command_is_bypass(command: &str) -> bool {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let head_spec = spec_for_command(command);
     for (i, tok) in tokens.iter().enumerate() {
-        // `--permission-mode bypassPermissions` / `--permission-mode bypass`
-        if *tok == "--permission-mode" {
-            if tokens.get(i + 1).map(|v| is_bypass_permission_mode(v)) == Some(true) {
+        // `--permission-mode bypassPermissions` / `--approval-mode yolo` など
+        if TWO_TOKEN_BYPASS.iter().any(|(f, _)| f == tok) {
+            if tokens.get(i + 1).map(|v| is_bypass_two_token(tok, v)) == Some(true) {
                 return true;
             }
             continue;
         }
-        // `--permission-mode=bypassPermissions`
-        if let Some(v) = tok.strip_prefix("--permission-mode=") {
-            if is_bypass_permission_mode(v) {
+        // `--permission-mode=bypassPermissions` など `=` 区切り 1 トークン形
+        if TWO_TOKEN_BYPASS
+            .iter()
+            .any(|(f, _)| tok.starts_with(f) && tok.len() > f.len() && tok.as_bytes()[f.len()] == b'=')
+        {
+            if is_bypass_joined(tok) {
                 return true;
             }
             continue;
@@ -1192,23 +1431,21 @@ pub fn apply_approval(command: &str, approval: Approval) -> String {
             i += 1;
             continue;
         }
-        // `--permission-mode bypassPermissions` / `--permission-mode bypass`
+        // `--permission-mode bypassPermissions` / `--approval-mode yolo`
         // (スペース区切り2トークン)を除去。`--permission-mode plan` などは残す。
-        if tok == "--permission-mode"
+        if TWO_TOKEN_BYPASS.iter().any(|(f, _)| *f == tok)
             && tokens
                 .get(i + 1)
-                .map(|v| is_bypass_permission_mode(v))
+                .map(|v| is_bypass_two_token(tok, v))
                 .unwrap_or(false)
         {
             i += 2;
             continue;
         }
         // `--permission-mode=bypassPermissions`(= 区切り1トークン)を除去
-        if let Some(v) = tok.strip_prefix("--permission-mode=") {
-            if is_bypass_permission_mode(v) {
-                i += 1;
-                continue;
-            }
+        if is_bypass_joined(tok) {
+            i += 1;
+            continue;
         }
         parts.push(tok);
         i += 1;
@@ -1692,8 +1929,9 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_approval, apply_resume, apply_resume_id, env_enables_auto, isolated_env_for_session,
-        merged_env, Approval, SessionStore,
+        apply_approval, apply_resume, apply_resume_id, env_enables_auto, is_bypass_two_token,
+        isolated_env_for_session, merged_env, Approval, SessionStore, AGENT_ALIASES, LAUNCH_ARGS,
+        SESSION_STORES,
     };
     use std::collections::HashMap;
 
@@ -1734,9 +1972,14 @@ mod tests {
 
     #[test]
     fn non_known_command_untouched() {
+        // カタログ外のコマンドは Auto でも Ask でも一切書き換えない
         assert_eq!(
-            apply_approval("gemini --dangerously-skip-permissions", Approval::Auto),
-            "gemini --dangerously-skip-permissions"
+            apply_approval("some-unknown-cli --dangerously-skip-permissions", Approval::Auto),
+            "some-unknown-cli --dangerously-skip-permissions"
+        );
+        assert_eq!(
+            apply_approval("some-unknown-cli --dangerously-skip-permissions", Approval::Ask),
+            "some-unknown-cli --dangerously-skip-permissions"
         );
     }
 
@@ -1879,18 +2122,78 @@ mod tests {
             spec_for_bin("codex").unwrap().session_store(),
             SessionStore::CodexRollouts
         );
-        // 保存先を宣言している = ID 指定再開もできる、が常に成り立つこと
+        // 保存先を宣言しているなら ID 指定再開は必ずできる (逆は成り立たない —
+        // 一覧はできないが ID 指定再開だけできる CLI があるため)。
         for spec in AGENT_CATALOG {
             let has_store = spec.session_store() != SessionStore::None;
-            assert_eq!(
-                has_store,
-                !spec.resume_id_flag().is_empty(),
-                "{} のカタログが片肺",
-                spec.bin
-            );
             if has_store {
+                assert!(
+                    !spec.resume_id_flag().is_empty(),
+                    "{} は保存先だけあって ID 指定再開が無い",
+                    spec.bin
+                );
                 assert!(!spec.resume_flag.is_empty(), "{} は再開指定も要る", spec.bin);
             }
+        }
+    }
+
+    /// 一覧できないのに ID 指定再開だけ持つ CLI は、**必ず理由を書く**。
+    /// (書き忘れると「一覧が空なのはバグか仕様か」が誰にも分からなくなる)
+    #[test]
+    fn resume_id_without_store_has_a_reason() {
+        for spec in AGENT_CATALOG {
+            if spec.resume_id_flag().is_empty() {
+                assert_eq!(
+                    spec.no_store_reason(),
+                    "",
+                    "{} は ID 指定再開が無いのに理由だけある",
+                    spec.bin
+                );
+                continue;
+            }
+            if spec.session_store() == SessionStore::None {
+                assert!(
+                    !spec.no_store_reason().is_empty(),
+                    "{} は一覧できないのに理由が空",
+                    spec.bin
+                );
+            }
+        }
+    }
+
+    /// SESSION_STORES / LAUNCH_ARGS の bin は、必ずカタログに実在すること。
+    /// (bin をリネームしたときに表だけ取り残されるのを防ぐ)
+    #[test]
+    fn side_tables_only_reference_real_bins() {
+        for (bin, ..) in SESSION_STORES {
+            assert!(
+                AGENT_CATALOG.iter().any(|s| s.bin == *bin),
+                "SESSION_STORES の {bin} がカタログに無い"
+            );
+        }
+        for (bin, args) in LAUNCH_ARGS {
+            assert!(
+                AGENT_CATALOG.iter().any(|s| s.bin == *bin),
+                "LAUNCH_ARGS の {bin} がカタログに無い"
+            );
+            assert!(!args.trim().is_empty(), "{bin} の起動引数が空");
+        }
+    }
+
+    /// 起動コマンドは必ず bin で始まり、余計な空白を含まない。
+    #[test]
+    fn launch_command_starts_with_bin() {
+        for spec in AGENT_CATALOG {
+            let cmd = spec.launch_command();
+            assert!(cmd.starts_with(spec.bin), "{}: {cmd}", spec.bin);
+            assert_eq!(cmd.trim(), cmd, "{}: 前後に空白がある", spec.bin);
+            // 起動コマンドの先頭トークンからカタログを引き直せること
+            assert_eq!(
+                spec_for_command(&cmd).map(|s| s.bin),
+                Some(spec.bin),
+                "{} の起動形からカタログを引けない",
+                spec.bin
+            );
         }
     }
 
@@ -2190,9 +2493,14 @@ mod tests {
     }
 
     #[test]
-    fn codebuff_is_absent_from_catalog() {
-        // ヘッドレス実行も一括自動承認も無いため意図的に除外している
-        assert!(AGENT_CATALOG.iter().all(|s| s.bin != "codebuff"));
+    fn codebuff_is_present_but_without_a_fabricated_auto_flag() {
+        // 一括自動承認フラグを持たない CLI も、フラグを捏造しなければ
+        // 「起動はできる項目」として並べてよい (auggie / goose と同じ扱い)。
+        let s = spec_for_bin("codebuff").expect("codebuff はカタログにある");
+        assert_eq!(s.auto_flag, "", "codebuff に自動承認フラグを捏造してはいけない");
+        assert!(s.auto_env.is_empty());
+        // 「全自動」プリセットは作られない = 壊れた項目が UI に出ない
+        assert!(crate::agent_picker::auto_preset(s).is_none());
     }
 
     #[test]
@@ -2212,6 +2520,157 @@ mod tests {
                 s.bin
             );
         }
+    }
+
+    // ── カタログ整合性 (カタログ全件を回すので、追加分は自動で対象になる) ──
+
+    /// Ask で確実に自動承認を解除できること = 自分の auto フラグを
+    /// 自分で剥がせること。単独トークンのフラグは `strip` に、
+    /// 「フラグ + 値」の 2 トークン形は `TWO_TOKEN_BYPASS` に載っていなければならない。
+    #[test]
+    fn every_auto_flag_is_strippable_by_its_own_spec() {
+        for s in AGENT_CATALOG {
+            if s.auto_flag.is_empty() {
+                continue;
+            }
+            let tokens: Vec<&str> = s.auto_flag.split_whitespace().collect();
+            if tokens.len() == 1 {
+                assert!(
+                    s.strip.contains(&s.auto_flag),
+                    "{} の strip に自分の auto フラグ {} が無い",
+                    s.bin,
+                    s.auto_flag
+                );
+            } else {
+                assert_eq!(tokens.len(), 2, "{} の auto フラグが 3 トークン以上", s.bin);
+                assert!(
+                    is_bypass_two_token(tokens[0], tokens[1]),
+                    "{} の 2 トークン auto フラグが TWO_TOKEN_BYPASS に無い: {}",
+                    s.bin,
+                    s.auto_flag
+                );
+            }
+        }
+    }
+
+    /// カタログ全件で Auto → Ask → Auto が期待どおり動くこと。
+    /// 個別に書かないので、CLI を足しても自動で検証対象になる。
+    #[test]
+    fn apply_approval_round_trips_for_every_catalog_entry() {
+        for s in AGENT_CATALOG {
+            let plain = s.launch_command();
+            let auto = apply_approval(&plain, Approval::Auto);
+            if s.auto_flag.is_empty() {
+                // フラグを持たない CLI は Auto でも書き換えない(捏造しない)
+                assert_eq!(auto, plain, "{}: auto フラグが無いのに書き換えた", s.bin);
+            } else {
+                assert_eq!(auto, format!("{plain} {}", s.auto_flag), "{}", s.bin);
+                assert!(command_is_bypass(&auto), "{}: bypass と判定されない", s.bin);
+                // 二重付与しない
+                assert_eq!(apply_approval(&auto, Approval::Auto), auto, "{}", s.bin);
+            }
+            // Ask は必ず素のコマンドへ戻す
+            assert_eq!(apply_approval(&auto, Approval::Ask), plain, "{}", s.bin);
+            assert!(!command_is_bypass(&apply_approval(&auto, Approval::Ask)), "{}", s.bin);
+            // Agent はどんなコマンドでも一切触らない
+            assert_eq!(apply_approval(&auto, Approval::Agent), auto, "{}", s.bin);
+        }
+    }
+
+    /// カタログ全件で「直前の会話を再開」と「ID 指定で再開」が壊れないこと。
+    #[test]
+    fn apply_resume_and_resume_id_are_sane_for_every_catalog_entry() {
+        for s in AGENT_CATALOG {
+            let plain = s.launch_command();
+
+            let resumed = apply_resume(&plain, s);
+            if s.resume_flag.is_empty() {
+                assert_eq!(resumed, plain, "{}: 再開未対応なのに書き換えた", s.bin);
+            } else {
+                assert!(resumed.starts_with(s.bin), "{}: {resumed}", s.bin);
+                assert!(resumed.contains(s.resume_flag), "{}: {resumed}", s.bin);
+                // 二重付与しない
+                assert_eq!(apply_resume(&resumed, s), resumed, "{}", s.bin);
+                // 先頭トークンからカタログを引き直せる (サブコマンド型でも壊れない)
+                assert_eq!(spec_for_command(&resumed).map(|x| x.bin), Some(s.bin));
+            }
+
+            let by_id = apply_resume_id(&plain, s, "abc-123");
+            if s.resume_id_flag().is_empty() {
+                assert_eq!(by_id, plain, "{}: ID 再開未対応なのに書き換えた", s.bin);
+            } else {
+                assert!(by_id.contains("abc-123"), "{}: {by_id}", s.bin);
+                assert!(by_id.starts_with(s.bin), "{}: {by_id}", s.bin);
+                assert_eq!(apply_resume_id(&by_id, s, "zzz"), by_id, "{}", s.bin);
+                assert_eq!(spec_for_command(&by_id).map(|x| x.bin), Some(s.bin));
+            }
+            // 危険な ID は絶対にコマンドへ載せない
+            for bad in ["", "  ", "a b", "x;rm -rf /", "$(id)"] {
+                assert_eq!(apply_resume_id(&plain, s, bad), plain, "{}: {bad}", s.bin);
+            }
+        }
+    }
+
+    /// 別名は必ずただ 1 つの spec に解決し、実在の bin と衝突しないこと。
+    #[test]
+    fn every_alias_resolves_to_exactly_one_spec() {
+        for (alias, target, windows_safe) in AGENT_ALIASES {
+            assert!(
+                AGENT_CATALOG.iter().any(|s| s.bin == *target),
+                "別名 {alias} の解決先 {target} がカタログに無い"
+            );
+            assert_ne!(alias, target, "自分自身への別名は無意味: {alias}");
+            assert!(
+                AGENT_CATALOG.iter().all(|s| s.bin != *alias),
+                "{alias} は実在の bin なので別名にしてはいけない"
+            );
+            assert!(
+                AGENT_ALIASES.iter().filter(|(a, ..)| a == alias).count() == 1,
+                "別名 {alias} が重複している"
+            );
+            // Windows で解決してよい別名だけが Windows でも引ける
+            let resolved = spec_for_bin(alias).map(|s| s.bin);
+            let expect_resolvable = *windows_safe || !cfg!(windows);
+            assert_eq!(
+                resolved,
+                expect_resolvable.then_some(*target),
+                "別名 {alias} の解決結果が想定と違う"
+            );
+        }
+    }
+
+    /// 別名から引いた spec は、本名から引いたものと完全に同一であること。
+    #[test]
+    fn alias_lookup_table() {
+        let table: &[(&str, &str)] = &[
+            ("claude-code", "claude"),
+            ("gemini-cli", "gemini"),
+            ("antigravity", "agy"),
+            ("antigravity-cli", "agy"),
+            ("mimo-code", "mimo"),
+            ("qwen-code", "qwen"),
+            ("mistral-vibe", "vibe"),
+            ("cursor", "cursor-agent"),
+            ("aug", "auggie"),
+        ];
+        for (alias, bin) in table {
+            let via_alias = spec_for_bin(alias).unwrap_or_else(|| panic!("{alias} が引けない"));
+            let via_bin = spec_for_bin(bin).unwrap_or_else(|| panic!("{bin} が引けない"));
+            assert!(std::ptr::eq(via_alias, via_bin), "{alias} と {bin} が別実体");
+            // コマンド行 (引数つき) からも同じ spec に届くこと
+            assert_eq!(
+                spec_for_command(&format!("/opt/bin/{alias} --model x")).map(|s| s.bin),
+                Some(*bin)
+            );
+        }
+        // `cmd` は Windows では解決してはいけない (cmd.exe と衝突するため)
+        #[cfg(windows)]
+        assert!(spec_for_bin("cmd").is_none());
+        #[cfg(not(windows))]
+        assert_eq!(spec_for_bin("cmd").map(|s| s.bin), Some("command-code"));
+        // 定義していない名前は解決しない
+        assert!(spec_for_bin("kiro").is_none(), "kiro は IDE 本体で別物");
+        assert!(spec_for_bin("continue").is_none(), "continue はシェル予約語");
     }
 
     // ── 権限モード切替キー ────────────────────────────────────────────

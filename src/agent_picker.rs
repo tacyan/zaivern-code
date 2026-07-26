@@ -141,7 +141,9 @@ fn preset_key(p: &AgentPreset) -> String {
 pub fn plain_preset(spec: &AgentSpec) -> AgentPreset {
     AgentPreset {
         name: spec.label.to_string(),
-        command: spec.bin.to_string(),
+        // `kiro-cli chat --tui` のように、実行ファイル名だけでは
+        // エージェント UI が立たない CLI がある(起動形はカタログ側のデータ)。
+        command: spec.launch_command(),
         icon: spec.icon.to_string(),
         cwd: None,
         env: HashMap::new(),
@@ -158,9 +160,9 @@ pub fn auto_preset(spec: &AgentSpec) -> Option<AgentPreset> {
         return None;
     }
     let command = if spec.auto_flag.is_empty() {
-        spec.bin.to_string()
+        spec.launch_command()
     } else {
-        format!("{} {}", spec.bin, spec.auto_flag)
+        format!("{} {}", spec.launch_command(), spec.auto_flag)
     };
     Some(AgentPreset {
         name: format!("{}{AUTO_SUFFIX}", spec.label),
@@ -473,9 +475,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_twenty_nine_agents() {
-        // 「29 件すべてを選べる」が要件なので、件数そのものを固定する。
-        assert_eq!(AGENT_CATALOG.len(), 29);
+    fn catalog_has_thirty_three_agents() {
+        // 「カタログ全件を選べる」が要件なので、件数そのものを固定する。
+        // orca (stablyai/orca) が起動対象にしている CLI を全て含む。
+        assert_eq!(AGENT_CATALOG.len(), 33);
     }
 
     #[test]
@@ -602,7 +605,9 @@ mod tests {
     fn plain_preset_command_is_just_the_binary() {
         for spec in AGENT_CATALOG {
             let p = plain_preset(spec);
-            assert_eq!(p.command, spec.bin);
+            // 起動形 (`kiro-cli chat --tui` 等) はカタログのデータ由来。
+            assert_eq!(p.command, spec.launch_command());
+            assert!(p.command.starts_with(spec.bin));
             assert!(!p.icon.is_empty());
             assert!(!p.name.is_empty());
         }

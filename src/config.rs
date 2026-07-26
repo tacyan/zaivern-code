@@ -1,3 +1,4 @@
+use crate::agents;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -368,55 +369,33 @@ impl Default for AgentPreset {
     }
 }
 
+/// 既定のプリセット一覧。
+///
+/// **エージェント固有の値をここへ直書きしない**: 並びは
+/// [`agents::DEFAULT_PRESET_BINS`]、中身は [`agents::AGENT_CATALOG`] の
+/// エントリから組み立てる(プリセットの作り方はピッカーで「追加」したときと
+/// 完全に同じ経路 = `agent_picker::plain_preset` / `auto_preset`)。
+/// カタログに CLI を足せば、ここを触らずに既定へ載せられる。
 fn default_agents() -> Vec<AgentPreset> {
-    vec![
-        AgentPreset {
-            name: "Claude Code".into(),
-            command: "claude".into(),
-            icon: "👾".into(),
-            ..Default::default()
-        },
-        AgentPreset {
-            name: "Claude Code (全自動)".into(),
-            command: "claude --dangerously-skip-permissions".into(),
-            icon: "⚡".into(),
-            ..Default::default()
-        },
-        AgentPreset {
-            name: "Codex".into(),
-            command: "codex".into(),
-            icon: "💡".into(),
-            ..Default::default()
-        },
-        AgentPreset {
-            name: "Codex (全自動)".into(),
-            command: "codex --dangerously-bypass-approvals-and-sandbox".into(),
-            icon: "⚡".into(),
-            ..Default::default()
-        },
-        AgentPreset {
-            name: "Antigravity".into(),
-            command: "agy".into(),
-            icon: "🚀".into(),
-            ..Default::default()
-        },
-        AgentPreset {
-            name: "Antigravity (全自動)".into(),
-            command: "agy --dangerously-skip-permissions".into(),
-            icon: "⚡".into(),
-            env: HashMap::from([
-                ("ANTIGRAVITY_AUTO_APPROVE".to_string(), "1".to_string()),
-                ("AGY_AUTO_APPROVE".to_string(), "1".to_string()),
-            ]),
-            ..Default::default()
-        },
-        AgentPreset {
-            name: "Shell".into(),
-            command: String::new(),
-            icon: "🖥".into(),
-            ..Default::default()
-        },
-    ]
+    let mut out = Vec::new();
+    for bin in agents::DEFAULT_PRESET_BINS {
+        // 別名でも引けるよう spec_for_bin を通す(bin が変わっても壊れない)。
+        let Some(spec) = agents::spec_for_bin(bin) else {
+            continue;
+        };
+        out.push(crate::agent_picker::plain_preset(spec));
+        if let Some(auto) = crate::agent_picker::auto_preset(spec) {
+            out.push(auto);
+        }
+    }
+    // 素のログインシェルは常に最後(コマンド空 = シェル起動)。
+    out.push(AgentPreset {
+        name: "Shell".into(),
+        command: String::new(),
+        icon: "🖥".into(),
+        ..Default::default()
+    });
+    out
 }
 
 /// Project-local overlay (<workspace>/.zaivern.toml): every field optional.
@@ -647,8 +626,10 @@ show_pet = true
 # command はログインシェル (-lc) 経由で実行されます。
 # 空文字 "" は普通のシェルを起動します。
 # env でプリセット固有の環境変数を設定できます。
-# claude / codex / agy で始まるコマンドには承認モードが自動適用されます
+# カタログ登録済みの CLI (claude / codex / gemini / agy / cursor-agent / droid …)
+# で始まるコマンドには承認モードが自動適用されます
 # (approval_mode = "agent" ならコマンドをそのまま尊重します)。
+# ここに無い CLI も「エージェント追加」から選べます (対応 CLI は 30 種類以上)。
 
 [[agents]]
 name = "Claude Code"
@@ -671,6 +652,16 @@ icon = "⚡"
 command = "codex --dangerously-bypass-approvals-and-sandbox"
 
 [[agents]]
+name = "Gemini CLI"
+icon = "✨"
+command = "gemini"
+
+[[agents]]
+name = "Gemini CLI (全自動)"
+icon = "⚡"
+command = "gemini --yolo"
+
+[[agents]]
 name = "Antigravity"
 icon = "🚀"
 command = "agy"
@@ -679,6 +670,26 @@ command = "agy"
 name = "Antigravity (全自動)"
 icon = "⚡"
 command = "agy --dangerously-skip-permissions"
+
+[[agents]]
+name = "Cursor"
+icon = "🖱"
+command = "cursor-agent"
+
+[[agents]]
+name = "Cursor (全自動)"
+icon = "⚡"
+command = "cursor-agent -f"
+
+[[agents]]
+name = "Droid"
+icon = "👾"
+command = "droid"
+
+[[agents]]
+name = "Droid (全自動)"
+icon = "⚡"
+command = "droid --skip-permissions-unsafe"
 
 [[agents]]
 name = "Shell"
@@ -1253,11 +1264,41 @@ mod tests {
                 "Claude Code (全自動)",
                 "Codex",
                 "Codex (全自動)",
+                "Gemini CLI",
+                "Gemini CLI (全自動)",
                 "Antigravity",
                 "Antigravity (全自動)",
+                "Cursor",
+                "Cursor (全自動)",
+                "Droid",
+                "Droid (全自動)",
                 "Shell",
             ]
         );
+    }
+
+    /// 既定プリセットは **カタログから導出** される。おすすめ表に足した CLI が
+    /// そのまま既定へ載ること、素のシェルが必ず最後に来ることを固定する。
+    #[test]
+    fn default_agents_are_derived_from_the_catalog() {
+        let agents = default_agents();
+        for bin in agents::DEFAULT_PRESET_BINS {
+            let spec = agents::spec_for_bin(bin).expect("おすすめ表の bin はカタログにある");
+            assert!(
+                agents.iter().any(|a| a.command == spec.launch_command()),
+                "{bin} の素のプリセットが既定に無い"
+            );
+            if crate::agent_picker::auto_preset(spec).is_some() {
+                assert!(
+                    agents
+                        .iter()
+                        .any(|a| a.name == format!("{}{}", spec.label, crate::agent_picker::AUTO_SUFFIX)),
+                    "{bin} の全自動プリセットが既定に無い"
+                );
+            }
+        }
+        let last = agents.last().expect("空にはならない");
+        assert_eq!(last.command, "", "最後は素のシェル");
     }
 
     #[test]
@@ -1265,21 +1306,32 @@ mod tests {
         let agents = default_agents();
         for a in &agents {
             if a.name.contains("全自動") {
+                // フラグ名は CLI ごとに違うので、判定は agents.rs の表に任せる
                 assert!(
-                    a.command.contains("--dangerously"),
-                    "{} に bypass フラグが無い: {:?}",
+                    agents::command_is_bypass(&a.command),
+                    "{} が bypass と判定されない: {:?}",
                     a.name,
                     a.command
                 );
             }
         }
-        // 通常プリセットは素のコマンドのまま
-        let plain: Vec<&str> = agents
-            .iter()
-            .filter(|a| !a.name.contains("全自動"))
-            .map(|a| a.command.as_str())
-            .collect();
-        assert_eq!(plain, vec!["claude", "codex", "agy", ""]);
+        // 通常プリセットは素の起動コマンドのまま (bypass フラグが混ざらない)
+        for a in agents.iter().filter(|a| !a.name.contains("全自動")) {
+            assert!(
+                !agents::command_is_bypass(&a.command),
+                "{} に bypass フラグが混ざっている: {:?}",
+                a.name,
+                a.command
+            );
+        }
+        assert_eq!(
+            agents
+                .iter()
+                .filter(|a| !a.name.contains("全自動"))
+                .map(|a| a.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "gemini", "agy", "cursor-agent", "droid", ""]
+        );
     }
 
     #[test]
@@ -1423,6 +1475,61 @@ mod tests {
             from_template, from_code,
             "テンプレートと default_agents() がずれている"
         );
+    }
+
+    /// **既存ユーザーの config.toml を壊さない**こと。
+    ///
+    /// 新しい CLI を既定プリセットへ足しても、[[agents]] を書いている設定は
+    /// その内容だけが残る (新既定が勝手に混ざらない)。逆に [[agents]] が
+    /// 1 つも無い古い設定では、新しい既定一式が入る。
+    #[test]
+    fn old_config_without_new_presets_still_loads() {
+        // 新プリセット導入前の設定 (claude / codex / agy の 3 件だけ)
+        let old = r#"
+theme = "zaivern-dark"
+editor_font_size = 15.0
+
+[[agents]]
+name = "Claude Code"
+icon = "👾"
+command = "claude"
+
+[[agents]]
+name = "Codex"
+icon = "💡"
+command = "codex"
+
+[[agents]]
+name = "Antigravity"
+icon = "🚀"
+command = "agy"
+"#;
+        let cfg: Config = toml::from_str(old).expect("旧設定が読めなくなった");
+        assert_eq!(cfg.theme, "zaivern-dark");
+        assert_eq!(cfg.agents.len(), 3, "旧設定のプリセットに新既定が混ざった");
+        assert_eq!(cfg.agents[0].command, "claude");
+        assert_eq!(cfg.agents[2].command, "agy");
+        // 旧設定に無い新フィールドは既定値で埋まる
+        assert!(cfg.agents.iter().all(|a| a.cwd.is_none() && a.env.is_empty()));
+
+        // [[agents]] を書いていない古い設定は、新しい既定一式を受け取る
+        let bare: Config = toml::from_str("theme = \"zaivern-dark\"").expect("読める");
+        assert_eq!(bare.agents.len(), default_agents().len());
+        assert!(
+            bare.agents.iter().any(|a| a.command == "gemini"),
+            "新しく足した CLI が既定に出てこない"
+        );
+
+        // 新しい既定はそのまま書き出して読み戻せる (往復で欠けない)
+        for p in default_agents() {
+            let text = render_agent_preset(&p);
+            let back: Config = toml::from_str(&text).expect("往復で壊れた");
+            assert_eq!(back.agents.len(), 1, "{}", p.name);
+            assert_eq!(back.agents[0].name, p.name);
+            assert_eq!(back.agents[0].command, p.command);
+            assert_eq!(back.agents[0].icon, p.icon);
+            assert_eq!(back.agents[0].env, p.env);
+        }
     }
 
     // ---- Config のデシリアライズ (正常系) ----
@@ -1791,7 +1898,9 @@ mod supervisor_field_tests {
         );
         let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定の設定が読めなくなった");
         assert_eq!(cfg.theme, "zaivern-dark");
-        assert_eq!(cfg.agents.len(), 7);
+        // プリセット件数はテンプレートと default_agents() で必ず一致する
+        // (`default_config_template_agents_match_default_agents` が担保)
+        assert_eq!(cfg.agents.len(), default_agents().len());
         // supervisor は SupervisorConfig の既定値で埋まる
         let d = crate::supervisor::SupervisorConfig::default();
         assert_eq!(cfg.supervisor.enabled, d.enabled);
