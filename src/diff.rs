@@ -8,8 +8,11 @@
 //! (カウント省略 = 1、行番号は diff 上 1-based) に揃えてある。
 
 
+use std::collections::HashMap;
+
 use eframe::egui::{self, Color32, FontId, RichText};
 
+use crate::i18n::{tr, trf};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -83,6 +86,331 @@ impl FileDiff {
         } else {
             self.old_path.clone()
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// インラインレビューコメント (レビューのループを閉じる)
+// ---------------------------------------------------------------------------
+
+/// コメントが指す diff の側。
+///
+/// 追加行・文脈行は「これから直す側」= 新側、削除行は旧側にしか行番号が無い。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CommentSide {
+    /// 変更後 (`+++` 側) の行番号。
+    New,
+    /// 変更前 (`---` 側) の行番号 — 削除行に付いたコメント。
+    Old,
+}
+
+/// コメントの取り付け先。
+///
+/// **行インデックスではなく (パス, 側, 1-based 行番号)** を鍵にするので、
+/// 同じ diff を再パースしても・スクロールで仮想化が働いても位置がずれない。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CommentAnchor {
+    /// エージェントに渡すパス (リネームなら新パス)。
+    pub path: String,
+    pub side: CommentSide,
+    /// 1-based 行番号。
+    pub line: usize,
+}
+
+impl CommentAnchor {
+    pub fn new(path: impl Into<String>, side: CommentSide, line: usize) -> Self {
+        CommentAnchor {
+            path: path.into(),
+            side,
+            line,
+        }
+    }
+}
+
+/// diff の 1 行に紐づくレビューコメント。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffComment {
+    /// ストア内で一意。編集・削除・解決のキー。
+    pub id: u64,
+    pub anchor: CommentAnchor,
+    /// アンカー行の内容。プロンプトの引用 (`> ...`) に使う。
+    pub quote: String,
+    pub body: String,
+    /// 解決済みはプロンプトから除外される。
+    pub resolved: bool,
+}
+
+/// エージェントに渡すファイルパス。リネームでも「これから編集する側」= 新パス。
+/// 表示用の `display_path()` (`old → new`) とは別物なので混ぜないこと。
+pub fn anchor_path(file: &FileDiff) -> String {
+    if !file.new_path.is_empty() && file.new_path != DEV_NULL {
+        file.new_path.clone()
+    } else {
+        file.old_path.clone()
+    }
+}
+
+/// diff 行のクリック先 (側, 1-based 行番号) を決める純関数。
+///
+/// 追加行・文脈行は**新側**の行番号、削除行は**旧側**の行番号を選ぶ。
+/// 行番号を持たない側にしか座標が無い行 (壊れた diff) は `None`。
+pub fn line_target(line: &DiffLine) -> Option<(CommentSide, usize)> {
+    match line.kind {
+        LineKind::Added | LineKind::Context => line.new_no.map(|n| (CommentSide::New, n)),
+        LineKind::Removed => line.old_no.map(|n| (CommentSide::Old, n)),
+    }
+}
+
+/// `line_target` にファイルパスを載せてアンカーにする。
+pub fn line_anchor(path: &str, line: &DiffLine) -> Option<CommentAnchor> {
+    line_target(line).map(|(side, no)| CommentAnchor::new(path, side, no))
+}
+
+/// プロンプトに載せる引用行の最大文字数 (超過分は `…`)。
+const MAX_QUOTE_CHARS: usize = 200;
+/// コメント本文 1 件の最大文字数 (超過分は `…`)。
+const MAX_BODY_CHARS: usize = 2000;
+/// 組み立てるプロンプトの先頭行。
+const REVIEW_PROMPT_HEADER: &str = "以下のレビューコメントに対応してください:";
+
+/// 改行・タブを空白へ潰して 1 行にし、長すぎれば文字単位で省略する。
+///
+/// 文字単位なので日本語でも UTF-8 境界を割らない。インデントは情報なので
+/// 連続空白は潰さない (行頭のズレがコメントの手掛かりになる)。
+fn flatten_one_line(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (i, ch) in s.chars().enumerate() {
+        if i >= max {
+            truncated = true;
+            break;
+        }
+        out.push(match ch {
+            '\n' | '\r' | '\t' => ' ',
+            c => c,
+        });
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    if truncated {
+        out.push('…');
+    }
+    out
+}
+
+/// 文字単位で丸める (改行は保つ)。
+fn clamp_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// レビューコメントをエージェント向けの追いプロンプトへ組み立てる**純関数**。
+///
+/// - 解決済み / 本文が空のコメントは対象外。対象が 0 件なら空文字列を返す。
+/// - ファイルは初出順 (= diff の並び)、ファイル内は行番号 → 側 → 追加順にそろえる。
+/// - 各コメントは `@path:line` + 引用 1 行 + 本文。削除行は `(削除行)` を添える。
+///
+/// ```text
+/// 以下のレビューコメントに対応してください:
+///
+/// @src/foo.rs:120
+/// > 該当行の内容
+/// コメント本文
+/// ```
+pub fn build_review_prompt(comments: &[DiffComment]) -> String {
+    let mut targets: Vec<&DiffComment> = comments
+        .iter()
+        .filter(|c| !c.resolved && !c.body.trim().is_empty())
+        .collect();
+    if targets.is_empty() {
+        return String::new();
+    }
+
+    // ファイルの初出順を控える (アルファベット順ではなく diff の並びを保つ)。
+    let mut order: Vec<&str> = Vec::new();
+    for c in targets.iter().copied() {
+        let p = c.anchor.path.as_str();
+        if !order.iter().any(|q| *q == p) {
+            order.push(p);
+        }
+    }
+    let idx = |p: &str| order.iter().position(|q| *q == p).unwrap_or(usize::MAX);
+    targets.sort_by(|a, b| {
+        idx(&a.anchor.path)
+            .cmp(&idx(&b.anchor.path))
+            .then(a.anchor.line.cmp(&b.anchor.line))
+            .then(a.anchor.side.cmp(&b.anchor.side))
+            .then(a.id.cmp(&b.id))
+    });
+
+    let mut out = String::from(REVIEW_PROMPT_HEADER);
+    for c in targets {
+        out.push_str("\n\n@");
+        out.push_str(&c.anchor.path);
+        out.push(':');
+        out.push_str(&c.anchor.line.to_string());
+        if c.anchor.side == CommentSide::Old {
+            out.push_str(" (削除行)");
+        }
+        let quote = flatten_one_line(&c.quote, MAX_QUOTE_CHARS);
+        if !quote.is_empty() {
+            out.push_str("\n> ");
+            out.push_str(&quote);
+        }
+        out.push('\n');
+        out.push_str(&clamp_chars(c.body.trim(), MAX_BODY_CHARS));
+    }
+    out
+}
+
+/// インラインコメントの保管庫。
+///
+/// diff 本体 (`Vec<FileDiff>`) とは独立に持ち、鍵は `CommentAnchor` なので
+/// 再パースやスクロールでコメントが別の行にずれることが無い。
+#[derive(Clone, Debug, Default)]
+pub struct DiffCommentStore {
+    /// 追加順。表示順・プロンプト順の安定性はこの順序が土台。
+    comments: Vec<DiffComment>,
+    /// 次に払い出す id (削除しても再利用しない)。
+    next_id: u64,
+    /// 未確定の下書き (行アンカー → 本文)。
+    drafts: HashMap<CommentAnchor, String>,
+    /// 編集中の既存コメント (id → 編集中の本文)。
+    editing: HashMap<u64, String>,
+}
+
+impl DiffCommentStore {
+    /// コメントを追加し、払い出した id を返す。
+    pub fn add(
+        &mut self,
+        anchor: CommentAnchor,
+        quote: impl Into<String>,
+        body: impl Into<String>,
+    ) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.comments.push(DiffComment {
+            id,
+            anchor,
+            quote: quote.into(),
+            body: body.into(),
+            resolved: false,
+        });
+        id
+    }
+
+    /// 本文を差し替える。存在しない id なら false。
+    pub fn edit(&mut self, id: u64, body: impl Into<String>) -> bool {
+        match self.comments.iter_mut().find(|c| c.id == id) {
+            Some(c) => {
+                c.body = body.into();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 削除する。編集中の状態も一緒に片付ける。
+    pub fn remove(&mut self, id: u64) -> bool {
+        let before = self.comments.len();
+        self.comments.retain(|c| c.id != id);
+        self.editing.remove(&id);
+        self.comments.len() != before
+    }
+
+    /// 解決状態を明示的に設定する。
+    /// (UI はトグルしか使わないが、呼び出し側の配線用に公開しておく)
+    #[allow(dead_code)]
+    pub fn set_resolved(&mut self, id: u64, resolved: bool) -> bool {
+        match self.comments.iter_mut().find(|c| c.id == id) {
+            Some(c) => {
+                c.resolved = resolved;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 解決状態を反転する。存在しない id なら false。
+    pub fn toggle_resolved(&mut self, id: u64) -> bool {
+        match self.comments.iter_mut().find(|c| c.id == id) {
+            Some(c) => {
+                c.resolved = !c.resolved;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 追加順のまま全件。
+    #[allow(dead_code)]
+    pub fn all(&self) -> &[DiffComment] {
+        &self.comments
+    }
+
+    /// 指定行のコメント (追加順)。
+    #[allow(dead_code)]
+    pub fn at(&self, anchor: &CommentAnchor) -> Vec<&DiffComment> {
+        self.comments.iter().filter(|c| &c.anchor == anchor).collect()
+    }
+
+    /// 指定行のコメント件数と「全部解決済みか」。0 件なら None。
+    pub fn badge(&self, anchor: &CommentAnchor) -> Option<(usize, bool)> {
+        let mut n = 0usize;
+        let mut all_resolved = true;
+        for c in self.comments.iter().filter(|c| &c.anchor == anchor) {
+            n += 1;
+            all_resolved &= c.resolved;
+        }
+        (n > 0).then_some((n, all_resolved))
+    }
+
+    /// その行に何か描くもの (コメント or 下書き) があるか。仮想化の判定に使う。
+    pub fn has_ui_at(&self, anchor: &CommentAnchor) -> bool {
+        self.drafts.contains_key(anchor) || self.comments.iter().any(|c| &c.anchor == anchor)
+    }
+
+    /// 下書きを開く/閉じるを反転する (行クリックの動作)。
+    pub fn toggle_draft(&mut self, anchor: CommentAnchor) {
+        if self.drafts.remove(&anchor).is_none() {
+            self.drafts.insert(anchor, String::new());
+        }
+    }
+
+    pub fn close_draft(&mut self, anchor: &CommentAnchor) {
+        self.drafts.remove(anchor);
+    }
+
+    pub fn len(&self) -> usize {
+        self.comments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.comments.is_empty()
+    }
+
+    /// 未解決かつ本文のあるもの = プロンプトに載る件数。
+    pub fn actionable_len(&self) -> usize {
+        self.comments
+            .iter()
+            .filter(|c| !c.resolved && !c.body.trim().is_empty())
+            .count()
+    }
+
+    pub fn clear(&mut self) {
+        self.comments.clear();
+        self.drafts.clear();
+        self.editing.clear();
+    }
+
+    /// 送信用プロンプト (`build_review_prompt` の薄い包み)。
+    pub fn prompt(&self) -> String {
+        build_review_prompt(&self.comments)
     }
 }
 
@@ -419,23 +747,83 @@ impl DiffPalette {
 
 const GUTTER_COL_W: f32 = 34.0;
 const SIGN_W: f32 = 12.0;
+/// コメントマーカー列の幅 (常に確保して行のズレを防ぐ)。
+const MARK_COL_W: f32 = 16.0;
+
+/// diff ビューが呼び出し側へ返すアクション。
+///
+/// 既定は `None` なので、返り値を無視する既存の呼び出し元は今まで通り動く。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DiffAction {
+    /// 何も起きていない。
+    #[default]
+    None,
+    /// 「エージェントに送る」が押された。中身は組み立て済みプロンプト。
+    SendToAgent(String),
+}
+
+/// `diff_ui` が生成したプロンプトの一時置き場 (型で衝突を防ぐための newtype)。
+#[derive(Clone, Debug, Default)]
+struct PendingReview(String);
+
+fn pending_review_id() -> egui::Id {
+    egui::Id::new("zv-diff-pending-review")
+}
+
+/// `diff_ui` 経由で組み立てられたレビュープロンプトを **1 回だけ**取り出す。
+///
+/// シグネチャを変えられない既存の呼び出し元 (`panels::pr_diff_ui` /
+/// `race::race_diff_ui`) の配線ポイント。app.rs 側の毎フレーム処理で
+/// `if let Some(p) = diff::take_pending_review_prompt(ctx) { ... }` と拾い、
+/// `agent_input::AgentInputBuffer::append_prompt` などへ流せばよい。
+// app.rs 側の配線待ち。配線されるまで未使用でも警告にしない。
+#[allow(dead_code)]
+pub fn take_pending_review_prompt(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|d| d.remove_temp::<PendingReview>(pending_review_id()))
+        .map(|p| p.0)
+        .filter(|p| !p.is_empty())
+}
 
 /// diff をインライン表示する。スクロールは呼び出し側の責務。
+///
+/// コメントの状態は egui の一時データ (この `Ui` の id 由来) に持たせるので、
+/// 呼び出し元がストアを抱えなくてもインラインコメントが使える。生成された
+/// プロンプトは `take_pending_review_prompt` で受け取る。
 pub fn diff_ui(ui: &mut egui::Ui, theme: &Theme, files: &[FileDiff]) {
+    let store_id = ui.id().with("zv-diff-comments");
+    let mut store: DiffCommentStore = ui.data_mut(|d| d.get_temp(store_id)).unwrap_or_default();
+    let action = diff_ui_with_actions(ui, theme, files, &mut store);
+    ui.data_mut(|d| d.insert_temp(store_id, store));
+    if let DiffAction::SendToAgent(prompt) = action {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(pending_review_id(), PendingReview(prompt)));
+    }
+}
+
+/// コメントストアを外から与える版。返り値で「エージェントに送る」を受け取れる。
+pub fn diff_ui_with_actions(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    files: &[FileDiff],
+    comments: &mut DiffCommentStore,
+) -> DiffAction {
     let pal = DiffPalette::from_theme(theme);
     let size = 12.5;
 
     if files.is_empty() {
         ui.label(
-            RichText::new("差分はありません")
+            RichText::new(tr("差分はありません"))
                 .color(theme.text_dim)
                 .size(size),
         );
-        return;
+        return DiffAction::None;
     }
+
+    let action = review_toolbar_ui(ui, theme, comments, size);
 
     for (fi, file) in files.iter().enumerate() {
         let header = file_header_job(file, theme, size);
+        let path = anchor_path(file);
         egui::CollapsingHeader::new(header)
             .id_salt(("zv-diff-file", fi))
             .default_open(true)
@@ -443,7 +831,7 @@ pub fn diff_ui(ui: &mut egui::Ui, theme: &Theme, files: &[FileDiff]) {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 if file.is_binary {
                     ui.label(
-                        RichText::new("バイナリファイル (差分表示なし)")
+                        RichText::new(tr("バイナリファイル (差分表示なし)"))
                             .color(theme.text_dim)
                             .size(size),
                     );
@@ -451,9 +839,9 @@ pub fn diff_ui(ui: &mut egui::Ui, theme: &Theme, files: &[FileDiff]) {
                 }
                 if file.hunks.is_empty() {
                     let msg = if file.is_rename {
-                        "リネームのみ (内容の変更なし)"
+                        tr("リネームのみ (内容の変更なし)")
                     } else {
-                        "変更行なし"
+                        tr("変更行なし")
                     };
                     ui.label(RichText::new(msg).color(theme.text_dim).size(size));
                     return;
@@ -461,27 +849,90 @@ pub fn diff_ui(ui: &mut egui::Ui, theme: &Theme, files: &[FileDiff]) {
                 // 仮想化: 画面外の行はウィジェットを組み立てず、同じ高さの
                 // 空白だけ確保する。数千行の PR でも毎フレームのコストは
                 // 可視行ぶんだけになる (行高は最初に描いた 1 行から実測)。
+                // ただしコメント/下書きが付いた行は高さが違うので必ず実描画し、
+                // 以降の行の座標が狂わないようにする。
                 let clip = ui.clip_rect();
                 let mut row_h: Option<f32> = None;
-                for hunk in &file.hunks {
+                for (hi, hunk) in file.hunks.iter().enumerate() {
                     hunk_header_ui(ui, theme, &pal, hunk, size);
-                    for line in &hunk.lines {
-                        if let Some(h) = row_h {
+                    for (li, line) in hunk.lines.iter().enumerate() {
+                        let anchor = line_anchor(&path, line);
+                        let expanded = anchor.as_ref().is_some_and(|a| comments.has_ui_at(a));
+                        if let (Some(h), false) = (row_h, expanded) {
                             let top = ui.cursor().top();
                             if top + h < clip.top() || top > clip.bottom() {
                                 ui.allocate_space(egui::vec2(ui.available_width(), h));
                                 continue;
                             }
                         }
-                        let h = diff_line_ui(ui, theme, &pal, line, size);
-                        if row_h.is_none() {
+                        let badge = anchor.as_ref().and_then(|a| comments.badge(a));
+                        let (h, resp) =
+                            diff_line_ui(ui, theme, &pal, line, size, badge, (fi, hi, li));
+                        // 高さの基準は「素の行」からだけ拾う。
+                        if row_h.is_none() && !expanded {
                             row_h = Some(h);
+                        }
+                        if let Some(a) = anchor {
+                            if resp.clicked() {
+                                comments.toggle_draft(a.clone());
+                            }
+                            comment_thread_ui(ui, theme, comments, &a, line, size);
                         }
                     }
                 }
             });
         ui.add_space(6.0);
     }
+    action
+}
+
+/// コメントが 1 件でもあるときだけ出す操作バー。
+fn review_toolbar_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    store: &mut DiffCommentStore,
+    size: f32,
+) -> DiffAction {
+    if store.is_empty() {
+        return DiffAction::None;
+    }
+    let mut action = DiffAction::None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(trf(
+                "レビューコメント {n} 件 (未解決 {a} 件)",
+                &[
+                    ("n", store.len().to_string()),
+                    ("a", store.actionable_len().to_string()),
+                ],
+            ))
+            .color(theme.text_dim)
+            .size(size),
+        );
+        let ready = store.actionable_len() > 0;
+        if ui
+            .add_enabled(ready, egui::Button::new(tr("エージェントに送る")))
+            .on_hover_text(tr("未解決コメントをまとめて追いプロンプトにする"))
+            .clicked()
+        {
+            let prompt = store.prompt();
+            if !prompt.is_empty() {
+                action = DiffAction::SendToAgent(prompt);
+            }
+        }
+        if ui
+            .add_enabled(ready, egui::Button::new(tr("コピー")))
+            .clicked()
+        {
+            let prompt = store.prompt();
+            ui.output_mut(|o| o.copied_text = prompt);
+        }
+        if ui.button(tr("すべて削除")).clicked() {
+            store.clear();
+        }
+    });
+    ui.add_space(4.0);
+    action
 }
 
 /// ファイル見出し: パス + `+追加 -削除`。
@@ -526,15 +977,20 @@ fn hunk_header_ui(ui: &mut egui::Ui, theme: &Theme, pal: &DiffPalette, hunk: &Hu
         });
 }
 
-/// 1 行分: [旧行番号][新行番号] +/- 本文。
-/// 1 行を描き、実際に占めた高さを返す (仮想化のプレースホルダ用)。
+/// 1 行分: [旧行番号][新行番号][コメント印] +/- 本文。
+///
+/// 1 行を描き、(占めた高さ, クリック判定用の Response) を返す。
+/// 高さは仮想化のプレースホルダ用、Response はコメント追加のトリガ。
+#[allow(clippy::too_many_arguments)]
 fn diff_line_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     pal: &DiffPalette,
     line: &DiffLine,
     size: f32,
-) -> f32 {
+    badge: Option<(usize, bool)>,
+    row_key: (usize, usize, usize),
+) -> (f32, egui::Response) {
     let (bg, sign_fg, sign) = match line.kind {
         LineKind::Added => (pal.add_bg, pal.add_fg, "+"),
         LineKind::Removed => (pal.del_bg, pal.del_fg, "-"),
@@ -547,6 +1003,7 @@ fn diff_line_ui(
             ui.spacing_mut().item_spacing.x = 0.0;
             gutter_cell(ui, theme, pal, line.old_no, size);
             gutter_cell(ui, theme, pal, line.new_no, size);
+            marker_cell(ui, theme, badge, size);
             ui.add_space(4.0);
             ui.add(
                 egui::Label::new(
@@ -566,7 +1023,211 @@ fn diff_line_ui(
             );
         });
     });
-    resp.response.rect.height()
+    let rect = resp.response.rect;
+    let hit = ui.interact(
+        rect,
+        ui.id().with(("zv-diff-row", row_key)),
+        egui::Sense::click(),
+    );
+    if hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        // ホバー中の行は薄く持ち上げて、押せることを示す。
+        ui.painter()
+            .rect_filled(rect, 0.0, mix(Color32::TRANSPARENT, theme.accent, 0.10));
+    }
+    let hit = hit.on_hover_text(tr("クリックでコメントを追加/閉じる"));
+    (rect.height(), hit)
+}
+
+/// 行の直下に出すコメントスレッド (既存コメント + 下書き)。
+///
+/// 状態の書き換えは一旦ローカル変数に溜めてからまとめて適用する。
+/// 描画中に `store` を組み替えると、同フレームの列挙とインデックスが食い違う。
+fn comment_thread_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    store: &mut DiffCommentStore,
+    anchor: &CommentAnchor,
+    line: &DiffLine,
+    size: f32,
+) {
+    let ids: Vec<u64> = store
+        .comments
+        .iter()
+        .filter(|c| &c.anchor == anchor)
+        .map(|c| c.id)
+        .collect();
+    let has_draft = store.drafts.contains_key(anchor);
+    if ids.is_empty() && !has_draft {
+        return;
+    }
+
+    let w = ui.available_width();
+    let mut remove: Option<u64> = None;
+    let mut toggle: Option<u64> = None;
+    let mut begin_edit: Option<u64> = None;
+    let mut commit_edit: Option<u64> = None;
+    let mut cancel_edit: Option<u64> = None;
+    let mut submit_draft = false;
+    let mut cancel_draft = false;
+
+    egui::Frame::none()
+        .fill(mix(theme.bg, theme.panel, 0.85))
+        .inner_margin(egui::Margin {
+            // 行番号 2 列 + コメント印の幅ぶん右へ寄せて、本文と桁を合わせる。
+            left: GUTTER_COL_W * 2.0 + MARK_COL_W,
+            right: 6.0,
+            top: 4.0,
+            bottom: 4.0,
+        })
+        .show(ui, |ui| {
+            ui.set_min_width(w);
+            ui.spacing_mut().item_spacing.y = 3.0;
+            for id in ids {
+                let Some((resolved, body)) = store
+                    .comments
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| (c.resolved, c.body.clone()))
+                else {
+                    continue;
+                };
+                let editing = store.editing.contains_key(&id);
+                ui.horizontal_wrapped(|ui| {
+                    let (state, state_col) = if resolved {
+                        (tr("解決済み"), theme.ok)
+                    } else {
+                        (tr("未解決"), theme.warn)
+                    };
+                    ui.label(RichText::new(state).size(size * 0.85).color(state_col));
+                    let label = if resolved {
+                        tr("未解決に戻す")
+                    } else {
+                        tr("解決")
+                    };
+                    if ui.small_button(label).clicked() {
+                        toggle = Some(id);
+                    }
+                    if !editing && ui.small_button(tr("編集")).clicked() {
+                        begin_edit = Some(id);
+                    }
+                    if ui.small_button(tr("削除")).clicked() {
+                        remove = Some(id);
+                    }
+                });
+                if editing {
+                    if let Some(buf) = store.editing.get_mut(&id) {
+                        ui.add(
+                            egui::TextEdit::multiline(buf)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .font(FontId::monospace(size)),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button(tr("保存")).clicked() {
+                            commit_edit = Some(id);
+                        }
+                        if ui.small_button(tr("取消")).clicked() {
+                            cancel_edit = Some(id);
+                        }
+                    });
+                } else {
+                    let col = if resolved { theme.text_dim } else { theme.text };
+                    ui.add(
+                        egui::Label::new(RichText::new(body).size(size).color(col))
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                    );
+                }
+            }
+
+            if let Some(buf) = store.drafts.get_mut(anchor) {
+                ui.add(
+                    egui::TextEdit::multiline(buf)
+                        .hint_text(tr("この行へのコメント"))
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .font(FontId::monospace(size)),
+                );
+                let can_add = !buf.trim().is_empty();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_add, egui::Button::new(tr("追加")).small())
+                        .clicked()
+                    {
+                        submit_draft = true;
+                    }
+                    if ui.small_button(tr("取消")).clicked() {
+                        cancel_draft = true;
+                    }
+                });
+            }
+        });
+
+    // --- 溜めた操作をまとめて適用 ---
+    if let Some(id) = toggle {
+        store.toggle_resolved(id);
+    }
+    if let Some(id) = begin_edit {
+        let body = store
+            .comments
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.body.clone())
+            .unwrap_or_default();
+        store.editing.insert(id, body);
+    }
+    if let Some(id) = commit_edit {
+        if let Some(body) = store.editing.remove(&id) {
+            store.edit(id, body);
+        }
+    }
+    if let Some(id) = cancel_edit {
+        store.editing.remove(&id);
+    }
+    if let Some(id) = remove {
+        store.remove(id);
+    }
+    if submit_draft {
+        if let Some(body) = store.drafts.remove(anchor) {
+            store.add(anchor.clone(), line.text.clone(), body.trim());
+        }
+    }
+    if cancel_draft {
+        store.close_draft(anchor);
+    }
+}
+
+/// コメント印の列。件数が無くても幅は確保して行のズレを防ぐ。
+fn marker_cell(ui: &mut egui::Ui, theme: &Theme, badge: Option<(usize, bool)>, size: f32) {
+    let (text, color) = match badge {
+        // 全部解決済みなら ok 色、未解決が残っていれば accent。
+        Some((n, all_resolved)) => (
+            if n > 1 {
+                format!("●{n}")
+            } else {
+                "●".to_string()
+            },
+            if all_resolved { theme.ok } else { theme.accent },
+        ),
+        None => (String::new(), theme.text_dim),
+    };
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(MARK_COL_W, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(text)
+                        .monospace()
+                        .size(size * 0.8)
+                        .color(color),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend),
+            );
+        },
+    );
 }
 
 /// 行番号 1 列 (右寄せ)。番号が無い側は空欄。
@@ -1170,5 +1831,373 @@ diff --git a/b b/b
             strip_side_prefix("\"a/\\346\\227\\245.txt\""),
             "日.txt"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // インラインレビューコメント
+    // -----------------------------------------------------------------
+
+    /// テスト用のコメント (id と解決状態は既定)。
+    fn cmt(path: &str, line: usize, quote: &str, body: &str) -> DiffComment {
+        DiffComment {
+            id: 0,
+            anchor: CommentAnchor::new(path, CommentSide::New, line),
+            quote: quote.to_string(),
+            body: body.to_string(),
+            resolved: false,
+        }
+    }
+
+    // ---- build_review_prompt ----
+
+    #[test]
+    fn review_prompt_empty_list_is_empty_string() {
+        assert_eq!(build_review_prompt(&[]), "");
+    }
+
+    #[test]
+    fn review_prompt_single_comment() {
+        let got = build_review_prompt(&[cmt("src/foo.rs", 120, "    let x = 1;", "命名が雑")]);
+        assert_eq!(
+            got,
+            "以下のレビューコメントに対応してください:\n\
+             \n\
+             @src/foo.rs:120\n\
+             >     let x = 1;\n\
+             命名が雑"
+        );
+    }
+
+    #[test]
+    fn review_prompt_sorts_lines_within_a_file() {
+        // 入力はバラバラでも行番号順に並ぶ。
+        let got = build_review_prompt(&[
+            cmt("src/foo.rs", 180, "b", "後ろ"),
+            cmt("src/foo.rs", 12, "a", "前"),
+            cmt("src/foo.rs", 99, "c", "真ん中"),
+        ]);
+        let lines: Vec<&str> = got.lines().filter(|l| l.starts_with('@')).collect();
+        assert_eq!(
+            lines,
+            vec!["@src/foo.rs:12", "@src/foo.rs:99", "@src/foo.rs:180"]
+        );
+    }
+
+    #[test]
+    fn review_prompt_groups_by_file_in_first_seen_order() {
+        // zzz が先に出てくれば zzz が先 (アルファベット順にはしない)。
+        let got = build_review_prompt(&[
+            cmt("zzz.rs", 5, "z", "z へのコメント"),
+            cmt("aaa.rs", 3, "a", "a へのコメント"),
+            cmt("zzz.rs", 1, "z1", "z の先頭"),
+        ]);
+        let heads: Vec<&str> = got.lines().filter(|l| l.starts_with('@')).collect();
+        assert_eq!(heads, vec!["@zzz.rs:1", "@zzz.rs:5", "@aaa.rs:3"]);
+    }
+
+    #[test]
+    fn review_prompt_marks_old_side_and_skips_resolved_and_empty() {
+        let mut removed = cmt("src/foo.rs", 42, "let old = 1;", "これは残すべき");
+        removed.anchor.side = CommentSide::Old;
+        let mut resolved = cmt("src/foo.rs", 43, "x", "解決済みなので出ない");
+        resolved.resolved = true;
+        let blank = cmt("src/foo.rs", 44, "y", "   ");
+        let got = build_review_prompt(&[removed, resolved, blank]);
+        assert!(got.contains("@src/foo.rs:42 (削除行)"), "{got}");
+        assert!(!got.contains("解決済みなので出ない"), "{got}");
+        assert!(!got.contains(":44"), "{got}");
+    }
+
+    #[test]
+    fn review_prompt_all_resolved_is_empty_string() {
+        let mut c = cmt("a.rs", 1, "x", "済み");
+        c.resolved = true;
+        assert_eq!(build_review_prompt(&[c]), "");
+    }
+
+    #[test]
+    fn review_prompt_quote_keeps_backticks_and_flattens_newlines() {
+        // バッククォートはコードフェンスを使わないのでそのまま通す。
+        // 引用は必ず 1 行 (改行・タブは空白へ)。
+        let got = build_review_prompt(&[cmt(
+            "a.rs",
+            1,
+            "let s = `a`;\nlet t = 2;\tend",
+            "本文",
+        )]);
+        assert!(got.contains("> let s = `a`; let t = 2; end"), "{got}");
+        // 引用が 1 行であること = '>' で始まる行はちょうど 1 本。
+        assert_eq!(got.lines().filter(|l| l.starts_with('>')).count(), 1);
+    }
+
+    #[test]
+    fn review_prompt_truncates_long_quote_by_chars() {
+        // 日本語でも UTF-8 境界を割らずに文字数で丸める。
+        let long: String = "あ".repeat(MAX_QUOTE_CHARS + 50);
+        let got = build_review_prompt(&[cmt("a.rs", 1, &long, "本文")]);
+        let quote = got
+            .lines()
+            .find(|l| l.starts_with("> "))
+            .expect("引用行がある");
+        assert_eq!(quote.chars().count(), 2 + MAX_QUOTE_CHARS + 1); // "> " + 本体 + "…"
+        assert!(quote.ends_with('…'));
+    }
+
+    #[test]
+    fn review_prompt_truncates_long_body_by_chars() {
+        let long: String = "長".repeat(MAX_BODY_CHARS + 10);
+        let got = build_review_prompt(&[cmt("a.rs", 1, "q", &long)]);
+        assert!(got.ends_with('…'), "末尾が省略記号ではない");
+        // ヘッダ + パス行 + 引用行 + 本文(MAX+1文字) 程度に収まっている。
+        assert!(got.chars().count() < MAX_BODY_CHARS + 200);
+    }
+
+    #[test]
+    fn review_prompt_multiline_body_is_preserved() {
+        let got = build_review_prompt(&[cmt("a.rs", 1, "q", "1行目\n2行目")]);
+        assert!(got.ends_with("1行目\n2行目"), "{got}");
+    }
+
+    // ---- DiffCommentStore ----
+
+    #[test]
+    fn store_add_edit_delete_resolve() {
+        let mut s = DiffCommentStore::default();
+        let a = CommentAnchor::new("a.rs", CommentSide::New, 10);
+        let id = s.add(a.clone(), "let x = 1;", "直して");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.actionable_len(), 1);
+
+        assert!(s.edit(id, "やっぱりこう直して"));
+        assert_eq!(s.all()[0].body, "やっぱりこう直して");
+        assert!(!s.edit(id + 999, "存在しない"));
+
+        assert!(s.toggle_resolved(id));
+        assert!(s.all()[0].resolved);
+        assert_eq!(s.actionable_len(), 0, "解決済みは送信対象から外れる");
+        assert!(s.set_resolved(id, false));
+        assert_eq!(s.actionable_len(), 1);
+
+        assert!(s.remove(id));
+        assert!(!s.remove(id), "二度目の削除は false");
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn store_keeps_insertion_order_and_never_reuses_ids() {
+        let mut s = DiffCommentStore::default();
+        let a1 = CommentAnchor::new("a.rs", CommentSide::New, 1);
+        let a2 = CommentAnchor::new("a.rs", CommentSide::New, 2);
+        let i1 = s.add(a1.clone(), "q1", "1つ目");
+        let i2 = s.add(a2.clone(), "q2", "2つ目");
+        s.remove(i1);
+        let i3 = s.add(a1.clone(), "q1", "3つ目");
+        assert!(i3 > i2 && i2 > i1, "id は単調増加 ({i1},{i2},{i3})");
+        let bodies: Vec<&str> = s.all().iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["2つ目", "3つ目"], "追加順が保たれる");
+    }
+
+    #[test]
+    fn store_badge_counts_per_anchor() {
+        let mut s = DiffCommentStore::default();
+        let a = CommentAnchor::new("a.rs", CommentSide::New, 7);
+        let other = CommentAnchor::new("a.rs", CommentSide::Old, 7);
+        assert_eq!(s.badge(&a), None);
+        let id = s.add(a.clone(), "q", "x");
+        s.add(a.clone(), "q", "y");
+        assert_eq!(s.badge(&a), Some((2, false)));
+        assert_eq!(s.badge(&other), None, "側が違えば別の行");
+        s.set_resolved(id, true);
+        assert_eq!(s.badge(&a), Some((2, false)), "1件でも未解決なら未解決扱い");
+        for c in s.all().to_vec() {
+            s.set_resolved(c.id, true);
+        }
+        assert_eq!(s.badge(&a), Some((2, true)));
+        assert_eq!(s.at(&a).len(), 2);
+    }
+
+    #[test]
+    fn store_draft_toggles_and_marks_row_as_expanded() {
+        let mut s = DiffCommentStore::default();
+        let a = CommentAnchor::new("a.rs", CommentSide::New, 3);
+        assert!(!s.has_ui_at(&a));
+        s.toggle_draft(a.clone());
+        assert!(s.has_ui_at(&a), "下書き中の行は仮想化から外す");
+        s.toggle_draft(a.clone());
+        assert!(!s.has_ui_at(&a));
+        s.add(a.clone(), "q", "本文");
+        assert!(s.has_ui_at(&a), "コメント付きの行も仮想化から外す");
+        s.clear();
+        assert!(!s.has_ui_at(&a));
+    }
+
+    // ---- クリック位置 → アンカー ----
+
+    #[test]
+    fn line_target_picks_new_side_for_added_and_context() {
+        let src = "\
+diff --git a/src/foo.rs b/src/foo.rs
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -10,2 +20,3 @@ fn f() {
+ ctx1
+-removed
++added1
++added2
+";
+        let files = parse_unified(src);
+        assert_eq!(files.len(), 1);
+        let path = anchor_path(&files[0]);
+        assert_eq!(path, "src/foo.rs");
+        let got: Vec<(CommentSide, usize)> = files[0].hunks[0]
+            .lines
+            .iter()
+            .map(|l| line_target(l).expect("行番号がある"))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (CommentSide::New, 20), // 文脈行 → 新側
+                (CommentSide::Old, 11), // 削除行 → 旧側 (10 は ctx1)
+                (CommentSide::New, 21), // 追加行 → 新側
+                (CommentSide::New, 22),
+            ]
+        );
+        // アンカーはパス付きで組み立たる
+        let a = line_anchor(&path, &files[0].hunks[0].lines[2]).unwrap();
+        assert_eq!(a, CommentAnchor::new("src/foo.rs", CommentSide::New, 21));
+    }
+
+    #[test]
+    fn line_target_handles_multiple_hunks_and_pure_add_delete() {
+        let src = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1,2 @@
+ keep
++new
+@@ -100,2 +101,1 @@
+-gone
+ tail
+";
+        let files = parse_unified(src);
+        let f = &files[0];
+        assert_eq!(f.hunks.len(), 2);
+        let h0: Vec<_> = f.hunks[0].lines.iter().filter_map(line_target).collect();
+        assert_eq!(h0, vec![(CommentSide::New, 1), (CommentSide::New, 2)]);
+        let h1: Vec<_> = f.hunks[1].lines.iter().filter_map(line_target).collect();
+        assert_eq!(
+            h1,
+            vec![(CommentSide::Old, 100), (CommentSide::New, 101)],
+            "2つ目のハンクでもヘッダの開始行が効く"
+        );
+    }
+
+    #[test]
+    fn anchor_path_prefers_new_path_even_on_rename() {
+        let src = "\
+diff --git a/old.rs b/new.rs
+similarity index 90%
+rename from old.rs
+rename to new.rs
+--- a/old.rs
++++ b/new.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let files = parse_unified(src);
+        assert!(files[0].is_rename);
+        // 表示は "old.rs → new.rs" でも、エージェントに渡すのは新パスだけ。
+        assert!(files[0].display_path().contains('→'));
+        assert_eq!(anchor_path(&files[0]), "new.rs");
+    }
+
+    #[test]
+    fn anchor_path_falls_back_to_old_path_on_delete() {
+        let src = "\
+diff --git a/gone.rs b/gone.rs
+deleted file mode 100644
+--- a/gone.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+";
+        let files = parse_unified(src);
+        assert_eq!(anchor_path(&files[0]), "gone.rs");
+    }
+
+    // ---- 再パース耐性 ----
+
+    #[test]
+    fn comments_survive_a_reparse_of_the_same_diff() {
+        let src = "\
+diff --git a/src/foo.rs b/src/foo.rs
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -10,2 +20,3 @@
+ ctx
+-old
++new1
++new2
+";
+        let files = parse_unified(src);
+        let path = anchor_path(&files[0]);
+        let mut store = DiffCommentStore::default();
+        // 3 行目 (追加行 new1) と削除行にコメントを付ける。
+        let add_line = &files[0].hunks[0].lines[2];
+        let del_line = &files[0].hunks[0].lines[1];
+        store.add(
+            line_anchor(&path, add_line).unwrap(),
+            add_line.text.clone(),
+            "追加行へのコメント",
+        );
+        store.add(
+            line_anchor(&path, del_line).unwrap(),
+            del_line.text.clone(),
+            "削除行へのコメント",
+        );
+
+        // まったく同じ diff を再パース (タブ切り替え等で毎フレーム起こりうる)。
+        let again = parse_unified(src);
+        let path2 = anchor_path(&again[0]);
+        let hits: Vec<(usize, &str)> = again[0].hunks[0]
+            .lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let a = line_anchor(&path2, l)?;
+                let c = store.at(&a).first().copied()?;
+                Some((i, c.body.as_str()))
+            })
+            .collect();
+        assert_eq!(
+            hits,
+            vec![(1, "削除行へのコメント"), (2, "追加行へのコメント")],
+            "再パース後も同じ行に付いている (行インデックスではなく行番号が鍵)"
+        );
+
+        // ハンクの前に行が増えても、その行の行番号が変わらない限り追随する。
+        let prompt = store.prompt();
+        assert!(prompt.contains("@src/foo.rs:21"), "{prompt}");
+        assert!(prompt.contains("@src/foo.rs:11 (削除行)"), "{prompt}");
+    }
+
+    #[test]
+    fn store_prompt_matches_build_review_prompt() {
+        let mut s = DiffCommentStore::default();
+        s.add(
+            CommentAnchor::new("a.rs", CommentSide::New, 1),
+            "q",
+            "body",
+        );
+        assert_eq!(s.prompt(), build_review_prompt(s.all()));
+        assert!(!s.prompt().is_empty());
+    }
+
+    #[test]
+    fn diff_action_defaults_to_none() {
+        assert_eq!(DiffAction::default(), DiffAction::None);
     }
 }

@@ -427,6 +427,44 @@ impl AgentInputBuffer {
         expanded
     }
 
+    /// 外部で組み立てたプロンプト (diff ビューのレビューコメントなど) を
+    /// 入力欄へ流し込む。
+    ///
+    /// 書きかけの下書きは捨てず、空行 1 つを挟んで後ろに継ぎ足す。Undo 1 回で
+    /// 元に戻せるので、誤って流し込んでも取り返しがつく。追記できたら true。
+    ///
+    /// 呼び出し側 (app.rs) の想定配線:
+    /// ```text
+    /// if let Some(p) = crate::diff::take_pending_review_prompt(ctx) {
+    ///     self.agent_input_buf.append_prompt(&p);
+    /// }
+    /// ```
+    /// そのまま送信まで通したい場合は `append_prompt` の後に `submit()` の
+    /// 戻り値をエージェントの stdin へ書けばよい (送信経路は agents.rs 側)。
+    // app.rs 側の配線待ち。配線されるまで未使用でも警告にしない。
+    #[allow(dead_code)]
+    pub fn append_prompt(&mut self, prompt: &str) -> bool {
+        let add = prompt.trim();
+        if add.is_empty() {
+            return false;
+        }
+        self.push_undo_state();
+        if !self.text.trim().is_empty() {
+            // 末尾の改行を 1 本にそろえてから空行区切りで連結する。
+            while self.text.ends_with('\n') || self.text.ends_with('\r') {
+                self.text.pop();
+            }
+            self.text.push_str("\n\n");
+        } else {
+            self.text.clear();
+        }
+        self.text.push_str(add);
+        self.cursor = self.text.chars().count();
+        self.selection = None;
+        self.history_idx = None;
+        true
+    }
+
     /// クリア
     pub fn clear(&mut self) {
         self.push_undo_state();
@@ -611,5 +649,35 @@ mod tests {
         }
         let elapsed = start.elapsed();
         assert!(elapsed.as_millis() < 2000, "Parsing took too long: {:?}", elapsed);
+    }
+
+    // ---- レビュープロンプトの流し込み ----
+
+    #[test]
+    fn append_prompt_into_empty_buffer() {
+        let mut b = AgentInputBuffer::new();
+        assert!(b.append_prompt("  以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x\n直して  "));
+        assert_eq!(b.text(), "以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x\n直して");
+        assert_eq!(b.cursor(), b.text().chars().count());
+    }
+
+    #[test]
+    fn append_prompt_keeps_existing_draft_and_separates_with_blank_line() {
+        let mut b = AgentInputBuffer::new();
+        b.set_text("書きかけ\n\n\n");
+        assert!(b.append_prompt("@a.rs:1\n> x\n直して"));
+        assert_eq!(b.text(), "書きかけ\n\n@a.rs:1\n> x\n直して");
+    }
+
+    #[test]
+    fn append_prompt_ignores_blank_and_is_undoable() {
+        let mut b = AgentInputBuffer::new();
+        b.set_text("元の下書き");
+        assert!(!b.append_prompt("   \n  "), "空プロンプトは無視");
+        assert_eq!(b.text(), "元の下書き");
+        assert!(b.append_prompt("追いプロンプト"));
+        assert_eq!(b.text(), "元の下書き\n\n追いプロンプト");
+        b.undo();
+        assert_eq!(b.text(), "元の下書き", "Undo 1 回で流し込み前に戻る");
     }
 }
