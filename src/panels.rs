@@ -1549,9 +1549,12 @@ pub fn composer_target_chips(
                     let txt = RichText::new(label)
                         .size(11.5)
                         .color(if sel { theme.accent } else { theme.text_dim });
-                    // ID はセッション id から作る。selectable_label はラベル文字列から
-                    // 自動生成するため、同名のエージェントが並ぶと ID が衝突し、
-                    // どれを押しても最後の 1 つが選ばれてしまう (実際に起きた)。
+                    // ID をセッション id に固定する。egui 0.29 の
+                    // `selectable_label` はラベル文字列ではなく **Ui の自動採番**
+                    // (`next_auto_id_salt`) から ID を作るので、1 フレームの中で
+                    // 衝突はしない。だが採番は**並び順に依存する**ため、同名の
+                    // エージェントが増減・並べ替えされるとホバー/フォーカスなどの
+                    // 状態が隣のチップへずれる。id を混ぜて順序から切り離す。
                     let clicked = ui
                         .push_id(*id, |ui| {
                             ui.selectable_label(sel, txt).on_hover_text(label).clicked()
@@ -2883,5 +2886,661 @@ mod tests {
         );
         // 拾ったキーは取り除く (下の層で二重に効かない)
         assert!(head.contains("i.events.retain("), "キーを消費していない");
+    }
+}
+
+/// **egui 0.29 のウィジェット ID 衝突を再発させないための番人。**
+///
+/// # egui 0.29 で実際に衝突するのはどれか (思い込み厳禁)
+///
+/// egui 0.29.1 の `Ui` は ID を 2 本持つ (`egui/src/ui.rs`):
+/// - `id` (= *stable_id*) = 親の `id` に `UiBuilder::id_salt` を混ぜたもの。
+///   `id_salt` の既定値は**定数** `"child"` なので、`ui.horizontal(…)` などで
+///   作った子 Ui の `id` は**ループの各周回で同じ値**になる。
+/// - `unique_id` = `stable_id` に自動採番カウンタを混ぜたもの (周回ごとに違う)。
+///
+/// ここから 2 階層に分かれる:
+/// - `Button` / `SelectableLabel` / `Checkbox` / `RadioButton` /
+///   `id_salt` 無しの `TextEdit` は `Ui::allocate_*` 経由で
+///   `Id::new(next_auto_id_salt)` を貰う = **1 フレーム内では必ず一意**。
+///   「同じラベルのボタンを並べると最後の 1 つしか押せない」は
+///   **egui 0.29 では起きない** (ID はラベル文字列から作られていない)。
+///   ただし採番は**並び順に依存する**ので、行が増減するとホバー/フォーカス/
+///   カーソルの状態が隣の行へずれる。そこは `push_id` / `id_salt` で
+///   行の安定キーに縛る。
+/// - `ScrollArea` / `ComboBox` / `CollapsingHeader` / `CollapsingState` /
+///   `Grid` / `id_salt` 付きの `TextEdit` は `Ui::make_persistent_id` =
+///   **stable_id** から作る。これらを**定数 salt のままループ内に置くと
+///   全周回で ID が一致し、本当に衝突する**。
+///
+/// この番人が落とすのは後者だけ。前者まで機械的に `push_id` で包むのは
+/// 効果のないノイズなので入れない (CLAUDE.md「足す前に減らす」)。
+///
+/// # 限界 (正直に)
+///
+/// 字面の走査なので、**ループから呼ばれるヘルパ関数の中身**までは追えない。
+/// そこは「行のキーを `id_salt` に渡す」規約で守る。
+#[cfg(test)]
+mod egui_id_guard {
+    use regex::Regex;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    /// 走査から外す場所。`(ファイル名, 文に含まれる文字列, 外す理由)`。
+    /// **1 件ごとに理由を書くこと** — 理由の書けない除外は入れない。
+    const ALLOW: &[(&str, &str, &str)] = &[];
+
+    /// 実行時の値を含まない (= 全周回で同じ) 語。
+    const CONST_WORDS: &[&str] = &[
+        "Id", "new", "with", "tr", "String", "str", "as", "to_string", "from",
+    ];
+
+    /// `src/` の場所。ビルド時に決まる値から導くので、どの環境でも動く
+    /// (ユーザー名やドライブ文字を書かない)。
+    fn src_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    fn re_loop() -> &'static Regex {
+        static R: OnceLock<Regex> = OnceLock::new();
+        R.get_or_init(|| {
+            Regex::new(concat!(
+                r"(?:^|[^\w.])(?:for|while)[\s(]",
+                r"|(?:^|[^\w.])loop\s*\{",
+                r"|\.(?:for_each|retain|retain_mut)\s*\(",
+            ))
+            .expect("ループ検出の正規表現")
+        })
+    }
+
+    fn re_persistent() -> &'static Regex {
+        static R: OnceLock<Regex> = OnceLock::new();
+        R.get_or_init(|| {
+            Regex::new(concat!(
+                r"\bScrollArea::(?:vertical|horizontal|both|new)\s*\(",
+                r"|\bCollapsingHeader::new\s*\(",
+                r"|\bCollapsingState::(?:load_with_default_open|load)\s*\(",
+                r"|\bComboBox::(?:from_label|from_id_salt|from_id_source|new)\s*\(",
+                r"|\bGrid::new\s*\(",
+                r"|\bWindow::new\s*\(",
+                r"|\bArea::new\s*\(",
+                r"|\.collapsing\s*\(",
+                r"|\.make_persistent_id\s*\(",
+                r"|\bTextEdit::(?:singleline|multiline)\s*\(",
+            ))
+            .expect("永続 ID ウィジェットの正規表現")
+        })
+    }
+
+    /// salt を明示している文か。
+    fn has_explicit_salt(stmt: &str) -> bool {
+        stmt.contains(".id_salt(") || stmt.contains(".id_source(") || stmt.contains(".id(")
+    }
+
+    /// この文を違反として挙げるか。
+    ///
+    /// `TextEdit` だけは扱いが違う: salt を**書いたときだけ**
+    /// `make_persistent_id` (= stable_id) を使い、無指定なら自動採番になる。
+    /// つまり「salt 無し」は衝突しないので挙げてはいけない。
+    /// 他のウィジェットは salt 無し = 既定の定数 salt = 衝突する。
+    fn is_violation(widget: &str, stmt: &str) -> bool {
+        if widget.contains("TextEdit") {
+            return has_explicit_salt(stmt) && salt_is_constant(stmt);
+        }
+        salt_is_constant(stmt)
+    }
+
+    /// id salt を渡している場所。並び順が優先順位なので `id_salt` を `id` より先に置く。
+    fn re_salt() -> &'static Regex {
+        static R: OnceLock<Regex> = OnceLock::new();
+        R.get_or_init(|| {
+            Regex::new(concat!(
+                r"\.id_salt\s*\(|\.id_source\s*\(",
+                r"|from_id_salt\s*\(|from_id_source\s*\(",
+                r"|make_persistent_id\s*\(|load_with_default_open\s*\(",
+                r"|Grid::new\s*\(|Window::new\s*\(|Area::new\s*\(",
+                r"|CollapsingHeader::new\s*\(|ComboBox::from_label\s*\(",
+                r"|\.collapsing\s*\(|\.id\s*\(",
+            ))
+            .expect("id salt の正規表現")
+        })
+    }
+
+    fn re_ident() -> &'static Regex {
+        static R: OnceLock<Regex> = OnceLock::new();
+        R.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("識別子の正規表現"))
+    }
+
+    fn re_strlit() -> &'static Regex {
+        static R: OnceLock<Regex> = OnceLock::new();
+        R.get_or_init(|| Regex::new(r#""[^"]*""#).expect("文字列リテラルの正規表現"))
+    }
+
+    /// 行から**コメント・文字列の中身・文字リテラル**を落とす。
+    ///
+    /// 文字リテラルまで落とすのが要点。`code.matches('{')` のような行を
+    /// 残すと `'{'` を本物の波括弧として数えてしまい、以降の入れ子が
+    /// 丸ごとずれる (この番人自身のソースで実際に踏んだ)。
+    /// ライフタイム (`&'a str`) は文字リテラルではないので温存する。
+    fn strip_noise(line: &str) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0;
+        let mut in_str = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_str {
+                if c == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    in_str = false;
+                    out.push('"');
+                }
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+                out.push('"');
+                i += 1;
+                continue;
+            }
+            if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                break;
+            }
+            // 文字リテラル `'x'` / `'\n'` だけを畳む。`'a` (ライフタイム) は
+            // 閉じ引用符が来ないのでここには入らない。
+            if c == '\'' {
+                let esc = chars.get(i + 1) == Some(&'\\');
+                let close = if esc { i + 3 } else { i + 2 };
+                if chars.get(close) == Some(&'\'') {
+                    out.push_str("''");
+                    i = close + 1;
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// この行がループの頭か (`for` / `while` / `loop` / `for_each`)。
+    fn is_loop_head(code: &str) -> bool {
+        re_loop().is_match(code)
+    }
+
+    /// **stable_id から ID を作るウィジェット**なら、その名前を返す。
+    /// 自動採番組 (Button / SelectableLabel / …) はここに入れない。
+    fn persistent_widget(code: &str) -> Option<String> {
+        re_persistent().find(code).map(|m| m.as_str().trim().to_string())
+    }
+
+    /// 文の中の id salt が**すべて定数**なら `true` (= ループ内なら衝突する)。
+    /// 1 つでも実行時の値 (変数・フィールド) が混ざっていれば `false`。
+    /// salt を一切書いていない場合も既定の定数 salt なので `true`。
+    fn salt_is_constant(stmt: &str) -> bool {
+        let chars: Vec<char> = stmt.chars().collect();
+        for m in re_salt().find_iter(stmt) {
+            let start = stmt[..m.start()].chars().count();
+            let Some(open) = (start..chars.len()).find(|&k| chars[k] == '(') else {
+                continue;
+            };
+            let mut depth = 0usize;
+            let mut end = open;
+            for (k, c) in chars.iter().enumerate().skip(open) {
+                if *c == '(' {
+                    depth += 1;
+                } else if *c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = k;
+                        break;
+                    }
+                }
+            }
+            if end <= open {
+                continue;
+            }
+            let arg: String = chars[open + 1..end].iter().collect();
+            // 文字列リテラルの中身は定数なので落とす
+            let arg = re_strlit().replace_all(&arg, "");
+            if re_ident()
+                .find_iter(&arg)
+                .any(|t| !CONST_WORDS.contains(&t.as_str()))
+            {
+                return false; // 実行時の値が混ざっている = 周回ごとに変わる
+            }
+        }
+        true
+    }
+
+    /// 見つかった違反。`(行番号, ウィジェット名, 文)`。
+    type Finding = (usize, String, String);
+
+    /// `i` 行目を含む**メソッドチェーン全体**を 1 本の文にまとめる。
+    /// `.id_salt(…)` が数行下にぶら下がっていても取りこぼさないため。
+    fn widen(lines: &[&str], codes: &[String], i: usize) -> String {
+        let mut lo = i;
+        while lo > 0 {
+            let t = lines[lo].trim_start();
+            if t.starts_with('.') || t.starts_with('|') {
+                lo -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut hi = lo;
+        let mut depth: i64 = 0;
+        loop {
+            depth += codes[hi].matches('(').count() as i64;
+            depth -= codes[hi].matches(')').count() as i64;
+            let next_is_chain = hi + 1 < lines.len() && lines[hi + 1].trim_start().starts_with('.');
+            if depth <= 0 && hi >= i && !next_is_chain {
+                break;
+            }
+            if hi + 1 >= lines.len() || hi - lo > 60 {
+                break;
+            }
+            hi += 1;
+        }
+        lines[lo..=hi]
+            .iter()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// 1 ファイル分を走査する。`#[cfg(test)]` の中は見ない。
+    fn scan_source(src: &str) -> Vec<Finding> {
+        let src = src.replace("\r\n", "\n");
+        let lines: Vec<&str> = src.split('\n').collect();
+        let codes: Vec<String> = lines.iter().map(|l| strip_noise(l)).collect();
+        let mut hits = Vec::new();
+        // 波括弧ごとの枠。`.0` = この枠がループの本体か、`.1` = push_id で包まれたか
+        let mut stack: Vec<(bool, bool)> = Vec::new();
+        let (mut pend_loop, mut pend_id, mut pend_cfg) = (false, false, false);
+        let mut test_exit: Option<usize> = None;
+        let mut in_raw = false;
+
+        for (i, code) in codes.iter().enumerate() {
+            // 複数行の生文字列 (`r#"…"#`) の中身はコードではない。
+            // ここを数えると、テストの fixture がそのまま本物の
+            // ソースとして走査されてしまう。
+            if in_raw {
+                if lines[i].contains("\"#") {
+                    in_raw = false;
+                }
+                continue;
+            }
+            if lines[i].trim_start().starts_with("//") {
+                continue;
+            }
+            if let Some(d) = test_exit {
+                if stack.len() <= d {
+                    test_exit = None;
+                }
+            }
+            let mut in_test = test_exit.is_some();
+            if code.contains("#[cfg(test)]") {
+                pend_cfg = true;
+            }
+            let opens = code.matches('{').count();
+            let closes = code.matches('}').count();
+            if pend_cfg && opens > 0 && test_exit.is_none() {
+                test_exit = Some(stack.len());
+                pend_cfg = false;
+                in_test = true;
+            }
+
+            let this_loop = is_loop_head(code);
+            let this_id = code.contains("push_id(");
+
+            if !in_test && stack.iter().any(|f| f.0) {
+                if let Some(w) = persistent_widget(code) {
+                    let li = stack.iter().rposition(|f| f.0).expect("ループ枠がある");
+                    if !stack[li..].iter().any(|f| f.1) {
+                        let stmt = widen(&lines, &codes, i);
+                        if is_violation(&w, &stmt) {
+                            hits.push((i + 1, w, stmt));
+                        }
+                    }
+                }
+            }
+
+            // この行が開いた枠に「ループ本体 / push_id の中」の印を付ける
+            let first = (this_loop || pend_loop, this_id || pend_id);
+            let net = opens as i64 - closes as i64;
+            if opens > 0 {
+                pend_loop = false;
+                pend_id = false;
+            }
+            for k in 0..net.max(0) {
+                stack.push(if k == 0 { first } else { (false, false) });
+            }
+            for _ in 0..(-net).max(0) {
+                stack.pop();
+            }
+            // 波括弧が次の行へ回った書き方 (`for x in y\n{`) を拾う
+            if opens == 0 {
+                pend_loop |= this_loop;
+                pend_id |= this_id;
+            }
+            if code.trim_end().ends_with(';') {
+                pend_loop = false;
+                pend_id = false;
+            }
+            // 生文字列がこの行で開いて閉じていないなら、次行から中身を飛ばす
+            if let Some(p) = lines[i].rfind("r#\"") {
+                if !lines[i][p + 3..].contains("\"#") {
+                    in_raw = true;
+                }
+            }
+        }
+        hits
+    }
+
+    fn allowed(file: &str, stmt: &str) -> bool {
+        ALLOW
+            .iter()
+            .any(|(f, needle, _why)| *f == file && stmt.contains(needle))
+    }
+
+    // ---- 走査器そのものの単体テスト (fixture で振る舞いを固定する) ----
+
+    #[test]
+    fn 走査器はループ内の定数idウィジェットを見つける() {
+        let bad = r#"
+fn a(ui: &mut egui::Ui, rows: &[Row]) {
+    for r in rows {
+        ui.horizontal(|ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {});
+            egui::CollapsingHeader::new(tr("詳細")).show(ui, |ui| {});
+            egui::ComboBox::from_id_salt("mode").show_ui(ui, |ui| {});
+            egui::Grid::new("g").show(ui, |ui| {});
+        });
+    }
+}
+"#;
+        let hits = scan_source(bad);
+        assert_eq!(hits.len(), 4, "4 件すべて見つける: {hits:?}");
+        assert!(hits.iter().any(|h| h.1.contains("ScrollArea")));
+        assert!(hits.iter().any(|h| h.1.contains("CollapsingHeader")));
+        assert!(hits.iter().any(|h| h.1.contains("ComboBox")));
+        assert!(hits.iter().any(|h| h.1.contains("Grid")));
+    }
+
+    #[test]
+    fn 走査器はpush_idとid_saltを許す() {
+        let good = r#"
+fn a(ui: &mut egui::Ui, rows: &[Row]) {
+    for r in rows {
+        ui.push_id(r.id, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {});
+        });
+        egui::ScrollArea::vertical()
+            .id_salt(("row", r.id))
+            .show(ui, |ui| {});
+    }
+}
+"#;
+        assert!(scan_source(good).is_empty(), "{:?}", scan_source(good));
+    }
+
+    #[test]
+    fn texteditはsaltを書いたときだけ見る() {
+        // salt 無し = 自動採番 = 衝突しないので挙げない
+        let auto = r#"
+fn a(ui: &mut egui::Ui, rows: &[Row]) {
+    for r in rows {
+        ui.add(egui::TextEdit::singleline(&mut v));
+    }
+}
+"#;
+        assert!(scan_source(auto).is_empty(), "{:?}", scan_source(auto));
+
+        // 定数 salt = stable_id = 全周回で一致 = 衝突する
+        let fixed = r#"
+fn a(ui: &mut egui::Ui, rows: &[Row]) {
+    for r in rows {
+        ui.add(egui::TextEdit::singleline(&mut v).id_salt("one"));
+    }
+}
+"#;
+        assert_eq!(scan_source(fixed).len(), 1, "{:?}", scan_source(fixed));
+
+        // 行のキーを混ぜてあれば通す
+        let keyed = r#"
+fn a(ui: &mut egui::Ui, rows: &[Row]) {
+    for r in rows {
+        ui.add(egui::TextEdit::singleline(&mut v).id_salt(("row", r.id)));
+    }
+}
+"#;
+        assert!(scan_source(keyed).is_empty(), "{:?}", scan_source(keyed));
+    }
+
+    #[test]
+    fn 走査器は自動採番のウィジェットを騒ぎ立てない() {
+        // Button / SelectableLabel は 1 フレーム内で必ず一意なので対象外。
+        let fine = r#"
+fn a(ui: &mut egui::Ui, rows: &[Row]) {
+    for r in rows {
+        if ui.button("👁").clicked() {}
+        if ui.small_button("🔍").clicked() {}
+        ui.selectable_label(false, "同じ名前");
+    }
+}
+"#;
+        assert!(scan_source(fine).is_empty());
+    }
+
+    #[test]
+    fn 走査器はテストコードとコメントを見ない() {
+        let src = r#"
+fn a(ui: &mut egui::Ui) {
+    for r in rows {
+        // egui::ScrollArea::vertical() と書いても拾わない
+        let s = "egui::Grid::new(g)";
+    }
+}
+#[cfg(test)]
+mod tests {
+    fn b(ui: &mut egui::Ui) {
+        for r in rows {
+            egui::ScrollArea::vertical().show(ui, |ui| {});
+        }
+    }
+}
+"#;
+        assert!(scan_source(src).is_empty(), "{:?}", scan_source(src));
+    }
+
+    #[test]
+    fn salt判定は実行時の値を見分ける() {
+        assert!(salt_is_constant(r#"ScrollArea::vertical().id_salt("fixed")"#));
+        assert!(salt_is_constant(r#"Grid::new("g")"#));
+        assert!(salt_is_constant(r#"ScrollArea::vertical().show(ui, |ui| {})"#));
+        assert!(!salt_is_constant(
+            r#"ScrollArea::vertical().id_salt(("row", r.id))"#
+        ));
+        assert!(!salt_is_constant(r#"Grid::new(("md-table", table_id))"#));
+        // tr(..) は定数の言い換えなので定数扱い
+        assert!(salt_is_constant(r#"CollapsingHeader::new(tr("詳細"))"#));
+    }
+
+    #[test]
+    fn 行のコメントと文字列は落とす() {
+        assert_eq!(strip_noise("let a = 1; // ScrollArea"), "let a = 1; ");
+        assert_eq!(strip_noise(r#"let s = "Grid::new";"#), r#"let s = "";"#);
+    }
+
+    #[test]
+    fn 文字リテラルの波括弧を数えない() {
+        // ここを取りこぼすと入れ子の深さがずれ、番人が別の場所を誤検知する
+        assert_eq!(strip_noise("code.matches('{').count();"), "code.matches('').count();");
+        assert_eq!(strip_noise("if c == '\"' {"), "if c == '' {");
+        assert_eq!(strip_noise("i += 1; // '}'"), "i += 1; ");
+        // ライフタイムは文字リテラルではないので壊さない
+        assert_eq!(strip_noise("fn f<'a>(x: &'a str) {"), "fn f<'a>(x: &'a str) {");
+    }
+
+    #[test]
+    fn 複数行の生文字列は走査しない() {
+        // fixture をソースに置いても本物のコードとして数えない
+        let src = "fn a() {\n    let s = r#\"\nfor r in rows {\n    egui::Grid::new(\"g\");\n}\n\"#;\n}\n";
+        assert!(scan_source(src).is_empty(), "{:?}", scan_source(src));
+    }
+
+    #[test]
+    fn チェーンをまたいだid_saltを取りこぼさない() {
+        let lines = vec![
+            "egui::TextEdit::singleline(",
+            "    &mut v,",
+            ")",
+            ".id_salt((",
+            "    \"zv-plset-val\",",
+            "    &s.key,",
+            "))",
+            ".password(true);",
+        ];
+        let codes: Vec<String> = lines.iter().map(|l| strip_noise(l)).collect();
+        let stmt = widen(&lines, &codes, 0);
+        assert!(stmt.contains("id_salt"), "チェーンを取りこぼした: {stmt}");
+        assert!(!salt_is_constant(&stmt), "実行時の値を見落とした: {stmt}");
+    }
+
+    // ---- egui を実際に走らせて「どれが衝突するか」を証拠で固定する ----
+    //
+    // 番人の前提そのものを実行時に確かめる。ここが緑である限り、
+    // 「同じラベルのボタンは最後の 1 つしか押せない」という**誤った前提**で
+    // 無意味な `push_id` を撒く改修は入らない。
+
+    /// ヘッドレスで 1 フレームだけ描いて、集めた ID を返す。
+    /// 窓もGPUも要らない (egui の描画は純粋な CPU レイアウト)。
+    fn ids_of_one_frame(build: impl FnOnce(&mut egui::Ui, &mut Vec<egui::Id>)) -> Vec<egui::Id> {
+        let ctx = egui::Context::default();
+        let mut ids = Vec::new();
+        let mut build = Some(build);
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(b) = build.take() {
+                    b(ui, &mut ids);
+                }
+            });
+        });
+        ids
+    }
+
+    fn all_unique(ids: &[egui::Id]) -> bool {
+        let set: std::collections::HashSet<&egui::Id> = ids.iter().collect();
+        set.len() == ids.len()
+    }
+
+    #[test]
+    fn 同じラベルのボタンでもidは衝突しない() {
+        let ids = ids_of_one_frame(|ui, ids| {
+            for _ in 0..5 {
+                ui.horizontal(|ui| {
+                    ids.push(ui.button("👁").id);
+                    ids.push(ui.selectable_label(false, "同じ名前").id);
+                });
+            }
+        });
+        assert_eq!(ids.len(), 10);
+        assert!(
+            all_unique(&ids),
+            "egui 0.29 の Button/SelectableLabel はラベルではなく Ui の自動採番から \
+             ID を作る。ここが赤くなったら egui の実装が変わった証拠なので、\
+             番人の対象ウィジェット一覧を見直すこと。"
+        );
+    }
+
+    #[test]
+    fn 定数saltのscrollareaはループ内で本当に衝突する() {
+        let ids = ids_of_one_frame(|ui, ids| {
+            for _ in 0..3 {
+                ui.horizontal(|ui| {
+                    let out = egui::ScrollArea::vertical()
+                        .id_salt("fixed")
+                        .show(ui, |ui| ui.label("x"));
+                    ids.push(out.id);
+                });
+            }
+        });
+        assert_eq!(ids.len(), 3);
+        assert!(
+            !all_unique(&ids),
+            "定数 salt の ScrollArea がループ内で衝突しなくなった = \
+             egui の make_persistent_id の扱いが変わった"
+        );
+    }
+
+    #[test]
+    fn push_idとid_saltは衝突を解く() {
+        let by_push = ids_of_one_frame(|ui, ids| {
+            for i in 0..3u64 {
+                ui.push_id(i, |ui| {
+                    let out = egui::ScrollArea::vertical()
+                        .id_salt("fixed")
+                        .show(ui, |ui| ui.label("x"));
+                    ids.push(out.id);
+                });
+            }
+        });
+        assert!(all_unique(&by_push), "push_id で解けていない");
+
+        let by_salt = ids_of_one_frame(|ui, ids| {
+            for i in 0..3u64 {
+                let out = egui::ScrollArea::vertical()
+                    .id_salt(("row", i))
+                    .show(ui, |ui| ui.label("x"));
+                ids.push(out.id);
+            }
+        });
+        assert!(all_unique(&by_salt), "id_salt で解けていない");
+    }
+
+    // ---- 本番: src/ 全体を走査する ----
+
+    #[test]
+    fn srcにループ内の定数idウィジェットが無い() {
+        let dir = src_dir();
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("src/ が読める")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|e| e == "rs").unwrap_or(false))
+            .collect();
+        files.sort();
+        assert!(files.len() > 20, "走査対象が少なすぎる ({})", files.len());
+
+        let mut bad: Vec<String> = Vec::new();
+        for p in &files {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let src = std::fs::read_to_string(p).expect("ソースが読める");
+            for (line, widget, stmt) in scan_source(&src) {
+                if allowed(&name, &stmt) {
+                    continue;
+                }
+                bad.push(format!(
+                    "{name}:{line} — {widget} がループの中で定数 ID を使っている\n    {}",
+                    stmt.chars().take(160).collect::<String>()
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "egui 0.29 で ID が衝突する書き方が {} 件ある。\n\
+             周回をまたいで同じ ID になるので、`ui.push_id(<行の安定キー>, |ui| …)` で囲むか\n\
+             `.id_salt((\"名前\", <行の安定キー>))` を付けること:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
     }
 }

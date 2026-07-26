@@ -1119,6 +1119,11 @@ fn comment_thread_ui(
                     if let Some(buf) = store.editing.get_mut(&id) {
                         ui.add(
                             egui::TextEdit::multiline(buf)
+                                // ID はコメント id から作る。省くと egui は
+                                // **並び順から自動採番**するため、上の行が
+                                // 増減した瞬間にカーソル/選択が別のコメントへ
+                                // 移る (編集中に解決印を付けると起きる)。
+                                .id_salt(("zv-diff-comment-edit", id))
                                 .desired_rows(2)
                                 .desired_width(f32::INFINITY)
                                 .font(FontId::monospace(size)),
