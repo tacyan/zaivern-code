@@ -1997,6 +1997,15 @@ fn run_blocking(req: &RunRequest) -> RunOutcome {
     for (k, v) in &req.envs {
         cmd.env(k, v);
     }
+    // タイムアウト時にプロセスツリーごと止められるよう、子を独立した
+    // プロセスグループに置く。これをしないと killpg の相手が存在せず、
+    // 孫 (シェルが exec せずに起動した実体) がパイプを握ったまま生き残り、
+    // 下の読み取り join が孫の寿命まで戻らない = プラグインが固まる。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return fail(format!("{shell} を起動できません: {e}")),
@@ -2020,6 +2029,10 @@ fn run_blocking(req: &RunRequest) -> RunOutcome {
             Ok(Some(st)) => break Ok(st),
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    // 直接の子だけを殺すと、シェルが exec せずに起動した実体 (孫) が
+                    // 標準出力パイプを握ったまま残り、読み取り join がその寿命まで
+                    // 戻らない。ツリーごと落とす。
+                    crate::procx::kill_tree(child.id());
                     let _ = child.kill();
                     let _ = child.wait();
                     break Err(format!(
