@@ -17,11 +17,18 @@
 //!
 //! # 正規表現について
 //!
-//! このクレートは `regex` クレートに依存していない (Cargo.toml は他所有者の管理下)。
-//! そのため **自前のバックトラッキング型エンジン** を同梱している。対応構文は
-//! [`RegexError::Unsupported`] のドキュメントに列挙した部分集合で、未対応の構文は
-//! 「黙って別物として解釈する」のではなく **エラーを返す**。`regex` クレートが
-//! 依存に入れば [`Matcher`] の中身を差し替えるだけで全構文へ広げられる。
+//! 本体は [`regex`] クレート (有限オートマトン方式)。**入力長に対して線形時間**が
+//! 保証されるので、`(a+)+$` のようなユーザー入力でも破滅的バックトラック (ReDoS)
+//! に陥らない。以前は自前のバックトラッキング VM を積んでいたが、
+//!
+//! * 対応構文が部分集合 (`\p{…}` や名前付きグループが使えない)
+//! * 探索予算を切らすと**マッチを取りこぼす**
+//!
+//! という二重の弱点があったため丸ごと差し替えた。差し替えで広がったのは
+//! [`Matcher`] の中身だけで、公開 API と挙動 (バイトオフセット・
+//! `whole_word` の単語境界判定・リテラル検索の速い経路) は据え置き。
+//! 後方参照と先読み/後読みは `regex` が原理的に持たないため、
+//! [`RegexError::Syntax`] として弾かれる。
 
 use crate::textenc::Encoding;
 use std::path::{Path, PathBuf};
@@ -47,13 +54,15 @@ pub const MAX_HITS: usize = 500;
 pub const MAX_FILE_BYTES: u64 = 1_500_000;
 /// 表示用スニペットの最大文字数。
 const MAX_SNIPPET_CHARS: usize = 240;
-/// 1 行 1 回のマッチ試行で許すバックトラック回数。
-/// 破滅的バックトラック (`(a+)+$` 等) で固まらないための保険。
-const REGEX_STEP_BUDGET: usize = 100_000;
-/// 正規表現プログラムの最大命令数 (`a{1000}{1000}` 対策)。
-const REGEX_PROGRAM_LIMIT: usize = 20_000;
-/// `{n,m}` の上限。
-const REGEX_REPEAT_LIMIT: u32 = 1_000;
+/// コンパイル済みパターン (NFA) のメモリ上限。人が検索窓に打つパターンは
+/// 大きくても数十 KB にしかならないので、これを超えるものは
+/// `(a{1000}){1000}` のような組み合わせ爆発とみなし**コンパイル時に**弾く
+/// (走らせてからメモリを食い潰させない)。`regex` の既定 10 MiB より厳しめ。
+const REGEX_SIZE_LIMIT: usize = 4 * 1024 * 1024;
+/// 遅延 DFA のキャッシュ上限。検索はワーカースレッド分だけ並列に走るため
+/// 1 本あたりを絞る。超えても `regex` が自動で低速な NFA 実行へ落ちるだけで
+/// **結果は変わらない** (安全弁であって挙動の切り替えではない)。
+const REGEX_DFA_SIZE_LIMIT: usize = 1024 * 1024;
 
 // ─────────────────────────── 検索オプション ───────────────────────────
 
@@ -68,7 +77,7 @@ pub struct SearchOptions {
     /// 単語文字は `char::is_alphanumeric() || '_'` (Unicode 準拠)。
     /// 日本語のように区切りが無い文はひとかたまりの単語として扱われる。
     pub whole_word: bool,
-    /// `query` を正規表現として解釈する (自前エンジン。モジュール冒頭の注記参照)。
+    /// `query` を正規表現として解釈する (`regex` クレート。モジュール冒頭の注記参照)。
     pub regex: bool,
     /// 空でなければ「どれかに一致するファイルだけ」を対象にする。
     pub include_globs: Vec<String>,
@@ -125,19 +134,18 @@ pub enum SearchError {
     Regex(RegexError),
 }
 
-/// 自前正規表現エンジンのエラー。
+/// 正規表現のコンパイル失敗。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegexError {
-    /// 構文エラー (閉じ括弧が無い等)。
+    /// 構文エラー。閉じ括弧が無い等のほか、`regex` が原理的に持たない構文
+    /// (後方参照 `\1`・先読み `(?=…)`・後読み `(?<=…)`) もここに入る。
     Syntax(String),
-    /// このエンジンが対応していない構文。
+    /// 上記のどれにも当てはまらないコンパイル失敗。
     ///
-    /// 対応済み: 文字 / `.` / `^` `$` / `[...]` (`^` 否定・範囲・クラス略記) /
-    /// `\d \D \w \W \s \S \b \B \t \n \r` と記号のエスケープ /
-    /// `( )` `(?: )` / `|` / `* + ?` と `{n}` `{n,}` `{n,m}` (末尾 `?` で最短一致)。
-    /// 未対応: 後方参照・先読み/後読み・名前付きグループ・インラインフラグ・`\p{...}`。
+    /// `regex::Error` は `#[non_exhaustive]` なので、将来の新種を握り潰さずに
+    /// ここへ落とす。UI 側の `match` を壊さないためバリアントは残してある。
     Unsupported(String),
-    /// パターンが大きすぎる。
+    /// パターンが大きすぎる ([`REGEX_SIZE_LIMIT`] 超過)。
     TooLarge,
 }
 
@@ -358,8 +366,30 @@ enum Kind {
     /// 空クエリ。何にも一致しない。
     Never,
     /// 部分一致。`ascii_needle` があるときはバイト走査の速い経路を使う。
+    /// 非正規表現モードは `regex::escape` を通さず**この専用経路**のままにしてある:
+    ///   * ASCII 経路はコンパイル無し・確保無しのバイト走査で、`regex` の
+    ///     リテラル最適化 (memchr/Teddy) を起動するより初期費用が小さい。
+    ///     検索語は 1 回のセッションで数十文字、行は数百バイトなので前処理が支配的。
+    ///   * 大文字小文字の畳み込みが [`fold`] (先頭 1 文字の `to_lowercase`) のままで、
+    ///     `ß`/`SS` のような Unicode 完全ケースフォールドで**別物に化けない**。
+    ///     既存テスト (`literal_non_ascii_case_folding`) の意味論をそのまま保てる。
     Literal { chars: Vec<char>, ascii_needle: Option<Vec<u8>> },
-    Regex(Program),
+    /// 正規表現。`regex` クレート = 有限オートマトンなので線形時間。
+    Regex(regex::Regex),
+}
+
+/// `regex` のビルダを 1 箇所に閉じ込める (上限とフラグの付け忘れ防止)。
+fn build_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, RegexError> {
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+        .build()
+        .map_err(|e| match e {
+            regex::Error::Syntax(m) => RegexError::Syntax(m),
+            regex::Error::CompiledTooBig(_) => RegexError::TooLarge,
+            other => RegexError::Unsupported(other.to_string()),
+        })
 }
 
 impl Matcher {
@@ -368,7 +398,8 @@ impl Matcher {
         let kind = if opts.query.is_empty() {
             Kind::Never
         } else if opts.regex {
-            Kind::Regex(Program::compile(&opts.query, !opts.case_sensitive).map_err(SearchError::Regex)?)
+            // 大文字小文字の扱いはフラグ 1 個で `regex` 側へ委譲する
+            Kind::Regex(build_regex(&opts.query, !opts.case_sensitive).map_err(SearchError::Regex)?)
         } else if opts.query.is_ascii() {
             let needle: Vec<u8> = if opts.case_sensitive {
                 opts.query.bytes().collect()
@@ -388,6 +419,11 @@ impl Matcher {
     }
 
     /// 1 行の中で `from` バイト以降の最初のマッチ (バイト範囲) を返す。
+    ///
+    /// `whole_word` のときは**単語境界で落ちたら 1 文字進めて再挑戦**する。
+    /// 境界判定は正規表現の `\b` ではなく [`word_boundary_ok`] (= `is_word_char`)
+    /// で行う。`regex` の `\b` は結合文字なども単語文字に数えるため、
+    /// 「区切りの無い日本語はひとかたまり」という既存の意味論とはズレる。
     pub fn find_from(&self, line: &str, from: usize) -> Option<(usize, usize)> {
         let mut at = from;
         loop {
@@ -396,7 +432,21 @@ impl Matcher {
                 Kind::Literal { chars, ascii_needle } => {
                     self.literal_find(line, at, chars, ascii_needle.as_deref())?
                 }
-                Kind::Regex(prog) => prog.find_from(line, at)?,
+                Kind::Regex(re) => {
+                    // `^` はこの行の先頭 (バイト 0) にしか一致しない。`find_at` は
+                    // 前後の文脈を見るので、`at` から切った部分文字列を渡すのとは違い
+                    // `^` / `\b` の意味が壊れない (旧 VM と同じ振る舞い)。
+                    if at > line.len() {
+                        return None;
+                    }
+                    // `from` が文字の途中を指していたら次の境界へ寄せる (旧実装互換)
+                    let mut start = at;
+                    while start < line.len() && !line.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    let m = re.find_at(line, start)?;
+                    (m.start(), m.end())
+                }
             };
             if !self.whole_word || word_boundary_ok(line, s, e) {
                 return Some((s, e));
@@ -487,590 +537,6 @@ impl Matcher {
             }
         }
         None
-    }
-}
-
-// ─────────────────── 自前の正規表現エンジン (部分集合) ───────────────────
-
-#[derive(Clone, Debug)]
-enum Node {
-    Char(char),
-    Any,
-    Class(ClassSet),
-    Start,
-    End,
-    Boundary(bool),
-    Concat(Vec<Node>),
-    Alt(Vec<Node>),
-    Repeat { node: Box<Node>, min: u32, max: Option<u32>, greedy: bool },
-}
-
-#[derive(Clone, Debug, Default)]
-struct ClassSet {
-    negated: bool,
-    ranges: Vec<(char, char)>,
-    /// `\d` `\w` `\s` (bool = 否定形か)
-    shorthands: Vec<(Short, bool)>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Short {
-    Digit,
-    Word,
-    Space,
-}
-
-impl ClassSet {
-    fn contains(&self, c: char, ci: bool) -> bool {
-        let mut cand = vec![c];
-        if ci {
-            if let Some(l) = c.to_lowercase().next() {
-                cand.push(l);
-            }
-            if let Some(u) = c.to_uppercase().next() {
-                cand.push(u);
-            }
-        }
-        let raw = cand.iter().any(|ch| {
-            self.ranges.iter().any(|(a, b)| (*a..=*b).contains(ch))
-                || self.shorthands.iter().any(|(s, neg)| short_match(*s, *ch) != *neg)
-        });
-        raw != self.negated
-    }
-}
-
-fn short_match(s: Short, c: char) -> bool {
-    match s {
-        Short::Digit => c.is_ascii_digit(),
-        Short::Word => is_word_char(c),
-        Short::Space => c.is_whitespace(),
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Inst {
-    Char(char),
-    Any,
-    Class(usize),
-    Start,
-    End,
-    Boundary(bool),
-    /// 先に `0`、失敗したら `1` を試す
-    Split(usize, usize),
-    Jmp(usize),
-    Match,
-}
-
-/// コンパイル済みプログラム (バックトラッキング VM)。
-#[derive(Clone, Debug)]
-struct Program {
-    insts: Vec<Inst>,
-    classes: Vec<ClassSet>,
-    ci: bool,
-}
-
-impl Program {
-    fn compile(pattern: &str, ci: bool) -> Result<Self, RegexError> {
-        let mut p = Parser { src: pattern.chars().collect(), i: 0 };
-        let node = p.parse_alt()?;
-        if p.i < p.src.len() {
-            return Err(RegexError::Syntax(format!("余分な `{}`", p.src[p.i])));
-        }
-        let mut prog = Program { insts: Vec::new(), classes: Vec::new(), ci };
-        prog.emit_node(&node)?;
-        prog.insts.push(Inst::Match);
-        Ok(prog)
-    }
-
-    fn push(&mut self, i: Inst) -> Result<usize, RegexError> {
-        if self.insts.len() >= REGEX_PROGRAM_LIMIT {
-            return Err(RegexError::TooLarge);
-        }
-        self.insts.push(i);
-        Ok(self.insts.len() - 1)
-    }
-
-    fn emit_node(&mut self, n: &Node) -> Result<(), RegexError> {
-        match n {
-            Node::Char(c) => {
-                self.push(Inst::Char(fold(*c, self.ci)))?;
-            }
-            Node::Any => {
-                self.push(Inst::Any)?;
-            }
-            Node::Class(cs) => {
-                self.classes.push(cs.clone());
-                let idx = self.classes.len() - 1;
-                self.push(Inst::Class(idx))?;
-            }
-            Node::Start => {
-                self.push(Inst::Start)?;
-            }
-            Node::End => {
-                self.push(Inst::End)?;
-            }
-            Node::Boundary(want) => {
-                self.push(Inst::Boundary(*want))?;
-            }
-            Node::Concat(v) => {
-                for x in v {
-                    self.emit_node(x)?;
-                }
-            }
-            Node::Alt(branches) => {
-                let mut jmps = Vec::new();
-                let last = branches.len() - 1;
-                for (i, b) in branches.iter().enumerate() {
-                    if i == last {
-                        self.emit_node(b)?;
-                    } else {
-                        let sp = self.push(Inst::Split(0, 0))?;
-                        self.emit_node(b)?;
-                        jmps.push(self.push(Inst::Jmp(0))?);
-                        let next = self.insts.len();
-                        self.insts[sp] = Inst::Split(sp + 1, next);
-                    }
-                }
-                let end = self.insts.len();
-                for j in jmps {
-                    self.insts[j] = Inst::Jmp(end);
-                }
-            }
-            Node::Repeat { node, min, max, greedy } => {
-                if let Some(m) = max {
-                    if *m < *min {
-                        return Err(RegexError::Syntax("{n,m} の n > m".into()));
-                    }
-                }
-                if *min > REGEX_REPEAT_LIMIT || max.is_some_and(|m| m > REGEX_REPEAT_LIMIT) {
-                    return Err(RegexError::TooLarge);
-                }
-                if max.is_none() && nullable(node) {
-                    // `(a?)*` の類は空マッチで無限ループするので受け付けない
-                    return Err(RegexError::Unsupported(
-                        "空文字に一致し得る要素の無制限繰り返し".into(),
-                    ));
-                }
-                for _ in 0..*min {
-                    self.emit_node(node)?;
-                }
-                match max {
-                    None => self.emit_star(node, *greedy)?,
-                    Some(m) => {
-                        for _ in *min..*m {
-                            self.emit_opt(node, *greedy)?;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn emit_star(&mut self, node: &Node, greedy: bool) -> Result<(), RegexError> {
-        let sp = self.push(Inst::Split(0, 0))?;
-        self.emit_node(node)?;
-        self.push(Inst::Jmp(sp))?;
-        let after = self.insts.len();
-        self.insts[sp] =
-            if greedy { Inst::Split(sp + 1, after) } else { Inst::Split(after, sp + 1) };
-        Ok(())
-    }
-
-    fn emit_opt(&mut self, node: &Node, greedy: bool) -> Result<(), RegexError> {
-        let sp = self.push(Inst::Split(0, 0))?;
-        self.emit_node(node)?;
-        let after = self.insts.len();
-        self.insts[sp] =
-            if greedy { Inst::Split(sp + 1, after) } else { Inst::Split(after, sp + 1) };
-        Ok(())
-    }
-
-    /// `from` バイト以降で最初に一致するバイト範囲を返す (leftmost, Perl 流の優先順)。
-    fn find_from(&self, line: &str, from: usize) -> Option<(usize, usize)> {
-        let chars: Vec<char> = line.chars().collect();
-        let mut offs: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
-        offs.push(line.len());
-        let start_idx = offs.iter().position(|o| *o >= from)?;
-        let mut budget = REGEX_STEP_BUDGET;
-        for s in start_idx..offs.len() {
-            if let Some(e) = self.run(&chars, s, &mut budget) {
-                return Some((offs[s], offs[e]));
-            }
-            if budget == 0 {
-                return None; // 予算切れ: これ以上粘らない (固まらないことを優先)
-            }
-        }
-        None
-    }
-
-    fn run(&self, s: &[char], start: usize, budget: &mut usize) -> Option<usize> {
-        let mut stack: Vec<(usize, usize)> = vec![(0, start)];
-        while let Some((mut pc, mut pos)) = stack.pop() {
-            loop {
-                if *budget == 0 {
-                    return None;
-                }
-                *budget -= 1;
-                match self.insts[pc] {
-                    Inst::Char(c) => {
-                        if pos < s.len() && fold(s[pos], self.ci) == c {
-                            pc += 1;
-                            pos += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    Inst::Any => {
-                        if pos < s.len() && s[pos] != '\n' {
-                            pc += 1;
-                            pos += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    Inst::Class(idx) => {
-                        if pos < s.len() && self.classes[idx].contains(s[pos], self.ci) {
-                            pc += 1;
-                            pos += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    Inst::Start => {
-                        if pos == 0 {
-                            pc += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    Inst::End => {
-                        if pos == s.len() {
-                            pc += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    Inst::Boundary(want) => {
-                        let before = pos > 0 && is_word_char(s[pos - 1]);
-                        let after = pos < s.len() && is_word_char(s[pos]);
-                        if (before != after) == want {
-                            pc += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    Inst::Split(a, b) => {
-                        stack.push((b, pos));
-                        pc = a;
-                    }
-                    Inst::Jmp(t) => pc = t,
-                    Inst::Match => return Some(pos),
-                }
-            }
-        }
-        None
-    }
-}
-
-/// 空文字に一致し得るか (無制限繰り返しの安全弁)。
-fn nullable(n: &Node) -> bool {
-    match n {
-        Node::Char(_) | Node::Any | Node::Class(_) => false,
-        Node::Start | Node::End | Node::Boundary(_) => true,
-        Node::Concat(v) => v.iter().all(nullable),
-        Node::Alt(v) => v.iter().any(nullable),
-        Node::Repeat { node, min, .. } => *min == 0 || nullable(node),
-    }
-}
-
-struct Parser {
-    src: Vec<char>,
-    i: usize,
-}
-
-impl Parser {
-    fn peek(&self) -> Option<char> {
-        self.src.get(self.i).copied()
-    }
-
-    fn parse_alt(&mut self) -> Result<Node, RegexError> {
-        let mut branches = vec![self.parse_concat()?];
-        while self.peek() == Some('|') {
-            self.i += 1;
-            branches.push(self.parse_concat()?);
-        }
-        Ok(if branches.len() == 1 { branches.pop().expect("1 要素") } else { Node::Alt(branches) })
-    }
-
-    fn parse_concat(&mut self) -> Result<Node, RegexError> {
-        let mut items = Vec::new();
-        while let Some(c) = self.peek() {
-            if c == '|' || c == ')' {
-                break;
-            }
-            items.push(self.parse_repeat()?);
-        }
-        Ok(match items.len() {
-            1 => items.pop().expect("1 要素"),
-            _ => Node::Concat(items),
-        })
-    }
-
-    fn parse_repeat(&mut self) -> Result<Node, RegexError> {
-        let atom = self.parse_atom()?;
-        let (min, max) = match self.peek() {
-            Some('*') => {
-                self.i += 1;
-                (0, None)
-            }
-            Some('+') => {
-                self.i += 1;
-                (1, None)
-            }
-            Some('?') => {
-                self.i += 1;
-                (0, Some(1))
-            }
-            Some('{') => match self.try_parse_braces()? {
-                Some(mm) => mm,
-                None => return Ok(atom),
-            },
-            _ => return Ok(atom),
-        };
-        let greedy = if self.peek() == Some('?') {
-            self.i += 1;
-            false
-        } else {
-            if self.peek() == Some('+') {
-                return Err(RegexError::Unsupported("所有量指定子 `+`".into()));
-            }
-            true
-        };
-        Ok(Node::Repeat { node: Box::new(atom), min, max, greedy })
-    }
-
-    /// `{n}` `{n,}` `{n,m}` を読む。数値でなければ `{` はただの文字として扱う。
-    fn try_parse_braces(&mut self) -> Result<Option<(u32, Option<u32>)>, RegexError> {
-        let save = self.i;
-        self.i += 1; // '{'
-        let mut min = String::new();
-        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            min.push(self.src[self.i]);
-            self.i += 1;
-        }
-        if min.is_empty() {
-            self.i = save;
-            return Ok(None);
-        }
-        let min_v: u32 = min.parse().map_err(|_| RegexError::TooLarge)?;
-        match self.peek() {
-            Some('}') => {
-                self.i += 1;
-                Ok(Some((min_v, Some(min_v))))
-            }
-            Some(',') => {
-                self.i += 1;
-                let mut max = String::new();
-                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                    max.push(self.src[self.i]);
-                    self.i += 1;
-                }
-                if self.peek() != Some('}') {
-                    self.i = save;
-                    return Ok(None);
-                }
-                self.i += 1;
-                if max.is_empty() {
-                    Ok(Some((min_v, None)))
-                } else {
-                    Ok(Some((min_v, Some(max.parse().map_err(|_| RegexError::TooLarge)?))))
-                }
-            }
-            _ => {
-                self.i = save;
-                Ok(None)
-            }
-        }
-    }
-
-    fn parse_atom(&mut self) -> Result<Node, RegexError> {
-        let c = self.peek().ok_or_else(|| RegexError::Syntax("パターンが途中で終わった".into()))?;
-        match c {
-            '(' => {
-                self.i += 1;
-                if self.peek() == Some('?') {
-                    match self.src.get(self.i + 1) {
-                        Some(':') => self.i += 2,
-                        Some('=') | Some('!') => {
-                            return Err(RegexError::Unsupported("先読み `(?=` `(?!`".into()))
-                        }
-                        Some('<') => {
-                            return Err(RegexError::Unsupported(
-                                "後読み / 名前付きグループ `(?<`".into(),
-                            ))
-                        }
-                        Some('P') => {
-                            return Err(RegexError::Unsupported("名前付きグループ `(?P<`".into()))
-                        }
-                        _ => return Err(RegexError::Unsupported("インラインフラグ `(?…)`".into())),
-                    }
-                }
-                let inner = self.parse_alt()?;
-                if self.peek() != Some(')') {
-                    return Err(RegexError::Syntax("`)` が足りない".into()));
-                }
-                self.i += 1;
-                Ok(inner)
-            }
-            ')' => Err(RegexError::Syntax("対応する `(` が無い `)`".into())),
-            '[' => self.parse_class(),
-            '.' => {
-                self.i += 1;
-                Ok(Node::Any)
-            }
-            '^' => {
-                self.i += 1;
-                Ok(Node::Start)
-            }
-            '$' => {
-                self.i += 1;
-                Ok(Node::End)
-            }
-            '*' | '+' | '?' => {
-                Err(RegexError::Syntax(format!("繰り返し `{c}` の対象がない")))
-            }
-            '\\' => {
-                self.i += 1;
-                let e = self
-                    .peek()
-                    .ok_or_else(|| RegexError::Syntax("`\\` で終わっている".into()))?;
-                self.i += 1;
-                match e {
-                    'd' => Ok(Node::Class(ClassSet {
-                        shorthands: vec![(Short::Digit, false)],
-                        ..Default::default()
-                    })),
-                    'D' => Ok(Node::Class(ClassSet {
-                        shorthands: vec![(Short::Digit, false)],
-                        negated: true,
-                        ..Default::default()
-                    })),
-                    'w' => Ok(Node::Class(ClassSet {
-                        shorthands: vec![(Short::Word, false)],
-                        ..Default::default()
-                    })),
-                    'W' => Ok(Node::Class(ClassSet {
-                        shorthands: vec![(Short::Word, false)],
-                        negated: true,
-                        ..Default::default()
-                    })),
-                    's' => Ok(Node::Class(ClassSet {
-                        shorthands: vec![(Short::Space, false)],
-                        ..Default::default()
-                    })),
-                    'S' => Ok(Node::Class(ClassSet {
-                        shorthands: vec![(Short::Space, false)],
-                        negated: true,
-                        ..Default::default()
-                    })),
-                    'b' => Ok(Node::Boundary(true)),
-                    'B' => Ok(Node::Boundary(false)),
-                    'n' => Ok(Node::Char('\n')),
-                    't' => Ok(Node::Char('\t')),
-                    'r' => Ok(Node::Char('\r')),
-                    '0' => Ok(Node::Char('\0')),
-                    'p' | 'P' => Err(RegexError::Unsupported("Unicode 特性 `\\p{…}`".into())),
-                    'k' => Err(RegexError::Unsupported("名前付き後方参照 `\\k<…>`".into())),
-                    c if c.is_ascii_digit() => {
-                        Err(RegexError::Unsupported("後方参照 `\\1`".into()))
-                    }
-                    c if c.is_alphanumeric() => {
-                        Err(RegexError::Unsupported(format!("エスケープ `\\{c}`")))
-                    }
-                    c => Ok(Node::Char(c)),
-                }
-            }
-            c => {
-                self.i += 1;
-                Ok(Node::Char(c))
-            }
-        }
-    }
-
-    fn parse_class(&mut self) -> Result<Node, RegexError> {
-        self.i += 1; // '['
-        let mut set = ClassSet::default();
-        if self.peek() == Some('^') {
-            set.negated = true;
-            self.i += 1;
-        }
-        let mut first = true;
-        loop {
-            let c = self
-                .peek()
-                .ok_or_else(|| RegexError::Syntax("`]` が足りない".into()))?;
-            if c == ']' && !first {
-                self.i += 1;
-                break;
-            }
-            first = false;
-            let lo = if c == '\\' {
-                self.i += 1;
-                let e = self
-                    .peek()
-                    .ok_or_else(|| RegexError::Syntax("`\\` で終わっている".into()))?;
-                self.i += 1;
-                match e {
-                    'd' => {
-                        set.shorthands.push((Short::Digit, false));
-                        continue;
-                    }
-                    'D' => {
-                        set.shorthands.push((Short::Digit, true));
-                        continue;
-                    }
-                    'w' => {
-                        set.shorthands.push((Short::Word, false));
-                        continue;
-                    }
-                    'W' => {
-                        set.shorthands.push((Short::Word, true));
-                        continue;
-                    }
-                    's' => {
-                        set.shorthands.push((Short::Space, false));
-                        continue;
-                    }
-                    'S' => {
-                        set.shorthands.push((Short::Space, true));
-                        continue;
-                    }
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    c if c.is_alphanumeric() => {
-                        return Err(RegexError::Unsupported(format!("クラス内 `\\{c}`")))
-                    }
-                    c => c,
-                }
-            } else {
-                self.i += 1;
-                c
-            };
-            if self.peek() == Some('-') && self.src.get(self.i + 1).is_some_and(|c| *c != ']') {
-                self.i += 1;
-                let hi = self.src[self.i];
-                self.i += 1;
-                if hi < lo {
-                    return Err(RegexError::Syntax("文字クラスの範囲が逆順".into()));
-                }
-                set.ranges.push((lo, hi));
-            } else {
-                set.ranges.push((lo, lo));
-            }
-        }
-        Ok(Node::Class(set))
     }
 }
 
@@ -1712,30 +1178,73 @@ mod tests {
         assert!(!m.is_match("全文検索する")); // 後ろに単語文字が続く
     }
 
+    /// 不正パターンを `Matcher::compile` に渡した結果 (テスト用の短縮)。
+    fn compile_err(q: &str) -> SearchError {
+        Matcher::compile(&SearchOptions { regex: true, ..SearchOptions::literal(q) })
+            .expect_err("should fail")
+    }
+
     #[test]
     fn regex_errors_are_explicit_not_silent() {
-        let err = |q: &str| {
-            Matcher::compile(&SearchOptions { regex: true, ..SearchOptions::literal(q) })
-                .expect_err("should fail")
-        };
-        assert!(matches!(err(r"(a"), SearchError::Regex(RegexError::Syntax(_))));
-        assert!(matches!(err(r"a)"), SearchError::Regex(RegexError::Syntax(_))));
-        assert!(matches!(err(r"[a-"), SearchError::Regex(RegexError::Syntax(_))));
-        assert!(matches!(err(r"(a)\1"), SearchError::Regex(RegexError::Unsupported(_))));
-        assert!(matches!(err(r"(?=a)"), SearchError::Regex(RegexError::Unsupported(_))));
-        assert!(matches!(err(r"(?<name>a)"), SearchError::Regex(RegexError::Unsupported(_))));
-        assert!(matches!(err(r"\p{L}"), SearchError::Regex(RegexError::Unsupported(_))));
-        assert!(matches!(err(r"(a?)*"), SearchError::Regex(RegexError::Unsupported(_))));
-        assert!(matches!(err(r"a{2000}"), SearchError::Regex(RegexError::TooLarge)));
+        assert!(matches!(compile_err(r"(a"), SearchError::Regex(RegexError::Syntax(_))));
+        assert!(matches!(compile_err(r"a)"), SearchError::Regex(RegexError::Syntax(_))));
+        assert!(matches!(compile_err(r"[a-"), SearchError::Regex(RegexError::Syntax(_))));
+        // 後方参照と先読みは `regex` (有限オートマトン) が原理的に持たない構文。
+        // 旧・自前エンジンでは Unsupported だったが、今は構文エラーとして弾かれる。
+        assert!(matches!(compile_err(r"(a)\1"), SearchError::Regex(RegexError::Syntax(_))));
+        assert!(matches!(compile_err(r"(?=a)"), SearchError::Regex(RegexError::Syntax(_))));
+        // Display は日本語の前置きを付ける (UI がそのまま出せること)
+        assert!(compile_err(r"(a").to_string().starts_with("正規表現の構文エラー"));
+    }
+
+    #[test]
+    fn invalid_pattern_returns_error_instead_of_panicking() {
+        // 公開 API の入口でも panic せず Err が返ること (UI が赤くできる)
+        let opts = SearchOptions { regex: true, ..SearchOptions::literal(r"(unclosed") };
+        assert!(matches!(search_with_options(&[], &opts), Err(SearchError::Regex(_))));
+        assert!(matches!(spawn_with_options(Vec::new(), opts).err(), Some(SearchError::Regex(_))));
+    }
+
+    #[test]
+    fn constructs_the_old_engine_rejected_now_work() {
+        let re = |q: &str| matcher(&SearchOptions { regex: true, ..SearchOptions::literal(q) });
+        // 旧エンジンが Unsupported で弾いていたもの
+        assert_eq!(re(r"(?<year>\d{4})").find_from("v 2026 y", 0), Some((2, 6)));
+        assert!(re(r"\p{Hiragana}+").is_match("漢字とかな"));
+        assert_eq!(re(r"\p{Hiragana}+").find_from("漢字とかな", 0), Some((6, 15)));
+        assert!(re(r"(?i)FOO").is_match("foo")); // インラインフラグ
+        assert!(re(r"(a?)*").is_match("aaa")); // 空にもなり得る繰り返し
+        // 旧エンジンは TooLarge にしていたが、これは真っ当なパターン
+        assert!(re(r"a{2000}").is_match(&"a".repeat(2000)));
+        // 部分集合の外にあった構文の組み合わせ
+        assert_eq!(re(r"\d{2,4}").find_from("x 12345", 0), Some((2, 6)));
+        assert_eq!(re(r"(foo|ba(r|z))+").find_from("xxfoobaz!", 0), Some((2, 8)));
+    }
+
+    #[test]
+    fn oversized_pattern_fails_to_compile() {
+        // NFA が REGEX_SIZE_LIMIT を超える組み合わせ爆発は、走らせる前に弾く
+        assert!(matches!(compile_err(r"((a{1000}){1000}){1000}"), SearchError::Regex(RegexError::TooLarge)));
+        // 上限内の素直なパターンは通る (上限が厳しすぎないことの確認)
+        assert!(Matcher::compile(&SearchOptions {
+            regex: true,
+            ..SearchOptions::literal(r"(?i)\b[a-z_][a-z0-9_]{0,64}\s*\([^)]*\)\s*\{")
+        })
+        .is_ok());
     }
 
     #[test]
     fn regex_does_not_hang_on_pathological_pattern() {
+        // ReDoS 耐性。バックトラッキング実装ならここで指数時間に落ちる。
         let m = matcher(&SearchOptions { regex: true, ..SearchOptions::literal(r"(a+)+$") });
-        let line = format!("{}b", "a".repeat(40));
+        let line = format!("{}b", "a".repeat(10_000));
         let t0 = std::time::Instant::now();
-        let _ = m.is_match(&line); // 予算切れで諦める = 固まらないことが要件
-        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "予算が効いていない");
+        assert!(!m.is_match(&line)); // 予算切れで諦めるのではなく「無い」と答え切る
+        let dt = t0.elapsed();
+        assert!(dt < std::time::Duration::from_secs(1), "線形時間で終わっていない: {dt:?}");
+        // 一致する側も同じ長さで即答できる
+        let hit = "a".repeat(10_000);
+        assert_eq!(m.find_from(&hit, 0), Some((0, 10_000)));
     }
 
     #[test]

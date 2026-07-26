@@ -35,6 +35,13 @@ arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 #   * pdfium-render は OS ごとの prebuilt libpdfium が要る
 # のでいずれも採らない。
 pdf-extract = "0.12"
+# 「ファイル間で検索」の正規表現エンジン (file_search.rs)。自前のバックトラッキング
+# 実装は `(a+)+$` のような入力で破滅的バックトラック (ReDoS) を起こすため置き換えた。
+# regex は有限オートマトン方式で**入力長に対して線形時間**を保証し、後方参照や
+# 先読みを持たない代わりにユーザー入力のパターンを安全に走らせられる。
+# ライセンスは MIT OR Apache-2.0、依存も純 Rust (build.rs / ネイティブ無し)。
+# regex-syntax は syntect 経由で既にロックに入っており、増える実体は僅か。
+regex = "1"
 
 # セッション破棄時のプロセス**グループ**への killpg (procx::kill_tree)。
 # portable-pty は子を setsid するため pgid == pid で、グループごと落とせば
