@@ -6,6 +6,18 @@ use eframe::egui;
 use crate::config::AgentPreset;
 use crate::terminal::{Session, SpawnSpec};
 
+// 統合承認キュー (全エージェント横断の承認待ち + ポリシー + 監査ログ)。
+//
+// `#[path]` でこのモジュールの子として取り込む。coordinator.rs の `quota`
+// と同じ流儀で、**main.rs へ `mod approvals;` を足す必要は無い**
+// (足すなら下の 1 行を消し、`approvals::` を `crate::approvals::` へ
+// 書き換えること。二重登録は型が別物になる)。
+// 外からは `crate::agents::approvals::…` で参照する。
+
+/// 承認要求の分類・ポリシー・監査ログ (詳細はモジュール doc)。
+#[path = "approvals.rs"]
+pub mod approvals;
+
 pub enum SessionEvent {
     /// (title) — セッションがユーザーの承認待ちになった
     NeedsApproval(String),
@@ -1162,7 +1174,43 @@ pub struct AgentManager {
     pub sessions: Vec<Session>,
     pub active: usize,
     pub panel_open: bool,
+    /// 全エージェント横断の統合承認キュー。`poll_events` が投入し、
+    /// 承認パネル (UI) がこれを描く。詳細は `approvals` モジュール doc。
+    pub approvals: approvals::ApprovalQueue,
     next_id: u64,
+}
+
+/// 承認要求の分類に使う画面テキストの取得範囲。
+/// 承認プロンプトは画面下部にしか出ないので、末尾の数十行で足りる
+/// (画面全体の contents() を毎フレーム作らないための上限)。
+const APPROVAL_SCAN_ROWS: usize = 40;
+/// 同上、1 行あたりの文字数上限。
+const APPROVAL_SCAN_COLS: usize = 400;
+
+/// 承認判定用に、セッション画面の末尾テキストを取り出す。
+fn approval_scan_text(s: &Session) -> String {
+    s.screen_tail_lines(APPROVAL_SCAN_ROWS, APPROVAL_SCAN_COLS)
+        .join("\n")
+}
+
+/// 承認キューが決めた応答を実際に PTY へ送る。送れたら true。
+///
+/// 承認側は `press_pet_approve_button` を通す — 画面に合った承認キー
+/// (「1. No, exit」が既定選択のプロンプトでは番号キー等) を選び、
+/// 送信後に同じプロンプトを応答済みにしてくれるため。
+fn apply_reply_action(s: &mut Session, action: approvals::ReplyAction) -> bool {
+    let (approve_keys, deny_keys) = approvals::reply_keys();
+    match action {
+        approvals::ReplyAction::None => false,
+        approvals::ReplyAction::Approve => s.press_pet_approve_button(Some(&approve_keys)),
+        approvals::ReplyAction::Deny => {
+            let ok = s.send_text(&deny_keys);
+            if ok {
+                s.resolve_attention();
+            }
+            ok
+        }
+    }
 }
 
 fn expand_home(p: &str) -> PathBuf {
@@ -1180,6 +1228,7 @@ impl AgentManager {
             sessions: Vec::new(),
             active: 0,
             panel_open: false,
+            approvals: approvals::ApprovalQueue::new(),
             next_id: 1,
         }
     }
@@ -1289,6 +1338,12 @@ impl AgentManager {
         if i >= self.sessions.len() {
             return;
         }
+        // 閉じたセッションの承認待ち・重複記録を捨てる。PID と同じく
+        // セッション ID は再利用され得るので、残すと別セッションの
+        // プロンプトを「見たことがある」と誤判定してしまう。
+        if let Some(s) = self.sessions.get(i) {
+            self.approvals.forget_session(s.id);
+        }
         // 取り除いたセッションは**この場で drop しない**。ConPTY を閉じる
         // Drop は UI スレッドを止め得るので、後始末ごと reap に預ける
         // (crate::terminal::reap の説明を参照)。
@@ -1321,13 +1376,51 @@ impl AgentManager {
     pub fn poll_events(&mut self, allow_auto_yes: bool) -> Vec<SessionEvent> {
         use crate::terminal::Attention;
         let mut events = Vec::new();
-        for s in self.sessions.iter_mut() {
+        // approvals と sessions を同時に可変で借りるため、フィールドを分解する。
+        let Self {
+            sessions,
+            approvals,
+            ..
+        } = self;
+        for s in sessions.iter_mut() {
             if s.running() {
-                match s.scan_attention(s.auto_yes_target(allow_auto_yes)) {
+                // ── ① ポリシー相談は従来の自動YESより先 ──────────────
+                // 「常に拒否」ポリシーは全自動YESより強くなければ意味がない。
+                // ところが scan_attention(true) は検知と同時に YES を撃つので、
+                // 撃たせる前にここで栓をする。拒否ポリシーが 1 件も無い既定
+                // 構成では画面テキストの取得すら走らない (追加コスト 0)。
+                let mut auto = s.auto_yes_target(allow_auto_yes);
+                if auto
+                    && approvals.auto_yes_blocked(s.id, s.agent_bin(), || {
+                        approval_scan_text(s)
+                    })
+                {
+                    auto = false;
+                }
+                match s.scan_attention(auto) {
                     Some(Attention::NeedsApproval) => {
-                        events.push(SessionEvent::NeedsApproval(s.title.clone()));
+                        // ── ② 統合承認キューへ投入。ポリシーが決着させたら即答する ──
+                        let text = approval_scan_text(s);
+                        let sig = crate::terminal::prompt_signature(&text);
+                        match approvals.intake(s.id, s.agent_bin(), &text, sig) {
+                            approvals::Verdict::Decided { reply, note, .. } => {
+                                if apply_reply_action(s, reply) {
+                                    // 既存の SessionEvent を増やさずに済むよう、
+                                    // 無人応答は許可/拒否とも AutoApproved で伝える
+                                    // (note に「自動承認/自動拒否」が入る)。
+                                    events.push(SessionEvent::AutoApproved(s.title.clone(), note));
+                                } else {
+                                    events.push(SessionEvent::NeedsApproval(s.title.clone()));
+                                }
+                            }
+                            // Duplicate は「同じプロンプトの再検出」。従来どおり
+                            // 承認待ちとして報告する (トーストは app.rs 側で間引く)。
+                            _ => events.push(SessionEvent::NeedsApproval(s.title.clone())),
+                        }
                     }
                     Some(Attention::AutoReplied(desc)) => {
+                        // 従来の全自動YES が撃った分も監査ログへ残す (source: auto_yes)。
+                        approvals.log_auto_yes(s.id, s.agent_bin(), &approval_scan_text(s));
                         events.push(SessionEvent::AutoApproved(s.title.clone(), desc));
                     }
                     Some(Attention::RateLimited(line)) => {

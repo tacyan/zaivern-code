@@ -73,6 +73,13 @@ pub struct Config {
     /// config.toml だけで直せるようにするための逃げ道。
     /// 組み込みの表より先に評価されるので、既定の判断を上書きもできる。
     pub auto_yes_rules: Vec<AutoYesRule>,
+    /// 統合承認キューのポリシー (`[[approval_policies]]`)。
+    ///
+    /// 「この種別の承認は、この範囲では常に許可/拒否」を宣言する表。
+    /// 空 (既定) なら従来どおり全部ユーザーに聞く。**このキーが無い
+    /// 既存の config.toml でも `Config` の `#[serde(default)]` により
+    /// 空として読み込まれる**ので、古い設定を壊さない。
+    pub approval_policies: Vec<ApprovalPolicy>,
     /// 音声認識エンジン: "auto" | "mac" | "powershell" | "browser" | "command" | "off"
     /// auto = macOS は内蔵、voice_command 設定済みならそれ、Windows は標準の
     /// 音声認識、残りはブラウザの /voice ページ (src/voice.rs の resolve_engine)
@@ -231,6 +238,7 @@ impl Default for Config {
             pet_approve_keys: "\r".into(),
             pet_deny_keys: "\u{1b}".into(),
             auto_yes_rules: Vec::new(),
+            approval_policies: Vec::new(),
             voice_engine: "auto".into(),
             voice_target: "active".into(),
             voice_lang: "ja-JP".into(),
@@ -275,6 +283,66 @@ impl Default for AutoYesRule {
             agent: String::new(),
         }
     }
+}
+
+/// 統合承認キューのポリシー 1 件 (`[[approval_policies]]`)。
+///
+/// ```toml
+/// [[approval_policies]]
+/// kind     = "file_read"     # 承認の種別 (src/approvals.rs の ApprovalKind)
+/// scope    = "agent"         # 適用範囲: "global" | "agent" | "session" | "path"
+/// target   = "claude"        # scope の対象 (global は空)
+/// decision = "allow_always"  # "ask" | "allow_once" | "allow_always" | "deny_always"
+/// ```
+///
+/// 値はすべて**安定 ID (英小文字)** で持つ。列挙型を直接 serde に載せず
+/// 文字列にしているのは、将来 kind が増えても古い Zaivern が
+/// 「未知の行」として読み飛ばせるようにするため
+/// ([`approval_policies_from_config`] が未知の値の行を捨てる)。
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(default)]
+pub struct ApprovalPolicy {
+    /// 承認の種別 ID (`file_read` / `file_write` / `file_delete` /
+    /// `shell_command` / `network_access` / `git_operation` /
+    /// `package_install` / `privilege` / `other`)。
+    pub kind: String,
+    /// 適用範囲 (`global` / `agent` / `session` / `path`)。省略で `global`。
+    pub scope: String,
+    /// `scope` の対象値。`agent` なら実行ファイル名、`session` なら数値 ID、
+    /// `path` ならパス接頭辞。`global` では空。
+    pub target: String,
+    /// 判断 (`ask` / `allow_once` / `allow_always` / `deny_always`)。
+    pub decision: String,
+}
+
+impl Default for ApprovalPolicy {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            scope: "global".into(),
+            target: String::new(),
+            decision: "ask".into(),
+        }
+    }
+}
+
+/// `[[approval_policies]]` を承認エンジンの [`crate::agents::approvals::Policy`] へ変換する。
+///
+/// **未知の種別 / 範囲 / 判断の行は黙って捨てる**。書き間違いや、
+/// 新しい Zaivern が書いた行を古いバイナリで読んだときに、意図しない
+/// 種別へ丸めて自動承認してしまう事故を防ぐため (「推測しない」の原則)。
+pub fn approval_policies_from_config(cfg: &Config) -> Vec<crate::agents::approvals::Policy> {
+    use crate::agents::approvals::{ApprovalKind, Decision, Policy, Scope};
+    cfg.approval_policies
+        .iter()
+        .filter_map(|p| {
+            Some(Policy {
+                kind: ApprovalKind::from_id(p.kind.trim())?,
+                scope: Scope::from_toml(p.scope.trim(), p.target.trim())?,
+                decision: Decision::from_id(p.decision.trim())?,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -498,6 +566,46 @@ show_pet = true
 # [[auto_yes_rules]]
 # pattern = "Continue with this plan?"
 # reply = "y\r"
+
+# ── 承認ポリシー (統合承認キュー) ──────────────
+# すべてのエージェントの承認要求を 1 本のキューへ集め、種別ごとに
+# 「常に許可 / 常に拒否 / 毎回聞く」を決められます。全自動YES と違って
+# **種別と範囲を絞れる**のと、判断が ~/.zaivern/approvals.jsonl に
+# 追記されて後から監査できるのが違いです。
+#
+# kind     … file_read / file_write / file_delete / shell_command /
+#            network_access / git_operation / package_install /
+#            privilege / other
+# scope    … global (全部) / agent (実行ファイル名) /
+#            session (セッションID) / path (パス接頭辞)
+# target   … scope の対象値 (global のときは不要)
+# decision … ask / allow_once / allow_always / deny_always
+#
+# 具体的な範囲が優先されます: session > path > agent > global
+# (path 同士は深い方が勝つ)。同じ具体性なら後に書いた方が勝ちます。
+#
+# ★ privilege (管理者権限の昇格) だけは allow_always を書いても効きません。
+#   自動承認は決して行わず、必ず本人に聞きます。
+#
+# 例1: Claude のファイル読み取りは黙って通す
+# [[approval_policies]]
+# kind = "file_read"
+# scope = "agent"
+# target = "claude"
+# decision = "allow_always"
+#
+# 例2: ネットワークアクセスはどのエージェントでも必ず拒否
+# [[approval_policies]]
+# kind = "network_access"
+# scope = "global"
+# decision = "deny_always"
+#
+# 例3: このフォルダ配下の書き込みだけ自動許可
+# [[approval_policies]]
+# kind = "file_write"
+# scope = "path"
+# target = "/Users/me/work/sandbox"
+# decision = "allow_always"
 
 # ── 音声入力 (🎤) ──────────────
 # 🎤 を押すと録音が始まり、⏹ を押すまで話した内容がエージェントの入力欄へ
@@ -785,6 +893,8 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     // 自動YESのユーザー定義ルールを応答エンジンへ渡す。
     // ここで配るので、設定を読み直せば再起動なしで反映される。
     publish_auto_yes_rules(&cfg);
+    // 承認ポリシーと承認/拒否キーも同じタイミングで配る。
+    publish_approval_policies(&cfg);
     cfg
 }
 
@@ -796,6 +906,13 @@ pub fn publish_auto_yes_rules(cfg: &Config) {
         .map(|r| (r.pattern.clone(), r.reply.clone(), r.agent.clone()))
         .collect();
     crate::agents::set_user_prompt_rules(&rules);
+}
+
+/// `[[approval_policies]]` と承認/拒否キーを統合承認キュー
+/// (src/approvals.rs) へ登録する。設定を読み直せば再起動なしで反映される。
+pub fn publish_approval_policies(cfg: &Config) {
+    crate::agents::approvals::set_policies(approval_policies_from_config(cfg));
+    crate::agents::approvals::set_reply_keys(&cfg.pet_approve_keys, &cfg.pet_deny_keys);
 }
 
 /// `<root>/.zaivern.toml` を 1 枚 `cfg` に重ねる。無ければ何もしない。
@@ -1931,6 +2048,107 @@ reply = "y\r"
         let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定 config.toml が壊れている");
         assert!(
             cfg.auto_yes_rules.is_empty(),
+            "記入例が有効になっている (コメントアウトのはず)"
+        );
+    }
+
+    // ---- 承認ポリシー ([[approval_policies]]) ----
+
+    #[test]
+    fn 承認ポリシーが書いて読んで往復する() {
+        use crate::agents::approvals::{ApprovalKind, Decision, Scope};
+        let src = r#"
+theme = "dark"
+
+[[approval_policies]]
+kind = "file_read"
+scope = "agent"
+target = "claude"
+decision = "allow_always"
+
+[[approval_policies]]
+kind = "network_access"
+decision = "deny_always"
+
+[[approval_policies]]
+kind = "file_write"
+scope = "path"
+target = "/repo/src"
+decision = "allow_once"
+"#;
+        let cfg: Config = toml::from_str(src).expect("approval_policies が読めない");
+        assert_eq!(cfg.approval_policies.len(), 3);
+        // scope 省略時は既定の "global"。
+        assert_eq!(cfg.approval_policies[1].scope, "global");
+
+        let ps = approval_policies_from_config(&cfg);
+        assert_eq!(ps.len(), 3);
+        assert_eq!(ps[0].kind, ApprovalKind::FileRead);
+        assert_eq!(ps[0].scope, Scope::Agent("claude".into()));
+        assert_eq!(ps[0].decision, Decision::AllowAlways);
+        assert_eq!(ps[1].scope, Scope::Global);
+        assert_eq!(ps[1].decision, Decision::DenyAlways);
+        assert_eq!(ps[2].scope, Scope::PathPrefix("/repo/src".into()));
+        assert_eq!(ps[2].decision, Decision::AllowOnce);
+
+        // 書き戻して読み直しても同じ (シリアライズ側の欠落よけ)。
+        let out = toml::to_string(&cfg).expect("書き戻せない");
+        let back: Config = toml::from_str(&out).expect("書き戻したものが読めない");
+        assert_eq!(back.approval_policies, cfg.approval_policies);
+        assert_eq!(approval_policies_from_config(&back), ps);
+    }
+
+    #[test]
+    fn 未知の値の承認ポリシー行は捨てる() {
+        // 新しい Zaivern が書いた種別を古いバイナリで読んだときに、
+        // 近い種別へ丸めて自動承認してしまう事故を防ぐ。
+        let src = r#"
+[[approval_policies]]
+kind = "quantum_teleport"
+decision = "allow_always"
+
+[[approval_policies]]
+kind = "file_read"
+scope = "brainwave"
+decision = "allow_always"
+
+[[approval_policies]]
+kind = "file_read"
+decision = "yolo"
+
+[[approval_policies]]
+kind = "file_read"
+decision = "allow_always"
+"#;
+        let cfg: Config = toml::from_str(src).expect("読めない");
+        assert_eq!(cfg.approval_policies.len(), 4);
+        let ps = approval_policies_from_config(&cfg);
+        assert_eq!(ps.len(), 1, "妥当な 1 行だけ残るはず");
+        assert_eq!(ps[0].kind, crate::agents::approvals::ApprovalKind::FileRead);
+    }
+
+    #[test]
+    fn 承認ポリシーキーの無い古い設定ファイルもそのまま読める() {
+        let old = "theme = \"dark\"\npet_auto_yes = true\n";
+        let cfg: Config = toml::from_str(old).expect("古い設定が読めなくなった");
+        assert_eq!(cfg.theme, "dark");
+        assert!(cfg.pet_auto_yes);
+        assert!(
+            cfg.approval_policies.is_empty(),
+            "未指定なら空 (= 従来どおり全部ユーザーに聞く)"
+        );
+        assert!(approval_policies_from_config(&cfg).is_empty());
+    }
+
+    #[test]
+    fn 既定テンプレートの承認ポリシー例はコメントアウトされている() {
+        assert!(
+            DEFAULT_CONFIG.contains("# [[approval_policies]]"),
+            "DEFAULT_CONFIG に approval_policies の記入例が無い"
+        );
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定 config.toml が壊れている");
+        assert!(
+            cfg.approval_policies.is_empty(),
             "記入例が有効になっている (コメントアウトのはず)"
         );
     }
