@@ -15,6 +15,11 @@ on:
     branches: ["night/**"]
   workflow_dispatch:
 
+# 同一ブランチへの連続 push では古い run をキャンセルし、ランナーを節約する。
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # デバッグ情報を落としてビルド時間とキャッシュサイズを削減。
