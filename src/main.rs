@@ -57,6 +57,7 @@ mod test_util;
 mod textenc;
 mod theme;
 mod theme_json;
+mod tutorial;
 mod voice;
 
 use eframe::egui;
