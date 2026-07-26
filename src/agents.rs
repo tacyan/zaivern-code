@@ -101,6 +101,50 @@ impl AgentSpec {
         }
         Some(self.switch_hint)
     }
+
+    /// この CLI の「過去セッション保存先」。列挙できない CLI は `SessionStore::None`。
+    pub fn session_store(&self) -> SessionStore {
+        session_entry(self.bin).map(|e| e.1).unwrap_or(SessionStore::None)
+    }
+
+    /// セッション ID を指定して再開するための指定 (`--resume` / `resume`)。
+    /// 未対応なら ""。`apply_resume_id()` から使う。
+    pub fn resume_id_flag(&self) -> &'static str {
+        session_entry(self.bin).map(|e| e.2).unwrap_or("")
+    }
+}
+
+/// 過去セッションの保存先の種類。列挙器 (session_picker.rs) がこの値で分岐する。
+///
+/// gemini は `~/.gemini/tmp/<sha256>/chats/` が空のことが多く実機で当てにならないため、
+/// 意図的に `None` (= 一覧は出さず、従来どおり `resume_flag` での再開に落とす)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // UI 配線は後続ウェーブ (session_picker.rs 経由で使う)
+pub enum SessionStore {
+    /// 過去セッションを列挙できない。
+    None,
+    /// `~/.claude/projects/<エンコード済み cwd>/<uuid>.jsonl` — プロジェクト単位。
+    ClaudeProjects,
+    /// `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` — 全プロジェクト混在。
+    CodexRollouts,
+}
+
+/// bin → (保存先, ID 指定再開の指定) のカタログ。
+///
+/// **AgentSpec のフィールドとして持たない理由**: `AgentSpec` の構造体リテラルは
+/// 他モジュール (diagnostician.rs のテスト用フィクスチャ) にも存在し、フィールドを
+/// 増やすとそれらが一斉にコンパイルエラーになる。ここでは bin をキーにした別テーブルで
+/// 保持し、参照は必ず `AgentSpec::session_store()` / `resume_id_flag()` 経由にする
+/// (エージェント固有の知識をコード中へ直書きしないという原則は保たれる)。
+const SESSION_STORES: &[(&str, SessionStore, &str)] = &[
+    // claude: フラグ型。`claude --resume <id>`
+    ("claude", SessionStore::ClaudeProjects, "--resume"),
+    // codex: サブコマンド型。`codex resume <id>` (bin の直後に挟む)
+    ("codex", SessionStore::CodexRollouts, "resume"),
+];
+
+fn session_entry(bin: &str) -> Option<&'static (&'static str, SessionStore, &'static str)> {
+    SESSION_STORES.iter().find(|e| e.0 == bin)
 }
 
 /// 承認モードを自動適用できる CLI カタログ。
@@ -736,6 +780,59 @@ pub fn apply_resume(command: &str, spec: &AgentSpec) -> String {
     out.join(" ")
 }
 
+/// 「この過去セッションを開く」用に、コマンドへ **セッション ID 指定の再開** を足す。
+///
+/// `apply_resume` (= 直前の会話を再開) の ID 指定版。フラグ型 (`claude --resume <id>`)
+/// とサブコマンド型 (`codex resume <id>` — 実行ファイル名の直後) の扱いは
+/// `apply_resume` と同じ規則。ID 指定再開に未対応の CLI、および ID が空/不正
+/// (空白やシェルのメタ文字を含む) なら **何もせず素のコマンドを返す** —
+/// 壊れた引数で起動に失敗するより、新規会話になる方がまし。
+///
+/// 二重付与ガード: 既に ID 指定 (`--resume` / `resume`) または直前再開指定
+/// (`--continue` など `resume_flag` の先頭トークン) が入っているコマンドは触らない。
+#[allow(dead_code)] // UI 配線は後続ウェーブ (session_picker.rs の一覧から呼ぶ)
+pub fn apply_resume_id(command: &str, spec: &AgentSpec, id: &str) -> String {
+    let flag = spec.resume_id_flag();
+    let id = id.trim();
+    if flag.is_empty() || id.is_empty() || !is_safe_session_id(id) {
+        return command.to_string();
+    }
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.is_empty() {
+        return command.to_string();
+    }
+    let resume: Vec<&str> = flag.split_whitespace().collect();
+    // 既に再開指定 (ID 指定・直前再開のどちらでも) があるなら二重に付けない
+    let already = spec.resume_flag.split_whitespace().next().unwrap_or("");
+    if tokens
+        .iter()
+        .any(|t| *t == resume[0] || (!already.is_empty() && *t == already))
+    {
+        return command.to_string();
+    }
+    if resume[0].starts_with('-') {
+        // フラグ型: 末尾に `--resume <id>` を足す
+        return format!("{} {flag} {id}", command.trim());
+    }
+    // サブコマンド型: `bin resume <id> ...` の順で実行ファイル名の直後に挟む
+    let mut out: Vec<&str> = Vec::with_capacity(tokens.len() + resume.len() + 1);
+    out.push(tokens[0]);
+    out.extend(resume.iter());
+    out.push(id);
+    out.extend(tokens[1..].iter());
+    out.join(" ")
+}
+
+/// セッション ID としてコマンド行へ素で置いて安全か。
+/// 実体はファイル名由来の UUID なので、英数と `-` `_` `.` だけを許す
+/// (空白・引用符・シェルのメタ文字が入る余地を残さない)。
+fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// 起動時にプロセスへ渡す環境変数を組み立てる。
 ///
 /// goose / aider のように「一括自動承認フラグを持たない」CLI は、環境変数でしか
@@ -1043,8 +1140,8 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_approval, apply_resume, env_enables_auto, isolated_env_for_session, merged_env,
-        Approval,
+        apply_approval, apply_resume, apply_resume_id, env_enables_auto, isolated_env_for_session,
+        merged_env, Approval, SessionStore,
     };
     use std::collections::HashMap;
 
@@ -1145,6 +1242,104 @@ mod tests {
             apply_resume("codex resume --last", codex),
             "codex resume --last"
         );
+    }
+
+    // ── apply_resume_id (ID 指定でこの過去セッションを開く) ─────────
+
+    #[test]
+    fn resume_id_table() {
+        // (bin, コマンド, id, 期待値)
+        let table: &[(&str, &str, &str, &str)] = &[
+            // フラグ型: 末尾に `--resume <id>`
+            ("claude", "claude", "abc-123", "claude --resume abc-123"),
+            (
+                "claude",
+                "claude --dangerously-skip-permissions",
+                "abc-123",
+                "claude --dangerously-skip-permissions --resume abc-123",
+            ),
+            // サブコマンド型: bin の直後に `resume <id>`
+            ("codex", "codex", "9f-77", "codex resume 9f-77"),
+            (
+                "codex",
+                "codex --dangerously-bypass-approvals-and-sandbox",
+                "9f-77",
+                "codex resume 9f-77 --dangerously-bypass-approvals-and-sandbox",
+            ),
+            // パス付き実行ファイルでもカタログは引ける (bin は basename 一致)
+            (
+                "claude",
+                "/usr/local/bin/claude --model opus",
+                "id1",
+                "/usr/local/bin/claude --model opus --resume id1",
+            ),
+            // 空 ID / 空白だけの ID は何もしない
+            ("claude", "claude", "", "claude"),
+            ("claude", "claude", "   ", "claude"),
+            // 危険な文字を含む ID は付けない (シェルへ素で置くため)
+            ("claude", "claude", "a b", "claude"),
+            ("claude", "claude", "x;rm -rf /", "claude"),
+            ("codex", "codex", "$(id)", "codex"),
+        ];
+        for (bin, cmd, id, want) in table {
+            let spec = spec_for_bin(bin).expect("カタログにある");
+            assert_eq!(apply_resume_id(cmd, spec, id), *want, "{bin} / {cmd} / {id}");
+        }
+    }
+
+    #[test]
+    fn resume_id_unsupported_cli_returns_command_unchanged() {
+        for bin in ["goose", "qwen", "aider", "grok"] {
+            let spec = spec_for_bin(bin).expect("カタログにある");
+            assert_eq!(spec.resume_id_flag(), "", "{bin} は ID 指定再開 未対応のはず");
+            assert_eq!(spec.session_store(), SessionStore::None);
+            assert_eq!(apply_resume_id(bin, spec, "abc"), bin);
+        }
+    }
+
+    #[test]
+    fn resume_id_does_not_double_add() {
+        let claude = spec_for_bin("claude").unwrap();
+        // 既に ID 指定がある
+        assert_eq!(
+            apply_resume_id("claude --resume old", claude, "new"),
+            "claude --resume old"
+        );
+        // 直前再開 (--continue) と併用させない
+        assert_eq!(
+            apply_resume_id("claude --continue", claude, "new"),
+            "claude --continue"
+        );
+        let codex = spec_for_bin("codex").unwrap();
+        assert_eq!(
+            apply_resume_id("codex resume --last", codex, "new"),
+            "codex resume --last"
+        );
+    }
+
+    #[test]
+    fn session_store_catalog_matches_resume_id_support() {
+        assert_eq!(
+            spec_for_bin("claude").unwrap().session_store(),
+            SessionStore::ClaudeProjects
+        );
+        assert_eq!(
+            spec_for_bin("codex").unwrap().session_store(),
+            SessionStore::CodexRollouts
+        );
+        // 保存先を宣言している = ID 指定再開もできる、が常に成り立つこと
+        for spec in AGENT_CATALOG {
+            let has_store = spec.session_store() != SessionStore::None;
+            assert_eq!(
+                has_store,
+                !spec.resume_id_flag().is_empty(),
+                "{} のカタログが片肺",
+                spec.bin
+            );
+            if has_store {
+                assert!(!spec.resume_flag.is_empty(), "{} は再開指定も要る", spec.bin);
+            }
+        }
     }
 
     #[test]

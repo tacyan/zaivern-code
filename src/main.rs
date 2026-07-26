@@ -47,6 +47,7 @@ mod recent;
 mod remote;
 mod sound;
 mod session;
+mod session_picker;
 mod shellenv;
 mod snippets;
 mod supervisor;
@@ -113,6 +114,15 @@ fn main() -> eframe::Result<()> {
             files.push(p);
         }
     }
+    // 引数でフォルダを指定していない起動は「前回開いていたフォルダ」を開き直す。
+    // 判定は recent::startup_folder（純粋関数）に集約している:
+    //   引数指定あり → 復元しない / `--no-restore` か ZAIVERN_NO_RESTORE → 復元しない /
+    //   それ以外は MRU (~/.zaivern/menu_state.toml) の先頭から実在するものを 1 つ。
+    // menu_state.toml が無い・壊れている場合は None が返り、従来どおりカレントになる。
+    if let Some(prev) = recent::startup_folder_for_launch(&dirs, &args) {
+        dirs.push(prev);
+    }
+
     // 引数無し = カレントディレクトリ（従来どおり）。roots は決して空にしない。
     let mut roots = file_tree::normalize_roots(dirs);
     if roots.is_empty() {
