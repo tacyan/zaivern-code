@@ -1,47 +1,60 @@
-//! エージェントデッキ — 縦 1 本のリストでエージェントを管理する、キーボード優先の画面。
+//! エージェントデッキ — 左に細いレール、右にその端末だけ。cmux と同じ静かな見え方。
 //!
-//! cmux の「左に縦一列のセッション、右にその端末」という操作感を、
-//! Zaivern の材料 (稼働中セッション / ローカルに残っている過去の会話 /
-//! 起動プリセット) の**全部**を 1 本のリストに並べる形で作り直したもの。
+//! ## レールに並ぶのは「いま動いているエージェント」だけ
+//! デッキは **ランチャ + 端末** であって、ダッシュボードでも一覧画面でもない。
+//! - 「誰がどの状態か」を持つのは**フリート看板 (kanban.rs)** の役目。
+//! - 「過去の会話を再開する」を持つのは**サイドバーのセッションタブ
+//!   (session_picker.rs)** の役目。
 //!
-//! ## 既存の 2 画面との違い
-//! - **Cockpit** はライブタイルの**グリッド**。全員を同時に眺める画面で、
-//!   1 体を深く触るには向かない。デッキは常に「1 本を選んで、その端末を全高で見る」。
-//! - **フリート看板 (kanban.rs)** は状態レーンの**ボード**。「誰がどの状態か」を
-//!   俯瞰する画面で、過去の会話も起動導線も持たない。デッキは状態で並べ替えず、
-//!   稼働中 → ローカルのセッション → 新規 の 3 セクションを縦に固定して並べ、
-//!   「再開する / 起動する / 名前を変える / 複製する / 止める」までを鍵盤だけで回す。
+//! どちらもデッキでは二重に持たない (実際に看板と被っていた)。だからレールの
+//! 行は稼働中セッションと 1 対 1 で、状態は一切描かない: 区画見出し・
+//! フィルタチップ・稼働/承認の件数・経過時間・出力スパークライン・承認バッジ —
+//! すべて持たない。起動プリセットも行にしない (上端の ＋ メニューだけ)。
 //!
-//! ## 構成
+//! ## 一覧の 1 行
+//! [`RowView`] がそのまま「画面に出る 1 行」で、**タイトル 1 行 + 副題 1 行**しかない。
+//!
 //! ```text
-//! ┌ ヘッダー: 稼働中 N / 承認待ち M ・上限の助言 ・レイアウト切替 ────────┐
-//! │ フィルタチップ (すべて/作業中/待機/要対応) + 絞り込み欄               │
-//! ├────────────┬────────────────────────────────────────────────────────┤
-//! │ ▾ 稼働中    │  選択中セッションのライブ端末 (terminal::draw)          │
-//! │ ▾ ローカル  │  ─ 積み上げモードでは複数セッションを上下に並べる ─      │
-//! │ ▾ 新規      │  下端: そのエージェント宛ての複数行コンポーザ           │
-//! └────────────┴────────────────────────────────────────────────────────┘
+//! ┌───────────────┬──────────────────────────────────────────────┐
+//! │ ＋        ▤   │ zaivern-code · ~/dev/zaivern    ▤ ⊟ ＋ － ✕  │
+//! │ zaivern-code  ├──────────────────────────────────────────────┤
+//! │ main • ~/dev… │                                              │
+//! │ kindle2pdf    │            端末 (端から端まで)                │
+//! │ master • ~/d… │                                              │
+//! └───────────────┴──────────────────────────────────────────────┘
 //! ```
 //!
+//! 選択行は accent の**べた塗り**。文字色は [`on_accent`] が明度差で選ぶ。
+//!
+//! ## 絞り込みは「見えない」
+//! 絞り込み欄は描かない。**そのまま文字を打てば絞り込み**、Backspace で 1 文字消し、
+//! Esc で全消し ([`type_into_filter`])。絞り込みが効いている間だけ、
+//! レール下端に細いピルでその語を出す (それ以外は何も出さない)。
+//! そのため 1 打鍵のライフサイクル操作は **⌥ (Alt) 付き**に置いた
+//! ([`key_intent`]): ⌥N 新規 / ⌥R 名前変更 / ⌥D 複製 / ⌥X 停止 (2 回) /
+//! ⌥S 再起動 / ⌥↑⌥↓ 並べ替え。素の ↑↓ で選択、Enter で端末へ。
+//!
+//! ## 寸法
+//! 固定ピクセルを書かない。レール幅は窓幅の割合 ([`rail_width`]) で、
+//! 下限・上限は**本文 1 行の高さ**を単位に決める (DPI・フォント設定に追従する)。
+//!
 //! ## 負荷 (アイドルで 1 枚も描かない)
-//! - PTY 画面の読み直しは [`DeckState::sample_due`] が真のフレームだけ
-//!   (kanban と同じ適応周期: 動いていれば ~6.7Hz / 静かなら 1Hz)。
+//! - PTY 画面の読み直しは [`DeckState::sample_due`] が真のフレームだけ。
 //! - 再描画要求は [`deck_repaint_ms`] が決める。**誰も出力していなければ
 //!   `None` = 1 枚も予約しない** — app.rs の `schedule_idle_repaint` に判断を返す。
 //!   ここが `Some` に固定されるとアイドル時の CPU が跳ねる (回帰テストあり)。
 //!
 //! 作法は kanban.rs / orchestration.rs と同じ: 判断と描画はこのモジュール、
-//! 副作用 (起動・再開・停止・PTY への書き込み) は [`DeckAction`] で app.rs へ返す。
-//! Session を直接借りない (app.rs が [`LiveRow`] へ写して渡す)。
+//! 副作用 (起動・停止・並べ替え) は [`DeckAction`] で app.rs へ返す。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use eframe::egui::{self, Color32, RichText, Stroke};
+use eframe::egui::{self, Color32, RichText};
 
-use crate::i18n::{tr, trf};
-use crate::kanban::{self, Activity, Source};
-use crate::session_picker::PastSession;
+use crate::i18n::tr;
+use crate::kanban::{self, Activity};
 use crate::supervisor;
 use crate::theme::Theme;
 
@@ -49,145 +62,42 @@ use crate::theme::Theme;
 /// フォントに glyph がある字だけを使う (app.rs の `ui_symbols_have_glyphs` 参照)。
 pub const DECK_ICON: &str = "📇";
 
+/// 副題の区切り (cmux と同じ中黒)。
+pub const SUBTITLE_SEP: &str = " • ";
+
 // ---------------------------------------------------------------------------
 // リストの構成要素
 // ---------------------------------------------------------------------------
 
-/// 縦リストの区画。表示順はこの並び (上から順に固定)。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Section {
-    /// いま走っている (または枠だけ残っている) セッション
-    Live,
-    /// ディスクに残っている過去の会話 (再開できる)
-    Past,
-    /// 起動プリセット (1 打鍵で新しいエージェントを起こす)
-    New,
-}
-
-/// 表示順。
-pub const SECTIONS: [Section; 3] = [Section::Live, Section::Past, Section::New];
-
-impl Section {
-    /// 折りたたみ配列の添字。
-    pub fn ix(self) -> usize {
-        match self {
-            Section::Live => 0,
-            Section::Past => 1,
-            Section::New => 2,
-        }
-    }
-
-    /// 見出し (tr のキーになる日本語原文)。
-    pub fn title(self) -> &'static str {
-        match self {
-            Section::Live => "稼働中",
-            Section::Past => "ローカルのセッション",
-            Section::New => "新規",
-        }
-    }
-
-    /// 見出しの記号。
-    pub fn icon(self) -> &'static str {
-        match self {
-            Section::Live => "●",
-            Section::Past => "💬",
-            Section::New => "➕",
-        }
-    }
-
-    /// 見出しのホバー説明 (tr のキー)。
-    pub fn hint(self) -> &'static str {
-        match self {
-            Section::Live => "いま動いているセッション — Enter でその端末へ入ります",
-            Section::Past => "この PC に残っている過去の会話 — Enter で再開します",
-            Section::New => "起動プリセット — Enter で新しいエージェントを起こします",
-        }
-    }
-}
-
-/// 行の同一性。**index ではなく中身**で持つので、リストが増減しても選択が飛ばない。
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum RowKey {
-    /// 稼働中セッション (セッション ID)
-    Live(u64),
-    /// 過去の会話 (実行ファイル名, 会話 ID)
-    Past(String, String),
-    /// 起動プリセット (プリセット index)
-    Launcher(usize),
-}
-
-impl RowKey {
-    /// 永続メモリへ書ける文字列表現 (egui の memory は型付きなので 1 本の String にする)。
-    pub fn to_persist(&self) -> String {
-        match self {
-            RowKey::Live(id) => format!("L\u{1}{id}"),
-            RowKey::Past(bin, id) => format!("P\u{1}{bin}\u{1}{id}"),
-            RowKey::Launcher(i) => format!("N\u{1}{i}"),
-        }
-    }
-
-    /// [`RowKey::to_persist`] の逆。壊れた文字列は `None` (選択なしに戻すだけ)。
-    pub fn from_persist(s: &str) -> Option<RowKey> {
-        let mut it = s.split('\u{1}');
-        match it.next()? {
-            "L" => it.next()?.parse().ok().map(RowKey::Live),
-            "P" => {
-                let bin = it.next()?.to_string();
-                let id = it.next()?.to_string();
-                Some(RowKey::Past(bin, id))
-            }
-            "N" => it.next()?.parse().ok().map(RowKey::Launcher),
-            _ => None,
-        }
-    }
-
-    /// 稼働中セッションの ID (それ以外は `None`)。
-    pub fn live_id(&self) -> Option<u64> {
-        match self {
-            RowKey::Live(id) => Some(*id),
-            _ => None,
-        }
-    }
-}
-
 /// 稼働中セッション 1 本のスナップショット (app.rs が毎フレーム写す)。
+///
+/// **状態の表示に使う値は持たない** (承認件数・未読・稼働時間は看板の担当)。
+/// ここに残っているのは「並べる」「見分ける」「サンプリングの速さを決める」ための材料だけ。
 #[derive(Clone, Debug, Default)]
 pub struct LiveRow {
     /// `AgentManager.sessions` の index (**このフレーム内でのみ**有効)
     pub idx: usize,
+    /// セッション ID。行の同一性はこれ (index ではない) なので並べ替えで飛ばない。
     pub id: u64,
-    pub icon: String,
+    /// 一覧の 1 行目に出る表示名 (プリセット名 or セッション名)
     pub title: String,
     pub cwd: PathBuf,
-    /// 起動に使ったコマンド。過去の会話との重複判定 (`--resume <id>`) に使う。
+    /// 作業ディレクトリの git ブランチ (分からなければ空)
+    pub branch: String,
+    /// 起動コマンド (名前も場所も無いときの最後の手がかり)
     pub command: String,
     pub running: bool,
     pub attention: bool,
-    pub unread: bool,
     pub rate_limited: bool,
-    /// このセッション宛ての承認待ち件数 (`agents.approvals`)
-    pub approvals: usize,
-    /// 見張り (supervisor.rs) の判定
+    /// 見張り (supervisor.rs) の判定 — サンプリング周期の決定にだけ使う
     pub sup: Option<supervisor::SessionState>,
-    /// アクティブ (紫枠) のセッションか
+    /// アクティブ (紫枠) のセッションか (初回選択の既定)
     pub active: bool,
-    /// 連続稼働時間の表示 (`Session::uptime`)
-    pub uptime: String,
     /// 画面末尾の意味のある行。**サンプリングしたフレームだけ**中身が入る。
     pub tail_lines: Vec<String>,
 }
 
-/// 過去の会話 1 本。
-#[derive(Clone, Debug)]
-pub struct PastRow {
-    pub session: PastSession,
-    /// 一覧に出す相対時刻 (`session_picker::relative_age` の結果)
-    pub age: String,
-    /// エージェントの印 (アイコン or 実行ファイル名の頭文字)
-    pub mark: String,
-}
-
-/// 起動プリセット 1 本。
+/// 起動プリセット 1 本 (レール上端の ＋ メニューに出る。**行にはしない**)。
 #[derive(Clone, Debug)]
 pub struct LauncherRow {
     /// `cfg.agents` の index
@@ -196,80 +106,26 @@ pub struct LauncherRow {
     pub name: String,
 }
 
-/// 画面に実際に並ぶ 1 行。詳細は `idx` で元のスライスを引く。
-#[derive(Clone, Debug, PartialEq)]
+/// 画面に実際に並ぶ 1 行 = 稼働中セッション 1 本。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Row {
-    pub key: RowKey,
-    pub section: Section,
-    /// Live: `live[idx]` / Past: `past[idx]` / New: `launchers[idx]`
+    /// セッション ID (選択の同一性)
+    pub id: u64,
+    /// `live[idx]` (**このフレーム内でのみ**有効)
     pub idx: usize,
 }
 
-// ---------------------------------------------------------------------------
-// フィルタ
-// ---------------------------------------------------------------------------
-
-/// ヘッダーのフィルタチップ。
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Chip {
-    /// 全部 (3 セクションとも出す)
-    #[default]
-    All,
-    /// 出力が動いているセッションだけ
-    Working,
-    /// 生きているが動いていないセッションだけ
-    Waiting,
-    /// 承認待ち・停滞・レート制限・未読の注意マークが付くものだけ
-    Attention,
-}
-
-/// チップの表示順。
-pub const CHIPS: [Chip; 4] = [Chip::All, Chip::Working, Chip::Waiting, Chip::Attention];
-
-impl Chip {
-    /// チップのラベル (tr のキー)。
-    pub fn label(self) -> &'static str {
-        match self {
-            Chip::All => "すべて",
-            Chip::Working => "作業中",
-            Chip::Waiting => "待機",
-            Chip::Attention => "要対応",
-        }
-    }
-
-    /// 稼働中セクションの 1 行がこのチップに残るか (純関数)。
-    pub fn keeps(self, a: Activity, row: &LiveRow) -> bool {
-        match self {
-            Chip::All => true,
-            Chip::Working => a.is_busy(),
-            Chip::Waiting => matches!(a, Activity::Idle | Activity::Starting),
-            Chip::Attention => {
-                row.attention
-                    || row.approvals > 0
-                    || matches!(
-                        a,
-                        Activity::Approval | Activity::Stalled | Activity::RateLimited
-                    )
-            }
-        }
-    }
-
-    /// 「すべて」以外は**稼働中セクションだけ**に絞る。
-    /// 過去の会話も起動プリセットも「作業中/待機/要対応」を持たないので、
-    /// 混ぜて出すとチップの意味が壊れる。
-    pub fn live_only(self) -> bool {
-        self != Chip::All
-    }
-}
-
-/// リスト構築に効く表示条件。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Filter {
-    pub chip: Chip,
-    /// 打ち込み絞り込み (空なら無効)。大文字小文字は区別しない。
-    pub query: String,
-    /// セクションごとの折りたたみ ([`Section::ix`] の順)
-    pub collapsed: [bool; 3],
+/// **画面に出る 1 行そのもの**。タイトルと、薄い 1 行の副題だけ。
+///
+/// ここにフィールドを足すことが、そのまま「デッキがダッシュボードに戻る」こと
+/// なので、増やさない (テストが分解パターンで固定している)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowView {
+    pub id: u64,
+    /// 1 行目 — エージェントの表示名
+    pub title: String,
+    /// 2 行目 — `<ブランチ> • <短縮 cwd>` / 短縮 cwd / 起動コマンド
+    pub subtitle: String,
 }
 
 /// 絞り込み語がどれかの欄に含まれるか (純関数・大文字小文字を無視)。
@@ -281,106 +137,59 @@ pub fn matches_query(query: &str, fields: &[&str]) -> bool {
     fields.iter().any(|f| f.to_lowercase().contains(&q))
 }
 
-/// 過去の会話が「いま稼働中のセッションとして開かれている」か (純関数)。
+/// レールに並べる行を組み立てる **純関数**。
 ///
-/// 再開起動のコマンドには会話 ID がそのまま入る (`--resume <uuid>` 等) ので、
-/// それを唯一の根拠にする。cwd の一致だけで消すと、同じフォルダの別の会話まで
-/// 一覧から消えてしまう。
-pub fn is_open_live(past_id: &str, live: &[LiveRow]) -> bool {
-    if past_id.trim().is_empty() {
-        return false;
-    }
+/// 入力は**稼働中セッションだけ**。過去の会話も起動プリセットも受け取らない
+/// (= 行として出しようがない)。並びは渡された順 = app.rs のセッション順。
+pub fn build_rows(live: &[LiveRow], query: &str) -> Vec<Row> {
     live.iter()
-        .any(|l| l.running && l.command.contains(past_id))
-}
-
-/// 3 セクションぶんの行を 1 本の縦リストへ組み立てる **純関数**。
-///
-/// - 稼働中: 渡された順 (app.rs = セッションの並び順) をそのまま保つ
-/// - ローカルのセッション: 渡された順 (新しい順)。稼働中と重複するものは落とす
-/// - 新規: プリセットの順
-/// - 折りたたみ中のセクションは 0 行 (見出しだけ UI 側が描く)
-pub fn build_rows(
-    live: &[LiveRow],
-    acts: &[Activity],
-    past: &[PastRow],
-    launchers: &[LauncherRow],
-    f: &Filter,
-) -> Vec<Row> {
-    let mut out: Vec<Row> = Vec::new();
-
-    if !f.collapsed[Section::Live.ix()] {
-        for (i, l) in live.iter().enumerate() {
-            let a = acts.get(i).copied().unwrap_or(Activity::Starting);
-            if !f.chip.keeps(a, l) {
-                continue;
-            }
+        .enumerate()
+        .filter(|(_, l)| {
             let cwd = l.cwd.to_string_lossy();
-            if !matches_query(&f.query, &[&l.title, &cwd, &l.icon]) {
-                continue;
-            }
-            out.push(Row {
-                key: RowKey::Live(l.id),
-                section: Section::Live,
-                idx: i,
-            });
-        }
-    }
-
-    if !f.chip.live_only() && !f.collapsed[Section::Past.ix()] {
-        for (i, p) in past.iter().enumerate() {
-            if is_open_live(&p.session.id, live) {
-                continue;
-            }
-            let cwd = p.session.cwd.to_string_lossy();
-            if !matches_query(
-                &f.query,
-                &[&p.session.summary, &cwd, &p.session.agent_bin],
-            ) {
-                continue;
-            }
-            out.push(Row {
-                key: RowKey::Past(p.session.agent_bin.clone(), p.session.id.clone()),
-                section: Section::Past,
-                idx: i,
-            });
-        }
-    }
-
-    if !f.chip.live_only() && !f.collapsed[Section::New.ix()] {
-        for (i, n) in launchers.iter().enumerate() {
-            if !matches_query(&f.query, &[&n.name, &n.icon]) {
-                continue;
-            }
-            out.push(Row {
-                key: RowKey::Launcher(n.idx),
-                section: Section::New,
-                idx: i,
-            });
-        }
-    }
-
-    out
+            matches_query(query, &[&l.title, &cwd, &l.branch])
+        })
+        .map(|(i, l)| Row { id: l.id, idx: i })
+        .collect()
 }
 
-/// 見出しに出す件数 (折りたたみを無視した、フィルタ適用後の件数)。
-pub fn section_counts(
-    live: &[LiveRow],
-    acts: &[Activity],
-    past: &[PastRow],
-    launchers: &[LauncherRow],
-    f: &Filter,
-) -> [usize; 3] {
-    let open = Filter {
-        collapsed: [false; 3],
-        ..f.clone()
+/// 副題 **純関数**。
+/// repo が分かれば `<ブランチ> • <短縮 cwd>`、分からなければ短縮 cwd、
+/// それも無ければ起動コマンド。改行は含めない (必ず 1 行)。
+pub fn subtitle_of(branch: &str, cwd: &str, command: &str) -> String {
+    let b = branch.trim();
+    let c = cwd.trim();
+    let s = match (b.is_empty(), c.is_empty()) {
+        (false, false) => format!("{b}{SUBTITLE_SEP}{c}"),
+        (true, false) => c.to_string(),
+        (false, true) => b.to_string(),
+        (true, true) => command.trim().to_string(),
     };
-    let rows = build_rows(live, acts, past, launchers, &open);
-    let mut n = [0usize; 3];
-    for r in &rows {
-        n[r.section.ix()] += 1;
-    }
-    n
+    one_line(&s)
+}
+
+/// 改行・タブを潰して 1 行にする (タイトルも副題も必ず 1 行という不変条件)。
+fn one_line(s: &str) -> String {
+    s.replace(['\n', '\r', '\t'], " ").trim().to_string()
+}
+
+/// 行 → 画面に出る 2 行 (**純関数**)。ここに状態は一切入らない。
+pub fn row_views(rows: &[Row], live: &[LiveRow], home: Option<&Path>) -> Vec<RowView> {
+    rows.iter()
+        .filter_map(|r| {
+            let l = live.get(r.idx)?;
+            let cwd = short_path(&l.cwd, home);
+            let title = if l.title.trim().is_empty() {
+                one_line(&l.command)
+            } else {
+                one_line(&l.title)
+            };
+            Some(RowView {
+                id: l.id,
+                title,
+                subtitle: subtitle_of(&l.branch, &cwd, &l.command),
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -389,34 +198,29 @@ pub fn section_counts(
 
 /// 選択をいまのリストへ解決する **純関数**。
 ///
-/// - キーがそのまま残っていれば、その位置を返す (並べ替え・挿入で飛ばない)
+/// - セッションがそのまま残っていれば、その位置を返す (並べ替え・挿入で飛ばない)
 /// - 消えていれば、最後に居た位置へ寄せる (末尾を超えたら末尾)
 /// - リストが空なら `None`
-pub fn resolve_selection(
-    sel: Option<&RowKey>,
-    last_pos: usize,
-    rows: &[Row],
-) -> Option<(RowKey, usize)> {
+pub fn resolve_selection(sel: Option<u64>, last_pos: usize, rows: &[Row]) -> Option<(u64, usize)> {
     if rows.is_empty() {
         return None;
     }
-    if let Some(k) = sel {
-        if let Some(pos) = rows.iter().position(|r| &r.key == k) {
-            return Some((k.clone(), pos));
+    if let Some(id) = sel {
+        if let Some(pos) = rows.iter().position(|r| r.id == id) {
+            return Some((id, pos));
         }
     }
     let pos = last_pos.min(rows.len() - 1);
-    Some((rows[pos].key.clone(), pos))
+    Some((rows[pos].id, pos))
 }
 
-/// 上下移動 **純関数**。セクションの境目は素通りする (リストが 1 本だから)。
-/// 端では止まる (巻き戻さない — 長いリストで迷子になるため)。
-pub fn move_selection(rows: &[Row], cur: Option<&RowKey>, delta: i32) -> Option<RowKey> {
+/// 上下移動 **純関数**。端では止まる (巻き戻さない — 長いリストで迷子になるため)。
+pub fn move_selection(rows: &[Row], cur: Option<u64>, delta: i32) -> Option<u64> {
     if rows.is_empty() || delta == 0 {
         return None;
     }
     let at = cur
-        .and_then(|k| rows.iter().position(|r| &r.key == k))
+        .and_then(|id| rows.iter().position(|r| r.id == id))
         .map(|p| p as i32);
     let next = match at {
         Some(p) => (p + delta).clamp(0, rows.len() as i32 - 1),
@@ -424,29 +228,39 @@ pub fn move_selection(rows: &[Row], cur: Option<&RowKey>, delta: i32) -> Option<
         None if delta > 0 => 0,
         None => rows.len() as i32 - 1,
     };
-    rows.get(next as usize).map(|r| r.key.clone())
+    rows.get(next as usize).map(|r| r.id)
 }
 
 // ---------------------------------------------------------------------------
-// レイアウト
+// レイアウト (寸法はすべて「窓幅」と「本文 1 行の高さ」から導く)
 // ---------------------------------------------------------------------------
 
-/// 端末ペインの見せ方。Cockpit (グリッド) と看板 (ボード) に無い「使い分け」。
+/// 端末ペインの見せ方。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DeckLayout {
-    /// 選択中の 1 本だけを全高で出す
-    #[default]
+    /// レールを畳んで、選択中の 1 本を全幅で出す
     Single,
-    /// 左レール + 右に 1 本 (既定の 2 分割はレールの有無で決まるので、
-    /// ここでは「レールを常に出す」意味になる)
+    /// 左レール + 右に 1 本 (cmux の既定)
+    #[default]
     Split,
-    /// 選択の前後を上下に積み上げる (cmux の複数ペイン)
+    /// 左レール + 右で選択の前後を上下に積み上げる
     Stacked,
 }
 
 /// 積み上げモードで同時に出せるセッション数の下限・上限。
 pub const MIN_STACK: usize = 2;
 pub const MAX_STACK: usize = 6;
+
+/// レール幅の既定 (窓幅に対する割合)。cmux の細い左レールに合わせる。
+pub const RAIL_FRAC_DEFAULT: f32 = 0.14;
+/// レール幅の上限 (窓幅に対する割合)。
+pub const RAIL_FRAC_MAX: f32 = 0.42;
+/// レール幅の下限 (本文 1 行の高さの倍数)。DPI・フォント設定に追従させるため
+/// ピクセルではなく行の高さを単位にする。
+const RAIL_MIN_UNITS: f32 = 9.0;
+/// レールを横に置ける最小の窓幅 (本文 1 行の高さの倍数)。
+/// これより細い窓では、上にレール・下に端末を積む。
+const RAIL_SIDE_MIN_UNITS: f32 = 40.0;
 
 impl DeckLayout {
     pub fn to_u8(self) -> u8 {
@@ -459,36 +273,35 @@ impl DeckLayout {
 
     pub fn from_u8(v: u8) -> Self {
         match v {
-            1 => DeckLayout::Split,
+            0 => DeckLayout::Single,
             2 => DeckLayout::Stacked,
-            _ => DeckLayout::Single,
+            _ => DeckLayout::Split,
         }
     }
 
-    /// 次のレイアウトへ (1画面 → 2分割 → 積み上げ → 1画面)。
-    pub fn next(self) -> Self {
-        match self {
-            DeckLayout::Single => DeckLayout::Split,
-            DeckLayout::Split => DeckLayout::Stacked,
-            DeckLayout::Stacked => DeckLayout::Single,
-        }
-    }
-
-    /// ラベル (tr のキー)。
-    pub fn label(self) -> &'static str {
-        match self {
-            DeckLayout::Single => "1画面 (選択のみ)",
-            DeckLayout::Split => "2分割",
-            DeckLayout::Stacked => "積み上げ",
-        }
-    }
-
-    /// この配置で一覧 (レール) を出すか。1 画面モードは端末に全部渡す。
-    /// `enabled` は呼び出し側の都合 (窓が狭すぎる等) で畳みたいときの上書き。
+    /// この配置で一覧 (レール) を出すか。`Single` は端末に全部渡す。
     pub fn shows_rail(self, enabled: bool) -> bool {
         match self {
             DeckLayout::Single => false,
             DeckLayout::Split | DeckLayout::Stacked => enabled,
+        }
+    }
+
+    /// レールの表示/非表示だけを切り替える (積み上げは保つ)。
+    pub fn with_rail(self, on: bool) -> Self {
+        match (self, on) {
+            (DeckLayout::Stacked, true) => DeckLayout::Stacked,
+            (_, true) => DeckLayout::Split,
+            (_, false) => DeckLayout::Single,
+        }
+    }
+
+    /// 積み上げの入/切だけを切り替える (レールは出したまま)。
+    pub fn with_stacked(self, on: bool) -> Self {
+        if on {
+            DeckLayout::Stacked
+        } else {
+            DeckLayout::Split
         }
     }
 }
@@ -498,33 +311,42 @@ pub fn clamp_stack(n: usize) -> usize {
     n.clamp(MIN_STACK, MAX_STACK)
 }
 
+/// レール幅を窓幅から決める **純関数**。
+///
+/// `unit` は本文 1 行の高さ (`ui.text_style_height(Body)`)。固定ピクセルを
+/// 書かないための単位で、これにより DPI とフォント設定に自動で追従する。
+/// 壊れた割合 (負・巨大) を渡されても、必ず `0 < w <= 窓幅 * RAIL_FRAC_MAX` に収まる。
+pub fn rail_width(window_w: f32, frac: f32, unit: f32) -> f32 {
+    let w = window_w.max(0.0);
+    let hi = w * RAIL_FRAC_MAX;
+    let lo = (unit.max(1.0) * RAIL_MIN_UNITS).min(hi);
+    let want = w * frac.clamp(0.0, RAIL_FRAC_MAX);
+    want.clamp(lo, hi.max(lo))
+}
+
+/// レールを横 (左) に置けるだけの幅があるか **純関数**。
+pub fn rail_fits_beside(window_w: f32, unit: f32) -> bool {
+    window_w >= unit.max(1.0) * RAIL_SIDE_MIN_UNITS
+}
+
 /// 積み上げモードで実際に描くセッション ID を決める **純関数**。
 ///
-/// 選択中の行から下へ順に稼働中セッションを拾い、足りなければ先頭から補う。
-/// 稼働中セッションが 1 本も無ければ空 (端末を描かない)。
-pub fn stacked_ids(rows: &[Row], live: &[LiveRow], sel: Option<&RowKey>, want: usize) -> Vec<u64> {
-    let ids: Vec<u64> = rows
-        .iter()
-        .filter(|r| r.section == Section::Live)
-        .filter_map(|r| live.get(r.idx).map(|l| l.id))
-        .collect();
-    if ids.is_empty() {
+/// 選択中の行から下へ順に拾い、足りなければ先頭から補う。行が無ければ空。
+pub fn stacked_ids(rows: &[Row], sel: Option<u64>, want: usize) -> Vec<u64> {
+    if rows.is_empty() {
         return Vec::new();
     }
     let start = sel
-        .and_then(|k| k.live_id())
-        .and_then(|id| ids.iter().position(|x| *x == id))
+        .and_then(|id| rows.iter().position(|r| r.id == id))
         .unwrap_or(0);
-    let n = want.min(ids.len());
-    (0..n).map(|i| ids[(start + i) % ids.len()]).collect()
+    let n = want.min(rows.len());
+    (0..n).map(|i| rows[(start + i) % rows.len()].id).collect()
 }
 
-/// 積み上げペインの高さ比を、ドラッグ量に合わせて付け替える **純関数**。
-///
-/// `i` 番目と `i+1` 番目の間のバーを `delta`(全高に対する割合) だけ動かす。
-/// どちらのペインも [`MIN_WEIGHT`] より薄くならない。
+/// 積み上げペインの高さ比の下限 (全体に対する割合)。
 pub const MIN_WEIGHT: f32 = 0.08;
 
+/// 積み上げペインの高さ比を、ドラッグ量に合わせて付け替える **純関数**。
 pub fn adjust_weights(w: &mut [f32], i: usize, delta: f32) {
     if i + 1 >= w.len() {
         return;
@@ -575,17 +397,17 @@ pub fn fit_weights(w: &mut Vec<f32>, n: usize) {
 pub enum DeckKey {
     Up,
     Down,
-    /// Enter — 稼働中なら端末へ / 過去なら再開 / 新規なら起動
+    /// Enter — その端末へ入る
     Enter,
-    /// n — 新しいエージェント (選択中プリセット、無ければ先頭)
+    /// ⌥N — 新しいエージェント (先頭プリセット)
     New,
-    /// r — 名前変更
+    /// ⌥R — 名前変更
     Rename,
-    /// d — 複製 (同じプリセット + 同じ作業ディレクトリ)
+    /// ⌥D — 複製 (同じプリセット + 同じ作業ディレクトリ)
     Duplicate,
-    /// x — 停止 (2 打鍵で確定)
+    /// ⌥X — 停止 (2 打鍵で確定)
     Stop,
-    /// s — 再起動
+    /// ⌥S — 再起動
     Restart,
     /// ⌥↑ — 並べ替え (上へ)
     MoveUp,
@@ -594,7 +416,10 @@ pub enum DeckKey {
 }
 
 /// 打鍵 → [`DeckKey`] の対応表 **純関数**。
-/// 修飾キー付きは並べ替えだけ (文字キーに修飾が乗っていたら無視する)。
+///
+/// **素の文字キーは何にも割り当てない** — そのまま「見えない絞り込み」へ流れる
+/// から。ライフサイクル操作はすべて ⌥ (Alt) 付き。⌘ が乗っているときは
+/// アプリ側のショートカットが先なので手を出さない。
 pub fn key_intent(key: egui::Key, alt: bool, cmd: bool) -> Option<DeckKey> {
     if cmd {
         return None;
@@ -603,20 +428,31 @@ pub fn key_intent(key: egui::Key, alt: bool, cmd: bool) -> Option<DeckKey> {
         return match key {
             egui::Key::ArrowUp => Some(DeckKey::MoveUp),
             egui::Key::ArrowDown => Some(DeckKey::MoveDown),
+            egui::Key::N => Some(DeckKey::New),
+            egui::Key::R => Some(DeckKey::Rename),
+            egui::Key::D => Some(DeckKey::Duplicate),
+            egui::Key::X => Some(DeckKey::Stop),
+            egui::Key::S => Some(DeckKey::Restart),
             _ => None,
         };
     }
     Some(match key {
-        egui::Key::ArrowUp | egui::Key::K => DeckKey::Up,
-        egui::Key::ArrowDown | egui::Key::J => DeckKey::Down,
+        egui::Key::ArrowUp => DeckKey::Up,
+        egui::Key::ArrowDown => DeckKey::Down,
         egui::Key::Enter => DeckKey::Enter,
-        egui::Key::N => DeckKey::New,
-        egui::Key::R => DeckKey::Rename,
-        egui::Key::D => DeckKey::Duplicate,
-        egui::Key::X => DeckKey::Stop,
-        egui::Key::S => DeckKey::Restart,
         _ => return None,
     })
+}
+
+/// 「見えない絞り込み」へ打った文字を足す **純関数**。
+/// 制御文字は捨てる。1 文字でも入ったら true。
+pub fn type_into_filter(query: &mut String, text: &str) -> bool {
+    let mut changed = false;
+    for ch in text.chars().filter(|c| !c.is_control()) {
+        query.push(ch);
+        changed = true;
+    }
+    changed
 }
 
 /// app.rs へ返す副作用の要求。実行は app.rs (`deck_ui`) 側。
@@ -624,10 +460,8 @@ pub fn key_intent(key: egui::Key, alt: bool, cmd: bool) -> Option<DeckKey> {
 pub enum DeckAction {
     /// アクティブ (紫枠) をこのセッション index へ
     Select(usize),
-    /// プリセット index のエージェントを起動
+    /// プリセット index のエージェントを起動 (＋ メニュー / ⌥N)
     Launch(usize),
-    /// この過去の会話を再開する
-    Resume(Box<PastSession>),
     /// セッションの表示名を変える
     Rename { id: u64, title: String },
     /// 同じプリセット + 同じ作業ディレクトリでもう 1 本起こす
@@ -638,10 +472,6 @@ pub enum DeckAction {
     Restart(usize),
     /// 並べ替え (from → to)
     Reorder { from: usize, to: usize },
-    /// 選択中セッションへ送信
-    Send { id: u64, text: String },
-    /// 全エージェントへ送信 (コンポーザの宛先が「全員」のとき)
-    Broadcast(String),
     /// デッキを閉じる
     Close,
 }
@@ -665,25 +495,17 @@ pub enum Intent {
 
 /// 打鍵を意図へ落とす **純関数** (ここにプロセスを起こす処理は一切無い)。
 ///
-/// `row` は選択中の行。`stop_armed` は「x の 1 打目が入っているセッション」。
+/// `row` は選択中の行。`stop_armed` は「⌥X の 1 打目が入っているセッション」。
 pub fn dispatch(
     k: DeckKey,
     rows: &[Row],
-    row: Option<&Row>,
+    row: Option<Row>,
     live: &[LiveRow],
-    past: &[PastRow],
     launchers: &[LauncherRow],
     stop_armed: Option<u64>,
 ) -> Vec<Intent> {
     let mut out = Vec::new();
-    // 選択が動く操作は、いつでも停止の確認を取り下げる (誤爆防止)
-    let live_of = |r: &Row| -> Option<&LiveRow> {
-        if r.section == Section::Live {
-            live.get(r.idx)
-        } else {
-            None
-        }
-    };
+    let cur = row.and_then(|r| live.get(r.idx));
     match k {
         DeckKey::Up => {
             out.push(Intent::DisarmStop);
@@ -694,50 +516,28 @@ pub fn dispatch(
             out.push(Intent::Move(1));
         }
         DeckKey::Enter => {
-            let Some(r) = row else { return out };
-            match r.section {
-                Section::Live => {
-                    if let Some(l) = live.get(r.idx) {
-                        out.push(Intent::Act(DeckAction::Select(l.idx)));
-                    }
-                    out.push(Intent::FocusTerminal);
-                }
-                Section::Past => {
-                    if let Some(p) = past.get(r.idx) {
-                        out.push(Intent::Act(DeckAction::Resume(Box::new(
-                            p.session.clone(),
-                        ))));
-                    }
-                }
-                Section::New => {
-                    if let Some(n) = launchers.get(r.idx) {
-                        out.push(Intent::Act(DeckAction::Launch(n.idx)));
-                    }
-                }
+            if let Some(l) = cur {
+                out.push(Intent::Act(DeckAction::Select(l.idx)));
+                out.push(Intent::FocusTerminal);
             }
         }
         DeckKey::New => {
-            // 選択が起動プリセットならそれを、そうでなければ先頭のプリセットを起こす
-            let pick = row
-                .filter(|r| r.section == Section::New)
-                .and_then(|r| launchers.get(r.idx))
-                .or_else(|| launchers.first());
-            if let Some(n) = pick {
+            if let Some(n) = launchers.first() {
                 out.push(Intent::Act(DeckAction::Launch(n.idx)));
             }
         }
         DeckKey::Rename => {
-            if let Some(l) = row.and_then(live_of) {
+            if let Some(l) = cur {
                 out.push(Intent::BeginRename(l.id));
             }
         }
         DeckKey::Duplicate => {
-            if let Some(l) = row.and_then(live_of) {
+            if let Some(l) = cur {
                 out.push(Intent::Act(DeckAction::Duplicate(l.idx)));
             }
         }
         DeckKey::Stop => {
-            if let Some(l) = row.and_then(live_of) {
+            if let Some(l) = cur {
                 if stop_armed == Some(l.id) {
                     out.push(Intent::DisarmStop);
                     out.push(Intent::Act(DeckAction::Stop(l.idx)));
@@ -747,29 +547,25 @@ pub fn dispatch(
             }
         }
         DeckKey::Restart => {
-            if let Some(l) = row.and_then(live_of) {
+            if let Some(l) = cur {
                 out.push(Intent::Act(DeckAction::Restart(l.idx)));
             }
         }
         DeckKey::MoveUp | DeckKey::MoveDown => {
-            let Some(r) = row else { return out };
-            let Some(l) = live_of(r) else { return out };
+            let (Some(r), Some(l)) = (row, cur) else {
+                return out;
+            };
             let up = k == DeckKey::MoveUp;
-            // 画面の並び (稼働中セクション内) で隣の行を探し、その実 index と入れ替える
-            let live_rows: Vec<&Row> =
-                rows.iter().filter(|x| x.section == Section::Live).collect();
-            let Some(at) = live_rows.iter().position(|x| x.key == r.key) else {
+            // 画面の並びで隣の行を探し、その実 index と入れ替える
+            let Some(at) = rows.iter().position(|x| x.id == r.id) else {
                 return out;
             };
             let to = if up {
                 at.checked_sub(1)
             } else {
-                (at + 1 < live_rows.len()).then_some(at + 1)
+                (at + 1 < rows.len()).then_some(at + 1)
             };
-            let Some(to) = to.and_then(|t| live_rows.get(t)) else {
-                return out;
-            };
-            let Some(target) = live.get(to.idx) else {
+            let Some(target) = to.and_then(|t| rows.get(t)).and_then(|t| live.get(t.idx)) else {
                 return out;
             };
             out.push(Intent::Act(DeckAction::Reorder {
@@ -789,16 +585,15 @@ pub fn dispatch(
 const FAST_SAMPLE_MS: u64 = 150;
 /// 静かなときのサンプリング間隔 (1Hz)。
 const SLOW_SAMPLE_MS: u64 = 1_000;
-/// 過去セッションの走査中だけ回す刻み (結果が届いたらすぐ止まる)。
+/// 裏の問い合わせ (ブランチ解決) が飛んでいる間だけ回す刻み。
 const SCAN_POLL_MS: u64 = 250;
-/// 出力の勢いスパークラインの窓とバケツ数。
+/// 出力の勢いを覚えておく窓 (「まだ動いている」の判定にだけ使う)。
 const PULSE_WINDOW_MS: u64 = 30_000;
-const PULSE_BUCKETS: usize = 20;
 
 /// 次に再描画を予約するまでの ms。**`None` なら 1 枚も予約しない**。
 ///
 /// これがデッキの負荷の全て。誰も出力しておらず、走っているエージェントも
-/// 無く、走査も飛んでいなければ `None` を返し、判断を app.rs の
+/// 無く、裏の問い合わせも飛んでいなければ `None` を返し、判断を app.rs の
 /// `schedule_idle_repaint` (= 完全アイドルなら 0 枚) に返す。
 pub fn deck_repaint_ms(busy: bool, any_running: bool, scanning: bool) -> Option<u64> {
     if busy {
@@ -813,38 +608,23 @@ pub fn deck_repaint_ms(busy: bool, any_running: bool, scanning: bool) -> Option<
     None
 }
 
-/// 1 セッションぶんの追跡状態 (アクティビティ・経過・出力の勢い)。
+/// 1 セッションぶんの追跡状態。**描画には一切使わない** —
+/// 「サンプリングをどれくらいの速さで回すか」を決めるためだけの内部モデル。
 #[derive(Clone, Debug)]
-pub struct Track {
+struct Track {
     activity: Activity,
-    since_ms: u64,
-    source: Source,
-    detail: String,
     tail: Vec<String>,
     /// 出力の勢い `(時刻, 新規文字数)`
     pulse: Vec<(u64, u64)>,
 }
 
 impl Track {
-    fn new(a: Activity, source: Source, now_ms: u64) -> Self {
+    fn new(a: Activity) -> Self {
         Self {
             activity: a,
-            since_ms: now_ms,
-            source,
-            detail: String::new(),
             tail: Vec::new(),
             pulse: Vec::new(),
         }
-    }
-
-    /// 現在のアクティビティが続いている時間 (ms)。
-    pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.since_ms)
-    }
-
-    /// 直近 30 秒の出力の勢い (古い → 新しい)。
-    pub fn pulse_series(&self, now_ms: u64) -> Vec<f32> {
-        kanban::bucket_series(&self.pulse, now_ms, PULSE_WINDOW_MS, PULSE_BUCKETS)
     }
 
     /// 直近 3 秒に新しい出力があったか。
@@ -852,18 +632,6 @@ impl Track {
         self.pulse
             .iter()
             .any(|(t, v)| *v > 0 && now_ms.saturating_sub(*t) <= 3_000)
-    }
-
-    pub fn activity(&self) -> Activity {
-        self.activity
-    }
-
-    pub fn source(&self) -> Source {
-        self.source
-    }
-
-    pub fn detail(&self) -> &str {
-        &self.detail
     }
 }
 
@@ -873,26 +641,25 @@ impl Track {
 
 /// デッキ画面の UI 状態 (app.rs が保持する)。
 ///
-/// 永続化は egui の persisted memory に置く。config.rs は他所有なので触らない
-/// — **将来 config.toml へ移すべき** (レイアウト・積み上げ数・折りたたみ・選択)。
+/// 永続化は egui の persisted memory に置く。config.rs は他所有なので触らない。
 #[derive(Default)]
 pub struct DeckState {
-    /// 選択中の行 (中身で持つので並べ替えで飛ばない)
-    selected: Option<RowKey>,
+    /// 選択中のセッション ID (中身で持つので並べ替えで飛ばない)
+    selected: Option<u64>,
     /// 最後に居た位置 (行が消えたときの寄せ先)
     sel_pos: usize,
-    /// フィルタ (チップ・絞り込み語・折りたたみ)
-    pub filter: Filter,
+    /// 見えない絞り込み (打った文字がそのまま入る)
+    query: String,
     /// レイアウト (None = 永続メモリから未読込)
     layout: Option<DeckLayout>,
     /// 積み上げ数 (None = 未読込)
     stack: Option<usize>,
     /// 積み上げペインの高さ比
     stack_weights: Vec<f32>,
-    /// 左レールの取り分 (0.18..0.5)
+    /// 左レールの取り分 (窓幅に対する割合)
     rail: Option<f32>,
     dirty: bool,
-    /// セッション id → 追跡状態
+    /// セッション id → 追跡状態 (サンプリング周期の決定用)
     tracks: HashMap<u64, Track>,
     /// 最後に PTY 画面をサンプルした時刻
     last_sample_ms: Option<u64>,
@@ -906,8 +673,6 @@ pub struct DeckState {
     rename_focus: bool,
     /// 停止の 1 打目が入っているセッション
     stop_armed: Option<u64>,
-    /// 絞り込み欄へフォーカスを移す予約
-    filter_focus: bool,
     /// 次のフレームで端末へフォーカスを移す
     focus_term_req: bool,
     /// 前フレームに描いた端末の egui Id (Esc を一覧へ返すために覚える)
@@ -933,6 +698,7 @@ impl DeckState {
     }
 
     /// 追跡状態を 1 ステップ進め、行ごとのアクティビティを返す。
+    /// 返り値は**描画には使わない** (サンプリング周期とテスト用)。
     /// `fresh` が true のフレームだけ `live[..].tail_lines` に新しい画面が入っている。
     pub fn update_tracks(&mut self, live: &[LiveRow], now_ms: u64, fresh: bool) -> Vec<Activity> {
         let mut acts = Vec::with_capacity(live.len());
@@ -943,15 +709,11 @@ impl DeckState {
                 any_running = true;
             }
             // 画面が来ていないフレームは前回サンプルした画面で判定する
-            // (生死・承認・レート制限といった構造化信号は毎フレーム最新)
+            // (生死・レート制限といった構造化信号は毎フレーム最新)
             let read = match (fresh, self.tracks.get(&l.id)) {
-                (true, _) => kanban::classify(
-                    l.running,
-                    l.attention,
-                    l.rate_limited,
-                    l.sup,
-                    &l.tail_lines,
-                ),
+                (true, _) => {
+                    kanban::classify(l.running, l.attention, l.rate_limited, l.sup, &l.tail_lines)
+                }
                 (false, Some(t)) => {
                     kanban::classify(l.running, l.attention, l.rate_limited, l.sup, &t.tail)
                 }
@@ -962,7 +724,7 @@ impl DeckState {
             let track = self
                 .tracks
                 .entry(l.id)
-                .or_insert_with(|| Track::new(read.activity, read.source, now_ms));
+                .or_insert_with(|| Track::new(read.activity));
             if fresh {
                 let delta = kanban::tail_delta(&track.tail, &l.tail_lines);
                 track.pulse.push((now_ms, delta));
@@ -970,12 +732,7 @@ impl DeckState {
                 track.pulse.retain(|(t, _)| *t >= from);
                 track.tail = l.tail_lines.clone();
             }
-            if track.activity != read.activity {
-                track.activity = read.activity;
-                track.since_ms = now_ms;
-            }
-            track.source = read.source;
-            track.detail = read.detail.clone();
+            track.activity = read.activity;
             if read.activity.is_busy() || track.recently_noisy(now_ms) {
                 busy = true;
             }
@@ -988,32 +745,45 @@ impl DeckState {
         acts
     }
 
-    /// いまの選択 (テスト・app.rs 用)。
-    pub fn selected(&self) -> Option<&RowKey> {
-        self.selected.as_ref()
+    /// いまの選択 (テスト用)。
+    #[cfg(test)]
+    fn selected(&self) -> Option<u64> {
+        self.selected
     }
 
     /// 選択を差し替える (クリック・パレットから)。
-    pub fn select(&mut self, key: RowKey) {
-        self.selected = Some(key);
+    pub fn select(&mut self, id: u64) {
+        self.selected = Some(id);
         self.dirty = true;
     }
 
+    /// 追跡が生きているか (テスト用)。
+    #[cfg(test)]
+    fn tracked(&self, id: u64) -> bool {
+        self.tracks.contains_key(&id)
+    }
+
+    /// 停止の確認が出ているセッション (テスト用。UI は行の枠で示す)。
+    #[cfg(test)]
+    fn stop_armed(&self) -> Option<u64> {
+        self.stop_armed
+    }
+
     /// 選択をいまのリストへ解決して覚え直す。
-    pub fn sync_selection(&mut self, rows: &[Row], live: &[LiveRow]) -> Option<RowKey> {
+    pub fn sync_selection(&mut self, rows: &[Row], live: &[LiveRow]) -> Option<u64> {
         // 初回はアクティブ (紫枠) のセッションを選んでおく
         if self.selected.is_none() {
             self.selected = live
                 .iter()
                 .find(|l| l.active)
-                .map(|l| RowKey::Live(l.id))
-                .or_else(|| rows.first().map(|r| r.key.clone()));
+                .map(|l| l.id)
+                .or_else(|| rows.first().map(|r| r.id));
         }
-        match resolve_selection(self.selected.as_ref(), self.sel_pos, rows) {
-            Some((k, pos)) => {
-                self.selected = Some(k.clone());
+        match resolve_selection(self.selected, self.sel_pos, rows) {
+            Some((id, pos)) => {
+                self.selected = Some(id);
                 self.sel_pos = pos;
-                Some(k)
+                Some(id)
             }
             None => {
                 self.selected = None;
@@ -1044,22 +814,17 @@ impl DeckState {
         self.dirty = true;
     }
 
-    /// 追跡状態の参照 (描画・テスト用)。
-    pub fn track(&self, id: u64) -> Option<&Track> {
-        self.tracks.get(&id)
+    /// レールの取り分 (窓幅に対する割合)。
+    pub fn rail_frac(&self) -> f32 {
+        self.rail.unwrap_or(RAIL_FRAC_DEFAULT)
     }
 
-    /// 停止の確認が出ているセッション。
-    pub fn stop_armed(&self) -> Option<u64> {
-        self.stop_armed
-    }
-
-    /// 内部の意図を 1 件処理する (キーボードもボタンも同じ口を通す)。
+    /// 内部の意図を 1 件処理する (キーボードもクリックも同じ口を通す)。
     fn apply_intent(&mut self, it: Intent, rows: &[Row], out: &mut Vec<DeckAction>) {
         match it {
             Intent::Move(d) => {
-                if let Some(k) = move_selection(rows, self.selected.as_ref(), d) {
-                    self.selected = Some(k);
+                if let Some(id) = move_selection(rows, self.selected, d) {
+                    self.selected = Some(id);
                     self.dirty = true;
                 }
             }
@@ -1089,20 +854,20 @@ fn mem_id(name: &str) -> egui::Id {
     egui::Id::new(("zv-deck", name))
 }
 
-/// レールを出せる最小幅。これより細い窓ではレールを上、端末を下に積む。
-const RAIL_MIN_WIDTH: f32 = 720.0;
+/// 相対輝度 (sRGB の近似)。選択行の文字色を選ぶためだけに使う。
+fn luma(c: Color32) -> f32 {
+    (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0
+}
 
-/// アクティビティの色 (すべて theme.rs 由来 — リテラルを書かない)。
-fn activity_color(th: &Theme, a: Activity) -> Color32 {
-    match a {
-        Activity::Starting | Activity::Idle => th.text_dim,
-        Activity::Thinking => th.ansi[13],
-        Activity::Editing => th.accent,
-        Activity::Running => th.ok,
-        Activity::Verifying => th.ansi[14],
-        Activity::Approval => th.warn,
-        Activity::RateLimited | Activity::Stalled => th.err,
-        Activity::Exited => th.text_dim,
+/// accent のべた塗りの上に置く文字色 **純関数**。
+/// テーマの 2 色 (本文色 / 背景色) のうち、accent との明度差が大きい方を選ぶ。
+/// リテラルの色を書かずに、どのテーマでも読める前景を得るための唯一の判断。
+pub fn on_accent(theme: &Theme) -> Color32 {
+    let a = luma(theme.accent);
+    if (luma(theme.text) - a).abs() >= (luma(theme.bg) - a).abs() {
+        theme.text
+    } else {
+        theme.bg
     }
 }
 
@@ -1125,32 +890,58 @@ pub fn short_path(p: &Path, home: Option<&Path>) -> String {
     format!("…/{}/{}", segs[segs.len() - 2], segs[segs.len() - 1])
 }
 
+/// 1 行に収めた galley (溢れたら `…`)。行の高さを固定するために使う。
+fn line_galley(
+    ui: &egui::Ui,
+    text: &str,
+    style: egui::TextStyle,
+    color: Color32,
+    max_w: f32,
+) -> Arc<egui::Galley> {
+    let font = style.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_string(),
+        egui::TextFormat {
+            font_id: font,
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_w.max(1.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.fonts(|f| f.layout_job(job))
+}
+
 /// デッキ画面を描き、押された操作を返す。
 ///
 /// `now_ms` は supervisor の経過時計 (アプリ起動からの ms)。
 /// `fresh_tail` は「このフレームの `live[..].tail_lines` が新しいか」。
-/// `scanning` は過去セッションの走査が飛んでいるか (再描画のリズムに効く)。
+/// `scanning` は裏の問い合わせ (ブランチ解決) が飛んでいるか
+/// (再描画のリズムに効く。終わったら止まる)。
 #[allow(clippy::too_many_arguments)]
 pub fn ui(
     st: &mut DeckState,
     ui: &mut egui::Ui,
     theme: &Theme,
     live: &[LiveRow],
-    past: &[PastRow],
     launchers: &[LauncherRow],
-    quota: Option<(String, u8)>,
     now_ms: u64,
     fresh_tail: bool,
     scanning: bool,
-    composer: &mut crate::agent_input::AgentInputBuffer,
     draw: LiveDraw<'_>,
 ) -> Vec<DeckAction> {
     let mut acts: Vec<DeckAction> = Vec::new();
     let ctx = ui.ctx().clone();
 
-    // ── 永続状態の読み書き ─────────────────────────────────
+    // ── 永続状態の読み込み ─────────────────────────────────
     if st.layout.is_none() {
-        let v = ctx.data_mut(|d| *d.get_persisted_mut_or(mem_id("layout"), 0_u8));
+        let v = ctx.data_mut(|d| {
+            *d.get_persisted_mut_or(mem_id("layout"), DeckLayout::default().to_u8())
+        });
         st.layout = Some(DeckLayout::from_u8(v));
     }
     if st.stack.is_none() {
@@ -1158,122 +949,96 @@ pub fn ui(
         st.stack = Some(clamp_stack(v));
     }
     if st.rail.is_none() {
-        let v = ctx.data_mut(|d| *d.get_persisted_mut_or(mem_id("rail"), 0.28_f32));
-        st.rail = Some(v.clamp(0.18, 0.5));
+        let v = ctx.data_mut(|d| *d.get_persisted_mut_or(mem_id("rail"), RAIL_FRAC_DEFAULT));
+        st.rail = Some(v.clamp(0.0, RAIL_FRAC_MAX));
     }
     if st.selected.is_none() {
-        let s = ctx.data_mut(|d| d.get_persisted_mut_or(mem_id("sel"), String::new()).clone());
-        st.selected = RowKey::from_persist(&s);
-    }
-    {
-        let mask = ctx.data_mut(|d| *d.get_persisted_mut_or(mem_id("collapse"), 0_u8));
-        if !st.dirty {
-            for s in SECTIONS {
-                st.filter.collapsed[s.ix()] = mask & (1 << s.ix()) != 0;
-            }
-        }
+        let v = ctx.data_mut(|d| *d.get_persisted_mut_or(mem_id("sel-id"), 0_u64));
+        st.selected = (v != 0).then_some(v);
     }
 
     // ── 判定 (PTY は sample_due のフレームだけ読まれている) ──
-    let activities = st.update_tracks(live, now_ms, fresh_tail);
+    // 返ってくるアクティビティは**描かない**。サンプリング周期の材料。
+    st.update_tracks(live, now_ms, fresh_tail);
     // 無条件の再描画はしない。動きがあるときだけ回す (完全に静かなら 1 枚も出さない)。
     if let Some(ms) = deck_repaint_ms(st.busy, st.any_running, scanning) {
         ctx.request_repaint_after(std::time::Duration::from_millis(ms));
     }
 
-    let rows = build_rows(live, &activities, past, launchers, &st.filter);
-    let counts = section_counts(live, &activities, past, launchers, &st.filter);
+    let rows = build_rows(live, &st.query);
     let selected = st.sync_selection(&rows, live);
+    let views = row_views(&rows, live, home_dir().as_deref());
 
-    egui::Frame::none()
-        .inner_margin(egui::Margin::same(10.0))
-        .show(ui, |ui| {
-            // ボトムパネルと同じ理由で、先に割り当てられた全高を消費しておく。
-            ui.set_min_height(ui.available_height());
-            let wide = ui.available_width();
+    let unit = ui.text_style_height(&egui::TextStyle::Body);
+    let full_w = ui.available_width();
+    let full_h = ui.available_height().max(unit * 4.0);
+    ui.set_min_height(full_h);
 
-            header_ui(st, ui, theme, live, &activities, quota, &mut acts);
-            ui.add_space(6.0);
-            chips_ui(st, ui, theme);
-            ui.add_space(6.0);
+    keyboard_ui(st, ui, &rows, live, launchers, &mut acts);
 
-            keyboard_ui(st, ui, &rows, live, past, launchers, &mut acts);
+    let show_rail = st.layout().shows_rail(true);
+    let beside = rail_fits_beside(full_w, unit);
 
-            let horizontal = wide >= RAIL_MIN_WIDTH;
-            // 「1画面 (選択のみ)」は一覧を畳んで端末に全部渡す — cmux で
-            // 1 セッションに没入するときの見え方。移動は ↑↓/jk がそのまま効く。
-            let show_rail = st.layout().shows_rail(true);
-            let rail_frac = st.rail.unwrap_or(0.28);
-            let main_h = (ui.available_height()).max(160.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), main_h),
-                if horizontal {
-                    egui::Layout::left_to_right(egui::Align::Min)
-                } else {
-                    egui::Layout::top_down(egui::Align::Min)
-                },
-                |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    if !show_rail {
-                        pane_ui(
-                            st, ui, theme, &rows, live, &activities, selected.as_ref(), main_h,
-                            now_ms, composer, draw, &mut acts,
-                        );
-                    } else if horizontal {
-                        let rail_w = (wide * rail_frac).clamp(210.0, wide * 0.5);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(rail_w, main_h),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                rail_ui(
-                                    st, ui, theme, &rows, &counts, live, &activities, past,
-                                    launchers, now_ms, &mut acts,
-                                );
-                            },
-                        );
-                        splitter_ui(st, ui, theme, true, wide);
-                        pane_ui(
-                            st, ui, theme, &rows, live, &activities, selected.as_ref(), main_h,
-                            now_ms, composer, draw, &mut acts,
-                        );
-                    } else {
-                        // 細い窓: 一覧を上、端末を下に積む
-                        let rail_h = (main_h * 0.42).clamp(120.0, main_h - 140.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), rail_h),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                rail_ui(
-                                    st, ui, theme, &rows, &counts, live, &activities, past,
-                                    launchers, now_ms, &mut acts,
-                                );
-                            },
-                        );
-                        let rest = (main_h - rail_h - 8.0).max(120.0);
-                        pane_ui(
-                            st, ui, theme, &rows, live, &activities, selected.as_ref(), rest,
-                            now_ms, composer, draw, &mut acts,
-                        );
-                    }
-                },
-            );
-        });
+    ui.allocate_ui_with_layout(
+        egui::vec2(full_w, full_h),
+        if beside {
+            egui::Layout::left_to_right(egui::Align::Min)
+        } else {
+            egui::Layout::top_down(egui::Align::Min)
+        },
+        |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            if !show_rail {
+                pane_ui(
+                    st, ui, theme, &rows, live, selected, &views, full_w, full_h, launchers, draw,
+                    &mut acts,
+                );
+            } else if beside {
+                let rail_w = rail_width(full_w, st.rail_frac(), unit);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(rail_w, full_h),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        rail_ui(st, ui, theme, &rows, live, &views, launchers, unit, &mut acts);
+                    },
+                );
+                let thin = splitter_ui(st, ui, theme, true, full_w, unit);
+                let rest = (full_w - rail_w - thin).max(unit * 6.0);
+                pane_ui(
+                    st, ui, theme, &rows, live, selected, &views, rest, full_h, launchers, draw,
+                    &mut acts,
+                );
+            } else {
+                // 細い窓: 一覧を上、端末を下に積む
+                let rail_h =
+                    (full_h * 0.35).clamp(unit * 4.0, (full_h - unit * 8.0).max(unit * 4.0));
+                ui.allocate_ui_with_layout(
+                    egui::vec2(full_w, rail_h),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        rail_ui(st, ui, theme, &rows, live, &views, launchers, unit, &mut acts);
+                    },
+                );
+                let rest = (full_h - rail_h).max(unit * 6.0);
+                pane_ui(
+                    st, ui, theme, &rows, live, selected, &views, full_w, rest, launchers, draw,
+                    &mut acts,
+                );
+            }
+        },
+    );
 
     // ── 永続状態の書き戻し ─────────────────────────────────
     if st.dirty {
-        let mask: u8 = SECTIONS.iter().fold(0, |m, s| {
-            m | (u8::from(st.filter.collapsed[s.ix()]) << s.ix())
-        });
         let layout = st.layout.unwrap_or_default().to_u8();
         let stack = st.stack();
-        let rail = st.rail.unwrap_or(0.28);
-        let sel = st.selected.as_ref().map(RowKey::to_persist).unwrap_or_default();
+        let rail = st.rail_frac();
+        let sel = st.selected.unwrap_or(0);
         ctx.data_mut(|d| {
             d.insert_persisted(mem_id("layout"), layout);
             d.insert_persisted(mem_id("stack"), stack);
             d.insert_persisted(mem_id("rail"), rail);
-            d.insert_persisted(mem_id("collapse"), mask);
-            d.insert_persisted(mem_id("sel"), sel);
+            d.insert_persisted(mem_id("sel-id"), sel);
         });
         st.dirty = false;
     }
@@ -1281,150 +1046,259 @@ pub fn ui(
     acts
 }
 
-/// ヘッダー (件数・上限の助言・レイアウト切替・閉じる)。
+/// 小さなアイコンボタン (枠なし)。ヘッダー / レール上端で共通に使う。
+fn icon_button(ui: &mut egui::Ui, theme: &Theme, glyph: &str, on: bool, hint: &str) -> bool {
+    let color = if on { theme.accent } else { theme.text_dim };
+    ui.add(
+        egui::Button::new(RichText::new(glyph).small().color(color))
+            .frame(false)
+            .small(),
+    )
+    .on_hover_text(hint.to_string())
+    .clicked()
+}
+
+/// ＋ メニュー (新しいエージェント)。押されたプリセットを返す。
+/// **プリセットを行として並べないための唯一の入口**。
+fn new_agent_menu(ui: &mut egui::Ui, theme: &Theme, launchers: &[LauncherRow]) -> Option<usize> {
+    let mut picked = None;
+    ui.menu_button(RichText::new("＋").small().color(theme.text_dim), |ui| {
+        if launchers.is_empty() {
+            ui.label(RichText::new(tr("起動プリセットがありません")).small());
+        }
+        for l in launchers {
+            if ui.button(format!("{} {}", l.icon, l.name)).clicked() {
+                picked = Some(l.idx);
+                ui.close_menu();
+            }
+        }
+    })
+    .response
+    .on_hover_text(tr("新しいエージェントを起こす (⌥N)"));
+    picked
+}
+
+/// 左レール: ＋ とレール畳みだけの上端 + 稼働中エージェントの縦 1 本。
 #[allow(clippy::too_many_arguments)]
-fn header_ui(
+fn rail_ui(
     st: &mut DeckState,
     ui: &mut egui::Ui,
     theme: &Theme,
+    rows: &[Row],
     live: &[LiveRow],
-    acts_of: &[Activity],
-    quota: Option<(String, u8)>,
+    views: &[RowView],
+    launchers: &[LauncherRow],
+    unit: f32,
     acts: &mut Vec<DeckAction>,
 ) {
-    let running = live.iter().filter(|l| l.running).count();
-    let pending: usize = live.iter().map(|l| l.approvals).sum();
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("{DECK_ICON} {}", tr("エージェントデッキ")))
-                .size(14.0)
-                .strong()
-                .color(theme.text),
-        );
-        chip(
-            ui,
-            theme.ok,
-            &trf("稼働中 {n}", &[("n", running.to_string())]),
-        );
-        chip(
-            ui,
-            if pending > 0 { theme.warn } else { theme.text_dim },
-            &trf("承認待ち {n}", &[("n", pending.to_string())]),
-        );
-        let working = acts_of.iter().filter(|a| a.is_busy()).count();
-        chip(
-            ui,
-            theme.accent,
-            &trf("作業中 {n}", &[("n", working.to_string())]),
-        );
-        if let Some((msg, sev)) = quota {
-            if !msg.is_empty() {
-                ui.label(
-                    RichText::new(format!("⚠ {msg}"))
-                        .size(11.0)
-                        .color(if sev >= 2 { theme.err } else { theme.warn }),
-                )
-                .on_hover_text(tr("使用量の見立て (coordinator::QuotaWatch)"));
-            }
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button("✕")
-                .on_hover_text(tr("デッキを閉じる (Esc)"))
-                .clicked()
-            {
-                acts.push(DeckAction::Close);
-            }
-            // 積み上げ数 (積み上げモードのときだけ)
-            if st.layout() == DeckLayout::Stacked {
-                if ui
-                    .small_button("＋")
-                    .on_hover_text(tr("同時に映すセッションを増やす"))
-                    .clicked()
-                {
-                    st.set_stack(st.stack() + 1);
+    let pad = unit * 0.35;
+    egui::Frame::none()
+        .fill(theme.panel)
+        .inner_margin(egui::Margin::symmetric(pad, pad * 0.6))
+        .show(ui, |ui| {
+            ui.set_min_height(ui.available_height());
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = egui::vec2(pad * 0.5, pad * 0.4);
+
+            // ── 上端: ＋ と レール畳み だけ ──
+            ui.horizontal(|ui| {
+                if let Some(i) = new_agent_menu(ui, theme, launchers) {
+                    acts.push(DeckAction::Launch(i));
                 }
-                ui.label(
-                    RichText::new(st.stack().to_string())
-                        .size(11.5)
-                        .color(theme.text),
-                );
-                if ui
-                    .small_button("–")
-                    .on_hover_text(tr("同時に映すセッションを減らす"))
-                    .clicked()
-                {
-                    st.set_stack(st.stack().saturating_sub(1));
-                }
-            }
-            for l in [DeckLayout::Stacked, DeckLayout::Split, DeckLayout::Single] {
-                let on = st.layout() == l;
-                if ui
-                    .selectable_label(on, RichText::new(tr(l.label())).size(11.0))
-                    .clicked()
-                {
-                    st.set_layout(l);
-                }
-            }
-            if ui
-                .small_button("⇄")
-                .on_hover_text(tr("表示を切り替える (1画面 → 2分割 → 積み上げ)"))
-                .clicked()
-            {
-                st.set_layout(st.layout().next());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, theme, "▤", true, &tr("一覧を畳む (端末だけにする)")) {
+                        st.set_layout(st.layout().with_rail(false));
+                    }
+                });
+            });
+
+            // ── 一覧 (絞り込みピルを出すときだけ、その 1 行ぶんを残す) ──
+            let pill_h = if st.query.is_empty() { 0.0 } else { unit * 1.4 };
+            let list_h = (ui.available_height() - pill_h).max(unit * 2.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), list_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    let w = ui.available_width();
+                    egui::ScrollArea::vertical()
+                        .id_salt("zv-deck-rail")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(w);
+                            if views.is_empty() {
+                                empty_rail_ui(ui, theme, launchers, live.is_empty(), unit, acts);
+                                return;
+                            }
+                            for (v, r) in views.iter().zip(rows.iter()) {
+                                row_ui(st, ui, theme, v, *r, live, unit, acts);
+                            }
+                        });
+                },
+            );
+
+            // ── 下端: 絞り込みが効いているときだけ、細いピル ──
+            if !st.query.is_empty() {
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    egui::Frame::none()
+                        .fill(theme.panel_alt)
+                        .rounding(egui::Rounding::same(unit * 0.5))
+                        .inner_margin(egui::Margin::symmetric(pad, pad * 0.2))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!("🔎 {}", st.query))
+                                    .small()
+                                    .color(theme.text_dim),
+                            )
+                            .on_hover_text(tr("打った文字で絞り込み中 — Esc で消えます"));
+                        });
+                });
             }
         });
-    });
 }
 
-/// フィルタチップの行 + 打ち込み絞り込み欄。
-fn chips_ui(st: &mut DeckState, ui: &mut egui::Ui, theme: &Theme) {
-    ui.horizontal(|ui| {
-        for c in CHIPS {
-            let on = st.filter.chip == c;
-            if ui
-                .selectable_label(on, RichText::new(tr(c.label())).size(11.0))
-                .clicked()
-            {
-                st.filter.chip = c;
-                st.dirty = true;
+/// エージェントが 1 体も居ないときのレール (1 行 + ＋ だけ)。
+fn empty_rail_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    launchers: &[LauncherRow],
+    no_sessions: bool,
+    unit: f32,
+    acts: &mut Vec<DeckAction>,
+) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(unit);
+        ui.label(
+            RichText::new(if no_sessions {
+                tr("まだエージェントがいません")
+            } else {
+                tr("該当なし")
+            })
+            .small()
+            .color(theme.text_dim),
+        );
+        ui.add_space(unit * 0.4);
+        if no_sessions {
+            if let Some(i) = new_agent_menu(ui, theme, launchers) {
+                acts.push(DeckAction::Launch(i));
             }
         }
-        ui.add_space(8.0);
-        ui.label(RichText::new("🔎").size(11.0).color(theme.text_dim));
-        let id = mem_id("filter-text");
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut st.filter.query)
-                .id(id)
-                .desired_width(180.0)
-                .hint_text(tr("絞り込み (/ でここへ)")),
-        );
-        if st.filter_focus {
-            resp.request_focus();
-            st.filter_focus = false;
-        }
-        if !st.filter.query.is_empty()
-            && ui
-                .small_button("✕")
-                .on_hover_text(tr("絞り込みを消す"))
-                .clicked()
-        {
-            st.filter.query.clear();
-        }
     });
 }
 
-/// 一覧と端末の間のドラッグバー。
-fn splitter_ui(st: &mut DeckState, ui: &mut egui::Ui, theme: &Theme, horizontal: bool, span: f32) {
-    let size = if horizontal {
-        egui::vec2(4.0, ui.available_height())
+/// 一覧の 1 行 — **2 行の文字だけ**。選択行は accent のべた塗り。
+#[allow(clippy::too_many_arguments)]
+fn row_ui(
+    st: &mut DeckState,
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    v: &RowView,
+    r: Row,
+    live: &[LiveRow],
+    unit: f32,
+    acts: &mut Vec<DeckAction>,
+) {
+    let on = st.selected == Some(v.id);
+    let pad = unit * 0.3;
+    let title_h = ui.text_style_height(&egui::TextStyle::Body);
+    let sub_h = ui.text_style_height(&egui::TextStyle::Small);
+    let h = title_h + sub_h + pad * 2.0;
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+
+    let fill = if on {
+        theme.accent
+    } else if resp.hovered() {
+        theme.panel_alt
     } else {
-        egui::vec2(ui.available_width(), 4.0)
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(rect, egui::Rounding::same(pad), fill);
+    }
+
+    let fg = if on { on_accent(theme) } else { theme.text };
+    let dim = if on {
+        on_accent(theme).gamma_multiply(0.72)
+    } else {
+        theme.text_dim
+    };
+    let inner_w = (w - pad * 2.0).max(unit);
+
+    // 名前変更中はタイトル行が入力欄に化ける (状態表示ではなく一時的な編集)
+    if st.rename_for == Some(v.id) {
+        let id = mem_id("rename");
+        let edit = ui.put(
+            egui::Rect::from_min_size(
+                rect.min + egui::vec2(pad, pad * 0.5),
+                egui::vec2(inner_w, title_h + pad),
+            ),
+            egui::TextEdit::singleline(&mut st.rename_buf).id(id),
+        );
+        if st.rename_focus {
+            edit.request_focus();
+            st.rename_focus = false;
+        }
+        let commit = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if commit {
+            let t = st.rename_buf.trim().to_string();
+            if !t.is_empty() {
+                acts.push(DeckAction::Rename { id: v.id, title: t });
+            }
+            st.rename_for = None;
+        } else if edit.lost_focus() {
+            st.rename_for = None;
+        }
+    } else {
+        let t = line_galley(ui, &v.title, egui::TextStyle::Body, fg, inner_w);
+        ui.painter().galley(rect.min + egui::vec2(pad, pad), t, fg);
+    }
+
+    let s = line_galley(ui, &v.subtitle, egui::TextStyle::Small, dim, inner_w);
+    ui.painter()
+        .galley(rect.min + egui::vec2(pad, pad + title_h), s, dim);
+
+    // 停止の 1 打目が入っている行は、枠だけで知らせる (文字は増やさない)
+    if st.stop_armed == Some(v.id) {
+        ui.painter().rect_stroke(
+            rect,
+            egui::Rounding::same(pad),
+            egui::Stroke::new(1.0_f32, theme.err),
+        );
+    }
+
+    let resp = resp.on_hover_text(format!("{}\n{}", v.title, v.subtitle));
+    if resp.clicked() || resp.double_clicked() {
+        st.select(v.id);
+        st.stop_armed = None;
+        if let Some(l) = live.get(r.idx) {
+            acts.push(DeckAction::Select(l.idx));
+        }
+    }
+}
+
+/// レールと端末の間のドラッグバー。実際に使った太さを返す。
+fn splitter_ui(
+    st: &mut DeckState,
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    horizontal: bool,
+    span: f32,
+    unit: f32,
+) -> f32 {
+    let thin = (unit * 0.16).max(1.0);
+    let size = if horizontal {
+        egui::vec2(thin, ui.available_height())
+    } else {
+        egui::vec2(ui.available_width(), thin)
     };
     let resp = ui.allocate_response(size, egui::Sense::drag());
     let hot = resp.hovered() || resp.dragged();
-    ui.painter()
-        .rect_filled(resp.rect, 2.0, if hot { theme.accent } else { theme.border });
+    ui.painter().rect_filled(
+        resp.rect,
+        egui::Rounding::ZERO,
+        if hot { theme.accent } else { theme.border },
+    );
     resp.clone().on_hover_cursor(if horizontal {
         egui::CursorIcon::ResizeHorizontal
     } else {
@@ -1433,361 +1307,13 @@ fn splitter_ui(st: &mut DeckState, ui: &mut egui::Ui, theme: &Theme, horizontal:
     if resp.dragged() && span > 1.0 {
         let d = resp.drag_delta();
         let delta = if horizontal { d.x } else { d.y } / span;
-        st.rail = Some((st.rail.unwrap_or(0.28) + delta).clamp(0.18, 0.5));
+        st.rail = Some((st.rail_frac() + delta).clamp(0.0, RAIL_FRAC_MAX));
         st.dirty = true;
     }
+    thin
 }
 
-/// 左レール: 3 セクションの縦 1 本リスト。
-#[allow(clippy::too_many_arguments)]
-fn rail_ui(
-    st: &mut DeckState,
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    rows: &[Row],
-    counts: &[usize; 3],
-    live: &[LiveRow],
-    activities: &[Activity],
-    past: &[PastRow],
-    launchers: &[LauncherRow],
-    now_ms: u64,
-    acts: &mut Vec<DeckAction>,
-) {
-    let home = home_dir();
-    egui::Frame::none()
-        .fill(theme.panel)
-        .stroke(Stroke::new(1.0_f32, theme.border))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(6.0))
-        .show(ui, |ui| {
-            ui.set_min_height(ui.available_height());
-            let w = ui.available_width();
-            egui::ScrollArea::vertical()
-                .id_salt("zv-deck-rail")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_width(w);
-                    for sec in SECTIONS {
-                        section_header_ui(st, ui, theme, sec, counts[sec.ix()]);
-                        if st.filter.collapsed[sec.ix()] {
-                            continue;
-                        }
-                        let mut any = false;
-                        for r in rows.iter().filter(|r| r.section == sec) {
-                            any = true;
-                            row_ui(
-                                st, ui, theme, r, live, activities, past, launchers, now_ms,
-                                home.as_deref(), acts,
-                            );
-                        }
-                        if !any {
-                            ui.label(
-                                RichText::new(tr("該当なし"))
-                                    .size(10.5)
-                                    .color(theme.text_dim),
-                            );
-                        }
-                        ui.add_space(4.0);
-                    }
-                });
-        });
-}
-
-/// セクション見出し (折りたたみ)。
-fn section_header_ui(
-    st: &mut DeckState,
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    sec: Section,
-    count: usize,
-) {
-    let open = !st.filter.collapsed[sec.ix()];
-    let arrow = if open { "▾" } else { "▸" };
-    let label = format!("{arrow} {} {} ({count})", sec.icon(), tr(sec.title()));
-    let resp = ui.add(
-        egui::Label::new(
-            RichText::new(label)
-                .size(11.5)
-                .strong()
-                .color(theme.text_dim),
-        )
-        .sense(egui::Sense::click()),
-    );
-    if resp.on_hover_text(tr(sec.hint())).clicked() {
-        st.filter.collapsed[sec.ix()] = open;
-        st.dirty = true;
-    }
-}
-
-/// 一覧の 1 行。
-#[allow(clippy::too_many_arguments)]
-fn row_ui(
-    st: &mut DeckState,
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    r: &Row,
-    live: &[LiveRow],
-    activities: &[Activity],
-    past: &[PastRow],
-    launchers: &[LauncherRow],
-    now_ms: u64,
-    home: Option<&Path>,
-    acts: &mut Vec<DeckAction>,
-) {
-    let on = st.selected() == Some(&r.key);
-    let bg = if on { theme.accent_soft } else { theme.panel_alt };
-    let stroke = if on { theme.accent } else { theme.border };
-    let mut clicked = false;
-    let mut activated = false;
-    egui::Frame::none()
-        .fill(bg)
-        .stroke(Stroke::new(1.0_f32, stroke))
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(6.0, 4.0))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            match r.section {
-                Section::Live => {
-                    let Some(l) = live.get(r.idx) else { return };
-                    let a = activities.get(r.idx).copied().unwrap_or(Activity::Starting);
-                    let col = activity_color(theme, a);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("●").size(9.0).color(col));
-                        // 名前変更中はその場で入力欄に化ける
-                        if st.rename_for == Some(l.id) {
-                            let id = mem_id("rename");
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut st.rename_buf)
-                                    .id(id)
-                                    .desired_width(ui.available_width() - 8.0),
-                            );
-                            if st.rename_focus {
-                                resp.request_focus();
-                                st.rename_focus = false;
-                            }
-                            let done = resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            if done {
-                                let t = st.rename_buf.trim().to_string();
-                                if !t.is_empty() {
-                                    acts.push(DeckAction::Rename { id: l.id, title: t });
-                                }
-                                st.rename_for = None;
-                            } else if resp.lost_focus() {
-                                st.rename_for = None;
-                            }
-                            return;
-                        }
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("{} {}", l.icon, l.title))
-                                    .size(12.0)
-                                    .strong()
-                                    .color(theme.text),
-                            )
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                        )
-                        .clicked()
-                        .then(|| clicked = true);
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if l.approvals > 0 {
-                                    ui.label(
-                                        RichText::new(format!("🛡{}", l.approvals))
-                                            .size(10.0)
-                                            .color(theme.warn),
-                                    )
-                                    .on_hover_text(tr("承認待ちがあります"));
-                                }
-                                if l.attention {
-                                    ui.label(RichText::new("⏳").size(10.0).color(theme.warn))
-                                        .on_hover_text(tr("入力・承認を待っています"));
-                                }
-                                if l.unread {
-                                    ui.label(RichText::new("◆").size(9.0).color(theme.accent))
-                                        .on_hover_text(tr(
-                                            "最後に見てから新しい出力があります",
-                                        ));
-                                }
-                            },
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(short_path(&l.cwd, home))
-                                .size(10.0)
-                                .color(theme.text_dim),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        let (label, elapsed) = match st.track(l.id) {
-                            Some(t) => (
-                                tr(t.activity().label()),
-                                kanban::fmt_elapsed(t.elapsed_ms(now_ms)),
-                            ),
-                            None => (tr(a.label()), String::new()),
-                        };
-                        ui.label(RichText::new(label).size(10.0).color(col));
-                        if !elapsed.is_empty() {
-                            ui.label(
-                                RichText::new(elapsed).size(9.5).color(theme.text_dim),
-                            );
-                        }
-                        if let Some(t) = st.track(l.id) {
-                            if !t.detail().is_empty() {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(t.detail())
-                                            .size(9.5)
-                                            .color(theme.text_dim),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(trf(
-                                    "{src}: {detail}",
-                                    &[
-                                        ("src", tr(t.source().label())),
-                                        ("detail", t.detail().to_string()),
-                                    ],
-                                ));
-                            }
-                            if t.source().is_guess() {
-                                ui.label(
-                                    RichText::new(tr("推定")).size(9.0).color(theme.text_dim),
-                                );
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    pulse_ui(ui, col, &t.pulse_series(now_ms));
-                                },
-                            );
-                        }
-                    });
-                    if st.stop_armed() == Some(l.id) {
-                        ui.label(
-                            RichText::new(tr("もう一度 x で停止します"))
-                                .size(10.0)
-                                .color(theme.err),
-                        );
-                    }
-                }
-                Section::Past => {
-                    let Some(p) = past.get(r.idx) else { return };
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&p.mark).size(11.0).color(theme.text_dim));
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(if p.session.summary.is_empty() {
-                                    tr("（要約なし）")
-                                } else {
-                                    p.session.summary.clone()
-                                })
-                                .size(11.5)
-                                .color(theme.text),
-                            )
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                        )
-                        .clicked()
-                        .then(|| clicked = true);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&p.age).size(10.0).color(theme.text_dim));
-                        ui.label(
-                            RichText::new(short_path(&p.session.cwd, home))
-                                .size(10.0)
-                                .color(theme.text_dim),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .small_button(tr("再開"))
-                                    .on_hover_text(tr("この会話を続きから開きます"))
-                                    .clicked()
-                                {
-                                    acts.push(DeckAction::Resume(Box::new(p.session.clone())));
-                                }
-                            },
-                        );
-                    });
-                }
-                Section::New => {
-                    let Some(n) = launchers.get(r.idx) else { return };
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&n.icon).size(12.0));
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&n.name).size(11.5).color(theme.text),
-                            )
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                        )
-                        .clicked()
-                        .then(|| clicked = true);
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .small_button(tr("起動"))
-                                    .on_hover_text(tr("このプリセットで新しく起こします"))
-                                    .clicked()
-                                {
-                                    activated = true;
-                                }
-                            },
-                        );
-                    });
-                }
-            }
-        });
-    ui.add_space(3.0);
-
-    if clicked {
-        st.select(r.key.clone());
-        st.stop_armed = None;
-        if let Some(l) = (r.section == Section::Live)
-            .then(|| live.get(r.idx))
-            .flatten()
-        {
-            acts.push(DeckAction::Select(l.idx));
-        }
-    }
-    if activated {
-        if let Some(n) = launchers.get(r.idx) {
-            acts.push(DeckAction::Launch(n.idx));
-        }
-    }
-}
-
-/// 出力の勢い (小さなバー)。
-fn pulse_ui(ui: &mut egui::Ui, color: Color32, values: &[f32]) {
-    let h = 10.0;
-    let w = 44.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
-    if values.is_empty() {
-        return;
-    }
-    let n = values.len() as f32;
-    let bw = (rect.width() / n).max(1.0);
-    for (i, v) in values.iter().enumerate() {
-        let vh = (v * h).clamp(0.0, h);
-        if vh <= 0.5 {
-            continue;
-        }
-        let x = rect.left() + i as f32 * bw;
-        let r = egui::Rect::from_min_size(
-            egui::pos2(x, rect.bottom() - vh),
-            egui::vec2((bw - 1.0).max(1.0), vh),
-        );
-        ui.painter().rect_filled(r, 0.0, color.gamma_multiply(0.85));
-    }
-}
-
-/// 右 (または下) の端末ペイン。レイアウトに応じて 1 本 / 積み上げを描く。
+/// 右 (または下) 側 — 細いヘッダー 1 本 + 端末が残り全部。
 #[allow(clippy::too_many_arguments)]
 fn pane_ui(
     st: &mut DeckState,
@@ -1795,221 +1321,241 @@ fn pane_ui(
     theme: &Theme,
     rows: &[Row],
     live: &[LiveRow],
-    activities: &[Activity],
-    selected: Option<&RowKey>,
+    selected: Option<u64>,
+    views: &[RowView],
+    width: f32,
     height: f32,
-    now_ms: u64,
-    composer: &mut crate::agent_input::AgentInputBuffer,
+    launchers: &[LauncherRow],
     draw: LiveDraw<'_>,
     acts: &mut Vec<DeckAction>,
 ) {
-    let w = ui.available_width();
+    let unit = ui.text_style_height(&egui::TextStyle::Body);
     ui.allocate_ui_with_layout(
-        egui::vec2(w, height),
+        egui::vec2(width, height),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
-            // 下端のコンポーザぶんを先に確保する (端末は残りを全部使う)
-            let composer_h = 96.0_f32.min(height * 0.4);
-            let term_h = (height - composer_h - 8.0).max(80.0);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            let head_h = unit * 1.7;
+            header_strip_ui(
+                st, ui, theme, selected, views, launchers, width, head_h, unit, acts,
+            );
 
+            let body_h = (height - head_h).max(unit * 3.0);
             let ids: Vec<u64> = match st.layout() {
-                DeckLayout::Stacked => stacked_ids(rows, live, selected, st.stack()),
-                _ => selected.and_then(RowKey::live_id).into_iter().collect(),
+                DeckLayout::Stacked => stacked_ids(rows, selected, st.stack()),
+                _ => selected.into_iter().collect(),
             };
 
             st.term_ids.clear();
             if ids.is_empty() {
-                empty_pane_ui(ui, theme, term_h, live.is_empty());
+                empty_pane_ui(ui, theme, width, body_h);
+                return;
+            }
+            fit_weights(&mut st.stack_weights, ids.len());
+            let total: f32 = st.stack_weights.iter().sum();
+            let bar = if ids.len() > 1 {
+                (unit * 0.16).max(1.0)
             } else {
-                fit_weights(&mut st.stack_weights, ids.len());
-                let total: f32 = st.stack_weights.iter().sum();
-                let bars = (ids.len().saturating_sub(1)) as f32 * 6.0;
-                let usable = (term_h - bars).max(60.0);
-                let mut want_focus = st.focus_term_req;
-                for (i, id) in ids.iter().enumerate() {
-                    let frac = st.stack_weights.get(i).copied().unwrap_or(1.0) / total.max(0.001);
-                    let h = (usable * frac).max(60.0);
-                    let focused_pane = Some(*id) == selected.and_then(RowKey::live_id);
-                    term_pane_ui(
-                        st,
-                        ui,
-                        theme,
-                        live,
-                        activities,
-                        *id,
-                        h,
-                        now_ms,
-                        focused_pane && want_focus,
-                        draw,
-                        acts,
-                    );
-                    if focused_pane {
-                        want_focus = false;
-                    }
-                    if i + 1 < ids.len() {
-                        stack_bar_ui(st, ui, theme, i, usable);
-                    }
+                0.0
+            };
+            let usable = (body_h - bar * (ids.len() - 1) as f32).max(unit * 3.0);
+            let mut want_focus = st.focus_term_req;
+            let multi = ids.len() > 1;
+            for (i, id) in ids.iter().enumerate() {
+                let frac = st.stack_weights.get(i).copied().unwrap_or(1.0) / total.max(0.001);
+                let h = (usable * frac).max(unit * 3.0);
+                let focused = Some(*id) == selected;
+                term_pane_ui(
+                    st,
+                    ui,
+                    theme,
+                    live,
+                    *id,
+                    width,
+                    h,
+                    unit,
+                    multi,
+                    focused && want_focus,
+                    draw,
+                    acts,
+                );
+                if focused {
+                    want_focus = false;
                 }
-                st.focus_term_req = false;
+                if i + 1 < ids.len() {
+                    stack_bar_ui(st, ui, theme, i, usable, bar);
+                }
             }
-
-            ui.add_space(4.0);
-            // ── 選択中エージェント宛てのコンポーザ (ブロードキャストではない) ──
-            let target: Option<(u64, String)> = selected
-                .and_then(RowKey::live_id)
-                .and_then(|id| live.iter().find(|l| l.id == id))
-                .map(|l| (l.id, format!("{} {}", l.icon, l.title)));
-            // 宛先チップは入力欄の下に横一列で出す (全ライブセッション)。
-            let targets: Vec<(u64, String)> = live
-                .iter()
-                .map(|l| (l.id, format!("{} {}", l.icon, l.title)))
-                .collect();
-            match crate::panels::agent_composer_ui(
-                ui,
-                theme,
-                composer,
-                target.as_ref().map(|(id, t)| (*id, t.as_str())),
-                &targets,
-            ) {
-                crate::panels::ComposerAction::SendTo(id, text) => {
-                    acts.push(DeckAction::Send { id, text })
-                }
-                crate::panels::ComposerAction::Send(text) => {
-                    acts.push(DeckAction::Broadcast(text))
-                }
-                crate::panels::ComposerAction::Cancel => {
-                    ui.memory_mut(|m| m.stop_text_input());
-                }
-                crate::panels::ComposerAction::None => {}
-            }
+            st.focus_term_req = false;
         },
     );
 }
 
-/// 端末 1 枚 (ヘッダー付き)。
+/// 上端の細い帯 — 選んでいるものの名前と場所 + 小さなアイコンだけ。
+#[allow(clippy::too_many_arguments)]
+fn header_strip_ui(
+    st: &mut DeckState,
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    selected: Option<u64>,
+    views: &[RowView],
+    launchers: &[LauncherRow],
+    width: f32,
+    height: f32,
+    unit: f32,
+    acts: &mut Vec<DeckAction>,
+) {
+    let cur = selected.and_then(|id| views.iter().find(|v| v.id == id));
+    let pad = unit * 0.35;
+    egui::Frame::none()
+        .fill(theme.panel)
+        .inner_margin(egui::Margin::symmetric(pad, pad * 0.25))
+        .show(ui, |ui| {
+            ui.set_width((width - pad * 2.0).max(unit));
+            ui.set_min_height(height - pad * 0.5);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = pad * 0.6;
+                let title = cur
+                    .map(|v| v.title.clone())
+                    .unwrap_or_else(|| format!("{DECK_ICON} {}", tr("エージェントデッキ")));
+                let sub = cur.map(|v| v.subtitle.clone()).unwrap_or_default();
+                let avail = ui.available_width();
+                let t = line_galley(ui, &title, egui::TextStyle::Body, theme.text, avail * 0.45);
+                let (r1, _) = ui.allocate_exact_size(t.size(), egui::Sense::hover());
+                ui.painter().galley(r1.min, t, theme.text);
+                if !sub.is_empty() {
+                    let s = line_galley(
+                        ui,
+                        &sub,
+                        egui::TextStyle::Small,
+                        theme.text_dim,
+                        avail * 0.35,
+                    );
+                    let (r2, _) = ui.allocate_exact_size(s.size(), egui::Sense::hover());
+                    let y = r1.center().y - s.size().y * 0.5;
+                    ui.painter()
+                        .galley(egui::pos2(r2.min.x, y), s, theme.text_dim);
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, theme, "✕", false, &tr("デッキを閉じる (Esc)")) {
+                        acts.push(DeckAction::Close);
+                    }
+                    if st.layout() == DeckLayout::Stacked {
+                        if icon_button(ui, theme, "－", false, &tr("同時に映す数を減らす")) {
+                            st.set_stack(st.stack().saturating_sub(1));
+                        }
+                        if icon_button(ui, theme, "＋", false, &tr("同時に映す数を増やす")) {
+                            st.set_stack(st.stack() + 1);
+                        }
+                    }
+                    let stacked = st.layout() == DeckLayout::Stacked;
+                    if icon_button(ui, theme, "⊟", stacked, &tr("複数の端末を上下に積む")) {
+                        st.set_layout(st.layout().with_stacked(!stacked));
+                    }
+                    let rail = st.layout().shows_rail(true);
+                    if icon_button(ui, theme, "▤", rail, &tr("一覧の出し入れ")) {
+                        st.set_layout(st.layout().with_rail(!rail));
+                    }
+                    if !rail {
+                        if let Some(i) = new_agent_menu(ui, theme, launchers) {
+                            acts.push(DeckAction::Launch(i));
+                        }
+                    }
+                });
+            });
+        });
+}
+
+/// 端末 1 枚 — 枠も余白も持たず、渡された矩形いっぱいに描く。
+/// 積み上げているときだけ、上に薄い 1 行の名前を出す (どれか分からなくなるため)。
 #[allow(clippy::too_many_arguments)]
 fn term_pane_ui(
     st: &mut DeckState,
     ui: &mut egui::Ui,
     theme: &Theme,
     live: &[LiveRow],
-    activities: &[Activity],
     id: u64,
+    width: f32,
     height: f32,
-    now_ms: u64,
+    unit: f32,
+    show_name: bool,
     want_focus: bool,
     draw: LiveDraw<'_>,
     acts: &mut Vec<DeckAction>,
 ) {
-    let Some((i, l)) = live.iter().enumerate().find(|(_, l)| l.id == id) else {
+    let Some(l) = live.iter().find(|l| l.id == id) else {
         return;
     };
-    let a = activities.get(i).copied().unwrap_or(Activity::Starting);
-    let col = activity_color(theme, a);
-    let on = st.selected.as_ref() == Some(&RowKey::Live(id));
-    let w = ui.available_width();
+    let idx = l.idx;
+    let title = l.title.clone();
+    let on = st.selected == Some(id);
     ui.allocate_ui_with_layout(
-        egui::vec2(w, height),
+        egui::vec2(width, height),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
-            egui::Frame::none()
-                .fill(theme.panel)
-                .stroke(Stroke::new(1.0_f32, if on { theme.accent } else { theme.border }))
-                .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::same(6.0))
-                .show(ui, |ui| {
-                    ui.set_width(w - 12.0);
-                    ui.set_min_height(height - 12.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("●").size(9.0).color(col));
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("{} {}", l.icon, l.title))
-                                    .size(12.0)
-                                    .strong()
-                                    .color(theme.text),
-                            )
-                            .truncate(),
-                        );
-                        ui.label(RichText::new(tr(a.label())).size(10.5).color(col));
-                        if !l.uptime.is_empty() {
-                            ui.label(
-                                RichText::new(&l.uptime).size(10.0).color(theme.text_dim),
-                            );
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            let mut body = height;
+            if show_name {
+                let hh = unit * 1.2;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(width, hh), egui::Sense::hover());
+                let col = if on { theme.text } else { theme.text_dim };
+                let g = line_galley(ui, &title, egui::TextStyle::Small, col, width - unit * 0.6);
+                ui.painter().galley(
+                    egui::pos2(rect.min.x + unit * 0.3, rect.center().y - g.size().y * 0.5),
+                    g,
+                    col,
+                );
+                body -= hh;
+            }
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, body.max(unit * 2.0)),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| match draw(ui, id) {
+                    Some(r) => {
+                        st.term_ids.push(r.id);
+                        if want_focus {
+                            r.request_focus();
                         }
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .small_button("✕")
-                                    .on_hover_text(tr("このセッションを閉じる (x を 2 回)"))
-                                    .clicked()
-                                {
-                                    acts.push(DeckAction::Stop(l.idx));
-                                }
-                                if ui
-                                    .small_button("⟳")
-                                    .on_hover_text(tr("再起動 (s)"))
-                                    .clicked()
-                                {
-                                    acts.push(DeckAction::Restart(l.idx));
-                                }
-                                if ui
-                                    .small_button("⇄")
-                                    .on_hover_text(tr("複製 (d) — 同じプリセットと作業ディレクトリ"))
-                                    .clicked()
-                                {
-                                    acts.push(DeckAction::Duplicate(l.idx));
-                                }
-                                ui.label(
-                                    RichText::new(tr(
-                                        "↑↓/jk: 選択 / Enter: 端末へ / Esc: 一覧へ戻る",
-                                    ))
-                                    .size(9.0)
-                                    .color(theme.text_dim),
-                                );
-                            },
+                        // 端末を触ったらアクティブ選択も追従させる
+                        if r.clicked() || r.drag_started() || r.gained_focus() {
+                            st.selected = Some(id);
+                            st.dirty = true;
+                            acts.push(DeckAction::Select(idx));
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new(tr("この端末はいま表示できません"))
+                                .small()
+                                .color(theme.text_dim),
                         );
-                    });
-                    ui.add_space(3.0);
-                    let inner = ui.available_height().max(50.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), inner),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| match draw(ui, id) {
-                            Some(r) => {
-                                st.term_ids.push(r.id);
-                                if want_focus {
-                                    r.request_focus();
-                                }
-                                // 端末を触ったらアクティブ選択も追従させる
-                                if r.clicked() || r.drag_started() || r.gained_focus() {
-                                    st.selected = Some(RowKey::Live(id));
-                                    st.dirty = true;
-                                    acts.push(DeckAction::Select(l.idx));
-                                }
-                            }
-                            None => {
-                                ui.label(
-                                    RichText::new(tr("この端末はいま表示できません"))
-                                        .size(11.0)
-                                        .color(theme.text_dim),
-                                );
-                            }
-                        },
-                    );
-                    let _ = now_ms;
-                });
+                    }
+                },
+            );
         },
     );
 }
 
 /// 積み上げペインの間のドラッグバー。
-fn stack_bar_ui(st: &mut DeckState, ui: &mut egui::Ui, theme: &Theme, i: usize, span: f32) {
-    let resp = ui.allocate_response(egui::vec2(ui.available_width(), 4.0), egui::Sense::drag());
+fn stack_bar_ui(
+    st: &mut DeckState,
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    i: usize,
+    span: f32,
+    thin: f32,
+) {
+    let resp = ui.allocate_response(
+        egui::vec2(ui.available_width(), thin.max(1.0)),
+        egui::Sense::drag(),
+    );
     let hot = resp.hovered() || resp.dragged();
-    ui.painter()
-        .rect_filled(resp.rect, 2.0, if hot { theme.accent } else { theme.border });
+    ui.painter().rect_filled(
+        resp.rect,
+        egui::Rounding::ZERO,
+        if hot { theme.accent } else { theme.border },
+    );
     resp.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical);
     if resp.dragged() && span > 1.0 {
         adjust_weights(&mut st.stack_weights, i, resp.drag_delta().y / span);
@@ -2017,45 +1563,30 @@ fn stack_bar_ui(st: &mut DeckState, ui: &mut egui::Ui, theme: &Theme, i: usize, 
     }
 }
 
-/// 端末が 1 枚も無いときの案内。
-fn empty_pane_ui(ui: &mut egui::Ui, theme: &Theme, height: f32, no_sessions: bool) {
+/// 端末が 1 枚も無いときの右側 (1 行だけ。プリセット一覧は出さない)。
+fn empty_pane_ui(ui: &mut egui::Ui, theme: &Theme, width: f32, height: f32) {
     ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), height),
+        egui::vec2(width, height),
         egui::Layout::top_down(egui::Align::Center),
         |ui| {
-            ui.add_space(height * 0.3);
+            ui.add_space(height * 0.35);
             ui.label(
-                RichText::new(if no_sessions {
-                    tr("まだセッションがありません — 「新規」から n で起こせます")
-                } else {
-                    tr("一覧から選ぶと、ここにその端末が出ます")
-                })
-                .size(12.0)
-                .color(theme.text_dim),
+                RichText::new(tr("一覧から選ぶと、ここにその端末が出ます"))
+                    .small()
+                    .color(theme.text_dim),
             );
         },
     );
 }
 
-/// 角丸チップ。
-fn chip(ui: &mut egui::Ui, color: Color32, text: &str) {
-    egui::Frame::none()
-        .fill(color.gamma_multiply(0.18))
-        .rounding(egui::Rounding::same(9.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.0).strong().color(color));
-        });
-}
-
-/// キーボード操作。端末・入力欄にフォーカスがある間は選択移動を奪わない。
-#[allow(clippy::too_many_arguments)]
+/// キーボード操作。端末・入力欄にフォーカスがある間は打鍵を奪わない。
+///
+/// 素の文字は**見えない絞り込み**へ流れる。ライフサイクルは ⌥ 付き。
 fn keyboard_ui(
     st: &mut DeckState,
     ui: &mut egui::Ui,
     rows: &[Row],
     live: &[LiveRow],
-    past: &[PastRow],
     launchers: &[LauncherRow],
     acts: &mut Vec<DeckAction>,
 ) {
@@ -2074,23 +1605,41 @@ fn keyboard_ui(
         }
         return;
     }
-
-    let filter_id = mem_id("filter-text");
-    let typing_filter = focus == Some(filter_id);
-    // 絞り込み欄以外の入力欄 (名前変更・コンポーザ) を打っている間は何もしない
-    if focus.is_some() && !typing_filter {
+    // 名前変更の入力欄を打っている間は何もしない
+    if focus.is_some() {
         return;
     }
 
-    // Tab で端末へ (一覧側にフォーカスがあるときだけ奪う)
-    if !typing_filter && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
+    // Tab で端末へ
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
         st.focus_term_req = true;
     }
-    // / で絞り込み欄へ
-    if !typing_filter && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Slash)) {
-        st.filter_focus = true;
+    // Esc: 絞り込みが効いていれば、まずそれを消す (デッキは閉じない)
+    if !st.query.is_empty()
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        st.query.clear();
         return;
     }
+    // Backspace で 1 文字消す
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)) {
+        st.query.pop();
+    }
+    // 打った文字はそのまま絞り込みへ (修飾キーが乗っているときは触らない —
+    // macOS の ⌥ は文字イベントも出すため)
+    let typed: String = ui.input(|i| {
+        if i.modifiers.alt || i.modifiers.command || i.modifiers.mac_cmd || i.modifiers.ctrl {
+            return String::new();
+        }
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    });
+    type_into_filter(&mut st.query, &typed);
 
     let pressed: Vec<(egui::Key, egui::Modifiers)> = ui.input(|i| {
         i.events
@@ -2109,23 +1658,13 @@ fn keyboard_ui(
 
     let row = st
         .selected
-        .as_ref()
-        .and_then(|k| rows.iter().find(|r| &r.key == k))
-        .cloned();
+        .and_then(|id| rows.iter().find(|r| r.id == id))
+        .copied();
     for (key, m) in pressed {
-        // 絞り込み欄を打っている間は、矢印と Enter だけ受ける (文字は欄へ)
-        if typing_filter
-            && !matches!(
-                key,
-                egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Enter
-            )
-        {
-            continue;
-        }
         let Some(k) = key_intent(key, m.alt, m.command || m.mac_cmd || m.ctrl) else {
             continue;
         };
-        let intents = dispatch(k, rows, row.as_ref(), live, past, launchers, st.stop_armed);
+        let intents = dispatch(k, rows, row, live, launchers, st.stop_armed);
         // 名前変更を始めるときは、いまの名前を初期値に入れる
         for it in intents {
             if let Intent::BeginRename(id) = &it {
@@ -2154,34 +1693,17 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn live(idx: usize, id: u64, title: &str) -> LiveRow {
         LiveRow {
             idx,
             id,
-            icon: "👾".into(),
             title: title.into(),
             cwd: PathBuf::from("/tmp/work"),
+            branch: String::new(),
             command: "claude".into(),
             running: true,
-            uptime: "0:10".into(),
             ..Default::default()
-        }
-    }
-
-    fn past(bin: &str, id: &str, summary: &str) -> PastRow {
-        PastRow {
-            session: PastSession {
-                id: id.into(),
-                agent_bin: bin.into(),
-                started: UNIX_EPOCH + Duration::from_secs(1),
-                modified: UNIX_EPOCH + Duration::from_secs(2),
-                summary: summary.into(),
-                cwd: PathBuf::from("/tmp/work"),
-            },
-            age: "1時間前".into(),
-            mark: "C".into(),
         }
     }
 
@@ -2193,97 +1715,90 @@ mod tests {
         }
     }
 
-    fn acts_of(n: usize, a: Activity) -> Vec<Activity> {
-        vec![a; n]
-    }
+    // ── レールに並ぶのは稼働中エージェントだけ ─────────────
 
-    // ── リストの組み立て ────────────────────────────────────
-
+    /// 行はセッションと 1 対 1。見出しも過去セッションもプリセットも作らない。
     #[test]
-    fn sections_are_built_in_fixed_order() {
-        let l = vec![live(0, 1, "a"), live(1, 2, "b")];
-        let p = vec![past("claude", "uuid-1", "直したい")];
-        let n = vec![launcher(0, "Claude"), launcher(1, "Codex")];
-        let rows = build_rows(&l, &acts_of(2, Activity::Idle), &p, &n, &Filter::default());
-        let secs: Vec<Section> = rows.iter().map(|r| r.section).collect();
+    fn only_live_agents_get_rows() {
+        let l = vec![live(0, 1, "a"), live(1, 2, "b"), live(2, 3, "c")];
+        let rows = build_rows(&l, "");
+        assert_eq!(rows.len(), l.len(), "行はセッションと 1 対 1");
         assert_eq!(
-            secs,
-            vec![
-                Section::Live,
-                Section::Live,
-                Section::Past,
-                Section::New,
-                Section::New
-            ]
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "渡された順のまま"
         );
-        assert_eq!(rows[0].key, RowKey::Live(1));
-        assert_eq!(
-            rows[2].key,
-            RowKey::Past("claude".into(), "uuid-1".into())
-        );
-        assert_eq!(rows[4].key, RowKey::Launcher(1));
+        let views = row_views(&rows, &l, None);
+        assert_eq!(views.len(), rows.len(), "見出し行が挟まらない");
+        assert_eq!(views.iter().map(|v| v.id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        // セッションが 0 なら行も 0 (プリセットで埋めない)
+        assert!(build_rows(&[], "").is_empty());
+        assert!(row_views(&[], &[], None).is_empty());
+    }
+
+    /// **画面に出るのは id + タイトル + 副題だけ。**
+    /// ここに状態・経過・件数のフィールドが増えたら、分解パターンが落ちる。
+    #[test]
+    fn row_view_has_exactly_a_title_and_one_subtitle() {
+        let mut a = live(0, 1, "zaivern-code");
+        a.branch = "main".into();
+        a.cwd = PathBuf::from("/Users/me/dev/zaivern-code");
+        let home = PathBuf::from("/Users/me");
+        let rows = build_rows(std::slice::from_ref(&a), "");
+        let views = row_views(&rows, std::slice::from_ref(&a), Some(&home));
+
+        // フィールドが増えたらここでコンパイルが落ちる (ダッシュボードへの出戻り防止)
+        let RowView {
+            id,
+            title,
+            subtitle,
+        } = views[0].clone();
+        assert_eq!(id, 1);
+        assert_eq!(title, "zaivern-code");
+        assert_eq!(subtitle, "main • ~/dev/zaivern-code");
+        assert!(!title.contains('\n') && !subtitle.contains('\n'), "各 1 行");
     }
 
     #[test]
-    fn collapsed_sections_contribute_no_rows_but_counts_stay() {
-        let l = vec![live(0, 1, "a")];
-        let p = vec![past("claude", "u1", "x")];
-        let n = vec![launcher(0, "Claude")];
-        let mut f = Filter::default();
-        f.collapsed[Section::Past.ix()] = true;
-        let rows = build_rows(&l, &acts_of(1, Activity::Idle), &p, &n, &f);
-        assert!(rows.iter().all(|r| r.section != Section::Past));
-        let c = section_counts(&l, &acts_of(1, Activity::Idle), &p, &n, &f);
-        assert_eq!(c, [1, 1, 1], "件数は折りたたんでも数える");
-    }
-
-    /// 稼働中として開かれている過去の会話は一覧から落ちる (二重表示しない)。
-    #[test]
-    fn past_session_open_as_live_is_deduped() {
-        let mut l = live(0, 1, "claude");
-        l.command = "claude --resume 4f2a-uuid".into();
-        let p = vec![past("claude", "4f2a-uuid", "続き"), past("claude", "other", "別")];
-        let rows = build_rows(
-            &[l],
-            &acts_of(1, Activity::Thinking),
-            &p,
-            &[],
-            &Filter::default(),
-        );
-        let past_keys: Vec<&RowKey> = rows
-            .iter()
-            .filter(|r| r.section == Section::Past)
-            .map(|r| &r.key)
-            .collect();
-        assert_eq!(past_keys.len(), 1);
-        assert_eq!(*past_keys[0], RowKey::Past("claude".into(), "other".into()));
+    fn subtitles_fall_back_from_branch_to_cwd_to_command() {
+        assert_eq!(subtitle_of("main", "~/dev/x", "claude"), "main • ~/dev/x");
+        assert_eq!(subtitle_of("", "~/dev/x", "claude"), "~/dev/x");
+        assert_eq!(subtitle_of("", "", "claude --resume 1"), "claude --resume 1");
+        assert_eq!(subtitle_of("main", "", "claude"), "main");
+        // 改行が混ざっても 1 行に潰す
+        assert_eq!(subtitle_of("ma\nin", "x", "c"), "ma in • x");
     }
 
     #[test]
-    fn dedup_needs_a_running_session_and_a_real_id() {
-        let mut l = live(0, 1, "claude");
-        l.command = "claude --resume 4f2a".into();
-        l.running = false;
-        assert!(!is_open_live("4f2a", &[l.clone()]), "終了済みは隠さない");
-        l.running = true;
-        assert!(is_open_live("4f2a", &[l.clone()]));
-        assert!(!is_open_live("", &[l]), "空 ID で全部消さない");
+    fn live_rows_without_a_title_fall_back_to_the_command() {
+        let mut l = live(0, 1, "");
+        l.command = "codex --yolo".into();
+        let rows = build_rows(std::slice::from_ref(&l), "");
+        let views = row_views(&rows, std::slice::from_ref(&l), None);
+        assert_eq!(views[0].title, "codex --yolo");
     }
 
+    // ── 見えない絞り込み ───────────────────────────────────
+
     #[test]
-    fn query_filters_across_sections() {
+    fn typing_filters_the_list_and_esc_clears_it() {
         let l = vec![live(0, 1, "claude 本体"), live(1, 2, "codex")];
-        let p = vec![past("claude", "u1", "codex の話")];
-        let n = vec![launcher(0, "Codex CLI"), launcher(1, "Claude Code")];
-        let f = Filter {
-            query: "codex".into(),
-            ..Default::default()
-        };
-        let rows = build_rows(&l, &acts_of(2, Activity::Idle), &p, &n, &f);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].key, RowKey::Live(2));
-        assert_eq!(rows[1].section, Section::Past);
-        assert_eq!(rows[2].key, RowKey::Launcher(0));
+        let mut q = String::new();
+
+        assert!(type_into_filter(&mut q, "co"), "打った文字が入る");
+        assert_eq!(q, "co");
+        assert!(!type_into_filter(&mut q, "\n\t"), "制御文字は入れない");
+        assert_eq!(q, "co");
+
+        let rows = build_rows(&l, &q);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 2);
+
+        // Backspace 相当と Esc 相当 (欄を持たないので単なる String 操作)
+        q.pop();
+        assert_eq!(build_rows(&l, &q).len(), 2, "1 文字消すと広がる");
+        q.clear();
+        assert_eq!(build_rows(&l, &q).len(), 2);
     }
 
     #[test]
@@ -2293,69 +1808,12 @@ mod tests {
         assert!(!matches_query("zzz", &["claude"]));
     }
 
-    // ── フィルタチップ ──────────────────────────────────────
-
     #[test]
-    fn chips_select_live_states() {
-        let mut busy = live(0, 1, "busy");
-        let idle = live(1, 2, "idle");
-        let mut waiting = live(2, 3, "waiting");
-        waiting.attention = true;
-        busy.command = "x".into();
-        let l = vec![busy, idle, waiting];
-        let a = vec![Activity::Running, Activity::Idle, Activity::Approval];
-        let n = vec![launcher(0, "Claude")];
-
-        let pick = |c: Chip| -> Vec<RowKey> {
-            build_rows(
-                &l,
-                &a,
-                &[],
-                &n,
-                &Filter {
-                    chip: c,
-                    ..Default::default()
-                },
-            )
-            .into_iter()
-            .map(|r| r.key)
-            .collect()
-        };
-        assert_eq!(
-            pick(Chip::All),
-            vec![
-                RowKey::Live(1),
-                RowKey::Live(2),
-                RowKey::Live(3),
-                RowKey::Launcher(0)
-            ]
-        );
-        assert_eq!(pick(Chip::Working), vec![RowKey::Live(1)]);
-        assert_eq!(pick(Chip::Waiting), vec![RowKey::Live(2)]);
-        assert_eq!(pick(Chip::Attention), vec![RowKey::Live(3)]);
-    }
-
-    #[test]
-    fn non_all_chips_hide_past_and_launcher_sections() {
-        let l = vec![live(0, 1, "a")];
-        let p = vec![past("claude", "u1", "x")];
-        let n = vec![launcher(0, "Claude")];
-        for c in [Chip::Working, Chip::Waiting, Chip::Attention] {
-            let rows = build_rows(
-                &l,
-                &acts_of(1, Activity::Running),
-                &p,
-                &n,
-                &Filter {
-                    chip: c,
-                    ..Default::default()
-                },
-            );
-            assert!(
-                rows.iter().all(|r| r.section == Section::Live),
-                "{c:?} で稼働中以外が残っている"
-            );
-        }
+    fn branch_is_searchable_even_though_it_is_only_a_subtitle() {
+        let mut l = live(0, 1, "a");
+        l.branch = "night/2026-07-26".into();
+        let rows = build_rows(std::slice::from_ref(&l), "night/");
+        assert_eq!(rows.len(), 1);
     }
 
     // ── 選択の安定性 ────────────────────────────────────────
@@ -2363,117 +1821,253 @@ mod tests {
     fn rows_of(ids: &[u64]) -> Vec<Row> {
         ids.iter()
             .enumerate()
-            .map(|(i, id)| Row {
-                key: RowKey::Live(*id),
-                section: Section::Live,
-                idx: i,
-            })
+            .map(|(i, id)| Row { id: *id, idx: i })
             .collect()
     }
 
     #[test]
     fn selection_survives_insert_and_reorder() {
         let rows = rows_of(&[1, 2, 3]);
-        let sel = RowKey::Live(2);
-        let (k, pos) = resolve_selection(Some(&sel), 1, &rows).unwrap();
-        assert_eq!((k.clone(), pos), (RowKey::Live(2), 1));
+        let (k, pos) = resolve_selection(Some(2), 1, &rows).unwrap();
+        assert_eq!((k, pos), (2, 1));
         // 先頭に 1 本挿さっても同じセッションを指す
         let rows2 = rows_of(&[9, 1, 2, 3]);
-        let (k2, pos2) = resolve_selection(Some(&k), pos, &rows2).unwrap();
-        assert_eq!((k2.clone(), pos2), (RowKey::Live(2), 2));
+        let (k2, pos2) = resolve_selection(Some(k), pos, &rows2).unwrap();
+        assert_eq!((k2, pos2), (2, 2));
         // 並べ替えても同じ
         let rows3 = rows_of(&[3, 2, 1, 9]);
-        let (k3, pos3) = resolve_selection(Some(&k2), pos2, &rows3).unwrap();
-        assert_eq!((k3, pos3), (RowKey::Live(2), 1));
+        assert_eq!(resolve_selection(Some(k2), pos2, &rows3).unwrap(), (2, 1));
     }
 
     #[test]
     fn selection_falls_back_to_the_same_slot_when_removed() {
-        let rows = rows_of(&[1, 2, 3]);
-        let gone = RowKey::Live(2);
         // 2 が消えた: 同じ位置 (index 1) に居る 3 へ寄る
-        let rows2 = rows_of(&[1, 3]);
-        let (k, pos) = resolve_selection(Some(&gone), 1, &rows2).unwrap();
-        assert_eq!((k, pos), (RowKey::Live(3), 1));
+        assert_eq!(resolve_selection(Some(2), 1, &rows_of(&[1, 3])), Some((3, 1)));
         // 末尾が消えた: 末尾へ丸める
-        let rows3 = rows_of(&[1]);
-        let (k, pos) = resolve_selection(Some(&RowKey::Live(3)), 2, &rows3).unwrap();
-        assert_eq!((k, pos), (RowKey::Live(1), 0));
+        assert_eq!(resolve_selection(Some(3), 2, &rows_of(&[1])), Some((1, 0)));
         // 空なら選択なし
-        assert_eq!(resolve_selection(Some(&RowKey::Live(1)), 0, &[]), None);
-        let _ = rows;
+        assert_eq!(resolve_selection(Some(1), 0, &[]), None);
     }
 
-    // ── キーボード移動 ──────────────────────────────────────
-
+    /// 一覧が入れ替わっても選択が飛ばない (止めた / 起こした直後)。
     #[test]
-    fn arrows_cross_section_boundaries() {
-        let l = vec![live(0, 1, "a")];
-        let p = vec![past("claude", "u1", "x")];
-        let n = vec![launcher(0, "Claude")];
-        let rows = build_rows(&l, &acts_of(1, Activity::Idle), &p, &n, &Filter::default());
-        assert_eq!(rows.len(), 3);
-        let mut cur = Some(rows[0].key.clone());
-        cur = move_selection(&rows, cur.as_ref(), 1);
-        assert_eq!(cur, Some(rows[1].key.clone()), "稼働中 → ローカル");
-        cur = move_selection(&rows, cur.as_ref(), 1);
-        assert_eq!(cur, Some(rows[2].key.clone()), "ローカル → 新規");
-        // 端では止まる
-        assert_eq!(
-            move_selection(&rows, cur.as_ref(), 1),
-            Some(rows[2].key.clone())
-        );
-        assert_eq!(
-            move_selection(&rows, Some(&rows[0].key), -1),
-            Some(rows[0].key.clone())
-        );
+    fn selection_is_stable_when_the_list_mutates_under_it() {
+        let l = vec![live(0, 1, "a"), live(1, 2, "b"), live(2, 3, "c")];
+        let rows = build_rows(&l, "");
+        let mut st = DeckState::default();
+        st.select(2);
+        assert_eq!(st.sync_selection(&rows, &l), Some(2));
+        // 2 が消える → 同じ位置 (index 1) に来た 3 へ寄る
+        let rest = vec![live(0, 1, "a"), live(1, 3, "c")];
+        let rows2 = build_rows(&rest, "");
+        assert_eq!(st.sync_selection(&rows2, &rest), Some(3));
+        // 絞り込みで一時的に空になっても、解除で戻せる
+        let none = build_rows(&rest, "zzz");
+        assert_eq!(st.sync_selection(&none, &rest), None);
+        assert_eq!(st.sync_selection(&rows2, &rest), Some(1), "先頭へ寄る");
     }
 
-    #[test]
-    fn navigation_respects_the_active_filter() {
-        let l = vec![live(0, 1, "claude"), live(1, 2, "codex")];
-        let n = vec![launcher(0, "Codex")];
-        let f = Filter {
-            query: "codex".into(),
-            ..Default::default()
-        };
-        let rows = build_rows(&l, &acts_of(2, Activity::Idle), &[], &n, &f);
-        assert_eq!(rows.len(), 2);
-        // 絞り込みで消えた行 (Live(1)) からの移動は、残っている先頭へ入る
-        let next = move_selection(&rows, Some(&RowKey::Live(1)), 1);
-        assert_eq!(next, Some(RowKey::Live(2)));
-        let next = move_selection(&rows, next.as_ref(), 1);
-        assert_eq!(next, Some(RowKey::Launcher(0)));
-    }
+    // ── キーボード ──────────────────────────────────────────
 
     #[test]
-    fn navigation_on_empty_list_is_noop() {
+    fn arrows_walk_the_list_and_stop_at_the_ends() {
+        let rows = rows_of(&[1, 2, 3]);
+        let mut cur = Some(1);
+        cur = move_selection(&rows, cur, 1);
+        assert_eq!(cur, Some(2));
+        cur = move_selection(&rows, cur, 1);
+        assert_eq!(cur, Some(3));
+        assert_eq!(move_selection(&rows, cur, 1), Some(3), "端では止まる");
+        assert_eq!(move_selection(&rows, Some(1), -1), Some(1));
         assert_eq!(move_selection(&[], None, 1), None);
-        assert_eq!(move_selection(&rows_of(&[1]), None, 0), None);
+        assert_eq!(move_selection(&rows, None, 0), None);
     }
 
-    // ── レイアウトの状態機械 ───────────────────────────────
+    /// 素の文字キーは**何にも割り当てない** (絞り込みへ流すため)。
+    #[test]
+    fn bare_letters_go_to_the_filter_and_lifecycle_lives_on_alt() {
+        for k in [egui::Key::D, egui::Key::X, egui::Key::N, egui::Key::J] {
+            assert_eq!(key_intent(k, false, false), None, "{k:?} は絞り込みへ");
+        }
+        assert_eq!(
+            key_intent(egui::Key::ArrowDown, false, false),
+            Some(DeckKey::Down)
+        );
+        assert_eq!(
+            key_intent(egui::Key::Enter, false, false),
+            Some(DeckKey::Enter)
+        );
+        assert_eq!(key_intent(egui::Key::D, true, false), Some(DeckKey::Duplicate));
+        assert_eq!(key_intent(egui::Key::X, true, false), Some(DeckKey::Stop));
+        assert_eq!(key_intent(egui::Key::S, true, false), Some(DeckKey::Restart));
+        assert_eq!(key_intent(egui::Key::R, true, false), Some(DeckKey::Rename));
+        assert_eq!(key_intent(egui::Key::N, true, false), Some(DeckKey::New));
+        assert_eq!(
+            key_intent(egui::Key::ArrowUp, true, false),
+            Some(DeckKey::MoveUp)
+        );
+        // ⌘ が乗っていたらデッキは手を出さない (アプリのショートカットが先)
+        assert_eq!(key_intent(egui::Key::N, false, true), None);
+        assert_eq!(key_intent(egui::Key::ArrowUp, true, true), None);
+    }
+
+    /// 実際の起動・停止を一切しない記録専用のディスパッチャ。
+    #[derive(Default)]
+    struct FakeDispatcher {
+        seen: Vec<DeckAction>,
+    }
+
+    impl FakeDispatcher {
+        fn feed(
+            &mut self,
+            st: &mut DeckState,
+            k: DeckKey,
+            rows: &[Row],
+            live: &[LiveRow],
+            launchers: &[LauncherRow],
+        ) {
+            let row = st.selected.and_then(|id| rows.iter().find(|r| r.id == id)).copied();
+            let intents = dispatch(k, rows, row, live, launchers, st.stop_armed);
+            for it in intents {
+                st.apply_intent(it, rows, &mut self.seen);
+            }
+        }
+    }
 
     #[test]
-    fn layout_cycles_and_round_trips_through_u8() {
-        let mut l = DeckLayout::default();
-        assert_eq!(l, DeckLayout::Single);
-        l = l.next();
-        assert_eq!(l, DeckLayout::Split);
-        l = l.next();
-        assert_eq!(l, DeckLayout::Stacked);
-        l = l.next();
-        assert_eq!(l, DeckLayout::Single);
+    fn lifecycle_keys_emit_intents_without_launching() {
+        let l = vec![live(0, 7, "claude"), live(1, 8, "codex")];
+        let n = vec![launcher(0, "Claude"), launcher(1, "Codex")];
+        let rows = build_rows(&l, "");
+        let mut st = DeckState::default();
+        st.select(7);
+        let mut d = FakeDispatcher::default();
+
+        // ⌥N = 新規 (先頭プリセット。一覧にプリセット行は出さない)
+        d.feed(&mut st, DeckKey::New, &rows, &l, &n);
+        assert_eq!(d.seen.last(), Some(&DeckAction::Launch(0)));
+
+        d.feed(&mut st, DeckKey::Duplicate, &rows, &l, &n);
+        assert_eq!(d.seen.last(), Some(&DeckAction::Duplicate(0)));
+
+        d.feed(&mut st, DeckKey::Restart, &rows, &l, &n);
+        assert_eq!(d.seen.last(), Some(&DeckAction::Restart(0)));
+
+        // Enter = アクティブ切替 + 端末へフォーカス
+        d.feed(&mut st, DeckKey::Enter, &rows, &l, &n);
+        assert_eq!(d.seen.last(), Some(&DeckAction::Select(0)));
+        assert!(st.focus_term_req);
+
+        // ⌥R = 名前変更 (副作用は出さず、入力欄が開くだけ)
+        let before = d.seen.len();
+        d.feed(&mut st, DeckKey::Rename, &rows, &l, &n);
+        assert_eq!(d.seen.len(), before, "⌥R 単体では何も実行しない");
+        assert_eq!(st.rename_for, Some(7));
+        st.rename_for = None;
+
+        // ⌥X = 停止 (1 打目は確認、2 打目で実行)
+        let before = d.seen.len();
+        d.feed(&mut st, DeckKey::Stop, &rows, &l, &n);
+        assert_eq!(d.seen.len(), before, "1 打目では止めない");
+        assert_eq!(st.stop_armed(), Some(7));
+        d.feed(&mut st, DeckKey::Stop, &rows, &l, &n);
+        assert_eq!(d.seen.last(), Some(&DeckAction::Stop(0)));
+        assert_eq!(st.stop_armed(), None, "実行したら確認は下ろす");
+
+        // 選択が動いたら確認は取り下げる
+        d.feed(&mut st, DeckKey::Stop, &rows, &l, &n);
+        assert_eq!(st.stop_armed(), Some(7));
+        d.feed(&mut st, DeckKey::Down, &rows, &l, &n);
+        assert_eq!(st.stop_armed(), None);
+        assert_eq!(st.selected(), Some(8));
+    }
+
+    #[test]
+    fn alt_arrows_reorder_by_screen_order() {
+        let l = vec![live(0, 1, "a"), live(1, 2, "b"), live(2, 3, "c")];
+        let rows = build_rows(&l, "");
+        let mut st = DeckState::default();
+        let mut d = FakeDispatcher::default();
+
+        st.select(2);
+        d.feed(&mut st, DeckKey::MoveUp, &rows, &l, &[]);
+        assert_eq!(d.seen.last(), Some(&DeckAction::Reorder { from: 1, to: 0 }));
+        d.feed(&mut st, DeckKey::MoveDown, &rows, &l, &[]);
+        assert_eq!(d.seen.last(), Some(&DeckAction::Reorder { from: 1, to: 2 }));
+
+        // 端では何も出さない
+        let before = d.seen.len();
+        st.select(1);
+        d.feed(&mut st, DeckKey::MoveUp, &rows, &l, &[]);
+        assert_eq!(d.seen.len(), before);
+        st.select(3);
+        d.feed(&mut st, DeckKey::MoveDown, &rows, &l, &[]);
+        assert_eq!(d.seen.len(), before);
+    }
+
+    /// プリセットが 1 つも無ければ ⌥N は何も起こさない (落ちない)。
+    #[test]
+    fn new_agent_without_presets_is_a_noop() {
+        let l = vec![live(0, 1, "a")];
+        let rows = build_rows(&l, "");
+        let mut st = DeckState::default();
+        let mut d = FakeDispatcher::default();
+        st.select(1);
+        d.feed(&mut st, DeckKey::New, &rows, &l, &[]);
+        assert!(d.seen.is_empty());
+    }
+
+    // ── レイアウトと寸法 ───────────────────────────────────
+
+    #[test]
+    fn layout_toggles_and_round_trips_through_u8() {
+        assert_eq!(DeckLayout::default(), DeckLayout::Split);
         for l in [DeckLayout::Single, DeckLayout::Split, DeckLayout::Stacked] {
             assert_eq!(DeckLayout::from_u8(l.to_u8()), l);
         }
-        assert_eq!(DeckLayout::from_u8(99), DeckLayout::Single, "壊れた値は既定へ");
+        assert_eq!(DeckLayout::from_u8(99), DeckLayout::Split, "壊れた値は既定へ");
+        // レールの出し入れは積み上げを壊さない
+        assert_eq!(DeckLayout::Stacked.with_rail(false), DeckLayout::Single);
+        assert_eq!(DeckLayout::Stacked.with_rail(true), DeckLayout::Stacked);
+        assert_eq!(DeckLayout::Single.with_rail(true), DeckLayout::Split);
+        assert_eq!(DeckLayout::Split.with_stacked(true), DeckLayout::Stacked);
+        assert_eq!(DeckLayout::Stacked.with_stacked(false), DeckLayout::Split);
+        assert!(!DeckLayout::Single.shows_rail(true));
+        assert!(DeckLayout::Split.shows_rail(true));
+        assert!(!DeckLayout::Split.shows_rail(false));
+    }
+
+    /// レール幅はどの窓幅・どの DPI でも「細いが読める」範囲に収まる。
+    #[test]
+    fn rail_width_is_clamped_across_window_sizes() {
+        for unit in [12.0_f32, 18.0, 32.0] {
+            for w in [320.0_f32, 800.0, 1440.0, 2560.0, 3840.0] {
+                let r = rail_width(w, RAIL_FRAC_DEFAULT, unit);
+                assert!(r > 0.0, "w={w} unit={unit}");
+                assert!(
+                    r <= w * RAIL_FRAC_MAX + 0.01,
+                    "レールが窓の {RAIL_FRAC_MAX} を超えた (w={w})"
+                );
+                assert!(r <= w * 0.5, "レールが窓の半分を超えた (w={w})");
+            }
+            // 広い窓では割合どおり
+            assert!((rail_width(3000.0, 0.2, unit) - 600.0).abs() < 0.01);
+            // 狭い窓でも上限は必ず守る
+            assert!(rail_width(200.0, RAIL_FRAC_DEFAULT, unit) <= 200.0 * RAIL_FRAC_MAX + 0.01);
+            // 壊れた割合でも落ちない
+            assert!(rail_width(1000.0, -5.0, unit) >= 0.0);
+            assert!(rail_width(1000.0, 9.0, unit) <= 1000.0 * RAIL_FRAC_MAX + 0.01);
+        }
+        // 単位 (文字の高さ) が大きいほど下限も大きい = DPI に追従する
+        assert!(rail_width(1000.0, 0.01, 32.0) > rail_width(1000.0, 0.01, 12.0));
+        // 細い窓ではレールを横に置かない
+        assert!(!rail_fits_beside(400.0, 18.0));
+        assert!(rail_fits_beside(1440.0, 18.0));
     }
 
     #[test]
     fn stack_count_is_bounded() {
         assert_eq!(clamp_stack(0), MIN_STACK);
-        assert_eq!(clamp_stack(1), MIN_STACK);
         assert_eq!(clamp_stack(3), 3);
         assert_eq!(clamp_stack(99), MAX_STACK);
         let mut st = DeckState::default();
@@ -2488,15 +2082,15 @@ mod tests {
 
     #[test]
     fn stacked_ids_start_at_the_selection_and_wrap() {
-        let l = vec![live(0, 1, "a"), live(1, 2, "b"), live(2, 3, "c")];
-        let rows = build_rows(&l, &acts_of(3, Activity::Idle), &[], &[], &Filter::default());
-        let sel = RowKey::Live(2);
-        assert_eq!(stacked_ids(&rows, &l, Some(&sel), 2), vec![2, 3]);
-        assert_eq!(stacked_ids(&rows, &l, Some(&sel), 3), vec![2, 3, 1]);
+        let rows = rows_of(&[1, 2, 3]);
+        assert_eq!(stacked_ids(&rows, Some(2), 2), vec![2, 3]);
+        assert_eq!(stacked_ids(&rows, Some(2), 3), vec![2, 3, 1]);
         // 欲しい数がセッション数を超えても重複させない
-        assert_eq!(stacked_ids(&rows, &l, Some(&sel), 9), vec![2, 3, 1]);
-        // 稼働中が無ければ空
-        assert!(stacked_ids(&[], &[], Some(&sel), 3).is_empty());
+        assert_eq!(stacked_ids(&rows, Some(2), 9), vec![2, 3, 1]);
+        // 行が無ければ空
+        assert!(stacked_ids(&[], Some(2), 3).is_empty());
+        // 選択が消えていても先頭から出す
+        assert_eq!(stacked_ids(&rows, Some(99), 2), vec![1, 2]);
     }
 
     #[test]
@@ -2519,153 +2113,21 @@ mod tests {
         assert_eq!(w, before);
     }
 
-    // ── ライフサイクルの発行 (偽のディスパッチャで記録するだけ) ──
-
-    /// 実際の起動・停止を一切しない記録専用のディスパッチャ。
-    #[derive(Default)]
-    struct FakeDispatcher {
-        seen: Vec<DeckAction>,
-    }
-
-    impl FakeDispatcher {
-        fn feed(
-            &mut self,
-            st: &mut DeckState,
-            k: DeckKey,
-            rows: &[Row],
-            live: &[LiveRow],
-            past: &[PastRow],
-            launchers: &[LauncherRow],
-        ) {
-            let row = st
-                .selected
-                .as_ref()
-                .and_then(|key| rows.iter().find(|r| &r.key == key))
-                .cloned();
-            let intents = dispatch(k, rows, row.as_ref(), live, past, launchers, st.stop_armed);
-            for it in intents {
-                st.apply_intent(it, rows, &mut self.seen);
-            }
+    /// 選択行 (accent のべた塗り) の文字は、どのテーマでも読める側が選ばれる。
+    #[test]
+    fn selected_row_text_contrasts_with_the_accent_fill() {
+        for t in crate::theme::all() {
+            let fg = on_accent(&t);
+            assert!(fg == t.text || fg == t.bg);
+            let d = (luma(fg) - luma(t.accent)).abs();
+            let other = if fg == t.text { t.bg } else { t.text };
+            assert!(
+                d >= (luma(other) - luma(t.accent)).abs(),
+                "{}: 明度差の小さい方を選んでいる",
+                t.name
+            );
+            assert!(d > 0.1, "{}: 選択行の文字が読めない", t.name);
         }
-    }
-
-    #[test]
-    fn lifecycle_keys_emit_intents_without_launching() {
-        let l = vec![live(0, 7, "claude"), live(1, 8, "codex")];
-        let p = vec![past("claude", "u1", "続き")];
-        let n = vec![launcher(0, "Claude"), launcher(1, "Codex")];
-        let rows = build_rows(&l, &acts_of(2, Activity::Idle), &p, &n, &Filter::default());
-        let mut st = DeckState::default();
-        st.select(RowKey::Live(7));
-        let mut d = FakeDispatcher::default();
-
-        // n = 新規 (選択が稼働中なら先頭プリセット)
-        d.feed(&mut st, DeckKey::New, &rows, &l, &p, &n);
-        assert_eq!(d.seen.last(), Some(&DeckAction::Launch(0)));
-
-        // d = 複製
-        d.feed(&mut st, DeckKey::Duplicate, &rows, &l, &p, &n);
-        assert_eq!(d.seen.last(), Some(&DeckAction::Duplicate(0)));
-
-        // s = 再起動
-        d.feed(&mut st, DeckKey::Restart, &rows, &l, &p, &n);
-        assert_eq!(d.seen.last(), Some(&DeckAction::Restart(0)));
-
-        // r = 名前変更 (副作用は出さず、入力欄が開くだけ)
-        let before = d.seen.len();
-        d.feed(&mut st, DeckKey::Rename, &rows, &l, &p, &n);
-        assert_eq!(d.seen.len(), before, "r 単体では何も実行しない");
-        assert_eq!(st.rename_for, Some(7));
-        st.rename_for = None;
-
-        // x = 停止 (1 打目は確認、2 打目で実行)
-        let before = d.seen.len();
-        d.feed(&mut st, DeckKey::Stop, &rows, &l, &p, &n);
-        assert_eq!(d.seen.len(), before, "1 打目では止めない");
-        assert_eq!(st.stop_armed(), Some(7));
-        d.feed(&mut st, DeckKey::Stop, &rows, &l, &p, &n);
-        assert_eq!(d.seen.last(), Some(&DeckAction::Stop(0)));
-        assert_eq!(st.stop_armed(), None, "実行したら確認は下ろす");
-
-        // 選択が動いたら確認は取り下げる
-        d.feed(&mut st, DeckKey::Stop, &rows, &l, &p, &n);
-        assert_eq!(st.stop_armed(), Some(7));
-        d.feed(&mut st, DeckKey::Down, &rows, &l, &p, &n);
-        assert_eq!(st.stop_armed(), None);
-        assert_eq!(st.selected(), Some(&RowKey::Live(8)));
-    }
-
-    #[test]
-    fn enter_resumes_a_past_session_and_launches_a_preset() {
-        let l = vec![live(0, 7, "claude")];
-        let p = vec![past("claude", "u1", "続き")];
-        let n = vec![launcher(3, "Codex")];
-        let rows = build_rows(&l, &acts_of(1, Activity::Idle), &p, &n, &Filter::default());
-        let mut st = DeckState::default();
-        let mut d = FakeDispatcher::default();
-
-        st.select(rows[1].key.clone());
-        d.feed(&mut st, DeckKey::Enter, &rows, &l, &p, &n);
-        match d.seen.last() {
-            Some(DeckAction::Resume(s)) => assert_eq!(s.id, "u1"),
-            other => panic!("再開が出ていない: {other:?}"),
-        }
-
-        st.select(rows[2].key.clone());
-        d.feed(&mut st, DeckKey::Enter, &rows, &l, &p, &n);
-        assert_eq!(
-            d.seen.last(),
-            Some(&DeckAction::Launch(3)),
-            "プリセットの実 index を渡す"
-        );
-
-        // 稼働中で Enter = アクティブ切替 + 端末へフォーカス
-        st.select(rows[0].key.clone());
-        d.feed(&mut st, DeckKey::Enter, &rows, &l, &p, &n);
-        assert_eq!(d.seen.last(), Some(&DeckAction::Select(0)));
-        assert!(st.focus_term_req);
-    }
-
-    #[test]
-    fn alt_arrows_reorder_within_the_live_section_only() {
-        let l = vec![live(0, 1, "a"), live(1, 2, "b"), live(2, 3, "c")];
-        let n = vec![launcher(0, "Claude")];
-        let rows = build_rows(&l, &acts_of(3, Activity::Idle), &[], &n, &Filter::default());
-        let mut st = DeckState::default();
-        let mut d = FakeDispatcher::default();
-
-        st.select(RowKey::Live(2));
-        d.feed(&mut st, DeckKey::MoveUp, &rows, &l, &[], &n);
-        assert_eq!(d.seen.last(), Some(&DeckAction::Reorder { from: 1, to: 0 }));
-        d.feed(&mut st, DeckKey::MoveDown, &rows, &l, &[], &n);
-        assert_eq!(d.seen.last(), Some(&DeckAction::Reorder { from: 1, to: 2 }));
-
-        // 端では何も出さない
-        let before = d.seen.len();
-        st.select(RowKey::Live(1));
-        d.feed(&mut st, DeckKey::MoveUp, &rows, &l, &[], &n);
-        assert_eq!(d.seen.len(), before);
-
-        // 起動プリセットの行では並べ替えない
-        st.select(RowKey::Launcher(0));
-        d.feed(&mut st, DeckKey::MoveDown, &rows, &l, &[], &n);
-        assert_eq!(d.seen.len(), before);
-    }
-
-    #[test]
-    fn key_intents_ignore_command_chords() {
-        assert_eq!(key_intent(egui::Key::J, false, false), Some(DeckKey::Down));
-        assert_eq!(key_intent(egui::Key::K, false, false), Some(DeckKey::Up));
-        assert_eq!(key_intent(egui::Key::X, false, false), Some(DeckKey::Stop));
-        assert_eq!(
-            key_intent(egui::Key::ArrowUp, true, false),
-            Some(DeckKey::MoveUp)
-        );
-        // ⌘ が乗っていたらデッキは手を出さない (アプリのショートカットが先)
-        assert_eq!(key_intent(egui::Key::N, false, true), None);
-        assert_eq!(key_intent(egui::Key::ArrowUp, true, true), None);
-        // ⌥ + 文字は並べ替え以外に割り当てない
-        assert_eq!(key_intent(egui::Key::D, true, false), None);
     }
 
     // ── 再描画のリズム ──────────────────────────────────────
@@ -2681,10 +2143,27 @@ mod tests {
     fn repaint_cadence_follows_activity() {
         assert_eq!(deck_repaint_ms(true, true, false), Some(FAST_SAMPLE_MS));
         assert_eq!(deck_repaint_ms(false, true, false), Some(SLOW_SAMPLE_MS));
-        // 走査中だけは短く回して、結果が届いたら止まる
+        // 裏の問い合わせ中だけは短く回して、届いたら止まる
         assert_eq!(deck_repaint_ms(false, false, true), Some(SCAN_POLL_MS));
         // 出力があるときは走っている扱いより優先
         assert_eq!(deck_repaint_ms(true, false, true), Some(FAST_SAMPLE_MS));
+    }
+
+    /// 何も出力しておらず、誰も走っていないフレームは 0 枚。
+    #[test]
+    fn a_deck_with_nothing_producing_output_schedules_nothing() {
+        let mut st = DeckState::default();
+        let l = vec![LiveRow {
+            idx: 0,
+            id: 1,
+            title: "a".into(),
+            running: false,
+            ..Default::default()
+        }];
+        st.update_tracks(&l, 10_000, true);
+        assert!(!st.any_running);
+        assert!(!st.busy);
+        assert_eq!(deck_repaint_ms(st.busy, st.any_running, false), None);
     }
 
     #[test]
@@ -2705,9 +2184,9 @@ mod tests {
         let l = vec![live(0, 1, "a"), live(1, 2, "b")];
         let a = st.update_tracks(&l, 0, true);
         assert_eq!(a.len(), 2);
-        assert!(st.track(1).is_some() && st.track(2).is_some());
+        assert!(st.tracked(1) && st.tracked(2));
         st.update_tracks(&l[..1], 100, true);
-        assert!(st.track(2).is_none(), "消えたセッションの追跡は捨てる");
+        assert!(!st.tracked(2), "消えたセッションの追跡は捨てる");
         assert!(st.any_running);
     }
 
@@ -2725,32 +2204,13 @@ mod tests {
         assert_eq!(a1, a2, "サンプルしていないフレームで状態が揺れない");
     }
 
-    // ── 永続化のキー ────────────────────────────────────────
-
-    #[test]
-    fn row_keys_round_trip_through_persistence() {
-        for k in [
-            RowKey::Live(42),
-            RowKey::Past("claude".into(), "uuid-1".into()),
-            RowKey::Launcher(3),
-        ] {
-            assert_eq!(RowKey::from_persist(&k.to_persist()), Some(k));
-        }
-        assert_eq!(RowKey::from_persist(""), None);
-        assert_eq!(RowKey::from_persist("Z\u{1}1"), None);
-        assert_eq!(RowKey::from_persist("L\u{1}notanumber"), None);
-    }
-
     // ── 表示ヘルパ ──────────────────────────────────────────
 
     #[test]
     fn short_path_uses_home_and_keeps_the_tail() {
         let home = PathBuf::from("/Users/me");
         assert_eq!(short_path(Path::new("/Users/me"), Some(&home)), "~");
-        assert_eq!(
-            short_path(Path::new("/Users/me/dev"), Some(&home)),
-            "~/dev"
-        );
+        assert_eq!(short_path(Path::new("/Users/me/dev"), Some(&home)), "~/dev");
         assert_eq!(
             short_path(Path::new("/Users/me/dev/a/b/c"), Some(&home)),
             "…/b/c"
@@ -2759,25 +2219,45 @@ mod tests {
     }
 
     #[test]
-    fn section_indices_are_distinct_and_ordered() {
-        let ixs: Vec<usize> = SECTIONS.iter().map(|s| s.ix()).collect();
-        assert_eq!(ixs, vec![0, 1, 2]);
-    }
-
-    #[test]
     fn deck_state_selection_defaults_to_the_active_session() {
         let mut l = vec![live(0, 1, "a"), live(1, 2, "b")];
         l[1].active = true;
-        let rows = build_rows(&l, &acts_of(2, Activity::Idle), &[], &[], &Filter::default());
+        let rows = build_rows(&l, "");
         let mut st = DeckState::default();
-        assert_eq!(st.sync_selection(&rows, &l), Some(RowKey::Live(2)));
+        assert_eq!(st.sync_selection(&rows, &l), Some(2));
     }
 
+    /// **看板・サイドバーとの被りを二度と作らないための番人。**
+    /// デッキの描画にダッシュボード部品や「他の画面の仕事」が戻ってきたら落ちる。
     #[test]
-    fn relative_age_helper_is_reused_from_session_picker() {
-        // 過去セクションの相対時刻は session_picker の実装をそのまま使う
-        let now = SystemTime::now();
-        let then = now - Duration::from_secs(3600);
-        assert!(!crate::session_picker::relative_age(now, then).is_empty());
+    fn the_deck_renders_only_live_agents_and_nothing_status_like() {
+        let src = &include_str!("deck.rs").replace("\r\n", "\n");
+        // テストの中の語 (この関数自身) は除き、さらに**コメントも外して**
+        // 実コードだけを見る (「サイドバーの担当」と書いた説明文で落ちないように)。
+        let body: String = src
+            .split("mod tests {")
+            .next()
+            .expect("本体がある")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (banned, why) in [
+            ("section_header_ui", "区画見出し"),
+            ("chips_ui", "フィルタチップ"),
+            ("pulse_ui", "出力スパークライン"),
+            ("fmt_elapsed", "経過時間"),
+            ("approvals", "承認バッジ"),
+            ("activity_color", "状態の色分け"),
+            ("agent_composer_ui", "コンポーザ"),
+            ("PastSession", "過去セッション行 (サイドバーの担当)"),
+            ("session_picker", "過去セッションの走査"),
+            ("再開", "再開導線 (サイドバーの担当)"),
+        ] {
+            assert!(
+                !body.contains(banned),
+                "デッキに {why} ({banned}) が戻っている — レールは稼働中エージェントだけ"
+            );
+        }
     }
 }

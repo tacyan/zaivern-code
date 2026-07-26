@@ -1748,8 +1748,15 @@ pub struct ZaivernApp {
     /// エージェントデッキ (縦 1 本でエージェントを管理する画面)。
     /// Cockpit / 看板と同格の中央画面モードで、3 つ同時には出さない。
     deck: bool,
-    /// デッキ画面の UI 状態 (選択・レイアウト・フィルタ・追跡)
+    /// デッキ画面の UI 状態 (選択・レイアウト・絞り込み・追跡)
     deck_state: deck::DeckState,
+    /// デッキの副題に出す「作業ディレクトリ → git ブランチ」。
+    /// 値は (ブランチ名, 取得時刻)。空文字 = repo ではない (再問い合わせは TTL 後)。
+    deck_branches: HashMap<PathBuf, (String, Instant)>,
+    /// いまバックグラウンドで問い合わせ中の作業ディレクトリ (二重起動よけ)
+    deck_branch_pending: HashSet<PathBuf>,
+    deck_branch_tx: mpsc::Sender<(PathBuf, String)>,
+    deck_branch_rx: mpsc::Receiver<(PathBuf, String)>,
     /// Markdown/HTML ファイルをレンダリング表示するモード (Cockpit の編集ペインでも有効)
     md_preview: bool,
     /// プレビューが参照するローカル画像のテクスチャキャッシュ
@@ -2271,6 +2278,8 @@ impl ZaivernApp {
             let (ide_tx, _ide_rx) = mpsc::channel();
             ide::detect_async(ide_tx, cc.egui_ctx.clone());
         }
+        // デッキの副題 (ブランチ) を裏で解決するための口。
+        let (deck_branch_tx, deck_branch_rx) = mpsc::channel();
         let mut app = Self {
             tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
             gitinfo: git::GitSet::new(roots.clone()),
@@ -2323,6 +2332,10 @@ impl ZaivernApp {
             kanban_state: kanban::KanbanState::default(),
             deck: false,
             deck_state: deck::DeckState::default(),
+            deck_branches: HashMap::new(),
+            deck_branch_pending: HashSet::new(),
+            deck_branch_tx,
+            deck_branch_rx,
             md_preview: false,
             md_images: markdown::ImageCache::default(),
             md_pre_cache: None,
@@ -11606,35 +11619,50 @@ impl ZaivernApp {
     // 看板と同じ橋渡し構造: ここは「材料を写す」「返ってきた操作を実行する」だけ。
     // 判断と描画は deck.rs 側にある。
 
-    /// デッキに並べる過去の会話 (稼働中と重複するものは deck 側が落とす)。
+    /// デッキの副題に出す git ブランチ (作業ディレクトリごと・TTL 付きキャッシュ)。
     ///
-    /// 走査そのものはサイドバーと同じ [`session_picker::SidebarState`] が
-    /// 別スレッドへ逃がしている (TTL 付き)。ここはキャッシュを読むだけ。
-    fn deck_past_rows(&mut self) -> (Vec<deck::PastRow>, bool) {
-        self.refresh_session_folders();
-        self.sidebar_sessions.refresh_if_stale(&self.sess_folders);
-        let now = std::time::SystemTime::now();
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        let mut out: Vec<session_picker::PastSession> = Vec::new();
-        for f in &self.sess_folders {
-            for s in self.sidebar_sessions.sessions_for(f) {
-                if seen.insert((s.agent_bin.clone(), s.id.clone())) {
-                    out.push(s.clone());
-                }
-            }
+    /// git は **UI スレッドでは回さない** (git.rs と同じ方針)。1 つの作業
+    /// ディレクトリにつき 1 本だけ裏へ投げ、届いたら貼る。まだ届いていない
+    /// 間は空文字を返すので、副題は「短縮 cwd だけ」に落ちる (欠落しても壊れない)。
+    fn deck_branch_of(&mut self, cwd: &Path) -> String {
+        /// ブランチは checkout で変わるので、そこそこの周期で取り直す。
+        const TTL: Duration = Duration::from_secs(20);
+        while let Ok((dir, name)) = self.deck_branch_rx.try_recv() {
+            self.deck_branch_pending.remove(&dir);
+            self.deck_branches.insert(dir, (name, Instant::now()));
         }
-        // 新しい順。件数はデッキの縦リストが破綻しない範囲で切る。
-        out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
-        out.truncate(session_picker::MAX_RESULTS);
-        let rows = out
-            .into_iter()
-            .map(|s| deck::PastRow {
-                age: session_picker::relative_age(now, s.modified),
-                mark: panels::agent_mark(&s.agent_bin),
-                session: s,
-            })
-            .collect();
-        (rows, self.sidebar_sessions.loading())
+        let cur = self.deck_branches.get(cwd);
+        let fresh = matches!(cur, Some((_, at)) if at.elapsed() < TTL);
+        let out = cur.map(|(n, _)| n.clone()).unwrap_or_default();
+        if !fresh && !self.deck_branch_pending.contains(cwd) && !cwd.as_os_str().is_empty() {
+            self.deck_branch_pending.insert(cwd.to_path_buf());
+            let tx = self.deck_branch_tx.clone();
+            let dir = cwd.to_path_buf();
+            std::thread::spawn(move || {
+                let name = Self::git_branch_at(&dir).unwrap_or_default();
+                let _ = tx.send((dir, name));
+            });
+        }
+        out
+    }
+
+    /// `dir` の git ブランチ名 (**バックグラウンド専用**)。
+    /// detached HEAD なら短縮 SHA。非 repo / git 不在なら `None`。
+    /// `.git/HEAD` を直接読まないのは worktree / submodule で壊れるため。
+    fn git_branch_at(dir: &Path) -> Option<String> {
+        let run = |args: &[&str]| -> Option<String> {
+            let out = crate::procx::hidden_command("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        run(&["branch", "--show-current"]).or_else(|| run(&["rev-parse", "--short", "HEAD"]))
     }
 
     fn deck_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -11643,41 +11671,35 @@ impl ZaivernApp {
         let now_ms = self.supervisor.elapsed_ms();
         // PTY 画面の読み直しはデッキが「今」と言ったフレームだけ (看板と同じ作法)。
         let fresh_tail = self.deck_state.sample_due(now_ms);
-        let (past, scanning) = self.deck_past_rows();
 
+        // 副題のブランチだけ先に解決しておく (`&mut self` が要るので一覧の外で)。
+        let cwds: Vec<PathBuf> = self.agents.sessions.iter().map(|s| s.cwd.clone()).collect();
+        let branches: Vec<String> = cwds.iter().map(|c| self.deck_branch_of(c)).collect();
+
+        // 一覧に描くのは「名前」と「ブランチ • 場所」だけ。承認件数・未読・
+        // 稼働時間といった状態は看板 (kanban.rs) の担当なので写さない。
         let live: Vec<deck::LiveRow> = self
             .agents
             .sessions
             .iter()
             .enumerate()
-            .map(|(i, s)| {
-                let id = s.id;
-                deck::LiveRow {
-                    idx: i,
-                    id,
-                    icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
-                    title: s.title.clone(),
-                    cwd: s.cwd.clone(),
-                    command: s.command.clone(),
-                    running: s.running(),
-                    attention: s.attention && s.running(),
-                    unread: s.has_unread(),
-                    rate_limited: s.rate_limited.is_some(),
-                    approvals: self
-                        .agents
-                        .approvals
-                        .pending()
-                        .filter(|r| r.agent_session_id == id)
-                        .count(),
-                    sup: self.supervisor.state_of(id),
-                    active: i == active,
-                    uptime: s.uptime(),
-                    tail_lines: if fresh_tail {
-                        s.screen_tail_lines(10, 180)
-                    } else {
-                        Vec::new()
-                    },
-                }
+            .map(|(i, s)| deck::LiveRow {
+                idx: i,
+                id: s.id,
+                title: s.title.clone(),
+                branch: branches.get(i).cloned().unwrap_or_default(),
+                cwd: s.cwd.clone(),
+                command: s.command.clone(),
+                running: s.running(),
+                attention: s.attention && s.running(),
+                rate_limited: s.rate_limited.is_some(),
+                sup: self.supervisor.state_of(s.id),
+                active: i == active,
+                tail_lines: if fresh_tail {
+                    s.screen_tail_lines(10, 180)
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         let launchers: Vec<deck::LauncherRow> = self
@@ -11691,12 +11713,9 @@ impl ZaivernApp {
                 name: p.name.clone(),
             })
             .collect();
-        // 使用量の助言 (最も深刻なものだけ。無ければ出さない)。
-        let quota = {
-            let a = self.quota.worst_advice(std::time::SystemTime::now());
-            let msg = a.message();
-            (!msg.is_empty()).then(|| (msg.to_string(), a.severity()))
-        };
+        // 走査中 = ブランチ解決が飛んでいる間だけ。届けば止まるので、
+        // アイドル時の予約は 0 枚のまま。
+        let scanning = !self.deck_branch_pending.is_empty();
 
         // ライブ端末は Cockpit / 看板とまったく同じ道 (`terminal::draw`) を通す。
         let mini_font = (self.cfg.terminal_font_size - 2.0).clamp(8.0, 16.0);
@@ -11724,13 +11743,10 @@ impl ZaivernApp {
             ui,
             &theme,
             &live,
-            &past,
             &launchers,
-            quota,
             now_ms,
             fresh_tail,
             scanning,
-            &mut self.agent_input_buf,
             &mut draw,
         );
 
@@ -11742,10 +11758,6 @@ impl ZaivernApp {
                     }
                 }
                 deck::DeckAction::Launch(i) => self.launch_preset(i, ctx),
-                deck::DeckAction::Resume(s) => {
-                    // 再開はサイドバーとまったく同じ純関数を通す (判断を二重に持たない)
-                    self.apply_session_sidebar(session_picker::SidebarAction::Resume(*s), ctx);
-                }
                 deck::DeckAction::Rename { id, title } => {
                     if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == id) {
                         s.title = title;
@@ -11760,32 +11772,6 @@ impl ZaivernApp {
                     }
                 }
                 deck::DeckAction::Reorder { from, to } => self.reorder_agent(from, to),
-                deck::DeckAction::Send { id, text } => {
-                    let sent = self.agents.sessions.iter_mut().find(|s| s.id == id).map(|s| {
-                        // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)
-                        s.note_user_input();
-                        let mut t = text.clone();
-                        t.push('\r');
-                        (s.send_text(&t), s.title.clone())
-                    });
-                    match sent {
-                        Some((true, title)) => {
-                            self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true)
-                        }
-                        Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
-                        None => {}
-                    }
-                }
-                deck::DeckAction::Broadcast(text) => {
-                    self.agents.broadcast(&text);
-                    self.toast(
-                        trf(
-                            "📣 {n} セッションへ送信しました",
-                            &[("n", self.agents.running_count().to_string())],
-                        ),
-                        true,
-                    );
-                }
                 deck::DeckAction::Close => self.deck = false,
             }
         }
