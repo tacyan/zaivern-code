@@ -114,6 +114,11 @@ impl Grid {
                 .pos
                 .row
                 .saturating_sub(u16::try_from(from_top).unwrap_or(u16::MAX));
+            // 保存カーソル (DECSC) も同じだけ内容がずれる
+            self.saved_pos.row = self
+                .saved_pos
+                .row
+                .saturating_sub(u16::try_from(from_top).unwrap_or(u16::MAX));
         }
         self.rows.resize(new_rows, self.new_row());
 
@@ -123,6 +128,13 @@ impl Grid {
         if self.scroll_bottom < self.scroll_top {
             self.scroll_top = 0;
         }
+
+        // zaivern patch: saved_pos (DECSC) も必ず新しい画面内へ収める。
+        // ?1049h (保存) → 縮小 → ?1049l (DECRC 復元) の順で範囲外の行を
+        // 復元すると、直後の描画で current_row_mut() の unwrap が panic し、
+        // PTY 読取スレッドだけが死んで端末が黒いまま戻らなくなる。
+        self.saved_pos.row = self.saved_pos.row.min(size.rows.saturating_sub(1));
+        self.saved_pos.col = self.saved_pos.col.min(size.cols.saturating_sub(1));
 
         self.row_clamp_top(false);
         self.row_clamp_bottom(false);
@@ -151,6 +163,11 @@ impl Grid {
     pub fn restore_cursor(&mut self) {
         self.pos = self.saved_pos;
         self.origin_mode = self.saved_origin_mode;
+        // zaivern patch: 保存後に画面が縮んでいた場合の保険 (set_size 側の
+        // クランプと二重化)。範囲外カーソルを復元すると current_row_mut() の
+        // unwrap が panic する。
+        self.pos.row = self.pos.row.min(self.size.rows.saturating_sub(1));
+        self.pos.col = self.pos.col.min(self.size.cols.saturating_sub(1));
     }
 
     pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {

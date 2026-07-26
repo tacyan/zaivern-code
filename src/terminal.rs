@@ -2140,6 +2140,22 @@ mod tests {
     }
 
     #[test]
+    fn decrc_after_shrink_does_not_panic() {
+        // 代替画面 (?1049h) がカーソルを保存 → ペイン縮小 → ?1049l の DECRC が
+        // 縮小前の行番号を復元 → 次の描画で範囲外 unwrap により PTY 読取
+        // スレッドが panic し、端末が黒いまま戻らなくなっていた
+        // (vendor/vt100 の saved_pos クランプの回帰テスト)。
+        let mut p = vt100::Parser::new(30, 80, 100);
+        p.process(b"\x1b[30;1H");   // カーソルを最下行 (30行目) へ
+        p.process(b"\x1b[?1049h"); // 代替画面へ (通常グリッドの位置を保存)
+        p.set_size(12, 80); // Cockpit でファイルを開く等でペインが縮む
+        p.process(b"\x1b[?1049l"); // 代替画面終了 + DECRC (保存位置を復元)
+        p.process(b"\r\x1b[2K$ x"); // プロンプト再描画 — ここで落ちないこと
+        let (row, _col) = p.screen().cursor_position();
+        assert!(row < 12, "復元されたカーソルは画面内に収まる: row={row}");
+    }
+
+    #[test]
     fn line_hits_is_case_insensitive_and_skips_empty_query() {
         let lines = vec![
             "Error: build failed".to_string(),

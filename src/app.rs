@@ -387,8 +387,17 @@ pub struct ZaivernApp {
     /// 救出 (Fullscreen(false) 送信) を開始した時刻。長時間変化が無ければ
     /// 解除コマンドが取りこぼされたと判断して諦める。
     fs_rescue_at: Option<Instant>,
-    /// 解除後の矩形が変化してからの安定計測 (0.4 秒続いたら疑似フルスクリーンへ)。
-    fs_settle_since: Option<Instant>,
+    /// 直前フレームで観測した inner_rect (矩形の「真の安定」検出用)。
+    fs_last_rect: Option<egui::Rect>,
+    /// inner_rect が最後に動いた時刻。「now との差」が安定継続時間になる。
+    /// 全画面の遷移アニメーション中は毎フレーム更新され続ける。
+    fs_rect_moved_at: Option<Instant>,
+    /// 疑似フルスクリーン復帰の後半 (枠と位置の復元) の予約。
+    /// zoom: (Maximized) と setStyleMask: (Decorations) を同一ターンで
+    /// 送らないための分割 (遷移中の styleMask は AppKit が NSException)。
+    fake_fs_restore: Option<(egui::Pos2, egui::Vec2, Instant)>,
+    /// ネイティブ全画面の出入りを最後に指示した時刻 (連打クールダウン)。
+    fs_toggle_at: Option<Instant>,
     /// 全画面ジオメトリ不一致を最初に観測した時刻 (遷移アニメ中の揺れと区別するため
     /// 0.5 秒持続してから壊れていると確定する)。
     fs_broken_since: Option<Instant>,
@@ -798,7 +807,10 @@ impl ZaivernApp {
             fs_rescue_pending: false,
             fs_rescue_from: None,
             fs_rescue_at: None,
-            fs_settle_since: None,
+            fs_last_rect: None,
+            fs_rect_moved_at: None,
+            fake_fs_restore: None,
+            fs_toggle_at: None,
             fs_broken_since: None,
             gsearch: GlobalSearchState::new(),
             nav_history: Vec::new(),
@@ -2635,39 +2647,18 @@ impl ZaivernApp {
             return;
         }
         let text = self.editor.buffers[i].text.clone();
-        let hay_lower = text.to_lowercase();
-        let needle_lower = self.find.query.to_lowercase();
-        // Lowercasing can shift byte offsets for exotic chars; fall back to
-        // case-sensitive search when lengths diverge.
-        let (hay, needle) = if hay_lower.len() == text.len() {
-            (hay_lower.as_str(), needle_lower.as_str())
-        } else {
-            (text.as_str(), self.find.query.as_str())
-        };
-
+        // 大小無視の検索と境界ずれ (İ Ω 等) のフォールバックは find_ci に集約
         let start_char = self.find.last.map(|c| c + 1).unwrap_or(0);
-        let start_byte = text
-            .char_indices()
-            .nth(start_char)
-            .map(|(b, _)| b)
-            .unwrap_or(text.len());
-
-        let found = hay[start_byte.min(hay.len())..]
-            .find(needle)
-            .map(|p| p + start_byte)
-            .or_else(|| hay.find(needle));
-
-        let Some(byte_pos) = found else {
+        let Some(char_pos) = editor_ops::find_ci(&text, &self.find.query, start_char) else {
             self.toast(tr("見つかりませんでした"), false);
             self.find.last = None;
             return;
         };
 
-        let char_pos = text[..byte_pos].chars().count();
         let n_chars = self.find.query.chars().count();
         self.find.last = Some(char_pos);
         self.pending_select = Some((char_pos, char_pos + n_chars));
-        let line = text[..byte_pos].matches('\n').count();
+        let line = editor_ops::line_of_char(&text, char_pos);
         // VS Code 同様、ヒット行が画面の中央付近に来るようにスクロールする
         self.pending_scroll =
             Some((line as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
@@ -3076,21 +3067,40 @@ impl ZaivernApp {
             }
             Cmd::ToggleProblems => self.problems_open = !self.problems_open,
             Cmd::ToggleFullScreen => {
+                // 救出 (壊れた全画面から脱出) 中・枠復元の予約中は何も送らない。
+                // 遷移の最中に styleMask/zoom を重ねると AppKit が NSException を
+                // 投げてプロセスごと落ちる (実測)。救出中は viewport().fullscreen が
+                // 既に false + broken_native_fs 学習済みなので、ガードが無いと
+                // ⌃⌘F が enter_fake_fullscreen へ直行してしまう。
+                if self.fs_rescue_pending || self.fake_fs_restore.is_some() {
+                    return;
+                }
                 let cur = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
                 if self.fake_fullscreen.is_some() {
                     self.exit_fake_fullscreen(ctx);
-                } else if cur {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 } else {
-                    // このモニタでネイティブ全画面が壊れると学習済みなら最初から疑似で
-                    let mon = ctx.input(|i| i.viewport().monitor_size);
-                    let known_broken = mon.is_some_and(|m| {
-                        self.broken_native_fs.iter().any(|b| (*b - m).length() < 1.0)
-                    });
-                    if known_broken {
-                        self.enter_fake_fullscreen(ctx);
+                    // ネイティブ全画面の出入りは遷移アニメ (~1秒) を伴うので、
+                    // 連打は 1.5 秒のクールダウンで無視する (遷移中の再送防止)。
+                    if self
+                        .fs_toggle_at
+                        .is_some_and(|t| t.elapsed().as_millis() < 1500)
+                    {
+                        return;
+                    }
+                    self.fs_toggle_at = Some(Instant::now());
+                    if cur {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     } else {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                        // このモニタでネイティブ全画面が壊れると学習済みなら最初から疑似で
+                        let mon = ctx.input(|i| i.viewport().monitor_size);
+                        let known_broken = mon.is_some_and(|m| {
+                            self.broken_native_fs.iter().any(|b| (*b - m).length() < 1.0)
+                        });
+                        if known_broken {
+                            self.enter_fake_fullscreen(ctx);
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                        }
                     }
                 }
             }
@@ -3685,6 +3695,39 @@ impl ZaivernApp {
             let v = i.viewport();
             (v.fullscreen.unwrap_or(false), v.inner_rect, v.monitor_size)
         });
+
+        // 疑似フルスクリーン復帰の後半: Maximized(false) を送った 150ms 後に
+        // 枠と位置を戻す。zoom: のアニメーションと setStyleMask: を同一ターンに
+        // 重ねないため、必ずターンを分けて送る。
+        if let Some((pos, size, at)) = self.fake_fs_restore {
+            if at.elapsed().as_millis() >= 150 {
+                self.fake_fs_restore = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // 矩形の「真の安定」観測: 前フレームから 1px 超動いたら時刻を取り直す。
+        // 全画面の遷移アニメーション中はここが毎フレーム更新され続けるので、
+        // 「最後に動いてから N ms」で遷移が本当に終わったかを判定できる。
+        let rect_moved = match (inner, self.fs_last_rect) {
+            (Some(now), Some(prev)) => {
+                (now.min - prev.min).length() > 1.0
+                    || (now.size() - prev.size()).length() > 1.0
+            }
+            (now, prev) => now.is_some() != prev.is_some(),
+        };
+        if rect_moved || self.fs_rect_moved_at.is_none() {
+            self.fs_rect_moved_at = Some(Instant::now());
+        }
+        self.fs_last_rect = inner;
+        let rect_stable_ms = self
+            .fs_rect_moved_at
+            .map(|t| t.elapsed().as_millis())
+            .unwrap_or(0);
+
         if fs {
             let broken = match (inner, mon) {
                 (Some(r), Some(m)) => r.width() > m.x + 1.0 || r.height() > m.y + 1.0,
@@ -3696,14 +3739,17 @@ impl ZaivernApp {
             }
             // 進入アニメーション (~1秒) の最中に Fullscreen(false) を送ると winit が
             // 取りこぼし、「フラグは解除・実体は全画面のまま」で固まる (実測)。
-            // アニメが確実に終わる 1.5 秒までは判定を確定させない。
+            // 時間 (1.5 秒) に加えて「矩形が 0.5 秒動いていない」ことも要求する —
+            // 負荷でアニメが 1.5 秒を超えても、動いている間は絶対に送らない。
             let since = *self.fs_broken_since.get_or_insert_with(Instant::now);
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
-            if since.elapsed().as_millis() >= 1500 && !self.fs_rescue_pending {
+            if since.elapsed().as_millis() >= 1500
+                && rect_stable_ms >= 500
+                && !self.fs_rescue_pending
+            {
                 self.fs_rescue_pending = true;
                 self.fs_rescue_from = inner;
                 self.fs_rescue_at = Some(Instant::now());
-                self.fs_settle_since = None;
                 if let Some(m) = mon {
                     if !self.broken_native_fs.iter().any(|b| (*b - m).length() < 1.0) {
                         self.broken_native_fs.push(m);
@@ -3729,7 +3775,10 @@ impl ZaivernApp {
                 // 全画面解除のアニメーション中に styleMask/zoom を触ると AppKit が
                 // NSException を投げてプロセスごと落ちる (実測)。fullscreen フラグは
                 // アニメより先に false になるので、「矩形が救出開始時の壊れた値から
-                // 実際に変化して 0.4 秒安定した」ことを解除完了の合図にする。
+                // 実際に変化し、かつ 0.4 秒動いていない」ことを解除完了の合図にする。
+                // 注意: 以前は「動き始めてから 0.4 秒経過」で発火していた — 遅い
+                // マシンでは解除アニメがまだ続いている最中に styleMask を送って
+                // しまい、まさにこの NSException で落ちていた (v0.4.14 まで)。
                 let moved = match (inner, self.fs_rescue_from) {
                     (Some(now), Some(from)) => {
                         (now.min - from.min).length() > 1.0
@@ -3737,17 +3786,12 @@ impl ZaivernApp {
                     }
                     _ => inner.is_some(),
                 };
-                if moved {
-                    let since = *self.fs_settle_since.get_or_insert_with(Instant::now);
-                    if since.elapsed().as_millis() >= 400 {
-                        self.fs_rescue_pending = false;
-                        self.fs_rescue_from = None;
-                        self.fs_rescue_at = None;
-                        self.fs_settle_since = None;
-                        self.enter_fake_fullscreen(ctx);
-                    }
-                } else {
-                    self.fs_settle_since = None;
+                if moved && rect_stable_ms >= 400 {
+                    self.fs_rescue_pending = false;
+                    self.fs_rescue_from = None;
+                    self.fs_rescue_at = None;
+                    self.enter_fake_fullscreen(ctx);
+                } else if !moved {
                     // 解除コマンドが取りこぼされて実体が全画面のまま固まったら、
                     // これ以上は触らず諦める (この状態で styleMask を触ると落ちる)。
                     if self.fs_rescue_at.is_some_and(|at| at.elapsed().as_secs() >= 6) {
@@ -3768,10 +3812,17 @@ impl ZaivernApp {
 
     /// 疑似フルスクリーン: 現在ジオメトリを覚えてから枠を消して最大化する。
     fn enter_fake_fullscreen(&mut self, ctx: &egui::Context) {
-        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
-        let restore = match (outer, inner) {
-            (Some(o), Some(inn)) => (o.min, inn.size()),
-            _ => (egui::pos2(80.0, 80.0), egui::vec2(1280.0, 860.0)),
+        // 復帰の後半 (枠復元) が予約中に再進入したら、その予約の座標こそが
+        // 「戻るべき姿」なので引き継ぐ (今の見た目は復元途中の中間状態)。
+        let restore = if let Some((pos, size, _)) = self.fake_fs_restore.take() {
+            (pos, size)
+        } else {
+            let (outer, inner) =
+                ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+            match (outer, inner) {
+                (Some(o), Some(inn)) => (o.min, inn.size()),
+                _ => (egui::pos2(80.0, 80.0), egui::vec2(1280.0, 860.0)),
+            }
         };
         self.fake_fullscreen = Some(restore);
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
@@ -3780,12 +3831,13 @@ impl ZaivernApp {
 
     /// 疑似フルスクリーンから復帰。Maximized(false) はゾーン前の枠を正しく
     /// 戻さないことがある (実測: 幅が変わる) ので、覚えた位置/サイズを明示的に戻す。
+    /// ただし zoom: (Maximized) と setStyleMask: (Decorations) を同一ターンで
+    /// 送らず、復元の後半は fullscreen_guard の予約消化 (150ms 後) に分ける。
     fn exit_fake_fullscreen(&mut self, ctx: &egui::Context) {
         if let Some((pos, size)) = self.fake_fullscreen.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            self.fake_fs_restore = Some((pos, size, Instant::now()));
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 

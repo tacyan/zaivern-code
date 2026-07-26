@@ -397,23 +397,35 @@ pub fn pair_on_backspace(text: &str, cursor: usize) -> Option<(String, usize)> {
 }
 
 /// 大文字小文字を無視して `start_char` 以降 (見つからなければ先頭から) を検索。
-/// ヒットの char 位置を返す。app.rs の find_next と同じフォールバック規則。
+/// `hay[from..]` から検索 (from が char 境界でなければ None)。
+fn find_at(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    hay.get(from..)?.find(needle).map(|p| p + from)
+}
+
+/// ヒットの char 位置を返す (start_char から、無ければ先頭から取り直す)。
+///
+/// 小文字化はバイト境界をずらすことがある (İ は +1、Ω ẞ は −1 など)。
+/// 「合計バイト長が同じなら安全」という従来の判定は İ と Ω の相殺で破れ、
+/// `text[..byte_pos]` が char 境界 panic を起こしていた。境界を跨ぐスライスは
+/// すべて `get()` にして、ずれを検知したら大小区別ありへフォールバックする。
 pub fn find_ci(text: &str, query: &str, start_char: usize) -> Option<usize> {
     if query.is_empty() {
         return None;
     }
+    let start_byte = char_to_byte(text, start_char);
     let hay_lower = text.to_lowercase();
     let needle_lower = query.to_lowercase();
-    let (hay, needle): (&str, &str) = if hay_lower.len() == text.len() {
-        (&hay_lower, &needle_lower)
-    } else {
-        (text, query)
-    };
-    let start_byte = char_to_byte(text, start_char);
-    let byte_pos = hay[start_byte.min(hay.len())..]
-        .find(needle)
-        .map(|p| p + start_byte)
-        .or_else(|| hay.find(needle))?;
+    if hay_lower.len() == text.len() {
+        if let Some(byte_pos) = find_at(&hay_lower, &needle_lower, start_byte.min(hay_lower.len()))
+            .or_else(|| hay_lower.find(&needle_lower))
+        {
+            if let Some(head) = text.get(..byte_pos) {
+                return Some(head.chars().count());
+            }
+        }
+    }
+    let byte_pos =
+        find_at(text, query, start_byte.min(text.len())).or_else(|| text.find(query))?;
     Some(text[..byte_pos].chars().count())
 }
 
@@ -425,23 +437,30 @@ pub fn replace_all_ci(text: &str, query: &str, rep: &str) -> (String, usize) {
     }
     let hay_lower = text.to_lowercase();
     let needle_lower = query.to_lowercase();
-    let (hay, needle): (&str, &str) = if hay_lower.len() == text.len() {
-        (&hay_lower, &needle_lower)
-    } else {
-        (text, query)
-    };
+    // find_ci と同じ理由で、小文字化した写しの位置が text の char 境界から
+    // ずれたら (get() が None) 大小区別ありでやり直す。
+    if hay_lower.len() == text.len() {
+        if let Some(r) = replace_all_mapped(text, &hay_lower, &needle_lower, rep) {
+            return r;
+        }
+    }
+    replace_all_mapped(text, text, query, rep).unwrap_or_else(|| (text.to_string(), 0))
+}
+
+/// hay 上のヒット位置で text を置換する。境界がずれていたら None。
+fn replace_all_mapped(text: &str, hay: &str, needle: &str, rep: &str) -> Option<(String, usize)> {
     let mut out = String::with_capacity(text.len());
     let mut count = 0usize;
     let mut byte = 0usize;
-    while let Some(p) = hay[byte..].find(needle) {
+    while let Some(p) = hay.get(byte..)?.find(needle) {
         let at = byte + p;
-        out.push_str(&text[byte..at]);
+        out.push_str(text.get(byte..at)?);
         out.push_str(rep);
         count += 1;
         byte = at + needle.len();
     }
-    out.push_str(&text[byte..]);
-    (out, count)
+    out.push_str(text.get(byte..)?);
+    Some((out, count))
 }
 
 /// char 位置の行番号 (0-based) を返す。スクロール計算用。
@@ -718,6 +737,35 @@ mod tests {
         let (t, n) = replace_all_ci("こんにちは世界。世界!", "世界", "World");
         assert_eq!(t, "こんにちはWorld。World!");
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn find_ci_exotic_case_folding_does_not_panic() {
+        // İ (U+0130) は小文字化で 2→3 バイト、Ω (U+2126 OHM SIGN) は 3→2 バイト。
+        // 両方を含むと「合計バイト長は同じなのに char 境界がずれる」状態になり、
+        // 以前は text[..byte_pos] が char 境界 panic を起こしていた (回帰テスト)。
+        let text = "\u{130}\u{2126} abc ABC"; // İΩ abc ABC
+        assert!(find_ci(text, "abc", 0).is_some());
+        // ずれた写し上のヒットでも panic しない (途中の char 境界計算を通す)
+        let _ = find_ci(text, "\u{130}", 0);
+        let _ = find_ci(text, "\u{3c9}", 1); // ω
+        let _ = find_ci(text, "ABC", 0);
+        // 境界がずれても後続の ASCII は見つかる
+        assert_eq!(find_ci("\u{130}\u{2126}x", "x", 0), Some(2));
+    }
+
+    #[test]
+    fn replace_all_ci_exotic_case_folding_does_not_panic() {
+        let text = "\u{130}\u{2126} abc ABC"; // İΩ abc ABC
+        let (t, n) = replace_all_ci(text, "abc", "x");
+        assert_eq!(n, 2, "境界ずれ文字が混ざっても両方置換される: {t:?}");
+        assert!(
+            t.starts_with("\u{130}\u{2126}"),
+            "対象外の部分は保たれる: {t:?}"
+        );
+        // ヒットなしでも本文が壊れない
+        let (t, n) = replace_all_ci("\u{130}\u{2126}", "zzz", "x");
+        assert_eq!((t.as_str(), n), ("\u{130}\u{2126}", 0));
     }
 
     #[test]

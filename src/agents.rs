@@ -823,7 +823,10 @@ impl AgentManager {
         let Some(old) = self.sessions.get_mut(i) else {
             return Ok(());
         };
-        old.kill();
+        // ここで old.kill() を呼んではいけない: kill() のスレッドが先に根 (シェル)
+        // を落とすと、後段 reap の taskkill /T が木を辿れず孫が生き残り、
+        // ConPTY を閉じる drop が reap スレッドごと永久に固まる (remove と同じ罠)。
+        // 木→根→drop の正しい順序は reap が一手に引き受ける。
         let id = self.next_id;
         self.next_id += 1;
         let session = Session::spawn(

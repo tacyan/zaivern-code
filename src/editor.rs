@@ -264,18 +264,21 @@ impl Editor {
         };
         // エージェントが書き換えた結果で符号化が変わることもあるので、毎回判定する
         let (text, encoding) = crate::textenc::decode_bytes(&raw);
-        b.encoding = encoding;
         if text == b.text {
             // 内容は同じ(自前の保存・touch 等)。保存済み扱いに同期するだけ
+            b.encoding = encoding;
             b.disk_mtime = m;
             b.conflict_notified = None;
             b.saved_hash = hash_str(&text);
             return false;
         }
         if b.dirty() {
-            // 未保存の編集は守る。mtime も据え置き、ポーリング側が競合を警告できるようにする
+            // 未保存の編集は守る。mtime も据え置き、ポーリング側が競合を警告できる
+            // ようにする。encoding も据え置く — 再読込を拒否したのに符号化だけ
+            // ディスク側へ合わせると、次の保存で本文が意図しない符号に落ちる
             return false;
         }
+        b.encoding = encoding;
         b.disk_mtime = m;
         b.conflict_notified = None;
         b.saved_hash = hash_str(&text);
