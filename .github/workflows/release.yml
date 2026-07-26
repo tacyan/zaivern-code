@@ -45,6 +45,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # 依存クレートのビルド結果をタグ間で使い回す。これが無いと毎リリース
+      # フルビルドになり、待ち時間が数倍になる (キーはリリースタグに依存しない)。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
       - name: Install Linux build deps
         if: startsWith(matrix.label, 'linux')
         run: |
