@@ -1728,9 +1728,35 @@ fn truncate_chars(s: &str, max: usize) -> String {
     t
 }
 
+/// kill を撃ってよい相手を判定する純関数 (Drop の木殺しが使う)。
+///
+/// 終了済み (`exited`) なら **None** — wait 済みの child_pid は OS に返却されて
+/// おり、無関係なプロセス (グループ) に再利用され得る。そこへ killpg /
+/// taskkill /T /F を撃つとユーザーの別ジョブを巻き添えにする
+/// ([`Session::kill`] / [`reap`] / [`abandon`] と同じガード)。
+fn kill_target(exited: bool, child_pid: Option<u32>) -> Option<u32> {
+    if exited {
+        None
+    } else {
+        child_pid
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.killer.kill();
+        // [`reap`] / [`abandon`] を通らずに drop される経路 (テストや異常系) の
+        // 最後の砦。`killer.kill()` は PTY 直下の子 (シェル) にしか届かず、
+        // ログインシェルの子 (`bash -lc '…; sleep N'`) や孫が生き残って
+        // プロセスツリーが漏れる (CI ランナーを飢えさせた原因)。
+        // グループごと落としてから、保険として根も撃つ。
+        let exited = self.exited.load(Ordering::SeqCst);
+        if let Some(pid) = kill_target(exited, self.child_pid) {
+            crate::procx::kill_tree(pid);
+        }
+        if !exited {
+            // PID が取れなかったセッションでも根だけは落とす。
+            let _ = self.killer.kill();
+        }
     }
 }
 
@@ -2067,7 +2093,7 @@ mod tests {
             title: "unread-e2e".into(),
             preset_name: "test".into(),
             icon: "◆".into(),
-            command: "echo UNREAD_MARKER_1; sleep 30".into(),
+            command: "echo UNREAD_MARKER_1; sleep 5".into(),
             cwd: std::env::temp_dir(),
             env: HashMap::new(),
             log_path: None,
@@ -2811,7 +2837,8 @@ mod tests {
 
         // 入力を読まずにプロンプトを出しっぱなしにする子。TUI ダイアログ同様
         // エコー無し (以前は画面に残っている限り2秒おきに再送 → Enter連打事故)。
-        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        // sleep は生かしておくためだけ (検知 + 4秒の監視窓を超えれば十分)。
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 10"#;
         let spec = SpawnSpec {
             title: "one-shot-auto".into(),
             preset_name: "test".into(),
@@ -2859,7 +2886,7 @@ mod tests {
 
         // 自動YESの応答 (y\r) を無視してプロンプトが固まったままの子。
         // 「YESを送ったのに効かず 30 秒止まる」停滞を再現する (テストは 2 秒に短縮)。
-        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 10"#;
         let spec = SpawnSpec {
             title: "stall-resend".into(),
             preset_name: "test".into(),
@@ -3021,7 +3048,7 @@ mod tests {
         use std::collections::HashMap;
         use std::time::Duration;
 
-        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 10"#;
         let spec = SpawnSpec {
             title: "one-shot-deny".into(),
             preset_name: "test".into(),
@@ -3074,7 +3101,7 @@ mod tests {
         // テキストが画面に残っていても承認待ちを引きずらない。引きずると
         // coordinator が WaitingApproval のまま配達を保留し続け、エージェント間の
         // やり取りが進まなくなる (2026-07-24 の手動運転バグ)。
-        let cmd = r#"stty -echo; sleep 2; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let cmd = r#"stty -echo; sleep 2; printf 'Do you want to proceed? (y/n) '; sleep 10"#;
         let spec = SpawnSpec {
             title: "manual-answer".into(),
             preset_name: "test".into(),
@@ -3133,7 +3160,7 @@ mod tests {
 
         // 連続承認キューを模す: 1つ目に応答済みでも、内容の異なる2つ目が
         // 現れたら(1つ目が画面から消えていなくても)新規プロンプトとして検出する
-        let cmd = r#"stty -echo; printf 'cmd A\nDo you want to proceed? (y/n) '; sleep 4; printf '\ncmd B\nDo you want to proceed? (y/n) '; sleep 30"#;
+        let cmd = r#"stty -echo; printf 'cmd A\nDo you want to proceed? (y/n) '; sleep 4; printf '\ncmd B\nDo you want to proceed? (y/n) '; sleep 5"#;
         let spec = SpawnSpec {
             title: "queued-prompts".into(),
             preset_name: "test".into(),
@@ -3213,7 +3240,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         // 入力を読まずにプロンプトを出しっぱなしにする子 (エコー無し)。
-        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 5"#;
         let mut s = spawn_prompt_session(981, cmd);
         wait_prompt_on_screen(&s, "(y/n)");
 
@@ -3246,7 +3273,7 @@ mod tests {
         use super::Attention;
         use std::time::{Duration, Instant};
 
-        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 5"#;
         let mut s = spawn_prompt_session(982, cmd);
         wait_prompt_on_screen(&s, "(y/n)");
 
@@ -3271,7 +3298,7 @@ mod tests {
         use super::Attention;
         use std::time::{Duration, Instant};
 
-        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 10"#;
         let mut s = spawn_prompt_session(983, cmd);
 
         // 1) 自動YESオフで検出済み (バブル待ちの状態)
@@ -3306,7 +3333,7 @@ mod tests {
         use super::Attention;
         use std::time::{Duration, Instant};
 
-        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 10"#;
         let mut s = spawn_prompt_session(984, cmd);
         // 停滞閾値を大きく超えさせても「オフなら再送しない」ことを見るため短縮。
         s.auto_yes_resend_after = Duration::from_millis(300);
@@ -3349,7 +3376,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         // 応答 (y\r) を無視してプロンプトが固まったままの子。
-        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 30"#;
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 10"#;
         let mut s = spawn_prompt_session(985, cmd);
         s.auto_yes_resend_after = Duration::from_millis(600);
 
@@ -3416,7 +3443,7 @@ mod tests {
 
         // プロンプトを出して 3 秒待った後、行を氾濫させて選択肢を
         // 可視域 (30 行) の外へ追い出し、入力自体は待ち続ける子。
-        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 3; i=0; while [ $i -lt 40 ]; do echo "filler-$i"; i=$((i+1)); done; sleep 30"#;
+        let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 3; i=0; while [ $i -lt 40 ]; do echo "filler-$i"; i=$((i+1)); done; sleep 5"#;
         let mut s = spawn_prompt_session(986, cmd);
 
         // 1) まず承認待ちとして検出される
@@ -5166,6 +5193,23 @@ mod reap_tests {
     fn missing_pid_is_not_fatal() {
         assert!(!kill_tree_blocking(None));
     }
+
+    /// Drop の木殺しは「終了済みセッションへ kill を撃たない」ガード
+    /// (b27faf5) を必ず通ること。wait 済みの PID は再利用され得るため、
+    /// exited なら相手が何であれ撃ってはいけない。
+    #[test]
+    fn kill_target_honors_the_already_exited_guard() {
+        // (exited, child_pid, 期待, 説明)
+        let cases = [
+            (false, Some(42), Some(42), "生きている子は撃ってよい"),
+            (true, Some(42), None, "終了済み → PID 再利用の巻き添え防止で撃たない"),
+            (false, None, None, "PID 不明なら木は辿れない (killer の保険のみ)"),
+            (true, None, None, "終了済み + PID 不明も当然撃たない"),
+        ];
+        for (exited, pid, want, why) in cases {
+            assert_eq!(kill_target(exited, pid), want, "{why}");
+        }
+    }
 }
 
 /// PTY への書き込みが呼び出し側 (UI スレッド) を止めないことの取り決め。
@@ -5382,6 +5426,38 @@ mod reap_pty_tests {
             }
         };
         assert!(quiet, "閉じたのに孫プロセスが書き続けている: {}", probe.display());
+    }
+
+    /// [`reap`] / [`abandon`] を通さず **drop しただけ**でも孫まで止まること
+    /// (Drop の木殺し)。テストや異常系はこの経路で畳まれるため、ここが
+    /// 単発 kill のままだとログインシェルの子・孫が生き残り、実 PTY テストの
+    /// たびにプロセスツリーが漏れて CI ランナーを飢えさせる。
+    #[test]
+    fn dropping_a_session_stops_the_whole_tree() {
+        let (session, probe) = spawn_with_a_noisy_grandchild("droptree");
+        if wait_until_growing(&probe).is_none() {
+            drop(session);
+            return;
+        }
+        drop(session);
+
+        // 落ち切るまでの猶予 (Windows の taskkill は別プロセスなので少し待つ)。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let quiet = loop {
+            let before = len_of(&probe);
+            std::thread::sleep(Duration::from_millis(500));
+            if len_of(&probe) == before {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+        };
+        assert!(
+            quiet,
+            "drop したのに孫プロセスが書き続けている: {}",
+            probe.display()
+        );
     }
 }
 
@@ -5963,6 +6039,68 @@ printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
         assert!(!sess.attention);
         assert!(sess.attention_since.is_none());
         sess.kill();
+    }
+
+    /// Drop の木殺しが**プロセスグループ全体**へ届くこと。孫の実 PID を
+    /// 画面経由で取り、drop 後に ESRCH (もういない) になるのを確認する。
+    /// ログインシェル配下の `sleep` 系が生き残って積もり、CI ランナーを
+    /// 飢えさせた回帰のテスト。
+    #[test]
+    fn dropping_a_session_kills_the_grandchild_process_group() {
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            // ログインシェル (-lc) の下に /bin/sh、さらにその下に sleep。
+            // 非対話シェルはジョブ制御が無いので、全員が同じプロセスグループ
+            // (= PTY 直下の子の pgid) にいる。`_END` は PID が画面へ
+            // **書き切られた**ことの目印 (途中読みで PID を切り詰めない)。
+            command: "/bin/sh -c 'sleep 30 & echo GPID_IS_${!}_END; wait'".into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let sess = Session::spawn(5, spec, egui::Context::default()).unwrap();
+
+        // 画面から孫 PID を読む
+        let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        let mut gpid: Option<i32> = None;
+        while Instant::now() < deadline && gpid.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let screen = sess.parser.lock().unwrap().screen().contents();
+            if let Some(rest) = screen.split("GPID_IS_").nth(1) {
+                if rest.contains("_END") {
+                    if let Some(digits) = rest.split("_END").next() {
+                        gpid = digits.parse::<i32>().ok();
+                    }
+                }
+            }
+        }
+        let gpid = gpid.expect("孫 PID が画面に出なかった");
+        assert_eq!(unsafe { libc::kill(gpid, 0) }, 0, "孫 (pid={gpid}) が起きていない");
+
+        drop(sess);
+
+        // 2 秒以内に ESRCH (もういない) になること
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut gone = false;
+        while Instant::now() < deadline {
+            if unsafe { libc::kill(gpid, 0) } != 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                assert_eq!(
+                    errno,
+                    Some(libc::ESRCH),
+                    "kill(pid, 0) の失敗理由が ESRCH でない"
+                );
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            gone,
+            "drop 後も孫 (pid={gpid}) が生きている — Drop の木殺しがグループへ届いていない"
+        );
     }
 }
 

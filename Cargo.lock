@@ -4741,6 +4741,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "libc",
  "portable-pty",
  "qrcode",
  "rfd",

@@ -28,6 +28,12 @@ qrcode = { version = "0.14", default-features = false }
 # wayland-data-control は Linux (Wayland) 専用で他 OS のビルドには影響しない。
 arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 
+# セッション破棄時のプロセス**グループ**への killpg (procx::kill_tree)。
+# portable-pty は子を setsid するため pgid == pid で、グループごと落とせば
+# ログインシェルの子・孫まで確実に片付く (CI のプロセスツリー漏れ対策)。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
