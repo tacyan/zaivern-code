@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -80,6 +80,154 @@ impl PtyWriter {
     }
 }
 
+/// PTY へサイズを送る前に要求が安定しているべき連続フレーム数。
+///
+/// Cockpit のタイル増減・ファイルオープンでタイルサイズが毎フレーム揺れる間は
+/// 送らず、同じサイズが K フレーム続いてから 1 回だけ送る (全画面レースの
+/// 「前フレーム比の矩形安定」と同じ考え方)。K は小さく保つ — 一発で決まる
+/// 普通のリサイズも 1 フレーム遅れで届くだけで、体感は即時のまま。
+const RESIZE_STABLE_FRAMES: u8 = 2;
+
+/// リサイズ要求のフレーム安定判定 (純ロジック)。
+///
+/// vt100 (描画側) は毎フレーム即時に合わせるが、PTY (ConPTY) への通知は
+/// ここが「安定した」と判定したサイズだけを [`ResizeCoalescer`] へ渡す。
+/// Windows の `ResizePseudoConsole` は conhost への**ブロッキング RPC** で、
+/// 毎フレーム × タイル数だけ撃つと 1 個詰まっただけで UI が固まるため。
+#[derive(Default)]
+struct ResizeDebounce {
+    /// 直近フレームで要求されたサイズ。
+    last: Option<(u16, u16)>,
+    /// `last` が連続で要求されたフレーム数。
+    stable: u8,
+    /// `last` を PTY へ送り出し済みか。
+    shipped: bool,
+}
+
+impl ResizeDebounce {
+    /// `size` を適用済みとして開始する (spawn 直後の PTY 初期サイズ)。
+    /// 最初のフレームが同じサイズを要求しても無駄撃ちしない。
+    fn settled(size: (u16, u16)) -> Self {
+        Self {
+            last: Some(size),
+            stable: RESIZE_STABLE_FRAMES,
+            shipped: true,
+        }
+    }
+
+    /// 毎フレームの要求サイズを受け、PTY へ送るべきなら Some を返す。
+    /// 同じサイズは高々 1 回しか Some にならない。
+    fn on_request(&mut self, size: (u16, u16)) -> Option<(u16, u16)> {
+        if self.last == Some(size) {
+            if self.shipped {
+                return None;
+            }
+            self.stable = self.stable.saturating_add(1);
+            if self.stable >= RESIZE_STABLE_FRAMES {
+                self.shipped = true;
+                return Some(size);
+            }
+            None
+        } else {
+            self.last = Some(size);
+            self.stable = 1;
+            self.shipped = RESIZE_STABLE_FRAMES <= 1;
+            if self.shipped {
+                Some(size)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// まだ送っていない要求が残っているか。draw 側はこれが立っている間
+    /// 再描画を要求し続け、安定カウントを必ず完走させる (取りこぼし防止)。
+    fn pending(&self) -> bool {
+        !self.shipped && self.last.is_some()
+    }
+}
+
+/// 「最新の 1 サイズ」だけを持つ受け渡し箱。
+struct CoalesceState {
+    /// まだ適用していない最新の要求。送り手は常に上書きするだけ。
+    pending: Option<(u16, u16)>,
+    /// セッションが畳まれた印。ワーカーはこれを見て抜ける。
+    shutdown: bool,
+}
+
+/// PTY リサイズを UI スレッドから引き剥がすためのワーカー。
+///
+/// [`PtyWriter`] と同じ発想: 詰まり得る呼び出し (Windows では
+/// `ResizePseudoConsole` = conhost への同期 RPC) は専用スレッドに任せ、
+/// UI スレッドは「最新サイズを上書きして通知する」だけで**絶対に待たない**。
+/// 箱には最新の 1 個しか入らないので、リサイズの嵐が来ても
+/// ワーカーが実際に撃つ回数は「取り出した時点の最新」ぶんだけに潰れる。
+///
+/// ワーカーは apply クロージャ経由で master の [`Weak`] しか持たない。
+/// セッションが drop されて強参照が消えれば upgrade が失敗して自然に抜ける
+/// ため、master (ConPTY ハンドル) より長生きして触ることはできない。
+struct ResizeCoalescer {
+    shared: Arc<(Mutex<CoalesceState>, Condvar)>,
+}
+
+impl ResizeCoalescer {
+    /// ワーカーを起こす。`apply` が false を返したら送り先が消えたとみなして畳む。
+    /// スレッドを起こせなかったら None (呼び出し側が同期適用へ切り替える)。
+    fn start(
+        name: String,
+        mut apply: impl FnMut(u16, u16) -> bool + Send + 'static,
+    ) -> Option<Self> {
+        let shared = Arc::new((
+            Mutex::new(CoalesceState {
+                pending: None,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_shared = shared.clone();
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                let (lock, cv) = &*worker_shared;
+                let mut st = lock_ok(lock);
+                loop {
+                    if st.shutdown {
+                        break;
+                    }
+                    if let Some((rows, cols)) = st.pending.take() {
+                        // 適用中はロックを持たない — request 側を一瞬たりとも
+                        // ブロッキング RPC に巻き込まないため。
+                        drop(st);
+                        if !apply(rows, cols) {
+                            return;
+                        }
+                        st = lock_ok(lock);
+                    } else {
+                        st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+            })
+            .ok()
+            .map(|_| Self { shared })
+    }
+
+    /// 最新サイズを上書きして通知する。待たない。
+    fn request(&self, rows: u16, cols: u16) {
+        let (lock, cv) = &*self.shared;
+        lock_ok(lock).pending = Some((rows, cols));
+        cv.notify_one();
+    }
+
+    /// ワーカーへ終了を伝える。join はしない — 通知だけして即戻る。
+    fn shutdown(&self) {
+        let (lock, cv) = &*self.shared;
+        let mut st = lock_ok(lock);
+        st.shutdown = true;
+        st.pending = None;
+        cv.notify_one();
+    }
+}
+
 pub struct Session {
     /// セッション毎に一意な安定ID(呼び出し側が採番)。sessions の index は
     /// 削除で前へ詰まるため、バブル却下記録などの識別にはこちらを使う。
@@ -93,7 +241,13 @@ pub struct Session {
     pub parser: Arc<Mutex<vt100::Parser>>,
     /// PTY への書き込み口。問い合わせへの返事を読取スレッドからも書くため共有する。
     writer: PtyWriter,
-    master: Box<dyn MasterPty + Send>,
+    /// PTY の master ハンドル。リサイズワーカーが Weak で覗くため Arc に包む。
+    /// 強参照はここだけ — drop すれば従来どおり ConPTY が閉じる。
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    /// PTY リサイズの安定判定 (毎フレームの要求 → 送るべき 1 回に潰す)。
+    resize_debounce: ResizeDebounce,
+    /// リサイズを実際に撃つワーカー。初回のリサイズ確定時に遅延起動する。
+    resizer: Option<ResizeCoalescer>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// PTY に直接ぶら下がっている子 (cmd.exe / ログインシェル) の PID。
     /// エージェント本体はその**孫**なので、畳むときはここを起点に
@@ -1202,7 +1356,9 @@ impl Session {
             env: spec.env,
             parser,
             writer,
-            master: pair.master,
+            master: Arc::new(Mutex::new(pair.master)),
+            resize_debounce: ResizeDebounce::settled((rows, cols)),
+            resizer: None,
             killer,
             child_pid,
             exited,
@@ -1549,18 +1705,76 @@ impl Session {
         true
     }
 
+    /// 毎フレーム呼んでよいリサイズ。vt100 (描画グリッド) は**即時**に合わせ、
+    /// PTY (ConPTY) への通知だけをフレーム安定 + ワーカー経由に逃がす。
+    ///
+    /// Windows の `ResizePseudoConsole` は conhost への同期 RPC で、Cockpit の
+    /// タイル増減中に毎フレーム × セッション数だけ UI スレッドから撃つと、
+    /// conhost が 1 個詰まっただけで画面ごと固まる。ここは絶対に待たない。
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        if self.size == (rows, cols) || rows < 3 || cols < 20 {
+        if rows < 3 || cols < 20 {
             return;
         }
-        self.size = (rows, cols);
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
-        lock_ok(&self.parser).set_size(rows, cols);
+        // 描画側は即時。ここが 1 フレームでも遅れると、描いた矩形と
+        // グリッドがずれて「画面が崩れる」ため、遅延側には含めない。
+        if self.size != (rows, cols) {
+            self.size = (rows, cols);
+            lock_ok(&self.parser).set_size(rows, cols);
+        }
+        if let Some((r, c)) = self.resize_debounce.on_request((rows, cols)) {
+            self.ship_resize(r, c);
+        }
+    }
+
+    /// 安定したサイズをワーカーへ渡す (無ければ遅延起動)。待たない。
+    fn ship_resize(&mut self, rows: u16, cols: u16) {
+        if self.resizer.is_none() {
+            let weak: Weak<Mutex<Box<dyn MasterPty + Send>>> = Arc::downgrade(&self.master);
+            self.resizer = ResizeCoalescer::start(
+                format!("zv-pty-resize-{}", self.id),
+                move |rows, cols| {
+                    // セッションが drop 済みなら master は消えている → 撃たずに畳む。
+                    let Some(master) = weak.upgrade() else {
+                        return false;
+                    };
+                    let _ = lock_ok(&master).resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                    true
+                },
+            );
+        }
+        match &self.resizer {
+            Some(r) => r.request(rows, cols),
+            // ワーカーを起こせない環境 (スレッド枯渇など) では従来どおり同期適用。
+            // 詰まり得るが、サイズを取りこぼすよりはよい。
+            None => {
+                let _ = lock_ok(&self.master).resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+            }
+        }
+    }
+
+    /// まだ PTY へ送っていないリサイズ要求が残っているか。
+    /// draw はこれが立っている間 request_repaint し、安定カウントを完走させる。
+    pub fn resize_pending(&self) -> bool {
+        self.resize_debounce.pending()
+    }
+
+    /// PTY が現在認識しているサイズ (テストの突き合わせ用)。
+    #[cfg(test)]
+    fn pty_size(&self) -> Option<(u16, u16)> {
+        lock_ok(&self.master)
+            .get_size()
+            .ok()
+            .map(|s| (s.rows, s.cols))
     }
 
     /// エージェントを終了させる。孫まで落とすが**待たない**ので、
@@ -1744,6 +1958,12 @@ fn kill_target(exited: bool, child_pid: Option<u32>) -> Option<u32> {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // リサイズワーカーを先に畳む (通知だけ — join せず待たない)。
+        // ワーカーは master の Weak しか持たないので、万一通知を取り逃しても
+        // upgrade 失敗で自然に抜け、master より長生きして触ることはない。
+        if let Some(r) = self.resizer.take() {
+            r.shutdown();
+        }
         // [`reap`] / [`abandon`] を通らずに drop される経路 (テストや異常系) の
         // 最後の砦。`killer.kill()` は PTY 直下の子 (シェル) にしか届かず、
         // ログインシェルの子 (`bash -lc '…; sleep N'`) や孫が生き残って
@@ -1844,6 +2064,11 @@ pub fn reap(session: Session) {
 /// 終了処理そのものが止まり、ウィンドウが閉じないまま残る)。
 pub fn abandon(session: Session) {
     let mut session = session;
+    // mem::forget は Drop を通らないため、リサイズワーカーへの終了通知だけ
+    // ここで出しておく (放置しても Weak 頼みで無害だが、待機のまま残さない)。
+    if let Some(r) = session.resizer.take() {
+        r.shutdown();
+    }
     // 終了済みセッションには撃たない (reap と同じ理由: wait 済みの PID は
     // 無関係なプロセスに再利用され得る)。
     if !session.exited.load(Ordering::SeqCst) {
@@ -4996,6 +5221,12 @@ pub fn draw(
         let cols = ((rect.width() - padding * 2.0) / cell_w).floor() as u16;
         let rows = ((rect.height() - padding * 2.0) / cell_h).floor() as u16;
         session.resize(rows, cols);
+        if session.resize_pending() {
+            // 安定カウント (RESIZE_STABLE_FRAMES) が完走する前に再描画が
+            // 止まると、最終サイズが PTY へ届かないまま残る。完走するまで
+            // フレームを回し続けて取りこぼしを防ぐ (高々 K フレーム)。
+            ui.ctx().request_repaint();
+        }
     }
 
     // ── マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行) ──
@@ -6214,5 +6445,216 @@ mod resize_tests {
         for i in 0..5 {
             assert!(got.contains(&format!("line{i}")), "line{i} が消えた: {got:?}");
         }
+    }
+}
+
+/// PTY リサイズが UI スレッドを止めないことの取り決め。
+///
+/// Windows の `ResizePseudoConsole` は conhost への同期 RPC。Cockpit の
+/// タイル増減で毎フレーム × セッション数だけ UI スレッドから撃つと、
+/// conhost が 1 個詰まっただけでアプリ全体が固まる (「画面が崩れて
+/// 動かなくなる」の正体)。ここでは (1) 送り側が絶対に待たないこと、
+/// (2) 嵐が潰し込まれること、(3) 最終サイズは必ず届くこと、を固定する。
+#[cfg(test)]
+mod pty_resize_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// 潰し込み: 送り側は最新サイズを上書きするだけで待たず、
+    /// 詰まった受け側が動き出したら「取り出した時点の最新」だけが届く。
+    #[test]
+    fn coalescer_delivers_only_the_latest_size_and_never_blocks_the_sender() {
+        let sink: Arc<Mutex<Vec<(u16, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+        // conhost が詰まった状況の再現: テストがゲートを握っている間、
+        // 受け側 (apply) は 1 回目の適用で止まったままになる。
+        let gate = Arc::new(Mutex::new(()));
+        let hold = gate.lock().unwrap();
+
+        let c = {
+            let sink = sink.clone();
+            let gate = gate.clone();
+            ResizeCoalescer::start("zv-test-coalesce".into(), move |r, co| {
+                drop(gate.lock());
+                sink.lock().unwrap().push((r, co));
+                true
+            })
+            .expect("ワーカー起動")
+        };
+
+        let t0 = Instant::now();
+        for i in 0..1000u16 {
+            c.request(10 + i % 50, 40 + i % 80);
+        }
+        c.request(24, 100); // 最終サイズ
+        let sent_in = t0.elapsed();
+        // 受け側が完全に詰まっていても、送り側 1001 発は待たされない。
+        assert!(
+            sent_in < Duration::from_secs(1),
+            "送り側がブロックした: {sent_in:?}"
+        );
+
+        drop(hold); // conhost が復帰
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.lock().unwrap().last() != Some(&(24, 100)) {
+            assert!(
+                Instant::now() < deadline,
+                "最終サイズが届かない: {:?}",
+                sink.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let delivered = sink.lock().unwrap().clone();
+        // ゲートで止まっていた高々 1 発 + 最新の 1 発。1001 発が素通りしたら失敗。
+        assert!(
+            delivered.len() <= 2,
+            "潰し込みが効いていない: {delivered:?}"
+        );
+        c.shutdown();
+    }
+
+    /// 取りこぼし禁止: 嵐のあと静止しても、最後のサイズは必ず 1 回だけ届く。
+    /// (フレームが止まっても worker は notify で動くので、追加の呼び出しは不要)
+    #[test]
+    fn last_size_is_delivered_exactly_once_after_quiescence() {
+        let sink: Arc<Mutex<Vec<(u16, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+        let c = {
+            let sink = sink.clone();
+            ResizeCoalescer::start("zv-test-lost-update".into(), move |r, co| {
+                sink.lock().unwrap().push((r, co));
+                true
+            })
+            .expect("ワーカー起動")
+        };
+        for i in 0..200u16 {
+            c.request(10 + i % 13, 40 + i % 23);
+        }
+        let last = (99u16, 199u16); // 嵐には現れない値
+        c.request(last.0, last.1);
+        // ここから先は一切呼ばない (= フレームが止まった状況)。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.lock().unwrap().last() != Some(&last) {
+            assert!(
+                Instant::now() < deadline,
+                "静止後に最終サイズが流れてこない: {:?}",
+                sink.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(50)); // 余分な再送が無いか見張る
+        let delivered = sink.lock().unwrap().clone();
+        let n = delivered.iter().filter(|&&s| s == last).count();
+        assert_eq!(n, 1, "最終サイズが {n} 回届いた: {delivered:?}");
+        assert_eq!(delivered.last(), Some(&last));
+        c.shutdown();
+    }
+
+    /// フレーム安定判定の方針表。全画面レースと同じ「前フレーム比の矩形安定」:
+    /// 同じサイズが RESIZE_STABLE_FRAMES 回続いてはじめて 1 回だけ出荷する。
+    #[test]
+    fn debounce_policy_table() {
+        assert_eq!(
+            RESIZE_STABLE_FRAMES, 2,
+            "この表は K=2 前提。K を変えたら表も更新すること"
+        );
+        let a = (10u16, 40u16);
+        let b = (12u16, 50u16);
+        // (フレームの要求, 期待する出荷, 説明)
+        let table: &[((u16, u16), Option<(u16, u16)>, &str)] = &[
+            (a, None, "変化直後は出さない (安定 1 フレーム目)"),
+            (a, Some(a), "すぐ安定したケース: 2 フレーム目で出荷"),
+            (a, None, "出荷済みサイズは再送しない"),
+            (a, None, "何フレーム続いても再送しない"),
+            (b, None, "揺れ始め: 出さない"),
+            (a, None, "振動: 出さない"),
+            (b, None, "振動: 出さない"),
+            (b, Some(b), "振動が収まって 2 フレーム安定 → 最終だけ出荷"),
+            (b, None, "以降は静かなまま"),
+        ];
+        let mut d = ResizeDebounce::default();
+        assert!(!d.pending(), "初期状態で未出荷扱いはおかしい");
+        for (i, (req, want, why)) in table.iter().enumerate() {
+            assert_eq!(d.on_request(*req), *want, "frame {i}: {why}");
+        }
+        assert!(!d.pending(), "表の最後は出荷済みで終わるはず");
+
+        // settled 開始: spawn 直後と同じサイズを要求しても無駄撃ちしない。
+        let mut d = ResizeDebounce::settled(a);
+        for i in 0..4 {
+            assert_eq!(d.on_request(a), None, "初期サイズを再送した (frame {i})");
+        }
+        assert!(!d.pending());
+        // そこから変化すれば通常どおり K フレームで出荷。
+        assert_eq!(d.on_request(b), None);
+        assert!(d.pending(), "変化直後は未出荷 (draw が再描画を要求する印)");
+        assert_eq!(d.on_request(b), Some(b));
+        assert!(!d.pending());
+    }
+
+    fn resize_probe_session(id: u64) -> Session {
+        // リサイズの間 PTY を生かしておくだけの静かな子。
+        #[cfg(windows)]
+        let command = "powershell -NoProfile -Command \"Start-Sleep -Seconds 30\"".to_string();
+        #[cfg(not(windows))]
+        let command = "/bin/sh -c 'sleep 30'".to_string();
+        Session::spawn(
+            id,
+            SpawnSpec {
+                title: "resize".into(),
+                preset_name: "resize".into(),
+                icon: "r".into(),
+                command,
+                cwd: std::env::temp_dir(),
+                env: HashMap::new(),
+                log_path: None,
+            },
+            egui::Context::default(),
+        )
+        .expect("PTY起動")
+    }
+
+    /// 実 PTY: リサイズの嵐が呼び出し側 (UI スレッド相当) を待たせないこと、
+    /// それでも最終サイズは PTY まで必ず届くこと。修正前はこのループが
+    /// 1 発ごとに ConPTY への同期 RPC (`ResizePseudoConsole`) を撃っていた。
+    #[test]
+    fn resize_storm_neither_blocks_the_caller_nor_loses_the_final_size() {
+        let mut s = resize_probe_session(9401);
+        let t0 = Instant::now();
+        for i in 0..100u16 {
+            let (rows, cols) = (10 + i % 17, 40 + i % 29);
+            // 同じサイズを K フレームぶん要求し、毎回ワーカーへの出荷まで起こす
+            // (変化だけを 100 回並べると安定せず 1 発も出荷されないため)。
+            for _ in 0..RESIZE_STABLE_FRAMES {
+                s.resize(rows, cols);
+            }
+        }
+        let (frows, fcols) = (24u16, 100u16);
+        for _ in 0..RESIZE_STABLE_FRAMES {
+            s.resize(frows, fcols);
+        }
+        let elapsed = t0.elapsed();
+        // 修正前は 101 回の同期 RPC がここに乗っていた。呼び出し側は
+        // サイズの上書きと通知しかしないので、詰まりようがない。
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "リサイズの呼び出し側がブロックした: {elapsed:?}"
+        );
+        // 描画グリッド (vt100) は即時に最終サイズ。
+        assert_eq!(
+            lock_ok(&s.parser).screen().size(),
+            (frows, fcols),
+            "vt100 が要求サイズに即時追従していない"
+        );
+        // PTY 本体にも水面下で最終サイズが届く (取りこぼし禁止)。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while s.pty_size() != Some((frows, fcols)) {
+            assert!(
+                Instant::now() < deadline,
+                "最終サイズが PTY へ届かない: {:?}",
+                s.pty_size()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        s.kill();
     }
 }
