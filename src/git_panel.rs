@@ -2569,6 +2569,11 @@ bare
             std::fs::remove_dir_all(&dir).ok();
             return None;
         }
+        // Windows の既定では core.autocrlf=true のため checkout で LF が CRLF に
+        // 書き換わり、「作業ツリーが HEAD に戻る」検証がバイト比較で落ちる。
+        // テストの意図は改行変換ではなく git の状態遷移なので固定する。
+        git_ok(&dir, &["config", "core.autocrlf", "false"]);
+        git_ok(&dir, &["config", "core.eol", "lf"]);
         std::fs::write(dir.join("keep.rs"), "fn main() {}\n").ok()?;
         std::fs::create_dir_all(dir.join("src/deep")).ok()?;
         std::fs::write(dir.join("src/deep/mod.rs"), "// one\n// two\n").ok()?;

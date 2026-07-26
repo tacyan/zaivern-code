@@ -746,6 +746,20 @@ pub fn file_url_to_path(url: &str) -> Option<PathBuf> {
     } else {
         return None;
     };
+    // Windows のアプリは file://C:\dir\a.png のように区切りが `\` の URL を
+    // 吐くことがある。RFC 的には不正だが実在するので受け付ける。
+    let normalized;
+    let rest: &str = if rest.contains('\\') {
+        normalized = rest.replace('\\', "/");
+        &normalized
+    } else {
+        rest
+    };
+    // ドライブ文字直結 (file://C:/…) はホスト部ではなくパスとして扱う
+    let b0 = rest.as_bytes();
+    if b0.len() >= 2 && b0[0].is_ascii_alphabetic() && b0[1] == b':' {
+        return Some(PathBuf::from(percent_decode(rest)));
+    }
     // file://host/path のホスト部は捨てる (localhost / 空のみ想定)
     let path = match rest.find('/') {
         Some(0) => rest,
