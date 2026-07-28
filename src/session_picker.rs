@@ -33,9 +33,9 @@
 //! // 1) 状態は App のフィールドに 1 つ持つ (Default で良い)
 //! //    sidebar_sessions: session_picker::SidebarState,
 //! //
-//! // 2) フォルダ一覧は「開いているルート → MRU (重複除去)」の順で作る
-//! let folders = session_picker::sidebar_folders(&self.open_roots, &recent::load().folders());
-//! //    ※ is_dir() を見るので毎フレームではなく、ルート/MRU が変わったときに作り直す
+//! // 2) フォルダ一覧は「いま開いているルートだけ」(重複除去)
+//! let folders = session_picker::sidebar_folders(&self.open_roots);
+//! //    ※ is_dir() を見るので毎フレームではなく、ルートが変わったときに作り直す
 //! //
 //! // 3) 左サイドバーの「セッション」タブの中身として呼ぶ
 //! match panels::sessions_sidebar_ui(ui, &self.theme, &mut self.sidebar_sessions, &folders) {
@@ -1346,15 +1346,18 @@ pub const MAX_SIDEBAR_FOLDERS: usize = 16;
 
 /// サイドバーのフォルダ順を決める。
 ///
-/// 1. いま開いているルート (`open_roots`) を与えられた順で先頭に置く。
-/// 2. その後ろに MRU (`recent`) を順に置く。既に出たフォルダは足さない。
-/// 3. 実在しないディレクトリは落とす (消えたフォルダの見出しを残さない)。
-/// 4. [`MAX_SIDEBAR_FOLDERS`] 件で打ち切る。
+/// 対象は **いま開いているワークスペースのルートだけ**。MRU や、同じリポジトリの
+/// 他ブランチ (worktree) は混ぜない — 「開いているフォルダで交わした会話だけが
+/// 出る」という一本の規則にするため (VS Code の Claude Code 拡張と同じ切り方)。
+///
+/// 1. `open_roots` を与えられた順に置く。同じフォルダは 1 度だけ。
+/// 2. 実在しないディレクトリは落とす (消えたフォルダの見出しを残さない)。
+/// 3. [`MAX_SIDEBAR_FOLDERS`] 件で打ち切る。
 ///
 /// `is_dir` を見るので毎フレームではなく「フォルダ集合が変わったとき」に呼ぶこと。
-pub fn sidebar_folders(open_roots: &[PathBuf], recent: &[PathBuf]) -> Vec<PathBuf> {
+pub fn sidebar_folders(open_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for p in open_roots.iter().chain(recent.iter()) {
+    for p in open_roots.iter() {
         if out.len() >= MAX_SIDEBAR_FOLDERS {
             break;
         }
@@ -1366,105 +1369,6 @@ pub fn sidebar_folders(open_roots: &[PathBuf], recent: &[PathBuf]) -> Vec<PathBu
         }
         out.push(p.clone());
     }
-    out
-}
-
-// ══════════════ リポジトリ単位のグルーピング (worktree をまたぐ) ══════════════
-//
-// ブランチごとに worktree を分ける運用だと、ブランチを切り替えた瞬間に
-// 「フォルダが変わった」ことになり、それまでの会話が一覧から消えてしまう。
-// そこで **同じリポジトリに属する worktree すべて** を並べ、ブランチ
-// (取れなければ worktree のフォルダ名) を見出しにする。
-//
-// リポジトリの同一性は `git::repo_key` (= `rev-parse --git-common-dir`) で
-// 見る。本体 worktree でもリンク worktree でも同じ値になるのが要点。
-
-/// サイドバーの 1 グループ (= 1 つの worktree フォルダ)。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FolderGroup {
-    pub folder: PathBuf,
-    /// そのフォルダのブランチ。取れないときは `None` (フォルダ名で見出しにする)。
-    pub branch: Option<String>,
-    /// そのフォルダの過去セッション数。
-    pub count: usize,
-    /// いま開いているフォルダか (先頭・展開状態にする)。
-    pub current: bool,
-}
-
-impl FolderGroup {
-    /// 見出しに出す名前。ブランチ名が取れればそちら、無ければフォルダ名。
-    pub fn label(&self) -> String {
-        match &self.branch {
-            Some(b) if !b.is_empty() => b.clone(),
-            _ => self
-                .folder
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| self.folder.display().to_string()),
-        }
-    }
-}
-
-/// リポジトリ全体を見るときのフォルダ順。
-///
-/// 1. いま開いているフォルダ (`current`) を必ず先頭に置く。
-/// 2. その後ろに他の開いているルート → 同じリポジトリの worktree → MRU。
-/// 3. 実在しないディレクトリは黙って落とす (消えた worktree の見出しを残さない)。
-/// 4. [`MAX_SIDEBAR_FOLDERS`] 件で打ち切る。
-///
-/// `sidebar_folders` と同じく `is_dir()` を叩くので、毎フレームではなく
-/// 「もとの集合が変わったとき」だけ呼ぶこと。
-pub fn repo_sidebar_folders(
-    current: &Path,
-    open_roots: &[PathBuf],
-    worktrees: &[PathBuf],
-    recent: &[PathBuf],
-) -> Vec<PathBuf> {
-    let head = [current.to_path_buf()];
-    let all = head
-        .iter()
-        .chain(open_roots.iter())
-        .chain(worktrees.iter())
-        .chain(recent.iter());
-    let mut out: Vec<PathBuf> = Vec::new();
-    for p in all {
-        if out.len() >= MAX_SIDEBAR_FOLDERS {
-            break;
-        }
-        if p.as_os_str().is_empty() || out.iter().any(|q| same_dir(q, p)) {
-            continue;
-        }
-        if !p.is_dir() {
-            continue;
-        }
-        out.push(p.clone());
-    }
-    out
-}
-
-/// 表示用のグループ列 (**純関数**。ファイルシステムには触らない)。
-///
-/// 並びは `folders` のまま。ただし現在のフォルダが混ざっていれば必ず先頭へ出す。
-pub fn folder_groups(
-    folders: &[PathBuf],
-    current: &Path,
-    branches: &HashMap<PathBuf, String>,
-    counts: &HashMap<PathBuf, usize>,
-) -> Vec<FolderGroup> {
-    let mut out: Vec<FolderGroup> = folders
-        .iter()
-        .map(|f| FolderGroup {
-            folder: f.clone(),
-            branch: branches
-                .get(f)
-                .filter(|b| !b.trim().is_empty())
-                .cloned(),
-            count: counts.get(f).copied().unwrap_or(0),
-            current: same_dir(f, current),
-        })
-        .collect();
-    // 現在のフォルダは常に先頭 (安定ソート = 残りの順は保たれる)。
-    out.sort_by_key(|g| !g.current);
     out
 }
 
@@ -1518,12 +1422,6 @@ pub struct SidebarState {
     /// 走査に使うホーム。`None` なら `dirs::home_dir()` (本番はこちら)。
     /// テストは [`SidebarState::with_home`] で一時ディレクトリを差し込む。
     home: Option<PathBuf>,
-    /// 既定の畳み方をもう当てたフォルダ。**一度きり**にするための記録で、
-    /// ユーザーが開いた/畳んだ状態を毎フレーム上書きしないためにある。
-    defaulted: HashSet<PathBuf>,
-    /// 既定を当てたときの「いまのフォルダ」。ここが変わる = ブランチを
-    /// 切り替えた、なので新しいカレントだけ開き直す。
-    defaulted_current: Option<PathBuf>,
 }
 
 impl Default for SidebarState {
@@ -1538,8 +1436,6 @@ impl Default for SidebarState {
             ttl: SIDEBAR_TTL,
             scroll: 0.0,
             home: None,
-            defaulted: HashSet::new(),
-            defaulted_current: None,
         }
     }
 }
@@ -1671,33 +1567,6 @@ impl SidebarState {
             self.collapsed.insert(folder.to_path_buf());
             // 畳んだら「すべて表示」も解除する (開き直したときに元の高さへ戻す)。
             self.show_all.remove(folder);
-        }
-    }
-
-    /// 初めて見るフォルダに既定の畳み方を当てる。
-    ///
-    /// 「いま開いているフォルダのグループは開き、他のブランチ/worktree の
-    /// グループは畳む」。**一度きり**なので、ユーザーが開いた状態は次の
-    /// フレームで畳み直されない。
-    pub fn apply_default_collapse(&mut self, folders: &[PathBuf], current: &Path) {
-        // ブランチを切り替えて「いまのフォルダ」が変わったら、その 1 つは必ず開く
-        // (畳まれたまま出てくると、切り替えた先の会話が見えない)。
-        let moved = self
-            .defaulted_current
-            .as_deref()
-            .map(|p| !same_dir(p, current))
-            .unwrap_or(true);
-        if moved {
-            self.defaulted_current = Some(current.to_path_buf());
-            self.collapsed.retain(|p| !same_dir(p, current));
-        }
-        for f in folders {
-            if !self.defaulted.insert(f.clone()) {
-                continue;
-            }
-            if !same_dir(f, current) {
-                self.collapsed.insert(f.clone());
-            }
         }
     }
 
@@ -2689,143 +2558,35 @@ mod sidebar_tests {
     // ── フォルダの並び ───────────────────────────────────────────
 
     #[test]
-    fn sidebar_folders_open_roots_first_dedup_and_drop_missing() {
+    fn sidebar_folders_keeps_open_roots_only_dedup_and_drop_missing() {
         let tmp = unique_temp_dir("zaivern-sidebar", "folders");
         let mk = |n: &str| {
             let p = tmp.join(n);
             std::fs::create_dir_all(&p).unwrap();
             p
         };
-        let (a, b, c, d) = (mk("a"), mk("b"), mk("c"), mk("d"));
+        let (a, b) = (mk("a"), mk("b"));
         let gone = tmp.join("gone");
 
-        // 開いているルートが先、その後ろに MRU。重複は落とす。
-        let got = sidebar_folders(&[a.clone(), b.clone()], &[c.clone(), a.clone(), d.clone()]);
-        assert_eq!(got, vec![a.clone(), b.clone(), c.clone(), d.clone()]);
+        // 開いているルートを与えられた順にそのまま
+        assert_eq!(sidebar_folders(&[a.clone(), b.clone()]), vec![a.clone(), b.clone()]);
 
-        // 実在しないディレクトリは両側とも落ちる
-        let got = sidebar_folders(&[gone.clone(), a.clone()], &[gone.clone(), b.clone()]);
-        assert_eq!(got, vec![a.clone(), b.clone()]);
+        // 実在しないディレクトリは落ちる
+        assert_eq!(sidebar_folders(&[gone.clone(), a.clone()]), vec![a.clone()]);
 
-        // 末尾区切り違いも同一視する
+        // 重複と末尾区切り違いは同一視する
         let a_slash = PathBuf::from(format!("{}{}", a.display(), std::path::MAIN_SEPARATOR));
-        let got = sidebar_folders(std::slice::from_ref(&a), &[a_slash]);
-        assert_eq!(got, vec![a.clone()]);
+        assert_eq!(sidebar_folders(&[a.clone(), a_slash]), vec![a.clone()]);
 
         // 上限
         let many: Vec<PathBuf> = (0..MAX_SIDEBAR_FOLDERS + 5)
             .map(|i| mk(&format!("m{i}")))
             .collect();
-        assert_eq!(sidebar_folders(&many, &[]).len(), MAX_SIDEBAR_FOLDERS);
+        assert_eq!(sidebar_folders(&many).len(), MAX_SIDEBAR_FOLDERS);
 
         // 全部空
-        assert!(sidebar_folders(&[], &[]).is_empty());
+        assert!(sidebar_folders(&[]).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    // ── リポジトリ全体 (worktree をまたぐ) の並びとグループ ────────────
-
-    /// いまのフォルダが先頭・重複除去・消えた worktree は落ちる・上限で切る。
-    #[test]
-    fn repo_folders_put_current_first_and_drop_missing() {
-        let tmp = unique_temp_dir("zaivern-sidebar", "repo-folders");
-        let mk = |n: &str| {
-            let p = tmp.join(n);
-            std::fs::create_dir_all(&p).unwrap();
-            p
-        };
-        let (main, night, feat, other) = (mk("main"), mk("night"), mk("feat"), mk("other-repo"));
-        let gone = tmp.join("removed-worktree");
-
-        // current が MRU の後ろにいても必ず先頭へ来る
-        let got = repo_sidebar_folders(
-            &night,
-            &[main.clone()],
-            &[main.clone(), night.clone(), feat.clone(), gone.clone()],
-            &[other.clone(), night.clone()],
-        );
-        assert_eq!(
-            got,
-            vec![night.clone(), main.clone(), feat.clone(), other.clone()],
-            "current → 開いているルート → worktree → MRU の順。消えた worktree は落ちる"
-        );
-
-        // 上限で切る
-        let many: Vec<PathBuf> = (0..MAX_SIDEBAR_FOLDERS + 6)
-            .map(|i| mk(&format!("w{i}")))
-            .collect();
-        assert_eq!(
-            repo_sidebar_folders(&main, &[], &many, &[]).len(),
-            MAX_SIDEBAR_FOLDERS
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// グループ化: ブランチ名を見出しに、件数は走査結果から、current が先頭。
-    #[test]
-    fn folder_groups_label_count_and_current_first() {
-        let main = PathBuf::from("/ws/repo");
-        let night = PathBuf::from("/ws/repo/.wt/night-2026-07-26");
-        let nameless = PathBuf::from("/ws/repo/.wt/detached-one");
-
-        let mut branches = HashMap::new();
-        branches.insert(main.clone(), "main".to_string());
-        branches.insert(night.clone(), "night/2026-07-26".to_string());
-        branches.insert(nameless.clone(), "   ".to_string()); // 取得中 / 不明
-
-        let mut counts = HashMap::new();
-        counts.insert(main.clone(), 12);
-        counts.insert(night.clone(), 3);
-
-        let groups = folder_groups(
-            &[main.clone(), night.clone(), nameless.clone()],
-            &night,
-            &branches,
-            &counts,
-        );
-        assert_eq!(
-            groups.iter().map(|g| g.folder.clone()).collect::<Vec<_>>(),
-            vec![night.clone(), main.clone(), nameless.clone()],
-            "現在のブランチのグループが先頭 (残りの順は保たれる)"
-        );
-        assert!(groups[0].current && !groups[1].current);
-        assert_eq!(groups[0].label(), "night/2026-07-26");
-        assert_eq!(groups[0].count, 3);
-        assert_eq!(groups[1].label(), "main");
-        assert_eq!(groups[1].count, 12);
-        assert_eq!(
-            groups[2].label(),
-            "detached-one",
-            "ブランチが分からなければ worktree のフォルダ名で見出しにする"
-        );
-        assert_eq!(groups[2].count, 0, "走査結果が無いグループは 0 件");
-    }
-
-    /// 既定の畳み方は「いまのフォルダだけ開く」。ユーザー操作は上書きしない。
-    #[test]
-    fn default_collapse_opens_only_current_and_respects_user() {
-        let main = PathBuf::from("/ws/repo");
-        let night = PathBuf::from("/ws/repo/.wt/night");
-        let feat = PathBuf::from("/ws/repo/.wt/feat");
-        let folders = vec![main.clone(), night.clone(), feat.clone()];
-
-        let mut st = SidebarState::default();
-        st.apply_default_collapse(&folders, &main);
-        assert!(!st.is_collapsed(&main), "いまのフォルダは開いている");
-        assert!(st.is_collapsed(&night) && st.is_collapsed(&feat), "他は畳む");
-
-        // ユーザーが開いたら、次のフレームで畳み直さない
-        st.toggle_collapsed(&night);
-        st.apply_default_collapse(&folders, &main);
-        assert!(!st.is_collapsed(&night), "ユーザーが開いた状態を維持する");
-
-        // ブランチを切り替えて current が変わったら、その 1 つは必ず開く
-        st.toggle_collapsed(&night); // 畳み直しておく
-        assert!(st.is_collapsed(&night));
-        st.apply_default_collapse(&folders, &night);
-        assert!(!st.is_collapsed(&night), "切り替えた先は開く");
-        assert!(st.is_collapsed(&feat), "他はそのまま");
     }
 
     /// 走査結果は **フォルダごとに分かれて** キャッシュされる。

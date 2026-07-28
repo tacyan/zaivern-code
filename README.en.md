@@ -61,7 +61,7 @@ A large update after fifteen 0.4.x patches ([release notes](https://github.com/t
 
 - **Vertical agent deck** (`⌘⇧L`) — running agents only, in a single column. Together with the Cockpit and the board, you can pick the shape that fits the moment. **Terminal splits** landed too.
 - **The board now has 8 lanes** — thinking / editing / running / verifying are all visible, so you never have to guess whether an agent is working or stuck. The live pane goes fullscreen.
-- **Branch switching and cross-branch sessions** — switch from the toolbar; a branch held by another worktree, an in-progress merge, or uncommitted changes stop the switch with the reason spelled out (**no `git stash`** — the stash stack is shared across worktrees). Sessions list across branches.
+- **Branch switching** — switch from the toolbar; a branch held by another worktree, an in-progress merge, or uncommitted changes stop the switch with the reason spelled out (**no `git stash`** — the stash stack is shared across worktrees). The session list only ever covers the folder you have open, so moving between branches never changes what you see.
 - **The editor reaches VS Code parity** — full LSP, multiple carets / block selection, folding / guides / sticky headers, regex and glob bulk replace, Emmet, images / PDF / CSV / huge files, and a Markdown preview that renders Mermaid diagrams and TeX math.
 - **Paste images straight in** — `⌘V` / `Ctrl+V`, in every composer in the Cockpit and the deck.
 - **Idle CPU 0.70% → 0.13%** (0.03% unfocused). Repaints are damage-driven only.
@@ -202,14 +202,14 @@ Everything below is the manual for each instrument on the flight deck.
 - **Rate-limit detection (⏳)**: warnings like `usage limit reached` are detected on screen and surfaced as a badge + notification. **A rate-limited session is never assigned new tasks**; it rejoins automatically once the limit clears
 - **Account/profile switching**: put `CLAUDE_CONFIG_DIR` / `CODEX_HOME` etc. in a preset's `env` to run **the same CLI under different accounts (subscriptions) in parallel** (a leading `~/` in values expands to your home directory)
 - **📜 Persistent terminal logs**: each session's raw output is kept under `~/.zaivern/term_logs/` (4 MB rotation, newest 40 files), and the 📜 menu on the terminal panel reopens last session's log — "how far did it get last night?" survives a restart
-- **💬 Chat history saved per folder, and resumed**: reopen a folder and **your agent tabs come back**. The previous scrollback (up to the last 1 MB) is replayed into the terminal, a `── 前回のセッションここまで / 再開します ──` divider is drawn, and the live session picks up from there. **claude is relaunched with `--continue` and codex with `resume --last`**, so the conversation on the CLI side continues too (agents with no resume flag simply start fresh). A toast confirms how many sessions came back. Set `restore_agents = false` in `config.toml` to switch the whole thing off — no tabs are recreated at all. **Environment variables are deliberately not persisted** (they can hold secrets); they are re-read from the matching preset in your current config
+- **💬 Chat history is resumed only when you ask for it**: launching Zaivern starts **nothing** on its own. The single way back into an earlier conversation is the 💬 sessions tab. Set `restore_agents = true` in `config.toml` and the old behaviour returns: previous agent tabs are recreated, the last 1 MB of scrollback is replayed behind a `── 前回のセッションここまで / 再開します ──` divider, and **claude is relaunched with `--continue`, codex with `resume --last`**. **Environment variables are deliberately not persisted** (they can hold secrets); they are re-read from the matching preset in your current config
 - **✉ A multiline composer per agent**: the input box under the Cockpit is addressed to one agent, and **Enter inserts a newline — ⌘ (Ctrl on Windows / Linux) + Enter sends**. Drafts are kept per recipient, so a half-written review no longer flies off to everyone the moment you press Enter
-- **📂 Past-session sidebar / 📊 plan usage**: pick a session claude or codex left behind and **resume it in that folder** (`--continue` / `resume` are added for you). The status bar carries a usage estimate; click it for the breakdown (per account, measured values marked apart from projections, plus a run-out estimate). The tally is computed entirely offline
+- **💬 Past-session sidebar / 📊 plan usage**: pick a session claude or codex left behind and **resume it in that folder** (`--resume <id>` is added for you). The list shows **only conversations held in the folder you have open** — there is no per-branch (worktree) grouping, so the list stays the same for as long as the folder does (the same scoping the VS Code Claude Code extension uses). The status bar carries a usage estimate; click it for the breakdown (per account, measured values marked apart from projections, plus a run-out estimate). The tally is computed entirely offline
 - **🔢 Numbered menus and surveys don't stall you**: prompts like `1. Yes` or `Select an option [1-3]:` are detected and answered automatically (skip → affirmative → most-positive end of a rating scale). The fact that it answered is recorded as "auto-answered the survey: n" in the session events and the audit log. Meaningful open choices and privilege escalation are never auto-answered — they surface as pending approvals instead
 - **📋 Paste a clipboard image straight in**: press **⌘V** (**Ctrl+V** on Windows / Linux) in an agent terminal. If the clipboard holds an image it is written as a PNG into `zaivern-clip/` in your temp directory and `@path` lands in the input box — **nothing is submitted**. If the clipboard holds text, normal text paste wins as before, so nothing you already do changes. Saved PNGs are pruned automatically to the newest 24
 
 ### 📋 Fleet board — eight lanes, everyone's "right now"
-**⌘⇧K** (the "フリート看板" menu item, or the "📋 看板" tab at the top). Every running agent becomes a card, sorted into the lane matching its state, under KPI tiles for running / working / needs-you / done.
+**⌘⇧K** (the "フリート看板" menu item, or the "📋 看板" tab at the top). Every running agent becomes a card, sorted into the lane matching its state, under KPI tiles for running / working / needs-you / done. It is a **full-window centre view**, on par with the Cockpit and the deck.
 
 - Eight lanes: **idle / thinking / editing / running / verifying / waiting for approval / stalled-or-broken / finished**. A card must hold a new state for 400 ms before it moves (approval, stalls, and completion move instantly), and it glows briefly when it lands
 - Each card carries: an activity chip, how long the current state has lasted, the file it touched most recently, the last command, the newest output line, and an output pulse for the last 30 seconds
@@ -420,7 +420,7 @@ On top of that, you can hand the question code is bad at — *"okay, so what's t
 - **The commander can keep doing normal work.** You don't have to burn a slot on supervision alone
 
 ### 💾 Session restore
-On restart, the previous tabs, active tab, and panel state are restored automatically per workspace (`~/.zaivern/sessions/`). Agent tabs come back too — scrollback and all — while `restore_agents` (default `true`) is on.
+On restart, the previous tabs, active tab, and panel state are restored automatically per workspace (`~/.zaivern/sessions/`). Agent tabs are **not** brought back unless you opt in with `restore_agents = true` (default `false`).
 
 **The folder comes back as well.** Start `zai` with no folder argument and it walks the most-recently-used list in `~/.zaivern/menu_state.toml` and reopens **the first entry that still exists**. To always start in the current directory instead, use `zai --no-restore` or `ZAIVERN_NO_RESTORE=1`.
 
@@ -590,7 +590,7 @@ show_hidden_files = true
 # When you reopen a folder, restore the previous agent tabs and pick the
 # conversation back up (previous scrollback is replayed, then claude is
 # relaunched with --continue and codex with resume --last; false = don't restore)
-# restore_agents = true
+# restore_agents = false
 
 # Default permission mode (auto-applied to all 29 agents in the catalog)
 #   "ask"   = user approval required every time (safe, default)

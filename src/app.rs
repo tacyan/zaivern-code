@@ -1929,20 +1929,12 @@ pub struct ZaivernApp {
     /// 「セッション」タブ (フォルダごとの過去の会話) の表示状態 + 走査キャッシュ。
     /// 走査はこの中でバックグラウンドスレッドへ逃がされる。
     sidebar_sessions: session_picker::SidebarState,
-    /// セッションタブに出すフォルダ一覧。`sidebar_folders` は `is_dir()` を叩くので
-    /// 毎フレームは作り直さず、元になる「ルート + MRU」が変わったときだけ作り直す。
+    /// セッションタブに出すフォルダ一覧 (= いま開いているワークスペースのルート)。
+    /// `sidebar_folders` は `is_dir()` を叩くので毎フレームは作り直さず、
+    /// 元になるルートが変わったときだけ作り直す。
     sess_folders: Vec<PathBuf>,
-    /// `sess_folders` を作った元 (ルート + MRU + worktree)。変化検知用。
+    /// `sess_folders` を作った元 (ルート)。変化検知用。
     sess_folders_src: Vec<PathBuf>,
-    /// いま開いているリポジトリの worktree 一覧 (ブランチをまたいでも会話を
-    /// 見せるための材料)。git は裏で叩き、届いたら貼る。
-    repo_worktrees: Vec<PathBuf>,
-    /// `repo_worktrees` を取ったルートと取得時刻 (TTL 再取得用)。
-    repo_worktrees_at: Option<(PathBuf, Instant)>,
-    /// 取得中フラグ (同じルートへ二重に投げない)。
-    repo_worktrees_pending: bool,
-    repo_worktrees_tx: mpsc::Sender<(PathBuf, Vec<PathBuf>)>,
-    repo_worktrees_rx: mpsc::Receiver<(PathBuf, Vec<PathBuf>)>,
     /// ツールバーのブランチボタン (一覧・切り替え。git は全て裏で回す)。
     branch_nav: git::BranchNav,
     file_index: Vec<IndexedFile>,
@@ -2448,8 +2440,6 @@ impl ZaivernApp {
         }
         // デッキの副題 (ブランチ) を裏で解決するための口。
         let (deck_branch_tx, deck_branch_rx) = mpsc::channel();
-        // リポジトリの worktree 一覧 (セッション一覧をブランチ横断にする材料)。
-        let (repo_worktrees_tx, repo_worktrees_rx) = mpsc::channel();
         let primary_root = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
         let mut app = Self {
             tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
@@ -2519,11 +2509,6 @@ impl ZaivernApp {
             sidebar_sessions: session_picker::SidebarState::default(),
             sess_folders: Vec::new(),
             sess_folders_src: Vec::new(),
-            repo_worktrees: Vec::new(),
-            repo_worktrees_at: None,
-            repo_worktrees_pending: false,
-            repo_worktrees_tx,
-            repo_worktrees_rx,
             branch_nav: git::BranchNav::new(primary_root.clone()),
             file_index: Vec::new(),
             index_at: None,
@@ -2748,9 +2733,6 @@ impl ZaivernApp {
         // ブランチピッカーも新しいリポジトリへ。旧 repo の一覧が残っていると、
         // そこに無いブランチへの切り替えを発行できてしまう。
         self.branch_nav.set_repo(self.primary_root().to_path_buf());
-        // 別リポジトリを開いたら worktree 一覧も引き継がない
-        self.repo_worktrees.clear();
-        self.repo_worktrees_at = None;
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
         self.tree.show_hidden = self.cfg.show_hidden_files;
@@ -4684,175 +4666,36 @@ impl ZaivernApp {
 
     /// セッションタブのフォルダ一覧を必要なときだけ作り直す。
     ///
+    /// 対象は **いま開いているワークスペースのルートだけ**。MRU も他ブランチの
+    /// worktree も混ぜない (VS Code の Claude Code 拡張と同じ切り方: 開いている
+    /// フォルダで交わした会話だけが出る)。
+    ///
     /// [`session_picker::sidebar_folders`] は `is_dir()` を叩く = ファイルシステムに
-    /// 触るので、毎フレームは呼ばない。元になる「開いているルート + MRU」が
-    /// 変わったときだけ作り直す (走査そのものは SidebarState 側がスレッドへ逃がす)。
+    /// 触るので毎フレームは呼ばない。ルートが変わったときだけ作り直す
+    /// (走査そのものは SidebarState 側がスレッドへ逃がす)。
     fn refresh_session_folders(&mut self) {
         // 変化の判定には **fs を叩かない** 生の値だけを使う。
-        // `MenuState::folders()` は is_dir() を叩くので、ここでは呼ばない
-        // (呼ぶのは「変わった」と分かった後の 1 回だけ)。
-        let repo_wide = self.cfg.sessions_repo_wide;
-        // worktree 一覧はセッションタブを **見ているときだけ** 取り直す。
-        // 誰も見ていない一覧のために git を起動しない (アイドルのコストは 0)。
-        if repo_wide && self.sidebar_open && self.sidebar_tab == SidebarTab::Sessions {
-            self.poll_repo_worktrees();
-        }
-        let mut src: Vec<PathBuf> = self.roots.clone();
-        src.extend(self.menu_state.recent_folders.iter().map(PathBuf::from));
-        // 表示範囲そのものが変わったときも作り直す (fs を叩かない目印を混ぜる)。
-        src.push(PathBuf::from(if repo_wide { "\u{0}repo" } else { "\u{0}folder" }));
-        if repo_wide {
-            src.extend(self.repo_worktrees.iter().cloned());
-        }
+        let src: Vec<PathBuf> = self.roots.clone();
         if src == self.sess_folders_src {
             return;
         }
-        let mru: Vec<PathBuf> = self
-            .menu_state
-            .recent_folders
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        self.sess_folders = if repo_wide {
-            session_picker::repo_sidebar_folders(
-                &self.primary_root().to_path_buf(),
-                &self.roots,
-                &self.repo_worktrees,
-                &mru,
-            )
-        } else {
-            session_picker::sidebar_folders(&self.roots, &mru)
-        };
+        self.sess_folders = session_picker::sidebar_folders(&self.roots);
         self.sess_folders_src = src;
         // 対象フォルダが変わった = 走査結果のキャッシュはもう当たらない
         self.sidebar_sessions.invalidate();
     }
 
-    /// いま開いているリポジトリの worktree 一覧を裏で取り直す。
-    ///
-    /// `git worktree list` はプロセス起動なので **UI スレッドでは回さない**。
-    /// 届くまでは空 (= 従来どおりこのフォルダだけ) で描き、届いたら増える。
-    fn poll_repo_worktrees(&mut self) {
-        /// worktree の増減はそう頻繁ではないので長めでよい。
-        const TTL: Duration = Duration::from_secs(30);
-        while let Ok((root, list)) = self.repo_worktrees_rx.try_recv() {
-            self.repo_worktrees_pending = false;
-            // 別のフォルダへ移った後に届いた古い結果は捨てる。
-            if root == *self.primary_root() {
-                self.repo_worktrees = list;
-                self.repo_worktrees_at = Some((root, Instant::now()));
-            }
-        }
-        let root = self.primary_root().to_path_buf();
-        let fresh = matches!(
-            &self.repo_worktrees_at,
-            Some((r, at)) if *r == root && at.elapsed() < TTL
-        );
-        if fresh || self.repo_worktrees_pending {
-            return;
-        }
-        // ルートが変わったら、前のリポジトリの worktree を引きずらない。
-        if self.repo_worktrees_at.as_ref().is_some_and(|(r, _)| *r != root) {
-            self.repo_worktrees.clear();
-            self.repo_worktrees_at = None;
-        }
-        self.repo_worktrees_pending = true;
-        let tx = self.repo_worktrees_tx.clone();
-        // 「同じリポジトリか」は開いているルートと MRU にも当てる。worktree
-        // 一覧に出ない (サブディレクトリを開いている等) フォルダも拾うため。
-        let mut candidates: Vec<PathBuf> = self.roots.clone();
-        candidates.extend(self.menu_state.recent_folders.iter().map(PathBuf::from));
-        let spawned = std::thread::Builder::new()
-            .name("zv-worktrees".into())
-            .spawn(move || {
-                let fam = git::scan_repo_family(&root, &candidates);
-                let mut list = fam.worktrees;
-                for r in fam.related {
-                    if !list.contains(&r) {
-                        list.push(r);
-                    }
-                }
-                let _ = tx.send((root, list));
-            });
-        if spawned.is_err() {
-            self.repo_worktrees_pending = false;
-        }
-    }
-
     /// 「💬 セッション」タブ。
     ///
-    /// 一覧そのものは `panels::sessions_sidebar_ui` が描く。ここが足すのは
-    /// - 表示範囲の切り替え (`このフォルダのみ` / リポジトリ全体)
-    /// - ブランチの索引: どの worktree がどのブランチで何件か。畳んだ
-    ///   グループの件数もここで分かり、押せば開閉できる。
+    /// 出すのは **いま開いているフォルダで交わした会話だけ**。ブランチ
+    /// (worktree) 別にまとめる表示は持たない — 同じフォルダを開いている限り
+    /// 一覧は常に同じ、という一本の規則にする (VS Code の Claude Code 拡張と同じ)。
     fn sidebar_sessions_ui(
         &mut self,
         ui: &mut egui::Ui,
         theme: &Theme,
     ) -> session_picker::SidebarAction {
-        let repo_wide = self.cfg.sessions_repo_wide;
         let folders = self.sess_folders.clone();
-        let current = self.primary_root().to_path_buf();
-
-        ui.horizontal(|ui| {
-            let mut only_here = !repo_wide;
-            let hit = ui
-                .checkbox(
-                    &mut only_here,
-                    RichText::new(tr("このフォルダのみ")).size(11.0),
-                )
-                .on_hover_text(tr(
-                    "オフ: 同じリポジトリの全ブランチ (worktree) の会話をまとめて出します",
-                ));
-            if hit.changed() {
-                self.cfg.sessions_repo_wide = !only_here;
-                config::save_state(&self.cfg);
-                // 次のフレームでフォルダ一覧を作り直させる
-                self.sess_folders_src.clear();
-                self.sidebar_sessions.invalidate();
-            }
-        });
-
-        if repo_wide && folders.len() > 1 {
-            // ブランチ名は deck と同じ TTL キャッシュ (git は裏で回る)。
-            let mut branches: HashMap<PathBuf, String> = HashMap::new();
-            for f in &folders {
-                let b = self.deck_branch_of(f);
-                branches.insert(f.clone(), b);
-            }
-            let counts: HashMap<PathBuf, usize> = folders
-                .iter()
-                .map(|f| (f.clone(), self.sidebar_sessions.sessions_for(f).len()))
-                .collect();
-            let groups = session_picker::folder_groups(&folders, &current, &branches, &counts);
-            let mut toggle: Option<PathBuf> = None;
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(4.0, 3.0);
-                for g in &groups {
-                    let open = !self.sidebar_sessions.is_collapsed(&g.folder);
-                    let color = if g.current { theme.accent } else { theme.text_dim };
-                    let text = format!("🌿 {} {}", g.label(), g.count);
-                    let hit = ui
-                        .add(
-                            egui::Button::new(RichText::new(text).size(10.5).color(color))
-                                .frame(open),
-                        )
-                        .on_hover_text(g.folder.display().to_string());
-                    if hit.clicked() {
-                        toggle = Some(g.folder.clone());
-                    }
-                }
-            });
-            if let Some(f) = toggle {
-                self.sidebar_sessions.toggle_collapsed(&f);
-            }
-            ui.add_space(2.0);
-            ui.separator();
-            // 既定は「いまのブランチのグループだけ開く」(一度きり)。
-            self.sidebar_sessions
-                .apply_default_collapse(&folders, &current);
-        }
-
         panels::sessions_sidebar_ui(ui, theme, &mut self.sidebar_sessions, &folders)
     }
 
@@ -7562,10 +7405,11 @@ impl ZaivernApp {
             Cmd::ToggleKanban => {
                 self.kanban = !self.kanban;
                 if self.kanban {
+                    // 看板は Cockpit / デッキと同格の中央画面。3 つ同時には出さない。
+                    // 下部端末パネルの開閉には触らない — 触ると閉じて開くだけで
+                    // パネルが勝手に開いた状態へ変わってしまう。
                     self.cockpit = false;
                     self.deck = false;
-                    // 看板はターミナルパネル内のタブなので、パネルごと出す
-                    self.agents.panel_open = true;
                 }
             }
             // エージェントデッキは Cockpit と同格の中央画面。3 つ同時には出さない。
@@ -8767,9 +8611,8 @@ impl ZaivernApp {
         self.git_panel.invalidate();
         self.review.invalidate();
         self.branch_nav.invalidate();
-        // ブランチが変われば worktree 構成もセッション一覧も見直す
-        self.repo_worktrees_at = None;
-        self.sess_folders_src.clear();
+        // ブランチが変わっても一覧の対象フォルダは同じ (このフォルダのみ) だが、
+        // 会話そのものは増減し得るので走査キャッシュだけ捨てる
         self.sidebar_sessions.invalidate();
     }
 
@@ -10621,10 +10464,11 @@ impl ZaivernApp {
         let theme = self.theme.clone();
         // デッキ表示中も畳む: 同じ端末を 2 か所で描かせない (egui の Id が衝突する)
         // うえ、デッキは端末を全高で見せる画面なので下部パネルは邪魔になる。
-        // 中央ビューが Cockpit / デッキのときは畳む (同じ端末を 2 か所で
+        // 中央ビューが Cockpit / デッキ / 看板のときは畳む (同じ端末を 2 か所で
         // 描かせない = egui の Id 衝突と絵の重なりを構造的に防ぐ)。
-        let show = self.agents.panel_open
-            && matches!(self.center, CenterView::Kanban | CenterView::Editor);
+        // 看板は「全エージェントを俯瞰する」画面なので、下部 300px の中ではなく
+        // 中央パネル全面に出す (下部パネルの中だと 1/3 しか見えなかった)。
+        let show = self.agents.panel_open && self.center == CenterView::Editor;
         let mut launch: Option<usize> = None;
         let mut restart: Option<usize> = None;
         let mut remove: Option<usize> = None;
@@ -10751,19 +10595,6 @@ impl ZaivernApp {
                         if ui.button("⌄").on_hover_text(tr("パネルを隠す (⌘J)")).clicked() {
                             self.agents.panel_open = false;
                         }
-                        // 看板タブ: パネルの中身を 端末 ⇄ フリート看板 で切り替える
-                        if ui
-                            .selectable_label(self.kanban, tr("📋 看板"))
-                            .on_hover_text(tr(
-                                "フリート看板 — 全エージェントの状況を俯瞰 (⌘⇧K)",
-                            ))
-                            .clicked()
-                        {
-                            self.kanban = !self.kanban;
-                            if self.kanban {
-                                self.approvals_view = false;
-                            }
-                        }
                         // 承認タブ: 統合承認キュー。待ち件数を数字で添える
                         // (0 件でもタブ自体は出す — どこにあるか分からなくなるため)
                         let n_pending = self.agents.approvals.pending_len();
@@ -10862,10 +10693,10 @@ impl ZaivernApp {
                 let font = self.cfg.terminal_font_size;
                 let want_focus = self.term_focus_pending;
                 // 予約を下ろすのは、この後で実際に端末を描くときだけ。
-                // 「📋 看板」タブ表示中やセッションが 0 件の間に消してしまうと、
+                // 「🛡 承認」タブ表示中やセッションが 0 件の間に消してしまうと、
                 // タブ切替やエージェントを閉じた直後のフォーカス要求が握り潰され、
                 // どこにも入力が届かなくなる。
-                if !self.kanban && !self.approvals_view && !self.agents.sessions.is_empty() {
+                if !self.approvals_view && !self.agents.sessions.is_empty() {
                     self.term_focus_pending = false;
                 }
                 if self.approvals_view {
@@ -10885,10 +10716,6 @@ impl ZaivernApp {
                         // 描画中に I/O はしない。控えを捨てて、描画後に読み直す。
                         self.approvals_audit_cache = None;
                     }
-                } else if self.kanban {
-                    // 「📋 看板」タブ: 端末の代わりにフリート看板を敷き詰める
-                    let ctx = ui.ctx().clone();
-                    self.kanban_ui(ui, &ctx);
                 } else if let Some(s) = self.agents.active_session() {
                     let resp = terminal::draw(ui, s, &theme, font, true, true, true);
                     // タブ選択でアクティブになった端末へ、その場でフォーカスを渡す。
@@ -11242,8 +11069,6 @@ impl ZaivernApp {
                 {
                     self.kanban = true;
                     self.cockpit = false;
-                    // 看板はターミナルパネル内のタブなので、パネルごと出す
-                    self.agents.panel_open = true;
                 }
                 if ui
                     .button(
@@ -18027,17 +17852,21 @@ impl ZaivernApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme_bg))
             .show(ctx, |ui| {
-                // 看板はここではなくターミナルパネル内の「📋 看板」タブで描く
-                // (terminal_panel 参照)。エディタと同時に見えるようにするため。
-                //
-                // デッキは選択したセッションの端末を**全高**で見せる画面なので、
-                // Cockpit と同じ中央パネル全面に描く (下部端末パネルは畳む)。
+                // 看板・デッキ・Cockpit はどれも「全エージェントを一望する」画面
+                // なので、中央パネル全面に描く (下部端末パネルは畳む)。看板を
+                // 下部パネルの中で描いていた頃は既定 300px しか使えず、画面の
+                // 1/3 にレーンが押し込まれていた。
                 // **ここで見るのは `self.center` だけ。** 生のフラグを見ると、
                 // 描画中に押された「看板」でフラグが変わり、同じフレームに
                 // 2 つのビューが描かれて重なる (実際に起きた不具合)。
                 if self.center == CenterView::Deck {
                     let ctx = ui.ctx().clone();
                     self.guarded_ui(Subview::Panel("deck"), ui, |me, ui| me.deck_ui(ui, &ctx));
+                } else if self.center == CenterView::Kanban {
+                    let ctx = ui.ctx().clone();
+                    self.guarded_ui(Subview::Panel("kanban"), ui, |me, ui| {
+                        me.kanban_ui(ui, &ctx)
+                    });
                 } else if self.center == CenterView::Cockpit {
                     let ctx = ui.ctx().clone();
                     // ファイルを開いていれば左に編集ペインを並べて出す。
@@ -18353,7 +18182,6 @@ impl ZaivernApp {
                 self.kanban = true;
                 self.cockpit = false;
                 self.deck = false;
-                self.agents.panel_open = true;
                 self.approvals_view = false;
             }
             TA::ShowDeck => {
@@ -23270,26 +23098,52 @@ mod ui_wiring_tests {
         );
     }
 
-    /// セッションタブの表示範囲トグルと、ブランチ索引の配線。
+    /// セッションタブは「いま開いているフォルダの会話」だけを出す。
+    ///
+    /// ブランチ (worktree) ごとにまとめる表示は**持たない**。同じフォルダを
+    /// 開いている限り一覧は常に同じ、という一本の規則にするため
+    /// (VS Code の Claude Code 拡張と同じ切り方)。
     #[test]
-    fn セッション一覧はリポジトリ全体を出せる() {
+    fn セッション一覧はこのフォルダだけを出す() {
         let src = &include_str!("app.rs").replace("\r\n", "\n");
         for needle in [
             "sess_action = self.sidebar_sessions_ui(ui, &theme);",
-            "tr(\"このフォルダのみ\")",
-            "self.cfg.sessions_repo_wide = !only_here;",
-            "config::save_state(&self.cfg);",
-            // リポジトリの同一性は --git-common-dir 由来のキーで見る
-            "let fam = git::scan_repo_family(&root, &candidates);",
-            "session_picker::repo_sidebar_folders(",
-            "session_picker::folder_groups(&folders, &current, &branches, &counts);",
-            ".apply_default_collapse(&folders, &current);",
+            "self.sess_folders = session_picker::sidebar_folders(&self.roots);",
         ] {
             assert!(src.contains(needle), "セッション一覧の配線が無い: {needle}");
         }
+        // ブランチ横断の表示範囲を復活させない (見た目には出にくいので形で固定)。
+        // 探すのは**製品コードだけ** — この検査自体が名前を書いているので、
+        // テストモジュールまで含めると必ず自分に当たってしまう。
+        let prod = src.split("\n#[cfg(test)]\nmod ").next().expect("製品コード");
+        for gone in [
+            "sessions_repo_wide",
+            "repo_sidebar_folders",
+            "folder_groups",
+            "apply_default_collapse",
+            "scan_repo_family",
+            "repo_worktrees",
+        ] {
+            assert!(
+                !prod.contains(gone),
+                "セッション一覧がブランチ単位に戻っている: {gone}"
+            );
+        }
+    }
+
+    /// 起動しただけでは前回のエージェントが立ち上がらない。
+    ///
+    /// 過去の会話へ戻る口は「💬 セッション」タブ (明示的に選んで再開) の 1 本。
+    #[test]
+    fn 前回のエージェントは既定で復元しない() {
         assert!(
-            config::Config::default().sessions_repo_wide,
-            "既定はリポジトリ全体 (ブランチを切り替えても会話が消えない)",
+            !config::Config::default().restore_agents,
+            "起動しただけで前回の会話が走り出してはいけない",
+        );
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        assert!(
+            src.contains("if self.cfg.restore_agents && !sess.agents.is_empty() {"),
+            "復元の入口が設定で切れる形になっていない"
         );
     }
 
@@ -23970,13 +23824,36 @@ mod cockpit_layout_tests {
         // 中央パネルの分岐がスナップショットを見ている
         assert!(
             src.contains("if self.center == CenterView::Deck {")
+                && src.contains("} else if self.center == CenterView::Kanban {")
                 && src.contains("} else if self.center == CenterView::Cockpit {"),
             "中央パネルの分岐が生のフラグを見ている"
         );
-        // 下部端末パネル (看板のホスト) も同じ値で判断している
+        // 下部端末パネルはエディタ表示のときだけ出す。看板・デッキ・Cockpit は
+        // 中央パネル全面を使う画面なので、下部パネルとは同時に描かない。
         assert!(
-            src.contains("matches!(self.center, CenterView::Kanban | CenterView::Editor)"),
+            src.contains("let show = self.agents.panel_open && self.center == CenterView::Editor;"),
             "端末パネルの表示判定が生のフラグを見ている"
+        );
+    }
+
+    /// 看板は中央パネル全面で描く (下部 300px の中に押し込めない)。
+    #[test]
+    fn 看板は中央パネル全面で描く() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        // 中央パネルに看板の描画口がある
+        assert!(
+            src.contains("me.kanban_ui(ui, &ctx)"),
+            "看板の描画口が中央パネルに無い"
+        );
+        // 端末パネル側には残っていない (2 か所で描くと egui の Id が衝突する)
+        let term = src
+            .split("fn terminal_panel(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("terminal_panel がある");
+        let term = &term[..term.find("\n    fn ").unwrap_or(term.len())];
+        assert!(
+            !term.contains("kanban_ui"),
+            "看板が端末パネルの中にも残っている"
         );
     }
 
@@ -24059,9 +23936,9 @@ mod deck_wiring_tests {
             .expect("terminal_panel がある");
         let head = &body[..body.find("let panel =").unwrap_or(body.len())];
         // 生のフラグではなく**このフレームの中央ビュー**で判断する。
-        // Kanban と Editor のときだけ出す = デッキ/Cockpit では畳む。
+        // Editor のときだけ出す = デッキ/Cockpit/看板では畳む。
         assert!(
-            head.contains("matches!(self.center, CenterView::Kanban | CenterView::Editor)"),
+            head.contains("let show = self.agents.panel_open && self.center == CenterView::Editor;"),
             "デッキを開いている間も端末パネルが出る配線になっている"
         );
     }
