@@ -55,6 +55,12 @@ On first launch a **26-step guided tour** walks you through the cockpit, highlig
 
 ---
 
+## 🆕 v0.5.1 — nothing moves just because you launched it
+
+- **The session list only shows conversations from the folder you have open** — the per-branch (worktree) grouping is gone. The list stays the same for as long as the folder does (the same scoping the VS Code Claude Code extension uses).
+- **Launching starts nothing** — restoring last session's agent tabs is now off by default. The single way back into an earlier conversation is the 💬 sessions tab (`restore_agents = true` brings the old behaviour back).
+- **The fleet board is full-window** — it used to be a tab inside the 300 px bottom panel; it is now a centre view on par with the Cockpit and the deck, so the 8 lanes are not squeezed into a third of the screen.
+
 ## 🆕 v0.5.0 — pick the shape of your command post
 
 A large update after fifteen 0.4.x patches ([release notes](https://github.com/tacyan/zaivern-code/releases/latest)).
