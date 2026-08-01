@@ -7,6 +7,7 @@ use eframe::egui::{self, Align2, Color32, FontId, RichText};
 
 use crate::agent_picker::{self, AgentPicker};
 use crate::agents::{self, AgentManager, SessionEvent};
+use crate::breadcrumb;
 use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
@@ -1853,6 +1854,36 @@ fn flatten_symbols(
     }
 }
 
+/// ブレッドクラムの 1 セグメント。押されたら true。
+fn breadcrumb_seg(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    kind: &breadcrumb::SegKind,
+) -> bool {
+    let color = match kind {
+        breadcrumb::SegKind::File(_) => theme.text,
+        _ => theme.text_dim,
+    };
+    let r = ui.add(
+        egui::Label::new(RichText::new(label).size(12.0).color(color))
+            .selectable(false)
+            .sense(egui::Sense::click()),
+    );
+    if r.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let hint = match kind {
+        breadcrumb::SegKind::Folder(p) => trf(
+            "{p} をエクスプローラーで開く",
+            &[("p", p.display().to_string())],
+        ),
+        breadcrumb::SegKind::File(_) => tr("ファイルパレットを開く"),
+        breadcrumb::SegKind::Symbol { .. } => tr("この定義へジャンプ"),
+    };
+    r.on_hover_text(hint).clicked()
+}
+
 pub struct ZaivernApp {
     cfg: Config,
     theme: Theme,
@@ -2010,6 +2041,13 @@ pub struct ZaivernApp {
     /// find バーのヒット数キャッシュ: (本文ハッシュ, query, ヒット数)。
     /// 本文ハッシュは last_text_hash を使い回し、新たな全文走査はしない
     find_count_cache: Option<(u64, String, usize)>,
+    /// ミニマップに出す検索ヒット行のキャッシュ: (本文ハッシュ, query, 行番号)。
+    /// find バーと同じ `last_text_hash` を鍵に使うので、新たな全文走査は
+    /// 検索語か本文が変わったときだけ起きる。
+    minimap_hits: Option<(u64, String, Vec<usize>)>,
+    /// ブレッドクラム用に documentSymbol を投げた記録: (パス, 本文ハッシュ, 時刻)。
+    /// 同じ内容へ二重に投げないためのデバウンス。
+    breadcrumb_symbols_asked: Option<(PathBuf, u64, Instant)>,
     /// スマホリモートサーバ (起動失敗時は None + remote_err)
     remote: Option<remote::RemoteServer>,
     remote_err: Option<String>,
@@ -2079,6 +2117,10 @@ pub struct ZaivernApp {
     lsp_symbols_busy: bool,
     lsp_symbols_query: String,
     lsp_symbols_path: Option<PathBuf>,
+    /// 直近の documentSymbol がブレッドクラムの背景更新か。
+    /// true の間は「見つかりませんでした」のトーストを出さない
+    /// (ユーザーが頼んでいない更新で通知を鳴らさないため)。
+    lsp_symbols_quiet: bool,
     /// リネームの進行状態
     lsp_rename: Option<RenameFlow>,
     /// 整形の要求元 (バッファ id, 整形後に保存するか)
@@ -2469,6 +2511,7 @@ impl ZaivernApp {
             lsp_symbols_busy: false,
             lsp_symbols_query: String::new(),
             lsp_symbols_path: None,
+            lsp_symbols_quiet: false,
             lsp_rename: None,
             lsp_format_buf: None,
             format_on_save: false,
@@ -2553,6 +2596,8 @@ impl ZaivernApp {
             last_scroll_y: 0.0,
             last_text_hash: 0,
             find_count_cache: None,
+            minimap_hits: None,
+            breadcrumb_symbols_asked: None,
             remote: None,
             remote_err: None,
             remote_open: false,
@@ -5956,6 +6001,55 @@ impl ZaivernApp {
             self.lsp_symbols_open = true;
             self.lsp_symbols_query.clear();
             self.lsp_symbols_path = Some(path);
+            self.lsp_symbols_quiet = false;
+        }
+    }
+
+    /// ブレッドクラムのシンボル階層を最新に保つための背景更新。
+    ///
+    /// **要求経路は `lsp_document_symbols` と同じ** `request_document_symbols` 1 本で、
+    /// 違うのは「ピッカーを開かない」「見つからなくても黙る」の 2 点だけ。
+    /// 同じ (パス, 本文ハッシュ) へは二重に投げず、失敗時も 700ms は再送しない。
+    /// LSP が無い / 非対応なら何もしない (ブレッドクラムのパス部分は消えない)。
+    fn request_breadcrumb_symbols(&mut self, path: &Path) {
+        // シンボルピッカーを開いている間は触らない (ユーザーの一覧を書き換えない)
+        if self.lsp_symbols_open || self.lsp_symbols_busy {
+            return;
+        }
+        let hash = self.last_text_hash;
+        if hash == 0 {
+            return; // まだ本文を 1 度も描いていない
+        }
+        let now = Instant::now();
+        if let Some((p, h, at)) = &self.breadcrumb_symbols_asked {
+            if p == path && *h == hash {
+                return;
+            }
+            if now.duration_since(*at) < Duration::from_millis(700) {
+                return;
+            }
+        }
+        let Some((key, target)) = self.active_lsp_target() else {
+            return;
+        };
+        if target != path {
+            return;
+        }
+        let Some(c) = self.lsp.get(&key) else {
+            return;
+        };
+        if !c.caps().document_symbol {
+            return;
+        }
+        if c.request_document_symbols(&target).is_sent() {
+            // ファイルが変わったときだけ古いシンボルを捨てる。
+            // 打鍵のたびに消すと、行がちらついて「突然変わる画面」になる。
+            if self.lsp_symbols_path.as_deref() != Some(path) {
+                self.lsp_symbols.clear();
+                self.lsp_symbols_path = Some(path.to_path_buf());
+            }
+            self.lsp_symbols_quiet = true;
+            self.breadcrumb_symbols_asked = Some((target, hash, now));
         }
     }
 
@@ -6202,9 +6296,13 @@ impl ZaivernApp {
             self.lsp_symbols = nodes;
             self.lsp_symbols_busy = false;
             if self.lsp_symbols.is_empty() {
-                self.toast_warn(tr("シンボルは見つかりませんでした"));
+                // ブレッドクラムの背景更新では黙る (ユーザーが頼んでいない)
+                if !self.lsp_symbols_quiet {
+                    self.toast_warn(tr("シンボルは見つかりませんでした"));
+                }
                 self.lsp_symbols_open = false;
             }
+            self.lsp_symbols_quiet = false;
         }
         if let Some(range) = prepare {
             if let Some(f) = self.lsp_rename.as_mut() {
@@ -6936,7 +7034,9 @@ impl ZaivernApp {
             | Cmd::TogglePetAutoYes
             | Cmd::ToggleRemote
             | Cmd::ToggleWordWrap
-            | Cmd::ToggleShowWhitespace => self.apply_cmd_settings(cmd, ctx),
+            | Cmd::ToggleShowWhitespace
+            | Cmd::ToggleMinimap
+            | Cmd::ToggleBreadcrumbs => self.apply_cmd_settings(cmd, ctx),
             Cmd::VoiceInput(_)
             | Cmd::VoiceStop
             | Cmd::SetVoiceTarget(_)
@@ -7619,6 +7719,32 @@ impl ZaivernApp {
                         tr("· 空白文字の表示: オン (スペース=· / タブ=→)")
                     } else {
                         tr("· 空白文字の表示: オフ")
+                    },
+                    true,
+                );
+            }
+            Cmd::ToggleMinimap => {
+                self.cfg.minimap = !self.cfg.minimap;
+                self.cfg.global_minimap = self.cfg.minimap;
+                config::save_state(&self.cfg);
+                self.toast(
+                    if self.cfg.minimap {
+                        tr("🗺 ミニマップ: オン (クリック / ドラッグでスクロールできます)")
+                    } else {
+                        tr("🗺 ミニマップ: オフ")
+                    },
+                    true,
+                );
+            }
+            Cmd::ToggleBreadcrumbs => {
+                self.cfg.breadcrumbs = !self.cfg.breadcrumbs;
+                self.cfg.global_breadcrumbs = self.cfg.breadcrumbs;
+                config::save_state(&self.cfg);
+                self.toast(
+                    if self.cfg.breadcrumbs {
+                        tr("🔗 ブレッドクラム: オン (セグメントを押すと移動できます)")
+                    } else {
+                        tr("🔗 ブレッドクラム: オフ")
                     },
                     true,
                 );
@@ -12771,6 +12897,9 @@ impl ZaivernApp {
                 return;
             }
         }
+        // パンくず (ワークスペース › フォルダ › ファイル › シンボル)。
+        // 出すものが無ければ何も描かない = 高さも取らない。
+        self.breadcrumb_bar(ui);
         // Markdown / HTML ファイルは 編集/プレビュー の切替バーを出す
         // (Cockpit の編集ペインに出ているときも同様に切り替えられる)
         let (is_md, is_html) = self
@@ -12792,6 +12921,115 @@ impl ZaivernApp {
             }
         }
         self.code_editor_ui(ui);
+    }
+
+    /// エディタ上部のブレッドクラム (`ワークスペース › フォルダ › ファイル › シンボル`)。
+    ///
+    /// * **パス部分は LSP 不要**。ルートからの相対パスを分解するだけなので、
+    ///   サーバーが無い言語でもここが消えることはない。
+    /// * シンボルは `documentSymbol` の応答が**このファイルのぶんとして届いている
+    ///   ときだけ**足す。後から届いても**高さは変わらない** (常に 1 行)。
+    /// * 出すものが無い (untitled / 仮想タブ) ときは**行ごと描かない** (空白を作らない)。
+    /// * 幅に収まらないときは中央を「…」で省略する (判断は `breadcrumb::elide`)。
+    fn breadcrumb_bar(&mut self, ui: &mut egui::Ui) {
+        if !self.cfg.breadcrumbs {
+            return;
+        }
+        let Some(active) = self.editor.active else {
+            return;
+        };
+        let Some(path) = self.editor.buffers[active].path.clone() else {
+            return; // untitled は行ごと消す
+        };
+        // 既存の documentSymbol 経路をそのまま使って背景更新を頼む (新経路は作らない)
+        self.request_breadcrumb_symbols(&path);
+
+        let caret_line = self.editor.cursor.0.saturating_sub(1);
+        let syms: Vec<(String, usize)> = match self.lsp_symbols_path.as_deref() {
+            Some(p) if p == path => breadcrumb::symbol_chain(&self.lsp_symbols, caret_line),
+            _ => Vec::new(),
+        };
+        let segs = breadcrumb::segments(&self.roots, &path, &syms);
+        if segs.is_empty() {
+            return;
+        }
+
+        let theme = self.theme.clone();
+        let font = FontId::proportional(12.0);
+        let measure = |ui: &egui::Ui, s: &str| -> f32 {
+            ui.fonts(|f| {
+                f.layout_no_wrap(s.to_string(), font.clone(), theme.text)
+                    .size()
+                    .x
+            })
+        };
+        let sep_w = measure(ui, breadcrumb::SEP) + 8.0;
+        let ell_w = measure(ui, breadcrumb::ELLIPSIS);
+        let widths: Vec<f32> = segs.iter().map(|s| measure(ui, &s.label)).collect();
+        let char_w = ui.fonts(|f| f.glyph_width(&font, 'M')).max(1.0);
+        // Frame の内側余白 (左右 8px) を引いた実効幅
+        let avail = (ui.available_width() - 16.0).max(0.0);
+        let shown = breadcrumb::elide(&widths, sep_w, ell_w, avail);
+
+        let mut act: Option<breadcrumb::SegKind> = None;
+        egui::Frame::none()
+            .fill(theme.panel_alt)
+            .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // 高さは常に 1 行ぶん。シンボルが後から届いても伸び縮みしない。
+                    ui.set_min_height(font.size + 4.0);
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (i, piece) in shown.iter().enumerate() {
+                        if i > 0 {
+                            ui.label(
+                                RichText::new(breadcrumb::SEP)
+                                    .size(12.0)
+                                    .color(theme.text_dim),
+                            );
+                        }
+                        match piece {
+                            breadcrumb::Shown::Ellipsis => {
+                                ui.label(
+                                    RichText::new(breadcrumb::ELLIPSIS)
+                                        .size(12.0)
+                                        .color(theme.text_dim),
+                                )
+                                .on_hover_text(tr("幅に収まらないフォルダを省略しています"));
+                            }
+                            breadcrumb::Shown::Seg(n) => {
+                                if let Some(s) = segs.get(*n) {
+                                    if breadcrumb_seg(ui, &theme, &s.label, &s.kind) {
+                                        act = Some(s.kind.clone());
+                                    }
+                                }
+                            }
+                            breadcrumb::Shown::Truncated { index, budget } => {
+                                if let Some(s) = segs.get(*index) {
+                                    let label =
+                                        breadcrumb::truncate_label(&s.label, *budget, char_w);
+                                    if breadcrumb_seg(ui, &theme, &label, &s.kind) {
+                                        act = Some(s.kind.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+
+        if let Some(kind) = act {
+            let ctx = ui.ctx().clone();
+            match kind {
+                breadcrumb::SegKind::Folder(p) => {
+                    self.sidebar_open = true;
+                    self.sidebar_tab = SidebarTab::Files;
+                    self.tree.reveal_dir(&ctx, &p);
+                }
+                breadcrumb::SegKind::File(_) => self.palette.open_files(),
+                breadcrumb::SegKind::Symbol { line } => self.goto_line(line + 1),
+            }
+        }
     }
 
     /// Markdown / HTML 用の 編集/プレビュー 切替バー。
@@ -13347,6 +13585,14 @@ impl ZaivernApp {
             .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
             .max(1.0 / ppp);
         self.last_row_h = row_h;
+        // ミニマップ: 帯を出すかは**純関数** minimap_visible が決める
+        // (狭い画面では設定が ON でも自動的に隠れる)。
+        let mm_on = crate::minimap::minimap_visible(ui.available_width(), self.cfg.minimap);
+        let mm_w = if mm_on {
+            crate::minimap::strip_width(ppp)
+        } else {
+            0.0
+        };
         // galley をフレーム跨ぎでキャッシュするためのフォント世代キー。
         // egui は pixels_per_point 変更時とフォントアトラス逼迫時(fill_ratio > 0.8)に
         // FontsImpl ごと作り直し、そのとき全グリフの UV が変わる。古い galley を
@@ -13383,6 +13629,33 @@ impl ZaivernApp {
         let text_hash = hash_str(&self.editor.buffers[active].text);
         // find バーのヒット数キャッシュもこのハッシュを使い回す(再計算しない)
         self.last_text_hash = text_hash;
+        // ミニマップに出す検索ヒット行。**本文か検索語が変わったときだけ**走査する
+        // (find バーと同じ text_hash を鍵に使うので、追加の全文走査は起きない)。
+        let mm_search: Vec<usize> = if mm_on && self.find.open && !self.find.query.is_empty() {
+            let q = self.find.query.clone();
+            let fresh = self
+                .minimap_hits
+                .as_ref()
+                .is_some_and(|(h, qq, _)| *h == text_hash && *qq == q);
+            if !fresh {
+                let needle = q.to_lowercase();
+                let lines: Vec<usize> = self.editor.buffers[active]
+                    .text
+                    .split('\n')
+                    .enumerate()
+                    .filter(|(_, l)| l.to_lowercase().contains(&needle))
+                    .map(|(i, _)| i)
+                    .take(crate::minimap::MAX_HITS)
+                    .collect();
+                self.minimap_hits = Some((text_hash, q, lines));
+            }
+            self.minimap_hits
+                .as_ref()
+                .map(|(_, _, v)| v.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         // Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製されない
         let marks = match abs {
             Some(p) => self.gitinfo.line_marks(&p, text_hash),
@@ -13739,6 +14012,7 @@ impl ZaivernApp {
             lang,
             cache,
             gutter,
+            minimap,
             ..
         } = buf;
 
@@ -13817,7 +14091,7 @@ impl ZaivernApp {
         // VS Code の scrollBeyondLastLine: 最終行を越えてスクロールできる余白
         let past_end = (view_h - row_h * 3.0).max(0.0);
 
-        let inner = sa.show(ui, |ui| {
+        let body_ui = |ui: &mut egui::Ui| {
             if let Some((s, e)) = pending_select {
                 let mut st =
                     egui::TextEdit::load_state(ui.ctx(), ed_id).unwrap_or_default();
@@ -13960,7 +14234,26 @@ impl ZaivernApp {
                 caret_at,
                 hover_hit,
             )
-        });
+        };
+
+        // ミニマップを出すときは、その帯のぶんだけ**先に**本文の幅を取り置く。
+        // (`ui.set_max_width` はタブ行で確定済みの min_rect に引っ張られて効かない)
+        // 帯を置ける全体領域 (本文 + 帯)。帯の右端は必ずここの右端に合わせる
+        // — ScrollArea の inner_rect はスクロールバーぶん内側に来ることがあり、
+        // それを基準にすると帯と画面端の間に死んだ余白ができる。
+        let mut mm_area: Option<egui::Rect> = None;
+        let inner = if mm_on {
+            let avail = ui.available_rect_before_wrap();
+            mm_area = Some(avail);
+            ui.allocate_ui_with_layout(
+                egui::vec2((avail.width() - mm_w).max(0.0), avail.height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| sa.show(ui, body_ui),
+            )
+            .inner
+        } else {
+            sa.show(ui, body_ui)
+        };
 
         let (cursor_out, changed, text_top, text_left, caret_at, hover_hit) = inner.inner;
 
@@ -13985,6 +14278,28 @@ impl ZaivernApp {
                 disp_lines.get(d).copied().unwrap_or(d)
             }
         };
+        // 折りたたみ中は表示行と原文行がずれる。印 (検索 / 診断 / ブックマーク) は
+        // 原文行なので、その間はミニマップに印を出さない (ずれた場所に出すより無い方がよい)。
+        let folds_active = !disp_lines.is_empty();
+
+        // ── ミニマップの行データ: **本文 galley のキーが変わったときだけ**組み直す ──
+        //
+        // ここが唯一の再構築点。キーが同じフレーム (= テキストもテーマも
+        // フォントも折り返しも変わっていないフレーム) では Vec に触りもしない。
+        // 設計原則 3「アイドル時のコストはゼロ」。
+        if mm_on && minimap.as_ref().map(|(k, _)| *k) != Some(body_key) {
+            let rows = match cache.as_ref() {
+                Some((_, g)) => crate::minimap::build_rows(
+                    &g.job,
+                    // 巨大ファイルでハイライトを切っているときは単色
+                    if structure_on { None } else { Some(theme_dim) },
+                    crate::minimap::MAX_ROWS,
+                ),
+                None => crate::minimap::MinimapRows::default(),
+            };
+            *minimap = Some((body_key, rows));
+        }
+
         let gutter_key = [
             marks_hash,
             diag_hash,
@@ -14240,6 +14555,82 @@ impl ZaivernApp {
             }
         }
 
+        // ═══ ミニマップ (右端の細い帯) ═════════════════════════════════
+        //
+        // ここでやるのは「キャッシュ済みの矩形列を描く」「ビューポート枠を重ねる」
+        // 「クリック / ドラッグを受ける」だけ。再計算も再描画要求も出さない。
+        let mut mm_scroll: Option<f32> = None;
+        if let (true, Some(area)) = (mm_on, mm_area) {
+            // 縦は本文の可視範囲、横は「本文 + 帯」の全体領域の右端まで
+            let full = egui::Rect::from_min_max(
+                vis.min,
+                egui::pos2(area.right().max(vis.right() + mm_w), vis.bottom()),
+            );
+            let geom = crate::minimap::geometry(full, disp_count, ppp);
+            // クリックとドラッグでスクロール (これが無いミニマップは飾り)
+            let resp = ui.interact(
+                geom.strip,
+                ed_id.with("minimap"),
+                egui::Sense::click_and_drag(),
+            );
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() || resp.dragged() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    mm_scroll = Some(geom.scroll_for_y(p.y, row_h, vis.height()));
+                }
+            }
+            let none_hits: Vec<usize> = Vec::new();
+            let none_diag: HashMap<usize, u8> = HashMap::new();
+            let none_marks: HashSet<usize> = HashSet::new();
+            let marks = crate::minimap::Marks {
+                search: if folds_active { &none_hits } else { &mm_search },
+                diags: if folds_active { &none_diag } else { diag_by_line },
+                bookmarks: if folds_active {
+                    &none_marks
+                } else {
+                    &bookmark_lines
+                },
+            };
+            let colors = crate::minimap::Colors {
+                bg: theme_panel,
+                border: theme_border,
+                viewport: theme_text.gamma_multiply(0.10),
+                accent: theme_accent,
+                err: theme_err,
+                warn: theme_warn,
+            };
+            let first_line = if row_h > 0.0 {
+                inner.state.offset.y / row_h
+            } else {
+                0.0
+            };
+            let on_screen = if row_h > 0.0 {
+                (vis.height() / row_h).max(1.0)
+            } else {
+                1.0
+            };
+            let default_rows = crate::minimap::MinimapRows::default();
+            let rows = self.editor.buffers[active]
+                .minimap
+                .as_ref()
+                .map(|(_, r)| r)
+                .unwrap_or(&default_rows);
+            crate::minimap::paint(
+                &ui.painter().with_clip_rect(geom.strip),
+                &geom,
+                rows,
+                &marks,
+                &colors,
+                first_line,
+                on_screen,
+            );
+        }
+        if let Some(y) = mm_scroll {
+            self.pending_scroll = Some(y);
+        }
+
         if let Some(c) = cursor_out {
             self.editor.cursor = c;
         }
@@ -14396,6 +14787,8 @@ impl ZaivernApp {
             ("👁".into(), tr("Markdown/HTML プレビュー切替"), "⌘⇧V".into(), Cmd::ToggleMdPreview),
             ("↩".into(), tr("折り返し切替"), String::new(), Cmd::ToggleWordWrap),
             ("·".into(), tr("空白文字表示切替"), String::new(), Cmd::ToggleShowWhitespace),
+            ("🗺".into(), tr("ミニマップの表示切替"), String::new(), Cmd::ToggleMinimap),
+            ("🔗".into(), tr("ブレッドクラムの表示切替"), String::new(), Cmd::ToggleBreadcrumbs),
             ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),
             ("🌿".into(), tr("Git パネルを開く"), String::new(), Cmd::OpenGitPanel),
             (
@@ -14459,7 +14852,7 @@ impl ZaivernApp {
             ("🚪".into(), tr("すべてのエディターを閉じる"), String::new(), Cmd::CloseAllTabs),
             ("🔎".into(), tr("ファイル間で検索"), "⇧⌘F".into(), Cmd::GlobalSearch),
             ("⇄".into(), tr("置換"), "⌥⌘F".into(), Cmd::OpenReplace),
-            // 🧭 は同梱フォントに字が無く豆腐(□)になるため「→」を使う
+            // 🔗 は同梱フォントに字が無く豆腐(□)になるため「→」を使う
             // (glyph_tests::ui_glyph_symbols_have_glyphs が担保している字)。
             ("→".into(), tr("行/列へ移動…"), "⌃G".into(), Cmd::GoToLine),
             ("→".into(), tr("定義へ移動"), "F12".into(), Cmd::GoToDefinition),
@@ -18859,6 +19252,8 @@ impl ZaivernApp {
             auto_save: self.menu_state.auto_save,
             word_wrap: self.cfg.word_wrap,
             show_whitespace: self.cfg.show_whitespace,
+            minimap: self.cfg.minimap,
+            breadcrumbs: self.cfg.breadcrumbs,
             has_editor: self.editor.active.is_some(),
             has_file: active_path.is_some(),
             md_preview: self.md_preview,
@@ -22647,9 +23042,66 @@ mod wave2_tests {
             "Cmd::SaveWithEncoding",
             // ── エージェントデッキ ──
             "Cmd::ToggleDeck",
+            // ── ミニマップ / ブレッドクラム ──
+            "Cmd::ToggleMinimap",
+            "Cmd::ToggleBreadcrumbs",
         ] {
             assert!(list.contains(c), "{c} がコマンドパレットに無い");
             assert!(router.contains(c), "{c} のディスパッチが無い");
+        }
+    }
+
+    /// ミニマップとブレッドクラムが「画面から到達できる」ことと、
+    /// **アイドル時に再構築も再描画要求もしない**ことをソースで固定する。
+    ///
+    /// ソースを読むテストなので改行は正規化する (Windows は CRLF)。
+    #[test]
+    fn ミニマップとブレッドクラムがアイドルを増やさない配線になっている() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let menu = include_str!("menu_bar.rs").replace("\r\n", "\n");
+
+        // 到達経路: 表示メニュー
+        for c in ["Cmd::ToggleMinimap", "Cmd::ToggleBreadcrumbs"] {
+            assert!(menu.contains(c), "{c} が表示メニューから押せない");
+        }
+        // 到達経路: エディタ本体の描画
+        assert!(
+            src.contains("self.breadcrumb_bar(ui);"),
+            "ブレッドクラムを描いていない (描かないと画面に出ない)"
+        );
+        assert!(
+            src.contains("crate::minimap::paint("),
+            "ミニマップを描いていない (描かないと画面に出ない)"
+        );
+        assert!(
+            src.contains("crate::minimap::minimap_visible("),
+            "幅による自動非表示の純関数を通していない"
+        );
+
+        // 再構築はキャッシュキーが変わったときだけ (毎フレームではない)
+        assert!(
+            src.contains("if mm_on && minimap.as_ref().map(|(k, _)| *k) != Some(body_key)"),
+            "ミニマップの再構築がキー比較で守られていない (毎フレーム再生成になる)"
+        );
+        // ミニマップ/ブレッドクラムのために再描画を要求していない
+        let (_, editor_src) = src
+            .split_once("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .expect("code_editor_ui がある");
+        let (editor_src, _) = editor_src
+            .split_once("\n    // ─── UI: palette ")
+            .expect("code_editor_ui の終わり");
+        assert!(
+            !editor_src.contains("request_repaint"),
+            "エディタ描画が再描画を要求している (アイドルで CPU を焼く)"
+        );
+        for m in [
+            include_str!("minimap.rs").replace("\r\n", "\n"),
+            include_str!("breadcrumb.rs").replace("\r\n", "\n"),
+        ] {
+            assert!(
+                !m.contains("request_repaint"),
+                "ミニマップ / ブレッドクラムが再描画を要求している"
+            );
         }
     }
 }
@@ -22667,7 +23119,7 @@ mod glyph_tests {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
         const UI_SYMBOLS: &str = "📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
-                                  💬📊⛔🔁·↩▸▾🔎◆📇💤\
+                                  💬📊⛔🔁·↩▸▾🔎◆📇💤🗺🔗›…\
                                   🔍📡🖱📦🍚🌀🔷🔶🕊👷🐦🅰🌊⌘➡🔩🌙🎏🎐🐉💠";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);

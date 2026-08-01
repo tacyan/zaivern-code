@@ -236,6 +236,22 @@ impl FileTree {
         self.scroll_to = Some(p.to_path_buf());
     }
 
+    /// 指定フォルダを**その場で**開いて選択する (ブレッドクラムのフォルダ押下)。
+    ///
+    /// `set_active_file` の予約と違い、追従トグル (`auto_reveal`) が OFF でも効く
+    /// — ユーザーが自分でそのフォルダを押したのだから、その 1 回は必ず開く。
+    pub fn reveal_dir(&mut self, ctx: &egui::Context, p: &Path) {
+        // ルート自身のときは祖先を辿らない (ワークスペースの外まで開いてしまうため)
+        if !self.roots.iter().any(|r| r == p) {
+            for anc in reveal_ancestors(&self.roots, p) {
+                set_open(ctx, &anc, true);
+            }
+        }
+        set_open(ctx, p, true);
+        self.selected = Some(p.to_path_buf());
+        self.scroll_to = Some(p.to_path_buf());
+    }
+
     /// `p` 配下(自身含む)を指していた選択・クリップボードを外す(削除後の後始末)。
     pub fn deselect_under(&mut self, p: &Path) {
         if self.selected.as_deref().is_some_and(|s| s.starts_with(p)) {
