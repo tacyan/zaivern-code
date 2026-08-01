@@ -9383,14 +9383,18 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::SplitEditorRight)) {
             cmds.push(Cmd::SplitEditorRight);
         }
-        for (a, n) in [
-            (BindAction::FocusPane1, 1usize),
-            (BindAction::FocusPane2, 2),
-            (BindAction::FocusPane3, 3),
-        ] {
-            if consume(ctx, self.keys.get(a)) {
-                cmds.push(Cmd::FocusEditorPane(n));
-            }
+        // ここはループで畳まない。畳むと `consume(ctx, self.keys.get(BindAction::X))`
+        // という一様な形が崩れ、`keybinds::tests::全アクションが消費地点に
+        // 繋がっている` が「押せない」と誤検出する (実際に 3 OS で落ちた)。
+        // 番人を緩めるより、消費地点を 1 アクション 1 行に揃える方を選ぶ。
+        if consume(ctx, self.keys.get(BindAction::FocusPane1)) {
+            cmds.push(Cmd::FocusEditorPane(1));
+        }
+        if consume(ctx, self.keys.get(BindAction::FocusPane2)) {
+            cmds.push(Cmd::FocusEditorPane(2));
+        }
+        if consume(ctx, self.keys.get(BindAction::FocusPane3)) {
+            cmds.push(Cmd::FocusEditorPane(3));
         }
         if consume(ctx, self.keys.get(BindAction::GlobalSearch)) {
             cmds.push(Cmd::GlobalSearch);
