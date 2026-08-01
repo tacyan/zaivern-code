@@ -65,6 +65,7 @@ mod test_util;
 mod textenc;
 mod theme;
 mod theme_json;
+mod tunnel;
 mod tutorial;
 mod voice;
 

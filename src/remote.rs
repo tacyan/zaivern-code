@@ -13,10 +13,42 @@
 use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+
+/// 待ち受け先。**LAN と SSH トンネルの違いはここだけ**
+/// (設計原則 5: ハンドラは 1 面、トランスポートは多数)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bind {
+    /// 同じ Wi-Fi のスマホから直接繋ぐ (`0.0.0.0`)。
+    Lan,
+    /// SSH トンネル経由だけを許す (`127.0.0.1`)。
+    ///
+    /// トンネルを張ったまま `0.0.0.0` で待ち受けていると、**SSH を迂回して
+    /// 平文で直接叩けてしまう** — トンネルを張る意味が消えるので必ず絞る。
+    Loopback,
+}
+
+impl Bind {
+    /// 実際に bind する IP。
+    pub fn ip(&self) -> &'static str {
+        match self {
+            Bind::Lan => "0.0.0.0",
+            Bind::Loopback => "127.0.0.1",
+        }
+    }
+
+    /// UI に出す 1 行 (呼び出し側で `tr()` を通すこと)。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Bind::Lan => "0.0.0.0 (同じ Wi-Fi から直接)",
+            Bind::Loopback => "127.0.0.1 (SSH トンネル経由のみ)",
+        }
+    }
+}
 
 /// UI スレッドへ渡す問い合わせの種類。
 pub enum Query {
@@ -144,8 +176,13 @@ pub struct RemoteServer {
     pub token: String,
     /// トークンなしのベース URL (例: http://192.168.1.10:8899/)
     pub url: String,
+    /// いまどこで待ち受けているか (UI に必ず出す)
+    pub bind: Bind,
     rx: mpsc::Receiver<Request>,
     reach: Arc<Mutex<Reach>>,
+    /// accept ループの停止指示 (`Drop` で立てる)
+    stop: Arc<AtomicBool>,
+    accept: Option<std::thread::JoinHandle<()>>,
 }
 
 /// 待ち受けに使うポートの範囲 (両端を含む)。
@@ -158,11 +195,38 @@ pub const PORT_TO: u16 = 8919;
 
 impl RemoteServer {
     /// サーバを起動する。8899 から順に空きポートを探す。
-    pub fn start(ctx: egui::Context) -> Result<Self, String> {
+    pub fn start(ctx: egui::Context, bind: Bind) -> Result<Self, String> {
+        Self::start_with(ctx, bind, None, None)
+    }
+
+    /// 待ち受け先だけを変えて張り直す (LAN ⇄ SSH トンネル)。
+    ///
+    /// **トークンとポートは引き継ぐ** — トークンを変えると既に QR を読み込んだ
+    /// スマホや CLI の接続情報が一斉に無効になり、ポートが動くと別インスタンスの
+    /// 待ち受けを横取りしかねない。呼び出し側は古いサーバを先に drop して
+    /// ポートを解放すること (`Drop` が accept スレッドの終了まで待つ)。
+    pub fn rebind(
+        ctx: egui::Context,
+        bind: Bind,
+        token: String,
+        prefer_port: u16,
+    ) -> Result<Self, String> {
+        Self::start_with(ctx, bind, Some(token), Some(prefer_port))
+    }
+
+    fn start_with(
+        ctx: egui::Context,
+        bind: Bind,
+        keep_token: Option<String>,
+        prefer_port: Option<u16>,
+    ) -> Result<Self, String> {
         let mut listener = None;
         let mut port = 0u16;
-        for p in PORT_FROM..=PORT_TO {
-            if let Ok(l) = TcpListener::bind(("0.0.0.0", p)) {
+        // 張り直しでは元のポートを最優先で試す。unix では SO_REUSEADDR が
+        // 効くため `0.0.0.0:P` と `127.0.0.1:P` が同居できてしまい、素直に
+        // 先頭から走査すると**別インスタンスのポート**を掴むことがある。
+        for p in prefer_port.into_iter().chain(PORT_FROM..=PORT_TO) {
+            if let Ok(l) = TcpListener::bind((bind.ip(), p)) {
                 listener = Some(l);
                 port = p;
                 break;
@@ -171,17 +235,30 @@ impl RemoteServer {
         let listener = listener
             .ok_or_else(|| format!("空きポートがありません ({PORT_FROM}-{PORT_TO})"))?;
 
-        let token = gen_token();
-        let url = format!("http://{}:{}/", lan_ip(), port);
+        let token = keep_token.unwrap_or_else(gen_token);
+        // 待ち受けが loopback だけのときに LAN の IP を出すと、
+        // 「その URL では絶対に繋がらない」嘘の案内になる。
+        let host = match bind {
+            Bind::Lan => lan_ip(),
+            Bind::Loopback => "127.0.0.1".to_string(),
+        };
+        let url = format!("http://{host}:{port}/");
         let (tx, rx) = mpsc::channel::<Request>();
         let reach = Arc::new(Mutex::new(Reach::default()));
+        let stop = Arc::new(AtomicBool::new(false));
 
         let tok = token.clone();
         let reach_srv = Arc::clone(&reach);
-        std::thread::Builder::new()
+        let stop_srv = Arc::clone(&stop);
+        let accept = std::thread::Builder::new()
             .name("zv-remote-accept".into())
             .spawn(move || {
                 for stream in listener.incoming() {
+                    // 停止指示は accept を抜けた直後に見る。`Drop` が自分自身へ
+                    // 1 本繋いで起こすので、ここが最初に踏まれる。
+                    if stop_srv.load(Ordering::SeqCst) {
+                        return;
+                    }
                     let Ok(stream) = stream else {
                         // fd 枯渇などで accept が失敗し続けると待機なしの
                         // ビジーループになるため、少し休んでから再試行する
@@ -208,13 +285,16 @@ impl RemoteServer {
             })
             .map_err(|e| format!("サーバスレッド起動失敗: {e}"))?;
 
-        eprintln!("📱 スマホリモート起動: {url}?t={token}");
+        eprintln!("📱 スマホリモート起動 ({}): {url}?t={token}", bind.ip());
         Ok(Self {
             port,
             token,
             url,
+            bind,
             rx,
             reach,
+            stop,
+            accept: Some(accept),
         })
     }
 
@@ -227,6 +307,28 @@ impl RemoteServer {
     /// 毒された Mutex でも UI を落とさないよう、取れなければ既定値を返す。
     pub fn reach(&self) -> Reach {
         self.reach.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+}
+
+impl Drop for RemoteServer {
+    /// accept ループを確実に終わらせてからポートを手放す。
+    ///
+    /// 単にフラグを立てるだけでは accept が次の接続まで起きないので、
+    /// **自分自身へ 1 本繋いで起こす**。join まで待つのは、直後に同じポートへ
+    /// 張り直す ([`RemoteServer::rebind`]) から — 待たないと EADDRINUSE で
+    /// ポート番号がずれ、トンネルの転送先と食い違う。
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // loopback は Lan / Loopback どちらの待ち受けにも届く
+        if let Ok(s) = TcpStream::connect_timeout(
+            &(std::net::Ipv4Addr::LOCALHOST, self.port).into(),
+            Duration::from_millis(500),
+        ) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(h) = self.accept.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -1316,6 +1418,40 @@ mod tests {
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
         // OS 乱数由来なので毎回変わる (固定シードなら等しくなり検出できる)
         assert_ne!(gen_token(), gen_token());
+    }
+
+    /// トンネル使用時に `0.0.0.0` のままだと、SSH を迂回して LAN から平文で
+    /// 直接叩けてしまう (= トンネルを張った意味が消える)。
+    #[test]
+    fn bind先はモードで切り替わる() {
+        assert_eq!(Bind::Lan.ip(), "0.0.0.0");
+        assert_eq!(Bind::Loopback.ip(), "127.0.0.1");
+        assert!(!Bind::Lan.label().is_empty());
+        assert!(!Bind::Loopback.label().is_empty());
+        assert!(
+            Bind::Loopback.label().contains("127.0.0.1"),
+            "どちらで待ち受けているかが UI から読めること"
+        );
+    }
+
+    /// 張り直しでトークンが変わると、既に QR を読んだスマホが一斉に 401 になる。
+    /// URL のホスト部も待ち受けに合わせて変える (繋がらない URL を出さない)。
+    #[test]
+    fn 張り直してもトークンは変わらずurlのホストだけ変わる() {
+        let ctx = egui::Context::default();
+        let lan = RemoteServer::start(ctx.clone(), Bind::Lan).expect("LAN で起動できる");
+        let token = lan.token.clone();
+        let port = lan.port;
+        assert_eq!(lan.bind, Bind::Lan);
+        drop(lan); // Drop が accept を畳んでポートを解放するまで待つ
+
+        let lo = RemoteServer::rebind(ctx, Bind::Loopback, token.clone(), port)
+            .expect("loopback へ張り直せる");
+        assert_eq!(lo.token, token, "トークンは引き継ぐ");
+        assert_eq!(lo.port, port, "ポートも引き継ぐ (トンネルの転送先とずれない)");
+        assert_eq!(lo.bind, Bind::Loopback);
+        // URL は待ち受けと必ず一致させる (繋がらない URL を QR にしない)
+        assert_eq!(lo.url, format!("http://127.0.0.1:{}/", lo.port));
     }
 
     #[test]
