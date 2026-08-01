@@ -71,7 +71,8 @@ pub fn save(roots: &[PathBuf], data: &SessionData) {
 }
 
 /// 既定の保存先ディレクトリ: `~/.zaivern/sessions`
-fn sessions_dir() -> PathBuf {
+/// (`zai session list` からも走査するので pub)
+pub fn sessions_dir() -> PathBuf {
     crate::config::zaivern_dir().join("sessions")
 }
 
