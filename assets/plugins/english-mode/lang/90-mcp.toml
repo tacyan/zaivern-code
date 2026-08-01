@@ -1,0 +1,60 @@
+# MCP サーバ管理パネル (mcp.rs / app.rs のタブとパレット)
+#
+# 既に他ファイルにあるキー (設定済み / 未設定 …) はここに書かない
+# (辞書は後勝ちマージなので、重複させると先の訳が黙って消える)。
+
+# ── 呼び出し (パレット / ボトムパネルのタブ) ──
+"MCP サーバを管理" = "Manage MCP servers"
+"🔌 MCP" = "🔌 MCP"
+"🔌 MCP サーバ" = "🔌 MCP servers"
+"MCP サーバ — .mcp.json / .cursor / .vscode / .claude.json / .codex / .gemini を横断して一覧します\nenv の値は表示しません (キー名と設定済みかだけ)" = "MCP servers — one list across .mcp.json / .cursor / .vscode / .claude.json / .codex / .gemini\nenv values are never shown (key names and whether they are set, only)"
+
+# ── 一覧 ──
+# ("{n} 件" は 20-app.toml、"有効"/"無効" は 10-common.toml に既にある
+#  — 後勝ちマージで先の訳が消えるのでここには書かない)
+"設定ファイルを読み直す" = "Reload the config files"
+"クリックで詳細を開閉" = "Click to expand or collapse the details"
+"有効化" = "Enable"
+"無効化" = "Disable"
+"このサーバを有効に戻す (設定ファイルを書き換えます)" = "Turn this server back on (rewrites the config file)"
+"このサーバを無効にする (設定ファイルを書き換えます)" = "Turn this server off (rewrites the config file)"
+"📂 出典" = "📂 Source"
+"出典ファイルを開く: {p}" = "Open the source file: {p}"
+
+# ── 出典の名前 ──
+"プロジェクト .mcp.json" = "Project .mcp.json"
+"プロジェクト .cursor" = "Project .cursor"
+"プロジェクト .vscode" = "Project .vscode"
+"ユーザー .claude.json" = "User .claude.json"
+"ユーザー .codex" = "User .codex"
+"ユーザー .gemini" = "User .gemini"
+"ユーザー .cursor" = "User .cursor"
+
+# ── 詳細 (値は出さない。キー名とマスクだけ) ──
+"command: {v}" = "command: {v}"
+"args: {v}" = "args: {v}"
+"cwd: {v}" = "cwd: {v}"
+"url: {v}" = "url: {v}"
+"env: {k} = *** ({state})" = "env: {k} = *** ({state})"
+"header: {k} = *** ({state})" = "header: {k} = *** ({state})"
+"出典: {p}" = "Source: {p}"
+"種別を判定できません (command も url もありません)" = "Cannot tell the transport (neither command nor url)"
+"この形式は編集非対応です (読み取り専用)" = "This format cannot be edited here (read-only)"
+
+# ── 空状態 ──
+"MCP サーバが未設定です" = "No MCP servers configured"
+"ワークスペース直下の .mcp.json / .cursor/mcp.json / .vscode/mcp.json、またはホームの .claude.json・.codex/config.toml・.gemini/settings.json に書くとここに並びます" = "Add them to .mcp.json / .cursor/mcp.json / .vscode/mcp.json in the workspace, or to .claude.json / .codex/config.toml / .gemini/settings.json in your home folder, and they show up here"
+
+# ── 書き戻し / 読み取りの結果 ──
+"{name} を{state}にしました (控え: {bak})" = "{name} is now {state} (backup: {bak})"
+"{name} を切り替えられません: {why}" = "Cannot toggle {name}: {why}"
+"控えを作れません: {why}" = "Cannot write the backup: {why}"
+"書き込めません: {why}" = "Cannot write: {why}"
+"読めません: {why}" = "Cannot read: {why}"
+"JSON として読めません: {why}" = "Not valid JSON: {why}"
+"TOML として読めません: {why}" = "Not valid TOML: {why}"
+"大きすぎるため読み込みません" = "Too large to read"
+"設定の中に {what} が見つかりません" = "{what} is not in the config"
+"書き換えると設定が壊れるため中止しました" = "Stopped: the rewrite would have corrupted the config"
+"設定の本体 (オブジェクト)" = "the config body (an object)"
+"⚠ {p}: {why}" = "⚠ {p}: {why}"

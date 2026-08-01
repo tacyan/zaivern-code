@@ -251,6 +251,8 @@ pub enum Cmd {
     OpenApprovals,
     /// 承認の監査ログ (approvals.jsonl の末尾) を開く
     OpenApprovalAudit,
+    /// MCP サーバ管理パネルを開く
+    OpenMcp,
     /// キャレットを 1 つ上の行に増やす
     AddCursorAbove,
     /// キャレットを 1 つ下の行に増やす
@@ -543,6 +545,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::TogglePetAutoYes
         | Cmd::OpenApprovals
         | Cmd::OpenApprovalAudit
+        | Cmd::OpenMcp
         | Cmd::ShowSessions
         | Cmd::ShowQuota
         | Cmd::VoiceInput(_)
