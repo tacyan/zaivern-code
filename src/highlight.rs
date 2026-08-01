@@ -15,7 +15,18 @@ const MAX_HIGHLIGHT_LINE_BYTES: usize = 8_192;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+/// プロセスで 1 つだけの [`Highlighter`]。
+///
+/// `SyntaxSet` / `ThemeSet` は数 MB あるので、エディタ本文・差分ビュー・
+/// Markdown プレビューがそれぞれ持つとメモリが素直に倍々になる。
+/// 内部のキャッシュは `Mutex` 越しなので複数箇所から同時に呼んで安全。
+/// **初回呼び出しまでロードしない**ので、起動時間には影響しない。
+pub fn shared() -> &'static Highlighter {
+    static H: OnceLock<Highlighter> = OnceLock::new();
+    H.get_or_init(Highlighter::new)
+}
 
 pub struct Highlighter {
     ps: SyntaxSet,
@@ -180,6 +191,71 @@ impl Highlighter {
         self.cache_put(key, &job);
 
         job
+    }
+
+    /// 連続した行の並びを 1 パスで色分けし、**行ごとの (開始, 終了, 色)** を返す。
+    ///
+    /// 差分ビューのように「行を 1 本ずつ別ウィジェットで描く」画面のための API。
+    /// 1 行ずつ [`Self::layout_job`] を呼ぶとキャッシュが行数ぶん溢れるうえ、
+    /// 複数行にまたがる文字列やブロックコメントの状態が毎行リセットされて
+    /// 色が壊れる。ここでは syntect の状態を行を跨いで持ち回る。
+    ///
+    /// 範囲は**各行の先頭を 0 とするバイトオフセット**の半開区間で、必ず
+    /// 昇順・連続・行長に収まる (呼び出し側はそのまま `&line[s..e]` できる)。
+    /// 合計が [`MAX_HIGHLIGHT_BYTES`] を超える / 言語が Plain Text /
+    /// テーマが無い場合は**空の Vec** を返す (= 呼び出し側は素の色で描く)。
+    pub fn line_spans(
+        &self,
+        lines: &[&str],
+        lang: &str,
+        theme_name: &str,
+    ) -> Vec<Vec<(usize, usize, Color32)>> {
+        let total: usize = lines.iter().map(|l| l.len() + 1).sum();
+        let syntax = self
+            .ps
+            .find_syntax_by_name(lang)
+            .unwrap_or_else(|| self.ps.find_syntax_plain_text());
+        if total > MAX_HIGHLIGHT_BYTES || syntax.name == "Plain Text" {
+            return Vec::new();
+        }
+        let Some(theme) = self.ts.themes.get(theme_name) else {
+            return Vec::new();
+        };
+        let mut h = HighlightLines::new(syntax, theme);
+        let mut out = Vec::with_capacity(lines.len());
+        for line in lines {
+            if line.len() > MAX_HIGHLIGHT_LINE_BYTES {
+                // 極端に長い 1 行 (minify 済み JS など) で UI を止めない。
+                out.push(Vec::new());
+                continue;
+            }
+            // syntect は行末の改行込みで状態を進めるので付けて渡し、
+            // 範囲は元の行長で丸める。
+            let with_nl = format!("{line}\n");
+            match h.highlight_line(&with_nl, &self.ps) {
+                Ok(regions) => {
+                    let mut spans: Vec<(usize, usize, Color32)> = Vec::with_capacity(regions.len());
+                    let mut off = 0usize;
+                    for (style, piece) in regions {
+                        let start = off.min(line.len());
+                        off += piece.len();
+                        let end = off.min(line.len());
+                        if end > start {
+                            let fg = style.foreground;
+                            spans.push((start, end, Color32::from_rgb(fg.r, fg.g, fg.b)));
+                        }
+                    }
+                    out.push(spans);
+                }
+                Err(_) => {
+                    // エラー後の HighlightLines は内部状態が壊れている可能性が
+                    // あるので、以降の行のために作り直す。
+                    h = HighlightLines::new(syntax, theme);
+                    out.push(Vec::new());
+                }
+            }
+        }
+        out
     }
 
     /// キャッシュへ 1 件入れる。上限は古い方から追い出す (全消しすると

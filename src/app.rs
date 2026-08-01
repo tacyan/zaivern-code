@@ -2003,7 +2003,9 @@ pub struct ZaivernApp {
     /// 🏁 プロンプトレース (1 プロンプトを複数エージェントに並走させる) の
     /// ダッシュボード状態。描画・git 操作の実体は race.rs。
     race: race::RacePanel,
-    highlighter: Highlighter,
+    /// 構文ハイライタ。プロセスで 1 つの共有インスタンス
+    /// (`SyntaxSet` は数 MB あるので差分ビューと二重に持たない)。
+    highlighter: &'static Highlighter,
     cockpit: bool,
     /// **このフレームで描く中央ビュー** (毎フレーム [`center_view`] で畳む)。
     /// 描画の分岐はフラグではなく必ずこれを見る。
@@ -2674,7 +2676,7 @@ impl ZaivernApp {
             palette_worktrees: None,
             pending_prompts: Vec::new(),
             race: race::RacePanel::new(),
-            highlighter: Highlighter::new(),
+            highlighter: crate::highlight::shared(),
             cockpit: false,
             center: CenterView::Editor,
             kanban: false,
@@ -4192,7 +4194,7 @@ impl ZaivernApp {
         }
         let base = self.editor.buffers.len();
         for f in &sess.open_files {
-            let _ = self.editor.open(Path::new(f), &self.highlighter);
+            let _ = self.editor.open(Path::new(f), self.highlighter);
         }
         if let Some(a) = sess.active {
             let idx = base + a;
@@ -4651,7 +4653,7 @@ impl ZaivernApp {
     }
 
     fn open_path(&mut self, path: &Path) {
-        match self.editor.open(path, &self.highlighter) {
+        match self.editor.open(path, self.highlighter) {
             Ok(reloaded) => {
                 // Cockpit 表示中でも左の編集ペインに開いた内容が見えるため、
                 // ビューは切り替えない
@@ -4763,6 +4765,10 @@ impl ZaivernApp {
             ctx.data_mut(|d| *d.get_persisted_mut_or(Self::editor_prefs_id(), (false, false)));
         self.save_trim_trailing = t;
         self.save_final_newline = n;
+        // 差分ビューの表示モードは config が持ち主。ここで 1 回だけ ctx へ種を蒔く
+        // (以降はビューのトグル / パレット / F7 が ctx 側を書き換え、
+        //  update の頭で config へ書き戻す)。
+        crate::diff::set_diff_mode(ctx, crate::diff::DiffMode::from_config_str(&self.cfg.diff_view));
     }
 
     fn save_search_prefs(&self, ctx: &egui::Context) {
@@ -6907,7 +6913,7 @@ impl ZaivernApp {
                 b.path.as_deref() == Some(fe.path.as_path())
             }) {
                 Some(i) => Some(i),
-                None => match self.editor.open(&fe.path, &self.highlighter) {
+                None => match self.editor.open(&fe.path, self.highlighter) {
                     Ok(_) => self.editor.active,
                     Err(e) => {
                         failed.push(e);
@@ -7425,7 +7431,7 @@ impl ZaivernApp {
         let theme = self.theme.clone();
         let base = self.cfg.editor_font_size;
         let mut images = std::mem::take(&mut self.md_images);
-        let hl = &self.highlighter;
+        let hl = self.highlighter;
         egui::Area::new(egui::Id::new("zv-lsp-hover"))
             .order(egui::Order::Tooltip)
             .fixed_pos(at + egui::vec2(0.0, HOVER_OFFSET_Y))
@@ -7919,6 +7925,17 @@ impl ZaivernApp {
 
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
+            // 差分ビュー: 表示モードの切替と変更箇所のジャンプ。
+            // ctx へ書くだけで、実際の反映は差分ビュー自身が同フレームで行う。
+            Cmd::ToggleDiffView => {
+                let next = crate::diff::diff_mode(ctx).toggled();
+                crate::diff::set_diff_mode(ctx, next);
+                self.cfg.diff_view = next.config_str().into();
+                config::save_state(&self.cfg);
+                self.toast(trf("差分の表示: {m}", &[("m", next.label())]), true);
+            }
+            Cmd::DiffNextChange => crate::diff::request_jump(ctx, 1),
+            Cmd::DiffPrevChange => crate::diff::request_jump(ctx, -1),
             // 折りたたみ / ブックマーク / テーブル表示 / レビュー / LSP
             Cmd::OpenReview
             | Cmd::SetReviewBase(_)
@@ -9293,6 +9310,13 @@ impl ZaivernApp {
         // ⌘D: 次の出現を選択 (⇧⌘D の行複製より修飾キーが少ないので後に見る)
         if consume(ctx, self.keys.get(BindAction::SelectNextOccurrence)) {
             cmds.push(Cmd::SelectNextOccurrence);
+        }
+        // 差分の変更ジャンプ。⇧F7 を F7 より先に見る (修飾キーが多い方が先)。
+        if consume(ctx, self.keys.get(BindAction::DiffPrevChange)) {
+            cmds.push(Cmd::DiffPrevChange);
+        }
+        if consume(ctx, self.keys.get(BindAction::DiffNextChange)) {
+            cmds.push(Cmd::DiffNextChange);
         }
         if consume(ctx, self.keys.get(BindAction::CloseTab)) {
             cmds.push(Cmd::CloseTab);
@@ -11488,7 +11512,7 @@ impl ZaivernApp {
         p: &plugins::Plugin,
     ) {
         let md_base = self.cfg.editor_font_size;
-        let hl = &self.highlighter;
+        let hl = self.highlighter;
         for pa in &p.panels {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
@@ -14615,7 +14639,7 @@ impl ZaivernApp {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let theme = self.theme.clone();
         let base = self.cfg.editor_font_size;
-        let hl = &self.highlighter;
+        let hl = self.highlighter;
         let images = &mut self.md_images;
         egui::ScrollArea::vertical()
             .id_salt(("md-preview", id))
@@ -15867,7 +15891,7 @@ impl ZaivernApp {
             };
 
         let diag_by_line = &self.diag_cache.1;
-        let hl = &self.highlighter;
+        let hl = self.highlighter;
         let buf = &mut self.editor.buffers[active];
         let Buffer {
             id,
@@ -16801,6 +16825,24 @@ impl ZaivernApp {
             ("⚠".into(), tr("問題パネルの切替"), "⇧⌘M".into(), Cmd::ToggleProblems),
             // ── 第 2 次配線: レビュー / 折りたたみ / ブックマーク / 表 / LSP ──
             ("🔎".into(), tr("変更をレビュー (PR 風のローカルレビュー)"), String::new(), Cmd::OpenReview),
+            (
+                "⇋".into(),
+                tr("差分の表示を切替 (並列 ⇔ 一列)"),
+                String::new(),
+                Cmd::ToggleDiffView,
+            ),
+            (
+                "⤓".into(),
+                tr("差分: 次の変更へ"),
+                fmt_key(BindAction::DiffNextChange),
+                Cmd::DiffNextChange,
+            ),
+            (
+                "⤒".into(),
+                tr("差分: 前の変更へ"),
+                fmt_key(BindAction::DiffPrevChange),
+                Cmd::DiffPrevChange,
+            ),
             (
                 "🔎".into(),
                 tr("レビューの比較: 作業ツリー vs HEAD"),
@@ -18238,7 +18280,7 @@ impl ZaivernApp {
             return json!({"ok": false, "error": "ワークスペース外は開けません"})
                 .to_string();
         }
-        match self.editor.open(&p, &self.highlighter) {
+        match self.editor.open(&p, self.highlighter) {
             Ok(reloaded) => {
                 if reloaded {
                     if let Some(i) = self.editor.active {
@@ -19912,6 +19954,19 @@ impl ZaivernApp {
         // 差分ビューの「エージェントに送る」を拾って入力欄へ流し込む
         if let Some(p) = crate::diff::take_pending_review_prompt(ctx) {
             self.take_review_prompt(p);
+        }
+        // 差分ビューのツールバーで表示モードが切り替えられていたら控えて永続化する
+        // (ctx が実行時の持ち主・config が既定値の持ち主、という 1 方向の関係)。
+        {
+            let m = crate::diff::diff_mode(ctx);
+            if m != crate::diff::DiffMode::from_config_str(&self.cfg.diff_view) {
+                self.cfg.diff_view = m.config_str().into();
+                config::save_state(&self.cfg);
+            }
+        }
+        // 差分ビューからの一言 (「変更はありません」など)
+        if let Some(msg) = crate::diff::take_pending_notice(ctx) {
+            self.toast(msg, true);
         }
         // 別スレッドで開いているファイルダイアログの結果を取り込む
         self.poll_dialogs(ctx);
@@ -25223,6 +25278,10 @@ mod wave2_tests {
         for c in [
             "Cmd::OpenReview",
             "Cmd::SetReviewBase",
+            // ── 差分ビュー (並列 / 変更ジャンプ) ──
+            "Cmd::ToggleDiffView",
+            "Cmd::DiffNextChange",
+            "Cmd::DiffPrevChange",
             "Cmd::ToggleFold",
             "Cmd::FoldAll",
             "Cmd::UnfoldAll",

@@ -106,10 +106,14 @@ pub enum BindAction {
     FocusPane2,
     /// 3 番目のエディタペインへフォーカス (VS Code: ⌘3)
     FocusPane3,
+    /// 差分ビューで次の変更へ (VS Code: F7)
+    DiffNextChange,
+    /// 差分ビューで前の変更へ (VS Code: ⇧F7)
+    DiffPrevChange,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 55] = [
+const ALL_ACTIONS: [BindAction; 57] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -165,6 +169,8 @@ const ALL_ACTIONS: [BindAction; 55] = [
     BindAction::FocusPane1,
     BindAction::FocusPane2,
     BindAction::FocusPane3,
+    BindAction::DiffNextChange,
+    BindAction::DiffPrevChange,
 ];
 
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
@@ -265,6 +271,14 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::FocusPane1 => KeyboardShortcut::new(cmd, Key::Num1),
         BindAction::FocusPane2 => KeyboardShortcut::new(cmd, Key::Num2),
         BindAction::FocusPane3 => KeyboardShortcut::new(cmd, Key::Num3),
+        // 差分の次/前の変更 = VS Code と同じ F7 / ⇧F7。
+        // ファンクションキーの既存割り当ては F2 (リネーム) / F12 (定義へ) /
+        // ⇧F12 (参照検索) だけなので F7 系は空いている。修飾キー無しの単打だが、
+        // 差分ビューが出ていないときは `diff::take_jump` が捨てるので誤爆しない。
+        // macOS が予約するのは ⌘⌥D (Dock) や F11 (Mission Control) 系で、
+        // F7 は既定でメディアキー扱いでもアプリへ届く (fn 併用が要る機種はある)。
+        BindAction::DiffNextChange => KeyboardShortcut::new(Modifiers::NONE, Key::F7),
+        BindAction::DiffPrevChange => KeyboardShortcut::new(Modifiers::SHIFT, Key::F7),
     }
 }
 
@@ -357,6 +371,8 @@ impl Keybinds {
             "focus_pane_1" => FocusPane1,
             "focus_pane_2" => FocusPane2,
             "focus_pane_3" => FocusPane3,
+            "diff_next_change" => DiffNextChange,
+            "diff_prev_change" => DiffPrevChange,
             _ => return None,
         })
     }
@@ -880,7 +896,7 @@ mod tests {
             "lsp_symbols", "lsp_rename", "lsp_format", "lsp_code_action",
             "lsp_signature_help", "select_next_occurrence",
             "split_editor_right", "split_editor_down", "focus_pane_1", "focus_pane_2",
-            "focus_pane_3",
+            "focus_pane_3", "diff_next_change", "diff_prev_change",
         ];
         assert_eq!(names.len(), ALL_ACTIONS.len(), "名前表とアクション一覧の数が合わない");
         let mut resolved: Vec<BindAction> =

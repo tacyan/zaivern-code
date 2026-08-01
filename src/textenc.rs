@@ -1859,6 +1859,81 @@ pub fn truncate_to_width(s: &str, max: usize) -> String {
     out
 }
 
+/// 絵文字の肌色修飾子 (Emoji_Modifier)。前の絵文字にくっついて 1 つの
+/// 書記素クラスタを作るが、幅は 2 なので [`char_width`] では 0 にならない。
+const EMOJI_MODIFIER: (u32, u32) = (0x1F3FB, 0x1F3FF);
+/// 地域表示記号。2 つ並んで 1 つの国旗になる。
+const REGIONAL_INDICATOR: (u32, u32) = (0x1F1E6, 0x1F1FF);
+/// ZERO WIDTH JOINER。直後の文字まで巻き込んで 1 クラスタにする
+/// (`👨‍👩‍👧` = 人 + ZWJ + 人 + ZWJ + 人)。
+const ZWJ: char = '\u{200D}';
+
+fn in_range(r: (u32, u32), c: char) -> bool {
+    let u = c as u32;
+    u >= r.0 && u <= r.1
+}
+
+/// この文字は「直前のクラスタにくっつく」か。
+///
+/// 幅 0 の文字 (結合ダイアクリティカル・異体字セレクタ・ZWJ) と絵文字修飾子が該当する。
+/// **ASCII 制御文字は除く** — `\t` や `\n` も [`char_width`] は 0 を返すが、
+/// これらは独立したトークンでなければ差分のトークン分割が壊れる。
+fn joins_previous(c: char) -> bool {
+    let u = c as u32;
+    if u < 0x20 || u == 0x7F {
+        return false;
+    }
+    char_width(c) == 0 || in_range(EMOJI_MODIFIER, c)
+}
+
+/// `s[at..]` の先頭にある**書記素クラスタ**の終端バイト位置を返す。
+///
+/// `at` は文字境界であること (そうでなければ `at` をそのまま返す)。
+/// 戻り値は必ず文字境界なので、`&s[at..end]` は panic しない。
+///
+/// 完全な UAX #29 ではなく、差分の語単位ハイライトに必要な範囲だけを見る:
+/// 結合記号・異体字セレクタ・ZWJ 連結・絵文字の肌色修飾子・国旗 (地域表示記号 2 つ)。
+/// ハングルのジャモ合成は端末グリッドと同じく 1 文字ずつ扱う
+/// ([`str_width`] の方針と揃える)。
+pub fn grapheme_end(s: &str, at: usize) -> usize {
+    if at >= s.len() || !s.is_char_boundary(at) {
+        return at.min(s.len());
+    }
+    let mut it = s[at..].char_indices();
+    let Some((_, first)) = it.next() else {
+        return s.len();
+    };
+    let mut end = at + first.len_utf8();
+    let regional = in_range(REGIONAL_INDICATOR, first);
+    let mut paired_flag = false;
+    let mut after_zwj = false;
+    for (off, c) in it {
+        let abs = at + off;
+        if after_zwj {
+            // ZWJ の直後は無条件で取り込む (絵文字の連結)。
+            end = abs + c.len_utf8();
+            after_zwj = false;
+            continue;
+        }
+        if c == ZWJ {
+            end = abs + c.len_utf8();
+            after_zwj = true;
+            continue;
+        }
+        if joins_previous(c) {
+            end = abs + c.len_utf8();
+            continue;
+        }
+        if regional && !paired_flag && in_range(REGIONAL_INDICATOR, c) {
+            end = abs + c.len_utf8();
+            paired_flag = true;
+            continue;
+        }
+        break;
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2871,6 +2946,71 @@ mod tests {
         let bytes = "日本語\r\nです\r\n".as_bytes();
         assert_eq!(decode_bytes(bytes).1, Encoding::Utf8);
         assert_eq!(detect_all(bytes)[0].0, Encoding::Utf8);
+    }
+
+    // ---- grapheme_end (差分の語単位ハイライトの土台) -----------------------
+
+    /// 先頭から順に `grapheme_end` を回して、クラスタの列を作る。
+    fn clusters(s: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < s.len() {
+            let e = grapheme_end(s, i);
+            assert!(e > i, "前に進まない: {s:?} at {i}");
+            out.push(&s[i..e]);
+            i = e;
+        }
+        out
+    }
+
+    #[test]
+    fn grapheme_end_table() {
+        // (入力, 期待するクラスタ列, 何を見ているか)
+        let table: &[(&str, &[&str], &str)] = &[
+            ("abc", &["a", "b", "c"], "ASCII は 1 文字 1 クラスタ"),
+            ("日本語", &["日", "本", "語"], "日本語のみ"),
+            ("か\u{3099}き", &["か\u{3099}", "き"], "結合濁点は基底にくっつく"),
+            ("é", &["é"], "合成済み (1 文字)"),
+            ("e\u{0301}", &["e\u{0301}"], "分解形 (基底 + 結合アクセント)"),
+            ("🚀ok", &["🚀", "o", "k"], "4 バイト絵文字は割らない"),
+            ("👍\u{1F3FD}!", &["👍\u{1F3FD}", "!"], "肌色修飾子は前にくっつく"),
+            (
+                "👨\u{200D}👩\u{200D}👧",
+                &["👨\u{200D}👩\u{200D}👧"],
+                "ZWJ の家族絵文字は 1 クラスタ",
+            ),
+            ("🇯🇵🇺🇸", &["🇯🇵", "🇺🇸"], "国旗は地域表示記号 2 つで 1 つ"),
+            ("a\tb", &["a", "\t", "b"], "タブは幅 0 でも独立トークン"),
+            ("あ\u{FE0F}", &["あ\u{FE0F}"], "異体字セレクタは前にくっつく"),
+            ("𝔘𝔫", &["𝔘", "𝔫"], "BMP 外 (4 バイト) を割らない"),
+        ];
+        for (input, want, why) in table {
+            assert_eq!(&clusters(input)[..], *want, "{why}: {input:?}");
+        }
+    }
+
+    #[test]
+    fn grapheme_end_never_splits_a_char() {
+        // 4 バイト文字・結合列・絵文字が混ざった文字列でも、返る位置は必ず文字境界。
+        let s = "a日🚀\u{1F469}\u{200D}\u{1F4BB}か\u{3099}𝔘";
+        let mut i = 0;
+        while i < s.len() {
+            let e = grapheme_end(s, i);
+            assert!(s.is_char_boundary(e), "文字境界でない: {e} in {s:?}");
+            assert!(e > i && e <= s.len());
+            i = e;
+        }
+        assert_eq!(i, s.len(), "最後まで走り切る");
+    }
+
+    #[test]
+    fn grapheme_end_handles_out_of_range_and_non_boundary() {
+        let s = "日本";
+        assert_eq!(grapheme_end(s, s.len()), s.len(), "終端はそのまま");
+        assert_eq!(grapheme_end(s, 999), s.len(), "範囲外は末尾へ丸める");
+        // 文字の途中 (境界でない) を渡しても panic しない
+        assert_eq!(grapheme_end(s, 1), 1, "境界でなければ動かさない");
+        assert_eq!(grapheme_end("", 0), 0, "空文字列");
     }
 }
 

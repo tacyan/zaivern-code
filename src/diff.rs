@@ -1,10 +1,26 @@
-//! unified diff のパースと、追加/削除行を色分けするインライン diff ビュー。
+//! unified diff のパースと、VS Code 相当の diff ビュー。
 //!
 //! `git diff` / `gh pr diff` が吐く unified 形式をそのまま受け取り、
 //! ファイル単位 → ハンク単位 → 行単位に分解して描画する。
 //!
-//! パース部 (`parse_unified`) は純関数で、GUI に依存しない。
-//! ハンクヘッダの解釈は `git::parse_range` / `git::parse_hunk_marks` と同じ流儀
+//! 表示は **一列 (インライン) / 並列 (左右 2 列)** の 2 モード
+//! ([`DiffMode`]) で、幅が足りなければ自動で一列へ縮退する。
+//! 並列でも左右のセルは**同じ 1 本の行矩形**の中に置くので、対応する行の
+//! 高さは構造的に必ず揃い、スクロールの同期処理そのものが要らない
+//! (= 毎フレームの再描画要求もゼロ)。
+//!
+//! **判断は全部 GUI に依存しない純関数へ切り出してある**:
+//!
+//! | 何を決めるか | 関数 |
+//! |---|---|
+//! | 幅 → 桁割り / 縮退 | [`diff_layout`] |
+//! | 左右の行の対応付け | [`align_hunk`] |
+//! | 語単位ハイライト | [`word_diff`] |
+//! | 未変更行の折りたたみ | [`fold_context_runs`] |
+//! | 変更箇所のジャンプ先 | [`change_blocks`] / [`next_change_index`] |
+//!
+//! パース部 (`parse_unified`) も純関数。ハンクヘッダの解釈は
+//! `git::parse_range` / `git::parse_hunk_marks` と同じ流儀
 //! (カウント省略 = 1、行番号は diff 上 1-based) に揃えてある。
 
 
@@ -708,6 +724,627 @@ fn process_file_level(line: &str, cur: &mut Option<FileDiff>, files: &mut Vec<Fi
     // 追加情報を持たないので読み飛ばす。
 }
 
+// ===========================================================================
+// 表示の決定層 — **GUI に一切依存しない純関数**
+//
+// 並列表示の行揃え・幅による縮退・語単位ハイライト・文脈行の折りたたみ・
+// 変更箇所のジャンプ先は、すべてここで決めてテーブルテストで固定する。
+// 描画側 (下の「描画」節) はここが返した値をそのまま絵にするだけ。
+// ===========================================================================
+
+/// 差分の表示モード。**独立した bool を並べない** — 2 つのビューが同時に
+/// 描かれる事故を型で潰すため、必ずこの 1 つの列挙型で持つ。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffMode {
+    /// 1 列に `+` / `-` を混ぜる表示。狭い幅ではこちらへ自動縮退する。
+    Inline,
+    /// 左 = 変更前 / 右 = 変更後 の 2 列 (VS Code の既定)。
+    #[default]
+    SideBySide,
+}
+
+impl DiffMode {
+    /// config の文字列から。未知の値は既定 (並列)。
+    pub fn from_config_str(s: &str) -> DiffMode {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "inline" | "unified" | "1" => DiffMode::Inline,
+            _ => DiffMode::SideBySide,
+        }
+    }
+
+    /// config へ書く文字列。
+    pub fn config_str(self) -> &'static str {
+        match self {
+            DiffMode::Inline => "inline",
+            DiffMode::SideBySide => "side_by_side",
+        }
+    }
+
+    pub fn toggled(self) -> DiffMode {
+        match self {
+            DiffMode::Inline => DiffMode::SideBySide,
+            DiffMode::SideBySide => DiffMode::Inline,
+        }
+    }
+
+    /// UI に出す名前。
+    pub fn label(self) -> String {
+        match self {
+            DiffMode::Inline => tr("一列 (インライン)"),
+            DiffMode::SideBySide => tr("並列 (左右)"),
+        }
+    }
+}
+
+/// 行番号 1 列の幅。
+const GUTTER_COL_W: f32 = 34.0;
+/// `+` / `-` の記号列の幅。
+const SIGN_W: f32 = 12.0;
+/// コメントマーカー列の幅 (常に確保して行のズレを防ぐ)。
+const MARK_COL_W: f32 = 16.0;
+/// 左右ペインの間の溝。
+const PANE_GAP: f32 = 8.0;
+
+/// 本文が読める最小幅。
+///
+/// 差分の本文は等幅 12.5px で描くので 1 桁およそ 7.5px。240px ≒ 32 桁で、
+/// これは「インデント 1 段 + 識別子 + 演算子」がぎりぎり読める最小単位。
+/// これを下回ると左右に並べても両側とも読めず、横スクロールも無い
+/// (行は `available_width()` に収める規約) ため、並べる意味が無くなる。
+const MIN_CODE_W: f32 = 240.0;
+
+/// 1 ペインが要求する最小幅 = 行番号 + コメント印 + 記号 + 本文。
+const PANE_MIN_W: f32 = GUTTER_COL_W + MARK_COL_W + SIGN_W + MIN_CODE_W;
+
+/// これ未満の可用幅では並列をやめてインラインへ**自動縮退**する。
+///
+/// 2 ペイン + 溝 = 34+16+12+240 の 2 倍 + 8 = 612px。
+/// VS Code の `diffEditor.renderSideBySideInlineBreakpoint` は既定 900px だが、
+/// あちらは各ペインにミニマップと独立したスクロールバーを抱えている。
+/// こちらはどちらも持たないぶん、同じ読みやすさをより狭い幅で出せる。
+pub const SIDE_BY_SIDE_MIN_W: f32 = PANE_MIN_W * 2.0 + PANE_GAP;
+
+/// 1 ペインの桁割り。x は差分ビューの左端を 0 とした相対座標。
+///
+/// **不変条件**: `x >= 0`、`x + width <= 可用幅`、
+/// `gutter_w + mark_w + sign_w + text_w == width`、すべて非負。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneCols {
+    pub x: f32,
+    pub width: f32,
+    /// 行番号列の合計幅 (`cols` 本ぶん)。
+    pub gutter_w: f32,
+    /// 行番号列の本数。インライン = 2 (旧/新)、並列 = 1。
+    pub cols: u8,
+    pub mark_w: f32,
+    pub sign_w: f32,
+    /// 本文の左端 (絶対ではなく差分ビュー左端からの相対)。
+    pub text_x: f32,
+    pub text_w: f32,
+}
+
+/// 幅とモードから決まる差分ビューのレイアウト。
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiffLayout {
+    /// ユーザーが選んでいるモード。
+    pub requested: DiffMode,
+    /// 実際に描くモード (幅が足りなければ縮退後)。
+    pub mode: DiffMode,
+    /// 使える横幅 (スナップ済み)。
+    pub width: f32,
+    /// 左右ペインの溝 (インラインでは 0)。
+    pub gap: f32,
+    /// インライン = 1 枚、並列 = 2 枚 (左, 右)。
+    pub panes: Vec<PaneCols>,
+}
+
+impl DiffLayout {
+    /// 幅が足りなくてインラインへ落とされたか。
+    pub fn degraded(&self) -> bool {
+        self.requested != self.mode
+    }
+}
+
+/// 残り幅から `want` を切り出す。足りなければ残り全部 (負にはしない)。
+fn cut(rem: &mut f32, want: f32, ppp: f32) -> f32 {
+    let w = crate::theme::snap_len(want.max(0.0), ppp).min(*rem).max(0.0);
+    *rem -= w;
+    w
+}
+
+/// 1 ペインの桁割りを作る。**幅が足りないときは右の列から順に潰れる**ので、
+/// どんなに狭くても合計がペイン幅を超えない。
+fn pane_cols(x: f32, width: f32, cols: u8, ppp: f32) -> PaneCols {
+    let width = width.max(0.0);
+    let mut rem = width;
+    let gutter_w = cut(&mut rem, GUTTER_COL_W * cols as f32, ppp);
+    let mark_w = cut(&mut rem, MARK_COL_W, ppp);
+    let sign_w = cut(&mut rem, SIGN_W, ppp);
+    PaneCols {
+        x,
+        width,
+        gutter_w,
+        cols,
+        mark_w,
+        sign_w,
+        text_x: x + gutter_w + mark_w + sign_w,
+        // 端数はすべて本文が吸う = 合計はぴったり width。
+        text_w: rem,
+    }
+}
+
+/// 可用幅と希望モードから、実際に描くレイアウトを決める**純関数**。
+///
+/// `ppp` (pixels per point) を受けるのは、桁の境界を物理ピクセルへ揃える
+/// ため (`theme::snap_len`)。小数のまま置くと epaint が文字位置だけを丸めて
+/// 桁間隔が揺れる — 端末セルと同じ罠。
+pub fn diff_layout(available_w: f32, mode: DiffMode, ppp: f32) -> DiffLayout {
+    let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+    let w = if available_w.is_finite() {
+        crate::theme::snap_len(available_w.max(0.0), ppp)
+    } else {
+        0.0
+    };
+    let effective = if mode == DiffMode::SideBySide && w >= SIDE_BY_SIDE_MIN_W {
+        DiffMode::SideBySide
+    } else {
+        DiffMode::Inline
+    };
+    let (gap, panes) = match effective {
+        DiffMode::Inline => (0.0, vec![pane_cols(0.0, w, 2, ppp)]),
+        DiffMode::SideBySide => {
+            let gap = crate::theme::snap_len(PANE_GAP, ppp);
+            let left_w = crate::theme::snap_len(((w - gap) * 0.5).max(0.0), ppp);
+            let right_x = (left_w + gap).min(w);
+            let right_w = (w - right_x).max(0.0);
+            (
+                gap,
+                vec![
+                    pane_cols(0.0, left_w, 1, ppp),
+                    pane_cols(right_x, right_w, 1, ppp),
+                ],
+            )
+        }
+    };
+    DiffLayout {
+        requested: mode,
+        mode: effective,
+        width: w,
+        gap,
+        panes,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 並列表示の行揃え
+// ---------------------------------------------------------------------------
+
+/// ハンク内の 1 行を指す。`idx` は [`Hunk::lines`] の添字。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineRef {
+    pub idx: usize,
+}
+
+impl LineRef {
+    fn at(idx: usize) -> LineRef {
+        LineRef { idx }
+    }
+}
+
+/// ハンクを「左 (変更前) / 右 (変更後)」の行の対に畳む**純関数**。
+///
+/// * 文脈行は左右に同じ行が並ぶ。
+/// * 連続する削除と、それに続く連続する追加は**置換の組**として同じ高さに並べる。
+/// * 数が合わない側は `None` (= 反対側に空のプレースホルダ行を置く)。
+///
+/// 追加が先に来て削除が後に来る (順序が逆の) ハンクでも、塊の切れ目で
+/// いったん確定させるので行が入れ替わらない。
+pub fn align_hunk(hunk: &Hunk) -> Vec<(Option<LineRef>, Option<LineRef>)> {
+    let mut out: Vec<(Option<LineRef>, Option<LineRef>)> = Vec::with_capacity(hunk.lines.len());
+    let mut dels: Vec<usize> = Vec::new();
+    let mut adds: Vec<usize> = Vec::new();
+
+    fn flush(
+        dels: &mut Vec<usize>,
+        adds: &mut Vec<usize>,
+        out: &mut Vec<(Option<LineRef>, Option<LineRef>)>,
+    ) {
+        let n = dels.len().max(adds.len());
+        for i in 0..n {
+            out.push((
+                dels.get(i).copied().map(LineRef::at),
+                adds.get(i).copied().map(LineRef::at),
+            ));
+        }
+        dels.clear();
+        adds.clear();
+    }
+
+    for (i, line) in hunk.lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Removed => {
+                // 追加のあとに削除が来たら、そこで塊が切れている。
+                if !adds.is_empty() {
+                    flush(&mut dels, &mut adds, &mut out);
+                }
+                dels.push(i);
+            }
+            LineKind::Added => adds.push(i),
+            LineKind::Context => {
+                flush(&mut dels, &mut adds, &mut out);
+                out.push((Some(LineRef::at(i)), Some(LineRef::at(i))));
+            }
+        }
+    }
+    flush(&mut dels, &mut adds, &mut out);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 語単位 (書記素クラスタ単位) のハイライト
+// ---------------------------------------------------------------------------
+
+/// 行内の「変わった部分」のバイト範囲 (半開区間)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WordSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// 語単位判定を諦める行長 (バイト)。これを超える行は行全体を塗る。
+const WORD_DIFF_MAX_BYTES: usize = 8_192;
+/// 語単位判定を諦める DP のマス数。`|old| * |new|` がこれを超えたら諦める。
+/// 500x500 = 25 万マス。1 行の比較で数 ms を超えさせない上限。
+const WORD_DIFF_MAX_CELLS: usize = 250_000;
+/// トークン 1 個どうしを文字単位で精査するときの上限 (128x128)。
+const WORD_DIFF_REFINE_MAX_CELLS: usize = 16_384;
+/// 精査した結果、語のこの割合以上が変わっていたら語ごと塗る。
+/// 点在する塗りは「どこが変わったか」を却って分かりにくくする。
+const REFINE_COVER_RATIO: f32 = 0.6;
+
+/// ASCII の識別子を作る文字か (ここだけ 1 トークンにまとめる)。
+///
+/// **ASCII に限る**のが要点。日本語や絵文字までまとめると 1 行が 1 トークンに
+/// なり、語単位ハイライトが行全体の塗りに退化する (CJK では実際にそうなる)。
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// 行をトークン列 (バイト範囲) に割る。
+///
+/// ASCII の識別子は 1 トークン、それ以外は**書記素クラスタ 1 個**が 1 トークン。
+/// クラスタ単位なので、結合濁点・異体字セレクタ・ZWJ 絵文字・国旗を割らない
+/// (= 4 バイト文字の途中で範囲が切れることが原理的に起きない)。
+fn tokenize(s: &str) -> Vec<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < s.len() {
+        if is_word_byte(bytes[i]) {
+            let start = i;
+            while i < s.len() && is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            out.push((start, i));
+        } else {
+            let end = crate::textenc::grapheme_end(s, i);
+            // grapheme_end は必ず前に進むが、万一に備えて止まらない保険。
+            let end = if end > i { end } else { i + 1 };
+            out.push((i, end.min(s.len())));
+            i = end;
+        }
+    }
+    out
+}
+
+/// 連続するトークン範囲を 1 つの [`WordSpan`] にまとめる。
+fn merge_spans(ranges: &[(usize, usize)]) -> Vec<WordSpan> {
+    let mut out: Vec<WordSpan> = Vec::new();
+    for &(s, e) in ranges {
+        match out.last_mut() {
+            Some(last) if last.end == s => last.end = e,
+            _ => out.push(WordSpan { start: s, end: e }),
+        }
+    }
+    out
+}
+
+/// 書記素クラスタ 1 個ずつのバイト範囲。
+fn cluster_ranges(s: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < s.len() {
+        let end = crate::textenc::grapheme_end(s, i);
+        let end = if end > i { end } else { i + 1 };
+        let end = end.min(s.len());
+        out.push((i, end));
+        i = end;
+    }
+    out
+}
+
+/// 先頭・末尾で一致するトークン数 `(接頭辞, 接尾辞)`。区間は重ならない。
+fn common_affix(av: &[&str], bv: &[&str]) -> (usize, usize) {
+    let mut p = 0usize;
+    while p < av.len() && p < bv.len() && av[p] == bv[p] {
+        p += 1;
+    }
+    let mut s = 0usize;
+    while s < av.len() - p && s < bv.len() - p && av[av.len() - 1 - s] == bv[bv.len() - 1 - s] {
+        s += 1;
+    }
+    (p, s)
+}
+
+/// トークン列の LCS を取り、「同じ位置で置き換わった塊」ごとに
+/// `(旧側のトークン, 新側のトークン)` を返す。
+///
+/// マス数が `max_cells` を超えるときは `None` (呼び出し側が諦める)。
+/// 計算量・記憶量ともに `|a| * |b|` なので、上限はここで必ず効かせる。
+#[allow(clippy::type_complexity)]
+fn lcs_groups(
+    a: &[(usize, usize)],
+    av: &[&str],
+    b: &[(usize, usize)],
+    bv: &[&str],
+    max_cells: usize,
+) -> Option<Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)>> {
+    let (n, m) = (av.len(), bv.len());
+    if n.saturating_mul(m) > max_cells {
+        return None;
+    }
+    // dp[i][j] = av[i..] と bv[j..] の LCS 長
+    let mut dp = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[at(i, j)] = if av[i] == bv[j] {
+                dp[at(i + 1, j + 1)] + 1
+            } else {
+                dp[at(i + 1, j)].max(dp[at(i, j + 1)])
+            };
+        }
+    }
+    let mut groups: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)> = Vec::new();
+    let mut cur: (Vec<(usize, usize)>, Vec<(usize, usize)>) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if av[i] == bv[j] {
+            if !cur.0.is_empty() || !cur.1.is_empty() {
+                groups.push(std::mem::take(&mut cur));
+            }
+            i += 1;
+            j += 1;
+        } else if dp[at(i + 1, j)] >= dp[at(i, j + 1)] {
+            cur.0.push(a[i]);
+            i += 1;
+        } else {
+            cur.1.push(b[j]);
+            j += 1;
+        }
+    }
+    while i < n {
+        cur.0.push(a[i]);
+        i += 1;
+    }
+    while j < m {
+        cur.1.push(b[j]);
+        j += 1;
+    }
+    if !cur.0.is_empty() || !cur.1.is_empty() {
+        groups.push(cur);
+    }
+    Some(groups)
+}
+
+/// トークン 1 個どうしの置換を、書記素クラスタ単位でさらに細かく突き合わせる。
+///
+/// `count` → `counter` を「語まるごと」ではなく「増えた `er` だけ」の塗りにする
+/// (VS Code と同じ粒度)。ただし**塗りが点在すると却って読みにくい**ので、
+/// 変更が語の大半 ([`REFINE_COVER_RATIO`] 以上) に及ぶときや、塗りが 3 つ以上に
+/// 割れるときは語ごと塗りへ戻す。
+fn refine_pair(
+    old: &str,
+    a: (usize, usize),
+    new: &str,
+    b: (usize, usize),
+) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let whole = || (vec![a], vec![b]);
+    let (os, ns) = (&old[a.0..a.1], &new[b.0..b.1]);
+    let ar = cluster_ranges(os);
+    let br = cluster_ranges(ns);
+    let av: Vec<&str> = ar.iter().map(|&(x, y)| &os[x..y]).collect();
+    let bv: Vec<&str> = br.iter().map(|&(x, y)| &ns[x..y]).collect();
+    let (p, s) = common_affix(&av, &bv);
+    if p == 0 && s == 0 {
+        // 1 文字も共有しないなら刻む意味が無い。
+        return whole();
+    }
+    let (am, bm) = (&ar[p..ar.len() - s], &br[p..br.len() - s]);
+    let (amv, bmv) = (&av[p..av.len() - s], &bv[p..bv.len() - s]);
+    let Some(groups) = lcs_groups(am, amv, bm, bmv, WORD_DIFF_REFINE_MAX_CELLS) else {
+        return whole();
+    };
+    if groups.len() > 2 {
+        return whole();
+    }
+    let mut oc: Vec<(usize, usize)> = Vec::new();
+    let mut nc: Vec<(usize, usize)> = Vec::new();
+    for (d, i) in groups {
+        oc.extend(d.into_iter().map(|(x, y)| (a.0 + x, a.0 + y)));
+        nc.extend(i.into_iter().map(|(x, y)| (b.0 + x, b.0 + y)));
+    }
+    let covered = |spans: &[(usize, usize)], total: usize| -> f32 {
+        if total == 0 {
+            return 0.0;
+        }
+        spans.iter().map(|(x, y)| y - x).sum::<usize>() as f32 / total as f32
+    };
+    if covered(&oc, a.1 - a.0) >= REFINE_COVER_RATIO
+        || covered(&nc, b.1 - b.0) >= REFINE_COVER_RATIO
+    {
+        return whole();
+    }
+    (oc, nc)
+}
+
+/// 置換された行の対から「変わった部分」だけを取り出す**純関数**。
+///
+/// 戻り値は `(旧側の範囲, 新側の範囲)`。`None` は**語単位を諦めた**印で、
+/// 呼び出し側は行全体を塗る (極端に長い行で O(n²) を走らせないための逃げ)。
+/// 完全に同じ行なら `Some((空, 空))`。
+///
+/// 手順は 2 段:
+/// 1. 共通接頭辞・接尾辞を**トークン単位**で削り、残った中央部を LCS で突き合わせる。
+///    トークンは「ASCII の識別子 1 個」か「書記素クラスタ 1 個」なので、
+///    日本語のように空白の無い言語でも文字単位まで刻める。
+/// 2. 1 対 1 の置換だけ、さらに**書記素クラスタ単位**で精査する
+///    ([`refine_pair`])。`count` → `counter` が語まるごとの塗りにならない。
+///
+/// 前後が一致している行 (実際の差分のほとんど) では中央部が数トークンまで
+/// 縮むので、上限に当たること自体が稀。
+pub fn word_diff(old: &str, new: &str) -> Option<(Vec<WordSpan>, Vec<WordSpan>)> {
+    if old == new {
+        return Some((Vec::new(), Vec::new()));
+    }
+    if old.len() > WORD_DIFF_MAX_BYTES || new.len() > WORD_DIFF_MAX_BYTES {
+        return None;
+    }
+    let ar = tokenize(old);
+    let br = tokenize(new);
+    let av: Vec<&str> = ar.iter().map(|&(x, y)| &old[x..y]).collect();
+    let bv: Vec<&str> = br.iter().map(|&(x, y)| &new[x..y]).collect();
+    let (p, s) = common_affix(&av, &bv);
+    let (am, bm) = (&ar[p..ar.len() - s], &br[p..br.len() - s]);
+    let (amv, bmv) = (&av[p..av.len() - s], &bv[p..bv.len() - s]);
+    let groups = lcs_groups(am, amv, bm, bmv, WORD_DIFF_MAX_CELLS)?;
+    let mut oc: Vec<(usize, usize)> = Vec::new();
+    let mut nc: Vec<(usize, usize)> = Vec::new();
+    for (d, i) in groups {
+        if let ([one], [two]) = (&d[..], &i[..]) {
+            let (a2, b2) = refine_pair(old, *one, new, *two);
+            oc.extend(a2);
+            nc.extend(b2);
+        } else {
+            oc.extend(d);
+            nc.extend(i);
+        }
+    }
+    Some((merge_spans(&oc), merge_spans(&nc)))
+}
+
+// ---------------------------------------------------------------------------
+// 未変更行の折りたたみ
+// ---------------------------------------------------------------------------
+
+/// 畳む行の区間 (半開区間)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldRun {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl FoldRun {
+    pub fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+}
+
+/// 変更の前後に残す文脈行の数 (VS Code の既定と同じ 3 行)。
+pub const CONTEXT_KEEP: usize = 3;
+
+/// 連続する文脈行のうち、前後 `keep` 行を残した**中央部**を畳む**純関数**。
+///
+/// 畳んだ結果が 2 行に満たない塊は畳まない (「⋯ 1 行を展開」は
+/// 元の 1 行より場所を食うだけで得が無い)。つまり `2*keep + 2` 行以上
+/// 続いたときにだけ畳む。`keep == 0` なら 2 行以上の塊すべてが対象。
+pub fn fold_context_runs(kinds: &[LineKind], keep: usize) -> Vec<FoldRun> {
+    let min_run = keep * 2 + 2;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < kinds.len() {
+        if kinds[i] != LineKind::Context {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < kinds.len() && kinds[i] == LineKind::Context {
+            i += 1;
+        }
+        if i - start >= min_run {
+            out.push(FoldRun {
+                start: start + keep,
+                end: i - keep,
+            });
+        }
+    }
+    out
+}
+
+/// `line` を隠す折りたたみがあれば、その区間を返す。
+pub fn fold_covering(runs: &[FoldRun], line: usize) -> Option<FoldRun> {
+    runs.iter()
+        .find(|r| line >= r.start && line < r.end)
+        .copied()
+}
+
+// ---------------------------------------------------------------------------
+// 変更箇所のジャンプ (F7 / ⇧F7)
+// ---------------------------------------------------------------------------
+
+/// 変更の塊の先頭位置。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChangeAnchor {
+    pub file: usize,
+    pub hunk: usize,
+    /// [`Hunk::lines`] の添字。
+    pub line: usize,
+}
+
+/// 「変更の塊」= 文脈行に挟まれた追加/削除のひと続き、の先頭を全部集める
+/// **純関数**。F7 / ⇧F7 の飛び先はこの列を順に辿る。
+pub fn change_blocks(files: &[FileDiff]) -> Vec<ChangeAnchor> {
+    let mut out = Vec::new();
+    for (fi, f) in files.iter().enumerate() {
+        for (hi, h) in f.hunks.iter().enumerate() {
+            let mut prev_changed = false;
+            for (li, l) in h.lines.iter().enumerate() {
+                let changed = l.kind != LineKind::Context;
+                if changed && !prev_changed {
+                    out.push(ChangeAnchor {
+                        file: fi,
+                        hunk: hi,
+                        line: li,
+                    });
+                }
+                prev_changed = changed;
+            }
+        }
+    }
+    out
+}
+
+/// 現在位置と向きから次の変更番号を決める**純関数**。
+///
+/// * まだどこにも居ない (`None`) なら、前向きは先頭・後ろ向きは末尾へ。
+/// * 端を越えたら反対側へ回り込む。
+/// * 変更が 0 件なら `None` (呼び出し側は「変更はありません」と伝えるだけ)。
+pub fn next_change_index(cur: Option<usize>, delta: i32, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let forward = delta >= 0;
+    let Some(cur) = cur else {
+        return Some(if forward { 0 } else { len - 1 });
+    };
+    let cur = cur.min(len - 1);
+    Some(if forward {
+        (cur + 1) % len
+    } else {
+        (cur + len - 1) % len
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 描画
 // ---------------------------------------------------------------------------
@@ -723,6 +1360,11 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 struct DiffPalette {
     add_bg: Color32,
     del_bg: Color32,
+    /// 語単位で「ここが変わった」を示す濃いめの塗り (行の地色より強い)。
+    add_word_bg: Color32,
+    del_word_bg: Color32,
+    /// 片側にしか行が無いときの空プレースホルダ (VS Code の斜線帯に相当)。
+    void_bg: Color32,
     gutter_bg: Color32,
     hunk_bg: Color32,
     add_fg: Color32,
@@ -733,9 +1375,14 @@ impl DiffPalette {
     fn from_theme(t: &Theme) -> Self {
         // ライトテーマは地の明度が高く、同じ比率では色が沈むので濃いめに混ぜる。
         let tint = if t.dark { 0.18 } else { 0.26 };
+        // 語単位の塗りは行の地色の 2 倍強度。行の中で「ここ」が分かる濃さ。
+        let word = if t.dark { 0.42 } else { 0.5 };
         DiffPalette {
             add_bg: mix(t.bg, t.ok, tint),
             del_bg: mix(t.bg, t.err, tint),
+            add_word_bg: mix(t.bg, t.ok, word),
+            del_word_bg: mix(t.bg, t.err, word),
+            void_bg: mix(t.bg, t.panel, if t.dark { 0.55 } else { 0.75 }),
             gutter_bg: mix(t.bg, t.panel, 0.7),
             hunk_bg: mix(t.bg, t.accent_soft, 0.9),
             // 記号 (+/-) は本文より強調するが、テーマ色を保つ。
@@ -745,10 +1392,94 @@ impl DiffPalette {
     }
 }
 
-const GUTTER_COL_W: f32 = 34.0;
-const SIGN_W: f32 = 12.0;
-/// コメントマーカー列の幅 (常に確保して行のズレを防ぐ)。
-const MARK_COL_W: f32 = 16.0;
+// ---------------------------------------------------------------------------
+// 表示モード / ジャンプ要求の受け渡し
+//
+// diff_ui の**シグネチャを変えずに**アプリ側と状態を共有するための口。
+// 既存の `take_pending_review_prompt` と同じ流儀 (型で衝突を防ぐ newtype を
+// egui の一時データへ置く) に揃えてある。
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ModeCell(DiffMode);
+
+fn mode_id() -> egui::Id {
+    egui::Id::new("zv-diff-mode")
+}
+
+/// いま使う表示モード。未設定なら既定 (並列)。
+pub fn diff_mode(ctx: &egui::Context) -> DiffMode {
+    ctx.data(|d| d.get_temp::<ModeCell>(mode_id()))
+        .unwrap_or_default()
+        .0
+}
+
+/// 表示モードを差し替える (config の既定の反映・トグル・パレットから使う)。
+pub fn set_diff_mode(ctx: &egui::Context, mode: DiffMode) {
+    ctx.data_mut(|d| d.insert_temp(mode_id(), ModeCell(mode)));
+}
+
+/// 変更箇所ジャンプの依頼。`frame` を持つのは、差分ビューが出ていない
+/// フレームに撃たれた依頼が**後で暴発しない**ようにするため。
+/// `Default` は egui の `remove_temp` の型境界を満たすためだけに要る
+/// (`delta == 0` は「何も頼まれていない」に等しく、無害な値)。
+#[derive(Clone, Copy, Debug, Default)]
+struct JumpRequest {
+    delta: i32,
+    frame: u64,
+}
+
+fn jump_id() -> egui::Id {
+    egui::Id::new("zv-diff-jump")
+}
+
+/// 次 (`delta > 0`) / 前 (`delta < 0`) の変更へ飛ぶよう頼む。
+pub fn request_jump(ctx: &egui::Context, delta: i32) {
+    let frame = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(jump_id(), JumpRequest { delta, frame }));
+}
+
+/// 依頼を 1 回だけ取り出す。1 フレーム以上前の依頼は捨てる
+/// (差分ビューが出ていないときに撃たれた F7 は、静かに無かったことにする)。
+fn take_jump(ctx: &egui::Context) -> Option<i32> {
+    let req = ctx.data_mut(|d| d.remove_temp::<JumpRequest>(jump_id()))?;
+    (ctx.cumulative_pass_nr().saturating_sub(req.frame) <= 1).then_some(req.delta)
+}
+
+/// 差分ビューがアプリへ伝えたい一言 (「変更はありません」など)。
+#[derive(Clone, Debug, Default)]
+struct PendingNotice(String);
+
+fn notice_id() -> egui::Id {
+    egui::Id::new("zv-diff-notice")
+}
+
+/// 差分ビューからの通知を **1 回だけ**取り出す。app.rs 側でトーストにする。
+pub fn take_pending_notice(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|d| d.remove_temp::<PendingNotice>(notice_id()))
+        .map(|n| n.0)
+        .filter(|s| !s.is_empty())
+}
+
+fn set_notice(ctx: &egui::Context, msg: String) {
+    ctx.data_mut(|d| d.insert_temp(notice_id(), PendingNotice(msg)));
+}
+
+/// いま選ばれている変更番号 (F7 で進む位置)。
+#[derive(Clone, Copy, Debug, Default)]
+struct NavCell(Option<usize>);
+
+/// 展開済みの折りたたみ (ファイル, ハンク, 区間の先頭)。既定は「全部畳む」。
+#[derive(Clone, Debug, Default)]
+struct UnfoldedCell(std::collections::HashSet<(usize, usize, usize)>);
+
+/// ファイル差分ごとの構文色キャッシュ。`key` が変わったときだけ計算し直す。
+#[derive(Clone)]
+struct HlCell {
+    key: u64,
+    /// ハンクを跨いだ通し番号 → その行の (開始, 終了, 色)。
+    spans: std::sync::Arc<Vec<Vec<(usize, usize, Color32)>>>,
+}
 
 /// diff ビューが呼び出し側へ返すアクション。
 ///
@@ -784,7 +1515,10 @@ pub fn take_pending_review_prompt(ctx: &egui::Context) -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
-/// diff をインライン表示する。スクロールは呼び出し側の責務。
+/// diff を表示する。スクロールは呼び出し側の責務。
+///
+/// 表示モード (一列 / 並列) は [`diff_mode`] が返す**単一の列挙型**で決まり、
+/// 幅が足りなければ [`diff_layout`] が自動で一列へ縮退させる。
 ///
 /// コメントの状態は egui の一時データ (この `Ui` の id 由来) に持たせるので、
 /// 呼び出し元がストアを抱えなくてもインラインコメントが使える。生成された
@@ -799,6 +1533,10 @@ pub fn diff_ui(ui: &mut egui::Ui, theme: &Theme, files: &[FileDiff]) {
             .data_mut(|d| d.insert_temp(pending_review_id(), PendingReview(prompt)));
     }
 }
+
+/// 構文ハイライトを諦める差分の大きさ (バイト)。
+/// これを超えるファイル差分は素の色で描く (`editor::LargeFileMode` と同じ考え方)。
+const DIFF_HL_MAX_BYTES: usize = 200_000;
 
 /// コメントストアを外から与える版。返り値で「エージェントに送る」を受け取れる。
 pub fn diff_ui_with_actions(
@@ -819,7 +1557,47 @@ pub fn diff_ui_with_actions(
         return DiffAction::None;
     }
 
-    let action = review_toolbar_ui(ui, theme, comments, size);
+    let ppp = ui.ctx().pixels_per_point();
+    let mode = diff_mode(ui.ctx());
+    // ファイルの中身は CollapsingHeader のぶんだけ字下げされる。行はその
+    // **内側の幅**に収めなければならないので、操作バーの表示判断も同じ幅で行う
+    // (実際の桁割りは下で body の available_width から取り直す)。
+    let outer = diff_layout(
+        (ui.available_width() - ui.spacing().indent).max(0.0),
+        mode,
+        ppp,
+    );
+    let action = diff_toolbar_ui(ui, theme, comments, size, &outer);
+
+    // --- F7 / ⇧F7: 次/前の変更へ ---------------------------------------
+    let nav_id = ui.id().with("zv-diff-nav");
+    let mut jump_to: Option<ChangeAnchor> = None;
+    if let Some(delta) = take_jump(ui.ctx()) {
+        let blocks = change_blocks(files);
+        let cur = ui
+            .data(|d| d.get_temp::<NavCell>(nav_id))
+            .unwrap_or_default()
+            .0;
+        match next_change_index(cur, delta, blocks.len()) {
+            Some(n) => {
+                ui.data_mut(|d| d.insert_temp(nav_id, NavCell(Some(n))));
+                jump_to = blocks.get(n).copied();
+            }
+            // 変更が 0 件: 何も動かさず、ひとこと伝えるだけ。
+            None => set_notice(ui.ctx(), tr("変更はありません")),
+        }
+    }
+
+    // --- 文脈行の折りたたみ (既定は畳む。展開したものだけ覚える) --------
+    let unfold_id = ui.id().with("zv-diff-unfold");
+    let mut unfolded = ui
+        .data(|d| d.get_temp::<UnfoldedCell>(unfold_id))
+        .unwrap_or_default()
+        .0;
+    let mut unfold_toggle: Option<(usize, usize, usize)> = None;
+
+    let font = FontId::monospace(size);
+    let row_h = crate::theme::snap_len(ui.fonts(|f| f.row_height(&font)) + 2.0, ppp);
 
     for (fi, file) in files.iter().enumerate() {
         let header = file_header_job(file, theme, size);
@@ -846,68 +1624,167 @@ pub fn diff_ui_with_actions(
                     ui.label(RichText::new(msg).color(theme.text_dim).size(size));
                     return;
                 }
-                // 仮想化: 画面外の行はウィジェットを組み立てず、同じ高さの
-                // 空白だけ確保する。数千行の PR でも毎フレームのコストは
-                // 可視行ぶんだけになる (行高は最初に描いた 1 行から実測)。
-                // ただしコメント/下書きが付いた行は高さが違うので必ず実描画し、
-                // 以降の行の座標が狂わないようにする。
+                // 字下げされた**この ui の幅**で桁を割る。外側の幅で割ると
+                // 右ペインが字下げのぶんだけ右へはみ出す。
+                let lay = diff_layout(ui.available_width(), mode, ppp);
+                let syntax = file_line_colors(ui, theme, file, &path, fi);
                 let clip = ui.clip_rect();
-                let mut row_h: Option<f32> = None;
+                // ファイル内の通し行番号 (syntax の添字)。
+                let mut ord = 0usize;
                 for (hi, hunk) in file.hunks.iter().enumerate() {
                     hunk_header_ui(ui, theme, &pal, hunk, size);
-                    for (li, line) in hunk.lines.iter().enumerate() {
-                        let anchor = line_anchor(&path, line);
-                        let expanded = anchor.as_ref().is_some_and(|a| comments.has_ui_at(a));
-                        if let (Some(h), false) = (row_h, expanded) {
-                            let top = ui.cursor().top();
-                            if top + h < clip.top() || top > clip.bottom() {
-                                ui.allocate_space(egui::vec2(ui.available_width(), h));
+                    let base = ord;
+                    ord += hunk.lines.len();
+                    let kinds: Vec<LineKind> = hunk.lines.iter().map(|l| l.kind).collect();
+                    let folds = fold_context_runs(&kinds, CONTEXT_KEEP);
+                    let rows: Vec<(Option<LineRef>, Option<LineRef>)> = match lay.mode {
+                        // 一列: 左右の区別が無いので「左だけ」に全行を流す。
+                        DiffMode::Inline => (0..hunk.lines.len())
+                            .map(|i| (Some(LineRef::at(i)), None))
+                            .collect(),
+                        DiffMode::SideBySide => align_hunk(hunk),
+                    };
+                    for (left, right) in rows {
+                        // 折りたたみ対象かどうかは「文脈行の添字」で決まる。
+                        let li = left.or(right).map(|r| r.idx).unwrap_or(0);
+                        if let Some(run) = fold_covering(&folds, li) {
+                            if !unfolded.contains(&(fi, hi, run.start)) {
+                                if li == run.start
+                                    && fold_row_ui(ui, theme, &pal, &lay, run.len(), size, row_h)
+                                {
+                                    unfold_toggle = Some((fi, hi, run.start));
+                                }
                                 continue;
                             }
                         }
-                        let badge = anchor.as_ref().and_then(|a| comments.badge(a));
-                        let (h, resp) =
-                            diff_line_ui(ui, theme, &pal, line, size, badge, (fi, hi, li));
-                        // 高さの基準は「素の行」からだけ拾う。
-                        if row_h.is_none() && !expanded {
-                            row_h = Some(h);
-                        }
-                        if let Some(a) = anchor {
-                            if resp.clicked() {
-                                comments.toggle_draft(a.clone());
-                            }
-                            comment_thread_ui(ui, theme, comments, &a, line, size);
-                        }
+                        let scroll_here = jump_to.is_some_and(|a| {
+                            a.file == fi
+                                && a.hunk == hi
+                                && (left.is_some_and(|r| r.idx == a.line)
+                                    || right.is_some_and(|r| r.idx == a.line))
+                        });
+                        let mut cx = RowCtx {
+                            ui: &mut *ui,
+                            theme,
+                            pal: &pal,
+                            lay: &lay,
+                            comments: &mut *comments,
+                            syntax: &syntax,
+                        };
+                        diff_row_ui(
+                            &mut cx,
+                            RowArgs {
+                                hunk,
+                                base,
+                                left,
+                                right,
+                                path: &path,
+                                size,
+                                row_h,
+                                clip,
+                                scroll_here,
+                            },
+                        );
                     }
                 }
             });
         ui.add_space(6.0);
     }
+
+    if let Some(k) = unfold_toggle {
+        if !unfolded.remove(&k) {
+            unfolded.insert(k);
+        }
+        ui.data_mut(|d| d.insert_temp(unfold_id, UnfoldedCell(unfolded)));
+    }
     action
 }
 
-/// コメントが 1 件でもあるときだけ出す操作バー。
-fn review_toolbar_ui(
+/// 表示モードのボタンを**このフレームで最初の 1 回だけ**描くための札。
+///
+/// Git のレビュー画面は「1 ファイル = 1 回」`diff_ui_with_actions` を呼ぶので、
+/// 素朴に描くとファイルの数だけ同じトグルが並ぶ (= 同じ操作への到達経路が
+/// 何本もある状態)。札を取れた最初の 1 回にだけ描いて重複を潰す。
+fn claim_mode_toggle(ctx: &egui::Context) -> bool {
+    let id = egui::Id::new("zv-diff-toolbar-pass");
+    let now = ctx.cumulative_pass_nr();
+    if ctx.data(|d| d.get_temp::<u64>(id)) == Some(now) {
+        return false;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, now));
+    true
+}
+
+/// 差分ビューの操作バー。表示モードの切替が**常に**ここから届く
+/// (キーバインドを覚えていなくても使える到達経路)。
+/// レビュー操作はコメントが 1 件でもあるときだけ足す。
+/// **両方とも出すものが無ければバー自体を描かない** (空の帯を残さない)。
+fn diff_toolbar_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     store: &mut DiffCommentStore,
     size: f32,
+    lay: &DiffLayout,
 ) -> DiffAction {
-    if store.is_empty() {
+    let show_mode = claim_mode_toggle(ui.ctx());
+    let show_review = !store.is_empty();
+    if !show_mode && !show_review {
         return DiffAction::None;
     }
     let mut action = DiffAction::None;
     ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(trf(
-                "レビューコメント {n} 件 (未解決 {a} 件)",
-                &[
-                    ("n", store.len().to_string()),
-                    ("a", store.actionable_len().to_string()),
-                ],
-            ))
-            .color(theme.text_dim)
-            .size(size),
+        if show_mode {
+            let (icon, next) = match lay.mode {
+                DiffMode::SideBySide => ("⇋", DiffMode::Inline),
+                DiffMode::Inline => ("≡", DiffMode::SideBySide),
+            };
+            if ui
+                .add(egui::Button::new(
+                    RichText::new(format!("{icon} {}", lay.mode.label())).size(size),
+                ))
+                .on_hover_text(trf(
+                    "{next} に切り替えます (F7 / ⇧F7 で変更箇所を移動)",
+                    &[("next", next.label())],
+                ))
+                .clicked()
+            {
+                // 押した時点の「実際の表示」の逆へ。縮退中に押しても
+                // 「並列を選んだのに一列のまま」にはならない。
+                set_diff_mode(ui.ctx(), next);
+            }
+            if lay.degraded() {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(tr("幅が狭いため一列"))
+                            .color(theme.text_dim)
+                            .size(size * 0.9),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Truncate),
+                )
+                .on_hover_text(tr(
+                    "並列表示は片側が読める幅を確保できないため、自動で一列にしています",
+                ));
+            }
+        }
+        if !show_review {
+            return;
+        }
+        if show_mode {
+            ui.separator();
+        }
+        ui.add(
+            egui::Label::new(
+                RichText::new(trf(
+                    "レビューコメント {n} 件 (未解決 {a} 件)",
+                    &[
+                        ("n", store.len().to_string()),
+                        ("a", store.actionable_len().to_string()),
+                    ],
+                ))
+                .color(theme.text_dim)
+                .size(size),
+            )
+            .wrap_mode(egui::TextWrapMode::Truncate),
         );
         let ready = store.actionable_len() > 0;
         if ui
@@ -936,6 +1813,9 @@ fn review_toolbar_ui(
 }
 
 /// ファイル見出し: パス + `+追加 -削除`。
+///
+/// **0 のバッジは出さない** (リネームのみ・モード変更だけのファイルに
+/// `+0 -0` が並んでも情報がゼロで、パスが読みにくくなるだけ)。
 fn file_header_job(file: &FileDiff, theme: &Theme, size: f32) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let mut job = LayoutJob::default();
@@ -951,18 +1831,27 @@ fn file_header_job(file: &FileDiff, theme: &Theme, size: f32) -> egui::text::Lay
     if file.is_binary {
         job.append("  [binary]", 0.0, fmt(theme.text_dim));
     } else {
-        job.append(&format!("  +{}", file.additions), 0.0, fmt(theme.ok));
-        job.append(&format!(" -{}", file.deletions), 0.0, fmt(theme.err));
+        if file.additions > 0 {
+            job.append(&format!("  +{}", file.additions), 0.0, fmt(theme.ok));
+        }
+        if file.deletions > 0 {
+            job.append(&format!("  -{}", file.deletions), 0.0, fmt(theme.err));
+        }
     }
     job
 }
 
+/// ハンク見出しの左右の余白 (片側)。
+const HUNK_PAD_X: f32 = 4.0;
+
 /// ハンク見出し (`@@ ... @@`) — アクセント色の帯で本文と区別する。
 fn hunk_header_ui(ui: &mut egui::Ui, theme: &Theme, pal: &DiffPalette, hunk: &Hunk, size: f32) {
-    let w = ui.available_width();
+    // 余白は帯の**内側**なので、可用幅から先に引く。引き忘れると帯が
+    // 左右の余白ぶんだけ広がり、可用領域からはみ出す。
+    let w = (ui.available_width() - HUNK_PAD_X * 2.0).max(0.0);
     egui::Frame::none()
         .fill(pal.hunk_bg)
-        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+        .inner_margin(egui::Margin::symmetric(HUNK_PAD_X, 2.0))
         .show(ui, |ui| {
             ui.set_min_width(w);
             ui.add(
@@ -972,72 +1861,462 @@ fn hunk_header_ui(ui: &mut egui::Ui, theme: &Theme, pal: &DiffPalette, hunk: &Hu
                         .size(size)
                         .color(theme.accent),
                 )
-                .wrap_mode(egui::TextWrapMode::Extend),
-            );
+                .wrap_mode(egui::TextWrapMode::Truncate),
+            )
+            .on_hover_text(&hunk.header);
         });
 }
 
-/// 1 行分: [旧行番号][新行番号][コメント印] +/- 本文。
+/// ファイル差分の全行を 1 パスで色分けし、ハンクを跨いだ通し番号で引ける表を返す。
 ///
-/// 1 行を描き、(占めた高さ, クリック判定用の Response) を返す。
-/// 高さは仮想化のプレースホルダ用、Response はコメント追加のトリガ。
-#[allow(clippy::too_many_arguments)]
-fn diff_line_ui(
+/// **再計算は鍵が変わったときだけ**。鍵は「パス・配色テーマ・ハンクの形
+/// (ヘッダと行数)・本文の合計バイト数・増減行数」から作る — 毎フレーム
+/// 数百 KB の本文をハッシュすると描画フレームのコストが素直に乗るので、
+/// **バイトを読まない要素だけ**で作る。中身だけが変わってこの鍵が一致する
+/// ことは実用上ありえない (行数も合計長も動く)。
+fn file_line_colors(
+    ui: &egui::Ui,
+    theme: &Theme,
+    file: &FileDiff,
+    path: &str,
+    fi: usize,
+) -> std::sync::Arc<Vec<Vec<(usize, usize, Color32)>>> {
+    use std::hash::{Hash, Hasher};
+    let id = ui.id().with(("zv-diff-hl", fi));
+    let total: usize = file
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .map(|l| l.text.len() + 1)
+        .sum();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    theme.syntect_theme.hash(&mut hasher);
+    total.hash(&mut hasher);
+    file.additions.hash(&mut hasher);
+    file.deletions.hash(&mut hasher);
+    for h in &file.hunks {
+        h.header.hash(&mut hasher);
+        h.lines.len().hash(&mut hasher);
+    }
+    let key = hasher.finish();
+    if let Some(c) = ui.data(|d| d.get_temp::<HlCell>(id)) {
+        if c.key == key {
+            return c.spans;
+        }
+    }
+    let lines: Vec<&str> = file
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .map(|l| l.text.as_str())
+        .collect();
+    let spans = if total > DIFF_HL_MAX_BYTES {
+        Vec::new()
+    } else {
+        let hl = crate::highlight::shared();
+        let lang = hl.lang_for(
+            Some(std::path::Path::new(path)),
+            lines.first().copied().unwrap_or(""),
+        );
+        hl.line_spans(&lines, &lang, &theme.syntect_theme)
+    };
+    let arc = std::sync::Arc::new(spans);
+    ui.data_mut(|d| {
+        d.insert_temp(
+            id,
+            HlCell {
+                key,
+                spans: arc.clone(),
+            },
+        )
+    });
+    arc
+}
+
+/// 1 行ぶんの `LayoutJob`。構文色 (前景) と語単位の変更 (背景) を重ねる。
+///
+/// 範囲の境界だけで区切って `append` するので、手間は区間数に比例するだけ。
+fn line_job(
+    text: &str,
+    syntax: &[(usize, usize, Color32)],
+    words: &[WordSpan],
+    font: &FontId,
+    fg: Color32,
+    word_bg: Color32,
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    if text.is_empty() {
+        return job;
+    }
+    let n = text.len();
+    let mut cuts: Vec<usize> = Vec::with_capacity(syntax.len() * 2 + words.len() * 2 + 2);
+    cuts.push(0);
+    cuts.push(n);
+    for (s, e, _) in syntax {
+        cuts.push((*s).min(n));
+        cuts.push((*e).min(n));
+    }
+    for w in words {
+        cuts.push(w.start.min(n));
+        cuts.push(w.end.min(n));
+    }
+    // 文字境界でない切れ目は捨てる (色より本文の正しさが先)。
+    cuts.retain(|&c| text.is_char_boundary(c));
+    cuts.sort_unstable();
+    cuts.dedup();
+    for pair in cuts.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if b <= a {
+            continue;
+        }
+        let color = syntax
+            .iter()
+            .find(|(s, e, _)| a >= *s && a < *e)
+            .map(|(_, _, c)| *c)
+            .unwrap_or(fg);
+        let background = if words.iter().any(|w| a >= w.start && a < w.end) {
+            word_bg
+        } else {
+            Color32::TRANSPARENT
+        };
+        job.append(
+            &text[a..b],
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color,
+                background,
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
+/// 1 ペインに描くもの。`line` が `None` なら「反対側にしか行が無い」空欄。
+struct Cell<'a> {
+    line: Option<&'a DiffLine>,
+    /// 行番号列に出す番号 (左から順)。使う本数は [`PaneCols::cols`]。
+    nums: [Option<usize>; 2],
+    badge: Option<(usize, bool)>,
+    syntax: &'a [(usize, usize, Color32)],
+    words: Vec<WordSpan>,
+}
+
+/// 行の描画に要る参照をひとまとめにする (引数の数を抑えるため)。
+struct RowCtx<'a> {
+    ui: &'a mut egui::Ui,
+    theme: &'a Theme,
+    pal: &'a DiffPalette,
+    lay: &'a DiffLayout,
+    comments: &'a mut DiffCommentStore,
+    syntax: &'a std::sync::Arc<Vec<Vec<(usize, usize, Color32)>>>,
+}
+
+/// 行 1 本ぶんの位置情報。
+struct RowArgs<'a> {
+    hunk: &'a Hunk,
+    /// ファイル内の通し番号の起点 (`syntax` の添字は `base + idx`)。
+    base: usize,
+    left: Option<LineRef>,
+    right: Option<LineRef>,
+    path: &'a str,
+    size: f32,
+    row_h: f32,
+    clip: egui::Rect,
+    /// この行へスクロールして見せる (F7 の飛び先)。
+    scroll_here: bool,
+}
+
+/// 対応する 1 行 (一列なら 1 セル、並列なら左右 2 セル) を描く。
+///
+/// **左右のセルは同じ 1 本の矩形の中に置く**ので、行の高さは構造的に必ず揃う。
+/// スクロールの同期処理そのものが不要になり、毎フレームの再描画要求もゼロ。
+fn diff_row_ui(cx: &mut RowCtx, args: RowArgs) {
+    let lay: &DiffLayout = cx.lay;
+    let theme: &Theme = cx.theme;
+    let pal: &DiffPalette = cx.pal;
+    let syntax_all = cx.syntax;
+    let side_by_side = lay.mode == DiffMode::SideBySide;
+
+    let line_of = |r: Option<LineRef>| r.and_then(|r| args.hunk.lines.get(r.idx));
+    let left_line = line_of(args.left);
+    let right_line = line_of(args.right);
+
+    // コメントのアンカー (並列は左右それぞれ、一列は 1 本)。
+    let anchor_of = |l: Option<&DiffLine>| l.and_then(|l| line_anchor(args.path, l));
+    let left_anchor = anchor_of(left_line);
+    let right_anchor = if side_by_side {
+        anchor_of(right_line)
+    } else {
+        None
+    };
+    // 並列でも文脈行は左右が同じ行 = 同じアンカー。スレッドを二重に出さない。
+    let right_anchor = match (&left_anchor, right_anchor) {
+        (Some(a), Some(b)) if *a == b => None,
+        (_, b) => b,
+    };
+
+    let expanded = [&left_anchor, &right_anchor]
+        .into_iter()
+        .flatten()
+        .any(|a| cx.comments.has_ui_at(a));
+
+    // 仮想化: 画面外で、かつコメントも下書きも無い行はウィジェットを作らず
+    // 高さだけ確保する。数千行の PR でも毎フレームの手間は可視行ぶんだけ。
+    let top = cx.ui.cursor().top();
+    let offscreen = top + args.row_h < args.clip.top() || top > args.clip.bottom();
+    if offscreen && !expanded {
+        let (_, rect) = cx
+            .ui
+            .allocate_space(egui::vec2(lay.width.max(1.0), args.row_h));
+        if args.scroll_here {
+            cx.ui.scroll_to_rect(rect, Some(egui::Align::Center));
+        }
+        return;
+    }
+
+    let (rect, resp) = cx.ui.allocate_exact_size(
+        egui::vec2(lay.width.max(1.0), args.row_h),
+        egui::Sense::click(),
+    );
+    if args.scroll_here {
+        cx.ui.scroll_to_rect(rect, Some(egui::Align::Center));
+    }
+
+    // --- 語単位ハイライト: 置換の組にだけ効かせる ---
+    let (mut lw, mut rw) = (Vec::new(), Vec::new());
+    if let (Some(o), Some(n)) = (left_line, right_line) {
+        if o.kind == LineKind::Removed && n.kind == LineKind::Added {
+            if let Some((a, b)) = word_diff(&o.text, &n.text) {
+                lw = a;
+                rw = b;
+            }
+        }
+    }
+
+    let span_of = |r: Option<LineRef>| -> &[(usize, usize, Color32)] {
+        r.and_then(|r| syntax_all.get(args.base + r.idx))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    };
+
+    let cells: Vec<Cell> = if side_by_side {
+        vec![
+            Cell {
+                line: left_line,
+                nums: [left_line.and_then(|l| l.old_no), None],
+                badge: left_anchor.as_ref().and_then(|a| cx.comments.badge(a)),
+                syntax: span_of(args.left),
+                words: lw,
+            },
+            Cell {
+                line: right_line,
+                nums: [right_line.and_then(|l| l.new_no), None],
+                badge: right_anchor.as_ref().and_then(|a| cx.comments.badge(a)),
+                syntax: span_of(args.right),
+                words: rw,
+            },
+        ]
+    } else {
+        vec![Cell {
+            line: left_line,
+            nums: [
+                left_line.and_then(|l| l.old_no),
+                left_line.and_then(|l| l.new_no),
+            ],
+            badge: left_anchor.as_ref().and_then(|a| cx.comments.badge(a)),
+            syntax: span_of(args.left),
+            words: Vec::new(),
+        }]
+    };
+
+    for (cols, cell) in lay.panes.iter().zip(cells.iter()) {
+        paint_cell(cx.ui, theme, pal, cols, rect, cell, args.size);
+    }
+    drop(cells);
+
+    // --- クリック: 押されたペインの行へコメントを開く ---
+    if resp.hovered() {
+        cx.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        cx.ui
+            .painter()
+            .rect_filled(rect, 0.0, mix(Color32::TRANSPARENT, theme.accent, 0.10));
+    }
+    let resp = resp.on_hover_text(tr("クリックでコメントを追加/閉じる"));
+    if resp.clicked() {
+        let x = resp
+            .interact_pointer_pos()
+            .map(|p| p.x - rect.left())
+            .unwrap_or(0.0);
+        let right_side = side_by_side && lay.panes.len() > 1 && x >= lay.panes[1].x;
+        let target = if right_side {
+            right_anchor.clone().or_else(|| left_anchor.clone())
+        } else {
+            left_anchor.clone().or_else(|| right_anchor.clone())
+        };
+        if let Some(a) = target {
+            cx.comments.toggle_draft(a);
+        }
+    }
+
+    // --- 行の下のコメントスレッド (左右どちらの行にも打てる) ---
+    let indent = lay
+        .panes
+        .first()
+        .map(|c| c.gutter_w + c.mark_w)
+        .unwrap_or(0.0);
+    for (anchor, line) in [(left_anchor, left_line), (right_anchor, right_line)] {
+        if let (Some(a), Some(l)) = (anchor, line) {
+            if cx.comments.has_ui_at(&a) {
+                comment_thread_ui(cx.ui, theme, cx.comments, &a, l, args.size, indent);
+            }
+        }
+    }
+}
+
+/// 1 ペインぶんを塗る。**ペインの外へは 1px も描かない** (必ずクリップする)。
+fn paint_cell(
+    ui: &egui::Ui,
+    theme: &Theme,
+    pal: &DiffPalette,
+    cols: &PaneCols,
+    row: egui::Rect,
+    cell: &Cell,
+    size: f32,
+) {
+    let x0 = row.left() + cols.x;
+    let pane = egui::Rect::from_min_max(
+        egui::pos2(x0, row.top()),
+        egui::pos2(x0 + cols.width, row.bottom()),
+    );
+    let p = ui.painter().with_clip_rect(pane.intersect(ui.clip_rect()));
+    let (bg, sign_fg, sign) = match cell.line {
+        None => (pal.void_bg, theme.text_dim, ""),
+        Some(l) => match l.kind {
+            LineKind::Added => (pal.add_bg, pal.add_fg, "+"),
+            LineKind::Removed => (pal.del_bg, pal.del_fg, "-"),
+            LineKind::Context => (theme.bg, theme.text_dim, " "),
+        },
+    };
+    p.rect_filled(pane, 0.0, bg);
+    let Some(line) = cell.line else {
+        // 反対側にしか行が無い = ここには何も無い、を地色で示す。
+        return;
+    };
+    // 行番号列
+    if cols.gutter_w > 0.0 {
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, row.top()),
+                egui::pos2(x0 + cols.gutter_w, row.bottom()),
+            ),
+            0.0,
+            pal.gutter_bg,
+        );
+        let n = cols.cols.max(1) as f32;
+        let sub = cols.gutter_w / n;
+        let num_font = FontId::monospace(size * 0.9);
+        for (i, no) in cell.nums.iter().take(cols.cols as usize).enumerate() {
+            let Some(no) = no else { continue };
+            p.text(
+                egui::pos2(x0 + sub * (i as f32 + 1.0) - 3.0, row.top() + 1.0),
+                egui::Align2::RIGHT_TOP,
+                no.to_string(),
+                num_font.clone(),
+                theme.text_dim,
+            );
+        }
+    }
+    // コメント印
+    if let Some((n, all_resolved)) = cell.badge {
+        let text = if n > 1 {
+            format!("●{n}")
+        } else {
+            "●".to_string()
+        };
+        p.text(
+            egui::pos2(x0 + cols.gutter_w + 2.0, row.top() + 1.0),
+            egui::Align2::LEFT_TOP,
+            text,
+            FontId::monospace(size * 0.8),
+            if all_resolved { theme.ok } else { theme.accent },
+        );
+    }
+    // +/- の記号
+    if !sign.trim().is_empty() {
+        p.text(
+            egui::pos2(x0 + cols.gutter_w + cols.mark_w + 2.0, row.top() + 1.0),
+            egui::Align2::LEFT_TOP,
+            sign,
+            FontId::monospace(size),
+            sign_fg,
+        );
+    }
+    // 本文
+    if cols.text_w <= 0.0 {
+        return;
+    }
+    let word_bg = match line.kind {
+        LineKind::Added => pal.add_word_bg,
+        LineKind::Removed => pal.del_word_bg,
+        LineKind::Context => Color32::TRANSPARENT,
+    };
+    let job = line_job(
+        &line.text,
+        cell.syntax,
+        &cell.words,
+        &FontId::monospace(size),
+        theme.text,
+        word_bg,
+    );
+    let galley = ui.fonts(|f| f.layout_job(job));
+    p.galley(
+        egui::pos2(row.left() + cols.text_x, row.top() + 1.0),
+        galley,
+        theme.text,
+    );
+}
+
+/// 「⋯ N 行を展開」の 1 行。押されたら true。
+fn fold_row_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     pal: &DiffPalette,
-    line: &DiffLine,
+    lay: &DiffLayout,
+    hidden: usize,
     size: f32,
-    badge: Option<(usize, bool)>,
-    row_key: (usize, usize, usize),
-) -> (f32, egui::Response) {
-    let (bg, sign_fg, sign) = match line.kind {
-        LineKind::Added => (pal.add_bg, pal.add_fg, "+"),
-        LineKind::Removed => (pal.del_bg, pal.del_fg, "-"),
-        LineKind::Context => (theme.bg, theme.text_dim, " "),
-    };
-    let w = ui.available_width();
-    let resp = egui::Frame::none().fill(bg).show(ui, |ui| {
-        ui.set_min_width(w);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            gutter_cell(ui, theme, pal, line.old_no, size);
-            gutter_cell(ui, theme, pal, line.new_no, size);
-            marker_cell(ui, theme, badge, size);
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(sign).monospace().size(size).color(sign_fg),
-                )
-                .wrap_mode(egui::TextWrapMode::Extend),
-            );
-            ui.add_space(SIGN_W - 6.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(&line.text)
-                        .monospace()
-                        .size(size)
-                        .color(theme.text),
-                )
-                .wrap_mode(egui::TextWrapMode::Extend),
-            );
-        });
-    });
-    let rect = resp.response.rect;
-    let hit = ui.interact(
-        rect,
-        ui.id().with(("zv-diff-row", row_key)),
-        egui::Sense::click(),
-    );
-    if hit.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        // ホバー中の行は薄く持ち上げて、押せることを示す。
-        ui.painter()
-            .rect_filled(rect, 0.0, mix(Color32::TRANSPARENT, theme.accent, 0.10));
+    row_h: f32,
+) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(lay.width.max(1.0), row_h), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        p.rect_filled(rect, 0.0, pal.gutter_bg);
+        let text_x = lay.panes.first().map(|c| c.text_x).unwrap_or(0.0);
+        p.text(
+            egui::pos2(rect.left() + text_x, rect.top() + 1.0),
+            egui::Align2::LEFT_TOP,
+            trf("⋯ {n} 行を展開", &[("n", hidden.to_string())]),
+            FontId::monospace(size),
+            if resp.hovered() {
+                theme.accent
+            } else {
+                theme.text_dim
+            },
+        );
     }
-    let hit = hit.on_hover_text(tr("クリックでコメントを追加/閉じる"));
-    (rect.height(), hit)
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text(tr("変更のない行を表示します")).clicked()
 }
+
+/// コメントスレッドの右余白。
+const THREAD_PAD_RIGHT: f32 = 6.0;
 
 /// 行の直下に出すコメントスレッド (既存コメント + 下書き)。
 ///
@@ -1050,6 +2329,7 @@ fn comment_thread_ui(
     anchor: &CommentAnchor,
     line: &DiffLine,
     size: f32,
+    indent: f32,
 ) {
     let ids: Vec<u64> = store
         .comments
@@ -1062,7 +2342,13 @@ fn comment_thread_ui(
         return;
     }
 
-    let w = ui.available_width();
+    let avail = ui.available_width();
+    // 本文と桁を合わせる字下げ。狭い幅では本文の場所が無くなるので
+    // 使える幅の 1/4 で頭打ちにする (どの幅でも見切れない)。
+    let indent = indent.max(0.0).min(avail * 0.25);
+    // 左右の余白は枠の**内側**なので、最小幅から先に引いておく
+    // (引かないと枠が余白ぶん広がって可用領域をはみ出す)。
+    let w = (avail - indent - THREAD_PAD_RIGHT).max(0.0);
     let mut remove: Option<u64> = None;
     let mut toggle: Option<u64> = None;
     let mut begin_edit: Option<u64> = None;
@@ -1074,9 +2360,9 @@ fn comment_thread_ui(
     egui::Frame::none()
         .fill(mix(theme.bg, theme.panel, 0.85))
         .inner_margin(egui::Margin {
-            // 行番号 2 列 + コメント印の幅ぶん右へ寄せて、本文と桁を合わせる。
-            left: GUTTER_COL_W * 2.0 + MARK_COL_W,
-            right: 6.0,
+            // 行番号列 + コメント印の幅ぶん右へ寄せて、本文と桁を合わせる。
+            left: indent,
+            right: THREAD_PAD_RIGHT,
             top: 4.0,
             bottom: 4.0,
         })
@@ -1201,64 +2487,6 @@ fn comment_thread_ui(
     if cancel_draft {
         store.close_draft(anchor);
     }
-}
-
-/// コメント印の列。件数が無くても幅は確保して行のズレを防ぐ。
-fn marker_cell(ui: &mut egui::Ui, theme: &Theme, badge: Option<(usize, bool)>, size: f32) {
-    let (text, color) = match badge {
-        // 全部解決済みなら ok 色、未解決が残っていれば accent。
-        Some((n, all_resolved)) => (
-            if n > 1 {
-                format!("●{n}")
-            } else {
-                "●".to_string()
-            },
-            if all_resolved { theme.ok } else { theme.accent },
-        ),
-        None => (String::new(), theme.text_dim),
-    };
-    let h = ui.spacing().interact_size.y;
-    ui.allocate_ui_with_layout(
-        egui::vec2(MARK_COL_W, h),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(text)
-                        .monospace()
-                        .size(size * 0.8)
-                        .color(color),
-                )
-                .wrap_mode(egui::TextWrapMode::Extend),
-            );
-        },
-    );
-}
-
-/// 行番号 1 列 (右寄せ)。番号が無い側は空欄。
-fn gutter_cell(ui: &mut egui::Ui, theme: &Theme, pal: &DiffPalette, no: Option<usize>, size: f32) {
-    let text = no.map(|n| n.to_string()).unwrap_or_default();
-    let h = ui.spacing().interact_size.y;
-    egui::Frame::none()
-        .fill(pal.gutter_bg)
-        .inner_margin(egui::Margin::symmetric(3.0, 0.0))
-        .show(ui, |ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(GUTTER_COL_W, h),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(text)
-                                .monospace()
-                                .size(size * 0.9)
-                                .color(theme.text_dim),
-                        )
-                        .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                },
-            );
-        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2204,5 +3432,968 @@ diff --git a/src/foo.rs b/src/foo.rs
     #[test]
     fn diff_action_defaults_to_none() {
         assert_eq!(DiffAction::default(), DiffAction::None);
+    }
+
+    // =======================================================================
+    // 表示の決定層 (純関数) のテーブルテスト
+    // =======================================================================
+
+    // ---- diff_layout: 幅 → 桁割り / 縮退 ----------------------------------
+
+    /// レイアウトの不変条件を全部まとめて検査する。
+    ///
+    /// 1. どのペインも可用領域 `[0, width]` の外へ出ない
+    /// 2. ペイン同士が重ならない (左の右端 <= 右の左端)
+    /// 3. ペイン内の桁 (行番号 / 印 / 記号 / 本文) の合計がペイン幅ぴったり
+    /// 4. 幅は非負
+    fn assert_layout_sane(lay: &DiffLayout, want_w: f32, ppp: f32, why: &str) {
+        assert!(lay.width >= 0.0, "{why}: 幅が負");
+        assert!(
+            lay.width <= want_w + 0.001,
+            "{why}: スナップで可用幅を超えた ({} > {want_w})",
+            lay.width
+        );
+        assert!(!lay.panes.is_empty(), "{why}: ペインが 0 枚");
+        assert_eq!(
+            lay.panes.len(),
+            match lay.mode {
+                DiffMode::Inline => 1,
+                DiffMode::SideBySide => 2,
+            },
+            "{why}: モードとペイン数が食い違う"
+        );
+        let mut prev_right = 0.0f32;
+        for (i, p) in lay.panes.iter().enumerate() {
+            assert!(p.x >= -0.001, "{why}[{i}]: 左端が領域外 ({})", p.x);
+            assert!(
+                p.x + p.width <= lay.width + 0.001,
+                "{why}[{i}]: 右端が領域外 ({} > {})",
+                p.x + p.width,
+                lay.width
+            );
+            assert!(
+                p.x >= prev_right - 0.001,
+                "{why}[{i}]: 前のペインと重なっている ({} < {prev_right})",
+                p.x
+            );
+            for (name, v) in [
+                ("gutter_w", p.gutter_w),
+                ("mark_w", p.mark_w),
+                ("sign_w", p.sign_w),
+                ("text_w", p.text_w),
+                ("width", p.width),
+            ] {
+                assert!(v >= 0.0, "{why}[{i}]: {name} が負 ({v})");
+            }
+            let sum = p.gutter_w + p.mark_w + p.sign_w + p.text_w;
+            assert!(
+                (sum - p.width).abs() < 0.001,
+                "{why}[{i}]: 桁の合計 {sum} がペイン幅 {} と合わない",
+                p.width
+            );
+            assert!(
+                (p.text_x - (p.x + p.gutter_w + p.mark_w + p.sign_w)).abs() < 0.001,
+                "{why}[{i}]: 本文の左端がずれている"
+            );
+            // 物理ピクセルへ揃っている (端末セルと同じ規約)
+            for (name, v) in [("x", p.x), ("gutter_w", p.gutter_w), ("mark_w", p.mark_w)] {
+                let px = v * ppp;
+                assert!(
+                    (px - px.round()).abs() < 0.001,
+                    "{why}[{i}]: {name} が物理ピクセルに揃っていない ({v} @ ppp={ppp})"
+                );
+            }
+            prev_right = p.x + p.width + lay.gap;
+        }
+    }
+
+    #[test]
+    fn diff_layout_table() {
+        // (可用幅, 希望モード, 期待する実モード, 何を見ているか)
+        let table: &[(f32, DiffMode, DiffMode, &str)] = &[
+            (320.0, DiffMode::SideBySide, DiffMode::Inline, "スマホ幅は一列へ縮退"),
+            (320.0, DiffMode::Inline, DiffMode::Inline, "一列指定はそのまま"),
+            (611.0, DiffMode::SideBySide, DiffMode::Inline, "閾値の 1px 下は一列"),
+            (612.0, DiffMode::SideBySide, DiffMode::SideBySide, "閾値ちょうどは並列"),
+            (900.0, DiffMode::SideBySide, DiffMode::SideBySide, "900x700 の中央ビュー"),
+            (1200.0, DiffMode::SideBySide, DiffMode::SideBySide, "1200x300 の横長"),
+            (1200.0, DiffMode::Inline, DiffMode::Inline, "広くても一列指定は一列"),
+            (0.0, DiffMode::SideBySide, DiffMode::Inline, "幅 0 でも壊れない"),
+            (0.0, DiffMode::Inline, DiffMode::Inline, "幅 0 の一列"),
+            (1.0, DiffMode::SideBySide, DiffMode::Inline, "幅 1px"),
+            (60.0, DiffMode::Inline, DiffMode::Inline, "行番号すら入らない幅"),
+            (f32::NAN, DiffMode::SideBySide, DiffMode::Inline, "NaN は幅 0 扱い"),
+            (f32::INFINITY, DiffMode::SideBySide, DiffMode::Inline, "無限も幅 0 扱い"),
+        ];
+        for &(w, req, want, why) in table {
+            for ppp in [1.0f32, 1.5, 2.0] {
+                let lay = diff_layout(w, req, ppp);
+                assert_eq!(lay.mode, want, "{why} (w={w} ppp={ppp})");
+                assert_eq!(lay.requested, req, "{why}: 希望モードを覚えていない");
+                let cap = if w.is_finite() { w.max(0.0) } else { 0.0 };
+                assert_layout_sane(&lay, cap.max(lay.width), ppp, why);
+            }
+        }
+    }
+
+    #[test]
+    fn diff_layout_degraded_flag_only_when_downgraded() {
+        assert!(diff_layout(320.0, DiffMode::SideBySide, 1.0).degraded());
+        assert!(!diff_layout(320.0, DiffMode::Inline, 1.0).degraded());
+        assert!(!diff_layout(900.0, DiffMode::SideBySide, 1.0).degraded());
+    }
+
+    #[test]
+    fn diff_layout_side_by_side_halves_are_balanced_and_readable() {
+        for w in [612.0f32, 900.0, 1200.0, 1920.0, 2560.0] {
+            let lay = diff_layout(w, DiffMode::SideBySide, 1.0);
+            assert_eq!(lay.mode, DiffMode::SideBySide, "w={w}");
+            let (l, r) = (&lay.panes[0], &lay.panes[1]);
+            assert!(
+                (l.width - r.width).abs() <= 1.0,
+                "w={w}: 左右の幅が偏っている ({} vs {})",
+                l.width,
+                r.width
+            );
+            assert!(l.cols == 1 && r.cols == 1, "w={w}: 並列は行番号 1 列ずつ");
+            assert!(
+                l.text_w >= MIN_CODE_W - 1.0 && r.text_w >= MIN_CODE_W - 1.0,
+                "w={w}: 並べたのに本文が読める幅を割っている ({} / {})",
+                l.text_w,
+                r.text_w
+            );
+            // 溝が本当に空いている (左の右端 < 右の左端)
+            assert!(l.x + l.width <= r.x, "w={w}: 溝が無い");
+            assert!(r.x - (l.x + l.width) >= 4.0, "w={w}: 溝が狭すぎる");
+        }
+    }
+
+    #[test]
+    fn diff_layout_inline_has_two_number_columns() {
+        let lay = diff_layout(900.0, DiffMode::Inline, 1.0);
+        assert_eq!(lay.panes.len(), 1);
+        assert_eq!(lay.panes[0].cols, 2, "一列は旧/新の 2 列を出す");
+        assert_eq!(lay.panes[0].gutter_w, GUTTER_COL_W * 2.0);
+        assert_eq!(lay.gap, 0.0, "一列に溝は要らない");
+    }
+
+    /// 極端な画面サイズでも全矩形が可用領域に収まり重ならない。
+    #[test]
+    fn diff_layout_extreme_sizes_keep_every_rect_inside() {
+        // (幅, 高さ, 何の画面か) — 高さは判断に影響しないが、実際に使う組を並べる
+        let screens: &[(f32, f32, &str)] = &[
+            (320.0, 640.0, "スマホ縦"),
+            (900.0, 700.0, "既定の小ウィンドウ"),
+            (1200.0, 300.0, "横長の下部パネル"),
+            (480.0, 900.0, "サイドバーに入れた細い差分"),
+            (2560.0, 1440.0, "外部ディスプレイ"),
+            (100.0, 100.0, "極小"),
+        ];
+        for &(w, h, why) in screens {
+            for req in [DiffMode::Inline, DiffMode::SideBySide] {
+                for ppp in [1.0f32, 2.0] {
+                    let lay = diff_layout(w, req, ppp);
+                    assert_layout_sane(&lay, w, ppp, &format!("{why} {h}px 高 {req:?}"));
+                    // 「1 枚でも領域外へ出たら見切れる」— 面積の合計でも押さえる
+                    let total: f32 = lay.panes.iter().map(|p| p.width).sum();
+                    assert!(
+                        total + lay.gap * (lay.panes.len() - 1) as f32 <= lay.width + 0.001,
+                        "{why}: ペインの合計幅が可用幅を超えた"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- align_hunk: 左右の行揃え ----------------------------------------
+
+    fn hunk_of(spec: &[(LineKind, &str)]) -> Hunk {
+        let mut lines = Vec::new();
+        let (mut o, mut n) = (1usize, 1usize);
+        for (k, t) in spec {
+            let (old_no, new_no) = match k {
+                LineKind::Context => {
+                    let v = (Some(o), Some(n));
+                    o += 1;
+                    n += 1;
+                    v
+                }
+                LineKind::Removed => {
+                    let v = (Some(o), None);
+                    o += 1;
+                    v
+                }
+                LineKind::Added => {
+                    let v = (None, Some(n));
+                    n += 1;
+                    v
+                }
+            };
+            lines.push(DiffLine {
+                kind: *k,
+                old_no,
+                new_no,
+                text: (*t).to_string(),
+            });
+        }
+        Hunk {
+            header: "@@ -1 +1 @@".into(),
+            old_start: 1,
+            new_start: 1,
+            lines,
+        }
+    }
+
+    fn aligned(spec: &[(LineKind, &str)]) -> Vec<(Option<usize>, Option<usize>)> {
+        align_hunk(&hunk_of(spec))
+            .into_iter()
+            .map(|(l, r)| (l.map(|x| x.idx), r.map(|x| x.idx)))
+            .collect()
+    }
+
+    #[test]
+    fn align_hunk_table() {
+        use LineKind::{Added as A, Context as C, Removed as R};
+        // (入力の行種, 期待する (左, 右) の並び, 何を見ているか)
+        let table: &[(&[(LineKind, &str)], &[(Option<usize>, Option<usize>)], &str)] = &[
+            (&[], &[], "空ハンク"),
+            (
+                &[(C, "a"), (C, "b")],
+                &[(Some(0), Some(0)), (Some(1), Some(1))],
+                "文脈行だけ: 左右に同じ行",
+            ),
+            (
+                &[(A, "x"), (A, "y")],
+                &[(None, Some(0)), (None, Some(1))],
+                "追加のみ: 左は空プレースホルダ",
+            ),
+            (
+                &[(R, "x"), (R, "y")],
+                &[(Some(0), None), (Some(1), None)],
+                "削除のみ: 右は空プレースホルダ",
+            ),
+            (
+                &[(R, "old"), (A, "new")],
+                &[(Some(0), Some(1))],
+                "1 対 1 の置換は同じ高さに並ぶ",
+            ),
+            (
+                &[(R, "a"), (R, "b"), (A, "c")],
+                &[(Some(0), Some(2)), (Some(1), None)],
+                "削除 2 追加 1: 余った削除の右は空",
+            ),
+            (
+                &[(R, "a"), (A, "b"), (A, "c")],
+                &[(Some(0), Some(1)), (None, Some(2))],
+                "削除 1 追加 2: 余った追加の左は空",
+            ),
+            (
+                &[(C, "h"), (R, "a"), (A, "b"), (C, "t")],
+                &[(Some(0), Some(0)), (Some(1), Some(2)), (Some(3), Some(3))],
+                "文脈に挟まれた置換",
+            ),
+            (
+                &[(A, "x"), (R, "y")],
+                &[(None, Some(0)), (Some(1), None)],
+                "追加のあとの削除は別の塊 (順序が入れ替わらない)",
+            ),
+            (
+                &[(R, "a"), (A, "b"), (R, "c"), (A, "d")],
+                &[(Some(0), Some(1)), (Some(2), Some(3))],
+                "置換が 2 連: それぞれ組になる",
+            ),
+        ];
+        for (input, want, why) in table {
+            assert_eq!(&aligned(input)[..], *want, "{why}");
+        }
+    }
+
+    #[test]
+    fn align_hunk_every_line_appears_exactly_once() {
+        use LineKind::{Added as A, Context as C, Removed as R};
+        let spec: Vec<(LineKind, &str)> = vec![
+            (C, "0"),
+            (R, "1"),
+            (R, "2"),
+            (A, "3"),
+            (C, "4"),
+            (A, "5"),
+            (C, "6"),
+            (R, "7"),
+        ];
+        let rows = aligned(&spec);
+        let mut seen = vec![0usize; spec.len()];
+        for (l, r) in &rows {
+            if let Some(i) = l {
+                seen[*i] += 1;
+            }
+            // 文脈行は左右に同じ添字が出るので二重に数えない
+            if let Some(i) = r {
+                if Some(*i) != *l {
+                    seen[*i] += 1;
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|&n| n == 1),
+            "各行はちょうど 1 回だけ現れる: {seen:?}"
+        );
+    }
+
+    // ---- word_diff: 語単位 (書記素クラスタ単位) ハイライト ------------------
+
+    fn spans_text<'a>(s: &'a str, sp: &[WordSpan]) -> Vec<&'a str> {
+        sp.iter().map(|w| &s[w.start..w.end]).collect()
+    }
+
+    #[test]
+    fn word_diff_table() {
+        // (旧, 新, 旧側の変更部分, 新側の変更部分, 何を見ているか)
+        let table: &[(&str, &str, &[&str], &[&str], &str)] = &[
+            ("same", "same", &[], &[], "同じ行は変更なし"),
+            (
+                "let a = 1;",
+                "let a = 2;",
+                &["1"],
+                &["2"],
+                "1 トークンだけ変わる",
+            ),
+            (
+                "fn foo(x: i32)",
+                "fn foo(x: u32)",
+                &["i"],
+                &["u"],
+                "型名の変わった 1 文字だけ (語の中まで精査する)",
+            ),
+            (
+                "let count = 0;",
+                "let counter = 0;",
+                &[],
+                &["er"],
+                "語の末尾に足した分だけ塗る",
+            ),
+            (
+                "value_old",
+                "value_new",
+                &["old"],
+                &["new"],
+                "語の後半が総取り替えなら塗りは 1 かたまり",
+            ),
+            ("abc", "abcdef", &[], &["def"], "末尾に追加"),
+            ("abcdef", "abc", &["def"], &[], "末尾を削除"),
+            ("xyz", "", &["xyz"], &[], "行が空になる"),
+            ("", "xyz", &[], &["xyz"], "空行に足す"),
+            // --- 日本語 (空白が無いので書記素クラスタ単位で刻めないと壊れる) ---
+            (
+                "こんにちは世界",
+                "こんばんは世界",
+                &["にち"],
+                &["ばん"],
+                "日本語のみ: 変わった 2 文字だけ",
+            ),
+            (
+                "値を取得する",
+                "値を設定する",
+                &["取得"],
+                &["設定"],
+                "日本語の語の入れ替え",
+            ),
+            (
+                "日本語",
+                "日本語です",
+                &[],
+                &["です"],
+                "日本語の末尾に追加",
+            ),
+            // --- 絵文字 (サロゲート相当の 4 バイト文字・ZWJ・肌色修飾子) ---
+            (
+                "ok 🚀 go",
+                "ok 🎉 go",
+                &["🚀"],
+                &["🎉"],
+                "4 バイト絵文字の入れ替え",
+            ),
+            (
+                "👨\u{200D}👩\u{200D}👧 family",
+                "👩\u{200D}👩\u{200D}👦 family",
+                &["👨\u{200D}👩\u{200D}👧"],
+                &["👩\u{200D}👩\u{200D}👦"],
+                "ZWJ 絵文字は 1 かたまりとして入れ替わる",
+            ),
+            (
+                "👍\u{1F3FB}",
+                "👍\u{1F3FF}",
+                &["👍\u{1F3FB}"],
+                &["👍\u{1F3FF}"],
+                "肌色修飾子だけ違う = クラスタごと差し替え",
+            ),
+            (
+                "か\u{3099}き",
+                "かき",
+                &["か\u{3099}"],
+                &["か"],
+                "結合濁点を割らない",
+            ),
+            (
+                "🇯🇵 と 🇺🇸",
+                "🇯🇵 と 🇫🇷",
+                &["🇺🇸"],
+                &["🇫🇷"],
+                "国旗 (地域表示記号 2 つ) を割らない",
+            ),
+        ];
+        for (old, new, wo, wn, why) in table {
+            let (a, b) = word_diff(old, new).unwrap_or_else(|| panic!("{why}: 諦めてはいけない"));
+            assert_eq!(spans_text(old, &a), *wo, "{why}: 旧側");
+            assert_eq!(spans_text(new, &b), *wn, "{why}: 新側");
+        }
+    }
+
+    #[test]
+    fn word_diff_spans_are_valid_char_boundaries() {
+        // 日本語・絵文字・ASCII が混ざった行でも、返る範囲は必ず文字境界で
+        // 昇順・重なりなし (これを破ると `&s[a..b]` が panic する)。
+        let old = "let 名前 = \"🚀 起動\"; // 旧";
+        let new = "let 名前 = \"🎉 完了\"; // 新";
+        let (a, b) = word_diff(old, new).expect("諦めない長さ");
+        for (s, spans) in [(old, &a), (new, &b)] {
+            let mut prev = 0usize;
+            for w in spans.iter() {
+                assert!(w.start < w.end, "空の範囲を返した");
+                assert!(w.start >= prev, "範囲が重なっている / 逆順");
+                assert!(s.is_char_boundary(w.start), "開始が文字境界でない");
+                assert!(s.is_char_boundary(w.end), "終了が文字境界でない");
+                let _ = &s[w.start..w.end]; // panic しないこと
+                prev = w.end;
+            }
+        }
+    }
+
+    #[test]
+    fn word_diff_gives_up_on_pathological_lines() {
+        // 1. バイト長の上限
+        let long_a = "a".repeat(WORD_DIFF_MAX_BYTES + 1);
+        let long_b = "b".repeat(WORD_DIFF_MAX_BYTES + 1);
+        assert!(
+            word_diff(&long_a, &long_b).is_none(),
+            "長すぎる行は語単位を諦める (行全体を塗る)"
+        );
+        // 2. DP のマス数の上限。共通接頭辞・接尾辞が無い別々のトークン列。
+        let a: String = (0..1200).map(|i| format!("a{i} ")).collect();
+        let b: String = (0..1200).map(|i| format!("b{i} ")).collect();
+        assert!(a.len() <= WORD_DIFF_MAX_BYTES && b.len() <= WORD_DIFF_MAX_BYTES);
+        assert!(
+            word_diff(&a, &b).is_none(),
+            "マス数が上限を超えたら諦める (O(n²) を走らせない)"
+        );
+        // 3. 上限すれすれは諦めない (閾値が厳しすぎて実用行まで殺していない)
+        let c: String = (0..200).map(|i| format!("c{i} ")).collect();
+        let d: String = (0..200).map(|i| format!("d{i} ")).collect();
+        assert!(word_diff(&c, &d).is_some(), "実用サイズの行は語単位で出す");
+    }
+
+    #[test]
+    fn word_diff_long_but_similar_lines_still_work() {
+        // 前後がそっくりな長い行は、接頭辞・接尾辞を削った結果すぐ小さくなる。
+        let head = "x".repeat(3000);
+        let old = format!("{head} alpha {head}");
+        let new = format!("{head} beta {head}");
+        let (a, b) = word_diff(&old, &new).expect("接頭辞・接尾辞を削れば上限に当たらない");
+        assert_eq!(spans_text(&old, &a), vec!["alpha"]);
+        assert_eq!(spans_text(&new, &b), vec!["beta"]);
+    }
+
+    // ---- fold_context_runs: 未変更行の折りたたみ ---------------------------
+
+    fn kinds_of(s: &str) -> Vec<LineKind> {
+        s.chars()
+            .map(|c| match c {
+                '+' => LineKind::Added,
+                '-' => LineKind::Removed,
+                _ => LineKind::Context,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fold_context_runs_table() {
+        // (行種の並び, keep, 期待する畳む区間, 何を見ているか)
+        let table: &[(&str, usize, &[(usize, usize)], &str)] = &[
+            ("", 3, &[], "空"),
+            ("...", 3, &[], "3 行の文脈は畳まない"),
+            (".......", 3, &[], "7 行 = 2*keep+1 はまだ畳まない"),
+            ("........", 3, &[(3, 5)], "8 行 = 2*keep+2 で 2 行畳む"),
+            (
+                "..........",
+                3,
+                &[(3, 7)],
+                "10 行なら前後 3 行を残して 4 行畳む",
+            ),
+            ("+++", 3, &[], "変更行だけなら畳まない"),
+            (
+                "........+........",
+                3,
+                &[(3, 5), (12, 14)],
+                "変更を挟んだ 2 つの塊をそれぞれ畳む",
+            ),
+            ("..", 0, &[(0, 2)], "keep=0 なら 2 行から畳む"),
+            (".", 0, &[], "1 行は畳まない (⋯ の方が場所を食う)"),
+            (
+                "+........+",
+                3,
+                &[(4, 6)],
+                "前後が変更行でも中央の文脈だけ畳む",
+            ),
+        ];
+        for (spec, keep, want, why) in table {
+            let got: Vec<(usize, usize)> = fold_context_runs(&kinds_of(spec), *keep)
+                .into_iter()
+                .map(|r| (r.start, r.end))
+                .collect();
+            assert_eq!(&got[..], *want, "{why} ({spec:?} keep={keep})");
+        }
+    }
+
+    #[test]
+    fn fold_context_runs_never_hides_a_changed_line() {
+        let spec = "..+.....-.........+..";
+        let kinds = kinds_of(spec);
+        for run in fold_context_runs(&kinds, CONTEXT_KEEP) {
+            for i in run.start..run.end {
+                assert_eq!(kinds[i], LineKind::Context, "変更行 {i} を畳もうとした");
+            }
+            assert!(run.len() >= 2, "1 行だけ畳むのは無意味");
+        }
+    }
+
+    #[test]
+    fn fold_covering_finds_the_hiding_run() {
+        let runs = fold_context_runs(&kinds_of(".........."), 3);
+        assert_eq!(runs.len(), 1);
+        assert!(fold_covering(&runs, 2).is_none(), "残す行は隠れない");
+        assert_eq!(fold_covering(&runs, 3).map(|r| r.start), Some(3));
+        assert_eq!(fold_covering(&runs, 6).map(|r| r.start), Some(3));
+        assert!(fold_covering(&runs, 7).is_none(), "区間は半開");
+    }
+
+    // ---- change_blocks / next_change_index: F7 のジャンプ ------------------
+
+    #[test]
+    fn change_blocks_finds_each_run_once() {
+        let files = parse_unified(
+            "diff --git a/a.rs b/a.rs\n\
+             --- a/a.rs\n+++ b/a.rs\n\
+             @@ -1,7 +1,7 @@\n \
+             ctx0\n-old1\n+new1\n ctx1\n ctx2\n-old2\n+new2\n ctx3\n\
+             diff --git a/b.rs b/b.rs\n\
+             --- a/b.rs\n+++ b/b.rs\n\
+             @@ -1,2 +1,3 @@\n ctx\n+added\n",
+        );
+        let blocks = change_blocks(&files);
+        assert_eq!(
+            blocks,
+            vec![
+                ChangeAnchor { file: 0, hunk: 0, line: 1 },
+                ChangeAnchor { file: 0, hunk: 0, line: 5 },
+                ChangeAnchor { file: 1, hunk: 0, line: 1 },
+            ],
+            "連続した追加/削除は 1 つの塊として数える"
+        );
+    }
+
+    #[test]
+    fn change_blocks_is_empty_without_changes() {
+        let files = parse_unified(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n a\n b\n",
+        );
+        assert!(change_blocks(&files).is_empty(), "文脈行だけなら 0 件");
+        assert!(change_blocks(&[]).is_empty(), "ファイルが無ければ 0 件");
+    }
+
+    #[test]
+    fn next_change_index_table() {
+        // (現在位置, 向き, 件数, 期待, 何を見ているか)
+        let table: &[(Option<usize>, i32, usize, Option<usize>, &str)] = &[
+            (None, 1, 0, None, "変更 0 件は前向きでも None"),
+            (None, -1, 0, None, "変更 0 件は後ろ向きでも None"),
+            (Some(0), 1, 0, None, "件数 0 なら位置があっても None"),
+            (None, 1, 3, Some(0), "初回の F7 は先頭へ"),
+            (None, -1, 3, Some(2), "初回の ⇧F7 は末尾へ"),
+            (Some(0), 1, 3, Some(1), "次へ"),
+            (Some(2), 1, 3, Some(0), "最後の次は先頭へ回り込む"),
+            (Some(0), -1, 3, Some(2), "先頭の前は末尾へ回り込む"),
+            (Some(1), -1, 3, Some(0), "前へ"),
+            (Some(9), 1, 3, Some(0), "件数が減っていても範囲内へ丸める"),
+            (Some(0), 0, 3, Some(1), "delta 0 は前向き扱い"),
+            (None, 1, 1, Some(0), "1 件しかないとき"),
+            (Some(0), 1, 1, Some(0), "1 件のときは自分へ戻る"),
+            (Some(0), -1, 1, Some(0), "1 件のときは逆向きでも自分"),
+        ];
+        for &(cur, delta, len, want, why) in table {
+            assert_eq!(next_change_index(cur, delta, len), want, "{why}");
+        }
+    }
+
+    #[test]
+    fn next_change_index_cycles_through_everything() {
+        let n = 5;
+        let mut cur = None;
+        let mut seen = Vec::new();
+        for _ in 0..n {
+            cur = next_change_index(cur, 1, n);
+            seen.push(cur.unwrap());
+        }
+        assert_eq!(seen, vec![0, 1, 2, 3, 4], "一巡で全部を通る");
+        assert_eq!(next_change_index(cur, 1, n), Some(0), "そのあと先頭へ戻る");
+    }
+
+    // =======================================================================
+    // 実描画 (ヘッドレス) — 並列表示の行揃えと、左右どちらにもコメントが打てること
+    // =======================================================================
+
+    /// 描かれた**テキスト**の矩形を本文で探す (`painter.galley` 経由の行本文)。
+    fn galley_rect(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Rect> {
+        fn walk(s: &egui::Shape, needle: &str, out: &mut Option<egui::Rect>) {
+            if out.is_some() {
+                return;
+            }
+            match s {
+                egui::Shape::Text(t) => {
+                    if t.galley.job.text == needle {
+                        *out = Some(t.visual_bounding_rect());
+                    }
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, needle, out)),
+                _ => {}
+            }
+        }
+        let mut out = None;
+        for c in shapes {
+            walk(&c.shape, needle, &mut out);
+        }
+        out
+    }
+
+    fn sbs_diff() -> Vec<FileDiff> {
+        parse_unified(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n\
+             @@ -1,3 +1,3 @@\n ctxline\n-oldline\n+newline\n",
+        )
+    }
+
+    fn render(
+        ctx: &egui::Context,
+        theme: &Theme,
+        files: &[FileDiff],
+        store: &mut DiffCommentStore,
+        size: (f32, f32),
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let raw = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size.0, size.1),
+            )),
+            ..Default::default()
+        };
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                diff_ui_with_actions(ui, theme, files, store);
+            });
+        })
+        .shapes
+    }
+
+    fn click_at(at: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn side_by_side_pairs_sit_at_the_same_height() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        set_diff_mode(&ctx, DiffMode::SideBySide);
+        let files = sbs_diff();
+        let mut store = DiffCommentStore::default();
+        // 1 フレーム目はレイアウト確定用 (折りたたみヘッダの高さが決まる)
+        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), Vec::new());
+        let shapes = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), Vec::new());
+
+        let old = galley_rect(&shapes, "oldline").expect("旧側の行が描かれている");
+        let new = galley_rect(&shapes, "newline").expect("新側の行が描かれている");
+        assert!(
+            (old.top() - new.top()).abs() < 0.5,
+            "置換の対が同じ高さに並んでいない: {old:?} vs {new:?}"
+        );
+        let lay = diff_layout(900.0, DiffMode::SideBySide, ctx.pixels_per_point());
+        let mid = lay.panes[1].x;
+        assert!(old.left() < mid, "旧側が左ペインに無い ({} >= {mid})", old.left());
+        assert!(new.left() >= mid, "新側が右ペインに無い ({} < {mid})", new.left());
+        assert!(
+            new.right() <= 900.0 + 0.5,
+            "右ペインの本文が画面からはみ出した: {new:?}"
+        );
+    }
+
+    #[test]
+    fn side_by_side_takes_comments_on_both_sides() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        set_diff_mode(&ctx, DiffMode::SideBySide);
+        let files = sbs_diff();
+        let mut store = DiffCommentStore::default();
+        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), Vec::new());
+        let shapes = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), Vec::new());
+        let old = galley_rect(&shapes, "oldline").expect("旧側の行");
+        let new = galley_rect(&shapes, "newline").expect("新側の行");
+
+        // 左 (旧側) をクリック → 旧側の行番号にコメントの下書きが開く
+        let p = old.center();
+        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), click_at(p, true));
+        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), click_at(p, false));
+        assert!(
+            store.drafts.keys().any(|a| a.side == CommentSide::Old),
+            "左 (変更前) の行にコメントが打てない: {:?}",
+            store.drafts.keys().collect::<Vec<_>>()
+        );
+
+        // 右 (新側) をクリック → 新側の行番号にも打てる
+        let p = new.center();
+        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), click_at(p, true));
+        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), click_at(p, false));
+        assert!(
+            store.drafts.keys().any(|a| a.side == CommentSide::New),
+            "右 (変更後) の行にコメントが打てない: {:?}",
+            store.drafts.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn narrow_view_degrades_to_inline_and_still_takes_comments() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        // 並列を選んでいても、320px では一列で描かれる
+        set_diff_mode(&ctx, DiffMode::SideBySide);
+        let files = sbs_diff();
+        let mut store = DiffCommentStore::default();
+        let _ = render(&ctx, &theme, &files, &mut store, (320.0, 640.0), Vec::new());
+        let shapes = render(&ctx, &theme, &files, &mut store, (320.0, 640.0), Vec::new());
+        let old = galley_rect(&shapes, "oldline").expect("旧側の行");
+        let new = galley_rect(&shapes, "newline").expect("新側の行");
+        assert!(
+            (old.top() - new.top()).abs() > 1.0,
+            "一列なら上下に並ぶはず: {old:?} / {new:?}"
+        );
+        assert!(old.left() < 320.0 && new.left() < 320.0, "本文が画面外");
+
+        let p = new.center();
+        let _ = render(&ctx, &theme, &files, &mut store, (320.0, 640.0), click_at(p, true));
+        let _ = render(&ctx, &theme, &files, &mut store, (320.0, 640.0), click_at(p, false));
+        assert_eq!(store.drafts.len(), 1, "一列でも行コメントが打てる");
+    }
+
+    /// 描かれた**塗り矩形**を全部集める。テキストは長い行が意図的に
+    /// はみ出して (クリップされて) 描かれるので対象にしない。
+    fn filled_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        fn walk(s: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match s {
+                egui::Shape::Rect(r) => out.push(r.rect),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn every_painted_row_stays_inside_the_viewport() {
+        // 極端なサイズで描いて、塗り矩形もクリップ矩形も画面の横幅を出ないこと。
+        // 折りたたみ見出しの字下げぶんを勘定に入れ忘れると、並列の右ペインが
+        // ここで画面外へ出る (実際にそう書いて落ちた)。
+        for (w, h) in [(900.0f32, 700.0f32), (1200.0, 300.0), (320.0, 640.0), (700.0, 500.0)] {
+            let ctx = egui::Context::default();
+            let theme = crate::theme::all()[0].clone();
+            set_diff_mode(&ctx, DiffMode::SideBySide);
+            let files = sbs_diff();
+            // コメントスレッドと操作バーも描かせる (枠の余白ぶん広がりやすい所)
+            let mut store = DiffCommentStore::default();
+            store.add(
+                CommentAnchor::new("a.rs", CommentSide::New, 2),
+                "newline",
+                "ここを直して。長めの本文でも枠が広がってはいけない。",
+            );
+            store.toggle_draft(CommentAnchor::new("a.rs", CommentSide::Old, 2));
+            let _ = render(&ctx, &theme, &files, &mut store, (w, h), Vec::new());
+            let shapes = render(&ctx, &theme, &files, &mut store, (w, h), Vec::new());
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+            for r in filled_rects(&shapes) {
+                if !r.is_positive() {
+                    continue;
+                }
+                assert!(
+                    r.min.x >= screen.min.x - 0.5 && r.max.x <= screen.max.x + 0.5,
+                    "{w}x{h}: 塗り矩形が横にはみ出した {r:?} (画面 {screen:?})"
+                );
+            }
+            for c in &shapes {
+                let r = c.clip_rect;
+                if !r.is_positive() {
+                    continue;
+                }
+                assert!(
+                    r.min.x >= screen.min.x - 0.5 && r.max.x <= screen.max.x + 0.5,
+                    "{w}x{h}: クリップ矩形が横にはみ出した {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn side_by_side_panes_do_not_overlap_when_painted() {
+        // 左ペインの塗りが右ペインの領域へ入らない (= 行が重ならない)。
+        let (w, h) = (1000.0f32, 700.0f32);
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        set_diff_mode(&ctx, DiffMode::SideBySide);
+        let files = sbs_diff();
+        let mut store = DiffCommentStore::default();
+        let _ = render(&ctx, &theme, &files, &mut store, (w, h), Vec::new());
+        let shapes = render(&ctx, &theme, &files, &mut store, (w, h), Vec::new());
+        let old = galley_rect(&shapes, "oldline").expect("旧側の行");
+        let new = galley_rect(&shapes, "newline").expect("新側の行");
+        assert!(
+            old.right() <= new.left(),
+            "左ペインの本文が右ペインへ食い込んだ: {old:?} / {new:?}"
+        );
+        // 溝ぶんは必ず空いている
+        assert!(new.left() - old.right() >= PANE_GAP - 0.5);
+    }
+
+    #[test]
+    fn f7_jumps_and_reports_when_there_is_nothing_to_jump_to() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        // 変更が 0 件の差分に F7 → 「変更はありません」を積むだけ
+        let no_change = parse_unified(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n a\n b\n",
+        );
+        let mut store = DiffCommentStore::default();
+        request_jump(&ctx, 1);
+        let _ = render(&ctx, &theme, &no_change, &mut store, (900.0, 700.0), Vec::new());
+        assert_eq!(
+            take_pending_notice(&ctx).as_deref(),
+            Some(tr("変更はありません").as_str()),
+            "変更が無いときは静かに知らせるだけ"
+        );
+        assert!(take_pending_notice(&ctx).is_none(), "通知は 1 回きり");
+
+        // 変更のある差分では通知を出さない (黙って飛ぶ)
+        let files = sbs_diff();
+        request_jump(&ctx, 1);
+        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), Vec::new());
+        assert!(take_pending_notice(&ctx).is_none(), "飛べるときは黙って飛ぶ");
+    }
+
+    #[test]
+    fn stale_jump_requests_are_dropped() {
+        // 差分ビューが出ていないフレームで撃たれた F7 は、あとから暴発しない。
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        let files = sbs_diff();
+        let mut store = DiffCommentStore::default();
+        request_jump(&ctx, 1);
+        // 差分を描かないフレームを 3 枚流す
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+        }
+        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), Vec::new());
+        assert!(
+            take_pending_notice(&ctx).is_none(),
+            "古い依頼が生き残って何かを起こした"
+        );
+    }
+
+    #[test]
+    fn mode_toggle_is_drawn_once_per_pass_even_with_many_files() {
+        // Git のレビュー画面は 1 ファイルずつ diff_ui を呼ぶ。
+        // それでもモード切替ボタンは 1 個しか出ない。
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        set_diff_mode(&ctx, DiffMode::SideBySide);
+        let files = sbs_diff();
+        let mut store = DiffCommentStore::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let shapes = ctx
+            .run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for i in 0..4 {
+                        ui.push_id(i, |ui| {
+                            diff_ui_with_actions(ui, &theme, &files, &mut store);
+                        });
+                    }
+                });
+            })
+            .shapes;
+        let label = DiffMode::SideBySide.label();
+        let mut n = 0usize;
+        fn count(s: &egui::Shape, needle: &str, n: &mut usize) {
+            match s {
+                egui::Shape::Text(t) => {
+                    if t.galley.job.text.contains(needle) {
+                        *n += 1;
+                    }
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| count(s, needle, n)),
+                _ => {}
+            }
+        }
+        for c in &shapes {
+            count(&c.shape, &label, &mut n);
+        }
+        assert_eq!(n, 1, "モード切替ボタンが {n} 個描かれた (1 個であるべき)");
+    }
+
+
+    // ---- DiffMode: config との往復 ----------------------------------------
+
+    #[test]
+    fn diff_mode_config_roundtrip() {
+        for m in [DiffMode::Inline, DiffMode::SideBySide] {
+            assert_eq!(DiffMode::from_config_str(m.config_str()), m);
+            assert_eq!(m.toggled().toggled(), m);
+            assert_ne!(m.toggled(), m);
+            assert!(!m.label().is_empty());
+        }
+        assert_eq!(
+            DiffMode::default(),
+            DiffMode::SideBySide,
+            "既定は並列 (狭いときだけ diff_layout が一列へ落とす)"
+        );
+        // 未知の値・空文字・大文字混じりは既定へ倒す (設定を壊しても動く)
+        for s in ["", "  ", "SIDE_BY_SIDE", "なにか", "split"] {
+            assert_eq!(DiffMode::from_config_str(s), DiffMode::SideBySide, "{s:?}");
+        }
+        for s in ["inline", "Inline", " UNIFIED ", "1"] {
+            assert_eq!(DiffMode::from_config_str(s), DiffMode::Inline, "{s:?}");
+        }
     }
 }

@@ -225,6 +225,12 @@ pub enum Cmd {
     /// レビューの比較ベースを変える。値は "head" | "staged" | "unstaged"
     /// (任意リビジョンはレビュー画面のツールバーから入力する)
     SetReviewBase(String),
+    /// 差分の表示を 並列 (左右 2 列) ⇔ 一列 (インライン) で切り替える
+    ToggleDiffView,
+    /// 差分の次の変更へ (VS Code: F7)
+    DiffNextChange,
+    /// 差分の前の変更へ (VS Code: ⇧F7)
+    DiffPrevChange,
 
     // ── 折りたたみ (highlight.rs の構造解析 + editor::FoldState) ────
     /// カーソル行の折りたたみを切り替える
@@ -555,9 +561,13 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::TogglePetBubbles => Group::View,
 
         // ── Git ────────────────────────────────────────────────────
-        Cmd::OpenGitPanel | Cmd::ShowGitHubTab | Cmd::OpenReview | Cmd::SetReviewBase(_) => {
-            Group::Git
-        }
+        Cmd::OpenGitPanel
+        | Cmd::ShowGitHubTab
+        | Cmd::OpenReview
+        | Cmd::SetReviewBase(_)
+        | Cmd::ToggleDiffView
+        | Cmd::DiffNextChange
+        | Cmd::DiffPrevChange => Group::Git,
 
         // ── ターミナル・実行 ───────────────────────────────────────
         Cmd::ToggleTerminal

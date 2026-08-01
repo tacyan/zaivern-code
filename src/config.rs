@@ -30,6 +30,12 @@ pub struct Config {
     /// エディタ上部のブレッドクラム (`ワークスペース › フォルダ › ファイル › シンボル`)。
     /// **既定はオン** — 高さ 1 行ぶんで、どの言語でも (LSP 無しでも) 必ず出せる。
     pub breadcrumbs: bool,
+    /// 差分ビューの既定の表示: `"side_by_side"` (左右 2 列) | `"inline"` (1 列)。
+    ///
+    /// **既定は並列**。ただし幅が足りないときは `diff::diff_layout` が
+    /// 自動で 1 列へ縮退させるので、狭いウィンドウでも見切れない。
+    /// 値の解釈は [`crate::diff::DiffMode::from_config_str`] に集約してある。
+    pub diff_view: String,
 
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
@@ -244,6 +250,7 @@ impl Default for Config {
             lsp_highlight_occurrences: true,
             minimap: false,
             breadcrumbs: true,
+            diff_view: crate::diff::DiffMode::default().config_str().into(),
             approval_mode: "ask".into(),
             restore_agents: false,
             show_pet: true,
@@ -460,6 +467,8 @@ struct UiState {
     show_whitespace: Option<bool>,
     minimap: Option<bool>,
     breadcrumbs: Option<bool>,
+    /// 差分ビューの表示モード ("side_by_side" | "inline")。
+    diff_view: Option<String>,
     pet_image: Option<String>,
     pet_x: Option<f32>,
     pet_y: Option<f32>,
@@ -887,6 +896,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.breadcrumbs {
                     cfg.breadcrumbs = v;
                 }
+                if let Some(v) = st.diff_view {
+                    cfg.diff_view = v;
+                }
                 if st.pet_image.is_some() {
                     cfg.pet_image = st.pet_image;
                 }
@@ -1260,6 +1272,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         show_whitespace: Some(cfg.global_show_whitespace),
         minimap: Some(cfg.global_minimap),
         breadcrumbs: Some(cfg.global_breadcrumbs),
+        diff_view: Some(cfg.diff_view.clone()),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -1841,6 +1854,7 @@ command = "agy"
             show_whitespace: Some(true),
             minimap: Some(true),
             breadcrumbs: Some(false),
+            diff_view: Some("inline".into()),
             pet_image: Some("/tmp/p.png".into()),
             pet_x: Some(10.0),
             pet_y: Some(20.5),
