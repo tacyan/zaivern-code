@@ -15,6 +15,7 @@ use crate::orchestration;
 use crate::supervisor;
 use crate::editor::{combine_hash, disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
+use crate::editor_split;
 use crate::file_search;
 use crate::file_tree::{self, FileTree, TreeActions};
 use crate::firewall;
@@ -582,6 +583,16 @@ fn bottom_view(approvals: bool, mcp: bool) -> BottomView {
     } else {
         BottomView::Terminal
     }
+}
+
+/// エディタ本文 (`TextEdit`) の egui ID。**バッファとペインの両方**で決める。
+///
+/// 同じファイルを 2 つのペインで開いたとき、ID がバッファだけで決まっていると
+/// 2 枚の `TextEdit` が同じ状態 (カーソル・選択) を共有してしまい、
+/// 片方を触るともう片方のキャレットまで飛ぶ。ID にペインを混ぜて分ける。
+/// **本文は共有・ビュー状態は別** という原則の ID 側の表れ。
+fn buf_edit_id(pane: editor_split::PaneId, buf: u64) -> egui::Id {
+    egui::Id::new(("zaivern-buffer", buf, pane))
 }
 
 /// Cockpit の見出し行を縮退させるか (純関数)。
@@ -1909,6 +1920,19 @@ pub struct ZaivernApp {
     agent_root: Option<PathBuf>,
     tree: FileTree,
     editor: Editor,
+    /// エディタの分割 (VS Code の editor group 相当)。
+    ///
+    /// **バッファの実体は `editor.buffers` だけ** — ここが持つのはタブの並び
+    /// (バッファ ID) とペインごとのビュー状態 (スクロール・カーソル)。
+    /// だから同じファイルを 2 ペインで開いても本文は 1 つで、片方の編集は
+    /// 必ずもう片方にも出る。分割木そのものは端末と同じ
+    /// [`terminal::SplitLayout`] を流用している (`editor_split` の頭注参照)。
+    panes: editor_split::EditorPanes,
+    /// **いま描いている**エディタペイン。TextEdit / ScrollArea の egui ID に
+    /// 混ぜて、同じバッファを 2 ペインに出してもカーソルとスクロールが
+    /// 混ざらないようにする ([`buf_edit_id`])。描画外では
+    /// フォーカス中ペインを指す。
+    cur_pane: editor_split::PaneId,
     agents: AgentManager,
     /// Cockpit のタイル 1 枚ぶんの端末分割レイアウト。
     ///
@@ -2568,6 +2592,8 @@ impl ZaivernApp {
             agent_root: roots.first().cloned(),
             roots,
             editor: Editor::new(),
+            panes: editor_split::EditorPanes::new(),
+            cur_pane: 1,
             agents: AgentManager::new(),
             splits: HashMap::new(),
             split_rect: HashMap::new(),
@@ -2954,7 +2980,7 @@ impl ZaivernApp {
     /// アクティブバッファでいま選択されているテキスト (無選択なら None)。
     fn active_selection(&self, ctx: &egui::Context) -> Option<String> {
         let b = self.editor.active.map(|i| &self.editor.buffers[i])?;
-        let ed_id = egui::Id::new(("zaivern-buffer", b.id));
+        let ed_id = buf_edit_id(self.cur_pane, b.id);
         let r = egui::TextEdit::load_state(ctx, ed_id)?.cursor.char_range()?;
         let (s, e) = (
             r.primary.index.min(r.secondary.index),
@@ -3075,7 +3101,7 @@ impl ZaivernApp {
                     self.toast(tr("実行にはファイルを開いてください"), false);
                     return;
                 };
-                let ed_id = egui::Id::new(("zaivern-buffer", b.id));
+                let ed_id = buf_edit_id(self.cur_pane, b.id);
                 let range = egui::TextEdit::load_state(ctx, ed_id)
                     .and_then(|st| st.cursor.char_range())
                     .map(|r| (r.primary.index, r.secondary.index))
@@ -3203,7 +3229,7 @@ impl ZaivernApp {
                         );
                         continue;
                     };
-                    let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+                    let ed_id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
                     let cur = egui::TextEdit::load_state(ctx, ed_id)
                         .and_then(|st| st.cursor.char_range())
                         .map(|c| c.primary.index)
@@ -3535,7 +3561,7 @@ impl ZaivernApp {
             self.toast(tr("🔌 挿入先のタブがありません"), false);
             return;
         };
-        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        let ed_id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
         let cur = egui::TextEdit::load_state(ctx, ed_id)
             .and_then(|st| st.cursor.char_range())
             .map(|c| c.primary.index)
@@ -4191,7 +4217,7 @@ impl ZaivernApp {
         let Some(i) = self.editor.active else {
             return;
         };
-        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        let ed_id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
         let range = egui::TextEdit::load_state(ctx, ed_id)
             .and_then(|st| st.cursor.char_range())
             .map(|r| (r.primary.index, r.secondary.index))
@@ -4242,7 +4268,7 @@ impl ZaivernApp {
     fn active_buffer_selection(&self, ctx: &egui::Context) -> Option<(usize, u64, usize, usize)> {
         let i = self.editor.active?;
         let id = self.editor.buffers.get(i)?.id;
-        let ed_id = egui::Id::new(("zaivern-buffer", id));
+        let ed_id = buf_edit_id(self.cur_pane, id);
         let (a, b) = egui::TextEdit::load_state(ctx, ed_id)
             .and_then(|st| st.cursor.char_range())
             .map(|r| (r.primary.index, r.secondary.index))
@@ -6577,7 +6603,7 @@ impl ZaivernApp {
             return;
         };
         let buf_id = self.editor.buffers[i].id;
-        let ed_id = egui::Id::new(("zaivern-buffer", buf_id));
+        let ed_id = buf_edit_id(self.cur_pane, buf_id);
         let focused = ctx.memory(|m| m.has_focus(ed_id));
 
         // 開いているタブが変わったら候補は捨てる (別ファイルの候補を出さない)
@@ -7419,7 +7445,13 @@ impl ZaivernApp {
             | Cmd::MoveLineUp
             | Cmd::MoveLineDown
             | Cmd::OpenReplace => self.apply_cmd_edit(cmd, ctx),
-            Cmd::GlobalSearch
+            Cmd::SplitEditorRight
+            | Cmd::SplitEditorDown
+            | Cmd::UnsplitEditor
+            | Cmd::FocusNextPane
+            | Cmd::FocusEditorPane(_)
+            | Cmd::MoveTabToNextPane
+            | Cmd::GlobalSearch
             | Cmd::GlobalReplace
             | Cmd::ToggleSearchCase
             | Cmd::ToggleSearchWholeWord
@@ -7641,6 +7673,48 @@ impl ZaivernApp {
     #[allow(clippy::collapsible_match)]
     fn apply_cmd_view_nav(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
+            // ── エディタの分割 (VS Code の editor group 相当) ──────
+            // 開いているものが無いと分割に意味が無いので、バッファ 0 枚の
+            // ときは断る (中身の無いペインを増やさない)。
+            Cmd::SplitEditorRight | Cmd::SplitEditorDown => {
+                if self.editor.active.is_none() {
+                    self.toast(tr("分割するファイルが開かれていません"), false);
+                    return;
+                }
+                let dir = if matches!(cmd, Cmd::SplitEditorRight) {
+                    terminal::SplitDir::Horizontal
+                } else {
+                    terminal::SplitDir::Vertical
+                };
+                self.panes.split(dir);
+                self.sync_panes();
+            }
+            Cmd::UnsplitEditor => {
+                if self.panes.unsplit() {
+                    self.sync_panes();
+                } else {
+                    self.toast(tr("エディタは分割されていません"), false);
+                }
+            }
+            Cmd::FocusNextPane => {
+                if self.panes.focus_next() {
+                    self.sync_panes();
+                }
+            }
+            Cmd::FocusEditorPane(n) => {
+                if self.panes.focus_index(n) {
+                    self.sync_panes();
+                }
+            }
+            Cmd::MoveTabToNextPane => {
+                if self.editor.active.is_none() {
+                    self.toast(tr("移動するタブがありません"), false);
+                    return;
+                }
+                if self.panes.move_active_tab_to_next() {
+                    self.sync_panes();
+                }
+            }
             Cmd::GlobalSearch => {
                 self.sidebar_open = true;
                 self.sidebar_tab = SidebarTab::Search;
@@ -8576,6 +8650,22 @@ impl ZaivernApp {
             cmds.push(Cmd::OpenFileDialog);
         }
         // ⇧⌘F (横断検索) / ⌥⌘F (置換) は ⌘F (検索) より修飾キーが多いので先に
+        // エディタの分割 (⌘\ / ⌥⌘\ / ⌘1-3)。修飾の多いものを先に消費する。
+        if consume(ctx, self.keys.get(BindAction::SplitEditorDown)) {
+            cmds.push(Cmd::SplitEditorDown);
+        }
+        if consume(ctx, self.keys.get(BindAction::SplitEditorRight)) {
+            cmds.push(Cmd::SplitEditorRight);
+        }
+        for (a, n) in [
+            (BindAction::FocusPane1, 1usize),
+            (BindAction::FocusPane2, 2),
+            (BindAction::FocusPane3, 3),
+        ] {
+            if consume(ctx, self.keys.get(a)) {
+                cmds.push(Cmd::FocusEditorPane(n));
+            }
+        }
         if consume(ctx, self.keys.get(BindAction::GlobalSearch)) {
             cmds.push(Cmd::GlobalSearch);
         }
@@ -8728,7 +8818,7 @@ impl ZaivernApp {
             .editor
             .active
             .map(|i| {
-                let id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+                let id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
                 ctx.memory(|m| m.has_focus(id))
             })
             .unwrap_or(false);
@@ -8810,7 +8900,7 @@ impl ZaivernApp {
         let page = ((self.last_view_h / self.last_row_h.max(1.0)).floor() as usize)
             .saturating_sub(2)
             .max(1);
-        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        let ed_id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
         let cur = egui::TextEdit::load_state(ctx, ed_id)
             .and_then(|st| st.cursor.char_range())
             .map(|r| r.primary.index)
@@ -13311,114 +13401,224 @@ impl ZaivernApp {
 
     // ─── UI: editor ─────────────────────────────────────────────────
 
+    /// エディタの中央ビュー。**分割しているかどうかで経路が 1 本に決まる**
+    /// (bool を 2 つ持つと 2 つの経路が同時に描かれる事故が起きるため)。
     fn editor_area(&mut self, ui: &mut egui::Ui) {
-        let theme = self.theme.clone();
-
-        if !self.editor.buffers.is_empty() {
-            let mut close_req: Option<usize> = None;
-            let mut activate: Option<usize> = None;
-            let tabs = egui::Frame::none()
-                .fill(theme.panel_alt)
-                .inner_margin(egui::Margin {
-                    left: 6.0,
-                    right: 6.0,
-                    top: 6.0,
-                    bottom: 0.0,
-                })
-                .show(ui, |ui| {
-                    egui::ScrollArea::horizontal()
-                        .id_salt("editor-tabs")
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for (i, b) in self.editor.buffers.iter().enumerate() {
-                                    let active = Some(i) == self.editor.active;
-                                    let fill = if active {
-                                        theme.bg
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    };
-                                    // タブは Frame 全体を当たり判定にする。Label に
-                                    // Sense を付けるとテキストの矩形しか反応せず、
-                                    // inner_margin の余白を押しても切り替わらない
-                                    // (押せるのは見た目のタブの 3 割ほどしかない)。
-                                    // × は Sense を持たせず座標で判定する — 後から
-                                    // 呼ぶ interact に当たり判定を奪われて閉じるボタンが
-                                    // 無反応になるのを避けるため。
-                                    let fr = egui::Frame::none()
-                                        .fill(fill)
-                                        .rounding(egui::Rounding {
-                                            nw: 7.0,
-                                            ne: 7.0,
-                                            sw: 0.0,
-                                            se: 0.0,
-                                        })
-                                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                                        .show(ui, |ui| {
-                                            ui.spacing_mut().item_spacing.x = 6.0;
-                                            let icon = file_tree::icon_for(&b.title);
-                                            let name = if b.dirty() {
-                                                format!("{icon} {} ●", b.title)
-                                            } else {
-                                                format!("{icon} {}", b.title)
-                                            };
-                                            let color = if active {
-                                                theme.text
-                                            } else {
-                                                theme.text_dim
-                                            };
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(name).color(color),
-                                                )
-                                                .selectable(false),
-                                            );
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new("×").color(theme.text_dim),
-                                                )
-                                                .selectable(false),
-                                            )
-                                            .rect
-                                        });
-                                    let x_rect = fr.inner;
-                                    let tab = ui.interact(
-                                        fr.response.rect,
-                                        ui.id().with(("editor-tab", i)),
-                                        egui::Sense::click(),
-                                    );
-                                    if tab.hovered() {
-                                        ui.ctx()
-                                            .set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    if tab.clicked() {
-                                        if tab
-                                            .interact_pointer_pos()
-                                            .is_some_and(|p| x_rect.expand(4.0).contains(p))
-                                        {
-                                            close_req = Some(i);
-                                        } else {
-                                            activate = Some(i);
-                                        }
-                                    }
-                                }
-                            });
-                        });
-                });
-            tutorial::anchor(ui.ctx(), AnchorId::EditorTabs, tabs.response.rect);
-            if let Some(i) = activate {
-                self.editor.active = Some(i);
-                self.find.last = None;
-            }
-            if let Some(i) = close_req {
-                self.request_close(i);
-            }
+        self.sync_panes();
+        if self.panes.is_split() {
+            self.editor_split_ui(ui);
+            return;
         }
-
+        // 分割していない間は**今までと同じ 1 本の経路**を通す。
+        // 分割機能を足しただけで画面が変わらないようにするための分岐。
+        self.cur_pane = self.panes.focus_id();
+        if !self.editor.buffers.is_empty() {
+            let idx: Vec<usize> = (0..self.editor.buffers.len()).collect();
+            let hit = self.editor_tab_strip(ui, &idx, self.editor.active, true);
+            self.apply_tab_hit(self.cur_pane, hit);
+        }
         if self.find.open && self.editor.active.is_some() {
             self.find_bar(ui);
         }
+        self.editor_body_ui(ui);
+    }
 
+    /// `editor.buffers` とペインのタブを突き合わせ、`editor.active` を
+    /// フォーカス中ペインのアクティブタブへ合わせ直す。
+    ///
+    /// これが「バッファは 1 つ・ビューは複数」の接ぎ目。ペインは
+    /// バッファ ID しか持たないので、`Vec` の添字がずれても壊れない。
+    fn sync_panes(&mut self) {
+        let ids: Vec<u64> = self.editor.buffers.iter().map(|b| b.id).collect();
+        let active_id = self.editor.active.and_then(|i| self.editor.buffers.get(i)).map(|b| b.id);
+        let left = self.panes.sync(&ids, active_id);
+        self.editor.active = left.and_then(|b| self.editor.buffers.iter().position(|x| x.id == b));
+        self.cur_pane = self.panes.focus_id();
+    }
+
+    /// タブ列のクリック結果 `(activate, close)` を適用する。
+    /// どちらも **`editor.buffers` の添字**。
+    fn apply_tab_hit(&mut self, pane: editor_split::PaneId, hit: (Option<usize>, Option<usize>)) {
+        let (activate, close) = hit;
+        if let Some(i) = activate {
+            self.panes.set_focus(pane);
+            if let (Some(buf), Some(p)) =
+                (self.editor.buffers.get(i).map(|b| b.id), self.panes.pane_mut(pane))
+            {
+                if let Some(at) = p.tabs.iter().position(|x| *x == buf) {
+                    p.active = at;
+                }
+            }
+            self.editor.active = Some(i);
+            self.find.last = None;
+        }
+        if let Some(i) = close {
+            let buf = self.editor.buffers.get(i).map(|b| b.id);
+            match buf {
+                // 同じファイルを別のペインでも開いているなら、**このペインの
+                // タブを外すだけ**でバッファは生かす (VS Code と同じ)。
+                Some(b) if self.panes.open_count(b) > 1 => {
+                    self.panes.close_tab(pane, b);
+                    self.sync_panes();
+                }
+                _ => self.request_close(i),
+            }
+        }
+    }
+
+    /// タブ列を 1 本描く。`idx` は `editor.buffers` の添字の並び、
+    /// `active` はそのうちアクティブなもの。戻り値は `(押された, 閉じられた)`。
+    ///
+    /// **どの幅でも見切れない** — 幅が足りなければ題名を省略し、それでも
+    /// 足りなければアイコンだけへ縮退する。判断は純関数
+    /// [`editor_split::tab_strip`] が持ち、ここは結果を置くだけ。
+    fn editor_tab_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: &[usize],
+        active: Option<usize>,
+        anchor: bool,
+    ) -> (Option<usize>, Option<usize>) {
+        let theme = self.theme.clone();
+        let mut close_req: Option<usize> = None;
+        let mut activate: Option<usize> = None;
+        if idx.is_empty() {
+            return (None, None);
+        }
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let longest = idx
+            .iter()
+            .filter_map(|i| self.editor.buffers.get(*i))
+            .map(|b| {
+                let name = format!("{} {}", file_tree::icon_for(&b.title), b.title);
+                ui.fonts(|f| f.layout_no_wrap(name, font.clone(), theme.text).size().x)
+            })
+            .fold(0.0f32, f32::max);
+        let strip = editor_split::tab_strip(ui.available_width() - 12.0, idx.len(), longest);
+        let text_w = (strip.tab_w - editor_split::TAB_CHROME_W).max(0.0);
+        let tabs = egui::Frame::none()
+            .fill(theme.panel_alt)
+            .inner_margin(egui::Margin {
+                left: 6.0,
+                right: 6.0,
+                top: 6.0,
+                bottom: 0.0,
+            })
+            .show(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("editor-tabs")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for i in idx {
+                                let i = *i;
+                                let Some(b) = self.editor.buffers.get(i) else {
+                                    continue;
+                                };
+                                let active = Some(i) == active;
+                                let fill = if active {
+                                    theme.bg
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                // タブは Frame 全体を当たり判定にする。Label に
+                                // Sense を付けるとテキストの矩形しか反応せず、
+                                // inner_margin の余白を押しても切り替わらない
+                                // (押せるのは見た目のタブの 3 割ほどしかない)。
+                                // × は Sense を持たせず座標で判定する — 後から
+                                // 呼ぶ interact に当たり判定を奪われて閉じるボタンが
+                                // 無反応になるのを避けるため。
+                                let icon = file_tree::icon_for(&b.title);
+                                let full = if b.dirty() {
+                                    format!("{icon} {} ●", b.title)
+                                } else {
+                                    format!("{icon} {}", b.title)
+                                };
+                                let color = if active { theme.text } else { theme.text_dim };
+                                let mode = strip.mode;
+                                let fr = egui::Frame::none()
+                                    .fill(fill)
+                                    .rounding(egui::Rounding {
+                                        nw: 7.0,
+                                        ne: 7.0,
+                                        sw: 0.0,
+                                        se: 0.0,
+                                    })
+                                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                    .show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        let lab = match mode {
+                                            // 狭いときはアイコンだけへ縮退。
+                                            // 題名はホバーで全文を出す。
+                                            editor_split::TabLabelMode::IconOnly => {
+                                                let c = if b.dirty() { theme.accent } else { color };
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(icon).color(c),
+                                                    )
+                                                    .selectable(false),
+                                                )
+                                            }
+                                            editor_split::TabLabelMode::Truncated => {
+                                                ui.set_max_width(text_w.max(1.0));
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&full).color(color),
+                                                    )
+                                                    .selectable(false)
+                                                    .truncate(),
+                                                )
+                                            }
+                                            editor_split::TabLabelMode::Full => ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&full).color(color),
+                                                )
+                                                .selectable(false),
+                                            ),
+                                        };
+                                        if mode != editor_split::TabLabelMode::Full {
+                                            lab.on_hover_text(&full);
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new("×").color(theme.text_dim),
+                                            )
+                                            .selectable(false),
+                                        )
+                                        .rect
+                                    });
+                                let x_rect = fr.inner;
+                                let tab = ui.interact(
+                                    fr.response.rect,
+                                    ui.id().with(("editor-tab", i)),
+                                    egui::Sense::click(),
+                                );
+                                if tab.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if tab.clicked() {
+                                    if tab
+                                        .interact_pointer_pos()
+                                        .is_some_and(|p| x_rect.expand(4.0).contains(p))
+                                    {
+                                        close_req = Some(i);
+                                    } else {
+                                        activate = Some(i);
+                                    }
+                                }
+                            }
+                        });
+                    });
+            });
+        if anchor {
+            tutorial::anchor(ui.ctx(), AnchorId::EditorTabs, tabs.response.rect);
+        }
+        (activate, close_req)
+    }
+
+    /// エディタ本文 (`editor.active` が指すバッファ) を種類ごとに振り分けて描く。
+    fn editor_body_ui(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme.clone();
         if self.editor.active.is_none() {
             self.welcome_ui(ui);
             return;
@@ -13470,6 +13670,170 @@ impl ZaivernApp {
             }
         }
         self.code_editor_ui(ui);
+    }
+
+    /// 分割中のエディタを描く。
+    ///
+    /// ペインの矩形と仕切りは [`editor_split::EditorPanes`]
+    /// (= 端末と同じ分割木) が唯一の真実源 — 幾何をここで作り直さない。
+    fn editor_split_ui(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme.clone();
+        // 検索バーは分割の上に 1 本だけ。対象はフォーカス中のバッファなので、
+        // ペインごとに出すと同じものが何本も並ぶ。
+        if self.find.open && self.editor.active.is_some() {
+            self.find_bar(ui);
+        }
+        let area = ui.available_rect_before_wrap();
+        if area.width() < 2.0 || area.height() < 2.0 {
+            return;
+        }
+        ui.allocate_rect(area, egui::Sense::hover());
+        let gutter = editor_split::GUTTER;
+        let rects = self.panes.rects(area, gutter);
+
+        // クリックしたペインへフォーカスを移す。イベントは**消費しない**ので、
+        // 同じクリックは本文側 (キャレット移動・選択) にもそのまま届く。
+        let press = ui.input(|i| {
+            if i.pointer.button_pressed(egui::PointerButton::Primary) {
+                i.pointer.interact_pos()
+            } else {
+                None
+            }
+        });
+        if let Some(pos) = press {
+            if let Some((id, _)) = rects.iter().find(|(_, r)| r.contains(pos)) {
+                self.panes.set_focus(*id);
+            }
+        }
+        let focus = self.panes.focus_id();
+        let strip_h = ui.text_style_height(&egui::TextStyle::Body) + 18.0;
+        let mut hits: Vec<(editor_split::PaneId, (Option<usize>, Option<usize>))> = Vec::new();
+
+        for (pid, r) in &rects {
+            let (pid, r) = (*pid, *r);
+            // このペインのタブを **バッファ ID → 添字** へ解決する。
+            let tabs: Vec<u64> = self
+                .panes
+                .pane(pid)
+                .map(|p| p.tabs.clone())
+                .unwrap_or_default();
+            let idx: Vec<usize> = tabs
+                .iter()
+                .filter_map(|b| self.editor.buffers.iter().position(|x| x.id == *b))
+                .collect();
+            let active_idx = self
+                .panes
+                .pane(pid)
+                .and_then(|p| p.active_buf())
+                .and_then(|b| self.editor.buffers.iter().position(|x| x.id == b));
+            let lay = editor_split::pane_layout(r, idx.len(), strip_h);
+            let is_focus = pid == focus;
+
+            // ペインごとのビュー状態を持ち込む (スクロール・カーソル)。
+            if let Some(p) = self.panes.pane(pid) {
+                let (sc, cur) = (p.scroll, p.cursor);
+                self.last_scroll_y = sc;
+                self.editor.cursor = cur;
+            }
+            self.cur_pane = pid;
+            self.editor.active = active_idx;
+
+            let mut pane_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(r)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            // **必ず push_id** — ペインごとに ScrollArea / TextEdit の
+            // 永続 ID を分ける。分けないと同じファイルを 2 ペインで開いた
+            // ときにスクロールとキャレットが混ざる。
+            pane_ui.push_id(pid, |ui| {
+                let mut tab_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(lay.tabs)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                tab_ui.set_clip_rect(lay.tabs);
+                let hit = self.editor_tab_strip(&mut tab_ui, &idx, active_idx, false);
+                if hit.0.is_some() || hit.1.is_some() {
+                    hits.push((pid, hit));
+                }
+                let mut body_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(lay.body)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                body_ui.set_clip_rect(lay.body);
+                self.editor_body_ui(&mut body_ui);
+            });
+
+            // 描き終わったビュー状態を書き戻す。
+            let (sc, cur) = (self.last_scroll_y, self.editor.cursor);
+            if let Some(p) = self.panes.pane_mut(pid) {
+                p.scroll = sc;
+                p.cursor = cur;
+            }
+            // フォーカスの合図は細い輪だけ。太枠にすると本文が狭く見える。
+            if is_focus {
+                ui.painter().rect_stroke(
+                    r.shrink(1.0),
+                    4.0,
+                    egui::Stroke::new(terminal::FOCUS_RING, theme.accent),
+                );
+            }
+        }
+
+        // ── 仕切り (ドラッグでリサイズ / ダブルクリックで均等化) ──
+        for g in self.panes.gutters(area, gutter) {
+            let hit = match g.dir {
+                terminal::SplitDir::Horizontal => g.rect.expand2(egui::vec2(2.0, 0.0)),
+                terminal::SplitDir::Vertical => g.rect.expand2(egui::vec2(0.0, 2.0)),
+            };
+            let id = ui.id().with(("zv-editor-gutter", g.path.as_slice()));
+            let resp = ui.interact(hit, id, egui::Sense::click_and_drag());
+            let hot = resp.hovered() || resp.dragged();
+            if hot {
+                ui.ctx().set_cursor_icon(match g.dir {
+                    terminal::SplitDir::Horizontal => egui::CursorIcon::ResizeHorizontal,
+                    terminal::SplitDir::Vertical => egui::CursorIcon::ResizeVertical,
+                });
+            }
+            if resp.double_clicked() {
+                self.panes.equalize_at(&g.path);
+            } else if resp.dragged() {
+                let d = resp.drag_delta();
+                let (delta, span) = match g.dir {
+                    terminal::SplitDir::Horizontal => (d.x, g.span.width()),
+                    terminal::SplitDir::Vertical => (d.y, g.span.height()),
+                };
+                if delta != 0.0 {
+                    self.panes.drag_gutter(&g.path, delta, span, gutter);
+                }
+            }
+            let col = if hot { theme.accent } else { theme.border };
+            let bar = match g.dir {
+                terminal::SplitDir::Horizontal => {
+                    g.rect.shrink2(egui::vec2(g.rect.width() * 0.3, 2.0))
+                }
+                terminal::SplitDir::Vertical => {
+                    g.rect.shrink2(egui::vec2(2.0, g.rect.height() * 0.3))
+                }
+            };
+            ui.painter().rect_filled(bar, 1.0, col);
+        }
+
+        for (pid, hit) in hits {
+            self.apply_tab_hit(pid, hit);
+        }
+        // フォーカス中ペインの状態を「現在のもの」として残す
+        // (ステータスバーのカーソル表示・スクロール指示の宛先になる)。
+        let f = self.panes.focus_id();
+        self.cur_pane = f;
+        if let Some(p) = self.panes.pane(f) {
+            let (sc, cur, buf) = (p.scroll, p.cursor, p.active_buf());
+            self.last_scroll_y = sc;
+            self.editor.cursor = cur;
+            self.editor.active = buf.and_then(|b| self.editor.buffers.iter().position(|x| x.id == b));
+        }
     }
 
     /// Markdown / HTML 用の 編集/プレビュー 切替バー。
@@ -14434,7 +14798,7 @@ impl ZaivernApp {
         // スニペット Tab 展開: エディタにフォーカスがあり、選択が空で、
         // カーソル直前の単語が prefix に一致するときだけ Tab を横取りする
         // (一致しなければ Tab はそのまま TextEdit のタブ挿入に流す)。
-        let ed_id_early = egui::Id::new(("zaivern-buffer", self.editor.buffers[active].id));
+        let ed_id_early = buf_edit_id(self.cur_pane, self.editor.buffers[active].id);
         let has_focus = ui.memory(|m| m.has_focus(ed_id_early));
 
         // Ctrl+A 全選択: egui 標準の TextEdit は mac では Cmd+A のみ対応で、
@@ -14807,7 +15171,7 @@ impl ZaivernApp {
         let gutter_w =
             ui.fonts(|f| f.glyph_width(&font, '0')) * gutter_digits as f32 + 22.0 + marker_w;
 
-        let ed_id = egui::Id::new(("zaivern-buffer", *id));
+        let ed_id = buf_edit_id(self.cur_pane, *id);
         // 折り返し OFF: highlight::layout_job が wrap.max_width = INFINITY を設定
         // する (横スクロールのため折り返さない) ので galley は wrap 幅に依存しない。
         // 折り返し ON: TextEdit から渡る利用可能幅で折り返す。キャッシュキーに
@@ -15473,7 +15837,37 @@ impl ZaivernApp {
             ("👁".into(), tr("Markdown/HTML プレビュー切替"), "⌘⇧V".into(), Cmd::ToggleMdPreview),
             ("↩".into(), tr("折り返し切替"), String::new(), Cmd::ToggleWordWrap),
             ("·".into(), tr("空白文字表示切替"), String::new(), Cmd::ToggleShowWhitespace),
-            ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),
+                ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),
+            (
+                "▥".into(),
+                tr("エディタを右に分割"),
+                fmt_key(BindAction::SplitEditorRight),
+                Cmd::SplitEditorRight,
+            ),
+            (
+                "▤".into(),
+                tr("エディタを下に分割"),
+                fmt_key(BindAction::SplitEditorDown),
+                Cmd::SplitEditorDown,
+            ),
+            (
+                "▢".into(),
+                tr("エディタの分割を解除"),
+                String::new(),
+                Cmd::UnsplitEditor,
+            ),
+            (
+                "⇥".into(),
+                tr("次のエディタペインへ"),
+                fmt_key(BindAction::FocusPane2),
+                Cmd::FocusNextPane,
+            ),
+            (
+                "⇨".into(),
+                tr("タブを次のペインへ移動"),
+                String::new(),
+                Cmd::MoveTabToNextPane,
+            ),
             ("🌿".into(), tr("Git パネルを開く"), String::new(), Cmd::OpenGitPanel),
             (
                 "👾".into(),
@@ -19962,6 +20356,7 @@ impl ZaivernApp {
             word_wrap: self.cfg.word_wrap,
             show_whitespace: self.cfg.show_whitespace,
             has_editor: self.editor.active.is_some(),
+            editor_split: self.panes.is_split(),
             has_file: active_path.is_some(),
             md_preview: self.md_preview,
             roots: self.roots.clone(),
@@ -20155,7 +20550,7 @@ impl ZaivernApp {
             self.pending_editor_events.clear();
             return;
         };
-        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        let ed_id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
         ctx.memory_mut(|m| m.request_focus(ed_id));
         for ev in std::mem::take(&mut self.pending_editor_events) {
             ctx.input_mut(|inp| inp.events.push(ev));
@@ -20172,7 +20567,7 @@ impl ZaivernApp {
     /// アクティブなエディタのカーソル位置 (char)。TextEdit の状態から読む。
     fn active_cursor_char(&self, ctx: &egui::Context) -> usize {
         let Some(i) = self.editor.active else { return 0 };
-        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        let ed_id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
         egui::TextEdit::load_state(ctx, ed_id)
             .and_then(|st| st.cursor.char_range())
             .map(|r| r.primary.index)
@@ -20392,7 +20787,7 @@ impl ZaivernApp {
     fn run_selection(&mut self, ctx: &egui::Context) {
         let Some(i) = self.editor.active else { return };
         let text = self.editor.buffers[i].text.clone();
-        let ed_id = egui::Id::new(("zaivern-buffer", self.editor.buffers[i].id));
+        let ed_id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
         let sel = egui::TextEdit::load_state(ctx, ed_id)
             .and_then(|st| st.cursor.char_range())
             .map(|r| {
@@ -20896,6 +21291,11 @@ fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
         (tr("新しいウィンドウ"), format_shortcut(keys.get(BindAction::NewWindow))),
         (tr("ファイルを開く"), format_shortcut(keys.get(BindAction::OpenFile))),
         (tr("タブを閉じる"), format_shortcut(keys.get(BindAction::CloseTab))),
+        (tr("エディタを右に分割"), format_shortcut(keys.get(BindAction::SplitEditorRight))),
+        (tr("エディタを下に分割"), format_shortcut(keys.get(BindAction::SplitEditorDown))),
+        (tr("1 番目のペインへ"), format_shortcut(keys.get(BindAction::FocusPane1))),
+        (tr("2 番目のペインへ"), format_shortcut(keys.get(BindAction::FocusPane2))),
+        (tr("3 番目のペインへ"), format_shortcut(keys.get(BindAction::FocusPane3))),
         (tr("検索"), format_shortcut(keys.get(BindAction::Find))),
         (tr("置換"), format_shortcut(keys.get(BindAction::OpenReplace))),
         (tr("ファイル間で検索"), format_shortcut(keys.get(BindAction::GlobalSearch))),
@@ -23776,6 +24176,12 @@ mod wave2_tests {
             "Cmd::SaveWithEncoding",
             // ── エージェントデッキ ──
             "Cmd::ToggleDeck",
+            // ── エディタの分割 ──
+            "Cmd::SplitEditorRight",
+            "Cmd::SplitEditorDown",
+            "Cmd::UnsplitEditor",
+            "Cmd::FocusNextPane",
+            "Cmd::MoveTabToNextPane",
         ] {
             assert!(list.contains(c), "{c} がコマンドパレットに無い");
             assert!(router.contains(c), "{c} のディスパッチが無い");

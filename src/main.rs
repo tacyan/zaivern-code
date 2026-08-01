@@ -14,6 +14,7 @@ mod diagnostician;
 mod diff;
 mod editor;
 mod editor_ops;
+mod editor_split;
 mod file_search;
 mod file_tree;
 mod firewall;

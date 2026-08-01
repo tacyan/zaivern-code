@@ -28,6 +28,8 @@ pub struct MenuInfo {
     pub show_whitespace: bool,
     /// アクティブなエディタタブがあるか (編集系メニューの有効/無効)
     pub has_editor: bool,
+    /// エディタが分割されているか (分割の解除・ペイン移動の有効/無効)
+    pub editor_split: bool,
     /// アクティブなタブがファイル (path 持ち) か
     pub has_file: bool,
     /// Markdown/HTML プレビュー対象タブか
@@ -371,6 +373,40 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             }
             if item(ui, &tr("ズームアウト"), &sc(keys, BindAction::FontDec), true) {
                 cmds.push(Cmd::FontDec);
+            }
+        });
+        ui.separator();
+        // ── エディタの分割 (VS Code の editor group 相当) ──
+        // 分割していない間は「解除」「次のペインへ」を押せなくする
+        // (押しても何も起きない項目を出さない)。
+        ui.menu_button(tr("エディタの分割"), |ui| {
+            ui.set_min_width(300.0);
+            if item(
+                ui,
+                &tr("右に分割"),
+                &sc(keys, BindAction::SplitEditorRight),
+                ed,
+            ) {
+                cmds.push(Cmd::SplitEditorRight);
+            }
+            if item(ui, &tr("下に分割"), &sc(keys, BindAction::SplitEditorDown), ed) {
+                cmds.push(Cmd::SplitEditorDown);
+            }
+            ui.separator();
+            if item(
+                ui,
+                &tr("次のペインへ"),
+                &sc(keys, BindAction::FocusPane2),
+                info.editor_split,
+            ) {
+                cmds.push(Cmd::FocusNextPane);
+            }
+            if item(ui, &tr("タブを次のペインへ移動"), "", ed) {
+                cmds.push(Cmd::MoveTabToNextPane);
+            }
+            ui.separator();
+            if item(ui, &tr("分割を解除"), "", info.editor_split) {
+                cmds.push(Cmd::UnsplitEditor);
             }
         });
         ui.separator();

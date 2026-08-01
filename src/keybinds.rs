@@ -96,10 +96,20 @@ pub enum BindAction {
     LspSignatureHelp,
     /// 次の出現を選択してキャレットを増やす (VS Code: ⌘D)
     SelectNextOccurrence,
+    /// エディタを右に分割 (VS Code: ⌘\ と同じ)
+    SplitEditorRight,
+    /// エディタを下に分割
+    SplitEditorDown,
+    /// 1 番目のエディタペインへフォーカス (VS Code: ⌘1)
+    FocusPane1,
+    /// 2 番目のエディタペインへフォーカス (VS Code: ⌘2)
+    FocusPane2,
+    /// 3 番目のエディタペインへフォーカス (VS Code: ⌘3)
+    FocusPane3,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 50] = [
+const ALL_ACTIONS: [BindAction; 55] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -150,6 +160,11 @@ const ALL_ACTIONS: [BindAction; 50] = [
     BindAction::LspCodeAction,
     BindAction::LspSignatureHelp,
     BindAction::SelectNextOccurrence,
+    BindAction::SplitEditorRight,
+    BindAction::SplitEditorDown,
+    BindAction::FocusPane1,
+    BindAction::FocusPane2,
+    BindAction::FocusPane3,
 ];
 
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
@@ -236,6 +251,20 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::LspSignatureHelp => KeyboardShortcut::new(cmd_shift, Key::Space),
         // VS Code と同じ ⌘D。⇧⌘D (行の複製) とは別で、既存の割り当てとは重ならない
         BindAction::SelectNextOccurrence => KeyboardShortcut::new(cmd, Key::D),
+        // ── エディタの分割 ────────────────────────────────────────
+        // ⌘\ は VS Code の「エディターの分割」そのもの。⌥⌘\ は下方向。
+        // どちらも既定表にも、端末側の分割コード (⌘⌥ / Ctrl+Alt + N W Z E
+        // H J K L と矢印) にも無い。macOS の OS 予約 (⌘⌥D=Dock・⌘⌥Esc・
+        // ⌘Space・⌃↑/↓) とも重ならない。
+        BindAction::SplitEditorRight => KeyboardShortcut::new(cmd, Key::Backslash),
+        BindAction::SplitEditorDown => {
+            KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::Backslash)
+        }
+        // ⌘1..⌘3 は VS Code の「エディターグループへフォーカス」と同じ。
+        // 既定表に数字キーの割り当ては 1 つも無い。
+        BindAction::FocusPane1 => KeyboardShortcut::new(cmd, Key::Num1),
+        BindAction::FocusPane2 => KeyboardShortcut::new(cmd, Key::Num2),
+        BindAction::FocusPane3 => KeyboardShortcut::new(cmd, Key::Num3),
     }
 }
 
@@ -323,6 +352,11 @@ impl Keybinds {
             "lsp_code_action" => LspCodeAction,
             "lsp_signature_help" => LspSignatureHelp,
             "select_next_occurrence" => SelectNextOccurrence,
+            "split_editor_right" => SplitEditorRight,
+            "split_editor_down" => SplitEditorDown,
+            "focus_pane_1" => FocusPane1,
+            "focus_pane_2" => FocusPane2,
+            "focus_pane_3" => FocusPane3,
             _ => return None,
         })
     }
@@ -845,6 +879,8 @@ mod tests {
             "toggle_bookmark", "reopen_closed_tab", "lsp_completion", "lsp_references",
             "lsp_symbols", "lsp_rename", "lsp_format", "lsp_code_action",
             "lsp_signature_help", "select_next_occurrence",
+            "split_editor_right", "split_editor_down", "focus_pane_1", "focus_pane_2",
+            "focus_pane_3",
         ];
         assert_eq!(names.len(), ALL_ACTIONS.len(), "名前表とアクション一覧の数が合わない");
         let mut resolved: Vec<BindAction> =
