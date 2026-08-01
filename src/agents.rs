@@ -211,6 +211,87 @@ fn session_entry(bin: &str) -> Option<&'static (&'static str, SessionStore, &'st
     SESSION_STORES.iter().find(|e| e.0 == bin)
 }
 
+/// bin → 「どのアカウント/プロファイルで動くか」を決める環境変数のカタログ。
+///
+/// プリセットの `env` にこれらのどれかが入っていれば、**同じ CLI でも別の枠**を
+/// 食う (= レート制限のフェイルオーバー先になれる)。値そのものは秘密になり得るので
+/// 呼び出し側 (`crate::failover::account_key`) がハッシュ化してから持ち回る。
+///
+/// `AgentSpec` のフィールドにしない理由は [`SESSION_STORES`] と同じ
+/// (他モジュールに `AgentSpec` の構造体リテラルがあり、増やすと一斉に壊れる)。
+/// 3 つ目の要素は 2 つ目の**部分集合**で、「会話の保存先そのものを引っ越す」変数。
+/// これが違う切替先では過去の会話を再開できない (`--continue` を付けても中身が無い)。
+const ACCOUNT_ENVS: &[(&str, &[&str], &[&str])] = &[
+    // claude: 設定ディレクトリを分けると別ログイン + 会話も別置き場になる。
+    (
+        "claude",
+        &[
+            "CLAUDE_CONFIG_DIR",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+        ],
+        &["CLAUDE_CONFIG_DIR"],
+    ),
+    // codex: `CODEX_HOME` が認証情報と rollout の置き場所。
+    (
+        "codex",
+        &["CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL"],
+        &["CODEX_HOME"],
+    ),
+    (
+        "gemini",
+        &["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT"],
+        &[],
+    ),
+    (
+        "qwen",
+        &["DASHSCOPE_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"],
+        &[],
+    ),
+    ("cursor-agent", &["CURSOR_API_KEY"], &[]),
+    (
+        "opencode",
+        &["OPENCODE_CONFIG", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+        &["OPENCODE_CONFIG"],
+    ),
+    ("crush", &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"], &[]),
+    (
+        "aider",
+        &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AIDER_MODEL"],
+        &[],
+    ),
+    (
+        "goose",
+        &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOSE_PROVIDER"],
+        &[],
+    ),
+    ("grok", &["XAI_API_KEY"], &[]),
+    ("droid", &["FACTORY_API_KEY"], &[]),
+];
+
+/// この CLI でアカウント (プロファイル) を分ける環境変数名。未知の bin では空。
+///
+/// 空を返す CLI は「プリセットの env ではアカウントを分けられない」という意味で、
+/// フェイルオーバー先としては**別 CLI** としてしか扱われない。
+pub fn account_env_keys(bin: &str) -> &'static [&'static str] {
+    ACCOUNT_ENVS
+        .iter()
+        .find(|e| e.0 == bin)
+        .map(|e| e.1)
+        .unwrap_or(&[])
+}
+
+/// 会話の保存先そのものを引っ越す環境変数名 ([`account_env_keys`] の部分集合)。
+/// これが一致しない切替先では、再開指定 (`--continue` 等) を付けてはいけない。
+pub fn session_store_env_keys(bin: &str) -> &'static [&'static str] {
+    ACCOUNT_ENVS
+        .iter()
+        .find(|e| e.0 == bin)
+        .map(|e| e.2)
+        .unwrap_or(&[])
+}
+
 /// 実行ファイル名だけでは起動できない CLI の「bin の直後に必ず要る引数」。
 ///
 /// orca (`src/shared/tui-agent-config.ts` の `launchCmd`) と同じ考え方で、

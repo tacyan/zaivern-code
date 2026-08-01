@@ -132,6 +132,9 @@ pub struct Config {
     /// `[super_agent]` セクションが無い既存の config.toml でも、
     /// `SuperAgentConfig` 側の `#[serde(default)]` により既定値 (= なし) で読み込まれる。
     pub super_agent: SuperAgentConfig,
+    /// レート制限時のアカウント自動フェイルオーバー (`[failover]`)。
+    /// **既定は無効** — ユーザーが明示的に有効化したときだけ働く。
+    pub failover: crate::failover::FailoverConfig,
 }
 
 /// `[super_agent]` セクション。**どのエージェントに他のエージェントを見張らせるか**。
@@ -277,6 +280,7 @@ impl Default for Config {
             supervisor: crate::supervisor::SupervisorConfig::default(),
             super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),
+            failover: crate::failover::FailoverConfig::default(),
         }
     }
 }
@@ -479,6 +483,10 @@ struct UiState {
     super_agent_session_title: Option<String>,
     super_agent_enabled: Option<bool>,
     super_agent_timeout_secs: Option<u64>,
+    /// レート制限の自動フェイルオーバーの有効/無効。UI (パレット / Cockpit) から
+    /// 切り替えるものなので、手書きの config.toml ではなく state 側に置く。
+    /// 上限やクールダウンの数値は `[failover]` (config.toml) のまま。
+    failover_enabled: Option<bool>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -759,6 +767,22 @@ command = ""
 # command = "codex"
 # env = { CODEX_HOME = "~/.codex-alt" }
 
+# ── レート制限時の自動フェイルオーバー ──────────
+# 上限に当たったら、同じ CLI の別プロファイル → 別 CLI の順で切替先を選び、
+# 新しいセッションを立てて続きを渡します。上限に当たった側のセッションは
+# **そのまま残します** (終了させません)。
+# **既定は無効** — 有効にするのは ⌘⇧P →「自動フェイルオーバーを有効化」か、
+# 📊 プラン使用量ウィンドウのチェックボックス、あるいは下の enabled = true。
+# 上の [[agents]] に別プロファイルを 2 つ以上書いておかないと切替先がありません。
+# [failover]
+# enabled = false           # 自動で切り替えるか
+# max_switches = 3          # 1 セッションあたりの連鎖切替の上限
+# max_attempts = 2          # 同じ枠を試し直す上限
+# cooldown_secs = 300       # 枯れた枠を寝かせる基準時間 (失敗のたびに倍)
+# max_cooldown_secs = 3600  # クールダウンの上限
+# verify_secs = 90          # 切替先が動いていると見なすまでの観察時間
+# min_screen_hits = 2       # 画面由来の検知を信じるまでの連続一致回数
+
 # [[agents]]
 # name = "Gemini CLI"
 # icon = "✨"
@@ -925,6 +949,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 }
                 if let Some(v) = st.super_agent_timeout_secs {
                     cfg.super_agent.timeout_secs = v;
+                }
+                if let Some(v) = st.failover_enabled {
+                    cfg.failover.enabled = v;
                 }
             }
         }
@@ -1254,6 +1281,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         super_agent_session_title: Some(cfg.super_agent.session_title.clone()),
         super_agent_enabled: Some(cfg.super_agent.enabled),
         super_agent_timeout_secs: Some(cfg.super_agent.timeout_secs),
+        failover_enabled: Some(cfg.failover.enabled),
     };
     if let Ok(s) = toml::to_string_pretty(&st) {
         let _ = std::fs::create_dir_all(dir);
@@ -1834,6 +1862,7 @@ command = "agy"
             super_agent_session_title: Some("Claude Code (全自動) #3".into()),
             super_agent_enabled: Some(true),
             super_agent_timeout_secs: Some(45),
+            failover_enabled: Some(true),
         };
         let s = toml::to_string_pretty(&st).expect("UiState は TOML 化できる");
         let back: UiState = toml::from_str(&s).expect("読み戻せる");
@@ -1863,6 +1892,8 @@ command = "agy"
         );
         assert_eq!(back.super_agent_enabled, Some(true));
         assert_eq!(back.super_agent_timeout_secs, Some(45));
+        // 自動フェイルオーバーの有効/無効も state に残る
+        assert_eq!(back.failover_enabled, Some(true));
     }
 
     #[test]
@@ -1981,6 +2012,49 @@ mod supervisor_field_tests {
         assert!(!cfg.theme.is_empty());
         // 新しく生えた [super_agent] を書いていない既存ファイルでも既定値で埋まる
         assert_eq!(cfg.super_agent, SuperAgentConfig::default());
+    }
+}
+
+#[cfg(test)]
+mod failover_field_tests {
+    use super::*;
+
+    /// `[failover]` を書いていない設定は **必ず無効** で読み込まれる。
+    /// (勝手に別アカウントへ移る = 課金先が変わる。既定で入ってはいけない)
+    #[test]
+    fn failoverセクションが無ければ既定で無効() {
+        assert!(
+            !DEFAULT_CONFIG.contains("\n[failover]"),
+            "テンプレートは [failover] をコメントのままにしておく (既定は無効)"
+        );
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定の設定が読める");
+        assert_eq!(cfg.failover, crate::failover::FailoverConfig::default());
+        assert!(!cfg.failover.enabled, "既定は必ず無効");
+    }
+
+    /// テンプレートに書いた `[failover]` の例 (コメントを外した形) が実際に読める。
+    /// 書き方の見本がそのままでは動かない、を防ぐ。
+    #[test]
+    fn テンプレートのfailover例はコメントを外せば読める() {
+        let uncommented: String = DEFAULT_CONFIG
+            .lines()
+            .skip_while(|l| !l.starts_with("# [failover]"))
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| l.trim_start_matches("# ").trim_start_matches('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            uncommented.starts_with("[failover]"),
+            "テンプレートに [failover] の例が無い: {uncommented:?}"
+        );
+        let cfg: Config = toml::from_str(&uncommented).expect("例がそのまま読める");
+        assert!(!cfg.failover.enabled, "例の既定値も無効のまま");
+        assert_eq!(cfg.failover.max_switches, 3);
+        assert_eq!(cfg.failover.min_screen_hits, 2);
+        // 有効化した形も読める。
+        let on = uncommented.replace("enabled = false", "enabled = true");
+        let cfg: Config = toml::from_str(&on).expect("有効化した形も読める");
+        assert!(cfg.failover.enabled);
     }
 }
 

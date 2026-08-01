@@ -332,6 +332,8 @@ pub struct Session {
     /// 現在の意味的画面ハッシュ。スピナー・経過秒・カウンタの揺れは
     /// 正規化済みなので、変化 = 本当に新しい出力 (scan_attention の周期で更新)。
     cur_hash: u64,
+    /// 1 つ前のスキャン時点の `cur_hash`。「出力が進んでいるか」の裏取り用。
+    prev_hash: u64,
     /// 手動の「あとで見る」ピン。フォーカスを当て直す (acknowledge) まで未読扱い。
     pub pinned_unread: bool,
     /// レート制限/使用上限の警告が画面に出ているとき、その行。
@@ -339,6 +341,13 @@ pub struct Session {
     pub rate_limited: Option<String>,
     /// レート制限警告を連続で見失った回数 (2 回で解除。1 回では画面遷移の瞬きと区別できない)。
     rl_miss: u8,
+    /// レート制限警告が**同じまま**続けて見えた回数。画面由来の判定は
+    /// 単発では信じないので、裏取り (`failover::confirm_screen`) の材料にする。
+    rl_hits: u8,
+    /// 直近にこのセッションへ投げた「プロンプト」の本文。
+    /// フェイルオーバーで別プロファイルへ引き継ぐ材料 ([`Session::note_prompt`])。
+    /// キーストロークや承認キーは含めない。
+    pub last_prompt: Option<String>,
     /// このセッションの生ログの書き出し先 (再起動時の引き継ぎ・UI 表示用)。
     pub log_path: Option<PathBuf>,
 }
@@ -409,6 +418,13 @@ struct LogSink {
 /// 1 ファイルあたりのログ上限。超えると .old へ退避して書き直す
 /// (合計で最大 2 倍まで。直近分は必ず .log 側にある)。
 const LOG_CAP: u64 = 4 * 1024 * 1024;
+
+/// [`Session::note_prompt`] が「プロンプト」と見なす最短の文字数。
+/// これ未満は `y` / Enter / 番号キーなどの応答なので覚えない。
+const PROMPT_MIN_CHARS: usize = 4;
+
+/// 覚えておくプロンプトの最大文字数 (引き継ぎ材料。無限に太らせない)。
+const PROMPT_KEEP_CHARS: usize = 4000;
 
 impl LogSink {
     fn open(path: &Path, header: &str) -> Option<Self> {
@@ -1679,9 +1695,12 @@ impl Session {
             report_bg,
             seen_hash: 0,
             cur_hash: 0,
+            prev_hash: 0,
             pinned_unread: false,
             rate_limited: None,
             rl_miss: 0,
+            rl_hits: 0,
+            last_prompt: None,
             log_path: spec.log_path,
         })
     }
@@ -1751,6 +1770,8 @@ impl Session {
         self.last_scan = Instant::now();
         let text = lock_ok(&self.parser).screen().contents();
         // 未読判定用: 意味的な画面ハッシュを更新する (スピナー等の揺れは無視)。
+        // 直前のスキャン時の値を控えてから更新する (`output_advanced` の材料)。
+        self.prev_hash = self.cur_hash;
         self.cur_hash = semantic_hash(&text);
         // レート制限の「継続 / 解除」の追跡。新規検知の確定は末尾で行う
         // (承認イベントと同時のときは承認を優先し、通知を次回スキャンへ持ち越すため)。
@@ -1760,12 +1781,14 @@ impl Session {
                 Some(line) => {
                     self.rate_limited = Some(line.clone());
                     self.rl_miss = 0;
+                    self.rl_hits = self.rl_hits.saturating_add(1);
                 }
                 None => {
                     self.rl_miss += 1;
                     if self.rl_miss >= 2 {
                         self.rate_limited = None;
                         self.rl_miss = 0;
+                        self.rl_hits = 0;
                     }
                 }
             }
@@ -1842,10 +1865,40 @@ impl Session {
             if let Some(line) = rl_detect {
                 self.rate_limited = Some(line.clone());
                 self.rl_miss = 0;
+                self.rl_hits = 1;
                 return Some(Attention::RateLimited(line));
             }
         }
         None
+    }
+
+    /// 上限警告が**同じまま**続けて見えている回数。
+    /// 画面由来の判定を信じてよいかの裏取り (`failover::confirm_screen`) に使う。
+    pub fn rate_limit_hits(&self) -> u8 {
+        self.rl_hits
+    }
+
+    /// 直近のスキャンからこのスキャンまでに、意味的な画面内容が動いたか。
+    ///
+    /// スピナー・経過秒・カウンタは `semantic_hash` が潰しているので、
+    /// true = **本当に出力が進んでいる**。「止まっているから異常」の裏取りに使う
+    /// (画面テキストの部分一致だけで異常と決めないための材料)。
+    pub fn output_advanced(&self) -> bool {
+        self.cur_hash != self.prev_hash
+    }
+
+    /// このセッションへ投げた「プロンプト」の本文を覚える。
+    ///
+    /// フェイルオーバーで別プロファイルのセッションへ引き継ぐための材料。
+    /// キーストローク・承認キー (`\r` や `\u{1b}` 単体) は覚えない。
+    pub fn note_prompt(&mut self, text: &str) {
+        let t = text
+            .trim_matches(|c: char| c.is_control() || c.is_whitespace())
+            .trim();
+        if t.chars().count() < PROMPT_MIN_CHARS {
+            return;
+        }
+        self.last_prompt = Some(t.chars().take(PROMPT_KEEP_CHARS).collect());
     }
 
     /// 未読か。「最後に見た時点から意味的な画面内容が変わった」または手動ピン。

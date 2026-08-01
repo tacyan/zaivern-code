@@ -209,6 +209,9 @@ pub enum Cmd {
     ShowSessions,
     /// プラン使用量・枯渇予測のウィンドウを開く
     ShowQuota,
+    /// レート制限時のアカウント自動フェイルオーバーを有効化 / 無効化する (切替)。
+    /// 状態と履歴は 📊 プラン使用量ウィンドウに出る。
+    ToggleFailover,
     /// 保存時に行末の空白を落とす (切替)
     ToggleTrimTrailingOnSave,
     /// 保存時に最終行へ改行を入れる (切替)
@@ -584,6 +587,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenMcp
         | Cmd::ShowSessions
         | Cmd::ShowQuota
+        | Cmd::ToggleFailover
         | Cmd::VoiceInput(_)
         | Cmd::VoiceStop
         | Cmd::SetVoiceTarget(_) => Group::Agent,
