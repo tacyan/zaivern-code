@@ -60,6 +60,7 @@ mod skills;
 mod snippets;
 mod sound;
 mod supervisor;
+mod tasks;
 mod terminal;
 #[cfg(test)]
 mod test_util;
