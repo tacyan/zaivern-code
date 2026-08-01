@@ -37,15 +37,18 @@ on:
   workflow_dispatch:
 
 # 同一ブランチへの連続 push では古い run をキャンセルし、ランナーを節約する。
-# キーをブランチ名へ正規化しているのが要点:
-#   push       -> github.ref_name              = "night/2026-08-02"
-#   PR         -> pull_request.head.ref        = "night/2026-08-02"
-# 両者が同じグループに入るため、PR を開いているブランチへ push しても
-# push run と pull_request run が二重に走らず、後発が先発をキャンセルする。
-# (github.ref をそのまま使うと "refs/heads/x" と "refs/pull/N/merge" で
-#  キーが割れ、同一コミットに対して 14 ジョブが同時に走っていた。)
+#
+# キーに **event 名を含める**のが要点。含めないと push run と pull_request run が
+# 同じグループへ入り、**後から来た方が先の方をキャンセルする**。同一コミットの
+# 二重実行は確かに消えるが、ブランチの履歴には「7 ジョブ全部 cancelled」が残り、
+# テストが通っているのに落ちたように見える (実際にそう報告された)。
+#
+# 二重実行は下の `if:` で断つ — 同一リポジトリからの PR は push run が既に
+# 同じコミットを見ているので PR 側のジョブを丸ごと飛ばす。fork からの PR は
+# push イベントが飛んでこないので、そちらだけ PR run が実体を持つ。
+# これで「キャンセルもされず、二重にも走らない」。
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
@@ -57,6 +60,12 @@ env:
 jobs:
   # terminal:: 以外の全テスト。表示名: "fast (ubuntu-latest)" など。
   fast:
+    # 同一リポジトリからの PR はスキップする。push run が同じコミットを
+    # 既に見ているため二重実行になるだけで、得るものが無い。
+    # fork からの PR は push イベントが飛んでこないので、そこだけ実体を持つ。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +111,12 @@ jobs:
   # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
   # 表示名: "pty (ubuntu-latest)" など。
   pty:
+    # 同一リポジトリからの PR はスキップする。push run が同じコミットを
+    # 既に見ているため二重実行になるだけで、得るものが無い。
+    # fork からの PR は push イベントが飛んでこないので、そこだけ実体を持つ。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -144,6 +159,12 @@ jobs:
   #   「fmt を先に通す」判断はオーナーが明示的に行うこと。通せた日にこの節を
   #   `- run: cargo fmt --all --check` へ差し替える。
   lint:
+    # 同一リポジトリからの PR はスキップする。push run が同じコミットを
+    # 既に見ているため二重実行になるだけで、得るものが無い。
+    # fork からの PR は push イベントが飛んでこないので、そこだけ実体を持つ。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     name: lint (clippy)
     runs-on: ubuntu-latest
     timeout-minutes: 10
