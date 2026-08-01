@@ -123,6 +123,73 @@ pub fn empty_card(avail: egui::Rect, presets: usize) -> EmptyCard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// メディアカードの幾何 (純関数) — 動画・音声タブが使う
+// ---------------------------------------------------------------------------
+
+/// メディアカードの寸法。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MediaCard {
+    /// カードの矩形。**必ず** `avail` の中に収まる。
+    pub card: egui::Rect,
+    /// ボタン 1 個の幅。
+    pub btn_w: f32,
+    /// ボタンを横に並べず縦へ積むか (狭い窓で見切れないため)。
+    pub stack: bool,
+    /// 中身がカードに収まらず縦スクロールが要るか。
+    pub scroll: bool,
+}
+
+/// カード見出し (アイコン + ファイル名) の高さ。
+pub const MEDIA_HEAD_H: f32 = 56.0 + 24.0;
+/// 情報 1 行の高さ。
+pub const MEDIA_ROW_H: f32 = 22.0;
+/// ボタンの高さ。
+pub const MEDIA_BTN_H: f32 = 30.0;
+/// ボタンの最小幅 (これを割ると「システムのプレイヤーで開く」が読めない)。
+pub const MEDIA_BTN_MIN_W: f32 = 190.0;
+/// カードの最大幅 (広い窓で間延びさせない)。
+pub const MEDIA_CARD_MAX_W: f32 = 460.0;
+
+/// **メディアカードのレイアウト** (純関数)。
+///
+/// 不変条件 (テーブルテストで固定):
+/// - 返す `card` は必ず `avail` の中 (下や右へ突き抜けてボタンが押せなくならない)
+/// - `btn_w` は 1 以上 (幅 0 のボタンを作らない)
+/// - ボタンが横に並ばない幅では `stack` が真になる
+pub fn media_card(avail: egui::Rect, rows: usize, buttons: usize) -> MediaCard {
+    let n = buttons.max(1);
+    let pad = space::MD;
+    let card_w = (avail.width() - space::LG * 2.0)
+        .clamp(1.0, MEDIA_CARD_MAX_W)
+        .min(avail.width().max(1.0));
+    let inner_w = (card_w - pad * 2.0).max(1.0);
+    // 横に並べて全部が最小幅を満たせるときだけ横並び
+    let side_by_side = (inner_w - space::SM * (n as f32 - 1.0)) / n as f32 >= MEDIA_BTN_MIN_W;
+    let stack = !side_by_side;
+    let btn_w = if stack {
+        inner_w
+    } else {
+        ((inner_w - space::SM * (n as f32 - 1.0)) / n as f32).max(1.0)
+    };
+    let btn_rows = if stack { n } else { 1 };
+    let content_h = MEDIA_HEAD_H
+        + rows as f32 * MEDIA_ROW_H
+        + space::MD
+        + btn_rows as f32 * (MEDIA_BTN_H + space::SM)
+        - space::SM;
+    let want_h = content_h + pad * 2.0;
+    let card_h = want_h.min(avail.height().max(1.0));
+    let x = avail.left() + (avail.width() - card_w) * 0.5;
+    let y = avail.top() + ((avail.height() - card_h) * 0.5).max(0.0);
+    MediaCard {
+        card: egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(card_w, card_h)),
+        btn_w,
+        stack,
+        scroll: want_h > avail.height(),
+    }
+}
+
 /// 一覧の取得件数上限 (gh 側でも clamp される)。
 const LIST_LIMIT: usize = 50;
 

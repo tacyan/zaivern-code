@@ -1446,6 +1446,8 @@ const STICKY_MAX_ROWS: usize = 3;
 const FOLD_MARKER_W: f32 = 12.0;
 /// テーブル表示で 1 列に見せる最大文字数 (長いセルは畳んで横幅を守る)。
 const TABLE_CELL_CHARS: usize = 40;
+/// 書庫一覧で見せるエントリ名の最大文字数 (超えたら省略しホバーで全文)。
+const ARCHIVE_NAME_CHARS: usize = 72;
 
 /// 折りたたみ表示の 1 バッファぶんのキャッシュ。
 ///
@@ -12748,9 +12750,9 @@ impl ZaivernApp {
         // PR 差分タブはファイルではないので、専用の読み取り専用ビューを出して終わる
         // (TextEdit を一切出さないので、編集も保存も原理的に起きない)
         if let Some(i) = self.editor.active {
-            // 画像タブも専用ビューア (TextEdit を通らない読み取り専用表示)
-            if self.editor.buffers[i].kind == crate::editor::BufferKind::Image {
-                self.image_viewer_ui(ui, i);
+            // 画像 / 16 進 / メディア / 書庫も専用ビューア
+            // (TextEdit を通らない読み取り専用表示)
+            if self.preview_view_ui(ui, i) {
                 return;
             }
             if let crate::editor::BufferKind::PrDiff { number } = self.editor.buffers[i].kind {
@@ -13322,14 +13324,366 @@ impl ZaivernApp {
         }
     }
 
+    /// 専用ビューア (画像 / 16 進 / メディア / 書庫) を描く。描いたら true。
+    ///
+    /// 中央ビューの分岐と `code_editor_ui` の二重防御が**同じ 1 か所**を
+    /// 通るようにしてある (片方だけ Kind を足し忘れると、そのタブは
+    /// TextEdit にバイナリを流し込む — 実際に起きうる事故)。
+    fn preview_view_ui(&mut self, ui: &mut egui::Ui, i: usize) -> bool {
+        use crate::editor::BufferKind;
+        use crate::preview::PreviewTag;
+        let kind = self.editor.buffers[i].kind;
+        if !kind.preview_only() {
+            return false;
+        }
+        if kind == BufferKind::Image {
+            self.image_viewer_ui(ui, i);
+            return true;
+        }
+        // 借用を握ったまま `&mut self` のメソッドは呼べないので、
+        // どのビューかは Copy な印で先に確定させる
+        match self.editor.buffers[i].preview.as_ref().map(|p| p.tag()) {
+            Some(PreviewTag::Hex) => self.hex_viewer_ui(ui, i),
+            Some(PreviewTag::Media) => self.media_card_ui(ui, i),
+            Some(PreviewTag::Archive) => self.archive_list_ui(ui, i),
+            // 読み取り自体に失敗した (権限・削除・IO エラー)。
+            // 空の TextEdit を出すより「開けなかった」と言い切る。
+            None => {
+                let dim = self.theme.text_dim;
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new(tr("このファイルは読み込めませんでした")).color(dim));
+                });
+            }
+        }
+        true
+    }
+
+    /// 16 進ダンプ。`オフセット | 16 バイトの hex | ASCII 列` の古典的レイアウト。
+    ///
+    /// 行は**見えている分だけ**組み立てる (`show_rows`)。4 MB のファイルでも
+    /// 26 万行を String に展開しないので、開いた瞬間に固まらない。
+    fn hex_viewer_ui(&mut self, ui: &mut egui::Ui, i: usize) {
+        let theme = self.theme.clone();
+        let ppp = ui.ctx().pixels_per_point();
+        let font = FontId::monospace(crate::theme::snap_font_size(self.cfg.editor_font_size, ppp));
+        let row_h = ui
+            .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
+            .max(1.0 / ppp);
+        let b = &self.editor.buffers[i];
+        let id = b.id;
+        let Some(crate::preview::PreviewDoc::Hex(doc)) = b.preview.as_ref() else {
+            return;
+        };
+        let rows = crate::preview::hex_row_count(doc.bytes.len());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(trf(
+                    "🔩 {kind} · {size}",
+                    &[
+                        ("kind", tr(doc.kind.unwrap_or("バイナリ"))),
+                        ("size", crate::editor::human_bytes(doc.file_bytes)),
+                    ],
+                ))
+                .color(theme.text_dim)
+                .small(),
+            );
+            if doc.truncated {
+                ui.label(
+                    RichText::new(trf(
+                        "⚠ 先頭 {n} だけ表示しています",
+                        &[(
+                            "n",
+                            crate::editor::human_bytes(crate::preview::HEX_MAX_BYTES),
+                        )],
+                    ))
+                    .color(theme.warn)
+                    .small(),
+                );
+            }
+            ui.label(RichText::new(tr("読み取り専用")).color(theme.text_dim).small());
+        });
+        ui.separator();
+        if rows == 0 {
+            ui.label(
+                RichText::new(tr("空のファイルです"))
+                    .color(theme.text_dim)
+                    .small(),
+            );
+            return;
+        }
+        egui::ScrollArea::both()
+            .id_salt(("zv-hex", id))
+            .auto_shrink(false)
+            .show_rows(ui, row_h, rows, |ui, range| {
+                // 折り返させない。折り返すと行高が揃わず `show_rows` の
+                // 仮想化 (= 行番号 → y 座標) がずれて、桁が踊る。
+                // 狭い窓では横スクロールへ逃がすのが正しい。
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                for r in range {
+                    ui.label(
+                        RichText::new(crate::preview::hex_row(&doc.bytes, r))
+                            .font(font.clone())
+                            .color(theme.text),
+                    );
+                }
+            });
+    }
+
+    /// 動画・音声の情報カード。再生器は持たないので、**中央に 1 枚のカード**で
+    /// 分かることだけを出し、再生はシステムのプレイヤーへ渡す。
+    fn media_card_ui(&mut self, ui: &mut egui::Ui, i: usize) {
+        let theme = self.theme.clone();
+        let b = &self.editor.buffers[i];
+        let title = b.title.clone();
+        let path = b.path.clone();
+        let Some(crate::preview::PreviewDoc::Media(doc)) = b.preview.as_ref() else {
+            return;
+        };
+        // (見出し, 値) の並び。取れなかった項目は「—」で埋める
+        // (行ごと消すとファイルによって高さが変わって落ち着かない)。
+        let dash = "—".to_string();
+        let mut rows: Vec<(String, String)> = vec![
+            (
+                tr("種別"),
+                doc.kind.map(|k| tr(k)).unwrap_or_else(|| dash.clone()),
+            ),
+            (tr("サイズ"), crate::editor::human_bytes(doc.file_bytes)),
+            (
+                tr("再生時間"),
+                doc.info
+                    .duration_secs
+                    .map(crate::preview::format_duration)
+                    .unwrap_or_else(|| dash.clone()),
+            ),
+        ];
+        if doc.video {
+            rows.push((
+                tr("解像度"),
+                match (doc.info.width, doc.info.height) {
+                    (Some(w), Some(h)) => format!("{w} × {h}"),
+                    _ => dash.clone(),
+                },
+            ));
+        }
+        rows.push((
+            tr("音声"),
+            match (doc.info.sample_rate, doc.info.channels) {
+                (Some(r), Some(c)) => trf(
+                    "{rate} Hz / {ch} ch",
+                    &[("rate", r.to_string()), ("ch", c.to_string())],
+                ),
+                (Some(r), None) => trf("{rate} Hz", &[("rate", r.to_string())]),
+                _ => dash.clone(),
+            },
+        ));
+        let icon = if doc.video { "🎬" } else { "🎵" };
+
+        let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        let l = panels::media_card(avail, rows.len(), 2);
+        let mut open_it = false;
+        let mut copy_it = false;
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(l.card), |ui| {
+            egui::Frame::none()
+                .fill(theme.panel_alt)
+                .stroke(egui::Stroke::new(1.0_f32, theme.border))
+                .rounding(egui::Rounding::same(10.0))
+                .inner_margin(egui::Margin::same(panels::space::MD))
+                .show(ui, |ui| {
+                    ui.set_width(l.card.width() - panels::space::MD * 2.0);
+                    let mut body = |ui: &mut egui::Ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new(icon).size(44.0));
+                            // 長いファイル名でカードを押し広げない (全文はホバーで)
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&title)
+                                        .size(16.0)
+                                        .strong()
+                                        .color(theme.text)
+                                        .monospace(),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Truncate),
+                            )
+                            .on_hover_text(&title);
+                        });
+                        for (k, v) in &rows {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(k).color(theme.text_dim).small());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(v).color(theme.text).small().monospace(),
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                        ui.add_space(panels::space::MD);
+                        // 狭くてラベルが入らない幅では短い文言へ縮退させる
+                        // (見切れた文字を出すより、短くても読める方がよい)
+                        let tight = l.btn_w < panels::MEDIA_BTN_MIN_W;
+                        let (open_label, copy_label) = if tight {
+                            (tr("▶ 開く"), tr("📋 パス"))
+                        } else {
+                            (tr("▶ システムのプレイヤーで開く"), tr("📋 パスをコピー"))
+                        };
+                        let mut buttons = |ui: &mut egui::Ui| {
+                            if ui
+                                .add_sized(
+                                    [l.btn_w, panels::MEDIA_BTN_H],
+                                    egui::Button::new(&open_label),
+                                )
+                                .on_hover_text(tr("システムのプレイヤーで開く"))
+                                .clicked()
+                            {
+                                open_it = true;
+                            }
+                            if ui
+                                .add_sized(
+                                    [l.btn_w, panels::MEDIA_BTN_H],
+                                    egui::Button::new(&copy_label),
+                                )
+                                .on_hover_text(tr("フルパスをクリップボードへコピー"))
+                                .clicked()
+                            {
+                                copy_it = true;
+                            }
+                        };
+                        if l.stack {
+                            buttons(ui);
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = panels::space::SM;
+                                buttons(ui);
+                            });
+                        }
+                    };
+                    if l.scroll {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("zv-media", self.editor.buffers[i].id))
+                            .show(ui, |ui| body(ui));
+                    } else {
+                        body(ui);
+                    }
+                });
+        });
+        if let Some(p) = path {
+            if open_it {
+                open_external(&p.to_string_lossy());
+            }
+            if copy_it {
+                ui.ctx().copy_text(p.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    /// 書庫 (ZIP 形式) の中身一覧。展開はせず、目次だけを見せる。
+    fn archive_list_ui(&mut self, ui: &mut egui::Ui, i: usize) {
+        let theme = self.theme.clone();
+        let b = &self.editor.buffers[i];
+        let id = b.id;
+        let Some(crate::preview::PreviewDoc::Archive(doc)) = b.preview.as_ref() else {
+            return;
+        };
+        let l = &doc.listing;
+        let total_size: u64 = l.entries.iter().map(|e| e.size).sum();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(trf(
+                    "📦 {n} 件 · 書庫 {zip} · 展開後 {raw}",
+                    &[
+                        ("n", l.total.to_string()),
+                        ("zip", crate::editor::human_bytes(doc.file_bytes)),
+                        ("raw", crate::editor::human_bytes(total_size)),
+                    ],
+                ))
+                .color(theme.text_dim)
+                .small(),
+            );
+            if l.truncated {
+                ui.label(
+                    RichText::new(trf(
+                        "⚠ 先頭 {n} 件だけ表示しています",
+                        &[("n", crate::preview::ZIP_MAX_ENTRIES.to_string())],
+                    ))
+                    .color(theme.warn)
+                    .small(),
+                );
+            }
+            if l.error == Some(crate::preview::ZipError::BrokenDirectory) {
+                ui.label(
+                    RichText::new(tr("⚠ 目次が途中で壊れています (読めた分だけ表示)"))
+                        .color(theme.warn)
+                        .small(),
+                );
+            }
+            ui.label(RichText::new(tr("読み取り専用")).color(theme.text_dim).small());
+        });
+        ui.separator();
+        if l.entries.is_empty() {
+            ui.label(
+                RichText::new(tr("空の書庫です"))
+                    .color(theme.text_dim)
+                    .small(),
+            );
+            return;
+        }
+        egui::ScrollArea::both()
+            .id_salt(("zv-archive", id))
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                // 長いパスは折り返さず横スクロールへ (行高を揃えて表を保つ)
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                egui::Grid::new("zv-archive-grid")
+                    .striped(true)
+                    .num_columns(3)
+                    .show(ui, |ui| {
+                        for h in [tr("名前"), tr("サイズ"), tr("圧縮後")] {
+                            ui.label(RichText::new(h).monospace().strong().color(theme.accent));
+                        }
+                        ui.end_row();
+                        for e in &l.entries {
+                            let name = if e.name.chars().count() > ARCHIVE_NAME_CHARS {
+                                let head: String =
+                                    e.name.chars().take(ARCHIVE_NAME_CHARS).collect();
+                                format!("{head}…")
+                            } else {
+                                e.name.clone()
+                            };
+                            ui.label(
+                                RichText::new(if e.dir {
+                                    format!("📁 {name}")
+                                } else {
+                                    format!("📄 {name}")
+                                })
+                                .monospace()
+                                .color(if e.dir { theme.text_dim } else { theme.text }),
+                            )
+                            .on_hover_text(&e.name);
+                            let (size, comp) = if e.dir {
+                                ("—".to_string(), "—".to_string())
+                            } else {
+                                (
+                                    crate::editor::human_bytes(e.size),
+                                    crate::editor::human_bytes(e.compressed),
+                                )
+                            };
+                            ui.label(RichText::new(size).monospace().color(theme.text_dim));
+                            ui.label(RichText::new(comp).monospace().color(theme.text_dim));
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
     fn code_editor_ui(&mut self, ui: &mut egui::Ui) {
         let Some(active) = self.editor.active else {
             return;
         };
-        // 画像タブが紛れ込んでも TextEdit を出さない (二重の防御。
-        // 通常はタブ描画の分岐で先に image_viewer_ui へ振られる)
-        if self.editor.buffers[active].kind == crate::editor::BufferKind::Image {
-            self.image_viewer_ui(ui, active);
+        // 専用ビューアのタブ (画像 / 16 進 / メディア / 書庫) が紛れ込んでも
+        // TextEdit を出さない (二重の防御。通常はタブ描画の分岐で先に振られる)
+        if self.preview_view_ui(ui, active) {
             return;
         }
         let theme_text = self.theme.text;
@@ -22667,7 +23021,7 @@ mod glyph_tests {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
         const UI_SYMBOLS: &str = "📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
-                                  💬📊⛔🔁·↩▸▾🔎◆📇💤\
+                                  💬📊⛔🔁·↩▸▾🔎◆📇💤🎬🎵\
                                   🔍📡🖱📦🍚🌀🔷🔶🕊👷🐦🅰🌊⌘➡🔩🌙🎏🎐🐉💠";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);
@@ -23065,6 +23419,40 @@ mod ui_wiring_tests {
         assert!(
             src.contains("self.launch_preset_with(preset, command, &cwd, ctx);"),
             "SessionSidebarEffect::Launch の cwd が起動へ渡っていない",
+        );
+    }
+
+    /// ユニバーサルプレビューが**画面から到達できる**こと。
+    ///
+    /// 「作ったのに繋いでいない」を検出する番人。中央ビューと
+    /// `code_editor_ui` の二重防御が同じ 1 か所 (`preview_view_ui`) を
+    /// 通っていないと、片方だけ Kind を足し忘れたときに TextEdit へ
+    /// バイナリが流れ込む。
+    #[test]
+    fn プレビューの各ビューが描画へ配線されている() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        for needle in [
+            // 3 種のビューが実装されている
+            "fn hex_viewer_ui(&mut self, ui: &mut egui::Ui, i: usize)",
+            "fn media_card_ui(&mut self, ui: &mut egui::Ui, i: usize)",
+            "fn archive_list_ui(&mut self, ui: &mut egui::Ui, i: usize)",
+            // 振り分けが 3 種すべてを数え上げている
+            "Some(PreviewTag::Hex) => self.hex_viewer_ui(ui, i),",
+            "Some(PreviewTag::Media) => self.media_card_ui(ui, i),",
+            "Some(PreviewTag::Archive) => self.archive_list_ui(ui, i),",
+            // 外部オープンとコピーが繋がっている (カードのボタンが死んでいない)
+            "open_external(&p.to_string_lossy());",
+            "ui.ctx().copy_text(p.to_string_lossy().to_string());",
+        ] {
+            assert!(src.contains(needle), "配線が切れている: {needle}");
+        }
+        // 数を数えるので、**この行自体が一致しないように**分けて組み立てる
+        // (include_str! はテストコードも含むため、素の文字列だと 1 多く数える)
+        let call = format!("self.{}(ui,", "preview_view_ui");
+        assert_eq!(
+            src.matches(call.as_str()).count(),
+            2,
+            "中央ビューと code_editor_ui の二重防御が同じ入口を通っていない"
         );
     }
 
@@ -23732,6 +24120,58 @@ mod cockpit_layout_tests {
             "低い窓では段組みして縦を詰める (cols={})",
             l.cols
         );
+    }
+
+    /// メディアカードも**必ず可用領域の中**に収まる (空状態カードと同じ不変条件)。
+    #[test]
+    fn メディアカードは可用領域からはみ出さない() {
+        for avail in areas() {
+            for rows in 0..=6usize {
+                for buttons in 1..=3usize {
+                    let l = panels::media_card(avail, rows, buttons);
+                    assert!(
+                        l.card.left() >= avail.left() - 0.01
+                            && l.card.right() <= avail.right() + 0.01
+                            && l.card.top() >= avail.top() - 0.01
+                            && l.card.bottom() <= avail.bottom() + 0.01,
+                        "avail={avail:?} rows={rows} buttons={buttons}: カード {:?} がはみ出した",
+                        l.card
+                    );
+                    assert!(l.btn_w > 0.0, "幅 0 のボタンを作らない");
+                    // ボタン列はカードの内側に収まる (横並びのときだけ列になる)
+                    let cols = if l.stack { 1 } else { buttons };
+                    let used =
+                        l.btn_w * cols as f32 + crate::panels::space::SM * (cols as f32 - 1.0);
+                    assert!(
+                        used <= l.card.width() - crate::panels::space::MD * 2.0 + 0.01,
+                        "avail={avail:?} rows={rows} buttons={buttons}: ボタン列 {used} が超えた"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 広い窓では横並び・狭い窓では縦積み。高さが足りなければスクロールへ逃げる。
+    #[test]
+    fn メディアカードは狭いとボタンを縦へ積む() {
+        let wide = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 700.0));
+        let l = panels::media_card(wide, 4, 2);
+        assert!(!l.stack, "460px のカードなら 2 ボタンは横に並ぶ");
+        assert!(!l.scroll, "700px あれば収まる");
+        let top = l.card.top() - wide.top();
+        let bottom = wide.bottom() - l.card.bottom();
+        assert!(
+            (top - bottom).abs() < 1.0,
+            "上下の余白が揃っていない: {top} / {bottom}"
+        );
+
+        let narrow = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 700.0));
+        assert!(panels::media_card(narrow, 4, 2).stack, "狭ければ縦へ積む");
+
+        let low = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 120.0));
+        let l3 = panels::media_card(low, 6, 2);
+        assert!(l3.scroll, "入り切らないならスクロールへ逃がす");
+        assert_eq!(l3.card.top(), low.top(), "入り切らないときは上詰め");
     }
 
     /// トップバー右側は、左のメニューバーと重なる前にアイコンだけへ縮退する。

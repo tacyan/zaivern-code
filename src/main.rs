@@ -42,6 +42,7 @@ mod pet;
 mod pet_bubble;
 mod pet_variants;
 mod plugins;
+mod preview;
 mod procx;
 mod race;
 mod recent;
