@@ -1,0 +1,72 @@
+# SSH リモート接続 (tunnel.rs / remote.rs / app.rs のリモートウィンドウ)
+
+# ── 入口 (コマンドパレット / 見出し) ──
+"リモート接続 (SSH) — 同じ Wi-Fi でなくてもスマホから繋ぐ" = "Remote access (SSH) — reach your phone even off your Wi-Fi"
+"🔐 SSH リモート接続" = "🔐 SSH remote access"
+"(同じ Wi-Fi でなくても繋ぐ)" = "(works away from your Wi-Fi)"
+"SSH トンネル経由 — 外出先のスマホで QR を読み取って接続" = "Over an SSH tunnel — scan the QR from anywhere to connect"
+
+# ── 接続操作 ──
+"接続" = "Connect"
+"切断" = "Disconnect"
+"SSH で入れるホスト (VPS / 自宅サーバ / 踏み台)。\nポートを変えているときは user@host:2222 と書きます。\n認証は OS の ssh と ~/.ssh/config / ssh-agent に任せます —\nこのアプリはパスワードも鍵も保存しません。" = "A host you can already SSH into (VPS / home server / bastion).\nUse user@host:2222 if it listens on a non-default port.\nAuthentication is left to the OS ssh, ~/.ssh/config and ssh-agent —\nthis app never stores a password or a key."
+
+# ── 段 (状態機械) ──
+"未接続" = "Not connected"
+"接続中" = "Connecting"
+"接続済み" = "Connected"
+"接続失敗" = "Connection failed"
+"接続中 (再試行 {n}/{max})" = "Connecting (retry {n}/{max})"
+"● {stage}" = "● {stage}"
+"· 待ち受け: {bind}" = "· Listening on: {bind}"
+
+# ── 待ち受け先 (remote::Bind) ──
+"0.0.0.0 (同じ Wi-Fi から直接)" = "0.0.0.0 (direct from the same Wi-Fi)"
+"127.0.0.1 (SSH トンネル経由のみ)" = "127.0.0.1 (SSH tunnel only)"
+
+# ── 接続先の書式エラー (tunnel::TargetError) ──
+"接続先を入力してください (例: user@example.com)" = "Enter a destination (e.g. user@example.com)"
+"ユーザー名が空です (例: user@example.com)" = "The user name is empty (e.g. user@example.com)"
+"ホスト名が空です (例: user@example.com)" = "The host name is empty (e.g. user@example.com)"
+"ホスト名に使えない文字があります" = "The host name contains characters that are not allowed"
+"ポート番号は 1〜65535 の数値で指定してください" = "The port must be a number between 1 and 65535"
+
+# ── 失敗の見出し (tunnel::Failure::headline) ──
+"OpenSSH クライアントが見つかりません" = "No OpenSSH client found"
+"鍵認証が拒否されました" = "Key authentication was rejected"
+"パスワード入力が必要な設定です" = "This host wants a password"
+"ホスト名を解決できません" = "Cannot resolve the host name"
+"接続を拒否されました" = "Connection refused"
+"接続がタイムアウトしました" = "Connection timed out"
+"ホスト鍵を確認できません" = "Cannot verify the host key"
+"踏み台側のポートが使用中です" = "That port is already in use on the relay host"
+"ネットワーク経路がありません" = "No network route to that host"
+"SSH 接続に失敗しました" = "The SSH connection failed"
+
+# ── 失敗のあとにすること (tunnel::Failure::hint) ──
+"公開鍵を踏み台の ~/.ssh/authorized_keys へ登録してください (パスワードは使いません)" = "Add your public key to ~/.ssh/authorized_keys on the relay host (passwords are never used)"
+"鍵認証を設定してください — パスワードはこのアプリでは扱いません" = "Set up key authentication — this app never handles passwords"
+"ホスト名の綴りと DNS / VPN の状態を確認してください" = "Check the spelling of the host and your DNS / VPN"
+"ポート番号と、踏み台で sshd が動いているかを確認してください" = "Check the port number and that sshd is running on the relay host"
+"踏み台に届いていません (ファイアウォール / 回線を確認)" = "Nothing reached the relay host (check firewalls and your connection)"
+"一度ターミナルで ssh <接続先> を実行し、ホスト鍵を登録してください" = "Run ssh <destination> once in a terminal to record the host key"
+"踏み台で同じポートを使う別のトンネルが残っています (数十秒で解放されます)" = "Another tunnel still holds that port on the relay host (it frees up in under a minute)"
+"VPN / ネットワーク接続を確認してください" = "Check your VPN and network connection"
+"ターミナルで ssh <接続先> を実行して原因を確認してください" = "Run ssh <destination> in a terminal to see what went wrong"
+
+# ── OpenSSH の入れ方 (tunnel::install_hint — OS ごとに 1 つだけ出る) ──
+"Windows 10 以降は「設定 → システム → オプション機能」で OpenSSH クライアントを追加できます" = "On Windows 10 and later, add the OpenSSH client from Settings → System → Optional features"
+"macOS には標準で入っています — PATH が通っているかを確認してください" = "macOS ships with it — check that ssh is on your PATH"
+"openssh-client パッケージを入れてください (例: sudo apt install openssh-client)" = "Install the openssh-client package (e.g. sudo apt install openssh-client)"
+
+# ── ssh -L の案内 ──
+"📋 ssh -L のコマンドをコピー" = "📋 Copy the ssh -L command"
+"SSH クライアントを持っている PC 向け。実行後、\nブラウザで http://127.0.0.1:<ポート>/ を開きます\n(このアプリからは実行しません)" = "For a computer that already has an SSH client. Run it, then open\nhttp://127.0.0.1:<port>/ in a browser\n(this app never runs it for you)"
+"ssh -L のコマンドをコピーしました" = "Copied the ssh -L command"
+
+# ── 公開範囲の説明 (踏み台側は既定で loopback のみ) ──
+"※ 踏み台側の公開ポートは既定で 127.0.0.1 にだけ開きます。\n　インターネットから直接開くには、踏み台の sshd_config で\n　GatewayPorts を有効にしてください。" = "Note: on the relay host the forwarded port is opened on 127.0.0.1 only.\n　To reach it straight from the internet, enable GatewayPorts in the\n　relay host's sshd_config."
+
+# ── 失敗メッセージ (app.rs) ──
+"スマホリモートが起動していません" = "The phone remote server is not running"
+"待ち受けの切り替えに失敗しました: {e}" = "Could not switch where the server listens: {e}"

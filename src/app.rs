@@ -49,6 +49,7 @@ use crate::terminal;
 use crate::theme::{self, Theme};
 use crate::plugins;
 use crate::theme_json;
+use crate::tunnel;
 use crate::tutorial::{self, AnchorId};
 use crate::voice;
 
@@ -2018,6 +2019,15 @@ pub struct ZaivernApp {
     /// 他 OS では常に「確認不要」なので何も表示しない。
     fw: firewall::FirewallUi,
     qr_tex: Option<egui::TextureHandle>,
+    /// `qr_tex` の元になった URL。変わったら作り直す
+    /// (LAN ⇄ SSH トンネルで URL が入れ替わるため)
+    qr_url: String,
+    /// SSH リバーストンネル — スマホが同じ Wi-Fi にいなくても繋ぐ経路
+    tunnel: tunnel::Tunnel,
+    /// トンネルの接続先入力欄 (`user@host[:port]`)。鍵は一切保持しない
+    tunnel_host: String,
+    /// 接続先の書式エラー / 待ち受けの張り替え失敗 (1 行)
+    tunnel_err: Option<String>,
     /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
     /// プラン使用量の監視 (集約・枯渇予測)。読み取りはこの中で TTL 付きの
@@ -2559,6 +2569,10 @@ impl ZaivernApp {
             fw: firewall::FirewallUi::default(),
             voice: VoiceState::default(),
             qr_tex: None,
+            qr_url: String::new(),
+            tunnel: tunnel::Tunnel::new(cc.egui_ctx.clone()),
+            tunnel_host: cfg.ssh_tunnel_host.clone(),
+            tunnel_err: None,
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
@@ -2642,8 +2656,9 @@ impl ZaivernApp {
             app.pet_tex = load_pet_texture(&cc.egui_ctx, Path::new(&path));
         }
         app.rebuild_plugins();
-        // スマホリモートサーバを起動 (LAN 内からブラウザで操作可能に)
-        match remote::RemoteServer::start(cc.egui_ctx.clone()) {
+        // スマホリモートサーバを起動 (LAN 内からブラウザで操作可能に)。
+        // 既定は LAN。SSH トンネルを張るときだけ 127.0.0.1 へ絞る。
+        match remote::RemoteServer::start(cc.egui_ctx.clone(), remote::Bind::Lan) {
             Ok(s) => {
                 // CLI (`zai open` など) が接続先を見つけられるよう接続情報を書き出す
                 let ws = app.primary_root().to_string_lossy().to_string();
@@ -6935,6 +6950,7 @@ impl ZaivernApp {
             | Cmd::TogglePetBubbles
             | Cmd::TogglePetAutoYes
             | Cmd::ToggleRemote
+            | Cmd::OpenSshRemote
             | Cmd::ToggleWordWrap
             | Cmd::ToggleShowWhitespace => self.apply_cmd_settings(cmd, ctx),
             Cmd::VoiceInput(_)
@@ -7703,6 +7719,12 @@ impl ZaivernApp {
             Cmd::TogglePetAutoYes => {
                 self.cfg.pet_auto_yes = !self.cfg.pet_auto_yes;
                 config::save_state(&self.cfg);
+            }
+            // 「SSH で繋ぎたい」は用事が決まっている入口なので、
+            // トグルではなく必ず開く (閉じるのは ✕ か 📱 ボタン)。
+            Cmd::OpenSshRemote => {
+                self.remote_open = true;
+                self.fw.recheck();
             }
             Cmd::ToggleRemote => {
                 self.remote_open = !self.remote_open;
@@ -8665,7 +8687,14 @@ impl ZaivernApp {
         // スマホリモート (QR コード表示)。
         // Windows で受信が許可されていないと分かっているときは ⚠ を添える
         // (📱 を開かないと理由が分からない、という状態を作らないため)
-        let blocked = self.fw.needs_allow();
+        // SSH トンネル中は 127.0.0.1 でしか待ち受けないので、受信許可は無関係。
+        // それでも ⚠ を出すと「直せない警告」を突きつけることになる。
+        let lan_mode = self
+            .remote
+            .as_ref()
+            .map(|r| r.bind == remote::Bind::Lan)
+            .unwrap_or(true);
+        let blocked = lan_mode && self.fw.needs_allow();
         let mut icon = RichText::new(if blocked { "📱⚠" } else { "📱" });
         if blocked {
             icon = icon.color(theme.warn);
@@ -14437,6 +14466,12 @@ impl ZaivernApp {
                 Cmd::ToggleRemote,
             ),
             (
+                "🔐".into(),
+                tr("リモート接続 (SSH) — 同じ Wi-Fi でなくてもスマホから繋ぐ"),
+                String::new(),
+                Cmd::OpenSshRemote,
+            ),
+            (
                 "🎤".into(),
                 tr("音声入力: 全エージェントの入力欄へ (送信は自分で Enter)"),
                 String::new(),
@@ -16130,16 +16165,69 @@ impl ZaivernApp {
         }
     }
 
+    /// スマホリモートの**待ち受け先だけ**を張り替える (LAN ⇄ SSH トンネル)。
+    ///
+    /// ハンドラ ([`remote::handle_conn`] 以下) は 1 面のまま、変わるのは
+    /// トランスポート = bind 先だけ (設計原則 5)。トークンは引き継ぐので、
+    /// 既に QR を読んだスマホや CLI の接続情報が無効にならない。
+    /// 戻り値は張り直した後のポート (トンネルの転送先に使う)。
+    fn rebind_remote(&mut self, ctx: &egui::Context, bind: remote::Bind) -> Result<u16, String> {
+        let Some(old) = self.remote.take() else {
+            return Err(tr("スマホリモートが起動していません"));
+        };
+        if old.bind == bind {
+            let port = old.port;
+            self.remote = Some(old);
+            return Ok(port);
+        }
+        let token = old.token.clone();
+        let prefer = old.port;
+        // 先に畳んでポートを解放する (Drop が accept の終了まで待つ)
+        drop(old);
+        match remote::RemoteServer::rebind(ctx.clone(), bind, token, prefer) {
+            Ok(s) => {
+                let port = s.port;
+                // CLI (`zai open` など) が見る接続情報も更新する
+                let ws = self.primary_root().to_string_lossy().to_string();
+                if let Err(e) = cli::write_instance_file(s.port, &s.token, &ws) {
+                    eprintln!("インスタンス情報の書き出しに失敗しました: {e}");
+                }
+                self.remote = Some(s);
+                self.remote_err = None;
+                self.qr_url.clear(); // URL が変わるので QR を作り直す
+                Ok(port)
+            }
+            Err(e) => {
+                let msg = trf("待ち受けの切り替えに失敗しました: {e}", &[("e", e.clone())]);
+                self.remote_err = Some(e);
+                Err(msg)
+            }
+        }
+    }
+
     /// QR コード付きの接続ウィンドウ。📱 ボタンで開閉する。
     fn remote_window(&mut self, ctx: &egui::Context) {
         if !self.remote_open {
             return;
         }
-        // QR テクスチャを一度だけ生成 (トークン付き接続 URL)
-        if self.qr_tex.is_none() {
-            if let Some(r) = &self.remote {
-                let full = format!("{}?t={}", r.url, r.token);
-                if let Ok(code) = qrcode::QrCode::new(full.as_bytes()) {
+        // スマホに読ませる URL。SSH トンネルが繋がっていれば踏み台の URL、
+        // そうでなければ LAN の URL。**どちらか 1 つしか出さない**
+        // (2 つ並べると、どちらを開けばよいのか分からなくなる)。
+        let tstate = self.tunnel.state();
+        let url_full = self.remote.as_ref().and_then(|r| {
+            tstate
+                .phone_url(&r.token)
+                .or_else(|| Some(format!("{}?t={}", r.url, r.token)))
+        });
+
+        // QR テクスチャは URL が変わったときだけ作り直す
+        // (毎フレーム作ると 240×240 のテクスチャを延々とアップロードすることになる)
+        let want_qr = url_full.clone().unwrap_or_default();
+        if self.qr_url != want_qr {
+            self.qr_tex = None;
+            self.qr_url = want_qr.clone();
+            if !want_qr.is_empty() {
+                if let Ok(code) = qrcode::QrCode::new(want_qr.as_bytes()) {
                     let w = code.width();
                     let colors = code.to_colors();
                     let m = 2usize;
@@ -16166,10 +16254,6 @@ impl ZaivernApp {
         }
 
         let theme = self.theme.clone();
-        let url_full = self
-            .remote
-            .as_ref()
-            .map(|r| format!("{}?t={}", r.url, r.token));
         let err = self.remote_err.clone();
         let qr_tex = self.qr_tex.clone();
         let mut open = self.remote_open;
@@ -16177,12 +16261,34 @@ impl ZaivernApp {
         let mut open_voice = false;
         // 「スマホから届いているのか」— 規則をいくら読んでも分からない事実。
         // これが無いと、真っ白な画面を前に PC 側で何も判断できない。
+        // (SSH トンネル経由の接続は loopback から来るので数に入らない。
+        //  数えない代わりに、下のトンネル状態行が「どの段にいるか」を出す)
         let reach = self.remote.as_ref().map(|r| r.reach());
+        // ── SSH トンネルの UI 用に取り出しておく値 ──
+        let tstage = tstate.stage;
+        let tattempt = tstate.attempt;
+        let tlast = tstate.last_failure;
+        let mut tunnel_host = self.tunnel_host.clone();
+        let tunnel_err = self.tunnel_err.clone();
+        let ssh_missing = tunnel::ssh_path().is_none();
+        let mut tunnel_connect = false;
+        let mut tunnel_disconnect = false;
+        let mut tunnel_copy_l = false;
+
+        // いまどこで待ち受けているか。SSH トンネル時は 127.0.0.1 だけなので、
+        // LAN 前提の案内 (ファイアウォール / 同じ Wi-Fi / 到達確認) は全部消す —
+        // 出したままだと「許可したのに繋がらない」と誤解させる。
+        let bind = self
+            .remote
+            .as_ref()
+            .map(|r| r.bind)
+            .unwrap_or(remote::Bind::Lan);
+        let lan_mode = bind == remote::Bind::Lan;
 
         // Windows の受信許可。ここが無いと「QR は読めるのにスマホからだけ
         // 何も起きない」になるので、繋がる前提として真っ先に見せる
         self.fw.ensure_checked();
-        let fw_check = firewall::applicable();
+        let fw_check = firewall::applicable() && lan_mode;
         let fw_busy = self.fw.busy();
         let fw_report = self.fw.report().cloned();
         let fw_error = self.fw.error.clone();
@@ -16208,8 +16314,12 @@ impl ZaivernApp {
                     (Some(url), _) => {
                         ui.vertical_centered(|ui| {
                             ui.label(
-                                RichText::new(tr("同じ Wi-Fi のスマホで QR を読み取るだけで接続"))
-                                    .color(theme.text),
+                                RichText::new(tr(if lan_mode {
+                                    "同じ Wi-Fi のスマホで QR を読み取るだけで接続"
+                                } else {
+                                    "SSH トンネル経由 — 外出先のスマホで QR を読み取って接続"
+                                }))
+                                .color(theme.text),
                             );
                             // ── Windows: 受信許可の状態と、その場で直せるボタン ──
                             if fw_check {
@@ -16426,7 +16536,7 @@ impl ZaivernApp {
                             // ルータのクライアント分離)、1 件でもあれば届いてはいる、と
                             // 切り分けられる。「真っ白で、繋がっているのかも分からない」を
                             // PC 側から潰すための表示。
-                            if let Some(re) = &reach {
+                            if let Some(re) = reach.as_ref().filter(|_| lan_mode) {
                                 ui.add_space(6.0);
                                 if re.hits == 0 {
                                     ui.label(
@@ -16487,6 +16597,149 @@ impl ZaivernApp {
                             );
                             ui.add_space(6.0);
                             ui.separator();
+
+                            // ── SSH リモート接続 ────────────────────────
+                            // 同じ Wi-Fi にいないスマホは、ユーザーが既に SSH で
+                            // 入れるホストを中継すれば届く。スマホ側に SSH
+                            // クライアントは要らない (ブラウザだけ)。
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(tr("🔐 SSH リモート接続"))
+                                        .strong()
+                                        .color(theme.text),
+                                );
+                                ui.label(
+                                    RichText::new(tr("(同じ Wi-Fi でなくても繋ぐ)"))
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                );
+                            });
+                            ui.add_space(3.0);
+                            let busy = matches!(
+                                tstage,
+                                tunnel::Stage::Connecting | tunnel::Stage::Connected
+                            );
+                            ui.horizontal(|ui| {
+                                // ボタン幅を先に確保して、残りを入力欄に渡す
+                                // (どの幅でも見切れないこと)
+                                let btn_w = 72.0_f32;
+                                let field_w =
+                                    (ui.available_width() - btn_w - 8.0).max(80.0);
+                                ui.add_enabled(
+                                    !busy,
+                                    egui::TextEdit::singleline(&mut tunnel_host)
+                                        .desired_width(field_w)
+                                        .hint_text("user@example.com")
+                                        .font(FontId::monospace(12.0)),
+                                )
+                                .on_hover_text(tr(tunnel::HOST_HINT));
+                                if ui
+                                    .add_sized(
+                                        [btn_w, 22.0],
+                                        egui::Button::new(if busy {
+                                            tr("切断")
+                                        } else {
+                                            tr("接続")
+                                        }),
+                                    )
+                                    .clicked()
+                                {
+                                    if busy {
+                                        tunnel_disconnect = true;
+                                    } else {
+                                        tunnel_connect = true;
+                                    }
+                                }
+                            });
+
+                            // ── 状態 1 行: いまどの段か + どこで待ち受けているか ──
+                            let stage_txt = match tstage {
+                                tunnel::Stage::Connecting if tattempt > 0 => trf(
+                                    "接続中 (再試行 {n}/{max})",
+                                    &[
+                                        ("n", tattempt.to_string()),
+                                        ("max", tunnel::MAX_RETRIES.to_string()),
+                                    ],
+                                ),
+                                s => tr(s.label()),
+                            };
+                            let stage_col = match tstage {
+                                tunnel::Stage::Connected => theme.ok,
+                                tunnel::Stage::Failed(_) => theme.err,
+                                tunnel::Stage::Connecting => theme.warn,
+                                tunnel::Stage::Disconnected => theme.text_dim,
+                            };
+                            ui.add_space(3.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(trf(
+                                        "● {stage}",
+                                        &[("stage", stage_txt)],
+                                    ))
+                                    .size(11.5)
+                                    .color(stage_col),
+                                );
+                                ui.label(
+                                    RichText::new(trf(
+                                        "· 待ち受け: {bind}",
+                                        &[("bind", tr(bind.label()))],
+                                    ))
+                                    .size(11.0)
+                                    .color(theme.text_dim),
+                                );
+                            });
+                            // 失敗の理由と、次にすることを 1 行ずつ
+                            // (生の ssh の stderr は出さない)
+                            let show_fail = match tstage {
+                                tunnel::Stage::Failed(f) => Some(f),
+                                tunnel::Stage::Connecting if tattempt > 0 => tlast,
+                                _ => None,
+                            };
+                            if let Some(f) = show_fail {
+                                ui.label(
+                                    RichText::new(tr(f.headline()))
+                                        .size(11.0)
+                                        .color(theme.err),
+                                );
+                                ui.label(
+                                    RichText::new(tr(f.hint()))
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                );
+                            }
+                            if let Some(e) = &tunnel_err {
+                                ui.label(RichText::new(e).size(11.0).color(theme.err));
+                            }
+                            if ssh_missing && show_fail.is_none() {
+                                ui.label(
+                                    RichText::new(tr(
+                                        "OpenSSH クライアントが見つかりません",
+                                    ))
+                                    .size(11.0)
+                                    .color(theme.warn),
+                                );
+                                ui.label(
+                                    RichText::new(tr(tunnel::install_hint()))
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                );
+                            }
+                            ui.add_space(3.0);
+                            if ui
+                                .button(tr("📋 ssh -L のコマンドをコピー"))
+                                .on_hover_text(tr(tunnel::SSH_L_HINT))
+                                .clicked()
+                            {
+                                tunnel_copy_l = true;
+                            }
+                            ui.label(
+                                RichText::new(tr(tunnel::GATEWAY_NOTE))
+                                    .size(10.5)
+                                    .color(theme.text_dim),
+                            );
+
+                            ui.add_space(6.0);
+                            ui.separator();
                             if ui
                                 .button(tr("🎤 PC で音声入力する"))
                                 .on_hover_text(tr(
@@ -16510,6 +16763,44 @@ impl ZaivernApp {
             });
 
         self.remote_open = open;
+        self.tunnel_host = tunnel_host;
+        // ── SSH トンネルの操作 ──
+        if tunnel_connect {
+            match tunnel::parse_target(&self.tunnel_host) {
+                Ok(t) => {
+                    self.tunnel_err = None;
+                    // 入力を正規化して欄へ戻す (前後の空白などを残さない)
+                    self.tunnel_host = t.display();
+                    // 接続先だけ覚える (鍵・パスフレーズは保存しない)
+                    self.cfg.ssh_tunnel_host = self.tunnel_host.clone();
+                    config::save_state(&self.cfg);
+                    // **先に** 待ち受けを 127.0.0.1 へ絞る。0.0.0.0 のままだと
+                    // SSH を迂回して平文で直接叩けてしまう。
+                    match self.rebind_remote(ctx, remote::Bind::Loopback) {
+                        Ok(port) => self.tunnel.connect(t, port),
+                        Err(e) => self.tunnel_err = Some(e),
+                    }
+                }
+                Err(e) => self.tunnel_err = Some(tr(e.msg())),
+            }
+        }
+        if tunnel_disconnect {
+            self.tunnel.disconnect();
+            self.tunnel_err = match self.rebind_remote(ctx, remote::Bind::Lan) {
+                Ok(_) => None,
+                Err(e) => Some(e),
+            };
+        }
+        if tunnel_copy_l {
+            match tunnel::parse_target(&self.tunnel_host) {
+                Ok(t) => {
+                    let port = self.remote.as_ref().map(|r| r.port).unwrap_or(remote::PORT_FROM);
+                    ctx.copy_text(tunnel::ssh_l_command(&t, port, port));
+                    self.toast(tr("ssh -L のコマンドをコピーしました"), true);
+                }
+                Err(e) => self.tunnel_err = Some(tr(e.msg())),
+            }
+        }
         if open_voice {
             self.apply_cmd(Cmd::VoiceInput(voice::Target::Broadcast), ctx);
         }
@@ -17501,6 +17792,9 @@ impl eframe::App for ZaivernApp {
         // 確実に残せない (走らせたまま閉じても、次回開けば会話を再開できる)。
         self.persist_session();
         cli::remove_instance_file();
+        // SSH トンネルは必ず畳む。置き去りにすると踏み台の公開ポートを掴んだ
+        // ssh が残り、次に繋ぐとき「ポート使用中」で失敗する。
+        self.tunnel.disconnect();
         for s in std::mem::take(&mut self.agents.sessions) {
             crate::terminal::abandon(s);
         }

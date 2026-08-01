@@ -78,6 +78,9 @@ pub enum Cmd {
     TogglePetAutoYes,
     /// スマホリモートの QR コードウィンドウ表示切替
     ToggleRemote,
+    /// 同じ画面を「SSH リモート接続」の用事で開く (トグルではなく必ず開く)。
+    /// 外出先のスマホから繋ぐときの入口。
+    OpenSshRemote,
     /// 音声入力の録音を開始/停止する。認識テキストは届け先の入力欄へ
     /// 挿入されるだけで、Enter は送られない
     VoiceInput(crate::voice::Target),
@@ -553,6 +556,7 @@ fn group_of(cmd: &Cmd) -> Group {
         Cmd::OpenConfig
         | Cmd::ReloadConfig
         | Cmd::ToggleRemote
+        | Cmd::OpenSshRemote
         | Cmd::SetVoiceEngine(_)
         | Cmd::SetVoiceLang(_)
         | Cmd::SetVoiceKeyword(_)

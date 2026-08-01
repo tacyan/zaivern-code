@@ -1361,6 +1361,7 @@ const BUNDLED: &[(&str, &[(&str, &str)])] = &[
             ("lang/50-editor.toml", include_str!("../assets/plugins/english-mode/lang/50-editor.toml")),
             ("lang/60-menubar.toml", include_str!("../assets/plugins/english-mode/lang/60-menubar.toml")),
             ("lang/70-kanban.toml", include_str!("../assets/plugins/english-mode/lang/70-kanban.toml")),
+            ("lang/80-tunnel.toml", include_str!("../assets/plugins/english-mode/lang/80-tunnel.toml")),
             ("plugin.toml", include_str!("../assets/plugins/english-mode/plugin.toml")),
         ],
     ),

@@ -98,6 +98,11 @@ pub struct Config {
     pub voice_command: String,
     /// 話すと自動で Enter まで送るキーワード (空文字 = 常に手動 Enter)
     pub voice_keyword: String,
+    /// SSH リモート接続の踏み台 (`user@host` / `user@host:port`。空 = 未設定)。
+    ///
+    /// **鍵やパスフレーズは絶対に保存しない** — 認証は OS の `ssh` と
+    /// `~/.ssh/config` / ssh-agent に丸投げする。ここに置くのは接続先だけ。
+    pub ssh_tunnel_host: String,
     /// 外部通知の Webhook URL (空 = 無効)。承認待ち・終了・レート制限を
     /// curl で POST する。ntfy トピック URL / Slack / Discord の Incoming Webhook に対応。
     pub webhook_url: String,
@@ -248,6 +253,7 @@ impl Default for Config {
             voice_lang: "ja-JP".into(),
             voice_command: String::new(),
             voice_keyword: String::new(),
+            ssh_tunnel_host: String::new(),
             webhook_url: String::new(),
             agents: default_agents(),
             keybindings: HashMap::new(),
@@ -446,6 +452,8 @@ struct UiState {
     voice_lang: Option<String>,
     voice_command: Option<String>,
     voice_keyword: Option<String>,
+    /// SSH リモート接続の踏み台 (接続先だけ。鍵は保存しない)。
+    ssh_tunnel_host: Option<String>,
     /// 監視役 LLM の選択。UI から選ぶものなので、手書きの config.toml ではなく
     /// state 側に置く (config.toml をアプリが書き換えない方針に合わせる)。
     super_agent_command: Option<String>,
@@ -871,6 +879,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.voice_keyword {
                     cfg.voice_keyword = v;
                 }
+                if let Some(v) = st.ssh_tunnel_host {
+                    cfg.ssh_tunnel_host = v;
+                }
                 if let Some(v) = st.super_agent_command {
                     cfg.super_agent.command = v;
                 }
@@ -1197,6 +1208,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         voice_lang: Some(cfg.voice_lang.clone()),
         voice_command: Some(cfg.voice_command.clone()),
         voice_keyword: Some(cfg.voice_keyword.clone()),
+        ssh_tunnel_host: Some(cfg.ssh_tunnel_host.clone()),
         super_agent_command: Some(cfg.super_agent.command.clone()),
         super_agent_session_title: Some(cfg.super_agent.session_title.clone()),
         super_agent_enabled: Some(cfg.super_agent.enabled),
@@ -1775,6 +1787,7 @@ command = "agy"
             voice_lang: Some("en-US".into()),
             voice_command: Some("my-stt --lang {lang}".into()),
             voice_keyword: Some("送信".into()),
+            ssh_tunnel_host: Some("user@bastion.example:2222".into()),
             super_agent_command: Some("claude".into()),
             super_agent_session_title: Some("Claude Code (全自動) #3".into()),
             super_agent_enabled: Some(true),
@@ -1795,6 +1808,11 @@ command = "agy"
         assert_eq!(back.pet_free_roam, Some(false));
         assert_eq!(back.pet_auto_yes, Some(true));
         assert_eq!(back.voice_keyword, Some("送信".to_string()));
+        assert_eq!(
+            back.ssh_tunnel_host,
+            Some("user@bastion.example:2222".to_string()),
+            "接続先は残す (鍵・パスフレーズは保存しない)"
+        );
         // エスケープが必要な制御文字も往復する
         assert_eq!(back.pet_approve_keys, Some("\r".to_string()));
         assert_eq!(back.pet_deny_keys, Some("\u{1b}".to_string()));
