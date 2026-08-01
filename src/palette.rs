@@ -55,6 +55,8 @@ pub enum Cmd {
     ToggleMinimap,
     /// エディタ上部のブレッドクラム (パンくず) を切り替える (config へ永続化)
     ToggleBreadcrumbs,
+    /// ガターの git blame (著者 · 相対日時) 表示を切り替える (config へ永続化)
+    ToggleGitBlame,
     /// サイドバーを Git タブで開く
     OpenGitPanel,
     OpenFind,
@@ -567,7 +569,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::SetReviewBase(_)
         | Cmd::ToggleDiffView
         | Cmd::DiffNextChange
-        | Cmd::DiffPrevChange => Group::Git,
+        | Cmd::DiffPrevChange
+        | Cmd::ToggleGitBlame => Group::Git,
 
         // ── ターミナル・実行 ───────────────────────────────────────
         Cmd::ToggleTerminal

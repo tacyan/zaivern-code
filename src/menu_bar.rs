@@ -30,6 +30,8 @@ pub struct MenuInfo {
     pub minimap: bool,
     /// ブレッドクラム (表示メニューのチェック状態)
     pub breadcrumbs: bool,
+    /// ガターの git blame 表示 (表示メニューのチェック状態)
+    pub git_blame: bool,
     /// アクティブなエディタタブがあるか (編集系メニューの有効/無効)
     pub has_editor: bool,
     /// エディタが分割されているか (分割の解除・ペイン移動の有効/無効)
@@ -487,6 +489,14 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         };
         if item(ui, &bc, "", true) {
             cmds.push(Cmd::ToggleBreadcrumbs);
+        }
+        let gb = if info.git_blame {
+            tr("✓ Git blame をガターに表示")
+        } else {
+            tr("Git blame をガターに表示")
+        };
+        if item(ui, &gb, "", true) {
+            cmds.push(Cmd::ToggleGitBlame);
         }
         ui.separator();
         let md = if info.md_preview {

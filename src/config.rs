@@ -36,6 +36,9 @@ pub struct Config {
     /// 自動で 1 列へ縮退させるので、狭いウィンドウでも見切れない。
     /// 値の解釈は [`crate::diff::DiffMode::from_config_str`] に集約してある。
     pub diff_view: String,
+    /// エディタ左端のガターに git blame (著者 · 相対日時) を出す。既定はオフ。
+    /// オンの間だけ可視範囲ぶんの `git blame` を非同期で取る。
+    pub git_blame: bool,
 
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
@@ -65,6 +68,7 @@ pub struct Config {
     pub global_minimap: bool,
     #[serde(skip)]
     pub global_breadcrumbs: bool,
+    pub global_git_blame: bool,
     /// overlay を重ねる前のグローバルなプラグイン設定の控え。
     /// save_plugins_section はこちらを書く — セッション中の値を書くと
     /// プロジェクトの .zaivern.toml 由来の無効化・設定値がグローバル
@@ -251,6 +255,7 @@ impl Default for Config {
             minimap: false,
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
+            git_blame: false,
             approval_mode: "ask".into(),
             restore_agents: false,
             show_pet: true,
@@ -261,6 +266,7 @@ impl Default for Config {
             global_show_whitespace: false,
             global_minimap: false,
             global_breadcrumbs: true,
+            global_git_blame: false,
             global_plugins: PluginsConfig::default(),
             pet_image: None,
             pet_x: None,
@@ -447,6 +453,7 @@ struct Overlay {
     show_whitespace: Option<bool>,
     minimap: Option<bool>,
     breadcrumbs: Option<bool>,
+    git_blame: Option<bool>,
     approval_mode: Option<String>,
     show_pet: Option<bool>,
     agents: Vec<AgentPreset>,
@@ -469,6 +476,7 @@ struct UiState {
     breadcrumbs: Option<bool>,
     /// 差分ビューの表示モード ("side_by_side" | "inline")。
     diff_view: Option<String>,
+    git_blame: Option<bool>,
     pet_image: Option<String>,
     pet_x: Option<f32>,
     pet_y: Option<f32>,
@@ -545,6 +553,9 @@ show_hidden_files = true
 # ミニマップは本文の幅を 64px 使うため既定はオフ。狭い画面では自動的に隠れます
 # minimap = false
 # breadcrumbs = true
+# ガターに git blame (著者 · 相対日時) を出す。既定はオフ
+# (表示メニュー・コマンドパレットの「Git blame の表示切替」でも変更できます)
+# git_blame = false
 
 # 既定の権限モード (claude / codex / agy に自動適用)
 #   "ask"   = 毎回ユーザー承認が必要（安全・デフォルト）
@@ -899,6 +910,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.diff_view {
                     cfg.diff_view = v;
                 }
+                if let Some(v) = st.git_blame {
+                    cfg.git_blame = v;
+                }
                 if st.pet_image.is_some() {
                     cfg.pet_image = st.pet_image;
                 }
@@ -977,6 +991,7 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     cfg.global_show_whitespace = cfg.show_whitespace;
     cfg.global_minimap = cfg.minimap;
     cfg.global_breadcrumbs = cfg.breadcrumbs;
+    cfg.global_git_blame = cfg.git_blame;
     cfg.global_plugins = cfg.plugins.clone();
 
     for root in roots {
@@ -1052,6 +1067,9 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
             }
             if let Some(v) = o.breadcrumbs {
                 cfg.breadcrumbs = v;
+            }
+            if let Some(v) = o.git_blame {
+                cfg.git_blame = v;
             }
             if let Some(v) = o.approval_mode {
                 cfg.approval_mode = v;
@@ -1273,6 +1291,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         minimap: Some(cfg.global_minimap),
         breadcrumbs: Some(cfg.global_breadcrumbs),
         diff_view: Some(cfg.diff_view.clone()),
+        git_blame: Some(cfg.global_git_blame),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -1855,6 +1874,7 @@ command = "agy"
             minimap: Some(true),
             breadcrumbs: Some(false),
             diff_view: Some("inline".into()),
+            git_blame: Some(true),
             pet_image: Some("/tmp/p.png".into()),
             pet_x: Some(10.0),
             pet_y: Some(20.5),
@@ -1887,6 +1907,7 @@ command = "agy"
         assert_eq!(back.show_whitespace, Some(true));
         assert_eq!(back.minimap, Some(true));
         assert_eq!(back.breadcrumbs, Some(false));
+        assert_eq!(back.git_blame, Some(true));
         assert_eq!(back.pet_image, Some("/tmp/p.png".to_string()));
         assert_eq!(back.pet_x, Some(10.0));
         assert_eq!(back.pet_y, Some(20.5));
