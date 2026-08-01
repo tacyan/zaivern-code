@@ -171,7 +171,11 @@ pub fn elide(widths: &[f32], sep_w: f32, ell_w: f32, avail: f32) -> Vec<Shown> {
     if n == 0 {
         return Vec::new();
     }
-    let avail = if avail.is_finite() { avail.max(0.0) } else { 0.0 };
+    let avail = if avail.is_finite() {
+        avail.max(0.0)
+    } else {
+        0.0
+    };
     let fits = |v: &[Shown]| total_width(v, widths, sep_w, ell_w) <= avail + 1e-3;
 
     // 1. 全部入る
@@ -320,10 +324,7 @@ mod tests {
             (vec![60.0, 40.0, 80.0], 0.0),
             (vec![300.0], 200.0),
             (vec![300.0], 1200.0),
-            (
-                vec![70.0, 55.0, 55.0, 90.0, 60.0, 45.0, 120.0],
-                1200.0,
-            ),
+            (vec![70.0, 55.0, 55.0, 90.0, 60.0, 45.0, 120.0], 1200.0),
             (vec![70.0, 55.0, 55.0, 90.0, 60.0, 45.0, 120.0], 300.0),
             (vec![70.0, 55.0, 55.0, 90.0, 60.0, 45.0, 120.0], 200.0),
             (vec![70.0, 55.0, 55.0, 90.0, 60.0, 45.0, 120.0], 130.0),
@@ -377,7 +378,13 @@ mod tests {
     #[test]
     fn elide_rejects_non_finite_width() {
         let v = elide(&[80.0], 10.0, 12.0, f32::NAN);
-        assert_eq!(v, vec![Shown::Truncated { index: 0, budget: 0.0 }]);
+        assert_eq!(
+            v,
+            vec![Shown::Truncated {
+                index: 0,
+                budget: 0.0
+            }]
+        );
     }
 
     #[test]

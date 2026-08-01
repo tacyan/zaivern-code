@@ -102,11 +102,7 @@ pub enum Query {
     /// 負数なら全エージェントへブロードキャスト。
     /// submit=false ならテキストを入力欄へ挿入するだけで Enter は送らない
     /// (PC 側と同じく、送信は必ず人の操作で行う)。
-    VoiceSend {
-        text: String,
-        id: i64,
-        submit: bool,
-    },
+    VoiceSend { text: String, id: i64, submit: bool },
 }
 
 impl Query {
@@ -232,8 +228,8 @@ impl RemoteServer {
                 break;
             }
         }
-        let listener = listener
-            .ok_or_else(|| format!("空きポートがありません ({PORT_FROM}-{PORT_TO})"))?;
+        let listener =
+            listener.ok_or_else(|| format!("空きポートがありません ({PORT_FROM}-{PORT_TO})"))?;
 
         let token = keep_token.unwrap_or_else(gen_token);
         // 待ち受けが loopback だけのときに LAN の IP を出すと、
@@ -366,7 +362,12 @@ fn lan_ip() -> String {
 
 // ─── HTTP 処理 ──────────────────────────────────────────────────────
 
-fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Context, token: String) {
+fn handle_conn(
+    mut stream: TcpStream,
+    tx: mpsc::Sender<Request>,
+    ctx: egui::Context,
+    token: String,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
@@ -401,7 +402,9 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
     let mut content_len = 0usize;
     let mut hdr_token = String::new();
     for l in lines {
-        let Some((k, v)) = l.split_once(':') else { continue };
+        let Some((k, v)) = l.split_once(':') else {
+            continue;
+        };
         let k = k.trim().to_ascii_lowercase();
         let v = v.trim();
         if k == "content-length" {
@@ -416,11 +419,21 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
 
     // ─── ルーティング (静的ページはボディ不要なので先に返す) ───
     if path == "/" || path == "/index.html" {
-        return respond(&mut stream, 200, "text/html; charset=utf-8", PAGE.as_bytes());
+        return respond(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            PAGE.as_bytes(),
+        );
     }
     if path == "/voice" {
         // PC 用の音声入力ページ (Web Speech API — 127.0.0.1 で開くこと)
-        return respond(&mut stream, 200, "text/html; charset=utf-8", VOICE_PAGE.as_bytes());
+        return respond(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            VOICE_PAGE.as_bytes(),
+        );
     }
     if !path.starts_with("/api/") {
         return respond(&mut stream, 404, "text/plain", b"not found");
@@ -436,7 +449,12 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
     if hdr_token != token && q_token != token {
         // 総当たりを減速させる (接続ごとスレッドなので他リクエストは塞がない)
         std::thread::sleep(std::time::Duration::from_millis(250));
-        return respond(&mut stream, 401, "application/json", br#"{"ok":false,"error":"unauthorized"}"#);
+        return respond(
+            &mut stream,
+            401,
+            "application/json",
+            br#"{"ok":false,"error":"unauthorized"}"#,
+        );
     }
 
     // ボディを読む (認証済みのリクエストのみ)
@@ -476,7 +494,12 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
     } else {
         serde_json::Value::Null
     };
-    let s = |k: &str| json.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let s = |k: &str| {
+        json.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let n = |k: &str| json.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
 
     let query = match (method.as_str(), path.as_str()) {
@@ -510,7 +533,11 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
         ),
         ("POST", "/api/notify") => {
             let level = s("level");
-            let level = if level.is_empty() { "info".into() } else { level };
+            let level = if level.is_empty() {
+                "info".into()
+            } else {
+                level
+            };
             Query::Notify(s("message"), level)
         }
         ("POST", "/api/panel") => Query::SetPanel {
@@ -523,32 +550,56 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
             text: s("text"),
             agent: s("agent"),
             // 既定は「挿入のみ」。/api/voice と同じ約束にする
-            submit: json.get("submit").and_then(|v| v.as_bool()).unwrap_or(false),
+            submit: json
+                .get("submit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
         ("POST", "/api/tab") => Query::Tab(n("index").max(0) as usize),
-        ("POST", "/api/term") => {
-            Query::TermInput(s("text"), json.get("raw").and_then(|v| v.as_bool()).unwrap_or(false))
-        }
+        ("POST", "/api/term") => Query::TermInput(
+            s("text"),
+            json.get("raw").and_then(|v| v.as_bool()).unwrap_or(false),
+        ),
         ("POST", "/api/voice") => Query::VoiceSend {
             text: s("text"),
             id: json.get("id").and_then(|v| v.as_i64()).unwrap_or(-1),
             // 既定は「挿入のみ」。送信は明示的に submit=true を渡したときだけ
-            submit: json.get("submit").and_then(|v| v.as_bool()).unwrap_or(false),
+            submit: json
+                .get("submit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
-        _ => return respond(&mut stream, 404, "application/json", br#"{"ok":false,"error":"unknown api"}"#),
+        _ => {
+            return respond(
+                &mut stream,
+                404,
+                "application/json",
+                br#"{"ok":false,"error":"unknown api"}"#,
+            )
+        }
     };
 
     // UI スレッドへ渡す
     let (rtx, rrx) = mpsc::sync_channel::<String>(1);
     let immediate = query.is_fire_and_forget().then(|| query.ack());
     if tx.send(Request { query, reply: rtx }).is_err() {
-        return respond(&mut stream, 500, "application/json", br#"{"ok":false,"error":"app closed"}"#);
+        return respond(
+            &mut stream,
+            500,
+            "application/json",
+            br#"{"ok":false,"error":"app closed"}"#,
+        );
     }
 
     // 一方向の指示は積んだ時点で成功。UI スレッドの復帰を待たない。
     if let Some(js) = immediate {
         ctx.request_repaint();
-        return respond(&mut stream, 200, "application/json; charset=utf-8", js.as_bytes());
+        return respond(
+            &mut stream,
+            200,
+            "application/json; charset=utf-8",
+            js.as_bytes(),
+        );
     }
     // UI スレッドは次のフレームでしか応答できない。ウィンドウが背面や
     // 非表示だとフレームが来る間隔が延びるため、1 回だけ起こして待つと
@@ -567,8 +618,18 @@ fn handle_conn(mut stream: TcpStream, tx: mpsc::Sender<Request>, ctx: egui::Cont
         }
     };
     match reply {
-        Some(js) => respond(&mut stream, 200, "application/json; charset=utf-8", js.as_bytes()),
-        None => respond(&mut stream, 504, "application/json", br#"{"ok":false,"error":"timeout"}"#),
+        Some(js) => respond(
+            &mut stream,
+            200,
+            "application/json; charset=utf-8",
+            js.as_bytes(),
+        ),
+        None => respond(
+            &mut stream,
+            504,
+            "application/json",
+            br#"{"ok":false,"error":"timeout"}"#,
+        ),
     }
 }
 
@@ -1395,10 +1456,19 @@ mod tests {
     #[test]
     fn only_lan_peers_count_as_the_phone() {
         let p = |s: &str| s.parse::<std::net::SocketAddr>().expect("addr");
-        assert!(counts_as_remote(&p("192.168.1.23:51000")), "同じ Wi-Fi のスマホ");
+        assert!(
+            counts_as_remote(&p("192.168.1.23:51000")),
+            "同じ Wi-Fi のスマホ"
+        );
         assert!(counts_as_remote(&p("10.0.0.5:51000")));
-        assert!(!counts_as_remote(&p("127.0.0.1:51000")), "PC 自身は数えない");
-        assert!(!counts_as_remote(&p("[::1]:51000")), "IPv6 のループバックも同じ");
+        assert!(
+            !counts_as_remote(&p("127.0.0.1:51000")),
+            "PC 自身は数えない"
+        );
+        assert!(
+            !counts_as_remote(&p("[::1]:51000")),
+            "IPv6 のループバックも同じ"
+        );
     }
 
     #[test]
@@ -1448,7 +1518,10 @@ mod tests {
         let lo = RemoteServer::rebind(ctx, Bind::Loopback, token.clone(), port)
             .expect("loopback へ張り直せる");
         assert_eq!(lo.token, token, "トークンは引き継ぐ");
-        assert_eq!(lo.port, port, "ポートも引き継ぐ (トンネルの転送先とずれない)");
+        assert_eq!(
+            lo.port, port,
+            "ポートも引き継ぐ (トンネルの転送先とずれない)"
+        );
         assert_eq!(lo.bind, Bind::Loopback);
         // URL は待ち受けと必ず一致させる (繋がらない URL を QR にしない)
         assert_eq!(lo.url, format!("http://127.0.0.1:{}/", lo.port));
@@ -1456,7 +1529,10 @@ mod tests {
 
     #[test]
     fn subslice_finds_header_end() {
-        assert_eq!(find_subslice(b"GET / HTTP/1.1\r\n\r\nbody", b"\r\n\r\n"), Some(14));
+        assert_eq!(
+            find_subslice(b"GET / HTTP/1.1\r\n\r\nbody", b"\r\n\r\n"),
+            Some(14)
+        );
         assert_eq!(find_subslice(b"abc", b"\r\n\r\n"), None);
     }
 
@@ -1479,7 +1555,10 @@ mod tests {
     #[test]
     fn page_shows_the_file_encoding() {
         assert!(PAGE.contains("f.encoding"), "文字コードを表示していない");
-        assert!(PAGE.contains("r.promoted"), "UTF-8 への格上げを伝えていない");
+        assert!(
+            PAGE.contains("r.promoted"),
+            "UTF-8 への格上げを伝えていない"
+        );
         assert!(PAGE.contains("UTF-8 で保存しました"));
     }
 

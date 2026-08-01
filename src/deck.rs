@@ -976,9 +976,8 @@ pub fn ui(
 
     // ── 永続状態の読み込み ─────────────────────────────────
     if st.layout.is_none() {
-        let v = ctx.data_mut(|d| {
-            *d.get_persisted_mut_or(mem_id("layout"), DeckLayout::default().to_u8())
-        });
+        let v = ctx
+            .data_mut(|d| *d.get_persisted_mut_or(mem_id("layout"), DeckLayout::default().to_u8()));
         st.layout = Some(DeckLayout::from_u8(v));
     }
     if st.stack.is_none() {
@@ -1036,7 +1035,9 @@ pub fn ui(
                     egui::vec2(rail_w, full_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        rail_ui(st, ui, theme, &rows, live, &views, launchers, unit, &mut acts);
+                        rail_ui(
+                            st, ui, theme, &rows, live, &views, launchers, unit, &mut acts,
+                        );
                     },
                 );
                 let thin = splitter_ui(st, ui, theme, true, full_w, unit);
@@ -1053,7 +1054,9 @@ pub fn ui(
                     egui::vec2(full_w, rail_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        rail_ui(st, ui, theme, &rows, live, &views, launchers, unit, &mut acts);
+                        rail_ui(
+                            st, ui, theme, &rows, live, &views, launchers, unit, &mut acts,
+                        );
                     },
                 );
                 let rest = (full_h - rail_h).max(unit * 6.0);
@@ -1143,7 +1146,8 @@ fn rail_ui(
                     acts.push(DeckAction::Launch(i));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_button(ui, theme, "▤", true, &tr("一覧を畳む (端末だけにする)")) {
+                    if icon_button(ui, theme, "▤", true, &tr("一覧を畳む (端末だけにする)"))
+                    {
                         st.set_layout(st.layout().with_rail(false));
                     }
                 });
@@ -1516,15 +1520,18 @@ fn header_strip_ui(
                         acts.push(DeckAction::Close);
                     }
                     if st.layout() == DeckLayout::Stacked {
-                        if icon_button(ui, theme, "－", false, &tr("同時に映す数を減らす")) {
+                        if icon_button(ui, theme, "－", false, &tr("同時に映す数を減らす"))
+                        {
                             st.set_stack(st.stack().saturating_sub(1));
                         }
-                        if icon_button(ui, theme, "＋", false, &tr("同時に映す数を増やす")) {
+                        if icon_button(ui, theme, "＋", false, &tr("同時に映す数を増やす"))
+                        {
                             st.set_stack(st.stack() + 1);
                         }
                     }
                     let stacked = st.layout() == DeckLayout::Stacked;
-                    if icon_button(ui, theme, "⊟", stacked, &tr("複数の端末を上下に積む")) {
+                    if icon_button(ui, theme, "⊟", stacked, &tr("複数の端末を上下に積む"))
+                    {
                         st.set_layout(st.layout().with_stacked(!stacked));
                     }
                     let rail = st.layout().shows_rail(true);
@@ -1630,7 +1637,8 @@ fn stack_bar_ui(
         egui::Rounding::ZERO,
         if hot { theme.accent } else { theme.border },
     );
-    resp.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    resp.clone()
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
     if resp.dragged() && span > 1.0 {
         adjust_weights(&mut st.stack_weights, i, resp.drag_delta().y / span);
         st.dirty = true;
@@ -1808,7 +1816,10 @@ mod tests {
         );
         let views = row_views(&rows, &l, None);
         assert_eq!(views.len(), rows.len(), "見出し行が挟まらない");
-        assert_eq!(views.iter().map(|v| v.id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            views.iter().map(|v| v.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         // セッションが 0 なら行も 0 (プリセットで埋めない)
         assert!(build_rows(&[], "").is_empty());
         assert!(row_views(&[], &[], None).is_empty());
@@ -1841,7 +1852,10 @@ mod tests {
     fn subtitles_fall_back_from_branch_to_cwd_to_command() {
         assert_eq!(subtitle_of("main", "~/dev/x", "claude"), "main • ~/dev/x");
         assert_eq!(subtitle_of("", "~/dev/x", "claude"), "~/dev/x");
-        assert_eq!(subtitle_of("", "", "claude --resume 1"), "claude --resume 1");
+        assert_eq!(
+            subtitle_of("", "", "claude --resume 1"),
+            "claude --resume 1"
+        );
         assert_eq!(subtitle_of("main", "", "claude"), "main");
         // 改行が混ざっても 1 行に潰す
         assert_eq!(subtitle_of("ma\nin", "x", "c"), "ma in • x");
@@ -1920,7 +1934,10 @@ mod tests {
     #[test]
     fn selection_falls_back_to_the_same_slot_when_removed() {
         // 2 が消えた: 同じ位置 (index 1) に居る 3 へ寄る
-        assert_eq!(resolve_selection(Some(2), 1, &rows_of(&[1, 3])), Some((3, 1)));
+        assert_eq!(
+            resolve_selection(Some(2), 1, &rows_of(&[1, 3])),
+            Some((3, 1))
+        );
         // 末尾が消えた: 末尾へ丸める
         assert_eq!(resolve_selection(Some(3), 2, &rows_of(&[1])), Some((1, 0)));
         // 空なら選択なし
@@ -1975,9 +1992,15 @@ mod tests {
             key_intent(egui::Key::Enter, false, false),
             Some(DeckKey::Enter)
         );
-        assert_eq!(key_intent(egui::Key::D, true, false), Some(DeckKey::Duplicate));
+        assert_eq!(
+            key_intent(egui::Key::D, true, false),
+            Some(DeckKey::Duplicate)
+        );
         assert_eq!(key_intent(egui::Key::X, true, false), Some(DeckKey::Stop));
-        assert_eq!(key_intent(egui::Key::S, true, false), Some(DeckKey::Restart));
+        assert_eq!(
+            key_intent(egui::Key::S, true, false),
+            Some(DeckKey::Restart)
+        );
         assert_eq!(key_intent(egui::Key::R, true, false), Some(DeckKey::Rename));
         assert_eq!(key_intent(egui::Key::N, true, false), Some(DeckKey::New));
         assert_eq!(
@@ -2004,7 +2027,10 @@ mod tests {
             live: &[LiveRow],
             launchers: &[LauncherRow],
         ) {
-            let row = st.selected.and_then(|id| rows.iter().find(|r| r.id == id)).copied();
+            let row = st
+                .selected
+                .and_then(|id| rows.iter().find(|r| r.id == id))
+                .copied();
             let intents = dispatch(k, rows, row, live, launchers, st.stop_armed);
             for it in intents {
                 st.apply_intent(it, rows, &mut self.seen);
@@ -2103,7 +2129,11 @@ mod tests {
         for l in [DeckLayout::Single, DeckLayout::Split, DeckLayout::Stacked] {
             assert_eq!(DeckLayout::from_u8(l.to_u8()), l);
         }
-        assert_eq!(DeckLayout::from_u8(99), DeckLayout::Split, "壊れた値は既定へ");
+        assert_eq!(
+            DeckLayout::from_u8(99),
+            DeckLayout::Split,
+            "壊れた値は既定へ"
+        );
         // レールの出し入れは積み上げを壊さない
         assert_eq!(DeckLayout::Stacked.with_rail(false), DeckLayout::Single);
         assert_eq!(DeckLayout::Stacked.with_rail(true), DeckLayout::Stacked);

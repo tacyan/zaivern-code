@@ -23,7 +23,6 @@
 //! `git::parse_range` / `git::parse_hunk_marks` と同じ流儀
 //! (カウント省略 = 1、行番号は diff 上 1-based) に揃えてある。
 
-
 use std::collections::HashMap;
 
 use eframe::egui::{self, Color32, FontId, RichText};
@@ -372,7 +371,10 @@ impl DiffCommentStore {
     /// 指定行のコメント (追加順)。
     #[allow(dead_code)]
     pub fn at(&self, anchor: &CommentAnchor) -> Vec<&DiffComment> {
-        self.comments.iter().filter(|c| &c.anchor == anchor).collect()
+        self.comments
+            .iter()
+            .filter(|c| &c.anchor == anchor)
+            .collect()
     }
 
     /// 指定行のコメント件数と「全部解決済みか」。0 件なら None。
@@ -525,10 +527,7 @@ fn unquote_git_path(s: &str) -> String {
 /// するため、「両側が同じパスになる分割」を優先して選ぶ (リネーム以外の
 /// diff は old == new なのでこれで正しく直る)。
 fn split_git_header(rest: &str) -> Option<(String, String)> {
-    let candidates: Vec<usize> = rest
-        .match_indices(" b/")
-        .map(|(i, _)| i)
-        .collect();
+    let candidates: Vec<usize> = rest.match_indices(" b/").map(|(i, _)| i).collect();
     // 両側が一致する分割があればそれが正解 (非リネームの通常ケース)
     for &pos in &candidates {
         let (a, b) = rest.split_at(pos);
@@ -847,7 +846,9 @@ impl DiffLayout {
 
 /// 残り幅から `want` を切り出す。足りなければ残り全部 (負にはしない)。
 fn cut(rem: &mut f32, want: f32, ppp: f32) -> f32 {
-    let w = crate::theme::snap_len(want.max(0.0), ppp).min(*rem).max(0.0);
+    let w = crate::theme::snap_len(want.max(0.0), ppp)
+        .min(*rem)
+        .max(0.0);
     *rem -= w;
     w
 }
@@ -879,7 +880,11 @@ fn pane_cols(x: f32, width: f32, cols: u8, ppp: f32) -> PaneCols {
 /// ため (`theme::snap_len`)。小数のまま置くと epaint が文字位置だけを丸めて
 /// 桁間隔が揺れる — 端末セルと同じ罠。
 pub fn diff_layout(available_w: f32, mode: DiffMode, ppp: f32) -> DiffLayout {
-    let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+    let ppp = if ppp.is_finite() && ppp > 0.0 {
+        ppp
+    } else {
+        1.0
+    };
     let w = if available_w.is_finite() {
         crate::theme::snap_len(available_w.max(0.0), ppp)
     } else {
@@ -1352,7 +1357,11 @@ pub fn next_change_index(cur: Option<usize>, delta: i32, len: usize) -> Option<u
 /// `a` と `b` を混ぜる。t=0 で a、t=1 で b。
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
-    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    let f = |x: u8, y: u8| {
+        (x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
@@ -2854,7 +2863,10 @@ diff --git a/e.rs b/e.rs
 
     #[test]
     fn side_paths_strip_timestamps() {
-        assert_eq!(strip_side_prefix("a/src/x.rs\t2024-01-01 12:00"), "src/x.rs");
+        assert_eq!(
+            strip_side_prefix("a/src/x.rs\t2024-01-01 12:00"),
+            "src/x.rs"
+        );
         assert_eq!(strip_side_prefix("/dev/null"), "/dev/null");
         assert_eq!(strip_side_prefix("b/plain.txt"), "plain.txt");
     }
@@ -3060,10 +3072,7 @@ diff --git a/b b/b
         // エスケープされた引用符とバックスラッシュ
         assert_eq!(unquote_git_path("\"a/q\\\"x\\\\y\""), "a/q\"x\\y");
         // strip_side_prefix 経由で a/ プレフィックスも落ちる
-        assert_eq!(
-            strip_side_prefix("\"a/\\346\\227\\245.txt\""),
-            "日.txt"
-        );
+        assert_eq!(strip_side_prefix("\"a/\\346\\227\\245.txt\""), "日.txt");
     }
 
     // -----------------------------------------------------------------
@@ -3152,12 +3161,7 @@ diff --git a/b b/b
     fn review_prompt_quote_keeps_backticks_and_flattens_newlines() {
         // バッククォートはコードフェンスを使わないのでそのまま通す。
         // 引用は必ず 1 行 (改行・タブは空白へ)。
-        let got = build_review_prompt(&[cmt(
-            "a.rs",
-            1,
-            "let s = `a`;\nlet t = 2;\tend",
-            "本文",
-        )]);
+        let got = build_review_prompt(&[cmt("a.rs", 1, "let s = `a`;\nlet t = 2;\tend", "本文")]);
         assert!(got.contains("> let s = `a`; let t = 2; end"), "{got}");
         // 引用が 1 行であること = '>' で始まる行はちょうど 1 本。
         assert_eq!(got.lines().filter(|l| l.starts_with('>')).count(), 1);
@@ -3420,11 +3424,7 @@ diff --git a/src/foo.rs b/src/foo.rs
     #[test]
     fn store_prompt_matches_build_review_prompt() {
         let mut s = DiffCommentStore::default();
-        s.add(
-            CommentAnchor::new("a.rs", CommentSide::New, 1),
-            "q",
-            "body",
-        );
+        s.add(CommentAnchor::new("a.rs", CommentSide::New, 1), "q", "body");
         assert_eq!(s.prompt(), build_review_prompt(s.all()));
         assert!(!s.prompt().is_empty());
     }
@@ -3511,19 +3511,74 @@ diff --git a/src/foo.rs b/src/foo.rs
     fn diff_layout_table() {
         // (可用幅, 希望モード, 期待する実モード, 何を見ているか)
         let table: &[(f32, DiffMode, DiffMode, &str)] = &[
-            (320.0, DiffMode::SideBySide, DiffMode::Inline, "スマホ幅は一列へ縮退"),
-            (320.0, DiffMode::Inline, DiffMode::Inline, "一列指定はそのまま"),
-            (611.0, DiffMode::SideBySide, DiffMode::Inline, "閾値の 1px 下は一列"),
-            (612.0, DiffMode::SideBySide, DiffMode::SideBySide, "閾値ちょうどは並列"),
-            (900.0, DiffMode::SideBySide, DiffMode::SideBySide, "900x700 の中央ビュー"),
-            (1200.0, DiffMode::SideBySide, DiffMode::SideBySide, "1200x300 の横長"),
-            (1200.0, DiffMode::Inline, DiffMode::Inline, "広くても一列指定は一列"),
-            (0.0, DiffMode::SideBySide, DiffMode::Inline, "幅 0 でも壊れない"),
+            (
+                320.0,
+                DiffMode::SideBySide,
+                DiffMode::Inline,
+                "スマホ幅は一列へ縮退",
+            ),
+            (
+                320.0,
+                DiffMode::Inline,
+                DiffMode::Inline,
+                "一列指定はそのまま",
+            ),
+            (
+                611.0,
+                DiffMode::SideBySide,
+                DiffMode::Inline,
+                "閾値の 1px 下は一列",
+            ),
+            (
+                612.0,
+                DiffMode::SideBySide,
+                DiffMode::SideBySide,
+                "閾値ちょうどは並列",
+            ),
+            (
+                900.0,
+                DiffMode::SideBySide,
+                DiffMode::SideBySide,
+                "900x700 の中央ビュー",
+            ),
+            (
+                1200.0,
+                DiffMode::SideBySide,
+                DiffMode::SideBySide,
+                "1200x300 の横長",
+            ),
+            (
+                1200.0,
+                DiffMode::Inline,
+                DiffMode::Inline,
+                "広くても一列指定は一列",
+            ),
+            (
+                0.0,
+                DiffMode::SideBySide,
+                DiffMode::Inline,
+                "幅 0 でも壊れない",
+            ),
             (0.0, DiffMode::Inline, DiffMode::Inline, "幅 0 の一列"),
             (1.0, DiffMode::SideBySide, DiffMode::Inline, "幅 1px"),
-            (60.0, DiffMode::Inline, DiffMode::Inline, "行番号すら入らない幅"),
-            (f32::NAN, DiffMode::SideBySide, DiffMode::Inline, "NaN は幅 0 扱い"),
-            (f32::INFINITY, DiffMode::SideBySide, DiffMode::Inline, "無限も幅 0 扱い"),
+            (
+                60.0,
+                DiffMode::Inline,
+                DiffMode::Inline,
+                "行番号すら入らない幅",
+            ),
+            (
+                f32::NAN,
+                DiffMode::SideBySide,
+                DiffMode::Inline,
+                "NaN は幅 0 扱い",
+            ),
+            (
+                f32::INFINITY,
+                DiffMode::SideBySide,
+                DiffMode::Inline,
+                "無限も幅 0 扱い",
+            ),
         ];
         for &(w, req, want, why) in table {
             for ppp in [1.0f32, 1.5, 2.0] {
@@ -3798,13 +3853,7 @@ diff --git a/src/foo.rs b/src/foo.rs
                 &["設定"],
                 "日本語の語の入れ替え",
             ),
-            (
-                "日本語",
-                "日本語です",
-                &[],
-                &["です"],
-                "日本語の末尾に追加",
-            ),
+            ("日本語", "日本語です", &[], &["です"], "日本語の末尾に追加"),
             // --- 絵文字 (サロゲート相当の 4 バイト文字・ZWJ・肌色修飾子) ---
             (
                 "ok 🚀 go",
@@ -3993,9 +4042,21 @@ diff --git a/src/foo.rs b/src/foo.rs
         assert_eq!(
             blocks,
             vec![
-                ChangeAnchor { file: 0, hunk: 0, line: 1 },
-                ChangeAnchor { file: 0, hunk: 0, line: 5 },
-                ChangeAnchor { file: 1, hunk: 0, line: 1 },
+                ChangeAnchor {
+                    file: 0,
+                    hunk: 0,
+                    line: 1
+                },
+                ChangeAnchor {
+                    file: 0,
+                    hunk: 0,
+                    line: 5
+                },
+                ChangeAnchor {
+                    file: 1,
+                    hunk: 0,
+                    line: 1
+                },
             ],
             "連続した追加/削除は 1 つの塊として数える"
         );
@@ -4136,8 +4197,16 @@ diff --git a/src/foo.rs b/src/foo.rs
         );
         let lay = diff_layout(900.0, DiffMode::SideBySide, ctx.pixels_per_point());
         let mid = lay.panes[1].x;
-        assert!(old.left() < mid, "旧側が左ペインに無い ({} >= {mid})", old.left());
-        assert!(new.left() >= mid, "新側が右ペインに無い ({} < {mid})", new.left());
+        assert!(
+            old.left() < mid,
+            "旧側が左ペインに無い ({} >= {mid})",
+            old.left()
+        );
+        assert!(
+            new.left() >= mid,
+            "新側が右ペインに無い ({} < {mid})",
+            new.left()
+        );
         assert!(
             new.right() <= 900.0 + 0.5,
             "右ペインの本文が画面からはみ出した: {new:?}"
@@ -4158,8 +4227,22 @@ diff --git a/src/foo.rs b/src/foo.rs
 
         // 左 (旧側) をクリック → 旧側の行番号にコメントの下書きが開く
         let p = old.center();
-        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), click_at(p, true));
-        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), click_at(p, false));
+        let _ = render(
+            &ctx,
+            &theme,
+            &files,
+            &mut store,
+            (900.0, 700.0),
+            click_at(p, true),
+        );
+        let _ = render(
+            &ctx,
+            &theme,
+            &files,
+            &mut store,
+            (900.0, 700.0),
+            click_at(p, false),
+        );
         assert!(
             store.drafts.keys().any(|a| a.side == CommentSide::Old),
             "左 (変更前) の行にコメントが打てない: {:?}",
@@ -4168,8 +4251,22 @@ diff --git a/src/foo.rs b/src/foo.rs
 
         // 右 (新側) をクリック → 新側の行番号にも打てる
         let p = new.center();
-        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), click_at(p, true));
-        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), click_at(p, false));
+        let _ = render(
+            &ctx,
+            &theme,
+            &files,
+            &mut store,
+            (900.0, 700.0),
+            click_at(p, true),
+        );
+        let _ = render(
+            &ctx,
+            &theme,
+            &files,
+            &mut store,
+            (900.0, 700.0),
+            click_at(p, false),
+        );
         assert!(
             store.drafts.keys().any(|a| a.side == CommentSide::New),
             "右 (変更後) の行にコメントが打てない: {:?}",
@@ -4196,8 +4293,22 @@ diff --git a/src/foo.rs b/src/foo.rs
         assert!(old.left() < 320.0 && new.left() < 320.0, "本文が画面外");
 
         let p = new.center();
-        let _ = render(&ctx, &theme, &files, &mut store, (320.0, 640.0), click_at(p, true));
-        let _ = render(&ctx, &theme, &files, &mut store, (320.0, 640.0), click_at(p, false));
+        let _ = render(
+            &ctx,
+            &theme,
+            &files,
+            &mut store,
+            (320.0, 640.0),
+            click_at(p, true),
+        );
+        let _ = render(
+            &ctx,
+            &theme,
+            &files,
+            &mut store,
+            (320.0, 640.0),
+            click_at(p, false),
+        );
         assert_eq!(store.drafts.len(), 1, "一列でも行コメントが打てる");
     }
 
@@ -4223,7 +4334,12 @@ diff --git a/src/foo.rs b/src/foo.rs
         // 極端なサイズで描いて、塗り矩形もクリップ矩形も画面の横幅を出ないこと。
         // 折りたたみ見出しの字下げぶんを勘定に入れ忘れると、並列の右ペインが
         // ここで画面外へ出る (実際にそう書いて落ちた)。
-        for (w, h) in [(900.0f32, 700.0f32), (1200.0, 300.0), (320.0, 640.0), (700.0, 500.0)] {
+        for (w, h) in [
+            (900.0f32, 700.0f32),
+            (1200.0, 300.0),
+            (320.0, 640.0),
+            (700.0, 500.0),
+        ] {
             let ctx = egui::Context::default();
             let theme = crate::theme::all()[0].clone();
             set_diff_mode(&ctx, DiffMode::SideBySide);
@@ -4292,7 +4408,14 @@ diff --git a/src/foo.rs b/src/foo.rs
         );
         let mut store = DiffCommentStore::default();
         request_jump(&ctx, 1);
-        let _ = render(&ctx, &theme, &no_change, &mut store, (900.0, 700.0), Vec::new());
+        let _ = render(
+            &ctx,
+            &theme,
+            &no_change,
+            &mut store,
+            (900.0, 700.0),
+            Vec::new(),
+        );
         assert_eq!(
             take_pending_notice(&ctx).as_deref(),
             Some(tr("変更はありません").as_str()),
@@ -4304,7 +4427,10 @@ diff --git a/src/foo.rs b/src/foo.rs
         let files = sbs_diff();
         request_jump(&ctx, 1);
         let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), Vec::new());
-        assert!(take_pending_notice(&ctx).is_none(), "飛べるときは黙って飛ぶ");
+        assert!(
+            take_pending_notice(&ctx).is_none(),
+            "飛べるときは黙って飛ぶ"
+        );
     }
 
     #[test]
@@ -4371,7 +4497,6 @@ diff --git a/src/foo.rs b/src/foo.rs
         }
         assert_eq!(n, 1, "モード切替ボタンが {n} 個描かれた (1 個であるべき)");
     }
-
 
     // ---- DiffMode: config との往復 ----------------------------------------
 

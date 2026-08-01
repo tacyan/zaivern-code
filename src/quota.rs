@@ -272,7 +272,11 @@ pub fn snapshot_all_in(home: &Path) -> Vec<QuotaSnapshot> {
 /// [`SourceKind::Observed`] へ格上げする。
 pub fn merge_observed(snaps: &mut [QuotaSnapshot], events: &[RateLimitEvent]) {
     for s in snaps.iter_mut() {
-        s.observed_events = events.iter().filter(|e| e.agent == s.agent).cloned().collect();
+        s.observed_events = events
+            .iter()
+            .filter(|e| e.agent == s.agent)
+            .cloned()
+            .collect();
         s.observed_events.sort_by_key(|e| e.at);
         if s.source == SourceKind::Unavailable && !s.observed_events.is_empty() {
             s.source = SourceKind::Observed;
@@ -532,7 +536,11 @@ impl AccountUsage {
     pub fn recent_events(&self, window: Duration, now: SystemTime) -> usize {
         self.events
             .iter()
-            .filter(|e| now.duration_since(e.at).map(|d| d <= window).unwrap_or(true))
+            .filter(|e| {
+                now.duration_since(e.at)
+                    .map(|d| d <= window)
+                    .unwrap_or(true)
+            })
             .count()
     }
 }
@@ -540,7 +548,10 @@ impl AccountUsage {
 /// スナップショットをアカウント単位へ畳む (純関数)。
 ///
 /// `running_by_agent` は「bin 名 → いま走っている本数」。
-pub fn aggregate(snaps: &[QuotaSnapshot], running_by_agent: &[(String, usize)]) -> Vec<AccountUsage> {
+pub fn aggregate(
+    snaps: &[QuotaSnapshot],
+    running_by_agent: &[(String, usize)],
+) -> Vec<AccountUsage> {
     let mut order: Vec<String> = Vec::new();
     let mut by: HashMap<String, AccountUsage> = HashMap::new();
     for s in snaps {
@@ -779,7 +790,10 @@ impl BurnHistory {
     }
 
     pub fn samples(&self, account: &str) -> &[BurnSample] {
-        self.per_account.get(account).map(|v| v.as_slice()).unwrap_or(&[])
+        self.per_account
+            .get(account)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// 燃焼速度 (窓は [`BurnHistory::WINDOW`])。
@@ -842,12 +856,14 @@ impl AdviceReason {
     /// 日本語の一言 (辞書があれば翻訳される)。
     pub fn label(&self) -> String {
         match self {
-            AdviceReason::AlreadyLimited { agent } => {
-                trf("{agent} が使用上限に当たっています", &[("agent", agent.clone())])
-            }
-            AdviceReason::HighUsage { percent } => {
-                trf("プラン枠を {percent}% 使っています", &[("percent", percent.to_string())])
-            }
+            AdviceReason::AlreadyLimited { agent } => trf(
+                "{agent} が使用上限に当たっています",
+                &[("agent", agent.clone())],
+            ),
+            AdviceReason::HighUsage { percent } => trf(
+                "プラン枠を {percent}% 使っています",
+                &[("percent", percent.to_string())],
+            ),
             AdviceReason::ExhaustsSoon { in_secs, running } => trf(
                 "この調子だと約 {mins} 分で枠が尽きます ({running} 本並列)",
                 &[
@@ -861,7 +877,10 @@ impl AdviceReason {
             ),
             AdviceReason::Crowded { running, percent } => trf(
                 "{running} 本を並列で走らせたまま枠を {percent}% 使っています",
-                &[("running", running.to_string()), ("percent", percent.to_string())],
+                &[
+                    ("running", running.to_string()),
+                    ("percent", percent.to_string()),
+                ],
             ),
         }
     }
@@ -900,7 +919,12 @@ impl Advice {
 /// 助言を決める (純関数)。
 ///
 /// 判定は上から順に見て**最初に当たったもの**を返す。
-pub fn advise(usage: &AccountUsage, running_agents: usize, policy: &Policy, now: SystemTime) -> Advice {
+pub fn advise(
+    usage: &AccountUsage,
+    running_agents: usize,
+    policy: &Policy,
+    now: SystemTime,
+) -> Advice {
     // 1) 既に当たっている — 予測より観測が強い
     let recent = usage.recent_events(policy.event_window, now);
     if recent > 0 {
@@ -918,9 +942,7 @@ pub fn advise(usage: &AccountUsage, running_agents: usize, policy: &Policy, now:
     if let Some(u) = used {
         if u >= policy.stop_fraction {
             return Advice::Stop {
-                reason: AdviceReason::HighUsage {
-                    percent: pct(u),
-                },
+                reason: AdviceReason::HighUsage { percent: pct(u) },
             };
         }
     }
@@ -1024,7 +1046,10 @@ mod tests {
     fn codex_rollout_relative_reset() {
         let c = r#"{"timestamp":"2026-07-25T00:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":50,"window_minutes":300,"resets_in_seconds":600}}}}"#;
         let u = parse_codex_rollout(c).unwrap();
-        assert_eq!(u.resets_at, Some(parse_rfc3339("2026-07-25T00:10:00Z").unwrap()));
+        assert_eq!(
+            u.resets_at,
+            Some(parse_rfc3339("2026-07-25T00:10:00Z").unwrap())
+        );
     }
 
     /// 壊れた入力でも**絶対に panic せず** None を返す。
@@ -1070,11 +1095,20 @@ mod tests {
     fn rfc3339_table() {
         assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(t(0)));
         assert_eq!(parse_rfc3339("1970-01-02T00:00:00Z"), Some(t(86_400)));
-        assert_eq!(parse_rfc3339("2026-07-25T03:36:12.345Z"), parse_rfc3339("2026-07-25T03:36:12Z"));
+        assert_eq!(
+            parse_rfc3339("2026-07-25T03:36:12.345Z"),
+            parse_rfc3339("2026-07-25T03:36:12Z")
+        );
         // +09:00 は UTC より 9 時間進んでいる → エポックは 9 時間手前
         let jst = parse_rfc3339("2026-07-25T09:00:00+09:00").unwrap();
         assert_eq!(jst, parse_rfc3339("2026-07-25T00:00:00Z").unwrap());
-        for bad in ["", "abc", "2026-07-25", "2026/07/25T00:00:00Z", "2026-13-01T00:00:00Z"] {
+        for bad in [
+            "",
+            "abc",
+            "2026-07-25",
+            "2026/07/25T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+        ] {
             assert_eq!(parse_rfc3339(bad), None, "入力: {bad:?}");
         }
     }
@@ -1300,13 +1334,21 @@ mod tests {
         let now = t(1_000);
         let w = Duration::from_secs(3600);
         assert!(burn_rate(&[], w, now).is_none(), "標本ゼロ");
-        assert!(burn_rate(&samples(&[(900, 0.5)]), w, now).is_none(), "標本 1 つ");
+        assert!(
+            burn_rate(&samples(&[(900, 0.5)]), w, now).is_none(),
+            "標本 1 つ"
+        );
         assert!(
             burn_rate(&samples(&[(900, 0.5), (900, 0.7)]), w, now).is_none(),
             "時間幅ゼロ"
         );
         assert!(
-            burn_rate(&samples(&[(0, 0.1), (10, 0.2)]), Duration::from_secs(60), now).is_none(),
+            burn_rate(
+                &samples(&[(0, 0.1), (10, 0.2)]),
+                Duration::from_secs(60),
+                now
+            )
+            .is_none(),
             "全部が窓の外"
         );
     }
@@ -1335,7 +1377,13 @@ mod tests {
     #[test]
     fn burn_rate_restarts_after_reset() {
         let now = t(1_000);
-        let s = samples(&[(200, 0.80), (400, 0.90), (600, 0.05), (800, 0.15), (1000, 0.25)]);
+        let s = samples(&[
+            (200, 0.80),
+            (400, 0.90),
+            (600, 0.05),
+            (800, 0.15),
+            (1000, 0.25),
+        ]);
         let r = burn_rate(&s, Duration::from_secs(3600), now).unwrap();
         assert_eq!(r.samples, 3, "リセット後の 3 点だけ");
         assert!((r.per_sec - 0.0005).abs() < 1e-6, "0.2 / 400s");
@@ -1345,8 +1393,12 @@ mod tests {
     #[test]
     fn burn_rate_flat_is_zero() {
         let now = t(1_000);
-        let r = burn_rate(&samples(&[(400, 0.5), (700, 0.5), (1000, 0.5)]), Duration::from_secs(3600), now)
-            .unwrap();
+        let r = burn_rate(
+            &samples(&[(400, 0.5), (700, 0.5), (1000, 0.5)]),
+            Duration::from_secs(3600),
+            now,
+        )
+        .unwrap();
         assert_eq!(r.per_sec, 0.0);
     }
 
@@ -1359,7 +1411,11 @@ mod tests {
         }
         assert_eq!(h.samples("openai").len(), BurnHistory::CAP);
         h.record("openai", t((BurnHistory::CAP + 49) as u64), 0.9);
-        assert_eq!(h.samples("openai").len(), BurnHistory::CAP, "同時刻は上書き");
+        assert_eq!(
+            h.samples("openai").len(),
+            BurnHistory::CAP,
+            "同時刻は上書き"
+        );
         assert_eq!(h.samples("openai").last().unwrap().used_fraction, 0.9);
         assert!(h.samples("unknown-account").is_empty());
     }
@@ -1427,11 +1483,17 @@ mod tests {
     /// 予測はアカウントへ貼れる。
     #[test]
     fn attach_projection_fills_account() {
-        let mut u = aggregate(&[snap("codex", "openai", Some(0.7), SourceKind::Vendor)], &[])
-            .pop()
-            .unwrap();
+        let mut u = aggregate(
+            &[snap("codex", "openai", Some(0.7), SourceKind::Vendor)],
+            &[],
+        )
+        .pop()
+        .unwrap();
         attach_projection(&mut u, Some(&burn(0.001)), t(0));
-        assert_eq!(u.projection, Projection::Exhaustion(Duration::from_secs(300)));
+        assert_eq!(
+            u.projection,
+            Projection::Exhaustion(Duration::from_secs(300))
+        );
     }
 
     // ── 助言 ────────────────────────────────────────────────────────
@@ -1468,7 +1530,12 @@ mod tests {
         let now = t(100_000);
         // 余裕あり
         assert_eq!(
-            advise(&account(Some(0.10), Projection::NotBurning, vec![]), 1, &p, now),
+            advise(
+                &account(Some(0.10), Projection::NotBurning, vec![]),
+                1,
+                &p,
+                now
+            ),
             Advice::Ok
         );
         // 既に上限に当たっている → 止める (予測より観測が強い)
@@ -1485,7 +1552,12 @@ mod tests {
         ));
         // 使用率が停止しきい値超え
         assert!(matches!(
-            advise(&account(Some(0.96), Projection::NotBurning, vec![]), 1, &p, now),
+            advise(
+                &account(Some(0.96), Projection::NotBurning, vec![]),
+                1,
+                &p,
+                now
+            ),
             Advice::Stop {
                 reason: AdviceReason::HighUsage { percent: 96 }
             }
@@ -1493,7 +1565,11 @@ mod tests {
         // 予測枯渇が 5 分以内 → 止める
         assert!(matches!(
             advise(
-                &account(Some(0.30), Projection::Exhaustion(Duration::from_secs(120)), vec![]),
+                &account(
+                    Some(0.30),
+                    Projection::Exhaustion(Duration::from_secs(120)),
+                    vec![]
+                ),
                 4,
                 &p,
                 now
@@ -1505,7 +1581,11 @@ mod tests {
         // 予測枯渇が 30 分以内 → 絞る
         assert!(matches!(
             advise(
-                &account(Some(0.30), Projection::Exhaustion(Duration::from_secs(1200)), vec![]),
+                &account(
+                    Some(0.30),
+                    Projection::Exhaustion(Duration::from_secs(1200)),
+                    vec![]
+                ),
                 2,
                 &p,
                 now
@@ -1516,7 +1596,12 @@ mod tests {
         ));
         // 使用率が警戒しきい値超え
         assert!(matches!(
-            advise(&account(Some(0.85), Projection::NotBurning, vec![]), 1, &p, now),
+            advise(
+                &account(Some(0.85), Projection::NotBurning, vec![]),
+                1,
+                &p,
+                now
+            ),
             Advice::SlowDown {
                 reason: AdviceReason::HighUsage { percent: 85 }
             }
@@ -1524,7 +1609,11 @@ mod tests {
         // 少し前の上限警告が積み上がっている (窓の外だが 4 倍窓の中)
         assert!(matches!(
             advise(
-                &account(None, Projection::InsufficientData, vec![ev(98_000), ev(98_500)]),
+                &account(
+                    None,
+                    Projection::InsufficientData,
+                    vec![ev(98_000), ev(98_500)]
+                ),
                 1,
                 &p,
                 now
@@ -1535,7 +1624,12 @@ mod tests {
         ));
         // 並列が多く枠も半分以上
         assert!(matches!(
-            advise(&account(Some(0.60), Projection::NotBurning, vec![]), 3, &p, now),
+            advise(
+                &account(Some(0.60), Projection::NotBurning, vec![]),
+                3,
+                &p,
+                now
+            ),
             Advice::SlowDown {
                 reason: AdviceReason::Crowded {
                     running: 3,
@@ -1545,7 +1639,12 @@ mod tests {
         ));
         // 情報が無ければ黙る (推測で騒がない)
         assert_eq!(
-            advise(&account(None, Projection::InsufficientData, vec![]), 5, &p, now),
+            advise(
+                &account(None, Projection::InsufficientData, vec![]),
+                5,
+                &p,
+                now
+            ),
             Advice::Ok
         );
     }

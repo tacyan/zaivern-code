@@ -126,7 +126,13 @@ pub fn term_log_dir(workspace: &Path) -> PathBuf {
 pub fn term_log_path(workspace: &Path, session_id: u64, title: &str) -> PathBuf {
     let safe: String = title
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(40)
         .collect();
     term_log_dir(workspace).join(format!("{safe}-{session_id}.log"))
@@ -248,7 +254,8 @@ mod tests {
         };
 
         save_to(&dir, std::slice::from_ref(&workspace), &data);
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
+        let loaded =
+            load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
 
         assert_eq!(loaded.open_files, data.open_files);
         assert_eq!(loaded.active, Some(1));
@@ -272,7 +279,8 @@ mod tests {
         };
 
         save_to(&dir, std::slice::from_ref(&workspace), &data);
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
+        let loaded =
+            load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
 
         assert!(loaded.open_files.is_empty());
         assert_eq!(loaded.active, None);
@@ -291,7 +299,10 @@ mod tests {
         let data = SessionData {
             open_files: vec![
                 workspace.join("メモ帳.txt").to_string_lossy().into_owned(),
-                workspace.join("設計/仕様書.md").to_string_lossy().into_owned(),
+                workspace
+                    .join("設計/仕様書.md")
+                    .to_string_lossy()
+                    .into_owned(),
             ],
             active: Some(0),
             sidebar_open: true,
@@ -301,7 +312,8 @@ mod tests {
         };
 
         save_to(&dir, std::slice::from_ref(&workspace), &data);
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("japanese session should load");
+        let loaded = load_from(&dir, std::slice::from_ref(&workspace))
+            .expect("japanese session should load");
 
         assert_eq!(loaded.open_files, data.open_files);
         assert_eq!(loaded.active, Some(0));
@@ -381,7 +393,10 @@ mod tests {
         let loaded = load_from(&dir, roots).expect("session should load");
         assert_eq!(loaded.agents.len(), 2);
         assert_eq!(loaded.agents[0].preset_name, "Claude Code");
-        assert_eq!(loaded.agents[0].command, "claude --dangerously-skip-permissions");
+        assert_eq!(
+            loaded.agents[0].command,
+            "claude --dangerously-skip-permissions"
+        );
         assert_eq!(loaded.agents[1].title, "Codex #2");
         assert_eq!(loaded.agents[1].cwd, "/p/サブ");
         assert_eq!(loaded.agents[1].log_file, "/logs/Codex__2-2.log");
@@ -555,7 +570,8 @@ mod tests {
         };
         save_to(&dir, std::slice::from_ref(&workspace), &second);
 
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
+        let loaded =
+            load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
         assert_eq!(loaded.open_files, vec!["/new.rs", "/new2.rs"]);
         assert_eq!(loaded.active, Some(1));
 

@@ -704,7 +704,10 @@ pub fn dim_alpha(dark_theme: bool) -> u8 {
 }
 
 pub fn dim_rects(target: Option<Rect>, screen: Rect) -> Vec<Rect> {
-    let Some(t) = target.map(|t| t.intersect(screen)).filter(|t| t.is_positive()) else {
+    let Some(t) = target
+        .map(|t| t.intersect(screen))
+        .filter(|t| t.is_positive())
+    else {
         return vec![screen];
     };
     let mut out = Vec::with_capacity(4);
@@ -1058,7 +1061,13 @@ impl Tutorial {
 
     /// 暗幕。`interactable` な Area ではなく素の painter なので、背面のクリックは
     /// そのまま通る (= ツアー中でもアプリを触れる)。
-    fn paint_dim(&self, ctx: &egui::Context, theme: &crate::theme::Theme, target: Option<Rect>, screen: Rect) {
+    fn paint_dim(
+        &self,
+        ctx: &egui::Context,
+        theme: &crate::theme::Theme,
+        target: Option<Rect>,
+        screen: Rect,
+    ) {
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             Id::new("zv-tutorial-dim"),
@@ -1504,7 +1513,10 @@ mod tests {
         for (name, t) in targets {
             let p = place_callout(Some(t), screen, card);
             assert!(inside(p.rect, screen), "{name}: 画面外へ出た {:?}", p.rect);
-            assert!(p.rect.width() > 0.0 && p.rect.height() > 0.0, "{name}: 潰れた");
+            assert!(
+                p.rect.width() > 0.0 && p.rect.height() > 0.0,
+                "{name}: 潰れた"
+            );
         }
     }
 
@@ -1612,7 +1624,10 @@ mod tests {
     fn dim_rects_handle_edge_targets() {
         let screen = rect(0.0, 0.0, 1000.0, 600.0);
         // 左上に密着 → 上と左の帯が消えて 2 枚
-        assert_eq!(dim_rects(Some(rect(0.0, 0.0, 200.0, 100.0)), screen).len(), 2);
+        assert_eq!(
+            dim_rects(Some(rect(0.0, 0.0, 200.0, 100.0)), screen).len(),
+            2
+        );
         // 全画面の対象 → 暗幕なし
         assert!(dim_rects(Some(screen), screen).is_empty());
         // 画面外の対象 → 全面 1 枚
@@ -1630,7 +1645,10 @@ mod tests {
         assert!(!m.observe(0.0, false), "いきなり自動送りしてはいけない");
         assert!(m.waiting());
         assert!(!m.observe(MISSING_ANCHOR_TIMEOUT - 0.1, false));
-        assert!(m.observe(MISSING_ANCHOR_TIMEOUT, false), "時間切れで進むはず");
+        assert!(
+            m.observe(MISSING_ANCHOR_TIMEOUT, false),
+            "時間切れで進むはず"
+        );
     }
 
     #[test]
@@ -1651,7 +1669,10 @@ mod tests {
         m.observe(0.0, false);
         m.reset();
         assert!(!m.waiting());
-        assert!(!m.observe(MISSING_ANCHOR_TIMEOUT, false), "reset 後は数え直し");
+        assert!(
+            !m.observe(MISSING_ANCHOR_TIMEOUT, false),
+            "reset 後は数え直し"
+        );
     }
 
     // ── 永続化 ──

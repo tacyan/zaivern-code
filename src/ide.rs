@@ -544,10 +544,7 @@ pub fn folder_url_for(spec: &IdeSpec, dir: &Path) -> Option<String> {
     let scheme = spec.url_scheme?;
     let abs = path_string(&absolutize(dir));
     let trimmed = abs.strip_prefix('/').unwrap_or(&abs);
-    Some(format!(
-        "{scheme}://file/{}",
-        percent_encode_path(trimmed)
-    ))
+    Some(format!("{scheme}://file/{}", percent_encode_path(trimmed)))
 }
 
 /// 検出結果 1 件。
@@ -867,18 +864,28 @@ mod tests {
     #[test]
     fn goto_colon_vscode_family() {
         let args = build_open_file_args(spec("vscode"), &p("/tmp/a.rs"), 42, 5);
-        assert_eq!(args, vec!["-g".to_string(), format!("{}:42:5", ps("/tmp/a.rs"))]);
+        assert_eq!(
+            args,
+            vec!["-g".to_string(), format!("{}:42:5", ps("/tmp/a.rs"))]
+        );
         // フォークも同じ形
         for key in ["cursor", "trae", "kiro", "vscode-insiders"] {
             let a = build_open_file_args(spec(key), &p("/tmp/a.rs"), 7, 3);
-            assert_eq!(a, vec!["-g".to_string(), format!("{}:7:3", ps("/tmp/a.rs"))], "{key}");
+            assert_eq!(
+                a,
+                vec!["-g".to_string(), format!("{}:7:3", ps("/tmp/a.rs"))],
+                "{key}"
+            );
         }
     }
 
     #[test]
     fn goto_space_colon_windsurf() {
         let args = build_open_file_args(spec("windsurf"), &p("/tmp/a.rs"), 10, 2);
-        assert_eq!(args, vec!["--goto".to_string(), format!("{}:10:2", ps("/tmp/a.rs"))]);
+        assert_eq!(
+            args,
+            vec!["--goto".to_string(), format!("{}:10:2", ps("/tmp/a.rs"))]
+        );
     }
 
     #[test]
@@ -944,30 +951,49 @@ mod tests {
     #[test]
     fn line_only_android_studio() {
         let args = build_open_file_args(spec("android-studio"), &p("/src/Main.kt"), 8, 2);
-        assert_eq!(args, vec!["--line".to_string(), "8".to_string(), ps("/src/Main.kt")]);
+        assert_eq!(
+            args,
+            vec!["--line".to_string(), "8".to_string(), ps("/src/Main.kt")]
+        );
     }
 
     #[test]
     fn plus_line_neovide_has_separator_and_no_column() {
         let args = build_open_file_args(spec("neovide"), &p("/tmp/a.rs"), 33, 7);
-        assert_eq!(args, vec!["--".to_string(), "+33".to_string(), ps("/tmp/a.rs")]);
+        assert_eq!(
+            args,
+            vec!["--".to_string(), "+33".to_string(), ps("/tmp/a.rs")]
+        );
     }
 
     #[test]
     fn plus_line_col_emacs() {
         let args = build_open_file_args(spec("emacs"), &p("/tmp/a.rs"), 33, 7);
-        assert_eq!(args, vec!["-c".to_string(), "+33:7".to_string(), ps("/tmp/a.rs")]);
+        assert_eq!(
+            args,
+            vec!["-c".to_string(), "+33:7".to_string(), ps("/tmp/a.rs")]
+        );
     }
 
     #[test]
     fn path_with_spaces_stays_one_argv_element() {
         let path = p("/Users/me/My Projects/hello world.rs");
         let args = build_open_file_args(spec("cursor"), &path, 3, 4);
-        assert_eq!(args.len(), 2, "クォート不要: シェルを経由しないので 1 要素のまま");
-        assert_eq!(args[1], format!("{}:3:4", ps("/Users/me/My Projects/hello world.rs")));
+        assert_eq!(
+            args.len(),
+            2,
+            "クォート不要: シェルを経由しないので 1 要素のまま"
+        );
+        assert_eq!(
+            args[1],
+            format!("{}:3:4", ps("/Users/me/My Projects/hello world.rs"))
+        );
 
         let jb = build_open_file_args(spec("intellij"), &path, 3, 4);
-        assert_eq!(jb.last().unwrap(), &ps("/Users/me/My Projects/hello world.rs"));
+        assert_eq!(
+            jb.last().unwrap(),
+            &ps("/Users/me/My Projects/hello world.rs")
+        );
 
         let folder = build_open_folder_args(spec("zed"), &p("/Users/me/My Projects"), false);
         assert_eq!(folder, vec![ps("/Users/me/My Projects")]);
@@ -977,7 +1003,10 @@ mod tests {
     fn zero_based_input_is_clamped_to_one() {
         // 契約は 1 始まり。0 は呼び出し側のバグだが 1 に丸めて事故を防ぐ。
         let args = build_open_file_args(spec("cursor"), &p("/tmp/a.rs"), 0, 0);
-        assert_eq!(args, vec!["-g".to_string(), format!("{}:1:1", ps("/tmp/a.rs"))]);
+        assert_eq!(
+            args,
+            vec!["-g".to_string(), format!("{}:1:1", ps("/tmp/a.rs"))]
+        );
         let jb = build_open_file_args(spec("intellij"), &p("/tmp/a.rs"), 0, 0);
         assert_eq!(
             jb,
@@ -1115,6 +1144,9 @@ mod tests {
     #[test]
     fn unknown_path_is_inconclusive_not_a_rejection() {
         // Linux の素朴な配置などでマーカーが当たらない場合は --version へ回す。
-        assert_eq!(identify_by_path(spec("fleet"), "/opt/custom/bin/myeditor"), None);
+        assert_eq!(
+            identify_by_path(spec("fleet"), "/opt/custom/bin/myeditor"),
+            None
+        );
     }
 }

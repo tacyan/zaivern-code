@@ -34,7 +34,6 @@
 //! timeout_secs = 30            # 暴走防止 (1〜600)
 //! ```
 
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -367,7 +366,7 @@ pub struct Plugin {
     pub settings: Vec<PluginSetting>,
     /// 設定の現在値 (既定値で初期化し、apply_settings で上書き)。
     pub setting_values: HashMap<String, String>,
-    pub themes: Vec<(String, PathBuf)>,        // (label, json path)
+    pub themes: Vec<(String, PathBuf)>, // (label, json path)
     pub snippet_files: Vec<(String, PathBuf)>, // (language, path)
     /// UI 言語パック (`[language]`)。有効なプラグインのものが i18n へ入る。
     pub language: Option<PluginLanguage>,
@@ -493,7 +492,9 @@ impl PluginList for [Plugin] {
 
     fn apply_disabled(&mut self, disabled: &[String]) {
         for p in self.iter_mut() {
-            p.enabled = !disabled.iter().any(|d| d.trim().eq_ignore_ascii_case(&p.name));
+            p.enabled = !disabled
+                .iter()
+                .any(|d| d.trim().eq_ignore_ascii_case(&p.name));
         }
     }
 
@@ -1039,7 +1040,9 @@ fn check_panel_ref(
         return Ok(if id.is_empty() { None } else { Some(id) });
     }
     if id.is_empty() {
-        return Err(format!("{what}: output = \"panel\" には panel の指定が必要です"));
+        return Err(format!(
+            "{what}: output = \"panel\" には panel の指定が必要です"
+        ));
     }
     if !panels.iter().any(|p| p.id == id) {
         return Err(format!(
@@ -1062,7 +1065,11 @@ pub fn slug(title: &str) -> String {
     }
     let s = out.trim_matches('-').to_string();
     if s.len() > 64 {
-        s.chars().take(64).collect::<String>().trim_matches('-').to_string()
+        s.chars()
+            .take(64)
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
     } else {
         s
     }
@@ -1140,18 +1147,48 @@ impl NotifyLevel {
 /// `output = "actions"` のとき stdout の 1 行が 1 つのこれになる。
 #[derive(Clone, PartialEq, Debug)]
 pub enum PluginAction {
-    OpenFile { path: String, line: Option<u32> },
-    Notify { message: String, level: NotifyLevel },
-    InsertText { text: String },
-    ReplaceBuffer { text: String },
-    NewTab { title: String, text: String },
-    AgentPrompt { agent: Option<String>, text: String, submit: bool },
-    RunTerminal { command: String, cwd: Option<String> },
-    OpenUrl { url: String },
-    SetPanel { panel: String, text: String },
-    SetStatus { text: String },
+    OpenFile {
+        path: String,
+        line: Option<u32>,
+    },
+    Notify {
+        message: String,
+        level: NotifyLevel,
+    },
+    InsertText {
+        text: String,
+    },
+    ReplaceBuffer {
+        text: String,
+    },
+    NewTab {
+        title: String,
+        text: String,
+    },
+    AgentPrompt {
+        agent: Option<String>,
+        text: String,
+        submit: bool,
+    },
+    RunTerminal {
+        command: String,
+        cwd: Option<String>,
+    },
+    OpenUrl {
+        url: String,
+    },
+    SetPanel {
+        panel: String,
+        text: String,
+    },
+    SetStatus {
+        text: String,
+    },
     RefreshFiles,
-    SetSetting { key: String, value: String },
+    SetSetting {
+        key: String,
+        value: String,
+    },
 }
 
 /// stdout を JSON Lines として解釈する。
@@ -1184,7 +1221,9 @@ fn parse_action_line(line: &str) -> Option<PluginAction> {
         "insert_text" => PluginAction::InsertText { text: s("text")? },
         "replace_buffer" => PluginAction::ReplaceBuffer { text: s("text")? },
         "new_tab" => PluginAction::NewTab {
-            title: s("title").filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "結果".into()),
+            title: s("title")
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "結果".into()),
             text: s("text").unwrap_or_default(),
         },
         "agent_prompt" => PluginAction::AgentPrompt {
@@ -1259,7 +1298,9 @@ pub fn command_env(plugin: &Plugin, ctx: &EnvContext) -> Vec<(String, String)> {
     // 既存 (v1) — 意味も名前も変えない
     push(
         "ZV_FILE",
-        ctx.file.map(|p| p.display().to_string()).unwrap_or_default(),
+        ctx.file
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
     );
     push("ZV_LANG", ctx.lang.to_string());
     push("ZV_WORKSPACE", ctx.workspace.display().to_string());
@@ -1285,7 +1326,9 @@ pub fn command_env(plugin: &Plugin, ctx: &EnvContext) -> Vec<(String, String)> {
     push("ZV_AGENT", ctx.agent.to_string());
     push(
         "ZV_EVENT",
-        ctx.event.map(|e| e.as_str().to_string()).unwrap_or_default(),
+        ctx.event
+            .map(|e| e.as_str().to_string())
+            .unwrap_or_default(),
     );
     push("ZV_GIT_BRANCH", ctx.git_branch.to_string());
 
@@ -1318,116 +1361,323 @@ const BUNDLED: &[(&str, &[(&str, &str)])] = &[
     (
         "agent-compare",
         &[
-            ("compare.sh", include_str!("../assets/plugins/agent-compare/compare.sh")),
-            ("lib.sh", include_str!("../assets/plugins/agent-compare/lib.sh")),
-            ("pick.sh", include_str!("../assets/plugins/agent-compare/pick.sh")),
-            ("plugin.toml", include_str!("../assets/plugins/agent-compare/plugin.toml")),
+            (
+                "compare.sh",
+                include_str!("../assets/plugins/agent-compare/compare.sh"),
+            ),
+            (
+                "lib.sh",
+                include_str!("../assets/plugins/agent-compare/lib.sh"),
+            ),
+            (
+                "pick.sh",
+                include_str!("../assets/plugins/agent-compare/pick.sh"),
+            ),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/agent-compare/plugin.toml"),
+            ),
         ],
     ),
     (
         "diff-review",
         &[
-            ("clear.sh", include_str!("../assets/plugins/diff-review/clear.sh")),
-            ("comment.sh", include_str!("../assets/plugins/diff-review/comment.sh")),
-            ("lib.sh", include_str!("../assets/plugins/diff-review/lib.sh")),
-            ("pending.sh", include_str!("../assets/plugins/diff-review/pending.sh")),
-            ("plugin.toml", include_str!("../assets/plugins/diff-review/plugin.toml")),
-            ("review.sh", include_str!("../assets/plugins/diff-review/review.sh")),
-            ("send.sh", include_str!("../assets/plugins/diff-review/send.sh")),
+            (
+                "clear.sh",
+                include_str!("../assets/plugins/diff-review/clear.sh"),
+            ),
+            (
+                "comment.sh",
+                include_str!("../assets/plugins/diff-review/comment.sh"),
+            ),
+            (
+                "lib.sh",
+                include_str!("../assets/plugins/diff-review/lib.sh"),
+            ),
+            (
+                "pending.sh",
+                include_str!("../assets/plugins/diff-review/pending.sh"),
+            ),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/diff-review/plugin.toml"),
+            ),
+            (
+                "review.sh",
+                include_str!("../assets/plugins/diff-review/review.sh"),
+            ),
+            (
+                "send.sh",
+                include_str!("../assets/plugins/diff-review/send.sh"),
+            ),
         ],
     ),
     (
         "element-capture",
         &[
-            ("plugin.toml", include_str!("../assets/plugins/element-capture/plugin.toml")),
-            ("scripts/build-prompt.py", include_str!("../assets/plugins/element-capture/scripts/build-prompt.py")),
-            ("scripts/capture-common.sh", include_str!("../assets/plugins/element-capture/scripts/capture-common.sh")),
-            ("scripts/common.sh", include_str!("../assets/plugins/element-capture/scripts/common.sh")),
-            ("scripts/find-browser.applescript", include_str!("../assets/plugins/element-capture/scripts/find-browser.applescript")),
-            ("scripts/paste.sh", include_str!("../assets/plugins/element-capture/scripts/paste.sh")),
-            ("scripts/pick.sh", include_str!("../assets/plugins/element-capture/scripts/pick.sh")),
-            ("scripts/picker.js", include_str!("../assets/plugins/element-capture/scripts/picker.js")),
-            ("scripts/poll.js", include_str!("../assets/plugins/element-capture/scripts/poll.js")),
-            ("scripts/region.sh", include_str!("../assets/plugins/element-capture/scripts/region.sh")),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/element-capture/plugin.toml"),
+            ),
+            (
+                "scripts/build-prompt.py",
+                include_str!("../assets/plugins/element-capture/scripts/build-prompt.py"),
+            ),
+            (
+                "scripts/capture-common.sh",
+                include_str!("../assets/plugins/element-capture/scripts/capture-common.sh"),
+            ),
+            (
+                "scripts/common.sh",
+                include_str!("../assets/plugins/element-capture/scripts/common.sh"),
+            ),
+            (
+                "scripts/find-browser.applescript",
+                include_str!("../assets/plugins/element-capture/scripts/find-browser.applescript"),
+            ),
+            (
+                "scripts/paste.sh",
+                include_str!("../assets/plugins/element-capture/scripts/paste.sh"),
+            ),
+            (
+                "scripts/pick.sh",
+                include_str!("../assets/plugins/element-capture/scripts/pick.sh"),
+            ),
+            (
+                "scripts/picker.js",
+                include_str!("../assets/plugins/element-capture/scripts/picker.js"),
+            ),
+            (
+                "scripts/poll.js",
+                include_str!("../assets/plugins/element-capture/scripts/poll.js"),
+            ),
+            (
+                "scripts/region.sh",
+                include_str!("../assets/plugins/element-capture/scripts/region.sh"),
+            ),
         ],
     ),
     (
         "english-mode",
         &[
-            ("lang/10-common.toml", include_str!("../assets/plugins/english-mode/lang/10-common.toml")),
-            ("lang/20-app.toml", include_str!("../assets/plugins/english-mode/lang/20-app.toml")),
-            ("lang/30-cockpit.toml", include_str!("../assets/plugins/english-mode/lang/30-cockpit.toml")),
-            ("lang/40-panels.toml", include_str!("../assets/plugins/english-mode/lang/40-panels.toml")),
-            ("lang/50-editor.toml", include_str!("../assets/plugins/english-mode/lang/50-editor.toml")),
-            ("lang/60-menubar.toml", include_str!("../assets/plugins/english-mode/lang/60-menubar.toml")),
-            ("lang/70-kanban.toml", include_str!("../assets/plugins/english-mode/lang/70-kanban.toml")),
-            ("lang/80-deck.toml", include_str!("../assets/plugins/english-mode/lang/80-deck.toml")),
-            ("lang/80-tunnel.toml", include_str!("../assets/plugins/english-mode/lang/80-tunnel.toml")),
-            ("lang/90-license.toml", include_str!("../assets/plugins/english-mode/lang/90-license.toml")),
-            ("lang/90-mcp.toml", include_str!("../assets/plugins/english-mode/lang/90-mcp.toml")),
-            ("plugin.toml", include_str!("../assets/plugins/english-mode/plugin.toml")),
+            (
+                "lang/10-common.toml",
+                include_str!("../assets/plugins/english-mode/lang/10-common.toml"),
+            ),
+            (
+                "lang/20-app.toml",
+                include_str!("../assets/plugins/english-mode/lang/20-app.toml"),
+            ),
+            (
+                "lang/30-cockpit.toml",
+                include_str!("../assets/plugins/english-mode/lang/30-cockpit.toml"),
+            ),
+            (
+                "lang/40-panels.toml",
+                include_str!("../assets/plugins/english-mode/lang/40-panels.toml"),
+            ),
+            (
+                "lang/50-editor.toml",
+                include_str!("../assets/plugins/english-mode/lang/50-editor.toml"),
+            ),
+            (
+                "lang/60-menubar.toml",
+                include_str!("../assets/plugins/english-mode/lang/60-menubar.toml"),
+            ),
+            (
+                "lang/70-kanban.toml",
+                include_str!("../assets/plugins/english-mode/lang/70-kanban.toml"),
+            ),
+            (
+                "lang/80-deck.toml",
+                include_str!("../assets/plugins/english-mode/lang/80-deck.toml"),
+            ),
+            (
+                "lang/80-tunnel.toml",
+                include_str!("../assets/plugins/english-mode/lang/80-tunnel.toml"),
+            ),
+            (
+                "lang/90-license.toml",
+                include_str!("../assets/plugins/english-mode/lang/90-license.toml"),
+            ),
+            (
+                "lang/90-mcp.toml",
+                include_str!("../assets/plugins/english-mode/lang/90-mcp.toml"),
+            ),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/english-mode/plugin.toml"),
+            ),
         ],
     ),
     (
         "quick-actions",
         &[
-            ("plugin.toml", include_str!("../assets/plugins/quick-actions/plugin.toml")),
-            ("scripts/common.sh", include_str!("../assets/plugins/quick-actions/scripts/common.sh")),
-            ("scripts/detect.sh", include_str!("../assets/plugins/quick-actions/scripts/detect.sh")),
-            ("scripts/panel.sh", include_str!("../assets/plugins/quick-actions/scripts/panel.sh")),
-            ("scripts/render.sh", include_str!("../assets/plugins/quick-actions/scripts/render.sh")),
-            ("scripts/run.sh", include_str!("../assets/plugins/quick-actions/scripts/run.sh")),
-            ("scripts/startup.sh", include_str!("../assets/plugins/quick-actions/scripts/startup.sh")),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/quick-actions/plugin.toml"),
+            ),
+            (
+                "scripts/common.sh",
+                include_str!("../assets/plugins/quick-actions/scripts/common.sh"),
+            ),
+            (
+                "scripts/detect.sh",
+                include_str!("../assets/plugins/quick-actions/scripts/detect.sh"),
+            ),
+            (
+                "scripts/panel.sh",
+                include_str!("../assets/plugins/quick-actions/scripts/panel.sh"),
+            ),
+            (
+                "scripts/render.sh",
+                include_str!("../assets/plugins/quick-actions/scripts/render.sh"),
+            ),
+            (
+                "scripts/run.sh",
+                include_str!("../assets/plugins/quick-actions/scripts/run.sh"),
+            ),
+            (
+                "scripts/startup.sh",
+                include_str!("../assets/plugins/quick-actions/scripts/startup.sh"),
+            ),
         ],
     ),
     (
         "remote-host",
         &[
-            ("agent.sh", include_str!("../assets/plugins/remote-host/agent.sh")),
-            ("exec.sh", include_str!("../assets/plugins/remote-host/exec.sh")),
-            ("lib.sh", include_str!("../assets/plugins/remote-host/lib.sh")),
-            ("plugin.toml", include_str!("../assets/plugins/remote-host/plugin.toml")),
-            ("pull.sh", include_str!("../assets/plugins/remote-host/pull.sh")),
-            ("push.sh", include_str!("../assets/plugins/remote-host/push.sh")),
-            ("remote.sh", include_str!("../assets/plugins/remote-host/remote.sh")),
-            ("worktree.sh", include_str!("../assets/plugins/remote-host/worktree.sh")),
+            (
+                "agent.sh",
+                include_str!("../assets/plugins/remote-host/agent.sh"),
+            ),
+            (
+                "exec.sh",
+                include_str!("../assets/plugins/remote-host/exec.sh"),
+            ),
+            (
+                "lib.sh",
+                include_str!("../assets/plugins/remote-host/lib.sh"),
+            ),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/remote-host/plugin.toml"),
+            ),
+            (
+                "pull.sh",
+                include_str!("../assets/plugins/remote-host/pull.sh"),
+            ),
+            (
+                "push.sh",
+                include_str!("../assets/plugins/remote-host/push.sh"),
+            ),
+            (
+                "remote.sh",
+                include_str!("../assets/plugins/remote-host/remote.sh"),
+            ),
+            (
+                "worktree.sh",
+                include_str!("../assets/plugins/remote-host/worktree.sh"),
+            ),
         ],
     ),
     (
         "tasks",
         &[
-            ("plugin.toml", include_str!("../assets/plugins/tasks/plugin.toml")),
-            ("scripts/common.sh", include_str!("../assets/plugins/tasks/scripts/common.sh")),
-            ("scripts/gh-common.sh", include_str!("../assets/plugins/tasks/scripts/gh-common.sh")),
-            ("scripts/issue-branch.sh", include_str!("../assets/plugins/tasks/scripts/issue-branch.sh")),
-            ("scripts/issue-list.sh", include_str!("../assets/plugins/tasks/scripts/issue-list.sh")),
-            ("scripts/panel.sh", include_str!("../assets/plugins/tasks/scripts/panel.sh")),
-            ("scripts/pr-diff.sh", include_str!("../assets/plugins/tasks/scripts/pr-diff.sh")),
-            ("scripts/pr-list.sh", include_str!("../assets/plugins/tasks/scripts/pr-list.sh")),
-            ("scripts/pr-review.sh", include_str!("../assets/plugins/tasks/scripts/pr-review.sh")),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/tasks/plugin.toml"),
+            ),
+            (
+                "scripts/common.sh",
+                include_str!("../assets/plugins/tasks/scripts/common.sh"),
+            ),
+            (
+                "scripts/gh-common.sh",
+                include_str!("../assets/plugins/tasks/scripts/gh-common.sh"),
+            ),
+            (
+                "scripts/issue-branch.sh",
+                include_str!("../assets/plugins/tasks/scripts/issue-branch.sh"),
+            ),
+            (
+                "scripts/issue-list.sh",
+                include_str!("../assets/plugins/tasks/scripts/issue-list.sh"),
+            ),
+            (
+                "scripts/panel.sh",
+                include_str!("../assets/plugins/tasks/scripts/panel.sh"),
+            ),
+            (
+                "scripts/pr-diff.sh",
+                include_str!("../assets/plugins/tasks/scripts/pr-diff.sh"),
+            ),
+            (
+                "scripts/pr-list.sh",
+                include_str!("../assets/plugins/tasks/scripts/pr-list.sh"),
+            ),
+            (
+                "scripts/pr-review.sh",
+                include_str!("../assets/plugins/tasks/scripts/pr-review.sh"),
+            ),
         ],
     ),
     (
         "usage-meter",
         &[
-            ("plugin.toml", include_str!("../assets/plugins/usage-meter/plugin.toml")),
-            ("scripts/common.sh", include_str!("../assets/plugins/usage-meter/scripts/common.sh")),
-            ("scripts/panel.sh", include_str!("../assets/plugins/usage-meter/scripts/panel.sh")),
-            ("scripts/refresh.sh", include_str!("../assets/plugins/usage-meter/scripts/refresh.sh")),
-            ("scripts/report.sh", include_str!("../assets/plugins/usage-meter/scripts/report.sh")),
-            ("scripts/scan.py", include_str!("../assets/plugins/usage-meter/scripts/scan.py")),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/usage-meter/plugin.toml"),
+            ),
+            (
+                "scripts/common.sh",
+                include_str!("../assets/plugins/usage-meter/scripts/common.sh"),
+            ),
+            (
+                "scripts/panel.sh",
+                include_str!("../assets/plugins/usage-meter/scripts/panel.sh"),
+            ),
+            (
+                "scripts/refresh.sh",
+                include_str!("../assets/plugins/usage-meter/scripts/refresh.sh"),
+            ),
+            (
+                "scripts/report.sh",
+                include_str!("../assets/plugins/usage-meter/scripts/report.sh"),
+            ),
+            (
+                "scripts/scan.py",
+                include_str!("../assets/plugins/usage-meter/scripts/scan.py"),
+            ),
         ],
     ),
     (
         "worktrees",
         &[
-            ("create.sh", include_str!("../assets/plugins/worktrees/create.sh")),
+            (
+                "create.sh",
+                include_str!("../assets/plugins/worktrees/create.sh"),
+            ),
             ("lib.sh", include_str!("../assets/plugins/worktrees/lib.sh")),
-            ("list.sh", include_str!("../assets/plugins/worktrees/list.sh")),
-            ("merge.sh", include_str!("../assets/plugins/worktrees/merge.sh")),
-            ("parallel.sh", include_str!("../assets/plugins/worktrees/parallel.sh")),
-            ("plugin.toml", include_str!("../assets/plugins/worktrees/plugin.toml")),
-            ("remove.sh", include_str!("../assets/plugins/worktrees/remove.sh")),
+            (
+                "list.sh",
+                include_str!("../assets/plugins/worktrees/list.sh"),
+            ),
+            (
+                "merge.sh",
+                include_str!("../assets/plugins/worktrees/merge.sh"),
+            ),
+            (
+                "parallel.sh",
+                include_str!("../assets/plugins/worktrees/parallel.sh"),
+            ),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/worktrees/plugin.toml"),
+            ),
+            (
+                "remove.sh",
+                include_str!("../assets/plugins/worktrees/remove.sh"),
+            ),
         ],
     ),
 ];
@@ -1715,7 +1965,8 @@ pub fn install(src: &Path) -> Result<Plugin, String> {
 }
 
 fn install_at(root: &Path, src: &Path) -> Result<Plugin, String> {
-    std::fs::create_dir_all(root).map_err(|e| format!("{} を作成できません: {e}", root.display()))?;
+    std::fs::create_dir_all(root)
+        .map_err(|e| format!("{} を作成できません: {e}", root.display()))?;
 
     if src.is_dir() {
         let manifest = parse_manifest(src)?;
@@ -1857,13 +2108,17 @@ fn uninstall_at(root: &Path, plugin_dir: &Path) -> Result<(), String> {
         ));
     }
     if !canon_dir.is_dir() {
-        return Err(format!("{} はディレクトリではありません", plugin_dir.display()));
+        return Err(format!(
+            "{} はディレクトリではありません",
+            plugin_dir.display()
+        ));
     }
     std::fs::remove_dir_all(&canon_dir).map_err(|e| format!("削除に失敗: {e}"))
 }
 
 fn copy_dir(src: &Path, dest: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dest).map_err(|e| format!("{} を作成できません: {e}", dest.display()))?;
+    std::fs::create_dir_all(dest)
+        .map_err(|e| format!("{} を作成できません: {e}", dest.display()))?;
     let rd = std::fs::read_dir(src).map_err(|e| format!("{} を読めません: {e}", src.display()))?;
     for e in rd.flatten() {
         let from = e.path();
@@ -1974,7 +2229,9 @@ pub fn run_async(req: RunRequest, tx: Sender<RunOutcome>, ctx: egui::Context) {
 
 fn run_blocking(req: &RunRequest) -> RunOutcome {
     // シェルの選び方は OS で違う (Windows に `$SHELL` は無い) ので shellenv に任せる。
-    let shell = crate::shellenv::shell_program().to_string_lossy().into_owned();
+    let shell = crate::shellenv::shell_program()
+        .to_string_lossy()
+        .into_owned();
     let fail = |msg: String| RunOutcome {
         plugin: req.plugin.clone(),
         command_id: req.command.id.clone(),
@@ -2050,12 +2307,8 @@ fn run_blocking(req: &RunRequest) -> RunOutcome {
         }
     };
 
-    let stdout = out_reader
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-    let stderr = err_reader
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
+    let stdout = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
 
     match status {
         Ok(st) => RunOutcome {
@@ -2087,9 +2340,7 @@ fn run_blocking(req: &RunRequest) -> RunOutcome {
     }
 }
 
-fn spawn_reader<R: std::io::Read + Send + 'static>(
-    mut r: R,
-) -> std::thread::JoinHandle<String> {
+fn spawn_reader<R: std::io::Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = r.read_to_end(&mut buf);
@@ -2350,7 +2601,9 @@ input = "clipboard"
         // エクスポート → zip インストール
         let exported = export(&p, &stage).expect("export ok");
         assert!(exported.is_file());
-        assert!(exported.to_string_lossy().ends_with("roundtrip-0.1.0.zvplug"));
+        assert!(exported
+            .to_string_lossy()
+            .ends_with("roundtrip-0.1.0.zvplug"));
         uninstall_at(&root, &p.dir).expect("uninstall ok");
         assert!(!p.dir.exists());
         let p2 = install_at(&root, &exported).expect("zip install ok");
@@ -2633,7 +2886,9 @@ default = true
         assert!(parse_manifest(&d).unwrap_err().contains("type"));
 
         // パネルID の重複 / 不正
-        write(&format!("{head}[[panel]]\nid = \"a\"\n[[panel]]\nid = \"a\"\n"));
+        write(&format!(
+            "{head}[[panel]]\nid = \"a\"\n[[panel]]\nid = \"a\"\n"
+        ));
         assert!(parse_manifest(&d).unwrap_err().contains("重複"));
         write(&format!("{head}[[panel]]\nid = \"タスク\"\n"));
         assert!(parse_manifest(&d).unwrap_err().contains("id"));
@@ -2642,7 +2897,11 @@ default = true
         let root = temp_dir("v2bad-root");
         let inner = root.join("bad");
         std::fs::create_dir_all(&inner).unwrap();
-        std::fs::write(inner.join("plugin.toml"), "[plugin]\nname = \"bad\"\napi = 99\n").unwrap();
+        std::fs::write(
+            inner.join("plugin.toml"),
+            "[plugin]\nname = \"bad\"\napi = 99\n",
+        )
+        .unwrap();
         let list = scan_root(&root);
         assert_eq!(list.len(), 1);
         assert!(list[0].error.as_deref().unwrap_or_default().contains("api"));
@@ -2714,16 +2973,39 @@ run = "c"
         assert_eq!(a.len(), 14);
         assert_eq!(
             a[0],
-            PluginAction::OpenFile { path: "src/main.rs".into(), line: Some(42) }
+            PluginAction::OpenFile {
+                path: "src/main.rs".into(),
+                line: Some(42)
+            }
         );
         assert_eq!(
             a[1],
-            PluginAction::Notify { message: "完了".into(), level: NotifyLevel::Warn }
+            PluginAction::Notify {
+                message: "完了".into(),
+                level: NotifyLevel::Warn
+            }
         );
-        assert!(matches!(&a[2], PluginAction::Notify { level: NotifyLevel::Info, .. }));
+        assert!(matches!(
+            &a[2],
+            PluginAction::Notify {
+                level: NotifyLevel::Info,
+                ..
+            }
+        ));
         assert_eq!(a[3], PluginAction::InsertText { text: "abc".into() });
-        assert_eq!(a[4], PluginAction::ReplaceBuffer { text: "whole".into() });
-        assert_eq!(a[5], PluginAction::NewTab { title: "結果".into(), text: "body".into() });
+        assert_eq!(
+            a[4],
+            PluginAction::ReplaceBuffer {
+                text: "whole".into()
+            }
+        );
+        assert_eq!(
+            a[5],
+            PluginAction::NewTab {
+                title: "結果".into(),
+                text: "body".into()
+            }
+        );
         assert_eq!(
             a[6],
             PluginAction::AgentPrompt {
@@ -2734,37 +3016,58 @@ run = "c"
         );
         assert_eq!(
             a[7],
-            PluginAction::AgentPrompt { agent: None, text: "送信しない".into(), submit: false },
+            PluginAction::AgentPrompt {
+                agent: None,
+                text: "送信しない".into(),
+                submit: false
+            },
             "submit の既定は false"
         );
         assert_eq!(
             a[8],
-            PluginAction::RunTerminal { command: "cargo test".into(), cwd: Some(".".into()) }
+            PluginAction::RunTerminal {
+                command: "cargo test".into(),
+                cwd: Some(".".into())
+            }
         );
-        assert_eq!(a[9], PluginAction::OpenUrl { url: "https://example.com".into() });
+        assert_eq!(
+            a[9],
+            PluginAction::OpenUrl {
+                url: "https://example.com".into()
+            }
+        );
         assert_eq!(
             a[10],
-            PluginAction::SetPanel { panel: "tasks".into(), text: "t".into() },
+            PluginAction::SetPanel {
+                panel: "tasks".into(),
+                text: "t".into()
+            },
             "パネルIDは小文字化される"
         );
         assert_eq!(a[11], PluginAction::SetStatus { text: "s".into() });
         assert_eq!(a[12], PluginAction::RefreshFiles);
-        assert_eq!(a[13], PluginAction::SetSetting { key: "token".into(), value: "xxx".into() });
+        assert_eq!(
+            a[13],
+            PluginAction::SetSetting {
+                key: "token".into(),
+                value: "xxx".into()
+            }
+        );
     }
 
     #[test]
     fn parse_actions_skips_malformed_lines() {
         let out = concat!(
             "これはJSONではない\n",
-            "{\"action\":\"open_file\"}\n",            // path 欠落
-            "{\"action\":\"unknown_thing\"}\n",        // 未知アクション
+            "{\"action\":\"open_file\"}\n",     // path 欠落
+            "{\"action\":\"unknown_thing\"}\n", // 未知アクション
             "{\"message\":\"action キーが無い\"}\n",
             "{broken json\n",
-            "[1,2,3]\n",                                // オブジェクトでない
+            "[1,2,3]\n", // オブジェクトでない
             "\n",
             "   \n",
             "{\"action\":\"set_status\",\"text\":\"ok\"}\n",
-            "{\"action\":\"run_terminal\"}\n",         // command 欠落
+            "{\"action\":\"run_terminal\"}\n", // command 欠落
         );
         let a = parse_actions(out);
         assert_eq!(a, vec![PluginAction::SetStatus { text: "ok".into() }]);
@@ -2955,12 +3258,18 @@ run = "c"
         let v1 = bundle("1.0.0");
         assert_eq!(seed(&root, &v1), vec!["std-demo".to_string()]);
         assert!(dir.join("plugin.toml").is_file());
-        assert_eq!(std::fs::read_to_string(dir.join(".bundled")).unwrap(), "1.0.0");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".bundled")).unwrap(),
+            "1.0.0"
+        );
         assert!(parse_manifest(&dir).is_ok(), "展開物がそのまま解析できる");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join("run.sh")).unwrap().permissions().mode();
+            let mode = std::fs::metadata(dir.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o111, 0o111, ".sh に実行権限が付く");
         }
 
@@ -2974,13 +3283,21 @@ run = "c"
 
         // 古い版は上書きしない
         assert!(seed(&root, &bundle("0.9.0")).is_empty());
-        assert_eq!(std::fs::read_to_string(dir.join(".bundled")).unwrap(), "1.0.0");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".bundled")).unwrap(),
+            "1.0.0"
+        );
 
         // 新しい版なら再展開
         let v2 = bundle("1.0.1");
         assert_eq!(seed(&root, &v2), vec!["std-demo".to_string()]);
-        assert!(std::fs::read_to_string(dir.join("run.sh")).unwrap().contains("1.0.1"));
-        assert_eq!(std::fs::read_to_string(dir.join(".bundled")).unwrap(), "1.0.1");
+        assert!(std::fs::read_to_string(dir.join("run.sh"))
+            .unwrap()
+            .contains("1.0.1"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".bundled")).unwrap(),
+            "1.0.1"
+        );
 
         // .bundled を消したら再展開される (取り込み漏れの復旧)
         std::fs::remove_file(dir.join(".bundled")).unwrap();
@@ -3071,6 +3388,9 @@ run = "c"
         });
         assert!(!out.ok);
         assert!(out.stderr.contains("タイムアウト"));
-        assert!(started.elapsed() < Duration::from_secs(10), "kill が効いている");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "kill が効いている"
+        );
     }
 }

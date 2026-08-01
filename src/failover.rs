@@ -166,7 +166,8 @@ pub fn confirm_screen(line: &str, hits: u8, output_advanced: bool, min_hits: u8)
 fn strip_pathlike(line: &str) -> String {
     line.split_whitespace()
         .filter(|t| {
-            let t = t.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.');
+            let t =
+                t.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.');
             // 区切り記号を含む = パス。拡張子付きの単独トークンもパス扱いにする。
             if t.contains('/') || t.contains('\\') {
                 return false;
@@ -506,23 +507,17 @@ impl Stage {
                     ("evidence", crate::notify::truncate_chars(evidence, 60)),
                 ],
             ),
-            Stage::Picking { signal } => trf(
-                "②候補選定 — {signal}",
-                &[("signal", signal.label())],
+            Stage::Picking { signal } => trf("②候補選定 — {signal}", &[("signal", signal.label())]),
+            Stage::Switching { to } => trf("③切替 — {to} を起動中", &[("to", to.clone())]),
+            Stage::Resuming { to, .. } => trf(
+                "④再開 — {to} へプロンプトを引き継ぎ中",
+                &[("to", to.clone())],
             ),
-            Stage::Switching { to } => {
-                trf("③切替 — {to} を起動中", &[("to", to.clone())])
-            }
-            Stage::Resuming { to, .. } => {
-                trf("④再開 — {to} へプロンプトを引き継ぎ中", &[("to", to.clone())])
-            }
             Stage::Verifying { to, .. } => {
                 trf("⑤検証 — {to} が進んでいるか確認中", &[("to", to.clone())])
             }
             Stage::Done { to } => trf("✅ 切替完了 — {to}", &[("to", to.clone())]),
-            Stage::GaveUp { reason } => {
-                trf("⏹ 打ち切り — {why}", &[("why", reason.label())])
-            }
+            Stage::GaveUp { reason } => trf("⏹ 打ち切り — {why}", &[("why", reason.label())]),
         }
     }
 }
@@ -781,7 +776,10 @@ impl Failover {
 
     /// このセッションで既に試したプリセット名。
     pub fn tried_for(&self, session: u64) -> &[String] {
-        self.tried.get(&session).map(|v| v.as_slice()).unwrap_or(&[])
+        self.tried
+            .get(&session)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn switches_for(&self, session: u64) -> u8 {
@@ -1057,7 +1055,13 @@ mod tests {
             ("裏取り済み", line, 2, false, true),
             ("1 回だけ = 信じない", line, 1, false, false),
             ("出力が進んでいる = 別の理由", line, 5, true, false),
-            ("上限警告ではない行", "普通のビルド出力です", 5, false, false),
+            (
+                "上限警告ではない行",
+                "普通のビルド出力です",
+                5,
+                false,
+                false,
+            ),
             (
                 "パスらしいトークンだけ",
                 "Read(src/usage_limit_reached.rs)",
@@ -1101,9 +1105,15 @@ mod tests {
     fn account_key_separates_profiles_without_leaking_values() {
         let plain: HashMap<String, String> = HashMap::new();
         let mut work = HashMap::new();
-        work.insert("CLAUDE_CONFIG_DIR".to_string(), "~/.claude-work".to_string());
+        work.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "~/.claude-work".to_string(),
+        );
         let mut secret = HashMap::new();
-        secret.insert("ANTHROPIC_API_KEY".to_string(), "sk-super-secret".to_string());
+        secret.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sk-super-secret".to_string(),
+        );
 
         let a = account_key("claude", &plain);
         let b = account_key("claude", &work);
@@ -1111,7 +1121,10 @@ mod tests {
         assert_eq!(a, "anthropic:default");
         assert_ne!(a, b, "プロファイルを分けたら別の枠");
         assert_ne!(b, c);
-        assert!(!c.contains("sk-super-secret"), "秘密の値を鍵へ載せない: {c}");
+        assert!(
+            !c.contains("sk-super-secret"),
+            "秘密の値を鍵へ載せない: {c}"
+        );
         // 同じ内容なら安定 (毎回同じ鍵になる)。
         assert_eq!(b, account_key("claude", &work));
         // 関係ない環境変数は枠を分けない。
@@ -1126,7 +1139,10 @@ mod tests {
     fn resume_only_when_the_conversation_store_is_the_same() {
         let plain: HashMap<String, String> = HashMap::new();
         let mut work = HashMap::new();
-        work.insert("CLAUDE_CONFIG_DIR".to_string(), "~/.claude-work".to_string());
+        work.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "~/.claude-work".to_string(),
+        );
         let mut key_only = HashMap::new();
         key_only.insert("ANTHROPIC_API_KEY".to_string(), "sk-x".to_string());
 

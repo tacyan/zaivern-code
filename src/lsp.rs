@@ -1001,7 +1001,10 @@ impl LspClient {
                 .filter(|(_, e)| now.saturating_duration_since(e.at) >= timeout)
                 .map(|(id, _)| *id)
                 .collect();
-            ids.iter().filter_map(|id| p.remove(id)).map(|e| e.kind).collect()
+            ids.iter()
+                .filter_map(|id| p.remove(id))
+                .map(|e| e.kind)
+                .collect()
         };
         for k in &stale {
             self.shared.abandon(*k);
@@ -1161,7 +1164,11 @@ impl LspClient {
         let st = self.begin(self.caps().document_highlight, Pending::Highlight);
         if let RequestStatus::Sent(id) = st {
             self.shared.highlight.begin(id);
-            self.request_raw(id, "textDocument/documentHighlight", Self::doc_pos(path, pos));
+            self.request_raw(
+                id,
+                "textDocument/documentHighlight",
+                Self::doc_pos(path, pos),
+            );
         }
         st
     }
@@ -1454,9 +1461,9 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, tx: &mpsc::Sender<Value>) {
                     );
                     shared.init_done.store(true, Ordering::SeqCst);
                 }
-                Some(Pending::Completion) => {
-                    shared.completion.fulfill(id, parse_completion_list(&result))
-                }
+                Some(Pending::Completion) => shared
+                    .completion
+                    .fulfill(id, parse_completion_list(&result)),
                 Some(Pending::Hover) => shared.hover.fulfill(id, parse_hover(&result)),
                 Some(Pending::Definition) => {
                     shared.definition.fulfill(id, parse_definition(&result))
@@ -1464,15 +1471,13 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, tx: &mpsc::Sender<Value>) {
                 Some(Pending::References) => shared
                     .references
                     .fulfill(id, group_locations(parse_locations(&result))),
-                Some(Pending::Highlight) => {
-                    shared.highlight.fulfill(id, parse_document_highlights(&result))
-                }
-                Some(Pending::PrepareRename) => {
-                    shared.prepare_rename.fulfill(id, parse_prepare_rename(&result))
-                }
-                Some(Pending::Rename) => {
-                    shared.rename.fulfill(id, parse_workspace_edit(&result))
-                }
+                Some(Pending::Highlight) => shared
+                    .highlight
+                    .fulfill(id, parse_document_highlights(&result)),
+                Some(Pending::PrepareRename) => shared
+                    .prepare_rename
+                    .fulfill(id, parse_prepare_rename(&result)),
+                Some(Pending::Rename) => shared.rename.fulfill(id, parse_workspace_edit(&result)),
                 Some(Pending::Formatting) => {
                     shared.formatting.fulfill(id, parse_text_edits(&result))
                 }
@@ -1838,7 +1843,8 @@ pub fn group_locations(locs: Vec<Location>) -> Vec<ReferenceGroup> {
     let mut groups: Vec<ReferenceGroup> = map
         .into_iter()
         .map(|(path, mut locations)| {
-            locations.sort_by_key(|r| (r.start.line, r.start.character, r.end.line, r.end.character));
+            locations
+                .sort_by_key(|r| (r.start.line, r.start.character, r.end.line, r.end.character));
             locations.dedup();
             ReferenceGroup { path, locations }
         })
@@ -1935,9 +1941,7 @@ pub fn parse_workspace_edit(result: &Value) -> WorkspaceEditPlan {
         .map(|(path, mut edits)| {
             // 後ろから適用できる順 = 開始位置の降順。同位置は元の順序を保つため
             // 「安定ソートで昇順 → reverse」ではなく、降順キーの安定ソートにする。
-            edits.sort_by(|a, b| {
-                (b.range.start, b.range.end).cmp(&(a.range.start, a.range.end))
-            });
+            edits.sort_by(|a, b| (b.range.start, b.range.end).cmp(&(a.range.start, a.range.end)));
             FileEdits { path, edits }
         })
         .collect();
@@ -1983,10 +1987,7 @@ fn symbol_common(v: &Value) -> (String, String, u8, bool) {
 
 fn parse_hierarchical_symbol(v: &Value) -> Option<SymbolNode> {
     let range = v.get("range").and_then(get_range)?;
-    let selection_range = v
-        .get("selectionRange")
-        .and_then(get_range)
-        .unwrap_or(range);
+    let selection_range = v.get("selectionRange").and_then(get_range).unwrap_or(range);
     let (name, detail, kind, deprecated) = symbol_common(v);
     let children = v
         .get("children")
@@ -2173,10 +2174,7 @@ pub fn parse_code_actions(result: &Value) -> Vec<CodeAction> {
                     if title.is_empty() {
                         return None;
                     }
-                    let edit = v
-                        .get("edit")
-                        .map(parse_workspace_edit)
-                        .unwrap_or_default();
+                    let edit = v.get("edit").map(parse_workspace_edit).unwrap_or_default();
                     let needs_resolve = v.get("edit").is_none() && v.get("command").is_none();
                     Some(CodeAction {
                         title,
@@ -2305,11 +2303,7 @@ pub fn action_is_actionable(a: &CodeAction) -> bool {
 /// 選択があればそれを (前後を正規化して) 使い、無ければ**キャレット行の全体**を使う。
 /// 行全体にするのは「行のどこにキャレットがあってもその行の診断を拾う」ため
 /// (VS Code の電球と同じ体感にする)。
-pub fn action_range(
-    text: &str,
-    selection: Option<(Position, Position)>,
-    caret: Position,
-) -> Range {
+pub fn action_range(text: &str, selection: Option<(Position, Position)>, caret: Position) -> Range {
     if let Some((a, b)) = selection {
         let (s, e) = if a <= b { (a, b) } else { (b, a) };
         if s != e {
@@ -2601,7 +2595,10 @@ impl CompletionState {
 
     /// 表示順の候補。
     pub fn visible(&self) -> Vec<&CompletionItem> {
-        self.order.iter().filter_map(|i| self.items.get(*i)).collect()
+        self.order
+            .iter()
+            .filter_map(|i| self.items.get(*i))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -2716,11 +2713,7 @@ impl HoverState {
     }
 
     /// デバウンス満了で要求すべき位置を返す (同じ位置で二度は返さない)。
-    pub fn due_request(
-        &mut self,
-        now: std::time::Instant,
-        debounce: Duration,
-    ) -> Option<Position> {
+    pub fn due_request(&mut self, now: std::time::Instant, debounce: Duration) -> Option<Position> {
         let (pos, at) = self.resting?;
         if self.requested_for == Some(pos) || now.saturating_duration_since(at) < debounce {
             return None;
@@ -2797,11 +2790,7 @@ impl HighlightState {
     }
 
     /// デバウンス満了で要求すべき位置を返す (同じ位置で二度は返さない)。
-    pub fn due_request(
-        &mut self,
-        now: std::time::Instant,
-        debounce: Duration,
-    ) -> Option<Position> {
+    pub fn due_request(&mut self, now: std::time::Instant, debounce: Duration) -> Option<Position> {
         let (pos, at) = self.resting?;
         if self.requested_for == Some(pos) || now.saturating_duration_since(at) < debounce {
             return None;
@@ -2987,7 +2976,11 @@ mod tests {
         });
         assert_eq!(
             parse_definition(&v),
-            Some(DefinitionLoc { path: PathBuf::from("/a/b.rs"), line: 3, col: 7 })
+            Some(DefinitionLoc {
+                path: PathBuf::from("/a/b.rs"),
+                line: 3,
+                col: 7
+            })
         );
     }
 
@@ -3025,7 +3018,10 @@ mod tests {
 
     #[test]
     fn encode_basic() {
-        assert_eq!(encode_message("{}"), b"Content-Length: 2\r\n\r\n{}".to_vec());
+        assert_eq!(
+            encode_message("{}"),
+            b"Content-Length: 2\r\n\r\n{}".to_vec()
+        );
     }
 
     #[test]
@@ -3242,7 +3238,7 @@ mod tests {
         let t = "a🎉b";
         assert_eq!(lsp_pos_to_byte_index(t, pos(0, 0)), 0);
         assert_eq!(lsp_pos_to_byte_index(t, pos(0, 1)), 1); // 絵文字の先頭
-        // サロゲートペアの途中 (col=2) は文字の先頭へ丸める = byte 1
+                                                            // サロゲートペアの途中 (col=2) は文字の先頭へ丸める = byte 1
         assert_eq!(lsp_pos_to_byte_index(t, pos(0, 2)), 1);
         assert_eq!(lsp_pos_to_byte_index(t, pos(0, 3)), 5); // 'b'
         assert_eq!(lsp_pos_to_byte_index(t, pos(0, 4)), 6); // 行末
@@ -3266,7 +3262,7 @@ mod tests {
         let t = "あ🎉\nx";
         // 行末を超える col → 改行の直前
         assert_eq!(lsp_pos_to_byte_index(t, pos(0, 99)), 7); // 3 + 4
-        // 存在しない行 → テキスト末尾
+                                                             // 存在しない行 → テキスト末尾
         assert_eq!(lsp_pos_to_byte_index(t, pos(9, 0)), t.len());
         // 空テキスト
         assert_eq!(lsp_pos_to_byte_index("", pos(0, 0)), 0);
@@ -3384,7 +3380,10 @@ mod tests {
         assert_eq!(list.items[3].documentation, "**md**");
 
         // InsertReplaceEdit は insert 側を採る
-        assert_eq!(list.items[4].text_edit.as_ref().unwrap().range, rng(0, 1, 0, 1));
+        assert_eq!(
+            list.items[4].text_edit.as_ref().unwrap().range,
+            rng(0, 1, 0, 1)
+        );
 
         // 配列形式 (CompletionItem[]) も読める
         let arr = parse_completion_list(&json!([{"label":"a"}]));
@@ -3457,7 +3456,9 @@ mod tests {
             Some(CompletionTrigger::Invoked)
         );
         // 一度返したら消える
-        assert!(st.due_request(t0 + COMPLETION_DEBOUNCE, COMPLETION_DEBOUNCE).is_none());
+        assert!(st
+            .due_request(t0 + COMPLETION_DEBOUNCE, COMPLETION_DEBOUNCE)
+            .is_none());
 
         // トリガ文字は語を仕切り直して必ず再要求
         st.on_typed('.', &caps, t0);
@@ -3471,12 +3472,16 @@ mod tests {
         st.on_typed('a', &caps, t0);
         st.on_typed(' ', &caps, t0);
         assert!(!st.is_open());
-        assert!(st.due_request(t0 + COMPLETION_DEBOUNCE, COMPLETION_DEBOUNCE).is_none());
+        assert!(st
+            .due_request(t0 + COMPLETION_DEBOUNCE, COMPLETION_DEBOUNCE)
+            .is_none());
 
         // 能力の無いサーバーでは何も予約しない
         let mut st2 = CompletionState::new();
         st2.on_typed('a', &ServerCaps::default(), t0);
-        assert!(st2.due_request(t0 + COMPLETION_DEBOUNCE, COMPLETION_DEBOUNCE).is_none());
+        assert!(st2
+            .due_request(t0 + COMPLETION_DEBOUNCE, COMPLETION_DEBOUNCE)
+            .is_none());
     }
 
     #[test]
@@ -3513,7 +3518,10 @@ mod tests {
             },
         );
         st2.on_typed('f', &caps, t0);
-        assert_eq!(st2.due_request(late, COMPLETION_DEBOUNCE), Some(CompletionTrigger::Invoked));
+        assert_eq!(
+            st2.due_request(late, COMPLETION_DEBOUNCE),
+            Some(CompletionTrigger::Invoked)
+        );
     }
 
     #[test]
@@ -3522,15 +3530,21 @@ mod tests {
         let mut st = CompletionState::new();
         st.mark_sent(RequestStatus::Sent(1), pos(0, 0));
         st.mark_sent(RequestStatus::Sent(2), pos(0, 1)); // 2 が最新
-        assert!(!st.apply_response(1, CompletionList {
-            is_incomplete: false,
-            items: vec![item("old")],
-        }));
+        assert!(!st.apply_response(
+            1,
+            CompletionList {
+                is_incomplete: false,
+                items: vec![item("old")],
+            }
+        ));
         assert!(st.is_empty());
-        assert!(st.apply_response(2, CompletionList {
-            is_incomplete: false,
-            items: vec![item("new")],
-        }));
+        assert!(st.apply_response(
+            2,
+            CompletionList {
+                is_incomplete: false,
+                items: vec![item("new")],
+            }
+        ));
         assert_eq!(st.visible()[0].label, "new");
 
         // 受信側: Slot も最新 id 以外を捨てる
@@ -3637,9 +3651,14 @@ mod tests {
         let mut hs = HoverState::new();
         hs.on_move(pos(1, 1), t0);
         assert!(hs.due_request(t0, HOVER_DEBOUNCE).is_none());
-        assert_eq!(hs.due_request(t0 + HOVER_DEBOUNCE, HOVER_DEBOUNCE), Some(pos(1, 1)));
+        assert_eq!(
+            hs.due_request(t0 + HOVER_DEBOUNCE, HOVER_DEBOUNCE),
+            Some(pos(1, 1))
+        );
         // 同じ位置で二度は要求しない
-        assert!(hs.due_request(t0 + HOVER_DEBOUNCE * 2, HOVER_DEBOUNCE).is_none());
+        assert!(hs
+            .due_request(t0 + HOVER_DEBOUNCE * 2, HOVER_DEBOUNCE)
+            .is_none());
 
         hs.mark_sent(RequestStatus::Sent(5));
         // 移動したら応答を捨てる
@@ -3760,7 +3779,11 @@ mod tests {
         let plan = parse_workspace_edit(&v);
         assert!(plan.has_resource_ops);
         assert_eq!(plan.files.len(), 2);
-        let a = plan.files.iter().find(|f| f.path.ends_with("a.rs")).unwrap();
+        let a = plan
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("a.rs"))
+            .unwrap();
         assert_eq!(a.edits[0].range.start, pos(1, 0)); // 降順に整列済み
         assert_eq!(apply_file_edits("foo\nbar\n", a), "BBB\nAAA\n");
 
@@ -3892,7 +3915,10 @@ mod tests {
         shape(&a, 0, &mut sa);
         shape(&b, 0, &mut sb);
         assert_eq!(sa, sb);
-        assert_eq!(sa, ["0:5:Foo", "1:6:bar", "2:12:inner", "1:6:baz", "0:12:top"]);
+        assert_eq!(
+            sa,
+            ["0:5:Foo", "1:6:bar", "2:12:inner", "1:6:baz", "0:12:top"]
+        );
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].name, "Foo");
         assert_eq!(a[0].children.len(), 2);
@@ -3950,7 +3976,10 @@ mod tests {
         assert!(acts[0].is_preferred);
         assert_eq!(acts[0].edit.edit_count(), 1);
         // Command 形式
-        assert_eq!(acts[1].command.as_ref().unwrap().command, "editor.organizeImports");
+        assert_eq!(
+            acts[1].command.as_ref().unwrap().command,
+            "editor.organizeImports"
+        );
         // edit も command も無い = resolve が要る
         assert!(acts[2].needs_resolve);
         assert!(parse_code_actions(&Value::Null).is_empty());
@@ -3989,19 +4018,22 @@ mod tests {
         }
         // 巨大入力でも上限を必ず守る
         let huge = "x".repeat(100_000);
-        assert_eq!(one_line_label(&huge, ACTION_TITLE_MAX).chars().count(), ACTION_TITLE_MAX);
+        assert_eq!(
+            one_line_label(&huge, ACTION_TITLE_MAX).chars().count(),
+            ACTION_TITLE_MAX
+        );
     }
 
     #[test]
     fn rank_code_actions_は押したい順に安定整列して上限で切る() {
         let v = vec![
             act("refactor", "refactor.extract", false),
-            act("", "quickfix", false),          // タイトル空 = 落とす
-            act("   ", "quickfix", false),       // 空白だけ = 落とす
+            act("", "quickfix", false),    // タイトル空 = 落とす
+            act("   ", "quickfix", false), // 空白だけ = 落とす
             act("command", "", false),
             act("fixAll", "source.fixAll.eslint", false),
             act("qf1", "quickfix", false),
-            act("qf2", "quickfix", false),       // 同順位は元の順序のまま
+            act("qf2", "quickfix", false), // 同順位は元の順序のまま
             act("preferred", "refactor", true),
             act("organize", "source.organizeImports", false),
         ];
@@ -4009,12 +4041,22 @@ mod tests {
         let titles: Vec<&str> = out.iter().map(|a| a.title.as_str()).collect();
         assert_eq!(
             titles,
-            ["preferred", "qf1", "qf2", "fixAll", "refactor", "organize", "command"]
+            [
+                "preferred",
+                "qf1",
+                "qf2",
+                "fixAll",
+                "refactor",
+                "organize",
+                "command"
+            ]
         );
         // 空応答
         assert!(rank_code_actions(Vec::new()).is_empty());
         // 巨大な配列は上限で切る (同名アクションが大量に並んでも壊れない)
-        let many: Vec<CodeAction> = (0..500).map(|_| act("同じ名前", "quickfix", false)).collect();
+        let many: Vec<CodeAction> = (0..500)
+            .map(|_| act("同じ名前", "quickfix", false))
+            .collect();
         let cut = rank_code_actions(many);
         assert_eq!(cut.len(), MAX_CODE_ACTIONS);
         assert!(cut.iter().all(|a| a.title == "同じ名前"));
@@ -4045,7 +4087,10 @@ mod tests {
         // files はあるが編集が 0 件でも押せない
         let mut empty_edit = act("z", "quickfix", false);
         empty_edit.edit = WorkspaceEditPlan {
-            files: vec![FileEdits { path: PathBuf::from("a.rs"), edits: vec![] }],
+            files: vec![FileEdits {
+                path: PathBuf::from("a.rs"),
+                edits: vec![],
+            }],
             has_resource_ops: false,
         };
         assert!(!action_is_actionable(&empty_edit));
@@ -4055,10 +4100,7 @@ mod tests {
     fn action_range_は選択優先でなければ行全体() {
         let text = "let a = 1;\nlet 日本語 = 2;\n";
         // 選択なし → キャレット行の全体 (UTF-16 桁で行末まで)
-        assert_eq!(
-            action_range(text, None, pos(0, 4)),
-            rng(0, 0, 0, 10)
-        );
+        assert_eq!(action_range(text, None, pos(0, 4)), rng(0, 0, 0, 10));
         // 日本語行: "let 日本語 = 2;" は UTF-16 で 12 単位 (char 数と同じ = BMP のみ)
         assert_eq!(action_range(text, None, pos(1, 0)).end.character, 12);
         // 空選択は「選択なし」と同じ扱い
@@ -4091,10 +4133,10 @@ mod tests {
             message: format!("{l}:{c}"),
         };
         let all = vec![
-            d(0, 0, 0, 5),  // 行 0
-            d(2, 1, 2, 1),  // 空範囲 (端点だけ触れる)
-            d(5, 0, 5, 3),  // 行 5
-            d(3, 9, 3, 2),  // 逆転した壊れた診断 (正規化して判定)
+            d(0, 0, 0, 5), // 行 0
+            d(2, 1, 2, 1), // 空範囲 (端点だけ触れる)
+            d(5, 0, 5, 3), // 行 5
+            d(3, 9, 3, 2), // 逆転した壊れた診断 (正規化して判定)
         ];
         let got = diagnostics_in_range(&all, &rng(0, 0, 0, 10));
         assert_eq!(got.len(), 1);
@@ -4132,7 +4174,14 @@ mod tests {
         assert!(signature_display(&mk(vec![], 0, None), 60).is_none());
         // ラベルが空白だけ
         assert!(signature_display(
-            &mk(vec![SignatureInfo { label: "  \n ".into(), ..Default::default() }], 0, None),
+            &mk(
+                vec![SignatureInfo {
+                    label: "  \n ".into(),
+                    ..Default::default()
+                }],
+                0,
+                None
+            ),
             60
         )
         .is_none());
@@ -4141,8 +4190,14 @@ mod tests {
             label: "fn push(&mut self,\n  value: T)".into(),
             documentation: "要素を\n末尾へ追加する".into(),
             parameters: vec![
-                ParameterInfo { label: "&mut self".into(), documentation: String::new() },
-                ParameterInfo { label: "value: T".into(), documentation: String::new() },
+                ParameterInfo {
+                    label: "&mut self".into(),
+                    documentation: String::new(),
+                },
+                ParameterInfo {
+                    label: "value: T".into(),
+                    documentation: String::new(),
+                },
             ],
         };
         let d = signature_display(&mk(vec![sig.clone()], 0, Some(1)), 60).unwrap();
@@ -4163,16 +4218,19 @@ mod tests {
     #[test]
     fn highlight_char_spans_は整列重複除去して上限で切る() {
         let text = "aa bb aa\nあ aa\n";
-        let h = |sl, sc, el, ec| DocumentHighlight { range: rng(sl, sc, el, ec), kind: 1 };
+        let h = |sl, sc, el, ec| DocumentHighlight {
+            range: rng(sl, sc, el, ec),
+            kind: 1,
+        };
         let got = highlight_char_spans(
             text,
             &[
-                h(1, 2, 1, 4), // "aa" (2 行目、日本語の後ろ)
-                h(0, 6, 0, 8), // "aa"
-                h(0, 0, 0, 2), // "aa"
-                h(0, 0, 0, 2), // 重複
-                h(0, 5, 0, 3), // 逆転 = 捨てる
-                h(0, 4, 0, 4), // 空 = 捨てる
+                h(1, 2, 1, 4),   // "aa" (2 行目、日本語の後ろ)
+                h(0, 6, 0, 8),   // "aa"
+                h(0, 0, 0, 2),   // "aa"
+                h(0, 0, 0, 2),   // 重複
+                h(0, 5, 0, 3),   // 逆転 = 捨てる
+                h(0, 4, 0, 4),   // 空 = 捨てる
                 h(99, 0, 99, 5), // 本文外 = 捨てる
             ],
         );
@@ -4180,8 +4238,9 @@ mod tests {
         assert!(highlight_char_spans(text, &[]).is_empty());
         assert!(highlight_char_spans("", &[h(0, 0, 0, 3)]).is_empty());
         // 上限で切る
-        let many: Vec<DocumentHighlight> =
-            (0..MAX_HIGHLIGHTS + 50).map(|i| h(0, i % 8, 0, (i % 8) + 1)).collect();
+        let many: Vec<DocumentHighlight> = (0..MAX_HIGHLIGHTS + 50)
+            .map(|i| h(0, i % 8, 0, (i % 8) + 1))
+            .collect();
         assert!(highlight_char_spans(text, &many).len() <= MAX_HIGHLIGHTS);
     }
 
@@ -4189,22 +4248,43 @@ mod tests {
     fn highlight_state_はデバウンスして同じ位置を二度要求しない() {
         let t0 = std::time::Instant::now();
         let mut st = HighlightState::new();
-        assert!(st.due_request(t0, HIGHLIGHT_DEBOUNCE).is_none(), "動く前は要求しない");
-        assert!(st.due_in(t0, HIGHLIGHT_DEBOUNCE).is_none(), "予定が無ければ再描画も予約しない");
+        assert!(
+            st.due_request(t0, HIGHLIGHT_DEBOUNCE).is_none(),
+            "動く前は要求しない"
+        );
+        assert!(
+            st.due_in(t0, HIGHLIGHT_DEBOUNCE).is_none(),
+            "予定が無ければ再描画も予約しない"
+        );
 
         st.on_move(pos(1, 1), t0);
-        assert!(st.due_request(t0, HIGHLIGHT_DEBOUNCE).is_none(), "満了前は要求しない");
-        assert!(st.due_in(t0, HIGHLIGHT_DEBOUNCE).is_some(), "満了までの残りを返す");
+        assert!(
+            st.due_request(t0, HIGHLIGHT_DEBOUNCE).is_none(),
+            "満了前は要求しない"
+        );
+        assert!(
+            st.due_in(t0, HIGHLIGHT_DEBOUNCE).is_some(),
+            "満了までの残りを返す"
+        );
         // 同じ位置で on_move を連打しても時計は進まない
         st.on_move(pos(1, 1), t0 + Duration::from_millis(200));
         let t1 = t0 + HIGHLIGHT_DEBOUNCE;
         assert_eq!(st.due_request(t1, HIGHLIGHT_DEBOUNCE), Some(pos(1, 1)));
-        assert!(st.due_request(t1, HIGHLIGHT_DEBOUNCE).is_none(), "同じ位置で二度は要求しない");
-        assert!(st.due_in(t1, HIGHLIGHT_DEBOUNCE).is_none(), "要求済みなら再描画を予約しない");
+        assert!(
+            st.due_request(t1, HIGHLIGHT_DEBOUNCE).is_none(),
+            "同じ位置で二度は要求しない"
+        );
+        assert!(
+            st.due_in(t1, HIGHLIGHT_DEBOUNCE).is_none(),
+            "要求済みなら再描画を予約しない"
+        );
 
         // 応答: 飛行中の id 以外は捨てる
         st.mark_sent(RequestStatus::Sent(7));
-        let hl = vec![DocumentHighlight { range: rng(0, 0, 0, 2), kind: 2 }];
+        let hl = vec![DocumentHighlight {
+            range: rng(0, 0, 0, 2),
+            kind: 2,
+        }];
         assert!(!st.apply_response(6, hl.clone()), "古い応答は捨てる");
         assert!(st.shown().is_empty());
         assert!(st.apply_response(7, hl.clone()));
@@ -4253,7 +4333,10 @@ mod tests {
         assert!(c2.rename && !c2.prepare_rename);
         // 空 / null
         assert_eq!(parse_server_caps(&Value::Null), ServerCaps::default());
-        assert_eq!(parse_server_caps(&json!({"renameProvider": false})), ServerCaps::default());
+        assert_eq!(
+            parse_server_caps(&json!({"renameProvider": false})),
+            ServerCaps::default()
+        );
     }
 
     /// 能力を宣言しないサーバーでは各リクエストが Unsupported (エラーでも panic でもない)。
@@ -4261,22 +4344,54 @@ mod tests {
     fn capability_gating_makes_requests_noop() {
         let client = fake_client();
         // initialize 応答前 = NotReady
-        assert_eq!(client.request_rename(Path::new("/w/a.rs"), pos(0, 0), "x"), RequestStatus::NotReady);
+        assert_eq!(
+            client.request_rename(Path::new("/w/a.rs"), pos(0, 0), "x"),
+            RequestStatus::NotReady
+        );
 
         // renameProvider を持たないサーバーが initialize を返した
-        deliver(&client, 1, Pending::Initialize, json!({"capabilities": {"hoverProvider": true}}));
+        deliver(
+            &client,
+            1,
+            Pending::Initialize,
+            json!({"capabilities": {"hoverProvider": true}}),
+        );
         assert!(client.is_ready());
         assert!(!client.caps().rename);
 
         let p = Path::new("/w/a.rs");
-        assert_eq!(client.request_rename(p, pos(0, 0), "x"), RequestStatus::Unsupported);
-        assert_eq!(client.request_prepare_rename(p, pos(0, 0)), RequestStatus::Unsupported);
-        assert_eq!(client.request_references(p, pos(0, 0), true), RequestStatus::Unsupported);
-        assert_eq!(client.request_formatting(p, &FormatOptions::default()), RequestStatus::Unsupported);
-        assert_eq!(client.request_document_symbols(p), RequestStatus::Unsupported);
-        assert_eq!(client.request_code_actions(p, &Range::default(), &[]), RequestStatus::Unsupported);
-        assert_eq!(client.request_signature_help(p, pos(0, 0)), RequestStatus::Unsupported);
-        assert_eq!(client.request_completion(p, 0, 0), RequestStatus::Unsupported);
+        assert_eq!(
+            client.request_rename(p, pos(0, 0), "x"),
+            RequestStatus::Unsupported
+        );
+        assert_eq!(
+            client.request_prepare_rename(p, pos(0, 0)),
+            RequestStatus::Unsupported
+        );
+        assert_eq!(
+            client.request_references(p, pos(0, 0), true),
+            RequestStatus::Unsupported
+        );
+        assert_eq!(
+            client.request_formatting(p, &FormatOptions::default()),
+            RequestStatus::Unsupported
+        );
+        assert_eq!(
+            client.request_document_symbols(p),
+            RequestStatus::Unsupported
+        );
+        assert_eq!(
+            client.request_code_actions(p, &Range::default(), &[]),
+            RequestStatus::Unsupported
+        );
+        assert_eq!(
+            client.request_signature_help(p, pos(0, 0)),
+            RequestStatus::Unsupported
+        );
+        assert_eq!(
+            client.request_completion(p, 0, 0),
+            RequestStatus::Unsupported
+        );
         // 宣言済みのものは送られる
         assert!(client.request_hover(p, 0, 0).is_sent());
         // no-op なのでスロットは空のまま (UI は何も起きない)
@@ -4474,7 +4589,10 @@ mod tests {
         );
         let plan = client.poll_rename().expect("応答あり");
         assert_eq!(plan.edit_count(), 1);
-        assert_eq!(apply_file_edits("let old = 1;", &plan.files[0]), "let 新しい名前 = 1;");
+        assert_eq!(
+            apply_file_edits("let old = 1;", &plan.files[0]),
+            "let 新しい名前 = 1;"
+        );
         // 2 度目の poll は空 (消費済み)
         assert!(client.poll_rename().is_none());
     }

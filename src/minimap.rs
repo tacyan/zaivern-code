@@ -270,7 +270,11 @@ fn snap_at(v: f32, ppp: f32) -> f32 {
 ///
 /// 返る矩形は必ず `avail` の内側に収まり、`strip` と `body` は重ならない。
 pub fn geometry(avail: Rect, line_count: usize, ppp: f32) -> Geom {
-    let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+    let ppp = if ppp.is_finite() && ppp > 0.0 {
+        ppp
+    } else {
+        1.0
+    };
     let px = 1.0 / ppp;
     let line_count = line_count.max(1);
 
@@ -357,10 +361,7 @@ impl Geom {
         if y1 <= y0 {
             return None;
         }
-        Some(Rect::from_min_max(
-            egui::pos2(x0, y0),
-            egui::pos2(x1, y1),
-        ))
+        Some(Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)))
     }
 
     /// いま画面に出ている範囲を示す枠。掴めるように最低の高さを確保する。
@@ -494,11 +495,7 @@ pub fn paint(
                 1 => (Marker::Error, colors.err),
                 _ => (Marker::Warn, colors.warn),
             };
-            shapes.push(egui::Shape::rect_filled(
-                geom.marker_rect(kind, *l),
-                0.0,
-                c,
-            ));
+            shapes.push(egui::Shape::rect_filled(geom.marker_rect(kind, *l), 0.0, c));
         }
     }
 
@@ -549,10 +546,10 @@ mod tests {
     fn minimap_visible_table() {
         // (可用幅, 設定 ON か, 期待)
         let table: &[(f32, bool, bool)] = &[
-            (200.0, true, false),   // 極端に狭い → 隠す
+            (200.0, true, false), // 極端に狭い → 隠す
             (300.0, true, false),
-            (423.0, true, false),   // しきい値の直前
-            (424.0, true, true),    // しきい値ちょうど (64 + 360)
+            (423.0, true, false), // しきい値の直前
+            (424.0, true, true),  // しきい値ちょうど (64 + 360)
             (900.0, true, true),
             (1200.0, true, true),
             (1920.0, true, true),
@@ -640,7 +637,10 @@ mod tests {
                     }
                     // 間引きが効いて、描く本数は帯の物理ピクセル数の 2 倍を超えない
                     let cap = (h * ppp).ceil() as usize * 2 + 4;
-                    assert!(drawn <= cap, "{tag}: 描画本数 {drawn} が上限 {cap} を超えた");
+                    assert!(
+                        drawn <= cap,
+                        "{tag}: 描画本数 {drawn} が上限 {cap} を超えた"
+                    );
 
                     for kind in [
                         Marker::Bookmark,
@@ -656,7 +656,8 @@ mod tests {
                             );
                         }
                     }
-                    for (first, on_screen) in [(0.0, 30.0), (*n as f32 * 0.5, 30.0), (*n as f32, 1.0)]
+                    for (first, on_screen) in
+                        [(0.0, 30.0), (*n as f32 * 0.5, 30.0), (*n as f32, 1.0)]
                     {
                         let vp = g.viewport_rect(first, on_screen);
                         assert!(
@@ -764,12 +765,18 @@ mod tests {
 
     #[test]
     fn build_rows_groups_huge_files_instead_of_truncating() {
-        let text: String = (0..1000).map(|i| format!("{}x\n", " ".repeat(i % 4))).collect();
+        let text: String = (0..1000)
+            .map(|i| format!("{}x\n", " ".repeat(i % 4)))
+            .collect();
         let j = job_of(&[(text.as_str(), BLUE)]);
         let r = build_rows(&j, None, 100);
         assert_eq!(r.line_count, 1001, "行数は原文どおり");
         assert_eq!(r.group, 11, "1001 行を 100 本以内へ束ねる");
-        assert!(r.rows.len() <= 100, "上限を超えて持たない: {}", r.rows.len());
+        assert!(
+            r.rows.len() <= 100,
+            "上限を超えて持たない: {}",
+            r.rows.len()
+        );
         // 末尾の行まで引ける (打ち切りだと EMPTY になる)
         assert!(r.at(1000).len == 0 || r.at(1000).len > 0, "末尾も引ける");
         assert!(r.at(500).len > 0, "中ほどの行に中身がある");

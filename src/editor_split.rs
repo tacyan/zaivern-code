@@ -286,7 +286,10 @@ impl EditorPanes {
 
     fn focused(&mut self) -> &mut EditorPane {
         let f = self.focus_id();
-        self.panes.iter_mut().find(|p| p.id == f).expect("フォーカス中ペイン")
+        self.panes
+            .iter_mut()
+            .find(|p| p.id == f)
+            .expect("フォーカス中ペイン")
     }
 
     /// フォーカス中ペインのアクティブバッファ。
@@ -510,7 +513,12 @@ impl EditorPanes {
         // 1. 死んだバッファを落とす
         for p in &mut self.panes {
             let before = p.tabs.len();
-            let keep: Vec<BufId> = p.tabs.iter().copied().filter(|b| buffer_ids.contains(b)).collect();
+            let keep: Vec<BufId> = p
+                .tabs
+                .iter()
+                .copied()
+                .filter(|b| buffer_ids.contains(b))
+                .collect();
             if keep.len() != before {
                 let active_buf = p.active_buf();
                 let fallback = p.active.min(keep.len().saturating_sub(1));
@@ -649,9 +657,18 @@ mod tests {
                 for strip in [0.0f32, 12.0, TAB_STRIP_H, 400.0, f32::NAN] {
                     let p = area(*w, *h);
                     let l = pane_layout(p, n, strip);
-                    assert!(inside(l.tabs, p), "{w}x{h} n={n} strip={strip}: タブ列がはみ出した");
-                    assert!(inside(l.body, p), "{w}x{h} n={n} strip={strip}: 本文がはみ出した");
-                    assert!(!overlaps(l.tabs, l.body), "{w}x{h} n={n} strip={strip}: 重なった");
+                    assert!(
+                        inside(l.tabs, p),
+                        "{w}x{h} n={n} strip={strip}: タブ列がはみ出した"
+                    );
+                    assert!(
+                        inside(l.body, p),
+                        "{w}x{h} n={n} strip={strip}: 本文がはみ出した"
+                    );
+                    assert!(
+                        !overlaps(l.tabs, l.body),
+                        "{w}x{h} n={n} strip={strip}: 重なった"
+                    );
                 }
                 let p = area(*w, *h);
                 let l = pane_layout(p, n, TAB_STRIP_H);
@@ -668,7 +685,10 @@ mod tests {
                 );
                 // 本文が消えない (タブ列は高さの半分まで)
                 if n > 0 && p.height() > 0.0 {
-                    assert!(l.body.height() >= p.height() * 0.5 - 0.01, "{w}x{h}: 本文が潰れた");
+                    assert!(
+                        l.body.height() >= p.height() * 0.5 - 0.01,
+                        "{w}x{h}: 本文が潰れた"
+                    );
                 }
             }
         }
@@ -742,7 +762,10 @@ mod tests {
                     ));
                     for (j, o) in rects.iter().enumerate() {
                         if i != j {
-                            assert!(!overlaps(*r, *o), "{w}x{h} n={n}: タブ {i} と {j} が重なった");
+                            assert!(
+                                !overlaps(*r, *o),
+                                "{w}x{h} n={n}: タブ {i} と {j} が重なった"
+                            );
                         }
                     }
                 }
@@ -780,7 +803,10 @@ mod tests {
                 // ペインごとの内訳まで含めて領域内に収まる
                 for (_, r) in &rects {
                     let l = pane_layout(*r, 3, TAB_STRIP_H);
-                    assert!(inside(l.tabs, a) && inside(l.body, a), "{w}x{h}: 内訳がはみ出した");
+                    assert!(
+                        inside(l.tabs, a) && inside(l.body, a),
+                        "{w}x{h}: 内訳がはみ出した"
+                    );
                 }
             }
         }
@@ -910,7 +936,11 @@ mod tests {
         assert_eq!(p.active_buf(), Some(11));
         assert_eq!(p.open_count(11), 1, "移動なのに 2 箇所に残った");
         let src = p.order()[0];
-        assert_eq!(p.pane(src).unwrap().tabs, vec![10], "送り元から消えていない");
+        assert_eq!(
+            p.pane(src).unwrap().tabs,
+            vec![10],
+            "送り元から消えていない"
+        );
     }
 
     #[test]
@@ -1016,13 +1046,24 @@ mod tests {
         assert_eq!(ed.buffers.len(), 1, "バッファが複製された");
 
         // 左のペイン経由で編集する
-        let i = ed.buffers.iter().position(|b| b.id == lb).expect("左の実体");
+        let i = ed
+            .buffers
+            .iter()
+            .position(|b| b.id == lb)
+            .expect("左の実体");
         ed.buffers[i].text.push_str("＋追記");
 
         // 右のペインから読むと同じ本文が見える
-        let j = ed.buffers.iter().position(|b| b.id == rb).expect("右の実体");
+        let j = ed
+            .buffers
+            .iter()
+            .position(|b| b.id == rb)
+            .expect("右の実体");
         assert_eq!(i, j, "実体が 2 つに分かれている");
-        assert_eq!(ed.buffers[j].text, "はじめの本文＋追記", "編集が伝わっていない");
+        assert_eq!(
+            ed.buffers[j].text, "はじめの本文＋追記",
+            "編集が伝わっていない"
+        );
 
         // 片方のペインを畳んでもバッファは生き残る
         panes.close_tab(right, rb);

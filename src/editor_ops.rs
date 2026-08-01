@@ -244,17 +244,15 @@ pub fn matching_bracket(text: &str, cursor_char: usize) -> Option<usize> {
     } else {
         return None;
     };
-    let (open, close, forward) = PAIRS
-        .iter()
-        .find_map(|&(o, c)| {
-            if ch == o {
-                Some((o, c, true))
-            } else if ch == c {
-                Some((o, c, false))
-            } else {
-                None
-            }
-        })?;
+    let (open, close, forward) = PAIRS.iter().find_map(|&(o, c)| {
+        if ch == o {
+            Some((o, c, true))
+        } else if ch == c {
+            Some((o, c, false))
+        } else {
+            None
+        }
+    })?;
     let mut depth = 0i64;
     if forward {
         for (i, &c) in chars.iter().enumerate().skip(pos) {
@@ -301,7 +299,10 @@ const AUTO_PAIRS: [(char, char); 6] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairEdit {
     /// 選択範囲を開き/閉じで囲む。新テキストと新しい選択範囲 (char)。
-    Surround { text: String, select: (usize, usize) },
+    Surround {
+        text: String,
+        select: (usize, usize),
+    },
     /// 開き+閉じを挿入してカーソルをペアの間に置く。
     Insert { text: String, cursor: usize },
     /// 既にある閉じを飛び越える (重複挿入を避けてカーソルだけ右へ)。
@@ -310,12 +311,7 @@ pub enum PairEdit {
 
 /// 文字 `typed` を打った瞬間の自動ペア判定。該当しなければ None (通常入力)。
 /// `sel_min..sel_max` は現在の選択 (char)。空選択なら両者同値。
-pub fn pair_on_type(
-    text: &str,
-    sel_min: usize,
-    sel_max: usize,
-    typed: char,
-) -> Option<PairEdit> {
+pub fn pair_on_type(text: &str, sel_min: usize, sel_max: usize, typed: char) -> Option<PairEdit> {
     let closer_of = AUTO_PAIRS
         .iter()
         .find(|(o, _)| *o == typed)
@@ -345,14 +341,14 @@ pub fn pair_on_type(
     // スキップ: 閉じ文字を打ったが直後に同じ閉じ文字がもうある
     let is_closer = AUTO_PAIRS.iter().any(|(_, c)| *c == typed);
     if is_closer && next == Some(typed) {
-        return Some(PairEdit::SkipOver { cursor: sel_max + 1 });
+        return Some(PairEdit::SkipOver {
+            cursor: sel_max + 1,
+        });
     }
     let close = closer_of?;
     // 引用符は単語や同じ引用符の直後では自動閉じしない (don't 等のアポストロフィ)
     if typed == close {
-        let prev = sel_min
-            .checked_sub(1)
-            .and_then(|i| text.chars().nth(i));
+        let prev = sel_min.checked_sub(1).and_then(|i| text.chars().nth(i));
         if prev.is_some_and(|c| c.is_alphanumeric() || c == typed) {
             return None;
         }
@@ -426,8 +422,7 @@ pub fn find_ci(text: &str, query: &str, start_char: usize) -> Option<usize> {
             }
         }
     }
-    let byte_pos =
-        find_at(text, query, start_byte.min(text.len())).or_else(|| text.find(query))?;
+    let byte_pos = find_at(text, query, start_byte.min(text.len())).or_else(|| text.find(query))?;
     Some(text[..byte_pos].chars().count())
 }
 
@@ -709,7 +704,10 @@ pub fn adjust_offset_after_cleanup(original: &str, cleaned: &str, offset: usize)
 /// UI から呼ぶときはこちらを使う (バイト版はファイル入出力側向け)。
 pub fn adjust_char_index_after_cleanup(original: &str, cleaned: &str, char_idx: usize) -> usize {
     let byte = char_to_byte(original, char_idx);
-    byte_to_char(cleaned, adjust_offset_after_cleanup(original, cleaned, byte))
+    byte_to_char(
+        cleaned,
+        adjust_offset_after_cleanup(original, cleaned, byte),
+    )
 }
 
 /// バイト位置を文字境界まで手前へ寄せる (多バイト文字を割らないため)。
@@ -813,9 +811,9 @@ impl MultiSel {
     pub fn from_char_ranges(text: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> Self {
         Self::in_text(
             text,
-            ranges
-                .into_iter()
-                .map(|r| char_to_byte(text, r.start.min(r.end))..char_to_byte(text, r.end.max(r.start))),
+            ranges.into_iter().map(|r| {
+                char_to_byte(text, r.start.min(r.end))..char_to_byte(text, r.end.max(r.start))
+            }),
         )
     }
 
@@ -1025,8 +1023,9 @@ fn add_cursor_vertical(
         };
         let Some(ti) = target else { continue };
         let (ls, le, _) = segs[li];
-        let col = desired_col
-            .unwrap_or_else(|| visual_col_in_line(&text[ls..le], anchor.saturating_sub(ls), tab_width));
+        let col = desired_col.unwrap_or_else(|| {
+            visual_col_in_line(&text[ls..le], anchor.saturating_sub(ls), tab_width)
+        });
         let (ts, te, _) = segs[ti];
         let b = ts + byte_at_visual_col(&text[ts..te], col, tab_width);
         out.push(b..b);
@@ -1075,7 +1074,12 @@ pub fn select_all_occurrences(text: &str, needle: &str, opts: MatchOpts) -> Mult
 /// - 探し始めるのは**最後のキャレットの終端**。そこから後ろに無ければ先頭へ回り込む。
 /// - 既に集合に入っている範囲は飛ばす。全部入っていれば `sel` をそのまま返す
 ///   (押し続けても増えなくなる = VS Code と同じ止まり方)。
-pub fn select_next_occurrence(text: &str, sel: &MultiSel, needle: &str, opts: MatchOpts) -> MultiSel {
+pub fn select_next_occurrence(
+    text: &str,
+    sel: &MultiSel,
+    needle: &str,
+    opts: MatchOpts,
+) -> MultiSel {
     let Some(m) = compile_matcher(needle, opts) else {
         return sel.clone();
     };
@@ -1607,7 +1611,10 @@ mod tests {
     fn trim_removes_spaces_and_tabs_at_line_end() {
         assert_eq!(trim_trailing_whitespace("a  \nb\t\t\nc   "), "a\nb\nc");
         // 行頭・行中の空白は触らない
-        assert_eq!(trim_trailing_whitespace("    let x = 1;  \n"), "    let x = 1;\n");
+        assert_eq!(
+            trim_trailing_whitespace("    let x = 1;  \n"),
+            "    let x = 1;\n"
+        );
     }
 
     #[test]
@@ -1647,7 +1654,11 @@ mod tests {
     fn trim_keeps_ideographic_space_and_nbsp() {
         let text = "日本語　\n次の行　";
         assert_eq!(trim_trailing_whitespace(text), text, "全角スペースは残す");
-        assert_eq!(trim_trailing_whitespace("x\u{a0}\n"), "x\u{a0}\n", "NBSP も残す");
+        assert_eq!(
+            trim_trailing_whitespace("x\u{a0}\n"),
+            "x\u{a0}\n",
+            "NBSP も残す"
+        );
         // 全角スペースの後ろに付いた半角だけが落ちる
         assert_eq!(trim_trailing_whitespace("日本語　  \t\n"), "日本語　\n");
     }
@@ -1657,13 +1668,24 @@ mod tests {
     #[test]
     fn ensure_final_newline_adds_only_when_missing() {
         assert_eq!(ensure_final_newline("a", LineEnding::Lf), "a\n");
-        assert_eq!(ensure_final_newline("a\n", LineEnding::Lf), "a\n", "二重にしない");
+        assert_eq!(
+            ensure_final_newline("a\n", LineEnding::Lf),
+            "a\n",
+            "二重にしない"
+        );
         assert_eq!(ensure_final_newline("a\r\n", LineEnding::Crlf), "a\r\n");
         assert_eq!(ensure_final_newline("a\r", LineEnding::Cr), "a\r");
-        assert_eq!(ensure_final_newline("", LineEnding::Lf), "", "空のファイルは空のまま");
+        assert_eq!(
+            ensure_final_newline("", LineEnding::Lf),
+            "",
+            "空のファイルは空のまま"
+        );
         // 空白だけの本文は「1 行書いてある」ので他の行と同じ扱い
         assert_eq!(ensure_final_newline("   ", LineEnding::Lf), "   \n");
-        assert_eq!(ensure_final_newline("日本語", LineEnding::Crlf), "日本語\r\n");
+        assert_eq!(
+            ensure_final_newline("日本語", LineEnding::Crlf),
+            "日本語\r\n"
+        );
         // 混在は最多の様式で足す
         let mixed = crate::textenc::detect_line_ending("a\r\nb\r\nc\n");
         assert_eq!(ensure_final_newline("x", mixed), "x\r\n");
@@ -1681,7 +1703,11 @@ mod tests {
         let (out, changed) = apply_save_cleanup_checked("a  \nb\t", &opts);
         assert_eq!(out, "a\r\nb\r\n");
         assert!(changed);
-        assert_eq!(apply_save_cleanup("a  \nb\t", &opts), out, "短い版も同じ結果");
+        assert_eq!(
+            apply_save_cleanup("a  \nb\t", &opts),
+            out,
+            "短い版も同じ結果"
+        );
     }
 
     #[test]
@@ -1750,7 +1776,10 @@ mod tests {
             );
         }
         // 範囲外を渡しても落ちない
-        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 999), cleaned.len());
+        assert_eq!(
+            adjust_offset_after_cleanup(original, &cleaned, 999),
+            cleaned.len()
+        );
     }
 
     #[test]
@@ -1758,11 +1787,31 @@ mod tests {
         let original = "日本語  \nあ";
         let cleaned = trim_trailing_whitespace(original);
         assert_eq!(cleaned, "日本語\nあ");
-        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 3), 3, "日と本の間");
-        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 9), 9, "語の直後");
-        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 10), 9, "空白の中");
-        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 12), 10, "次の行の行頭");
-        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 15), 13, "EOF");
+        assert_eq!(
+            adjust_offset_after_cleanup(original, &cleaned, 3),
+            3,
+            "日と本の間"
+        );
+        assert_eq!(
+            adjust_offset_after_cleanup(original, &cleaned, 9),
+            9,
+            "語の直後"
+        );
+        assert_eq!(
+            adjust_offset_after_cleanup(original, &cleaned, 10),
+            9,
+            "空白の中"
+        );
+        assert_eq!(
+            adjust_offset_after_cleanup(original, &cleaned, 12),
+            10,
+            "次の行の行頭"
+        );
+        assert_eq!(
+            adjust_offset_after_cleanup(original, &cleaned, 15),
+            13,
+            "EOF"
+        );
         // どのバイト位置から呼んでも多バイト文字の途中には落ちない
         for off in 0..=original.len() {
             let got = adjust_offset_after_cleanup(original, &cleaned, off);
@@ -1779,8 +1828,16 @@ mod tests {
         let original = "a  \r\nb";
         let cleaned = trim_trailing_whitespace(original);
         assert_eq!(cleaned, "a\r\nb");
-        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 4), 2, "\\r と \\n の間");
-        assert_eq!(adjust_offset_after_cleanup(original, &cleaned, 5), 3, "次の行の行頭");
+        assert_eq!(
+            adjust_offset_after_cleanup(original, &cleaned, 4),
+            2,
+            "\\r と \\n の間"
+        );
+        assert_eq!(
+            adjust_offset_after_cleanup(original, &cleaned, 5),
+            3,
+            "次の行の行頭"
+        );
         // LF → CRLF で位置が増える向きも追随する
         let cleaned = normalize_to("a\nb", LineEnding::Crlf);
         assert_eq!(adjust_offset_after_cleanup("a\nb", &cleaned, 2), 3);
@@ -1798,7 +1855,11 @@ mod tests {
         // char 4 = 2 つ目の半角スペース → 削られたので行末 (char 3) へ
         assert_eq!(adjust_char_index_after_cleanup(original, &cleaned, 4), 3);
         assert_eq!(adjust_char_index_after_cleanup(original, &cleaned, 2), 2);
-        assert_eq!(adjust_char_index_after_cleanup(original, &cleaned, 6), 4, "次の行の行頭");
+        assert_eq!(
+            adjust_char_index_after_cleanup(original, &cleaned, 6),
+            4,
+            "次の行の行頭"
+        );
         assert_eq!(
             adjust_char_index_after_cleanup(original, &cleaned, 99),
             cleaned.chars().count(),
@@ -1864,7 +1925,11 @@ mod tests {
     fn multisel_keeps_adjacent_nonempty_ranges_apart() {
         let text = "abcdefghij";
         let sel = MultiSel::in_text(text, [3..6, 0..3]);
-        assert_eq!(sel.carets(), &[0..3, 3..6], "隣接するだけの範囲は別キャレット");
+        assert_eq!(
+            sel.carets(),
+            &[0..3, 3..6],
+            "隣接するだけの範囲は別キャレット"
+        );
         assert_invariants(text, &sel, "隣接");
     }
 
@@ -1908,7 +1973,11 @@ mod tests {
         let text = "aXbXc";
         let sel = MultiSel::in_text(text, [1..2, 3..4]);
         assert_eq!(sel.to_single_selection(), 3..4, "最後の範囲");
-        assert_eq!(MultiSel::default().to_single_selection(), 0..0, "空なら 0..0");
+        assert_eq!(
+            MultiSel::default().to_single_selection(),
+            0..0,
+            "空なら 0..0"
+        );
     }
 
     // ──────────────── カーソルを上/下に追加 ────────────────
@@ -2037,7 +2106,11 @@ mod tests {
         // タブを割ったバイト位置は絶対に作らない
         let sel = column_selection(text, 0, 1, 1, 3, 4);
         assert_invariants(text, &sel, "タブの丸め");
-        assert_eq!(sel.carets(), &[0..1, 5..7], "1行目はタブ1文字、2行目は桁1..3");
+        assert_eq!(
+            sel.carets(),
+            &[0..1, 5..7],
+            "1行目はタブ1文字、2行目は桁1..3"
+        );
     }
 
     #[test]
@@ -2181,7 +2254,10 @@ mod tests {
             regex: true,
             ..MatchOpts::default()
         };
-        assert!(select_all_occurrences(text, "(", bad).is_empty(), "壊れた正規表現でも落ちない");
+        assert!(
+            select_all_occurrences(text, "(", bad).is_empty(),
+            "壊れた正規表現でも落ちない"
+        );
     }
 
     #[test]
@@ -2216,7 +2292,10 @@ mod tests {
     fn select_next_occurrence_with_no_match_is_noop() {
         let text = "abc";
         let sel = MultiSel::in_text(text, [0..1]);
-        assert_eq!(select_next_occurrence(text, &sel, "zzz", MatchOpts::default()), sel);
+        assert_eq!(
+            select_next_occurrence(text, &sel, "zzz", MatchOpts::default()),
+            sel
+        );
     }
 
     #[test]
@@ -2250,7 +2329,11 @@ mod tests {
                 for sel in [
                     MultiSel::in_text(text, [0..text.len(), 1..2, text.len()..text.len()]),
                     add_cursor_below(text, &seed, tab),
-                    add_cursor_above(text, &MultiSel::in_text(text, [text.len()..text.len()]), tab),
+                    add_cursor_above(
+                        text,
+                        &MultiSel::in_text(text, [text.len()..text.len()]),
+                        tab,
+                    ),
                     column_selection(text, 0, 0, 5, 3, tab),
                     column_selection(text, 3, 7, 0, 0, tab),
                     select_all_occurrences(text, "a", MatchOpts::default()),

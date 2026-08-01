@@ -382,7 +382,10 @@ pub enum AdoptDecision {
         files: Vec<PathBuf>,
     },
     /// 重なるが確認済み (2 度目のクリック) → 承知の上で採用を通す。
-    ConfirmedProceed { with: Vec<usize>, files: Vec<PathBuf> },
+    ConfirmedProceed {
+        with: Vec<usize>,
+        files: Vec<PathBuf>,
+    },
 }
 
 impl AdoptDecision {
@@ -578,7 +581,10 @@ pub fn start_race(root: &Path, prompt: &str, presets: &[(String, String)]) -> Re
     if !(MIN_RACERS..=MAX_RACERS).contains(&n) {
         return Err(trf(
             "レースは {min}〜{max} 体で行います",
-            &[("min", MIN_RACERS.to_string()), ("max", MAX_RACERS.to_string())],
+            &[
+                ("min", MIN_RACERS.to_string()),
+                ("max", MAX_RACERS.to_string()),
+            ],
         ));
     }
     let repo = PathBuf::from(
@@ -615,11 +621,17 @@ pub fn start_race(root: &Path, prompt: &str, presets: &[(String, String)]) -> Re
     let slug = unique_slug(&slugify_prompt(prompt), |cand| {
         (1..=n).any(|i| {
             branches.iter().any(|b| b == &race_branch(cand, i))
-                || base_dir.join(worktree_dir_name(&repo_name, cand, i)).exists()
+                || base_dir
+                    .join(worktree_dir_name(&repo_name, cand, i))
+                    .exists()
         })
     });
-    std::fs::create_dir_all(&base_dir)
-        .map_err(|e| trf("worktree の置き場を作れません: {e}", &[("e", e.to_string())]))?;
+    std::fs::create_dir_all(&base_dir).map_err(|e| {
+        trf(
+            "worktree の置き場を作れません: {e}",
+            &[("e", e.to_string())],
+        )
+    })?;
 
     let mut racers: Vec<Racer> = Vec::with_capacity(n);
     for (i, (icon, name)) in presets.iter().enumerate() {
@@ -680,8 +692,7 @@ fn collect_scan(dir: &Path, base_commit: &str) -> Result<(DiffStat, HashSet<Path
     let mut st = parse_shortstat(&short);
     let entries = parse_status_z(&run_git(dir, &["status", "--porcelain=v1", "-z"])?);
     st.untracked = entries.iter().filter(|e| e.is_untracked()).count();
-    let mut touched: HashSet<PathBuf> =
-        entries.into_iter().flat_map(|e| e.paths).collect();
+    let mut touched: HashSet<PathBuf> = entries.into_iter().flat_map(|e| e.paths).collect();
     let range = format!("{base_commit}...HEAD");
     let committed = run_git(dir, &["diff", "--name-only", "-z", &range])?;
     touched.extend(parse_name_only_z(&committed));
@@ -710,7 +721,10 @@ pub fn adopt_racer(race: &Race, idx: usize) -> Result<String, String> {
             &[("base", race.base_branch.clone()), ("cur", cur)],
         ));
     }
-    let base_dirty = run_git(&race.repo, &["status", "--porcelain", "--untracked-files=no"])?;
+    let base_dirty = run_git(
+        &race.repo,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )?;
     if !base_dirty.is_empty() {
         return Err(tr(
             "ベースの作業ツリーに未コミットの変更があります — 綺麗にしてから採用してください",
@@ -720,15 +734,24 @@ pub fn adopt_racer(race: &Race, idx: usize) -> Result<String, String> {
         Ok(out) => Ok(match parse_merge_kind(&out) {
             MergeKind::FastForward => trf(
                 "✅ {branch} を {base} へ取り込みました (fast-forward)",
-                &[("branch", racer.branch.clone()), ("base", race.base_branch.clone())],
+                &[
+                    ("branch", racer.branch.clone()),
+                    ("base", race.base_branch.clone()),
+                ],
             ),
             MergeKind::Merge => trf(
                 "✅ {branch} を {base} へマージしました",
-                &[("branch", racer.branch.clone()), ("base", race.base_branch.clone())],
+                &[
+                    ("branch", racer.branch.clone()),
+                    ("base", race.base_branch.clone()),
+                ],
             ),
             MergeKind::UpToDate => trf(
                 "{base} は既に {branch} の内容を含んでいます",
-                &[("base", race.base_branch.clone()), ("branch", racer.branch.clone())],
+                &[
+                    ("base", race.base_branch.clone()),
+                    ("branch", racer.branch.clone()),
+                ],
             ),
         }),
         Err(e) => {
@@ -886,10 +909,7 @@ impl RacePanel {
             .get(idx)
             .ok_or_else(|| tr("racer が見つかりません"))?;
         let text = run_git(&racer.dir, &["diff", &race.base_commit])?;
-        let title = trf(
-            "🏁 {name} の差分",
-            &[("name", racer.preset_name.clone())],
-        );
+        let title = trf("🏁 {name} の差分", &[("name", racer.preset_name.clone())]);
         Ok((title, text))
     }
 
@@ -1083,7 +1103,11 @@ pub fn race_section(
     panel.sync_sessions(sessions);
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new(tr("🏁 プロンプトレース")).strong().color(theme.accent));
+        ui.label(
+            RichText::new(tr("🏁 プロンプトレース"))
+                .strong()
+                .color(theme.accent),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if panel.race.is_some() {
                 if ui
@@ -1148,7 +1172,10 @@ fn race_form_ui(
         ui.label(
             RichText::new(trf(
                 "racer ({min}〜{max} 体):",
-                &[("min", MIN_RACERS.to_string()), ("max", MAX_RACERS.to_string())],
+                &[
+                    ("min", MIN_RACERS.to_string()),
+                    ("max", MAX_RACERS.to_string()),
+                ],
             ))
             .color(theme.text_dim)
             .size(11.5),
@@ -1382,7 +1409,11 @@ fn race_rows_ui(
             None
         };
         if let Some(d) = armed {
-            let who: Vec<String> = d.conflict_with().iter().map(|&o| racer_label(race, o)).collect();
+            let who: Vec<String> = d
+                .conflict_with()
+                .iter()
+                .map(|&o| racer_label(race, o))
+                .collect();
             ui.label(
                 RichText::new(trf(
                     "⚠ 採用済みの {who} と {files} が重なります — もう一度 [⚠ それでも採用] を押すとマージします",
@@ -1404,9 +1435,11 @@ fn race_rows_ui(
     }
     if all_settled {
         ui.label(
-            RichText::new(tr("全 racer が決着しました — [✕ レースを閉じる] で片付けられます"))
-                .color(theme.text_dim)
-                .size(11.0),
+            RichText::new(tr(
+                "全 racer が決着しました — [✕ レースを閉じる] で片付けられます",
+            ))
+            .color(theme.text_dim)
+            .size(11.0),
         );
     }
 }
@@ -1487,7 +1520,10 @@ mod tests {
 
     #[test]
     fn slug_from_english_prompt() {
-        assert_eq!(slugify_prompt("Add dark mode toggle"), "add-dark-mode-toggle");
+        assert_eq!(
+            slugify_prompt("Add dark mode toggle"),
+            "add-dark-mode-toggle"
+        );
         assert_eq!(slugify_prompt("  Fix   bug #42!  "), "fix-bug-42");
     }
 
@@ -1512,7 +1548,10 @@ mod tests {
     #[test]
     fn branch_and_dir_names() {
         assert_eq!(race_branch("fix-bug", 2), "race/fix-bug-2");
-        assert_eq!(worktree_dir_name("myrepo", "fix-bug", 3), "myrepo-race-fix-bug-3");
+        assert_eq!(
+            worktree_dir_name("myrepo", "fix-bug", 3),
+            "myrepo-race-fix-bug-3"
+        );
     }
 
     #[test]
@@ -1571,7 +1610,12 @@ mod tests {
         let st = parse_shortstat(" 3 files changed, 10 insertions(+), 2 deletions(-)");
         assert_eq!(
             st,
-            DiffStat { files: 3, insertions: 10, deletions: 2, untracked: 0 }
+            DiffStat {
+                files: 3,
+                insertions: 10,
+                deletions: 2,
+                untracked: 0
+            }
         );
     }
 
@@ -1606,13 +1650,19 @@ mod tests {
     #[test]
     fn status_transitions() {
         // 起動 → 走行 → 終了
-        assert_eq!(RacerStatus::Preparing.next(Some(true)), RacerStatus::Running);
+        assert_eq!(
+            RacerStatus::Preparing.next(Some(true)),
+            RacerStatus::Running
+        );
         assert_eq!(RacerStatus::Running.next(Some(false)), RacerStatus::Exited);
         // セッションが消えた (タブごと閉じた) 場合も終了扱い
         assert_eq!(RacerStatus::Running.next(None), RacerStatus::Exited);
         // 終端状態は覆らない
         assert_eq!(RacerStatus::Adopted.next(Some(true)), RacerStatus::Adopted);
-        assert_eq!(RacerStatus::Discarded.next(Some(true)), RacerStatus::Discarded);
+        assert_eq!(
+            RacerStatus::Discarded.next(Some(true)),
+            RacerStatus::Discarded
+        );
         let err = RacerStatus::Error("x".into());
         assert_eq!(err.next(Some(true)), err);
     }
@@ -1656,7 +1706,11 @@ mod tests {
         panel.sync_sessions(&[(7, false)]);
         let race = panel.race.as_ref().unwrap();
         assert_eq!(race.racers[0].status, RacerStatus::Exited);
-        assert_eq!(race.racers[1].status, RacerStatus::Preparing, "未起動の racer は据え置き");
+        assert_eq!(
+            race.racers[1].status,
+            RacerStatus::Preparing,
+            "未起動の racer は据え置き"
+        );
     }
 
     #[test]
@@ -1672,9 +1726,15 @@ mod tests {
     #[test]
     fn scoped_prompt_appends_hint() {
         let p = build_scoped_race_prompt("直して", "race/x-1", Some("src/editor/"));
-        assert!(p.starts_with(&build_race_prompt("直して", "race/x-1")), "既存の文面が前置きになる");
+        assert!(
+            p.starts_with(&build_race_prompt("直して", "race/x-1")),
+            "既存の文面が前置きになる"
+        );
         assert!(p.contains("担当範囲: src/editor/"));
-        assert!(p.contains("衝突") || p.contains("奪い合"), "住み分けの理由が入る: {p}");
+        assert!(
+            p.contains("衝突") || p.contains("奪い合"),
+            "住み分けの理由が入る: {p}"
+        );
     }
 
     #[test]
@@ -1682,14 +1742,21 @@ mod tests {
         // ヒント無し / 空 / 空白だけ → 既存の投入文と 1 文字も変わらない
         let base = build_race_prompt("直して", "race/x-1");
         for hint in [None, Some(""), Some("   \n ")] {
-            assert_eq!(build_scoped_race_prompt("直して", "race/x-1", hint), base, "hint={hint:?}");
+            assert_eq!(
+                build_scoped_race_prompt("直して", "race/x-1", hint),
+                base,
+                "hint={hint:?}"
+            );
         }
     }
 
     #[test]
     fn scoped_prompt_trims_hint() {
         let p = build_scoped_race_prompt("x", "race/x-1", Some("  src/**/*.rs  "));
-        assert!(p.contains("担当範囲: src/**/*.rs —"), "前後の空白は落ちる: {p}");
+        assert!(
+            p.contains("担当範囲: src/**/*.rs —"),
+            "前後の空白は落ちる: {p}"
+        );
     }
 
     // ── status / name-only のパース ────────────────────────────────
@@ -1733,7 +1800,10 @@ mod tests {
         assert!(parse_status_z("").is_empty());
         assert!(parse_status_z("\0\0").is_empty());
         assert!(parse_status_z("xx").is_empty(), "短すぎるレコードは捨てる");
-        assert!(parse_status_z("MMno-space").is_empty(), "3 文字目が空白でなければ捨てる");
+        assert!(
+            parse_status_z("MMno-space").is_empty(),
+            "3 文字目が空白でなければ捨てる"
+        );
     }
 
     #[test]
@@ -1820,14 +1890,21 @@ mod tests {
                 .map(|(p, who)| (PathBuf::from(p), who.clone()))
                 .collect();
             assert_eq!(rep.contended, want, "{}: contended", c.name);
-            let want_pairs: Vec<(usize, usize, Vec<PathBuf>)> = c
-                .pairs
-                .iter()
-                .map(|(a, b, f)| (*a, *b, paths(f)))
-                .collect();
+            let want_pairs: Vec<(usize, usize, Vec<PathBuf>)> =
+                c.pairs.iter().map(|(a, b, f)| (*a, *b, paths(f))).collect();
             assert_eq!(rep.pairs, want_pairs, "{}: pairs", c.name);
-            assert_eq!(rep.is_clean(), c.contended.is_empty(), "{}: is_clean", c.name);
-            assert_eq!(rep.contended_count(), c.contended.len(), "{}: count", c.name);
+            assert_eq!(
+                rep.is_clean(),
+                c.contended.is_empty(),
+                "{}: is_clean",
+                c.name
+            );
+            assert_eq!(
+                rep.contended_count(),
+                c.contended.len(),
+                "{}: count",
+                c.name
+            );
         }
     }
 
@@ -1897,10 +1974,7 @@ mod tests {
             },
             Case {
                 name: "複数の採用済みと重なる → 相手もファイルも昇順で束ねる",
-                adopted: vec![
-                    (2, fset(&["src/race.rs"])),
-                    (0, fset(&["src/app.rs"])),
-                ],
+                adopted: vec![(2, fset(&["src/race.rs"])), (0, fset(&["src/app.rs"]))],
                 confirmed: false,
                 want: AdoptDecision::NeedsConfirm {
                     with: vec![0, 2],
@@ -2005,7 +2079,9 @@ mod tests {
 
     #[test]
     fn start_race_creates_worktrees_and_branches() {
-        let Some(repo) = fixture_repo("start") else { return };
+        let Some(repo) = fixture_repo("start") else {
+            return;
+        };
         let race = start_race(&repo, "add dark mode", &two_presets()).expect("開始できる");
         assert_eq!(race.racers.len(), 2);
         assert_eq!(race.racers[0].branch, "race/add-dark-mode-1");
@@ -2017,7 +2093,11 @@ mod tests {
             let head = run_git(&r.dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
             assert_eq!(head, r.branch);
         }
-        let branches = run_git(&race.repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]).unwrap();
+        let branches = run_git(
+            &race.repo,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        )
+        .unwrap();
         assert!(branches.contains("race/add-dark-mode-1"));
         assert!(branches.contains("race/add-dark-mode-2"));
 
@@ -2030,7 +2110,9 @@ mod tests {
 
     #[test]
     fn start_race_refuses_dirty_tree() {
-        let Some(repo) = fixture_repo("dirty") else { return };
+        let Some(repo) = fixture_repo("dirty") else {
+            return;
+        };
         std::fs::write(repo.join("a.txt"), "modified\n").expect("dirty write");
         let err = start_race(&repo, "x y", &two_presets()).expect_err("汚れたツリーでは開始しない");
         assert!(err.contains("未コミット"), "err={err}");
@@ -2039,7 +2121,9 @@ mod tests {
 
     #[test]
     fn adopt_fast_forwards_committed_work() {
-        let Some(repo) = fixture_repo("adopt") else { return };
+        let Some(repo) = fixture_repo("adopt") else {
+            return;
+        };
         let race = start_race(&repo, "feature x", &two_presets()).expect("開始");
         // racer 1 が成果をコミットする
         let r0 = &race.racers[0];
@@ -2054,14 +2138,23 @@ mod tests {
         // 敗者は破棄できる (綺麗な worktree なので force 不要)
         discard_racer(&race, 1, false).expect("敗者の破棄");
         assert!(!race.racers[1].dir.exists());
-        let branches = run_git(&race.repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]).unwrap();
-        assert!(!branches.contains(&race.racers[1].branch), "ブランチも消える");
+        let branches = run_git(
+            &race.repo,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        )
+        .unwrap();
+        assert!(
+            !branches.contains(&race.racers[1].branch),
+            "ブランチも消える"
+        );
         cleanup(&race);
     }
 
     #[test]
     fn adopt_refuses_uncommitted_racer_changes() {
-        let Some(repo) = fixture_repo("adopt-dirty") else { return };
+        let Some(repo) = fixture_repo("adopt-dirty") else {
+            return;
+        };
         let race = start_race(&repo, "feature y", &two_presets()).expect("開始");
         std::fs::write(race.racers[0].dir.join("a.txt"), "uncommitted\n").expect("write");
         let err = adopt_racer(&race, 0).expect_err("未コミットの成果は採用しない");
@@ -2071,7 +2164,9 @@ mod tests {
 
     #[test]
     fn adopt_conflict_aborts_and_leaves_base_clean() {
-        let Some(repo) = fixture_repo("conflict") else { return };
+        let Some(repo) = fixture_repo("conflict") else {
+            return;
+        };
         let race = start_race(&repo, "conflict z", &two_presets()).expect("開始");
         // racer とベースが同じファイルの同じ行を別内容に変える
         std::fs::write(race.racers[0].dir.join("a.txt"), "racer version\n").expect("write");
@@ -2093,7 +2188,9 @@ mod tests {
 
     #[test]
     fn discard_dirty_needs_force() {
-        let Some(repo) = fixture_repo("discard") else { return };
+        let Some(repo) = fixture_repo("discard") else {
+            return;
+        };
         let race = start_race(&repo, "discard w", &two_presets()).expect("開始");
         // 未コミットの変更がある worktree は force 無しでは消えない
         std::fs::write(race.racers[0].dir.join("junk.txt"), "junk\n").expect("write");
@@ -2108,7 +2205,9 @@ mod tests {
 
     #[test]
     fn panel_discard_sets_confirm_flag_on_refusal() {
-        let Some(repo) = fixture_repo("panel-discard") else { return };
+        let Some(repo) = fixture_repo("panel-discard") else {
+            return;
+        };
         let race = start_race(&repo, "panel v", &two_presets()).expect("開始");
         let mut panel = RacePanel::new();
         panel.begin(race);
@@ -2133,7 +2232,9 @@ mod tests {
 
     #[test]
     fn collect_scan_sees_committed_and_uncommitted() {
-        let Some(repo) = fixture_repo("touched") else { return };
+        let Some(repo) = fixture_repo("touched") else {
+            return;
+        };
         // ベースに 3 ファイル置いてからレースを始める
         for f in ["shared.rs", "solo1.rs", "solo2.rs"] {
             std::fs::write(repo.join(f), "base\n").expect("write");
@@ -2164,7 +2265,11 @@ mod tests {
             fset(&["shared.rs", "solo1.rs", "new0.txt"]),
             "racer0 の集合 t0={t0:?}"
         );
-        assert_eq!(t1, fset(&["shared.rs", "solo2.rs"]), "racer1 の集合 t1={t1:?}");
+        assert_eq!(
+            t1,
+            fset(&["shared.rs", "solo2.rs"]),
+            "racer1 の集合 t1={t1:?}"
+        );
 
         // 重なるのは shared.rs だけ — solo1/solo2/new0 は安全
         let rep = compute_overlaps(&[(0, t0), (1, t1)]);
@@ -2176,7 +2281,9 @@ mod tests {
 
     #[test]
     fn collect_scan_disjoint_racers_have_no_overlap() {
-        let Some(repo) = fixture_repo("disjoint") else { return };
+        let Some(repo) = fixture_repo("disjoint") else {
+            return;
+        };
         let race = start_race(&repo, "disjoint test", &two_presets()).expect("開始");
         std::fs::write(race.racers[0].dir.join("only-a.rs"), "a\n").expect("write");
         std::fs::write(race.racers[1].dir.join("only-b.rs"), "b\n").expect("write");
@@ -2190,14 +2297,19 @@ mod tests {
 
     #[test]
     fn collect_scan_tracks_renames_on_both_paths() {
-        let Some(repo) = fixture_repo("rename") else { return };
+        let Some(repo) = fixture_repo("rename") else {
+            return;
+        };
         let race = start_race(&repo, "rename test", &two_presets()).expect("開始");
         let d0 = race.racers[0].dir.clone();
         // a.txt (フィクスチャの初期ファイル) を index 上でリネームする
         git_ok(&d0, &["mv", "a.txt", "b.txt"]);
         let (_, t0) = collect_scan(&d0, &race.base_commit).expect("scan");
         assert!(t0.contains(&PathBuf::from("b.txt")), "新パス t0={t0:?}");
-        assert!(t0.contains(&PathBuf::from("a.txt")), "旧パスも触った扱い t0={t0:?}");
+        assert!(
+            t0.contains(&PathBuf::from("a.txt")),
+            "旧パスも触った扱い t0={t0:?}"
+        );
         cleanup(&race);
     }
 
@@ -2205,7 +2317,9 @@ mod tests {
 
     #[test]
     fn panel_adopt_guard_warns_on_second_overlapping_adopt() {
-        let Some(repo) = fixture_repo("guard") else { return };
+        let Some(repo) = fixture_repo("guard") else {
+            return;
+        };
         let race = start_race(&repo, "guard test", &two_presets()).expect("開始");
         let (d0, d1) = (race.racers[0].dir.clone(), race.racers[1].dir.clone());
         // 2 体とも a.txt を触る (別の行なのでマージ自体は通るが、取り合いではある)
@@ -2221,8 +2335,14 @@ mod tests {
         // ポーリングの中身を同期で流し込む (UI スレッドの経路は別テストの範囲外)
         {
             let base = panel.race.as_ref().unwrap().base_commit.clone();
-            let dirs: Vec<PathBuf> =
-                panel.race.as_ref().unwrap().racers.iter().map(|r| r.dir.clone()).collect();
+            let dirs: Vec<PathBuf> = panel
+                .race
+                .as_ref()
+                .unwrap()
+                .racers
+                .iter()
+                .map(|r| r.dir.clone())
+                .collect();
             for (i, dir) in dirs.iter().enumerate() {
                 let (st, touched) = collect_scan(dir, &base).expect("scan");
                 let r = &mut panel.race.as_mut().unwrap().racers[i];
@@ -2231,7 +2351,11 @@ mod tests {
             }
             panel.recompute_overlaps();
         }
-        assert_eq!(panel.overlap().contended_count(), 1, "a.txt を取り合っている");
+        assert_eq!(
+            panel.overlap().contended_count(),
+            1,
+            "a.txt を取り合っている"
+        );
 
         // 1 体目の採用は警告なし (採用済みが居ないので)
         assert_eq!(panel.adopt_decision_for(0), AdoptDecision::Proceed);
@@ -2252,7 +2376,9 @@ mod tests {
 
     #[test]
     fn panel_adopt_guard_silent_when_disjoint() {
-        let Some(repo) = fixture_repo("guard-disjoint") else { return };
+        let Some(repo) = fixture_repo("guard-disjoint") else {
+            return;
+        };
         let race = start_race(&repo, "guard disjoint", &two_presets()).expect("開始");
         let mut panel = RacePanel::new();
         panel.begin(race);
@@ -2264,14 +2390,20 @@ mod tests {
         panel.race.as_mut().unwrap().racers[1].touched = Some(fset(&["src/two.rs"]));
         panel.recompute_overlaps();
         assert!(panel.overlap().is_clean());
-        assert_eq!(panel.adopt_decision_for(1), AdoptDecision::Proceed, "重ならなければ黙って通す");
+        assert_eq!(
+            panel.adopt_decision_for(1),
+            AdoptDecision::Proceed,
+            "重ならなければ黙って通す"
+        );
         let snapshot = panel.race.as_ref().unwrap().clone();
         cleanup(&snapshot);
     }
 
     #[test]
     fn discard_clears_touched_and_overlap() {
-        let Some(repo) = fixture_repo("discard-overlap") else { return };
+        let Some(repo) = fixture_repo("discard-overlap") else {
+            return;
+        };
         let race = start_race(&repo, "discard overlap", &two_presets()).expect("開始");
         let mut panel = RacePanel::new();
         panel.begin(race);
@@ -2282,7 +2414,11 @@ mod tests {
         assert_eq!(panel.overlap().contended_count(), 1);
         // 破棄した racer はもう誰とも競合しない → サマリが消える
         panel.discard(1, false).expect("破棄");
-        assert!(panel.overlap().is_clean(), "破棄後は競合なし: {:?}", panel.overlap());
+        assert!(
+            panel.overlap().is_clean(),
+            "破棄後は競合なし: {:?}",
+            panel.overlap()
+        );
         assert!(panel.race.as_ref().unwrap().racers[1].touched.is_none());
         let snapshot = panel.race.as_ref().unwrap().clone();
         cleanup(&snapshot);

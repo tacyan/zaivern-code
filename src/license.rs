@@ -333,7 +333,8 @@ pub fn load_key_from(path: &Path) -> Option<String> {
 /// キーを保存する。ディレクトリが無ければ作る。
 pub fn save_key_to(path: &Path, key: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
     }
     let body = format!("{}\n", key.trim());
     std::fs::write(path, body).map_err(|e| format!("{} を保存できません: {e}", path.display()))?;
@@ -667,7 +668,11 @@ mod tests {
     fn empty_and_blank_are_unlicensed() {
         let (_, pk) = test_keys("blank");
         for s in ["", "   ", "\n\n", "\t \r\n"] {
-            assert_eq!(verify_key(s, &pk, 0), LicenseStatus::Unlicensed, "input={s:?}");
+            assert_eq!(
+                verify_key(s, &pk, 0),
+                LicenseStatus::Unlicensed,
+                "input={s:?}"
+            );
         }
     }
 
@@ -686,7 +691,10 @@ mod tests {
             (format!("ZVL1.{}.@@@@", parts[1]), "署名が Base64 でない"),
             (format!("ZVL1.{}.QUJD", parts[1]), "署名が 64 バイトでない"),
             ("ライセンスキー.あいう.えお".to_string(), "非 ASCII"),
-            (format!("ZVL1.{}.{}", parts[1], &parts[2][..10]), "署名が途中で切れている"),
+            (
+                format!("ZVL1.{}.{}", parts[1], &parts[2][..10]),
+                "署名が途中で切れている",
+            ),
         ];
         for (input, why) in cases {
             match verify_key(&input, &pk, 1_800_000_000) {
@@ -869,7 +877,10 @@ mod tests {
         assert_eq!(mask_key("1234567890123"), "123456…0123");
         assert_eq!(mask_key("ZVL1.abcdefghij.klmnop"), "ZVL1.a…mnop");
         // 非 ASCII でも文字境界で切るので panic しない
-        assert_eq!(mask_key("あいうえおかきくけこさしす"), "あいうえおか…こさしす");
+        assert_eq!(
+            mask_key("あいうえおかきくけこさしす"),
+            "あいうえおか…こさしす"
+        );
     }
 
     #[test]

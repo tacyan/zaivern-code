@@ -166,8 +166,9 @@ impl Default for SupervisorConfig {
             notify_after_secs: 30,
             escalate_after_secs: 180,
             allow_nudge: true,
-            nudge_text: "作業が止まっているようです。今の状況を1行で報告し、続行できるなら続けてください。"
-                .into(),
+            nudge_text:
+                "作業が止まっているようです。今の状況を1行で報告し、続行できるなら続けてください。"
+                    .into(),
             allow_auto_restart: false,
             allow_auto_halt: false,
 
@@ -424,9 +425,7 @@ pub fn gate(action: Intervention, approval: Approval, cfg: &SupervisorConfig) ->
 
         Intervention::AutoAnswer => match approval {
             // 承認モードでの自動応答はユーザーの承認権を奪うので、確認でも通さず拒否する。
-            Approval::Ask => {
-                GateResult::Refuse("承認モードが「都度確認」のため自動応答しません")
-            }
+            Approval::Ask => GateResult::Refuse("承認モードが「都度確認」のため自動応答しません"),
             Approval::Auto => GateResult::Allow,
             // Agent モードはプリセットのコマンド任せ。勝手には答えず確認を挟む。
             Approval::Agent => GateResult::NeedConfirm("Agent モードのため確認します"),
@@ -437,7 +436,9 @@ pub fn gate(action: Intervention, approval: Approval, cfg: &SupervisorConfig) ->
                 return GateResult::Refuse("促しが設定で無効です");
             }
             match approval {
-                Approval::Ask => GateResult::NeedConfirm("承認モードが「都度確認」のため確認します"),
+                Approval::Ask => {
+                    GateResult::NeedConfirm("承認モードが「都度確認」のため確認します")
+                }
                 Approval::Auto | Approval::Agent => GateResult::Allow,
             }
         }
@@ -457,7 +458,9 @@ pub fn gate(action: Intervention, approval: Approval, cfg: &SupervisorConfig) ->
 
         Intervention::Halt => {
             if approval == Approval::Ask {
-                return GateResult::NeedConfirm("承認モードが「都度確認」のため停止は確認が必要です");
+                return GateResult::NeedConfirm(
+                    "承認モードが「都度確認」のため停止は確認が必要です",
+                );
             }
             if cfg.allow_auto_halt {
                 GateResult::Allow
@@ -874,7 +877,11 @@ pub fn analyze_screen(text: &str, cfg: &SupervisorConfig) -> ScreenAnalysis {
 
     let n = cfg.loop_block_lines.max(1);
     let tail: Vec<u64> = norm_hashes.iter().rev().take(n).rev().copied().collect();
-    a.block_hash = if tail.is_empty() { 0 } else { hash_slice(&tail) };
+    a.block_hash = if tail.is_empty() {
+        0
+    } else {
+        hash_slice(&tail)
+    };
     a
 }
 
@@ -902,7 +909,11 @@ fn changes_in(samples: &[Sample], from_ms: u64, volatile: bool) -> usize {
     let mut n = 0;
     let mut prev: Option<u64> = None;
     for s in samples.iter() {
-        let h = if volatile { s.volatile_hash } else { s.content_hash };
+        let h = if volatile {
+            s.volatile_hash
+        } else {
+            s.content_hash
+        };
         if s.t_ms >= from_ms {
             if let Some(p) = prev {
                 if p != h {
@@ -1135,10 +1146,7 @@ pub fn detect_runaway(samples: &[Sample], cfg: &SupervisorConfig, now_ms: u64) -
         bytes as f32 / (span as f32 / 1000.0)
     };
 
-    let recent_span = recent
-        .last()?
-        .t_ms
-        .saturating_sub(recent.first()?.t_ms);
+    let recent_span = recent.last()?.t_ms.saturating_sub(recent.first()?.t_ms);
     if recent_span < sustain_ms / 2 {
         return None; // 十分な持続がない
     }
@@ -1453,7 +1461,11 @@ impl Supervisor {
     }
 
     /// UI スレッドから毎フレーム呼ぶ。内部で間引くので毎フレームで安い。
-    pub fn tick(&mut self, snaps: &[SessionSnapshot], approval: Approval) -> Vec<InterventionIntent> {
+    pub fn tick(
+        &mut self,
+        snaps: &[SessionSnapshot],
+        approval: Approval,
+    ) -> Vec<InterventionIntent> {
         let now = self.elapsed_ms();
         self.tick_ms(snaps, approval, now)
     }
@@ -1655,8 +1667,7 @@ impl Supervisor {
         // last_seen_ms から一定の猶予内は状態を保持する。
         const ESCALATION_GRACE_MS: u64 = 30_000;
         mon.escalation.retain(|k, e| {
-            active.contains(k)
-                || now_ms.saturating_sub(e.last_seen_ms) < ESCALATION_GRACE_MS
+            active.contains(k) || now_ms.saturating_sub(e.last_seen_ms) < ESCALATION_GRACE_MS
         });
 
         for (anomaly, reason) in &found {
@@ -2005,7 +2016,14 @@ mod tests {
         c.stall_secs = 60; // 猶予込みで 120s
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
         let texts: Vec<String> = (0..20)
-            .map(|i| format!("{} Thinking… ({}s · {} tokens)", frames[i % 8], i * 5, 100 + i * 7))
+            .map(|i| {
+                format!(
+                    "{} Thinking… ({}s · {} tokens)",
+                    frames[i % 8],
+                    i * 5,
+                    100 + i * 7
+                )
+            })
             .collect();
         let screens: Vec<(u64, &str)> = texts
             .iter()
@@ -2141,7 +2159,10 @@ mod tests {
         let mut body = String::new();
         let mut screens: Vec<(u64, String)> = Vec::new();
         for i in 0..30u64 {
-            body.push_str(&format!("error[E{:04}]: mismatched types at line {}\n", i, i));
+            body.push_str(&format!(
+                "error[E{:04}]: mismatched types at line {}\n",
+                i, i
+            ));
             screens.push((i * 1_000, body.clone()));
         }
         let refs: Vec<(u64, &str)> = screens.iter().map(|(t, s)| (*t, s.as_str())).collect();
@@ -2170,8 +2191,14 @@ mod tests {
     fn zero_errors_summary_is_not_an_error() {
         // 偽陽性テスト: "0 errors" をエラー行にしない
         let c = cfg();
-        assert!(!is_error_line(&normalize_line("build finished: 0 errors", false), &c));
-        assert!(!is_error_line(&normalize_line("no errors found", false), &c));
+        assert!(!is_error_line(
+            &normalize_line("build finished: 0 errors", false),
+            &c
+        ));
+        assert!(!is_error_line(
+            &normalize_line("no errors found", false),
+            &c
+        ));
         assert!(is_error_line(&normalize_line("error: boom", false), &c));
     }
 
@@ -2240,7 +2267,10 @@ mod tests {
             ("エラー: 失敗しました", "エラー"),
         ] {
             assert!(contains_error_word(hay, needle), "{hay} / {needle}");
-            assert!(crate::kanban::contains_word(hay, needle), "{hay} / {needle}");
+            assert!(
+                crate::kanban::contains_word(hay, needle),
+                "{hay} / {needle}"
+            );
         }
         // 部分一致では当たるが語としては当たらない
         assert!(!contains_error_word("errorlevel neq #", "error"));
@@ -2351,8 +2381,9 @@ mod tests {
     fn stable_error_screen_is_not_a_storm() {
         // 偽陽性テスト: 同じエラーが画面に残り続けるだけでは嵐ではない
         let c = cfg();
-        let screens: Vec<(u64, &str)> =
-            (0..60).map(|i| (i * 1_000u64, "error: one single failure")).collect();
+        let screens: Vec<(u64, &str)> = (0..60)
+            .map(|i| (i * 1_000u64, "error: one single failure"))
+            .collect();
         let s = samples_from(&screens, &c, false);
         assert!(
             detect_error_storm(&s, &c, 59_000).is_none(),
@@ -2419,7 +2450,10 @@ mod tests {
             gate(Intervention::AutoAnswer, Approval::Ask, &c),
             GateResult::Refuse("承認モードが「都度確認」のため自動応答しません")
         );
-        assert_eq!(gate(Intervention::AutoAnswer, Approval::Auto, &c), GateResult::Allow);
+        assert_eq!(
+            gate(Intervention::AutoAnswer, Approval::Auto, &c),
+            GateResult::Allow
+        );
         assert!(matches!(
             gate(Intervention::AutoAnswer, Approval::Agent, &c),
             GateResult::NeedConfirm(_)
@@ -2444,8 +2478,14 @@ mod tests {
             );
         }
         // Notify 以下は常に通る
-        assert_eq!(gate(Intervention::Notify, Approval::Ask, &c), GateResult::Allow);
-        assert_eq!(gate(Intervention::Observe, Approval::Ask, &c), GateResult::Allow);
+        assert_eq!(
+            gate(Intervention::Notify, Approval::Ask, &c),
+            GateResult::Allow
+        );
+        assert_eq!(
+            gate(Intervention::Observe, Approval::Ask, &c),
+            GateResult::Allow
+        );
     }
 
     #[test]
@@ -2455,7 +2495,10 @@ mod tests {
         assert!(!c.allow_auto_halt, "既定で自動停止は無効であるべき");
         for ap in [Approval::Ask, Approval::Auto, Approval::Agent] {
             assert!(
-                matches!(gate(Intervention::Restart, ap, &c), GateResult::NeedConfirm(_)),
+                matches!(
+                    gate(Intervention::Restart, ap, &c),
+                    GateResult::NeedConfirm(_)
+                ),
                 "既定では {} でも再起動は確認が要る",
                 ap_name(ap)
             );
@@ -2467,7 +2510,10 @@ mod tests {
         // 明示的にオプトインし、かつ Ask でない場合のみ自動
         let mut c2 = cfg();
         c2.allow_auto_restart = true;
-        assert_eq!(gate(Intervention::Restart, Approval::Auto, &c2), GateResult::Allow);
+        assert_eq!(
+            gate(Intervention::Restart, Approval::Auto, &c2),
+            GateResult::Allow
+        );
     }
 
     #[test]
@@ -2494,9 +2540,19 @@ mod tests {
     fn restart_does_not_auto_fire_on_crash_under_default_config() {
         let mut sv = Supervisor::new(cfg());
         // 作業中にする (数字だけの違いは正規化で潰れるので語そのものを変える)
-        let steps = ["reading src/a.rs", "editing src/b.rs", "running tests", "linking", "checking"];
+        let steps = [
+            "reading src/a.rs",
+            "editing src/b.rs",
+            "running tests",
+            "linking",
+            "checking",
+        ];
         for (i, step) in steps.iter().enumerate() {
-            sv.tick_ms(&[snap(1, step, true, false)], Approval::Auto, i as u64 * 2_000);
+            sv.tick_ms(
+                &[snap(1, step, true, false)],
+                Approval::Auto,
+                i as u64 * 2_000,
+            );
         }
         assert_eq!(sv.state_of(1), Some(SessionState::Working));
         // 異常終了
@@ -2526,8 +2582,15 @@ mod tests {
         let mut sv = Supervisor::new(c);
         let mut total_notify = 0;
         for i in 0..60u64 {
-            let out = sv.tick_ms(&[snap(1, "frozen screen", true, false)], Approval::Auto, i * 5_000);
-            total_notify += out.iter().filter(|x| x.action == Intervention::Notify).count();
+            let out = sv.tick_ms(
+                &[snap(1, "frozen screen", true, false)],
+                Approval::Auto,
+                i * 5_000,
+            );
+            total_notify += out
+                .iter()
+                .filter(|x| x.action == Intervention::Notify)
+                .count();
         }
         assert_eq!(
             total_notify, 1,
@@ -2569,7 +2632,10 @@ mod tests {
                 Approval::Auto,
                 i * 5_000,
             );
-            auto.extend(out.into_iter().filter(|x| x.action == Intervention::AutoAnswer));
+            auto.extend(
+                out.into_iter()
+                    .filter(|x| x.action == Intervention::AutoAnswer),
+            );
         }
         assert!(!auto.is_empty(), "Auto モードでは自動応答が出るべき");
         assert!(!auto[0].needs_confirmation);
@@ -2601,7 +2667,11 @@ mod tests {
         c.sample_interval_ms = 0;
         let mut sv = Supervisor::new(c);
         for i in 0..500u64 {
-            sv.tick_ms(&[snap(1, &format!("line {i}"), true, false)], Approval::Auto, i * 100);
+            sv.tick_ms(
+                &[snap(1, &format!("line {i}"), true, false)],
+                Approval::Auto,
+                i * 100,
+            );
         }
         let mon = sv.monitors.get(&1).unwrap();
         assert_eq!(mon.samples.len(), 10);
@@ -2611,15 +2681,26 @@ mod tests {
     #[test]
     fn gone_sessions_are_forgotten() {
         let mut sv = Supervisor::new(cfg());
-        sv.tick_ms(&[snap(1, "a", true, false), snap(2, "b", true, false)], Approval::Auto, 0);
+        sv.tick_ms(
+            &[snap(1, "a", true, false), snap(2, "b", true, false)],
+            Approval::Auto,
+            0,
+        );
         assert_eq!(sv.monitors.len(), 2);
         sv.tick_ms(&[snap(1, "a", true, false)], Approval::Auto, 2_000);
-        assert_eq!(sv.monitors.len(), 1, "消えたセッションの監視状態は捨てるべき");
+        assert_eq!(
+            sv.monitors.len(),
+            1,
+            "消えたセッションの監視状態は捨てるべき"
+        );
     }
 
     #[test]
     fn redaction_removes_secrets() {
-        let out = redact("token sk-abcdefghijklmnopqrstuvwxyz012345 user a@b.com", 500);
+        let out = redact(
+            "token sk-abcdefghijklmnopqrstuvwxyz012345 user a@b.com",
+            500,
+        );
         assert!(!out.contains("sk-abcdef"), "APIキーは秘匿されるべき: {out}");
         assert!(!out.contains("a@b.com"), "メールは秘匿されるべき: {out}");
     }
@@ -2652,7 +2733,10 @@ mod tests {
                 .unwrap_or("")
                 .contains("一晩中自律改善ループ")
         });
-        assert!(loop_intent.is_some(), "アイドルのセッションでループ指示が生成されるべき");
+        assert!(
+            loop_intent.is_some(),
+            "アイドルのセッションでループ指示が生成されるべき"
+        );
 
         // インターバル内は再発火しないこと
         let intents_soon = sv.tick_ms(&snaps, Approval::Auto, 5_000);
@@ -2662,7 +2746,10 @@ mod tests {
                 .unwrap_or("")
                 .contains("一晩中自律改善ループ")
         });
-        assert!(loop_intent_soon.is_none(), "インターバル内は重複発生しないこと");
+        assert!(
+            loop_intent_soon.is_none(),
+            "インターバル内は重複発生しないこと"
+        );
     }
 
     // ---------------- derive_state (状態導出の優先順位) ----------------

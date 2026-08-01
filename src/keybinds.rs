@@ -241,12 +241,8 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         }
         // ⌥⌘[ / ⌥⌘] は VS Code (mac) の折りたたみ / 展開と同じ。
         // 既存の ⌥⌘ 割り当ては S (すべて保存) と F (置換) だけなので空いている。
-        BindAction::ToggleFold => {
-            KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::OpenBracket)
-        }
-        BindAction::UnfoldAll => {
-            KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::CloseBracket)
-        }
+        BindAction::ToggleFold => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::OpenBracket),
+        BindAction::UnfoldAll => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::CloseBracket),
         BindAction::ToggleBookmark => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::B),
         BindAction::ReopenClosedTab => KeyboardShortcut::new(cmd_shift, Key::T),
         // ⌃Space は macOS が「前の入力ソース」に予約している (実測: 本文の
@@ -827,7 +823,10 @@ mod tests {
         assert_eq!(parse_shortcut("ctrl+backtick"), parse_shortcut("ctrl+`"));
         // F13 以降 (macOS で輝度/音量キーと競合しない) もバインドできる
         assert_eq!(parse_shortcut("f13"), Some(sc(Modifiers::NONE, Key::F13)));
-        assert_eq!(parse_shortcut("cmd+f20"), Some(sc(Modifiers::COMMAND, Key::F20)));
+        assert_eq!(
+            parse_shortcut("cmd+f20"),
+            Some(sc(Modifiers::COMMAND, Key::F20))
+        );
         assert_eq!(parse_shortcut("f21"), None);
     }
 
@@ -838,7 +837,10 @@ mod tests {
             Some(sc(Modifiers::ALT, Key::ArrowUp))
         );
         // option は alt の別名
-        assert_eq!(parse_shortcut("option+down"), Some(sc(Modifiers::ALT, Key::ArrowDown)));
+        assert_eq!(
+            parse_shortcut("option+down"),
+            Some(sc(Modifiers::ALT, Key::ArrowDown))
+        );
     }
 
     #[test]
@@ -876,7 +878,10 @@ mod tests {
 
     #[test]
     fn parse_space() {
-        assert_eq!(parse_shortcut("space"), Some(sc(Modifiers::NONE, Key::Space)));
+        assert_eq!(
+            parse_shortcut("space"),
+            Some(sc(Modifiers::NONE, Key::Space))
+        );
         assert_eq!(
             parse_shortcut("cmd+space"),
             Some(sc(Modifiers::COMMAND, Key::Space))
@@ -1108,28 +1113,78 @@ mod tests {
     #[test]
     fn every_action_has_a_config_name() {
         let names = [
-            "save", "save_as", "close_tab", "new_file", "new_window", "palette_files",
-            "palette_commands", "toggle_terminal", "toggle_sidebar", "find", "toggle_cockpit",
-            "toggle_kanban", "toggle_deck", "toggle_md_preview", "new_agent", "font_inc",
+            "save",
+            "save_as",
+            "close_tab",
+            "new_file",
+            "new_window",
+            "palette_files",
+            "palette_commands",
+            "toggle_terminal",
+            "toggle_sidebar",
+            "find",
+            "toggle_cockpit",
+            "toggle_kanban",
+            "toggle_deck",
+            "toggle_md_preview",
+            "new_agent",
+            "font_inc",
             "font_dec",
-            "toggle_comment", "duplicate_line", "move_line_up", "move_line_down",
-            "focus_explorer", "open_file", "save_all", "goto_line", "next_tab", "prev_tab",
-            "global_search", "global_replace", "open_replace", "new_terminal", "nav_back",
-            "nav_forward", "goto_definition", "goto_bracket", "run_build_task",
-            "toggle_problems", "toggle_fullscreen", "toggle_fold", "unfold_all",
-            "toggle_bookmark", "reopen_closed_tab", "lsp_completion", "lsp_references",
-            "lsp_symbols", "lsp_rename", "lsp_format", "lsp_code_action",
-            "lsp_signature_help", "select_next_occurrence",
-            "split_editor_right", "split_editor_down", "focus_pane_1", "focus_pane_2",
-            "focus_pane_3", "diff_next_change", "diff_prev_change",
+            "toggle_comment",
+            "duplicate_line",
+            "move_line_up",
+            "move_line_down",
+            "focus_explorer",
+            "open_file",
+            "save_all",
+            "goto_line",
+            "next_tab",
+            "prev_tab",
+            "global_search",
+            "global_replace",
+            "open_replace",
+            "new_terminal",
+            "nav_back",
+            "nav_forward",
+            "goto_definition",
+            "goto_bracket",
+            "run_build_task",
+            "toggle_problems",
+            "toggle_fullscreen",
+            "toggle_fold",
+            "unfold_all",
+            "toggle_bookmark",
+            "reopen_closed_tab",
+            "lsp_completion",
+            "lsp_references",
+            "lsp_symbols",
+            "lsp_rename",
+            "lsp_format",
+            "lsp_code_action",
+            "lsp_signature_help",
+            "select_next_occurrence",
+            "split_editor_right",
+            "split_editor_down",
+            "focus_pane_1",
+            "focus_pane_2",
+            "focus_pane_3",
+            "diff_next_change",
+            "diff_prev_change",
         ];
-        assert_eq!(names.len(), ALL_ACTIONS.len(), "名前表とアクション一覧の数が合わない");
-        let mut resolved: Vec<BindAction> =
-            names.iter().map(|n| Keybinds::action_from_name(n).unwrap()).collect();
+        assert_eq!(
+            names.len(),
+            ALL_ACTIONS.len(),
+            "名前表とアクション一覧の数が合わない"
+        );
+        let mut resolved: Vec<BindAction> = names
+            .iter()
+            .map(|n| Keybinds::action_from_name(n).unwrap())
+            .collect();
         for a in ALL_ACTIONS {
-            let i = resolved.iter().position(|r| *r == a).unwrap_or_else(|| {
-                panic!("{a:?} を引ける config 名が無い")
-            });
+            let i = resolved
+                .iter()
+                .position(|r| *r == a)
+                .unwrap_or_else(|| panic!("{a:?} を引ける config 名が無い"));
             resolved.remove(i);
         }
         assert!(resolved.is_empty());
@@ -1269,10 +1324,16 @@ mod tests {
                 plain = ctx.input_mut(|i| i.consume_shortcut(&sc));
                 compat = ctx.input_mut(|i| consume_shortcut_compat(i, sc));
             });
-            assert!(!plain, "{a:?}: 素の consume_shortcut が拾えたなら前提が変わった");
+            assert!(
+                !plain,
+                "{a:?}: 素の consume_shortcut が拾えたなら前提が変わった"
+            );
             assert!(compat, "{a:?} = {} を拾えていない", format_shortcut(sc));
         }
-        assert!(checked >= 2, "⌘⇧C / ⌘⇧V が対象から外れている ({checked} 件)");
+        assert!(
+            checked >= 2,
+            "⌘⇧C / ⌘⇧V が対象から外れている ({checked} 件)"
+        );
     }
 
     /// 素の ⌘C / ⌘V は横取りしない (コピー&ペーストを壊さない)。

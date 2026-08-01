@@ -268,7 +268,10 @@ impl Git {
     /// 相対ディレクトリ直下の「git 上は削除済み」ファイル名 (幽霊行表示用)。
     pub fn deleted_names_in(&self, rel_dir: &str) -> &[String] {
         let key = rel_dir.trim_end_matches('/');
-        self.deleted_cache.get(key).map(Vec::as_slice).unwrap_or(&[])
+        self.deleted_cache
+            .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// 変更ファイル数 (status のエントリ数)。
@@ -293,8 +296,10 @@ impl Git {
                 .map(|out| parse_hunk_marks(&out))
                 .unwrap_or_default(),
         );
-        self.marks_cache
-            .insert(rel_path.to_string(), (text_hash, Instant::now(), Arc::clone(&marks)));
+        self.marks_cache.insert(
+            rel_path.to_string(),
+            (text_hash, Instant::now(), Arc::clone(&marks)),
+        );
         marks
     }
 
@@ -455,7 +460,11 @@ impl GitSet {
 
     /// primary ルートが属する repo のブランチ名。
     pub fn branch(&mut self) -> Option<String> {
-        let top = self.roots.first().and_then(|r| self.toplevels.get(r))?.clone()?;
+        let top = self
+            .roots
+            .first()
+            .and_then(|r| self.toplevels.get(r))?
+            .clone()?;
         self.repos.get_mut(&top)?.branch()
     }
 
@@ -622,7 +631,9 @@ fn derive_deleted_by_dir(files: &HashMap<String, FileStatus>) -> HashMap<String,
             continue;
         }
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
-        map.entry(dir.to_string()).or_default().push(name.to_string());
+        map.entry(dir.to_string())
+            .or_default()
+            .push(name.to_string());
     }
     for names in map.values_mut() {
         names.sort();
@@ -1129,10 +1140,7 @@ pub fn commit_diff(repo: &Path, sha: &str) -> Result<(String, String), String> {
     let title = if subject.is_empty() {
         trf("差分 {sha}", &[("sha", short)])
     } else {
-        trf(
-            "{sha} {subject}",
-            &[("sha", short), ("subject", subject)],
-        )
+        trf("{sha} {subject}", &[("sha", short), ("subject", subject)])
     };
     Ok((title, body))
 }
@@ -1192,9 +1200,7 @@ impl SwitchBlock {
     /// ユーザーに出す説明文。
     pub fn message(&self) -> String {
         match self {
-            SwitchBlock::AlreadyOn(b) => {
-                trf("すでに {b} に居ます", &[("b", b.clone())])
-            }
+            SwitchBlock::AlreadyOn(b) => trf("すでに {b} に居ます", &[("b", b.clone())]),
             SwitchBlock::Dirty { names, total } => {
                 let head = names.join(", ");
                 let rest = total.saturating_sub(names.len());
@@ -1218,9 +1224,7 @@ impl SwitchBlock {
                 "{b} は別の作業ツリーで開かれています: {p}",
                 &[("b", branch.clone()), ("p", path.display().to_string())],
             ),
-            SwitchBlock::BadName(n) => {
-                trf("ブランチ名として使えません: {n}", &[("n", n.clone())])
-            }
+            SwitchBlock::BadName(n) => trf("ブランチ名として使えません: {n}", &[("n", n.clone())]),
         }
     }
 
@@ -1243,7 +1247,9 @@ pub fn local_branch_for_remote(remote_ref: &str) -> Option<String> {
 /// `git --version` の出力から (major, minor) を取り出す。
 pub fn parse_git_version(out: &str) -> Option<(u32, u32)> {
     // "git version 2.39.3 (Apple Git-145)" / "git version 2.45.1.windows.1"
-    let tail = out.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let tail = out
+        .split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
     let mut it = tail.split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next().unwrap_or("0");
@@ -1644,7 +1650,9 @@ pub(crate) fn run_git_at(dir: &Path, args: &[String]) -> Result<String, String> 
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
-        let err = crate::textenc::decode_output(&out.stderr).trim().to_string();
+        let err = crate::textenc::decode_output(&out.stderr)
+            .trim()
+            .to_string();
         return Err(if err.is_empty() {
             trf("git {args} が失敗しました", &[("args", args.join(" "))])
         } else {
@@ -1884,11 +1892,11 @@ mod tests {
             ("Alice", "3日前", 12, Some("A")),             // 入らない → イニシャル
             ("Alice Smith", "3日前", 5, Some("AS")),       // 2 語 → 頭文字 2 つ
             ("Alice Smith", "3日前", 1, None),             // イニシャルも入らない
-            ("山田 太郎", "1年前", 3, Some("山")),          // 全角は 1 文字で 2 桁
+            ("山田 太郎", "1年前", 3, Some("山")),         // 全角は 1 文字で 2 桁
             ("山田 太郎", "1年前", 1, None),
-            ("Alice", "3日前", 0, None), // 幅ゼロは常に非表示
+            ("Alice", "3日前", 0, None),          // 幅ゼロは常に非表示
             ("", "3日前", 20, Some("? · 3日前")), // 著者不明でも壊れない
-            ("Alice", "", 6, Some("Alice")), // 日時が取れないときは著者だけ
+            ("Alice", "", 6, Some("Alice")),      // 日時が取れないときは著者だけ
         ];
         for (author, rel, cols, want) in table {
             let got = fit_blame_label(author, rel, *cols);
@@ -2104,7 +2112,11 @@ index 1234567..89abcde 100644
             a.canonicalize().expect("canon a"),
             b.canonicalize().expect("canon b"),
         ]);
-        assert_eq!(set.repo_count(), 1, "同一 repo の 2 ルートは Git を共有する");
+        assert_eq!(
+            set.repo_count(),
+            1,
+            "同一 repo の 2 ルートは Git を共有する"
+        );
 
         std::fs::remove_dir_all(&repo).ok();
     }
@@ -2309,7 +2321,16 @@ index 1234567..89abcde 100644
         files.insert(deep.to_string(), FileStatus::Modified);
         let dirs = derive_dir_status(&files, &[]);
 
-        for anc in ["", "a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e", "a/b/c/d/e/f", "a/b/c/d/e/f/g"] {
+        for anc in [
+            "",
+            "a",
+            "a/b",
+            "a/b/c",
+            "a/b/c/d",
+            "a/b/c/d/e",
+            "a/b/c/d/e/f",
+            "a/b/c/d/e/f/g",
+        ] {
             assert_eq!(
                 dirs.get(anc),
                 Some(&(FileStatus::Modified, 1)),
@@ -2336,7 +2357,10 @@ index 1234567..89abcde 100644
         assert_eq!(g.dir_status("src"), Some((FileStatus::Modified, 3)));
         // 中間層は 2 件・単一種なので Added のまま
         assert_eq!(g.dir_status("src/deep"), Some((FileStatus::Added, 2)));
-        assert_eq!(g.dir_status("src/deep/one/two/three"), Some((FileStatus::Added, 2)));
+        assert_eq!(
+            g.dir_status("src/deep/one/two/three"),
+            Some((FileStatus::Added, 2))
+        );
         // 末尾スラッシュ付きでも同じキーに解決する
         assert_eq!(g.dir_status("src/deep/"), Some((FileStatus::Added, 2)));
         assert_eq!(g.dir_status("vendor"), None);
@@ -2363,12 +2387,23 @@ index 1234567..89abcde 100644
     fn delete_tints_parent_chain_even_though_file_is_gone() {
         let parsed = parse_porcelain_z(" D a/b/c/d/e/f/gone.rs\0", MAX_STATUS_ENTRIES);
         let dirs = derive_dir_status(&parsed.files, &parsed.renames);
-        for anc in ["", "a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e", "a/b/c/d/e/f"] {
+        for anc in [
+            "",
+            "a",
+            "a/b",
+            "a/b/c",
+            "a/b/c/d",
+            "a/b/c/d/e",
+            "a/b/c/d/e/f",
+        ] {
             assert_eq!(dirs.get(anc), Some(&(FileStatus::Deleted, 1)), "{anc}");
         }
         // 幽霊行 (消えたファイル名) も親ディレクトリから引ける
         let ghosts = derive_deleted_by_dir(&parsed.files);
-        assert_eq!(ghosts.get("a/b/c/d/e/f").map(Vec::as_slice), Some(&["gone.rs".to_string()][..]));
+        assert_eq!(
+            ghosts.get("a/b/c/d/e/f").map(Vec::as_slice),
+            Some(&["gone.rs".to_string()][..])
+        );
     }
 
     /// サブモジュール / ネストした repo の扱い。
@@ -2407,7 +2442,11 @@ index 1234567..89abcde 100644
         let dirs = derive_dir_status(&parsed.files, &parsed.renames);
         // ルートは取り込めた件数ぶん、ディレクトリ数はパス空間ぶんで抑えられる
         assert_eq!(dirs.get("").map(|d| d.1), Some(MAX_STATUS_ENTRIES));
-        assert!(dirs.len() <= 1 + 40 + 400, "ディレクトリ集計が爆発しない: {}", dirs.len());
+        assert!(
+            dirs.len() <= 1 + 40 + 400,
+            "ディレクトリ集計が爆発しない: {}",
+            dirs.len()
+        );
     }
 
     /// 病的に深いパスでも祖先の展開を打ち切る (メモリ暴走止め)。
@@ -2625,14 +2664,26 @@ index 1234567..89abcde 100644
         let names: Vec<&str> = list.local.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["feature/login-v2", "night/2026-07-26", "日本語ブランチ", "main"],
+            vec![
+                "feature/login-v2",
+                "night/2026-07-26",
+                "日本語ブランチ",
+                "main"
+            ],
             "`/` 入りも非 ASCII も出力順のまま残る"
         );
         assert!(
-            list.local.iter().find(|b| b.name == "night/2026-07-26").unwrap().other_worktree,
+            list.local
+                .iter()
+                .find(|b| b.name == "night/2026-07-26")
+                .unwrap()
+                .other_worktree,
             "`+` は別 worktree で使用中",
         );
-        assert!(!list.local.iter().any(|b| b.current), "detached なので current は無い");
+        assert!(
+            !list.local.iter().any(|b| b.current),
+            "detached なので current は無い"
+        );
         assert_eq!(
             list.remote,
             vec!["origin/feature/login-v2", "origin/日本語ブランチ"],
@@ -2817,7 +2868,8 @@ index 1234567..89abcde 100644
         assert_eq!(snap.dirty, vec!["a.txt".to_string()]);
         assert_eq!(snap.dirty_total, 1);
         assert!(
-            snap.plan_switch(&SwitchTarget::Local("whatever".into())).is_err(),
+            snap.plan_switch(&SwitchTarget::Local("whatever".into()))
+                .is_err(),
             "汚れていれば切り替えない"
         );
 
@@ -2832,7 +2884,13 @@ index 1234567..89abcde 100644
             return; // git が無い環境ではスキップ
         };
         // 1 つ目: 2 行
-        commit_with(&repo, "note.txt", "first line\nsecond line\n", "山田 太郎", "最初のコミット");
+        commit_with(
+            &repo,
+            "note.txt",
+            "first line\nsecond line\n",
+            "山田 太郎",
+            "最初のコミット",
+        );
         // 2 つ目: 3 行目を足す (別の著者)
         commit_with(
             &repo,
@@ -2842,8 +2900,11 @@ index 1234567..89abcde 100644
             "3 行目を追加",
         );
         // 保存前の編集に相当する未コミット行
-        std::fs::write(repo.join("note.txt"), "first line\nsecond line\nthird line\ndraft\n")
-            .expect("dirty it");
+        std::fs::write(
+            repo.join("note.txt"),
+            "first line\nsecond line\nthird line\ndraft\n",
+        )
+        .expect("dirty it");
 
         let got = run_blame(&repo, "note.txt", 1, 4).expect("blame が取れる");
         println!("── git blame --line-porcelain -L 1,4 -- note.txt の解析結果 ──");
@@ -2872,8 +2933,14 @@ index 1234567..89abcde 100644
         assert!(body.contains("+third line"), "差分本文: {body}");
         // repo でないフォルダは静かに None
         let plain = crate::test_util::unique_temp_dir("zaivern-git-test", "blame-norepo");
-        assert!(run_blame(&plain, "nothing.txt", 1, 1).is_none(), "非 repo は静かに諦める");
-        assert!(run_blame(&repo, "untracked.txt", 1, 1).is_none(), "未追跡も同じ");
+        assert!(
+            run_blame(&plain, "nothing.txt", 1, 1).is_none(),
+            "非 repo は静かに諦める"
+        );
+        assert!(
+            run_blame(&repo, "untracked.txt", 1, 1).is_none(),
+            "未追跡も同じ"
+        );
         std::fs::remove_dir_all(&plain).ok();
 
         std::fs::remove_dir_all(&repo).ok();

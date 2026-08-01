@@ -202,7 +202,9 @@ pub fn sniff_kind(head: &[u8]) -> Option<&'static str> {
     }
     MAGICS
         .iter()
-        .find(|(off, magic, _)| head.len() >= off + magic.len() && &&head[*off..off + magic.len()] == magic)
+        .find(|(off, magic, _)| {
+            head.len() >= off + magic.len() && &&head[*off..off + magic.len()] == magic
+        })
         .map(|(_, _, name)| *name)
 }
 
@@ -392,7 +394,9 @@ fn probe_wav(b: &[u8]) -> MediaInfo {
     // チャンクは (id 4B, size 4B LE, payload) が偶数境界で並ぶ
     while pos + 8 <= b.len() {
         let id = &b[pos..pos + 4];
-        let Some(size) = le_u32(b, pos + 4) else { break };
+        let Some(size) = le_u32(b, pos + 4) else {
+            break;
+        };
         let body = pos + 8;
         if id == b"fmt " {
             info.channels = le_u16(b, body + 2);
@@ -403,7 +407,9 @@ fn probe_wav(b: &[u8]) -> MediaInfo {
             break;
         }
         // 奇数長のチャンクは 1 バイトのパディングが入る
-        let step = (size as usize).saturating_add(size as usize % 2).saturating_add(8);
+        let step = (size as usize)
+            .saturating_add(size as usize % 2)
+            .saturating_add(8);
         pos = pos.saturating_add(step.max(8));
     }
     info
@@ -656,7 +662,10 @@ pub fn parse_zip_at(window: &[u8], base: u64) -> ZipListing {
         }
     }
     // window はファイルの base バイト目から始まる
-    let Some(rel) = cd_off.checked_sub(base).and_then(|v| usize::try_from(v).ok()) else {
+    let Some(rel) = cd_off
+        .checked_sub(base)
+        .and_then(|v| usize::try_from(v).ok())
+    else {
         return ZipListing {
             error: Some(ZipError::BrokenDirectory),
             ..Default::default()
@@ -987,7 +996,9 @@ mod tests {
         let cp932 = vec![0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA, 0x0A];
         // Latin-1 の "café" (0xE9 は UTF-8 として不正、SJIS としても不正)
         let latin1 = vec![b'c', b'a', b'f', 0xE9, b'\n'];
-        let random: Vec<u8> = (0u32..512).map(|i| (i.wrapping_mul(37) % 256) as u8).collect();
+        let random: Vec<u8> = (0u32..512)
+            .map(|i| (i.wrapping_mul(37) % 256) as u8)
+            .collect();
         let no_nul_binary: Vec<u8> = (0u32..512)
             .map(|i| {
                 let b = (i.wrapping_mul(37) % 255) as u8;
@@ -1162,7 +1173,7 @@ mod tests {
         let mut v = b"fLaC".to_vec();
         v.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]); // last block, STREAMINFO, 34B
         v.extend_from_slice(&[0u8; 10]); // min/max block, min/max frame
-        // sample_rate=48000(20b) | channels-1=1(3b) | bits-1=15(5b) | samples=96000(36b)
+                                         // sample_rate=48000(20b) | channels-1=1(3b) | bits-1=15(5b) | samples=96000(36b)
         let packed: u64 = (48000u64 << 44) | (1u64 << 41) | (15u64 << 36) | 96000u64;
         v.extend_from_slice(&packed.to_be_bytes());
         let info = probe_flac(&v);

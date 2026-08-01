@@ -20,10 +20,7 @@ use crate::theme::Theme;
 /// このバッファを Markdown としてプレビュー可能か。
 pub fn is_markdown(title: &str, lang: &str) -> bool {
     let t = title.to_lowercase();
-    lang == "Markdown"
-        || t.ends_with(".md")
-        || t.ends_with(".markdown")
-        || t.ends_with(".mdx")
+    lang == "Markdown" || t.ends_with(".md") || t.ends_with(".markdown") || t.ends_with(".mdx")
 }
 
 // ─── 入力サイズの上限 ───────────────────────────────────────────────
@@ -255,7 +252,11 @@ fn read_bare_url(chars: &[char], i: usize) -> Option<(String, usize)> {
         return None;
     }
     // 毎フレーム走るので文字列を作らずに突き合わせる
-    let starts = |s: &str| s.chars().enumerate().all(|(k, c)| chars.get(i + k) == Some(&c));
+    let starts = |s: &str| {
+        s.chars()
+            .enumerate()
+            .all(|(k, c)| chars.get(i + k) == Some(&c))
+    };
     let scheme_len = if starts("https://") {
         8
     } else if starts("http://") {
@@ -382,7 +383,9 @@ pub fn parse_inline(s: &str) -> Vec<Span> {
                         flush(&mut out, &mut cur, strong, em, strike);
                         let mut t: String = chars[i + n..cl].iter().collect();
                         // CommonMark: 前後に空白が1つずつあるときだけ剥がす
-                        if t.len() > 2 && t.starts_with(' ') && t.ends_with(' ')
+                        if t.len() > 2
+                            && t.starts_with(' ')
+                            && t.ends_with(' ')
                             && !t.trim().is_empty()
                         {
                             t = t[1..t.len() - 1].to_string();
@@ -415,7 +418,11 @@ pub fn parse_inline(s: &str) -> Vec<Span> {
             }
             '_' => {
                 // snake_case を斜体にしないよう、単語境界でのみ効かせる
-                let prev = if i == 0 { None } else { chars.get(i - 1).copied() };
+                let prev = if i == 0 {
+                    None
+                } else {
+                    chars.get(i - 1).copied()
+                };
                 let boundary = if em {
                     next.is_none_or(|n| !n.is_alphanumeric())
                 } else {
@@ -451,24 +458,22 @@ pub fn parse_inline(s: &str) -> Vec<Span> {
                 }
             },
             // 脚注参照 `[^1]` (定義行 `[^1]:` はブロック側で処理する)
-            '[' if next == Some('^') => {
-                match (i + 2..chars.len()).find(|&k| chars[k] == ']') {
-                    Some(cl) if cl > i + 2 => {
-                        flush(&mut out, &mut cur, strong, em, strike);
-                        let label: String = chars[i + 2..cl].iter().collect();
-                        out.push(Span {
-                            text: format!("[{label}]"),
-                            fnote: true,
-                            ..Default::default()
-                        });
-                        i = cl + 1;
-                    }
-                    _ => {
-                        cur.push('[');
-                        i += 1;
-                    }
+            '[' if next == Some('^') => match (i + 2..chars.len()).find(|&k| chars[k] == ']') {
+                Some(cl) if cl > i + 2 => {
+                    flush(&mut out, &mut cur, strong, em, strike);
+                    let label: String = chars[i + 2..cl].iter().collect();
+                    out.push(Span {
+                        text: format!("[{label}]"),
+                        fnote: true,
+                        ..Default::default()
+                    });
+                    i = cl + 1;
                 }
-            }
+                _ => {
+                    cur.push('[');
+                    i += 1;
+                }
+            },
             '[' => match read_link(&chars, i) {
                 Some((text, url, ni)) => {
                     flush(&mut out, &mut cur, strong, em, strike);
@@ -545,9 +550,7 @@ pub fn is_hr(t: &str) -> bool {
 /// テーブルの区切り行 (`|---|:--:|` 形式) か。
 pub fn is_table_sep(t: &str) -> bool {
     let t = t.trim();
-    t.starts_with('|')
-        && t.contains('-')
-        && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+    t.starts_with('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
 }
 
 /// `| a | b |` をセル列へ分解する。`\|` はエスケープされたパイプとして本文に残す。
@@ -753,7 +756,9 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// `data:image/png;base64,….` を (MIME, バイト列) へ復号する。
 /// base64 でない `data:` (パーセントエンコードされた SVG 等) にも対応。
 pub fn parse_data_uri(url: &str) -> Option<(String, Vec<u8>)> {
-    let rest = url.strip_prefix("data:").or_else(|| url.strip_prefix("DATA:"))?;
+    let rest = url
+        .strip_prefix("data:")
+        .or_else(|| url.strip_prefix("DATA:"))?;
     let (meta, payload) = rest.split_once(',')?;
     let meta_l = meta.to_ascii_lowercase();
     let mime = meta_l
@@ -837,7 +842,9 @@ pub fn classify_image(dir: Option<&Path>, url: &str) -> ImageSrc {
     if let Some(colon) = u.find(':') {
         let scheme = &lower[..colon];
         if colon > 1
-            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-')
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-')
             && u[colon..].starts_with("://")
         {
             return ImageSrc::Remote(u.to_string());
@@ -932,7 +939,11 @@ fn decode_texture(ctx: &egui::Context, key: &str, bytes: &[u8]) -> Option<egui::
         return None;
     }
     let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
-    Some(ctx.load_texture(format!("zv-md-img:{key}"), color, egui::TextureOptions::LINEAR))
+    Some(ctx.load_texture(
+        format!("zv-md-img:{key}"),
+        color,
+        egui::TextureOptions::LINEAR,
+    ))
 }
 
 /// 画像を描けないときの一行プレースホルダ文言。
@@ -943,7 +954,10 @@ fn image_placeholder_text(src: &ImageSrc, alt: &str) -> String {
             if alt.is_empty() {
                 tr("🌐 リモート画像 (未取得)")
             } else {
-                trf("🌐 リモート画像 (未取得): {alt}", &[("alt", alt.to_string())])
+                trf(
+                    "🌐 リモート画像 (未取得): {alt}",
+                    &[("alt", alt.to_string())],
+                )
             }
         }
         _ => {
@@ -1100,7 +1114,13 @@ pub mod mermaid {
 
     impl Flow {
         /// ID からノード添字を引く (無ければ作る)。上限超過時は None。
-        fn node_of(&mut self, id: &str, label: &str, shape: Shape, group: Option<usize>) -> Option<usize> {
+        fn node_of(
+            &mut self,
+            id: &str,
+            label: &str,
+            shape: Shape,
+            group: Option<usize>,
+        ) -> Option<usize> {
             if let Some(k) = self.nodes.iter().position(|n| n.id == id) {
                 // 後から形やラベルが指定されたら上書きする (mermaid と同じ)
                 if shape != Shape::Rect || label != id {
@@ -1299,7 +1319,11 @@ pub mod mermaid {
                 && rest.ends_with(close)
             {
                 let inner = clean_label(&rest[open.len()..rest.len() - close.len()]);
-                let label = if inner.is_empty() { id.to_string() } else { inner };
+                let label = if inner.is_empty() {
+                    id.to_string()
+                } else {
+                    inner
+                };
                 return Some((id.to_string(), label, *shape));
             }
         }
@@ -1366,7 +1390,12 @@ pub mod mermaid {
                 }
             }
             return Some((
-                Link { line: style(&pre), arrow_to: true, arrow_from, label: clean_label(&label) },
+                Link {
+                    line: style(&pre),
+                    arrow_to: true,
+                    arrow_from,
+                    label: clean_label(&label),
+                },
                 k2,
             ));
         }
@@ -1375,7 +1404,12 @@ pub mod mermaid {
             if let Some(close) = (k + 1..c.len()).find(|&z| c[z] == '|') {
                 let label: String = c[k + 1..close].iter().collect();
                 return Some((
-                    Link { line: style(&pre), arrow_to: false, arrow_from, label: clean_label(&label) },
+                    Link {
+                        line: style(&pre),
+                        arrow_to: false,
+                        arrow_from,
+                        label: clean_label(&label),
+                    },
                     close + 1,
                 ));
             }
@@ -1399,13 +1433,26 @@ pub mod mermaid {
                 if !text.trim().is_empty() {
                     let both = format!("{pre}{post}");
                     return Some((
-                        Link { line: style(&both), arrow_to: arrow, arrow_from, label: clean_label(&text) },
+                        Link {
+                            line: style(&both),
+                            arrow_to: arrow,
+                            arrow_from,
+                            label: clean_label(&text),
+                        },
                         end,
                     ));
                 }
             }
         }
-        Some((Link { line: style(&pre), arrow_to: false, arrow_from, label: String::new() }, k))
+        Some((
+            Link {
+                line: style(&pre),
+                arrow_to: false,
+                arrow_from,
+                label: String::new(),
+            },
+            k,
+        ))
     }
 
     // ── フローチャートの解析 ────────────────────────────────────────
@@ -1435,7 +1482,8 @@ pub mod mermaid {
                 }
                 if depth == 0 && (is_link_char(ch) || ch == '<') {
                     if let Some((link, ni)) = read_link(&c, i) {
-                        let cur = node_spec(&seg).and_then(|(id, lb, sh)| g.node_of(&id, &lb, sh, group));
+                        let cur =
+                            node_spec(&seg).and_then(|(id, lb, sh)| g.node_of(&id, &lb, sh, group));
                         connect(g, &mut prev, &mut pending, cur);
                         pending = Some(link);
                         seg.clear();
@@ -1451,7 +1499,12 @@ pub mod mermaid {
         connect(g, &mut prev, &mut pending, cur);
     }
 
-    fn connect(g: &mut Flow, prev: &mut Option<usize>, pending: &mut Option<Link>, cur: Option<usize>) {
+    fn connect(
+        g: &mut Flow,
+        prev: &mut Option<usize>,
+        pending: &mut Option<Link>,
+        cur: Option<usize>,
+    ) {
         if let (Some(p), Some(l), Some(n)) = (*prev, pending.take(), cur) {
             if g.edges.len() < MAX_EDGES {
                 g.edges.push(Edge {
@@ -1495,7 +1548,11 @@ pub mod mermaid {
                 if first {
                     // 図種の宣言行そのものは読み飛ばす
                     first = false;
-                    let head = t.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+                    let head = t
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
                     if head == "graph" || head == "flowchart" {
                         continue;
                     }
@@ -1508,15 +1565,27 @@ pub mod mermaid {
                 if let Some(rest) = strip_kw(t, "subgraph") {
                     if g.groups.len() < MAX_NODES {
                         let (id, title) = subgraph_head(rest);
-                        g.groups.push(Group { id, title, nodes: Vec::new() });
+                        g.groups.push(Group {
+                            id,
+                            title,
+                            nodes: Vec::new(),
+                        });
                         groups.push(g.groups.len() - 1);
                     }
                     continue;
                 }
                 // 見た目指定・対話系は図の骨格に関係しないので読み飛ばす
-                if ["style", "classdef", "class", "click", "linkstyle", "direction", "%%"]
-                    .iter()
-                    .any(|k| low.starts_with(k))
+                if [
+                    "style",
+                    "classdef",
+                    "class",
+                    "click",
+                    "linkstyle",
+                    "direction",
+                    "%%",
+                ]
+                .iter()
+                .any(|k| low.starts_with(k))
                 {
                     continue;
                 }
@@ -1591,7 +1660,10 @@ pub mod mermaid {
         let from = line[..at].trim().to_string();
         let rest = &line[at + tok.len()..];
         let (to, text) = match rest.find(':') {
-            Some(k) => (rest[..k].trim().to_string(), rest[k + 1..].trim().to_string()),
+            Some(k) => (
+                rest[..k].trim().to_string(),
+                rest[k + 1..].trim().to_string(),
+            ),
             None => (rest.trim().to_string(), String::new()),
         };
         if from.is_empty() || to.is_empty() {
@@ -1626,7 +1698,11 @@ pub mod mermaid {
                     None => (rest, clean_label(rest)),
                 };
                 if let Some(p) = d.participant_of(id) {
-                    d.participants[p].label = if label.is_empty() { id.to_string() } else { label };
+                    d.participants[p].label = if label.is_empty() {
+                        id.to_string()
+                    } else {
+                        label
+                    };
                 }
                 continue;
             }
@@ -1654,9 +1730,23 @@ pub mod mermaid {
             // ブロック構文 (loop/alt/opt/par/else/end/rect/critical/break) は
             // 骨格に効かないので読み飛ばす。autonumber も同じ。
             let low = t.to_ascii_lowercase();
-            if ["loop", "alt", "opt", "par", "else", "end", "rect", "critical", "break", "autonumber", "box", "link", "links"]
-                .iter()
-                .any(|k| low == *k || low.starts_with(&format!("{k} ")))
+            if [
+                "loop",
+                "alt",
+                "opt",
+                "par",
+                "else",
+                "end",
+                "rect",
+                "critical",
+                "break",
+                "autonumber",
+                "box",
+                "link",
+                "links",
+            ]
+            .iter()
+            .any(|k| low == *k || low.starts_with(&format!("{k} ")))
             {
                 continue;
             }
@@ -1664,7 +1754,13 @@ pub mod mermaid {
                 let (f, o) = (d.participant_of(&from), d.participant_of(&to));
                 if let (Some(f), Some(o)) = (f, o) {
                     if d.events.len() < MAX_EDGES {
-                        d.events.push(SeqEvent::Msg { from: f, to: o, text: clean_label(&text), dashed, arrow });
+                        d.events.push(SeqEvent::Msg {
+                            from: f,
+                            to: o,
+                            text: clean_label(&text),
+                            dashed,
+                            arrow,
+                        });
                     } else {
                         d.notice = Some(cap_notice(d.participants.len(), d.events.len()));
                     }
@@ -1698,7 +1794,12 @@ pub mod mermaid {
         let mut ids = who.split(',').map(str::trim).filter(|s| !s.is_empty());
         let a = d.participant_of(ids.next()?)?;
         let b = ids.next().and_then(|s| d.participant_of(s)).unwrap_or(a);
-        Some(SeqEvent::Note { from: a.min(b), to: a.max(b), text, pos })
+        Some(SeqEvent::Note {
+            from: a.min(b),
+            to: a.max(b),
+            text,
+            pos,
+        })
     }
 
     /// 語として現れる `as` の位置 (バイト添字)。
@@ -1772,7 +1873,9 @@ pub mod mermaid {
 
     /// 表示桁数 (全角 = 2)。
     pub fn disp_cols(s: &str) -> usize {
-        s.chars().map(|c| if super::is_cjk(c) { 2 } else { 1 }).sum()
+        s.chars()
+            .map(|c| if super::is_cjk(c) { 2 } else { 1 })
+            .sum()
     }
 
     /// ラベルを max 桁で折り返す。明示改行を尊重し、単語境界を優先する。
@@ -1784,7 +1887,11 @@ pub mod mermaid {
             let mut cur_w = 0usize;
             let mut word = String::new();
             let mut word_w = 0usize;
-            let flush_word = |cur: &mut String, cur_w: &mut usize, word: &mut String, word_w: &mut usize, out: &mut Vec<String>| {
+            let flush_word = |cur: &mut String,
+                              cur_w: &mut usize,
+                              word: &mut String,
+                              word_w: &mut usize,
+                              out: &mut Vec<String>| {
                 if word.is_empty() {
                     return;
                 }
@@ -1884,7 +1991,12 @@ pub mod mermaid {
     impl Metrics {
         fn hash_into(&self, h: &mut impl Hasher) {
             for v in [
-                self.char_w, self.line_h, self.pad_x, self.pad_y, self.gap_rank, self.gap_cross,
+                self.char_w,
+                self.line_h,
+                self.pad_x,
+                self.pad_y,
+                self.gap_rank,
+                self.gap_cross,
                 self.margin,
             ] {
                 v.to_bits().hash(h);
@@ -1997,7 +2109,11 @@ pub mod mermaid {
     pub fn layout_flow(g: &Flow, m: Metrics) -> FlowLayout {
         let n = g.nodes.len();
         if n == 0 {
-            return FlowLayout { size: vec2(0.0, 0.0), notice: g.notice.clone(), ..Default::default() };
+            return FlowLayout {
+                size: vec2(0.0, 0.0),
+                notice: g.notice.clone(),
+                ..Default::default()
+            };
         }
         // ラベル折返しと素の寸法
         let mut lines: Vec<Vec<String>> = Vec::with_capacity(n);
@@ -2033,7 +2149,11 @@ pub mod mermaid {
             if e.from == e.to || e.from >= n || e.to >= n || rank[e.from] == rank[e.to] {
                 continue;
             }
-            let (a, b) = if rank[e.from] < rank[e.to] { (e.from, e.to) } else { (e.to, e.from) };
+            let (a, b) = if rank[e.from] < rank[e.to] {
+                (e.from, e.to)
+            } else {
+                (e.to, e.from)
+            };
             succs[a].push(b);
             preds[b].push(a);
         }
@@ -2048,7 +2168,13 @@ pub mod mermaid {
         refresh(&layers, &mut pos_in);
         for _ in 0..2 {
             for r in 1..=maxr {
-                sort_layer(&mut layers[r], &preds, &pos_in, rank.as_slice(), r.wrapping_sub(1));
+                sort_layer(
+                    &mut layers[r],
+                    &preds,
+                    &pos_in,
+                    rank.as_slice(),
+                    r.wrapping_sub(1),
+                );
                 refresh(&layers, &mut pos_in);
             }
             for r in (0..maxr).rev() {
@@ -2065,7 +2191,10 @@ pub mod mermaid {
         let mut acc = 0.0f32;
         for (r, layer) in layers.iter().enumerate() {
             main_at[r] = acc;
-            let ext = layer.iter().map(|&v| main_of(size[v])).fold(0.0f32, f32::max);
+            let ext = layer
+                .iter()
+                .map(|&v| main_of(size[v]))
+                .fold(0.0f32, f32::max);
             acc += ext + m.gap_rank;
         }
         let total_main = (acc - m.gap_rank).max(0.0);
@@ -2080,7 +2209,10 @@ pub mod mermaid {
         let mut rects = vec![Rect::NOTHING; n];
         for (r, layer) in layers.iter().enumerate() {
             let mut c = (total_cross - cross_len[r]) * 0.5;
-            let ext = layer.iter().map(|&v| main_of(size[v])).fold(0.0f32, f32::max);
+            let ext = layer
+                .iter()
+                .map(|&v| main_of(size[v]))
+                .fold(0.0f32, f32::max);
             for &v in layer {
                 let s = size[v];
                 // 主軸方向はランク帯の中央へ寄せる
@@ -2112,7 +2244,11 @@ pub mod mermaid {
                 }
             }
             if r.is_finite() && !grp.nodes.is_empty() {
-                let title = if grp.title.is_empty() { grp.id.clone() } else { grp.title.clone() };
+                let title = if grp.title.is_empty() {
+                    grp.id.clone()
+                } else {
+                    grp.title.clone()
+                };
                 groups.push((title, r.expand2(vec2(10.0, 14.0))));
             }
         }
@@ -2151,7 +2287,13 @@ pub mod mermaid {
             });
         }
 
-        FlowLayout { boxes, edges: geoms, groups, size: size_all, notice: g.notice.clone() }
+        FlowLayout {
+            boxes,
+            edges: geoms,
+            groups,
+            size: size_all,
+            notice: g.notice.clone(),
+        }
     }
 
     fn sort_layer(
@@ -2180,7 +2322,11 @@ pub mod mermaid {
                 (b, p, v)
             })
             .collect();
-        keyed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal).then(a.1.cmp(&b.1)));
+        keyed.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
         *layer = keyed.into_iter().map(|k| k.2).collect();
     }
 
@@ -2192,8 +2338,16 @@ pub mod mermaid {
         if d.x.abs() < 1e-6 && d.y.abs() < 1e-6 {
             return c;
         }
-        let tx = if d.x.abs() > 1e-6 { hw / d.x.abs() } else { f32::INFINITY };
-        let ty = if d.y.abs() > 1e-6 { hh / d.y.abs() } else { f32::INFINITY };
+        let tx = if d.x.abs() > 1e-6 {
+            hw / d.x.abs()
+        } else {
+            f32::INFINITY
+        };
+        let ty = if d.y.abs() > 1e-6 {
+            hh / d.y.abs()
+        } else {
+            f32::INFINITY
+        };
         let t = tx.min(ty);
         c + d * t
     }
@@ -2262,11 +2416,19 @@ pub mod mermaid {
     pub fn layout_seq(d: &Seq, m: Metrics) -> SeqLayout {
         let np = d.participants.len();
         if np == 0 {
-            return SeqLayout { size: vec2(0.0, 0.0), notice: d.notice.clone(), ..Default::default() };
+            return SeqLayout {
+                size: vec2(0.0, 0.0),
+                notice: d.notice.clone(),
+                ..Default::default()
+            };
         }
         let head_h = m.line_h * 2.0 + m.pad_y * 2.0;
         let row_h = m.line_h * 2.2;
-        let title_h = if d.title.is_some() { m.line_h * 1.8 } else { 0.0 };
+        let title_h = if d.title.is_some() {
+            m.line_h * 1.8
+        } else {
+            0.0
+        };
 
         let labels: Vec<Vec<String>> = d
             .participants
@@ -2317,7 +2479,11 @@ pub mod mermaid {
                 pos2(xs[i], m.margin + title_h + head_h * 0.5),
                 vec2(col_w[i], head_h),
             );
-            cols.push(SeqCol { label: labels[i].clone(), head, x: xs[i] });
+            cols.push(SeqCol {
+                label: labels[i].clone(),
+                head,
+                x: xs[i],
+            });
         }
 
         let top = m.margin + title_h + head_h;
@@ -2328,7 +2494,13 @@ pub mod mermaid {
         for ev in &d.events {
             row_y.push(y);
             match ev {
-                SeqEvent::Msg { from, to, text, dashed, arrow } => {
+                SeqEvent::Msg {
+                    from,
+                    to,
+                    text,
+                    dashed,
+                    arrow,
+                } => {
                     let loopback = from == to;
                     let (a, b) = (xs[*from], xs[*to]);
                     if loopback {
@@ -2336,7 +2508,10 @@ pub mod mermaid {
                     }
                     arrows.push(SeqArrowGeom {
                         from: pos2(a, y),
-                        to: pos2(if loopback { a + 34.0 } else { b }, if loopback { y + row_h * 0.7 } else { y }),
+                        to: pos2(
+                            if loopback { a + 34.0 } else { b },
+                            if loopback { y + row_h * 0.7 } else { y },
+                        ),
                         text: text.clone(),
                         dashed: *dashed,
                         arrow: *arrow,
@@ -2344,7 +2519,12 @@ pub mod mermaid {
                     });
                     y += if loopback { row_h * 1.6 } else { row_h };
                 }
-                SeqEvent::Note { from, to, text, pos } => {
+                SeqEvent::Note {
+                    from,
+                    to,
+                    text,
+                    pos,
+                } => {
                     let ls = wrap_label(text, LABEL_COLS);
                     let w = (ls.iter().map(|l| disp_cols(l)).max().unwrap_or(1) as f32) * m.char_w
                         + m.pad_x * 2.0;
@@ -2358,7 +2538,10 @@ pub mod mermaid {
                     .max(w * 0.5 + m.margin);
                     width = width.max(cx + w * 0.5 + m.margin);
                     notes.push(SeqNoteGeom {
-                        rect: Rect::from_center_size(pos2(cx, y + h * 0.5 - m.line_h * 0.3), vec2(w, h)),
+                        rect: Rect::from_center_size(
+                            pos2(cx, y + h * 0.5 - m.line_h * 0.3),
+                            vec2(w, h),
+                        ),
                         lines: ls,
                     });
                     y += h + m.pad_y * 2.0;
@@ -2502,7 +2685,11 @@ pub mod mermaid {
                 if e.arrow_from { "<" } else { "" },
                 line,
                 if e.arrow_to { ">" } else { "" },
-                if e.label.is_empty() { String::new() } else { format!("|{}|", e.label) },
+                if e.label.is_empty() {
+                    String::new()
+                } else {
+                    format!("|{}|", e.label)
+                },
                 g.nodes[e.to].id,
             )
         }
@@ -2661,7 +2848,14 @@ pub mod mermaid {
 
         #[test]
         fn unknown_diagram_types_degrade() {
-            for kind in ["classDiagram", "gantt", "stateDiagram-v2", "pie", "erDiagram", "journey"] {
+            for kind in [
+                "classDiagram",
+                "gantt",
+                "stateDiagram-v2",
+                "pie",
+                "erDiagram",
+                "journey",
+            ] {
                 let src = format!("{kind}\n  なにか\n");
                 match parse(&src) {
                     Diagram::Unsupported(got) => {
@@ -2770,14 +2964,21 @@ pub mod mermaid {
         fn ranks_terminate_on_cycles() {
             let g = flow("graph LR\nA-->B\nB-->C\nC-->A\nC-->D");
             let r = ranks(g.nodes.len(), &g.edges);
-            assert!(r.iter().all(|&x| x < g.nodes.len()), "循環でランクが発散した: {r:?}");
+            assert!(
+                r.iter().all(|&x| x < g.nodes.len()),
+                "循環でランクが発散した: {r:?}"
+            );
             let lay = layout_flow(&g, Metrics::default());
             assert_eq!(lay.boxes.len(), 4);
         }
 
         #[test]
         fn nodes_never_overlap_and_stay_inside_bounds() {
-            for src in [DAG, "graph LR\nA-->B-->C\nA-->C", "graph BT\nA-->B\nA-->C\nA-->D\nB-->E"] {
+            for src in [
+                DAG,
+                "graph LR\nA-->B-->C\nA-->C",
+                "graph BT\nA-->B\nA-->C\nA-->D\nB-->E",
+            ] {
                 let g = flow(src);
                 let lay = layout_flow(&g, Metrics::default());
                 let bounds = Rect::from_min_size(pos2(0.0, 0.0), lay.size);
@@ -2811,8 +3012,14 @@ pub mod mermaid {
                 let (a, b) = (lay.boxes[e.from].rect, lay.boxes[e.to].rect);
                 let p0 = geom.points[0];
                 let p1 = *geom.points.last().unwrap();
-                assert!(a.expand(1.0).contains(p0), "始点が枠から離れた: {p0:?} / {a:?}");
-                assert!(b.expand(1.0).contains(p1), "終点が枠から離れた: {p1:?} / {b:?}");
+                assert!(
+                    a.expand(1.0).contains(p0),
+                    "始点が枠から離れた: {p0:?} / {a:?}"
+                );
+                assert!(
+                    b.expand(1.0).contains(p1),
+                    "終点が枠から離れた: {p1:?} / {b:?}"
+                );
             }
         }
 
@@ -2820,12 +3027,24 @@ pub mod mermaid {
         fn horizontal_and_vertical_flow_swap_the_axes() {
             let td = layout_flow(&flow("graph TD\nA-->B"), Metrics::default());
             let lr = layout_flow(&flow("graph LR\nA-->B"), Metrics::default());
-            assert!(td.boxes[0].rect.center().y < td.boxes[1].rect.center().y, "TD は上から下");
-            assert!(lr.boxes[0].rect.center().x < lr.boxes[1].rect.center().x, "LR は左から右");
+            assert!(
+                td.boxes[0].rect.center().y < td.boxes[1].rect.center().y,
+                "TD は上から下"
+            );
+            assert!(
+                lr.boxes[0].rect.center().x < lr.boxes[1].rect.center().x,
+                "LR は左から右"
+            );
             let bt = layout_flow(&flow("graph BT\nA-->B"), Metrics::default());
-            assert!(bt.boxes[0].rect.center().y > bt.boxes[1].rect.center().y, "BT は下から上");
+            assert!(
+                bt.boxes[0].rect.center().y > bt.boxes[1].rect.center().y,
+                "BT は下から上"
+            );
             let rl = layout_flow(&flow("graph RL\nA-->B"), Metrics::default());
-            assert!(rl.boxes[0].rect.center().x > rl.boxes[1].rect.center().x, "RL は右から左");
+            assert!(
+                rl.boxes[0].rect.center().x > rl.boxes[1].rect.center().x,
+                "RL は右から左"
+            );
         }
 
         /// 同じ入力からは必ず同じ座標が出る。
@@ -2870,7 +3089,10 @@ pub mod mermaid {
             assert_eq!(wrap_label("上\n下", 22), vec!["上", "下"]);
             let w = wrap_label("the quick brown fox jumps over the lazy dog", 12);
             assert!(w.len() > 1, "長い文は折り返す: {w:?}");
-            assert!(w.iter().all(|l| disp_cols(l) <= 12), "はみ出した行がある: {w:?}");
+            assert!(
+                w.iter().all(|l| disp_cols(l) <= 12),
+                "はみ出した行がある: {w:?}"
+            );
             // CJK は全角 2 桁で数える
             let j = wrap_label("あいうえおかきくけこさしすせそ", 10);
             assert!(j.iter().all(|l| disp_cols(l) <= 10), "{j:?}");
@@ -2904,17 +3126,31 @@ pub mod mermaid {
         fn sequence_parse_table() {
             let d = seq(SEQ);
             assert_eq!(
-                d.participants.iter().map(|p| (p.id.as_str(), p.label.as_str())).collect::<Vec<_>>(),
+                d.participants
+                    .iter()
+                    .map(|p| (p.id.as_str(), p.label.as_str()))
+                    .collect::<Vec<_>>(),
                 [("A", "利用者"), ("B", "サーバ")]
             );
             let kinds: Vec<String> = d
                 .events
                 .iter()
                 .map(|e| match e {
-                    SeqEvent::Msg { from, to, text, dashed, arrow } => {
+                    SeqEvent::Msg {
+                        from,
+                        to,
+                        text,
+                        dashed,
+                        arrow,
+                    } => {
                         format!("{from}->{to} {arrow:?} dashed={dashed} {text}")
                     }
-                    SeqEvent::Note { from, to, text, pos } => format!("note {pos:?} {from}..{to} {text}"),
+                    SeqEvent::Note {
+                        from,
+                        to,
+                        text,
+                        pos,
+                    } => format!("note {pos:?} {from}..{to} {text}"),
                 })
                 .collect();
             assert_eq!(
@@ -2952,8 +3188,7 @@ pub mod mermaid {
 
         #[test]
         fn sequence_notes_and_blocks() {
-            let d = seq(
-                "sequenceDiagram\n\
+            let d = seq("sequenceDiagram\n\
                  participant A\n\
                  participant B\n\
                  Note left of A: 左\n\
@@ -2961,8 +3196,7 @@ pub mod mermaid {
                  loop 毎日\n\
                  A->>B: 呼ぶ\n\
                  end\n\
-                 autonumber",
-            );
+                 autonumber");
             let notes: Vec<_> = d
                 .events
                 .iter()
@@ -2971,7 +3205,13 @@ pub mod mermaid {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(notes, [(NotePos::LeftOf, "左".into()), (NotePos::RightOf, "右".into())]);
+            assert_eq!(
+                notes,
+                [
+                    (NotePos::LeftOf, "左".into()),
+                    (NotePos::RightOf, "右".into())
+                ]
+            );
             // loop / end / autonumber は骨格に効かず、中のメッセージは残る
             assert_eq!(d.events.len(), 3);
         }
@@ -2979,7 +3219,13 @@ pub mod mermaid {
         #[test]
         fn sequence_implicit_participants_keep_first_seen_order() {
             let d = seq("sequenceDiagram\nC->>A: 1\nB->>C: 2");
-            assert_eq!(d.participants.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["C", "A", "B"]);
+            assert_eq!(
+                d.participants
+                    .iter()
+                    .map(|p| p.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["C", "A", "B"]
+            );
         }
 
         #[test]
@@ -2992,7 +3238,10 @@ pub mod mermaid {
             assert_eq!(lay.cols[0].head.top(), lay.cols[1].head.top());
             // 事象は時間順に下がる
             let ys: Vec<f32> = lay.arrows.iter().map(|a| a.from.y).collect();
-            assert!(ys.windows(2).all(|w| w[0] < w[1]), "行が時間順に下がっていない: {ys:?}");
+            assert!(
+                ys.windows(2).all(|w| w[0] < w[1]),
+                "行が時間順に下がっていない: {ys:?}"
+            );
             // 生存線は見出しの下から図の下端まで
             for (i, (a, b)) in lay.lifelines.iter().enumerate() {
                 assert_eq!(a.x, lay.cols[i].x);
@@ -3034,7 +3283,10 @@ pub mod mermaid {
             assert!(Rc::ptr_eq(&a, &b), "同じ入力で作り直している");
             assert_eq!(&*a, &build(src, m));
             // 寸法が変われば作り直す
-            let m2 = Metrics { char_w: m.char_w + 1.0, ..m };
+            let m2 = Metrics {
+                char_w: m.char_w + 1.0,
+                ..m
+            };
             let c = cached(src, m2);
             assert!(!Rc::ptr_eq(&a, &c));
             clear_cache();
@@ -3042,7 +3294,13 @@ pub mod mermaid {
 
         #[test]
         fn build_never_leaves_a_blank_result() {
-            for src in ["", "gantt\n title x", "graph TD\nA-->B", SEQ, "!!!壊れた!!!"] {
+            for src in [
+                "",
+                "gantt\n title x",
+                "graph TD\nA-->B",
+                SEQ,
+                "!!!壊れた!!!",
+            ] {
                 match build(src, Metrics::default()) {
                     Prepared::Fallback(note) => assert!(!note.is_empty(), "注記が空: {src}"),
                     Prepared::Flow(l) => assert!(!l.boxes.is_empty()),
@@ -3103,7 +3361,12 @@ pub mod math {
     }
 
     const fn s(tex: &'static str, glyph: &'static str, ascii: &'static str, class: Class) -> Sym {
-        Sym { tex, glyph, ascii, class }
+        Sym {
+            tex,
+            glyph,
+            ascii,
+            class,
+        }
     }
 
     /// 対応記号の全表。ここに無い `\macro` は生 TeX として出す。
@@ -3267,9 +3530,40 @@ pub mod math {
 
     /// 立体で組む関数名 (`\sin` など)。
     pub const FUNCS: &[&str] = &[
-        "sin", "cos", "tan", "sec", "csc", "cot", "arcsin", "arccos", "arctan", "sinh", "cosh",
-        "tanh", "log", "ln", "lg", "exp", "lim", "limsup", "liminf", "max", "min", "sup", "inf",
-        "det", "dim", "ker", "deg", "gcd", "arg", "Pr", "hom", "mod", "bmod", "operatorname",
+        "sin",
+        "cos",
+        "tan",
+        "sec",
+        "csc",
+        "cot",
+        "arcsin",
+        "arccos",
+        "arctan",
+        "sinh",
+        "cosh",
+        "tanh",
+        "log",
+        "ln",
+        "lg",
+        "exp",
+        "lim",
+        "limsup",
+        "liminf",
+        "max",
+        "min",
+        "sup",
+        "inf",
+        "det",
+        "dim",
+        "ker",
+        "deg",
+        "gcd",
+        "arg",
+        "Pr",
+        "hom",
+        "mod",
+        "bmod",
+        "operatorname",
     ];
 
     /// 空きだけを作る命令 (幅は em 比)。
@@ -3454,7 +3748,9 @@ pub mod math {
     /// 括弧として使える 1 文字 (`\left` `\right` の引数)。
     fn delim_str(tok: &Tok) -> Option<String> {
         match tok {
-            Tok::Chr(c) if matches!(c, '(' | ')' | '[' | ']' | '/' | '|' | '.') => Some(c.to_string()),
+            Tok::Chr(c) if matches!(c, '(' | ')' | '[' | ']' | '/' | '|' | '.') => {
+                Some(c.to_string())
+            }
             Tok::Open => Some("{".into()),
             Tok::Close => Some("}".into()),
             Tok::Cmd(name) => match name.as_str() {
@@ -3578,7 +3874,11 @@ pub mod math {
                     _ => break,
                 }
             }
-            Node::Script { base: Box::new(base), sup, sub }
+            Node::Script {
+                base: Box::new(base),
+                sup,
+                sub,
+            }
         }
 
         /// 原子 1 個。読めないトークンは None (読み進めるだけ)。
@@ -3677,7 +3977,10 @@ pub mod math {
                             Node::Row(inner)
                         }));
                     }
-                    Node::Sqrt { index, body: Box::new(self.group()) }
+                    Node::Sqrt {
+                        index,
+                        body: Box::new(self.group()),
+                    }
                 }
                 "text" | "textrm" | "textbf" | "textit" | "mathrm" | "mathbf" | "mathit"
                 | "mathsf" | "mathtt" | "mathbb" | "mathcal" | "mathfrak" | "bm" | "boldsymbol" => {
@@ -3718,11 +4021,26 @@ pub mod math {
                     let _ = self.env_name();
                     Node::Row(Vec::new())
                 }
-                "overline" | "bar" => Node::Accent { mark: Accent::Bar, body: Box::new(self.group()) },
-                "vec" => Node::Accent { mark: Accent::Vec, body: Box::new(self.group()) },
-                "hat" | "widehat" => Node::Accent { mark: Accent::Hat, body: Box::new(self.group()) },
-                "tilde" | "widetilde" => Node::Accent { mark: Accent::Tilde, body: Box::new(self.group()) },
-                "dot" => Node::Accent { mark: Accent::Dot, body: Box::new(self.group()) },
+                "overline" | "bar" => Node::Accent {
+                    mark: Accent::Bar,
+                    body: Box::new(self.group()),
+                },
+                "vec" => Node::Accent {
+                    mark: Accent::Vec,
+                    body: Box::new(self.group()),
+                },
+                "hat" | "widehat" => Node::Accent {
+                    mark: Accent::Hat,
+                    body: Box::new(self.group()),
+                },
+                "tilde" | "widetilde" => Node::Accent {
+                    mark: Accent::Tilde,
+                    body: Box::new(self.group()),
+                },
+                "dot" => Node::Accent {
+                    mark: Accent::Dot,
+                    body: Box::new(self.group()),
+                },
                 "operatorname" => Node::Fun(plain_text(&self.group())),
                 _ => {
                     if FUNCS.contains(&name) {
@@ -3837,17 +4155,28 @@ pub mod math {
                     }
                 }
             }
-            while rows.last().map(|r| r.iter().all(Node::is_empty)).unwrap_or(false) && rows.len() > 1 {
+            while rows
+                .last()
+                .map(|r| r.iter().all(Node::is_empty))
+                .unwrap_or(false)
+                && rows.len() > 1
+            {
                 rows.pop();
             }
-            Node::Matrix { left: left.to_string(), right: right.to_string(), rows }
+            Node::Matrix {
+                left: left.to_string(),
+                right: right.to_string(),
+                rows,
+            }
         }
     }
 
     /// `\text{…}` の中身をただの文字列へ潰す。
     fn plain_text(n: &Node) -> String {
         match n {
-            Node::Ident(s) | Node::Num(s) | Node::Text(s) | Node::Fun(s) | Node::Raw(s) => s.clone(),
+            Node::Ident(s) | Node::Num(s) | Node::Text(s) | Node::Fun(s) | Node::Raw(s) => {
+                s.clone()
+            }
             Node::Op(s, _) => s.clone(),
             Node::Sym(s) => s.glyph.to_string(),
             Node::Row(r) => r.iter().map(plain_text).collect(),
@@ -3861,7 +4190,11 @@ pub mod math {
         if src.len() > MAX_LEN {
             return Node::Raw(src.chars().take(MAX_LEN).collect());
         }
-        let mut p = Parser { t: tokenize(src), i: 0, depth: 0 };
+        let mut p = Parser {
+            t: tokenize(src),
+            i: 0,
+            depth: 0,
+        };
         let n = p.row(false);
         // 余りが出たら (壊れた入力) 読み飛ばして続きも拾う
         if p.i < p.t.len() {
@@ -3911,20 +4244,57 @@ pub mod math {
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum Kind {
-        Glyph { text: String, size: f32, style: Style },
+        Glyph {
+            text: String,
+            size: f32,
+            style: Style,
+        },
         /// ベースライン揃えの横並び (dx, 箱)
         Row(Vec<(f32, MBox)>),
         /// 分数 (rule_y はベースラインからの線の高さ、gap は線と分子分母の空き)
-        Frac { num: Box<MBox>, den: Box<MBox>, rule_y: f32, thick: f32, gap: f32 },
+        Frac {
+            num: Box<MBox>,
+            den: Box<MBox>,
+            rule_y: f32,
+            thick: f32,
+            gap: f32,
+        },
         /// 根号 (lead は √ 記号の幅)
-        Sqrt { body: Box<MBox>, index: Option<Box<MBox>>, lead: f32, size: f32 },
+        Sqrt {
+            body: Box<MBox>,
+            index: Option<Box<MBox>>,
+            lead: f32,
+            size: f32,
+        },
         /// 上下付き (dy は上へ正)
-        Script { base: Box<MBox>, sup: Option<(f32, Box<MBox>)>, sub: Option<(f32, Box<MBox>)> },
+        Script {
+            base: Box<MBox>,
+            sup: Option<(f32, Box<MBox>)>,
+            sub: Option<(f32, Box<MBox>)>,
+        },
         /// 大きさを合わせた括弧
-        Delim { left: String, right: String, body: Box<MBox>, size: f32, lw: f32, rw: f32 },
-        Accent { body: Box<MBox>, mark: Accent, size: f32 },
+        Delim {
+            left: String,
+            right: String,
+            body: Box<MBox>,
+            size: f32,
+            lw: f32,
+            rw: f32,
+        },
+        Accent {
+            body: Box<MBox>,
+            mark: Accent,
+            size: f32,
+        },
         /// 行列 (セルは (dx, dy, 箱)。dy はベースラインからの下向き)
-        Grid { cells: Vec<Vec<(f32, f32, MBox)>>, left: String, right: String, size: f32, lw: f32, rw: f32 },
+        Grid {
+            cells: Vec<Vec<(f32, f32, MBox)>>,
+            left: String,
+            right: String,
+            size: f32,
+            lw: f32,
+            rw: f32,
+        },
         Space,
     }
 
@@ -3964,7 +4334,11 @@ pub mod math {
             w: m.width(text, size, mono),
             asc: h * ASCENT_RATIO,
             desc: h * (1.0 - ASCENT_RATIO),
-            kind: Kind::Glyph { text: text.to_string(), size, style },
+            kind: Kind::Glyph {
+                text: text.to_string(),
+                size,
+                style,
+            },
         }
     }
 
@@ -4042,9 +4416,19 @@ pub mod math {
                 }
                 if placed.is_empty() {
                     let h = m.line_h(size, false);
-                    return MBox { w: 0.0, asc: h * ASCENT_RATIO, desc: h * (1.0 - ASCENT_RATIO), kind: Kind::Row(placed) };
+                    return MBox {
+                        w: 0.0,
+                        asc: h * ASCENT_RATIO,
+                        desc: h * (1.0 - ASCENT_RATIO),
+                        kind: Kind::Row(placed),
+                    };
                 }
-                MBox { w: x, asc, desc, kind: Kind::Row(placed) }
+                MBox {
+                    w: x,
+                    asc,
+                    desc,
+                    kind: Kind::Row(placed),
+                }
             }
             Node::Frac(a, b) => {
                 let sz = size * 0.96;
@@ -4060,19 +4444,32 @@ pub mod math {
                     w,
                     asc,
                     desc,
-                    kind: Kind::Frac { num: Box::new(num), den: Box::new(den), rule_y, thick, gap },
+                    kind: Kind::Frac {
+                        num: Box::new(num),
+                        den: Box::new(den),
+                        rule_y,
+                        thick,
+                        gap,
+                    },
                 }
             }
             Node::Sqrt { index, body } => {
                 let inner = layout(body, size, m);
-                let idx = index.as_ref().map(|i| Box::new(layout(i, script_size(size) * 0.85, m)));
+                let idx = index
+                    .as_ref()
+                    .map(|i| Box::new(layout(i, script_size(size) * 0.85, m)));
                 let lead = size * 0.62 + idx.as_ref().map(|b| b.w * 0.8).unwrap_or(0.0);
                 let asc = inner.asc + size * 0.24;
                 MBox {
                     w: lead + inner.w + size * 0.14,
                     asc: asc.max(idx.as_ref().map(|b| b.height() + size * 0.3).unwrap_or(0.0)),
                     desc: inner.desc,
-                    kind: Kind::Sqrt { body: Box::new(inner), index: idx, lead, size },
+                    kind: Kind::Sqrt {
+                        body: Box::new(inner),
+                        index: idx,
+                        lead,
+                        size,
+                    },
                 }
             }
             Node::Script { base, sup, sub } => {
@@ -4095,7 +4492,16 @@ pub mod math {
                     desc = desc.max(down + s.desc);
                     (-down, Box::new(s))
                 });
-                MBox { w, asc, desc, kind: Kind::Script { base: Box::new(b), sup: sup_p, sub: sub_p } }
+                MBox {
+                    w,
+                    asc,
+                    desc,
+                    kind: Kind::Script {
+                        base: Box::new(b),
+                        sup: sup_p,
+                        sub: sub_p,
+                    },
+                }
             }
             Node::Delim { left, right, body } => {
                 let inner = layout(body, size, m);
@@ -4103,13 +4509,28 @@ pub mod math {
                 let base_h = m.line_h(size, false).max(1.0);
                 let scale = (inner.height() / base_h).clamp(1.0, 3.0);
                 let dsz = size * scale;
-                let lw = if left.is_empty() { 0.0 } else { m.width(left, dsz, false) };
-                let rw = if right.is_empty() { 0.0 } else { m.width(right, dsz, false) };
+                let lw = if left.is_empty() {
+                    0.0
+                } else {
+                    m.width(left, dsz, false)
+                };
+                let rw = if right.is_empty() {
+                    0.0
+                } else {
+                    m.width(right, dsz, false)
+                };
                 MBox {
                     w: lw + inner.w + rw + size * 0.1,
                     asc: inner.asc + size * 0.06,
                     desc: inner.desc + size * 0.06,
-                    kind: Kind::Delim { left: left.clone(), right: right.clone(), body: Box::new(inner), size: dsz, lw, rw },
+                    kind: Kind::Delim {
+                        left: left.clone(),
+                        right: right.clone(),
+                        body: Box::new(inner),
+                        size: dsz,
+                        lw,
+                        rw,
+                    },
                 }
             }
             Node::Accent { mark, body } => {
@@ -4118,7 +4539,11 @@ pub mod math {
                     w: inner.w,
                     asc: inner.asc + size * 0.22,
                     desc: inner.desc,
-                    kind: Kind::Accent { body: Box::new(inner), mark: *mark, size },
+                    kind: Kind::Accent {
+                        body: Box::new(inner),
+                        mark: *mark,
+                        size,
+                    },
                 }
             }
             Node::Matrix { left, right, rows } => {
@@ -4137,8 +4562,12 @@ pub mod math {
                 let gap_x = size * 0.7;
                 let gap_y = size * 0.35;
                 let total_w: f32 = colw.iter().sum::<f32>() + gap_x * ncol.saturating_sub(1) as f32;
-                let row_h: Vec<f32> = laid.iter().map(|r| r.iter().map(|b| b.height()).fold(size, f32::max)).collect();
-                let total_h: f32 = row_h.iter().sum::<f32>() + gap_y * laid.len().saturating_sub(1) as f32;
+                let row_h: Vec<f32> = laid
+                    .iter()
+                    .map(|r| r.iter().map(|b| b.height()).fold(size, f32::max))
+                    .collect();
+                let total_h: f32 =
+                    row_h.iter().sum::<f32>() + gap_y * laid.len().saturating_sub(1) as f32;
                 let mut cells: Vec<Vec<(f32, f32, MBox)>> = Vec::with_capacity(laid.len());
                 let mut y = -total_h * 0.5;
                 for (ri, r) in laid.into_iter().enumerate() {
@@ -4156,13 +4585,28 @@ pub mod math {
                     cells.push(line);
                 }
                 let dsz = size * (total_h / m.line_h(size, false).max(1.0)).clamp(1.0, 4.0);
-                let lw = if left.is_empty() { 0.0 } else { m.width(left, dsz, false) };
-                let rw = if right.is_empty() { 0.0 } else { m.width(right, dsz, false) };
+                let lw = if left.is_empty() {
+                    0.0
+                } else {
+                    m.width(left, dsz, false)
+                };
+                let rw = if right.is_empty() {
+                    0.0
+                } else {
+                    m.width(right, dsz, false)
+                };
                 MBox {
                     w: total_w + lw + rw + size * 0.2,
                     asc: total_h * 0.5 + size * 0.3,
                     desc: total_h * 0.5 - size * 0.1,
-                    kind: Kind::Grid { cells, left: left.clone(), right: right.clone(), size: dsz, lw, rw },
+                    kind: Kind::Grid {
+                        cells,
+                        left: left.clone(),
+                        right: right.clone(),
+                        size: dsz,
+                        lw,
+                        rw,
+                    },
                 }
             }
         }
@@ -4448,13 +4892,16 @@ pub mod math {
             );
             // `\,` のような 1 文字命令、行列の区切り
             assert_eq!(tokenize("\\,"), vec![Tok::Cmd(",".into())]);
-            assert_eq!(tokenize("a&b\\\\c"), vec![
-                Tok::Chr('a'),
-                Tok::Amp,
-                Tok::Chr('b'),
-                Tok::NewRow,
-                Tok::Chr('c')
-            ]);
+            assert_eq!(
+                tokenize("a&b\\\\c"),
+                vec![
+                    Tok::Chr('a'),
+                    Tok::Amp,
+                    Tok::Chr('b'),
+                    Tok::NewRow,
+                    Tok::Chr('c')
+                ]
+            );
             // 末尾の裸のバックスラッシュでも落ちない
             assert_eq!(tokenize("\\"), vec![Tok::Chr('\\')]);
         }
@@ -4533,7 +4980,10 @@ pub mod math {
             for src in junk {
                 let n = parse(src);
                 let b = layout(&n, 14.0, &ok());
-                assert!(b.w.is_finite() && b.height().is_finite(), "壊れた寸法: {src}");
+                assert!(
+                    b.w.is_finite() && b.height().is_finite(),
+                    "壊れた寸法: {src}"
+                );
             }
         }
 
@@ -4570,7 +5020,11 @@ pub mod math {
             let total = names.len();
             names.sort_unstable();
             names.dedup();
-            assert_eq!(total, names.len(), "SYMBOLS に重複した TeX 名がある (後ろが死ぬ)");
+            assert_eq!(
+                total,
+                names.len(),
+                "SYMBOLS に重複した TeX 名がある (後ろが死ぬ)"
+            );
         }
 
         #[test]
@@ -4585,9 +5039,15 @@ pub mod math {
         fn missing_glyphs_fall_back_to_ascii() {
             let src: String = SYMBOLS.iter().map(|s| format!("\\{} ", s.tex)).collect();
             let mut with = Vec::new();
-            glyphs(&layout(&parse(&src), 14.0, &Fake { glyphs: true }), &mut with);
+            glyphs(
+                &layout(&parse(&src), 14.0, &Fake { glyphs: true }),
+                &mut with,
+            );
             let mut without = Vec::new();
-            glyphs(&layout(&parse(&src), 14.0, &Fake { glyphs: false }), &mut without);
+            glyphs(
+                &layout(&parse(&src), 14.0, &Fake { glyphs: false }),
+                &mut without,
+            );
             assert_eq!(with.len(), SYMBOLS.len());
             assert_eq!(without.len(), SYMBOLS.len());
             for (i, s) in SYMBOLS.iter().enumerate() {
@@ -4669,8 +5129,15 @@ pub mod math {
 
         #[test]
         fn matrix_cells_are_laid_out_in_a_grid() {
-            let b = layout(&parse("\\begin{pmatrix}a&b\\\\c&d\\end{pmatrix}"), 14.0, &ok());
-            let Kind::Grid { cells, left, right, .. } = &b.kind else {
+            let b = layout(
+                &parse("\\begin{pmatrix}a&b\\\\c&d\\end{pmatrix}"),
+                14.0,
+                &ok(),
+            );
+            let Kind::Grid {
+                cells, left, right, ..
+            } = &b.kind
+            else {
                 panic!("Grid にならない: {:?}", b.kind);
             };
             assert_eq!((left.as_str(), right.as_str()), ("(", ")"));
@@ -4894,7 +5361,9 @@ fn spans_width(ui: &egui::Ui, text: &str, size: f32) -> f32 {
                 } else {
                     FontId::proportional(size)
                 };
-                f.layout_no_wrap(sp.text.clone(), font, Color32::WHITE).size().x
+                f.layout_no_wrap(sp.text.clone(), font, Color32::WHITE)
+                    .size()
+                    .x
             })
             .sum()
     })
@@ -4919,7 +5388,12 @@ fn table_cell_ui(
     style: CellStyle,
     rctx: &mut RenderCtx,
 ) {
-    let CellStyle { size, strong: strong_all, color, align } = style;
+    let CellStyle {
+        size,
+        strong: strong_all,
+        color,
+        align,
+    } = style;
     if align == TableAlign::Left {
         line_ui(ui, theme, text, size, strong_all, color, rctx);
         return;
@@ -4929,7 +5403,11 @@ fn table_cell_ui(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.set_min_width(w);
-        ui.add_space(if align == TableAlign::Right { pad } else { pad * 0.5 });
+        ui.add_space(if align == TableAlign::Right {
+            pad
+        } else {
+            pad * 0.5
+        });
         spans_ui(ui, theme, text, size, strong_all, color, rctx);
     });
 }
@@ -5046,7 +5524,11 @@ fn draw_math(ui: &egui::Ui, theme: &Theme, b: &math::MBox, base: egui::Pos2, col
     match &b.kind {
         Kind::Space => {}
         Kind::Glyph { text, size, style } => {
-            let col = if *style == math::Style::Raw { theme.warn } else { color };
+            let col = if *style == math::Style::Raw {
+                theme.warn
+            } else {
+                color
+            };
             let g = math_galley(ui, text, *size, *style, col);
             p.galley(egui::pos2(base.x, base.y - b.asc), g, col);
             if *style == math::Style::Raw {
@@ -5063,7 +5545,13 @@ fn draw_math(ui: &egui::Ui, theme: &Theme, b: &math::MBox, base: egui::Pos2, col
                 draw_math(ui, theme, child, egui::pos2(base.x + dx, base.y), color);
             }
         }
-        Kind::Frac { num, den, rule_y, thick, gap } => {
+        Kind::Frac {
+            num,
+            den,
+            rule_y,
+            thick,
+            gap,
+        } => {
             let cx = base.x + b.w * 0.5;
             let y = base.y - rule_y;
             p.line_segment(
@@ -5073,10 +5561,27 @@ fn draw_math(ui: &egui::Ui, theme: &Theme, b: &math::MBox, base: egui::Pos2, col
                 ],
                 egui::Stroke::new(*thick, color),
             );
-            draw_math(ui, theme, num, egui::pos2(cx - num.w * 0.5, y - gap - num.desc), color);
-            draw_math(ui, theme, den, egui::pos2(cx - den.w * 0.5, y + gap + den.asc), color);
+            draw_math(
+                ui,
+                theme,
+                num,
+                egui::pos2(cx - num.w * 0.5, y - gap - num.desc),
+                color,
+            );
+            draw_math(
+                ui,
+                theme,
+                den,
+                egui::pos2(cx - den.w * 0.5, y + gap + den.asc),
+                color,
+            );
         }
-        Kind::Sqrt { body, index, lead, size } => {
+        Kind::Sqrt {
+            body,
+            index,
+            lead,
+            size,
+        } => {
             let idx_w = index.as_ref().map(|i| i.w * 0.8).unwrap_or(0.0);
             let top = base.y - b.asc + size * 0.06;
             let bot = base.y + body.desc;
@@ -5091,15 +5596,27 @@ fn draw_math(ui: &egui::Ui, theme: &Theme, b: &math::MBox, base: egui::Pos2, col
                 stroke,
             );
             p.line_segment(
-                [egui::pos2(x0 + hook * 0.35, bot), egui::pos2(x0 + hook * 0.8, top)],
+                [
+                    egui::pos2(x0 + hook * 0.35, bot),
+                    egui::pos2(x0 + hook * 0.8, top),
+                ],
                 stroke,
             );
             p.line_segment(
-                [egui::pos2(x0 + hook * 0.8, top), egui::pos2(base.x + b.w, top)],
+                [
+                    egui::pos2(x0 + hook * 0.8, top),
+                    egui::pos2(base.x + b.w, top),
+                ],
                 stroke,
             );
             if let Some(idx) = index {
-                draw_math(ui, theme, idx, egui::pos2(base.x, top + idx.asc + size * 0.1), color);
+                draw_math(
+                    ui,
+                    theme,
+                    idx,
+                    egui::pos2(base.x, top + idx.asc + size * 0.1),
+                    color,
+                );
             }
             draw_math(ui, theme, body, egui::pos2(base.x + lead, base.y), color);
         }
@@ -5113,7 +5630,14 @@ fn draw_math(ui: &egui::Ui, theme: &Theme, b: &math::MBox, base: egui::Pos2, col
                 draw_math(ui, theme, s, egui::pos2(x, base.y - dy), color);
             }
         }
-        Kind::Delim { left, right, body, size, lw, rw } => {
+        Kind::Delim {
+            left,
+            right,
+            body,
+            size,
+            lw,
+            rw,
+        } => {
             let cy = base.y - b.asc + b.height() * 0.5;
             if !left.is_empty() {
                 let g = math_galley(ui, left, *size, math::Style::Norm, color);
@@ -5150,7 +5674,11 @@ fn draw_math(ui: &egui::Ui, theme: &Theme, b: &math::MBox, base: egui::Pos2, col
                 math::Accent::Tilde => {
                     let g = math_galley(ui, "~", *size * 0.9, math::Style::Norm, color);
                     let w = g.size().x;
-                    p.galley(egui::pos2(base.x + (b.w - w) * 0.5, y - size * 0.62), g, color);
+                    p.galley(
+                        egui::pos2(base.x + (b.w - w) * 0.5, y - size * 0.62),
+                        g,
+                        color,
+                    );
                 }
                 math::Accent::Dot => {
                     p.circle_filled(
@@ -5161,7 +5689,14 @@ fn draw_math(ui: &egui::Ui, theme: &Theme, b: &math::MBox, base: egui::Pos2, col
                 }
             }
         }
-        Kind::Grid { cells, left, right, size, lw, rw } => {
+        Kind::Grid {
+            cells,
+            left,
+            right,
+            size,
+            lw,
+            rw,
+        } => {
             let cy = base.y - b.asc + b.height() * 0.5;
             if !left.is_empty() {
                 let g = math_galley(ui, left, *size, math::Style::Norm, color);
@@ -5170,7 +5705,13 @@ fn draw_math(ui: &egui::Ui, theme: &Theme, b: &math::MBox, base: egui::Pos2, col
             }
             for row in cells {
                 for (dx, dy, cell) in row {
-                    draw_math(ui, theme, cell, egui::pos2(base.x + lw + dx, base.y + dy), color);
+                    draw_math(
+                        ui,
+                        theme,
+                        cell,
+                        egui::pos2(base.x + lw + dx, base.y + dy),
+                        color,
+                    );
                 }
             }
             if !right.is_empty() {
@@ -5308,7 +5849,13 @@ fn poly_line(p: &egui::Painter, pts: &[egui::Pos2], line: mermaid::Line, color: 
 }
 
 /// ノード 1 個の枠を形どおりに描く。
-fn node_shape(p: &egui::Painter, r: egui::Rect, shape: mermaid::Shape, fill: Color32, stroke: egui::Stroke) {
+fn node_shape(
+    p: &egui::Painter,
+    r: egui::Rect,
+    shape: mermaid::Shape,
+    fill: Color32,
+    stroke: egui::Stroke,
+) {
     use mermaid::Shape as S;
     let (cx, cy) = (r.center().x, r.center().y);
     match shape {
@@ -5324,7 +5871,10 @@ fn node_shape(p: &egui::Painter, r: egui::Rect, shape: mermaid::Shape, fill: Col
             if shape == S::Cylinder {
                 let d = 6.0;
                 p.line_segment(
-                    [egui::pos2(r.left(), r.top() + d), egui::pos2(r.right(), r.top() + d)],
+                    [
+                        egui::pos2(r.left(), r.top() + d),
+                        egui::pos2(r.right(), r.top() + d),
+                    ],
                     stroke,
                 );
             }
@@ -5379,7 +5929,14 @@ fn node_shape(p: &egui::Painter, r: egui::Rect, shape: mermaid::Shape, fill: Col
 }
 
 /// 折返し済みラベルを矩形の中央へ描く。
-fn centered_lines(p: &egui::Painter, r: egui::Rect, lines: &[String], size: f32, color: Color32, line_h: f32) {
+fn centered_lines(
+    p: &egui::Painter,
+    r: egui::Rect,
+    lines: &[String],
+    size: f32,
+    color: Color32,
+    line_h: f32,
+) {
     let total = lines.len() as f32 * line_h;
     let mut y = r.center().y - total * 0.5 + line_h * 0.5;
     for l in lines {
@@ -5395,15 +5952,29 @@ fn centered_lines(p: &egui::Painter, r: egui::Rect, lines: &[String], size: f32,
 }
 
 /// フローチャートを描く。
-fn flow_ui(ui: &mut egui::Ui, theme: &Theme, lay: &mermaid::FlowLayout, size: f32, m: mermaid::Metrics) {
+fn flow_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    lay: &mermaid::FlowLayout,
+    size: f32,
+    m: mermaid::Metrics,
+) {
     let (resp, p) = ui.allocate_painter(lay.size, egui::Sense::hover());
     let o = resp.rect.min.to_vec2();
     let shift = |r: egui::Rect| r.translate(o);
     // サブグラフの枠を先に (背面へ)
     for (title, r) in &lay.groups {
         let rr = shift(*r);
-        p.rect_filled(rr, egui::Rounding::same(6.0), theme.panel.linear_multiply(0.6));
-        p.rect_stroke(rr, egui::Rounding::same(6.0), egui::Stroke::new(1.0_f32, theme.border));
+        p.rect_filled(
+            rr,
+            egui::Rounding::same(6.0),
+            theme.panel.linear_multiply(0.6),
+        );
+        p.rect_stroke(
+            rr,
+            egui::Rounding::same(6.0),
+            egui::Stroke::new(1.0_f32, theme.border),
+        );
         if !title.is_empty() {
             p.text(
                 egui::pos2(rr.left() + 6.0, rr.top() + 2.0),
@@ -5419,7 +5990,13 @@ fn flow_ui(ui: &mut egui::Ui, theme: &Theme, lay: &mermaid::FlowLayout, size: f3
         let pts: Vec<egui::Pos2> = e.points.iter().map(|q| *q + o).collect();
         poly_line(&p, &pts, e.line, theme.text_dim);
         if e.arrow_to && pts.len() >= 2 {
-            arrow_head(&p, pts[pts.len() - 1], pts[pts.len() - 2], theme.text_dim, 4.5);
+            arrow_head(
+                &p,
+                pts[pts.len() - 1],
+                pts[pts.len() - 2],
+                theme.text_dim,
+                4.5,
+            );
         }
         if e.arrow_from && pts.len() >= 2 {
             arrow_head(&p, pts[0], pts[1], theme.text_dim, 4.5);
@@ -5427,7 +6004,11 @@ fn flow_ui(ui: &mut egui::Ui, theme: &Theme, lay: &mermaid::FlowLayout, size: f3
         if !e.label.is_empty() {
             let at = e.label_at + o;
             let g = ui.fonts(|f| {
-                f.layout_no_wrap(e.label.clone(), FontId::proportional(size * 0.82), theme.text)
+                f.layout_no_wrap(
+                    e.label.clone(),
+                    FontId::proportional(size * 0.82),
+                    theme.text,
+                )
             });
             let r = egui::Rect::from_center_size(at, g.size() + egui::vec2(6.0, 2.0));
             p.rect_filled(r, egui::Rounding::same(3.0), theme.bg);
@@ -5449,7 +6030,13 @@ fn flow_ui(ui: &mut egui::Ui, theme: &Theme, lay: &mermaid::FlowLayout, size: f3
 }
 
 /// シーケンス図を描く。
-fn seq_ui(ui: &mut egui::Ui, theme: &Theme, lay: &mermaid::SeqLayout, size: f32, m: mermaid::Metrics) {
+fn seq_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    lay: &mermaid::SeqLayout,
+    size: f32,
+    m: mermaid::Metrics,
+) {
     let (resp, p) = ui.allocate_painter(lay.size, egui::Sense::hover());
     let o = resp.rect.min.to_vec2();
     if let Some(t) = &lay.title {
@@ -5474,26 +6061,42 @@ fn seq_ui(ui: &mut egui::Ui, theme: &Theme, lay: &mermaid::SeqLayout, size: f32,
     for r in &lay.activations {
         let rr = r.translate(o);
         p.rect_filled(rr, egui::Rounding::same(2.0), theme.accent_soft);
-        p.rect_stroke(rr, egui::Rounding::same(2.0), egui::Stroke::new(1.0_f32, theme.accent));
+        p.rect_stroke(
+            rr,
+            egui::Rounding::same(2.0),
+            egui::Stroke::new(1.0_f32, theme.accent),
+        );
     }
     // 参加者
     for c in &lay.cols {
         let r = c.head.translate(o);
         p.rect_filled(r, egui::Rounding::same(4.0), theme.panel_alt);
-        p.rect_stroke(r, egui::Rounding::same(4.0), egui::Stroke::new(1.4_f32, theme.accent));
+        p.rect_stroke(
+            r,
+            egui::Rounding::same(4.0),
+            egui::Stroke::new(1.4_f32, theme.accent),
+        );
         centered_lines(&p, r, &c.label, size, theme.text, m.line_h);
     }
     // ノート
     for n in &lay.notes {
         let r = n.rect.translate(o);
         p.rect_filled(r, egui::Rounding::same(3.0), theme.panel);
-        p.rect_stroke(r, egui::Rounding::same(3.0), egui::Stroke::new(1.0_f32, theme.warn));
+        p.rect_stroke(
+            r,
+            egui::Rounding::same(3.0),
+            egui::Stroke::new(1.0_f32, theme.warn),
+        );
         centered_lines(&p, r, &n.lines, size * 0.9, theme.text_dim, m.line_h);
     }
     // メッセージ
     for a in &lay.arrows {
         let (from, to) = (a.from + o, a.to + o);
-        let line = if a.dashed { mermaid::Line::Dotted } else { mermaid::Line::Solid };
+        let line = if a.dashed {
+            mermaid::Line::Dotted
+        } else {
+            mermaid::Line::Solid
+        };
         let pts = if a.loopback {
             vec![from, egui::pos2(to.x, from.y), to, egui::pos2(from.x, to.y)]
         } else {
@@ -5525,8 +6128,18 @@ fn seq_ui(ui: &mut egui::Ui, theme: &Theme, lay: &mermaid::SeqLayout, size: f32,
             } else {
                 egui::pos2((from.x + to.x) * 0.5, from.y - m.line_h * 0.62)
             };
-            let anchor = if a.loopback { egui::Align2::LEFT_CENTER } else { egui::Align2::CENTER_CENTER };
-            p.text(mid, anchor, &a.text, FontId::proportional(size * 0.85), theme.text);
+            let anchor = if a.loopback {
+                egui::Align2::LEFT_CENTER
+            } else {
+                egui::Align2::CENTER_CENTER
+            };
+            p.text(
+                mid,
+                anchor,
+                &a.text,
+                FontId::proportional(size * 0.85),
+                theme.text,
+            );
         }
     }
 }
@@ -5605,13 +6218,12 @@ pub fn render(
     }
     let lines: Vec<&str> = text.lines().collect();
     let mut para = String::new();
-    let flush_para =
-        |ui: &mut egui::Ui, para: &mut String, theme: &Theme, rctx: &mut RenderCtx| {
-            if !para.trim_end().is_empty() {
-                line_ui(ui, theme, para.trim_end(), base, false, theme.text, rctx);
-            }
-            para.clear();
-        };
+    let flush_para = |ui: &mut egui::Ui, para: &mut String, theme: &Theme, rctx: &mut RenderCtx| {
+        if !para.trim_end().is_empty() {
+            line_ui(ui, theme, para.trim_end(), base, false, theme.text, rctx);
+        }
+        para.clear();
+    };
 
     let mut i = 0;
     while i < lines.len() {
@@ -5627,10 +6239,7 @@ pub fn render(
             while end < lines.len() && !lines[end].trim_start().starts_with(f) {
                 end += 1;
             }
-            let code: String = lines[start..end]
-                .iter()
-                .flat_map(|l| [*l, "\n"])
-                .collect();
+            let code: String = lines[start..end].iter().flat_map(|l| [*l, "\n"]).collect();
             if lang_tok.eq_ignore_ascii_case("mermaid") {
                 mermaid_ui(ui, theme, hl, base, i, &code);
             } else {
@@ -5679,7 +6288,11 @@ pub fn render(
                 let bar: String = std::iter::repeat_n("▍", depth.max(1)).collect();
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(RichText::new(format!("{bar} ")).color(theme.accent).size(base));
+                    ui.label(
+                        RichText::new(format!("{bar} "))
+                            .color(theme.accent)
+                            .size(base),
+                    );
                     spans_ui(ui, theme, body, base, false, theme.text_dim, rctx);
                 });
                 i += 1;
@@ -5704,9 +6317,7 @@ pub fn render(
         }
 
         // テーブル
-        if trimmed.starts_with('|')
-            && lines.get(i + 1).map(|l| is_table_sep(l)).unwrap_or(false)
-        {
+        if trimmed.starts_with('|') && lines.get(i + 1).map(|l| is_table_sep(l)).unwrap_or(false) {
             flush_para(ui, &mut para, theme, rctx);
             let header = split_row(trimmed);
             let aligns = table_aligns(lines[i + 1]);
@@ -5727,8 +6338,7 @@ pub fn render(
             }
             // 列幅の上限は全列均等割り (最低 80px)。egui::Grid は上限が有限のときだけ
             // セル内折り返しが有効になる。収まらない分は横スクロールで逃がす。
-            let cap = ((ui.available_width() - 34.0 - 16.0 * (ncols - 1) as f32)
-                / ncols as f32)
+            let cap = ((ui.available_width() - 34.0 - 16.0 * (ncols - 1) as f32) / ncols as f32)
                 .max(80.0);
             let col_align = |c: usize| aligns.get(c).copied().unwrap_or(TableAlign::Left);
             egui::ScrollArea::horizontal()
@@ -5863,7 +6473,11 @@ mod tests {
             .into_iter()
             .map(|s| {
                 let kind = if s.math {
-                    if s.math_display { "math$$" } else { "math" }
+                    if s.math_display {
+                        "math$$"
+                    } else {
+                        "math"
+                    }
                 } else if s.image {
                     "image"
                 } else if s.fnote {
@@ -5885,7 +6499,6 @@ mod tests {
             })
             .collect()
     }
-
 
     /// 図と数式を含む文書を実際に描いてみて、描画経路が落ちないことを見る。
     /// (解析と配置は純関数側で検査済み。ここは painter 呼び出しの通し確認)
@@ -5946,7 +6559,10 @@ $$
         for _ in 0..2 {
             let _ = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut rctx = RenderCtx { dir: None, images: &mut images };
+                    let mut rctx = RenderCtx {
+                        dir: None,
+                        images: &mut images,
+                    };
                     render(ui, &theme, &hl, 14.0, doc, &mut rctx);
                 });
             });
@@ -5958,34 +6574,43 @@ $$
     /// `$` を数式にする条件を本文の側から固定する。
     #[test]
     fn inline_math_delimiters() {
-        assert_eq!(kinds("式は $x^2$ です"), [
-            ("text", "式は ".into()),
-            ("math", "x^2".into()),
-            ("text", " です".into()),
-        ]);
+        assert_eq!(
+            kinds("式は $x^2$ です"),
+            [
+                ("text", "式は ".into()),
+                ("math", "x^2".into()),
+                ("text", " です".into()),
+            ]
+        );
         assert_eq!(kinds("$$a+b$$"), [("math$$", "a+b".into())]);
         assert_eq!(kinds("\\(x\\)"), [("math", "x".into())]);
         assert_eq!(kinds("\\[x\\]"), [("math$$", "x".into())]);
         // 1 行に 2 つ
-        assert_eq!(kinds("$a$ と $b$"), [
-            ("math", "a".into()),
-            ("text", " と ".into()),
-            ("math", "b".into()),
-        ]);
+        assert_eq!(
+            kinds("$a$ と $b$"),
+            [
+                ("math", "a".into()),
+                ("text", " と ".into()),
+                ("math", "b".into()),
+            ]
+        );
     }
 
     /// 通貨・エスケープ・コードスパンは数式にしない (誤爆すると本文が消える)。
     #[test]
     fn dollars_that_must_not_become_math() {
-        assert_eq!(kinds("$5 and $10 です"), [("text", "$5 and $10 です".into())]);
+        assert_eq!(
+            kinds("$5 and $10 です"),
+            [("text", "$5 and $10 です".into())]
+        );
         assert_eq!(kinds("値段は $100"), [("text", "値段は $100".into())]);
         // `\$` はエスケープ (前の `\` が消えてただの $ になる)
         assert_eq!(kinds("\\$x\\$"), [("text", "$x$".into())]);
         // コードスパンの中の $ は素通し
-        assert_eq!(kinds("`$x$` は式ではない"), [
-            ("code", "$x$".into()),
-            ("text", " は式ではない".into()),
-        ]);
+        assert_eq!(
+            kinds("`$x$` は式ではない"),
+            [("code", "$x$".into()), ("text", " は式ではない".into()),]
+        );
         // 開きの直後が空白 / 閉じの直前が空白
         assert_eq!(kinds("$ x$"), [("text", "$ x$".into())]);
         assert_eq!(kinds("$x $"), [("text", "$x $".into())]);
@@ -6000,7 +6625,10 @@ $$
         assert_eq!(display_math_block(&one, 0), Some(("E = mc^2".into(), 1)));
 
         let multi = ["$$", "\\frac{a}{b}", "+ c", "$$", "続き"];
-        assert_eq!(display_math_block(&multi, 0), Some(("\\frac{a}{b}\n+ c".into(), 4)));
+        assert_eq!(
+            display_math_block(&multi, 0),
+            Some(("\\frac{a}{b}\n+ c".into(), 4))
+        );
 
         let bracket = ["\\[", "x^2", "\\]"];
         assert_eq!(display_math_block(&bracket, 0), Some(("x^2".into(), 3)));
@@ -6042,7 +6670,11 @@ $$
             math::SYMBOLS
                 .iter()
                 .filter_map(|s| {
-                    let shown = if m.has_glyph(s.glyph, false) { s.glyph } else { s.ascii };
+                    let shown = if m.has_glyph(s.glyph, false) {
+                        s.glyph
+                    } else {
+                        s.ascii
+                    };
                     (!m.has_glyph(shown, false)).then(|| format!("\\{} → {shown}", s.tex))
                 })
                 .collect()
@@ -6072,7 +6704,10 @@ $$
             for tex in cases {
                 let b = math::layout(&math::parse(tex), 14.0, &m);
                 assert!(b.w.is_finite() && b.w > 0.0, "幅が壊れた: {tex} → {}", b.w);
-                assert!(b.height().is_finite() && b.height() > 0.0, "高さが壊れた: {tex}");
+                assert!(
+                    b.height().is_finite() && b.height() > 0.0,
+                    "高さが壊れた: {tex}"
+                );
             }
         });
     }
@@ -6147,7 +6782,10 @@ $$
     #[test]
     fn table_alignment_parse() {
         use TableAlign::*;
-        assert_eq!(table_aligns("|:--|:-:|--:|---|"), vec![Left, Center, Right, Left]);
+        assert_eq!(
+            table_aligns("|:--|:-:|--:|---|"),
+            vec![Left, Center, Right, Left]
+        );
         assert_eq!(table_aligns("| :--: | --- |"), vec![Center, Left]);
         assert_eq!(list_marker("- x"), Some((2, "•".into())));
         assert_eq!(list_marker("3. x"), Some((3, "3.".into())));
@@ -6173,7 +6811,10 @@ $$
         // dir があってもリモート/データ URL はローカル解決しない
         assert_eq!(resolve_image(Some(&dir), "http://a.b/img.png"), None);
         assert_eq!(resolve_image(Some(&dir), "https://a.b/img.png"), None);
-        assert_eq!(resolve_image(Some(&dir), "data:image/png;base64,AAAA"), None);
+        assert_eq!(
+            resolve_image(Some(&dir), "data:image/png;base64,AAAA"),
+            None
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6495,7 +7136,10 @@ $$
     #[test]
     fn hard_break_forms() {
         assert_eq!(hard_break("行末に空白2つ  "), (true, "行末に空白2つ"));
-        assert_eq!(hard_break("行末にバックスラッシュ\\"), (true, "行末にバックスラッシュ"));
+        assert_eq!(
+            hard_break("行末にバックスラッシュ\\"),
+            (true, "行末にバックスラッシュ")
+        );
         // `\\` はバックスラッシュそのもの (改行しない)
         assert_eq!(hard_break("path\\\\"), (false, "path\\\\"));
         assert_eq!(hard_break("普通の行"), (false, "普通の行"));

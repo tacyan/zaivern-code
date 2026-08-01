@@ -279,7 +279,7 @@ fn well_known_dirs() -> Vec<PathBuf> {
 
     // どの OS でも同じ場所に入るもの (公式インストーラ / rustup / bun / deno …)
     for rel in [
-        ".local/bin",   // Claude Code ネイティブ版 / uv / pipx
+        ".local/bin",    // Claude Code ネイティブ版 / uv / pipx
         ".claude/local", // Claude Code のローカルインストール
         ".cargo/bin",
         ".bun/bin",
@@ -297,8 +297,8 @@ fn well_known_dirs() -> Vec<PathBuf> {
             ".npm-packages/bin",
             ".yarn/bin",
             ".config/yarn/global/node_modules/.bin",
-            "Library/pnpm",           // macOS の pnpm
-            ".local/share/pnpm",      // Linux の pnpm
+            "Library/pnpm",      // macOS の pnpm
+            ".local/share/pnpm", // Linux の pnpm
             ".asdf/shims",
             ".local/share/mise/shims",
         ] {
@@ -454,7 +454,10 @@ mod tests {
         }
         // 自プロセスの PATH は必ず残す (端末から起動したときの正解を捨てない)
         if let Some(p) = std::env::var_os("PATH") {
-            for d in path_dirs(&p).into_iter().filter(|d| !d.as_os_str().is_empty()) {
+            for d in path_dirs(&p)
+                .into_iter()
+                .filter(|d| !d.as_os_str().is_empty())
+            {
                 assert!(dirs.contains(&d), "{} が落ちている", d.display());
             }
         }
@@ -556,7 +559,9 @@ mod tests {
     /// DoD: shell_command は両 OS で実際にコマンドを走らせられる。
     #[test]
     fn shell_command_runs_on_this_platform() {
-        let out = shell_command("echo zaivern-ok").output().expect("起動できる");
+        let out = shell_command("echo zaivern-ok")
+            .output()
+            .expect("起動できる");
         assert!(String::from_utf8_lossy(&out.stdout).contains("zaivern-ok"));
     }
 }

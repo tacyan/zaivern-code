@@ -68,9 +68,10 @@ impl GhRequest {
             GhRequest::PrDiff { number, .. } => {
                 trf("PR #{number} の差分取得", &[("number", number.to_string())])
             }
-            GhRequest::PrCheckout { number, .. } => {
-                trf("PR #{number} のチェックアウト", &[("number", number.to_string())])
-            }
+            GhRequest::PrCheckout { number, .. } => trf(
+                "PR #{number} のチェックアウト",
+                &[("number", number.to_string())],
+            ),
             GhRequest::BranchList { .. } => tr("ブランチ一覧の取得"),
         }
     }
@@ -150,11 +151,20 @@ pub enum GhOutcome {
     Repo(RepoInfo),
     Prs(Vec<PullRequest>),
     Issues(Vec<Issue>),
-    Diff { number: u64, text: String },
-    Checkout { number: u64, message: String },
+    Diff {
+        number: u64,
+        text: String,
+    },
+    Checkout {
+        number: u64,
+        message: String,
+    },
     Branches(Vec<Branch>),
     /// 失敗。`req_label` は [`GhRequest::label`]、`message` は利用者向け日本語。
-    Error { req_label: String, message: String },
+    Error {
+        req_label: String,
+        message: String,
+    },
 }
 
 impl GhOutcome {
@@ -167,7 +177,10 @@ impl GhOutcome {
         match self {
             GhOutcome::Error { req_label, message } => Some(trf(
                 "{req_label}に失敗: {message}",
-                &[("req_label", req_label.clone()), ("message", message.clone())],
+                &[
+                    ("req_label", req_label.clone()),
+                    ("message", message.clone()),
+                ],
             )),
             _ => None,
         }
@@ -342,7 +355,10 @@ pub fn run_blocking(req: &GhRequest) -> GhOutcome {
             GhOutcome::Checkout {
                 number: *number,
                 message: if msg.is_empty() {
-                    trf("PR #{number} をチェックアウトしました", &[("number", number.to_string())])
+                    trf(
+                        "PR #{number} をチェックアウトしました",
+                        &[("number", number.to_string())],
+                    )
                 } else {
                     msg.to_string()
                 },
@@ -394,7 +410,10 @@ fn capture(root: &Path, args: &[&str], timeout: Duration) -> Result<String, Stri
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
-                return Err(trf("gh の終了待ちに失敗しました: {e}", &[("e", e.to_string())]))
+                return Err(trf(
+                    "gh の終了待ちに失敗しました: {e}",
+                    &[("e", e.to_string())],
+                ))
             }
         }
     };
@@ -425,7 +444,8 @@ pub fn msg_gh_missing() -> String {
 }
 
 pub fn msg_not_authenticated(detail: &str) -> String {
-    let base = tr("GitHub にログインしていません。ターミナルで `gh auth login` を実行してください。");
+    let base =
+        tr("GitHub にログインしていません。ターミナルで `gh auth login` を実行してください。");
     if detail.is_empty() {
         base
     } else {
@@ -506,7 +526,10 @@ pub fn classify_failure(code: Option<i32>, stderr: &str) -> String {
             "gh が終了コード {c} で失敗しました: {detail}",
             &[("c", c.to_string()), ("detail", detail.clone())],
         ),
-        None => trf("gh が中断されました: {detail}", &[("detail", detail.clone())]),
+        None => trf(
+            "gh が中断されました: {detail}",
+            &[("detail", detail.clone())],
+        ),
     }
 }
 
@@ -544,13 +567,23 @@ fn decode(json: &str, what: &str) -> Result<serde_json::Value, String> {
     })
 }
 
-fn as_array<'a>(v: &'a serde_json::Value, what: &str) -> Result<&'a Vec<serde_json::Value>, String> {
-    v.as_array()
-        .ok_or_else(|| trf("{what}の応答が配列ではありません", &[("what", what.to_string())]))
+fn as_array<'a>(
+    v: &'a serde_json::Value,
+    what: &str,
+) -> Result<&'a Vec<serde_json::Value>, String> {
+    v.as_array().ok_or_else(|| {
+        trf(
+            "{what}の応答が配列ではありません",
+            &[("what", what.to_string())],
+        )
+    })
 }
 
 fn str_at(v: &serde_json::Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn u64_at(v: &serde_json::Value, key: &str) -> u64 {
@@ -619,9 +652,9 @@ pub fn parse_issues(json: &str) -> Result<Vec<Issue>, String> {
                     ls.iter()
                         .filter_map(|l| {
                             // 文字列そのままの場合と {name: ...} の場合の両方を許容する。
-                            l.as_str()
-                                .map(str::to_string)
-                                .or_else(|| l.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                            l.as_str().map(str::to_string).or_else(|| {
+                                l.get("name").and_then(|n| n.as_str()).map(str::to_string)
+                            })
                         })
                         .filter(|s| !s.is_empty())
                         .collect()
@@ -879,7 +912,10 @@ mod tests {
 
     #[test]
     fn classify_failure_detects_not_a_git_repo() {
-        let m = classify_failure(Some(1), "fatal: not a git repository (or any of the parent directories): .git");
+        let m = classify_failure(
+            Some(1),
+            "fatal: not a git repository (or any of the parent directories): .git",
+        );
         assert!(m.contains("git リポジトリではありません"), "{m}");
         // stderr は捨てずに添える。
         assert!(m.contains("not a git repository"), "{m}");
@@ -900,8 +936,10 @@ mod tests {
     fn classify_failure_detects_404_403_and_network() {
         assert!(classify_failure(Some(1), "HTTP 404: Not Found").contains("権限がありません"));
         assert!(classify_failure(Some(1), "HTTP 403: rate limit exceeded").contains("レート制限"));
-        assert!(classify_failure(Some(1), "dial tcp: lookup api.github.com: no such host")
-            .contains("接続できません"));
+        assert!(
+            classify_failure(Some(1), "dial tcp: lookup api.github.com: no such host")
+                .contains("接続できません")
+        );
     }
 
     #[test]

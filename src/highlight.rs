@@ -781,10 +781,7 @@ fn scan_source(text: &str, spec: &LangSpec) -> SourceScan {
 /// 「自分より深い行が続く行」がヘッダになり、末尾の空行は範囲に含めない
 /// (空行まで畳むと、次のブロックとの間の余白まで消えて読みにくいため)。
 fn indent_folds(lines: &[&str], tab_width: usize, out: &mut Vec<FoldRange>) {
-    let ind: Vec<Option<usize>> = lines
-        .iter()
-        .map(|l| visual_indent(l, tab_width))
-        .collect();
+    let ind: Vec<Option<usize>> = lines.iter().map(|l| visual_indent(l, tab_width)).collect();
     // (インデント, 行)
     let mut stack: Vec<(usize, usize)> = Vec::new();
     let mut prev_nonblank: Option<usize> = None;
@@ -1003,10 +1000,7 @@ pub fn fold_ranges_with(text: &str, lang: &str, tab_width: usize) -> Vec<FoldRan
 /// 各行の「実効インデント」。空行は前後の非空行の**浅い方**を継ぐ
 /// (ブロックの切れ目でガイドが宙に浮かないようにするため)。
 fn effective_indents(lines: &[&str], tab_width: usize) -> Vec<usize> {
-    let raw: Vec<Option<usize>> = lines
-        .iter()
-        .map(|l| visual_indent(l, tab_width))
-        .collect();
+    let raw: Vec<Option<usize>> = lines.iter().map(|l| visual_indent(l, tab_width)).collect();
     let n = raw.len();
     let mut before = vec![0usize; n];
     let mut cur = 0usize;
@@ -1092,10 +1086,7 @@ pub fn active_guide(text: &str, tab_width: usize, caret_line: usize) -> Option<A
         return None;
     }
     let eff = effective_indents(&lines, tw);
-    let raw: Vec<Option<usize>> = lines
-        .iter()
-        .map(|l| visual_indent(l, tw))
-        .collect();
+    let raw: Vec<Option<usize>> = lines.iter().map(|l| visual_indent(l, tw)).collect();
     let own = eff[caret_line];
     let opens = raw[(caret_line + 1).min(n)..]
         .iter()
@@ -1275,7 +1266,10 @@ mod tests {
 
     #[test]
     fn lang_for_resolves_known_extension() {
-        assert_eq!(hl().lang_for(Some(Path::new("a.rs")), "fn main() {}"), "Rust");
+        assert_eq!(
+            hl().lang_for(Some(Path::new("a.rs")), "fn main() {}"),
+            "Rust"
+        );
     }
 
     #[test]
@@ -1545,7 +1539,11 @@ mod tests {
         assert!(text.len() > MAX_HIGHLIGHT_BYTES);
 
         let job = job_of(&text, "Rust");
-        assert_eq!(job.sections.len(), 1, "large files must be laid out in one plain span");
+        assert_eq!(
+            job.sections.len(),
+            1,
+            "large files must be laid out in one plain span"
+        );
         assert_eq!(job.sections[0].format.color, fallback());
     }
 
@@ -1553,7 +1551,10 @@ mod tests {
     fn oversized_single_line_is_passed_through_without_highlighting() {
         // minify された JS のような 1 行だけ巨大なテキストでも、その行は
         // 素通し (フォールバック色) にして残りの行はハイライトを続ける。
-        let long_line = format!("let s = \"{}\";\n", "x".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1));
+        let long_line = format!(
+            "let s = \"{}\";\n",
+            "x".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1)
+        );
         let text = format!("fn main() {{}}\n{long_line}// tail\n");
         let job = job_of(&text, "Rust");
         assert_spans_ok(&job, &text);
@@ -1794,10 +1795,7 @@ other: 2
             f.contains(&(3, 7, FoldKind::Section)),
             "最初の ## は次の ## の直前まで: {f:?}"
         );
-        assert!(
-            f.contains(&(6, 7, FoldKind::Section)),
-            "### は 6..7: {f:?}"
-        );
+        assert!(f.contains(&(6, 7, FoldKind::Section)), "### は 6..7: {f:?}");
         assert!(
             f.contains(&(9, 10, FoldKind::Section)),
             "最後の ## は末尾まで: {f:?}"
@@ -1884,7 +1882,10 @@ fn a() {
 ";
         let r = fold_ranges(text, "Rust");
         for w in r.windows(2) {
-            assert!(w[0].start_line < w[1].start_line, "開始行が昇順かつ一意: {r:?}");
+            assert!(
+                w[0].start_line < w[1].start_line,
+                "開始行が昇順かつ一意: {r:?}"
+            );
         }
         for x in &r {
             assert!(x.end_line > x.start_line, "空の範囲は無い: {x:?}");
@@ -1926,12 +1927,7 @@ fn a() {
                 4,
                 &[&[], &[0], &[0], &[]],
             ),
-            (
-                "タブ幅 2",
-                "a\n  b\n    c\n",
-                2,
-                &[&[], &[0], &[0, 2], &[]],
-            ),
+            ("タブ幅 2", "a\n  b\n    c\n", 2, &[&[], &[0], &[0, 2], &[]]),
             (
                 "深いネスト",
                 "a\n    b\n        c\n            d\n",

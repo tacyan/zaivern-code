@@ -874,13 +874,8 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 // 原因を stderr に出し、復旧用に .broken へ控えてから既定値で
                 // 起動する (以後の保存で壊れたファイルが上書きされても戻せる)。
                 eprintln!("zaivern: config.toml のパースに失敗: {e}");
-                let _ = std::fs::copy(
-                    dir.join("config.toml"),
-                    dir.join("config.toml.broken"),
-                );
-                eprintln!(
-                    "zaivern: 壊れた config.toml を config.toml.broken に控えました"
-                );
+                let _ = std::fs::copy(dir.join("config.toml"), dir.join("config.toml.broken"));
+                eprintln!("zaivern: 壊れた config.toml を config.toml.broken に控えました");
                 Config::default()
             }
         },
@@ -1422,7 +1417,8 @@ mod tests {
                 assert!(
                     agents
                         .iter()
-                        .any(|a| a.name == format!("{}{}", spec.label, crate::agent_picker::AUTO_SUFFIX)),
+                        .any(|a| a.name
+                            == format!("{}{}", spec.label, crate::agent_picker::AUTO_SUFFIX)),
                     "{bin} の全自動プリセットが既定に無い"
                 );
             }
@@ -1460,7 +1456,15 @@ mod tests {
                 .filter(|a| !a.name.contains("全自動"))
                 .map(|a| a.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["claude", "codex", "gemini", "agy", "cursor-agent", "droid", ""]
+            vec![
+                "claude",
+                "codex",
+                "gemini",
+                "agy",
+                "cursor-agent",
+                "droid",
+                ""
+            ]
         );
     }
 
@@ -1640,7 +1644,10 @@ command = "agy"
         assert_eq!(cfg.agents[0].command, "claude");
         assert_eq!(cfg.agents[2].command, "agy");
         // 旧設定に無い新フィールドは既定値で埋まる
-        assert!(cfg.agents.iter().all(|a| a.cwd.is_none() && a.env.is_empty()));
+        assert!(cfg
+            .agents
+            .iter()
+            .all(|a| a.cwd.is_none() && a.env.is_empty()));
 
         // [[agents]] を書いていない古い設定は、新しい既定一式を受け取る
         let bare: Config = toml::from_str("theme = \"zaivern-dark\"").expect("読める");
@@ -1686,16 +1693,15 @@ command = "agy"
     fn config_ignores_unknown_fields() {
         // deny_unknown_fields を付けていないので、将来削除された項目が
         // 残っていても設定全体が壊れない
-        let c: Config = toml::from_str("theme = \"x\"\nlegacy_option = 42\n")
-            .expect("未知のキーは無視される");
+        let c: Config =
+            toml::from_str("theme = \"x\"\nlegacy_option = 42\n").expect("未知のキーは無視される");
         assert_eq!(c.theme, "x");
     }
 
     #[test]
     fn config_accepts_optional_pet_position() {
-        let c: Config =
-            toml::from_str("pet_x = 12.5\npet_y = -3.0\npet_image = \"/tmp/p.png\"\n")
-                .expect("parse ok");
+        let c: Config = toml::from_str("pet_x = 12.5\npet_y = -3.0\npet_image = \"/tmp/p.png\"\n")
+            .expect("parse ok");
         assert_eq!(c.pet_x, Some(12.5));
         assert_eq!(c.pet_y, Some(-3.0));
         assert_eq!(c.pet_image, Some("/tmp/p.png".to_string()));
@@ -1774,7 +1780,10 @@ command = "agy"
     #[test]
     fn config_rejects_malformed_toml() {
         assert!(toml::from_str::<Config>("theme = ").is_err(), "値が無い");
-        assert!(toml::from_str::<Config>("[[agents\n").is_err(), "括弧が閉じていない");
+        assert!(
+            toml::from_str::<Config>("[[agents\n").is_err(),
+            "括弧が閉じていない"
+        );
         assert!(toml::from_str::<Config>("= \"x\"\n").is_err(), "キーが無い");
     }
 
@@ -1819,8 +1828,8 @@ command = "agy"
 
     #[test]
     fn overlay_parses_only_present_fields() {
-        let o: Overlay = toml::from_str("theme = \"zaivern-midnight\"\nshow_pet = false\n")
-            .expect("parse ok");
+        let o: Overlay =
+            toml::from_str("theme = \"zaivern-midnight\"\nshow_pet = false\n").expect("parse ok");
         assert_eq!(o.theme, Some("zaivern-midnight".to_string()));
         assert_eq!(o.show_pet, Some(false));
         assert_eq!(o.approval_mode, None, "未指定はグローバル設定を残す");
@@ -1844,15 +1853,19 @@ command = "agy"
 
     #[test]
     fn overlay_keybindings_merge_per_key() {
-        let o: Overlay = toml::from_str("[keybindings]\nsave = \"ctrl+s\"\nrun = \"f5\"\n")
-            .expect("parse ok");
+        let o: Overlay =
+            toml::from_str("[keybindings]\nsave = \"ctrl+s\"\nrun = \"f5\"\n").expect("parse ok");
         let mut base: HashMap<String, String> = HashMap::new();
         base.insert("save".into(), "cmd+s".into());
         base.insert("quit".into(), "cmd+q".into());
         for (k, v) in o.keybindings {
             base.insert(k, v);
         }
-        assert_eq!(base.get("save").map(String::as_str), Some("ctrl+s"), "上書き");
+        assert_eq!(
+            base.get("save").map(String::as_str),
+            Some("ctrl+s"),
+            "上書き"
+        );
         assert_eq!(base.get("run").map(String::as_str), Some("f5"), "追加");
         assert_eq!(base.get("quit").map(String::as_str), Some("cmd+q"), "温存");
         assert_eq!(base.len(), 3);
@@ -2008,7 +2021,10 @@ command = "agy"
         assert_eq!(s.file_name().and_then(|f| f.to_str()), Some("state.toml"));
         assert_eq!(c.parent(), s.parent(), "同じ ~/.zaivern に置かれる");
         assert!(c.parent().is_some_and(|p| p.ends_with(".zaivern")));
-        assert!(c.is_absolute() || c.starts_with("."), "home 不明時は ./.zaivern");
+        assert!(
+            c.is_absolute() || c.starts_with("."),
+            "home 不明時は ./.zaivern"
+        );
     }
 
     #[test]
@@ -2256,7 +2272,10 @@ mod plugins_config_tests {
         assert!(out.contains("# 大事なメモ"), "区画外のコメントが消えた");
         assert!(out.contains("save = \"cmd+s\""), "他セクションが消えた");
         assert!(!out.contains("\"old\""), "古い disabled が残っている");
-        assert!(!out.contains("[plugins.settings.foo]"), "古い設定テーブルが残っている");
+        assert!(
+            !out.contains("[plugins.settings.foo]"),
+            "古い設定テーブルが残っている"
+        );
         assert!(out.contains("[plugins.settings.bar]"));
 
         let back: Config = toml::from_str(&out).expect("書き戻した config.toml が壊れている");
@@ -2342,7 +2361,10 @@ reply = "y\r"
         let cfg: Config = toml::from_str(old).expect("古い設定が読めなくなった");
         assert_eq!(cfg.theme, "dark");
         assert!(cfg.pet_auto_yes, "既存のキーが読めている");
-        assert!(cfg.auto_yes_rules.is_empty(), "未指定なら空 (既定の表だけ使う)");
+        assert!(
+            cfg.auto_yes_rules.is_empty(),
+            "未指定なら空 (既定の表だけ使う)"
+        );
     }
 
     #[test]
@@ -2372,8 +2394,14 @@ reply = "3\r"
 "#;
         let cfg: Config = toml::from_str(src).expect("番号メニューのルールが読めない");
         assert_eq!(cfg.auto_yes_rules.len(), 1);
-        assert_eq!(cfg.auto_yes_rules[0].reply, "3\r", "番号 + Enter が書けない");
-        assert!(cfg.auto_yes_rules[0].agent.is_empty(), "省略時は全エージェント");
+        assert_eq!(
+            cfg.auto_yes_rules[0].reply, "3\r",
+            "番号 + Enter が書けない"
+        );
+        assert!(
+            cfg.auto_yes_rules[0].agent.is_empty(),
+            "省略時は全エージェント"
+        );
         // 記入例が既定 config.toml に載っていること (ユーザーが真似できる)
         assert!(
             DEFAULT_CONFIG.contains("reply = \"3\\r\""),
@@ -2539,7 +2567,10 @@ mod state_overlay_tests {
 
         let loaded = load_from_dir(&home, &[], true);
         assert!(loaded.word_wrap, "折り返しが state.toml から復元される");
-        assert!(loaded.show_whitespace, "空白表示が state.toml から復元される");
+        assert!(
+            loaded.show_whitespace,
+            "空白表示が state.toml から復元される"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -2563,7 +2594,10 @@ mod state_overlay_tests {
         save_state_to_dir(&home, &cfg);
         let loaded = load_from_dir(&home, &[], true);
         assert!(loaded.minimap, "ミニマップが state.toml から復元される");
-        assert!(!loaded.breadcrumbs, "ブレッドクラムが state.toml から復元される");
+        assert!(
+            !loaded.breadcrumbs,
+            "ブレッドクラムが state.toml から復元される"
+        );
 
         // プロジェクト overlay で上書きでき、グローバルの控えへは漏れない
         std::fs::write(
@@ -2573,7 +2607,10 @@ mod state_overlay_tests {
         .expect("write .zaivern.toml");
         let cfg = load_from_dir(&home, std::slice::from_ref(&root), true);
         assert!(!cfg.minimap && cfg.breadcrumbs, "プロジェクト値が効く");
-        assert!(cfg.global_minimap && !cfg.global_breadcrumbs, "控えは overlay 前のまま");
+        assert!(
+            cfg.global_minimap && !cfg.global_breadcrumbs,
+            "控えは overlay 前のまま"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&root);
@@ -2583,8 +2620,11 @@ mod state_overlay_tests {
     fn 折り返しはプロジェクトoverlayでも上書きできる() {
         let home = crate::test_util::unique_temp_dir("zaivern-config-test", "wrap-ov-home");
         let root = crate::test_util::unique_temp_dir("zaivern-config-test", "wrap-ov-root");
-        std::fs::write(root.join(".zaivern.toml"), "word_wrap = true\nshow_whitespace = true\n")
-            .expect("write .zaivern.toml");
+        std::fs::write(
+            root.join(".zaivern.toml"),
+            "word_wrap = true\nshow_whitespace = true\n",
+        )
+        .expect("write .zaivern.toml");
 
         let cfg = load_from_dir(&home, std::slice::from_ref(&root), true);
         assert!(cfg.word_wrap && cfg.show_whitespace, "プロジェクト値が効く");

@@ -1430,7 +1430,10 @@ mod tests {
             Some("claude"),
         );
         assert_eq!(kind, ApprovalKind::GitOperation);
-        assert!(detail.contains("git commit"), "根拠行が取れていない: {detail}");
+        assert!(
+            detail.contains("git commit"),
+            "根拠行が取れていない: {detail}"
+        );
     }
 
     #[test]
@@ -1654,20 +1657,32 @@ mod tests {
         let dir = unique_temp_dir("zaivern-approvals-test", "dedup");
         let mut q = ApprovalQueue::in_dir(&dir);
         let text = "Allow access to this file?\n> Yes, allow access";
-        assert_eq!(q.intake(1, Some("agy"), text, 77), Verdict::Queued { id: 1 });
+        assert_eq!(
+            q.intake(1, Some("agy"), text, 77),
+            Verdict::Queued { id: 1 }
+        );
         // 同じセッション・同じ指紋 → 二重に積まない
         assert_eq!(q.intake(1, Some("agy"), text, 77), Verdict::Duplicate);
         assert_eq!(q.pending_len(), 1);
         // 別セッションなら別物
-        assert_eq!(q.intake(2, Some("agy"), text, 77), Verdict::Queued { id: 2 });
+        assert_eq!(
+            q.intake(2, Some("agy"), text, 77),
+            Verdict::Queued { id: 2 }
+        );
         // 同じセッションでも指紋が違えば別物 (連続承認の 2 個目)
-        assert_eq!(q.intake(1, Some("agy"), text, 78), Verdict::Queued { id: 3 });
+        assert_eq!(
+            q.intake(1, Some("agy"), text, 78),
+            Verdict::Queued { id: 3 }
+        );
         assert_eq!(q.pending_len(), 3);
         // セッションを閉じたら、その分だけ消える
         q.forget_session(1);
         assert_eq!(q.pending_len(), 1);
         // 閉じた後は同じ指紋でもまた積める
-        assert_eq!(q.intake(1, Some("agy"), text, 77), Verdict::Queued { id: 4 });
+        assert_eq!(
+            q.intake(1, Some("agy"), text, 77),
+            Verdict::Queued { id: 4 }
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1810,7 +1825,10 @@ mod tests {
             append_audit(&dir, &e(n));
         }
         let tail = read_audit_tail(&dir, 400);
-        assert!(!tail.is_empty() && tail.len() < 50, "末尾読みが効いていない");
+        assert!(
+            !tail.is_empty() && tail.len() < 50,
+            "末尾読みが効いていない"
+        );
         assert_eq!(
             tail.last().map(|x| x.ts),
             Some(1_700_000_000 + 49),

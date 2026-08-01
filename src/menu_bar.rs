@@ -103,14 +103,29 @@ fn native_sc(spec: &str) -> String {
 fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<Cmd>) {
     ui.menu_button(tr("ファイル"), |ui| {
         ui.set_min_width(280.0);
-        if item(ui, &tr("新しいテキスト ファイル"), &sc(keys, BindAction::NewFile), true) {
+        if item(
+            ui,
+            &tr("新しいテキスト ファイル"),
+            &sc(keys, BindAction::NewFile),
+            true,
+        ) {
             cmds.push(Cmd::NewFile);
         }
-        if item(ui, &tr("新しいウィンドウ"), &sc(keys, BindAction::NewWindow), true) {
+        if item(
+            ui,
+            &tr("新しいウィンドウ"),
+            &sc(keys, BindAction::NewWindow),
+            true,
+        ) {
             cmds.push(Cmd::NewWindow);
         }
         ui.separator();
-        if item(ui, &tr("ファイルを開く…"), &sc(keys, BindAction::OpenFile), true) {
+        if item(
+            ui,
+            &tr("ファイルを開く…"),
+            &sc(keys, BindAction::OpenFile),
+            true,
+        ) {
             cmds.push(Cmd::OpenFileDialog);
         }
         if item(ui, &tr("フォルダーを開く…"), "", true) {
@@ -147,23 +162,41 @@ fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             cmds.push(Cmd::AddFolder);
         }
         if info.roots.len() > 1 {
-            ui.menu_button(tr("フォルダーをワークスペースから削除"), |ui| {
-                ui.set_min_width(280.0);
-                for r in &info.roots {
-                    if item(ui, &display_path(r), "", true) {
-                        cmds.push(Cmd::RemoveFolder(r.clone()));
+            ui.menu_button(
+                tr("フォルダーをワークスペースから削除"),
+                |ui| {
+                    ui.set_min_width(280.0);
+                    for r in &info.roots {
+                        if item(ui, &display_path(r), "", true) {
+                            cmds.push(Cmd::RemoveFolder(r.clone()));
+                        }
                     }
-                }
-            });
+                },
+            );
         }
         ui.separator();
-        if item(ui, &tr("保存"), &sc(keys, BindAction::Save), info.has_editor) {
+        if item(
+            ui,
+            &tr("保存"),
+            &sc(keys, BindAction::Save),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::Save);
         }
-        if item(ui, &tr("名前を付けて保存…"), &sc(keys, BindAction::SaveAs), info.has_editor) {
+        if item(
+            ui,
+            &tr("名前を付けて保存…"),
+            &sc(keys, BindAction::SaveAs),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::SaveAs);
         }
-        if item(ui, &tr("すべて保存"), &sc(keys, BindAction::SaveAll), info.has_editor) {
+        if item(
+            ui,
+            &tr("すべて保存"),
+            &sc(keys, BindAction::SaveAll),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::SaveAll);
         }
         let mut auto = info.auto_save;
@@ -189,7 +222,12 @@ fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             }
         });
         ui.separator();
-        if item(ui, &tr("エディターを閉じる"), &sc(keys, BindAction::CloseTab), info.has_editor) {
+        if item(
+            ui,
+            &tr("エディターを閉じる"),
+            &sc(keys, BindAction::CloseTab),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::CloseTab);
         }
         if item(ui, &tr("すべてのエディターを閉じる"), "", info.has_editor) {
@@ -226,14 +264,29 @@ fn edit_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             cmds.push(Cmd::OpenReplace);
         }
         ui.separator();
-        if item(ui, &tr("ファイル間で検索"), &sc(keys, BindAction::GlobalSearch), true) {
+        if item(
+            ui,
+            &tr("ファイル間で検索"),
+            &sc(keys, BindAction::GlobalSearch),
+            true,
+        ) {
             cmds.push(Cmd::GlobalSearch);
         }
-        if item(ui, &tr("ファイル間で置換"), &sc(keys, BindAction::GlobalReplace), true) {
+        if item(
+            ui,
+            &tr("ファイル間で置換"),
+            &sc(keys, BindAction::GlobalReplace),
+            true,
+        ) {
             cmds.push(Cmd::GlobalReplace);
         }
         ui.separator();
-        if item(ui, &tr("行コメントの切り替え"), &sc(keys, BindAction::ToggleComment), ed) {
+        if item(
+            ui,
+            &tr("行コメントの切り替え"),
+            &sc(keys, BindAction::ToggleComment),
+            ed,
+        ) {
             cmds.push(Cmd::ToggleLineComment);
         }
         ui.separator();
@@ -287,13 +340,28 @@ fn selection_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mu
             cmds.push(Cmd::SelectAll);
         }
         ui.separator();
-        if item(ui, &tr("行を複製"), &sc(keys, BindAction::DuplicateLine), ed) {
+        if item(
+            ui,
+            &tr("行を複製"),
+            &sc(keys, BindAction::DuplicateLine),
+            ed,
+        ) {
             cmds.push(Cmd::DuplicateLine);
         }
-        if item(ui, &tr("行を上へ移動"), &sc(keys, BindAction::MoveLineUp), ed) {
+        if item(
+            ui,
+            &tr("行を上へ移動"),
+            &sc(keys, BindAction::MoveLineUp),
+            ed,
+        ) {
             cmds.push(Cmd::MoveLineUp);
         }
-        if item(ui, &tr("行を下へ移動"), &sc(keys, BindAction::MoveLineDown), ed) {
+        if item(
+            ui,
+            &tr("行を下へ移動"),
+            &sc(keys, BindAction::MoveLineDown),
+            ed,
+        ) {
             cmds.push(Cmd::MoveLineDown);
         }
     });
@@ -303,7 +371,12 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
     let ed = info.has_editor;
     ui.menu_button(tr("表示"), |ui| {
         ui.set_min_width(300.0);
-        if item(ui, &tr("コマンド パレット…"), &sc(keys, BindAction::PaletteCommands), true) {
+        if item(
+            ui,
+            &tr("コマンド パレット…"),
+            &sc(keys, BindAction::PaletteCommands),
+            true,
+        ) {
             cmds.push(Cmd::OpenCommandPalette);
         }
         ui.separator();
@@ -377,7 +450,12 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             if item(ui, &tr("ズームイン"), &sc(keys, BindAction::FontInc), true) {
                 cmds.push(Cmd::FontInc);
             }
-            if item(ui, &tr("ズームアウト"), &sc(keys, BindAction::FontDec), true) {
+            if item(
+                ui,
+                &tr("ズームアウト"),
+                &sc(keys, BindAction::FontDec),
+                true,
+            ) {
                 cmds.push(Cmd::FontDec);
             }
         });
@@ -395,7 +473,12 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             ) {
                 cmds.push(Cmd::SplitEditorRight);
             }
-            if item(ui, &tr("下に分割"), &sc(keys, BindAction::SplitEditorDown), ed) {
+            if item(
+                ui,
+                &tr("下に分割"),
+                &sc(keys, BindAction::SplitEditorDown),
+                ed,
+            ) {
                 cmds.push(Cmd::SplitEditorDown);
             }
             ui.separator();
@@ -416,7 +499,12 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             }
         });
         ui.separator();
-        if item(ui, &tr("エクスプローラー"), &sc(keys, BindAction::FocusExplorer), true) {
+        if item(
+            ui,
+            &tr("エクスプローラー"),
+            &sc(keys, BindAction::FocusExplorer),
+            true,
+        ) {
             cmds.push(Cmd::ShowExplorer);
         }
         if item(ui, &tr("検索"), &sc(keys, BindAction::GlobalSearch), true) {
@@ -504,7 +592,12 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         } else {
             tr("Markdown/HTML プレビュー")
         };
-        if item(ui, &md, &sc(keys, BindAction::ToggleMdPreview), info.has_editor) {
+        if item(
+            ui,
+            &md,
+            &sc(keys, BindAction::ToggleMdPreview),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::ToggleMdPreview);
         }
         ui.separator();
@@ -512,13 +605,23 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         // 2 打鍵のコードが要るのでメニューとパレット専用にしてある。
         ui.menu_button(tr("折りたたみ"), |ui| {
             ui.set_min_width(280.0);
-            if item(ui, &tr("折りたたみ切替"), &sc(keys, BindAction::ToggleFold), ed) {
+            if item(
+                ui,
+                &tr("折りたたみ切替"),
+                &sc(keys, BindAction::ToggleFold),
+                ed,
+            ) {
                 cmds.push(Cmd::ToggleFold);
             }
             if item(ui, &tr("すべて折りたたむ"), "", ed) {
                 cmds.push(Cmd::FoldAll);
             }
-            if item(ui, &tr("すべて展開する"), &sc(keys, BindAction::UnfoldAll), ed) {
+            if item(
+                ui,
+                &tr("すべて展開する"),
+                &sc(keys, BindAction::UnfoldAll),
+                ed,
+            ) {
                 cmds.push(Cmd::UnfoldAll);
             }
             ui.separator();
@@ -546,31 +649,71 @@ fn go_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<C
             cmds.push(Cmd::NavForward);
         }
         ui.separator();
-        if item(ui, &tr("ファイルへ移動…"), &sc(keys, BindAction::PaletteFiles), true) {
+        if item(
+            ui,
+            &tr("ファイルへ移動…"),
+            &sc(keys, BindAction::PaletteFiles),
+            true,
+        ) {
             cmds.push(Cmd::OpenFilePalette);
         }
         ui.separator();
-        if item(ui, &tr("次のエディター"), &sc(keys, BindAction::NextTab), ed) {
+        if item(
+            ui,
+            &tr("次のエディター"),
+            &sc(keys, BindAction::NextTab),
+            ed,
+        ) {
             cmds.push(Cmd::NextTab);
         }
-        if item(ui, &tr("前のエディター"), &sc(keys, BindAction::PrevTab), ed) {
+        if item(
+            ui,
+            &tr("前のエディター"),
+            &sc(keys, BindAction::PrevTab),
+            ed,
+        ) {
             cmds.push(Cmd::PrevTab);
         }
         ui.separator();
-        if item(ui, &tr("定義へ移動"), &sc(keys, BindAction::GoToDefinition), info.has_file) {
+        if item(
+            ui,
+            &tr("定義へ移動"),
+            &sc(keys, BindAction::GoToDefinition),
+            info.has_file,
+        ) {
             cmds.push(Cmd::GoToDefinition);
         }
-        if item(ui, &tr("ブラケットへ移動"), &sc(keys, BindAction::GoToBracket), ed) {
+        if item(
+            ui,
+            &tr("ブラケットへ移動"),
+            &sc(keys, BindAction::GoToBracket),
+            ed,
+        ) {
             cmds.push(Cmd::GoToBracket);
         }
-        if item(ui, &tr("シンボルにジャンプ"), &sc(keys, BindAction::LspSymbols), info.has_file) {
+        if item(
+            ui,
+            &tr("シンボルにジャンプ"),
+            &sc(keys, BindAction::LspSymbols),
+            info.has_file,
+        ) {
             cmds.push(Cmd::LspSymbols);
         }
-        if item(ui, &tr("参照を検索"), &sc(keys, BindAction::LspReferences), info.has_file) {
+        if item(
+            ui,
+            &tr("参照を検索"),
+            &sc(keys, BindAction::LspReferences),
+            info.has_file,
+        ) {
             cmds.push(Cmd::LspReferences);
         }
         ui.separator();
-        if item(ui, &tr("ブックマーク切替"), &sc(keys, BindAction::ToggleBookmark), ed) {
+        if item(
+            ui,
+            &tr("ブックマーク切替"),
+            &sc(keys, BindAction::ToggleBookmark),
+            ed,
+        ) {
             cmds.push(Cmd::ToggleBookmark);
         }
         if item(ui, &tr("次のブックマークへ"), "", ed) {
@@ -641,7 +784,12 @@ fn run_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<
 fn terminal_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<Cmd>) {
     ui.menu_button(tr("ターミナル"), |ui| {
         ui.set_min_width(300.0);
-        if item(ui, &tr("新しいターミナル"), &sc(keys, BindAction::NewTerminal), true) {
+        if item(
+            ui,
+            &tr("新しいターミナル"),
+            &sc(keys, BindAction::NewTerminal),
+            true,
+        ) {
             cmds.push(Cmd::NewTerminal);
         }
         ui.separator();
@@ -661,15 +809,24 @@ fn terminal_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut
         if item(ui, &run_label, "", info.run_label.is_some()) {
             cmds.push(Cmd::RunActiveFile);
         }
-        if item(ui, &tr("選択したテキストをターミナルへ送る"), "", info.has_editor) {
+        if item(
+            ui,
+            &tr("選択したテキストをターミナルへ送る"),
+            "",
+            info.has_editor,
+        ) {
             cmds.push(Cmd::RunSelection);
         }
         let build_label = match &info.build_task {
             Some(l) => format!("🔨 {l}"),
             None => tr("ビルド タスクの実行…"),
         };
-        if item(ui, &build_label, &sc(keys, BindAction::RunBuildTask), info.build_task.is_some())
-        {
+        if item(
+            ui,
+            &build_label,
+            &sc(keys, BindAction::RunBuildTask),
+            info.build_task.is_some(),
+        ) {
             cmds.push(Cmd::RunBuildTask);
         }
         if !info.plugin_commands.is_empty() {
@@ -696,7 +853,12 @@ fn help_menu(ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
         if item(ui, &tr("キーボード ショートカットのリファレンス"), "", true) {
             cmds.push(Cmd::ShowShortcuts);
         }
-        if item(ui, &tr("コマンド パレットですべてのコマンドを表示"), "", true) {
+        if item(
+            ui,
+            &tr("コマンド パレットですべてのコマンドを表示"),
+            "",
+            true,
+        ) {
             cmds.push(Cmd::OpenCommandPalette);
         }
         ui.separator();
@@ -838,7 +1000,10 @@ mod tests {
     #[test]
     fn runner_for_rust_requires_cargo_project() {
         // Cargo.toml が無いルートでは .rs は実行できない
-        assert_eq!(runner_for(Path::new("/a/main.rs"), Path::new("/nonexistent")), None);
+        assert_eq!(
+            runner_for(Path::new("/a/main.rs"), Path::new("/nonexistent")),
+            None
+        );
     }
 
     #[test]
@@ -886,7 +1051,10 @@ mod tests {
 
     #[test]
     fn shq_preserves_spaces_inside_quotes() {
-        assert_eq!(shq(Path::new("/my dir/file name.txt")), "'/my dir/file name.txt'");
+        assert_eq!(
+            shq(Path::new("/my dir/file name.txt")),
+            "'/my dir/file name.txt'"
+        );
     }
 
     #[test]
@@ -929,7 +1097,11 @@ mod tests {
         if let Some(home) = dirs::home_dir() {
             assert_eq!(
                 display_path(&home.join("proj").join("main.rs")),
-                format!("~{}proj{}main.rs", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR)
+                format!(
+                    "~{}proj{}main.rs",
+                    std::path::MAIN_SEPARATOR,
+                    std::path::MAIN_SEPARATOR
+                )
             );
             // ホームそのものは "~" になる
             assert_eq!(display_path(&home), "~");

@@ -490,7 +490,9 @@ fn toml_to_json(v: &toml::Value) -> serde_json::Value {
         toml::Value::Datetime(d) => serde_json::Value::String(d.to_string()),
         toml::Value::Array(a) => serde_json::Value::Array(a.iter().map(toml_to_json).collect()),
         toml::Value::Table(t) => serde_json::Value::Object(
-            t.iter().map(|(k, v)| (k.clone(), toml_to_json(v))).collect(),
+            t.iter()
+                .map(|(k, v)| (k.clone(), toml_to_json(v)))
+                .collect(),
         ),
     }
 }
@@ -585,10 +587,7 @@ pub fn detail_lines(s: &McpServer) -> Vec<String> {
             ],
         ));
     }
-    out.push(trf(
-        "出典: {p}",
-        &[("p", s.path.display().to_string())],
-    ));
+    out.push(trf("出典: {p}", &[("p", s.path.display().to_string())]));
     if !s.source.editable() {
         out.push(tr("この形式は編集非対応です (読み取り専用)"));
     }
@@ -630,9 +629,10 @@ impl EditError {
     pub fn message(&self) -> String {
         match self {
             EditError::Unsupported => tr("この形式は編集非対応です (読み取り専用)"),
-            EditError::NotFound(what) => {
-                trf("設定の中に {what} が見つかりません", &[("what", what.clone())])
-            }
+            EditError::NotFound(what) => trf(
+                "設定の中に {what} が見つかりません",
+                &[("what", what.clone())],
+            ),
             EditError::WouldCorrupt => tr("書き換えると設定が壊れるため中止しました"),
         }
     }
@@ -719,9 +719,7 @@ fn end_of_value(b: &[u8], i: usize) -> Option<usize> {
         }
         _ => {
             let mut j = i;
-            while j < b.len()
-                && !matches!(b[j], b',' | b'}' | b']')
-                && !b[j].is_ascii_whitespace()
+            while j < b.len() && !matches!(b[j], b',' | b'}' | b']') && !b[j].is_ascii_whitespace()
             {
                 j += 1;
             }
@@ -1033,7 +1031,11 @@ impl RowLayout {
 /// 操作列は「切り替えに到達できなくなる」ので最後まで落とさず、
 /// 狭いところではアイコンだけに縮退させる。
 pub fn row_layout(avail_w: f32) -> RowLayout {
-    let avail = if avail_w.is_finite() { avail_w.max(0.0) } else { 0.0 };
+    let avail = if avail_w.is_finite() {
+        avail_w.max(0.0)
+    } else {
+        0.0
+    };
     let compact_actions = avail < ACTIONS_LABEL_MIN_ROW_W;
     let actions_w = if compact_actions {
         ACTIONS_ICON_W
@@ -1166,11 +1168,11 @@ pub fn ui(ui: &mut egui::Ui, theme: &Theme, panel: &mut McpPanel) -> McpAction {
 
     // ── 直近の書き戻し結果 ──
     if let Some((msg, ok)) = &panel.notice {
-        ui.label(
-            RichText::new(msg.clone())
-                .size(11.0)
-                .color(if *ok { theme.ok } else { theme.err }),
-        );
+        ui.label(RichText::new(msg.clone()).size(11.0).color(if *ok {
+            theme.ok
+        } else {
+            theme.err
+        }));
     }
 
     // ── 読めなかったファイル (握り潰さず理由ごと出す) ──
@@ -1375,10 +1377,7 @@ fn server_row(
     if hit.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    if hit
-        .on_hover_text(tr("クリックで詳細を開閉"))
-        .clicked()
-    {
+    if hit.on_hover_text(tr("クリックで詳細を開閉")).clicked() {
         row_clicked = true;
     }
     row_clicked
@@ -1657,8 +1656,8 @@ mod tests {
     #[test]
     fn 無効化はキー順とコメントを保つ() {
         let src = "{\n  // 先頭コメント\n  \"mcpServers\": {\n    \"zeta\": {\n      \"command\": \"c\",\n      \"args\": [\"--x\"] // 引数\n    },\n    \"alpha\": {\"command\": \"d\"}\n  }\n}\n";
-        let out = toggle_disabled(src, ConfigSource::ProjectMcpJson, "zeta", true)
-            .expect("書き戻せる");
+        let out =
+            toggle_disabled(src, ConfigSource::ProjectMcpJson, "zeta", true).expect("書き戻せる");
         assert!(out.contains("// 先頭コメント"), "コメントが消えた:\n{out}");
         assert!(out.contains("// 引数"), "行末コメントが消えた:\n{out}");
         assert!(
@@ -1778,10 +1777,14 @@ mod tests {
 
     #[test]
     fn 他のサーバの状態は巻き込まない() {
-        let src = r#"{"mcpServers": {"a": {"command": "c", "disabled": true}, "b": {"command": "d"}}}"#;
+        let src =
+            r#"{"mcpServers": {"a": {"command": "c", "disabled": true}, "b": {"command": "d"}}}"#;
         let out = toggle_disabled(src, ConfigSource::UserCursor, "b", true).expect("書ける");
         let after = parse_mcp_config(&out, ConfigSource::UserCursor);
-        assert!(after.iter().any(|s| s.name == "a" && s.disabled), "a を巻き込んだ");
+        assert!(
+            after.iter().any(|s| s.name == "a" && s.disabled),
+            "a を巻き込んだ"
+        );
         assert!(after.iter().any(|s| s.name == "b" && s.disabled));
     }
 
@@ -1841,8 +1844,11 @@ mod tests {
     #[test]
     fn 走査はプロジェクトの3か所を見る() {
         let dir = crate::test_util::unique_temp_dir("zaivern-mcp-test", "scan");
-        std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers": {"p": {"command": "c"}}}"#)
-            .expect("書ける");
+        std::fs::write(
+            dir.join(".mcp.json"),
+            r#"{"mcpServers": {"p": {"command": "c"}}}"#,
+        )
+        .expect("書ける");
         std::fs::create_dir_all(dir.join(".cursor")).expect("作れる");
         std::fs::write(
             dir.join(".cursor").join("mcp.json"),
@@ -1980,8 +1986,7 @@ mod tests {
             (0.0, 0.0),
         ];
         for (w, h) in sizes {
-            let avail =
-                egui::Rect::from_min_size(egui::pos2(11.0, 23.0), egui::vec2(w, h));
+            let avail = egui::Rect::from_min_size(egui::pos2(11.0, 23.0), egui::vec2(w, h));
             let card = empty_card(avail);
             assert!(
                 avail.contains_rect(card),

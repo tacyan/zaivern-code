@@ -220,11 +220,7 @@ fn encode_claude_project_dir_unicode(workspace: &Path) -> String {
 }
 
 /// `projects_root` 配下から、`workspace` のセッションを列挙する。
-pub fn list_claude_sessions(
-    projects_root: &Path,
-    workspace: &Path,
-    bin: &str,
-) -> Vec<PastSession> {
+pub fn list_claude_sessions(projects_root: &Path, workspace: &Path, bin: &str) -> Vec<PastSession> {
     let mut names = vec![encode_claude_project_dir(workspace)];
     let uni = encode_claude_project_dir_unicode(workspace);
     if uni != names[0] {
@@ -305,11 +301,7 @@ fn claude_summary(path: &Path) -> (String, Option<SystemTime>) {
 ///
 /// codex はプロジェクト別ディレクトリを持たず日付で掘るので、新しい日付から順に
 /// ファイルを集め、**1 行目 (session_meta) だけ** を読んで cwd で絞り込む。
-pub fn list_codex_sessions(
-    sessions_root: &Path,
-    workspace: &Path,
-    bin: &str,
-) -> Vec<PastSession> {
+pub fn list_codex_sessions(sessions_root: &Path, workspace: &Path, bin: &str) -> Vec<PastSession> {
     let mut files = codex_rollout_files(sessions_root, CODEX_META_SCAN_CAP);
     files.sort_by(|a, b| b.1.cmp(&a.1));
 
@@ -536,7 +528,10 @@ fn is_envelope(text: &str) -> bool {
         return false;
     }
     let tag = rest[..end].trim_end_matches('/');
-    tag.contains('-') && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    tag.contains('-')
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// パスが同じディレクトリを指すか (末尾の区切りを無視。Windows は大小無視)。
@@ -723,7 +718,9 @@ pub fn list_antigravity_sessions(db: &Path, workspace: &Path, bin: &str) -> Vec<
     );
 
     let cell = |row: &Vec<sqlite_lite::Cell>, i: Option<usize>| -> String {
-        i.and_then(|i| row.get(i)).map(|c| c.text()).unwrap_or_default()
+        i.and_then(|i| row.get(i))
+            .map(|c| c.text())
+            .unwrap_or_default()
     };
     let mut out = Vec::new();
     for row in &rows {
@@ -800,7 +797,9 @@ fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
     // Windows のドライブ表記 `/C:/…` は先頭のスラッシュを落とす。
     let b = decoded.as_bytes();
     if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
-        return Some(PathBuf::from(normalize_uri_separators(decoded[1..].to_string())));
+        return Some(PathBuf::from(normalize_uri_separators(
+            decoded[1..].to_string(),
+        )));
     }
     Some(PathBuf::from(normalize_uri_separators(decoded)))
 }
@@ -885,7 +884,11 @@ fn tz_offset_secs(s: &str) -> i64 {
     }
     let num = |d: &[u8]| -> i64 { d.iter().fold(0i64, |a, c| a * 10 + (c - b'0') as i64) };
     let h = num(&digits[..2]);
-    let m = if digits.len() >= 4 { num(&digits[2..4]) } else { 0 };
+    let m = if digits.len() >= 4 {
+        num(&digits[2..4])
+    } else {
+        0
+    };
     if h > 23 || m > 59 {
         return 0;
     }
@@ -996,7 +999,11 @@ mod sqlite_lite {
                 };
                 let ptype = hdr[0];
                 let ncell = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
-                let hdr_len = if ptype == 0x05 || ptype == 0x02 { 12 } else { 8 };
+                let hdr_len = if ptype == 0x05 || ptype == 0x02 {
+                    12
+                } else {
+                    8
+                };
                 // セルポインタ配列 (オフセットは「ページ先頭」からの相対)。
                 let mut ptrs = Vec::with_capacity(ncell.min(4096));
                 for i in 0..ncell {
@@ -1291,10 +1298,7 @@ pub enum AgeUnit {
 ///
 /// 未来の時刻 (時計のずれ・タイムゾーン誤差) は負にせず [`AgeUnit::Now`] に倒す。
 pub fn age_parts(now: SystemTime, then: SystemTime) -> (u64, AgeUnit) {
-    let secs = now
-        .duration_since(then)
-        .map(|d| d.as_secs())
-        .unwrap_or(0); // then が未来 → 0
+    let secs = now.duration_since(then).map(|d| d.as_secs()).unwrap_or(0); // then が未来 → 0
     const MIN: u64 = 60;
     const HOUR: u64 = 60 * MIN;
     const DAY: u64 = 24 * HOUR;
@@ -1681,7 +1685,11 @@ mod tests {
     #[test]
     fn claude_missing_project_dir_is_empty_not_panic() {
         let home = unique_temp_dir("zaivern-picker", "claude-none");
-        let got = list_claude_sessions(&claude_projects_root(&home), Path::new("/no/such/ws"), "claude");
+        let got = list_claude_sessions(
+            &claude_projects_root(&home),
+            Path::new("/no/such/ws"),
+            "claude",
+        );
         assert!(got.is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1716,7 +1724,10 @@ mod tests {
         let other = home.join("other");
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        let day = codex_sessions_root(&home).join("2026").join("07").join("25");
+        let day = codex_sessions_root(&home)
+            .join("2026")
+            .join("07")
+            .join("25");
 
         write_at(
             &day.join("rollout-2026-07-25T03-06-23-aaa-1111.jsonl"),
@@ -1760,7 +1771,10 @@ mod tests {
         std::fs::create_dir_all(&cdir).unwrap();
         write_at(&cdir.join("c-old.jsonl"), CLAUDE_BLOCK_LIST, 100);
         write_at(&cdir.join("c-new.jsonl"), CLAUDE_BLOCK_LIST, 300);
-        let day = codex_sessions_root(&home).join("2026").join("07").join("25");
+        let day = codex_sessions_root(&home)
+            .join("2026")
+            .join("07")
+            .join("25");
         write_at(
             &day.join("rollout-x-x-mid.jsonl"),
             &codex_rollout("x-mid", &ws, "まんなか"),
@@ -1890,7 +1904,10 @@ mod tests {
             agent_bin: "codex".into(),
             ..s.clone()
         };
-        assert_eq!(resume_command("codex --yolo", &c), "codex resume abc-123 --yolo");
+        assert_eq!(
+            resume_command("codex --yolo", &c),
+            "codex resume abc-123 --yolo"
+        );
         // 未知の bin は素通し
         let u = PastSession {
             agent_bin: "totally-unknown".into(),
@@ -2190,7 +2207,13 @@ mod agy_tests {
                 &[file_uri(&other), file_uri(&ws)],
             ),
             // ID が空の行は捨てる
-            row("", "", "壊れた行", "2026-07-20 00:00:00.000000+00:00", &[file_uri(&ws)]),
+            row(
+                "",
+                "",
+                "壊れた行",
+                "2026-07-20 00:00:00.000000+00:00",
+                &[file_uri(&ws)],
+            ),
         ];
         let db = home.join("store.db");
         write_db(&db, &build_db(4096, "conversation_summaries", DDL, &rows));
@@ -2303,7 +2326,17 @@ mod agy_tests {
     #[test]
     fn sqlite_column_names_from_ddl() {
         let cases: &[(&str, &[&str])] = &[
-            (DDL, &["conversation_id", "title", "preview", "last_modified_time", "workspace_uris", "last_user_input_time"]),
+            (
+                DDL,
+                &[
+                    "conversation_id",
+                    "title",
+                    "preview",
+                    "last_modified_time",
+                    "workspace_uris",
+                    "last_user_input_time",
+                ],
+            ),
             ("CREATE TABLE t (a INT, b TEXT)", &["a", "b"]),
             (
                 "CREATE TABLE t (a NUMERIC(10, 2), \"b c\" TEXT, PRIMARY KEY (a), UNIQUE (a))",
@@ -2329,7 +2362,10 @@ mod agy_tests {
         let cases: &[(&str, Option<&str>)] = &[
             ("file:///Users/me/ws", Some("/Users/me/ws")),
             ("file:///Users/me/my%20ws", Some("/Users/me/my ws")),
-            ("file:///Users/me/%E9%96%8B%E7%99%BA", Some("/Users/me/開発")),
+            (
+                "file:///Users/me/%E9%96%8B%E7%99%BA",
+                Some("/Users/me/開発"),
+            ),
             // 壊れたエスケープはそのまま残す
             ("file:///a/%zz", Some("/a/%zz")),
             ("vscode://file/x", None),
@@ -2338,7 +2374,11 @@ mod agy_tests {
         for (uri, want) in cases {
             let got = path_from_file_uri(uri);
             match want {
-                Some(w) => assert_eq!(got, Some(PathBuf::from(normalize_uri_separators(w.to_string()))), "uri={uri}"),
+                Some(w) => assert_eq!(
+                    got,
+                    Some(PathBuf::from(normalize_uri_separators(w.to_string()))),
+                    "uri={uri}"
+                ),
                 None => assert!(got.is_none(), "uri={uri}"),
             }
         }
@@ -2401,7 +2441,10 @@ mod agy_tests {
                 .unwrap();
         }
         // codex: mtime 200
-        let day = codex_sessions_root(&home).join("1970").join("01").join("01");
+        let day = codex_sessions_root(&home)
+            .join("1970")
+            .join("01")
+            .join("01");
         std::fs::create_dir_all(&day).unwrap();
         let cx = day.join("rollout-x.jsonl");
         let meta = format!(
@@ -2569,7 +2612,10 @@ mod sidebar_tests {
         let gone = tmp.join("gone");
 
         // 開いているルートを与えられた順にそのまま
-        assert_eq!(sidebar_folders(&[a.clone(), b.clone()]), vec![a.clone(), b.clone()]);
+        assert_eq!(
+            sidebar_folders(&[a.clone(), b.clone()]),
+            vec![a.clone(), b.clone()]
+        );
 
         // 実在しないディレクトリは落ちる
         assert_eq!(sidebar_folders(&[gone.clone(), a.clone()]), vec![a.clone()]);
@@ -2736,7 +2782,10 @@ mod sidebar_tests {
         let (_tx, rx) = mpsc::channel();
         st.pending = Some(rx);
         assert!(st.loading());
-        assert_eq!(st.plan_refresh(&[PathBuf::from("/other")]), RefreshPlan::Idle);
+        assert_eq!(
+            st.plan_refresh(&[PathBuf::from("/other")]),
+            RefreshPlan::Idle
+        );
     }
 
     #[test]

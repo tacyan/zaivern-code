@@ -217,12 +217,8 @@ pub fn decode_image_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
             let orig = rgba.dimensions();
             if let Some((nw, nh)) = image_downscale(orig.0, orig.1, MAX_TEXTURE_SIDE) {
                 // 巨大画像は GPU 上限超えの描画エラーを避けるため縮小して載せる
-                rgba = image::imageops::resize(
-                    &rgba,
-                    nw,
-                    nh,
-                    image::imageops::FilterType::Triangle,
-                );
+                rgba =
+                    image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
             }
             let (w, h) = rgba.dimensions();
             ImageDoc {
@@ -358,7 +354,9 @@ fn read_media_doc(path: &Path, file_bytes: u64) -> MediaDoc {
             if let Some((off, len)) = found {
                 let mut moov = Vec::new();
                 if f.seek(SeekFrom::Start(off)).is_ok() {
-                    let _ = (&mut f).take(len.min(MOOV_MAX_BYTES)).read_to_end(&mut moov);
+                    let _ = (&mut f)
+                        .take(len.min(MOOV_MAX_BYTES))
+                        .read_to_end(&mut moov);
                     info = crate::preview::probe_mp4_moov(&moov);
                 }
             }
@@ -536,7 +534,8 @@ pub fn extract_pdf_pages(raw: &[u8]) -> Result<Vec<String>, String> {
 /// 抽出したページ群を、ヘッダ + ページ区切り付きの本文へ組み立てる。
 fn pdf_render_pages(header: &str, pages: &[String]) -> String {
     let total = pages.len();
-    let mut out = String::with_capacity(header.len() + pages.iter().map(|p| p.len() + 32).sum::<usize>());
+    let mut out =
+        String::with_capacity(header.len() + pages.iter().map(|p| p.len() + 32).sum::<usize>());
     out.push_str(header);
     for (i, page) in pages.iter().enumerate() {
         out.push_str(&format!("\n── ページ {} / {} ──\n\n", i + 1, total));
@@ -717,10 +716,10 @@ pub fn whitespace_layout_job(
         let mut run_start = text.len();
         let mut run_ws: Option<bool> = None;
         let flush = |sections: &mut Vec<LayoutSection>,
-                         start: usize,
-                         end: usize,
-                         ws: bool,
-                         leading: &mut f32| {
+                     start: usize,
+                     end: usize,
+                     ws: bool,
+                     leading: &mut f32| {
             if end > start {
                 let mut format = sec.format.clone();
                 if ws {
@@ -1210,11 +1209,7 @@ pub fn detect_delimiter(text: &str) -> char {
         if t.headers.len() < 2 {
             continue;
         }
-        let consistent = t
-            .rows
-            .iter()
-            .filter(|r| r.len() == t.headers.len())
-            .count();
+        let consistent = t.rows.iter().filter(|r| r.len() == t.headers.len()).count();
         let score = consistent * 1000 + t.headers.len();
         if score > best.0 {
             best = (score, d);
@@ -1315,40 +1310,40 @@ impl Buffer {
     }
 
     /// このタブが読み取り専用か。種類 (画像 / PDF / 差分) と
-#[allow(dead_code)]
+    #[allow(dead_code)]
     /// 巨大ファイルモードの**どちらか**が読み取り専用ならそう扱う。
     pub fn read_only(&self) -> bool {
         self.kind.read_only() || self.large.read_only
     }
 
     /// シンタックスハイライトを行ってよいか (巨大ファイルでは false)。
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn highlight_enabled(&self) -> bool {
         self.large.highlight
     }
 
     /// 巨大ファイルのバナーを出すべきならそのサイズ。
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn large_file_banner(&self) -> Option<u64> {
         self.large.active.then_some(self.large.bytes)
     }
 
     /// 折りたたみ範囲を本文に追随させる。再計算したら `true`。
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn refresh_folds(&mut self) -> bool {
         let (text, lang) = (&self.text, &self.lang);
         self.folds.refresh(text, lang)
     }
 
     /// 本文を表として解析して `table` に載せる (テーブル表示の ON)。
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn build_table(&mut self) -> &TableView {
         let t = parse_table(&self.text, TABLE_MAX_ROWS);
         self.table.insert(t)
     }
 
     /// テーブル表示を降ろす。
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn drop_table(&mut self) {
         self.table = None;
     }
@@ -1981,7 +1976,10 @@ mod tests {
         assert_eq!(ed.buffers[0].text, "日本語の本文");
 
         ed.buffers[0].text.push_str("と追記");
-        assert!(!ed.buffers[0].write_to(&path).expect("save"), "格上げは起きない");
+        assert!(
+            !ed.buffers[0].write_to(&path).expect("save"),
+            "格上げは起きない"
+        );
         assert_eq!(
             std::fs::read(&path).expect("read back"),
             "日本語の本文と追記".as_bytes(),
@@ -2003,7 +2001,10 @@ mod tests {
         let mut ed = Editor::new();
         assert_eq!(ed.open(&path, &hl), Ok(false));
         assert_eq!(ed.buffers[0].encoding, crate::textenc::Encoding::Utf8Bom);
-        assert!(!ed.buffers[0].text.starts_with('\u{feff}'), "BOM は本文に混ぜない");
+        assert!(
+            !ed.buffers[0].text.starts_with('\u{feff}'),
+            "BOM は本文に混ぜない"
+        );
 
         assert!(!ed.buffers[0].write_to(&path).expect("save"));
         assert_eq!(std::fs::read(&path).expect("read back"), raw);
@@ -2019,9 +2020,10 @@ mod tests {
         let path = dir.join("legacy.txt");
         let body = "日本語のログ";
         // 素材は OS のコードページ変換で作る (バイト列を書き下さない)
-        let (raw, enc) = crate::textenc::encode_bytes(body, crate::textenc::Encoding::Ansi(
-            crate::textenc::os_ansi_code_page(),
-        ));
+        let (raw, enc) = crate::textenc::encode_bytes(
+            body,
+            crate::textenc::Encoding::Ansi(crate::textenc::os_ansi_code_page()),
+        );
         if !enc.is_legacy() {
             return; // この環境の ANSI では表せない = 試験対象外
         }
@@ -2061,7 +2063,10 @@ mod tests {
         assert_eq!(ed.open(&path, &hl), Ok(false));
         ed.buffers[0].text.push_str(" 🚀");
 
-        assert!(ed.buffers[0].write_to(&path).expect("save"), "格上げを知らせる");
+        assert!(
+            ed.buffers[0].write_to(&path).expect("save"),
+            "格上げを知らせる"
+        );
         assert_eq!(ed.buffers[0].encoding, crate::textenc::Encoding::Utf8);
         assert_eq!(
             std::fs::read_to_string(&path).expect("read back"),
@@ -2094,8 +2099,16 @@ mod tests {
     fn image_extension_routing_table() {
         // 画像として開く拡張子 (大文字小文字は問わない)
         for name in [
-            "a.png", "a.PNG", "a.jpg", "a.JPEG", "a.jpeg", "a.gif", "a.webp", "a.ico",
-            "a.bmp", "dir.d/photo.Png",
+            "a.png",
+            "a.PNG",
+            "a.jpg",
+            "a.JPEG",
+            "a.jpeg",
+            "a.gif",
+            "a.webp",
+            "a.ico",
+            "a.bmp",
+            "dir.d/photo.Png",
         ] {
             assert!(is_image_path(Path::new(name)), "{name} は画像として開く");
         }
@@ -2116,7 +2129,10 @@ mod tests {
         let b = &ed.buffers[0];
         assert_eq!(b.kind, BufferKind::Image);
         assert!(b.kind.read_only(), "画像タブは読み取り専用");
-        assert!(b.text.is_empty() && !b.dirty(), "本文は空で dirty にならない");
+        assert!(
+            b.text.is_empty() && !b.dirty(),
+            "本文は空で dirty にならない"
+        );
         let doc = b.image.as_ref().expect("decoded image");
         assert_eq!(doc.error, None);
         assert_eq!(doc.orig_size, (3, 2));
@@ -2131,10 +2147,17 @@ mod tests {
         std::fs::write(&path, b"\x89PNG not really a png\x00\x01\x02").expect("write");
         let hl = Highlighter::new();
         let mut ed = Editor::new();
-        assert_eq!(ed.open(&path, &hl), Ok(false), "壊れた画像でも開ける (panic しない)");
+        assert_eq!(
+            ed.open(&path, &hl),
+            Ok(false),
+            "壊れた画像でも開ける (panic しない)"
+        );
         let b = &ed.buffers[0];
         assert_eq!(b.kind, BufferKind::Image);
-        assert!(b.image.as_ref().expect("doc").error.is_some(), "読めない旨を持つ");
+        assert!(
+            b.image.as_ref().expect("doc").error.is_some(),
+            "読めない旨を持つ"
+        );
         assert!(b.text.is_empty(), "文字化けテキストを本文に入れない");
     }
 
@@ -2247,7 +2270,9 @@ mod tests {
             assert!(is_pdf_path(Path::new(name)), "{name} は PDF として開く");
         }
         // 拡張子が違う・無い・紛らわしいものはテキスト/画像のまま
-        for name in ["a.pd", "a.pdfx", "a.png", "a.txt", "pdf", ".pdf.txt", "Makefile"] {
+        for name in [
+            "a.pd", "a.pdfx", "a.png", "a.txt", "pdf", ".pdf.txt", "Makefile",
+        ] {
             assert!(!is_pdf_path(Path::new(name)), "{name} は PDF 扱いしない");
         }
         // 画像経路と食い合わない
@@ -2283,7 +2308,10 @@ mod tests {
         let t = &ed.buffers[0].text;
         assert!(t.contains("3 ページ"), "ページ総数: {t}");
         for i in 1..=3 {
-            assert!(t.contains(&format!("── ページ {i} / 3 ──")), "区切り {i}: {t}");
+            assert!(
+                t.contains(&format!("── ページ {i} / 3 ──")),
+                "区切り {i}: {t}"
+            );
         }
         for body in ["Page One", "Page Two", "Page Three"] {
             assert!(t.contains(body), "{body} が本文にある");
@@ -2303,7 +2331,11 @@ mod tests {
         std::fs::write(&path, &junk).expect("write");
         let hl = Highlighter::new();
         let mut ed = Editor::new();
-        assert_eq!(ed.open(&path, &hl), Ok(false), "壊れた PDF でも panic せず開ける");
+        assert_eq!(
+            ed.open(&path, &hl),
+            Ok(false),
+            "壊れた PDF でも panic せず開ける"
+        );
         let b = &ed.buffers[0];
         assert_eq!(b.kind, BufferKind::Pdf);
         assert!(!b.dirty(), "壊れた PDF でも dirty にならない");
@@ -2337,7 +2369,10 @@ mod tests {
         let t = pdf_buffer_text("edge.pdf", b"", PDF_MAX_BYTES);
         assert!(!t.contains("大きすぎる"), "境界値は抽出を試みる: {t}");
         // open() の 50 MB 制限より小さくないと、この分岐へ到達できない
-        assert!(PDF_MAX_BYTES < MAX_OPEN_BYTES, "抽出上限は読み込み上限より小さい");
+        assert!(
+            PDF_MAX_BYTES < MAX_OPEN_BYTES,
+            "抽出上限は読み込み上限より小さい"
+        );
     }
 
     #[test]
@@ -2441,7 +2476,10 @@ mod tests {
             let mut ed = Editor::new();
             assert_eq!(ed.open(&path, &hl), Ok(false));
             assert_eq!(ed.buffers[0].kind, BufferKind::File, "{name} はテキスト");
-            assert!(ed.buffers[0].preview.is_none(), "{name} にプレビューは付かない");
+            assert!(
+                ed.buffers[0].preview.is_none(),
+                "{name} にプレビューは付かない"
+            );
         }
     }
 
@@ -2474,8 +2512,11 @@ mod tests {
 
         // moov が末尾にある mp4 (ffmpeg の既定) でも解析できる
         let mp4 = dir.join("clip.mp4");
-        std::fs::write(&mp4, crate::preview::testdata::make_mp4(600, 6000, 1920, 1080, true))
-            .expect("write mp4");
+        std::fs::write(
+            &mp4,
+            crate::preview::testdata::make_mp4(600, 6000, 1920, 1080, true),
+        )
+        .expect("write mp4");
         let mut ed = Editor::new();
         assert_eq!(ed.open(&mp4, &hl), Ok(false));
         assert_preview_tab(&ed.buffers[0], BufferKind::Media);
@@ -2552,8 +2593,11 @@ mod tests {
     fn preview_tabs_rebuild_on_external_change_and_stay_clean() {
         let dir = unique_temp_dir("zaivern-editor-test", "preview-reload");
         let path = dir.join("box.zip");
-        std::fs::write(&path, crate::preview::testdata::make_zip(&[("a.txt", b"1")]))
-            .expect("write zip");
+        std::fs::write(
+            &path,
+            crate::preview::testdata::make_zip(&[("a.txt", b"1")]),
+        )
+        .expect("write zip");
         let hl = Highlighter::new();
         let mut ed = Editor::new();
         assert_eq!(ed.open(&path, &hl), Ok(false));
@@ -2627,7 +2671,11 @@ mod tests {
             .expect("send");
         assert!(ed.poll_pdf_jobs(), "完了したら差し替える");
         let b = &ed.buffers[0];
-        assert!(b.text.contains("本文だよ"), "完成本文へ差し替わる: {}", b.text);
+        assert!(
+            b.text.contains("本文だよ"),
+            "完成本文へ差し替わる: {}",
+            b.text
+        );
         assert!(!b.text.contains("読み込み中"));
         assert!(!b.dirty(), "差し替え後も dirty にならない");
         assert!(b.pdf_job.is_none(), "ジョブは畳まれる");
@@ -2687,8 +2735,16 @@ mod tests {
         };
         job.text = src.into();
         job.sections = vec![
-            LayoutSection { leading_space: 0.0, byte_range: 0..5, format: fmt_a.clone() },
-            LayoutSection { leading_space: 0.0, byte_range: 5..src.len(), format: fmt_b.clone() },
+            LayoutSection {
+                leading_space: 0.0,
+                byte_range: 0..5,
+                format: fmt_a.clone(),
+            },
+            LayoutSection {
+                leading_space: 0.0,
+                byte_range: 5..src.len(),
+                format: fmt_b.clone(),
+            },
         ];
 
         let dim = Color32::GRAY;
@@ -2827,7 +2883,11 @@ fn g() {
         let edited = format!("use std::io;\n{text}");
         fs.shift_lines(0, 1);
         assert!(fs.refresh(&edited, "Rust"), "本文が変われば再計算する");
-        assert!(fs.is_folded(4), "ずれた先でも畳んだまま: {:?}", folded_sorted(&fs));
+        assert!(
+            fs.is_folded(4),
+            "ずれた先でも畳んだまま: {:?}",
+            folded_sorted(&fs)
+        );
         assert_eq!(fs.range_at(4).map(|r| r.end_line), Some(6));
         // 挿入した行を消して元に戻す
         fs.shift_lines(0, -1);
@@ -2971,7 +3031,10 @@ fn g() {
         // ファイルに紐づかないタブは積まない
         ed.new_untitled();
         ed.close(0);
-        assert!(ed.closed_tabs.is_empty(), "untitled は開き直せないので積まない");
+        assert!(
+            ed.closed_tabs.is_empty(),
+            "untitled は開き直せないので積まない"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

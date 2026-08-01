@@ -159,7 +159,9 @@ pub fn parse_target(raw: &str) -> Result<Target, TargetError> {
         }
         let port = match tail {
             "" => None,
-            t => Some(parse_port(t.strip_prefix(':').ok_or(TargetError::BadPort)?)?),
+            t => Some(parse_port(
+                t.strip_prefix(':').ok_or(TargetError::BadPort)?,
+            )?),
         };
         (h.to_string(), port)
     } else if rest.matches(':').count() >= 2 {
@@ -328,9 +330,7 @@ pub fn backoff(attempt: u32) -> Option<Duration> {
     if attempt == 0 || attempt > MAX_RETRIES {
         return None;
     }
-    let secs = 2u64
-        .saturating_pow(attempt)
-        .min(30);
+    let secs = 2u64.saturating_pow(attempt).min(30);
     Some(Duration::from_secs(secs))
 }
 
@@ -346,12 +346,19 @@ pub fn backoff(attempt: u32) -> Option<Duration> {
 ///   踏み台側を loopback に留めるか公開するかは `GatewayPorts` でユーザーが決める
 pub fn ssh_args(t: &Target, public_port: u16, local_port: u16) -> Vec<String> {
     let mut a: Vec<String> = [
-        "-v", "-N", "-T",
-        "-o", "BatchMode=yes",
-        "-o", "ExitOnForwardFailure=yes",
-        "-o", "ServerAliveInterval=30",
-        "-o", "ServerAliveCountMax=3",
-        "-o", "ConnectTimeout=10",
+        "-v",
+        "-N",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "ConnectTimeout=10",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -635,13 +642,7 @@ impl Drop for Tunnel {
 }
 
 /// 監視ループ本体 (専用スレッド)。落ちたら指数バックオフで張り直す。
-fn supervise(
-    shared: Arc<Shared>,
-    ctx: egui::Context,
-    exe: PathBuf,
-    target: Target,
-    port: u16,
-) {
+fn supervise(shared: Arc<Shared>, ctx: egui::Context, exe: PathBuf, target: Target, port: u16) {
     let args = ssh_args(&target, port, port);
     let mut attempt = 0u32;
 
@@ -801,12 +802,18 @@ mod tests {
         let table: &[(&str, Result<Target, TargetError>)] = &[
             // 正常系
             ("user@example.com", t(Some("user"), "example.com", None)),
-            ("user@example.com:2222", t(Some("user"), "example.com", Some(2222))),
+            (
+                "user@example.com:2222",
+                t(Some("user"), "example.com", Some(2222)),
+            ),
             ("example.com", t(None, "example.com", None)),
             ("example.com:22", t(None, "example.com", Some(22))),
             ("  user@example.com  ", t(Some("user"), "example.com", None)),
             ("root@192.168.1.10", t(Some("root"), "192.168.1.10", None)),
-            ("ubuntu@bastion-1.internal_x", t(Some("ubuntu"), "bastion-1.internal_x", None)),
+            (
+                "ubuntu@bastion-1.internal_x",
+                t(Some("ubuntu"), "bastion-1.internal_x", None),
+            ),
             // IPv6
             ("user@[::1]:2222", t(Some("user"), "::1", Some(2222))),
             ("user@[2001:db8::1]", t(Some("user"), "2001:db8::1", None)),
@@ -854,7 +861,10 @@ mod tests {
     #[test]
     fn ipv6はurlで角括弧に包む() {
         assert_eq!(parse_target("user@[::1]").unwrap().url_host(), "[::1]");
-        assert_eq!(parse_target("example.com").unwrap().url_host(), "example.com");
+        assert_eq!(
+            parse_target("example.com").unwrap().url_host(),
+            "example.com"
+        );
         // ssh へ渡す側は角括弧なし
         assert_eq!(parse_target("user@[::1]").unwrap().dest(), "user@::1");
         assert_eq!(parse_target("example.com").unwrap().dest(), "example.com");
@@ -970,8 +980,14 @@ mod tests {
                 true,
             ),
             ("debug1: Authentication succeeded (publickey).", false),
-            ("debug1: Local connections to LOCALHOST:8899 forwarded", false),
-            ("Warning: remote port forwarding failed for listen port 8899", false),
+            (
+                "debug1: Local connections to LOCALHOST:8899 forwarded",
+                false,
+            ),
+            (
+                "Warning: remote port forwarding failed for listen port 8899",
+                false,
+            ),
             ("", false),
         ];
         for (line, want) in table {
@@ -1064,7 +1080,12 @@ mod tests {
                 8899,
                 "ssh -N -L 8899:127.0.0.1:8899 -p 2222 user@example.com",
             ),
-            ("bastion", 9000, 8899, "ssh -N -L 8899:127.0.0.1:9000 bastion"),
+            (
+                "bastion",
+                9000,
+                8899,
+                "ssh -N -L 8899:127.0.0.1:9000 bastion",
+            ),
         ];
         for (raw, pub_p, local_p, want) in table {
             let t = parse_target(raw).unwrap();
@@ -1262,6 +1283,9 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        assert!(closed, "切断しても公開ポート {port} が開いたまま (ssh が残っている)");
+        assert!(
+            closed,
+            "切断しても公開ポート {port} が開いたまま (ssh が残っている)"
+        );
     }
 }

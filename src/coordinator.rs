@@ -864,7 +864,9 @@ impl Coordinator {
     /// セッションを登録する(受信箱を用意する)。既存なら何もしない。
     pub fn register_session(&mut self, id: SessionId) {
         let cap = self.limits.mailbox_cap;
-        self.mailboxes.entry(id).or_insert_with(|| Mailbox::new(cap));
+        self.mailboxes
+            .entry(id)
+            .or_insert_with(|| Mailbox::new(cap));
     }
 
     /// セッションを外す。溜まっていたメッセージは失われるので、
@@ -1023,10 +1025,7 @@ impl Coordinator {
                     }
                     let mut copy = msg.clone();
                     copy.to = Endpoint::Session(id);
-                    let evicted = self
-                        .mailboxes
-                        .get_mut(&id)
-                        .and_then(|mb| mb.push(copy));
+                    let evicted = self.mailboxes.get_mut(&id).and_then(|mb| mb.push(copy));
                     if let Some(old) = evicted {
                         self.record_drop(&old, DropReason::MailboxOverflow);
                     }
@@ -1333,9 +1332,7 @@ impl Coordinator {
                     t.record(now, TaskEvent::HandoverRefused(r));
                     t.record(
                         now,
-                        TaskEvent::EscalatedToUser(
-                            "再試行の上限に達したため人手が必要です".into(),
-                        ),
+                        TaskEvent::EscalatedToUser("再試行の上限に達したため人手が必要です".into()),
                     );
                 }
                 self.escalate(
@@ -1904,9 +1901,7 @@ mod tests {
         c.enqueue(msg(1, 2, t0()));
 
         assert!(c.take_deliverable(&[]).is_empty());
-        assert!(c
-            .take_deliverable(&[(2, SessionState::Unknown)])
-            .is_empty());
+        assert!(c.take_deliverable(&[(2, SessionState::Unknown)]).is_empty());
         assert_eq!(c.mailbox(2).unwrap().len(), 1);
     }
 
@@ -1921,7 +1916,10 @@ mod tests {
         let out = c.take_deliverable(&[(2, SessionState::Idle)]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].session, 2);
-        assert!(out[0].text.starts_with(INJECT_PREFIX), "機械注入の目印が要る");
+        assert!(
+            out[0].text.starts_with(INJECT_PREFIX),
+            "機械注入の目印が要る"
+        );
         assert!(out[0].text.ends_with('\r'), "1 ターンとして確定させる");
         assert!(out[0].text.contains("session:1"));
         assert_eq!(c.mailbox(2).unwrap().len(), 0);
@@ -2398,7 +2396,9 @@ mod tests {
         // 既定の上限は 3 回。
         assert_eq!(c.limits().max_attempts, DEFAULT_MAX_ATTEMPTS);
         for expected in 1..=DEFAULT_MAX_ATTEMPTS {
-            let s = c.try_assign(t, &list, now).expect("上限までは割り当てられる");
+            let s = c
+                .try_assign(t, &list, now)
+                .expect("上限までは割り当てられる");
             assert_eq!(s, expected as u64);
             c.note_failed(t, s, "失敗", now);
             c.confirm_stopped(t, now);
@@ -2457,7 +2457,7 @@ mod tests {
         c.add_context(t, "parser.rs は途中(式まで)", now);
 
         c.note_exited(1, now); // 落ちた → 停止確認済み
-        // 能力指定が無いので、空いている 3 が新担当になる(2 は作業中)。
+                               // 能力指定が無いので、空いている 3 が新担当になる(2 は作業中)。
         let (next, _) = c
             .redispatch(t, &cands(), ReassignReason::SessionDied, now)
             .expect("3 へ引き継ぐ");

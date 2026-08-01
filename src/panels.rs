@@ -441,7 +441,11 @@ pub fn github_ui(
     }
 
     if let Some(err) = panel.last_error.clone() {
-        ui.label(RichText::new(format!("⚠ {err}")).color(theme.err).size(11.5));
+        ui.label(
+            RichText::new(format!("⚠ {err}"))
+                .color(theme.err)
+                .size(11.5),
+        );
         ui.add_space(4.0);
     }
 
@@ -465,7 +469,12 @@ pub fn github_ui(
         }
         GhTab::Issues => {
             if panel.issues.is_empty() {
-                empty_state(ui, theme, panel.inflight > 0, &tr("オープンな Issue はありません"));
+                empty_state(
+                    ui,
+                    theme,
+                    panel.inflight > 0,
+                    &tr("オープンな Issue はありません"),
+                );
             }
             for is in &panel.issues {
                 issue_row(ui, theme, is, presets, &root, actions);
@@ -479,7 +488,10 @@ pub fn github_ui(
             panel.pending_diff = Some(number);
             request(panel, actions, GhRequest::PrDiff { root, number });
             actions.toast = Some((
-                trf("🐙 PR #{number} の差分を取得中…", &[("number", number.to_string())]),
+                trf(
+                    "🐙 PR #{number} の差分を取得中…",
+                    &[("number", number.to_string())],
+                ),
                 true,
             ));
         }
@@ -514,7 +526,11 @@ fn gh_missing_ui(ui: &mut egui::Ui, theme: &Theme) {
             .size(11.5),
     );
     ui.add_space(6.0);
-    ui.label(RichText::new(tr("セットアップ手順:")).color(theme.text_dim).size(11.5));
+    ui.label(
+        RichText::new(tr("セットアップ手順:"))
+            .color(theme.text_dim)
+            .size(11.5),
+    );
     ui.label(
         RichText::new("  1. brew install gh   (macOS)")
             .monospace()
@@ -538,7 +554,11 @@ fn gh_missing_ui(ui: &mut egui::Ui, theme: &Theme) {
 /// 一覧が空のときの表示。取得中と「本当に 0 件」を区別する。
 fn empty_state(ui: &mut egui::Ui, theme: &Theme, loading: bool, msg: &str) {
     ui.add_space(8.0);
-    let text = if loading { tr("取得中…") } else { msg.to_string() };
+    let text = if loading {
+        tr("取得中…")
+    } else {
+        msg.to_string()
+    };
     ui.label(RichText::new(text).color(theme.text_dim).size(11.5));
 }
 
@@ -585,7 +605,9 @@ fn pr_row(ui: &mut egui::Ui, theme: &Theme, pr: &PullRequest, busy: bool) -> boo
                 if busy {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(tr("差分を取得中…")).color(theme.warn).size(10.5),
+                            RichText::new(tr("差分を取得中…"))
+                                .color(theme.warn)
+                                .size(10.5),
                         )
                         .selectable(false),
                     );
@@ -601,7 +623,8 @@ fn pr_row(ui: &mut egui::Ui, theme: &Theme, pr: &PullRequest, busy: bool) -> boo
     if hit.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    hit.on_hover_text(tr("クリックで差分をタブに開く")).clicked()
+    hit.on_hover_text(tr("クリックで差分をタブに開く"))
+        .clicked()
 }
 
 /// Issue 1 行。「⚡ 着手」で worktree + エージェント起動のワンフローが始まる。
@@ -643,8 +666,7 @@ fn issue_row(
                             );
                             for (i, (icon, name)) in presets.iter().enumerate() {
                                 if ui.button(format!("{icon} {name}")).clicked() {
-                                    actions.start_issue =
-                                        Some((root.to_path_buf(), is.clone(), i));
+                                    actions.start_issue = Some((root.to_path_buf(), is.clone(), i));
                                     ui.close_menu();
                                 }
                             }
@@ -707,8 +729,11 @@ pub fn pr_diff_ui(
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new(trf("🐙 PR #{number} の差分", &[("number", number.to_string())]))
-                        .strong(),
+                    RichText::new(trf(
+                        "🐙 PR #{number} の差分",
+                        &[("number", number.to_string())],
+                    ))
+                    .strong(),
                 );
                 ui.label(
                     RichText::new(trf(
@@ -892,7 +917,10 @@ pub fn open_in_ide(
             .map(|()| {
                 trf(
                     "{icon} {label} でフォルダを開きました",
-                    &[("icon", spec.icon.to_string()), ("label", spec.label.to_string())],
+                    &[
+                        ("icon", spec.icon.to_string()),
+                        ("label", spec.label.to_string()),
+                    ],
                 )
             })
             .map_err(|e| {
@@ -1028,10 +1056,7 @@ fn folder_group_ui(
         if title.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        if title
-            .on_hover_text(folder.display().to_string())
-            .clicked()
-        {
+        if title.on_hover_text(folder.display().to_string()).clicked() {
             toggle_collapse = true;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1148,11 +1173,9 @@ fn session_row_ui(
                     );
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(
-                            egui::Label::new(
-                                RichText::new(&title).color(theme.text).size(11.5),
-                            )
-                            .truncate()
-                            .selectable(false),
+                            egui::Label::new(RichText::new(&title).color(theme.text).size(11.5))
+                                .truncate()
+                                .selectable(false),
                         );
                     });
                 });
@@ -1309,7 +1332,11 @@ pub fn composer_rows(text: &str, cols: usize, max_rows: usize) -> usize {
     let mut n = 0usize;
     for seg in text.split('\n') {
         let len = seg.chars().count();
-        n += if cols == 0 { 1 } else { len.div_ceil(cols).max(1) };
+        n += if cols == 0 {
+            1
+        } else {
+            len.div_ceil(cols).max(1)
+        };
         if n >= max {
             return max;
         }
@@ -1438,7 +1465,11 @@ pub fn inline_target_label(target: ComposerTarget, agent: Option<&str>) -> Strin
 /// 折りたたみ中に出す 1 行サマリ。先頭の中身 + 残りの分量。
 pub fn collapsed_summary(text: &str) -> String {
     let (chars, lines) = composer_stats(text);
-    let head = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let head = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     // 文字境界で切る (日本語が壊れないよう chars() で数える)
     let mut shown: String = head.chars().take(40).collect();
     if head.chars().count() > 40 {
@@ -1659,9 +1690,11 @@ pub fn composer_target_chips(
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = space::XS + 2.0;
                 let bsel = buf.target().is_broadcast();
-                let btxt = RichText::new(tr("📢 全員"))
-                    .size(11.5)
-                    .color(if bsel { theme.warn } else { theme.text_dim });
+                let btxt = RichText::new(tr("📢 全員")).size(11.5).color(if bsel {
+                    theme.warn
+                } else {
+                    theme.text_dim
+                });
                 if ui
                     .selectable_label(bsel, btxt)
                     .on_hover_text(tr("起動中のすべてのエージェントへ送ります"))
@@ -1671,9 +1704,11 @@ pub fn composer_target_chips(
                 }
                 for (id, label) in targets {
                     let sel = buf.target() == ComposerTarget::Agent(*id);
-                    let txt = RichText::new(label)
-                        .size(11.5)
-                        .color(if sel { theme.accent } else { theme.text_dim });
+                    let txt = RichText::new(label).size(11.5).color(if sel {
+                        theme.accent
+                    } else {
+                        theme.text_dim
+                    });
                     // ID をセッション id に固定する。egui 0.29 の
                     // `selectable_label` はラベル文字列ではなく **Ui の自動採番**
                     // (`next_auto_id_salt`) から ID を作るので、1 フレームの中で
@@ -1776,7 +1811,11 @@ pub fn agent_composer_ui(
     if long {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            let label = if collapsed { tr("▸ 展開") } else { tr("▾ 折りたたむ") };
+            let label = if collapsed {
+                tr("▸ 展開")
+            } else {
+                tr("▾ 折りたたむ")
+            };
             if ui.small_button(label).clicked() {
                 collapsed = !collapsed;
                 ui.memory_mut(|m| m.data.insert_temp(collapse_id, collapsed));
@@ -2157,8 +2196,10 @@ fn audit_ui(
         ui.vertical_centered(|ui| {
             ui.add_space(18.0);
             ui.label(
-                RichText::new(tr("まだ記録がありません — 承認/拒否すると 1 行ずつ残ります"))
-                    .color(theme.text_dim),
+                RichText::new(tr(
+                    "まだ記録がありません — 承認/拒否すると 1 行ずつ残ります",
+                ))
+                .color(theme.text_dim),
             );
         });
         return;
@@ -2172,8 +2213,11 @@ fn audit_ui(
                 ui.horizontal(|ui| {
                     let allow = e.decision.starts_with("allow");
                     ui.label(
-                        RichText::new(if allow { "✔" } else { "✖" })
-                            .color(if allow { theme.ok } else { theme.err }),
+                        RichText::new(if allow { "✔" } else { "✖" }).color(if allow {
+                            theme.ok
+                        } else {
+                            theme.err
+                        }),
                     );
                     ui.label(
                         RichText::new(format!("{} / {} / {}", e.agent, e.kind, e.source))
@@ -2267,13 +2311,25 @@ mod tests {
     #[test]
     fn reopening_same_pr_reuses_the_tab() {
         let mut ed = Editor::new();
-        let a = ed.open_virtual("PR #7 差分".into(), "old".into(), BufferKind::PrDiff { number: 7 });
-        let b = ed.open_virtual("PR #7 差分".into(), "new".into(), BufferKind::PrDiff { number: 7 });
+        let a = ed.open_virtual(
+            "PR #7 差分".into(),
+            "old".into(),
+            BufferKind::PrDiff { number: 7 },
+        );
+        let b = ed.open_virtual(
+            "PR #7 差分".into(),
+            "new".into(),
+            BufferKind::PrDiff { number: 7 },
+        );
         assert_eq!(a, b, "同じ PR は同じタブを使い回す");
         assert_eq!(ed.buffers.len(), 1);
         assert_eq!(ed.buffers[0].text, "new");
         // 別 PR は別タブ。
-        ed.open_virtual("PR #8 差分".into(), "x".into(), BufferKind::PrDiff { number: 8 });
+        ed.open_virtual(
+            "PR #8 差分".into(),
+            "x".into(),
+            BufferKind::PrDiff { number: 8 },
+        );
         assert_eq!(ed.buffers.len(), 2);
     }
 
@@ -2281,7 +2337,11 @@ mod tests {
     fn closing_a_diff_tab_keeps_the_editor_consistent() {
         let mut ed = Editor::new();
         ed.new_untitled();
-        ed.open_virtual("PR #7 差分".into(), "d".into(), BufferKind::PrDiff { number: 7 });
+        ed.open_virtual(
+            "PR #7 差分".into(),
+            "d".into(),
+            BufferKind::PrDiff { number: 7 },
+        );
         ed.close(1);
         assert_eq!(ed.buffers.len(), 1);
         assert_eq!(ed.active, Some(0));
@@ -2304,7 +2364,10 @@ mod tests {
             });
         });
 
-        assert!(actions.requests.is_empty(), "有効化前に gh を叩いてはいけない");
+        assert!(
+            actions.requests.is_empty(),
+            "有効化前に gh を叩いてはいけない"
+        );
         assert!(panel.last_error.is_none());
     }
 
@@ -2499,7 +2562,13 @@ mod tests {
             assert!(pr.url.contains("cli/cli"));
             eprintln!(
                 "#{} {} — {} ({} → {}) +{} -{}",
-                pr.number, pr.title, pr.author, pr.head_ref, pr.base_ref, pr.additions, pr.deletions
+                pr.number,
+                pr.title,
+                pr.author,
+                pr.head_ref,
+                pr.base_ref,
+                pr.additions,
+                pr.deletions
             );
         }
 
@@ -2569,7 +2638,10 @@ mod tests {
             assert!(!agent_mark(bin).is_empty());
         }
         // 3 エージェントが並んでも見分けが付く (アイコンが衝突していない)
-        let marks: Vec<String> = ["claude", "codex", "agy"].iter().map(|b| agent_mark(b)).collect();
+        let marks: Vec<String> = ["claude", "codex", "agy"]
+            .iter()
+            .map(|b| agent_mark(b))
+            .collect();
         let uniq: std::collections::HashSet<&String> = marks.iter().collect();
         assert_eq!(uniq.len(), marks.len(), "アイコンが重複している: {marks:?}");
         // 未知の bin は頭文字へフォールバック
@@ -2579,7 +2651,10 @@ mod tests {
 
     #[test]
     fn folder_header_label_is_the_folder_name() {
-        assert_eq!(root_label(Path::new("/Users/me/dev/zaivern-code")), "zaivern-code");
+        assert_eq!(
+            root_label(Path::new("/Users/me/dev/zaivern-code")),
+            "zaivern-code"
+        );
         assert_eq!(root_label(Path::new("/")), "/");
     }
 
@@ -2615,11 +2690,11 @@ mod tests {
             // --- macOS: ⌘+Enter だけが送信 ---
             (true, false, true, false, false, egui::Key::Enter, true),
             (true, false, false, false, false, egui::Key::Enter, false), // Enter 単体 = 改行
-            (true, true, false, false, false, egui::Key::Enter, false), // Ctrl は端末側の役目
-            (true, false, true, true, false, egui::Key::Enter, false),  // ⌘+Shift は誤爆防止で無効
-            (true, false, true, false, true, egui::Key::Enter, false),  // ⌘+Alt も無効
-            (true, true, true, false, false, egui::Key::Enter, false),  // Ctrl 同時押しは無効
-            (true, false, true, false, false, egui::Key::A, false),     // Enter 以外は無関係
+            (true, true, false, false, false, egui::Key::Enter, false),  // Ctrl は端末側の役目
+            (true, false, true, true, false, egui::Key::Enter, false),   // ⌘+Shift は誤爆防止で無効
+            (true, false, true, false, true, egui::Key::Enter, false),   // ⌘+Alt も無効
+            (true, true, true, false, false, egui::Key::Enter, false),   // Ctrl 同時押しは無効
+            (true, false, true, false, false, egui::Key::A, false),      // Enter 以外は無関係
             // --- Windows / Linux: Ctrl+Enter だけが送信 ---
             (false, true, false, false, false, egui::Key::Enter, true),
             (false, false, false, false, false, egui::Key::Enter, false), // Enter 単体 = 改行
@@ -2658,7 +2733,10 @@ mod tests {
     #[test]
     fn only_long_multiline_drafts_collapse() {
         assert!(!should_collapse(""));
-        assert!(!should_collapse(&"あ".repeat(900)), "1 行なら長くても畳まない");
+        assert!(
+            !should_collapse(&"あ".repeat(900)),
+            "1 行なら長くても畳まない"
+        );
         assert!(!should_collapse("1\n2\n3"), "数行なら畳まない");
         assert!(should_collapse(&"行\n".repeat(20)), "行数が多ければ畳む");
         let wide = format!("見出し\n{}", "あ".repeat(700));
@@ -2692,7 +2770,10 @@ mod tests {
         b.set_text("7 番へ: この関数を直して");
 
         // 何も押さなければ何も起きない
-        assert_eq!(composer_action(&mut b, ComposerPress::None), ComposerAction::None);
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::None),
+            ComposerAction::None
+        );
         assert_eq!(b.text(), "7 番へ: この関数を直して");
 
         // 送信 → 宛先つきで返り、その宛先の下書きだけ空になる
@@ -2722,7 +2803,10 @@ mod tests {
         b.set_target(ComposerTarget::Agent(3));
         b.set_text("書きかけ\n途中まで");
 
-        assert_eq!(composer_action(&mut b, ComposerPress::Cancel), ComposerAction::Cancel);
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::Cancel),
+            ComposerAction::Cancel
+        );
         assert_eq!(b.text(), "書きかけ\n途中まで", "取消では下書きを消さない");
 
         // 閉じて別のエージェントを触ってから戻ってきても残っている
@@ -2736,11 +2820,17 @@ mod tests {
     fn composer_send_ignores_blank_and_swallowing_slash_commands() {
         let mut b = AgentInputBuffer::new();
         b.set_text("   \n  ");
-        assert_eq!(composer_action(&mut b, ComposerPress::Send), ComposerAction::None);
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::Send),
+            ComposerAction::None
+        );
 
         // /clear は展開結果が空なので送らない (下書きだけ消える)
         b.set_text("/clear");
-        assert_eq!(composer_action(&mut b, ComposerPress::Send), ComposerAction::None);
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::Send),
+            ComposerAction::None
+        );
         assert_eq!(b.text(), "");
     }
 
@@ -2780,7 +2870,10 @@ mod tests {
         assert_eq!(composer_rows("a\n\nb", cols, COMPOSER_MAX_ROWS), 3);
         // 上限で頭打ち (これ以上は中でスクロールする)
         let huge = "x".repeat(cols * (COMPOSER_MAX_ROWS + 20));
-        assert_eq!(composer_rows(&huge, cols, COMPOSER_MAX_ROWS), COMPOSER_MAX_ROWS);
+        assert_eq!(
+            composer_rows(&huge, cols, COMPOSER_MAX_ROWS),
+            COMPOSER_MAX_ROWS
+        );
         // 消したら 1 行へ戻る (状態を持たないので必ず戻る)
         assert_eq!(composer_rows("", cols, COMPOSER_MAX_ROWS), 1);
     }
@@ -2835,16 +2928,27 @@ mod tests {
         assert!(mention.ends_with(' '), "末尾に半角空白が要る: {mention}");
         // ファイル名は空白なしの ASCII (シェルクオートなしで分断されない)
         let name = png.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.is_ascii() && !name.contains(' '), "名前が ASCII 無空白でない: {name}");
+        assert!(
+            name.is_ascii() && !name.contains(' '),
+            "名前が ASCII 無空白でない: {name}"
+        );
 
         // キャレットの前後がそのまま残る (日本語でも文字境界で割れない)
         let (out, at) = insert_at_caret("これを直して", 3, &mention);
         assert_eq!(out, format!("これを{mention}直して"));
-        assert_eq!(out.chars().nth(at), Some('直'), "キャレットは挿入直後に来る");
+        assert_eq!(
+            out.chars().nth(at),
+            Some('直'),
+            "キャレットは挿入直後に来る"
+        );
         // 端 (先頭 / 末尾 / 範囲外) でも壊れない
         assert_eq!(insert_at_caret("ab", 0, "@x ").0, "@x ab");
         assert_eq!(insert_at_caret("ab", 2, "@x ").0, "ab@x ");
-        assert_eq!(insert_at_caret("ab", 999, "@x ").0, "ab@x ", "範囲外は末尾に寄せる");
+        assert_eq!(
+            insert_at_caret("ab", 999, "@x ").0,
+            "ab@x ",
+            "範囲外は末尾に寄せる"
+        );
         assert_eq!(insert_at_caret("", 0, "@x ").0, "@x ");
     }
 
@@ -2856,9 +2960,14 @@ mod tests {
         // 文字クリップボード / 画像なし / 初期化失敗 はすべてこの None に集約される
         assert_eq!(apply_image_paste("そのまま", 2, None), None);
         // 取れたときだけ差し込まれる
-        let p = std::env::temp_dir().join("zaivern-clip").join("clip-1-2-3.png");
+        let p = std::env::temp_dir()
+            .join("zaivern-clip")
+            .join("clip-1-2-3.png");
         let (out, _) = apply_image_paste("そのまま", 2, Some(&p)).expect("取れたら挿さる");
-        assert!(out.starts_with("その@"), "キャレット位置に挿さっていない: {out}");
+        assert!(
+            out.starts_with("その@"),
+            "キャレット位置に挿さっていない: {out}"
+        );
     }
 
     /// 宛先が「全員宛て」でも挿入経路は同じ — 挿すのは本文なので区別しない。
@@ -2872,7 +2981,10 @@ mod tests {
             b.set_text("これを見て");
             let (out, _) = insert_at_caret(b.text(), b.text().chars().count(), &mention);
             b.set_text(out);
-            assert!(b.text().contains(&mention), "target={target:?} で挿さっていない");
+            assert!(
+                b.text().contains(&mention),
+                "target={target:?} で挿さっていない"
+            );
             // 全員宛てのまま送れば全員へ同じ本文が渡る
             let act = composer_action(&mut b, ComposerPress::Send);
             match (target, act) {
@@ -2895,8 +3007,9 @@ mod tests {
     #[test]
     fn 宛先チップは全員と全エージェントを並べる() {
         for n in [0usize, 1, 5] {
-            let targets: Vec<(u64, String)> =
-                (0..n).map(|i| (i as u64 + 1, format!("エージェント{i}"))).collect();
+            let targets: Vec<(u64, String)> = (0..n)
+                .map(|i| (i as u64 + 1, format!("エージェント{i}")))
+                .collect();
             let mut b = AgentInputBuffer::new();
             b.sync_target(targets.first().map(|(id, _)| *id));
             // 並ぶチップの数 = 全員 1 個 + エージェント n 個
@@ -2921,10 +3034,15 @@ mod tests {
     /// 複製して同名が並んでも、チップは必ず見分けられる。
     #[test]
     fn 同名の宛先チップは番号で見分けられる() {
-        let names: Vec<String> = ["👾 Claude Code", "🤖 Codex", "👾 Claude Code", "👾 Claude Code"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let names: Vec<String> = [
+            "👾 Claude Code",
+            "🤖 Codex",
+            "👾 Claude Code",
+            "👾 Claude Code",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let out = disambiguate_labels(&names);
         assert_eq!(
             out,
@@ -2956,7 +3074,10 @@ mod tests {
         b.sync_target(Some(9));
         assert_eq!(b.target(), ComposerTarget::Agent(9));
         // 空は送らない → 中身があれば必ず SendTo (Send にはならない)
-        assert_eq!(composer_action(&mut b, ComposerPress::Send), ComposerAction::None);
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::Send),
+            ComposerAction::None
+        );
         b.set_text("これを見て");
         assert_eq!(
             composer_action(&mut b, ComposerPress::Send),
@@ -3195,7 +3316,15 @@ mod egui_id_guard {
 
     /// 実行時の値を含まない (= 全周回で同じ) 語。
     const CONST_WORDS: &[&str] = &[
-        "Id", "new", "with", "tr", "String", "str", "as", "to_string", "from",
+        "Id",
+        "new",
+        "with",
+        "tr",
+        "String",
+        "str",
+        "as",
+        "to_string",
+        "from",
     ];
 
     /// `src/` の場所。ビルド時に決まる値から導くので、どの環境でも動く
@@ -3338,7 +3467,9 @@ mod egui_id_guard {
     /// **stable_id から ID を作るウィジェット**なら、その名前を返す。
     /// 自動採番組 (Button / SelectableLabel / …) はここに入れない。
     fn persistent_widget(code: &str) -> Option<String> {
-        re_persistent().find(code).map(|m| m.as_str().trim().to_string())
+        re_persistent()
+            .find(code)
+            .map(|m| m.as_str().trim().to_string())
     }
 
     /// 文の中の id salt が**すべて定数**なら `true` (= ループ内なら衝突する)。
@@ -3623,9 +3754,13 @@ mod tests {
 
     #[test]
     fn salt判定は実行時の値を見分ける() {
-        assert!(salt_is_constant(r#"ScrollArea::vertical().id_salt("fixed")"#));
+        assert!(salt_is_constant(
+            r#"ScrollArea::vertical().id_salt("fixed")"#
+        ));
         assert!(salt_is_constant(r#"Grid::new("g")"#));
-        assert!(salt_is_constant(r#"ScrollArea::vertical().show(ui, |ui| {})"#));
+        assert!(salt_is_constant(
+            r#"ScrollArea::vertical().show(ui, |ui| {})"#
+        ));
         assert!(!salt_is_constant(
             r#"ScrollArea::vertical().id_salt(("row", r.id))"#
         ));
@@ -3643,11 +3778,17 @@ mod tests {
     #[test]
     fn 文字リテラルの波括弧を数えない() {
         // ここを取りこぼすと入れ子の深さがずれ、番人が別の場所を誤検知する
-        assert_eq!(strip_noise("code.matches('{').count();"), "code.matches('').count();");
+        assert_eq!(
+            strip_noise("code.matches('{').count();"),
+            "code.matches('').count();"
+        );
         assert_eq!(strip_noise("if c == '\"' {"), "if c == '' {");
         assert_eq!(strip_noise("i += 1; // '}'"), "i += 1; ");
         // ライフタイムは文字リテラルではないので壊さない
-        assert_eq!(strip_noise("fn f<'a>(x: &'a str) {"), "fn f<'a>(x: &'a str) {");
+        assert_eq!(
+            strip_noise("fn f<'a>(x: &'a str) {"),
+            "fn f<'a>(x: &'a str) {"
+        );
     }
 
     #[test]

@@ -243,7 +243,11 @@ pub fn draw(
         if t >= rt.roam_state_until {
             rt.roam_walking = !rt.roam_walking;
             let r = prand(t);
-            rt.roam_state_until = t + if rt.roam_walking { 3.0 + r * 3.5 } else { 1.5 + r * 2.5 };
+            rt.roam_state_until = t + if rt.roam_walking {
+                3.0 + r * 3.5
+            } else {
+                1.5 + r * 2.5
+            };
         }
         if rt.roam_walking {
             rt.roam_phase += dt * 0.45;
@@ -265,11 +269,19 @@ pub fn draw(
         PetState::Idle => {
             // ときどき耳をぴょこぴょこ動かす
             let wiggle = if (t * 0.11).fract() < 0.22 { 2.0 } else { 0.5 };
-            ((t * 2.0).sin() * 2.5, (t * 1.6).sin() * wiggle, (t * 1.6).sin() * 0.5)
+            (
+                (t * 2.0).sin() * 2.5,
+                (t * 1.6).sin() * wiggle,
+                (t * 1.6).sin() * 0.5,
+            )
         }
         PetState::Roam => {
             if roam_moving {
-                ((t * 3.4).sin() * 2.0, (t * 3.0).sin() * 1.5, (t * 6.0).sin() * 2.4)
+                (
+                    (t * 3.4).sin() * 2.0,
+                    (t * 3.0).sin() * 1.5,
+                    (t * 6.0).sin() * 2.4,
+                )
             } else {
                 ((t * 2.0).sin() * 1.8, (t * 1.4).sin() * 0.8, 0.0)
             }
@@ -277,17 +289,33 @@ pub fn draw(
         PetState::Working(n) => {
             // 稼働数に応じて足踏みが速くなる
             let sp = 3.0 + (n.min(8) as f64) * 0.7;
-            ((t * sp).sin() * 2.2, (t * sp).sin() * 2.0, (t * sp * 1.3).sin() * 2.6)
+            (
+                (t * sp).sin() * 2.2,
+                (t * sp).sin() * 2.0,
+                (t * sp * 1.3).sin() * 2.6,
+            )
         }
-        PetState::Groove => {
-            (-(t * 7.0).sin().abs() * 5.0, (t * 11.0).sin() * 3.2, (t * 9.0).sin() * 2.4)
-        }
-        PetState::Attention => ((t * 6.4).sin() * 1.6, (t * 6.0).sin() * 2.0, (t * 8.0).sin() * 2.0),
-        PetState::Happy => {
-            (-(t * 7.0).sin().abs() * 6.0, (t * 9.0).sin() * 2.5, (t * 9.0).sin() * 2.0)
-        }
+        PetState::Groove => (
+            -(t * 7.0).sin().abs() * 5.0,
+            (t * 11.0).sin() * 3.2,
+            (t * 9.0).sin() * 2.4,
+        ),
+        PetState::Attention => (
+            (t * 6.4).sin() * 1.6,
+            (t * 6.0).sin() * 2.0,
+            (t * 8.0).sin() * 2.0,
+        ),
+        PetState::Happy => (
+            -(t * 7.0).sin().abs() * 6.0,
+            (t * 9.0).sin() * 2.5,
+            (t * 9.0).sin() * 2.0,
+        ),
         PetState::Error => ((t * 20.0).sin() * 0.8, 0.5, 0.5),
-        PetState::Annoyed => ((t * 4.0).sin() * 1.0, (t * 14.0).sin() * 2.5, (t * 16.0).sin() * 2.0),
+        PetState::Annoyed => (
+            (t * 4.0).sin() * 1.0,
+            (t * 14.0).sin() * 2.5,
+            (t * 16.0).sin() * 2.0,
+        ),
     };
     let mut bob = bob as f32 * scale;
     let wave = wave as f32 * scale;
@@ -325,8 +353,7 @@ pub fn draw(
 
     let inner = area
         .show(ctx, |ui| {
-            let (rect, resp) =
-                ui.allocate_exact_size(box_size, egui::Sense::click_and_drag());
+            let (rect, resp) = ui.allocate_exact_size(box_size, egui::Sense::click_and_drag());
 
             // ── 視線: カーソル方向へ ±1.5*scale px(ローム歩行中は進行方向)──
             let mut eye_look = Vec2::ZERO;
@@ -618,19 +645,31 @@ fn draw_blocky(painter: &egui::Painter, rect: Rect, t: f64, state: PetState, p: 
                 // バツ目(2本の交差ストローク)
                 let r = 3.2 * s;
                 let st = egui::Stroke::new(2.0 * s, eye_col);
-                painter.line_segment([egui::pos2(ex - r, ecy - r), egui::pos2(ex + r, ecy + r)], st);
-                painter.line_segment([egui::pos2(ex - r, ecy + r), egui::pos2(ex + r, ecy - r)], st);
+                painter.line_segment(
+                    [egui::pos2(ex - r, ecy - r), egui::pos2(ex + r, ecy + r)],
+                    st,
+                );
+                painter.line_segment(
+                    [egui::pos2(ex - r, ecy + r), egui::pos2(ex + r, ecy - r)],
+                    st,
+                );
             }
             PetState::Happy => {
                 // にっこり(上向きアーチの ∧ 目)
                 let r = 3.0 * s;
                 let st = egui::Stroke::new(2.0 * s, eye_col);
                 painter.line_segment(
-                    [egui::pos2(ex - r, ecy + 1.5 * s), egui::pos2(ex, ecy - 2.5 * s)],
+                    [
+                        egui::pos2(ex - r, ecy + 1.5 * s),
+                        egui::pos2(ex, ecy - 2.5 * s),
+                    ],
                     st,
                 );
                 painter.line_segment(
-                    [egui::pos2(ex, ecy - 2.5 * s), egui::pos2(ex + r, ecy + 1.5 * s)],
+                    [
+                        egui::pos2(ex, ecy - 2.5 * s),
+                        egui::pos2(ex + r, ecy + 1.5 * s),
+                    ],
                     st,
                 );
             }
@@ -700,7 +739,11 @@ fn draw_bubble(painter: &egui::Painter, rect: Rect, theme: &Theme, state: PetSta
         );
         let bg = Rect::from_min_size(pos, galley.size()).expand(4.0);
         painter.rect_filled(bg, 6.0, theme.panel);
-        painter.rect_stroke(bg, 6.0, egui::Stroke::new(1.0_f32, color.gamma_multiply(0.8)));
+        painter.rect_stroke(
+            bg,
+            6.0,
+            egui::Stroke::new(1.0_f32, color.gamma_multiply(0.8)),
+        );
         painter.galley(pos, galley, theme.text);
     }
 }
@@ -809,7 +852,10 @@ mod tests {
         let mut input = base_input();
         input.working = 1;
         input.sleep_enabled = true;
-        assert_eq!(resolve(&input, SLEEP_AFTER * 10.0, false), PetState::Working(1));
+        assert_eq!(
+            resolve(&input, SLEEP_AFTER * 10.0, false),
+            PetState::Working(1)
+        );
     }
 
     #[test]
@@ -820,7 +866,10 @@ mod tests {
         assert_eq!(resolve(&input, DOZE_AFTER - 0.001, false), PetState::Idle);
         // DOZE_AFTER 以上 SLEEP_AFTER 未満は Dozing
         assert_eq!(resolve(&input, DOZE_AFTER, false), PetState::Dozing);
-        assert_eq!(resolve(&input, SLEEP_AFTER - 0.001, false), PetState::Dozing);
+        assert_eq!(
+            resolve(&input, SLEEP_AFTER - 0.001, false),
+            PetState::Dozing
+        );
         // SLEEP_AFTER 以上は Sleeping
         assert_eq!(resolve(&input, SLEEP_AFTER, false), PetState::Sleeping);
     }

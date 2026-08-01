@@ -12,21 +12,22 @@ use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
 use crate::coordinator;
-use crate::orchestration;
-use crate::supervisor;
 use crate::editor::{combine_hash, disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
 use crate::editor_split;
-use crate::file_search;
 use crate::failover;
+use crate::file_search;
 use crate::file_tree::{self, FileTree, TreeActions};
 use crate::firewall;
 use crate::fuzzy;
 use crate::git;
 use crate::git_panel;
+use crate::github;
 use crate::highlight::Highlighter;
 use crate::html;
 use crate::i18n::{self, tr, trf};
+use crate::ide;
+use crate::kanban;
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::license;
 use crate::lsp;
@@ -34,14 +35,13 @@ use crate::markdown;
 use crate::mcp;
 use crate::menu_bar;
 use crate::notify;
-use crate::github;
-use crate::ide;
-use crate::kanban;
+use crate::orchestration;
 use crate::palette::{Action, Cmd, Item, Palette, Results};
 use crate::panels::{self, space};
 use crate::pathx;
 use crate::pet;
 use crate::pet_bubble;
+use crate::plugins;
 use crate::race;
 use crate::recent;
 use crate::remote;
@@ -50,9 +50,9 @@ use crate::session_picker;
 use crate::shellenv;
 use crate::snippets::{self, Snippet};
 use crate::sound::{self, SoundKind};
+use crate::supervisor;
 use crate::terminal;
 use crate::theme::{self, Theme};
-use crate::plugins;
 use crate::theme_json;
 use crate::tunnel;
 use crate::tutorial::{self, AnchorId};
@@ -287,11 +287,17 @@ impl ReplacePhase {
                 ReplacePhase::Done { files: 0, hits: 0 }
             }
             (ReplacePhase::Running, ReplaceEvent::DryRunDone { files, hits }) => {
-                ReplacePhase::Confirm { files: *files, hits: *hits }
+                ReplacePhase::Confirm {
+                    files: *files,
+                    hits: *hits,
+                }
             }
             (ReplacePhase::Confirm { .. }, ReplaceEvent::Confirm) => ReplacePhase::Running,
             (ReplacePhase::Running, ReplaceEvent::ExecuteDone { files, hits }) => {
-                ReplacePhase::Done { files: *files, hits: *hits }
+                ReplacePhase::Done {
+                    files: *files,
+                    hits: *hits,
+                }
             }
             (_, ReplaceEvent::Cancel) | (_, ReplaceEvent::Failed) => ReplacePhase::Idle,
             // 未確認のまま実行要求が来ても書き込みへは進めない
@@ -472,9 +478,9 @@ enum SessionSidebarEffect {
 /// 先に見て、無ければ諦める。名前の前方一致のような曖昧な照合はしない —
 /// 別の CLI を再開コマンドで起動してしまうため。
 fn preset_for_bin(presets: &[config::AgentPreset], bin: &str) -> Option<usize> {
-    presets.iter().position(|p| {
-        crate::agents::spec_for_command(&p.command).is_some_and(|s| s.bin == bin)
-    })
+    presets
+        .iter()
+        .position(|p| crate::agents::spec_for_command(&p.command).is_some_and(|s| s.bin == bin))
 }
 
 /// 「新しい会話」に使うプリセット。カタログ既知の CLI を優先し、
@@ -752,8 +758,8 @@ fn cockpit_grid_metrics(avail: egui::Vec2, n: usize) -> GridMetrics {
     };
     let rows = n.div_ceil(cols).max(1);
     let cell_w = ((avail.x - GRID_SPACING * (cols as f32 - 1.0)) / cols as f32 - 4.0).max(1.0);
-    let cell_h = (((avail.y - GRID_SPACING * (rows as f32 - 1.0)) / rows as f32) - 4.0)
-        .max(GRID_MIN_CELL_H);
+    let cell_h =
+        (((avail.y - GRID_SPACING * (rows as f32 - 1.0)) / rows as f32) - 4.0).max(GRID_MIN_CELL_H);
     GridMetrics {
         cols,
         rows,
@@ -878,7 +884,9 @@ fn split_tile_indices(ids: &[u64], splits: &HashMap<u64, terminal::SplitLayout>)
             }
         }
     }
-    (0..ids.len()).filter(|i| !child.contains(&ids[*i])).collect()
+    (0..ids.len())
+        .filter(|i| !child.contains(&ids[*i]))
+        .collect()
 }
 
 /// 保存された分割行を実行時のレイアウト表へ戻す。
@@ -1068,10 +1076,7 @@ impl DialogSpec {
         self
     }
     fn filter(mut self, name: impl Into<String>, exts: &[&str]) -> Self {
-        self.filter = Some((
-            name.into(),
-            exts.iter().map(|e| (*e).to_string()).collect(),
-        ));
+        self.filter = Some((name.into(), exts.iter().map(|e| (*e).to_string()).collect()));
         self
     }
 }
@@ -2263,7 +2268,11 @@ pub struct ZaivernApp {
     /// 鍵 = 本文ハッシュ + タブ幅 + キャレット行 (強調ガイドが行に依存するため)。
     /// 値 = (鍵, 行ごとの桁リスト, 強調するガイド)。
     #[allow(clippy::type_complexity)]
-    guide_cache: Option<(u64, Vec<(usize, Vec<usize>)>, Option<crate::highlight::ActiveGuide>)>,
+    guide_cache: Option<(
+        u64,
+        Vec<(usize, Vec<usize>)>,
+        Option<crate::highlight::ActiveGuide>,
+    )>,
     /// 補完ポップアップの状態 (デバウンス + 候補 + 選択)。
     lsp_completion: lsp::CompletionState,
     /// 補完を要求したバッファ id (別のタブへ移ったら候補を捨てるため)
@@ -2601,10 +2610,7 @@ fn route_intent(it: &supervisor::InterventionIntent) -> IntentRoute {
 fn commander_notice(d: &commander::Directive, titles: &[String]) -> Option<String> {
     let body = supervisor::redact(&d.body, coordinator::INJECT_BODY_MAX);
     match &d.target {
-        commander::Target::All => Some(trf(
-            "指揮官の指示 (全員宛): {body}",
-            &[("body", body)],
-        )),
+        commander::Target::All => Some(trf("指揮官の指示 (全員宛): {body}", &[("body", body)])),
         commander::Target::Named(name) => {
             let title = titles.iter().find(|t| commander::title_matches(t, name))?;
             Some(trf(
@@ -2953,7 +2959,10 @@ impl ZaivernApp {
     /// ダイアログの初期ディレクトリ・エージェントの cwd 等、
     /// 「1 つ選ぶしかない」場面で使う。
     fn primary_root(&self) -> &Path {
-        self.roots.first().map(|p| p.as_path()).unwrap_or(Path::new("."))
+        self.roots
+            .first()
+            .map(|p| p.as_path())
+            .unwrap_or(Path::new("."))
     }
 
     /// これから起動するエージェント / ターミナル / ビルドタスクの作業フォルダ。
@@ -3013,7 +3022,8 @@ impl ZaivernApp {
         self.gitinfo.set_roots(self.roots.clone());
         // Git パネルは単一 repo 表示。GitSet と同じ「primary ルート」を見せることで、
         // サイドバーとステータスバーのブランチ表示が食い違わないようにする。
-        self.git_panel.set_workspace(self.primary_root().to_path_buf());
+        self.git_panel
+            .set_workspace(self.primary_root().to_path_buf());
         self.review.set_workspace(self.primary_root().to_path_buf());
         // ブランチピッカーも新しいリポジトリへ。旧 repo の一覧が残っていると、
         // そこに無いブランチへの切り替えを発行できてしまう。
@@ -3151,7 +3161,9 @@ impl ZaivernApp {
     fn active_selection(&self, ctx: &egui::Context) -> Option<String> {
         let b = self.editor.active.map(|i| &self.editor.buffers[i])?;
         let ed_id = buf_edit_id(self.cur_pane, b.id);
-        let r = egui::TextEdit::load_state(ctx, ed_id)?.cursor.char_range()?;
+        let r = egui::TextEdit::load_state(ctx, ed_id)?
+            .cursor
+            .char_range()?;
         let (s, e) = (
             r.primary.index.min(r.secondary.index),
             r.primary.index.max(r.secondary.index),
@@ -3224,7 +3236,10 @@ impl ZaivernApp {
             self.toast(
                 trf(
                     "🔌 コマンドが見つかりません: {plugin}/{cmd_id}",
-                    &[("plugin", plugin.to_string()), ("cmd_id", cmd_id.to_string())],
+                    &[
+                        ("plugin", plugin.to_string()),
+                        ("cmd_id", cmd_id.to_string()),
+                    ],
                 ),
                 false,
             );
@@ -3232,7 +3247,10 @@ impl ZaivernApp {
         };
         if !plugin.active() {
             let name = plugin.name.clone();
-            self.toast(trf("🔌 {name} は無効になっています", &[("name", name)]), false);
+            self.toast(
+                trf("🔌 {name} は無効になっています", &[("name", name)]),
+                false,
+            );
             return;
         }
         let plugin_name = plugin.name.clone();
@@ -3353,7 +3371,12 @@ impl ZaivernApp {
                     msg.to_string()
                 };
                 self.toast(
-                    format!("🔌 {} ({}): {}", r.title, r.plugin, notify::truncate_chars(&msg, 200)),
+                    format!(
+                        "🔌 {} ({}): {}",
+                        r.title,
+                        r.plugin,
+                        notify::truncate_chars(&msg, 200)
+                    ),
                     false,
                 );
                 continue;
@@ -3406,7 +3429,7 @@ impl ZaivernApp {
                         .unwrap_or_else(|| self.editor.buffers[i].text.chars().count());
                     let b = &mut self.editor.buffers[i];
                     let cur = cur.min(b.text.chars().count());
-                    let byte = editor_ops::char_to_byte(&b.text,cur);
+                    let byte = editor_ops::char_to_byte(&b.text, cur);
                     b.text.insert_str(byte, &r.stdout);
                     b.cache = None;
                     b.gutter = None;
@@ -3448,14 +3471,17 @@ impl ZaivernApp {
                                 );
                                 continue;
                             }
-                            let start = editor_ops::char_to_byte(&b.text,s);
-                            let end = editor_ops::char_to_byte(&b.text,e);
+                            let start = editor_ops::char_to_byte(&b.text, s);
+                            let end = editor_ops::char_to_byte(&b.text, e);
                             b.text.replace_range(start..end, &r.stdout);
                             b.cache = None;
                             b.gutter = None;
                             let np = s + r.stdout.chars().count();
                             self.pending_select = Some((np, np));
-                            self.toast(trf("🔌 {title} を適用しました", &[("title", r.title.clone())]), true);
+                            self.toast(
+                                trf("🔌 {title} を適用しました", &[("title", r.title.clone())]),
+                                true,
+                            );
                         }
                         // ファイル全体の置換 (整形など)
                         None => {
@@ -3504,17 +3530,17 @@ impl ZaivernApp {
                                         Err(e) => self.toast(
                                             trf(
                                                 "🔌 {title}: 再保存に失敗: {e}",
-                                                &[
-                                                    ("title", r.title.clone()),
-                                                    ("e", e.to_string()),
-                                                ],
+                                                &[("title", r.title.clone()), ("e", e.to_string())],
                                             ),
                                             false,
                                         ),
                                     }
                                 }
                             } else {
-                                self.toast(trf("🔌 {title} を適用しました", &[("title", r.title.clone())]), true);
+                                self.toast(
+                                    trf("🔌 {title} を適用しました", &[("title", r.title.clone())]),
+                                    true,
+                                );
                             }
                         }
                     }
@@ -3587,9 +3613,11 @@ impl ZaivernApp {
             expanded_text.clone()
         };
         let idx = match agent.map(str::trim).filter(|a| !a.is_empty()) {
-            Some(name) => self.agents.sessions.iter().position(|s| {
-                s.running() && (s.preset_name == name || s.title == name)
-            }),
+            Some(name) => self
+                .agents
+                .sessions
+                .iter()
+                .position(|s| s.running() && (s.preset_name == name || s.title == name)),
             None => self
                 .agents
                 .sessions
@@ -3609,9 +3637,16 @@ impl ZaivernApp {
             s.title.clone()
         };
         self.agents.panel_open = true;
-        let verb = if submit { tr("送信") } else { tr("入力欄へ") };
+        let verb = if submit {
+            tr("送信")
+        } else {
+            tr("入力欄へ")
+        };
         self.toast(
-            format!("🔌 {title} {verb}: {}", notify::truncate_chars(&expanded_text, 60)),
+            format!(
+                "🔌 {title} {verb}: {}",
+                notify::truncate_chars(&expanded_text, 60)
+            ),
             true,
         );
         true
@@ -3677,7 +3712,9 @@ impl ZaivernApp {
                 } => {
                     self.send_agent_prompt(agent.as_deref(), &text, submit);
                 }
-                A::RunTerminal { command, cwd } => self.run_in_terminal(&command, cwd.as_deref(), ctx),
+                A::RunTerminal { command, cwd } => {
+                    self.run_in_terminal(&command, cwd.as_deref(), ctx)
+                }
                 A::OpenUrl { url } => {
                     open_external(&url);
                     self.toast(trf("🔗 {url} を開きました", &[("url", url)]), true);
@@ -3754,7 +3791,12 @@ impl ZaivernApp {
 
     /// 指定イベントのフックを一斉に起動する (仕様 1章 `[[hook]]`)。
     /// 実行は既存の非同期機構に載せるので UI スレッドは止まらない。
-    fn fire_hooks(&mut self, event: plugins::HookEvent, file: Option<PathBuf>, ctx: &egui::Context) {
+    fn fire_hooks(
+        &mut self,
+        event: plugins::HookEvent,
+        file: Option<PathBuf>,
+        ctx: &egui::Context,
+    ) {
         use plugins::PluginList;
         let targets: Vec<(String, plugins::PluginCommand)> = self
             .plugins
@@ -3771,8 +3813,7 @@ impl ZaivernApp {
             .map(|e| snippets::lang_id_for(&e.to_string_lossy()).to_string())
             .unwrap_or_default();
         for (plugin_name, command) in targets {
-            let envs =
-                self.plugin_envs(&plugin_name, file.as_deref(), &lang, "", Some(event));
+            let envs = self.plugin_envs(&plugin_name, file.as_deref(), &lang, "", Some(event));
             plugins::run_async(
                 plugins::RunRequest {
                     plugin: plugin_name,
@@ -3811,7 +3852,10 @@ impl ZaivernApp {
             .collect();
         for (plugin_name, command) in due {
             self.hook_last_run.insert(
-                (plugin_name.clone(), plugins::HookEvent::Interval.as_str().to_string()),
+                (
+                    plugin_name.clone(),
+                    plugins::HookEvent::Interval.as_str().to_string(),
+                ),
                 Instant::now(),
             );
             let envs = self.plugin_envs(
@@ -3928,7 +3972,10 @@ impl ZaivernApp {
             .launch(&preset, &root, crate::agents::Approval::Agent, ctx)
         {
             Ok(()) => self.toast(
-                trf("▶ {command} を実行しています", &[("command", command.to_string())]),
+                trf(
+                    "▶ {command} を実行しています",
+                    &[("command", command.to_string())],
+                ),
                 true,
             ),
             Err(e) => self.toast(trf("実行に失敗: {e}", &[("e", e.to_string())]), false),
@@ -3983,7 +4030,10 @@ impl ZaivernApp {
                     self.rebuild_plugins();
                     self.open_path(&dir.join("plugin.toml"));
                     self.toast(
-                        trf("➕ 作成しました: {dir}", &[("dir", dir.display().to_string())]),
+                        trf(
+                            "➕ 作成しました: {dir}",
+                            &[("dir", dir.display().to_string())],
+                        ),
                         true,
                     );
                     self.new_plugin_name = None;
@@ -4106,8 +4156,11 @@ impl ZaivernApp {
             // ここは毎フレーム通るので、「見つからなかった」結果を短時間だけ覚えて
             // PATH の走査を繰り返さないようにする。
             let now = Instant::now();
-            if which_result_is_fresh(self.lsp_which_missing.get(bin).copied(), now, WHICH_MISS_TTL)
-            {
+            if which_result_is_fresh(
+                self.lsp_which_missing.get(bin).copied(),
+                now,
+                WHICH_MISS_TTL,
+            ) {
                 return; // 直近で確認済み。未インストールのまま
             }
             if !which(bin) {
@@ -4273,9 +4326,8 @@ impl ZaivernApp {
         };
         // 記録されていたルート一覧が現在のルートをすべて含み、かつより広いなら
         // マルチルートワークスペースとして開き直す。
-        let saved = file_tree::normalize_roots(
-            sess.roots.iter().map(PathBuf::from).collect::<Vec<_>>(),
-        );
+        let saved =
+            file_tree::normalize_roots(sess.roots.iter().map(PathBuf::from).collect::<Vec<_>>());
         if let Some(wider) = restored_roots(&self.roots, saved) {
             self.apply_roots(wider, ctx);
         }
@@ -4397,15 +4449,17 @@ impl ZaivernApp {
         let prefix = editor_ops::comment_prefix_for(&self.editor.buffers[i].lang);
         if matches!(op, EditOp::ToggleComment) && prefix.is_none() {
             let lang = self.editor.buffers[i].lang.clone();
-            self.toast(trf("{lang} の行コメント記法が不明です", &[("lang", lang)]), false);
+            self.toast(
+                trf("{lang} の行コメント記法が不明です", &[("lang", lang)]),
+                false,
+            );
             return;
         }
 
         let buf = &mut self.editor.buffers[i];
         let (new_text, new_sel) = match op {
             EditOp::ToggleComment => {
-                let (t, s, e) =
-                    editor_ops::toggle_comment(&buf.text, start, end, prefix.unwrap());
+                let (t, s, e) = editor_ops::toggle_comment(&buf.text, start, end, prefix.unwrap());
                 (t, (s, e))
             }
             EditOp::Duplicate => {
@@ -4450,7 +4504,13 @@ impl ZaivernApp {
     ///
     /// タブが切り替わっていたら (バッファ ID が違う) 前の集合は**捨てる** —
     /// 別のファイルのバイト位置をそのまま当てると本文を壊すため。
-    fn multi_seed(&mut self, buf_id: u64, text: &str, start: usize, end: usize) -> editor_ops::MultiSel {
+    fn multi_seed(
+        &mut self,
+        buf_id: u64,
+        text: &str,
+        start: usize,
+        end: usize,
+    ) -> editor_ops::MultiSel {
         match &self.multi_sel {
             Some((id, sel)) if *id == buf_id && !sel.is_empty() => sel.clone(),
             _ => editor_ops::MultiSel::from_char_ranges(text, [start..end]),
@@ -4471,7 +4531,10 @@ impl ZaivernApp {
         };
         // バイト範囲 → char 範囲 (egui のキャレットは char 添字)
         let cs = text[..r.start.min(text.len())].chars().count();
-        let ce = cs + text[r.start.min(text.len())..r.end.min(text.len())].chars().count();
+        let ce = cs
+            + text[r.start.min(text.len())..r.end.min(text.len())]
+                .chars()
+                .count();
         self.pending_select = Some((cs, ce));
         self.multi_sel = Some((buf_id, sel));
         if n > 1 {
@@ -4584,12 +4647,10 @@ impl ZaivernApp {
                             // (ベタ書きの ⌘Z は Windows/Linux で嘘になる)。
                             (
                                 "undo",
-                                crate::keybinds::format_shortcut(
-                                    egui::KeyboardShortcut::new(
-                                        egui::Modifiers::COMMAND,
-                                        egui::Key::Z,
-                                    ),
-                                ),
+                                crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
+                                    egui::Modifiers::COMMAND,
+                                    egui::Key::Z,
+                                )),
                             ),
                         ],
                     ),
@@ -4617,7 +4678,10 @@ impl ZaivernApp {
                 };
                 if aid != buf_id {
                     self.column_anchor = None;
-                    self.toast(tr("矩形選択の始点は別のタブのものでした — やり直してください"), false);
+                    self.toast(
+                        tr("矩形選択の始点は別のタブのものでした — やり直してください"),
+                        false,
+                    );
                     return;
                 }
                 let (hl, hc) = char_index_to_line_col(&text, end, tw);
@@ -4747,7 +4811,6 @@ fn build_file_index(roots: &[PathBuf]) -> Vec<IndexedFile> {
 }
 
 impl ZaivernApp {
-
     /// primary ルートが属する repo のブランチ名 (git.rs 側で TTL キャッシュ)。
     fn git_branch(&mut self) -> Option<String> {
         self.gitinfo.branch()
@@ -4762,7 +4825,10 @@ impl ZaivernApp {
                     if let Some(i) = self.editor.active {
                         let title = self.editor.buffers[i].title.clone();
                         self.toast(
-                            trf("↻ {title} を再読み込みしました(外部で変更)", &[("title", title)]),
+                            trf(
+                                "↻ {title} を再読み込みしました(外部で変更)",
+                                &[("title", title)],
+                            ),
                             true,
                         );
                         self.queue_lsp_change(i);
@@ -4798,7 +4864,10 @@ impl ZaivernApp {
             match ev {
                 ExternalEvent::Reloaded { index, title } => {
                     self.toast(
-                        trf("↻ {title} を再読み込みしました(外部で変更)", &[("title", title)]),
+                        trf(
+                            "↻ {title} を再読み込みしました(外部で変更)",
+                            &[("title", title)],
+                        ),
                         true,
                     );
                     self.queue_lsp_change(index);
@@ -4855,9 +4924,8 @@ impl ZaivernApp {
         }
         self.prefs_loaded = true;
         // (大文字小文字, 単語単位, 正規表現)
-        let (c, w, r) = ctx.data_mut(|d| {
-            *d.get_persisted_mut_or(Self::search_prefs_id(), (false, false, false))
-        });
+        let (c, w, r) = ctx
+            .data_mut(|d| *d.get_persisted_mut_or(Self::search_prefs_id(), (false, false, false)));
         self.gsearch.case_sensitive = c;
         self.gsearch.whole_word = w;
         self.gsearch.regex = r;
@@ -4869,7 +4937,10 @@ impl ZaivernApp {
         // 差分ビューの表示モードは config が持ち主。ここで 1 回だけ ctx へ種を蒔く
         // (以降はビューのトグル / パレット / F7 が ctx 側を書き換え、
         //  update の頭で config へ書き戻す)。
-        crate::diff::set_diff_mode(ctx, crate::diff::DiffMode::from_config_str(&self.cfg.diff_view));
+        crate::diff::set_diff_mode(
+            ctx,
+            crate::diff::DiffMode::from_config_str(&self.cfg.diff_view),
+        );
     }
 
     fn save_search_prefs(&self, ctx: &egui::Context) {
@@ -5157,10 +5228,7 @@ impl ZaivernApp {
             .map(|r| {
                 trf(
                     "{ago} 前: {line}",
-                    &[
-                        ("ago", fmt_ago(r.ago(mono))),
-                        ("line", r.line()),
-                    ],
+                    &[("ago", fmt_ago(r.ago(mono))), ("line", r.line())],
                 )
             })
             .collect();
@@ -5180,9 +5248,11 @@ impl ZaivernApp {
                         .checkbox(&mut on, tr("🔁 レート制限で自動的に切り替える"))
                         .on_hover_text(format!(
                             "{}\n\n{}",
-                            tr("上限に当たったら、同じ CLI の別プロファイル → 別 CLI の順で\n\
+                            tr(
+                                "上限に当たったら、同じ CLI の別プロファイル → 別 CLI の順で\n\
                                 切替先を選び、新しいセッションを立てて続きを渡します。\n\
-                                いま動いているセッションは残したまま (終了させません)。"),
+                                いま動いているセッションは残したまま (終了させません)。"
+                            ),
                             fo_ladder,
                         ))
                         .changed()
@@ -5242,10 +5312,11 @@ impl ZaivernApp {
                     ui.horizontal(|ui| {
                         ui.label(quota_severity_icon(sev));
                         ui.label(RichText::new(u.account.clone()).strong());
-                        ui.label(
-                            RichText::new(quota_usage_label(u))
-                                .color(if sev >= 2 { theme.err } else { theme.text }),
-                        );
+                        ui.label(RichText::new(quota_usage_label(u)).color(if sev >= 2 {
+                            theme.err
+                        } else {
+                            theme.text
+                        }));
                     });
                     ui.label(
                         RichText::new(trf(
@@ -5262,11 +5333,13 @@ impl ZaivernApp {
                     if let Some((_, a)) = advice.iter().find(|(a, _)| *a == u.account) {
                         let msg = a.message();
                         if !msg.is_empty() {
-                            ui.label(
-                                RichText::new(format!("　⚠ {msg}"))
-                                    .size(11.5)
-                                    .color(if a.severity() >= 2 { theme.err } else { theme.warn }),
-                            );
+                            ui.label(RichText::new(format!("　⚠ {msg}")).size(11.5).color(
+                                if a.severity() >= 2 {
+                                    theme.err
+                                } else {
+                                    theme.warn
+                                },
+                            ));
                         }
                     }
                     ui.separator();
@@ -5426,7 +5499,11 @@ impl ZaivernApp {
                     self.toast(m, false);
                 }
             }
-            SessionSidebarEffect::Launch { preset, command, cwd } => {
+            SessionSidebarEffect::Launch {
+                preset,
+                command,
+                cwd,
+            } => {
                 self.launch_preset_with(preset, command, &cwd, ctx);
             }
             SessionSidebarEffect::Reveal(dir) => {
@@ -5452,13 +5529,7 @@ impl ZaivernApp {
     /// 過去セッションの再開 (`--resume <id>` 付き) と、フォルダを指定した新規会話が
     /// これを通る。承認モードの判定・トーストは通常の起動とまったく同じ
     /// (再開だけ全自動判定が違う、といったズレを作らないため)。
-    fn launch_preset_with(
-        &mut self,
-        i: usize,
-        command: String,
-        cwd: &Path,
-        ctx: &egui::Context,
-    ) {
+    fn launch_preset_with(&mut self, i: usize, command: String, cwd: &Path, ctx: &egui::Context) {
         use crate::agents::{
             apply_approval, command_is_bypass, env_enables_auto, merged_env, spec_for_command,
             Approval,
@@ -5549,7 +5620,10 @@ impl ZaivernApp {
             self.agents.panel_open = true;
             self.toast(tr("アクティブなエージェントに送信しました"), true);
         } else {
-            self.toast(tr("エージェントセッションがありません（👾 Agent＋ から起動）"), false);
+            self.toast(
+                tr("エージェントセッションがありません（👾 Agent＋ から起動）"),
+                false,
+            );
         }
     }
 
@@ -5631,11 +5705,7 @@ impl ZaivernApp {
         // (editor.cursor は 1-based で持っている)。
         let sel = self.pending_select.unwrap_or_else(|| {
             let (ln, col) = self.editor.cursor;
-            let c = editor_ops::char_index_at(
-                &before,
-                ln.saturating_sub(1),
-                col.saturating_sub(1),
-            );
+            let c = editor_ops::char_index_at(&before, ln.saturating_sub(1), col.saturating_sub(1));
             (c, c)
         });
         let Some((cleaned, sel)) = save_cleanup_edit(&before, sel, &opts) else {
@@ -5681,14 +5751,20 @@ impl ZaivernApp {
                     ));
                 } else {
                     self.toast(
-                        trf("💾 保存しました: {path}", &[("path", path.display().to_string())]),
+                        trf(
+                            "💾 保存しました: {path}",
+                            &[("path", path.display().to_string())],
+                        ),
                         true,
                     );
                 }
                 true
             }
             Err(e) => {
-                self.toast(trf("保存に失敗しました: {e}", &[("e", e.to_string())]), false);
+                self.toast(
+                    trf("保存に失敗しました: {e}", &[("e", e.to_string())]),
+                    false,
+                );
                 false
             }
         }
@@ -5726,7 +5802,13 @@ impl ZaivernApp {
             return;
         };
         let Some(enc) = crate::textenc::encoding_by_name(id) else {
-            self.toast(trf("この環境では使えない符号化です: {id}", &[("id", id.to_string())]), false);
+            self.toast(
+                trf(
+                    "この環境では使えない符号化です: {id}",
+                    &[("id", id.to_string())],
+                ),
+                false,
+            );
             return;
         };
         let Some(path) = self.editor.buffers[i].path.clone() else {
@@ -5784,7 +5866,13 @@ impl ZaivernApp {
             return;
         };
         let Some(enc) = crate::textenc::encoding_by_name(id) else {
-            self.toast(trf("この環境では使えない符号化です: {id}", &[("id", id.to_string())]), false);
+            self.toast(
+                trf(
+                    "この環境では使えない符号化です: {id}",
+                    &[("id", id.to_string())],
+                ),
+                false,
+            );
             return;
         };
         let Some(path) = self.editor.buffers[i].path.clone() else {
@@ -5812,9 +5900,10 @@ impl ZaivernApp {
                         true,
                     );
                 }
-                Err(e) => {
-                    self.toast(trf("保存に失敗しました: {e}", &[("e", e.to_string())]), false)
-                }
+                Err(e) => self.toast(
+                    trf("保存に失敗しました: {e}", &[("e", e.to_string())]),
+                    false,
+                ),
             },
             Err(issue) => {
                 // 保存できない文字へキャレットを移す。char 添字なのでそのまま渡せる。
@@ -5828,7 +5917,9 @@ impl ZaivernApp {
 
     /// 符号化ピッカーの小窓。**実測で使えるものだけ**を並べる。
     fn encoding_picker_ui(&mut self, ctx: &egui::Context) {
-        let Some(for_save) = self.enc_picker else { return };
+        let Some(for_save) = self.enc_picker else {
+            return;
+        };
         let theme = self.theme.clone();
         let mut open = true;
         let mut chosen: Option<String> = None;
@@ -5987,10 +6078,7 @@ impl ZaivernApp {
                     self.sidebar_tab = SidebarTab::Plugins;
                     self.toast(msg, true);
                 }
-                Err(e) => self.toast(
-                    trf("インストール失敗: {e}", &[("e", e.to_string())]),
-                    false,
-                ),
+                Err(e) => self.toast(trf("インストール失敗: {e}", &[("e", e.to_string())]), false),
             },
             DialogPurpose::SaveAs {
                 buffer_id,
@@ -6079,7 +6167,10 @@ impl ZaivernApp {
         self.menu_state.touch_folder(&dir);
         recent::save(&self.menu_state);
         self.toast(
-            trf("📂 {dir} を開きました", &[("dir", dir.display().to_string())]),
+            trf(
+                "📂 {dir} を開きました",
+                &[("dir", dir.display().to_string())],
+            ),
             true,
         );
     }
@@ -6109,9 +6200,13 @@ impl ZaivernApp {
                 .output()
                 .map_err(|e| e.to_string())?;
             if out.status.success() {
-                Ok(crate::textenc::decode_output(&out.stdout).trim().to_string())
+                Ok(crate::textenc::decode_output(&out.stdout)
+                    .trim()
+                    .to_string())
             } else {
-                Err(crate::textenc::decode_output(&out.stderr).trim().to_string())
+                Err(crate::textenc::decode_output(&out.stderr)
+                    .trim()
+                    .to_string())
             }
         };
         let repo = match git(&["rev-parse", "--show-toplevel"]) {
@@ -6159,7 +6254,10 @@ impl ZaivernApp {
             self.toast(
                 trf(
                     "🌿 worktree を作成しました: {dir} (ブランチ {branch})",
-                    &[("dir", dir.display().to_string()), ("branch", branch.clone())],
+                    &[
+                        ("dir", dir.display().to_string()),
+                        ("branch", branch.clone()),
+                    ],
                 ),
                 true,
             );
@@ -6207,7 +6305,10 @@ impl ZaivernApp {
             .map(|p| (p.icon.clone(), p.name.clone()))
             .collect();
         if pairs.len() != preset_indices.len() {
-            self.toast(tr("選択したプリセットが見つかりません (設定が変わりました)"), false);
+            self.toast(
+                tr("選択したプリセットが見つかりません (設定が変わりました)"),
+                false,
+            );
             return;
         }
         let mut race = match race::start_race(&root, prompt, &pairs) {
@@ -6263,13 +6364,17 @@ impl ZaivernApp {
     fn apply_race_actions(&mut self, acts: Vec<race::RaceAction>, ctx: &egui::Context) {
         for act in acts {
             match act {
-                race::RaceAction::Start { prompt, preset_indices } => {
+                race::RaceAction::Start {
+                    prompt,
+                    preset_indices,
+                } => {
                     self.start_race_flow(&prompt, &preset_indices, ctx);
                 }
                 race::RaceAction::Focus(idx) => {
-                    let pos = self.race.session_of(idx).and_then(|sid| {
-                        self.agents.sessions.iter().position(|s| s.id == sid)
-                    });
+                    let pos = self
+                        .race
+                        .session_of(idx)
+                        .and_then(|sid| self.agents.sessions.iter().position(|s| s.id == sid));
                     if let Some(pos) = pos {
                         self.agents.active = pos;
                         self.agents.panel_open = true;
@@ -6302,9 +6407,11 @@ impl ZaivernApp {
                 race::RaceAction::Discard { idx, force } => {
                     // 走行中/終了済みのセッションが残っていれば先にタブごと閉じる
                     // (Windows では生きたシェルが worktree を掴んで削除を妨げるため)
-                    if let Some(pos) = self.race.session_of(idx).and_then(|sid| {
-                        self.agents.sessions.iter().position(|s| s.id == sid)
-                    }) {
+                    if let Some(pos) = self
+                        .race
+                        .session_of(idx)
+                        .and_then(|sid| self.agents.sessions.iter().position(|s| s.id == sid))
+                    {
                         self.close_agent(pos);
                     }
                     match self.race.discard(idx, force) {
@@ -6373,10 +6480,9 @@ impl ZaivernApp {
             Cmd::ToggleFold | Cmd::FoldAll | Cmd::UnfoldAll | Cmd::FoldLevel(_) => {
                 self.apply_fold_cmd(&cmd)
             }
-            Cmd::ToggleBookmark
-            | Cmd::NextBookmark
-            | Cmd::PrevBookmark
-            | Cmd::ClearBookmarks => self.apply_bookmark_cmd(&cmd),
+            Cmd::ToggleBookmark | Cmd::NextBookmark | Cmd::PrevBookmark | Cmd::ClearBookmarks => {
+                self.apply_bookmark_cmd(&cmd)
+            }
             Cmd::ReopenClosedTab => self.reopen_closed_tab(),
             Cmd::ToggleTableView => self.toggle_table_view(),
             Cmd::LspCompletion => {
@@ -6558,9 +6664,7 @@ impl ZaivernApp {
             TableToggle::Build => {
                 self.editor.buffers[i].build_table();
             }
-            TableToggle::NotTable => {
-                self.toast_warn(tr("このファイルは CSV / TSV ではありません"))
-            }
+            TableToggle::NotTable => self.toast_warn(tr("このファイルは CSV / TSV ではありません")),
         }
     }
 
@@ -7010,9 +7114,12 @@ impl ZaivernApp {
         let mut files = 0usize;
         let mut failed: Vec<String> = Vec::new();
         for fe in &plan.files {
-            let idx = match self.editor.buffers.iter().position(|b| {
-                b.path.as_deref() == Some(fe.path.as_path())
-            }) {
+            let idx = match self
+                .editor
+                .buffers
+                .iter()
+                .position(|b| b.path.as_deref() == Some(fe.path.as_path()))
+            {
                 Some(i) => Some(i),
                 None => match self.editor.open(&fe.path, self.highlighter) {
                     Ok(_) => self.editor.active,
@@ -7045,10 +7152,7 @@ impl ZaivernApp {
         self.toast(
             trf(
                 "✏ {files} ファイル / {edits} 箇所を書き換えました (未保存)",
-                &[
-                    ("files", files.to_string()),
-                    ("edits", total.to_string()),
-                ],
+                &[("files", files.to_string()), ("edits", total.to_string())],
             ),
             true,
         );
@@ -7707,9 +7811,7 @@ impl ZaivernApp {
                             ui.label(RichText::new(&d.label).color(theme.text));
                             if !d.active_param.is_empty() {
                                 ui.label(
-                                    RichText::new(&d.active_param)
-                                        .strong()
-                                        .color(theme.accent),
+                                    RichText::new(&d.active_param).strong().color(theme.accent),
                                 );
                             }
                         });
@@ -7745,12 +7847,9 @@ impl ZaivernApp {
                     return;
                 }
                 ui.label(
-                    RichText::new(trf(
-                        "{n} 件",
-                        &[("n", total.to_string())],
-                    ))
-                    .color(theme.text_dim)
-                    .small(),
+                    RichText::new(trf("{n} 件", &[("n", total.to_string())]))
+                        .color(theme.text_dim)
+                        .small(),
                 );
                 egui::ScrollArea::vertical()
                     .max_height(REF_WINDOW_H)
@@ -7774,8 +7873,7 @@ impl ZaivernApp {
                                     .selectable_label(false, RichText::new(label).small())
                                     .clicked()
                                 {
-                                    jump =
-                                        Some((path.clone(), r.start.line, r.start.character));
+                                    jump = Some((path.clone(), r.start.line, r.start.character));
                                 }
                             }
                         }
@@ -7805,7 +7903,11 @@ impl ZaivernApp {
             .default_width(REF_WINDOW_W)
             .show(ctx, |ui| {
                 if busy {
-                    ui.label(RichText::new(tr("読み込み中…")).color(theme.text_dim).small());
+                    ui.label(
+                        RichText::new(tr("読み込み中…"))
+                            .color(theme.text_dim)
+                            .small(),
+                    );
                     return;
                 }
                 ui.text_edit_singleline(&mut query);
@@ -7955,7 +8057,10 @@ impl ZaivernApp {
                     .small(),
                 );
             }
-            if ui.button(RichText::new(tr("テキストとして表示")).small()).clicked() {
+            if ui
+                .button(RichText::new(tr("テキストとして表示")).small())
+                .clicked()
+            {
                 close = true;
             }
         });
@@ -7988,11 +8093,7 @@ impl ZaivernApp {
                         ui.end_row();
                         for row in &t.rows {
                             for n in 0..cols {
-                                ui.label(
-                                    RichText::new(cell(row, n))
-                                        .monospace()
-                                        .color(theme.text),
-                                );
+                                ui.label(RichText::new(cell(row, n)).monospace().color(theme.text));
                             }
                             ui.end_row();
                         }
@@ -8023,10 +8124,7 @@ impl ZaivernApp {
                 ui.label(
                     RichText::new(trf(
                         "⚠ 大きなファイル ({size} MB): {why}",
-                        &[
-                            ("size", format!("{mb:.1}")),
-                            ("why", why.join(" / ")),
-                        ],
+                        &[("size", format!("{mb:.1}")), ("why", why.join(" / "))],
                     ))
                     .color(theme.warn)
                     .small(),
@@ -8178,7 +8276,7 @@ impl ZaivernApp {
             | Cmd::ToggleShowWhitespace
             | Cmd::ToggleMinimap
             | Cmd::ToggleBreadcrumbs => self.apply_cmd_settings(cmd, ctx),
-            | Cmd::ToggleGitBlame => self.apply_cmd_settings(cmd, ctx),
+            Cmd::ToggleGitBlame => self.apply_cmd_settings(cmd, ctx),
             Cmd::VoiceInput(_)
             | Cmd::VoiceStop
             | Cmd::SetVoiceTarget(_)
@@ -8217,9 +8315,7 @@ impl ZaivernApp {
             | Cmd::ColumnSelectFinish
             | Cmd::ClearMultiCursor
             | Cmd::MultiPaste => self.apply_cmd_multi_cursor(cmd, ctx),
-            Cmd::ReopenWithEncoding(_) | Cmd::SaveWithEncoding(_) => {
-                self.apply_cmd_encoding(cmd)
-            }
+            Cmd::ReopenWithEncoding(_) | Cmd::SaveWithEncoding(_) => self.apply_cmd_encoding(cmd),
         }
     }
 
@@ -8386,9 +8482,7 @@ impl ZaivernApp {
                 self.gsearch.replace_open = true;
                 self.gsearch.focus = true;
             }
-            Cmd::ToggleSearchCase
-            | Cmd::ToggleSearchWholeWord
-            | Cmd::ToggleSearchRegex => {
+            Cmd::ToggleSearchCase | Cmd::ToggleSearchWholeWord | Cmd::ToggleSearchRegex => {
                 let (flag, on_label, off_label) = match cmd {
                     Cmd::ToggleSearchCase => (
                         &mut self.gsearch.case_sensitive,
@@ -8513,7 +8607,9 @@ impl ZaivernApp {
                         // このモニタでネイティブ全画面が壊れると学習済みなら最初から疑似で
                         let mon = ctx.input(|i| i.viewport().monitor_size);
                         let known_broken = mon.is_some_and(|m| {
-                            self.broken_native_fs.iter().any(|b| (*b - m).length() < 1.0)
+                            self.broken_native_fs
+                                .iter()
+                                .any(|b| (*b - m).length() < 1.0)
                         });
                         if known_broken {
                             self.enter_fake_fullscreen(ctx);
@@ -8639,7 +8735,10 @@ impl ZaivernApp {
             Ok(e) => e,
             Err(e) => {
                 self.toast(
-                    trf("実行ファイルの場所を取得できません: {err}", &[("err", e.to_string())]),
+                    trf(
+                        "実行ファイルの場所を取得できません: {err}",
+                        &[("err", e.to_string())],
+                    ),
                     false,
                 );
                 return;
@@ -8666,7 +8765,10 @@ impl ZaivernApp {
                 None => self.toast(tr("🪟 新しいウィンドウを開きました"), true),
             },
             Err(e) => self.toast(
-                trf("新しいウィンドウを開けません: {err}", &[("err", e.to_string())]),
+                trf(
+                    "新しいウィンドウを開けません: {err}",
+                    &[("err", e.to_string())],
+                ),
                 false,
             ),
         }
@@ -8739,8 +8841,7 @@ impl ZaivernApp {
                     .active
                     .map(|i| {
                         let b = &self.editor.buffers[i];
-                        markdown::is_markdown(&b.title, &b.lang)
-                            || html::is_html(&b.title, &b.lang)
+                        markdown::is_markdown(&b.title, &b.lang) || html::is_html(&b.title, &b.lang)
                     })
                     .unwrap_or(false);
                 if ok {
@@ -8802,7 +8903,10 @@ impl ZaivernApp {
                 }
                 config::save_state(&self.cfg);
                 self.toast(
-                    trf("🎨 {label} を適用しました", &[("label", self.theme.label.clone())]),
+                    trf(
+                        "🎨 {label} を適用しました",
+                        &[("label", self.theme.label.clone())],
+                    ),
                     true,
                 );
             }
@@ -8883,7 +8987,10 @@ impl ZaivernApp {
                     ),
                 }
                 if self.agents.running_count() > 0 {
-                    self.toast(tr("実行中のセッションは各行の 🛡 ボタン（または 🛡 全切替）で切替できます"), true);
+                    self.toast(
+                        tr("実行中のセッションは各行の 🛡 ボタン（または 🛡 全切替）で切替できます"),
+                        true,
+                    );
                 }
             }
             Cmd::ToggleWordWrap => {
@@ -9103,7 +9210,10 @@ impl ZaivernApp {
                 self.cfg.voice_lang = l;
                 config::save_state(&self.cfg);
                 self.toast(
-                    trf("🎤 認識言語: {lang}", &[("lang", self.cfg.voice_lang.clone())]),
+                    trf(
+                        "🎤 認識言語: {lang}",
+                        &[("lang", self.cfg.voice_lang.clone())],
+                    ),
                     true,
                 );
             }
@@ -9130,8 +9240,7 @@ impl ZaivernApp {
             Cmd::InstallPlugin => {
                 self.ask_dialog(
                     DialogPurpose::InstallPlugin,
-                    DialogSpec::pick_file()
-                        .filter(tr("Zaivern プラグイン"), &["zvplug", "zip"]),
+                    DialogSpec::pick_file().filter(tr("Zaivern プラグイン"), &["zvplug", "zip"]),
                     ctx,
                 );
             }
@@ -9207,8 +9316,7 @@ impl ZaivernApp {
         // 「最後に動いてから N ms」で遷移が本当に終わったかを判定できる。
         let rect_moved = match (inner, self.fs_last_rect) {
             (Some(now), Some(prev)) => {
-                (now.min - prev.min).length() > 1.0
-                    || (now.size() - prev.size()).length() > 1.0
+                (now.min - prev.min).length() > 1.0 || (now.size() - prev.size()).length() > 1.0
             }
             (now, prev) => now.is_some() != prev.is_some(),
         };
@@ -9244,7 +9352,11 @@ impl ZaivernApp {
                 self.fs_rescue_from = inner;
                 self.fs_rescue_at = Some(Instant::now());
                 if let Some(m) = mon {
-                    if !self.broken_native_fs.iter().any(|b| (*b - m).length() < 1.0) {
+                    if !self
+                        .broken_native_fs
+                        .iter()
+                        .any(|b| (*b - m).length() < 1.0)
+                    {
                         self.broken_native_fs.push(m);
                     }
                 }
@@ -9287,7 +9399,10 @@ impl ZaivernApp {
                 } else if !moved {
                     // 解除コマンドが取りこぼされて実体が全画面のまま固まったら、
                     // これ以上は触らず諦める (この状態で styleMask を触ると落ちる)。
-                    if self.fs_rescue_at.is_some_and(|at| at.elapsed().as_secs() >= 6) {
+                    if self
+                        .fs_rescue_at
+                        .is_some_and(|at| at.elapsed().as_secs() >= 6)
+                    {
                         eprintln!(
                             "zaivern: fullscreen exit seems lost — giving up rescue \
                              (use the green button / Mission Control to leave fullscreen)"
@@ -9310,8 +9425,7 @@ impl ZaivernApp {
         let restore = if let Some((pos, size, _)) = self.fake_fs_restore.take() {
             (pos, size)
         } else {
-            let (outer, inner) =
-                ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+            let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
             match (outer, inner) {
                 (Some(o), Some(inn)) => (o.min, inn.size()),
                 _ => (egui::pos2(80.0, 80.0), egui::vec2(1280.0, 860.0)),
@@ -9483,7 +9597,10 @@ impl ZaivernApp {
             cmds.push(Cmd::NewFile);
         }
         if consume(ctx, self.keys.get(BindAction::ToggleTerminal))
-            || consume(ctx, KeyboardShortcut::new(Modifiers::COMMAND, Key::Backtick))
+            || consume(
+                ctx,
+                KeyboardShortcut::new(Modifiers::COMMAND, Key::Backtick),
+            )
         {
             cmds.push(Cmd::ToggleTerminal);
         }
@@ -9851,10 +9968,7 @@ impl ZaivernApp {
             ui.label(RichText::new(s).color(theme.text_dim).size(10.5));
         };
         if let Some(what) = &snap.in_progress {
-            note(
-                ui,
-                trf("{what}の途中です", &[("what", what.clone())]),
-            );
+            note(ui, trf("{what}の途中です", &[("what", what.clone())]));
         } else if snap.dirty_total > 0 {
             note(
                 ui,
@@ -10050,12 +10164,7 @@ impl ZaivernApp {
     }
 
     /// トップバー: 📱 スマホリモートと 🎤 音声入力まわり。
-    fn top_bar_remote_and_voice(
-        &self,
-        ui: &mut egui::Ui,
-        theme: &Theme,
-        cmds: &mut Vec<Cmd>,
-    ) {
+    fn top_bar_remote_and_voice(&self, ui: &mut egui::Ui, theme: &Theme, cmds: &mut Vec<Cmd>) {
         // スマホリモート (QR コード表示)。
         // Windows で受信が許可されていないと分かっているときは ⚠ を添える
         // (📱 を開かないと理由が分からない、という状態を作らないため)
@@ -10075,16 +10184,16 @@ impl ZaivernApp {
         tutorial::anchor(ui.ctx(), AnchorId::RemoteButton, remote_btn.rect);
         if remote_btn
             .on_hover_text(if blocked {
-                tr("⚠ Windows のファイアウォールが受信をブロックしています\n\u{3000}\
-                    押して開く画面のボタンで許可できます (それまでスマホからは繋がりません)")
-            } else {
                 tr(
-                    "スマホから操作 — QR コードを表示\n\
+                    "⚠ Windows のファイアウォールが受信をブロックしています\n\u{3000}\
+                    押して開く画面のボタンで許可できます (それまでスマホからは繋がりません)",
+                )
+            } else {
+                tr("スマホから操作 — QR コードを表示\n\
                      同じ Wi-Fi のスマホで読み取るだけで、編集・保存・\n\
                      エージェント操作(Claude の承認も)ができます\n\
                      🎤 音声入力: PC は Cockpit 各タブの 🎤 /\n\
-                     ブロードキャスト欄の 🎤、スマホは「エージェント」タブ",
-                )
+                     ブロードキャスト欄の 🎤、スマホは「エージェント」タブ")
             })
             .clicked()
         {
@@ -10104,8 +10213,11 @@ impl ZaivernApp {
         }
         let voice_btn = ui.selectable_label(
             rec,
-            RichText::new(if rec { "🔴" } else { "🎤" })
-                .color(if rec { theme.err } else { theme.text }),
+            RichText::new(if rec { "🔴" } else { "🎤" }).color(if rec {
+                theme.err
+            } else {
+                theme.text
+            }),
         );
         tutorial::anchor(ui.ctx(), AnchorId::VoiceButton, voice_btn.rect);
         if voice_btn
@@ -10137,10 +10249,8 @@ impl ZaivernApp {
         }
         ui.menu_button("▾", |ui| {
             ui.label(
-                RichText::new(tr(
-                    "話した内容は入力欄に入るだけです。\n\
-                     送信されるのは自分で Enter を押したときだけ。",
-                ))
+                RichText::new(tr("話した内容は入力欄に入るだけです。\n\
+                     送信されるのは自分で Enter を押したときだけ。"))
                 .size(11.0)
                 .color(theme.text_dim),
             );
@@ -10167,7 +10277,10 @@ impl ZaivernApp {
             ui.label(RichText::new(tr("届け先")).size(11.0).color(theme.text_dim));
             for (t, label) in [
                 (voice::Target::Active, "🎯 アクティブなエージェント"),
-                (voice::Target::Broadcast, "📣 全エージェントへブロードキャスト"),
+                (
+                    voice::Target::Broadcast,
+                    "📣 全エージェントへブロードキャスト",
+                ),
             ] {
                 if ui.radio(cur == t, tr(label)).clicked() {
                     cmds.push(Cmd::SetVoiceTarget(t));
@@ -10177,18 +10290,19 @@ impl ZaivernApp {
             ui.menu_button(
                 trf("🌐 言語: {lang}", &[("lang", self.cfg.voice_lang.clone())]),
                 |ui| {
-                for (code, label) in [
-                    ("ja-JP", "日本語"),
-                    ("en-US", "English (US)"),
-                    ("zh-CN", "中文"),
-                    ("ko-KR", "한국어"),
-                ] {
-                    if ui.radio(self.cfg.voice_lang == code, label).clicked() {
-                        cmds.push(Cmd::SetVoiceLang(code.to_string()));
-                        ui.close_menu();
+                    for (code, label) in [
+                        ("ja-JP", "日本語"),
+                        ("en-US", "English (US)"),
+                        ("zh-CN", "中文"),
+                        ("ko-KR", "한국어"),
+                    ] {
+                        if ui.radio(self.cfg.voice_lang == code, label).clicked() {
+                            cmds.push(Cmd::SetVoiceLang(code.to_string()));
+                            ui.close_menu();
+                        }
                     }
-                }
-            });
+                },
+            );
             ui.menu_button(
                 if self.cfg.voice_keyword.is_empty() {
                     tr("🗣 合図で送信: なし (常に手動 Enter)")
@@ -10200,16 +10314,17 @@ impl ZaivernApp {
                 },
                 |ui| {
                     ui.label(
-                        RichText::new(tr(
-                            "この言葉で終わったときだけ Enter まで送ります",
-                        ))
-                        .size(11.0)
-                        .color(theme.text_dim),
+                        RichText::new(tr("この言葉で終わったときだけ Enter まで送ります"))
+                            .size(11.0)
+                            .color(theme.text_dim),
                     );
                     for kw in ["", "送信", "送って", "オーケー"] {
                         let sel = self.cfg.voice_keyword == kw;
-                        let label =
-                            if kw.is_empty() { tr("なし") } else { kw.to_string() };
+                        let label = if kw.is_empty() {
+                            tr("なし")
+                        } else {
+                            kw.to_string()
+                        };
                         if ui.radio(sel, label).clicked() {
                             cmds.push(Cmd::SetVoiceKeyword(kw.to_string()));
                             ui.close_menu();
@@ -10241,11 +10356,9 @@ impl ZaivernApp {
             );
         })
         .response
-        .on_hover_text(tr(
-            "音声入力 — キーを押している間だけ録音し、\n\
+        .on_hover_text(tr("音声入力 — キーを押している間だけ録音し、\n\
              認識テキストをエージェントの入力欄へ挿入します。\n\
-             Enter は送られないので、確認してから自分で送信できます。",
-        ));
+             Enter は送られないので、確認してから自分で送信できます。"));
     }
 
     /// トップバー: 🐾 ペットメニュー (表示切替・画像変更)。
@@ -10256,7 +10369,11 @@ impl ZaivernApp {
             if ui
                 .selectable_label(
                     show,
-                    if show { tr("🐾 表示中") } else { tr("🐾 非表示") },
+                    if show {
+                        tr("🐾 表示中")
+                    } else {
+                        tr("🐾 非表示")
+                    },
                 )
                 .clicked()
             {
@@ -10285,7 +10402,10 @@ impl ZaivernApp {
                     (pet::PetVariant::Cat, "🐱 ネコ"),
                     (pet::PetVariant::Cloud, "☁ クラウド"),
                 ] {
-                    if ui.radio(self.cfg.pet_variant == v.name(), tr(label)).clicked() {
+                    if ui
+                        .radio(self.cfg.pet_variant == v.name(), tr(label))
+                        .clicked()
+                    {
                         cmds.push(Cmd::SetPetVariant(v.name().to_string()));
                         ui.close_menu();
                     }
@@ -10364,16 +10484,24 @@ impl ZaivernApp {
         let mode = self.cfg.approval_mode.as_str();
         let (ap_label, next_mode, highlight) = match mode {
             "auto" => (
-                RichText::new(tr("⚡ 既定:全自動")).color(theme.warn).strong(),
+                RichText::new(tr("⚡ 既定:全自動"))
+                    .color(theme.warn)
+                    .strong(),
                 "agent",
                 true,
             ),
             "agent" => (
-                RichText::new(tr("👾 既定:Agent優先")).color(theme.ok).strong(),
+                RichText::new(tr("👾 既定:Agent優先"))
+                    .color(theme.ok)
+                    .strong(),
                 "ask",
                 true,
             ),
-            _ => (RichText::new(tr("🛡 既定:承認")).color(theme.ok), "auto", false),
+            _ => (
+                RichText::new(tr("🛡 既定:承認")).color(theme.ok),
+                "auto",
+                false,
+            ),
         };
         if density != TopBarDensity::Overflow {
             // 狭いときは絵文字だけ残す (色と絵文字でモードは判別できる)
@@ -10470,9 +10598,7 @@ impl ZaivernApp {
             // エージェントと同じ場所から呼び出せる「指揮統制の看板」。
             if ui
                 .button(tr("📋 フリート看板 — 全員の状況を俯瞰"))
-                .on_hover_text(tr(
-                    "エージェントをカンバン方式で指揮統制する画面を開く",
-                ))
+                .on_hover_text(tr("エージェントをカンバン方式で指揮統制する画面を開く"))
                 .clicked()
             {
                 cmds.push(Cmd::ToggleKanban);
@@ -10488,12 +10614,10 @@ impl ZaivernApp {
             }
         });
         tutorial::anchor(ui.ctx(), AnchorId::NewAgentButton, new_agent.response.rect);
-        new_agent
-            .response
-            .on_hover_text(trf(
-                "エージェントを起動 ({key})",
-                &[("key", self.key_hint(BindAction::NewAgent))],
-            ));
+        new_agent.response.on_hover_text(trf(
+            "エージェントを起動 ({key})",
+            &[("key", self.key_hint(BindAction::NewAgent))],
+        ));
 
         if ui
             .button("🔍")
@@ -10541,20 +10665,19 @@ impl ZaivernApp {
         let mut open_approvals = false;
         // Pro の解錠判定は license::is_pro **1 か所だけ**を通す。
         // 未ライセンス時は 1 ピクセルも出さない (常に何かを表示するバッジは作らない)。
-        let pro_badge = license::is_pro(&self.license_status).then(|| {
-            match &self.license_status {
-                license::LicenseStatus::Valid { sub, exp, .. } => trf(
-                    "Pro ライセンス — {sub} ・ 期限 {exp}",
-                    &[
-                        ("sub", sub.clone()),
-                        (
-                            "exp",
-                            exp.map(license::format_unix_date).unwrap_or_else(|| tr("無期限")),
-                        ),
-                    ],
-                ),
-                _ => tr("Pro ライセンス"),
-            }
+        let pro_badge = license::is_pro(&self.license_status).then(|| match &self.license_status {
+            license::LicenseStatus::Valid { sub, exp, .. } => trf(
+                "Pro ライセンス — {sub} ・ 期限 {exp}",
+                &[
+                    ("sub", sub.clone()),
+                    (
+                        "exp",
+                        exp.map(license::format_unix_date)
+                            .unwrap_or_else(|| tr("無期限")),
+                    ),
+                ],
+            ),
+            _ => tr("Pro ライセンス"),
         });
 
         let bar = egui::TopBottomPanel::bottom("zv-status")
@@ -10649,21 +10772,28 @@ impl ZaivernApp {
                             // 押すと改行コードの変換メニューが出る (VS Code と同じ位置)。
                             if let Some(label) = &fmt_label {
                                 let enc = self.editor.buffers[i].encoding;
-                                let color = if enc.is_legacy() { theme.warn } else { theme.text_dim };
-                                ui.menu_button(RichText::new(label.clone()).size(11.5).color(color), |ui| {
-                                    ui.set_min_width(200.0);
-                                    ui.label(RichText::new(tr("改行コードを変換")).strong());
-                                    for (le, name) in [
-                                        (crate::textenc::LineEnding::Lf, "LF (Unix)"),
-                                        (crate::textenc::LineEnding::Crlf, "CRLF (Windows)"),
-                                        (crate::textenc::LineEnding::Cr, "CR (旧 Mac)"),
-                                    ] {
-                                        if ui.button(tr(name)).clicked() {
-                                            convert_eol = Some(le);
-                                            ui.close_menu();
+                                let color = if enc.is_legacy() {
+                                    theme.warn
+                                } else {
+                                    theme.text_dim
+                                };
+                                ui.menu_button(
+                                    RichText::new(label.clone()).size(11.5).color(color),
+                                    |ui| {
+                                        ui.set_min_width(200.0);
+                                        ui.label(RichText::new(tr("改行コードを変換")).strong());
+                                        for (le, name) in [
+                                            (crate::textenc::LineEnding::Lf, "LF (Unix)"),
+                                            (crate::textenc::LineEnding::Crlf, "CRLF (Windows)"),
+                                            (crate::textenc::LineEnding::Cr, "CR (旧 Mac)"),
+                                        ] {
+                                            if ui.button(tr(name)).clicked() {
+                                                convert_eol = Some(le);
+                                                ui.close_menu();
+                                            }
                                         }
-                                    }
-                                })
+                                    },
+                                )
                                 .response
                                 .on_hover_text(tr(
                                     "この文字コード・改行コードのまま保存します\n\u{3000}\
@@ -10675,25 +10805,29 @@ impl ZaivernApp {
                         let (derr, dwarn) = self.diag_counts;
                         if derr > 0 {
                             ui.label(
-                                RichText::new(format!("⛔ {derr}")).size(11.5).color(theme.err),
+                                RichText::new(format!("⛔ {derr}"))
+                                    .size(11.5)
+                                    .color(theme.err),
                             );
                         }
                         if dwarn > 0 {
                             ui.label(
-                                RichText::new(format!("⚠ {dwarn}")).size(11.5).color(theme.warn),
+                                RichText::new(format!("⚠ {dwarn}"))
+                                    .size(11.5)
+                                    .color(theme.warn),
                             );
                         }
                         // プラン使用量 (最も深刻な助言の色。押すと明細)
                         if let Some(sev) = quota_sev {
                             let r = ui.add(
                                 egui::Label::new(
-                                    RichText::new(quota_severity_icon(sev))
-                                        .size(11.5)
-                                        .color(match sev {
+                                    RichText::new(quota_severity_icon(sev)).size(11.5).color(
+                                        match sev {
                                             0 => theme.text_dim,
                                             1 => theme.warn,
                                             _ => theme.err,
-                                        }),
+                                        },
+                                    ),
                                 )
                                 .sense(egui::Sense::click()),
                             );
@@ -10882,97 +11016,99 @@ impl ZaivernApp {
                 ui.separator();
 
                 let body = ui.scope(|ui| {
-                match self.sidebar_tab {
-                    SidebarTab::Files => {
-                        self.sidebar_files_ui(
-                            ui,
-                            &theme,
-                            &mut actions,
-                            &mut refresh,
-                            &mut nf_root,
-                            &mut nd_root,
-                        );
-                    }
-                    SidebarTab::Search => {
-                        self.sidebar_search_ui(
-                            ui,
-                            &theme,
-                            &mut gsearch_go,
-                            &mut gsearch_jump,
-                            &mut gsearch_replace,
-                        );
-                    }
-                    SidebarTab::Agents => {
-                        self.sidebar_agents_ui(
-                            ui,
-                            &theme,
-                            &mut launch,
-                            &mut focus,
-                            &mut restart,
-                            &mut remove,
-                            &mut cycle,
-                        );
-                    }
-                    SidebarTab::Sessions => {
-                        // フォルダ一覧は is_dir() を叩くので、元が変わった時だけ作り直す
-                        sess_action = self.sidebar_sessions_ui(ui, &theme);
-                    }
-                    SidebarTab::Plugins => {
-                        self.sidebar_plugins_ui(
-                            ui,
-                            &theme,
-                            &panel_texts,
-                            &mut md_images,
-                            &mut pl,
-                        );
-                    }
-                    SidebarTab::Git => {
-                        // サブタブ: 「変更」(従来の Git パネル) と
-                        // 「変更をレビュー」(PR 風のローカルレビュー)。
-                        // レビューは左に変更ファイル・右に diff の 2 ペインなので
-                        // サイドバーを広げて使う想定 (幅はユーザーが決める)。
-                        ui.horizontal(|ui| {
-                            for (on_review, label) in
-                                [(false, tr("変更")), (true, tr("変更をレビュー"))]
-                            {
-                                let sel = self.git_sub_review == on_review;
-                                if ui.selectable_label(sel, RichText::new(label).small()).clicked()
+                    match self.sidebar_tab {
+                        SidebarTab::Files => {
+                            self.sidebar_files_ui(
+                                ui,
+                                &theme,
+                                &mut actions,
+                                &mut refresh,
+                                &mut nf_root,
+                                &mut nd_root,
+                            );
+                        }
+                        SidebarTab::Search => {
+                            self.sidebar_search_ui(
+                                ui,
+                                &theme,
+                                &mut gsearch_go,
+                                &mut gsearch_jump,
+                                &mut gsearch_replace,
+                            );
+                        }
+                        SidebarTab::Agents => {
+                            self.sidebar_agents_ui(
+                                ui,
+                                &theme,
+                                &mut launch,
+                                &mut focus,
+                                &mut restart,
+                                &mut remove,
+                                &mut cycle,
+                            );
+                        }
+                        SidebarTab::Sessions => {
+                            // フォルダ一覧は is_dir() を叩くので、元が変わった時だけ作り直す
+                            sess_action = self.sidebar_sessions_ui(ui, &theme);
+                        }
+                        SidebarTab::Plugins => {
+                            self.sidebar_plugins_ui(
+                                ui,
+                                &theme,
+                                &panel_texts,
+                                &mut md_images,
+                                &mut pl,
+                            );
+                        }
+                        SidebarTab::Git => {
+                            // サブタブ: 「変更」(従来の Git パネル) と
+                            // 「変更をレビュー」(PR 風のローカルレビュー)。
+                            // レビューは左に変更ファイル・右に diff の 2 ペインなので
+                            // サイドバーを広げて使う想定 (幅はユーザーが決める)。
+                            ui.horizontal(|ui| {
+                                for (on_review, label) in
+                                    [(false, tr("変更")), (true, tr("変更をレビュー"))]
                                 {
-                                    self.git_sub_review = on_review;
-                                }
-                            }
-                        });
-                        ui.separator();
-                        // both: 長いパス名でサイドバーが横に突き破るのを防ぐ
-                        // (sidebar_files_ui の zv-tree と同じ理由)
-                        egui::ScrollArea::both()
-                            .id_salt("zv-git")
-                            .auto_shrink(false)
-                            .show(ui, |ui| {
-                                if self.git_sub_review {
-                                    self.review.ui(ui, &theme, &mut git_actions);
-                                } else {
-                                    self.git_panel.ui(ui, &theme, &mut git_actions);
+                                    let sel = self.git_sub_review == on_review;
+                                    if ui
+                                        .selectable_label(sel, RichText::new(label).small())
+                                        .clicked()
+                                    {
+                                        self.git_sub_review = on_review;
+                                    }
                                 }
                             });
+                            ui.separator();
+                            // both: 長いパス名でサイドバーが横に突き破るのを防ぐ
+                            // (sidebar_files_ui の zv-tree と同じ理由)
+                            egui::ScrollArea::both()
+                                .id_salt("zv-git")
+                                .auto_shrink(false)
+                                .show(ui, |ui| {
+                                    if self.git_sub_review {
+                                        self.review.ui(ui, &theme, &mut git_actions);
+                                    } else {
+                                        self.git_panel.ui(ui, &theme, &mut git_actions);
+                                    }
+                                });
+                        }
+                        SidebarTab::GitHub => {
+                            // both: 長い PR/Issue タイトルでの横突き破り防止 (zv-tree と同じ理由)
+                            egui::ScrollArea::both()
+                                .id_salt("zv-github")
+                                .auto_shrink(false)
+                                .show(ui, |ui| {
+                                    panels::github_ui(
+                                        ui,
+                                        &theme,
+                                        &mut self.github,
+                                        &gh_roots,
+                                        &gh_presets,
+                                        &mut gh_actions,
+                                    );
+                                });
+                        }
                     }
-                    SidebarTab::GitHub => {
-                        // both: 長い PR/Issue タイトルでの横突き破り防止 (zv-tree と同じ理由)
-                        egui::ScrollArea::both()
-                            .id_salt("zv-github")
-                            .auto_shrink(false)
-                            .show(ui, |ui| {
-                                panels::github_ui(
-                                    ui,
-                                    &theme,
-                                    &mut self.github,
-                                    &gh_roots,
-                                    &gh_presets,
-                                    &mut gh_actions,
-                                );
-                            });
-                    }
-                }
                 });
                 // ガイドツアーのアンカー: 「いま見えているタブ」だけ申告する。
                 // タブ本体が細いとき (空の一覧) でも押す場所が分かるよう、
@@ -11032,10 +11168,7 @@ impl ZaivernApp {
             self.cfg.plugins.set_enabled(&name, enabled);
             self.cfg.global_plugins.set_enabled(&name, enabled);
             if let Err(e) = config::save_plugins_section(&self.cfg) {
-                self.toast(
-                    trf("設定の保存に失敗: {e}", &[("e", e)]),
-                    false,
-                );
+                self.toast(trf("設定の保存に失敗: {e}", &[("e", e)]), false);
             }
             self.rebuild_plugins();
             let verb = tr(if enabled { "有効" } else { "無効" });
@@ -11103,10 +11236,7 @@ impl ZaivernApp {
         }
         if let Some(pi) = pl.export {
             let root = self.primary_root().to_path_buf();
-            let res = self
-                .plugins
-                .get(pi)
-                .map(|p| plugins::export(p, &root));
+            let res = self.plugins.get(pi).map(|p| plugins::export(p, &root));
             match res {
                 Some(Ok(path)) => self.toast(
                     trf(
@@ -11115,10 +11245,9 @@ impl ZaivernApp {
                     ),
                     true,
                 ),
-                Some(Err(e)) => self.toast(
-                    trf("エクスポート失敗: {e}", &[("e", e.to_string())]),
-                    false,
-                ),
+                Some(Err(e)) => {
+                    self.toast(trf("エクスポート失敗: {e}", &[("e", e.to_string())]), false)
+                }
                 None => {}
             }
         }
@@ -11170,20 +11299,17 @@ impl ZaivernApp {
     ) {
         ui.horizontal(|ui| {
             ui.label(RichText::new(roots_label(&self.roots)).strong());
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    if ui.button("⟳").on_hover_text(tr("再読み込み")).clicked() {
-                        *refresh = true;
-                    }
-                    if ui.button("📂").on_hover_text(tr("新規フォルダ")).clicked() {
-                        *nd_root = true;
-                    }
-                    if ui.button("➕").on_hover_text(tr("新規ファイル")).clicked() {
-                        *nf_root = true;
-                    }
-                },
-            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("⟳").on_hover_text(tr("再読み込み")).clicked() {
+                    *refresh = true;
+                }
+                if ui.button("📂").on_hover_text(tr("新規フォルダ")).clicked() {
+                    *nd_root = true;
+                }
+                if ui.button("➕").on_hover_text(tr("新規ファイル")).clicked() {
+                    *nf_root = true;
+                }
+            });
         });
         // 横スクロールも許可する: 長いファイル名 (Windows のホームにある
         // NTUSER.DAT{...}.regtrans-ms 等) が縦専用スクロールだと収まらず、
@@ -11271,83 +11397,77 @@ impl ZaivernApp {
                             .id_salt(("agent-row", i))
                             .sense(egui::Sense::click()),
                         |ui| {
-                    frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let dot = if s.running() {
-                                if s.attention {
-                                    RichText::new("●").color(theme.warn)
-                                } else {
-                                    RichText::new("●").color(theme.ok)
-                                }
-                            } else {
-                                RichText::new("○").color(theme.err)
-                            };
-                            ui.label(dot);
-                            let badge = if s.is_permission_agent() {
-                                s.approval_badge()
-                            } else {
-                                ""
-                            };
-                            let permission_hint = s.permission_switch_hint();
-                            // 選択可能ラベルはクリックを吸ってしまい
-                            // 行クリック (フォーカス) が効かなくなるので、
-                            // タイトルは文字選択を切ってクリックを行へ通す
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(format!(
-                                        "{}{} {}",
-                                        badge, s.icon, s.title
-                                    ))
-                                    .color(theme.text),
-                                )
-                                .selectable(false),
-                            );
-                            if s.has_unread() && !active {
-                                ui.label(
-                                    RichText::new("◆")
-                                        .size(9.0)
-                                        .color(theme.accent),
-                                )
-                                .on_hover_text(tr(
-                                    "最後に見てから新しい出力があります",
-                                ));
-                            }
-                            if let Some(line) = &s.rate_limited {
-                                ui.label(
-                                    RichText::new("⏳").color(theme.warn),
-                                )
-                                .on_hover_text(trf(
-                                    "レート制限/使用上限: {line}",
-                                    &[("line", line.clone())],
-                                ));
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("✕").clicked() {
-                                        *remove = Some(i);
-                                    }
-                                    if ui.small_button("⟳").clicked() {
-                                        *restart = Some(i);
-                                    }
-                                    if let Some(hint) = permission_hint {
-                                        if ui
-                                            .small_button("🛡")
-                                            .on_hover_text(hint)
-                                            .clicked()
-                                        {
-                                            *cycle = Some(i);
+                            frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let dot = if s.running() {
+                                        if s.attention {
+                                            RichText::new("●").color(theme.warn)
+                                        } else {
+                                            RichText::new("●").color(theme.ok)
                                         }
-                                    }
-                                    ui.label(
-                                        RichText::new(s.uptime())
-                                            .size(10.5)
-                                            .color(theme.text_dim),
+                                    } else {
+                                        RichText::new("○").color(theme.err)
+                                    };
+                                    ui.label(dot);
+                                    let badge = if s.is_permission_agent() {
+                                        s.approval_badge()
+                                    } else {
+                                        ""
+                                    };
+                                    let permission_hint = s.permission_switch_hint();
+                                    // 選択可能ラベルはクリックを吸ってしまい
+                                    // 行クリック (フォーカス) が効かなくなるので、
+                                    // タイトルは文字選択を切ってクリックを行へ通す
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!(
+                                                "{}{} {}",
+                                                badge, s.icon, s.title
+                                            ))
+                                            .color(theme.text),
+                                        )
+                                        .selectable(false),
                                     );
-                                },
-                            );
-                        });
-                    });
+                                    if s.has_unread() && !active {
+                                        ui.label(RichText::new("◆").size(9.0).color(theme.accent))
+                                            .on_hover_text(tr(
+                                                "最後に見てから新しい出力があります",
+                                            ));
+                                    }
+                                    if let Some(line) = &s.rate_limited {
+                                        ui.label(RichText::new("⏳").color(theme.warn))
+                                            .on_hover_text(trf(
+                                                "レート制限/使用上限: {line}",
+                                                &[("line", line.clone())],
+                                            ));
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("✕").clicked() {
+                                                *remove = Some(i);
+                                            }
+                                            if ui.small_button("⟳").clicked() {
+                                                *restart = Some(i);
+                                            }
+                                            if let Some(hint) = permission_hint {
+                                                if ui
+                                                    .small_button("🛡")
+                                                    .on_hover_text(hint)
+                                                    .clicked()
+                                                {
+                                                    *cycle = Some(i);
+                                                }
+                                            }
+                                            ui.label(
+                                                RichText::new(s.uptime())
+                                                    .size(10.5)
+                                                    .color(theme.text_dim),
+                                            );
+                                        },
+                                    );
+                                });
+                            });
                         },
                     );
                     let resp = fr.response;
@@ -11355,10 +11475,7 @@ impl ZaivernApp {
                         *focus = Some(i);
                     }
                     resp.context_menu(|ui| {
-                        if !s.has_unread()
-                            && ui
-                                .button(tr("📩 あとで見る (未読にする)"))
-                                .clicked()
+                        if !s.has_unread() && ui.button(tr("📩 あとで見る (未読にする)")).clicked()
                         {
                             set_unread = Some(i);
                             ui.close_menu();
@@ -11409,10 +11526,8 @@ impl ZaivernApp {
             .show(ui, |ui| {
                 if self.plugins.is_empty() {
                     ui.label(
-                        RichText::new(tr(
-                            "プラグインがありません。➕ から自作できます",
-                        ))
-                        .color(theme.text_dim),
+                        RichText::new(tr("プラグインがありません。➕ から自作できます"))
+                            .color(theme.text_dim),
                     );
                 }
                 for (pi, p) in self.plugins.iter().enumerate() {
@@ -11444,9 +11559,7 @@ impl ZaivernApp {
                             }
                             if !p.enabled {
                                 ui.label(
-                                    RichText::new(tr("(無効)"))
-                                        .size(10.5)
-                                        .color(theme.text_dim),
+                                    RichText::new(tr("(無効)")).size(10.5).color(theme.text_dim),
                                 );
                                 return;
                             }
@@ -11475,8 +11588,7 @@ impl ZaivernApp {
                                 .color(theme.text_dim),
                             );
                             for (ci, c) in p.commands.iter().enumerate() {
-                                let btn = ui
-                                    .small_button(format!("{} {}", c.icon, c.title));
+                                let btn = ui.small_button(format!("{} {}", c.icon, c.title));
                                 let btn = match &c.keybind {
                                     Some(k) => btn.on_hover_text(k),
                                     None => btn,
@@ -11486,21 +11598,14 @@ impl ZaivernApp {
                                 }
                             }
                             for (label, path) in &p.themes {
-                                if ui
-                                    .small_button(format!("🎨 {label}"))
-                                    .clicked()
-                                {
-                                    pl.theme = Some(
-                                        path.to_string_lossy().to_string(),
-                                    );
+                                if ui.small_button(format!("🎨 {label}")).clicked() {
+                                    pl.theme = Some(path.to_string_lossy().to_string());
                                 }
                             }
 
                             self.plugin_settings_ui(ui, theme, pl, pi, p);
 
-                            self.plugin_panels_ui(
-                                ui, theme, panel_texts, md_images, pl, p,
-                            );
+                            self.plugin_panels_ui(ui, theme, panel_texts, md_images, pl, p);
                         });
                     ui.add_space(4.0);
                 }
@@ -11509,12 +11614,7 @@ impl ZaivernApp {
 
     /// サイドバー: プラグインタブ上部のツールバー (新規/インストール/再スキャン) と
     /// 説明行。ボタンは PluginActions に記録するだけ。
-    fn sidebar_plugins_toolbar_ui(
-        &self,
-        ui: &mut egui::Ui,
-        theme: &Theme,
-        pl: &mut PluginActions,
-    ) {
+    fn sidebar_plugins_toolbar_ui(&self, ui: &mut egui::Ui, theme: &Theme, pl: &mut PluginActions) {
         ui.horizontal(|ui| {
             if ui
                 .button(tr("➕ 新規作成"))
@@ -11554,11 +11654,7 @@ impl ZaivernApp {
         p: &plugins::Plugin,
     ) {
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(&p.name)
-                    .strong()
-                    .color(theme.text),
-            );
+            ui.label(RichText::new(&p.name).strong().color(theme.text));
             ui.label(
                 RichText::new(format!("v{}", p.version))
                     .size(10.5)
@@ -11569,40 +11665,30 @@ impl ZaivernApp {
                     .size(10.0)
                     .color(theme.text_dim),
             )
-            .on_hover_text(tr(
-                "マニフェストの api バージョン",
-            ));
-            ui.with_layout(
-                egui::Layout::right_to_left(
-                    egui::Align::Center,
-                ),
-                |ui| {
-                    if ui
-                        .small_button("🗑")
-                        .on_hover_text(tr("アンインストール"))
-                        .clicked()
-                    {
-                        pl.uninstall = Some(p.dir.clone());
-                    }
-                    if ui
-                        .small_button("📤")
-                        .on_hover_text(tr(
-                            "配布用 .zvplug をエクスポート",
-                        ))
-                        .clicked()
-                    {
-                        pl.export = Some(pi);
-                    }
-                    if ui
-                        .small_button("📝")
-                        .on_hover_text(tr("plugin.toml を開く"))
-                        .clicked()
-                    {
-                        pl.open =
-                            Some(p.dir.join("plugin.toml"));
-                    }
-                },
-            );
+            .on_hover_text(tr("マニフェストの api バージョン"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("🗑")
+                    .on_hover_text(tr("アンインストール"))
+                    .clicked()
+                {
+                    pl.uninstall = Some(p.dir.clone());
+                }
+                if ui
+                    .small_button("📤")
+                    .on_hover_text(tr("配布用 .zvplug をエクスポート"))
+                    .clicked()
+                {
+                    pl.export = Some(pi);
+                }
+                if ui
+                    .small_button("📝")
+                    .on_hover_text(tr("plugin.toml を開く"))
+                    .clicked()
+                {
+                    pl.open = Some(p.dir.join("plugin.toml"));
+                }
+            });
         });
     }
 
@@ -11629,47 +11715,26 @@ impl ZaivernApp {
                         let cur = p.setting(&s.key);
                         match s.kind {
                             plugins::SettingType::Bool => {
-                                let mut on =
-                                    cur.trim() == "true";
-                                if ui
-                                    .checkbox(&mut on, label)
-                                    .changed()
-                                {
-                                    pl.setting = Some((
-                                        p.name.clone(),
-                                        s.key.clone(),
-                                        on.to_string(),
-                                    ));
+                                let mut on = cur.trim() == "true";
+                                if ui.checkbox(&mut on, label).changed() {
+                                    pl.setting =
+                                        Some((p.name.clone(), s.key.clone(), on.to_string()));
                                 }
                             }
                             _ => {
-                                ui.label(
-                                    RichText::new(label)
-                                        .size(10.5)
-                                        .color(theme.text_dim),
-                                );
+                                ui.label(RichText::new(label).size(10.5).color(theme.text_dim));
                                 let mut v = cur.clone();
-                                let te =
-                                    egui::TextEdit::singleline(
-                                        &mut v,
-                                    )
+                                let te = egui::TextEdit::singleline(&mut v)
                                     // ID は設定キーから作る。省くと egui は
                                     // **並び順から自動採番**するので、設定が
                                     // 増減するとカーソルが別の欄へ移る。
-                                    .id_salt((
-                                        "zv-plset-val",
-                                        &s.key,
-                                    ))
+                                    .id_salt(("zv-plset-val", &s.key))
                                     .password(s.secret)
                                     .desired_width(f32::INFINITY);
                                 if ui.add(te).changed() {
                                     // 型に合わない入力は保存しない
                                     if s.kind.accepts(&v) {
-                                        pl.setting = Some((
-                                            p.name.clone(),
-                                            s.key.clone(),
-                                            v,
-                                        ));
+                                        pl.setting = Some((p.name.clone(), s.key.clone(), v));
                                     }
                                 }
                             }
@@ -11695,13 +11760,10 @@ impl ZaivernApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!(
-                        "{} {}",
-                        pa.icon, pa.title
-                    ))
-                    .size(11.0)
-                    .strong()
-                    .color(theme.text),
+                    RichText::new(format!("{} {}", pa.icon, pa.title))
+                        .size(11.0)
+                        .strong()
+                        .color(theme.text),
                 );
                 if !pa.run.trim().is_empty()
                     && ui
@@ -11709,38 +11771,23 @@ impl ZaivernApp {
                         .on_hover_text(tr("このパネルを更新"))
                         .clicked()
                 {
-                    pl.panel_refresh = Some((
-                        p.name.clone(),
-                        pa.id.clone(),
-                    ));
+                    pl.panel_refresh = Some((p.name.clone(), pa.id.clone()));
                 }
             });
-            let key =
-                (p.name.clone(), pa.id.clone());
+            let key = (p.name.clone(), pa.id.clone());
             match panel_texts.get(&key) {
-                Some(t) if !t.trim().is_empty() => {
-                    match pa.format {
-                        plugins::PanelFormat::Markdown => {
-                            let mut rctx =
-                                markdown::RenderCtx {
-                                    dir: None,
-                                    images: &mut *md_images,
-                                };
-                            markdown::render(
-                                ui, theme, hl, md_base,
-                                t, &mut rctx,
-                            );
-                        }
-                        plugins::PanelFormat::Text => {
-                            ui.label(
-                                RichText::new(t)
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(theme.text),
-                            );
-                        }
+                Some(t) if !t.trim().is_empty() => match pa.format {
+                    plugins::PanelFormat::Markdown => {
+                        let mut rctx = markdown::RenderCtx {
+                            dir: None,
+                            images: &mut *md_images,
+                        };
+                        markdown::render(ui, theme, hl, md_base, t, &mut rctx);
                     }
-                }
+                    plugins::PanelFormat::Text => {
+                        ui.label(RichText::new(t).monospace().size(11.0).color(theme.text));
+                    }
+                },
                 _ => {
                     ui.label(
                         RichText::new(tr("(内容なし)"))
@@ -11825,14 +11872,10 @@ impl ZaivernApp {
             // なので to.exists() が真になるが、これは同一ファイル。拒否せず
             // fs::rename に任せる (case-only rename は OS 側が正しく扱う)。
             let case_only = from.parent() == to.parent()
-                && from
-                    .file_name()
-                    .zip(to.file_name())
-                    .is_some_and(|(a, b)| {
-                        a != b
-                            && a.to_string_lossy().to_lowercase()
-                                == b.to_string_lossy().to_lowercase()
-                    });
+                && from.file_name().zip(to.file_name()).is_some_and(|(a, b)| {
+                    a != b
+                        && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+                });
             if to.exists() && !case_only {
                 self.toast(
                     trf("既に存在します: {path}", &[("path", self.rel_label(&to))]),
@@ -11874,12 +11917,14 @@ impl ZaivernApp {
                     self.tree.invalidate();
                     self.tree.select(&dest);
                     let msg = match kind {
-                        file_tree::Transfer::Move => {
-                            trf("➡ {path} へ移動しました", &[("path", self.rel_label(&dest))])
-                        }
-                        file_tree::Transfer::Copy => {
-                            trf("📋 {path} に貼り付けました", &[("path", self.rel_label(&dest))])
-                        }
+                        file_tree::Transfer::Move => trf(
+                            "➡ {path} へ移動しました",
+                            &[("path", self.rel_label(&dest))],
+                        ),
+                        file_tree::Transfer::Copy => trf(
+                            "📋 {path} に貼り付けました",
+                            &[("path", self.rel_label(&dest))],
+                        ),
                     };
                     self.toast(msg, true);
                 }
@@ -12221,8 +12266,10 @@ impl ZaivernApp {
         // 監査ログの読み込みも描画の外で 1 回だけ (毎フレーム I/O にしない)。
         if self.approvals_view && self.approvals_audit && self.approvals_audit_cache.is_none() {
             let dir = self.agents.approvals.log_dir();
-            self.approvals_audit_cache =
-                Some(agents::approvals::read_audit_tail(&dir, APPROVAL_AUDIT_TAIL));
+            self.approvals_audit_cache = Some(agents::approvals::read_audit_tail(
+                &dir,
+                APPROVAL_AUDIT_TAIL,
+            ));
         }
         // MCP パネルの実行 (描画後)。走査も**このビューを出している間だけ** 1 回。
         self.apply_mcp_action(mcp_action);
@@ -12278,7 +12325,9 @@ impl ZaivernApp {
             .collect();
         let title = format!(
             "📜 {}",
-            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
         );
         self.editor.new_untitled();
         if let Some(i) = self.editor.active {
@@ -12338,10 +12387,7 @@ impl ZaivernApp {
                             "{name} を{state}にしました (控え: {bak})",
                             &[
                                 ("name", name.clone()),
-                                (
-                                    "state",
-                                    if disable { tr("無効") } else { tr("有効") },
-                                ),
+                                ("state", if disable { tr("無効") } else { tr("有効") }),
                                 (
                                     "bak",
                                     mcp::backup_path(&path)
@@ -12545,12 +12591,7 @@ impl ZaivernApp {
 
     /// Cockpit のヘッダー行 (タイトル・稼働数・閉じる/全切替・Agent 起動・
     /// 一斉送信・音声)。押されたボタンは acts に記録だけして呼び出し側で反映する。
-    fn cockpit_header_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        theme: &Theme,
-        acts: &mut CockpitActions,
-    ) {
+    fn cockpit_header_ui(&mut self, ui: &mut egui::Ui, theme: &Theme, acts: &mut CockpitActions) {
         // 幅が足りないとき (エディタと分割している / 窓が狭い) は、
         // 文字を落としてアイコンだけにする。右端で切れて押せなくなるのを防ぐ。
         let compact = cockpit_header_compact(ui.available_width());
@@ -12586,10 +12627,14 @@ impl ZaivernApp {
 
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(if compact { "🎛" } else { "🎛 Agent Cockpit" })
-                    .size(if compact { 16.0 } else { 20.0 })
-                    .strong()
-                    .color(theme.accent),
+                RichText::new(if compact {
+                    "🎛"
+                } else {
+                    "🎛 Agent Cockpit"
+                })
+                .size(if compact { 16.0 } else { 20.0 })
+                .strong()
+                .color(theme.accent),
             );
             let running = self.agents.running_count();
             let total = self.agents.sessions.len();
@@ -12599,7 +12644,10 @@ impl ZaivernApp {
                 } else {
                     trf(
                         "{running} 稼働中 / {total} セッション",
-                        &[("running", running.to_string()), ("total", total.to_string())],
+                        &[
+                            ("running", running.to_string()),
+                            ("total", total.to_string()),
+                        ],
                     )
                 })
                 .color(theme.text_dim),
@@ -12607,14 +12655,22 @@ impl ZaivernApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button(if compact { "✕".to_string() } else { tr("✕ 閉じる") })
+                    .button(if compact {
+                        "✕".to_string()
+                    } else {
+                        tr("✕ 閉じる")
+                    })
                     .on_hover_text(tr("Cockpit を閉じる"))
                     .clicked()
                 {
                     self.cockpit = false;
                 }
                 if ui
-                    .button(if compact { "📋".to_string() } else { tr("📋 看板") })
+                    .button(if compact {
+                        "📋".to_string()
+                    } else {
+                        tr("📋 看板")
+                    })
                     .on_hover_text(tr("フリート看板へ切替"))
                     .clicked()
                 {
@@ -12623,8 +12679,12 @@ impl ZaivernApp {
                 }
                 if ui
                     .button(
-                        RichText::new(if compact { "🛡".to_string() } else { tr("🛡 全切替") })
-                            .color(theme.ok),
+                        RichText::new(if compact {
+                            "🛡".to_string()
+                        } else {
+                            tr("🛡 全切替")
+                        })
+                        .color(theme.ok),
                     )
                     .on_hover_text(tr(
                         "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
@@ -12657,11 +12717,9 @@ impl ZaivernApp {
                         rec && self.voice.target == voice::Target::Broadcast,
                         if rec { "🔴" } else { "🎤" },
                     )
-                    .on_hover_text(tr(
-                        "音声入力 → 全エージェントの入力欄へ\n\
+                    .on_hover_text(tr("音声入力 → 全エージェントの入力欄へ\n\
                          ⏹ を押すまで話した内容が入り続けます。\n\
-                         送信はされないので、自分で Enter を押してください",
-                    ))
+                         送信はされないので、自分で Enter を押してください"))
                     .clicked()
                 {
                     acts.voice_all = true;
@@ -13355,7 +13413,11 @@ impl ZaivernApp {
 
         // ヘッダの中身と隔離状態は**先に**作る。`chrome` と `leaf` の 2 つの
         // クロージャが同時にセッション列を可変で借りられないため。
-        let leaves = self.splits.get(&sid).map(|l| l.leaves()).unwrap_or_default();
+        let leaves = self
+            .splits
+            .get(&sid)
+            .map(|l| l.leaves())
+            .unwrap_or_default();
         let panes: Vec<(u64, terminal::PaneChrome, bool)> = leaves
             .iter()
             .map(|pid| {
@@ -13510,9 +13572,7 @@ impl ZaivernApp {
                 if let (Some(area), Some(l)) = (area, self.splits.get_mut(&tile)) {
                     if l.focus_dir(dir, area, terminal::GUTTER) {
                         if let Some(f) = l.focus() {
-                            if let Some(ix) =
-                                self.agents.sessions.iter().position(|s| s.id == f)
-                            {
+                            if let Some(ix) = self.agents.sessions.iter().position(|s| s.id == f) {
                                 self.agents.active = ix;
                             }
                         }
@@ -13763,16 +13823,15 @@ impl ZaivernApp {
                 kanban::Card {
                     idx: i,
                     id: s.id,
-                    icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
+                    icon: if s.icon.is_empty() {
+                        "👾".into()
+                    } else {
+                        s.icon.clone()
+                    },
                     title: s.title.clone(),
                     active: i == active,
                     column: kanban::column_for(running, s.attention, rate_limited, sup),
-                    state_label: tr(kanban::state_label(
-                        running,
-                        s.attention,
-                        rate_limited,
-                        sup,
-                    )),
+                    state_label: tr(kanban::state_label(running, s.attention, rate_limited, sup)),
                     uptime: s.uptime(),
                     unread: s.has_unread(),
                     rate_limited: s.rate_limited.clone(),
@@ -13807,16 +13866,17 @@ impl ZaivernApp {
         // アクティビティフィード: supervisor の状態遷移履歴を新しい順に混ぜる
         let mut activity: Vec<kanban::ActivityEntry> = Vec::new();
         for s in &self.agents.sessions {
-            let icon = if s.icon.is_empty() { "👾".to_string() } else { s.icon.clone() };
+            let icon = if s.icon.is_empty() {
+                "👾".to_string()
+            } else {
+                s.icon.clone()
+            };
             for t in self.supervisor.history_of(s.id).iter().rev().take(12) {
                 activity.push(kanban::ActivityEntry {
                     age_ms: now_ms.saturating_sub(t.at_ms),
                     icon: icon.clone(),
                     title: s.title.clone(),
-                    text: trf(
-                        "が「{state}」になりました",
-                        &[("state", tr(t.to.label()))],
-                    ),
+                    text: trf("が「{state}」になりました", &[("state", tr(t.to.label()))]),
                     detail: t.reason.clone(),
                     // 遷移先状態の列色で塗る (フラグは関与させない)
                     column: kanban::column_for(true, false, false, Some(t.to)),
@@ -13903,17 +13963,13 @@ impl ZaivernApp {
                     }
                 }
                 kanban::KanbanAction::Remove(i) => self.close_agent(i),
-                kanban::KanbanAction::CyclePermission(i) => {
-                    match self.agents.cycle_permission(i) {
-                        Some(hint) => self.toast_warn(trf(
-                            "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）",
-                            &[("hint", hint.to_string())],
-                        )),
-                        None => {
-                            self.toast(tr("このセッションは権限モード切替に未対応です"), false)
-                        }
-                    }
-                }
+                kanban::KanbanAction::CyclePermission(i) => match self.agents.cycle_permission(i) {
+                    Some(hint) => self.toast_warn(trf(
+                        "🛡 権限モード切替を送信しました（{hint} / 画面を確認してください）",
+                        &[("hint", hint.to_string())],
+                    )),
+                    None => self.toast(tr("このセッションは権限モード切替に未対応です"), false),
+                },
                 kanban::KanbanAction::Send { idx, text } => {
                     let sent = self.agents.sessions.get_mut(idx).map(|s| {
                         // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)。
@@ -14148,10 +14204,9 @@ impl ZaivernApp {
             .or_else(|| {
                 // プリセット名が変わっていても、同じ CLI のプリセットがあれば拾う
                 let bin = agents::spec_for_command(&command).map(|sp| sp.bin)?;
-                self.cfg
-                    .agents
-                    .iter()
-                    .position(|p| agents::spec_for_command(&p.command).is_some_and(|x| x.bin == bin))
+                self.cfg.agents.iter().position(|p| {
+                    agents::spec_for_command(&p.command).is_some_and(|x| x.bin == bin)
+                })
             });
         match idx {
             Some(n) => {
@@ -14263,7 +14318,11 @@ impl ZaivernApp {
     /// バッファ ID しか持たないので、`Vec` の添字がずれても壊れない。
     fn sync_panes(&mut self) {
         let ids: Vec<u64> = self.editor.buffers.iter().map(|b| b.id).collect();
-        let active_id = self.editor.active.and_then(|i| self.editor.buffers.get(i)).map(|b| b.id);
+        let active_id = self
+            .editor
+            .active
+            .and_then(|i| self.editor.buffers.get(i))
+            .map(|b| b.id);
         let left = self.panes.sync(&ids, active_id);
         self.editor.active = left.and_then(|b| self.editor.buffers.iter().position(|x| x.id == b));
         self.cur_pane = self.panes.focus_id();
@@ -14275,9 +14334,10 @@ impl ZaivernApp {
         let (activate, close) = hit;
         if let Some(i) = activate {
             self.panes.set_focus(pane);
-            if let (Some(buf), Some(p)) =
-                (self.editor.buffers.get(i).map(|b| b.id), self.panes.pane_mut(pane))
-            {
+            if let (Some(buf), Some(p)) = (
+                self.editor.buffers.get(i).map(|b| b.id),
+                self.panes.pane_mut(pane),
+            ) {
                 if let Some(at) = p.tabs.iter().position(|x| *x == buf) {
                     p.active = at;
                 }
@@ -14390,12 +14450,11 @@ impl ZaivernApp {
                                             // 狭いときはアイコンだけへ縮退。
                                             // 題名はホバーで全文を出す。
                                             editor_split::TabLabelMode::IconOnly => {
-                                                let c = if b.dirty() { theme.accent } else { color };
+                                                let c =
+                                                    if b.dirty() { theme.accent } else { color };
                                                 ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(icon).color(c),
-                                                    )
-                                                    .selectable(false),
+                                                    egui::Label::new(RichText::new(icon).color(c))
+                                                        .selectable(false),
                                                 )
                                             }
                                             editor_split::TabLabelMode::Truncated => {
@@ -14409,10 +14468,8 @@ impl ZaivernApp {
                                                 )
                                             }
                                             editor_split::TabLabelMode::Full => ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&full).color(color),
-                                                )
-                                                .selectable(false),
+                                                egui::Label::new(RichText::new(&full).color(color))
+                                                    .selectable(false),
                                             ),
                                         };
                                         if mode != editor_split::TabLabelMode::Full {
@@ -14465,8 +14522,7 @@ impl ZaivernApp {
                             let pointer = ui.ctx().pointer_latest_pos();
                             let down = ui.ctx().input(|i| i.pointer.any_down());
                             if let Some(from) = drag_from {
-                                let pos_in_strip =
-                                    tab_rects.iter().position(|(b, _)| *b == from);
+                                let pos_in_strip = tab_rects.iter().position(|(b, _)| *b == from);
                                 let rects: Vec<egui::Rect> =
                                     tab_rects.iter().map(|(_, r)| *r).collect();
                                 let to = pos_in_strip.and_then(|f| {
@@ -14563,9 +14619,8 @@ impl ZaivernApp {
                 let b = &self.editor.buffers[i];
                 let (id, title, text) = (b.id, b.title.clone(), b.text.clone());
                 let cache = &mut self.commit_diff_cache;
-                let view = ui.scope(|ui| {
-                    panels::commit_diff_ui(ui, &theme, id, &title, &text, cache)
-                });
+                let view =
+                    ui.scope(|ui| panels::commit_diff_ui(ui, &theme, id, &title, &text, cache));
                 tutorial::anchor(ui.ctx(), AnchorId::DiffView, view.response.rect);
                 return;
             }
@@ -14765,7 +14820,8 @@ impl ZaivernApp {
             let (sc, cur, buf) = (p.scroll, p.cursor, p.active_buf());
             self.last_scroll_y = sc;
             self.editor.cursor = cur;
-            self.editor.active = buf.and_then(|b| self.editor.buffers.iter().position(|x| x.id == b));
+            self.editor.active =
+                buf.and_then(|b| self.editor.buffers.iter().position(|x| x.id == b));
         }
     }
 
@@ -14897,14 +14953,24 @@ impl ZaivernApp {
                             self.md_preview,
                             RichText::new(tr("👁 プレビュー")).size(12.0),
                         );
-                        if p.on_hover_text(trf("レンダリング表示 ({key})", &[("key", self.key_hint(BindAction::ToggleMdPreview))])).clicked() {
+                        if p.on_hover_text(trf(
+                            "レンダリング表示 ({key})",
+                            &[("key", self.key_hint(BindAction::ToggleMdPreview))],
+                        ))
+                        .clicked()
+                        {
                             self.md_preview = true;
                         }
                         let e = ui.selectable_label(
                             !self.md_preview,
                             RichText::new(tr("✏ 編集")).size(12.0),
                         );
-                        if e.on_hover_text(trf("ソースを編集 ({key})", &[("key", self.key_hint(BindAction::ToggleMdPreview))])).clicked() {
+                        if e.on_hover_text(trf(
+                            "ソースを編集 ({key})",
+                            &[("key", self.key_hint(BindAction::ToggleMdPreview))],
+                        ))
+                        .clicked()
+                        {
                             self.md_preview = false;
                         }
                         // HTML はブラウザで開けば完全な見た目で確認できる
@@ -15005,7 +15071,10 @@ impl ZaivernApp {
                     let caret = if self.find.replace_open { "▾" } else { "▸" };
                     if ui
                         .button(caret)
-                        .on_hover_text(trf("置換行の表示切替 ({key})", &[("key", self.key_hint(BindAction::OpenReplace))]))
+                        .on_hover_text(trf(
+                            "置換行の表示切替 ({key})",
+                            &[("key", self.key_hint(BindAction::OpenReplace))],
+                        ))
                         .clicked()
                     {
                         self.find.replace_open = !self.find.replace_open;
@@ -15117,7 +15186,10 @@ impl ZaivernApp {
         let hints: Vec<(String, String)> = [
             (tr("ファイル検索"), BindAction::PaletteFiles),
             (tr("コマンドパレット"), BindAction::PaletteCommands),
-            (tr("ターミナル / エージェントパネル"), BindAction::ToggleTerminal),
+            (
+                tr("ターミナル / エージェントパネル"),
+                BindAction::ToggleTerminal,
+            ),
             (tr("エージェント起動"), BindAction::NewAgent),
             (tr("Cockpit ビュー"), BindAction::ToggleCockpit),
         ]
@@ -15295,24 +15367,18 @@ impl ZaivernApp {
                     let vis = img_rect.intersect(ui.clip_rect());
                     if vis.is_positive() {
                         let p = ui.painter().with_clip_rect(vis);
-                        let uv = egui::Rect::from_min_max(
-                            egui::pos2(0.0, 0.0),
-                            egui::pos2(1.0, 1.0),
-                        );
+                        let uv =
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                         // 模様は画像の左上に揃える (パンしても模様が泳がない)
                         let t = 128.0;
-                        let mut y =
-                            img_rect.top() + ((vis.top() - img_rect.top()) / t).floor() * t;
+                        let mut y = img_rect.top() + ((vis.top() - img_rect.top()) / t).floor() * t;
                         while y < vis.bottom() {
-                            let mut x = img_rect.left()
-                                + ((vis.left() - img_rect.left()) / t).floor() * t;
+                            let mut x =
+                                img_rect.left() + ((vis.left() - img_rect.left()) / t).floor() * t;
                             while x < vis.right() {
                                 p.image(
                                     checker.id(),
-                                    egui::Rect::from_min_size(
-                                        egui::pos2(x, y),
-                                        egui::vec2(t, t),
-                                    ),
+                                    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(t, t)),
                                     uv,
                                     egui::Color32::WHITE,
                                 );
@@ -15342,7 +15408,11 @@ impl ZaivernApp {
             .inner_margin(egui::Margin::symmetric(10.0, 4.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("🖼 {title}")).size(11.5).color(theme_dim));
+                    ui.label(
+                        RichText::new(format!("🖼 {title}"))
+                            .size(11.5)
+                            .color(theme_dim),
+                    );
                     if error.is_none() {
                         let mut meta = format!(
                             "{}×{} px · {}",
@@ -15366,11 +15436,11 @@ impl ZaivernApp {
                                     .size(11.5)
                                     .color(theme_text),
                             );
-                            let f = ui.selectable_label(
-                                is_fit,
-                                RichText::new(tr("フィット")).size(11.5),
-                            );
-                            if f.on_hover_text(tr("ウィンドウの大きさに合わせる")).clicked() {
+                            let f = ui
+                                .selectable_label(is_fit, RichText::new(tr("フィット")).size(11.5));
+                            if f.on_hover_text(tr("ウィンドウの大きさに合わせる"))
+                                .clicked()
+                            {
                                 new_zoom = Some(None);
                             }
                             if ui
@@ -15385,21 +15455,21 @@ impl ZaivernApp {
                                 .on_hover_text(tr("拡大 (Ctrl/⌘+スクロールでも)"))
                                 .clicked()
                             {
-                                new_zoom =
-                                    Some(Some(crate::editor::image_zoom_step(scale, 1)));
+                                new_zoom = Some(Some(crate::editor::image_zoom_step(scale, 1)));
                             }
                             if ui
                                 .button(RichText::new("−").size(11.5))
                                 .on_hover_text(tr("縮小 (Ctrl/⌘+スクロールでも)"))
                                 .clicked()
                             {
-                                new_zoom =
-                                    Some(Some(crate::editor::image_zoom_step(scale, -1)));
+                                new_zoom = Some(Some(crate::editor::image_zoom_step(scale, -1)));
                             }
                             ui.separator();
                         }
                         ui.label(
-                            RichText::new(tr("読み取り専用")).size(11.0).color(theme_dim),
+                            RichText::new(tr("読み取り専用"))
+                                .size(11.0)
+                                .color(theme_dim),
                         );
                     });
                 });
@@ -15492,7 +15562,11 @@ impl ZaivernApp {
                     .small(),
                 );
             }
-            ui.label(RichText::new(tr("読み取り専用")).color(theme.text_dim).small());
+            ui.label(
+                RichText::new(tr("読み取り専用"))
+                    .color(theme.text_dim)
+                    .small(),
+            );
         });
         ui.separator();
         if rows == 0 {
@@ -15535,10 +15609,7 @@ impl ZaivernApp {
         // (行ごと消すとファイルによって高さが変わって落ち着かない)。
         let dash = "—".to_string();
         let mut rows: Vec<(String, String)> = vec![
-            (
-                tr("種別"),
-                doc.kind.map(tr).unwrap_or_else(|| dash.clone()),
-            ),
+            (tr("種別"), doc.kind.map(tr).unwrap_or_else(|| dash.clone())),
             (tr("サイズ"), crate::editor::human_bytes(doc.file_bytes)),
             (
                 tr("再生時間"),
@@ -15710,7 +15781,11 @@ impl ZaivernApp {
                         .small(),
                 );
             }
-            ui.label(RichText::new(tr("読み取り専用")).color(theme.text_dim).small());
+            ui.label(
+                RichText::new(tr("読み取り専用"))
+                    .color(theme.text_dim)
+                    .small(),
+            );
         });
         ui.separator();
         if l.entries.is_empty() {
@@ -15750,7 +15825,11 @@ impl ZaivernApp {
                                     format!("📄 {name}")
                                 })
                                 .monospace()
-                                .color(if e.dir { theme.text_dim } else { theme.text }),
+                                .color(if e.dir {
+                                    theme.text_dim
+                                } else {
+                                    theme.text
+                                }),
                             )
                             .on_hover_text(&e.name);
                             let (size, comp) = if e.dir {
@@ -15785,10 +15864,7 @@ impl ZaivernApp {
         // 行高が小数だと N 行目の y が丸められる位置が行ごとに変わり、
         // ガター番号・本文・スティッキーヘッダの縦位置が 1px ずつずれる。
         let ppp = ui.ctx().pixels_per_point();
-        let font = FontId::monospace(crate::theme::snap_font_size(
-            self.cfg.editor_font_size,
-            ppp,
-        ));
+        let font = FontId::monospace(crate::theme::snap_font_size(self.cfg.editor_font_size, ppp));
         let row_h = ui
             .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
             .max(1.0 / ppp);
@@ -15893,9 +15969,7 @@ impl ZaivernApp {
         // 個別対応済みなので、エディタだけ効かない不一致になっていた)。
         // 選択するのは TextEdit の中身 = 実際に文字を打ち込める本文だけ。
         // 行番号ガターは別描画なので選択には含まれない。
-        if has_focus
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A))
-        {
+        if has_focus && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A)) {
             let len = self.editor.buffers[active].text.chars().count();
             pending_select = Some((0, len));
         }
@@ -15959,9 +16033,8 @@ impl ZaivernApp {
                                     &filename,
                                 )
                                 .map(|(ins, rel)| {
-                                    let mut nt = String::with_capacity(
-                                        text.len() - word_len + ins.len(),
-                                    );
+                                    let mut nt =
+                                        String::with_capacity(text.len() - word_len + ins.len());
                                     nt.push_str(&text[..word_start]);
                                     nt.push_str(&ins);
                                     nt.push_str(&text[cursor_byte..]);
@@ -16012,12 +16085,7 @@ impl ZaivernApp {
                     })
                 });
                 let edit = typed.and_then(|c| {
-                    editor_ops::pair_on_type(
-                        &self.editor.buffers[active].text,
-                        sel_min,
-                        sel_max,
-                        c,
-                    )
+                    editor_ops::pair_on_type(&self.editor.buffers[active].text, sel_min, sel_max, c)
                 });
                 if let Some(edit) = edit {
                     // 元の 1 文字 Text イベントは消費して TextEdit へ渡さない
@@ -16029,9 +16097,7 @@ impl ZaivernApp {
                                 return true;
                             }
                             match e {
-                                egui::Event::Text(t)
-                                    if t.chars().eq(std::iter::once(c)) =>
-                                {
+                                egui::Event::Text(t) if t.chars().eq(std::iter::once(c)) => {
                                     removed = true;
                                     false
                                 }
@@ -16054,13 +16120,10 @@ impl ZaivernApp {
                             pending_select = Some((cursor, cursor));
                         }
                     }
-                } else if sel_min == sel_max
-                    && ui.input(|i| i.key_pressed(egui::Key::Backspace))
-                {
-                    if let Some((nt, cur)) = editor_ops::pair_on_backspace(
-                        &self.editor.buffers[active].text,
-                        sel_min,
-                    ) {
+                } else if sel_min == sel_max && ui.input(|i| i.key_pressed(egui::Key::Backspace)) {
+                    if let Some((nt, cur)) =
+                        editor_ops::pair_on_backspace(&self.editor.buffers[active].text, sel_min)
+                    {
                         if ui.input_mut(|i| {
                             i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
                         }) {
@@ -16119,8 +16182,7 @@ impl ZaivernApp {
         } else {
             HashMap::new()
         };
-        let bookmark_lines: HashSet<usize> =
-            self.editor.buffers[active].bookmarks.iter().collect();
+        let bookmark_lines: HashSet<usize> = self.editor.buffers[active].bookmarks.iter().collect();
 
         // インデントガイド (鍵にキャレット行を含める = 強調ガイドが行依存のため)
         let tab_w = crate::highlight::DEFAULT_TAB_WIDTH;
@@ -16154,8 +16216,7 @@ impl ZaivernApp {
         if hidden_spans.is_empty() {
             fv = None;
         } else if fv.is_none() {
-            let (t, lines, cut) =
-                build_fold_view(&self.editor.buffers[active].text, &hidden_spans);
+            let (t, lines, cut) = build_fold_view(&self.editor.buffers[active].text, &hidden_spans);
             fv = Some(FoldView {
                 buf: buf_id_now,
                 key: fold_key,
@@ -16302,7 +16363,11 @@ impl ZaivernApp {
         // (等幅フォントなので数字幅 × 桁数で galley と同じ幅になる)。
         let gutter_digits = line_count.to_string().len().max(3);
         // 右端に「折りたたみ ▸/▾」と「ブックマーク ◆」の 2 桁を確保する
-        let marker_w = if structure_on { FOLD_MARKER_W * 2.0 } else { 0.0 };
+        let marker_w = if structure_on {
+            FOLD_MARKER_W * 2.0
+        } else {
+            0.0
+        };
         // blame 欄は行番号の**左**に置く (行番号は本文の隣に残す)
         let gutter_w = char_w * gutter_digits as f32 + 22.0 + marker_w + blame_w;
 
@@ -16329,8 +16394,7 @@ impl ZaivernApp {
                 // LayoutJob のコピーも egui 側の job ハッシュ計算も起きない。
                 Some((k, g)) if *k == key => g.clone(),
                 _ => {
-                    let mut j =
-                        hl.layout_job(t, lang, &syntect_theme, font.clone(), theme_text);
+                    let mut j = hl.layout_job(t, lang, &syntect_theme, font.clone(), theme_text);
                     if show_ws {
                         // スペース→「·」/ タブ→「→」(char 数は変えない)
                         j = crate::editor::whitespace_layout_job(j, ws_color);
@@ -16360,8 +16424,7 @@ impl ZaivernApp {
 
         let body_ui = |ui: &mut egui::Ui| {
             if let Some((s, e)) = pending_select {
-                let mut st =
-                    egui::TextEdit::load_state(ui.ctx(), ed_id).unwrap_or_default();
+                let mut st = egui::TextEdit::load_state(ui.ctx(), ed_id).unwrap_or_default();
                 st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
                     egui::text::CCursor::new(s),
                     egui::text::CCursor::new(e),
@@ -16419,9 +16482,7 @@ impl ZaivernApp {
                 // ホバー: マウス下の文字位置 (表示テキストの char 添字)
                 if let Some(p) = ui.ctx().pointer_hover_pos() {
                     if output.response.rect.contains(p) {
-                        let c = output
-                            .galley
-                            .cursor_from_pos(p - output.galley_pos);
+                        let c = output.galley.cursor_from_pos(p - output.galley_pos);
                         hover_hit = Some((c.ccursor.index, p));
                     }
                 }
@@ -16499,9 +16560,7 @@ impl ZaivernApp {
                 }
 
                 // Enter 直後の自動インデント
-                if output.response.changed()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                {
+                if output.response.changed() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     if let Some(cr) = output.cursor_range {
                         let cursor = cr.primary.ccursor.index;
                         let indented = editor_ops::auto_indent_after_newline(
@@ -16511,8 +16570,8 @@ impl ZaivernApp {
                         if let Some((new_text, new_cursor)) = indented {
                             // cache はキーが text ハッシュなので書き換えだけで無効化される
                             target.set(new_text);
-                            let mut st = egui::TextEdit::load_state(ui.ctx(), ed_id)
-                                .unwrap_or_default();
+                            let mut st =
+                                egui::TextEdit::load_state(ui.ctx(), ed_id).unwrap_or_default();
                             st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
                                 egui::text::CCursor::new(new_cursor),
                             )));
@@ -16712,8 +16771,7 @@ impl ZaivernApp {
         // フォーカスリング: エディタに入力フォーカスがあるときだけ、
         // キー入力が入る本文エリアをアクセント色の枠で囲って明示する
         if ui.memory(|m| m.has_focus(ed_id)) {
-            let text_area =
-                egui::Rect::from_min_max(egui::pos2(gutter_edge, vis.top()), vis.max);
+            let text_area = egui::Rect::from_min_max(egui::pos2(gutter_edge, vis.top()), vis.max);
             painter.rect_stroke(
                 text_area.shrink(1.0),
                 0.0,
@@ -16910,11 +16968,7 @@ impl ZaivernApp {
                     egui::pos2(vis.right(), y + row_h),
                 );
                 if ui
-                    .interact(
-                        row_r,
-                        ed_id.with(("sticky", n)),
-                        egui::Sense::click(),
-                    )
+                    .interact(row_r, ed_id.with(("sticky", n)), egui::Sense::click())
                     .clicked()
                 {
                     sticky_jump = Some(*line);
@@ -16953,7 +17007,11 @@ impl ZaivernApp {
             let none_marks: HashSet<usize> = HashSet::new();
             let marks = crate::minimap::Marks {
                 search: if folds_active { &none_hits } else { &mm_search },
-                diags: if folds_active { &none_diag } else { diag_by_line },
+                diags: if folds_active {
+                    &none_diag
+                } else {
+                    diag_by_line
+                },
                 bookmarks: if folds_active {
                     &none_marks
                 } else {
@@ -17082,8 +17140,7 @@ impl ZaivernApp {
                 let key = self.lsp_key_for(&p, &lang);
                 if self.lsp.contains_key(&key) {
                     let text = self.editor.buffers[active].text.clone();
-                    self.lsp_pending
-                        .insert(p, (text, Instant::now(), key));
+                    self.lsp_pending.insert(p, (text, Instant::now(), key));
                 }
             }
         }
@@ -17117,26 +17174,80 @@ impl ZaivernApp {
     fn palette_builtin_cmds(&self) -> Vec<(String, String, String, Cmd)> {
         // 実際に効いているキーバインドをそのまま出す (config で上書きされていても
         // パレットの表示とズレない)
-        let fmt_key =
-            |a: BindAction| crate::keybinds::format_shortcut(self.keys.get(a));
+        let fmt_key = |a: BindAction| crate::keybinds::format_shortcut(self.keys.get(a));
         vec![
-            ("💾".into(), tr("保存"), fmt_key(BindAction::Save), Cmd::Save),
-            ("💾".into(), tr("名前を付けて保存"), fmt_key(BindAction::SaveAs), Cmd::SaveAs),
-            ("📄".into(), tr("新規ファイル"), fmt_key(BindAction::NewFile), Cmd::NewFile),
-            ("🪟".into(), tr("新しいウィンドウ"), fmt_key(BindAction::NewWindow), Cmd::NewWindow),
-            ("📂".into(), tr("フォルダを開く…"), String::new(), Cmd::OpenFolder),
+            (
+                "💾".into(),
+                tr("保存"),
+                fmt_key(BindAction::Save),
+                Cmd::Save,
+            ),
+            (
+                "💾".into(),
+                tr("名前を付けて保存"),
+                fmt_key(BindAction::SaveAs),
+                Cmd::SaveAs,
+            ),
+            (
+                "📄".into(),
+                tr("新規ファイル"),
+                fmt_key(BindAction::NewFile),
+                Cmd::NewFile,
+            ),
+            (
+                "🪟".into(),
+                tr("新しいウィンドウ"),
+                fmt_key(BindAction::NewWindow),
+                Cmd::NewWindow,
+            ),
+            (
+                "📂".into(),
+                tr("フォルダを開く…"),
+                String::new(),
+                Cmd::OpenFolder,
+            ),
             (
                 "🪟".into(),
                 tr("新しいウィンドウでフォルダーを開く…"),
                 String::new(),
                 Cmd::NewWindowFolder,
             ),
-            ("📚".into(), tr("フォルダをワークスペースに追加"), String::new(), Cmd::AddFolder),
-            ("❌".into(), tr("タブを閉じる"), fmt_key(BindAction::CloseTab), Cmd::CloseTab),
-            ("🔍".into(), tr("ファイル内検索"), fmt_key(BindAction::Find), Cmd::OpenFind),
-            ("🖥".into(), tr("ターミナル表示切替"), fmt_key(BindAction::ToggleTerminal), Cmd::ToggleTerminal),
-            ("🎛".into(), tr("Cockpit 切替"), fmt_key(BindAction::ToggleCockpit), Cmd::ToggleCockpit),
-            ("📋".into(), tr("フリート看板 切替"), fmt_key(BindAction::ToggleKanban), Cmd::ToggleKanban),
+            (
+                "📚".into(),
+                tr("フォルダをワークスペースに追加"),
+                String::new(),
+                Cmd::AddFolder,
+            ),
+            (
+                "❌".into(),
+                tr("タブを閉じる"),
+                fmt_key(BindAction::CloseTab),
+                Cmd::CloseTab,
+            ),
+            (
+                "🔍".into(),
+                tr("ファイル内検索"),
+                fmt_key(BindAction::Find),
+                Cmd::OpenFind,
+            ),
+            (
+                "🖥".into(),
+                tr("ターミナル表示切替"),
+                fmt_key(BindAction::ToggleTerminal),
+                Cmd::ToggleTerminal,
+            ),
+            (
+                "🎛".into(),
+                tr("Cockpit 切替"),
+                fmt_key(BindAction::ToggleCockpit),
+                Cmd::ToggleCockpit,
+            ),
+            (
+                "📋".into(),
+                tr("フリート看板 切替"),
+                fmt_key(BindAction::ToggleKanban),
+                Cmd::ToggleKanban,
+            ),
             (
                 deck::DECK_ICON.into(),
                 tr("エージェントデッキ"),
@@ -17149,17 +17260,42 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::OpenAgentPicker,
             ),
-            ("📋".into(), tr("タスクを作成してエージェントに割り当て"), String::new(), Cmd::NewTask),
+            (
+                "📋".into(),
+                tr("タスクを作成してエージェントに割り当て"),
+                String::new(),
+                Cmd::NewTask,
+            ),
             (
                 "🏁".into(),
                 tr("プロンプトレース (1 プロンプトを複数エージェントで並走)"),
                 String::new(),
                 Cmd::OpenRace,
             ),
-            ("📮".into(), tr("エージェントへメッセージを送る"), String::new(), Cmd::SendAgentMessage),
-            ("👁".into(), tr("Markdown/HTML プレビュー切替"), fmt_key(BindAction::ToggleMdPreview), Cmd::ToggleMdPreview),
-            ("↩".into(), tr("折り返し切替"), String::new(), Cmd::ToggleWordWrap),
-            ("·".into(), tr("空白文字表示切替"), String::new(), Cmd::ToggleShowWhitespace),
+            (
+                "📮".into(),
+                tr("エージェントへメッセージを送る"),
+                String::new(),
+                Cmd::SendAgentMessage,
+            ),
+            (
+                "👁".into(),
+                tr("Markdown/HTML プレビュー切替"),
+                fmt_key(BindAction::ToggleMdPreview),
+                Cmd::ToggleMdPreview,
+            ),
+            (
+                "↩".into(),
+                tr("折り返し切替"),
+                String::new(),
+                Cmd::ToggleWordWrap,
+            ),
+            (
+                "·".into(),
+                tr("空白文字表示切替"),
+                String::new(),
+                Cmd::ToggleShowWhitespace,
+            ),
             (
                 "▥".into(),
                 tr("エディタを右に分割"),
@@ -17190,24 +17326,84 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::MoveTabToNextPane,
             ),
-            ("🗺".into(), tr("ミニマップの表示切替"), String::new(), Cmd::ToggleMinimap),
-            ("🔗".into(), tr("ブレッドクラムの表示切替"), String::new(), Cmd::ToggleBreadcrumbs),
-            ("👤".into(), tr("Git blame の表示切替"), String::new(), Cmd::ToggleGitBlame),
-            ("📁".into(), tr("サイドバー切替"), fmt_key(BindAction::ToggleSidebar), Cmd::ToggleSidebar),
-            ("🌿".into(), tr("Git パネルを開く"), String::new(), Cmd::OpenGitPanel),
+            (
+                "🗺".into(),
+                tr("ミニマップの表示切替"),
+                String::new(),
+                Cmd::ToggleMinimap,
+            ),
+            (
+                "🔗".into(),
+                tr("ブレッドクラムの表示切替"),
+                String::new(),
+                Cmd::ToggleBreadcrumbs,
+            ),
+            (
+                "👤".into(),
+                tr("Git blame の表示切替"),
+                String::new(),
+                Cmd::ToggleGitBlame,
+            ),
+            (
+                "📁".into(),
+                tr("サイドバー切替"),
+                fmt_key(BindAction::ToggleSidebar),
+                Cmd::ToggleSidebar,
+            ),
+            (
+                "🌿".into(),
+                tr("Git パネルを開く"),
+                String::new(),
+                Cmd::OpenGitPanel,
+            ),
             (
                 "👾".into(),
                 tr("現在のファイルをエージェントに送信 (@path)"),
                 String::new(),
                 Cmd::SendFileToAgent,
             ),
-            ("⟳".into(), tr("アクティブなエージェントを再起動"), String::new(), Cmd::RestartAgent),
-            ("🗑".into(), tr("アクティブなエージェントを終了"), String::new(), Cmd::KillAgent),
-            ("⚙".into(), tr("設定 config.toml を開く"), String::new(), Cmd::OpenConfig),
-            ("🔄".into(), tr("設定を再読み込み"), String::new(), Cmd::ReloadConfig),
-            ("🔠".into(), tr("フォント拡大"), fmt_key(BindAction::FontInc), Cmd::FontInc),
-            ("🔠".into(), tr("フォント縮小"), fmt_key(BindAction::FontDec), Cmd::FontDec),
-            ("🌲".into(), tr("ファイルツリー再読み込み"), String::new(), Cmd::RefreshTree),
+            (
+                "⟳".into(),
+                tr("アクティブなエージェントを再起動"),
+                String::new(),
+                Cmd::RestartAgent,
+            ),
+            (
+                "🗑".into(),
+                tr("アクティブなエージェントを終了"),
+                String::new(),
+                Cmd::KillAgent,
+            ),
+            (
+                "⚙".into(),
+                tr("設定 config.toml を開く"),
+                String::new(),
+                Cmd::OpenConfig,
+            ),
+            (
+                "🔄".into(),
+                tr("設定を再読み込み"),
+                String::new(),
+                Cmd::ReloadConfig,
+            ),
+            (
+                "🔠".into(),
+                tr("フォント拡大"),
+                fmt_key(BindAction::FontInc),
+                Cmd::FontInc,
+            ),
+            (
+                "🔠".into(),
+                tr("フォント縮小"),
+                fmt_key(BindAction::FontDec),
+                Cmd::FontDec,
+            ),
+            (
+                "🌲".into(),
+                tr("ファイルツリー再読み込み"),
+                String::new(),
+                Cmd::RefreshTree,
+            ),
             (
                 "🛡".into(),
                 tr("承認モード: 毎回ユーザー承認 (Claude/Codex/Antigravity)"),
@@ -17226,7 +17422,12 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::SetApproval("agent".into()),
             ),
-            ("🐾".into(), tr("ペット表示切替"), String::new(), Cmd::TogglePet),
+            (
+                "🐾".into(),
+                tr("ペット表示切替"),
+                String::new(),
+                Cmd::TogglePet,
+            ),
             (
                 "📱".into(),
                 tr("スマホリモート (QR コード表示)"),
@@ -17251,38 +17452,148 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::CyclePermissionAll,
             ),
-            ("🖼".into(), tr("ペット画像を変更…"), String::new(), Cmd::SetPetImage),
-            ("↺".into(), tr("ペット画像を既定に戻す"), String::new(), Cmd::ResetPetImage),
-            ("🐾".into(), tr("ペット位置を右下に戻す"), String::new(), Cmd::ResetPetPos),
+            (
+                "🖼".into(),
+                tr("ペット画像を変更…"),
+                String::new(),
+                Cmd::SetPetImage,
+            ),
+            (
+                "↺".into(),
+                tr("ペット画像を既定に戻す"),
+                String::new(),
+                Cmd::ResetPetImage,
+            ),
+            (
+                "🐾".into(),
+                tr("ペット位置を右下に戻す"),
+                String::new(),
+                Cmd::ResetPetPos,
+            ),
             // ── VS Code 準拠メニューバーのコマンド ──
-            ("📄".into(), tr("ファイルを開く…"), fmt_key(BindAction::OpenFile), Cmd::OpenFileDialog),
-            ("💾".into(), tr("すべて保存"), fmt_key(BindAction::SaveAll), Cmd::SaveAll),
-            ("💾".into(), tr("自動保存の切替"), String::new(), Cmd::ToggleAutoSave),
-            ("↺".into(), tr("ファイルを元に戻す"), String::new(), Cmd::RevertFile),
-            ("🚪".into(), tr("すべてのエディターを閉じる"), String::new(), Cmd::CloseAllTabs),
-            ("🔎".into(), tr("ファイル間で検索"), fmt_key(BindAction::GlobalSearch), Cmd::GlobalSearch),
-            ("⇄".into(), tr("置換"), fmt_key(BindAction::OpenReplace), Cmd::OpenReplace),
+            (
+                "📄".into(),
+                tr("ファイルを開く…"),
+                fmt_key(BindAction::OpenFile),
+                Cmd::OpenFileDialog,
+            ),
+            (
+                "💾".into(),
+                tr("すべて保存"),
+                fmt_key(BindAction::SaveAll),
+                Cmd::SaveAll,
+            ),
+            (
+                "💾".into(),
+                tr("自動保存の切替"),
+                String::new(),
+                Cmd::ToggleAutoSave,
+            ),
+            (
+                "↺".into(),
+                tr("ファイルを元に戻す"),
+                String::new(),
+                Cmd::RevertFile,
+            ),
+            (
+                "🚪".into(),
+                tr("すべてのエディターを閉じる"),
+                String::new(),
+                Cmd::CloseAllTabs,
+            ),
+            (
+                "🔎".into(),
+                tr("ファイル間で検索"),
+                fmt_key(BindAction::GlobalSearch),
+                Cmd::GlobalSearch,
+            ),
+            (
+                "⇄".into(),
+                tr("置換"),
+                fmt_key(BindAction::OpenReplace),
+                Cmd::OpenReplace,
+            ),
             // 🧭 は同梱フォントに字が無く豆腐(□)になるため「→」を使う
             // (glyph_tests::ui_glyph_symbols_have_glyphs が担保している字)。
-            ("→".into(), tr("行/列へ移動…"), fmt_key(BindAction::GoToLine), Cmd::GoToLine),
-            ("→".into(), tr("定義へ移動"), fmt_key(BindAction::GoToDefinition), Cmd::GoToDefinition),
-            ("→".into(), tr("ブラケットへ移動"), fmt_key(BindAction::GoToBracket), Cmd::GoToBracket),
-            ("⬅".into(), tr("戻る"), fmt_key(BindAction::NavBack), Cmd::NavBack),
-            ("➡".into(), tr("進む"), fmt_key(BindAction::NavForward), Cmd::NavForward),
-            ("📑".into(), tr("次のエディター"), fmt_key(BindAction::NextTab), Cmd::NextTab),
-            ("📑".into(), tr("前のエディター"), fmt_key(BindAction::PrevTab), Cmd::PrevTab),
-            ("🖥".into(), tr("新しいターミナル"), fmt_key(BindAction::NewTerminal), Cmd::NewTerminal),
-            ("▶".into(), tr("アクティブなファイルを実行"), String::new(), Cmd::RunActiveFile),
+            (
+                "→".into(),
+                tr("行/列へ移動…"),
+                fmt_key(BindAction::GoToLine),
+                Cmd::GoToLine,
+            ),
+            (
+                "→".into(),
+                tr("定義へ移動"),
+                fmt_key(BindAction::GoToDefinition),
+                Cmd::GoToDefinition,
+            ),
+            (
+                "→".into(),
+                tr("ブラケットへ移動"),
+                fmt_key(BindAction::GoToBracket),
+                Cmd::GoToBracket,
+            ),
+            (
+                "⬅".into(),
+                tr("戻る"),
+                fmt_key(BindAction::NavBack),
+                Cmd::NavBack,
+            ),
+            (
+                "➡".into(),
+                tr("進む"),
+                fmt_key(BindAction::NavForward),
+                Cmd::NavForward,
+            ),
+            (
+                "📑".into(),
+                tr("次のエディター"),
+                fmt_key(BindAction::NextTab),
+                Cmd::NextTab,
+            ),
+            (
+                "📑".into(),
+                tr("前のエディター"),
+                fmt_key(BindAction::PrevTab),
+                Cmd::PrevTab,
+            ),
+            (
+                "🖥".into(),
+                tr("新しいターミナル"),
+                fmt_key(BindAction::NewTerminal),
+                Cmd::NewTerminal,
+            ),
+            (
+                "▶".into(),
+                tr("アクティブなファイルを実行"),
+                String::new(),
+                Cmd::RunActiveFile,
+            ),
             (
                 "▶".into(),
                 tr("選択したテキストをターミナルへ送る"),
                 String::new(),
                 Cmd::RunSelection,
             ),
-            ("🔨".into(), tr("ビルド タスクの実行…"), fmt_key(BindAction::RunBuildTask), Cmd::RunBuildTask),
-            ("⚠".into(), tr("問題パネルの切替"), fmt_key(BindAction::ToggleProblems), Cmd::ToggleProblems),
+            (
+                "🔨".into(),
+                tr("ビルド タスクの実行…"),
+                fmt_key(BindAction::RunBuildTask),
+                Cmd::RunBuildTask,
+            ),
+            (
+                "⚠".into(),
+                tr("問題パネルの切替"),
+                fmt_key(BindAction::ToggleProblems),
+                Cmd::ToggleProblems,
+            ),
             // ── 第 2 次配線: レビュー / 折りたたみ / ブックマーク / 表 / LSP ──
-            ("🔎".into(), tr("変更をレビュー (PR 風のローカルレビュー)"), String::new(), Cmd::OpenReview),
+            (
+                "🔎".into(),
+                tr("変更をレビュー (PR 風のローカルレビュー)"),
+                String::new(),
+                Cmd::OpenReview,
+            ),
             (
                 "⇋".into(),
                 tr("差分の表示を切替 (並列 ⇔ 一列)"),
@@ -17325,32 +17636,72 @@ impl ZaivernApp {
                 fmt_key(BindAction::ToggleFold),
                 Cmd::ToggleFold,
             ),
-            ("▸".into(), tr("すべて折りたたむ"), String::new(), Cmd::FoldAll),
+            (
+                "▸".into(),
+                tr("すべて折りたたむ"),
+                String::new(),
+                Cmd::FoldAll,
+            ),
             (
                 "▾".into(),
                 tr("すべて展開する"),
                 fmt_key(BindAction::UnfoldAll),
                 Cmd::UnfoldAll,
             ),
-            ("▸".into(), tr("レベル 1 で折りたたむ"), String::new(), Cmd::FoldLevel(1)),
-            ("▸".into(), tr("レベル 2 で折りたたむ"), String::new(), Cmd::FoldLevel(2)),
-            ("▸".into(), tr("レベル 3 で折りたたむ"), String::new(), Cmd::FoldLevel(3)),
+            (
+                "▸".into(),
+                tr("レベル 1 で折りたたむ"),
+                String::new(),
+                Cmd::FoldLevel(1),
+            ),
+            (
+                "▸".into(),
+                tr("レベル 2 で折りたたむ"),
+                String::new(),
+                Cmd::FoldLevel(2),
+            ),
+            (
+                "▸".into(),
+                tr("レベル 3 で折りたたむ"),
+                String::new(),
+                Cmd::FoldLevel(3),
+            ),
             (
                 "◆".into(),
                 tr("ブックマーク切替"),
                 fmt_key(BindAction::ToggleBookmark),
                 Cmd::ToggleBookmark,
             ),
-            ("◆".into(), tr("次のブックマークへ"), String::new(), Cmd::NextBookmark),
-            ("◆".into(), tr("前のブックマークへ"), String::new(), Cmd::PrevBookmark),
-            ("◆".into(), tr("ブックマークをすべて解除"), String::new(), Cmd::ClearBookmarks),
+            (
+                "◆".into(),
+                tr("次のブックマークへ"),
+                String::new(),
+                Cmd::NextBookmark,
+            ),
+            (
+                "◆".into(),
+                tr("前のブックマークへ"),
+                String::new(),
+                Cmd::PrevBookmark,
+            ),
+            (
+                "◆".into(),
+                tr("ブックマークをすべて解除"),
+                String::new(),
+                Cmd::ClearBookmarks,
+            ),
             (
                 "📑".into(),
                 tr("閉じたタブを開き直す"),
                 fmt_key(BindAction::ReopenClosedTab),
                 Cmd::ReopenClosedTab,
             ),
-            ("📊".into(), tr("テーブル表示の切替 (CSV / TSV)"), String::new(), Cmd::ToggleTableView),
+            (
+                "📊".into(),
+                tr("テーブル表示の切替 (CSV / TSV)"),
+                String::new(),
+                Cmd::ToggleTableView,
+            ),
             (
                 "💡".into(),
                 tr("補完候補を出す"),
@@ -17369,7 +17720,12 @@ impl ZaivernApp {
                 fmt_key(BindAction::LspSymbols),
                 Cmd::LspSymbols,
             ),
-            ("✏".into(), tr("リネーム"), fmt_key(BindAction::LspRename), Cmd::LspRename),
+            (
+                "✏".into(),
+                tr("リネーム"),
+                fmt_key(BindAction::LspRename),
+                Cmd::LspRename,
+            ),
             (
                 "🛠".into(),
                 tr("ドキュメントを整形"),
@@ -17394,21 +17750,66 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::ToggleLspHighlight,
             ),
-            ("🛠".into(), tr("保存時に整形するかの切替"), String::new(), Cmd::ToggleFormatOnSave),
-            ("🖥".into(), tr("フルスクリーンの切替"), fmt_key(BindAction::ToggleFullScreen), Cmd::ToggleFullScreen),
-            ("🐙".into(), tr("GitHub パネルを開く"), String::new(), Cmd::ShowGitHubTab),
+            (
+                "🛠".into(),
+                tr("保存時に整形するかの切替"),
+                String::new(),
+                Cmd::ToggleFormatOnSave,
+            ),
+            (
+                "🖥".into(),
+                tr("フルスクリーンの切替"),
+                fmt_key(BindAction::ToggleFullScreen),
+                Cmd::ToggleFullScreen,
+            ),
+            (
+                "🐙".into(),
+                tr("GitHub パネルを開く"),
+                String::new(),
+                Cmd::ShowGitHubTab,
+            ),
             (
                 "⌨".into(),
                 tr("キーボード ショートカットのリファレンス"),
                 String::new(),
                 Cmd::ShowShortcuts,
             ),
-            ("ℹ".into(), tr("バージョン情報"), String::new(), Cmd::ShowAbout),
-            ("🔑".into(), tr("ライセンスキーを入力…"), String::new(), Cmd::OpenLicense),
-            ("➕".into(), tr("新規プラグインを作成…"), String::new(), Cmd::NewPlugin),
-            ("📦".into(), tr("プラグインをインストール… (.zvplug / .zip)"), String::new(), Cmd::InstallPlugin),
-            ("🔌".into(), tr("プラグインを表示"), String::new(), Cmd::ShowPlugins),
-            ("⟳".into(), tr("プラグインを再スキャン"), String::new(), Cmd::RescanPlugins),
+            (
+                "ℹ".into(),
+                tr("バージョン情報"),
+                String::new(),
+                Cmd::ShowAbout,
+            ),
+            (
+                "🔑".into(),
+                tr("ライセンスキーを入力…"),
+                String::new(),
+                Cmd::OpenLicense,
+            ),
+            (
+                "➕".into(),
+                tr("新規プラグインを作成…"),
+                String::new(),
+                Cmd::NewPlugin,
+            ),
+            (
+                "📦".into(),
+                tr("プラグインをインストール… (.zvplug / .zip)"),
+                String::new(),
+                Cmd::InstallPlugin,
+            ),
+            (
+                "🔌".into(),
+                tr("プラグインを表示"),
+                String::new(),
+                Cmd::ShowPlugins,
+            ),
+            (
+                "⟳".into(),
+                tr("プラグインを再スキャン"),
+                String::new(),
+                Cmd::RescanPlugins,
+            ),
             // ── 横断検索のオプション ──
             (
                 "⇄".into(),
@@ -17489,17 +17890,42 @@ impl ZaivernApp {
                 Cmd::ConvertLineEnding(crate::textenc::LineEnding::Cr),
             ),
             // ── 第 3 次配線: ガイドツアー / 承認キュー / 複数キャレット / 符号化 ──
-            ("💡".into(), tr("チュートリアルを再開"), String::new(), Cmd::RestartTutorial),
-            ("🛡".into(), tr("承認キューを開く"), String::new(), Cmd::OpenApprovals),
+            (
+                "💡".into(),
+                tr("チュートリアルを再開"),
+                String::new(),
+                Cmd::RestartTutorial,
+            ),
+            (
+                "🛡".into(),
+                tr("承認キューを開く"),
+                String::new(),
+                Cmd::OpenApprovals,
+            ),
             (
                 "📜".into(),
                 tr("承認の監査ログを開く"),
                 String::new(),
                 Cmd::OpenApprovalAudit,
             ),
-            ("🔌".into(), tr("MCP サーバを管理"), String::new(), Cmd::OpenMcp),
-            ("✏".into(), tr("カーソルを上に追加"), String::new(), Cmd::AddCursorAbove),
-            ("✏".into(), tr("カーソルを下に追加"), String::new(), Cmd::AddCursorBelow),
+            (
+                "🔌".into(),
+                tr("MCP サーバを管理"),
+                String::new(),
+                Cmd::OpenMcp,
+            ),
+            (
+                "✏".into(),
+                tr("カーソルを上に追加"),
+                String::new(),
+                Cmd::AddCursorAbove,
+            ),
+            (
+                "✏".into(),
+                tr("カーソルを下に追加"),
+                String::new(),
+                Cmd::AddCursorBelow,
+            ),
             (
                 "✏".into(),
                 tr("全ての出現を選択"),
@@ -17512,8 +17938,18 @@ impl ZaivernApp {
                 fmt_key(BindAction::SelectNextOccurrence),
                 Cmd::SelectNextOccurrence,
             ),
-            ("◇".into(), tr("矩形選択の開始"), String::new(), Cmd::ColumnSelectStart),
-            ("◇".into(), tr("矩形選択の確定"), String::new(), Cmd::ColumnSelectFinish),
+            (
+                "◇".into(),
+                tr("矩形選択の開始"),
+                String::new(),
+                Cmd::ColumnSelectStart,
+            ),
+            (
+                "◇".into(),
+                tr("矩形選択の確定"),
+                String::new(),
+                Cmd::ColumnSelectFinish,
+            ),
             (
                 "✏".into(),
                 tr("複数カーソルを解除"),
@@ -17645,10 +18081,18 @@ impl ZaivernApp {
             } else {
                 "終了"
             });
-            let unread = if s.has_unread() { tr(" ◆未読") } else { String::new() };
+            let unread = if s.has_unread() {
+                tr(" ◆未読")
+            } else {
+                String::new()
+            };
             if let Some(score) = pq.score(&s.title) {
                 items.push(Item {
-                    icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
+                    icon: if s.icon.is_empty() {
+                        "👾".into()
+                    } else {
+                        s.icon.clone()
+                    },
                     label: s.title.clone(),
                     detail: format!("{state}{unread} ・ {}", s.uptime()),
                     action: Action::Cmd(Cmd::FocusAgent(i)),
@@ -17694,9 +18138,7 @@ impl ZaivernApp {
                 }
             }
         }
-        for (branch, path, added) in
-            self.palette_worktrees.as_deref().unwrap_or(&[])
-        {
+        for (branch, path, added) in self.palette_worktrees.as_deref().unwrap_or(&[]) {
             if *added {
                 continue; // 既にワークスペースにあるものは「外す」側で出る
             }
@@ -17744,8 +18186,7 @@ impl ZaivernApp {
 
     /// 各ルートの git worktree 一覧。パレットを開いている間だけキャッシュされる。
     fn list_git_worktrees(&self) -> Vec<(String, PathBuf, bool)> {
-        let canon =
-            |p: &Path| -> PathBuf { p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) };
+        let canon = |p: &Path| -> PathBuf { p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) };
         let roots: Vec<PathBuf> = self.roots.iter().map(|r| canon(r)).collect();
         let mut out: Vec<(String, PathBuf, bool)> = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -17813,7 +18254,10 @@ impl ZaivernApp {
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(theme.panel)
-                    .stroke(egui::Stroke::new(1.0_f32, theme.accent.gamma_multiply(0.55)))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        theme.accent.gamma_multiply(0.55),
+                    ))
                     .rounding(egui::Rounding::same(10.0))
                     .inner_margin(egui::Margin::same(10.0))
                     .shadow(egui::epaint::Shadow {
@@ -17846,10 +18290,7 @@ impl ZaivernApp {
                             // IME イベントと同じフレームの Enter は変換確定なので
                             // コマンド実行に使わない (Windows / Linux の IME 対策。
                             // macOS は winit 側で確定 Enter が抑止される)
-                            let ime = i
-                                .events
-                                .iter()
-                                .any(|e| matches!(e, egui::Event::Ime(_)));
+                            let ime = i.events.iter().any(|e| matches!(e, egui::Event::Ime(_)));
                             (
                                 i.key_pressed(egui::Key::ArrowDown),
                                 i.key_pressed(egui::Key::ArrowUp),
@@ -17861,11 +18302,9 @@ impl ZaivernApp {
                             close = true;
                         }
                         // 見出しは選べない。↑↓ は見出しを飛び越して端で折り返す。
-                        self.palette.selected =
-                            results.step(self.palette.selected, down, up);
+                        self.palette.selected = results.step(self.palette.selected, down, up);
                         if enter && !close {
-                            if let Some(it) = results.selected_item(self.palette.selected)
-                            {
+                            if let Some(it) = results.selected_item(self.palette.selected) {
                                 execute = Some(it.clone());
                             }
                             close = true;
@@ -18010,7 +18449,10 @@ impl ZaivernApp {
                         &[("name", name.clone())],
                     )
                 } else {
-                    trf("ファイル「{name}」を削除しますか？", &[("name", name.clone())])
+                    trf(
+                        "ファイル「{name}」を削除しますか？",
+                        &[("name", name.clone())],
+                    )
                 });
                 ui.label(
                     RichText::new(tr("この操作は取り消せません"))
@@ -18069,7 +18511,9 @@ impl ZaivernApp {
                             true,
                         );
                     }
-                    Err(e) => self.toast(trf("削除できません: {e}", &[("e", e.to_string())]), false),
+                    Err(e) => {
+                        self.toast(trf("削除できません: {e}", &[("e", e.to_string())]), false)
+                    }
                 }
                 self.pending_delete = None;
             }
@@ -18117,7 +18561,9 @@ impl ZaivernApp {
             return;
         }
         if self.agents.running_count() == 0 {
-            self.toast_warn(tr("音声入力の宛先がありません — 先にエージェントを起動してください"));
+            self.toast_warn(tr(
+                "音声入力の宛先がありません — 先にエージェントを起動してください",
+            ));
             return;
         }
         // ブラウザ経路は子プロセスを持たない — /voice をブラウザで開いて、
@@ -18370,9 +18816,7 @@ impl ZaivernApp {
     fn resolve_voice_target(&self) -> Option<u64> {
         match self.voice.target {
             voice::Target::Broadcast => None,
-            voice::Target::Active => {
-                self.agents.sessions.get(self.agents.active).map(|s| s.id)
-            }
+            voice::Target::Active => self.agents.sessions.get(self.agents.active).map(|s| s.id),
             voice::Target::Session(id) => Some(id),
         }
     }
@@ -18536,9 +18980,7 @@ impl ZaivernApp {
             remote::Query::VoiceSend { text, id, submit } => {
                 self.remote_reply_voice_send(text, *id, *submit)
             }
-            remote::Query::TermInput(payload, raw) => {
-                self.remote_reply_term_input(payload, *raw)
-            }
+            remote::Query::TermInput(payload, raw) => self.remote_reply_term_input(payload, *raw),
             remote::Query::Cmd(name, arg) => self.remote_reply_cmd(name, *arg, ctx),
         }
     }
@@ -18613,8 +19055,12 @@ impl ZaivernApp {
         use serde_json::json;
         // 全ルートの索引を表示ラベル (曖昧なときだけルート名付き) で返す。
         // OpenFile ではこのラベルを索引で引き直して絶対パスに戻す。
-        let files: Vec<&String> =
-            self.file_index.iter().take(4000).map(|f| &f.label).collect();
+        let files: Vec<&String> = self
+            .file_index
+            .iter()
+            .take(4000)
+            .map(|f| &f.label)
+            .collect();
         json!({"ok": true, "files": files}).to_string()
     }
 
@@ -18622,8 +19068,7 @@ impl ZaivernApp {
     fn remote_reply_set_text(&mut self, text: &str, index: i64, save: bool) -> String {
         use serde_json::json;
         let Some(active) = self.editor.active else {
-            return json!({"ok": false, "error": "ファイルが開かれていません"})
-                .to_string();
+            return json!({"ok": false, "error": "ファイルが開かれていません"}).to_string();
         };
         // スマホが編集していたタブと PC のアクティブタブが違えば拒否
         // (別ファイルを誤って上書きしない)
@@ -18693,10 +19138,7 @@ impl ZaivernApp {
                 })
                 .to_string()
             }
-            Err(e) => {
-                json!({"ok": false, "error": format!("保存に失敗しました: {e}")})
-                    .to_string()
-            }
+            Err(e) => json!({"ok": false, "error": format!("保存に失敗しました: {e}")}).to_string(),
         }
     }
 
@@ -18711,8 +19153,7 @@ impl ZaivernApp {
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
         {
-            return json!({"ok": false, "error": "ワークスペース外は開けません"})
-                .to_string();
+            return json!({"ok": false, "error": "ワークスペース外は開けません"}).to_string();
         }
         // 索引の表示ラベル → 絶対パス (マルチルートでも一意に定まる)。
         // 索引に無ければ各ルートからの相対パスとして解決を試みる。
@@ -18721,12 +19162,7 @@ impl ZaivernApp {
             .iter()
             .find(|f| f.label == *rel)
             .map(|f| f.abs.clone())
-            .or_else(|| {
-                self.roots
-                    .iter()
-                    .map(|r| r.join(rel))
-                    .find(|c| c.is_file())
-            })
+            .or_else(|| self.roots.iter().map(|r| r.join(rel)).find(|c| c.is_file()))
             .unwrap_or_else(|| self.primary_root().join(rel));
 
         // パストラバーサル防御 (セキュリティ上の要): canonicalize したうえで
@@ -18738,8 +19174,7 @@ impl ZaivernApp {
             canon.starts_with(&root)
         });
         if !inside {
-            return json!({"ok": false, "error": "ワークスペース外は開けません"})
-                .to_string();
+            return json!({"ok": false, "error": "ワークスペース外は開けません"}).to_string();
         }
         match self.editor.open(&p, self.highlighter) {
             Ok(reloaded) => {
@@ -18860,13 +19295,16 @@ impl ZaivernApp {
         } else {
             text.clone()
         };
-        let verb = if submit { tr("送信") } else { tr("入力欄へ") };
+        let verb = if submit {
+            tr("送信")
+        } else {
+            tr("入力欄へ")
+        };
         if id < 0 {
             // 全エージェントへブロードキャスト
             let n = self.agents.running_count();
             if n == 0 {
-                return json!({"ok": false, "error": "実行中のセッションがありません"})
-                    .to_string();
+                return json!({"ok": false, "error": "実行中のセッションがありません"}).to_string();
             }
             for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
                 // リモートからの手動送信もユーザーの応答扱い
@@ -18887,12 +19325,7 @@ impl ZaivernApp {
             json!({"ok": true, "sent": n}).to_string()
         } else {
             // セッション id 指定 (インデックスではなく id — 閉じてもずれない)
-            match self
-                .agents
-                .sessions
-                .iter_mut()
-                .find(|s| s.id == id as u64)
-            {
+            match self.agents.sessions.iter_mut().find(|s| s.id == id as u64) {
                 Some(s) if s.running() => {
                     s.note_user_input();
                     s.write_bytes(payload.as_bytes());
@@ -18900,8 +19333,7 @@ impl ZaivernApp {
                     self.toast(format!("🎤 {title} {verb}: {text}"), true);
                     json!({"ok": true, "sent": 1}).to_string()
                 }
-                Some(_) => json!({"ok": false, "error": "セッションが停止しています"})
-                    .to_string(),
+                Some(_) => json!({"ok": false, "error": "セッションが停止しています"}).to_string(),
                 None => json!({
                     "ok": false,
                     "error": "セッションが見つかりません (閉じられた可能性)",
@@ -18925,9 +19357,7 @@ impl ZaivernApp {
                 }
                 json!({"ok": true}).to_string()
             }
-            _ => {
-                json!({"ok": false, "error": "実行中のセッションがありません"}).to_string()
-            }
+            _ => json!({"ok": false, "error": "実行中のセッションがありません"}).to_string(),
         }
     }
 
@@ -19066,11 +19496,8 @@ impl ZaivernApp {
                         size: [size, size],
                         pixels,
                     };
-                    self.qr_tex = Some(ctx.load_texture(
-                        "zv-remote-qr",
-                        img,
-                        egui::TextureOptions::NEAREST,
-                    ));
+                    self.qr_tex =
+                        Some(ctx.load_texture("zv-remote-qr", img, egui::TextureOptions::NEAREST));
                 }
             }
         }
@@ -19114,7 +19541,11 @@ impl ZaivernApp {
         let fw_busy = self.fw.busy();
         let fw_report = self.fw.report().cloned();
         let fw_error = self.fw.error.clone();
-        let fw_manual = if fw_check { self.fw.manual() } else { String::new() };
+        let fw_manual = if fw_check {
+            self.fw.manual()
+        } else {
+            String::new()
+        };
         let mut fw_allow = false;
         let mut fw_revoke = false;
         let mut fw_recheck = false;
@@ -19122,8 +19553,16 @@ impl ZaivernApp {
         let mut fw_unblock = false;
         let mut fw_copy_exe = false;
         // 別のファイアウォール製品 (ノートン等) の名前と、そこへ登録する exe パス
-        let fw_other = if fw_check { self.fw.other_firewall() } else { String::new() };
-        let fw_exe = if fw_check { self.fw.exe() } else { String::new() };
+        let fw_other = if fw_check {
+            self.fw.other_firewall()
+        } else {
+            String::new()
+        };
+        let fw_exe = if fw_check {
+            self.fw.exe()
+        } else {
+            String::new()
+        };
 
         egui::Window::new(tr("📱 スマホリモート"))
             .open(&mut open)
@@ -19613,7 +20052,11 @@ impl ZaivernApp {
         if tunnel_copy_l {
             match tunnel::parse_target(&self.tunnel_host) {
                 Ok(t) => {
-                    let port = self.remote.as_ref().map(|r| r.port).unwrap_or(remote::PORT_FROM);
+                    let port = self
+                        .remote
+                        .as_ref()
+                        .map(|r| r.port)
+                        .unwrap_or(remote::PORT_FROM);
                     ctx.copy_text(tunnel::ssh_l_command(&t, port, port));
                     self.toast(tr("ssh -L のコマンドをコピーしました"), true);
                 }
@@ -19752,8 +20195,8 @@ impl ZaivernApp {
     /// 指示が二重通知扱いで握り潰されたりする。
     fn sync_super_agent_session(&mut self) {
         let sa = &self.cfg.super_agent;
-        let appointed = sa.enabled
-            && (!sa.session_title.trim().is_empty() || !sa.command.trim().is_empty());
+        let appointed =
+            sa.enabled && (!sa.session_title.trim().is_empty() || !sa.command.trim().is_empty());
         let id = if appointed {
             // 素のシェル (コマンド空) は候補から外す。エコーの @行 を指示と
             // 誤検出しやすい (理由文は commander_reject_reason 参照)。
@@ -19871,7 +20314,10 @@ impl ZaivernApp {
         // 確認ゲートを飛ばす近道は作らない。
         let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
         for d in self.supervisor.poll_diagnoses() {
-            self.toast(trf("💡 AI 診断: {summary}", &[("summary", d.summary.clone())]), false);
+            self.toast(
+                trf("💡 AI 診断: {summary}", &[("summary", d.summary.clone())]),
+                false,
+            );
             if let Some(it) = self.supervisor.intent_from_diagnosis(&d, approval) {
                 self.accept_intent(it, ctx, win_focused);
             }
@@ -19903,10 +20349,7 @@ impl ZaivernApp {
             // (AutoAnswer) を **エージェントへ直接投げない**。エージェントへ実際に
             // 働きかけるのは、スーパーエージェントの指揮 (drive_commander) のみ。
             use supervisor::Intervention as I;
-            if matches!(
-                it.action,
-                I::AutoAnswer | I::Nudge | I::Restart | I::Halt
-            ) {
+            if matches!(it.action, I::AutoAnswer | I::Nudge | I::Restart | I::Halt) {
                 continue;
             }
             // llm_escalation は常に false なので、この相談は入口で no-op (spawn しない)。
@@ -19987,7 +20430,12 @@ impl ZaivernApp {
             .map(|s| {
                 (
                     s.id,
-                    coordinator_state(s.running(), s.attention, s.rate_limited.is_some(), self.supervisor.state_of(s.id)),
+                    coordinator_state(
+                        s.running(),
+                        s.attention,
+                        s.rate_limited.is_some(),
+                        self.supervisor.state_of(s.id),
+                    ),
                 )
             })
             .collect();
@@ -20108,7 +20556,12 @@ impl ZaivernApp {
                 id: s.id,
                 title: s.title.clone(),
                 running: s.running(),
-                state: coordinator_state(s.running(), s.attention, s.rate_limited.is_some(), self.supervisor.state_of(s.id)),
+                state: coordinator_state(
+                    s.running(),
+                    s.attention,
+                    s.rate_limited.is_some(),
+                    self.supervisor.state_of(s.id),
+                ),
             })
             .collect()
     }
@@ -20174,7 +20627,8 @@ impl ZaivernApp {
 
         // 前任の停止が確認できたタスクだけを次の担当へ渡す。
         let rows = self.orch_rows();
-        let eff = orchestration::redispatch_ready(&mut self.orch, &mut self.coordinator, &rows, now);
+        let eff =
+            orchestration::redispatch_ready(&mut self.orch, &mut self.coordinator, &rows, now);
         self.orch_effects(eff);
     }
 
@@ -20293,10 +20747,7 @@ impl ZaivernApp {
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let label = trf(
-                        "▶ {action} を実行",
-                        &[("action", tr(it.action.label()))],
-                    );
+                    let label = trf("▶ {action} を実行", &[("action", tr(it.action.label()))]);
                     if ui.button(RichText::new(label).color(warn)).clicked() {
                         decided = Some(true);
                     }
@@ -20337,7 +20788,10 @@ impl ZaivernApp {
                 ui.label(&body);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new(tr("🛑 停止する")).color(warn)).clicked() {
+                    if ui
+                        .button(RichText::new(tr("🛑 停止する")).color(warn))
+                        .clicked()
+                    {
                         decided = Some(true);
                     }
                     if ui.button(tr("キャンセル")).clicked() {
@@ -20476,10 +20930,8 @@ impl ZaivernApp {
                 .color(err),
             );
             ui.label(
-                RichText::new(tr(
-                    "内部エラーが繰り返し起きたため描画から外しています。\n\
-                     詳細は ~/.zaivern/panic.log を見てください。",
-                ))
+                RichText::new(tr("内部エラーが繰り返し起きたため描画から外しています。\n\
+                     詳細は ~/.zaivern/panic.log を見てください。"))
                 .size(11.5)
                 .color(dim),
             );
@@ -20563,11 +21015,10 @@ impl eframe::App for ZaivernApp {
                 let msg = panic_message(&*payload);
                 // 犯人はまず「描いている途中の印」から。取れなければ
                 // panic メッセージに混ざった位置情報から推測する。
-                let culprit =
-                    take_drawing_subview().or_else(|| subview_from_panic_message(&msg));
-                let action =
-                    self.frame_guard
-                        .observe(FrameOutcome::Panic, culprit.clone(), now_ms);
+                let culprit = take_drawing_subview().or_else(|| subview_from_panic_message(&msg));
+                let action = self
+                    .frame_guard
+                    .observe(FrameOutcome::Panic, culprit.clone(), now_ms);
                 eprintln!(
                     "zaivern: frame panicked ({action:?}, culprit={culprit:?}) — {msg} \
                      (details: ~/.zaivern/panic.log)"
@@ -20759,8 +21210,7 @@ impl ZaivernApp {
                 .iter()
                 .filter_map(|b| b.path.clone())
                 .collect();
-            let closed: Vec<PathBuf> =
-                self.lsp_opened.difference(&open_paths).cloned().collect();
+            let closed: Vec<PathBuf> = self.lsp_opened.difference(&open_paths).cloned().collect();
             for p in closed {
                 for client in self.lsp.values() {
                     client.did_close(&p);
@@ -20785,7 +21235,8 @@ impl ZaivernApp {
                         .get(&title)
                         .is_some_and(|at| at.elapsed().as_secs() < 10);
                     if !throttled {
-                        self.pet_attention_notified.insert(title.clone(), Instant::now());
+                        self.pet_attention_notified
+                            .insert(title.clone(), Instant::now());
                         self.toast_warn(trf(
                             "🔔 {title} が承認待ちです — パネルで確認してください",
                             &[("title", title.clone())],
@@ -20959,14 +21410,18 @@ impl ZaivernApp {
         {
             let sessions = &self.agents.sessions;
             // 承認待ちでなくなったセッションの却下記録は外す(次のプロンプトで再表示)
-            self.pet_bubble_dismissed
-                .retain(|&id| sessions.iter().any(|s| s.id == id && s.attention && s.running()));
+            self.pet_bubble_dismissed.retain(|&id| {
+                sessions
+                    .iter()
+                    .any(|s| s.id == id && s.attention && s.running())
+            });
             // 応答済み記録は3秒経過またはセッション消滅で外す
             self.pet_bubble_answered.retain(|&id, at| {
                 at.elapsed().as_secs() < 3 && sessions.iter().any(|s| s.id == id)
             });
             // 通知スロットルの古い記録も掃除する
-            self.pet_attention_notified.retain(|_, at| at.elapsed().as_secs() < 10);
+            self.pet_attention_notified
+                .retain(|_, at| at.elapsed().as_secs() < 10);
         }
 
         // ── 監視・連携 ────────────────────────────────────────
@@ -21219,7 +21674,11 @@ impl ZaivernApp {
                     .map(|(i, s)| pet_bubble::BubbleItem {
                         session_idx: i,
                         key: s.id,
-                        icon: if s.icon.is_empty() { "👾".into() } else { s.icon.clone() },
+                        icon: if s.icon.is_empty() {
+                            "👾".into()
+                        } else {
+                            s.icon.clone()
+                        },
                         title: s.title.clone(),
                     })
                     .collect();
@@ -21379,10 +21838,13 @@ impl ZaivernApp {
             || self.awaiting_definition.is_some();
         // 外部での書き換えを見張る対象: 開いているフォルダか、
         // ディスク上のファイルに紐付いたタブ (`check_external_changes` の対象)
-        let watching_files = !self.roots.is_empty()
-            || self.editor.buffers.iter().any(|b| b.path.is_some());
+        let watching_files =
+            !self.roots.is_empty() || self.editor.buffers.iter().any(|b| b.path.is_some());
         let timers_due = self.menu_state.auto_save
-            || !self.plugins.active_hooks(plugins::HookEvent::Interval).is_empty();
+            || !self
+                .plugins
+                .active_hooks(plugins::HookEvent::Interval)
+                .is_empty();
         let signals = IdleSignals {
             had_input,
             animating: ctx.has_requested_repaint(),
@@ -21587,12 +22049,7 @@ fn restored_roots(current: &[PathBuf], mut saved: Vec<PathBuf>) -> Option<Vec<Pa
 /// - ディレクトリとして実在する (worktree を消した後などを弾く)
 /// - いずれかのルート配下にある (ワークスペースから外したフォルダを弾く)
 fn agent_cwd_from(roots: &[PathBuf], chosen: Option<&Path>) -> PathBuf {
-    let primary = || {
-        roots
-            .first()
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("."))
-    };
+    let primary = || roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     match chosen {
         Some(c) if c.is_dir() && roots.iter().any(|r| c.starts_with(r)) => c.to_path_buf(),
         _ => primary(),
@@ -21611,7 +22068,11 @@ fn parse_gitdir_file(contents: &str, workspace: &Path) -> Option<PathBuf> {
         return None;
     }
     let p = PathBuf::from(raw);
-    Some(if p.is_absolute() { p } else { workspace.join(p) })
+    Some(if p.is_absolute() {
+        p
+    } else {
+        workspace.join(p)
+    })
 }
 
 /// ブランチ表示のために読むべき HEAD のパス。
@@ -21720,10 +22181,7 @@ fn chrome_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    CANDIDATES
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
+    CANDIDATES.iter().map(PathBuf::from).find(|p| p.is_file())
 }
 
 fn open_external(target: &str) {
@@ -21822,7 +22280,9 @@ fn push_fallback_font<'a>(
     candidates: &[&'a str],
 ) -> Option<&'a str> {
     for p in candidates {
-        let Ok(bytes) = std::fs::read(p) else { continue };
+        let Ok(bytes) = std::fs::read(p) else {
+            continue;
+        };
         fonts
             .font_data
             .insert(name.to_owned(), egui::FontData::from_owned(bytes));
@@ -21858,7 +22318,9 @@ fn push_fallback_fonts_all(
         if Some(*p) == skip {
             continue;
         }
-        let Ok(bytes) = std::fs::read(p) else { continue };
+        let Ok(bytes) = std::fs::read(p) else {
+            continue;
+        };
         let key = format!("{name}{n}");
         fonts
             .font_data
@@ -21985,12 +22447,9 @@ impl ZaivernApp {
             .iter()
             .enumerate()
             .flat_map(|(pi, p)| {
-                p.commands
-                    .iter()
-                    .enumerate()
-                    .map(move |(ci, c)| {
-                        (pi, ci, c.icon.clone(), format!("{}: {}", p.name, c.title))
-                    })
+                p.commands.iter().enumerate().map(move |(ci, c)| {
+                    (pi, ci, c.icon.clone(), format!("{}: {}", p.name, c.title))
+                })
             })
             .take(40)
             .collect();
@@ -22071,12 +22530,18 @@ impl ZaivernApp {
         if saved > 0 {
             self.persist_session();
             self.toast(
-                trf("💾 {n} 件のファイルを保存しました", &[("n", saved.to_string())]),
+                trf(
+                    "💾 {n} 件のファイルを保存しました",
+                    &[("n", saved.to_string())],
+                ),
                 true,
             );
         }
         if untitled > 0 {
-            self.toast(tr("無題のタブは「名前を付けて保存」で保存してください"), false);
+            self.toast(
+                tr("無題のタブは「名前を付けて保存」で保存してください"),
+                false,
+            );
         }
     }
 
@@ -22087,7 +22552,11 @@ impl ZaivernApp {
         if !self.menu_state.auto_save {
             return;
         }
-        if self.autosave_at.map(|t| t.elapsed().as_millis() < 2000).unwrap_or(false) {
+        if self
+            .autosave_at
+            .map(|t| t.elapsed().as_millis() < 2000)
+            .unwrap_or(false)
+        {
             return;
         }
         self.autosave_at = Some(Instant::now());
@@ -22138,7 +22607,13 @@ impl ZaivernApp {
         b.gutter = None;
         let title = b.title.clone();
         self.queue_lsp_change(i);
-        self.toast(trf("↺ {title} をディスクの内容に戻しました", &[("title", title)]), true);
+        self.toast(
+            trf(
+                "↺ {title} をディスクの内容に戻しました",
+                &[("title", title)],
+            ),
+            true,
+        );
     }
 
     /// すべてのエディタタブを閉じる。未保存タブは確認ダイアログに回す。
@@ -22220,7 +22695,9 @@ impl ZaivernApp {
 
     /// アクティブなエディタのカーソル位置 (char)。TextEdit の状態から読む。
     fn active_cursor_char(&self, ctx: &egui::Context) -> usize {
-        let Some(i) = self.editor.active else { return 0 };
+        let Some(i) = self.editor.active else {
+            return 0;
+        };
         let ed_id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
         egui::TextEdit::load_state(ctx, ed_id)
             .and_then(|st| st.cursor.char_range())
@@ -22229,7 +22706,9 @@ impl ZaivernApp {
     }
 
     fn active_file_path(&self) -> Option<PathBuf> {
-        self.editor.active.and_then(|i| self.editor.buffers[i].path.clone())
+        self.editor
+            .active
+            .and_then(|i| self.editor.buffers[i].path.clone())
     }
 
     // ── ナビゲーション履歴 (戻る / 進む) ──
@@ -22294,8 +22773,7 @@ impl ZaivernApp {
         // 現在位置を履歴へ (エディタのカーソルは (行, 桁) で保持されている)
         if let (Some(cur), Some(i)) = (self.active_file_path(), self.editor.active) {
             let (line0, col0) = self.editor.cursor;
-            let cur_char =
-                editor_ops::char_index_at(&self.editor.buffers[i].text, line0, col0);
+            let cur_char = editor_ops::char_index_at(&self.editor.buffers[i].text, line0, col0);
             self.nav_push(cur, cur_char);
         }
         if self.active_file_path().as_deref() != Some(path) {
@@ -22334,7 +22812,10 @@ impl ZaivernApp {
             return;
         };
         if !client.is_ready() {
-            self.toast(tr("LSP サーバーの準備中です — 少し待ってからもう一度"), false);
+            self.toast(
+                tr("LSP サーバーの準備中です — 少し待ってからもう一度"),
+                false,
+            );
             return;
         }
         let cursor = self.active_cursor_char(ctx);
@@ -22345,12 +22826,16 @@ impl ZaivernApp {
 
     /// F12 の応答を毎フレーム確認して、届いたらジャンプする。
     fn poll_definition_result(&mut self) {
-        let Some(key) = self.awaiting_definition.clone() else { return };
+        let Some(key) = self.awaiting_definition.clone() else {
+            return;
+        };
         let Some(client) = self.lsp.get(&key) else {
             self.awaiting_definition = None;
             return;
         };
-        let Some(resp) = client.poll_definition() else { return };
+        let Some(resp) = client.poll_definition() else {
+            return;
+        };
         self.awaiting_definition = None;
         match resp {
             Some(loc) => self.jump_to_lsp_pos(&loc.path.clone(), loc.line, loc.col),
@@ -22386,10 +22871,12 @@ impl ZaivernApp {
             cwd: Some(cwd.display().to_string()),
             env: HashMap::new(),
         };
-        match self
-            .agents
-            .launch(&preset, cwd, Approval::from_mode(&self.cfg.approval_mode), ctx)
-        {
+        match self.agents.launch(
+            &preset,
+            cwd,
+            Approval::from_mode(&self.cfg.approval_mode),
+            ctx,
+        ) {
             Ok(()) => {
                 self.agents.panel_open = true;
                 self.toast(trf("▶ {name} を開始しました", &[("name", name)]), true);
@@ -22401,7 +22888,13 @@ impl ZaivernApp {
     fn run_active_file(&mut self, ctx: &egui::Context) {
         let Some(i) = self.editor.active else { return };
         let Some(path) = self.editor.buffers[i].path.clone() else {
-            self.toast(trf("先にファイルとして保存してください ({key})", &[("key", self.key_hint(BindAction::Save))]), false);
+            self.toast(
+                trf(
+                    "先にファイルとして保存してください ({key})",
+                    &[("key", self.key_hint(BindAction::Save))],
+                ),
+                false,
+            );
             return;
         };
         if self.editor.buffers[i].dirty() {
@@ -22494,7 +22987,9 @@ impl ZaivernApp {
         if self.gsearch.query.trim().is_empty() || self.gsearch.running {
             return;
         }
-        let opts = self.gsearch.options(Some(self.primary_root().to_path_buf()));
+        let opts = self
+            .gsearch
+            .options(Some(self.primary_root().to_path_buf()));
         let files: Vec<PathBuf> = self.file_index.iter().map(|f| f.abs.clone()).collect();
         // 正規表現のコンパイルは spawn_with_options が**同期で**返すので、
         // 壊れたパターンはここで赤字にする (literal に落として黙って別の結果を出さない)
@@ -22547,7 +23042,9 @@ impl ZaivernApp {
         if self.gsearch.results.is_empty() {
             return;
         }
-        let opts = self.gsearch.options(Some(self.primary_root().to_path_buf()));
+        let opts = self
+            .gsearch
+            .options(Some(self.primary_root().to_path_buf()));
         let Ok(m) = file_search::Matcher::compile(&opts) else {
             return;
         };
@@ -22588,7 +23085,9 @@ impl ZaivernApp {
             }
         };
         let req = file_search::ReplaceRequest {
-            options: self.gsearch.options(Some(self.primary_root().to_path_buf())),
+            options: self
+                .gsearch
+                .options(Some(self.primary_root().to_path_buf())),
             replacement: self.gsearch.replace.clone(),
             dry_run: dry,
         };
@@ -22676,8 +23175,7 @@ impl ZaivernApp {
         let hit = self.find.last.filter(|c| {
             let sb = editor_ops::char_to_byte(&text, *c);
             let eb = editor_ops::char_to_byte(&text, *c + qn);
-            eb <= text.len()
-                && text[sb..eb].to_lowercase() == self.find.query.to_lowercase()
+            eb <= text.len() && text[sb..eb].to_lowercase() == self.find.query.to_lowercase()
         });
         let Some(c) = hit else {
             self.find_next();
@@ -22779,9 +23277,13 @@ impl ZaivernApp {
         for b in &self.editor.buffers {
             let Some(path) = b.path.clone() else { continue };
             let key = self.lsp_key_for(&path, &b.lang);
-            let Some(client) = self.lsp.get(&key) else { continue };
+            let Some(client) = self.lsp.get(&key) else {
+                continue;
+            };
             let can_fix = client.caps().code_action;
-            let Some(diags) = client.diagnostics(&path) else { continue };
+            let Some(diags) = client.diagnostics(&path) else {
+                continue;
+            };
             for d in diags.iter() {
                 rows.push((path.clone(), b.title.clone(), d.clone(), can_fix));
             }
@@ -23135,15 +23637,11 @@ fn license_status_head(
     theme: &theme::Theme,
 ) -> (&'static str, String, egui::Color32) {
     match status {
-        license::LicenseStatus::Valid { .. } => {
-            ("✨", tr("Pro ライセンス 有効"), theme.ok)
-        }
+        license::LicenseStatus::Valid { .. } => ("✨", tr("Pro ライセンス 有効"), theme.ok),
         license::LicenseStatus::Expired { .. } => ("⌛", tr("期限切れ"), theme.warn),
         license::LicenseStatus::Malformed(_) => ("⚠", tr("キーの形式が不正です"), theme.err),
         license::LicenseStatus::BadSignature => ("⚠", tr("キーの署名が不正です"), theme.err),
-        license::LicenseStatus::Unlicensed => {
-            ("🆓", tr("未ライセンス (無料版)"), theme.text_dim)
-        }
+        license::LicenseStatus::Unlicensed => ("🆓", tr("未ライセンス (無料版)"), theme.text_dim),
     }
 }
 
@@ -23151,49 +23649,169 @@ fn license_status_head(
 fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
     use crate::keybinds::format_shortcut;
     let mut rows: Vec<(String, String)> = vec![
-        (tr("コマンド パレット"), format_shortcut(keys.get(BindAction::PaletteCommands))),
-        (tr("ファイルへ移動"), format_shortcut(keys.get(BindAction::PaletteFiles))),
+        (
+            tr("コマンド パレット"),
+            format_shortcut(keys.get(BindAction::PaletteCommands)),
+        ),
+        (
+            tr("ファイルへ移動"),
+            format_shortcut(keys.get(BindAction::PaletteFiles)),
+        ),
         (tr("保存"), format_shortcut(keys.get(BindAction::Save))),
-        (tr("名前を付けて保存"), format_shortcut(keys.get(BindAction::SaveAs))),
-        (tr("すべて保存"), format_shortcut(keys.get(BindAction::SaveAll))),
-        (tr("新規ファイル"), format_shortcut(keys.get(BindAction::NewFile))),
-        (tr("新しいウィンドウ"), format_shortcut(keys.get(BindAction::NewWindow))),
-        (tr("ファイルを開く"), format_shortcut(keys.get(BindAction::OpenFile))),
-        (tr("タブを閉じる"), format_shortcut(keys.get(BindAction::CloseTab))),
-        (tr("エディタを右に分割"), format_shortcut(keys.get(BindAction::SplitEditorRight))),
-        (tr("エディタを下に分割"), format_shortcut(keys.get(BindAction::SplitEditorDown))),
-        (tr("1 番目のペインへ"), format_shortcut(keys.get(BindAction::FocusPane1))),
-        (tr("2 番目のペインへ"), format_shortcut(keys.get(BindAction::FocusPane2))),
-        (tr("3 番目のペインへ"), format_shortcut(keys.get(BindAction::FocusPane3))),
+        (
+            tr("名前を付けて保存"),
+            format_shortcut(keys.get(BindAction::SaveAs)),
+        ),
+        (
+            tr("すべて保存"),
+            format_shortcut(keys.get(BindAction::SaveAll)),
+        ),
+        (
+            tr("新規ファイル"),
+            format_shortcut(keys.get(BindAction::NewFile)),
+        ),
+        (
+            tr("新しいウィンドウ"),
+            format_shortcut(keys.get(BindAction::NewWindow)),
+        ),
+        (
+            tr("ファイルを開く"),
+            format_shortcut(keys.get(BindAction::OpenFile)),
+        ),
+        (
+            tr("タブを閉じる"),
+            format_shortcut(keys.get(BindAction::CloseTab)),
+        ),
+        (
+            tr("エディタを右に分割"),
+            format_shortcut(keys.get(BindAction::SplitEditorRight)),
+        ),
+        (
+            tr("エディタを下に分割"),
+            format_shortcut(keys.get(BindAction::SplitEditorDown)),
+        ),
+        (
+            tr("1 番目のペインへ"),
+            format_shortcut(keys.get(BindAction::FocusPane1)),
+        ),
+        (
+            tr("2 番目のペインへ"),
+            format_shortcut(keys.get(BindAction::FocusPane2)),
+        ),
+        (
+            tr("3 番目のペインへ"),
+            format_shortcut(keys.get(BindAction::FocusPane3)),
+        ),
         (tr("検索"), format_shortcut(keys.get(BindAction::Find))),
-        (tr("置換"), format_shortcut(keys.get(BindAction::OpenReplace))),
-        (tr("ファイル間で検索"), format_shortcut(keys.get(BindAction::GlobalSearch))),
-        (tr("ファイル間で置換"), format_shortcut(keys.get(BindAction::GlobalReplace))),
-        (tr("行コメントの切り替え"), format_shortcut(keys.get(BindAction::ToggleComment))),
-        (tr("行を複製"), format_shortcut(keys.get(BindAction::DuplicateLine))),
-        (tr("行を上へ移動"), format_shortcut(keys.get(BindAction::MoveLineUp))),
-        (tr("行を下へ移動"), format_shortcut(keys.get(BindAction::MoveLineDown))),
-        (tr("行/列へ移動"), format_shortcut(keys.get(BindAction::GoToLine))),
-        (tr("定義へ移動"), format_shortcut(keys.get(BindAction::GoToDefinition))),
-        (tr("ブラケットへ移動"), format_shortcut(keys.get(BindAction::GoToBracket))),
+        (
+            tr("置換"),
+            format_shortcut(keys.get(BindAction::OpenReplace)),
+        ),
+        (
+            tr("ファイル間で検索"),
+            format_shortcut(keys.get(BindAction::GlobalSearch)),
+        ),
+        (
+            tr("ファイル間で置換"),
+            format_shortcut(keys.get(BindAction::GlobalReplace)),
+        ),
+        (
+            tr("行コメントの切り替え"),
+            format_shortcut(keys.get(BindAction::ToggleComment)),
+        ),
+        (
+            tr("行を複製"),
+            format_shortcut(keys.get(BindAction::DuplicateLine)),
+        ),
+        (
+            tr("行を上へ移動"),
+            format_shortcut(keys.get(BindAction::MoveLineUp)),
+        ),
+        (
+            tr("行を下へ移動"),
+            format_shortcut(keys.get(BindAction::MoveLineDown)),
+        ),
+        (
+            tr("行/列へ移動"),
+            format_shortcut(keys.get(BindAction::GoToLine)),
+        ),
+        (
+            tr("定義へ移動"),
+            format_shortcut(keys.get(BindAction::GoToDefinition)),
+        ),
+        (
+            tr("ブラケットへ移動"),
+            format_shortcut(keys.get(BindAction::GoToBracket)),
+        ),
         (tr("戻る"), format_shortcut(keys.get(BindAction::NavBack))),
-        (tr("進む"), format_shortcut(keys.get(BindAction::NavForward))),
-        (tr("次のエディター"), format_shortcut(keys.get(BindAction::NextTab))),
-        (tr("前のエディター"), format_shortcut(keys.get(BindAction::PrevTab))),
-        (tr("エクスプローラー"), format_shortcut(keys.get(BindAction::FocusExplorer))),
-        (tr("サイドバー切替"), format_shortcut(keys.get(BindAction::ToggleSidebar))),
-        (tr("ターミナル切替"), format_shortcut(keys.get(BindAction::ToggleTerminal))),
-        (tr("新しいターミナル"), format_shortcut(keys.get(BindAction::NewTerminal))),
-        (tr("Cockpit 切替"), format_shortcut(keys.get(BindAction::ToggleCockpit))),
-        (tr("フリート看板 切替"), format_shortcut(keys.get(BindAction::ToggleKanban))),
-        (tr("エージェントデッキ 切替"), format_shortcut(keys.get(BindAction::ToggleDeck))),
-        (tr("Markdown プレビュー"), format_shortcut(keys.get(BindAction::ToggleMdPreview))),
-        (tr("エージェント起動"), format_shortcut(keys.get(BindAction::NewAgent))),
-        (tr("ビルド タスクの実行"), format_shortcut(keys.get(BindAction::RunBuildTask))),
-        (tr("問題パネル"), format_shortcut(keys.get(BindAction::ToggleProblems))),
-        (tr("フルスクリーン"), format_shortcut(keys.get(BindAction::ToggleFullScreen))),
-        (tr("フォント拡大"), format_shortcut(keys.get(BindAction::FontInc))),
-        (tr("フォント縮小"), format_shortcut(keys.get(BindAction::FontDec))),
+        (
+            tr("進む"),
+            format_shortcut(keys.get(BindAction::NavForward)),
+        ),
+        (
+            tr("次のエディター"),
+            format_shortcut(keys.get(BindAction::NextTab)),
+        ),
+        (
+            tr("前のエディター"),
+            format_shortcut(keys.get(BindAction::PrevTab)),
+        ),
+        (
+            tr("エクスプローラー"),
+            format_shortcut(keys.get(BindAction::FocusExplorer)),
+        ),
+        (
+            tr("サイドバー切替"),
+            format_shortcut(keys.get(BindAction::ToggleSidebar)),
+        ),
+        (
+            tr("ターミナル切替"),
+            format_shortcut(keys.get(BindAction::ToggleTerminal)),
+        ),
+        (
+            tr("新しいターミナル"),
+            format_shortcut(keys.get(BindAction::NewTerminal)),
+        ),
+        (
+            tr("Cockpit 切替"),
+            format_shortcut(keys.get(BindAction::ToggleCockpit)),
+        ),
+        (
+            tr("フリート看板 切替"),
+            format_shortcut(keys.get(BindAction::ToggleKanban)),
+        ),
+        (
+            tr("エージェントデッキ 切替"),
+            format_shortcut(keys.get(BindAction::ToggleDeck)),
+        ),
+        (
+            tr("Markdown プレビュー"),
+            format_shortcut(keys.get(BindAction::ToggleMdPreview)),
+        ),
+        (
+            tr("エージェント起動"),
+            format_shortcut(keys.get(BindAction::NewAgent)),
+        ),
+        (
+            tr("ビルド タスクの実行"),
+            format_shortcut(keys.get(BindAction::RunBuildTask)),
+        ),
+        (
+            tr("問題パネル"),
+            format_shortcut(keys.get(BindAction::ToggleProblems)),
+        ),
+        (
+            tr("フルスクリーン"),
+            format_shortcut(keys.get(BindAction::ToggleFullScreen)),
+        ),
+        (
+            tr("フォント拡大"),
+            format_shortcut(keys.get(BindAction::FontInc)),
+        ),
+        (
+            tr("フォント縮小"),
+            format_shortcut(keys.get(BindAction::FontDec)),
+        ),
     ];
     // egui TextEdit 内蔵 (バインド変更不可) のもの
     for (label, spec) in [
@@ -23247,7 +23865,11 @@ fn search_row_job(
     job.append(&format!("{:>5}  ", line_no), 0.0, dim);
     let mut at = 0usize;
     for &(s, e) in marks {
-        if s < at || e <= s || e > text.len() || !text.is_char_boundary(s) || !text.is_char_boundary(e)
+        if s < at
+            || e <= s
+            || e > text.len()
+            || !text.is_char_boundary(s)
+            || !text.is_char_boundary(e)
         {
             continue;
         }
@@ -23300,7 +23922,11 @@ fn global_search_panel(
     ui.horizontal(|ui| {
         let mut changed = false;
         let toggles: [(&mut bool, &str, &str); 3] = [
-            (&mut gsearch.case_sensitive, "Aa", "大文字と小文字を区別する"),
+            (
+                &mut gsearch.case_sensitive,
+                "Aa",
+                "大文字と小文字を区別する",
+            ),
             (&mut gsearch.whole_word, "Ab|", "単語単位で検索する"),
             (&mut gsearch.regex, ".*", "正規表現として検索する"),
         ];
@@ -23349,7 +23975,9 @@ fn global_search_panel(
             let can = !gsearch.query.trim().is_empty() && !gsearch.phase.busy();
             if ui
                 .add_enabled(can, egui::Button::new(tr("置換")))
-                .on_hover_text(tr("まず件数だけ数えます (この時点では 1 バイトも書きません)"))
+                .on_hover_text(tr(
+                    "まず件数だけ数えます (この時点では 1 バイトも書きません)",
+                ))
                 .clicked()
             {
                 replace_ev = Some(ReplaceEvent::Start);
@@ -23359,7 +23987,11 @@ fn global_search_panel(
             ReplacePhase::Running => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new(tr("置換を数えています…")).size(11.5).color(theme.text_dim));
+                    ui.label(
+                        RichText::new(tr("置換を数えています…"))
+                            .size(11.5)
+                            .color(theme.text_dim),
+                    );
                 });
             }
             ReplacePhase::Confirm { files, hits } => {
@@ -23576,51 +24208,86 @@ mod idle_repaint_tests {
     /// 入力があっても、追加の予約はしない (egui が入力で起こす)。
     #[test]
     fn input_alone_does_not_schedule() {
-        let s = IdleSignals { had_input: true, ..idle() };
+        let s = IdleSignals {
+            had_input: true,
+            ..idle()
+        };
         assert_eq!(idle_repaint_ms(s), None);
     }
 
     /// アニメーションが飛んでいるときは持ち主に任せる。
     #[test]
     fn animation_is_left_to_its_owner() {
-        let s = IdleSignals { animating: true, ..idle() };
+        let s = IdleSignals {
+            animating: true,
+            ..idle()
+        };
         assert_eq!(idle_repaint_ms(s), None);
         // 家事があってもアニメの刻みの方が細かいので任せる
-        let s = IdleSignals { animating: true, watching_files: true, ..idle() };
+        let s = IdleSignals {
+            animating: true,
+            watching_files: true,
+            ..idle()
+        };
         assert_eq!(idle_repaint_ms(s), None);
     }
 
     /// 応答待ちはアニメより優先。取りこぼすと選んだファイルが開かない。
     #[test]
     fn awaiting_wins_over_animation() {
-        let s = IdleSignals { awaiting: true, animating: true, ..idle() };
+        let s = IdleSignals {
+            awaiting: true,
+            animating: true,
+            ..idle()
+        };
         assert_eq!(idle_repaint_ms(s), Some(IDLE_AWAITING_MS));
     }
 
     /// エージェントが走っている間は、出力が無くても状態機械を進める。
     #[test]
     fn running_agents_keep_ticking() {
-        let s = IdleSignals { agents_running: true, ..idle() };
+        let s = IdleSignals {
+            agents_running: true,
+            ..idle()
+        };
         assert_eq!(idle_repaint_ms(s), Some(IDLE_AGENT_MS));
         // 背面ではもっと緩める (通知は別スレッドから届く)
-        let s = IdleSignals { focused: false, ..s };
+        let s = IdleSignals {
+            focused: false,
+            ..s
+        };
         assert_eq!(idle_repaint_ms(s), Some(IDLE_AGENT_BACKGROUND_MS));
         // フォーカス情報が取れない環境でも、直前に入力があれば前景扱い
-        let s = IdleSignals { had_input: true, ..s };
+        let s = IdleSignals {
+            had_input: true,
+            ..s
+        };
         assert_eq!(idle_repaint_ms(s), Some(IDLE_AGENT_MS));
     }
 
     /// 家事 (外部変更の取り込み) があるときだけ、低頻度で回す。
     #[test]
     fn housekeeping_backs_off_with_visibility() {
-        let s = IdleSignals { watching_files: true, ..idle() };
+        let s = IdleSignals {
+            watching_files: true,
+            ..idle()
+        };
         assert_eq!(idle_repaint_ms(s), Some(IDLE_HOUSEKEEP_MS));
-        let s = IdleSignals { focused: false, ..s };
+        let s = IdleSignals {
+            focused: false,
+            ..s
+        };
         assert_eq!(idle_repaint_ms(s), Some(IDLE_BACKGROUND_MS));
-        let s = IdleSignals { visible: false, ..s };
+        let s = IdleSignals {
+            visible: false,
+            ..s
+        };
         assert_eq!(idle_repaint_ms(s), Some(IDLE_HIDDEN_MS));
         // タイマ (自動保存・interval プラグイン) だけでも同じ扱い
-        let s = IdleSignals { timers_due: true, ..idle() };
+        let s = IdleSignals {
+            timers_due: true,
+            ..idle()
+        };
         assert_eq!(idle_repaint_ms(s), Some(IDLE_HOUSEKEEP_MS));
     }
 
@@ -23638,9 +24305,19 @@ mod idle_repaint_tests {
             visible: true,
         };
         assert_eq!(idle_repaint_ms(all), Some(IDLE_AWAITING_MS));
-        assert_eq!(idle_repaint_ms(IdleSignals { awaiting: false, ..all }), None);
         assert_eq!(
-            idle_repaint_ms(IdleSignals { awaiting: false, animating: false, ..all }),
+            idle_repaint_ms(IdleSignals {
+                awaiting: false,
+                ..all
+            }),
+            None
+        );
+        assert_eq!(
+            idle_repaint_ms(IdleSignals {
+                awaiting: false,
+                animating: false,
+                ..all
+            }),
             Some(IDLE_AGENT_MS)
         );
         assert_eq!(
@@ -23670,7 +24347,6 @@ mod tests {
     use super::*;
     use crate::test_util::unique_temp_dir;
 
-
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir -p");
         std::fs::write(path, body).expect("write file");
@@ -23694,7 +24370,7 @@ mod tests {
     fn タブの落とし先は境界でも範囲外にならない() {
         let w = 100.0_f32;
         let five = tab_row(5, w); // 中心 50,150,250,350,450
-        // 表: (タブ枚数, ポインタ x, 掴んだ添字) → 期待
+                                  // 表: (タブ枚数, ポインタ x, 掴んだ添字) → 期待
         let table: &[(usize, f32, usize, Option<usize>)] = &[
             // 左端より左へ引きずる
             (5, -9999.0, 3, Some(0)),
@@ -23725,8 +24401,9 @@ mod tests {
             }
         }
         // 幅が極端に狭く、全タブが同じ位置に重なっている場合
-        let stacked: Vec<egui::Rect> =
-            (0..6).map(|_| egui::Rect::from_min_max(egui::pos2(10.0, 0.0), egui::pos2(10.0, 24.0))).collect();
+        let stacked: Vec<egui::Rect> = (0..6)
+            .map(|_| egui::Rect::from_min_max(egui::pos2(10.0, 0.0), egui::pos2(10.0, 24.0)))
+            .collect();
         for from in 0..6 {
             for x in [-1.0_f32, 9.99, 10.0, 10.01, 99.0] {
                 let got = reorder_target(&stacked, x, from);
@@ -23803,7 +24480,11 @@ mod tests {
         let e = v.remove(from);
         v.insert(to, e);
         assert_eq!(v, vec!["c.rs", "a.rs", "b.rs", "d.rs"]);
-        assert_eq!(v[reorder_active(from, from, to)], "c.rs", "掴んだタブのまま");
+        assert_eq!(
+            v[reorder_active(from, from, to)],
+            "c.rs",
+            "掴んだタブのまま"
+        );
         // 掴んだのが非アクティブ (d.rs がアクティブ) でも指し先は変わらない
         assert_eq!(v[reorder_active(3, from, to)], "d.rs");
         // a.rs (元 0) は 1 つ右へずれる
@@ -23889,7 +24570,10 @@ mod tests {
         let got = run_policy(&seq, 16);
         let first_q = got.iter().position(|a| *a == Quarantine);
         assert_eq!(first_q, Some(4), "3 回目の panic (添字 4) で隔離へ上げる");
-        let abort = got.iter().position(|a| *a == Abort).expect("いつかは中止する");
+        let abort = got
+            .iter()
+            .position(|a| *a == Abort)
+            .expect("いつかは中止する");
         // 隔離 3 回 (= panic 9 回) までは粘り、その先で諦める
         assert!(
             (18..=24).contains(&abort),
@@ -23997,7 +24681,9 @@ mod tests {
         assert!(!jobs.busy());
 
         // 要求 → 受理
-        let tx = jobs.begin(DialogKind::OpenFile).expect("最初の要求は受理される");
+        let tx = jobs
+            .begin(DialogKind::OpenFile)
+            .expect("最初の要求は受理される");
         assert!(jobs.busy());
         // 実行中: 同じ用途の再要求は無視 (二重に開かない)
         assert!(
@@ -24055,7 +24741,10 @@ mod tests {
         assert_eq!(other.kind(), purpose.kind());
         let mut jobs = DialogJobs::new();
         assert!(jobs.begin(purpose.kind()).is_some());
-        assert!(jobs.begin(other.kind()).is_none(), "保存ダイアログは 1 枚まで");
+        assert!(
+            jobs.begin(other.kind()).is_none(),
+            "保存ダイアログは 1 枚まで"
+        );
     }
 
     /// DoD: ダイアログの組み立て材料はスレッドへ送れる (Send) 素材だけを持つ。
@@ -24070,7 +24759,10 @@ mod tests {
         assert_eq!(spec.directory.as_deref(), Some(Path::new("/tmp/zv")));
         assert_eq!(
             spec.filter,
-            Some(("画像".to_string(), vec!["png".to_string(), "webp".to_string()]))
+            Some((
+                "画像".to_string(),
+                vec!["png".to_string(), "webp".to_string()]
+            ))
         );
         assert_eq!(DialogSpec::pick_folder().mode, DialogMode::PickFolder);
         assert_eq!(DialogSpec::save_file().mode, DialogMode::SaveFile);
@@ -24119,7 +24811,11 @@ mod tests {
         // `zai beta` 起動 + 保存構成 [alpha, beta] → beta を先頭に戻して復元する
         let restored = restored_roots(std::slice::from_ref(&b), vec![a.clone(), b.clone()])
             .expect("より広い構成は復元する");
-        assert_eq!(restored, vec![b.clone(), a.clone()], "開いたフォルダが primary");
+        assert_eq!(
+            restored,
+            vec![b.clone(), a.clone()],
+            "開いたフォルダが primary"
+        );
 
         // 現在のルートを含まない保存構成は別ワークスペース扱いで復元しない
         assert!(restored_roots(std::slice::from_ref(&c), vec![a.clone(), b.clone()]).is_none());
@@ -24145,8 +24841,7 @@ mod tests {
         let index = build_file_index(&roots);
 
         // 衝突する rel は両方ともルート名付きラベルになる
-        let mains: Vec<&IndexedFile> =
-            index.iter().filter(|f| f.rel == "src/main.rs").collect();
+        let mains: Vec<&IndexedFile> = index.iter().filter(|f| f.rel == "src/main.rs").collect();
         assert_eq!(mains.len(), 2, "両方のルートから索引される");
         let mut labels: Vec<&str> = mains.iter().map(|f| f.label.as_str()).collect();
         labels.sort();
@@ -24280,7 +24975,11 @@ mod tests {
         let old = now - WHICH_MISS_TTL - Duration::from_millis(1);
         assert!(!which_result_is_fresh(Some(old), now, WHICH_MISS_TTL));
         // 境界(ちょうど TTL)も再確認側に倒す
-        assert!(!which_result_is_fresh(Some(now - WHICH_MISS_TTL), now, WHICH_MISS_TTL));
+        assert!(!which_result_is_fresh(
+            Some(now - WHICH_MISS_TTL),
+            now,
+            WHICH_MISS_TTL
+        ));
     }
 
     #[test]
@@ -24329,7 +25028,10 @@ mod tests {
     fn streaming_rewrites_only_what_changed() {
         // 変換が確定して後ろが書き換わったケース。共通する先頭は残す
         // (「きょうは」まで同じ → 「いいてんき」3 文字を消して「良い天気」を書く)
-        assert_eq!(diff_edit("きょうはいい", "きょうは良い"), (2, "良い".into()));
+        assert_eq!(
+            diff_edit("きょうはいい", "きょうは良い"),
+            (2, "良い".into())
+        );
         // 文字数は「バイト数」ではなく「文字数」で数える (日本語が壊れないこと)
         let (del, add) = diff_edit("あいうえお", "あい");
         assert_eq!((del, add.as_str()), (3, ""));
@@ -24479,8 +25181,12 @@ mod tests {
     fn english_dictation_keeps_words_apart() {
         let mut v = VoiceState::default();
         let mut field = String::new();
-        for (text, is_final) in [("hello", false), ("hello", true), ("world", false), ("world", true)]
-        {
+        for (text, is_final) in [
+            ("hello", false),
+            ("hello", true),
+            ("world", false),
+            ("world", true),
+        ] {
             let e = v.plan(text, DEST);
             apply_bytes(&mut field, &e.bytes(false));
             v.commit(e, is_final, false, DEST);
@@ -24595,7 +25301,10 @@ mod tests {
     fn strip_trailing_keyword_alone_yields_empty_text() {
         // キーワードだけを言ったら本文は空 (空送信の扱いは呼び出し側の判断)
         assert_eq!(strip_trailing_keyword("送信", "送信"), Some(String::new()));
-        assert_eq!(strip_trailing_keyword(" 送信。", "送信"), Some(String::new()));
+        assert_eq!(
+            strip_trailing_keyword(" 送信。", "送信"),
+            Some(String::new())
+        );
     }
 
     // ── shortcut_reference: ショートカット一覧ダイアログの整合性 ─────
@@ -24727,14 +25436,23 @@ mod wiring_tests {
     fn attention_wins_over_everything_while_running() {
         // 承認プロンプトで止まっている相手には割り込ませない。
         for sup in [None, Some(S::Working), Some(S::Idle)] {
-            assert_eq!(coordinator_state(true, true, false, sup), C::WaitingApproval);
+            assert_eq!(
+                coordinator_state(true, true, false, sup),
+                C::WaitingApproval
+            );
         }
     }
 
     #[test]
     fn recent_output_is_working_and_quiet_prompt_is_idle() {
-        assert_eq!(coordinator_state(true, false, false, Some(S::Working)), C::Working);
-        assert_eq!(coordinator_state(true, false, false, Some(S::Idle)), C::Idle);
+        assert_eq!(
+            coordinator_state(true, false, false, Some(S::Working)),
+            C::Working
+        );
+        assert_eq!(
+            coordinator_state(true, false, false, Some(S::Idle)),
+            C::Idle
+        );
     }
 
     #[test]
@@ -24800,7 +25518,10 @@ mod wiring_tests {
             C::WaitingApproval
         );
         // 制限が解けたら通常判定に戻る
-        assert_eq!(coordinator_state(true, false, false, Some(S::Idle)), C::Idle);
+        assert_eq!(
+            coordinator_state(true, false, false, Some(S::Idle)),
+            C::Idle
+        );
     }
 
     // ── 確認ゲート ──────────────────────────────────────────
@@ -25077,12 +25798,10 @@ mod super_agent_tests {
     #[test]
     fn 指名は再起動で変わったidに追従する() {
         let title = "Claude Code (全自動) #3";
-        let a: Vec<(u64, bool, String, String)> =
-            vec![(7, true, "claude".into(), title.into())];
+        let a: Vec<(u64, bool, String, String)> = vec![(7, true, "claude".into(), title.into())];
         assert_eq!(pick_commander_session(&a, title, "claude"), Some(7));
         // 再起動で ID が変わっても同じタイトルなら追従
-        let b: Vec<(u64, bool, String, String)> =
-            vec![(9, true, "claude".into(), title.into())];
+        let b: Vec<(u64, bool, String, String)> = vec![(9, true, "claude".into(), title.into())];
         assert_eq!(pick_commander_session(&b, title, "claude"), Some(9));
     }
 
@@ -25222,7 +25941,10 @@ mod super_agent_tests {
         let mut sv = supervisor::Supervisor::new(cfg);
         // 1 番が監視役として選ばれている想定でも、両方を渡して両方が見られる
         sv.tick(&[snap(1), snap(2)], Approval::Ask);
-        assert!(sv.state_of(1).is_some(), "監視役自身の状態も見立てられるべき");
+        assert!(
+            sv.state_of(1).is_some(),
+            "監視役自身の状態も見立てられるべき"
+        );
         assert!(sv.state_of(2).is_some());
     }
 
@@ -25272,7 +25994,10 @@ mod super_agent_tests {
                                 for (i, term_rect) in term_rects.iter_mut().enumerate() {
                                     let is_active = i == *active;
                                     let stroke = if is_active {
-                                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(160, 100, 250))
+                                        egui::Stroke::new(
+                                            2.0_f32,
+                                            egui::Color32::from_rgb(160, 100, 250),
+                                        )
                                     } else {
                                         egui::Stroke::new(1.0_f32, egui::Color32::GRAY)
                                     };
@@ -25333,7 +26058,10 @@ mod super_agent_tests {
         };
 
         let rects = draw(&mut active, vec![]);
-        assert!(rects[0] != rects[1] && rects[1].width() > 50.0, "前提: セルが2つ並ぶ");
+        assert!(
+            rects[0] != rects[1] && rects[1].width() > 50.0,
+            "前提: セルが2つ並ぶ"
+        );
 
         // 2 つ目のセルのターミナルをクリック → 紫が 1 へ移動
         let at = rects[1].center();
@@ -25389,7 +26117,13 @@ mod super_agent_tests {
                     let selected = cell.response.clicked()
                         || (cell.response.contains_pointer()
                             && ui.input(|i| i.pointer.primary_pressed()));
-                    out = (btn.clicked(), selected, btn.rect, title.rect, cell.response.rect);
+                    out = (
+                        btn.clicked(),
+                        selected,
+                        btn.rect,
+                        title.rect,
+                        cell.response.rect,
+                    );
                 });
             });
             out
@@ -25606,9 +26340,7 @@ mod wave2_tests {
         assert_eq!(ag.column, tw);
         assert!(ag.start_line <= 2 && 2 <= ag.end_line);
         // 描画側の判定 (この行のこの桁を強調するか) と噛み合う
-        let on = guides[2].1.contains(&ag.column)
-            && ag.start_line <= 2
-            && 2 <= ag.end_line;
+        let on = guides[2].1.contains(&ag.column) && ag.start_line <= 2 && 2 <= ag.end_line;
         assert!(on, "強調する桁がガイドの桁集合に含まれている");
     }
 
@@ -25617,8 +26349,7 @@ mod wave2_tests {
     fn スティッキーヘッダが上端の文脈を返す() {
         let text = "fn outer() {\n    if x {\n        a();\n        b();\n    }\n}\n";
         // 3 行目 (a();) が最上部に見えているとき
-        let heads =
-            crate::highlight::sticky_headers(text, "Rust", 2, STICKY_MAX_ROWS);
+        let heads = crate::highlight::sticky_headers(text, "Rust", 2, STICKY_MAX_ROWS);
         assert!(!heads.is_empty(), "囲んでいるブロックのヘッダが出る");
         assert!(heads.len() <= STICKY_MAX_ROWS);
         // 外側から順 (行番号が昇順)
@@ -25669,7 +26400,10 @@ mod wave2_tests {
     #[test]
     fn 閉じたタブを新しい順に開き直せる() {
         let mut ct = ClosedTabs::default();
-        assert!(ct.pop_closed().is_none(), "何も閉じていなければ何も返らない");
+        assert!(
+            ct.pop_closed().is_none(),
+            "何も閉じていなければ何も返らない"
+        );
         for (n, name) in ["a.rs", "b.rs"].iter().enumerate() {
             ct.push_closed(ClosedTab {
                 path: PathBuf::from(name),
@@ -25837,7 +26571,10 @@ mod wave2_tests {
             }
             st.select_next();
         }
-        assert_eq!(st.selected().map(|i| i.label.clone()), Some("println!".into()));
+        assert_eq!(
+            st.selected().map(|i| i.label.clone()),
+            Some("println!".into())
+        );
 
         let fallback = lsp::Range::new(lsp::Position::new(2, 0), anchor);
         let edits = st.accept(fallback).expect("確定できる");
@@ -25851,7 +26588,9 @@ mod wave2_tests {
         st.select_next();
         assert_eq!(st.selected().map(|i| i.label.clone()), Some("print".into()));
         assert!(
-            st.selected().map(|i| i.text_edit.is_none()).unwrap_or(false),
+            st.selected()
+                .map(|i| i.text_edit.is_none())
+                .unwrap_or(false),
             "こちらは textEdit を持たない候補"
         );
         let edits2 = st.accept(fallback).expect("確定できる");
@@ -25886,9 +26625,18 @@ mod wave2_tests {
     fn 参照の一覧がファイルごとにまとまる() {
         let r = |l: usize| lsp::Range::new(lsp::Position::new(l, 0), lsp::Position::new(l, 4));
         let locs = vec![
-            lsp::Location { path: PathBuf::from("/w/b.rs"), range: r(9) },
-            lsp::Location { path: PathBuf::from("/w/a.rs"), range: r(3) },
-            lsp::Location { path: PathBuf::from("/w/a.rs"), range: r(1) },
+            lsp::Location {
+                path: PathBuf::from("/w/b.rs"),
+                range: r(9),
+            },
+            lsp::Location {
+                path: PathBuf::from("/w/a.rs"),
+                range: r(3),
+            },
+            lsp::Location {
+                path: PathBuf::from("/w/a.rs"),
+                range: r(1),
+            },
         ];
         let groups = lsp::group_locations(locs);
         assert_eq!(groups.len(), 2);
@@ -25906,8 +26654,8 @@ mod wave2_tests {
     /// シンボル木が quick-open 用の平らな並びになる (深さつき・先行順)。
     #[test]
     fn シンボル一覧が深さつきで平らになる() {
-        let node = |name: &str, kind: u8, line: usize, children: Vec<lsp::SymbolNode>| {
-            lsp::SymbolNode {
+        let node =
+            |name: &str, kind: u8, line: usize, children: Vec<lsp::SymbolNode>| lsp::SymbolNode {
                 name: name.into(),
                 detail: String::new(),
                 kind,
@@ -25921,18 +26669,29 @@ mod wave2_tests {
                 ),
                 deprecated: false,
                 children,
-            }
-        };
+            };
         let tree = vec![
-            node("Foo", 23, 10, vec![node("bar", 6, 12, vec![]), node("baz", 6, 14, vec![])]),
+            node(
+                "Foo",
+                23,
+                10,
+                vec![node("bar", 6, 12, vec![]), node("baz", 6, 14, vec![])],
+            ),
             node("top", 12, 30, vec![]),
         ];
         let mut flat = Vec::new();
         flatten_symbols(&tree, 0, &mut flat);
         assert_eq!(flat.len(), 4);
         let names: Vec<&str> = flat.iter().map(|(_, n, ..)| n.as_str()).collect();
-        assert_eq!(names, vec!["Foo", "bar", "baz", "top"], "先行順で平らになる");
-        assert_eq!(flat.iter().map(|(d, ..)| *d).collect::<Vec<_>>(), vec![0, 1, 1, 0]);
+        assert_eq!(
+            names,
+            vec!["Foo", "bar", "baz", "top"],
+            "先行順で平らになる"
+        );
+        assert_eq!(
+            flat.iter().map(|(d, ..)| *d).collect::<Vec<_>>(),
+            vec![0, 1, 1, 0]
+        );
         // ジャンプ先は selection_range の先頭 (名前の位置)
         assert_eq!(flat[1].3, lsp::Position::new(12, 3));
         assert_eq!(symbol_kind_label(flat[0].2), "struct");
@@ -25988,7 +26747,10 @@ mod wave2_tests {
             lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 5)),
             "fn ",
         )];
-        assert_eq!(lsp::apply_text_edits("fn   a() {}\n", &edits), "fn a() {}\n");
+        assert_eq!(
+            lsp::apply_text_edits("fn   a() {}\n", &edits),
+            "fn a() {}\n"
+        );
         // 空の応答は「整形の必要はありませんでした」= 本文を触らない
         let none: Vec<lsp::TextEdit> = Vec::new();
         assert_eq!(lsp::apply_text_edits("x\n", &none), "x\n");
@@ -26036,7 +26798,10 @@ mod wave2_tests {
             .split("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {")
             .nth(1)
             .expect("update がある");
-        assert!(update.contains("self.poll_lsp();"), "update から呼んでいない");
+        assert!(
+            update.contains("self.poll_lsp();"),
+            "update から呼んでいない"
+        );
         assert!(
             update.contains("self.lsp_completion_tick(ctx);"),
             "補完のデバウンスが update から呼ばれていない"
@@ -26049,9 +26814,7 @@ mod wave2_tests {
     /// 一番壊れやすい経路を固定する。
     #[test]
     fn 畳んだまま編集しても折りたたみが追随する() {
-        let mut text = String::from(
-            "fn a() {\n    x();\n}\nfn b() {\n    y();\n    z();\n}\n",
-        );
+        let mut text = String::from("fn a() {\n    x();\n}\nfn b() {\n    y();\n    z();\n}\n");
         let mut folds = FoldState::default();
         folds.refresh(&text, "Rust");
         // 2 つ目の関数 (行 3 から) を畳む
@@ -26088,7 +26851,9 @@ mod wave2_tests {
     fn 折りたたみ中は添字前提の補助機能を止めている() {
         let src = &include_str!("app.rs").replace("\r\n", "\n");
         assert!(
-            src.contains("let folds_closed = !self.editor.buffers[active].folds.folded().is_empty();"),
+            src.contains(
+                "let folds_closed = !self.editor.buffers[active].folds.folded().is_empty();"
+            ),
             "折りたたみ中かの判定が無い"
         );
         assert!(
@@ -26096,7 +26861,9 @@ mod wave2_tests {
             "スニペット展開を止めていない"
         );
         assert!(
-            src.contains("if has_focus && !folds_closed && !self.editor.buffers[active].read_only() {"),
+            src.contains(
+                "if has_focus && !folds_closed && !self.editor.buffers[active].read_only() {"
+            ),
             "自動ペアを止めていない / 読み取り専用を見ていない"
         );
     }
@@ -26122,7 +26889,10 @@ mod wave2_tests {
             "ワークスペース切替に追随していない"
         );
         // 比較ベースの切替がコマンドから届く
-        for k in ["\"staged\" => git_panel::ReviewBase::Staged", "\"unstaged\" => git_panel::ReviewBase::Unstaged"] {
+        for k in [
+            "\"staged\" => git_panel::ReviewBase::Staged",
+            "\"unstaged\" => git_panel::ReviewBase::Unstaged",
+        ] {
             assert!(src.contains(k), "{k} が無い");
         }
     }
@@ -26311,7 +27081,10 @@ mod wave2_tests {
     fn 自動フェイルオーバーが画面と駆動点に繋がっている() {
         let src = &include_str!("app.rs").replace("\r\n", "\n");
         // 毎フレームの駆動 (段を進める) と、レート制限イベントからの起動。
-        assert!(src.contains("self.failover_tick();"), "毎フレームの駆動が無い");
+        assert!(
+            src.contains("self.failover_tick();"),
+            "毎フレームの駆動が無い"
+        );
         assert!(
             src.contains("self.failover_on_rate_limit(&title, &line, ctx);"),
             "レート制限イベントから呼ばれていない"
@@ -26458,7 +27231,11 @@ mod wave2_tests {
                 seen.push(ident);
             }
         }
-        assert!(seen.len() > 80, "パレットの走査が壊れている ({} 件)", seen.len());
+        assert!(
+            seen.len() > 80,
+            "パレットの走査が壊れている ({} 件)",
+            seen.len()
+        );
 
         let mut broken: Vec<String> = Vec::new();
         for name in &seen {
@@ -26722,7 +27499,12 @@ mod ui_wiring_tests {
 
     #[test]
     fn glob欄はカンマでも空白でも同じに割れる() {
-        for src in ["*.rs, *.toml", "*.rs *.toml", " *.rs ,, *.toml , ", "*.rs\n*.toml"] {
+        for src in [
+            "*.rs, *.toml",
+            "*.rs *.toml",
+            " *.rs ,, *.toml , ",
+            "*.rs\n*.toml",
+        ] {
             assert_eq!(split_globs(src), vec!["*.rs", "*.toml"], "区切り: {src:?}");
         }
         assert!(split_globs("  ,  ").is_empty(), "空パターンを作らない");
@@ -26737,7 +27519,11 @@ mod ui_wiring_tests {
         .options(Some(PathBuf::from("/ws")));
         assert_eq!(o.include_globs, vec!["src/**"]);
         assert_eq!(o.exclude_globs, vec!["target/**", "*.lock"]);
-        assert_eq!(o.root, Some(PathBuf::from("/ws")), "glob の基準はワークスペース");
+        assert_eq!(
+            o.root,
+            Some(PathBuf::from("/ws")),
+            "glob の基準はワークスペース"
+        );
     }
 
     #[test]
@@ -26935,7 +27721,11 @@ mod ui_wiring_tests {
         // 再開: 会話が走っていたフォルダで、再開指定付きのコマンド
         let s = past("claude", "abc-123", "/ws/other");
         match session_sidebar_effect(&A::Resume(s.clone()), &presets) {
-            SessionSidebarEffect::Launch { preset, command, cwd } => {
+            SessionSidebarEffect::Launch {
+                preset,
+                command,
+                cwd,
+            } => {
                 assert_eq!(preset, 1, "claude のプリセットを選ぶ");
                 assert_eq!(command, session_picker::resume_command("claude", &s));
                 assert!(command.contains("abc-123"), "再開 ID が乗る: {command}");
@@ -27052,7 +27842,10 @@ mod ui_wiring_tests {
             // 成功後に依存物を作り直す
             "self.after_branch_switch();",
         ] {
-            assert!(src.contains(needle), "ブランチ切り替えの配線が無い: {needle}");
+            assert!(
+                src.contains(needle),
+                "ブランチ切り替えの配線が無い: {needle}"
+            );
         }
         // stash は絶対に使わない (worktree 間で共有されるため)
         assert!(
@@ -27078,7 +27871,10 @@ mod ui_wiring_tests {
         // ブランチ横断の表示範囲を復活させない (見た目には出にくいので形で固定)。
         // 探すのは**製品コードだけ** — この検査自体が名前を書いているので、
         // テストモジュールまで含めると必ず自分に当たってしまう。
-        let prod = src.split("\n#[cfg(test)]\nmod ").next().expect("製品コード");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("製品コード");
         for gone in [
             "sessions_repo_wide",
             "repo_sidebar_folders",
@@ -27172,7 +27968,10 @@ mod ui_wiring_tests {
     fn 実測以外の使用率には推定と明記する() {
         let measured = quota_usage_label(&usage(Some(0.42), quota::Confidence::Measured));
         assert!(measured.contains("42"), "{measured}");
-        assert!(!measured.contains("推定"), "実測に推定と書かない: {measured}");
+        assert!(
+            !measured.contains("推定"),
+            "実測に推定と書かない: {measured}"
+        );
         for c in [quota::Confidence::Estimated, quota::Confidence::Unknown] {
             let s = quota_usage_label(&usage(Some(0.42), c));
             assert!(s.contains("42") && s.contains("推定"), "{c:?}: {s}");
@@ -27289,7 +28088,10 @@ mod ui_wiring_tests {
         let text = "aa  \nbb  \n";
         let (out, (s, e)) = save_cleanup_edit(text, (4, 9), &opts).expect("本文が変わる");
         assert_eq!(out, "aa\nbb\n");
-        assert!(s < e && e <= out.chars().count(), "選択が潰れない: ({s}, {e})");
+        assert!(
+            s < e && e <= out.chars().count(),
+            "選択が潰れない: ({s}, {e})"
+        );
     }
 
     // ── GAP4: 改行コードの変換 ────────────────────────────────────
@@ -27317,10 +28119,16 @@ mod ui_wiring_tests {
     #[test]
     fn ステータスバーの表記は文字コードと改行を並べる() {
         // 「UTF-8 / CRLF」の形。混在は内訳付き
-        assert_eq!(crate::textenc::detect_line_ending("a\r\nb\r\n").label(), "CRLF");
+        assert_eq!(
+            crate::textenc::detect_line_ending("a\r\nb\r\n").label(),
+            "CRLF"
+        );
         assert_eq!(crate::textenc::detect_line_ending("a\nb\n").label(), "LF");
         let mixed = crate::textenc::detect_line_ending("a\r\nb\nc\n").label();
-        assert!(mixed.contains("LF") && mixed.contains("混在"), "内訳を出す: {mixed}");
+        assert!(
+            mixed.contains("LF") && mixed.contains("混在"),
+            "内訳を出す: {mixed}"
+        );
     }
 
     // ── GAP5: レビューコメントの受け取りは 1 回だけ ────────────────
@@ -27412,9 +28220,12 @@ mod ui_wiring_tests {
         let _ = draw(click(btn.center(), true));
         let _ = draw(click(btn.center(), false));
 
-        let first = crate::diff::take_pending_review_prompt(&ctx)
-            .expect("押したらプロンプトが積まれる");
-        assert!(first.contains("ここを直して"), "コメント本文が入る: {first}");
+        let first =
+            crate::diff::take_pending_review_prompt(&ctx).expect("押したらプロンプトが積まれる");
+        assert!(
+            first.contains("ここを直して"),
+            "コメント本文が入る: {first}"
+        );
         assert!(first.contains("a.rs"), "対象ファイルが入る: {first}");
 
         // 2 回目以降は取れない = 毎フレーム拾っても入力欄へ二重に入らない
@@ -27568,7 +28379,9 @@ mod tutorial_wiring_tests {
             .split("fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {")
             .nth(1)
             .expect("update_impl がある");
-        let tick = body.find("self.tutorial_tick(ctx);").expect("ツアーを描いている");
+        let tick = body
+            .find("self.tutorial_tick(ctx);")
+            .expect("ツアーを描いている");
         let idle = body
             .find("self.schedule_idle_repaint(ctx);")
             .expect("アイドル予約がある");
@@ -27594,8 +28407,7 @@ mod cockpit_layout_tests {
             for h in [200.0_f32, 600.0, 1200.0] {
                 for n in 1..=9usize {
                     let g = cockpit_grid_metrics(egui::vec2(w, h), n);
-                    let total = g.cell_w * g.cols as f32
-                        + GRID_SPACING * (g.cols as f32 - 1.0);
+                    let total = g.cell_w * g.cols as f32 + GRID_SPACING * (g.cols as f32 - 1.0);
                     assert!(
                         total <= w,
                         "w={w} h={h} n={n}: 総幅 {total} が可用幅 {w} を超えた"
@@ -27770,7 +28582,11 @@ mod cockpit_layout_tests {
             top_bar_density(TOP_BAR_LEFT_W + TOP_BAR_RIGHT_W),
             TopBarDensity::Full
         );
-        assert_eq!(top_bar_density(1400.0), TopBarDensity::Full, "1400px はそのまま");
+        assert_eq!(
+            top_bar_density(1400.0),
+            TopBarDensity::Full,
+            "1400px はそのまま"
+        );
         assert!(!top_bar_density(2560.0).compact());
         // 幅が広がるほど密度が下がることはない (単調)
         let order = |d: TopBarDensity| match d {
@@ -27779,7 +28595,9 @@ mod cockpit_layout_tests {
             TopBarDensity::Full => 2,
         };
         let mut prev = 0;
-        for w in [0.0_f32, 400.0, 800.0, 1000.0, 1049.0, 1050.0, 1200.0, 2000.0] {
+        for w in [
+            0.0_f32, 400.0, 800.0, 1000.0, 1049.0, 1050.0, 1200.0, 2000.0,
+        ] {
             let cur = order(top_bar_density(w));
             assert!(cur >= prev, "w={w}: 幅が広いのに密度が下がった");
             prev = cur;
@@ -27876,7 +28694,8 @@ mod cockpit_layout_tests {
         let guard = "if self.mcp_view && !self.mcp.scanned {";
         let body = src.split(guard).nth(1).expect("MCP の走査ガードが無い");
         assert!(
-            body.trim_start().starts_with("self.mcp.inventory = mcp::scan("),
+            body.trim_start()
+                .starts_with("self.mcp.inventory = mcp::scan("),
             "ガードの直後で走査していない: {:?}",
             body.chars().take(60).collect::<String>()
         );
@@ -28015,7 +28834,9 @@ mod deck_wiring_tests {
         // 生のフラグではなく**このフレームの中央ビュー**で判断する。
         // Editor のときだけ出す = デッキ/Cockpit/看板では畳む。
         assert!(
-            head.contains("let show = self.agents.panel_open && self.center == CenterView::Editor;"),
+            head.contains(
+                "let show = self.agents.panel_open && self.center == CenterView::Editor;"
+            ),
             "デッキを開いている間も端末パネルが出る配線になっている"
         );
     }
@@ -28057,8 +28878,7 @@ mod approval_panel_tests {
     };
 
     fn queue() -> ApprovalQueue {
-        let dir =
-            crate::test_util::unique_temp_dir("zaivern-approvals", "panel");
+        let dir = crate::test_util::unique_temp_dir("zaivern-approvals", "panel");
         ApprovalQueue::in_dir(dir)
     }
 
@@ -28112,7 +28932,10 @@ mod approval_panel_tests {
             head.contains("self.agents.sessions.iter_mut().find(|s| s.id == *sid)"),
             "セッション ID で引いていない"
         );
-        assert!(head.contains("press_pet_approve_button"), "承認キーの経路が無い");
+        assert!(
+            head.contains("press_pet_approve_button"),
+            "承認キーの経路が無い"
+        );
         assert!(head.contains("resolve_attention"), "拒否後の後始末が無い");
     }
 
@@ -28150,7 +28973,10 @@ mod approval_panel_tests {
         else {
             panic!("積まれるはず");
         };
-        assert!(q.get(id).map(|r| r.never_auto).unwrap_or(false), "権限昇格として分類される");
+        assert!(
+            q.get(id).map(|r| r.never_auto).unwrap_or(false),
+            "権限昇格として分類される"
+        );
 
         let res = q.apply(id, Command::ApproveKindForAgentAlways);
         assert!(res.refused_always, "常に許可は断られる");
@@ -28188,7 +29014,9 @@ mod approval_panel_tests {
         );
         assert!(head.contains("read_audit_tail"), "監査ログの読み口が無い");
         // 読み込みはパネルのクロージャの**外**にある = 描画中の I/O ではない
-        let show = head.find(".show_animated(ctx, show,").expect("パネル描画がある");
+        let show = head
+            .find(".show_animated(ctx, show,")
+            .expect("パネル描画がある");
         let read = head.find("read_audit_tail").expect("読み口がある");
         assert!(read > show, "描画クロージャの中で読んでいる可能性がある");
     }
@@ -28222,8 +29050,14 @@ mod composer_wiring_tests {
             .nth(1)
             .expect("send_to の実行部がある");
         let apply = &apply[..apply.find("if acts.voice_stop").unwrap_or(apply.len())];
-        assert!(apply.contains("find(|s| s.id == id)"), "ID で 1 体を引いていない");
-        assert!(!apply.contains("broadcast"), "指名宛てが一斉送信へ落ちている");
+        assert!(
+            apply.contains("find(|s| s.id == id)"),
+            "ID で 1 体を引いていない"
+        );
+        assert!(
+            !apply.contains("broadcast"),
+            "指名宛てが一斉送信へ落ちている"
+        );
     }
 
     /// 死んだエージェントの下書きは掃かれる。
@@ -28238,9 +29072,21 @@ mod composer_wiring_tests {
 
         // 2 番が死んだ
         b.retain_agents(&[1]);
-        assert_eq!(b.draft_for(ComposerTarget::Agent(1)), "1 番への指示", "生きている方は残る");
-        assert_eq!(b.draft_for(ComposerTarget::Agent(2)), "", "死んだ方は消える");
-        assert_eq!(b.draft_for(ComposerTarget::Broadcast), "全員へ", "全員宛ては消さない");
+        assert_eq!(
+            b.draft_for(ComposerTarget::Agent(1)),
+            "1 番への指示",
+            "生きている方は残る"
+        );
+        assert_eq!(
+            b.draft_for(ComposerTarget::Agent(2)),
+            "",
+            "死んだ方は消える"
+        );
+        assert_eq!(
+            b.draft_for(ComposerTarget::Broadcast),
+            "全員へ",
+            "全員宛ては消さない"
+        );
     }
 
     /// 掃除はセッションの増減を拾う 1 か所 (`reconcile_sessions`) で走る。
@@ -28301,7 +29147,10 @@ mod multi_cursor_wiring_tests {
             1,
             "本文を 2 回以上書き換えている (取り消しが 1 段で戻らない)"
         );
-        assert!(arm.contains("multi_batch_insert("), "一括編集を通っていない");
+        assert!(
+            arm.contains("multi_batch_insert("),
+            "一括編集を通っていない"
+        );
     }
 
     /// char 添字 → (行, 表示桁)。矩形選択の座標変換。
@@ -28347,7 +29196,11 @@ mod encoding_wiring_tests {
                 "{} を id から引けない",
                 info.id
             );
-            assert!(crate::textenc::is_supported(info.enc), "{} が使えない", info.id);
+            assert!(
+                crate::textenc::is_supported(info.enc),
+                "{} が使えない",
+                info.id
+            );
         }
     }
 
@@ -28436,7 +29289,10 @@ mod quarantine_hole_tests {
             "隔離時に代わりの描画をしていない (黒い空間になる)"
         );
         // guarded_ui 側も同じ約束
-        let ui_body = src.split("fn guarded_ui(").nth(1).expect("guarded_ui がある");
+        let ui_body = src
+            .split("fn guarded_ui(")
+            .nth(1)
+            .expect("guarded_ui がある");
         let ui_head = &ui_body[..ui_body.find("\n    /// ").unwrap_or(ui_body.len())];
         assert!(ui_head.contains("quarantine_placeholder_ui"));
     }
@@ -28451,7 +29307,10 @@ mod quarantine_hole_tests {
             .nth(1)
             .expect("代わりの描画がある");
         let head = &body[..body.find("\n    /// ").unwrap_or(body.len())];
-        assert!(head.contains("SidePanel::left(\"zv-side\")"), "サイドバーの id が違う");
+        assert!(
+            head.contains("SidePanel::left(\"zv-side\")"),
+            "サイドバーの id が違う"
+        );
         assert!(
             head.contains("TopBottomPanel::bottom(\"zv-terminal\")"),
             "ターミナルパネルの id が違う"
@@ -28494,11 +29353,17 @@ mod quarantine_hole_tests {
         g.policy.clean = 0;
 
         g.unquarantine(&Subview::Panel("sidebar"));
-        assert!(!g.is_quarantined(&Subview::Panel("sidebar")), "外れていない");
+        assert!(
+            !g.is_quarantined(&Subview::Panel("sidebar")),
+            "外れていない"
+        );
         assert!(g.is_quarantined(&Subview::Session(7)), "他まで外している");
         assert_eq!(g.policy.streak, 0, "連続カウンタが残っている");
         assert!(g.policy.recent.is_empty(), "時間窓の記憶が残っている");
-        assert!(g.banner.is_some(), "まだ隔離が残っているのでバナーは消さない");
+        assert!(
+            g.banner.is_some(),
+            "まだ隔離が残っているのでバナーは消さない"
+        );
 
         // 最後の 1 つを外したらバナーも消える
         g.unquarantine(&Subview::Session(7));
@@ -28518,8 +29383,14 @@ mod quarantine_hole_tests {
         let alive: HashSet<u64> = [2u64].into_iter().collect();
         g.forget_sessions(&alive);
 
-        assert!(!g.is_quarantined(&Subview::Session(1)), "消えたセッションが残っている");
-        assert!(g.is_quarantined(&Subview::Session(2)), "生きている方まで外している");
+        assert!(
+            !g.is_quarantined(&Subview::Session(1)),
+            "消えたセッションが残っている"
+        );
+        assert!(
+            g.is_quarantined(&Subview::Session(2)),
+            "生きている方まで外している"
+        );
         assert!(
             g.is_quarantined(&Subview::Panel("editor")),
             "パネルの隔離まで外している"
@@ -28576,10 +29447,7 @@ mod split_wiring_tests {
     }
 
     fn map(layouts: Vec<SplitLayout>) -> HashMap<u64, SplitLayout> {
-        layouts
-            .into_iter()
-            .map(|l| (l.leaves()[0], l))
-            .collect()
+        layouts.into_iter().map(|l| (l.leaves()[0], l)).collect()
     }
 
     // ── 新しいペインで起動するプリセットの決め方 ────────────────────
@@ -28602,7 +29470,10 @@ mod split_wiring_tests {
             Some(1)
         );
         // シェル指定は常に素のシェル
-        assert_eq!(split_preset_index(&agents, "Codex", PanePreset::Shell), Some(1));
+        assert_eq!(
+            split_preset_index(&agents, "Codex", PanePreset::Shell),
+            Some(1)
+        );
 
         // 素のシェルが登録されていない構成でも動く (先頭で代替する)
         let no_shell = vec![preset("Claude Code", "claude")];
@@ -28610,7 +29481,10 @@ mod split_wiring_tests {
             split_preset_index(&no_shell, "Codex", PanePreset::SameAsParent),
             Some(0)
         );
-        assert_eq!(split_preset_index(&no_shell, "x", PanePreset::Shell), Some(0));
+        assert_eq!(
+            split_preset_index(&no_shell, "x", PanePreset::Shell),
+            Some(0)
+        );
 
         // 1 つも登録が無ければ None (呼び出し側がトーストを出す)
         assert_eq!(split_preset_index(&[], "x", PanePreset::Shell), None);
@@ -28639,7 +29513,11 @@ mod split_wiring_tests {
         let live: HashSet<u64> = [2, 3].into_iter().collect();
         let out = normalize_split_map(m, &live);
         assert_eq!(out.len(), 1);
-        assert!(out.contains_key(&2), "キーが先頭リーフへ付け替わる: {:?}", out.keys());
+        assert!(
+            out.contains_key(&2),
+            "キーが先頭リーフへ付け替わる: {:?}",
+            out.keys()
+        );
         assert_eq!(out[&2].leaves(), vec![2, 3]);
         // フォーカスは生き残ったペインの中にある
         assert!(out[&2].focus().is_some_and(|f| f == 2 || f == 3));
@@ -28920,7 +29798,10 @@ mod crisp_text_tests {
 
         for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             let list = &fonts.families[&fam];
-            assert_eq!(list[1], "cjk", "{fam:?}: CJK が主フォントの直後にない {list:?}");
+            assert_eq!(
+                list[1], "cjk",
+                "{fam:?}: CJK が主フォントの直後にない {list:?}"
+            );
             assert_eq!(list[2], "symbols0", "{fam:?}: 記号の順序が崩れた {list:?}");
             assert_eq!(list[3], "symbols1", "{fam:?}: 記号の順序が崩れた {list:?}");
             for shrunken in SHRUNKEN {
@@ -28939,7 +29820,10 @@ mod crisp_text_tests {
         let before = fonts.families.clone();
         let dir = crate::test_util::unique_temp_dir("zaivern-font-test", "missing");
         let nope = dir.join("いない.ttf").to_string_lossy().into_owned();
-        assert_eq!(push_fallback_font(&mut fonts, "cjk", &[nope.as_str()]), None);
+        assert_eq!(
+            push_fallback_font(&mut fonts, "cjk", &[nope.as_str()]),
+            None
+        );
         assert_eq!(
             push_fallback_fonts_all(&mut fonts, "symbols", &[nope.as_str()], None, 1),
             0

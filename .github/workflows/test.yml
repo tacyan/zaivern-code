@@ -152,12 +152,11 @@ jobs:
 
   # 静的解析。ubuntu 1 台だけ (診断は OS 非依存。3 OS で回すのは丸損)。
   #
-  # ■ cargo fmt --check を入れていない理由 (意図的な欠落):
-  #   2026-08-02 時点で 55 ファイル / 1475 箇所が rustfmt 未適用。
-  #   ここで --check を有効にすると初回から全 PR が赤になり、ゲートとして機能しない。
-  #   一括 fmt は複数エージェントの並行編集と全面衝突するため、
-  #   「fmt を先に通す」判断はオーナーが明示的に行うこと。通せた日にこの節を
-  #   `- run: cargo fmt --all --check` へ差し替える。
+  # ■ cargo fmt --check は 2026-08-02 に有効化した。
+  #   それまで 55 ファイル / 1475 箇所が未適用で、有効にすると全 PR が初回から
+  #   赤くなるためゲートとして機能しなかった。一括 fmt は複数エージェントの
+  #   並行編集と全面衝突するので、**並行作業がゼロになった瞬間**にまとめて
+  #   適用し、そのまま --check を入れて二度と溜まらないようにしてある。
   lint:
     # 同一リポジトリからの PR はスキップする。push run が同じコミットを
     # 既に見ているため二重実行になるだけで、得るものが無い。
@@ -194,6 +193,12 @@ jobs:
           if command -v ld.lld >/dev/null 2>&1; then
             echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
           fi
+
+      # 整形は全ファイル適用済み。ここを通しておけば二度と債務が溜まらない。
+      # clippy より先に置くのは、失敗したときの直し方が最も自明だから
+      # (`cargo fmt --all` を実行して commit するだけ)。
+      - name: fmt
+        run: cargo fmt --all --check
 
       # ■ ラチェット方式 (whitelist ではなく blocklist):
       #   `-D warnings` で「rustc の全警告 + clippy の全 lint」を deny した上で、

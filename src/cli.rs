@@ -51,8 +51,7 @@ pub fn write_instance_file(port: u16, token: &str, workspace: &str) -> Result<()
     let dir = zaivern_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("~/.zaivern を作成できません: {e}"))?;
     let json = serde_json::to_string(&inst).map_err(|e| format!("JSON 化に失敗: {e}"))?;
-    std::fs::write(instance_path(), json)
-        .map_err(|e| format!("instance.json を書けません: {e}"))
+    std::fs::write(instance_path(), json).map_err(|e| format!("instance.json を書けません: {e}"))
 }
 
 /// 終了時に呼ぶ。存在しなくてもエラーにしない。
@@ -109,7 +108,12 @@ fn pid_alive(pid: u32) -> bool {
 /// `http://127.0.0.1:<port>` へ HTTP/1.1 を素の TCP で話す。
 /// 認証は remote.rs の実装に合わせ `X-Token` ヘッダ。
 /// 戻り値は (ステータスコード, ボディ)。
-fn http(inst: &Instance, method: &str, path: &str, body: Option<String>) -> Result<(u16, String), String> {
+fn http(
+    inst: &Instance,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<(u16, String), String> {
     let addr = format!("127.0.0.1:{}", inst.port);
     let mut stream = TcpStream::connect(&addr)
         .map_err(|e| format!("インスタンスへ接続できません ({addr}): {e}"))?;
@@ -162,7 +166,8 @@ fn http(inst: &Instance, method: &str, path: &str, body: Option<String>) -> Resu
 /// 実行中インスタンスを取得する。無ければ日本語で説明して `Err`。
 fn require_instance() -> Result<Instance, String> {
     read_instance_file().ok_or_else(|| {
-        "実行中の Zaivern Code が見つかりません。先に `zai` でエディタを起動してください。".to_string()
+        "実行中の Zaivern Code が見つかりません。先に `zai` でエディタを起動してください。"
+            .to_string()
     })
 }
 
@@ -170,8 +175,12 @@ fn require_instance() -> Result<Instance, String> {
 fn call(inst: &Instance, method: &str, path: &str, body: Option<String>) -> Result<String, String> {
     match http(inst, method, path, body)? {
         (200, b) => Ok(b),
-        (401, _) => Err("認証に失敗しました。instance.json のトークンが古い可能性があります。".into()),
-        (404, _) => Err(format!("この操作は実行中のインスタンスが対応していません ({path})。")),
+        (401, _) => {
+            Err("認証に失敗しました。instance.json のトークンが古い可能性があります。".into())
+        }
+        (404, _) => Err(format!(
+            "この操作は実行中のインスタンスが対応していません ({path})。"
+        )),
         (504, _) => Err(
             "エディタが応答しません。ウィンドウが背面にあると OS が動作を止めるため、\n\
 現在の状態を読む操作はエディタを一度前面に出してから実行してください。"
@@ -338,12 +347,10 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         }
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
         // テキスト付きは従来どおりステータスバー更新 (下の run_remote へ落ちる)。
-        "status" if status_list_mode(rest).is_some() => {
-            run_status_list(
-                &crate::instances::instances_dir(),
-                status_list_mode(rest).unwrap_or(StatusFmt::Table),
-            )
-        }
+        "status" if status_list_mode(rest).is_some() => run_status_list(
+            &crate::instances::instances_dir(),
+            status_list_mode(rest).unwrap_or(StatusFmt::Table),
+        ),
         "plugin" => run_plugin(rest),
         "app" => crate::desktop::run(rest),
         "firewall" => crate::firewall::run(rest),
@@ -467,7 +474,9 @@ fn run_remote(cmd: &str, args: &[String]) -> Result<String, String> {
             let (level, rest) = take_opt(args, "--level");
             let level = level.unwrap_or_else(|| "info".into());
             if !matches!(level.as_str(), "info" | "warn" | "error") {
-                return Err(format!("--level は info / warn / error のいずれかです: {level}"));
+                return Err(format!(
+                    "--level は info / warn / error のいずれかです: {level}"
+                ));
             }
             let message = rest.join(" ");
             if message.is_empty() {
@@ -583,7 +592,11 @@ fn plugin_list() -> Result<String, String> {
     }
     let mut out = String::new();
     for p in &plugins {
-        let mark = if cfg.is_enabled(&p.name) { "有効" } else { "無効" };
+        let mark = if cfg.is_enabled(&p.name) {
+            "有効"
+        } else {
+            "無効"
+        };
         out.push_str(&format!("[{mark}] {} {}", p.name, p.version));
         if let Some(e) = &p.error {
             out.push_str(&format!("  ⚠ {e}"));
@@ -758,12 +771,18 @@ pub fn worktrees_base(main_root: &Path) -> PathBuf {
 /// **worktree の中で実行しても本体のルートを指す** (= `.claude/worktrees` が
 /// 入れ子にならない)。取れない git では `--show-toplevel` へ落とす。
 fn main_repo_root(cwd: &Path) -> Result<PathBuf, String> {
-    let common = git_out(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .or_else(|_| git_out(cwd, &["rev-parse", "--git-common-dir"]))
-        .map_err(|e| format!("git リポジトリではありません: {e}"))?;
+    let common = git_out(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .or_else(|_| git_out(cwd, &["rev-parse", "--git-common-dir"]))
+    .map_err(|e| format!("git リポジトリではありません: {e}"))?;
     let p = PathBuf::from(common.trim());
     let p = if p.is_absolute() { p } else { cwd.join(p) };
-    if p.file_name().map(|n| n.to_string_lossy() == ".git").unwrap_or(false) {
+    if p.file_name()
+        .map(|n| n.to_string_lossy() == ".git")
+        .unwrap_or(false)
+    {
         if let Some(parent) = p.parent() {
             return Ok(parent.to_path_buf());
         }
@@ -895,7 +914,11 @@ pub fn render_worktrees(rows: &[WorktreeRow], json: bool) -> String {
                 "-".to_string()
             };
             let head: String = r.head.chars().take(7).collect();
-            let head = if head.is_empty() { "-".to_string() } else { head };
+            let head = if head.is_empty() {
+                "-".to_string()
+            } else {
+                head
+            };
             let mut state: Vec<&str> = Vec::new();
             if r.locked {
                 state.push("locked");
@@ -983,7 +1006,8 @@ fn worktree_remove(args: &[String]) -> CliOut {
     reject_extra(&rest[1..], USAGE)?;
     let cwd = current_dir()?;
     let root = main_repo_root(&cwd).map_err(CliError::Runtime)?;
-    let listing = git_out(&root, &["worktree", "list", "--porcelain"]).map_err(CliError::Runtime)?;
+    let listing =
+        git_out(&root, &["worktree", "list", "--porcelain"]).map_err(CliError::Runtime)?;
     let rows = parse_worktree_porcelain(&listing);
     let target = find_worktree(&rows, &branch).ok_or_else(|| {
         CliError::Runtime(format!(
@@ -1243,7 +1267,9 @@ fn session_send(args: &[String]) -> CliOut {
     }
     let text = args[1..].join(" ");
     if text.trim().is_empty() {
-        return Err(CliError::Usage(format!("送るテキストがありません: {USAGE}")));
+        return Err(CliError::Usage(format!(
+            "送るテキストがありません: {USAGE}"
+        )));
     }
     let inst = require_instance().map_err(CliError::Runtime)?;
     let body = serde_json::json!({ "text": text, "id": id_num, "submit": true }).to_string();
@@ -1410,8 +1436,24 @@ mod tests {
     #[test]
     fn every_spec_subcommand_is_recognized() {
         for a in [
-            "open", "notify", "prompt", "run", "panel", "status", "state", "plugin", "app",
-            "firewall", "worktree", "session", "agent", "help", "--help", "-h", "--version", "-V",
+            "open",
+            "notify",
+            "prompt",
+            "run",
+            "panel",
+            "status",
+            "state",
+            "plugin",
+            "app",
+            "firewall",
+            "worktree",
+            "session",
+            "agent",
+            "help",
+            "--help",
+            "-h",
+            "--version",
+            "-V",
         ] {
             assert!(is_cli_subcommand(a), "{a} は CLI サブコマンドであるべき");
         }
@@ -1485,7 +1527,10 @@ mod tests {
     fn per_command_help_is_a_slice_of_the_full_help() {
         let help = help_text();
         for section in [HELP_WORKTREE, HELP_SESSION, HELP_AGENT] {
-            assert!(help.contains(section), "全体ヘルプに含まれていない:\n{section}");
+            assert!(
+                help.contains(section),
+                "全体ヘルプに含まれていない:\n{section}"
+            );
         }
         for (args, section) in [
             (v(&["--help"]), HELP_WORKTREE),
@@ -1558,7 +1603,11 @@ mod tests {
     #[test]
     fn status_list_empty_dir_exits_one() {
         let dir = crate::test_util::unique_temp_dir("zaivern-cli-test", "status-empty");
-        assert_eq!(run_status_list(&dir, StatusFmt::Table), 1, "実行中なし = 終了コード 1");
+        assert_eq!(
+            run_status_list(&dir, StatusFmt::Table),
+            1,
+            "実行中なし = 終了コード 1"
+        );
         assert_eq!(run_status_list(&dir, StatusFmt::Json), 1);
         // 存在しないディレクトリでも落ちずに 1
         assert_eq!(run_status_list(&dir.join("ghost"), StatusFmt::Table), 1);
@@ -1569,7 +1618,11 @@ mod tests {
         let dir = crate::test_util::unique_temp_dir("zaivern-cli-test", "status-alive");
         let _guard = crate::instances::register_in(&dir, &[std::path::PathBuf::from("/ws")])
             .expect("register");
-        assert_eq!(run_status_list(&dir, StatusFmt::Table), 0, "実行中あり = 終了コード 0");
+        assert_eq!(
+            run_status_list(&dir, StatusFmt::Table),
+            0,
+            "実行中あり = 終了コード 0"
+        );
         assert_eq!(run_status_list(&dir, StatusFmt::Json), 0);
     }
 
@@ -1826,7 +1879,14 @@ prunable gitdir file points to non-existent location
         ]}"#;
         let live = parse_live_sessions(json);
         assert_eq!(live.len(), 2, "id の無い要素は捨てる");
-        assert_eq!(live[0], LiveSession { id: "1".into(), title: "Claude Code".into(), running: true });
+        assert_eq!(
+            live[0],
+            LiveSession {
+                id: "1".into(),
+                title: "Claude Code".into(),
+                running: true
+            }
+        );
         assert!(!live[1].running);
         // 壊れた入力・agents 無しでも空を返す (panic しない)
         assert!(parse_live_sessions("{").is_empty());
@@ -1844,9 +1904,17 @@ prunable gitdir file points to non-existent location
             log: "/logs/Claude_Code-1.log".into(),
         }];
         let live = vec![
-            LiveSession { id: "1".into(), title: "Claude Code".into(), running: false },
+            LiveSession {
+                id: "1".into(),
+                title: "Claude Code".into(),
+                running: false,
+            },
             // 起動直後でまだ保存されていないセッションも一覧へ出す
-            LiveSession { id: "9".into(), title: "Codex".into(), running: true },
+            LiveSession {
+                id: "9".into(),
+                title: "Codex".into(),
+                running: true,
+            },
         ];
         let got = merge_live_sessions(stored, &live, "/ws");
         assert_eq!(got.len(), 2);
@@ -1882,7 +1950,10 @@ prunable gitdir file points to non-existent location
         ];
         let lines = render_sessions(&rows, false);
         assert_eq!(lines.lines().count(), 2);
-        assert_eq!(lines.lines().next(), Some("2\trunning\tCodex\t900\t/ws/sub"));
+        assert_eq!(
+            lines.lines().next(),
+            Some("2\trunning\tCodex\t900\t/ws/sub")
+        );
         for l in lines.lines() {
             assert_eq!(l.split('\t').count(), 5, "列数が揃っている: {l}");
         }
@@ -2066,9 +2137,4 @@ prunable gitdir file points to non-existent location
             assert!(!yields_to_directory(w), "{w} は譲らない");
         }
     }
-
-
-    
-    
-    
-    }
+}

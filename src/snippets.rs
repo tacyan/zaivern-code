@@ -70,54 +70,438 @@ static FALLBACK_SPEC: LangSpec = LangSpec {
 
 /// 言語データ表 — Emmet 可否・コメント記法・既定インデント・スニペット継承。
 pub static LANGS: &[LangSpec] = &[
-    LangSpec { id: "rust", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &[] },
-    LangSpec { id: "c", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &[] },
-    LangSpec { id: "cpp", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &["c"] },
-    LangSpec { id: "csharp", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &[] },
-    LangSpec { id: "objective-c", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &["c"] },
-    LangSpec { id: "objective-cpp", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &["objective-c", "c"] },
-    LangSpec { id: "go", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (1, true), inherits: &[] },
-    LangSpec { id: "java", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &[] },
-    LangSpec { id: "kotlin", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &[] },
-    LangSpec { id: "swift", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &[] },
-    LangSpec { id: "dart", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "scala", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "javascript", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "typescript", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &["javascript"] },
-    LangSpec { id: "javascriptreact", emmet: EmmetKind::Markup, xml_close: true, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &["javascript"] },
-    LangSpec { id: "typescriptreact", emmet: EmmetKind::Markup, xml_close: true, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &["typescript", "javascript"] },
-    LangSpec { id: "vue", emmet: EmmetKind::Markup, xml_close: false, line_comment: "//", block_comment: ("<!--", "-->"), indent: (2, false), inherits: &["html", "javascript"] },
-    LangSpec { id: "svelte", emmet: EmmetKind::Markup, xml_close: false, line_comment: "//", block_comment: ("<!--", "-->"), indent: (2, false), inherits: &["html", "javascript"] },
-    LangSpec { id: "html", emmet: EmmetKind::Markup, xml_close: false, line_comment: "", block_comment: ("<!--", "-->"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "xml", emmet: EmmetKind::Markup, xml_close: true, line_comment: "", block_comment: ("<!--", "-->"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "php", emmet: EmmetKind::Markup, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (4, false), inherits: &["html"] },
-    LangSpec { id: "handlebars", emmet: EmmetKind::Markup, xml_close: false, line_comment: "", block_comment: ("{{!--", "--}}"), indent: (2, false), inherits: &["html"] },
-    LangSpec { id: "astro", emmet: EmmetKind::Markup, xml_close: false, line_comment: "//", block_comment: ("<!--", "-->"), indent: (2, false), inherits: &["html", "typescript"] },
-    LangSpec { id: "css", emmet: EmmetKind::Style, xml_close: false, line_comment: "", block_comment: ("/*", "*/"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "scss", emmet: EmmetKind::Style, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &["css"] },
-    LangSpec { id: "sass", emmet: EmmetKind::Style, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &["css"] },
-    LangSpec { id: "less", emmet: EmmetKind::Style, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &["css"] },
-    LangSpec { id: "python", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("\"\"\"", "\"\"\""), indent: (4, false), inherits: &[] },
-    LangSpec { id: "ruby", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("=begin", "=end"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "perl", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("", ""), indent: (4, false), inherits: &[] },
-    LangSpec { id: "lua", emmet: EmmetKind::None, xml_close: false, line_comment: "--", block_comment: ("--[[", "]]"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "r", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("", ""), indent: (2, false), inherits: &[] },
-    LangSpec { id: "haskell", emmet: EmmetKind::None, xml_close: false, line_comment: "--", block_comment: ("{-", "-}"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "elixir", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("", ""), indent: (2, false), inherits: &[] },
-    LangSpec { id: "erlang", emmet: EmmetKind::None, xml_close: false, line_comment: "%", block_comment: ("", ""), indent: (4, false), inherits: &[] },
-    LangSpec { id: "shellscript", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("", ""), indent: (2, false), inherits: &[] },
-    LangSpec { id: "bat", emmet: EmmetKind::None, xml_close: false, line_comment: "REM", block_comment: ("", ""), indent: (2, false), inherits: &[] },
-    LangSpec { id: "powershell", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("<#", "#>"), indent: (4, false), inherits: &[] },
-    LangSpec { id: "makefile", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("", ""), indent: (1, true), inherits: &[] },
-    LangSpec { id: "dockerfile", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("", ""), indent: (2, false), inherits: &[] },
-    LangSpec { id: "sql", emmet: EmmetKind::None, xml_close: false, line_comment: "--", block_comment: ("/*", "*/"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "yaml", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("", ""), indent: (2, false), inherits: &[] },
-    LangSpec { id: "toml", emmet: EmmetKind::None, xml_close: false, line_comment: "#", block_comment: ("", ""), indent: (2, false), inherits: &[] },
-    LangSpec { id: "json", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "markdown", emmet: EmmetKind::None, xml_close: false, line_comment: "", block_comment: ("<!--", "-->"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "latex", emmet: EmmetKind::None, xml_close: false, line_comment: "%", block_comment: ("", ""), indent: (2, false), inherits: &[] },
-    LangSpec { id: "dot", emmet: EmmetKind::None, xml_close: false, line_comment: "//", block_comment: ("/*", "*/"), indent: (2, false), inherits: &[] },
-    LangSpec { id: "plaintext", emmet: EmmetKind::None, xml_close: false, line_comment: "", block_comment: ("", ""), indent: (4, false), inherits: &[] },
+    LangSpec {
+        id: "rust",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "c",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "cpp",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &["c"],
+    },
+    LangSpec {
+        id: "csharp",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "objective-c",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &["c"],
+    },
+    LangSpec {
+        id: "objective-cpp",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &["objective-c", "c"],
+    },
+    LangSpec {
+        id: "go",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (1, true),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "java",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "kotlin",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "swift",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "dart",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "scala",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "javascript",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "typescript",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &["javascript"],
+    },
+    LangSpec {
+        id: "javascriptreact",
+        emmet: EmmetKind::Markup,
+        xml_close: true,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &["javascript"],
+    },
+    LangSpec {
+        id: "typescriptreact",
+        emmet: EmmetKind::Markup,
+        xml_close: true,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &["typescript", "javascript"],
+    },
+    LangSpec {
+        id: "vue",
+        emmet: EmmetKind::Markup,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("<!--", "-->"),
+        indent: (2, false),
+        inherits: &["html", "javascript"],
+    },
+    LangSpec {
+        id: "svelte",
+        emmet: EmmetKind::Markup,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("<!--", "-->"),
+        indent: (2, false),
+        inherits: &["html", "javascript"],
+    },
+    LangSpec {
+        id: "html",
+        emmet: EmmetKind::Markup,
+        xml_close: false,
+        line_comment: "",
+        block_comment: ("<!--", "-->"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "xml",
+        emmet: EmmetKind::Markup,
+        xml_close: true,
+        line_comment: "",
+        block_comment: ("<!--", "-->"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "php",
+        emmet: EmmetKind::Markup,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (4, false),
+        inherits: &["html"],
+    },
+    LangSpec {
+        id: "handlebars",
+        emmet: EmmetKind::Markup,
+        xml_close: false,
+        line_comment: "",
+        block_comment: ("{{!--", "--}}"),
+        indent: (2, false),
+        inherits: &["html"],
+    },
+    LangSpec {
+        id: "astro",
+        emmet: EmmetKind::Markup,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("<!--", "-->"),
+        indent: (2, false),
+        inherits: &["html", "typescript"],
+    },
+    LangSpec {
+        id: "css",
+        emmet: EmmetKind::Style,
+        xml_close: false,
+        line_comment: "",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "scss",
+        emmet: EmmetKind::Style,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &["css"],
+    },
+    LangSpec {
+        id: "sass",
+        emmet: EmmetKind::Style,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &["css"],
+    },
+    LangSpec {
+        id: "less",
+        emmet: EmmetKind::Style,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &["css"],
+    },
+    LangSpec {
+        id: "python",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("\"\"\"", "\"\"\""),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "ruby",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("=begin", "=end"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "perl",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("", ""),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "lua",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "--",
+        block_comment: ("--[[", "]]"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "r",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("", ""),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "haskell",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "--",
+        block_comment: ("{-", "-}"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "elixir",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("", ""),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "erlang",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "%",
+        block_comment: ("", ""),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "shellscript",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("", ""),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "bat",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "REM",
+        block_comment: ("", ""),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "powershell",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("<#", "#>"),
+        indent: (4, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "makefile",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("", ""),
+        indent: (1, true),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "dockerfile",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("", ""),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "sql",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "--",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "yaml",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("", ""),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "toml",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "#",
+        block_comment: ("", ""),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "json",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "markdown",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "",
+        block_comment: ("<!--", "-->"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "latex",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "%",
+        block_comment: ("", ""),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "dot",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "//",
+        block_comment: ("/*", "*/"),
+        indent: (2, false),
+        inherits: &[],
+    },
+    LangSpec {
+        id: "plaintext",
+        emmet: EmmetKind::None,
+        xml_close: false,
+        line_comment: "",
+        block_comment: ("", ""),
+        indent: (4, false),
+        inherits: &[],
+    },
 ];
 
 /// 言語 ID から規則を引く。未知の ID はプレーンテキスト相当へフォールバック。
@@ -163,20 +547,68 @@ pub fn snippet_langs(lang_id: &str) -> Vec<String> {
 
 /// 拡張子 → 言語 ID のデータ表 (ファイル名だけから言語を決めるとき用)。
 static EXT_LANG: &[(&str, &str)] = &[
-    ("rs", "rust"), ("c", "c"), ("h", "c"), ("cc", "cpp"), ("cpp", "cpp"), ("cxx", "cpp"),
-    ("hpp", "cpp"), ("cs", "csharp"), ("m", "objective-c"), ("mm", "objective-cpp"),
-    ("go", "go"), ("java", "java"), ("kt", "kotlin"), ("kts", "kotlin"), ("swift", "swift"),
-    ("dart", "dart"), ("scala", "scala"), ("js", "javascript"), ("mjs", "javascript"),
-    ("cjs", "javascript"), ("jsx", "javascriptreact"), ("ts", "typescript"),
-    ("tsx", "typescriptreact"), ("vue", "vue"), ("svelte", "svelte"), ("html", "html"),
-    ("htm", "html"), ("xhtml", "html"), ("xml", "xml"), ("svg", "xml"), ("php", "php"),
-    ("hbs", "handlebars"), ("astro", "astro"), ("css", "css"), ("scss", "scss"),
-    ("sass", "sass"), ("less", "less"), ("py", "python"), ("rb", "ruby"), ("pl", "perl"),
-    ("lua", "lua"), ("r", "r"), ("hs", "haskell"), ("ex", "elixir"), ("exs", "elixir"),
-    ("erl", "erlang"), ("sh", "shellscript"), ("bash", "shellscript"), ("zsh", "shellscript"),
-    ("bat", "bat"), ("cmd", "bat"), ("ps1", "powershell"), ("sql", "sql"), ("yaml", "yaml"),
-    ("yml", "yaml"), ("toml", "toml"), ("json", "json"), ("md", "markdown"),
-    ("markdown", "markdown"), ("tex", "latex"), ("dot", "dot"), ("txt", "plaintext"),
+    ("rs", "rust"),
+    ("c", "c"),
+    ("h", "c"),
+    ("cc", "cpp"),
+    ("cpp", "cpp"),
+    ("cxx", "cpp"),
+    ("hpp", "cpp"),
+    ("cs", "csharp"),
+    ("m", "objective-c"),
+    ("mm", "objective-cpp"),
+    ("go", "go"),
+    ("java", "java"),
+    ("kt", "kotlin"),
+    ("kts", "kotlin"),
+    ("swift", "swift"),
+    ("dart", "dart"),
+    ("scala", "scala"),
+    ("js", "javascript"),
+    ("mjs", "javascript"),
+    ("cjs", "javascript"),
+    ("jsx", "javascriptreact"),
+    ("ts", "typescript"),
+    ("tsx", "typescriptreact"),
+    ("vue", "vue"),
+    ("svelte", "svelte"),
+    ("html", "html"),
+    ("htm", "html"),
+    ("xhtml", "html"),
+    ("xml", "xml"),
+    ("svg", "xml"),
+    ("php", "php"),
+    ("hbs", "handlebars"),
+    ("astro", "astro"),
+    ("css", "css"),
+    ("scss", "scss"),
+    ("sass", "sass"),
+    ("less", "less"),
+    ("py", "python"),
+    ("rb", "ruby"),
+    ("pl", "perl"),
+    ("lua", "lua"),
+    ("r", "r"),
+    ("hs", "haskell"),
+    ("ex", "elixir"),
+    ("exs", "elixir"),
+    ("erl", "erlang"),
+    ("sh", "shellscript"),
+    ("bash", "shellscript"),
+    ("zsh", "shellscript"),
+    ("bat", "bat"),
+    ("cmd", "bat"),
+    ("ps1", "powershell"),
+    ("sql", "sql"),
+    ("yaml", "yaml"),
+    ("yml", "yaml"),
+    ("toml", "toml"),
+    ("json", "json"),
+    ("md", "markdown"),
+    ("markdown", "markdown"),
+    ("tex", "latex"),
+    ("dot", "dot"),
+    ("txt", "plaintext"),
 ];
 
 /// ファイル名/パスの拡張子から言語 ID を推定する。
@@ -350,14 +782,28 @@ impl Clock {
 }
 
 static MONTH_NAMES: &[(&str, &str)] = &[
-    ("January", "Jan"), ("February", "Feb"), ("March", "Mar"), ("April", "Apr"),
-    ("May", "May"), ("June", "Jun"), ("July", "Jul"), ("August", "Aug"),
-    ("September", "Sep"), ("October", "Oct"), ("November", "Nov"), ("December", "Dec"),
+    ("January", "Jan"),
+    ("February", "Feb"),
+    ("March", "Mar"),
+    ("April", "Apr"),
+    ("May", "May"),
+    ("June", "Jun"),
+    ("July", "Jul"),
+    ("August", "Aug"),
+    ("September", "Sep"),
+    ("October", "Oct"),
+    ("November", "Nov"),
+    ("December", "Dec"),
 ];
 
 static DAY_NAMES: &[(&str, &str)] = &[
-    ("Sunday", "Sun"), ("Monday", "Mon"), ("Tuesday", "Tue"), ("Wednesday", "Wed"),
-    ("Thursday", "Thu"), ("Friday", "Fri"), ("Saturday", "Sat"),
+    ("Sunday", "Sun"),
+    ("Monday", "Mon"),
+    ("Tuesday", "Tue"),
+    ("Wednesday", "Wed"),
+    ("Thursday", "Thu"),
+    ("Friday", "Fri"),
+    ("Saturday", "Sat"),
 ];
 
 /// スニペット変数を解決するための入力一式。すべて呼び出し側が用意する。
@@ -666,21 +1112,33 @@ fn parse_nodes(
 fn read_number(cs: &[char], i: &mut usize) -> u32 {
     let mut n: u32 = 0;
     while *i < cs.len() && cs[*i].is_ascii_digit() {
-        n = n.saturating_mul(10).saturating_add(cs[*i] as u32 - '0' as u32);
+        n = n
+            .saturating_mul(10)
+            .saturating_add(cs[*i] as u32 - '0' as u32);
         *i += 1;
     }
     n
 }
 
 /// `$…` を解析する (`i` は `$` を指している)。
-fn parse_dollar(cs: &[char], i: &mut usize, out: &mut Vec<Node>, depth: usize, warn: &mut Vec<String>) {
+fn parse_dollar(
+    cs: &[char],
+    i: &mut usize,
+    out: &mut Vec<Node>,
+    depth: usize,
+    warn: &mut Vec<String>,
+) {
     let start = *i;
     let next = cs[start + 1];
     // $1 / $12 / $0
     if next.is_ascii_digit() {
         *i = start + 1;
         let index = read_number(cs, i);
-        out.push(Node::Stop { index, children: Vec::new(), choices: Vec::new() });
+        out.push(Node::Stop {
+            index,
+            children: Vec::new(),
+            choices: Vec::new(),
+        });
         return;
     }
     // $TM_FILENAME など
@@ -691,7 +1149,10 @@ fn parse_dollar(cs: &[char], i: &mut usize, out: &mut Vec<Node>, depth: usize, w
         }
         let name: String = cs[start + 1..j].iter().collect();
         *i = j;
-        out.push(Node::Var { name, default: Vec::new() });
+        out.push(Node::Var {
+            name,
+            default: Vec::new(),
+        });
         return;
     }
     if next != '{' {
@@ -711,19 +1172,31 @@ fn parse_dollar(cs: &[char], i: &mut usize, out: &mut Vec<Node>, depth: usize, w
         let index = read_number(cs, &mut j);
         if j >= cs.len() {
             warn.push("`${` が閉じられていません".to_string());
-            out.push(Node::Stop { index, children: Vec::new(), choices: Vec::new() });
+            out.push(Node::Stop {
+                index,
+                children: Vec::new(),
+                choices: Vec::new(),
+            });
             *i = j;
             return;
         }
         match cs[j] {
             '}' => {
-                out.push(Node::Stop { index, children: Vec::new(), choices: Vec::new() });
+                out.push(Node::Stop {
+                    index,
+                    children: Vec::new(),
+                    choices: Vec::new(),
+                });
                 *i = j + 1;
             }
             ':' => {
                 let mut k = j + 1;
                 let children = parse_nodes(cs, &mut k, true, depth + 1, warn);
-                out.push(Node::Stop { index, children, choices: Vec::new() });
+                out.push(Node::Stop {
+                    index,
+                    children,
+                    choices: Vec::new(),
+                });
                 *i = k;
             }
             '|' => {
@@ -760,13 +1233,21 @@ fn parse_dollar(cs: &[char], i: &mut usize, out: &mut Vec<Node>, depth: usize, w
                 } else if closed {
                     warn.push("選択肢の後に `}` がありません".to_string());
                 }
-                out.push(Node::Stop { index, children: Vec::new(), choices });
+                out.push(Node::Stop {
+                    index,
+                    children: Vec::new(),
+                    choices,
+                });
                 *i = k;
             }
             '/' => {
                 // ${1/正規表現/置換/} — 変換は非対応。素のタブストップ扱い。
                 warn.push("`${n/正規表現/置換/}` の変換は未対応です".to_string());
-                out.push(Node::Stop { index, children: Vec::new(), choices: Vec::new() });
+                out.push(Node::Stop {
+                    index,
+                    children: Vec::new(),
+                    choices: Vec::new(),
+                });
                 *i = skip_brace(cs, j + 1);
             }
             _ => {
@@ -785,13 +1266,19 @@ fn parse_dollar(cs: &[char], i: &mut usize, out: &mut Vec<Node>, depth: usize, w
         let name: String = cs[name_start..j].iter().collect();
         if j >= cs.len() {
             warn.push("`${` が閉じられていません".to_string());
-            out.push(Node::Var { name, default: Vec::new() });
+            out.push(Node::Var {
+                name,
+                default: Vec::new(),
+            });
             *i = j;
             return;
         }
         match cs[j] {
             '}' => {
-                out.push(Node::Var { name, default: Vec::new() });
+                out.push(Node::Var {
+                    name,
+                    default: Vec::new(),
+                });
                 *i = j + 1;
             }
             ':' => {
@@ -802,7 +1289,10 @@ fn parse_dollar(cs: &[char], i: &mut usize, out: &mut Vec<Node>, depth: usize, w
             }
             '/' => {
                 warn.push("`${VAR/正規表現/置換/}` の変換は未対応です".to_string());
-                out.push(Node::Var { name, default: Vec::new() });
+                out.push(Node::Var {
+                    name,
+                    default: Vec::new(),
+                });
                 *i = skip_brace(cs, j + 1);
             }
             _ => {
@@ -905,7 +1395,11 @@ impl<'a> Render<'a> {
                     Some(v) if !v.is_empty() => self.push_str(&v),
                     _ => self.run(default),
                 },
-                Node::Stop { index, children, choices } => {
+                Node::Stop {
+                    index,
+                    children,
+                    choices,
+                } => {
                     let start = self.len;
                     let first_time = !self.ranges.contains_key(index);
                     if first_time && !children.is_empty() {
@@ -935,7 +1429,11 @@ fn collect_values(nodes: &[Node], ctx: &ExpandCtx, values: &mut HashMap<u32, Str
         match n {
             Node::Text(_) => {}
             Node::Var { default, .. } => collect_values(default, ctx, values),
-            Node::Stop { index, children, choices } => {
+            Node::Stop {
+                index,
+                children,
+                choices,
+            } => {
                 if !children.is_empty() {
                     collect_values(children, ctx, values);
                     if !values.contains_key(index) {
@@ -1317,9 +1815,7 @@ pub fn lang_id_for(syntect_name: &str) -> &'static str {
         "TOML" => "toml",
         "Markdown" => "markdown",
         "SQL" => "sql",
-        "Shell-Unix-Generic" | "Bourne Again Shell (bash)" | "Shell Script (Bash)" => {
-            "shellscript"
-        }
+        "Shell-Unix-Generic" | "Bourne Again Shell (bash)" | "Shell Script (Bash)" => "shellscript",
         "Batch File" => "bat",
         "PowerShell" => "powershell",
         "Makefile" => "makefile",
@@ -1338,16 +1834,29 @@ pub fn lang_id_for(syntect_name: &str) -> &'static str {
 
 /// 空要素 (子を持たないタグ)。
 static VOID_TAGS: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-    "source", "track", "wbr",
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
 ];
 
 /// 親タグ → 省略時に補う子タグ (`ul>.item` が `li.item` になる規則)。
 static IMPLICIT_CHILD: &[(&str, &str)] = &[
-    ("ul", "li"), ("ol", "li"), ("dl", "dt"), ("table", "tr"), ("tbody", "tr"),
-    ("thead", "tr"), ("tfoot", "tr"), ("tr", "td"), ("select", "option"),
-    ("optgroup", "option"), ("datalist", "option"), ("map", "area"), ("audio", "source"),
-    ("video", "source"), ("picture", "source"), ("nav", "a"), ("figure", "img"),
+    ("ul", "li"),
+    ("ol", "li"),
+    ("dl", "dt"),
+    ("table", "tr"),
+    ("tbody", "tr"),
+    ("thead", "tr"),
+    ("tfoot", "tr"),
+    ("tr", "td"),
+    ("select", "option"),
+    ("optgroup", "option"),
+    ("datalist", "option"),
+    ("map", "area"),
+    ("audio", "source"),
+    ("video", "source"),
+    ("picture", "source"),
+    ("nav", "a"),
+    ("figure", "img"),
 ];
 
 /// タグに自動で付く属性 (明示指定があればそちらが勝つ)。
@@ -1363,17 +1872,118 @@ static IMPLICIT_ATTRS: &[(&str, &[(&str, &str)])] = &[
 /// 既知の HTML タグ。1 要素だけの略記 (`div`, `p`) はこの表に載っている
 /// ときだけ展開する — 散文の単語を Tab で壊さないための歯止め。
 static HTML_TAGS: &[&str] = &[
-    "a", "abbr", "address", "area", "article", "aside", "audio", "b", "base", "bdi", "bdo",
-    "blockquote", "body", "br", "button", "canvas", "caption", "cite", "code", "col",
-    "colgroup", "data", "datalist", "dd", "del", "details", "dfn", "dialog", "div", "dl",
-    "dt", "em", "embed", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2",
-    "h3", "h4", "h5", "h6", "head", "header", "hgroup", "hr", "html", "i", "iframe", "img",
-    "input", "ins", "kbd", "label", "legend", "li", "link", "main", "map", "mark", "menu",
-    "meta", "meter", "nav", "noscript", "object", "ol", "optgroup", "option", "output", "p",
-    "param", "picture", "pre", "progress", "q", "rp", "rt", "ruby", "s", "samp", "script",
-    "section", "select", "slot", "small", "source", "span", "strong", "style", "sub",
-    "summary", "sup", "table", "tbody", "td", "template", "textarea", "tfoot", "th",
-    "thead", "time", "title", "tr", "track", "u", "ul", "var", "video", "wbr",
+    "a",
+    "abbr",
+    "address",
+    "area",
+    "article",
+    "aside",
+    "audio",
+    "b",
+    "base",
+    "bdi",
+    "bdo",
+    "blockquote",
+    "body",
+    "br",
+    "button",
+    "canvas",
+    "caption",
+    "cite",
+    "code",
+    "col",
+    "colgroup",
+    "data",
+    "datalist",
+    "dd",
+    "del",
+    "details",
+    "dfn",
+    "dialog",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "embed",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hgroup",
+    "hr",
+    "html",
+    "i",
+    "iframe",
+    "img",
+    "input",
+    "ins",
+    "kbd",
+    "label",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "map",
+    "mark",
+    "menu",
+    "meta",
+    "meter",
+    "nav",
+    "noscript",
+    "object",
+    "ol",
+    "optgroup",
+    "option",
+    "output",
+    "p",
+    "param",
+    "picture",
+    "pre",
+    "progress",
+    "q",
+    "rp",
+    "rt",
+    "ruby",
+    "s",
+    "samp",
+    "script",
+    "section",
+    "select",
+    "slot",
+    "small",
+    "source",
+    "span",
+    "strong",
+    "style",
+    "sub",
+    "summary",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "template",
+    "textarea",
+    "tfoot",
+    "th",
+    "thead",
+    "time",
+    "title",
+    "tr",
+    "track",
+    "u",
+    "ul",
+    "var",
+    "video",
+    "wbr",
 ];
 
 /// 記号入りの定型略記 (`!` = HTML5 雛形)。`\t` は要求インデントへ置換する。
@@ -1388,27 +1998,66 @@ static MARKUP_SNIPPETS: &[(&str, &str)] = &[
 
 /// CSS の定型略記 (値を取らないもの)。
 static CSS_SNIPPETS: &[(&str, &str)] = &[
-    ("df", "display: flex;"), ("dib", "display: inline-block;"), ("db", "display: block;"),
-    ("dn", "display: none;"), ("dg", "display: grid;"), ("posr", "position: relative;"),
-    ("posa", "position: absolute;"), ("posf", "position: fixed;"), ("poss", "position: sticky;"),
-    ("fll", "float: left;"), ("flr", "float: right;"), ("tac", "text-align: center;"),
-    ("tal", "text-align: left;"), ("tar", "text-align: right;"), ("ma", "margin: auto;"),
-    ("mt-a", "margin-top: auto;"), ("ovh", "overflow: hidden;"), ("ova", "overflow: auto;"),
-    ("fwb", "font-weight: bold;"), ("fwn", "font-weight: normal;"), ("curp", "cursor: pointer;"),
-    ("aic", "align-items: center;"), ("jcc", "justify-content: center;"),
-    ("jcsb", "justify-content: space-between;"), ("fxdc", "flex-direction: column;"),
-    ("bdn", "border: none;"), ("bxsbb", "box-sizing: border-box;"),
+    ("df", "display: flex;"),
+    ("dib", "display: inline-block;"),
+    ("db", "display: block;"),
+    ("dn", "display: none;"),
+    ("dg", "display: grid;"),
+    ("posr", "position: relative;"),
+    ("posa", "position: absolute;"),
+    ("posf", "position: fixed;"),
+    ("poss", "position: sticky;"),
+    ("fll", "float: left;"),
+    ("flr", "float: right;"),
+    ("tac", "text-align: center;"),
+    ("tal", "text-align: left;"),
+    ("tar", "text-align: right;"),
+    ("ma", "margin: auto;"),
+    ("mt-a", "margin-top: auto;"),
+    ("ovh", "overflow: hidden;"),
+    ("ova", "overflow: auto;"),
+    ("fwb", "font-weight: bold;"),
+    ("fwn", "font-weight: normal;"),
+    ("curp", "cursor: pointer;"),
+    ("aic", "align-items: center;"),
+    ("jcc", "justify-content: center;"),
+    ("jcsb", "justify-content: space-between;"),
+    ("fxdc", "flex-direction: column;"),
+    ("bdn", "border: none;"),
+    ("bxsbb", "box-sizing: border-box;"),
 ];
 
 /// CSS の「プロパティ略記 → プロパティ名」。値は数値部分から組む。
 static CSS_PROPS: &[(&str, &str)] = &[
-    ("m", "margin"), ("mt", "margin-top"), ("mr", "margin-right"), ("mb", "margin-bottom"),
-    ("ml", "margin-left"), ("p", "padding"), ("pt", "padding-top"), ("pr", "padding-right"),
-    ("pb", "padding-bottom"), ("pl", "padding-left"), ("w", "width"), ("h", "height"),
-    ("maw", "max-width"), ("mah", "max-height"), ("miw", "min-width"), ("mih", "min-height"),
-    ("fz", "font-size"), ("lh", "line-height"), ("bdrs", "border-radius"), ("op", "opacity"),
-    ("z", "z-index"), ("t", "top"), ("r", "right"), ("b", "bottom"), ("l", "left"),
-    ("fxg", "flex-grow"), ("fxsh", "flex-shrink"), ("gap", "gap"), ("bdw", "border-width"),
+    ("m", "margin"),
+    ("mt", "margin-top"),
+    ("mr", "margin-right"),
+    ("mb", "margin-bottom"),
+    ("ml", "margin-left"),
+    ("p", "padding"),
+    ("pt", "padding-top"),
+    ("pr", "padding-right"),
+    ("pb", "padding-bottom"),
+    ("pl", "padding-left"),
+    ("w", "width"),
+    ("h", "height"),
+    ("maw", "max-width"),
+    ("mah", "max-height"),
+    ("miw", "min-width"),
+    ("mih", "min-height"),
+    ("fz", "font-size"),
+    ("lh", "line-height"),
+    ("bdrs", "border-radius"),
+    ("op", "opacity"),
+    ("z", "z-index"),
+    ("t", "top"),
+    ("r", "right"),
+    ("b", "bottom"),
+    ("l", "left"),
+    ("fxg", "flex-grow"),
+    ("fxsh", "flex-shrink"),
+    ("gap", "gap"),
+    ("bdw", "border-width"),
 ];
 
 /// Emmet 展開の設定。言語データ表から `for_lang` で組むのが基本。
@@ -1494,7 +2143,10 @@ fn apply_numbering(s: &str, idx: usize) -> String {
 
 /// 1 要素 (`div.a#b[href=x]{text}*3`) を読む。読めなければ None。
 fn parse_em_element(cs: &[char], i: &mut usize) -> Option<EmNode> {
-    let mut n = EmNode { mult: 1, ..Default::default() };
+    let mut n = EmNode {
+        mult: 1,
+        ..Default::default()
+    };
     // タグ名 (英字始まり)
     if *i < cs.len() && cs[*i].is_ascii_alphabetic() {
         let start = *i;
@@ -1669,7 +2321,10 @@ fn parse_emmet_tree(abbr: &str) -> Option<Vec<EmNode>> {
     if cs.is_empty() || cs.len() > MAX_ABBR {
         return None;
     }
-    let mut arena: Vec<EmNode> = vec![EmNode { mult: 1, ..Default::default() }];
+    let mut arena: Vec<EmNode> = vec![EmNode {
+        mult: 1,
+        ..Default::default()
+    }];
     let mut parent = 0usize;
     let mut i = 0usize;
     loop {
@@ -1980,7 +2635,11 @@ pub fn try_emmet_at(line: &str, caret: usize, lang_id: &str, indent: &str) -> Op
                 .position(|w| w == ['>', '<', '/'])
                 .map(|p| p + 1)
                 .unwrap_or(chars.len());
-            return Some(EmmetHit { start: s, text, cursor });
+            return Some(EmmetHit {
+                start: s,
+                text,
+                cursor,
+            });
         }
     }
     None
@@ -2016,7 +2675,7 @@ mod tests {
             (r"\$1 \\ \}", r"$1 \ }", 6),                // エスケープ
             ("${1|red,green,blue|}!", "red!", 0),        // 選択肢は先頭が入る
             (r"${1|a\,b,c|}", "a,b", 0),                 // 選択肢内のエスケープカンマ
-            ("こんにちは$1世界", "こんにちは世界", 5),    // char 単位 (バイトでない)
+            ("こんにちは$1世界", "こんにちは世界", 5),   // char 単位 (バイトでない)
             ("${1:outer ${2:inner}}", "outer inner", 0), // ネスト
             ("if $1 {\n\t$0\n}", "if  {\n\t\n}", 3),     // 複数行
             ("$", "$", 1),                               // 裸の $
@@ -2107,7 +2766,9 @@ mod tests {
 
     #[test]
     fn expand_is_deterministic() {
-        let c = ctx("/tmp/a.rs").with_clock(Clock::from_unix(T)).with_random_seed(7);
+        let c = ctx("/tmp/a.rs")
+            .with_clock(Clock::from_unix(T))
+            .with_random_seed(7);
         let body = "${1:x} $1 ${TM_FILENAME} $CURRENT_YEAR $UUID $RANDOM ${2|a,b|} $0";
         let a = expand(body, &c);
         let b = expand(body, &c);
@@ -2244,7 +2905,9 @@ mod tests {
         // 正常な本文は警告なし
         assert!(lint("fn ${1:name}() {\n\t$0\n}").is_empty());
         // 未知の変数は警告される
-        assert!(lint("$NO_SUCH_VAR").iter().any(|m| m.contains("未知の変数")));
+        assert!(lint("$NO_SUCH_VAR")
+            .iter()
+            .any(|m| m.contains("未知の変数")));
     }
 
     #[test]
@@ -2388,7 +3051,7 @@ mod tests {
         let e = parse_file_checked(&d.join("rust.json"), "rust").unwrap_err();
         assert!(e.contains("JSON 構文エラー"), "{e}");
         assert!(parse_file(&d.join("rust.json"), "rust").is_empty()); // 互換 API は空
-        // 最上位が配列 → 別のエラー文
+                                                                      // 最上位が配列 → 別のエラー文
         write(&d, "arr.json", "[1,2,3]");
         let e2 = parse_file_checked(&d.join("arr.json"), "rust").unwrap_err();
         assert!(e2.contains("オブジェクト"), "{e2}");
@@ -2414,7 +3077,11 @@ mod tests {
     fn store_loads_per_language_and_global_files() {
         let d = unique_temp_dir("zaivern-snippets-test", "load");
         write(&d, "rust.json", r#"{"R":{"prefix":"rr","body":"RUST"}}"#);
-        write(&d, "global.code-snippets", r#"{"G":{"prefix":"gg","body":"GLOBAL"}}"#);
+        write(
+            &d,
+            "global.code-snippets",
+            r#"{"G":{"prefix":"gg","body":"GLOBAL"}}"#,
+        );
         write(&d, "notes.txt", "無視される");
         let mut st = SnippetStore::new(d.clone());
         st.reload();
@@ -2424,7 +3091,10 @@ mod tests {
         assert!(rs.iter().any(|s| s.prefix == "rr"));
         assert!(rs.iter().any(|s| s.prefix == "gg"));
         let py = st.for_lang("python");
-        assert!(!py.iter().any(|s| s.prefix == "rr"), "言語別は他言語へ漏れない");
+        assert!(
+            !py.iter().any(|s| s.prefix == "rr"),
+            "言語別は他言語へ漏れない"
+        );
         assert!(py.iter().any(|s| s.prefix == "gg"), "global は全言語へ");
     }
 
@@ -2432,7 +3102,11 @@ mod tests {
     fn store_precedence_language_over_global_over_builtin() {
         let d = unique_temp_dir("zaivern-snippets-test", "prec");
         write(&d, "rust.json", r#"{"A":{"prefix":"p","body":"LANG"}}"#);
-        write(&d, "global.json", r#"{"B":{"prefix":"p","body":"GLOBAL"},"C":{"prefix":"fn","body":"USERFN"}}"#);
+        write(
+            &d,
+            "global.json",
+            r#"{"B":{"prefix":"p","body":"GLOBAL"},"C":{"prefix":"fn","body":"USERFN"}}"#,
+        );
         let mut st = SnippetStore::new(d.clone());
         st.reload();
         let rs = st.for_lang("rust");
@@ -2447,8 +3121,16 @@ mod tests {
     #[test]
     fn store_inherited_language_snippets_apply() {
         let d = unique_temp_dir("zaivern-snippets-test", "inherit");
-        write(&d, "javascript.json", r#"{"J":{"prefix":"jj","body":"JS"}}"#);
-        write(&d, "typescript.json", r#"{"T":{"prefix":"tt","body":"TS"}}"#);
+        write(
+            &d,
+            "javascript.json",
+            r#"{"J":{"prefix":"jj","body":"JS"}}"#,
+        );
+        write(
+            &d,
+            "typescript.json",
+            r#"{"T":{"prefix":"tt","body":"TS"}}"#,
+        );
         let mut st = SnippetStore::new(d.clone());
         st.reload();
         let tsx = st.for_lang("typescriptreact");
@@ -2461,7 +3143,11 @@ mod tests {
     #[test]
     fn store_scope_field_routes_to_languages() {
         let d = unique_temp_dir("zaivern-snippets-test", "scope");
-        write(&d, "mine.code-snippets", r#"{"S":{"prefix":"ss","body":"X","scope":"rust,go"}}"#);
+        write(
+            &d,
+            "mine.code-snippets",
+            r#"{"S":{"prefix":"ss","body":"X","scope":"rust,go"}}"#,
+        );
         let mut st = SnippetStore::new(d.clone());
         st.reload();
         assert!(st.for_lang("rust").iter().any(|s| s.prefix == "ss"));
@@ -2477,7 +3163,11 @@ mod tests {
         let mut st = SnippetStore::new(d.clone());
         st.reload();
         assert_eq!(st.diagnostics().len(), 1);
-        assert!(st.diagnostics()[0].contains("rust.json"), "{:?}", st.diagnostics());
+        assert!(
+            st.diagnostics()[0].contains("rust.json"),
+            "{:?}",
+            st.diagnostics()
+        );
         assert!(st.for_lang("python").iter().any(|s| s.prefix == "pp"));
         // 壊れた言語も組み込みへ落ちるだけ (panic しない)
         assert!(st.for_lang("rust").iter().any(|s| s.prefix == "fn"));
@@ -2519,13 +3209,29 @@ mod tests {
 
     #[test]
     fn lang_table_emmet_gating() {
-        for l in ["html", "xml", "javascriptreact", "typescriptreact", "vue", "svelte", "php"] {
+        for l in [
+            "html",
+            "xml",
+            "javascriptreact",
+            "typescriptreact",
+            "vue",
+            "svelte",
+            "php",
+        ] {
             assert_eq!(emmet_kind(l), EmmetKind::Markup, "{l} は Emmet(Markup)");
         }
         for l in ["css", "scss", "sass", "less"] {
             assert_eq!(emmet_kind(l), EmmetKind::Style, "{l} は Emmet(Style)");
         }
-        for l in ["rust", "python", "markdown", "json", "javascript", "typescript", "plaintext"] {
+        for l in [
+            "rust",
+            "python",
+            "markdown",
+            "json",
+            "javascript",
+            "typescript",
+            "plaintext",
+        ] {
             assert_eq!(emmet_kind(l), EmmetKind::None, "{l} は Emmet 無効");
         }
     }
@@ -2533,7 +3239,10 @@ mod tests {
     #[test]
     fn snippet_langs_inheritance_order() {
         assert_eq!(snippet_langs("rust"), vec!["rust"]);
-        assert_eq!(snippet_langs("typescript"), vec!["typescript", "javascript"]);
+        assert_eq!(
+            snippet_langs("typescript"),
+            vec!["typescript", "javascript"]
+        );
         assert_eq!(
             snippet_langs("typescriptreact"),
             vec!["typescriptreact", "typescript", "javascript"]
@@ -2579,7 +3288,14 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), n, "言語 ID が重複している");
         // lang_id_for が返す ID はすべて表に載っていること
-        for name in ["Rust", "HTML", "Vue Component", "Svelte", "TSX", "Graphviz (DOT)"] {
+        for name in [
+            "Rust",
+            "HTML",
+            "Vue Component",
+            "Svelte",
+            "TSX",
+            "Graphviz (DOT)",
+        ] {
             let id = lang_id_for(name);
             assert!(LANGS.iter().any(|l| l.id == id), "{id} が LANGS に無い");
         }
@@ -2613,7 +3329,10 @@ mod tests {
             (2023, 11, 14, 22, 13, 20, 2)
         );
         let epoch = Clock::from_unix(0);
-        assert_eq!((epoch.year, epoch.month, epoch.day, epoch.weekday), (1970, 1, 1, 4));
+        assert_eq!(
+            (epoch.year, epoch.month, epoch.day, epoch.weekday),
+            (1970, 1, 1, 4)
+        );
         let leap = Clock::from_unix(951_782_400); // 2000-02-29
         assert_eq!((leap.year, leap.month, leap.day), (2000, 2, 29));
     }
@@ -2665,17 +3384,25 @@ mod tests {
         assert!(out.starts_with("<!DOCTYPE html>"));
         assert!(out.contains("  <meta charset=\"UTF-8\">"), "{out}");
         assert!(out.ends_with("</html>"));
-        assert!(expand_emmet("link:css", &html_opts()).unwrap().contains("stylesheet"));
+        assert!(expand_emmet("link:css", &html_opts())
+            .unwrap()
+            .contains("stylesheet"));
     }
 
     #[test]
     fn emmet_indent_unit_follows_request() {
-        let tabs = EmmetOpts { indent: "\t".into(), ..html_opts() };
+        let tabs = EmmetOpts {
+            indent: "\t".into(),
+            ..html_opts()
+        };
         assert_eq!(
             expand_emmet("ul>li", &tabs).unwrap(),
             "<ul>\n\t<li></li>\n</ul>"
         );
-        let four = EmmetOpts { indent: "    ".into(), ..html_opts() };
+        let four = EmmetOpts {
+            indent: "    ".into(),
+            ..html_opts()
+        };
         assert_eq!(
             expand_emmet("ul>li", &four).unwrap(),
             "<ul>\n    <li></li>\n</ul>"
@@ -2689,8 +3416,14 @@ mod tests {
 
     #[test]
     fn emmet_self_closing_style_follows_language() {
-        assert_eq!(expand_emmet("br", &EmmetOpts::for_lang("html", "  ")).unwrap(), "<br>");
-        assert_eq!(expand_emmet("br", &EmmetOpts::for_lang("xml", "  ")).unwrap(), "<br />");
+        assert_eq!(
+            expand_emmet("br", &EmmetOpts::for_lang("html", "  ")).unwrap(),
+            "<br>"
+        );
+        assert_eq!(
+            expand_emmet("br", &EmmetOpts::for_lang("xml", "  ")).unwrap(),
+            "<br />"
+        );
         assert_eq!(
             expand_emmet("br", &EmmetOpts::for_lang("typescriptreact", "  ")).unwrap(),
             "<br />"
@@ -2712,7 +3445,10 @@ mod tests {
 
     #[test]
     fn emmet_repeat_zero_and_huge_counts_are_capped() {
-        assert_eq!(expand_emmet("ul>li*0", &html_opts()).unwrap(), "<ul>\n</ul>");
+        assert_eq!(
+            expand_emmet("ul>li*0", &html_opts()).unwrap(),
+            "<ul>\n</ul>"
+        );
         let big = expand_emmet("li*99999", &html_opts()).unwrap();
         assert_eq!(big.lines().count(), MAX_REPEAT, "繰り返しは上限で頭打ち");
     }
@@ -2722,17 +3458,17 @@ mod tests {
         let bad = [
             "",
             "   ",
-            "hello world",     // 空白入りの散文
-            "div>",            // 演算子で終わる
-            "div..",           // 空のクラス名
-            "div#",            // 空の id
-            "ul>li*",          // 個数がない
-            "a[href",          // ] が来ない
-            "span{unclosed",   // } が来ない
-            "こんにちは",       // 非 ASCII の語
-            "foo",             // 未知の単独タグ (散文保護)
-            "div>>p",          // 演算子の連続
-            "*3",              // 要素がない
+            "hello world",   // 空白入りの散文
+            "div>",          // 演算子で終わる
+            "div..",         // 空のクラス名
+            "div#",          // 空の id
+            "ul>li*",        // 個数がない
+            "a[href",        // ] が来ない
+            "span{unclosed", // } が来ない
+            "こんにちは",    // 非 ASCII の語
+            "foo",           // 未知の単独タグ (散文保護)
+            "div>>p",        // 演算子の連続
+            "*3",            // 要素がない
         ];
         for b in bad {
             assert_eq!(expand_emmet(b, &html_opts()), None, "略記: {b:?}");
@@ -2789,7 +3525,11 @@ mod tests {
             ("m10+p5", "margin: 10px;\npadding: 5px;"),
         ];
         for (abbr, want) in cases {
-            assert_eq!(expand_emmet(abbr, &o).as_deref(), Some(*want), "略記: {abbr}");
+            assert_eq!(
+                expand_emmet(abbr, &o).as_deref(),
+                Some(*want),
+                "略記: {abbr}"
+            );
         }
         for bad in ["zzz9", "m", "10", "m10-", "mq!!", ""] {
             assert_eq!(expand_emmet(bad, &o), None, "略記: {bad:?}");
@@ -2844,7 +3584,12 @@ mod tests {
             let c = ExpandCtx::for_path("/tmp/x").with_language(lang);
             let ex = expand(b.body, &c);
             assert!(!ex.text.is_empty(), "空展開: {}", b.prefix);
-            assert!(lint(b.body).is_empty(), "警告: {} {:?}", b.prefix, lint(b.body));
+            assert!(
+                lint(b.body).is_empty(),
+                "警告: {} {:?}",
+                b.prefix,
+                lint(b.body)
+            );
         }
         // 全言語共通スニペットは言語のコメント記号に追従する
         let c = ExpandCtx::for_path("/tmp/a.py");
@@ -2854,7 +3599,16 @@ mod tests {
 
     #[test]
     fn builtin_prefixes_are_unique_per_language() {
-        for lang in ["rust", "javascript", "typescript", "python", "go", "markdown", "html", "css"] {
+        for lang in [
+            "rust",
+            "javascript",
+            "typescript",
+            "python",
+            "go",
+            "markdown",
+            "html",
+            "css",
+        ] {
             let v = builtin_for_lang(lang);
             let mut p: Vec<&str> = v.iter().map(|s| s.prefix.as_str()).collect();
             p.sort_unstable();

@@ -354,7 +354,12 @@ pub fn set_process_name() {
 
 /// 稼働時間を日本語で人間向けに (例: "42秒" / "5分3秒" / "2時間30分" / "3日2時間")。
 pub fn humanize_uptime(secs: u64) -> String {
-    let (d, h, m, s) = (secs / 86_400, (secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60,
+    );
     if d > 0 {
         format!("{d}日{h}時間")
     } else if h > 0 {
@@ -462,7 +467,11 @@ mod tests {
 
         let guard = register_in(&dir, &[PathBuf::from("/ws")]).expect("register");
         let entries = scan_and_prune(&dir);
-        assert_eq!(entries.len(), 1, "自分のエントリだけが生き残る: {entries:?}");
+        assert_eq!(
+            entries.len(),
+            1,
+            "自分のエントリだけが生き残る: {entries:?}"
+        );
         assert_eq!(entries[0].pid, std::process::id());
         assert_eq!(entries[0].version, env!("CARGO_PKG_VERSION"));
         assert_eq!(entries[0].workspace_roots, vec!["/ws".to_string()]);
@@ -488,7 +497,9 @@ mod tests {
             .spawn()
             .expect("spawn cmd");
         #[cfg(unix)]
-        let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
         let pid = child.id();
         child.wait().expect("wait child");
 
