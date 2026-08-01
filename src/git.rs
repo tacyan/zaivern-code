@@ -1200,7 +1200,10 @@ impl BranchNav {
 
 /// `git -C <dir> <args>` を同期実行して stdout を返す。失敗は stderr の文言。
 /// 呼ぶ側がスレッドを用意すること。
-fn run_git_at(dir: &Path, args: &[String]) -> Result<String, String> {
+///
+/// CLI (`zai worktree …`) からも使う — git の呼び出し方 (色無効・quotepath 無効・
+/// エンコーディング復号) を 1 箇所に集めておくため、実装を複製しないこと。
+pub(crate) fn run_git_at(dir: &Path, args: &[String]) -> Result<String, String> {
     let out = crate::procx::hidden_command("git")
         // color.ui=always / core.quotepath=true な設定でも素の UTF-8 を得る
         // (ブランチ名の日本語がエスケープされるとパースも表示も壊れる)。
