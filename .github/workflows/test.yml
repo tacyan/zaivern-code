@@ -250,25 +250,25 @@ jobs:
 
       # 参考情報。落とさない (ゲートではない) が、債務の残量を毎 run 可視化して
       # 「いつ fmt を通せるか」「clippy 債務が減っているか」を数字で追えるようにする。
+      # 情報表示だけのステップ。**絶対に失敗してはいけない。**
+      #
+      # 以前はここで rustfmt の未適用件数を数えていたが、fmt を全ファイルへ
+      # 適用して上の `fmt` ステップを hard gate にした結果、
+      # `grep '^Diff in '` がマッチ 0 件で exit 1 を返し、`set -o pipefail` が
+      # それをパイプライン全体の失敗へ昇格させ、既定シェルの `-e` が
+      # **情報表示のためだけのステップで CI を赤くした** (実際に起きた)。
+      # 「綺麗になったから落ちる」という最悪の回帰なので、数え上げごと捨てた。
+      # fmt の残量は常に 0 (通らなければ手前のステップで落ちる) ので、
+      # 数える意味がそもそも無い。
       - name: 債務レポート (informational)
         if: always()
         run: |
-          set -uo pipefail
-          # rustfmt が無い環境で 0 件と誤報しないよう、存在を確かめてから数える。
-          if cargo fmt --version >/dev/null 2>&1; then
-            cargo fmt --check > "$RUNNER_TEMP/fmt.txt" 2>&1 || true
-            hunks=$(grep -c '^Diff in ' "$RUNNER_TEMP/fmt.txt" || true)
-            files=$(grep '^Diff in ' "$RUNNER_TEMP/fmt.txt" | sed 's/:[0-9]*:$//' | sort -u | wc -l | tr -d ' ')
-          else
-            hunks='n/a (rustfmt なし)'; files='n/a'
-          fi
           {
             echo "### 静的解析の債務 (ゲートではない / 残量の可視化)"
             echo ""
             echo "| 項目 | 残量 |"
             echo "| --- | ---: |"
-            echo "| rustfmt 未適用ファイル | ${files} |"
-            echo "| rustfmt 未適用 diff hunk | ${hunks} |"
+            echo "| rustfmt 未適用 | 0 (fmt ステップが hard gate) |"
             echo "| clippy 凍結 lint 種別 | 26 |"
             echo ""
             echo "clippy の -A を 1 行消すごとに債務が 1 種類返済される (.github/workflows/test.yml)。"
