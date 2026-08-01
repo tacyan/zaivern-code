@@ -141,6 +141,13 @@ pub struct Buffer {
     /// 1 本の列挙型にまとめてある。`kind.preview_only()` が真でも、読めなかった
     /// ときは `None` になりうる (app.rs は「表示できません」を出す)。
     pub preview: Option<PreviewDoc>,
+    /// ミニマップの行データ: `(本文 galley のキャッシュキー, 行データ)`。
+    ///
+    /// **キーが変わったときだけ**組み直す (設計原則 3: アイドル時のコストはゼロ)。
+    /// キーは `cache` のキーと同じもの — つまり本文・言語・テーマ・フォント・
+    /// 折り返し・空白可視化のどれかが変わったときにだけ再構築が走り、
+    /// 何も変わらないフレームでは Vec を読むだけになる。
+    pub minimap: Option<(u64, crate::minimap::MinimapRows)>,
 }
 
 /// 画像タブのデコード結果。
@@ -1406,6 +1413,7 @@ impl Editor {
             large: LargeFileMode::default(),
             table: None,
             preview: None,
+            minimap: None,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -1444,6 +1452,7 @@ impl Editor {
             large: LargeFileMode::default(),
             table: None,
             preview,
+            minimap: None,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -1549,6 +1558,7 @@ impl Editor {
                 large: LargeFileMode::default(),
                 table: None,
                 preview: None,
+                minimap: None,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -1593,6 +1603,7 @@ impl Editor {
                 large: LargeFileMode::default(),
                 table: None,
                 preview: None,
+                minimap: None,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -1627,6 +1638,7 @@ impl Editor {
             large,
             table: None,
             preview: None,
+            minimap: None,
         });
         self.active = Some(self.buffers.len() - 1);
         Ok(false)
@@ -1673,6 +1685,7 @@ impl Editor {
             large: LargeFileMode::default(),
             table: None,
             preview: None,
+            minimap: None,
         });
         self.active = Some(self.buffers.len() - 1);
         id

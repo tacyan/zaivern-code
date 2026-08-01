@@ -51,6 +51,10 @@ pub enum Cmd {
     ToggleWordWrap,
     /// 空白文字 (スペース「·」/ タブ「→」) の可視化を切り替える (config へ永続化)
     ToggleShowWhitespace,
+    /// エディタ右端のミニマップ (遠景ビュー) を切り替える (config へ永続化)
+    ToggleMinimap,
+    /// エディタ上部のブレッドクラム (パンくず) を切り替える (config へ永続化)
+    ToggleBreadcrumbs,
     /// サイドバーを Git タブで開く
     OpenGitPanel,
     OpenFind,
@@ -524,6 +528,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleMdPreview
         | Cmd::ToggleWordWrap
         | Cmd::ToggleShowWhitespace
+        | Cmd::ToggleMinimap
+        | Cmd::ToggleBreadcrumbs
         | Cmd::ToggleProblems
         | Cmd::ToggleFullScreen
         | Cmd::ToggleTableView

@@ -26,6 +26,10 @@ pub struct MenuInfo {
     pub word_wrap: bool,
     /// 空白文字の可視化 (表示メニューのチェック状態)
     pub show_whitespace: bool,
+    /// ミニマップ (表示メニューのチェック状態)
+    pub minimap: bool,
+    /// ブレッドクラム (表示メニューのチェック状態)
+    pub breadcrumbs: bool,
     /// アクティブなエディタタブがあるか (編集系メニューの有効/無効)
     pub has_editor: bool,
     /// エディタが分割されているか (分割の解除・ペイン移動の有効/無効)
@@ -466,6 +470,23 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         };
         if item(ui, &ws, "", true) {
             cmds.push(Cmd::ToggleShowWhitespace);
+        }
+        // ミニマップ / ブレッドクラム (VS Code: 表示 > 外観)
+        let mm = if info.minimap {
+            tr("✓ ミニマップ")
+        } else {
+            tr("ミニマップ")
+        };
+        if item(ui, &mm, "", true) {
+            cmds.push(Cmd::ToggleMinimap);
+        }
+        let bc = if info.breadcrumbs {
+            tr("✓ ブレッドクラム")
+        } else {
+            tr("ブレッドクラム")
+        };
+        if item(ui, &bc, "", true) {
+            cmds.push(Cmd::ToggleBreadcrumbs);
         }
         ui.separator();
         let md = if info.md_preview {

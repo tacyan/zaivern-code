@@ -22,6 +22,15 @@ pub struct Config {
     /// オフにすると要求自体を送らないので、サーバーへの往復もゼロになる。
     pub lsp_highlight_occurrences: bool,
 
+    /// エディタ右端のミニマップ (VS Code の遠景ビュー相当)。
+    /// **既定はオフ** — 本文の横幅を 64px 奪うので、欲しい人だけが払う。
+    /// 幅が足りない画面では設定が ON でも自動的に隠れる。
+    pub minimap: bool,
+
+    /// エディタ上部のブレッドクラム (`ワークスペース › フォルダ › ファイル › シンボル`)。
+    /// **既定はオン** — 高さ 1 行ぶんで、どの言語でも (LSP 無しでも) 必ず出せる。
+    pub breadcrumbs: bool,
+
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
@@ -46,6 +55,10 @@ pub struct Config {
     pub global_word_wrap: bool,
     #[serde(skip)]
     pub global_show_whitespace: bool,
+    #[serde(skip)]
+    pub global_minimap: bool,
+    #[serde(skip)]
+    pub global_breadcrumbs: bool,
     /// overlay を重ねる前のグローバルなプラグイン設定の控え。
     /// save_plugins_section はこちらを書く — セッション中の値を書くと
     /// プロジェクトの .zaivern.toml 由来の無効化・設定値がグローバル
@@ -226,6 +239,8 @@ impl Default for Config {
             word_wrap: false,
             show_whitespace: false,
             lsp_highlight_occurrences: true,
+            minimap: false,
+            breadcrumbs: true,
             approval_mode: "ask".into(),
             restore_agents: false,
             show_pet: true,
@@ -234,6 +249,8 @@ impl Default for Config {
             global_show_pet: true,
             global_word_wrap: false,
             global_show_whitespace: false,
+            global_minimap: false,
+            global_breadcrumbs: true,
             global_plugins: PluginsConfig::default(),
             pet_image: None,
             pet_x: None,
@@ -417,6 +434,8 @@ struct Overlay {
     show_hidden_files: Option<bool>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
+    minimap: Option<bool>,
+    breadcrumbs: Option<bool>,
     approval_mode: Option<String>,
     show_pet: Option<bool>,
     agents: Vec<AgentPreset>,
@@ -435,6 +454,8 @@ struct UiState {
     show_pet: Option<bool>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
+    minimap: Option<bool>,
+    breadcrumbs: Option<bool>,
     pet_image: Option<String>,
     pet_x: Option<f32>,
     pet_y: Option<f32>,
@@ -501,6 +522,12 @@ show_hidden_files = true
 # カーソル下のシンボルと同じものを本文で薄くハイライトする (LSP documentHighlight)
 # (コマンドパレットの「同一シンボルのハイライト切替」でも変更できます)
 # lsp_highlight_occurrences = true
+
+# ミニマップ (エディタ右端の遠景) とブレッドクラム (上部のパンくず)
+# (表示メニュー・コマンドパレットの「ミニマップの表示切替」「ブレッドクラムの表示切替」でも変更できます)
+# ミニマップは本文の幅を 64px 使うため既定はオフ。狭い画面では自動的に隠れます
+# minimap = false
+# breadcrumbs = true
 
 # 既定の権限モード (claude / codex / agy に自動適用)
 #   "ask"   = 毎回ユーザー承認が必要（安全・デフォルト）
@@ -830,6 +857,12 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.show_whitespace {
                     cfg.show_whitespace = v;
                 }
+                if let Some(v) = st.minimap {
+                    cfg.minimap = v;
+                }
+                if let Some(v) = st.breadcrumbs {
+                    cfg.breadcrumbs = v;
+                }
                 if st.pet_image.is_some() {
                     cfg.pet_image = st.pet_image;
                 }
@@ -903,6 +936,8 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     cfg.global_show_pet = cfg.show_pet;
     cfg.global_word_wrap = cfg.word_wrap;
     cfg.global_show_whitespace = cfg.show_whitespace;
+    cfg.global_minimap = cfg.minimap;
+    cfg.global_breadcrumbs = cfg.breadcrumbs;
     cfg.global_plugins = cfg.plugins.clone();
 
     for root in roots {
@@ -972,6 +1007,12 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
             }
             if let Some(v) = o.show_whitespace {
                 cfg.show_whitespace = v;
+            }
+            if let Some(v) = o.minimap {
+                cfg.minimap = v;
+            }
+            if let Some(v) = o.breadcrumbs {
+                cfg.breadcrumbs = v;
             }
             if let Some(v) = o.approval_mode {
                 cfg.approval_mode = v;
@@ -1190,6 +1231,8 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         show_pet: Some(cfg.global_show_pet),
         word_wrap: Some(cfg.global_word_wrap),
         show_whitespace: Some(cfg.global_show_whitespace),
+        minimap: Some(cfg.global_minimap),
+        breadcrumbs: Some(cfg.global_breadcrumbs),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -1768,6 +1811,8 @@ command = "agy"
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
+            minimap: Some(true),
+            breadcrumbs: Some(false),
             pet_image: Some("/tmp/p.png".into()),
             pet_x: Some(10.0),
             pet_y: Some(20.5),
@@ -1797,6 +1842,8 @@ command = "agy"
         assert_eq!(back.show_pet, Some(false));
         assert_eq!(back.word_wrap, Some(true));
         assert_eq!(back.show_whitespace, Some(true));
+        assert_eq!(back.minimap, Some(true));
+        assert_eq!(back.breadcrumbs, Some(false));
         assert_eq!(back.pet_image, Some("/tmp/p.png".to_string()));
         assert_eq!(back.pet_x, Some(10.0));
         assert_eq!(back.pet_y, Some(20.5));
@@ -2368,6 +2415,41 @@ mod state_overlay_tests {
         assert!(loaded.show_whitespace, "空白表示が state.toml から復元される");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ミニマップとブレッドクラムの既定と永続化() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "mm-bc-home");
+        let root = crate::test_util::unique_temp_dir("zaivern-config-test", "mm-bc-root");
+        let cfg = Config::default();
+        // 既定: ミニマップはオフ (本文の幅を奪うので使う人だけが払う)
+        //       ブレッドクラムはオン (高さ 1 行・LSP 無しでも必ず出せる)
+        assert!(!cfg.minimap, "ミニマップの既定はオフ");
+        assert!(cfg.breadcrumbs, "ブレッドクラムの既定はオン");
+
+        // UI からの切替相当: 控えも一緒に更新する
+        let mut cfg = cfg;
+        cfg.minimap = true;
+        cfg.global_minimap = true;
+        cfg.breadcrumbs = false;
+        cfg.global_breadcrumbs = false;
+        save_state_to_dir(&home, &cfg);
+        let loaded = load_from_dir(&home, &[], true);
+        assert!(loaded.minimap, "ミニマップが state.toml から復元される");
+        assert!(!loaded.breadcrumbs, "ブレッドクラムが state.toml から復元される");
+
+        // プロジェクト overlay で上書きでき、グローバルの控えへは漏れない
+        std::fs::write(
+            root.join(".zaivern.toml"),
+            "minimap = false\nbreadcrumbs = true\n",
+        )
+        .expect("write .zaivern.toml");
+        let cfg = load_from_dir(&home, std::slice::from_ref(&root), true);
+        assert!(!cfg.minimap && cfg.breadcrumbs, "プロジェクト値が効く");
+        assert!(cfg.global_minimap && !cfg.global_breadcrumbs, "控えは overlay 前のまま");
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
