@@ -34,6 +34,19 @@ pub enum Cmd {
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替
     ToggleMdPreview,
     ToggleSidebar,
+    // ── エディタの分割 (split editor / VS Code の editor group 相当) ──
+    /// アクティブなエディタペインを左右に分割する (分割先は同じファイルを開く)
+    SplitEditorRight,
+    /// アクティブなエディタペインを上下に分割する
+    SplitEditorDown,
+    /// 分割を解除して 1 枚に戻す (他ペインのタブは吸収される)
+    UnsplitEditor,
+    /// 次のエディタペインへフォーカスを移す (巡回)
+    FocusNextPane,
+    /// n 番目 (1 始まり) のエディタペインへフォーカスを移す
+    FocusEditorPane(usize),
+    /// アクティブなタブを次のペインへ移す (1 枚のときは右へ分割して移す)
+    MoveTabToNextPane,
     /// エディタ本文の折り返しを切り替える (config へ永続化)
     ToggleWordWrap,
     /// 空白文字 (スペース「·」/ タブ「→」) の可視化を切り替える (config へ永続化)
@@ -492,6 +505,12 @@ fn group_of(cmd: &Cmd) -> Group {
 
         // ── 表示 ───────────────────────────────────────────────────
         Cmd::ToggleSidebar
+        | Cmd::SplitEditorRight
+        | Cmd::SplitEditorDown
+        | Cmd::UnsplitEditor
+        | Cmd::FocusNextPane
+        | Cmd::FocusEditorPane(_)
+        | Cmd::MoveTabToNextPane
         | Cmd::ToggleMdPreview
         | Cmd::ToggleWordWrap
         | Cmd::ToggleShowWhitespace
