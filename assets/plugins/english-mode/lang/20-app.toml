@@ -582,3 +582,57 @@
 # ── フレームガード: 隔離した領域のプレースホルダ ──
 "⟳ ここだけ再試行" = "⟳ Retry just this area"
 "この領域の隔離だけを解いて描画をやり直します" = "Lifts the quarantine on this area only and redraws it"
+
+# ── レート制限の自動フェイルオーバー (failover.rs / app.rs) ──
+"自動フェイルオーバーを有効化 (レート制限時の自動切替)" = "Enable Auto Failover (switch accounts when rate-limited)"
+"自動フェイルオーバーを無効化 (レート制限時の自動切替)" = "Disable Auto Failover (switch accounts when rate-limited)"
+"🔁 レート制限で自動的に切り替える" = "🔁 Switch automatically when rate-limited"
+"上限に当たったら、同じ CLI の別プロファイル → 別 CLI の順で\n切替先を選び、新しいセッションを立てて続きを渡します。\nいま動いているセッションは残したまま (終了させません)。" = "When a limit is hit, a target is picked in this order: another profile of the same CLI, then a different CLI.\nA new session is started and the work is handed over.\nThe session that hit the limit keeps running (it is never killed)."
+"1 セッションあたり最大 {n} 回" = "up to {n} switches per session"
+"　待機中 — 次の切替先: {to}" = "　Standing by — next target: {to}"
+"　待機中 — 使える切替先はいまありません" = "　Standing by — no usable target right now"
+"🔁 自動フェイルオーバーを有効化しました — 上限に当たったら別プロファイルへ切り替えます" = "🔁 Auto failover enabled — a rate limit will switch to another profile"
+"🔁 自動フェイルオーバーを無効化しました" = "🔁 Auto failover disabled"
+"🔁 自動フェイルオーバー" = "🔁 Auto failover"
+"🔁 自動フェイルオーバー: 切り替えませんでした — {why}" = "🔁 Auto failover: did not switch — {why}"
+"🔁 {to} の起動に失敗しました: {e}" = "🔁 Failed to launch {to}: {e}"
+"プリセットが見つかりません" = "Preset not found"
+"起動したセッションが見つかりません" = "Cannot find the session that was just launched"
+"検知の根拠 (上ほど確実):" = "Detection evidence (most reliable first):"
+" ※裏取りが通ったときだけ使う" = " (used only when corroborated)"
+"{ago} 前: {line}" = "{ago} ago: {line}"
+"{n} 秒" = "{n}s"
+"{n} 分" = "{n}m"
+"{n} 時間" = "{n}h"
+
+# 検知の根拠 (設計原則 4 のはしご)
+"{rung}段目: {name}" = "rung {rung}: {name}"
+"構造化プロトコル" = "structured protocol"
+"ベンダー提供フック" = "vendor hook"
+"状態ファイル (実測)" = "state file (measured)"
+"画面スクレイプ (推定)" = "screen scrape (estimated)"
+
+# 候補を選んだ理由
+"同じ CLI の別プロファイル" = "another profile of the same CLI"
+"別の CLI" = "a different CLI"
+
+# 切り替えなかった理由
+"自動フェイルオーバーは無効です" = "auto failover is disabled"
+"切替先の候補がありません" = "there is no candidate to switch to"
+"同じ枠を使う候補しかありません (一緒に枯れています)" = "only candidates on the same plan are left (they run out together)"
+"この連鎖で候補を全て試し終えました" = "every candidate in this chain has already been tried"
+"候補ごとの試行上限 ({max} 回) に到達しました" = "reached the per-candidate attempt cap ({max})"
+"候補は全てクールダウン中です" = "every candidate is cooling down"
+"このセッションの切替上限 ({max} 回) に到達しました" = "reached this session's switch cap ({max})"
+"切替先も上限に当たりました (ここで人へ渡します)" = "the target hit a limit too (handing this back to you)"
+"切替先が立ち上がりませんでした" = "the target session did not come up"
+
+# 段 (検知 → 候補選定 → 切替 → 再開 → 検証)
+"①検知 — {signal} / {evidence}" = "①Detected — {signal} / {evidence}"
+"②候補選定 — {signal}" = "②Picking a target — {signal}"
+"③切替 — {to} を起動中" = "③Switching — launching {to}"
+"④再開 — {to} へプロンプトを引き継ぎ中" = "④Resuming — handing the prompt to {to}"
+"⑤検証 — {to} が進んでいるか確認中" = "⑤Verifying — checking that {to} is making progress"
+"✅ 切替完了 — {to}" = "✅ Switched — {to}"
+"⏹ 打ち切り — {why}" = "⏹ Stopped — {why}"
+"{from} がレート制限 → {to} へ切替 ({why} / 根拠 {signal})" = "{from} hit a rate limit → switched to {to} ({why} / evidence {signal})"

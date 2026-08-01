@@ -16,6 +16,7 @@ use crate::supervisor;
 use crate::editor::{combine_hash, disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
 use crate::file_search;
+use crate::failover;
 use crate::file_tree::{self, FileTree, TreeActions};
 use crate::firewall;
 use crate::fuzzy;
@@ -423,6 +424,19 @@ fn quota_severity_icon(severity: u8) -> &'static str {
         0 => "○",
         1 => "◇",
         _ => "●",
+    }
+}
+
+/// 経過時間の短い表記 (「45 秒」「12 分」「3 時間」)。
+/// 桁を増やさないので、狭い幅でも行が伸びない。
+fn fmt_ago(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        trf("{n} 秒", &[("n", s.to_string())])
+    } else if s < 3600 {
+        trf("{n} 分", &[("n", (s / 60).to_string())])
+    } else {
+        trf("{n} 時間", &[("n", (s / 3600).to_string())])
     }
 }
 
@@ -2025,6 +2039,9 @@ pub struct ZaivernApp {
     quota: coordinator::QuotaWatch,
     /// 使用量の詳細ウィンドウ (ステータスバーの表示をクリック / パレット)
     quota_open: bool,
+    /// レート制限時のアカウント自動フェイルオーバー。**既定は無効**。
+    /// 段 (検知→候補選定→切替→再開→検証) と履歴をここが持つ。
+    failover: failover::Failover,
     /// 保存時に行末の空白を落とす (egui memory へ永続化。将来は config.toml へ)
     save_trim_trailing: bool,
     /// 保存時に最終行へ改行を入れる (同上)
@@ -2562,6 +2579,7 @@ impl ZaivernApp {
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
+            failover: failover::Failover::new(cfg.failover.clone()),
             save_trim_trailing: false,
             save_final_newline: false,
             prefs_loaded: false,
@@ -4598,6 +4616,233 @@ impl ZaivernApp {
         self.quota.refresh_if_stale();
     }
 
+    /// このセッションが「レート制限だ」と言える根拠のうち、いちばん上の段。
+    ///
+    /// 設計原則 4 の降り方をそのまま実装している:
+    /// 状態ファイル (ベンダーの実測値) → 画面スクレイプ (裏取り済みのときだけ)。
+    /// 構造化プロトコル / ベンダーフックの段は、それを出す CLI が現れたらここへ足す。
+    fn failover_signal(&self, sid: u64, line: &str) -> Option<failover::Signal> {
+        let Some(s) = self.agents.sessions.iter().find(|x| x.id == sid) else {
+            return None;
+        };
+        let bin = crate::agents::spec_for_command(&s.command).map(|sp| sp.bin);
+        let mut have: Vec<failover::Signal> = Vec::new();
+        // 3 段目: ベンダーがローカルへ書いた使用率。実測なので最優先で採る。
+        if let Some(bin) = bin {
+            let exhausted = self.quota.snapshots().iter().any(|q| {
+                q.agent == bin
+                    && q.source == coordinator::quota::SourceKind::Vendor
+                    && q.used_fraction.map(|u| u >= 0.99).unwrap_or(false)
+            });
+            if exhausted {
+                have.push(failover::Signal::StateFile);
+            }
+        }
+        // 4 段目: 画面。単語列一致 + 連続一致 + 出力が進んでいないことを裏取りする。
+        if failover::confirm_screen(
+            line,
+            s.rate_limit_hits(),
+            s.output_advanced(),
+            self.cfg.failover.min_screen_hits,
+        ) {
+            have.push(failover::Signal::Screen);
+        }
+        failover::classify_signal(&have)
+    }
+
+    /// レート制限を検知したセッションを、別プロファイル / 別 CLI へ引き継ぐ。
+    ///
+    /// **現行セッションには一切触らない** (kill もしない)。新しいプリセットで
+    /// 別セッションを立ち上げ、覚えているプロンプトを既存の遅延配達
+    /// (`pending_prompts` — 相手が落ち着いてから入れる) に載せるだけ。
+    /// 切り替えたら true。
+    fn failover_on_rate_limit(&mut self, title: &str, line: &str, ctx: &egui::Context) -> bool {
+        if !self.failover.enabled() {
+            return false;
+        }
+        let Some((sid, preset_name, bin, env, carry)) = self
+            .agents
+            .sessions
+            .iter()
+            .find(|s| s.title == title)
+            .and_then(|s| {
+                let spec = crate::agents::spec_for_command(&s.command)?;
+                Some((
+                    s.id,
+                    s.preset_name.clone(),
+                    spec.bin.to_string(),
+                    s.env.clone(),
+                    s.last_prompt.clone(),
+                ))
+            })
+        else {
+            return false;
+        };
+        let Some(signal) = self.failover_signal(sid, line) else {
+            // 根拠が足りない (画面に一瞬出ただけ等)。勝手に切り替えない。
+            return false;
+        };
+        let now = Instant::now();
+        self.failover.note_detected(sid, signal, line, now);
+
+        let current = failover::FailingSession {
+            session_id: sid,
+            preset: preset_name.clone(),
+            bin: bin.clone(),
+            account: failover::account_key(&bin, &env),
+            signal,
+            switches: self.failover.switches_for(sid),
+            tried: self.failover.tried_for(sid).to_vec(),
+        };
+        let candidates = failover::candidates_from_presets(
+            &self.cfg.agents,
+            self.failover.cooldowns(),
+            self.failover.attempt_counts(),
+            now,
+        );
+        let plan = match self.failover.plan(&current, &candidates, now) {
+            Ok(p) => p,
+            Err(why) => {
+                self.toast_warn(trf(
+                    "🔁 自動フェイルオーバー: 切り替えませんでした — {why}",
+                    &[("why", why.label())],
+                ));
+                return false;
+            }
+        };
+        // 枯れた枠は寝かせる (次の候補選定から外れ、時間が経てば復活する)。
+        self.failover.note_failed(&current.account, now);
+
+        match self.failover_launch(&plan, &env, carry, ctx) {
+            Ok(new_id) => {
+                self.failover
+                    .note_switched(sid, &preset_name, &plan, new_id, signal, now);
+                let msg = self
+                    .failover
+                    .records()
+                    .last()
+                    .map(|r| r.line())
+                    .unwrap_or_default();
+                self.toast_warn(format!("🔁 {msg}"));
+                notify::notify("Zaivern Code", &msg);
+                notify::webhook(&self.cfg.webhook_url, &tr("🔁 自動フェイルオーバー"), &msg);
+                true
+            }
+            Err(e) => {
+                // 起動に失敗した枠も寝かせる (同じ相手へ即座に殺到しない)。
+                self.failover.note_failed(&plan.account, now);
+                self.toast(
+                    trf(
+                        "🔁 {to} の起動に失敗しました: {e}",
+                        &[("to", plan.preset.clone()), ("e", e)],
+                    ),
+                    false,
+                );
+                false
+            }
+        }
+    }
+
+    /// 切替先プリセットでセッションを起動し、覚えているプロンプトを引き継ぐ。
+    /// 成功したら新しいセッション ID。
+    fn failover_launch(
+        &mut self,
+        plan: &failover::FailoverPlan,
+        from_env: &HashMap<String, String>,
+        carry: Option<String>,
+        ctx: &egui::Context,
+    ) -> Result<u64, String> {
+        let Some(mut preset) = self
+            .cfg
+            .agents
+            .iter()
+            .find(|p| p.name == plan.preset)
+            .cloned()
+        else {
+            return Err(tr("プリセットが見つかりません"));
+        };
+        // 会話の保存先が同じなら、既存の再開の仕組みをそのまま使う
+        // (別 CLI / 別設定ディレクトリでは過去の会話が無いので付けない)。
+        if let Some(spec) = crate::agents::spec_for_command(&preset.command) {
+            if failover::can_resume(&plan.bin, from_env, spec.bin, &preset.env) {
+                preset.command = crate::agents::apply_resume(&preset.command, spec);
+            }
+        }
+        let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
+        let cwd = self.agent_cwd();
+        self.agents.launch(&preset, &cwd, approval, ctx)?;
+        let new_id = self
+            .agents
+            .sessions
+            .last()
+            .map(|s| s.id)
+            .ok_or_else(|| tr("起動したセッションが見つかりません"))?;
+        if let Some(text) = carry.filter(|t| !t.trim().is_empty()) {
+            // 既存の遅延配達に載せる: 相手が落ち着く (Idle) のを待ってから入れる。
+            self.pending_prompts
+                .push((new_id, Instant::now(), format!("{}\r", text.trim())));
+        }
+        Ok(new_id)
+    }
+
+    /// 切替後の段 (④再開 → ⑤検証 → 完了 / 打ち切り) を 1 フレームぶん進める。
+    ///
+    /// 「新しい側が本当に動いているか」を、画面ではなく**セッションの生死と
+    /// レート制限フラグ**で見る (画面の文字列を読み直して推測しない)。
+    fn failover_tick(&mut self) {
+        if self.failover.in_flight().is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for sid in self.failover.in_flight() {
+            let Some(stage) = self.failover.stage_of(sid).cloned() else {
+                continue;
+            };
+            match stage {
+                failover::Stage::Resuming { session, .. } => {
+                    // 引き継ぎ待ちが捌けたら検証へ。
+                    if !self.pending_prompts.iter().any(|(id, _, _)| *id == session) {
+                        self.failover.note_resumed(sid, now);
+                    }
+                }
+                failover::Stage::Verifying { session, .. } => {
+                    let alive = self
+                        .agents
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == session)
+                        .filter(|s| s.running());
+                    match alive {
+                        // 切替先まで上限に当たった: 枠を寝かせて打ち切る
+                        // (ここから連鎖させると人が見ていない間に暴走する)。
+                        Some(s) if s.rate_limited.is_some() => {
+                            let account = crate::agents::spec_for_command(&s.command)
+                                .map(|sp| failover::account_key(sp.bin, &s.env));
+                            if let Some(a) = account {
+                                self.failover.note_failed(&a, now);
+                            }
+                            self.failover.note_gave_up(
+                                sid,
+                                failover::Refusal::TargetAlsoLimited,
+                                now,
+                            );
+                        }
+                        Some(_) if self.failover.verify_elapsed(sid, now) => {
+                            self.failover.note_verified(sid, now);
+                        }
+                        Some(_) => {}
+                        // 立ち上がった直後に落ちた = 切替先が使えない。
+                        None => {
+                            self.failover
+                                .note_gave_up(sid, failover::Refusal::TargetFailed, now)
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 使用量の詳細ウィンドウ (ステータスバーのクリック / パレットから開く)。
     fn quota_window_ui(&mut self, ctx: &egui::Context) {
         if !self.quota_open {
@@ -4607,12 +4852,87 @@ impl ZaivernApp {
         let now = std::time::SystemTime::now();
         let accounts = self.quota.accounts(now);
         let advice = self.quota.advice(now);
+        // フェイルオーバーの表示材料はクロージャの外で作る (self の二重借用を避ける)。
+        let fo_enabled = self.failover.enabled();
+        let fo_max = self.failover.config().max_switches;
+        let fo_stage = self.failover.active().map(|(_, s)| (s.step(), s.label()));
+        let mono = Instant::now();
+        let fo_recent: Vec<String> = self
+            .failover
+            .records()
+            .iter()
+            .rev()
+            .take(3)
+            .map(|r| {
+                trf(
+                    "{ago} 前: {line}",
+                    &[
+                        ("ago", fmt_ago(r.ago(mono))),
+                        ("line", r.line()),
+                    ],
+                )
+            })
+            .collect();
+        let fo_ladder = self.failover_ladder_text();
+        let fo_next = self.failover_preview(mono);
+        let mut toggle_failover = false;
         let mut open = self.quota_open;
         egui::Window::new(tr("📊 プラン使用量"))
             .open(&mut open)
             .resizable(true)
             .default_width(460.0)
             .show(ctx, |ui| {
+                // ── 🔁 自動フェイルオーバー (既定は無効) ──────────────
+                let mut on = fo_enabled;
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .checkbox(&mut on, tr("🔁 レート制限で自動的に切り替える"))
+                        .on_hover_text(format!(
+                            "{}\n\n{}",
+                            tr("上限に当たったら、同じ CLI の別プロファイル → 別 CLI の順で\n\
+                                切替先を選び、新しいセッションを立てて続きを渡します。\n\
+                                いま動いているセッションは残したまま (終了させません)。"),
+                            fo_ladder,
+                        ))
+                        .changed()
+                    {
+                        toggle_failover = true;
+                    }
+                    ui.label(
+                        RichText::new(trf(
+                            "1 セッションあたり最大 {n} 回",
+                            &[("n", fo_max.to_string())],
+                        ))
+                        .size(11.5)
+                        .color(theme.text_dim),
+                    );
+                });
+                // 「今どの段にいるか」を必ず出す (設計原則 4)。
+                if let Some((step, label)) = &fo_stage {
+                    ui.label(
+                        RichText::new(format!("　{}/5  {label}", step))
+                            .size(11.5)
+                            .color(theme.warn),
+                    );
+                } else if on {
+                    ui.label(
+                        RichText::new(match &fo_next {
+                            Some(to) => trf("　待機中 — 次の切替先: {to}", &[("to", to.clone())]),
+                            None => tr("　待機中 — 使える切替先はいまありません"),
+                        })
+                        .size(11.5)
+                        .color(theme.text_dim),
+                    );
+                }
+                for line in &fo_recent {
+                    ui.label(
+                        RichText::new(format!("　• {line}"))
+                            .size(11.5)
+                            .color(theme.text_dim),
+                    );
+                }
+                ui.separator();
+
                 if accounts.is_empty() {
                     ui.label(
                         RichText::new(tr(
@@ -4662,6 +4982,81 @@ impl ZaivernApp {
                 }
             });
         self.quota_open = open;
+        if toggle_failover {
+            self.set_failover_enabled(!fo_enabled);
+        }
+    }
+
+    /// 「どの段の情報で判断できる状態か」を段ごとに並べた説明文。
+    ///
+    /// 設計原則 4 のはしごをそのまま見せる。最下段 (画面スクレイプ) しか無いときに
+    /// 「上の段が使えないから推定でやっている」とユーザーが分かるようにするため。
+    fn failover_ladder_text(&self) -> String {
+        let vendor_ok = self
+            .quota
+            .snapshots()
+            .iter()
+            .any(|q| q.source == coordinator::quota::SourceKind::Vendor);
+        let mut lines = vec![tr("検知の根拠 (上ほど確実):")];
+        for s in failover::LADDER {
+            let available = match s {
+                // これらを出す CLI はまだ無い (対応が出たらここを繋ぐ)。
+                failover::Signal::Protocol | failover::Signal::VendorHook => false,
+                failover::Signal::StateFile => vendor_ok,
+                // 画面は常に読めるが、単独では裏取りを通さないと使わない。
+                failover::Signal::Screen => true,
+            };
+            let mark = if available { "✓" } else { "−" };
+            let note = if s.is_estimate() {
+                tr(" ※裏取りが通ったときだけ使う")
+            } else {
+                String::new()
+            };
+            lines.push(format!("  {mark} {}{note}", s.label()));
+        }
+        lines.join("\n")
+    }
+
+    /// いまアクティブなエージェントが上限に当たったら、どこへ移るかの下見。
+    /// 切替はまだ何も起きていない (純関数 [`failover::pick_failover`] を引くだけ)。
+    fn failover_preview(&self, now: Instant) -> Option<String> {
+        let s = self
+            .agents
+            .sessions
+            .get(self.agents.active)
+            .filter(|s| s.running())?;
+        let spec = crate::agents::spec_for_command(&s.command)?;
+        let current = failover::FailingSession {
+            session_id: s.id,
+            preset: s.preset_name.clone(),
+            bin: spec.bin.to_string(),
+            account: failover::account_key(spec.bin, &s.env),
+            signal: failover::Signal::Screen,
+            switches: self.failover.switches_for(s.id),
+            tried: self.failover.tried_for(s.id).to_vec(),
+        };
+        let candidates = failover::candidates_from_presets(
+            &self.cfg.agents,
+            self.failover.cooldowns(),
+            self.failover.attempt_counts(),
+            now,
+        );
+        failover::pick_failover(&current, &candidates, now).map(|p| p.preset)
+    }
+
+    /// 自動フェイルオーバーの有効/無効を切り替えて保存し、結果を知らせる。
+    /// パレット項目と 📊 プラン使用量ウィンドウのトグルが両方ここを通る。
+    fn set_failover_enabled(&mut self, on: bool) {
+        self.failover.set_enabled(on);
+        self.cfg.failover.enabled = on;
+        config::save_state(&self.cfg);
+        if on {
+            self.toast_warn(tr(
+                "🔁 自動フェイルオーバーを有効化しました — 上限に当たったら別プロファイルへ切り替えます",
+            ));
+        } else {
+            self.toast(tr("🔁 自動フェイルオーバーを無効化しました"), true);
+        }
     }
 
     /// セッションタブのフォルダ一覧を必要なときだけ作り直す。
@@ -4840,6 +5235,11 @@ impl ZaivernApp {
     /// (渡さないと入力の行き先が無くなり、「閉じたら操作を受け付けなくなった」
     /// ように見える)。
     fn close_agent(&mut self, i: usize) {
+        // セッション ID は再利用され得るので、フェイルオーバーの段も一緒に忘れる
+        // (残すと別セッションの状態として読まれてしまう)。
+        if let Some(id) = self.agents.sessions.get(i).map(|s| s.id) {
+            self.failover.forget_session(id);
+        }
         self.agents.remove(i);
         // 閉じたセッションが分割ペインだったら、木からも外して畳む
         // (残り 1 枚になったタイルは分割なしの描画へ戻る)。
@@ -4852,6 +5252,8 @@ impl ZaivernApp {
     fn send_to_agent(&mut self, text: String) {
         if let Some(s) = self.agents.active_session() {
             s.note_user_input();
+            // フェイルオーバーで別プロファイルへ引き継ぐ材料として覚えておく。
+            s.note_prompt(&text);
             s.write_bytes(text.as_bytes());
             self.agents.panel_open = true;
             self.toast(tr("アクティブなエージェントに送信しました"), true);
@@ -6867,6 +7269,7 @@ impl ZaivernApp {
             | Cmd::ToggleSearchRegex
             | Cmd::ShowSessions
             | Cmd::ShowQuota
+            | Cmd::ToggleFailover
             | Cmd::ToggleTrimTrailingOnSave
             | Cmd::ToggleFinalNewlineOnSave
             | Cmd::ConvertLineEnding(_)
@@ -7134,6 +7537,7 @@ impl ZaivernApp {
                 self.quota.force_refresh();
                 self.quota_open = true;
             }
+            Cmd::ToggleFailover => self.set_failover_enabled(!self.failover.enabled()),
             Cmd::ToggleTrimTrailingOnSave => {
                 self.save_trim_trailing = !self.save_trim_trailing;
                 self.save_editor_prefs(ctx);
@@ -7525,6 +7929,8 @@ impl ZaivernApp {
                 // 監視設定も入れ替える。サンプル間隔が変わるので次回刻みも捨てる。
                 self.supervisor.set_config(self.cfg.supervisor.clone());
                 self.sup_next_at = None;
+                // 自動フェイルオーバーのしきい値も入れ替える (有効/無効も config どおり)。
+                self.failover.set_config(self.cfg.failover.clone());
                 // 監視役 LLM も選び直されているかもしれないので作り直す。
                 self.apply_super_agent();
                 self.keys = Keybinds::from_overrides(&self.cfg.keybindings);
@@ -12058,6 +12464,7 @@ impl ZaivernApp {
                 .map(|s| {
                     // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)
                     s.note_user_input();
+                    s.note_prompt(&text);
                     (s.send_text(&format!("{text}\r")), s.title.clone())
                 });
             match sent {
@@ -12366,6 +12773,7 @@ impl ZaivernApp {
                     let sent = self.agents.sessions.get_mut(idx).map(|s| {
                         // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)。
                         s.note_user_input();
+                        s.note_prompt(&text);
                         let mut t = text.clone();
                         t.push('\r');
                         (s.send_text(&t), s.title.clone())
@@ -14606,6 +15014,16 @@ impl ZaivernApp {
                 tr("プラン使用量と枯渇予測を表示"),
                 String::new(),
                 Cmd::ShowQuota,
+            ),
+            (
+                "🔁".into(),
+                if self.failover.enabled() {
+                    tr("自動フェイルオーバーを無効化 (レート制限時の自動切替)")
+                } else {
+                    tr("自動フェイルオーバーを有効化 (レート制限時の自動切替)")
+                },
+                String::new(),
+                Cmd::ToggleFailover,
             ),
             // ── 保存時のクリーンアップ / 改行コード ──
             (
@@ -17007,6 +17425,7 @@ impl ZaivernApp {
     fn orch_effects(&mut self, eff: orchestration::Effects) {
         for (sid, text) in eff.writes {
             if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == sid) {
+                s.note_prompt(&text);
                 s.write_bytes(text.as_bytes());
             }
         }
@@ -17735,6 +18154,9 @@ impl ZaivernApp {
                         "⏳ {title} がレート制限/使用上限に達しました",
                         &[("title", title.clone())],
                     ));
+                    // 自動フェイルオーバー (既定は無効)。有効なときだけ、
+                    // 別プロファイル / 別 CLI へ引き継ぐ。現行セッションは残す。
+                    self.failover_on_rate_limit(&title, &line, ctx);
                     if self.cfg.pet_sounds {
                         self.sound.play(SoundKind::Confirm);
                     }
@@ -17777,6 +18199,7 @@ impl ZaivernApp {
                 }
                 let overdue = queued.elapsed().as_secs() >= 45 && !s.attention;
                 if idle || overdue {
+                    s.note_prompt(&text);
                     s.write_bytes(text.as_bytes());
                     delivered.push(s.title.clone());
                 } else if queued.elapsed().as_secs() < 120 {
@@ -17835,6 +18258,7 @@ impl ZaivernApp {
         self.supervise(ctx, win_focused);
         self.coordinate(win_focused);
         self.quota_tick();
+        self.failover_tick();
 
         self.top_bar(ctx);
         self.status_bar(ctx);
@@ -22647,9 +23071,68 @@ mod wave2_tests {
             "Cmd::SaveWithEncoding",
             // ── エージェントデッキ ──
             "Cmd::ToggleDeck",
+            // ── レート制限の自動フェイルオーバー ──
+            "Cmd::ToggleFailover",
         ] {
             assert!(list.contains(c), "{c} がコマンドパレットに無い");
             assert!(router.contains(c), "{c} のディスパッチが無い");
+        }
+    }
+
+    /// フェイルオーバーが「作ったのに繋いでいない」状態で終わらないことを、
+    /// ソースの構造で固定する。UI から到達できない実装は未完成なので、
+    /// 到達経路 (パレット / 設定トグル / 状態表示) と駆動点を全部見る。
+    #[test]
+    fn 自動フェイルオーバーが画面と駆動点に繋がっている() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        // 毎フレームの駆動 (段を進める) と、レート制限イベントからの起動。
+        assert!(src.contains("self.failover_tick();"), "毎フレームの駆動が無い");
+        assert!(
+            src.contains("self.failover_on_rate_limit(&title, &line, ctx);"),
+            "レート制限イベントから呼ばれていない"
+        );
+        // 設定トグル (📊 プラン使用量ウィンドウ) と、そこからの保存。
+        let win = src
+            .split("fn quota_window_ui(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("使用量ウィンドウがある");
+        assert!(
+            win.contains("🔁 レート制限で自動的に切り替える"),
+            "設定トグルがウィンドウに無い"
+        );
+        assert!(win.contains("fo_stage"), "今どの段にいるかを出していない");
+        assert!(
+            src.contains("fn set_failover_enabled(&mut self, on: bool)")
+                && src.contains("config::save_state(&self.cfg);"),
+            "切替結果が永続化されていない"
+        );
+        // セッションを閉じたら段を忘れる (ID 再利用の巻き添え防止)。
+        let close = src
+            .split("fn close_agent(&mut self, i: usize) {")
+            .nth(1)
+            .expect("close_agent がある");
+        assert!(
+            close.contains("self.failover.forget_session(id);"),
+            "閉じたセッションの段を忘れていない"
+        );
+    }
+
+    /// 切替は**現行セッションを殺さない**。フェイルオーバー経路に kill / remove /
+    /// restart が紛れ込んでいないことをソースで固定する
+    /// (終了済みセッションへ kill を撃たない既存ガードの regress 防止も兼ねる)。
+    #[test]
+    fn フェイルオーバーは現行セッションを殺さない() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn failover_on_rate_limit(&mut self, title: &str, line: &str, ctx: &egui::Context) -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// 切替先プリセットでセッションを起動し").next())
+            .expect("failover_on_rate_limit の本体がある");
+        for forbidden in ["kill", "close_agent", "agents.remove", "agents.restart"] {
+            assert!(
+                !body.contains(forbidden),
+                "フェイルオーバーが {forbidden} を呼んでいる (現行セッションは残すこと)"
+            );
         }
     }
 }

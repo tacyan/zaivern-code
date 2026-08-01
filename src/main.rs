@@ -16,6 +16,7 @@ mod editor;
 mod editor_ops;
 mod file_search;
 mod file_tree;
+mod failover;
 mod firewall;
 mod fuzzy;
 mod git;
