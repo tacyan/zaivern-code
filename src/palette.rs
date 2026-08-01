@@ -292,6 +292,8 @@ pub enum Cmd {
     OpenApprovalAudit,
     /// MCP サーバ管理パネルを開く
     OpenMcp,
+    /// Skills / slash command 管理パネルを開く
+    OpenSkills,
     /// キャレットを 1 つ上の行に増やす
     AddCursorAbove,
     /// キャレットを 1 つ下の行に増やす
@@ -601,6 +603,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenApprovals
         | Cmd::OpenApprovalAudit
         | Cmd::OpenMcp
+        | Cmd::OpenSkills
         | Cmd::ShowSessions
         | Cmd::ShowQuota
         | Cmd::ToggleFailover

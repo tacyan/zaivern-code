@@ -1505,6 +1505,10 @@ const BUNDLED: &[(&str, &[(&str, &str)])] = &[
                 include_str!("../assets/plugins/english-mode/lang/90-mcp.toml"),
             ),
             (
+                "lang/90-skills.toml",
+                include_str!("../assets/plugins/english-mode/lang/90-skills.toml"),
+            ),
+            (
                 "plugin.toml",
                 include_str!("../assets/plugins/english-mode/plugin.toml"),
             ),
