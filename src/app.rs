@@ -1463,6 +1463,15 @@ const COMPLETION_POPUP_H: f32 = 240.0;
 const HOVER_OFFSET_Y: f32 = 18.0;
 const HOVER_POPUP_W: f32 = 560.0;
 const HOVER_POPUP_H: f32 = 320.0;
+/// クイックフィックス (コードアクション) ポップアップの見た目。
+/// 幅は補完より狭く固定する — タイトルは `lsp::one_line_label` で先に
+/// 切り詰めてあるので、どの幅でも 1 行が見切れない。
+const ACTION_POPUP_W: f32 = 460.0;
+const ACTION_POPUP_H: f32 = 260.0;
+/// シグネチャ (引数ヒント) ポップアップの幅。
+const SIGNATURE_POPUP_W: f32 = 560.0;
+/// シグネチャの説明文をこの文字数で 1 行に畳む。
+const SIGNATURE_DOC_MAX: usize = 120;
 /// 参照 / シンボル一覧の小窓の大きさ。
 const REF_WINDOW_W: f32 = 420.0;
 const REF_WINDOW_H: f32 = 360.0;
@@ -2115,6 +2124,33 @@ pub struct ZaivernApp {
     lsp_rename: Option<RenameFlow>,
     /// 整形の要求元 (バッファ id, 整形後に保存するか)
     lsp_format_buf: Option<(u64, bool)>,
+    /// クイックフィックス (codeAction) の候補と表示状態。
+    /// `lsp_actions_key` は選んだアクションの command を
+    /// `workspace/executeCommand` へ返すための送り先。
+    lsp_actions: Vec<lsp::CodeAction>,
+    lsp_actions_open: bool,
+    lsp_actions_busy: bool,
+    lsp_actions_sel: usize,
+    lsp_actions_key: Option<LspKey>,
+    /// ポップアップを出す画面位置 (要求した時点のキャレット直下で固定する。
+    /// 追従させると候補を選ぶ間に飛び回るため)
+    lsp_actions_anchor: Option<egui::Pos2>,
+    /// 引数ヒント (signatureHelp) の表示中の応答。
+    /// 飛行中 ID は持たない — 古い応答は `lsp::LspClient` 側のスロットが
+    /// 要求 ID で弾くので、UI 側で二重に見張る必要がない。
+    lsp_signature: Option<lsp::SignatureHelp>,
+    /// カーソル下シンボルのハイライト (documentHighlight) の状態
+    lsp_highlight: lsp::HighlightState,
+    /// 応答が来た時点で計算した本文の char 添字スパン。
+    /// **毎フレーム計算しない** — 本文走査が要るので、応答時に 1 回だけ作る。
+    lsp_highlight_spans: Vec<(usize, usize)>,
+    /// 上のスパンがどのバッファのものか (別タブの位置を塗らないため)
+    lsp_highlight_buf: Option<u64>,
+    /// 同一シンボルのハイライトを出すか (config.lsp_highlight_occurrences の実行時値)
+    lsp_highlight_on: bool,
+    /// 直近フレームの本文選択範囲 (char 添字, start < end)。無選択なら None。
+    /// 折りたたみ表示中は表示テキストの添字になってしまうので None にする。
+    editor_sel_chars: Option<(usize, usize)>,
     /// 保存時に LSP で整形するか。config.rs は別担当なのでここでは
     /// セッション内の切替のみ (既定は OFF = 何も変えない)。
     format_on_save: bool,
@@ -2510,6 +2546,18 @@ impl ZaivernApp {
             lsp_symbols_path: None,
             lsp_rename: None,
             lsp_format_buf: None,
+            lsp_actions: Vec::new(),
+            lsp_actions_open: false,
+            lsp_actions_busy: false,
+            lsp_actions_sel: 0,
+            lsp_actions_key: None,
+            lsp_actions_anchor: None,
+            lsp_signature: None,
+            lsp_highlight: lsp::HighlightState::new(),
+            lsp_highlight_spans: Vec::new(),
+            lsp_highlight_buf: None,
+            lsp_highlight_on: cfg.lsp_highlight_occurrences,
+            editor_sel_chars: None,
             format_on_save: false,
             ext_check_at: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
@@ -4557,6 +4605,12 @@ impl ZaivernApp {
 
     /// リロード後のテキストを LSP へ(デバウンス付きで)通知する
     fn queue_lsp_change(&mut self, i: usize) {
+        // 本文が変わった時点で、ハイライトの char 添字は指す場所を失う。
+        // ずれた位置を塗り続けるくらいなら消す (次のデバウンス満了で入れ直る)。
+        if !self.lsp_highlight_spans.is_empty() {
+            self.lsp_highlight_spans.clear();
+            self.lsp_highlight_buf = None;
+        }
         let Some(b) = self.editor.buffers.get(i) else {
             return;
         };
@@ -5751,6 +5805,20 @@ impl ZaivernApp {
                     self.toast_warn(tr("整形できるサーバーが動いていません"));
                 }
             }
+            Cmd::LspCodeAction => self.lsp_code_actions(),
+            Cmd::LspSignatureHelp => self.lsp_signature_help(),
+            Cmd::ToggleLspHighlight => {
+                self.lsp_highlight_on = !self.lsp_highlight_on;
+                if !self.lsp_highlight_on {
+                    self.clear_highlight_spans();
+                }
+                let msg = if self.lsp_highlight_on {
+                    tr("同一シンボルのハイライト: ON")
+                } else {
+                    tr("同一シンボルのハイライト: OFF")
+                };
+                self.toast(msg, true);
+            }
             Cmd::ToggleFormatOnSave => {
                 self.format_on_save = !self.format_on_save;
                 let msg = if self.format_on_save {
@@ -6035,6 +6103,13 @@ impl ZaivernApp {
     }
 
     /// 「ドキュメントを整形」。`save_after` が true なら結果の適用後に保存する。
+    ///
+    /// **選択があれば `textDocument/rangeFormatting` へ振り分ける**
+    /// (VS Code の「選択範囲のフォーマット」と同じ)。到達経路は ⇧⌥F と
+    /// パレットの 1 本のままで、何を整形するかは選択の有無だけで決まる。
+    /// 保存時整形は選択に関係なく常に全体 — 一部だけ整形して保存すると、
+    /// 保存のたびに結果が変わって驚くため。
+    /// 範囲整形に非対応のサーバーでは黙って全体整形へ落ちる。
     /// 送れたら true (サーバーが無い / 非対応なら false)。
     fn lsp_format_document(&mut self, save_after: bool) -> bool {
         let Some(i) = self.editor.active else {
@@ -6043,24 +6118,175 @@ impl ZaivernApp {
         let Some((key, path)) = self.active_lsp_target() else {
             return false;
         };
-        let Some(c) = self.lsp.get(&key) else {
-            return false;
-        };
-        if !c.caps().formatting {
-            return false;
-        }
         // 保存時クリーンアップの設定と食い違わせない
         let opts = lsp::FormatOptions {
             trim_trailing_whitespace: self.save_trim_trailing,
             insert_final_newline: self.save_final_newline,
             ..Default::default()
         };
-        if c.request_formatting(&path, &opts).is_sent() {
-            self.lsp_format_buf = Some((self.editor.buffers[i].id, save_after));
-            true
+        let sel = if save_after {
+            None
         } else {
-            false
+            self.editor_sel_chars
+                .map(|(s, e)| lsp::char_span_to_range(&self.editor.buffers[i].text, s, e))
+        };
+        let buf_id = self.editor.buffers[i].id;
+        let Some(c) = self.lsp.get(&key) else {
+            return false;
+        };
+        let caps = c.caps();
+        let sent = match sel {
+            Some(range) if caps.range_formatting => {
+                c.request_range_formatting(&path, &range, &opts).is_sent()
+            }
+            _ if caps.formatting => c.request_formatting(&path, &opts).is_sent(),
+            _ => false,
+        };
+        if sent {
+            self.lsp_format_buf = Some((buf_id, save_after));
         }
+        sent
+    }
+
+    /// 「クイックフィックス」。キャレット行 (選択があればその範囲) の
+    /// コードアクションを要求する。
+    ///
+    /// サーバーが codeAction 非対応なら**黙って何もしない**のではなく 1 行で
+    /// 伝える (定義ジャンプと同じ流儀)。押しても無反応、が一番わかりにくい。
+    fn lsp_code_actions(&mut self) {
+        let (Some((key, path)), Some(caret)) = (self.active_lsp_target(), self.caret_lsp_pos())
+        else {
+            self.toast_warn(tr("この言語の LSP サーバーが動いていません"));
+            return;
+        };
+        let supported = self
+            .lsp
+            .get(&key)
+            .map(|c| c.caps().code_action)
+            .unwrap_or(false);
+        if !supported {
+            self.toast_warn(tr("この言語の LSP は クイックフィックスに対応していません"));
+            return;
+        }
+        let Some(i) = self.editor.active else {
+            return;
+        };
+        let sel = self.editor_sel_chars.map(|(s, e)| {
+            let r = lsp::char_span_to_range(&self.editor.buffers[i].text, s, e);
+            (r.start, r.end)
+        });
+        let range = lsp::action_range(&self.editor.buffers[i].text, sel, caret);
+        let sent = match self.lsp.get(&key) {
+            Some(c) => {
+                // その範囲に重なる診断だけを context に載せる
+                // (サーバーはこれを見て「その問題の修正」を絞り込む)
+                let diags = c.diagnostics(&path);
+                let picked = diags
+                    .as_deref()
+                    .map(|v| lsp::diagnostics_in_range(v, &range))
+                    .unwrap_or_default();
+                c.request_code_actions(&path, &range, &picked).is_sent()
+            }
+            None => false,
+        };
+        if sent {
+            self.lsp_actions.clear();
+            self.lsp_actions_sel = 0;
+            self.lsp_actions_busy = true;
+            self.lsp_actions_open = true;
+            self.lsp_actions_key = Some(key);
+            // 要求した時点のキャレット直下で固定する。追従させると候補を
+            // 選んでいる間にポップアップが飛び回る。
+            self.lsp_actions_anchor = self.caret_screen;
+        }
+    }
+
+    /// 選んだクイックフィックスを 1 件適用する。
+    ///
+    /// WorkspaceEdit を持つものは既存の適用経路 (`apply_workspace_edit`) を
+    /// そのまま通す (未保存で残す方針も共通)。command 形式は
+    /// `workspace/executeCommand` をサーバーへ送る — 本クライアントは
+    /// `workspace/applyEdit` を受けないので、サーバー内で完結するコマンド専用。
+    fn apply_code_action(&mut self, n: usize) {
+        let Some(a) = self.lsp_actions.get(n).cloned() else {
+            return;
+        };
+        self.lsp_actions_open = false;
+        self.lsp_actions.clear();
+        if !lsp::action_is_actionable(&a) {
+            self.toast_warn(tr(
+                "このアクションはサーバー側での解決が必要で、まだ適用できません",
+            ));
+            return;
+        }
+        if !a.edit.is_empty() {
+            self.apply_workspace_edit(a.edit.clone());
+        }
+        let Some(cmd) = a.command.as_ref() else {
+            return;
+        };
+        let key = self.lsp_actions_key.clone();
+        let st = match key.as_ref().and_then(|k| self.lsp.get(k)) {
+            Some(c) => c.execute_command(cmd),
+            None => lsp::RequestStatus::Dead,
+        };
+        let title = lsp::one_line_label(&a.title, lsp::ACTION_TITLE_MAX);
+        if st.is_sent() {
+            self.toast(
+                trf("🛠 {title} をサーバーへ依頼しました", &[("title", title)]),
+                true,
+            );
+        } else {
+            self.toast_warn(tr("このアクションをサーバーへ送れませんでした"));
+        }
+    }
+
+    /// 「引数ヒント」の手動要求 (⇧⌘Space / パレット)。
+    /// 自動トリガ ('(' や ',' の直後) は `lsp_completion_tick` 側で撃つ。
+    fn lsp_signature_help(&mut self) {
+        let (Some((key, path)), Some(pos)) = (self.active_lsp_target(), self.caret_lsp_pos())
+        else {
+            self.toast_warn(tr("この言語の LSP サーバーが動いていません"));
+            return;
+        };
+        let supported = self
+            .lsp
+            .get(&key)
+            .map(|c| c.caps().signature_help)
+            .unwrap_or(false);
+        if !supported {
+            self.toast_warn(tr("この言語の LSP は 引数ヒントに対応していません"));
+            return;
+        }
+        if let Some(c) = self.lsp.get(&key) {
+            c.request_signature_help(&path, pos);
+        }
+    }
+
+    /// documentHighlight の結果を本文の char スパンへ焼き直す。
+    /// **応答が来たときとバッファが変わったときだけ**呼ぶ (毎フレームは走査しない)。
+    fn refresh_highlight_spans(&mut self) {
+        let Some(i) = self.editor.active else {
+            self.lsp_highlight_spans.clear();
+            self.lsp_highlight_buf = None;
+            return;
+        };
+        let (id, spans) = {
+            let b = &self.editor.buffers[i];
+            (
+                b.id,
+                lsp::highlight_char_spans(&b.text, self.lsp_highlight.shown()),
+            )
+        };
+        self.lsp_highlight_spans = spans;
+        self.lsp_highlight_buf = Some(id);
+    }
+
+    /// 同一シンボルのハイライトを全部捨てる (本文編集・タブ切替・機能 OFF)。
+    fn clear_highlight_spans(&mut self) {
+        self.lsp_highlight.clear();
+        self.lsp_highlight_spans.clear();
+        self.lsp_highlight_buf = None;
     }
 
     /// 補完候補を確定して本文へ差し込む (`additionalTextEdits` も一緒に当てる)。
@@ -6193,6 +6419,9 @@ impl ZaivernApp {
         let mut prepare: Option<Option<lsp::Range>> = None;
         let mut plan: Option<lsp::WorkspaceEditPlan> = None;
         let mut fmt: Option<Vec<lsp::TextEdit>> = None;
+        let mut actions: Option<Vec<lsp::CodeAction>> = None;
+        let mut signature: Option<lsp::SignatureHelp> = None;
+        let mut highlights: Option<Vec<lsp::DocumentHighlight>> = None;
         for c in self.lsp.values() {
             c.sweep_timeouts(lsp::REQUEST_TIMEOUT);
             if let Some(v) = c.poll_completion() {
@@ -6215,6 +6444,15 @@ impl ZaivernApp {
             }
             if let Some(v) = c.poll_formatting() {
                 fmt = Some(v);
+            }
+            if let Some(v) = c.poll_code_actions() {
+                actions = Some(v);
+            }
+            if let Some(v) = c.poll_signature_help() {
+                signature = Some(v);
+            }
+            if let Some(v) = c.poll_document_highlight() {
+                highlights = Some(v);
             }
         }
 
@@ -6270,6 +6508,27 @@ impl ZaivernApp {
         if let Some(edits) = fmt {
             self.apply_format_result(edits);
         }
+        if let Some(list) = actions {
+            self.lsp_actions = lsp::rank_code_actions(list);
+            self.lsp_actions_busy = false;
+            self.lsp_actions_sel = 0;
+            if self.lsp_actions.is_empty() {
+                // 空のポップアップを開いたままにしない (空白は作らない)
+                self.lsp_actions_open = false;
+                self.toast_warn(tr("ここで使えるクイックフィックスはありません"));
+            }
+        }
+        if let Some(help) = signature {
+            // 中身が無い応答でポップアップを出さない (空の枠だけが残る)
+            self.lsp_signature = (!help.signatures.is_empty()).then_some(help);
+        }
+        if let Some(hl) = highlights {
+            if let Some(id) = self.lsp_highlight.in_flight() {
+                if self.lsp_highlight.apply_response(id, hl) {
+                    self.refresh_highlight_spans();
+                }
+            }
+        }
     }
 
     /// 整形の結果を本文へ当てる (必要なら続けて保存する)。
@@ -6313,6 +6572,8 @@ impl ZaivernApp {
         let Some(i) = self.editor.active else {
             self.lsp_completion.dismiss();
             self.lsp_hover.dismiss();
+            self.lsp_signature = None;
+            self.clear_highlight_spans();
             return;
         };
         let buf_id = self.editor.buffers[i].id;
@@ -6323,6 +6584,10 @@ impl ZaivernApp {
         if self.lsp_completion_buf != Some(buf_id) {
             self.lsp_completion.dismiss();
             self.lsp_hover.dismiss();
+            self.lsp_signature = None;
+            self.lsp_actions_open = false;
+            self.lsp_actions.clear();
+            self.clear_highlight_spans();
             self.lsp_completion_buf = Some(buf_id);
         }
 
@@ -6352,6 +6617,9 @@ impl ZaivernApp {
             if self.lsp_completion.is_open() {
                 self.lsp_completion.dismiss();
             }
+            // 引数ヒントはキャレット基準のオーバーレイなので、本文から
+            // フォーカスが外れたら残さない (どこの引数か分からなくなる)。
+            self.lsp_signature = None;
             return;
         }
 
@@ -6364,19 +6632,21 @@ impl ZaivernApp {
         };
         let now = Instant::now();
 
-        // 打鍵の検出 (Text イベント = 実際に本文へ入った文字)
-        if caps.completion {
-            let (typed, backspace) = ctx.input(|inp| {
-                let mut typed: Vec<char> = Vec::new();
-                for e in &inp.events {
-                    if let egui::Event::Text(s) = e {
-                        typed.extend(s.chars());
-                    }
+        // 打鍵の検出 (Text イベント = 実際に本文へ入った文字)。
+        // 補完とシグネチャの両方が見るので、能力ゲートの外で 1 回だけ集める。
+        let (typed, backspace) = ctx.input(|inp| {
+            let mut typed: Vec<char> = Vec::new();
+            for e in &inp.events {
+                if let egui::Event::Text(s) = e {
+                    typed.extend(s.chars());
                 }
-                (typed, inp.key_pressed(egui::Key::Backspace))
-            });
-            for ch in typed {
-                self.lsp_completion.on_typed(ch, &caps, now);
+            }
+            (typed, inp.key_pressed(egui::Key::Backspace))
+        });
+
+        if caps.completion {
+            for ch in &typed {
+                self.lsp_completion.on_typed(*ch, &caps, now);
             }
             if backspace {
                 self.lsp_completion.on_backspace(now);
@@ -6420,6 +6690,99 @@ impl ZaivernApp {
                     self.lsp_hover.mark_sent(st);
                 }
             }
+        }
+
+        // 引数ヒント: '(' や ',' を打った直後に出し、')' と Esc で閉じる。
+        // **既存レイアウトは押しのけない** — キャレット近傍のオーバーレイだけ。
+        if caps.signature_help {
+            let mut want = false;
+            for ch in &typed {
+                if *ch == '(' || *ch == ',' || caps.signature_trigger_chars.contains(ch) {
+                    want = true;
+                }
+                if *ch == ')' {
+                    self.lsp_signature = None;
+                    want = false;
+                }
+            }
+            // Esc で閉じる。補完ポップアップが開いているときは上で吸われている
+            // ので、ここへ来るのは「シグネチャだけが出ている」ときだけ。
+            if self.lsp_signature.is_some()
+                && ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                self.lsp_signature = None;
+            }
+            if want {
+                let sent = match (self.caret_lsp_pos(), self.lsp.get(&key)) {
+                    (Some(pos), Some(c)) => c.request_signature_help(&path, pos).is_sent(),
+                    _ => false,
+                };
+                if !sent {
+                    self.lsp_signature = None;
+                }
+            }
+        } else if self.lsp_signature.is_some() {
+            self.lsp_signature = None;
+        }
+
+        // 同一シンボルのハイライト: キャレットが止まってから 1 回だけ要求する。
+        // 毎フレームは撃たない (設計原則 3: アイドル時のコストはゼロ)。
+        if caps.document_highlight && self.lsp_highlight_on {
+            if let Some(pos) = self.caret_lsp_pos() {
+                self.lsp_highlight.on_move(pos, now);
+            }
+            if let Some(pos) = self.lsp_highlight.due_request(now, lsp::HIGHLIGHT_DEBOUNCE) {
+                let st = self
+                    .lsp
+                    .get(&key)
+                    .map(|c| c.request_document_highlight(&path, pos));
+                if let Some(st) = st {
+                    self.lsp_highlight.mark_sent(st);
+                }
+            }
+            // デバウンス満了の瞬間に 1 回だけ起こす。予定が無ければ何も予約
+            // しないので、放っておけば再描画は止まる (常時アニメーションにしない)。
+            if let Some(after) = self.lsp_highlight.due_in(now, lsp::HIGHLIGHT_DEBOUNCE) {
+                ctx.request_repaint_after(after);
+            }
+        } else if !self.lsp_highlight_spans.is_empty() {
+            self.clear_highlight_spans();
+        }
+    }
+
+    /// クイックフィックスのポップアップのキー操作。
+    ///
+    /// **本文の TextEdit より先に**呼ぶこと (Enter / Esc / 矢印を先に横取りする)。
+    /// 開いていないときは何も消費しないので、通常の編集は素通しする。
+    fn lsp_actions_tick(&mut self, ctx: &egui::Context) {
+        if !self.lsp_actions_open {
+            return;
+        }
+        let (esc, up, down, accept) = ctx.input_mut(|inp| {
+            (
+                inp.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                inp.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            )
+        });
+        if esc {
+            self.lsp_actions_open = false;
+            self.lsp_actions.clear();
+            return;
+        }
+        let n = self.lsp_actions.len();
+        if n == 0 {
+            return;
+        }
+        if up {
+            self.lsp_actions_sel = (self.lsp_actions_sel + n - 1) % n;
+        }
+        if down {
+            self.lsp_actions_sel = (self.lsp_actions_sel + 1) % n;
+        }
+        if accept {
+            self.apply_code_action(self.lsp_actions_sel);
         }
     }
 
@@ -6542,6 +6905,158 @@ impl ZaivernApp {
                     });
             });
         self.md_images = images;
+    }
+
+    /// クイックフィックスのポップアップ。キャレット直下に小さく出す。
+    ///
+    /// 中央ビューは奪わず [`egui::Area`] で重ねるだけ (画面が突然変わらない)。
+    /// タイトルは `lsp::one_line_label` で先に 1 行へ畳んであるので、
+    /// 幅がいくつでも行が見切れない。全文はホバーで出す。
+    fn lsp_code_actions_popup(&mut self, ctx: &egui::Context) {
+        if !self.lsp_actions_open {
+            return;
+        }
+        if self.lsp_actions.is_empty() && !self.lsp_actions_busy {
+            // 中身も見込みも無いなら枠ごと消す (空白は作らない)
+            self.lsp_actions_open = false;
+            return;
+        }
+        let theme = self.theme.clone();
+        let anchor = self
+            .lsp_actions_anchor
+            .or(self.caret_screen)
+            .unwrap_or_else(|| ctx.screen_rect().center());
+        let busy = self.lsp_actions_busy;
+        let sel = self.lsp_actions_sel;
+        // (1 行に畳んだ表示, 全文, 押せるか)
+        let rows: Vec<(String, String, bool)> = self
+            .lsp_actions
+            .iter()
+            .map(|a| {
+                (
+                    lsp::one_line_label(&a.title, lsp::ACTION_TITLE_MAX),
+                    a.title.clone(),
+                    lsp::action_is_actionable(a),
+                )
+            })
+            .collect();
+        let mut clicked: Option<usize> = None;
+        let area = egui::Area::new(egui::Id::new("zv-lsp-code-actions"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(anchor + egui::vec2(0.0, HOVER_OFFSET_Y))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(theme.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, theme.border))
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(6.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(ACTION_POPUP_W);
+                        ui.label(
+                            RichText::new(tr("💡 クイックフィックス"))
+                                .size(11.0)
+                                .color(theme.text_dim),
+                        );
+                        if rows.is_empty() && busy {
+                            ui.label(
+                                RichText::new(tr("候補を問い合わせています…"))
+                                    .color(theme.text_dim),
+                            );
+                            return;
+                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("zv-code-actions")
+                            .max_height(ACTION_POPUP_H)
+                            .show(ui, |ui| {
+                                for (n, (short, full, ok)) in rows.iter().enumerate() {
+                                    let txt = RichText::new(short).color(if *ok {
+                                        theme.text
+                                    } else {
+                                        theme.text_dim
+                                    });
+                                    let mut r = ui.selectable_label(n == sel, txt);
+                                    if short != full {
+                                        r = r.on_hover_text(full);
+                                    }
+                                    if r.clicked() {
+                                        clicked = Some(n);
+                                    }
+                                }
+                            });
+                    });
+            });
+        if let Some(n) = clicked {
+            self.apply_code_action(n);
+            return;
+        }
+        // ポップアップの外を押したら閉じる。閉じないと `lsp_actions_tick` が
+        // Enter / Esc / 矢印を横取りし続けて、本文が打てなくなる。
+        let rect = area.response.rect;
+        let outside = ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer
+                    .interact_pos()
+                    .map(|p| !rect.contains(p))
+                    .unwrap_or(false)
+        });
+        if outside {
+            self.lsp_actions_open = false;
+            self.lsp_actions.clear();
+        }
+    }
+
+    /// 引数ヒント (シグネチャ) のポップアップ。
+    ///
+    /// キャレット近傍のオーバーレイに 1 行だけ出す。補完ポップアップが開いて
+    /// いる間は出さない — 同じ場所に 2 枚重ねると、どちらも読めなくなる。
+    fn lsp_signature_popup(&mut self, ctx: &egui::Context) {
+        if self.lsp_completion.is_open() {
+            return;
+        }
+        let Some(help) = self.lsp_signature.as_ref() else {
+            return;
+        };
+        let Some(d) = lsp::signature_display(help, SIGNATURE_DOC_MAX) else {
+            return;
+        };
+        let Some(at) = self.caret_screen else {
+            return;
+        };
+        let theme = self.theme.clone();
+        egui::Area::new(egui::Id::new("zv-lsp-signature"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(at + egui::vec2(0.0, HOVER_OFFSET_Y))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(theme.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, theme.border))
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(6.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(SIGNATURE_POPUP_W);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if d.total > 1 {
+                                ui.label(
+                                    RichText::new(format!("{}/{}", d.index, d.total))
+                                        .size(11.0)
+                                        .color(theme.text_dim),
+                                );
+                            }
+                            ui.label(RichText::new(&d.label).color(theme.text));
+                            if !d.active_param.is_empty() {
+                                ui.label(
+                                    RichText::new(&d.active_param)
+                                        .strong()
+                                        .color(theme.accent),
+                                );
+                            }
+                        });
+                        if !d.doc.is_empty() {
+                            ui.label(RichText::new(&d.doc).size(11.5).color(theme.text_dim));
+                        }
+                    });
+            });
     }
 
     /// 「参照を検索」の結果一覧。行をクリックするとそこへ飛ぶ。
@@ -6878,6 +7393,9 @@ impl ZaivernApp {
             | Cmd::LspSymbols
             | Cmd::LspRename
             | Cmd::LspFormat
+            | Cmd::LspCodeAction
+            | Cmd::LspSignatureHelp
+            | Cmd::ToggleLspHighlight
             | Cmd::ToggleFormatOnSave => self.apply_cmd_editor_extras(cmd),
             Cmd::Save
             | Cmd::SaveAs
@@ -8116,6 +8634,12 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.get(BindAction::LspFormat)) {
             cmds.push(Cmd::LspFormat);
+        }
+        if consume(ctx, self.keys.get(BindAction::LspCodeAction)) {
+            cmds.push(Cmd::LspCodeAction);
+        }
+        if consume(ctx, self.keys.get(BindAction::LspSignatureHelp)) {
+            cmds.push(Cmd::LspSignatureHelp);
         }
         // ⌘D: 次の出現を選択 (⇧⌘D の行複製より修飾キーが少ないので後に見る)
         if consume(ctx, self.keys.get(BindAction::SelectNextOccurrence)) {
@@ -14236,6 +14760,18 @@ impl ZaivernApp {
             sticky_cache = None;
         }
 
+        // 同一シンボルの薄いハイライト (LSP documentHighlight) を塗る位置。
+        // 応答が来た時点で計算済みの char スパンを写すだけで、ここでは本文を
+        // 走査しない。折りたたみ中は表示テキストと char 添字がずれるので塗らない。
+        let folding = disp_text.is_some();
+        let occ_color = self.theme.accent.gamma_multiply(0.16);
+        let occ_spans: Vec<(usize, usize)> =
+            if folding || self.lsp_highlight_buf != Some(self.editor.buffers[active].id) {
+                Vec::new()
+            } else {
+                self.lsp_highlight_spans.clone()
+            };
+
         let diag_by_line = &self.diag_cache.1;
         let hl = &self.highlighter;
         let buf = &mut self.editor.buffers[active];
@@ -14341,6 +14877,7 @@ impl ZaivernApp {
             let mut text_left: Option<f32> = None;
             let mut caret_at: Option<egui::Pos2> = None;
             let mut hover_hit: Option<(usize, egui::Pos2)> = None;
+            let mut sel_out: Option<(usize, usize)> = None;
             // 編集対象: 折りたたみ中は表示テキスト、読み取り専用なら
             // is_mutable() == false の包み (選択とコピーは残る)
             let mut target = match (read_only, disp_text.as_mut()) {
@@ -14411,7 +14948,38 @@ impl ZaivernApp {
                     }
                 }
 
+                // カーソル下シンボルと同じものの薄いハイライト。
+                // 現在行ハイライトと同じく**文字の上に重ねる**ので、字を潰さない
+                // 極薄の塗りにする。視覚行をまたぐ範囲は矩形が一意に決まらない
+                // ので塗らない (識別子は 1 行に収まるので実害がない)。
+                for (s, e) in &occ_spans {
+                    let c0 = output.galley.from_ccursor(egui::text::CCursor::new(*s));
+                    let c1 = output.galley.from_ccursor(egui::text::CCursor::new(*e));
+                    let r0 = output.galley.pos_from_cursor(&c0);
+                    let r1 = output.galley.pos_from_cursor(&c1);
+                    if (r0.min.y - r1.min.y).abs() > 0.5 || r1.min.x <= r0.min.x {
+                        continue;
+                    }
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(
+                            output.galley_pos.x + r0.min.x,
+                            output.galley_pos.y + r0.min.y,
+                        ),
+                        egui::pos2(
+                            output.galley_pos.x + r1.min.x,
+                            output.galley_pos.y + r0.max.y,
+                        ),
+                    );
+                    ui.painter().rect_filled(rect, 2.0, occ_color);
+                }
+
                 if let Some(cr) = output.cursor_range {
+                    // 選択範囲 (char 添字)。折りたたみ中は表示テキストの添字に
+                    // なってしまうので、LSP へ渡せる形ではないため None のまま。
+                    let (sa, sb) = (cr.primary.ccursor.index, cr.secondary.ccursor.index);
+                    if sa != sb && !folding {
+                        sel_out = Some((sa.min(sb), sa.max(sb)));
+                    }
                     let idx = cr.primary.ccursor.index;
                     let mut line = 1usize;
                     let mut col = 1usize;
@@ -14465,10 +15033,11 @@ impl ZaivernApp {
                 text_left,
                 caret_at,
                 hover_hit,
+                sel_out,
             )
         });
 
-        let (cursor_out, changed, text_top, text_left, caret_at, hover_hit) = inner.inner;
+        let (cursor_out, changed, text_top, text_left, caret_at, hover_hit, sel_out) = inner.inner;
 
         // 行番号ガター: git マークで行ごとに色分けした galley をキャッシュ。
         // 折り返し OFF は論理行と 1:1。ON は本文 galley の視覚行に合わせ、
@@ -14749,6 +15318,8 @@ impl ZaivernApp {
         if let Some(c) = cursor_out {
             self.editor.cursor = c;
         }
+        // 選択範囲は「選択があれば範囲整形 / 範囲のコードアクション」の分岐に使う
+        self.editor_sel_chars = sel_out;
 
         // 折りたたみ表示への編集を原文へ差し戻す。
         // 表示テキストは原文から隠す行を抜いたものなので、共通接頭辞 /
@@ -15060,6 +15631,24 @@ impl ZaivernApp {
                 tr("ドキュメントを整形"),
                 fmt_key(BindAction::LspFormat),
                 Cmd::LspFormat,
+            ),
+            (
+                "💡".into(),
+                tr("クイックフィックス"),
+                fmt_key(BindAction::LspCodeAction),
+                Cmd::LspCodeAction,
+            ),
+            (
+                "()".into(),
+                tr("引数ヒントを表示"),
+                fmt_key(BindAction::LspSignatureHelp),
+                Cmd::LspSignatureHelp,
+            ),
+            (
+                "🔆".into(),
+                tr("同一シンボルのハイライト切替"),
+                String::new(),
+                Cmd::ToggleLspHighlight,
             ),
             ("🛠".into(), tr("保存時に整形するかの切替"), String::new(), Cmd::ToggleFormatOnSave),
             ("🖥".into(), tr("フルスクリーンの切替"), "⌃⌘F".into(), Cmd::ToggleFullScreen),
@@ -18060,6 +18649,7 @@ impl ZaivernApp {
         // 補完ポップアップのキー (Enter/Tab/Esc/矢印) は本文 TextEdit より先に
         // 消費する必要があるので、パネル描画前のここで処理する。
         self.lsp_completion_tick(ctx);
+        self.lsp_actions_tick(ctx);
         self.poll_global_search();
         // セッションタブに出すフォルダ一覧 (is_dir を叩くので変化時だけ作り直す)
         self.refresh_session_folders();
@@ -18451,6 +19041,8 @@ impl ZaivernApp {
 
         // 本文の上に重ねる LSP のポップアップ (中央パネルより後に描く)
         self.lsp_completion_popup(ctx);
+        self.lsp_signature_popup(ctx);
+        self.lsp_code_actions_popup(ctx);
         self.lsp_hover_popup(ctx);
 
         self.palette_ui(ctx);
@@ -20130,20 +20722,25 @@ impl ZaivernApp {
             return;
         }
         let theme = self.theme.clone();
-        // 開いている全ファイルの診断を集める
-        let mut rows: Vec<(PathBuf, String, lsp::Diagnostic)> = Vec::new();
+        // 開いている全ファイルの診断を集める。
+        // 4 つ目の bool = そのファイルの LSP がクイックフィックスに対応しているか
+        // (対応していない言語で「押しても何も起きないボタン」を並べない)。
+        let mut rows: Vec<(PathBuf, String, lsp::Diagnostic, bool)> = Vec::new();
         for b in &self.editor.buffers {
             let Some(path) = b.path.clone() else { continue };
             let key = self.lsp_key_for(&path, &b.lang);
             let Some(client) = self.lsp.get(&key) else { continue };
+            let can_fix = client.caps().code_action;
             let Some(diags) = client.diagnostics(&path) else { continue };
             for d in diags.iter() {
-                rows.push((path.clone(), b.title.clone(), d.clone()));
+                rows.push((path.clone(), b.title.clone(), d.clone(), can_fix));
             }
         }
-        rows.sort_by_key(|(_, _, d)| (d.severity, d.line));
+        rows.sort_by_key(|(_, _, d, _)| (d.severity, d.line));
         let mut open = self.problems_open;
         let mut jump: Option<(PathBuf, usize, usize)> = None;
+        // 「この診断を直す」= その位置へ飛んでからクイックフィックスを要求する
+        let mut fix: Option<(PathBuf, usize, usize)> = None;
         egui::Window::new(tr("⚠ 問題"))
             .open(&mut open)
             .default_size([560.0, 300.0])
@@ -20161,7 +20758,7 @@ impl ZaivernApp {
                     .id_salt("zv-problems")
                     .auto_shrink(false)
                     .show(ui, |ui| {
-                        for (path, title, d) in &rows {
+                        for (path, title, d, can_fix) in &rows {
                             let icon = match d.severity {
                                 1 => "❌",
                                 2 => "⚠",
@@ -20172,22 +20769,39 @@ impl ZaivernApp {
                                 d.line + 1,
                                 d.message.lines().next().unwrap_or("")
                             );
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new(label).size(12.5))
-                                        .frame(false)
-                                        .wrap_mode(egui::TextWrapMode::Truncate),
-                                )
-                                .clicked()
-                            {
-                                jump = Some((path.clone(), d.line, d.col));
-                            }
+                            // 1 行 = [💡] + 診断本文。💡 は固定幅なので、残りは
+                            // 必ず available_width に収まる (見切れは Truncate 側で吸収)。
+                            ui.horizontal(|ui| {
+                                if *can_fix
+                                    && ui
+                                        .add(egui::Button::new("💡").frame(false))
+                                        .on_hover_text(tr("クイックフィックス"))
+                                        .clicked()
+                                {
+                                    fix = Some((path.clone(), d.line, d.col));
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(label).size(12.5))
+                                            .frame(false)
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                    )
+                                    .clicked()
+                                {
+                                    jump = Some((path.clone(), d.line, d.col));
+                                }
+                            });
                         }
                     });
             });
         self.problems_open = open;
         if let Some((path, line, col)) = jump {
             self.jump_to_lsp_pos(&path, line, col);
+        }
+        if let Some((path, line, col)) = fix {
+            // 先に診断の位置へ飛ぶ (codeAction はキャレット位置で範囲を決めるため)
+            self.jump_to_lsp_pos(&path, line, col);
+            self.lsp_code_actions();
         }
     }
 
@@ -23140,6 +23754,9 @@ mod wave2_tests {
             "Cmd::LspSymbols",
             "Cmd::LspRename",
             "Cmd::LspFormat",
+            "Cmd::LspCodeAction",
+            "Cmd::LspSignatureHelp",
+            "Cmd::ToggleLspHighlight",
             "Cmd::ToggleFormatOnSave",
             // ── 第 3 次配線 ──
             "Cmd::RestartTutorial",
@@ -23164,6 +23781,54 @@ mod wave2_tests {
             assert!(router.contains(c), "{c} のディスパッチが無い");
         }
     }
+
+    /// 第 4 次配線: `lsp.rs` に実装済みだった機能が UI から実際に呼ばれている。
+    ///
+    /// `cargo check` の `never used` は「作ったのに繋いでいない」を一度は
+    /// 捕まえるが、あとから配線だけ外れても警告は出ない (別の場所から
+    /// 呼ばれ続けるため)。呼び出し側・到達経路・描画のどれが欠けても
+    /// ここで落ちるようにして、未配線への逆戻りを止める。
+    #[test]
+    fn lspのコードアクションと引数ヒントとハイライトが配線されている() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        // ① クライアント API を実際に叩いている
+        for call in [
+            "c.request_code_actions(&path, &range, &picked)",
+            "c.poll_code_actions()",
+            "c.execute_command(cmd)",
+            "c.request_signature_help(&path, pos)",
+            "c.poll_signature_help()",
+            "c.request_document_highlight(&path, pos)",
+            "c.poll_document_highlight()",
+            "c.request_range_formatting(&path, &range, &opts)",
+        ] {
+            assert!(src.contains(call), "{call} を呼んでいる場所が無い");
+        }
+        // ② 到達経路 (キーバインド / パレット / 問題パネルの💡ボタン)
+        for route in [
+            "BindAction::LspCodeAction",
+            "BindAction::LspSignatureHelp",
+            "Cmd::LspCodeAction => self.lsp_code_actions()",
+            "Cmd::LspSignatureHelp => self.lsp_signature_help()",
+            "fix = Some((path.clone(), d.line, d.col));",
+        ] {
+            assert!(src.contains(route), "{route} の到達経路が無い");
+        }
+        // ③ 描いていなければ画面には出ない
+        for draw in [
+            "self.lsp_actions_tick(ctx);",
+            "self.lsp_code_actions_popup(ctx);",
+            "self.lsp_signature_popup(ctx);",
+            "ui.painter().rect_filled(rect, 2.0, occ_color);",
+        ] {
+            assert!(src.contains(draw), "{draw} が呼ばれていない (画面に出ない)");
+        }
+        // ④ 整形は「選択があれば範囲整形」へ分岐している (経路は増やさない)
+        assert!(
+            src.contains("Some(range) if caps.range_formatting =>"),
+            "選択時に rangeFormatting へ振り分けていない"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -23179,7 +23844,7 @@ mod glyph_tests {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
         const UI_SYMBOLS: &str = "📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
-                                  💬📊⛔🔁·↩▸▾🔎◆📇💤🎬🎵\
+                                  💬📊⛔🔁·↩▸▾🔎◆📇💤🎬🎵🔆\
                                   🔍📡🖱📦🍚🌀🔷🔶🕊👷🐦🅰🌊⌘➡🔩🌙🎏🎐🐉💠";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);

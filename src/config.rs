@@ -17,6 +17,11 @@ pub struct Config {
     /// 空白文字の可視化 (スペース「·」/ タブ「→」)。既定はオフ。
     pub show_whitespace: bool,
 
+    /// カーソル下のシンボルと同じものを本文で薄くハイライトするか
+    /// (LSP の textDocument/documentHighlight)。既定はオン。
+    /// オフにすると要求自体を送らないので、サーバーへの往復もゼロになる。
+    pub lsp_highlight_occurrences: bool,
+
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
@@ -220,6 +225,7 @@ impl Default for Config {
             show_hidden_files: true,
             word_wrap: false,
             show_whitespace: false,
+            lsp_highlight_occurrences: true,
             approval_mode: "ask".into(),
             restore_agents: false,
             show_pet: true,
@@ -491,6 +497,10 @@ show_hidden_files = true
 # (表示メニュー・コマンドパレットの「折り返し切替」「空白文字表示切替」でも変更できます)
 # word_wrap = false
 # show_whitespace = false
+
+# カーソル下のシンボルと同じものを本文で薄くハイライトする (LSP documentHighlight)
+# (コマンドパレットの「同一シンボルのハイライト切替」でも変更できます)
+# lsp_highlight_occurrences = true
 
 # 既定の権限モード (claude / codex / agy に自動適用)
 #   "ask"   = 毎回ユーザー承認が必要（安全・デフォルト）

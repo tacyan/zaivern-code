@@ -2206,6 +2206,215 @@ pub fn parse_code_actions(result: &Value) -> Vec<CodeAction> {
 }
 
 // ---------------------------------------------------------------------------
+// 応答の「見せ方」を決める純関数
+//
+// 並べ替え・切り詰め・塗る場所の算出はここに閉じ込める。egui も App の状態も
+// 知らないので、モックした JSON 応答だけでテーブルテストできる
+// (実際に LSP サーバーを起動するテストは CI にプロセスを残すので書かない)。
+// ---------------------------------------------------------------------------
+
+/// コードアクションのポップアップに並べる最大件数。
+/// tsserver の import 候補のように数百件返すサーバーがあるため、
+/// 「押したい順」に並べてから頭だけを切り取る。
+pub const MAX_CODE_ACTIONS: usize = 30;
+
+/// ポップアップ 1 行に出すタイトルの最大文字数 (超えたら末尾を … に畳む)。
+/// どの幅でも見切れないよう、描画側の折り返しに頼らずここで決める。
+pub const ACTION_TITLE_MAX: usize = 72;
+
+/// 同一シンボルのハイライトを塗る最大件数。
+/// 巨大ファイルで全出現が返ってきても、塗る矩形の数を有限に保つ。
+pub const MAX_HIGHLIGHTS: usize = 200;
+
+/// documentHighlight の既定デバウンス (キャレットが止まってから要求するまで)。
+pub const HIGHLIGHT_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// 改行・タブ・連続空白を 1 個の空白へ潰し、`max_chars` 文字で切り詰める。
+///
+/// LSP のタイトルやドキュメントは複数行で来ることがあり、そのまま 1 行に
+/// 置くと行が伸びて見切れる。切り詰めは **char 単位**なので日本語でも
+/// 文字の途中で切れない。
+pub fn one_line_label(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut gap = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            gap = !out.is_empty();
+            continue;
+        }
+        if gap {
+            out.push(' ');
+            gap = false;
+        }
+        out.push(ch);
+    }
+    if out.chars().count() > max_chars {
+        let keep: String = out.chars().take(max_chars.saturating_sub(1)).collect();
+        out = keep;
+        out.push('…');
+    }
+    out
+}
+
+/// アクションの並び順の重み (小さいほど上)。
+fn action_rank(a: &CodeAction) -> u8 {
+    if a.is_preferred {
+        return 0;
+    }
+    if a.kind.starts_with("quickfix") {
+        return 1;
+    }
+    if a.kind.starts_with("source.fixAll") {
+        return 2;
+    }
+    if a.kind.starts_with("refactor") {
+        return 3;
+    }
+    if a.kind.starts_with("source") {
+        return 4;
+    }
+    // kind 無し = Command 形式。何を直すのか分からないので後ろへ。
+    5
+}
+
+/// コードアクションを「押したい順」に安定整列して上限で切る。
+///
+/// タイトルが空のものは押しても何を選んだか分からないので落とす。
+/// 同順位はサーバーが返した順のまま (`sort_by_key` は安定ソート)。
+pub fn rank_code_actions(actions: Vec<CodeAction>) -> Vec<CodeAction> {
+    let mut v: Vec<CodeAction> = actions
+        .into_iter()
+        .filter(|a| !a.title.trim().is_empty())
+        .collect();
+    v.sort_by_key(action_rank);
+    v.truncate(MAX_CODE_ACTIONS);
+    v
+}
+
+/// 選んだときに実際に何かできるアクションか。
+/// edit も command も無いものは `codeAction/resolve` が要る (本クライアントは未対応)。
+pub fn action_is_actionable(a: &CodeAction) -> bool {
+    !a.edit.is_empty() || a.command.is_some()
+}
+
+/// codeAction / rangeFormatting へ渡す範囲を決める。
+///
+/// 選択があればそれを (前後を正規化して) 使い、無ければ**キャレット行の全体**を使う。
+/// 行全体にするのは「行のどこにキャレットがあってもその行の診断を拾う」ため
+/// (VS Code の電球と同じ体感にする)。
+pub fn action_range(
+    text: &str,
+    selection: Option<(Position, Position)>,
+    caret: Position,
+) -> Range {
+    if let Some((a, b)) = selection {
+        let (s, e) = if a <= b { (a, b) } else { (b, a) };
+        if s != e {
+            return Range::new(s, e);
+        }
+    }
+    let width = text
+        .split('\n')
+        .nth(caret.line)
+        .map(|l| l.trim_end_matches('\r').encode_utf16().count())
+        .unwrap_or(caret.character);
+    Range::new(
+        Position::new(caret.line, 0),
+        Position::new(caret.line, width),
+    )
+}
+
+/// `range` に重なる診断だけを返す (codeAction の `context.diagnostics`)。
+///
+/// 端点だけが触れる場合も重なりとみなす — 空範囲の診断 (「ここに ; が要る」)
+/// を落とすと、サーバーがその修正候補を返さなくなるため。
+pub fn diagnostics_in_range(diags: &[Diagnostic], range: &Range) -> Vec<Diagnostic> {
+    diags
+        .iter()
+        .filter(|d| {
+            let s = Position::new(d.line, d.col);
+            let e = Position::new(d.end_line, d.end_col);
+            let (s, e) = if s <= e { (s, e) } else { (e, s) };
+            s <= range.end && range.start <= e
+        })
+        .cloned()
+        .collect()
+}
+
+/// char 添字の範囲を LSP の [`Range`] にする (選択範囲の整形など)。
+pub fn char_span_to_range(text: &str, start: usize, end: usize) -> Range {
+    let (a, b) = (start.min(end), start.max(end));
+    let (sl, sc) = char_index_to_lsp_pos(text, a);
+    let (el, ec) = char_index_to_lsp_pos(text, b);
+    Range::new(Position::new(sl, sc), Position::new(el, ec))
+}
+
+/// シグネチャヘルプを 1 枚のポップアップに出すための材料。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SignatureDisplay {
+    /// 関数のシグネチャ全体 (1 行に潰し済み)。
+    pub label: String,
+    /// いま入力中の引数のラベル。空なら強調しない。
+    pub active_param: String,
+    /// 1 行に潰したドキュメント (無ければ空)。
+    pub doc: String,
+    /// 何番目のシグネチャか (1 始まり) と総数。overload が 1 つなら (1, 1)。
+    pub index: usize,
+    pub total: usize,
+}
+
+/// 応答から「いま出すべき 1 枚」を作る。出すものが無ければ `None`。
+///
+/// `activeSignature` / `activeParameter` が範囲外を指す壊れた応答でも
+/// panic せず、クランプするか強調を諦める。
+pub fn signature_display(help: &SignatureHelp, doc_max: usize) -> Option<SignatureDisplay> {
+    if help.signatures.is_empty() {
+        return None;
+    }
+    let i = help.active_signature.min(help.signatures.len() - 1);
+    let sig = &help.signatures[i];
+    let label = one_line_label(&sig.label, ACTION_TITLE_MAX * 2);
+    if label.is_empty() {
+        return None;
+    }
+    let active_param = help
+        .active_parameter
+        .and_then(|p| sig.parameters.get(p))
+        .map(|p| one_line_label(&p.label, ACTION_TITLE_MAX))
+        .unwrap_or_default();
+    Some(SignatureDisplay {
+        label,
+        active_param,
+        doc: one_line_label(&sig.documentation, doc_max),
+        index: i + 1,
+        total: help.signatures.len(),
+    })
+}
+
+/// documentHighlight を本文の char 添字スパンへ落とす。
+///
+/// 逆転・空・本文外は捨て、開始位置で整列して重複を除き、[`MAX_HIGHLIGHTS`] で切る。
+/// **応答が来た瞬間に 1 回だけ**呼ぶこと (毎フレーム呼ぶと本文を何度も走査する)。
+pub fn highlight_char_spans(text: &str, hl: &[DocumentHighlight]) -> Vec<(usize, usize)> {
+    let total = text.chars().count();
+    let mut out: Vec<(usize, usize)> = hl
+        .iter()
+        .filter_map(|h| {
+            let s = lsp_pos_to_char_index(text, h.range.start.line, h.range.start.character);
+            let e = lsp_pos_to_char_index(text, h.range.end.line, h.range.end.character);
+            (s < e && e <= total).then_some((s, e))
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(MAX_HIGHLIGHTS);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // UI 非依存の状態層
 //
 // ここは egui を一切知らない。UI 側は
@@ -2550,6 +2759,93 @@ impl HoverState {
     /// 表示中のホバーが指している位置。
     pub fn shown_at(&self) -> Option<Position> {
         self.shown_at
+    }
+}
+
+/// カーソル下シンボルのハイライト状態。
+///
+/// **アイドル時にリクエストを撃たない**ための門番 (設計原則 3)。キャレットが
+/// 止まってからデバウンス経過後に 1 回だけ要求し、同じ位置では二度と要求しない。
+/// 表示中のハイライトはキャレット移動では消さない — 消すと打鍵のたびに点滅して
+/// 「常時アニメーション」になるため、新しい応答が来たときに置き換える。
+#[derive(Debug, Default)]
+pub struct HighlightState {
+    resting: Option<(Position, std::time::Instant)>,
+    requested_for: Option<Position>,
+    in_flight: Option<u64>,
+    shown: Vec<DocumentHighlight>,
+}
+
+impl HighlightState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// キャレットが動いたら呼ぶ。同じ位置なら時計を進めない。
+    pub fn on_move(&mut self, pos: Position, now: std::time::Instant) {
+        if self.resting.map(|(p, _)| p) == Some(pos) {
+            return;
+        }
+        self.resting = Some((pos, now));
+        self.requested_for = None;
+        self.in_flight = None;
+    }
+
+    /// 表示も予定も全部捨てる (タブ切替・本文編集・機能 OFF)。
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// デバウンス満了で要求すべき位置を返す (同じ位置で二度は返さない)。
+    pub fn due_request(
+        &mut self,
+        now: std::time::Instant,
+        debounce: Duration,
+    ) -> Option<Position> {
+        let (pos, at) = self.resting?;
+        if self.requested_for == Some(pos) || now.saturating_duration_since(at) < debounce {
+            return None;
+        }
+        self.requested_for = Some(pos);
+        Some(pos)
+    }
+
+    /// 次のデバウンス満了までの残り時間。**再描画の予約を 1 回だけ入れる**ために使う。
+    /// 予定が無い / もう要求済み / すでに満了しているなら `None` = 何も予約しない
+    /// (常時再描画にならないことがこの `None` で担保される)。
+    pub fn due_in(&self, now: std::time::Instant, debounce: Duration) -> Option<Duration> {
+        let (pos, at) = self.resting?;
+        if self.requested_for == Some(pos) {
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(at);
+        (elapsed < debounce).then(|| debounce - elapsed)
+    }
+
+    pub fn mark_sent(&mut self, status: RequestStatus) {
+        self.in_flight = status.id();
+        if !status.is_sent() {
+            self.requested_for = None;
+        }
+    }
+
+    /// 応答を取り込む。古い応答は捨てる。取り込んだら true。
+    pub fn apply_response(&mut self, id: u64, hl: Vec<DocumentHighlight>) -> bool {
+        if self.in_flight != Some(id) {
+            return false;
+        }
+        self.in_flight = None;
+        self.shown = hl;
+        true
+    }
+
+    pub fn shown(&self) -> &[DocumentHighlight] {
+        &self.shown
+    }
+
+    /// 飛行中の要求 ID (応答の新旧を UI 側で見分けるため)。
+    pub fn in_flight(&self) -> Option<u64> {
+        self.in_flight
     }
 }
 
@@ -3658,6 +3954,273 @@ mod tests {
         // edit も command も無い = resolve が要る
         assert!(acts[2].needs_resolve);
         assert!(parse_code_actions(&Value::Null).is_empty());
+    }
+
+    // =======================================================================
+    // 見せ方の純関数 (並べ替え / 切り詰め / 塗る場所)
+    // =======================================================================
+
+    fn act(title: &str, kind: &str, preferred: bool) -> CodeAction {
+        CodeAction {
+            title: title.into(),
+            kind: kind.into(),
+            is_preferred: preferred,
+            ..CodeAction::default()
+        }
+    }
+
+    #[test]
+    fn one_line_label_は改行を潰して文字単位で切る() {
+        // (入力, 上限, 期待)
+        let cases: &[(&str, usize, &str)] = &[
+            ("", 10, ""),
+            ("hello", 10, "hello"),
+            ("  a \n b\t\tc  ", 20, "a b c"),
+            ("\n\n\n", 20, ""),
+            ("abcdefghij", 5, "abcd…"),
+            // 日本語は char 単位で切る (byte で切ると壊れる)
+            ("あいうえおかきくけこ", 4, "あいう…"),
+            ("あいう", 3, "あいう"),
+            ("なんでも", 0, ""),
+            ("絵文字🙂🙂🙂🙂", 3, "絵文…"),
+        ];
+        for (src, max, want) in cases {
+            assert_eq!(&one_line_label(src, *max), want, "src={src:?} max={max}");
+        }
+        // 巨大入力でも上限を必ず守る
+        let huge = "x".repeat(100_000);
+        assert_eq!(one_line_label(&huge, ACTION_TITLE_MAX).chars().count(), ACTION_TITLE_MAX);
+    }
+
+    #[test]
+    fn rank_code_actions_は押したい順に安定整列して上限で切る() {
+        let v = vec![
+            act("refactor", "refactor.extract", false),
+            act("", "quickfix", false),          // タイトル空 = 落とす
+            act("   ", "quickfix", false),       // 空白だけ = 落とす
+            act("command", "", false),
+            act("fixAll", "source.fixAll.eslint", false),
+            act("qf1", "quickfix", false),
+            act("qf2", "quickfix", false),       // 同順位は元の順序のまま
+            act("preferred", "refactor", true),
+            act("organize", "source.organizeImports", false),
+        ];
+        let out = rank_code_actions(v);
+        let titles: Vec<&str> = out.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["preferred", "qf1", "qf2", "fixAll", "refactor", "organize", "command"]
+        );
+        // 空応答
+        assert!(rank_code_actions(Vec::new()).is_empty());
+        // 巨大な配列は上限で切る (同名アクションが大量に並んでも壊れない)
+        let many: Vec<CodeAction> = (0..500).map(|_| act("同じ名前", "quickfix", false)).collect();
+        let cut = rank_code_actions(many);
+        assert_eq!(cut.len(), MAX_CODE_ACTIONS);
+        assert!(cut.iter().all(|a| a.title == "同じ名前"));
+    }
+
+    #[test]
+    fn action_is_actionable_は解決待ちを弾く() {
+        let mut with_edit = act("e", "quickfix", false);
+        with_edit.edit = WorkspaceEditPlan {
+            files: vec![FileEdits {
+                path: PathBuf::from("a.rs"),
+                edits: vec![TextEdit::new(rng(0, 0, 0, 1), "X")],
+            }],
+            has_resource_ops: false,
+        };
+        assert!(action_is_actionable(&with_edit));
+
+        let mut with_cmd = act("c", "", false);
+        with_cmd.command = Some(CommandRef {
+            title: "c".into(),
+            command: "do.it".into(),
+            arguments: vec![],
+        });
+        assert!(action_is_actionable(&with_cmd));
+
+        // edit も command も無い (needs_resolve) は押せない
+        assert!(!action_is_actionable(&act("lazy", "refactor", false)));
+        // files はあるが編集が 0 件でも押せない
+        let mut empty_edit = act("z", "quickfix", false);
+        empty_edit.edit = WorkspaceEditPlan {
+            files: vec![FileEdits { path: PathBuf::from("a.rs"), edits: vec![] }],
+            has_resource_ops: false,
+        };
+        assert!(!action_is_actionable(&empty_edit));
+    }
+
+    #[test]
+    fn action_range_は選択優先でなければ行全体() {
+        let text = "let a = 1;\nlet 日本語 = 2;\n";
+        // 選択なし → キャレット行の全体 (UTF-16 桁で行末まで)
+        assert_eq!(
+            action_range(text, None, pos(0, 4)),
+            rng(0, 0, 0, 10)
+        );
+        // 日本語行: "let 日本語 = 2;" は UTF-16 で 12 単位 (char 数と同じ = BMP のみ)
+        assert_eq!(action_range(text, None, pos(1, 0)).end.character, 12);
+        // 空選択は「選択なし」と同じ扱い
+        assert_eq!(
+            action_range(text, Some((pos(0, 3), pos(0, 3))), pos(0, 3)),
+            rng(0, 0, 0, 10)
+        );
+        // 選択あり → そのまま
+        assert_eq!(
+            action_range(text, Some((pos(0, 2), pos(1, 5))), pos(1, 5)),
+            rng(0, 2, 1, 5)
+        );
+        // 逆向きの選択は正規化される
+        assert_eq!(
+            action_range(text, Some((pos(1, 5), pos(0, 2))), pos(0, 2)),
+            rng(0, 2, 1, 5)
+        );
+        // 行が足りない (末尾より後ろ) → character はキャレットのまま、panic しない
+        assert_eq!(action_range("", None, pos(9, 3)), rng(9, 0, 9, 3));
+    }
+
+    #[test]
+    fn diagnostics_in_range_は重なりだけ拾う() {
+        let d = |l: usize, c: usize, el: usize, ec: usize| Diagnostic {
+            line: l,
+            col: c,
+            end_line: el,
+            end_col: ec,
+            severity: 1,
+            message: format!("{l}:{c}"),
+        };
+        let all = vec![
+            d(0, 0, 0, 5),  // 行 0
+            d(2, 1, 2, 1),  // 空範囲 (端点だけ触れる)
+            d(5, 0, 5, 3),  // 行 5
+            d(3, 9, 3, 2),  // 逆転した壊れた診断 (正規化して判定)
+        ];
+        let got = diagnostics_in_range(&all, &rng(0, 0, 0, 10));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].message, "0:0");
+        // 空範囲の診断は端点一致でも拾う
+        assert_eq!(diagnostics_in_range(&all, &rng(2, 1, 2, 1)).len(), 1);
+        // 逆転診断も行 3 の範囲で拾える
+        assert_eq!(diagnostics_in_range(&all, &rng(3, 0, 3, 20)).len(), 1);
+        // どこにも重ならない
+        assert!(diagnostics_in_range(&all, &rng(9, 0, 9, 1)).is_empty());
+        assert!(diagnostics_in_range(&[], &rng(0, 0, 0, 1)).is_empty());
+    }
+
+    #[test]
+    fn char_span_to_range_は日本語でも桁が合う() {
+        let text = "abc\nあいう\n";
+        assert_eq!(char_span_to_range(text, 0, 3), rng(0, 0, 0, 3));
+        // "あいう" は 1 文字 1 UTF-16 単位
+        assert_eq!(char_span_to_range(text, 4, 7), rng(1, 0, 1, 3));
+        // 逆順でも正規化される
+        assert_eq!(char_span_to_range(text, 7, 4), rng(1, 0, 1, 3));
+        // 範囲外はクランプ (panic しない)
+        let end = char_span_to_range(text, 0, 9999);
+        assert!(end.end.line >= 2);
+    }
+
+    #[test]
+    fn signature_display_は壊れた応答でも落ちない() {
+        let mk = |sigs: Vec<SignatureInfo>, a: usize, p: Option<usize>| SignatureHelp {
+            signatures: sigs,
+            active_signature: a,
+            active_parameter: p,
+        };
+        // 空応答
+        assert!(signature_display(&mk(vec![], 0, None), 60).is_none());
+        // ラベルが空白だけ
+        assert!(signature_display(
+            &mk(vec![SignatureInfo { label: "  \n ".into(), ..Default::default() }], 0, None),
+            60
+        )
+        .is_none());
+
+        let sig = SignatureInfo {
+            label: "fn push(&mut self,\n  value: T)".into(),
+            documentation: "要素を\n末尾へ追加する".into(),
+            parameters: vec![
+                ParameterInfo { label: "&mut self".into(), documentation: String::new() },
+                ParameterInfo { label: "value: T".into(), documentation: String::new() },
+            ],
+        };
+        let d = signature_display(&mk(vec![sig.clone()], 0, Some(1)), 60).unwrap();
+        assert_eq!(d.label, "fn push(&mut self, value: T)");
+        assert_eq!(d.active_param, "value: T");
+        assert_eq!(d.doc, "要素を 末尾へ追加する");
+        assert_eq!((d.index, d.total), (1, 1));
+
+        // activeSignature が範囲外 → 最後へクランプ
+        let two = mk(vec![sig.clone(), sig.clone()], 99, Some(0));
+        let d = signature_display(&two, 60).unwrap();
+        assert_eq!((d.index, d.total), (2, 2));
+        // activeParameter が範囲外 → 強調しないだけ
+        let d = signature_display(&mk(vec![sig], 0, Some(42)), 60).unwrap();
+        assert_eq!(d.active_param, "");
+    }
+
+    #[test]
+    fn highlight_char_spans_は整列重複除去して上限で切る() {
+        let text = "aa bb aa\nあ aa\n";
+        let h = |sl, sc, el, ec| DocumentHighlight { range: rng(sl, sc, el, ec), kind: 1 };
+        let got = highlight_char_spans(
+            text,
+            &[
+                h(1, 2, 1, 4), // "aa" (2 行目、日本語の後ろ)
+                h(0, 6, 0, 8), // "aa"
+                h(0, 0, 0, 2), // "aa"
+                h(0, 0, 0, 2), // 重複
+                h(0, 5, 0, 3), // 逆転 = 捨てる
+                h(0, 4, 0, 4), // 空 = 捨てる
+                h(99, 0, 99, 5), // 本文外 = 捨てる
+            ],
+        );
+        assert_eq!(got, vec![(0, 2), (6, 8), (11, 13)]);
+        assert!(highlight_char_spans(text, &[]).is_empty());
+        assert!(highlight_char_spans("", &[h(0, 0, 0, 3)]).is_empty());
+        // 上限で切る
+        let many: Vec<DocumentHighlight> =
+            (0..MAX_HIGHLIGHTS + 50).map(|i| h(0, i % 8, 0, (i % 8) + 1)).collect();
+        assert!(highlight_char_spans(text, &many).len() <= MAX_HIGHLIGHTS);
+    }
+
+    #[test]
+    fn highlight_state_はデバウンスして同じ位置を二度要求しない() {
+        let t0 = std::time::Instant::now();
+        let mut st = HighlightState::new();
+        assert!(st.due_request(t0, HIGHLIGHT_DEBOUNCE).is_none(), "動く前は要求しない");
+        assert!(st.due_in(t0, HIGHLIGHT_DEBOUNCE).is_none(), "予定が無ければ再描画も予約しない");
+
+        st.on_move(pos(1, 1), t0);
+        assert!(st.due_request(t0, HIGHLIGHT_DEBOUNCE).is_none(), "満了前は要求しない");
+        assert!(st.due_in(t0, HIGHLIGHT_DEBOUNCE).is_some(), "満了までの残りを返す");
+        // 同じ位置で on_move を連打しても時計は進まない
+        st.on_move(pos(1, 1), t0 + Duration::from_millis(200));
+        let t1 = t0 + HIGHLIGHT_DEBOUNCE;
+        assert_eq!(st.due_request(t1, HIGHLIGHT_DEBOUNCE), Some(pos(1, 1)));
+        assert!(st.due_request(t1, HIGHLIGHT_DEBOUNCE).is_none(), "同じ位置で二度は要求しない");
+        assert!(st.due_in(t1, HIGHLIGHT_DEBOUNCE).is_none(), "要求済みなら再描画を予約しない");
+
+        // 応答: 飛行中の id 以外は捨てる
+        st.mark_sent(RequestStatus::Sent(7));
+        let hl = vec![DocumentHighlight { range: rng(0, 0, 0, 2), kind: 2 }];
+        assert!(!st.apply_response(6, hl.clone()), "古い応答は捨てる");
+        assert!(st.shown().is_empty());
+        assert!(st.apply_response(7, hl.clone()));
+        assert_eq!(st.shown().len(), 1);
+
+        // キャレットが動いても表示は消さない (点滅させない)
+        st.on_move(pos(2, 0), t1);
+        assert_eq!(st.shown().len(), 1);
+        // 送れなかったら再挑戦できるよう requested_for を戻す
+        st.mark_sent(RequestStatus::Unsupported);
+        let t2 = t1 + HIGHLIGHT_DEBOUNCE;
+        assert_eq!(st.due_request(t2, HIGHLIGHT_DEBOUNCE), Some(pos(2, 0)));
+        // clear で全部消える
+        st.clear();
+        assert!(st.shown().is_empty());
+        assert!(st.due_request(t2, HIGHLIGHT_DEBOUNCE).is_none());
     }
 
     // =======================================================================
