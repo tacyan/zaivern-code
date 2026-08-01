@@ -335,7 +335,7 @@ Bare `zai` and `zai .` still launch the GUI, exactly as before. **Launched with 
 ### 🔤 Language servers (LSP)
 If `rust-analyzer` / `typescript-language-server` / `pyright-langserver` / `gopls` is on your PATH it starts automatically and shows diagnostics (errors/warnings). The line-number gutter turns red/yellow, and the status bar shows `⛔count ⚠count`. Editing works normally even without any server installed.
 
-Diagnostics are not all of it — **the usual VS Code keys are wired up**: **⌃Space** completion, hover for types and docs, **⇧F12** find references, **⇧⌘O** go to symbol, **F2** rename (edits spanning several files are applied together), **⇧⌥F** format document. Turn on "🛠 Format on save" in the toolbar and every save formats first (off by default). When a server doesn't implement a capability, it says "this server doesn't support …" rather than silently doing nothing.
+Diagnostics are not all of it — **the usual VS Code keys are wired up**: **⌘I** (or ⌃Space) completion, hover for types and docs, **⇧F12** find references, **⇧⌘O** go to symbol, **F2** rename (edits spanning several files are applied together), **⇧⌥F** format document. Turn on "🛠 Format on save" in the toolbar and every save formats first (off by default). When a server doesn't implement a capability, it says "this server doesn't support …" rather than silently doing nothing.
 
 Setup examples: `rustup component add rust-analyzer` / `npm i -g typescript-language-server typescript` / `npm i -g pyright` / `go install golang.org/x/tools/gopls@latest`
 
@@ -536,8 +536,12 @@ The split isn't about Linux disliking PTYs. On GitHub's hosted Linux runner (2 c
 | ⌘⇧D / ⌘D | Duplicate line / Select next occurrence, add caret |
 | ⌥⌘[ / ⌥⌘] / ⌥⌘B | Toggle fold / Unfold all / Toggle bookmark |
 | ⇧⌘T / ⌘⇧V / ⇧⌘H | Reopen closed tab / Markdown・HTML preview / Replace across workspace |
+<<<<<<< HEAD
 | F7 / ⇧F7 | Diff view: jump to next / previous change (wraps around) |
 | ⌃Space / ⇧F12 / ⇧⌘O | LSP: completion / find references / go to symbol |
+=======
+| ⌘I / ⇧F12 / ⇧⌘O | LSP: completion / find references / go to symbol |
+>>>>>>> worktree-agent-a0ebe81a65cf15bbf
 | F2 / ⇧⌥F | LSP: rename / format document |
 | ⌥↑ / ⌥↓ | Move line up / down |
 | PageUp / PageDown | Cursor + scroll by one screen |

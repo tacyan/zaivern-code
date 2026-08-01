@@ -9,6 +9,7 @@ use eframe::egui;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 use crate::i18n::{tr, trf};
+use crate::keybinds::{key_hint, BindAction};
 use crate::lockx::lock_ok;
 use crate::theme::Theme;
 
@@ -6554,8 +6555,21 @@ pub fn draw(
     if interactive {
         response.context_menu(|ui| {
             let has_sel = session.selection.is_some();
+            // 打鍵の表記はベタ書きしない。コピーは egui-winit 固定の打鍵、
+            // 検索は再割り当てできるので app 側が配った表記を使う。
+            let copy_key = crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::C,
+            ));
+            let find_key = key_hint(ui.ctx(), BindAction::Find);
             if ui
-                .add_enabled(has_sel, egui::Button::new(tr("📋 選択をコピー (⌘C)")))
+                .add_enabled(
+                    has_sel,
+                    egui::Button::new(trf(
+                        "📋 選択をコピー ({key})",
+                        &[("key", copy_key)],
+                    )),
+                )
                 .clicked()
             {
                 copy_selection(ui, session);
@@ -6567,7 +6581,10 @@ pub fn draw(
                 session.copied_at = Some(Instant::now());
                 ui.close_menu();
             }
-            if ui.button(tr("🔍 端末内を検索 (⌘F)")).clicked() {
+            if ui
+                .button(trf("🔍 端末内を検索 ({key})", &[("key", find_key)]))
+                .clicked()
+            {
                 session.search.open = true;
                 session.search.focus_pending = true;
                 ui.close_menu();

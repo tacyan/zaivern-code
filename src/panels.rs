@@ -2013,9 +2013,17 @@ pub fn approvals_ui(
         return out;
     }
 
+    // 打鍵の表記は整形器から作る (ベタ書きの ⇧A は Windows/Linux で嘘になる)。
+    let shift_key = |k: egui::Key| {
+        crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, k))
+    };
     ui.label(
-        RichText::new(tr(
-            "Y=承認 / A=この種別を全て承認 / ⇧A=このエージェントの この種別を常に許可 / N=拒否 / ⇧N=常に拒否",
+        RichText::new(trf(
+            "Y=承認 / A=この種別を全て承認 / {sa}=このエージェントの この種別を常に許可 / N=拒否 / {sn}=常に拒否",
+            &[
+                ("sa", shift_key(egui::Key::A)),
+                ("sn", shift_key(egui::Key::N)),
+            ],
         ))
         .size(11.0)
         .color(theme.text_dim),
@@ -2111,7 +2119,7 @@ pub fn approvals_ui(
                             );
                             btn(
                                 ui,
-                                tr("🛡 常に許可 (⇧A)"),
+                                trf("🛡 常に許可 ({key})", &[("key", shift_key(egui::Key::A))]),
                                 &tr(
                                     "以後このエージェントのこの種別を自動で許可します (config.toml に残ります)",
                                 ),
@@ -2120,7 +2128,7 @@ pub fn approvals_ui(
                             btn(ui, tr("✖ 拒否 (N)"), &tr("この 1 件を断ります"), Command::Deny);
                             btn(
                                 ui,
-                                tr("⛔ 常に拒否 (⇧N)"),
+                                trf("⛔ 常に拒否 ({key})", &[("key", shift_key(egui::Key::N))]),
                                 &tr(
                                     "以後このエージェントのこの種別を自動で断ります (config.toml に残ります)",
                                 ),

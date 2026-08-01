@@ -4576,8 +4576,22 @@ impl ZaivernApp {
                 self.commit_multi(buf_id, sel, false);
                 self.toast(
                     trf(
-                        "✏ {n} 箇所へ貼り付けました (⌘Z 一回で戻ります)",
-                        &[("n", n.to_string())],
+                        "✏ {n} 箇所へ貼り付けました ({undo} 一回で戻ります)",
+                        &[
+                            ("n", n.to_string()),
+                            // 取り消しは egui の TextEdit が持つ固定の打鍵なので
+                            // BindAction は無い。表記だけは同じ整形器で作る
+                            // (ベタ書きの ⌘Z は Windows/Linux で嘘になる)。
+                            (
+                                "undo",
+                                crate::keybinds::format_shortcut(
+                                    egui::KeyboardShortcut::new(
+                                        egui::Modifiers::COMMAND,
+                                        egui::Key::Z,
+                                    ),
+                                ),
+                            ),
+                        ],
                     ),
                     true,
                 );
@@ -4791,8 +4805,8 @@ impl ZaivernApp {
                 }
                 ExternalEvent::Conflict { title } => {
                     self.toast_warn(trf(
-                        "⚠ {title} が外部で変更されました — 未保存の編集があるため読み直していません(⌘S で上書き)",
-                        &[("title", title)],
+                        "⚠ {title} が外部で変更されました — 未保存の編集があるため読み直していません({key} で上書き)",
+                        &[("title", title), ("key", self.key_hint(BindAction::Save))],
                     ));
                 }
             }
@@ -7288,9 +7302,19 @@ impl ZaivernApp {
             if backspace {
                 self.lsp_completion.on_backspace(now);
             }
-            // ⌃Space = 明示的に呼び出す
-            if ctx.input_mut(|inp| inp.consume_shortcut(&self.keys.get(BindAction::LspCompletion)))
-            {
+            // 明示的に呼び出す。既定は ⌘I (VS Code mac の第 2 割り当て)。
+            // ⌃Space は macOS が「前の入力ソース」に予約していてアプリまで
+            // 届かないため既定から外したが、届く環境では拾えるよう残してある。
+            let invoke = ctx.input_mut(|inp| {
+                crate::keybinds::consume_shortcut_compat(
+                    inp,
+                    self.keys.get(BindAction::LspCompletion),
+                ) || crate::keybinds::consume_shortcut_compat(
+                    inp,
+                    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Space),
+                )
+            });
+            if invoke {
                 let w = self.word_before_caret();
                 self.lsp_completion.invoke(&w, now);
             }
@@ -9310,10 +9334,24 @@ impl ZaivernApp {
         }
     }
 
+    /// UI に出す打鍵表記。**必ずキーバインド表から生成する。**
+    ///
+    /// ベタ書きすると (1) config.toml で再割り当てされた瞬間に嘘になり
+    /// (2) Windows/Linux では表記そのものが違う (⌘⇧C ではなく Ctrl+Shift+C)、
+    /// という二重の嘘になる。`keybinds::画面のショートカット表記をベタ書きしていない`
+    /// が番人。
+    fn key_hint(&self, a: BindAction) -> String {
+        crate::keybinds::format_shortcut(self.keys.get(a))
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
+        // 素の `consume_shortcut` ではなく互換経路を通す。egui-winit 0.29 は
+        // ⌘⇧C / ⌘⇧V の **押下イベントごと** 捨てて Copy/Paste にすり替えるため、
+        // 素のままだと「画面には ⌘⇧C と出ているのに効かない」になる
+        // (詳細は `keybinds::clipboard_alias`)。
         let consume = |ctx: &egui::Context, sc: KeyboardShortcut| -> bool {
-            ctx.input_mut(|i| i.consume_shortcut(&sc))
+            ctx.input_mut(|i| crate::keybinds::consume_shortcut_compat(i, sc))
         };
         let mut cmds: Vec<Cmd> = Vec::new();
         let mut ops: Vec<EditOp> = Vec::new();
@@ -10367,7 +10405,13 @@ impl ZaivernApp {
             RichText::new(if compact { "🎛" } else { "🎛 Cockpit" }),
         );
         tutorial::anchor(ui.ctx(), AnchorId::CockpitButton, cockpit.rect);
-        if cockpit.on_hover_text(tr("全エージェント一覧 (⌘⇧C)")).clicked() {
+        if cockpit
+            .on_hover_text(trf(
+                "全エージェント一覧 ({key})",
+                &[("key", self.key_hint(BindAction::ToggleCockpit))],
+            ))
+            .clicked()
+        {
             cmds.push(Cmd::ToggleCockpit);
         }
 
@@ -10381,8 +10425,9 @@ impl ZaivernApp {
         );
         tutorial::anchor(ui.ctx(), AnchorId::KanbanButton, kanban.rect);
         if kanban
-            .on_hover_text(tr(
-                "フリート看板 — 全エージェントの状況を俯瞰 (⌘⇧K)",
+            .on_hover_text(trf(
+                "フリート看板 — 全エージェントの状況を俯瞰 ({key})",
+                &[("key", self.key_hint(BindAction::ToggleKanban))],
             ))
             .clicked()
         {
@@ -10401,8 +10446,9 @@ impl ZaivernApp {
         );
         tutorial::anchor(ui.ctx(), AnchorId::DeckButton, deck.rect);
         if deck
-            .on_hover_text(tr(
-                "エージェントデッキ — 稼働中と過去のセッションを縦 1 本で管理",
+            .on_hover_text(trf(
+                "エージェントデッキ — 稼働中と過去のセッションを縦 1 本で管理 ({key})",
+                &[("key", self.key_hint(BindAction::ToggleDeck))],
             ))
             .clicked()
         {
@@ -10440,11 +10486,20 @@ impl ZaivernApp {
         tutorial::anchor(ui.ctx(), AnchorId::NewAgentButton, new_agent.response.rect);
         new_agent
             .response
-            .on_hover_text(tr("エージェントを起動 (⌘⇧A)"));
+            .on_hover_text(trf(
+                "エージェントを起動 ({key})",
+                &[("key", self.key_hint(BindAction::NewAgent))],
+            ));
 
         if ui
             .button("🔍")
-            .on_hover_text(tr("コマンドパレット (⌘P / ⌘⇧P)"))
+            .on_hover_text(trf(
+                "コマンドパレット ({files} / {cmds})",
+                &[
+                    ("files", self.key_hint(BindAction::PaletteFiles)),
+                    ("cmds", self.key_hint(BindAction::PaletteCommands)),
+                ],
+            ))
             .clicked()
         {
             self.palette.open_files();
@@ -11975,7 +12030,7 @@ impl ZaivernApp {
                         });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("⌄").on_hover_text(tr("パネルを隠す (⌘J)")).clicked() {
+                        if ui.button("⌄").on_hover_text(trf("パネルを隠す ({key})", &[("key", self.key_hint(BindAction::ToggleTerminal))])).clicked() {
                             self.agents.panel_open = false;
                         }
                         // 承認タブ: 統合承認キュー。待ち件数を数字で添える
@@ -14838,14 +14893,14 @@ impl ZaivernApp {
                             self.md_preview,
                             RichText::new(tr("👁 プレビュー")).size(12.0),
                         );
-                        if p.on_hover_text(tr("レンダリング表示 (⌘⇧V)")).clicked() {
+                        if p.on_hover_text(trf("レンダリング表示 ({key})", &[("key", self.key_hint(BindAction::ToggleMdPreview))])).clicked() {
                             self.md_preview = true;
                         }
                         let e = ui.selectable_label(
                             !self.md_preview,
                             RichText::new(tr("✏ 編集")).size(12.0),
                         );
-                        if e.on_hover_text(tr("ソースを編集 (⌘⇧V)")).clicked() {
+                        if e.on_hover_text(trf("ソースを編集 ({key})", &[("key", self.key_hint(BindAction::ToggleMdPreview))])).clicked() {
                             self.md_preview = false;
                         }
                         // HTML はブラウザで開けば完全な見た目で確認できる
@@ -14946,7 +15001,7 @@ impl ZaivernApp {
                     let caret = if self.find.replace_open { "▾" } else { "▸" };
                     if ui
                         .button(caret)
-                        .on_hover_text(tr("置換行の表示切替 (⌥⌘F)"))
+                        .on_hover_text(trf("置換行の表示切替 ({key})", &[("key", self.key_hint(BindAction::OpenReplace))]))
                         .clicked()
                     {
                         self.find.replace_open = !self.find.replace_open;
@@ -15052,7 +15107,19 @@ impl ZaivernApp {
         let mut launch_claude = false;
         let mut open_folder = false;
 
-        let key = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
+        // 打鍵の表記はキーバインド表から生成する (ベタ書きは再割り当てで嘘に
+        // なり、Windows/Linux では表記そのものが違う)。描画クロージャは
+        // self を可変で借りるので、先に文字列だけ作っておく。
+        let hints: Vec<(String, String)> = [
+            (tr("ファイル検索"), BindAction::PaletteFiles),
+            (tr("コマンドパレット"), BindAction::PaletteCommands),
+            (tr("ターミナル / エージェントパネル"), BindAction::ToggleTerminal),
+            (tr("エージェント起動"), BindAction::NewAgent),
+            (tr("Cockpit ビュー"), BindAction::ToggleCockpit),
+        ]
+        .into_iter()
+        .map(|(label, a)| (label, self.key_hint(a)))
+        .collect();
 
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.16);
@@ -15092,11 +15159,9 @@ impl ZaivernApp {
             let hint = |s: &str, k: String| -> RichText {
                 RichText::new(format!("{k}  —  {s}")).size(12.5).color(theme.text_dim)
             };
-            ui.label(hint(&tr("ファイル検索"), format!("{key}P")));
-            ui.label(hint(&tr("コマンドパレット"), format!("{key}⇧P")));
-            ui.label(hint(&tr("ターミナル / エージェントパネル"), format!("{key}J")));
-            ui.label(hint(&tr("エージェント起動"), format!("{key}⇧A")));
-            ui.label(hint(&tr("Cockpit ビュー"), format!("{key}⇧C")));
+            for (label, k) in &hints {
+                ui.label(hint(label, k.clone()));
+            }
         });
 
         let ctx = ui.ctx().clone();
@@ -17051,10 +17116,10 @@ impl ZaivernApp {
         let fmt_key =
             |a: BindAction| crate::keybinds::format_shortcut(self.keys.get(a));
         vec![
-            ("💾".into(), tr("保存"), "⌘S".into(), Cmd::Save),
-            ("💾".into(), tr("名前を付けて保存"), "⌘⇧S".into(), Cmd::SaveAs),
-            ("📄".into(), tr("新規ファイル"), "⌘N".into(), Cmd::NewFile),
-            ("🪟".into(), tr("新しいウィンドウ"), "⌘⇧N".into(), Cmd::NewWindow),
+            ("💾".into(), tr("保存"), fmt_key(BindAction::Save), Cmd::Save),
+            ("💾".into(), tr("名前を付けて保存"), fmt_key(BindAction::SaveAs), Cmd::SaveAs),
+            ("📄".into(), tr("新規ファイル"), fmt_key(BindAction::NewFile), Cmd::NewFile),
+            ("🪟".into(), tr("新しいウィンドウ"), fmt_key(BindAction::NewWindow), Cmd::NewWindow),
             ("📂".into(), tr("フォルダを開く…"), String::new(), Cmd::OpenFolder),
             (
                 "🪟".into(),
@@ -17063,15 +17128,15 @@ impl ZaivernApp {
                 Cmd::NewWindowFolder,
             ),
             ("📚".into(), tr("フォルダをワークスペースに追加"), String::new(), Cmd::AddFolder),
-            ("❌".into(), tr("タブを閉じる"), "⌘W".into(), Cmd::CloseTab),
-            ("🔍".into(), tr("ファイル内検索"), "⌘F".into(), Cmd::OpenFind),
-            ("🖥".into(), tr("ターミナル表示切替"), "⌘J".into(), Cmd::ToggleTerminal),
-            ("🎛".into(), tr("Cockpit 切替"), "⌘⇧C".into(), Cmd::ToggleCockpit),
-            ("📋".into(), tr("フリート看板 切替"), "⌘⇧K".into(), Cmd::ToggleKanban),
+            ("❌".into(), tr("タブを閉じる"), fmt_key(BindAction::CloseTab), Cmd::CloseTab),
+            ("🔍".into(), tr("ファイル内検索"), fmt_key(BindAction::Find), Cmd::OpenFind),
+            ("🖥".into(), tr("ターミナル表示切替"), fmt_key(BindAction::ToggleTerminal), Cmd::ToggleTerminal),
+            ("🎛".into(), tr("Cockpit 切替"), fmt_key(BindAction::ToggleCockpit), Cmd::ToggleCockpit),
+            ("📋".into(), tr("フリート看板 切替"), fmt_key(BindAction::ToggleKanban), Cmd::ToggleKanban),
             (
                 deck::DECK_ICON.into(),
                 tr("エージェントデッキ"),
-                "⌥⌘D".into(),
+                fmt_key(BindAction::ToggleDeck),
                 Cmd::ToggleDeck,
             ),
             (
@@ -17088,7 +17153,7 @@ impl ZaivernApp {
                 Cmd::OpenRace,
             ),
             ("📮".into(), tr("エージェントへメッセージを送る"), String::new(), Cmd::SendAgentMessage),
-            ("👁".into(), tr("Markdown/HTML プレビュー切替"), "⌘⇧V".into(), Cmd::ToggleMdPreview),
+            ("👁".into(), tr("Markdown/HTML プレビュー切替"), fmt_key(BindAction::ToggleMdPreview), Cmd::ToggleMdPreview),
             ("↩".into(), tr("折り返し切替"), String::new(), Cmd::ToggleWordWrap),
             ("·".into(), tr("空白文字表示切替"), String::new(), Cmd::ToggleShowWhitespace),
             (
@@ -17124,7 +17189,7 @@ impl ZaivernApp {
             ("🗺".into(), tr("ミニマップの表示切替"), String::new(), Cmd::ToggleMinimap),
             ("🔗".into(), tr("ブレッドクラムの表示切替"), String::new(), Cmd::ToggleBreadcrumbs),
             ("👤".into(), tr("Git blame の表示切替"), String::new(), Cmd::ToggleGitBlame),
-            ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),
+            ("📁".into(), tr("サイドバー切替"), fmt_key(BindAction::ToggleSidebar), Cmd::ToggleSidebar),
             ("🌿".into(), tr("Git パネルを開く"), String::new(), Cmd::OpenGitPanel),
             (
                 "👾".into(),
@@ -17136,8 +17201,8 @@ impl ZaivernApp {
             ("🗑".into(), tr("アクティブなエージェントを終了"), String::new(), Cmd::KillAgent),
             ("⚙".into(), tr("設定 config.toml を開く"), String::new(), Cmd::OpenConfig),
             ("🔄".into(), tr("設定を再読み込み"), String::new(), Cmd::ReloadConfig),
-            ("🔠".into(), tr("フォント拡大"), "⌘+".into(), Cmd::FontInc),
-            ("🔠".into(), tr("フォント縮小"), "⌘-".into(), Cmd::FontDec),
+            ("🔠".into(), tr("フォント拡大"), fmt_key(BindAction::FontInc), Cmd::FontInc),
+            ("🔠".into(), tr("フォント縮小"), fmt_key(BindAction::FontDec), Cmd::FontDec),
             ("🌲".into(), tr("ファイルツリー再読み込み"), String::new(), Cmd::RefreshTree),
             (
                 "🛡".into(),
@@ -17186,23 +17251,23 @@ impl ZaivernApp {
             ("↺".into(), tr("ペット画像を既定に戻す"), String::new(), Cmd::ResetPetImage),
             ("🐾".into(), tr("ペット位置を右下に戻す"), String::new(), Cmd::ResetPetPos),
             // ── VS Code 準拠メニューバーのコマンド ──
-            ("📄".into(), tr("ファイルを開く…"), "⌘O".into(), Cmd::OpenFileDialog),
-            ("💾".into(), tr("すべて保存"), "⌥⌘S".into(), Cmd::SaveAll),
+            ("📄".into(), tr("ファイルを開く…"), fmt_key(BindAction::OpenFile), Cmd::OpenFileDialog),
+            ("💾".into(), tr("すべて保存"), fmt_key(BindAction::SaveAll), Cmd::SaveAll),
             ("💾".into(), tr("自動保存の切替"), String::new(), Cmd::ToggleAutoSave),
             ("↺".into(), tr("ファイルを元に戻す"), String::new(), Cmd::RevertFile),
             ("🚪".into(), tr("すべてのエディターを閉じる"), String::new(), Cmd::CloseAllTabs),
-            ("🔎".into(), tr("ファイル間で検索"), "⇧⌘F".into(), Cmd::GlobalSearch),
-            ("⇄".into(), tr("置換"), "⌥⌘F".into(), Cmd::OpenReplace),
-            // 🔗 は同梱フォントに字が無く豆腐(□)になるため「→」を使う
+            ("🔎".into(), tr("ファイル間で検索"), fmt_key(BindAction::GlobalSearch), Cmd::GlobalSearch),
+            ("⇄".into(), tr("置換"), fmt_key(BindAction::OpenReplace), Cmd::OpenReplace),
+            // 🧭 は同梱フォントに字が無く豆腐(□)になるため「→」を使う
             // (glyph_tests::ui_glyph_symbols_have_glyphs が担保している字)。
-            ("→".into(), tr("行/列へ移動…"), "⌃G".into(), Cmd::GoToLine),
-            ("→".into(), tr("定義へ移動"), "F12".into(), Cmd::GoToDefinition),
-            ("→".into(), tr("ブラケットへ移動"), "⇧⌘\\".into(), Cmd::GoToBracket),
-            ("⬅".into(), tr("戻る"), "⌃-".into(), Cmd::NavBack),
-            ("➡".into(), tr("進む"), "⌃⇧-".into(), Cmd::NavForward),
-            ("📑".into(), tr("次のエディター"), "⇧⌘]".into(), Cmd::NextTab),
-            ("📑".into(), tr("前のエディター"), "⇧⌘[".into(), Cmd::PrevTab),
-            ("🖥".into(), tr("新しいターミナル"), "⌃⇧`".into(), Cmd::NewTerminal),
+            ("→".into(), tr("行/列へ移動…"), fmt_key(BindAction::GoToLine), Cmd::GoToLine),
+            ("→".into(), tr("定義へ移動"), fmt_key(BindAction::GoToDefinition), Cmd::GoToDefinition),
+            ("→".into(), tr("ブラケットへ移動"), fmt_key(BindAction::GoToBracket), Cmd::GoToBracket),
+            ("⬅".into(), tr("戻る"), fmt_key(BindAction::NavBack), Cmd::NavBack),
+            ("➡".into(), tr("進む"), fmt_key(BindAction::NavForward), Cmd::NavForward),
+            ("📑".into(), tr("次のエディター"), fmt_key(BindAction::NextTab), Cmd::NextTab),
+            ("📑".into(), tr("前のエディター"), fmt_key(BindAction::PrevTab), Cmd::PrevTab),
+            ("🖥".into(), tr("新しいターミナル"), fmt_key(BindAction::NewTerminal), Cmd::NewTerminal),
             ("▶".into(), tr("アクティブなファイルを実行"), String::new(), Cmd::RunActiveFile),
             (
                 "▶".into(),
@@ -17210,8 +17275,8 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::RunSelection,
             ),
-            ("🔨".into(), tr("ビルド タスクの実行…"), "⇧⌘B".into(), Cmd::RunBuildTask),
-            ("⚠".into(), tr("問題パネルの切替"), "⇧⌘M".into(), Cmd::ToggleProblems),
+            ("🔨".into(), tr("ビルド タスクの実行…"), fmt_key(BindAction::RunBuildTask), Cmd::RunBuildTask),
+            ("⚠".into(), tr("問題パネルの切替"), fmt_key(BindAction::ToggleProblems), Cmd::ToggleProblems),
             // ── 第 2 次配線: レビュー / 折りたたみ / ブックマーク / 表 / LSP ──
             ("🔎".into(), tr("変更をレビュー (PR 風のローカルレビュー)"), String::new(), Cmd::OpenReview),
             (
@@ -17326,7 +17391,7 @@ impl ZaivernApp {
                 Cmd::ToggleLspHighlight,
             ),
             ("🛠".into(), tr("保存時に整形するかの切替"), String::new(), Cmd::ToggleFormatOnSave),
-            ("🖥".into(), tr("フルスクリーンの切替"), "⌃⌘F".into(), Cmd::ToggleFullScreen),
+            ("🖥".into(), tr("フルスクリーンの切替"), fmt_key(BindAction::ToggleFullScreen), Cmd::ToggleFullScreen),
             ("🐙".into(), tr("GitHub パネルを開く"), String::new(), Cmd::ShowGitHubTab),
             (
                 "⌨".into(),
@@ -17344,7 +17409,7 @@ impl ZaivernApp {
             (
                 "⇄".into(),
                 tr("ファイル間で置換…"),
-                crate::keybinds::format_shortcut(self.keys.get(BindAction::GlobalReplace)),
+                fmt_key(BindAction::GlobalReplace),
                 Cmd::GlobalReplace,
             ),
             (
@@ -18584,7 +18649,10 @@ impl ZaivernApp {
         let Some(path) = b.path.clone() else {
             return json!({
                 "ok": false,
-                "error": "名前のないファイルは PC 側で保存してください (⌘S)",
+                "error": trf(
+                    "名前のないファイルは PC 側で保存してください ({key})",
+                    &[("key", self.key_hint(BindAction::Save))],
+                ),
             })
             .to_string();
         };
@@ -18873,7 +18941,10 @@ impl ZaivernApp {
             if no_path {
                 return json!({
                     "ok": false,
-                    "error": "名前のないファイルは PC 側で保存してください (⌘S)",
+                    "error": trf(
+                        "名前のないファイルは PC 側で保存してください ({key})",
+                        &[("key", self.key_hint(BindAction::Save))],
+                    ),
                 })
                 .to_string();
             }
@@ -20580,6 +20651,9 @@ impl ZaivernApp {
         self.poll_voice(ctx);
 
         self.handle_shortcuts(ctx);
+        // Keybinds を持てない描画側 (ターミナルの右クリックメニュー等) へ
+        // 打鍵表記を配る。ベタ書きを増やさないための唯一の経路。
+        crate::keybinds::publish_key_hints(ctx, &self.keys, &[BindAction::Find]);
 
         // メニューバー経由のエディタ操作 (元に戻す/貼り付け等) を、パネル描画前に
         // フォーカス復帰 + イベント注入で TextEdit へ届ける
@@ -21218,7 +21292,7 @@ impl ZaivernApp {
             }
         }
         let theme = self.theme.clone();
-        if let Some(act) = self.tutorial.overlay(ctx, &theme) {
+        if let Some(act) = self.tutorial.overlay(ctx, &theme, &self.keys) {
             self.apply_tutorial_action(act, ctx);
         }
     }
@@ -22323,7 +22397,7 @@ impl ZaivernApp {
     fn run_active_file(&mut self, ctx: &egui::Context) {
         let Some(i) = self.editor.active else { return };
         let Some(path) = self.editor.buffers[i].path.clone() else {
-            self.toast(tr("先にファイルとして保存してください (⌘S)"), false);
+            self.toast(trf("先にファイルとして保存してください ({key})", &[("key", self.key_hint(BindAction::Save))]), false);
             return;
         };
         if self.editor.buffers[i].dirty() {
@@ -26334,6 +26408,173 @@ mod wave2_tests {
             "並べ替えの実体が無い"
         );
     }
+
+    /// `palette_builtin_cmds` の本体だけを切り出す。
+    fn palette_body(src: &str) -> &str {
+        let body = src
+            .split("fn palette_builtin_cmds(&self) -> Vec<(String, String, String, Cmd)> {")
+            .nth(1)
+            .expect("パレットの一覧がある");
+        let end = body.find("\n    }\n").expect("一覧の終わり");
+        &body[..end]
+    }
+
+    /// `at` 以降にある最初の `Cmd::識別子` を返す。
+    fn next_cmd_ident(src: &str, at: usize) -> Option<(usize, String)> {
+        let rel = src[at..].find("Cmd::")?;
+        let start = at + rel + "Cmd::".len();
+        let ident: String = src[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        (!ident.is_empty()).then_some((start, ident))
+    }
+
+    /// **パレットに並ぶ全コマンドが、実際に何かを実行する腕へ届く。**
+    ///
+    /// 「パレットには出るが押しても無反応」を潰すための番人。
+    /// ディスパッチが無い / 空の腕になっているものは 1 つでも落とす。
+    #[test]
+    fn パレットの全コマンドが実行される腕へ届く() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let list = palette_body(src);
+        // 上位ディスパッチ (`apply_cmd` の本体) だけを見る。ここから先を全部
+        // 対象にすると、パレットの一覧自身に当たって素通りしてしまう。
+        let router_all = src
+            .split("fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("ディスパッチがある");
+        let router = &router_all[..router_all.find("\n    fn ").unwrap_or(router_all.len())];
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut at = 0usize;
+        while let Some((next, ident)) = next_cmd_ident(list, at) {
+            at = next + ident.len();
+            if !seen.contains(&ident) {
+                seen.push(ident);
+            }
+        }
+        assert!(seen.len() > 80, "パレットの走査が壊れている ({} 件)", seen.len());
+
+        let mut broken: Vec<String> = Vec::new();
+        for name in &seen {
+            if !router.contains(&format!("Cmd::{name}")) {
+                broken.push(format!("{name}: ディスパッチが無い"));
+            }
+            // 何もしない腕 (書いたつもりで繋いでいない) も落とす
+            for noop in [
+                format!("Cmd::{name} => {{}}"),
+                format!("Cmd::{name} => (),"),
+                format!("Cmd::{name}(..) => {{}}"),
+                format!("Cmd::{name}(_) => {{}}"),
+            ] {
+                if src.contains(&noop) {
+                    broken.push(format!("{name}: 何もしない腕になっている"));
+                }
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "パレットに出るのに効かないコマンドがある: {broken:?}"
+        );
+    }
+
+    /// **パレットが表示する打鍵は、その行が実行する `Cmd` の `BindAction` から作る。**
+    ///
+    /// ベタ書きに戻すと再割り当てで嘘になり、別のアクションの打鍵を貼ると
+    /// 「書いてある通りに押しても違うことが起きる」。両方をここで止める。
+    #[test]
+    fn パレットの打鍵表示は実行するコマンドと一致する() {
+        // (BindAction, その行が実行する Cmd)
+        const PAIRS: &[(&str, &str)] = &[
+            // ── 第 4 次で足したもの (分割 / 差分ジャンプ / LSP) ──
+            // 名前が食い違う 1 件だけ注釈する: ⌘2 は「次のペインへ」を
+            // 実行する (ペイン 2 を名指しで選ぶのではない)。
+            ("SplitEditorRight", "SplitEditorRight"),
+            ("SplitEditorDown", "SplitEditorDown"),
+            ("FocusPane2", "FocusNextPane"),
+            ("DiffNextChange", "DiffNextChange"),
+            ("DiffPrevChange", "DiffPrevChange"),
+            ("LspCodeAction", "LspCodeAction"),
+            ("LspSignatureHelp", "LspSignatureHelp"),
+            ("Save", "Save"),
+            ("SaveAs", "SaveAs"),
+            ("NewFile", "NewFile"),
+            ("NewWindow", "NewWindow"),
+            ("CloseTab", "CloseTab"),
+            ("Find", "OpenFind"),
+            ("ToggleTerminal", "ToggleTerminal"),
+            ("ToggleCockpit", "ToggleCockpit"),
+            ("ToggleKanban", "ToggleKanban"),
+            ("ToggleDeck", "ToggleDeck"),
+            ("ToggleMdPreview", "ToggleMdPreview"),
+            ("ToggleSidebar", "ToggleSidebar"),
+            ("FontInc", "FontInc"),
+            ("FontDec", "FontDec"),
+            ("OpenFile", "OpenFileDialog"),
+            ("SaveAll", "SaveAll"),
+            ("GlobalSearch", "GlobalSearch"),
+            ("GlobalReplace", "GlobalReplace"),
+            ("OpenReplace", "OpenReplace"),
+            ("GoToLine", "GoToLine"),
+            ("GoToDefinition", "GoToDefinition"),
+            ("GoToBracket", "GoToBracket"),
+            ("NavBack", "NavBack"),
+            ("NavForward", "NavForward"),
+            ("NextTab", "NextTab"),
+            ("PrevTab", "PrevTab"),
+            ("NewTerminal", "NewTerminal"),
+            ("RunBuildTask", "RunBuildTask"),
+            ("ToggleProblems", "ToggleProblems"),
+            ("ToggleFullScreen", "ToggleFullScreen"),
+            ("ToggleFold", "ToggleFold"),
+            ("UnfoldAll", "UnfoldAll"),
+            ("ToggleBookmark", "ToggleBookmark"),
+            ("ReopenClosedTab", "ReopenClosedTab"),
+            ("LspCompletion", "LspCompletion"),
+            ("LspReferences", "LspReferences"),
+            ("LspSymbols", "LspSymbols"),
+            ("LspRename", "LspRename"),
+            ("LspFormat", "LspFormat"),
+            ("SelectNextOccurrence", "SelectNextOccurrence"),
+        ];
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let list = palette_body(src);
+
+        let mut checked = 0usize;
+        let mut wrong: Vec<String> = Vec::new();
+        let needle = "fmt_key(BindAction::";
+        let mut at = 0usize;
+        while let Some(rel) = list[at..].find(needle) {
+            let start = at + rel + needle.len();
+            let action: String = list[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            at = start + action.len();
+            let Some((_, cmd)) = next_cmd_ident(list, at) else {
+                wrong.push(format!("{action}: 同じ行に Cmd が無い"));
+                continue;
+            };
+            checked += 1;
+            match PAIRS.iter().find(|(a, _)| *a == action) {
+                Some((_, want)) if *want == cmd => {}
+                Some((_, want)) => wrong.push(format!(
+                    "BindAction::{action} の打鍵を Cmd::{cmd} の行に出している (正しくは Cmd::{want})"
+                )),
+                None => wrong.push(format!(
+                    "BindAction::{action} / Cmd::{cmd} の対応が表に無い (表を更新すること)"
+                )),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        assert_eq!(
+            checked,
+            PAIRS.len(),
+            "打鍵を出しているパレット行の数が表と合わない \
+             (ベタ書きへ戻したか、行を消した)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -27309,7 +27550,7 @@ mod tutorial_wiring_tests {
         let head = &body[..body.find("fn ").unwrap_or(body.len())];
         assert!(head.contains("if !self.tutorial_autostarted"));
         assert!(head.contains("self.tutorial_autostarted = true;"));
-        assert!(head.contains("self.tutorial.overlay(ctx, &theme)"));
+        assert!(head.contains("self.tutorial.overlay(ctx, &theme, &self.keys)"));
     }
 
     /// オーバーレイはアイドル判定の**前**に呼ぶ。
