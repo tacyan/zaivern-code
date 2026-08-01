@@ -17334,7 +17334,7 @@ impl ZaivernApp {
         // 実際に効いているキーバインドをそのまま出す (config で上書きされていても
         // パレットの表示とズレない)
         let fmt_key = |a: BindAction| crate::keybinds::format_shortcut(self.keys.get(a));
-        vec![
+        let mut rows: Vec<(String, String, String, Cmd)> = vec![
             (
                 "💾".into(),
                 tr("保存"),
@@ -18139,7 +18139,16 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::SaveWithEncoding(None),
             ),
-        ]
+        ];
+        // 公開鍵が入っていないビルドでは「ライセンスキーを入力…」を出さない。
+        // 番兵 (全ゼロ) のままだと**どんなキーも必ず弾かれる**ので、押しても
+        // 絶対に成立しない入口になる。CLAUDE.md の「常に 0 を表示するバッジ」
+        // と同じ理由で、機能ではなく雑音として扱い、項目ごと消す。
+        // 鍵を入れて焼き直せば同じコードのまま復活する。
+        if !crate::license::signing_configured() {
+            rows.retain(|(_, _, _, c)| !matches!(c, Cmd::OpenLicense));
+        }
+        rows
     }
 
     /// パレット: コマンドモード (`>`) の候補を items へ積む。

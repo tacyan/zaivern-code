@@ -109,6 +109,19 @@ pub const EMBEDDED_PUBKEY: [u8; PUBKEY_LEN] = match option_env!("ZAIVERN_LICENSE
     None => [0u8; PUBKEY_LEN],
 };
 
+/// このビルドがライセンスキーを検証できるか (= 本物の公開鍵が入っているか)。
+///
+/// 番兵 (全ゼロ) のままのビルドは**どんなキーも解錠できない**。そこで
+/// 「ライセンスキーを入力…」という**絶対に成立しない入口**を画面へ出さない
+/// ための判定に使う。CLAUDE.md の「常に 0 を表示するバッジ」「中身より
+/// 空状態を見せる時間が長いパネル」と同じ理由 — 押しても必ず失敗する項目は
+/// 機能ではなく雑音である。
+///
+/// コードそのものは残す。鍵を入れて焼き直せば同じバイナリで有効になる。
+pub fn signing_configured() -> bool {
+    EMBEDDED_PUBKEY != [0u8; PUBKEY_LEN]
+}
+
 /// 16 進 64 桁 → 32 バイト。const 文脈でのみ使う。
 const fn decode_hex_pubkey(s: &str) -> [u8; PUBKEY_LEN] {
     let b = s.as_bytes();
