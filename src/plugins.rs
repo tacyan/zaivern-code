@@ -1361,6 +1361,8 @@ const BUNDLED: &[(&str, &[(&str, &str)])] = &[
             ("lang/50-editor.toml", include_str!("../assets/plugins/english-mode/lang/50-editor.toml")),
             ("lang/60-menubar.toml", include_str!("../assets/plugins/english-mode/lang/60-menubar.toml")),
             ("lang/70-kanban.toml", include_str!("../assets/plugins/english-mode/lang/70-kanban.toml")),
+            ("lang/80-deck.toml", include_str!("../assets/plugins/english-mode/lang/80-deck.toml")),
+            ("lang/90-license.toml", include_str!("../assets/plugins/english-mode/lang/90-license.toml")),
             ("plugin.toml", include_str!("../assets/plugins/english-mode/plugin.toml")),
         ],
     ),
@@ -2895,6 +2897,51 @@ run = "c"
         let table: Vec<(&str, &[(&str, &str)])> =
             owned.iter().map(|(n, f)| (*n, f.as_slice())).collect();
         seed_bundled_from(root, &table)
+    }
+
+    /// `assets/plugins/` に置いたファイルは、`BUNDLED` へ 1 行足すまで
+    /// **バイナリに入らない** (= 出荷されない)。書いたのに届かないのを
+    /// 黙って見逃さないための検出器。
+    ///
+    /// 実際に `assets/plugins/english-mode/lang/80-deck.toml` が、
+    /// ここに載らないまま (= デッキの英語訳が届かないまま) 眠っていた。
+    #[test]
+    fn every_asset_file_is_listed_in_bundled() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/plugins");
+        let mut missing: Vec<String> = Vec::new();
+        for (name, files) in BUNDLED {
+            let dir = assets.join(name);
+            let mut stack = vec![dir.clone()];
+            while let Some(d) = stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&d) else {
+                    continue;
+                };
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                        continue;
+                    }
+                    // ディレクトリ区切りは BUNDLED の表記 (`/`) に合わせる
+                    let Ok(rel) = p.strip_prefix(&dir) else {
+                        continue;
+                    };
+                    let rel = rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    if !files.iter().any(|(f, _)| *f == rel) {
+                        missing.push(format!("{name}/{rel}"));
+                    }
+                }
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "assets にあるのに BUNDLED へ載っていない (出荷されない) ファイル: {missing:?}"
+        );
     }
 
     #[test]

@@ -27,6 +27,7 @@ use crate::highlight::Highlighter;
 use crate::html;
 use crate::i18n::{self, tr, trf};
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
+use crate::license;
 use crate::lsp;
 use crate::markdown;
 use crate::mcp;
@@ -2050,6 +2051,14 @@ pub struct ZaivernApp {
     /// キーボードショートカット一覧 / バージョン情報ダイアログ
     shortcuts_open: bool,
     about_open: bool,
+    /// ライセンス (Pro) の状態ダイアログを開いているか。
+    license_open: bool,
+    /// ダイアログの貼り付け欄。保存済みキーとは別に持つ (貼り直しを中断できる)。
+    license_input: String,
+    /// 保存済みの生キー。画面には [`license::mask_key`] を通してしか出さない。
+    license_key: Option<String>,
+    /// 起動時と適用時にだけ計算する検証結果。毎フレーム署名検証はしない。
+    license_status: license::LicenseStatus,
     /// 疑似フルスクリーン (枠なし最大化) 中なら復帰用の元ジオメトリ (outer 左上, inner サイズ)。
     /// macOS のネイティブ全画面は縦オフセット配置のサブディスプレイでウィンドウが
     /// モニタより大きく作られ、描画と当たり判定がずれて UI 全体が効かなくなる
@@ -2582,6 +2591,10 @@ impl ZaivernApp {
         // デッキの副題 (ブランチ) を裏で解決するための口。
         let (deck_branch_tx, deck_branch_rx) = mpsc::channel();
         let primary_root = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
+        // ライセンスは `~/.zaivern/license.key` を 1 回読んで署名検証するだけ。
+        // ネットワークは叩かない (通信ゼロの約束を破らない)。未ライセンスでも
+        // アプリは完全に動くので、失敗しても起動を止めない。
+        let license_boot = license::current_status();
         let mut app = Self {
             tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
             gitinfo: git::GitSet::new(roots.clone()),
@@ -2684,6 +2697,11 @@ impl ZaivernApp {
             problems_open: false,
             shortcuts_open: false,
             about_open: false,
+            // 起動時に 1 回だけローカルのキーを読んで検証する (通信なし)。
+            license_open: false,
+            license_input: String::new(),
+            license_key: license_boot.0,
+            license_status: license_boot.1,
             fake_fullscreen: None,
             broken_native_fs: Vec::new(),
             fs_rescue_pending: false,
@@ -7641,6 +7659,15 @@ impl ZaivernApp {
             | Cmd::RunPlugin(_, _) => self.apply_cmd_voice_plugin(cmd, ctx),
             // ── 第 3 次配線 ──
             Cmd::RestartTutorial => self.tutorial.restart(),
+            Cmd::OpenLicense => {
+                // 開くたびに読み直す — 別ウィンドウ (別プロセス) で適用された
+                // キーや、外部で消されたファイルを画面へ反映するため。
+                let (k, st) = license::current_status();
+                self.license_key = k;
+                self.license_status = st;
+                self.license_input.clear();
+                self.license_open = true;
+            }
             Cmd::OpenApprovals => self.open_approvals_panel(),
             Cmd::OpenMcp => self.open_mcp_panel(),
             Cmd::OpenApprovalAudit => {
@@ -8999,6 +9026,7 @@ impl ZaivernApp {
             && !self.goto_open
             && !self.shortcuts_open
             && !self.about_open
+            && !self.license_open
             && !self.remote_open
             && ctx.memory(|m| m.focused().is_none() && !m.any_popup_open())
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
@@ -9903,6 +9931,23 @@ impl ZaivernApp {
         // 統合承認キューの待ち件数バッジ (押すとボトムパネルの承認ビューを開く)
         let approvals_pending = self.agents.approvals.pending_len();
         let mut open_approvals = false;
+        // Pro の解錠判定は license::is_pro **1 か所だけ**を通す。
+        // 未ライセンス時は 1 ピクセルも出さない (常に何かを表示するバッジは作らない)。
+        let pro_badge = license::is_pro(&self.license_status).then(|| {
+            match &self.license_status {
+                license::LicenseStatus::Valid { sub, exp, .. } => trf(
+                    "Pro ライセンス — {sub} ・ 期限 {exp}",
+                    &[
+                        ("sub", sub.clone()),
+                        (
+                            "exp",
+                            exp.map(license::format_unix_date).unwrap_or_else(|| tr("無期限")),
+                        ),
+                    ],
+                ),
+                _ => tr("Pro ライセンス"),
+            }
+        });
 
         let bar = egui::TopBottomPanel::bottom("zv-status")
             .exact_height(26.0)
@@ -9957,6 +10002,10 @@ impl ZaivernApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(dim("Zaivern v0.2".into()));
+                        if let Some(tip) = &pro_badge {
+                            ui.label(RichText::new("✨ Pro").size(11.5).color(theme.accent))
+                                .on_hover_text(tip.clone());
+                        }
                         if let Some(r) = &self.remote {
                             ui.label(dim(format!("📱 :{}", r.port)));
                         }
@@ -16447,6 +16496,7 @@ impl ZaivernApp {
                 Cmd::ShowShortcuts,
             ),
             ("ℹ".into(), tr("バージョン情報"), String::new(), Cmd::ShowAbout),
+            ("🔑".into(), tr("ライセンスキーを入力…"), String::new(), Cmd::OpenLicense),
             ("➕".into(), tr("新規プラグインを作成…"), String::new(), Cmd::NewPlugin),
             ("📦".into(), tr("プラグインをインストール… (.zvplug / .zip)"), String::new(), Cmd::InstallPlugin),
             ("🔌".into(), tr("プラグインを表示"), String::new(), Cmd::ShowPlugins),
@@ -21466,6 +21516,7 @@ impl ZaivernApp {
         self.problems_window(ctx);
         self.shortcuts_window(ctx);
         self.about_window(ctx);
+        self.license_window(ctx);
     }
 
     fn goto_line_window(&mut self, ctx: &egui::Context) {
@@ -21670,6 +21721,220 @@ impl ZaivernApp {
                 });
             });
         self.about_open = open;
+    }
+
+    /// ライセンス (Pro) の状態表示とキーの適用。**通信は一切しない**。
+    ///
+    /// - キー全体は画面に出さない ([`license::mask_key`] で伏せる)
+    /// - オフライン検証なので**失効はできない**ことを画面に明記する
+    /// - 未ライセンスでも全機能が使えることを正直に書く (機能は奪っていない)
+    fn license_window(&mut self, ctx: &egui::Context) {
+        if !self.license_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let mut open = self.license_open;
+        let mut apply = false;
+        let mut remove = false;
+        let status = self.license_status.clone();
+        let saved = self.license_key.clone();
+        let configured = license::pubkey_configured(&license::EMBEDDED_PUBKEY);
+
+        egui::Window::new(tr("🔑 ライセンス"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                // 幅は必ず可用領域に収める (狭い画面でも行が見切れない)
+                let w = ui.available_width().min(430.0);
+                ui.set_max_width(w);
+
+                // ── 現在の状態 ──────────────────────────────────
+                let (icon, head, color) = license_status_head(&status, &theme);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(icon).size(16.0).color(color));
+                    ui.label(RichText::new(head).size(14.0).strong().color(color));
+                });
+
+                match &status {
+                    license::LicenseStatus::Valid {
+                        tier,
+                        sub,
+                        exp,
+                        seats,
+                    } => {
+                        let exp_text = match exp {
+                            Some(e) => license::format_unix_date(*e),
+                            None => tr("無期限"),
+                        };
+                        ui.label(
+                            RichText::new(trf(
+                                "等級 {tier} ・ 購入者 {sub} ・ 期限 {exp} ・ {seats} 席",
+                                &[
+                                    ("tier", tier.clone()),
+                                    ("sub", sub.clone()),
+                                    ("exp", exp_text),
+                                    ("seats", seats.to_string()),
+                                ],
+                            ))
+                            .size(11.5)
+                            .color(theme.text_dim),
+                        );
+                    }
+                    license::LicenseStatus::Expired { exp } => {
+                        ui.label(
+                            RichText::new(trf(
+                                "{exp} に期限が切れています。新しいキーを貼り付けてください",
+                                &[("exp", license::format_unix_date(*exp))],
+                            ))
+                            .size(11.5)
+                            .color(theme.text_dim),
+                        );
+                    }
+                    license::LicenseStatus::Malformed(why) => {
+                        ui.label(RichText::new(tr(why)).size(11.5).color(theme.text_dim));
+                    }
+                    license::LicenseStatus::BadSignature => {
+                        ui.label(
+                            RichText::new(tr(
+                                "署名が一致しません。写し間違いか、別の製品のキーの可能性があります",
+                            ))
+                            .size(11.5)
+                            .color(theme.text_dim),
+                        );
+                    }
+                    license::LicenseStatus::Unlicensed => {
+                        ui.label(
+                            RichText::new(tr(
+                                "Zaivern Code は無料で全機能使えます。Pro ライセンスは開発支援者向けです",
+                            ))
+                            .size(11.5)
+                            .color(theme.text_dim),
+                        );
+                    }
+                }
+
+                if let Some(k) = &saved {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(trf(
+                            "保存済みのキー: {k}",
+                            &[("k", license::mask_key(k))],
+                        ))
+                        .size(11.0)
+                        .color(theme.text_dim),
+                    );
+                }
+
+                if !configured {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(tr(
+                            "⚠ この配布版には検証用の公開鍵が入っていないため、どのキーも有効になりません",
+                        ))
+                        .size(11.0)
+                        .color(theme.warn),
+                    );
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // ── キーの貼り付け ──────────────────────────────
+                ui.label(RichText::new(tr("ライセンスキーを貼り付け:")).size(12.0));
+                let te = ui.add(
+                    egui::TextEdit::multiline(&mut self.license_input)
+                        .desired_rows(3)
+                        .desired_width(w)
+                        .hint_text("ZVL1.…")
+                        .font(egui::TextStyle::Monospace),
+                );
+                // 改行はキーの一部にならないので、Enter は「適用」と解釈する
+                if te.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    let can_apply = !self.license_input.trim().is_empty();
+                    if ui
+                        .add_enabled(can_apply, egui::Button::new(tr("適用")))
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                    if saved.is_some() && ui.button(tr("保存済みのキーを削除")).clicked() {
+                        remove = true;
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(trf(
+                        "検証は完全にこの端末の中だけで行われます (通信ゼロ)。キーは {p} に保存されます",
+                        &[("p", license::license_path().display().to_string())],
+                    ))
+                    .size(10.5)
+                    .color(theme.text_dim),
+                );
+                ui.label(
+                    RichText::new(tr(
+                        "オフライン検証のため、発行済みキーの失効 (revoke) はできません。期限付きキーで運用しています",
+                    ))
+                    .size(10.5)
+                    .color(theme.text_dim),
+                );
+            });
+
+        self.license_open = open;
+
+        if apply {
+            let input = self.license_input.clone();
+            match license::apply_key(&input) {
+                Ok((k, st)) => {
+                    self.license_key = k;
+                    self.license_status = st;
+                    self.license_input.clear();
+                    let ok = license::is_pro(&self.license_status);
+                    let (_, head, _) = license_status_head(&self.license_status, &theme);
+                    self.toast(head, ok);
+                }
+                Err(e) => self.toast(trf("ライセンスの保存に失敗: {e}", &[("e", e)]), false),
+            }
+        } else if remove {
+            match license::remove_key() {
+                Ok(()) => {
+                    self.license_key = None;
+                    self.license_status = license::LicenseStatus::Unlicensed;
+                    self.toast(tr("🔑 ライセンスキーを削除しました"), true);
+                }
+                Err(e) => self.toast(trf("ライセンスの削除に失敗: {e}", &[("e", e)]), false),
+            }
+        }
+    }
+}
+
+/// ライセンス状態の見出し (アイコン・1 行の要約・色)。
+///
+/// ダイアログとトーストの両方が同じ文言を使うために切り出してある
+/// (状態と文言の対応が 2 か所へ散らない)。
+fn license_status_head(
+    status: &license::LicenseStatus,
+    theme: &theme::Theme,
+) -> (&'static str, String, egui::Color32) {
+    match status {
+        license::LicenseStatus::Valid { .. } => {
+            ("✨", tr("Pro ライセンス 有効"), theme.ok)
+        }
+        license::LicenseStatus::Expired { .. } => ("⌛", tr("期限切れ"), theme.warn),
+        license::LicenseStatus::Malformed(_) => ("⚠", tr("キーの形式が不正です"), theme.err),
+        license::LicenseStatus::BadSignature => ("⚠", tr("キーの署名が不正です"), theme.err),
+        license::LicenseStatus::Unlicensed => {
+            ("🆓", tr("未ライセンス (無料版)"), theme.text_dim)
+        }
     }
 }
 
