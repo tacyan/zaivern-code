@@ -48,6 +48,7 @@ use crate::remote;
 use crate::session;
 use crate::session_picker;
 use crate::shellenv;
+use crate::skills;
 use crate::snippets::{self, Snippet};
 use crate::sound::{self, SoundKind};
 use crate::supervisor;
@@ -582,7 +583,7 @@ fn center_view(cockpit: bool, kanban: bool, deck: bool) -> CenterView {
 /// **ボトムパネルの中身。** 同時に 2 つは描かない。
 ///
 /// 中央ビュー ([`CenterView`]) と同じ理由でここも 1 個の値へ畳む。
-/// 「🛡 承認」「🔌 MCP」「端末」を独立した bool で持つと、
+/// 「🛡 承認」「🔌 MCP」「🧩 Skills」「端末」を独立した bool で持つと、
 /// タブを続けて押したときに 2 つが重なって描かれる事故が構造的に起こり得る。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum BottomView {
@@ -593,16 +594,20 @@ enum BottomView {
     Approvals,
     /// 🔌 MCP サーバ管理
     Mcp,
+    /// 🧩 Skills / slash command 管理
+    Skills,
 }
 
-/// 2 本のフラグから「今フレーム描くボトムパネルの中身」を 1 つ決める (純関数)。
+/// 3 本のフラグから「今フレーム描くボトムパネルの中身」を 1 つ決める (純関数)。
 ///
-/// 優先順は 承認 > MCP > 端末。フラグが両方立っていても返り値は必ず 1 つ。
-fn bottom_view(approvals: bool, mcp: bool) -> BottomView {
+/// 優先順は 承認 > MCP > Skills > 端末。複数立っていても返り値は必ず 1 つ。
+fn bottom_view(approvals: bool, mcp: bool, skills: bool) -> BottomView {
     if approvals {
         BottomView::Approvals
     } else if mcp {
         BottomView::Mcp
+    } else if skills {
+        BottomView::Skills
     } else {
         BottomView::Terminal
     }
@@ -2505,6 +2510,13 @@ pub struct ZaivernApp {
     /// (`~/.claude.json` は 100KB 級で、毎フレーム読む相手ではない)。
     mcp: mcp::McpPanel,
 
+    // ── Skills / slash command 管理パネル (crate::skills) ──────────
+    /// ボトムパネルを「🧩 Skills」表示に切り替えているか。
+    skills_view: bool,
+    /// 走査結果・検索語・展開状態。走査は**このビューを出したときだけ**行う
+    /// (プラグインの木は数百ディレクトリで、毎フレーム歩く相手ではない)。
+    skills: skills::SkillsPanel,
+
     // ── 複数キャレット (crate::editor_ops::MultiSel) ────────────────
     /// `(バッファ ID, 選択集合)`。**タブごとに 1 つ**で、タブを切り替えると
     /// 捨てる (別のファイルのバイト位置を持ち越すと本文を壊すため)。
@@ -2918,6 +2930,8 @@ impl ZaivernApp {
             approvals_expanded: HashSet::new(),
             mcp_view: false,
             mcp: mcp::McpPanel::default(),
+            skills_view: false,
+            skills: skills::SkillsPanel::default(),
             multi_sel: None,
             multi_sticky_col: None,
             column_anchor: None,
@@ -8301,6 +8315,7 @@ impl ZaivernApp {
             }
             Cmd::OpenApprovals => self.open_approvals_panel(),
             Cmd::OpenMcp => self.open_mcp_panel(),
+            Cmd::OpenSkills => self.open_skills_panel(),
             Cmd::OpenApprovalAudit => {
                 self.open_approvals_panel();
                 self.approvals_audit = true;
@@ -11963,6 +11978,8 @@ impl ZaivernApp {
         let mut approval_cmds: Vec<(u64, agents::approvals::Command)> = Vec::new();
         // MCP パネルの要求 (ファイルを開く / 書き戻す / 再走査) も描画後に実行する。
         let mut mcp_action = mcp::McpAction::None;
+        // Skills パネルの要求 (開く / 送る / コピー / 再走査) も描画後に実行する。
+        let mut skills_action = skills::SkillAction::None;
 
         let panel = egui::TopBottomPanel::bottom("zv-terminal")
             .resizable(true)
@@ -12068,10 +12085,11 @@ impl ZaivernApp {
                                 if let Some(i) = set_active {
                                     self.agents.active = i;
                                     // タブで選び直したら、その端末をアクティブな
-                                    // 入力先 (フォーカス) にする。看板 / MCP タブ
-                                    // 表示中なら端末ビューへ戻す。
+                                    // 入力先 (フォーカス) にする。看板 / MCP /
+                                    // Skills タブ表示中なら端末ビューへ戻す。
                                     self.kanban = false;
                                     self.mcp_view = false;
+                                    self.skills_view = false;
                                     self.term_focus_pending = true;
                                     self.agents.sessions[i].acknowledge();
                                 }
@@ -12109,6 +12127,7 @@ impl ZaivernApp {
                             if self.approvals_view {
                                 self.kanban = false;
                                 self.mcp_view = false;
+                                self.skills_view = false;
                             }
                         }
                         // MCP タブ: 全エージェント横断の MCP サーバ一覧。
@@ -12130,8 +12149,33 @@ impl ZaivernApp {
                             if self.mcp_view {
                                 self.kanban = false;
                                 self.approvals_view = false;
+                                self.skills_view = false;
                                 // 開いた回だけ読み直す (毎フレーム I/O にしない)
                                 self.mcp.invalidate();
+                            }
+                        }
+                        // Skills タブ: Skill と slash command を 1 枚の表に。
+                        // 件数は **0 のとき出さない** (常に 0 のバッジを作らない)。
+                        let sk_label = match self.skills.badge() {
+                            Some(n) => format!("{} {n}", tr("🧩 Skills")),
+                            None => tr("🧩 Skills"),
+                        };
+                        if ui
+                            .selectable_label(self.skills_view, RichText::new(sk_label))
+                            .on_hover_text(tr(
+                                "Skills / slash command — .claude/skills と .claude/commands を \
+                                 プロジェクト・ユーザー・プラグイン横断で一覧します\n\
+                                 コマンドはそのままエージェントへ送れます",
+                            ))
+                            .clicked()
+                        {
+                            self.skills_view = !self.skills_view;
+                            if self.skills_view {
+                                self.kanban = false;
+                                self.approvals_view = false;
+                                self.mcp_view = false;
+                                // 開いた回だけ読み直す (毎フレーム I/O にしない)
+                                self.skills.invalidate();
                             }
                         }
                         ui.menu_button("📜", |ui| {
@@ -12207,7 +12251,7 @@ impl ZaivernApp {
                 // 「🛡 承認」タブ表示中やセッションが 0 件の間に消してしまうと、
                 // タブ切替やエージェントを閉じた直後のフォーカス要求が握り潰され、
                 // どこにも入力が届かなくなる。
-                let view = bottom_view(self.approvals_view, self.mcp_view);
+                let view = bottom_view(self.approvals_view, self.mcp_view, self.skills_view);
                 if view == BottomView::Terminal && !self.agents.sessions.is_empty() {
                     self.term_focus_pending = false;
                 }
@@ -12233,6 +12277,10 @@ impl ZaivernApp {
                     BottomView::Mcp => {
                         // 「🔌 MCP」タブ: 走査は描画の外 (この下) で行う。
                         mcp_action = mcp::ui(ui, &theme, &mut self.mcp);
+                    }
+                    BottomView::Skills => {
+                        // 「🧩 Skills」タブ: 走査は描画の外 (この下) で行う。
+                        skills_action = skills::ui(ui, &theme, &mut self.skills);
                     }
                     BottomView::Terminal => {
                         if let Some(s) = self.agents.active_session() {
@@ -12276,6 +12324,12 @@ impl ZaivernApp {
         if self.mcp_view && !self.mcp.scanned {
             self.mcp.inventory = mcp::scan(&self.roots);
             self.mcp.scanned = true;
+        }
+        // Skills パネルの実行 (描画後)。走査も**このビューを出している間だけ** 1 回。
+        self.apply_skills_action(skills_action, ctx);
+        if self.skills_view && !self.skills.scanned {
+            self.skills.entries = skills::scan(&self.roots);
+            self.skills.scanned = true;
         }
 
         if let Some(i) = launch {
@@ -12349,6 +12403,7 @@ impl ZaivernApp {
         self.cockpit = false;
         self.kanban = false;
         self.mcp_view = false;
+        self.skills_view = false;
         self.approvals_view = true;
     }
 
@@ -12361,6 +12416,7 @@ impl ZaivernApp {
         self.cockpit = false;
         self.kanban = false;
         self.approvals_view = false;
+        self.skills_view = false;
         self.mcp_view = true;
         // 開いた回だけ読み直す (アイドル時に I/O しない)
         self.mcp.invalidate();
@@ -12411,6 +12467,38 @@ impl ZaivernApp {
                 }
                 // 書けても書けなくても、実ファイルの今の姿を読み直す
                 self.mcp.invalidate();
+            }
+        }
+    }
+
+    // ─── Skills / slash command (パネルの外側の実行部) ─────────────
+
+    /// ボトムパネルを開いて「🧩 Skills」ビューへ切り替える
+    /// (コマンドパレットの入口)。
+    fn open_skills_panel(&mut self) {
+        self.agents.panel_open = true;
+        self.cockpit = false;
+        self.kanban = false;
+        self.approvals_view = false;
+        self.mcp_view = false;
+        self.skills_view = true;
+        // 開いた回だけ読み直す (アイドル時に I/O しない)
+        self.skills.invalidate();
+    }
+
+    /// Skills パネルが積んだ要求を実行する。**描画の外でだけ呼ぶ**。
+    fn apply_skills_action(&mut self, action: skills::SkillAction, ctx: &egui::Context) {
+        match action {
+            skills::SkillAction::None => {}
+            skills::SkillAction::Rescan => self.skills.invalidate(),
+            skills::SkillAction::Open(path) => self.open_path(&path),
+            // slash command は `/名前 ` がそのまま呼び出し方なので、
+            // ファイル送信 (@path) と同じ経路でアクティブな端末へ流す。
+            skills::SkillAction::Send(text) => self.send_to_agent(text),
+            skills::SkillAction::CopyPath(path) => {
+                let p = path.display().to_string();
+                ctx.copy_text(p.clone());
+                self.toast(trf("📋 パスをコピーしました: {p}", &[("p", p)]), true);
             }
         }
     }
@@ -17915,6 +18003,12 @@ impl ZaivernApp {
                 Cmd::OpenMcp,
             ),
             (
+                "🧩".into(),
+                tr("Skills / コマンドを管理"),
+                String::new(),
+                Cmd::OpenSkills,
+            ),
+            (
                 "✏".into(),
                 tr("カーソルを上に追加"),
                 String::new(),
@@ -21777,6 +21871,7 @@ impl ZaivernApp {
                 self.kanban = false;
                 self.approvals_view = false;
                 self.mcp_view = false;
+                self.skills_view = false;
             }
             TA::ShowCockpit => {
                 self.cockpit = true;
@@ -21788,6 +21883,7 @@ impl ZaivernApp {
                 self.deck = false;
                 self.approvals_view = false;
                 self.mcp_view = false;
+                self.skills_view = false;
             }
             TA::ShowDeck => {
                 self.deck = true;
@@ -21796,6 +21892,7 @@ impl ZaivernApp {
                 self.agents.panel_open = true;
                 self.approvals_view = false;
                 self.mcp_view = false;
+                self.skills_view = false;
             }
             TA::OpenPalette => self.palette.open_commands(),
             TA::OpenRaceForm => {
@@ -26941,6 +27038,8 @@ mod wave2_tests {
             "Cmd::OpenApprovalAudit",
             // ── MCP サーバ管理 ──
             "Cmd::OpenMcp",
+            // ── Skills / slash command 管理 ──
+            "Cmd::OpenSkills",
             "Cmd::AddCursorAbove",
             "Cmd::AddCursorBelow",
             "Cmd::SelectAllOccurrences",
@@ -28639,30 +28738,35 @@ mod cockpit_layout_tests {
     }
 
     /// **ボトムパネルの中身も常に 1 つだけ。**
-    /// 「🛡 承認」と「🔌 MCP」を独立した bool で持つ以上、描く直前に畳む。
+    /// 「🛡 承認」「🔌 MCP」「🧩 Skills」を独立した bool で持つ以上、描く直前に畳む。
     #[test]
     fn ボトムパネルのビューは常に一つだけ() {
-        // (承認, MCP) → 描くもの
+        // (承認, MCP, Skills) → 描くもの
         let table = [
-            (false, false, BottomView::Terminal),
-            (true, false, BottomView::Approvals),
-            (false, true, BottomView::Mcp),
-            // 両方立っていても 1 つ (承認 > MCP)
-            (true, true, BottomView::Approvals),
+            (false, false, false, BottomView::Terminal),
+            (true, false, false, BottomView::Approvals),
+            (false, true, false, BottomView::Mcp),
+            (false, false, true, BottomView::Skills),
+            // 複数立っていても 1 つ (承認 > MCP > Skills)
+            (true, true, true, BottomView::Approvals),
+            (false, true, true, BottomView::Mcp),
         ];
-        for (a, m, want) in table {
-            assert_eq!(bottom_view(a, m), want, "承認={a} MCP={m}");
+        for (a, m, s, want) in table {
+            assert_eq!(bottom_view(a, m, s), want, "承認={a} MCP={m} Skills={s}");
         }
-        // 全 4 通りで必ず 1 つの値になる (= 重ねようがない)
+        // 全 8 通りで必ず 1 つの値になる (= 重ねようがない)
         for a in [false, true] {
             for m in [false, true] {
-                let v = bottom_view(a, m);
-                let hits = [
-                    v == BottomView::Terminal,
-                    v == BottomView::Approvals,
-                    v == BottomView::Mcp,
-                ];
-                assert_eq!(hits.iter().filter(|x| **x).count(), 1, "a={a} m={m}");
+                for s in [false, true] {
+                    let v = bottom_view(a, m, s);
+                    let hits = [
+                        v == BottomView::Terminal,
+                        v == BottomView::Approvals,
+                        v == BottomView::Mcp,
+                        v == BottomView::Skills,
+                    ];
+                    assert_eq!(hits.iter().filter(|x| **x).count(), 1, "a={a} m={m} s={s}");
+                }
             }
         }
     }
@@ -28673,13 +28777,16 @@ mod cockpit_layout_tests {
     fn ボトムパネルの分岐は畳んだ値を見る() {
         let src = &include_str!("app.rs").replace("\r\n", "\n");
         assert!(
-            src.contains("let view = bottom_view(self.approvals_view, self.mcp_view);"),
+            src.contains(
+                "let view = bottom_view(self.approvals_view, self.mcp_view, self.skills_view);"
+            ),
             "描く直前に 1 つへ畳んでいない"
         );
         assert!(
             src.contains("match view {")
                 && src.contains("BottomView::Approvals => {")
                 && src.contains("BottomView::Mcp => {")
+                && src.contains("BottomView::Skills => {")
                 && src.contains("BottomView::Terminal => {"),
             "ボトムパネルの分岐が match になっていない"
         );
@@ -28698,6 +28805,37 @@ mod cockpit_layout_tests {
                 .starts_with("self.mcp.inventory = mcp::scan("),
             "ガードの直後で走査していない: {:?}",
             body.chars().take(60).collect::<String>()
+        );
+    }
+
+    /// Skills パネルも**要求されたときだけ**走査し、UI から到達できる。
+    ///
+    /// プラグインの木は数百ディレクトリあるので、毎フレーム歩くと
+    /// アイドルのコストがゼロでなくなる (設計原則 3)。
+    #[test]
+    fn skillsの走査はビューを出している間だけ() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let guard = "if self.skills_view && !self.skills.scanned {";
+        let body = src.split(guard).nth(1).expect("Skills の走査ガードが無い");
+        assert!(
+            body.trim_start()
+                .starts_with("self.skills.entries = skills::scan("),
+            "ガードの直後で走査していない: {:?}",
+            body.chars().take(60).collect::<String>()
+        );
+        // 到達経路 2 つ (パレット / ボトムパネルのタブ) と描画・実行部
+        for route in [
+            "Cmd::OpenSkills => self.open_skills_panel(),",
+            "self.skills_view = !self.skills_view;",
+            "skills_action = skills::ui(ui, &theme, &mut self.skills);",
+            "self.apply_skills_action(skills_action, ctx);",
+        ] {
+            assert!(src.contains(route), "{route} が無い (画面から到達できない)");
+        }
+        // 「送る」は既存のエージェント送信経路をそのまま使う (経路を増やさない)
+        assert!(
+            src.contains("skills::SkillAction::Send(text) => self.send_to_agent(text),"),
+            "送信が既存の send_to_agent を通っていない"
         );
     }
 
