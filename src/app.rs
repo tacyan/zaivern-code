@@ -27,6 +27,7 @@ use crate::i18n::{self, tr, trf};
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::lsp;
 use crate::markdown;
+use crate::mcp;
 use crate::menu_bar;
 use crate::notify;
 use crate::github;
@@ -551,6 +552,35 @@ fn center_view(cockpit: bool, kanban: bool, deck: bool) -> CenterView {
         CenterView::Kanban
     } else {
         CenterView::Editor
+    }
+}
+
+/// **ボトムパネルの中身。** 同時に 2 つは描かない。
+///
+/// 中央ビュー ([`CenterView`]) と同じ理由でここも 1 個の値へ畳む。
+/// 「🛡 承認」「🔌 MCP」「端末」を独立した bool で持つと、
+/// タブを続けて押したときに 2 つが重なって描かれる事故が構造的に起こり得る。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum BottomView {
+    /// エージェントの端末 (既定)
+    #[default]
+    Terminal,
+    /// 🛡 統合承認キュー
+    Approvals,
+    /// 🔌 MCP サーバ管理
+    Mcp,
+}
+
+/// 2 本のフラグから「今フレーム描くボトムパネルの中身」を 1 つ決める (純関数)。
+///
+/// 優先順は 承認 > MCP > 端末。フラグが両方立っていても返り値は必ず 1 つ。
+fn bottom_view(approvals: bool, mcp: bool) -> BottomView {
+    if approvals {
+        BottomView::Approvals
+    } else if mcp {
+        BottomView::Mcp
+    } else {
+        BottomView::Terminal
     }
 }
 
@@ -2248,6 +2278,13 @@ pub struct ZaivernApp {
     /// 折りたたみを開いている承認要求の ID (詳細 / 生プロンプト抜粋)。
     approvals_expanded: HashSet<u64>,
 
+    // ── MCP サーバ管理パネル (crate::mcp) ─────────────────────────
+    /// ボトムパネルを「🔌 MCP」表示に切り替えているか。
+    mcp_view: bool,
+    /// 走査結果と展開状態。走査は**このビューを出したときだけ**行う
+    /// (`~/.claude.json` は 100KB 級で、毎フレーム読む相手ではない)。
+    mcp: mcp::McpPanel,
+
     // ── 複数キャレット (crate::editor_ops::MultiSel) ────────────────
     /// `(バッファ ID, 選択集合)`。**タブごとに 1 つ**で、タブを切り替えると
     /// 捨てる (別のファイルのバイト位置を持ち越すと本文を壊すため)。
@@ -2628,6 +2665,8 @@ impl ZaivernApp {
             approvals_audit: false,
             approvals_audit_cache: None,
             approvals_expanded: HashSet::new(),
+            mcp_view: false,
+            mcp: mcp::McpPanel::default(),
             multi_sel: None,
             multi_sticky_col: None,
             column_anchor: None,
@@ -6951,6 +6990,7 @@ impl ZaivernApp {
             // ── 第 3 次配線 ──
             Cmd::RestartTutorial => self.tutorial.restart(),
             Cmd::OpenApprovals => self.open_approvals_panel(),
+            Cmd::OpenMcp => self.open_mcp_panel(),
             Cmd::OpenApprovalAudit => {
                 self.open_approvals_panel();
                 self.approvals_audit = true;
@@ -10477,6 +10517,8 @@ impl ZaivernApp {
         // 承認キューのキー操作は描画後にまとめて実行する (描画中に
         // self.agents を可変で借りると、端末描画と衝突するため)。
         let mut approval_cmds: Vec<(u64, agents::approvals::Command)> = Vec::new();
+        // MCP パネルの要求 (ファイルを開く / 書き戻す / 再走査) も描画後に実行する。
+        let mut mcp_action = mcp::McpAction::None;
 
         let panel = egui::TopBottomPanel::bottom("zv-terminal")
             .resizable(true)
@@ -10582,9 +10624,10 @@ impl ZaivernApp {
                                 if let Some(i) = set_active {
                                     self.agents.active = i;
                                     // タブで選び直したら、その端末をアクティブな
-                                    // 入力先 (フォーカス) にする。看板タブ表示中
-                                    // なら端末ビューへ戻す。
+                                    // 入力先 (フォーカス) にする。看板 / MCP タブ
+                                    // 表示中なら端末ビューへ戻す。
                                     self.kanban = false;
+                                    self.mcp_view = false;
                                     self.term_focus_pending = true;
                                     self.agents.sessions[i].acknowledge();
                                 }
@@ -10621,6 +10664,30 @@ impl ZaivernApp {
                             self.approvals_view = !self.approvals_view;
                             if self.approvals_view {
                                 self.kanban = false;
+                                self.mcp_view = false;
+                            }
+                        }
+                        // MCP タブ: 全エージェント横断の MCP サーバ一覧。
+                        // 件数は **0 のとき出さない** (常に 0 のバッジを作らない)。
+                        let mcp_label = match self.mcp.badge() {
+                            Some(n) => format!("{} {n}", tr("🔌 MCP")),
+                            None => tr("🔌 MCP"),
+                        };
+                        if ui
+                            .selectable_label(self.mcp_view, RichText::new(mcp_label))
+                            .on_hover_text(tr(
+                                "MCP サーバ — .mcp.json / .cursor / .vscode / \
+                                 .claude.json / .codex / .gemini を横断して一覧します\n\
+                                 env の値は表示しません (キー名と設定済みかだけ)",
+                            ))
+                            .clicked()
+                        {
+                            self.mcp_view = !self.mcp_view;
+                            if self.mcp_view {
+                                self.kanban = false;
+                                self.approvals_view = false;
+                                // 開いた回だけ読み直す (毎フレーム I/O にしない)
+                                self.mcp.invalidate();
                             }
                         }
                         ui.menu_button("📜", |ui| {
@@ -10696,40 +10763,52 @@ impl ZaivernApp {
                 // 「🛡 承認」タブ表示中やセッションが 0 件の間に消してしまうと、
                 // タブ切替やエージェントを閉じた直後のフォーカス要求が握り潰され、
                 // どこにも入力が届かなくなる。
-                if !self.approvals_view && !self.agents.sessions.is_empty() {
+                let view = bottom_view(self.approvals_view, self.mcp_view);
+                if view == BottomView::Terminal && !self.agents.sessions.is_empty() {
                     self.term_focus_pending = false;
                 }
-                if self.approvals_view {
-                    // 「🛡 承認」タブ: 端末の代わりに統合承認キューを敷き詰める。
-                    // フィールドを別々に借りる (agents は読み取り、表示状態は可変)。
-                    let out = panels::approvals_ui(
-                        ui,
-                        &theme,
-                        &self.agents.approvals,
-                        &mut self.approvals_expanded,
-                        &mut self.approvals_audit,
-                        self.approvals_audit_cache.as_deref(),
-                        now_epoch_secs(),
-                    );
-                    approval_cmds = out.commands;
-                    if out.reload_audit {
-                        // 描画中に I/O はしない。控えを捨てて、描画後に読み直す。
-                        self.approvals_audit_cache = None;
-                    }
-                } else if let Some(s) = self.agents.active_session() {
-                    let resp = terminal::draw(ui, s, &theme, font, true, true, true);
-                    // タブ選択でアクティブになった端末へ、その場でフォーカスを渡す。
-                    if want_focus {
-                        resp.request_focus();
-                    }
-                } else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(20.0);
-                        ui.label(
-                            RichText::new(tr("セッションがありません — ＋ から起動してください"))
-                                .color(theme.text_dim),
+                match view {
+                    BottomView::Approvals => {
+                        // 「🛡 承認」タブ: 端末の代わりに統合承認キューを敷き詰める。
+                        // フィールドを別々に借りる (agents は読み取り、表示状態は可変)。
+                        let out = panels::approvals_ui(
+                            ui,
+                            &theme,
+                            &self.agents.approvals,
+                            &mut self.approvals_expanded,
+                            &mut self.approvals_audit,
+                            self.approvals_audit_cache.as_deref(),
+                            now_epoch_secs(),
                         );
-                    });
+                        approval_cmds = out.commands;
+                        if out.reload_audit {
+                            // 描画中に I/O はしない。控えを捨てて、描画後に読み直す。
+                            self.approvals_audit_cache = None;
+                        }
+                    }
+                    BottomView::Mcp => {
+                        // 「🔌 MCP」タブ: 走査は描画の外 (この下) で行う。
+                        mcp_action = mcp::ui(ui, &theme, &mut self.mcp);
+                    }
+                    BottomView::Terminal => {
+                        if let Some(s) = self.agents.active_session() {
+                            let resp = terminal::draw(ui, s, &theme, font, true, true, true);
+                            // タブ選択でアクティブになった端末へ、その場でフォーカスを渡す。
+                            if want_focus {
+                                resp.request_focus();
+                            }
+                        } else {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(20.0);
+                                ui.label(
+                                    RichText::new(tr(
+                                        "セッションがありません — ＋ から起動してください",
+                                    ))
+                                    .color(theme.text_dim),
+                                );
+                            });
+                        }
+                    }
                 }
             });
         if let Some(p) = &panel {
@@ -10745,6 +10824,12 @@ impl ZaivernApp {
             let dir = self.agents.approvals.log_dir();
             self.approvals_audit_cache =
                 Some(agents::approvals::read_audit_tail(&dir, APPROVAL_AUDIT_TAIL));
+        }
+        // MCP パネルの実行 (描画後)。走査も**このビューを出している間だけ** 1 回。
+        self.apply_mcp_action(mcp_action);
+        if self.mcp_view && !self.mcp.scanned {
+            self.mcp.inventory = mcp::scan(&self.roots);
+            self.mcp.scanned = true;
         }
 
         if let Some(i) = launch {
@@ -10815,7 +10900,74 @@ impl ZaivernApp {
         self.agents.panel_open = true;
         self.cockpit = false;
         self.kanban = false;
+        self.mcp_view = false;
         self.approvals_view = true;
+    }
+
+    // ─── MCP サーバ管理 (パネルの外側の実行部) ─────────────────────
+
+    /// ボトムパネルを開いて「🔌 MCP」ビューへ切り替える
+    /// (コマンドパレット / メニューの共通の入口)。
+    fn open_mcp_panel(&mut self) {
+        self.agents.panel_open = true;
+        self.cockpit = false;
+        self.kanban = false;
+        self.approvals_view = false;
+        self.mcp_view = true;
+        // 開いた回だけ読み直す (アイドル時に I/O しない)
+        self.mcp.invalidate();
+    }
+
+    /// MCP パネルが積んだ要求を実行する。**描画の外でだけ呼ぶ** (I/O があるため)。
+    fn apply_mcp_action(&mut self, action: mcp::McpAction) {
+        match action {
+            mcp::McpAction::None => {}
+            mcp::McpAction::Rescan => self.mcp.invalidate(),
+            mcp::McpAction::Open(path) => {
+                self.mcp.notice = None;
+                self.open_path(&path);
+            }
+            mcp::McpAction::Toggle {
+                path,
+                source,
+                name,
+                disable,
+            } => {
+                match mcp::write_toggle(&path, source, &name, disable) {
+                    Ok(()) => {
+                        let msg = trf(
+                            "{name} を{state}にしました (控え: {bak})",
+                            &[
+                                ("name", name.clone()),
+                                (
+                                    "state",
+                                    if disable { tr("無効") } else { tr("有効") },
+                                ),
+                                (
+                                    "bak",
+                                    mcp::backup_path(&path)
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_default(),
+                                ),
+                            ],
+                        );
+                        self.mcp.notice = Some((msg.clone(), true));
+                        self.toast(msg, true);
+                    }
+                    Err(why) => {
+                        let msg = trf(
+                            "{name} を切り替えられません: {why}",
+                            &[("name", name.clone()), ("why", why)],
+                        );
+                        self.mcp.notice = Some((msg.clone(), false));
+                        self.toast(msg, false);
+                    }
+                }
+                // 書けても書けなくても、実ファイルの今の姿を読み直す
+                self.mcp.invalidate();
+            }
+        }
     }
 
     /// 承認パネルで押された 1 コマンドを実行する。
@@ -14647,6 +14799,7 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::OpenApprovalAudit,
             ),
+            ("🔌".into(), tr("MCP サーバを管理"), String::new(), Cmd::OpenMcp),
             ("✏".into(), tr("カーソルを上に追加"), String::new(), Cmd::AddCursorAbove),
             ("✏".into(), tr("カーソルを下に追加"), String::new(), Cmd::AddCursorBelow),
             (
@@ -18173,6 +18326,7 @@ impl ZaivernApp {
                 self.cockpit = false;
                 self.kanban = false;
                 self.approvals_view = false;
+                self.mcp_view = false;
             }
             TA::ShowCockpit => {
                 self.cockpit = true;
@@ -18183,6 +18337,7 @@ impl ZaivernApp {
                 self.cockpit = false;
                 self.deck = false;
                 self.approvals_view = false;
+                self.mcp_view = false;
             }
             TA::ShowDeck => {
                 self.deck = true;
@@ -18190,6 +18345,7 @@ impl ZaivernApp {
                 self.kanban = false;
                 self.agents.panel_open = true;
                 self.approvals_view = false;
+                self.mcp_view = false;
             }
             TA::OpenPalette => self.palette.open_commands(),
             TA::OpenRaceForm => {
@@ -22635,6 +22791,8 @@ mod wave2_tests {
             "Cmd::RestartTutorial",
             "Cmd::OpenApprovals",
             "Cmd::OpenApprovalAudit",
+            // ── MCP サーバ管理 ──
+            "Cmd::OpenMcp",
             "Cmd::AddCursorAbove",
             "Cmd::AddCursorBelow",
             "Cmd::SelectAllOccurrences",
@@ -23803,6 +23961,68 @@ mod cockpit_layout_tests {
                 }
             }
         }
+    }
+
+    /// **ボトムパネルの中身も常に 1 つだけ。**
+    /// 「🛡 承認」と「🔌 MCP」を独立した bool で持つ以上、描く直前に畳む。
+    #[test]
+    fn ボトムパネルのビューは常に一つだけ() {
+        // (承認, MCP) → 描くもの
+        let table = [
+            (false, false, BottomView::Terminal),
+            (true, false, BottomView::Approvals),
+            (false, true, BottomView::Mcp),
+            // 両方立っていても 1 つ (承認 > MCP)
+            (true, true, BottomView::Approvals),
+        ];
+        for (a, m, want) in table {
+            assert_eq!(bottom_view(a, m), want, "承認={a} MCP={m}");
+        }
+        // 全 4 通りで必ず 1 つの値になる (= 重ねようがない)
+        for a in [false, true] {
+            for m in [false, true] {
+                let v = bottom_view(a, m);
+                let hits = [
+                    v == BottomView::Terminal,
+                    v == BottomView::Approvals,
+                    v == BottomView::Mcp,
+                ];
+                assert_eq!(hits.iter().filter(|x| **x).count(), 1, "a={a} m={m}");
+            }
+        }
+    }
+
+    /// ボトムパネルの分岐が**畳んだ値の match** になっている (bool の連鎖に戻さない)。
+    /// ソースを読む回帰テストなので改行は正規化する (Windows は CRLF)。
+    #[test]
+    fn ボトムパネルの分岐は畳んだ値を見る() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        assert!(
+            src.contains("let view = bottom_view(self.approvals_view, self.mcp_view);"),
+            "描く直前に 1 つへ畳んでいない"
+        );
+        assert!(
+            src.contains("match view {")
+                && src.contains("BottomView::Approvals => {")
+                && src.contains("BottomView::Mcp => {")
+                && src.contains("BottomView::Terminal => {"),
+            "ボトムパネルの分岐が match になっていない"
+        );
+    }
+
+    /// MCP パネルは**要求されたときだけ**走査する (アイドルのコストをゼロに保つ)。
+    #[test]
+    fn mcpの走査はビューを出している間だけ() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        // 「表示中かつ未走査」のガードの**直後**でだけ走査する。毎フレーム
+        // `~/.claude.json` (100KB 級) を読むと、アイドルのコストがゼロでなくなる。
+        let guard = "if self.mcp_view && !self.mcp.scanned {";
+        let body = src.split(guard).nth(1).expect("MCP の走査ガードが無い");
+        assert!(
+            body.trim_start().starts_with("self.mcp.inventory = mcp::scan("),
+            "ガードの直後で走査していない: {:?}",
+            body.chars().take(60).collect::<String>()
+        );
     }
 
     /// 中央ビューの分岐は**生のフラグではなく `self.center`** を見る。

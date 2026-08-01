@@ -32,6 +32,7 @@ mod keybinds;
 mod lockx;
 mod lsp;
 mod markdown;
+mod mcp;
 mod menu_bar;
 mod notify;
 mod orchestration;
