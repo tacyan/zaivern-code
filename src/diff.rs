@@ -3959,8 +3959,8 @@ diff --git a/src/foo.rs b/src/foo.rs
         let spec = "..+.....-.........+..";
         let kinds = kinds_of(spec);
         for run in fold_context_runs(&kinds, CONTEXT_KEEP) {
-            for i in run.start..run.end {
-                assert_eq!(kinds[i], LineKind::Context, "変更行 {i} を畳もうとした");
+            for (i, kind) in kinds.iter().enumerate().take(run.end).skip(run.start) {
+                assert_eq!(*kind, LineKind::Context, "変更行 {i} を畳もうとした");
             }
             assert!(run.len() >= 2, "1 行だけ畳むのは無意味");
         }

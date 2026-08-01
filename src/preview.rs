@@ -328,7 +328,7 @@ impl MediaInfo {
 /// 秒を `h:mm:ss` / `m:ss` に整形する純関数。
 /// 有限でない値・負の値は `—` (取れなかったのと同じ見た目) にする。
 pub fn format_duration(secs: f64) -> String {
-    if !secs.is_finite() || secs < 0.0 || secs >= 1e9 {
+    if !secs.is_finite() || !(0.0..1e9).contains(&secs) {
         return "—".into();
     }
     let total = secs.round() as u64;
@@ -404,7 +404,7 @@ fn probe_wav(b: &[u8]) -> MediaInfo {
         }
         // 奇数長のチャンクは 1 バイトのパディングが入る
         let step = (size as usize).saturating_add(size as usize % 2).saturating_add(8);
-        pos = pos.checked_add(step.max(8)).unwrap_or(usize::MAX);
+        pos = pos.saturating_add(step.max(8));
     }
     info
 }

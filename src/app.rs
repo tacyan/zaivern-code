@@ -15468,7 +15468,7 @@ impl ZaivernApp {
         let mut rows: Vec<(String, String)> = vec![
             (
                 tr("種別"),
-                doc.kind.map(|k| tr(k)).unwrap_or_else(|| dash.clone()),
+                doc.kind.map(tr).unwrap_or_else(|| dash.clone()),
             ),
             (tr("サイズ"), crate::editor::human_bytes(doc.file_bytes)),
             (
@@ -19533,10 +19533,7 @@ impl ZaivernApp {
         }
         if tunnel_disconnect {
             self.tunnel.disconnect();
-            self.tunnel_err = match self.rebind_remote(ctx, remote::Bind::Lan) {
-                Ok(_) => None,
-                Err(e) => Some(e),
-            };
+            self.tunnel_err = self.rebind_remote(ctx, remote::Bind::Lan).err();
         }
         if tunnel_copy_l {
             match tunnel::parse_target(&self.tunnel_host) {
