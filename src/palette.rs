@@ -239,8 +239,14 @@ pub enum Cmd {
     LspSymbols,
     /// カーソル位置のシンボルをリネームする
     LspRename,
-    /// ドキュメント全体を整形する
+    /// ドキュメント全体を整形する (選択があればその範囲だけ)
     LspFormat,
+    /// カーソル位置 / 選択範囲のクイックフィックス候補を出す
+    LspCodeAction,
+    /// 関数呼び出しの引数ヒント (シグネチャ) を出す
+    LspSignatureHelp,
+    /// カーソル下のシンボルを薄くハイライトするかを切り替える
+    ToggleLspHighlight,
     /// 保存時に自動で整形するかを切り替える
     ToggleFormatOnSave,
 
@@ -463,7 +469,9 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::FoldLevel(_)
         | Cmd::LspCompletion
         | Cmd::LspRename
-        | Cmd::LspFormat => Group::Edit,
+        | Cmd::LspFormat
+        | Cmd::LspCodeAction
+        | Cmd::LspSignatureHelp => Group::Edit,
 
         // ── 移動・検索 ─────────────────────────────────────────────
         Cmd::OpenFind
@@ -498,6 +506,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleProblems
         | Cmd::ToggleFullScreen
         | Cmd::ToggleTableView
+        | Cmd::ToggleLspHighlight
         | Cmd::FontInc
         | Cmd::FontDec
         | Cmd::SetTheme(_)

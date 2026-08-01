@@ -88,14 +88,18 @@ pub enum BindAction {
     LspSymbols,
     /// リネーム (VS Code: F2)
     LspRename,
-    /// ドキュメントの整形 (VS Code: ⇧⌥F)
+    /// ドキュメントの整形 (VS Code: ⇧⌥F)。選択があれば選択範囲だけを整形する
     LspFormat,
+    /// クイックフィックス / コードアクション (VS Code: ⌘. / Ctrl+.)
+    LspCodeAction,
+    /// 引数ヒント (シグネチャヘルプ) を出す (VS Code: ⇧⌘Space)
+    LspSignatureHelp,
     /// 次の出現を選択してキャレットを増やす (VS Code: ⌘D)
     SelectNextOccurrence,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 48] = [
+const ALL_ACTIONS: [BindAction; 50] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -143,6 +147,8 @@ const ALL_ACTIONS: [BindAction; 48] = [
     BindAction::LspSymbols,
     BindAction::LspRename,
     BindAction::LspFormat,
+    BindAction::LspCodeAction,
+    BindAction::LspSignatureHelp,
     BindAction::SelectNextOccurrence,
 ];
 
@@ -219,6 +225,15 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::LspFormat => {
             KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F)
         }
+        // VS Code と同じ ⌘. / Ctrl+.。⌘ 単独の既存割り当ては
+        // S W N P J B F +/- / O D だけで `.` は空いている。
+        // macOS の OS 予約 (⌘Space=Spotlight, ⌘⌥D=Dock, ⌃Space=入力ソース) にも
+        // 当たらない — ⌘. はダイアログのキャンセル相当だがアプリまで届く。
+        BindAction::LspCodeAction => KeyboardShortcut::new(cmd, Key::Period),
+        // VS Code (mac) の「パラメーターヒントを表示」と同じ ⇧⌘Space。
+        // ⌘Space (Spotlight) / ⌥⌘Space (Finder 検索) / ⌃Space (入力ソース切替 =
+        // 補完に使用中) のいずれとも別で、⇧⌘ 系にも Space の割り当ては無い。
+        BindAction::LspSignatureHelp => KeyboardShortcut::new(cmd_shift, Key::Space),
         // VS Code と同じ ⌘D。⇧⌘D (行の複製) とは別で、既存の割り当てとは重ならない
         BindAction::SelectNextOccurrence => KeyboardShortcut::new(cmd, Key::D),
     }
@@ -305,6 +320,8 @@ impl Keybinds {
             "lsp_symbols" => LspSymbols,
             "lsp_rename" => LspRename,
             "lsp_format" => LspFormat,
+            "lsp_code_action" => LspCodeAction,
+            "lsp_signature_help" => LspSignatureHelp,
             "select_next_occurrence" => SelectNextOccurrence,
             _ => return None,
         })
@@ -826,7 +843,8 @@ mod tests {
             "nav_forward", "goto_definition", "goto_bracket", "run_build_task",
             "toggle_problems", "toggle_fullscreen", "toggle_fold", "unfold_all",
             "toggle_bookmark", "reopen_closed_tab", "lsp_completion", "lsp_references",
-            "lsp_symbols", "lsp_rename", "lsp_format", "select_next_occurrence",
+            "lsp_symbols", "lsp_rename", "lsp_format", "lsp_code_action",
+            "lsp_signature_help", "select_next_occurrence",
         ];
         assert_eq!(names.len(), ALL_ACTIONS.len(), "名前表とアクション一覧の数が合わない");
         let mut resolved: Vec<BindAction> =
