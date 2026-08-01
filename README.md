@@ -362,7 +362,18 @@ git リポジトリのファイルは行番号が差分で色分け(緑 = 追加
 ### 🐙 GitHub 連携
 `gh` コマンド経由で Pull Request / Issue の一覧、PR の差分閲覧、ブランチ操作。**追加の認証設定は不要**(`gh auth login` 済みならそのまま使える)。`gh` が入っていない環境では機能が安全に無効化される。
 
-差分は追加行 / 削除行を色分けしたインライン diff ビューで読める。
+差分は **VS Code と同じ並列(左右 2 列)ビュー**で読める。詳細は次節。
+
+### ⇋ 差分ビュー(VS Code 相当)
+PR の差分タブ・レースの差分タブ・Git の「変更をレビュー」——**差分が出るところは全部同じレンダラ**なので、どこでも同じように読めます。
+
+- **並列(左右 2 列)が既定。** 左が変更前 / 右が変更後で、対応する行は必ず同じ高さに並ぶ(片側にしか無い行は反対側が空欄になる)。左右は 1 本の行として描くので**スクロールのズレが原理的に起きず**、同期のための再描画も走らない
+- **狭いときは自動で一列へ。** 片側 240px(≒ 32 桁)を割り込む幅では、並列をやめてインライン表示に落ちる。サイドバーに入れても、ウィンドウを縮めても見切れない。ツールバーの **⇋ / ≡** ボタン、コマンドパレット「差分の表示を切替」、`config.toml` の `diff_view = "side_by_side" | "inline"` のどれからでも切り替えられる
+- **語単位ハイライト。** 置換された行は、行全体ではなく**変わった部分だけ**を濃く塗る。`count` → `counter` なら増えた `er` だけ。**書記素クラスタ単位**で刻むので、日本語(空白が無い)でも絵文字(ZWJ の家族絵文字・肌色修飾子・国旗)でも崩れない。極端に長い行では自動的に諦めて行全体を塗る(UI を止めない)
+- **F7 / ⇧F7 で次 / 前の変更へ。** 最後まで行くと先頭へ回り込む。変更が無いときは何もせず「変更はありません」とだけ伝える
+- **未変更行は畳む。** 文脈行が続くところは前後 3 行を残して「⋯ N 行を展開」になり、クリックで開く
+- **差分の中も構文ハイライト。** ファイル名から言語を判定し、色はファイルごとにキャッシュ(中身が変わったときだけ計算し直す)。巨大な差分ではハイライトを止めて素の色で描く
+- 見出しの `+N` `-M` は**0 のときは出さない**(リネームだけのファイルに `+0 -0` を並べない)
 
 **⚡ Issue にワンクリックで着手。** Issue の「⚡ 着手」からエージェントを選ぶと、(1) その issue 専用の git worktree をリポジトリの隣に作成(ブランチ `wt/issue-N`、worktrees プラグインと同じ規約)、(2) ワークスペースへ追加、(3) そこを作業ディレクトリにエージェントを起動、(4) セッションが落ち着いたタイミングで着手指示を入力欄へ投入 — まで自動で繋がる。**Enter を押すのはあなた**なので、指示を直してから走らせられる。
 
@@ -523,6 +534,7 @@ cargo nextest run --locked --no-fail-fast --profile ci \
 | ⌘⇧D / ⌘D | 行を複製 / 次の一致を選んでキャレットを増やす |
 | ⌥⌘[ / ⌥⌘] / ⌥⌘B | 折りたたみ切替 / すべて展開 / ブックマーク切替 |
 | ⇧⌘T / ⌘⇧V / ⇧⌘H | 閉じたタブを開き直す / Markdown・HTML プレビュー / 全体置換 |
+| F7 / ⇧F7 | 差分ビュー: 次 / 前の変更へジャンプ(最後まで行くと先頭へ回り込む) |
 | ⌃Space / ⇧F12 / ⇧⌘O | LSP: 補完 / 参照を検索 / シンボルにジャンプ |
 | F2 / ⇧⌥F | LSP: リネーム / ドキュメント整形 |
 | ⌥↑ / ⌥↓ | 行を上下に移動 |
@@ -570,7 +582,7 @@ cargo nextest run --locked --no-fail-fast --profile ci \
 
 Windows / Linux では ⌘ を Ctrl に読み替えてください。ターミナル内では Ctrl+C 等の制御キー、矢印、Tab、Esc がそのまま PTY へ送られます(Shift/Option+Enter は改行として送信され、Claude Code の複数行入力に対応)。
 
-`config.toml` の `[keybindings]` で全ショートカットを上書きできます(`save = "cmd+s"` 形式)。action 名: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer`。修飾キー: `cmd` `ctrl` `shift` `alt`(=`option`)。ファイルツリーのキーは VS Code 既定に固定です。
+`config.toml` の `[keybindings]` で全ショートカットを上書きできます(`save = "cmd+s"` 形式)。action 名: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `diff_next_change` `diff_prev_change`。修飾キー: `cmd` `ctrl` `shift` `alt`(=`option`)。ファイルツリーのキーは VS Code 既定に固定です。
 
 ---
 
@@ -712,7 +724,7 @@ src/
 ├── git.rs           git CLI 連携(リポジトリ検出・ブランチ・行単位 diff マーク)
 ├── git_panel.rs     Git サイドパネル(ブランチ・worktree の一覧と切替)
 ├── github.rs        GitHub 連携(gh CLI 経由・PR/Issue/差分・非同期)
-├── diff.rs          unified diff パーサ + インライン diff ビュー
+├── diff.rs          unified diff パーサ + 差分ビュー(並列/一列・語単位ハイライト)
 ├── ide.rs           外部 IDE への受け渡し(現在行を指定して開く)
 ├── panels.rs        GitHub パネル・PR 差分タブ・IDE 連携の描画
 ├── kanban.rs        フリート看板(8レーンの状態表示・カードからの操作・ライブ端末)
@@ -761,7 +773,7 @@ src/
 - [x] ペット強化(見た目4種・画像差し替え・サイズ・睡眠/散歩・効果音・承認バブルからの承認/拒否)
 - [x] 音声入力(🎤/⏹ だけで完結・止めるまで連続入力・入力欄へ挿入して手動 Enter・届け先/言語/エンジンを個別設定)
 - [x] 音声入力のクロスプラットフォーム対応(macOS 内蔵 / Windows 標準(認識器がある場合)/ Linux・非対応 Windows はブラウザページ / スマホはキーボードの音声入力へ案内)
-- [x] インライン diff ビュー(unified diff のパースと色分け描画)
+- [x] 差分ビュー(VS Code 相当: 並列 ⇔ 一列・語単位ハイライト・F7 で変更ジャンプ・文脈行の折りたたみ・構文色)
 - [x] マルチフォルダ・ワークスペース(複数のフォルダを同時に開く)
 - [x] GitHub 連携(PR / Issue 一覧・PR 差分の閲覧・ブランチ操作)
 - [x] エージェント・カタログ(29種の CLI エージェントを権限モードごと自動設定)

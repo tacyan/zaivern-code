@@ -17,6 +17,13 @@ pub struct Config {
     /// 空白文字の可視化 (スペース「·」/ タブ「→」)。既定はオフ。
     pub show_whitespace: bool,
 
+    /// 差分ビューの既定の表示: `"side_by_side"` (左右 2 列) | `"inline"` (1 列)。
+    ///
+    /// **既定は並列**。ただし幅が足りないときは `diff::diff_layout` が
+    /// 自動で 1 列へ縮退させるので、狭いウィンドウでも見切れない。
+    /// 値の解釈は [`crate::diff::DiffMode::from_config_str`] に集約してある。
+    pub diff_view: String,
+
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
@@ -220,6 +227,7 @@ impl Default for Config {
             show_hidden_files: true,
             word_wrap: false,
             show_whitespace: false,
+            diff_view: crate::diff::DiffMode::default().config_str().into(),
             approval_mode: "ask".into(),
             restore_agents: false,
             show_pet: true,
@@ -429,6 +437,8 @@ struct UiState {
     show_pet: Option<bool>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
+    /// 差分ビューの表示モード ("side_by_side" | "inline")。
+    diff_view: Option<String>,
     pet_image: Option<String>,
     pet_x: Option<f32>,
     pet_y: Option<f32>,
@@ -820,6 +830,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.show_whitespace {
                     cfg.show_whitespace = v;
                 }
+                if let Some(v) = st.diff_view {
+                    cfg.diff_view = v;
+                }
                 if st.pet_image.is_some() {
                     cfg.pet_image = st.pet_image;
                 }
@@ -1180,6 +1193,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         show_pet: Some(cfg.global_show_pet),
         word_wrap: Some(cfg.global_word_wrap),
         show_whitespace: Some(cfg.global_show_whitespace),
+        diff_view: Some(cfg.diff_view.clone()),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -1758,6 +1772,7 @@ command = "agy"
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
+            diff_view: Some("inline".into()),
             pet_image: Some("/tmp/p.png".into()),
             pet_x: Some(10.0),
             pet_y: Some(20.5),

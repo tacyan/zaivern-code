@@ -92,10 +92,14 @@ pub enum BindAction {
     LspFormat,
     /// 次の出現を選択してキャレットを増やす (VS Code: ⌘D)
     SelectNextOccurrence,
+    /// 差分ビューで次の変更へ (VS Code: F7)
+    DiffNextChange,
+    /// 差分ビューで前の変更へ (VS Code: ⇧F7)
+    DiffPrevChange,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 48] = [
+const ALL_ACTIONS: [BindAction; 50] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -144,6 +148,8 @@ const ALL_ACTIONS: [BindAction; 48] = [
     BindAction::LspRename,
     BindAction::LspFormat,
     BindAction::SelectNextOccurrence,
+    BindAction::DiffNextChange,
+    BindAction::DiffPrevChange,
 ];
 
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
@@ -221,6 +227,14 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         }
         // VS Code と同じ ⌘D。⇧⌘D (行の複製) とは別で、既存の割り当てとは重ならない
         BindAction::SelectNextOccurrence => KeyboardShortcut::new(cmd, Key::D),
+        // 差分の次/前の変更 = VS Code と同じ F7 / ⇧F7。
+        // ファンクションキーの既存割り当ては F2 (リネーム) / F12 (定義へ) /
+        // ⇧F12 (参照検索) だけなので F7 系は空いている。修飾キー無しの単打だが、
+        // 差分ビューが出ていないときは `diff::take_jump` が捨てるので誤爆しない。
+        // macOS が予約するのは ⌘⌥D (Dock) や F11 (Mission Control) 系で、
+        // F7 は既定でメディアキー扱いでもアプリへ届く (fn 併用が要る機種はある)。
+        BindAction::DiffNextChange => KeyboardShortcut::new(Modifiers::NONE, Key::F7),
+        BindAction::DiffPrevChange => KeyboardShortcut::new(Modifiers::SHIFT, Key::F7),
     }
 }
 
@@ -306,6 +320,8 @@ impl Keybinds {
             "lsp_rename" => LspRename,
             "lsp_format" => LspFormat,
             "select_next_occurrence" => SelectNextOccurrence,
+            "diff_next_change" => DiffNextChange,
+            "diff_prev_change" => DiffPrevChange,
             _ => return None,
         })
     }
@@ -827,6 +843,7 @@ mod tests {
             "toggle_problems", "toggle_fullscreen", "toggle_fold", "unfold_all",
             "toggle_bookmark", "reopen_closed_tab", "lsp_completion", "lsp_references",
             "lsp_symbols", "lsp_rename", "lsp_format", "select_next_occurrence",
+            "diff_next_change", "diff_prev_change",
         ];
         assert_eq!(names.len(), ALL_ACTIONS.len(), "名前表とアクション一覧の数が合わない");
         let mut resolved: Vec<BindAction> =

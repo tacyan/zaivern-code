@@ -364,7 +364,18 @@ Open several folders at once. List them as arguments — `zai frontend backend s
 ### 🐙 GitHub integration
 List pull requests and issues, read a PR's diff, and switch branches — all through the `gh` command. **No extra auth setup**: if you've run `gh auth login`, it already works. On a machine without `gh`, the panel is disabled cleanly rather than erroring at you.
 
-A PR diff opens as a read-only tab rendered in the inline diff view, with added and removed lines colour-coded.
+A PR diff opens as a read-only tab rendered in the **side-by-side diff view**, same as VS Code. See the next section.
+
+### ⇋ Diff view (VS Code parity)
+PR diff tabs, race diff tabs and Git's "review changes" pane all go through **the same renderer**, so a diff reads the same wherever you find it.
+
+- **Side-by-side by default.** Before on the left, after on the right, with matching lines always at the same height (a line that exists on only one side gets an empty placeholder opposite it). Both columns are painted as one row, so **the two sides cannot drift out of sync** — and no repaint is needed to keep them together
+- **Falls back to one column when narrow.** Below ~240px (≒ 32 columns) of code per side it degrades to inline automatically, so it never gets cut off in a sidebar or a shrunken window. Toggle it from the **⇋ / ≡** button in the diff toolbar, the "toggle diff view" command in the palette, or `diff_view = "side_by_side" | "inline"` in `config.toml`
+- **Word-level highlighting.** A replaced line tints only the part that actually changed — `count` → `counter` highlights just the added `er`. Splitting happens at **grapheme-cluster** boundaries, so Japanese (no spaces) and emoji (ZWJ families, skin-tone modifiers, flags) never break. Pathologically long lines fall back to tinting the whole line rather than stalling the UI
+- **F7 / ⇧F7 jump to the next / previous change**, wrapping around at the end. With nothing to jump to it stays put and just says "no changes"
+- **Unchanged lines collapse.** Long runs of context keep 3 lines on each side and fold the middle into "⋯ N lines", click to expand
+- **Syntax highlighting inside the diff.** The language comes from the file name, and colours are cached per file (recomputed only when the diff content changes). Huge diffs skip highlighting and render plain
+- The `+N` / `-M` badges in the file header are **omitted when zero** (no `+0 -0` on a rename-only file)
 
 **⚡ Start on an issue in one click.** Pick an agent from an issue's "⚡ 着手" (start) menu and Zaivern will (1) create a dedicated git worktree next to the repo (branch `wt/issue-N`, same convention as the worktrees plugin), (2) add it to the workspace, (3) launch the agent with that directory as its working dir, and (4) drop a kick-off instruction into its input field once the session has settled. **You still press Enter** — so you can edit the instruction before it runs.
 
@@ -525,6 +536,7 @@ The split isn't about Linux disliking PTYs. On GitHub's hosted Linux runner (2 c
 | ⌘⇧D / ⌘D | Duplicate line / Select next occurrence, add caret |
 | ⌥⌘[ / ⌥⌘] / ⌥⌘B | Toggle fold / Unfold all / Toggle bookmark |
 | ⇧⌘T / ⌘⇧V / ⇧⌘H | Reopen closed tab / Markdown・HTML preview / Replace across workspace |
+| F7 / ⇧F7 | Diff view: jump to next / previous change (wraps around) |
 | ⌃Space / ⇧F12 / ⇧⌘O | LSP: completion / find references / go to symbol |
 | F2 / ⇧⌥F | LSP: rename / format document |
 | ⌥↑ / ⌥↓ | Move line up / down |
@@ -572,7 +584,7 @@ Pasting onto an existing name auto-renames the VS Code way: `file copy.ts` → `
 
 On Windows / Linux, read ⌘ as Ctrl. Inside the terminal, control keys like Ctrl+C, arrows, Tab, and Esc go straight to the PTY (Shift/Option+Enter is sent as a newline, supporting Claude Code's multi-line input).
 
-Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
+Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `diff_next_change` `diff_prev_change`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
 
 ---
 
@@ -713,7 +725,7 @@ src/
 ├── git.rs           git CLI integration (repo detection, branch, per-line diff marks)
 ├── git_panel.rs     Git side panel (list and switch branches / worktrees)
 ├── github.rs        GitHub integration (via gh CLI — PR/Issue/diffs, async)
-├── diff.rs          Unified diff parser + inline diff view
+├── diff.rs          Unified diff parser + diff view (side-by-side/inline, word-level)
 ├── ide.rs           Hand-off to external IDEs (open at the current line)
 ├── panels.rs        Rendering for the GitHub panel, PR diff tabs, IDE integration
 ├── kanban.rs        Fleet board (8 state lanes, card actions, live terminal pane)
@@ -762,7 +774,7 @@ src/
 - [x] Pet upgrades (4 looks, custom images, sizes, sleep/walk, sounds, approve/deny from the bubble)
 - [x] Voice input (🎤/⏹ only, records until stopped, inserts into the input box for a manual Enter, configurable destination/language/engine)
 - [x] Cross-platform voice input (built-in on macOS; Windows' own recognizer when one is installed; a browser page on Linux and on Windows without one; keyboard dictation guidance on phones)
-- [x] Inline diff view (unified diff parsing and colour-coded rendering)
+- [x] Diff view at VS Code parity (side-by-side ⇔ inline, word-level highlighting, F7 change jumps, context folding, syntax colours)
 - [x] Multi-folder workspace (open several folders at once)
 - [x] GitHub integration (PR / Issue lists, PR diff viewing, branch operations)
 - [x] Agent catalog (29 CLI agents configured automatically per permission mode)
