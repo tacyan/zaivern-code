@@ -79,6 +79,14 @@ $RECYCLE.BIN/
 *.key
 *.p12
 
+# ライセンス発行用の Ed25519 秘密鍵 (tools/licgen)。
+# **本来リポジトリの外に置くもの**だが、うっかり手元へ落としたときに
+# コミットされないよう名前でも弾く。公開鍵はビルド時の環境変数
+# ZAIVERN_LICENSE_PUBKEY で渡すのでリポジトリには入らない。
+*_secret*
+*.secret
+licgen_key*
+
 # === App artifacts (拡張の実体は ~/.zaivern/ 配下。手元に落とした .vsix はコミットしない) ===
 *.vsix
 

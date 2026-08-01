@@ -177,6 +177,8 @@ pub enum Cmd {
     ShowShortcuts,
     /// バージョン情報ダイアログ
     ShowAbout,
+    /// ライセンスキーの入力・状態表示ダイアログ (オフライン検証・通信ゼロ)
+    OpenLicense,
     // ── 横断検索のオプション (サイドバーの検索タブと同じ状態を切り替える) ──
     /// 大文字小文字を区別する
     ToggleSearchCase,
@@ -565,6 +567,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenFolderInIde(_)
         | Cmd::ShowShortcuts
         | Cmd::ShowAbout
+        | Cmd::OpenLicense
         | Cmd::RestartTutorial => Group::Tools,
     }
 }

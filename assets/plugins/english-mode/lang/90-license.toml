@@ -1,0 +1,47 @@
+# オフライン・ライセンス認証 (src/license.rs / app.rs の license_window)。
+# 形式: "日本語原文" = "English"
+
+# ── 到達経路 ──
+"ライセンスキーを入力…" = "Enter license key…"
+"🔑 ライセンス" = "🔑 License"
+
+# ── 状態の見出し ──
+"Pro ライセンス 有効" = "Pro license active"
+"期限切れ" = "Expired"
+"キーの形式が不正です" = "Malformed key"
+"キーの署名が不正です" = "Invalid signature"
+"未ライセンス (無料版)" = "Unlicensed (free)"
+"Pro ライセンス" = "Pro license"
+"無期限" = "no expiry"
+
+# ── 状態の説明 ──
+"等級 {tier} ・ 購入者 {sub} ・ 期限 {exp} ・ {seats} 席" = "Tier {tier} · Licensed to {sub} · Expires {exp} · {seats} seat(s)"
+"Pro ライセンス — {sub} ・ 期限 {exp}" = "Pro license — {sub} · expires {exp}"
+"{exp} に期限が切れています。新しいキーを貼り付けてください" = "Expired on {exp}. Paste a new key to continue."
+"署名が一致しません。写し間違いか、別の製品のキーの可能性があります" = "Signature does not match. The key may be mistyped, or issued for a different product."
+"Zaivern Code は無料で全機能使えます。Pro ライセンスは開発支援者向けです" = "Zaivern Code is free and fully featured. A Pro license is for people who want to support development."
+"保存済みのキー: {k}" = "Stored key: {k}"
+"⚠ この配布版には検証用の公開鍵が入っていないため、どのキーも有効になりません" = "⚠ This build has no verification public key embedded, so no key can be activated."
+
+# ── 操作 ──
+"ライセンスキーを貼り付け:" = "Paste your license key:"
+"保存済みのキーを削除" = "Remove stored key"
+"🔑 ライセンスキーを削除しました" = "🔑 License key removed"
+"ライセンスの保存に失敗: {e}" = "Could not save the license: {e}"
+"ライセンスの削除に失敗: {e}" = "Could not remove the license: {e}"
+
+# ── 注記 (通信ゼロ / 失効できない) ──
+"検証は完全にこの端末の中だけで行われます (通信ゼロ)。キーは {p} に保存されます" = "Verification happens entirely on this machine (zero network). The key is stored at {p}."
+"オフライン検証のため、発行済みキーの失効 (revoke) はできません。期限付きキーで運用しています" = "Because verification is offline, issued keys cannot be revoked. Keys are therefore issued with an expiry date."
+
+# ── 検証エラーの理由 (license.rs の LicenseStatus::Malformed) ──
+"ライセンスキーが長すぎます" = "License key is too long"
+"ライセンスキーに使えない文字が含まれています" = "License key contains characters that cannot appear in a key"
+"ライセンスキーの形式が違います" = "License key is not in the expected format"
+"対応していないライセンスキーの版です" = "Unsupported license key version"
+"この配布版には検証用の公開鍵がありません" = "This build has no verification public key"
+"署名を読み取れません" = "Could not read the signature"
+"署名の長さが不正です" = "Signature has the wrong length"
+"ライセンス情報を読み取れません" = "Could not read the license payload"
+"ライセンス情報の文字コードが不正です" = "License payload is not valid UTF-8"
+"ライセンス情報の中身が不正です" = "License payload is missing or has invalid fields"

@@ -29,6 +29,7 @@ mod instances;
 mod jsonc;
 mod kanban;
 mod keybinds;
+mod license;
 mod lockx;
 mod lsp;
 mod markdown;

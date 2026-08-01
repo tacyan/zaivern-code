@@ -1,0 +1,30 @@
+# Zaivern Code のライセンスキー発行ツール — **販売者だけが使う**。
+#
+# メインの `zai` バイナリとは**完全に別のクレート**にしてある。
+#   * 空の [workspace] を置いてあるので、リポジトリ直下の `cargo build` /
+#     `cargo build --release` は**このクレートを一切ビルドしない**
+#     (= 秘密鍵を扱うコードがリリースバイナリに混ざらない)
+#   * 使うときだけ `cargo run --manifest-path tools/licgen/Cargo.toml -- …`
+#
+# 秘密鍵はこのリポジトリに置かないこと (.gitignore で `*.pem` / `*_secret*` /
+# `licgen_key*` を弾いているが、そもそも別の安全な場所に保管する)。
+[package]
+name = "licgen"
+version = "0.1.0"
+edition = "2021"
+description = "Zaivern Code のライセンスキー発行ツール (販売者用・非公開)"
+license = "Apache-2.0"
+publish = false
+
+# ← これがルートのワークスペースから切り離す指定。消さないこと。
+[workspace]
+
+[dependencies]
+# 検証側 (src/license.rs) と同じ版・同じ既定 feature に揃える。
+ed25519-dalek = "3"
+# 鍵の種 (32 バイト) を OS の CSPRNG から取る。`SigningKey::generate` は
+# 内部でこれと同じことをしているだけなので、rand / rand_core の版差に
+# 巻き込まれないよう getrandom を直接使う。
+getrandom = "0.4"
+base64 = "0.22"
+serde_json = "1"
