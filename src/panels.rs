@@ -675,6 +675,69 @@ pub fn pr_diff_ui(
         });
 }
 
+/// 1 コミットの差分タブ (ガターの git blame をクリックして開く)。
+///
+/// PR 差分タブと同じく**読み取り専用**で、`diff::parse_unified` の結果を
+/// バッファ id をキーにキャッシュする (数千行を毎フレーム舐めないため)。
+pub fn commit_diff_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    buf_id: u64,
+    title: &str,
+    text: &str,
+    cache: &mut std::collections::HashMap<u64, Vec<FileDiff>>,
+) {
+    if cache.len() > DIFF_CACHE_CAP {
+        cache.clear();
+    }
+    let files = cache
+        .entry(buf_id)
+        .or_insert_with(|| diff::parse_unified(text));
+    let (add, del): (u64, u64) = files.iter().fold((0, 0), |(a, d), f| {
+        (a + f.additions as u64, d + f.deletions as u64)
+    });
+    egui::Frame::none()
+        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                // 長いコミット件名は available_width に収め、ホバーで全文を出す
+                let short = crate::textenc::truncate_to_width(title, 80);
+                let lbl = ui.label(RichText::new(format!("🔖 {short}")).strong());
+                if short != title {
+                    lbl.on_hover_text(title);
+                }
+                ui.label(
+                    RichText::new(trf(
+                        "{n} ファイル · +{add} -{del} · 読み取り専用",
+                        &[
+                            ("n", files.len().to_string()),
+                            ("add", add.to_string()),
+                            ("del", del.to_string()),
+                        ],
+                    ))
+                    .color(theme.text_dim)
+                    .size(11.0),
+                );
+            });
+        });
+
+    egui::ScrollArea::vertical()
+        .id_salt(("zv-commit-diff", buf_id))
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            if files.is_empty() {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(tr("このコミットに差分はありません"))
+                        .color(theme.text_dim)
+                        .size(11.5),
+                );
+            } else {
+                diff::diff_ui(ui, theme, files);
+            }
+        });
+}
+
 // ---------------------------------------------------------------------------
 // 外部 IDE 連携
 // ---------------------------------------------------------------------------

@@ -26,6 +26,8 @@ pub struct MenuInfo {
     pub word_wrap: bool,
     /// 空白文字の可視化 (表示メニューのチェック状態)
     pub show_whitespace: bool,
+    /// ガターの git blame 表示 (表示メニューのチェック状態)
+    pub git_blame: bool,
     /// アクティブなエディタタブがあるか (編集系メニューの有効/無効)
     pub has_editor: bool,
     /// アクティブなタブがファイル (path 持ち) か
@@ -430,6 +432,14 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         };
         if item(ui, &ws, "", true) {
             cmds.push(Cmd::ToggleShowWhitespace);
+        }
+        let gb = if info.git_blame {
+            tr("✓ Git blame をガターに表示")
+        } else {
+            tr("Git blame をガターに表示")
+        };
+        if item(ui, &gb, "", true) {
+            cmds.push(Cmd::ToggleGitBlame);
         }
         ui.separator();
         let md = if info.md_preview {

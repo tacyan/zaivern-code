@@ -1674,6 +1674,67 @@ fn fold_click_line(
         .map(|(src, ..)| *src)
 }
 
+// ─── タブのドラッグ並べ替え (純関数) ──────────────────────────────────
+//
+// 並べ替えの「掴んでいたものを指し続ける」という約束は、デッキの
+// `DeckAction::Reorder` (`reorder_agent`) と同じ。違うのは移動の形だけで、
+// デッキの ⌥↑/⌥↓ は隣どうしの swap、ドラッグは remove + insert になる。
+
+/// ドラッグ中のタブの落とし先を求める**純関数**。
+///
+/// `tab_rects` は画面に並んだ順のタブ矩形、`pointer_x` はポインタの x、
+/// `dragging` は掴んでいるタブの添字。戻りは**並べ替え後の添字**で、
+/// 動かす必要が無ければ `None`。
+///
+/// 判定は「ポインタより中心が左にある**自分以外の**タブの数」。
+/// 端より外へ出しても数は 0 / `len-1` で頭打ちになるので、
+/// **戻り値が範囲外になることはない**。
+fn reorder_target(tab_rects: &[egui::Rect], pointer_x: f32, dragging: usize) -> Option<usize> {
+    let n = tab_rects.len();
+    if n < 2 || dragging >= n {
+        return None; // タブ 0/1 枚、または壊れた添字
+    }
+    let mut target = 0usize;
+    for (i, r) in tab_rects.iter().enumerate() {
+        if i == dragging {
+            continue;
+        }
+        if r.center().x < pointer_x {
+            target += 1;
+        }
+    }
+    let target = target.min(n - 1);
+    if target == dragging {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+/// `from` のタブを `to` へ動かしたとき、アクティブタブが**同じタブを
+/// 指し続ける**ための新しい添字を返す**純関数**。
+///
+/// 掴んだタブがアクティブなら落とし先へ、間に挟まれたタブは 1 つずれる。
+fn reorder_active(active: usize, from: usize, to: usize) -> usize {
+    if active == from {
+        return to;
+    }
+    if from < to && active > from && active <= to {
+        active - 1
+    } else if from > to && active >= to && active < from {
+        active + 1
+    } else {
+        active
+    }
+}
+
+/// 挿入位置インジケータを描く x 座標。落とし先より手前なら左端、
+/// 後ろなら右端に線を引く。矩形が足りなければ `None` (描かない)。
+fn reorder_marker_x(tab_rects: &[egui::Rect], from: usize, to: usize) -> Option<f32> {
+    let r = tab_rects.get(to)?;
+    Some(if to <= from { r.left() } else { r.right() })
+}
+
 /// ブックマーク系コマンドの効果。戻り値はジャンプ先の行 (0 始まり)。
 ///
 /// 切替 / 全解除は `None` を返す (その場から動かない)。次 / 前は端で
@@ -2036,6 +2097,14 @@ pub struct ZaivernApp {
     /// 判定は本文全走査なので、同じ長さのまま短時間に何度も数え直さない。
     le_cache: Option<(u64, usize, Instant, crate::textenc::LineEnding)>,
     gitinfo: git::GitSet,
+    /// ガターの git blame (既定 OFF)。ON の間だけ可視ブロックを非同期で取る。
+    /// OFF ならワーカーもキャッシュも持たない = アイドルコストはゼロ。
+    blame: git::Blame,
+    /// blame からクリックで開いたコミット差分タブのパース結果
+    /// (バッファ id → ファイル差分)。毎フレーム parse_unified を回さないため。
+    commit_diff_cache: HashMap<u64, Vec<crate::diff::FileDiff>>,
+    /// ドラッグ中のエディタタブの添字 (ドラッグ並べ替え)。押していない間は None。
+    tab_drag: Option<usize>,
     /// Git サイドバー。単一 repo 表示なので常に primary ルートを見る。
     git_panel: git_panel::GitPanel,
     /// PR 風のローカル変更レビュー。Git サイドバーのサブタブとして出す。
@@ -2444,6 +2513,9 @@ impl ZaivernApp {
         let mut app = Self {
             tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
             gitinfo: git::GitSet::new(roots.clone()),
+            blame: git::Blame::default(),
+            commit_diff_cache: HashMap::new(),
+            tab_drag: None,
             git_panel: git_panel::GitPanel::new(
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
             ),
@@ -6936,7 +7008,8 @@ impl ZaivernApp {
             | Cmd::TogglePetAutoYes
             | Cmd::ToggleRemote
             | Cmd::ToggleWordWrap
-            | Cmd::ToggleShowWhitespace => self.apply_cmd_settings(cmd, ctx),
+            | Cmd::ToggleShowWhitespace
+            | Cmd::ToggleGitBlame => self.apply_cmd_settings(cmd, ctx),
             Cmd::VoiceInput(_)
             | Cmd::VoiceStop
             | Cmd::SetVoiceTarget(_)
@@ -7619,6 +7692,23 @@ impl ZaivernApp {
                         tr("· 空白文字の表示: オン (スペース=· / タブ=→)")
                     } else {
                         tr("· 空白文字の表示: オフ")
+                    },
+                    true,
+                );
+            }
+            Cmd::ToggleGitBlame => {
+                self.cfg.git_blame = !self.cfg.git_blame;
+                self.cfg.global_git_blame = self.cfg.git_blame;
+                if !self.cfg.git_blame {
+                    // OFF にしたら覚えている結果ごと捨てる (裏で走り続けない)
+                    self.blame.clear();
+                }
+                config::save_state(&self.cfg);
+                self.toast(
+                    if self.cfg.git_blame {
+                        tr("👤 Git blame: オン (ガターに 著者 · 相対日時。クリックでそのコミットの差分)")
+                    } else {
+                        tr("👤 Git blame: オフ")
                     },
                     true,
                 );
@@ -12631,6 +12721,54 @@ impl ZaivernApp {
         self.persist_session();
     }
 
+    /// エディタタブをドラッグで並べ替える (`from` → `to`)。
+    ///
+    /// **掴んでいたタブはアクティブのまま**動く。デッキの `reorder_agent` と
+    /// 同じ約束だが、ドラッグは離れた位置へ落とせるので swap ではなく
+    /// remove + insert で動かす (間のタブが 1 つずつずれる)。
+    fn reorder_tab(&mut self, from: usize, to: usize) {
+        let n = self.editor.buffers.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let b = self.editor.buffers.remove(from);
+        self.editor.buffers.insert(to, b);
+        // アクティブは「同じタブ」を指し続ける (添字と ID の取り違え防止)
+        if let Some(a) = self.editor.active {
+            self.editor.active = Some(reorder_active(a, from, to));
+        }
+        // 検索のヒット位置はバッファに紐づくので、並びが変わっても持ち越さない
+        self.find.last = None;
+        self.persist_session();
+    }
+
+    /// blame のガターをクリックしたコミットの差分をタブで開く。
+    ///
+    /// 開けない (git が無い / 非 repo / 既に消えたコミット) ときは
+    /// **静かに何もしない** — blame はユーザーが明示的に呼んだ機能ではないので、
+    /// エラーダイアログもトーストも出さない。
+    fn open_commit_diff(&mut self, sha: &str) {
+        let Some(path) = self
+            .editor
+            .active
+            .and_then(|i| self.editor.buffers[i].path.clone())
+        else {
+            return;
+        };
+        let Some((top, _)) = self.gitinfo.locate(&path) else {
+            return;
+        };
+        let Ok((title, text)) = git::commit_diff(&top, sha) else {
+            return;
+        };
+        let id = self
+            .editor
+            .open_virtual(title, text, crate::editor::BufferKind::CommitDiff);
+        // 同じタブを使い回すことがあるので古いパース結果は捨てる
+        self.commit_diff_cache.remove(&id);
+        self.persist_session();
+    }
+
     // ─── UI: editor ─────────────────────────────────────────────────
 
     fn editor_area(&mut self, ui: &mut egui::Ui) {
@@ -12639,6 +12777,9 @@ impl ZaivernApp {
         if !self.editor.buffers.is_empty() {
             let mut close_req: Option<usize> = None;
             let mut activate: Option<usize> = None;
+            // ドラッグ並べ替え: このフレームで確定した (from, to)
+            let mut reorder: Option<(usize, usize)> = None;
+            let mut drag_from = self.tab_drag;
             let tabs = egui::Frame::none()
                 .fill(theme.panel_alt)
                 .inner_margin(egui::Margin {
@@ -12653,6 +12794,8 @@ impl ZaivernApp {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                // 落とし先の計算に使うタブ矩形 (画面に並んだ順)
+                                let mut tab_rects: Vec<egui::Rect> = Vec::new();
                                 for (i, b) in self.editor.buffers.iter().enumerate() {
                                     let active = Some(i) == self.editor.active;
                                     let fill = if active {
@@ -12704,14 +12847,24 @@ impl ZaivernApp {
                                             .rect
                                         });
                                     let x_rect = fr.inner;
+                                    tab_rects.push(fr.response.rect);
+                                    // click_and_drag: ドラッグ中は clicked() が
+                                    // 立たないので、並べ替えと切り替えは競合しない
                                     let tab = ui.interact(
                                         fr.response.rect,
                                         ui.id().with(("editor-tab", i)),
-                                        egui::Sense::click(),
+                                        egui::Sense::click_and_drag(),
                                     );
                                     if tab.hovered() {
                                         ui.ctx()
                                             .set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    if tab.drag_started() {
+                                        drag_from = Some(i);
+                                    }
+                                    if tab.dragged() {
+                                        ui.ctx()
+                                            .set_cursor_icon(egui::CursorIcon::Grabbing);
                                     }
                                     if tab.clicked() {
                                         if tab
@@ -12724,10 +12877,67 @@ impl ZaivernApp {
                                         }
                                     }
                                 }
+
+                                // ── ドラッグ中: 落とし先を線で示し、離したら確定 ──
+                                let pointer = ui.ctx().pointer_latest_pos();
+                                let down = ui.ctx().input(|i| i.pointer.any_down());
+                                if let Some(from) = drag_from {
+                                    // 掴んでいる間だけ挿入位置を描く (画面は動かさない)
+                                    let to = pointer
+                                        .and_then(|p| reorder_target(&tab_rects, p.x, from));
+                                    let row = tab_rects.get(from).copied();
+                                    if down {
+                                        if let (Some(r), Some(x)) = (
+                                            row,
+                                            to.and_then(|t| reorder_marker_x(&tab_rects, from, t)),
+                                        ) {
+                                            ui.painter().vline(
+                                                x,
+                                                egui::Rangef::new(r.top(), r.bottom()),
+                                                egui::Stroke::new(2.5_f32, theme.accent),
+                                            );
+                                        }
+                                        // 端に寄せたらタブ列を自動スクロールする
+                                        // (掴んだまま ScrollArea の外へは行けないため)
+                                        if let Some(p) = pointer {
+                                            let vis = ui.clip_rect();
+                                            const EDGE: f32 = 28.0;
+                                            const STEP: f32 = 12.0;
+                                            // scroll_with_delta の +x は中身を右へ動かす
+                                            // = オフセットが減る = 左のタブが見える
+                                            if p.x < vis.left() + EDGE {
+                                                ui.scroll_with_delta(egui::vec2(STEP, 0.0));
+                                                ui.ctx().request_repaint();
+                                            } else if p.x > vis.right() - EDGE {
+                                                ui.scroll_with_delta(egui::vec2(-STEP, 0.0));
+                                                ui.ctx().request_repaint();
+                                            }
+                                        }
+                                    } else {
+                                        // 離した = 確定。ただしタブ列から縦に大きく
+                                        // 外れた位置で離したら取り消す (誤操作対策)。
+                                        // ポインタが取れないとき (窓の外) も同じ。
+                                        let inside = match (pointer, row) {
+                                            (Some(p), Some(r)) => {
+                                                p.y >= r.top() - r.height()
+                                                    && p.y <= r.bottom() + r.height()
+                                            }
+                                            _ => false,
+                                        };
+                                        if let Some(t) = to.filter(|_| inside) {
+                                            reorder = Some((from, t));
+                                        }
+                                        drag_from = None;
+                                    }
+                                }
                             });
                         });
                 });
             tutorial::anchor(ui.ctx(), AnchorId::EditorTabs, tabs.response.rect);
+            self.tab_drag = drag_from;
+            if let Some((from, to)) = reorder {
+                self.reorder_tab(from, to);
+            }
             if let Some(i) = activate {
                 self.editor.active = Some(i);
                 self.find.last = None;
@@ -12757,6 +12967,17 @@ impl ZaivernApp {
                 let b = &self.editor.buffers[i];
                 let view = ui.scope(|ui| {
                     panels::pr_diff_ui(ui, &theme, number, b.id, &b.text, &mut self.github)
+                });
+                tutorial::anchor(ui.ctx(), AnchorId::DiffView, view.response.rect);
+                return;
+            }
+            // コミット差分タブ (blame のガターから開く) も読み取り専用の専用ビュー
+            if self.editor.buffers[i].kind == crate::editor::BufferKind::CommitDiff {
+                let b = &self.editor.buffers[i];
+                let (id, title, text) = (b.id, b.title.clone(), b.text.clone());
+                let cache = &mut self.commit_diff_cache;
+                let view = ui.scope(|ui| {
+                    panels::commit_diff_ui(ui, &theme, id, &title, &text, cache)
                 });
                 tutorial::anchor(ui.ctx(), AnchorId::DiffView, view.response.rect);
                 return;
@@ -13384,8 +13605,8 @@ impl ZaivernApp {
         // find バーのヒット数キャッシュもこのハッシュを使い回す(再計算しない)
         self.last_text_hash = text_hash;
         // Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製されない
-        let marks = match abs {
-            Some(p) => self.gitinfo.line_marks(&p, text_hash),
+        let marks = match &abs {
+            Some(p) => self.gitinfo.line_marks(p, text_hash),
             None => git::empty_line_marks(),
         };
 
@@ -13730,6 +13951,55 @@ impl ZaivernApp {
             sticky_cache = None;
         }
 
+        // ── Git blame (既定 OFF) ────────────────────────────────────
+        // **可視ブロックだけ**を非同期で取る。キーは (パス, 保存時ハッシュ,
+        // ブロック範囲) なので、同じ場所を見ている限り git は 1 度も起きない。
+        // 打鍵中に取り直さないのは意図的 — `git blame` はディスク上の内容を
+        // 見るので、保存するまで結果は変わらない。
+        let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
+        let line_count = self.editor.buffers[active].text.split('\n').count();
+        let blame_map: Option<git::BlameMap> = if self.cfg.git_blame
+            && self.editor.buffers[active].kind == crate::editor::BufferKind::File
+        {
+            let rows = if row_h > 0.0 {
+                (view_h / row_h).ceil() as usize + 2
+            } else {
+                1
+            };
+            let (bs, be) = git::blame_block(top_src_line + 1, top_src_line + 1 + rows, line_count);
+            let rev = self.editor.buffers[active].saved_hash;
+            match abs.clone() {
+                Some(p) => match self.gitinfo.locate(&p) {
+                    // git リポジトリでなければ静かに何もしない (ジョブも起こさない)
+                    None => None,
+                    Some((top, rel)) => {
+                        let key = git::BlameKey {
+                            path: p,
+                            rev,
+                            start: bs,
+                            end: be,
+                        };
+                        self.blame.request(&top, &rel, key)
+                    }
+                },
+                None => None,
+            }
+        } else {
+            // OFF の間はキャッシュもワーカーも持たない (既に空なら無視される)
+            self.blame.clear();
+            None
+        };
+        // blame 欄の桁数と幅。狭い窓では 0 (= 出さない) まで落ちる。
+        let blame_cols = match blame_map.as_ref() {
+            Some(_) => git::blame_gutter_cols(ui.available_width(), char_w),
+            None => 0,
+        };
+        let blame_w = if blame_cols > 0 {
+            blame_cols as f32 * char_w + 10.0
+        } else {
+            0.0
+        };
+
         let diag_by_line = &self.diag_cache.1;
         let hl = &self.highlighter;
         let buf = &mut self.editor.buffers[active];
@@ -13743,7 +14013,6 @@ impl ZaivernApp {
         } = buf;
 
         // 行番号ガター: git マークで行ごとに色分けした LayoutJob をキャッシュ
-        let line_count = text.split('\n').count();
         let mut marks_hash: u64 = marks.len() as u64;
         for (l, m) in marks.iter() {
             marks_hash = marks_hash
@@ -13762,8 +14031,8 @@ impl ZaivernApp {
         let gutter_digits = line_count.to_string().len().max(3);
         // 右端に「折りたたみ ▸/▾」と「ブックマーク ◆」の 2 桁を確保する
         let marker_w = if structure_on { FOLD_MARKER_W * 2.0 } else { 0.0 };
-        let gutter_w =
-            ui.fonts(|f| f.glyph_width(&font, '0')) * gutter_digits as f32 + 22.0 + marker_w;
+        // blame 欄は行番号の**左**に置く (行番号は本文の隣に残す)
+        let gutter_w = char_w * gutter_digits as f32 + 22.0 + marker_w + blame_w;
 
         let ed_id = egui::Id::new(("zaivern-buffer", *id));
         // 折り返し OFF: highlight::layout_job が wrap.max_width = INFINITY を設定
@@ -14083,7 +14352,7 @@ impl ZaivernApp {
         );
         painter.galley(
             egui::pos2(
-                vis.left() + 6.0,
+                vis.left() + 6.0 + blame_w,
                 text_top.unwrap_or(vis.top() - inner.state.offset.y),
             ),
             gutter_galley,
@@ -14112,7 +14381,7 @@ impl ZaivernApp {
         // 折り返し ON でも OFF でも同じ経路で正しい y が出る。
         let top_y = text_top.unwrap_or(vis.top() - inner.state.offset.y);
         let mut row_lines: Vec<(usize, f32, f32)> = Vec::new();
-        if structure_on {
+        if structure_on || blame_cols > 0 {
             if let Some((_, g)) = cache.as_ref() {
                 let nl: Vec<bool> = g.rows.iter().map(|r| r.ends_with_newline).collect();
                 for (ri, dl) in row_line_starts(&nl) {
@@ -14153,6 +14422,73 @@ impl ZaivernApp {
                         egui::Stroke::new(1.0_f32, if on { hot } else { dim }),
                     );
                 }
+            }
+        }
+
+        // Git blame: ガター左端に「著者 · 相対日時」を薄く出す。
+        // 描くのは**可視行だけ** (row_lines が画面外を除いてある)。
+        let mut blame_open: Option<String> = None;
+        if let (Some(map), true) = (blame_map.as_ref(), blame_cols > 0) {
+            let now = git::unix_now();
+            let col = egui::Rect::from_min_max(
+                egui::pos2(vis.left(), vis.top()),
+                egui::pos2(vis.left() + blame_w, vis.bottom()),
+            );
+            let resp = ui.interact(col, ed_id.with("blame-gutter"), egui::Sense::click());
+            let pointer = resp.hover_pos().or_else(|| resp.interact_pointer_pos());
+            let mut detail: Option<String> = None;
+            let blame_color = theme_dim.gamma_multiply(0.8);
+            for (src, y0, y1) in &row_lines {
+                let Some(bl) = map.get(src) else {
+                    continue;
+                };
+                let rel = git::relative_time(bl.time, now);
+                let author = if bl.uncommitted {
+                    tr("未コミット")
+                } else {
+                    bl.author.clone()
+                };
+                let rel = if bl.uncommitted { String::new() } else { rel };
+                // 幅が足りなければイニシャルへ、それも無理なら描かない
+                if let Some(label) = git::fit_blame_label(&author, &rel, blame_cols) {
+                    painter.text(
+                        egui::pos2(vis.left() + 6.0, *y0),
+                        Align2::LEFT_TOP,
+                        &label,
+                        font.clone(),
+                        blame_color,
+                    );
+                }
+                // ホバー: 完全なコミットメッセージ・SHA・日時
+                let row = egui::Rect::from_min_max(
+                    egui::pos2(vis.left(), *y0),
+                    egui::pos2(vis.left() + blame_w, *y1),
+                );
+                let Some(p) = pointer.filter(|p| row.contains(*p)) else {
+                    continue;
+                };
+                let _ = p;
+                detail = Some(if bl.uncommitted {
+                    trf(
+                        "{line} 行目: まだコミットされていません",
+                        &[("line", (src + 1).to_string())],
+                    )
+                } else {
+                    format!(
+                        "{}\n{}\n{} · {}\n{}",
+                        bl.summary,
+                        bl.sha,
+                        bl.author,
+                        crate::git::relative_time(bl.time, now),
+                        tr("クリックでこのコミットの差分を開きます"),
+                    )
+                });
+                if resp.clicked() && !bl.uncommitted {
+                    blame_open = Some(bl.sha.clone());
+                }
+            }
+            if let Some(d) = detail {
+                resp.on_hover_text(d);
             }
         }
 
@@ -14291,6 +14627,10 @@ impl ZaivernApp {
         if let Some(l) = sticky_jump {
             self.goto_line(l + 1);
         }
+        // blame のガターをクリック → そのコミットの差分を既存の差分ビューで開く
+        if let Some(sha) = blame_open {
+            self.open_commit_diff(&sha);
+        }
 
         // 補完 / ホバーの基準位置を控える (ポップアップは中央パネルの後に描く)
         self.caret_screen = caret_at;
@@ -14396,6 +14736,7 @@ impl ZaivernApp {
             ("👁".into(), tr("Markdown/HTML プレビュー切替"), "⌘⇧V".into(), Cmd::ToggleMdPreview),
             ("↩".into(), tr("折り返し切替"), String::new(), Cmd::ToggleWordWrap),
             ("·".into(), tr("空白文字表示切替"), String::new(), Cmd::ToggleShowWhitespace),
+            ("👤".into(), tr("Git blame の表示切替"), String::new(), Cmd::ToggleGitBlame),
             ("📁".into(), tr("サイドバー切替"), "⌘B".into(), Cmd::ToggleSidebar),
             ("🌿".into(), tr("Git パネルを開く"), String::new(), Cmd::OpenGitPanel),
             (
@@ -17554,6 +17895,12 @@ impl ZaivernApp {
         // 消費する必要があるので、パネル描画前のここで処理する。
         self.lsp_completion_tick(ctx);
         self.poll_global_search();
+        // Git blame: ワーカーの結果を取り込む。ジョブが無ければ Option の
+        // 検査 1 回で戻り、再描画も要求しない (= アイドル時のコストはゼロ)。
+        self.blame.poll();
+        if self.blame.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        }
         // セッションタブに出すフォルダ一覧 (is_dir を叩くので変化時だけ作り直す)
         self.refresh_session_folders();
         // 差分ビューの「エージェントに送る」を拾って入力欄へ流し込む
@@ -18859,6 +19206,7 @@ impl ZaivernApp {
             auto_save: self.menu_state.auto_save,
             word_wrap: self.cfg.word_wrap,
             show_whitespace: self.cfg.show_whitespace,
+            git_blame: self.cfg.git_blame,
             has_editor: self.editor.active.is_some(),
             has_file: active_path.is_some(),
             md_preview: self.md_preview,
@@ -20281,6 +20629,140 @@ mod tests {
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir -p");
         std::fs::write(path, body).expect("write file");
+    }
+
+    // ── タブのドラッグ並べ替え ────────────────────────────────────
+
+    /// 幅 `w` のタブを隙間なく `n` 枚並べた矩形列 (中心は w/2, 3w/2, …)。
+    fn tab_row(n: usize, w: f32) -> Vec<egui::Rect> {
+        (0..n)
+            .map(|i| {
+                egui::Rect::from_min_max(
+                    egui::pos2(i as f32 * w, 0.0),
+                    egui::pos2((i + 1) as f32 * w, 24.0),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn タブの落とし先は境界でも範囲外にならない() {
+        let w = 100.0_f32;
+        let five = tab_row(5, w); // 中心 50,150,250,350,450
+        // 表: (タブ枚数, ポインタ x, 掴んだ添字) → 期待
+        let table: &[(usize, f32, usize, Option<usize>)] = &[
+            // 左端より左へ引きずる
+            (5, -9999.0, 3, Some(0)),
+            (5, 0.0, 4, Some(0)),
+            // 右端より右へ
+            (5, 9999.0, 0, Some(4)),
+            (5, 1000.0, 2, Some(4)),
+            // 自分自身の位置 (掴んだまま動かさない) → 変更なし
+            (5, 50.0, 0, None),
+            (5, 250.0, 2, None),
+            (5, 449.0, 4, None),
+            // 隣へ 1 つ
+            (5, 160.0, 0, Some(1)),
+            (5, 40.0, 1, Some(0)),
+            (5, 260.0, 1, Some(2)),
+            // タブ 1 枚 / 0 枚は常に None
+            (1, 50.0, 0, None),
+            (0, 50.0, 0, None),
+            // 壊れた添字 (範囲外) でも panic しない
+            (3, 50.0, 99, None),
+        ];
+        for (n, x, from, want) in table {
+            let rects = tab_row(*n, w);
+            let got = reorder_target(&rects, *x, *from);
+            assert_eq!(got, *want, "reorder_target(n={n}, x={x}, from={from})");
+            if let Some(t) = got {
+                assert!(t < *n, "落とし先 {t} が {n} 枚の範囲外");
+            }
+        }
+        // 幅が極端に狭く、全タブが同じ位置に重なっている場合
+        let stacked: Vec<egui::Rect> =
+            (0..6).map(|_| egui::Rect::from_min_max(egui::pos2(10.0, 0.0), egui::pos2(10.0, 24.0))).collect();
+        for from in 0..6 {
+            for x in [-1.0_f32, 9.99, 10.0, 10.01, 99.0] {
+                let got = reorder_target(&stacked, x, from);
+                assert!(
+                    got.map(|t| t < 6).unwrap_or(true),
+                    "重なったタブで範囲外 (from={from}, x={x}): {got:?}"
+                );
+            }
+        }
+        // 落とし先が決まれば必ず remove+insert が成立する添字であること
+        for from in 0..5 {
+            for x in [-100.0_f32, 0.0, 99.0, 101.0, 250.0, 499.0, 900.0] {
+                if let Some(to) = reorder_target(&five, x, from) {
+                    let mut v: Vec<usize> = (0..5).collect();
+                    let e = v.remove(from);
+                    v.insert(to, e);
+                    assert_eq!(v.len(), 5, "並べ替えで枚数が変わった");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 並べ替えてもアクティブタブは同じものを指し続ける() {
+        // 表: (要素数, from, to)。全ての active について検証する
+        let cases: &[(usize, usize, usize)] = &[
+            (5, 0, 4), // 先頭を末尾へ
+            (5, 4, 0), // 末尾を先頭へ
+            (5, 1, 2), // 隣へ
+            (5, 2, 1),
+            (5, 3, 3), // 動かさない
+            (2, 0, 1),
+            (2, 1, 0),
+        ];
+        for (n, from, to) in cases {
+            for active in 0..*n {
+                // 実際の Vec で同じ移動を行い、値が一致するかで検算する
+                let mut v: Vec<usize> = (0..*n).collect();
+                let want_value = v[active];
+                let e = v.remove(*from);
+                v.insert(*to, e);
+                let new_active = reorder_active(active, *from, *to);
+                assert!(new_active < *n, "アクティブ添字が範囲外");
+                assert_eq!(
+                    v[new_active], want_value,
+                    "n={n} from={from} to={to} active={active}: 別のタブを指した"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 挿入インジケータは落とし先の側に出る() {
+        let rects = tab_row(4, 100.0);
+        // 手前へ落とすなら左端、後ろへ落とすなら右端
+        assert_eq!(reorder_marker_x(&rects, 3, 1), Some(100.0));
+        assert_eq!(reorder_marker_x(&rects, 1, 3), Some(400.0));
+        assert_eq!(reorder_marker_x(&rects, 2, 2), Some(200.0));
+        // 範囲外は描かない (panic しない)
+        assert_eq!(reorder_marker_x(&rects, 0, 99), None);
+        assert_eq!(reorder_marker_x(&[], 0, 0), None);
+    }
+
+    /// ドロップ後の状態を実際の `Vec` で通しで確かめる (index と ID の取り違え検出)。
+    #[test]
+    fn ドロップ後もつかんでいたタブがアクティブのまま() {
+        let names = ["a.rs", "b.rs", "c.rs", "d.rs"];
+        let rects = tab_row(names.len(), 100.0);
+        // c.rs (添字 2) を掴んで一番左へ落とす
+        let from = 2usize;
+        let to = reorder_target(&rects, -50.0, from).expect("左端へ動く");
+        assert_eq!(to, 0);
+        let mut v: Vec<&str> = names.to_vec();
+        let e = v.remove(from);
+        v.insert(to, e);
+        assert_eq!(v, vec!["c.rs", "a.rs", "b.rs", "d.rs"]);
+        assert_eq!(v[reorder_active(from, from, to)], "c.rs", "掴んだタブのまま");
+        // 掴んだのが非アクティブ (d.rs がアクティブ) でも指し先は変わらない
+        assert_eq!(v[reorder_active(3, from, to)], "d.rs");
+        // a.rs (元 0) は 1 つ右へずれる
+        assert_eq!(v[reorder_active(0, from, to)], "a.rs");
     }
 
     // ── フレームガードの panic ポリシー ────────────────────────────
@@ -22647,10 +23129,64 @@ mod wave2_tests {
             "Cmd::SaveWithEncoding",
             // ── エージェントデッキ ──
             "Cmd::ToggleDeck",
+            // ── Git blame ──
+            "Cmd::ToggleGitBlame",
         ] {
             assert!(list.contains(c), "{c} がコマンドパレットに無い");
             assert!(router.contains(c), "{c} のディスパッチが無い");
         }
+    }
+
+    /// Git blame は「パレット」「表示メニュー」「config」の 3 経路から届き、
+    /// **既定は OFF**。どれかが切れたら気付けるようにする。
+    #[test]
+    fn git_blameは既定offで3経路から届く() {
+        assert!(
+            !crate::config::Config::default().git_blame,
+            "既定は OFF (勝手に git が走らない)"
+        );
+        let menu = include_str!("menu_bar.rs").replace("\r\n", "\n");
+        assert!(
+            menu.contains("Cmd::ToggleGitBlame"),
+            "表示メニューから届いていない"
+        );
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let update = src
+            .split("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {")
+            .nth(1)
+            .expect("update がある");
+        assert!(
+            update.contains("self.blame.poll();"),
+            "blame の結果を update から取り込んでいない"
+        );
+        assert!(
+            update.contains("self.blame.busy()"),
+            "実行中だけ再描画を予約する仕組みが無い (アイドルで回り続ける)"
+        );
+        // ガターの描画とクリックの配線
+        assert!(src.contains("git::fit_blame_label"), "ガターへ描いていない");
+        assert!(
+            src.contains("self.open_commit_diff(&sha)"),
+            "クリックで差分を開いていない"
+        );
+    }
+
+    /// タブのドラッグ並べ替えが**実際に配線されている**こと。
+    #[test]
+    fn タブは掴んで並べ替えられる() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        assert!(
+            src.contains("egui::Sense::click_and_drag()"),
+            "タブが click_and_drag になっていない"
+        );
+        assert!(
+            src.contains("self.reorder_tab(from, to);"),
+            "落とした結果が並べ替えへ繋がっていない"
+        );
+        assert!(
+            src.contains("fn reorder_tab(&mut self, from: usize, to: usize)"),
+            "並べ替えの実体が無い"
+        );
     }
 }
 
@@ -22667,7 +23203,7 @@ mod glyph_tests {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
         const UI_SYMBOLS: &str = "📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
-                                  💬📊⛔🔁·↩▸▾🔎◆📇💤\
+                                  💬📊⛔🔁·↩▸▾🔎◆📇💤👤🔖\
                                   🔍📡🖱📦🍚🌀🔷🔶🕊👷🐦🅰🌊⌘➡🔩🌙🎏🎐🐉💠";
         let ctx = egui::Context::default();
         super::install_fonts(&ctx);

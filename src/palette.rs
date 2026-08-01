@@ -38,6 +38,8 @@ pub enum Cmd {
     ToggleWordWrap,
     /// 空白文字 (スペース「·」/ タブ「→」) の可視化を切り替える (config へ永続化)
     ToggleShowWhitespace,
+    /// ガターの git blame (著者 · 相対日時) 表示を切り替える (config へ永続化)
+    ToggleGitBlame,
     /// サイドバーを Git タブで開く
     OpenGitPanel,
     OpenFind,
@@ -514,9 +516,11 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::TogglePetBubbles => Group::View,
 
         // ── Git ────────────────────────────────────────────────────
-        Cmd::OpenGitPanel | Cmd::ShowGitHubTab | Cmd::OpenReview | Cmd::SetReviewBase(_) => {
-            Group::Git
-        }
+        Cmd::OpenGitPanel
+        | Cmd::ShowGitHubTab
+        | Cmd::OpenReview
+        | Cmd::ToggleGitBlame
+        | Cmd::SetReviewBase(_) => Group::Git,
 
         // ── ターミナル・実行 ───────────────────────────────────────
         Cmd::ToggleTerminal
