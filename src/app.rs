@@ -52,6 +52,7 @@ use crate::skills;
 use crate::snippets::{self, Snippet};
 use crate::sound::{self, SoundKind};
 use crate::supervisor;
+use crate::tasks;
 use crate::terminal;
 use crate::theme::{self, Theme};
 use crate::theme_json;
@@ -2023,6 +2024,22 @@ fn breadcrumb_seg(
     r.on_hover_text(hint).clicked()
 }
 
+/// `.vscode/tasks.json` を読み直す間隔。
+///
+/// これより短い間隔では**ディスクを触らない**。メニューとコマンドパレットは
+/// 毎フレーム組み直されるので、この歯止めが無いと 60fps でファイルを開くことになる。
+const TASKS_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// tasks.json の走査結果キャッシュ。
+#[derive(Default)]
+struct TasksCache {
+    /// 走査したワークスペースルート。ここが変わったら TTL を待たずに読み直す。
+    root: Option<PathBuf>,
+    /// 最後にディスクを読んだ時刻。`None` = 一度も読んでいない。
+    read_at: Option<std::time::Instant>,
+    doc: tasks::TasksDoc,
+}
+
 pub struct ZaivernApp {
     cfg: Config,
     theme: Theme,
@@ -2051,6 +2068,12 @@ pub struct ZaivernApp {
     /// 混ざらないようにする ([`buf_edit_id`])。描画外では
     /// フォーカス中ペインを指す。
     cur_pane: editor_split::PaneId,
+    /// `.vscode/tasks.json` の走査キャッシュ。
+    ///
+    /// メニューとコマンドパレットは毎フレーム組み直されるので、素直に読むと
+    /// 1 フレームごとにディスク I/O が走る (設計原則 3: アイドル時のコストは 0)。
+    /// 短い TTL とルート一致でしか読み直さない。
+    tasks_cache: TasksCache,
     agents: AgentManager,
     /// Cockpit のタイル 1 枚ぶんの端末分割レイアウト。
     ///
@@ -2769,6 +2792,7 @@ impl ZaivernApp {
             editor: Editor::new(),
             panes: editor_split::EditorPanes::new(),
             cur_pane: 1,
+            tasks_cache: TasksCache::default(),
             agents: AgentManager::new(),
             splits: HashMap::new(),
             split_rect: HashMap::new(),
@@ -4279,6 +4303,35 @@ impl ZaivernApp {
         self.diag_cache = (content, by_line, errs, warns);
     }
 
+    /// 保存済みのエディタ分割レイアウトを復元する。
+    ///
+    /// リーフはパスで指しているので、**開き直せなかったファイルは黙って落ちる**。
+    /// 残るペインが 1 枚以下なら分割を復元しない (空ペインを残さない)。
+    /// 壊れた記録・未知のバージョンでも `EditorPanesRec` 側が空を返すので、
+    /// ここは常に「復元できたか / できなかったか」だけを見る。
+    fn restore_editor_split(&mut self, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        let rec = editor_split::EditorPanesRec::from_line(line);
+        let restored = rec.to_panes(&mut |p| {
+            let path = Path::new(p);
+            self.editor
+                .buffers
+                .iter()
+                .find(|b| b.path.as_deref() == Some(path))
+                .map(|b| b.id)
+        });
+        let Some(panes) = restored else { return };
+        self.panes = panes;
+        self.cur_pane = self.panes.focus_id();
+        // `sync_panes` がフォーカス中ペインへ `editor.active` を押し込まないよう、
+        // 先にこちらから合わせておく (合っていないとタブが 1 枚増える)。
+        if let Some(b) = self.panes.active_buf() {
+            self.editor.active = self.editor.buffers.iter().position(|x| x.id == b);
+        }
+    }
+
     /// 現在のタブ構成などをワークスペース単位で保存する。
     fn persist_session(&self) {
         let data = session::SessionData {
@@ -4298,6 +4351,19 @@ impl ZaivernApp {
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect(),
+            // エディタ分割。リーフはバッファ ID ではなく**絶対パス**で指す
+            // (ID は再起動で必ず変わる)。分割していなければ空文字。
+            editor_split: self
+                .panes
+                .to_rec(&mut |b| {
+                    self.editor
+                        .buffers
+                        .iter()
+                        .find(|x| x.id == b)
+                        .and_then(|x| x.path.as_ref())
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+                .to_line(),
             // 走らせているエージェントタブの記録 (チャット履歴のフォルダ別保存)。
             // 終了済みは復元しても意味が無いので残さない。
             agents: self
@@ -4355,6 +4421,7 @@ impl ZaivernApp {
                 self.editor.active = Some(idx);
             }
         }
+        self.restore_editor_split(&sess.editor_split);
         self.sidebar_open = sess.sidebar_open;
         self.sidebar_tab = SidebarTab::from_key(&sess.sidebar_tab);
         self.agents.panel_open = sess.panel_open;
@@ -8235,6 +8302,7 @@ impl ZaivernApp {
             | Cmd::GoToLine => self.apply_cmd_view_nav(cmd, ctx),
             Cmd::RunActiveFile
             | Cmd::RunBuildTask
+            | Cmd::RunJsonTask(_)
             | Cmd::RunSelection
             | Cmd::NewTerminal
             | Cmd::ShowShortcuts
@@ -8655,6 +8723,7 @@ impl ZaivernApp {
         match cmd {
             Cmd::RunActiveFile => self.run_active_file(ctx),
             Cmd::RunBuildTask => self.run_build_task(ctx),
+            Cmd::RunJsonTask(i) => self.run_json_task(i, ctx),
             Cmd::RunSelection => self.run_selection(ctx),
             Cmd::NewTerminal => self.new_terminal(ctx),
             Cmd::ShowShortcuts => self.shortcuts_open = true,
@@ -9815,6 +9884,8 @@ impl ZaivernApp {
         let mut cmds: Vec<Cmd> = Vec::new();
         let branch = self.git_branch();
 
+        // tasks.json は TTL 内なら読み直さない (メニューを組む前に 1 回だけ)
+        self.refresh_tasks_cache();
         // VS Code 準拠メニューバーの表示状態スナップショット (描画用の読み取り専用)
         let menu_info = self.build_menu_info(ctx);
 
@@ -18116,6 +18187,26 @@ impl ZaivernApp {
                 ));
             }
         }
+        // `.vscode/tasks.json` のタスク。出典が分かる接頭辞を付ける
+        // (自動検出のビルドタスクと混ざると、どこを直せばいいか分からなくなる)。
+        for (i, t) in self
+            .tasks_cache
+            .doc
+            .tasks
+            .iter()
+            .enumerate()
+            .take(menu_bar::MAX_TASK_ROWS)
+        {
+            cmds.push((
+                "🧰".into(),
+                trf(
+                    "タスク (tasks.json): {label}",
+                    &[("label", t.label.clone())],
+                ),
+                String::new(),
+                Cmd::RunJsonTask(i),
+            ));
+        }
         // ルートが 2 つ以上のときだけ削除コマンドを出す
         // (最後の 1 つは削除できない = roots は決して空にならない)
         if self.roots.len() > 1 {
@@ -22550,6 +22641,11 @@ impl ZaivernApp {
             })
             .take(40)
             .collect();
+        // tasks.json 由来のタスク。走らせられない理由はここで確定させ、
+        // メニュー側はグレーアウトとホバーに使うだけにする。
+        let json_tasks =
+            menu_bar::task_rows(&self.tasks_cache.doc, active_path.as_deref(), cfg!(windows));
+        let build_target = self.build_target();
         menu_bar::MenuInfo {
             sidebar_open: self.sidebar_open,
             terminal_open: self.agents.panel_open,
@@ -22587,7 +22683,11 @@ impl ZaivernApp {
                 .map(|_| self.active_line_ending().label()),
             trim_trailing_on_save: self.save_trim_trailing,
             final_newline_on_save: self.save_final_newline,
-            build_task: menu_bar::build_task_for(&self.agent_cwd()).map(|(l, _)| l),
+            build_task: build_target.as_ref().map(|(l, ..)| l.clone()),
+            build_from_tasks_json: build_target.as_ref().is_some_and(|t| t.4),
+            detected_task: menu_bar::build_task_for(&self.agent_cwd()).map(|(l, _)| l),
+            json_tasks,
+            tasks_error: self.tasks_cache.doc.error.clone(),
             run_label,
         }
     }
@@ -22960,13 +23060,26 @@ impl ZaivernApp {
         cwd: &Path,
         ctx: &egui::Context,
     ) {
+        self.spawn_command_terminal_env(name, command, cwd, &[], ctx);
+    }
+
+    /// [`Self::spawn_command_terminal`] に環境変数を足したもの
+    /// (tasks.json の `options.env` 用。**起動の仕組みはこの 1 箇所だけ**)。
+    fn spawn_command_terminal_env(
+        &mut self,
+        name: String,
+        command: String,
+        cwd: &Path,
+        env: &[(String, String)],
+        ctx: &egui::Context,
+    ) {
         use crate::agents::Approval;
         let preset = config::AgentPreset {
             name: name.clone(),
             command,
             icon: "▶".into(),
             cwd: Some(cwd.display().to_string()),
-            env: HashMap::new(),
+            env: env.iter().cloned().collect::<HashMap<_, _>>(),
         };
         match self.agents.launch(
             &preset,
@@ -23013,17 +23126,85 @@ impl ZaivernApp {
         self.spawn_command_terminal(trf("Run {name}", &[("name", name)]), cmd, &root, ctx);
     }
 
-    fn run_build_task(&mut self, ctx: &egui::Context) {
-        // 検出もビルドも作業フォルダ基準 (メニューのラベルと同じ判定にする)
+    // ── tasks.json ──
+
+    /// `.vscode/tasks.json` を必要なときだけ読み直す。
+    ///
+    /// 描画のたびに呼ばれる前提なので、**TTL 内かつ同じルートなら何もしない**
+    /// (設計原則 3: アイドル時のコストはゼロ)。
+    fn refresh_tasks_cache(&mut self) {
         let root = self.agent_cwd();
-        let Some((label, cmd)) = menu_bar::build_task_for(&root) else {
+        let fresh = self.tasks_cache.root.as_deref() == Some(root.as_path())
+            && self
+                .tasks_cache
+                .read_at
+                .is_some_and(|t| t.elapsed() < TASKS_TTL);
+        if fresh {
+            return;
+        }
+        self.tasks_cache.doc = tasks::load_tasks(&root);
+        self.tasks_cache.root = Some(root);
+        self.tasks_cache.read_at = Some(std::time::Instant::now());
+    }
+
+    /// tasks.json のタスクを実行できる 1 行へ解決する。
+    /// 未対応の `${...}` を含む・パースで弾かれた等の理由なら `Err(理由)`。
+    fn resolve_json_task(&self, t: &tasks::TaskDef) -> Result<String, String> {
+        let file = self
+            .editor
+            .active
+            .and_then(|i| self.editor.buffers[i].path.clone());
+        tasks::resolve(t, file.as_deref(), cfg!(windows))
+    }
+
+    /// ⇧⌘B が実際に走らせる対象。tasks.json の既定ビルドタスクを優先し、
+    /// 走らせられない (未対応変数など) ときだけ自動検出へ落ちる。
+    /// メニューのラベルはこの戻り値から作る — **表示と実行を必ず一致させる**。
+    ///
+    /// 戻り値: (ラベル, コマンド, 作業ディレクトリ, 環境変数, tasks.json 由来か)
+    fn build_target(&self) -> Option<(String, String, PathBuf, Vec<(String, String)>, bool)> {
+        if let Some(t) = self.tasks_cache.doc.default_build() {
+            if let Ok(cmd) = self.resolve_json_task(t) {
+                return Some((t.label.clone(), cmd, t.cwd.clone(), t.env.clone(), true));
+            }
+        }
+        let root = self.agent_cwd();
+        menu_bar::build_task_for(&root).map(|(l, c)| (l, c, root, Vec::new(), false))
+    }
+
+    /// tasks.json の n 番目のタスクを実行する (メニュー / コマンドパレット共通)。
+    fn run_json_task(&mut self, idx: usize, ctx: &egui::Context) {
+        let Some(t) = self.tasks_cache.doc.tasks.get(idx).cloned() else {
+            self.toast(tr("そのタスクは見つかりませんでした"), false);
+            return;
+        };
+        // 解決できないタスクは走らせない。理由を出す (黙って壊れたコマンドを撃たない)。
+        let cmd = match self.resolve_json_task(&t) {
+            Ok(c) => c,
+            Err(why) => {
+                self.toast(why, false);
+                return;
+            }
+        };
+        let reveal = t.reveal;
+        self.spawn_command_terminal_env(t.label, cmd, &t.cwd, &t.env, ctx);
+        if !reveal {
+            self.agents.panel_open = false;
+        }
+    }
+
+    fn run_build_task(&mut self, ctx: &egui::Context) {
+        // 起動直後 (まだ 1 度も描いていない) でも tasks.json を見てから決める。
+        self.refresh_tasks_cache();
+        // 検出もビルドも作業フォルダ基準 (メニューのラベルと同じ判定にする)
+        let Some((label, cmd, cwd, env, _)) = self.build_target() else {
             self.toast(
                 tr("ビルドタスクを検出できませんでした (Cargo.toml / package.json / Makefile)"),
                 false,
             );
             return;
         };
-        self.spawn_command_terminal(label, cmd, &root, ctx);
+        self.spawn_command_terminal_env(label, cmd, &cwd, &env, ctx);
     }
 
     /// 選択テキスト (無ければカーソル行) をアクティブなターミナルの入力欄へ送る。

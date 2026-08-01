@@ -191,6 +191,8 @@ pub enum Cmd {
     RunActiveFile,
     /// ビルドタスク (cargo build / npm run build / make) を実行 (VS Code: ⇧⌘B)
     RunBuildTask,
+    /// `.vscode/tasks.json` の n 番目のタスクを実行 (index は走査キャッシュ順)
+    RunJsonTask(usize),
     /// 選択テキストをアクティブなターミナルの入力欄へ送る (Enter は送らない)
     RunSelection,
     /// 新しいターミナル (Shell プリセット) を開く (VS Code: ⌃⇧`)
@@ -582,6 +584,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::NewTerminal
         | Cmd::RunActiveFile
         | Cmd::RunBuildTask
+        | Cmd::RunJsonTask(_)
         | Cmd::RunSelection => Group::Run,
 
         // ── エージェント ───────────────────────────────────────────

@@ -26,7 +26,7 @@
 //!   「可用幅・件数・最長ラベル幅 → 矩形／列幅／縮退」を決め、描画側は
 //!   その結果を置くだけ。極端なサイズでの不変条件はテーブルテストで固定する。
 
-use crate::terminal::{Gutter, SplitDir, SplitLayout};
+use crate::terminal::{Gutter, SplitDir, SplitLayout, SplitLayoutRec};
 
 /// ペインの識別子。分割木のリーフに入る値。
 pub type PaneId = u64;
@@ -578,6 +578,231 @@ impl EditorPanes {
         }
         self.active_buf()
     }
+
+    // ── 永続化 ──────────────────────────────────────────────────
+
+    /// 保存用の形へ落とす。`path_of` はバッファ ID → **絶対パス文字列**
+    /// (無題タブなど引けないものは `None`)。
+    ///
+    /// **バッファ ID は保存しない** — 再起動で必ず変わるため、リーフは
+    /// 端末側が生ログのパスで指しているのと同じ流儀で、ファイルの絶対パスで指す。
+    /// パスを引けるタブが 1 枚も無いペインは落とし、残りが 1 枚以下なら
+    /// 空 (= 保存する分割は無い) を返す。
+    pub fn to_rec(&self, path_of: &mut dyn FnMut(BufId) -> Option<String>) -> EditorPanesRec {
+        if !self.is_split() {
+            return EditorPanesRec::default();
+        }
+        let mut recs: Vec<PaneRec> = Vec::new();
+        let mut keys: Vec<(PaneId, String)> = Vec::new();
+        for p in &self.panes {
+            let mut paths: Vec<String> = Vec::new();
+            let mut active = 0usize;
+            for (i, b) in p.tabs.iter().enumerate() {
+                let Some(s) = path_of(*b) else { continue };
+                if i == p.active {
+                    active = paths.len();
+                }
+                paths.push(s);
+            }
+            if paths.is_empty() {
+                continue;
+            }
+            let key = format!("p{}", recs.len());
+            keys.push((p.id, key.clone()));
+            recs.push(PaneRec { key, active, paths });
+        }
+        if recs.len() < 2 {
+            return EditorPanesRec::default();
+        }
+        let split = self.layout.to_rec(&mut |id| {
+            keys.iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, k)| k.to_string())
+        });
+        // 木から落とされたペインの記録は残さない (穴あきの記録を書かない)。
+        let alive: Vec<&str> = split
+            .nodes
+            .iter()
+            .filter_map(|t| t.strip_prefix("L:"))
+            .collect();
+        recs.retain(|r| alive.contains(&r.key.as_str()));
+        if recs.len() < 2 {
+            return EditorPanesRec::default();
+        }
+        EditorPanesRec { split, panes: recs }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 永続化 (保存形式)
+// ════════════════════════════════════════════════════════════════════
+
+/// 保存形式のバージョン。未知の値を読んだら**分割なしで開き直す**
+/// (前方互換のために panic も部分解釈もしない)。
+const REC_VERSION: &str = "1";
+
+/// 最上位の区切り (ASCII Group Separator)。端末側が使っている
+/// FS(`\u{1f}`) / RS(`\u{1e}`) の 1 つ外側の階層として使う。
+const REC_GS: char = '\u{1d}';
+/// ペイン記録のフィールド区切り (端末と同じ ASCII Unit Separator)。
+const REC_FS: char = '\u{1f}';
+/// ペイン記録のパス列の区切り (端末と同じ ASCII Record Separator)。
+const REC_RS: char = '\u{1e}';
+
+/// ペイン 1 枚の保存記録。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneRec {
+    /// 分割木のリーフが指す安定キー (`"p0"`, `"p1"`, …)。
+    pub key: String,
+    /// アクティブタブの位置 (`paths` の index)。範囲外なら復元時に丸める。
+    pub active: usize,
+    /// このペインに並んでいたファイルの**絶対パス**。
+    pub paths: Vec<String>,
+}
+
+impl PaneRec {
+    fn to_field(&self) -> String {
+        format!(
+            "{}{REC_FS}{}{REC_FS}{}",
+            self.key,
+            self.active,
+            self.paths.join(&REC_RS.to_string())
+        )
+    }
+
+    /// 壊れていれば `None` (その 1 枚だけ落として残りは活かす)。
+    fn from_field(s: &str) -> Option<Self> {
+        let mut it = s.splitn(3, REC_FS);
+        let (key, active, paths) = (it.next()?, it.next()?, it.next()?);
+        if key.is_empty() || paths.is_empty() {
+            return None;
+        }
+        Some(Self {
+            key: key.to_string(),
+            // 数字でなければ先頭タブ扱い (壊れた記録でも開けるようにする)。
+            active: active.parse().unwrap_or(0),
+            paths: paths
+                .split(REC_RS)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+}
+
+/// エディタ分割レイアウトの保存記録。
+///
+/// 分割木そのものは端末と**同じ** [`SplitLayoutRec`] を使う
+/// (木の形と比率の書式・healing・不正比率のクランプを二重に書かない)。
+/// ここが足すのは「どのリーフがどのファイルを並べていたか」だけ。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EditorPanesRec {
+    /// 分割木。リーフは [`PaneRec::key`] を指す。
+    pub split: SplitLayoutRec,
+    /// ペインの中身。
+    pub panes: Vec<PaneRec>,
+}
+
+impl EditorPanesRec {
+    pub fn is_empty(&self) -> bool {
+        self.split.is_empty() || self.panes.is_empty()
+    }
+
+    /// 1 行の文字列へ潰す。保存側 (`session.rs`) に**プレーンな `String` を
+    /// 1 本足すだけ**で済ませるための形 — 端末分割と同じ流儀。
+    pub fn to_line(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(REC_VERSION);
+        out.push(REC_GS);
+        out.push_str(&self.split.to_line());
+        for p in &self.panes {
+            out.push(REC_GS);
+            out.push_str(&p.to_field());
+        }
+        out
+    }
+
+    /// [`Self::to_line`] の逆。**壊れた記録・未知のバージョンでも panic しない** —
+    /// 読めなければ空 (= 分割なし) を返す。
+    pub fn from_line(line: &str) -> Self {
+        let mut it = line.split(REC_GS);
+        let (Some(ver), Some(split)) = (it.next(), it.next()) else {
+            return Self::default();
+        };
+        if ver != REC_VERSION {
+            return Self::default();
+        }
+        let panes: Vec<PaneRec> = it.filter_map(PaneRec::from_field).collect();
+        Self {
+            split: SplitLayoutRec::from_line(split),
+            panes,
+        }
+    }
+
+    /// 実行時の形へ戻す純関数。`buf_of` は絶対パス → バッファ ID
+    /// (開けない = 存在しなくなったファイルは `None`)。
+    ///
+    /// * 引けないパスは**黙って飛ばす**。
+    /// * タブが 1 枚も残らないペインは畳む (空ペインを残さない)。
+    /// * 残るペインが 1 枚以下なら `None` — 呼び出し側は 1 ペインのまま開く。
+    /// * 比率が負 / NaN / inf でも [`SplitLayoutRec::to_layout`] が丸めるので panic しない。
+    pub fn to_panes(&self, buf_of: &mut dyn FnMut(&str) -> Option<BufId>) -> Option<EditorPanes> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut live: Vec<(String, EditorPane)> = Vec::new();
+        let mut next_id: PaneId = 1;
+        for r in &self.panes {
+            if live.iter().any(|(k, _)| *k == r.key) {
+                continue; // 同じキーが 2 回出てくる記録は先勝ち
+            }
+            let mut tabs: Vec<BufId> = Vec::new();
+            let mut active = 0usize;
+            for (i, p) in r.paths.iter().enumerate() {
+                let Some(b) = buf_of(p) else { continue };
+                if tabs.contains(&b) {
+                    continue; // 同じペインに同じバッファは 1 枚だけ
+                }
+                if i == r.active {
+                    active = tabs.len();
+                }
+                tabs.push(b);
+            }
+            if tabs.is_empty() {
+                continue;
+            }
+            let mut pane = EditorPane::new(next_id);
+            next_id += 1;
+            pane.active = active.min(tabs.len() - 1);
+            pane.tabs = tabs;
+            live.push((r.key.clone(), pane));
+        }
+        if live.len() < 2 {
+            return None;
+        }
+        let layout = self
+            .split
+            .to_layout(&mut |k| live.iter().find(|(key, _)| key == k).map(|(_, p)| p.id));
+        let leaves = layout.leaves();
+        if leaves.len() < 2 {
+            return None;
+        }
+        let panes: Vec<EditorPane> = live
+            .into_iter()
+            .map(|(_, p)| p)
+            .filter(|p| leaves.contains(&p.id))
+            .collect();
+        if panes.len() < 2 {
+            return None;
+        }
+        Some(EditorPanes {
+            layout,
+            panes,
+            next_id,
+        })
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1083,5 +1308,223 @@ mod tests {
         assert!(!p.is_split());
         // ペインが 0 枚にならないので focus_id は必ず引ける
         assert!(p.pane(p.focus_id()).is_some());
+    }
+
+    // ── 永続化 ────────────────────────────────────────────────
+
+    /// テスト用のパス解決: `paths` に載っているものだけ「存在する」。
+    /// index+1 をバッファ ID にする (0 を避ける)。
+    fn resolver<'a>(paths: &'a [&'a str]) -> impl FnMut(&str) -> Option<BufId> + 'a {
+        move |p: &str| paths.iter().position(|x| *x == p).map(|i| i as BufId + 1)
+    }
+
+    /// 保存 → 文字列 → 復元 を通す。
+    fn roundtrip(panes: &EditorPanes, of: &[(BufId, &str)], alive: &[&str]) -> Option<EditorPanes> {
+        let line = panes
+            .to_rec(&mut |b| {
+                of.iter()
+                    .find(|(id, _)| *id == b)
+                    .map(|(_, p)| (*p).to_string())
+            })
+            .to_line();
+        EditorPanesRec::from_line(&line).to_panes(&mut resolver(alive))
+    }
+
+    #[test]
+    fn 分割していなければ保存する分割は無い() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11], Some(10));
+        let rec = p.to_rec(&mut |b| Some(format!("/w/{b}.rs")));
+        assert!(rec.is_empty(), "1 ペインなら記録しない");
+        assert_eq!(rec.to_line(), "");
+    }
+
+    #[test]
+    fn 分割と比率とタブがそのまま戻る() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11], Some(10));
+        p.split(SplitDir::Horizontal);
+        // 仕切りを動かして 50:50 から外す
+        p.drag_gutter(&[], 100.0, 1000.0, GUTTER);
+        let ratio_before = p.rects(area(1000.0, 600.0), GUTTER)[0].1.width();
+
+        let of = [(10u64, "/w/a.rs"), (11u64, "/w/b.rs")];
+        let back = roundtrip(&p, &of, &["/w/a.rs", "/w/b.rs"]).expect("復元できる");
+        assert_eq!(back.len(), 2);
+        let ratio_after = back.rects(area(1000.0, 600.0), GUTTER)[0].1.width();
+        assert!(
+            (ratio_before - ratio_after).abs() < 0.01,
+            "比率が戻っていない: {ratio_before} → {ratio_after}"
+        );
+        // 左ペインは 2 枚、分割で生えた右ペインは引き継いだ 1 枚
+        let tabs: Vec<usize> = back
+            .order()
+            .iter()
+            .map(|id| back.pane(*id).unwrap().tabs.len())
+            .collect();
+        assert_eq!(tabs, vec![2, 1]);
+    }
+
+    #[test]
+    fn 入れ子の分割も戻る() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10], Some(10));
+        p.split(SplitDir::Vertical);
+        p.split(SplitDir::Horizontal);
+        assert_eq!(p.len(), 3);
+        let of = [(10u64, "/w/a.rs")];
+        let back = roundtrip(&p, &of, &["/w/a.rs"]).expect("復元できる");
+        assert_eq!(back.len(), 3, "入れ子の 3 ペインが戻る");
+        // どの矩形も領域内で重ならない (端末側の不変条件を引き継いでいる)
+        let rects = back.rects(area(1200.0, 300.0), GUTTER);
+        assert_eq!(rects.len(), 3);
+        for (i, (_, r)) in rects.iter().enumerate() {
+            assert!(inside(*r, area(1200.0, 300.0)), "ペイン {i} が領域外");
+            for (j, (_, o)) in rects.iter().enumerate() {
+                assert!(i == j || !overlaps(*r, *o), "ペイン {i} と {j} が重なった");
+            }
+        }
+    }
+
+    #[test]
+    fn 復元のテーブル() {
+        // (名前, 保存元のタブ配置, 復元時に存在するパス, 期待するペイン枚数)
+        // 枚数 0 = 分割を復元しない (1 ペインのまま開く)
+        let cases: [(&str, [&[&str]; 2], &[&str], usize); 6] = [
+            (
+                "両方そろっている",
+                [&["/w/a.rs"], &["/w/b.rs"]],
+                &["/w/a.rs", "/w/b.rs"],
+                2,
+            ),
+            (
+                "片方だけ存在 → 1 枚しか残らないので畳む",
+                [&["/w/a.rs"], &["/w/b.rs"]],
+                &["/w/a.rs"],
+                0,
+            ),
+            (
+                "存在しないパスだけ → 畳む",
+                [&["/w/a.rs"], &["/w/b.rs"]],
+                &[],
+                0,
+            ),
+            (
+                "片ペインの一部だけ消えても残りで復元する",
+                [&["/w/a.rs", "/w/gone.rs"], &["/w/b.rs"]],
+                &["/w/a.rs", "/w/b.rs"],
+                2,
+            ),
+            (
+                "無関係なパスしか無い → 畳む",
+                [&["/w/a.rs"], &["/w/b.rs"]],
+                &["/w/z.rs"],
+                0,
+            ),
+            (
+                "同じファイルを 2 ペインで開いていた",
+                [&["/w/a.rs"], &["/w/a.rs"]],
+                &["/w/a.rs"],
+                2,
+            ),
+        ];
+        for (name, tabs, alive, want) in cases {
+            // 保存元を組む: バッファ ID は 100 番台の連番で振る
+            let mut of: Vec<(BufId, &str)> = Vec::new();
+            let mut id = 100u64;
+            let mut p = EditorPanes::new();
+            p.split(SplitDir::Horizontal);
+            let order = p.order();
+            for (pi, list) in tabs.iter().enumerate() {
+                let pane = p.pane_mut(order[pi]).unwrap();
+                pane.tabs.clear();
+                for path in list.iter() {
+                    let bid = match of.iter().find(|(_, x)| x == path) {
+                        Some((b, _)) => *b,
+                        None => {
+                            id += 1;
+                            of.push((id, path));
+                            id
+                        }
+                    };
+                    pane.tabs.push(bid);
+                }
+                pane.active = 0;
+            }
+            let got = roundtrip(&p, &of, alive);
+            match want {
+                0 => assert!(got.is_none(), "{name}: 分割を復元しないはず"),
+                n => assert_eq!(got.map(|g| g.len()), Some(n), "{name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn 壊れた記録でも例外を出さず1ペインで開く() {
+        let fs = '\u{1f}';
+        let rs = '\u{1e}';
+        let gs = '\u{1d}';
+        let bad: Vec<String> = vec![
+            String::new(),
+            "ごみ".into(),
+            // 未知のバージョン
+            format!("9{gs}0{fs}p0{fs}L:p0{rs}L:p1{gs}p0{fs}0{fs}/w/a.rs"),
+            // 木だけあって中身が無い
+            format!("1{gs}0{fs}{fs}L:p0"),
+            // ノードが足りない (H の子が 1 つしかない)
+            format!("1{gs}0{fs}p0{fs}H:0.5{rs}L:p0{gs}p0{fs}0{fs}/w/a.rs"),
+            // 比率が NaN / inf / 負
+            format!("1{gs}0{fs}p0{fs}H:NaN{rs}L:p0{rs}L:p1{gs}p0{fs}0{fs}/w/a.rs{gs}p1{fs}0{fs}/w/b.rs"),
+            format!("1{gs}0{fs}p0{fs}H:inf{rs}L:p0{rs}L:p1{gs}p0{fs}0{fs}/w/a.rs{gs}p1{fs}0{fs}/w/b.rs"),
+            format!("1{gs}0{fs}p0{fs}V:-9{rs}L:p0{rs}L:p1{gs}p0{fs}0{fs}/w/a.rs{gs}p1{fs}0{fs}/w/b.rs"),
+            // active が範囲外 / 数字ですらない
+            format!("1{gs}0{fs}p0{fs}H:0.5{rs}L:p0{rs}L:p1{gs}p0{fs}999{fs}/w/a.rs{gs}p1{fs}x{fs}/w/b.rs"),
+            // 同じキーが 2 回
+            format!("1{gs}0{fs}p0{fs}H:0.5{rs}L:p0{rs}L:p1{gs}p0{fs}0{fs}/w/a.rs{gs}p0{fs}0{fs}/w/b.rs"),
+        ];
+        for line in bad {
+            let rec = EditorPanesRec::from_line(&line);
+            let got = rec.to_panes(&mut resolver(&["/w/a.rs", "/w/b.rs"]));
+            // panic しないこと自体が主張。復元できた場合も必ず 2 枚以上。
+            if let Some(g) = &got {
+                assert!(g.len() >= 2, "1 枚以下の分割を作った: {line:?}");
+                // 比率が壊れていても矩形は領域内に収まる
+                for (_, r) in g.rects(area(900.0, 700.0), GUTTER) {
+                    assert!(inside(r, area(900.0, 700.0)), "領域外: {line:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn アクティブタブの位置も戻る() {
+        let mut p = EditorPanes::new();
+        p.split(SplitDir::Horizontal);
+        let order = p.order();
+        p.pane_mut(order[0]).unwrap().tabs = vec![1, 2, 3];
+        p.pane_mut(order[0]).unwrap().active = 2;
+        p.pane_mut(order[1]).unwrap().tabs = vec![2];
+        p.pane_mut(order[1]).unwrap().active = 0;
+        let of = [(1u64, "/w/a.rs"), (2u64, "/w/b.rs"), (3u64, "/w/c.rs")];
+        let back = roundtrip(&p, &of, &["/w/a.rs", "/w/b.rs", "/w/c.rs"]).expect("復元");
+        let o = back.order();
+        let left = back.pane(o[0]).unwrap();
+        assert_eq!(left.tabs.len(), 3);
+        assert_eq!(left.active, 2, "アクティブは 3 枚目のまま");
+    }
+
+    #[test]
+    fn 消えたファイルがアクティブでもはみ出さない() {
+        let mut p = EditorPanes::new();
+        p.split(SplitDir::Horizontal);
+        let order = p.order();
+        p.pane_mut(order[0]).unwrap().tabs = vec![1, 2];
+        p.pane_mut(order[0]).unwrap().active = 1; // 消える方がアクティブ
+        p.pane_mut(order[1]).unwrap().tabs = vec![3];
+        let of = [(1u64, "/w/a.rs"), (2u64, "/w/gone.rs"), (3u64, "/w/c.rs")];
+        let back = roundtrip(&p, &of, &["/w/a.rs", "/w/c.rs"]).expect("復元");
+        let left = back.pane(back.order()[0]).unwrap();
+        assert_eq!(left.tabs.len(), 1);
+        assert!(left.active < left.tabs.len(), "active が範囲外");
     }
 }

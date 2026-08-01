@@ -82,6 +82,12 @@
 "アクティブなファイルを実行" = "Run Active File"
 "ビルド タスクの実行…" = "Run Build Task…"
 "タスクの実行…" = "Run Task…"
+# tasks.json / 自動検出 の出典見出しと、実行できない理由
+"自動検出" = "Auto-detected"
+"⚠ tasks.json を読めませんでした" = "⚠ Could not read tasks.json"
+"tasks.json の既定ビルドタスクが優先されます" = "The default build task in tasks.json takes precedence"
+"そのタスクは見つかりませんでした" = "That task no longer exists"
+"タスク (tasks.json): {label}" = "Task (tasks.json): {label}"
 "エージェントを起動" = "Launch Agent"
 "新しいターミナル" = "New Terminal"
 "ターミナル パネル" = "Terminal Panel"
