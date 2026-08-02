@@ -2473,6 +2473,9 @@ pub struct ZaivernApp {
     pet_attention_notified: HashMap<String, Instant>,
     /// インストール済みプラグイン(~/.zaivern/plugins)
     plugins: Vec<plugins::Plugin>,
+    /// プラグイン名 → そのプラグインが足した言語名 (名前順)。
+    /// プラグイン一覧に「🔤 何言語増えたか」を出すためだけの表示用。
+    plugin_langs: HashMap<String, Vec<String>>,
     /// プラグインコマンドのキーバインド: (shortcut, plugins index, commands index)
     plugin_keys: Vec<(egui::KeyboardShortcut, usize, usize)>,
     /// プラグインコマンド実行結果の受け渡し(ワーカースレッド → UI)
@@ -2995,6 +2998,7 @@ impl ZaivernApp {
             pet_bubble_answered: HashMap::new(),
             pet_attention_notified: HashMap::new(),
             plugins: Vec::new(),
+            plugin_langs: HashMap::new(),
             plugin_keys: Vec::new(),
             plugin_tx,
             plugin_rx,
@@ -3252,11 +3256,20 @@ impl ZaivernApp {
         // 読めない定義は黙って捨てず、理由をトーストで見せる (作者がすぐ気づけるように)。
         let mut packs = crate::grammar::GrammarSet::default();
         let mut syn_errs: Vec<String> = Vec::new();
+        let mut by_plugin: HashMap<String, Vec<String>> = HashMap::new();
         for p in self.plugins.iter().filter(|p| p.active()) {
+            let mut mine = crate::grammar::GrammarSet::default();
             for path in &p.syntax_files {
-                packs.merge(crate::grammar::GrammarSet::load_path(path, &mut syn_errs));
+                mine.merge(crate::grammar::GrammarSet::load_path(path, &mut syn_errs));
             }
+            if !mine.is_empty() {
+                let mut names: Vec<String> = mine.names().iter().map(|s| s.to_string()).collect();
+                names.sort_by_key(|s| s.to_lowercase());
+                by_plugin.insert(p.name.clone(), names);
+            }
+            packs.merge(mine);
         }
+        self.plugin_langs = by_plugin;
         let had_langs = self.highlighter.extra_lang_count();
         let now_langs = packs.grammars.len();
         self.highlighter.set_grammars(packs);
@@ -11990,14 +12003,22 @@ impl ZaivernApp {
                                         .color(theme.text_dim),
                                 );
                             }
-                            ui.label(
+                            // 構文定義を持つプラグインだけ 🔤 を足す
+                            // (常に 0 が並ぶバッジは作らない)
+                            let langs = self.plugin_langs.get(&p.name);
+                            let lang_badge = match langs {
+                                Some(v) if !v.is_empty() => format!("  🔤{}", v.len()),
+                                _ => String::new(),
+                            };
+                            let counts = ui.label(
                                 RichText::new(format!(
-                                    "▶{}  🪝{}  📋{}  🎨{}  ✂{}{}",
+                                    "▶{}  🪝{}  📋{}  🎨{}  ✂{}{}{}",
                                     p.commands.len(),
                                     p.hooks.len(),
                                     p.panels.len(),
                                     p.themes.len(),
                                     p.snippet_files.len(),
+                                    lang_badge,
                                     if p.author.is_empty() {
                                         String::new()
                                     } else {
@@ -12007,6 +12028,12 @@ impl ZaivernApp {
                                 .size(10.5)
                                 .color(theme.text_dim),
                             );
+                            if let Some(v) = langs.filter(|v| !v.is_empty()) {
+                                counts.on_hover_text(trf(
+                                    "追加される言語 ({n}): {list}",
+                                    &[("n", v.len().to_string()), ("list", v.join(", "))],
+                                ));
+                            }
                             for (ci, c) in p.commands.iter().enumerate() {
                                 let btn = ui.small_button(format!("{} {}", c.icon, c.title));
                                 let btn = match &c.keybind {
@@ -14365,7 +14392,7 @@ impl ZaivernApp {
                     } else {
                         ""
                     },
-                    // 指揮官は 1 フレームに 1 体だけ (sync_super_agent_session が決める)
+                    // 指名スーパーエージェント (指揮官) は 1 フレームに 1 体だけ
                     commander: self.super_agent_session == Some(s.id),
                     can_cycle: s.permission_switch_hint().is_some(),
                     // カードの一言 + ホバープレビュー + アクティビティ分類の材料。
@@ -28321,7 +28348,7 @@ mod glyph_tests {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
         const UI_SYMBOLS: &str =
-            "👑📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
+            "👑📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠🔤\
                                   💬📊⛔🔁·↩▸▾🔎◆📇💤🎬🎵🔆\
                                   💬📊⛔🔁·↩▸▾🔎◆📇💤🗺🔗›…\
                                   💬📊⛔🔁·↩▸▾🔎◆📇💤👤🔖\

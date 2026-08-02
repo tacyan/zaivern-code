@@ -105,13 +105,6 @@ impl Highlighter {
         self.packs().grammars.len()
     }
 
-    /// 追加言語の名前 (プラグイン画面の表示用、名前順)。
-    pub fn extra_lang_names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.packs().names().iter().map(|s| s.to_string()).collect();
-        v.sort_by_key(|s| s.to_lowercase());
-        v
-    }
-
     pub fn lang_for(&self, path: Option<&Path>, text: &str) -> String {
         // プラグインのパックを先に見る。syntect が知らない言語を足すのが
         // 主目的だが、`.sass` → Ruby Haml のような既定の取り違えを
@@ -869,6 +862,15 @@ pub fn register_lang_specs(set: &GrammarSet) {
         let spec: &'static LangSpec = Box::leak(Box::new(spec_from_grammar(g)));
         map.insert(key, spec);
     }
+}
+
+/// プラグイン定義の言語の行コメント記号。**組み込みの表は見ない**ので、
+/// 既存言語のコメント切り替えの挙動は変わらない (CSS の `//` のように、
+/// 折りたたみ用には使うがコメント挿入には使いたくない記号があるため)。
+pub fn dynamic_line_comment(lang: &str) -> Option<&'static str> {
+    let map = dynamic_specs().lock().ok()?;
+    let spec = map.get(&lang.to_lowercase())?;
+    spec.line_comment.first().copied()
 }
 
 /// syntax 名から言語仕様を引く。**組み込みの表 → プラグイン定義**の順に見る
@@ -2333,5 +2335,194 @@ int main(int argc)
             vec![(2, "int main(int argc)".to_string())],
             "コメントは貼らず、`{{` の行ではなく宣言行を貼る"
         );
+    }
+}
+
+// ===========================================================================
+// 同梱シンタックスパックとの結合テスト
+//
+// 「プラグインを入れたのに .ts が白いまま」を防ぐ番人。
+// 実際に出荷するデータ (assets/plugins/syntax-pack) を読み、
+// Highlighter 越しに言語判定と着色まで通す。
+// ===========================================================================
+#[cfg(test)]
+mod pack_integration {
+    use super::*;
+
+    /// 同梱パックを積んだ専用インスタンス (`shared()` を汚さない)。
+    fn hl() -> Highlighter {
+        let h = Highlighter::new();
+        h.set_grammars(crate::grammar::bundled_pack::load());
+        h
+    }
+
+    #[test]
+    fn 同梱パックで主要言語が拡張子から解決される() {
+        let h = hl();
+        let cases: &[(&str, &str)] = &[
+            ("a/b/x.ts", "TypeScript"),
+            ("x.tsx", "TypeScript"),
+            ("x.mts", "TypeScript"),
+            ("x.kt", "Kotlin"),
+            ("x.kts", "Kotlin"),
+            ("x.swift", "Swift"),
+            ("x.dart", "Dart"),
+            ("x.zig", "Zig"),
+            ("x.ex", "Elixir"),
+            ("x.jl", "Julia"),
+            ("x.nim", "Nim"),
+            ("x.sol", "Solidity"),
+            ("x.gql", "GraphQL"),
+            ("x.scss", "SCSS"),
+            ("x.less", "Less"),
+            ("x.ps1", "PowerShell"),
+            ("x.proto", "Protocol Buffers"),
+            ("x.nix", "Nix"),
+            ("x.tf", "Terraform"),
+            ("Cargo.toml", "TOML"),
+            ("Dockerfile", "Dockerfile"),
+            ("CMakeLists.txt", "CMake"),
+            (".env", "DotEnv"),
+            (".gitignore", "Ignore List"),
+            ("justfile", "Just"),
+            ("x.vue", "HTML"),
+            ("x.svelte", "HTML"),
+            ("x.mjs", "JavaScript"),
+            ("x.json5", "JSON"),
+            ("x.vhd", "VHDL"),
+            ("x.sv", "Verilog"),
+            ("x.wgsl", "WGSL"),
+            ("x.fs", "F#"),
+            ("x.hx", "Haxe"),
+            ("x.elm", "Elm"),
+            ("x.rkt", "Racket"),
+            ("x.vim", "Vim script"),
+            ("x.awk", "AWK"),
+            ("x.bzl", "Starlark"),
+            ("x.bicep", "Bicep"),
+        ];
+        for (path, want) in cases {
+            let got = h.lang_for(Some(Path::new(path)), "");
+            assert_eq!(&got, want, "{path} の言語判定");
+        }
+    }
+
+    #[test]
+    fn 既存のsyntect言語は影響を受けない() {
+        let h = hl();
+        let cases: &[(&str, &str)] = &[
+            ("x.rs", "Rust"),
+            ("x.py", "Python"),
+            ("x.go", "Go"),
+            ("x.c", "C"),
+            ("x.java", "Java"),
+            ("x.rb", "Ruby"),
+            ("x.php", "PHP"),
+            ("x.html", "HTML"),
+            ("x.css", "CSS"),
+            ("x.json", "JSON"),
+            ("x.md", "Markdown"),
+            ("x.yaml", "YAML"),
+            ("x.sql", "SQL"),
+            ("x.js", "JavaScript"),
+            ("x.lua", "Lua"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(&h.lang_for(Some(Path::new(path)), ""), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn フェンスの言語トークンも引ける() {
+        let h = hl();
+        for (tok, want) in [
+            ("ts", "TypeScript"),
+            ("typescript", "TypeScript"),
+            ("kotlin", "Kotlin"),
+            ("dockerfile", "Dockerfile"),
+            ("toml", "TOML"),
+            ("hcl", "Terraform"),
+            ("rust", "Rust"),
+            ("python", "Python"),
+        ] {
+            assert_eq!(h.lang_for_fence(tok), want, "```{tok}");
+        }
+        assert_eq!(h.lang_for_fence("しらない言語"), "Plain Text");
+    }
+
+    #[test]
+    fn 追加言語に実際に色が付く() {
+        let h = hl();
+        let src = "// コメント\nexport const x: number = 42;\nconsole.log(\"hi\");\n";
+        let job = h.layout_job(
+            src,
+            "TypeScript",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        let mut colors: Vec<[u8; 4]> = job
+            .sections
+            .iter()
+            .map(|s| s.format.color.to_array())
+            .collect();
+        colors.sort();
+        colors.dedup();
+        assert!(
+            colors.len() >= 4,
+            "TypeScript が単色で塗られている (色数 {})",
+            colors.len()
+        );
+        // 本文が欠けていないこと (連結すると元に戻る)
+        assert_eq!(job.text, src);
+    }
+
+    #[test]
+    fn 同梱パックの全言語が着色経路を通る() {
+        let h = hl();
+        let src = "a = 1 // b\n#c\n\"s\"\n";
+        for name in crate::grammar::bundled_pack::load().names() {
+            let job = h.layout_job(
+                src,
+                &name,
+                "base16-ocean.dark",
+                FontId::monospace(12.0),
+                Color32::WHITE,
+            );
+            assert_eq!(job.text, src, "{name}: 本文が欠けた");
+            assert!(job.sections.len() > 1, "{name}: 素通し (色が付いていない)");
+        }
+    }
+
+    #[test]
+    fn 追加言語の折りたたみとコメント記号が登録される() {
+        let h = hl();
+        // 組み込みの表に無い言語 (Elixir / Nix) が引けること
+        assert_eq!(lang_spec("Elixir").line_comment, &["#"]);
+        assert_eq!(lang_spec("Elixir").strategy, FoldStrategy::Indent);
+        assert_eq!(lang_spec("Zig").strategy, FoldStrategy::Brackets);
+        assert_eq!(dynamic_line_comment("Nix"), Some("#"));
+        assert_eq!(dynamic_line_comment("Elixir"), Some("#"));
+        assert_eq!(dynamic_line_comment("Zig"), Some("//"));
+        // 知らない言語は None のまま
+        assert_eq!(dynamic_line_comment("まだ無い言語"), None);
+        // 使わない警告避け (hl() を通してパックを登録するのが前提)
+        assert!(h.extra_lang_count() >= 50);
+    }
+
+    #[test]
+    fn パック無しでも従来どおり動く() {
+        let h = Highlighter::new();
+        assert_eq!(h.extra_lang_count(), 0);
+        assert_eq!(h.lang_for(Some(Path::new("x.rs")), ""), "Rust");
+        // 知らない言語は素通し (落ちない)
+        let job = h.layout_job(
+            "x = 1\n",
+            "TypeScript",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        assert_eq!(job.text, "x = 1\n");
     }
 }
