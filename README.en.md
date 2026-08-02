@@ -310,6 +310,7 @@ Every major capability ships as a plugin. On first launch they unpack into `~/.z
 | 🎯 `element-capture` | Pick an element on screen and pass its structure, styles, and a cropped image into the prompt |
 | 📊 `usage-meter` | Show agent usage in a panel |
 | ⚡ `quick-actions` | Detect the project type and run test / build / format immediately |
+| 🔤 `syntax-pack` | **Syntax highlighting for the major programming languages.** Adds **53 languages** missing from the built-in set — TypeScript / Kotlin / Swift / Dart / Zig / Elixir / Julia / Solidity / TOML / Dockerfile / Terraform / PowerShell and more — and resolves aliases such as `.tsx` `.vue` `.mjs` `.json5` (definitions are plain TOML, so **you can add your own language**) |
 | 🌐 `english-mode` | Language pack that switches the UI to English (the only one that starts disabled; toggle it in the 🔌 tab — English instantly, back to Japanese when off. The `lang/*.toml` dictionaries are editable) |
 
 They are just shell scripts. **Read them, copy them, rewrite them.** Anything you don't want can be disabled from the 🔌 tab.
@@ -326,6 +327,10 @@ If you can write shell, you can write one. A single folder under `~/.zaivern/plu
 - **🪝 Hooks**: fire on startup, file open/close, save, **agent completion**, approval-wait, git changes, or a fixed interval
 - **⚙️ Settings**: declare values for the user to fill in; they arrive as `ZV_CFG_<KEY>`
 - **🎨 Themes / ✂️ Snippets**: bundle the usual editor-compatible formats unchanged
+- **🔤 Syntax highlighting**: bundle language definitions (TOML) with `[[syntax]]`. One language = one
+  block: comment markers, quotes and a keyword table are all it takes. Colors come from the active
+  color theme's scopes, so added languages follow your theme
+  (→ [Add a language](#-add-a-language))
 
 **Drive the app itself**: set `output = "actions"` and every line of stdout becomes an instruction (JSON Lines).
 
@@ -337,6 +342,55 @@ echo '{"action":"agent_prompt","agent":"claude","text":"write tests for this fun
 Open files, notify, open tabs, run things in the terminal, rewrite a panel, **talk to an agent** — all fair game. `agent_prompt` **only places the text in the input box** unless you explicitly pass `submit`, so nothing runs off on its own.
 
 Three buttons to manage it all: **➕ New** (generates a full sample template), **📤 Export** (writes a `.zvplug` you can hand to anyone), **📦 Install** (just pick a received `.zvplug` / `.zip`).
+
+#### 🔤 Add a language
+
+`syntax-pack` ships by default, so **TypeScript, Kotlin and Zig are colored out of the box**.
+Anything missing is one TOML block away — no Rust, no rebuild.
+
+```toml
+# ~/.zaivern/plugins/my-langs/syntaxes/mylang.toml
+[[syntax]]
+name = "MyLang"
+extensions = ["ml2", "mylang"]     # extensions (no dot)
+filenames = ["mylangfile"]         # or match files that have no extension
+line_comment = ["#"]               # line comments
+block_comment = [["/*", "*/"]]     # block comments (tracked across lines)
+doc_comment = ["##"]               # doc comments get their own color
+strings = ["\"", "'"]               # quotes
+multiline_strings = [['"""', '"""']]
+char_literal = true                # treat 'a' as a character literal
+ident_extra = "$-"                 # extra characters allowed in identifiers
+attribute = "@"                    # annotation / decorator prefix
+preproc = ["#"]                    # preprocessor directives at line start
+fold = "brackets"                  # brackets | indent | markdown (folding strategy)
+case_sensitive = true
+keywords  = ["if", "else", "loop"]
+types     = ["int", "str"]
+constants = ["true", "false", "nil"]
+builtins  = ["print"]
+
+# If an existing syntax already fits, alias it instead of writing a new one
+[[alias]]
+target = "HTML"
+extensions = ["myhtml"]
+```
+
+```toml
+# ~/.zaivern/plugins/my-langs/plugin.toml
+[plugin]
+name = "my-langs"
+version = "0.1.0"
+api = 3
+
+[[syntax]]
+path = "syntaxes"        # a file or a directory
+```
+
+- Detection order is **plugin → built-in (syntect) → first line (shebang)**, so a plugin can also
+  override a built-in mapping.
+- Folding, indent guides and `⌘/` comment toggling all follow from the same definition.
+- The plugin row in the 🔌 tab shows **🔤 and the language count** (hover for the list).
 
 ```toml
 # plugin.toml example: auto-format JSON on save
@@ -514,7 +568,7 @@ On restart, the previous tabs, active tab, and panel state are restored automati
 - **The "black tile" terminal was fixed at the source.** Panics in the vt100 parser (scroll regions, tab stops, line operations) and runaway `CSI <huge number>` repeat parameters are now clamped — the patches live in `vendor/vt100` and are pinned by a hostile-input test suite. A tile that still breaks is quarantined on its own with a "⚠ retry" banner, **never left as an empty black rectangle**. Closed alongside it: plugin timeouts now kill the whole process tree (a stray grandchild used to freeze the editor), the IME confirm-Enter that leaked through to the agent, and corruption when saving in non-UTF-8 encodings such as CP932
 
 ### 📱 Phone Remote in detail
-- **What you can do**: view/edit/save open files, switch tabs, search & open workspace files, view agent terminals, send instructions, approve (Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y buttons), and run commands (save, new file, Cockpit, font ±, approval-mode switch, and more)
+- **What you can do**: view/edit/save open files, switch tabs, search & open workspace files, view agent terminals, send instructions, approve (Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y buttons), and run commands (save, new file, Cockpit, zoom ±, approval-mode switch, and more)
 - **How it works**: a tiny built-in HTTP server (port 8899, auto-fallback to 8900–8919 if busy). Pure `std::net` — zero extra crates
 - **Security**: authenticated with a random token generated per launch (embedded in the QR URL). Tokenless API access gets a 401. LAN only
 - **🔐 Reach it without sharing a Wi-Fi — SSH reverse tunnel**: LAN mode assumes you are on the same Wi-Fi, so it does not reach you away from home. 📱 → "Remote connection (SSH)" relays through **a host you can already SSH into** (a VPS, a home server, the office jump box). The path is `phone ──HTTP──▶ jump box:8899 ──SSH tunnel──▶ PC:127.0.0.1:8899`, so **the phone needs no SSH client at all** — it just opens a URL
@@ -626,7 +680,16 @@ cargo clippy --all-targets --locked -- -D warnings   # plus the frozen -A list (
 | Enter | Auto-indent (previous line's indent, extra level after `{ ( [ :`) |
 | ⌘B | Toggle sidebar |
 | ⌘⇧E | Show and focus the Explorer (file tree) |
-| ⌘+ / ⌘- | Font size up / down |
+| ⌘+ / ⌘- / ⌘0 | Zoom **the whole window** in / out / back to 100% |
+| ⌘⌥+ / ⌘⌥- / ⌘⌥0 | Zoom **only the open file** in / out / reset |
+| ⌘ + wheel (or pinch) | File-level zoom when the pointer is over the editor body, window zoom otherwise |
+
+**Zoom has two levels.** Window zoom works like VS Code's `window.zoomLevel`: the entire
+UI — sidebar, tabs, menus, and the **terminal** — scales together, and the factor is
+remembered in `~/.zaivern/state.toml` (50%–300%, 13 steps). File zoom applies only to that
+tab's body (and its Markdown preview); it is temporary and disappears when the tab closes.
+While either is off 100%, the status bar shows `🔍 125%` / `🔎 150%` — **click it to reset**.
+The View menu and the command palette offer the same actions.
 
 ### Agent terminal (macOS)
 
@@ -666,7 +729,7 @@ Pasting onto an existing name auto-renames the VS Code way: `file copy.ts` → `
 
 On Windows / Linux, read ⌘ as Ctrl. Inside the terminal, control keys like Ctrl+C, arrows, Tab, and Esc go straight to the PTY (Shift/Option+Enter is sent as a newline, supporting Claude Code's multi-line input).
 
-Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `global_replace` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_deck` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `toggle_fold` `unfold_all` `toggle_bookmark` `reopen_closed_tab` `lsp_completion` `lsp_references` `lsp_symbols` `lsp_rename` `lsp_format` `lsp_code_action` `lsp_signature_help` `select_next_occurrence` `split_editor_right` `split_editor_down` `focus_pane_1` `focus_pane_2` `focus_pane_3` `diff_next_change` `diff_prev_change`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
+Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `global_replace` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_deck` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `zoom_in` `zoom_out` `zoom_reset` `file_zoom_in` `file_zoom_out` `file_zoom_reset` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `toggle_fold` `unfold_all` `toggle_bookmark` `reopen_closed_tab` `lsp_completion` `lsp_references` `lsp_symbols` `lsp_rename` `lsp_format` `lsp_code_action` `lsp_signature_help` `select_next_occurrence` `split_editor_right` `split_editor_down` `focus_pane_1` `focus_pane_2` `focus_pane_3` `diff_next_change` `diff_prev_change`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
 
 **The keystrokes printed on screen are generated from this table.** Every "⌘S" in a menu, a context menu, the palette or a tooltip is looked up rather than hand-written, so rebinding an action in `[keybindings]` **changes the label too** — the UI can never claim a shortcut you no longer have. Each action is also pinned by a test that it reaches a place which actually consumes it, so **a shortcut that shows up but does nothing fails CI**. The set of keystrokes macOS holds onto (⌘Space, ⌃Space, ⌥⌘D and friends) was read off the OS rather than guessed, and the same test proves no default binding lands on one. The egui-winit 0.29 bug where **⌘⇧C / ⌘⇧V have their key-press event swallowed and replaced by Copy / Paste** is routed around by reconstructing the original keystroke from the substituted event (the Cockpit's ⌘⇧C goes through that path).
 
@@ -677,7 +740,9 @@ Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save =
 Generated automatically on first launch. After editing, run **"Reload settings"** from the command palette for instant effect (or open the file directly via **"Open config.toml"**).
 
 ```toml
-# Theme: "zaivern-dark" | "zaivern-midnight" | "zaivern-light"
+# Theme (dark):  "zaivern-dark" "zaivern-midnight" "zaivern-nordic"
+#                "zaivern-ember" "zaivern-forest" "zaivern-ocean" "zaivern-carbon"
+# Theme (light): "zaivern-light" "zaivern-paper" "zaivern-daylight" "zaivern-frost"
 # or a full path to a VS Code-compatible theme JSON
 theme = "zaivern-dark"
 editor_font_size = 15.0
@@ -806,7 +871,7 @@ command = ""          # empty string = login shell
 src/
 ├── main.rs          Entry point (eframe bootstrap)
 ├── app.rs           App state, layout, shortcuts, palette integration
-├── theme.rs         3 themes (Dark / Midnight / Light) + egui style application
+├── theme.rs         11 themes (7 dark / 4 light) + egui style application
 ├── theme_json.rs    Color-theme JSON import (VS Code-compatible)
 ├── config.rs        ~/.zaivern/config.toml loading, generation, project overrides
 ├── editor.rs        Buffer & tab management

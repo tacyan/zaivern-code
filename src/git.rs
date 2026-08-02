@@ -2155,8 +2155,10 @@ index 1234567..89abcde 100644
         let mut set = GitSet::new(vec![c1.clone(), c2.clone()]);
         assert_eq!(set.repo_count(), 2, "別 repo は別々に持つ");
 
-        // 同期的にスキャンを取り込む (バックグラウンドの完了を待つ)
-        for _ in 0..200 {
+        // 同期的にスキャンを取り込む (バックグラウンドの完了を待つ)。
+        // 実 `git status` の子プロセスを 2 本待つので、全量テストで CPU が
+        // 埋まっている場合に備えて上限は長めに取る (短いと全量実行でだけ落ちる)。
+        for _ in 0..1000 {
             set.refresh_if_stale();
             if set.dirty_count() >= 2 {
                 break;
@@ -2536,8 +2538,12 @@ index 1234567..89abcde 100644
 
         let mut g = Git::new(repo.clone());
         g.refresh_if_stale(); // スキャン開始 (この時点では空のまま)
+                              // 待ち時間は**余裕を持たせる**。ここが待っているのは実 `git status` の
+                              // 子プロセスで、全量テストのように CPU が埋まっている環境では
+                              // 数秒では返らないことがある (5 秒だと全量実行でだけ落ちた)。
+                              // 判定内容は変えない — 「いつか必ず届く」を確かめるテスト。
         let mut landed = false;
-        for _ in 0..100 {
+        for _ in 0..400 {
             std::thread::sleep(Duration::from_millis(50));
             g.refresh(true); // ポーリング (force でも pending 中は再起動しない)
             if g.file_status("fresh.txt") == Some(FileStatus::Untracked) {

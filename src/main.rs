@@ -24,6 +24,7 @@ mod fuzzy;
 mod git;
 mod git_panel;
 mod github;
+mod grammar;
 mod highlight;
 mod html;
 mod i18n;
@@ -70,6 +71,7 @@ mod theme_json;
 mod tunnel;
 mod tutorial;
 mod voice;
+mod zoom;
 
 use eframe::egui;
 

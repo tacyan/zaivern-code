@@ -308,6 +308,7 @@ AI が 9 割を書く時代でも、最後の 1 割——設計の勘所、名�
 | 🎯 `element-capture` | 画面上の要素を選び、その構造・スタイル・切り抜き画像をプロンプトへ渡す |
 | 📊 `usage-meter` | エージェントの利用状況をパネルに表示する |
 | ⚡ `quick-actions` | プロジェクトの種類を判別し、テスト・ビルド・整形をすぐ実行する |
+| 🔤 `syntax-pack` | **主要プログラミング言語の構文ハイライト**。TypeScript / Kotlin / Swift / Dart / Zig / Elixir / Julia / Solidity / TOML / Dockerfile / Terraform / PowerShell など **53 言語**を追加し、`.tsx` `.vue` `.mjs` `.json5` などの別名も解決する(定義は TOML なので**言語を自分で足せる**) |
 | 🌐 `english-mode` | UI を英語表示に切り替える言語パック(これだけ初回は無効。🔌 タブで ON にすると即座に English、OFF で日本語に戻る。辞書 `lang/*.toml` は編集可) |
 
 中身はただのシェルスクリプトです。**読んで、真似して、書き換えて構いません。** 要らないものは 🔌 タブで無効にできます。
@@ -324,6 +325,9 @@ AI が 9 割を書く時代でも、最後の 1 割——設計の勘所、名�
 - **🪝 フック**: 起動時・ファイル開閉・保存時・**エージェント完了時**・承認待ち・git 変更時・一定間隔で自動実行
 - **⚙️ 設定項目**: ユーザーに入力させる値を宣言でき、`ZV_CFG_<KEY>` として渡ります
 - **🎨 テーマ / ✂️ スニペット**: 一般的なエディタ互換形式をそのまま同梱できます
+- **🔤 構文ハイライト**: `[[syntax]]` で言語定義(TOML)を同梱できます。1 言語 = 1 ブロックで、
+  コメント記号・引用符・キーワード表を書くだけ。色はカラーテーマのスコープから引くので、
+  テーマを変えれば追加言語も一緒に変わります(→ [構文ハイライトを足す](#-構文ハイライトを足す))
 
 **アプリを操作する**: `output = "actions"` にすると、標準出力の各行が指示になります(JSON Lines)。
 
@@ -335,6 +339,55 @@ echo '{"action":"agent_prompt","agent":"claude","text":"この関数をテスト
 ファイルを開く・通知する・タブを開く・ターミナルで実行する・パネルを書き換える・**エージェントに話しかける**などが自由に行えます。`agent_prompt` は `submit` を明示しない限り**送信せず入力欄に置くだけ**なので、勝手に走り出すことはありません。
 
 操作は 3 ボタン: **➕ 新規作成**(テンプレート一式を生成)/ **📤 エクスポート**(`.zvplug` を書き出して配布)/ **📦 インストール**(受け取った `.zvplug` / `.zip` を選ぶだけ)。
+
+#### 🔤 構文ハイライトを足す
+
+標準の `syntax-pack` が入っているので、**TypeScript も Kotlin も Zig も最初から色が付きます**。
+足りない言語は TOML を 1 ブロック書くだけで足せます(Rust の再ビルドは不要)。
+
+```toml
+# ~/.zaivern/plugins/my-langs/syntaxes/mylang.toml
+[[syntax]]
+name = "MyLang"
+extensions = ["ml2", "mylang"]     # 拡張子 (ドット無し)
+filenames = ["mylangfile"]         # 拡張子を持たないファイル名でもよい
+line_comment = ["#"]               # 行コメント
+block_comment = [["/*", "*/"]]     # ブロックコメント (行を跨いで追跡する)
+doc_comment = ["##"]               # ドキュメントコメントは色を分ける
+strings = ["\"", "'"]               # 引用符
+multiline_strings = [[', ']]
+char_literal = true                # 'a' を文字リテラルとして扱う
+ident_extra = "$-"                 # 識別子に使える追加文字
+attribute = "@"                    # 注釈・デコレータの先頭記号
+preproc = ["#"]                    # 行頭のプリプロセッサ指令
+fold = "brackets"                  # brackets | indent | markdown (折りたたみ方式)
+case_sensitive = true
+keywords  = ["if", "else", "loop"]
+types     = ["int", "str"]
+constants = ["true", "false", "nil"]
+builtins  = ["print"]
+
+# 既にある構文で足りるなら、別名で回せば定義は増えません
+[[alias]]
+target = "HTML"
+extensions = ["myhtml"]
+```
+
+```toml
+# ~/.zaivern/plugins/my-langs/plugin.toml
+[plugin]
+name = "my-langs"
+version = "0.1.0"
+api = 3
+
+[[syntax]]
+path = "syntaxes"        # ファイルでもディレクトリでもよい
+```
+
+- 判定の順番は **プラグイン → 内蔵(syntect) → 1 行目(シェバン)**。内蔵の割り当てを
+  上書きしたいときもプラグイン側に書けば勝ちます。
+- 折りたたみ・インデントガイド・`⌘/` のコメント切り替えも、この定義から自動で効きます。
+- 🔌 タブのプラグイン行に **🔤 と言語数**が出ます(ホバーで言語名の一覧)。
 
 ```toml
 # plugin.toml の例: 保存時に JSON を自動整形
@@ -512,7 +565,7 @@ LLM に「宛先っぽい文」を推測させるようなことはしない。*
 - **端末が「黒いタイル」で残る問題は、原因の側で塞いだ。** vt100 パーサのスクロール領域・タブストップ・行操作で起きていた panic と、`CSI <巨大な数値>` の反復パラメータの暴走を上限で抑え込んだ(パッチは `vendor/vt100` に取り込み、敵対的入力のテストで固定)。それでも壊れたタイルは 1 枚だけを隔離して「⚠ 再試行」を出す——**空の黒い矩形のまま放置しない**。併せて、プラグインのタイムアウト時に**孫プロセスまで木ごと止める**(取り残しでエディタが固まっていた)、日本語入力の変換確定 Enter がエージェントへ漏れる問題、CP932 など非 UTF-8 保存の破損も塞いだ
 
 ### 📱 スマホリモートの詳細
-- **できること**: ファイルの閲覧・編集・保存、タブ切替、ワークスペース検索&オープン、エージェントのターミナル閲覧・指示送信・承認操作(Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y)、各種コマンド(保存・新規・Cockpit・フォント±・承認モード切替など)
+- **できること**: ファイルの閲覧・編集・保存、タブ切替、ワークスペース検索&オープン、エージェントのターミナル閲覧・指示送信・承認操作(Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y)、各種コマンド(保存・新規・Cockpit・ズーム±・承認モード切替など)
 - **仕組み**: 内蔵の極小 HTTP サーバ(ポート 8899、使用中なら 8900〜8919 に自動フォールバック)。依存クレート追加なしの `std::net` のみ
 - **セキュリティ**: 起動ごとにランダム生成されるトークンで認証(QR の URL に埋め込み済み)。トークンなしの API アクセスは 401 拒否。LAN 内のみ
 - **🔐 同じ Wi-Fi でなくても繋ぐ — SSH リバーストンネル**: LAN モードは「同じ Wi-Fi」が前提なので、外出先からは届かない。トップバーの 📱 →「リモート接続 (SSH)」から、**あなたが既に SSH で入れるホスト**(VPS / 自宅サーバ / 会社の踏み台)を中継点にできる。`スマホ ──HTTP──▶ 踏み台:8899 ──SSHトンネル──▶ PC:127.0.0.1:8899` という経路を張るだけなので、**スマホ側に SSH クライアントは要らない**(ブラウザで URL を開くだけ)
@@ -624,7 +677,17 @@ cargo clippy --all-targets --locked -- -D warnings   # + 凍結した債務の -
 | Enter | 自動インデント(直前行の字下げ + `{ ( [ :` 後は追加字下げ) |
 | ⌘B | サイドバー切替 |
 | ⌘⇧E | エクスプローラー(ファイルツリー)を表示してフォーカス |
-| ⌘+ / ⌘- | フォント拡大 / 縮小 |
+| ⌘+ / ⌘- / ⌘0 | **画面全体**をズームイン / アウト / 100% に戻す |
+| ⌘⌥+ / ⌘⌥- / ⌘⌥0 | **開いているファイルだけ**をズームイン / アウト / 解除 |
+| ⌘ + ホイール(またはピンチ) | ポインタがエディタ本文の上ならファイル単位、それ以外なら画面全体 |
+
+**ズームは二階建てです。**
+「画面全体」は VS Code の `window.zoomLevel` と同じで、サイドバー・タブ・メニュー・
+**ターミナル**まで含めた UI 全部が一緒に拡大縮小し、倍率は `~/.zaivern/state.toml` に
+記憶されます(50%〜300%、13 段)。「ファイル単位」はそのタブの本文(と Markdown
+プレビュー)だけに掛かる一時的な倍率で、タブを閉じれば消えます。
+等倍から外れている間だけステータスバーに `🔍 125%` / `🔎 150%` が出て、
+**押すとその場で解除**できます。表示メニューとコマンドパレットからも同じ操作ができます。
 
 ### エージェント端末 (macOS)
 
@@ -664,7 +727,7 @@ cargo clippy --all-targets --locked -- -D warnings   # + 凍結した債務の -
 
 Windows / Linux では ⌘ を Ctrl に読み替えてください。ターミナル内では Ctrl+C 等の制御キー、矢印、Tab、Esc がそのまま PTY へ送られます(Shift/Option+Enter は改行として送信され、Claude Code の複数行入力に対応)。
 
-`config.toml` の `[keybindings]` で全ショートカットを上書きできます(`save = "cmd+s"` 形式)。action 名: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `global_replace` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_deck` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `toggle_fold` `unfold_all` `toggle_bookmark` `reopen_closed_tab` `lsp_completion` `lsp_references` `lsp_symbols` `lsp_rename` `lsp_format` `lsp_code_action` `lsp_signature_help` `select_next_occurrence` `split_editor_right` `split_editor_down` `focus_pane_1` `focus_pane_2` `focus_pane_3` `diff_next_change` `diff_prev_change`。修飾キー: `cmd` `ctrl` `shift` `alt`(=`option`)。ファイルツリーのキーは VS Code 既定に固定です。
+`config.toml` の `[keybindings]` で全ショートカットを上書きできます(`save = "cmd+s"` 形式)。action 名: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `global_replace` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_deck` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `zoom_in` `zoom_out` `zoom_reset` `file_zoom_in` `file_zoom_out` `file_zoom_reset` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `toggle_fold` `unfold_all` `toggle_bookmark` `reopen_closed_tab` `lsp_completion` `lsp_references` `lsp_symbols` `lsp_rename` `lsp_format` `lsp_code_action` `lsp_signature_help` `select_next_occurrence` `split_editor_right` `split_editor_down` `focus_pane_1` `focus_pane_2` `focus_pane_3` `diff_next_change` `diff_prev_change`。修飾キー: `cmd` `ctrl` `shift` `alt`(=`option`)。ファイルツリーのキーは VS Code 既定に固定です。
 
 **画面に出る打鍵表記は、この表から生成されます。** メニュー・右クリック・パレット・ツールチップに並ぶ「⌘S」の類は文字列を手書きしていないので、`[keybindings]` で割り当てを変えると**表示のほうも一緒に変わります**——設定を変えたのに画面が古い打鍵を主張する、ということは起こりません。全アクションは「押したら本当に消費される場所へ繋がっているか」をテストで固定してあり、**画面に出ているのに効かないショートカットは CI で落ちます**。macOS が OS 側で握っている打鍵(⌘Space・⌃Space・⌥⌘D など)の表も実測で持っていて、既定バインドがそこへ入らないことも同じテストで確かめています。egui-winit 0.29 が **⌘⇧C / ⌘⇧V の押下イベントごと Copy / Paste にすり替えてしまう**問題も、すり替え後のイベントから元の打鍵を復元する互換経路で回避してあります(Cockpit の ⌘⇧C はこの経路を通っています)。
 
@@ -675,7 +738,9 @@ Windows / Linux では ⌘ を Ctrl に読み替えてください。ターミ�
 初回起動時に自動生成されます。編集後はコマンドパレットの **「設定を再読み込み」** で即反映(パレットから **「設定 config.toml を開く」** で直接編集も可能)。
 
 ```toml
-# テーマ: "zaivern-dark" | "zaivern-midnight" | "zaivern-light"
+# テーマ (ダーク): "zaivern-dark" "zaivern-midnight" "zaivern-nordic"
+#                 "zaivern-ember" "zaivern-forest" "zaivern-ocean" "zaivern-carbon"
+# テーマ (ライト): "zaivern-light" "zaivern-paper" "zaivern-daylight" "zaivern-frost"
 # または VS Code 互換テーマJSONへのフルパス
 theme = "zaivern-dark"
 editor_font_size = 15.0
@@ -804,7 +869,7 @@ command = ""          # 空文字はログインシェル
 src/
 ├── main.rs          エントリポイント(eframe ブートストラップ)
 ├── app.rs           アプリ状態・レイアウト・ショートカット・パレット統合
-├── theme.rs         3テーマ(Dark / Midnight / Light)と egui スタイル適用
+├── theme.rs         11テーマ(ダーク7 / ライト4)と egui スタイル適用
 ├── theme_json.rs    カラーテーマ JSON(VS Code 互換形式)の取り込み
 ├── config.rs        ~/.zaivern/config.toml の読み込み・自動生成・プロジェクト上書き
 ├── editor.rs        バッファ・タブ管理

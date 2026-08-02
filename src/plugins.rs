@@ -43,7 +43,11 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 /// このビルドが解釈できるマニフェスト API 世代の上限。
-pub const API_VERSION: u32 = 2;
+///
+/// * 1 … コマンド / テーマ / スニペット
+/// * 2 … パネル / フック / 設定 / UI 言語パック
+/// * 3 … `[[syntax]]` (構文ハイライト定義。`grammar.rs` が読む)
+pub const API_VERSION: u32 = 3;
 
 /// `interval` 系の最小間隔 (秒)。
 pub const MIN_INTERVAL_SECS: u64 = 5;
@@ -368,6 +372,9 @@ pub struct Plugin {
     pub setting_values: HashMap<String, String>,
     pub themes: Vec<(String, PathBuf)>, // (label, json path)
     pub snippet_files: Vec<(String, PathBuf)>, // (language, path)
+    /// 構文ハイライト定義 (`[[syntax]]`) のパス。ファイルまたはディレクトリ。
+    /// 有効なプラグインのものだけが `Highlighter` へ読み込まれる。
+    pub syntax_files: Vec<PathBuf>,
     /// UI 言語パック (`[language]`)。有効なプラグインのものが i18n へ入る。
     pub language: Option<PluginLanguage>,
     /// 初回インストール時に有効で始めるか (マニフェストの `default_enabled`)。
@@ -523,6 +530,8 @@ struct RawManifest {
     themes: Vec<RawTheme>,
     #[serde(default, rename = "snippet")]
     snippets: Vec<RawSnippet>,
+    #[serde(default, rename = "syntax")]
+    syntaxes: Vec<RawSyntaxRef>,
     #[serde(default)]
     language: Option<RawLanguage>,
 }
@@ -643,6 +652,13 @@ struct RawSnippet {
     path: String,
 }
 
+/// `[[syntax]]` — 構文ハイライト定義 (TOML) の置き場。
+/// `path` はファイルでもディレクトリでもよい (ディレクトリなら中の `*.toml`)。
+#[derive(Deserialize)]
+struct RawSyntaxRef {
+    path: String,
+}
+
 /// プラグイン名として妥当か (小文字英数と - _ のみ、1〜64 文字)。
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -694,6 +710,7 @@ fn scan_root(root: &Path) -> Vec<Plugin> {
                 settings: Vec::new(),
                 setting_values: HashMap::new(),
                 themes: Vec::new(),
+                syntax_files: Vec::new(),
                 snippet_files: Vec::new(),
                 language: None,
                 default_enabled: true,
@@ -766,6 +783,13 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
         })
         .collect();
 
+    let syntax_files: Vec<PathBuf> = m
+        .syntaxes
+        .into_iter()
+        .filter(|s| !s.path.trim().is_empty())
+        .map(|s| resolve_rel(dir, &s.path))
+        .collect();
+
     let language = match m.language {
         None => None,
         Some(l) => {
@@ -802,6 +826,7 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
         setting_values: HashMap::new(),
         themes,
         snippet_files,
+        syntax_files,
         language,
         default_enabled: m.plugin.default_enabled.unwrap_or(true),
         enabled: true,
@@ -1581,6 +1606,39 @@ const BUNDLED: &[(&str, &[(&str, &str)])] = &[
             (
                 "worktree.sh",
                 include_str!("../assets/plugins/remote-host/worktree.sh"),
+            ),
+        ],
+    ),
+    (
+        "syntax-pack",
+        &[
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/syntax-pack/plugin.toml"),
+            ),
+            (
+                "syntaxes/10-web.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/10-web.toml"),
+            ),
+            (
+                "syntaxes/20-systems.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/20-systems.toml"),
+            ),
+            (
+                "syntaxes/30-apps.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/30-apps.toml"),
+            ),
+            (
+                "syntaxes/40-functional.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/40-functional.toml"),
+            ),
+            (
+                "syntaxes/50-config.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/50-config.toml"),
+            ),
+            (
+                "syntaxes/60-shell.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/60-shell.toml"),
             ),
         ],
     ),
@@ -3158,7 +3216,8 @@ run = "c"
         assert_eq!(get("ZV_LANG"), "rust");
         assert_eq!(get("ZV_WORKSPACE"), "/ws");
         assert_eq!(get("ZV_PLUGIN_DIR"), a.dir.display().to_string());
-        assert_eq!(get("ZV_API"), "2");
+        // API 世代はビルドの対応上限をそのまま渡す (世代を上げても直さなくてよい)
+        assert_eq!(get("ZV_API"), API_VERSION.to_string());
         assert!(!get("ZV_BIN").is_empty());
         // Windows は \ 区切りで返るので / に寄せてから比較する
         assert!(get("ZV_PLUGIN_DATA")
@@ -3246,11 +3305,75 @@ run = "c"
                 }
             }
         }
+        // ディレクトリごと載っていないプラグインも検出する
+        // (ファイル単位の照合だけだと、新しいプラグインを丸ごと忘れても気づけない)
+        if let Ok(rd) = std::fs::read_dir(&assets) {
+            for ent in rd.flatten() {
+                if !ent.path().is_dir() {
+                    continue;
+                }
+                let name = ent.file_name().to_string_lossy().to_string();
+                if !BUNDLED.iter().any(|(n, _)| *n == name) {
+                    missing.push(format!("{name}/ (プラグインごと未登録)"));
+                }
+            }
+        }
+        // ディレクトリごと載っていないプラグインも検出する
+        // (ファイル単位の照合だけだと、新しいプラグインを丸ごと忘れても気づけない)
+        if let Ok(rd) = std::fs::read_dir(&assets) {
+            for ent in rd.flatten() {
+                if !ent.path().is_dir() {
+                    continue;
+                }
+                let name = ent.file_name().to_string_lossy().to_string();
+                if !BUNDLED.iter().any(|(n, _)| *n == name) {
+                    missing.push(format!("{name}/ (プラグインごと未登録)"));
+                }
+            }
+        }
         missing.sort();
         assert!(
             missing.is_empty(),
             "assets にあるのに BUNDLED へ載っていない (出荷されない) ファイル: {missing:?}"
         );
+    }
+
+    /// 「起動 → 展開 → 読み込み」の一本道を通す。
+    /// 同梱パックはここまで通って初めて **利用者の画面で色が付く**ので、
+    /// マニフェストと構文定義の両方が本物であることを一度に確かめる。
+    #[test]
+    fn 同梱シンタックスパックは展開後にそのまま読める() {
+        let root = temp_dir("syntax-pack");
+        let seeded = seed_bundled_from(&root, BUNDLED);
+        assert!(
+            seeded.iter().any(|n| n == "syntax-pack"),
+            "syntax-pack が展開されない: {seeded:?}"
+        );
+
+        let p = parse_manifest(&root.join("syntax-pack")).expect("マニフェストが読める");
+        assert_eq!(p.api, 3, "構文定義は API 3");
+        assert!(p.default_enabled, "既定で有効でなければ色が付かない");
+        assert_eq!(
+            p.syntax_files.len(),
+            1,
+            "[[syntax]] は 1 本 (ディレクトリ指定)"
+        );
+        assert!(p.syntax_files[0].is_dir(), "syntaxes/ が展開されていない");
+
+        let mut errs = Vec::new();
+        let set = crate::grammar::GrammarSet::load_path(&p.syntax_files[0], &mut errs);
+        assert!(errs.is_empty(), "展開後の構文定義が読めない: {errs:?}");
+        assert!(
+            set.grammars.len() >= 50,
+            "言語数が足りない: {}",
+            set.grammars.len()
+        );
+        assert_eq!(
+            set.detect_path(Path::new("a.ts")).as_deref(),
+            Some("TypeScript")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

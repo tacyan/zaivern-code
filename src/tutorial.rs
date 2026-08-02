@@ -555,7 +555,7 @@ pub const STEPS: &[Step] = &[
         chapter: Chapter::Finish,
         anchor: Some(AnchorId::ThemeMenu),
         title: "テーマとキーバインド",
-        body: "テーマは 3 種内蔵 + VS Code 互換テーマ JSON をそのまま読み込めます。\nショートカットは config.toml の [keybindings] で全部差し替えられます。",
+        body: "テーマはダーク 7・ライト 4 を内蔵 + VS Code 互換テーマ JSON をそのまま読み込めます。\nショートカットは config.toml の [keybindings] で全部差し替えられます。",
         hint: None,
         keys: &[],
         pre_action: None,

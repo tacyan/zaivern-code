@@ -1,0 +1,173 @@
+# Web / フロントエンド。
+#
+# syntect の既定セットには JavaScript しか無く、TypeScript・SCSS・GraphQL は
+# 丸ごと欠けている。ここで足す。
+# `.tsx` `.vue` `.mjs` のような「既にある定義で足りるもの」は [[alias]] で回す
+# (定義を二重に持たない)。
+
+[[syntax]]
+name = "TypeScript"
+extensions = ["ts", "mts", "cts"]
+tokens = ["typescript", "ts"]
+line_comment = ["//"]
+doc_block = [["/**", "*/"]]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+multiline_strings = [["`", "`"]]
+ident_extra = "$"
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "abstract", "accessor", "as", "asserts", "async", "await", "break", "case", "catch",
+  "class", "const", "constructor", "continue", "debugger", "declare", "default", "delete",
+  "do", "else", "enum", "export", "extends", "finally", "for", "from", "function", "get",
+  "if", "implements", "import", "in", "infer", "instanceof", "interface", "is", "keyof",
+  "let", "namespace", "new", "of", "out", "override", "package", "private", "protected",
+  "public", "readonly", "return", "satisfies", "set", "static", "super", "switch", "this",
+  "throw", "try", "type", "typeof", "using", "var", "void", "while", "with", "yield",
+]
+types = [
+  "any", "bigint", "boolean", "never", "number", "object", "string", "symbol", "unknown",
+  "Array", "Awaited", "BigInt", "Boolean", "Date", "Error", "Function", "Map", "Number",
+  "Object", "Omit", "Partial", "Pick", "Promise", "Readonly", "Record", "RegExp", "Required",
+  "Set", "String", "Symbol", "Uint8Array", "WeakMap", "WeakSet",
+]
+constants = ["true", "false", "null", "undefined", "NaN", "Infinity", "globalThis"]
+builtins = [
+  "console", "document", "window", "process", "globalThis", "JSON", "Math", "fetch",
+  "require", "module", "exports", "setTimeout", "setInterval", "clearTimeout",
+  "clearInterval", "queueMicrotask", "structuredClone", "localStorage", "sessionStorage",
+]
+
+[[syntax]]
+name = "SCSS"
+extensions = ["scss"]
+tokens = ["scss"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+ident_extra = "-$"
+attribute = "@"
+fold = "brackets"
+keywords = ["from", "through", "to", "in", "and", "or", "not", "if", "else"]
+constants = ["true", "false", "null", "important", "inherit", "initial", "unset", "auto", "none"]
+builtins = [
+  "rgb", "rgba", "hsl", "hsla", "calc", "var", "url", "clamp", "min", "max", "attr",
+  "lighten", "darken", "saturate", "desaturate", "mix", "map-get", "map-merge", "nth",
+  "length", "percentage", "translate", "rotate", "scale",
+]
+
+[[syntax]]
+name = "Sass"
+extensions = ["sass"]
+tokens = ["sass"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+ident_extra = "-$"
+attribute = "@"
+fold = "indent"
+keywords = ["from", "through", "to", "in", "and", "or", "not", "if", "else"]
+constants = ["true", "false", "null", "important", "inherit", "initial", "unset", "auto", "none"]
+builtins = ["rgb", "rgba", "hsl", "hsla", "calc", "var", "url", "lighten", "darken", "mix", "nth"]
+
+[[syntax]]
+name = "Less"
+extensions = ["less"]
+tokens = ["less"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+ident_extra = "-@"
+attribute = "@"
+fold = "brackets"
+keywords = ["when", "and", "not", "or", "if", "else"]
+constants = ["true", "false", "important", "inherit", "initial", "unset", "auto", "none"]
+builtins = ["rgb", "rgba", "hsl", "hsla", "calc", "var", "url", "fade", "lighten", "darken", "mix"]
+
+[[syntax]]
+name = "Stylus"
+extensions = ["styl", "stylus"]
+tokens = ["stylus"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+ident_extra = "-$"
+attribute = "@"
+fold = "indent"
+keywords = ["if", "else", "unless", "for", "in", "return", "and", "or", "not"]
+constants = ["true", "false", "null", "important", "inherit", "auto", "none"]
+builtins = ["rgb", "rgba", "hsl", "hsla", "calc", "url", "lighten", "darken", "mix"]
+
+[[syntax]]
+name = "GraphQL"
+extensions = ["graphql", "gql", "graphqls"]
+tokens = ["graphql", "gql"]
+line_comment = ["#"]
+strings = ["\""]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "query", "mutation", "subscription", "fragment", "on", "type", "input", "enum",
+  "interface", "union", "scalar", "schema", "extend", "implements", "directive",
+  "repeatable", "extends",
+]
+types = ["Int", "Float", "String", "Boolean", "ID"]
+constants = ["true", "false", "null"]
+
+[[syntax]]
+name = "WebAssembly"
+extensions = ["wat", "wast"]
+tokens = ["wasm", "wat"]
+line_comment = [";;"]
+block_comment = [["(;", ";)"]]
+strings = ["\""]
+ident_extra = "$.-"
+fold = "brackets"
+keywords = [
+  "module", "func", "param", "result", "local", "global", "table", "memory", "elem",
+  "data", "start", "import", "export", "type", "block", "loop", "if", "else", "end",
+  "br", "br_if", "br_table", "return", "call", "call_indirect", "drop", "select",
+  "unreachable", "nop", "mut",
+]
+types = ["i32", "i64", "f32", "f64", "v128", "funcref", "externref"]
+
+# ── 既存定義への別名 ───────────────────────────────────────────────
+# 中身は既にある構文で十分なもの。定義を増やさずに拡張子だけ通す。
+
+[[alias]]
+target = "TypeScript"
+extensions = ["tsx"]
+tokens = ["tsx", "typescriptreact"]
+
+[[alias]]
+target = "JavaScript"
+extensions = ["mjs", "cjs", "jsx", "es6"]
+tokens = ["jsx", "javascriptreact", "node"]
+first_line = ["#!/usr/bin/env node"]
+
+[[alias]]
+target = "HTML"
+# Vue / Svelte / Astro は「HTML + 埋め込み script/style」なので HTML 構文が
+# そのまま効く (script ブロックの中まで色が付く)。
+extensions = ["vue", "svelte", "astro", "hbs", "handlebars", "mustache", "twig", "jinja", "jinja2", "j2", "njk", "liquid", "ejs", "pug", "jade"]
+tokens = ["vue", "svelte", "astro", "handlebars", "jinja", "liquid"]
+
+[[alias]]
+target = "CSS"
+extensions = ["pcss", "postcss"]
+
+[[alias]]
+target = "JSON"
+extensions = ["json5", "jsonc", "webmanifest", "avsc", "code-workspace"]
+tokens = ["json5", "jsonc"]
+
+[[alias]]
+target = "Markdown"
+extensions = ["mdx", "mkd", "mdwn"]
+tokens = ["mdx"]
+
+[[alias]]
+target = "XML"
+extensions = ["xaml", "plist", "csproj", "vbproj", "props", "targets", "resx", "storyboard", "xib", "wsdl", "xul"]

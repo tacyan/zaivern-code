@@ -11,6 +11,63 @@ use crate::palette::Cmd;
 use crate::textenc::LineEnding;
 use std::path::{Path, PathBuf};
 
+/// 配色テーマ一覧の段。同梱テーマが増えても一覧が読めるように、
+/// 明暗とカスタムを見出しで分ける (並べ替えはしない = `theme::all()` の順のまま)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThemeGroup {
+    Dark,
+    Light,
+    /// ユーザー/プラグイン提供のテーマ JSON (明暗は読み込むまで判らない)
+    Custom,
+}
+
+impl ThemeGroup {
+    /// 段の見出し (翻訳前の原文)。
+    fn heading(self) -> &'static str {
+        match self {
+            ThemeGroup::Dark => "ダーク",
+            ThemeGroup::Light => "ライト",
+            ThemeGroup::Custom => "カスタム (テーマJSON)",
+        }
+    }
+}
+
+/// メニューに 1 行として出る配色テーマ。
+#[derive(Clone)]
+pub struct ThemeEntry {
+    /// `Cmd::SetTheme` にそのまま渡す値 (同梱テーマ名、またはテーマ JSON のパス)
+    pub name: String,
+    pub label: String,
+    pub selected: bool,
+    pub group: ThemeGroup,
+}
+
+/// 配色テーマの選択メニュー本体。トップバーの 🎨 と
+/// メニューバーの「表示 > 配色テーマ」で **同じ実装**を使う
+/// (2 か所で別々に描くと、片方だけ段組みが崩れる)。
+pub fn theme_menu_ui(ui: &mut egui::Ui, themes: &[ThemeEntry], cmds: &mut Vec<Cmd>) {
+    ui.set_min_width(240.0);
+    egui::ScrollArea::vertical()
+        .id_salt("zv-theme-menu")
+        .max_height(420.0)
+        .show(ui, |ui| {
+            let mut shown: Option<ThemeGroup> = None;
+            for t in themes {
+                if shown != Some(t.group) {
+                    if shown.is_some() {
+                        ui.separator();
+                    }
+                    heading(ui, &tr(t.group.heading()));
+                    shown = Some(t.group);
+                }
+                if ui.selectable_label(t.selected, &t.label).clicked() {
+                    cmds.push(Cmd::SetTheme(t.name.clone()));
+                    ui.close_menu();
+                }
+            }
+        });
+}
+
 /// メニューの表示状態スナップショット。描画のためだけの読み取り専用情報。
 pub struct MenuInfo {
     pub sidebar_open: bool,
@@ -47,10 +104,14 @@ pub struct MenuInfo {
     pub plugin_commands: Vec<(usize, usize, String, String)>,
     /// (プリセット index, アイコン, 名前)
     pub agent_presets: Vec<(usize, String, String)>,
-    /// (テーマ name, ラベル, 選択中か)。カスタムテーマも同じ形で混ぜる
-    pub themes: Vec<(String, String, bool)>,
+    /// 配色テーマの一覧 (同梱 + カスタム)。`ThemeEntry::group` で段に分かれる
+    pub themes: Vec<ThemeEntry>,
     /// アクティブなタブの改行コード表示 (例 "CRLF")。タブが無ければ None
     pub line_ending: Option<String>,
+    /// 画面全体のズーム倍率 (1.0 = 等倍)。表示メニューの「戻す」の有効/無効に使う
+    pub ui_zoom: f32,
+    /// アクティブなタブのズーム倍率。タブが無ければ None (ファイル単位の項目を落とす)
+    pub file_zoom: Option<f32>,
     /// 保存時に行末の空白を落とす (編集メニューのチェック状態)
     pub trim_trailing_on_save: bool,
     /// 保存時に最終行へ改行を入れる (同上)
@@ -468,30 +529,65 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             }
             ui.separator();
             ui.menu_button(tr("配色テーマ"), |ui| {
-                ui.set_min_width(260.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("menubar-themes")
-                    .max_height(380.0)
-                    .show(ui, |ui| {
-                        for (name, label, selected) in &info.themes {
-                            if ui.selectable_label(*selected, label).clicked() {
-                                cmds.push(Cmd::SetTheme(name.clone()));
-                                ui.close_menu();
-                            }
-                        }
-                    });
+                theme_menu_ui(ui, &info.themes, cmds);
             });
             ui.separator();
-            if item(ui, &tr("ズームイン"), &sc(keys, BindAction::FontInc), true) {
-                cmds.push(Cmd::FontInc);
+            // ズームは二階建て。「画面全体」を先に置き、「このファイルだけ」を
+            // その下に置くことで、対象の広い順に読める並びにする。
+            if item(ui, &tr("ズームイン"), &sc(keys, BindAction::ZoomIn), true) {
+                cmds.push(Cmd::ZoomIn);
             }
             if item(
                 ui,
                 &tr("ズームアウト"),
-                &sc(keys, BindAction::FontDec),
+                &sc(keys, BindAction::ZoomOut),
                 true,
             ) {
-                cmds.push(Cmd::FontDec);
+                cmds.push(Cmd::ZoomOut);
+            }
+            // 等倍のときは「戻す」を押せなくする (押しても何も起きない項目を
+            // 生かしておくと、効かないのか壊れているのか区別が付かない)。
+            if item(
+                ui,
+                &trf(
+                    "ズームを戻す ({pct})",
+                    &[("pct", crate::zoom::label(info.ui_zoom))],
+                ),
+                &sc(keys, BindAction::ZoomReset),
+                !crate::zoom::is_default(info.ui_zoom),
+            ) {
+                cmds.push(Cmd::ZoomReset);
+            }
+            ui.separator();
+            // ファイル単位のズームはタブが開いているときだけ意味を持つ。
+            let has_file = info.file_zoom.is_some();
+            if item(
+                ui,
+                &tr("このファイルだけズームイン"),
+                &sc(keys, BindAction::FileZoomIn),
+                has_file,
+            ) {
+                cmds.push(Cmd::FileZoomIn);
+            }
+            if item(
+                ui,
+                &tr("このファイルだけズームアウト"),
+                &sc(keys, BindAction::FileZoomOut),
+                has_file,
+            ) {
+                cmds.push(Cmd::FileZoomOut);
+            }
+            let file_z = info.file_zoom.unwrap_or(crate::zoom::DEFAULT);
+            if item(
+                ui,
+                &trf(
+                    "このファイルのズームを解除 ({pct})",
+                    &[("pct", crate::zoom::label(file_z))],
+                ),
+                &sc(keys, BindAction::FileZoomReset),
+                has_file && !crate::zoom::is_default(file_z),
+            ) {
+                cmds.push(Cmd::FileZoomReset);
             }
         });
         ui.separator();

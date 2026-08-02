@@ -977,6 +977,22 @@ pub fn detect_stall(samples: &[Sample], cfg: &SupervisorConfig, now_ms: u64) -> 
 /// 静止画面 (スピナーだけ) を誤検出しないため、連続する同一ハッシュは 1 つに潰す。
 /// つまり `A,A,A` は 1 回、`A,B,A,B,A` は A が 3 回。
 /// 「似た行を大量に出す」正常系 (cargo build 等) は各行が別ハッシュになるので出現 1 回止まり。
+///
+/// ## 「入力欄へ戻ってくる」を数えない (偽陽性の本命)
+///
+/// CLI エージェントの画面は**末尾がほぼ常に入力欄**で、仕事をするたびに
+/// 「作業の出力 → 入力欄 → 次の作業の出力 → 入力欄 …」と往復する。
+/// 出現回数だけを見ると、窓の中で 3 回仕事をした**正常なエージェント全員**が
+/// ループになる (実際に看板の全カードが「停滞・異常: ループ」へ入った)。
+///
+/// 本物のループは「同じ**周回**を回っている」= 窓の大半が再訪で埋まる。
+/// 休憩画面へ戻るだけの往復は、あいだの作業ブロックが毎回別物なので再訪が少ない。
+/// そこで出現回数に加えて**再訪が過半を占めること**を求める:
+///
+/// | ブロック列 | 長さ | 相異 | 再訪 | 判定 |
+/// |---|---|---|---|---|
+/// | `A,B,A,B,A` (本物のループ) | 5 | 2 | 3 | 3×2 ≥ 5 → ループ |
+/// | `P,W1,P,W2,P` (入力欄へ戻るだけ) | 5 | 3 | 2 | 2×2 < 5 → ループではない |
 pub fn detect_loop(samples: &[Sample], cfg: &SupervisorConfig, now_ms: u64) -> Option<String> {
     if !cfg.detect_loop {
         return None;
@@ -999,15 +1015,19 @@ pub fn detect_loop(samples: &[Sample], cfg: &SupervisorConfig, now_ms: u64) -> O
         *counts.entry(*h).or_insert(0) += 1;
     }
     let max = counts.values().copied().max().unwrap_or(0);
-    if max >= cfg.loop_repeats.max(2) {
-        Some(format!(
-            "同じ出力が {} 分以内に {} 回繰り返されています",
-            cfg.loop_window_secs / 60,
-            max
-        ))
-    } else {
-        None
+    if max < cfg.loop_repeats.max(2) {
+        return None;
     }
+    // 再訪 = 「初めて見るのではないブロック」の数。周回していれば過半を占める。
+    let revisits = seq.len().saturating_sub(counts.len());
+    if revisits * 2 < seq.len() {
+        return None;
+    }
+    Some(format!(
+        "同じ出力が {} 分以内に {} 回繰り返されています",
+        cfg.loop_window_secs / 60,
+        max
+    ))
 }
 
 /// **エラー嵐**: 新規エラー行の発生率がしきい値を超え、かつ
@@ -2149,6 +2169,63 @@ mod tests {
             detect_loop(&s, &c, 80_000).is_none(),
             "似た行の大量出力をループ扱いしてはいけない"
         );
+    }
+
+    /// **偽陽性の本命**: 仕事のたびに入力欄へ戻ってくるのはループではない。
+    ///
+    /// CLI エージェントの画面末尾はほぼ常に入力欄なので、
+    /// 「作業 → 入力欄 → 別の作業 → 入力欄 …」を繰り返す。出現回数だけを数えると
+    /// 正常に働いているエージェントが全員「停滞・異常: ループ」へ入る
+    /// (オーナー報告のバグ: 稼働中 6 体すべてが異常レーンに並んだ)。
+    #[test]
+    fn 入力欄へ戻る往復はループではない() {
+        let c = cfg();
+        // 入力欄 (休憩画面) — 末尾 loop_block_lines 行がここで毎回同じになる
+        let prompt = "\
+> \n\
+  auto mode on (shift+tab to cycle)\n\
+  ? for shortcuts\n\
+  ─────────────";
+        // 毎回中身の違う作業画面 (数字は normalize_line が潰すので語で変える)
+        const JOBS: [&str; 8] = [
+            "parser", "lexer", "render", "theme", "keymap", "search", "export", "config",
+        ];
+        let work: Vec<String> = JOBS
+            .iter()
+            .map(|j| {
+                format!(
+                    "> fix the {j}\n\
+                     Read(src/{j}.rs)\n\
+                     Edit(src/{j}.rs)\n\
+                     Bash(cargo test {j})\n\
+                     test {j} ... ok"
+                )
+            })
+            .collect();
+        let mut screens: Vec<(u64, &str)> = Vec::new();
+        for (i, w) in work.iter().enumerate() {
+            let t = i as u64 * 30_000;
+            screens.push((t, w.as_str()));
+            screens.push((t + 15_000, prompt));
+        }
+        let s = samples_from(&screens, &c, false);
+        assert!(
+            detect_loop(&s, &c, 250_000).is_none(),
+            "入力欄への復帰をループ扱いしてはいけない"
+        );
+    }
+
+    /// 上のガードを入れても、**本物の周回**は落ちない (対になる真陽性テスト)。
+    #[test]
+    fn 周回している出力はループのまま検出する() {
+        let c = cfg();
+        let a = "$ cargo build\nerror: linker failed\nretrying...";
+        let b = "$ cargo build\nlinking...\n";
+        let screens: Vec<(u64, &str)> = (0..12u64)
+            .map(|i| (i * 10_000, if i % 2 == 0 { a } else { b }))
+            .collect();
+        let s = samples_from(&screens, &c, false);
+        assert!(detect_loop(&s, &c, 115_000).is_some());
     }
 
     // ---------------- エラー嵐 ----------------

@@ -2,9 +2,11 @@ use std::path::Path;
 
 use eframe::egui::{text::LayoutJob, Color32, FontId, TextFormat};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::highlighting::{FontStyle, Highlighter as SynHighlighter, ThemeSet};
+use syntect::parsing::{Scope, SyntaxSet};
 use syntect::util::LinesWithEndings;
+
+use crate::grammar::{self, FoldKindSpec, Grammar, GrammarSet, ScanState, Span, Tok};
 
 /// Files larger than this are laid out without highlighting to stay snappy.
 const MAX_HIGHLIGHT_BYTES: usize = 400_000;
@@ -15,7 +17,7 @@ const MAX_HIGHLIGHT_LINE_BYTES: usize = 8_192;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// プロセスで 1 つだけの [`Highlighter`]。
 ///
@@ -31,6 +33,16 @@ pub fn shared() -> &'static Highlighter {
 pub struct Highlighter {
     ps: SyntaxSet,
     ts: ThemeSet,
+    /// プラグインが持ち込んだ軽量シンタックス定義 (`[[syntax]]`)。
+    /// syntect が知らない言語 (TypeScript / Kotlin / Zig …) はこちらで塗る。
+    ///
+    /// [`shared`] はプロセスで 1 つの `&'static` なので、プラグインの
+    /// 有効/無効が切り替わったときに差し替えられるよう内部可変にしてある。
+    /// 読み側は `Arc` を 1 回複製するだけで、ロックを跨いで持ち歩かない。
+    packs: RwLock<Arc<GrammarSet>>,
+    /// テーマ名 → トークン種類ごとの色。テーマは滅多に変わらないので
+    /// 一度作ったら使い回す (毎行スコープ解決をやり直さないため)。
+    palettes: Mutex<HashMap<String, Arc<Palette>>>,
     /// key → LayoutJob と、その挿入順。キーは本文全体のハッシュを含むため
     /// 1 打鍵ごとに新しいエントリが増える。上限到達で全消しすると次の
     /// フレームに全再ハイライトのスパイクが出るので、古い方から 1 件ずつ
@@ -40,11 +52,22 @@ pub struct Highlighter {
 
 const HL_CACHE_CAP: usize = 32;
 
+/// トークン種類ごとの見た目。syntect のテーマスコープから引くので、
+/// 追加言語の配色も**カラーテーマを変えれば一緒に変わる**。
+#[derive(Clone, Debug)]
+struct Palette {
+    fg: [Color32; Tok::COUNT],
+    italic: [bool; Tok::COUNT],
+    underline: [bool; Tok::COUNT],
+}
+
 impl Highlighter {
     pub fn new() -> Self {
         Self {
             ps: SyntaxSet::load_defaults_newlines(),
             ts: ThemeSet::load_defaults(),
+            packs: RwLock::new(Arc::new(GrammarSet::default())),
+            palettes: Mutex::new(HashMap::new()),
             cache: Mutex::new((
                 HashMap::with_capacity(HL_CACHE_CAP),
                 std::collections::VecDeque::with_capacity(HL_CACHE_CAP),
@@ -52,8 +75,45 @@ impl Highlighter {
         }
     }
 
+    /// いま読み込んでいる言語定義 (`Arc` の複製を返すので、呼び出し側は
+    /// ロックを握ったまま走査しない)。
+    fn packs(&self) -> Arc<GrammarSet> {
+        match self.packs.read() {
+            Ok(g) => g.clone(),
+            // 毒されたロックでも「追加言語が無い」状態で描画は続ける。
+            Err(e) => e.into_inner().clone(),
+        }
+    }
+
+    /// プラグイン由来の言語定義を差し替える。折りたたみ用の [`LangSpec`] も
+    /// ここで登録するので、以後 `lang_spec()` が追加言語を知っている状態になる。
+    pub fn set_grammars(&self, packs: GrammarSet) {
+        register_lang_specs(&packs);
+        match self.packs.write() {
+            Ok(mut g) => *g = Arc::new(packs),
+            Err(e) => *e.into_inner() = Arc::new(packs),
+        }
+        // 既存のキャッシュは「その言語を知らなかった頃」の結果なので捨てる。
+        if let Ok(mut g) = self.cache.lock() {
+            g.0.clear();
+            g.1.clear();
+        }
+    }
+
+    /// 追加で認識できる言語の数 (プラグイン画面の表示用)。
+    pub fn extra_lang_count(&self) -> usize {
+        self.packs().grammars.len()
+    }
+
     pub fn lang_for(&self, path: Option<&Path>, text: &str) -> String {
+        // プラグインのパックを先に見る。syntect が知らない言語を足すのが
+        // 主目的だが、`.sass` → Ruby Haml のような既定の取り違えを
+        // 利用者が上書きできる余地もここで確保する。
+        let packs = self.packs();
         if let Some(p) = path {
+            if let Some(name) = packs.detect_path(p) {
+                return name;
+            }
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 if let Some(s) = self.ps.find_syntax_by_extension(ext) {
                     return s.name.clone();
@@ -66,6 +126,9 @@ impl Highlighter {
             }
         }
         if let Some(line) = text.lines().next() {
+            if let Some(name) = packs.detect_first_line(line) {
+                return name;
+            }
             if let Some(s) = self.ps.find_syntax_by_first_line(line) {
                 return s.name.clone();
             }
@@ -73,15 +136,51 @@ impl Highlighter {
         "Plain Text".into()
     }
 
-    /// フェンスコードの言語トークン ("rust", "py" など) から syntect の言語名を引く。
+    /// フェンスコードの言語トークン ("rust", "py" など) から言語名を引く。
     pub fn lang_for_fence(&self, token: &str) -> String {
         if token.is_empty() {
             return "Plain Text".into();
+        }
+        if let Some(name) = self.packs().detect_token(token) {
+            return name;
         }
         self.ps
             .find_syntax_by_token(token)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "Plain Text".into())
+    }
+
+    /// テーマ名からパレットを作る (作成済みなら使い回す)。
+    fn palette(&self, theme_name: &str) -> Option<Arc<Palette>> {
+        if let Ok(g) = self.palettes.lock() {
+            if let Some(p) = g.get(theme_name) {
+                return Some(p.clone());
+            }
+        }
+        let theme = self.ts.themes.get(theme_name)?;
+        let sh = SynHighlighter::new(theme);
+        let default = sh.get_default();
+        let mut pal = Palette {
+            fg: [Color32::WHITE; Tok::COUNT],
+            italic: [false; Tok::COUNT],
+            underline: [false; Tok::COUNT],
+        };
+        for i in 0..Tok::COUNT {
+            let tok = Tok::from_index(i);
+            let style = Scope::new(tok.scope())
+                .ok()
+                .map(|s| sh.style_for_stack(&[s]))
+                .unwrap_or(default);
+            pal.fg[i] =
+                Color32::from_rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+            pal.italic[i] = style.font_style.contains(FontStyle::ITALIC);
+            pal.underline[i] = style.font_style.contains(FontStyle::UNDERLINE);
+        }
+        let arc = Arc::new(pal);
+        if let Ok(mut g) = self.palettes.lock() {
+            g.insert(theme_name.to_string(), arc.clone());
+        }
+        Some(arc)
     }
 
     pub fn layout_job(
@@ -122,16 +221,29 @@ impl Highlighter {
         let mut job = LayoutJob::default();
         job.wrap.max_width = f32::INFINITY;
 
-        let syntax = self
-            .ps
-            .find_syntax_by_name(lang)
-            .unwrap_or_else(|| self.ps.find_syntax_plain_text());
-
-        if text.len() > MAX_HIGHLIGHT_BYTES || syntax.name == "Plain Text" {
+        if text.len() > MAX_HIGHLIGHT_BYTES {
             plain(&mut job);
             self.cache_put(key, &job);
             return job;
         }
+
+        // syntect が知っている言語はそちらで塗る。知らない言語 (TypeScript /
+        // Kotlin / Zig …) はプラグインのパックへ落とし、そこにも無ければ素の文字。
+        let Some(syntax) = self
+            .ps
+            .find_syntax_by_name(lang)
+            .filter(|s| s.name != "Plain Text")
+        else {
+            let packs = self.packs();
+            match (packs.by_name(lang), self.palette(theme_name)) {
+                (Some(g), Some(pal)) => {
+                    append_grammar(&mut job, text, g, &pal, &font, fallback);
+                }
+                _ => plain(&mut job),
+            }
+            self.cache_put(key, &job);
+            return job;
+        };
 
         let Some(theme) = self.ts.themes.get(theme_name) else {
             plain(&mut job);
@@ -277,6 +389,52 @@ impl Highlighter {
             if map.insert(key, job.clone()).is_none() {
                 order.push_back(key);
             }
+        }
+    }
+}
+
+/// プラグイン定義の言語を 1 文書ぶん塗って `job` へ積む。
+/// 走査は 1 行ごと ([`grammar::scan_line`]) で、行を跨ぐコメント・文字列は
+/// `ScanState` が引き継ぐ。長すぎる 1 行は syntect 経路と同じく素通しにする。
+fn append_grammar(
+    job: &mut LayoutJob,
+    text: &str,
+    g: &Grammar,
+    pal: &Palette,
+    font: &FontId,
+    fallback: Color32,
+) {
+    let mut st = ScanState::default();
+    let mut spans: Vec<Span> = Vec::new();
+    for line in LinesWithEndings::from(text) {
+        if line.len() > MAX_HIGHLIGHT_LINE_BYTES {
+            job.append(
+                line,
+                0.0,
+                TextFormat {
+                    font_id: font.clone(),
+                    color: fallback,
+                    ..Default::default()
+                },
+            );
+            continue;
+        }
+        spans.clear();
+        grammar::scan_line(g, line, &mut st, &mut spans);
+        for s in &spans {
+            let i = s.tok.index();
+            let mut fmt = TextFormat {
+                font_id: font.clone(),
+                color: pal.fg[i],
+                ..Default::default()
+            };
+            if pal.italic[i] {
+                fmt.italics = true;
+            }
+            if pal.underline[i] {
+                fmt.underline = eframe::egui::Stroke::new(1.0_f32, fmt.color);
+            }
+            job.append(&line[s.start..s.end], 0.0, fmt);
         }
     }
 }
@@ -628,12 +786,109 @@ pub static DEFAULT_LANG_SPEC: LangSpec = LangSpec {
     escape: None,
 };
 
-/// syntect の syntax 名から言語仕様を引く。未知の言語は [`DEFAULT_LANG_SPEC`]。
+/// プラグイン定義の言語ぶんの [`LangSpec`]。文法データ ([`Grammar`]) から作り、
+/// **言語名につき 1 回だけ**確保して `&'static` に固定する。プラグインの
+/// 読み直しで何度 `set_grammars` が呼ばれても、同じ名前なら作り直さない。
+static DYNAMIC_SPECS: std::sync::OnceLock<Mutex<HashMap<String, &'static LangSpec>>> =
+    std::sync::OnceLock::new();
+
+fn dynamic_specs() -> &'static Mutex<HashMap<String, &'static LangSpec>> {
+    DYNAMIC_SPECS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn leak_str(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
+}
+
+/// 文法データから折りたたみ用の言語仕様を作る。
+fn spec_from_grammar(g: &Grammar) -> LangSpec {
+    let names: &'static [&'static str] = Box::leak(vec![leak_str(&g.name)].into_boxed_slice());
+    let line_comment: &'static [&'static str] = Box::leak(
+        g.line_comment
+            .iter()
+            .map(|s| leak_str(s))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let block_comment: &'static [(&'static str, &'static str)] = Box::leak(
+        g.block_comment
+            .iter()
+            .chain(g.doc_block.iter())
+            .map(|(a, b)| (leak_str(a), leak_str(b)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    // 折りたたみは「文字列の中の括弧を数えない」ためだけに引用符を見る。
+    // 1 文字の開き記号だけを渡せば足りる。
+    let mut qs: Vec<char> = g
+        .strings
+        .iter()
+        .filter_map(|r| {
+            let mut it = r.open.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        })
+        .collect();
+    qs.sort_unstable();
+    qs.dedup();
+    let quotes: &'static [char] = Box::leak(qs.into_boxed_slice());
+    LangSpec {
+        names,
+        strategy: match g.fold {
+            FoldKindSpec::Brackets => FoldStrategy::Brackets,
+            FoldKindSpec::Indent => FoldStrategy::Indent,
+            FoldKindSpec::Markdown => FoldStrategy::Markdown,
+        },
+        line_comment,
+        block_comment,
+        brackets: BR_CURLY,
+        quotes,
+        escape: g.escape,
+    }
+}
+
+/// プラグインの言語定義を折りたたみ側へ登録する ([`Highlighter::set_grammars`] から)。
+pub fn register_lang_specs(set: &GrammarSet) {
+    let Ok(mut map) = dynamic_specs().lock() else {
+        return;
+    };
+    for g in &set.grammars {
+        let key = g.name.to_lowercase();
+        if map.contains_key(&key) {
+            continue;
+        }
+        let spec: &'static LangSpec = Box::leak(Box::new(spec_from_grammar(g)));
+        map.insert(key, spec);
+    }
+}
+
+/// プラグイン定義の言語の行コメント記号。**組み込みの表は見ない**ので、
+/// 既存言語のコメント切り替えの挙動は変わらない (CSS の `//` のように、
+/// 折りたたみ用には使うがコメント挿入には使いたくない記号があるため)。
+pub fn dynamic_line_comment(lang: &str) -> Option<&'static str> {
+    let map = dynamic_specs().lock().ok()?;
+    let spec = map.get(&lang.to_lowercase())?;
+    spec.line_comment.first().copied()
+}
+
+/// syntax 名から言語仕様を引く。**組み込みの表 → プラグイン定義**の順に見る
+/// (組み込みを先に見るので、既存言語の挙動はプラグインで変わらない)。
+/// どちらにも無ければ [`DEFAULT_LANG_SPEC`]。
 pub fn lang_spec(lang: &str) -> &'static LangSpec {
-    LANG_SPECS
+    if let Some(s) = LANG_SPECS
         .iter()
         .find(|s| s.names.iter().any(|n| n.eq_ignore_ascii_case(lang)))
-        .unwrap_or(&DEFAULT_LANG_SPEC)
+    {
+        return s;
+    }
+    if let Ok(map) = dynamic_specs().lock() {
+        if let Some(s) = map.get(&lang.to_lowercase()) {
+            return s;
+        }
+    }
+    &DEFAULT_LANG_SPEC
 }
 
 /// インデント幅の既定値 (タブ 1 個ぶんの桁数)。UI が設定値を持つなら
@@ -2080,5 +2335,226 @@ int main(int argc)
             vec![(2, "int main(int argc)".to_string())],
             "コメントは貼らず、`{{` の行ではなく宣言行を貼る"
         );
+    }
+}
+
+// ===========================================================================
+// 同梱シンタックスパックとの結合テスト
+//
+// 「プラグインを入れたのに .ts が白いまま」を防ぐ番人。
+// 実際に出荷するデータ (assets/plugins/syntax-pack) を読み、
+// Highlighter 越しに言語判定と着色まで通す。
+// ===========================================================================
+#[cfg(test)]
+mod pack_integration {
+    use super::*;
+
+    /// 同梱パックを積んだ専用インスタンス (`shared()` を汚さない)。
+    fn hl() -> Highlighter {
+        let h = Highlighter::new();
+        h.set_grammars(crate::grammar::bundled_pack::load());
+        h
+    }
+
+    #[test]
+    fn 同梱パックで主要言語が拡張子から解決される() {
+        let h = hl();
+        let cases: &[(&str, &str)] = &[
+            ("a/b/x.ts", "TypeScript"),
+            ("x.tsx", "TypeScript"),
+            ("x.mts", "TypeScript"),
+            ("x.kt", "Kotlin"),
+            ("x.kts", "Kotlin"),
+            ("x.swift", "Swift"),
+            ("x.dart", "Dart"),
+            ("x.zig", "Zig"),
+            ("x.ex", "Elixir"),
+            ("x.jl", "Julia"),
+            ("x.nim", "Nim"),
+            ("x.sol", "Solidity"),
+            ("x.gql", "GraphQL"),
+            ("x.scss", "SCSS"),
+            ("x.less", "Less"),
+            ("x.ps1", "PowerShell"),
+            ("x.proto", "Protocol Buffers"),
+            ("x.nix", "Nix"),
+            ("x.tf", "Terraform"),
+            ("Cargo.toml", "TOML"),
+            ("Dockerfile", "Dockerfile"),
+            ("CMakeLists.txt", "CMake"),
+            (".env", "DotEnv"),
+            (".gitignore", "Ignore List"),
+            ("justfile", "Just"),
+            ("x.vue", "HTML"),
+            ("x.svelte", "HTML"),
+            ("x.mjs", "JavaScript"),
+            ("x.json5", "JSON"),
+            ("x.vhd", "VHDL"),
+            ("x.sv", "Verilog"),
+            ("x.wgsl", "WGSL"),
+            ("x.fs", "F#"),
+            ("x.hx", "Haxe"),
+            ("x.elm", "Elm"),
+            ("x.rkt", "Racket"),
+            ("x.vim", "Vim script"),
+            ("x.awk", "AWK"),
+            ("x.bzl", "Starlark"),
+            ("x.bicep", "Bicep"),
+        ];
+        for (path, want) in cases {
+            let got = h.lang_for(Some(Path::new(path)), "");
+            assert_eq!(&got, want, "{path} の言語判定");
+        }
+    }
+
+    #[test]
+    fn 既存のsyntect言語は影響を受けない() {
+        let h = hl();
+        let cases: &[(&str, &str)] = &[
+            ("x.rs", "Rust"),
+            ("x.py", "Python"),
+            ("x.go", "Go"),
+            ("x.c", "C"),
+            ("x.java", "Java"),
+            ("x.rb", "Ruby"),
+            ("x.php", "PHP"),
+            ("x.html", "HTML"),
+            ("x.css", "CSS"),
+            ("x.json", "JSON"),
+            ("x.md", "Markdown"),
+            ("x.yaml", "YAML"),
+            ("x.sql", "SQL"),
+            ("x.js", "JavaScript"),
+            ("x.lua", "Lua"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(&h.lang_for(Some(Path::new(path)), ""), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn フェンスの言語トークンも引ける() {
+        let h = hl();
+        for (tok, want) in [
+            ("ts", "TypeScript"),
+            ("typescript", "TypeScript"),
+            ("kotlin", "Kotlin"),
+            ("dockerfile", "Dockerfile"),
+            ("toml", "TOML"),
+            ("hcl", "Terraform"),
+            ("rust", "Rust"),
+            ("python", "Python"),
+        ] {
+            assert_eq!(h.lang_for_fence(tok), want, "```{tok}");
+        }
+        assert_eq!(h.lang_for_fence("しらない言語"), "Plain Text");
+    }
+
+    #[test]
+    fn 追加言語に実際に色が付く() {
+        let h = hl();
+        let src = "// コメント\nexport const x: number = 42;\nconsole.log(\"hi\");\n";
+        let job = h.layout_job(
+            src,
+            "TypeScript",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        let mut colors: Vec<[u8; 4]> = job
+            .sections
+            .iter()
+            .map(|s| s.format.color.to_array())
+            .collect();
+        colors.sort();
+        colors.dedup();
+        assert!(
+            colors.len() >= 4,
+            "TypeScript が単色で塗られている (色数 {})",
+            colors.len()
+        );
+        // 本文が欠けていないこと (連結すると元に戻る)
+        assert_eq!(job.text, src);
+    }
+
+    #[test]
+    fn 同梱パックの全言語が着色経路を通る() {
+        let h = hl();
+        let src = "a = 1 // b\n#c\n\"s\"\n";
+        for name in crate::grammar::bundled_pack::load().names() {
+            let job = h.layout_job(
+                src,
+                name,
+                "base16-ocean.dark",
+                FontId::monospace(12.0),
+                Color32::WHITE,
+            );
+            assert_eq!(job.text, src, "{name}: 本文が欠けた");
+            assert!(job.sections.len() > 1, "{name}: 素通し (色が付いていない)");
+        }
+    }
+
+    #[test]
+    fn 追加言語の折りたたみとコメント記号が登録される() {
+        let h = hl();
+        // 組み込みの表に無い言語 (Elixir / Nix) が引けること
+        assert_eq!(lang_spec("Elixir").line_comment, &["#"]);
+        assert_eq!(lang_spec("Elixir").strategy, FoldStrategy::Indent);
+        assert_eq!(lang_spec("Zig").strategy, FoldStrategy::Brackets);
+        assert_eq!(dynamic_line_comment("Nix"), Some("#"));
+        assert_eq!(dynamic_line_comment("Elixir"), Some("#"));
+        assert_eq!(dynamic_line_comment("Zig"), Some("//"));
+        // 知らない言語は None のまま
+        assert_eq!(dynamic_line_comment("まだ無い言語"), None);
+        // 使わない警告避け (hl() を通してパックを登録するのが前提)
+        assert!(h.extra_lang_count() >= 50);
+    }
+
+    /// 起動と描画に載る費用の番人。閾値は debug ビルドでも余裕がある値
+    /// (実測は読み込み ~100ms / 2000 行 ~55ms、release はこれより速い)。
+    /// 巨大な定義を足して起動を重くしたら、ここで気づける。
+    #[test]
+    fn 読み込みと着色が遅くなっていない() {
+        let t = std::time::Instant::now();
+        let set = crate::grammar::bundled_pack::load();
+        let load = t.elapsed();
+        assert!(
+            load < std::time::Duration::from_millis(600),
+            "同梱パックの読み込みが遅い: {load:?}"
+        );
+
+        let h = Highlighter::new();
+        h.set_grammars(set);
+        let src = "// c\nexport const x: number = foo(1) + \"s\";\n".repeat(1000);
+        let t = std::time::Instant::now();
+        let job = h.layout_job(
+            &src,
+            "TypeScript",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        let paint = t.elapsed();
+        assert_eq!(job.text, src);
+        assert!(
+            paint < std::time::Duration::from_millis(1500),
+            "2000 行の着色が遅い: {paint:?}"
+        );
+    }
+
+    #[test]
+    fn パック無しでも従来どおり動く() {
+        let h = Highlighter::new();
+        assert_eq!(h.extra_lang_count(), 0);
+        assert_eq!(h.lang_for(Some(Path::new("x.rs")), ""), "Rust");
+        // 知らない言語は素通し (落ちない)
+        let job = h.layout_job(
+            "x = 1\n",
+            "TypeScript",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        assert_eq!(job.text, "x = 1\n");
     }
 }

@@ -1,0 +1,148 @@
+# 関数型・宣言型の言語。
+
+[[syntax]]
+name = "Elixir"
+extensions = ["ex", "exs", "heex", "eex", "leex"]
+tokens = ["elixir", "ex"]
+line_comment = ["#"]
+strings = ["\"", "'"]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+ident_extra = "?!"
+attribute = "@"
+fold = "indent"
+keywords = [
+  "def", "defp", "defmodule", "defmacro", "defmacrop", "defstruct", "defprotocol",
+  "defimpl", "defdelegate", "defexception", "defguard", "defguardp", "defoverridable",
+  "do", "end", "fn", "if", "unless", "else", "cond", "case", "with", "for", "when", "in",
+  "and", "or", "not", "import", "require", "use", "alias", "receive", "after", "try",
+  "catch", "rescue", "raise", "throw", "quote", "unquote", "super", "spawn", "send",
+]
+types = [
+  "Enum", "Map", "List", "String", "Atom", "Integer", "Float", "Tuple", "Keyword",
+  "Process", "Task", "Agent", "GenServer", "Supervisor", "Stream", "Regex", "Kernel",
+]
+constants = ["true", "false", "nil"]
+builtins = ["IO", "inspect", "puts", "is_nil", "is_atom", "is_binary", "is_list", "is_map", "length", "hd", "tl", "elem", "put_elem"]
+
+[[syntax]]
+name = "Elm"
+extensions = ["elm"]
+tokens = ["elm"]
+line_comment = ["--"]
+block_comment = [["{-", "-}"]]
+strings = ["\""]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+char_literal = true
+fold = "indent"
+keywords = [
+  "module", "exposing", "import", "type", "alias", "port", "let", "in", "if", "then",
+  "else", "case", "of", "infix", "infixl", "infixr", "where", "as",
+]
+types = [
+  "Int", "Float", "String", "Bool", "Char", "List", "Maybe", "Result", "Cmd", "Sub",
+  "Html", "Program", "Array", "Dict", "Set", "Order", "Never",
+]
+constants = ["True", "False", "Nothing", "Just", "Ok", "Err", "LT", "EQ", "GT"]
+
+[[syntax]]
+name = "PureScript"
+extensions = ["purs"]
+tokens = ["purescript", "purs"]
+line_comment = ["--"]
+block_comment = [["{-", "-}"]]
+strings = ["\""]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+char_literal = true
+fold = "indent"
+keywords = [
+  "module", "where", "import", "as", "hiding", "data", "newtype", "type", "class",
+  "instance", "derive", "foreign", "infix", "infixl", "infixr", "let", "in", "do", "ado",
+  "case", "of", "if", "then", "else", "forall",
+]
+types = ["Int", "Number", "String", "Boolean", "Char", "Array", "Maybe", "Either", "Effect", "Aff", "Unit", "Record"]
+constants = ["true", "false", "Nothing", "Just", "Left", "Right", "unit"]
+
+[[syntax]]
+name = "ReScript"
+extensions = ["res", "resi"]
+tokens = ["rescript"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+char_literal = true
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "let", "type", "module", "open", "include", "external", "and", "rec", "if", "else",
+  "switch", "when", "try", "catch", "for", "in", "to", "downto", "while", "mutable",
+  "lazy", "assert", "exception", "of", "as", "async", "await",
+]
+types = ["int", "float", "string", "bool", "unit", "array", "list", "option", "result", "promise", "char"]
+constants = ["true", "false", "None", "Some", "Ok", "Error"]
+builtins = ["Js", "Belt", "Console", "Array", "String", "Math"]
+
+[[syntax]]
+name = "Racket"
+extensions = ["rkt", "rktl", "rktd"]
+tokens = ["racket"]
+line_comment = [";"]
+block_comment = [["#|", "|#"]]
+strings = ["\""]
+ident_extra = "-?!*/<>=+"
+fold = "brackets"
+keywords = [
+  "define", "define-values", "define-syntax", "define-syntax-rule", "define-struct",
+  "lambda", "let", "let*", "letrec", "let-values", "if", "cond", "else", "when", "unless",
+  "begin", "set!", "quote", "quasiquote", "unquote", "syntax-rules", "require", "provide",
+  "module", "module+", "struct", "match", "for", "for/list", "for/fold", "do", "case",
+  "and", "or", "not", "delay", "force", "parameterize", "with-handlers", "lang",
+]
+types = ["Integer", "Real", "String", "Boolean", "Char", "Listof", "Vectorof", "Any"]
+constants = ["#t", "#f", "true", "false", "null", "empty"]
+builtins = ["display", "displayln", "printf", "print", "write", "list", "cons", "car", "cdr", "map", "filter", "foldl", "foldr", "apply", "error", "length", "append", "reverse"]
+
+[[syntax]]
+name = "Gleam"
+extensions = ["gleam"]
+tokens = ["gleam"]
+line_comment = ["//"]
+doc_comment = ["///", "////"]
+strings = ["\""]
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "as", "assert", "case", "const", "external", "fn", "if", "import", "let", "opaque",
+  "panic", "pub", "todo", "type", "use", "echo", "auto", "delegate", "derive", "else",
+  "implement", "macro", "test",
+]
+types = ["Int", "Float", "String", "Bool", "List", "Result", "Option", "Nil", "BitArray", "Dict"]
+constants = ["True", "False", "Nil", "Ok", "Error", "Some", "None"]
+builtins = ["io", "println", "debug", "list", "string", "int", "float"]
+
+[[syntax]]
+name = "Prolog"
+extensions = ["pro", "prolog", "plg"]
+tokens = ["prolog"]
+line_comment = ["%"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+fold = "indent"
+keywords = [
+  "is", "not", "module", "use_module", "dynamic", "discontiguous", "initialization",
+  "assert", "asserta", "assertz", "retract", "findall", "bagof", "setof", "forall",
+  "between", "fail", "true", "halt", "catch", "throw", "op", "consult", "ensure_loaded",
+]
+builtins = [
+  "member", "append", "length", "nth0", "nth1", "reverse", "sort", "msort", "sum_list",
+  "max_list", "min_list", "atom", "number", "var", "nonvar", "functor", "arg", "write",
+  "writeln", "read", "format", "nl", "tab",
+]
+
+[[alias]]
+target = "Haskell"
+extensions = ["hs-boot", "hsig"]
+
+[[alias]]
+target = "Lisp"
+extensions = ["fnl", "janet", "carp"]
+tokens = ["fennel", "janet"]

@@ -59,6 +59,7 @@ use crate::theme_json;
 use crate::tunnel;
 use crate::tutorial::{self, AnchorId};
 use crate::voice;
+use crate::zoom;
 
 // エージェントデッキ (縦 1 本のエージェント管理画面) は main.rs が
 // `mod deck;` で登録している。ここで `#[path]` 付きの二重登録をすると
@@ -542,6 +543,16 @@ const GRID_SPACING: f32 = 10.0;
 const GRID_TWO_COL_W: f32 = 640.0;
 /// タイルの最低高さ。
 const GRID_MIN_CELL_H: f32 = 150.0;
+/// タイル 1 枚に残したいミニターミナルの行数。
+///
+/// これを下回ると「何かが動いているのは分かるが、何をしているかは読めない」
+/// タイルになる。6 枚以上開いたときに全部を 1 画面へ詰め込むのをやめ、
+/// この行数を保ったままスクロールへ逃がすための基準。
+const GRID_COMFORT_ROWS: f32 = 16.0;
+/// タイルのヘッダ行 + 枠の余白 (端末の外側で使う固定の高さ)。
+const GRID_TILE_CHROME_H: f32 = 46.0;
+/// 快適な高さの上限。巨大フォントでもタイル 1 枚で画面を独占させない。
+const GRID_COMFORT_MAX_H: f32 = 420.0;
 /// 見出し行を「アイコンだけ」に縮退させる幅のしきい値。
 const COCKPIT_HEADER_COMPACT_W: f32 = 820.0;
 
@@ -563,6 +574,20 @@ enum CenterView {
     Kanban,
     /// 🗂 エージェントデッキ
     Deck,
+}
+
+/// ズームジェスチャ (⌘+ホイール / ピンチ) を持っている中央ビューの種別。
+///
+/// egui は ⌘+ホイールもピンチも `zoom_delta()` にまとめてしまい、しかも
+/// **消費できない** (`zoom_factor_delta` は非公開)。同じジェスチャで
+/// 「画像も拡大・文字も拡大」の二重掛けが起きないよう、持ち主をここで
+/// 1 つに決めてから配る ([`ZaivernApp::handle_zoom_gesture`])。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZoomArea {
+    /// エディタ本文 / Markdown プレビュー — そのファイルだけを拡大縮小する
+    File,
+    /// 画像ビューア — 自前で `zoom_delta` を読むので、ここでは何もしない
+    Image,
 }
 
 /// 3 本のフラグから「今フレーム描くビュー」を 1 つ決める (純関数)。
@@ -753,10 +778,42 @@ struct GridMetrics {
     cell_h: f32,
 }
 
+impl GridMetrics {
+    /// 格子全体の高さ (= スクロール領域の中身の高さ)。
+    fn content_h(&self) -> f32 {
+        self.rows as f32 * (self.cell_h + 4.0) + GRID_SPACING * (self.rows as f32 - 1.0)
+    }
+
+    /// この寸法だと縦スクロールが要るか (可用高さ `avail_y` に対して)。
+    fn scrolls(&self, avail_y: f32) -> bool {
+        self.content_h() > avail_y + 0.5
+    }
+}
+
+/// タイル 1 枚に確保したい高さ (= これ以上は縮めない下限)。
+///
+/// ミニターミナルの文字が大きいほど、同じ行数を読むのに要る高さも増えるので
+/// フォントから導く。ハードコードした 1 つの値だと、フォントを上げた途端に
+/// 「タイルは大きいのに 5 行しか見えない」に戻ってしまう。
+fn grid_comfort_cell_h(mini_font: f32) -> f32 {
+    // 行送りは epaint の等幅フォントの実測 (≒ 1.35em) に合わせた概算。
+    // 正確な値は描画時にしか判らないが、ここで要るのは「読める高さ」の目安。
+    (mini_font * 1.35 * GRID_COMFORT_ROWS + GRID_TILE_CHROME_H)
+        .clamp(GRID_MIN_CELL_H, GRID_COMFORT_MAX_H)
+}
+
 /// 与えられた領域に n 枚のタイルを敷くときの寸法 (純関数)。
 ///
-/// 不変条件: **総幅は `avail.x` を超えない**。超えると右端のタイルが切れる。
-fn cockpit_grid_metrics(avail: egui::Vec2, n: usize) -> GridMetrics {
+/// 不変条件:
+/// * **総幅は `avail.x` を超えない** — 超えると右端のタイルが切れる。
+/// * **タイルは `comfort` より低くしない** — 枚数が増えたときに全部を 1 画面へ
+///   詰め込むと、6 枚あたりから中身が読めなくなる。縮めるのをやめて縦へ伸ばし、
+///   はみ出したぶんはスクロールで見せる ([`GridMetrics::scrolls`])。
+///   副次効果として、7 枚目を足しても既存タイルの高さが変わらない
+///   = 既存 PTY のリサイズが起きない。
+/// * ただし**窓そのものが低いとき**は 1 枚が窓に収まる高さまで譲る
+///   (タイル 1 枚しか無いのにスクロールさせない)。
+fn cockpit_grid_metrics(avail: egui::Vec2, n: usize, comfort: f32) -> GridMetrics {
     let cols = if n <= 1 || avail.x < GRID_TWO_COL_W {
         1
     } else {
@@ -764,13 +821,15 @@ fn cockpit_grid_metrics(avail: egui::Vec2, n: usize) -> GridMetrics {
     };
     let rows = n.div_ceil(cols).max(1);
     let cell_w = ((avail.x - GRID_SPACING * (cols as f32 - 1.0)) / cols as f32 - 4.0).max(1.0);
-    let cell_h =
-        (((avail.y - GRID_SPACING * (rows as f32 - 1.0)) / rows as f32) - 4.0).max(GRID_MIN_CELL_H);
+    // 全部を 1 画面へ詰め込むときの高さ (旧実装の計算そのまま)。
+    let fit = ((avail.y - GRID_SPACING * (rows as f32 - 1.0)) / rows as f32) - 4.0;
+    // 譲れる下限。低い窓では「1 枚が窓に収まる高さ」まで下げてよい。
+    let floor = comfort.min(avail.y - 4.0).max(GRID_MIN_CELL_H);
     GridMetrics {
         cols,
         rows,
         cell_w,
-        cell_h,
+        cell_h: fit.max(floor),
     }
 }
 
@@ -830,28 +889,34 @@ struct PluginActions {
 // ため、テストできる形は「状態 → 状態」の純関数だけ。app.rs の作法どおり
 // 判断はここへ出し、メソッド側は self との受け渡しに徹する。
 
+/// 「既定のエージェント」= プリセットの**先頭**。
+///
+/// キーボードの `NewAgent` も端末分割も、新しい 1 体はここを見る
+/// (別々の場所で添字を決めると「キーと分割で違うものが立つ」が起きる)。
+const DEFAULT_PRESET_IX: usize = 0;
+
 /// 新しいペインで起動するプリセットの添字。
 ///
-/// * 親と同じ → 見つからなければ素のシェル → それも無ければ先頭
-/// * シェル指定 → 素のシェル (コマンドが空のプリセット) → 無ければ先頭
+/// * エージェント指定 → **既定プリセット** ([`DEFAULT_PRESET_IX`])。
+///   `NewAgent` キーや `👾 Agent ＋` からの新規起動と同じ 1 体を起こす —
+///   分割かどうかで起動するものを変えない (親のプリセットは引き継がない)。
+/// * シェル指定 → 素のシェル (コマンドが空のプリセット) → 無ければ既定
 ///
 /// 「1 つも登録が無い」ときだけ `None` (呼び出し側がトーストを出す)。
 fn split_preset_index(
     agents: &[config::AgentPreset],
-    parent: &str,
     preset: terminal::PanePreset,
 ) -> Option<usize> {
     if agents.is_empty() {
         return None;
     }
-    let shell = agents.iter().position(|p| p.command.trim().is_empty());
     match preset {
-        terminal::PanePreset::SameAsParent => {
-            agents.iter().position(|p| p.name == parent).or(shell)
-        }
-        terminal::PanePreset::Shell => shell,
+        terminal::PanePreset::NewAgent => Some(DEFAULT_PRESET_IX),
+        terminal::PanePreset::Shell => agents
+            .iter()
+            .position(|p| p.command.trim().is_empty())
+            .or(Some(DEFAULT_PRESET_IX)),
     }
-    .or(Some(0))
 }
 
 /// 分割レイアウト表を整える (消えたペインを落とす → 1 枚は畳む → キーを揃える)。
@@ -2102,6 +2167,12 @@ pub struct ZaivernApp {
     /// (`SyntaxSet` は数 MB あるので差分ビューと二重に持たない)。
     highlighter: &'static Highlighter,
     cockpit: bool,
+    /// Cockpit グリッドで最後に「見える位置まで運んだ」セッション。
+    ///
+    /// タイルが 1 画面に収まらない (= スクロールしている) ときだけ使う。
+    /// アクティブが変わったフレームにだけ追従させるための記録で、毎フレーム
+    /// 運ぶとユーザーが自分でスクロールできなくなる。
+    cockpit_followed: Option<u64>,
     /// **このフレームで描く中央ビュー** (毎フレーム [`center_view`] で畳む)。
     /// 描画の分岐はフラグではなく必ずこれを見る。
     center: CenterView,
@@ -2219,6 +2290,18 @@ pub struct ZaivernApp {
     last_row_h: f32,
     /// エディタ可視領域の高さ(前フレーム値)。PageUp/Down・検索ジャンプで使用
     last_view_h: f32,
+    /// 今フレームのズームジェスチャの持ち主 (前フレームで確定した値)。
+    /// ⌘+ホイール / ピンチを「ファイル単位 / 画像ビューア / 画面全体」の
+    /// どこへ流すかの振り分けに使う。1 フレーム遅れだが、ポインタが
+    /// 1 フレームで領域を跨ぐことは無い。
+    zoom_area: Option<(egui::Rect, ZoomArea)>,
+    /// 描画中に申告される次フレーム用の値。フレーム末尾で `zoom_area` へ移す。
+    zoom_area_next: Option<(egui::Rect, ZoomArea)>,
+    /// ホイール / ピンチの連続的な倍率変化を段送りへ均す蓄積器。
+    /// 対象 (画面全体 / ファイル) が変わったら貯まりを捨てる。
+    zoom_wheel: zoom::WheelAccum,
+    /// 直前のホイールズームがファイル単位だったか (対象切替の検出用)。
+    zoom_wheel_on_file: bool,
     /// エディタの垂直スクロール量(前フレーム値)
     last_scroll_y: f32,
     /// アクティブバッファ本文のハッシュ (code_editor_ui が line_marks 用に毎フレーム更新)
@@ -2390,6 +2473,9 @@ pub struct ZaivernApp {
     pet_attention_notified: HashMap<String, Instant>,
     /// インストール済みプラグイン(~/.zaivern/plugins)
     plugins: Vec<plugins::Plugin>,
+    /// プラグイン名 → そのプラグインが足した言語名 (名前順)。
+    /// プラグイン一覧に「🔤 何言語増えたか」を出すためだけの表示用。
+    plugin_langs: HashMap<String, Vec<String>>,
     /// プラグインコマンドのキーバインド: (shortcut, plugins index, commands index)
     plugin_keys: Vec<(egui::KeyboardShortcut, usize, usize)>,
     /// プラグインコマンド実行結果の受け渡し(ワーカースレッド → UI)
@@ -2712,6 +2798,10 @@ impl ZaivernApp {
             roots
         };
         let cfg = config::load(&roots, true);
+        // 画面全体のズームは **テーマ適用より先** に入れる。theme::apply は
+        // その時点の pixels_per_point でフォントサイズを物理ピクセルへ丸めるので、
+        // 後から倍率を変えると最初のフレームだけ丸めがズレた絵になる。
+        apply_ui_zoom(&cc.egui_ctx, cfg.ui_zoom);
         let theme = resolve_theme(&cfg.theme);
         theme::apply(&cc.egui_ctx, &theme);
 
@@ -2802,6 +2892,7 @@ impl ZaivernApp {
             race: race::RacePanel::new(),
             highlighter: crate::highlight::shared(),
             cockpit: false,
+            cockpit_followed: None,
             center: CenterView::Editor,
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
@@ -2867,6 +2958,10 @@ impl ZaivernApp {
             pending_scroll: None,
             last_row_h: 18.0,
             last_view_h: 620.0,
+            zoom_area: None,
+            zoom_area_next: None,
+            zoom_wheel: zoom::WheelAccum::default(),
+            zoom_wheel_on_file: false,
             last_scroll_y: 0.0,
             last_text_hash: 0,
             find_count_cache: None,
@@ -2903,6 +2998,7 @@ impl ZaivernApp {
             pet_bubble_answered: HashMap::new(),
             pet_attention_notified: HashMap::new(),
             plugins: Vec::new(),
+            plugin_langs: HashMap::new(),
             plugin_keys: Vec::new(),
             plugin_tx,
             plugin_rx,
@@ -3154,6 +3250,44 @@ impl ZaivernApp {
                 .iter()
                 .any(|p| p.active() && &p.name == pl && p.panels.iter().any(|x| &x.id == id))
         });
+
+        // 構文ハイライト定義 (`[[syntax]]`) を集めて Highlighter へ入れる。
+        // syntect が知らない言語 (TypeScript / Kotlin / Zig …) はここで足される。
+        // 読めない定義は黙って捨てず、理由をトーストで見せる (作者がすぐ気づけるように)。
+        let mut packs = crate::grammar::GrammarSet::default();
+        let mut syn_errs: Vec<String> = Vec::new();
+        let mut by_plugin: HashMap<String, Vec<String>> = HashMap::new();
+        for p in self.plugins.iter().filter(|p| p.active()) {
+            let mut mine = crate::grammar::GrammarSet::default();
+            for path in &p.syntax_files {
+                mine.merge(crate::grammar::GrammarSet::load_path(path, &mut syn_errs));
+            }
+            if !mine.is_empty() {
+                let mut names: Vec<String> = mine.names().iter().map(|s| s.to_string()).collect();
+                names.sort_by_key(|s| s.to_lowercase());
+                by_plugin.insert(p.name.clone(), names);
+            }
+            packs.merge(mine);
+        }
+        self.plugin_langs = by_plugin;
+        let had_langs = self.highlighter.extra_lang_count();
+        let now_langs = packs.grammars.len();
+        self.highlighter.set_grammars(packs);
+        if had_langs != now_langs {
+            // 認識できる言語が変わったので、開いているタブを判定し直す
+            // (プラグインを有効にした瞬間に、開いたままの .ts が色づく)。
+            for b in self.editor.buffers.iter_mut() {
+                if let Some(path) = b.path.clone() {
+                    b.lang = self.highlighter.lang_for(Some(&path), &b.text);
+                }
+            }
+        }
+        if let Some(e) = syn_errs.first() {
+            self.toast(
+                trf("⚠ 構文定義を読めません — {e}", &[("e", e.clone())]),
+                false,
+            );
+        }
 
         // スニペットを言語IDごとに集約
         let mut by_lang: HashMap<String, Vec<Snippet>> = HashMap::new();
@@ -8335,8 +8469,12 @@ impl ZaivernApp {
             Cmd::SetTheme(_)
             | Cmd::OpenConfig
             | Cmd::ReloadConfig
-            | Cmd::FontInc
-            | Cmd::FontDec
+            | Cmd::ZoomIn
+            | Cmd::ZoomOut
+            | Cmd::ZoomReset
+            | Cmd::FileZoomIn
+            | Cmd::FileZoomOut
+            | Cmd::FileZoomReset
             | Cmd::SendFileToAgent
             | Cmd::RefreshTree
             | Cmd::SetApproval(_)
@@ -8974,6 +9112,126 @@ impl ZaivernApp {
         }
     }
 
+    // ─── ズーム (画面全体 / ファイル単位) ────────────────────────────────
+    //
+    // VS Code と同じ二階建て:
+    //   画面全体 = egui の `zoom_factor` を動かす → UI の全部が拡大縮小する。
+    //              値は `Config::ui_zoom` に持ち、state.toml へ覚える。
+    //   ファイル = そのタブのフォント倍率だけを動かす → 本文だけが変わる。
+    //              値は `Buffer::zoom` に持ち、タブを閉じれば消える。
+    // どちらも段は `crate::zoom::STEPS` を共有するので、
+    // キー / ホイール / メニュー / パレットのどこから触っても同じ倍率を行き来する。
+
+    /// 画面全体のズームを設定して state.toml へ覚える。
+    ///
+    /// egui へ渡すのはフレーム先頭の [`apply_ui_zoom`] なので、ここは値の確定だけ。
+    /// はしごの端では黙って何も起きない (ブラウザ・VS Code と同じ)。
+    fn set_ui_zoom(&mut self, z: f32) {
+        let z = zoom::clamp(z);
+        if (z - self.cfg.ui_zoom).abs() < 1e-4 {
+            return;
+        }
+        self.cfg.ui_zoom = z;
+        config::save_state(&self.cfg);
+    }
+
+    /// アクティブなタブだけのズームを段送りする。
+    ///
+    /// 本文とガターの galley はフォントサイズをキーに持っているので、
+    /// ここでキャッシュを捨てる必要はない (次のフレームで自然に作り直される)。
+    fn step_file_zoom(&mut self, steps: i32) {
+        let Some(i) = self.editor.active else {
+            self.toast(
+                tr("ファイルを開いてから、そのファイルだけのズームを変えてください"),
+                false,
+            );
+            return;
+        };
+        let b = &mut self.editor.buffers[i];
+        let next = zoom::step_by(b.zoom, steps);
+        if (next - b.zoom).abs() < 1e-4 {
+            return;
+        }
+        b.zoom = next;
+    }
+
+    /// アクティブなタブのズームを解除し、画面全体の倍率だけに戻す。
+    fn reset_file_zoom(&mut self) {
+        let Some(i) = self.editor.active else {
+            self.toast(
+                tr("ファイルを開いてから、そのファイルだけのズームを変えてください"),
+                false,
+            );
+            return;
+        };
+        self.editor.buffers[i].zoom = zoom::DEFAULT;
+    }
+
+    /// アクティブなタブのズーム倍率 (タブが無ければ等倍)。
+    fn file_zoom(&self) -> f32 {
+        self.editor
+            .active
+            .map(|i| zoom::clamp(self.editor.buffers[i].zoom))
+            .unwrap_or(zoom::DEFAULT)
+    }
+
+    /// エディタ本文のフォントサイズ (画面全体のズームは egui が持つので、
+    /// ここで掛けるのは **ファイル単位の倍率だけ**)。
+    ///
+    /// 二重に掛けないこと — `zoom_factor` は pixels_per_point 側を動かすので、
+    /// ここでも掛けると倍率が二乗になる。
+    fn editor_font_pt(&self) -> f32 {
+        (self.cfg.editor_font_size * self.file_zoom()).clamp(6.0, 96.0)
+    }
+
+    /// ⌘ + ホイール / トラックパッドのピンチを、ポインタの位置で振り分ける。
+    ///
+    /// エディタ本文 (と Markdown プレビュー) の上なら「そのファイルだけ」、
+    /// それ以外 (ターミナル・サイドバー・タブ・看板など) なら「画面全体」。
+    /// ブラウザで言えば前者が VS Code の `editor.mouseWheelZoom`、
+    /// 後者がページズーム。
+    ///
+    /// **画像ビューアの上では何もしない。** あちらは `zoom_delta` を自分で
+    /// 読んで画像を拡大するので、ここでも拾うと同じジェスチャで画像と UI が
+    /// 二重に拡大する。持ち主は前フレームに申告された [`ZoomArea`] で決める。
+    ///
+    /// egui は ⌘+ホイールを `zoom_delta()` (1 フレームあたりの乗算係数) へ
+    /// 変換済みで、スクロールからは取り除いてくれる。変化が無いフレームでは
+    /// 1.0 が返るだけなので、毎フレーム呼んでもアイドルコストはゼロ。
+    fn handle_zoom_gesture(&mut self, ctx: &egui::Context) {
+        let delta = ctx.input(|i| i.zoom_delta());
+        if !delta.is_finite() || (delta - 1.0).abs() < 1e-6 {
+            return;
+        }
+        let pointer = ctx.input(|i| i.pointer.latest_pos());
+        // ポインタが乗っている領域の持ち主 (乗っていなければ None = 画面全体)
+        let owner = match (pointer, self.zoom_area) {
+            (Some(p), Some((r, kind))) if r.contains(p) => Some(kind),
+            _ => None,
+        };
+        if owner == Some(ZoomArea::Image) {
+            // 画像ビューアが自分で消費する。貯まりも持ち越さない。
+            self.zoom_wheel.reset();
+            return;
+        }
+        let on_file = owner == Some(ZoomArea::File) && self.editor.active.is_some();
+        // 対象が変わったら貯まりを捨てる (画面全体の途中経過でファイルが
+        // いきなり 1 段飛ぶ、を防ぐ)。
+        if on_file != self.zoom_wheel_on_file {
+            self.zoom_wheel.reset();
+            self.zoom_wheel_on_file = on_file;
+        }
+        let steps = self.zoom_wheel.feed(delta);
+        if steps == 0 {
+            return;
+        }
+        if on_file {
+            self.step_file_zoom(steps);
+        } else {
+            self.set_ui_zoom(zoom::step_by(self.cfg.ui_zoom, steps));
+        }
+    }
+
     /// `apply_cmd` のテーマ/設定/ペットカテゴリ (Cmd::SetTheme 〜 Cmd::ToggleRemote)。
     fn apply_cmd_settings(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
@@ -9013,6 +9271,9 @@ impl ZaivernApp {
                 // 監視役 LLM も選び直されているかもしれないので作り直す。
                 self.apply_super_agent();
                 self.keys = Keybinds::from_overrides(&self.cfg.keybindings);
+                // config.toml / state.toml の ui_zoom を画面へ戻す
+                // (読み直したのに倍率だけ前のまま、を作らない)
+                apply_ui_zoom(ctx, self.cfg.ui_zoom);
                 for b in &mut self.editor.buffers {
                     b.cache = None;
                     b.gutter = None;
@@ -9020,14 +9281,12 @@ impl ZaivernApp {
                 config::save_state(&self.cfg);
                 self.toast(tr("🔄 設定を再読み込みしました"), true);
             }
-            Cmd::FontInc => {
-                self.cfg.editor_font_size = (self.cfg.editor_font_size + 1.0).min(32.0);
-                self.cfg.terminal_font_size = (self.cfg.terminal_font_size + 1.0).min(28.0);
-            }
-            Cmd::FontDec => {
-                self.cfg.editor_font_size = (self.cfg.editor_font_size - 1.0).max(8.0);
-                self.cfg.terminal_font_size = (self.cfg.terminal_font_size - 1.0).max(7.0);
-            }
+            Cmd::ZoomIn => self.set_ui_zoom(zoom::step_up(self.cfg.ui_zoom)),
+            Cmd::ZoomOut => self.set_ui_zoom(zoom::step_down(self.cfg.ui_zoom)),
+            Cmd::ZoomReset => self.set_ui_zoom(zoom::DEFAULT),
+            Cmd::FileZoomIn => self.step_file_zoom(1),
+            Cmd::FileZoomOut => self.step_file_zoom(-1),
+            Cmd::FileZoomReset => self.reset_file_zoom(),
             Cmd::SendFileToAgent => {
                 let rel = self.editor.active.and_then(|i| {
                     let b = &self.editor.buffers[i];
@@ -9612,6 +9871,26 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::PrevTab)) {
             cmds.push(Cmd::PrevTab);
         }
+        // ファイル単位ズーム (⌥⌘+ / Ctrl+Alt+Shift++ …) は「戻る/進む」より先。
+        // egui の `Modifiers::matches_logically` は「パターンに無い修飾キーは
+        // 押されていてもよい」判定なので、修飾キーの多い方から取らないと
+        // 少ない方 (戻る・画面全体ズーム) に吸われる。
+        // ⌥⌘= の別名も足す: macOS の ⌥= は「≠」を打つ組み合わせで論理キーが
+        // 取れず、winit が物理キー (Equal) へフォールバックするため。
+        if consume(ctx, self.keys.get(BindAction::FileZoomIn))
+            || consume(
+                ctx,
+                KeyboardShortcut::new(self.keys.get(BindAction::FileZoomIn).modifiers, Key::Equals),
+            )
+        {
+            cmds.push(Cmd::FileZoomIn);
+        }
+        if consume(ctx, self.keys.get(BindAction::FileZoomOut)) {
+            cmds.push(Cmd::FileZoomOut);
+        }
+        if consume(ctx, self.keys.get(BindAction::FileZoomReset)) {
+            cmds.push(Cmd::FileZoomReset);
+        }
         if consume(ctx, self.keys.get(BindAction::NavForward)) {
             cmds.push(Cmd::NavForward);
         }
@@ -9732,15 +10011,34 @@ impl ZaivernApp {
             cmds.push(Cmd::ToggleMdPreview);
         }
         if consume(ctx, self.keys.get(BindAction::NewAgent)) {
-            cmds.push(Cmd::NewAgent(0));
+            cmds.push(Cmd::NewAgent(DEFAULT_PRESET_IX));
         }
-        if consume(ctx, self.keys.get(BindAction::FontInc))
-            || consume(ctx, KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals))
+        // ズーム: 画面全体 (⌘+ / ⌘- / ⌘0) とファイル単位 (⌥ を足したもの)。
+        //
+        // `=` も拾うのはブラウザと同じ理由 — US 配列の `+` は ⇧= なので、
+        // ⌘+ を打つのに毎回 shift を押させたくない。
+        // **⌥ 付きを必ず先に消費すること。** egui の `matches_logically` は
+        // 「パターンが要求していない修飾キーが余分に押されていても一致する」
+        // ので、⌘⌥- は ⌘- のパターンにも一致してしまう。先に ⌘⌥- を
+        // 消費して初めて、ファイル単位と画面全体が別の操作として成立する
+        // (このファイル冒頭の「修飾キーの多いものを先に消費する」と同じ理由)。
+        // 順序を入れ替えると **ファイル単位のズームが画面全体になる**。
+        // ファイル単位 (⌘⌥+ / ⌘⌥- / ⌘⌥0) は上でもう消費済み — ⌥ 付きを
+        // 先に取らないと、少ない方 (画面全体) へ吸われるため。
+        // `=` の別名も割り当てから作る (再割り当てしても別名がついてくる)。
+        if consume(ctx, self.keys.get(BindAction::ZoomIn))
+            || consume(
+                ctx,
+                KeyboardShortcut::new(self.keys.get(BindAction::ZoomIn).modifiers, Key::Equals),
+            )
         {
-            cmds.push(Cmd::FontInc);
+            cmds.push(Cmd::ZoomIn);
         }
-        if consume(ctx, self.keys.get(BindAction::FontDec)) {
-            cmds.push(Cmd::FontDec);
+        if consume(ctx, self.keys.get(BindAction::ZoomOut)) {
+            cmds.push(Cmd::ZoomOut);
+        }
+        if consume(ctx, self.keys.get(BindAction::ZoomReset)) {
+            cmds.push(Cmd::ZoomReset);
         }
 
         // プラグインコマンドの keybind (plugin.toml の keybind = "cmd+alt+u" など)
@@ -10210,39 +10508,41 @@ impl ZaivernApp {
         self.sidebar_sessions.invalidate();
     }
 
+    /// メニュー用のテーマ一覧を作る (同梱テーマ → カスタムテーマ JSON の順)。
+    ///
+    /// トップバーの 🎨 とメニューバーの「表示 > 配色テーマ」が同じ一覧を見るので、
+    /// 段組みも選択状態も 2 か所で食い違わない。
+    fn theme_entries(&self) -> Vec<menu_bar::ThemeEntry> {
+        let mut out: Vec<menu_bar::ThemeEntry> = theme::all()
+            .into_iter()
+            .map(|t| menu_bar::ThemeEntry {
+                selected: t.name == self.cfg.theme,
+                group: if t.dark {
+                    menu_bar::ThemeGroup::Dark
+                } else {
+                    menu_bar::ThemeGroup::Light
+                },
+                name: t.name,
+                label: t.label,
+            })
+            .collect();
+        // カスタムテーマは中身を読むまで明暗が判らないので独立した段に置く。
+        for (label, path) in self.custom_themes.iter().take(60) {
+            out.push(menu_bar::ThemeEntry {
+                name: path.clone(),
+                label: format!("🔌 {label}"),
+                selected: self.cfg.theme == *path,
+                group: menu_bar::ThemeGroup::Custom,
+            });
+        }
+        out
+    }
+
     /// トップバー: 🎨 テーマ選択メニュー (プラグインのカスタムテーマ含む)。
     fn top_bar_theme_menu(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        let themes = self.theme_entries();
         let menu = ui.menu_button("🎨", |ui| {
-            for t in theme::all() {
-                let sel = t.name == self.cfg.theme;
-                if ui.selectable_label(sel, t.label.clone()).clicked() {
-                    cmds.push(Cmd::SetTheme(t.name.clone()));
-                    ui.close_menu();
-                }
-            }
-            if !self.custom_themes.is_empty() {
-                ui.separator();
-                ui.menu_button(
-                    trf(
-                        "🔌 カスタムテーマ ({n})",
-                        &[("n", self.custom_themes.len().to_string())],
-                    ),
-                    |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("custom-themes")
-                            .max_height(340.0)
-                            .show(ui, |ui| {
-                                for (label, path) in self.custom_themes.clone() {
-                                    let sel = self.cfg.theme == path;
-                                    if ui.selectable_label(sel, label).clicked() {
-                                        cmds.push(Cmd::SetTheme(path));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                    },
-                );
-            }
+            menu_bar::theme_menu_ui(ui, &themes, cmds);
         });
         tutorial::anchor(ui.ctx(), AnchorId::ThemeMenu, menu.response.rect);
         menu.response
@@ -10765,6 +11065,11 @@ impl ZaivernApp {
             ),
             _ => tr("Pro ライセンス"),
         });
+        // ズームのバッジ。**等倍のときは 1 ピクセルも出さない** —
+        // 常に "100%" が居座ると、変わっていないことを見張るための場所になる。
+        let ui_zoom = self.cfg.ui_zoom;
+        let file_zoom = self.file_zoom();
+        let mut zoom_cmd: Option<Cmd> = None;
 
         let bar = egui::TopBottomPanel::bottom("zv-status")
             .exact_height(26.0)
@@ -10833,6 +11138,39 @@ impl ZaivernApp {
                         };
                         ui.label(RichText::new(tr(ap_text)).size(11.5).color(ap_color));
                         ui.label(dim(self.theme.label.clone()));
+                        // ズームは等倍から外れているときだけ出す。押せば元に戻る。
+                        // 画面全体とファイル単位は別のバッジにする — どちらが
+                        // 効いているのか分からないまま倍率だけ出ても直せない。
+                        if !zoom::is_default(file_zoom) {
+                            let r = ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("🔎 {}", zoom::label(file_zoom)))
+                                        .size(11.5)
+                                        .color(theme.accent),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text(tr("このファイルだけのズーム — 押すと解除します"))
+                                .clicked()
+                            {
+                                zoom_cmd = Some(Cmd::FileZoomReset);
+                            }
+                        }
+                        if !zoom::is_default(ui_zoom) {
+                            let r = ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("🔍 {}", zoom::label(ui_zoom)))
+                                        .size(11.5)
+                                        .color(theme.accent),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text(tr("画面全体のズーム — 押すと 100% に戻します"))
+                                .clicked()
+                            {
+                                zoom_cmd = Some(Cmd::ZoomReset);
+                            }
+                        }
                         let (ln, col) = self.editor.cursor;
                         if let Some(i) = self.editor.active {
                             ui.label(dim(format!("Ln {ln}, Col {col}")));
@@ -10956,6 +11294,9 @@ impl ZaivernApp {
         }
         if let Some(le) = convert_eol {
             self.editor_op(ctx, EditOp::NormalizeEol(le));
+        }
+        if let Some(c) = zoom_cmd {
+            self.apply_cmd(c, ctx);
         }
         self.quota_window_ui(ctx);
     }
@@ -11656,14 +11997,22 @@ impl ZaivernApp {
                                         .color(theme.text_dim),
                                 );
                             }
-                            ui.label(
+                            // 構文定義を持つプラグインだけ 🔤 を足す
+                            // (常に 0 が並ぶバッジは作らない)
+                            let langs = self.plugin_langs.get(&p.name);
+                            let lang_badge = match langs {
+                                Some(v) if !v.is_empty() => format!("  🔤{}", v.len()),
+                                _ => String::new(),
+                            };
+                            let counts = ui.label(
                                 RichText::new(format!(
-                                    "▶{}  🪝{}  📋{}  🎨{}  ✂{}{}",
+                                    "▶{}  🪝{}  📋{}  🎨{}  ✂{}{}{}",
                                     p.commands.len(),
                                     p.hooks.len(),
                                     p.panels.len(),
                                     p.themes.len(),
                                     p.snippet_files.len(),
+                                    lang_badge,
                                     if p.author.is_empty() {
                                         String::new()
                                     } else {
@@ -11673,6 +12022,12 @@ impl ZaivernApp {
                                 .size(10.5)
                                 .color(theme.text_dim),
                             );
+                            if let Some(v) = langs.filter(|v| !v.is_empty()) {
+                                counts.on_hover_text(trf(
+                                    "追加される言語 ({n}): {list}",
+                                    &[("n", v.len().to_string()), ("list", v.join(", "))],
+                                ));
+                            }
                             for (ci, c) in p.commands.iter().enumerate() {
                                 let btn = ui.small_button(format!("{} {}", c.icon, c.title));
                                 let btn = match &c.keybind {
@@ -13245,9 +13600,28 @@ impl ZaivernApp {
         }
 
         let avail = ui.available_size();
-        let g = cockpit_grid_metrics(avail, n);
-        let (cols, rows, cell_w, cell_h) = (g.cols, g.rows, g.cell_w, g.cell_h);
         let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
+        // 6 枚以上でも 1 枚ずつは読める高さを保つ。入り切らないぶんは
+        // 縦スクロールで見せる (潰さない)。
+        let g = cockpit_grid_metrics(avail, n, grid_comfort_cell_h(mini_font));
+        let (cols, rows, cell_w, cell_h) = (g.cols, g.rows, g.cell_w, g.cell_h);
+        let scrolls = g.scrolls(avail.y);
+
+        // アクティブが変わったフレームだけ、そのタイルを見える位置へ運ぶ。
+        // 毎フレーム運ぶと自分でスクロールできなくなるので、直前に運んだ
+        // セッションを憶えて「変わったとき」だけにする。
+        let active_id = self.active_id();
+        let follow = scrolls && active_id.is_some() && active_id != self.cockpit_followed;
+        self.cockpit_followed = active_id;
+
+        if scrolls {
+            // 既定の浮動バーは触るまで完全に透明で、「まだ下にタイルがある」
+            // ことに気付けない。幅は取らせない (レイアウトを動かさない) まま、
+            // 薄く常時見せる。
+            let sc = &mut ui.spacing_mut().scroll;
+            sc.dormant_background_opacity = 0.35;
+            sc.dormant_handle_opacity = 0.8;
+        }
 
         egui::ScrollArea::vertical()
             .id_salt("cockpit-grid")
@@ -13439,7 +13813,9 @@ impl ZaivernApp {
                                                     && ui
                                                     .small_button(split_label)
                                                     .on_hover_text(tr(
-                                                        "このタイルを右へ分割\n\
+                                                        "このタイルを右へ分割して、新しいエージェントを起動\n\
+                                                         起動するものは 👾 Agent ＋ からの新規起動と同じです\n\
+                                                         (既定プリセット・作業フォルダはワークスペース)。\n\
                                                          分割中は各ペインのヘッダに ◎ (拡大) と ✕ (閉じる) が出ます。\n\
                                                          キーは ⌘⌥⇧→ 右へ分割 / ⌘⌥⇧↓ 下へ分割 / ⌘⌥N シェル /\n\
                                                          ⌘⌥W 閉じる / ⌘⌥←↑↓→ 移動 / ⌘⌥Z 拡大 / ⌘⌥E 等分 /\n\
@@ -13451,8 +13827,7 @@ impl ZaivernApp {
                                                         sid,
                                                         terminal::SplitAction::SplitWith {
                                                             dir: terminal::SplitDir::Horizontal,
-                                                            preset:
-                                                                terminal::PanePreset::SameAsParent,
+                                                            preset: terminal::PanePreset::NewAgent,
                                                         },
                                                     ));
                                                 }
@@ -13506,6 +13881,14 @@ impl ZaivernApp {
                                 });
                                 },
                             );
+                            // 画面外にあるタイルがアクティブになったら、そこまで
+                            // スクロールして見せる (キーやサイドバーで切り替えた
+                            // ときに「選んだはずのタイルが見えない」を防ぐ)。
+                            // align=None = 見えるようになる最小移動なので、
+                            // 既に見えているタイルを選んでも画面は動かない。
+                            if follow && active {
+                                ui.scroll_to_rect(cell.response.rect, None);
+                            }
                             // セル内のどこを押しても (タイトル文字・各ボタン・
                             // ミニターミナル含め) 紫枠のアクティブ選択が追従する。
                             // contains_pointer は子ウィジェットに覆われていても
@@ -13685,20 +14068,21 @@ impl ZaivernApp {
             .unwrap_or(tile);
         match action {
             SplitAction::SplitWith { dir, preset } => {
-                let Some(parent) = self.agents.sessions.iter().find(|s| s.id == focused) else {
+                // 置き場所 (どのペインの隣か) だけが分割の仕事。**何を起こすかは
+                // 新規起動と 1 か所も変えない** — 既定プリセットを、ワークスペースの
+                // 作業フォルダで起こす (親のプリセット・親の cwd は引き継がない)。
+                if !self.agents.sessions.iter().any(|s| s.id == focused) {
                     return;
-                };
-                let (cwd, parent_preset) = (parent.cwd.clone(), parent.preset_name.clone());
-                let Some(ix) = split_preset_index(&self.cfg.agents, &parent_preset, preset) else {
+                }
+                let Some(ix) = split_preset_index(&self.cfg.agents, preset) else {
                     self.toast(tr("起動できるエージェントの登録がありません"), false);
                     return;
                 };
-                let command = self.cfg.agents[ix].command.clone();
                 let before = self.agents.sessions.len();
                 // 分割はタイルの中で完結する操作なので、下部パネルを勝手に
                 // 開かない (「画面が突然変わらない」)。起動側の副作用だけ戻す。
                 let panel_was = self.agents.panel_open;
-                self.launch_preset_with(ix, command, &cwd, ctx);
+                self.launch_preset(ix, ctx);
                 self.agents.panel_open = panel_was;
                 if self.agents.sessions.len() == before {
                     return; // 起動に失敗した (トーストは launch 側が出す)
@@ -14002,6 +14386,9 @@ impl ZaivernApp {
                     } else {
                         ""
                     },
+                    // 指名スーパーエージェント (指揮官)。看板は同じ形のカードが
+                    // 並ぶので、どれが指揮官かを枠と冠で一目で分かるようにする。
+                    commander: self.super_agent_session == Some(s.id),
                     can_cycle: s.permission_switch_hint().is_some(),
                     // カードの一言 + ホバープレビュー + アクティビティ分類の材料。
                     // サンプリング周期のフレームだけ実際に PTY を読む
@@ -15161,6 +15548,9 @@ impl ZaivernApp {
         let Some(active) = self.editor.active else {
             return;
         };
+        // プレビューも「そのファイルの表示」なので、ファイル単位のズームが効く。
+        // ⌘+ホイールの振り分け対象にもする (本文とプレビューで挙動を変えない)。
+        self.zoom_area_next = Some((ui.max_rect(), ZoomArea::File));
         let id = self.editor.buffers[active].id;
         // 変換 (HTML→MD / 埋め込みHTML展開) は重いので内容が変わったときだけ行う
         let h = hash_str(&self.editor.buffers[active].text);
@@ -15186,7 +15576,7 @@ impl ZaivernApp {
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let theme = self.theme.clone();
-        let base = self.cfg.editor_font_size;
+        let base = self.editor_font_pt();
         let hl = self.highlighter;
         let images = &mut self.md_images;
         egui::ScrollArea::vertical()
@@ -15445,6 +15835,10 @@ impl ZaivernApp {
     /// − / ＋ / 100% / フィット ボタンと Ctrl(⌘)+スクロール (ピンチ) でズームできる。
     /// 壊れた画像はエラーメッセージだけを出す (文字化けテキストは出さない)。
     fn image_viewer_ui(&mut self, ui: &mut egui::Ui, i: usize) {
+        // ⌘+ホイール / ピンチはこのビューが自分で消費する。
+        // 申告しておかないと handle_zoom_gesture が同じジェスチャで
+        // 画面全体まで拡大してしまう (画像と UI の二重掛け)。
+        self.zoom_area_next = Some((ui.max_rect(), ZoomArea::Image));
         let theme_text = self.theme.text;
         let theme_dim = self.theme.text_dim;
         let theme_warn = self.theme.warn;
@@ -16016,6 +16410,9 @@ impl ZaivernApp {
         if self.preview_view_ui(ui, active) {
             return;
         }
+        // ⌘+ホイール / ピンチを「このファイルだけ」へ振り分けるための矩形。
+        // 次のフレームの `handle_zoom_gestures` が読む。
+        self.zoom_area_next = Some((ui.max_rect(), ZoomArea::File));
         let theme_text = self.theme.text;
         let theme_dim = self.theme.text_dim;
         let syntect_theme = self.theme.syntect_theme.clone();
@@ -16023,7 +16420,9 @@ impl ZaivernApp {
         // 行高が小数だと N 行目の y が丸められる位置が行ごとに変わり、
         // ガター番号・本文・スティッキーヘッダの縦位置が 1px ずつずれる。
         let ppp = ui.ctx().pixels_per_point();
-        let font = FontId::monospace(crate::theme::snap_font_size(self.cfg.editor_font_size, ppp));
+        // 画面全体のズームは pixels_per_point 側に乗っているので、ここで掛けるのは
+        // このタブだけの倍率 (`editor_font_pt`)。両方掛けると倍率が二乗になる。
+        let font = FontId::monospace(crate::theme::snap_font_size(self.editor_font_pt(), ppp));
         let row_h = ui
             .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
             .max(1.0 / ppp);
@@ -17545,17 +17944,43 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::ReloadConfig,
             ),
+            // ズームは対象が 2 つある。ラベルで対象を必ず言う
+            // (「拡大」だけだと何が大きくなるのか分からない)
             (
-                "🔠".into(),
-                tr("フォント拡大"),
-                fmt_key(BindAction::FontInc),
-                Cmd::FontInc,
+                "🔍".into(),
+                tr("画面全体をズームイン"),
+                fmt_key(BindAction::ZoomIn),
+                Cmd::ZoomIn,
             ),
             (
-                "🔠".into(),
-                tr("フォント縮小"),
-                fmt_key(BindAction::FontDec),
-                Cmd::FontDec,
+                "🔍".into(),
+                tr("画面全体をズームアウト"),
+                fmt_key(BindAction::ZoomOut),
+                Cmd::ZoomOut,
+            ),
+            (
+                "🔍".into(),
+                tr("画面全体のズームを 100% に戻す"),
+                fmt_key(BindAction::ZoomReset),
+                Cmd::ZoomReset,
+            ),
+            (
+                "🔎".into(),
+                tr("このファイルだけズームイン"),
+                fmt_key(BindAction::FileZoomIn),
+                Cmd::FileZoomIn,
+            ),
+            (
+                "🔎".into(),
+                tr("このファイルだけズームアウト"),
+                fmt_key(BindAction::FileZoomOut),
+                Cmd::FileZoomOut,
+            ),
+            (
+                "🔎".into(),
+                tr("このファイルのズームを解除"),
+                fmt_key(BindAction::FileZoomReset),
+                Cmd::FileZoomReset,
             ),
             (
                 "🌲".into(),
@@ -18171,9 +18596,17 @@ impl ZaivernApp {
             ));
         }
         for t in theme::all() {
+            // 明暗をラベルに入れておくと「ライト」「ダーク」でも絞り込める
+            // (テーマ名は英語なので、日本語の入力からは届かない)
             cmds.push((
                 "🎨".into(),
-                trf("テーマ: {label}", &[("label", t.label.clone())]),
+                trf(
+                    "テーマ: {label} ({kind})",
+                    &[
+                        ("label", t.label.clone()),
+                        ("kind", tr(if t.dark { "ダーク" } else { "ライト" })),
+                    ],
+                ),
                 String::new(),
                 Cmd::SetTheme(t.name.clone()),
             ));
@@ -19589,8 +20022,15 @@ impl ZaivernApp {
             "deck" => Some(Cmd::ToggleDeck),
             "new_task" => Some(Cmd::NewTask),
             "agent_message" => Some(Cmd::SendAgentMessage),
-            "font_inc" => Some(Cmd::FontInc),
-            "font_dec" => Some(Cmd::FontDec),
+            "zoom_in" => Some(Cmd::ZoomIn),
+            "zoom_out" => Some(Cmd::ZoomOut),
+            "zoom_reset" => Some(Cmd::ZoomReset),
+            "file_zoom_in" => Some(Cmd::FileZoomIn),
+            "file_zoom_out" => Some(Cmd::FileZoomOut),
+            "file_zoom_reset" => Some(Cmd::FileZoomReset),
+            // v0.5.1 までの名前。既存プラグインの run_command を壊さない。
+            "font_inc" => Some(Cmd::ZoomIn),
+            "font_dec" => Some(Cmd::ZoomOut),
             "tree" => Some(Cmd::RefreshTree),
             "approval_auto" => Some(Cmd::SetApproval("auto".into())),
             "approval_ask" => Some(Cmd::SetApproval("ask".into())),
@@ -21289,6 +21729,13 @@ impl ZaivernApp {
         // 永続 UI 設定 (検索オプション・保存時クリーンアップ) は最初のフレームで読む
         self.load_prefs_once(ctx);
 
+        // 画面全体のズームは毎フレームここで egui へ揃える。値が変わって
+        // いなければ何も起きない (再描画も要求されない)。
+        apply_ui_zoom(ctx, self.cfg.ui_zoom);
+        // ⌘+ホイール / ピンチはショートカットより先に見る。ここで拾わないと
+        // ScrollArea が同じイベントをスクロールとして食ってしまう。
+        self.handle_zoom_gesture(ctx);
+
         // **このフレームで描く中央ビューをここで 1 つに畳む。**
         // 以降の描画判断はすべて `self.center` を見る。描画中にフラグが
         // 変わっても今フレームの絵は変わらないので、2 つのビューが重なって
@@ -21300,6 +21747,9 @@ impl ZaivernApp {
         self.poll_voice(ctx);
 
         self.handle_shortcuts(ctx);
+        // ⌘+ホイール / トラックパッドのピンチ。egui はどちらも zoom_delta へ
+        // 集約するので、ここで 1 か所だけ拾う (画像タブは自前で消費する)。
+        self.handle_zoom_gesture(ctx);
         // Keybinds を持てない描画側 (ターミナルの右クリックメニュー等) へ
         // 打鍵表記を配る。ベタ書きを増やさないための唯一の経路。
         crate::keybinds::publish_key_hints(ctx, &self.keys, &[BindAction::Find]);
@@ -21930,6 +22380,11 @@ impl ZaivernApp {
         // 非表示のときは 1 本も予約しないので、完全アイドルの 0fps は保たれる。
         self.tutorial_tick(ctx);
 
+        // 今フレームのズームジェスチャの持ち主を確定させる。描かなかった
+        // フレームでは None になり、看板や画像タブに切り替えたあとも
+        // 古い矩形で「ファイル単位ズーム」に流れることがない。
+        self.zoom_area = self.zoom_area_next.take();
+
         // フレームの最後に、次の定期フレームだけをまとめて予約する。
         // ここより上で誰かが予約していれば egui は最短を採るので、
         // このポリシーは「他に誰も予約していないときの下限」を決める役になる。
@@ -22532,6 +22987,27 @@ fn push_fallback_fonts_all(
     n
 }
 
+/// 画面全体のズームを egui へ反映する。
+///
+/// egui は `pixels_per_point = zoom_factor × ネイティブ DPI` で描くので、
+/// これ 1 本で UI の全部 — サイドバー・タブ・メニュー・ターミナル・エディタ —
+/// が一緒に拡大縮小する。フォントサイズと余白の物理ピクセル丸め直しは
+/// `theme::resync_pixel_snapping` のフレーム先頭フックが自動で追随するため、
+/// ここでテーマを焼き直す必要はない。
+///
+/// **egui 内蔵のキーボードズームは切る。** egui は既定で `end_pass` に
+/// ⌘+/⌘-/⌘0 を拾って `zoom_factor` を直接書き換えるが、それを残すと
+/// 「アプリが `Config::ui_zoom` から入れた値」と「egui が勝手に入れた値」が
+/// 毎フレーム押し合いになり、倍率が戻る / 保存されないという形で壊れる。
+/// ズームの所有者は `Config::ui_zoom` 1 つに絞る。
+///
+/// `set_zoom_factor` は値が同じなら再描画も要求しないので、毎フレーム
+/// 呼んでもアイドル時のコストはゼロのまま。
+fn apply_ui_zoom(ctx: &egui::Context, z: f32) {
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
+    ctx.set_zoom_factor(zoom::clamp(z));
+}
+
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let candidates: Vec<&str> = if cfg!(target_os = "macos") {
@@ -22632,13 +23108,7 @@ impl ZaivernApp {
                 trf("{name} を実行", &[("name", name)])
             })
         });
-        let mut themes: Vec<(String, String, bool)> = theme::all()
-            .iter()
-            .map(|t| (t.name.clone(), t.label.clone(), t.name == self.cfg.theme))
-            .collect();
-        for (label, path) in self.custom_themes.iter().take(60) {
-            themes.push((path.clone(), format!("🔌 {label}"), self.cfg.theme == *path));
-        }
+        let themes = self.theme_entries();
         let plugin_commands: Vec<(usize, usize, String, String)> = self
             .plugins
             .iter()
@@ -22690,6 +23160,11 @@ impl ZaivernApp {
                 .editor
                 .active
                 .map(|_| self.active_line_ending().label()),
+            ui_zoom: self.cfg.ui_zoom,
+            file_zoom: self
+                .editor
+                .active
+                .map(|i| zoom::clamp(self.editor.buffers[i].zoom)),
             trim_trailing_on_save: self.save_trim_trailing,
             final_newline_on_save: self.save_final_newline,
             build_task: build_target.as_ref().map(|(l, ..)| l.clone()),
@@ -24092,12 +24567,28 @@ fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
             format_shortcut(keys.get(BindAction::ToggleFullScreen)),
         ),
         (
-            tr("フォント拡大"),
-            format_shortcut(keys.get(BindAction::FontInc)),
+            tr("画面全体をズームイン"),
+            format_shortcut(keys.get(BindAction::ZoomIn)),
         ),
         (
-            tr("フォント縮小"),
-            format_shortcut(keys.get(BindAction::FontDec)),
+            tr("画面全体をズームアウト"),
+            format_shortcut(keys.get(BindAction::ZoomOut)),
+        ),
+        (
+            tr("画面全体のズームを戻す"),
+            format_shortcut(keys.get(BindAction::ZoomReset)),
+        ),
+        (
+            tr("このファイルだけズームイン"),
+            format_shortcut(keys.get(BindAction::FileZoomIn)),
+        ),
+        (
+            tr("このファイルだけズームアウト"),
+            format_shortcut(keys.get(BindAction::FileZoomOut)),
+        ),
+        (
+            tr("このファイルのズームを解除"),
+            format_shortcut(keys.get(BindAction::FileZoomReset)),
         ),
     ];
     // egui TextEdit 内蔵 (バインド変更不可) のもの
@@ -27579,8 +28070,12 @@ mod wave2_tests {
             ("ToggleDeck", "ToggleDeck"),
             ("ToggleMdPreview", "ToggleMdPreview"),
             ("ToggleSidebar", "ToggleSidebar"),
-            ("FontInc", "FontInc"),
-            ("FontDec", "FontDec"),
+            ("ZoomIn", "ZoomIn"),
+            ("ZoomOut", "ZoomOut"),
+            ("ZoomReset", "ZoomReset"),
+            ("FileZoomIn", "FileZoomIn"),
+            ("FileZoomOut", "FileZoomOut"),
+            ("FileZoomReset", "FileZoomReset"),
             ("OpenFile", "OpenFileDialog"),
             ("SaveAll", "SaveAll"),
             ("GlobalSearch", "GlobalSearch"),
@@ -27645,6 +28140,194 @@ mod wave2_tests {
              (ベタ書きへ戻したか、行を消した)"
         );
     }
+    // ─── ズーム (画面全体 / ファイル単位) ────────────────────────────────
+
+    /// ズームの 6 コマンドすべてに、UI から届く経路が最低 1 本ある。
+    ///
+    /// 「実装したがどこからも押せない」を防ぐための配線チェック
+    /// (パレット / メニュー / キーバインド / ディスパッチの 4 点)。
+    #[test]
+    fn ズームは画面全体とファイル単位の両方から到達できる() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let menu = &include_str!("menu_bar.rs").replace("\r\n", "\n");
+        let list = src
+            .split("fn palette_builtin_cmds(&self) -> Vec<(String, String, String, Cmd)> {")
+            .nth(1)
+            .expect("パレットの一覧がある");
+        let router = src
+            .split("fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("ディスパッチがある");
+        let keys = src
+            .split("fn handle_shortcuts(&mut self, ctx: &egui::Context)")
+            .nth(1)
+            .expect("ショートカット処理がある");
+        for (cmd, action) in [
+            ("Cmd::ZoomIn", "BindAction::ZoomIn"),
+            ("Cmd::ZoomOut", "BindAction::ZoomOut"),
+            ("Cmd::ZoomReset", "BindAction::ZoomReset"),
+            ("Cmd::FileZoomIn", "BindAction::FileZoomIn"),
+            ("Cmd::FileZoomOut", "BindAction::FileZoomOut"),
+            ("Cmd::FileZoomReset", "BindAction::FileZoomReset"),
+        ] {
+            assert!(list.contains(cmd), "{cmd} がコマンドパレットに無い");
+            assert!(router.contains(cmd), "{cmd} のディスパッチが無い");
+            assert!(menu.contains(cmd), "{cmd} が表示メニューに無い");
+            assert!(keys.contains(action), "{action} のキーバインド処理が無い");
+        }
+    }
+
+    /// ⌘⌥- は「ファイル単位」だけに効き、「画面全体」へは流れない。
+    ///
+    /// egui の `matches_logically` は余分な修飾キーを許すので、⌘⌥- は
+    /// ⌘- のパターンにも一致する。⌥ 付きを先に消費していないと、
+    /// ファイル単位のズームのつもりで画面全体が動く (しかも 2 つ同時に動く)。
+    /// ここは順序が仕様なので、実際のイベントで固定する。
+    #[test]
+    fn ファイル単位のズームキーが画面全体へ漏れない() {
+        use egui::{Key, Modifiers};
+        let keys = Keybinds::default();
+        // 前提: egui の照合は余分な修飾キーを許す (許さなくなったら順序依存が消える)
+        assert!(
+            Modifiers::COMMAND
+                .plus(Modifiers::ALT)
+                .matches_logically(Modifiers::COMMAND),
+            "egui の修飾キー照合が変わった (この順序依存の前提が崩れている)"
+        );
+
+        for (file_act, ui_act, key) in [
+            (BindAction::FileZoomIn, BindAction::ZoomIn, Key::Plus),
+            (BindAction::FileZoomOut, BindAction::ZoomOut, Key::Minus),
+            (BindAction::FileZoomReset, BindAction::ZoomReset, Key::Num0),
+        ] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            let mods = Modifiers::COMMAND.plus(Modifiers::ALT);
+            input.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: mods,
+            });
+            input.modifiers = mods;
+            let (file_sc, ui_sc) = (keys.get(file_act), keys.get(ui_act));
+            let (mut hit_file, mut hit_ui) = (false, false);
+            let _ = ctx.run(input, |ctx| {
+                // handle_shortcuts と同じ順序 (⌥ 付きが先)
+                // handle_shortcuts と同じ互換経路・同じ順序 (⌥ 付きが先)
+                hit_file = ctx.input_mut(|i| crate::keybinds::consume_shortcut_compat(i, file_sc));
+                hit_ui = ctx.input_mut(|i| crate::keybinds::consume_shortcut_compat(i, ui_sc));
+            });
+            assert!(hit_file, "{file_act:?} が ⌘⌥ の打鍵を拾えていない");
+            assert!(!hit_ui, "{ui_act:?} まで発火している (画面全体へ漏れた)");
+        }
+    }
+
+    /// ファイル単位の倍率は **エディタの論理フォントサイズにだけ** 掛ける。
+    ///
+    /// 画面全体のズームは egui が `pixels_per_point` 側で掛けるので、
+    /// ここでも掛けると倍率が二乗になる (150% × 150% = 225% に見える)。
+    #[test]
+    fn ファイル単位のズームは画面全体と二重に掛からない() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn editor_font_pt(&self) -> f32 {")
+            .nth(1)
+            .expect("editor_font_pt がある");
+        let head = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        assert!(
+            head.contains("self.file_zoom()"),
+            "ファイル倍率を掛けていない"
+        );
+        assert!(
+            !head.contains("ui_zoom"),
+            "画面全体の倍率まで掛けている (二重適用): {head}"
+        );
+        // エディタ本文はこの関数を通す (cfg を直に読むと倍率が抜ける)
+        let editor = src
+            .split("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .nth(1)
+            .expect("code_editor_ui がある");
+        let head = &editor[..editor
+            .find("self.last_row_h = row_h;")
+            .unwrap_or(editor.len())];
+        assert!(
+            head.contains("self.editor_font_pt()"),
+            "本文のフォントサイズがファイル倍率を通っていない"
+        );
+    }
+
+    /// 画面全体のズームは egui の `zoom_factor` を動かし、UI 全体の
+    /// `pixels_per_point` に乗る。テーマ側の丸め直しもそれに追随する。
+    #[test]
+    fn 画面全体のズームがピクセル密度と文字サイズへ届く() {
+        let ctx = egui::Context::default();
+        super::install_fonts(&ctx);
+        crate::theme::apply(&ctx, &crate::theme::by_name("zaivern-dark"));
+        let _ = ctx.run(Default::default(), |_| {});
+        let native = ctx.native_pixels_per_point().unwrap_or(1.0);
+
+        for z in [0.5_f32, 1.0, 1.25, 2.0, 3.0] {
+            super::apply_ui_zoom(&ctx, z);
+            // set_zoom_factor はパス末尾で効くので、1 フレーム回してから見る
+            let _ = ctx.run(Default::default(), |_| {});
+            assert_eq!(ctx.zoom_factor(), z, "zoom_factor が入っていない");
+            assert!(
+                (ctx.pixels_per_point() - native * z).abs() < 1e-3,
+                "pixels_per_point が倍率に追随していない ({z})"
+            );
+            // 文字サイズは論理ポイントのまま (拡大は ppp 側が担う) だが、
+            // 物理ピクセル整数への丸めは新しい ppp でやり直されている
+            let _ = ctx.run(Default::default(), |_| {});
+            let ppp = ctx.pixels_per_point();
+            let body = ctx.style().text_styles[&egui::TextStyle::Body].size;
+            assert!(
+                (body - crate::theme::snap_font_size(crate::theme::BASE_BODY_SIZE, ppp)).abs()
+                    < 1e-4,
+                "倍率 {z} で文字サイズが丸め直されていない (body={body}, ppp={ppp})"
+            );
+        }
+    }
+
+    /// egui 内蔵のキーボードズームは切っておく。
+    ///
+    /// 残すと `Config::ui_zoom` と egui が同じ `zoom_factor` を毎フレーム
+    /// 奪い合い、「⌘+ が効かない / 倍率が保存されない」という形で壊れる。
+    /// ズームの所有者は 1 つに絞る (設計原則: 状態の持ち主を 1 つにする)。
+    #[test]
+    fn egui内蔵のキーボードズームは無効化されている() {
+        let ctx = egui::Context::default();
+        assert!(
+            ctx.options(|o| o.zoom_with_keyboard),
+            "egui の既定が変わった (この対策の前提が崩れている)"
+        );
+        super::apply_ui_zoom(&ctx, 1.0);
+        assert!(
+            !ctx.options(|o| o.zoom_with_keyboard),
+            "内蔵ズームを切っていない"
+        );
+    }
+
+    /// 壊れた設定値でも UI が潰れない。
+    ///
+    /// `ui_zoom = 0` を素通しすると全部が 0 ピクセルになり、設定を戻す口ごと
+    /// 消えて操作不能になる。ここは必ずクランプを通す。
+    #[test]
+    fn 壊れたズーム値でも表示が潰れない() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        for bad in [0.0_f32, -3.0, 1e9, f32::NAN, f32::INFINITY] {
+            super::apply_ui_zoom(&ctx, bad);
+            let _ = ctx.run(Default::default(), |_| {});
+            let z = ctx.zoom_factor();
+            assert!(
+                (crate::zoom::MIN..=crate::zoom::MAX).contains(&z),
+                "{bad} → {z} が範囲外"
+            );
+            assert!(ctx.pixels_per_point() > 0.0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -27659,7 +28342,8 @@ mod glyph_tests {
     fn ui_symbols_have_glyphs() {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
-        const UI_SYMBOLS: &str = "📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
+        const UI_SYMBOLS: &str =
+            "👑📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠🔤\
                                   💬📊⛔🔁·↩▸▾🔎◆📇💤🎬🎵🔆\
                                   💬📊⛔🔁·↩▸▾🔎◆📇💤🗺🔗›…\
                                   💬📊⛔🔁·↩▸▾🔎◆📇💤👤🔖\
@@ -28689,13 +29373,19 @@ mod tutorial_wiring_tests {
 mod cockpit_layout_tests {
     use super::*;
 
+    /// 既定のミニターミナル (端末 13pt → ミニ 10pt) での快適な高さ。
+    /// レイアウトのテストはこの値を基準にする。
+    fn comfort() -> f32 {
+        grid_comfort_cell_h(10.0)
+    }
+
     /// タイルの総幅は、どんな幅・枚数でも割り当てを超えない。
     #[test]
     fn グリッドは可用幅からはみ出さない() {
         for w in [320.0_f32, 480.0, 639.0, 640.0, 900.0, 1440.0, 2560.0] {
             for h in [200.0_f32, 600.0, 1200.0] {
                 for n in 1..=9usize {
-                    let g = cockpit_grid_metrics(egui::vec2(w, h), n);
+                    let g = cockpit_grid_metrics(egui::vec2(w, h), n, comfort());
                     let total = g.cell_w * g.cols as f32 + GRID_SPACING * (g.cols as f32 - 1.0);
                     assert!(
                         total <= w,
@@ -28711,10 +29401,193 @@ mod cockpit_layout_tests {
     /// 狭いときは 1 列へ落ちる (2 列のままだとタイルが潰れて中身が読めない)。
     #[test]
     fn 狭い窓では一列に落ちる() {
-        assert_eq!(cockpit_grid_metrics(egui::vec2(639.0, 800.0), 4).cols, 1);
-        assert_eq!(cockpit_grid_metrics(egui::vec2(640.0, 800.0), 4).cols, 2);
+        assert_eq!(
+            cockpit_grid_metrics(egui::vec2(639.0, 800.0), 4, comfort()).cols,
+            1
+        );
+        assert_eq!(
+            cockpit_grid_metrics(egui::vec2(640.0, 800.0), 4, comfort()).cols,
+            2
+        );
         // 1 枚しかないときは幅があっても 1 列 (半分空けない)
-        assert_eq!(cockpit_grid_metrics(egui::vec2(1600.0, 800.0), 1).cols, 1);
+        assert_eq!(
+            cockpit_grid_metrics(egui::vec2(1600.0, 800.0), 1, comfort()).cols,
+            1
+        );
+    }
+
+    /// **6 枚以上でタイルを潰さない。**
+    ///
+    /// これが本題: 枚数が増えたら 1 画面へ詰め込むのをやめ、快適な高さを保った
+    /// ままスクロールへ逃がす。ここが緩むと「開くほど何も読めない」に戻る。
+    #[test]
+    fn 枚数が増えてもタイルを潰さずスクロールへ逃がす() {
+        let avail = egui::vec2(1280.0, 700.0); // 2 列に割れる普通の窓
+        for n in 1..=16usize {
+            let g = cockpit_grid_metrics(avail, n, comfort());
+            assert!(
+                g.cell_h >= comfort() - 0.5,
+                "n={n}: タイルが快適な高さ ({}) を割った: {}",
+                comfort(),
+                g.cell_h
+            );
+        }
+        // 4 枚 (2 行) までは 1 画面に収まり、6 枚 (3 行) からはスクロールする。
+        assert!(!cockpit_grid_metrics(avail, 4, comfort()).scrolls(avail.y));
+        assert!(cockpit_grid_metrics(avail, 6, comfort()).scrolls(avail.y));
+        assert!(cockpit_grid_metrics(avail, 12, comfort()).scrolls(avail.y));
+    }
+
+    /// 枚数が増えても**既存タイルの高さは変わらない** (= 既存 PTY が
+    /// リサイズされない)。快適な高さで頭打ちになったあとの性質。
+    #[test]
+    fn 快適な高さに達したら枚数を足しても高さが動かない() {
+        let avail = egui::vec2(1280.0, 700.0);
+        let h6 = cockpit_grid_metrics(avail, 6, comfort()).cell_h;
+        for n in 6..=20usize {
+            assert_eq!(
+                cockpit_grid_metrics(avail, n, comfort()).cell_h,
+                h6,
+                "n={n}: 枚数を足しただけで既存タイルの高さが動いた"
+            );
+        }
+    }
+
+    /// 低い窓では 1 枚ぶんは窓へ収める (タイル 1 枚しか無いのに
+    /// スクロールさせない)。窓を縮めていったときに連続であること。
+    #[test]
+    fn 低い窓では一枚を窓に収める() {
+        for h in [180.0_f32, 240.0, 320.0, 400.0] {
+            let g = cockpit_grid_metrics(egui::vec2(900.0, h), 1, comfort());
+            assert!(
+                !g.scrolls(h),
+                "h={h}: タイル 1 枚しか無いのにスクロールしている"
+            );
+        }
+    }
+
+    /// 快適な高さは文字サイズに追従する (大きい文字ほど高いタイルが要る)。
+    #[test]
+    fn 快適な高さは文字サイズに追従する() {
+        assert!(grid_comfort_cell_h(14.0) > grid_comfort_cell_h(8.0));
+        // どのサイズでも最低高さは割らず、上限も超えない
+        for f in [8.0_f32, 10.0, 12.0, 14.0] {
+            let h = grid_comfort_cell_h(f);
+            assert!((GRID_MIN_CELL_H..=GRID_COMFORT_MAX_H).contains(&h), "f={f}");
+        }
+    }
+
+    /// **8 枚のときホイールでページが動く。**
+    ///
+    /// タイルの中身 (ミニターミナル相当) がセルを埋め尽くしていても、ホイールは
+    /// 外側の ScrollArea へ抜けて格子全体が動くこと。実際の描画と同じ
+    /// 「ScrollArea → 行 → セル → 全域を取るクリック可能領域」で組んで確かめる。
+    #[test]
+    fn 八枚のときホイールでページがスクロールする() {
+        use egui::{pos2, vec2, Rect};
+
+        let ctx = egui::Context::default();
+        let screen = vec2(1280.0, 700.0);
+        let n = 8usize;
+        let g = cockpit_grid_metrics(screen, n, comfort());
+        assert!(g.scrolls(screen.y), "前提: 8 枚は 1 画面に収まらない");
+
+        // 1 枚目のセルの矩形を返す (スクロールすれば上へ動く)。
+        let draw = |events: Vec<egui::Event>| -> Rect {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), screen)),
+                events,
+                ..Default::default()
+            };
+            let mut first = Rect::NOTHING;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("cockpit-grid")
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            for row in 0..g.rows {
+                                ui.horizontal(|ui| {
+                                    for col in 0..g.cols {
+                                        let i = row * g.cols + col;
+                                        if i >= n {
+                                            continue;
+                                        }
+                                        let cell = ui.scope_builder(
+                                            egui::UiBuilder::new()
+                                                .id_salt(("cockpit-cell-select", i))
+                                                .sense(egui::Sense::click()),
+                                            |ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.set_width(g.cell_w - 18.0);
+                                                    ui.set_height(g.cell_h - 18.0);
+                                                    // ミニターミナル相当 (フォーカス
+                                                    // していないのでホイールは取らない)
+                                                    ui.allocate_exact_size(
+                                                        ui.available_size(),
+                                                        egui::Sense::click_and_drag(),
+                                                    );
+                                                });
+                                            },
+                                        );
+                                        if i == 0 {
+                                            first = cell.response.rect;
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                });
+            });
+            first
+        };
+
+        let before = draw(vec![]);
+        // 格子の真ん中あたり (= タイルの上) でホイールを回す
+        let over = pos2(screen.x * 0.5, screen.y * 0.5);
+        let wheel = vec![
+            egui::Event::PointerMoved(over),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, -400.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let mut after = draw(wheel);
+        // egui はスクロールを数フレームに均すので、落ち着くまで空フレームを回す
+        for _ in 0..16 {
+            after = draw(vec![]);
+        }
+        assert!(
+            after.top() < before.top() - 100.0,
+            "ホイールでページが動いていない: {} → {}",
+            before.top(),
+            after.top()
+        );
+    }
+
+    /// Cockpit のミニターミナルは **hover_scroll=false** で描く。
+    ///
+    /// true にすると、タイルの上でホイールを回したときに端末の履歴だけが動き、
+    /// ページがスクロールできなくなる (タイルは画面の大半を覆っているので、
+    /// 事実上「6 枚目以降が見られない」に戻る)。
+    #[test]
+    fn ミニターミナルはホイールを外側へ譲る() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn cockpit_grid_ui(")
+            .nth(1)
+            .expect("cockpit_grid_ui がある");
+        let body = body
+            .split("fn active_id(")
+            .next()
+            .expect("後ろに別の関数がある");
+        // 改行位置に依存しないよう空白を潰してから照合する
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("mini_font, true, true, false"),
+            "Cockpit のミニターミナルは hover_scroll=false (最後の引数) で描くこと"
+        );
     }
 
     /// 代表的な窓 (900x700 と極端に低い窓を含む)。
@@ -29787,35 +30660,48 @@ mod split_wiring_tests {
             preset("シェル", ""),
             preset("Codex", "codex"),
         ];
-        // 親と同じ → 名前で引ける
-        assert_eq!(
-            split_preset_index(&agents, "Codex", PanePreset::SameAsParent),
-            Some(2)
-        );
-        // 親のプリセットが消えていたら素のシェルへ (勝手に別の CLI を起こさない)
-        assert_eq!(
-            split_preset_index(&agents, "消えたプリセット", PanePreset::SameAsParent),
-            Some(1)
-        );
+        // エージェント指定は **常に既定プリセット (先頭)** —
+        // 親が Codex でも Codex は引き継がない (新規起動と同じ 1 体)。
+        assert_eq!(split_preset_index(&agents, PanePreset::NewAgent), Some(0));
         // シェル指定は常に素のシェル
-        assert_eq!(
-            split_preset_index(&agents, "Codex", PanePreset::Shell),
-            Some(1)
-        );
+        assert_eq!(split_preset_index(&agents, PanePreset::Shell), Some(1));
 
         // 素のシェルが登録されていない構成でも動く (先頭で代替する)
         let no_shell = vec![preset("Claude Code", "claude")];
-        assert_eq!(
-            split_preset_index(&no_shell, "Codex", PanePreset::SameAsParent),
-            Some(0)
-        );
-        assert_eq!(
-            split_preset_index(&no_shell, "x", PanePreset::Shell),
-            Some(0)
-        );
+        assert_eq!(split_preset_index(&no_shell, PanePreset::NewAgent), Some(0));
+        assert_eq!(split_preset_index(&no_shell, PanePreset::Shell), Some(0));
 
         // 1 つも登録が無ければ None (呼び出し側がトーストを出す)
-        assert_eq!(split_preset_index(&[], "x", PanePreset::Shell), None);
+        assert_eq!(split_preset_index(&[], PanePreset::Shell), None);
+        assert_eq!(split_preset_index(&[], PanePreset::NewAgent), None);
+    }
+
+    /// 分割で起こすエージェントは「新規起動」と同じ経路を通ること。
+    ///
+    /// `launch_preset_with` (コマンドと cwd を差し替える再開用の口) を
+    /// 使ってしまうと、親の cwd・親のプリセットが混ざる。ソースを読んで
+    /// **新規起動と同じ `launch_preset`** を呼んでいることを固定する。
+    #[test]
+    fn split_launches_through_the_new_agent_path() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let (_, body) = src
+            .split_once("SplitAction::SplitWith { dir, preset } => {")
+            .expect("SplitWith の腕");
+        let (arm, _) = body
+            .split_once("SplitAction::ClosePane =>")
+            .expect("次の腕まで");
+        assert!(
+            arm.contains("self.launch_preset(ix, ctx);"),
+            "分割は新規起動と同じ launch_preset を通ること"
+        );
+        assert!(
+            !arm.contains("launch_preset_with"),
+            "分割で親の cwd / コマンドを差し替えないこと"
+        );
+        assert!(
+            !arm.contains("preset_name"),
+            "分割で親のプリセット名を引き継がないこと"
+        );
     }
 
     // ── レイアウト表の正規化 ────────────────────────────────────────
@@ -29992,7 +30878,7 @@ mod split_wiring_tests {
             got,
             Some(SplitAction::SplitWith {
                 dir: SplitDir::Horizontal,
-                preset: PanePreset::SameAsParent
+                preset: PanePreset::NewAgent
             })
         );
         assert!(left.is_empty());
