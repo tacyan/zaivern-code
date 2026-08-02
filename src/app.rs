@@ -10023,20 +10023,14 @@ impl ZaivernApp {
         // 消費して初めて、ファイル単位と画面全体が別の操作として成立する
         // (このファイル冒頭の「修飾キーの多いものを先に消費する」と同じ理由)。
         // 順序を入れ替えると **ファイル単位のズームが画面全体になる**。
-        let alt_cmd = Modifiers::COMMAND.plus(Modifiers::ALT);
-        if consume(ctx, self.keys.get(BindAction::FileZoomIn))
-            || consume(ctx, KeyboardShortcut::new(alt_cmd, Key::Equals))
-        {
-            cmds.push(Cmd::FileZoomIn);
-        }
-        if consume(ctx, self.keys.get(BindAction::FileZoomOut)) {
-            cmds.push(Cmd::FileZoomOut);
-        }
-        if consume(ctx, self.keys.get(BindAction::FileZoomReset)) {
-            cmds.push(Cmd::FileZoomReset);
-        }
+        // ファイル単位 (⌘⌥+ / ⌘⌥- / ⌘⌥0) は上でもう消費済み — ⌥ 付きを
+        // 先に取らないと、少ない方 (画面全体) へ吸われるため。
+        // `=` の別名も割り当てから作る (再割り当てしても別名がついてくる)。
         if consume(ctx, self.keys.get(BindAction::ZoomIn))
-            || consume(ctx, KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals))
+            || consume(
+                ctx,
+                KeyboardShortcut::new(self.keys.get(BindAction::ZoomIn).modifiers, Key::Equals),
+            )
         {
             cmds.push(Cmd::ZoomIn);
         }
