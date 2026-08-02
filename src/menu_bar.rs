@@ -51,6 +51,10 @@ pub struct MenuInfo {
     pub themes: Vec<(String, String, bool)>,
     /// アクティブなタブの改行コード表示 (例 "CRLF")。タブが無ければ None
     pub line_ending: Option<String>,
+    /// 画面全体のズーム倍率 (1.0 = 等倍)。表示メニューの「戻す」の有効/無効に使う
+    pub ui_zoom: f32,
+    /// アクティブなタブのズーム倍率。タブが無ければ None (ファイル単位の項目を落とす)
+    pub file_zoom: Option<f32>,
     /// 保存時に行末の空白を落とす (編集メニューのチェック状態)
     pub trim_trailing_on_save: bool,
     /// 保存時に最終行へ改行を入れる (同上)
@@ -482,16 +486,62 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
                     });
             });
             ui.separator();
-            if item(ui, &tr("ズームイン"), &sc(keys, BindAction::FontInc), true) {
-                cmds.push(Cmd::FontInc);
+            // ズームは二階建て。「画面全体」を先に置き、「このファイルだけ」を
+            // その下に置くことで、対象の広い順に読める並びにする。
+            if item(ui, &tr("ズームイン"), &sc(keys, BindAction::ZoomIn), true) {
+                cmds.push(Cmd::ZoomIn);
             }
             if item(
                 ui,
                 &tr("ズームアウト"),
-                &sc(keys, BindAction::FontDec),
+                &sc(keys, BindAction::ZoomOut),
                 true,
             ) {
-                cmds.push(Cmd::FontDec);
+                cmds.push(Cmd::ZoomOut);
+            }
+            // 等倍のときは「戻す」を押せなくする (押しても何も起きない項目を
+            // 生かしておくと、効かないのか壊れているのか区別が付かない)。
+            if item(
+                ui,
+                &trf(
+                    "ズームを戻す ({pct})",
+                    &[("pct", crate::zoom::label(info.ui_zoom))],
+                ),
+                &sc(keys, BindAction::ZoomReset),
+                !crate::zoom::is_default(info.ui_zoom),
+            ) {
+                cmds.push(Cmd::ZoomReset);
+            }
+            ui.separator();
+            // ファイル単位のズームはタブが開いているときだけ意味を持つ。
+            let has_file = info.file_zoom.is_some();
+            if item(
+                ui,
+                &tr("このファイルだけズームイン"),
+                &sc(keys, BindAction::FileZoomIn),
+                has_file,
+            ) {
+                cmds.push(Cmd::FileZoomIn);
+            }
+            if item(
+                ui,
+                &tr("このファイルだけズームアウト"),
+                &sc(keys, BindAction::FileZoomOut),
+                has_file,
+            ) {
+                cmds.push(Cmd::FileZoomOut);
+            }
+            let file_z = info.file_zoom.unwrap_or(crate::zoom::DEFAULT);
+            if item(
+                ui,
+                &trf(
+                    "このファイルのズームを解除 ({pct})",
+                    &[("pct", crate::zoom::label(file_z))],
+                ),
+                &sc(keys, BindAction::FileZoomReset),
+                has_file && !crate::zoom::is_default(file_z),
+            ) {
+                cmds.push(Cmd::FileZoomReset);
             }
         });
         ui.separator();

@@ -151,6 +151,17 @@ pub struct Buffer {
     /// 折り返し・空白可視化のどれかが変わったときにだけ再構築が走り、
     /// 何も変わらないフレームでは Vec を読むだけになる。
     pub minimap: Option<(u64, crate::minimap::MinimapRows)>,
+    /// このタブだけのズーム倍率 (1.0 = 画面全体のズームに従うだけ)。
+    ///
+    /// 画面全体のズーム (`Config::ui_zoom`) の **上に掛かる** ので、
+    /// 「UI は 100% のまま、このファイルだけ 150% で読む」ができる。
+    /// 段は [`crate::zoom::STEPS`]。
+    ///
+    /// タブを閉じれば消える一時的な表示状態 (スクロール位置と同じ扱い) で、
+    /// ディスクにも state.toml にも保存しない。ファイルの中身ではないものを
+    /// 永続化すると、後から「なぜこのファイルだけ字が大きいのか」が
+    /// どこにも書かれていない謎として残るため。
+    pub zoom: f32,
 }
 
 /// 画像タブのデコード結果。
@@ -1412,6 +1423,7 @@ impl Editor {
             table: None,
             preview: None,
             minimap: None,
+            zoom: crate::zoom::DEFAULT,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -1451,6 +1463,7 @@ impl Editor {
             table: None,
             preview,
             minimap: None,
+            zoom: crate::zoom::DEFAULT,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -1557,6 +1570,7 @@ impl Editor {
                 table: None,
                 preview: None,
                 minimap: None,
+                zoom: crate::zoom::DEFAULT,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -1602,6 +1616,7 @@ impl Editor {
                 table: None,
                 preview: None,
                 minimap: None,
+                zoom: crate::zoom::DEFAULT,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -1637,6 +1652,7 @@ impl Editor {
             table: None,
             preview: None,
             minimap: None,
+            zoom: crate::zoom::DEFAULT,
         });
         self.active = Some(self.buffers.len() - 1);
         Ok(false)
@@ -1684,6 +1700,7 @@ impl Editor {
             table: None,
             preview: None,
             minimap: None,
+            zoom: crate::zoom::DEFAULT,
         });
         self.active = Some(self.buffers.len() - 1);
         id

@@ -514,7 +514,7 @@ On restart, the previous tabs, active tab, and panel state are restored automati
 - **The "black tile" terminal was fixed at the source.** Panics in the vt100 parser (scroll regions, tab stops, line operations) and runaway `CSI <huge number>` repeat parameters are now clamped — the patches live in `vendor/vt100` and are pinned by a hostile-input test suite. A tile that still breaks is quarantined on its own with a "⚠ retry" banner, **never left as an empty black rectangle**. Closed alongside it: plugin timeouts now kill the whole process tree (a stray grandchild used to freeze the editor), the IME confirm-Enter that leaked through to the agent, and corruption when saving in non-UTF-8 encodings such as CP932
 
 ### 📱 Phone Remote in detail
-- **What you can do**: view/edit/save open files, switch tabs, search & open workspace files, view agent terminals, send instructions, approve (Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y buttons), and run commands (save, new file, Cockpit, font ±, approval-mode switch, and more)
+- **What you can do**: view/edit/save open files, switch tabs, search & open workspace files, view agent terminals, send instructions, approve (Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y buttons), and run commands (save, new file, Cockpit, zoom ±, approval-mode switch, and more)
 - **How it works**: a tiny built-in HTTP server (port 8899, auto-fallback to 8900–8919 if busy). Pure `std::net` — zero extra crates
 - **Security**: authenticated with a random token generated per launch (embedded in the QR URL). Tokenless API access gets a 401. LAN only
 - **🔐 Reach it without sharing a Wi-Fi — SSH reverse tunnel**: LAN mode assumes you are on the same Wi-Fi, so it does not reach you away from home. 📱 → "Remote connection (SSH)" relays through **a host you can already SSH into** (a VPS, a home server, the office jump box). The path is `phone ──HTTP──▶ jump box:8899 ──SSH tunnel──▶ PC:127.0.0.1:8899`, so **the phone needs no SSH client at all** — it just opens a URL
@@ -626,7 +626,16 @@ cargo clippy --all-targets --locked -- -D warnings   # plus the frozen -A list (
 | Enter | Auto-indent (previous line's indent, extra level after `{ ( [ :`) |
 | ⌘B | Toggle sidebar |
 | ⌘⇧E | Show and focus the Explorer (file tree) |
-| ⌘+ / ⌘- | Font size up / down |
+| ⌘+ / ⌘- / ⌘0 | Zoom **the whole window** in / out / back to 100% |
+| ⌘⌥+ / ⌘⌥- / ⌘⌥0 | Zoom **only the open file** in / out / reset |
+| ⌘ + wheel (or pinch) | File-level zoom when the pointer is over the editor body, window zoom otherwise |
+
+**Zoom has two levels.** Window zoom works like VS Code's `window.zoomLevel`: the entire
+UI — sidebar, tabs, menus, and the **terminal** — scales together, and the factor is
+remembered in `~/.zaivern/state.toml` (50%–300%, 13 steps). File zoom applies only to that
+tab's body (and its Markdown preview); it is temporary and disappears when the tab closes.
+While either is off 100%, the status bar shows `🔍 125%` / `🔎 150%` — **click it to reset**.
+The View menu and the command palette offer the same actions.
 
 ### Agent terminal (macOS)
 
@@ -666,7 +675,7 @@ Pasting onto an existing name auto-renames the VS Code way: `file copy.ts` → `
 
 On Windows / Linux, read ⌘ as Ctrl. Inside the terminal, control keys like Ctrl+C, arrows, Tab, and Esc go straight to the PTY (Shift/Option+Enter is sent as a newline, supporting Claude Code's multi-line input).
 
-Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `global_replace` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_deck` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `toggle_fold` `unfold_all` `toggle_bookmark` `reopen_closed_tab` `lsp_completion` `lsp_references` `lsp_symbols` `lsp_rename` `lsp_format` `lsp_code_action` `lsp_signature_help` `select_next_occurrence` `split_editor_right` `split_editor_down` `focus_pane_1` `focus_pane_2` `focus_pane_3` `diff_next_change` `diff_prev_change`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
+Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `global_replace` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_deck` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `zoom_in` `zoom_out` `zoom_reset` `file_zoom_in` `file_zoom_out` `file_zoom_reset` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `toggle_fold` `unfold_all` `toggle_bookmark` `reopen_closed_tab` `lsp_completion` `lsp_references` `lsp_symbols` `lsp_rename` `lsp_format` `lsp_code_action` `lsp_signature_help` `select_next_occurrence` `split_editor_right` `split_editor_down` `focus_pane_1` `focus_pane_2` `focus_pane_3` `diff_next_change` `diff_prev_change`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
 
 **The keystrokes printed on screen are generated from this table.** Every "⌘S" in a menu, a context menu, the palette or a tooltip is looked up rather than hand-written, so rebinding an action in `[keybindings]` **changes the label too** — the UI can never claim a shortcut you no longer have. Each action is also pinned by a test that it reaches a place which actually consumes it, so **a shortcut that shows up but does nothing fails CI**. The set of keystrokes macOS holds onto (⌘Space, ⌃Space, ⌥⌘D and friends) was read off the OS rather than guessed, and the same test proves no default binding lands on one. The egui-winit 0.29 bug where **⌘⇧C / ⌘⇧V have their key-press event swallowed and replaced by Copy / Paste** is routed around by reconstructing the original keystroke from the substituted event (the Cockpit's ⌘⇧C goes through that path).
 

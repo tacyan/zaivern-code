@@ -69,8 +69,20 @@ pub enum Cmd {
     SetTheme(String),
     OpenConfig,
     ReloadConfig,
-    FontInc,
-    FontDec,
+    /// 画面全体を 1 段拡大する (VS Code の「ズームイン」= ⌘+)。
+    /// UI の全部 — サイドバー・タブ・メニュー・端末・エディタ — が一緒に大きくなる。
+    ZoomIn,
+    /// 画面全体を 1 段縮小する (⌘-)。
+    ZoomOut,
+    /// 画面全体のズームを 100% へ戻す (⌘0)。
+    ZoomReset,
+    /// アクティブなタブ **だけ** を 1 段拡大する (⌘⌥+)。
+    /// 画面全体のズームの上に掛かるので、UI は等倍のままこのファイルだけ拡大できる。
+    FileZoomIn,
+    /// アクティブなタブだけを 1 段縮小する (⌘⌥-)。
+    FileZoomOut,
+    /// アクティブなタブのズームを解除して画面全体の倍率に戻す (⌘⌥0)。
+    FileZoomReset,
     SendFileToAgent,
     RefreshTree,
     /// 既定の承認モード: "ask"(毎回ユーザー承認) | "auto"(全自動YES) | "agent"(Agent欄優先)
@@ -554,8 +566,12 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleFullScreen
         | Cmd::ToggleTableView
         | Cmd::ToggleLspHighlight
-        | Cmd::FontInc
-        | Cmd::FontDec
+        | Cmd::ZoomIn
+        | Cmd::ZoomOut
+        | Cmd::ZoomReset
+        | Cmd::FileZoomIn
+        | Cmd::FileZoomOut
+        | Cmd::FileZoomReset
         | Cmd::SetTheme(_)
         | Cmd::ShowExplorer
         | Cmd::TogglePet
