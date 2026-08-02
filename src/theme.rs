@@ -120,12 +120,15 @@ fn zaivern_light() -> Theme {
         accent: c(0x6f, 0x5b, 0xd0),
         accent_soft: c(0xe4, 0xdf, 0xf7),
         text: c(0x24, 0x28, 0x33),
-        text_dim: c(0x74, 0x7a, 0x8a),
+        // 補助テキストは白地に対して 4.5:1 (WCAG AA) を満たす濃さにする
+        text_dim: c(0x6b, 0x71, 0x80),
         border: c(0xd8, 0xd8, 0xd2),
         term_bg: c(0xff, 0xff, 0xfe),
         term_fg: c(0x2c, 0x31, 0x3d),
-        ok: c(0x16, 0xa3, 0x4a),
-        warn: c(0xb4, 0x83, 0x06),
+        // 明るい緑 (#16a34a) / 黄 (#b48306) は白地パネルに対して 3:1 を割り、
+        // バッジや診断の色として沈んでいた。基準を満たす濃さへ落とす。
+        ok: c(0x15, 0x80, 0x3d),
+        warn: c(0x9a, 0x6b, 0x00),
         err: c(0xdc, 0x26, 0x26),
         ansi: [
             c(0x3a, 0x3f, 0x4b),
@@ -146,6 +149,345 @@ fn zaivern_light() -> Theme {
             c(0x24, 0x28, 0x33),
         ],
         syntect_theme: "InspiredGitHub".into(),
+    }
+}
+
+// ─── 追加テーマ ──────────────────────────────────────────────────
+//
+// 新しい配色を足すときの制約 (どれも回帰テストが守っている):
+//   * `syntect_theme` は syntect の `ThemeSet::load_defaults()` に**実在する名前**。
+//     外すとハイライトが黙って無地に落ちる (highlight.rs が None でプレーン化する)。
+//   * ダークの `panel` は十分に暗く。file_tree の git バッジ (VS Code 準拠の
+//     固定色) とのコントラスト比 3.0 を割ると回帰テストが落ちる。
+//   * `accent_soft` は「地に近い淡色」。diff の hunk 背景がこれなので、
+//     本文色 (`text`) と十分離れていないと差分ビューが読めなくなる。
+//   * `ansi[0..8]` は互いに異なる色 (明色側 8..16 は再利用可)。
+
+/// 北欧の青灰 (Nord 系)。寒色でコントラストは穏やか。
+fn zaivern_nordic() -> Theme {
+    Theme {
+        name: "zaivern-nordic".into(),
+        label: "Zaivern Nordic".into(),
+        dark: true,
+        bg: c(0x10, 0x14, 0x1b),
+        panel: c(0x17, 0x1d, 0x27),
+        panel_alt: c(0x13, 0x19, 0x22),
+        accent: c(0x88, 0xc0, 0xd0),
+        accent_soft: c(0x24, 0x31, 0x3f),
+        text: c(0xe5, 0xe9, 0xf0),
+        text_dim: c(0x8b, 0x98, 0xad),
+        border: c(0x23, 0x2c, 0x3a),
+        term_bg: c(0x0d, 0x11, 0x17),
+        term_fg: c(0xd8, 0xde, 0xe9),
+        ok: c(0xa3, 0xbe, 0x8c),
+        warn: c(0xeb, 0xcb, 0x8b),
+        err: c(0xbf, 0x61, 0x6a),
+        ansi: [
+            c(0x2e, 0x34, 0x40),
+            c(0xbf, 0x61, 0x6a),
+            c(0xa3, 0xbe, 0x8c),
+            c(0xeb, 0xcb, 0x8b),
+            c(0x81, 0xa1, 0xc1),
+            c(0xb4, 0x8e, 0xad),
+            c(0x88, 0xc0, 0xd0),
+            c(0xd8, 0xde, 0xe9),
+            c(0x4c, 0x56, 0x6a),
+            c(0xcf, 0x6f, 0x78),
+            c(0xb3, 0xcd, 0x9a),
+            c(0xf2, 0xd7, 0x9c),
+            c(0x8f, 0xb0, 0xd4),
+            c(0xc4, 0x9d, 0xbd),
+            c(0x8f, 0xbc, 0xbb),
+            c(0xec, 0xef, 0xf4),
+        ],
+        syntect_theme: "base16-ocean.dark".into(),
+    }
+}
+
+/// 炭火の暖色 (Gruvbox 系)。目に刺さらないレトロな色調。
+fn zaivern_ember() -> Theme {
+    Theme {
+        name: "zaivern-ember".into(),
+        label: "Zaivern Ember".into(),
+        dark: true,
+        bg: c(0x1a, 0x17, 0x14),
+        panel: c(0x22, 0x1d, 0x19),
+        panel_alt: c(0x1d, 0x19, 0x16),
+        accent: c(0xfe, 0x80, 0x19),
+        accent_soft: c(0x3b, 0x2a, 0x1c),
+        text: c(0xec, 0xe0, 0xcd),
+        text_dim: c(0xa8, 0x99, 0x84),
+        border: c(0x33, 0x2b, 0x24),
+        term_bg: c(0x17, 0x14, 0x11),
+        term_fg: c(0xeb, 0xdb, 0xb2),
+        ok: c(0xb8, 0xbb, 0x26),
+        warn: c(0xfa, 0xbd, 0x2f),
+        err: c(0xfb, 0x49, 0x34),
+        ansi: [
+            c(0x28, 0x28, 0x28),
+            c(0xcc, 0x24, 0x1d),
+            c(0x98, 0x97, 0x1a),
+            c(0xd7, 0x99, 0x21),
+            c(0x45, 0x85, 0x88),
+            c(0xb1, 0x62, 0x86),
+            c(0x68, 0x9d, 0x6a),
+            c(0xa8, 0x99, 0x84),
+            c(0x92, 0x83, 0x74),
+            c(0xfb, 0x49, 0x34),
+            c(0xb8, 0xbb, 0x26),
+            c(0xfa, 0xbd, 0x2f),
+            c(0x83, 0xa5, 0x98),
+            c(0xd3, 0x86, 0x9b),
+            c(0x8e, 0xc0, 0x7c),
+            c(0xeb, 0xdb, 0xb2),
+        ],
+        syntect_theme: "base16-eighties.dark".into(),
+    }
+}
+
+/// 深緑 (Everforest 系)。長時間の作業向けに彩度を落とした緑基調。
+fn zaivern_forest() -> Theme {
+    Theme {
+        name: "zaivern-forest".into(),
+        label: "Zaivern Forest".into(),
+        dark: true,
+        bg: c(0x0f, 0x16, 0x11),
+        panel: c(0x16, 0x1e, 0x17),
+        panel_alt: c(0x12, 0x1a, 0x14),
+        accent: c(0xa7, 0xc0, 0x80),
+        accent_soft: c(0x24, 0x33, 0x1f),
+        text: c(0xe0, 0xe6, 0xd4),
+        text_dim: c(0x93, 0xa1, 0x7f),
+        border: c(0x23, 0x30, 0x1f),
+        term_bg: c(0x0c, 0x12, 0x0e),
+        term_fg: c(0xd3, 0xc6, 0xaa),
+        ok: c(0x8f, 0xbf, 0x7f),
+        warn: c(0xdb, 0xbc, 0x7f),
+        err: c(0xe6, 0x7e, 0x80),
+        ansi: [
+            c(0x1e, 0x23, 0x26),
+            c(0xe6, 0x7e, 0x80),
+            c(0xa7, 0xc0, 0x80),
+            c(0xdb, 0xbc, 0x7f),
+            c(0x7f, 0xbb, 0xb3),
+            c(0xd6, 0x99, 0xb6),
+            c(0x83, 0xc0, 0x92),
+            c(0xd3, 0xc6, 0xaa),
+            c(0x4b, 0x56, 0x5c),
+            c(0xef, 0x93, 0x95),
+            c(0xb8, 0xd0, 0x93),
+            c(0xe8, 0xcc, 0x94),
+            c(0x94, 0xcb, 0xc4),
+            c(0xe3, 0xac, 0xc6),
+            c(0x97, 0xd0, 0xa5),
+            c(0xf0, 0xed, 0xdf),
+        ],
+        syntect_theme: "base16-ocean.dark".into(),
+    }
+}
+
+/// 深海の青緑 (Solarized Dark 系)。彩度を抑えた低刺激の配色。
+fn zaivern_ocean() -> Theme {
+    Theme {
+        name: "zaivern-ocean".into(),
+        label: "Zaivern Ocean".into(),
+        dark: true,
+        bg: c(0x00, 0x20, 0x28),
+        panel: c(0x00, 0x2a, 0x35),
+        panel_alt: c(0x00, 0x24, 0x2d),
+        accent: c(0x2a, 0xa1, 0x98),
+        accent_soft: c(0x07, 0x36, 0x42),
+        text: c(0xd6, 0xe3, 0xe0),
+        text_dim: c(0x8b, 0xa1, 0xa0),
+        border: c(0x0b, 0x3c, 0x48),
+        term_bg: c(0x00, 0x1b, 0x21),
+        term_fg: c(0x9a, 0xa9, 0xa8),
+        ok: c(0x85, 0x99, 0x00),
+        warn: c(0xb5, 0x89, 0x00),
+        err: c(0xdc, 0x32, 0x2f),
+        ansi: [
+            c(0x07, 0x36, 0x42),
+            c(0xdc, 0x32, 0x2f),
+            c(0x85, 0x99, 0x00),
+            c(0xb5, 0x89, 0x00),
+            c(0x26, 0x8b, 0xd2),
+            c(0xd3, 0x36, 0x82),
+            c(0x2a, 0xa1, 0x98),
+            c(0xee, 0xe8, 0xd5),
+            c(0x58, 0x6e, 0x75),
+            c(0xe0, 0x5a, 0x57),
+            c(0x9f, 0xb3, 0x00),
+            c(0xcf, 0x9f, 0x00),
+            c(0x4a, 0xa3, 0xe0),
+            c(0xe0, 0x55, 0x9b),
+            c(0x3d, 0xc0, 0xb5),
+            c(0xfd, 0xf6, 0xe3),
+        ],
+        syntect_theme: "Solarized (dark)".into(),
+    }
+}
+
+/// 純黒。OLED の消灯を活かした高コントラスト (省電力・暗所向け)。
+fn zaivern_carbon() -> Theme {
+    Theme {
+        name: "zaivern-carbon".into(),
+        label: "Zaivern Carbon".into(),
+        dark: true,
+        bg: c(0x00, 0x00, 0x00),
+        panel: c(0x0a, 0x0a, 0x0a),
+        panel_alt: c(0x05, 0x05, 0x05),
+        accent: c(0x00, 0xd1, 0xff),
+        accent_soft: c(0x10, 0x22, 0x2a),
+        text: c(0xff, 0xff, 0xff),
+        text_dim: c(0xa0, 0xa0, 0xa0),
+        border: c(0x26, 0x26, 0x26),
+        term_bg: c(0x00, 0x00, 0x00),
+        term_fg: c(0xf2, 0xf2, 0xf2),
+        ok: c(0x22, 0xe0, 0x6a),
+        warn: c(0xff, 0xcc, 0x00),
+        err: c(0xff, 0x5f, 0x5f),
+        ansi: [
+            c(0x1a, 0x1a, 0x1a),
+            c(0xff, 0x5f, 0x5f),
+            c(0x4e, 0xe8, 0x8a),
+            c(0xff, 0xd1, 0x66),
+            c(0x63, 0xb3, 0xff),
+            c(0xd7, 0x8b, 0xff),
+            c(0x5f, 0xe4, 0xe4),
+            c(0xe6, 0xe6, 0xe6),
+            c(0x4d, 0x4d, 0x4d),
+            c(0xff, 0x87, 0x87),
+            c(0x7f, 0xf0, 0xa8),
+            c(0xff, 0xe0, 0x8a),
+            c(0x8e, 0xc9, 0xff),
+            c(0xe3, 0xb0, 0xff),
+            c(0x93, 0xf2, 0xf2),
+            c(0xff, 0xff, 0xff),
+        ],
+        syntect_theme: "base16-eighties.dark".into(),
+    }
+}
+
+/// 生成りの紙 (Solarized Light 系)。白飛びしない暖色のライト。
+fn zaivern_paper() -> Theme {
+    Theme {
+        name: "zaivern-paper".into(),
+        label: "Zaivern Paper".into(),
+        dark: false,
+        bg: c(0xfd, 0xf6, 0xe3),
+        panel: c(0xf2, 0xea, 0xd3),
+        panel_alt: c(0xec, 0xe3, 0xc8),
+        accent: c(0xa3, 0x5d, 0x16),
+        accent_soft: c(0xf0, 0xe2, 0xc4),
+        text: c(0x3b, 0x32, 0x28),
+        text_dim: c(0x6f, 0x63, 0x50),
+        border: c(0xdd, 0xd3, 0xb4),
+        term_bg: c(0xff, 0xfb, 0xf0),
+        term_fg: c(0x45, 0x3b, 0x2e),
+        ok: c(0x4d, 0x7c, 0x0f),
+        warn: c(0xa1, 0x62, 0x07),
+        err: c(0xb9, 0x1c, 0x1c),
+        ansi: [
+            c(0x46, 0x3c, 0x2f),
+            c(0xc0, 0x39, 0x2b),
+            c(0x4d, 0x7c, 0x0f),
+            c(0xa1, 0x62, 0x07),
+            c(0x1d, 0x6f, 0xa5),
+            c(0x8e, 0x44, 0xad),
+            c(0x0f, 0x76, 0x6e),
+            c(0x6b, 0x61, 0x52),
+            c(0x8a, 0x7f, 0x6d),
+            c(0xc0, 0x39, 0x2b),
+            c(0x4d, 0x7c, 0x0f),
+            c(0xa1, 0x62, 0x07),
+            c(0x1d, 0x6f, 0xa5),
+            c(0x8e, 0x44, 0xad),
+            c(0x0f, 0x76, 0x6e),
+            c(0x2b, 0x24, 0x1b),
+        ],
+        syntect_theme: "Solarized (light)".into(),
+    }
+}
+
+/// 白地に黒。屋外や外部ディスプレイ向けの高コントラストなライト。
+fn zaivern_daylight() -> Theme {
+    Theme {
+        name: "zaivern-daylight".into(),
+        label: "Zaivern Daylight".into(),
+        dark: false,
+        bg: c(0xff, 0xff, 0xff),
+        panel: c(0xf4, 0xf4, 0xf5),
+        panel_alt: c(0xea, 0xea, 0xec),
+        accent: c(0x0b, 0x57, 0xd0),
+        accent_soft: c(0xdb, 0xe6, 0xfb),
+        text: c(0x10, 0x10, 0x14),
+        text_dim: c(0x55, 0x55, 0x5e),
+        border: c(0xc8, 0xc8, 0xcc),
+        term_bg: c(0xff, 0xff, 0xff),
+        term_fg: c(0x14, 0x14, 0x1a),
+        ok: c(0x0a, 0x7a, 0x34),
+        warn: c(0x8a, 0x5a, 0x00),
+        err: c(0xc1, 0x12, 0x12),
+        ansi: [
+            c(0x1b, 0x1b, 0x20),
+            c(0xc1, 0x12, 0x12),
+            c(0x0a, 0x7a, 0x34),
+            c(0x8a, 0x5a, 0x00),
+            c(0x0b, 0x57, 0xd0),
+            c(0x7a, 0x1f, 0xa2),
+            c(0x00, 0x70, 0x6b),
+            c(0x5c, 0x5c, 0x66),
+            c(0x7a, 0x7a, 0x85),
+            c(0xc1, 0x12, 0x12),
+            c(0x0a, 0x7a, 0x34),
+            c(0x8a, 0x5a, 0x00),
+            c(0x0b, 0x57, 0xd0),
+            c(0x7a, 0x1f, 0xa2),
+            c(0x00, 0x70, 0x6b),
+            c(0x10, 0x10, 0x14),
+        ],
+        syntect_theme: "InspiredGitHub".into(),
+    }
+}
+
+/// 霜の青みがかったライト。白すぎず、寒色で締まった配色。
+fn zaivern_frost() -> Theme {
+    Theme {
+        name: "zaivern-frost".into(),
+        label: "Zaivern Frost".into(),
+        dark: false,
+        bg: c(0xf4, 0xf7, 0xfb),
+        panel: c(0xe8, 0xee, 0xf7),
+        panel_alt: c(0xdf, 0xe7, 0xf2),
+        accent: c(0x2f, 0x6f, 0xd0),
+        accent_soft: c(0xd6, 0xe2, 0xf5),
+        text: c(0x1f, 0x2a, 0x3a),
+        text_dim: c(0x5a, 0x6a, 0x80),
+        border: c(0xc6, 0xd2, 0xe2),
+        term_bg: c(0xfb, 0xfd, 0xff),
+        term_fg: c(0x24, 0x30, 0x4a),
+        ok: c(0x17, 0x80, 0x3d),
+        warn: c(0x9a, 0x67, 0x00),
+        err: c(0xc6, 0x28, 0x28),
+        ansi: [
+            c(0x2b, 0x36, 0x48),
+            c(0xc6, 0x28, 0x28),
+            c(0x17, 0x80, 0x3d),
+            c(0x9a, 0x67, 0x00),
+            c(0x2f, 0x6f, 0xd0),
+            c(0x7b, 0x3f, 0xb5),
+            c(0x0e, 0x74, 0x90),
+            c(0x5b, 0x6b, 0x80),
+            c(0x84, 0x94, 0xa8),
+            c(0xc6, 0x28, 0x28),
+            c(0x17, 0x80, 0x3d),
+            c(0x9a, 0x67, 0x00),
+            c(0x2f, 0x6f, 0xd0),
+            c(0x7b, 0x3f, 0xb5),
+            c(0x0e, 0x74, 0x90),
+            c(0x1f, 0x2a, 0x3a),
+        ],
+        syntect_theme: "base16-ocean.light".into(),
     }
 }
 
@@ -318,8 +660,24 @@ fn install_pixel_snap_plugin(ctx: &egui::Context) {
     );
 }
 
+/// 同梱テーマの一覧。**ダークを先、ライトを後**にまとめて返す
+/// (メニューはこの順をそのまま 2 段の見出しに割る)。
 pub fn all() -> Vec<Theme> {
-    vec![zaivern_dark(), zaivern_midnight(), zaivern_light()]
+    vec![
+        // ダーク
+        zaivern_dark(),
+        zaivern_midnight(),
+        zaivern_nordic(),
+        zaivern_ember(),
+        zaivern_forest(),
+        zaivern_ocean(),
+        zaivern_carbon(),
+        // ライト
+        zaivern_light(),
+        zaivern_paper(),
+        zaivern_daylight(),
+        zaivern_frost(),
+    ]
 }
 
 pub fn by_name(name: &str) -> Theme {
@@ -411,9 +769,54 @@ mod tests {
     // ---- all ----
 
     #[test]
-    fn all_returns_three_builtin_themes_in_order() {
+    fn all_returns_the_builtin_themes_in_order() {
         let names: Vec<String> = all().into_iter().map(|t| t.name).collect();
-        assert_eq!(names, ["zaivern-dark", "zaivern-midnight", "zaivern-light"]);
+        assert_eq!(
+            names,
+            [
+                "zaivern-dark",
+                "zaivern-midnight",
+                "zaivern-nordic",
+                "zaivern-ember",
+                "zaivern-forest",
+                "zaivern-ocean",
+                "zaivern-carbon",
+                "zaivern-light",
+                "zaivern-paper",
+                "zaivern-daylight",
+                "zaivern-frost",
+            ]
+        );
+    }
+
+    /// メニューは `all()` の並びをそのまま「ダーク → ライト」の 2 段に割る。
+    /// 途中でライトが混ざると見出しが交互に出て一覧が読めなくなる。
+    #[test]
+    fn all_lists_every_dark_theme_before_the_light_ones() {
+        let themes = all();
+        let first_light = themes
+            .iter()
+            .position(|t| !t.dark)
+            .expect("ライトテーマが 1 つも無い");
+        assert!(
+            themes[first_light..].iter().all(|t| !t.dark),
+            "ライトの後ろにダークが混ざっている"
+        );
+        assert!(first_light >= 2, "ダークテーマが少なすぎる");
+    }
+
+    /// 明暗どちらも複数用意する (片側 1 つだけだと「選べない」に等しい)。
+    #[test]
+    fn both_dark_and_light_have_multiple_choices() {
+        let themes = all();
+        assert!(
+            themes.iter().filter(|t| t.dark).count() >= 4,
+            "ダークが少ない"
+        );
+        assert!(
+            themes.iter().filter(|t| !t.dark).count() >= 3,
+            "ライトが少ない"
+        );
     }
 
     #[test]
@@ -494,13 +897,106 @@ mod tests {
     }
 
     #[test]
-    fn zaivern_light_is_the_only_light_theme() {
+    fn zaivern_light_is_a_light_theme() {
         let t = zaivern_light();
         assert_eq!(t.name, "zaivern-light");
         assert_eq!(t.label, "Zaivern Light");
         assert!(!t.dark);
         assert_eq!(t.syntect_theme, "InspiredGitHub");
-        assert_eq!(all().iter().filter(|t| !t.dark).count(), 1);
+    }
+
+    /// `dark` フラグと実際の背景の明るさが食い違っていないこと。
+    /// (ここがズレると egui の Visuals とアイコンの明暗が逆になる)
+    #[test]
+    fn the_dark_flag_matches_the_actual_background_brightness() {
+        for t in all() {
+            let l = relative_luminance(t.bg);
+            if t.dark {
+                assert!(l < 0.2, "{}: dark なのに背景が明るい ({l:.3})", t.name);
+            } else {
+                assert!(l > 0.5, "{}: light なのに背景が暗い ({l:.3})", t.name);
+            }
+            // パネルは地と同系の明るさ (片方だけ反転していると画面が割れて見える)
+            let p = relative_luminance(t.panel);
+            assert_eq!(
+                t.dark,
+                p < 0.5,
+                "{}: panel の明るさがテーマの明暗と逆 ({p:.3})",
+                t.name
+            );
+        }
+    }
+
+    /// 本文と補助テキストが背景に対して読める (WCAG 相対輝度によるコントラスト比)。
+    /// 新しいテーマを足したときに「雰囲気は良いが読めない」配色を弾く。
+    #[test]
+    fn every_theme_meets_the_text_contrast_floor() {
+        for t in all() {
+            for (name, fg, bg, floor) in [
+                ("text/bg", t.text, t.bg, 7.0),
+                ("text/panel", t.text, t.panel, 7.0),
+                ("text_dim/bg", t.text_dim, t.bg, 4.5),
+                ("term_fg/term_bg", t.term_fg, t.term_bg, 7.0),
+                // diff の hunk 背景 (accent_soft) の上にも本文を置く
+                ("text/accent_soft", t.text, t.accent_soft, 4.5),
+            ] {
+                let r = contrast_ratio(fg, bg);
+                assert!(
+                    r >= floor,
+                    "{}: {name} のコントラストが {r:.2} (最低 {floor})",
+                    t.name
+                );
+            }
+        }
+    }
+
+    /// 状態色 (成功/警告/エラー) がパネルの上で判別できること。
+    /// バッジや診断の色なので、地に沈むと状態が伝わらない。
+    #[test]
+    fn every_theme_status_colors_stand_out_on_the_panel() {
+        for t in all() {
+            for (name, col) in [("ok", t.ok), ("warn", t.warn), ("err", t.err)] {
+                let r = contrast_ratio(col, t.panel);
+                assert!(r >= 3.0, "{}: {name} が panel に埋もれる ({r:.2})", t.name);
+            }
+            assert_ne!(t.ok, t.err, "{}: 成功とエラーが同色", t.name);
+        }
+    }
+
+    /// syntect のテーマ名は実在するものだけ。
+    /// 名前を間違えると highlight.rs が黙って無地にフォールバックし、
+    /// 「そのテーマだけ色が付かない」という気づきにくい壊れ方をする。
+    #[test]
+    fn every_syntect_theme_name_exists_in_the_default_set() {
+        let ts = syntect::highlighting::ThemeSet::load_defaults();
+        for t in all() {
+            assert!(
+                ts.themes.contains_key(&t.syntect_theme),
+                "{}: syntect に '{}' は無い (候補: {:?})",
+                t.name,
+                t.syntect_theme,
+                ts.themes.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// sRGB の相対輝度 (WCAG 2.x)。
+    fn relative_luminance(col: Color32) -> f32 {
+        let f = |v: u8| {
+            let s = v as f32 / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(col.r()) + 0.7152 * f(col.g()) + 0.0722 * f(col.b())
+    }
+
+    fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+        let (x, y) = (relative_luminance(a), relative_luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
     }
 
     #[test]

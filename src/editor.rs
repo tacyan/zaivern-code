@@ -138,6 +138,13 @@ pub struct Buffer {
     pub large: LargeFileMode,
     /// CSV/TSV のテーブル表示。`None` の間は普通のテキストとして描く。
     pub table: Option<TableView>,
+    /// このタブだけのズーム段数 (pt)。0 = 設定どおり (`editor_font_size`)。
+    ///
+    /// 基準サイズからの **差分** で持つので、設定側のフォントを変えても
+    /// 「このファイルは少し大きめ」という相対関係が保たれる。
+    /// タブを閉じれば消える (セッション中だけの見た目の調整であって、
+    /// ファイルの属性ではない)。実サイズへの変換は [`crate::zoom`]。
+    pub zoom: i32,
     /// 専用ビューア (16 進 / メディア / 書庫) の中身。
     ///
     /// 種類ごとにフィールドを増やすと `Buffer` の生成箇所が毎回全部壊れるので、
@@ -1412,6 +1419,7 @@ impl Editor {
             table: None,
             preview: None,
             minimap: None,
+            zoom: 0,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -1451,6 +1459,7 @@ impl Editor {
             table: None,
             preview,
             minimap: None,
+            zoom: 0,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -1557,6 +1566,7 @@ impl Editor {
                 table: None,
                 preview: None,
                 minimap: None,
+                zoom: 0,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -1602,6 +1612,7 @@ impl Editor {
                 table: None,
                 preview: None,
                 minimap: None,
+                zoom: 0,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -1637,6 +1648,7 @@ impl Editor {
             table: None,
             preview: None,
             minimap: None,
+            zoom: 0,
         });
         self.active = Some(self.buffers.len() - 1);
         Ok(false)
@@ -1684,6 +1696,7 @@ impl Editor {
             table: None,
             preview: None,
             minimap: None,
+            zoom: 0,
         });
         self.active = Some(self.buffers.len() - 1);
         id

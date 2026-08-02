@@ -70,6 +70,7 @@ mod theme_json;
 mod tunnel;
 mod tutorial;
 mod voice;
+mod zoom;
 
 use eframe::egui;
 

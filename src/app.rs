@@ -565,6 +565,20 @@ enum CenterView {
     Deck,
 }
 
+/// ズームジェスチャ (⌘+ホイール / ピンチ) を持っている中央ビューの種別。
+///
+/// egui は ⌘+ホイールもピンチも `zoom_delta()` にまとめてしまい、しかも
+/// **消費できない** (`zoom_factor_delta` は非公開)。同じジェスチャで
+/// 「画像も拡大・文字も拡大」の二重掛けが起きないよう、持ち主をここで
+/// 1 つに決めてから配る ([`ZaivernApp::handle_zoom_gesture`])。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZoomArea {
+    /// エディタ本文 / Markdown プレビュー — そのファイルだけを拡大縮小する
+    File,
+    /// 画像ビューア — 自前で `zoom_delta` を読むので、ここでは何もしない
+    Image,
+}
+
 /// 3 本のフラグから「今フレーム描くビュー」を 1 つ決める (純関数)。
 ///
 /// 優先順は デッキ > Cockpit > 看板 > エディタ。フラグが複数立っていても
@@ -2219,6 +2233,15 @@ pub struct ZaivernApp {
     last_row_h: f32,
     /// エディタ可視領域の高さ(前フレーム値)。PageUp/Down・検索ジャンプで使用
     last_view_h: f32,
+    /// 中央ビューでズームジェスチャ (⌘+ホイール / ピンチ) を持っている領域
+    /// (前フレーム値)。誰の矩形でもない場所で回したら画面全体ズームになる。
+    zoom_area: Option<(egui::Rect, ZoomArea)>,
+    /// 今フレームぶんの控え。フレーム末尾で [`Self::zoom_area`] へ移す
+    /// (描かなかったフレームは None = 古い矩形が残らない)。
+    zoom_area_next: Option<(egui::Rect, ZoomArea)>,
+    /// ホイール/ピンチのズーム量の溜め ([`crate::zoom::wheel_steps`])。
+    /// 段に満たない端数を次のフレームへ持ち越すためだけの値。
+    zoom_gesture_accum: f32,
     /// エディタの垂直スクロール量(前フレーム値)
     last_scroll_y: f32,
     /// アクティブバッファ本文のハッシュ (code_editor_ui が line_marks 用に毎フレーム更新)
@@ -2867,6 +2890,9 @@ impl ZaivernApp {
             pending_scroll: None,
             last_row_h: 18.0,
             last_view_h: 620.0,
+            zoom_area: None,
+            zoom_area_next: None,
+            zoom_gesture_accum: 0.0,
             last_scroll_y: 0.0,
             last_text_hash: 0,
             find_count_cache: None,
@@ -4984,6 +5010,169 @@ impl ZaivernApp {
         }
     }
 
+    // ── ズーム (画面全体 / ファイル単位) ──
+    //
+    // 対象が違う 3 つを混ぜないための入口。
+    //   `zoom_window*` … egui の zoom_factor。UI 全体が拡大縮小し state.toml に残る
+    //   `zoom_file*`   … アクティブなタブの本文フォントだけ (セッション中のみ)
+    //   Cmd::FontInc/Dec … 全ファイル共通の基準フォント (config の値)
+    // 段の刻みと上下限の判断は crate::zoom (純粋関数・テーブルテスト済み)。
+
+    /// 画面全体のズームを段表で 1 段動かす。
+    fn zoom_window(&mut self, ctx: &egui::Context, dir: i32) {
+        self.zoom_window_to(ctx, crate::zoom::window_step(self.cfg.ui_zoom, dir));
+    }
+
+    /// 画面全体のズームを指定倍率にする (⌘0 = 1.0)。
+    ///
+    /// `pixels_per_point` は egui が `zoom_factor × ネイティブ DPI` で決めるので、
+    /// ここで倍率を渡せばフォントの物理ピクセル整合
+    /// (`theme::resync_pixel_snapping`) も次のフレーム先頭で自動的に追従する。
+    fn zoom_window_to(&mut self, ctx: &egui::Context, zoom: f32) {
+        let z = crate::zoom::sanitize_window(zoom);
+        let same = (self.cfg.ui_zoom - z).abs() <= f32::EPSILON;
+        self.cfg.ui_zoom = z;
+        self.cfg.global_ui_zoom = z;
+        self.apply_ui_zoom(ctx);
+        if !same {
+            config::save_state(&self.cfg);
+        }
+        // 端に着いたときも「効いていない」ではなく現在値を見せる
+        self.toast(
+            trf(
+                "🔍 画面全体のズーム {pct}",
+                &[("pct", crate::zoom::percent_label(z))],
+            ),
+            true,
+        );
+    }
+
+    /// いまの設定値を egui に反映する。変化が無ければ **何もしない**
+    /// (毎フレーム呼んでも f32 比較 1 回で終わり、再描画も起きない)。
+    fn apply_ui_zoom(&self, ctx: &egui::Context) {
+        let z = crate::zoom::sanitize_window(self.cfg.ui_zoom);
+        if (ctx.zoom_factor() - z).abs() > f32::EPSILON {
+            ctx.set_zoom_factor(z);
+        }
+    }
+
+    /// アクティブなタブだけのズームを `steps` 段動かす。
+    fn zoom_file(&mut self, steps: i32) {
+        let base = self.cfg.editor_font_size;
+        let Some(i) = self.editor.active else {
+            self.toast(tr("ファイルを開いてから使ってください"), false);
+            return;
+        };
+        let mut next = self.editor.buffers[i].zoom;
+        for _ in 0..steps.unsigned_abs() {
+            next = crate::zoom::file_step(base, next, steps.signum());
+        }
+        if next != self.editor.buffers[i].zoom {
+            let b = &mut self.editor.buffers[i];
+            b.zoom = next;
+            // galley はフォントサイズ込みでキャッシュしているので捨てる
+            b.cache = None;
+            b.gutter = None;
+        }
+        // 上限/下限で動かなかったときも黙らない (いまの大きさを見せる)
+        self.toast(self.file_zoom_label(), true);
+    }
+
+    /// アクティブなタブのズームを等倍へ戻す。
+    fn zoom_file_reset(&mut self) {
+        let Some(i) = self.editor.active else {
+            self.toast(tr("ファイルを開いてから使ってください"), false);
+            return;
+        };
+        if self.editor.buffers[i].zoom == 0 {
+            return;
+        }
+        let b = &mut self.editor.buffers[i];
+        b.zoom = 0;
+        b.cache = None;
+        b.gutter = None;
+        self.toast(self.file_zoom_label(), true);
+    }
+
+    /// トースト用のラベル ("🔍 このファイル 17pt (+2pt)")。
+    fn file_zoom_label(&self) -> String {
+        let steps = self.active_file_zoom();
+        let size = crate::zoom::file_font_size(self.cfg.editor_font_size, steps);
+        match crate::zoom::file_label(steps) {
+            Some(d) => trf(
+                "🔍 このファイル {size}pt ({delta})",
+                &[("size", format!("{size:.0}")), ("delta", d)],
+            ),
+            None => trf(
+                "🔍 このファイル {size}pt (設定どおり)",
+                &[("size", format!("{size:.0}"))],
+            ),
+        }
+    }
+
+    /// 基準フォント (全ファイル共通) のトーストラベル。
+    fn font_size_label(&self) -> String {
+        trf(
+            "🔠 基準フォント エディタ {ed}pt / 端末 {tm}pt",
+            &[
+                ("ed", format!("{:.0}", self.cfg.editor_font_size)),
+                ("tm", format!("{:.0}", self.cfg.terminal_font_size)),
+            ],
+        )
+    }
+
+    /// アクティブなタブのズーム段数 (pt)。タブが無ければ 0。
+    fn active_file_zoom(&self) -> i32 {
+        self.editor
+            .active
+            .and_then(|i| self.editor.buffers.get(i))
+            .map(|b| b.zoom)
+            .unwrap_or(0)
+    }
+
+    /// アクティブなタブの本文フォントサイズ (pt)。ファイル単位ズーム込み。
+    fn active_font_size(&self) -> f32 {
+        crate::zoom::file_font_size(self.cfg.editor_font_size, self.active_file_zoom())
+    }
+
+    /// ⌘+ホイール / トラックパッドのピンチを段へ均して適用する。
+    ///
+    /// 行き先は **ポインタの下にあるもの** で決める:
+    ///   エディタ本文 / プレビュー → そのファイルだけ (VS Code の
+    ///     `editor.mouseWheelZoom` と同じ勘所)
+    ///   画像タブ → 何もしない (image_viewer_ui が自前で拡大縮小する)
+    ///   それ以外 (サイドバー・端末・看板…) → 画面全体
+    ///
+    /// egui は ⌘+ホイールもピンチも `zoom_delta()` に集約し、しかも
+    /// **消費できない** (zoom_factor_delta は非公開)。だから
+    /// 「誰の上で回したか」をここで一度だけ決め、二重に効かせない。
+    fn handle_zoom_gesture(&mut self, ctx: &egui::Context) {
+        let delta = ctx.input(|i| i.zoom_delta());
+        let steps = crate::zoom::wheel_steps(&mut self.zoom_gesture_accum, delta);
+        if steps == 0 {
+            return;
+        }
+        let area = ctx
+            .pointer_latest_pos()
+            .zip(self.zoom_area)
+            .filter(|(p, (r, _))| r.contains(*p))
+            .map(|(_, (_, a))| a);
+        if area == Some(ZoomArea::Image) {
+            return; // 画像ビューアが自分で拡大縮小する
+        }
+        if area == Some(ZoomArea::File) && self.editor.active.is_some() {
+            self.zoom_file(steps);
+        } else {
+            // 段は 1 段ずつ辿るが、保存とトーストは最後に 1 回だけ
+            // (ホイールを回している間ずっと state.toml を書かない)
+            let mut z = self.cfg.ui_zoom;
+            for _ in 0..steps.unsigned_abs() {
+                z = crate::zoom::window_step(z, steps.signum());
+            }
+            self.zoom_window_to(ctx, z);
+        }
+    }
+
     // ── 永続する UI 設定 (egui memory) ──
     //
     // config.toml ではなく egui の永続メモリに置いてある。config.rs は別担当が
@@ -5004,6 +5193,13 @@ impl ZaivernApp {
             return;
         }
         self.prefs_loaded = true;
+        // 前回終了時の画面全体ズーム。egui の zoom_factor は起動直後だけ
+        // 既定の 1.0 なので、最初のフレームでここが揃える
+        // (フォントの物理ピクセル整合は theme 側のフックが追従する)。
+        self.apply_ui_zoom(ctx);
+        // ⌘+ / ⌘- / ⌘0 は自前で処理する (段表・保存・トーストが要る)。
+        // egui 内蔵のキーボードズームを残すと 0.1 刻みで二重に動く。
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         // (大文字小文字, 単語単位, 正規表現)
         let (c, w, r) = ctx
             .data_mut(|d| *d.get_persisted_mut_or(Self::search_prefs_id(), (false, false, false)));
@@ -8337,6 +8533,12 @@ impl ZaivernApp {
             | Cmd::ReloadConfig
             | Cmd::FontInc
             | Cmd::FontDec
+            | Cmd::ZoomIn
+            | Cmd::ZoomOut
+            | Cmd::ZoomReset
+            | Cmd::FileZoomIn
+            | Cmd::FileZoomOut
+            | Cmd::FileZoomReset
             | Cmd::SendFileToAgent
             | Cmd::RefreshTree
             | Cmd::SetApproval(_)
@@ -9013,6 +9215,9 @@ impl ZaivernApp {
                 // 監視役 LLM も選び直されているかもしれないので作り直す。
                 self.apply_super_agent();
                 self.keys = Keybinds::from_overrides(&self.cfg.keybindings);
+                // config.toml / state.toml の ui_zoom を画面へ戻す
+                // (読み直したのに倍率だけ前のまま、を作らない)
+                self.apply_ui_zoom(ctx);
                 for b in &mut self.editor.buffers {
                     b.cache = None;
                     b.gutter = None;
@@ -9023,11 +9228,19 @@ impl ZaivernApp {
             Cmd::FontInc => {
                 self.cfg.editor_font_size = (self.cfg.editor_font_size + 1.0).min(32.0);
                 self.cfg.terminal_font_size = (self.cfg.terminal_font_size + 1.0).min(28.0);
+                self.toast(self.font_size_label(), true);
             }
             Cmd::FontDec => {
                 self.cfg.editor_font_size = (self.cfg.editor_font_size - 1.0).max(8.0);
                 self.cfg.terminal_font_size = (self.cfg.terminal_font_size - 1.0).max(7.0);
+                self.toast(self.font_size_label(), true);
             }
+            Cmd::ZoomIn => self.zoom_window(ctx, 1),
+            Cmd::ZoomOut => self.zoom_window(ctx, -1),
+            Cmd::ZoomReset => self.zoom_window_to(ctx, 1.0),
+            Cmd::FileZoomIn => self.zoom_file(1),
+            Cmd::FileZoomOut => self.zoom_file(-1),
+            Cmd::FileZoomReset => self.zoom_file_reset(),
             Cmd::SendFileToAgent => {
                 let rel = self.editor.active.and_then(|i| {
                     let b = &self.editor.buffers[i];
@@ -9612,6 +9825,29 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::PrevTab)) {
             cmds.push(Cmd::PrevTab);
         }
+        // ファイル単位ズーム (⌥⌘+ / Ctrl+Alt+Shift++ …) は「戻る/進む」より先。
+        // egui の `Modifiers::matches_logically` は「パターンに無い修飾キーは
+        // 押されていてもよい」判定なので、修飾キーの多い方から取らないと
+        // 少ない方 (戻る・画面全体ズーム) に吸われる。
+        // ⌥⌘= の別名も足す: macOS の ⌥= は「≠」を打つ組み合わせで論理キーが
+        // 取れず、winit が物理キー (Equal) へフォールバックするため。
+        if consume(ctx, self.keys.get(BindAction::FileZoomIn))
+            || consume(
+                ctx,
+                KeyboardShortcut::new(
+                    self.keys.get(BindAction::FileZoomIn).modifiers,
+                    Key::Equals,
+                ),
+            )
+        {
+            cmds.push(Cmd::FileZoomIn);
+        }
+        if consume(ctx, self.keys.get(BindAction::FileZoomOut)) {
+            cmds.push(Cmd::FileZoomOut);
+        }
+        if consume(ctx, self.keys.get(BindAction::FileZoomReset)) {
+            cmds.push(Cmd::FileZoomReset);
+        }
         if consume(ctx, self.keys.get(BindAction::NavForward)) {
             cmds.push(Cmd::NavForward);
         }
@@ -9734,13 +9970,19 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::NewAgent)) {
             cmds.push(Cmd::NewAgent(0));
         }
-        if consume(ctx, self.keys.get(BindAction::FontInc))
+        // 画面全体のズーム (VS Code と同じ ⌘+ / ⌘- / ⌘0)。⌘= も拡大として
+        // 受ける (英字配列の + は ⇧= なので、⇧ 抜きで押す人が多い)。
+        // ファイル単位 (⌥⌘ 系) はここより前で消費済み。
+        if consume(ctx, self.keys.get(BindAction::ZoomIn))
             || consume(ctx, KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals))
         {
-            cmds.push(Cmd::FontInc);
+            cmds.push(Cmd::ZoomIn);
         }
-        if consume(ctx, self.keys.get(BindAction::FontDec)) {
-            cmds.push(Cmd::FontDec);
+        if consume(ctx, self.keys.get(BindAction::ZoomOut)) {
+            cmds.push(Cmd::ZoomOut);
+        }
+        if consume(ctx, self.keys.get(BindAction::ZoomReset)) {
+            cmds.push(Cmd::ZoomReset);
         }
 
         // プラグインコマンドの keybind (plugin.toml の keybind = "cmd+alt+u" など)
@@ -10210,39 +10452,41 @@ impl ZaivernApp {
         self.sidebar_sessions.invalidate();
     }
 
+    /// メニュー用のテーマ一覧を作る (同梱テーマ → カスタムテーマ JSON の順)。
+    ///
+    /// トップバーの 🎨 とメニューバーの「表示 > 配色テーマ」が同じ一覧を見るので、
+    /// 段組みも選択状態も 2 か所で食い違わない。
+    fn theme_entries(&self) -> Vec<menu_bar::ThemeEntry> {
+        let mut out: Vec<menu_bar::ThemeEntry> = theme::all()
+            .into_iter()
+            .map(|t| menu_bar::ThemeEntry {
+                selected: t.name == self.cfg.theme,
+                group: if t.dark {
+                    menu_bar::ThemeGroup::Dark
+                } else {
+                    menu_bar::ThemeGroup::Light
+                },
+                name: t.name,
+                label: t.label,
+            })
+            .collect();
+        // カスタムテーマは中身を読むまで明暗が判らないので独立した段に置く。
+        for (label, path) in self.custom_themes.iter().take(60) {
+            out.push(menu_bar::ThemeEntry {
+                name: path.clone(),
+                label: format!("🔌 {label}"),
+                selected: self.cfg.theme == *path,
+                group: menu_bar::ThemeGroup::Custom,
+            });
+        }
+        out
+    }
+
     /// トップバー: 🎨 テーマ選択メニュー (プラグインのカスタムテーマ含む)。
     fn top_bar_theme_menu(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        let themes = self.theme_entries();
         let menu = ui.menu_button("🎨", |ui| {
-            for t in theme::all() {
-                let sel = t.name == self.cfg.theme;
-                if ui.selectable_label(sel, t.label.clone()).clicked() {
-                    cmds.push(Cmd::SetTheme(t.name.clone()));
-                    ui.close_menu();
-                }
-            }
-            if !self.custom_themes.is_empty() {
-                ui.separator();
-                ui.menu_button(
-                    trf(
-                        "🔌 カスタムテーマ ({n})",
-                        &[("n", self.custom_themes.len().to_string())],
-                    ),
-                    |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("custom-themes")
-                            .max_height(340.0)
-                            .show(ui, |ui| {
-                                for (label, path) in self.custom_themes.clone() {
-                                    let sel = self.cfg.theme == path;
-                                    if ui.selectable_label(sel, label).clicked() {
-                                        cmds.push(Cmd::SetTheme(path));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                    },
-                );
-            }
+            menu_bar::theme_menu_ui(ui, &themes, cmds);
         });
         tutorial::anchor(ui.ctx(), AnchorId::ThemeMenu, menu.response.rect);
         menu.response
@@ -15186,7 +15430,10 @@ impl ZaivernApp {
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let theme = self.theme.clone();
-        let base = self.cfg.editor_font_size;
+        // プレビューも「このファイルのズーム」に従う (編集 ⇄ プレビューを
+        // 往復しても文字の大きさが変わらない)。
+        let base = self.active_font_size();
+        self.zoom_area_next = Some((ui.max_rect(), ZoomArea::File));
         let hl = self.highlighter;
         let images = &mut self.md_images;
         egui::ScrollArea::vertical()
@@ -15445,6 +15692,10 @@ impl ZaivernApp {
     /// − / ＋ / 100% / フィット ボタンと Ctrl(⌘)+スクロール (ピンチ) でズームできる。
     /// 壊れた画像はエラーメッセージだけを出す (文字化けテキストは出さない)。
     fn image_viewer_ui(&mut self, ui: &mut egui::Ui, i: usize) {
+        // ⌘+ホイール / ピンチはこのビューが自分で消費する。
+        // 申告しておかないと handle_zoom_gesture が同じジェスチャで
+        // 画面全体まで拡大してしまう (画像と UI の二重掛け)。
+        self.zoom_area_next = Some((ui.max_rect(), ZoomArea::Image));
         let theme_text = self.theme.text;
         let theme_dim = self.theme.text_dim;
         let theme_warn = self.theme.warn;
@@ -16016,6 +16267,10 @@ impl ZaivernApp {
         if self.preview_view_ui(ui, active) {
             return;
         }
+        // ⌘+ホイール / ピンチの行き先判定に使う「本文の矩形」。
+        // 今フレームぶんを控え、フレーム末尾で確定させる (本文を描かなかった
+        // フレームでは None になり、古い矩形が残らない)。
+        self.zoom_area_next = Some((ui.max_rect(), ZoomArea::File));
         let theme_text = self.theme.text;
         let theme_dim = self.theme.text_dim;
         let syntect_theme = self.theme.syntect_theme.clone();
@@ -16023,7 +16278,10 @@ impl ZaivernApp {
         // 行高が小数だと N 行目の y が丸められる位置が行ごとに変わり、
         // ガター番号・本文・スティッキーヘッダの縦位置が 1px ずつずれる。
         let ppp = ui.ctx().pixels_per_point();
-        let font = FontId::monospace(crate::theme::snap_font_size(self.cfg.editor_font_size, ppp));
+        // このタブのズーム段数 (⌥⌘+ / ⌘+ホイール) を効かせたサイズ。
+        // galley のキャッシュキーにはフォントサイズが入っているので、
+        // 段が変われば自動で作り直される。
+        let font = FontId::monospace(crate::theme::snap_font_size(self.active_font_size(), ppp));
         let row_h = ui
             .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
             .max(1.0 / ppp);
@@ -17545,16 +17803,54 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::ReloadConfig,
             ),
+            // ズームは 3 種類あって対象が違う。ラベルで対象を必ず言う
+            // (「拡大」だけだと何が大きくなるのか分からない)
+            (
+                "🔍".into(),
+                tr("画面全体を拡大 (UI ごと)"),
+                fmt_key(BindAction::ZoomIn),
+                Cmd::ZoomIn,
+            ),
+            (
+                "🔍".into(),
+                tr("画面全体を縮小 (UI ごと)"),
+                fmt_key(BindAction::ZoomOut),
+                Cmd::ZoomOut,
+            ),
+            (
+                "🔍".into(),
+                tr("画面全体のズームを 100% に戻す"),
+                fmt_key(BindAction::ZoomReset),
+                Cmd::ZoomReset,
+            ),
+            (
+                "🔎".into(),
+                tr("このファイルだけ拡大"),
+                fmt_key(BindAction::FileZoomIn),
+                Cmd::FileZoomIn,
+            ),
+            (
+                "🔎".into(),
+                tr("このファイルだけ縮小"),
+                fmt_key(BindAction::FileZoomOut),
+                Cmd::FileZoomOut,
+            ),
+            (
+                "🔎".into(),
+                tr("このファイルのズームを戻す"),
+                fmt_key(BindAction::FileZoomReset),
+                Cmd::FileZoomReset,
+            ),
             (
                 "🔠".into(),
-                tr("フォント拡大"),
-                fmt_key(BindAction::FontInc),
+                tr("エディタと端末のフォントを拡大 (全ファイル)"),
+                String::new(),
                 Cmd::FontInc,
             ),
             (
                 "🔠".into(),
-                tr("フォント縮小"),
-                fmt_key(BindAction::FontDec),
+                tr("エディタと端末のフォントを縮小 (全ファイル)"),
+                String::new(),
                 Cmd::FontDec,
             ),
             (
@@ -18171,9 +18467,17 @@ impl ZaivernApp {
             ));
         }
         for t in theme::all() {
+            // 明暗をラベルに入れておくと「ライト」「ダーク」でも絞り込める
+            // (テーマ名は英語なので、日本語の入力からは届かない)
             cmds.push((
                 "🎨".into(),
-                trf("テーマ: {label}", &[("label", t.label.clone())]),
+                trf(
+                    "テーマ: {label} ({kind})",
+                    &[
+                        ("label", t.label.clone()),
+                        ("kind", tr(if t.dark { "ダーク" } else { "ライト" })),
+                    ],
+                ),
                 String::new(),
                 Cmd::SetTheme(t.name.clone()),
             ));
@@ -19591,6 +19895,12 @@ impl ZaivernApp {
             "agent_message" => Some(Cmd::SendAgentMessage),
             "font_inc" => Some(Cmd::FontInc),
             "font_dec" => Some(Cmd::FontDec),
+            "zoom_in" => Some(Cmd::ZoomIn),
+            "zoom_out" => Some(Cmd::ZoomOut),
+            "zoom_reset" => Some(Cmd::ZoomReset),
+            "file_zoom_in" => Some(Cmd::FileZoomIn),
+            "file_zoom_out" => Some(Cmd::FileZoomOut),
+            "file_zoom_reset" => Some(Cmd::FileZoomReset),
             "tree" => Some(Cmd::RefreshTree),
             "approval_auto" => Some(Cmd::SetApproval("auto".into())),
             "approval_ask" => Some(Cmd::SetApproval("ask".into())),
@@ -21300,6 +21610,9 @@ impl ZaivernApp {
         self.poll_voice(ctx);
 
         self.handle_shortcuts(ctx);
+        // ⌘+ホイール / トラックパッドのピンチ。egui はどちらも zoom_delta へ
+        // 集約するので、ここで 1 か所だけ拾う (画像タブは自前で消費する)。
+        self.handle_zoom_gesture(ctx);
         // Keybinds を持てない描画側 (ターミナルの右クリックメニュー等) へ
         // 打鍵表記を配る。ベタ書きを増やさないための唯一の経路。
         crate::keybinds::publish_key_hints(ctx, &self.keys, &[BindAction::Find]);
@@ -21929,6 +22242,11 @@ impl ZaivernApp {
         // (`idle_repaint_ms` は animating のとき `None` を返す)。
         // 非表示のときは 1 本も予約しないので、完全アイドルの 0fps は保たれる。
         self.tutorial_tick(ctx);
+
+        // 今フレームのズームジェスチャの持ち主を確定させる。描かなかった
+        // フレームでは None になり、看板や画像タブに切り替えたあとも
+        // 古い矩形で「ファイル単位ズーム」に流れることがない。
+        self.zoom_area = self.zoom_area_next.take();
 
         // フレームの最後に、次の定期フレームだけをまとめて予約する。
         // ここより上で誰かが予約していれば egui は最短を採るので、
@@ -22632,13 +22950,7 @@ impl ZaivernApp {
                 trf("{name} を実行", &[("name", name)])
             })
         });
-        let mut themes: Vec<(String, String, bool)> = theme::all()
-            .iter()
-            .map(|t| (t.name.clone(), t.label.clone(), t.name == self.cfg.theme))
-            .collect();
-        for (label, path) in self.custom_themes.iter().take(60) {
-            themes.push((path.clone(), format!("🔌 {label}"), self.cfg.theme == *path));
-        }
+        let themes = self.theme_entries();
         let plugin_commands: Vec<(usize, usize, String, String)> = self
             .plugins
             .iter()
@@ -22690,6 +23002,8 @@ impl ZaivernApp {
                 .editor
                 .active
                 .map(|_| self.active_line_ending().label()),
+            ui_zoom: self.cfg.ui_zoom,
+            file_zoom: self.active_file_zoom(),
             trim_trailing_on_save: self.save_trim_trailing,
             final_newline_on_save: self.save_final_newline,
             build_task: build_target.as_ref().map(|(l, ..)| l.clone()),
@@ -24092,12 +24406,28 @@ fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
             format_shortcut(keys.get(BindAction::ToggleFullScreen)),
         ),
         (
-            tr("フォント拡大"),
-            format_shortcut(keys.get(BindAction::FontInc)),
+            tr("画面全体を拡大"),
+            format_shortcut(keys.get(BindAction::ZoomIn)),
         ),
         (
-            tr("フォント縮小"),
-            format_shortcut(keys.get(BindAction::FontDec)),
+            tr("画面全体を縮小"),
+            format_shortcut(keys.get(BindAction::ZoomOut)),
+        ),
+        (
+            tr("画面全体のズームを戻す"),
+            format_shortcut(keys.get(BindAction::ZoomReset)),
+        ),
+        (
+            tr("このファイルだけ拡大"),
+            format_shortcut(keys.get(BindAction::FileZoomIn)),
+        ),
+        (
+            tr("このファイルだけ縮小"),
+            format_shortcut(keys.get(BindAction::FileZoomOut)),
+        ),
+        (
+            tr("このファイルのズームを戻す"),
+            format_shortcut(keys.get(BindAction::FileZoomReset)),
         ),
     ];
     // egui TextEdit 内蔵 (バインド変更不可) のもの
@@ -27579,8 +27909,12 @@ mod wave2_tests {
             ("ToggleDeck", "ToggleDeck"),
             ("ToggleMdPreview", "ToggleMdPreview"),
             ("ToggleSidebar", "ToggleSidebar"),
-            ("FontInc", "FontInc"),
-            ("FontDec", "FontDec"),
+            ("ZoomIn", "ZoomIn"),
+            ("ZoomOut", "ZoomOut"),
+            ("ZoomReset", "ZoomReset"),
+            ("FileZoomIn", "FileZoomIn"),
+            ("FileZoomOut", "FileZoomOut"),
+            ("FileZoomReset", "FileZoomReset"),
             ("OpenFile", "OpenFileDialog"),
             ("SaveAll", "SaveAll"),
             ("GlobalSearch", "GlobalSearch"),

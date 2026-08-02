@@ -9,6 +9,10 @@ pub struct Config {
     pub theme: String,
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
+    /// 画面全体のズーム倍率 (VS Code の ⌘+ / ⌘- / ⌘0 相当)。1.0 = 等倍。
+    /// フォントサイズと違い **UI 全体** (サイドバー・タブ・端末・ステータス
+    /// バー) が拡大縮小する。値は `crate::zoom` の段表へ丸めて使う。
+    pub ui_zoom: f32,
     pub show_hidden_files: bool,
 
     /// エディタ本文の折り返し (VS Code の Word Wrap 相当)。既定はオフ。
@@ -64,6 +68,8 @@ pub struct Config {
     pub global_word_wrap: bool,
     #[serde(skip)]
     pub global_show_whitespace: bool,
+    #[serde(skip)]
+    pub global_ui_zoom: f32,
     #[serde(skip)]
     pub global_minimap: bool,
     #[serde(skip)]
@@ -253,6 +259,7 @@ impl Default for Config {
             theme: "zaivern-dark".into(),
             editor_font_size: 15.0,
             terminal_font_size: 13.0,
+            ui_zoom: 1.0,
             show_hidden_files: true,
             word_wrap: false,
             show_whitespace: false,
@@ -269,6 +276,7 @@ impl Default for Config {
             global_show_pet: true,
             global_word_wrap: false,
             global_show_whitespace: false,
+            global_ui_zoom: 1.0,
             global_minimap: false,
             global_breadcrumbs: true,
             global_git_blame: false,
@@ -454,6 +462,7 @@ struct Overlay {
     theme: Option<String>,
     editor_font_size: Option<f32>,
     terminal_font_size: Option<f32>,
+    ui_zoom: Option<f32>,
     show_hidden_files: Option<bool>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
@@ -478,6 +487,9 @@ struct UiState {
     show_pet: Option<bool>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
+    /// 画面全体ズーム。⌘+ / ⌘- は UI からの操作なので state 側に置く
+    /// (config.toml はアプリが書き換えない方針)。
+    ui_zoom: Option<f32>,
     minimap: Option<bool>,
     breadcrumbs: Option<bool>,
     /// 差分ビューの表示モード ("side_by_side" | "inline")。
@@ -539,13 +551,20 @@ pub const DEFAULT_CONFIG: &str = r#"# ══════════════
 #  変更後はコマンドパレット (⌘⇧P) の「設定を再読み込み」で反映されます
 # ══════════════════════════════════════════════════
 
-# テーマ: "zaivern-dark" | "zaivern-midnight" | "zaivern-light"
+# テーマ (ダーク): "zaivern-dark" | "zaivern-midnight" | "zaivern-nordic"
+#                 | "zaivern-ember" | "zaivern-forest" | "zaivern-ocean" | "zaivern-carbon"
+# テーマ (ライト): "zaivern-light" | "zaivern-paper" | "zaivern-daylight" | "zaivern-frost"
 # カラーテーマJSON (VS Code 互換形式) へのフルパスも指定できます
 # (~/.zaivern/themes とプラグイン同梱のテーマは 🎨 メニューに自動で並びます)
 theme = "zaivern-dark"
 editor_font_size = 15.0
 terminal_font_size = 13.0
 show_hidden_files = true
+
+# 画面全体のズーム (1.0 = 100%)。UI 全体が拡大縮小します。
+# ⌘+ / ⌘- / ⌘0 (Windows/Linux は Ctrl) で変更でき、値は自動保存されます。
+# ファイル 1 枚だけを拡大するときは ⌥⌘+ / ⌥⌘- / ⌥⌘0 か ⌘+ホイール。
+# ui_zoom = 1.0
 
 # エディタ本文の折り返しと空白文字 (·/→) の可視化
 # (表示メニュー・コマンドパレットの「折り返し切替」「空白文字表示切替」でも変更できます)
@@ -904,6 +923,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.show_whitespace {
                     cfg.show_whitespace = v;
                 }
+                if let Some(v) = st.ui_zoom {
+                    cfg.ui_zoom = v;
+                }
                 if let Some(v) = st.minimap {
                     cfg.minimap = v;
                 }
@@ -995,6 +1017,7 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     cfg.global_show_pet = cfg.show_pet;
     cfg.global_word_wrap = cfg.word_wrap;
     cfg.global_show_whitespace = cfg.show_whitespace;
+    cfg.global_ui_zoom = crate::zoom::sanitize_window(cfg.ui_zoom);
     cfg.global_minimap = cfg.minimap;
     cfg.global_breadcrumbs = cfg.breadcrumbs;
     cfg.global_git_blame = cfg.git_blame;
@@ -1012,6 +1035,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     }
     cfg.editor_font_size = cfg.editor_font_size.clamp(8.0, 32.0);
     cfg.terminal_font_size = cfg.terminal_font_size.clamp(7.0, 28.0);
+    // 手書きの config.toml / 壊れた state.toml で NaN や 0 が入っても、
+    // ここで必ず有限の倍率にする (0 倍で起動すると何も見えなくなる)。
+    cfg.ui_zoom = crate::zoom::sanitize_window(cfg.ui_zoom);
     cfg.pet_scale = cfg.pet_scale.clamp(0.5, 2.0);
     // 期限が 0 だと診断側で毎回丸められて分かりにくいので、ここで下限を揃える。
     cfg.super_agent.timeout_secs = cfg.super_agent.timeout_secs.clamp(5, 600);
@@ -1058,6 +1084,9 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
             }
             if let Some(v) = o.terminal_font_size {
                 cfg.terminal_font_size = v;
+            }
+            if let Some(v) = o.ui_zoom {
+                cfg.ui_zoom = v;
             }
             if let Some(v) = o.show_hidden_files {
                 cfg.show_hidden_files = v;
@@ -1294,6 +1323,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         show_pet: Some(cfg.global_show_pet),
         word_wrap: Some(cfg.global_word_wrap),
         show_whitespace: Some(cfg.global_show_whitespace),
+        ui_zoom: Some(crate::zoom::sanitize_window(cfg.global_ui_zoom)),
         minimap: Some(cfg.global_minimap),
         breadcrumbs: Some(cfg.global_breadcrumbs),
         diff_view: Some(cfg.diff_view.clone()),

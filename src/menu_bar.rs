@@ -11,6 +11,63 @@ use crate::palette::Cmd;
 use crate::textenc::LineEnding;
 use std::path::{Path, PathBuf};
 
+/// 配色テーマ一覧の段。同梱テーマが増えても一覧が読めるように、
+/// 明暗とカスタムを見出しで分ける (並べ替えはしない = `theme::all()` の順のまま)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThemeGroup {
+    Dark,
+    Light,
+    /// ユーザー/プラグイン提供のテーマ JSON (明暗は読み込むまで判らない)
+    Custom,
+}
+
+impl ThemeGroup {
+    /// 段の見出し (翻訳前の原文)。
+    fn heading(self) -> &'static str {
+        match self {
+            ThemeGroup::Dark => "ダーク",
+            ThemeGroup::Light => "ライト",
+            ThemeGroup::Custom => "カスタム (テーマJSON)",
+        }
+    }
+}
+
+/// メニューに 1 行として出る配色テーマ。
+#[derive(Clone)]
+pub struct ThemeEntry {
+    /// `Cmd::SetTheme` にそのまま渡す値 (同梱テーマ名、またはテーマ JSON のパス)
+    pub name: String,
+    pub label: String,
+    pub selected: bool,
+    pub group: ThemeGroup,
+}
+
+/// 配色テーマの選択メニュー本体。トップバーの 🎨 と
+/// メニューバーの「表示 > 配色テーマ」で **同じ実装**を使う
+/// (2 か所で別々に描くと、片方だけ段組みが崩れる)。
+pub fn theme_menu_ui(ui: &mut egui::Ui, themes: &[ThemeEntry], cmds: &mut Vec<Cmd>) {
+    ui.set_min_width(240.0);
+    egui::ScrollArea::vertical()
+        .id_salt("zv-theme-menu")
+        .max_height(420.0)
+        .show(ui, |ui| {
+            let mut shown: Option<ThemeGroup> = None;
+            for t in themes {
+                if shown != Some(t.group) {
+                    if shown.is_some() {
+                        ui.separator();
+                    }
+                    heading(ui, &tr(t.group.heading()));
+                    shown = Some(t.group);
+                }
+                if ui.selectable_label(t.selected, &t.label).clicked() {
+                    cmds.push(Cmd::SetTheme(t.name.clone()));
+                    ui.close_menu();
+                }
+            }
+        });
+}
+
 /// メニューの表示状態スナップショット。描画のためだけの読み取り専用情報。
 pub struct MenuInfo {
     pub sidebar_open: bool,
@@ -47,14 +104,18 @@ pub struct MenuInfo {
     pub plugin_commands: Vec<(usize, usize, String, String)>,
     /// (プリセット index, アイコン, 名前)
     pub agent_presets: Vec<(usize, String, String)>,
-    /// (テーマ name, ラベル, 選択中か)。カスタムテーマも同じ形で混ぜる
-    pub themes: Vec<(String, String, bool)>,
+    /// 配色テーマの一覧 (同梱 + カスタム)。`ThemeEntry::group` で段に分かれる
+    pub themes: Vec<ThemeEntry>,
     /// アクティブなタブの改行コード表示 (例 "CRLF")。タブが無ければ None
     pub line_ending: Option<String>,
     /// 保存時に行末の空白を落とす (編集メニューのチェック状態)
     pub trim_trailing_on_save: bool,
     /// 保存時に最終行へ改行を入れる (同上)
     pub final_newline_on_save: bool,
+    /// 画面全体のズーム倍率 (1.0 = 100%)。表示メニューの「ズーム」に出す
+    pub ui_zoom: f32,
+    /// アクティブなタブだけのズーム段数 (pt)。0 なら等倍
+    pub file_zoom: i32,
     /// ビルドタスクのラベル。**⇧⌘B が実際に走らせる方**を入れる
     /// (tasks.json の既定ビルドがあればそれ、無ければ自動検出のラベル)。
     pub build_task: Option<String>,
@@ -468,29 +529,70 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             }
             ui.separator();
             ui.menu_button(tr("配色テーマ"), |ui| {
-                ui.set_min_width(260.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("menubar-themes")
-                    .max_height(380.0)
-                    .show(ui, |ui| {
-                        for (name, label, selected) in &info.themes {
-                            if ui.selectable_label(*selected, label).clicked() {
-                                cmds.push(Cmd::SetTheme(name.clone()));
-                                ui.close_menu();
-                            }
-                        }
-                    });
+                theme_menu_ui(ui, &info.themes, cmds);
             });
             ui.separator();
-            if item(ui, &tr("ズームイン"), &sc(keys, BindAction::FontInc), true) {
-                cmds.push(Cmd::FontInc);
+            // ── ズーム ──────────────────────────────────────────
+            // 3 つの段は **対象が違う**。同じ場所に並べて違いを見せる:
+            //   画面全体    = UI ごと (VS Code の ⌘+ / ⌘- / ⌘0)
+            //   このファイル = 開いているタブの本文だけ
+            //   フォント     = 全ファイル共通の基準サイズ (設定値)
+            ui.label(
+                egui::RichText::new(trf(
+                    "画面全体のズーム: {pct}",
+                    &[("pct", crate::zoom::percent_label(info.ui_zoom))],
+                ))
+                .weak(),
+            );
+            if item(ui, &tr("ズームイン"), &sc(keys, BindAction::ZoomIn), true) {
+                cmds.push(Cmd::ZoomIn);
+            }
+            if item(ui, &tr("ズームアウト"), &sc(keys, BindAction::ZoomOut), true) {
+                cmds.push(Cmd::ZoomOut);
             }
             if item(
                 ui,
-                &tr("ズームアウト"),
-                &sc(keys, BindAction::FontDec),
-                true,
+                &tr("ズームをリセット"),
+                &sc(keys, BindAction::ZoomReset),
+                (info.ui_zoom - 1.0).abs() > f32::EPSILON,
             ) {
+                cmds.push(Cmd::ZoomReset);
+            }
+            ui.separator();
+            if let Some(l) = crate::zoom::file_label(info.file_zoom) {
+                ui.label(
+                    egui::RichText::new(trf("このファイル: {delta}", &[("delta", l)])).weak(),
+                );
+            }
+            if item(
+                ui,
+                &tr("このファイルだけ拡大"),
+                &sc(keys, BindAction::FileZoomIn),
+                ed,
+            ) {
+                cmds.push(Cmd::FileZoomIn);
+            }
+            if item(
+                ui,
+                &tr("このファイルだけ縮小"),
+                &sc(keys, BindAction::FileZoomOut),
+                ed,
+            ) {
+                cmds.push(Cmd::FileZoomOut);
+            }
+            if item(
+                ui,
+                &tr("このファイルのズームを戻す"),
+                &sc(keys, BindAction::FileZoomReset),
+                ed && info.file_zoom != 0,
+            ) {
+                cmds.push(Cmd::FileZoomReset);
+            }
+            ui.separator();
+            if item(ui, &tr("エディタと端末のフォントを拡大 (全ファイル)"), "", true) {
+                cmds.push(Cmd::FontInc);
+            }
+            if item(ui, &tr("エディタと端末のフォントを縮小 (全ファイル)"), "", true) {
                 cmds.push(Cmd::FontDec);
             }
         });

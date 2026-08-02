@@ -29,8 +29,21 @@ pub enum BindAction {
     ToggleDeck,
     ToggleMdPreview,
     NewAgent,
-    FontInc,
-    FontDec,
+    /// 画面全体のズーム (VS Code: ⌘+ / ⌘- / ⌘0)。
+    /// UI 全体 (サイドバー・タブ・端末・ステータスバー) が拡大縮小する。
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    /// いま開いているファイルだけのズーム (⌥⌘+ / ⌥⌘- / ⌥⌘0)。
+    /// 本文フォントだけが変わる。⌘+ホイール / ピンチでも同じ操作になる。
+    ///
+    /// **画面全体側より先に消費すること。** egui の
+    /// [`Modifiers::matches_logically`] は「パターンに無い修飾キーは
+    /// 押されていてもよい」判定なので、⌥⌘+ の押下は ⌘+ のパターンにも
+    /// 一致する。修飾キーの多いこちらを先に取らないと画面全体が動く。
+    FileZoomIn,
+    FileZoomOut,
+    FileZoomReset,
     ToggleComment,
     DuplicateLine,
     MoveLineUp,
@@ -119,7 +132,7 @@ pub enum BindAction {
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 57] = [
+pub const ALL_ACTIONS: [BindAction; 61] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -135,8 +148,12 @@ pub const ALL_ACTIONS: [BindAction; 57] = [
     BindAction::ToggleDeck,
     BindAction::ToggleMdPreview,
     BindAction::NewAgent,
-    BindAction::FontInc,
-    BindAction::FontDec,
+    BindAction::ZoomIn,
+    BindAction::ZoomOut,
+    BindAction::ZoomReset,
+    BindAction::FileZoomIn,
+    BindAction::FileZoomOut,
+    BindAction::FileZoomReset,
     BindAction::ToggleComment,
     BindAction::DuplicateLine,
     BindAction::MoveLineUp,
@@ -179,6 +196,19 @@ pub const ALL_ACTIONS: [BindAction; 57] = [
     BindAction::DiffPrevChange,
 ];
 
+/// ファイル単位ズームの修飾キー。macOS は ⌥⌘、他は Ctrl+Alt+Shift。
+///
+/// 他 OS で ⇧ まで足しているのは、Ctrl+Alt+- が「戻る」(VS Code 準拠) と
+/// 重なるため。[`Modifiers::matches_logically`] は修飾キーの **上位集合** も
+/// 一致とみなすので、重ねると消費順だけが頼りになり事故りやすい。
+fn file_zoom_mods() -> Modifiers {
+    if cfg!(target_os = "macos") {
+        Modifiers::COMMAND.plus(Modifiers::ALT)
+    } else {
+        Modifiers::COMMAND.plus(Modifiers::ALT).plus(Modifiers::SHIFT)
+    }
+}
+
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
 fn default_shortcut(a: BindAction) -> KeyboardShortcut {
     let cmd = Modifiers::COMMAND;
@@ -209,8 +239,24 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::ToggleDeck => KeyboardShortcut::new(cmd_shift, Key::L),
         BindAction::ToggleMdPreview => KeyboardShortcut::new(cmd_shift, Key::V),
         BindAction::NewAgent => KeyboardShortcut::new(cmd_shift, Key::A),
-        BindAction::FontInc => KeyboardShortcut::new(cmd, Key::Plus),
-        BindAction::FontDec => KeyboardShortcut::new(cmd, Key::Minus),
+        // VS Code と同じ ⌘+ / ⌘- / ⌘0 (Windows/Linux は Ctrl)。
+        // ⌘= も拡大として受ける (英字配列では + が ⇧= なので、⇧ を押さずに
+        // 拡大したい人が多い) — その別名は app.rs の消費側で足している。
+        // macOS の予約表 (MACOS_RESERVED) にはどれも載っていない。
+        BindAction::ZoomIn => KeyboardShortcut::new(cmd, Key::Plus),
+        BindAction::ZoomOut => KeyboardShortcut::new(cmd, Key::Minus),
+        BindAction::ZoomReset => KeyboardShortcut::new(cmd, Key::Num0),
+        // ファイル単位は修飾キーを 1 つ足した段。⌘⇧ 側は使えない — 英字配列の
+        // ⌘+ は実際には ⌘⇧= なので、⌘⇧+ と ⌘+ が同じ打鍵になってしまう。
+        //
+        // macOS: ⌥⌘。OS のアクセシビリティのズームも ⌥⌘= / ⌥⌘- を使うが、
+        //   あちらは既定で無効 (使う人は config.toml で付け替えられる)。
+        //   `MACOS_RESERVED` にある ⌥⌘ の予約は D / Space / Escape / ` だけ。
+        // Windows/Linux: Ctrl+Alt+- は VS Code の「戻る」(下の NavBack) が
+        //   持っているので、⇧ を足した段を使う。
+        BindAction::FileZoomIn => KeyboardShortcut::new(file_zoom_mods(), Key::Plus),
+        BindAction::FileZoomOut => KeyboardShortcut::new(file_zoom_mods(), Key::Minus),
+        BindAction::FileZoomReset => KeyboardShortcut::new(file_zoom_mods(), Key::Num0),
         BindAction::ToggleComment => KeyboardShortcut::new(cmd, Key::Slash),
         BindAction::DuplicateLine => KeyboardShortcut::new(cmd_shift, Key::D),
         BindAction::MoveLineUp => KeyboardShortcut::new(alt, Key::ArrowUp),
@@ -228,7 +274,18 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::NewTerminal => {
             KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Backtick)
         }
-        BindAction::NavBack => KeyboardShortcut::new(Modifiers::CTRL, Key::Minus),
+        // 戻る。**macOS 以外では ⌥ を足す** — Windows/Linux の Modifiers::CTRL は
+        // 「⌘ (COMMAND)」と同じ打鍵なので、Ctrl+- のままだとブラウザでも
+        // VS Code でも縮小である Ctrl+- を先に食ってしまい、画面全体の
+        // ズームアウトが永久に効かなくなる (VS Code の Windows 版も
+        // 「戻る」は Ctrl+Alt+- を使っている)。
+        BindAction::NavBack => {
+            if cfg!(target_os = "macos") {
+                KeyboardShortcut::new(Modifiers::CTRL, Key::Minus)
+            } else {
+                KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::ALT), Key::Minus)
+            }
+        }
         BindAction::NavForward => {
             KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Minus)
         }
@@ -340,8 +397,15 @@ impl Keybinds {
             "toggle_deck" => ToggleDeck,
             "toggle_md_preview" => ToggleMdPreview,
             "new_agent" => NewAgent,
-            "font_inc" => FontInc,
-            "font_dec" => FontDec,
+            // 旧名 (font_inc / font_dec) も画面全体ズームとして受ける。
+            // v0.6 までは ⌘+ / ⌘- が「フォント拡大/縮小」だったので、
+            // 既存の config.toml の上書きを無効にしない。
+            "zoom_in" | "font_inc" => ZoomIn,
+            "zoom_out" | "font_dec" => ZoomOut,
+            "zoom_reset" => ZoomReset,
+            "file_zoom_in" => FileZoomIn,
+            "file_zoom_out" => FileZoomOut,
+            "file_zoom_reset" => FileZoomReset,
             "toggle_comment" => ToggleComment,
             "duplicate_line" => DuplicateLine,
             "move_line_up" => MoveLineUp,
@@ -468,6 +532,7 @@ fn key_from_name(name: &str) -> Option<Key> {
             ',' => Comma,
             '.' => Period,
             '-' => Minus,
+            '=' => Equals,
             '[' => OpenBracket,
             ']' => CloseBracket,
             '\\' => Backslash,
@@ -507,6 +572,7 @@ fn key_from_name(name: &str) -> Option<Key> {
         "backtick" => Backtick,
         "plus" => Plus,
         "minus" => Minus,
+        "equals" | "equal" => Equals,
         "slash" => Slash,
         "comma" => Comma,
         "period" => Period,
@@ -1128,8 +1194,12 @@ mod tests {
             "toggle_deck",
             "toggle_md_preview",
             "new_agent",
-            "font_inc",
-            "font_dec",
+            "zoom_in",
+            "zoom_out",
+            "zoom_reset",
+            "file_zoom_in",
+            "file_zoom_out",
+            "file_zoom_reset",
             "toggle_comment",
             "duplicate_line",
             "move_line_up",

@@ -677,7 +677,9 @@ Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save =
 Generated automatically on first launch. After editing, run **"Reload settings"** from the command palette for instant effect (or open the file directly via **"Open config.toml"**).
 
 ```toml
-# Theme: "zaivern-dark" | "zaivern-midnight" | "zaivern-light"
+# Theme (dark):  "zaivern-dark" "zaivern-midnight" "zaivern-nordic"
+#                "zaivern-ember" "zaivern-forest" "zaivern-ocean" "zaivern-carbon"
+# Theme (light): "zaivern-light" "zaivern-paper" "zaivern-daylight" "zaivern-frost"
 # or a full path to a VS Code-compatible theme JSON
 theme = "zaivern-dark"
 editor_font_size = 15.0
@@ -806,7 +808,7 @@ command = ""          # empty string = login shell
 src/
 ├── main.rs          Entry point (eframe bootstrap)
 ├── app.rs           App state, layout, shortcuts, palette integration
-├── theme.rs         3 themes (Dark / Midnight / Light) + egui style application
+├── theme.rs         11 themes (7 dark / 4 light) + egui style application
 ├── theme_json.rs    Color-theme JSON import (VS Code-compatible)
 ├── config.rs        ~/.zaivern/config.toml loading, generation, project overrides
 ├── editor.rs        Buffer & tab management

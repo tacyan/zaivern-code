@@ -675,7 +675,9 @@ Windows / Linux では ⌘ を Ctrl に読み替えてください。ターミ�
 初回起動時に自動生成されます。編集後はコマンドパレットの **「設定を再読み込み」** で即反映(パレットから **「設定 config.toml を開く」** で直接編集も可能)。
 
 ```toml
-# テーマ: "zaivern-dark" | "zaivern-midnight" | "zaivern-light"
+# テーマ (ダーク): "zaivern-dark" "zaivern-midnight" "zaivern-nordic"
+#                 "zaivern-ember" "zaivern-forest" "zaivern-ocean" "zaivern-carbon"
+# テーマ (ライト): "zaivern-light" "zaivern-paper" "zaivern-daylight" "zaivern-frost"
 # または VS Code 互換テーマJSONへのフルパス
 theme = "zaivern-dark"
 editor_font_size = 15.0
@@ -804,7 +806,7 @@ command = ""          # 空文字はログインシェル
 src/
 ├── main.rs          エントリポイント(eframe ブートストラップ)
 ├── app.rs           アプリ状態・レイアウト・ショートカット・パレット統合
-├── theme.rs         3テーマ(Dark / Midnight / Light)と egui スタイル適用
+├── theme.rs         11テーマ(ダーク7 / ライト4)と egui スタイル適用
 ├── theme_json.rs    カラーテーマ JSON(VS Code 互換形式)の取り込み
 ├── config.rs        ~/.zaivern/config.toml の読み込み・自動生成・プロジェクト上書き
 ├── editor.rs        バッファ・タブ管理
