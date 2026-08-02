@@ -21,6 +21,7 @@ mod file_search;
 mod file_tree;
 mod firewall;
 mod fuzzy;
+mod grammar;
 mod git;
 mod git_panel;
 mod github;
