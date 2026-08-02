@@ -192,6 +192,9 @@ pub struct Grammar {
     /// 1 行目に含まれていればこの言語とみなす文字列 (シェバン)。
     pub first_line: Vec<String>,
     pub line_comment: Vec<String>,
+    /// **行頭 (インデントの後) にあるときだけ**コメントになる記号。
+    /// Vim script の `"` のように、行中では文字列の開始記号でもある言語向け。
+    pub line_comment_bol: Vec<String>,
     pub doc_comment: Vec<String>,
     pub block_comment: Vec<(String, String)>,
     pub doc_block: Vec<(String, String)>,
@@ -324,7 +327,17 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
         };
         let cl = c.len_utf8();
 
-        // 1. コメント (ドキュメント優先 / 長い記号優先)
+        // 1. 行頭限定のコメント (Vim script の `"` など。行中では文字列)
+        if line_start
+            && g.line_comment_bol
+                .iter()
+                .any(|c| !c.is_empty() && line[i..].starts_with(c.as_str()))
+        {
+            o.push(Tok::Comment, i, len);
+            break;
+        }
+
+        // 2. コメント (ドキュメント優先 / 長い記号優先)
         if let Some((tok, tlen, block)) = comment_at(g, line, i) {
             match block {
                 None => {
@@ -354,7 +367,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             }
         }
 
-        // 2. 文字列 (複数行は状態を持ち越す)
+        // 3. 文字列 (複数行は状態を持ち越す)
         if let Some((si, rule)) = string_at(g, line, i) {
             let open_end = i + rule.open.len();
             o.push(Tok::Str, i, open_end);
@@ -371,7 +384,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             continue;
         }
 
-        // 3. 文字リテラル
+        // 4. 文字リテラル
         if g.char_literal && c == '\'' {
             let end = scan_char_literal(g, line, i);
             o.push(Tok::Char, i, end);
@@ -380,7 +393,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             continue;
         }
 
-        // 4. 行頭のプリプロセッサ指令
+        // 5. 行頭のプリプロセッサ指令
         if line_start && !g.preproc.is_empty() {
             if let Some(d) = g.preproc.iter().find(|d| line[i..].starts_with(d.as_str())) {
                 let mut e = i + d.len();
@@ -409,7 +422,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             }
         }
 
-        // 5. 注釈・デコレータ (`@Override`)
+        // 6. 注釈・デコレータ (`@Override`)
         if g.attribute.contains(&c) {
             let mut e = i + cl;
             while e < len {
@@ -430,7 +443,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             }
         }
 
-        // 6. 数値
+        // 7. 数値
         if c.is_ascii_digit() {
             let e = scan_number(line, i);
             o.push(Tok::Number, i, e);
@@ -439,7 +452,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             continue;
         }
 
-        // 7. 識別子 / キーワード
+        // 8. 識別子 / キーワード
         if g.ident_start(c) {
             let mut e = i + cl;
             while e < len {
@@ -465,7 +478,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             continue;
         }
 
-        // 8. 演算子 / 区切り / 空白
+        // 9. 演算子 / 区切り / 空白
         let tok = if is_operator(c) {
             Tok::Operator
         } else if is_punct(c) {
@@ -703,6 +716,8 @@ struct RawSyntax {
     #[serde(default)]
     line_comment: Vec<String>,
     #[serde(default)]
+    line_comment_bol: Vec<String>,
+    #[serde(default)]
     doc_comment: Vec<String>,
     #[serde(default)]
     block_comment: Vec<Vec<String>>,
@@ -788,11 +803,13 @@ impl RawSyntax {
             return Err("[[syntax]] に name が必要です".into());
         }
         let case_sensitive = self.case_sensitive.unwrap_or(true);
-        let escape = self
-            .escape
-            .as_deref()
-            .and_then(|s| s.chars().next())
-            .or(Some('\\'));
+        // `escape = ""` は「エスケープ記号を持たない言語」(VB の "" 等)。
+        // 省略時だけ `\` を既定にする。
+        let escape = match self.escape.as_deref() {
+            Some("") => None,
+            Some(s) => s.chars().next(),
+            None => Some('\\'),
+        };
 
         let mut strings: Vec<StringRule> = Vec::new();
         for q in self.strings {
@@ -846,6 +863,7 @@ impl RawSyntax {
             tokens,
             first_line: self.first_line,
             line_comment: self.line_comment,
+            line_comment_bol: self.line_comment_bol,
             doc_comment: self.doc_comment,
             block_comment: pairs(self.block_comment),
             doc_block: pairs(self.doc_block),

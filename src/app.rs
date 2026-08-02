@@ -3232,6 +3232,35 @@ impl ZaivernApp {
                 .any(|p| p.active() && &p.name == pl && p.panels.iter().any(|x| &x.id == id))
         });
 
+        // 構文ハイライト定義 (`[[syntax]]`) を集めて Highlighter へ入れる。
+        // syntect が知らない言語 (TypeScript / Kotlin / Zig …) はここで足される。
+        // 読めない定義は黙って捨てず、理由をトーストで見せる (作者がすぐ気づけるように)。
+        let mut packs = crate::grammar::GrammarSet::default();
+        let mut syn_errs: Vec<String> = Vec::new();
+        for p in self.plugins.iter().filter(|p| p.active()) {
+            for path in &p.syntax_files {
+                packs.merge(crate::grammar::GrammarSet::load_path(path, &mut syn_errs));
+            }
+        }
+        let had_langs = self.highlighter.extra_lang_count();
+        let now_langs = packs.grammars.len();
+        self.highlighter.set_grammars(packs);
+        if had_langs != now_langs {
+            // 認識できる言語が変わったので、開いているタブを判定し直す
+            // (プラグインを有効にした瞬間に、開いたままの .ts が色づく)。
+            for b in self.editor.buffers.iter_mut() {
+                if let Some(path) = b.path.clone() {
+                    b.lang = self.highlighter.lang_for(Some(&path), &b.text);
+                }
+            }
+        }
+        if let Some(e) = syn_errs.first() {
+            self.toast(
+                trf("⚠ 構文定義を読めません — {e}", &[("e", e.clone())]),
+                false,
+            );
+        }
+
         // スニペットを言語IDごとに集約
         let mut by_lang: HashMap<String, Vec<Snippet>> = HashMap::new();
         for p in self.plugins.iter().filter(|p| p.active()) {

@@ -1,0 +1,11 @@
+[plugin]
+name = "syntax-pack"
+version = "1.0.0"
+author = "Zaivern"
+description = "主要プログラミング言語の構文ハイライト。syntect の既定に無い TypeScript / Kotlin / Swift / Dart / Zig / TOML / Dockerfile / Terraform など 50 言語超を足し、別名 (.tsx / .vue / .mjs …) も解決する"
+api = 3
+
+# 構文定義は syntaxes/ の *.toml をまとめて読む。
+# 1 言語 = 1 ブロック。追加も削除もこのディレクトリの中だけで完結する。
+[[syntax]]
+path = "syntaxes"
