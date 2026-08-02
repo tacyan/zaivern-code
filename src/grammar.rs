@@ -574,7 +574,11 @@ fn scan_string_body(
         let cl = c.len_utf8();
         if Some(c) == esc && i + cl < len {
             // エスケープは 1 文字ぶんだけ色を変える (`\n`, `\"` …)
-            let nl = line[i + cl..].chars().next().map(|n| n.len_utf8()).unwrap_or(0);
+            let nl = line[i + cl..]
+                .chars()
+                .next()
+                .map(|n| n.len_utf8())
+                .unwrap_or(0);
             o.push(Tok::Str, seg, i);
             o.push(Tok::Escape, i, i + cl + nl);
             i += cl + nl;
@@ -670,7 +674,10 @@ fn is_operator(c: char) -> bool {
 }
 
 fn is_punct(c: char) -> bool {
-    matches!(c, '(' | ')' | '{' | '}' | '[' | ']' | ';' | ',' | ':' | '.' | '@' | '#' | '$')
+    matches!(
+        c,
+        '(' | ')' | '{' | '}' | '[' | ']' | ';' | ',' | ':' | '.' | '@' | '#' | '$'
+    )
 }
 
 /// `needle` を `from` 以降から探す (バイト位置)。
@@ -954,7 +961,11 @@ impl GrammarSet {
     ///  そちらを先に読み込む側で順序を決める)。
     pub fn merge(&mut self, other: GrammarSet) {
         for g in other.grammars {
-            if !self.grammars.iter().any(|x| x.name.eq_ignore_ascii_case(&g.name)) {
+            if !self
+                .grammars
+                .iter()
+                .any(|x| x.name.eq_ignore_ascii_case(&g.name))
+            {
                 self.grammars.push(g);
             }
         }
@@ -962,7 +973,9 @@ impl GrammarSet {
     }
 
     pub fn by_name(&self, name: &str) -> Option<&Grammar> {
-        self.grammars.iter().find(|g| g.name.eq_ignore_ascii_case(name))
+        self.grammars
+            .iter()
+            .find(|g| g.name.eq_ignore_ascii_case(name))
     }
 
     /// ファイル名から言語名を引く。拡張子より**ファイル名の完全一致**が優先
@@ -1009,12 +1022,18 @@ impl GrammarSet {
     /// 1 行目 (シェバン等) から引く。
     pub fn detect_first_line(&self, line: &str) -> Option<String> {
         for g in &self.grammars {
-            if g.first_line.iter().any(|p| !p.is_empty() && line.contains(p.as_str())) {
+            if g.first_line
+                .iter()
+                .any(|p| !p.is_empty() && line.contains(p.as_str()))
+            {
                 return Some(g.name.clone());
             }
         }
         for a in &self.aliases {
-            if a.first_line.iter().any(|p| !p.is_empty() && line.contains(p.as_str())) {
+            if a.first_line
+                .iter()
+                .any(|p| !p.is_empty() && line.contains(p.as_str()))
+            {
                 return Some(a.target.clone());
             }
         }
@@ -1051,7 +1070,10 @@ mod tests {
     use super::*;
 
     fn g(src: &str) -> Grammar {
-        GrammarSet::parse_toml(src).expect("解析できる").grammars.remove(0)
+        GrammarSet::parse_toml(src)
+            .expect("解析できる")
+            .grammars
+            .remove(0)
     }
 
     fn ts() -> Grammar {
@@ -1137,7 +1159,11 @@ builtins = ["console"]
     #[test]
     fn 呼び出し位置の識別子は関数扱い() {
         let gr = ts();
-        kinds(&gr, "foo(1);\n", &[(Tok::Function, "foo"), (Tok::Number, "1")]);
+        kinds(
+            &gr,
+            "foo(1);\n",
+            &[(Tok::Function, "foo"), (Tok::Number, "1")],
+        );
         // 空白を挟んでも呼び出し
         kinds(&gr, "bar ();\n", &[(Tok::Function, "bar")]);
         // 呼び出しでなければただの文字
@@ -1209,7 +1235,10 @@ builtins = ["console"]
         }
         // `1..2` の範囲は数値 2 つ
         let got = toks(&gr, "1..2;\n");
-        assert!(got.iter().filter(|(t, _)| *t == Tok::Number).count() == 2, "{got:?}");
+        assert!(
+            got.iter().filter(|(t, _)| *t == Tok::Number).count() == 2,
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -1229,7 +1258,11 @@ line_comment = ["--"]
 strings = ["'"]
 keywords = ["select", "from"]
 "##);
-        kinds(&gr, "SELECT * FROM t;\n", &[(Tok::Keyword, "SELECT"), (Tok::Keyword, "FROM")]);
+        kinds(
+            &gr,
+            "SELECT * FROM t;\n",
+            &[(Tok::Keyword, "SELECT"), (Tok::Keyword, "FROM")],
+        );
     }
 
     #[test]
@@ -1263,7 +1296,10 @@ strings = ["\""]
         kinds(&gr, "c = '\\n';\n", &[(Tok::Char, "'\\n'")]);
         // 閉じない `'` は 1 文字で諦める (Rust のライフタイム対策)
         let got = toks(&gr, "x: &'static str = 1;\n");
-        assert!(got.iter().any(|(t, b)| *t == Tok::Number && b == "1"), "{got:?}");
+        assert!(
+            got.iter().any(|(t, b)| *t == Tok::Number && b == "1"),
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -1285,12 +1321,24 @@ extensions = ["vue", "svelte"]
 "##,
         )
         .unwrap();
-        assert_eq!(set.detect_path(Path::new("/a/b/x.ts")).as_deref(), Some("TypeScript"));
-        assert_eq!(set.detect_path(Path::new("/a/Dockerfile")).as_deref(), Some("Dockerfile"));
-        assert_eq!(set.detect_path(Path::new("/a/app.vue")).as_deref(), Some("HTML"));
+        assert_eq!(
+            set.detect_path(Path::new("/a/b/x.ts")).as_deref(),
+            Some("TypeScript")
+        );
+        assert_eq!(
+            set.detect_path(Path::new("/a/Dockerfile")).as_deref(),
+            Some("Dockerfile")
+        );
+        assert_eq!(
+            set.detect_path(Path::new("/a/app.vue")).as_deref(),
+            Some("HTML")
+        );
         assert_eq!(set.detect_path(Path::new("/a/x.unknown")), None);
         assert_eq!(set.detect_token("ts").as_deref(), Some("TypeScript"));
-        assert_eq!(set.detect_token("TypeScript").as_deref(), Some("TypeScript"));
+        assert_eq!(
+            set.detect_token("TypeScript").as_deref(),
+            Some("TypeScript")
+        );
         assert_eq!(set.detect_token("svelte").as_deref(), Some("HTML"));
     }
 
@@ -1319,7 +1367,8 @@ extensions = ["tf", "tfvars"]
 
     #[test]
     fn 同名は先に読んだ方が残る() {
-        let mut a = GrammarSet::parse_toml("[[syntax]]\nname = \"X\"\nkeywords = [\"a\"]\n").unwrap();
+        let mut a =
+            GrammarSet::parse_toml("[[syntax]]\nname = \"X\"\nkeywords = [\"a\"]\n").unwrap();
         let b = GrammarSet::parse_toml("[[syntax]]\nname = \"X\"\nkeywords = [\"b\"]\n").unwrap();
         a.merge(b);
         assert_eq!(a.grammars.len(), 1);

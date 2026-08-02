@@ -178,11 +178,8 @@ impl Highlighter {
                 .ok()
                 .map(|s| sh.style_for_stack(&[s]))
                 .unwrap_or(default);
-            pal.fg[i] = Color32::from_rgb(
-                style.foreground.r,
-                style.foreground.g,
-                style.foreground.b,
-            );
+            pal.fg[i] =
+                Color32::from_rgb(style.foreground.r, style.foreground.g, style.foreground.b);
             pal.italic[i] = style.font_style.contains(FontStyle::ITALIC);
             pal.underline[i] = style.font_style.contains(FontStyle::UNDERLINE);
         }

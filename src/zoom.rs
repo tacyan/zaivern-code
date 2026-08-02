@@ -1,348 +1,324 @@
-//! ズーム (拡大 / 縮小) の純粋ロジック。
+//! ズーム倍率のはしご — 画面全体 (UI 全体) とファイル単位 (アクティブなエディタ)
+//! の両方が同じ段を共有する。
 //!
-//! 「どれだけ拡大するか」の判断だけをここに置き、egui にも `Config` にも
-//! 依存しない。段の刻み・上下限・端数の丸めはテーブルテストで固定してある
-//! ので、UI 側 (app.rs) は「1 段上げる / 下げる / 戻す」を呼ぶだけでよい。
+//! ## なぜ「段 (ladder)」なのか
 //!
-//! 対象は 2 つ。**混ぜない**:
+//! 連続値でズームすると 113% のような半端な倍率に落ち、
+//!   - ステータスバーの表示が読みにくい
+//!   - キーボードとホイールで到達できる倍率が食い違う
+//!   - 「100% に戻したつもりが 99% だった」が起きる
+//! の 3 つが同時に起きる。段に固定しておけば、どの入口 (キー / ホイール /
+//! メニュー / パレット) から操作しても同じ倍率の列を行き来する。
 //!
-//! 1. **画面全体** (`window_*`) — egui の `zoom_factor` を動かす。
-//!    サイドバー・タブ・端末・ステータスバーまで含めて全部が拡大する
-//!    (VS Code の ⌘+ / ⌘- / ⌘0 と同じ)。
-//! 2. **ファイル単位** (`file_*`) — そのタブの本文フォントだけを動かす。
-//!    基準サイズ (`config.editor_font_size`) からの **段数 (pt)** で持つので、
-//!    基準を変えても各ファイルの相対的な大きさは保たれる。
+//! ## レイアウト判断は純粋関数へ
+//!
+//! ここは egui にも `Config` にも依存しない純粋関数だけを置く。
+//! 段送りの挙動 (端での飽和・はしごから外れた値の扱い・異常値のフェイルソフト)
+//! はテーブルテストで固定してあるので、UI 側は結果を信じて使える。
 
-/// 画面全体ズームの段 (倍率)。VS Code と同じく 100% を中心に上下へ広げる。
+/// 選べる倍率の段。VS Code のズームレベルと同じく 1 段で 1 割前後変わる粒度。
 ///
-/// **昇順・重複なし** であること。`window_step` はこの表を前後に舐めるだけ
-/// なので、順序が崩れると 1 段の移動が飛ぶ。`window_levels_are_sorted` が守る。
-pub const WINDOW_LEVELS: [f32; 15] = [
-    0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0,
+/// **昇順・重複なしを保つこと** (`steps_are_sorted_and_unique` が守る)。
+/// 1.0 を必ず含める — 「リセット = 1.0」がはしごの上に無いと、
+/// リセット直後の段送りが不自然な位置へ飛ぶ。
+pub const STEPS: [f32; 15] = [
+    0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0,
 ];
 
-/// 画面全体ズームの下限 / 上限 (= 段表の両端)。
-pub const WINDOW_MIN: f32 = WINDOW_LEVELS[0];
-pub const WINDOW_MAX: f32 = WINDOW_LEVELS[WINDOW_LEVELS.len() - 1];
+/// 等倍。「リセット」はここへ戻す。
+pub const DEFAULT: f32 = 1.0;
 
-/// ファイル単位ズームで許すフォントサイズ (pt)。`config.editor_font_size`
-/// のクランプ範囲と同じにしてある (これを外すと保存された基準サイズを
-/// 開いた瞬間に段が食い違う)。
-pub const FILE_FONT_MIN: f32 = 8.0;
-pub const FILE_FONT_MAX: f32 = 32.0;
+/// 最小倍率 (はしごの下端)。
+pub const MIN: f32 = STEPS[0];
+/// 最大倍率 (はしごの上端)。
+pub const MAX: f32 = STEPS[STEPS.len() - 1];
 
-/// 異常値 (NaN / 無限 / 非正) を等倍へ丸める。設定ファイルの手書きや
-/// 壊れた state.toml で NaN が入っても、ここで必ず有限値になる。
-pub fn sanitize_window(z: f32) -> f32 {
-    if !z.is_finite() || z <= 0.0 {
-        return 1.0;
+/// 同じ倍率と見なす誤差。f32 の丸め (0.1 を足した結果など) を吸収する。
+const EPS: f32 = 1e-4;
+
+/// 倍率を有効範囲へ収める。異常値 (NaN / 無限) は等倍へフェイルソフトする。
+///
+/// ここで panic すると設定ファイルの 1 文字で起動不能になるので、絶対に assert しない。
+pub fn clamp(z: f32) -> f32 {
+    if !z.is_finite() {
+        return DEFAULT;
     }
-    z.clamp(WINDOW_MIN, WINDOW_MAX)
+    z.clamp(MIN, MAX)
 }
 
-/// 画面全体ズームを `dir` 段動かす (正=拡大 / 負=縮小 / 0=そのまま)。
+/// 1 段大きくする。上端では上端のまま (飽和)。
 ///
-/// 現在値が段の途中 (config で 1.15 を手書きした等) でも、
-/// 「次に大きい段 / 次に小さい段」へ正しく着地する。
-pub fn window_step(current: f32, dir: i32) -> f32 {
-    let cur = sanitize_window(current);
-    if dir == 0 {
-        return cur;
-    }
-    // 誤差でその場に留まらないよう、比較には少しだけ余裕を持たせる。
-    const EPS: f32 = 1e-4;
-    let mut z = cur;
-    for _ in 0..dir.unsigned_abs().min(WINDOW_LEVELS.len() as u32) {
-        z = if dir > 0 {
-            WINDOW_LEVELS
-                .iter()
-                .copied()
-                .find(|l| *l > z + EPS)
-                .unwrap_or(WINDOW_MAX)
-        } else {
-            WINDOW_LEVELS
-                .iter()
-                .copied()
-                .rev()
-                .find(|l| *l < z - EPS)
-                .unwrap_or(WINDOW_MIN)
-        };
+/// はしごに無い値 (手書き config の `ui_zoom = 1.05` など) からでも
+/// 「いまより大きい最初の段」へ着地する。
+pub fn step_up(cur: f32) -> f32 {
+    let cur = clamp(cur);
+    STEPS
+        .iter()
+        .copied()
+        .find(|s| *s > cur + EPS)
+        .unwrap_or(MAX)
+}
+
+/// 1 段小さくする。下端では下端のまま (飽和)。
+pub fn step_down(cur: f32) -> f32 {
+    let cur = clamp(cur);
+    STEPS
+        .iter()
+        .rev()
+        .copied()
+        .find(|s| *s < cur - EPS)
+        .unwrap_or(MIN)
+}
+
+/// 指定した段数だけ動かす (正=拡大 / 負=縮小 / 0=そのまま)。
+pub fn step_by(cur: f32, steps: i32) -> f32 {
+    let mut z = clamp(cur);
+    for _ in 0..steps.abs() {
+        z = if steps > 0 { step_up(z) } else { step_down(z) };
     }
     z
 }
 
-/// ステータスバー / メニュー用のラベル ("125%")。
-pub fn percent_label(z: f32) -> String {
-    format!("{}%", (sanitize_window(z) * 100.0).round() as i32)
+/// 表示用のラベル (`"100%"` / `"125%"`)。
+pub fn label(z: f32) -> String {
+    format!("{}%", (clamp(z) * 100.0).round() as i32)
 }
 
-/// 基準サイズと段数から、そのファイルで実際に使うフォントサイズ (pt)。
-pub fn file_font_size(base: f32, steps: i32) -> f32 {
-    let base = if base.is_finite() && base > 0.0 {
-        base
-    } else {
-        FILE_FONT_MIN
-    };
-    (base + steps as f32).clamp(FILE_FONT_MIN, FILE_FONT_MAX)
-}
-
-/// ファイル単位ズームの段数を `dir` だけ動かす。
+/// 等倍か (ステータスバーのバッジを出すかの判定に使う)。
 ///
-/// 上下限に張り付いたあとも段数だけが増え続けると「20 回拡大 → 1 回縮小」で
-/// 何も起きない (見た目が固まる) ため、**実際に効く範囲へ切り詰めて**返す。
-pub fn file_step(base: f32, steps: i32, dir: i32) -> i32 {
-    let base = if base.is_finite() && base > 0.0 {
-        base
-    } else {
-        FILE_FONT_MIN
-    };
-    let lo = (FILE_FONT_MIN - base).ceil() as i32;
-    let hi = (FILE_FONT_MAX - base).floor() as i32;
-    // 基準サイズ自体が範囲外でも lo <= hi を保つ (clamp が panic しない)。
-    let (lo, hi) = if lo <= hi { (lo, hi) } else { (0, 0) };
-    steps.saturating_add(dir).clamp(lo, hi)
+/// 「常に 0 を表示するバッジ」を作らないため、等倍のときは何も描かない。
+pub fn is_default(z: f32) -> bool {
+    (clamp(z) - DEFAULT).abs() < EPS
 }
 
-/// ファイル単位ズームのラベル ("+2pt" / "-1pt")。等倍のときは `None` —
-/// ステータスバーに「±0」を常時出さないため (空白は作らない/常に 0 の
-/// バッジは出さない、という UI 原則)。
-pub fn file_label(steps: i32) -> Option<String> {
-    if steps == 0 {
-        None
-    } else {
-        Some(format!("{steps:+}pt"))
-    }
+/// ホイール / ピンチの連続的な倍率変化を、はしごの段送りへ均す蓄積器。
+///
+/// egui は `ctx.input(|i| i.zoom_delta())` を **1 フレームあたりの乗算係数**
+/// (1.0 = 変化なし) として返し、しかもスクロールを数フレームに均して滑らかにする。
+/// そのまま倍率へ掛けると連続値になってしまうので、対数で貯めて
+/// しきい値を超えた分だけ段を送る。
+///
+/// 余りは持ち越す — 捨てると、ゆっくり回したときに永遠に段が動かない。
+#[derive(Default)]
+pub struct WheelAccum {
+    /// 貯まった `ln(係数)`。
+    acc: f32,
 }
 
-/// ⌘ + ホイール / ピンチの連続値を「段」へ均す。
+/// 1 段送るのに必要な `ln(係数)`。
 ///
-/// egui は ⌘+ホイールもトラックパッドのピンチも `zoom_delta()` (倍率) に
-/// 集約する。倍率をそのまま段に直すと 1 ノッチで数段飛ぶので、対数で
-/// 溜めてしきい値を跨いだぶんだけ返し、**端数は次のフレームへ持ち越す**
-/// (取りこぼすとゆっくりしたピンチが効かなくなる)。
-///
-/// `accum` は呼び出し側が持つ溜め。ジェスチャが止んだフレーム
-/// (`delta == 1.0`) では 0 に戻すので、次のジェスチャは必ず素の状態から始まる。
-pub fn wheel_steps(accum: &mut f32, delta: f32) -> i32 {
-    /// 1 段ぶんの対数量 (≒ 12% の拡大で 1 段)。
-    const PER_STEP: f32 = 0.113_328_68; // ln(1.12)
-    /// 1 フレームで進める上限。ホイールを勢いよく回しても飛びすぎない。
-    const MAX_PER_FRAME: i32 = 4;
+/// マウスホイールの 1 ノッチは egui 既定 (`scroll_zoom_speed = 1/200`) で
+/// おおよそ `exp(0.07)` になるので、1 ノッチ = 1 段になる値を選んである。
+const STEP_LN: f32 = 0.06;
 
-    if !delta.is_finite() || delta <= 0.0 || !accum.is_finite() {
-        *accum = 0.0;
-        return 0;
+impl WheelAccum {
+    /// `zoom_delta()` の値を流し込み、動かすべき段数を返す。
+    ///
+    /// 異常値は 0 段として無視する (入力デバイス由来の NaN で倍率を壊さない)。
+    pub fn feed(&mut self, zoom_delta: f32) -> i32 {
+        if !zoom_delta.is_finite() || zoom_delta <= 0.0 {
+            return 0;
+        }
+        self.acc += zoom_delta.ln();
+        // ちょうど 1 段分の入力が f32 の丸めで 0.99999 段になり、段が動かないまま
+        // 次フレームへ持ち越される (= ホイールを回しても反応しない瞬間がある)
+        // のを防ぐ許容。単位は「段」なので 1e-3 段 = 見た目には無いに等しい。
+        const TOL: f32 = 1e-3;
+        let q = self.acc / STEP_LN;
+        let whole = if q >= 0.0 {
+            (q + TOL).floor()
+        } else {
+            (q - TOL).ceil()
+        };
+        // 暴走した入力 (一気に 100 倍など) でも段数は現実的な範囲に抑える。
+        let steps = whole.clamp(-8.0, 8.0) as i32;
+        if steps != 0 {
+            self.acc -= steps as f32 * STEP_LN;
+        }
+        steps
     }
-    if (delta - 1.0).abs() <= f32::EPSILON {
-        *accum = 0.0;
-        return 0;
+
+    /// 貯まりを捨てる (ズーム対象が切り替わったときなど)。
+    pub fn reset(&mut self) {
+        self.acc = 0.0;
     }
-    *accum += delta.ln();
-    let steps = (*accum / PER_STEP).trunc() as i32;
-    let steps = steps.clamp(-MAX_PER_FRAME, MAX_PER_FRAME);
-    *accum -= steps as f32 * PER_STEP;
-    steps
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---- 段表そのもの ----
-
     #[test]
-    fn window_levels_are_sorted_and_unique() {
-        for w in WINDOW_LEVELS.windows(2) {
-            assert!(w[0] < w[1], "段表は昇順・重複なし: {w:?}");
+    fn steps_are_sorted_and_unique() {
+        for w in STEPS.windows(2) {
+            assert!(w[0] < w[1], "昇順でない: {w:?}");
         }
-        assert!(WINDOW_LEVELS.contains(&1.0), "等倍が段表に無いと ⌘0 と往復できない");
+        assert!(STEPS.contains(&DEFAULT), "等倍がはしごに無い");
+        assert_eq!(MIN, STEPS[0]);
+        assert_eq!(MAX, STEPS[STEPS.len() - 1]);
     }
 
-    // ---- sanitize ----
-
     #[test]
-    fn sanitize_maps_broken_values_to_one() {
-        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -2.0] {
-            assert_eq!(sanitize_window(bad), 1.0, "壊れた値 {bad} は等倍へ");
+    fn step_up_and_down_walk_the_ladder() {
+        // 下端から上端まで昇り切り、同じ道を降りて戻る。
+        let mut z = MIN;
+        let mut seen = vec![z];
+        for _ in 0..STEPS.len() * 2 {
+            z = step_up(z);
+            if z != *seen.last().unwrap() {
+                seen.push(z);
+            }
         }
-        assert_eq!(sanitize_window(10.0), WINDOW_MAX, "上限で頭打ち");
-        assert_eq!(sanitize_window(0.01), WINDOW_MIN, "下限で底打ち");
-        assert_eq!(sanitize_window(1.25), 1.25, "段の途中でもそのまま通す");
+        assert_eq!(seen, STEPS.to_vec(), "昇りではしごを踏み外している");
+
+        for _ in 0..STEPS.len() * 2 {
+            z = step_down(z);
+        }
+        assert_eq!(z, MIN, "降り切っても下端に着かない");
     }
 
-    // ---- window_step ----
-
     #[test]
-    fn window_step_walks_the_ladder() {
-        let table: [(f32, i32, f32); 8] = [
-            (1.0, 1, 1.1),
-            (1.0, -1, 0.9),
-            (1.0, 0, 1.0),
-            (1.0, 3, 1.3),
-            (1.0, -3, 0.7),
-            (WINDOW_MAX, 1, WINDOW_MAX),
-            (WINDOW_MIN, -1, WINDOW_MIN),
-            (1.15, 1, 1.2), // 段の途中からは「次の段」へ
-        ];
-        for (from, dir, want) in table {
-            let got = window_step(from, dir);
-            assert!(
-                (got - want).abs() < 1e-5,
-                "window_step({from}, {dir}) = {got}, want {want}"
-            );
+    fn steps_saturate_at_both_ends() {
+        assert_eq!(step_up(MAX), MAX);
+        assert_eq!(step_up(MAX + 10.0), MAX);
+        assert_eq!(step_down(MIN), MIN);
+        assert_eq!(step_down(MIN - 10.0), MIN);
+    }
+
+    /// はしごから外れた値 (手書き config) でも、正しい向きの隣の段へ着地する。
+    #[test]
+    fn off_ladder_values_land_on_the_next_step() {
+        for (cur, up, down) in [
+            (1.05_f32, 1.1_f32, 1.0_f32),
+            (1.4, 1.5, 1.25),
+            (0.55, 0.6, 0.5),
+            (2.9, 3.0, 2.75),
+        ] {
+            assert_eq!(step_up(cur), up, "step_up({cur})");
+            assert_eq!(step_down(cur), down, "step_down({cur})");
+        }
+    }
+
+    /// f32 の丸めで段がずれない (0.9 + 0.1 が 1.0000001 になっても 1 段だけ動く)。
+    #[test]
+    fn floating_point_noise_does_not_skip_a_step() {
+        for s in STEPS {
+            let noisy = s + 1e-6;
+            assert_eq!(step_up(noisy), step_up(s), "{s} + ε");
+            assert_eq!(step_down(noisy), step_down(s), "{s} + ε");
         }
     }
 
     #[test]
-    fn window_step_from_between_levels_goes_down_to_the_lower_level() {
-        assert!((window_step(1.15, -1) - 1.1).abs() < 1e-5);
+    fn clamp_fails_soft_on_bad_input() {
+        assert_eq!(clamp(f32::NAN), DEFAULT);
+        assert_eq!(clamp(f32::INFINITY), DEFAULT);
+        assert_eq!(clamp(f32::NEG_INFINITY), DEFAULT);
+        assert_eq!(clamp(0.0), MIN);
+        assert_eq!(clamp(1000.0), MAX);
+        assert_eq!(clamp(1.25), 1.25);
+        // 異常値から段送りしても壊れない
+        assert_eq!(step_up(f32::NAN), step_up(DEFAULT));
+        assert_eq!(step_down(f32::NAN), step_down(DEFAULT));
     }
 
     #[test]
-    fn window_step_is_reversible_within_the_ladder() {
-        let mut z = 1.0;
-        for _ in 0..4 {
-            z = window_step(z, 1);
+    fn step_by_moves_the_requested_number_of_steps() {
+        assert_eq!(step_by(1.0, 0), 1.0);
+        assert_eq!(step_by(1.0, 2), 1.25);
+        assert_eq!(step_by(1.0, -2), 0.8);
+        assert_eq!(step_by(1.0, 100), MAX);
+        assert_eq!(step_by(1.0, -100), MIN);
+    }
+
+    #[test]
+    fn label_is_whole_percent() {
+        assert_eq!(label(1.0), "100%");
+        assert_eq!(label(1.25), "125%");
+        assert_eq!(label(0.5), "50%");
+        assert_eq!(label(f32::NAN), "100%");
+        // はしごの全段で「%」付きの整数になる
+        for s in STEPS {
+            let l = label(s);
+            assert!(l.ends_with('%'), "{l}");
+            assert!(l[..l.len() - 1].parse::<i32>().is_ok(), "{l}");
         }
-        for _ in 0..4 {
-            z = window_step(z, -1);
-        }
-        assert!((z - 1.0).abs() < 1e-5, "同じ回数だけ戻せば等倍へ戻る: {z}");
     }
 
     #[test]
-    fn window_step_survives_broken_input() {
-        assert_eq!(window_step(f32::NAN, 1), 1.1);
-        assert_eq!(window_step(0.0, -1), 0.9);
+    fn is_default_only_at_one() {
+        assert!(is_default(1.0));
+        assert!(is_default(1.0 + 1e-6));
+        assert!(!is_default(1.1));
+        assert!(!is_default(0.9));
+        assert!(is_default(f32::NAN), "異常値は等倍扱い (バッジを出さない)");
+    }
+
+    /// マウスホイール 1 ノッチ ≒ 1 段。egui の平滑化で複数フレームに割れても
+    /// 合計が同じなら同じ段数になる。
+    #[test]
+    fn wheel_accum_one_notch_is_one_step() {
+        let notch = (0.07_f32).exp();
+        let mut a = WheelAccum::default();
+        assert_eq!(a.feed(notch), 1);
+
+        // 平滑化で 7 フレームに割れた場合も合計 1 段
+        let mut b = WheelAccum::default();
+        let part = (0.01_f32).exp();
+        let total: i32 = (0..7).map(|_| b.feed(part)).sum();
+        assert_eq!(total, 1);
     }
 
     #[test]
-    fn window_step_never_leaves_the_range() {
-        let mut z = 1.0;
-        for _ in 0..50 {
-            z = window_step(z, 1);
-            assert!((WINDOW_MIN..=WINDOW_MAX).contains(&z));
-        }
-        assert_eq!(z, WINDOW_MAX);
-        for _ in 0..50 {
-            z = window_step(z, -1);
-            assert!((WINDOW_MIN..=WINDOW_MAX).contains(&z));
-        }
-        assert_eq!(z, WINDOW_MIN);
-    }
+    fn wheel_accum_is_symmetric_and_keeps_remainder() {
+        let mut a = WheelAccum::default();
+        // 小さすぎる変化では段は動かない (が、貯まりは残る)
+        assert_eq!(a.feed((0.03_f32).exp()), 0);
+        assert_eq!(a.feed((0.03_f32).exp()), 1, "貯まりを捨てている");
 
-    // ---- percent_label ----
+        let mut b = WheelAccum::default();
+        assert_eq!(b.feed((-0.07_f32).exp()), -1);
 
-    #[test]
-    fn percent_label_is_readable() {
-        assert_eq!(percent_label(1.0), "100%");
-        assert_eq!(percent_label(1.25), "125%");
-        assert_eq!(percent_label(0.5), "50%");
-        assert_eq!(percent_label(f32::NAN), "100%");
-    }
-
-    // ---- file zoom ----
-
-    #[test]
-    fn file_font_size_clamps_to_editor_range() {
-        assert_eq!(file_font_size(15.0, 0), 15.0);
-        assert_eq!(file_font_size(15.0, 3), 18.0);
-        assert_eq!(file_font_size(15.0, -3), 12.0);
-        assert_eq!(file_font_size(15.0, 100), FILE_FONT_MAX);
-        assert_eq!(file_font_size(15.0, -100), FILE_FONT_MIN);
-        assert_eq!(file_font_size(f32::NAN, 0), FILE_FONT_MIN);
+        // 貯まりを捨てられる
+        let mut c = WheelAccum::default();
+        c.feed((0.05_f32).exp());
+        c.reset();
+        assert_eq!(c.feed((0.05_f32).exp()), 0);
     }
 
     #[test]
-    fn file_step_saturates_at_the_edges_and_comes_back_immediately() {
-        let base = 15.0;
-        let mut s = 0;
-        for _ in 0..40 {
-            s = file_step(base, s, 1);
-        }
-        assert_eq!(file_font_size(base, s), FILE_FONT_MAX, "上限に張り付く");
-        // 上限で 40 回押しても段数は伸びていないので、1 回の縮小で必ず縮む
-        let back = file_step(base, s, -1);
+    fn wheel_accum_ignores_bad_input() {
+        let mut a = WheelAccum::default();
+        assert_eq!(a.feed(f32::NAN), 0);
+        assert_eq!(a.feed(0.0), 0);
+        assert_eq!(a.feed(-1.0), 0);
+        assert_eq!(a.feed(f32::INFINITY), 0);
+        // 壊れた入力の後も普通に動く
+        assert_eq!(a.feed((0.07_f32).exp()), 1);
+    }
+
+    #[test]
+    fn wheel_accum_clamps_runaway_input() {
+        let mut a = WheelAccum::default();
+        let steps = a.feed(100.0);
         assert!(
-            file_font_size(base, back) < FILE_FONT_MAX,
-            "上限のあと 1 回縮小したら必ず小さくなる"
+            (1..=8).contains(&steps),
+            "暴走入力で段数が飛びすぎ: {steps}"
         );
+        // 1.0 から適用しても範囲内
+        let z = step_by(1.0, steps);
+        assert!((MIN..=MAX).contains(&z));
     }
 
+    /// ホイールで動かした結果も必ずはしごの上に乗る (連続値にならない)。
     #[test]
-    fn file_step_table() {
-        let table: [(f32, i32, i32, i32); 6] = [
-            (15.0, 0, 1, 1),
-            (15.0, 0, -1, -1),
-            (15.0, 0, 0, 0),
-            (15.0, 17, 1, 17),  // 15+17=32 (上限) で頭打ち
-            (15.0, -7, -1, -7), // 15-7=8 (下限) で底打ち
-            (8.0, 0, -1, 0),    // 基準が下限なら縮小できない
-        ];
-        for (base, steps, dir, want) in table {
-            assert_eq!(
-                file_step(base, steps, dir),
-                want,
-                "file_step({base}, {steps}, {dir})"
-            );
+    fn wheel_zoom_stays_on_the_ladder() {
+        let mut a = WheelAccum::default();
+        let mut z = DEFAULT;
+        for _ in 0..40 {
+            z = step_by(z, a.feed((0.07_f32).exp()));
         }
-    }
-
-    #[test]
-    fn file_step_survives_broken_base() {
-        // 基準が壊れていても panic せず、段数は有限のまま
-        let s = file_step(f32::NAN, 0, 1);
-        assert!(s.abs() <= 64);
-    }
-
-    #[test]
-    fn file_label_hides_the_neutral_state() {
-        assert_eq!(file_label(0), None);
-        assert_eq!(file_label(2).as_deref(), Some("+2pt"));
-        assert_eq!(file_label(-1).as_deref(), Some("-1pt"));
-    }
-
-    // ---- wheel_steps ----
-
-    #[test]
-    fn wheel_steps_needs_a_real_gesture() {
-        let mut a = 0.0;
-        assert_eq!(wheel_steps(&mut a, 1.0), 0, "動きが無ければ 0 段");
-        assert_eq!(a, 0.0);
-    }
-
-    #[test]
-    fn wheel_steps_accumulates_small_gestures() {
-        let mut a = 0.0;
-        // 1 回では足りない小さなピンチでも、続ければいつか 1 段になる
-        let mut total = 0;
-        for _ in 0..4 {
-            total += wheel_steps(&mut a, 1.04);
-        }
-        assert_eq!(total, 1, "0.04 ずつでも溜まって 1 段進む");
-    }
-
-    #[test]
-    fn wheel_steps_is_symmetric() {
-        let mut a = 0.0;
-        let up = wheel_steps(&mut a, 1.5);
-        let mut b = 0.0;
-        let down = wheel_steps(&mut b, 1.0 / 1.5);
-        assert_eq!(up, -down, "拡大と縮小で同じ段数");
-    }
-
-    #[test]
-    fn wheel_steps_is_capped_per_frame() {
-        let mut a = 0.0;
-        assert!(wheel_steps(&mut a, 100.0) <= 4);
-        let mut b = 0.0;
-        assert!(wheel_steps(&mut b, 0.001) >= -4);
-    }
-
-    #[test]
-    fn wheel_steps_resets_on_broken_input() {
-        let mut a = 0.5;
-        assert_eq!(wheel_steps(&mut a, f32::NAN), 0);
-        assert_eq!(a, 0.0, "壊れた入力では溜めを捨てる");
+        assert!(STEPS.contains(&z), "はしごから外れた: {z}");
+        assert_eq!(z, MAX);
     }
 }

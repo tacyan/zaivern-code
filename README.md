@@ -512,7 +512,7 @@ LLM に「宛先っぽい文」を推測させるようなことはしない。*
 - **端末が「黒いタイル」で残る問題は、原因の側で塞いだ。** vt100 パーサのスクロール領域・タブストップ・行操作で起きていた panic と、`CSI <巨大な数値>` の反復パラメータの暴走を上限で抑え込んだ(パッチは `vendor/vt100` に取り込み、敵対的入力のテストで固定)。それでも壊れたタイルは 1 枚だけを隔離して「⚠ 再試行」を出す——**空の黒い矩形のまま放置しない**。併せて、プラグインのタイムアウト時に**孫プロセスまで木ごと止める**(取り残しでエディタが固まっていた)、日本語入力の変換確定 Enter がエージェントへ漏れる問題、CP932 など非 UTF-8 保存の破損も塞いだ
 
 ### 📱 スマホリモートの詳細
-- **できること**: ファイルの閲覧・編集・保存、タブ切替、ワークスペース検索&オープン、エージェントのターミナル閲覧・指示送信・承認操作(Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y)、各種コマンド(保存・新規・Cockpit・フォント±・承認モード切替など)
+- **できること**: ファイルの閲覧・編集・保存、タブ切替、ワークスペース検索&オープン、エージェントのターミナル閲覧・指示送信・承認操作(Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y)、各種コマンド(保存・新規・Cockpit・ズーム±・承認モード切替など)
 - **仕組み**: 内蔵の極小 HTTP サーバ(ポート 8899、使用中なら 8900〜8919 に自動フォールバック)。依存クレート追加なしの `std::net` のみ
 - **セキュリティ**: 起動ごとにランダム生成されるトークンで認証(QR の URL に埋め込み済み)。トークンなしの API アクセスは 401 拒否。LAN 内のみ
 - **🔐 同じ Wi-Fi でなくても繋ぐ — SSH リバーストンネル**: LAN モードは「同じ Wi-Fi」が前提なので、外出先からは届かない。トップバーの 📱 →「リモート接続 (SSH)」から、**あなたが既に SSH で入れるホスト**(VPS / 自宅サーバ / 会社の踏み台)を中継点にできる。`スマホ ──HTTP──▶ 踏み台:8899 ──SSHトンネル──▶ PC:127.0.0.1:8899` という経路を張るだけなので、**スマホ側に SSH クライアントは要らない**(ブラウザで URL を開くだけ)
@@ -624,7 +624,17 @@ cargo clippy --all-targets --locked -- -D warnings   # + 凍結した債務の -
 | Enter | 自動インデント(直前行の字下げ + `{ ( [ :` 後は追加字下げ) |
 | ⌘B | サイドバー切替 |
 | ⌘⇧E | エクスプローラー(ファイルツリー)を表示してフォーカス |
-| ⌘+ / ⌘- | フォント拡大 / 縮小 |
+| ⌘+ / ⌘- / ⌘0 | **画面全体**をズームイン / アウト / 100% に戻す |
+| ⌘⌥+ / ⌘⌥- / ⌘⌥0 | **開いているファイルだけ**をズームイン / アウト / 解除 |
+| ⌘ + ホイール(またはピンチ) | ポインタがエディタ本文の上ならファイル単位、それ以外なら画面全体 |
+
+**ズームは二階建てです。**
+「画面全体」は VS Code の `window.zoomLevel` と同じで、サイドバー・タブ・メニュー・
+**ターミナル**まで含めた UI 全部が一緒に拡大縮小し、倍率は `~/.zaivern/state.toml` に
+記憶されます(50%〜300%、13 段)。「ファイル単位」はそのタブの本文(と Markdown
+プレビュー)だけに掛かる一時的な倍率で、タブを閉じれば消えます。
+等倍から外れている間だけステータスバーに `🔍 125%` / `🔎 150%` が出て、
+**押すとその場で解除**できます。表示メニューとコマンドパレットからも同じ操作ができます。
 
 ### エージェント端末 (macOS)
 
@@ -664,7 +674,7 @@ cargo clippy --all-targets --locked -- -D warnings   # + 凍結した債務の -
 
 Windows / Linux では ⌘ を Ctrl に読み替えてください。ターミナル内では Ctrl+C 等の制御キー、矢印、Tab、Esc がそのまま PTY へ送られます(Shift/Option+Enter は改行として送信され、Claude Code の複数行入力に対応)。
 
-`config.toml` の `[keybindings]` で全ショートカットを上書きできます(`save = "cmd+s"` 形式)。action 名: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `global_replace` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_deck` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `toggle_fold` `unfold_all` `toggle_bookmark` `reopen_closed_tab` `lsp_completion` `lsp_references` `lsp_symbols` `lsp_rename` `lsp_format` `lsp_code_action` `lsp_signature_help` `select_next_occurrence` `split_editor_right` `split_editor_down` `focus_pane_1` `focus_pane_2` `focus_pane_3` `diff_next_change` `diff_prev_change`。修飾キー: `cmd` `ctrl` `shift` `alt`(=`option`)。ファイルツリーのキーは VS Code 既定に固定です。
+`config.toml` の `[keybindings]` で全ショートカットを上書きできます(`save = "cmd+s"` 形式)。action 名: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `global_replace` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_deck` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `zoom_in` `zoom_out` `zoom_reset` `file_zoom_in` `file_zoom_out` `file_zoom_reset` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `toggle_fold` `unfold_all` `toggle_bookmark` `reopen_closed_tab` `lsp_completion` `lsp_references` `lsp_symbols` `lsp_rename` `lsp_format` `lsp_code_action` `lsp_signature_help` `select_next_occurrence` `split_editor_right` `split_editor_down` `focus_pane_1` `focus_pane_2` `focus_pane_3` `diff_next_change` `diff_prev_change`。修飾キー: `cmd` `ctrl` `shift` `alt`(=`option`)。ファイルツリーのキーは VS Code 既定に固定です。
 
 **画面に出る打鍵表記は、この表から生成されます。** メニュー・右クリック・パレット・ツールチップに並ぶ「⌘S」の類は文字列を手書きしていないので、`[keybindings]` で割り当てを変えると**表示のほうも一緒に変わります**——設定を変えたのに画面が古い打鍵を主張する、ということは起こりません。全アクションは「押したら本当に消費される場所へ繋がっているか」をテストで固定してあり、**画面に出ているのに効かないショートカットは CI で落ちます**。macOS が OS 側で握っている打鍵(⌘Space・⌃Space・⌥⌘D など)の表も実測で持っていて、既定バインドがそこへ入らないことも同じテストで確かめています。egui-winit 0.29 が **⌘⇧C / ⌘⇧V の押下イベントごと Copy / Paste にすり替えてしまう**問題も、すり替え後のイベントから元の打鍵を復元する互換経路で回避してあります(Cockpit の ⌘⇧C はこの経路を通っています)。
 

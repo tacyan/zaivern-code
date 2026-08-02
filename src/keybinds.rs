@@ -29,18 +29,11 @@ pub enum BindAction {
     ToggleDeck,
     ToggleMdPreview,
     NewAgent,
-    /// 画面全体のズーム (VS Code: ⌘+ / ⌘- / ⌘0)。
-    /// UI 全体 (サイドバー・タブ・端末・ステータスバー) が拡大縮小する。
+    /// 画面全体のズーム (VS Code: ⌘+ / ⌘- / ⌘0)。UI 全部が拡大縮小する。
     ZoomIn,
     ZoomOut,
     ZoomReset,
-    /// いま開いているファイルだけのズーム (⌥⌘+ / ⌥⌘- / ⌥⌘0)。
-    /// 本文フォントだけが変わる。⌘+ホイール / ピンチでも同じ操作になる。
-    ///
-    /// **画面全体側より先に消費すること。** egui の
-    /// [`Modifiers::matches_logically`] は「パターンに無い修飾キーは
-    /// 押されていてもよい」判定なので、⌥⌘+ の押下は ⌘+ のパターンにも
-    /// 一致する。修飾キーの多いこちらを先に取らないと画面全体が動く。
+    /// アクティブなタブだけのズーム (⌘⌥+ / ⌘⌥- / ⌘⌥0)。
     FileZoomIn,
     FileZoomOut,
     FileZoomReset,
@@ -205,7 +198,9 @@ fn file_zoom_mods() -> Modifiers {
     if cfg!(target_os = "macos") {
         Modifiers::COMMAND.plus(Modifiers::ALT)
     } else {
-        Modifiers::COMMAND.plus(Modifiers::ALT).plus(Modifiers::SHIFT)
+        Modifiers::COMMAND
+            .plus(Modifiers::ALT)
+            .plus(Modifiers::SHIFT)
     }
 }
 
@@ -239,24 +234,22 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::ToggleDeck => KeyboardShortcut::new(cmd_shift, Key::L),
         BindAction::ToggleMdPreview => KeyboardShortcut::new(cmd_shift, Key::V),
         BindAction::NewAgent => KeyboardShortcut::new(cmd_shift, Key::A),
-        // VS Code と同じ ⌘+ / ⌘- / ⌘0 (Windows/Linux は Ctrl)。
-        // ⌘= も拡大として受ける (英字配列では + が ⇧= なので、⇧ を押さずに
-        // 拡大したい人が多い) — その別名は app.rs の消費側で足している。
-        // macOS の予約表 (MACOS_RESERVED) にはどれも載っていない。
+        // 画面全体のズーム。ブラウザ / VS Code と同じ ⌘+ / ⌘- / ⌘0。
+        // (⌘= も同義として app.rs 側で拾う — US 配列では + が ⇧= で打ちにくいため)
         BindAction::ZoomIn => KeyboardShortcut::new(cmd, Key::Plus),
         BindAction::ZoomOut => KeyboardShortcut::new(cmd, Key::Minus),
         BindAction::ZoomReset => KeyboardShortcut::new(cmd, Key::Num0),
-        // ファイル単位は修飾キーを 1 つ足した段。⌘⇧ 側は使えない — 英字配列の
-        // ⌘+ は実際には ⌘⇧= なので、⌘⇧+ と ⌘+ が同じ打鍵になってしまう。
+        // ファイル単位のズームは画面全体に ⌥ を足した形にする
+        // (「同じ操作の、対象が狭い版」が打鍵でも伝わる)。
         //
-        // macOS: ⌥⌘。OS のアクセシビリティのズームも ⌥⌘= / ⌥⌘- を使うが、
-        //   あちらは既定で無効 (使う人は config.toml で付け替えられる)。
-        //   `MACOS_RESERVED` にある ⌥⌘ の予約は D / Space / Escape / ` だけ。
-        // Windows/Linux: Ctrl+Alt+- は VS Code の「戻る」(下の NavBack) が
-        //   持っているので、⇧ を足した段を使う。
-        BindAction::FileZoomIn => KeyboardShortcut::new(file_zoom_mods(), Key::Plus),
-        BindAction::FileZoomOut => KeyboardShortcut::new(file_zoom_mods(), Key::Minus),
-        BindAction::FileZoomReset => KeyboardShortcut::new(file_zoom_mods(), Key::Num0),
+        // ⌥⌘ 系の既存割り当ては S / F / B / [ / ] だけなので衝突しない。
+        // macOS の「アクセシビリティ拡大」も ⌥⌘= / ⌥⌘- を使うが、
+        // これは既定でオフ (システム設定 → アクセシビリティ → ズーム →
+        // 「キーボードショートカットを使用してズーム」)。有効にしている人は
+        // config.toml の [keybindings] で `file_zoom_in` などを付け替えられる。
+        BindAction::FileZoomIn => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Plus),
+        BindAction::FileZoomOut => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Minus),
+        BindAction::FileZoomReset => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Num0),
         BindAction::ToggleComment => KeyboardShortcut::new(cmd, Key::Slash),
         BindAction::DuplicateLine => KeyboardShortcut::new(cmd_shift, Key::D),
         BindAction::MoveLineUp => KeyboardShortcut::new(alt, Key::ArrowUp),
@@ -397,15 +390,15 @@ impl Keybinds {
             "toggle_deck" => ToggleDeck,
             "toggle_md_preview" => ToggleMdPreview,
             "new_agent" => NewAgent,
-            // 旧名 (font_inc / font_dec) も画面全体ズームとして受ける。
-            // v0.6 までは ⌘+ / ⌘- が「フォント拡大/縮小」だったので、
-            // 既存の config.toml の上書きを無効にしない。
-            "zoom_in" | "font_inc" => ZoomIn,
-            "zoom_out" | "font_dec" => ZoomOut,
+            "zoom_in" => ZoomIn,
+            "zoom_out" => ZoomOut,
             "zoom_reset" => ZoomReset,
             "file_zoom_in" => FileZoomIn,
             "file_zoom_out" => FileZoomOut,
             "file_zoom_reset" => FileZoomReset,
+            // v0.5.1 までの名前。既存の config.toml を黙って壊さないための別名。
+            "font_inc" => ZoomIn,
+            "font_dec" => ZoomOut,
             "toggle_comment" => ToggleComment,
             "duplicate_line" => DuplicateLine,
             "move_line_up" => MoveLineUp,
@@ -1530,6 +1523,49 @@ mod tests {
              (fmt_key / format_shortcut から生成すること):\n{}",
             bad.join("\n")
         );
+    }
+
+    /// 旧名 (`font_inc` / `font_dec`) を書いた config.toml を壊さない。
+    /// ズーム系の改名で既存ユーザーのキーバインドが黙って無効化されると、
+    /// 「アップデートしたら自分の設定が効かなくなった」になるため。
+    #[test]
+    fn legacy_font_action_names_still_resolve() {
+        assert_eq!(
+            Keybinds::action_from_name("font_inc"),
+            Some(BindAction::ZoomIn)
+        );
+        assert_eq!(
+            Keybinds::action_from_name("font_dec"),
+            Some(BindAction::ZoomOut)
+        );
+        // 旧名で上書きすると、新しいアクションの割り当てが変わる
+        let mut o = HashMap::new();
+        o.insert("font_inc".to_string(), "ctrl+shift+u".to_string());
+        let kb = Keybinds::from_overrides(&o);
+        assert_eq!(
+            kb.get(BindAction::ZoomIn),
+            parse_shortcut("ctrl+shift+u").unwrap()
+        );
+    }
+
+    /// 画面全体とファイル単位のズームは、別々の打鍵で両方到達できる。
+    #[test]
+    fn zoom_bindings_cover_both_scopes() {
+        let kb = Keybinds::default();
+        for (a, b) in [
+            (BindAction::ZoomIn, BindAction::FileZoomIn),
+            (BindAction::ZoomOut, BindAction::FileZoomOut),
+            (BindAction::ZoomReset, BindAction::FileZoomReset),
+        ] {
+            let (sa, sb) = (kb.get(a), kb.get(b));
+            assert_eq!(
+                sa.logical_key, sb.logical_key,
+                "{a:?} と {b:?} でキーが違う"
+            );
+            assert!(!sa.modifiers.alt, "{a:?} に ⌥ が付いている");
+            assert!(sb.modifiers.alt, "{b:?} に ⌥ が付いていない");
+            assert_ne!(sa, sb);
+        }
     }
 
     #[test]

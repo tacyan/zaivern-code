@@ -138,13 +138,6 @@ pub struct Buffer {
     pub large: LargeFileMode,
     /// CSV/TSV のテーブル表示。`None` の間は普通のテキストとして描く。
     pub table: Option<TableView>,
-    /// このタブだけのズーム段数 (pt)。0 = 設定どおり (`editor_font_size`)。
-    ///
-    /// 基準サイズからの **差分** で持つので、設定側のフォントを変えても
-    /// 「このファイルは少し大きめ」という相対関係が保たれる。
-    /// タブを閉じれば消える (セッション中だけの見た目の調整であって、
-    /// ファイルの属性ではない)。実サイズへの変換は [`crate::zoom`]。
-    pub zoom: i32,
     /// 専用ビューア (16 進 / メディア / 書庫) の中身。
     ///
     /// 種類ごとにフィールドを増やすと `Buffer` の生成箇所が毎回全部壊れるので、
@@ -158,6 +151,17 @@ pub struct Buffer {
     /// 折り返し・空白可視化のどれかが変わったときにだけ再構築が走り、
     /// 何も変わらないフレームでは Vec を読むだけになる。
     pub minimap: Option<(u64, crate::minimap::MinimapRows)>,
+    /// このタブだけのズーム倍率 (1.0 = 画面全体のズームに従うだけ)。
+    ///
+    /// 画面全体のズーム (`Config::ui_zoom`) の **上に掛かる** ので、
+    /// 「UI は 100% のまま、このファイルだけ 150% で読む」ができる。
+    /// 段は [`crate::zoom::STEPS`]。
+    ///
+    /// タブを閉じれば消える一時的な表示状態 (スクロール位置と同じ扱い) で、
+    /// ディスクにも state.toml にも保存しない。ファイルの中身ではないものを
+    /// 永続化すると、後から「なぜこのファイルだけ字が大きいのか」が
+    /// どこにも書かれていない謎として残るため。
+    pub zoom: f32,
 }
 
 /// 画像タブのデコード結果。
@@ -1419,7 +1423,7 @@ impl Editor {
             table: None,
             preview: None,
             minimap: None,
-            zoom: 0,
+            zoom: crate::zoom::DEFAULT,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -1459,7 +1463,7 @@ impl Editor {
             table: None,
             preview,
             minimap: None,
-            zoom: 0,
+            zoom: crate::zoom::DEFAULT,
         });
         self.active = Some(self.buffers.len() - 1);
     }
@@ -1566,7 +1570,7 @@ impl Editor {
                 table: None,
                 preview: None,
                 minimap: None,
-                zoom: 0,
+                zoom: crate::zoom::DEFAULT,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -1612,7 +1616,7 @@ impl Editor {
                 table: None,
                 preview: None,
                 minimap: None,
-                zoom: 0,
+                zoom: crate::zoom::DEFAULT,
             });
             self.active = Some(self.buffers.len() - 1);
             return Ok(false);
@@ -1648,7 +1652,7 @@ impl Editor {
             table: None,
             preview: None,
             minimap: None,
-            zoom: 0,
+            zoom: crate::zoom::DEFAULT,
         });
         self.active = Some(self.buffers.len() - 1);
         Ok(false)
@@ -1696,7 +1700,7 @@ impl Editor {
             table: None,
             preview: None,
             minimap: None,
-            zoom: 0,
+            zoom: crate::zoom::DEFAULT,
         });
         self.active = Some(self.buffers.len() - 1);
         id

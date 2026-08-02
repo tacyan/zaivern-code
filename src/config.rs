@@ -9,9 +9,11 @@ pub struct Config {
     pub theme: String,
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
-    /// 画面全体のズーム倍率 (VS Code の ⌘+ / ⌘- / ⌘0 相当)。1.0 = 等倍。
-    /// フォントサイズと違い **UI 全体** (サイドバー・タブ・端末・ステータス
-    /// バー) が拡大縮小する。値は `crate::zoom` の段表へ丸めて使う。
+    /// 画面全体のズーム倍率 (VS Code の `window.zoomLevel` 相当)。
+    ///
+    /// egui の `zoom_factor` へそのまま渡す = **UI の全部** (サイドバー・タブ・
+    /// メニュー・端末・エディタ) が一緒に拡大縮小する。段は `crate::zoom::STEPS`。
+    /// ファイル単位のズームは倍率をバッファ側が持つので、ここには入らない。
     pub ui_zoom: f32,
     pub show_hidden_files: bool,
 
@@ -259,7 +261,7 @@ impl Default for Config {
             theme: "zaivern-dark".into(),
             editor_font_size: 15.0,
             terminal_font_size: 13.0,
-            ui_zoom: 1.0,
+            ui_zoom: crate::zoom::DEFAULT,
             show_hidden_files: true,
             word_wrap: false,
             show_whitespace: false,
@@ -487,7 +489,8 @@ struct UiState {
     show_pet: Option<bool>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
-    /// 画面全体ズーム。⌘+ / ⌘- は UI からの操作なので state 側に置く
+    /// 画面全体のズーム倍率。⌘+ / ⌘- は UI からの操作なので、
+    /// 手書きの config.toml ではなく state 側に覚える
     /// (config.toml はアプリが書き換えない方針)。
     ui_zoom: Option<f32>,
     minimap: Option<bool>,
@@ -561,9 +564,10 @@ editor_font_size = 15.0
 terminal_font_size = 13.0
 show_hidden_files = true
 
-# 画面全体のズーム (1.0 = 100%)。UI 全体が拡大縮小します。
-# ⌘+ / ⌘- / ⌘0 (Windows/Linux は Ctrl) で変更でき、値は自動保存されます。
-# ファイル 1 枚だけを拡大するときは ⌥⌘+ / ⌥⌘- / ⌥⌘0 か ⌘+ホイール。
+# 画面全体のズーム (0.5〜3.0)。UI の全部が一緒に拡大縮小します。
+# ⌘+ / ⌘- / ⌘0 で変えた値は ~/.zaivern/state.toml に覚えるので、
+# ここに書くのは「起動時の初期値を固定したい」ときだけで構いません。
+# ファイル単位のズーム (⌘⌥+ / ⌘⌥- / ⌘⌥0) はタブごとの一時的な値で、保存しません。
 # ui_zoom = 1.0
 
 # エディタ本文の折り返しと空白文字 (·/→) の可視化
@@ -1017,7 +1021,7 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     cfg.global_show_pet = cfg.show_pet;
     cfg.global_word_wrap = cfg.word_wrap;
     cfg.global_show_whitespace = cfg.show_whitespace;
-    cfg.global_ui_zoom = crate::zoom::sanitize_window(cfg.ui_zoom);
+    cfg.global_ui_zoom = crate::zoom::clamp(cfg.ui_zoom);
     cfg.global_minimap = cfg.minimap;
     cfg.global_breadcrumbs = cfg.breadcrumbs;
     cfg.global_git_blame = cfg.git_blame;
@@ -1035,9 +1039,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     }
     cfg.editor_font_size = cfg.editor_font_size.clamp(8.0, 32.0);
     cfg.terminal_font_size = cfg.terminal_font_size.clamp(7.0, 28.0);
-    // 手書きの config.toml / 壊れた state.toml で NaN や 0 が入っても、
-    // ここで必ず有限の倍率にする (0 倍で起動すると何も見えなくなる)。
-    cfg.ui_zoom = crate::zoom::sanitize_window(cfg.ui_zoom);
+    // ここを外すと `ui_zoom = 0` で UI が 1 ピクセルに潰れて操作不能になる
+    // (設定を戻す口も潰れるので、必ず範囲へ収めてから返す)。
+    cfg.ui_zoom = crate::zoom::clamp(cfg.ui_zoom);
     cfg.pet_scale = cfg.pet_scale.clamp(0.5, 2.0);
     // 期限が 0 だと診断側で毎回丸められて分かりにくいので、ここで下限を揃える。
     cfg.super_agent.timeout_secs = cfg.super_agent.timeout_secs.clamp(5, 600);
@@ -1323,7 +1327,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         show_pet: Some(cfg.global_show_pet),
         word_wrap: Some(cfg.global_word_wrap),
         show_whitespace: Some(cfg.global_show_whitespace),
-        ui_zoom: Some(crate::zoom::sanitize_window(cfg.global_ui_zoom)),
+        ui_zoom: Some(crate::zoom::clamp(cfg.global_ui_zoom)),
         minimap: Some(cfg.global_minimap),
         breadcrumbs: Some(cfg.global_breadcrumbs),
         diff_view: Some(cfg.diff_view.clone()),
@@ -1923,6 +1927,7 @@ command = "agy"
         let st = UiState {
             theme: Some("zaivern-light".into()),
             approval_mode: Some("auto".into()),
+            ui_zoom: Some(1.25),
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
@@ -1958,6 +1963,7 @@ command = "agy"
         let back: UiState = toml::from_str(&s).expect("読み戻せる");
         assert_eq!(back.theme, Some("zaivern-light".to_string()));
         assert_eq!(back.approval_mode, Some("auto".to_string()));
+        assert_eq!(back.ui_zoom, Some(1.25));
         assert_eq!(back.show_pet, Some(false));
         assert_eq!(back.word_wrap, Some(true));
         assert_eq!(back.show_whitespace, Some(true));

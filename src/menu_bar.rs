@@ -108,14 +108,14 @@ pub struct MenuInfo {
     pub themes: Vec<ThemeEntry>,
     /// アクティブなタブの改行コード表示 (例 "CRLF")。タブが無ければ None
     pub line_ending: Option<String>,
+    /// 画面全体のズーム倍率 (1.0 = 等倍)。表示メニューの「戻す」の有効/無効に使う
+    pub ui_zoom: f32,
+    /// アクティブなタブのズーム倍率。タブが無ければ None (ファイル単位の項目を落とす)
+    pub file_zoom: Option<f32>,
     /// 保存時に行末の空白を落とす (編集メニューのチェック状態)
     pub trim_trailing_on_save: bool,
     /// 保存時に最終行へ改行を入れる (同上)
     pub final_newline_on_save: bool,
-    /// 画面全体のズーム倍率 (1.0 = 100%)。表示メニューの「ズーム」に出す
-    pub ui_zoom: f32,
-    /// アクティブなタブだけのズーム段数 (pt)。0 なら等倍
-    pub file_zoom: i32,
     /// ビルドタスクのラベル。**⇧⌘B が実際に走らせる方**を入れる
     /// (tasks.json の既定ビルドがあればそれ、無ければ自動検出のラベル)。
     pub build_task: Option<String>,
@@ -532,68 +532,62 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
                 theme_menu_ui(ui, &info.themes, cmds);
             });
             ui.separator();
-            // ── ズーム ──────────────────────────────────────────
-            // 3 つの段は **対象が違う**。同じ場所に並べて違いを見せる:
-            //   画面全体    = UI ごと (VS Code の ⌘+ / ⌘- / ⌘0)
-            //   このファイル = 開いているタブの本文だけ
-            //   フォント     = 全ファイル共通の基準サイズ (設定値)
-            ui.label(
-                egui::RichText::new(trf(
-                    "画面全体のズーム: {pct}",
-                    &[("pct", crate::zoom::percent_label(info.ui_zoom))],
-                ))
-                .weak(),
-            );
+            // ズームは二階建て。「画面全体」を先に置き、「このファイルだけ」を
+            // その下に置くことで、対象の広い順に読める並びにする。
             if item(ui, &tr("ズームイン"), &sc(keys, BindAction::ZoomIn), true) {
                 cmds.push(Cmd::ZoomIn);
             }
-            if item(ui, &tr("ズームアウト"), &sc(keys, BindAction::ZoomOut), true) {
-                cmds.push(Cmd::ZoomOut);
-            }
             if item(
                 ui,
-                &tr("ズームをリセット"),
+                &tr("ズームアウト"),
+                &sc(keys, BindAction::ZoomOut),
+                true,
+            ) {
+                cmds.push(Cmd::ZoomOut);
+            }
+            // 等倍のときは「戻す」を押せなくする (押しても何も起きない項目を
+            // 生かしておくと、効かないのか壊れているのか区別が付かない)。
+            if item(
+                ui,
+                &trf(
+                    "ズームを戻す ({pct})",
+                    &[("pct", crate::zoom::label(info.ui_zoom))],
+                ),
                 &sc(keys, BindAction::ZoomReset),
-                (info.ui_zoom - 1.0).abs() > f32::EPSILON,
+                !crate::zoom::is_default(info.ui_zoom),
             ) {
                 cmds.push(Cmd::ZoomReset);
             }
             ui.separator();
-            if let Some(l) = crate::zoom::file_label(info.file_zoom) {
-                ui.label(
-                    egui::RichText::new(trf("このファイル: {delta}", &[("delta", l)])).weak(),
-                );
-            }
+            // ファイル単位のズームはタブが開いているときだけ意味を持つ。
+            let has_file = info.file_zoom.is_some();
             if item(
                 ui,
-                &tr("このファイルだけ拡大"),
+                &tr("このファイルだけズームイン"),
                 &sc(keys, BindAction::FileZoomIn),
-                ed,
+                has_file,
             ) {
                 cmds.push(Cmd::FileZoomIn);
             }
             if item(
                 ui,
-                &tr("このファイルだけ縮小"),
+                &tr("このファイルだけズームアウト"),
                 &sc(keys, BindAction::FileZoomOut),
-                ed,
+                has_file,
             ) {
                 cmds.push(Cmd::FileZoomOut);
             }
+            let file_z = info.file_zoom.unwrap_or(crate::zoom::DEFAULT);
             if item(
                 ui,
-                &tr("このファイルのズームを戻す"),
+                &trf(
+                    "このファイルのズームを解除 ({pct})",
+                    &[("pct", crate::zoom::label(file_z))],
+                ),
                 &sc(keys, BindAction::FileZoomReset),
-                ed && info.file_zoom != 0,
+                has_file && !crate::zoom::is_default(file_z),
             ) {
                 cmds.push(Cmd::FileZoomReset);
-            }
-            ui.separator();
-            if item(ui, &tr("エディタと端末のフォントを拡大 (全ファイル)"), "", true) {
-                cmds.push(Cmd::FontInc);
-            }
-            if item(ui, &tr("エディタと端末のフォントを縮小 (全ファイル)"), "", true) {
-                cmds.push(Cmd::FontDec);
             }
         });
         ui.separator();

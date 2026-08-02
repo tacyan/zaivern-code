@@ -58,6 +58,10 @@
 "配色テーマ" = "Color Theme"
 "ズームイン" = "Zoom In"
 "ズームアウト" = "Zoom Out"
+"ズームを戻す ({pct})" = "Reset Zoom ({pct})"
+"このファイルのズームを解除 ({pct})" = "Reset this file's zoom ({pct})"
+# 「このファイルだけズームイン / アウト」はコマンドパレットと共通の原文なので
+# 20-app.toml 側に置く (同じキーを 2 ファイルに書くと後勝ちで片方が消える)。
 "エクスプローラー" = "Explorer"
 "ソース管理" = "Source Control"
 "拡張機能 (プラグイン)" = "Extensions (Plugins)"

@@ -1612,13 +1612,34 @@ const BUNDLED: &[(&str, &[(&str, &str)])] = &[
     (
         "syntax-pack",
         &[
-            ("plugin.toml", include_str!("../assets/plugins/syntax-pack/plugin.toml")),
-            ("syntaxes/10-web.toml", include_str!("../assets/plugins/syntax-pack/syntaxes/10-web.toml")),
-            ("syntaxes/20-systems.toml", include_str!("../assets/plugins/syntax-pack/syntaxes/20-systems.toml")),
-            ("syntaxes/30-apps.toml", include_str!("../assets/plugins/syntax-pack/syntaxes/30-apps.toml")),
-            ("syntaxes/40-functional.toml", include_str!("../assets/plugins/syntax-pack/syntaxes/40-functional.toml")),
-            ("syntaxes/50-config.toml", include_str!("../assets/plugins/syntax-pack/syntaxes/50-config.toml")),
-            ("syntaxes/60-shell.toml", include_str!("../assets/plugins/syntax-pack/syntaxes/60-shell.toml")),
+            (
+                "plugin.toml",
+                include_str!("../assets/plugins/syntax-pack/plugin.toml"),
+            ),
+            (
+                "syntaxes/10-web.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/10-web.toml"),
+            ),
+            (
+                "syntaxes/20-systems.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/20-systems.toml"),
+            ),
+            (
+                "syntaxes/30-apps.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/30-apps.toml"),
+            ),
+            (
+                "syntaxes/40-functional.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/40-functional.toml"),
+            ),
+            (
+                "syntaxes/50-config.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/50-config.toml"),
+            ),
+            (
+                "syntaxes/60-shell.toml",
+                include_str!("../assets/plugins/syntax-pack/syntaxes/60-shell.toml"),
+            ),
         ],
     ),
     (
@@ -3195,7 +3216,8 @@ run = "c"
         assert_eq!(get("ZV_LANG"), "rust");
         assert_eq!(get("ZV_WORKSPACE"), "/ws");
         assert_eq!(get("ZV_PLUGIN_DIR"), a.dir.display().to_string());
-        assert_eq!(get("ZV_API"), "2");
+        // 定数から取る。ベタ書きだと API を上げるたびにここだけ嘘になる
+        assert_eq!(get("ZV_API"), API_VERSION.to_string());
         assert!(!get("ZV_BIN").is_empty());
         // Windows は \ 区切りで返るので / に寄せてから比較する
         assert!(get("ZV_PLUGIN_DATA")

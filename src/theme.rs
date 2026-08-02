@@ -511,8 +511,12 @@ fn zaivern_frost() -> Theme {
 //   2. 実行時の pixels_per_point で論理サイズを丸め直し、端数スケールでも
 //      物理ピクセル整数へ着地させる (`snap_font_size`)。
 //
-// `pixels_per_point` / `zoom_factor` 自体は決して変更しない。
-// あれを触ると UI 全体の大きさが変わってしまい、別の問題になる。
+// **このモジュールは `pixels_per_point` / `zoom_factor` を変更しない。**
+// ここが担うのは「与えられた ppp に対して丸めを合わせる」ことだけで、
+// 倍率そのものは持たない。UI 全体の拡大縮小 (ユーザーの ⌘+ / ⌘-) は
+// `app::apply_ui_zoom` が `zoom_factor` を動かして行い、その結果として
+// 変わった ppp へは下の `resync_pixel_snapping` フックが自動で追随する。
+// 倍率の持ち主は `Config::ui_zoom` 1 つ — ここで別に持つと二重管理になる。
 
 /// UI テキストの基準サイズ (論理ポイント)。
 ///
