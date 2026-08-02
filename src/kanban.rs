@@ -126,6 +126,18 @@ const LANE_HOLD_MS: u64 = 400;
 /// (情報は遅らせない / 視線だけ動かさない、という分担)。
 const WORK_HOLD_MS: u64 = FAST_SAMPLE_MS * 8;
 
+/// 「停滞・異常」へ落とすのに要る保持時間 (ms)。
+///
+/// このレーンは**人を呼ぶ**ので、誤報のコストがいちばん高い。見張りの異常判定は
+/// 画面のハッシュ列から出るため、ツールの切り替わりや一瞬の静けさで 1〜2 サンプルだけ
+/// 立つことがある。それをそのまま採ると、動いているエージェントが「停滞・異常」へ
+/// 飛ぶ (オーナー報告のバグ: 稼働中の全カードが異常レーンに並んだ)。
+///
+/// **本当に異常なら数秒では消えない**ので、この時間だけ続くことを求める。
+/// 続かないあいだカードは作業系レーン (= 処理中) に居る。
+/// 承認待ちと完了は人を待たせる/待たせないの判断が逆なので 0 のまま。
+const TROUBLE_HOLD_MS: u64 = 5_000;
+
 /// 「新しいレーンへ着地した」ハイライトの寿命 (ms)。
 const LAND_HIGHLIGHT_MS: u64 = 900;
 
@@ -225,13 +237,16 @@ impl Column {
 
     /// このレーンへ移るまでに判定が続く必要のある時間 (ms)。
     ///
-    /// - 承認待ち・停滞・完了は人がすぐ気づくべき強い信号 (かつ [`Read::lane`] が
+    /// - 承認待ち・完了は人がすぐ気づくべき強い信号 (かつ [`Read::lane`] が
     ///   画面推定だけでは入れない) なので 0 = 即時。
+    /// - **停滞・異常だけは [`TROUBLE_HOLD_MS`]** — 人を呼ぶのに誤報がいちばん
+    ///   高くつくレーンなので、「本当に続いている」ことを確かめてから落とす。
     /// - 作業系 4 本は往復しやすいので [`WORK_HOLD_MS`] を掛ける。
     /// - 待機はその中間 ([`LANE_HOLD_MS`]) — 出力が一瞬途切れただけで落とさない。
     pub fn hold_ms(self) -> u64 {
         match self {
-            Column::Approval | Column::Trouble | Column::Done => 0,
+            Column::Approval | Column::Done => 0,
+            Column::Trouble => TROUBLE_HOLD_MS,
             Column::Ready => LANE_HOLD_MS,
             _ => WORK_HOLD_MS,
         }
@@ -859,7 +874,8 @@ pub fn state_label(
 ///
 /// - 判定が現在のレーンと同じなら何もしない (候補は取り下げ)
 /// - 違うレーンの判定が [`Column::hold_ms`] 以上続いたら初めて移動
-/// - 承認待ち・停滞・完了は `hold_ms == 0` なので即座に動く
+/// - 承認待ち・完了は `hold_ms == 0` なので即座に動く
+///   (「停滞・異常」だけは [`TROUBLE_HOLD_MS`] 続くことを求める)
 ///
 /// 8 レーンでは 思考↔編集↔実行↔検証 の往復がそのままレーンをまたぐので、
 /// この機械がいちばん効く場所になる ([`WORK_HOLD_MS`])。
@@ -1429,6 +1445,12 @@ pub struct Card {
     pub sup: Option<supervisor::SessionState>,
     /// ⚡/🛡 (権限モード対応エージェントのみ、他は "")
     pub permission_badge: &'static str,
+    /// **指名スーパーエージェント (指揮官) か** ([`config::SuperAgentConfig`])。
+    ///
+    /// 看板は同じ見た目のカードが並ぶので、「どれが指揮官か」は**枠の色**と
+    /// 名前の前の [`COMMANDER_BADGE`] で一目で分かるようにする。
+    /// 1 フレームに 1 体だけ true になる (app.rs `super_agent_session`)。
+    pub commander: bool,
     /// 権限モード切替キーを送れるか
     pub can_cycle: bool,
     /// 画面末尾の「意味のある行」たち (時系列順)。
@@ -4317,8 +4339,8 @@ mod tests {
 
     #[test]
     fn strong_signals_move_without_waiting() {
-        // 承認待ち・停滞・完了は hold_ms == 0 なので即座に動く (人を待たせない)
-        for col in [Column::Approval, Column::Trouble, Column::Done] {
+        // 承認待ち・完了は hold_ms == 0 なので即座に動く (人を待たせない)
+        for col in [Column::Approval, Column::Done] {
             for from in [Column::Ready, Column::Editing, Column::Verifying] {
                 let mut lt = LaneTracker::new(from, 0);
                 assert!(lt.step(col, 10), "{from:?} → {col:?} は即移動のはず");
@@ -4326,17 +4348,53 @@ mod tests {
             }
         }
         for col in COLUMNS {
-            let want = if col.loud() || col == Column::Done {
-                0
-            } else if col == Column::Ready {
-                LANE_HOLD_MS
-            } else {
-                WORK_HOLD_MS
+            let want = match col {
+                Column::Approval | Column::Done => 0,
+                Column::Trouble => TROUBLE_HOLD_MS,
+                Column::Ready => LANE_HOLD_MS,
+                _ => WORK_HOLD_MS,
             };
             assert_eq!(col.hold_ms(), want, "{col:?}");
         }
         // 作業系のホールドは「1 サンプルで動かない」ために十分な長さがある
         assert!(WORK_HOLD_MS >= FAST_SAMPLE_MS * 4, "ホールドが短すぎる");
+        // 「停滞・異常」は作業系より長く粘る — 誤報のコストがいちばん高いレーン
+        assert!(
+            TROUBLE_HOLD_MS > WORK_HOLD_MS,
+            "異常レーンのホールドが作業系より短い"
+        );
+    }
+
+    /// **本題の回帰テスト**: 一瞬だけ立った異常判定では「停滞・異常」へ落ちない。
+    ///
+    /// 見張りの判定はハッシュ列から出るので 1〜2 サンプルだけ立つことがある。
+    /// それで人を呼んでいたため、動いているエージェントが異常レーンに並んだ。
+    #[test]
+    fn 一瞬の異常判定では異常レーンへ落ちない() {
+        let mut lt = LaneTracker::new(Column::Running, 0);
+        // 数サンプル異常が立つ (TROUBLE_HOLD_MS 未満)
+        let mut t = 0;
+        while t < TROUBLE_HOLD_MS {
+            assert!(!lt.step(Column::Trouble, t), "{t}ms で異常レーンへ飛んだ");
+            t += FAST_SAMPLE_MS;
+        }
+        // 収まれば候補は取り下げ — 作業中のまま
+        assert!(!lt.step(Column::Running, t));
+        assert_eq!(lt.lane(), Column::Running);
+    }
+
+    /// 逆に**続く異常はちゃんと落ちる** (人を呼び損ねない)。
+    #[test]
+    fn 続く異常判定は異常レーンへ落ちる() {
+        let mut lt = LaneTracker::new(Column::Running, 0);
+        let mut t = 0;
+        let mut moved = false;
+        while t <= TROUBLE_HOLD_MS + FAST_SAMPLE_MS {
+            moved |= lt.step(Column::Trouble, t);
+            t += FAST_SAMPLE_MS;
+        }
+        assert!(moved, "続いている異常が異常レーンへ落ちない");
+        assert_eq!(lt.lane(), Column::Trouble);
     }
 
     #[test]
