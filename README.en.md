@@ -55,6 +55,17 @@ On first launch a **26-step guided tour** walks you through the cockpit, highlig
 
 ---
 
+## 🆕 v0.7.0 — the look, the languages, and the splits all line up
+
+- **🔍 Two-storey zoom** — the **whole UI** (`⌘+` / `⌘-` / `⌘0`) and **per-file** text size, the same split VS Code makes: grow the interface, or grow only the code you are reading. The factor is saved with the session.
+- **🎨 Colour themes went from 3 to 11** (7 dark / 4 light). The terminal and the editor draw from the same palette, so switching a theme moves everything together.
+- **🔤 Syntax highlighting for the languages that were missing.** TypeScript, Swift, Kotlin, Dart, Zig, TOML, Dockerfile, Terraform and friends are absent from syntect's default set; they now come from a lightweight tokenizer (`grammar.rs`) where **one language is one TOML block**, plus a bundled plugin. It carries no colours of its own — tokens are **mapped onto theme scopes**, so changing the theme changes the code too.
+- **🎛 The Cockpit no longer squashes past six tiles** — it scrolls vertically and every tile stays readable.
+- **📋 The kanban stops crying wolf** — only a *sustained* anomaly is called "stalled / error". The designated super agent (the commander) is obvious from **its frame and crown**.
+- **⊞ Splitting a terminal now behaves exactly like launching a new agent.** It used to inherit the parent pane's preset and working directory; splitting is now only about **where the pane goes**, and what starts in it is identical to `👾 Agent ＋` (the default preset, in the workspace folder).
+
+**Quality**: **2565 tests, all passing**, `cargo fmt --check` clean, clippy ratchet (`-D warnings` plus the frozen debt list) with **0 warnings**.
+
 ## 🆕 v0.6.0 — no file you cannot open, no key that does nothing
 
 - **Every file opens.** Anything unreadable as text lands in a **hex viewer**; video and audio become **info cards** (WAV and MP4 have their duration and resolution parsed in-house); ZIP / JAR / WHL list **their contents**. Routing is by **leading magic bytes** (40+ formats), not by extension — **a lying extension still opens correctly**.
