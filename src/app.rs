@@ -542,6 +542,16 @@ const GRID_SPACING: f32 = 10.0;
 const GRID_TWO_COL_W: f32 = 640.0;
 /// タイルの最低高さ。
 const GRID_MIN_CELL_H: f32 = 150.0;
+/// タイル 1 枚に残したいミニターミナルの行数。
+///
+/// これを下回ると「何かが動いているのは分かるが、何をしているかは読めない」
+/// タイルになる。6 枚以上開いたときに全部を 1 画面へ詰め込むのをやめ、
+/// この行数を保ったままスクロールへ逃がすための基準。
+const GRID_COMFORT_ROWS: f32 = 16.0;
+/// タイルのヘッダ行 + 枠の余白 (端末の外側で使う固定の高さ)。
+const GRID_TILE_CHROME_H: f32 = 46.0;
+/// 快適な高さの上限。巨大フォントでもタイル 1 枚で画面を独占させない。
+const GRID_COMFORT_MAX_H: f32 = 420.0;
 /// 見出し行を「アイコンだけ」に縮退させる幅のしきい値。
 const COCKPIT_HEADER_COMPACT_W: f32 = 820.0;
 
@@ -767,10 +777,42 @@ struct GridMetrics {
     cell_h: f32,
 }
 
+impl GridMetrics {
+    /// 格子全体の高さ (= スクロール領域の中身の高さ)。
+    fn content_h(&self) -> f32 {
+        self.rows as f32 * (self.cell_h + 4.0) + GRID_SPACING * (self.rows as f32 - 1.0)
+    }
+
+    /// この寸法だと縦スクロールが要るか (可用高さ `avail_y` に対して)。
+    fn scrolls(&self, avail_y: f32) -> bool {
+        self.content_h() > avail_y + 0.5
+    }
+}
+
+/// タイル 1 枚に確保したい高さ (= これ以上は縮めない下限)。
+///
+/// ミニターミナルの文字が大きいほど、同じ行数を読むのに要る高さも増えるので
+/// フォントから導く。ハードコードした 1 つの値だと、フォントを上げた途端に
+/// 「タイルは大きいのに 5 行しか見えない」に戻ってしまう。
+fn grid_comfort_cell_h(mini_font: f32) -> f32 {
+    // 行送りは epaint の等幅フォントの実測 (≒ 1.35em) に合わせた概算。
+    // 正確な値は描画時にしか判らないが、ここで要るのは「読める高さ」の目安。
+    (mini_font * 1.35 * GRID_COMFORT_ROWS + GRID_TILE_CHROME_H)
+        .clamp(GRID_MIN_CELL_H, GRID_COMFORT_MAX_H)
+}
+
 /// 与えられた領域に n 枚のタイルを敷くときの寸法 (純関数)。
 ///
-/// 不変条件: **総幅は `avail.x` を超えない**。超えると右端のタイルが切れる。
-fn cockpit_grid_metrics(avail: egui::Vec2, n: usize) -> GridMetrics {
+/// 不変条件:
+/// * **総幅は `avail.x` を超えない** — 超えると右端のタイルが切れる。
+/// * **タイルは `comfort` より低くしない** — 枚数が増えたときに全部を 1 画面へ
+///   詰め込むと、6 枚あたりから中身が読めなくなる。縮めるのをやめて縦へ伸ばし、
+///   はみ出したぶんはスクロールで見せる ([`GridMetrics::scrolls`])。
+///   副次効果として、7 枚目を足しても既存タイルの高さが変わらない
+///   = 既存 PTY のリサイズが起きない。
+/// * ただし**窓そのものが低いとき**は 1 枚が窓に収まる高さまで譲る
+///   (タイル 1 枚しか無いのにスクロールさせない)。
+fn cockpit_grid_metrics(avail: egui::Vec2, n: usize, comfort: f32) -> GridMetrics {
     let cols = if n <= 1 || avail.x < GRID_TWO_COL_W {
         1
     } else {
@@ -778,13 +820,15 @@ fn cockpit_grid_metrics(avail: egui::Vec2, n: usize) -> GridMetrics {
     };
     let rows = n.div_ceil(cols).max(1);
     let cell_w = ((avail.x - GRID_SPACING * (cols as f32 - 1.0)) / cols as f32 - 4.0).max(1.0);
-    let cell_h =
-        (((avail.y - GRID_SPACING * (rows as f32 - 1.0)) / rows as f32) - 4.0).max(GRID_MIN_CELL_H);
+    // 全部を 1 画面へ詰め込むときの高さ (旧実装の計算そのまま)。
+    let fit = ((avail.y - GRID_SPACING * (rows as f32 - 1.0)) / rows as f32) - 4.0;
+    // 譲れる下限。低い窓では「1 枚が窓に収まる高さ」まで下げてよい。
+    let floor = comfort.min(avail.y - 4.0).max(GRID_MIN_CELL_H);
     GridMetrics {
         cols,
         rows,
         cell_w,
-        cell_h,
+        cell_h: fit.max(floor),
     }
 }
 
@@ -2116,6 +2160,12 @@ pub struct ZaivernApp {
     /// (`SyntaxSet` は数 MB あるので差分ビューと二重に持たない)。
     highlighter: &'static Highlighter,
     cockpit: bool,
+    /// Cockpit グリッドで最後に「見える位置まで運んだ」セッション。
+    ///
+    /// タイルが 1 画面に収まらない (= スクロールしている) ときだけ使う。
+    /// アクティブが変わったフレームにだけ追従させるための記録で、毎フレーム
+    /// 運ぶとユーザーが自分でスクロールできなくなる。
+    cockpit_followed: Option<u64>,
     /// **このフレームで描く中央ビュー** (毎フレーム [`center_view`] で畳む)。
     /// 描画の分岐はフラグではなく必ずこれを見る。
     center: CenterView,
@@ -2825,6 +2875,7 @@ impl ZaivernApp {
             race: race::RacePanel::new(),
             highlighter: crate::highlight::shared(),
             cockpit: false,
+            cockpit_followed: None,
             center: CenterView::Editor,
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
@@ -13489,9 +13540,28 @@ impl ZaivernApp {
         }
 
         let avail = ui.available_size();
-        let g = cockpit_grid_metrics(avail, n);
-        let (cols, rows, cell_w, cell_h) = (g.cols, g.rows, g.cell_w, g.cell_h);
         let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
+        // 6 枚以上でも 1 枚ずつは読める高さを保つ。入り切らないぶんは
+        // 縦スクロールで見せる (潰さない)。
+        let g = cockpit_grid_metrics(avail, n, grid_comfort_cell_h(mini_font));
+        let (cols, rows, cell_w, cell_h) = (g.cols, g.rows, g.cell_w, g.cell_h);
+        let scrolls = g.scrolls(avail.y);
+
+        // アクティブが変わったフレームだけ、そのタイルを見える位置へ運ぶ。
+        // 毎フレーム運ぶと自分でスクロールできなくなるので、直前に運んだ
+        // セッションを憶えて「変わったとき」だけにする。
+        let active_id = self.active_id();
+        let follow = scrolls && active_id.is_some() && active_id != self.cockpit_followed;
+        self.cockpit_followed = active_id;
+
+        if scrolls {
+            // 既定の浮動バーは触るまで完全に透明で、「まだ下にタイルがある」
+            // ことに気付けない。幅は取らせない (レイアウトを動かさない) まま、
+            // 薄く常時見せる。
+            let sc = &mut ui.spacing_mut().scroll;
+            sc.dormant_background_opacity = 0.35;
+            sc.dormant_handle_opacity = 0.8;
+        }
 
         egui::ScrollArea::vertical()
             .id_salt("cockpit-grid")
@@ -13750,6 +13820,14 @@ impl ZaivernApp {
                                 });
                                 },
                             );
+                            // 画面外にあるタイルがアクティブになったら、そこまで
+                            // スクロールして見せる (キーやサイドバーで切り替えた
+                            // ときに「選んだはずのタイルが見えない」を防ぐ)。
+                            // align=None = 見えるようになる最小移動なので、
+                            // 既に見えているタイルを選んでも画面は動かない。
+                            if follow && active {
+                                ui.scroll_to_rect(cell.response.rect, None);
+                            }
                             // セル内のどこを押しても (タイトル文字・各ボタン・
                             // ミニターミナル含め) 紫枠のアクティブ選択が追従する。
                             // contains_pointer は子ウィジェットに覆われていても
@@ -29023,13 +29101,19 @@ mod tutorial_wiring_tests {
 mod cockpit_layout_tests {
     use super::*;
 
+    /// 既定のミニターミナル (端末 13pt → ミニ 10pt) での快適な高さ。
+    /// レイアウトのテストはこの値を基準にする。
+    fn comfort() -> f32 {
+        grid_comfort_cell_h(10.0)
+    }
+
     /// タイルの総幅は、どんな幅・枚数でも割り当てを超えない。
     #[test]
     fn グリッドは可用幅からはみ出さない() {
         for w in [320.0_f32, 480.0, 639.0, 640.0, 900.0, 1440.0, 2560.0] {
             for h in [200.0_f32, 600.0, 1200.0] {
                 for n in 1..=9usize {
-                    let g = cockpit_grid_metrics(egui::vec2(w, h), n);
+                    let g = cockpit_grid_metrics(egui::vec2(w, h), n, comfort());
                     let total = g.cell_w * g.cols as f32 + GRID_SPACING * (g.cols as f32 - 1.0);
                     assert!(
                         total <= w,
@@ -29045,10 +29129,193 @@ mod cockpit_layout_tests {
     /// 狭いときは 1 列へ落ちる (2 列のままだとタイルが潰れて中身が読めない)。
     #[test]
     fn 狭い窓では一列に落ちる() {
-        assert_eq!(cockpit_grid_metrics(egui::vec2(639.0, 800.0), 4).cols, 1);
-        assert_eq!(cockpit_grid_metrics(egui::vec2(640.0, 800.0), 4).cols, 2);
+        assert_eq!(
+            cockpit_grid_metrics(egui::vec2(639.0, 800.0), 4, comfort()).cols,
+            1
+        );
+        assert_eq!(
+            cockpit_grid_metrics(egui::vec2(640.0, 800.0), 4, comfort()).cols,
+            2
+        );
         // 1 枚しかないときは幅があっても 1 列 (半分空けない)
-        assert_eq!(cockpit_grid_metrics(egui::vec2(1600.0, 800.0), 1).cols, 1);
+        assert_eq!(
+            cockpit_grid_metrics(egui::vec2(1600.0, 800.0), 1, comfort()).cols,
+            1
+        );
+    }
+
+    /// **6 枚以上でタイルを潰さない。**
+    ///
+    /// これが本題: 枚数が増えたら 1 画面へ詰め込むのをやめ、快適な高さを保った
+    /// ままスクロールへ逃がす。ここが緩むと「開くほど何も読めない」に戻る。
+    #[test]
+    fn 枚数が増えてもタイルを潰さずスクロールへ逃がす() {
+        let avail = egui::vec2(1280.0, 700.0); // 2 列に割れる普通の窓
+        for n in 1..=16usize {
+            let g = cockpit_grid_metrics(avail, n, comfort());
+            assert!(
+                g.cell_h >= comfort() - 0.5,
+                "n={n}: タイルが快適な高さ ({}) を割った: {}",
+                comfort(),
+                g.cell_h
+            );
+        }
+        // 4 枚 (2 行) までは 1 画面に収まり、6 枚 (3 行) からはスクロールする。
+        assert!(!cockpit_grid_metrics(avail, 4, comfort()).scrolls(avail.y));
+        assert!(cockpit_grid_metrics(avail, 6, comfort()).scrolls(avail.y));
+        assert!(cockpit_grid_metrics(avail, 12, comfort()).scrolls(avail.y));
+    }
+
+    /// 枚数が増えても**既存タイルの高さは変わらない** (= 既存 PTY が
+    /// リサイズされない)。快適な高さで頭打ちになったあとの性質。
+    #[test]
+    fn 快適な高さに達したら枚数を足しても高さが動かない() {
+        let avail = egui::vec2(1280.0, 700.0);
+        let h6 = cockpit_grid_metrics(avail, 6, comfort()).cell_h;
+        for n in 6..=20usize {
+            assert_eq!(
+                cockpit_grid_metrics(avail, n, comfort()).cell_h,
+                h6,
+                "n={n}: 枚数を足しただけで既存タイルの高さが動いた"
+            );
+        }
+    }
+
+    /// 低い窓では 1 枚ぶんは窓へ収める (タイル 1 枚しか無いのに
+    /// スクロールさせない)。窓を縮めていったときに連続であること。
+    #[test]
+    fn 低い窓では一枚を窓に収める() {
+        for h in [180.0_f32, 240.0, 320.0, 400.0] {
+            let g = cockpit_grid_metrics(egui::vec2(900.0, h), 1, comfort());
+            assert!(
+                !g.scrolls(h),
+                "h={h}: タイル 1 枚しか無いのにスクロールしている"
+            );
+        }
+    }
+
+    /// 快適な高さは文字サイズに追従する (大きい文字ほど高いタイルが要る)。
+    #[test]
+    fn 快適な高さは文字サイズに追従する() {
+        assert!(grid_comfort_cell_h(14.0) > grid_comfort_cell_h(8.0));
+        // どのサイズでも最低高さは割らず、上限も超えない
+        for f in [8.0_f32, 10.0, 12.0, 14.0] {
+            let h = grid_comfort_cell_h(f);
+            assert!((GRID_MIN_CELL_H..=GRID_COMFORT_MAX_H).contains(&h), "f={f}");
+        }
+    }
+
+    /// **8 枚のときホイールでページが動く。**
+    ///
+    /// タイルの中身 (ミニターミナル相当) がセルを埋め尽くしていても、ホイールは
+    /// 外側の ScrollArea へ抜けて格子全体が動くこと。実際の描画と同じ
+    /// 「ScrollArea → 行 → セル → 全域を取るクリック可能領域」で組んで確かめる。
+    #[test]
+    fn 八枚のときホイールでページがスクロールする() {
+        use egui::{pos2, vec2, Rect};
+
+        let ctx = egui::Context::default();
+        let screen = vec2(1280.0, 700.0);
+        let n = 8usize;
+        let g = cockpit_grid_metrics(screen, n, comfort());
+        assert!(g.scrolls(screen.y), "前提: 8 枚は 1 画面に収まらない");
+
+        // 1 枚目のセルの矩形を返す (スクロールすれば上へ動く)。
+        let draw = |events: Vec<egui::Event>| -> Rect {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), screen)),
+                events,
+                ..Default::default()
+            };
+            let mut first = Rect::NOTHING;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("cockpit-grid")
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            for row in 0..g.rows {
+                                ui.horizontal(|ui| {
+                                    for col in 0..g.cols {
+                                        let i = row * g.cols + col;
+                                        if i >= n {
+                                            continue;
+                                        }
+                                        let cell = ui.scope_builder(
+                                            egui::UiBuilder::new()
+                                                .id_salt(("cockpit-cell-select", i))
+                                                .sense(egui::Sense::click()),
+                                            |ui| {
+                                                ui.vertical(|ui| {
+                                                    ui.set_width(g.cell_w - 18.0);
+                                                    ui.set_height(g.cell_h - 18.0);
+                                                    // ミニターミナル相当 (フォーカス
+                                                    // していないのでホイールは取らない)
+                                                    ui.allocate_exact_size(
+                                                        ui.available_size(),
+                                                        egui::Sense::click_and_drag(),
+                                                    );
+                                                });
+                                            },
+                                        );
+                                        if i == 0 {
+                                            first = cell.response.rect;
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                });
+            });
+            first
+        };
+
+        let before = draw(vec![]);
+        // 格子の真ん中あたり (= タイルの上) でホイールを回す
+        let over = pos2(screen.x * 0.5, screen.y * 0.5);
+        let wheel = vec![
+            egui::Event::PointerMoved(over),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, -400.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let mut after = draw(wheel);
+        // egui はスクロールを数フレームに均すので、落ち着くまで空フレームを回す
+        for _ in 0..16 {
+            after = draw(vec![]);
+        }
+        assert!(
+            after.top() < before.top() - 100.0,
+            "ホイールでページが動いていない: {} → {}",
+            before.top(),
+            after.top()
+        );
+    }
+
+    /// Cockpit のミニターミナルは **hover_scroll=false** で描く。
+    ///
+    /// true にすると、タイルの上でホイールを回したときに端末の履歴だけが動き、
+    /// ページがスクロールできなくなる (タイルは画面の大半を覆っているので、
+    /// 事実上「6 枚目以降が見られない」に戻る)。
+    #[test]
+    fn ミニターミナルはホイールを外側へ譲る() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn cockpit_grid_ui(")
+            .nth(1)
+            .expect("cockpit_grid_ui がある");
+        let body = body
+            .split("fn active_id(")
+            .next()
+            .expect("後ろに別の関数がある");
+        // 改行位置に依存しないよう空白を潰してから照合する
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("mini_font, true, true, false"),
+            "Cockpit のミニターミナルは hover_scroll=false (最後の引数) で描くこと"
+        );
     }
 
     /// 代表的な窓 (900x700 と極端に低い窓を含む)。
