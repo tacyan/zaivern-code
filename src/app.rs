@@ -9933,10 +9933,7 @@ impl ZaivernApp {
         if consume(ctx, self.keys.get(BindAction::FileZoomIn))
             || consume(
                 ctx,
-                KeyboardShortcut::new(
-                    self.keys.get(BindAction::FileZoomIn).modifiers,
-                    Key::Equals,
-                ),
+                KeyboardShortcut::new(self.keys.get(BindAction::FileZoomIn).modifiers, Key::Equals),
             )
         {
             cmds.push(Cmd::FileZoomIn);
@@ -28137,7 +28134,8 @@ mod glyph_tests {
     fn ui_symbols_have_glyphs() {
         // UI 上で意味を担っている記号だけを並べる。
         // 末尾のひとかたまりは「エージェントを追加」ピッカーが並べるカタログのアイコン。
-        const UI_SYMBOLS: &str = "👑📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠\
+        const UI_SYMBOLS: &str =
+            "👑📁📂👾🔌🌿🐙⚡🛡🚀💡💾🗑📝🔔🎤⏹⟳➕✅❌⚠🖥🔒📱🐾📄📋🔄🔗✋●○◇⇄◎⇩▶→✏🛠🔤\
                                   💬📊⛔🔁·↩▸▾🔎◆📇💤🎬🎵🔆\
                                   💬📊⛔🔁·↩▸▾🔎◆📇💤🗺🔗›…\
                                   💬📊⛔🔁·↩▸▾🔎◆📇💤👤🔖\

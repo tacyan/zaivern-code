@@ -3011,14 +3011,13 @@ fn rail_entry_ui(
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&c.title)
-                                        .size(12.0)
-                                        .strong()
-                                        .color(if c.commander {
+                                    RichText::new(&c.title).size(12.0).strong().color(
+                                        if c.commander {
                                             commander_color(theme)
                                         } else {
                                             theme.text
-                                        }),
+                                        },
+                                    ),
                                 )
                                 .truncate(),
                             );
@@ -3390,9 +3389,7 @@ fn card_ui(
     };
     let fill = if c.commander {
         // 枠だけだと縦に並んだときに見落とす。地も薄く染める。
-        theme
-            .panel_alt
-            .lerp_to_gamma(commander_color(theme), 0.10)
+        theme.panel_alt.lerp_to_gamma(commander_color(theme), 0.10)
     } else if glow > 0.0 {
         theme.panel_alt.lerp_to_gamma(color, 0.18 * glow)
     } else {

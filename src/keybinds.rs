@@ -205,7 +205,9 @@ fn file_zoom_mods() -> Modifiers {
     if cfg!(target_os = "macos") {
         Modifiers::COMMAND.plus(Modifiers::ALT)
     } else {
-        Modifiers::COMMAND.plus(Modifiers::ALT).plus(Modifiers::SHIFT)
+        Modifiers::COMMAND
+            .plus(Modifiers::ALT)
+            .plus(Modifiers::SHIFT)
     }
 }
 

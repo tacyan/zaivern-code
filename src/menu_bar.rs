@@ -547,7 +547,12 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             if item(ui, &tr("ズームイン"), &sc(keys, BindAction::ZoomIn), true) {
                 cmds.push(Cmd::ZoomIn);
             }
-            if item(ui, &tr("ズームアウト"), &sc(keys, BindAction::ZoomOut), true) {
+            if item(
+                ui,
+                &tr("ズームアウト"),
+                &sc(keys, BindAction::ZoomOut),
+                true,
+            ) {
                 cmds.push(Cmd::ZoomOut);
             }
             if item(
@@ -560,9 +565,7 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             }
             ui.separator();
             if let Some(l) = crate::zoom::file_label(info.file_zoom) {
-                ui.label(
-                    egui::RichText::new(trf("このファイル: {delta}", &[("delta", l)])).weak(),
-                );
+                ui.label(egui::RichText::new(trf("このファイル: {delta}", &[("delta", l)])).weak());
             }
             if item(
                 ui,
@@ -589,10 +592,20 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
                 cmds.push(Cmd::FileZoomReset);
             }
             ui.separator();
-            if item(ui, &tr("エディタと端末のフォントを拡大 (全ファイル)"), "", true) {
+            if item(
+                ui,
+                &tr("エディタと端末のフォントを拡大 (全ファイル)"),
+                "",
+                true,
+            ) {
                 cmds.push(Cmd::FontInc);
             }
-            if item(ui, &tr("エディタと端末のフォントを縮小 (全ファイル)"), "", true) {
+            if item(
+                ui,
+                &tr("エディタと端末のフォントを縮小 (全ファイル)"),
+                "",
+                true,
+            ) {
                 cmds.push(Cmd::FontDec);
             }
         });

@@ -155,7 +155,10 @@ mod tests {
         for w in WINDOW_LEVELS.windows(2) {
             assert!(w[0] < w[1], "段表は昇順・重複なし: {w:?}");
         }
-        assert!(WINDOW_LEVELS.contains(&1.0), "等倍が段表に無いと ⌘0 と往復できない");
+        assert!(
+            WINDOW_LEVELS.contains(&1.0),
+            "等倍が段表に無いと ⌘0 と往復できない"
+        );
     }
 
     // ---- sanitize ----
