@@ -41,6 +41,15 @@
 //! 突き合わせ、**矛盾したら弱いほうを採らない** — 進んでいる証拠がある間は
 //! 人を呼ばず、疑いはカードに ⚠ として残す。
 //!
+//! さらに「停滞・異常」だけは [`TROUBLE_HOLD_MS`] 続くことを要求する。
+//! 人を呼ぶレーンは誤報のコストがいちばん高いので、**本当に続いている異常**
+//! だけを落とす。続かないあいだカードは作業系レーン (= 処理中) に居る。
+//!
+//! ## 指揮官 (スーパーエージェント)
+//! [`Card::commander`] が立った 1 体は、カード・左レール・ライブ見出し・ヘッダーの
+//! 4 か所すべてで [`COMMANDER_BADGE`] と琥珀色の枠を持つ。どのレーンへ移っても
+//! 探し直さずに見つかる。指名が無いフレームでは 1 文字も足さない。
+//!
 //! ## 負荷
 //! アイドル時にコストを払わない設計:
 //! - PTY 画面の読み直し (`screen_tail_lines`) は [`KanbanState::sample_due`] が
@@ -126,8 +135,32 @@ const LANE_HOLD_MS: u64 = 400;
 /// (情報は遅らせない / 視線だけ動かさない、という分担)。
 const WORK_HOLD_MS: u64 = FAST_SAMPLE_MS * 8;
 
+/// 「停滞・異常」へ落とすのに要る保持時間 (ms)。
+///
+/// このレーンは**人を呼ぶ**ので、誤報のコストがいちばん高い。見張りの異常判定は
+/// 画面のハッシュ列から出るため、ツールの切り替わりや一瞬の静けさで 1〜2 サンプルだけ
+/// 立つことがある。それをそのまま採ると、動いているエージェントが「停滞・異常」へ
+/// 飛ぶ (オーナー報告のバグ: 稼働中の全カードが異常レーンに並んだ)。
+///
+/// **本当に異常なら数秒では消えない**ので、この時間だけ続くことを求める。
+/// 続かないあいだカードは作業系レーン (= 処理中) に居る。
+/// 承認待ちと完了は人を待たせる/待たせないの判断が逆なので 0 のまま。
+const TROUBLE_HOLD_MS: u64 = 5_000;
+
 /// 「新しいレーンへ着地した」ハイライトの寿命 (ms)。
 const LAND_HIGHLIGHT_MS: u64 = 900;
+
+/// **指揮官 (スーパーエージェント) の印。** カード・左レール・ライブ見出しの
+/// 3 か所すべてで同じ字を使う (別の字を使うと「同じものだ」と分からない)。
+///
+/// 豆腐にならない字だけを使う — `app.rs` の `ui_symbols_have_glyphs` が番人。
+pub const COMMANDER_BADGE: &str = "👑";
+
+/// 指揮官の枠・印の色。テーマの `warn` (琥珀) は
+/// レーン 8 色のどれとも別物なので、レーン色に紛れずに目に入る。
+fn commander_color(th: &Theme) -> Color32 {
+    th.warn
+}
 
 impl Column {
     /// 列見出し (tr のキーになる日本語原文)。
@@ -225,13 +258,16 @@ impl Column {
 
     /// このレーンへ移るまでに判定が続く必要のある時間 (ms)。
     ///
-    /// - 承認待ち・停滞・完了は人がすぐ気づくべき強い信号 (かつ [`Read::lane`] が
+    /// - 承認待ち・完了は人がすぐ気づくべき強い信号 (かつ [`Read::lane`] が
     ///   画面推定だけでは入れない) なので 0 = 即時。
+    /// - **停滞・異常だけは [`TROUBLE_HOLD_MS`]** — 人を呼ぶのに誤報がいちばん
+    ///   高くつくレーンなので、「本当に続いている」ことを確かめてから落とす。
     /// - 作業系 4 本は往復しやすいので [`WORK_HOLD_MS`] を掛ける。
     /// - 待機はその中間 ([`LANE_HOLD_MS`]) — 出力が一瞬途切れただけで落とさない。
     pub fn hold_ms(self) -> u64 {
         match self {
-            Column::Approval | Column::Trouble | Column::Done => 0,
+            Column::Approval | Column::Done => 0,
+            Column::Trouble => TROUBLE_HOLD_MS,
             Column::Ready => LANE_HOLD_MS,
             _ => WORK_HOLD_MS,
         }
@@ -859,7 +895,8 @@ pub fn state_label(
 ///
 /// - 判定が現在のレーンと同じなら何もしない (候補は取り下げ)
 /// - 違うレーンの判定が [`Column::hold_ms`] 以上続いたら初めて移動
-/// - 承認待ち・停滞・完了は `hold_ms == 0` なので即座に動く
+/// - 承認待ち・完了は `hold_ms == 0` なので即座に動く
+///   (「停滞・異常」だけは [`TROUBLE_HOLD_MS`] 続くことを求める)
 ///
 /// 8 レーンでは 思考↔編集↔実行↔検証 の往復がそのままレーンをまたぐので、
 /// この機械がいちばん効く場所になる ([`WORK_HOLD_MS`])。
@@ -1429,6 +1466,12 @@ pub struct Card {
     pub sup: Option<supervisor::SessionState>,
     /// ⚡/🛡 (権限モード対応エージェントのみ、他は "")
     pub permission_badge: &'static str,
+    /// **指名スーパーエージェント (指揮官) か** ([`config::SuperAgentConfig`])。
+    ///
+    /// 看板は同じ見た目のカードが並ぶので、「どれが指揮官か」は**枠の色**と
+    /// 名前の前の [`COMMANDER_BADGE`] で一目で分かるようにする。
+    /// 1 フレームに 1 体だけ true になる (app.rs `super_agent_session`)。
+    pub commander: bool,
     /// 権限モード切替キーを送れるか
     pub can_cycle: bool,
     /// 画面末尾の「意味のある行」たち (時系列順)。
@@ -2106,7 +2149,12 @@ pub fn ui(
             let show_kpi = !full && show_kpi(wide, tall);
             let show_chart = !full && !vertical && !live_on && tall >= 470.0;
 
-            header_ui(st, ui, theme, &t, presets, now_ms, vertical, &mut acts);
+            // 指揮官はカードが下へスクロールしても見えていてほしいので
+            // ヘッダーにも名前を出す (指名なしなら 1 文字も足さない)。
+            let commander = cards.iter().find(|c| c.commander).map(|c| c.title.as_str());
+            header_ui(
+                st, ui, theme, &t, presets, commander, now_ms, vertical, &mut acts,
+            );
 
             if cards.is_empty() {
                 empty_ui(ui, theme, presets, &mut acts);
@@ -2345,12 +2393,24 @@ fn live_pane_ui(
                     ui.set_min_height(height - space::SM * 2.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("●").size(10.0).color(color));
+                        if c.commander {
+                            ui.label(
+                                RichText::new(COMMANDER_BADGE)
+                                    .size(12.0)
+                                    .color(commander_color(theme)),
+                            )
+                            .on_hover_text(tr("スーパーエージェント (指揮官)"));
+                        }
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!("{} {}", c.icon, c.title))
                                     .size(12.5)
                                     .strong()
-                                    .color(theme.text),
+                                    .color(if c.commander {
+                                        commander_color(theme)
+                                    } else {
+                                        theme.text
+                                    }),
                             )
                             .truncate(),
                         );
@@ -2450,6 +2510,20 @@ fn chip(ui: &mut egui::Ui, color: Color32, text: &str) {
         });
 }
 
+/// ホバー説明の付いたチップ (長い名前は省略されるので全文をホバーに出す)。
+fn chip_hover(ui: &mut egui::Ui, color: Color32, text: &str, hover: &str) {
+    egui::Frame::none()
+        .fill(color.gamma_multiply(0.18))
+        .rounding(egui::Rounding::same(9.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(RichText::new(text).size(11.0).strong().color(color)).truncate(),
+            )
+            .on_hover_text(hover);
+        });
+}
+
 /// 赤く脈打つ LIVE インジケータ。
 fn live_dot(ui: &mut egui::Ui, theme: &Theme, now_ms: u64) {
     let pulse = ((now_ms as f32 / 500.0).sin() * 0.35 + 0.65).clamp(0.0, 1.0);
@@ -2468,6 +2542,8 @@ fn header_ui(
     theme: &Theme,
     t: &Tally,
     presets: &[(String, String)],
+    // 指名スーパーエージェント (指揮官) のタイトル。指名なしなら None。
+    commander: Option<&str>,
     now_ms: u64,
     vertical: bool,
     acts: &mut Vec<KanbanAction>,
@@ -2497,6 +2573,24 @@ fn header_ui(
             theme.ok,
             &trf("{n} 稼働中", &[("n", t.running.to_string())]),
         );
+        // 指揮官チップ。指名が無いフレームでは**何も足さない** (常に出る
+        // 空のバッジを作らない)。狭い窓では冠だけに縮退させる。
+        if let Some(name) = commander {
+            let label = if compact {
+                COMMANDER_BADGE.to_string()
+            } else {
+                format!("{COMMANDER_BADGE} {name}")
+            };
+            chip_hover(
+                ui,
+                commander_color(theme),
+                &label,
+                &trf(
+                    "スーパーエージェント (指揮官): {name} — 他のエージェントを見張ります",
+                    &[("name", name.to_string())],
+                ),
+            );
+        }
         // レーン別の内訳 (0 のレーンは出さない — いま意味のある数だけ目に入る)。
         // 「稼働中」はレーンではなくプロセスの生死なので、上のチップとは別の軸。
         //
@@ -2867,6 +2961,8 @@ fn rail_entry_ui(
     let col_color = lane.color(theme);
     let stroke = if st.selected == Some(c.id) {
         Stroke::new(1.5_f32, theme.accent)
+    } else if c.commander {
+        Stroke::new(1.5_f32, commander_color(theme))
     } else if c.active {
         Stroke::new(1.0_f32, theme.accent_soft)
     } else {
@@ -2901,6 +2997,16 @@ fn rail_entry_ui(
                             egui::FontId::proportional(12.0),
                             theme.term_bg,
                         );
+                        // 指揮官はアバターに冠を重ねる (行を増やさずに分かる)
+                        if c.commander {
+                            ui.painter().text(
+                                rect.left_top(),
+                                egui::Align2::CENTER_CENTER,
+                                COMMANDER_BADGE,
+                                egui::FontId::proportional(11.0),
+                                commander_color(theme),
+                            );
+                        }
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.add(
@@ -2908,7 +3014,11 @@ fn rail_entry_ui(
                                     RichText::new(&c.title)
                                         .size(12.0)
                                         .strong()
-                                        .color(theme.text),
+                                        .color(if c.commander {
+                                            commander_color(theme)
+                                        } else {
+                                            theme.text
+                                        }),
                                 )
                                 .truncate(),
                             );
@@ -3264,8 +3374,13 @@ fn card_ui(
         .get(&c.id)
         .map(|t| t.lane.land_glow(now_ms))
         .unwrap_or(0.0);
+    // 選択だけは常に最優先 (押した反応が消えると操作不能に見える)。
+    // その次が指揮官 — 着地ハイライトやアクティブ枠より強く主張させて、
+    // どのレーンへ移っても探し直さずに見つかるようにする。
     let stroke = if selected {
         Stroke::new(2.0_f32, theme.accent)
+    } else if c.commander {
+        Stroke::new(2.0_f32, commander_color(theme))
     } else if glow > 0.0 {
         Stroke::new(1.0 + glow, color.gamma_multiply(0.4 + 0.6 * glow))
     } else if c.active {
@@ -3273,7 +3388,12 @@ fn card_ui(
     } else {
         Stroke::new(1.0_f32, theme.border)
     };
-    let fill = if glow > 0.0 {
+    let fill = if c.commander {
+        // 枠だけだと縦に並んだときに見落とす。地も薄く染める。
+        theme
+            .panel_alt
+            .lerp_to_gamma(commander_color(theme), 0.10)
+    } else if glow > 0.0 {
         theme.panel_alt.lerp_to_gamma(color, 0.18 * glow)
     } else {
         theme.panel_alt
@@ -3302,6 +3422,17 @@ fn card_ui(
                         ui.horizontal(|ui| {
                             let dot = if c.running { "●" } else { "○" };
                             ui.label(RichText::new(dot).size(10.0).color(color));
+                            if c.commander {
+                                ui.label(
+                                    RichText::new(COMMANDER_BADGE)
+                                        .size(12.0)
+                                        .color(commander_color(theme)),
+                                )
+                                .on_hover_text(tr(
+                                    "スーパーエージェント (指揮官) — 他のエージェントを見張り、\
+                                     @宛先: 指示 で指揮します",
+                                ));
+                            }
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(format!(
@@ -3310,7 +3441,11 @@ fn card_ui(
                                     ))
                                     .size(12.5)
                                     .strong()
-                                    .color(theme.text),
+                                    .color(if c.commander {
+                                        commander_color(theme)
+                                    } else {
+                                        theme.text
+                                    }),
                                 )
                                 .truncate(),
                             );
@@ -4317,8 +4452,8 @@ mod tests {
 
     #[test]
     fn strong_signals_move_without_waiting() {
-        // 承認待ち・停滞・完了は hold_ms == 0 なので即座に動く (人を待たせない)
-        for col in [Column::Approval, Column::Trouble, Column::Done] {
+        // 承認待ち・完了は hold_ms == 0 なので即座に動く (人を待たせない)
+        for col in [Column::Approval, Column::Done] {
             for from in [Column::Ready, Column::Editing, Column::Verifying] {
                 let mut lt = LaneTracker::new(from, 0);
                 assert!(lt.step(col, 10), "{from:?} → {col:?} は即移動のはず");
@@ -4326,17 +4461,53 @@ mod tests {
             }
         }
         for col in COLUMNS {
-            let want = if col.loud() || col == Column::Done {
-                0
-            } else if col == Column::Ready {
-                LANE_HOLD_MS
-            } else {
-                WORK_HOLD_MS
+            let want = match col {
+                Column::Approval | Column::Done => 0,
+                Column::Trouble => TROUBLE_HOLD_MS,
+                Column::Ready => LANE_HOLD_MS,
+                _ => WORK_HOLD_MS,
             };
             assert_eq!(col.hold_ms(), want, "{col:?}");
         }
         // 作業系のホールドは「1 サンプルで動かない」ために十分な長さがある
         assert!(WORK_HOLD_MS >= FAST_SAMPLE_MS * 4, "ホールドが短すぎる");
+        // 「停滞・異常」は作業系より長く粘る — 誤報のコストがいちばん高いレーン
+        assert!(
+            TROUBLE_HOLD_MS > WORK_HOLD_MS,
+            "異常レーンのホールドが作業系より短い"
+        );
+    }
+
+    /// **本題の回帰テスト**: 一瞬だけ立った異常判定では「停滞・異常」へ落ちない。
+    ///
+    /// 見張りの判定はハッシュ列から出るので 1〜2 サンプルだけ立つことがある。
+    /// それで人を呼んでいたため、動いているエージェントが異常レーンに並んだ。
+    #[test]
+    fn 一瞬の異常判定では異常レーンへ落ちない() {
+        let mut lt = LaneTracker::new(Column::Running, 0);
+        // 数サンプル異常が立つ (TROUBLE_HOLD_MS 未満)
+        let mut t = 0;
+        while t < TROUBLE_HOLD_MS {
+            assert!(!lt.step(Column::Trouble, t), "{t}ms で異常レーンへ飛んだ");
+            t += FAST_SAMPLE_MS;
+        }
+        // 収まれば候補は取り下げ — 作業中のまま
+        assert!(!lt.step(Column::Running, t));
+        assert_eq!(lt.lane(), Column::Running);
+    }
+
+    /// 逆に**続く異常はちゃんと落ちる** (人を呼び損ねない)。
+    #[test]
+    fn 続く異常判定は異常レーンへ落ちる() {
+        let mut lt = LaneTracker::new(Column::Running, 0);
+        let mut t = 0;
+        let mut moved = false;
+        while t <= TROUBLE_HOLD_MS + FAST_SAMPLE_MS {
+            moved |= lt.step(Column::Trouble, t);
+            t += FAST_SAMPLE_MS;
+        }
+        assert!(moved, "続いている異常が異常レーンへ落ちない");
+        assert_eq!(lt.lane(), Column::Trouble);
     }
 
     #[test]
@@ -4842,6 +5013,73 @@ mod tests {
         }
     }
 
+    // ── 指揮官 (スーパーエージェント) の見分け ──
+
+    /// 看板を 1 枚描いて、`needle` を含むテキストが何回出たかを数える。
+    fn draw_and_count(cards: &[Card], needle: &str) -> usize {
+        fn walk(sh: &egui::Shape, needle: &str, n: &mut usize) {
+            match sh {
+                egui::Shape::Text(t) => {
+                    if t.galley.job.text.contains(needle) {
+                        *n += 1;
+                    }
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, needle, n)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all().remove(0);
+        let mut st = KanbanState::default();
+        let mut n = 0;
+        // 2 フレーム: 1 枚目で追跡を作り、2 枚目で本描画 (初回はレーンが確定しない)
+        for _ in 0..2 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            n = 0;
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut live = |_: &mut egui::Ui, _: usize| None;
+                    let _ = super::ui(&mut st, ui, &theme, cards, &[], &[], 1_000, true, &mut live);
+                });
+            });
+            for c in &out.shapes {
+                walk(&c.shape, needle, &mut n);
+            }
+        }
+        n
+    }
+
+    /// **指名した 1 体だけ**が冠付きで描かれる (指名なしなら 1 つも出ない)。
+    ///
+    /// 看板は同じ形のカードが並ぶので、「どれがスーパーエージェントか」は
+    /// 画面を読まないと分からない状態だった。冠が出ていること自体を番人にする。
+    #[test]
+    fn 指揮官だけが冠付きで描かれる() {
+        let mut plain = vec![
+            card_id(1, Column::Running),
+            card_id(2, Column::Thinking),
+            card_id(3, Column::Ready),
+        ];
+        assert_eq!(
+            draw_and_count(&plain, COMMANDER_BADGE),
+            0,
+            "指名が無いのに冠が出ている"
+        );
+        // 2 番目を指揮官に指名する
+        plain[1].commander = true;
+        let n = draw_and_count(&plain, COMMANDER_BADGE);
+        assert!(
+            n > 0,
+            "指揮官を指名したのに冠がどこにも描かれていない (カード / 左レール / ヘッダー)"
+        );
+    }
+
     // ── ダッシュボード用の純関数 ──
 
     fn card(column: Column, running: bool) -> Card {
@@ -4860,6 +5098,7 @@ mod tests {
             running,
             sup: None,
             permission_badge: "",
+            commander: false,
             can_cycle: false,
             tail_lines: Vec::new(),
             task: None,
