@@ -236,12 +236,32 @@ impl FileTree {
         self.scroll_to = Some(p.to_path_buf());
     }
 
+    /// 指定フォルダを**その場で**開いて選択する (ブレッドクラムのフォルダ押下)。
+    ///
+    /// `set_active_file` の予約と違い、追従トグル (`auto_reveal`) が OFF でも効く
+    /// — ユーザーが自分でそのフォルダを押したのだから、その 1 回は必ず開く。
+    pub fn reveal_dir(&mut self, ctx: &egui::Context, p: &Path) {
+        // ルート自身のときは祖先を辿らない (ワークスペースの外まで開いてしまうため)
+        if !self.roots.iter().any(|r| r == p) {
+            for anc in reveal_ancestors(&self.roots, p) {
+                set_open(ctx, &anc, true);
+            }
+        }
+        set_open(ctx, p, true);
+        self.selected = Some(p.to_path_buf());
+        self.scroll_to = Some(p.to_path_buf());
+    }
+
     /// `p` 配下(自身含む)を指していた選択・クリップボードを外す(削除後の後始末)。
     pub fn deselect_under(&mut self, p: &Path) {
         if self.selected.as_deref().is_some_and(|s| s.starts_with(p)) {
             self.selected = None;
         }
-        if self.clipboard.as_ref().is_some_and(|(c, _)| c.starts_with(p)) {
+        if self
+            .clipboard
+            .as_ref()
+            .is_some_and(|(c, _)| c.starts_with(p))
+        {
             self.clipboard = None;
         }
     }
@@ -406,7 +426,10 @@ impl FileTree {
         let roots = self.roots.clone();
         // 単一ルート時は従来どおりヘッダ無しで直下を描く(見た目を変えない)。
         if roots.len() <= 1 {
-            let root = roots.into_iter().next().unwrap_or_else(|| PathBuf::from("."));
+            let root = roots
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| PathBuf::from("."));
             self.dir_ui(ui, &root, theme, gitinfo, actions, 0);
         } else {
             for root in &roots {
@@ -425,10 +448,13 @@ impl FileTree {
                 let hr = st.show_header(ui, |ui| {
                     ui.selectable_label(
                         sel,
-                        RichText::new(format!("📚 {name}{badge_text}")).color(color).strong(),
+                        RichText::new(format!("📚 {name}{badge_text}"))
+                            .color(color)
+                            .strong(),
                     )
                 });
-                let (_, header, _) = hr.body(|ui| self.dir_ui(ui, root, theme, gitinfo, actions, 0));
+                let (_, header, _) =
+                    hr.body(|ui| self.dir_ui(ui, root, theme, gitinfo, actions, 0));
                 let resp = header.inner;
                 if resp.clicked() {
                     self.select(root);
@@ -450,11 +476,13 @@ impl FileTree {
                     }
                     ui.separator();
                     let can_paste = self.clipboard.is_some();
-                    if menu_btn_enabled(ui, can_paste, tr("📋 貼り付け"), h("⌘V", "Ctrl+V")) {
+                    if menu_btn_enabled(ui, can_paste, tr("📋 貼り付け"), h("⌘V", "Ctrl+V"))
+                    {
                         self.paste_into(root.clone(), actions);
                     }
                     ui.separator();
-                    if menu_btn(ui, tr("📋 フルパスをコピー"), h("⌥⌘C", "Shift+Alt+C")) {
+                    if menu_btn(ui, tr("📋 フルパスをコピー"), h("⌥⌘C", "Shift+Alt+C"))
+                    {
                         ui.ctx().copy_text(root.to_string_lossy().to_string());
                     }
                     ui.separator();
@@ -589,7 +617,11 @@ impl FileTree {
             go = Some(sel_idx.map(|i| (i + 1).min(rows.len() - 1)).unwrap_or(0));
         }
         if pressed(Modifiers::NONE, Key::ArrowUp) {
-            go = Some(sel_idx.map(|i| i.saturating_sub(1)).unwrap_or(rows.len() - 1));
+            go = Some(
+                sel_idx
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(rows.len() - 1),
+            );
         }
         if pressed(Modifiers::NONE, Key::Home) {
             go = Some(0);
@@ -602,7 +634,9 @@ impl FileTree {
         }
 
         // ── ← : 折りたたみ / 親へ (list.collapse)。→ : 展開 / 最初の子へ (list.expand) ──
-        if pressed(Modifiers::NONE, Key::ArrowLeft) || (mac && pressed(Modifiers::COMMAND, Key::ArrowUp)) {
+        if pressed(Modifiers::NONE, Key::ArrowLeft)
+            || (mac && pressed(Modifiers::COMMAND, Key::ArrowUp))
+        {
             if let Some(r) = sel_idx.map(|i| &rows[i]) {
                 if r.is_dir && r.open {
                     set_open(ctx, &r.path, false);
@@ -743,7 +777,9 @@ impl FileTree {
         }
         if mac
             && pressed(
-                Modifiers::COMMAND.plus(Modifiers::ALT).plus(Modifiers::SHIFT),
+                Modifiers::COMMAND
+                    .plus(Modifiers::ALT)
+                    .plus(Modifiers::SHIFT),
                 Key::C,
             )
         {
@@ -1019,8 +1055,7 @@ impl FileTree {
             }
             let sel = self.selected.as_deref() == Some(e.path.as_path());
             // 切り取り待ちの項目は薄く描く(VS Code と同じ合図)
-            let cut_pending =
-                matches!(&self.clipboard, Some((p, true)) if p == &e.path);
+            let cut_pending = matches!(&self.clipboard, Some((p, true)) if p == &e.path);
             if e.is_dir {
                 let ctx = ui.ctx().clone();
                 let mut st =
@@ -1468,7 +1503,11 @@ mod tests {
         std::fs::create_dir_all(&b).expect("mkdir b");
 
         let out = normalize_roots(vec![a.clone(), b.clone(), a.clone()]);
-        assert_eq!(out, vec![canon(&a), canon(&b)], "重複は落ち、順序は保たれる");
+        assert_eq!(
+            out,
+            vec![canon(&a), canon(&b)],
+            "重複は落ち、順序は保たれる"
+        );
 
         // `..` 経由の別表記も canonicalize で同一視される
         let a_alt = dir.join("b").join("..").join("a");
@@ -1517,7 +1556,11 @@ mod tests {
                 "ルートは素のパス: {}",
                 root.display()
             );
-            assert!(root.is_dir(), "指しているものは変わらない: {}", root.display());
+            assert!(
+                root.is_dir(),
+                "指しているものは変わらない: {}",
+                root.display()
+            );
         }
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1544,7 +1587,10 @@ mod tests {
             vec![PathBuf::from("/ws/a"), PathBuf::from("/ws/a/deep")],
             false,
         );
-        assert_eq!(t.root_for(Path::new("/ws/a/x.rs")), Some(Path::new("/ws/a")));
+        assert_eq!(
+            t.root_for(Path::new("/ws/a/x.rs")),
+            Some(Path::new("/ws/a"))
+        );
         assert_eq!(
             t.root_for(Path::new("/ws/a/deep/x.rs")),
             Some(Path::new("/ws/a/deep")),
@@ -1557,7 +1603,11 @@ mod tests {
     fn icon_for_ignores_extension_case() {
         assert_eq!(icon_for("README.MD"), icon_for("readme.md"));
         assert_eq!(icon_for("Main.RS"), icon_for("main.rs"));
-        assert_ne!(icon_for("README.MD"), icon_for("unknown.zzz"), "既定に落ちていない");
+        assert_ne!(
+            icon_for("README.MD"),
+            icon_for("unknown.zzz"),
+            "既定に落ちていない"
+        );
     }
 
     #[test]
@@ -1592,12 +1642,21 @@ mod tests {
         // 衝突なし → そのままの名前
         assert_eq!(next_paste_path(&dir, "b.txt", false), dir.join("b.txt"));
         // 1 回目の衝突 → "a copy.txt"
-        assert_eq!(next_paste_path(&dir, "a.txt", false), dir.join("a copy.txt"));
+        assert_eq!(
+            next_paste_path(&dir, "a.txt", false),
+            dir.join("a copy.txt")
+        );
         // "a copy.txt" が既にある → "a copy 2.txt" → "a copy 3.txt"
         std::fs::write(dir.join("a copy.txt"), "x").expect("write");
-        assert_eq!(next_paste_path(&dir, "a.txt", false), dir.join("a copy 2.txt"));
+        assert_eq!(
+            next_paste_path(&dir, "a.txt", false),
+            dir.join("a copy 2.txt")
+        );
         std::fs::write(dir.join("a copy 2.txt"), "x").expect("write");
-        assert_eq!(next_paste_path(&dir, "a.txt", false), dir.join("a copy 3.txt"));
+        assert_eq!(
+            next_paste_path(&dir, "a.txt", false),
+            dir.join("a copy 3.txt")
+        );
         // コピー名自体を貼り付けても "copy copy" にはならない
         assert_eq!(
             next_paste_path(&dir, "a copy.txt", false),
@@ -1683,11 +1742,18 @@ mod tests {
         let file = root.join("src").join("deep").join("mod.rs");
         assert_eq!(
             reveal_ancestors(&roots, &file),
-            vec![root.clone(), root.join("src"), root.join("src").join("deep")],
+            vec![
+                root.clone(),
+                root.join("src"),
+                root.join("src").join("deep")
+            ],
             "ルート → 親 の順で、対象自身は含まない"
         );
         // ルート直下のファイルはルートだけ
-        assert_eq!(reveal_ancestors(&roots, &root.join("main.rs")), vec![root.clone()]);
+        assert_eq!(
+            reveal_ancestors(&roots, &root.join("main.rs")),
+            vec![root.clone()]
+        );
     }
 
     #[test]
@@ -1790,7 +1856,10 @@ mod tests {
         for theme in crate::theme::all() {
             for st in statuses {
                 let (c, badge, hint) = git_status_style(st, &theme);
-                assert!(!badge.is_empty() && !hint.is_empty(), "{st:?} のバッジ/説明");
+                assert!(
+                    !badge.is_empty() && !hint.is_empty(),
+                    "{st:?} のバッジ/説明"
+                );
                 let ratio = contrast(c, theme.panel);
                 assert!(
                     ratio >= 3.0,

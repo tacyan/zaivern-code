@@ -160,7 +160,10 @@ fn draw_ball_eye(
     match mode {
         EyeMode::Closed => {
             // 閉眼 → 水平線
-            painter.line_segment([c + vec2(-r.x, 0.0), c + vec2(r.x, 0.0)], Stroke::new(lw, ink));
+            painter.line_segment(
+                [c + vec2(-r.x, 0.0), c + vec2(r.x, 0.0)],
+                Stroke::new(lw, ink),
+            );
         }
         EyeMode::Cross => {
             // ×目
@@ -211,8 +214,14 @@ fn draw_ball_eye(
 /// 怒り眉（内側が下がる「ハ」の字を上下逆にした形）
 fn angry_brows(painter: &Painter, le: Pos2, re: Pos2, ink: Color32, u: f32) {
     let s = Stroke::new(1.4 * u, ink);
-    painter.line_segment([le + vec2(-3.0 * u, -4.5 * u), le + vec2(2.5 * u, -2.6 * u)], s);
-    painter.line_segment([re + vec2(-2.5 * u, -2.6 * u), re + vec2(3.0 * u, -4.5 * u)], s);
+    painter.line_segment(
+        [le + vec2(-3.0 * u, -4.5 * u), le + vec2(2.5 * u, -2.6 * u)],
+        s,
+    );
+    painter.line_segment(
+        [re + vec2(-2.5 * u, -2.6 * u), re + vec2(3.0 * u, -4.5 * u)],
+        s,
+    );
 }
 
 /// 口のアーク。`depth > 0` で笑い(∪)、`depth < 0` でへの字(∩)。
@@ -332,8 +341,24 @@ pub fn draw_crab(painter: &Painter, rect: Rect, t: f64, state: PetState, p: &Dra
             Stroke::new(2.0 * u, OUTLINE),
         );
     }
-    draw_ball_eye(painter, le, vec2(4.8 * u, 4.8 * u), eyes, p.eye_look, Color32::BLACK, u);
-    draw_ball_eye(painter, re, vec2(4.8 * u, 4.8 * u), eyes, p.eye_look, Color32::BLACK, u);
+    draw_ball_eye(
+        painter,
+        le,
+        vec2(4.8 * u, 4.8 * u),
+        eyes,
+        p.eye_look,
+        Color32::BLACK,
+        u,
+    );
+    draw_ball_eye(
+        painter,
+        re,
+        vec2(4.8 * u, 4.8 * u),
+        eyes,
+        p.eye_look,
+        Color32::BLACK,
+        u,
+    );
     if state == PetState::Annoyed {
         angry_brows(painter, le, re, OUTLINE, u);
     }
@@ -416,11 +441,7 @@ pub fn draw_cat(painter: &Painter, rect: Rect, t: f64, state: PetState, p: &Draw
         q(-11.0 + p.wave * 0.8, -21.0),
         q(-4.0, -10.0),
     ];
-    let r_ear = [
-        q(4.0, -10.0),
-        q(11.0 - p.wave * 0.8, -21.0),
-        q(14.0, -8.0),
-    ];
+    let r_ear = [q(4.0, -10.0), q(11.0 - p.wave * 0.8, -21.0), q(14.0, -8.0)];
     painter.add(Shape::convex_polygon(
         l_ear.to_vec(),
         ORANGE,
@@ -431,14 +452,38 @@ pub fn draw_cat(painter: &Painter, rect: Rect, t: f64, state: PetState, p: &Draw
         DARK,
         Stroke::new(1.4 * u, INK),
     ));
-    painter.add(Shape::convex_polygon(inner_tri(&l_ear, 0.45), PINK, Stroke::NONE));
-    painter.add(Shape::convex_polygon(inner_tri(&r_ear, 0.45), PINK, Stroke::NONE));
+    painter.add(Shape::convex_polygon(
+        inner_tri(&l_ear, 0.45),
+        PINK,
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(
+        inner_tri(&r_ear, 0.45),
+        PINK,
+        Stroke::NONE,
+    ));
 
     // ── 目（アーモンド形。瞳がカーソル追従） ──
     let eyes = eye_mode(state, p.blink);
     let (le, re) = (q(-6.0, -2.0), q(6.0, -2.0));
-    draw_ball_eye(painter, le, vec2(3.4 * u, 2.6 * u), eyes, p.eye_look, INK, u);
-    draw_ball_eye(painter, re, vec2(3.4 * u, 2.6 * u), eyes, p.eye_look, INK, u);
+    draw_ball_eye(
+        painter,
+        le,
+        vec2(3.4 * u, 2.6 * u),
+        eyes,
+        p.eye_look,
+        INK,
+        u,
+    );
+    draw_ball_eye(
+        painter,
+        re,
+        vec2(3.4 * u, 2.6 * u),
+        eyes,
+        p.eye_look,
+        INK,
+        u,
+    );
     if state == PetState::Annoyed {
         angry_brows(painter, le, re, INK, u);
     }
@@ -584,8 +629,14 @@ pub fn draw_cloud(painter: &Painter, rect: Rect, t: f64, state: PetState, p: &Dr
             }
             EyeMode::Cross => {
                 let r = 1.8 * u;
-                painter.line_segment([e + vec2(-r, -r), e + vec2(r, r)], Stroke::new(1.3 * u, INK));
-                painter.line_segment([e + vec2(-r, r), e + vec2(r, -r)], Stroke::new(1.3 * u, INK));
+                painter.line_segment(
+                    [e + vec2(-r, -r), e + vec2(r, r)],
+                    Stroke::new(1.3 * u, INK),
+                );
+                painter.line_segment(
+                    [e + vec2(-r, r), e + vec2(r, -r)],
+                    Stroke::new(1.3 * u, INK),
+                );
             }
             EyeMode::Arc => {
                 painter.add(Shape::line(

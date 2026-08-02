@@ -80,7 +80,13 @@ pub enum BindAction {
     ToggleBookmark,
     /// 直前に閉じたタブを開き直す (VS Code: ⇧⌘T)
     ReopenClosedTab,
-    /// 補完候補を出す (VS Code: ⌃Space)
+    /// 補完候補を出す (VS Code mac の第 2 割り当てと同じ ⌘I)。
+    ///
+    /// VS Code 既定の ⌃Space は **macOS が予約している** ("前の入力ソースを
+    /// 選択"; `com.apple.symbolichotkeys` の id 60 が既定で enabled)。
+    /// 入力ソースを 2 つ以上持つ環境 (日本語 IME を使えば必ずそうなる) では
+    /// アプリまでイベントが届かないので、既定は ⌘I にしてある。
+    /// ⌃Space は「効く環境では効く」おまけの打鍵として残してある。
     LspCompletion,
     /// 参照を検索 (VS Code: ⇧F12)
     LspReferences,
@@ -88,14 +94,32 @@ pub enum BindAction {
     LspSymbols,
     /// リネーム (VS Code: F2)
     LspRename,
-    /// ドキュメントの整形 (VS Code: ⇧⌥F)
+    /// ドキュメントの整形 (VS Code: ⇧⌥F)。選択があれば選択範囲だけを整形する
     LspFormat,
+    /// クイックフィックス / コードアクション (VS Code: ⌘. / Ctrl+.)
+    LspCodeAction,
+    /// 引数ヒント (シグネチャヘルプ) を出す (VS Code: ⇧⌘Space)
+    LspSignatureHelp,
     /// 次の出現を選択してキャレットを増やす (VS Code: ⌘D)
     SelectNextOccurrence,
+    /// エディタを右に分割 (VS Code: ⌘\ と同じ)
+    SplitEditorRight,
+    /// エディタを下に分割
+    SplitEditorDown,
+    /// 1 番目のエディタペインへフォーカス (VS Code: ⌘1)
+    FocusPane1,
+    /// 2 番目のエディタペインへフォーカス (VS Code: ⌘2)
+    FocusPane2,
+    /// 3 番目のエディタペインへフォーカス (VS Code: ⌘3)
+    FocusPane3,
+    /// 差分ビューで次の変更へ (VS Code: F7)
+    DiffNextChange,
+    /// 差分ビューで前の変更へ (VS Code: ⇧F7)
+    DiffPrevChange,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-const ALL_ACTIONS: [BindAction; 48] = [
+pub const ALL_ACTIONS: [BindAction; 57] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -143,7 +167,16 @@ const ALL_ACTIONS: [BindAction; 48] = [
     BindAction::LspSymbols,
     BindAction::LspRename,
     BindAction::LspFormat,
+    BindAction::LspCodeAction,
+    BindAction::LspSignatureHelp,
     BindAction::SelectNextOccurrence,
+    BindAction::SplitEditorRight,
+    BindAction::SplitEditorDown,
+    BindAction::FocusPane1,
+    BindAction::FocusPane2,
+    BindAction::FocusPane3,
+    BindAction::DiffNextChange,
+    BindAction::DiffPrevChange,
 ];
 
 /// 現行 app.rs::handle_shortcuts と同一のデフォルト。
@@ -162,6 +195,10 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::ToggleTerminal => KeyboardShortcut::new(cmd, Key::J),
         BindAction::ToggleSidebar => KeyboardShortcut::new(cmd, Key::B),
         BindAction::Find => KeyboardShortcut::new(cmd, Key::F),
+        // ⌘⇧C / ⌘⇧V は egui-winit 0.29 が **押下イベントごと** 握り潰して
+        // `Event::Copy` / `Event::Paste` にすり替える (shift の有無を見ていない)。
+        // 素の `InputState::consume_shortcut` では絶対に発火しないので、
+        // [`consume_shortcut_compat`] を通して拾い直すこと。
         BindAction::ToggleCockpit => KeyboardShortcut::new(cmd_shift, Key::C),
         BindAction::ToggleKanban => KeyboardShortcut::new(cmd_shift, Key::K),
         // ⌥⌘D = デッキ (Deck)。⇧⌘D は「行を複製」に埋まっているので ⌥ 側を使う。
@@ -204,23 +241,53 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         }
         // ⌥⌘[ / ⌥⌘] は VS Code (mac) の折りたたみ / 展開と同じ。
         // 既存の ⌥⌘ 割り当ては S (すべて保存) と F (置換) だけなので空いている。
-        BindAction::ToggleFold => {
-            KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::OpenBracket)
-        }
-        BindAction::UnfoldAll => {
-            KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::CloseBracket)
-        }
+        BindAction::ToggleFold => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::OpenBracket),
+        BindAction::UnfoldAll => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::CloseBracket),
         BindAction::ToggleBookmark => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::B),
         BindAction::ReopenClosedTab => KeyboardShortcut::new(cmd_shift, Key::T),
-        BindAction::LspCompletion => KeyboardShortcut::new(Modifiers::CTRL, Key::Space),
+        // ⌃Space は macOS が「前の入力ソース」に予約している (実測: 本文の
+        // `MACOS_RESERVED` を参照)。既定は ⌘I にして、⌃Space は
+        // `app.rs::lsp_completion_tick` が追加で拾う。
+        BindAction::LspCompletion => KeyboardShortcut::new(cmd, Key::I),
         BindAction::LspReferences => KeyboardShortcut::new(Modifiers::SHIFT, Key::F12),
         BindAction::LspSymbols => KeyboardShortcut::new(cmd_shift, Key::O),
         BindAction::LspRename => KeyboardShortcut::new(Modifiers::NONE, Key::F2),
         BindAction::LspFormat => {
             KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::F)
         }
+        // VS Code と同じ ⌘. / Ctrl+.。⌘ 単独の既存割り当ては
+        // S W N P J B F +/- / O D だけで `.` は空いている。
+        // macOS の OS 予約 (⌘Space=Spotlight, ⌘⌥D=Dock, ⌃Space=入力ソース) にも
+        // 当たらない — ⌘. はダイアログのキャンセル相当だがアプリまで届く。
+        BindAction::LspCodeAction => KeyboardShortcut::new(cmd, Key::Period),
+        // VS Code (mac) の「パラメーターヒントを表示」と同じ ⇧⌘Space。
+        // ⌘Space (Spotlight) / ⌥⌘Space (Finder 検索) / ⌃Space (入力ソース切替 =
+        // 補完に使用中) のいずれとも別で、⇧⌘ 系にも Space の割り当ては無い。
+        BindAction::LspSignatureHelp => KeyboardShortcut::new(cmd_shift, Key::Space),
         // VS Code と同じ ⌘D。⇧⌘D (行の複製) とは別で、既存の割り当てとは重ならない
         BindAction::SelectNextOccurrence => KeyboardShortcut::new(cmd, Key::D),
+        // ── エディタの分割 ────────────────────────────────────────
+        // ⌘\ は VS Code の「エディターの分割」そのもの。⌥⌘\ は下方向。
+        // どちらも既定表にも、端末側の分割コード (⌘⌥ / Ctrl+Alt + N W Z E
+        // H J K L と矢印) にも無い。macOS の OS 予約 (⌘⌥D=Dock・⌘⌥Esc・
+        // ⌘Space・⌃↑/↓) とも重ならない。
+        BindAction::SplitEditorRight => KeyboardShortcut::new(cmd, Key::Backslash),
+        BindAction::SplitEditorDown => {
+            KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::Backslash)
+        }
+        // ⌘1..⌘3 は VS Code の「エディターグループへフォーカス」と同じ。
+        // 既定表に数字キーの割り当ては 1 つも無い。
+        BindAction::FocusPane1 => KeyboardShortcut::new(cmd, Key::Num1),
+        BindAction::FocusPane2 => KeyboardShortcut::new(cmd, Key::Num2),
+        BindAction::FocusPane3 => KeyboardShortcut::new(cmd, Key::Num3),
+        // 差分の次/前の変更 = VS Code と同じ F7 / ⇧F7。
+        // ファンクションキーの既存割り当ては F2 (リネーム) / F12 (定義へ) /
+        // ⇧F12 (参照検索) だけなので F7 系は空いている。修飾キー無しの単打だが、
+        // 差分ビューが出ていないときは `diff::take_jump` が捨てるので誤爆しない。
+        // macOS が予約するのは ⌘⌥D (Dock) や F11 (Mission Control) 系で、
+        // F7 は既定でメディアキー扱いでもアプリへ届く (fn 併用が要る機種はある)。
+        BindAction::DiffNextChange => KeyboardShortcut::new(Modifiers::NONE, Key::F7),
+        BindAction::DiffPrevChange => KeyboardShortcut::new(Modifiers::SHIFT, Key::F7),
     }
 }
 
@@ -305,7 +372,16 @@ impl Keybinds {
             "lsp_symbols" => LspSymbols,
             "lsp_rename" => LspRename,
             "lsp_format" => LspFormat,
+            "lsp_code_action" => LspCodeAction,
+            "lsp_signature_help" => LspSignatureHelp,
             "select_next_occurrence" => SelectNextOccurrence,
+            "split_editor_right" => SplitEditorRight,
+            "split_editor_down" => SplitEditorDown,
+            "focus_pane_1" => FocusPane1,
+            "focus_pane_2" => FocusPane2,
+            "focus_pane_3" => FocusPane3,
+            "diff_next_change" => DiffNextChange,
+            "diff_prev_change" => DiffPrevChange,
             _ => return None,
         })
     }
@@ -441,6 +517,218 @@ fn key_from_name(name: &str) -> Option<Key> {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// egui-winit 0.29 がキーイベントごと飲み込む打鍵の救出
+// ─────────────────────────────────────────────────────────────────────────
+
+/// クリップボードイベントにすり替えられてしまう打鍵の種類。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClipboardAlias {
+    Cut,
+    Copy,
+    Paste,
+}
+
+/// この修飾キーの組み合わせを egui-winit が `command` として扱うか。
+///
+/// egui-winit 0.29 は macOS では ⌘ を、それ以外の OS では Ctrl を
+/// `Modifiers::command` に写す。判定はその写像に合わせる。
+fn acts_as_command(m: Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        m.command || m.mac_cmd
+    } else {
+        m.command || m.ctrl
+    }
+}
+
+/// egui-winit 0.29 が **押した瞬間のキーイベントごと捨ててしまう** 打鍵か。
+///
+/// `egui-winit-0.29.1/src/lib.rs:758-774` は、押下イベントが
+/// `is_cut_command` / `is_copy_command` / `is_paste_command` に当たると
+/// `Event::Cut` / `Event::Copy` / `Event::Paste` を積んで **その場で return** する
+/// (= `Event::Key { pressed: true }` を一切積まない)。判定は
+/// `modifiers.command && key == X|C|V` だけで、**shift / alt の有無を見ていない**
+/// (同ファイル 1023-1039 行)。
+///
+/// そのため ⌘⇧C (Cockpit) や ⌘⇧V (プレビュー) のようなバインドは
+/// `InputState::consume_shortcut` では**構造的に絶対発火しない**。
+/// リリースイベントは飲まれない (`if pressed` の内側なので) が、
+/// 「⌘ を先に離す」と修飾キーが落ちるため押下側で拾い直すのが正しい。
+///
+/// 素の ⌘C / ⌘X / ⌘V は本物のクリップボード操作なので対象外にする
+/// (ここで横取りするとコピー&ペーストが壊れる)。
+pub fn clipboard_alias(sc: KeyboardShortcut) -> Option<ClipboardAlias> {
+    if !acts_as_command(sc.modifiers) {
+        return None;
+    }
+    if !(sc.modifiers.shift || sc.modifiers.alt) {
+        return None;
+    }
+    match sc.logical_key {
+        Key::X => Some(ClipboardAlias::Cut),
+        Key::C => Some(ClipboardAlias::Copy),
+        Key::V => Some(ClipboardAlias::Paste),
+        _ => None,
+    }
+}
+
+/// [`egui::InputState::consume_shortcut`] の代替。
+///
+/// 通常の経路で拾えなかったときだけ、[`clipboard_alias`] のすり替えを
+/// 逆再生して該当イベントを消費する。**アプリのショートカット消費は
+/// 必ずこれを通すこと** — 素の `consume_shortcut` を使うと
+/// 「画面には ⌘⇧C と書いてあるのに効かない」が再発する。
+pub fn consume_shortcut_compat(i: &mut egui::InputState, sc: KeyboardShortcut) -> bool {
+    if i.consume_shortcut(&sc) {
+        return true;
+    }
+    let Some(alias) = clipboard_alias(sc) else {
+        return false;
+    };
+    // `Event::Copy` 等は修飾キーを持たないので、フレームの修飾キー状態で照合する。
+    if !i.modifiers.matches_logically(sc.modifiers) {
+        return false;
+    }
+    let mut hit = false;
+    i.events.retain(|e| {
+        let is_match = matches!(
+            (e, alias),
+            (egui::Event::Cut, ClipboardAlias::Cut)
+                | (egui::Event::Copy, ClipboardAlias::Copy)
+                | (egui::Event::Paste(_), ClipboardAlias::Paste)
+        );
+        hit |= is_match;
+        !is_match
+    });
+    hit
+}
+
+fn hint_id(a: BindAction) -> egui::Id {
+    egui::Id::new(("zv-key-hint", format!("{a:?}")))
+}
+
+/// `Keybinds` を持てない描画関数へ打鍵表記を配る。
+///
+/// ターミナルの右クリックメニューのように、キーバインド表を引数で持ち回すと
+/// 呼び出し側を全部書き換える羽目になる場所がある。アプリが毎フレームここで
+/// 配り、描画側は [`key_hint`] で読む。
+pub fn publish_key_hints(ctx: &egui::Context, keys: &Keybinds, actions: &[BindAction]) {
+    ctx.data_mut(|d| {
+        for a in actions {
+            d.insert_temp(hint_id(*a), format_shortcut(keys.get(*a)));
+        }
+    });
+}
+
+/// [`publish_key_hints`] が配った打鍵表記を読む。
+/// 配られていなければ既定の打鍵へ落ちるので、表示が空になることはない。
+pub fn key_hint(ctx: &egui::Context, a: BindAction) -> String {
+    ctx.data(|d| d.get_temp::<String>(hint_id(a)))
+        .unwrap_or_else(|| format_shortcut(default_shortcut(a)))
+}
+
+/// macOS が OS 側で握っていて、アプリまで届かない打鍵の表。
+///
+/// 出典は推測ではなく実測 —
+/// `~/Library/Preferences/com.apple.symbolichotkeys.plist` の
+/// `AppleSymbolicHotKeys` で `enabled = true` になっている項目を読み出して作った
+/// (id 60 = ⌃Space「前の入力ソース」、id 52 = ⌥⌘D「Dock を隠す」、
+/// id 64 = ⌘Space「Spotlight」、id 27 = ⌘\`「次のウィンドウ」など)。
+/// ここに載る打鍵を既定バインドにすると、UI には出るのに**絶対に効かない**。
+pub const MACOS_RESERVED: &[(Modifiers, Key, &str)] = &[
+    (Modifiers::COMMAND, Key::Space, "Spotlight (id 64)"),
+    (
+        Modifiers::COMMAND.plus(Modifiers::ALT),
+        Key::Space,
+        "Finder の検索ウィンドウ (id 65)",
+    ),
+    (Modifiers::CTRL, Key::Space, "前の入力ソース (id 60)"),
+    (
+        Modifiers::CTRL.plus(Modifiers::ALT),
+        Key::Space,
+        "次の入力ソース (id 61)",
+    ),
+    (
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::Space,
+        "入力メニュー (id 156)",
+    ),
+    (
+        Modifiers::COMMAND.plus(Modifiers::ALT),
+        Key::D,
+        "Dock を隠す/表示 (id 52)",
+    ),
+    (
+        Modifiers::COMMAND.plus(Modifiers::CTRL),
+        Key::D,
+        "辞書で調べる (id 70)",
+    ),
+    (
+        Modifiers::COMMAND.plus(Modifiers::ALT),
+        Key::Escape,
+        "強制終了ダイアログ",
+    ),
+    (Modifiers::CTRL, Key::ArrowUp, "Mission Control (id 32)"),
+    (
+        Modifiers::CTRL,
+        Key::ArrowDown,
+        "アプリケーションウィンドウ (id 33)",
+    ),
+    (
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::ArrowUp,
+        "Mission Control (逆) (id 34)",
+    ),
+    (
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::ArrowDown,
+        "アプリケーションウィンドウ (逆) (id 35)",
+    ),
+    (Modifiers::CTRL, Key::ArrowLeft, "左のスペースへ (id 79)"),
+    (Modifiers::CTRL, Key::ArrowRight, "右のスペースへ (id 81)"),
+    (Modifiers::COMMAND, Key::Tab, "アプリケーション切替"),
+    (
+        Modifiers::COMMAND.plus(Modifiers::SHIFT),
+        Key::Tab,
+        "アプリケーション切替 (逆)",
+    ),
+    (Modifiers::COMMAND, Key::Backtick, "次のウィンドウ (id 27)"),
+    (
+        Modifiers::COMMAND.plus(Modifiers::ALT),
+        Key::Backtick,
+        "前のウィンドウ (id 51)",
+    ),
+    (
+        Modifiers::COMMAND.plus(Modifiers::SHIFT),
+        Key::Num3,
+        "スクリーンショット (id 28)",
+    ),
+    (
+        Modifiers::COMMAND.plus(Modifiers::SHIFT),
+        Key::Num4,
+        "選択部分を撮影 (id 30)",
+    ),
+    (
+        Modifiers::COMMAND.plus(Modifiers::SHIFT),
+        Key::Num5,
+        "スクリーンショットと画面収録",
+    ),
+    (
+        Modifiers::COMMAND.plus(Modifiers::SHIFT),
+        Key::Slash,
+        "ヘルプメニューの検索 (id 98)",
+    ),
+    (Modifiers::NONE, Key::F11, "デスクトップを表示 (id 36)"),
+    (Modifiers::COMMAND, Key::H, "アプリケーションを隠す"),
+    (Modifiers::COMMAND, Key::M, "ウィンドウをしまう"),
+    (Modifiers::COMMAND, Key::Q, "アプリケーションを終了"),
+    (
+        Modifiers::COMMAND.plus(Modifiers::SHIFT),
+        Key::Q,
+        "ログアウト",
+    ),
+];
+
 /// ショートカットをメニュー表示用の文字列にする。
 /// macOS は VS Code と同じ記号表記 (⌃⌥⇧⌘ + キー)、他 OS は "Ctrl+Shift+P" 形式。
 pub fn format_shortcut(sc: KeyboardShortcut) -> String {
@@ -535,7 +823,10 @@ mod tests {
         assert_eq!(parse_shortcut("ctrl+backtick"), parse_shortcut("ctrl+`"));
         // F13 以降 (macOS で輝度/音量キーと競合しない) もバインドできる
         assert_eq!(parse_shortcut("f13"), Some(sc(Modifiers::NONE, Key::F13)));
-        assert_eq!(parse_shortcut("cmd+f20"), Some(sc(Modifiers::COMMAND, Key::F20)));
+        assert_eq!(
+            parse_shortcut("cmd+f20"),
+            Some(sc(Modifiers::COMMAND, Key::F20))
+        );
         assert_eq!(parse_shortcut("f21"), None);
     }
 
@@ -546,7 +837,10 @@ mod tests {
             Some(sc(Modifiers::ALT, Key::ArrowUp))
         );
         // option は alt の別名
-        assert_eq!(parse_shortcut("option+down"), Some(sc(Modifiers::ALT, Key::ArrowDown)));
+        assert_eq!(
+            parse_shortcut("option+down"),
+            Some(sc(Modifiers::ALT, Key::ArrowDown))
+        );
     }
 
     #[test]
@@ -584,7 +878,10 @@ mod tests {
 
     #[test]
     fn parse_space() {
-        assert_eq!(parse_shortcut("space"), Some(sc(Modifiers::NONE, Key::Space)));
+        assert_eq!(
+            parse_shortcut("space"),
+            Some(sc(Modifiers::NONE, Key::Space))
+        );
         assert_eq!(
             parse_shortcut("cmd+space"),
             Some(sc(Modifiers::COMMAND, Key::Space))
@@ -816,28 +1113,353 @@ mod tests {
     #[test]
     fn every_action_has_a_config_name() {
         let names = [
-            "save", "save_as", "close_tab", "new_file", "new_window", "palette_files",
-            "palette_commands", "toggle_terminal", "toggle_sidebar", "find", "toggle_cockpit",
-            "toggle_kanban", "toggle_deck", "toggle_md_preview", "new_agent", "font_inc",
+            "save",
+            "save_as",
+            "close_tab",
+            "new_file",
+            "new_window",
+            "palette_files",
+            "palette_commands",
+            "toggle_terminal",
+            "toggle_sidebar",
+            "find",
+            "toggle_cockpit",
+            "toggle_kanban",
+            "toggle_deck",
+            "toggle_md_preview",
+            "new_agent",
+            "font_inc",
             "font_dec",
-            "toggle_comment", "duplicate_line", "move_line_up", "move_line_down",
-            "focus_explorer", "open_file", "save_all", "goto_line", "next_tab", "prev_tab",
-            "global_search", "global_replace", "open_replace", "new_terminal", "nav_back",
-            "nav_forward", "goto_definition", "goto_bracket", "run_build_task",
-            "toggle_problems", "toggle_fullscreen", "toggle_fold", "unfold_all",
-            "toggle_bookmark", "reopen_closed_tab", "lsp_completion", "lsp_references",
-            "lsp_symbols", "lsp_rename", "lsp_format", "select_next_occurrence",
+            "toggle_comment",
+            "duplicate_line",
+            "move_line_up",
+            "move_line_down",
+            "focus_explorer",
+            "open_file",
+            "save_all",
+            "goto_line",
+            "next_tab",
+            "prev_tab",
+            "global_search",
+            "global_replace",
+            "open_replace",
+            "new_terminal",
+            "nav_back",
+            "nav_forward",
+            "goto_definition",
+            "goto_bracket",
+            "run_build_task",
+            "toggle_problems",
+            "toggle_fullscreen",
+            "toggle_fold",
+            "unfold_all",
+            "toggle_bookmark",
+            "reopen_closed_tab",
+            "lsp_completion",
+            "lsp_references",
+            "lsp_symbols",
+            "lsp_rename",
+            "lsp_format",
+            "lsp_code_action",
+            "lsp_signature_help",
+            "select_next_occurrence",
+            "split_editor_right",
+            "split_editor_down",
+            "focus_pane_1",
+            "focus_pane_2",
+            "focus_pane_3",
+            "diff_next_change",
+            "diff_prev_change",
         ];
-        assert_eq!(names.len(), ALL_ACTIONS.len(), "名前表とアクション一覧の数が合わない");
-        let mut resolved: Vec<BindAction> =
-            names.iter().map(|n| Keybinds::action_from_name(n).unwrap()).collect();
+        assert_eq!(
+            names.len(),
+            ALL_ACTIONS.len(),
+            "名前表とアクション一覧の数が合わない"
+        );
+        let mut resolved: Vec<BindAction> = names
+            .iter()
+            .map(|n| Keybinds::action_from_name(n).unwrap())
+            .collect();
         for a in ALL_ACTIONS {
-            let i = resolved.iter().position(|r| *r == a).unwrap_or_else(|| {
-                panic!("{a:?} を引ける config 名が無い")
-            });
+            let i = resolved
+                .iter()
+                .position(|r| *r == a)
+                .unwrap_or_else(|| panic!("{a:?} を引ける config 名が無い"));
             resolved.remove(i);
         }
         assert!(resolved.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 「画面に書いてあることが実行できる」ことの番人
+    // ─────────────────────────────────────────────────────────────────
+
+    /// 改行を正規化したソース (Windows の CRLF チェックアウト対策)。
+    fn src_of(raw: &str) -> String {
+        raw.replace("\r\n", "\n")
+    }
+
+    /// `at` の手前 `n` バイトを、UTF-8 の境界を壊さずに取り出す。
+    /// (日本語コメントが混ざるので、素の添字スライスは panic する)
+    fn window_before(src: &str, at: usize, n: usize) -> String {
+        let start = at.saturating_sub(n);
+        String::from_utf8_lossy(&src.as_bytes()[start..at]).into_owned()
+    }
+
+    /// **全 `BindAction` が実際に消費されている**ことをソースで固定する。
+    ///
+    /// 「バインドは足したが `handle_shortcuts` に繋いでいない」= 画面には
+    /// ショートカットが出るのに押しても何も起きない、という事故の検出器。
+    /// 1 つでも欠けたら落ちる。
+    #[test]
+    fn 全アクションが消費地点に繋がっている() {
+        let src = src_of(include_str!("app.rs"));
+        let mut missing: Vec<String> = Vec::new();
+        for a in ALL_ACTIONS {
+            // 使用箇所は必ず `self.keys.get(BindAction::X)` の形なので、
+            // 閉じ括弧まで含めて照合する (Save と SaveAs の取り違え防止)。
+            let needle = format!("BindAction::{a:?})");
+            let mut found = false;
+            let mut from = 0usize;
+            while let Some(rel) = src[from..].find(&needle) {
+                let at = from + rel;
+                if window_before(&src, at, 96).contains("consume") {
+                    found = true;
+                    break;
+                }
+                from = at + needle.len();
+            }
+            if !found {
+                missing.push(format!("{a:?}"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "ショートカットを消費していない BindAction がある \
+             (画面に出ても押せない): {missing:?}"
+        );
+    }
+
+    /// ショートカットの消費は **必ず** [`consume_shortcut_compat`] を通す。
+    ///
+    /// 素の `InputState::consume_shortcut` へ戻すと ⌘⇧C / ⌘⇧V が
+    /// 二度と発火しなくなる (egui-winit がキーイベントごと捨てるため)。
+    #[test]
+    fn ショートカット消費は互換経路を通っている() {
+        let src = src_of(include_str!("app.rs"));
+        let body = src
+            .split("fn handle_shortcuts(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("handle_shortcuts がある");
+        let head = &body[..body.len().min(600)];
+        assert!(
+            head.contains("crate::keybinds::consume_shortcut_compat"),
+            "handle_shortcuts の consume が互換経路を通っていない"
+        );
+        // 素の consume_shortcut を app.rs 側で直接呼んでいないこと
+        // (compat 側の呼び出しは keybinds.rs にだけある)
+        assert!(
+            !src.contains(".consume_shortcut(&"),
+            "app.rs が素の InputState::consume_shortcut を直接呼んでいる"
+        );
+    }
+
+    /// 既定バインドが macOS の OS 予約と衝突していない。
+    #[test]
+    fn 既定バインドはシステム予約と衝突しない() {
+        let mut clashes: Vec<String> = Vec::new();
+        for a in ALL_ACTIONS {
+            let sc = default_shortcut(a);
+            for (mods, key, why) in MACOS_RESERVED {
+                if sc.logical_key == *key && sc.modifiers == *mods {
+                    clashes.push(format!("{a:?} = {} は {why}", format_shortcut(sc)));
+                }
+            }
+        }
+        assert!(
+            clashes.is_empty(),
+            "macOS が握っていてアプリに届かない打鍵を既定にしている: {clashes:?}"
+        );
+    }
+
+    /// 予約表そのものの健全性 (空でない・重複していない)。
+    #[test]
+    fn システム予約表に重複が無い() {
+        assert!(!MACOS_RESERVED.is_empty());
+        let mut seen: Vec<String> = Vec::new();
+        for (m, k, _) in MACOS_RESERVED {
+            let id = format!("{m:?}+{k:?}");
+            assert!(!seen.contains(&id), "予約表が重複している: {id}");
+            seen.push(id);
+        }
+    }
+
+    /// egui-winit に飲み込まれる既定バインドが、互換経路で拾えている。
+    ///
+    /// これが落ちるときは「画面には出るのに押しても効かない」状態。
+    #[test]
+    fn クリップボードに化ける打鍵を拾い直せる() {
+        let mut checked = 0;
+        for a in ALL_ACTIONS {
+            let sc = default_shortcut(a);
+            let Some(alias) = clipboard_alias(sc) else {
+                continue;
+            };
+            checked += 1;
+            // egui-winit が実際に積むイベント (キーイベントは積まれない)
+            let swallowed = match alias {
+                ClipboardAlias::Cut => egui::Event::Cut,
+                ClipboardAlias::Copy => egui::Event::Copy,
+                ClipboardAlias::Paste => egui::Event::Paste("x".into()),
+            };
+            let raw = egui::RawInput {
+                modifiers: sc.modifiers,
+                events: vec![swallowed],
+                ..Default::default()
+            };
+            let ctx = egui::Context::default();
+            let mut plain = false;
+            let mut compat = false;
+            let _ = ctx.run(raw, |ctx| {
+                plain = ctx.input_mut(|i| i.consume_shortcut(&sc));
+                compat = ctx.input_mut(|i| consume_shortcut_compat(i, sc));
+            });
+            assert!(
+                !plain,
+                "{a:?}: 素の consume_shortcut が拾えたなら前提が変わった"
+            );
+            assert!(compat, "{a:?} = {} を拾えていない", format_shortcut(sc));
+        }
+        assert!(
+            checked >= 2,
+            "⌘⇧C / ⌘⇧V が対象から外れている ({checked} 件)"
+        );
+    }
+
+    /// 素の ⌘C / ⌘V は横取りしない (コピー&ペーストを壊さない)。
+    #[test]
+    fn 素のクリップボード打鍵は横取りしない() {
+        for (key, ev) in [
+            (Key::C, egui::Event::Copy),
+            (Key::V, egui::Event::Paste("x".into())),
+            (Key::X, egui::Event::Cut),
+        ] {
+            let sc = KeyboardShortcut::new(Modifiers::COMMAND, key);
+            assert_eq!(clipboard_alias(sc), None, "{key:?}: 素の ⌘{key:?} は対象外");
+            let ctx = egui::Context::default();
+            let mut left = 0;
+            let _ = ctx.run(
+                egui::RawInput {
+                    modifiers: Modifiers::COMMAND,
+                    events: vec![ev],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input_mut(|i| {
+                        let _ = consume_shortcut_compat(i, sc);
+                        left = i.events.len();
+                    });
+                },
+            );
+            assert_eq!(left, 1, "{key:?}: クリップボードイベントを食べてしまった");
+        }
+    }
+
+    /// ⌘⇧C は「キーイベントとして届けば」ちゃんと発火する。
+    ///
+    /// = アプリ側の配線 (handle_shortcuts → Cmd::ToggleCockpit) は正しく、
+    ///   効かない原因はイベントが届かないことだけ、という切り分けの固定。
+    #[test]
+    fn キーイベントとして届けば発火する() {
+        let sc = default_shortcut(BindAction::ToggleCockpit);
+        let ctx = egui::Context::default();
+        let mut fired = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: sc.modifiers,
+                events: vec![egui::Event::Key {
+                    key: Key::C,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: sc.modifiers,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                fired = ctx.input_mut(|i| consume_shortcut_compat(i, sc));
+            },
+        );
+        assert!(fired, "キーイベントが届けば ⌘⇧C は消費できる");
+    }
+
+    /// UI に出るショートカット文字列をベタ書きしていない。
+    ///
+    /// ベタ書きは (1) 再割り当てで嘘になり (2) Windows/Linux で表記が違う、
+    /// の二重の嘘になる。許す例外は理由付きでここに並べる。
+    #[test]
+    fn 画面のショートカット表記をベタ書きしていない() {
+        // 修飾キーの記号。これが文字列リテラルに出てきたら生成経路に直す。
+        const GLYPHS: [char; 4] = ['⌘', '⌥', '⌃', '⇧'];
+        // 例外 (どれも「キーバインド表に対応する行動が無い」もの)。
+        const ALLOWED: &[&str] = &[
+            // アイコン/ラベルとしての記号 (打鍵の案内ではない)
+            "\"⌘\"",
+            // マウス操作の案内 (BindAction を持たない)
+            "Ctrl/⌘+スクロール",
+            "⌘スクロール",
+            // OS/フレームワークが固定で持つ打鍵 (キーバインド表に無い)。
+            // どれも `h(mac, other)` で OS 分岐済み。
+            "⌘V",
+            "⌘X",
+            "⌘C",
+            // エージェント入力欄の送信キー (`panels::send_hint` が OS で書き分け)
+            "⌘+Enter",
+            "⌘⌫",
+            "⌘↓",
+            "⌥⌘C",
+            "⇧⌥⌘C",
+        ];
+        let files: [(&str, &str); 7] = [
+            ("app.rs", include_str!("app.rs")),
+            ("menu_bar.rs", include_str!("menu_bar.rs")),
+            ("palette.rs", include_str!("palette.rs")),
+            ("tutorial.rs", include_str!("tutorial.rs")),
+            ("panels.rs", include_str!("panels.rs")),
+            ("terminal.rs", include_str!("terminal.rs")),
+            ("file_tree.rs", include_str!("file_tree.rs")),
+        ];
+        let mut bad: Vec<String> = Vec::new();
+        for (name, raw) in files {
+            let src = src_of(raw);
+            for line in src.lines() {
+                // 期待値として記号を書くテストは対象外
+                if line.contains("assert") {
+                    continue;
+                }
+                if !line.contains('"') || !line.chars().any(|c| GLYPHS.contains(&c)) {
+                    continue;
+                }
+                let (a, b) = match (line.find('"'), line.rfind('"')) {
+                    (Some(a), Some(b)) if b > a => (a, b),
+                    _ => continue,
+                };
+                let lit = &line[a..=b];
+                if !lit.chars().any(|c| GLYPHS.contains(&c)) {
+                    continue;
+                }
+                if ALLOWED.iter().any(|a| lit.contains(a)) {
+                    continue;
+                }
+                bad.push(format!("{name}: {}", line.trim()));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "ショートカット表記がベタ書きされている \
+             (fmt_key / format_shortcut から生成すること):\n{}",
+            bad.join("\n")
+        );
     }
 
     #[test]

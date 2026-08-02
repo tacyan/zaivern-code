@@ -9,6 +9,7 @@ use eframe::egui;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 use crate::i18n::{tr, trf};
+use crate::keybinds::{key_hint, BindAction};
 use crate::lockx::lock_ok;
 use crate::theme::Theme;
 
@@ -332,6 +333,8 @@ pub struct Session {
     /// 現在の意味的画面ハッシュ。スピナー・経過秒・カウンタの揺れは
     /// 正規化済みなので、変化 = 本当に新しい出力 (scan_attention の周期で更新)。
     cur_hash: u64,
+    /// 1 つ前のスキャン時点の `cur_hash`。「出力が進んでいるか」の裏取り用。
+    prev_hash: u64,
     /// 手動の「あとで見る」ピン。フォーカスを当て直す (acknowledge) まで未読扱い。
     pub pinned_unread: bool,
     /// レート制限/使用上限の警告が画面に出ているとき、その行。
@@ -339,6 +342,13 @@ pub struct Session {
     pub rate_limited: Option<String>,
     /// レート制限警告を連続で見失った回数 (2 回で解除。1 回では画面遷移の瞬きと区別できない)。
     rl_miss: u8,
+    /// レート制限警告が**同じまま**続けて見えた回数。画面由来の判定は
+    /// 単発では信じないので、裏取り (`failover::confirm_screen`) の材料にする。
+    rl_hits: u8,
+    /// 直近にこのセッションへ投げた「プロンプト」の本文。
+    /// フェイルオーバーで別プロファイルへ引き継ぐ材料 ([`Session::note_prompt`])。
+    /// キーストロークや承認キーは含めない。
+    pub last_prompt: Option<String>,
     /// このセッションの生ログの書き出し先 (再起動時の引き継ぎ・UI 表示用)。
     pub log_path: Option<PathBuf>,
 }
@@ -409,6 +419,13 @@ struct LogSink {
 /// 1 ファイルあたりのログ上限。超えると .old へ退避して書き直す
 /// (合計で最大 2 倍まで。直近分は必ず .log 側にある)。
 const LOG_CAP: u64 = 4 * 1024 * 1024;
+
+/// [`Session::note_prompt`] が「プロンプト」と見なす最短の文字数。
+/// これ未満は `y` / Enter / 番号キーなどの応答なので覚えない。
+const PROMPT_MIN_CHARS: usize = 4;
+
+/// 覚えておくプロンプトの最大文字数 (引き継ぎ材料。無限に太らせない)。
+const PROMPT_KEEP_CHARS: usize = 4000;
 
 impl LogSink {
     fn open(path: &Path, header: &str) -> Option<Self> {
@@ -503,7 +520,10 @@ pub fn auto_yes_reply_for(
         return Some((b"\r", "フォルダ信頼確認に「Yes」"));
     }
     // Press Enter 系の確認プロンプト
-    if text.contains("Press Enter to continue") || text.contains("Press Enter to proceed") || text.contains("Press [Enter]") {
+    if text.contains("Press Enter to continue")
+        || text.contains("Press Enter to proceed")
+        || text.contains("Press [Enter]")
+    {
         return Some((b"\r", "Enterで続行"));
     }
 
@@ -531,7 +551,12 @@ pub fn auto_yes_reply_for(
         || text.contains("Allow action")
         || text.contains("Allow file")
         || text.contains("Antigravity:");
-    if agent_approval && (text.contains("1. Yes") || text.contains("1. Allow") || text.contains("Yes, proceed") || text.contains("Yes, allow")) {
+    if agent_approval
+        && (text.contains("1. Yes")
+            || text.contains("1. Allow")
+            || text.contains("Yes, proceed")
+            || text.contains("Yes, allow"))
+    {
         return Some((b"1", "Codex/Antigravityの承認に「1」"));
     }
 
@@ -555,8 +580,8 @@ pub fn auto_yes_reply_for(
     }
 
     // 質問コンテクストが存在し、かつ番号キー「1. Yes」または「1. Allow」「1. はい」がある場合は直接選ぶ
-    if has_question_context && (
-        text.contains("1. Yes")
+    if has_question_context
+        && (text.contains("1. Yes")
             || text.contains("1. Allow")
             || text.contains("1. はい")
             || text.contains("1. 許可")
@@ -566,8 +591,8 @@ pub fn auto_yes_reply_for(
             || text.contains("1. Continue")
             || text.contains("1) Yes")
             || text.contains("(1) Yes")
-            || text.contains("[1] Yes")
-    ) {
+            || text.contains("[1] Yes"))
+    {
         return Some((b"1", "「1. Yes/Allow/はい」"));
     }
 
@@ -599,7 +624,11 @@ pub fn auto_yes_reply_for(
 
 /// 画面末尾が質問文か、あるいはプロンプト入力待ち(>, $, :)で直前行が質問文であるか判定
 fn recent_lines_has_question(text: &str) -> bool {
-    let mut non_empty_lines = text.lines().rev().map(str::trim).filter(|line| !line.is_empty());
+    let mut non_empty_lines = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
     let Some(last) = non_empty_lines.next() else {
         return false;
     };
@@ -668,7 +697,9 @@ fn is_question_line(line: &str) -> bool {
         "Overwrite?",
     ];
 
-    endings.iter().any(|ending| line.ends_with(ending) || line.contains(ending))
+    endings
+        .iter()
+        .any(|ending| line.ends_with(ending) || line.contains(ending))
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -824,7 +855,9 @@ fn menu_number_hint(text: &str) -> bool {
         .filter(|l| parse_option_line(l).is_none())
         .any(|l| {
             let lc = crate::supervisor::strip_ansi(l).to_lowercase();
-            crate::agents::MENU_NUMBER_HINTS.iter().any(|h| lc.contains(h))
+            crate::agents::MENU_NUMBER_HINTS
+                .iter()
+                .any(|h| lc.contains(h))
                 || crate::agents::MENU_RANGE_OPENERS.iter().any(|o| {
                     lc.split(o)
                         .skip(1)
@@ -918,7 +951,10 @@ pub fn numbered_menu_reply(text: &str) -> Option<(&'static [u8], &'static str)> 
     }
     let lc_all = crate::supervisor::strip_ansi(text).to_lowercase();
     // 矢印キーで選ぶ UI に数字を送らない (Enter 確定の CLI が別途処理する)。
-    if crate::agents::MENU_ARROW_HINTS.iter().any(|h| lc_all.contains(h)) {
+    if crate::agents::MENU_ARROW_HINTS
+        .iter()
+        .any(|h| lc_all.contains(h))
+    {
         return None;
     }
     let opts = numbered_menu_prompt(text)?;
@@ -930,10 +966,7 @@ pub fn numbered_menu_reply(text: &str) -> Option<(&'static [u8], &'static str)> 
         .iter()
         .any(|m| lc_all.contains(m));
     let find = |f: &dyn Fn(&str) -> bool, kind: MenuPick| {
-        labels
-            .iter()
-            .find(|(_, l)| f(l))
-            .map(|(n, _)| (*n, kind))
+        labels.iter().find(|(_, l)| f(l)).map(|(n, _)| (*n, kind))
     };
     let picked = if survey {
         // アンケート/評価: ① 見送り肢 → ② それも無ければ肯定側の端。
@@ -1507,10 +1540,7 @@ impl Session {
         let exited = Arc::new(AtomicBool::new(false));
         let exit_code: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| e.to_string())?;
+        let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
         // PTY への書き込みは専用スレッドに任せる (PtyWriter の説明を参照)。
         // 送り手 (UI スレッド / 読取スレッド) が全員居なくなると recv が切れて畳まれる。
@@ -1679,9 +1709,12 @@ impl Session {
             report_bg,
             seen_hash: 0,
             cur_hash: 0,
+            prev_hash: 0,
             pinned_unread: false,
             rate_limited: None,
             rl_miss: 0,
+            rl_hits: 0,
+            last_prompt: None,
             log_path: spec.log_path,
         })
     }
@@ -1751,6 +1784,8 @@ impl Session {
         self.last_scan = Instant::now();
         let text = lock_ok(&self.parser).screen().contents();
         // 未読判定用: 意味的な画面ハッシュを更新する (スピナー等の揺れは無視)。
+        // 直前のスキャン時の値を控えてから更新する (`output_advanced` の材料)。
+        self.prev_hash = self.cur_hash;
         self.cur_hash = semantic_hash(&text);
         // レート制限の「継続 / 解除」の追跡。新規検知の確定は末尾で行う
         // (承認イベントと同時のときは承認を優先し、通知を次回スキャンへ持ち越すため)。
@@ -1760,12 +1795,14 @@ impl Session {
                 Some(line) => {
                     self.rate_limited = Some(line.clone());
                     self.rl_miss = 0;
+                    self.rl_hits = self.rl_hits.saturating_add(1);
                 }
                 None => {
                     self.rl_miss += 1;
                     if self.rl_miss >= 2 {
                         self.rate_limited = None;
                         self.rl_miss = 0;
+                        self.rl_hits = 0;
                     }
                 }
             }
@@ -1789,7 +1826,11 @@ impl Session {
             || numbered_menu_prompt(&text).is_some();
         // 応答済みエピソードの追跡: プロンプトが画面から消えた、または指紋が
         // 変わった(連続承認キューの次のダイアログ等)ら「応答済み」を下ろす。
-        let sig = if present { Some(prompt_signature(&text)) } else { None };
+        let sig = if present {
+            Some(prompt_signature(&text))
+        } else {
+            None
+        };
         if self.answered_sig.is_some() && self.answered_sig != sig {
             self.answered_sig = None;
             self.auto_stall_since = None;
@@ -1842,10 +1883,40 @@ impl Session {
             if let Some(line) = rl_detect {
                 self.rate_limited = Some(line.clone());
                 self.rl_miss = 0;
+                self.rl_hits = 1;
                 return Some(Attention::RateLimited(line));
             }
         }
         None
+    }
+
+    /// 上限警告が**同じまま**続けて見えている回数。
+    /// 画面由来の判定を信じてよいかの裏取り (`failover::confirm_screen`) に使う。
+    pub fn rate_limit_hits(&self) -> u8 {
+        self.rl_hits
+    }
+
+    /// 直近のスキャンからこのスキャンまでに、意味的な画面内容が動いたか。
+    ///
+    /// スピナー・経過秒・カウンタは `semantic_hash` が潰しているので、
+    /// true = **本当に出力が進んでいる**。「止まっているから異常」の裏取りに使う
+    /// (画面テキストの部分一致だけで異常と決めないための材料)。
+    pub fn output_advanced(&self) -> bool {
+        self.cur_hash != self.prev_hash
+    }
+
+    /// このセッションへ投げた「プロンプト」の本文を覚える。
+    ///
+    /// フェイルオーバーで別プロファイルのセッションへ引き継ぐための材料。
+    /// キーストローク・承認キー (`\r` や `\u{1b}` 単体) は覚えない。
+    pub fn note_prompt(&mut self, text: &str) {
+        let t = text
+            .trim_matches(|c: char| c.is_control() || c.is_whitespace())
+            .trim();
+        if t.chars().count() < PROMPT_MIN_CHARS {
+            return;
+        }
+        self.last_prompt = Some(t.chars().take(PROMPT_KEEP_CHARS).collect());
     }
 
     /// 未読か。「最後に見た時点から意味的な画面内容が変わった」または手動ピン。
@@ -1923,9 +1994,7 @@ impl Session {
     /// Neovim はこれで背景の明暗を判定し 'background' を決める。
     #[allow(dead_code)] // TODO(app.rs 連携): テーマ色を渡すまで未使用
     pub fn set_report_colors(&self, fg: egui::Color32, bg: egui::Color32) {
-        let pack = |c: egui::Color32| {
-            ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32
-        };
+        let pack = |c: egui::Color32| ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32;
         self.report_fg.store(pack(fg), Ordering::Relaxed);
         self.report_bg.store(pack(bg), Ordering::Relaxed);
     }
@@ -2036,9 +2105,8 @@ impl Session {
         // (失敗するたびにスレッド生成のコストを払い、UI が引っかかる)。
         if self.resizer.is_none() && !self.resizer_spawn_failed {
             let weak: Weak<Mutex<Box<dyn MasterPty + Send>>> = Arc::downgrade(&self.master);
-            self.resizer = ResizeCoalescer::start(
-                format!("zv-pty-resize-{}", self.id),
-                move |rows, cols| {
+            self.resizer =
+                ResizeCoalescer::start(format!("zv-pty-resize-{}", self.id), move |rows, cols| {
                     // セッションが drop 済みなら master は消えている → 撃たずに畳む。
                     let Some(master) = weak.upgrade() else {
                         return false;
@@ -2050,8 +2118,7 @@ impl Session {
                         pixel_height: 0,
                     });
                     true
-                },
-            );
+                });
             self.resizer_spawn_failed = self.resizer.is_none();
         }
         match &self.resizer {
@@ -2206,10 +2273,7 @@ impl Session {
     pub fn wheel_modes(&self) -> (bool, bool, bool) {
         let p = lock_ok(&self.parser);
         let s = p.screen();
-        let mouse_on = !matches!(
-            s.mouse_protocol_mode(),
-            vt100::MouseProtocolMode::None
-        );
+        let mouse_on = !matches!(s.mouse_protocol_mode(), vt100::MouseProtocolMode::None);
         let sgr = matches!(
             s.mouse_protocol_encoding(),
             vt100::MouseProtocolEncoding::Sgr
@@ -2441,7 +2505,10 @@ mod tail_tests {
     #[test]
     fn tail_skips_border_and_blank_lines() {
         let screen = "✻ テストを実行中…\n╭──────╮\n│ >    │\n╰──────╯\n\n";
-        assert_eq!(super::pick_tail_lines(screen, 8, 120), vec!["✻ テストを実行中…"]);
+        assert_eq!(
+            super::pick_tail_lines(screen, 8, 120),
+            vec!["✻ テストを実行中…"]
+        );
     }
 
     #[test]
@@ -2538,7 +2605,12 @@ mod tests {
         let screen = "Agent: 変更を適用しますか？ [y/N]\n  (1) Yes\n  (2) No\n> ";
         let (bytes, desc) = auto_yes_reply(screen).unwrap();
         assert!(!bytes.is_empty());
-        assert!(desc.contains("y") || desc.contains("1") || desc.contains("Yes") || desc.contains("自動"));
+        assert!(
+            desc.contains("y")
+                || desc.contains("1")
+                || desc.contains("Yes")
+                || desc.contains("自動")
+        );
     }
 
     #[test]
@@ -2588,7 +2660,11 @@ mod tests {
     fn antigravity_real_prompts_are_confirmed_with_enter() {
         // (見出し, 肯定選択肢, 否定選択肢) — すべて agy 本体から採取した実文言。
         let cases = [
-            ("Allow access to this file?", "Yes, allow access", "No, deny access"),
+            (
+                "Allow access to this file?",
+                "Yes, allow access",
+                "No, deny access",
+            ),
             (
                 "Allow creation of this file?",
                 "Yes, allow creation",
@@ -2827,8 +2903,8 @@ mod tests {
             // 選択肢ではないもの
             ("手順:", None),
             ("2024-01-01 build finished", None),
-            ("1.", None),           // 本文が無い
-            ("0. zero", None),      // 0 始まりは選択肢ではない
+            ("1.", None),            // 本文が無い
+            ("0. zero", None),       // 0 始まりは選択肢ではない
             ("100. too many", None), // 3 桁は年号や連番ログの可能性
             ("Enter a number (1-5): ", None),
         ];
@@ -2856,12 +2932,21 @@ mod tests {
         // 「番号を打て」と言っていない番号リストはメニューではない (誤爆防止)
         let table: &[(&str, bool)] = &[
             ("手順:\n1. Yes と入力\n2. 実行", false),
-            ("ログ: 処理に 1-3 秒かかりました\n1. 前処理\n2. 本処理", false),
+            (
+                "ログ: 処理に 1-3 秒かかりました\n1. 前処理\n2. 本処理",
+                false,
+            ),
             // 「(1-5)」が選択肢の本文の中にあるだけ → メニュー扱いしない
             ("結果一覧\n1. Rate on a scale (1-5)\n2. Skip it", false),
-            ("好きな番号は?\n1. one\n2. two\nEnter a number (1-2): ", true),
+            (
+                "好きな番号は?\n1. one\n2. two\nEnter a number (1-2): ",
+                true,
+            ),
             ("Choose an option:\n1) one\n2) two", true),
-            ("どれにしますか\n1. これ\n2. あれ\n番号を入力してください: ", true),
+            (
+                "どれにしますか\n1. これ\n2. あれ\n番号を入力してください: ",
+                true,
+            ),
             ("Pick:\n[1] one\n[2] two\nSelect an option [1-2]: ", true),
             ("Pick:\n1 - one\n2 - two\nChoose 1-2", true),
         ];
@@ -3106,7 +3191,10 @@ mod tests {
         assert_eq!(shipped, Some((30, 100)), "安定後に送信サイズが出ない");
         assert!(!d.pending(), "送信済みなのに保留が残っている");
         d.retry();
-        assert!(d.pending(), "retry 後に保留が立たない (draw が回らず止まる)");
+        assert!(
+            d.pending(),
+            "retry 後に保留が立たない (draw が回らず止まる)"
+        );
         assert_eq!(
             d.on_request((30, 100)),
             Some((30, 100)),
@@ -3276,12 +3364,18 @@ mod tests {
             "区切りバナーが最後に見える: {lines:?}"
         );
         // バナーは前回分の後 (= ここから下が今回のライブ出力になる)
-        let old = lines.iter().position(|l| l.contains("前回の出力 11")).unwrap();
+        let old = lines
+            .iter()
+            .position(|l| l.contains("前回の出力 11"))
+            .unwrap();
         let banner = lines
             .iter()
             .position(|l| l.contains("前回のセッションここまで"))
             .unwrap();
-        assert!(banner > old, "バナーは再生分の末尾: old={old} banner={banner}");
+        assert!(
+            banner > old,
+            "バナーは再生分の末尾: old={old} banner={banner}"
+        );
     }
 
     #[test]
@@ -3312,7 +3406,11 @@ mod tests {
             contents.lines().next().unwrap_or("").starts_with("deep"),
             "深いスクロールバックでも読める: {contents:?}"
         );
-        assert_eq!(p.screen().rows(0, 20).count(), 5, "可視行数は画面行数のまま");
+        assert_eq!(
+            p.screen().rows(0, 20).count(),
+            5,
+            "可視行数は画面行数のまま"
+        );
         p.set_scrollback(0);
     }
 
@@ -3323,7 +3421,7 @@ mod tests {
         // スレッドが panic し、端末が黒いまま戻らなくなっていた
         // (vendor/vt100 の saved_pos クランプの回帰テスト)。
         let mut p = vt100::Parser::new(30, 80, 100);
-        p.process(b"\x1b[30;1H");   // カーソルを最下行 (30行目) へ
+        p.process(b"\x1b[30;1H"); // カーソルを最下行 (30行目) へ
         p.process(b"\x1b[?1049h"); // 代替画面へ (通常グリッドの位置を保存)
         p.set_size(12, 80); // Cockpit でファイルを開く等でペインが縮む
         p.process(b"\x1b[?1049l"); // 代替画面終了 + DECRC (保存位置を復元)
@@ -3365,8 +3463,7 @@ mod tests {
             icon: "💬".into(),
             log_path: None,
         };
-        let mut session =
-            Session::spawn(9992, spec, eframe::egui::Context::default()).unwrap();
+        let mut session = Session::spawn(9992, spec, eframe::egui::Context::default()).unwrap();
         // 画面 30 行を超える出力を直接パーサへ流し込み、スクロールバックを作る
         {
             let mut p = session.parser.lock().unwrap();
@@ -3473,7 +3570,10 @@ mod tests {
             name.is_ascii() && !name.contains(' '),
             "空白なし ASCII 名: {name}"
         );
-        assert!(name.starts_with("clip-") && name.ends_with(".png"), "{name}");
+        assert!(
+            name.starts_with("clip-") && name.ends_with(".png"),
+            "{name}"
+        );
         // image クレートで読み戻して寸法と画素が一致する
         let img = image::open(&path).unwrap().to_rgba8();
         assert_eq!((img.width(), img.height()), (3, 2));
@@ -3771,8 +3871,7 @@ mod tests {
             env: HashMap::new(),
             log_path: None,
         };
-        let mut s =
-            Session::spawn(999, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut s = Session::spawn(999, spec, eframe::egui::Context::default()).expect("PTY起動");
 
         // 1) プロンプト検知で attention が立つ(= ペットバブルの表示条件)
         //    scan_attention は起動から900msスロットルされるためポーリングで待つ
@@ -3832,8 +3931,7 @@ mod tests {
             env: HashMap::new(),
             log_path: None,
         };
-        let mut s =
-            Session::spawn(998, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut s = Session::spawn(998, spec, eframe::egui::Context::default()).expect("PTY起動");
 
         // 1) プロンプト検知で attention が立つ
         let mut detected = false;
@@ -3852,7 +3950,10 @@ mod tests {
             .approve_reply()
             .map(str::to_string)
             .unwrap_or_else(|| "\r".into());
-        assert_eq!(keys, "y\r", "Antigravityの (y/n) プロンプトには y+Enter を送るはず");
+        assert_eq!(
+            keys, "y\r",
+            "Antigravityの (y/n) プロンプトには y+Enter を送るはず"
+        );
         assert!(s.send_text(&keys), "承認キーの送信に失敗");
         s.resolve_attention();
         assert!(!s.attention);
@@ -3921,8 +4022,7 @@ mod tests {
             env: HashMap::new(),
             log_path: None,
         };
-        let mut s =
-            Session::spawn(995, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut s = Session::spawn(995, spec, eframe::egui::Context::default()).expect("PTY起動");
 
         let mut replies = 0u32;
         for _ in 0..100 {
@@ -3943,8 +4043,14 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(replies, 1, "同じプロンプトへ自動YESが再送された(Enter連打バグ)");
-        assert!(!s.attention, "応答済みの間はバブル表示条件(attention)が立たない");
+        assert_eq!(
+            replies, 1,
+            "同じプロンプトへ自動YESが再送された(Enter連打バグ)"
+        );
+        assert!(
+            !s.attention,
+            "応答済みの間はバブル表示条件(attention)が立たない"
+        );
         s.kill();
     }
 
@@ -3969,8 +4075,7 @@ mod tests {
             env: HashMap::new(),
             log_path: None,
         };
-        let mut s =
-            Session::spawn(992, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut s = Session::spawn(992, spec, eframe::egui::Context::default()).expect("PTY起動");
         s.auto_yes_resend_after = Duration::from_secs(2);
 
         // 1) 最初の自動YES
@@ -3995,7 +4100,10 @@ mod tests {
             }
         }
         assert_eq!(pet_approved, 1, "停滞 2 秒後にペット承認が実行されなかった");
-        assert!(s.auto_stall_since.is_none(), "ペット承認後も停滞監視が残った");
+        assert!(
+            s.auto_stall_since.is_none(),
+            "ペット承認後も停滞監視が残った"
+        );
 
         // 3) ペット承認後は、同じ画面が残っても再送しない
         let mut repeated = 0u32;
@@ -4030,8 +4138,7 @@ mod tests {
             env: HashMap::new(),
             log_path: None,
         };
-        let mut s =
-            Session::spawn(994, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut s = Session::spawn(994, spec, eframe::egui::Context::default()).expect("PTY起動");
 
         let mut auto_replied = false;
         for _ in 0..100 {
@@ -4048,7 +4155,10 @@ mod tests {
                 break;
             }
         }
-        assert!(auto_replied, "表示された承認選択肢へ自動YESが送られなかった");
+        assert!(
+            auto_replied,
+            "表示された承認選択肢へ自動YESが送られなかった"
+        );
 
         let mut approved = false;
         for _ in 0..100 {
@@ -4064,7 +4174,10 @@ mod tests {
                 "子プロセスがYES以外を受信した"
             );
         }
-        assert!(approved, "子プロセスが自動YESを受信して承認処理を完了しなかった");
+        assert!(
+            approved,
+            "子プロセスが自動YESを受信して承認処理を完了しなかった"
+        );
         s.kill();
     }
 
@@ -4087,8 +4200,7 @@ mod tests {
             env: HashMap::new(),
             log_path: None,
         };
-        let mut s =
-            Session::spawn(993, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut s = Session::spawn(993, spec, eframe::egui::Context::default()).expect("PTY起動");
 
         let mut needs_approval = false;
         for _ in 0..100 {
@@ -4098,7 +4210,10 @@ mod tests {
                 break;
             }
         }
-        assert!(needs_approval, "自動YESオフ時に承認待ちとして検知されなかった");
+        assert!(
+            needs_approval,
+            "自動YESオフ時に承認待ちとして検知されなかった"
+        );
         assert!(s.attention, "自動YESオフ時に承認通知条件が立たなかった");
 
         // 自動入力が誤送信されないことを、子プロセスを待たせたまま確認する。
@@ -4131,8 +4246,7 @@ mod tests {
             env: HashMap::new(),
             log_path: None,
         };
-        let mut s =
-            Session::spawn(994, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut s = Session::spawn(994, spec, eframe::egui::Context::default()).expect("PTY起動");
 
         let mut detected = false;
         for _ in 0..100 {
@@ -4184,8 +4298,7 @@ mod tests {
             env: HashMap::new(),
             log_path: None,
         };
-        let mut s =
-            Session::spawn(992, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut s = Session::spawn(992, spec, eframe::egui::Context::default()).expect("PTY起動");
 
         // 1) プロンプトが出る前の手入力は user_typed を立てるだけで、
         //    後から出る本物のプロンプトの検知を抑止しない
@@ -4243,8 +4356,7 @@ mod tests {
             env: HashMap::new(),
             log_path: None,
         };
-        let mut s =
-            Session::spawn(993, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let mut s = Session::spawn(993, spec, eframe::egui::Context::default()).expect("PTY起動");
 
         let mut detected = false;
         for _ in 0..100 {
@@ -4265,7 +4377,10 @@ mod tests {
                 break;
             }
         }
-        assert!(redetected, "指紋の異なる2つ目のプロンプトが検知されなかった");
+        assert!(
+            redetected,
+            "指紋の異なる2つ目のプロンプトが検知されなかった"
+        );
         s.kill();
     }
 
@@ -4328,7 +4443,10 @@ mod tests {
             screen.contains("履歴は失われています"),
             "作り直しのバナーが画面に出ていない: {screen}"
         );
-        assert!(!s.parser.is_poisoned(), "毒が落ちていない (毎フレーム作り直す)");
+        assert!(
+            !s.parser.is_poisoned(),
+            "毒が落ちていない (毎フレーム作り直す)"
+        );
 
         // 2 回目は何も起きない (バナーの連発・履歴の再消失をしない)。
         s.parser_rebuilt_notice = None;
@@ -4367,7 +4485,13 @@ mod tests {
         use std::time::Duration;
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(100));
-            if s.parser.lock().unwrap().screen().contents().contains(needle) {
+            if s.parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains(needle)
+            {
                 return;
             }
         }
@@ -4388,7 +4512,10 @@ mod tests {
         // 900ms 未満: プロンプトが画面に見えていても None のまま。
         // cur_hash (未読判定用の意味的ハッシュ) もスロットル中は更新されない。
         s.last_scan = Instant::now();
-        assert!(s.scan_attention(false).is_none(), "スロットル中に検出された");
+        assert!(
+            s.scan_attention(false).is_none(),
+            "スロットル中に検出された"
+        );
         assert_eq!(s.cur_hash, 0, "スロットル中に cur_hash が更新された");
         assert!(!s.attention);
 
@@ -4404,7 +4531,10 @@ mod tests {
             "境界通過のスキャンで検出されなかった"
         );
         assert!(s.attention);
-        assert_ne!(s.cur_hash, 0, "採用されたスキャンで cur_hash が更新されるはず");
+        assert_ne!(
+            s.cur_hash, 0,
+            "採用されたスキャンで cur_hash が更新されるはず"
+        );
         s.kill();
     }
 
@@ -4420,7 +4550,10 @@ mod tests {
 
         // 窓の起点は「最後に採用されたスキャン」。弾かれた試行では動かない。
         s.last_scan = Instant::now() - Duration::from_millis(500);
-        assert!(s.scan_attention(false).is_none(), "500ms 経過では弾かれるはず");
+        assert!(
+            s.scan_attention(false).is_none(),
+            "500ms 経過では弾かれるはず"
+        );
         std::thread::sleep(Duration::from_millis(500));
         // 起点から計 ~1000ms。もし弾かれた試行が last_scan を更新していたら
         // まだ ~500ms しか経っていないことになり None のままになる。
@@ -4558,7 +4691,10 @@ mod tests {
 
         // 4) ペット承認直後は再発火しない
         s.last_scan = Instant::now() - Duration::from_millis(900);
-        assert!(s.scan_attention(true).is_none(), "ペット承認直後に二重発火した");
+        assert!(
+            s.scan_attention(true).is_none(),
+            "ペット承認直後に二重発火した"
+        );
 
         // 5) さらに間隔が経っても同じプロンプトには再発火しない
         let mut third = false;
@@ -4603,7 +4739,14 @@ mod tests {
         let mut gone = false;
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(100));
-            if !s.parser.lock().unwrap().screen().contents().contains("(y/n)") {
+            if !s
+                .parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("(y/n)")
+            {
                 gone = true;
                 break;
             }
@@ -4618,7 +4761,10 @@ mod tests {
             s.scan_attention(false).is_none(),
             "画面外へ流れたプロンプトでイベントが出た"
         );
-        assert!(!s.attention, "画面外に流れたプロンプトの承認待ちが解除されなかった");
+        assert!(
+            !s.attention,
+            "画面外に流れたプロンプトの承認待ちが解除されなかった"
+        );
 
         // 4) 以後も再検出しない (画面に見えないものは検出対象外)
         for _ in 0..5 {
@@ -4761,8 +4907,7 @@ mod tests {
             assert!(
                 !s.launched_bypass,
                 "Ask モードなのに bypass 起動と判定: {} -> {}",
-                bin,
-                cmd
+                bin, cmd
             );
             s.kill();
         }
@@ -4775,7 +4920,11 @@ mod tests {
         for (i, bin) in ["opencode", "copilot", "amp", "mimo"].iter().enumerate() {
             let cmd = apply_approval(bin, Approval::Auto);
             let mut s = probe_session(9500 + i as u64, &cmd);
-            assert!(s.launched_bypass, "Auto モードが bypass 判定されない: {}", cmd);
+            assert!(
+                s.launched_bypass,
+                "Auto モードが bypass 判定されない: {}",
+                cmd
+            );
             s.kill();
         }
     }
@@ -4795,7 +4944,11 @@ mod tests {
 
             let ask = merged_env(bin, Approval::Ask, &empty);
             let mut s = probe_session_env(9610 + i as u64, bin, ask);
-            assert!(!s.launched_bypass, "{} の Ask が bypass 判定されている", bin);
+            assert!(
+                !s.launched_bypass,
+                "{} の Ask が bypass 判定されている",
+                bin
+            );
             s.kill();
         }
     }
@@ -4812,12 +4965,18 @@ mod tests {
             s.auto_yes_target(true),
             "Ask 起動でも pet_auto_yes オンなら自動YESの対象"
         );
-        assert!(!s.auto_yes_target(false), "pet_auto_yes オフでは自動応答しない");
+        assert!(
+            !s.auto_yes_target(false),
+            "pet_auto_yes オフでは自動応答しない"
+        );
         s.kill();
 
         // カタログ外の素のコマンドは対象外(y/n プロンプトへ誤爆しない)
         let mut sh = probe_session(9701, "sleep 1");
-        assert!(!sh.auto_yes_target(true), "カタログ外セッションは自動YESの対象外");
+        assert!(
+            !sh.auto_yes_target(true),
+            "カタログ外セッションは自動YESの対象外"
+        );
         sh.kill();
     }
 }
@@ -4960,9 +5119,7 @@ fn build_command(command: &str, cwd: &Path, env: &HashMap<String, String>) -> Co
         let command = command.trim();
         if !command.is_empty() {
             let expanded = expand_windows_env_refs(command, &|name: &str| {
-                env.get(name)
-                    .cloned()
-                    .or_else(|| std::env::var(name).ok())
+                env.get(name).cloned().or_else(|| std::env::var(name).ok())
             });
             cmd.env(WINDOWS_CMD_ENV, expanded);
         }
@@ -5067,7 +5224,10 @@ fn terminal_search_bar_ui(
     rect: egui::Rect,
 ) {
     let area_id = egui::Id::new(("zv-term-search", session.id));
-    let pos = egui::pos2((rect.right() - 330.0).max(rect.left() + 4.0), rect.top() + 6.0);
+    let pos = egui::pos2(
+        (rect.right() - 330.0).max(rect.left() + 4.0),
+        rect.top() + 6.0,
+    );
     egui::Area::new(area_id)
         .fixed_pos(pos)
         .order(egui::Order::Foreground)
@@ -5083,9 +5243,8 @@ fn terminal_search_bar_ui(
                         te.request_focus();
                         session.search.focus_pending = false;
                     }
-                    let (enter, shift) = ui.input(|i| {
-                        (i.key_pressed(egui::Key::Enter), i.modifiers.shift)
-                    });
+                    let (enter, shift) =
+                        ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
                     if te.lost_focus() && enter {
                         // Enter = 前 (古い方) へ / Shift+Enter = 次 (新しい方) へ
                         session.search_step(shift);
@@ -5168,7 +5327,9 @@ fn paint_search_highlights(
         let mut chars: Vec<char> = Vec::new();
         let mut colmap: Vec<(u16, u16)> = Vec::new();
         for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else { continue };
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
             if cell.is_wide_continuation() {
                 continue;
             }
@@ -5326,7 +5487,11 @@ fn selection_text(screen: &vt100::Screen, sel: ((u16, u16), (u16, u16))) -> Stri
             out.push('\n');
         }
         let c0 = if r == s.0 { s.1 } else { 0 };
-        let c1 = if r == e.0 { e.1.min(last_col) } else { last_col };
+        let c1 = if r == e.0 {
+            e.1.min(last_col)
+        } else {
+            last_col
+        };
         let mut line = String::new();
         for c in c0..=c1 {
             let Some(cell) = screen.cell(r, c) else {
@@ -5470,7 +5635,8 @@ fn input_area_selection(screen: &vt100::Screen) -> Option<InputAreaSel> {
                 i += 1;
             }
         }
-        if i >= cs.len() || !matches!(cs[i], '›' | '❯' | '▸' | '▶' | '▌' | '>' | '$' | '%') {
+        if i >= cs.len() || !matches!(cs[i], '›' | '❯' | '▸' | '▶' | '▌' | '>' | '$' | '%')
+        {
             return None;
         }
         if i + 1 < cs.len() && cs[i + 1] != ' ' {
@@ -5616,9 +5782,7 @@ fn handle_mouse_selection(
         }
     }
     if response.dragged_by(egui::PointerButton::Primary) {
-        if let (Some(anchor), Some(pos)) =
-            (session.sel_anchor, response.interact_pointer_pos())
-        {
+        if let (Some(anchor), Some(pos)) = (session.sel_anchor, response.interact_pointer_pos()) {
             session.selection = Some((anchor, to_cell(pos)));
         }
     }
@@ -5987,9 +6151,7 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
         &mut session.preedit,
         caps,
         || input_area_selection(lock_ok(&parser).screen()),
-        || {
-            clipboard_image_to_png().map(|png| format!("@{} ", prompt_path(&png, &cwd)))
-        },
+        || clipboard_image_to_png().map(|png| format!("@{} ", prompt_path(&png, &cwd))),
     );
     if !out.is_empty() {
         // 人が打った分は音声入力の書き込み追跡とずれるので印を立てる。
@@ -6159,8 +6321,7 @@ fn draw_screen(
                 continue;
             }
             let w = cell_w * f32::from(cell_draw_cols(screen, r, cix));
-            let cell_rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, cell_h));
+            let cell_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, cell_h));
 
             let mut fg = cell_color(theme, cell.fgcolor(), true);
             let mut bg = match cell.bgcolor() {
@@ -6267,10 +6428,7 @@ fn draw_screen(
         // 扱うので、そのままでも文字は端末へ入る。
         ui.ctx().output_mut(|o| {
             o.mutable_text_under_cursor = true;
-            o.ime = Some(egui::output::IMEOutput {
-                rect,
-                cursor_rect,
-            });
+            o.ime = Some(egui::output::IMEOutput { rect, cursor_rect });
         });
 
         // IME 変換中の未確定文字列をカーソル位置にオーバーレイ表示。
@@ -6281,13 +6439,10 @@ fn draw_screen(
         // 場所取りに使い、端末の右端を越えるぶんだけ左へ寄せる
         // (寄せないと隣のパネルの上に未確定文字列が流れ出す)。
         if !session.preedit.is_empty() {
-            let galley = painter.layout_no_wrap(
-                session.preedit.clone(),
-                font_id.clone(),
-                theme.term_fg,
-            );
-            let want = (crate::textenc::str_width(&session.preedit) as f32 * cell_w)
-                .max(galley.size().x);
+            let galley =
+                painter.layout_no_wrap(session.preedit.clone(), font_id.clone(), theme.term_fg);
+            let want =
+                (crate::textenc::str_width(&session.preedit) as f32 * cell_w).max(galley.size().x);
             let left = rect.min.x + padding;
             let right = rect.max.x - padding;
             let x = cursor_rect.min.x.min((right - want).max(left));
@@ -6378,8 +6533,7 @@ pub fn draw(
     }
     // ドラッグ中はドロップ先が分かるよう枠を光らせる
     let dragging_file = response.dnd_hover_payload::<PathBuf>().is_some()
-        || (ui.input(|i| !i.raw.hovered_files.is_empty())
-            && ui.rect_contains_pointer(rect));
+        || (ui.input(|i| !i.raw.hovered_files.is_empty()) && ui.rect_contains_pointer(rect));
     if dragging_file {
         ui.painter()
             .rect_stroke(rect, 6.0, egui::Stroke::new(2.0_f32, theme.accent));
@@ -6465,11 +6619,9 @@ pub fn draw(
         );
         let r = ui.put(
             btn_rect,
-            egui::Button::new(
-                egui::RichText::new(label).size(11.0).color(theme.term_bg),
-            )
-            .fill(theme.warn)
-            .rounding(4.0),
+            egui::Button::new(egui::RichText::new(label).size(11.0).color(theme.term_bg))
+                .fill(theme.warn)
+                .rounding(4.0),
         );
         if r.on_hover_text(tr("クリックで履歴表示を終了して一番下(最新)へ戻る"))
             .clicked()
@@ -6501,8 +6653,18 @@ pub fn draw(
     if interactive {
         response.context_menu(|ui| {
             let has_sel = session.selection.is_some();
+            // 打鍵の表記はベタ書きしない。コピーは egui-winit 固定の打鍵、
+            // 検索は再割り当てできるので app 側が配った表記を使う。
+            let copy_key = crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::C,
+            ));
+            let find_key = key_hint(ui.ctx(), BindAction::Find);
             if ui
-                .add_enabled(has_sel, egui::Button::new(tr("📋 選択をコピー (⌘C)")))
+                .add_enabled(
+                    has_sel,
+                    egui::Button::new(trf("📋 選択をコピー ({key})", &[("key", copy_key)])),
+                )
                 .clicked()
             {
                 copy_selection(ui, session);
@@ -6514,7 +6676,10 @@ pub fn draw(
                 session.copied_at = Some(Instant::now());
                 ui.close_menu();
             }
-            if ui.button(tr("🔍 端末内を検索 (⌘F)")).clicked() {
+            if ui
+                .button(trf("🔍 端末内を検索 ({key})", &[("key", find_key)]))
+                .clicked()
+            {
                 session.search.open = true;
                 session.search.focus_pending = true;
                 ui.close_menu();
@@ -6616,8 +6781,18 @@ mod reap_tests {
         // (exited, child_pid, 期待, 説明)
         let cases = [
             (false, Some(42), Some(42), "生きている子は撃ってよい"),
-            (true, Some(42), None, "終了済み → PID 再利用の巻き添え防止で撃たない"),
-            (false, None, None, "PID 不明なら木は辿れない (killer の保険のみ)"),
+            (
+                true,
+                Some(42),
+                None,
+                "終了済み → PID 再利用の巻き添え防止で撃たない",
+            ),
+            (
+                false,
+                None,
+                None,
+                "PID 不明なら木は辿れない (killer の保険のみ)",
+            ),
             (true, None, None, "終了済み + PID 不明も当然撃たない"),
         ];
         for (exited, pid, want, why) in cases {
@@ -6693,7 +6868,11 @@ mod pty_writer_tests {
         let mut seen = false;
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));
-            if lock_ok(&s.parser).screen().contents().contains("ZAIVERNPING") {
+            if lock_ok(&s.parser)
+                .screen()
+                .contents()
+                .contains("ZAIVERNPING")
+            {
                 seen = true;
                 break;
             }
@@ -6855,7 +7034,11 @@ mod reap_pty_tests {
                 break false;
             }
         };
-        assert!(quiet, "閉じたのに孫プロセスが書き続けている: {}", probe.display());
+        assert!(
+            quiet,
+            "閉じたのに孫プロセスが書き続けている: {}",
+            probe.display()
+        );
     }
 
     /// [`reap`] / [`abandon`] を通さず **drop しただけ**でも孫まで止まること
@@ -6916,7 +7099,10 @@ mod shell_args_tests {
     /// 素のシェルは `/K` — `/C` だと chcp 直後に cmd が終わって端末が即閉じる。
     #[test]
     fn plain_shell_keeps_running() {
-        assert_eq!(windows_shell_args(false), vec!["/K", "chcp 65001 >nul 2>nul"]);
+        assert_eq!(
+            windows_shell_args(false),
+            vec!["/K", "chcp 65001 >nul 2>nul"]
+        );
     }
 
     /// `%NAME%` は自分で解決する (環境変数経由では cmd が二度目の展開をしないため)。
@@ -7067,7 +7253,10 @@ mod query_tests {
     fn secondary_and_tertiary_da() {
         assert_eq!(replies(&scan1(b"\x1b[>c")), b"\x1b[>0;95;0c".to_vec());
         assert_eq!(replies(&scan1(b"\x1b[>0c")), b"\x1b[>0;95;0c".to_vec());
-        assert_eq!(replies(&scan1(b"\x1b[=c")), b"\x1bP!|00000000\x1b\\".to_vec());
+        assert_eq!(
+            replies(&scan1(b"\x1b[=c")),
+            b"\x1bP!|00000000\x1b\\".to_vec()
+        );
     }
 
     #[test]
@@ -7102,22 +7291,25 @@ mod query_tests {
         let r = replies(&scan1(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"));
         assert_eq!(r, b"\x1b_Gi=31;ENOTSUPPORTED\x1b\\".to_vec());
         // q=2 (応答不要) のときは黙る
-        assert_eq!(replies(&scan1(b"\x1b_Gi=7,q=2,a=q;AA\x1b\\")), Vec::<u8>::new());
+        assert_eq!(
+            replies(&scan1(b"\x1b_Gi=7,q=2,a=q;AA\x1b\\")),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
     fn decscusr_all_ps_values() {
         use CursorShape::*;
         let cases: &[(&[u8], CursorShape)] = &[
-            (b"\x1b[ q", Block),      // 引数省略 = 既定
+            (b"\x1b[ q", Block), // 引数省略 = 既定
             (b"\x1b[0 q", Block),
             (b"\x1b[1 q", Block),     // 点滅ブロック
             (b"\x1b[2 q", Block),     // 固定ブロック
             (b"\x1b[3 q", Underline), // 点滅アンダーライン
             (b"\x1b[4 q", Underline),
-            (b"\x1b[5 q", Bar),       // 点滅バー (nvim/helix の挿入モード)
+            (b"\x1b[5 q", Bar), // 点滅バー (nvim/helix の挿入モード)
             (b"\x1b[6 q", Bar),
-            (b"\x1b[9 q", Block),     // 未知の値はブロックへ倒す
+            (b"\x1b[9 q", Block), // 未知の値はブロックへ倒す
         ];
         for (seq, want) in cases {
             assert_eq!(
@@ -7217,10 +7409,10 @@ mod query_tests {
     fn osc52_decodes_all_padding_variants() {
         // 余り0 / 余り2文字(==) / 余り3文字(=) の3パターン
         let cases: &[(&[u8], &str)] = &[
-            (b"\x1b]52;c;YWJjZGVm\x07", "abcdef"),     // 6byte, パディング無し
-            (b"\x1b]52;c;YQ==\x07", "a"),              // "=="
-            (b"\x1b]52;c;YWI=\x07", "ab"),             // "="
-            (b"\x1b]52;c;\x07", ""),                   // 空(何も起きない, 下で確認)
+            (b"\x1b]52;c;YWJjZGVm\x07", "abcdef"), // 6byte, パディング無し
+            (b"\x1b]52;c;YQ==\x07", "a"),          // "=="
+            (b"\x1b]52;c;YWI=\x07", "ab"),         // "="
+            (b"\x1b]52;c;\x07", ""),               // 空(何も起きない, 下で確認)
         ];
         for (seq, want) in &cases[..3] {
             assert_eq!(scan1(seq), vec![TermEvent::Clipboard((*want).into())]);
@@ -7252,11 +7444,11 @@ mod query_tests {
     #[test]
     fn osc52_malformed_payloads_are_dropped() {
         for bad in [
-            &b"\x1b]52;c;YWJ!\x07"[..],   // 不正な文字
-            &b"\x1b]52;c;YWJjZ\x07"[..],  // 4文字境界に1文字余る
-            &b"\x1b]52;c;=YWJj\x07"[..],  // パディングの後にデータ
-            &b"\x1b]52;c;YQ===\x07"[..],  // パディング過剰
-            &b"\x1b]52;c;/w==\x07"[..],   // 0xFF = 不正な UTF-8
+            &b"\x1b]52;c;YWJ!\x07"[..],  // 不正な文字
+            &b"\x1b]52;c;YWJjZ\x07"[..], // 4文字境界に1文字余る
+            &b"\x1b]52;c;=YWJj\x07"[..], // パディングの後にデータ
+            &b"\x1b]52;c;YQ===\x07"[..], // パディング過剰
+            &b"\x1b]52;c;/w==\x07"[..],  // 0xFF = 不正な UTF-8
         ] {
             assert_eq!(scan1(bad), vec![], "bad={:?}", String::from_utf8_lossy(bad));
         }
@@ -7285,7 +7477,10 @@ mod query_tests {
     fn osc_color_queries() {
         assert_eq!(scan1(b"\x1b]10;?\x1b\\"), vec![TermEvent::ColorQuery(10)]);
         assert_eq!(scan1(b"\x1b]11;?\x07"), vec![TermEvent::ColorQuery(11)]);
-        assert_eq!(color_report(11, 0x12141a), b"\x1b]11;rgb:1212/1414/1a1a\x1b\\".to_vec());
+        assert_eq!(
+            color_report(11, 0x12141a),
+            b"\x1b]11;rgb:1212/1414/1a1a\x1b\\".to_vec()
+        );
         // 色の「設定」(? が無い) には返事をしない
         assert_eq!(scan1(b"\x1b]11;#000000\x07"), vec![]);
     }
@@ -7294,19 +7489,15 @@ mod query_tests {
 
     #[test]
     fn ordinary_output_produces_no_replies() {
-        let evs = scan1(
-            b"\x1b[1;32mgreen\x1b[0m\r\n\x1b[2J\x1b[H\x1b[?1049h\x1b[38;2;255;0;0mred\x1b[m",
-        );
+        let evs =
+            scan1(b"\x1b[1;32mgreen\x1b[0m\r\n\x1b[2J\x1b[H\x1b[?1049h\x1b[38;2;255;0;0mred\x1b[m");
         assert_eq!(evs, vec![]);
     }
 
     #[test]
     fn garbage_escapes_do_not_desync_the_scanner() {
         // 壊れた ESC の直後の正しい問い合わせを取りこぼさない
-        assert_eq!(
-            scan1(b"\x1b[\x01\x1b[6n"),
-            vec![TermEvent::CursorReport]
-        );
+        assert_eq!(scan1(b"\x1b[\x01\x1b[6n"), vec![TermEvent::CursorReport]);
         assert_eq!(scan1(b"\x1b\x1b[6n"), vec![TermEvent::CursorReport]);
         // OSC が ST 以外の ESC で中断されても続きを読む
         assert_eq!(scan1(b"\x1b]52;c;YQ\x1b[6n"), vec![TermEvent::CursorReport]);
@@ -7507,7 +7698,11 @@ printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
             }
         }
         let gpid = gpid.expect("孫 PID が画面に出なかった");
-        assert_eq!(unsafe { libc::kill(gpid, 0) }, 0, "孫 (pid={gpid}) が起きていない");
+        assert_eq!(
+            unsafe { libc::kill(gpid, 0) },
+            0,
+            "孫 (pid={gpid}) が起きていない"
+        );
 
         drop(sess);
 
@@ -7534,7 +7729,6 @@ printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
     }
 }
 
-
 /// 画面を縮めたときに「いま描かれている内容」が消えないこと。
 ///
 /// Cockpit でファイルを開くと編集ペインが割り込んでミニターミナルの行数が減る。
@@ -7556,11 +7750,7 @@ mod resize_tests {
     }
 
     fn lines(p: &vt100::Parser) -> Vec<String> {
-        p.screen()
-            .contents()
-            .lines()
-            .map(str::to_string)
-            .collect()
+        p.screen().contents().lines().map(str::to_string).collect()
     }
 
     /// 縮めても直近の行 (カーソル側) が残ること。元実装はここで line9 を捨てていた。
@@ -7642,7 +7832,10 @@ mod resize_tests {
         p.set_size(8, 80);
         let got = lines(&p);
         for i in 0..5 {
-            assert!(got.contains(&format!("line{i}")), "line{i} が消えた: {got:?}");
+            assert!(
+                got.contains(&format!("line{i}")),
+                "line{i} が消えた: {got:?}"
+            );
         }
     }
 }
@@ -7883,7 +8076,9 @@ mod cjk_tests {
         let (_, cols) = screen.size();
         let mut out = String::new();
         for c in 0..cols {
-            let Some(cell) = screen.cell(row, c) else { continue };
+            let Some(cell) = screen.cell(row, c) else {
+                continue;
+            };
             if cell.is_wide_continuation() {
                 continue;
             }
@@ -7907,7 +8102,9 @@ mod cjk_tests {
         let (rows, cols) = screen.size();
         for r in 0..rows {
             for c in 0..cols {
-                let Some(cell) = screen.cell(r, c) else { continue };
+                let Some(cell) = screen.cell(r, c) else {
+                    continue;
+                };
                 if cell.is_wide() && c + 1 < cols {
                     let next = screen.cell(r, c + 1).expect("右隣のセル");
                     assert!(
@@ -7918,10 +8115,7 @@ mod cjk_tests {
                 if cell.is_wide_continuation() {
                     assert!(c > 0, "{what}: 継続セルが行頭にある ({r},{c})");
                     let prev = screen.cell(r, c - 1).expect("左隣のセル");
-                    assert!(
-                        prev.is_wide(),
-                        "{what}: 継続セルの左が全角でない ({r},{c})"
-                    );
+                    assert!(prev.is_wide(), "{what}: 継続セルの左が全角でない ({r},{c})");
                 }
                 // どこにあっても、描画に使う桁数は画面の右端を越えない
                 let w = super::cell_draw_cols(screen, r, c);
@@ -8033,7 +8227,9 @@ mod cjk_tests {
     #[test]
     fn resize_with_wide_chars_never_splits_or_panics() {
         let mut p = parser(6, 20);
-        p.process("日本語のテキスト\r\n한국어 텍스트\r\n中文文本\r\nascii mixed 日本\r\n".as_bytes());
+        p.process(
+            "日本語のテキスト\r\n한국어 텍스트\r\n中文文本\r\nascii mixed 日本\r\n".as_bytes(),
+        );
         // 狭める → 広げる → 極端に狭める → 戻す
         for (rows, cols) in [
             (6u16, 9u16),
@@ -8127,12 +8323,24 @@ mod cjk_tests {
         p.process("日本x".as_bytes());
         let screen = p.screen();
         assert_eq!(super::cell_draw_cols(screen, 0, 0), 2, "「日」");
-        assert_eq!(super::cell_draw_cols(screen, 0, 1), 1, "継続セル自体は 1 桁");
+        assert_eq!(
+            super::cell_draw_cols(screen, 0, 1),
+            1,
+            "継続セル自体は 1 桁"
+        );
         assert_eq!(super::cell_draw_cols(screen, 0, 2), 2, "「本」");
         assert_eq!(super::cell_draw_cols(screen, 0, 4), 1, "半角 x");
         assert_eq!(super::cell_draw_cols(screen, 0, 5), 1, "空セル");
-        assert_eq!(super::cell_draw_cols(screen, 0, 99), 1, "画面外でも落ちない");
-        assert_eq!(super::cell_draw_cols(screen, 0, u16::MAX), 1, "桁が振り切れても落ちない");
+        assert_eq!(
+            super::cell_draw_cols(screen, 0, 99),
+            1,
+            "画面外でも落ちない"
+        );
+        assert_eq!(
+            super::cell_draw_cols(screen, 0, u16::MAX),
+            1,
+            "桁が振り切れても落ちない"
+        );
     }
 
     /// 実際にカーソルが全角の上にあるとき 2 桁になること (`CUP` で置いた場合も)。
@@ -8145,7 +8353,11 @@ mod cjk_tests {
         assert_eq!(cursor_span(p.screen(), r, c), (2, 2));
         p.process(b"\x1b[1;4H"); // 「本」の右半分
         let (r, c) = p.screen().cursor_position();
-        assert_eq!(cursor_span(p.screen(), r, c), (2, 2), "右半分でも左から 2 桁");
+        assert_eq!(
+            cursor_span(p.screen(), r, c),
+            (2, 2),
+            "右半分でも左から 2 桁"
+        );
     }
 
     /// 選択範囲のコピーが全角を欠かさない・二重にしないこと。
@@ -8261,10 +8473,18 @@ mod cjk_tests {
         run(&[preedit("にほん")], &mut state);
         assert_eq!(state, "にほん");
         let plan = run(
-            &[preedit(""), egui::Event::Ime(egui::ImeEvent::Disabled), key(egui::Key::Escape)],
+            &[
+                preedit(""),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                key(egui::Key::Escape),
+            ],
             &mut state,
         );
-        assert!(plan.out.is_empty(), "取り消しで何かが送られた: {:?}", plan.out);
+        assert!(
+            plan.out.is_empty(),
+            "取り消しで何かが送られた: {:?}",
+            plan.out
+        );
         assert!(state.is_empty());
         // 変換していないときの Escape は従来どおり通る
         let plan = run(&[key(egui::Key::Escape)], &mut state);
@@ -8288,7 +8508,11 @@ mod cjk_tests {
             ],
             &mut state,
         );
-        assert_eq!(out_str(&plan), "日本語", "確定 Enter で改行を送ってはいけない");
+        assert_eq!(
+            out_str(&plan),
+            "日本語",
+            "確定 Enter で改行を送ってはいけない"
+        );
         // 次のフレームの Enter は素通し = 送信できる
         let plan = run(&[key(egui::Key::Enter)], &mut state);
         assert_eq!(plan.out, b"\r", "2 打鍵目の Enter は送信として届く");
@@ -8300,7 +8524,10 @@ mod cjk_tests {
     fn enter_before_commit_in_the_same_frame_is_also_swallowed() {
         let mut state = String::new();
         run(&[preedit("かんじ")], &mut state);
-        let plan = run(&[key(egui::Key::Enter), preedit(""), commit("漢字")], &mut state);
+        let plan = run(
+            &[key(egui::Key::Enter), preedit(""), commit("漢字")],
+            &mut state,
+        );
         assert_eq!(out_str(&plan), "漢字", "並び順に関係なく確定 Enter は飲む");
     }
 
@@ -8320,7 +8547,11 @@ mod cjk_tests {
             &[egui::Event::Text("日本語".into()), commit("日本語")],
             &mut state,
         );
-        assert_eq!(out_str(&plan), "日本語日本語", "先行 Text は素の入力として扱う");
+        assert_eq!(
+            out_str(&plan),
+            "日本語日本語",
+            "先行 Text は素の入力として扱う"
+        );
     }
 
     /// 別々の文字を確定した直後に、たまたま同じ文字を打鍵した場合は落とさない。
@@ -8344,10 +8575,18 @@ mod cjk_tests {
     fn text_events_during_composition_are_ignored() {
         let mut state = String::new();
         let plan = run(
-            &[preedit("に"), egui::Event::Text("n".into()), preedit("にほ")],
+            &[
+                preedit("に"),
+                egui::Event::Text("n".into()),
+                preedit("にほ"),
+            ],
             &mut state,
         );
-        assert!(plan.out.is_empty(), "変換中の生テキストが漏れた: {:?}", plan.out);
+        assert!(
+            plan.out.is_empty(),
+            "変換中の生テキストが漏れた: {:?}",
+            plan.out
+        );
         assert_eq!(state, "にほ");
     }
 
@@ -8410,7 +8649,10 @@ mod cjk_tests {
             let plan = translate_input(
                 &[egui::Event::Paste(text.into())],
                 &mut state,
-                InputCaps { bracketed, ..caps() },
+                InputCaps {
+                    bracketed,
+                    ..caps()
+                },
                 || None,
                 || None,
             );
@@ -8469,12 +8711,32 @@ mod cjk_tests {
     fn ime_frame_end_detection_table() {
         let cases: &[(&str, Vec<egui::Event>, bool, bool)] = &[
             ("確定あり", vec![commit("あ")], false, true),
-            ("確定あり(変換中から)", vec![preedit(""), commit("あ")], true, true),
+            (
+                "確定あり(変換中から)",
+                vec![preedit(""), commit("あ")],
+                true,
+                true,
+            ),
             ("未確定が空になった", vec![preedit("")], true, true),
-            ("変換していないのに空の未確定", vec![preedit("")], false, false),
+            (
+                "変換していないのに空の未確定",
+                vec![preedit("")],
+                false,
+                false,
+            ),
             ("変換継続", vec![preedit("にほ")], true, false),
-            ("無効化(変換中)", vec![egui::Event::Ime(egui::ImeEvent::Disabled)], true, true),
-            ("無効化(非変換)", vec![egui::Event::Ime(egui::ImeEvent::Disabled)], false, false),
+            (
+                "無効化(変換中)",
+                vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
+                true,
+                true,
+            ),
+            (
+                "無効化(非変換)",
+                vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
+                false,
+                false,
+            ),
             ("IME 無関係", vec![key(egui::Key::Enter)], false, false),
         ];
         for (what, events, composing, want) in cases {
@@ -8679,11 +8941,7 @@ fn is_split_chord(m: &egui::Modifiers, mac: bool) -> bool {
 ///
 /// これ以外 (素の文字・`Ctrl+文字`・`Alt+矢印` など) は `None` を返し、
 /// 入力はそのまま端末へ流れる。
-pub fn split_key_action(
-    key: egui::Key,
-    mods: &egui::Modifiers,
-    mac: bool,
-) -> Option<SplitAction> {
+pub fn split_key_action(key: egui::Key, mods: &egui::Modifiers, mac: bool) -> Option<SplitAction> {
     if !is_split_chord(mods, mac) {
         return None;
     }
@@ -8791,7 +9049,12 @@ fn clamp_ratio_px(r: f32, avail_px: f32) -> f32 {
 ///
 /// 3 つは**必ず `area` の内側**で、互いに重ならず、隙間なく `area` を埋める。
 /// 端数は `a` 側を floor して `b` に寄せる — 同じ入力なら常に同じ出力になる。
-fn split_area(area: egui::Rect, dir: SplitDir, ratio: f32, gutter: f32) -> (egui::Rect, egui::Rect, egui::Rect) {
+fn split_area(
+    area: egui::Rect,
+    dir: SplitDir,
+    ratio: f32,
+    gutter: f32,
+) -> (egui::Rect, egui::Rect, egui::Rect) {
     let g = gutter.max(0.0);
     match dir {
         SplitDir::Horizontal => {
@@ -8979,12 +9242,15 @@ impl SplitNode {
             }
         }
     }
-
 }
 
 /// 指定リーフを消し、親を畳む。畳んだ地点の兄弟の先頭リーフを `fallback` に残す
 /// (閉じたペインがフォーカス中だったとき、そこへフォーカスを移すため)。
-fn remove_leaf(node: SplitNode, id: SessionId, fallback: &mut Option<SessionId>) -> Option<SplitNode> {
+fn remove_leaf(
+    node: SplitNode,
+    id: SessionId,
+    fallback: &mut Option<SessionId>,
+) -> Option<SplitNode> {
     match node {
         SplitNode::Leaf(x) if x == id => None,
         SplitNode::Leaf(x) => Some(SplitNode::Leaf(x)),
@@ -9164,7 +9430,6 @@ impl SplitLayout {
         true
     }
 
-
     /// 幾何的な隣のペインへフォーカスを移す (VS Code / tmux と同じ判定)。
     ///
     /// 判定は「その向きに居る候補のうち **最も近い** もの、その中で
@@ -9264,7 +9529,6 @@ impl SplitLayout {
         *ratio = 0.5;
         changed
     }
-
 
     /// ズームのトグル。戻り値は**トグル後**の状態。
     /// ズーム中は [`Self::rects`] がフォーカス中ペイン 1 枚だけを返す。
@@ -9868,10 +10132,18 @@ fn pane_header_ui(
     let mut hit = (false, false);
     if head.width() > bh * 2.5 {
         let zoom = ui
-            .interact(zoom_r, ui.id().with(("zv-pane-zoom", id)), egui::Sense::click())
+            .interact(
+                zoom_r,
+                ui.id().with(("zv-pane-zoom", id)),
+                egui::Sense::click(),
+            )
             .on_hover_text(tr("このペインだけを大きく表示 (もう一度で戻す)"));
         let close = ui
-            .interact(close_r, ui.id().with(("zv-pane-close", id)), egui::Sense::click())
+            .interact(
+                close_r,
+                ui.id().with(("zv-pane-close", id)),
+                egui::Sense::click(),
+            )
             .on_hover_text(tr("このペインを閉じる"));
         for (r, resp, glyph) in [(zoom_r, &zoom, "◎"), (close_r, &close, "✕")] {
             let col = if resp.hovered() {
@@ -10036,8 +10308,11 @@ mod split_tests {
             rect(0.0, 0.0, 20.0, 20.0), // ガターより狭い極小
         ];
         let gutters = [0.0, 6.0, 13.0];
-        let layouts: [(&str, SplitLayout); 3] =
-            [("1枚", SplitLayout::single(7)), ("3枚", three()), ("田の字", quad())];
+        let layouts: [(&str, SplitLayout); 3] = [
+            ("1枚", SplitLayout::single(7)),
+            ("3枚", three()),
+            ("田の字", quad()),
+        ];
         for (name, l) in &layouts {
             for a in areas {
                 for g in gutters {
@@ -10146,17 +10421,16 @@ mod split_tests {
         assert_eq!(l.focus(), Some(9), "隣の列の上側へ");
     }
 
-
     #[test]
     fn resize_focused_clamps_table() {
         // (フォーカス, デルタ列, 期待比率)
         let cases: &[(u64, &[f32], f32)] = &[
-            (2, &[0.1], 0.4),                 // b 側 → 広がると ratio は減る
-            (1, &[0.1], 0.6),                 // a 側 → 増える
-            (1, &[10.0], 1.0 - MIN_RATIO),    // 上限クランプ
-            (1, &[-10.0], MIN_RATIO),         // 下限クランプ
-            (2, &[10.0], MIN_RATIO),          // b 側の上限 = a の下限
-            (1, &[0.1, 0.1, -0.2], 0.5),      // 往復
+            (2, &[0.1], 0.4),              // b 側 → 広がると ratio は減る
+            (1, &[0.1], 0.6),              // a 側 → 増える
+            (1, &[10.0], 1.0 - MIN_RATIO), // 上限クランプ
+            (1, &[-10.0], MIN_RATIO),      // 下限クランプ
+            (2, &[10.0], MIN_RATIO),       // b 側の上限 = a の下限
+            (1, &[0.1, 0.1, -0.2], 0.5),   // 往復
         ];
         for (focus, deltas, want) in cases {
             let mut l = SplitLayout::single(1);
@@ -10184,7 +10458,10 @@ mod split_tests {
         assert!(r * 194.0 >= MIN_PANE_PX - 0.5, "左ペインが潰れた: {r}");
         l.drag_gutter(&[], 1000.0, 200.0, 6.0);
         let r = l.ratio_at(&[]).unwrap();
-        assert!((1.0 - r) * 194.0 >= MIN_PANE_PX - 0.5, "右ペインが潰れた: {r}");
+        assert!(
+            (1.0 - r) * 194.0 >= MIN_PANE_PX - 0.5,
+            "右ペインが潰れた: {r}"
+        );
     }
 
     #[test]
@@ -10227,7 +10504,6 @@ mod split_tests {
         assert_invariants(&l, "均等化後");
     }
 
-
     #[test]
     fn serde_round_trip_and_heal() {
         let mut l = quad();
@@ -10266,7 +10542,9 @@ mod split_tests {
             zoomed: false,
         };
         assert!(broken.to_layout(&mut |k| ids(k)).is_empty());
-        assert!(SplitLayoutRec::default().to_layout(&mut |k| ids(k)).is_empty());
+        assert!(SplitLayoutRec::default()
+            .to_layout(&mut |k| ids(k))
+            .is_empty());
     }
 
     #[test]
@@ -10719,20 +10997,16 @@ mod split_tests {
         // 素直な往復
         let back = SplitLayoutRec::from_line(&line);
         assert_eq!(back, l.to_rec(&mut |id| key_of(id)));
-        let mut ids: Vec<(String, SessionId)> =
-            (1..=4).map(|i| (key_of(i).unwrap(), i)).collect();
-        let restored = back.to_layout(&mut |k| {
-            ids.iter().find(|(s, _)| s == k).map(|(_, i)| *i)
-        });
+        let mut ids: Vec<(String, SessionId)> = (1..=4).map(|i| (key_of(i).unwrap(), i)).collect();
+        let restored = back.to_layout(&mut |k| ids.iter().find(|(s, _)| s == k).map(|(_, i)| *i));
         assert_eq!(restored.leaves(), l.leaves());
         assert_eq!(restored.focus(), Some(3));
         assert_invariants(&restored, "往復後");
 
         // セッション 3 が消えていた場合 — 落として親を畳み、panic しない
         ids.retain(|(_, i)| *i != 3);
-        let healed = SplitLayoutRec::from_line(&line).to_layout(&mut |k| {
-            ids.iter().find(|(s, _)| s == k).map(|(_, i)| *i)
-        });
+        let healed = SplitLayoutRec::from_line(&line)
+            .to_layout(&mut |k| ids.iter().find(|(s, _)| s == k).map(|(_, i)| *i));
         assert_eq!(healed.len(), 3);
         assert!(!healed.contains(3));
         assert!(healed.focus().is_some_and(|f| healed.contains(f)));
@@ -10748,7 +11022,10 @@ mod split_tests {
             assert!(r.to_layout(&mut |_| Some(1)).len() <= 1);
         }
         // 分割していないレイアウトは空行になる (保存領域を汚さない)
-        assert!(SplitLayout::new().to_rec(&mut |_| None).to_line().is_empty());
+        assert!(SplitLayout::new()
+            .to_rec(&mut |_| None)
+            .to_line()
+            .is_empty());
     }
 
     /// ズームの状態も 1 行に乗る。
@@ -10832,7 +11109,9 @@ mod split_tests {
 
             let l = SplitLayout::single(7);
             let mut got: Vec<(SessionId, u16, u16)> = Vec::new();
-            apply_sizes(&l, a, GUTTER, *cw, *ch, &mut |id, r, c| got.push((id, r, c)));
+            apply_sizes(&l, a, GUTTER, *cw, *ch, &mut |id, r, c| {
+                got.push((id, r, c))
+            });
 
             // `draw` が allow_resize でやっている計算そのもの。
             let cols = ((a.width() - TERM_PADDING * 2.0) / cw).floor().max(1.0) as u16;

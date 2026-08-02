@@ -48,6 +48,24 @@
 ## 既知の罠
 
 - egui-winit 0.29 はペーストコード（⌘V / Ctrl+V）の **press イベントを飲み込む** — クリップボード処理は release イベント側で検知する。
+- **飲み込まれるのは V だけではない。** `egui-winit-0.29.1/src/lib.rs:758-774` は
+  押下イベントが `modifiers.command && key ∈ {X, C, V}` に当たると
+  `Event::Cut / Copy / Paste` を積んで **その場で return** する。判定は
+  **shift / alt の有無を見ていない**ので、`⌘⇧C`（Cockpit）や `⌘⇧V`（プレビュー）は
+  `consume_shortcut` では**構造的に絶対発火しない**（実際に「ツールチップに ⌘⇧C と
+  出ているのに効かない」として報告された）。`command` は mac では ⌘、
+  Windows/Linux では **Ctrl** に写るので、`Ctrl+Shift+C` も同じく死ぬ。
+  ショートカットの消費は必ず `keybinds::consume_shortcut_compat` を通すこと
+  （すり替えを逆再生して拾い直す。素の ⌘C/⌘V は横取りしない）。
+- **画面に出す打鍵表記をベタ書きしない。** `tr("… (⌘⇧C)")` は
+  (1) config.toml で再割り当てされた瞬間に嘘になり (2) Windows/Linux では表記そのものが違う。
+  必ず `keybinds::format_shortcut(keys.get(BindAction::X))`（app 内は `self.key_hint`,
+  `Keybinds` を持てない描画側は `keybinds::key_hint(ctx, ..)`）から生成する。
+  `keybinds::tests::画面のショートカット表記をベタ書きしていない` が番人。
+- **キーバインドは macOS の予約表と突き合わせる。** `keybinds::MACOS_RESERVED` は
+  `~/Library/Preferences/com.apple.symbolichotkeys.plist` の enabled 項目から起こした実測表。
+  `⌘⌥D`（Dock）だけでなく **`⌃Space`（前の入力ソース: 日本語 IME を使うと必ず有効）**、
+  `⌘\``（次のウィンドウ）、`⌘Space` / `⌥⌘Space` なども取られている。
 - **ソースを読む回帰テストは改行を正規化する。** `include_str!` の結果を
   `.replace("\r\n", "\n")` に通してから検索する。Windows のチェックアウトは CRLF なので、
   `"\n        });\n"` のようなパターンは必ず外れる。

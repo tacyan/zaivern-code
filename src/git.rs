@@ -268,7 +268,10 @@ impl Git {
     /// 相対ディレクトリ直下の「git 上は削除済み」ファイル名 (幽霊行表示用)。
     pub fn deleted_names_in(&self, rel_dir: &str) -> &[String] {
         let key = rel_dir.trim_end_matches('/');
-        self.deleted_cache.get(key).map(Vec::as_slice).unwrap_or(&[])
+        self.deleted_cache
+            .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// 変更ファイル数 (status のエントリ数)。
@@ -293,8 +296,10 @@ impl Git {
                 .map(|out| parse_hunk_marks(&out))
                 .unwrap_or_default(),
         );
-        self.marks_cache
-            .insert(rel_path.to_string(), (text_hash, Instant::now(), Arc::clone(&marks)));
+        self.marks_cache.insert(
+            rel_path.to_string(),
+            (text_hash, Instant::now(), Arc::clone(&marks)),
+        );
         marks
     }
 
@@ -447,9 +452,19 @@ impl GitSet {
         }
     }
 
+    /// 絶対パス → (repo トップレベル, repo からの相対パス)。
+    /// repo 外 / 非 repo なら `None` (呼び出し側は静かに諦めること)。
+    pub fn locate(&self, abs: &Path) -> Option<(PathBuf, String)> {
+        self.resolve(abs)
+    }
+
     /// primary ルートが属する repo のブランチ名。
     pub fn branch(&mut self) -> Option<String> {
-        let top = self.roots.first().and_then(|r| self.toplevels.get(r))?.clone()?;
+        let top = self
+            .roots
+            .first()
+            .and_then(|r| self.toplevels.get(r))?
+            .clone()?;
         self.repos.get_mut(&top)?.branch()
     }
 
@@ -616,7 +631,9 @@ fn derive_deleted_by_dir(files: &HashMap<String, FileStatus>) -> HashMap<String,
             continue;
         }
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
-        map.entry(dir.to_string()).or_default().push(name.to_string());
+        map.entry(dir.to_string())
+            .or_default()
+            .push(name.to_string());
     }
     for names in map.values_mut() {
         names.sort();
@@ -707,6 +724,428 @@ pub fn parse_hunk_marks(diff_output: &str) -> Vec<(usize, LineMark)> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+//  Git blame (VS Code / GitLens 相当のガター注釈)
+// ═════════════════════════════════════════════════════════════════════
+
+/// blame を取りに行く行ブロックの大きさ。可視範囲をこの倍数へ丸めることで、
+/// 1 行スクロールするたびに `git blame` を起こすのを防ぐ
+/// (設計原則 3「アイドル時のコストはゼロ」の具体形)。
+pub const BLAME_BLOCK: usize = 200;
+
+/// 未コミット行の SHA (git は全ゼロを返す)。
+const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+/// blame キャッシュに残す最大ブロック数。超えたら丸ごと捨てる
+/// (LRU を持つほどの量ではない。取り直しは 1 プロセスで済む)。
+const BLAME_CACHE_CAP: usize = 24;
+
+/// blame 1 行ぶん。`--line-porcelain` / `--porcelain` のどちらでも同じ形になる。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct BlameLine {
+    /// 最終ファイル側の行番号 (1 始まり)。
+    pub line: usize,
+    /// コミット SHA (40 桁)。未コミット行は全ゼロ。
+    pub sha: String,
+    /// 著者名 (日本語も入る)。
+    pub author: String,
+    /// author-time (unix 秒)。取れなければ 0。
+    pub time: i64,
+    /// author-tz (例 "+0900")。取れなければ空。
+    pub tz: String,
+    /// コミットの 1 行要約。
+    pub summary: String,
+    /// 未コミット (作業ツリーだけの変更) か。
+    pub uncommitted: bool,
+}
+
+/// 40 桁の 16 進 SHA か。
+fn is_sha40(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `git blame --line-porcelain` / `--porcelain` の出力を行の一覧へ変換する**純関数**。
+///
+/// porcelain のヘッダ行は `<sha> <元行> <最終行> [<行数>]` で、続く
+/// `key value` 群のあとに **タブで始まる本文行**が 1 行だけ来る。
+/// `--porcelain` は 2 度目以降の同一コミットでヘッダ群を省略するため、
+/// SHA をキーに一度覚えたメタ情報を使い回す。
+///
+/// **壊れた出力でも panic しない。** 認識できない行は黙って捨て、
+/// 本文行 (`\t`) に到達したエントリだけを結果へ積む。
+pub fn parse_blame_porcelain(out: &str) -> Vec<BlameLine> {
+    /// SHA ごとに覚えるメタ情報 (author, time, tz, summary)。
+    type Meta = (String, i64, String, String);
+    let mut known: HashMap<String, Meta> = HashMap::new();
+    let mut result: Vec<BlameLine> = Vec::new();
+
+    // 進行中のエントリ
+    let mut cur: Option<BlameLine> = None;
+    // このエントリでヘッダから読めた値 (未指定は None のまま = 既知メタで埋める)
+    let mut got_author: Option<String> = None;
+    let mut got_time: Option<i64> = None;
+    let mut got_tz: Option<String> = None;
+    let mut got_summary: Option<String> = None;
+
+    // Windows のチェックアウト/パイプ経由で `\r\n` が混じっても同じ結果にする
+    for raw in out.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(body) = line.strip_prefix('\t') {
+            // 本文行 = 1 エントリの終わり。本文自体は使わないが、
+            // ここに到達したことが「1 行ぶん揃った」の合図。
+            let _ = body;
+            let Some(mut e) = cur.take() else {
+                continue; // ヘッダ無しの本文行 (壊れた出力) は捨てる
+            };
+            let meta = known.get(&e.sha).cloned();
+            e.author = got_author
+                .take()
+                .or_else(|| meta.as_ref().map(|m| m.0.clone()))
+                .unwrap_or_default();
+            e.time = got_time
+                .take()
+                .or_else(|| meta.as_ref().map(|m| m.1))
+                .unwrap_or(0);
+            e.tz = got_tz
+                .take()
+                .or_else(|| meta.as_ref().map(|m| m.2.clone()))
+                .unwrap_or_default();
+            e.summary = got_summary
+                .take()
+                .or_else(|| meta.as_ref().map(|m| m.3.clone()))
+                .unwrap_or_default();
+            // 未コミット行: git は全ゼロ SHA + author "Not Committed Yet" を返す
+            e.uncommitted = e.sha == ZERO_SHA || e.author == "Not Committed Yet";
+            known.insert(
+                e.sha.clone(),
+                (e.author.clone(), e.time, e.tz.clone(), e.summary.clone()),
+            );
+            result.push(e);
+            continue;
+        }
+
+        let mut it = line.split(' ');
+        let head = it.next().unwrap_or("");
+        if is_sha40(head) {
+            // 新しいエントリの開始。前のエントリが本文行に到達していなければ捨てる。
+            let final_line = it.nth(1).and_then(|s| s.parse::<usize>().ok());
+            cur = Some(BlameLine {
+                line: final_line.unwrap_or(0),
+                sha: head.to_string(),
+                ..Default::default()
+            });
+            got_author = None;
+            got_time = None;
+            got_tz = None;
+            got_summary = None;
+            continue;
+        }
+        if cur.is_none() {
+            continue; // エントリの外にあるゴミ行
+        }
+        // `key value` 形式のヘッダ。value にはスペースが含まれ得る。
+        let value = line.get(head.len()..).map(|s| s.trim_start()).unwrap_or("");
+        match head {
+            "author" => got_author = Some(value.to_string()),
+            "author-time" => got_time = value.trim().parse::<i64>().ok(),
+            "author-tz" => got_tz = Some(value.trim().to_string()),
+            "summary" => got_summary = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    result
+}
+
+/// 可視範囲 (1 始まり・両端含む) を blame 取得ブロックへ丸める**純関数**。
+///
+/// スクロールしても同じブロックの間は同じキーになるので、`git blame` は
+/// ブロックを跨いだときにしか起きない。`total` (バッファの行数) を超えないよう
+/// 必ずクランプする — `git blame -L a,b` は b がファイル行数を超えると失敗する。
+pub fn blame_block(first: usize, last: usize, total: usize) -> (usize, usize) {
+    if total == 0 {
+        return (1, 1);
+    }
+    let first = first.max(1).min(total);
+    let last = last.max(first).min(total);
+    let b0 = (first - 1) / BLAME_BLOCK;
+    let b1 = (last - 1) / BLAME_BLOCK;
+    let start = b0 * BLAME_BLOCK + 1;
+    let end = ((b1 + 1) * BLAME_BLOCK).min(total).max(start);
+    (start, end)
+}
+
+/// 著者名のイニシャル (幅は最大 2 桁)。
+///
+/// ラテン文字は先頭 2 語の頭文字を大文字で、CJK のように 1 文字で 2 桁を
+/// 占める名前は先頭 1 文字だけにする (どちらも 2 桁に収まる)。
+pub fn author_initials(author: &str) -> String {
+    let mut out = String::new();
+    for w in author.split_whitespace().take(2) {
+        if let Some(c) = w.chars().next() {
+            for u in c.to_uppercase() {
+                out.push(u);
+            }
+        }
+    }
+    if out.is_empty() {
+        return "?".to_string();
+    }
+    // 全角 1 文字で 2 桁ぶん埋まるなら 1 文字で打ち切る
+    while crate::textenc::str_width(&out) > 2 {
+        out.pop();
+    }
+    if out.is_empty() {
+        "?".to_string()
+    } else {
+        out
+    }
+}
+
+/// ガター blame 欄に許す桁数を決める**純関数**。
+///
+/// エディタ幅の 1/4 を上限にし、`BLAME_MAX_COLS` で頭打ちにする。
+/// イニシャルすら置けない幅なら 0 (= 出さない) を返す。
+pub fn blame_gutter_cols(avail_w: f32, char_w: f32) -> usize {
+    /// これ以上は広げない (行番号と本文を押しやらないため)
+    const MAX: usize = 22;
+    /// イニシャルだけでも要る最低桁数
+    const MIN: usize = 2;
+    if !(char_w > 0.0) || !avail_w.is_finite() || avail_w <= 0.0 {
+        return 0;
+    }
+    let cols = (avail_w * 0.25 / char_w).floor();
+    if !cols.is_finite() || cols < MIN as f32 {
+        return 0;
+    }
+    (cols as usize).min(MAX)
+}
+
+/// ガターに出す blame ラベルを決める**純関数**。
+///
+/// 1. `著者 · 相対日時` が収まればそれ
+/// 2. 収まらなければ著者のイニシャルだけ
+/// 3. それも収まらなければ `None` (= 何も出さない)
+pub fn fit_blame_label(author: &str, rel_time: &str, cols: usize) -> Option<String> {
+    if cols == 0 {
+        return None;
+    }
+    let author = if author.trim().is_empty() {
+        "?"
+    } else {
+        author.trim()
+    };
+    let full = if rel_time.is_empty() {
+        author.to_string()
+    } else {
+        format!("{author} · {rel_time}")
+    };
+    if crate::textenc::str_width(&full) <= cols {
+        return Some(full);
+    }
+    let ini = author_initials(author);
+    if crate::textenc::str_width(&ini) <= cols {
+        return Some(ini);
+    }
+    None
+}
+
+/// unix 秒 → 「3日前」形式の相対表記 (**純関数**)。未来や 0 は素直に丸める。
+pub fn relative_time(then: i64, now: i64) -> String {
+    if then <= 0 {
+        return String::new();
+    }
+    let d = now.saturating_sub(then);
+    if d < 60 {
+        return tr("たった今");
+    }
+    let table: [(i64, &str); 5] = [
+        (60, "{n}分前"),
+        (3600, "{n}時間前"),
+        (86_400, "{n}日前"),
+        (2_592_000, "{n}か月前"),
+        (31_536_000, "{n}年前"),
+    ];
+    // 大きい単位から順に見る
+    for (unit, fmt) in table.iter().rev() {
+        if d >= *unit {
+            let n = d / *unit;
+            return trf(fmt, &[("n", n.to_string())]);
+        }
+    }
+    tr("たった今")
+}
+
+/// 現在時刻 (unix 秒)。システム時計が epoch より前でも 0 に丸める。
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// blame の取得単位を一意に決めるキー。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BlameKey {
+    /// 対象ファイル (絶対パス)。
+    pub path: PathBuf,
+    /// ディスク上の内容を代表する値 (保存時ハッシュ)。保存で作り直す。
+    pub rev: u64,
+    /// 取得する行範囲 (1 始まり・両端含む)。
+    pub start: usize,
+    pub end: usize,
+}
+
+/// blame の結果 (0 始まり行番号 → 1 行ぶん)。
+pub type BlameMap = Arc<HashMap<usize, BlameLine>>;
+
+/// blame をバックグラウンドで取り、可視ブロック単位でキャッシュする器。
+///
+/// **アイドル時のコストはゼロ**: 表示が OFF なら `request` は呼ばれず、
+/// ON でもキーが変わらない限り git は起きない。実行中のジョブが無ければ
+/// `poll` は `Option::is_none` 1 回で戻り、再描画も要求しない。
+#[derive(Default)]
+pub struct Blame {
+    /// 取得済みブロック。
+    cache: HashMap<BlameKey, BlameMap>,
+    /// 失敗したキー (非 repo / 未追跡 / blame 不可)。二度と撃たない。
+    failed: std::collections::HashSet<BlameKey>,
+    /// 実行中のジョブ (同時に 1 本だけ)。
+    job: Option<(BlameKey, Receiver<Option<Vec<BlameLine>>>)>,
+}
+
+impl Blame {
+    /// 可視ブロックの blame を要求する。
+    ///
+    /// キャッシュにあれば即返す。無ければワーカーを 1 本だけ起こして `None`
+    /// を返す (UI は決してブロックしない)。失敗済みのキーは何もしない。
+    pub fn request(&mut self, repo: &Path, rel: &str, key: BlameKey) -> Option<BlameMap> {
+        if let Some(m) = self.cache.get(&key) {
+            return Some(Arc::clone(m));
+        }
+        if self.failed.contains(&key) || self.job.is_some() {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel();
+        let repo = repo.to_path_buf();
+        let rel = rel.to_string();
+        let (start, end) = (key.start, key.end);
+        std::thread::spawn(move || {
+            let _ = tx.send(run_blame(&repo, &rel, start, end));
+        });
+        self.job = Some((key, rx));
+        None
+    }
+
+    /// ワーカーの結果を取り込む。`true` = 取り込んだ (描画に反映される)。
+    /// ジョブが無ければ**何もしない** (毎フレーム呼んでよい)。
+    pub fn poll(&mut self) -> bool {
+        let Some((_, rx)) = self.job.as_ref() else {
+            return false;
+        };
+        let got = match rx.try_recv() {
+            Ok(v) => v,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            // 送信側が消えた (通常は起こらない) — 失敗扱いにして終わらせる
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        let Some((key, _)) = self.job.take() else {
+            return false;
+        };
+        match got {
+            Some(lines) => {
+                if self.cache.len() >= BLAME_CACHE_CAP {
+                    self.cache.clear();
+                }
+                let map: HashMap<usize, BlameLine> = lines
+                    .into_iter()
+                    .filter(|l| l.line >= 1)
+                    .map(|l| (l.line - 1, l))
+                    .collect();
+                self.cache.insert(key, Arc::new(map));
+            }
+            // git リポジトリでない / 追跡されていない / blame が失敗した:
+            // **静かに何もしない** (トーストもダイアログも出さない)
+            None => {
+                self.failed.insert(key);
+            }
+        }
+        true
+    }
+
+    /// ワーカーが動いているか (動いている間だけ再描画を予約する)。
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// 覚えている結果を捨てる (表示を OFF にした / フォルダを開き直した)。
+    /// 既に空なら何もしない。
+    pub fn clear(&mut self) {
+        if self.cache.is_empty() && self.failed.is_empty() && self.job.is_none() {
+            return;
+        }
+        self.cache.clear();
+        self.failed.clear();
+        self.job = None;
+    }
+}
+
+/// `git blame --line-porcelain -L <start>,<end> -- <rel>` (ワーカースレッド専用)。
+///
+/// 末尾の範囲がディスク上の行数を超えると git は失敗するので、その場合だけ
+/// 「start から最後まで」で 1 度だけ取り直す。どちらも駄目なら `None`
+/// (非 repo / 未追跡 / git 不在) — 呼び出し側は静かに何もしない。
+fn run_blame(repo: &Path, rel: &str, start: usize, end: usize) -> Option<Vec<BlameLine>> {
+    let attempt = |range: String| -> Option<String> {
+        let args = vec![
+            "blame".to_string(),
+            "--line-porcelain".to_string(),
+            "-L".to_string(),
+            range,
+            "--".to_string(),
+            rel.to_string(),
+        ];
+        run_git_at(repo, &args).ok()
+    };
+    let out = attempt(format!("{start},{end}")).or_else(|| attempt(format!("{start},")))?;
+    Some(parse_blame_porcelain(&out))
+}
+
+/// 1 コミットの差分を取る (blame のガターをクリックしたときのジャンプ先)。
+/// 返り値は (タブのタイトル, unified diff 本文)。
+pub fn commit_diff(repo: &Path, sha: &str) -> Result<(String, String), String> {
+    if !is_sha40(sha) {
+        return Err(tr("コミットを特定できません"));
+    }
+    let subject = run_git_at(
+        repo,
+        &[
+            "show".to_string(),
+            "--no-patch".to_string(),
+            "--format=%s".to_string(),
+            sha.to_string(),
+        ],
+    )
+    .unwrap_or_default();
+    let subject = subject.lines().next().unwrap_or("").trim().to_string();
+    let body = run_git_at(
+        repo,
+        &[
+            "show".to_string(),
+            "--format=".to_string(),
+            "--no-color".to_string(),
+            "--patch".to_string(),
+            sha.to_string(),
+        ],
+    )?;
+    let short: String = sha.chars().take(7).collect();
+    let title = if subject.is_empty() {
+        trf("差分 {sha}", &[("sha", short)])
+    } else {
+        trf("{sha} {subject}", &[("sha", short), ("subject", subject)])
+    };
+    Ok((title, body))
+}
+
+// ═════════════════════════════════════════════════════════════════════
 //  ブランチ切り替え (ツールバーのブランチボタン)
 //
 //  【方針】
@@ -761,9 +1200,7 @@ impl SwitchBlock {
     /// ユーザーに出す説明文。
     pub fn message(&self) -> String {
         match self {
-            SwitchBlock::AlreadyOn(b) => {
-                trf("すでに {b} に居ます", &[("b", b.clone())])
-            }
+            SwitchBlock::AlreadyOn(b) => trf("すでに {b} に居ます", &[("b", b.clone())]),
             SwitchBlock::Dirty { names, total } => {
                 let head = names.join(", ");
                 let rest = total.saturating_sub(names.len());
@@ -787,9 +1224,7 @@ impl SwitchBlock {
                 "{b} は別の作業ツリーで開かれています: {p}",
                 &[("b", branch.clone()), ("p", path.display().to_string())],
             ),
-            SwitchBlock::BadName(n) => {
-                trf("ブランチ名として使えません: {n}", &[("n", n.clone())])
-            }
+            SwitchBlock::BadName(n) => trf("ブランチ名として使えません: {n}", &[("n", n.clone())]),
         }
     }
 
@@ -812,7 +1247,9 @@ pub fn local_branch_for_remote(remote_ref: &str) -> Option<String> {
 /// `git --version` の出力から (major, minor) を取り出す。
 pub fn parse_git_version(out: &str) -> Option<(u32, u32)> {
     // "git version 2.39.3 (Apple Git-145)" / "git version 2.45.1.windows.1"
-    let tail = out.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let tail = out
+        .split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
     let mut it = tail.split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next().unwrap_or("0");
@@ -1200,7 +1637,10 @@ impl BranchNav {
 
 /// `git -C <dir> <args>` を同期実行して stdout を返す。失敗は stderr の文言。
 /// 呼ぶ側がスレッドを用意すること。
-fn run_git_at(dir: &Path, args: &[String]) -> Result<String, String> {
+///
+/// CLI (`zai worktree …`) からも使う — git の呼び出し方 (色無効・quotepath 無効・
+/// エンコーディング復号) を 1 箇所に集めておくため、実装を複製しないこと。
+pub(crate) fn run_git_at(dir: &Path, args: &[String]) -> Result<String, String> {
     let out = crate::procx::hidden_command("git")
         // color.ui=always / core.quotepath=true な設定でも素の UTF-8 を得る
         // (ブランチ名の日本語がエスケープされるとパースも表示も壊れる)。
@@ -1210,7 +1650,9 @@ fn run_git_at(dir: &Path, args: &[String]) -> Result<String, String> {
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
-        let err = crate::textenc::decode_output(&out.stderr).trim().to_string();
+        let err = crate::textenc::decode_output(&out.stderr)
+            .trim()
+            .to_string();
         return Err(if err.is_empty() {
             trf("git {args} が失敗しました", &[("args", args.join(" "))])
         } else {
@@ -1306,6 +1748,232 @@ fn scan_branches(repo: &Path) -> Option<BranchSnapshot> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    // ── Git blame ────────────────────────────────────────────────────
+
+    /// `--line-porcelain` の 1 エントリを組み立てる (テスト用の素材)。
+    fn porcelain_entry(sha: &str, line: usize, author: &str, time: i64, summary: &str) -> String {
+        format!(
+            "{sha} {line} {line} 1\n\
+             author {author}\n\
+             author-mail <someone@example.com>\n\
+             author-time {time}\n\
+             author-tz +0900\n\
+             committer {author}\n\
+             committer-time {time}\n\
+             committer-tz +0900\n\
+             summary {summary}\n\
+             filename src/main.rs\n\
+             \tlet x = 1;\n"
+        )
+    }
+
+    #[test]
+    fn blame_porcelain_の基本形をパースする() {
+        let sha = "a".repeat(40);
+        let out = porcelain_entry(&sha, 3, "Alice Smith", 1_700_000_000, "初回コミット");
+        let got = parse_blame_porcelain(&out);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].line, 3);
+        assert_eq!(got[0].sha, sha);
+        assert_eq!(got[0].author, "Alice Smith");
+        assert_eq!(got[0].time, 1_700_000_000);
+        assert_eq!(got[0].tz, "+0900");
+        assert_eq!(got[0].summary, "初回コミット");
+        assert!(!got[0].uncommitted);
+    }
+
+    #[test]
+    fn blame_日本語の著者名と要約が壊れない() {
+        let sha = "b".repeat(40);
+        let out = porcelain_entry(&sha, 1, "山田 太郎", 1_600_000_000, "日本語の 要約 です");
+        let got = parse_blame_porcelain(&out);
+        assert_eq!(got[0].author, "山田 太郎", "スペース入りの名前も全部取る");
+        assert_eq!(got[0].summary, "日本語の 要約 です", "要約の空白も残す");
+    }
+
+    #[test]
+    fn blame_未コミット行を見分ける() {
+        // 全ゼロ SHA (git が未コミット行に付ける)
+        let zero = porcelain_entry(ZERO_SHA, 2, "Not Committed Yet", 1_700_000_100, "…");
+        let got = parse_blame_porcelain(&zero);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].uncommitted, "全ゼロ SHA は未コミット");
+
+        // SHA は本物でも著者が Not Committed Yet なら未コミット扱い
+        let odd = porcelain_entry(&"c".repeat(40), 1, "Not Committed Yet", 0, "x");
+        assert!(parse_blame_porcelain(&odd)[0].uncommitted);
+    }
+
+    #[test]
+    fn blame_同一コミットのヘッダ省略を補完する() {
+        // `--porcelain` は 2 度目以降のヘッダ群を省略し、SHA 行と本文行だけになる
+        let sha = "d".repeat(40);
+        let mut out = porcelain_entry(&sha, 1, "Bob", 1_500_000_000, "同じコミット");
+        out.push_str(&format!("{sha} 2 2 1\n\tlet y = 2;\n"));
+        out.push_str(&format!("{sha} 3 3 1\n\tlet z = 3;\n"));
+        let got = parse_blame_porcelain(&out);
+        assert_eq!(got.len(), 3);
+        for (i, g) in got.iter().enumerate() {
+            assert_eq!(g.line, i + 1);
+            assert_eq!(g.author, "Bob", "省略されたヘッダは既知のメタで埋める");
+            assert_eq!(g.summary, "同じコミット");
+            assert_eq!(g.time, 1_500_000_000);
+        }
+    }
+
+    #[test]
+    fn blame_crlf混じりでも同じ結果になる() {
+        let sha = "e".repeat(40);
+        let lf = porcelain_entry(&sha, 7, "Carol", 1_400_000_000, "改行の話");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(
+            parse_blame_porcelain(&lf),
+            parse_blame_porcelain(&crlf),
+            "\\r\\n が混じっても結果は同じ"
+        );
+    }
+
+    #[test]
+    fn blame_空出力と壊れた出力でpanicしない() {
+        assert!(parse_blame_porcelain("").is_empty());
+        assert!(parse_blame_porcelain("\n\n\n").is_empty());
+        // ヘッダ無しの本文行だけ
+        assert!(parse_blame_porcelain("\torphan body\n").is_empty());
+        // SHA が短い / 16 進でない
+        assert!(parse_blame_porcelain("zzzz 1 1 1\nauthor X\n\tbody\n").is_empty());
+        // 行番号が数字でない → 0 になり、本文行が来たら取り込まれる
+        let sha = "f".repeat(40);
+        let broken = format!("{sha} x y 1\nauthor Q\n\tbody\n");
+        let got = parse_blame_porcelain(&broken);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].line, 0, "壊れた行番号は 0 (呼び出し側が捨てる)");
+        // ヘッダだけで本文行が来ない (途中で切れた出力) → 取り込まない
+        let cut = format!("{sha} 1 1 1\nauthor Q\nauthor-time 1\n");
+        assert!(parse_blame_porcelain(&cut).is_empty());
+        // author-time が数字でない
+        let bad_time = format!("{sha} 1 1 1\nauthor Q\nauthor-time abc\n\tbody\n");
+        assert_eq!(parse_blame_porcelain(&bad_time)[0].time, 0);
+    }
+
+    #[test]
+    fn blame_blockは可視範囲を丸めてクランプする() {
+        let b = BLAME_BLOCK;
+        // 表: (first, last, total) → (start, end)
+        let table: &[(usize, usize, usize, usize, usize)] = &[
+            // 先頭ブロック
+            (1, 10, 1000, 1, b),
+            (b, b, 1000, 1, b),
+            // 2 ブロック目へ跨ぐ
+            (b, b + 1, 1000, 1, b * 2),
+            (b + 1, b + 5, 1000, b + 1, b * 2),
+            // 総行数でクランプ (git blame -L は行数超過で失敗する)
+            (1, 10_000, 50, 1, 50),
+            (b + 1, b + 40, b + 5, b + 1, b + 5),
+            // 0 / 逆転した入力でも範囲外にならない
+            (0, 0, 10, 1, 10),
+            (5, 1, 10, 1, 10),
+        ];
+        for (first, last, total, es, ee) in table {
+            let (s, e) = blame_block(*first, *last, *total);
+            assert_eq!((s, e), (*es, *ee), "blame_block({first},{last},{total})");
+            assert!(s >= 1 && e >= s && e <= *total, "範囲が壊れている");
+        }
+        // 空ファイル
+        assert_eq!(blame_block(1, 1, 0), (1, 1));
+    }
+
+    #[test]
+    fn blame_ラベルは幅に応じて縮退する() {
+        // 表: (著者, 相対日時, 桁数) → 期待
+        let table: &[(&str, &str, usize, Option<&str>)] = &[
+            ("Alice", "3日前", 20, Some("Alice · 3日前")), // 収まる
+            ("Alice", "3日前", 13, Some("Alice · 3日前")), // ちょうど 13 桁
+            ("Alice", "3日前", 12, Some("A")),             // 入らない → イニシャル
+            ("Alice Smith", "3日前", 5, Some("AS")),       // 2 語 → 頭文字 2 つ
+            ("Alice Smith", "3日前", 1, None),             // イニシャルも入らない
+            ("山田 太郎", "1年前", 3, Some("山")),         // 全角は 1 文字で 2 桁
+            ("山田 太郎", "1年前", 1, None),
+            ("Alice", "3日前", 0, None),          // 幅ゼロは常に非表示
+            ("", "3日前", 20, Some("? · 3日前")), // 著者不明でも壊れない
+            ("Alice", "", 6, Some("Alice")),      // 日時が取れないときは著者だけ
+        ];
+        for (author, rel, cols, want) in table {
+            let got = fit_blame_label(author, rel, *cols);
+            assert_eq!(
+                got.as_deref(),
+                *want,
+                "fit_blame_label({author:?}, {rel:?}, {cols})"
+            );
+            if let Some(s) = got {
+                assert!(
+                    crate::textenc::str_width(&s) <= *cols,
+                    "{s:?} が {cols} 桁を超えた"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blame_ガター桁数は幅から決まる() {
+        // 文字幅 8px。1/4 を上限に、22 桁で頭打ち
+        assert_eq!(blame_gutter_cols(800.0, 8.0), 22, "広い窓は上限で止まる");
+        assert_eq!(blame_gutter_cols(320.0, 8.0), 10);
+        assert_eq!(blame_gutter_cols(64.0, 8.0), 2, "イニシャルぶんは残す");
+        assert_eq!(blame_gutter_cols(32.0, 8.0), 0, "狭ければ出さない");
+        // 異常値で panic も巨大値も出さない
+        assert_eq!(blame_gutter_cols(0.0, 8.0), 0);
+        assert_eq!(blame_gutter_cols(-100.0, 8.0), 0);
+        assert_eq!(blame_gutter_cols(f32::NAN, 8.0), 0);
+        assert_eq!(blame_gutter_cols(f32::INFINITY, 8.0), 0);
+        assert_eq!(blame_gutter_cols(800.0, 0.0), 0);
+    }
+
+    #[test]
+    fn blame_相対日時は単位ごとに丸まる() {
+        let now = 1_700_000_000_i64;
+        let table: &[(i64, &str)] = &[
+            (now, "たった今"),
+            (now - 59, "たった今"),
+            (now - 60, "1分前"),
+            (now - 3599, "59分前"),
+            (now - 3600, "1時間前"),
+            (now - 86_399, "23時間前"),
+            (now - 86_400, "1日前"),
+            (now - 86_400 * 3, "3日前"),
+            (now - 2_592_000, "1か月前"),
+            (now - 31_536_000, "1年前"),
+            (now - 31_536_000 * 5, "5年前"),
+            (now + 10_000, "たった今"), // 未来 (時計ずれ) でも壊れない
+        ];
+        for (then, want) in table {
+            assert_eq!(&relative_time(*then, now), want, "relative_time({then})");
+        }
+        assert_eq!(relative_time(0, now), "", "時刻不明は空文字");
+        assert_eq!(relative_time(-5, now), "");
+    }
+
+    #[test]
+    fn blame_イニシャルは常に2桁以内() {
+        for name in [
+            "Alice",
+            "Alice Smith",
+            "alice bob carol dave",
+            "山田 太郎",
+            "  ",
+            "",
+            "𝔘𝔫𝔦𝔠𝔬𝔡𝔢 Name",
+        ] {
+            let ini = author_initials(name);
+            assert!(!ini.is_empty(), "{name:?} で空になった");
+            assert!(
+                crate::textenc::str_width(&ini) <= 2,
+                "{name:?} → {ini:?} が 2 桁を超えた"
+            );
+        }
+        assert_eq!(author_initials("Alice Smith"), "AS");
+        assert_eq!(author_initials(""), "?");
+    }
 
     #[test]
     fn added_only_hunk() {
@@ -1444,7 +2112,11 @@ index 1234567..89abcde 100644
             a.canonicalize().expect("canon a"),
             b.canonicalize().expect("canon b"),
         ]);
-        assert_eq!(set.repo_count(), 1, "同一 repo の 2 ルートは Git を共有する");
+        assert_eq!(
+            set.repo_count(),
+            1,
+            "同一 repo の 2 ルートは Git を共有する"
+        );
 
         std::fs::remove_dir_all(&repo).ok();
     }
@@ -1649,7 +2321,16 @@ index 1234567..89abcde 100644
         files.insert(deep.to_string(), FileStatus::Modified);
         let dirs = derive_dir_status(&files, &[]);
 
-        for anc in ["", "a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e", "a/b/c/d/e/f", "a/b/c/d/e/f/g"] {
+        for anc in [
+            "",
+            "a",
+            "a/b",
+            "a/b/c",
+            "a/b/c/d",
+            "a/b/c/d/e",
+            "a/b/c/d/e/f",
+            "a/b/c/d/e/f/g",
+        ] {
             assert_eq!(
                 dirs.get(anc),
                 Some(&(FileStatus::Modified, 1)),
@@ -1676,7 +2357,10 @@ index 1234567..89abcde 100644
         assert_eq!(g.dir_status("src"), Some((FileStatus::Modified, 3)));
         // 中間層は 2 件・単一種なので Added のまま
         assert_eq!(g.dir_status("src/deep"), Some((FileStatus::Added, 2)));
-        assert_eq!(g.dir_status("src/deep/one/two/three"), Some((FileStatus::Added, 2)));
+        assert_eq!(
+            g.dir_status("src/deep/one/two/three"),
+            Some((FileStatus::Added, 2))
+        );
         // 末尾スラッシュ付きでも同じキーに解決する
         assert_eq!(g.dir_status("src/deep/"), Some((FileStatus::Added, 2)));
         assert_eq!(g.dir_status("vendor"), None);
@@ -1703,12 +2387,23 @@ index 1234567..89abcde 100644
     fn delete_tints_parent_chain_even_though_file_is_gone() {
         let parsed = parse_porcelain_z(" D a/b/c/d/e/f/gone.rs\0", MAX_STATUS_ENTRIES);
         let dirs = derive_dir_status(&parsed.files, &parsed.renames);
-        for anc in ["", "a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e", "a/b/c/d/e/f"] {
+        for anc in [
+            "",
+            "a",
+            "a/b",
+            "a/b/c",
+            "a/b/c/d",
+            "a/b/c/d/e",
+            "a/b/c/d/e/f",
+        ] {
             assert_eq!(dirs.get(anc), Some(&(FileStatus::Deleted, 1)), "{anc}");
         }
         // 幽霊行 (消えたファイル名) も親ディレクトリから引ける
         let ghosts = derive_deleted_by_dir(&parsed.files);
-        assert_eq!(ghosts.get("a/b/c/d/e/f").map(Vec::as_slice), Some(&["gone.rs".to_string()][..]));
+        assert_eq!(
+            ghosts.get("a/b/c/d/e/f").map(Vec::as_slice),
+            Some(&["gone.rs".to_string()][..])
+        );
     }
 
     /// サブモジュール / ネストした repo の扱い。
@@ -1747,7 +2442,11 @@ index 1234567..89abcde 100644
         let dirs = derive_dir_status(&parsed.files, &parsed.renames);
         // ルートは取り込めた件数ぶん、ディレクトリ数はパス空間ぶんで抑えられる
         assert_eq!(dirs.get("").map(|d| d.1), Some(MAX_STATUS_ENTRIES));
-        assert!(dirs.len() <= 1 + 40 + 400, "ディレクトリ集計が爆発しない: {}", dirs.len());
+        assert!(
+            dirs.len() <= 1 + 40 + 400,
+            "ディレクトリ集計が爆発しない: {}",
+            dirs.len()
+        );
     }
 
     /// 病的に深いパスでも祖先の展開を打ち切る (メモリ暴走止め)。
@@ -1965,14 +2664,26 @@ index 1234567..89abcde 100644
         let names: Vec<&str> = list.local.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["feature/login-v2", "night/2026-07-26", "日本語ブランチ", "main"],
+            vec![
+                "feature/login-v2",
+                "night/2026-07-26",
+                "日本語ブランチ",
+                "main"
+            ],
             "`/` 入りも非 ASCII も出力順のまま残る"
         );
         assert!(
-            list.local.iter().find(|b| b.name == "night/2026-07-26").unwrap().other_worktree,
+            list.local
+                .iter()
+                .find(|b| b.name == "night/2026-07-26")
+                .unwrap()
+                .other_worktree,
             "`+` は別 worktree で使用中",
         );
-        assert!(!list.local.iter().any(|b| b.current), "detached なので current は無い");
+        assert!(
+            !list.local.iter().any(|b| b.current),
+            "detached なので current は無い"
+        );
         assert_eq!(
             list.remote,
             vec!["origin/feature/login-v2", "origin/日本語ブランチ"],
@@ -2157,11 +2868,99 @@ index 1234567..89abcde 100644
         assert_eq!(snap.dirty, vec!["a.txt".to_string()]);
         assert_eq!(snap.dirty_total, 1);
         assert!(
-            snap.plan_switch(&SwitchTarget::Local("whatever".into())).is_err(),
+            snap.plan_switch(&SwitchTarget::Local("whatever".into()))
+                .is_err(),
             "汚れていれば切り替えない"
         );
 
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// 実リポジトリで blame を取る (コミット 2 つ + 未コミット行)。
+    /// `--nocapture` を付けて走らせると実出力がそのまま見える。
+    #[test]
+    fn blame_実リポジトリで著者と要約が取れる() {
+        let Some(repo) = temp_repo("blame") else {
+            return; // git が無い環境ではスキップ
+        };
+        // 1 つ目: 2 行
+        commit_with(
+            &repo,
+            "note.txt",
+            "first line\nsecond line\n",
+            "山田 太郎",
+            "最初のコミット",
+        );
+        // 2 つ目: 3 行目を足す (別の著者)
+        commit_with(
+            &repo,
+            "note.txt",
+            "first line\nsecond line\nthird line\n",
+            "Alice Smith",
+            "3 行目を追加",
+        );
+        // 保存前の編集に相当する未コミット行
+        std::fs::write(
+            repo.join("note.txt"),
+            "first line\nsecond line\nthird line\ndraft\n",
+        )
+        .expect("dirty it");
+
+        let got = run_blame(&repo, "note.txt", 1, 4).expect("blame が取れる");
+        println!("── git blame --line-porcelain -L 1,4 -- note.txt の解析結果 ──");
+        for l in &got {
+            println!(
+                "  L{:<2} {} {:<12} {:<16} {}",
+                l.line,
+                &l.sha[..7.min(l.sha.len())],
+                l.author,
+                relative_time(l.time, unix_now()),
+                l.summary
+            );
+        }
+        assert_eq!(got.len(), 4, "4 行ぶん返る: {got:?}");
+        assert_eq!(got[0].author, "山田 太郎", "日本語の著者名が壊れない");
+        assert_eq!(got[0].summary, "最初のコミット");
+        assert!(!got[0].uncommitted);
+        assert_eq!(got[1].sha, got[0].sha, "同じコミットの 2 行目");
+        assert_eq!(got[2].author, "Alice Smith");
+        assert_ne!(got[2].sha, got[0].sha, "2 つ目のコミット");
+        assert!(got[3].uncommitted, "未コミット行を見分ける: {:?}", got[3]);
+        // 1 コミットぶんの差分がタブとして開ける
+        let (title, body) = commit_diff(&repo, &got[2].sha).expect("commit_diff");
+        println!("── commit_diff のタイトル ── {title}");
+        assert!(title.contains("3 行目を追加"), "タイトル: {title}");
+        assert!(body.contains("+third line"), "差分本文: {body}");
+        // repo でないフォルダは静かに None
+        let plain = crate::test_util::unique_temp_dir("zaivern-git-test", "blame-norepo");
+        assert!(
+            run_blame(&plain, "nothing.txt", 1, 1).is_none(),
+            "非 repo は静かに諦める"
+        );
+        assert!(
+            run_blame(&repo, "untracked.txt", 1, 1).is_none(),
+            "未追跡も同じ"
+        );
+        std::fs::remove_dir_all(&plain).ok();
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// テスト用: 著者とメッセージを指定して 1 コミット作る。
+    fn commit_with(repo: &Path, name: &str, body: &str, author: &str, msg: &str) {
+        std::fs::write(repo.join(name), body).expect("write file");
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("git run");
+        };
+        run(&["config", "user.email", "zaivern@example.invalid"]);
+        run(&["config", "user.name", author]);
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", msg]);
     }
 
     /// テスト用: 1 コミット作る (worktree 追加には最低 1 コミット要る)。

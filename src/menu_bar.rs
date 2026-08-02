@@ -26,8 +26,16 @@ pub struct MenuInfo {
     pub word_wrap: bool,
     /// 空白文字の可視化 (表示メニューのチェック状態)
     pub show_whitespace: bool,
+    /// ミニマップ (表示メニューのチェック状態)
+    pub minimap: bool,
+    /// ブレッドクラム (表示メニューのチェック状態)
+    pub breadcrumbs: bool,
+    /// ガターの git blame 表示 (表示メニューのチェック状態)
+    pub git_blame: bool,
     /// アクティブなエディタタブがあるか (編集系メニューの有効/無効)
     pub has_editor: bool,
+    /// エディタが分割されているか (分割の解除・ペイン移動の有効/無効)
+    pub editor_split: bool,
     /// アクティブなタブがファイル (path 持ち) か
     pub has_file: bool,
     /// Markdown/HTML プレビュー対象タブか
@@ -47,8 +55,20 @@ pub struct MenuInfo {
     pub trim_trailing_on_save: bool,
     /// 保存時に最終行へ改行を入れる (同上)
     pub final_newline_on_save: bool,
-    /// ビルドタスクのラベル (検出できたときだけ Some。例 "cargo build")
+    /// ビルドタスクのラベル。**⇧⌘B が実際に走らせる方**を入れる
+    /// (tasks.json の既定ビルドがあればそれ、無ければ自動検出のラベル)。
     pub build_task: Option<String>,
+    /// ⇧⌘B が tasks.json 由来のタスクを走らせるか。
+    /// `true` の間は自動検出のタスクへは ⇧⌘B では届かない。
+    pub build_from_tasks_json: bool,
+    /// 自動検出したビルドタスクのラベル (Cargo.toml / package.json / Makefile / go.mod)。
+    pub detected_task: Option<String>,
+    /// `.vscode/tasks.json` 由来のタスク。(index, ラベル, 実行できない理由)。
+    /// 理由が `Some` の行はグレーアウトし、ホバーで理由を出す
+    /// (黙って壊れたコマンドを走らせない。黙って消しもしない)。
+    pub json_tasks: Vec<(usize, String, Option<String>)>,
+    /// tasks.json を解釈できなかった理由 (無ければ None)。
+    pub tasks_error: Option<String>,
     /// アクティブファイルの実行コマンドラベル (例 "python3 main.py")
     pub run_label: Option<String>,
 }
@@ -80,6 +100,29 @@ fn item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> bool {
     clicked
 }
 
+/// [`item`] にホバー説明を足したもの。**無効な行の理由を黙って捨てない**ために使う
+/// (グレーアウトだけだと「なぜ押せないのか」がどこにも出ない)。
+fn item_hint(ui: &mut egui::Ui, label: &str, enabled: bool, hint: &str) -> bool {
+    let r = ui.add_enabled(enabled, egui::Button::new(label));
+    let r = if hint.is_empty() {
+        r
+    } else if enabled {
+        r.on_hover_text(hint)
+    } else {
+        r.on_disabled_hover_text(hint)
+    };
+    if r.clicked() {
+        ui.close_menu();
+        return true;
+    }
+    false
+}
+
+/// メニュー内の出典見出し (押せない小見出し)。
+fn heading(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).weak().small());
+}
+
 /// キーバインド済みアクションのショートカット表記。
 fn sc(keys: &Keybinds, a: BindAction) -> String {
     format_shortcut(keys.get(a))
@@ -95,14 +138,29 @@ fn native_sc(spec: &str) -> String {
 fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<Cmd>) {
     ui.menu_button(tr("ファイル"), |ui| {
         ui.set_min_width(280.0);
-        if item(ui, &tr("新しいテキスト ファイル"), &sc(keys, BindAction::NewFile), true) {
+        if item(
+            ui,
+            &tr("新しいテキスト ファイル"),
+            &sc(keys, BindAction::NewFile),
+            true,
+        ) {
             cmds.push(Cmd::NewFile);
         }
-        if item(ui, &tr("新しいウィンドウ"), &sc(keys, BindAction::NewWindow), true) {
+        if item(
+            ui,
+            &tr("新しいウィンドウ"),
+            &sc(keys, BindAction::NewWindow),
+            true,
+        ) {
             cmds.push(Cmd::NewWindow);
         }
         ui.separator();
-        if item(ui, &tr("ファイルを開く…"), &sc(keys, BindAction::OpenFile), true) {
+        if item(
+            ui,
+            &tr("ファイルを開く…"),
+            &sc(keys, BindAction::OpenFile),
+            true,
+        ) {
             cmds.push(Cmd::OpenFileDialog);
         }
         if item(ui, &tr("フォルダーを開く…"), "", true) {
@@ -139,23 +197,41 @@ fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             cmds.push(Cmd::AddFolder);
         }
         if info.roots.len() > 1 {
-            ui.menu_button(tr("フォルダーをワークスペースから削除"), |ui| {
-                ui.set_min_width(280.0);
-                for r in &info.roots {
-                    if item(ui, &display_path(r), "", true) {
-                        cmds.push(Cmd::RemoveFolder(r.clone()));
+            ui.menu_button(
+                tr("フォルダーをワークスペースから削除"),
+                |ui| {
+                    ui.set_min_width(280.0);
+                    for r in &info.roots {
+                        if item(ui, &display_path(r), "", true) {
+                            cmds.push(Cmd::RemoveFolder(r.clone()));
+                        }
                     }
-                }
-            });
+                },
+            );
         }
         ui.separator();
-        if item(ui, &tr("保存"), &sc(keys, BindAction::Save), info.has_editor) {
+        if item(
+            ui,
+            &tr("保存"),
+            &sc(keys, BindAction::Save),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::Save);
         }
-        if item(ui, &tr("名前を付けて保存…"), &sc(keys, BindAction::SaveAs), info.has_editor) {
+        if item(
+            ui,
+            &tr("名前を付けて保存…"),
+            &sc(keys, BindAction::SaveAs),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::SaveAs);
         }
-        if item(ui, &tr("すべて保存"), &sc(keys, BindAction::SaveAll), info.has_editor) {
+        if item(
+            ui,
+            &tr("すべて保存"),
+            &sc(keys, BindAction::SaveAll),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::SaveAll);
         }
         let mut auto = info.auto_save;
@@ -181,7 +257,12 @@ fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             }
         });
         ui.separator();
-        if item(ui, &tr("エディターを閉じる"), &sc(keys, BindAction::CloseTab), info.has_editor) {
+        if item(
+            ui,
+            &tr("エディターを閉じる"),
+            &sc(keys, BindAction::CloseTab),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::CloseTab);
         }
         if item(ui, &tr("すべてのエディターを閉じる"), "", info.has_editor) {
@@ -218,14 +299,29 @@ fn edit_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             cmds.push(Cmd::OpenReplace);
         }
         ui.separator();
-        if item(ui, &tr("ファイル間で検索"), &sc(keys, BindAction::GlobalSearch), true) {
+        if item(
+            ui,
+            &tr("ファイル間で検索"),
+            &sc(keys, BindAction::GlobalSearch),
+            true,
+        ) {
             cmds.push(Cmd::GlobalSearch);
         }
-        if item(ui, &tr("ファイル間で置換"), &sc(keys, BindAction::GlobalReplace), true) {
+        if item(
+            ui,
+            &tr("ファイル間で置換"),
+            &sc(keys, BindAction::GlobalReplace),
+            true,
+        ) {
             cmds.push(Cmd::GlobalReplace);
         }
         ui.separator();
-        if item(ui, &tr("行コメントの切り替え"), &sc(keys, BindAction::ToggleComment), ed) {
+        if item(
+            ui,
+            &tr("行コメントの切り替え"),
+            &sc(keys, BindAction::ToggleComment),
+            ed,
+        ) {
             cmds.push(Cmd::ToggleLineComment);
         }
         ui.separator();
@@ -279,13 +375,28 @@ fn selection_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mu
             cmds.push(Cmd::SelectAll);
         }
         ui.separator();
-        if item(ui, &tr("行を複製"), &sc(keys, BindAction::DuplicateLine), ed) {
+        if item(
+            ui,
+            &tr("行を複製"),
+            &sc(keys, BindAction::DuplicateLine),
+            ed,
+        ) {
             cmds.push(Cmd::DuplicateLine);
         }
-        if item(ui, &tr("行を上へ移動"), &sc(keys, BindAction::MoveLineUp), ed) {
+        if item(
+            ui,
+            &tr("行を上へ移動"),
+            &sc(keys, BindAction::MoveLineUp),
+            ed,
+        ) {
             cmds.push(Cmd::MoveLineUp);
         }
-        if item(ui, &tr("行を下へ移動"), &sc(keys, BindAction::MoveLineDown), ed) {
+        if item(
+            ui,
+            &tr("行を下へ移動"),
+            &sc(keys, BindAction::MoveLineDown),
+            ed,
+        ) {
             cmds.push(Cmd::MoveLineDown);
         }
     });
@@ -295,7 +406,12 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
     let ed = info.has_editor;
     ui.menu_button(tr("表示"), |ui| {
         ui.set_min_width(300.0);
-        if item(ui, &tr("コマンド パレット…"), &sc(keys, BindAction::PaletteCommands), true) {
+        if item(
+            ui,
+            &tr("コマンド パレット…"),
+            &sc(keys, BindAction::PaletteCommands),
+            true,
+        ) {
             cmds.push(Cmd::OpenCommandPalette);
         }
         ui.separator();
@@ -369,12 +485,61 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             if item(ui, &tr("ズームイン"), &sc(keys, BindAction::FontInc), true) {
                 cmds.push(Cmd::FontInc);
             }
-            if item(ui, &tr("ズームアウト"), &sc(keys, BindAction::FontDec), true) {
+            if item(
+                ui,
+                &tr("ズームアウト"),
+                &sc(keys, BindAction::FontDec),
+                true,
+            ) {
                 cmds.push(Cmd::FontDec);
             }
         });
         ui.separator();
-        if item(ui, &tr("エクスプローラー"), &sc(keys, BindAction::FocusExplorer), true) {
+        // ── エディタの分割 (VS Code の editor group 相当) ──
+        // 分割していない間は「解除」「次のペインへ」を押せなくする
+        // (押しても何も起きない項目を出さない)。
+        ui.menu_button(tr("エディタの分割"), |ui| {
+            ui.set_min_width(300.0);
+            if item(
+                ui,
+                &tr("右に分割"),
+                &sc(keys, BindAction::SplitEditorRight),
+                ed,
+            ) {
+                cmds.push(Cmd::SplitEditorRight);
+            }
+            if item(
+                ui,
+                &tr("下に分割"),
+                &sc(keys, BindAction::SplitEditorDown),
+                ed,
+            ) {
+                cmds.push(Cmd::SplitEditorDown);
+            }
+            ui.separator();
+            if item(
+                ui,
+                &tr("次のペインへ"),
+                &sc(keys, BindAction::FocusPane2),
+                info.editor_split,
+            ) {
+                cmds.push(Cmd::FocusNextPane);
+            }
+            if item(ui, &tr("タブを次のペインへ移動"), "", ed) {
+                cmds.push(Cmd::MoveTabToNextPane);
+            }
+            ui.separator();
+            if item(ui, &tr("分割を解除"), "", info.editor_split) {
+                cmds.push(Cmd::UnsplitEditor);
+            }
+        });
+        ui.separator();
+        if item(
+            ui,
+            &tr("エクスプローラー"),
+            &sc(keys, BindAction::FocusExplorer),
+            true,
+        ) {
             cmds.push(Cmd::ShowExplorer);
         }
         if item(ui, &tr("検索"), &sc(keys, BindAction::GlobalSearch), true) {
@@ -431,13 +596,43 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         if item(ui, &ws, "", true) {
             cmds.push(Cmd::ToggleShowWhitespace);
         }
+        // ミニマップ / ブレッドクラム (VS Code: 表示 > 外観)
+        let mm = if info.minimap {
+            tr("✓ ミニマップ")
+        } else {
+            tr("ミニマップ")
+        };
+        if item(ui, &mm, "", true) {
+            cmds.push(Cmd::ToggleMinimap);
+        }
+        let bc = if info.breadcrumbs {
+            tr("✓ ブレッドクラム")
+        } else {
+            tr("ブレッドクラム")
+        };
+        if item(ui, &bc, "", true) {
+            cmds.push(Cmd::ToggleBreadcrumbs);
+        }
+        let gb = if info.git_blame {
+            tr("✓ Git blame をガターに表示")
+        } else {
+            tr("Git blame をガターに表示")
+        };
+        if item(ui, &gb, "", true) {
+            cmds.push(Cmd::ToggleGitBlame);
+        }
         ui.separator();
         let md = if info.md_preview {
             tr("✓ Markdown/HTML プレビュー")
         } else {
             tr("Markdown/HTML プレビュー")
         };
-        if item(ui, &md, &sc(keys, BindAction::ToggleMdPreview), info.has_editor) {
+        if item(
+            ui,
+            &md,
+            &sc(keys, BindAction::ToggleMdPreview),
+            info.has_editor,
+        ) {
             cmds.push(Cmd::ToggleMdPreview);
         }
         ui.separator();
@@ -445,13 +640,23 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         // 2 打鍵のコードが要るのでメニューとパレット専用にしてある。
         ui.menu_button(tr("折りたたみ"), |ui| {
             ui.set_min_width(280.0);
-            if item(ui, &tr("折りたたみ切替"), &sc(keys, BindAction::ToggleFold), ed) {
+            if item(
+                ui,
+                &tr("折りたたみ切替"),
+                &sc(keys, BindAction::ToggleFold),
+                ed,
+            ) {
                 cmds.push(Cmd::ToggleFold);
             }
             if item(ui, &tr("すべて折りたたむ"), "", ed) {
                 cmds.push(Cmd::FoldAll);
             }
-            if item(ui, &tr("すべて展開する"), &sc(keys, BindAction::UnfoldAll), ed) {
+            if item(
+                ui,
+                &tr("すべて展開する"),
+                &sc(keys, BindAction::UnfoldAll),
+                ed,
+            ) {
                 cmds.push(Cmd::UnfoldAll);
             }
             ui.separator();
@@ -479,31 +684,71 @@ fn go_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<C
             cmds.push(Cmd::NavForward);
         }
         ui.separator();
-        if item(ui, &tr("ファイルへ移動…"), &sc(keys, BindAction::PaletteFiles), true) {
+        if item(
+            ui,
+            &tr("ファイルへ移動…"),
+            &sc(keys, BindAction::PaletteFiles),
+            true,
+        ) {
             cmds.push(Cmd::OpenFilePalette);
         }
         ui.separator();
-        if item(ui, &tr("次のエディター"), &sc(keys, BindAction::NextTab), ed) {
+        if item(
+            ui,
+            &tr("次のエディター"),
+            &sc(keys, BindAction::NextTab),
+            ed,
+        ) {
             cmds.push(Cmd::NextTab);
         }
-        if item(ui, &tr("前のエディター"), &sc(keys, BindAction::PrevTab), ed) {
+        if item(
+            ui,
+            &tr("前のエディター"),
+            &sc(keys, BindAction::PrevTab),
+            ed,
+        ) {
             cmds.push(Cmd::PrevTab);
         }
         ui.separator();
-        if item(ui, &tr("定義へ移動"), &sc(keys, BindAction::GoToDefinition), info.has_file) {
+        if item(
+            ui,
+            &tr("定義へ移動"),
+            &sc(keys, BindAction::GoToDefinition),
+            info.has_file,
+        ) {
             cmds.push(Cmd::GoToDefinition);
         }
-        if item(ui, &tr("ブラケットへ移動"), &sc(keys, BindAction::GoToBracket), ed) {
+        if item(
+            ui,
+            &tr("ブラケットへ移動"),
+            &sc(keys, BindAction::GoToBracket),
+            ed,
+        ) {
             cmds.push(Cmd::GoToBracket);
         }
-        if item(ui, &tr("シンボルにジャンプ"), &sc(keys, BindAction::LspSymbols), info.has_file) {
+        if item(
+            ui,
+            &tr("シンボルにジャンプ"),
+            &sc(keys, BindAction::LspSymbols),
+            info.has_file,
+        ) {
             cmds.push(Cmd::LspSymbols);
         }
-        if item(ui, &tr("参照を検索"), &sc(keys, BindAction::LspReferences), info.has_file) {
+        if item(
+            ui,
+            &tr("参照を検索"),
+            &sc(keys, BindAction::LspReferences),
+            info.has_file,
+        ) {
             cmds.push(Cmd::LspReferences);
         }
         ui.separator();
-        if item(ui, &tr("ブックマーク切替"), &sc(keys, BindAction::ToggleBookmark), ed) {
+        if item(
+            ui,
+            &tr("ブックマーク切替"),
+            &sc(keys, BindAction::ToggleBookmark),
+            ed,
+        ) {
             cmds.push(Cmd::ToggleBookmark);
         }
         if item(ui, &tr("次のブックマークへ"), "", ed) {
@@ -518,6 +763,70 @@ fn go_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<C
         ui.separator();
         if item(ui, &tr("行/列へ移動…"), &sc(keys, BindAction::GoToLine), ed) {
             cmds.push(Cmd::GoToLine);
+        }
+    });
+}
+
+/// 「タスクの実行…」に出せる中身があるか。
+/// 空なら呼び出し側がサブメニューごと出さない (中身の無いセクションを作らない)。
+fn has_tasks(info: &MenuInfo) -> bool {
+    !info.json_tasks.is_empty()
+        || info.tasks_error.is_some()
+        || info.detected_task.is_some()
+        || !info.plugin_commands.is_empty()
+}
+
+/// 「タスクの実行…」サブメニュー。**出典ごとに見出しで分ける** —
+/// `.vscode/tasks.json` / 自動検出 (Cargo.toml 等) / プラグインは
+/// 壊れ方も直し方も違うので、どこから来た行なのかが見えないと直せない。
+///
+/// 実行は全て既存の経路 (`Cmd::RunJsonTask` / `Cmd::RunBuildTask` /
+/// `Cmd::RunPlugin`) に流す。ここに新しい起動の仕組みは持たない。
+fn tasks_submenu(ui: &mut egui::Ui, info: &MenuInfo, cmds: &mut Vec<Cmd>) {
+    ui.menu_button(tr("タスクの実行…"), |ui| {
+        ui.set_min_width(320.0);
+        let mut shown = false;
+        if !info.json_tasks.is_empty() || info.tasks_error.is_some() {
+            heading(ui, "tasks.json");
+            shown = true;
+            // パースエラーは黙って消さない。理由はホバーで全文が読める。
+            if let Some(e) = &info.tasks_error {
+                item_hint(ui, &tr("⚠ tasks.json を読めませんでした"), false, e);
+            }
+            for (i, label, blocked) in &info.json_tasks {
+                let hint = blocked.clone().unwrap_or_default();
+                if item_hint(ui, &format!("▶ {label}"), blocked.is_none(), &hint) {
+                    cmds.push(Cmd::RunJsonTask(*i));
+                }
+            }
+        }
+        if let Some(d) = &info.detected_task {
+            if shown {
+                ui.separator();
+            }
+            shown = true;
+            heading(ui, &tr("自動検出"));
+            // tasks.json の既定ビルドがあるときは ⇧⌘B はそちらへ行く。
+            // ここを押せるままにすると「押した物と走る物が違う」ので落とす。
+            let hint = if info.build_from_tasks_json {
+                tr("tasks.json の既定ビルドタスクが優先されます")
+            } else {
+                String::new()
+            };
+            if item_hint(ui, &format!("🔨 {d}"), !info.build_from_tasks_json, &hint) {
+                cmds.push(Cmd::RunBuildTask);
+            }
+        }
+        if !info.plugin_commands.is_empty() {
+            if shown {
+                ui.separator();
+            }
+            heading(ui, &tr("プラグイン"));
+            for (pi, ci, icon, title) in &info.plugin_commands {
+                if item(ui, &format!("{icon} {title}"), "", true) {
+                    cmds.push(Cmd::RunPlugin(*pi, *ci));
+                }
+            }
         }
     });
 }
@@ -545,15 +854,8 @@ fn run_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<
         ) {
             cmds.push(Cmd::RunBuildTask);
         }
-        if !info.plugin_commands.is_empty() {
-            ui.menu_button(tr("タスクの実行…"), |ui| {
-                ui.set_min_width(300.0);
-                for (pi, ci, icon, title) in &info.plugin_commands {
-                    if item(ui, &format!("{icon} {title}"), "", true) {
-                        cmds.push(Cmd::RunPlugin(*pi, *ci));
-                    }
-                }
-            });
+        if has_tasks(info) {
+            tasks_submenu(ui, info, cmds);
         }
         ui.separator();
         ui.menu_button(tr("エージェントを起動"), |ui| {
@@ -574,7 +876,12 @@ fn run_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<
 fn terminal_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<Cmd>) {
     ui.menu_button(tr("ターミナル"), |ui| {
         ui.set_min_width(300.0);
-        if item(ui, &tr("新しいターミナル"), &sc(keys, BindAction::NewTerminal), true) {
+        if item(
+            ui,
+            &tr("新しいターミナル"),
+            &sc(keys, BindAction::NewTerminal),
+            true,
+        ) {
             cmds.push(Cmd::NewTerminal);
         }
         ui.separator();
@@ -594,27 +901,29 @@ fn terminal_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut
         if item(ui, &run_label, "", info.run_label.is_some()) {
             cmds.push(Cmd::RunActiveFile);
         }
-        if item(ui, &tr("選択したテキストをターミナルへ送る"), "", info.has_editor) {
+        if item(
+            ui,
+            &tr("選択したテキストをターミナルへ送る"),
+            "",
+            info.has_editor,
+        ) {
             cmds.push(Cmd::RunSelection);
         }
         let build_label = match &info.build_task {
             Some(l) => format!("🔨 {l}"),
             None => tr("ビルド タスクの実行…"),
         };
-        if item(ui, &build_label, &sc(keys, BindAction::RunBuildTask), info.build_task.is_some())
-        {
+        if item(
+            ui,
+            &build_label,
+            &sc(keys, BindAction::RunBuildTask),
+            info.build_task.is_some(),
+        ) {
             cmds.push(Cmd::RunBuildTask);
         }
-        if !info.plugin_commands.is_empty() {
+        if has_tasks(info) {
             ui.separator();
-            ui.menu_button(tr("タスクの実行…"), |ui| {
-                ui.set_min_width(300.0);
-                for (pi, ci, icon, title) in &info.plugin_commands {
-                    if item(ui, &format!("{icon} {title}"), "", true) {
-                        cmds.push(Cmd::RunPlugin(*pi, *ci));
-                    }
-                }
-            });
+            tasks_submenu(ui, info, cmds);
         }
     });
 }
@@ -629,7 +938,12 @@ fn help_menu(ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
         if item(ui, &tr("キーボード ショートカットのリファレンス"), "", true) {
             cmds.push(Cmd::ShowShortcuts);
         }
-        if item(ui, &tr("コマンド パレットですべてのコマンドを表示"), "", true) {
+        if item(
+            ui,
+            &tr("コマンド パレットですべてのコマンドを表示"),
+            "",
+            true,
+        ) {
             cmds.push(Cmd::OpenCommandPalette);
         }
         ui.separator();
@@ -684,6 +998,35 @@ pub fn runner_for(path: &Path, root: &Path) -> Option<String> {
         "swift" => format!("swift {q}"),
         _ => return None,
     })
+}
+
+/// 「タスクの実行…」と コマンドパレットに出す tasks.json の行数の上限。
+/// これを超える定義はメニューを縦に破壊するだけなので出さない。
+pub const MAX_TASK_ROWS: usize = 40;
+
+/// `.vscode/tasks.json` の走査結果を「タスクの実行…」の行へ落とす純関数。
+///
+/// 走らせられないタスクを**黙って消さない** — 行は出したまま理由を持たせ、
+/// 描画側がグレーアウトとホバーに使う。理由が `None` の行だけが実行できる。
+///
+/// OS 差分は `cfg!` ではなく引数で選ぶ (そうしないと片側しかテストできない)。
+pub fn task_rows(
+    doc: &crate::tasks::TasksDoc,
+    file: Option<&Path>,
+    windows: bool,
+) -> Vec<(usize, String, Option<String>)> {
+    doc.tasks
+        .iter()
+        .enumerate()
+        .take(MAX_TASK_ROWS)
+        .map(|(i, t)| {
+            (
+                i,
+                t.label.clone(),
+                crate::tasks::resolve(t, file, windows).err(),
+            )
+        })
+        .collect()
 }
 
 /// ワークスペースのビルドタスクを検出する。(ラベル, コマンド)
@@ -771,7 +1114,10 @@ mod tests {
     #[test]
     fn runner_for_rust_requires_cargo_project() {
         // Cargo.toml が無いルートでは .rs は実行できない
-        assert_eq!(runner_for(Path::new("/a/main.rs"), Path::new("/nonexistent")), None);
+        assert_eq!(
+            runner_for(Path::new("/a/main.rs"), Path::new("/nonexistent")),
+            None
+        );
     }
 
     #[test]
@@ -819,7 +1165,10 @@ mod tests {
 
     #[test]
     fn shq_preserves_spaces_inside_quotes() {
-        assert_eq!(shq(Path::new("/my dir/file name.txt")), "'/my dir/file name.txt'");
+        assert_eq!(
+            shq(Path::new("/my dir/file name.txt")),
+            "'/my dir/file name.txt'"
+        );
     }
 
     #[test]
@@ -862,7 +1211,11 @@ mod tests {
         if let Some(home) = dirs::home_dir() {
             assert_eq!(
                 display_path(&home.join("proj").join("main.rs")),
-                format!("~{}proj{}main.rs", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR)
+                format!(
+                    "~{}proj{}main.rs",
+                    std::path::MAIN_SEPARATOR,
+                    std::path::MAIN_SEPARATOR
+                )
             );
             // ホームそのものは "~" になる
             assert_eq!(display_path(&home), "~");
@@ -900,5 +1253,114 @@ mod tests {
         assert_eq!(native_sc(""), "");
         assert_eq!(native_sc("nosuchkey"), "");
         assert_eq!(native_sc("badmod+c"), "");
+    }
+
+    // ── tasks.json の行 ────────────────────────────────────────
+
+    /// ディスクに**本物の** `.vscode/tasks.json` (コメント・末尾カンマ・
+    /// 未対応変数入り) を置いて、「タスクの実行…」の行になるまでを通す。
+    #[test]
+    fn tasks_json_rows_keep_unrunnable_tasks_with_a_reason() {
+        let root = crate::test_util::unique_temp_dir("zaivern-menu-tasks", "rows");
+        let p = crate::tasks::tasks_json_path(&root);
+        std::fs::create_dir_all(p.parent().expect("親")).expect("mkdir .vscode");
+        std::fs::write(
+            &p,
+            concat!(
+                "{\n",
+                "  // JSONC: 行コメント\n",
+                "  /* ブロックコメントも通る */\n",
+                "  \"version\": \"2.0.0\",\n",
+                "  \"tasks\": [\n",
+                "    {\n",
+                "      \"label\": \"say hello\",\n",
+                "      \"type\": \"shell\",\n",
+                "      \"command\": \"echo\",\n",
+                "      \"args\": [\"zaivern hello\"],\n",
+                "    },\n",
+                "    {\n",
+                "      \"label\": \"lint this file\",\n",
+                "      \"type\": \"shell\",\n",
+                "      \"command\": \"echo ${file}\",\n",
+                "    },\n",
+                "    {\n",
+                "      \"label\": \"pick a target\",\n",
+                "      \"type\": \"shell\",\n",
+                "      \"command\": \"echo ${input:target} ${command:foo}\",\n",
+                "    },\n",
+                "  ],\n", // ← 末尾カンマ
+                "}\n"
+            ),
+        )
+        .expect("write tasks.json");
+
+        let doc = crate::tasks::load_tasks(&root);
+        assert_eq!(doc.error, None, "{doc:?}");
+
+        // アクティブファイルが無いとき
+        let rows = task_rows(&doc, None, false);
+        let names: Vec<&str> = rows.iter().map(|(_, l, _)| l.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["say hello", "lint this file", "pick a target"],
+            "3 件とも一覧に出る (壊れていても消さない)"
+        );
+        assert_eq!(rows[0].2, None, "echo タスクは実行できる");
+        assert!(rows[1].2.is_some(), "${{file}} はアクティブファイルが要る");
+        let why = rows[2].2.clone().expect("未対応変数の理由");
+        assert!(
+            why.contains("${input:target}") || why.contains("${command:foo}"),
+            "理由に未対応の変数が出る: {why}"
+        );
+
+        // アクティブファイルがあれば ${file} のタスクだけ実行できるようになる
+        let f = root.join("a.rs");
+        let rows = task_rows(&doc, Some(&f), false);
+        assert_eq!(rows[1].2, None, "${{file}} が解決できる");
+        assert!(rows[2].2.is_some(), "未対応変数は依然として実行させない");
+
+        // index はそのまま Cmd::RunJsonTask の引数になる (並びと一致すること)
+        assert_eq!(
+            rows.iter().map(|(i, ..)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        std::fs::remove_dir_all(&root).expect("後片付け");
+    }
+
+    /// 既定のビルドタスクは `⇧⌘B` が拾える形で出てくる。
+    #[test]
+    fn tasks_json_default_build_is_reachable_from_the_build_shortcut() {
+        let root = crate::test_util::unique_temp_dir("zaivern-menu-tasks", "build");
+        let p = crate::tasks::tasks_json_path(&root);
+        std::fs::create_dir_all(p.parent().expect("親")).expect("mkdir .vscode");
+        std::fs::write(
+            &p,
+            concat!(
+                "{\n",
+                "  \"tasks\": [\n",
+                "    { \"label\": \"other\", \"command\": \"echo other\" },\n",
+                "    {\n",
+                "      \"label\": \"my build\",\n",
+                "      \"command\": \"echo built\",\n",
+                "      \"group\": { \"kind\": \"build\", \"isDefault\": true }\n",
+                "    }\n",
+                "  ]\n",
+                "}\n"
+            ),
+        )
+        .expect("write tasks.json");
+
+        let doc = crate::tasks::load_tasks(&root);
+        let b = doc.default_build().expect("既定のビルドタスク");
+        assert_eq!(b.label, "my build");
+        assert_eq!(
+            crate::tasks::resolve(b, None, false).expect("実行行"),
+            "echo built"
+        );
+        // 自動検出は素のフォルダでは何も見つけない → tasks.json 側が拾われる
+        assert_eq!(build_task_for(&root), None);
+
+        std::fs::remove_dir_all(&root).expect("後片付け");
     }
 }

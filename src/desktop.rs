@@ -347,7 +347,9 @@ const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Fram
 
 #[cfg(target_os = "macos")]
 fn app_bundle_path() -> Result<PathBuf, String> {
-    Ok(home_dir()?.join("Applications").join(format!("{APP_NAME}.app")))
+    Ok(home_dir()?
+        .join("Applications")
+        .join(format!("{APP_NAME}.app")))
 }
 
 /// `.app` 一式を `app` へ書き出す。テストから fake root と偽の配置関数を
@@ -460,13 +462,15 @@ fn install() -> Result<String, String> {
     let home = home_dir()?;
     let (desktop, icon) = linux_paths()?;
     if let Some(dir) = icon.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
     }
     let img = load_icon_image()?;
     std::fs::write(&icon, png_square(&img, 512)?)
         .map_err(|e| format!("アイコンを書けません: {e}"))?;
     if let Some(dir) = desktop.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
         std::fs::write(&desktop, desktop_entry(&bin, &home))
             .map_err(|e| format!(".desktop を書けません: {e}"))?;
         // メニューのキャッシュ更新は任意 (無いディストリでも登録自体は有効)
@@ -550,11 +554,13 @@ fn install() -> Result<String, String> {
     let home = home_dir()?;
     let (lnk, ico) = windows_paths()?;
     if let Some(dir) = ico.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
     }
     std::fs::write(&ico, ico_bytes(ICON_PNG)?).map_err(|e| format!(".ico を書けません: {e}"))?;
     if let Some(dir) = lnk.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
     }
     run_powershell(&shortcut_ps(&lnk, &bin, &home, &ico))?;
     Ok(format!(
@@ -614,7 +620,11 @@ mod tests {
             tags.push(tag);
             pos += len;
         }
-        assert_eq!(pos, buf.len(), "チャンク列がちょうどファイル末尾で終わること");
+        assert_eq!(
+            pos,
+            buf.len(),
+            "チャンク列がちょうどファイル末尾で終わること"
+        );
         for expect in [b"ic07", b"ic08", b"ic09"] {
             assert!(tags.contains(expect), "{:?} チャンクがあること", expect);
         }
@@ -671,16 +681,31 @@ mod tests {
         }
     }
 
-    fn chain_case(dir: &Path, name: &str, hard_ok: bool, sym_ok: bool, copy_ok: bool) -> Result<LinkKind, String> {
+    fn chain_case(
+        dir: &Path,
+        name: &str,
+        hard_ok: bool,
+        sym_ok: bool,
+        copy_ok: bool,
+    ) -> Result<LinkKind, String> {
         let src = dir.join(format!("{name}-src"));
         std::fs::write(&src, "binary").unwrap();
         let dst = dir.join(name);
-        let h: Box<dyn Fn(&Path, &Path) -> std::io::Result<()>> =
-            if hard_ok { Box::new(ok_with("hard")) } else { Box::new(fail()) };
-        let s: Box<dyn Fn(&Path, &Path) -> std::io::Result<()>> =
-            if sym_ok { Box::new(ok_with("sym")) } else { Box::new(fail()) };
-        let c: Box<dyn Fn(&Path, &Path) -> std::io::Result<()>> =
-            if copy_ok { Box::new(ok_with("copy")) } else { Box::new(fail()) };
+        let h: Box<dyn Fn(&Path, &Path) -> std::io::Result<()>> = if hard_ok {
+            Box::new(ok_with("hard"))
+        } else {
+            Box::new(fail())
+        };
+        let s: Box<dyn Fn(&Path, &Path) -> std::io::Result<()>> = if sym_ok {
+            Box::new(ok_with("sym"))
+        } else {
+            Box::new(fail())
+        };
+        let c: Box<dyn Fn(&Path, &Path) -> std::io::Result<()>> = if copy_ok {
+            Box::new(ok_with("copy"))
+        } else {
+            Box::new(fail())
+        };
         place_executable_with(&src, &dst, h, s, c)
     }
 
@@ -724,7 +749,10 @@ mod tests {
         )
         .expect("配置");
         assert_eq!(kind, LinkKind::Hard);
-        assert!(!sym_called.get(), "成功後にシンボリックリンクを試さないこと");
+        assert!(
+            !sym_called.get(),
+            "成功後にシンボリックリンクを試さないこと"
+        );
         assert!(!copy_called.get(), "成功後にコピーを試さないこと");
         // ハードリンク先も元も中身が生きていること (切り詰め事故の直接検知)
         assert_eq!(std::fs::read_to_string(&src).unwrap(), "binary");
@@ -735,7 +763,8 @@ mod tests {
     fn place_executable_reports_all_failures() {
         let dir = crate::test_util::unique_temp_dir("zaivern-desktop-test", "chain-fail");
         let err = chain_case(&dir, "exe-none", false, false, false).unwrap_err();
-        for needle in ["ハードリンク", "シンボリックリンク", "コピー", "exe-none"] {
+        for needle in ["ハードリンク", "シンボリックリンク", "コピー", "exe-none"]
+        {
             assert!(err.contains(needle), "失敗理由に {needle} が無い: {err}");
         }
         assert!(!dir.join("exe-none").exists(), "全滅なら何も残さない");
@@ -750,7 +779,11 @@ mod tests {
         std::fs::write(&src, "binary").unwrap();
         let kind = place_executable_with(&src, &dst, ok_with("hard"), fail(), fail()).unwrap();
         assert_eq!(kind, LinkKind::Hard);
-        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "hard", "張り直されること");
+        assert_eq!(
+            std::fs::read_to_string(&dst).unwrap(),
+            "hard",
+            "張り直されること"
+        );
     }
 
     #[test]
@@ -759,8 +792,15 @@ mod tests {
         let dir = crate::test_util::unique_temp_dir("zaivern-desktop-test", "self");
         let p = dir.join("Zaivern");
         std::fs::write(&p, "binary").unwrap();
-        assert_eq!(place_executable_with(&p, &p, fail(), fail(), fail()), Ok(LinkKind::Hard));
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "binary", "自分自身は無傷");
+        assert_eq!(
+            place_executable_with(&p, &p, fail(), fail(), fail()),
+            Ok(LinkKind::Hard)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "binary",
+            "自分自身は無傷"
+        );
     }
 
     // ── バンドル一式のレイアウト: 作った物と、uninstall が全部消すこと ──
@@ -777,7 +817,9 @@ mod tests {
         std::fs::write(app.join("Contents/MacOS/zai"), "#!/bin/sh\nexec zai\n").unwrap();
 
         let kind = write_bundle(&app, &bin, "9.9.9", |s, d| {
-            std::fs::hard_link(s, d).map(|_| LinkKind::Hard).map_err(|e| e.to_string())
+            std::fs::hard_link(s, d)
+                .map(|_| LinkKind::Hard)
+                .map_err(|e| e.to_string())
         })
         .expect("bundle");
         assert_eq!(kind, LinkKind::Hard);
@@ -796,13 +838,20 @@ mod tests {
         assert!(text.contains("<key>CFBundleExecutable</key><string>Zaivern</string>"));
         assert!(text.contains("<string>9.9.9</string>"));
         assert!(text.contains(APP_NAME));
-        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "ELF-ish", "中身は本体と同じ");
+        assert_eq!(
+            std::fs::read_to_string(&exe).unwrap(),
+            "ELF-ish",
+            "中身は本体と同じ"
+        );
 
         // uninstall は .app 配下を全部消し、リンク元のバイナリには触らない。
         assert!(remove_bundle(&app).expect("uninstall"), "消す物があった");
         assert!(!app.exists(), ".app が丸ごと消えること");
         assert!(bin.exists(), "リンク元の zai 本体は残ること");
-        assert!(!remove_bundle(&app).expect("再 uninstall"), "2 回目は何もしない");
+        assert!(
+            !remove_bundle(&app).expect("再 uninstall"),
+            "2 回目は何もしない"
+        );
     }
 
     // ── .app 起動時の作業ディレクトリ補正 (ランチャーの `cd $HOME` の代替) ──
@@ -875,7 +924,10 @@ mod tests {
             Path::new(r"C:\Users\o'brien\Zaivern.ico"),
         );
         assert!(s.contains("WScript.Shell"));
-        assert!(s.contains(r"$s.TargetPath = 'C:\Users\o''brien\zai.exe'"), "' は '' に畳むこと");
+        assert!(
+            s.contains(r"$s.TargetPath = 'C:\Users\o''brien\zai.exe'"),
+            "' は '' に畳むこと"
+        );
         assert!(s.contains("$s.Save()"));
     }
 

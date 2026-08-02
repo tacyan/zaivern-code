@@ -134,7 +134,11 @@ fn normalize_command(command: &str) -> String {
 fn preset_key(p: &AgentPreset) -> String {
     let mut env: Vec<String> = p.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     env.sort();
-    format!("{}\u{1}{}", normalize_command(&p.command), env.join("\u{2}"))
+    format!(
+        "{}\u{1}{}",
+        normalize_command(&p.command),
+        env.join("\u{2}")
+    )
 }
 
 /// 素のプリセット (承認の既定は CLI 側にまかせる)。
@@ -396,9 +400,17 @@ fn agent_row(
                 .color(theme.text_dim),
         );
         if row.installed {
-            ui.label(RichText::new(tr("✅ インストール済み")).size(10.5).color(theme.ok));
+            ui.label(
+                RichText::new(tr("✅ インストール済み"))
+                    .size(10.5)
+                    .color(theme.ok),
+            );
         } else {
-            ui.label(RichText::new(tr("⚠ 未インストール")).size(10.5).color(theme.warn));
+            ui.label(
+                RichText::new(tr("⚠ 未インストール"))
+                    .size(10.5)
+                    .color(theme.warn),
+            );
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -440,9 +452,12 @@ fn agent_row(
     // 未インストールなら入れ方を併記する。
     if !row.installed && !spec.install.is_empty() {
         ui.label(
-            RichText::new(trf("インストール: {cmd}", &[("cmd", spec.install.to_string())]))
-                .size(10.5)
-                .color(theme.text_dim),
+            RichText::new(trf(
+                "インストール: {cmd}",
+                &[("cmd", spec.install.to_string())],
+            ))
+            .size(10.5)
+            .color(theme.text_dim),
         );
     }
 }
@@ -486,7 +501,11 @@ mod tests {
         let installed = Installed::from_bins(&["aider", "qwen"]);
         let rows = rows(&installed, &no_presets(), "");
         let first_two: Vec<&str> = rows.iter().take(2).map(|r| r.spec.bin).collect();
-        assert_eq!(first_two, vec!["qwen", "aider"], "インストール済みが先頭に来る");
+        assert_eq!(
+            first_two,
+            vec!["qwen", "aider"],
+            "インストール済みが先頭に来る"
+        );
         assert!(
             rows.iter().skip(2).all(|r| !r.installed),
             "3 件目以降に未インストールが混ざる順序になっている"
@@ -546,7 +565,10 @@ mod tests {
         let goose = crate::agents::spec_for_bin("goose").unwrap();
         assert!(goose.auto_flag.is_empty(), "前提: goose にフラグは無い");
         let auto = auto_preset(goose).expect("goose は環境変数経由で全自動にできる");
-        assert_eq!(auto.command, "goose", "コマンドにフラグを捏造してはいけない");
+        assert_eq!(
+            auto.command, "goose",
+            "コマンドにフラグを捏造してはいけない"
+        );
         assert_eq!(auto.env.get("GOOSE_MODE").map(String::as_str), Some("auto"));
     }
 
@@ -759,7 +781,11 @@ mod tests {
         let mut lines: Vec<String> = AGENT_CATALOG
             .iter()
             .map(|s| {
-                let mark = if found.is_installed(s.bin) { "OK  " } else { "--  " };
+                let mark = if found.is_installed(s.bin) {
+                    "OK  "
+                } else {
+                    "--  "
+                };
                 format!("{mark}{:<14} {}", s.bin, s.label)
             })
             .collect();

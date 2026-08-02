@@ -101,9 +101,7 @@ pub fn load_dict(path: &Path) -> Result<HashMap<String, String>, String> {
         .map_err(|e| format!("{} を読めません: {e}", path.display()))?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file() && p.extension().map(|x| x == "toml").unwrap_or(false)
-        })
+        .filter(|p| p.is_file() && p.extension().map(|x| x == "toml").unwrap_or(false))
         .collect();
     files.sort();
     if files.is_empty() {
@@ -173,8 +171,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("zai-i18n-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("10-a.toml"), "\"開く\" = \"Open\"\n\"閉じる\" = \"Close\"\n")
-            .unwrap();
+        std::fs::write(
+            root.join("10-a.toml"),
+            "\"開く\" = \"Open\"\n\"閉じる\" = \"Close\"\n",
+        )
+        .unwrap();
         std::fs::write(root.join("20-b.toml"), "\"閉じる\" = \"Close!\"\n").unwrap();
         std::fs::write(root.join("readme.txt"), "not a dict").unwrap();
 
@@ -222,9 +223,7 @@ mod tests {
         let mut out = std::collections::BTreeSet::new();
         for part in s.split('{').skip(1) {
             if let Some((name, _)) = part.split_once('}') {
-                if !name.is_empty()
-                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     out.insert(name.to_string());
                 }
             }
@@ -250,11 +249,7 @@ mod tests {
         // まず検出器自体の健全性を固定 (壊れると下の検査が空振りする)
         assert_eq!(
             placeholders("{n} 件を {dir} へ ({e})"),
-            std::collections::BTreeSet::from([
-                "dir".to_string(),
-                "e".to_string(),
-                "n".to_string()
-            ])
+            std::collections::BTreeSet::from(["dir".to_string(), "e".to_string(), "n".to_string()])
         );
         assert!(placeholders("プレースホルダなし {不正} {a b}").is_empty());
 
@@ -278,7 +273,10 @@ mod tests {
             bad.join("\n")
         );
         // 検査が空振りしていないこと (現在 200 件以上ある)
-        assert!(with_ph > 0, "プレースホルダ付きキーが 1 件も無い (検出の退化を疑う)");
+        assert!(
+            with_ph > 0,
+            "プレースホルダ付きキーが 1 件も無い (検出の退化を疑う)"
+        );
     }
 
     #[test]
@@ -338,7 +336,10 @@ mod tests {
         // 既知キーは訳される
         assert_eq!(tr("設定"), "Settings");
         // 未知キーは原文 (日本語) をそのまま返す = UI が壊れない
-        assert_eq!(tr("この文字列は辞書に存在しない"), "この文字列は辞書に存在しない");
+        assert_eq!(
+            tr("この文字列は辞書に存在しない"),
+            "この文字列は辞書に存在しない"
+        );
         set_dict(None);
     }
 

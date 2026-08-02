@@ -200,10 +200,22 @@ pub fn base_text_styles() -> [(egui::TextStyle, f32, egui::FontFamily); 5] {
     use egui::{FontFamily, TextStyle};
     [
         (TextStyle::Body, BASE_BODY_SIZE, FontFamily::Proportional),
-        (TextStyle::Button, BASE_BUTTON_SIZE, FontFamily::Proportional),
+        (
+            TextStyle::Button,
+            BASE_BUTTON_SIZE,
+            FontFamily::Proportional,
+        ),
         (TextStyle::Small, BASE_SMALL_SIZE, FontFamily::Proportional),
-        (TextStyle::Heading, BASE_HEADING_SIZE, FontFamily::Proportional),
-        (TextStyle::Monospace, BASE_MONOSPACE_SIZE, FontFamily::Monospace),
+        (
+            TextStyle::Heading,
+            BASE_HEADING_SIZE,
+            FontFamily::Proportional,
+        ),
+        (
+            TextStyle::Monospace,
+            BASE_MONOSPACE_SIZE,
+            FontFamily::Monospace,
+        ),
     ]
 }
 
@@ -586,7 +598,10 @@ mod tests {
             assert!(snap_len(-6.0, ppp) < 0.0, "ppp={ppp}: 符号が反転した");
             let s = snap_len(6.0, ppp);
             let px = s * ppp;
-            assert!((px - px.round()).abs() < 1e-3, "ppp={ppp}: {px}px が整数でない");
+            assert!(
+                (px - px.round()).abs() < 1e-3,
+                "ppp={ppp}: {px}px が整数でない"
+            );
         }
         assert_eq!(snap_len(6.0, f32::NAN).to_bits(), 6.0_f32.to_bits());
     }
@@ -651,7 +666,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{ts:?} が Style に無い"));
             assert_eq!(got.size, snap_font_size(size, ppp), "{ts:?}");
         }
-        assert_eq!(style.spacing.item_spacing, snap_vec2(BASE_ITEM_SPACING, ppp));
+        assert_eq!(
+            style.spacing.item_spacing,
+            snap_vec2(BASE_ITEM_SPACING, ppp)
+        );
         assert_eq!(
             style.spacing.button_padding,
             snap_vec2(BASE_BUTTON_PADDING, ppp)
@@ -671,7 +689,11 @@ mod tests {
         let dark = ctx.style_of(egui::Theme::Dark);
         let light = ctx.style_of(egui::Theme::Light);
         for (ts, _, _) in base_text_styles() {
-            assert_eq!(dark.text_styles.get(&ts), light.text_styles.get(&ts), "{ts:?}");
+            assert_eq!(
+                dark.text_styles.get(&ts),
+                light.text_styles.get(&ts),
+                "{ts:?}"
+            );
         }
         assert_eq!(dark.spacing.item_spacing, light.spacing.item_spacing);
     }
@@ -694,7 +716,10 @@ mod tests {
         ctx.set_pixels_per_point(1.25);
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         let ppp = ctx.pixels_per_point();
-        assert!((ppp - 1.25).abs() < 1e-6, "テスト前提が崩れている: ppp={ppp}");
+        assert!(
+            (ppp - 1.25).abs() < 1e-6,
+            "テスト前提が崩れている: ppp={ppp}"
+        );
 
         let style = ctx.style();
         for (ts, size, _) in base_text_styles() {
@@ -704,7 +729,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("{ts:?} が Style に無い"));
             assert_eq!(got.size, snap_font_size(size, 1.25), "{ts:?}");
             let px = got.size * 1.25;
-            assert!((px - px.round()).abs() < 1e-3, "{ts:?}: {px}px が整数でない");
+            assert!(
+                (px - px.round()).abs() < 1e-3,
+                "{ts:?}: {px}px が整数でない"
+            );
         }
         // 追従済みなので、もう一度呼んでも書き込みは起きない。
         assert!(!resync_pixel_snapping(&ctx));

@@ -165,7 +165,8 @@ impl SlashCommandEngine {
             }
             SlashCommand::Learn(prompt) => {
                 if prompt.is_empty() {
-                    "🧠 [Learn Mode] 今回の解決策およびルールを記憶として記録してください。".to_string()
+                    "🧠 [Learn Mode] 今回の解決策およびルールを記憶として記録してください。"
+                        .to_string()
                 } else {
                     format!("🧠 [Learn Mode] 以下のルールおよび知見を記録・永続記憶してください:\n{prompt}")
                 }
@@ -437,7 +438,10 @@ impl AgentInputBuffer {
 
     /// アクティブでない送信先に残っている下書きの数 (UI のバッジ用)
     pub fn pending_draft_count(&self) -> usize {
-        self.drafts.values().filter(|s| !s.trim().is_empty()).count()
+        self.drafts
+            .values()
+            .filter(|s| !s.trim().is_empty())
+            .count()
     }
 
     /// エージェントが畳まれたら、その宛先の下書きも捨てる。
@@ -455,7 +459,10 @@ impl AgentInputBuffer {
             // 退避させずに捨てる (set_target だと空を書き戻してしまう)
             self.text.clear();
             self.target = ComposerTarget::Broadcast;
-            self.text = self.drafts.remove(&ComposerTarget::Broadcast).unwrap_or_default();
+            self.text = self
+                .drafts
+                .remove(&ComposerTarget::Broadcast)
+                .unwrap_or_default();
             self.cursor = self.text.chars().count();
             self.selection = None;
             self.history_idx = None;
@@ -818,7 +825,8 @@ mod tests {
 
     #[test]
     fn test_goal_and_loop_expansion() {
-        let goal_cmd = SlashCommandEngine::parse("/goal DBのインデックス設計を見直して速度を100倍にする");
+        let goal_cmd =
+            SlashCommandEngine::parse("/goal DBのインデックス設計を見直して速度を100倍にする");
         let expanded = SlashCommandEngine::expand_command(&goal_cmd);
         assert!(expanded.contains("[Goal Mode]"));
         assert!(expanded.contains("DBのインデックス設計を見直して速度を100倍にする"));
@@ -839,7 +847,11 @@ mod tests {
             let _expanded = SlashCommandEngine::expand_command(&cmd);
         }
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() < 2000, "Parsing took too long: {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 2000,
+            "Parsing took too long: {:?}",
+            elapsed
+        );
     }
 
     // ---- レビュープロンプトの流し込み ----
@@ -847,8 +859,13 @@ mod tests {
     #[test]
     fn append_prompt_into_empty_buffer() {
         let mut b = AgentInputBuffer::new();
-        assert!(b.append_prompt("  以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x\n直して  "));
-        assert_eq!(b.text(), "以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x\n直して");
+        assert!(b.append_prompt(
+            "  以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x\n直して  "
+        ));
+        assert_eq!(
+            b.text(),
+            "以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x\n直して"
+        );
         assert_eq!(b.cursor(), b.text().chars().count());
     }
 
@@ -903,7 +920,11 @@ mod tests {
         assert_eq!(b.draft_for(A2), "codex へ: ドキュメントを更新");
         assert_eq!(b.draft_for(A1), "claude へ: このテストを直して");
         assert_eq!(b.draft_for(BC), "全員へ: リリース準備");
-        assert_eq!(b.draft_for(ComposerTarget::Agent(999)), "", "未使用の宛先は空");
+        assert_eq!(
+            b.draft_for(ComposerTarget::Agent(999)),
+            "",
+            "未使用の宛先は空"
+        );
         assert_eq!(b.target(), A2);
         assert_eq!(b.pending_draft_count(), 2, "アクティブ以外の下書きが 2 件");
     }
@@ -943,7 +964,11 @@ mod tests {
         b.retain_agents(&[2]);
         assert_eq!(b.draft_for(A1), "", "1 番は生きていないので消える");
         assert_eq!(b.draft_for(A2), "2 番へ", "2 番だけ残る");
-        assert_eq!(b.target(), BC, "アクティブだった 3 番が消えたら全員宛てへ戻る");
+        assert_eq!(
+            b.target(),
+            BC,
+            "アクティブだった 3 番が消えたら全員宛てへ戻る"
+        );
         assert_eq!(b.text(), "");
     }
 
@@ -989,7 +1014,10 @@ mod tests {
         // 先頭のエージェントを名指しする
         b.pick_target(A1);
         for frame in 0..5 {
-            assert!(!b.sync_target(Some(last)), "{frame}: 追従が指名を上書きした");
+            assert!(
+                !b.sync_target(Some(last)),
+                "{frame}: 追従が指名を上書きした"
+            );
             assert_eq!(b.target(), A1, "{frame} フレーム後に最後へ戻された");
         }
 
@@ -1021,10 +1049,16 @@ mod tests {
         b.set_text("1 番に書きかけ");
 
         // レビュープロンプトを別のエージェント宛てに置く
-        b.set_draft_for(A2, "以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x");
+        b.set_draft_for(
+            A2,
+            "以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x",
+        );
         assert_eq!(b.target(), A1, "送信先は勝手に変わらない");
         assert_eq!(b.text(), "1 番に書きかけ", "書きかけを奪われない");
-        assert_eq!(b.draft_for(A2), "以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x");
+        assert_eq!(
+            b.draft_for(A2),
+            "以下のレビューコメントに対応してください:\n\n@a.rs:1\n> x"
+        );
 
         // アクティブな宛先を指定した場合は set_text と同じ (Undo で戻せる)
         b.set_draft_for(A1, "上書き");
@@ -1051,7 +1085,11 @@ mod tests {
         active.set_target(A2);
         active.set_text("書きかけ\n\n\n");
         assert!(active.append_prompt_for(A2, "@a.rs:1\n> x\n直して"));
-        assert_eq!(active.text(), stashed.draft_for(A2), "宛先がどこでも結果は同じ");
+        assert_eq!(
+            active.text(),
+            stashed.draft_for(A2),
+            "宛先がどこでも結果は同じ"
+        );
 
         // 空プロンプトは無視され、空の枠も作らない
         let mut b = AgentInputBuffer::new();

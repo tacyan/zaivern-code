@@ -528,7 +528,12 @@ const JIS_TO_CP932: &[(char, char)] = &[
 /// JIS 側の字形を CP932 側へ寄せる。対象が 1 文字も無ければ入力をそのまま返す
 /// (借用のまま返るので、ほとんどの本文では確保が起きない)。
 pub fn fold_to_cp932(text: &str) -> std::borrow::Cow<'_, str> {
-    let hit = |c: char| JIS_TO_CP932.iter().find(|(jis, _)| *jis == c).map(|(_, w)| *w);
+    let hit = |c: char| {
+        JIS_TO_CP932
+            .iter()
+            .find(|(jis, _)| *jis == c)
+            .map(|(_, w)| *w)
+    };
     if !text.chars().any(|c| hit(c).is_some()) {
         return std::borrow::Cow::Borrowed(text);
     }
@@ -645,22 +650,42 @@ const PROBE_LATIN: &str = "café naïve ÿ\n";
 fn encoding_candidates() -> Vec<(Encoding, &'static str, &'static [&'static str])> {
     let mut v: Vec<(Encoding, &'static str, &'static [&'static str])> = vec![
         (Encoding::Utf8, "utf-8", &["utf8", "u8"]),
-        (Encoding::Utf8Bom, "utf-8-bom", &["utf8bom", "utf-8 bom", "bom"]),
-        (Encoding::Utf16Le, "utf-16le", &["utf16le", "utf-16 le", "ucs-2le"]),
-        (Encoding::Utf16Be, "utf-16be", &["utf16be", "utf-16 be", "ucs-2be"]),
+        (
+            Encoding::Utf8Bom,
+            "utf-8-bom",
+            &["utf8bom", "utf-8 bom", "bom"],
+        ),
+        (
+            Encoding::Utf16Le,
+            "utf-16le",
+            &["utf16le", "utf-16 le", "ucs-2le"],
+        ),
+        (
+            Encoding::Utf16Be,
+            "utf-16be",
+            &["utf16be", "utf-16 be", "ucs-2be"],
+        ),
         (
             Encoding::Ansi(CP_932),
             "cp932",
             &["shift_jis", "shift-jis", "sjis", "ms932", "windows-31j"],
         ),
         (Encoding::Ansi(CP_EUC_JP), "cp51932", &["euc-jp", "eucjp"]),
-        (Encoding::Ansi(CP_EUC_JP_X0212), "cp20932", &["euc-jp-x0212"]),
+        (
+            Encoding::Ansi(CP_EUC_JP_X0212),
+            "cp20932",
+            &["euc-jp-x0212"],
+        ),
         (
             Encoding::Ansi(CP_ISO2022JP),
             "cp50220",
             &["iso-2022-jp", "jis", "iso2022jp"],
         ),
-        (Encoding::Ansi(CP_ISO2022JP_ALLOW1B), "cp50221", &["iso-2022-jp-1"]),
+        (
+            Encoding::Ansi(CP_ISO2022JP_ALLOW1B),
+            "cp50221",
+            &["iso-2022-jp-1"],
+        ),
         (
             Encoding::Ansi(CP_LATIN1),
             "cp28591",
@@ -832,7 +857,9 @@ fn decode_exact(bytes: &[u8], enc: Encoding) -> String {
             String::from_utf8_lossy(body).into_owned()
         }
         Encoding::Utf16Le => decode_utf16(bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes), true),
-        Encoding::Utf16Be => decode_utf16(bytes.strip_prefix(&[0xFE, 0xFF]).unwrap_or(bytes), false),
+        Encoding::Utf16Be => {
+            decode_utf16(bytes.strip_prefix(&[0xFE, 0xFF]).unwrap_or(bytes), false)
+        }
         Encoding::Ansi(cp) => decode_ansi_or_lossy(bytes, cp),
     }
 }
@@ -1168,7 +1195,11 @@ fn score_iso2022jp(b: &[u8]) -> f32 {
         return 0.0;
     }
     let esc = b.windows(3).any(|w| {
-        w[0] == 0x1B && matches!((w[1], w[2]), (b'$', b'B') | (b'$', b'@') | (b'(', b'B') | (b'(', b'J'))
+        w[0] == 0x1B
+            && matches!(
+                (w[1], w[2]),
+                (b'$', b'B') | (b'$', b'@') | (b'(', b'B') | (b'(', b'J')
+            )
     });
     if esc {
         0.95
@@ -1237,7 +1268,8 @@ mod win {
         }
         let len = i32::try_from(bytes.len()).ok()?;
         // 1 回目は必要な UTF-16 長を問い合わせるだけ (出力バッファは渡さない)
-        let need = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+        let need =
+            unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
         if need <= 0 {
             return None;
         }
@@ -1859,6 +1891,81 @@ pub fn truncate_to_width(s: &str, max: usize) -> String {
     out
 }
 
+/// 絵文字の肌色修飾子 (Emoji_Modifier)。前の絵文字にくっついて 1 つの
+/// 書記素クラスタを作るが、幅は 2 なので [`char_width`] では 0 にならない。
+const EMOJI_MODIFIER: (u32, u32) = (0x1F3FB, 0x1F3FF);
+/// 地域表示記号。2 つ並んで 1 つの国旗になる。
+const REGIONAL_INDICATOR: (u32, u32) = (0x1F1E6, 0x1F1FF);
+/// ZERO WIDTH JOINER。直後の文字まで巻き込んで 1 クラスタにする
+/// (`👨‍👩‍👧` = 人 + ZWJ + 人 + ZWJ + 人)。
+const ZWJ: char = '\u{200D}';
+
+fn in_range(r: (u32, u32), c: char) -> bool {
+    let u = c as u32;
+    u >= r.0 && u <= r.1
+}
+
+/// この文字は「直前のクラスタにくっつく」か。
+///
+/// 幅 0 の文字 (結合ダイアクリティカル・異体字セレクタ・ZWJ) と絵文字修飾子が該当する。
+/// **ASCII 制御文字は除く** — `\t` や `\n` も [`char_width`] は 0 を返すが、
+/// これらは独立したトークンでなければ差分のトークン分割が壊れる。
+fn joins_previous(c: char) -> bool {
+    let u = c as u32;
+    if u < 0x20 || u == 0x7F {
+        return false;
+    }
+    char_width(c) == 0 || in_range(EMOJI_MODIFIER, c)
+}
+
+/// `s[at..]` の先頭にある**書記素クラスタ**の終端バイト位置を返す。
+///
+/// `at` は文字境界であること (そうでなければ `at` をそのまま返す)。
+/// 戻り値は必ず文字境界なので、`&s[at..end]` は panic しない。
+///
+/// 完全な UAX #29 ではなく、差分の語単位ハイライトに必要な範囲だけを見る:
+/// 結合記号・異体字セレクタ・ZWJ 連結・絵文字の肌色修飾子・国旗 (地域表示記号 2 つ)。
+/// ハングルのジャモ合成は端末グリッドと同じく 1 文字ずつ扱う
+/// ([`str_width`] の方針と揃える)。
+pub fn grapheme_end(s: &str, at: usize) -> usize {
+    if at >= s.len() || !s.is_char_boundary(at) {
+        return at.min(s.len());
+    }
+    let mut it = s[at..].char_indices();
+    let Some((_, first)) = it.next() else {
+        return s.len();
+    };
+    let mut end = at + first.len_utf8();
+    let regional = in_range(REGIONAL_INDICATOR, first);
+    let mut paired_flag = false;
+    let mut after_zwj = false;
+    for (off, c) in it {
+        let abs = at + off;
+        if after_zwj {
+            // ZWJ の直後は無条件で取り込む (絵文字の連結)。
+            end = abs + c.len_utf8();
+            after_zwj = false;
+            continue;
+        }
+        if c == ZWJ {
+            end = abs + c.len_utf8();
+            after_zwj = true;
+            continue;
+        }
+        if joins_previous(c) {
+            end = abs + c.len_utf8();
+            continue;
+        }
+        if regional && !paired_flag && in_range(REGIONAL_INDICATOR, c) {
+            end = abs + c.len_utf8();
+            paired_flag = true;
+            continue;
+        }
+        break;
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1926,7 +2033,11 @@ mod tests {
         // 番号は OS から来た値をそのまま出す。通称は分かるものだけ添える。
         assert_eq!(Encoding::Ansi(932).label(), "CP932 (Shift_JIS)");
         assert_eq!(Encoding::Ansi(1252).label(), "CP1252 (Windows)");
-        assert_eq!(Encoding::Ansi(28591).label(), "CP28591", "知らない番号でも出せる");
+        assert_eq!(
+            Encoding::Ansi(28591).label(),
+            "CP28591",
+            "知らない番号でも出せる"
+        );
         assert!(Encoding::Ansi(932).is_legacy());
     }
 
@@ -1979,7 +2090,10 @@ mod tests {
     fn ps_prelude_is_one_self_contained_line() {
         assert!(PS_UTF8_PRELUDE.ends_with('\n'));
         assert_eq!(PS_UTF8_PRELUDE.lines().count(), 1);
-        assert!(PS_UTF8_PRELUDE.starts_with("try {"), "失敗しても止まらないこと");
+        assert!(
+            PS_UTF8_PRELUDE.starts_with("try {"),
+            "失敗しても止まらないこと"
+        );
     }
 
     /// 打ち切りでお尻が切れた UTF-8 は、コードページで読み直してはいけない。
@@ -1989,7 +2103,10 @@ mod tests {
         let full = "進捗を報告します".as_bytes();
         let cut = &full[..full.len() - 1]; // 最後の 1 文字が途中で切れている
         let s = decode_output(cut);
-        assert!(s.starts_with("進捗を報告しま"), "頭は読めたままであること: {s}");
+        assert!(
+            s.starts_with("進捗を報告しま"),
+            "頭は読めたままであること: {s}"
+        );
     }
 
     // ── 以下は Windows のコードページ変換を実際に叩く ──
@@ -2144,14 +2261,20 @@ mod tests {
         assert_eq!(normalize_to("a\rb", LineEnding::Lf), "a\nb");
         assert_eq!(normalize_to("a\r", LineEnding::Crlf), "a\r\n");
         // 末尾に改行が無い本文は末尾に何も足さない
-        assert_eq!(normalize_to("末尾に改行なし", LineEnding::Crlf), "末尾に改行なし");
+        assert_eq!(
+            normalize_to("末尾に改行なし", LineEnding::Crlf),
+            "末尾に改行なし"
+        );
         assert_eq!(normalize_to("", LineEnding::Crlf), "");
     }
 
     #[test]
     fn normalize_keeps_multibyte_text_intact() {
         let src = "日本語\r\n🚀 絵文字\nおわり";
-        assert_eq!(normalize_to(&normalize_to(src, LineEnding::Lf), LineEnding::Crlf), "日本語\r\n🚀 絵文字\r\nおわり");
+        assert_eq!(
+            normalize_to(&normalize_to(src, LineEnding::Lf), LineEnding::Crlf),
+            "日本語\r\n🚀 絵文字\r\nおわり"
+        );
     }
 
     #[test]
@@ -2442,7 +2565,11 @@ mod tests {
             ('♪', "音符"),
         ];
         for (c, what) in ambiguous {
-            assert_eq!(char_width_with(c, AmbiguousWidth::Narrow), 1, "{what}: Narrow");
+            assert_eq!(
+                char_width_with(c, AmbiguousWidth::Narrow),
+                1,
+                "{what}: Narrow"
+            );
             assert_eq!(char_width_with(c, AmbiguousWidth::Wide), 2, "{what}: Wide");
             assert_eq!(
                 char_width(c),
@@ -2469,7 +2596,11 @@ mod tests {
             ("あア漢", 6, "かな + 漢字"),
             ("ｱｲｳ", 3, "半角カナ"),
             ("한글", 4, "ハングル音節"),
-            ("\u{1112}\u{1161}\u{11AB}", 2, "ハングル 초성+중성+종성 = 1 音節"),
+            (
+                "\u{1112}\u{1161}\u{11AB}",
+                2,
+                "ハングル 초성+중성+종성 = 1 音節",
+            ),
             ("か\u{3099}", 2, "か + 結合濁点 = が (1 セル)"),
             ("e\u{0301}", 1, "e + 結合アキュート"),
             ("葛\u{E0100}", 2, "漢字 + 異体字セレクタ"),
@@ -2497,8 +2628,16 @@ mod tests {
     /// 桁数で切り詰めること (文字数で切ると日本語の行が 2 倍はみ出す)。
     #[test]
     fn truncate_to_width_counts_columns_not_chars() {
-        assert_eq!(truncate_to_width("abcdef", 10), "abcdef", "収まるなら無加工");
-        assert_eq!(truncate_to_width("abcdef", 6), "abcdef", "ちょうどなら無加工");
+        assert_eq!(
+            truncate_to_width("abcdef", 10),
+            "abcdef",
+            "収まるなら無加工"
+        );
+        assert_eq!(
+            truncate_to_width("abcdef", 6),
+            "abcdef",
+            "ちょうどなら無加工"
+        );
         assert_eq!(truncate_to_width("abcdef", 4), "abc…");
         // 「日本語です」= 10 桁。8 桁枠なら 7 桁ぶん + …
         assert_eq!(truncate_to_width("日本語です", 8), "日本語…");
@@ -2567,7 +2706,11 @@ mod tests {
             let back = reopen_with_report(&r, info.enc);
             assert_eq!(back.text, ascii, "{}: ASCII の往復が壊れた", info.id);
             assert_eq!(back.replacements, 0, "{}: ASCII で化けた", info.id);
-            assert_eq!(back.format.encoding, info.enc, "{}: 符号化が変わった", info.id);
+            assert_eq!(
+                back.format.encoding, info.enc,
+                "{}: 符号化が変わった",
+                info.id
+            );
 
             if info.japanese {
                 let bytes = save_with(ja, info.enc, LineEnding::Lf)
@@ -2620,14 +2763,21 @@ mod tests {
 
     #[test]
     fn encoding_table_ids_are_unique_and_resolvable() {
-        let mut ids: Vec<&str> = supported_encodings().iter().map(|i| i.id.as_str()).collect();
+        let mut ids: Vec<&str> = supported_encodings()
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
         let n = ids.len();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), n, "識別子が重複している");
         for info in supported_encodings() {
             assert_eq!(encoding_by_name(&info.id), Some(info.enc), "id で引けない");
-            assert_eq!(encoding_by_name(&info.label), Some(info.enc), "label で引けない");
+            assert_eq!(
+                encoding_by_name(&info.label),
+                Some(info.enc),
+                "label で引けない"
+            );
             for a in &info.aliases {
                 assert_eq!(encoding_by_name(a), Some(info.enc), "別名 {a} で引けない");
             }
@@ -2655,8 +2805,16 @@ mod tests {
         assert!(r.lossy(), "化けたのに lossy でない");
         // 6 バイト中 0x7B だけは ASCII '{' として素通りするので化けるのは 5 バイト
         assert_eq!(r.replacements, 5, "不正バイトの数だけ U+FFFD が出る");
-        assert!(r.text.contains('{'), "たまたま ASCII だったバイトは残る: {:?}", r.text);
-        assert_eq!(r.format.encoding, Encoding::Utf8, "要求した符号化を報告する");
+        assert!(
+            r.text.contains('{'),
+            "たまたま ASCII だったバイトは残る: {:?}",
+            r.text
+        );
+        assert_eq!(
+            r.format.encoding,
+            Encoding::Utf8,
+            "要求した符号化を報告する"
+        );
     }
 
     #[test]
@@ -2674,7 +2832,11 @@ mod tests {
         // BOM 付きのバイト列を「UTF-8 (BOM なし)」で開き直す
         let (text, fmt) = reopen_with(&bytes, Encoding::Utf8);
         assert_eq!(text, "あ", "U+FEFF が本文に残らない");
-        assert_eq!(fmt.encoding, Encoding::Utf8, "保存すると BOM が落ちる状態になる");
+        assert_eq!(
+            fmt.encoding,
+            Encoding::Utf8,
+            "保存すると BOM が落ちる状態になる"
+        );
         // BOM 付きとして開けば当然そのまま
         assert_eq!(reopen_with(&bytes, Encoding::Utf8Bom).0, "あ");
     }
@@ -2701,12 +2863,18 @@ mod tests {
 
     #[test]
     fn save_with_applies_the_requested_line_ending() {
-        assert_eq!(save_with("a\r\nb", Encoding::Utf8, LineEnding::Lf).unwrap(), b"a\nb");
+        assert_eq!(
+            save_with("a\r\nb", Encoding::Utf8, LineEnding::Lf).unwrap(),
+            b"a\nb"
+        );
         assert_eq!(
             save_with("a\nb", Encoding::Utf8, LineEnding::Crlf).unwrap(),
             b"a\r\nb"
         );
-        assert_eq!(save_with("a\nb", Encoding::Utf8, LineEnding::Cr).unwrap(), b"a\rb");
+        assert_eq!(
+            save_with("a\nb", Encoding::Utf8, LineEnding::Cr).unwrap(),
+            b"a\rb"
+        );
     }
 
     /// **回帰テスト**: `encode_bytes` は変換できない文字があると黙って UTF-8 へ
@@ -2724,7 +2892,12 @@ mod tests {
                     assert_eq!(back.replacements, 0, "{}: 書いた本文が化けている", info.id);
                 }
                 // 書けないなら断る。UTF-8 へ逃げない。
-                Err(e) => assert_eq!(e.encoding(), info.enc, "{}: 別の符号化の話をしている", info.id),
+                Err(e) => assert_eq!(
+                    e.encoding(),
+                    info.enc,
+                    "{}: 別の符号化の話をしている",
+                    info.id
+                ),
             }
         }
         // CP932 に無い文字は、どの環境でも「保存できた」ことにならない
@@ -2753,7 +2926,10 @@ mod tests {
             } => {
                 assert_eq!(*ch, '𠮟');
                 assert_eq!(*char_index, 11, "「一行目\\n二行目\\nあいう」= 11 文字");
-                assert_eq!(*byte_index, 29, "3文字×3バイト + 改行 の 2 行 + 3 文字 = 29 バイト");
+                assert_eq!(
+                    *byte_index, 29,
+                    "3文字×3バイト + 改行 の 2 行 + 3 文字 = 29 バイト"
+                );
                 assert_eq!(*line, 3);
                 assert_eq!(*column, 4);
                 assert_eq!(*enc, Encoding::Ansi(CP_932));
@@ -2765,7 +2941,10 @@ mod tests {
         let msg = issue.message();
         assert!(msg.contains('𠮟'), "文字が入っていない: {msg}");
         assert!(msg.contains("3行目"), "行番号が入っていない: {msg}");
-        assert!(msg.contains("Shift_JIS"), "符号化の名前が入っていない: {msg}");
+        assert!(
+            msg.contains("Shift_JIS"),
+            "符号化の名前が入っていない: {msg}"
+        );
         // 全部書けるなら None
         assert!(first_unencodable("abc", Encoding::Utf8, |_| true).is_none());
     }
@@ -2809,7 +2988,10 @@ mod tests {
                 assert!(w[0].1 >= w[1].1, "降順に並んでいない: {got:?}");
             }
             for (enc, score) in &got {
-                assert!(*score > 0.0 && *score <= 1.0, "点数の範囲外: {enc:?} {score}");
+                assert!(
+                    *score > 0.0 && *score <= 1.0,
+                    "点数の範囲外: {enc:?} {score}"
+                );
             }
         }
     }
@@ -2872,5 +3054,85 @@ mod tests {
         assert_eq!(decode_bytes(bytes).1, Encoding::Utf8);
         assert_eq!(detect_all(bytes)[0].0, Encoding::Utf8);
     }
-}
 
+    // ---- grapheme_end (差分の語単位ハイライトの土台) -----------------------
+
+    /// 先頭から順に `grapheme_end` を回して、クラスタの列を作る。
+    fn clusters(s: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < s.len() {
+            let e = grapheme_end(s, i);
+            assert!(e > i, "前に進まない: {s:?} at {i}");
+            out.push(&s[i..e]);
+            i = e;
+        }
+        out
+    }
+
+    #[test]
+    fn grapheme_end_table() {
+        // (入力, 期待するクラスタ列, 何を見ているか)
+        let table: &[(&str, &[&str], &str)] = &[
+            ("abc", &["a", "b", "c"], "ASCII は 1 文字 1 クラスタ"),
+            ("日本語", &["日", "本", "語"], "日本語のみ"),
+            (
+                "か\u{3099}き",
+                &["か\u{3099}", "き"],
+                "結合濁点は基底にくっつく",
+            ),
+            ("é", &["é"], "合成済み (1 文字)"),
+            (
+                "e\u{0301}",
+                &["e\u{0301}"],
+                "分解形 (基底 + 結合アクセント)",
+            ),
+            ("🚀ok", &["🚀", "o", "k"], "4 バイト絵文字は割らない"),
+            (
+                "👍\u{1F3FD}!",
+                &["👍\u{1F3FD}", "!"],
+                "肌色修飾子は前にくっつく",
+            ),
+            (
+                "👨\u{200D}👩\u{200D}👧",
+                &["👨\u{200D}👩\u{200D}👧"],
+                "ZWJ の家族絵文字は 1 クラスタ",
+            ),
+            ("🇯🇵🇺🇸", &["🇯🇵", "🇺🇸"], "国旗は地域表示記号 2 つで 1 つ"),
+            ("a\tb", &["a", "\t", "b"], "タブは幅 0 でも独立トークン"),
+            (
+                "あ\u{FE0F}",
+                &["あ\u{FE0F}"],
+                "異体字セレクタは前にくっつく",
+            ),
+            ("𝔘𝔫", &["𝔘", "𝔫"], "BMP 外 (4 バイト) を割らない"),
+        ];
+        for (input, want, why) in table {
+            assert_eq!(&clusters(input)[..], *want, "{why}: {input:?}");
+        }
+    }
+
+    #[test]
+    fn grapheme_end_never_splits_a_char() {
+        // 4 バイト文字・結合列・絵文字が混ざった文字列でも、返る位置は必ず文字境界。
+        let s = "a日🚀\u{1F469}\u{200D}\u{1F4BB}か\u{3099}𝔘";
+        let mut i = 0;
+        while i < s.len() {
+            let e = grapheme_end(s, i);
+            assert!(s.is_char_boundary(e), "文字境界でない: {e} in {s:?}");
+            assert!(e > i && e <= s.len());
+            i = e;
+        }
+        assert_eq!(i, s.len(), "最後まで走り切る");
+    }
+
+    #[test]
+    fn grapheme_end_handles_out_of_range_and_non_boundary() {
+        let s = "日本";
+        assert_eq!(grapheme_end(s, s.len()), s.len(), "終端はそのまま");
+        assert_eq!(grapheme_end(s, 999), s.len(), "範囲外は末尾へ丸める");
+        // 文字の途中 (境界でない) を渡しても panic しない
+        assert_eq!(grapheme_end(s, 1), 1, "境界でなければ動かさない");
+        assert_eq!(grapheme_end("", 0), 0, "空文字列");
+    }
+}

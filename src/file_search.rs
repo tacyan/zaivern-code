@@ -115,7 +115,10 @@ impl SearchOptions {
     /// 本番の呼び出し元は UI 側で各項目を組み立てるので、ここはテスト専用。
     #[cfg(test)]
     pub fn literal(query: impl Into<String>) -> Self {
-        Self { query: query.into(), ..Self::default() }
+        Self {
+            query: query.into(),
+            ..Self::default()
+        }
     }
 }
 
@@ -211,7 +214,11 @@ fn normalize_for_glob(s: &str) -> String {
 pub fn glob_match(pattern: &str, path: &str) -> bool {
     let pat = normalize_for_glob(pattern);
     let p = normalize_for_glob(path);
-    let effective = if pat.contains('/') { pat } else { format!("**/{pat}") };
+    let effective = if pat.contains('/') {
+        pat
+    } else {
+        format!("**/{pat}")
+    };
     let pc: Vec<char> = effective.chars().collect();
     let sc: Vec<char> = p.chars().collect();
     glob_here(&pc, &sc, PATH_CASE_INSENSITIVE)
@@ -329,9 +336,11 @@ pub fn path_allowed(
     let hits = |pats: &[String]| {
         pats.iter().any(|g| {
             glob_match(g, &target)
-                || (absolute && g.contains('/') && !g.starts_with('/') && !g.starts_with("**/") && {
-                    glob_match(&format!("**/{g}"), &target)
-                })
+                || (absolute
+                    && g.contains('/')
+                    && !g.starts_with('/')
+                    && !g.starts_with("**/")
+                    && { glob_match(&format!("**/{g}"), &target) })
         })
     };
     if hits(exclude) {
@@ -374,7 +383,10 @@ enum Kind {
     ///   * 大文字小文字の畳み込みが [`fold`] (先頭 1 文字の `to_lowercase`) のままで、
     ///     `ß`/`SS` のような Unicode 完全ケースフォールドで**別物に化けない**。
     ///     既存テスト (`literal_non_ascii_case_folding`) の意味論をそのまま保てる。
-    Literal { chars: Vec<char>, ascii_needle: Option<Vec<u8>> },
+    Literal {
+        chars: Vec<char>,
+        ascii_needle: Option<Vec<u8>>,
+    },
     /// 正規表現。`regex` クレート = 有限オートマトンなので線形時間。
     Regex(regex::Regex),
 }
@@ -407,16 +419,26 @@ impl Matcher {
             } else {
                 opts.query.bytes().map(|b| b.to_ascii_lowercase()).collect()
             };
-            Kind::Literal { chars: opts.query.chars().collect(), ascii_needle: Some(needle) }
+            Kind::Literal {
+                chars: opts.query.chars().collect(),
+                ascii_needle: Some(needle),
+            }
         } else {
             let chars: Vec<char> = if opts.case_sensitive {
                 opts.query.chars().collect()
             } else {
                 opts.query.chars().map(|c| fold(c, true)).collect()
             };
-            Kind::Literal { chars, ascii_needle: None }
+            Kind::Literal {
+                chars,
+                ascii_needle: None,
+            }
         };
-        Ok(Self { kind, case_sensitive: opts.case_sensitive, whole_word: opts.whole_word })
+        Ok(Self {
+            kind,
+            case_sensitive: opts.case_sensitive,
+            whole_word: opts.whole_word,
+        })
     }
 
     /// 1 行の中で `from` バイト以降の最初のマッチ (バイト範囲) を返す。
@@ -430,9 +452,10 @@ impl Matcher {
         loop {
             let (s, e) = match &self.kind {
                 Kind::Never => return None,
-                Kind::Literal { chars, ascii_needle } => {
-                    self.literal_find(line, at, chars, ascii_needle.as_deref())?
-                }
+                Kind::Literal {
+                    chars,
+                    ascii_needle,
+                } => self.literal_find(line, at, chars, ascii_needle.as_deref())?,
                 Kind::Regex(re) => {
                     // `^` はこの行の先頭 (バイト 0) にしか一致しない。`find_at` は
                     // 前後の文脈を見るので、`at` から切った部分文字列を渡すのとは違い
@@ -473,7 +496,9 @@ impl Matcher {
         let mut out = Vec::new();
         let mut at = 0;
         while at <= line.len() {
-            let Some((s, e)) = self.find_from(line, at) else { break };
+            let Some((s, e)) = self.find_from(line, at) else {
+                break;
+            };
             out.push((s, e));
             at = if e > s {
                 e
@@ -552,7 +577,12 @@ enum Loaded {
 }
 
 fn load_text(path: &Path, opts: &SearchOptions) -> Loaded {
-    if !path_allowed(path, opts.root.as_deref(), &opts.include_globs, &opts.exclude_globs) {
+    if !path_allowed(
+        path,
+        opts.root.as_deref(),
+        &opts.include_globs,
+        &opts.exclude_globs,
+    ) {
         return Loaded::Skipped;
     }
     if !opts.follow_symlinks {
@@ -618,7 +648,10 @@ pub fn search_with_options(
             handles.push(scope.spawn(move || scan_chunk(slice, m, o, hc, cx)));
         }
         // ワーカーが panic しても検索全体は落とさない (空の結果として扱う)
-        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
     });
 
     let mut hits = Vec::new();
@@ -629,7 +662,11 @@ pub fn search_with_options(
     }
     let truncated = hits.len() >= opts.max_results;
     hits.truncate(opts.max_results);
-    Ok(SearchOutcome { hits, files_scanned, truncated })
+    Ok(SearchOutcome {
+        hits,
+        files_scanned,
+        truncated,
+    })
 }
 
 fn scan_chunk(
@@ -645,11 +682,21 @@ fn scan_chunk(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let Loaded::Text(text, _) = load_text(p, opts) else { continue };
+        let Loaded::Text(text, _) = load_text(p, opts) else {
+            continue;
+        };
         scanned += 1;
         for (n, line) in text.lines().enumerate() {
-            let Some((s, e)) = matcher.find_from(line, 0) else { continue };
-            hits.push(Hit { path: p.clone(), line: n, text: snippet(line), col: s, len: e - s });
+            let Some((s, e)) = matcher.find_from(line, 0) else {
+                continue;
+            };
+            hits.push(Hit {
+                path: p.clone(),
+                line: n,
+                text: snippet(line),
+                col: s,
+                len: e - s,
+            });
             if hit_count.fetch_add(1, Ordering::Relaxed) + 1 >= opts.max_results {
                 cancel.store(true, Ordering::Relaxed);
                 break;
@@ -699,7 +746,11 @@ pub struct ReplaceRequest {
 
 impl Default for ReplaceRequest {
     fn default() -> Self {
-        Self { options: SearchOptions::default(), replacement: String::new(), dry_run: true }
+        Self {
+            options: SearchOptions::default(),
+            replacement: String::new(),
+            dry_run: true,
+        }
     }
 }
 
@@ -745,7 +796,10 @@ pub struct ReplaceReport {
 #[allow(dead_code)] // UI 配線待ち
 pub fn replace_all(files: &[PathBuf], req: &ReplaceRequest) -> Result<ReplaceReport, SearchError> {
     let matcher = Matcher::compile(&req.options)?;
-    let mut report = ReplaceReport { dry_run: req.dry_run, ..Default::default() };
+    let mut report = ReplaceReport {
+        dry_run: req.dry_run,
+        ..Default::default()
+    };
     if matches!(matcher.kind, Kind::Never) {
         return Ok(report);
     }
@@ -755,7 +809,10 @@ pub fn replace_all(files: &[PathBuf], req: &ReplaceRequest) -> Result<ReplaceRep
             Loaded::Text(t, e) => (t, e),
             Loaded::Skipped => continue,
             Loaded::Error(msg) => {
-                report.errors.push(ReplaceIssue { path: path.clone(), message: msg });
+                report.errors.push(ReplaceIssue {
+                    path: path.clone(),
+                    message: msg,
+                });
                 continue;
             }
         };
@@ -866,9 +923,15 @@ fn split_eol(line: &str) -> (&str, &str) {
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf);
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
-    let stem = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let tmp = dir.join(format!(
         ".{stem}.zv-replace-{}-{}.tmp",
         std::process::id(),
@@ -931,7 +994,16 @@ mod tests {
         let (hits, scanned) = collect(vec![a.clone()], "hello");
         assert_eq!(scanned, 1);
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0], Hit { path: a.clone(), line: 0, text: "hello".into(), col: 0, len: 5 });
+        assert_eq!(
+            hits[0],
+            Hit {
+                path: a.clone(),
+                line: 0,
+                text: "hello".into(),
+                col: 0,
+                len: 5
+            }
+        );
         assert_eq!(hits[1].line, 1);
         assert_eq!(hits[1].col, 6);
         let _ = std::fs::remove_dir_all(&dir);
@@ -942,8 +1014,7 @@ mod tests {
         let dir = tmp("bin");
         let b = dir.join("b.bin");
         std::fs::write(&b, [0u8, 1, 2, b'h', b'i']).expect("write");
-        let (hits, scanned) =
-            collect(vec![b, dir.join("does-not-exist.txt")], "hi");
+        let (hits, scanned) = collect(vec![b, dir.join("does-not-exist.txt")], "hi");
         assert!(hits.is_empty());
         assert_eq!(scanned, 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -962,7 +1033,10 @@ mod tests {
     fn max_results_stops_early() {
         let dir = tmp("cap2");
         let c = write(&dir, "c.txt", &"match\n".repeat(1000));
-        let opts = SearchOptions { max_results: 7, ..SearchOptions::literal("match") };
+        let opts = SearchOptions {
+            max_results: 7,
+            ..SearchOptions::literal("match")
+        };
         let out = search(&[c], &opts);
         assert_eq!(out.hits.len(), 7);
         assert!(out.truncated);
@@ -973,11 +1047,17 @@ mod tests {
     fn oversized_files_are_skipped() {
         let dir = tmp("big");
         let big = write(&dir, "big.txt", &"needle\n".repeat(200));
-        let opts = SearchOptions { max_file_bytes: 10, ..SearchOptions::literal("needle") };
+        let opts = SearchOptions {
+            max_file_bytes: 10,
+            ..SearchOptions::literal("needle")
+        };
         let out = search(&[big.clone()], &opts);
         assert!(out.hits.is_empty() && out.files_scanned == 0);
         // 上限を上げれば見つかる = スキップ理由がサイズであることの裏取り
-        let opts = SearchOptions { max_file_bytes: 1 << 20, ..SearchOptions::literal("needle") };
+        let opts = SearchOptions {
+            max_file_bytes: 1 << 20,
+            ..SearchOptions::literal("needle")
+        };
         assert_eq!(search(&[big], &opts).files_scanned, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1031,7 +1111,11 @@ mod tests {
             ("a/**/b.txt", "a/x/y/b.txt", true),
         ];
         for (pat, path, want) in cases {
-            assert_eq!(glob_match(pat, path), *want, "glob_match({pat:?}, {path:?})");
+            assert_eq!(
+                glob_match(pat, path),
+                *want,
+                "glob_match({pat:?}, {path:?})"
+            );
         }
     }
 
@@ -1051,8 +1135,18 @@ mod tests {
         let exc = vec!["**/generated/**".to_string()];
         assert!(path_allowed(rs, Some(root), &inc, &exc));
         assert!(!path_allowed(gen, Some(root), &inc, &exc)); // exclude が勝つ
-        assert!(!path_allowed(Path::new("/w/docs/a.md"), Some(root), &inc, &[]));
-        assert!(path_allowed(Path::new("/w/docs/a.md"), Some(root), &[], &[]));
+        assert!(!path_allowed(
+            Path::new("/w/docs/a.md"),
+            Some(root),
+            &inc,
+            &[]
+        ));
+        assert!(path_allowed(
+            Path::new("/w/docs/a.md"),
+            Some(root),
+            &[],
+            &[]
+        ));
         // root 無し = 絶対パスに対しても相対 glob が効く
         assert!(path_allowed(rs, None, &inc, &[]));
         assert!(!path_allowed(gen, None, &[], &exc));
@@ -1087,7 +1181,10 @@ mod tests {
     fn literal_case_sensitivity() {
         let ci = matcher(&SearchOptions::literal("Foo"));
         assert!(ci.is_match("xxfooxx") && ci.is_match("FOO"));
-        let cs = matcher(&SearchOptions { case_sensitive: true, ..SearchOptions::literal("Foo") });
+        let cs = matcher(&SearchOptions {
+            case_sensitive: true,
+            ..SearchOptions::literal("Foo")
+        });
         assert!(!cs.is_match("xxfooxx"));
         assert_eq!(cs.find_from("a Foo b", 0), Some((2, 5)));
     }
@@ -1102,7 +1199,10 @@ mod tests {
 
     #[test]
     fn whole_word_ascii_identifier() {
-        let opts = SearchOptions { whole_word: true, ..SearchOptions::literal("foo") };
+        let opts = SearchOptions {
+            whole_word: true,
+            ..SearchOptions::literal("foo")
+        };
         let m = matcher(&opts);
         assert!(m.is_match("let foo = 1;"));
         assert!(m.is_match("(foo)"));
@@ -1114,7 +1214,10 @@ mod tests {
 
     #[test]
     fn whole_word_japanese_behaves_as_one_word() {
-        let opts = SearchOptions { whole_word: true, ..SearchOptions::literal("検索") };
+        let opts = SearchOptions {
+            whole_word: true,
+            ..SearchOptions::literal("検索")
+        };
         let m = matcher(&opts);
         // 区切りが無いので「全文検索」の一部としては単語一致しない
         assert!(!m.is_match("全文検索する"));
@@ -1125,9 +1228,17 @@ mod tests {
 
     #[test]
     fn regex_basics() {
-        let re = |q: &str| matcher(&SearchOptions { regex: true, ..SearchOptions::literal(q) });
+        let re = |q: &str| {
+            matcher(&SearchOptions {
+                regex: true,
+                ..SearchOptions::literal(q)
+            })
+        };
         assert_eq!(re(r"\d+").find_from("ab 1234 cd", 0), Some((3, 7)));
-        assert_eq!(re(r"^fn\s+(\w+)").find_from("fn  main() {", 0), Some((0, 8)));
+        assert_eq!(
+            re(r"^fn\s+(\w+)").find_from("fn  main() {", 0),
+            Some((0, 8))
+        );
         assert!(re(r"a.c").is_match("abc"));
         assert!(!re(r"a.c").is_match("ac"));
         assert!(re(r"foo|bar").is_match("xxbarxx"));
@@ -1143,7 +1254,10 @@ mod tests {
 
     #[test]
     fn regex_is_case_insensitive_by_default_and_respects_the_flag() {
-        let ci = matcher(&SearchOptions { regex: true, ..SearchOptions::literal("[a-z]+") });
+        let ci = matcher(&SearchOptions {
+            regex: true,
+            ..SearchOptions::literal("[a-z]+")
+        });
         assert!(ci.is_match("ABC"));
         let cs = matcher(&SearchOptions {
             regex: true,
@@ -1167,51 +1281,94 @@ mod tests {
 
     /// 不正パターンを `Matcher::compile` に渡した結果 (テスト用の短縮)。
     fn compile_err(q: &str) -> SearchError {
-        Matcher::compile(&SearchOptions { regex: true, ..SearchOptions::literal(q) })
-            .expect_err("should fail")
+        Matcher::compile(&SearchOptions {
+            regex: true,
+            ..SearchOptions::literal(q)
+        })
+        .expect_err("should fail")
     }
 
     #[test]
     fn regex_errors_are_explicit_not_silent() {
-        assert!(matches!(compile_err(r"(a"), SearchError::Regex(RegexError::Syntax(_))));
-        assert!(matches!(compile_err(r"a)"), SearchError::Regex(RegexError::Syntax(_))));
-        assert!(matches!(compile_err(r"[a-"), SearchError::Regex(RegexError::Syntax(_))));
+        assert!(matches!(
+            compile_err(r"(a"),
+            SearchError::Regex(RegexError::Syntax(_))
+        ));
+        assert!(matches!(
+            compile_err(r"a)"),
+            SearchError::Regex(RegexError::Syntax(_))
+        ));
+        assert!(matches!(
+            compile_err(r"[a-"),
+            SearchError::Regex(RegexError::Syntax(_))
+        ));
         // 後方参照と先読みは `regex` (有限オートマトン) が原理的に持たない構文。
         // 旧・自前エンジンでは Unsupported だったが、今は構文エラーとして弾かれる。
-        assert!(matches!(compile_err(r"(a)\1"), SearchError::Regex(RegexError::Syntax(_))));
-        assert!(matches!(compile_err(r"(?=a)"), SearchError::Regex(RegexError::Syntax(_))));
+        assert!(matches!(
+            compile_err(r"(a)\1"),
+            SearchError::Regex(RegexError::Syntax(_))
+        ));
+        assert!(matches!(
+            compile_err(r"(?=a)"),
+            SearchError::Regex(RegexError::Syntax(_))
+        ));
         // Display は日本語の前置きを付ける (UI がそのまま出せること)
-        assert!(compile_err(r"(a").to_string().starts_with("正規表現の構文エラー"));
+        assert!(compile_err(r"(a")
+            .to_string()
+            .starts_with("正規表現の構文エラー"));
     }
 
     #[test]
     fn invalid_pattern_returns_error_instead_of_panicking() {
         // 公開 API の入口でも panic せず Err が返ること (UI が赤くできる)
-        let opts = SearchOptions { regex: true, ..SearchOptions::literal(r"(unclosed") };
-        assert!(matches!(search_with_options(&[], &opts), Err(SearchError::Regex(_))));
-        assert!(matches!(spawn_with_options(Vec::new(), opts).err(), Some(SearchError::Regex(_))));
+        let opts = SearchOptions {
+            regex: true,
+            ..SearchOptions::literal(r"(unclosed")
+        };
+        assert!(matches!(
+            search_with_options(&[], &opts),
+            Err(SearchError::Regex(_))
+        ));
+        assert!(matches!(
+            spawn_with_options(Vec::new(), opts).err(),
+            Some(SearchError::Regex(_))
+        ));
     }
 
     #[test]
     fn constructs_the_old_engine_rejected_now_work() {
-        let re = |q: &str| matcher(&SearchOptions { regex: true, ..SearchOptions::literal(q) });
+        let re = |q: &str| {
+            matcher(&SearchOptions {
+                regex: true,
+                ..SearchOptions::literal(q)
+            })
+        };
         // 旧エンジンが Unsupported で弾いていたもの
         assert_eq!(re(r"(?<year>\d{4})").find_from("v 2026 y", 0), Some((2, 6)));
         assert!(re(r"\p{Hiragana}+").is_match("漢字とかな"));
-        assert_eq!(re(r"\p{Hiragana}+").find_from("漢字とかな", 0), Some((6, 15)));
+        assert_eq!(
+            re(r"\p{Hiragana}+").find_from("漢字とかな", 0),
+            Some((6, 15))
+        );
         assert!(re(r"(?i)FOO").is_match("foo")); // インラインフラグ
         assert!(re(r"(a?)*").is_match("aaa")); // 空にもなり得る繰り返し
-        // 旧エンジンは TooLarge にしていたが、これは真っ当なパターン
+                                               // 旧エンジンは TooLarge にしていたが、これは真っ当なパターン
         assert!(re(r"a{2000}").is_match(&"a".repeat(2000)));
         // 部分集合の外にあった構文の組み合わせ
         assert_eq!(re(r"\d{2,4}").find_from("x 12345", 0), Some((2, 6)));
-        assert_eq!(re(r"(foo|ba(r|z))+").find_from("xxfoobaz!", 0), Some((2, 8)));
+        assert_eq!(
+            re(r"(foo|ba(r|z))+").find_from("xxfoobaz!", 0),
+            Some((2, 8))
+        );
     }
 
     #[test]
     fn oversized_pattern_fails_to_compile() {
         // NFA が REGEX_SIZE_LIMIT を超える組み合わせ爆発は、走らせる前に弾く
-        assert!(matches!(compile_err(r"((a{1000}){1000}){1000}"), SearchError::Regex(RegexError::TooLarge)));
+        assert!(matches!(
+            compile_err(r"((a{1000}){1000}){1000}"),
+            SearchError::Regex(RegexError::TooLarge)
+        ));
         // 上限内の素直なパターンは通る (上限が厳しすぎないことの確認)
         assert!(Matcher::compile(&SearchOptions {
             regex: true,
@@ -1223,12 +1380,18 @@ mod tests {
     #[test]
     fn regex_does_not_hang_on_pathological_pattern() {
         // ReDoS 耐性。バックトラッキング実装ならここで指数時間に落ちる。
-        let m = matcher(&SearchOptions { regex: true, ..SearchOptions::literal(r"(a+)+$") });
+        let m = matcher(&SearchOptions {
+            regex: true,
+            ..SearchOptions::literal(r"(a+)+$")
+        });
         let line = format!("{}b", "a".repeat(10_000));
         let t0 = std::time::Instant::now();
         assert!(!m.is_match(&line)); // 予算切れで諦めるのではなく「無い」と答え切る
         let dt = t0.elapsed();
-        assert!(dt < std::time::Duration::from_secs(1), "線形時間で終わっていない: {dt:?}");
+        assert!(
+            dt < std::time::Duration::from_secs(1),
+            "線形時間で終わっていない: {dt:?}"
+        );
         // 一致する側も同じ長さで即答できる
         let hit = "a".repeat(10_000);
         assert_eq!(m.find_from(&hit, 0), Some((0, 10_000)));
@@ -1251,7 +1414,10 @@ mod tests {
     fn regex_search_over_files() {
         let dir = tmp("regexfiles");
         let a = write(&dir, "a.rs", "fn alpha() {}\nfn beta() {}\nstruct X;\n");
-        let opts = SearchOptions { regex: true, ..SearchOptions::literal(r"^fn\s+\w+") };
+        let opts = SearchOptions {
+            regex: true,
+            ..SearchOptions::literal(r"^fn\s+\w+")
+        };
         let out = search(&[a], &opts);
         assert_eq!(out.hits.len(), 2);
         assert_eq!(out.hits[0].line, 0);
@@ -1278,9 +1444,20 @@ mod tests {
         assert!(rep.dry_run);
         assert_eq!(rep.files_changed, 1);
         assert_eq!(rep.replacements, 2);
-        assert_eq!(rep.changes, vec![FileChange { path: a.clone(), replacements: 2, written: false }]);
+        assert_eq!(
+            rep.changes,
+            vec![FileChange {
+                path: a.clone(),
+                replacements: 2,
+                written: false
+            }]
+        );
         assert!(rep.errors.is_empty());
-        assert_eq!(std::fs::read_to_string(&a).expect("read"), before, "ドライランで書いた");
+        assert_eq!(
+            std::fs::read_to_string(&a).expect("read"),
+            before,
+            "ドライランで書いた"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1290,9 +1467,15 @@ mod tests {
         let a = write(&dir, "a.txt", "foo bar foo\nbaz\n");
         let b = write(&dir, "b.txt", "nothing here\n");
         let rep = replace_all(&[a.clone(), b.clone()], &req("foo", "qux", false)).expect("ok");
-        assert_eq!((rep.files_scanned, rep.files_changed, rep.replacements), (2, 1, 2));
+        assert_eq!(
+            (rep.files_scanned, rep.files_changed, rep.replacements),
+            (2, 1, 2)
+        );
         assert!(rep.changes[0].written);
-        assert_eq!(std::fs::read_to_string(&a).expect("read"), "qux bar qux\nbaz\n");
+        assert_eq!(
+            std::fs::read_to_string(&a).expect("read"),
+            "qux bar qux\nbaz\n"
+        );
         assert_eq!(std::fs::read_to_string(&b).expect("read"), "nothing here\n");
         // 一時ファイルを残さない
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -1310,7 +1493,10 @@ mod tests {
         let a = write(&dir, "a.txt", "foo\r\nbar foo\r\nlast foo");
         let rep = replace_all(&[a.clone()], &req("foo", "X", false)).expect("ok");
         assert_eq!(rep.replacements, 3);
-        assert_eq!(std::fs::read_to_string(&a).expect("read"), "X\r\nbar X\r\nlast X");
+        assert_eq!(
+            std::fs::read_to_string(&a).expect("read"),
+            "X\r\nbar X\r\nlast X"
+        );
         // 混在した改行もそのまま
         let b = write(&dir, "b.txt", "foo\nfoo\r\nfoo\n");
         replace_all(&[b.clone()], &req("foo", "Y", false)).expect("ok");
@@ -1343,7 +1529,10 @@ mod tests {
         r.options.exclude_globs = vec!["target/**".into()];
         let rep = replace_all(&[bin.clone(), keep.clone(), skip.clone()], &r).expect("ok");
         assert_eq!(rep.files_changed, 1);
-        assert_eq!(std::fs::read(&bin).expect("read"), [b'f', b'o', b'o', 0u8, 1]);
+        assert_eq!(
+            std::fs::read(&bin).expect("read"),
+            [b'f', b'o', b'o', 0u8, 1]
+        );
         assert_eq!(std::fs::read_to_string(&keep).expect("read"), "bar\n");
         assert_eq!(std::fs::read_to_string(&skip).expect("read"), "foo\n");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1354,17 +1543,26 @@ mod tests {
         let dir = tmp("replre");
         let a = write(&dir, "a.txt", "id=12, id=345, idx=7\n");
         let mut r = req("", "N", false);
-        r.options = SearchOptions { regex: true, ..SearchOptions::literal(r"\d+") };
+        r.options = SearchOptions {
+            regex: true,
+            ..SearchOptions::literal(r"\d+")
+        };
         let rep = replace_all(&[a.clone()], &r).expect("ok");
         assert_eq!(rep.replacements, 3);
-        assert_eq!(std::fs::read_to_string(&a).expect("read"), "id=N, id=N, idx=N\n");
+        assert_eq!(
+            std::fs::read_to_string(&a).expect("read"),
+            "id=N, id=N, idx=N\n"
+        );
 
         let b = write(&dir, "b.txt", "foo foobar foo_x foo\n");
         let mut r2 = req("foo", "Z", false);
         r2.options.whole_word = true;
         let rep2 = replace_all(&[b.clone()], &r2).expect("ok");
         assert_eq!(rep2.replacements, 2);
-        assert_eq!(std::fs::read_to_string(&b).expect("read"), "Z foobar foo_x Z\n");
+        assert_eq!(
+            std::fs::read_to_string(&b).expect("read"),
+            "Z foobar foo_x Z\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1427,7 +1625,9 @@ mod tests {
     fn empty_query_never_matches() {
         let dir = tmp("empty");
         let a = write(&dir, "a.txt", "anything\n");
-        assert!(search(&[a.clone()], &SearchOptions::default()).hits.is_empty());
+        assert!(search(&[a.clone()], &SearchOptions::default())
+            .hits
+            .is_empty());
         let rep = replace_all(&[a.clone()], &req("", "x", false)).expect("ok");
         assert_eq!(rep.replacements, 0);
         assert_eq!(std::fs::read_to_string(&a).expect("read"), "anything\n");
@@ -1444,14 +1644,19 @@ mod tests {
 
         let follow = SearchOptions::literal("needle");
         assert_eq!(search(&[link.clone()], &follow).files_scanned, 1);
-        let no_follow =
-            SearchOptions { follow_symlinks: false, ..SearchOptions::literal("needle") };
+        let no_follow = SearchOptions {
+            follow_symlinks: false,
+            ..SearchOptions::literal("needle")
+        };
         assert_eq!(search(&[link.clone()], &no_follow).files_scanned, 0);
 
         // リンクを辿る置換は実体へ書く (リンクを実ファイルに化けさせない)
         let rep = replace_all(&[link.clone()], &req("needle", "pin", false)).expect("ok");
         assert_eq!(rep.replacements, 1);
-        assert!(std::fs::symlink_metadata(&link).expect("meta").file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&link)
+            .expect("meta")
+            .file_type()
+            .is_symlink());
         assert_eq!(std::fs::read_to_string(&real).expect("read"), "pin\n");
         let _ = std::fs::remove_dir_all(&dir);
     }

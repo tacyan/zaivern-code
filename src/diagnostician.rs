@@ -148,7 +148,11 @@ pub fn ceiling_for(anomaly: Anomaly) -> Intervention {
 }
 
 /// 助言を上限まで丸める。`Intervention` は重い順に `Ord` なので min でよい。
-pub fn clamp_action(action: Intervention, anomaly: Anomaly, max_action: Intervention) -> Intervention {
+pub fn clamp_action(
+    action: Intervention,
+    anomaly: Anomaly,
+    max_action: Intervention,
+) -> Intervention {
     action.min(ceiling_for(anomaly)).min(max_action)
 }
 
@@ -188,7 +192,9 @@ pub fn build_invocation(command: &str, spec: &AgentSpec) -> Result<(String, Vec<
     // ヘッドレス形が同じサブコマンドを自前で置くので二重に付けてはいけない。
     // 何を落とすかはカタログのデータ (`AgentSpec::launch_args`) だけが知っている。
     let launch: Vec<&str> = spec.launch_args().split_whitespace().collect();
-    if !launch.is_empty() && user_args.len() >= launch.len() && user_args[..launch.len()] == launch[..]
+    if !launch.is_empty()
+        && user_args.len() >= launch.len()
+        && user_args[..launch.len()] == launch[..]
     {
         user_args.drain(..launch.len());
     }
@@ -765,11 +771,20 @@ mod tests {
             let (p, a) = build_invocation(spec.bin, spec).expect(spec.bin);
             assert_eq!(p, spec.bin);
             assert!(!a.is_empty(), "{}: 引数が空", spec.bin);
-            assert_ne!(a[0], spec.bin, "{}: 実行ファイル名が引数に残っている", spec.bin);
+            assert_ne!(
+                a[0], spec.bin,
+                "{}: 実行ファイル名が引数に残っている",
+                spec.bin
+            );
             // 対話用の起動形 (`acli rovodev run` 等) から作っても、
             // サブコマンドが二重に並ばないこと。
             let (p2, a2) = build_invocation(&spec.launch_command(), spec).expect(spec.bin);
-            assert_eq!((p2, &a2), (p, &a), "{}: 起動形からだと引数が変わる", spec.bin);
+            assert_eq!(
+                (p2, &a2),
+                (p, &a),
+                "{}: 起動形からだと引数が変わる",
+                spec.bin
+            );
         }
     }
 
@@ -783,16 +798,18 @@ mod tests {
         let p = build_prompt(&r, Some(180), MAX_EXCERPT_CHARS);
 
         // 秘匿化されている
-        assert!(!p.contains("sk-abcdefghijklmnopqrstuvwxyz0123"), "トークンが漏れている");
-        assert!(!p.contains("user@example.com"), "メールアドレスが漏れている");
+        assert!(
+            !p.contains("sk-abcdefghijklmnopqrstuvwxyz0123"),
+            "トークンが漏れている"
+        );
+        assert!(
+            !p.contains("user@example.com"),
+            "メールアドレスが漏れている"
+        );
         assert!(p.contains("***"));
 
         // 抜粋は上限まで。全文 (5000 行) は載らない。
-        assert!(
-            p.len() < 12_000,
-            "プロンプトが長すぎる: {} バイト",
-            p.len()
-        );
+        assert!(p.len() < 12_000, "プロンプトが長すぎる: {} バイト", p.len());
         assert!(p.matches("ログ行").count() < 2000);
 
         // 直近側 (末尾) が残っている
@@ -830,7 +847,11 @@ mod tests {
         );
         // 承認待ちは auto_answer が上限。
         assert_eq!(
-            clamp_action(Intervention::Restart, Anomaly::SilentWait, Intervention::Halt),
+            clamp_action(
+                Intervention::Restart,
+                Anomaly::SilentWait,
+                Intervention::Halt
+            ),
             Intervention::AutoAnswer
         );
         // 上限より軽い助言はそのまま。
@@ -893,10 +914,8 @@ mod tests {
     /// kill で確実に止まり、孫がパイプを塞ぐこともない。
     #[cfg(windows)]
     fn ps1_diag(name: &str, script: &str, timeout_secs: u64) -> CliDiagnostician {
-        let path = std::env::temp_dir().join(format!(
-            "zv-diag-test-{}-{name}.ps1",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("zv-diag-test-{}-{name}.ps1", std::process::id()));
         std::fs::write(&path, script).expect("write ps1");
         raw(
             "powershell",
@@ -927,7 +946,9 @@ mod tests {
     fn e2e_destructive_response_is_clamped_and_flagged() {
         // 暴走に対して halt を勧める応答 → halt のまま返るが確認必須の印が付く。
         let d = fake_reply("halt", "output never stops", 10);
-        let out = d.diagnose(&req(Anomaly::Runaway, "loop loop loop")).unwrap();
+        let out = d
+            .diagnose(&req(Anomaly::Runaway, "loop loop loop"))
+            .unwrap();
         assert_eq!(out.recommended, Intervention::Halt);
         assert!(out.summary.contains("確認が必要"), "{}", out.summary);
         assert!(requires_confirmation(out.recommended));
@@ -949,7 +970,9 @@ mod tests {
         assert_eq!(d.self_session_id(), Some(7));
 
         let t0 = Instant::now();
-        assert!(d.diagnose(&req(Anomaly::Stall, "自分が止まっている")).is_none());
+        assert!(d
+            .diagnose(&req(Anomaly::Stall, "自分が止まっている"))
+            .is_none());
         assert!(
             t0.elapsed() < Duration::from_secs(2),
             "自己診断ガードが子プロセスを起動してしまった"
@@ -990,7 +1013,10 @@ mod tests {
         let t0 = Instant::now();
         assert!(d.diagnose(&req(Anomaly::Stall, "x")).is_none());
         let took = t0.elapsed();
-        assert!(took < Duration::from_secs(20), "期限で切れていない: {took:?}");
+        assert!(
+            took < Duration::from_secs(20),
+            "期限で切れていない: {took:?}"
+        );
         assert!(d.last_error().unwrap().contains("中断"));
     }
 

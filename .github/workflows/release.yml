@@ -1,8 +1,12 @@
 name: Release
 
 # リリース公開 (gh release create) をトリガに 5 ターゲットをビルドし、
-# ビルド済みバイナリをそのリリースに添付する。
+# ビルド済みバイナリ + SHA256 チェックサム + インストーラをそのリリースに添付する。
 # 手動再実行: gh workflow run release.yml -f tag=v0.1.0
+#   (タグ指定は Resolve tag ステップで inputs.tag に落ちる。checkout も
+#    そのタグを ref にするので、後からの再実行でも当時のソースが再現される。
+#    アップロードは --clobber なので既存アセットを安全に上書きできる。
+#    前提: そのタグの GitHub Release が既に存在すること。無いと gh release upload が失敗する。)
 on:
   release:
     types: [published]
@@ -58,6 +62,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 
+      # アーカイブ名・実行ファイル名を 1 か所で決める。
+      # 以降のステップ (package / checksum / size / upload) はこの出力だけを見るので、
+      # 命名規則を変えるときの修正箇所が 1 つに収まる。
+      # install.sh / install.ps1 が組み立てる URL と同じ規則であること:
+      #   install.sh  -> zai-$tag-$os-$arch.tar.gz
+      #   install.ps1 -> zai-$tag-windows-x86_64.zip
+      - name: Artifact name
+        id: art
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="zai-${{ steps.tag.outputs.tag }}-${{ matrix.label }}"
+          if [ '${{ matrix.archive }}' = 'zip' ]; then
+            echo "file=$name.zip" >> "$GITHUB_OUTPUT"
+            echo "bin=target/${{ matrix.target }}/release/zai.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=$name.tar.gz" >> "$GITHUB_OUTPUT"
+            echo "bin=target/${{ matrix.target }}/release/zai" >> "$GITHUB_OUTPUT"
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -65,7 +90,7 @@ jobs:
         if: matrix.archive == 'tar'
         shell: bash
         run: |
-          name="zai-${{ steps.tag.outputs.tag }}-${{ matrix.label }}"
+          name='${{ steps.art.outputs.name }}'
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/zai" LICENSE README.md "$name/"
           tar czf "$name.tar.gz" "$name"
@@ -74,16 +99,153 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $name = "zai-${{ steps.tag.outputs.tag }}-${{ matrix.label }}"
+          $name = '${{ steps.art.outputs.name }}'
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/zai.exe", "LICENSE", "README.md" $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
+
+      # ■ チェックサムは「そのアーカイブを作ったランナー上で」計算する。
+      #   後からどこかで再ダウンロードして計算し直すと、経路上の改変を検出できなくなる。
+      #   出力は sha256sum(1) の標準形 "<64桁hex><SP><SP><filename>" に統一する
+      #   (install.sh 側で `sha256sum -c` / `shasum -a 256 -c` がそのまま使える形)。
+      - name: SHA256 (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          f='${{ steps.art.outputs.file }}'
+          out='sha256-${{ matrix.label }}.txt'
+          # Linux は coreutils の sha256sum、macOS は sha256sum が無いので shasum -a 256。
+          # どちらも既定の出力書式が標準形なので整形不要。
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$f" > "$out"
+          else
+            shasum -a 256 "$f" > "$out"
+          fi
+          cat "$out"
+
+      - name: SHA256 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $f = '${{ steps.art.outputs.file }}'
+          $out = 'sha256-${{ matrix.label }}.txt'
+          # Get-FileHash は大文字 hex を返す。sha256sum は小文字なので揃える
+          # (揃えないと Linux 上の `sha256sum -c` が不一致扱いにする)。
+          $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower()
+          # BOM 無し・LF 固定で書く。PowerShell の既定 (CRLF / 場合により BOM) のままだと
+          # 結合後の checksums.txt でファイル名末尾に \r が付き、
+          # Linux 側の検証が「そんなファイルは無い」で必ず失敗する。
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD $out),
+            "$h  $f`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+          Get-Content $out
+
+      # 単一バイナリ配布はこの製品の価値そのもの (競合は Electron で 190MB)。
+      # サイズを毎リリース可視化して、太ったことに後から気付く事故を防ぐ。
+      - name: Size report
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${{ matrix.label }}"
+            echo ""
+            echo "| item | bytes | MB |"
+            echo "| --- | ---: | ---: |"
+            for p in '${{ steps.art.outputs.bin }}' '${{ steps.art.outputs.file }}'; do
+              b=$(wc -c < "$p" | tr -d ' ')
+              # awk / basename に依存しない (Windows ランナーの Git Bash でも確実に動く)。
+              # 小数第1位までを整数演算で作る: 10 倍して割り、商と余りで組み立てる。
+              t=$(( b * 10 / 1048576 ))
+              printf '| %s | %s | %d.%d |\n' "${p##*/}" "$b" "$(( t / 10 ))" "$(( t % 10 ))"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 断片を集約ジョブへ渡す。ファイル名がターゲットごとに一意なので
+      # download-artifact の merge-multiple で 1 ディレクトリに平坦展開できる。
+      - name: Upload checksum fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256-${{ matrix.label }}
+          path: sha256-${{ matrix.label }}.txt
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload to release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.tag.outputs.tag }}" '${{ steps.art.outputs.file }}' --clobber
+
+  # 5 ターゲット分の断片を 1 枚の checksums.txt にまとめてリリースへ添付する。
+  # needs: build なので、1 ターゲットでもビルドが落ちれば このジョブは skip され、
+  # 「一部しか載っていない checksums.txt」が世に出ない (fail-closed)。
+  checksums:
+    name: checksums.txt + installers
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: echo "tag=${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sha256-*
+          path: parts
+          merge-multiple: true
+
+      - name: Assemble checksums.txt
+        shell: bash
         run: |
-          shopt -s nullglob
-          files=(zai-*.tar.gz zai-*.zip)
-          gh release upload "${{ steps.tag.outputs.tag }}" "${files[@]}" --clobber
+          set -euo pipefail
+          # インストーラ自身のハッシュも載せる。install.sh を curl | sh する利用者が
+          # 「実行する前にスクリプトを検証する」導線を持てるようにするため。
+          cat parts/sha256-*.txt > merged.txt
+          sha256sum install.sh install.ps1 >> merged.txt
+          # CR を除去 (Windows 断片の保険) し、ファイル名でソートして決定的にする。
+          tr -d '\r' < merged.txt | LC_ALL=C sort -k2 > checksums.txt
+
+          # 形式検査: 1 行でも標準形を外れたら公開しない。
+          # [^ ]+ ではなく [^[:space:]]+ を使う: 前者は末尾 CR を「非スペース」として
+          # 受理してしまい、CRLF 混入を素通しする (ローカルで実証済み)。
+          # ここを緩めると install.sh 側の検証が静かに素通りするようになる。
+          if grep -qvE '^[0-9a-f]{64}  [^[:space:]]+$' checksums.txt; then
+            echo "::error::checksums.txt に標準形でない行がある"
+            grep -nvE '^[0-9a-f]{64}  [^[:space:]]+$' checksums.txt
+            exit 1
+          fi
+
+          # 5 ターゲット + install.sh + install.ps1 = 7 行。
+          n=$(wc -l < checksums.txt)
+          if [ "$n" -ne 7 ]; then
+            echo "::error::checksums.txt は 7 行のはずが $n 行だった (ターゲット欠落の疑い)"
+            cat checksums.txt
+            exit 1
+          fi
+          cat checksums.txt
+
+          {
+            echo "### checksums.txt"
+            echo ""
+            echo '```'
+            cat checksums.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # install.sh / install.ps1 をリリースアセットとしても配る。
+      # 理由: main の HEAD ではなくタグに固定されたインストーラを指せるようになり、
+      # 「v0.5.1 を入れた手順」を後から完全に再現できる。ファイルは数 KB なのでコストは無い。
+      - name: Upload checksums + installers
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.tag.outputs.tag }}" checksums.txt install.sh install.ps1 --clobber

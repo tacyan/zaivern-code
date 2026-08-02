@@ -6,6 +6,8 @@
 #   - 同一 OS の 2 ジョブは rust-cache の shared-key で同じキャッシュを共有する
 #     (shared-key は自動のジョブ名ベースキーを置き換え、複数ジョブ間で安定 —
 #     両ジョブは同じ RUSTFLAGS / プロファイルでビルドするため成果物は完全に再利用可能)。
+#   - lint ジョブは ubuntu 1 台のみ。3 OS で回しても同じ診断しか出ないため無駄。
+#     6 本のテストジョブと並列に走るので wall-clock は増えない。
 #   - ハング時のコストは nextest の slow-timeout (terminate-after=1) で
 #     グローバル ~65 秒 / terminal:: ~50 秒に抑える (.config/nextest.toml)。
 #   - ジョブレベルの timeout-minutes は 10/12 分 — ランナーが固まっても
@@ -20,14 +22,33 @@
 # プロセスグループごと kill する (.config/nextest.toml の profile.ci 参照)。
 name: Test
 
+# main と PR にも品質ゲートを張る。night/** は従来どおり push で即回す。
+# paths-ignore: ドキュメントだけの変更で 7 ジョブ × 3 OS を焚かない
+# (README の同期コミットが多いリポジトリなので効果が大きい)。
+# 注意: main にブランチ保護の required checks を設定する場合、
+#   paths-ignore でスキップされた run は「未実行」のままマージをブロックする。
+#   その時は required checks を外すか、常緑のダミージョブを足すこと。
 on:
   push:
-    branches: ["night/**"]
+    branches: ["main", "night/**"]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
   workflow_dispatch:
 
 # 同一ブランチへの連続 push では古い run をキャンセルし、ランナーを節約する。
+#
+# キーに **event 名を含める**のが要点。含めないと push run と pull_request run が
+# 同じグループへ入り、**後から来た方が先の方をキャンセルする**。同一コミットの
+# 二重実行は確かに消えるが、ブランチの履歴には「7 ジョブ全部 cancelled」が残り、
+# テストが通っているのに落ちたように見える (実際にそう報告された)。
+#
+# 二重実行は下の `if:` で断つ — 同一リポジトリからの PR は push run が既に
+# 同じコミットを見ているので PR 側のジョブを丸ごと飛ばす。fork からの PR は
+# push イベントが飛んでこないので、そちらだけ PR run が実体を持つ。
+# これで「キャンセルもされず、二重にも走らない」。
 concurrency:
-  group: test-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
@@ -39,6 +60,12 @@ env:
 jobs:
   # terminal:: 以外の全テスト。表示名: "fast (ubuntu-latest)" など。
   fast:
+    # 同一リポジトリからの PR はスキップする。push run が同じコミットを
+    # 既に見ているため二重実行になるだけで、得るものが無い。
+    # fork からの PR は push イベントが飛んでこないので、そこだけ実体を持つ。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -84,6 +111,12 @@ jobs:
   # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
   # 表示名: "pty (ubuntu-latest)" など。
   pty:
+    # 同一リポジトリからの PR はスキップする。push run が同じコミットを
+    # 既に見ているため二重実行になるだけで、得るものが無い。
+    # fork からの PR は push イベントが飛んでこないので、そこだけ実体を持つ。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -116,3 +149,127 @@ jobs:
 
       - name: Terminal (real PTY) tests
         run: cargo nextest run --locked --no-fail-fast --profile ci -E 'test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
+
+  # 静的解析。ubuntu 1 台だけ (診断は OS 非依存。3 OS で回すのは丸損)。
+  #
+  # ■ cargo fmt --check は 2026-08-02 に有効化した。
+  #   それまで 55 ファイル / 1475 箇所が未適用で、有効にすると全 PR が初回から
+  #   赤くなるためゲートとして機能しなかった。一括 fmt は複数エージェントの
+  #   並行編集と全面衝突するので、**並行作業がゼロになった瞬間**にまとめて
+  #   適用し、そのまま --check を入れて二度と溜まらないようにしてある。
+  lint:
+    # 同一リポジトリからの PR はスキップする。push run が同じコミットを
+    # 既に見ているため二重実行になるだけで、得るものが無い。
+    # fork からの PR は push イベントが飛んでこないので、そこだけ実体を持つ。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository
+    name: lint (clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # dtolnay/rust-toolchain は --profile minimal 相当。rustfmt は既定で
+          # 入らないので明示する (下の債務レポートが cargo fmt を呼ぶため)。
+          components: clippy, rustfmt
+
+      # lint は clippy-driver 経由で fingerprint が変わるため、
+      # test ジョブとキャッシュを共有すると互いに上書きし合って
+      # 毎回ミスになる。専用の shared-key を持たせる。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint-ubuntu
+          cache-on-failure: true
+
+      # eframe/egui + rfd のビルドスクリプトが pkg-config gtk+-3.0 を要求するため、
+      # clippy (= 実際に型検査する) にも同じ依存が必要。
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
+          if command -v ld.lld >/dev/null 2>&1; then
+            echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+          fi
+
+      # 整形は全ファイル適用済み。ここを通しておけば二度と債務が溜まらない。
+      # clippy より先に置くのは、失敗したときの直し方が最も自明だから
+      # (`cargo fmt --all` を実行して commit するだけ)。
+      - name: fmt
+        run: cargo fmt --all --check
+
+      # ■ ラチェット方式 (whitelist ではなく blocklist):
+      #   `-D warnings` で「rustc の全警告 + clippy の全 lint」を deny した上で、
+      #   2026-08-02 時点で既に発生している 26 種 / 69 件だけを個別に -A で逃がす。
+      #   - 新種の lint / 新規の rustc 警告は即 CI 赤になる (= 債務が増えない)。
+      #   - とくに CLAUDE.md が要求する `never used` (dead_code) の検出が
+      #     ここで自動化される。現時点で rustc 警告は 0 件なので取りこぼしがない。
+      #   - 下の -A を 1 行消すごとに債務が 1 lint 分返済される。件数はコメント参照。
+      #   ローカル再現: このコマンドをそのまま実行する (exit 0 を確認済み)。
+      - name: clippy (deny all except the frozen debt list)
+        run: |
+          set -euo pipefail
+          DEBT=(
+            # 18件
+            -A clippy::cloned_ref_to_slice_refs
+            # 10件
+            -A clippy::assertions_on_constants
+            # 7件
+            -A clippy::type_complexity
+            # 4件
+            -A clippy::manual_contains
+            # 3件
+            -A clippy::unnecessary_sort_by
+            # 各2件
+            -A clippy::map_identity
+            -A clippy::derivable_impls
+            -A clippy::manual_inspect
+            -A clippy::neg_cmp_op_on_partial_ord
+            -A clippy::collapsible_match
+            -A clippy::doc_lazy_continuation
+            # 各1件
+            -A clippy::empty_line_after_doc_comments
+            -A clippy::int_plus_one
+            -A clippy::explicit_counter_loop
+            -A clippy::single_range_in_vec_init
+            -A clippy::cmp_owned
+            -A clippy::manual_div_ceil
+            -A clippy::field_reassign_with_default
+            -A clippy::needless_return
+            -A clippy::manual_repeat_n
+            -A clippy::manual_clamp
+            -A clippy::if_same_then_else
+            -A clippy::question_mark
+            -A clippy::single_match
+            -A clippy::redundant_pattern_matching
+            -A clippy::io_other_error
+          )
+          cargo clippy --all-targets --locked -- -D warnings "${DEBT[@]}"
+
+      # 参考情報。落とさない (ゲートではない) が、債務の残量を毎 run 可視化して
+      # 「いつ fmt を通せるか」「clippy 債務が減っているか」を数字で追えるようにする。
+      # 情報表示だけのステップ。**絶対に失敗してはいけない。**
+      #
+      # 以前はここで rustfmt の未適用件数を数えていたが、fmt を全ファイルへ
+      # 適用して上の `fmt` ステップを hard gate にした結果、
+      # `grep '^Diff in '` がマッチ 0 件で exit 1 を返し、`set -o pipefail` が
+      # それをパイプライン全体の失敗へ昇格させ、既定シェルの `-e` が
+      # **情報表示のためだけのステップで CI を赤くした** (実際に起きた)。
+      # 「綺麗になったから落ちる」という最悪の回帰なので、数え上げごと捨てた。
+      # fmt の残量は常に 0 (通らなければ手前のステップで落ちる) ので、
+      # 数える意味がそもそも無い。
+      - name: 債務レポート (informational)
+        if: always()
+        run: |
+          {
+            echo "### 静的解析の債務 (ゲートではない / 残量の可視化)"
+            echo ""
+            echo "| 項目 | 残量 |"
+            echo "| --- | ---: |"
+            echo "| rustfmt 未適用 | 0 (fmt ステップが hard gate) |"
+            echo "| clippy 凍結 lint 種別 | 26 |"
+            echo ""
+            echo "clippy の -A を 1 行消すごとに債務が 1 種類返済される (.github/workflows/test.yml)。"
+          } >> "$GITHUB_STEP_SUMMARY"

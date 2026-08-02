@@ -116,7 +116,9 @@ impl AgentSpec {
 
     /// この CLI の「過去セッション保存先」。列挙できない CLI は `SessionStore::None`。
     pub fn session_store(&self) -> SessionStore {
-        session_entry(self.bin).map(|e| e.1).unwrap_or(SessionStore::None)
+        session_entry(self.bin)
+            .map(|e| e.1)
+            .unwrap_or(SessionStore::None)
     }
 
     /// セッション ID を指定して再開するための指定 (`--resume` / `resume`)。
@@ -155,7 +157,10 @@ impl AgentSpec {
 /// (ロジック側にフラグ名や値のリテラルを一切置かないため)。
 const TWO_TOKEN_BYPASS: &[(&str, &[&str])] = &[
     // claude / devin / ante (`--permission-mode yolo`) / (orca 版) grok
-    ("--permission-mode", &["bypassPermissions", "bypass", "yolo"]),
+    (
+        "--permission-mode",
+        &["bypassPermissions", "bypass", "yolo"],
+    ),
     // gemini / qwen — `--approval-mode yolo` (実機 `gemini --help` で確認)
     ("--approval-mode", &["yolo"]),
 ];
@@ -206,9 +211,91 @@ const SESSION_STORES: &[(&str, SessionStore, &str, &str)] = &[
     ("codebuff", SessionStore::None, "--continue", "保存先は ~/.config/manicode/projects/ 配下で公式ドキュメントに記載が無く、形式が保証されない"),
 ];
 
-fn session_entry(bin: &str) -> Option<&'static (&'static str, SessionStore, &'static str, &'static str)>
-{
+fn session_entry(
+    bin: &str,
+) -> Option<&'static (&'static str, SessionStore, &'static str, &'static str)> {
     SESSION_STORES.iter().find(|e| e.0 == bin)
+}
+
+/// bin → 「どのアカウント/プロファイルで動くか」を決める環境変数のカタログ。
+///
+/// プリセットの `env` にこれらのどれかが入っていれば、**同じ CLI でも別の枠**を
+/// 食う (= レート制限のフェイルオーバー先になれる)。値そのものは秘密になり得るので
+/// 呼び出し側 (`crate::failover::account_key`) がハッシュ化してから持ち回る。
+///
+/// `AgentSpec` のフィールドにしない理由は [`SESSION_STORES`] と同じ
+/// (他モジュールに `AgentSpec` の構造体リテラルがあり、増やすと一斉に壊れる)。
+/// 3 つ目の要素は 2 つ目の**部分集合**で、「会話の保存先そのものを引っ越す」変数。
+/// これが違う切替先では過去の会話を再開できない (`--continue` を付けても中身が無い)。
+const ACCOUNT_ENVS: &[(&str, &[&str], &[&str])] = &[
+    // claude: 設定ディレクトリを分けると別ログイン + 会話も別置き場になる。
+    (
+        "claude",
+        &[
+            "CLAUDE_CONFIG_DIR",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+        ],
+        &["CLAUDE_CONFIG_DIR"],
+    ),
+    // codex: `CODEX_HOME` が認証情報と rollout の置き場所。
+    (
+        "codex",
+        &["CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL"],
+        &["CODEX_HOME"],
+    ),
+    (
+        "gemini",
+        &["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT"],
+        &[],
+    ),
+    (
+        "qwen",
+        &["DASHSCOPE_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"],
+        &[],
+    ),
+    ("cursor-agent", &["CURSOR_API_KEY"], &[]),
+    (
+        "opencode",
+        &["OPENCODE_CONFIG", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+        &["OPENCODE_CONFIG"],
+    ),
+    ("crush", &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"], &[]),
+    (
+        "aider",
+        &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AIDER_MODEL"],
+        &[],
+    ),
+    (
+        "goose",
+        &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOSE_PROVIDER"],
+        &[],
+    ),
+    ("grok", &["XAI_API_KEY"], &[]),
+    ("droid", &["FACTORY_API_KEY"], &[]),
+];
+
+/// この CLI でアカウント (プロファイル) を分ける環境変数名。未知の bin では空。
+///
+/// 空を返す CLI は「プリセットの env ではアカウントを分けられない」という意味で、
+/// フェイルオーバー先としては**別 CLI** としてしか扱われない。
+pub fn account_env_keys(bin: &str) -> &'static [&'static str] {
+    ACCOUNT_ENVS
+        .iter()
+        .find(|e| e.0 == bin)
+        .map(|e| e.1)
+        .unwrap_or(&[])
+}
+
+/// 会話の保存先そのものを引っ越す環境変数名 ([`account_env_keys`] の部分集合)。
+/// これが一致しない切替先では、再開指定 (`--continue` 等) を付けてはいけない。
+pub fn session_store_env_keys(bin: &str) -> &'static [&'static str] {
+    ACCOUNT_ENVS
+        .iter()
+        .find(|e| e.0 == bin)
+        .map(|e| e.2)
+        .unwrap_or(&[])
 }
 
 /// 実行ファイル名だけでは起動できない CLI の「bin の直後に必ず要る引数」。
@@ -242,14 +329,8 @@ pub fn launch_args_for(bin: &str) -> &'static str {
 /// [`AGENT_CATALOG`] 全件を出すので、いつでもプリセットに追加できる。
 /// 既定を短く保つのは、初回のプルダウンが 60 行になるのを避けるため。
 /// **この機で `--help` を実行して全項目を確認できた CLI だけ**を並べている。
-pub const DEFAULT_PRESET_BINS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "agy",
-    "cursor-agent",
-    "droid",
-];
+pub const DEFAULT_PRESET_BINS: &[&str] =
+    &["claude", "codex", "gemini", "agy", "cursor-agent", "droid"];
 
 /// 実行ファイル名の別名表。
 ///
@@ -279,7 +360,7 @@ const AGENT_ALIASES: &[(&str, &str, bool)] = &[
     // (npm/PyPI/Homebrew いずれにも無い)。実体の `acli rovodev run` へ寄せる。
     ("rovo", "acli", true),
     ("rovodev", "acli", true),
-    ("cmd", "command-code", false),   // Windows の cmd.exe と衝突するため除外
+    ("cmd", "command-code", false), // Windows の cmd.exe と衝突するため除外
 ];
 
 /// 承認モードを自動適用できる CLI カタログ。
@@ -1196,10 +1277,7 @@ fn user_rules_cell() -> &'static std::sync::RwLock<&'static [PromptRule]> {
 
 /// いま有効なユーザー定義ルール。
 pub fn user_prompt_rules() -> &'static [PromptRule] {
-    user_rules_cell()
-        .read()
-        .map(|g| *g)
-        .unwrap_or(&[])
+    user_rules_cell().read().map(|g| *g).unwrap_or(&[])
 }
 
 /// config.toml のユーザー定義ルールを取り込む(設定読み込みのたびに呼ぶ)。
@@ -1217,9 +1295,7 @@ pub fn set_user_prompt_rules(rules: &[(String, String, String)]) {
         .collect();
     let same = cur.len() == wanted.len()
         && cur.iter().zip(&wanted).all(|(c, w)| {
-            c.needles.first().copied() == Some(w.0)
-                && c.reply == w.1.as_bytes()
-                && c.agent == w.2
+            c.needles.first().copied() == Some(w.0) && c.reply == w.1.as_bytes() && c.agent == w.2
         });
     if same {
         return;
@@ -1228,7 +1304,9 @@ pub fn set_user_prompt_rules(rules: &[(String, String, String)]) {
         .iter()
         .map(|(p, r, a)| PromptRule {
             agent: Box::leak(a.to_string().into_boxed_str()),
-            needles: Box::leak(vec![&*Box::leak(p.to_string().into_boxed_str())].into_boxed_slice()),
+            needles: Box::leak(
+                vec![&*Box::leak(p.to_string().into_boxed_str())].into_boxed_slice(),
+            ),
             avoid: &[],
             reply: Box::leak(r.to_string().into_boxed_str()).as_bytes(),
             desc: Box::leak(format!("ユーザー定義ルール「{p}」").into_boxed_str()),
@@ -1264,10 +1342,7 @@ fn rule_matches(rule: &PromptRule, text: &str, agent: Option<&str>) -> bool {
 
 /// 応答表から、画面に合う応答キーと説明を引く。
 /// ユーザー定義ルールを先に見るので、組み込みの判断を上書きできる。
-pub fn prompt_rule_reply(
-    text: &str,
-    agent: Option<&str>,
-) -> Option<(&'static [u8], &'static str)> {
+pub fn prompt_rule_reply(text: &str, agent: Option<&str>) -> Option<(&'static [u8], &'static str)> {
     prompt_rule_reply_with(user_prompt_rules(), text, agent)
 }
 
@@ -1380,10 +1455,9 @@ pub fn command_is_bypass(command: &str) -> bool {
             continue;
         }
         // `--permission-mode=bypassPermissions` など `=` 区切り 1 トークン形
-        if TWO_TOKEN_BYPASS
-            .iter()
-            .any(|(f, _)| tok.starts_with(f) && tok.len() > f.len() && tok.as_bytes()[f.len()] == b'=')
-        {
+        if TWO_TOKEN_BYPASS.iter().any(|(f, _)| {
+            tok.starts_with(f) && tok.len() > f.len() && tok.as_bytes()[f.len()] == b'='
+        }) {
             if is_bypass_joined(tok) {
                 return true;
             }
@@ -1837,10 +1911,7 @@ impl AgentManager {
                 // 撃たせる前にここで栓をする。拒否ポリシーが 1 件も無い既定
                 // 構成では画面テキストの取得すら走らない (追加コスト 0)。
                 let mut auto = s.auto_yes_target(allow_auto_yes);
-                if auto
-                    && approvals.auto_yes_blocked(s.id, s.agent_bin(), || {
-                        approval_scan_text(s)
-                    })
+                if auto && approvals.auto_yes_blocked(s.id, s.agent_bin(), || approval_scan_text(s))
                 {
                     auto = false;
                 }
@@ -1974,11 +2045,17 @@ mod tests {
     fn non_known_command_untouched() {
         // カタログ外のコマンドは Auto でも Ask でも一切書き換えない
         assert_eq!(
-            apply_approval("some-unknown-cli --dangerously-skip-permissions", Approval::Auto),
+            apply_approval(
+                "some-unknown-cli --dangerously-skip-permissions",
+                Approval::Auto
+            ),
             "some-unknown-cli --dangerously-skip-permissions"
         );
         assert_eq!(
-            apply_approval("some-unknown-cli --dangerously-skip-permissions", Approval::Ask),
+            apply_approval(
+                "some-unknown-cli --dangerously-skip-permissions",
+                Approval::Ask
+            ),
             "some-unknown-cli --dangerously-skip-permissions"
         );
     }
@@ -2031,7 +2108,10 @@ mod tests {
     #[test]
     fn resume_does_not_double_add() {
         let claude = spec_for_bin("claude").unwrap();
-        assert_eq!(apply_resume("claude --continue", claude), "claude --continue");
+        assert_eq!(
+            apply_resume("claude --continue", claude),
+            "claude --continue"
+        );
         let codex = spec_for_bin("codex").unwrap();
         assert_eq!(
             apply_resume("codex resume --last", codex),
@@ -2078,7 +2158,11 @@ mod tests {
         ];
         for (bin, cmd, id, want) in table {
             let spec = spec_for_bin(bin).expect("カタログにある");
-            assert_eq!(apply_resume_id(cmd, spec, id), *want, "{bin} / {cmd} / {id}");
+            assert_eq!(
+                apply_resume_id(cmd, spec, id),
+                *want,
+                "{bin} / {cmd} / {id}"
+            );
         }
     }
 
@@ -2086,7 +2170,11 @@ mod tests {
     fn resume_id_unsupported_cli_returns_command_unchanged() {
         for bin in ["goose", "qwen", "aider", "grok"] {
             let spec = spec_for_bin(bin).expect("カタログにある");
-            assert_eq!(spec.resume_id_flag(), "", "{bin} は ID 指定再開 未対応のはず");
+            assert_eq!(
+                spec.resume_id_flag(),
+                "",
+                "{bin} は ID 指定再開 未対応のはず"
+            );
             assert_eq!(spec.session_store(), SessionStore::None);
             assert_eq!(apply_resume_id(bin, spec, "abc"), bin);
         }
@@ -2132,7 +2220,11 @@ mod tests {
                     "{} は保存先だけあって ID 指定再開が無い",
                     spec.bin
                 );
-                assert!(!spec.resume_flag.is_empty(), "{} は再開指定も要る", spec.bin);
+                assert!(
+                    !spec.resume_flag.is_empty(),
+                    "{} は再開指定も要る",
+                    spec.bin
+                );
             }
         }
     }
@@ -2215,7 +2307,10 @@ mod tests {
         );
         assert_eq!(apply_approval("claude", Approval::Agent), "claude");
         assert_eq!(
-            apply_approval("codex --dangerously-bypass-approvals-and-sandbox", Approval::Agent),
+            apply_approval(
+                "codex --dangerously-bypass-approvals-and-sandbox",
+                Approval::Agent
+            ),
             "codex --dangerously-bypass-approvals-and-sandbox"
         );
     }
@@ -2231,7 +2326,10 @@ mod tests {
     #[test]
     fn codex_ask_strips_auto_flags() {
         assert_eq!(
-            apply_approval("codex --dangerously-bypass-approvals-and-sandbox", Approval::Ask),
+            apply_approval(
+                "codex --dangerously-bypass-approvals-and-sandbox",
+                Approval::Ask
+            ),
             "codex"
         );
         assert_eq!(apply_approval("codex --yolo", Approval::Ask), "codex");
@@ -2376,8 +2474,14 @@ mod tests {
     fn catalog_lookup_by_bare_name() {
         assert_eq!(spec_for_command("claude").unwrap().label, "Claude Code");
         assert_eq!(spec_for_bin("kiro-cli").unwrap().label, "Kiro");
-        assert_eq!(spec_for_command("antigravity").unwrap().label, "Antigravity");
-        assert_eq!(spec_for_command("antigravity-cli").unwrap().label, "Antigravity");
+        assert_eq!(
+            spec_for_command("antigravity").unwrap().label,
+            "Antigravity"
+        );
+        assert_eq!(
+            spec_for_command("antigravity-cli").unwrap().label,
+            "Antigravity"
+        );
     }
 
     #[test]
@@ -2389,7 +2493,9 @@ mod tests {
             "claude"
         );
         assert_eq!(
-            spec_for_command("/opt/homebrew/bin/goose run -t hi").unwrap().bin,
+            spec_for_command("/opt/homebrew/bin/goose run -t hi")
+                .unwrap()
+                .bin,
             "goose"
         );
     }
@@ -2491,7 +2597,9 @@ mod tests {
         assert!(command_is_bypass(
             "claude --permission-mode bypassPermissions"
         ));
-        assert!(command_is_bypass("claude --permission-mode=bypassPermissions"));
+        assert!(command_is_bypass(
+            "claude --permission-mode=bypassPermissions"
+        ));
         // bypass ではないものは false
         assert!(!command_is_bypass("claude --permission-mode plan"));
         assert!(!command_is_bypass("claude"));
@@ -2506,7 +2614,10 @@ mod tests {
         // 一括自動承認フラグを持たない CLI も、フラグを捏造しなければ
         // 「起動はできる項目」として並べてよい (auggie / goose と同じ扱い)。
         let s = spec_for_bin("codebuff").expect("codebuff はカタログにある");
-        assert_eq!(s.auto_flag, "", "codebuff に自動承認フラグを捏造してはいけない");
+        assert_eq!(
+            s.auto_flag, "",
+            "codebuff に自動承認フラグを捏造してはいけない"
+        );
         assert!(s.auto_env.is_empty());
         // 「全自動」プリセットは作られない = 壊れた項目が UI に出ない
         assert!(crate::agent_picker::auto_preset(s).is_none());
@@ -2580,7 +2691,11 @@ mod tests {
             }
             // Ask は必ず素のコマンドへ戻す
             assert_eq!(apply_approval(&auto, Approval::Ask), plain, "{}", s.bin);
-            assert!(!command_is_bypass(&apply_approval(&auto, Approval::Ask)), "{}", s.bin);
+            assert!(
+                !command_is_bypass(&apply_approval(&auto, Approval::Ask)),
+                "{}",
+                s.bin
+            );
             // Agent はどんなコマンドでも一切触らない
             assert_eq!(apply_approval(&auto, Approval::Agent), auto, "{}", s.bin);
         }
@@ -2665,7 +2780,10 @@ mod tests {
         for (alias, bin) in table {
             let via_alias = spec_for_bin(alias).unwrap_or_else(|| panic!("{alias} が引けない"));
             let via_bin = spec_for_bin(bin).unwrap_or_else(|| panic!("{bin} が引けない"));
-            assert!(std::ptr::eq(via_alias, via_bin), "{alias} と {bin} が別実体");
+            assert!(
+                std::ptr::eq(via_alias, via_bin),
+                "{alias} と {bin} が別実体"
+            );
             // コマンド行 (引数つき) からも同じ spec に届くこと
             assert_eq!(
                 spec_for_command(&format!("/opt/bin/{alias} --model x")).map(|s| s.bin),
@@ -2679,7 +2797,10 @@ mod tests {
         assert_eq!(spec_for_bin("cmd").map(|s| s.bin), Some("command-code"));
         // 定義していない名前は解決しない
         assert!(spec_for_bin("kiro").is_none(), "kiro は IDE 本体で別物");
-        assert!(spec_for_bin("continue").is_none(), "continue はシェル予約語");
+        assert!(
+            spec_for_bin("continue").is_none(),
+            "continue はシェル予約語"
+        );
     }
 
     // ── 権限モード切替キー ────────────────────────────────────────────
@@ -2765,7 +2886,10 @@ mod tests {
         // CLAUDE_CONFIG_DIR = "~/.claude-work" のようなプロファイル切替を
         // 動かすため、値先頭の ~/ はホームへ展開される (env はシェルを経由しない)
         let mut preset = HashMap::new();
-        preset.insert("CLAUDE_CONFIG_DIR".to_string(), "~/.claude-work".to_string());
+        preset.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "~/.claude-work".to_string(),
+        );
         preset.insert("PLAIN".to_string(), "no~tilde/inside".to_string());
         let e = merged_env("claude", Approval::Ask, &preset);
         let home = dirs::home_dir().unwrap();
@@ -2819,12 +2943,19 @@ mod tests {
         let empty = HashMap::new();
         let env = isolated_env_for_session("claude", 42, Approval::Ask, &empty);
         let home = dirs::home_dir().unwrap();
-        let expected = home.join(".claude-sessions/session-42").to_str().unwrap().to_string();
+        let expected = home
+            .join(".claude-sessions/session-42")
+            .to_str()
+            .unwrap()
+            .to_string();
         assert_eq!(env.get("CLAUDE_CONFIG_DIR"), Some(&expected));
 
         // 明示的に指定されていれば上書きしない
         let mut preset = HashMap::new();
-        preset.insert("CLAUDE_CONFIG_DIR".to_string(), "~/custom-claude".to_string());
+        preset.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "~/custom-claude".to_string(),
+        );
         let env_custom = isolated_env_for_session("claude", 42, Approval::Ask, &preset);
         let expected_custom = home.join("custom-claude").to_str().unwrap().to_string();
         assert_eq!(env_custom.get("CLAUDE_CONFIG_DIR"), Some(&expected_custom));
@@ -2837,9 +2968,17 @@ mod tests {
         let empty = HashMap::new();
         for bin in ["goose", "aider"] {
             let auto = merged_env(bin, Approval::Auto, &empty);
-            assert!(env_enables_auto(bin, &auto), "{} は Auto で全自動になるべき", bin);
+            assert!(
+                env_enables_auto(bin, &auto),
+                "{} は Auto で全自動になるべき",
+                bin
+            );
             let ask = merged_env(bin, Approval::Ask, &empty);
-            assert!(!env_enables_auto(bin, &ask), "{} は Ask で全自動になってはいけない", bin);
+            assert!(
+                !env_enables_auto(bin, &ask),
+                "{} は Ask で全自動になってはいけない",
+                bin
+            );
         }
     }
 
@@ -2947,7 +3086,10 @@ mod tests {
                     m.sessions.len()
                 );
             }
-            assert!(m.active_session().is_none(), "空なら active_session は None");
+            assert!(
+                m.active_session().is_none(),
+                "空なら active_session は None"
+            );
         }
     }
 
@@ -3076,7 +3218,10 @@ mod tests {
 
             // 画面にはプロンプトが残っているが、死んだセッションはスキャン対象外
             let screen = m.sessions[0].parser.lock().unwrap().screen().contents();
-            assert!(screen.contains("(y/n)"), "前提: プロンプトは画面に残っている");
+            assert!(
+                screen.contains("(y/n)"),
+                "前提: プロンプトは画面に残っている"
+            );
             for _ in 0..10 {
                 std::thread::sleep(Duration::from_millis(100));
                 assert!(

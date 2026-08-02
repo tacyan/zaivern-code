@@ -198,7 +198,11 @@ fn run_git(ws: &Path, args: &[&str]) -> Result<String, RunErr> {
     let mut c = Command::new("git");
     // color.ui=always な環境でも ANSI エスケープ無しの出力を得る
     // (branch 一覧の "* " マーカー判定やブランチ名検証が壊れないように)
-    c.arg("-c").arg("color.ui=false").arg("-C").arg(ws).args(args);
+    c.arg("-c")
+        .arg("color.ui=false")
+        .arg("-C")
+        .arg(ws)
+        .args(args);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -208,7 +212,9 @@ fn run_git(ws: &Path, args: &[&str]) -> Result<String, RunErr> {
     }
     let out = c.output().map_err(|e| RunErr::Spawn(e.to_string()))?;
     if !out.status.success() {
-        let err = crate::textenc::decode_output(&out.stderr).trim().to_string();
+        let err = crate::textenc::decode_output(&out.stderr)
+            .trim()
+            .to_string();
         return Err(RunErr::Failed(if err.is_empty() {
             trf("git {args} が失敗しました", &[("args", args.join(" "))])
         } else {
@@ -447,7 +453,9 @@ pub fn validate_branch_name(input: &str) -> Result<String, String> {
     if n.contains("..") || n.contains("@{") {
         return Err(tr("名前に .. や @{ は使えません"));
     }
-    if n.chars().any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')) {
+    if n.chars()
+        .any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
         return Err(tr("名前に ~ ^ : ? * [ \\ は使えません"));
     }
     if n.starts_with('/') || n.ends_with('/') || n.ends_with(".lock") {
@@ -593,7 +601,11 @@ impl GitPanel {
             RepoState::Loading => {
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(12.0));
-                    ui.label(RichText::new(tr("読み込み中…")).color(theme.text_dim).small());
+                    ui.label(
+                        RichText::new(tr("読み込み中…"))
+                            .color(theme.text_dim)
+                            .small(),
+                    );
                 });
             }
             RepoState::Unavailable(msg) => {
@@ -661,7 +673,9 @@ impl GitPanel {
                         .strong()
                         .color(theme.warn),
                 )
-                .on_hover_text(tr("ブランチから外れています。作業前にブランチを作るか切り替えてください"));
+                .on_hover_text(tr(
+                    "ブランチから外れています。作業前にブランチを作るか切り替えてください",
+                ));
             }
             HeadState::Unknown => {
                 ui.label(
@@ -682,9 +696,12 @@ impl GitPanel {
         req: &mut Option<Job>,
     ) {
         egui::CollapsingHeader::new(
-            RichText::new(trf("ブランチ ({n})", &[("n", info.branches.local.len().to_string())]))
-                .color(theme.text)
-                .small(),
+            RichText::new(trf(
+                "ブランチ ({n})",
+                &[("n", info.branches.local.len().to_string())],
+            ))
+            .color(theme.text)
+            .small(),
         )
         .id_salt("zv_git_branches")
         .default_open(true)
@@ -707,10 +724,8 @@ impl GitPanel {
                     let label = RichText::new(&b.name)
                         .color(if b.current { theme.accent } else { theme.text })
                         .small();
-                    let resp = ui.add_enabled(
-                        !busy && !b.current,
-                        egui::Button::new(label).frame(false),
-                    );
+                    let resp =
+                        ui.add_enabled(!busy && !b.current, egui::Button::new(label).frame(false));
                     let resp = if b.current {
                         resp.on_hover_text(tr("現在のブランチ"))
                     } else if b.other_worktree {
@@ -737,8 +752,7 @@ impl GitPanel {
                     .desired_width(f32::INFINITY)
                     .hint_text(tr("新しいブランチ名"));
                 let resp = ui.add_enabled(!busy, te);
-                let enter =
-                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if enter && !self.new_branch_input.trim().is_empty() {
                     *req = Some(Job::NewBranch(self.new_branch_input.clone()));
                 }
@@ -769,8 +783,8 @@ impl GitPanel {
                         "リモート追跡 ({n})",
                         &[("n", info.branches.remote.len().to_string())],
                     ))
-                        .color(theme.text_dim)
-                        .small(),
+                    .color(theme.text_dim)
+                    .small(),
                 )
                 .id_salt("zv_git_remote_branches")
                 .default_open(false)
@@ -805,7 +819,11 @@ impl GitPanel {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(if is_current { "●" } else { "○" })
-                            .color(if is_current { theme.accent } else { theme.text_dim })
+                            .color(if is_current {
+                                theme.accent
+                            } else {
+                                theme.text_dim
+                            })
                             .small(),
                     );
                     let name = w
@@ -820,21 +838,18 @@ impl GitPanel {
                     if w.locked {
                         ui.label(RichText::new("🔒").small());
                     }
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui
-                                .add_enabled(
-                                    !is_current && !w.bare,
-                                    egui::Button::new(RichText::new(tr("開く")).small()),
-                                )
-                                .on_hover_text(tr("この worktree をワークスペースとして開く"))
-                                .clicked()
-                            {
-                                actions.open_path = Some(w.path.clone());
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                !is_current && !w.bare,
+                                egui::Button::new(RichText::new(tr("開く")).small()),
+                            )
+                            .on_hover_text(tr("この worktree をワークスペースとして開く"))
+                            .clicked()
+                        {
+                            actions.open_path = Some(w.path.clone());
+                        }
+                    });
                 });
             }
 
@@ -845,7 +860,10 @@ impl GitPanel {
                     .hint_text(tr("新しい worktree 名 / 絶対パス"));
                 let _ = ui.add_enabled(!busy, te);
             });
-            ui.checkbox(&mut self.worktree_new_branch, RichText::new(tr("同名のブランチも作る")).small());
+            ui.checkbox(
+                &mut self.worktree_new_branch,
+                RichText::new(tr("同名のブランチも作る")).small(),
+            );
 
             // 作成先プレビュー (どこに出来るかを隠さない)
             if !self.worktree_input.trim().is_empty() {
@@ -886,9 +904,12 @@ impl GitPanel {
 
     fn changes_ui(&self, ui: &mut egui::Ui, theme: &Theme, info: &RepoInfo) {
         egui::CollapsingHeader::new(
-            RichText::new(trf("変更ファイル ({n})", &[("n", info.changes.len().to_string())]))
-                .color(theme.text)
-                .small(),
+            RichText::new(trf(
+                "変更ファイル ({n})",
+                &[("n", info.changes.len().to_string())],
+            ))
+            .color(theme.text)
+            .small(),
         )
         .id_salt("zv_git_changes")
         .default_open(true)
@@ -1023,8 +1044,7 @@ impl GitPanel {
                     actions.toast = Some((tr("worktree のパスが不正です"), false));
                     return;
                 }
-                let mut args: Vec<String> =
-                    vec!["worktree".into(), "add".into()];
+                let mut args: Vec<String> = vec!["worktree".into(), "add".into()];
                 if let Some(b) = branch {
                     args.push("-b".into());
                     args.push(b);
@@ -1073,7 +1093,10 @@ impl GitPanel {
                 }
             }
             Err(e) => {
-                actions.toast = Some((trf("git を起動できません: {e}", &[("e", e.to_string())]), false));
+                actions.toast = Some((
+                    trf("git を起動できません: {e}", &[("e", e.to_string())]),
+                    false,
+                ));
             }
         }
     }
@@ -1295,10 +1318,7 @@ pub fn review_summary(files: &[ReviewFile]) -> (usize, usize, usize) {
 }
 
 /// diff から実効ステータスを決める (ツリーの色と意味を揃えるため)。
-pub fn review_file_status(
-    f: &crate::diff::FileDiff,
-    untracked: bool,
-) -> crate::git::FileStatus {
+pub fn review_file_status(f: &crate::diff::FileDiff, untracked: bool) -> crate::git::FileStatus {
     use crate::git::FileStatus;
     if untracked {
         return FileStatus::Untracked;
@@ -1328,8 +1348,7 @@ pub fn review_path(f: &crate::diff::FileDiff) -> String {
 /// 戻りは (ディレクトリ, 元の添字) をディレクトリ名順・パス順に並べたもの。
 /// "" はリポジトリ直下。
 pub fn group_by_dir(paths: &[String]) -> Vec<(String, Vec<usize>)> {
-    let mut map: std::collections::BTreeMap<String, Vec<usize>> =
-        std::collections::BTreeMap::new();
+    let mut map: std::collections::BTreeMap<String, Vec<usize>> = std::collections::BTreeMap::new();
     for (i, p) in paths.iter().enumerate() {
         let dir = p.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         map.entry(dir.to_string()).or_default().push(i);
@@ -1508,9 +1527,11 @@ enum ReviewJob {
 /// PR 風のローカル変更レビュー画面。
 ///
 /// 左 = 変更ファイル一覧 (ディレクトリごと・ツリーと同じ色とバッジ・`+N −M`)、
-/// 右 = 既存の diff レンダラ (`diff::diff_ui_with_actions`) による unified diff。
-/// diff の描画をレンダラに任せているので、今夜入ったインラインレビュー
-/// コメント (行クリック → コメント → まとめてエージェントへ) がそのまま効く。
+/// 右 = 既存の diff レンダラ (`diff::diff_ui_with_actions`) による差分。
+/// diff の描画をレンダラに任せているので、インラインレビューコメント
+/// (行クリック → コメント → まとめてエージェントへ) も、並列 (左右 2 列) 表示・
+/// 語単位ハイライト・F7 の変更ジャンプも、この画面でそのまま効く。
+/// 表示モードの切替ボタンは 1 フレームに 1 個だけ出る (`diff::claim_mode_toggle`)。
 pub struct ReviewPanel {
     workspace: PathBuf,
     base: ReviewBase,
@@ -1609,7 +1630,11 @@ impl ReviewPanel {
         if !self.loaded {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(12.0));
-                ui.label(RichText::new(tr("差分を集めています…")).color(theme.text_dim).small());
+                ui.label(
+                    RichText::new(tr("差分を集めています…"))
+                        .color(theme.text_dim)
+                        .small(),
+                );
             });
             return;
         }
@@ -1728,7 +1753,9 @@ impl ReviewPanel {
             }
             if ui
                 .selectable_label(self.ignore_ws, tr("空白無視"))
-                .on_hover_text(tr("インデントだけの変更を差分から外す (--ignore-all-space)"))
+                .on_hover_text(tr(
+                    "インデントだけの変更を差分から外す (--ignore-all-space)",
+                ))
                 .clicked()
             {
                 self.ignore_ws = !self.ignore_ws;
@@ -1752,8 +1779,16 @@ impl ReviewPanel {
                     .strong(),
             );
             ui.label(RichText::new("·").color(theme.text_dim));
-            ui.label(RichText::new(format!("+{adds}")).color(theme.ok).monospace());
-            ui.label(RichText::new(format!("−{dels}")).color(theme.err).monospace());
+            ui.label(
+                RichText::new(format!("+{adds}"))
+                    .color(theme.ok)
+                    .monospace(),
+            );
+            ui.label(
+                RichText::new(format!("−{dels}"))
+                    .color(theme.err)
+                    .monospace(),
+            );
         });
     }
 
@@ -1801,12 +1836,8 @@ impl ReviewPanel {
                     ui.label(RichText::new(format!("+{adds}")).color(theme.ok).small());
                     ui.label(RichText::new(format!("−{dels}")).color(theme.err).small());
                     if staged {
-                        ui.label(
-                            RichText::new(tr("済"))
-                                .color(theme.accent)
-                                .small(),
-                        )
-                        .on_hover_text(tr("ステージ済み"));
+                        ui.label(RichText::new(tr("済")).color(theme.accent).small())
+                            .on_hover_text(tr("ステージ済み"));
                     }
                 });
                 if self.selected == Some(i) {
@@ -1837,7 +1868,10 @@ impl ReviewPanel {
                 *job = Some(ReviewJob::Stage(path.to_string()));
             }
             if ui
-                .add_enabled(!busy && staged, egui::Button::new(tr("アンステージ")).small())
+                .add_enabled(
+                    !busy && staged,
+                    egui::Button::new(tr("アンステージ")).small(),
+                )
                 .clicked()
             {
                 *job = Some(ReviewJob::Unstage(path.to_string()));
@@ -1866,7 +1900,10 @@ impl ReviewPanel {
             {
                 self.confirm_discard = Some(path.to_string());
             }
-            if ui.button(RichText::new(tr("エディタで開く")).small()).clicked() {
+            if ui
+                .button(RichText::new(tr("エディタで開く")).small())
+                .clicked()
+            {
                 actions.open_file = Some(self.data.toplevel.join(path));
             }
         });
@@ -1942,10 +1979,7 @@ impl ReviewPanel {
     /// 一覧を一度クリックしている / ポインタがこのパネル上にある /
     /// テキスト入力にフォーカスが無い。エディタで打鍵中に奪わない。
     fn handle_keys(&mut self, ui: &mut egui::Ui) {
-        if !self.list_focused
-            || !ui.ui_contains_pointer()
-            || ui.memory(|m| m.focused().is_some())
-        {
+        if !self.list_focused || !ui.ui_contains_pointer() || ui.memory(|m| m.focused().is_some()) {
             return;
         }
         let len = self.data.files.len();
@@ -2031,10 +2065,7 @@ impl ReviewPanel {
             Ok(_) => self.pending = Some(rx),
             Err(e) => {
                 self.loaded = true;
-                self.data.error = Some(trf(
-                    "差分を取得できません: {e}",
-                    &[("e", e.to_string())],
-                ));
+                self.data.error = Some(trf("差分を取得できません: {e}", &[("e", e.to_string())]));
             }
         }
     }
@@ -2081,8 +2112,10 @@ impl ReviewPanel {
                 self.job_label = label;
             }
             Err(e) => {
-                actions.toast =
-                    Some((trf("git を起動できません: {e}", &[("e", e.to_string())]), false));
+                actions.toast = Some((
+                    trf("git を起動できません: {e}", &[("e", e.to_string())]),
+                    false,
+                ));
             }
         }
     }
@@ -2183,11 +2216,7 @@ bare
 
     #[test]
     fn branch_list_detects_detached_head() {
-        let out = concat!(
-            "* (HEAD detached at 2f14c3e)\n",
-            "  main\n",
-            "  develop\n",
-        );
+        let out = concat!("* (HEAD detached at 2f14c3e)\n", "  main\n", "  develop\n",);
         let b = parse_branch_list(out);
         assert_eq!(
             b.head,
@@ -2296,7 +2325,10 @@ bare
             validate_branch_name("feature/login-v2").unwrap(),
             "feature/login-v2"
         );
-        assert_eq!(validate_branch_name("日本語ブランチ").unwrap(), "日本語ブランチ");
+        assert_eq!(
+            validate_branch_name("日本語ブランチ").unwrap(),
+            "日本語ブランチ"
+        );
     }
 
     #[test]
@@ -2361,7 +2393,11 @@ bare
             vec!["diff", "--no-color", "-M", "--unified=3"]
         );
         assert_eq!(
-            review_diff_args(&ReviewBase::Rev("origin/main".into()), ContextLines::Ten, true),
+            review_diff_args(
+                &ReviewBase::Rev("origin/main".into()),
+                ContextLines::Ten,
+                true
+            ),
             vec![
                 "diff",
                 "--no-color",
@@ -2372,8 +2408,10 @@ bare
             ]
         );
         // 「全部」は git に十分大きい文脈行数を渡す
-        assert!(review_diff_args(&ReviewBase::Head, ContextLines::All, false)
-            .contains(&"--unified=100000".to_string()));
+        assert!(
+            review_diff_args(&ReviewBase::Head, ContextLines::All, false)
+                .contains(&"--unified=100000".to_string())
+        );
         // 未追跡の合成対象は index 比較のときだけ外れる
         assert!(ReviewBase::Head.includes_untracked());
         assert!(ReviewBase::Unstaged.includes_untracked());
@@ -2639,7 +2677,10 @@ bare
             "blob.bin",
             "moved-dst.txt",
         ] {
-            assert!(names.contains(&want), "HEAD 比較に {want} が出る: {names:?}");
+            assert!(
+                names.contains(&want),
+                "HEAD 比較に {want} が出る: {names:?}"
+            );
         }
         let by = |p: &str| head.files.iter().find(|f| f.path == p).expect(p);
         assert!(by("blob.bin").diff.is_binary, "バイナリは中身を出さない");
@@ -2653,20 +2694,32 @@ bare
         );
         let crlf = by("crlf.txt");
         assert!(
-            crlf.diff.hunks[0].lines.iter().all(|l| !l.text.contains('\r')),
+            crlf.diff.hunks[0]
+                .lines
+                .iter()
+                .all(|l| !l.text.contains('\r')),
             "CRLF の \\r を持ち込まない"
         );
         // 合計は各ファイルの +/- の総和
         let (n, adds, dels) = review_summary(&head.files);
         assert_eq!(n, head.files.len());
-        assert_eq!(adds, head.files.iter().map(|f| f.diff.additions).sum::<usize>());
-        assert_eq!(dels, head.files.iter().map(|f| f.diff.deletions).sum::<usize>());
+        assert_eq!(
+            adds,
+            head.files.iter().map(|f| f.diff.additions).sum::<usize>()
+        );
+        assert_eq!(
+            dels,
+            head.files.iter().map(|f| f.diff.deletions).sum::<usize>()
+        );
 
         // ステージ済みだけ: 未追跡も未ステージ変更も出ない
         let staged = collect_review(&repo, &ReviewBase::Staged, ContextLines::Three, false);
         let sn: Vec<&str> = staged.files.iter().map(|f| f.path.as_str()).collect();
         assert!(sn.contains(&"src/deep/mod.rs"), "{sn:?}");
-        assert!(!sn.contains(&"untracked.txt"), "未追跡は index に無い: {sn:?}");
+        assert!(
+            !sn.contains(&"untracked.txt"),
+            "未追跡は index に無い: {sn:?}"
+        );
         assert!(!sn.contains(&"keep.rs"), "未ステージは出ない: {sn:?}");
 
         // 未ステージだけ: index に上げた分は出ない
@@ -2674,7 +2727,10 @@ bare
         let un: Vec<&str> = unstaged.files.iter().map(|f| f.path.as_str()).collect();
         assert!(un.contains(&"keep.rs"), "{un:?}");
         assert!(!un.contains(&"src/deep/mod.rs"), "{un:?}");
-        assert!(un.contains(&"untracked.txt"), "未追跡は作業ツリー側: {un:?}");
+        assert!(
+            un.contains(&"untracked.txt"),
+            "未追跡は作業ツリー側: {un:?}"
+        );
 
         // 任意リビジョン: HEAD~1 と比べると seed コミットの分も差分に出る
         let rev = collect_review(
@@ -2685,7 +2741,10 @@ bare
         );
         let rn: Vec<&str> = rev.files.iter().map(|f| f.path.as_str()).collect();
         assert!(rev.error.is_none(), "{:?}", rev.error);
-        assert!(rn.contains(&"moved-dst.txt") || rn.contains(&"moved-src.txt"), "{rn:?}");
+        assert!(
+            rn.contains(&"moved-dst.txt") || rn.contains(&"moved-src.txt"),
+            "{rn:?}"
+        );
 
         // 存在しないリビジョンは静かにエラー文言を返す (panic しない)
         let bad = collect_review(
@@ -2712,7 +2771,9 @@ bare
 
         let run = |args: &[String]| {
             let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_git(&repo, &argv).map(|_| ()).map_err(|e| e.text().to_string())
+            run_git(&repo, &argv)
+                .map(|_| ())
+                .map_err(|e| e.text().to_string())
         };
 
         // ステージ → Staged ベースに出る
@@ -2723,7 +2784,10 @@ bare
         // アンステージ → Staged ベースから消える
         run(&unstage_args("keep.rs")).expect("unstage");
         let staged = collect_review(&repo, &ReviewBase::Staged, ContextLines::Three, false);
-        assert!(!staged.files.iter().any(|f| f.path == "keep.rs"), "index から下りた");
+        assert!(
+            !staged.files.iter().any(|f| f.path == "keep.rs"),
+            "index から下りた"
+        );
 
         // 破棄 (追跡済み) → 中身が HEAD に戻る
         run(&discard_args("keep.rs", false)).expect("discard tracked");

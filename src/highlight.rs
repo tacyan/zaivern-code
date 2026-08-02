@@ -15,7 +15,18 @@ const MAX_HIGHLIGHT_LINE_BYTES: usize = 8_192;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+/// プロセスで 1 つだけの [`Highlighter`]。
+///
+/// `SyntaxSet` / `ThemeSet` は数 MB あるので、エディタ本文・差分ビュー・
+/// Markdown プレビューがそれぞれ持つとメモリが素直に倍々になる。
+/// 内部のキャッシュは `Mutex` 越しなので複数箇所から同時に呼んで安全。
+/// **初回呼び出しまでロードしない**ので、起動時間には影響しない。
+pub fn shared() -> &'static Highlighter {
+    static H: OnceLock<Highlighter> = OnceLock::new();
+    H.get_or_init(Highlighter::new)
+}
 
 pub struct Highlighter {
     ps: SyntaxSet,
@@ -180,6 +191,71 @@ impl Highlighter {
         self.cache_put(key, &job);
 
         job
+    }
+
+    /// 連続した行の並びを 1 パスで色分けし、**行ごとの (開始, 終了, 色)** を返す。
+    ///
+    /// 差分ビューのように「行を 1 本ずつ別ウィジェットで描く」画面のための API。
+    /// 1 行ずつ [`Self::layout_job`] を呼ぶとキャッシュが行数ぶん溢れるうえ、
+    /// 複数行にまたがる文字列やブロックコメントの状態が毎行リセットされて
+    /// 色が壊れる。ここでは syntect の状態を行を跨いで持ち回る。
+    ///
+    /// 範囲は**各行の先頭を 0 とするバイトオフセット**の半開区間で、必ず
+    /// 昇順・連続・行長に収まる (呼び出し側はそのまま `&line[s..e]` できる)。
+    /// 合計が [`MAX_HIGHLIGHT_BYTES`] を超える / 言語が Plain Text /
+    /// テーマが無い場合は**空の Vec** を返す (= 呼び出し側は素の色で描く)。
+    pub fn line_spans(
+        &self,
+        lines: &[&str],
+        lang: &str,
+        theme_name: &str,
+    ) -> Vec<Vec<(usize, usize, Color32)>> {
+        let total: usize = lines.iter().map(|l| l.len() + 1).sum();
+        let syntax = self
+            .ps
+            .find_syntax_by_name(lang)
+            .unwrap_or_else(|| self.ps.find_syntax_plain_text());
+        if total > MAX_HIGHLIGHT_BYTES || syntax.name == "Plain Text" {
+            return Vec::new();
+        }
+        let Some(theme) = self.ts.themes.get(theme_name) else {
+            return Vec::new();
+        };
+        let mut h = HighlightLines::new(syntax, theme);
+        let mut out = Vec::with_capacity(lines.len());
+        for line in lines {
+            if line.len() > MAX_HIGHLIGHT_LINE_BYTES {
+                // 極端に長い 1 行 (minify 済み JS など) で UI を止めない。
+                out.push(Vec::new());
+                continue;
+            }
+            // syntect は行末の改行込みで状態を進めるので付けて渡し、
+            // 範囲は元の行長で丸める。
+            let with_nl = format!("{line}\n");
+            match h.highlight_line(&with_nl, &self.ps) {
+                Ok(regions) => {
+                    let mut spans: Vec<(usize, usize, Color32)> = Vec::with_capacity(regions.len());
+                    let mut off = 0usize;
+                    for (style, piece) in regions {
+                        let start = off.min(line.len());
+                        off += piece.len();
+                        let end = off.min(line.len());
+                        if end > start {
+                            let fg = style.foreground;
+                            spans.push((start, end, Color32::from_rgb(fg.r, fg.g, fg.b)));
+                        }
+                    }
+                    out.push(spans);
+                }
+                Err(_) => {
+                    // エラー後の HighlightLines は内部状態が壊れている可能性が
+                    // あるので、以降の行のために作り直す。
+                    h = HighlightLines::new(syntax, theme);
+                    out.push(Vec::new());
+                }
+            }
+        }
+        out
     }
 
     /// キャッシュへ 1 件入れる。上限は古い方から追い出す (全消しすると
@@ -705,10 +781,7 @@ fn scan_source(text: &str, spec: &LangSpec) -> SourceScan {
 /// 「自分より深い行が続く行」がヘッダになり、末尾の空行は範囲に含めない
 /// (空行まで畳むと、次のブロックとの間の余白まで消えて読みにくいため)。
 fn indent_folds(lines: &[&str], tab_width: usize, out: &mut Vec<FoldRange>) {
-    let ind: Vec<Option<usize>> = lines
-        .iter()
-        .map(|l| visual_indent(l, tab_width))
-        .collect();
+    let ind: Vec<Option<usize>> = lines.iter().map(|l| visual_indent(l, tab_width)).collect();
     // (インデント, 行)
     let mut stack: Vec<(usize, usize)> = Vec::new();
     let mut prev_nonblank: Option<usize> = None;
@@ -927,10 +1000,7 @@ pub fn fold_ranges_with(text: &str, lang: &str, tab_width: usize) -> Vec<FoldRan
 /// 各行の「実効インデント」。空行は前後の非空行の**浅い方**を継ぐ
 /// (ブロックの切れ目でガイドが宙に浮かないようにするため)。
 fn effective_indents(lines: &[&str], tab_width: usize) -> Vec<usize> {
-    let raw: Vec<Option<usize>> = lines
-        .iter()
-        .map(|l| visual_indent(l, tab_width))
-        .collect();
+    let raw: Vec<Option<usize>> = lines.iter().map(|l| visual_indent(l, tab_width)).collect();
     let n = raw.len();
     let mut before = vec![0usize; n];
     let mut cur = 0usize;
@@ -1016,10 +1086,7 @@ pub fn active_guide(text: &str, tab_width: usize, caret_line: usize) -> Option<A
         return None;
     }
     let eff = effective_indents(&lines, tw);
-    let raw: Vec<Option<usize>> = lines
-        .iter()
-        .map(|l| visual_indent(l, tw))
-        .collect();
+    let raw: Vec<Option<usize>> = lines.iter().map(|l| visual_indent(l, tw)).collect();
     let own = eff[caret_line];
     let opens = raw[(caret_line + 1).min(n)..]
         .iter()
@@ -1199,7 +1266,10 @@ mod tests {
 
     #[test]
     fn lang_for_resolves_known_extension() {
-        assert_eq!(hl().lang_for(Some(Path::new("a.rs")), "fn main() {}"), "Rust");
+        assert_eq!(
+            hl().lang_for(Some(Path::new("a.rs")), "fn main() {}"),
+            "Rust"
+        );
     }
 
     #[test]
@@ -1469,7 +1539,11 @@ mod tests {
         assert!(text.len() > MAX_HIGHLIGHT_BYTES);
 
         let job = job_of(&text, "Rust");
-        assert_eq!(job.sections.len(), 1, "large files must be laid out in one plain span");
+        assert_eq!(
+            job.sections.len(),
+            1,
+            "large files must be laid out in one plain span"
+        );
         assert_eq!(job.sections[0].format.color, fallback());
     }
 
@@ -1477,7 +1551,10 @@ mod tests {
     fn oversized_single_line_is_passed_through_without_highlighting() {
         // minify された JS のような 1 行だけ巨大なテキストでも、その行は
         // 素通し (フォールバック色) にして残りの行はハイライトを続ける。
-        let long_line = format!("let s = \"{}\";\n", "x".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1));
+        let long_line = format!(
+            "let s = \"{}\";\n",
+            "x".repeat(MAX_HIGHLIGHT_LINE_BYTES + 1)
+        );
         let text = format!("fn main() {{}}\n{long_line}// tail\n");
         let job = job_of(&text, "Rust");
         assert_spans_ok(&job, &text);
@@ -1718,10 +1795,7 @@ other: 2
             f.contains(&(3, 7, FoldKind::Section)),
             "最初の ## は次の ## の直前まで: {f:?}"
         );
-        assert!(
-            f.contains(&(6, 7, FoldKind::Section)),
-            "### は 6..7: {f:?}"
-        );
+        assert!(f.contains(&(6, 7, FoldKind::Section)), "### は 6..7: {f:?}");
         assert!(
             f.contains(&(9, 10, FoldKind::Section)),
             "最後の ## は末尾まで: {f:?}"
@@ -1808,7 +1882,10 @@ fn a() {
 ";
         let r = fold_ranges(text, "Rust");
         for w in r.windows(2) {
-            assert!(w[0].start_line < w[1].start_line, "開始行が昇順かつ一意: {r:?}");
+            assert!(
+                w[0].start_line < w[1].start_line,
+                "開始行が昇順かつ一意: {r:?}"
+            );
         }
         for x in &r {
             assert!(x.end_line > x.start_line, "空の範囲は無い: {x:?}");
@@ -1850,12 +1927,7 @@ fn a() {
                 4,
                 &[&[], &[0], &[0], &[]],
             ),
-            (
-                "タブ幅 2",
-                "a\n  b\n    c\n",
-                2,
-                &[&[], &[0], &[0, 2], &[]],
-            ),
+            ("タブ幅 2", "a\n  b\n    c\n", 2, &[&[], &[0], &[0, 2], &[]]),
             (
                 "深いネスト",
                 "a\n    b\n        c\n            d\n",

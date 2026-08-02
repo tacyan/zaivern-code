@@ -152,7 +152,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let verbatim = PathBuf::from(format!(r"\\?\{}", plain(canonical(&dir)).display()));
         let got = launch_dir(&verbatim);
-        assert!(!got.to_string_lossy().starts_with(r"\\?\"), "{}", got.display());
+        assert!(
+            !got.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            got.display()
+        );
         assert!(got.is_dir());
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -135,7 +135,9 @@ impl Problem {
             }
             Problem::DenyRule => "⚠ この実行ファイルを拒否する規則が残っています",
             Problem::NoRule => "⚠ Windows のファイアウォールが受信をブロックしています",
-            Problem::ProfileMismatch => "⚠ 許可規則が、いま繋いでいるネットワークに適用されていません",
+            Problem::ProfileMismatch => {
+                "⚠ 許可規則が、いま繋いでいるネットワークに適用されていません"
+            }
             Problem::OtherFirewall => "⚠ Windows とは別のファイアウォールが動いています",
         }
     }
@@ -205,16 +207,18 @@ impl Report {
         if self.categories.is_empty() || self.rule_profiles.is_empty() {
             return true;
         }
-        if self.rule_profiles.iter().any(|p| p.eq_ignore_ascii_case("Any")) {
+        if self
+            .rule_profiles
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("Any"))
+        {
             return true;
         }
         // 有線と無線で種別が違うことがある。スマホがどちら側かは分からないので、
         // **どれか 1 つでも外れていれば** 不一致として扱う。
-        self.categories.iter().all(|c| {
-            self.rule_profiles
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(c))
-        })
+        self.categories
+            .iter()
+            .all(|c| self.rule_profiles.iter().any(|p| p.eq_ignore_ascii_case(c)))
     }
 
     /// Windows とは別のファイアウォール製品が動いているか。
@@ -257,9 +261,12 @@ impl Report {
 
     /// 受信規則を作り直せば直る原因があるか (= 「許可する」ボタンを出すか)。
     pub fn fixable_by_allow(&self) -> bool {
-        self.problems()
-            .iter()
-            .any(|p| matches!(p, Problem::DenyRule | Problem::NoRule | Problem::ProfileMismatch))
+        self.problems().iter().any(|p| {
+            matches!(
+                p,
+                Problem::DenyRule | Problem::NoRule | Problem::ProfileMismatch
+            )
+        })
     }
 
     /// いま繋いでいるネットワークの種別 (表示用の日本語、例 "プライベート, パブリック")。
@@ -489,7 +496,10 @@ pub fn manual_command(exe: &str, profiles: &str) -> String {
 /// [`check_script`] の出力を読む。`ZVFW …` 行が無ければ `None`。
 #[cfg(any(windows, test))]
 pub fn parse_report(out: &str) -> Option<Report> {
-    let line = out.lines().rev().find(|l| l.trim_start().starts_with("ZVFW "))?;
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with("ZVFW "))?;
     let mut r = Report::default();
     // 製品名は空白を含む ("ノートン 360") ので、空白区切りの要約行には載せられない。
     // 1 製品 1 行の `ZVFWX <名前>` で受け取る。
@@ -568,7 +578,8 @@ fn script_path(name: &str) -> Result<PathBuf, String> {
     let dir = dirs::data_local_dir()
         .ok_or("LOCALAPPDATA が見つかりません")?
         .join("Zaivern");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
     Ok(dir.join(name))
 }
 
@@ -667,7 +678,10 @@ fn run_elevated(file: &str, script: &str) -> Result<(), String> {
         err.lines().next().unwrap_or("").to_string()
     };
     Err(if why.is_empty() {
-        format!("ファイアウォール設定の変更に失敗しました (終了コード {})", out.code)
+        format!(
+            "ファイアウォール設定の変更に失敗しました (終了コード {})",
+            out.code
+        )
     } else {
         format!("ファイアウォール設定の変更に失敗しました: {why}")
     })
@@ -921,9 +935,9 @@ impl FirewallUi {
                     Some(Busy::Allow) if report.problems().is_empty() => {
                         Some("🛡 ファイアウォールで受信を許可しました".to_string())
                     }
-                    Some(Busy::Unblock) if report.strict == 0 => Some(
-                        "🛡 「すべての受信接続をブロックする」を解除しました".to_string(),
-                    ),
+                    Some(Busy::Unblock) if report.strict == 0 => {
+                        Some("🛡 「すべての受信接続をブロックする」を解除しました".to_string())
+                    }
                     Some(Busy::Revoke) if !report.allowed => {
                         Some("🛡 受信許可を取り消しました".to_string())
                     }
@@ -967,7 +981,10 @@ impl FirewallUi {
         if !applicable() {
             return Vec::new();
         }
-        self.report.as_ref().map(|r| r.problems()).unwrap_or_default()
+        self.report
+            .as_ref()
+            .map(|r| r.problems())
+            .unwrap_or_default()
     }
 
     /// 手作業用の netsh コマンド (コピーさせる)。
@@ -1021,9 +1038,13 @@ mod tests {
 
     #[test]
     fn parse_report_maps_domain_authenticated_to_domain() {
-        let r = parse_report("ZVFW allow=1 block=0 profiles=Domain cats=DomainAuthenticated,Private")
-            .expect("読める");
-        assert_eq!(r.categories, vec!["Domain".to_string(), "Private".to_string()]);
+        let r =
+            parse_report("ZVFW allow=1 block=0 profiles=Domain cats=DomainAuthenticated,Private")
+                .expect("読める");
+        assert_eq!(
+            r.categories,
+            vec!["Domain".to_string(), "Private".to_string()]
+        );
     }
 
     #[test]
@@ -1032,7 +1053,10 @@ mod tests {
             "ZVFW allow=1 block=0 profiles=Domain,Private cats=Private net=1 on=1 strict=1",
         )
         .expect("読める");
-        assert_eq!(r.rule_profiles, vec!["Domain".to_string(), "Private".to_string()]);
+        assert_eq!(
+            r.rule_profiles,
+            vec!["Domain".to_string(), "Private".to_string()]
+        );
         assert_eq!((r.networks, r.enforcing, r.strict), (1, 1, 1));
     }
 
@@ -1043,9 +1067,16 @@ mod tests {
             .expect("読める");
         assert_eq!(
             r.rule_profiles,
-            vec!["Domain".to_string(), "Private".to_string(), "Public".to_string()]
+            vec![
+                "Domain".to_string(),
+                "Private".to_string(),
+                "Public".to_string()
+            ]
         );
-        assert!(r.covers_current_network(), "Public を含む規則があるなら適用される");
+        assert!(
+            r.covers_current_network(),
+            "Public を含む規則があるなら適用される"
+        );
     }
 
     // ── 「許可したのに繋がらない」の原因判定 ──
@@ -1055,8 +1086,10 @@ mod tests {
     /// 画面のどこにも原因が出ず、利用者は「許可しても直らない」と詰まる。
     #[test]
     fn a_private_rule_does_not_cover_a_public_network() {
-        let r = parse_report("ZVFW allow=1 block=0 profiles=Domain,Private cats=Public net=1 on=1 strict=0")
-            .expect("読める");
+        let r = parse_report(
+            "ZVFW allow=1 block=0 profiles=Domain,Private cats=Public net=1 on=1 strict=0",
+        )
+        .expect("読める");
         assert!(r.allowed, "規則自体はある");
         assert!(!r.covers_current_network());
         assert_eq!(r.problems(), vec![Problem::ProfileMismatch]);
@@ -1067,8 +1100,10 @@ mod tests {
 
     #[test]
     fn a_matching_rule_has_no_problems() {
-        let r = parse_report("ZVFW allow=1 block=0 profiles=Domain,Private cats=Private net=1 on=1 strict=0")
-            .expect("読める");
+        let r = parse_report(
+            "ZVFW allow=1 block=0 profiles=Domain,Private cats=Private net=1 on=1 strict=0",
+        )
+        .expect("読める");
         assert!(r.covers_current_network());
         assert!(r.problems().is_empty(), "繋がるはずの状態で警告を出さない");
         assert!(!r.fixable_by_allow());
@@ -1087,8 +1122,10 @@ mod tests {
     /// 規則を作り直しても直らないので、必ず先頭に出す。
     #[test]
     fn strict_inbound_comes_first_and_is_not_fixed_by_allowing() {
-        let r = parse_report("ZVFW allow=1 block=0 profiles=Domain,Private cats=Private net=1 on=1 strict=1")
-            .expect("読める");
+        let r = parse_report(
+            "ZVFW allow=1 block=0 profiles=Domain,Private cats=Private net=1 on=1 strict=1",
+        )
+        .expect("読める");
         assert_eq!(r.problems(), vec![Problem::StrictInbound]);
         assert!(!r.fixable_by_allow(), "許可ボタンでは直らない");
     }
@@ -1103,8 +1140,10 @@ mod tests {
 
     #[test]
     fn a_deny_rule_is_reported_even_with_an_allow_rule() {
-        let r = parse_report("ZVFW allow=1 block=1 profiles=Domain,Private cats=Private net=1 on=1 strict=0")
-            .expect("読める");
+        let r = parse_report(
+            "ZVFW allow=1 block=1 profiles=Domain,Private cats=Private net=1 on=1 strict=0",
+        )
+        .expect("読める");
         assert_eq!(r.problems(), vec![Problem::DenyRule]);
         assert!(r.fixable_by_allow(), "許可時に拒否規則を消すので直る");
     }
@@ -1179,15 +1218,24 @@ mod tests {
         )
         .expect("読める");
         assert!(!r.enforcing_now(), "Windows は検査していない");
-        assert_eq!(r.problems(), vec![Problem::OtherFirewall], "それでも黙らない");
-        assert!(!status_text(r).contains("✅"), "繋がらないのに ✅ を出さない");
+        assert_eq!(
+            r.problems(),
+            vec![Problem::OtherFirewall],
+            "それでも黙らない"
+        );
+        assert!(
+            !status_text(r).contains("✅"),
+            "繋がらないのに ✅ を出さない"
+        );
     }
 
     /// 名前が読めなくても「別の製品が居る」ことだけは伝える。
     #[test]
     fn an_unnamed_product_still_raises_the_cause() {
-        let r = parse_report("ZVFW allow=1 block=0 profiles=Any cats=Private net=1 on=1 strict=0 other=2")
-            .expect("読める");
+        let r = parse_report(
+            "ZVFW allow=1 block=0 profiles=Any cats=Private net=1 on=1 strict=0 other=2",
+        )
+        .expect("読める");
         assert!(r.has_other_firewall());
         assert_eq!(r.problems(), vec![Problem::OtherFirewall]);
         assert!(!r.other_firewall_label().is_empty(), "空欄を出さない");
@@ -1195,8 +1243,10 @@ mod tests {
 
     #[test]
     fn no_other_product_means_no_extra_noise() {
-        let r = parse_report("ZVFW allow=1 block=0 profiles=Any cats=Private net=1 on=1 strict=0 other=0")
-            .expect("読める");
+        let r = parse_report(
+            "ZVFW allow=1 block=0 profiles=Any cats=Private net=1 on=1 strict=0 other=0",
+        )
+        .expect("読める");
         assert!(!r.has_other_firewall());
         assert!(r.problems().is_empty(), "居ないのに警告を出さない");
     }
@@ -1247,7 +1297,8 @@ mod tests {
 
     #[test]
     fn network_label_is_japanese() {
-        let r = parse_report("ZVFW allow=1 block=0 profiles=Any cats=Private,Public").expect("読める");
+        let r =
+            parse_report("ZVFW allow=1 block=0 profiles=Any cats=Private,Public").expect("読める");
         assert_eq!(r.network_label(), "プライベート, パブリック");
         assert_eq!(Report::default().network_label(), "");
     }
@@ -1256,8 +1307,10 @@ mod tests {
 
     #[test]
     fn status_text_names_the_cause_and_the_fix() {
-        let r = parse_report("ZVFW allow=1 block=0 profiles=Domain,Private cats=Public net=1 on=1 strict=0")
-            .expect("読める");
+        let r = parse_report(
+            "ZVFW allow=1 block=0 profiles=Domain,Private cats=Public net=1 on=1 strict=0",
+        )
+        .expect("読める");
         let s = status_text(r);
         assert!(s.contains(Problem::ProfileMismatch.headline()));
         assert!(s.contains("zai firewall allow"), "直し方を出す");
@@ -1272,14 +1325,19 @@ mod tests {
                 .expect("読める"),
         );
         assert!(s.contains("zai firewall unblock"));
-        assert!(!s.contains("zai firewall allow"), "許可では直らないので勧めない");
+        assert!(
+            !s.contains("zai firewall allow"),
+            "許可では直らないので勧めない"
+        );
     }
 
     #[test]
     fn status_text_says_ok_when_nothing_is_wrong() {
         let s = status_text(
-            parse_report("ZVFW allow=1 block=0 profiles=Domain,Private cats=Private net=1 on=1 strict=0")
-                .expect("読める"),
+            parse_report(
+                "ZVFW allow=1 block=0 profiles=Domain,Private cats=Private net=1 on=1 strict=0",
+            )
+            .expect("読める"),
         );
         assert!(s.starts_with("✅"));
         assert!(s.contains(RULE_NAME));
@@ -1301,7 +1359,12 @@ mod tests {
         assert!(allow_script(r"C:\bin\zai.exe", allow_profiles())
             .contains("-Profile Domain,Private,Public"));
         // どの種別のネットワークでも適用される = 二度と不一致にならない
-        for cats in [vec!["Public"], vec!["Private"], vec!["Domain"], vec!["Private", "Public"]] {
+        for cats in [
+            vec!["Public"],
+            vec!["Private"],
+            vec!["Domain"],
+            vec!["Private", "Public"],
+        ] {
             let r = Report {
                 allowed: true,
                 rule_profiles: vec!["Domain".into(), "Private".into(), "Public".into()],
@@ -1325,7 +1388,10 @@ mod tests {
     #[test]
     fn allow_script_targets_this_exe_and_the_port_range() {
         let s = allow_script(r"C:\Users\o'brien\zai.exe", "Domain,Private,Public");
-        assert!(s.contains(r"$exe = 'C:\Users\o''brien\zai.exe'"), "' は '' に畳む");
+        assert!(
+            s.contains(r"$exe = 'C:\Users\o''brien\zai.exe'"),
+            "' は '' に畳む"
+        );
         assert!(s.contains("-LocalPort '8899-8919'"));
         assert!(s.contains("-Profile Domain,Private,Public"));
         assert!(s.contains("-Direction Inbound"));
@@ -1353,7 +1419,10 @@ mod tests {
         let s = check_script(r"C:\a'b\zai.exe");
         assert!(s.contains(r"$exe = 'C:\a''b\zai.exe'"));
         assert!(s.contains("ZVFW allow="));
-        assert!(s.contains("Get-NetConnectionProfile"), "ネットワーク種別も見る");
+        assert!(
+            s.contains("Get-NetConnectionProfile"),
+            "ネットワーク種別も見る"
+        );
         // 空白入りの値を出すと読めなくなる (Profile は "Private, Public" と出る)
         assert!(s.contains(r"-replace '[\s]', ''"));
     }
@@ -1384,7 +1453,10 @@ mod tests {
         assert!(!s.contains("-All "), "全プロファイルへ一括適用しない");
         assert!(!s.contains("Domain,Private,Public"));
         assert!(!s.contains("New-NetFirewallRule"), "規則は作らない");
-        assert!(!s.contains("Set-NetFirewallProfile -Enabled"), "ファイアウォールは切らない");
+        assert!(
+            !s.contains("Set-NetFirewallProfile -Enabled"),
+            "ファイアウォールは切らない"
+        );
     }
 
     /// UAC を断ったときの合図は終了コード。文言照合は言語で外れる。
@@ -1400,8 +1472,14 @@ mod tests {
     #[test]
     fn with_error_log_wraps_the_script_and_records_why_it_failed() {
         let s = with_error_log("New-NetFirewallRule ...\n", r"C:\tmp\o'brien\err.log");
-        assert!(s.contains(r"$ZvLog = 'C:\tmp\o''brien\err.log'"), "' は '' に畳む");
-        assert!(s.contains("New-NetFirewallRule ..."), "中身はそのまま走らせる");
+        assert!(
+            s.contains(r"$ZvLog = 'C:\tmp\o''brien\err.log'"),
+            "' は '' に畳む"
+        );
+        assert!(
+            s.contains("New-NetFirewallRule ..."),
+            "中身はそのまま走らせる"
+        );
         assert!(s.contains("try {"));
         assert!(s.contains("} catch {"));
         assert!(s.contains("Set-Content -LiteralPath $ZvLog"));

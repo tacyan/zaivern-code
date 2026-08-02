@@ -139,8 +139,12 @@ impl Drop for Session {
 /// (探索結果は [`powershell_recognizers`] が一度だけキャッシュする)。
 pub fn resolve_engine(engine: &str, lang: &str, command: &str) -> &'static str {
     // auto 以外なら探索は不要 — 無駄に powershell.exe を起こさない
-    let ps_ok = if engine == "mac" || engine == "command" || engine == "powershell"
-        || engine == "browser" || engine == "off" || !command.trim().is_empty()
+    let ps_ok = if engine == "mac"
+        || engine == "command"
+        || engine == "powershell"
+        || engine == "browser"
+        || engine == "off"
+        || !command.trim().is_empty()
     {
         false
     } else {
@@ -442,7 +446,8 @@ pub fn ensure_mac_helper() -> Result<PathBuf, String> {
         return Ok(bin);
     }
 
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
     let src = dir.join("zv-listen.swift");
     let plist = dir.join("zv-listen.plist");
     std::fs::write(&src, HELPER_SWIFT).map_err(|e| format!("ソースを書けません: {e}"))?;
@@ -490,7 +495,8 @@ pub fn ensure_powershell_helper() -> Result<PathBuf, String> {
         return Ok(src);
     }
 
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
     // PowerShell 5.1 は BOM が無いと UTF-8 の .ps1 を誤読する (日本語が化ける)
     std::fs::write(&src, crate::textenc::ps_script_bytes(HELPER_PS1))
         .map_err(|e| format!("音声スクリプトを書けません: {e}"))?;
@@ -892,7 +898,9 @@ mod tests {
     #[test]
     fn bare_text_is_treated_as_final() {
         // 外部コマンドがテキストだけを吐くケース
-        assert!(matches!(parse_line("今日はいい天気"), Some(Event::Final(t)) if t == "今日はいい天気"));
+        assert!(
+            matches!(parse_line("今日はいい天気"), Some(Event::Final(t)) if t == "今日はいい天気")
+        );
     }
 
     #[test]
@@ -939,8 +947,12 @@ mod tests {
             .split("func closeSegmentIfPaused()")
             .nth(1)
             .expect("closeSegmentIfPaused があること");
-        let emit = close.find("emit(\"F\", lastText)").expect("区切りで自ら確定を出すこと");
-        let relisten = close.find("let old = listen()").expect("次のタスクを張ること");
+        let emit = close
+            .find("emit(\"F\", lastText)")
+            .expect("区切りで自ら確定を出すこと");
+        let relisten = close
+            .find("let old = listen()")
+            .expect("次のタスクを張ること");
         assert!(emit < relisten, "確定は新しいタスクを張る前に出すこと");
         // 閉じた世代のコールバックは確定も含めて丸ごと捨てる (確定済みの文を
         // 後から書き換えないため)
@@ -966,10 +978,16 @@ mod tests {
         // macOS は探索結果によらず内蔵 (voice_command があっても内蔵が勝つ)
         assert_eq!(resolve_engine_core("auto", "macos", false, ""), "mac");
         assert_eq!(resolve_engine_core("auto", "macos", true, ""), "mac");
-        assert_eq!(resolve_engine_core("auto", "macos", false, "whisper"), "mac");
+        assert_eq!(
+            resolve_engine_core("auto", "macos", false, "whisper"),
+            "mac"
+        );
 
         // Windows: 認識器があれば PowerShell、無ければブラウザ
-        assert_eq!(resolve_engine_core("auto", "windows", true, ""), "powershell");
+        assert_eq!(
+            resolve_engine_core("auto", "windows", true, ""),
+            "powershell"
+        );
         assert_eq!(resolve_engine_core("auto", "windows", false, ""), "browser");
 
         // Linux/その他は常にブラウザ (認識器の有無は関係ない)
@@ -979,7 +997,10 @@ mod tests {
         // voice_command が入っていれば mac 以外では必ずそれが勝つ (旧来の逃げ道)
         for os in ["windows", "linux"] {
             for ps in [true, false] {
-                assert_eq!(resolve_engine_core("auto", os, ps, "whisper --stdout"), "command");
+                assert_eq!(
+                    resolve_engine_core("auto", os, ps, "whisper --stdout"),
+                    "command"
+                );
                 // 空白だけは「未設定」とみなす
                 assert_ne!(resolve_engine_core("auto", os, ps, "   "), "command");
             }

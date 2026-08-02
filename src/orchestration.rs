@@ -113,7 +113,10 @@ pub fn bus_status(co: &coordinator::Coordinator, rows: &[SessionRow]) -> BusStat
 
 /// 候補一覧を作る。
 fn candidates(rows: &[SessionRow]) -> Vec<SessionInfo> {
-    rows.iter().filter(|r| r.running).map(|r| r.as_info()).collect()
+    rows.iter()
+        .filter(|r| r.running)
+        .map(|r| r.as_info())
+        .collect()
 }
 
 // ── 呼び出し側にやってもらう副作用 ───────────────────────────────────
@@ -276,7 +279,10 @@ impl OrchState {
     fn allow_outbound(&mut self, id: SessionId, now: Instant) -> bool {
         let w = self.out_win.entry(id).or_default();
         while let Some(&front) = w.front() {
-            if now.checked_duration_since(front).is_some_and(|d| d > OUTBOUND_WINDOW) {
+            if now
+                .checked_duration_since(front)
+                .is_some_and(|d| d > OUTBOUND_WINDOW)
+            {
                 w.pop_front();
             } else {
                 break;
@@ -397,13 +403,19 @@ pub fn apply_action(
 
         OrchAction::MarkDone(tid) => {
             co.note_done(tid, now);
-            eff.ok(trf("✅ タスク #{tid} を完了にしました", &[("tid", tid.to_string())]));
+            eff.ok(trf(
+                "✅ タスク #{tid} を完了にしました",
+                &[("tid", tid.to_string())],
+            ));
         }
 
         OrchAction::MarkFailed(tid) => {
             let holder = co.task(tid).and_then(|t| t.assigned).unwrap_or(0);
             co.note_failed(tid, holder, "ユーザーが失敗と判断した", now);
-            eff.warn(trf("⚠ タスク #{tid} を失敗にしました", &[("tid", tid.to_string())]));
+            eff.warn(trf(
+                "⚠ タスク #{tid} を失敗にしました",
+                &[("tid", tid.to_string())],
+            ));
         }
     }
     eff
@@ -419,11 +431,17 @@ fn report_send(out: &SendOutcome, dest: &str) -> Effects {
         )),
         SendOutcome::Broadcast { id, delivered_to } => {
             if *delivered_to == 0 {
-                eff.warn(trf("📮 #{id} は届け先がいませんでした", &[("id", id.to_string())]));
+                eff.warn(trf(
+                    "📮 #{id} は届け先がいませんでした",
+                    &[("id", id.to_string())],
+                ));
             } else {
                 eff.ok(trf(
                     "📮 #{id} を {delivered_to} 件へ一斉送信しました",
-                    &[("id", id.to_string()), ("delivered_to", delivered_to.to_string())],
+                    &[
+                        ("id", id.to_string()),
+                        ("delivered_to", delivered_to.to_string()),
+                    ],
                 ));
             }
         }
@@ -550,13 +568,9 @@ pub fn redispatch_ready(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let mut body =
-                        format!("タスク #{tid} を引き継げるエージェントがいません。");
+                    let mut body = format!("タスク #{tid} を引き継げるエージェントがいません。");
                     if !excluded.is_empty() {
-                        body.push_str(&format!(
-                            " (このタスクで既に失敗: {})",
-                            excluded.join(", ")
-                        ));
+                        body.push_str(&format!(" (このタスクで既に失敗: {})", excluded.join(", ")));
                     }
                     body.push_str(&format!(
                         " 再試行の上限は {} 回です。",
@@ -677,16 +691,19 @@ fn resolve_target(target: &str, rows: &[SessionRow], from: SessionId) -> Option<
     }
     // セッション ID の直指定も許す。
     if let Some(id) = target.strip_prefix('#').and_then(|s| s.parse::<u64>().ok()) {
-        return rows.iter().find(|r| r.id == id).map(|r| Endpoint::Session(r.id));
+        return rows
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| Endpoint::Session(r.id));
     }
     // 名前の完全一致を優先し、無ければ前方一致。どちらも自分自身は除く。
     let exact = rows
         .iter()
         .find(|r| r.id != from && r.title.eq_ignore_ascii_case(target));
     let pick = exact.or_else(|| {
-        let mut it = rows.iter().filter(|r| {
-            r.id != from && r.title.to_lowercase().starts_with(&target.to_lowercase())
-        });
+        let mut it = rows
+            .iter()
+            .filter(|r| r.id != from && r.title.to_lowercase().starts_with(&target.to_lowercase()));
         // 前方一致が 2 つ以上あるなら曖昧なので選ばない。
         let first = it.next()?;
         if it.next().is_some() {
@@ -766,9 +783,12 @@ pub fn cockpit_section(
         );
         if stuck > 0 {
             ui.label(
-                RichText::new(trf("⚠ 人手待ち {stuck} 件", &[("stuck", stuck.to_string())]))
-                    .strong()
-                    .color(theme.err),
+                RichText::new(trf(
+                    "⚠ 人手待ち {stuck} 件",
+                    &[("stuck", stuck.to_string())],
+                ))
+                .strong()
+                .color(theme.err),
             );
         }
         // 配達待ちと、抑制されて消えた分。黙って消えたように見せない。
@@ -802,7 +822,9 @@ pub fn cockpit_section(
             // ブロードキャスト送信に一本化する (個別宛はフォーム内で選べる)。
             if ui
                 .button(tr("📣 全エージェントへブロードキャスト"))
-                .on_hover_text(tr("メッセージを全エージェントへ送ります (フォームで個別宛にも変更可)"))
+                .on_hover_text(tr(
+                    "メッセージを全エージェントへ送ります (フォームで個別宛にも変更可)",
+                ))
                 .clicked()
             {
                 st.msg_target = MsgTarget::Broadcast;
@@ -992,9 +1014,11 @@ pub fn task_form_ui(
 
             if rows.iter().all(|r| !r.running) {
                 ui.label(
-                    RichText::new(tr("稼働中のエージェントがいないため、いま割り当てはできません"))
-                        .small()
-                        .color(theme.warn),
+                    RichText::new(tr(
+                        "稼働中のエージェントがいないため、いま割り当てはできません",
+                    ))
+                    .small()
+                    .color(theme.warn),
                 );
             }
 
@@ -1179,7 +1203,10 @@ mod tests {
             coordinator::gate_for(permission_mode("agent")),
             G::NeedsUserConfirm
         );
-        assert_eq!(coordinator::gate_for(permission_mode("auto")), G::AutoApproved);
+        assert_eq!(
+            coordinator::gate_for(permission_mode("auto")),
+            G::AutoApproved
+        );
     }
 
     // ── タスク作成 ───────────────────────────────────────────────
@@ -1200,7 +1227,10 @@ mod tests {
             },
             t0(),
         );
-        assert!(eff.toasts.iter().any(|(_, ok)| *ok), "成功が伝わる: {eff:?}");
+        assert!(
+            eff.toasts.iter().any(|(_, ok)| *ok),
+            "成功が伝わる: {eff:?}"
+        );
         assert_eq!(co.tasks().len(), 1);
         assert_eq!(co.tasks()[0].assigned, Some(1));
         // 本文はバスに積まれ、相手が安全になってから届く。
@@ -1229,7 +1259,10 @@ mod tests {
             .map(|(s, _)| s)
             .collect();
         assert_eq!(warned.len(), 1, "{eff:?}");
-        assert!(warned[0].contains("割り当て可能なセッションがいない"), "{warned:?}");
+        assert!(
+            warned[0].contains("割り当て可能なセッションがいない"),
+            "{warned:?}"
+        );
     }
 
     // ── 再割り当ての順序 ─────────────────────────────────────────
@@ -1303,13 +1336,23 @@ mod tests {
         let now = t0();
 
         co.enqueue(
-            AgentMessage::new(Endpoint::User, Endpoint::Session(1), MsgKind::Status, "1 通目")
-                .at(now),
+            AgentMessage::new(
+                Endpoint::User,
+                Endpoint::Session(1),
+                MsgKind::Status,
+                "1 通目",
+            )
+            .at(now),
         );
         // 宛先不明は破棄される。
         co.enqueue(
-            AgentMessage::new(Endpoint::User, Endpoint::Session(9), MsgKind::Status, "行方不明")
-                .at(now),
+            AgentMessage::new(
+                Endpoint::User,
+                Endpoint::Session(9),
+                MsgKind::Status,
+                "行方不明",
+            )
+            .at(now),
         );
 
         let bus = bus_status(&co, &rows);
@@ -1389,7 +1432,11 @@ mod tests {
 
         let t = co.task(tid).unwrap();
         assert_eq!(t.state, TaskState::NeedsUser, "履歴: {:?}", t.history);
-        assert!(t.attempts <= max, "上限を超えて試行している: {}", t.attempts);
+        assert!(
+            t.attempts <= max,
+            "上限を超えて試行している: {}",
+            t.attempts
+        );
         // 人が気づけるよう、ユーザーの受信箱へ上がっている。
         assert!(!co.user_inbox().is_empty());
     }
@@ -1425,7 +1472,14 @@ mod tests {
         co.register_session(2);
         let mut st = OrchState::default();
         let rows = vec![live(1, "a"), live(2, "b")];
-        scan_outbound(&mut st, &mut co, 1, "[ZAI-TO:b] 前からある行\n", &rows, t0());
+        scan_outbound(
+            &mut st,
+            &mut co,
+            1,
+            "[ZAI-TO:b] 前からある行\n",
+            &rows,
+            t0(),
+        );
         assert_eq!(co.mailbox(2).map(|m| m.len()), Some(0));
     }
 
@@ -1511,7 +1565,9 @@ mod tests {
         assert_eq!(st.unknown_target_drops, 1);
         assert_eq!(co.mailbox(2).map(|m| m.len()), Some(0));
         assert!(
-            eff.toasts.iter().any(|(s, ok)| !*ok && s.contains("いない人")),
+            eff.toasts
+                .iter()
+                .any(|(s, ok)| !*ok && s.contains("いない人")),
             "理由が見えない: {eff:?}"
         );
     }
@@ -1640,7 +1696,10 @@ mod tests {
             .map(|(s, _)| s)
             .collect();
         assert_eq!(warned.len(), 1, "{eff:?}");
-        assert!(warned[0].contains("宛先セッションが存在しない"), "{warned:?}");
+        assert!(
+            warned[0].contains("宛先セッションが存在しない"),
+            "{warned:?}"
+        );
     }
 
     // ── 記憶量 ───────────────────────────────────────────────────

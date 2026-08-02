@@ -94,7 +94,10 @@ mod tests {
     #[test]
     fn version_quad_pads_and_packs() {
         assert_eq!(version_quad("0.4.15").0, "0.4.15.0");
-        assert_eq!(version_quad("0.4.15").1, (0u64 << 48) | (4 << 32) | (15 << 16));
+        assert_eq!(
+            version_quad("0.4.15").1,
+            (0u64 << 48) | (4 << 32) | (15 << 16)
+        );
         assert_eq!(version_quad("1.2.3.4").0, "1.2.3.4");
         assert_eq!(version_quad("1.2.3-rc.1").0, "1.2.3.0", "非数値部分は 0");
         assert_eq!(version_quad("").0, "0.0.0.0");

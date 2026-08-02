@@ -1,6 +1,6 @@
 [package]
 name = "zaivern-code"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "Zaivern Code — Rust-native AI cockpit editor (Zed × Cmux × AGI Cockpit)"
 license = "Apache-2.0"
@@ -42,6 +42,21 @@ pdf-extract = "0.12"
 # ライセンスは MIT OR Apache-2.0、依存も純 Rust (build.rs / ネイティブ無し)。
 # regex-syntax は syntect 経由で既にロックに入っており、増える実体は僅か。
 regex = "1"
+
+# オフライン・ライセンス認証 (license.rs) の Ed25519 署名**検証**。
+# アプリに入るのは公開鍵だけで、秘密鍵はリポジトリにもバイナリにも無い
+# (キーの発行は tools/licgen の独立クレート)。
+#   * ライセンスは BSD-3-Clause。本体 (Apache-2.0) と両立する寛容ライセンスで、
+#     コピーレフトではなく表示義務のみ (MIT/Apache 版は存在しない)
+#   * 純 Rust・build.rs もネイティブライブラリも無く、素の `cargo build` が
+#     macOS / Windows / Linux で通る
+#   * 既定 feature は fast / zeroize だけ。**rand_core を入れない**ので
+#     既存の rand 系 (0.8 / 0.9 / 0.10 が同居している) と衝突しない。
+#     アプリ側に鍵生成は無く、必要なのは検証だけなので乱数は要らない
+ed25519-dalek = "3"
+# ライセンスキーの Base64URL 部分。0.22 は syntect → plist 経由で既にロックへ
+# 入っているため、直接依存にしても依存グラフは 1 つも増えない。
+base64 = "0.22"
 
 # セッション破棄時のプロセス**グループ**への killpg (procx::kill_tree)。
 # portable-pty は子を setsid するため pgid == pid で、グループごと落とせば

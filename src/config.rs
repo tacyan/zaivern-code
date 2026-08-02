@@ -17,6 +17,29 @@ pub struct Config {
     /// 空白文字の可視化 (スペース「·」/ タブ「→」)。既定はオフ。
     pub show_whitespace: bool,
 
+    /// カーソル下のシンボルと同じものを本文で薄くハイライトするか
+    /// (LSP の textDocument/documentHighlight)。既定はオン。
+    /// オフにすると要求自体を送らないので、サーバーへの往復もゼロになる。
+    pub lsp_highlight_occurrences: bool,
+
+    /// エディタ右端のミニマップ (VS Code の遠景ビュー相当)。
+    /// **既定はオフ** — 本文の横幅を 64px 奪うので、欲しい人だけが払う。
+    /// 幅が足りない画面では設定が ON でも自動的に隠れる。
+    pub minimap: bool,
+
+    /// エディタ上部のブレッドクラム (`ワークスペース › フォルダ › ファイル › シンボル`)。
+    /// **既定はオン** — 高さ 1 行ぶんで、どの言語でも (LSP 無しでも) 必ず出せる。
+    pub breadcrumbs: bool,
+    /// 差分ビューの既定の表示: `"side_by_side"` (左右 2 列) | `"inline"` (1 列)。
+    ///
+    /// **既定は並列**。ただし幅が足りないときは `diff::diff_layout` が
+    /// 自動で 1 列へ縮退させるので、狭いウィンドウでも見切れない。
+    /// 値の解釈は [`crate::diff::DiffMode::from_config_str`] に集約してある。
+    pub diff_view: String,
+    /// エディタ左端のガターに git blame (著者 · 相対日時) を出す。既定はオフ。
+    /// オンの間だけ可視範囲ぶんの `git blame` を非同期で取る。
+    pub git_blame: bool,
+
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
@@ -41,6 +64,11 @@ pub struct Config {
     pub global_word_wrap: bool,
     #[serde(skip)]
     pub global_show_whitespace: bool,
+    #[serde(skip)]
+    pub global_minimap: bool,
+    #[serde(skip)]
+    pub global_breadcrumbs: bool,
+    pub global_git_blame: bool,
     /// overlay を重ねる前のグローバルなプラグイン設定の控え。
     /// save_plugins_section はこちらを書く — セッション中の値を書くと
     /// プロジェクトの .zaivern.toml 由来の無効化・設定値がグローバル
@@ -98,6 +126,11 @@ pub struct Config {
     pub voice_command: String,
     /// 話すと自動で Enter まで送るキーワード (空文字 = 常に手動 Enter)
     pub voice_keyword: String,
+    /// SSH リモート接続の踏み台 (`user@host` / `user@host:port`。空 = 未設定)。
+    ///
+    /// **鍵やパスフレーズは絶対に保存しない** — 認証は OS の `ssh` と
+    /// `~/.ssh/config` / ssh-agent に丸投げする。ここに置くのは接続先だけ。
+    pub ssh_tunnel_host: String,
     /// 外部通知の Webhook URL (空 = 無効)。承認待ち・終了・レート制限を
     /// curl で POST する。ntfy トピック URL / Slack / Discord の Incoming Webhook に対応。
     pub webhook_url: String,
@@ -114,6 +147,9 @@ pub struct Config {
     /// `[super_agent]` セクションが無い既存の config.toml でも、
     /// `SuperAgentConfig` 側の `#[serde(default)]` により既定値 (= なし) で読み込まれる。
     pub super_agent: SuperAgentConfig,
+    /// レート制限時のアカウント自動フェイルオーバー (`[failover]`)。
+    /// **既定は無効** — ユーザーが明示的に有効化したときだけ働く。
+    pub failover: crate::failover::FailoverConfig,
 }
 
 /// `[super_agent]` セクション。**どのエージェントに他のエージェントを見張らせるか**。
@@ -220,6 +256,11 @@ impl Default for Config {
             show_hidden_files: true,
             word_wrap: false,
             show_whitespace: false,
+            lsp_highlight_occurrences: true,
+            minimap: false,
+            breadcrumbs: true,
+            diff_view: crate::diff::DiffMode::default().config_str().into(),
+            git_blame: false,
             approval_mode: "ask".into(),
             restore_agents: false,
             show_pet: true,
@@ -228,6 +269,9 @@ impl Default for Config {
             global_show_pet: true,
             global_word_wrap: false,
             global_show_whitespace: false,
+            global_minimap: false,
+            global_breadcrumbs: true,
+            global_git_blame: false,
             global_plugins: PluginsConfig::default(),
             pet_image: None,
             pet_x: None,
@@ -248,12 +292,14 @@ impl Default for Config {
             voice_lang: "ja-JP".into(),
             voice_command: String::new(),
             voice_keyword: String::new(),
+            ssh_tunnel_host: String::new(),
             webhook_url: String::new(),
             agents: default_agents(),
             keybindings: HashMap::new(),
             supervisor: crate::supervisor::SupervisorConfig::default(),
             super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),
+            failover: crate::failover::FailoverConfig::default(),
         }
     }
 }
@@ -411,6 +457,9 @@ struct Overlay {
     show_hidden_files: Option<bool>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
+    minimap: Option<bool>,
+    breadcrumbs: Option<bool>,
+    git_blame: Option<bool>,
     approval_mode: Option<String>,
     show_pet: Option<bool>,
     agents: Vec<AgentPreset>,
@@ -429,6 +478,11 @@ struct UiState {
     show_pet: Option<bool>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
+    minimap: Option<bool>,
+    breadcrumbs: Option<bool>,
+    /// 差分ビューの表示モード ("side_by_side" | "inline")。
+    diff_view: Option<String>,
+    git_blame: Option<bool>,
     pet_image: Option<String>,
     pet_x: Option<f32>,
     pet_y: Option<f32>,
@@ -446,12 +500,18 @@ struct UiState {
     voice_lang: Option<String>,
     voice_command: Option<String>,
     voice_keyword: Option<String>,
+    /// SSH リモート接続の踏み台 (接続先だけ。鍵は保存しない)。
+    ssh_tunnel_host: Option<String>,
     /// 監視役 LLM の選択。UI から選ぶものなので、手書きの config.toml ではなく
     /// state 側に置く (config.toml をアプリが書き換えない方針に合わせる)。
     super_agent_command: Option<String>,
     super_agent_session_title: Option<String>,
     super_agent_enabled: Option<bool>,
     super_agent_timeout_secs: Option<u64>,
+    /// レート制限の自動フェイルオーバーの有効/無効。UI (パレット / Cockpit) から
+    /// 切り替えるものなので、手書きの config.toml ではなく state 側に置く。
+    /// 上限やクールダウンの数値は `[failover]` (config.toml) のまま。
+    failover_enabled: Option<bool>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -491,6 +551,19 @@ show_hidden_files = true
 # (表示メニュー・コマンドパレットの「折り返し切替」「空白文字表示切替」でも変更できます)
 # word_wrap = false
 # show_whitespace = false
+
+# カーソル下のシンボルと同じものを本文で薄くハイライトする (LSP documentHighlight)
+# (コマンドパレットの「同一シンボルのハイライト切替」でも変更できます)
+# lsp_highlight_occurrences = true
+
+# ミニマップ (エディタ右端の遠景) とブレッドクラム (上部のパンくず)
+# (表示メニュー・コマンドパレットの「ミニマップの表示切替」「ブレッドクラムの表示切替」でも変更できます)
+# ミニマップは本文の幅を 64px 使うため既定はオフ。狭い画面では自動的に隠れます
+# minimap = false
+# breadcrumbs = true
+# ガターに git blame (著者 · 相対日時) を出す。既定はオフ
+# (表示メニュー・コマンドパレットの「Git blame の表示切替」でも変更できます)
+# git_blame = false
 
 # 既定の権限モード (claude / codex / agy に自動適用)
 #   "ask"   = 毎回ユーザー承認が必要（安全・デフォルト）
@@ -722,6 +795,22 @@ command = ""
 # command = "codex"
 # env = { CODEX_HOME = "~/.codex-alt" }
 
+# ── レート制限時の自動フェイルオーバー ──────────
+# 上限に当たったら、同じ CLI の別プロファイル → 別 CLI の順で切替先を選び、
+# 新しいセッションを立てて続きを渡します。上限に当たった側のセッションは
+# **そのまま残します** (終了させません)。
+# **既定は無効** — 有効にするのは ⌘⇧P →「自動フェイルオーバーを有効化」か、
+# 📊 プラン使用量ウィンドウのチェックボックス、あるいは下の enabled = true。
+# 上の [[agents]] に別プロファイルを 2 つ以上書いておかないと切替先がありません。
+# [failover]
+# enabled = false           # 自動で切り替えるか
+# max_switches = 3          # 1 セッションあたりの連鎖切替の上限
+# max_attempts = 2          # 同じ枠を試し直す上限
+# cooldown_secs = 300       # 枯れた枠を寝かせる基準時間 (失敗のたびに倍)
+# max_cooldown_secs = 3600  # クールダウンの上限
+# verify_secs = 90          # 切替先が動いていると見なすまでの観察時間
+# min_screen_hits = 2       # 画面由来の検知を信じるまでの連続一致回数
+
 # [[agents]]
 # name = "Gemini CLI"
 # icon = "✨"
@@ -785,13 +874,8 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 // 原因を stderr に出し、復旧用に .broken へ控えてから既定値で
                 // 起動する (以後の保存で壊れたファイルが上書きされても戻せる)。
                 eprintln!("zaivern: config.toml のパースに失敗: {e}");
-                let _ = std::fs::copy(
-                    dir.join("config.toml"),
-                    dir.join("config.toml.broken"),
-                );
-                eprintln!(
-                    "zaivern: 壊れた config.toml を config.toml.broken に控えました"
-                );
+                let _ = std::fs::copy(dir.join("config.toml"), dir.join("config.toml.broken"));
+                eprintln!("zaivern: 壊れた config.toml を config.toml.broken に控えました");
                 Config::default()
             }
         },
@@ -819,6 +903,18 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 }
                 if let Some(v) = st.show_whitespace {
                     cfg.show_whitespace = v;
+                }
+                if let Some(v) = st.minimap {
+                    cfg.minimap = v;
+                }
+                if let Some(v) = st.breadcrumbs {
+                    cfg.breadcrumbs = v;
+                }
+                if let Some(v) = st.diff_view {
+                    cfg.diff_view = v;
+                }
+                if let Some(v) = st.git_blame {
+                    cfg.git_blame = v;
                 }
                 if st.pet_image.is_some() {
                     cfg.pet_image = st.pet_image;
@@ -871,6 +967,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.voice_keyword {
                     cfg.voice_keyword = v;
                 }
+                if let Some(v) = st.ssh_tunnel_host {
+                    cfg.ssh_tunnel_host = v;
+                }
                 if let Some(v) = st.super_agent_command {
                     cfg.super_agent.command = v;
                 }
@@ -883,6 +982,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.super_agent_timeout_secs {
                     cfg.super_agent.timeout_secs = v;
                 }
+                if let Some(v) = st.failover_enabled {
+                    cfg.failover.enabled = v;
+                }
             }
         }
     }
@@ -893,6 +995,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     cfg.global_show_pet = cfg.show_pet;
     cfg.global_word_wrap = cfg.word_wrap;
     cfg.global_show_whitespace = cfg.show_whitespace;
+    cfg.global_minimap = cfg.minimap;
+    cfg.global_breadcrumbs = cfg.breadcrumbs;
+    cfg.global_git_blame = cfg.git_blame;
     cfg.global_plugins = cfg.plugins.clone();
 
     for root in roots {
@@ -962,6 +1067,15 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
             }
             if let Some(v) = o.show_whitespace {
                 cfg.show_whitespace = v;
+            }
+            if let Some(v) = o.minimap {
+                cfg.minimap = v;
+            }
+            if let Some(v) = o.breadcrumbs {
+                cfg.breadcrumbs = v;
+            }
+            if let Some(v) = o.git_blame {
+                cfg.git_blame = v;
             }
             if let Some(v) = o.approval_mode {
                 cfg.approval_mode = v;
@@ -1180,6 +1294,10 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         show_pet: Some(cfg.global_show_pet),
         word_wrap: Some(cfg.global_word_wrap),
         show_whitespace: Some(cfg.global_show_whitespace),
+        minimap: Some(cfg.global_minimap),
+        breadcrumbs: Some(cfg.global_breadcrumbs),
+        diff_view: Some(cfg.diff_view.clone()),
+        git_blame: Some(cfg.global_git_blame),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -1197,10 +1315,12 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         voice_lang: Some(cfg.voice_lang.clone()),
         voice_command: Some(cfg.voice_command.clone()),
         voice_keyword: Some(cfg.voice_keyword.clone()),
+        ssh_tunnel_host: Some(cfg.ssh_tunnel_host.clone()),
         super_agent_command: Some(cfg.super_agent.command.clone()),
         super_agent_session_title: Some(cfg.super_agent.session_title.clone()),
         super_agent_enabled: Some(cfg.super_agent.enabled),
         super_agent_timeout_secs: Some(cfg.super_agent.timeout_secs),
+        failover_enabled: Some(cfg.failover.enabled),
     };
     if let Ok(s) = toml::to_string_pretty(&st) {
         let _ = std::fs::create_dir_all(dir);
@@ -1297,7 +1417,8 @@ mod tests {
                 assert!(
                     agents
                         .iter()
-                        .any(|a| a.name == format!("{}{}", spec.label, crate::agent_picker::AUTO_SUFFIX)),
+                        .any(|a| a.name
+                            == format!("{}{}", spec.label, crate::agent_picker::AUTO_SUFFIX)),
                     "{bin} の全自動プリセットが既定に無い"
                 );
             }
@@ -1335,7 +1456,15 @@ mod tests {
                 .filter(|a| !a.name.contains("全自動"))
                 .map(|a| a.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["claude", "codex", "gemini", "agy", "cursor-agent", "droid", ""]
+            vec![
+                "claude",
+                "codex",
+                "gemini",
+                "agy",
+                "cursor-agent",
+                "droid",
+                ""
+            ]
         );
     }
 
@@ -1515,7 +1644,10 @@ command = "agy"
         assert_eq!(cfg.agents[0].command, "claude");
         assert_eq!(cfg.agents[2].command, "agy");
         // 旧設定に無い新フィールドは既定値で埋まる
-        assert!(cfg.agents.iter().all(|a| a.cwd.is_none() && a.env.is_empty()));
+        assert!(cfg
+            .agents
+            .iter()
+            .all(|a| a.cwd.is_none() && a.env.is_empty()));
 
         // [[agents]] を書いていない古い設定は、新しい既定一式を受け取る
         let bare: Config = toml::from_str("theme = \"zaivern-dark\"").expect("読める");
@@ -1561,16 +1693,15 @@ command = "agy"
     fn config_ignores_unknown_fields() {
         // deny_unknown_fields を付けていないので、将来削除された項目が
         // 残っていても設定全体が壊れない
-        let c: Config = toml::from_str("theme = \"x\"\nlegacy_option = 42\n")
-            .expect("未知のキーは無視される");
+        let c: Config =
+            toml::from_str("theme = \"x\"\nlegacy_option = 42\n").expect("未知のキーは無視される");
         assert_eq!(c.theme, "x");
     }
 
     #[test]
     fn config_accepts_optional_pet_position() {
-        let c: Config =
-            toml::from_str("pet_x = 12.5\npet_y = -3.0\npet_image = \"/tmp/p.png\"\n")
-                .expect("parse ok");
+        let c: Config = toml::from_str("pet_x = 12.5\npet_y = -3.0\npet_image = \"/tmp/p.png\"\n")
+            .expect("parse ok");
         assert_eq!(c.pet_x, Some(12.5));
         assert_eq!(c.pet_y, Some(-3.0));
         assert_eq!(c.pet_image, Some("/tmp/p.png".to_string()));
@@ -1649,7 +1780,10 @@ command = "agy"
     #[test]
     fn config_rejects_malformed_toml() {
         assert!(toml::from_str::<Config>("theme = ").is_err(), "値が無い");
-        assert!(toml::from_str::<Config>("[[agents\n").is_err(), "括弧が閉じていない");
+        assert!(
+            toml::from_str::<Config>("[[agents\n").is_err(),
+            "括弧が閉じていない"
+        );
         assert!(toml::from_str::<Config>("= \"x\"\n").is_err(), "キーが無い");
     }
 
@@ -1694,8 +1828,8 @@ command = "agy"
 
     #[test]
     fn overlay_parses_only_present_fields() {
-        let o: Overlay = toml::from_str("theme = \"zaivern-midnight\"\nshow_pet = false\n")
-            .expect("parse ok");
+        let o: Overlay =
+            toml::from_str("theme = \"zaivern-midnight\"\nshow_pet = false\n").expect("parse ok");
         assert_eq!(o.theme, Some("zaivern-midnight".to_string()));
         assert_eq!(o.show_pet, Some(false));
         assert_eq!(o.approval_mode, None, "未指定はグローバル設定を残す");
@@ -1719,15 +1853,19 @@ command = "agy"
 
     #[test]
     fn overlay_keybindings_merge_per_key() {
-        let o: Overlay = toml::from_str("[keybindings]\nsave = \"ctrl+s\"\nrun = \"f5\"\n")
-            .expect("parse ok");
+        let o: Overlay =
+            toml::from_str("[keybindings]\nsave = \"ctrl+s\"\nrun = \"f5\"\n").expect("parse ok");
         let mut base: HashMap<String, String> = HashMap::new();
         base.insert("save".into(), "cmd+s".into());
         base.insert("quit".into(), "cmd+q".into());
         for (k, v) in o.keybindings {
             base.insert(k, v);
         }
-        assert_eq!(base.get("save").map(String::as_str), Some("ctrl+s"), "上書き");
+        assert_eq!(
+            base.get("save").map(String::as_str),
+            Some("ctrl+s"),
+            "上書き"
+        );
         assert_eq!(base.get("run").map(String::as_str), Some("f5"), "追加");
         assert_eq!(base.get("quit").map(String::as_str), Some("cmd+q"), "温存");
         assert_eq!(base.len(), 3);
@@ -1758,6 +1896,10 @@ command = "agy"
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
+            minimap: Some(true),
+            breadcrumbs: Some(false),
+            diff_view: Some("inline".into()),
+            git_blame: Some(true),
             pet_image: Some("/tmp/p.png".into()),
             pet_x: Some(10.0),
             pet_y: Some(20.5),
@@ -1775,10 +1917,12 @@ command = "agy"
             voice_lang: Some("en-US".into()),
             voice_command: Some("my-stt --lang {lang}".into()),
             voice_keyword: Some("送信".into()),
+            ssh_tunnel_host: Some("user@bastion.example:2222".into()),
             super_agent_command: Some("claude".into()),
             super_agent_session_title: Some("Claude Code (全自動) #3".into()),
             super_agent_enabled: Some(true),
             super_agent_timeout_secs: Some(45),
+            failover_enabled: Some(true),
         };
         let s = toml::to_string_pretty(&st).expect("UiState は TOML 化できる");
         let back: UiState = toml::from_str(&s).expect("読み戻せる");
@@ -1787,6 +1931,9 @@ command = "agy"
         assert_eq!(back.show_pet, Some(false));
         assert_eq!(back.word_wrap, Some(true));
         assert_eq!(back.show_whitespace, Some(true));
+        assert_eq!(back.minimap, Some(true));
+        assert_eq!(back.breadcrumbs, Some(false));
+        assert_eq!(back.git_blame, Some(true));
         assert_eq!(back.pet_image, Some("/tmp/p.png".to_string()));
         assert_eq!(back.pet_x, Some(10.0));
         assert_eq!(back.pet_y, Some(20.5));
@@ -1795,6 +1942,11 @@ command = "agy"
         assert_eq!(back.pet_free_roam, Some(false));
         assert_eq!(back.pet_auto_yes, Some(true));
         assert_eq!(back.voice_keyword, Some("送信".to_string()));
+        assert_eq!(
+            back.ssh_tunnel_host,
+            Some("user@bastion.example:2222".to_string()),
+            "接続先は残す (鍵・パスフレーズは保存しない)"
+        );
         // エスケープが必要な制御文字も往復する
         assert_eq!(back.pet_approve_keys, Some("\r".to_string()));
         assert_eq!(back.pet_deny_keys, Some("\u{1b}".to_string()));
@@ -1806,6 +1958,8 @@ command = "agy"
         );
         assert_eq!(back.super_agent_enabled, Some(true));
         assert_eq!(back.super_agent_timeout_secs, Some(45));
+        // 自動フェイルオーバーの有効/無効も state に残る
+        assert_eq!(back.failover_enabled, Some(true));
     }
 
     #[test]
@@ -1867,7 +2021,10 @@ command = "agy"
         assert_eq!(s.file_name().and_then(|f| f.to_str()), Some("state.toml"));
         assert_eq!(c.parent(), s.parent(), "同じ ~/.zaivern に置かれる");
         assert!(c.parent().is_some_and(|p| p.ends_with(".zaivern")));
-        assert!(c.is_absolute() || c.starts_with("."), "home 不明時は ./.zaivern");
+        assert!(
+            c.is_absolute() || c.starts_with("."),
+            "home 不明時は ./.zaivern"
+        );
     }
 
     #[test]
@@ -1924,6 +2081,49 @@ mod supervisor_field_tests {
         assert!(!cfg.theme.is_empty());
         // 新しく生えた [super_agent] を書いていない既存ファイルでも既定値で埋まる
         assert_eq!(cfg.super_agent, SuperAgentConfig::default());
+    }
+}
+
+#[cfg(test)]
+mod failover_field_tests {
+    use super::*;
+
+    /// `[failover]` を書いていない設定は **必ず無効** で読み込まれる。
+    /// (勝手に別アカウントへ移る = 課金先が変わる。既定で入ってはいけない)
+    #[test]
+    fn failoverセクションが無ければ既定で無効() {
+        assert!(
+            !DEFAULT_CONFIG.contains("\n[failover]"),
+            "テンプレートは [failover] をコメントのままにしておく (既定は無効)"
+        );
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定の設定が読める");
+        assert_eq!(cfg.failover, crate::failover::FailoverConfig::default());
+        assert!(!cfg.failover.enabled, "既定は必ず無効");
+    }
+
+    /// テンプレートに書いた `[failover]` の例 (コメントを外した形) が実際に読める。
+    /// 書き方の見本がそのままでは動かない、を防ぐ。
+    #[test]
+    fn テンプレートのfailover例はコメントを外せば読める() {
+        let uncommented: String = DEFAULT_CONFIG
+            .lines()
+            .skip_while(|l| !l.starts_with("# [failover]"))
+            .take_while(|l| l.starts_with('#'))
+            .map(|l| l.trim_start_matches("# ").trim_start_matches('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            uncommented.starts_with("[failover]"),
+            "テンプレートに [failover] の例が無い: {uncommented:?}"
+        );
+        let cfg: Config = toml::from_str(&uncommented).expect("例がそのまま読める");
+        assert!(!cfg.failover.enabled, "例の既定値も無効のまま");
+        assert_eq!(cfg.failover.max_switches, 3);
+        assert_eq!(cfg.failover.min_screen_hits, 2);
+        // 有効化した形も読める。
+        let on = uncommented.replace("enabled = false", "enabled = true");
+        let cfg: Config = toml::from_str(&on).expect("有効化した形も読める");
+        assert!(cfg.failover.enabled);
     }
 }
 
@@ -2072,7 +2272,10 @@ mod plugins_config_tests {
         assert!(out.contains("# 大事なメモ"), "区画外のコメントが消えた");
         assert!(out.contains("save = \"cmd+s\""), "他セクションが消えた");
         assert!(!out.contains("\"old\""), "古い disabled が残っている");
-        assert!(!out.contains("[plugins.settings.foo]"), "古い設定テーブルが残っている");
+        assert!(
+            !out.contains("[plugins.settings.foo]"),
+            "古い設定テーブルが残っている"
+        );
         assert!(out.contains("[plugins.settings.bar]"));
 
         let back: Config = toml::from_str(&out).expect("書き戻した config.toml が壊れている");
@@ -2158,7 +2361,10 @@ reply = "y\r"
         let cfg: Config = toml::from_str(old).expect("古い設定が読めなくなった");
         assert_eq!(cfg.theme, "dark");
         assert!(cfg.pet_auto_yes, "既存のキーが読めている");
-        assert!(cfg.auto_yes_rules.is_empty(), "未指定なら空 (既定の表だけ使う)");
+        assert!(
+            cfg.auto_yes_rules.is_empty(),
+            "未指定なら空 (既定の表だけ使う)"
+        );
     }
 
     #[test]
@@ -2188,8 +2394,14 @@ reply = "3\r"
 "#;
         let cfg: Config = toml::from_str(src).expect("番号メニューのルールが読めない");
         assert_eq!(cfg.auto_yes_rules.len(), 1);
-        assert_eq!(cfg.auto_yes_rules[0].reply, "3\r", "番号 + Enter が書けない");
-        assert!(cfg.auto_yes_rules[0].agent.is_empty(), "省略時は全エージェント");
+        assert_eq!(
+            cfg.auto_yes_rules[0].reply, "3\r",
+            "番号 + Enter が書けない"
+        );
+        assert!(
+            cfg.auto_yes_rules[0].agent.is_empty(),
+            "省略時は全エージェント"
+        );
         // 記入例が既定 config.toml に載っていること (ユーザーが真似できる)
         assert!(
             DEFAULT_CONFIG.contains("reply = \"3\\r\""),
@@ -2355,17 +2567,64 @@ mod state_overlay_tests {
 
         let loaded = load_from_dir(&home, &[], true);
         assert!(loaded.word_wrap, "折り返しが state.toml から復元される");
-        assert!(loaded.show_whitespace, "空白表示が state.toml から復元される");
+        assert!(
+            loaded.show_whitespace,
+            "空白表示が state.toml から復元される"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ミニマップとブレッドクラムの既定と永続化() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "mm-bc-home");
+        let root = crate::test_util::unique_temp_dir("zaivern-config-test", "mm-bc-root");
+        let cfg = Config::default();
+        // 既定: ミニマップはオフ (本文の幅を奪うので使う人だけが払う)
+        //       ブレッドクラムはオン (高さ 1 行・LSP 無しでも必ず出せる)
+        assert!(!cfg.minimap, "ミニマップの既定はオフ");
+        assert!(cfg.breadcrumbs, "ブレッドクラムの既定はオン");
+
+        // UI からの切替相当: 控えも一緒に更新する
+        let mut cfg = cfg;
+        cfg.minimap = true;
+        cfg.global_minimap = true;
+        cfg.breadcrumbs = false;
+        cfg.global_breadcrumbs = false;
+        save_state_to_dir(&home, &cfg);
+        let loaded = load_from_dir(&home, &[], true);
+        assert!(loaded.minimap, "ミニマップが state.toml から復元される");
+        assert!(
+            !loaded.breadcrumbs,
+            "ブレッドクラムが state.toml から復元される"
+        );
+
+        // プロジェクト overlay で上書きでき、グローバルの控えへは漏れない
+        std::fs::write(
+            root.join(".zaivern.toml"),
+            "minimap = false\nbreadcrumbs = true\n",
+        )
+        .expect("write .zaivern.toml");
+        let cfg = load_from_dir(&home, std::slice::from_ref(&root), true);
+        assert!(!cfg.minimap && cfg.breadcrumbs, "プロジェクト値が効く");
+        assert!(
+            cfg.global_minimap && !cfg.global_breadcrumbs,
+            "控えは overlay 前のまま"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn 折り返しはプロジェクトoverlayでも上書きできる() {
         let home = crate::test_util::unique_temp_dir("zaivern-config-test", "wrap-ov-home");
         let root = crate::test_util::unique_temp_dir("zaivern-config-test", "wrap-ov-root");
-        std::fs::write(root.join(".zaivern.toml"), "word_wrap = true\nshow_whitespace = true\n")
-            .expect("write .zaivern.toml");
+        std::fs::write(
+            root.join(".zaivern.toml"),
+            "word_wrap = true\nshow_whitespace = true\n",
+        )
+        .expect("write .zaivern.toml");
 
         let cfg = load_from_dir(&home, std::slice::from_ref(&root), true);
         assert!(cfg.word_wrap && cfg.show_whitespace, "プロジェクト値が効く");

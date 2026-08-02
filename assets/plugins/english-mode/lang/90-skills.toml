@@ -1,0 +1,33 @@
+# Skills / slash command 管理パネル (skills.rs / app.rs のタブとパレット)
+#
+# 既に他ファイルにあるキー ({n} 件 / クリックで詳細を開閉 …) はここに書かない
+# (辞書は後勝ちマージなので、重複させると先の訳が黙って消える)。
+
+# ── 呼び出し (パレット / ボトムパネルのタブ) ──
+"Skills / コマンドを管理" = "Manage skills and slash commands"
+"🧩 Skills" = "🧩 Skills"
+"🧩 Skills / コマンド" = "🧩 Skills / commands"
+"Skills / slash command — .claude/skills と .claude/commands を プロジェクト・ユーザー・プラグイン横断で一覧します\nコマンドはそのままエージェントへ送れます" = "Skills and slash commands — one list of .claude/skills and .claude/commands across project, user and plugins\nCommands can be sent straight to the agent"
+
+# ── 一覧 ──
+"置き場所を読み直す" = "Reload the folders"
+"名前・説明で絞り込む" = "Filter by name or description"
+"📂 開く" = "📂 Open"
+"ファイルを開く: {p}" = "Open the file: {p}"
+"👾 送る" = "👾 Send"
+"このエージェントへ送る: {c}" = "Send to this agent: {c}"
+"📋 パス" = "📋 Path"
+"SKILL.md のパスをコピーする(Skill は説明文で選ばれるので、打鍵名では呼べません)" = "Copy the path to SKILL.md (a skill is picked by its description, so there is no keystroke name to type)"
+"📋 パスをコピーしました: {p}" = "📋 Copied the path: {p}"
+
+# ── 出典 ──
+# ("プラグイン" 単独は 20-app.toml が見出しとして使っているのでここには書かない)
+"プロジェクト" = "Project"
+"ユーザー" = "User"
+"プラグイン由来" = "Plugin"
+
+# ── 空状態 ──
+"Skills も slash command もありません" = "No skills and no slash commands"
+".claude/skills/<名前>/SKILL.md を置くとここに並びます。.claude/commands/<名前>.md は /<名前> で呼べます (ワークスペース直下でも、ホームでも構いません)" = "Drop .claude/skills/<name>/SKILL.md and it shows up here. .claude/commands/<name>.md is callable as /<name> (either next to the workspace or in your home folder)"
+"この検索語に当たるものがありません" = "Nothing matches that search"
+"検索欄を消すと全部出ます" = "Clear the search box to see everything"

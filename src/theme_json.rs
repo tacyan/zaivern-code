@@ -52,7 +52,11 @@ pub fn load(path: &Path) -> Result<Theme, String> {
     let get = |keys: &[&str]| -> Option<Color32> {
         let colors = colors?;
         for k in keys {
-            if let Some(c) = colors.get(*k).and_then(|x| x.as_str()).and_then(parse_color) {
+            if let Some(c) = colors
+                .get(*k)
+                .and_then(|x| x.as_str())
+                .and_then(parse_color)
+            {
                 return Some(c);
             }
         }
@@ -66,7 +70,11 @@ pub fn load(path: &Path) -> Result<Theme, String> {
         .map(|t| t != "light" && t != "hc-light")
         .unwrap_or_else(|| luminance(bg) < 0.5);
 
-    let mut t = theme::by_name(if dark { "zaivern-dark" } else { "zaivern-light" });
+    let mut t = theme::by_name(if dark {
+        "zaivern-dark"
+    } else {
+        "zaivern-light"
+    });
     t.name = path.to_string_lossy().to_string();
     t.label = v
         .get("name")
@@ -81,8 +89,12 @@ pub fn load(path: &Path) -> Result<Theme, String> {
         });
     t.dark = dark;
     t.bg = bg;
-    t.panel = get(&["sideBar.background", "activityBar.background", "panel.background"])
-        .unwrap_or_else(|| shift(bg, if dark { 12 } else { -8 }));
+    t.panel = get(&[
+        "sideBar.background",
+        "activityBar.background",
+        "panel.background",
+    ])
+    .unwrap_or_else(|| shift(bg, if dark { 12 } else { -8 }));
     t.panel_alt = get(&[
         "editorGroupHeader.tabsBackground",
         "tab.inactiveBackground",
@@ -97,8 +109,11 @@ pub fn load(path: &Path) -> Result<Theme, String> {
     ]) {
         t.accent = c;
     }
-    t.accent_soft = get(&["list.activeSelectionBackground", "editor.selectionBackground"])
-        .unwrap_or_else(|| t.accent.gamma_multiply(0.25));
+    t.accent_soft = get(&[
+        "list.activeSelectionBackground",
+        "editor.selectionBackground",
+    ])
+    .unwrap_or_else(|| t.accent.gamma_multiply(0.25));
     if let Some(c) = get(&["editor.foreground", "foreground"]) {
         t.text = c;
     }
@@ -108,8 +123,13 @@ pub fn load(path: &Path) -> Result<Theme, String> {
         "editorLineNumber.foreground",
     ])
     .unwrap_or_else(|| t.text.gamma_multiply(0.6));
-    t.border = get(&["panel.border", "editorGroup.border", "sideBar.border", "contrastBorder"])
-        .unwrap_or_else(|| shift(bg, if dark { 22 } else { -16 }));
+    t.border = get(&[
+        "panel.border",
+        "editorGroup.border",
+        "sideBar.border",
+        "contrastBorder",
+    ])
+    .unwrap_or_else(|| shift(bg, if dark { 22 } else { -16 }));
     t.term_bg = get(&["terminal.background"]).unwrap_or(bg);
     t.term_fg = get(&["terminal.foreground"]).unwrap_or(t.text);
     if let Some(c) = get(&["editorError.foreground", "errorForeground"]) {
@@ -289,7 +309,10 @@ mod tests {
 
     #[test]
     fn shift_clamps_at_both_ends() {
-        assert_eq!(shift(Color32::from_rgb(10, 10, 10), -50), Color32::from_rgb(0, 0, 0));
+        assert_eq!(
+            shift(Color32::from_rgb(10, 10, 10), -50),
+            Color32::from_rgb(0, 0, 0)
+        );
         assert_eq!(
             shift(Color32::from_rgb(250, 250, 250), 50),
             Color32::from_rgb(255, 255, 255)
@@ -408,7 +431,10 @@ mod tests {
             "activityBar.background": "#303030"
         }}"##;
         let p = write_theme(&dir, "fb.json", src);
-        assert_eq!(load(&p).expect("load").panel, Color32::from_rgb(0x30, 0x30, 0x30));
+        assert_eq!(
+            load(&p).expect("load").panel,
+            Color32::from_rgb(0x30, 0x30, 0x30)
+        );
     }
 
     #[test]

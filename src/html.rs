@@ -13,10 +13,7 @@
 /// このバッファを HTML としてプレビュー可能か。
 pub fn is_html(title: &str, lang: &str) -> bool {
     let t = title.to_lowercase();
-    lang == "HTML"
-        || t.ends_with(".html")
-        || t.ends_with(".htm")
-        || t.ends_with(".xhtml")
+    lang == "HTML" || t.ends_with(".html") || t.ends_with(".htm") || t.ends_with(".xhtml")
 }
 
 // ─── 文字実体参照 ───────────────────────────────────────────────────
@@ -232,7 +229,10 @@ fn read_tag(chars: &[char], i: usize) -> Option<Tag> {
     {
         k += 1;
     }
-    let name: String = chars[name_start..k].iter().collect::<String>().to_lowercase();
+    let name: String = chars[name_start..k]
+        .iter()
+        .collect::<String>()
+        .to_lowercase();
     // `>` まで読む (引用符内の > は無視)
     let mut quote: Option<char> = None;
     let attr_start = k;
@@ -267,7 +267,8 @@ fn attr(attrs: &str, name: &str) -> Option<String> {
         let at = search + p;
         // 前が単語境界か
         let ok_before = at == 0
-            || !lower.as_bytes()[at - 1].is_ascii_alphanumeric() && lower.as_bytes()[at - 1] != b'-';
+            || !lower.as_bytes()[at - 1].is_ascii_alphanumeric()
+                && lower.as_bytes()[at - 1] != b'-';
         let after = at + name.len();
         if ok_before {
             let rest = lower[after..].trim_start();
@@ -279,7 +280,9 @@ fn attr(attrs: &str, name: &str) -> Option<String> {
                 } else if let Some(v) = val.strip_prefix('\'') {
                     v.split('\'').next().unwrap_or("")
                 } else {
-                    val.split(|c: char| c.is_whitespace() || c == '>').next().unwrap_or("")
+                    val.split(|c: char| c.is_whitespace() || c == '>')
+                        .next()
+                        .unwrap_or("")
                 };
                 return Some(val.to_string());
             }
@@ -543,10 +546,16 @@ impl Conv {
                 if tag.closing {
                     return;
                 }
-                let ty = attr(&tag.attrs, "type").unwrap_or_default().to_ascii_lowercase();
+                let ty = attr(&tag.attrs, "type")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
                 if ty == "checkbox" || ty == "radio" {
                     let done = attr(&tag.attrs, "checked").is_some()
-                        || tag.attrs.to_ascii_lowercase().split_whitespace().any(|w| w == "checked");
+                        || tag
+                            .attrs
+                            .to_ascii_lowercase()
+                            .split_whitespace()
+                            .any(|w| w == "checked");
                     let in_list = {
                         let s = self.sink();
                         s.ends_with("- ") || s.ends_with("* ") || s.ends_with("+ ")
@@ -805,7 +814,9 @@ impl Conv {
 
     /// 溜めたテーブルを Markdown テーブルとして書き出す。
     fn emit_table(&mut self) {
-        let Some(mut t) = self.table.take() else { return };
+        let Some(mut t) = self.table.take() else {
+            return;
+        };
         t.in_caption = false;
         if let Some(c) = t.cur_cell.take() {
             t.cur_row.push(c);
@@ -823,12 +834,7 @@ impl Conv {
             return;
         }
         let ncols = t.rows.iter().map(|r| r.len()).max().unwrap_or(1);
-        let clean = |s: &str| {
-            s.replace('\n', " ")
-                .replace('|', "\\|")
-                .trim()
-                .to_string()
-        };
+        let clean = |s: &str| s.replace('\n', " ").replace('|', "\\|").trim().to_string();
         self.block_break();
         for (ri, row) in t.rows.iter().enumerate() {
             let mut line = String::from("|");
@@ -859,7 +865,10 @@ fn fence_lang(attrs: &str) -> Option<String> {
     let class = attr(attrs, "class")?;
     class
         .split_whitespace()
-        .find_map(|c| c.strip_prefix("language-").or_else(|| c.strip_prefix("lang-")))
+        .find_map(|c| {
+            c.strip_prefix("language-")
+                .or_else(|| c.strip_prefix("lang-"))
+        })
         .map(|s| s.to_string())
 }
 
@@ -1215,7 +1224,9 @@ mod tests {
 
     #[test]
     fn md_img_and_link_convert() {
-        let md = preprocess_markdown(r#"<p align="center"><img src="logo.png" alt="Logo" width="200"></p>"#);
+        let md = preprocess_markdown(
+            r#"<p align="center"><img src="logo.png" alt="Logo" width="200"></p>"#,
+        );
         assert!(md.contains("![Logo](logo.png)"));
         let md = preprocess_markdown(r#"<a href="https://x.y">site</a>"#);
         assert!(md.contains("[site](https://x.y)"));
@@ -1354,9 +1365,21 @@ mod tests {
             ("<hr>", &["---"], &["<hr>"]),
             ("<h1>見出し</h1>", &["# 見出し"], &["<h1>"]),
             ("<h6>小</h6>", &["###### 小"], &["<h6>"]),
-            ("<blockquote>引用</blockquote>", &["> 引用"], &["<blockquote>"]),
-            ("<ul><li>一</li><li>二</li></ul>", &["- 一", "- 二"], &["<li>"]),
-            ("<ol><li>甲</li><li>乙</li></ol>", &["1. 甲", "2. 乙"], &["<ol>"]),
+            (
+                "<blockquote>引用</blockquote>",
+                &["> 引用"],
+                &["<blockquote>"],
+            ),
+            (
+                "<ul><li>一</li><li>二</li></ul>",
+                &["- 一", "- 二"],
+                &["<li>"],
+            ),
+            (
+                "<ol><li>甲</li><li>乙</li></ol>",
+                &["1. 甲", "2. 乙"],
+                &["<ol>"],
+            ),
             (
                 r#"<a href="https://a.b">サイト</a>"#,
                 &["[サイト](https://a.b)"],
@@ -1393,7 +1416,11 @@ mod tests {
                 &["<span"],
             ),
             (r#"<span class="x">素</span>"#, &["素"], &["<span", "class"]),
-            ("<dl><dt>語</dt><dd>説明</dd></dl>", &["**語**", "説明"], &["<dl>"]),
+            (
+                "<dl><dt>語</dt><dd>説明</dd></dl>",
+                &["**語**", "説明"],
+                &["<dl>"],
+            ),
             ("<sup>2</sup>", &["^(2)"], &["<sup>"]),
             ("<sub>i</sub>", &["_(i)"], &["<sub>"]),
             (
@@ -1408,7 +1435,11 @@ mod tests {
             ),
             // 未知の (=対応していない) タグは中身のテキストだけ残す
             ("<marquee>流れる</marquee>", &["流れる"], &["<marquee>"]),
-            ("<form><label>名前</label></form>", &["名前"], &["<form>", "<label>"]),
+            (
+                "<form><label>名前</label></form>",
+                &["名前"],
+                &["<form>", "<label>"],
+            ),
             ("<body><p>本文</p></body>", &["本文"], &["<body>"]),
         ];
         for (src, want, unwanted) in cases {
@@ -1554,7 +1585,10 @@ mod tests {
         assert!(md.contains("外"), "{md:?}");
         assert!(md.contains("内"), "{md:?}");
         assert!(md.contains("右"), "{md:?}");
-        assert!(md.lines().filter(|l| l.contains("---")).count() <= 1, "{md:?}");
+        assert!(
+            md.lines().filter(|l| l.contains("---")).count() <= 1,
+            "{md:?}"
+        );
     }
 
     #[test]
@@ -1613,8 +1647,18 @@ let v: Vec<Option<String>> = vec![];
 "#;
         let md = preprocess_markdown(src);
         for raw in [
-            "<p", "</p>", "<a href", "<img", "<details>", "<summary>", "<table>", "<tr>",
-            "<th>", "<td>", "&nbsp;", "&amp;",
+            "<p",
+            "</p>",
+            "<a href",
+            "<img",
+            "<details>",
+            "<summary>",
+            "<table>",
+            "<tr>",
+            "<th>",
+            "<td>",
+            "&nbsp;",
+            "&amp;",
         ] {
             assert!(!md.contains(raw), "{raw:?} が残っている:\n{md}");
         }
@@ -1646,8 +1690,16 @@ let v: Vec<Option<String>> = vec![];
         let big = format!("<p>{}</p>", "あ".repeat(4_000_000)); // 12MB 超
         assert!(big.len() > 10 * 1024 * 1024);
         let md = html_to_md(&big);
-        assert!(md.len() < crate::markdown::MAX_PREVIEW_BYTES + 4096, "len={}", md.len());
-        assert!(md.contains("⚠") || md.contains("KB"), "{}", &md[md.len() - 200..]);
+        assert!(
+            md.len() < crate::markdown::MAX_PREVIEW_BYTES + 4096,
+            "len={}",
+            md.len()
+        );
+        assert!(
+            md.contains("⚠") || md.contains("KB"),
+            "{}",
+            &md[md.len() - 200..]
+        );
         // HTML を含まない巨大 Markdown も同じ経路で切り詰められる
         let plain = "行\n".repeat(400_000);
         let out = preprocess_markdown(&plain);

@@ -28,6 +28,7 @@
 #![allow(dead_code)]
 
 use crate::i18n::tr;
+use crate::keybinds::{format_shortcut, BindAction, Keybinds};
 use eframe::egui;
 use egui::{Color32, Id, Pos2, Rect, Rounding, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
@@ -290,8 +291,13 @@ pub struct Step {
     pub title: &'static str,
     /// 3 文以内の短い説明
     pub body: &'static str,
-    /// キーボードショートカットのチップ (無ければ出さない)
+    /// キーボードショートカットのチップ (無ければ出さない)。
+    ///
+    /// **打鍵をここへ書かないこと。** 再割り当てで嘘になり、Windows/Linux では
+    /// 表記そのものが違う。打鍵は [`Step::keys`] に `BindAction` で並べる。
     pub hint: Option<&'static str>,
+    /// 案内に出す打鍵 (キーバインド表から生成する)。空なら [`Step::hint`] を使う。
+    pub keys: &'static [crate::keybinds::BindAction],
     /// 説明の前にホストへ頼みたいこと
     pub pre_action: Option<TutorialAction>,
 }
@@ -306,6 +312,7 @@ pub const STEPS: &[Step] = &[
         title: "Zaivern Code へようこそ",
         body: "この操縦席の計器を、場所を光らせながら一巡します。\n所要 2 分ほど。いつでも「スキップ」で終われます。",
         hint: Some("→ / Enter で次へ"),
+        keys: &[],
         pre_action: None,
     },
     Step {
@@ -315,6 +322,7 @@ pub const STEPS: &[Step] = &[
         title: "上部ツールバー",
         body: "Cockpit・看板・権限モード・📱・🎤 など、よく使うものが並びます。\nここが操縦席の計器盤です。",
         hint: None,
+        keys: &[],
         pre_action: None,
     },
     // ── エディタ ──
@@ -324,7 +332,8 @@ pub const STEPS: &[Step] = &[
         anchor: Some(AnchorId::FileTree),
         title: "ファイルツリーと git の色",
         body: "変更のあるファイルには M / A / U / D / R / C のバッジが付き、たたんだ親フォルダにも色が乗ります。\n右クリックで新規・名前変更・削除・「@パスをエージェントへ送信」。\nタブを切り替えるとツリーが自動追従します。",
-        hint: Some("⌘⇧E"),
+        hint: None,
+        keys: &[BindAction::FocusExplorer],
         pre_action: Some(TutorialAction::OpenSidebar(SidebarTarget::Files)),
     },
     Step {
@@ -333,7 +342,8 @@ pub const STEPS: &[Step] = &[
         anchor: Some(AnchorId::EditorTabs),
         title: "タブとエディタの基本",
         body: "syntect の構文ハイライト、行番号ガター、未保存マーク (●)。\n行ガターは git 差分 (緑=追加 / 黄=変更) と LSP 診断 (赤 / 黄) で色が付きます。",
-        hint: Some("⌘S / ⌘W"),
+        hint: None,
+        keys: &[BindAction::Save, BindAction::CloseTab],
         pre_action: None,
     },
     Step {
@@ -343,6 +353,7 @@ pub const STEPS: &[Step] = &[
         title: "画像・PDF・プレビュー",
         body: "png/jpg/gif/webp/ico は画像ビューア (⌘スクロールで 0.05〜32 倍)。\nPDF はページ区切り付きの読み取り専用テキストに展開されます。\nMarkdown / HTML はレンダリング表示に切り替えられます。",
         hint: None,
+        keys: &[],
         pre_action: None,
     },
     Step {
@@ -352,6 +363,7 @@ pub const STEPS: &[Step] = &[
         title: "折り返しと空白文字",
         body: "表示メニュー (またはコマンドパレット) から「折り返し切替」「空白文字表示切替」。\nスペースは ·、タブは → で見えるようになります。\n初期値は config.toml、プロジェクト単位の上書きは .zaivern.toml です。",
         hint: None,
+        keys: &[],
         pre_action: None,
     },
     Step {
@@ -360,7 +372,8 @@ pub const STEPS: &[Step] = &[
         anchor: Some(AnchorId::EditorFind),
         title: "ファイル内検索",
         body: "ヒット件数を出しながら、該当行を画面中央へジャンプします。\nエージェント端末にフォーカスがあるときは、スクロールバック全文の検索になります。",
-        hint: Some("⌘F"),
+        hint: None,
+        keys: &[BindAction::Find],
         pre_action: None,
     },
     Step {
@@ -369,7 +382,8 @@ pub const STEPS: &[Step] = &[
         anchor: Some(AnchorId::SearchTab),
         title: "横断検索と置換",
         body: "ワークスペース全体を検索し、正規表現・glob の絞り込み・一括置換ができます。\n複数フォルダを開いていれば全ルートを横断します。",
-        hint: Some("⇧⌘F"),
+        hint: None,
+        keys: &[BindAction::GlobalSearch],
         pre_action: Some(TutorialAction::OpenSidebar(SidebarTarget::Search)),
     },
     Step {
@@ -378,7 +392,8 @@ pub const STEPS: &[Step] = &[
         anchor: Some(AnchorId::CommandPalette),
         title: "コマンドパレット",
         body: "入力欄 1 つでファイル・コマンド・エージェント・worktree を横断します。\n無印=ファイル、> =コマンド、@ =エージェント、# =git worktree。",
-        hint: Some("⌘P / ⌘⇧P"),
+        hint: None,
+        keys: &[BindAction::PaletteFiles, BindAction::PaletteCommands],
         pre_action: Some(TutorialAction::OpenPalette),
     },
     // ── エージェント ──
@@ -388,7 +403,8 @@ pub const STEPS: &[Step] = &[
         anchor: Some(AnchorId::TerminalPanel),
         title: "エージェント端末",
         body: "本物の PTY なので、日本語 IME もカラーも普通に動きます。\nファイルをドラッグ&ドロップ、⌘V でクリップボードの画像を貼ると @パス が入ります (送信はしません)。",
-        hint: Some("⌘J"),
+        hint: None,
+        keys: &[BindAction::ToggleTerminal],
         pre_action: Some(TutorialAction::ShowTerminalPanel),
     },
     Step {
@@ -397,7 +413,8 @@ pub const STEPS: &[Step] = &[
         anchor: Some(AnchorId::NewAgentButton),
         title: "エージェントを起動する",
         body: "29 種の CLI エージェントを内蔵カタログで認識します (Claude Code / Codex / Cursor ほか)。\nプリセットは config.toml の [[agents]] にいくつでも追加でき、env でアカウントも分けられます。",
-        hint: Some("⌘⇧A"),
+        hint: None,
+        keys: &[BindAction::NewAgent],
         pre_action: None,
     },
     Step {
@@ -407,6 +424,7 @@ pub const STEPS: &[Step] = &[
         title: "権限モードと ⚡自動YES",
         body: "🛡承認 / ⚡全自動 / 👾Agent優先 の 3 モードをワンクリックで切り替え、実行中のセッションにも一括送信できます。\n対話プロンプトへの自動応答は別スイッチ「⚡ 自動YES」で、既定はオフです。\n最後の YES は、必ずあなたのものです。",
         hint: None,
+        keys: &[],
         pre_action: None,
     },
     Step {
@@ -415,7 +433,8 @@ pub const STEPS: &[Step] = &[
         anchor: Some(AnchorId::CockpitButton),
         title: "Agent Cockpit と一斉送信",
         body: "走っている全エージェントがライブ端末のグリッドで並び、上の入力欄から全員へ一斉送信できます。\n停滞・ループ・異常終了は見張りが検知してあなたへ上げます (勝手に打ち込みはしません)。\n「💡 スーパーエージェント」で 1 体を指揮官に指名することもできます。",
-        hint: Some("⌘⇧C"),
+        hint: None,
+        keys: &[BindAction::ToggleCockpit],
         pre_action: Some(TutorialAction::ShowCockpit),
     },
     Step {
@@ -425,6 +444,7 @@ pub const STEPS: &[Step] = &[
         title: "エージェントデッキ",
         body: "稼働中・過去のセッション・新規起動を縦 1 本にまとめた画面です。\n↑↓ で選ぶと右 (狭い画面では下) にその端末が出ます。\n積み上げモードにすると複数のセッションを上下に同時表示できます。",
         hint: None,
+        keys: &[],
         pre_action: Some(TutorialAction::ShowDeck),
     },
     Step {
@@ -433,7 +453,8 @@ pub const STEPS: &[Step] = &[
         anchor: Some(AnchorId::KanbanButton),
         title: "フリート看板",
         body: "待機 / 思考中 / 編集中 / 実行中 / 検証中 / 承認待ち / 停滞 / 完了 の 8 レーンで全機を俯瞰します。\n縦モードならカードを選ぶと下にライブ端末が出て、↑↓ で移動・Enter でそのまま入力できます。\n推定には ≈、確かな根拠には ✓ が付きます。",
-        hint: Some("⌘⇧K"),
+        hint: None,
+        keys: &[BindAction::ToggleKanban],
         pre_action: Some(TutorialAction::ShowKanban),
     },
     Step {
@@ -443,6 +464,7 @@ pub const STEPS: &[Step] = &[
         title: "プロンプト・ファンアウトレース",
         body: "1 つの指示を 2〜4 体へ同時に渡し、それぞれ専用の git worktree で走らせます。\n走行中から競合ファイルを突き合わせ、採用は merge、破棄は worktree ごと消して残骸を残しません。",
         hint: None,
+        keys: &[],
         pre_action: Some(TutorialAction::OpenRaceForm),
     },
     // ── レビューと Git ──
@@ -453,6 +475,7 @@ pub const STEPS: &[Step] = &[
         title: "過去の会話と再開",
         body: "フォルダごとの会話履歴が残り、開き直すと前回のタブがスクロールバックごと戻ります。\nclaude は --continue、codex は resume --last が自動で付くので、CLI 側の会話も続きから始まります。",
         hint: None,
+        keys: &[],
         pre_action: Some(TutorialAction::OpenSidebar(SidebarTarget::Sessions)),
     },
     Step {
@@ -462,6 +485,7 @@ pub const STEPS: &[Step] = &[
         title: "Git パネル",
         body: "変更ファイルの一覧・ステージ・コミット・ブランチ操作をここから。\ngit status はバックグラウンドスレッドで 2 秒ごとに取り直すので、大きなリポジトリでもフレームは落ちません。",
         hint: None,
+        keys: &[],
         pre_action: Some(TutorialAction::OpenSidebar(SidebarTarget::Git)),
     },
     Step {
@@ -471,6 +495,7 @@ pub const STEPS: &[Step] = &[
         title: "差分へのインラインコメント",
         body: "差分タブでは行をクリックしてその場にコメントを書けます。解決 / 未解決も管理できます。\n未解決のコメントはまとめて 1 通のプロンプトになり、そのままエージェントへ渡せます。",
         hint: None,
+        keys: &[],
         pre_action: None,
     },
     Step {
@@ -480,6 +505,7 @@ pub const STEPS: &[Step] = &[
         title: "GitHub と worktree",
         body: "gh 経由で PR / Issue を一覧し、差分をインライン diff で読めます (追加の認証設定は不要)。\nIssue の「⚡ 着手」で専用 worktree の作成・ワークスペース追加・エージェント起動まで繋がります。",
         hint: None,
+        keys: &[],
         pre_action: Some(TutorialAction::OpenSidebar(SidebarTarget::GitHub)),
     },
     // ── 拡張と外の世界 ──
@@ -490,6 +516,7 @@ pub const STEPS: &[Step] = &[
         title: "プラグイン",
         body: "worktrees・diff-review・tasks・quick-actions などが標準で同梱され、初回起動から有効です。\n中身はただのシェルスクリプトなので、読んで真似して書き換えられます (Rust の再ビルド不要)。\n.zvplug でエクスポート / インストールもできます。",
         hint: None,
+        keys: &[],
         pre_action: Some(TutorialAction::OpenSidebar(SidebarTarget::Plugins)),
     },
     Step {
@@ -499,6 +526,7 @@ pub const STEPS: &[Step] = &[
         title: "スマホリモート",
         body: "📱 の QR を読むだけで、同じ Wi-Fi のスマホがリモコンになります (承認・指示出し・編集まで)。\n認証は起動ごとのランダムトークンで、届く範囲は LAN 内のみ。\nWindows は同じ画面から受信許可を作れます。",
         hint: None,
+        keys: &[],
         pre_action: Some(TutorialAction::ShowRemoteQr),
     },
     Step {
@@ -508,6 +536,7 @@ pub const STEPS: &[Step] = &[
         title: "音声入力",
         body: "🎤 を押すと、話した内容が入力欄へ流れ込み続けます (⏹ で停止)。\nEnter は送らないので、目で見て直して納得してから自分で送信します。\n宛先は 🎯 アクティブ / 📣 全エージェントを、録音したまま切り替えられます。",
         hint: None,
+        keys: &[],
         pre_action: None,
     },
     Step {
@@ -517,6 +546,7 @@ pub const STEPS: &[Step] = &[
         title: "通知と相棒 🐾ザイガニ",
         body: "承認待ちになるとポップアップ・効果音・バブルから ✔承認 / ✖拒否 ができます。\nwebhook_url を書いておけば ntfy / Slack / Discord で外出先へも届きます。\n見た目 4 種とサイズ 3 段階、クリックで Cockpit が開きます。",
         hint: None,
+        keys: &[],
         pre_action: None,
     },
     // ── 仕上げ ──
@@ -527,6 +557,7 @@ pub const STEPS: &[Step] = &[
         title: "テーマとキーバインド",
         body: "テーマは 3 種内蔵 + VS Code 互換テーマ JSON をそのまま読み込めます。\nショートカットは config.toml の [keybindings] で全部差し替えられます。",
         hint: None,
+        keys: &[],
         pre_action: None,
     },
     Step {
@@ -536,6 +567,7 @@ pub const STEPS: &[Step] = &[
         title: "ターミナルからの操作 (zai)",
         body: "zai open / prompt / run / notify で、動いているこのエディタを外から操作できます。\nzai status は起動中のインスタンスを一覧し、1 つも無ければ終了コード 1 を返します。",
         hint: None,
+        keys: &[],
         pre_action: None,
     },
     Step {
@@ -543,8 +575,9 @@ pub const STEPS: &[Step] = &[
         chapter: Chapter::Finish,
         anchor: None,
         title: "ここまでです",
-        body: "あとは走らせるだけ。困ったら ⌘⇧P から「チュートリアルを再開」でいつでも戻ってこられます。\nよい夜を。",
-        hint: Some("⌘⇧P"),
+        body: "あとは走らせるだけ。困ったらコマンドパレット (下の打鍵) から「チュートリアルを再開」でいつでも戻ってこられます。\nよい夜を。",
+        hint: None,
+        keys: &[BindAction::PaletteCommands],
         pre_action: None,
     },
 ];
@@ -671,7 +704,10 @@ pub fn dim_alpha(dark_theme: bool) -> u8 {
 }
 
 pub fn dim_rects(target: Option<Rect>, screen: Rect) -> Vec<Rect> {
-    let Some(t) = target.map(|t| t.intersect(screen)).filter(|t| t.is_positive()) else {
+    let Some(t) = target
+        .map(|t| t.intersect(screen))
+        .filter(|t| t.is_positive())
+    else {
         return vec![screen];
     };
     let mut out = Vec::with_capacity(4);
@@ -986,6 +1022,7 @@ impl Tutorial {
         &mut self,
         ctx: &egui::Context,
         theme: &crate::theme::Theme,
+        keys: &Keybinds,
     ) -> Option<TutorialAction> {
         if !self.active {
             return None;
@@ -1013,7 +1050,7 @@ impl Tutorial {
         if let Some(t) = target {
             self.paint_ring(ctx, theme, t, now);
         }
-        self.card(ctx, theme, step, target, screen);
+        self.card(ctx, theme, step, target, screen, keys);
 
         // リングのアニメーションのため、控えめな間隔で再描画を促す。
         ctx.request_repaint_after(std::time::Duration::from_millis(REPAINT_MS));
@@ -1024,7 +1061,13 @@ impl Tutorial {
 
     /// 暗幕。`interactable` な Area ではなく素の painter なので、背面のクリックは
     /// そのまま通る (= ツアー中でもアプリを触れる)。
-    fn paint_dim(&self, ctx: &egui::Context, theme: &crate::theme::Theme, target: Option<Rect>, screen: Rect) {
+    fn paint_dim(
+        &self,
+        ctx: &egui::Context,
+        theme: &crate::theme::Theme,
+        target: Option<Rect>,
+        screen: Rect,
+    ) {
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             Id::new("zv-tutorial-dim"),
@@ -1063,6 +1106,7 @@ impl Tutorial {
         step: &'static Step,
         target: Option<Rect>,
         screen: Rect,
+        keys: &Keybinds,
     ) {
         let size_id = Id::new(("zv-tutorial-card-size", step.id));
         let measured: Vec2 = ctx
@@ -1084,7 +1128,7 @@ impl Tutorial {
                     .inner_margin(egui::Margin::same(12.0))
                     .show(ui, |ui| {
                         ui.set_max_width((inner_w - 26.0).max(80.0));
-                        self.card_contents(ui, theme, step);
+                        self.card_contents(ui, theme, step, keys);
                     });
             });
         let got = resp.response.rect.size();
@@ -1094,7 +1138,13 @@ impl Tutorial {
         }
     }
 
-    fn card_contents(&mut self, ui: &mut egui::Ui, theme: &crate::theme::Theme, step: &'static Step) {
+    fn card_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &crate::theme::Theme,
+        step: &'static Step,
+        keys: &Keybinds,
+    ) {
         // ── 見出し行: 章名 + 進捗
         ui.horizontal(|ui| {
             ui.label(
@@ -1120,7 +1170,19 @@ impl Tutorial {
         ui.add_space(4.0);
         ui.label(egui::RichText::new(tr(step.body)).color(theme.text_dim));
 
-        if let Some(hint) = step.hint {
+        // 打鍵はキーバインド表から作る (ベタ書きは再割り当てと OS 差で嘘になる)
+        let key_chip: Option<String> = if step.keys.is_empty() {
+            step.hint.map(tr)
+        } else {
+            Some(
+                step.keys
+                    .iter()
+                    .map(|a| format_shortcut(keys.get(*a)))
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+            )
+        };
+        if let Some(hint) = key_chip {
             ui.add_space(6.0);
             egui::Frame::none()
                 .fill(theme.panel_alt)
@@ -1129,7 +1191,7 @@ impl Tutorial {
                 .inner_margin(egui::Margin::symmetric(6.0, 2.0))
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new(tr(hint))
+                        egui::RichText::new(hint)
                             .small()
                             .monospace()
                             .color(theme.text),
@@ -1451,7 +1513,10 @@ mod tests {
         for (name, t) in targets {
             let p = place_callout(Some(t), screen, card);
             assert!(inside(p.rect, screen), "{name}: 画面外へ出た {:?}", p.rect);
-            assert!(p.rect.width() > 0.0 && p.rect.height() > 0.0, "{name}: 潰れた");
+            assert!(
+                p.rect.width() > 0.0 && p.rect.height() > 0.0,
+                "{name}: 潰れた"
+            );
         }
     }
 
@@ -1559,7 +1624,10 @@ mod tests {
     fn dim_rects_handle_edge_targets() {
         let screen = rect(0.0, 0.0, 1000.0, 600.0);
         // 左上に密着 → 上と左の帯が消えて 2 枚
-        assert_eq!(dim_rects(Some(rect(0.0, 0.0, 200.0, 100.0)), screen).len(), 2);
+        assert_eq!(
+            dim_rects(Some(rect(0.0, 0.0, 200.0, 100.0)), screen).len(),
+            2
+        );
         // 全画面の対象 → 暗幕なし
         assert!(dim_rects(Some(screen), screen).is_empty());
         // 画面外の対象 → 全面 1 枚
@@ -1577,7 +1645,10 @@ mod tests {
         assert!(!m.observe(0.0, false), "いきなり自動送りしてはいけない");
         assert!(m.waiting());
         assert!(!m.observe(MISSING_ANCHOR_TIMEOUT - 0.1, false));
-        assert!(m.observe(MISSING_ANCHOR_TIMEOUT, false), "時間切れで進むはず");
+        assert!(
+            m.observe(MISSING_ANCHOR_TIMEOUT, false),
+            "時間切れで進むはず"
+        );
     }
 
     #[test]
@@ -1598,7 +1669,10 @@ mod tests {
         m.observe(0.0, false);
         m.reset();
         assert!(!m.waiting());
-        assert!(!m.observe(MISSING_ANCHOR_TIMEOUT, false), "reset 後は数え直し");
+        assert!(
+            !m.observe(MISSING_ANCHOR_TIMEOUT, false),
+            "reset 後は数え直し"
+        );
     }
 
     // ── 永続化 ──

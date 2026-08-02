@@ -55,6 +55,18 @@ On first launch a **26-step guided tour** walks you through the cockpit, highlig
 
 ---
 
+## 🆕 v0.6.0 — no file you cannot open, no key that does nothing
+
+- **Every file opens.** Anything unreadable as text lands in a **hex viewer**; video and audio become **info cards** (WAV and MP4 have their duration and resolution parsed in-house); ZIP / JAR / WHL list **their contents**. Routing is by **leading magic bytes** (40+ formats), not by extension — **a lying extension still opens correctly**.
+- **The editor caught up on the rest of VS Code** — **⇹ splits** (`⌘\` / `⌥⌘\` / `⌘1`–`⌘3`; **the layout survives a restart**), a **🗺 minimap**, **🔗 breadcrumbs**, **💡 quick fix `⌘.`** and signature help `⇧⌘Space`, **👤 Git blame**, drag-to-reorder tabs, and running `.vscode/tasks.json`.
+- **🔌 An MCP server manager** and **🧩 a skills / slash-command manager**, folding scattered config into one table. **MCP `env` values are never displayed** — key names and "is it set", nothing else.
+- **📱 Your phone no longer has to be on the same Wi-Fi.** Open an **SSH reverse tunnel** to a host you already use (the phone needs no SSH client). **While the tunnel is up the server binds to `127.0.0.1` only**, closing the cleartext listener. No password is entered and none is stored.
+- **🔁 Automatic account failover on rate limits** (off by default). What convinced it is shown as a rung on the ladder — **structured protocol > vendor hook > state file > screen** — and screen-derived evidence is **labelled an estimate**.
+- **⌨️ Headless `zai`** — `zai worktree`, `zai session`, `zai agent`. All take `--json`; exit codes are **0 / 1 / 2** across the board.
+- **A key that does nothing fails CI.** Every binding is pinned by a test that it reaches somewhere which actually consumes it, and **the shortcuts printed on screen are generated from the keybinding table** (rebind in `config.toml` and the labels follow). `⌃Space` (completion) is reserved by macOS for "previous input source", so the default moved to **`⌘I`** (⌃Space still works where it reaches the app).
+
+**Quality**: CI **green on macOS, Windows and Linux**, **2488 tests**, **0 rustc warnings**. CI gained `cargo fmt --all --check` and a clippy ratchet that freezes the 26 existing debts and **only blocks new ones**.
+
 ## 🆕 v0.5.1 — nothing moves just because you launched it
 
 - **The session list only shows conversations from the folder you have open** — the per-branch (worktree) grouping is gone. The list stays the same for as long as the folder does (the same scoping the VS Code Claude Code extension uses).
@@ -125,7 +137,9 @@ You're not staring at cold logs — **a companion taps you on the shoulder.** De
 
 ### 📱 Leave your desk — the command continues — Phone Remote
 
-Tap 📱 in the top bar, scan the QR code, and any phone on the same Wi-Fi becomes your remote control. From the sofa, from the balcony, while the coffee brews — approvals, new instructions, file edits, progress checks. **While the agents are working, there is no reason left for you to be chained to a desk.** (Per-launch random token auth, LAN only.)
+Tap 📱 in the top bar, scan the QR code, and any phone on the same Wi-Fi becomes your remote control. From the sofa, from the balcony, while the coffee brews — approvals, new instructions, file edits, progress checks. **While the agents are working, there is no reason left for you to be chained to a desk.** (Per-launch random token auth.)
+
+**And it no longer has to be the same Wi-Fi.** The same 📱 panel offers "Remote connection (SSH)": relay through a host you can already SSH into and it opens a **reverse SSH tunnel**. The phone needs no SSH client — it just opens a URL. **While the tunnel is up the server binds to `127.0.0.1` only**, so the cleartext LAN listener stays closed. No password is entered and none is stored (authentication is left to the OS's `ssh` and your keys).
 
 **On Windows this needs one permission, once.** Windows blocks all inbound connections by default, so without a rule your phone's connection is dropped by the OS — the PC is listening, the QR is correct, and yet nothing happens on the phone. Nothing on screen told you why, so the story used to end at "phone remote doesn't work on Windows". Now the 📱 panel checks the inbound rule itself and, if it is missing, says so and offers a **"🛡 Allow inbound" button** (one administrator prompt). It allows **only this executable on TCP 8899-8919**, and you can revoke it from the same panel. From a terminal: `zai firewall status` / `zai firewall allow` / `zai firewall revoke`.
 
@@ -157,13 +171,13 @@ Want your own recognizer? Set `voice_command` as before — on anything but macO
 
 ### 📝 And the final stroke is still yours — a Zed-inspired editor
 
-Even in an era where AI writes 90% of the code, the last 10% — the architectural judgment calls, the naming, the one line you take responsibility for — belongs to a human. So Zaivern keeps a sharp pen right beside the commander's chair: syntect syntax highlighting, LSP diagnostics, Git diff gutters, a fuzzy palette (⌘P), VS Code-grade file operations and scrolling. **The moment you feel like writing, you can.**
+Even in an era where AI writes 90% of the code, the last 10% — the architectural judgment calls, the naming, the one line you take responsibility for — belongs to a human. So Zaivern keeps a sharp pen right beside the commander's chair: syntect syntax highlighting, LSP diagnostics and quick fixes (⌘.), Git diff gutters and Git blame, a fuzzy palette (⌘P), a minimap and breadcrumbs, **editor splits (⌘\)**, VS Code-grade file operations and scrolling. **And there is no file it cannot open** — anything unreadable as text lands in the hex viewer, and video, audio and archives each open in the shape that suits them. **The moment you feel like writing, you can.**
 
 ---
 
 ## Why Rust — a heavy cockpit is no cockpit at all
 
-- **No Electron. No Node.** A single native binary with GPU rendering via egui. Instant startup; idle memory lighter than one browser tab
+- **No Electron. No Node.** A single native binary with GPU rendering via egui. Instant startup; idle memory lighter than one browser tab. **A 10 MB download, about 19 MB once installed** (measured on macOS arm64) — no runtime and no `node_modules` ride along
 - **Watching costs no CPU.** Unconditional repainting is gone; each frame is requested only when the actual state needs one. Measured over a 30-second window on a release build: **0.13% focused, 0.03% unfocused**. Launch with `ZV_IDLE_TRACE=1` and it prints the real fps and the reason for each decision every second
 - **A real PTY terminal** (portable-pty + vt100). Claude Code's full-screen TUI runs as-is. 256-color / TrueColor, bracketed paste, scrollback — plus the unglamorous compatibility work: terminal queries (device attributes, cursor position, background colour) are actually *answered*, because a query left hanging either freezes the TUI waiting for a reply or dumps raw escape text into its input box. Cursor-shape changes, focus in/out reporting, and OSC 52 clipboard writes are handled too
 - **One codebase for macOS / Windows / Linux.** Child processes are killed automatically on exit — no orphan processes left behind
@@ -194,6 +208,18 @@ Everything below is the manual for each instrument on the flight deck.
 - **🔤 Encodings and line endings**: "Reopen with encoding" / "Save with encoding" from the command palette. The list only offers encodings this build **actually round-trips**, measured at startup rather than assumed. Line endings convert to LF / CRLF / CR, and a mixed file reports the breakdown. "Trim trailing whitespace" and "Insert final newline" on save are View-menu toggles (off by default)
 - **📊 CSV / TSV table view and large files**: `.csv` / `.tsv` render as a table via "Toggle table view". Past 4 MB, highlighting and folding switch off; past 50 MB the file opens read-only (the banner spells out which limits are in effect); files over 512 MB are not opened
 - **👁 Markdown / HTML preview** (**⌘⇧V**): GFM tables, task lists, footnotes and autolinks, collapsed front matter, raw HTML tags, and local / `data:` images. **```mermaid fences render as diagrams** (`graph` / `flowchart` / `sequenceDiagram`; unsupported kinds say so), and `$…$` / `$$…$$` TeX math is typeset — **both in pure Rust, with no added dependencies**
+- **🔢 Every file opens**: anything that is not readable as text **always lands in the hex viewer**. There is no "cannot open this file" dead end
+  - **Hex dump**: the classic `offset | 16 hex bytes | ASCII` layout. **Only the visible rows are built**, so drawing costs the same no matter how long the file is. A tab holds up to 4 MB and says so explicitly when it stops there
+  - **🎬 Video / 🎵 audio info cards**: `mp4` / `mov` / `mkv` / `webm` / `avi` / `m4v` and `mp3` / `wav` / `flac` / `aac` / `ogg` / `m4a`. **WAV and MP4 have their duration, resolution, sample rate and channel count parsed in-house** — no external command, no added crate. Fields the header does not give up are printed as `—` rather than guessed
+  - **📦 ZIP / JAR / WHL contents**: stored name, original size, compressed size and timestamp, **parsed in-house with no new dependency** (nothing is extracted)
+  - **Routed by content, not by name**: the leading magic bytes identify **more than 40 formats**, so **a lying extension still lands in the right viewer** (a PNG named `.txt` opens as an image, a ZIP named `.log` opens as an archive). The genuinely ambiguous pairs are disambiguated by reading further — `RIFF` splitting into WAV / AVI / WebP, and `CAFEBABE` shared between Mach-O universal binaries and Java class files
+- **🗺 Minimap** (off by default): a zoomed-out view of the buffer down the right edge. Click to jump, drag to scroll, and **search hits, LSP diagnostics and bookmarks are overlaid as marks** so a problem far away is still visible at that scale. It costs 64 px of body width, hence the default-off, and it hides itself automatically on narrow windows. Toggle from the View menu, the palette's "Toggle minimap", or `minimap` in `config.toml`
+- **🔗 Breadcrumbs** (on by default): `folder › folder › file › symbol` under the tab strip. **The path part does not need an LSP** — it is known the moment the file opens. Click a segment to navigate; when the row does not fit, **the middle is elided** and both ends are kept. Toggle from the View menu, the palette's "Toggle breadcrumbs", or `breadcrumbs` in `config.toml`
+- **⇹ Editor splits** (**⌘\** right / **⌥⌘\** down / **⌘1**–**⌘3** to focus a pane), nestable. **Buffers are shared**, so opening the same file in two panes still means one buffer and an edit in one always shows up in the other; **scroll position and cursor are per pane**. Dividers drag. **The split layout is restored across restarts** (it is saved with the session)
+- **💡 Quick fix (⌘.) and signature help (⇧⌘Space)**: press ⌘. on a diagnostic to get the LSP's code actions and fix it in place; open a call's parentheses and ⇧⌘Space shows the parameter hints. **The symbol under the cursor is faintly highlighted everywhere else in the file** (documentHighlight — turn it off from the palette), and a selection can be formatted on its own (rangeFormatting). Anything the server does not implement does nothing silently and tells you so
+- **👤 Git blame** (off by default): `author · relative date` in the gutter. **Only the visible lines are asked for**, and asynchronously, so a big file still holds its frame rate. Click a line to open that commit's diff as a tab. Toggle from the View menu, the palette's "Toggle Git blame", or `git_blame` in `config.toml`
+- **🖱 Drag tabs to reorder them**: grab a tab and move it left or right
+- **🛠 `.vscode/tasks.json` support**: picked up when the project has one, and runnable from the palette's "Run build task…". **JSONC (comments, trailing commas) is fine.** It reads `label` / `type` / `command` / `args` / `options.cwd` / `options.env` / `group` / `presentation.reveal` and expands `${workspaceFolder}`, `${file}`, `${fileBasename}` and `${fileDirname}`. **A task left holding a variable we cannot expand is not dropped from the list — it is greyed out with the reason**, because a task that silently vanishes leaves you guessing why
 - Git branch display, automatic Japanese UI font fallback
 
 ### 👾 Multi-agent
@@ -213,6 +239,30 @@ Everything below is the manual for each instrument on the flight deck.
 - **💬 Past-session sidebar / 📊 plan usage**: pick a session claude or codex left behind and **resume it in that folder** (`--resume <id>` is added for you). The list shows **only conversations held in the folder you have open** — there is no per-branch (worktree) grouping, so the list stays the same for as long as the folder does (the same scoping the VS Code Claude Code extension uses). The status bar carries a usage estimate; click it for the breakdown (per account, measured values marked apart from projections, plus a run-out estimate). The tally is computed entirely offline
 - **🔢 Numbered menus and surveys don't stall you**: prompts like `1. Yes` or `Select an option [1-3]:` are detected and answered automatically (skip → affirmative → most-positive end of a rating scale). The fact that it answered is recorded as "auto-answered the survey: n" in the session events and the audit log. Meaningful open choices and privilege escalation are never auto-answered — they surface as pending approvals instead
 - **📋 Paste a clipboard image straight in**: press **⌘V** (**Ctrl+V** on Windows / Linux) in an agent terminal. If the clipboard holds an image it is written as a PNG into `zaivern-clip/` in your temp directory and `@path` lands in the input box — **nothing is submitted**. If the clipboard holds text, normal text paste wins as before, so nothing you already do changes. Saved PNGs are pruned automatically to the newest 24
+
+### 🔌 MCP server manager — "where did I write that one down?" in a single table
+The palette's **"🔌 Manage MCP servers"**. Every CLI keeps its MCP servers in a different file, so from where you sit the question "which file holds this server, and which agent does it actually reach?" has no answer. This panel folds them into one.
+
+- It scans the workspace's **`.mcp.json` / `.cursor/mcp.json` / `.vscode/mcp.json`** and your home's **`~/.claude.json` / `~/.codex/config.toml` / `~/.gemini/settings.json` / `~/.cursor/mcp.json`**, and every row says which file it came from and which agent it reaches
+- **The values of `env` and `headers` are never displayed** — they never even enter the struct (what you do not hold cannot leak). You see **key names and whether they are set**, nothing more, and URLs are drawn with their query string and userinfo stripped. "No value is on screen" is pinned by a test on the single function that builds the displayed strings
+- Enabling / disabling edits the `disabled` key **surgically in the raw text**, so key order and comments survive (the result is re-parsed to confirm). **TOML is read-only** here, because there is no format-preserving writer for it
+- Broken JSON does not crash anything: the reason it could not be read becomes the row's state (never swallowed). Scanning happens **only when you open the panel** — `~/.claude.json` runs to 100 KB, and reading that every frame is out of the question
+
+### 🧩 Skills / slash command manager — the "I forgot where I put it" problem
+The palette's **"🧩 Manage skills / commands"**. `.claude/skills/<name>/SKILL.md` (a described prompt the agent loads when it becomes relevant) and `.claude/commands/<name>.md` (a prompt `/<name>` expands to) are folded into one table spanning **all three tiers: project, user and plugin**.
+
+- The YAML front matter's `description` is read by **a pure function of our own** (no new dependency). An unterminated `---`, a colon inside a value, an empty file, a huge one — none of it panics; it all falls back to "there was no front matter"
+- **This panel writes to no file at all** (read-only). Claude Code has no enabled/disabled concept for these, so neither do we
+- A skill offers **copy path**, not "send". Plugin-provided skills are addressed as `plugin:name` and some are loaded by description match, so there is no keystroke that reliably invokes one — firing a guessed `/name` would just fail silently. Slash commands *are* invoked as `/name`, so those are handed over as commands
+- Scanning happens only when you open it (a plugin tree runs to hundreds of directories)
+
+### 🔁 Automatic account failover on rate limits (off by default)
+So an unattended overnight run does not stop dead the moment one quota runs out. **Disabled by default** and only ever active when you turn it on — moving to another account is also moving where the bill lands. Enable it from the command palette.
+
+- **What convinced it there is a rate limit is always on screen.** The ladder is climbed down in order: **structured protocol > vendor-provided hook > vendor state file > screen scrape**. When the bottom rung (the screen) is the only evidence, it is **labelled an estimate** and will not switch until a corroboration pass — word-sequence match, repeated match, and **the raw output genuinely not advancing** — agrees (design principle 4)
+- The state machine is five stages — `detect → pick a candidate → switch → resume → verify` — and the UI shows **which stage it is on**
+- **The current session is never killed.** A new session is launched under the new profile, that is all (there is no path here that fires a kill at an exited session)
+- Four independent brakes stop it retrying forever: a per-session switch cap, a per-candidate attempt cap, exponential backoff, and **a preset already tried in this chain is never chosen again**
 
 ### 📋 Fleet board — eight lanes, everyone's "right now"
 **⌘⇧K** (the "フリート看板" menu item, or the "📋 看板" tab at the top). Every running agent becomes a card, sorted into the lane matching its state, under KPI tiles for running / working / needs-you / done. It is a **full-window centre view**, on par with the Cockpit and the deck.
@@ -328,6 +378,20 @@ zai firewall allow                 # allow 📱 inbound (TCP 8899-8919, admin)
 zai firewall revoke                # remove the inbound rule
 ```
 
+**Headless paths that work with no editor running.** CI, cron, or another agent can drive worktrees and sessions without bringing up a GUI.
+
+```bash
+zai worktree create <branch> [--from <base>]  # create under .claude/worktrees/, print the absolute path
+zai worktree list [--json]                    # branch → HEAD → state → path
+zai worktree remove <branch> [--force]        # remove the worktree (the branch itself stays)
+zai session list [--json]                     # id / state / agent / last update / working folder
+zai session send <id> <text>                  # send to a running session (an exited one errors, changes nothing)
+zai session log <id> [--tail N]               # the last N lines of raw log (default 50)
+zai agent list [--json]                       # name / installed? / launch command / resolved path
+```
+
+**Every one of them takes `--json`**, and the exit codes are the same across all subcommands — **0 = success, 1 = runtime error, 2 = bad arguments**. A shell can tell "I typed it wrong" apart from "it ran and failed", so scripts do not have to swallow either (that mapping is pinned by a test that spans the subcommands). `zai agent list` walks `PATH` itself, so it answers the same way on machines without `which` (and consults `PATHEXT` on Windows).
+
 Bare `zai` and `zai .` still launch the GUI, exactly as before. **Launched with no folder argument, Zaivern reopens the folder you had last time** — it walks the most-recently-used list in `~/.zaivern/menu_state.toml` and takes the first entry that still exists on disk. Want the current directory every time? Pass `zai --no-restore`, or set `ZAIVERN_NO_RESTORE=1`.
 
 **Detecting a running instance.** With no arguments, `zai status` / `zai status --json` reads the registry at `~/.zaivern/instances/<pid>.json` and **lists the Zaivern Code instances running right now**. Exit code is **0** when at least one is alive and **1** when none is, so a shell can branch on it directly: `zai status >/dev/null || zai .`. Liveness is checked per OS (Linux `/proc`, macOS `kill(pid, 0)`, Windows `tasklist`) and **matched against a start-time signature so a recycled PID never counts as alive**. `zai status "..."` with a string is unchanged — that still writes to the status bar.
@@ -335,7 +399,9 @@ Bare `zai` and `zai .` still launch the GUI, exactly as before. **Launched with 
 ### 🔤 Language servers (LSP)
 If `rust-analyzer` / `typescript-language-server` / `pyright-langserver` / `gopls` is on your PATH it starts automatically and shows diagnostics (errors/warnings). The line-number gutter turns red/yellow, and the status bar shows `⛔count ⚠count`. Editing works normally even without any server installed.
 
-Diagnostics are not all of it — **the usual VS Code keys are wired up**: **⌃Space** completion, hover for types and docs, **⇧F12** find references, **⇧⌘O** go to symbol, **F2** rename (edits spanning several files are applied together), **⇧⌥F** format document. Turn on "🛠 Format on save" in the toolbar and every save formats first (off by default). When a server doesn't implement a capability, it says "this server doesn't support …" rather than silently doing nothing.
+Diagnostics are not all of it — **the usual VS Code keys are wired up**: **⌘I** completion, hover for types and docs, **⇧F12** find references, **⇧⌘O** go to symbol, **F2** rename (edits spanning several files are applied together), **⇧⌥F** format document, **⌘.** quick fix (code actions), **⇧⌘Space** signature help. **The symbol under the cursor is faintly highlighted wherever else it appears** (documentHighlight — turn it off from the palette), and **a selection can be formatted on its own** (rangeFormatting). Turn on "🛠 Format on save" in the toolbar and every save formats first (off by default). When a server doesn't implement a capability, it says "this server doesn't support …" rather than silently doing nothing.
+
+> **Completion moved from `⌃Space` to `⌘I`.** macOS reserves `⌃Space` for "previous input source", so **it never reaches the app**. Rather than ship a default that shows up in the UI and can never fire, the default is now `⌘I` — VS Code's own second binding on the Mac. `⌃Space` still works wherever it does reach the app.
 
 Setup examples: `rustup component add rust-analyzer` / `npm i -g typescript-language-server typescript` / `npm i -g pyright` / `go install golang.org/x/tools/gopls@latest`
 
@@ -364,7 +430,18 @@ Open several folders at once. List them as arguments — `zai frontend backend s
 ### 🐙 GitHub integration
 List pull requests and issues, read a PR's diff, and switch branches — all through the `gh` command. **No extra auth setup**: if you've run `gh auth login`, it already works. On a machine without `gh`, the panel is disabled cleanly rather than erroring at you.
 
-A PR diff opens as a read-only tab rendered in the inline diff view, with added and removed lines colour-coded.
+A PR diff opens as a read-only tab rendered in the **side-by-side diff view**, same as VS Code. See the next section.
+
+### ⇋ Diff view (VS Code parity)
+PR diff tabs, race diff tabs and Git's "review changes" pane all go through **the same renderer**, so a diff reads the same wherever you find it.
+
+- **Side-by-side by default.** Before on the left, after on the right, with matching lines always at the same height (a line that exists on only one side gets an empty placeholder opposite it). Both columns are painted as one row, so **the two sides cannot drift out of sync** — and no repaint is needed to keep them together
+- **Falls back to one column when narrow.** Below ~240px (≒ 32 columns) of code per side it degrades to inline automatically, so it never gets cut off in a sidebar or a shrunken window. Toggle it from the **⇋ / ≡** button in the diff toolbar, the "toggle diff view" command in the palette, or `diff_view = "side_by_side" | "inline"` in `config.toml`
+- **Word-level highlighting.** A replaced line tints only the part that actually changed — `count` → `counter` highlights just the added `er`. Splitting happens at **grapheme-cluster** boundaries, so Japanese (no spaces) and emoji (ZWJ families, skin-tone modifiers, flags) never break. Pathologically long lines fall back to tinting the whole line rather than stalling the UI
+- **F7 / ⇧F7 jump to the next / previous change**, wrapping around at the end. With nothing to jump to it stays put and just says "no changes"
+- **Unchanged lines collapse.** Long runs of context keep 3 lines on each side and fold the middle into "⋯ N lines", click to expand
+- **Syntax highlighting inside the diff.** The language comes from the file name, and colours are cached per file (recomputed only when the diff content changes). Huge diffs skip highlighting and render plain
+- The `+N` / `-M` badges in the file header are **omitted when zero** (no `+0 -0` on a rename-only file)
 
 **⚡ Start on an issue in one click.** Pick an agent from an issue's "⚡ 着手" (start) menu and Zaivern will (1) create a dedicated git worktree next to the repo (branch `wt/issue-N`, same convention as the worktrees plugin), (2) add it to the workspace, (3) launch the agent with that directory as its working dir, and (4) drop a kick-off instruction into its input field once the session has settled. **You still press Enter** — so you can edit the instruction before it runs.
 
@@ -440,6 +517,11 @@ On restart, the previous tabs, active tab, and panel state are restored automati
 - **What you can do**: view/edit/save open files, switch tabs, search & open workspace files, view agent terminals, send instructions, approve (Enter / Esc / ^C / ↑ / ↓ / Tab / ⇧Tab / 1 / 2 / 3 / y buttons), and run commands (save, new file, Cockpit, font ±, approval-mode switch, and more)
 - **How it works**: a tiny built-in HTTP server (port 8899, auto-fallback to 8900–8919 if busy). Pure `std::net` — zero extra crates
 - **Security**: authenticated with a random token generated per launch (embedded in the QR URL). Tokenless API access gets a 401. LAN only
+- **🔐 Reach it without sharing a Wi-Fi — SSH reverse tunnel**: LAN mode assumes you are on the same Wi-Fi, so it does not reach you away from home. 📱 → "Remote connection (SSH)" relays through **a host you can already SSH into** (a VPS, a home server, the office jump box). The path is `phone ──HTTP──▶ jump box:8899 ──SSH tunnel──▶ PC:127.0.0.1:8899`, so **the phone needs no SSH client at all** — it just opens a URL
+  - **While the tunnel is up, the server binds to `127.0.0.1` only.** The cleartext LAN listener is closed before the tunnel opens, so you never end up with an encrypted path and a raw one sitting next to it
+  - **No password is entered and none is stored.** Authentication is left entirely to the OS's `ssh`, invoked with `BatchMode=yes`: with no key (ssh-agent / `~/.ssh/config`) it **fails immediately with a reason** rather than hanging on a prompt
+  - **The app does not choose the bind address on the jump box.** No bind address is written into `-R`, so OpenSSH's default applies (the jump box's loopback only). Whether that gets exposed to the internet is your call, made in the jump box's `sshd_config` via `GatewayPorts`
+  - Raw stderr never reaches the screen; it is folded into the point — "no OpenSSH client found", "key authentication was refused", "this host wants an interactive password" — first. Monitoring runs only while connected, so idle cost does not move
 - **Windows inbound rule**: Windows blocks inbound by default, so without a rule the phone cannot connect. The 📱 panel checks this itself and offers "🛡 Allow inbound (administrator)" when it is missing. The rule it creates is scoped to **this `zai.exe` + TCP 8899-8919**, with the Domain/Private profiles — plus **Public only when the network you are on is classified as Public** (home Wi-Fi is often classified that way, and leaving Public out would not fix anything). That fact is stated in the panel, so don't use 📱 on public Wi-Fi. Any **block rule** for the executable (created if you once hit "Cancel" on the Windows prompt) **is removed when allowing**, since Windows lets block win over allow. Revoke from the panel or with `zai firewall revoke`. The installer creates the rule on the spot when it is running elevated, and otherwise only prints guidance (it never elevates on its own)
 
 ---
@@ -506,6 +588,15 @@ The split isn't about Linux disliking PTYs. On GitHub's hosted Linux runner (2 c
 
 > This section used to tell you to run `cargo test -- --skip terminal::` on Linux. **That advice is obsolete.**
 
+**Formatting and lints are gated in CI too.**
+
+```bash
+cargo fmt --all --check   # if it fails, run `cargo fmt --all` and commit
+cargo clippy --all-targets --locked -- -D warnings   # plus the frozen -A list (same as CI)
+```
+
+`fmt` runs before clippy because its failure has the most obvious fix. Clippy denies **every rustc warning and every clippy lint** with `-D warnings`, then **freezes exactly 26 pre-existing debts** with individual `-A` flags. So **rustc warnings are at zero**, and clippy **fails on any new kind of finding** — a ratchet where the frozen 26 can shrink but never grow. (This is not "clippy is perfectly clean"; the frozen debts are still there.)
+
 ---
 
 ## Keybindings
@@ -525,7 +616,10 @@ The split isn't about Linux disliking PTYs. On GitHub's hosted Linux runner (2 c
 | ⌘⇧D / ⌘D | Duplicate line / Select next occurrence, add caret |
 | ⌥⌘[ / ⌥⌘] / ⌥⌘B | Toggle fold / Unfold all / Toggle bookmark |
 | ⇧⌘T / ⌘⇧V / ⇧⌘H | Reopen closed tab / Markdown・HTML preview / Replace across workspace |
-| ⌃Space / ⇧F12 / ⇧⌘O | LSP: completion / find references / go to symbol |
+| ⌘\ / ⌥⌘\ / ⌘1–⌘3 | **Split the editor right / down / focus the nth pane** |
+| F7 / ⇧F7 | Diff view: jump to next / previous change (wraps around) |
+| ⌘I (⌃Space also works) / ⇧F12 / ⇧⌘O | LSP: completion / find references / go to symbol |
+| ⌘. / ⇧⌘Space | LSP: quick fix (code action) / signature help |
 | F2 / ⇧⌥F | LSP: rename / format document |
 | ⌥↑ / ⌥↓ | Move line up / down |
 | PageUp / PageDown | Cursor + scroll by one screen |
@@ -572,7 +666,9 @@ Pasting onto an existing name auto-renames the VS Code way: `file copy.ts` → `
 
 On Windows / Linux, read ⌘ as Ctrl. Inside the terminal, control keys like Ctrl+C, arrows, Tab, and Esc go straight to the PTY (Shift/Option+Enter is sent as a newline, supporting Claude Code's multi-line input).
 
-Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
+Every shortcut can be overridden in `config.toml` under `[keybindings]` (`save = "cmd+s"` format). Action names: `save` `save_as` `save_all` `close_tab` `new_file` `new_window` `open_file` `palette_files` `palette_commands` `toggle_terminal` `new_terminal` `toggle_sidebar` `find` `global_search` `global_replace` `open_replace` `goto_line` `next_tab` `prev_tab` `nav_back` `nav_forward` `goto_definition` `goto_bracket` `toggle_cockpit` `toggle_kanban` `toggle_deck` `toggle_md_preview` `toggle_problems` `toggle_fullscreen` `run_build_task` `new_agent` `font_inc` `font_dec` `toggle_comment` `duplicate_line` `move_line_up` `move_line_down` `focus_explorer` `toggle_fold` `unfold_all` `toggle_bookmark` `reopen_closed_tab` `lsp_completion` `lsp_references` `lsp_symbols` `lsp_rename` `lsp_format` `lsp_code_action` `lsp_signature_help` `select_next_occurrence` `split_editor_right` `split_editor_down` `focus_pane_1` `focus_pane_2` `focus_pane_3` `diff_next_change` `diff_prev_change`. Modifiers: `cmd` `ctrl` `shift` `alt` (= `option`). File-tree keys are fixed to the VS Code defaults.
+
+**The keystrokes printed on screen are generated from this table.** Every "⌘S" in a menu, a context menu, the palette or a tooltip is looked up rather than hand-written, so rebinding an action in `[keybindings]` **changes the label too** — the UI can never claim a shortcut you no longer have. Each action is also pinned by a test that it reaches a place which actually consumes it, so **a shortcut that shows up but does nothing fails CI**. The set of keystrokes macOS holds onto (⌘Space, ⌃Space, ⌥⌘D and friends) was read off the OS rather than guessed, and the same test proves no default binding lands on one. The egui-winit 0.29 bug where **⌘⇧C / ⌘⇧V have their key-press event swallowed and replaced by Copy / Paste** is routed around by reconstructing the original keystroke from the substituted event (the Cockpit's ⌘⇧C goes through that path).
 
 ---
 
@@ -592,6 +688,17 @@ show_hidden_files = true
 # (also toggleable from the View menu and the command palette)
 # word_wrap = false
 # show_whitespace = false
+
+# Minimap (zoomed-out view on the right edge) and breadcrumbs (path bar on top)
+# (also toggleable from the View menu and the command palette)
+# The minimap costs 64px of body width, hence off by default; it hides itself
+# automatically on narrow windows
+# minimap = false
+# breadcrumbs = true
+
+# Show git blame (author · relative date) in the gutter. Off by default.
+# While on, only the visible range is blamed, asynchronously
+# git_blame = false
 
 # When you reopen a folder, restore the previous agent tabs and pick the
 # conversation back up (previous scrollback is replayed, then claude is
@@ -704,6 +811,11 @@ src/
 ├── config.rs        ~/.zaivern/config.toml loading, generation, project overrides
 ├── editor.rs        Buffer & tab management
 ├── editor_ops.rs    Pure text-editing operations (multibyte-safe)
+├── editor_split.rs  Editor splits (reuses the terminal's split tree, shared buffers, pure layout)
+├── minimap.rs       Minimap (zoomed-out view, click/drag scroll, hit/diagnostic/bookmark marks)
+├── breadcrumb.rs    Breadcrumbs (path part needs no LSP; middle elided when it does not fit)
+├── preview.rs       Hex viewer / video-audio info cards / ZIP listing + magic-number sniffing
+├── tasks.rs         `.vscode/tasks.json` (JSONC) reading — pure functions throughout
 ├── highlight.rs     syntect → egui LayoutJob conversion (hash-cached)
 ├── snippets.rs      VS Code-compatible snippet parsing & Tab expansion + Emmet
 ├── file_tree.rs     Lazy-loading file tree (multi-root) + context menu
@@ -713,7 +825,7 @@ src/
 ├── git.rs           git CLI integration (repo detection, branch, per-line diff marks)
 ├── git_panel.rs     Git side panel (list and switch branches / worktrees)
 ├── github.rs        GitHub integration (via gh CLI — PR/Issue/diffs, async)
-├── diff.rs          Unified diff parser + inline diff view
+├── diff.rs          Unified diff parser + diff view (side-by-side/inline, word-level)
 ├── ide.rs           Hand-off to external IDEs (open at the current line)
 ├── panels.rs        Rendering for the GitHub panel, PR diff tabs, IDE integration
 ├── kanban.rs        Fleet board (8 state lanes, card actions, live terminal pane)
@@ -734,7 +846,11 @@ src/
 ├── terminal.rs      PTY sessions + vt100 rendering + approval-prompt detection/auto-reply
 ├── shellenv.rs      PATH resolution for child processes + OS-independent `which`
 ├── agents.rs        Session management (launch/restart/destroy/broadcast/permission modes)
+├── mcp.rs           MCP server config discovery/parse/enable-disable (env values never held)
+├── skills.rs        Skills / slash command discovery and parsing (read-only, three tiers)
+├── failover.rs      Account failover on rate limits (off by default, evidence rung shown)
 ├── remote.rs        Phone remote (built-in HTTP server, QR code, token auth)
+├── tunnel.rs        SSH reverse tunnel (works off-LAN; binds loopback only while active)
 ├── firewall.rs      Windows inbound rule (what 📱 needs: check / allow / revoke)
 ├── voice.rs         Voice input (records until stopped, inserts without sending, auto-picks mac/Windows/browser)
 ├── session.rs       Per-workspace session restore
@@ -762,7 +878,7 @@ src/
 - [x] Pet upgrades (4 looks, custom images, sizes, sleep/walk, sounds, approve/deny from the bubble)
 - [x] Voice input (🎤/⏹ only, records until stopped, inserts into the input box for a manual Enter, configurable destination/language/engine)
 - [x] Cross-platform voice input (built-in on macOS; Windows' own recognizer when one is installed; a browser page on Linux and on Windows without one; keyboard dictation guidance on phones)
-- [x] Inline diff view (unified diff parsing and colour-coded rendering)
+- [x] Diff view at VS Code parity (side-by-side ⇔ inline, word-level highlighting, F7 change jumps, context folding, syntax colours)
 - [x] Multi-folder workspace (open several folders at once)
 - [x] GitHub integration (PR / Issue lists, PR diff viewing, branch operations)
 - [x] Agent catalog (29 CLI agents configured automatically per permission mode)
@@ -805,8 +921,20 @@ src/
 - [x] Branch switching from the toolbar (refuses with a reason on in-progress operations, branches held by another worktree, or uncommitted changes — never uses `git stash`)
 - [x] Repository-wide session list (folds by branch across worktrees)
 - [x] Command palette reorganized (8 groups, best-match ordering, recents)
+- [x] Split editor (right / down / nested, shared buffers, per-pane view state, layout restored across restarts)
+- [x] Every file opens (hex viewer, video/audio info cards, ZIP/JAR/WHL listing, 40+ magic-number formats)
+- [x] Minimap (search-hit / diagnostic / bookmark marks) and breadcrumbs (path part without an LSP, middle elided)
+- [x] The rest of LSP (quick fix ⌘., signature help ⇧⌘Space, document highlight, format selection)
+- [x] Git blame (visible range only, fetched async; click for that commit's diff) and drag-to-reorder tabs
+- [x] `.vscode/tasks.json` support (JSONC; a task with an unsupported variable is greyed out with the reason, not dropped)
+- [x] MCP server manager (six config files in one table, `env` values never displayed)
+- [x] Skills / slash command manager (project / user / plugin tiers)
+- [x] Account failover on rate limits (off by default, evidence rung and "estimate" spelled out)
+- [x] SSH reverse tunnel (phone works off-LAN; binds 127.0.0.1 only while active)
+- [x] Headless `zai` (`worktree` / `session` / `agent`, `--json`, exit codes 0/1/2)
+- [x] Keybinding reachability pinned by tests + on-screen shortcut labels generated from the keybinding table
+- [x] `cargo fmt --all --check` and a clippy ratchet in CI (existing debt frozen, new debt blocked)
 - [ ] Plugin grammars (TextMate) & registry sharing
-- [ ] Split editor
 
 ## License
 Apache License 2.0 — see [LICENSE](LICENSE) for details.

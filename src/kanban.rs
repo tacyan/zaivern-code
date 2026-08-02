@@ -473,10 +473,7 @@ impl Read {
         let src = tr(self.source.label());
         let d = self.detail.trim();
         let base = if d.is_empty() {
-            trf(
-                "{act} — 出どころ: {src}",
-                &[("act", act), ("src", src)],
-            )
+            trf("{act} — 出どころ: {src}", &[("act", act), ("src", src)])
         } else {
             trf(
                 "{act} — 出どころ: {src} / {detail}",
@@ -647,7 +644,9 @@ pub fn contains_word(hay: &str, needle: &str) -> bool {
 
 /// トークンがファイルパスらしいか。拡張子の一覧は持たない (OS 非依存)。
 pub fn looks_like_path(tok: &str) -> bool {
-    let t = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.' && c != '_' && c != '-');
+    let t = tok.trim_matches(|c: char| {
+        !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.' && c != '_' && c != '-'
+    });
     if t.len() < 3 || t.contains(char::is_whitespace) {
         return false;
     }
@@ -1123,7 +1122,6 @@ impl MainRects {
             feed: None,
         }
     }
-
 }
 
 #[cfg(test)]
@@ -1373,7 +1371,11 @@ pub fn show_kpi(avail_w: f32, avail_h: f32) -> bool {
 /// - ID がまだ居れば、その ID と現在位置を返す
 /// - 居なくなったら、消える前に居た位置 (`last_pos`) の近くへ寄せる
 /// - カードが 1 枚も無ければ None
-pub fn resolve_selection(sel: Option<u64>, last_pos: usize, cards: &[Card]) -> Option<(u64, usize)> {
+pub fn resolve_selection(
+    sel: Option<u64>,
+    last_pos: usize,
+    cards: &[Card],
+) -> Option<(u64, usize)> {
     if cards.is_empty() {
         return None;
     }
@@ -1401,7 +1403,6 @@ pub fn move_selection(order: &[u64], cur: Option<u64>, delta: i32) -> Option<u64
     };
     Some(order[next as usize])
 }
-
 
 // ---------------------------------------------------------------------------
 // カード / 集計 / アクティビティ / UI 状態 / アクション
@@ -1639,7 +1640,6 @@ impl Track {
         Flow::Unknown
     }
 
-
     /// 現在のアクティビティが続いている時間 (ms)。
     pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
         now_ms.saturating_sub(self.since_ms)
@@ -1732,7 +1732,10 @@ impl KanbanState {
     pub fn record_sample(&mut self, now_ms: u64, t: Tally) {
         match self.samples.last_mut() {
             Some(last) if now_ms.saturating_sub(last.at_ms) < SAMPLE_MS => last.tally = t,
-            _ => self.samples.push(Sample { at_ms: now_ms, tally: t }),
+            _ => self.samples.push(Sample {
+                at_ms: now_ms,
+                tally: t,
+            }),
         }
         if self.samples.len() > MAX_SAMPLES {
             let drop = self.samples.len() - MAX_SAMPLES;
@@ -1874,7 +1877,8 @@ impl KanbanState {
             self.scroll_to_sel = true;
         }
         // 消えたセッションの追跡は捨てる (無限に太らせない)
-        self.tracks.retain(|id, _| cards.iter().any(|c| c.id == *id));
+        self.tracks
+            .retain(|id, _| cards.iter().any(|c| c.id == *id));
         self.busy = busy;
         self.animating = animating;
         self.any_running = any_running;
@@ -1937,7 +1941,10 @@ pub enum KanbanAction {
     Remove(usize),
     CyclePermission(usize),
     /// このセッションへ指示を 1 行送信 (Enter 付き)
-    Send { idx: usize, text: String },
+    Send {
+        idx: usize,
+        text: String,
+    },
     Broadcast(String),
     OpenCockpit,
     Close,
@@ -2148,7 +2155,14 @@ pub fn ui(
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(br), |ui| {
                     if vertical {
                         board_vertical_ui(
-                            st, ui, theme, cards, &lanes, br.height(), now_ms, &mut acts,
+                            st,
+                            ui,
+                            theme,
+                            cards,
+                            &lanes,
+                            br.height(),
+                            now_ms,
+                            &mut acts,
                         );
                     } else {
                         board_ui(st, ui, theme, cards, &lanes, br.height(), now_ms, &mut acts);
@@ -2228,9 +2242,7 @@ fn keyboard_ui(
         return; // ブロードキャスト欄・指示欄などを打っている
     }
     // 端末にフォーカスが無くても Esc で全画面から出られる (出口を 1 つに限らない)。
-    if st.live_full
-        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-    {
+    if st.live_full && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
         st.set_live_full(false);
         return;
     }
@@ -2262,7 +2274,13 @@ fn keyboard_ui(
 }
 
 /// 看板とライブペインの間のドラッグバー。
-fn splitter_ui(st: &mut KanbanState, ui: &mut egui::Ui, theme: &Theme, horizontal: bool, span: f32) {
+fn splitter_ui(
+    st: &mut KanbanState,
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    horizontal: bool,
+    span: f32,
+) {
     let size = if horizontal {
         egui::vec2(4.0, ui.available_height())
     } else {
@@ -2342,38 +2360,40 @@ fn live_pane_ui(
                         // ヘッダーのボタンはラベル文字列から Id を作るので、
                         // カード側の同じ絵文字と衝突しないよう囲っておく。
                         ui.push_id("kanban-live-header", |ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text(tr("ライブ表示を閉じる"))
-                                .clicked()
-                            {
-                                st.live_open = false;
-                            }
-                            // 全画面トグル。豆腐にならない字だけを使う
-                            // (⊞ / ◎ は app.rs の記号テストが担保している)。
-                            let full = st.live_full;
-                            let (icon, tip) = if full {
-                                ("◎", "全画面をやめて看板へ戻す (Esc)")
-                            } else {
-                                ("⊞", "この端末を全画面にする (レーンは隠れます)")
-                            };
-                            if ui
-                                .selectable_label(full, icon)
-                                .on_hover_text(tr(tip))
-                                .clicked()
-                            {
-                                // 選択もスクロールも触らない — 見せ方だけを変える。
-                                st.set_live_full(!full);
-                            }
-                            if ui
-                                .small_button("🔍")
-                                .on_hover_text(tr("下部パネルにフォーカス"))
-                                .clicked()
-                            {
-                                acts.push(KanbanAction::Focus(i));
-                            }
-                            ui.label(
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("✕")
+                                        .on_hover_text(tr("ライブ表示を閉じる"))
+                                        .clicked()
+                                    {
+                                        st.live_open = false;
+                                    }
+                                    // 全画面トグル。豆腐にならない字だけを使う
+                                    // (⊞ / ◎ は app.rs の記号テストが担保している)。
+                                    let full = st.live_full;
+                                    let (icon, tip) = if full {
+                                        ("◎", "全画面をやめて看板へ戻す (Esc)")
+                                    } else {
+                                        ("⊞", "この端末を全画面にする (レーンは隠れます)")
+                                    };
+                                    if ui
+                                        .selectable_label(full, icon)
+                                        .on_hover_text(tr(tip))
+                                        .clicked()
+                                    {
+                                        // 選択もスクロールも触らない — 見せ方だけを変える。
+                                        st.set_live_full(!full);
+                                    }
+                                    if ui
+                                        .small_button("🔍")
+                                        .on_hover_text(tr("下部パネルにフォーカス"))
+                                        .clicked()
+                                    {
+                                        acts.push(KanbanAction::Focus(i));
+                                    }
+                                    ui.label(
                                 RichText::new(if st.live_full {
                                     tr("Esc: 全画面をやめる / ◎ でも戻せます")
                                 } else {
@@ -2382,7 +2402,8 @@ fn live_pane_ui(
                                 .size(9.5)
                                 .color(theme.text_dim),
                             );
-                        });
+                                },
+                            );
                         });
                     });
                     ui.add_space(4.0);
@@ -2584,7 +2605,9 @@ fn header_ui(
                 .as_ref()
                 .is_some_and(|i| i.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if (send.clicked() || enter) && !st.broadcast_input.trim().is_empty() {
-                acts.push(KanbanAction::Broadcast(st.broadcast_input.trim().to_string()));
+                acts.push(KanbanAction::Broadcast(
+                    st.broadcast_input.trim().to_string(),
+                ));
                 st.broadcast_input.clear();
             }
             // Enter でフォーカスが外れるので戻し、連続入力できるようにする
@@ -2882,7 +2905,10 @@ fn rail_entry_ui(
                             ui.spacing_mut().item_spacing.y = 1.0;
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&c.title).size(12.0).strong().color(theme.text),
+                                    RichText::new(&c.title)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(theme.text),
                                 )
                                 .truncate(),
                             );
@@ -3164,8 +3190,11 @@ fn column_ui(
                         egui::vec2(ui.available_width(), if hot { 3.0 } else { 2.0 }),
                         egui::Sense::hover(),
                     );
-                    ui.painter()
-                        .rect_filled(line, 1.0_f32, color.gamma_multiply(if hot { 1.0 } else { 0.6 }));
+                    ui.painter().rect_filled(
+                        line,
+                        1.0_f32,
+                        color.gamma_multiply(if hot { 1.0 } else { 0.6 }),
+                    );
                     ui.add_space(space::XS);
 
                     egui::ScrollArea::vertical()
@@ -3184,8 +3213,10 @@ fn column_ui(
 
 /// 出力の勢いバー (直近 30 秒)。折れ線より棒の方が「呼吸している」感じが出る。
 fn pulse_bars(ui: &mut egui::Ui, height: f32, color: Color32, values: &[f32]) {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
     if values.is_empty() {
         return;
     }
@@ -3283,9 +3314,14 @@ fn card_ui(
                                 )
                                 .truncate(),
                             );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(&c.uptime).size(9.5).color(theme.text_dim));
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(&c.uptime).size(9.5).color(theme.text_dim),
+                                    );
+                                },
+                            );
                         });
 
                         // ── 2 行目: 状態チップ + 経過 + 出どころ ──
@@ -3325,11 +3361,11 @@ fn card_ui(
                                     }
                                     _ => trf("判定の出どころ: {src}", &[("src", tr(s.label()))]),
                                 };
-                                ui.label(
-                                    RichText::new(mark)
-                                        .size(9.0)
-                                        .color(if s.is_guess() { theme.warn } else { theme.text_dim }),
-                                )
+                                ui.label(RichText::new(mark).size(9.0).color(if s.is_guess() {
+                                    theme.warn
+                                } else {
+                                    theme.text_dim
+                                }))
                                 .on_hover_text(why);
                             }
                             // 見張りが疑ったが、出力が続いていたので採らなかった判定。
@@ -3364,9 +3400,7 @@ fn card_ui(
                             if !t.detail.trim().is_empty() {
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(status_line(t))
-                                            .size(10.5)
-                                            .color(theme.text),
+                                        RichText::new(status_line(t)).size(10.5).color(theme.text),
                                     )
                                     .truncate(),
                                 )
@@ -3377,7 +3411,9 @@ fn card_ui(
                         if let Some(task) = &c.task {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(format!("📋 {task}")).size(11.0).color(theme.text),
+                                    RichText::new(format!("📋 {task}"))
+                                        .size(11.0)
+                                        .color(theme.text),
                                 )
                                 .truncate(),
                             )
@@ -3431,7 +3467,10 @@ fn card_ui(
                                 ui.set_max_width(460.0);
                                 for line in tail {
                                     ui.label(
-                                        RichText::new(line).size(11.0).monospace().color(theme.text),
+                                        RichText::new(line)
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(theme.text),
                                     );
                                 }
                             });
@@ -3468,57 +3507,68 @@ fn card_ui(
                         // 使っているとどのカードを押しても最後の 1 枚が反応する
                         // (実際に「エージェントを選んでも一番最後が選ばれる」として報告された)。
                         ui.push_id(c.id, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(selected, "👁")
-                                .on_hover_text(tr("このエージェントのライブ画面を開く"))
-                                .clicked()
-                            {
-                                // 👁 は明示的な操作なので、ここは開いてよい。
-                                // 同じカードの 👁 をもう一度押したら閉じる。
-                                let same = st.selected == Some(c.id);
-                                st.selected = Some(c.id);
-                                st.live_open = !(same && st.live_open);
-                                eye_toggled = true;
-                            }
-                            if ui
-                                .small_button("🔍")
-                                .on_hover_text(tr("下部パネルにフォーカス"))
-                                .clicked()
-                            {
-                                acts.push(KanbanAction::Focus(c.idx));
-                            }
-                            let editing = st.prompt_for == Some(c.id);
-                            if ui
-                                .selectable_label(editing, "✏")
-                                .on_hover_text(tr("このエージェントへ指示を送る"))
-                                .clicked()
-                            {
-                                if editing {
-                                    st.prompt_for = None;
-                                } else {
-                                    st.prompt_for = Some(c.id);
-                                    st.prompt_input.clear();
-                                    st.prompt_focus = true;
-                                }
-                            }
-                            if c.can_cycle
-                                && ui
-                                    .small_button("🛡")
-                                    .on_hover_text(tr("権限モード切替を送信"))
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(selected, "👁")
+                                    .on_hover_text(tr("このエージェントのライブ画面を開く"))
                                     .clicked()
-                            {
-                                acts.push(KanbanAction::CyclePermission(c.idx));
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("✕").on_hover_text(tr("閉じる")).clicked() {
-                                    acts.push(KanbanAction::Remove(c.idx));
+                                {
+                                    // 👁 は明示的な操作なので、ここは開いてよい。
+                                    // 同じカードの 👁 をもう一度押したら閉じる。
+                                    let same = st.selected == Some(c.id);
+                                    st.selected = Some(c.id);
+                                    st.live_open = !(same && st.live_open);
+                                    eye_toggled = true;
                                 }
-                                if ui.small_button("⟳").on_hover_text(tr("再起動")).clicked() {
-                                    acts.push(KanbanAction::Restart(c.idx));
+                                if ui
+                                    .small_button("🔍")
+                                    .on_hover_text(tr("下部パネルにフォーカス"))
+                                    .clicked()
+                                {
+                                    acts.push(KanbanAction::Focus(c.idx));
                                 }
+                                let editing = st.prompt_for == Some(c.id);
+                                if ui
+                                    .selectable_label(editing, "✏")
+                                    .on_hover_text(tr("このエージェントへ指示を送る"))
+                                    .clicked()
+                                {
+                                    if editing {
+                                        st.prompt_for = None;
+                                    } else {
+                                        st.prompt_for = Some(c.id);
+                                        st.prompt_input.clear();
+                                        st.prompt_focus = true;
+                                    }
+                                }
+                                if c.can_cycle
+                                    && ui
+                                        .small_button("🛡")
+                                        .on_hover_text(tr("権限モード切替を送信"))
+                                        .clicked()
+                                {
+                                    acts.push(KanbanAction::CyclePermission(c.idx));
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("✕")
+                                            .on_hover_text(tr("閉じる"))
+                                            .clicked()
+                                        {
+                                            acts.push(KanbanAction::Remove(c.idx));
+                                        }
+                                        if ui
+                                            .small_button("⟳")
+                                            .on_hover_text(tr("再起動"))
+                                            .clicked()
+                                        {
+                                            acts.push(KanbanAction::Restart(c.idx));
+                                        }
+                                    },
+                                );
                             });
-                        });
                         });
 
                         if st.prompt_for == Some(c.id) {
@@ -3604,12 +3654,9 @@ fn feed_ui(
                                 .strong()
                                 .color(theme.text_dim),
                         );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                live_dot(ui, theme, now_ms);
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            live_dot(ui, theme, now_ms);
+                        });
                     });
                     ui.add_space(4.0);
                     egui::ScrollArea::vertical()
@@ -3626,9 +3673,7 @@ fn feed_ui(
                             for e in activity.iter().take(60) {
                                 ui.horizontal_top(|ui| {
                                     ui.label(
-                                        RichText::new("●")
-                                            .size(8.0)
-                                            .color(e.column.color(theme)),
+                                        RichText::new("●").size(8.0).color(e.column.color(theme)),
                                     );
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
@@ -3697,10 +3742,8 @@ fn chart_ui(ui: &mut egui::Ui, theme: &Theme, st: &KanbanState) {
                 });
             });
             ui.add_space(2.0);
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), 44.0),
-                egui::Sense::hover(),
-            );
+            let (rect, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::hover());
             let painter = ui.painter();
             let values: Vec<f32> = st
                 .samples
@@ -3721,8 +3764,7 @@ fn chart_ui(ui: &mut egui::Ui, theme: &Theme, st: &KanbanState) {
                     .iter()
                     .enumerate()
                     .map(|(i, v)| {
-                        let x = rect.left()
-                            + rect.width() * i as f32 / (values.len() - 1) as f32;
+                        let x = rect.left() + rect.width() * i as f32 / (values.len() - 1) as f32;
                         let y = rect.bottom() - (rect.height() - 3.0) * (v / max);
                         egui::pos2(x, y)
                     })
@@ -3968,23 +4010,59 @@ mod tests {
     fn classify_screen_table() {
         let cases: &[(&str, Option<Activity>, &str)] = &[
             // 編集系
-            ("⏺ Update(src/kanban.rs)", Some(Activity::Editing), "src/kanban.rs"),
+            (
+                "⏺ Update(src/kanban.rs)",
+                Some(Activity::Editing),
+                "src/kanban.rs",
+            ),
             ("Edit(src/app.rs)", Some(Activity::Editing), "src/app.rs"),
-            ("● Writing tests/mod.rs", Some(Activity::Editing), "tests/mod.rs"),
-            ("apply_patch to lib/x.py", Some(Activity::Editing), "lib/x.py"),
-            ("ファイルを編集中: src/foo.rs", Some(Activity::Editing), "src/foo.rs"),
+            (
+                "● Writing tests/mod.rs",
+                Some(Activity::Editing),
+                "tests/mod.rs",
+            ),
+            (
+                "apply_patch to lib/x.py",
+                Some(Activity::Editing),
+                "lib/x.py",
+            ),
+            (
+                "ファイルを編集中: src/foo.rs",
+                Some(Activity::Editing),
+                "src/foo.rs",
+            ),
             // パスに "tests" が入っていても「テストを回している」ではない
-            ("⏺ Update(tests/mod.rs)", Some(Activity::Editing), "tests/mod.rs"),
+            (
+                "⏺ Update(tests/mod.rs)",
+                Some(Activity::Editing),
+                "tests/mod.rs",
+            ),
             // 検証系 (実行より優先 — 人が知りたいのは「検証中」)
-            ("⏺ Bash(cargo test --lib)", Some(Activity::Verifying), "cargo test --lib"),
-            ("Compiling zaivern-code v0.4.15", Some(Activity::Verifying), ""),
+            (
+                "⏺ Bash(cargo test --lib)",
+                Some(Activity::Verifying),
+                "cargo test --lib",
+            ),
+            (
+                "Compiling zaivern-code v0.4.15",
+                Some(Activity::Verifying),
+                "",
+            ),
             ("テストを実行しています", Some(Activity::Verifying), ""),
             // 実行系
             ("⏺ Bash(git status)", Some(Activity::Running), "git status"),
-            ("Running: npm install", Some(Activity::Running), "npm install"),
+            (
+                "Running: npm install",
+                Some(Activity::Running),
+                "npm install",
+            ),
             ("コマンド実行: ls -la", Some(Activity::Running), "ls -la"),
             // 思考系
-            ("✻ Thinking… (esc to interrupt)", Some(Activity::Thinking), ""),
+            (
+                "✻ Thinking… (esc to interrupt)",
+                Some(Activity::Thinking),
+                "",
+            ),
             ("調査中です…", Some(Activity::Thinking), ""),
             ("Searching for foo", Some(Activity::Thinking), ""),
             // 当たらない / 空
@@ -4101,10 +4179,7 @@ mod tests {
         let hits = work_lines
             .iter()
             .filter(|l| {
-                crate::supervisor::is_error_line(
-                    &crate::supervisor::normalize_line(l, false),
-                    &cfg,
-                )
+                crate::supervisor::is_error_line(&crate::supervisor::normalize_line(l, false), &cfg)
             })
             .count();
         // 先頭 2 行 (パス中の error) はもう数えない。残る 3 行は
@@ -4151,7 +4226,10 @@ mod tests {
         }
         // 承認プロンプト検出は出力の有無に関係なく最優先 (段位 1)
         let r = classify_flow(true, true, false, Some(S::Errored), &tail, Flow::Live);
-        assert_eq!((r.activity, r.lane()), (Activity::Approval, Column::Approval));
+        assert_eq!(
+            (r.activity, r.lane()),
+            (Activity::Approval, Column::Approval)
+        );
     }
 
     /// スピナー / 経過秒だけが動いている画面を「進捗」と数えない。
@@ -4511,7 +4589,11 @@ mod tests {
 
         // 本当に「いま起動した」1 体だけは、これまで通り選択とスクロールで示す
         st.update_tracks(&deal(&[1, 2, 3, 4, 9]), 1_000, true);
-        assert_eq!(st.selected(), Some(9), "新しく起動した 1 体を示さなくなった");
+        assert_eq!(
+            st.selected(),
+            Some(9),
+            "新しく起動した 1 体を示さなくなった"
+        );
 
         // 一度に複数増えたとき (ワークスペース復元) はどれも奪わない
         st.update_tracks(&deal(&[1, 2, 3, 4, 9, 10, 11]), 2_000, true);
@@ -4930,9 +5012,7 @@ mod tests {
                     .resizable(true)
                     .default_height(300.0)
                     .min_height(140.0)
-                    .frame(
-                        egui::Frame::none().inner_margin(egui::Margin::same(6.0)),
-                    )
+                    .frame(egui::Frame::none().inner_margin(egui::Margin::same(6.0)))
                     .show_animated(ctx, true, |ui| {
                         panel_h = ui.max_rect().height();
                         panel_top = ui.max_rect().top() - 6.0;
@@ -4950,9 +5030,7 @@ mod tests {
                         });
                         ui.add_space(4.0);
                         let mut live = |_: &mut egui::Ui, _: usize| None;
-                        let _ = super::ui(
-                            st, ui, theme, cards, &[], &[], now_ms, true, &mut live,
-                        );
+                        let _ = super::ui(st, ui, theme, cards, &[], &[], now_ms, true, &mut live);
                     });
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // エディタ/ターミナル相当: 全域が click_and_drag を持つ
@@ -4969,7 +5047,10 @@ mod tests {
         fn drag_bar(&mut self, from_y: f32, to_y: f32, cards: &[Card]) -> Vec<f32> {
             let mut tops = Vec::new();
             let x = 800.0;
-            self.frame(vec![egui::Event::PointerMoved(egui::pos2(x, from_y))], cards);
+            self.frame(
+                vec![egui::Event::PointerMoved(egui::pos2(x, from_y))],
+                cards,
+            );
             self.frame(
                 vec![egui::Event::PointerButton {
                     pos: egui::pos2(x, from_y),
@@ -5189,7 +5270,10 @@ mod tests {
         assert!(!h.st.live_full, "Esc で全画面から降りられない");
         assert_eq!(h.st.selected, before, "全画面を出たら選択が変わった");
         assert!(!h.st.scroll_to_sel, "全画面を出ただけでスクロールが動く");
-        assert!(h.st.live_open, "全画面をやめただけで端末まで閉じてはいけない");
+        assert!(
+            h.st.live_open,
+            "全画面をやめただけで端末まで閉じてはいけない"
+        );
         h.frame(none.clone(), &cards);
         let saved: Option<bool> = h.ctx.data_mut(|d| d.get_persisted(live_full_id()));
         assert_eq!(saved, Some(false));
@@ -5459,7 +5543,10 @@ mod geometry_tests {
                         "area={area:?}: レーン {i} が縦に溢れた"
                     );
                     for j in (i + 1)..rects.len() {
-                        assert!(!overlaps(rects[i], rects[j]), "レーン {i} と {j} が重なった");
+                        assert!(
+                            !overlaps(rects[i], rects[j]),
+                            "レーン {i} と {j} が重なった"
+                        );
                     }
                 }
                 // 中身のあるレーンが下限に張り付いていなければ、右端も板の中

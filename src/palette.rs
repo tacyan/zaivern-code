@@ -34,10 +34,29 @@ pub enum Cmd {
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替
     ToggleMdPreview,
     ToggleSidebar,
+    // ── エディタの分割 (split editor / VS Code の editor group 相当) ──
+    /// アクティブなエディタペインを左右に分割する (分割先は同じファイルを開く)
+    SplitEditorRight,
+    /// アクティブなエディタペインを上下に分割する
+    SplitEditorDown,
+    /// 分割を解除して 1 枚に戻す (他ペインのタブは吸収される)
+    UnsplitEditor,
+    /// 次のエディタペインへフォーカスを移す (巡回)
+    FocusNextPane,
+    /// n 番目 (1 始まり) のエディタペインへフォーカスを移す
+    FocusEditorPane(usize),
+    /// アクティブなタブを次のペインへ移す (1 枚のときは右へ分割して移す)
+    MoveTabToNextPane,
     /// エディタ本文の折り返しを切り替える (config へ永続化)
     ToggleWordWrap,
     /// 空白文字 (スペース「·」/ タブ「→」) の可視化を切り替える (config へ永続化)
     ToggleShowWhitespace,
+    /// エディタ右端のミニマップ (遠景ビュー) を切り替える (config へ永続化)
+    ToggleMinimap,
+    /// エディタ上部のブレッドクラム (パンくず) を切り替える (config へ永続化)
+    ToggleBreadcrumbs,
+    /// ガターの git blame (著者 · 相対日時) 表示を切り替える (config へ永続化)
+    ToggleGitBlame,
     /// サイドバーを Git タブで開く
     OpenGitPanel,
     OpenFind,
@@ -78,6 +97,9 @@ pub enum Cmd {
     TogglePetAutoYes,
     /// スマホリモートの QR コードウィンドウ表示切替
     ToggleRemote,
+    /// 同じ画面を「SSH リモート接続」の用事で開く (トグルではなく必ず開く)。
+    /// 外出先のスマホから繋ぐときの入口。
+    OpenSshRemote,
     /// 音声入力の録音を開始/停止する。認識テキストは届け先の入力欄へ
     /// 挿入されるだけで、Enter は送られない
     VoiceInput(crate::voice::Target),
@@ -169,6 +191,8 @@ pub enum Cmd {
     RunActiveFile,
     /// ビルドタスク (cargo build / npm run build / make) を実行 (VS Code: ⇧⌘B)
     RunBuildTask,
+    /// `.vscode/tasks.json` の n 番目のタスクを実行 (index は走査キャッシュ順)
+    RunJsonTask(usize),
     /// 選択テキストをアクティブなターミナルの入力欄へ送る (Enter は送らない)
     RunSelection,
     /// 新しいターミナル (Shell プリセット) を開く (VS Code: ⌃⇧`)
@@ -177,6 +201,8 @@ pub enum Cmd {
     ShowShortcuts,
     /// バージョン情報ダイアログ
     ShowAbout,
+    /// ライセンスキーの入力・状態表示ダイアログ (オフライン検証・通信ゼロ)
+    OpenLicense,
     // ── 横断検索のオプション (サイドバーの検索タブと同じ状態を切り替える) ──
     /// 大文字小文字を区別する
     ToggleSearchCase,
@@ -190,6 +216,9 @@ pub enum Cmd {
     ShowSessions,
     /// プラン使用量・枯渇予測のウィンドウを開く
     ShowQuota,
+    /// レート制限時のアカウント自動フェイルオーバーを有効化 / 無効化する (切替)。
+    /// 状態と履歴は 📊 プラン使用量ウィンドウに出る。
+    ToggleFailover,
     /// 保存時に行末の空白を落とす (切替)
     ToggleTrimTrailingOnSave,
     /// 保存時に最終行へ改行を入れる (切替)
@@ -203,6 +232,12 @@ pub enum Cmd {
     /// レビューの比較ベースを変える。値は "head" | "staged" | "unstaged"
     /// (任意リビジョンはレビュー画面のツールバーから入力する)
     SetReviewBase(String),
+    /// 差分の表示を 並列 (左右 2 列) ⇔ 一列 (インライン) で切り替える
+    ToggleDiffView,
+    /// 差分の次の変更へ (VS Code: F7)
+    DiffNextChange,
+    /// 差分の前の変更へ (VS Code: ⇧F7)
+    DiffPrevChange,
 
     // ── 折りたたみ (highlight.rs の構造解析 + editor::FoldState) ────
     /// カーソル行の折りたたみを切り替える
@@ -239,8 +274,14 @@ pub enum Cmd {
     LspSymbols,
     /// カーソル位置のシンボルをリネームする
     LspRename,
-    /// ドキュメント全体を整形する
+    /// ドキュメント全体を整形する (選択があればその範囲だけ)
     LspFormat,
+    /// カーソル位置 / 選択範囲のクイックフィックス候補を出す
+    LspCodeAction,
+    /// 関数呼び出しの引数ヒント (シグネチャ) を出す
+    LspSignatureHelp,
+    /// カーソル下のシンボルを薄くハイライトするかを切り替える
+    ToggleLspHighlight,
     /// 保存時に自動で整形するかを切り替える
     ToggleFormatOnSave,
 
@@ -251,6 +292,10 @@ pub enum Cmd {
     OpenApprovals,
     /// 承認の監査ログ (approvals.jsonl の末尾) を開く
     OpenApprovalAudit,
+    /// MCP サーバ管理パネルを開く
+    OpenMcp,
+    /// Skills / slash command 管理パネルを開く
+    OpenSkills,
     /// キャレットを 1 つ上の行に増やす
     AddCursorAbove,
     /// キャレットを 1 つ下の行に増やす
@@ -463,7 +508,9 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::FoldLevel(_)
         | Cmd::LspCompletion
         | Cmd::LspRename
-        | Cmd::LspFormat => Group::Edit,
+        | Cmd::LspFormat
+        | Cmd::LspCodeAction
+        | Cmd::LspSignatureHelp => Group::Edit,
 
         // ── 移動・検索 ─────────────────────────────────────────────
         Cmd::OpenFind
@@ -492,12 +539,21 @@ fn group_of(cmd: &Cmd) -> Group {
 
         // ── 表示 ───────────────────────────────────────────────────
         Cmd::ToggleSidebar
+        | Cmd::SplitEditorRight
+        | Cmd::SplitEditorDown
+        | Cmd::UnsplitEditor
+        | Cmd::FocusNextPane
+        | Cmd::FocusEditorPane(_)
+        | Cmd::MoveTabToNextPane
         | Cmd::ToggleMdPreview
         | Cmd::ToggleWordWrap
         | Cmd::ToggleShowWhitespace
+        | Cmd::ToggleMinimap
+        | Cmd::ToggleBreadcrumbs
         | Cmd::ToggleProblems
         | Cmd::ToggleFullScreen
         | Cmd::ToggleTableView
+        | Cmd::ToggleLspHighlight
         | Cmd::FontInc
         | Cmd::FontDec
         | Cmd::SetTheme(_)
@@ -514,15 +570,21 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::TogglePetBubbles => Group::View,
 
         // ── Git ────────────────────────────────────────────────────
-        Cmd::OpenGitPanel | Cmd::ShowGitHubTab | Cmd::OpenReview | Cmd::SetReviewBase(_) => {
-            Group::Git
-        }
+        Cmd::OpenGitPanel
+        | Cmd::ShowGitHubTab
+        | Cmd::OpenReview
+        | Cmd::SetReviewBase(_)
+        | Cmd::ToggleDiffView
+        | Cmd::DiffNextChange
+        | Cmd::DiffPrevChange
+        | Cmd::ToggleGitBlame => Group::Git,
 
         // ── ターミナル・実行 ───────────────────────────────────────
         Cmd::ToggleTerminal
         | Cmd::NewTerminal
         | Cmd::RunActiveFile
         | Cmd::RunBuildTask
+        | Cmd::RunJsonTask(_)
         | Cmd::RunSelection => Group::Run,
 
         // ── エージェント ───────────────────────────────────────────
@@ -543,8 +605,11 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::TogglePetAutoYes
         | Cmd::OpenApprovals
         | Cmd::OpenApprovalAudit
+        | Cmd::OpenMcp
+        | Cmd::OpenSkills
         | Cmd::ShowSessions
         | Cmd::ShowQuota
+        | Cmd::ToggleFailover
         | Cmd::VoiceInput(_)
         | Cmd::VoiceStop
         | Cmd::SetVoiceTarget(_) => Group::Agent,
@@ -553,6 +618,7 @@ fn group_of(cmd: &Cmd) -> Group {
         Cmd::OpenConfig
         | Cmd::ReloadConfig
         | Cmd::ToggleRemote
+        | Cmd::OpenSshRemote
         | Cmd::SetVoiceEngine(_)
         | Cmd::SetVoiceLang(_)
         | Cmd::SetVoiceKeyword(_)
@@ -565,6 +631,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenFolderInIde(_)
         | Cmd::ShowShortcuts
         | Cmd::ShowAbout
+        | Cmd::OpenLicense
         | Cmd::RestartTutorial => Group::Tools,
     }
 }
@@ -872,7 +939,9 @@ impl Palette {
                 rows.extend((0..items.len()).map(Row::Item));
                 tags = false; // 見出しを出したのでタグは出さない
             } else {
-                notes.push(tr("> でコマンド、@ でエージェント、# で worktree を探せます"));
+                notes.push(tr(
+                    "> でコマンド、@ でエージェント、# で worktree を探せます",
+                ));
             }
         } else if browse {
             // 3b) 素の一覧 — 最近使ったものを先頭に、あとは分類ごとに見出し
@@ -945,11 +1014,7 @@ pub fn list_ui(
     let sel = res.clamp(selected);
 
     for note in &res.notes {
-        ui.label(
-            egui::RichText::new(note)
-                .size(12.5)
-                .color(theme.text_dim),
-        );
+        ui.label(egui::RichText::new(note).size(12.5).color(theme.text_dim));
         ui.add_space(4.0);
     }
 
@@ -968,7 +1033,9 @@ pub fn list_ui(
                 ui.add_space(2.0);
             }
             Row::Item(i) => {
-                let Some(it) = res.items.get(*i) else { continue };
+                let Some(it) = res.items.get(*i) else {
+                    continue;
+                };
                 let is_sel = ri == sel;
                 let fill = if is_sel {
                     theme.accent_soft
@@ -984,42 +1051,39 @@ pub fn list_ui(
                         // 右端の分類タグを**先に**置いて幅を予約し、残りの幅で
                         // ラベルを省略する。逆順にするとタグの分だけ行がはみ出す。
                         let tag = if res.tags { group_of_item(it) } else { None };
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if let Some(g) = tag {
-                                    ui.label(
-                                        egui::RichText::new(g.title())
-                                            .size(11.0)
-                                            .color(theme.text_dim.gamma_multiply(0.75)),
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(g) = tag {
+                                ui.label(
+                                    egui::RichText::new(g.title())
+                                        .size(11.0)
+                                        .color(theme.text_dim.gamma_multiply(0.75)),
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(&it.icon);
+                                    // 長いラベル・詳細は省略する (どの幅でも
+                                    // 行からはみ出さない。全文はホバーで出る)
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&it.label).color(theme.text),
+                                        )
+                                        .truncate(),
                                     );
-                                }
-                                ui.with_layout(
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(&it.icon);
-                                        // 長いラベル・詳細は省略する (どの幅でも
-                                        // 行からはみ出さない。全文はホバーで出る)
+                                    if !it.detail.is_empty() {
                                         ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new(&it.label).color(theme.text),
+                                                egui::RichText::new(&it.detail)
+                                                    .size(11.5)
+                                                    .color(theme.text_dim),
                                             )
                                             .truncate(),
                                         );
-                                        if !it.detail.is_empty() {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(&it.detail)
-                                                        .size(11.5)
-                                                        .color(theme.text_dim),
-                                                )
-                                                .truncate(),
-                                            );
-                                        }
-                                    },
-                                );
-                            },
-                        );
+                                    }
+                                },
+                            );
+                        });
                     });
                 let r = ui.interact(
                     fr.response.rect,
@@ -1262,7 +1326,9 @@ mod group_tests {
         let (_, rest) = src.split_once("pub enum Cmd {").expect("enum Cmd");
         let (body, _) = rest.split_once("\n}\n").expect("end of enum Cmd");
         let (_, gsrc) = src.split_once("fn group_of(cmd: &Cmd)").expect("group_of");
-        let (garm, _) = gsrc.split_once("\n/// パレットに出さない").expect("end of group_of");
+        let (garm, _) = gsrc
+            .split_once("\n/// パレットに出さない")
+            .expect("end of group_of");
 
         let mut variants: Vec<&str> = Vec::new();
         for line in body.lines() {
@@ -1299,7 +1365,11 @@ mod group_tests {
             assert!(!seen.contains(&t), "見出しが重複: {t}");
             seen.push(t);
         }
-        assert_eq!(GROUP_ORDER.len(), 8, "分類は 8 つまで (増やすとまた壁になる)");
+        assert_eq!(
+            GROUP_ORDER.len(),
+            8,
+            "分類は 8 つまで (増やすとまた壁になる)"
+        );
     }
 
     // ── 削除 ──────────────────────────────────────────────────────
@@ -1309,7 +1379,10 @@ mod group_tests {
         let p = cmd_palette("");
         let res = p.results(vec![
             cmd("保存", Cmd::Save),
-            cmd("レビューの比較: ステージ済みだけ", Cmd::SetReviewBase("staged".into())),
+            cmd(
+                "レビューの比較: ステージ済みだけ",
+                Cmd::SetReviewBase("staged".into()),
+            ),
             cmd("ペット画像を変更…", Cmd::SetPetImage),
             cmd("プラグインを再スキャン", Cmd::RescanPlugins),
             cmd("バージョン情報", Cmd::ShowAbout),
@@ -1342,10 +1415,20 @@ mod group_tests {
     #[test]
     fn removed_commands_stay_reachable_elsewhere() {
         let menu = include_str!("menu_bar.rs").replace("\r\n", "\n");
-        assert!(menu.contains("Cmd::ShowAbout"), "ShowAbout がヘルプメニューから消えた");
+        assert!(
+            menu.contains("Cmd::ShowAbout"),
+            "ShowAbout がヘルプメニューから消えた"
+        );
         let git = include_str!("git_panel.rs").replace("\r\n", "\n");
-        for b in ["ReviewBase::Head", "ReviewBase::Staged", "ReviewBase::Unstaged"] {
-            assert!(git.contains(b), "レビューのベース切替 {b} がツールバーから消えた");
+        for b in [
+            "ReviewBase::Head",
+            "ReviewBase::Staged",
+            "ReviewBase::Unstaged",
+        ] {
+            assert!(
+                git.contains(b),
+                "レビューのベース切替 {b} がツールバーから消えた"
+            );
         }
     }
 
@@ -1365,7 +1448,10 @@ mod group_tests {
         let labels: Vec<&str> = res.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels[0], "save", "前方一致が先頭に来ていない");
         assert_eq!(labels[1], "file save all", "語頭一致が 2 番目に来ていない");
-        assert_eq!(labels[2], "autosave toggle", "部分一致が 3 番目に来ていない");
+        assert_eq!(
+            labels[2], "autosave toggle",
+            "部分一致が 3 番目に来ていない"
+        );
     }
 
     #[test]
@@ -1374,7 +1460,7 @@ mod group_tests {
         let p = cmd_palette("git");
         let res = p.results(vec![
             cmd("git パネルを開く", Cmd::OpenGitPanel), // 前方一致
-            cmd("変更をレビュー", Cmd::OpenReview),      // 分類名だけ一致
+            cmd("変更をレビュー", Cmd::OpenReview),     // 分類名だけ一致
         ]);
         let labels: Vec<&str> = res.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["git パネルを開く", "変更をレビュー"]);
@@ -1389,7 +1475,10 @@ mod group_tests {
             cmd("あ", Cmd::Save),
             cmd("ずっと後ろのはずの操作", Cmd::ToggleRemote),
         ]);
-        assert_eq!(res.items[0].label, "ずっと後ろのはずの操作", "MRU が効いていない");
+        assert_eq!(
+            res.items[0].label, "ずっと後ろのはずの操作",
+            "MRU が効いていない"
+        );
     }
 
     /// MRU は段を飛び越えない — よく使うからといって前方一致を追い越さない。
@@ -1503,7 +1592,11 @@ mod group_tests {
         p.open_files();
         p.input = "zzzz".into();
         let res = p.results(vec![]);
-        assert_eq!(res.notes.len(), 2, "ファイルモードの該当なしが 1 行しかない");
+        assert_eq!(
+            res.notes.len(),
+            2,
+            "ファイルモードの該当なしが 1 行しかない"
+        );
         assert!(res.notes[1].contains('>') && res.notes[1].contains('@'));
         // ファイルモードでコマンドを勝手に出さない
         assert!(res.items.is_empty());
@@ -1515,7 +1608,7 @@ mod group_tests {
     fn arrows_skip_headings_and_wrap() {
         let p = cmd_palette("");
         let res = p.results(vec![
-            cmd("保存", Cmd::Save),                        // File
+            cmd("保存", Cmd::Save),                         // File
             cmd("ターミナル表示切替", Cmd::ToggleTerminal), // Run
         ]);
         let out = rendered(&res);
@@ -1585,7 +1678,10 @@ mod group_tests {
     #[test]
     fn filtering_uses_row_tags_instead_of_headings() {
         let p = cmd_palette("保存");
-        let res = p.results(vec![cmd("保存", Cmd::Save), cmd("すべて保存", Cmd::SaveAll)]);
+        let res = p.results(vec![
+            cmd("保存", Cmd::Save),
+            cmd("すべて保存", Cmd::SaveAll),
+        ]);
         assert!(
             res.rows.iter().all(|r| matches!(r, Row::Item(_))),
             "絞り込み中に見出しが混ざっている (順位と喧嘩する)"
@@ -1616,7 +1712,10 @@ mod group_tests {
     fn word_start_matching_handles_japanese_separators() {
         assert_eq!(match_tier("save", None, "save"), TIER_PREFIX);
         assert_eq!(match_tier("file save", None, "save"), TIER_WORD);
-        assert_eq!(match_tier("検索: 正規表現を使用する", None, "正規表現"), TIER_WORD);
+        assert_eq!(
+            match_tier("検索: 正規表現を使用する", None, "正規表現"),
+            TIER_WORD
+        );
         assert_eq!(match_tier("レビュー (pr 風)", None, "pr"), TIER_WORD);
         assert_eq!(match_tier("autosave", None, "save"), TIER_SUBSTR);
         assert_eq!(match_tier("まったく別", Some("git"), "git"), TIER_GROUP);

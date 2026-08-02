@@ -93,7 +93,13 @@ pub fn webhook(url: &str, title: &str, body: &str) {
         || url.contains("discord.com/api/webhooks")
         || url.contains("discordapp.com/api/webhooks");
     let mut cmd = Command::new("curl");
-    cmd.args(["-fsS", "-m", "10", "-o", if cfg!(windows) { "NUL" } else { "/dev/null" }]);
+    cmd.args([
+        "-fsS",
+        "-m",
+        "10",
+        "-o",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    ]);
     if is_json {
         let payload = format!(
             "{{\"text\":{t},\"content\":{t}}}",
@@ -104,7 +110,12 @@ pub fn webhook(url: &str, title: &str, body: &str) {
         // ntfy 形式: 本文はプレーンテキスト、タイトルはヘッダで渡す。
         // ヘッダは latin-1 しか通らない実装があるため、日本語タイトルは
         // ntfy の UTF-8 拡張 (RFC 2047 は使わず X-Title に生 UTF-8) に任せる。
-        cmd.args(["-H", &format!("X-Title: {}", sanitize_header(title)), "-d", &body]);
+        cmd.args([
+            "-H",
+            &format!("X-Title: {}", sanitize_header(title)),
+            "-d",
+            &body,
+        ]);
     }
     cmd.arg(url);
     spawn_and_reap(&mut cmd);
@@ -164,7 +175,10 @@ mod tests {
 
     #[test]
     fn escape_applescript_quotes() {
-        assert_eq!(escape_applescript(r#"say "hello" now"#), r#"say \"hello\" now"#);
+        assert_eq!(
+            escape_applescript(r#"say "hello" now"#),
+            r#"say \"hello\" now"#
+        );
     }
 
     #[test]
@@ -176,7 +190,10 @@ mod tests {
 
     #[test]
     fn escape_applescript_japanese_passthrough() {
-        assert_eq!(escape_applescript("テスト通知です。改行なし"), "テスト通知です。改行なし");
+        assert_eq!(
+            escape_applescript("テスト通知です。改行なし"),
+            "テスト通知です。改行なし"
+        );
     }
 
     #[test]
@@ -209,7 +226,10 @@ mod tests {
 
     #[test]
     fn escape_powershell_single_quotes() {
-        assert_eq!(escape_powershell_single_quoted("it's a 'test'"), "it''s a ''test''");
+        assert_eq!(
+            escape_powershell_single_quoted("it's a 'test'"),
+            "it''s a ''test''"
+        );
     }
 
     // ── Webhook ──────────────────────────────────────────────────────

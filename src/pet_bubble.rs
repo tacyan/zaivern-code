@@ -83,7 +83,11 @@ pub fn draw(
     let visible = items.len().min(MAX_CARDS);
     let overflow = items.len().saturating_sub(MAX_CARDS);
     // ── オーバーフロー時はスタック最下段に "+他N件" ラベル分の高さを確保
-    let label_h = if overflow > 0 { MORE_LABEL_H + GAP } else { 0.0 };
+    let label_h = if overflow > 0 {
+        MORE_LABEL_H + GAP
+    } else {
+        0.0
+    };
 
     // ── スタックの基準位置（カード左端 x とスタック最下端 y）を決める
     let (base_x, base_bottom) = match anchor {
@@ -110,9 +114,12 @@ pub fn draw(
             .interactable(false)
             .show(ctx, |ui| {
                 ui.label(
-                    egui::RichText::new(trf("+他{overflow}件", &[("overflow", overflow.to_string())]))
-                        .small()
-                        .color(theme.text_dim),
+                    egui::RichText::new(trf(
+                        "+他{overflow}件",
+                        &[("overflow", overflow.to_string())],
+                    ))
+                    .small()
+                    .color(theme.text_dim),
                 );
             });
     }
@@ -223,10 +230,14 @@ fn draw_card(
 /// カードが画面内（余白 MARGIN 付き）に完全に収まるよう左上座標をクランプする
 fn clamp_to_screen(pos: egui::Pos2, screen: egui::Rect, w: f32, h: f32) -> egui::Pos2 {
     egui::pos2(
-        pos.x
-            .clamp(screen.left() + MARGIN, (screen.right() - MARGIN - w).max(screen.left() + MARGIN)),
-        pos.y
-            .clamp(screen.top() + MARGIN, (screen.bottom() - MARGIN - h).max(screen.top() + MARGIN)),
+        pos.x.clamp(
+            screen.left() + MARGIN,
+            (screen.right() - MARGIN - w).max(screen.left() + MARGIN),
+        ),
+        pos.y.clamp(
+            screen.top() + MARGIN,
+            (screen.bottom() - MARGIN - h).max(screen.top() + MARGIN),
+        ),
     )
 }
 

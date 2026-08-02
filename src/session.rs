@@ -26,6 +26,13 @@ pub struct SessionData {
     /// ワークスペースのルート一覧(絶対パス)。再起動時に全フォルダを復元する。
     /// 旧形式(単一ルート)のファイルでは空 — その場合は起動時のルートを使う。
     pub roots: Vec<String>,
+    /// エディタの分割レイアウト ([`crate::editor_split::EditorPanesRec::to_line`])。
+    ///
+    /// 端末分割 ([`AgentSessionRec::split`]) と**同じ流儀**: プレーンな文字列 1 本。
+    /// TOML はテーブル / 配列を単純値より後ろにしか置けないので、ここへ構造体や
+    /// `Vec` を足してはいけない。空 = 分割なし (1 ペインで開く)。
+    /// リーフはバッファ ID ではなく**ファイルの絶対パス**で指す (再起動で ID は変わる)。
+    pub editor_split: String,
     /// 走らせていたエージェントタブの記録 (チャット履歴のフォルダ別保存)。
     /// フォルダを開き直したときに、タブ + 前回スクロールバックを復元し、
     /// 対応 CLI (claude / codex) は会話を再開する。旧ファイルには無いので空。
@@ -71,7 +78,8 @@ pub fn save(roots: &[PathBuf], data: &SessionData) {
 }
 
 /// 既定の保存先ディレクトリ: `~/.zaivern/sessions`
-fn sessions_dir() -> PathBuf {
+/// (`zai session list` からも走査するので pub)
+pub fn sessions_dir() -> PathBuf {
     crate::config::zaivern_dir().join("sessions")
 }
 
@@ -125,7 +133,13 @@ pub fn term_log_dir(workspace: &Path) -> PathBuf {
 pub fn term_log_path(workspace: &Path, session_id: u64, title: &str) -> PathBuf {
     let safe: String = title
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(40)
         .collect();
     term_log_dir(workspace).join(format!("{safe}-{session_id}.log"))
@@ -247,7 +261,8 @@ mod tests {
         };
 
         save_to(&dir, std::slice::from_ref(&workspace), &data);
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
+        let loaded =
+            load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
 
         assert_eq!(loaded.open_files, data.open_files);
         assert_eq!(loaded.active, Some(1));
@@ -271,7 +286,8 @@ mod tests {
         };
 
         save_to(&dir, std::slice::from_ref(&workspace), &data);
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
+        let loaded =
+            load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
 
         assert!(loaded.open_files.is_empty());
         assert_eq!(loaded.active, None);
@@ -290,7 +306,10 @@ mod tests {
         let data = SessionData {
             open_files: vec![
                 workspace.join("メモ帳.txt").to_string_lossy().into_owned(),
-                workspace.join("設計/仕様書.md").to_string_lossy().into_owned(),
+                workspace
+                    .join("設計/仕様書.md")
+                    .to_string_lossy()
+                    .into_owned(),
             ],
             active: Some(0),
             sidebar_open: true,
@@ -300,7 +319,8 @@ mod tests {
         };
 
         save_to(&dir, std::slice::from_ref(&workspace), &data);
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("japanese session should load");
+        let loaded = load_from(&dir, std::slice::from_ref(&workspace))
+            .expect("japanese session should load");
 
         assert_eq!(loaded.open_files, data.open_files);
         assert_eq!(loaded.active, Some(0));
@@ -380,7 +400,10 @@ mod tests {
         let loaded = load_from(&dir, roots).expect("session should load");
         assert_eq!(loaded.agents.len(), 2);
         assert_eq!(loaded.agents[0].preset_name, "Claude Code");
-        assert_eq!(loaded.agents[0].command, "claude --dangerously-skip-permissions");
+        assert_eq!(
+            loaded.agents[0].command,
+            "claude --dangerously-skip-permissions"
+        );
         assert_eq!(loaded.agents[1].title, "Codex #2");
         assert_eq!(loaded.agents[1].cwd, "/p/サブ");
         assert_eq!(loaded.agents[1].log_file, "/logs/Codex__2-2.log");
@@ -393,6 +416,42 @@ mod tests {
         let loaded = load_from(&dir, roots).expect("old session should still load");
         assert!(loaded.agents.is_empty(), "旧ファイルでは空の agents になる");
         assert_eq!(loaded.open_files, vec!["/a.rs"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// エディタ分割の 1 行が `[[agents]]` (テーブル配列) と共存でき、
+    /// この欄を持たない旧セッションも読めること。
+    #[test]
+    fn editor_split_line_roundtrips_and_old_file_without_it_still_loads() {
+        let dir = unique_temp_dir("zaivern-session-test", "editor-split");
+        let roots = &[dir.join("ws")];
+        let line = format!(
+            "1{gs}0{fs}p0{fs}H:0.5{rs}L:p0{rs}L:p1{gs}p0{fs}0{fs}/p/a.rs{gs}p1{fs}0{fs}/p/b.rs",
+            gs = '\u{1d}',
+            fs = '\u{1f}',
+            rs = '\u{1e}',
+        );
+        let data = SessionData {
+            open_files: vec!["/p/a.rs".into(), "/p/b.rs".into()],
+            editor_split: line.clone(),
+            agents: vec![AgentSessionRec {
+                preset_name: "Claude Code".into(),
+                title: "Claude Code #1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        save_to(&dir, roots, &data);
+        let loaded = load_from(&dir, roots).expect("session should load");
+        assert_eq!(loaded.editor_split, line, "分割の 1 行がそのまま戻る");
+        assert_eq!(loaded.agents.len(), 1, "テーブル配列と共存できる");
+
+        // この欄を持たない旧ファイルは空文字 (= 分割なし) になる
+        let old = "open_files = [\"/a.rs\"]\nsidebar_open = true\npanel_open = false\n";
+        std::fs::write(session_file_in(&dir, roots), old).expect("write old session");
+        let loaded = load_from(&dir, roots).expect("old session should still load");
+        assert_eq!(loaded.editor_split, "");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -554,7 +613,8 @@ mod tests {
         };
         save_to(&dir, std::slice::from_ref(&workspace), &second);
 
-        let loaded = load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
+        let loaded =
+            load_from(&dir, std::slice::from_ref(&workspace)).expect("session should load");
         assert_eq!(loaded.open_files, vec!["/new.rs", "/new2.rs"]);
         assert_eq!(loaded.active, Some(1));
 
