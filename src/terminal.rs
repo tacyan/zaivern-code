@@ -8877,9 +8877,11 @@ pub struct SplitDraw {
 /// 新しいペインで何を起こすかの指示。モデルは何も起動しない。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PanePreset {
-    /// 親ペインと**同じプリセット**のエージェントを、**親と同じ cwd** で。
-    SameAsParent,
-    /// 素のシェルを親と同じ cwd で。
+    /// **新規起動とまったく同じ**エージェント — 既定プリセット (先頭) を
+    /// ワークスペースの作業フォルダで。`👾 Agent ＋` / `NewAgent` キーで
+    /// 起こすのと 1 か所も違わない (分割かどうかで挙動を変えない)。
+    NewAgent,
+    /// 素のシェルをワークスペースの作業フォルダで (同上)。
     Shell,
 }
 
@@ -8930,7 +8932,7 @@ fn is_split_chord(m: &egui::Modifiers, mac: bool) -> bool {
 ///
 /// | キー | 操作 |
 /// |---|---|
-/// | `Shift+→` | 右に分割 (親と同じエージェント) |
+/// | `Shift+→` | 右に分割 (新しいエージェント = 新規起動と同じ) |
 /// | `Shift+↓` | 下に分割 (同上) |
 /// | `Shift+H` / `Shift+L` | フォーカス中ペインを狭める / 広げる |
 /// | `N` | 右に分割してシェルを開く |
@@ -8951,11 +8953,11 @@ pub fn split_key_action(key: egui::Key, mods: &egui::Modifiers, mac: bool) -> Op
         return match key {
             K::ArrowRight => Some(SplitAction::SplitWith {
                 dir: SplitDir::Horizontal,
-                preset: PanePreset::SameAsParent,
+                preset: PanePreset::NewAgent,
             }),
             K::ArrowDown => Some(SplitAction::SplitWith {
                 dir: SplitDir::Vertical,
-                preset: PanePreset::SameAsParent,
+                preset: PanePreset::NewAgent,
             }),
             // 移動 (H / L) と同じ指で、押しっぱなしにできる幅調整。
             K::H => Some(SplitAction::Resize { grow: false }),
@@ -10657,11 +10659,11 @@ mod split_tests {
 
     const SPLIT_R: SplitAction = SplitAction::SplitWith {
         dir: SplitDir::Horizontal,
-        preset: PanePreset::SameAsParent,
+        preset: PanePreset::NewAgent,
     };
     const SPLIT_D: SplitAction = SplitAction::SplitWith {
         dir: SplitDir::Vertical,
-        preset: PanePreset::SameAsParent,
+        preset: PanePreset::NewAgent,
     };
     const SPLIT_SHELL: SplitAction = SplitAction::SplitWith {
         dir: SplitDir::Horizontal,
