@@ -468,34 +468,70 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
-    /// **テスト専用**の 32 バイト種を実行時に作る。
+    /// **テスト専用**の 32 バイト種をタグから作る。ソースに固定の秘密鍵
+    /// バイト列を書かないためのヘルパで、値は**タグだけ**で決まる。
     ///
-    /// ソースに固定の秘密鍵バイト列を書かないためのヘルパ。pid・時刻・タグから
-    /// FNV-1a で作るので、テストごとに違う鍵ペアになる (検証ロジックは鍵の値に
-    /// 依らないため、値が毎回変わっても結果は決定的)。
+    /// # 以前の実装が壊れていた話 (同じ轍を踏まないために残す)
+    ///
+    /// 旧実装は添字 `i` を FNV チェーンの**末尾**に置き、`(h >> 24) as u8` で
+    /// 取り出していた。FNV の乗数は `2^40 + 0x1b3` なので、最後に `i` を
+    /// XOR してから 1 回だけ乗じても**動くのは下位 17 ビットだけ**で、
+    /// 取り出す窓 (ビット 24..32) には届かない。結果、
+    /// **32 バイトが全部同じ値**になり、種は実質 **256 通りしか存在しなかった**。
+    /// 別タグ同士が 1/256 で同じ鍵ペアになり、「別の発行者の鍵は弾かれる」
+    /// テストが約 0.5% の確率で「弾かれない」と言って落ちていた
+    /// (実測: 200,000 回中 992 回衝突。CI の ubuntu で実際に踏んだ)。
+    ///
+    /// 直し方は 2 点:
+    /// 1. **添字を先頭に置く。** 以降の全ての乗算で拡散する。
+    /// 2. **64 ビットを畳んで 1 バイトにする。** 固定窓は上位の差を捨てる。
+    ///
+    /// 時刻と pid は**混ぜない**。テストは決定的であるべきで、
+    /// 実行ごとに鍵が変わると、こういう確率的な失敗が再現できなくなる。
     fn test_seed(tag: &str) -> [u8; 32] {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let pid = u64::from(std::process::id());
         let mut out = [0u8; 32];
         for (i, slot) in out.iter_mut().enumerate() {
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for b in tag
-                .as_bytes()
-                .iter()
-                .copied()
-                .chain(nanos.to_le_bytes())
-                .chain(pid.to_le_bytes())
-                .chain([i as u8])
-            {
+            for b in [i as u8].into_iter().chain(tag.as_bytes().iter().copied()) {
                 h ^= u64::from(b);
                 h = h.wrapping_mul(0x0000_0100_0000_01b3);
             }
-            *slot = (h >> 24) as u8;
+            *slot = (h ^ (h >> 32) ^ (h >> 16) ^ (h >> 8)) as u8;
         }
         out
+    }
+
+    /// テスト用の鍵導出そのものを検査する。ここが壊れると、他の
+    /// ライセンステストが**何も検証していない**のに緑になる。
+    #[test]
+    fn テスト用の鍵導出は十分に散らばる() {
+        // 1) 1 本の種の中でバイトが散らばっている
+        //    (旧実装は 32 バイトが全部同じ値だった)
+        let s = test_seed("entropy");
+        let uniq: std::collections::HashSet<u8> = s.iter().copied().collect();
+        assert!(
+            uniq.len() >= 16,
+            "種のバイトが散らばっていない (相異なる値 {} 個): {s:02x?}",
+            uniq.len()
+        );
+
+        // 2) 違うタグは違う鍵ペアになる。1 文字違い・長さ違いを含める
+        let tags = [
+            "issuer-a",
+            "issuer-b",
+            "issuer-c",
+            "a",
+            "b",
+            "",
+            "tamper-sig",
+            "unset-pubkey",
+            "issuer-aa",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for t in tags {
+            let (_, pk) = test_keys(t);
+            assert!(seen.insert(pk), "タグ {t:?} の鍵が他と衝突した");
+        }
     }
 
     fn test_keys(tag: &str) -> (SigningKey, [u8; 32]) {
@@ -654,8 +690,15 @@ mod tests {
 
     #[test]
     fn key_signed_by_another_keypair_is_rejected() {
-        let (sk_a, _) = test_keys("issuer-a");
+        let (sk_a, pk_a) = test_keys("issuer-a");
         let (_, pk_b) = test_keys("issuer-b");
+        // 導出が衝突していると、この後の assert は「弾かれなかった」と
+        // 言って落ちるが、原因は検証ロジックではなくヘルパにある。
+        // 先にここで落として、読む人が原因を取り違えないようにする。
+        assert_ne!(
+            pk_a, pk_b,
+            "テスト用の鍵導出が衝突した (検証の問題ではない)"
+        );
         let key = issue(&sk_a, &payload(None));
         assert_eq!(
             verify_key(&key, &pk_b, 1_800_000_000),
