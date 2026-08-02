@@ -14361,6 +14361,8 @@ impl ZaivernApp {
                     } else {
                         ""
                     },
+                    // 指名スーパーエージェント (指揮官) は 1 フレームに 1 体だけ
+                    commander: self.super_agent_session == Some(s.id),
                     can_cycle: s.permission_switch_hint().is_some(),
                     // カードの一言 + ホバープレビュー + アクティビティ分類の材料。
                     // サンプリング周期のフレームだけ実際に PTY を読む
