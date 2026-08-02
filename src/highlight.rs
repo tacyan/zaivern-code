@@ -2484,7 +2484,7 @@ mod pack_integration {
         for name in crate::grammar::bundled_pack::load().names() {
             let job = h.layout_job(
                 src,
-                &name,
+                name,
                 "base16-ocean.dark",
                 FontId::monospace(12.0),
                 Color32::WHITE,
