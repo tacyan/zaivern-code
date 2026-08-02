@@ -2510,6 +2510,38 @@ mod pack_integration {
         assert!(h.extra_lang_count() >= 50);
     }
 
+    /// 起動と描画に載る費用の番人。閾値は debug ビルドでも余裕がある値
+    /// (実測は読み込み ~100ms / 2000 行 ~55ms、release はこれより速い)。
+    /// 巨大な定義を足して起動を重くしたら、ここで気づける。
+    #[test]
+    fn 読み込みと着色が遅くなっていない() {
+        let t = std::time::Instant::now();
+        let set = crate::grammar::bundled_pack::load();
+        let load = t.elapsed();
+        assert!(
+            load < std::time::Duration::from_millis(600),
+            "同梱パックの読み込みが遅い: {load:?}"
+        );
+
+        let h = Highlighter::new();
+        h.set_grammars(set);
+        let src = "// c\nexport const x: number = foo(1) + \"s\";\n".repeat(1000);
+        let t = std::time::Instant::now();
+        let job = h.layout_job(
+            &src,
+            "TypeScript",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        let paint = t.elapsed();
+        assert_eq!(job.text, src);
+        assert!(
+            paint < std::time::Duration::from_millis(1500),
+            "2000 行の着色が遅い: {paint:?}"
+        );
+    }
+
     #[test]
     fn パック無しでも従来どおり動く() {
         let h = Highlighter::new();
