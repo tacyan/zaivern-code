@@ -830,28 +830,34 @@ struct PluginActions {
 // ため、テストできる形は「状態 → 状態」の純関数だけ。app.rs の作法どおり
 // 判断はここへ出し、メソッド側は self との受け渡しに徹する。
 
+/// 「既定のエージェント」= プリセットの**先頭**。
+///
+/// キーボードの `NewAgent` も端末分割も、新しい 1 体はここを見る
+/// (別々の場所で添字を決めると「キーと分割で違うものが立つ」が起きる)。
+const DEFAULT_PRESET_IX: usize = 0;
+
 /// 新しいペインで起動するプリセットの添字。
 ///
-/// * 親と同じ → 見つからなければ素のシェル → それも無ければ先頭
-/// * シェル指定 → 素のシェル (コマンドが空のプリセット) → 無ければ先頭
+/// * エージェント指定 → **既定プリセット** ([`DEFAULT_PRESET_IX`])。
+///   `NewAgent` キーや `👾 Agent ＋` からの新規起動と同じ 1 体を起こす —
+///   分割かどうかで起動するものを変えない (親のプリセットは引き継がない)。
+/// * シェル指定 → 素のシェル (コマンドが空のプリセット) → 無ければ既定
 ///
 /// 「1 つも登録が無い」ときだけ `None` (呼び出し側がトーストを出す)。
 fn split_preset_index(
     agents: &[config::AgentPreset],
-    parent: &str,
     preset: terminal::PanePreset,
 ) -> Option<usize> {
     if agents.is_empty() {
         return None;
     }
-    let shell = agents.iter().position(|p| p.command.trim().is_empty());
     match preset {
-        terminal::PanePreset::SameAsParent => {
-            agents.iter().position(|p| p.name == parent).or(shell)
-        }
-        terminal::PanePreset::Shell => shell,
+        terminal::PanePreset::NewAgent => Some(DEFAULT_PRESET_IX),
+        terminal::PanePreset::Shell => agents
+            .iter()
+            .position(|p| p.command.trim().is_empty())
+            .or(Some(DEFAULT_PRESET_IX)),
     }
-    .or(Some(0))
 }
 
 /// 分割レイアウト表を整える (消えたペインを落とす → 1 枚は畳む → キーを揃える)。
@@ -9732,7 +9738,7 @@ impl ZaivernApp {
             cmds.push(Cmd::ToggleMdPreview);
         }
         if consume(ctx, self.keys.get(BindAction::NewAgent)) {
-            cmds.push(Cmd::NewAgent(0));
+            cmds.push(Cmd::NewAgent(DEFAULT_PRESET_IX));
         }
         if consume(ctx, self.keys.get(BindAction::FontInc))
             || consume(ctx, KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals))
@@ -13439,7 +13445,9 @@ impl ZaivernApp {
                                                     && ui
                                                     .small_button(split_label)
                                                     .on_hover_text(tr(
-                                                        "このタイルを右へ分割\n\
+                                                        "このタイルを右へ分割して、新しいエージェントを起動\n\
+                                                         起動するものは 👾 Agent ＋ からの新規起動と同じです\n\
+                                                         (既定プリセット・作業フォルダはワークスペース)。\n\
                                                          分割中は各ペインのヘッダに ◎ (拡大) と ✕ (閉じる) が出ます。\n\
                                                          キーは ⌘⌥⇧→ 右へ分割 / ⌘⌥⇧↓ 下へ分割 / ⌘⌥N シェル /\n\
                                                          ⌘⌥W 閉じる / ⌘⌥←↑↓→ 移動 / ⌘⌥Z 拡大 / ⌘⌥E 等分 /\n\
@@ -13451,8 +13459,7 @@ impl ZaivernApp {
                                                         sid,
                                                         terminal::SplitAction::SplitWith {
                                                             dir: terminal::SplitDir::Horizontal,
-                                                            preset:
-                                                                terminal::PanePreset::SameAsParent,
+                                                            preset: terminal::PanePreset::NewAgent,
                                                         },
                                                     ));
                                                 }
@@ -13685,20 +13692,21 @@ impl ZaivernApp {
             .unwrap_or(tile);
         match action {
             SplitAction::SplitWith { dir, preset } => {
-                let Some(parent) = self.agents.sessions.iter().find(|s| s.id == focused) else {
+                // 置き場所 (どのペインの隣か) だけが分割の仕事。**何を起こすかは
+                // 新規起動と 1 か所も変えない** — 既定プリセットを、ワークスペースの
+                // 作業フォルダで起こす (親のプリセット・親の cwd は引き継がない)。
+                if !self.agents.sessions.iter().any(|s| s.id == focused) {
                     return;
-                };
-                let (cwd, parent_preset) = (parent.cwd.clone(), parent.preset_name.clone());
-                let Some(ix) = split_preset_index(&self.cfg.agents, &parent_preset, preset) else {
+                }
+                let Some(ix) = split_preset_index(&self.cfg.agents, preset) else {
                     self.toast(tr("起動できるエージェントの登録がありません"), false);
                     return;
                 };
-                let command = self.cfg.agents[ix].command.clone();
                 let before = self.agents.sessions.len();
                 // 分割はタイルの中で完結する操作なので、下部パネルを勝手に
                 // 開かない (「画面が突然変わらない」)。起動側の副作用だけ戻す。
                 let panel_was = self.agents.panel_open;
-                self.launch_preset_with(ix, command, &cwd, ctx);
+                self.launch_preset(ix, ctx);
                 self.agents.panel_open = panel_was;
                 if self.agents.sessions.len() == before {
                     return; // 起動に失敗した (トーストは launch 側が出す)
@@ -29787,35 +29795,48 @@ mod split_wiring_tests {
             preset("シェル", ""),
             preset("Codex", "codex"),
         ];
-        // 親と同じ → 名前で引ける
-        assert_eq!(
-            split_preset_index(&agents, "Codex", PanePreset::SameAsParent),
-            Some(2)
-        );
-        // 親のプリセットが消えていたら素のシェルへ (勝手に別の CLI を起こさない)
-        assert_eq!(
-            split_preset_index(&agents, "消えたプリセット", PanePreset::SameAsParent),
-            Some(1)
-        );
+        // エージェント指定は **常に既定プリセット (先頭)** —
+        // 親が Codex でも Codex は引き継がない (新規起動と同じ 1 体)。
+        assert_eq!(split_preset_index(&agents, PanePreset::NewAgent), Some(0));
         // シェル指定は常に素のシェル
-        assert_eq!(
-            split_preset_index(&agents, "Codex", PanePreset::Shell),
-            Some(1)
-        );
+        assert_eq!(split_preset_index(&agents, PanePreset::Shell), Some(1));
 
         // 素のシェルが登録されていない構成でも動く (先頭で代替する)
         let no_shell = vec![preset("Claude Code", "claude")];
-        assert_eq!(
-            split_preset_index(&no_shell, "Codex", PanePreset::SameAsParent),
-            Some(0)
-        );
-        assert_eq!(
-            split_preset_index(&no_shell, "x", PanePreset::Shell),
-            Some(0)
-        );
+        assert_eq!(split_preset_index(&no_shell, PanePreset::NewAgent), Some(0));
+        assert_eq!(split_preset_index(&no_shell, PanePreset::Shell), Some(0));
 
         // 1 つも登録が無ければ None (呼び出し側がトーストを出す)
-        assert_eq!(split_preset_index(&[], "x", PanePreset::Shell), None);
+        assert_eq!(split_preset_index(&[], PanePreset::Shell), None);
+        assert_eq!(split_preset_index(&[], PanePreset::NewAgent), None);
+    }
+
+    /// 分割で起こすエージェントは「新規起動」と同じ経路を通ること。
+    ///
+    /// `launch_preset_with` (コマンドと cwd を差し替える再開用の口) を
+    /// 使ってしまうと、親の cwd・親のプリセットが混ざる。ソースを読んで
+    /// **新規起動と同じ `launch_preset`** を呼んでいることを固定する。
+    #[test]
+    fn split_launches_through_the_new_agent_path() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let (_, body) = src
+            .split_once("SplitAction::SplitWith { dir, preset } => {")
+            .expect("SplitWith の腕");
+        let (arm, _) = body
+            .split_once("SplitAction::ClosePane =>")
+            .expect("次の腕まで");
+        assert!(
+            arm.contains("self.launch_preset(ix, ctx);"),
+            "分割は新規起動と同じ launch_preset を通ること"
+        );
+        assert!(
+            !arm.contains("launch_preset_with"),
+            "分割で親の cwd / コマンドを差し替えないこと"
+        );
+        assert!(
+            !arm.contains("preset_name"),
+            "分割で親のプリセット名を引き継がないこと"
+        );
     }
 
     // ── レイアウト表の正規化 ────────────────────────────────────────
@@ -29992,7 +30013,7 @@ mod split_wiring_tests {
             got,
             Some(SplitAction::SplitWith {
                 dir: SplitDir::Horizontal,
-                preset: PanePreset::SameAsParent
+                preset: PanePreset::NewAgent
             })
         );
         assert!(left.is_empty());
