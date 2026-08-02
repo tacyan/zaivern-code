@@ -1926,6 +1926,7 @@ command = "agy"
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
+            ui_zoom: Some(1.25),
             minimap: Some(true),
             breadcrumbs: Some(false),
             diff_view: Some("inline".into()),

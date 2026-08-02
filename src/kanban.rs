@@ -4917,6 +4917,7 @@ mod tests {
             attention: false,
             running,
             sup: None,
+            commander: false,
             permission_badge: "",
             can_cycle: false,
             tail_lines: Vec::new(),
