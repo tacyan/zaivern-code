@@ -3195,7 +3195,8 @@ run = "c"
         assert_eq!(get("ZV_LANG"), "rust");
         assert_eq!(get("ZV_WORKSPACE"), "/ws");
         assert_eq!(get("ZV_PLUGIN_DIR"), a.dir.display().to_string());
-        assert_eq!(get("ZV_API"), "2");
+        // 版はここにベタ書きせず定数から取る (API_VERSION を上げるたびに落ちない)
+        assert_eq!(get("ZV_API"), API_VERSION.to_string());
         assert!(!get("ZV_BIN").is_empty());
         // Windows は \ 区切りで返るので / に寄せてから比較する
         assert!(get("ZV_PLUGIN_DATA")
