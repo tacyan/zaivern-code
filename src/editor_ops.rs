@@ -507,6 +507,11 @@ pub fn comment_prefix_for(lang: &str) -> Option<&'static str> {
         | "zsh" | "toml" | "yaml" | "makefile" | "perl" | "r" | "dockerfile" => Some("#"),
         "lua" | "sql" | "haskell" => Some("--"),
         _ => {
+            // プラグインが持ち込んだ言語 (Zig / Elixir / Nix …) は
+            // その構文定義に書いてある行コメント記号を使う。
+            if let Some(p) = crate::highlight::dynamic_line_comment(lang) {
+                return Some(p);
+            }
             if l.contains("bash") || l.contains("shell") {
                 Some("#")
             } else {

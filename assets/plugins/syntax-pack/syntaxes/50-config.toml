@@ -6,6 +6,8 @@
 [[syntax]]
 name = "TOML"
 extensions = ["toml"]
+key_value = true
+section_header = true
 filenames = ["cargo.lock", "poetry.lock", "uv.lock", "pdm.lock"]
 tokens = ["toml"]
 line_comment = ["#"]
@@ -32,6 +34,7 @@ constants = ["true", "false"]
 
 [[syntax]]
 name = "Terraform"
+key_value = true
 extensions = ["tf", "tfvars", "hcl", "nomad"]
 filenames = ["terragrunt.hcl"]
 tokens = ["terraform", "hcl", "tf"]
@@ -73,6 +76,8 @@ builtins = [
 
 [[syntax]]
 name = "INI"
+key_value = true
+section_header = true
 extensions = ["ini", "cfg", "conf", "inf", "editorconfig", "prefs"]
 filenames = [".editorconfig", ".gitconfig", ".npmrc", ".flake8", ".coveragerc", "setup.cfg", "tox.ini", "pytest.ini", "gitconfig"]
 tokens = ["ini", "cfg", "conf", "editorconfig"]
@@ -84,6 +89,7 @@ constants = ["true", "false", "yes", "no", "on", "off", "none"]
 
 [[syntax]]
 name = "DotEnv"
+key_value = true
 extensions = ["env", "envrc"]
 filenames = [".env", ".envrc", ".env.local", ".env.example", ".env.sample", ".env.development", ".env.production", ".env.test"]
 tokens = ["dotenv", "env"]

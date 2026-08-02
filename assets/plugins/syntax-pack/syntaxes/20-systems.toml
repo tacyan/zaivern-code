@@ -249,7 +249,7 @@ builtins = [
 
 [[syntax]]
 name = "GLSL"
-extensions = ["glsl", "vert", "frag", "geom", "comp", "tesc", "tese", "vs", "fs", "hlsl", "fx", "metal"]
+extensions = ["glsl", "vert", "frag", "geom", "comp", "tesc", "tese", "vsh", "fsh", "hlsl", "fx", "metal"]
 tokens = ["glsl", "hlsl", "shader"]
 line_comment = ["//"]
 block_comment = [["/*", "*/"]]

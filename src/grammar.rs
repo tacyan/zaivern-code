@@ -212,6 +212,11 @@ pub struct Grammar {
     pub types: HashSet<String>,
     pub constants: HashSet<String>,
     pub builtins: HashSet<String>,
+    /// 行頭の `key = value` の **key** を属性色で塗るか (TOML / INI / .env / HCL)。
+    /// これが無いと Cargo.toml がほぼ全部地の文になる。
+    pub key_value: bool,
+    /// 行頭の `[section]` を属性色で塗るか (TOML / INI)。
+    pub section_header: bool,
     /// 大文字小文字を区別するか (SQL / Fortran などは false)。
     pub case_sensitive: bool,
     pub fold: FoldKindSpec,
@@ -342,7 +347,6 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             match block {
                 None => {
                     o.push(tok, i, len);
-                    i = len;
                     break;
                 }
                 Some((bi, close)) => {
@@ -367,7 +371,18 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             }
         }
 
-        // 3. 文字列 (複数行は状態を持ち越す)
+        // 3. 行頭の `[section]` (設定ファイル向け)
+        if line_start && g.section_header && c == '[' {
+            if let Some(p) = line[i..].find(']') {
+                let e = i + p + 1;
+                o.push(Tok::Attribute, i, e);
+                i = e;
+                line_start = false;
+                continue;
+            }
+        }
+
+        // 4. 文字列 (複数行は状態を持ち越す)
         if let Some((si, rule)) = string_at(g, line, i) {
             let open_end = i + rule.open.len();
             o.push(Tok::Str, i, open_end);
@@ -384,7 +399,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             continue;
         }
 
-        // 4. 文字リテラル
+        // 5. 文字リテラル
         if g.char_literal && c == '\'' {
             let end = scan_char_literal(g, line, i);
             o.push(Tok::Char, i, end);
@@ -393,7 +408,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             continue;
         }
 
-        // 5. 行頭のプリプロセッサ指令
+        // 6. 行頭のプリプロセッサ指令
         if line_start && !g.preproc.is_empty() {
             if let Some(d) = g.preproc.iter().find(|d| line[i..].starts_with(d.as_str())) {
                 let mut e = i + d.len();
@@ -422,7 +437,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             }
         }
 
-        // 6. 注釈・デコレータ (`@Override`)
+        // 7. 注釈・デコレータ (`@Override`)
         if g.attribute.contains(&c) {
             let mut e = i + cl;
             while e < len {
@@ -443,7 +458,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             }
         }
 
-        // 7. 数値
+        // 8. 数値
         if c.is_ascii_digit() {
             let e = scan_number(line, i);
             o.push(Tok::Number, i, e);
@@ -452,7 +467,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             continue;
         }
 
-        // 8. 識別子 / キーワード
+        // 9. 識別子 / キーワード
         if g.ident_start(c) {
             let mut e = i + cl;
             while e < len {
@@ -470,6 +485,10 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
                 Some(t) => t,
                 // 直後が `(` なら呼び出し (空白は跨ぐ)
                 None if next_nonspace(line, e) == Some('(') => Tok::Function,
+                // 行頭で `=` の左にあるなら設定キー
+                None if line_start && g.key_value && next_nonspace(line, e) == Some('=') => {
+                    Tok::Attribute
+                }
                 None => Tok::Text,
             };
             o.push(tok, i, e);
@@ -478,7 +497,7 @@ pub fn scan_line(g: &Grammar, line: &str, st: &mut ScanState, out: &mut Vec<Span
             continue;
         }
 
-        // 9. 演算子 / 区切り / 空白
+        // 10. 演算子 / 区切り / 空白
         let tok = if is_operator(c) {
             Tok::Operator
         } else if is_punct(c) {
@@ -574,7 +593,11 @@ fn scan_string_body(
         let cl = c.len_utf8();
         if Some(c) == esc && i + cl < len {
             // エスケープは 1 文字ぶんだけ色を変える (`\n`, `\"` …)
-            let nl = line[i + cl..].chars().next().map(|n| n.len_utf8()).unwrap_or(0);
+            let nl = line[i + cl..]
+                .chars()
+                .next()
+                .map(|n| n.len_utf8())
+                .unwrap_or(0);
             o.push(Tok::Str, seg, i);
             o.push(Tok::Escape, i, i + cl + nl);
             i += cl + nl;
@@ -670,7 +693,10 @@ fn is_operator(c: char) -> bool {
 }
 
 fn is_punct(c: char) -> bool {
-    matches!(c, '(' | ')' | '{' | '}' | '[' | ']' | ';' | ',' | ':' | '.' | '@' | '#' | '$')
+    matches!(
+        c,
+        '(' | ')' | '{' | '}' | '[' | ']' | ';' | ',' | ':' | '.' | '@' | '#' | '$'
+    )
 }
 
 /// `needle` を `from` 以降から探す (バイト位置)。
@@ -748,6 +774,10 @@ struct RawSyntax {
     constants: Vec<String>,
     #[serde(default)]
     builtins: Vec<String>,
+    #[serde(default)]
+    key_value: bool,
+    #[serde(default)]
+    section_header: bool,
     #[serde(default)]
     case_sensitive: Option<bool>,
     #[serde(default)]
@@ -877,6 +907,8 @@ impl RawSyntax {
             types: set_of(self.types, case_sensitive),
             constants: set_of(self.constants, case_sensitive),
             builtins: set_of(self.builtins, case_sensitive),
+            key_value: self.key_value,
+            section_header: self.section_header,
             case_sensitive,
             fold,
         })
@@ -954,7 +986,11 @@ impl GrammarSet {
     ///  そちらを先に読み込む側で順序を決める)。
     pub fn merge(&mut self, other: GrammarSet) {
         for g in other.grammars {
-            if !self.grammars.iter().any(|x| x.name.eq_ignore_ascii_case(&g.name)) {
+            if !self
+                .grammars
+                .iter()
+                .any(|x| x.name.eq_ignore_ascii_case(&g.name))
+            {
                 self.grammars.push(g);
             }
         }
@@ -962,7 +998,9 @@ impl GrammarSet {
     }
 
     pub fn by_name(&self, name: &str) -> Option<&Grammar> {
-        self.grammars.iter().find(|g| g.name.eq_ignore_ascii_case(name))
+        self.grammars
+            .iter()
+            .find(|g| g.name.eq_ignore_ascii_case(name))
     }
 
     /// ファイル名から言語名を引く。拡張子より**ファイル名の完全一致**が優先
@@ -1009,12 +1047,18 @@ impl GrammarSet {
     /// 1 行目 (シェバン等) から引く。
     pub fn detect_first_line(&self, line: &str) -> Option<String> {
         for g in &self.grammars {
-            if g.first_line.iter().any(|p| !p.is_empty() && line.contains(p.as_str())) {
+            if g.first_line
+                .iter()
+                .any(|p| !p.is_empty() && line.contains(p.as_str()))
+            {
                 return Some(g.name.clone());
             }
         }
         for a in &self.aliases {
-            if a.first_line.iter().any(|p| !p.is_empty() && line.contains(p.as_str())) {
+            if a.first_line
+                .iter()
+                .any(|p| !p.is_empty() && line.contains(p.as_str()))
+            {
                 return Some(a.target.clone());
             }
         }
@@ -1051,7 +1095,10 @@ mod tests {
     use super::*;
 
     fn g(src: &str) -> Grammar {
-        GrammarSet::parse_toml(src).expect("解析できる").grammars.remove(0)
+        GrammarSet::parse_toml(src)
+            .expect("解析できる")
+            .grammars
+            .remove(0)
     }
 
     fn ts() -> Grammar {
@@ -1137,7 +1184,11 @@ builtins = ["console"]
     #[test]
     fn 呼び出し位置の識別子は関数扱い() {
         let gr = ts();
-        kinds(&gr, "foo(1);\n", &[(Tok::Function, "foo"), (Tok::Number, "1")]);
+        kinds(
+            &gr,
+            "foo(1);\n",
+            &[(Tok::Function, "foo"), (Tok::Number, "1")],
+        );
         // 空白を挟んでも呼び出し
         kinds(&gr, "bar ();\n", &[(Tok::Function, "bar")]);
         // 呼び出しでなければただの文字
@@ -1209,7 +1260,10 @@ builtins = ["console"]
         }
         // `1..2` の範囲は数値 2 つ
         let got = toks(&gr, "1..2;\n");
-        assert!(got.iter().filter(|(t, _)| *t == Tok::Number).count() == 2, "{got:?}");
+        assert!(
+            got.iter().filter(|(t, _)| *t == Tok::Number).count() == 2,
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -1229,7 +1283,11 @@ line_comment = ["--"]
 strings = ["'"]
 keywords = ["select", "from"]
 "##);
-        kinds(&gr, "SELECT * FROM t;\n", &[(Tok::Keyword, "SELECT"), (Tok::Keyword, "FROM")]);
+        kinds(
+            &gr,
+            "SELECT * FROM t;\n",
+            &[(Tok::Keyword, "SELECT"), (Tok::Keyword, "FROM")],
+        );
     }
 
     #[test]
@@ -1263,7 +1321,10 @@ strings = ["\""]
         kinds(&gr, "c = '\\n';\n", &[(Tok::Char, "'\\n'")]);
         // 閉じない `'` は 1 文字で諦める (Rust のライフタイム対策)
         let got = toks(&gr, "x: &'static str = 1;\n");
-        assert!(got.iter().any(|(t, b)| *t == Tok::Number && b == "1"), "{got:?}");
+        assert!(
+            got.iter().any(|(t, b)| *t == Tok::Number && b == "1"),
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -1285,12 +1346,24 @@ extensions = ["vue", "svelte"]
 "##,
         )
         .unwrap();
-        assert_eq!(set.detect_path(Path::new("/a/b/x.ts")).as_deref(), Some("TypeScript"));
-        assert_eq!(set.detect_path(Path::new("/a/Dockerfile")).as_deref(), Some("Dockerfile"));
-        assert_eq!(set.detect_path(Path::new("/a/app.vue")).as_deref(), Some("HTML"));
+        assert_eq!(
+            set.detect_path(Path::new("/a/b/x.ts")).as_deref(),
+            Some("TypeScript")
+        );
+        assert_eq!(
+            set.detect_path(Path::new("/a/Dockerfile")).as_deref(),
+            Some("Dockerfile")
+        );
+        assert_eq!(
+            set.detect_path(Path::new("/a/app.vue")).as_deref(),
+            Some("HTML")
+        );
         assert_eq!(set.detect_path(Path::new("/a/x.unknown")), None);
         assert_eq!(set.detect_token("ts").as_deref(), Some("TypeScript"));
-        assert_eq!(set.detect_token("TypeScript").as_deref(), Some("TypeScript"));
+        assert_eq!(
+            set.detect_token("TypeScript").as_deref(),
+            Some("TypeScript")
+        );
         assert_eq!(set.detect_token("svelte").as_deref(), Some("HTML"));
     }
 
@@ -1319,7 +1392,8 @@ extensions = ["tf", "tfvars"]
 
     #[test]
     fn 同名は先に読んだ方が残る() {
-        let mut a = GrammarSet::parse_toml("[[syntax]]\nname = \"X\"\nkeywords = [\"a\"]\n").unwrap();
+        let mut a =
+            GrammarSet::parse_toml("[[syntax]]\nname = \"X\"\nkeywords = [\"a\"]\n").unwrap();
         let b = GrammarSet::parse_toml("[[syntax]]\nname = \"X\"\nkeywords = [\"b\"]\n").unwrap();
         a.merge(b);
         assert_eq!(a.grammars.len(), 1);
@@ -1340,5 +1414,266 @@ extensions = ["tf", "tfvars"]
             start.elapsed()
         );
         assert!(!out.is_empty());
+    }
+}
+
+// ===========================================================================
+// 同梱パック (assets/plugins/syntax-pack) の検証
+//
+// **出荷するデータそのもの**を読んで検査する。実ファイルを読むので、
+// 定義を足したり壊したりすると必ずここで落ちる。
+// ===========================================================================
+#[cfg(test)]
+pub(crate) mod bundled_pack {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// 同梱パックの syntaxes/ ディレクトリを丸ごと読む。
+    pub(crate) fn load() -> GrammarSet {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/plugins/syntax-pack/syntaxes");
+        let mut errs = Vec::new();
+        let set = GrammarSet::load_path(&dir, &mut errs);
+        assert!(errs.is_empty(), "同梱パックが読めない: {errs:?}");
+        assert!(!set.grammars.is_empty(), "同梱パックが空");
+        set
+    }
+
+    #[test]
+    fn 同梱パックは全て読めて名前が重複しない() {
+        let set = load();
+        let mut names: Vec<String> = set.grammars.iter().map(|g| g.name.to_lowercase()).collect();
+        names.sort();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "言語名が重複している");
+        // 出荷する言語数の下限 (減ったら気づけるように)
+        assert!(
+            set.grammars.len() >= 50,
+            "同梱言語が減っている: {}",
+            set.grammars.len()
+        );
+    }
+
+    #[test]
+    fn どの言語も引ける入口を持つ() {
+        for g in &load().grammars {
+            assert!(
+                !g.extensions.is_empty() || !g.filenames.is_empty(),
+                "{}: 拡張子もファイル名も無い (絶対に選ばれない)",
+                g.name
+            );
+            assert!(
+                !g.keywords.is_empty()
+                    || !g.constants.is_empty()
+                    || !g.line_comment.is_empty()
+                    || !g.line_comment_bol.is_empty(),
+                "{}: 色を付ける材料が何も無い",
+                g.name
+            );
+        }
+    }
+
+    #[test]
+    fn 別名の行き先は実在する言語である() {
+        let set = load();
+        let syn = syntect::parsing::SyntaxSet::load_defaults_newlines();
+        for a in &set.aliases {
+            let known =
+                set.by_name(&a.target).is_some() || syn.find_syntax_by_name(&a.target).is_some();
+            assert!(known, "別名の行き先が存在しない: {}", a.target);
+            assert!(
+                !a.extensions.is_empty() || !a.filenames.is_empty(),
+                "{}: 別名に拡張子もファイル名も無い",
+                a.target
+            );
+        }
+    }
+
+    #[test]
+    fn 同じ拡張子を二重に主張しない() {
+        let set = load();
+        let mut owner: HashMap<String, String> = HashMap::new();
+        for g in &set.grammars {
+            for e in &g.extensions {
+                if let Some(prev) = owner.insert(e.clone(), g.name.clone()) {
+                    panic!("拡張子 .{e} を {prev} と {} が奪い合っている", g.name);
+                }
+            }
+        }
+        for a in &set.aliases {
+            for e in &a.extensions {
+                if let Some(prev) = owner.insert(e.clone(), a.target.clone()) {
+                    panic!("拡張子 .{e} を {prev} と別名 {} が奪い合っている", a.target);
+                }
+            }
+        }
+    }
+
+    /// 同梱パックが syntect の既定構文を**奪わない**こと。
+    /// 奪ってよいのは、既定の割り当てが明らかに実態と合っていないものだけで、
+    /// ここに理由付きで列挙する (増やすときは必ず理由を書く)。
+    #[test]
+    fn 既存構文の拡張子を横取りしない() {
+        let set = load();
+        let syn = syntect::parsing::SyntaxSet::load_defaults_newlines();
+        // (拡張子, 奪ってよい理由)
+        let allowed: &[(&str, &str)] = &[
+            (
+                "sass",
+                "syntect は .sass を Ruby Haml に割り当てている (誤り)",
+            ),
+            (
+                "s",
+                "syntect は .s を R (S 言語) に割り当てているが実態はアセンブラ",
+            ),
+            ("fish", "syntect は fish を bash 構文で塗るが文法が別物"),
+            (
+                "cc",
+                "C++ として塗る (syntect も C++ だが別名側で明示している)",
+            ),
+        ];
+        let mut stolen: Vec<String> = Vec::new();
+        let mut claims: Vec<(String, String)> = Vec::new();
+        for g in &set.grammars {
+            for e in &g.extensions {
+                claims.push((e.clone(), g.name.clone()));
+            }
+        }
+        for a in &set.aliases {
+            for e in &a.extensions {
+                claims.push((e.clone(), a.target.clone()));
+            }
+        }
+        for (ext, name) in claims {
+            let Some(s) = syn.find_syntax_by_extension(&ext) else {
+                continue;
+            };
+            if s.name == name || allowed.iter().any(|(a, _)| *a == ext) {
+                continue;
+            }
+            stolen.push(format!(".{ext}: syntect の {} を {name} が奪う", s.name));
+        }
+        stolen.sort();
+        assert!(stolen.is_empty(), "{stolen:#?}");
+    }
+
+    #[test]
+    fn 代表的なコードを走査しても不変条件が崩れない() {
+        let set = load();
+        // 全言語に同じ本文を通す (言語ごとの想定外文字で破綻しないこと)
+        let sample = concat!(
+            "// comment #comment -- comment ; comment % comment\n",
+            "fn main(int x) { return \"a\\nb\" + 'c' + 0xFF + 1.5e-3; }\n",
+            "日本語コメント \"文字列\" 絵文字 🙂\n",
+            "/* block\n still block */ end\n",
+        );
+        for g in &set.grammars {
+            let mut st = ScanState::default();
+            let mut out = Vec::new();
+            for line in sample.split_inclusive('\n') {
+                out.clear();
+                scan_line(g, line, &mut st, &mut out);
+                let mut at = 0;
+                for sp in &out {
+                    assert_eq!(sp.start, at, "{}: 隙間がある {out:?}", g.name);
+                    assert!(
+                        line.is_char_boundary(sp.start),
+                        "{}: 文字境界でない",
+                        g.name
+                    );
+                    assert!(line.is_char_boundary(sp.end), "{}: 文字境界でない", g.name);
+                    at = sp.end;
+                }
+                assert_eq!(at, line.len(), "{}: 行末まで覆っていない", g.name);
+            }
+        }
+    }
+
+    #[test]
+    fn 主要言語のキーワードに色が付く() {
+        let set = load();
+        // (言語, 本文, その本文に必ず現れるトークン種類)
+        let cases: &[(&str, &str, Tok)] = &[
+            ("TypeScript", "export const x: number = 1;\n", Tok::Keyword),
+            ("Kotlin", "fun main() { val x = 1 }\n", Tok::Keyword),
+            ("Swift", "func main() { let x = 1 }\n", Tok::Keyword),
+            ("Dart", "void main() { final x = 1; }\n", Tok::Keyword),
+            ("Zig", "pub fn main() void { const x = 1; }\n", Tok::Keyword),
+            (
+                "Elixir",
+                "defmodule M do\n  def f, do: 1\nend\n",
+                Tok::Keyword,
+            ),
+            ("TOML", "# c\nname = \"zaivern\"\n", Tok::Str),
+            ("Dockerfile", "FROM alpine:3\nRUN echo hi\n", Tok::Keyword),
+            (
+                "Terraform",
+                "resource \"aws_s3_bucket\" \"b\" {}\n",
+                Tok::Keyword,
+            ),
+            ("PowerShell", "Write-Host \"hi\"\n", Tok::Builtin),
+            ("Solidity", "contract C { uint256 x; }\n", Tok::Keyword),
+            ("GraphQL", "query Q { a }\n", Tok::Keyword),
+            ("Julia", "function f(x)\n  return x\nend\n", Tok::Keyword),
+            ("Nix", "{ pkgs }: let x = 1; in x\n", Tok::Keyword),
+            ("Verilog", "module m; endmodule\n", Tok::Keyword),
+            ("Assembly", "mov rax, 1\n", Tok::Keyword),
+            ("Vim script", "\" コメント\nset number\n", Tok::Comment),
+        ];
+        for (lang, src, want) in cases {
+            let g = set.by_name(lang).unwrap_or_else(|| panic!("{lang} が無い"));
+            let mut st = ScanState::default();
+            let mut hit = false;
+            for line in src.split_inclusive('\n') {
+                let mut out = Vec::new();
+                scan_line(g, line, &mut st, &mut out);
+                hit |= out.iter().any(|s| s.tok == *want);
+            }
+            assert!(hit, "{lang}: {want:?} が出ない");
+        }
+    }
+
+    #[test]
+    fn 設定ファイルのキーと見出しに色が付く() {
+        let set = load();
+        let g = set.by_name("TOML").expect("TOML");
+        let mut st = ScanState::default();
+        let mut got: Vec<(Tok, String)> = Vec::new();
+        for line in "# c\n[package]\nname = \"zaivern\"\nx = [1, 2]\n".split_inclusive('\n') {
+            let mut out = Vec::new();
+            scan_line(g, line, &mut st, &mut out);
+            for s in &out {
+                got.push((s.tok, line[s.start..s.end].to_string()));
+            }
+        }
+        assert!(
+            got.iter()
+                .any(|(t, b)| *t == Tok::Attribute && b == "[package]"),
+            "セクション見出しに色が付いていない: {got:?}"
+        );
+        assert!(
+            got.iter().any(|(t, b)| *t == Tok::Attribute && b == "name"),
+            "キーに色が付いていない: {got:?}"
+        );
+        // 値の配列は見出しではない
+        assert!(
+            got.iter().any(|(t, b)| *t == Tok::Number && b == "1"),
+            "配列の値が壊れている: {got:?}"
+        );
+    }
+
+    #[test]
+    fn 行頭限定コメントは行中では文字列のまま() {
+        let set = load();
+        let g = set.by_name("Vim script").expect("Vim script");
+        let mut st = ScanState::default();
+        let mut out = Vec::new();
+        let line = "let g:x = \"foo\"\n";
+        scan_line(g, line, &mut st, &mut out);
+        assert!(
+            out.iter().any(|s| s.tok == Tok::Str),
+            "行中の \" が文字列になっていない: {out:?}"
+        );
     }
 }

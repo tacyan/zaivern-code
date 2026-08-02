@@ -310,6 +310,7 @@ Every major capability ships as a plugin. On first launch they unpack into `~/.z
 | 🎯 `element-capture` | Pick an element on screen and pass its structure, styles, and a cropped image into the prompt |
 | 📊 `usage-meter` | Show agent usage in a panel |
 | ⚡ `quick-actions` | Detect the project type and run test / build / format immediately |
+| 🔤 `syntax-pack` | **Syntax highlighting for the major programming languages.** Adds **53 languages** missing from the built-in set — TypeScript / Kotlin / Swift / Dart / Zig / Elixir / Julia / Solidity / TOML / Dockerfile / Terraform / PowerShell and more — and resolves aliases such as `.tsx` `.vue` `.mjs` `.json5` (definitions are plain TOML, so **you can add your own language**) |
 | 🌐 `english-mode` | Language pack that switches the UI to English (the only one that starts disabled; toggle it in the 🔌 tab — English instantly, back to Japanese when off. The `lang/*.toml` dictionaries are editable) |
 
 They are just shell scripts. **Read them, copy them, rewrite them.** Anything you don't want can be disabled from the 🔌 tab.
@@ -326,6 +327,10 @@ If you can write shell, you can write one. A single folder under `~/.zaivern/plu
 - **🪝 Hooks**: fire on startup, file open/close, save, **agent completion**, approval-wait, git changes, or a fixed interval
 - **⚙️ Settings**: declare values for the user to fill in; they arrive as `ZV_CFG_<KEY>`
 - **🎨 Themes / ✂️ Snippets**: bundle the usual editor-compatible formats unchanged
+- **🔤 Syntax highlighting**: bundle language definitions (TOML) with `[[syntax]]`. One language = one
+  block: comment markers, quotes and a keyword table are all it takes. Colors come from the active
+  color theme's scopes, so added languages follow your theme
+  (→ [Add a language](#-add-a-language))
 
 **Drive the app itself**: set `output = "actions"` and every line of stdout becomes an instruction (JSON Lines).
 
@@ -337,6 +342,55 @@ echo '{"action":"agent_prompt","agent":"claude","text":"write tests for this fun
 Open files, notify, open tabs, run things in the terminal, rewrite a panel, **talk to an agent** — all fair game. `agent_prompt` **only places the text in the input box** unless you explicitly pass `submit`, so nothing runs off on its own.
 
 Three buttons to manage it all: **➕ New** (generates a full sample template), **📤 Export** (writes a `.zvplug` you can hand to anyone), **📦 Install** (just pick a received `.zvplug` / `.zip`).
+
+#### 🔤 Add a language
+
+`syntax-pack` ships by default, so **TypeScript, Kotlin and Zig are colored out of the box**.
+Anything missing is one TOML block away — no Rust, no rebuild.
+
+```toml
+# ~/.zaivern/plugins/my-langs/syntaxes/mylang.toml
+[[syntax]]
+name = "MyLang"
+extensions = ["ml2", "mylang"]     # extensions (no dot)
+filenames = ["mylangfile"]         # or match files that have no extension
+line_comment = ["#"]               # line comments
+block_comment = [["/*", "*/"]]     # block comments (tracked across lines)
+doc_comment = ["##"]               # doc comments get their own color
+strings = ["\"", "'"]               # quotes
+multiline_strings = [['"""', '"""']]
+char_literal = true                # treat 'a' as a character literal
+ident_extra = "$-"                 # extra characters allowed in identifiers
+attribute = "@"                    # annotation / decorator prefix
+preproc = ["#"]                    # preprocessor directives at line start
+fold = "brackets"                  # brackets | indent | markdown (folding strategy)
+case_sensitive = true
+keywords  = ["if", "else", "loop"]
+types     = ["int", "str"]
+constants = ["true", "false", "nil"]
+builtins  = ["print"]
+
+# If an existing syntax already fits, alias it instead of writing a new one
+[[alias]]
+target = "HTML"
+extensions = ["myhtml"]
+```
+
+```toml
+# ~/.zaivern/plugins/my-langs/plugin.toml
+[plugin]
+name = "my-langs"
+version = "0.1.0"
+api = 3
+
+[[syntax]]
+path = "syntaxes"        # a file or a directory
+```
+
+- Detection order is **plugin → built-in (syntect) → first line (shebang)**, so a plugin can also
+  override a built-in mapping.
+- Folding, indent guides and `⌘/` comment toggling all follow from the same definition.
+- The plugin row in the 🔌 tab shows **🔤 and the language count** (hover for the list).
 
 ```toml
 # plugin.toml example: auto-format JSON on save
