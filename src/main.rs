@@ -24,6 +24,7 @@ mod fuzzy;
 mod git;
 mod git_panel;
 mod github;
+mod grammar;
 mod highlight;
 mod html;
 mod i18n;

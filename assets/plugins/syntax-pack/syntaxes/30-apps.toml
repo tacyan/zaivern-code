@@ -1,0 +1,227 @@
+# アプリ開発でよく使う言語 (モバイル / JVM / .NET / 科学計算)。
+
+[[syntax]]
+name = "Kotlin"
+extensions = ["kt", "kts", "ktm"]
+tokens = ["kotlin", "kt"]
+line_comment = ["//"]
+doc_block = [["/**", "*/"]]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+char_literal = true
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "package", "import", "class", "interface", "object", "fun", "val", "var", "if", "else",
+  "when", "while", "do", "for", "return", "break", "continue", "in", "is", "as", "by",
+  "constructor", "init", "this", "super", "typealias", "throw", "try", "catch", "finally",
+  "where", "get", "set", "out", "reified", "inline", "noinline", "crossinline", "suspend",
+  "operator", "infix", "external", "tailrec", "vararg", "lateinit", "companion", "data",
+  "sealed", "enum", "annotation", "abstract", "final", "open", "override", "private",
+  "protected", "public", "internal", "actual", "expect", "const", "dynamic", "value",
+]
+types = [
+  "Int", "Long", "Short", "Byte", "Float", "Double", "Boolean", "Char", "String", "Unit",
+  "Any", "Nothing", "Array", "List", "MutableList", "Map", "MutableMap", "Set",
+  "MutableSet", "Pair", "Triple", "Sequence", "Flow", "Result", "Number", "Comparable",
+]
+constants = ["true", "false", "null"]
+builtins = [
+  "println", "print", "listOf", "mutableListOf", "mapOf", "mutableMapOf", "setOf",
+  "arrayOf", "arrayListOf", "let", "run", "apply", "also", "with", "require", "check",
+  "lazy", "TODO", "error", "repeat", "runCatching", "launch", "async", "runBlocking",
+]
+
+[[syntax]]
+name = "Swift"
+extensions = ["swift"]
+tokens = ["swift"]
+line_comment = ["//"]
+doc_comment = ["///"]
+doc_block = [["/**", "*/"]]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "associatedtype", "class", "deinit", "enum", "extension", "fileprivate", "func",
+  "import", "init", "inout", "internal", "let", "open", "operator", "private", "protocol",
+  "public", "rethrows", "static", "struct", "subscript", "typealias", "var", "where",
+  "actor", "async", "await", "break", "case", "continue", "default", "defer", "do", "else",
+  "fallthrough", "for", "guard", "if", "in", "repeat", "return", "switch", "throw",
+  "throws", "try", "while", "as", "is", "some", "any", "catch", "lazy", "weak", "unowned",
+  "mutating", "nonmutating", "override", "final", "indirect", "convenience", "required",
+  "dynamic", "optional", "willSet", "didSet", "get", "set", "package", "borrowing",
+  "consuming", "macro",
+]
+types = [
+  "Int", "Int8", "Int16", "Int32", "Int64", "UInt", "UInt8", "UInt16", "UInt32", "UInt64",
+  "Double", "Float", "CGFloat", "Bool", "String", "Character", "Array", "Dictionary",
+  "Set", "Optional", "Any", "AnyObject", "Void", "Never", "Data", "URL", "Date", "Result",
+  "Error", "Task", "Self",
+]
+constants = ["true", "false", "nil", "self", "super"]
+builtins = [
+  "print", "debugPrint", "dump", "map", "filter", "reduce", "compactMap", "flatMap",
+  "sorted", "append", "count", "isEmpty", "assert", "precondition", "fatalError",
+  "withUnsafePointer", "DispatchQueue",
+]
+
+[[syntax]]
+name = "Dart"
+extensions = ["dart"]
+tokens = ["dart", "flutter"]
+line_comment = ["//"]
+doc_comment = ["///"]
+doc_block = [["/**", "*/"]]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+multiline_strings = [["'''", "'''"], ["\"\"\"", "\"\"\""]]
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "abstract", "as", "assert", "async", "await", "base", "break", "case", "catch", "class",
+  "const", "continue", "covariant", "default", "deferred", "do", "dynamic", "else", "enum",
+  "export", "extends", "extension", "external", "factory", "final", "finally", "for",
+  "get", "hide", "if", "implements", "import", "in", "interface", "is", "late", "library",
+  "mixin", "new", "on", "operator", "part", "required", "rethrow", "return", "sealed",
+  "set", "show", "static", "super", "switch", "sync", "this", "throw", "try", "typedef",
+  "var", "void", "when", "while", "with", "yield",
+]
+types = [
+  "int", "double", "num", "bool", "String", "List", "Map", "Set", "Future", "Stream",
+  "Object", "Function", "Iterable", "Symbol", "Runes", "Duration", "DateTime", "Widget",
+  "BuildContext", "State", "StatelessWidget", "StatefulWidget",
+]
+constants = ["true", "false", "null"]
+builtins = ["print", "identical", "runApp", "setState", "assert", "jsonEncode", "jsonDecode"]
+
+[[syntax]]
+name = "F#"
+extensions = ["fs", "fsi", "fsx", "fsscript"]
+tokens = ["fsharp", "f#"]
+line_comment = ["//"]
+doc_comment = ["///"]
+block_comment = [["(*", "*)"]]
+strings = ["\""]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+char_literal = true
+attribute = "@"
+fold = "indent"
+keywords = [
+  "let", "mutable", "rec", "and", "or", "not", "in", "if", "then", "elif", "else", "match",
+  "with", "when", "function", "fun", "try", "finally", "raise", "for", "to", "downto",
+  "while", "do", "done", "use", "new", "type", "member", "abstract", "override",
+  "interface", "inherit", "static", "val", "module", "namespace", "open", "exception",
+  "of", "begin", "end", "yield", "return", "lazy", "assert", "upcast", "downcast", "base",
+  "null", "struct", "class", "delegate", "enum", "extern", "global", "inline", "internal",
+  "private", "public", "sig", "as", "async", "task",
+]
+types = [
+  "int", "int64", "float", "double", "single", "decimal", "string", "bool", "char", "unit",
+  "list", "array", "option", "seq", "Map", "Set", "byte", "sbyte", "obj", "exn", "Async",
+  "Task", "Result",
+]
+constants = ["true", "false", "null"]
+builtins = ["printfn", "printf", "sprintf", "failwith", "ignore", "id", "fst", "snd", "List", "Array", "Seq"]
+
+[[syntax]]
+name = "Visual Basic"
+extensions = ["vb", "vbs", "bas", "frm", "cls.vb"]
+tokens = ["vb", "vbnet", "visualbasic", "vbscript"]
+case_sensitive = false
+line_comment = ["'"]
+strings = ["\""]
+escape = ""
+fold = "indent"
+keywords = [
+  "dim", "as", "set", "public", "private", "protected", "friend", "static", "const", "sub",
+  "function", "end", "if", "then", "else", "elseif", "select", "case", "for", "each",
+  "next", "to", "step", "while", "wend", "do", "loop", "until", "exit", "return", "class",
+  "module", "structure", "enum", "interface", "implements", "inherits", "new", "me",
+  "mybase", "myclass", "try", "catch", "finally", "throw", "property", "get", "let",
+  "option", "explicit", "on", "error", "resume", "byval", "byref", "optional",
+  "paramarray", "overrides", "overloads", "shared", "withevents", "raiseevent", "event",
+  "delegate", "namespace", "imports", "and", "or", "not", "xor", "mod", "is", "isnot",
+  "like", "call", "redim", "erase", "with", "in", "of", "handles", "addhandler",
+]
+types = [
+  "integer", "long", "short", "byte", "single", "double", "decimal", "string", "boolean",
+  "date", "object", "variant", "char", "sbyte", "uinteger", "ulong", "ushort",
+]
+constants = ["true", "false", "nothing", "null", "empty"]
+builtins = ["msgbox", "inputbox", "cstr", "cint", "clng", "cdbl", "len", "mid", "left", "right", "trim", "ubound", "lbound", "console"]
+
+[[syntax]]
+name = "Haxe"
+extensions = ["hx", "hxml"]
+tokens = ["haxe"]
+line_comment = ["//"]
+doc_block = [["/**", "*/"]]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "abstract", "break", "case", "cast", "catch", "class", "continue", "default", "do",
+  "dynamic", "else", "enum", "extends", "extern", "final", "for", "function", "if",
+  "implements", "import", "in", "inline", "interface", "macro", "new", "operator",
+  "overload", "override", "package", "private", "public", "return", "static", "super",
+  "switch", "this", "throw", "try", "typedef", "untyped", "using", "var", "while",
+]
+types = [
+  "Int", "Float", "Bool", "String", "Array", "Map", "Dynamic", "Void", "Null", "Class",
+  "Enum", "Iterator", "Iterable", "UInt", "Single",
+]
+constants = ["true", "false", "null"]
+builtins = ["trace", "Std", "Math", "Reflect", "Type", "Sys"]
+
+[[syntax]]
+name = "Julia"
+extensions = ["jl"]
+tokens = ["julia", "jl"]
+line_comment = ["#"]
+block_comment = [["#=", "=#"]]
+strings = ["\""]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+char_literal = true
+ident_extra = "!"
+attribute = "@"
+fold = "indent"
+keywords = [
+  "baremodule", "begin", "break", "catch", "const", "continue", "do", "else", "elseif",
+  "end", "export", "finally", "for", "function", "global", "if", "import", "in", "isa",
+  "let", "local", "macro", "module", "mutable", "primitive", "quote", "return", "struct",
+  "try", "type", "using", "where", "while", "abstract", "outer",
+]
+types = [
+  "Int", "Int8", "Int16", "Int32", "Int64", "Int128", "UInt", "UInt8", "UInt16", "UInt32",
+  "UInt64", "Float16", "Float32", "Float64", "Bool", "Char", "String", "Symbol", "Vector",
+  "Matrix", "Array", "Dict", "Set", "Tuple", "NamedTuple", "Nothing", "Any", "Complex",
+  "Rational", "BigInt", "BigFloat", "Number", "Real", "Integer", "AbstractString",
+]
+constants = ["true", "false", "nothing", "missing", "NaN", "Inf", "pi", "im"]
+builtins = [
+  "println", "print", "@printf", "length", "size", "push!", "pop!", "append!", "map",
+  "filter", "reduce", "sum", "zeros", "ones", "rand", "reshape", "collect", "typeof",
+  "isa", "convert", "error", "throw", "include", "@time", "@assert",
+]
+
+[[alias]]
+target = "Kotlin"
+extensions = ["gradle.kts"]
+
+[[alias]]
+target = "Groovy"
+extensions = ["gradle", "jenkinsfile", "nf"]
+filenames = ["jenkinsfile"]
+
+[[alias]]
+target = "Scala"
+extensions = ["sc"]
+
+[[alias]]
+target = "Java"
+extensions = ["aj", "jsh"]

@@ -1,0 +1,377 @@
+# システム/低レイヤ言語。
+
+[[syntax]]
+name = "Zig"
+extensions = ["zig", "zon"]
+tokens = ["zig"]
+line_comment = ["//"]
+doc_comment = ["///", "//!"]
+strings = ["\""]
+# `\\` で始まる複数行文字列は行末までが 1 本 (中身にエスケープは無い)
+raw_strings = [["\\\\", "\n"]]
+char_literal = true
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "addrspace", "align", "allowzero", "and", "anyframe", "anytype", "asm", "async", "await",
+  "break", "callconv", "catch", "comptime", "const", "continue", "defer", "else", "enum",
+  "errdefer", "error", "export", "extern", "fn", "for", "if", "inline", "noalias",
+  "noinline", "nosuspend", "opaque", "or", "orelse", "packed", "pub", "resume", "return",
+  "linksection", "struct", "suspend", "switch", "test", "threadlocal", "try", "union",
+  "unreachable", "usingnamespace", "var", "volatile", "while",
+]
+types = [
+  "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+  "f16", "f32", "f64", "f80", "f128", "bool", "void", "noreturn", "type", "anyerror",
+  "anyopaque", "comptime_int", "comptime_float", "c_int", "c_uint", "c_long", "c_ulong",
+  "c_char", "c_short", "c_ushort", "c_longlong", "c_ulonglong",
+]
+constants = ["true", "false", "null", "undefined"]
+
+[[syntax]]
+name = "Nim"
+extensions = ["nim", "nims", "nimble"]
+tokens = ["nim"]
+line_comment = ["#"]
+doc_comment = ["##"]
+block_comment = [["#[", "]#"]]
+strings = ["\""]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+char_literal = true
+attribute = "@"
+fold = "indent"
+keywords = [
+  "addr", "and", "as", "asm", "bind", "block", "break", "case", "cast", "concept", "const",
+  "continue", "converter", "defer", "discard", "distinct", "div", "do", "elif", "else",
+  "end", "enum", "except", "export", "finally", "for", "from", "func", "if", "import",
+  "include", "interface", "is", "isnot", "iterator", "let", "macro", "method", "mixin",
+  "mod", "nil", "not", "notin", "object", "of", "or", "out", "proc", "ptr", "raise", "ref",
+  "return", "shl", "shr", "static", "template", "try", "tuple", "type", "using", "var",
+  "when", "while", "xor", "yield",
+]
+types = [
+  "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64",
+  "float", "float32", "float64", "bool", "char", "string", "cstring", "seq", "array",
+  "openArray", "pointer", "auto", "any", "range", "set", "Table", "Option",
+]
+constants = ["true", "false", "nil"]
+builtins = ["echo", "len", "add", "new", "result", "assert", "doAssert", "inc", "dec", "high", "low"]
+
+[[syntax]]
+name = "Crystal"
+extensions = ["cr"]
+tokens = ["crystal"]
+line_comment = ["#"]
+strings = ["\"", "'"]
+fold = "indent"
+keywords = [
+  "abstract", "alias", "annotation", "as", "asm", "begin", "break", "case", "class", "def",
+  "do", "else", "elsif", "end", "ensure", "enum", "extend", "for", "fun", "if", "in",
+  "include", "instance_sizeof", "lib", "macro", "module", "next", "of", "out", "pointerof",
+  "private", "protected", "require", "rescue", "return", "select", "self", "sizeof",
+  "struct", "super", "then", "type", "typeof", "union", "uninitialized", "unless", "until",
+  "when", "while", "with", "yield",
+]
+types = [
+  "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64", "Float32",
+  "Float64", "Bool", "Char", "String", "Symbol", "Array", "Hash", "Set", "Tuple", "Nil",
+  "Proc", "Range", "Slice", "Number",
+]
+constants = ["true", "false", "nil"]
+builtins = ["puts", "print", "p", "pp", "raise", "loop", "spawn", "gets"]
+
+[[syntax]]
+name = "Odin"
+extensions = ["odin"]
+tokens = ["odin"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+char_literal = true
+fold = "brackets"
+keywords = [
+  "package", "import", "foreign", "using", "when", "if", "else", "for", "switch", "case",
+  "defer", "return", "proc", "struct", "union", "enum", "bit_set", "map", "dynamic", "in",
+  "not_in", "do", "break", "continue", "fallthrough", "distinct", "context", "or_else",
+  "or_return", "cast", "transmute", "auto_cast", "asm", "matrix",
+]
+types = [
+  "int", "i8", "i16", "i32", "i64", "i128", "uint", "u8", "u16", "u32", "u64", "u128",
+  "uintptr", "f16", "f32", "f64", "bool", "b8", "b16", "b32", "b64", "string", "cstring",
+  "rune", "rawptr", "any", "byte", "complex64", "complex128",
+]
+constants = ["true", "false", "nil"]
+builtins = ["len", "cap", "append", "make", "new", "delete", "free", "size_of", "align_of", "offset_of", "type_of"]
+
+[[syntax]]
+name = "Vala"
+extensions = ["vala", "vapi"]
+tokens = ["vala"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+multiline_strings = [["\"\"\"", "\"\"\""]]
+char_literal = true
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "namespace", "class", "interface", "struct", "enum", "delegate", "signal", "public",
+  "private", "protected", "internal", "static", "const", "abstract", "virtual", "override",
+  "new", "using", "var", "if", "else", "for", "foreach", "while", "do", "switch", "case",
+  "break", "continue", "return", "try", "catch", "finally", "throw", "throws", "lock",
+  "owned", "unowned", "weak", "async", "yield", "construct", "get", "set", "in", "out",
+  "ref", "params", "base", "this", "as", "is", "sizeof", "typeof",
+]
+types = [
+  "int", "uint", "long", "ulong", "short", "ushort", "char", "uchar", "float", "double",
+  "bool", "string", "void", "size_t", "ssize_t", "int8", "int16", "int32", "int64",
+  "uint8", "uint16", "uint32", "uint64", "unichar",
+]
+constants = ["true", "false", "null"]
+builtins = ["print", "printf", "stdout", "stderr", "message", "warning", "error"]
+
+[[syntax]]
+name = "Ada"
+extensions = ["adb", "ads", "ada"]
+tokens = ["ada"]
+case_sensitive = false
+line_comment = ["--"]
+strings = ["\""]
+escape = ""
+fold = "indent"
+keywords = [
+  "abort", "abs", "abstract", "accept", "access", "aliased", "all", "and", "array", "at",
+  "begin", "body", "case", "constant", "declare", "delay", "delta", "digits", "do", "else",
+  "elsif", "end", "entry", "exception", "exit", "for", "function", "generic", "goto", "if",
+  "in", "interface", "is", "limited", "loop", "mod", "new", "not", "null", "of", "or",
+  "others", "out", "overriding", "package", "pragma", "private", "procedure", "protected",
+  "raise", "range", "record", "rem", "renames", "requeue", "return", "reverse", "select",
+  "separate", "some", "subtype", "synchronized", "tagged", "task", "terminate", "then",
+  "type", "until", "use", "when", "while", "with", "xor",
+]
+types = [
+  "integer", "natural", "positive", "float", "long_float", "character", "string",
+  "boolean", "duration", "wide_character", "wide_string",
+]
+constants = ["true", "false"]
+
+[[syntax]]
+name = "Fortran"
+extensions = ["f90", "f95", "f03", "f08", "f", "for", "ftn", "fpp"]
+tokens = ["fortran"]
+case_sensitive = false
+line_comment = ["!"]
+strings = ["\"", "'"]
+escape = ""
+fold = "indent"
+keywords = [
+  "program", "endprogram", "end", "subroutine", "endsubroutine", "function", "endfunction",
+  "module", "endmodule", "submodule", "use", "implicit", "none", "contains", "interface",
+  "endinterface", "type", "endtype", "class", "call", "return", "stop", "print", "write",
+  "read", "open", "close", "inquire", "format", "common", "data", "equivalence", "save",
+  "external", "intrinsic", "recursive", "pure", "elemental", "result", "associate",
+  "block", "forall", "where", "if", "then", "else", "elseif", "endif", "do", "enddo",
+  "while", "select", "case", "endselect", "cycle", "exit", "go", "goto", "continue",
+  "allocate", "deallocate", "nullify", "public", "private", "protected", "intent",
+  "optional", "parameter", "pointer", "target", "allocatable", "dimension",
+]
+types = [
+  "integer", "real", "complex", "logical", "character", "double", "precision", "kind",
+]
+constants = [".true.", ".false."]
+
+[[syntax]]
+name = "Assembly"
+extensions = ["asm", "nasm", "s"]
+tokens = ["asm", "assembly", "nasm", "gas"]
+case_sensitive = false
+line_comment = [";", "//"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+ident_extra = ".%"
+fold = "indent"
+keywords = [
+  "mov", "movl", "movq", "movb", "movw", "movzx", "movsx", "lea", "push", "pop", "add",
+  "sub", "mul", "imul", "div", "idiv", "inc", "dec", "neg", "cmp", "test", "and", "or",
+  "xor", "not", "shl", "shr", "sar", "sal", "rol", "ror", "jmp", "je", "jne", "jz", "jnz",
+  "jg", "jge", "jl", "jle", "ja", "jae", "jb", "jbe", "call", "ret", "leave", "enter",
+  "nop", "int", "syscall", "sysret", "hlt", "cpuid", "loop", "cld", "std", "rep", "repe",
+  "repne", "movs", "stos", "lods", "scas", "sete", "setne", "cmove", "cmovne", "fld",
+  "fstp", "fadd", "fsub", "fmul", "fdiv", "adr", "adrp", "ldr", "str", "stp", "ldp", "bl",
+  "blr", "bx", "cbz", "cbnz", "svc", "msr", "mrs",
+]
+types = [
+  "byte", "word", "dword", "qword", "ptr", "short", "near", "far", ".byte", ".word",
+  ".long", ".quad", ".ascii", ".asciz", ".string", ".space", ".zero",
+]
+builtins = [
+  ".text", ".data", ".bss", ".rodata", ".section", ".global", ".globl", ".extern", ".align",
+  ".p2align", ".type", ".size", ".file", ".equ", ".set", ".macro", ".endm", ".include",
+  "section", "global", "extern", "bits", "org", "db", "dw", "dd", "dq", "resb", "resw",
+  "resd", "resq", "equ", "times",
+  "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12",
+  "r13", "r14", "r15", "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "ax", "bx",
+  "cx", "dx", "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh", "rip", "sp", "lr", "pc",
+  "x0", "x1", "x2", "x3", "x29", "x30", "w0", "w1", "w2", "w3",
+]
+
+[[syntax]]
+name = "Solidity"
+extensions = ["sol"]
+tokens = ["solidity", "sol"]
+line_comment = ["//"]
+doc_comment = ["///"]
+doc_block = [["/**", "*/"]]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+fold = "brackets"
+keywords = [
+  "pragma", "solidity", "import", "contract", "interface", "library", "is", "using", "for",
+  "function", "modifier", "event", "error", "struct", "enum", "mapping", "public",
+  "private", "internal", "external", "pure", "view", "payable", "constant", "immutable",
+  "returns", "return", "if", "else", "while", "do", "break", "continue", "throw", "emit",
+  "new", "delete", "require", "assert", "revert", "try", "catch", "constructor",
+  "fallback", "receive", "abstract", "override", "virtual", "memory", "storage",
+  "calldata", "indexed", "anonymous", "unchecked", "assembly", "let", "type",
+]
+types = [
+  "address", "bool", "string", "bytes", "byte", "bytes1", "bytes4", "bytes8", "bytes16",
+  "bytes32", "int", "int8", "int16", "int32", "int64", "int128", "int256", "uint",
+  "uint8", "uint16", "uint32", "uint64", "uint128", "uint256", "fixed", "ufixed",
+]
+constants = [
+  "true", "false", "wei", "gwei", "ether", "seconds", "minutes", "hours", "days", "weeks",
+]
+builtins = [
+  "msg", "block", "tx", "abi", "keccak256", "sha256", "ripemd160", "ecrecover", "addmod",
+  "mulmod", "selfdestruct", "blockhash", "gasleft", "this", "super",
+]
+
+[[syntax]]
+name = "GLSL"
+extensions = ["glsl", "vert", "frag", "geom", "comp", "tesc", "tese", "vsh", "fsh", "hlsl", "fx", "metal"]
+tokens = ["glsl", "hlsl", "shader"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+preproc = ["#"]
+fold = "brackets"
+keywords = [
+  "attribute", "const", "uniform", "varying", "buffer", "shared", "coherent", "volatile",
+  "restrict", "readonly", "writeonly", "layout", "centroid", "flat", "smooth",
+  "noperspective", "patch", "sample", "break", "continue", "do", "for", "while", "switch",
+  "case", "default", "if", "else", "subroutine", "in", "out", "inout", "discard", "return",
+  "struct", "precision", "lowp", "mediump", "highp", "invariant", "precise", "cbuffer",
+  "register", "technique", "pass", "kernel", "vertex", "fragment",
+]
+types = [
+  "void", "bool", "int", "uint", "float", "double", "vec2", "vec3", "vec4", "dvec2",
+  "dvec3", "dvec4", "bvec2", "bvec3", "bvec4", "ivec2", "ivec3", "ivec4", "uvec2", "uvec3",
+  "uvec4", "mat2", "mat3", "mat4", "mat2x2", "mat3x3", "mat4x4", "sampler1D", "sampler2D",
+  "sampler3D", "samplerCube", "sampler2DShadow", "image2D", "half", "half2", "half3",
+  "half4", "float2", "float3", "float4", "float4x4", "Texture2D", "SamplerState",
+]
+constants = ["true", "false"]
+builtins = [
+  "gl_Position", "gl_FragColor", "gl_FragCoord", "gl_VertexID", "gl_InstanceID",
+  "gl_GlobalInvocationID", "texture", "texture2D", "textureLod", "normalize", "dot",
+  "cross", "length", "distance", "mix", "clamp", "smoothstep", "step", "pow", "exp",
+  "log", "sqrt", "inversesqrt", "sin", "cos", "tan", "abs", "sign", "floor", "ceil",
+  "fract", "mod", "min", "max", "reflect", "refract", "transpose", "inverse", "dFdx",
+  "dFdy",
+]
+
+[[syntax]]
+name = "WGSL"
+extensions = ["wgsl"]
+tokens = ["wgsl"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "fn", "let", "var", "const", "struct", "return", "if", "else", "loop", "for", "while",
+  "break", "continue", "continuing", "discard", "switch", "case", "default", "fallthrough",
+  "override", "alias", "enable", "requires", "const_assert", "diagnostic", "ptr",
+]
+types = [
+  "bool", "i32", "u32", "f32", "f16", "vec2", "vec3", "vec4", "vec2f", "vec3f", "vec4f",
+  "mat2x2", "mat3x3", "mat4x4", "array", "atomic", "sampler", "sampler_comparison",
+  "texture_1d", "texture_2d", "texture_3d", "texture_cube", "texture_storage_2d",
+]
+constants = ["true", "false"]
+builtins = [
+  "textureSample", "textureLoad", "textureStore", "dot", "cross", "normalize", "length",
+  "distance", "mix", "clamp", "min", "max", "abs", "pow", "select", "arrayLength",
+  "workgroupBarrier", "storageBarrier",
+]
+
+[[syntax]]
+name = "Verilog"
+extensions = ["v", "sv", "svh", "vh"]
+tokens = ["verilog", "systemverilog"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+attribute = "`"
+fold = "indent"
+keywords = [
+  "module", "endmodule", "input", "output", "inout", "wire", "reg", "logic", "parameter",
+  "localparam", "assign", "always", "always_ff", "always_comb", "always_latch", "begin",
+  "end", "if", "else", "case", "casez", "casex", "endcase", "default", "for", "while",
+  "repeat", "forever", "initial", "final", "function", "endfunction", "task", "endtask",
+  "generate", "endgenerate", "genvar", "posedge", "negedge", "or", "and", "not", "xor",
+  "nand", "nor", "buf", "typedef", "struct", "union", "enum", "package", "endpackage",
+  "import", "export", "class", "endclass", "virtual", "extends", "implements", "interface",
+  "endinterface", "modport", "clocking", "endclocking", "property", "endproperty",
+  "assert", "assume", "cover", "sequence", "endsequence", "constraint", "randc", "rand",
+  "static", "automatic", "unique", "priority", "return", "break", "continue", "fork",
+  "join", "join_any", "join_none", "wait", "disable", "defparam", "specify", "endspecify",
+]
+types = [
+  "integer", "real", "realtime", "time", "signed", "unsigned", "bit", "byte", "shortint",
+  "int", "longint", "shortreal", "string", "void", "chandle", "event", "tri", "tri0",
+  "tri1", "wand", "wor", "supply0", "supply1",
+]
+builtins = [
+  "$display", "$write", "$monitor", "$finish", "$stop", "$time", "$random", "$readmemh",
+  "$readmemb", "$fopen", "$fclose", "$fwrite", "$signed", "$unsigned", "$clog2", "$bits",
+  "$past", "$rose", "$fell", "$stable", "$error", "$fatal", "$warning", "$info",
+]
+
+[[syntax]]
+name = "VHDL"
+extensions = ["vhd", "vhdl"]
+tokens = ["vhdl"]
+case_sensitive = false
+line_comment = ["--"]
+strings = ["\""]
+escape = ""
+fold = "indent"
+keywords = [
+  "entity", "architecture", "is", "begin", "end", "port", "map", "signal", "variable",
+  "constant", "process", "if", "then", "elsif", "else", "case", "when", "others", "loop",
+  "for", "while", "generate", "type", "subtype", "record", "array", "of", "downto", "to",
+  "in", "out", "inout", "buffer", "library", "use", "package", "body", "function",
+  "procedure", "return", "component", "generic", "attribute", "null", "wait", "until",
+  "report", "severity", "assert", "with", "select", "after", "transport", "inertial",
+  "block", "configuration", "alias", "shared", "impure", "pure", "and", "or", "not",
+  "nand", "nor", "xor", "xnor", "mod", "rem", "abs", "sll", "srl", "sla", "sra",
+]
+types = [
+  "std_logic", "std_logic_vector", "std_ulogic", "std_ulogic_vector", "signed", "unsigned",
+  "integer", "natural", "positive", "boolean", "bit", "bit_vector", "character", "string",
+  "real", "time", "severity_level",
+]
+constants = ["true", "false"]
+
+# CUDA / Metal のホスト側は C++ そのものなので、既存の C++ 構文へ寄せる。
+[[alias]]
+target = "C++"
+extensions = ["cu", "cuh", "cc", "ino", "ixx", "cppm"]
+tokens = ["cuda"]
+
+[[alias]]
+target = "C"
+extensions = ["h.in", "c.in"]

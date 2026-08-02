@@ -308,6 +308,7 @@ AI が 9 割を書く時代でも、最後の 1 割——設計の勘所、名�
 | 🎯 `element-capture` | 画面上の要素を選び、その構造・スタイル・切り抜き画像をプロンプトへ渡す |
 | 📊 `usage-meter` | エージェントの利用状況をパネルに表示する |
 | ⚡ `quick-actions` | プロジェクトの種類を判別し、テスト・ビルド・整形をすぐ実行する |
+| 🔤 `syntax-pack` | **主要プログラミング言語の構文ハイライト**。TypeScript / Kotlin / Swift / Dart / Zig / Elixir / Julia / Solidity / TOML / Dockerfile / Terraform / PowerShell など **53 言語**を追加し、`.tsx` `.vue` `.mjs` `.json5` などの別名も解決する(定義は TOML なので**言語を自分で足せる**) |
 | 🌐 `english-mode` | UI を英語表示に切り替える言語パック(これだけ初回は無効。🔌 タブで ON にすると即座に English、OFF で日本語に戻る。辞書 `lang/*.toml` は編集可) |
 
 中身はただのシェルスクリプトです。**読んで、真似して、書き換えて構いません。** 要らないものは 🔌 タブで無効にできます。
@@ -324,6 +325,9 @@ AI が 9 割を書く時代でも、最後の 1 割——設計の勘所、名�
 - **🪝 フック**: 起動時・ファイル開閉・保存時・**エージェント完了時**・承認待ち・git 変更時・一定間隔で自動実行
 - **⚙️ 設定項目**: ユーザーに入力させる値を宣言でき、`ZV_CFG_<KEY>` として渡ります
 - **🎨 テーマ / ✂️ スニペット**: 一般的なエディタ互換形式をそのまま同梱できます
+- **🔤 構文ハイライト**: `[[syntax]]` で言語定義(TOML)を同梱できます。1 言語 = 1 ブロックで、
+  コメント記号・引用符・キーワード表を書くだけ。色はカラーテーマのスコープから引くので、
+  テーマを変えれば追加言語も一緒に変わります(→ [構文ハイライトを足す](#-構文ハイライトを足す))
 
 **アプリを操作する**: `output = "actions"` にすると、標準出力の各行が指示になります(JSON Lines)。
 
@@ -335,6 +339,55 @@ echo '{"action":"agent_prompt","agent":"claude","text":"この関数をテスト
 ファイルを開く・通知する・タブを開く・ターミナルで実行する・パネルを書き換える・**エージェントに話しかける**などが自由に行えます。`agent_prompt` は `submit` を明示しない限り**送信せず入力欄に置くだけ**なので、勝手に走り出すことはありません。
 
 操作は 3 ボタン: **➕ 新規作成**(テンプレート一式を生成)/ **📤 エクスポート**(`.zvplug` を書き出して配布)/ **📦 インストール**(受け取った `.zvplug` / `.zip` を選ぶだけ)。
+
+#### 🔤 構文ハイライトを足す
+
+標準の `syntax-pack` が入っているので、**TypeScript も Kotlin も Zig も最初から色が付きます**。
+足りない言語は TOML を 1 ブロック書くだけで足せます(Rust の再ビルドは不要)。
+
+```toml
+# ~/.zaivern/plugins/my-langs/syntaxes/mylang.toml
+[[syntax]]
+name = "MyLang"
+extensions = ["ml2", "mylang"]     # 拡張子 (ドット無し)
+filenames = ["mylangfile"]         # 拡張子を持たないファイル名でもよい
+line_comment = ["#"]               # 行コメント
+block_comment = [["/*", "*/"]]     # ブロックコメント (行を跨いで追跡する)
+doc_comment = ["##"]               # ドキュメントコメントは色を分ける
+strings = ["\"", "'"]               # 引用符
+multiline_strings = [[', ']]
+char_literal = true                # 'a' を文字リテラルとして扱う
+ident_extra = "$-"                 # 識別子に使える追加文字
+attribute = "@"                    # 注釈・デコレータの先頭記号
+preproc = ["#"]                    # 行頭のプリプロセッサ指令
+fold = "brackets"                  # brackets | indent | markdown (折りたたみ方式)
+case_sensitive = true
+keywords  = ["if", "else", "loop"]
+types     = ["int", "str"]
+constants = ["true", "false", "nil"]
+builtins  = ["print"]
+
+# 既にある構文で足りるなら、別名で回せば定義は増えません
+[[alias]]
+target = "HTML"
+extensions = ["myhtml"]
+```
+
+```toml
+# ~/.zaivern/plugins/my-langs/plugin.toml
+[plugin]
+name = "my-langs"
+version = "0.1.0"
+api = 3
+
+[[syntax]]
+path = "syntaxes"        # ファイルでもディレクトリでもよい
+```
+
+- 判定の順番は **プラグイン → 内蔵(syntect) → 1 行目(シェバン)**。内蔵の割り当てを
+  上書きしたいときもプラグイン側に書けば勝ちます。
+- 折りたたみ・インデントガイド・`⌘/` のコメント切り替えも、この定義から自動で効きます。
+- 🔌 タブのプラグイン行に **🔤 と言語数**が出ます(ホバーで言語名の一覧)。
 
 ```toml
 # plugin.toml の例: 保存時に JSON を自動整形

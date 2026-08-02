@@ -1,0 +1,120 @@
+# シェル / エディタ設定 / テキスト処理。
+
+[[syntax]]
+name = "PowerShell"
+extensions = ["ps1", "psm1", "psd1", "ps1xml"]
+tokens = ["powershell", "pwsh", "ps1"]
+case_sensitive = false
+line_comment = ["#"]
+block_comment = [["<#", "#>"]]
+strings = ["\"", "'"]
+# `Get-ChildItem` や `-eq` を 1 語として扱うため `-` を識別子に含める
+ident_extra = "-$:"
+fold = "brackets"
+keywords = [
+  "function", "filter", "workflow", "configuration", "param", "begin", "process", "end",
+  "if", "elseif", "else", "switch", "foreach", "for", "while", "do", "until", "break",
+  "continue", "return", "try", "catch", "finally", "throw", "trap", "class", "enum",
+  "using", "namespace", "parallel", "sequence", "inlinescript", "exit", "in",
+  "-eq", "-ne", "-gt", "-ge", "-lt", "-le", "-like", "-notlike", "-match", "-notmatch",
+  "-contains", "-notcontains", "-in", "-notin", "-is", "-isnot", "-and", "-or", "-not",
+  "-xor", "-band", "-bor", "-join", "-split", "-replace", "-f",
+]
+types = ["string", "int", "long", "bool", "double", "decimal", "array", "hashtable", "pscustomobject", "scriptblock", "void", "switch"]
+constants = ["$true", "$false", "$null", "$_", "$args", "$PSItem", "$PSScriptRoot", "$Error", "$Host", "$Home", "$PWD"]
+builtins = [
+  "Write-Host", "Write-Output", "Write-Error", "Write-Warning", "Write-Verbose",
+  "Write-Debug", "Read-Host", "Get-ChildItem", "Get-Item", "Get-Content", "Set-Content",
+  "Add-Content", "New-Item", "Remove-Item", "Copy-Item", "Move-Item", "Rename-Item",
+  "Test-Path", "Join-Path", "Split-Path", "Resolve-Path", "Set-Location", "Get-Location",
+  "Select-Object", "Where-Object", "ForEach-Object", "Sort-Object", "Group-Object",
+  "Measure-Object", "Compare-Object", "Get-Command", "Get-Help", "Get-Member",
+  "Get-Process", "Stop-Process", "Start-Process", "Get-Service", "Invoke-Expression",
+  "Invoke-WebRequest", "Invoke-RestMethod", "ConvertTo-Json", "ConvertFrom-Json",
+  "Import-Module", "Export-ModuleMember", "New-Object", "Set-ExecutionPolicy",
+]
+
+[[syntax]]
+name = "Vim script"
+extensions = ["vim", "vimrc", "gvimrc", "nvimrc"]
+filenames = [".vimrc", "_vimrc", ".gvimrc", "init.vim"]
+tokens = ["vim", "viml", "vimscript"]
+# `"` は行頭ではコメント、行中では文字列という二役。行頭限定で判定する。
+line_comment_bol = ["\""]
+strings = ["\"", "'"]
+ident_extra = "#:&$<>"
+fold = "indent"
+keywords = [
+  "if", "elseif", "else", "endif", "while", "endwhile", "for", "endfor", "in", "try",
+  "catch", "finally", "endtry", "throw", "function", "endfunction", "return", "let",
+  "unlet", "const", "call", "execute", "source", "set", "setlocal", "setglobal", "map",
+  "nmap", "imap", "vmap", "xmap", "cmap", "tmap", "noremap", "nnoremap", "inoremap",
+  "vnoremap", "xnoremap", "cnoremap", "tnoremap", "autocmd", "augroup", "command",
+  "highlight", "syntax", "colorscheme", "normal", "echo", "echom", "echoerr", "silent",
+  "runtime", "packadd", "finish", "abort", "range", "range?", "break", "continue",
+  "lua", "python", "vim9script", "def", "enddef", "var", "export", "import",
+]
+constants = ["v:true", "v:false", "v:null", "v:count", "v:version"]
+builtins = [
+  "has", "exists", "empty", "len", "type", "get", "add", "extend", "insert", "remove",
+  "filter", "map", "sort", "join", "split", "substitute", "match", "matchstr", "stridx",
+  "strlen", "printf", "expand", "fnamemodify", "getline", "setline", "line", "col",
+  "bufnr", "bufname", "winnr", "system", "systemlist", "input", "confirm",
+]
+
+[[syntax]]
+name = "AWK"
+extensions = ["awk", "gawk", "mawk"]
+tokens = ["awk", "gawk"]
+first_line = ["#!/usr/bin/awk", "#!/usr/bin/env awk"]
+line_comment = ["#"]
+strings = ["\""]
+fold = "brackets"
+keywords = [
+  "BEGIN", "END", "function", "func", "if", "else", "while", "for", "do", "break",
+  "continue", "next", "nextfile", "exit", "return", "delete", "print", "printf",
+  "getline", "in", "switch", "case", "default",
+]
+builtins = [
+  "length", "substr", "index", "split", "sub", "gsub", "gensub", "match", "sprintf",
+  "tolower", "toupper", "system", "close", "fflush", "srand", "rand", "int", "sin",
+  "cos", "atan2", "exp", "log", "sqrt", "asort", "asorti", "strftime", "systime",
+  "ENVIRON", "ARGC", "ARGV", "NR", "FNR", "NF", "FS", "OFS", "ORS", "RS", "FILENAME",
+  "RSTART", "RLENGTH", "SUBSEP", "CONVFMT", "OFMT",
+]
+
+[[syntax]]
+name = "Fish"
+extensions = ["fish"]
+tokens = ["fish"]
+first_line = ["#!/usr/bin/fish", "#!/usr/bin/env fish", "#!/bin/fish"]
+line_comment = ["#"]
+strings = ["\"", "'"]
+ident_extra = "-$_"
+fold = "indent"
+keywords = [
+  "function", "end", "if", "else", "switch", "case", "for", "in", "while", "begin",
+  "return", "break", "continue", "and", "or", "not", "test", "set", "read", "source",
+  "exit", "exec", "eval", "command", "builtin", "status", "argparse", "complete",
+]
+builtins = [
+  "echo", "printf", "string", "math", "count", "contains", "abbr", "alias", "bind",
+  "fish_config", "funced", "funcsave", "history", "jobs", "type", "cd", "pwd", "set_color",
+]
+constants = ["true", "false"]
+
+[[alias]]
+target = "Bourne Again Shell (bash)"
+extensions = ["ksh", "mksh", "ash", "shrc", "bats", "zshrc", "bash_profile", "profile"]
+filenames = [".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile", ".bash_aliases", ".zlogin", "makefile.sh"]
+tokens = ["shell", "console", "terminal", "zsh", "ksh", "bats"]
+
+[[alias]]
+target = "Batch File"
+extensions = ["btm"]
+tokens = ["batch", "cmd", "dosbatch"]
+
+[[alias]]
+target = "Diff"
+extensions = ["rej", "orig.diff"]
+tokens = ["udiff"]

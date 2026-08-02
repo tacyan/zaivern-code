@@ -1,0 +1,280 @@
+# 設定・インフラ・スキーマ記述。
+#
+# 「コードではないから色は要らない」は誤り — Cargo.toml / Dockerfile /
+# *.tf は毎日開くのに、素の白文字だとコメントと値の区別すら付かない。
+
+[[syntax]]
+name = "TOML"
+extensions = ["toml"]
+key_value = true
+section_header = true
+filenames = ["cargo.lock", "poetry.lock", "uv.lock", "pdm.lock"]
+tokens = ["toml"]
+line_comment = ["#"]
+strings = ["\"", "'"]
+multiline_strings = [["\"\"\"", "\"\"\""], ["'''", "'''"]]
+fold = "indent"
+constants = ["true", "false", "inf", "nan"]
+
+[[syntax]]
+name = "Dockerfile"
+extensions = ["dockerfile", "containerfile"]
+filenames = ["dockerfile", "containerfile"]
+tokens = ["dockerfile", "docker"]
+case_sensitive = false
+line_comment = ["#"]
+strings = ["\"", "'"]
+fold = "indent"
+keywords = [
+  "from", "run", "cmd", "label", "maintainer", "expose", "env", "add", "copy",
+  "entrypoint", "volume", "user", "workdir", "arg", "onbuild", "stopsignal",
+  "healthcheck", "shell", "as",
+]
+constants = ["true", "false"]
+
+[[syntax]]
+name = "Terraform"
+key_value = true
+extensions = ["tf", "tfvars", "hcl", "nomad"]
+filenames = ["terragrunt.hcl"]
+tokens = ["terraform", "hcl", "tf"]
+line_comment = ["#", "//"]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+multiline_strings = [["<<-EOF", "EOF"], ["<<EOF", "EOF"]]
+fold = "brackets"
+keywords = [
+  "resource", "variable", "output", "provider", "module", "data", "locals", "terraform",
+  "provisioner", "backend", "for_each", "count", "depends_on", "lifecycle", "dynamic",
+  "if", "for", "in", "connection", "required_providers", "required_version",
+]
+types = ["string", "number", "bool", "list", "map", "set", "object", "tuple", "any"]
+constants = ["true", "false", "null"]
+builtins = [
+  "var", "local", "each", "path", "self", "file", "templatefile", "jsonencode",
+  "jsondecode", "lookup", "merge", "concat", "length", "join", "split", "format",
+  "coalesce", "try", "can", "toset", "tolist", "tomap", "tostring", "tonumber",
+]
+
+[[syntax]]
+name = "Nix"
+extensions = ["nix"]
+tokens = ["nix"]
+line_comment = ["#"]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+multiline_strings = [["''", "''"]]
+ident_extra = "-"
+fold = "brackets"
+keywords = ["let", "in", "with", "rec", "inherit", "if", "then", "else", "assert", "or", "import"]
+constants = ["true", "false", "null"]
+builtins = [
+  "builtins", "derivation", "fetchurl", "fetchGit", "fetchTarball", "map", "filter",
+  "toString", "removeAttrs", "mkDerivation", "mkIf", "mkOption", "mkEnableOption",
+  "callPackage", "lib", "pkgs", "config", "stdenv",
+]
+
+[[syntax]]
+name = "INI"
+key_value = true
+section_header = true
+extensions = ["ini", "cfg", "conf", "inf", "editorconfig", "prefs"]
+filenames = [".editorconfig", ".gitconfig", ".npmrc", ".flake8", ".coveragerc", "setup.cfg", "tox.ini", "pytest.ini", "gitconfig"]
+tokens = ["ini", "cfg", "conf", "editorconfig"]
+case_sensitive = false
+line_comment = ["#", ";"]
+strings = ["\"", "'"]
+fold = "indent"
+constants = ["true", "false", "yes", "no", "on", "off", "none"]
+
+[[syntax]]
+name = "DotEnv"
+key_value = true
+extensions = ["env", "envrc"]
+filenames = [".env", ".envrc", ".env.local", ".env.example", ".env.sample", ".env.development", ".env.production", ".env.test"]
+tokens = ["dotenv", "env"]
+line_comment = ["#"]
+strings = ["\"", "'"]
+fold = "indent"
+keywords = ["export"]
+constants = ["true", "false", "null"]
+
+[[syntax]]
+name = "Ignore List"
+extensions = ["gitignore", "dockerignore", "npmignore", "eslintignore", "prettierignore"]
+filenames = [
+  ".gitignore", ".dockerignore", ".npmignore", ".eslintignore", ".prettierignore",
+  ".gitattributes", ".rgignore", ".ignore", ".helmignore", ".vercelignore",
+]
+tokens = ["gitignore", "ignore"]
+line_comment = ["#"]
+fold = "indent"
+
+[[syntax]]
+name = "Nginx"
+extensions = ["nginx"]
+filenames = ["nginx.conf", "mime.types"]
+tokens = ["nginx"]
+line_comment = ["#"]
+strings = ["\"", "'"]
+ident_extra = "_"
+fold = "brackets"
+keywords = [
+  "http", "server", "location", "upstream", "events", "stream", "map", "if", "include",
+  "listen", "server_name", "root", "index", "try_files", "proxy_pass", "proxy_set_header",
+  "fastcgi_pass", "return", "rewrite", "set", "access_log", "error_log", "error_page",
+  "worker_processes", "worker_connections", "keepalive_timeout", "gzip", "ssl_certificate",
+  "ssl_certificate_key", "add_header", "client_max_body_size", "expires", "alias",
+]
+constants = ["on", "off"]
+
+[[syntax]]
+name = "Protocol Buffers"
+extensions = ["proto"]
+tokens = ["protobuf", "proto"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+fold = "brackets"
+keywords = [
+  "syntax", "edition", "package", "import", "option", "message", "enum", "service", "rpc",
+  "returns", "repeated", "optional", "required", "oneof", "map", "reserved", "extend",
+  "extensions", "stream", "public", "weak", "group", "to",
+]
+types = [
+  "double", "float", "int32", "int64", "uint32", "uint64", "sint32", "sint64", "fixed32",
+  "fixed64", "sfixed32", "sfixed64", "bool", "string", "bytes",
+]
+constants = ["true", "false"]
+
+[[syntax]]
+name = "Thrift"
+extensions = ["thrift"]
+tokens = ["thrift"]
+line_comment = ["//", "#"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+fold = "brackets"
+keywords = [
+  "namespace", "include", "cpp_include", "struct", "union", "exception", "service",
+  "enum", "const", "typedef", "required", "optional", "oneway", "extends", "throws",
+  "senum",
+]
+types = ["void", "bool", "byte", "i8", "i16", "i32", "i64", "double", "string", "binary", "list", "set", "map"]
+constants = ["true", "false"]
+
+[[syntax]]
+name = "CMake"
+extensions = ["cmake"]
+filenames = ["cmakelists.txt"]
+tokens = ["cmake"]
+case_sensitive = false
+line_comment = ["#"]
+block_comment = [["#[[", "]]"]]
+strings = ["\""]
+ident_extra = "_"
+fold = "indent"
+keywords = [
+  "if", "elseif", "else", "endif", "foreach", "endforeach", "while", "endwhile",
+  "function", "endfunction", "macro", "endmacro", "return", "break", "continue",
+  "and", "or", "not",
+]
+builtins = [
+  "cmake_minimum_required", "project", "set", "unset", "list", "string", "file",
+  "include", "add_executable", "add_library", "add_subdirectory", "add_definitions",
+  "add_custom_command", "add_custom_target", "add_test", "target_link_libraries",
+  "target_include_directories", "target_compile_options", "target_compile_definitions",
+  "find_package", "find_library", "find_path", "find_program", "option", "install",
+  "message", "configure_file", "enable_testing", "get_filename_component",
+]
+constants = ["true", "false", "on", "off", "yes", "no", "required", "quiet", "public", "private", "interface"]
+
+[[syntax]]
+name = "Just"
+extensions = ["just"]
+filenames = ["justfile", ".justfile", "makefile.just"]
+tokens = ["just", "justfile"]
+line_comment = ["#"]
+strings = ["\"", "'"]
+multiline_strings = [["\"\"\"", "\"\"\""], ["'''", "'''"]]
+attribute = "@"
+fold = "indent"
+keywords = ["set", "alias", "export", "import", "mod", "if", "else"]
+constants = ["true", "false"]
+
+[[syntax]]
+name = "Starlark"
+extensions = ["bzl", "star", "bazel"]
+filenames = ["build", "build.bazel", "workspace", "workspace.bazel", "module.bazel"]
+tokens = ["starlark", "bazel", "bzl"]
+line_comment = ["#"]
+strings = ["\"", "'"]
+multiline_strings = [["\"\"\"", "\"\"\""], ["'''", "'''"]]
+fold = "indent"
+keywords = [
+  "def", "load", "if", "elif", "else", "for", "in", "return", "pass", "break", "continue",
+  "lambda", "not", "and", "or", "is",
+]
+constants = ["True", "False", "None"]
+builtins = [
+  "glob", "select", "package", "licenses", "exports_files", "filegroup", "genrule",
+  "cc_library", "cc_binary", "cc_test", "java_library", "py_library", "py_binary",
+  "rust_library", "rust_binary", "http_archive", "git_repository", "rule", "attr",
+  "provider", "aspect", "depset", "struct", "fail", "print", "len", "range", "enumerate",
+]
+
+[[syntax]]
+name = "Jsonnet"
+extensions = ["jsonnet", "libsonnet"]
+tokens = ["jsonnet"]
+line_comment = ["//", "#"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+multiline_strings = [["|||", "|||"]]
+fold = "brackets"
+keywords = [
+  "local", "function", "if", "then", "else", "for", "in", "import", "importstr",
+  "importbin", "error", "assert", "tailstrict",
+]
+constants = ["true", "false", "null", "self", "super", "$"]
+builtins = ["std", "length", "join", "format", "manifestJson", "parseJson", "map", "filter", "foldl"]
+
+[[syntax]]
+name = "Bicep"
+extensions = ["bicep", "bicepparam"]
+tokens = ["bicep"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["'"]
+multiline_strings = [["'''", "'''"]]
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "param", "var", "resource", "module", "output", "targetScope", "existing", "for", "in",
+  "if", "func", "type", "import", "metadata", "using", "extends", "with", "as",
+]
+types = ["string", "int", "bool", "array", "object", "secureString", "secureObject"]
+constants = ["true", "false", "null"]
+builtins = ["resourceGroup", "subscription", "deployment", "union", "concat", "length", "reference", "uniqueString", "guid", "utcNow"]
+
+[[alias]]
+target = "YAML"
+extensions = ["yaml.tpl", "yml.tpl", "cff", "clang-format", "clang-tidy"]
+filenames = [
+  ".clang-format", ".clang-tidy", ".yamllint", "docker-compose.yaml", "docker-compose.yml",
+  ".gitlab-ci.yml", ".travis.yml", "action.yml", "action.yaml",
+]
+
+[[alias]]
+target = "SQL"
+extensions = ["psql", "pgsql", "mysql", "hql", "sqlite", "pls", "prc", "tab", "vw"]
+tokens = ["postgres", "postgresql", "mysql", "sqlite", "plpgsql"]
+
+[[alias]]
+target = "Makefile"
+extensions = ["makefile", "mkfile"]
+filenames = ["makefile.am", "makefile.in", "gnumakefile"]
+
+[[alias]]
+target = "Java Properties"
+filenames = ["gradle.properties", "local.properties"]
