@@ -4,18 +4,54 @@
 
 # ⚡ Zaivern Code
 
-**Claude Code・Codex・Gemini CLI を並列で指揮する、Rust製 AI Agent Cockpit。**
-
-これはコードを書くための道具ではありません。<br>
-**AIエージェントの群れを従え、開発そのものを指揮するための操縦席**です。
+**Claude Code・Codex・Gemini CLIを、1つの画面から並列実行・監視・操作する。**<br>
+Rust製のクロスプラットフォーム AI Agent Cockpit。
 
 [**日本語**](README.md) | [English](README.en.md)
 
 [![Release](https://img.shields.io/github/v/release/tacyan/zaivern-code)](https://github.com/tacyan/zaivern-code/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
+[![Tests](https://img.shields.io/badge/tests-2565%20passing-brightgreen)](#)
+
+[🌐 **実際の画面を見る**](https://zaivern.com/) ・ [⬇️ **最新版を入手**](https://github.com/tacyan/zaivern-code/releases/latest) ・ [📖 **機能を見る**](#操縦席から見える景色)
 
 </div>
+
+---
+
+## Zaivern Codeで変わること
+
+| 散らばったターミナル | Zaivern Code |
+|---|---|
+| エージェントごとにタブを行き来 | **すべてのエージェントを1画面で監視・操作** |
+| 同じ指示を何度も貼り付け | **1回の入力で全エージェントへ一括送信** |
+| 承認待ちや停止を見落とす | **通知・状態表示・ワンクリック承認** |
+| 作業中はデスクから離れられない | **スマホから進捗確認・指示・承認** |
+
+Claude Codeが実装し、Codexがテストし、Gemini CLIがドキュメントを書く。<br>
+Zaivern Codeは、その並列開発を**ひとつの操縦席**にまとめます。
+
+## 🚀 30秒で起動
+
+**macOS / Linux**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.sh | sh
+zai .
+```
+
+**Windows PowerShell**
+
+```powershell
+irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
+zai .
+```
+
+ビルド済みバイナリは[Releases](https://github.com/tacyan/zaivern-code/releases/latest)からもダウンロードできます。初回起動後は約2分のガイドツアーが操作を案内します。
+
+**対応OS:** macOS (arm64 / x86_64)・Linux (x86_64 / arm64)・Windows (x86_64)<br>
+**対応エージェント:** Claude Code・Codex・Gemini CLIを含む29種類のCLIエージェント
 
 ---
 
@@ -33,7 +69,7 @@ Zaivern Code は、この「指揮の摩擦」を消すために生まれまし�
 
 ---
 
-## 🚀 30秒で操縦席へ
+## 📦 インストール・初回起動の詳細
 
 **macOS / Linux** — ビルド済みバイナリを自動取得(無ければソースからビルド):
 
