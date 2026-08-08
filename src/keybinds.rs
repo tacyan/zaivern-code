@@ -145,10 +145,23 @@ pub enum BindAction {
     /// キーバインド編集 UI を開く (VS Code: ⌘K ⌘S)。
     /// 既定は 2 打鍵 ([`Binding::Chord`])。
     KeybindEditor,
+    /// **アクティブなエージェントの追従**を開始 / 解除する (Zed の "follow")。
+    /// エディタのビューポートが、そのエージェントが触っている行を追いかける。
+    FollowAgent,
+    /// 追従の**再開**。ユーザーが自分でスクロールすると追従は一時停止するので、
+    /// 戻すのは必ずこの明示操作から (勝手に再開はしない)。
+    FollowResume,
+    /// **次の未読エージェントへ飛ぶ** (端で折り返す)。視線移動ゼロで
+    /// 「今どれが自分待ちか」へ移るための動線。
+    NextUnread,
+    /// **いまの相手を未読に戻して次の未読へ** (後回し宣言)。
+    DeferUnread,
+    /// いまの相手の未読フラグを反転する。
+    ToggleUnread,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 68] = [
+pub const ALL_ACTIONS: [BindAction; 73] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -217,6 +230,11 @@ pub const ALL_ACTIONS: [BindAction; 68] = [
     BindAction::DiffNextChange,
     BindAction::DiffPrevChange,
     BindAction::KeybindEditor,
+    BindAction::FollowAgent,
+    BindAction::FollowResume,
+    BindAction::NextUnread,
+    BindAction::DeferUnread,
+    BindAction::ToggleUnread,
 ];
 
 /// ファイル単位ズームの修飾キー。macOS は ⌥⌘、他は Ctrl+Alt+Shift。
@@ -387,6 +405,18 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         // ⌘K ⌘S (VS Code の「キーボードショートカット」) の **1 打鍵目**。
         // 2 打鍵目は [`default_binding`] が付ける。⌘K 単打の既定は他に無い。
         BindAction::KeybindEditor => KeyboardShortcut::new(cmd, Key::K),
+        // ── 追従 / 未読カーソル ──────────────────────────────────
+        // ⇧⌘ 系で空いている G / R / U / J / I を使う。
+        // * 既存の ⇧⌘ 割り当ては C K L V A Z D E ] [ F H T O B M Backslash
+        //   Space S N P。
+        // * `MACOS_RESERVED` の ⇧⌘ 系は Tab / 3 / 4 / 5 / Slash / Q だけ。
+        // * ⌥ を混ぜないのは、mac の ⌥ + 母音 (E I N U) がアクセント合成の
+        //   デッドキーになりアプリまで届かないため (⌘⌥D = Dock と同じ轍)。
+        BindAction::FollowAgent => KeyboardShortcut::new(cmd_shift, Key::G),
+        BindAction::FollowResume => KeyboardShortcut::new(cmd_shift, Key::R),
+        BindAction::NextUnread => KeyboardShortcut::new(cmd_shift, Key::U),
+        BindAction::DeferUnread => KeyboardShortcut::new(cmd_shift, Key::J),
+        BindAction::ToggleUnread => KeyboardShortcut::new(cmd_shift, Key::I),
     }
 }
 
@@ -481,6 +511,11 @@ pub fn config_name(a: BindAction) -> &'static str {
         DiffNextChange => "diff_next_change",
         DiffPrevChange => "diff_prev_change",
         KeybindEditor => "keybind_editor",
+        FollowAgent => "follow_agent",
+        FollowResume => "follow_resume",
+        NextUnread => "next_unread",
+        DeferUnread => "defer_unread",
+        ToggleUnread => "toggle_unread",
     }
 }
 
@@ -559,6 +594,11 @@ pub fn action_label(a: BindAction) -> &'static str {
         DiffNextChange => "次の変更へ",
         DiffPrevChange => "前の変更へ",
         KeybindEditor => "キーボード ショートカットの設定",
+        FollowAgent => "エージェントを追従 (開始/解除)",
+        FollowResume => "追従を再開",
+        NextUnread => "次の未読エージェントへ",
+        DeferUnread => "あとで見る (未読に戻して次へ)",
+        ToggleUnread => "未読の切り替え",
     }
 }
 
@@ -749,6 +789,11 @@ impl Keybinds {
             "diff_next_change" => DiffNextChange,
             "diff_prev_change" => DiffPrevChange,
             "keybind_editor" => KeybindEditor,
+            "follow_agent" => FollowAgent,
+            "follow_resume" => FollowResume,
+            "next_unread" => NextUnread,
+            "defer_unread" => DeferUnread,
+            "toggle_unread" => ToggleUnread,
             _ => return None,
         })
     }

@@ -26,6 +26,7 @@ use crate::file_tree::{
 };
 use crate::find_buffer;
 use crate::firewall;
+use crate::follow;
 use crate::fuzzy;
 use crate::git;
 use crate::git_panel;
@@ -857,6 +858,43 @@ fn center_view(cockpit: bool, kanban: bool, deck: bool) -> CenterView {
         CenterView::Kanban
     } else {
         CenterView::Editor
+    }
+}
+
+/// **未読カーソルの巡回** (純関数)。`from` の**次**から探し、端で折り返す。
+///
+/// * 0 件なら `None` — 呼び出し側はバッジを 1 ピクセルも描かない。
+/// * `from` 自身も最後に見るので、「未読が 1 件だけでそれが今の相手」でも
+///   ちゃんとその 1 件を返す (「押しても何も起きない」を作らない)。
+/// * 順序は**セッションの並び順で固定**。通知の新しさで並べ替えない
+///   (cmux が「⌘1-9 の割当が動き続ける」と批判された轍を踏まない)。
+fn next_unread(unread: &[bool], from: usize) -> Option<usize> {
+    let n = unread.len();
+    if n == 0 {
+        return None;
+    }
+    let from = from.min(n - 1);
+    (1..=n).map(|step| (from + step) % n).find(|&i| unread[i])
+}
+
+/// 見張りの段 → 通知の遷移判定に使う粗い 3 値 (純関数)。
+///
+/// 設計原則 4 の実装: 画面の文字列ではなく、**見張り (supervisor) が既に
+/// 段位付きで出した判定**だけを見る。曖昧なものは `None` を返して
+/// [`notify::WorkGate`] に段を動かさせない。
+///
+/// * 走っていない → `None` (プロセスの終了は `SessionEvent::Exited` の担当)
+/// * 承認待ち / エラー / 異常終了 → `None` (**要対応イベント**であって遷移ではない。
+///   専用の通知が別に鳴るので、ここで二重に鳴らさない)
+fn work_phase(running: bool, sup: Option<supervisor::SessionState>) -> Option<notify::WorkPhase> {
+    use supervisor::SessionState as S;
+    if !running {
+        return None;
+    }
+    match sup? {
+        S::Working | S::Stalled | S::Looping => Some(notify::WorkPhase::Working),
+        S::Idle => Some(notify::WorkPhase::Idle),
+        S::WaitingApproval | S::Errored | S::Crashed | S::Done => None,
     }
 }
 
@@ -3190,6 +3228,12 @@ pub struct ZaivernApp {
     /// 承認待ちトースト+効果音の直近通知時刻(セッションタイトル毎)。
     /// 同じプロンプトの再検出による多重通知を10秒に1回へ抑える
     pet_attention_notified: HashMap<String, Instant>,
+    /// **Follow the agent** — 追従の状態機械 (オフなら git を 1 回も叩かない)。
+    follow: follow::Follow,
+    /// 通知を「稼働中 → 待機」の**遷移 1 点**へ絞る門番。
+    work_gate: notify::WorkGate,
+    /// 見張りの異常通知を「同じ内容が続く間は鳴らさない」ようにする門番。
+    anomaly_gate: notify::EdgeGate,
     /// インストール済みプラグイン(~/.zaivern/plugins)
     plugins: Vec<plugins::Plugin>,
     /// プラグイン名 → そのプラグインが足した言語名 (名前順)。
@@ -3769,6 +3813,9 @@ impl ZaivernApp {
             pet_bubble_dismissed: HashSet::new(),
             pet_bubble_answered: HashMap::new(),
             pet_attention_notified: HashMap::new(),
+            follow: follow::Follow::default(),
+            work_gate: notify::WorkGate::default(),
+            anomaly_gate: notify::EdgeGate::default(),
             plugins: Vec::new(),
             plugin_langs: HashMap::new(),
             plugin_keys: Vec::new(),
@@ -10045,6 +10092,11 @@ impl ZaivernApp {
             | Cmd::RestartAgent
             | Cmd::KillAgent
             | Cmd::NewAgentIsolated(_)
+            | Cmd::ToggleFollowAgent
+            | Cmd::ResumeFollowAgent
+            | Cmd::NextUnreadAgent
+            | Cmd::DeferUnreadAgent
+            | Cmd::ToggleUnreadAgent
             | Cmd::StopAllAgents => self.apply_cmd_agent(cmd, ctx),
             Cmd::SetTheme(_)
             | Cmd::OpenSettings
@@ -10765,8 +10817,261 @@ impl ZaivernApp {
                 let i = self.agents.active;
                 self.close_agent(i);
             }
+            Cmd::ToggleFollowAgent => self.toggle_follow_agent(),
+            Cmd::ResumeFollowAgent => self.resume_follow_agent(),
+            Cmd::NextUnreadAgent => self.jump_next_unread(),
+            Cmd::DeferUnreadAgent => self.defer_to_next_unread(),
+            Cmd::ToggleUnreadAgent => self.toggle_unread_here(),
             _ => {}
         }
+    }
+
+    // ── Follow the agent ──────────────────────────────────────────────
+    //
+    // 「いま何をしているか」を新しいパネルを増やさずに見せる。追従先は 1 体。
+    // 状態機械は `follow::Follow` が持ち、ここは UI との橋渡しだけ。
+
+    /// アクティブなエージェントの追従を開始 / 解除する。
+    fn toggle_follow_agent(&mut self) {
+        let Some(s) = self.agents.sessions.get(self.agents.active) else {
+            self.toast(tr("エージェントセッションがありません"), false);
+            return;
+        };
+        let (id, title, running) = (s.id, s.title.clone(), s.running());
+        if !running && self.follow.target() != Some(id) {
+            self.toast(tr("終了したエージェントは追従できません"), false);
+            return;
+        }
+        if self.follow.toggle(id) {
+            // 追従は**エディタ**の機能なので、始めた瞬間だけ中央ビューを戻す。
+            // ユーザーが自分で押した操作なので「画面が突然変わる」には当たらない。
+            self.cockpit = false;
+            self.kanban = false;
+            self.deck = false;
+            self.toast(trf("🎯 {title} を追従します", &[("title", title)]), true);
+        } else {
+            self.toast(
+                trf("🎯 {title} の追従を解除しました", &[("title", title)]),
+                true,
+            );
+        }
+    }
+
+    /// ユーザーのスクロールで止まった追従を明示的に再開する。
+    fn resume_follow_agent(&mut self) {
+        if self.follow.resume() {
+            self.toast(tr("🎯 追従を再開しました"), true);
+        } else if self.follow.is_on() {
+            self.toast(tr("追従は止まっていません"), false);
+        } else {
+            self.toast(tr("追従していません"), false);
+        }
+    }
+
+    /// **Follow the agent の 1 フレーム。**
+    ///
+    /// 追従がオフなら最初の 1 行で戻る — git もファイルシステムも触らない
+    /// (設計原則 3: アイドル時のコストはゼロ)。走査は
+    /// [`follow::Follow::tick`] がスロットリングし、実際の git は別スレッド。
+    fn follow_tick(&mut self, ctx: &egui::Context) {
+        if !self.follow.is_on() {
+            return;
+        }
+        // ① 追える相手 = 走っているセッション。消えたら黙って解除する。
+        let alive: Vec<u64> = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| s.running())
+            .map(|s| s.id)
+            .collect();
+        if self.follow.prune(&alive) {
+            self.toast_warn(tr(
+                "🎯 追従を解除しました — 対象のエージェントが終了しました",
+            ));
+            return;
+        }
+        // ② **ユーザーの操作が常に勝つ。** 自分でスクロールしたら一時停止。
+        if self.follow.is_active()
+            && ctx.input(|i| i.raw_scroll_delta.y.abs() > 0.5)
+            && self.follow.note_user_scroll()
+        {
+            let key = self.key_hint(BindAction::FollowResume);
+            self.toast_warn(trf(
+                "🎯 追従を一時停止しました — 再開は {key}",
+                &[("key", key)],
+            ));
+            return;
+        }
+        // ③ エディタを見ていないフレームは 1 命令も走らせない。
+        //    中央ビューを勝手に切り替えたりもしない (画面が突然変わらない)。
+        if self.center != CenterView::Editor {
+            return;
+        }
+        let Some(dir) = self
+            .follow
+            .target()
+            .and_then(|id| self.agents.sessions.iter().find(|s| s.id == id))
+            .map(|s| s.cwd.clone())
+        else {
+            return;
+        };
+        let spot = self.follow.tick(Instant::now(), move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            // git は UI スレッドで待たない (worktree.rs の約束)。
+            std::thread::spawn(move || {
+                let _ = tx.send(follow::probe(&dir));
+            });
+            rx
+        });
+        let Some(spot) = spot else { return };
+        // 未オープンなら**プレビュータブ**で開く (確定タブを増やさない)。
+        self.open_path_preview(&spot.path);
+        self.goto_line(spot.line);
+    }
+
+    /// **通知は「稼働中 → 待機」の遷移 1 点に絞る。**
+    ///
+    /// 競合実装 (orca) は「状態が続く間ずっと鳴らす」設計で通知スパムを
+    /// 未修正バグとして抱えている。ここは [`notify::WorkGate`] が
+    /// **遷移エッジでしか true を返さない**ので、構造的に鳴り続けない。
+    ///
+    /// 段の観測は見張り ([`supervisor`]) から取る — 画面の文字列からは
+    /// 推測しない (設計原則 4)。承認待ち・レート制限・プロセス終了は
+    /// 「遷移」ではなく**要対応イベント**なので、それぞれ専用の通知が残る。
+    fn notify_work_done(&mut self, win_focused: bool) {
+        let phases: Vec<(u64, String, Option<notify::WorkPhase>)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.id,
+                    s.title.clone(),
+                    work_phase(s.running(), self.supervisor.state_of(s.id)),
+                )
+            })
+            .collect();
+        let alive: Vec<u64> = phases.iter().map(|(id, _, _)| *id).collect();
+        // 消えたセッションの段は忘れる (PID 再利用で誤爆しないため)
+        self.work_gate.retain(&alive);
+        self.anomaly_gate.retain(&alive);
+        for (_, title, _) in phases
+            .iter()
+            .filter(|(id, _, ph)| self.work_gate.note(*id, *ph))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.toast(
+                trf(
+                    "✅ {title} が手を止めました — 待機中",
+                    &[("title", title.clone())],
+                ),
+                true,
+            );
+            if self.cfg.pet_sounds {
+                self.sound.play(SoundKind::Complete);
+            }
+            // OS 通知はこのファイルの既存の作法どおり非アクティブ時だけ
+            if !win_focused {
+                notify::notify(
+                    "Zaivern Code",
+                    &trf("✅ {title} が作業を終えました", &[("title", title.clone())]),
+                );
+            }
+            notify::webhook(
+                &self.cfg.webhook_url,
+                &tr("✅ 作業完了"),
+                &trf("{title} が待機に戻りました", &[("title", title)]),
+            );
+        }
+    }
+
+    // ── 未読カーソル ──────────────────────────────────────────────────
+    //
+    // 「今どれが自分待ちか」へ視線移動ゼロで飛ぶ。3 ビュー (Cockpit / 看板 /
+    // デッキ) は排他なので、**いま見ているビューのまま**選択だけを動かす。
+
+    /// ビューを変えずにそのエージェントを選ぶ (未読カーソルの着地点)。
+    fn focus_agent_in_place(&mut self, i: usize) {
+        if i >= self.agents.sessions.len() {
+            return;
+        }
+        self.agents.active = i;
+        // エディタを見ているときだけ端末パネルを開く。Cockpit / 看板 /
+        // デッキを見ているなら、その中で選択が動くだけで十分見える。
+        if self.center == CenterView::Editor {
+            self.agents.panel_open = true;
+            self.term_focus_pending = true;
+        }
+        let id = self.agents.sessions[i].id;
+        // デッキは自前の選択 (セッション ID) を持つので、そちらも合わせる。
+        // これが無いとデッキ表示中だけカーソルが動かない。
+        if self.center == CenterView::Deck {
+            self.deck_state.select(id);
+        }
+        self.agents.sessions[i].acknowledge();
+        // 見に行った相手は「鳴らし直し」の対象から外す
+        self.work_gate.forget(id);
+    }
+
+    /// 未読フラグの一覧 (巡回の入力)。
+    fn unread_flags(&self) -> Vec<bool> {
+        self.agents
+            .sessions
+            .iter()
+            .map(|s| s.has_unread())
+            .collect()
+    }
+
+    /// 次の未読エージェントへ飛ぶ (端で折り返す)。
+    fn jump_next_unread(&mut self) {
+        let flags = self.unread_flags();
+        match next_unread(&flags, self.agents.active) {
+            Some(i) => {
+                let title = self.agents.sessions[i].title.clone();
+                self.focus_agent_in_place(i);
+                self.toast(trf("◆ {title} へ移動しました", &[("title", title)]), true);
+            }
+            None => self.toast(tr("未読のエージェントはありません"), false),
+        }
+    }
+
+    /// いまの相手を未読へ戻してから次の未読へ (後回し宣言)。
+    fn defer_to_next_unread(&mut self) {
+        let cur = self.agents.active;
+        let Some(s) = self.agents.sessions.get_mut(cur) else {
+            self.toast(tr("エージェントセッションがありません"), false);
+            return;
+        };
+        s.mark_unread();
+        let id = s.id;
+        // 段を捨てる = 次に待機へ戻ったらもう一度だけ鳴らす
+        self.work_gate.forget(id);
+        self.jump_next_unread();
+    }
+
+    /// いまの相手の未読を反転する。
+    fn toggle_unread_here(&mut self) {
+        let cur = self.agents.active;
+        let Some(s) = self.agents.sessions.get_mut(cur) else {
+            self.toast(tr("エージェントセッションがありません"), false);
+            return;
+        };
+        let (title, was) = (s.title.clone(), s.has_unread());
+        if was {
+            s.acknowledge();
+        } else {
+            s.mark_unread();
+            let id = s.id;
+            self.work_gate.forget(id);
+        }
+        let msg = if was {
+            trf("✓ {title} を既読にしました", &[("title", title)])
+        } else {
+            trf("📩 {title} を未読に戻しました", &[("title", title)])
+        };
+        self.toast(msg, true);
     }
 
     // ─── ズーム (画面全体 / ファイル単位) ────────────────────────────────
@@ -11745,6 +12050,24 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.binding(BindAction::ToggleDeck)) {
             cmds.push(Cmd::ToggleDeck);
+        }
+        // ── 追従 / 未読カーソル ────────────────────────────────
+        // 中央ビュー (Cockpit / 看板 / デッキ / エディタ) を問わず同じキーで
+        // 効く。着地は `focus_agent_in_place` が**今見ているビューのまま**行う。
+        if consume(ctx, self.keys.binding(BindAction::FollowAgent)) {
+            cmds.push(Cmd::ToggleFollowAgent);
+        }
+        if consume(ctx, self.keys.binding(BindAction::FollowResume)) {
+            cmds.push(Cmd::ResumeFollowAgent);
+        }
+        if consume(ctx, self.keys.binding(BindAction::NextUnread)) {
+            cmds.push(Cmd::NextUnreadAgent);
+        }
+        if consume(ctx, self.keys.binding(BindAction::DeferUnread)) {
+            cmds.push(Cmd::DeferUnreadAgent);
+        }
+        if consume(ctx, self.keys.binding(BindAction::ToggleUnread)) {
+            cmds.push(Cmd::ToggleUnreadAgent);
         }
         if consume(ctx, self.keys.binding(BindAction::ToggleMdPreview)) {
             cmds.push(Cmd::ToggleMdPreview);
@@ -12842,6 +13165,45 @@ impl ZaivernApp {
         // 統合承認キューの待ち件数バッジ (押すとボトムパネルの承認ビューを開く)
         let approvals_pending = self.agents.approvals.pending_len();
         let mut open_approvals = false;
+        // 🎯 追従バッジ — **追従しているときだけ**出す。追従は画面が勝手に
+        // 動く唯一の機能なので、「いま誰を追っているか」は常に見えていること。
+        let follow_badge: Option<(String, bool)> = self.follow.target().and_then(|id| {
+            self.agents.sessions.iter().find(|s| s.id == id).map(|s| {
+                let icon = if s.icon.is_empty() {
+                    "👾"
+                } else {
+                    s.icon.as_str()
+                };
+                (format!("{icon} {}", s.title), self.follow.is_paused())
+            })
+        });
+        // いま追っている場所 (ファイル:行)。まだ 1 度も飛んでいなければ空。
+        let follow_at: String = self
+            .follow
+            .spot()
+            .map(|sp| {
+                let name = sp
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| sp.path.display().to_string());
+                format!("{name}:{}", sp.line)
+            })
+            .unwrap_or_default();
+        let mut follow_click = false;
+        let follow_keys = (
+            self.key_hint(BindAction::FollowAgent),
+            self.key_hint(BindAction::FollowResume),
+        );
+        // ◆ 未読バッジ — 0 件のときは 1 ピクセルも描かない。
+        let unread_count = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| s.has_unread())
+            .count();
+        let unread_key = self.key_hint(BindAction::NextUnread);
+        let mut jump_unread = false;
         // Pro の解錠判定は license::is_pro **1 か所だけ**を通す。
         // 未ライセンス時は 1 ピクセルも出さない (常に何かを表示するバッジは作らない)。
         let pro_badge = license::is_pro(&self.license_status).then(|| match &self.license_status {
@@ -12932,6 +13294,62 @@ impl ZaivernApp {
                             .clicked()
                     {
                         open_approvals = true;
+                    }
+
+                    // 🎯 追従中だけ出るバッジ。押すと (追従中) 解除 / (停止中) 再開。
+                    if let Some((who, paused)) = &follow_badge {
+                        let (mark, col) = if *paused {
+                            ("⏸", theme.warn)
+                        } else {
+                            ("🎯", theme.accent)
+                        };
+                        let mut tip = if *paused {
+                            trf(
+                                "{who} の追従は一時停止中 (自分でスクロールしたため) — 再開: {key}",
+                                &[("who", who.clone()), ("key", follow_keys.1.clone())],
+                            )
+                        } else {
+                            trf(
+                                "{who} を追従中 — 解除: {key}",
+                                &[("who", who.clone()), ("key", follow_keys.0.clone())],
+                            )
+                        };
+                        if !follow_at.is_empty() {
+                            tip.push('\n');
+                            tip.push_str(&trf("直近の編集: {at}", &[("at", follow_at.clone())]));
+                        }
+                        if ui
+                            .button(
+                                RichText::new(format!(
+                                    "{mark} {}",
+                                    notify::truncate_chars(who, 20)
+                                ))
+                                .size(11.5)
+                                .color(col),
+                            )
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            follow_click = true;
+                        }
+                    }
+
+                    // ◆ 未読バッジ — 0 件のときは 1 ピクセルも描かない
+                    if unread_count > 0
+                        && ui
+                            .button(
+                                RichText::new(format!("◆ {unread_count}"))
+                                    .size(11.5)
+                                    .color(theme.accent)
+                                    .strong(),
+                            )
+                            .on_hover_text(trf(
+                                "未読のエージェントが {n} 件 — 押すと次の未読へ ({key})",
+                                &[("n", unread_count.to_string()), ("key", unread_key.clone())],
+                            ))
+                            .clicked()
+                    {
+                        jump_unread = true;
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -13125,6 +13543,16 @@ impl ZaivernApp {
         }
         if toggle_cockpit {
             self.cockpit = !self.cockpit;
+        }
+        if follow_click {
+            if self.follow.is_paused() {
+                self.resume_follow_agent();
+            } else {
+                self.toggle_follow_agent();
+            }
+        }
+        if jump_unread {
+            self.jump_next_unread();
         }
         if open_quota {
             self.quota_open = true;
@@ -13768,8 +14196,13 @@ impl ZaivernApp {
                     });
                 }
                 if let Some(i) = set_unread {
-                    if let Some(s) = self.agents.sessions.get_mut(i) {
+                    let id = self.agents.sessions.get_mut(i).map(|s| {
                         s.mark_unread();
+                        s.id
+                    });
+                    if let Some(id) = id {
+                        // 後回し宣言 = 次に待機へ戻ったらもう一度だけ鳴らす
+                        self.work_gate.forget(id);
                     }
                 }
 
@@ -14356,8 +14789,14 @@ impl ZaivernApp {
                                     });
                                 }
                                 if let Some(i) = set_unread {
-                                    if let Some(s) = self.agents.sessions.get_mut(i) {
+                                    let id = self.agents.sessions.get_mut(i).map(|s| {
                                         s.mark_unread();
+                                        s.id
+                                    });
+                                    if let Some(id) = id {
+                                        // 後回し宣言 = 次に待機へ戻ったら
+                                        // もう一度だけ鳴らす
+                                        self.work_gate.forget(id);
                                     }
                                 }
                                 if let Some(i) = set_read {
@@ -15623,8 +16062,13 @@ impl ZaivernApp {
                                         .get(&self.agents.sessions[i].id)
                                         .is_some_and(|l| l.contains(a))
                                 });
+                            // 未読 (最後に見てから新しい出力がある) のタイルは
+                            // アクセント色のリングで囲う。未読が 1 件も無ければ
+                            // 枠の太さも色も**1 ピクセルも変わらない**。
                             let stroke = if active {
                                 egui::Stroke::new(2.0_f32, theme.accent)
+                            } else if self.agents.sessions[i].has_unread() {
+                                egui::Stroke::new(1.5_f32, theme.accent)
                             } else {
                                 egui::Stroke::new(1.0_f32, theme.border)
                             };
@@ -21012,6 +21456,36 @@ impl ZaivernApp {
                 Cmd::ToggleDeck,
             ),
             (
+                "🎯".into(),
+                tr("エージェントを追従 (編集中の行をエディタが追いかける)"),
+                fmt_key(BindAction::FollowAgent),
+                Cmd::ToggleFollowAgent,
+            ),
+            (
+                "▶".into(),
+                tr("追従を再開"),
+                fmt_key(BindAction::FollowResume),
+                Cmd::ResumeFollowAgent,
+            ),
+            (
+                "◆".into(),
+                tr("次の未読エージェントへ"),
+                fmt_key(BindAction::NextUnread),
+                Cmd::NextUnreadAgent,
+            ),
+            (
+                "📩".into(),
+                tr("あとで見る (未読に戻して次へ)"),
+                fmt_key(BindAction::DeferUnread),
+                Cmd::DeferUnreadAgent,
+            ),
+            (
+                "📩".into(),
+                tr("未読の切り替え"),
+                fmt_key(BindAction::ToggleUnread),
+                Cmd::ToggleUnreadAgent,
+            ),
+            (
                 "➕".into(),
                 tr("エージェントを追加 (対応 CLI の一覧から選ぶ)"),
                 String::new(),
@@ -25427,8 +25901,12 @@ impl ZaivernApp {
             I::Notify => {
                 let line = it.toast_line();
                 self.toast_warn(line.clone());
-                // 通知はウィンドウが非アクティブなときだけ (このファイルの既存の作法)
-                if !win_focused {
+                // **同じ異常が続く間は OS 通知を繰り返さない。**
+                // 見張りは cooldown (既定 120 秒) ごとに同じ診断を上げ直すので、
+                // 素通しすると通知センターが同文で埋まる。トーストは
+                // アプリ内なので残し、外へ出るものだけを遷移エッジへ絞る。
+                let fresh = self.anomaly_gate.changed(it.session_id, &line);
+                if !win_focused && fresh {
                     notify::notify("Zaivern Code", &line);
                 }
             }
@@ -26348,11 +26826,18 @@ impl ZaivernApp {
                 .retain(|_, at| at.elapsed().as_secs() < 10);
         }
 
+        // ── Follow the agent ──────────────────────────────────
+        // 追従がオフなら最初の 1 行で戻る (git もファイルシステムも触らない)。
+        self.follow_tick(ctx);
+
         // ── 監視・連携 ────────────────────────────────────────
         // セッションの増減を先に反映してから、見張り → 配達の順で回す。
         self.reconcile_sessions();
         self.terminal_hooks(ctx, win_focused);
         self.supervise(ctx, win_focused);
+        // 通知は「働いていたものが手を止めた瞬間」の 1 点だけ。
+        // 見張りが段を更新した直後に見る (同じフレームの判定を使う)。
+        self.notify_work_done(win_focused);
         self.coordinate(win_focused);
         self.quota_tick();
         self.failover_tick();
@@ -26805,6 +27290,240 @@ impl ZaivernApp {
         // ZV_IDLE_TRACE=1 のときだけ、1 秒ごとに実フレーム数と判断材料を出す。
         // 「アイドルで何枚描いたか」を実測するための計測窓 (既定では無効)。
         idle_trace(signals);
+    }
+}
+
+/// 未読カーソルの巡回 (純関数のテーブルテスト)。
+#[cfg(test)]
+mod unread_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn 未読が0件なら飛び先は無い() {
+        assert_eq!(next_unread(&[], 0), None);
+        assert_eq!(next_unread(&[false, false, false], 1), None);
+    }
+
+    #[test]
+    fn 未読が1件ならそれが今の相手でも返す() {
+        assert_eq!(next_unread(&[true], 0), Some(0));
+        assert_eq!(next_unread(&[false, true, false], 0), Some(1));
+        // 今いる相手だけが未読 → 一巡して自分へ戻る
+        // (「押しても何も起きないボタン」を作らない)
+        assert_eq!(next_unread(&[false, true, false], 1), Some(1));
+    }
+
+    #[test]
+    fn 全部未読なら次の要素へ順に進む() {
+        let all = [true, true, true];
+        assert_eq!(next_unread(&all, 0), Some(1));
+        assert_eq!(next_unread(&all, 1), Some(2));
+    }
+
+    #[test]
+    fn 端で折り返す() {
+        let all = [true, true, true];
+        assert_eq!(next_unread(&all, 2), Some(0));
+        assert_eq!(next_unread(&[true, false, false], 2), Some(0));
+        // 現在位置が範囲外 (セッションが減った直後) でも壊れない
+        assert_eq!(next_unread(&[true, false], 99), Some(0));
+    }
+
+    #[test]
+    fn 未読に戻すと巡回の順序が変わる() {
+        let mut flags = vec![false, true, false];
+        assert_eq!(next_unread(&flags, 0), Some(1));
+        // いまの相手 (0) を未読へ戻す = 後回し宣言
+        flags[0] = true;
+        assert_eq!(next_unread(&flags, 0), Some(1));
+        assert_eq!(
+            next_unread(&flags, 1),
+            Some(0),
+            "未読に戻した相手が巡回に入っていない"
+        );
+    }
+
+    #[test]
+    fn 巡回はセッションの並び順で固定される() {
+        // 通知の新しさで並べ替えない (cmux が「⌘1-9 の割当が動き続ける」と
+        // 批判された轍を踏まない)。同じ入力なら毎回同じ順に回る。
+        let flags = [true, false, true, false, true];
+        let mut seen = Vec::new();
+        let mut cur = 0usize;
+        for _ in 0..5 {
+            cur = next_unread(&flags, cur).expect("未読があるのに飛べない");
+            seen.push(cur);
+        }
+        assert_eq!(seen, vec![2, 4, 0, 2, 4]);
+    }
+}
+
+/// 通知の遷移判定 — 見張りの段を 3 値へ畳むところ。
+#[cfg(test)]
+mod work_phase_tests {
+    use super::*;
+    use supervisor::SessionState as S;
+
+    #[test]
+    fn 走っていないセッションは段を持たない() {
+        // プロセスの終了は `SessionEvent::Exited` の担当なので二重に鳴らさない
+        assert_eq!(work_phase(false, Some(S::Working)), None);
+        assert_eq!(work_phase(false, Some(S::Done)), None);
+        assert_eq!(work_phase(false, None), None);
+    }
+
+    #[test]
+    fn 見張りの段を3値へ畳む() {
+        assert_eq!(
+            work_phase(true, Some(S::Working)),
+            Some(notify::WorkPhase::Working)
+        );
+        assert_eq!(
+            work_phase(true, Some(S::Stalled)),
+            Some(notify::WorkPhase::Working)
+        );
+        assert_eq!(
+            work_phase(true, Some(S::Looping)),
+            Some(notify::WorkPhase::Working)
+        );
+        assert_eq!(
+            work_phase(true, Some(S::Idle)),
+            Some(notify::WorkPhase::Idle)
+        );
+    }
+
+    #[test]
+    fn 要対応イベントは遷移として扱わない() {
+        // 承認待ち・エラー・異常終了は専用の通知が持っている (残してある)
+        assert_eq!(work_phase(true, Some(S::WaitingApproval)), None);
+        assert_eq!(work_phase(true, Some(S::Errored)), None);
+        assert_eq!(work_phase(true, Some(S::Crashed)), None);
+        // 見張りの観測が足りないフレームも段を動かさない
+        assert_eq!(work_phase(true, None), None);
+    }
+
+    #[test]
+    fn 稼働中から待機で1回だけ鳴り待機のままなら鳴らない() {
+        let mut g = notify::WorkGate::default();
+        assert!(!g.note(1, work_phase(true, Some(S::Working))));
+        assert!(g.note(1, work_phase(true, Some(S::Idle))));
+        for _ in 0..10 {
+            assert!(!g.note(1, work_phase(true, Some(S::Idle))));
+        }
+    }
+
+    #[test]
+    fn 待機から稼働へ戻ってまた待機なら2回鳴る() {
+        let mut g = notify::WorkGate::default();
+        g.note(1, work_phase(true, Some(S::Working)));
+        assert!(g.note(1, work_phase(true, Some(S::Idle))));
+        assert!(!g.note(1, work_phase(true, Some(S::Working))));
+        assert!(g.note(1, work_phase(true, Some(S::Idle))));
+    }
+
+    #[test]
+    fn 承認を挟んでも作業完了は1回だけ鳴る() {
+        let mut g = notify::WorkGate::default();
+        g.note(1, work_phase(true, Some(S::Working)));
+        g.note(1, work_phase(true, Some(S::WaitingApproval)));
+        g.note(1, work_phase(true, Some(S::WaitingApproval)));
+        assert!(g.note(1, work_phase(true, Some(S::Idle))));
+    }
+
+    #[test]
+    fn 起動直後の初期状態で誤爆しない() {
+        let mut g = notify::WorkGate::default();
+        // 起動直後は見張りの観測がまだ無い → 段が動かない
+        assert!(!g.note(1, work_phase(true, None)));
+        // 最初の観測がいきなり待機でも鳴らない
+        assert!(!g.note(1, work_phase(true, Some(S::Idle))));
+    }
+}
+
+/// 追従の配線 (ソース構造の回帰テスト)。
+///
+/// 「アイドル時に git を叩かない」の**回数による門番**は
+/// `follow::tests::追従がオフならgitを一度も叩かない` が持つ。ここは
+/// app.rs 側がその門を通っていること (= 早期 return を消していないこと) を
+/// 固定する。実時間の assert はフレーキーになるので使わない。
+#[cfg(test)]
+mod follow_wiring_tests {
+    fn follow_tick_body() -> String {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let after = src
+            .split("fn follow_tick(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("follow_tick が無い")
+            .to_string();
+        after.chars().take(3000).collect()
+    }
+
+    #[test]
+    fn 追従がオフなら最初の1行で降りる() {
+        let body = follow_tick_body();
+        let head: String = body.chars().take(120).collect();
+        assert!(
+            head.contains("if !self.follow.is_on() {"),
+            "オフで即戻る門が消えた (アイドルで git を叩くようになる)"
+        );
+    }
+
+    #[test]
+    fn 追従は未オープンのファイルをプレビュータブで開く() {
+        let body = follow_tick_body();
+        assert!(
+            body.contains("self.open_path_preview(&spot.path);"),
+            "追従が確定タブを増やしている"
+        );
+        assert!(
+            !body.contains("self.open_path(&spot.path)"),
+            "プレビュータブを迂回している"
+        );
+    }
+
+    #[test]
+    fn 追従はユーザーのスクロールで一時停止する() {
+        let body = follow_tick_body();
+        assert!(
+            body.contains("raw_scroll_delta") && body.contains("note_user_scroll()"),
+            "ユーザーのスクロールで止まる経路が消えた"
+        );
+    }
+
+    #[test]
+    fn 追従はエディタを見ていないフレームでは走らない() {
+        let body = follow_tick_body();
+        assert!(
+            body.contains("if self.center != CenterView::Editor {"),
+            "見えていない画面のために git を起こしている"
+        );
+    }
+
+    #[test]
+    fn 追従の走査は別スレッドで行う() {
+        let body = follow_tick_body();
+        assert!(
+            body.contains("std::thread::spawn"),
+            "UI スレッドで git を待っている"
+        );
+    }
+
+    #[test]
+    fn 通知は稼働中から待機の遷移だけを通す() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn notify_work_done(&mut self, win_focused: bool) {")
+            .nth(1)
+            .expect("notify_work_done が無い");
+        let body: String = body.chars().take(2000).collect();
+        assert!(
+            body.contains("self.work_gate.note("),
+            "遷移エッジの門番を通っていない"
+        );
+        assert!(
+            body.contains("work_phase(s.running(), self.supervisor.state_of(s.id))"),
+            "段を画面から推測している (設計原則 4 違反)"
+        );
     }
 }
 
@@ -34193,6 +34912,11 @@ mod wave2_tests {
             ("LspFormat", "LspFormat"),
             ("SelectNextOccurrence", "SelectNextOccurrence"),
             ("KeybindEditor", "ShowShortcuts"),
+            ("FollowAgent", "ToggleFollowAgent"),
+            ("FollowResume", "ResumeFollowAgent"),
+            ("NextUnread", "NextUnreadAgent"),
+            ("DeferUnread", "DeferUnreadAgent"),
+            ("ToggleUnread", "ToggleUnreadAgent"),
         ];
         let src = &include_str!("app.rs").replace("\r\n", "\n");
         let list = palette_body(src);

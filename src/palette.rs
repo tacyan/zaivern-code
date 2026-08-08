@@ -80,6 +80,17 @@ pub enum Cmd {
     FocusAgent(usize),
     RestartAgent,
     KillAgent,
+    /// **アクティブなエージェントの追従**を開始 / 解除する (Zed の "follow")。
+    /// エディタのビューポートが、そのエージェントが触っている行を追いかける。
+    ToggleFollowAgent,
+    /// 追従の再開。ユーザーが自分でスクロールして止まったものを明示的に戻す。
+    ResumeFollowAgent,
+    /// **次の未読エージェントへ飛ぶ** (端で折り返す)。
+    NextUnreadAgent,
+    /// いまの相手を未読に戻して次の未読へ (後回し宣言)。
+    DeferUnreadAgent,
+    /// いまの相手の未読フラグを反転する。
+    ToggleUnreadAgent,
     SetTheme(String),
     /// 設定画面 (検索できる一覧) を開く。VS Code の「設定を開く (UI)」相当。
     OpenSettings,
@@ -763,6 +774,11 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::FocusAgent(_)
         | Cmd::RestartAgent
         | Cmd::KillAgent
+        | Cmd::ToggleFollowAgent
+        | Cmd::ResumeFollowAgent
+        | Cmd::NextUnreadAgent
+        | Cmd::DeferUnreadAgent
+        | Cmd::ToggleUnreadAgent
         | Cmd::SendFileToAgent
         | Cmd::SendAgentMessage
         | Cmd::NewTask
