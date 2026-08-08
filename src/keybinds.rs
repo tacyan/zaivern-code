@@ -662,6 +662,82 @@ pub fn consume_shortcut_compat(i: &mut egui::InputState, sc: KeyboardShortcut) -
     hit
 }
 
+// ─────────────── IME 変換中はショートカットを消費しない ───────────────
+//
+// ターミナル側は `terminal::translate_input` が「未確定文字列 (preedit) が
+// 空でない間はキーを IME に任せる」規則を持っている。**エディタ側には
+// それが無く**、変換中の生キーが `handle_shortcuts` まで届く環境がある
+// (winit は IME 合成中も KeyboardInput を配ることがある)。そのままだと
+// 「ひらがなを打っているのに ⌘S 相当のバインドが発火する」「変換確定の
+// Enter がコマンドとして食われる」が起きる。
+//
+// 判定は `terminal::ime_ended_in_frame` と**同じ考え方** — イベントの並びは
+// 環境依存 (Windows は Commit の前後に Enabled/Disabled を出し、macOS は
+// Disabled を出さない) なので、順序に依存せずフレーム単位で見る。
+
+/// 変換中フラグの置き場所 (egui の一時データ)。アプリの構造体に持たせないのは、
+/// 「ショートカットを消費してよいか」の判断材料が消費地点の隣にある方が
+/// 落ちにくいため (状態と規則が離れると片方だけ直されて壊れる)。
+fn ime_state_id() -> egui::Id {
+    egui::Id::new("zv-ime-composing")
+}
+
+/// このフレームを処理し終えた時点で「まだ変換中」か。
+///
+/// * `Preedit(非空)` → 変換中に入る / 続く
+/// * `Preedit("")` → 未確定文字列が消えた = 確定 or 取り消しで変換が閉じた
+/// * `Commit` / `Enabled` / `Disabled` → 変換は開いていない
+fn ime_composing_after(events: &[egui::Event], composing: bool) -> bool {
+    let mut composing = composing;
+    for ev in events {
+        if let egui::Event::Ime(ime) = ev {
+            composing = match ime {
+                egui::ImeEvent::Preedit(t) => !t.is_empty(),
+                egui::ImeEvent::Commit(_) | egui::ImeEvent::Enabled | egui::ImeEvent::Disabled => {
+                    false
+                }
+            };
+        }
+    }
+    composing
+}
+
+/// このフレームはショートカットの消費を止めるべきか。
+///
+/// 止めるのは (1) フレーム開始時点で変換中だった (2) このフレームで未確定
+/// 文字列が出た (3) このフレームで確定した、のいずれか。(3) を含めるのは
+/// **確定に使った Enter が同じフレームに載る**ため — ハングルは 1 打鍵ごとに
+/// 音節が組み上がって確定するので、ここを外すと変換のたびに Enter バインドが
+/// 発火する。
+fn ime_blocks_shortcuts(events: &[egui::Event], composing_at_start: bool) -> bool {
+    if composing_at_start {
+        return true;
+    }
+    events.iter().any(|ev| match ev {
+        egui::Event::Ime(egui::ImeEvent::Commit(_)) => true,
+        egui::Event::Ime(egui::ImeEvent::Preedit(t)) => !t.is_empty(),
+        _ => false,
+    })
+}
+
+/// IME 変換中か (変換中フラグを次フレームへ持ち越しつつ判定する)。
+///
+/// **1 フレームに 1 回だけ呼ぶこと** (状態を更新するため)。呼び出し地点は
+/// `App::handle_shortcuts` の先頭 1 か所。
+pub fn ime_blocks_shortcuts_now(ctx: &egui::Context) -> bool {
+    let was = ctx
+        .data(|d| d.get_temp::<bool>(ime_state_id()))
+        .unwrap_or(false);
+    let (blocked, next) = ctx.input(|i| {
+        (
+            ime_blocks_shortcuts(&i.events, was),
+            ime_composing_after(&i.events, was),
+        )
+    });
+    ctx.data_mut(|d| d.insert_temp(ime_state_id(), next));
+    blocked
+}
+
 fn hint_id(a: BindAction) -> egui::Id {
     egui::Id::new(("zv-key-hint", format!("{a:?}")))
 }
@@ -1314,7 +1390,9 @@ mod tests {
             .split("fn handle_shortcuts(&mut self, ctx: &egui::Context) {")
             .nth(1)
             .expect("handle_shortcuts がある");
-        let head = &body[..body.len().min(600)];
+        // 素の添字スライスは日本語コメントの途中で切れると panic するので
+        // バイト単位で切ってから lossy 変換する (`window_before` と同じ理由)。
+        let head = String::from_utf8_lossy(&body.as_bytes()[..body.len().min(600)]);
         assert!(
             head.contains("crate::keybinds::consume_shortcut_compat"),
             "handle_shortcuts の consume が互換経路を通っていない"
@@ -1454,6 +1532,167 @@ mod tests {
             },
         );
         assert!(fired, "キーイベントが届けば ⌘⇧C は消費できる");
+    }
+
+    // ──────────────── IME 変換中のショートカット保護 ────────────────
+
+    fn preedit(t: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Preedit(t.to_string()))
+    }
+    fn commit(t: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Commit(t.to_string()))
+    }
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// 日本語入力: `にほんご` を打って変換 → 確定するまで一度も消費しない。
+    ///
+    /// 変換中に生の `Text` / `Key` が漏れる環境があり、そのまま
+    /// `handle_shortcuts` へ流すと「かなを打っているだけでコマンドが走る」。
+    #[test]
+    fn 日本語の変換中はショートカットを消費しない() {
+        // (このフレームのイベント, 開始時の変換中フラグ → 期待: 止める?, 次フレームの変換中?)
+        let steps: &[(Vec<egui::Event>, bool, bool, &str)] = &[
+            (vec![], false, false, "何も起きていないフレームは素通し"),
+            (
+                vec![preedit("に")],
+                true,
+                true,
+                "未確定が出た瞬間から止める",
+            ),
+            (
+                vec![preedit("にほん"), enter()],
+                true,
+                true,
+                "変換中の Enter (候補確定) はアプリへ渡さない",
+            ),
+            (
+                vec![commit("日本語"), enter()],
+                true,
+                false,
+                "確定フレームの Enter も渡さない (確定は IME への操作)",
+            ),
+            (
+                vec![enter()],
+                false,
+                false,
+                "確定の次フレームの Enter は通常どおり",
+            ),
+        ];
+        let mut composing = false;
+        for (events, want_block, want_after, what) in steps {
+            assert_eq!(
+                ime_blocks_shortcuts(events, composing),
+                *want_block,
+                "{what}"
+            );
+            composing = ime_composing_after(events, composing);
+            assert_eq!(composing, *want_after, "{what}: 変換中フラグ");
+        }
+    }
+
+    /// ハングル: 1 打鍵ごとに音節が組み上がって確定する (ㅎ → 하 → 한)。
+    ///
+    /// 分解字母のあいだも「変換中」であり続けること。ここを取りこぼすと
+    /// 韓国語入力のあいだ中ショートカットが暴発する。
+    #[test]
+    fn ハングルの分解字母の途中でもショートカットを消費しない() {
+        let mut composing = false;
+        // 分解字母 (초성 → +중성 → +종성) が preedit として届く
+        for step in ["\u{1112}", "\u{1112}\u{1161}", "\u{1112}\u{1161}\u{11AB}"] {
+            let events = vec![preedit(step)];
+            assert!(
+                ime_blocks_shortcuts(&events, composing),
+                "分解字母 {step:?} の途中"
+            );
+            composing = ime_composing_after(&events, composing);
+            assert!(composing, "分解字母 {step:?} のあとも変換中");
+        }
+        // 確定 (完成形 한) — Windows は Commit の前後に Enabled/Disabled を出す
+        let events = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            commit("한"),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ];
+        assert!(
+            ime_blocks_shortcuts(&events, composing),
+            "確定フレームも止める"
+        );
+        assert!(
+            !ime_composing_after(&events, composing),
+            "確定したら変換中は終わる"
+        );
+    }
+
+    /// 変換の**取り消し** (Escape) も、順序に依存せず変換の終わりとして扱う。
+    #[test]
+    fn 変換の取り消しでも変換中フラグが残らない() {
+        let composing = ime_composing_after(&[preedit("にほん")], false);
+        assert!(composing);
+        // macOS は Disabled を出さず Preedit("") だけ、Windows は両方出す
+        assert!(
+            !ime_composing_after(&[preedit("")], composing),
+            "macOS の並び"
+        );
+        assert!(
+            !ime_composing_after(
+                &[preedit(""), egui::Event::Ime(egui::ImeEvent::Disabled)],
+                composing
+            ),
+            "Windows の並び"
+        );
+    }
+
+    /// 実際の `egui::Context` を 2 フレーム回して、変換中フラグが
+    /// フレームをまたいで持ち越されることを確かめる。
+    #[test]
+    fn 変換中フラグはフレームをまたいで持ち越される() {
+        let ctx = egui::Context::default();
+        let run = |events: Vec<egui::Event>| -> bool {
+            let mut blocked = false;
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| blocked = ime_blocks_shortcuts_now(ctx),
+            );
+            blocked
+        };
+        assert!(!run(vec![]), "変換していないフレームは素通し");
+        assert!(run(vec![preedit("に")]), "未確定が出たフレーム");
+        // イベントの無いフレームでも「変換中」は続く (IME は開いたまま)
+        assert!(run(vec![]), "変換中はイベントが無くても止める");
+        assert!(run(vec![commit("に")]), "確定フレーム");
+        assert!(!run(vec![]), "確定の次フレームから通常どおり");
+    }
+
+    /// `handle_shortcuts` の先頭に IME ガードがある (消費の前に必ず通る)。
+    ///
+    /// ガードを消費地点の**後ろ**へ動かすと、そのフレームのショートカットは
+    /// もう食われている。位置が仕様なので構造で固定する。
+    #[test]
+    fn ショートカット消費の前に必ず変換中ガードを通る() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn handle_shortcuts(&mut self, ctx: &egui::Context)")
+            .nth(1)
+            .expect("ショートカット処理がある");
+        let guard = body
+            .find("keybinds::ime_blocks_shortcuts_now(ctx)")
+            .expect("IME ガードが handle_shortcuts に無い");
+        let first_consume = body.find("if consume(ctx,").expect("消費地点がある");
+        assert!(
+            guard < first_consume,
+            "IME ガードが最初の consume より後ろにある (変換中に食われる)"
+        );
     }
 
     /// UI に出るショートカット文字列をベタ書きしていない。

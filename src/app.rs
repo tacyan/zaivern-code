@@ -9810,6 +9810,15 @@ impl ZaivernApp {
         let consume = |ctx: &egui::Context, sc: KeyboardShortcut| -> bool {
             ctx.input_mut(|i| crate::keybinds::consume_shortcut_compat(i, sc))
         };
+        // **IME 変換中は 1 つも消費しない。** 日本語/中国語/韓国語を打っている
+        // 最中の生キーは IME のものであってアプリのものではない。ここを通すと
+        // 「かなを打っているだけでコマンドが走る」「変換確定の Enter が
+        // ショートカットに食われる」が起きる (ターミナル側は
+        // `terminal::translate_input` が同じ規則を持っている — エディタ側にだけ
+        // 無かった)。1 フレーム 1 回の呼び出しで変換中フラグも更新される。
+        if crate::keybinds::ime_blocks_shortcuts_now(ctx) {
+            return;
+        }
         let mut cmds: Vec<Cmd> = Vec::new();
         let mut ops: Vec<EditOp> = Vec::new();
 
@@ -22585,23 +22594,21 @@ fn multi_batch_insert(
 /// ので、egui の char キャレットをこの座標系へ移す必要がある。
 /// 添字が本文より後ろなら末尾へクランプする (壊れた値でも落ちない)。
 fn char_index_to_line_col(text: &str, char_index: usize, tab_width: usize) -> (usize, usize) {
-    let tw = tab_width.max(1);
     let (mut line, mut col) = (0usize, 0usize);
     for (n, ch) in text.chars().enumerate() {
         if n >= char_index {
             break;
         }
-        match ch {
-            '\n' => {
-                line += 1;
-                col = 0;
-            }
-            // タブは次の tab_width の倍数まで進む (エディタの表示と同じ勘定)
-            '\t' => col = (col / tw + 1) * tw,
-            // CR は表示桁を進めない (CRLF の途中に桁を作らない)
-            '\r' => {}
-            _ => col += 1,
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+            continue;
         }
+        // タブ・全角 (CJK)・結合文字の桁送りは `textenc::advance_col` に一本化する。
+        // ここだけ「1 文字 = 1 桁」で数えると、日本語の行から始めた矩形選択が
+        // `editor_ops::column_selection` の数える桁とずれる (CR は制御文字 = 0 桁
+        // なので CRLF の途中に桁を作らない、も同じ表から出てくる)。
+        col = crate::textenc::advance_col(col, ch, tab_width);
     }
     (line, col)
 }

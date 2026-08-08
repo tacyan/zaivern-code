@@ -909,17 +909,22 @@ fn snap_boundary_up(s: &str, byte: usize) -> usize {
 
 /// 行内のバイト位置 `byte` (行頭からの相対) の**表示桁** (0 起点)。
 ///
-/// タブは次の `tab_width` の倍数まで進む。**タブ以外は全て 1 桁**として数える
-/// (VS Code の「桁」の定義。全角文字を 2 桁と数えないので、日本語の行でも
-/// 「上下のカーソル追加」が文字数どおりに並ぶ)。
+/// 桁送りは [`crate::textenc::advance_col`] に委ねる = **端末と同じ表**を使う。
+/// 以前はタブ以外を一律 1 桁として数えていたが、それだと日本語・中国語・
+/// ハングルの行で矩形選択と「上下へキャレット追加」が画面と合わない
+/// (`あいう` は 3 文字だが画面では 6 桁を占める)。CJK を最優先の品質領域と
+/// する以上、「桁」は**画面で占める桁**でなければならない。
+///
+/// 結合記号 (濁点・アクセント)・異体字セレクタ・ZWJ・ハングルの中声/終声は
+/// 0 桁なので、`が` (か+゛) や `한` (分解されたハングル) は基底 1 文字ぶんの
+/// 桁しか進まない — 入力途中の分解字母が別々の桁に散らない。
 fn visual_col_in_line(line: &str, byte: usize, tab_width: usize) -> usize {
-    let tw = tab_width.max(1);
     let mut col = 0usize;
     for (b, c) in line.char_indices() {
         if b >= byte {
             break;
         }
-        col += if c == '\t' { tw - (col % tw) } else { 1 };
+        col = crate::textenc::advance_col(col, c, tab_width);
     }
     col
 }
@@ -927,24 +932,30 @@ fn visual_col_in_line(line: &str, byte: usize, tab_width: usize) -> usize {
 /// 表示桁 `col` に当たる行内バイト位置 (行頭からの相対)。
 ///
 /// - 行がその桁まで届かない → 行末を返す (短い行では行末に寄る = VS Code と同じ)。
-/// - タブの途中に当たった → 近い方の端へ丸める (タブを割らない)。
+/// - 文字の途中 (タブの内側・全角の右半分) に当たった → 近い方の端へ丸める。
+///
+/// 走査は**書記素クラスタ単位** ([`crate::textenc::grapheme_end`])。1 文字ずつ
+/// 進めると「幅 0 の結合文字の手前」で止まれてしまい、`が` を `か` と `゛` に
+/// 割った位置や、家族絵文字を ZWJ の途中で割った位置を返してしまう
+/// (そこで矩形選択を切ると文字が壊れる)。戻り値は常にクラスタ境界。
 fn byte_at_visual_col(line: &str, col: usize, tab_width: usize) -> usize {
-    let tw = tab_width.max(1);
     let mut cur = 0usize;
-    for (b, c) in line.char_indices() {
+    let mut b = 0usize;
+    while b < line.len() {
         if col <= cur {
             return b;
         }
-        let next = cur + if c == '\t' { tw - (cur % tw) } else { 1 };
+        let end = crate::textenc::grapheme_end(line, b);
+        // クラスタ内の各文字ぶん桁を進める (結合文字は 0 桁なので効かない)
+        let next = line[b..end]
+            .chars()
+            .fold(cur, |acc, c| crate::textenc::advance_col(acc, c, tab_width));
         if col < next {
-            // 文字の途中 (タブの内側) — 近い端へ寄せる
-            return if col - cur <= next - col {
-                b
-            } else {
-                b + c.len_utf8()
-            };
+            // クラスタの途中 (タブの内側・全角の右半分) — 近い端へ寄せる
+            return if col - cur <= next - col { b } else { end };
         }
         cur = next;
+        b = end;
     }
     line.len()
 }
@@ -1107,8 +1118,11 @@ pub fn select_next_occurrence(
 /// 矩形 (列) 選択。行 × 表示桁の長方形を、行ごとの範囲の集合に変換する。
 ///
 /// - 行・桁は 0 起点。順序は問わない (逆向きに指定しても同じ矩形になる)。
-/// - 桁は**タブ展開後の表示桁**。タブの途中に辺が来たら近い端へ丸める
-///   (タブを割ったバイト位置は作らない)。
+/// - 桁は**画面で占める表示桁** (タブ展開後・東アジア文字幅つき)。全角 (CJK)・
+///   絵文字は 2 桁、結合記号や ZWJ は 0 桁なので、日本語の行と英語の行が
+///   混じっていても矩形の辺が視覚的に揃う。
+/// - タブの内側・全角の右半分に辺が来たら近い端へ丸める (文字を割ったバイト
+///   位置は作らない。書記素クラスタも割らない)。
 /// - 矩形より短い行は**行末の空キャレット**になる (VS Code と同じ。行を飛ばさないので
 ///   「各行の同じ桁に挿入」が短い行でも効く)。
 /// - 幅 0 の矩形は各行の空キャレット = 「複数行の先頭にカーソルを立てる」になる。
@@ -2126,11 +2140,173 @@ mod tests {
     }
 
     #[test]
-    fn column_selection_over_japanese_uses_character_columns() {
+    fn column_selection_over_japanese_uses_display_columns() {
         let text = "あいうえお\nかきくけこ";
-        let sel = column_selection(text, 0, 1, 1, 3, 4);
-        assert_eq!(sel.slices(text), vec!["いう", "きく"], "全角も1桁と数える");
+        // 全角は 2 桁。`いう` は表示桁 2..6 (文字数では 1..3)。
+        let sel = column_selection(text, 0, 2, 1, 6, 4);
+        assert_eq!(
+            sel.slices(text),
+            vec!["いう", "きく"],
+            "全角は 2 桁と数える"
+        );
         assert_invariants(text, &sel, "日本語の矩形");
+    }
+
+    /// 全角の**右半分**に辺が来たら近い端へ丸める (半分だけ選ばない)。
+    #[test]
+    fn column_selection_rounds_inside_a_wide_char() {
+        let text = "あいうえお\nかきくけこ";
+        // 桁 1 は `あ` の右半分 — 左端 (桁 0) へ寄る
+        assert_eq!(column_selection(text, 0, 0, 0, 1, 4).carets(), &[0..0]);
+        // 桁 3 は `い` の右半分 — 近いのは左端 (桁 2)
+        let sel = column_selection(text, 0, 2, 0, 3, 4);
+        assert_eq!(sel.carets(), &[3..3], "全角を割ったバイト位置は作らない");
+        assert_invariants(text, &sel, "全角の内側で丸める");
+    }
+
+    // ──────────────── 表示幅 (East Asian Width) ────────────────
+
+    /// 表示桁の表。**画面で何桁を占めるか**を 1 行ずつ固定する。
+    ///
+    /// 桁の勘定は `textenc::advance_col` (端末と同じ表) に一本化してある。
+    /// 幅 0 の文字 (結合記号・ZWJ・ハングルの中声/終声) を「1 文字 = 1 桁」で
+    /// 数えると、日本語の行で矩形選択とキャレット追加が必ずずれる。
+    ///
+    /// | 入力 | タブ幅 | 期待桁 |
+    /// |---|---|---|
+    /// | `""` (空行) | 4 | 0 |
+    /// | `abc` | 4 | 3 |
+    /// | `あいう` | 4 | 6 |
+    /// | `中文字` | 4 | 6 |
+    /// | `한` (完成形) | 4 | 2 |
+    /// | `ㅎ+ㅏ+ㄴ` (分解字母) | 4 | 2 |
+    /// | `ｱｲｳ` (半角カナ) | 4 | 3 |
+    /// | `😀` | 4 | 2 |
+    /// | `👍🏽` (肌色修飾子) | 4 | 4 |
+    /// | `👨‍👩‍👧‍👦` (ZWJ 家族) | 4 | 8 |
+    /// | `か+゛` (結合濁点) | 4 | 2 |
+    /// | `e+´` (結合アクセント) | 4 | 1 |
+    /// | `\t` | 4 / 8 | 4 / 8 |
+    /// | `BEL` (制御文字) | 4 | 0 |
+    #[test]
+    fn visual_column_follows_east_asian_width() {
+        // (入力, タブ幅, 期待桁, 何を固定しているか)
+        let table: &[(&str, usize, usize, &str)] = &[
+            ("", 4, 0, "空行"),
+            ("abc", 4, 3, "ASCII は 1 桁"),
+            ("あいう", 4, 6, "日本語 (かな) は 2 桁"),
+            ("漢字", 4, 4, "日本語 (漢字) は 2 桁"),
+            ("中文字", 4, 6, "中国語は 2 桁"),
+            ("한", 4, 2, "ハングル完成形は 2 桁"),
+            (
+                "\u{1112}\u{1161}\u{11AB}",
+                4,
+                2,
+                "ハングル分解字母 ㅎ+ㅏ+ㄴ = 初声 2 + 中声 0 + 終声 0 (1 音節ぶん)",
+            ),
+            ("ｱｲｳ", 4, 3, "半角カナは 1 桁"),
+            ("😀", 4, 2, "絵文字は 2 桁"),
+            (
+                "👍🏽",
+                4,
+                4,
+                "肌色修飾子は基底の後ろで 2 桁 (端末グリッドと同じ数え方)",
+            ),
+            (
+                "👨\u{200D}👩\u{200D}👧\u{200D}👦",
+                4,
+                8,
+                "ZWJ 家族絵文字 = 人 4 つ分。ZWJ 自体は 0 桁",
+            ),
+            ("か\u{3099}", 4, 2, "結合濁点は 0 桁 (基底に乗る)"),
+            ("e\u{0301}", 4, 1, "結合アクセントは 0 桁"),
+            ("\t", 4, 4, "タブは次のタブストップまで"),
+            ("ab\t", 4, 4, "桁 2 のタブは桁 4 まで"),
+            ("あ\t", 4, 4, "全角 (2 桁) の後ろのタブも桁で数える"),
+            ("\t", 8, 8, "タブ幅は設定から来る (8 なら 8)"),
+            (
+                "あいうえ\t",
+                8,
+                16,
+                "8 桁ちょうどのタブは次のストップ (16) へ",
+            ),
+            ("\u{7}", 4, 0, "制御文字 (BEL) は桁を進めない"),
+            ("a\u{7}b", 4, 2, "制御文字は行の途中でも 0 桁"),
+        ];
+        for (line, tab, want, what) in table {
+            assert_eq!(
+                visual_col_in_line(line, line.len(), *tab),
+                *want,
+                "{what}: {line:?} (タブ幅 {tab})"
+            );
+        }
+    }
+
+    /// 表示桁 → バイト位置は必ず**書記素クラスタの境界**を返す。
+    ///
+    /// 結合文字の手前で切ると `が` が `か` と `゛` に割れ、ZWJ の途中で切ると
+    /// 家族絵文字がばらける。ハングルは入力の途中で分解字母 (ㅎ+ㅏ+ㄴ) として
+    /// 届くので、ここを割ると打っている最中の音節が壊れる。
+    #[test]
+    fn byte_at_visual_col_never_splits_a_cluster() {
+        // (行, 桁, 期待バイト, 何を固定しているか)
+        let table: &[(&str, usize, usize, &str)] = &[
+            ("か\u{3099}あ", 2, 6, "結合濁点の後ろ (か+゛の間で切らない)"),
+            ("👍🏽X", 4, 8, "肌色修飾子の後ろ (基底と修飾子の間で切らない)"),
+            (
+                "\u{1112}\u{1161}\u{11AB}X",
+                2,
+                9,
+                "ハングル分解字母 3 つの後ろ (音節を割らない)",
+            ),
+            (
+                "👨\u{200D}👩X",
+                4,
+                11,
+                "ZWJ 連結の後ろ (絵文字の連結を割らない)",
+            ),
+        ];
+        for (line, col, want, what) in table {
+            let got = byte_at_visual_col(line, *col, 4);
+            assert_eq!(got, *want, "{what}: {line:?} 桁 {col}");
+            assert!(line.is_char_boundary(got), "{what}: 文字境界でない");
+        }
+    }
+
+    /// 日本語の行と英語の行が混じっていても、矩形の辺が**視覚桁で揃う**。
+    #[test]
+    fn column_selection_aligns_japanese_and_english_rows() {
+        let text = "あいうえお\nabcdefghij\n漢字abcd";
+        let (lo, hi) = (2usize, 6usize);
+        let sel = column_selection(text, 0, lo, 2, hi, 4);
+        assert_eq!(
+            sel.slices(text),
+            vec!["いう", "cdef", "字ab"],
+            "同じ桁で切り出される"
+        );
+        for r in sel.carets() {
+            assert_eq!(visual_column_of(text, r.start, 4), lo, "左辺が揃う");
+            assert_eq!(visual_column_of(text, r.end, 4), hi, "右辺が揃う");
+        }
+        assert_invariants(text, &sel, "日英混在の矩形");
+    }
+
+    /// 「上下へキャレット追加」も視覚桁で揃う (日本語 → 英語 → 日本語)。
+    #[test]
+    fn add_cursor_below_aligns_japanese_and_english_visually() {
+        let text = "あいうえお\nabcdefghij\n漢字abcd";
+        // 1 行目の `あいう` の直後 = 表示桁 6
+        let seed = MultiSel::in_text(text, [9..9]);
+        assert_eq!(visual_column_of(text, 9, 4), 6);
+        let mut got = seed;
+        for _ in 0..2 {
+            got = add_cursor_below(text, &got, 4);
+        }
+        assert_eq!(got.len(), 3, "3 行ぶんのキャレット");
+        for r in got.carets() {
+            assert_eq!(visual_column_of(text, r.start, 4), 6, "桁 6 に揃う");
+        }
+        assert_invariants(text, &got, "日英混在のキャレット追加");
     }
 
     // ──────────────── 一括編集 (後ろから前へ) ────────────────
@@ -2186,7 +2362,8 @@ mod tests {
     #[test]
     fn insert_at_all_keeps_the_selected_text_selected() {
         let text = "あ\nい\nう";
-        let sel = column_selection(text, 0, 0, 2, 1, 4);
+        // 全角 1 文字 = 表示桁 0..2
+        let sel = column_selection(text, 0, 0, 2, 2, 4);
         let (out, new) = insert_at_all(text, &sel, "# ");
         assert_eq!(out, "# あ\n# い\n# う");
         assert_eq!(new.slices(&out), vec!["あ", "い", "う"], "選択内容は残る");
