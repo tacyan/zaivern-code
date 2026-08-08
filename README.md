@@ -96,18 +96,15 @@ zai .
 
 コードを読んだり、AIが変更した箇所を確認したりできるエディタを内蔵しています。画像・PDF・CSV・Markdownなどもアプリ内で開けます。
 
-## 🆕 最新リリース: v0.7.0
+## 🆕 最新リリース: v0.7.1
 
-- 画面全体とファイル単位の2段階ズーム
-- 配色テーマを3種類から11種類へ拡充
-- TypeScript・Swift・Kotlin・Dart・Zig・TOML・Dockerfile・Terraformなどの構文ハイライト
-- 6枚以上のCockpitタイルを読みやすく保つスクロール表示
-- 停滞・異常判定の精度改善と指揮官エージェントの可視化
-- ターミナル分割を新規エージェント起動と同じ挙動に統一
+- 自動YESが選択式プロンプトへ数字を撃つのは、画面が30秒まったく動かない停滞時だけに変更
+- 通常のスキャンでは数字を送らないため、AIの出力に含まれる箇条書きへ反応して数字が連続入力される事故が起きない
+- 数字を送ったときは、選んだ番号を通知にそのまま表示
 
-**品質:** 2,565テスト成功、`cargo fmt --check`差分なし、clippy警告0。
+**品質:** 2,567テスト、`cargo fmt --check`差分なし。
 
-[v0.7.0の詳細](https://github.com/tacyan/zaivern-code/releases/latest) ・ [過去のリリース](https://github.com/tacyan/zaivern-code/releases)
+[v0.7.1の詳細](https://github.com/tacyan/zaivern-code/releases/latest) ・ [過去のリリース](https://github.com/tacyan/zaivern-code/releases)
 
 ## 対応環境
 
