@@ -96,18 +96,15 @@ Check progress, send instructions, approve actions, and edit files from your pho
 
 Read code and review changes made by your AI tools without leaving the app. The editor can also open images, PDFs, CSVs, Markdown, and large files.
 
-## 🆕 Latest release: v0.7.0
+## 🆕 Latest release: v0.7.1
 
-- Two-level zoom for the whole UI and individual files
-- 11 color themes, up from 3
-- Syntax highlighting for TypeScript, Swift, Kotlin, Dart, Zig, TOML, Dockerfile, Terraform, and more
-- Scrollable Cockpit layout that keeps 6+ tiles readable
-- More accurate stall detection and clearer commander-agent visibility
-- Terminal splits now behave consistently with launching a new agent
+- Auto-YES now types a digit into choice prompts only after the screen has been completely frozen for 30 seconds
+- Normal scans never send digits, so bullet lists in agent output can no longer trigger a burst of keystrokes
+- When a digit is sent, the notification states exactly which entry was picked
 
-**Quality:** 2,565 tests passing, clean `cargo fmt --check`, and zero clippy warnings.
+**Quality:** 2,567 tests, clean `cargo fmt --check`.
 
-[v0.7.0 details](https://github.com/tacyan/zaivern-code/releases/latest) · [Previous releases](https://github.com/tacyan/zaivern-code/releases)
+[v0.7.1 details](https://github.com/tacyan/zaivern-code/releases/latest) · [Previous releases](https://github.com/tacyan/zaivern-code/releases)
 
 ## Supported environments
 

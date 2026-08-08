@@ -487,9 +487,37 @@ pub fn auto_yes_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
 ///    CLI ごとの実際の文言と送るキーは全部そこにデータとして載っている。
 /// 2. 表に無い場合の **汎用ヒューリスティック** (以下)。「1. Yes」「(y/n)」
 ///    「Press Enter」など、CLI をまたいで通用する形だけを見る。
+///
+/// **番号入力メニュー (「1. …/2. … 番号を入力してください」型) はここに
+/// 含まれない。** 数字は画面が 30 秒動かない停滞時にだけ打つ
+/// ([`stalled_reply_for`])。理由は下の [`numbered_menu_reply`] 呼び出し箇所の
+/// コメントを参照。
 pub fn auto_yes_reply_for(
     text: &str,
     agent: Option<&str>,
+) -> Option<(&'static [u8], &'static str)> {
+    auto_yes_reply_inner(text, agent, false)
+}
+
+/// **停滞時 / 手動の「✔ 承認」用**の分類。[`auto_yes_reply_for`] に
+/// 番号入力メニューへの数字応答を足した版。
+///
+/// 数字を打つのは「自動YESが効かず、番号入力の画面で止まったまま
+/// 30 秒 (`auto_yes_resend_after`) 画面が 1 文字も動かない」ときだけ。
+/// 通常スキャンから外したのは、Claude Code が出す番号付きの本文
+/// (箇条書き + 「1-3 の番号を…」のような文言) に反応して**数字が連続で
+/// 打ち込まれる**事故が実際に起きたため。停滞を条件にすると、
+/// 数字 1 回ごとに「画面が完全に固まった 30 秒」が必ず必要になるので、
+/// 連打は構造的に起こらない。
+pub fn stalled_reply_for(text: &str, agent: Option<&str>) -> Option<(&'static [u8], &'static str)> {
+    auto_yes_reply_inner(text, agent, true)
+}
+
+/// 分類の本体。`allow_numbered` が真のときだけ番号入力メニューにも答える。
+fn auto_yes_reply_inner(
+    text: &str,
+    agent: Option<&str>,
+    allow_numbered: bool,
 ) -> Option<(&'static [u8], &'static str)> {
     // 管理者権限昇格など「自動で押してはいけない」画面ではここで打ち切る。
     if crate::agents::prompt_never_answer(text) {
@@ -499,11 +527,14 @@ pub fn auto_yes_reply_for(
     if let Some(hit) = crate::agents::prompt_rule_reply(text, agent) {
         return Some(hit);
     }
-    // 「1. …/2. … 番号を入力してください」型。**数字 + Enter** が要る画面は
-    // 他のどの分岐にも当たらず素通りしていた (ユーザー報告のアンケート停止)。
+    // 「1. …/2. … 番号を入力してください」型。**数字 + Enter** が要る画面。
+    // 汎用ヒューリスティックより先に見る — 後段の「1. Yes」判定は Enter を
+    // 付けない `b"1"` を返すため、番号入力の画面では確定しないまま残る。
     // 語彙は agents.rs の MENU_* 表、判定は numbered_menu_reply に閉じている。
-    if let Some(hit) = numbered_menu_reply(text) {
-        return Some(hit);
+    if allow_numbered {
+        if let Some(hit) = numbered_menu_reply(text) {
+            return Some(hit);
+        }
     }
     // 以降は CLI をまたいで通用する汎用の形だけを見る。
     // (Antigravity 固有の文言は agents.rs の応答表に移した — 以前はここに
@@ -1835,6 +1866,11 @@ impl Session {
             self.answered_sig = None;
             self.auto_stall_since = None;
         }
+        if !present {
+            // 応答前から回している停滞監視 (答えを出せない承認待ち) も、
+            // プロンプトが画面から消えたら畳む。
+            self.auto_stall_since = None;
+        }
         let waiting = present && self.answered_sig.is_none();
         let newly = waiting && !self.attention;
         self.attention = waiting;
@@ -1855,23 +1891,45 @@ impl Session {
                 self.attention = false;
                 return Some(Attention::AutoReplied(desc));
             }
+            // 自動YESが答えを持たない承認待ち (番号入力メニューなど)。
+            // ここでは**何も送らず**、停滞監視だけを始める。数字を打つのは
+            // 下のウォッチドッグが「画面が 30 秒動かない」と確認した後だけ。
+            if self.auto_stall_since.is_none() {
+                self.auto_stall_since = Some(Instant::now());
+                self.auto_stall_hash = self.cur_hash;
+            }
         }
-        // 自動YESの停滞ウォッチドッグ: 自動応答したのに同じプロンプトのまま
-        // 画面が 30 秒間まったく変化しない (= 応答が取りこぼされた) 場合は、
-        // YESを再送せず、ペットの「✔ 承認」ボタンと同じ操作へ切り替える。
+        // 自動YESの停滞ウォッチドッグ。対象は 2 通り:
+        //   ① 自動応答したのに同じプロンプトのまま画面が 30 秒まったく
+        //      変化しない (= 応答が取りこぼされた)。
+        //   ② そもそも自動YESが答えを出せず、承認待ちのまま 30 秒動かない
+        //      (= 番号入力の画面で止まっている)。
+        // どちらもペットの「✔ 承認」ボタンと同じ操作へ切り替える。②では
+        // それが `numbered_menu_reply` の数字 + Enter になる (通常スキャンでは
+        // 数字を打たないので、ここが唯一の入口 = 連打が構造的に起こらない)。
         // 出力が流れている間 (cur_hash が動く間) は「進んでいる」ので送らない —
         // 応答済みプロンプトが画面に残っているだけの状態への連打事故を防ぐ。
-        if auto_yes && present && self.answered_sig == sig {
+        if auto_yes && present && (self.answered_sig == sig || self.answered_sig.is_none()) {
             if let Some(since) = self.auto_stall_since {
                 if self.cur_hash != self.auto_stall_hash {
                     self.auto_stall_hash = self.cur_hash;
                     self.auto_stall_since = Some(Instant::now());
-                } else if since.elapsed() >= self.auto_yes_resend_after
-                    && self.press_pet_approve_button(None)
-                {
-                    return Some(Attention::AutoReplied(
-                        "自動YES停滞のためペットの承認ボタンを自動押下",
-                    ));
+                } else if since.elapsed() >= self.auto_yes_resend_after {
+                    // 押せても押せなくても次の判定は 30 秒後から。
+                    // (分類できない画面へ毎スキャン試し続けないため)
+                    self.auto_stall_since = Some(Instant::now());
+                    // 送るのが番号メニューの数字なら「何番を選んだか」を
+                    // そのまま説明に出す。勝手に答えた事実を隠さないための
+                    // 約束 (MENU_DESC_* の文面)。それ以外は従来の停滞文言。
+                    let menu_keys = numbered_menu_reply(&text).map(|(b, _)| b);
+                    let menu_desc = stalled_reply_for(&text, self.agent_bin())
+                        .filter(|(b, _)| menu_keys == Some(b))
+                        .map(|(_, d)| d);
+                    if self.press_pet_approve_button(None) {
+                        return Some(Attention::AutoReplied(
+                            menu_desc.unwrap_or("自動YES停滞のためペットの承認ボタンを自動押下"),
+                        ));
+                    }
                 }
             }
         }
@@ -2053,9 +2111,13 @@ impl Session {
     /// auto_yes_reply と同じ分類を再利用する。Bypass 警告のようにデフォルト選択が
     /// 「1. No, exit」のプロンプトへ Enter を送るとセッションが終了してしまうため、
     /// 番号キー「2」などプロンプトに合った承認キーを返す。分類不能なら None。
+    ///
+    /// ここは [`stalled_reply_for`] 側 (= 番号入力メニューにも答える版) を使う。
+    /// 呼び出し元は「人が✔を押した」か「停滞ウォッチドッグが 30 秒待った」かの
+    /// どちらかで、どちらも 1 回の明示的な操作に対応するため。
     pub fn approve_reply(&self) -> Option<&'static str> {
         let text = lock_ok(&self.parser).screen().contents();
-        let (bytes, _) = auto_yes_reply_for(&text, self.agent_bin())?;
+        let (bytes, _) = stalled_reply_for(&text, self.agent_bin())?;
         std::str::from_utf8(bytes).ok()
     }
 
@@ -2541,7 +2603,12 @@ mod tail_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_yes_reply, auto_yes_reply_for};
+    use super::{auto_yes_reply, auto_yes_reply_for, stalled_reply_for};
+
+    /// 停滞時の分類 (番号入力メニューにも答える版) のエージェント無し呼び出し。
+    fn stalled_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
+        stalled_reply_for(text, None)
+    }
 
     #[test]
     fn bypass_warning_selects_accept() {
@@ -2959,6 +3026,7 @@ mod tests {
         }
         // 誤爆しない = 自動応答もしない
         assert!(auto_yes_reply("手順:\n1. Yes と入力\n2. 実行").is_none());
+        assert!(stalled_reply("手順:\n1. Yes と入力\n2. 実行").is_none());
     }
 
     #[test]
@@ -3004,7 +3072,7 @@ mod tests {
             ),
         ];
         for (screen, want, desc_part) in table {
-            let (bytes, desc) = auto_yes_reply(screen).unwrap_or_else(|| {
+            let (bytes, desc) = stalled_reply(screen).unwrap_or_else(|| {
                 panic!("番号メニューに応答しなかった:\n{screen}");
             });
             assert_eq!(bytes, *want, "screen={screen}");
@@ -3050,7 +3118,7 @@ mod tests {
             ),
         ];
         for (screen, want) in table {
-            let (bytes, desc) = auto_yes_reply(screen)
+            let (bytes, desc) = stalled_reply(screen)
                 .unwrap_or_else(|| panic!("評点アンケートに答えなかった:\n{screen}"));
             assert_eq!(bytes, *want, "screen={screen}");
             assert!(
@@ -3071,9 +3139,55 @@ mod tests {
                       1. opus\n2. sonnet\n3. haiku\nEnter a number (1-3): ";
         assert!(auto_yes_reply(screen).is_none(), "自由選択に勝手に答えた");
         assert!(
+            stalled_reply(screen).is_none(),
+            "停滞後でも自由選択には答えない"
+        );
+        assert!(
             numbered_menu_prompt(screen).is_some(),
             "承認待ちとして検知できる形になっていない"
         );
+    }
+
+    #[test]
+    fn numbered_menu_digits_only_fire_when_stalled() {
+        // ユーザー報告: Claude Code の番号メニューへ**数字が連続で打ち込まれた**。
+        // 通常スキャンの分類 (auto_yes_reply*) は数字 + Enter を一切返さない。
+        // 数字を打つのは停滞ウォッチドッグ経由 (stalled_reply*) だけにする。
+        let table: &[(&str, &[u8])] = &[
+            (
+                "Allow this command to run?\n\
+                 1. No, cancel\n2. Yes, allow this once\n\
+                 Enter a number (1-2): ",
+                b"2\r",
+            ),
+            (
+                "アンケート: 満足度はいかがですか?\n\
+                 1) とても満足\n2) 普通\n3) 回答しない\n\
+                 番号を入力してください: ",
+                b"3\r",
+            ),
+            (
+                "Help us improve! Take a short survey?\n\
+                 1. Take the survey\n2. Maybe later\n\
+                 Enter a number (1-2): ",
+                b"2\r",
+            ),
+        ];
+        for (screen, want) in table {
+            assert!(
+                auto_yes_reply(screen).is_none(),
+                "通常スキャンで番号メニューへ数字を打った: {screen}"
+            );
+            assert!(
+                auto_yes_reply_for(screen, Some("claude")).is_none(),
+                "通常スキャン (claude) で番号メニューへ数字を打った: {screen}"
+            );
+            assert_eq!(
+                stalled_reply(screen).map(|(b, _)| b),
+                Some(*want),
+                "停滞後にも数字を打たない (= 永久に止まる): {screen}"
+            );
+        }
     }
 
     #[test]
@@ -3083,6 +3197,12 @@ mod tests {
                       1. Yes, allow\n2. No\nEnter a number (1-2): ";
         assert!(auto_yes_reply(screen).is_none(), "権限昇格に自動応答した");
         assert!(auto_yes_reply_for(screen, Some("agy")).is_none());
+        // 停滞後の分類でも同じ (30 秒待ったからといって権限昇格は押さない)
+        assert!(
+            stalled_reply(screen).is_none(),
+            "停滞時に権限昇格へ応答した"
+        );
+        assert!(stalled_reply_for(screen, Some("agy")).is_none());
         // 検知自体はされる = 人が判断できるよう承認待ちには出る
         assert!(numbered_menu_prompt(screen).is_some());
     }
@@ -3093,19 +3213,19 @@ mod tests {
         let screen = "Allow access to this file?\n\
                       1. Yes, allow access\n2. No\n\
                       [Use arrow keys to navigate, Enter to select]";
-        let (bytes, _) = auto_yes_reply_for(screen, Some("agy")).unwrap();
+        let (bytes, _) = stalled_reply_for(screen, Some("agy")).unwrap();
         assert_eq!(bytes, b"\r", "矢印キー UI に数字を送った");
         // 「番号を入力」の文言が混ざっていても数字は送らない
         let mixed = format!("{screen}\nEnter a number (1-2): ");
         assert_eq!(
-            auto_yes_reply_for(&mixed, Some("agy")).map(|(b, _)| b),
+            stalled_reply_for(&mixed, Some("agy")).map(|(b, _)| b),
             Some(&b"\r"[..])
         );
         // カタログに載っていない CLI でも、矢印ヒントがあれば数字は送らない
         let unknown = "Pick one\n1. Yes, continue\n2. No\n\
                        Use arrow keys to move, then Enter\nEnter a number (1-2): ";
         assert!(
-            auto_yes_reply_for(unknown, Some("claude")).map(|(b, _)| b) != Some(&b"1\r"[..]),
+            stalled_reply_for(unknown, Some("claude")).map(|(b, _)| b) != Some(&b"1\r"[..]),
             "矢印キー UI に番号を送った"
         );
     }
@@ -3150,7 +3270,7 @@ mod tests {
             ),
         ];
         for (bin, screen, want) in table {
-            let got = auto_yes_reply_for(screen, Some(bin)).map(|(b, _)| b);
+            let got = stalled_reply_for(screen, Some(bin)).map(|(b, _)| b);
             assert_eq!(got, Some(*want), "bin={bin} screen={screen}");
         }
     }
@@ -3162,7 +3282,7 @@ mod tests {
                       1. Great\n2. Fine\n3. Bad\n4. Skip\n\
                       Enter a number (1-4): ";
         // 組み込みの選び方ではスキップ肢
-        assert_eq!(auto_yes_reply(screen).map(|(b, _)| b), Some(&b"4\r"[..]));
+        assert_eq!(stalled_reply(screen).map(|(b, _)| b), Some(&b"4\r"[..]));
         // config.toml の [[auto_yes_rules]] で「3 を送る」に上書きできる。
         // (auto_yes_reply_for はユーザールール → 番号メニューの順に見るので、
         //  ここで一致すれば番号メニューの判断には進まない)
@@ -4412,6 +4532,58 @@ mod tests {
             screen.contains("Enter a number (1-3)"),
             "勝手に応答して画面が進んでしまった: {screen}"
         );
+        s.kill();
+    }
+
+    /// 番号入力メニューへ数字を打つのは「30 秒 (テストでは短縮) 画面が
+    /// まったく動かない」停滞時だけ。通常スキャンでは承認待ちに出すだけで、
+    /// 数字は打たない (ユーザー報告の「数字が連続で入力される」の再発防止)。
+    #[cfg(unix)]
+    #[test]
+    fn numbered_menu_digit_waits_for_the_stall_timeout() {
+        use super::Attention;
+        use std::time::{Duration, Instant};
+
+        let mut s = spawn_prompt_session(9403, "sleep 10");
+        s.auto_yes_resend_after = Duration::from_millis(600);
+        let menu = "Allow this command to run?\r\n\
+                    1. No, cancel\r\n2. Yes, allow this once\r\n\
+                    Enter a number (1-2): ";
+        s.parser.lock().unwrap().process(menu.as_bytes());
+        std::thread::sleep(Duration::from_millis(1_000));
+
+        // 1) 最初のスキャンは「承認待ち」を上げるだけ (数字は打たない)
+        assert!(
+            matches!(s.scan_attention(true), Some(Attention::NeedsApproval)),
+            "番号メニューが承認待ちにならなかった"
+        );
+        // 2) 停滞閾値の前は何度スキャンしても撃たない
+        for _ in 0..3 {
+            s.last_scan = Instant::now() - Duration::from_millis(900);
+            assert!(
+                s.scan_attention(true).is_none(),
+                "停滞閾値の前に番号メニューへ数字を打った"
+            );
+        }
+        // 3) 画面が固まったまま閾値を超えたら、そこで初めて数字を打つ
+        std::thread::sleep(Duration::from_millis(700));
+        s.last_scan = Instant::now() - Duration::from_millis(900);
+        match s.scan_attention(true) {
+            Some(Attention::AutoReplied(desc)) => assert!(
+                desc.contains('2'),
+                "勝手に選んだ番号が説明に出ていない: {desc}"
+            ),
+            _ => panic!("停滞後も番号メニューに答えなかった"),
+        }
+        // 4) 打ったあとは同じ画面が残っても打ち直さない (数字の連打を作らない)
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(200));
+            s.last_scan = Instant::now() - Duration::from_millis(900);
+            assert!(
+                !matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))),
+                "同じ番号メニューへ数字を再送した"
+            );
+        }
         s.kill();
     }
 
