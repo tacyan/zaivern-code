@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -14,6 +14,10 @@ pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+    /// `.gitignore` 等で git が無視する対象か。
+    /// 隠す設定なら `entries()` の時点で落ちるので、ここに残るのは
+    /// 「薄く表示する」設定のときだけ。
+    pub ignored: bool,
 }
 
 /// `p` を含むルート(最長一致)。どのルートにも属さなければ None。
@@ -47,9 +51,12 @@ pub struct TreeActions {
     pub create_dir: Option<PathBuf>,
     /// 名前の変更 (旧パス, 新パス)
     pub rename: Option<(PathBuf, PathBuf)>,
-    /// 削除要求(確認ダイアログは呼び出し側が出す)
+    /// 削除要求(確認ダイアログは呼び出し側が出す)。**複数選択に対応**する。
+    /// `None` = 削除要求なし。中の `paths` が実際の対象 (1 件でも複数でも同じ形)。
     pub delete: Option<DeleteRequest>,
     /// 移動/コピーの実行計画。**fs 操作も確認ダイアログも呼び出し側**が行う。
+    /// 複数選択のドロップ / 貼り付けは 1 ジョブに複数件入る
+    /// (同名衝突を「すべてに適用」で 1 回だけ聞くため)。
     pub transfer: Option<TransferJob>,
     /// ファイル操作の取り消し要求 (ツリーの ⌘Z / Ctrl+Z)。
     ///
@@ -67,10 +74,12 @@ pub struct TreeActions {
     pub notice: Option<String>,
 }
 
-/// 削除要求。`permanent` は Shift 併用 = ゴミ箱を通さない完全削除。
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// 削除要求。**複数選択に対応**するので対象は集合で持つ。
+/// `permanent` は 1 回の操作に 1 つ (Shift 併用 = ゴミ箱を通さない完全削除)。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct DeleteRequest {
-    pub path: PathBuf,
+    /// 消す対象 (ルートは含まない)。空なら何もしない。
+    pub paths: Vec<PathBuf>,
     /// true なら復元できない完全削除 (Shift+削除 / 設定でゴミ箱を切っている)。
     pub permanent: bool,
 }
@@ -143,6 +152,126 @@ pub fn normalize_roots(input: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf>
     out
 }
 
+/// ツリーの選択集合 (VS Code のエクスプローラー同様、複数選択できる)。
+///
+/// **単一選択のときの挙動は従来どおり**: `set_single` で `items` が 1 件になり、
+/// `lead` がその 1 件を指す。既存のキーボード操作・新規作成の基準は
+/// すべて `lead` を見るので、複数選択を足しても 1 件のときの動きは変わらない。
+#[derive(Default)]
+pub struct Selection {
+    /// 選択中のパス(クリック順)。
+    items: Vec<PathBuf>,
+    /// キーボード操作・新規作成の基準になる「最後に触れた」行。
+    lead: Option<PathBuf>,
+    /// Shift+クリックの範囲起点。
+    anchor: Option<PathBuf>,
+}
+
+impl Selection {
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn contains(&self, p: &Path) -> bool {
+        self.items.iter().any(|x| x == p)
+    }
+
+    /// キーボード操作の基準 (従来の `selected` 相当)。
+    pub fn lead(&self) -> Option<&Path> {
+        self.lead.as_deref()
+    }
+
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.items
+    }
+
+    /// 単一選択にする (修飾キー無しのクリック / 外部からの `select`)。
+    pub fn set_single(&mut self, p: &Path) {
+        self.items.clear();
+        self.items.push(p.to_path_buf());
+        self.lead = Some(p.to_path_buf());
+        self.anchor = Some(p.to_path_buf());
+    }
+
+    /// ⌘/Ctrl+クリック: 選択に足す / 外す。
+    pub fn toggle(&mut self, p: &Path) {
+        if let Some(i) = self.items.iter().position(|x| x == p) {
+            self.items.remove(i);
+            if self.lead.as_deref() == Some(p) {
+                self.lead = self.items.last().cloned();
+            }
+        } else {
+            self.items.push(p.to_path_buf());
+            self.lead = Some(p.to_path_buf());
+        }
+        self.anchor = Some(p.to_path_buf());
+    }
+
+    /// Shift+クリック: 起点から `to` までを選択する (起点は動かさない)。
+    pub fn set_range(&mut self, picked: Vec<PathBuf>, to: &Path) {
+        self.items = picked;
+        self.lead = Some(to.to_path_buf());
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.lead = None;
+        self.anchor = None;
+    }
+
+    /// `p` 配下(自身含む)を選択から外す(削除後の後始末)。
+    /// 選択中の要素が消えても `lead` / `anchor` が宙に浮かないようにする。
+    pub fn remove_under(&mut self, p: &Path) {
+        self.items.retain(|x| !x.starts_with(p));
+        if self.lead.as_deref().is_some_and(|l| l.starts_with(p)) {
+            self.lead = self.items.last().cloned();
+        }
+        if self.anchor.as_deref().is_some_and(|a| a.starts_with(p)) {
+            self.anchor = self.lead.clone();
+        }
+    }
+}
+
+/// Shift+クリックの範囲選択 (純粋関数)。`rows` は描画順のパス列。
+///
+/// **逆順 (下から上へ Shift+クリック) でも同じ範囲**を返す。
+/// どちらかが可視行に無ければ、クリックされた行だけを選ぶ。
+pub fn range_select(rows: &[PathBuf], anchor: &Path, to: &Path) -> Vec<PathBuf> {
+    let a = rows.iter().position(|r| r == anchor);
+    let b = rows.iter().position(|r| r == to);
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            rows[lo..=hi].to_vec()
+        }
+        _ => vec![to.to_path_buf()],
+    }
+}
+
+/// 1 ディレクトリの表示件数を決める純粋関数。
+///
+/// 戻りは `(描く件数, 残り件数)`。`page == 0` は上限なし。
+/// 「さらに N 件」を押すたびに `extra_pages` が 1 増え、同じ幅だけ伸びる。
+pub fn dir_page(total: usize, page: usize, extra_pages: usize) -> (usize, usize) {
+    if page == 0 {
+        return (total, 0);
+    }
+    let shown = total.min(page.saturating_mul(extra_pages.saturating_add(1)));
+    (shown, total - shown)
+}
+
+/// ツリーの絞り込み結果 (クエリと、描いてよいパスの集合)。
+struct FilterHit {
+    /// この結果を作ったクエリ(変わったら作り直す)。
+    query: String,
+    /// 一致した要素とその祖先ディレクトリ。
+    keep: HashSet<PathBuf>,
+    /// 一致した件数。
+    matched: usize,
+    /// 走査を予算で打ち切ったか。
+    truncated: bool,
+}
+
 /// キーボード操作用の可視行(描画順のスナップショット)。
 struct Row {
     path: PathBuf,
@@ -163,12 +292,15 @@ pub struct FileTree {
     mtimes: HashMap<PathBuf, Option<SystemTime>>,
     pub show_hidden: bool,
     edit: Option<EditState>,
-    /// 選択中(キーボードフォーカス)の行。VS Code のエクスプローラー選択に相当。
-    selected: Option<PathBuf>,
+    /// 選択集合。VS Code のエクスプローラー選択に相当 (⌘/Ctrl+クリックで追加、
+    /// Shift+クリックで範囲)。単一選択のときの挙動は従来と同じ。
+    sel: Selection,
+    /// 直前フレームの可視行(描画順)。Shift+クリックの範囲選択に使う。
+    row_paths: Vec<PathBuf>,
     /// ツリーがキーボード操作の対象か(最後のクリックがツリー内だったか)。
     focused: bool,
-    /// 内部クリップボード (パス, 切り取りか)。VS Code の filesExplorer.copy/cut。
-    clipboard: Option<(PathBuf, bool)>,
+    /// 内部クリップボード (パス集合, 切り取りか)。VS Code の filesExplorer.copy/cut。
+    clipboard: Option<(Vec<PathBuf>, bool)>,
     /// 次の描画でこの行を可視位置までスクロールする。
     scroll_to: Option<PathBuf>,
     /// タイプアヘッド(文字入力で行へジャンプ)のバッファと最終入力時刻。
@@ -194,6 +326,29 @@ pub struct FileTree {
     use_trash: bool,
     /// 取り消せるファイル操作の表示名。`None` = 履歴が空。
     undo_hint: Option<String>,
+    /// `.gitignore` の判定器 (設定で無効化できる)。
+    ignorer: crate::ignore::Ignorer,
+    /// 無視されたファイルを隠さず薄く表示するか。
+    dim_ignored: bool,
+    /// 1 ディレクトリで一度に描く行数 (0 = 上限なし)。設定から入れる。
+    dir_page: usize,
+    /// 「さらに N 件」を押した回数 (ディレクトリごと)。
+    more_pages: HashMap<PathBuf, usize>,
+    /// 絞り込みの走査で辿ってよい最大件数・最大深さ (設定から入れる)。
+    scan_budget: usize,
+    max_depth: usize,
+    /// ツリー上部の絞り込み入力 (`fuzzy` の既存あいまい検索を使う)。
+    pub filter: String,
+    /// 絞り込みの計算結果 (クエリが変わるまで使い回す)。
+    filter_hit: Option<FilterHit>,
+    /// 絞り込みの**走査専用**キャッシュ。`cache` と分けているのは、
+    /// 走査で読んだ数千階層を `mtimes` に載せると `refresh_if_changed()` が
+    /// 毎秒その数だけ stat を撃つことになるため (描画に使う階層だけを
+    /// `cache`/`mtimes` に置く、という元の性質を守る)。
+    scan_cache: HashMap<PathBuf, Vec<Entry>>,
+    /// テスト専用: 実際に `read_dir` を叩いた回数 (キャッシュ効果の計測)。
+    #[cfg(test)]
+    io_reads: usize,
 }
 
 impl FileTree {
@@ -205,7 +360,8 @@ impl FileTree {
             mtimes: HashMap::new(),
             show_hidden,
             edit: None,
-            selected: None,
+            sel: Selection::default(),
+            row_paths: Vec::new(),
             focused: false,
             clipboard: None,
             scroll_to: None,
@@ -220,6 +376,34 @@ impl FileTree {
             confirm_dnd: true,
             use_trash: true,
             undo_hint: None,
+            ignorer: crate::ignore::Ignorer::new(true),
+            dim_ignored: false,
+            dir_page: crate::config::DEFAULT_TREE_DIR_PAGE,
+            more_pages: HashMap::new(),
+            scan_budget: crate::config::DEFAULT_INDEX_MAX_FILES,
+            max_depth: crate::config::DEFAULT_INDEX_MAX_DEPTH,
+            filter: String::new(),
+            filter_hit: None,
+            scan_cache: HashMap::new(),
+            #[cfg(test)]
+            io_reads: 0,
+        }
+    }
+
+    /// 設定 (`.gitignore` の尊重 / 薄表示 / 1 階層の描画上限 / 走査予算) を反映する。
+    /// 値が変わったときだけキャッシュを捨てる (毎フレーム呼んでよい)。
+    pub fn apply_config(&mut self, cfg: &crate::config::Config) {
+        let before = (self.dim_ignored, self.dir_page);
+        self.ignorer.set_enabled(cfg.respect_gitignore);
+        self.dim_ignored = cfg.respect_gitignore && cfg.dim_ignored_files;
+        self.dir_page = cfg.tree_dir_page;
+        self.scan_budget = cfg.index_max_files;
+        self.max_depth = cfg.index_max_depth;
+        if before != (self.dim_ignored, self.dir_page) {
+            self.cache.clear();
+            self.mtimes.clear();
+            self.filter_hit = None;
+            self.scan_cache.clear();
         }
     }
 
@@ -227,8 +411,12 @@ impl FileTree {
         self.roots = roots;
         self.cache.clear();
         self.mtimes.clear();
+        self.ignorer.clear();
+        self.more_pages.clear();
+        self.filter_hit = None;
+        self.scan_cache.clear();
         self.edit = None;
-        self.selected = None;
+        self.sel.clear();
         self.clipboard = None;
         self.scroll_to = None;
         // アクティブファイルは次の set_active_file で改めて reveal し直す
@@ -289,9 +477,29 @@ impl FileTree {
     }
 
     /// 外部(アプリ側)から選択を移す。次フレームで見える位置までスクロールする。
+    /// 常に**単一選択**へ戻す (複数選択は明示的な修飾キー操作でだけ作る)。
     pub fn select(&mut self, p: &Path) {
-        self.selected = Some(p.to_path_buf());
+        self.sel.set_single(p);
         self.scroll_to = Some(p.to_path_buf());
+    }
+
+    /// 行クリック時の選択更新 (VS Code と同じ修飾キー規則)。
+    /// 修飾キー無し = 単一選択 / ⌘(Ctrl) = 追加・解除 / Shift = 範囲。
+    fn click_select(&mut self, p: &Path, mods: egui::Modifiers) {
+        if mods.command {
+            self.sel.toggle(p);
+        } else if mods.shift {
+            match self.sel.anchor.clone().or_else(|| self.sel.lead.clone()) {
+                Some(a) => {
+                    let picked = range_select(&self.row_paths, &a, p);
+                    self.sel.set_range(picked, p);
+                }
+                None => self.sel.set_single(p),
+            }
+        } else {
+            self.sel.set_single(p);
+        }
+        self.focused = true;
     }
 
     /// 指定フォルダを**その場で**開いて選択する (ブレッドクラムのフォルダ押下)。
@@ -306,27 +514,24 @@ impl FileTree {
             }
         }
         set_open(ctx, p, true);
-        self.selected = Some(p.to_path_buf());
+        self.sel.set_single(p);
         self.scroll_to = Some(p.to_path_buf());
     }
 
     /// `p` 配下(自身含む)を指していた選択・クリップボードを外す(削除後の後始末)。
     pub fn deselect_under(&mut self, p: &Path) {
-        if self.selected.as_deref().is_some_and(|s| s.starts_with(p)) {
-            self.selected = None;
+        self.sel.remove_under(p);
+        if let Some((paths, _)) = self.clipboard.as_mut() {
+            paths.retain(|c| !c.starts_with(p));
         }
-        if self
-            .clipboard
-            .as_ref()
-            .is_some_and(|(c, _)| c.starts_with(p))
-        {
+        if self.clipboard.as_ref().is_some_and(|(c, _)| c.is_empty()) {
             self.clipboard = None;
         }
     }
 
     /// 新規作成の対象ディレクトリ(VS Code 同様、選択中の場所を優先)。
     pub fn new_entry_dir(&self) -> PathBuf {
-        match self.selected.as_deref() {
+        match self.sel.lead() {
             Some(p) if p.is_dir() => p.to_path_buf(),
             Some(p) => p
                 .parent()
@@ -351,6 +556,10 @@ impl FileTree {
     pub fn invalidate(&mut self) {
         self.cache.clear();
         self.mtimes.clear();
+        self.ignorer.clear();
+        self.more_pages.clear();
+        self.filter_hit = None;
+        self.scan_cache.clear();
     }
 
     /// キャッシュ済みの各階層をディレクトリ mtime で確認し、外部(エージェント等)で
@@ -405,6 +614,30 @@ impl FileTree {
         if let Some(v) = self.cache.get(dir) {
             return v.clone();
         }
+        let v = self.read_entries(dir);
+        self.cache.insert(dir.to_path_buf(), v.clone());
+        self.mtimes.insert(dir.to_path_buf(), dir_mtime(dir));
+        v
+    }
+
+    /// 絞り込みの走査用。描画キャッシュを汚さない (mtime 監視も増やさない)。
+    fn scan_entries(&mut self, dir: &Path) -> Vec<Entry> {
+        if let Some(v) = self.cache.get(dir).or_else(|| self.scan_cache.get(dir)) {
+            return v.clone();
+        }
+        let v = self.read_entries(dir);
+        self.scan_cache.insert(dir.to_path_buf(), v.clone());
+        v
+    }
+
+    /// 1 階層をディスクから読む (隠しファイル / `.gitignore` の判定込み)。
+    fn read_entries(&mut self, dir: &Path) -> Vec<Entry> {
+        #[cfg(test)]
+        {
+            self.io_reads += 1;
+        }
+        // `.gitignore` はこのルート基準で解釈する (マルチルートでも取り違えない)。
+        let root = root_for(&self.roots, dir).map(Path::to_path_buf);
         let mut v: Vec<Entry> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
@@ -416,10 +649,20 @@ impl FileTree {
                     continue;
                 }
                 let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let path = e.path();
+                let ignored = match &root {
+                    Some(r) => self.ignorer.is_ignored(r, &path, is_dir),
+                    None => false,
+                };
+                // 既定は VS Code と同じで「隠す」。薄表示の設定なら残して淡く描く。
+                if ignored && !self.dim_ignored {
+                    continue;
+                }
                 v.push(Entry {
-                    path: e.path(),
+                    path,
                     name,
                     is_dir,
+                    ignored,
                 });
             }
         }
@@ -428,9 +671,122 @@ impl FileTree {
                 .cmp(&a.is_dir)
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
-        self.cache.insert(dir.to_path_buf(), v.clone());
-        self.mtimes.insert(dir.to_path_buf(), dir_mtime(dir));
         v
+    }
+
+    /// 絞り込みを掛けたあとの `dir` 直下(描画順)。
+    fn shown_entries(&mut self, dir: &Path) -> Vec<Entry> {
+        let mut v = self.entries(dir);
+        if let Some(f) = &self.filter_hit {
+            v.retain(|e| f.keep.contains(&e.path));
+        }
+        v
+    }
+
+    /// `dir` 直下のうち今フレーム描く件数と、畳んだ残り件数。
+    fn page_of(&self, dir: &Path, total: usize) -> (usize, usize) {
+        let extra = self.more_pages.get(dir).copied().unwrap_or(0);
+        dir_page(total, self.dir_page, extra)
+    }
+
+    /// 絞り込みを (必要なら) 計算し直し、一致した要素の祖先を展開する。
+    ///
+    /// クエリが変わるまで結果を使い回すので、毎フレーム走査はしない。
+    /// 走査は `scan_budget` 件・`max_depth` 段で打ち切る
+    /// (巨大リポジトリでも 1 フレームを食い潰さない)。
+    fn recompute_filter(&mut self, ctx: &egui::Context) {
+        let q = self.filter.trim().to_string();
+        if q.is_empty() {
+            self.filter_hit = None;
+            self.scan_cache.clear();
+            return;
+        }
+        if self.filter_hit.as_ref().is_some_and(|f| f.query == q) {
+            return;
+        }
+        let pq = crate::fuzzy::PreparedQuery::new(&q);
+        let mut keep: HashSet<PathBuf> = HashSet::new();
+        let mut open_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut matched = 0usize;
+        let mut visited = 0usize;
+        let mut truncated = false;
+        let roots = self.roots.clone();
+        let mut stack: Vec<(PathBuf, usize)> = roots.iter().map(|r| (r.clone(), 0usize)).collect();
+        stack.reverse();
+        while let Some((dir, depth)) = stack.pop() {
+            if depth >= self.max_depth {
+                continue;
+            }
+            for e in self.scan_entries(&dir) {
+                visited += 1;
+                if visited > self.scan_budget {
+                    truncated = true;
+                    break;
+                }
+                if pq.score(&e.name).is_some() {
+                    matched += 1;
+                    keep.insert(e.path.clone());
+                    // 祖先をたどって「見える道」を作る (ルートまで)
+                    for anc in reveal_ancestors(&roots, &e.path) {
+                        keep.insert(anc.clone());
+                        open_dirs.insert(anc);
+                    }
+                }
+                if e.is_dir {
+                    stack.push((e.path.clone(), depth + 1));
+                }
+            }
+            if truncated {
+                break;
+            }
+        }
+        for d in &open_dirs {
+            set_open(ctx, d, true);
+        }
+        self.filter_hit = Some(FilterHit {
+            query: q,
+            keep,
+            matched,
+            truncated,
+        });
+    }
+
+    /// ツリー上部の絞り込み入力。一致件数は入力があるときだけ 1 行足す
+    /// (空のときは案内行を描かないので高さも取らない)。
+    ///
+    /// **スクロール領域の外**で呼ぶこと (中に置くとツリーと一緒に流れて
+    /// 見えなくなる)。呼び出しは `app.rs` の sidebar_files_ui。
+    pub fn filter_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 26.0).max(40.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .id_salt("zv-tree-filter")
+                    .hint_text(tr("🔎 ツリーを絞り込み"))
+                    .desired_width(w),
+            );
+            if !self.filter.is_empty() && ui.small_button("✖").clicked() {
+                self.filter.clear();
+                self.filter_hit = None;
+            }
+        });
+        let Some(f) = &self.filter_hit else {
+            return; // 空のときは案内行を出さない (高さも取らない)
+        };
+        let msg = if f.matched == 0 {
+            trf(
+                "「{q}」に一致するファイルはありません",
+                &[("q", f.query.clone())],
+            )
+        } else if f.truncated {
+            trf(
+                "{n} 件一致 (走査を打ち切りました)",
+                &[("n", f.matched.to_string())],
+            )
+        } else {
+            trf("{n} 件一致", &[("n", f.matched.to_string())])
+        };
+        ui.label(RichText::new(msg).small().color(theme.text_dim));
     }
 
     pub fn ui(
@@ -471,14 +827,19 @@ impl FileTree {
                 for anc in reveal_ancestors(&self.roots, &target) {
                     set_open(&ctx, &anc, true);
                 }
-                self.selected = Some(target.clone());
+                self.sel.set_single(&target);
                 self.scroll_to = Some(target);
             }
         }
 
+        // 絞り込み (クエリが変わったときだけ走査し、一致の祖先を展開する)。
+        // 入力欄そのものはスクロール領域の外 (sidebar_files_ui) が描く。
+        self.recompute_filter(&ctx);
+
         // 描画前に可視行のスナップショットを取り、キーボード操作を先に処理する
         // (選択の移動・開閉が同じフレームの描画へ反映される)。
         let rows = self.visible_rows(&ctx);
+        self.row_paths = rows.iter().map(|r| r.path.clone()).collect();
         self.handle_keys(ui, actions, &rows);
 
         let roots = self.roots.clone();
@@ -495,7 +856,7 @@ impl FileTree {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| root.to_string_lossy().to_string());
-                let sel = self.selected.as_deref() == Some(root.as_path());
+                let sel = self.sel.contains(root);
                 let st = CollapsingState::load_with_default_open(&ctx, dir_state_id(root), true);
                 let (color, badge_text) = if let Some((st_type, count)) = gitinfo.dir_status(root) {
                     let (c, b, _) = git_status_style(st_type, theme);
@@ -517,12 +878,14 @@ impl FileTree {
                 let resp = header.inner;
                 self.drop_target(ui, &resp, root, theme, actions);
                 if resp.clicked() {
-                    self.select(root);
-                    self.focused = true;
+                    let mods = ui.input(|i| i.modifiers);
+                    self.click_select(root, mods);
                     toggle_open(&ctx, root, true);
                 }
                 if resp.secondary_clicked() {
-                    self.select(root);
+                    if !self.sel.contains(root) {
+                        self.select(root);
+                    }
                     self.focused = true;
                 }
                 self.maybe_scroll(&resp, root);
@@ -611,7 +974,10 @@ impl FileTree {
         if depth > 24 {
             return;
         }
-        for e in self.entries(dir) {
+        // 描画と同じ上限で切る (キーボードの行と画面の行がずれないように)
+        let all = self.shown_entries(dir);
+        let (shown, _rest) = self.page_of(dir, all.len());
+        for e in all.into_iter().take(shown) {
             let open = e.is_dir && is_open(ctx, &e.path, false);
             rows.push(Row {
                 path: e.path.clone(),
@@ -635,15 +1001,21 @@ impl FileTree {
         if ui.ctx().memory(|m| m.focused().is_some()) {
             return;
         }
+        // IME 変換中はキーを一切拾わない (⌘Z のファイル操作取り消しも含む)。
+        // 状態機械を進めない peek 版を使う — `handle_shortcuts` が同じフレームで
+        // 進めるので、ここで 2 回目を撃つと変換の開始/終了を食ってしまう。
+        if crate::keybinds::ime_blocks_shortcuts_peek(ui.ctx()) {
+            return;
+        }
         if rows.is_empty() {
             return;
         }
         let mac = cfg!(target_os = "macos");
         let ctx = ui.ctx().clone();
         let sel_idx = self
-            .selected
-            .as_ref()
-            .and_then(|s| rows.iter().position(|r| &r.path == s));
+            .sel
+            .lead()
+            .and_then(|s| rows.iter().position(|r| r.path == s));
         // タイプアヘッド用の文字は消費前に読む(修飾キー付きは Text にならない)
         let (typed, now) = ui.input(|i| {
             let t: String = i
@@ -805,19 +1177,19 @@ impl FileTree {
         let is_root = move |p: &Path| roots.iter().any(|r| r == p);
 
         // ── クリップボード (filesExplorer.copy/cut/paste) ──
-        if pressed(Modifiers::COMMAND, Key::C) {
-            if let Some(r) = sel_idx.map(|i| &rows[i]) {
-                if !is_root(&r.path) {
-                    self.clipboard = Some((r.path.clone(), false));
-                }
-            }
+        // 対象は「選択集合のうちルート以外」。単一選択なら 1 件で従来と同じ。
+        let targets: Vec<PathBuf> = self
+            .sel
+            .paths()
+            .iter()
+            .filter(|p| !is_root(p))
+            .cloned()
+            .collect();
+        if pressed(Modifiers::COMMAND, Key::C) && !targets.is_empty() {
+            self.clipboard = Some((targets.clone(), false));
         }
-        if pressed(Modifiers::COMMAND, Key::X) {
-            if let Some(r) = sel_idx.map(|i| &rows[i]) {
-                if !is_root(&r.path) {
-                    self.clipboard = Some((r.path.clone(), true));
-                }
-            }
+        if pressed(Modifiers::COMMAND, Key::X) && !targets.is_empty() {
+            self.clipboard = Some((targets.clone(), true));
         }
         if pressed(Modifiers::COMMAND, Key::V) {
             let dest = self.paste_dest_dir(rows, sel_idx);
@@ -868,16 +1240,12 @@ impl FileTree {
         } else {
             pressed(Modifiers::NONE, Key::Delete)
         };
-        if perm || trash {
-            if let Some(r) = sel_idx.map(|i| &rows[i]) {
-                if !is_root(&r.path) {
-                    actions.delete = Some(DeleteRequest {
-                        path: r.path.clone(),
-                        // 設定でゴミ箱を切っているときも完全削除になる
-                        permanent: perm || !self.use_trash,
-                    });
-                }
-            }
+        if (perm || trash) && !targets.is_empty() {
+            actions.delete = Some(DeleteRequest {
+                paths: targets,
+                // 設定でゴミ箱を切っているときも完全削除になる
+                permanent: perm || !self.use_trash,
+            });
         }
     }
 
@@ -931,27 +1299,34 @@ impl FileTree {
 
     /// クリップボードの内容を `dest_dir` へ貼り付ける(実 fs 操作は actions 経由で呼び出し側)。
     fn paste_into(&mut self, dest_dir: PathBuf, actions: &mut TreeActions) {
-        let Some((src, cut)) = self.clipboard.clone() else {
+        let Some((srcs, cut)) = self.clipboard.clone() else {
             return;
         };
         let kind = if cut { Transfer::Move } else { Transfer::Copy };
         // コピーは VS Code の incrementalNaming どおり自動採番 (既存を壊さない)。
         // 切り取り = 移動なので、既存があれば確認を取る (Ask)。
         let numbering = if cut { Numbering::Ask } else { Numbering::Auto };
-        match transfer_plan(&src, &dest_dir, kind, numbering) {
-            Ok(None) => {}
-            Ok(Some(item)) => {
-                actions.transfer = Some(TransferJob {
-                    items: vec![item],
-                    kind,
-                    from_drag: false,
-                    merge_root: None,
-                });
-                // 切り取りのクリップボードはここでは消さない。移動の成否は
-                // アプリ側で判るため、成功時に clear_clipboard() を呼んで
-                // もらう (失敗時に切り取り内容が失われないように)。
+        // 複数選択ぶんを**1 ジョブ**にまとめる。ここが「すべてに適用」の土台:
+        // 1 件ずつジョブにすると、衝突のたびに聞き直すことになる。
+        let mut items = Vec::new();
+        for src in srcs {
+            match transfer_plan(&src, &dest_dir, kind, numbering) {
+                Ok(None) => {}
+                Ok(Some(item)) => items.push(item),
+                // 1 件だめでも残りは貼り付ける (最後の理由だけ知らせる)
+                Err(msg) => actions.notice = Some(msg),
             }
-            Err(msg) => actions.notice = Some(msg),
+        }
+        if !items.is_empty() {
+            actions.transfer = Some(TransferJob {
+                items,
+                kind,
+                from_drag: false,
+                merge_root: None,
+            });
+            // 切り取りのクリップボードはここでは消さない。移動の成否は
+            // アプリ側で判るため、成功時に clear_clipboard() を呼んで
+            // もらう (失敗時に切り取り内容が失われないように)。
         }
     }
 
@@ -960,20 +1335,68 @@ impl FileTree {
     /// `alt` (macOS の ⌥ / Windows・Linux の Alt) が押されていればコピー、
     /// でなければ移動 — VS Code と同じ。`Modifiers::alt` は egui-winit が
     /// 両 OS 分を正規化して入れてくれるので OS 分岐は要らない。
+    ///
+    /// **掴んだ行が選択に入っていれば選択集合ごと運ぶ** (VS Code と同じ)。
+    /// 集合はそのまま 1 ジョブになるので、同名衝突は「すべてに適用」で
+    /// 1 回だけ聞ける。
     fn drop_into(&mut self, src: &Path, dest_dir: PathBuf, alt: bool, actions: &mut TreeActions) {
         let kind = if alt { Transfer::Copy } else { Transfer::Move };
-        match transfer_plan(src, &dest_dir, kind, Numbering::Ask) {
-            Ok(None) => {}
-            Ok(Some(item)) => {
-                actions.transfer = Some(TransferJob {
-                    items: vec![item],
-                    kind,
-                    from_drag: true,
-                    merge_root: None,
-                });
-                self.focused = true;
+        let mut items = Vec::new();
+        for s in self.selection_targets(src) {
+            match transfer_plan(&s, &dest_dir, kind, Numbering::Ask) {
+                Ok(None) => {}
+                Ok(Some(item)) => items.push(item),
+                // 1 件だめでも残りは運ぶ (最後の理由だけ知らせる)
+                Err(msg) => actions.notice = Some(msg),
             }
-            Err(msg) => actions.notice = Some(msg),
+        }
+        if items.is_empty() {
+            return;
+        }
+        actions.transfer = Some(TransferJob {
+            items,
+            kind,
+            from_drag: true,
+            merge_root: None,
+        });
+        self.focused = true;
+        // 移動先がツリーから見えなくなるなら、黙って消えたように見せない
+        if let Some(msg) = self.hidden_dest_notice(&dest_dir) {
+            actions.notice = Some(msg);
+        }
+    }
+
+    /// ドロップ先がツリーから見えなくなる場合の注意文。
+    ///
+    /// - **絞り込み中**: 絞り込みは「一致した要素 + その祖先」を残す剪定なので、
+    ///   行は本物のツリーのまま = 落とし先は曖昧にならない (だから受け付ける)。
+    ///   ただし移動後に新しい場所がクエリに当たらないと画面から消える。
+    /// - **`.gitignore` の対象**: 隠す設定なら行が無いので構造的に落とせない。
+    ///   薄表示のときは落とせるが、隠す設定に戻すと見えなくなる。
+    fn hidden_dest_notice(&mut self, dest_dir: &Path) -> Option<String> {
+        let ignored = root_for(&self.roots, dest_dir).is_some_and(|root| {
+            let root = root.to_path_buf();
+            self.ignorer.is_ignored(&root, dest_dir, true)
+        });
+        let filtering = !self.filter.trim().is_empty();
+        drop_visibility_notice(&label_of(dest_dir), ignored, filtering)
+    }
+
+    /// 右クリック / ドラッグの対象。その行が選択に入っていれば選択集合ごと、
+    /// 入っていなければその 1 件 (VS Code と同じ)。ルートは常に外す。
+    fn selection_targets(&self, path: &Path) -> Vec<PathBuf> {
+        let is_root = |p: &Path| self.roots.iter().any(|r| r == p);
+        if self.sel.contains(path) && self.sel.len() > 1 {
+            self.sel
+                .paths()
+                .iter()
+                .filter(|p| !is_root(p))
+                .cloned()
+                .collect()
+        } else if is_root(path) {
+            Vec::new()
+        } else {
+            vec![path.to_path_buf()]
         }
     }
 
@@ -1129,7 +1552,7 @@ impl FileTree {
                             if new_path != es.target {
                                 // 成否はアプリ側で判るが、成功時に選択が付いて
                                 // くるよう先に移しておく(失敗時は無害)
-                                self.selected = Some(new_path.clone());
+                                self.sel.set_single(&new_path);
                                 actions.rename = Some((es.target.clone(), new_path));
                             }
                         }
@@ -1240,15 +1663,19 @@ impl FileTree {
         if self.editing_new_in(dir) {
             self.edit_row_ui(ui, actions);
         }
-        for e in self.entries(dir) {
+        let all = self.shown_entries(dir);
+        let (shown, rest) = self.page_of(dir, all.len());
+        for e in all.into_iter().take(shown) {
             // リネーム中の項目は行ごと入力欄に置き換える
             if self.renaming(&e.path) {
                 self.edit_row_ui(ui, actions);
                 continue;
             }
-            let sel = self.selected.as_deref() == Some(e.path.as_path());
+            let sel = self.sel.contains(&e.path);
             // 切り取り待ちの項目は薄く描く(VS Code と同じ合図)
-            let cut_pending = matches!(&self.clipboard, Some((p, true)) if p == &e.path);
+            let cut_pending = matches!(&self.clipboard, Some((p, true)) if p.contains(&e.path));
+            // git が無視する項目は (薄表示の設定のときだけ現れ) 淡く描く
+            let dim = if e.ignored { 0.45_f32 } else { 1.0 };
             if e.is_dir {
                 let ctx = ui.ctx().clone();
                 let mut st =
@@ -1263,6 +1690,12 @@ impl FileTree {
                 // 配下の変更件数を常にバッジに出す (深さは問わない)。
                 let (dir_color, dir_badge, dir_hint) = if cut_pending {
                     (theme.text.gamma_multiply(0.5), String::new(), String::new())
+                } else if e.ignored {
+                    (
+                        theme.text.gamma_multiply(dim),
+                        String::new(),
+                        tr("git が無視しています (.gitignore)"),
+                    )
                 } else if let Some((st_type, count)) = gitinfo.dir_status(&e.path) {
                     let (c, b, h) = git_status_style(st_type, theme);
                     (
@@ -1297,13 +1730,18 @@ impl FileTree {
                 self.drop_target(ui, &resp, &e.path, theme, actions);
                 if resp.clicked() {
                     // VS Code: フォルダのクリックは選択 + 開閉
-                    self.select(&e.path);
+                    // (⌘/Ctrl・Shift 付きは選択だけを広げ、開閉しない)
+                    let mods = ui.input(|i| i.modifiers);
+                    self.click_select(&e.path, mods);
                     self.scroll_to = None; // クリック行は既に見えている
-                    self.focused = true;
-                    toggle_open(&ctx, &e.path, false);
+                    if !mods.command && !mods.shift {
+                        toggle_open(&ctx, &e.path, false);
+                    }
                 }
                 if resp.secondary_clicked() {
-                    self.select(&e.path);
+                    if !self.sel.contains(&e.path) {
+                        self.select(&e.path);
+                    }
                     self.scroll_to = None;
                     self.focused = true;
                 }
@@ -1332,6 +1770,12 @@ impl FileTree {
             } else {
                 let (file_color, file_badge, hint) = if cut_pending {
                     (theme.text.gamma_multiply(0.5), String::new(), "")
+                } else if e.ignored {
+                    (
+                        theme.text.gamma_multiply(dim),
+                        String::new(),
+                        "git が無視しています (.gitignore)",
+                    )
                 } else if let Some(st_type) = gitinfo.file_status(&e.path) {
                     let (c, b, h) = git_status_style(st_type, theme);
                     (c, format!("  {b}"), h)
@@ -1342,7 +1786,7 @@ impl FileTree {
                 let label = format!("{} {}{}", icon_for(&e.name), e.name, file_badge);
                 let mut resp = ui.selectable_label(sel, RichText::new(label).color(file_color));
                 if !hint.is_empty() {
-                    resp = resp.on_hover_text(hint);
+                    resp = resp.on_hover_text(tr(hint));
                 }
                 // エージェントのターミナルへドラッグ&ドロップでパスを渡せる
                 // (クリック=開く はそのまま。ドラッグとクリックは egui が排他にする)
@@ -1351,13 +1795,18 @@ impl FileTree {
                 // ファイル行へ落としたら「その隣」= 親フォルダへ入れる (VS Code と同じ)
                 self.drop_target(ui, &resp, dir, theme, actions);
                 if resp.clicked() {
-                    self.select(&e.path);
+                    let mods = ui.input(|i| i.modifiers);
+                    self.click_select(&e.path, mods);
                     self.scroll_to = None;
-                    self.focused = true;
-                    actions.open = Some(e.path.clone());
+                    // ⌘/Ctrl・Shift 付きは「選ぶ」だけ (まとめて消す/移す前段)
+                    if !mods.command && !mods.shift {
+                        actions.open = Some(e.path.clone());
+                    }
                 }
                 if resp.secondary_clicked() {
-                    self.select(&e.path);
+                    if !self.sel.contains(&e.path) {
+                        self.select(&e.path);
+                    }
                     self.scroll_to = None;
                     self.focused = true;
                 }
@@ -1385,6 +1834,22 @@ impl FileTree {
                     self.file_ops_menu(ui, actions);
                     self.auto_reveal_menu(ui);
                 });
+            }
+        }
+        if rest > 0 {
+            // 巨大ディレクトリは全部描かず、押した回数だけ伸ばす
+            // (数万行を毎フレーム描いてフレームを落とさないため)
+            let label = trf("… さらに {n} 件", &[("n", rest.to_string())]);
+            let resp = ui
+                .add(egui::Button::new(
+                    RichText::new(label).small().color(theme.text_dim),
+                ))
+                .on_hover_text(trf(
+                    "この階層は {n} 件ずつ表示します (設定 tree_dir_page)",
+                    &[("n", self.dir_page.to_string())],
+                ));
+            if resp.clicked() {
+                *self.more_pages.entry(dir.to_path_buf()).or_insert(0) += 1;
             }
         }
         self.deleted_ghost_rows(ui, dir, theme, gitinfo);
@@ -1428,12 +1893,18 @@ impl FileTree {
         paste_dir: PathBuf,
         actions: &mut TreeActions,
     ) {
+        // 右クリックした行が選択に入っていれば選択集合ごと、なければその 1 件。
+        let targets: Vec<PathBuf> = if self.sel.contains(path) && self.sel.len() > 1 {
+            self.sel.paths().to_vec()
+        } else {
+            vec![path.to_path_buf()]
+        };
         if menu_btn(ui, tr("✂ 切り取り"), h("⌘X", "Ctrl+X")) {
-            self.clipboard = Some((path.to_path_buf(), true));
+            self.clipboard = Some((targets.clone(), true));
             self.focused = true;
         }
         if menu_btn(ui, tr("📄 コピー"), h("⌘C", "Ctrl+C")) {
-            self.clipboard = Some((path.to_path_buf(), false));
+            self.clipboard = Some((targets.clone(), false));
             self.focused = true;
         }
         let can_paste = self.clipboard.is_some();
@@ -1446,15 +1917,33 @@ impl FileTree {
     /// 削除メニュー。ゴミ箱行きと完全削除を**別の項目**にして、
     /// どちらを押したのかが文言で分かるようにする (VS Code と同じ 2 系統)。
     fn delete_menu(&mut self, ui: &mut egui::Ui, path: &Path, actions: &mut TreeActions) {
-        if self.use_trash && menu_btn(ui, tr("🗑 ゴミ箱へ移動…"), h("⌘⌫", "Delete")) {
+        // 右クリックした行が選択に入っていれば選択集合ごと消す (VS Code と同じ)
+        let targets = self.delete_targets(path);
+        let n = targets.len();
+        let suffix = if n > 1 {
+            trf(" ({n} 件)", &[("n", n.to_string())])
+        } else {
+            String::new()
+        };
+        if self.use_trash
+            && menu_btn(
+                ui,
+                format!("{}{suffix}", tr("🗑 ゴミ箱へ移動…")),
+                h("⌘⌫", "Delete"),
+            )
+        {
             actions.delete = Some(DeleteRequest {
-                path: path.to_path_buf(),
+                paths: targets.clone(),
                 permanent: false,
             });
         }
-        if menu_btn(ui, tr("🗑 完全に削除…"), h("⌥⌘⌫", "Shift+Delete")) {
+        if menu_btn(
+            ui,
+            format!("{}{suffix}", tr("🗑 完全に削除…")),
+            h("⌥⌘⌫", "Shift+Delete"),
+        ) {
             actions.delete = Some(DeleteRequest {
-                path: path.to_path_buf(),
+                paths: targets,
                 permanent: true,
             });
         }
@@ -1502,6 +1991,12 @@ impl FileTree {
         if menu_btn(ui, label, "") {
             self.set_auto_reveal(!on);
         }
+    }
+
+    /// 右クリックされた行に対する削除対象。選択集合に入っていれば
+    /// **集合ごと**、入っていなければその 1 件だけ (ルートは常に除く)。
+    fn delete_targets(&self, path: &Path) -> Vec<PathBuf> {
+        self.selection_targets(path)
     }
 
     /// パスのコピー / エージェント送信 のメニュー節。
@@ -1926,11 +2421,9 @@ pub enum FileOp {
     },
     /// 新規作成 / 貼り付けで増えたもの。取り消しは**ゴミ箱経由**で消す。
     Create { path: PathBuf, is_dir: bool },
-    /// ゴミ箱へ送ったもの (元の場所, ゴミ箱の中の実体)。
-    Trash {
-        original: PathBuf,
-        restore_from: PathBuf,
-    },
+    /// ゴミ箱へ送ったもの (元の場所, ゴミ箱の中の実体) の並び。
+    /// 複数選択の削除をまとめて 1 手で戻す。
+    Trash { items: Vec<(PathBuf, PathBuf)> },
 }
 
 impl FileOp {
@@ -1970,6 +2463,47 @@ impl FileHistory {
     /// 直近の操作の表示名。`None` = 履歴が空。
     pub fn hint(&self) -> Option<String> {
         self.ops.last().map(FileOp::label)
+    }
+}
+
+/// 確認キューの 1 件を「実行してよいか」の判定 (純粋関数)。
+///
+/// - `None` を返したら**ユーザーに聞かなければならない** — ここが
+///   「確認を経ずに壊さない」の要。
+/// - 衝突が無い項目は常に実行してよい (聞かない)。
+/// - 「すべてに適用」(`apply_all`) が決まっていれば残り全部に効く。
+///   決まっていなければ「いま答えた 1 件ぶん」(`answer`) だけを使う。
+pub fn queue_answer(
+    clash: Option<Clash>,
+    answer: Option<bool>,
+    apply_all: Option<bool>,
+) -> Option<bool> {
+    match clash {
+        None => Some(true),
+        Some(_) => answer.or(apply_all),
+    }
+}
+
+/// ドロップ先がツリーから見えなくなるときの注意文 (純粋関数)。
+///
+/// **「落とした先が画面から消える」を黙って起こさない**ためだけのもので、
+/// ドロップ自体は止めない (行はどちらの場合も本物のツリーの行なので、
+/// 落とし先が曖昧になることはない)。
+pub fn drop_visibility_notice(
+    dest_name: &str,
+    dest_ignored: bool,
+    filtering: bool,
+) -> Option<String> {
+    match (dest_ignored, filtering) {
+        (true, _) => Some(trf(
+            "移動先の「{name}」は .gitignore の対象です (ツリーに出ないことがあります)",
+            &[("name", dest_name.to_string())],
+        )),
+        (false, true) => Some(trf(
+            "絞り込み中です: 移動先「{name}」の中身は条件に合うものだけが出ます",
+            &[("name", dest_name.to_string())],
+        )),
+        (false, false) => None,
     }
 }
 
@@ -2278,6 +2812,302 @@ mod tests {
     use super::*;
     use crate::test_util::unique_temp_dir;
     use std::time::Duration;
+
+    /// `.gitignore` を尊重する設定でツリーを作る (既定値をそのまま使う)。
+    fn tree_with(root: &Path, cfg: &crate::config::Config) -> FileTree {
+        let mut t = FileTree::new(vec![root.to_path_buf()], true);
+        t.apply_config(cfg);
+        t
+    }
+
+    fn names_of(t: &mut FileTree, dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = t.entries(dir).into_iter().map(|e| e.name).collect();
+        v.sort();
+        v
+    }
+
+    // ── .gitignore ────────────────────────────────────────────────
+
+    #[test]
+    fn gitignore_hides_generated_dirs_from_the_tree() {
+        let root = unique_temp_dir("zaivern-tree-test", "gitignore");
+        std::fs::write(
+            root.join(".gitignore"),
+            "node_modules/\ntarget/\ndist/\nbuild/\n*.log\n",
+        )
+        .unwrap();
+        for d in ["node_modules", "target", "dist", "build", "src"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("a.log"), "x").unwrap();
+        std::fs::write(root.join("README.md"), "x").unwrap();
+
+        let cfg = crate::config::Config::default();
+        let mut t = tree_with(&root, &cfg);
+        assert_eq!(names_of(&mut t, &root), [".gitignore", "README.md", "src"]);
+
+        // 薄く表示する設定なら消えずに残り、`ignored` が立つ
+        let dim = crate::config::Config {
+            dim_ignored_files: true,
+            ..crate::config::Config::default()
+        };
+        let mut t = tree_with(&root, &dim);
+        let entries = t.entries(&root);
+        let nm = entries
+            .iter()
+            .find(|e| e.name == "node_modules")
+            .expect("薄表示なら残る");
+        assert!(nm.ignored, "無視対象の印が立つ");
+        assert!(
+            entries.iter().any(|e| e.name == "src" && !e.ignored),
+            "無視されないものには印が付かない"
+        );
+
+        // 設定で切れば全部出る
+        let off = crate::config::Config {
+            respect_gitignore: false,
+            ..crate::config::Config::default()
+        };
+        let mut t = tree_with(&root, &off);
+        assert!(names_of(&mut t, &root).contains(&"node_modules".to_string()));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn nested_gitignore_can_re_include_in_the_tree() {
+        let root = unique_temp_dir("zaivern-tree-test", "nested");
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.join("logs").join(".gitignore"), "!important.log\n").unwrap();
+        std::fs::write(root.join("logs").join("important.log"), "x").unwrap();
+        std::fs::write(root.join("logs").join("noise.log"), "x").unwrap();
+
+        let cfg = crate::config::Config::default();
+        let mut t = tree_with(&root, &cfg);
+        assert_eq!(
+            names_of(&mut t, &root.join("logs")),
+            [".gitignore", "important.log"]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 複数選択 ──────────────────────────────────────────────────
+
+    #[test]
+    fn range_select_is_the_same_in_both_directions() {
+        let rows: Vec<PathBuf> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let down = range_select(&rows, Path::new("b"), Path::new("d"));
+        let up = range_select(&rows, Path::new("d"), Path::new("b"));
+        assert_eq!(down, up, "下から上へ Shift+クリックしても同じ範囲");
+        assert_eq!(down, rows[1..=3].to_vec());
+        // 同じ行なら 1 件
+        assert_eq!(
+            range_select(&rows, Path::new("c"), Path::new("c")),
+            vec![PathBuf::from("c")]
+        );
+        // 起点が可視行に無ければクリックされた行だけ
+        assert_eq!(
+            range_select(&rows, Path::new("zzz"), Path::new("c")),
+            vec![PathBuf::from("c")]
+        );
+        assert_eq!(range_select(&[], Path::new("a"), Path::new("b")).len(), 1);
+    }
+
+    #[test]
+    fn selection_single_click_behaviour_is_unchanged() {
+        let mut sel = Selection::default();
+        sel.set_single(Path::new("a"));
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel.lead(), Some(Path::new("a")));
+        // 別の行を単純クリックすると入れ替わる (従来の Option<PathBuf> と同じ)
+        sel.set_single(Path::new("b"));
+        assert_eq!(sel.paths(), [PathBuf::from("b")]);
+        assert!(!sel.contains(Path::new("a")));
+    }
+
+    #[test]
+    fn selection_toggles_and_mixes_dirs_and_files() {
+        let mut sel = Selection::default();
+        sel.set_single(Path::new("w-src"));
+        sel.toggle(Path::new("w-README.md"));
+        sel.toggle(Path::new("w-docs"));
+        assert_eq!(sel.len(), 3, "ディレクトリとファイルを混ぜて選べる");
+        assert!(sel.contains(Path::new("w-src")));
+        assert!(sel.contains(Path::new("w-README.md")));
+        // もう一度 ⌘クリックすると外れる
+        sel.toggle(Path::new("w-README.md"));
+        assert_eq!(sel.len(), 2);
+        assert!(!sel.contains(Path::new("w-README.md")));
+        assert_eq!(sel.lead(), Some(Path::new("w-docs")));
+    }
+
+    #[test]
+    fn selection_stays_consistent_when_selected_items_are_deleted() {
+        let base = unique_temp_dir("zaivern-tree-test", "sel-del");
+        let mut sel = Selection::default();
+        sel.set_single(&base.join("a"));
+        sel.toggle(&base.join("b").join("child.txt"));
+        sel.toggle(&base.join("c"));
+        // `b` フォルダごと消える → 配下の選択も消え、lead は生き残りへ移る
+        sel.remove_under(&base.join("b"));
+        assert_eq!(sel.len(), 2);
+        assert!(!sel.contains(&base.join("b").join("child.txt")));
+        assert_eq!(sel.lead(), Some(base.join("c").as_path()));
+        // 全部消えたら空 (宙に浮いた lead を残さない)
+        sel.remove_under(&base);
+        assert_eq!(sel.len(), 0);
+        assert_eq!(sel.lead(), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn deselect_under_also_prunes_the_clipboard() {
+        let root = unique_temp_dir("zaivern-tree-test", "deselect");
+        let mut t = FileTree::new(vec![root.clone()], true);
+        t.sel.set_single(&root.join("a"));
+        t.sel.toggle(&root.join("b"));
+        t.clipboard = Some((vec![root.join("a"), root.join("b")], true));
+        t.deselect_under(&root.join("a"));
+        assert_eq!(t.sel.paths(), [root.join("b")]);
+        assert_eq!(
+            t.clipboard.as_ref().map(|(v, _)| v.clone()),
+            Some(vec![root.join("b")])
+        );
+        // 最後の 1 件も消えたらクリップボードごと空にする
+        t.deselect_under(&root.join("b"));
+        assert!(t.clipboard.is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 1 ディレクトリの描画上限 ────────────────────────────────
+
+    #[test]
+    fn dir_page_table() {
+        // (総数, 1 ページ, 「さらに」を押した回数) → (描く件数, 残り)
+        let cases: &[(usize, usize, usize, usize, usize)] = &[
+            (10, 300, 0, 10, 0),
+            (1000, 300, 0, 300, 700),
+            (1000, 300, 1, 600, 400),
+            (1000, 300, 3, 1000, 0),
+            (1000, 0, 0, 1000, 0), // 0 = 上限なし
+            (0, 300, 0, 0, 0),
+        ];
+        for (total, page, extra, shown, rest) in cases {
+            assert_eq!(
+                dir_page(*total, *page, *extra),
+                (*shown, *rest),
+                "total={total} page={page} extra={extra}"
+            );
+        }
+        // 押しすぎても総数を超えない / 桁あふれしない
+        assert_eq!(dir_page(5, 300, usize::MAX), (5, 0));
+    }
+
+    /// 1 万エントリのディレクトリでも (1) 描く行は上限で頭打ち、
+    /// (2) `read_dir` は 1 回しか叩かない (キャッシュが効く) こと。
+    /// 実時間の assert はフレーキーなので**回数**で固定する。
+    #[test]
+    fn huge_directory_is_capped_and_read_once() {
+        let root = unique_temp_dir("zaivern-tree-test", "huge");
+        const N: usize = 10_000;
+        for i in 0..N {
+            std::fs::write(root.join(format!("f{i:05}.txt")), "").unwrap();
+        }
+        let cfg = crate::config::Config::default();
+        let page = cfg.tree_dir_page;
+        let mut t = tree_with(&root, &cfg);
+
+        let ctx = egui::Context::default();
+        let rows = t.visible_rows(&ctx);
+        assert_eq!(rows.len(), page, "1 階層は設定の上限まで (全部は描かない)");
+        assert_eq!(t.io_reads, 1, "ディスクは 1 回だけ読む");
+
+        // 「さらに N 件」を 1 回押した相当 → ちょうど 1 ページ分伸びる
+        *t.more_pages.entry(root.clone()).or_insert(0) += 1;
+        let rows = t.visible_rows(&ctx);
+        assert_eq!(rows.len(), page * 2);
+        assert_eq!(t.io_reads, 1, "再描画で読み直さない");
+
+        // 走査ノード数 = 上限で止まる (残りは「さらに N 件」に畳まれる)
+        assert_eq!(dir_page(N, page, 0), (page, N - page));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 絞り込み ──────────────────────────────────────────────────
+
+    #[test]
+    fn filter_keeps_matches_and_their_ancestors() {
+        let root = unique_temp_dir("zaivern-tree-test", "filter");
+        std::fs::create_dir_all(root.join("src").join("deep")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("src").join("deep").join("widget.rs"), "").unwrap();
+        std::fs::write(root.join("src").join("other.rs"), "").unwrap();
+        std::fs::write(root.join("docs").join("guide.md"), "").unwrap();
+
+        let cfg = crate::config::Config::default();
+        let mut t = tree_with(&root, &cfg);
+        let ctx = egui::Context::default();
+
+        t.filter = "widget".into();
+        t.recompute_filter(&ctx);
+        let hit = t.filter_hit.as_ref().expect("結果ができる");
+        assert_eq!(hit.matched, 1);
+        assert!(hit
+            .keep
+            .contains(&root.join("src").join("deep").join("widget.rs")));
+        assert!(hit.keep.contains(&root.join("src")), "祖先も残す");
+        assert!(hit.keep.contains(&root.join("src").join("deep")));
+        assert!(!hit.keep.contains(&root.join("docs")), "無関係な枝は落ちる");
+        // 祖先は自動展開される (押さなくても一致が見える)
+        assert!(is_open(&ctx, &root.join("src"), false));
+        assert!(is_open(&ctx, &root.join("src").join("deep"), false));
+
+        // 一致した行だけが可視行になる (祖先ディレクトリ + 一致)
+        let names: Vec<String> = t
+            .visible_rows(&ctx)
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert_eq!(names, ["src", "deep", "widget.rs"]);
+
+        // 空にすると全体へ戻る
+        t.filter.clear();
+        t.recompute_filter(&ctx);
+        assert!(t.filter_hit.is_none(), "空のときは結果を持たない");
+        let names: Vec<String> = t
+            .visible_rows(&ctx)
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert!(names.contains(&"docs".to_string()));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn filter_uses_the_existing_fuzzy_matcher() {
+        // マッチャは fuzzy.rs のものをそのまま使う (新しい実装を書かない)
+        let root = unique_temp_dir("zaivern-tree-test", "fuzzy");
+        std::fs::write(root.join("main_window.rs"), "").unwrap();
+        std::fs::write(root.join("other.txt"), "").unwrap();
+        let cfg = crate::config::Config::default();
+        let mut t = tree_with(&root, &cfg);
+        let ctx = egui::Context::default();
+        // 飛び飛びの部分列でも当たる = fuzzy::score と同じ挙動
+        t.filter = "mnwin".into();
+        t.recompute_filter(&ctx);
+        let hit = t.filter_hit.as_ref().expect("結果");
+        assert_eq!(hit.matched, 1);
+        assert!(hit.keep.contains(&root.join("main_window.rs")));
+        assert!(crate::fuzzy::score("mnwin", "main_window.rs").is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// 記録済みの mtime を過去へずらし、同一秒内の外部変更でも差が出るようにする
     /// （mtime 粒度が粗いファイルシステムでもテストを決定的にするため）。
@@ -3002,11 +3832,15 @@ mod tests {
         destructive.dedup();
         assert_eq!(
             destructive,
-            vec!["perform_delete".to_string(), "replace_dest".to_string()],
-            "復元できない削除は perform_delete / replace_dest の中だけに置くこと"
+            vec!["delete_permanently".to_string(), "replace_dest".to_string()],
+            "復元できない削除は delete_permanently / replace_dest の中だけに置くこと"
         );
 
         // ② その 2 つへ至る経路は 1 本ずつしかない
+        assert_eq!(
+            owners(&fns, "self.delete_permanently("),
+            vec!["perform_delete".to_string()],
+        );
         assert_eq!(
             owners(&fns, "self.perform_delete("),
             vec!["delete_confirm_ui".to_string()],
@@ -3041,13 +3875,145 @@ mod tests {
             "衝突が無い項目で置き換え (削除) を走らせてはいけない"
         );
 
-        // ⑤ 完全削除は履歴へ積まない (積むと「戻せる」と嘘になる)
-        let pd = body(&fns, "perform_delete");
-        let perm = &pd[pd.find("// 完全削除。").expect("完全削除の節")..];
+        // ⑤ 実行してよいかの判定は純粋関数 1 つに寄せる
+        //    (テストで固定した実装と、動いている実装を食い違わせない)
+        assert_eq!(
+            owners(&fns, "file_tree::queue_answer("),
+            vec!["drain_transfer".to_string()],
+        );
+
+        // ⑥ 完全削除は履歴へ積まない (積むと「戻せる」と嘘になる)。
+        //    「戻せるもの」と「戻せないもの」を関数の境界で分けてあるので、
+        //    完全削除側の関数に履歴が出てこないことだけ確かめればよい。
         assert!(
-            !perm.contains("push_file_op"),
+            !body(&fns, "delete_permanently").contains("push_file_op"),
             "完全削除は取り消せないので履歴へ積まないこと"
         );
+        // 履歴へ積むゴミ箱行きは、戻り先が分かる経路からしか来ない
+        assert_eq!(
+            owners(&fns, "FileOp::Trash {"),
+            vec!["perform_delete".to_string(), "revert_file_op".to_string()],
+        );
+    }
+
+    #[test]
+    fn 複数選択の一括移動は答えを一度だけ聞けば残り全部に効く() {
+        // 「すべてに適用」の実体は queue_answer。ここを通って初めて実行される
+        // ので、これが None を返すあいだは 1 バイトも動かない。
+        // 衝突なしは常に実行 (聞かない)
+        assert_eq!(queue_answer(None, None, None), Some(true));
+        // 衝突あり + 未回答 → 必ず聞く
+        assert_eq!(queue_answer(Some(Clash::Overwrite), None, None), None);
+        // 「すべてに適用」が決まっていれば残り全部に効く
+        assert_eq!(
+            queue_answer(Some(Clash::Overwrite), None, Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            queue_answer(Some(Clash::Overwrite), None, Some(false)),
+            Some(false)
+        );
+        // 1 件ぶんの答えは「すべてに適用」より優先される
+        assert_eq!(
+            queue_answer(Some(Clash::Merge), Some(false), Some(true)),
+            Some(false)
+        );
+
+        // 実際に 3 件を一括移動して、答えが 1 回で済むことを確かめる
+        let dir = unique_temp_dir("zaivern-tree-test", "apply-all");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::create_dir_all(&dst).expect("mkdir");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(src.join(n), "new").expect("write");
+            std::fs::write(dst.join(n), "old").expect("write");
+        }
+        // 複数選択のドロップ = 1 ジョブに 3 件
+        let items: Vec<TransferItem> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|n| {
+                transfer_plan(&src.join(n), &dst, Transfer::Move, Numbering::Ask)
+                    .expect("plan")
+                    .expect("some")
+            })
+            .collect();
+        assert!(
+            items.iter().all(|i| i.clash == Some(Clash::Overwrite)),
+            "3 件とも衝突する"
+        );
+
+        // app 側の drain_transfer と同じ順路を辿る (判定は同じ純粋関数)
+        let mut asked = 0usize;
+        let mut apply_all: Option<bool> = None;
+        for it in &items {
+            let mut answer = queue_answer(it.clash, None, apply_all);
+            if answer.is_none() {
+                // ここが確認ダイアログ。「置き換える」+「すべてに適用」を選ぶ
+                asked += 1;
+                apply_all = Some(true);
+                answer = Some(true);
+            }
+            if answer == Some(true) {
+                std::fs::remove_file(&it.dest).expect("replace");
+                std::fs::rename(&it.src, &it.dest).expect("move");
+            }
+        }
+        assert_eq!(asked, 1, "3 件でも聞かれるのは 1 回だけ");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            assert_eq!(
+                std::fs::read_to_string(dst.join(n)).expect("read"),
+                "new",
+                "{n} が置き換わっている"
+            );
+            assert!(!src.join(n).exists(), "{n} は移動済み");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 複数選択の対象は掴んだ行が選択に入っているときだけ集合になる() {
+        let dir = unique_temp_dir("zaivern-tree-test", "sel-targets");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let c = dir.join("c.txt");
+        for p in [&a, &b, &c] {
+            std::fs::write(p, "x").expect("write");
+        }
+        let mut t = FileTree::new(vec![dir.clone()], true);
+        t.sel.set_single(&a);
+        t.sel.toggle(&b);
+        // 選択に入っている行を掴んだら選択集合ごと
+        let mut got = t.selection_targets(&a);
+        got.sort();
+        assert_eq!(got, vec![a.clone(), b.clone()]);
+        // 選択の外を掴んだらその 1 件だけ (VS Code と同じ)
+        assert_eq!(t.selection_targets(&c), vec![c.clone()]);
+        // ルートは絶対に対象にしない (ワークスペースごと動かさない)
+        assert!(t.selection_targets(&dir).is_empty());
+        // 削除の対象も同じ規則 (実装を 1 本にしてある)
+        let mut del = t.delete_targets(&a);
+        del.sort();
+        assert_eq!(del, got);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 見えなくなるドロップ先は黙って受けずに知らせる() {
+        // 普通のフォルダ: 何も言わない
+        assert_eq!(drop_visibility_notice("src", false, false), None);
+        // .gitignore の対象へ入れた: ツリーから消えるので知らせる
+        let m = drop_visibility_notice("target", true, false).expect("注意が出る");
+        assert!(m.contains("target") && m.contains(".gitignore"), "{m}");
+        // 絞り込み中: 行は本物のツリーのままなので受け付けるが、
+        // 条件に合わないものは出ないことを知らせる
+        let m = drop_visibility_notice("src", false, true).expect("注意が出る");
+        assert!(m.contains("絞り込み"), "{m}");
+        // 両方なら .gitignore の方を出す (消える理由として強い)
+        let m = drop_visibility_notice("target", true, true).expect("注意が出る");
+        assert!(m.contains(".gitignore"), "{m}");
     }
 
     #[test]

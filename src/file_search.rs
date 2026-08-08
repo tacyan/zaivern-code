@@ -490,8 +490,19 @@ impl Matcher {
         self.find_from(line, 0).is_some()
     }
 
+    /// 正規表現モードのときだけ内側の [`regex::Regex`] を返す。
+    ///
+    /// バッファ内置換 ([`crate::find_buffer::expand`]) が `$1` などの
+    /// グループ参照を展開するために公開している。**エンジンを二重に持たない**
+    /// ための最小限の露出であって、外から差し替えられるようにはしていない。
+    pub fn regex(&self) -> Option<&regex::Regex> {
+        match &self.kind {
+            Kind::Regex(re) => Some(re),
+            _ => None,
+        }
+    }
+
     /// 行の中の重ならないマッチを全部返す (バイト範囲)。
-    #[allow(dead_code)] // UI 配線待ち
     pub fn find_all(&self, line: &str) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         let mut at = 0;

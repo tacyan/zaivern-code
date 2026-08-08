@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
@@ -12,6 +14,8 @@ use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
 use crate::coordinator;
+use crate::diagview;
+use crate::editor;
 use crate::editor::{combine_hash, disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
 use crate::editor_split;
@@ -20,6 +24,7 @@ use crate::file_search;
 use crate::file_tree::{
     self, Clash, DeleteRequest, FileHistory, FileOp, FileTree, TransferItem, TreeActions,
 };
+use crate::find_buffer;
 use crate::firewall;
 use crate::fuzzy;
 use crate::git;
@@ -61,6 +66,7 @@ use crate::theme_json;
 use crate::tunnel;
 use crate::tutorial::{self, AnchorId};
 use crate::voice;
+use crate::worktree;
 use crate::zoom;
 
 // エージェントデッキ (縦 1 本のエージェント管理画面) は main.rs が
@@ -293,10 +299,39 @@ struct FindState {
     open: bool,
     query: String,
     focus: bool,
-    last: Option<usize>,
+    /// いま選ばれているヒットの**バイト範囲**。本文が変わると照合に失敗するので
+    /// 「見つからなければ現在位置なし」として扱う (古い位置へ飛ばない)。
+    current: Option<(usize, usize)>,
+    /// 現在位置が無いときの探索起点 (バイト)。検索バーを開いた時点のカーソル。
+    anchor: usize,
+    /// 直前の移動で折り返したか。`Some(true)` = 末尾から先頭へ、
+    /// `Some(false)` = 先頭から末尾へ。`None` = 折り返していない。
+    wrapped: Option<bool>,
     /// 置換行 (VS Code: ⌥⌘F) を表示するか
     replace_open: bool,
     replace: String,
+    /// 検索バーのトグル 3 つ (大小区別 / 単語単位 / 正規表現)
+    opts: find_buffer::FindOptions,
+}
+
+/// バッファ内検索のヒット一覧キャッシュ。
+///
+/// 鍵は**本文ハッシュ + 検索語 + トグル**。1 回の走査結果を検索バー・
+/// ミニマップの印・本文のハイライトが共有する (同じ本文を 3 回走査しない)。
+struct FindHitCache {
+    text_hash: u64,
+    query: String,
+    opts: find_buffer::FindOptions,
+    /// 走査に使ったマッチャ (置換の `$1` 展開でも同じものを使う)
+    matcher: file_search::Matcher,
+    /// Arc 共有: 毎フレームの clone は参照カウント増加のみ
+    hits: std::sync::Arc<Vec<find_buffer::BufHit>>,
+    /// ミニマップに出す行 (重複を潰し、minimap::MAX_HITS で打ち切り)
+    mm_lines: std::sync::Arc<Vec<usize>>,
+    /// [`find_buffer::MAX_HITS`] で打ち切ったか
+    truncated: bool,
+    /// 正規表現のコンパイルエラー。あるときヒットは空。
+    error: Option<String>,
 }
 
 /// 置換フローの段階。**ドライラン → 確認 → 実行**の 3 段でしか進まない。
@@ -1091,6 +1126,10 @@ fn take_split_key(ctx: &egui::Context) -> Option<terminal::SplitAction> {
 
 /// Cockpit で押されたボタン類。クロージャの中では記録だけして、
 /// パネル描画後に self へ反映する (PluginActions と同じ流儀)。
+/// 衝突の一覧に並べる最大行数 (残りは「他 N 件」に畳む)。
+/// 警告は**目立つが邪魔にならない**のが方針なので、画面を占領させない。
+const CONFLICT_ROWS_MAX: usize = 6;
+
 #[derive(Default)]
 struct CockpitActions {
     launch: Option<usize>,
@@ -1143,6 +1182,112 @@ struct IndexedFile {
     abs: PathBuf,
     rel: String,
     label: String,
+}
+
+/// ファイル索引の走査条件 (すべて設定から来る — マジックナンバーを持たない)。
+#[derive(Clone)]
+struct IndexOptions {
+    max_files: usize,
+    max_depth: usize,
+    respect_gitignore: bool,
+}
+
+impl IndexOptions {
+    fn from_config(cfg: &config::Config) -> Self {
+        Self {
+            max_files: cfg.index_max_files,
+            max_depth: cfg.index_max_depth,
+            respect_gitignore: cfg.respect_gitignore,
+        }
+    }
+}
+
+/// 索引の走査結果。**打ち切りを黙って隠さない** — `truncated` を UI へ出す。
+struct IndexOutcome {
+    files: Vec<IndexedFile>,
+    /// 上限 (`index_max_files`) に達して途中で止めたか。
+    truncated: bool,
+}
+
+/// ⌘P で「最近開いたファイル」を索引の残りより上へ持ち上げる加点。
+///
+/// fuzzy の素点 (数十〜数百) は必ず超えるが、`palette` の一致段
+/// (TIER_SUBSTR = 30_000) には届かない値にしてある = **入力を始めたら
+/// 一致の質が最近順より必ず優先される**。
+const RECENT_FILE_BONUS: i32 = 5_000;
+/// 最近順 1 件ぶんの目減り。`recent::MAX_RECENT` (12) 件でも 0 にならない。
+const RECENT_FILE_STEP: i32 = 100;
+
+/// ⌘P (ファイル検索) の候補を組み立てる純粋関数。
+///
+/// * `recent` — 最近開いたファイルの絶対パス文字列 (先頭が直近。`recent.rs`)
+/// * `active` — いま開いているファイル。**加点しない** ので、クエリが空なら
+///   先頭に来るのは「直前に開いていたファイル」= ⌘P → Enter で戻れる
+/// * `query`  — `ファイル名:123[:45]` を含みうる生のクエリ
+fn file_mode_items(
+    index: &[IndexedFile],
+    recent: &[String],
+    active: Option<&Path>,
+    query: &str,
+) -> Vec<Item> {
+    let (name_q, goto) = split_path_goto(query);
+    let pq = fuzzy::PreparedQuery::new(name_q.trim());
+    // 実在確認 (`MenuState::files()`) はここでは通さない — パレットは毎フレーム
+    // 組み直されるので、12 回の stat を毎フレーム撃たない。
+    let rank: HashMap<&Path, usize> = recent
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (Path::new(s.as_str()), i))
+        .collect();
+    let mut out: Vec<Item> = Vec::with_capacity(index.len().min(256));
+    for f in index {
+        // マッチはルート相対パスに対して行い、単一ルート時と同じあいまい検索の
+        // 品質を保つ。表示 (detail) は曖昧回避済みラベル、開くのは絶対パス。
+        let Some(score) = pq.score(&f.rel) else {
+            continue;
+        };
+        let name = f.rel.rsplit('/').next().unwrap_or(&f.rel).to_string();
+        let bonus = match rank.get(f.abs.as_path()) {
+            Some(_) if active == Some(f.abs.as_path()) => 0,
+            Some(i) => RECENT_FILE_BONUS - (*i as i32) * RECENT_FILE_STEP,
+            None => 0,
+        };
+        let (detail, action) = match goto {
+            Some((line, col)) => (
+                trf(
+                    "{label} : {line} 行目",
+                    &[("label", f.label.clone()), ("line", (line + 1).to_string())],
+                ),
+                Action::OpenFileAt(f.abs.clone(), line, col),
+            ),
+            None => (f.label.clone(), Action::OpenFile(f.abs.clone())),
+        };
+        out.push(Item {
+            icon: file_tree::icon_for(&name).to_string(),
+            label: name,
+            detail,
+            action,
+            score: score.saturating_add(bonus),
+        });
+    }
+    out
+}
+
+/// `foo.rs:12:3` を (名前部分, 0 起点の (行, 桁)) に割る。
+///
+/// 行指定として読めない `:` (Windows のドライブレター `C:\`、`foo:bar`) は
+/// 名前側に残す。判定は `editor_ops::parse_goto` に委ねる — 数値の解釈を
+/// 2 箇所に書かないため。左から最初に「残りが行指定として読める」`:` で割る。
+fn split_path_goto(q: &str) -> (&str, Option<(usize, usize)>) {
+    for (i, _) in q.match_indices(':') {
+        if i == 0 {
+            continue; // 先頭の `:` は行ジャンプモード側の役目
+        }
+        if let Some(go) = editor_ops::parse_goto(&q[i + 1..]) {
+            return (&q[..i], Some(go));
+        }
+    }
+    (q, None)
 }
 
 // ── ネイティブファイルダイアログのジョブ化 ────────────────────────────
@@ -1640,6 +1785,88 @@ const REF_WINDOW_H: f32 = 360.0;
 const MAX_SYMBOL_ROWS: usize = 300;
 /// リネーム入力を画面上端からどれだけ下に置くか。
 const RENAME_WINDOW_Y: f32 = 120.0;
+/// コミットメッセージ入力窓の幅。
+const GIT_COMMIT_WINDOW_W: f32 = 460.0;
+/// パレットの「コミット履歴」に読み込む件数の上限。
+const GIT_HISTORY_MAX: usize = 200;
+
+/// パレットから撃つ git 操作。`git_panel.rs` は commit / push を
+/// スコープ外にしているので、実行はここが受け持つ (あちらは触らない)。
+#[derive(Clone)]
+enum GitJob {
+    Commit { message: String, all: bool },
+    Push,
+    Pull,
+}
+
+impl GitJob {
+    /// 画面に出す名前 (トーストの主語)。
+    fn label(&self) -> String {
+        match self {
+            GitJob::Commit { all: false, .. } => tr("コミット"),
+            GitJob::Commit { all: true, .. } => tr("すべてコミット"),
+            GitJob::Push => tr("push"),
+            GitJob::Pull => tr("pull"),
+        }
+    }
+
+    /// `git -C <repo>` に続けて渡す引数。
+    fn args(&self) -> Vec<String> {
+        match self {
+            GitJob::Commit { message, all } => {
+                let mut a: Vec<String> = vec!["commit".into()];
+                if *all {
+                    a.push("--all".into());
+                }
+                // `--` は付けない (パスではなくメッセージなので `-m` の値で確定する)。
+                a.push("-m".into());
+                a.push(message.clone());
+                a
+            }
+            // 追跡ブランチが無い初回でも通るように upstream を張る。
+            GitJob::Push => vec![
+                "push".into(),
+                "--porcelain".into(),
+                "--set-upstream".into(),
+                "origin".into(),
+                "HEAD".into(),
+            ],
+            // 履歴を勝手に書き換えない (merge も rebase もしない) 安全側。
+            GitJob::Pull => vec!["pull".into(), "--ff-only".into()],
+        }
+    }
+}
+
+/// パレットから撃つ git 操作の走行状態と小窓。
+#[derive(Default)]
+struct GitOps {
+    /// 走行中のジョブ (同時に 1 つだけ)
+    job: Option<mpsc::Receiver<(String, bool)>>,
+    /// 走行中ジョブの表示名
+    job_label: String,
+    commit_open: bool,
+    commit_msg: String,
+    commit_all: bool,
+    commit_focus: bool,
+    history_open: bool,
+    history_busy: bool,
+    /// (短い SHA, 「件名 — 著者 · 相対日時」)
+    history: Vec<(String, String)>,
+    history_rx: Option<mpsc::Receiver<Vec<(String, String)>>>,
+    history_query: String,
+}
+
+/// エラー本文の先頭 `n` 行だけを取り出す (トーストを縦に伸ばさない)。
+fn first_lines(s: &str, n: usize) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for l in s.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        out.push(l);
+        if out.len() >= n {
+            break;
+        }
+    }
+    out.join(" / ")
+}
 /// スティッキーヘッダの最大段数 (VS Code の既定と同じ 3 段)。
 const STICKY_MAX_ROWS: usize = 3;
 /// ガターの右端に確保する、折りたたみ記号 ▸ / ▾ の桁幅。
@@ -2004,39 +2231,75 @@ fn large_file_reasons(read_only: bool, highlight_off: bool) -> Vec<String> {
 /// 止まる**。巨大ファイル / 差分タブと、折りたたみ中の一時テキストを、
 /// 同じ `TextEdit` 呼び出しで扱うための薄い包み。
 enum EditTarget<'a> {
-    /// 通常編集 (原文そのもの、または折りたたみ表示テキスト)
+    /// 折りたたみ表示テキストへの編集 (原文ではないので履歴は取らない。
+    /// 原文への差し戻しは `splice_fold_edit` の側で 1 段として積む)
     Rw(&'a mut String),
+    /// 原文への通常編集。**`TextEdit` が入れた差分をその場で履歴へ積む**。
+    ///
+    /// フレーム終端で本文全体を突き合わせるのではなく、`TextBuffer` の
+    /// 挿入 / 削除をそのまま拾う。本文のコピーを 1 本も持たずに済み、
+    /// CJK / 絵文字でもバイト境界を割らない (位置は egui から char で来る)。
+    Rec {
+        text: &'a mut String,
+        hist: &'a mut editor::History,
+        ed: editor::Edit,
+    },
     /// 読み取り専用 (巨大ファイル・差分タブ)
     Ro(&'a str),
 }
 
 impl EditTarget<'_> {
     fn set(&mut self, s: String) {
-        if let EditTarget::Rw(t) = self {
-            **t = s;
+        match self {
+            EditTarget::Rw(t) => **t = s,
+            EditTarget::Rec { text, hist, ed } => {
+                if let Some((at, at_chars, before, after)) = editor::diff_replace(text, &s) {
+                    **text = s;
+                    hist.record(at, at_chars, before, after, *ed);
+                }
+            }
+            EditTarget::Ro(_) => {}
         }
     }
 }
 
 impl egui::TextBuffer for EditTarget<'_> {
     fn is_mutable(&self) -> bool {
-        matches!(self, EditTarget::Rw(_))
+        matches!(self, EditTarget::Rw(_) | EditTarget::Rec { .. })
     }
     fn as_str(&self) -> &str {
         match self {
             EditTarget::Rw(t) => t.as_str(),
+            EditTarget::Rec { text, .. } => text.as_str(),
             EditTarget::Ro(t) => t,
         }
     }
     fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
         match self {
             EditTarget::Rw(t) => <String as egui::TextBuffer>::insert_text(t, text, char_index),
+            EditTarget::Rec { text: t, hist, ed } => {
+                let at = editor_ops::char_to_byte(t, char_index);
+                let n = <String as egui::TextBuffer>::insert_text(*t, text, char_index);
+                hist.record(at, char_index, String::new(), text.to_string(), *ed);
+                n
+            }
             EditTarget::Ro(_) => 0,
         }
     }
     fn delete_char_range(&mut self, char_range: std::ops::Range<usize>) {
-        if let EditTarget::Rw(t) = self {
-            <String as egui::TextBuffer>::delete_char_range(t, char_range);
+        match self {
+            EditTarget::Rw(t) => {
+                <String as egui::TextBuffer>::delete_char_range(t, char_range);
+            }
+            EditTarget::Rec { text: t, hist, ed } => {
+                let (cs, ce) = (char_range.start, char_range.end);
+                let s = editor_ops::char_to_byte(t, cs);
+                let e = editor_ops::char_to_byte(t, ce);
+                let removed = t[s..e].to_string();
+                <String as egui::TextBuffer>::delete_char_range(*t, char_range);
+                hist.record(s, cs, removed, String::new(), *ed);
+            }
+            EditTarget::Ro(_) => {}
         }
     }
 }
@@ -2220,6 +2483,23 @@ pub struct ZaivernApp {
     /// 🏁 プロンプトレース (1 プロンプトを複数エージェントに並走させる) の
     /// ダッシュボード状態。描画・git 操作の実体は race.rs。
     race: race::RacePanel,
+    /// worktree 隔離で起動したエージェント (セッション ID → 割り当てた worktree)。
+    ///
+    /// セッションの `cwd` にも worktree のフォルダは入っているが、
+    /// 「どのリポジトリの worktree か / どのブランチか」はここにしか無い。
+    /// 破棄時の `git worktree remove` と、セッション保存 / 復元がこれを見る。
+    agent_worktrees: HashMap<u64, worktree::AgentWorktree>,
+    /// 同じ作業ツリーに同居しているエージェント同士のファイル衝突の見張り。
+    /// 同居が 0 なら git を 1 回も叩かない (アイドル時のコストはゼロ)。
+    conflicts: worktree::ConflictWatch,
+    /// 衝突バッジの詳細 (どのファイルを誰が取り合っているか) を開いているか。
+    /// **既定は閉じ**。画面が勝手に開かないよう、明示的に押されたときだけ広がる。
+    conflict_detail: bool,
+    /// 全エージェント一括停止の確認モーダルが出ているか (破壊的操作)。
+    pending_stop_all: bool,
+    /// 閉じたエージェントに割り当てられていた worktree の後始末待ち。
+    /// `(worktree, 未コミット変更が残っているか)`。**確認なしには消さない**。
+    pending_worktree: Option<(worktree::AgentWorktree, bool)>,
     /// 構文ハイライタ。プロセスで 1 つの共有インスタンス
     /// (`SyntaxSet` は数 MB あるので差分ビューと二重に持たない)。
     highlighter: &'static Highlighter,
@@ -2275,6 +2555,14 @@ pub struct ZaivernApp {
     branch_nav: git::BranchNav,
     file_index: Vec<IndexedFile>,
     index_at: Option<Instant>,
+    /// バックグラウンド索引の受け口 (世代付き)。`Some` = 走査中。
+    index_rx: Option<mpsc::Receiver<(u64, IndexOutcome)>>,
+    /// 走査済み件数 (索引スレッドが書き、UI が読むだけ)。
+    index_progress: Arc<AtomicUsize>,
+    /// 索引が上限で打ち切られたか (⌘P に必ず出す — 黙って切らない)。
+    index_truncated: bool,
+    /// 索引ジョブの世代。ルートが変わった後に届いた古い結果を捨てる。
+    index_gen: u64,
     /// カスタムテーマ (~/.zaivern/themes + プラグイン同梱): (表示名, JSONフルパス)
     custom_themes: Vec<(String, String)>,
     find: FindState,
@@ -2340,7 +2628,8 @@ pub struct ZaivernApp {
     awaiting_definition: Option<LspKey>,
     toasts: Vec<Toast>,
     pending_close: Option<usize>,
-    /// ファイルツリーからの削除確認待ち(対象と、ゴミ箱を通すかどうか)
+    /// ファイルツリーからの削除確認待ち(対象の集合と、ゴミ箱を通すかどうか)。
+    /// `None` = 確認ダイアログを出さない。
     pending_delete: Option<DeleteRequest>,
     /// 確認待ちの移動/コピー。**確認を通った項目しか実行されない**。
     pending_transfer: Option<TransferQueue>,
@@ -2352,6 +2641,9 @@ pub struct ZaivernApp {
     file_history: FileHistory,
     pending_select: Option<(usize, usize)>,
     pending_scroll: Option<f32>,
+    /// 取り消し履歴の「連続入力」判定に使う単調時計の原点。
+    /// `SystemTime` ではなく `Instant` — 時刻がずれても粒度が壊れない。
+    undo_clock: Instant,
     last_row_h: f32,
     /// エディタ可視領域の高さ(前フレーム値)。PageUp/Down・検索ジャンプで使用
     last_view_h: f32,
@@ -2371,13 +2663,9 @@ pub struct ZaivernApp {
     last_scroll_y: f32,
     /// アクティブバッファ本文のハッシュ (code_editor_ui が line_marks 用に毎フレーム更新)
     last_text_hash: u64,
-    /// find バーのヒット数キャッシュ: (本文ハッシュ, query, ヒット数)。
-    /// 本文ハッシュは last_text_hash を使い回し、新たな全文走査はしない
-    find_count_cache: Option<(u64, String, usize)>,
-    /// ミニマップに出す検索ヒット行のキャッシュ: (本文ハッシュ, query, 行番号)。
-    /// find バーと同じ `last_text_hash` を鍵に使うので、新たな全文走査は
-    /// 検索語か本文が変わったときだけ起きる。
-    minimap_hits: Option<(u64, String, Vec<usize>)>,
+    /// バッファ内検索のヒット一覧 (検索バー / ミニマップの印 / 本文のハイライトが共有)。
+    /// 本文か検索条件が変わったときだけ走査し直す。
+    find_hits: Option<FindHitCache>,
     /// ブレッドクラム用に documentSymbol を投げた記録: (パス, 本文ハッシュ, 時刻)。
     /// 同じ内容へ二重に投げないためのデバウンス。
     breadcrumb_symbols_asked: Option<(PathBuf, u64, Instant)>,
@@ -2427,8 +2715,16 @@ pub struct ZaivernApp {
     commit_diff_cache: HashMap<u64, Vec<crate::diff::FileDiff>>,
     /// ドラッグ中のエディタタブの添字 (ドラッグ並べ替え)。押していない間は None。
     tab_drag: Option<usize>,
+    /// ⌃Tab を**押している間**だけ生きる MRU 切替。離すと確定して None に戻る。
+    tab_switcher: Option<editor_split::TabSwitcher>,
+    /// ペインごとに「どのタブへ自動スクロール済みか」。同じタブへ毎フレーム
+    /// スクロールを要求すると横スクロールが手で動かせなくなるため、
+    /// **アクティブが変わった 1 回だけ**追従する。
+    tab_scrolled: HashMap<editor_split::PaneId, u64>,
     /// Git サイドバー。単一 repo 表示なので常に primary ルートを見る。
     git_panel: git_panel::GitPanel,
+    /// パレットから撃つ git 操作 (commit / push / pull / 履歴) の状態。
+    git_ops: GitOps,
     /// PR 風のローカル変更レビュー。Git サイドバーのサブタブとして出す。
     review: git_panel::ReviewPanel,
     /// Git サイドバーのサブタブ: true = 「変更をレビュー」/ false = 「変更」
@@ -2570,10 +2866,15 @@ pub struct ZaivernApp {
     lsp_which_missing: HashMap<String, Instant>,
     /// アクティブバッファの診断件数 (エラー, 警告) — ステータスバー用
     diag_counts: (usize, usize),
-    /// アクティブバッファの診断キャッシュ:
-    /// (内容ハッシュ, 行→最悪 severity, エラー数, 警告数)。
-    /// (line, severity) 列が変わったときだけマップを作り直す
-    diag_cache: (u64, HashMap<usize, u8>, usize, usize),
+    /// アクティブバッファの診断キャッシュ (行→最悪 severity + **範囲付きの診断**)。
+    /// 行だけでなく範囲を持つので、ガターの印と本文の波線が同じ源から出る。
+    diag_cache: diagview::DiagCache,
+    /// 対応括弧の強調キャッシュ: (本文ハッシュ, キャレット char, 塗る位置)。
+    /// 位置は (char 添字, 相手がいるか)。キャレットが動かない限り本文を走査しない。
+    bracket_hl: Option<(u64, usize, Vec<(usize, bool)>)>,
+    /// 本文でホバー中の診断 (メッセージ, severity, 画面位置)。
+    /// LSP ホバーより**優先**する (診断があるところに説明を二重で出さない)。
+    diag_hover: Option<(String, u8, egui::Pos2)>,
     /// プラグインパネルの内容: (プラグイン名, パネルID) → 本文
     plugin_panels: HashMap<(String, String), String>,
     /// プラグインがステータスバーへ出した文字列(空なら非表示)
@@ -2901,6 +3202,7 @@ impl ZaivernApp {
             review: git_panel::ReviewPanel::new(
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
             ),
+            git_ops: GitOps::default(),
             git_sub_review: false,
             fold_view: None,
             sticky_cache: None,
@@ -2947,14 +3249,32 @@ impl ZaivernApp {
             editor: Editor::new(),
             panes: editor_split::EditorPanes::new(),
             cur_pane: 1,
+            tab_switcher: None,
+            tab_scrolled: HashMap::new(),
             tasks_cache: TasksCache::default(),
             agents: AgentManager::new(),
             splits: HashMap::new(),
             split_rect: HashMap::new(),
-            palette: Palette::new(),
+            palette: {
+                // MRU (state.toml) を復元。実体 (Cmd) は保存していないので、
+                // パレットを最初に開いたフレームで組み込み表から引き直す。
+                let mut p = Palette::new();
+                let saved: Vec<(String, String, u32)> = cfg
+                    .palette_recent
+                    .iter()
+                    .map(|r| (r.label.clone(), r.icon.clone(), r.uses))
+                    .collect();
+                p.restore_recent(&saved);
+                p
+            },
             palette_worktrees: None,
             pending_prompts: Vec::new(),
             race: race::RacePanel::new(),
+            agent_worktrees: HashMap::new(),
+            conflicts: worktree::ConflictWatch::new(),
+            conflict_detail: false,
+            pending_stop_all: false,
+            pending_worktree: None,
             highlighter: crate::highlight::shared(),
             cockpit: false,
             cockpit_followed: None,
@@ -2980,14 +3300,21 @@ impl ZaivernApp {
             branch_nav: git::BranchNav::new(primary_root.clone()),
             file_index: Vec::new(),
             index_at: None,
+            index_rx: None,
+            index_progress: Arc::new(AtomicUsize::new(0)),
+            index_truncated: false,
+            index_gen: 0,
             custom_themes: Vec::new(),
             find: FindState {
                 open: false,
                 query: String::new(),
                 focus: false,
-                last: None,
+                current: None,
+                anchor: 0,
+                wrapped: None,
                 replace_open: false,
                 replace: String::new(),
+                opts: find_buffer::FindOptions::default(),
             },
             menu_state: recent::load(),
             autosave_at: None,
@@ -3023,6 +3350,7 @@ impl ZaivernApp {
             file_history: FileHistory::default(),
             pending_select: None,
             pending_scroll: None,
+            undo_clock: Instant::now(),
             last_row_h: 18.0,
             last_view_h: 620.0,
             zoom_area: None,
@@ -3031,8 +3359,7 @@ impl ZaivernApp {
             zoom_wheel_on_file: false,
             last_scroll_y: 0.0,
             last_text_hash: 0,
-            find_count_cache: None,
-            minimap_hits: None,
+            find_hits: None,
             breadcrumb_symbols_asked: None,
             remote: None,
             remote_err: None,
@@ -3081,7 +3408,9 @@ impl ZaivernApp {
             lsp_which_missing: HashMap::new(),
             diag_counts: (0, 0),
             // 初期キーは番兵 (u64::MAX): 最初の refresh で必ず作り直す
-            diag_cache: (u64::MAX, HashMap::new(), 0, 0),
+            diag_cache: diagview::DiagCache::default(),
+            bracket_hl: None,
+            diag_hover: None,
             plugin_panels: HashMap::new(),
             plugin_status: String::new(),
             hook_last_run: HashMap::new(),
@@ -3146,6 +3475,7 @@ impl ZaivernApp {
             }
             Err(e) => app.remote_err = Some(e),
         }
+        app.tree.apply_config(&app.cfg);
         app.rebuild_index();
         app.restore_session(&cc.egui_ctx);
         // コマンドラインで渡されたファイルはセッション復元の後に開く
@@ -3232,6 +3562,7 @@ impl ZaivernApp {
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
         self.tree.show_hidden = self.cfg.show_hidden_files;
+        self.tree.apply_config(&self.cfg);
         self.rebuild_index();
         // CLI (`zai open <file>`) が見る接続情報も新しいワークスペースへ更新する。
         // 起動時に書いたままだと、フォルダを開き直した後の相対パス解決が
@@ -3633,12 +3964,11 @@ impl ZaivernApp {
                 }
                 plugins::CmdSink::NewTab => {
                     self.editor.new_untitled();
+                    let ed = self.edit_step();
                     if let Some(i) = self.editor.active {
                         let b = &mut self.editor.buffers[i];
                         b.title = r.title.clone();
-                        b.text = r.stdout.clone();
-                        b.cache = None;
-                        b.gutter = None;
+                        b.apply_edit(r.stdout.clone(), ed);
                     }
                     self.toast(
                         trf("🔌 {title} → 新規タブ", &[("title", r.title.clone())]),
@@ -3666,12 +3996,14 @@ impl ZaivernApp {
                         .and_then(|st| st.cursor.char_range())
                         .map(|c| c.primary.index)
                         .unwrap_or_else(|| self.editor.buffers[i].text.chars().count());
+                    let ed = self.edit_step();
                     let b = &mut self.editor.buffers[i];
                     let cur = cur.min(b.text.chars().count());
                     let byte = editor_ops::char_to_byte(&b.text, cur);
                     b.text.insert_str(byte, &r.stdout);
-                    b.cache = None;
-                    b.gutter = None;
+                    b.history
+                        .record(byte, cur, String::new(), r.stdout.clone(), ed);
+                    b.invalidate_render_cache();
                     let end = cur + r.stdout.chars().count();
                     self.pending_select = Some((end, end));
                     self.toast(
@@ -3695,6 +4027,7 @@ impl ZaivernApp {
                         );
                         continue;
                     };
+                    let ed = self.edit_step();
                     let b = &mut self.editor.buffers[i];
                     match r.replace_range {
                         // 選択範囲の置換: 実行中に編集されていたら黙って上書きしない
@@ -3712,9 +4045,10 @@ impl ZaivernApp {
                             }
                             let start = editor_ops::char_to_byte(&b.text, s);
                             let end = editor_ops::char_to_byte(&b.text, e);
+                            let removed = b.text[start..end].to_string();
                             b.text.replace_range(start..end, &r.stdout);
-                            b.cache = None;
-                            b.gutter = None;
+                            b.history.record(start, s, removed, r.stdout.clone(), ed);
+                            b.invalidate_render_cache();
                             let np = s + r.stdout.chars().count();
                             self.pending_select = Some((np, np));
                             self.toast(
@@ -3747,15 +4081,13 @@ impl ZaivernApp {
                                 );
                                 continue;
                             }
-                            b.text = r.stdout.clone();
-                            b.cache = None;
-                            b.gutter = None;
+                            b.apply_edit(r.stdout.clone(), ed);
                             // 保存時フック由来なら整形結果をそのままファイルへ書き戻す
                             if r.resave {
                                 if let Some(path) = b.path.clone() {
                                     match b.write_to(&path) {
                                         Ok(_) => {
-                                            b.saved_hash = hash_str(&b.text);
+                                            b.mark_saved();
                                             b.disk_mtime = disk_mtime(&path);
                                             b.conflict_notified = None;
                                             self.toast(
@@ -3926,22 +4258,19 @@ impl ZaivernApp {
                 A::InsertText { text } => self.insert_at_cursor(&text, ctx),
                 A::ReplaceBuffer { text } => match self.editor.active {
                     Some(i) => {
-                        let b = &mut self.editor.buffers[i];
-                        b.text = text;
-                        b.cache = None;
-                        b.gutter = None;
+                        let ed = self.edit_step();
+                        self.editor.buffers[i].apply_edit(text, ed);
                         self.toast(tr("🔌 バッファを置き換えました"), true);
                     }
                     None => self.toast(tr("🔌 置き換え先のタブがありません"), false),
                 },
                 A::NewTab { title, text } => {
                     self.editor.new_untitled();
+                    let ed = self.edit_step();
                     if let Some(i) = self.editor.active {
                         let b = &mut self.editor.buffers[i];
                         b.title = title;
-                        b.text = text;
-                        b.cache = None;
-                        b.gutter = None;
+                        b.apply_edit(text, ed);
                     }
                 }
                 A::AgentPrompt {
@@ -4012,12 +4341,14 @@ impl ZaivernApp {
             .and_then(|st| st.cursor.char_range())
             .map(|c| c.primary.index)
             .unwrap_or_else(|| self.editor.buffers[i].text.chars().count());
+        let ed = self.edit_step();
         let b = &mut self.editor.buffers[i];
         let cur = cur.min(b.text.chars().count());
         let byte = editor_ops::char_to_byte(&b.text, cur);
         b.text.insert_str(byte, text);
-        b.cache = None;
-        b.gutter = None;
+        b.history
+            .record(byte, cur, String::new(), text.to_string(), ed);
+        b.invalidate_render_cache();
         let end = cur + text.chars().count();
         self.pending_select = Some((end, end));
     }
@@ -4470,38 +4801,53 @@ impl ZaivernApp {
     }
 
     /// アクティブバッファの診断を `self.diag_cache` へ反映する。
-    /// 結果は diag_cache = (内容ハッシュ, 行→最悪 severity, エラー数, 警告数)。
-    /// (line, severity) 列のハッシュが前回と同じなら HashMap は作り直さない
-    /// (毎フレームのマップ構築アロケを避ける。既存の (hash, value) キャッシュと同じ流儀)。
-    fn refresh_active_diagnostics(&mut self) {
+    ///
+    /// キャッシュは **範囲付き** で持つ (行→severity だけだと本文に波線を
+    /// 引けない)。組み直しの判定と中身は [`diagview::DiagCache`] 側にあり、
+    /// 診断も本文も変わっていないフレームでは何も確保しない。
+    fn refresh_active_diagnostics(&mut self, text_hash: u64) {
         let diags = (|| {
             let i = self.editor.active?;
             let path = self.editor.buffers[i].path.as_ref()?;
             let key = self.lsp_key_for(path, &self.editor.buffers[i].lang);
             self.lsp.get(&key)?.diagnostics(path)
-        })();
-        let diags: &[lsp::Diagnostic] = diags.as_deref().map_or(&[], |v| v.as_slice());
-        let mut content = diags.len() as u64;
-        for d in diags {
-            content = combine_hash(content, ((d.line as u64) << 8) | d.severity as u64);
-        }
-        if content == self.diag_cache.0 {
+        })()
+        .unwrap_or_default();
+        let text = self
+            .editor
+            .active
+            .map(|i| self.editor.buffers[i].text.as_str())
+            .unwrap_or("");
+        self.diag_cache.refresh(diags, text, text_hash);
+    }
+
+    /// 次 / 前の診断へ飛ぶ (VS Code の F8 / ⇧F8)。端では巻き戻る。
+    fn goto_diagnostic(&mut self, ctx: &egui::Context, forward: bool) {
+        let Some(i) = self.editor.active else { return };
+        let Some(path) = self.editor.buffers[i].path.clone() else {
+            self.toast(tr("このタブには診断がありません"), false);
+            return;
+        };
+        let diags = self.diag_cache.items.clone();
+        if diags.is_empty() {
+            self.toast(tr("診断はありません"), false);
             return;
         }
-        let mut by_line: HashMap<usize, u8> = HashMap::new();
-        let (mut errs, mut warns) = (0usize, 0usize);
-        for d in diags {
-            match d.severity {
-                1 => errs += 1,
-                2 => warns += 1,
-                _ => {}
-            }
-            let e = by_line.entry(d.line).or_insert(4);
-            if d.severity < *e {
-                *e = d.severity;
-            }
-        }
-        self.diag_cache = (content, by_line, errs, warns);
+        let cur_char = self.active_cursor_char(ctx);
+        let (line, col) = lsp::char_index_to_lsp_pos(&self.editor.buffers[i].text, cur_char);
+        let Some(n) = diagview::step_diag(&diags, lsp::Position::new(line, col), forward) else {
+            return;
+        };
+        let d = diags[n].clone();
+        self.jump_to_lsp_pos(&path, d.line, d.col);
+        // 飛んだ先が何なのかを 1 行で見せる (行末表示を切っていても分かるように)。
+        // トーストの種別は severity に合わせる (error だけ赤くする)。
+        let kind = match d.severity {
+            1 => 2u8,
+            2 => 1,
+            _ => 0,
+        };
+        self.push_toast(diagview::labeled_message(&d), kind);
     }
 
     /// 保存済みのエディタ分割レイアウトを復元する。
@@ -4531,6 +4877,34 @@ impl ZaivernApp {
         if let Some(b) = self.panes.active_buf() {
             self.editor.active = self.editor.buffers.iter().position(|x| x.id == b);
         }
+    }
+
+    /// 保存済みのピン留めを戻す。
+    ///
+    /// 記録はファイルの**絶対パス**なので、開き直せなかったファイルは黙って
+    /// 落ちる (バッファ ID は再起動で必ず変わる)。同じファイルを複数ペインで
+    /// 開いていたら、その全部でピン留めし直す。
+    fn restore_pinned_tabs(&mut self, files: &[String]) {
+        if files.is_empty() {
+            return;
+        }
+        for f in files {
+            let path = Path::new(f);
+            let Some(buf) = self
+                .editor
+                .buffers
+                .iter()
+                .find(|b| b.path.as_deref() == Some(path))
+                .map(|b| b.id)
+            else {
+                continue;
+            };
+            for id in self.panes.order() {
+                self.panes.set_pinned(id, buf, true);
+            }
+        }
+        // ピン留めを左端へ寄せた並びを `editor.buffers` へ写し戻す。
+        self.sync_panes();
     }
 
     /// 現在のタブ構成などをワークスペース単位で保存する。
@@ -4565,6 +4939,21 @@ impl ZaivernApp {
                         .map(|p| p.to_string_lossy().into_owned())
                 })
                 .to_line(),
+            // ピン留めは分割の有無に関わらず残す (分割していないと
+            // `editor_split` は空になるので、こちらが唯一の記録になる)。
+            pinned_files: self
+                .panes
+                .pinned_bufs()
+                .into_iter()
+                .filter_map(|b| {
+                    self.editor
+                        .buffers
+                        .iter()
+                        .find(|x| x.id == b)
+                        .and_then(|x| x.path.as_ref())
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+                .collect(),
             // 走らせているエージェントタブの記録 (チャット履歴のフォルダ別保存)。
             // 終了済みは復元しても意味が無いので残さない。
             agents: self
@@ -4585,6 +4974,18 @@ impl ZaivernApp {
                         .unwrap_or_default(),
                     // 分割しているタイルだけが中身を持つ (他は空文字)。
                     split: self.split_line_for(s.id),
+                    // worktree 隔離で起動した 1 体だけが中身を持つ (他は空文字)。
+                    // これが往復しないと、再起動で自分の worktree に戻れない。
+                    worktree_repo: self
+                        .agent_worktrees
+                        .get(&s.id)
+                        .map(|w| w.repo.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    worktree_branch: self
+                        .agent_worktrees
+                        .get(&s.id)
+                        .map(|w| w.branch.clone())
+                        .unwrap_or_default(),
                 })
                 .collect(),
         };
@@ -4623,6 +5024,7 @@ impl ZaivernApp {
             }
         }
         self.restore_editor_split(&sess.editor_split);
+        self.restore_pinned_tabs(&sess.pinned_files);
         self.sidebar_open = sess.sidebar_open;
         self.sidebar_tab = SidebarTab::from_key(&sess.sidebar_tab);
         self.agents.panel_open = sess.panel_open;
@@ -4691,7 +5093,17 @@ impl ZaivernApp {
                 log_path,
             };
             match self.agents.launch_restored(spec, &replay, ctx) {
-                Ok(()) => restored += 1,
+                Ok(()) => {
+                    restored += 1;
+                    // 隔離エージェントは**前回と同じ worktree** へ戻す。
+                    // cwd は上で worktree のフォルダを指しているので、
+                    // ここでは「どのリポジトリ / どのブランチか」を繋ぎ直す。
+                    if let Some(id) = self.agents.sessions.last().map(|s| s.id) {
+                        if let Some(wt) = restored_worktree(rec) {
+                            self.agent_worktrees.insert(id, wt);
+                        }
+                    }
+                }
                 Err(e) => self.toast(e, false),
             }
         }
@@ -4716,6 +5128,80 @@ impl ZaivernApp {
         }
     }
 
+    // ─── 取り消し履歴 (バッファ側の `editor::History` を駆動する) ─────
+
+    /// 単調時計の現在値 (ms)。連続入力の併合判定に使う。
+    fn undo_now_ms(&self) -> u64 {
+        self.undo_clock.elapsed().as_millis() as u64
+    }
+
+    /// プログラム的編集 1 回ぶんの記録情報 (整形・置換・行移動など)。
+    /// しきい値と上限は**必ず設定から**取る。
+    fn edit_step(&self) -> editor::Edit {
+        editor::Edit::programmatic(self.undo_now_ms(), self.cfg.history_limits())
+    }
+
+    /// 打鍵らしさを差分から決める記録情報 (`TextEdit` 経由・折りたたみの差し戻し)。
+    fn edit_typed(&self) -> editor::Edit {
+        editor::Edit::typed(self.undo_now_ms(), self.cfg.history_limits())
+    }
+
+    /// 取り消し / やり直しの後始末 (選択復元・折りたたみ表示の作り直し・LSP 通知)。
+    fn after_undo_redo(&mut self, i: usize, sel: (usize, usize)) {
+        self.pending_select = Some(sel);
+        self.fold_view = None;
+        self.queue_lsp_change(i);
+    }
+
+    /// アクティブなタブを 1 段取り消す。
+    fn undo_active(&mut self) {
+        let Some(i) = self.editor.active else { return };
+        if self.editor.buffers[i].read_only() {
+            self.toast(tr("このタブは読み取り専用です"), false);
+            return;
+        }
+        match self.editor.buffers[i].undo() {
+            Some(sel) => self.after_undo_redo(i, sel),
+            None => {
+                // 上限で古い段を捨てていたなら、黙って「戻せない」で終わらせない
+                let msg = if self.editor.buffers[i].history.dropped() > 0 {
+                    tr("これ以上取り消せません (古い履歴は上限で破棄しました)")
+                } else {
+                    tr("これ以上取り消せません")
+                };
+                self.toast(msg, false);
+            }
+        }
+    }
+
+    /// アクティブなタブを 1 段やり直す。
+    fn redo_active(&mut self) {
+        let Some(i) = self.editor.active else { return };
+        if self.editor.buffers[i].read_only() {
+            self.toast(tr("このタブは読み取り専用です"), false);
+            return;
+        }
+        match self.editor.buffers[i].redo() {
+            Some(sel) => self.after_undo_redo(i, sel),
+            None => self.toast(tr("やり直せる操作がありません"), false),
+        }
+    }
+
+    /// 本文エディタ (中央の `TextEdit`) にフォーカスがあるか。
+    ///
+    /// ⌘Z を横取りしてよいのはこのときだけ。検索欄やエージェント入力の
+    /// `TextEdit` では、そちらの取り消しをそのまま使わせる。
+    fn editor_body_focused(&self, ctx: &egui::Context) -> bool {
+        let Some(i) = self.editor.active else {
+            return false;
+        };
+        let Some(b) = self.editor.buffers.get(i) else {
+            return false;
+        };
+        let id = buf_edit_id(self.cur_pane, b.id);
+        ctx.memory(|m| m.has_focus(id))
+    }
+
     /// アクティブバッファへ editor_ops の編集操作を適用する。
     fn editor_op(&mut self, ctx: &egui::Context, op: EditOp) {
         let Some(i) = self.editor.active else {
@@ -4738,6 +5224,7 @@ impl ZaivernApp {
             return;
         }
 
+        let (now_ms, limits) = (self.undo_now_ms(), self.cfg.history_limits());
         let buf = &mut self.editor.buffers[i];
         let (new_text, new_sel) = match op {
             EditOp::ToggleComment => {
@@ -4760,11 +5247,11 @@ impl ZaivernApp {
                 (t, (s, e))
             }
         };
-        if new_text != buf.text {
-            buf.text = new_text;
-            buf.cache = None;
-            buf.gutter = None;
-        }
+        // プログラム的編集なので**必ず 1 段**。取り消しで編集前の選択へ戻す。
+        let ed = editor::Edit::programmatic(now_ms, limits)
+            .from_sel((start, end))
+            .to_sel(new_sel);
+        buf.apply_edit(new_text, ed);
         self.pending_select = Some(new_sel);
     }
 
@@ -4812,12 +5299,7 @@ impl ZaivernApp {
             sel.to_single_selection()
         };
         // バイト範囲 → char 範囲 (egui のキャレットは char 添字)
-        let cs = text[..r.start.min(text.len())].chars().count();
-        let ce = cs
-            + text[r.start.min(text.len())..r.end.min(text.len())]
-                .chars()
-                .count();
-        self.pending_select = Some((cs, ce));
+        self.pending_select = Some(byte_range_to_char_range(&text, &r));
         self.multi_sel = Some((buf_id, sel));
         if n > 1 {
             self.toast(
@@ -4827,6 +5309,82 @@ impl ZaivernApp {
                 ),
                 true,
             );
+        }
+    }
+
+    /// Alt 付きポインタ操作を複数キャレットへ反映する。
+    ///
+    /// `prev_caret` はクリック**前**の egui キャレット (char 範囲)。クリックの
+    /// 時点で egui は主キャレットを動かしてしまうので、1 本目の種はこれを使う。
+    fn apply_multi_pointer(
+        &mut self,
+        buf_index: usize,
+        ev: MultiPointer,
+        tab_width: usize,
+        prev_caret: Option<(usize, usize)>,
+    ) {
+        let Some(b) = self.editor.buffers.get(buf_index) else {
+            return;
+        };
+        let buf_id = b.id;
+        let text = b.text.clone();
+        match ev {
+            MultiPointer::Clear => {
+                self.multi_sel = None;
+                self.multi_sticky_col = None;
+            }
+            MultiPointer::DragEnd => {
+                self.column_anchor = None;
+            }
+            MultiPointer::DragStart(idx) => {
+                let (line, col) = char_index_to_line_col(&text, idx, tab_width);
+                self.column_anchor = Some((buf_id, line, col));
+                self.multi_sticky_col = None;
+            }
+            MultiPointer::Drag(idx) => {
+                let Some((aid, al, ac)) = self.column_anchor else {
+                    return;
+                };
+                if aid != buf_id {
+                    return;
+                }
+                let (hl, hc) = char_index_to_line_col(&text, idx, tab_width);
+                let sel = editor_ops::column_selection(&text, al, ac, hl, hc, tab_width);
+                if !sel.is_empty() {
+                    // egui 自身もドラッグで「行をまたぐ 1 本の選択」を作ってしまう。
+                    // 主キャレットを矩形の最後の行へ寄せて、画面に出るのが
+                    // 矩形だけになるようにする (寄せないと 2 種類の選択が重なる)。
+                    self.pending_select =
+                        Some(byte_range_to_char_range(&text, &sel.to_single_selection()));
+                    self.multi_sel = Some((buf_id, sel));
+                }
+            }
+            MultiPointer::Click(idx) => {
+                let byte = editor_ops::char_to_byte(&text, idx);
+                let mut ranges: Vec<std::ops::Range<usize>> = match &self.multi_sel {
+                    Some((id, s)) if *id == buf_id => s.carets().to_vec(),
+                    _ => Vec::new(),
+                };
+                if ranges.is_empty() {
+                    if let Some((a, z)) = prev_caret {
+                        ranges.push(
+                            editor_ops::char_to_byte(&text, a)..editor_ops::char_to_byte(&text, z),
+                        );
+                    }
+                }
+                match ranges.iter().position(|r| r.start == byte && r.end == byte) {
+                    // 同じ位置をもう一度 Alt+クリック → 取り除く (VS Code と同じ)。
+                    // 最後の 1 本は残す (0 本にすると打鍵の行き先が消える)。
+                    Some(p) if ranges.len() > 1 => {
+                        ranges.remove(p);
+                    }
+                    Some(_) => {}
+                    None => ranges.push(byte..byte),
+                }
+                let sel = editor_ops::MultiSel::in_text(&text, ranges);
+                self.multi_sel = (!sel.is_empty()).then_some((buf_id, sel));
+                self.multi_sticky_col = None;
+            }
         }
     }
 
@@ -4912,10 +5470,11 @@ impl ZaivernApp {
                 }
                 // **1 回だけ**本文を差し替える = egui の取り消しも 1 段。
                 let (new_text, sel, n) = multi_batch_insert(&text, &seed, &ins);
-                let b = &mut self.editor.buffers[i];
-                b.text = new_text;
-                b.cache = None;
-                b.gutter = None;
+                let ed = self.edit_step().from_sel((start, end)).to_sel({
+                    let r = sel.to_single_selection_chars(&new_text);
+                    (r.start, r.end)
+                });
+                self.editor.buffers[i].apply_edit(new_text, ed);
                 self.fold_view = None;
                 self.queue_lsp_change(i);
                 self.commit_multi(buf_id, sel, false);
@@ -4924,16 +5483,10 @@ impl ZaivernApp {
                         "✏ {n} 箇所へ貼り付けました ({undo} 一回で戻ります)",
                         &[
                             ("n", n.to_string()),
-                            // 取り消しは egui の TextEdit が持つ固定の打鍵なので
-                            // BindAction は無い。表記だけは同じ整形器で作る
-                            // (ベタ書きの ⌘Z は Windows/Linux で嘘になる)。
-                            (
-                                "undo",
-                                crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
-                                    egui::Modifiers::COMMAND,
-                                    egui::Key::Z,
-                                )),
-                            ),
+                            // 取り消しは自前の履歴なので割り当ては設定で変えられる。
+                            // 表記は必ず現在のバインドから作る
+                            // (ベタ書きの ⌘Z は Windows/Linux でも再割り当てでも嘘になる)。
+                            ("undo", self.key_hint(BindAction::Undo)),
                         ],
                     ),
                     true,
@@ -4999,28 +5552,97 @@ impl ZaivernApp {
         }
     }
 
+    /// ファイル索引の作り直しを**バックグラウンドで**始める。
+    ///
+    /// 設計原則 2: 隠れている処理は欠落ありで良いが、決して UI をブロックしない。
+    /// 走査中も ⌘P は開けて、そのとき出来ている分だけが出る (進捗を添える)。
     fn rebuild_index(&mut self) {
-        self.file_index = build_file_index(&self.roots);
+        let roots = self.roots.clone();
+        let opts = IndexOptions::from_config(&self.cfg);
+        self.index_gen = self.index_gen.wrapping_add(1);
+        let gen = self.index_gen;
+        let progress = Arc::new(AtomicUsize::new(0));
+        self.index_progress = progress.clone();
+        let (tx, rx) = mpsc::channel();
+        let job = opts.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-file-index".into())
+            .spawn(move || {
+                let out = build_file_index_with(&roots, &job, Some(&progress));
+                let _ = tx.send((gen, out));
+            })
+            .is_ok();
+        if spawned {
+            self.index_rx = Some(rx);
+        } else {
+            // スレッドが立てられない環境では従来どおり同期で作る
+            // (遅くはなるが「索引が無い」よりはよい)。
+            let out = build_file_index_with(&self.roots, &opts, None);
+            self.apply_index(out);
+        }
+    }
+
+    /// バックグラウンド索引の完了を取り込む (毎フレーム呼んでよい)。
+    /// 走査中は控えめな再描画を予約して進捗が止まって見えないようにする。
+    fn poll_index(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.index_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((gen, out)) => {
+                self.index_rx = None;
+                // 古い世代 (ルートが変わった等) の結果は捨てる
+                if gen == self.index_gen {
+                    self.apply_index(out);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.index_rx = None,
+        }
+    }
+
+    fn apply_index(&mut self, out: IndexOutcome) {
+        self.index_truncated = out.truncated;
+        self.file_index = out.files;
         self.index_at = Some(Instant::now());
+    }
+
+    /// ⌘P のパレットに出す「索引の状態」。作成中/打ち切りのときだけ Some。
+    fn index_note(&self) -> Option<String> {
+        if self.index_rx.is_some() {
+            let n = self.index_progress.load(Ordering::Relaxed);
+            return Some(trf(
+                "索引を作成中… {n} 件走査 (今ある分から探せます)",
+                &[("n", n.to_string())],
+            ));
+        }
+        if self.index_truncated {
+            return Some(trf(
+                "{n} 件で打ち切りました (設定 index_max_files で変更できます)",
+                &[("n", self.file_index.len().to_string())],
+            ));
+        }
+        None
     }
 }
 
 /// 全ルートを走査してファイル索引を作る (純関数 — テスト可能)。
-fn build_file_index(roots: &[PathBuf]) -> Vec<IndexedFile> {
+///
+/// 除外は `.gitignore` (+ `.git/info/exclude` + `core.excludesFile`) に任せる。
+/// 以前はここに `node_modules` / `target` などのハードコード 10 種しか無く、
+/// リポジトリ固有の生成物 (`out/` `.turbo/` …) が全部索引に載っていた。
+fn build_file_index_with(
+    roots: &[PathBuf],
+    opts: &IndexOptions,
+    progress: Option<&Arc<AtomicUsize>>,
+) -> IndexOutcome {
     {
-        const SKIP: [&str; 10] = [
-            "target",
-            "node_modules",
-            ".git",
-            ".venv",
-            "venv",
-            "__pycache__",
-            "dist",
-            "build",
-            ".next",
-            ".cache",
-        ];
+        let mut ig = crate::ignore::Ignorer::new(opts.respect_gitignore);
         let mut out: Vec<IndexedFile> = Vec::new();
+        let mut truncated = false;
+        let mut scanned = 0usize;
         // ルートを跨いで DFS。エントリは絶対パスを正として持ち、
         // 相対パスは所属ルート基準で作る (あいまい検索の品質を保つため)。
         for root in roots {
@@ -5030,32 +5652,48 @@ fn build_file_index(roots: &[PathBuf]) -> Vec<IndexedFile> {
                 .unwrap_or_else(|| root.to_string_lossy().to_string());
             let mut stack = vec![(root.clone(), 0usize)];
             while let Some((dir, depth)) = stack.pop() {
-                if depth > 12 || out.len() >= 8000 {
+                if depth >= opts.max_depth {
                     continue;
+                }
+                if out.len() >= opts.max_files {
+                    truncated = true;
+                    break;
                 }
                 let Ok(rd) = std::fs::read_dir(&dir) else {
                     continue;
                 };
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
+                    if name == ".git" || name == ".DS_Store" {
+                        continue;
+                    }
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let abs = e.path();
+                    scanned += 1;
+                    if let Some(p) = progress {
+                        // 進捗は 128 件ごとに 1 回だけ書く (アトミックの往復を減らす)
+                        if scanned % 128 == 0 {
+                            p.store(scanned, Ordering::Relaxed);
+                        }
+                    }
+                    if ig.is_ignored(root, &abs, is_dir) {
+                        continue;
+                    }
                     if is_dir {
-                        if !SKIP.contains(&name.as_str()) && !name.starts_with('.') {
-                            stack.push((e.path(), depth + 1));
+                        if !name.starts_with('.') {
+                            stack.push((abs, depth + 1));
                         }
-                    } else if name != ".DS_Store" {
-                        let abs = e.path();
-                        let mut rel = abs
-                            .strip_prefix(root)
-                            .unwrap_or(&abs)
-                            .to_string_lossy()
-                            .to_string();
-                        // 索引の相対パスは Windows でも / 区切りに正規化する。
+                    } else {
+                        if out.len() >= opts.max_files {
+                            truncated = true;
+                            break;
+                        }
+                        // 索引の相対パスは Windows でも / 区切りに正規化する
+                        // (`ignore::rel_slash` が `Path::components` で切るので、
                         // ファイル名抽出 (rsplit('/')) やあいまい検索の入力・
-                        // ラベル表示を OS 間で一致させるため (abs はネイティブのまま)。
-                        if cfg!(windows) {
-                            rel = rel.replace('\\', "/");
-                        }
+                        // ラベル表示が OS 間で一致する。abs はネイティブのまま)。
+                        let rel = crate::ignore::rel_slash(root, &abs)
+                            .unwrap_or_else(|| abs.to_string_lossy().to_string());
                         out.push(IndexedFile {
                             abs,
                             label: format!("{root_name}/{rel}"),
@@ -5088,7 +5726,13 @@ fn build_file_index(roots: &[PathBuf]) -> Vec<IndexedFile> {
             }
         }
         out.sort_by(|a, b| a.label.cmp(&b.label));
-        out
+        if let Some(p) = progress {
+            p.store(scanned, Ordering::Relaxed);
+        }
+        IndexOutcome {
+            files: out,
+            truncated,
+        }
     }
 }
 
@@ -5125,6 +5769,68 @@ impl ZaivernApp {
                 self.persist_session()
             }
             Err(e) => self.toast(e, false),
+        }
+    }
+
+    /// **プレビュー**としてファイルを開く (ツリー / パレットの 1 回クリック)。
+    ///
+    /// VS Code の斜体タブと同じ約束:
+    /// * 直前のプレビュータブは**置き換わる** — 眺めるだけでタブが増え続けない。
+    /// * 未保存の編集があるタブは置き換えず、確定タブへ昇格させてから残す。
+    /// * 同じファイルをもう一度開いたら確定タブへ昇格する
+    ///   (ツリーの 2 回目のクリック = ダブルクリック相当)。
+    ///
+    /// `preview_tabs = false` なら素通しで [`Self::open_path`] と同じ。
+    fn open_path_preview(&mut self, path: &Path) {
+        if !self.cfg.preview_tabs {
+            self.open_path(path);
+            return;
+        }
+        let pane = self.panes.focus_id();
+        let prev = self.panes.preview_of(pane);
+        let already = self
+            .editor
+            .buffers
+            .iter()
+            .find(|b| b.path.as_deref() == Some(path))
+            .map(|b| b.id);
+        if let Some(id) = already {
+            // 2 回目 = 確定タブへ昇格 (以後は他のプレビューに潰されない)
+            if prev == Some(id) {
+                self.panes.promote(id);
+            }
+            self.open_path(path);
+            return;
+        }
+        // 使い捨て枠を空ける。編集中のタブは捨てずに確定タブへ格上げする。
+        if let Some(old) = prev {
+            let dirty = self
+                .editor
+                .buffers
+                .iter()
+                .find(|b| b.id == old)
+                .map(|b| b.dirty())
+                .unwrap_or(false);
+            if dirty {
+                self.panes.promote(old);
+            } else if self.panes.open_count(old) > 1 {
+                self.panes.close_tab(pane, old);
+            } else if let Some(i) = self.editor.buffers.iter().position(|b| b.id == old) {
+                self.editor.close(i);
+            }
+        }
+        self.open_path(path);
+        // 開けていたら、そのタブを新しいプレビュー枠にする。
+        if let Some(id) = self
+            .editor
+            .buffers
+            .iter()
+            .find(|b| b.path.as_deref() == Some(path))
+            .map(|b| b.id)
+        {
+            self.sync_panes();
+            let pane = self.panes.focus_id();
+            self.panes.set_preview(pane, Some(id));
         }
     }
 
@@ -5799,6 +6505,55 @@ impl ZaivernApp {
         }
     }
 
+    /// プリセット `i` を **専用の git worktree** で起動する。
+    ///
+    /// 「並列エージェントは衝突を後で発見させない」の一番強い形 —
+    /// そもそも同じ作業ツリーを共有させない。作業フォルダが git リポジトリで
+    /// ないときは worktree を作れないので、理由を出して何もしない
+    /// (メニュー側でも同じ判定で選択肢を無効化している)。
+    fn launch_preset_isolated(&mut self, i: usize, ctx: &egui::Context) {
+        let Some(p) = self.cfg.agents.get(i).cloned() else {
+            return;
+        };
+        let root = self.agent_cwd();
+        if !worktree::looks_like_git_repo(&root) {
+            self.toast(
+                tr("git リポジトリではないので worktree 隔離は使えません（worktree は git の機能です）"),
+                false,
+            );
+            return;
+        }
+        let wt = match worktree::create_agent_worktree(&root, &p.name) {
+            Ok(wt) => wt,
+            Err(e) => {
+                self.toast(e, false);
+                return;
+            }
+        };
+        let before = self.agents.sessions.len();
+        self.launch_preset_with(i, p.command.clone(), &wt.dir, ctx);
+        match self.agents.sessions.len() > before {
+            true => {
+                if let Some(id) = self.agents.sessions.last().map(|s| s.id) {
+                    self.agent_worktrees.insert(id, wt.clone());
+                }
+                self.toast(
+                    trf(
+                        "🌿 {name} を隔離 worktree ({branch}) で起動しました",
+                        &[("name", p.name.clone()), ("branch", wt.branch.clone())],
+                    ),
+                    true,
+                );
+                self.persist_session();
+            }
+            // 起動できなかったなら、作ったばかりの worktree を残さず畳む
+            // (中身は空なので force で消して構わない)。
+            false => {
+                let _ = worktree::remove_agent_worktree(&wt, true);
+            }
+        }
+    }
+
     fn launch_preset(&mut self, i: usize, ctx: &egui::Context) {
         let cmd = self.cfg.agents.get(i).map(|p| p.command.clone());
         let Some(cmd) = cmd else { return };
@@ -5881,10 +6636,18 @@ impl ZaivernApp {
     fn close_agent(&mut self, i: usize) {
         // セッション ID は再利用され得るので、フェイルオーバーの段も一緒に忘れる
         // (残すと別セッションの状態として読まれてしまう)。
+        let mut freed: Option<worktree::AgentWorktree> = None;
         if let Some(id) = self.agents.sessions.get(i).map(|s| s.id) {
             self.failover.forget_session(id);
+            freed = self.agent_worktrees.remove(&id);
         }
         self.agents.remove(i);
+        // 隔離 worktree を持っていたなら、**残すか消すかをユーザーに選ばせる**。
+        // 黙って消すと未コミットの成果ごと消える (git 自身の拒否も回避してしまう)。
+        if let Some(wt) = freed {
+            let dirty = worktree::worktree_is_dirty(&wt.dir);
+            self.pending_worktree = Some((wt, dirty));
+        }
         // 閉じたセッションが分割ペインだったら、木からも外して畳む
         // (残り 1 枚になったタイルは分割なしの描画へ戻る)。
         self.normalize_splits();
@@ -5994,10 +6757,9 @@ impl ZaivernApp {
             return;
         };
         self.pending_select = Some(sel);
-        let b = &mut self.editor.buffers[i];
-        b.text = cleaned;
-        b.cache = None;
-        b.gutter = None;
+        // 保存時の掃除も取り消せる 1 段にする (VS Code の formatOnSave と同じ)
+        let ed = self.edit_step().to_sel(sel);
+        self.editor.buffers[i].apply_edit(cleaned, ed);
     }
 
     /// バッファ `i` を `path` へ書き出して後始末する。成功したら true。
@@ -6017,7 +6779,8 @@ impl ZaivernApp {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "???".into());
                 b.path = Some(path.clone());
-                b.saved_hash = hash_str(&text);
+                // 保存時点を履歴へ刻む (ここまで取り消したら未保存印が消える)
+                b.mark_saved();
                 b.lang = lang;
                 b.cache = None;
                 b.disk_mtime = disk_mtime(&path);
@@ -6118,11 +6881,9 @@ impl ZaivernApp {
         let label = rep.format.label();
         {
             let b = &mut self.editor.buffers[i];
-            b.text = rep.text;
+            // 別の符号化で**開き直した** = 取り消しで前の解釈へは戻さない
+            b.reset_text(rep.text);
             b.encoding = rep.format.encoding;
-            b.saved_hash = hash_str(&b.text);
-            b.cache = None;
-            b.gutter = None;
             b.disk_mtime = disk_mtime(&path);
             b.conflict_notified = None;
         }
@@ -6169,7 +6930,7 @@ impl ZaivernApp {
                 Ok(()) => {
                     let b = &mut self.editor.buffers[i];
                     b.encoding = enc;
-                    b.saved_hash = hash_str(&text);
+                    b.mark_saved();
                     b.disk_mtime = disk_mtime(&path);
                     b.conflict_notified = None;
                     self.tree.invalidate();
@@ -6401,29 +7162,163 @@ impl ZaivernApp {
         }
     }
 
-    fn find_next(&mut self) {
+    /// バッファ内検索のヒット一覧を最新にする。
+    ///
+    /// **本文か検索条件が変わったときだけ**走査する (鍵は本文ハッシュ + 検索語 +
+    /// トグル)。正規表現が不正でも panic せず、理由を [`FindHitCache::error`] に
+    /// 持ってヒット 0 件として扱う。
+    fn refresh_find_hits(&mut self, buf: usize, text_hash: u64) {
+        if self.find.query.is_empty() {
+            self.find_hits = None;
+            return;
+        }
+        let fresh = self.find_hits.as_ref().is_some_and(|c| {
+            c.text_hash == text_hash && c.query == self.find.query && c.opts == self.find.opts
+        });
+        if fresh {
+            return;
+        }
+        let (matcher, error) = match find_buffer::compile(&self.find.query, self.find.opts) {
+            Ok(m) => (m, None),
+            // 打鍵の途中は必ず不正な状態を通る (`(` を打った瞬間など)。
+            // 空マッチャへ落として理由だけ持ち、UI は赤枠と説明で示す。
+            Err(e) => (
+                find_buffer::compile("", self.find.opts).expect("空クエリは常にコンパイルできる"),
+                Some(e.to_string()),
+            ),
+        };
+        let (hits, truncated) = if error.is_some() {
+            (Vec::new(), false)
+        } else {
+            find_buffer::find_all(&self.editor.buffers[buf].text, &matcher)
+        };
+        // ミニマップの印は「ヒットのある行」なので重複を潰す (hits は行順)
+        let mut mm_lines: Vec<usize> = Vec::new();
+        for h in &hits {
+            if mm_lines.last() != Some(&h.line) {
+                if mm_lines.len() >= crate::minimap::MAX_HITS {
+                    break;
+                }
+                mm_lines.push(h.line);
+            }
+        }
+        self.find_hits = Some(FindHitCache {
+            text_hash,
+            query: self.find.query.clone(),
+            opts: self.find.opts,
+            matcher,
+            hits: std::sync::Arc::new(hits),
+            mm_lines: std::sync::Arc::new(mm_lines),
+            truncated,
+            error,
+        });
+    }
+
+    /// いまの現在位置がヒット一覧の何番目か (本文が変わって見失っていれば None)。
+    /// ヒットは start 昇順なので二分探索で足りる (毎フレーム線形走査しない)。
+    fn current_hit_index(&self) -> Option<usize> {
+        let (s, e) = self.find.current?;
+        let c = self.find_hits.as_ref()?;
+        let ix = c.hits.binary_search_by_key(&s, |h| h.start).ok()?;
+        (c.hits[ix].end == e).then_some(ix)
+    }
+
+    /// 次 (Enter) / 前 (⇧Enter) のヒットへ移動する。末尾↔先頭の折り返しに対応し、
+    /// 折り返したことは [`FindState::wrapped`] に残して検索バーで示す。
+    fn find_step(&mut self, forward: bool) {
         let Some(i) = self.editor.active else {
             return;
         };
         if self.find.query.is_empty() {
             return;
         }
-        let text = self.editor.buffers[i].text.clone();
-        // 大小無視の検索と境界ずれ (İ Ω 等) のフォールバックは find_ci に集約
-        let start_char = self.find.last.map(|c| c + 1).unwrap_or(0);
-        let Some(char_pos) = editor_ops::find_ci(&text, &self.find.query, start_char) else {
-            self.toast(tr("見つかりませんでした"), false);
-            self.find.last = None;
+        let text_hash = hash_str(&self.editor.buffers[i].text);
+        self.refresh_find_hits(i, text_hash);
+        // 現在位置が本文と食い違っていたら起点へ戻す (古い位置へ飛ばない)
+        let cur_start = self
+            .current_hit_index()
+            .map(|ix| self.find_hits.as_ref().expect("直前に確認済み").hits[ix].start);
+        let from = match cur_start {
+            Some(s) if forward => s + 1,
+            Some(s) => s,
+            None => self.find.anchor,
+        };
+        let picked = self
+            .find_hits
+            .as_ref()
+            .filter(|c| c.error.is_none())
+            .and_then(|c| find_buffer::step(&c.hits, from, forward).map(|(ix, w)| (c.hits[ix], w)));
+        let Some((hit, wrapped)) = picked else {
+            // 0 件 / 正規表現エラーはバー側 (赤枠と件数) で示す。
+            // 打鍵ごとにトーストを出すと通知が埋まるので鳴らさない。
+            self.find.current = None;
+            self.find.wrapped = None;
             return;
         };
-
-        let n_chars = self.find.query.chars().count();
-        self.find.last = Some(char_pos);
-        self.pending_select = Some((char_pos, char_pos + n_chars));
-        let line = editor_ops::line_of_char(&text, char_pos);
+        self.find.current = Some(hit.range());
+        self.find.wrapped = wrapped.then_some(forward);
+        let text = &self.editor.buffers[i].text;
+        let cs = find_buffer::byte_to_char(text, hit.start);
+        let ce = find_buffer::byte_to_char(text, hit.end);
+        self.pending_select = Some((cs, ce));
         // VS Code 同様、ヒット行が画面の中央付近に来るようにスクロールする
         self.pending_scroll =
-            Some((line as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
+            Some((hit.line as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
+    }
+
+    /// 検索バーを開く。選択があればそれを検索語にする (VS Code と同じ)。
+    ///
+    /// 入れない場合が 2 つある:
+    /// * **行をまたぐ選択** — 走査は行単位なので必ず 0 件になる。
+    /// * **選択がいまのヒットそのもの** — 直前の検索が付けた選択なので、
+    ///   入れると正規表現がヒット文字列に置き換わって消える。
+    fn open_find(&mut self, ctx: &egui::Context, with_replace: bool) {
+        let sel = self.active_cursor_bytes(ctx);
+        if let Some((s, e)) = sel {
+            let from_hit = e > s && self.find.current == Some((s, e));
+            let text = self
+                .editor
+                .active
+                .map(|i| self.editor.buffers[i].text.as_str());
+            if let Some(picked) = text.filter(|_| e > s && !from_hit).map(|t| &t[s..e]) {
+                if !picked.contains('\n') {
+                    // 正規表現モードでは選択を**そのまま探す**意図なのでエスケープする
+                    // (VS Code と同じ)。
+                    self.find.query = if self.find.opts.regex {
+                        regex::escape(picked)
+                    } else {
+                        picked.to_string()
+                    };
+                    self.find.current = None;
+                    self.find.wrapped = None;
+                }
+            }
+        }
+        // 起点はいまのカーソル (選択があれば手前側)。近い方のヒットから回る。
+        self.find.anchor = sel.map_or(0, |(s, _)| s);
+        self.find.open = true;
+        self.find.focus = true;
+        if with_replace {
+            self.find.replace_open = true;
+        }
+    }
+
+    /// アクティブバッファのカーソル位置をバイト範囲で返す。
+    /// 選択が無ければ `(c, c)`。バッファが無い / 状態が無いときは `None`。
+    fn active_cursor_bytes(&self, ctx: &egui::Context) -> Option<(usize, usize)> {
+        let b = self.editor.active.map(|i| &self.editor.buffers[i])?;
+        let ed_id = buf_edit_id(self.cur_pane, b.id);
+        let r = egui::TextEdit::load_state(ctx, ed_id)?
+            .cursor
+            .char_range()?;
+        let (s, e) = (
+            r.primary.index.min(r.secondary.index),
+            r.primary.index.max(r.secondary.index),
+        );
+        Some((
+            editor_ops::char_to_byte(&b.text, s),
+            editor_ops::char_to_byte(&b.text, e),
+        ))
     }
 
     /// 指定フォルダをワークスペースとして開き直す (フォルダを開く / worktree を開く)。
@@ -7372,10 +8267,9 @@ impl ZaivernApp {
             let ci = (base.max(0) as usize) + m.new_text.chars().count();
             self.pending_select = Some((ci, ci));
         }
-        let b = &mut self.editor.buffers[i];
-        b.text = after;
-        b.cache = None;
-        b.gutter = None;
+        // 補完の確定は additionalTextEdits も含めて**まとめて 1 段**
+        let ed = self.edit_step();
+        self.editor.buffers[i].apply_edit(after, ed);
         self.fold_view = None;
         self.queue_lsp_change(i);
         true
@@ -7412,12 +8306,11 @@ impl ZaivernApp {
                 },
             };
             let Some(i) = idx else { continue };
+            let ed = self.edit_step();
             let b = &mut self.editor.buffers[i];
             let next = lsp::apply_file_edits(&b.text, fe);
-            if next != b.text {
-                b.text = next;
-                b.cache = None;
-                b.gutter = None;
+            // ファイル 1 本ぶんの rename は 1 段 (⌘Z 1 回で丸ごと戻る)
+            if b.apply_edit(next, ed) {
                 files += 1;
             }
             self.queue_lsp_change(i);
@@ -7579,11 +8472,9 @@ impl ZaivernApp {
         if !edits.is_empty() {
             let before = self.editor.buffers[i].text.clone();
             let after = lsp::apply_text_edits(&before, &edits);
-            if after != before {
-                let b = &mut self.editor.buffers[i];
-                b.text = after;
-                b.cache = None;
-                b.gutter = None;
+            // 整形はファイル全体でも**必ず 1 段**
+            let ed = self.edit_step();
+            if self.editor.buffers[i].apply_edit(after, ed) {
                 self.fold_view = None;
                 self.queue_lsp_change(i);
             }
@@ -7917,6 +8808,39 @@ impl ZaivernApp {
     }
 
     /// ホバーポップアップ。本文は markdown なので既存のレンダラで描く。
+    /// 診断のホバー。波線の上にマウスがあるフレームだけ出す。
+    ///
+    /// [`Self::lsp_hover_popup`] とは**排他** — 本文描画側で診断が当たった
+    /// フレームは LSP ホバーを dismiss しているので、2 枚重なることはない。
+    fn diag_hover_popup(&mut self, ctx: &egui::Context) {
+        // take: 本文を描いていないフレーム (別ビューへ切り替えた等) で
+        // ツールチップが取り残されないように、1 フレームで使い切る。
+        // ホバーが続いていれば `code_editor_ui` が毎フレーム入れ直す。
+        let Some((msg, sev, at)) = self.diag_hover.take() else {
+            return;
+        };
+        let color = diagview::severity_color(&self.theme, sev);
+        let (panel, text) = (self.theme.panel, self.theme.text);
+        egui::Area::new(egui::Id::new("zv-diag-hover"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(at + egui::vec2(0.0, HOVER_OFFSET_Y))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(panel)
+                    .stroke(egui::Stroke::new(1.0_f32, color))
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        // 幅は LSP ホバーと同じ上限。長文は折り返して収める。
+                        ui.set_max_width(HOVER_POPUP_W);
+                        ui.horizontal_top(|ui| {
+                            ui.label(RichText::new("\u{25cf}").color(color));
+                            ui.label(RichText::new(msg).color(text));
+                        });
+                    });
+            });
+    }
+
     fn lsp_hover_popup(&mut self, ctx: &egui::Context) {
         let Some(info) = self.lsp_hover.shown() else {
             return;
@@ -8459,6 +9383,7 @@ impl ZaivernApp {
             | Cmd::SaveAll
             | Cmd::ToggleAutoSave
             | Cmd::RevertFile
+            | Cmd::TogglePinTab
             | Cmd::CloseAllTabs => self.apply_cmd_file(cmd, ctx),
             Cmd::Undo
             | Cmd::Redo
@@ -8493,14 +9418,23 @@ impl ZaivernApp {
             | Cmd::ShowExplorer
             | Cmd::ShowGitHubTab
             | Cmd::ToggleProblems
+            | Cmd::NextProblem
+            | Cmd::PrevProblem
+            | Cmd::ToggleInlineDiagnostics
             | Cmd::ToggleFullScreen
             | Cmd::NavBack
             | Cmd::NavForward
             | Cmd::NextTab
             | Cmd::PrevTab
+            | Cmd::SwitchTab
+            | Cmd::SwitchTabBack
+            | Cmd::ToggleTabSwitchMru
+            | Cmd::TogglePreviewTabs
             | Cmd::GoToDefinition
             | Cmd::GoToBracket
-            | Cmd::GoToLine => self.apply_cmd_view_nav(cmd, ctx),
+            | Cmd::GoToLine
+            | Cmd::GoToLineAt(_, _)
+            | Cmd::GoToLspPos(_, _) => self.apply_cmd_view_nav(cmd, ctx),
             Cmd::RunActiveFile
             | Cmd::RunBuildTask
             | Cmd::RunJsonTask(_)
@@ -8528,11 +9462,17 @@ impl ZaivernApp {
             | Cmd::ToggleMdPreview
             | Cmd::ToggleSidebar
             | Cmd::OpenGitPanel
+            | Cmd::GitCommit(_)
+            | Cmd::GitPush
+            | Cmd::GitPull
+            | Cmd::GitHistory
             | Cmd::OpenFind
             | Cmd::NewAgent(_)
             | Cmd::FocusAgent(_)
             | Cmd::RestartAgent
-            | Cmd::KillAgent => self.apply_cmd_agent(cmd, ctx),
+            | Cmd::KillAgent
+            | Cmd::NewAgentIsolated(_)
+            | Cmd::StopAllAgents => self.apply_cmd_agent(cmd, ctx),
             Cmd::SetTheme(_)
             | Cmd::OpenConfig
             | Cmd::ReloadConfig
@@ -8670,6 +9610,11 @@ impl ZaivernApp {
                 );
             }
             Cmd::RevertFile => self.revert_active(),
+            Cmd::TogglePinTab => {
+                if let Some(i) = self.editor.active {
+                    self.toggle_pin_tab(i);
+                }
+            }
             Cmd::CloseAllTabs => self.close_all_tabs(),
             _ => {}
         }
@@ -8680,16 +9625,8 @@ impl ZaivernApp {
     #[allow(clippy::collapsible_match)]
     fn apply_cmd_edit(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
-            Cmd::Undo => {
-                self.push_editor_key(egui::Key::Z, egui::Modifiers::COMMAND, true);
-            }
-            Cmd::Redo => {
-                self.push_editor_key(
-                    egui::Key::Z,
-                    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
-                    true,
-                );
-            }
+            Cmd::Undo => self.undo_active(),
+            Cmd::Redo => self.redo_active(),
             Cmd::CutSelection => self.push_editor_event(egui::Event::Cut, true),
             Cmd::CopySelection => self.push_editor_event(egui::Event::Copy, false),
             Cmd::PasteClipboard => match menu_bar::clipboard_text() {
@@ -8703,9 +9640,7 @@ impl ZaivernApp {
             Cmd::MoveLineDown => self.editor_op(ctx, EditOp::Move(false)),
             Cmd::OpenReplace => {
                 if self.editor.active.is_some() {
-                    self.find.open = true;
-                    self.find.focus = true;
-                    self.find.replace_open = true;
+                    self.open_find(ctx, true);
                 }
             }
             _ => {}
@@ -8867,6 +9802,17 @@ impl ZaivernApp {
                 self.github.active = true;
             }
             Cmd::ToggleProblems => self.problems_open = !self.problems_open,
+            Cmd::NextProblem => self.goto_diagnostic(ctx, true),
+            Cmd::PrevProblem => self.goto_diagnostic(ctx, false),
+            Cmd::ToggleInlineDiagnostics => {
+                self.cfg.inline_diagnostics = !self.cfg.inline_diagnostics;
+                let msg = if self.cfg.inline_diagnostics {
+                    tr("行末の診断メッセージ: ON")
+                } else {
+                    tr("行末の診断メッセージ: OFF")
+                };
+                self.toast(msg, true);
+            }
             Cmd::ToggleFullScreen => {
                 // 救出 (壊れた全画面から脱出) 中・枠復元の予約中は何も送らない。
                 // 遷移の最中に styleMask/zoom を重ねると AppKit が NSException を
@@ -8911,12 +9857,55 @@ impl ZaivernApp {
             Cmd::NavForward => self.nav_go(1),
             Cmd::NextTab => self.cycle_tab(1),
             Cmd::PrevTab => self.cycle_tab(-1),
+            Cmd::SwitchTab => self.switch_tab(1),
+            Cmd::SwitchTabBack => self.switch_tab(-1),
+            Cmd::ToggleTabSwitchMru => {
+                self.cfg.tab_switch_mru = !self.cfg.tab_switch_mru;
+                config::save_state(&self.cfg);
+                self.tab_switcher = None;
+                self.toast(
+                    if self.cfg.tab_switch_mru {
+                        tr("タブ切替: 最近使った順 (押している間に候補、離して確定)")
+                    } else {
+                        tr("タブ切替: 並び順")
+                    },
+                    true,
+                );
+            }
+            Cmd::TogglePreviewTabs => {
+                self.cfg.preview_tabs = !self.cfg.preview_tabs;
+                config::save_state(&self.cfg);
+                if !self.cfg.preview_tabs {
+                    // オフにした瞬間、いま開いているプレビューは確定タブにする
+                    // (斜体のまま置き去りにしない)。
+                    for id in self.panes.order() {
+                        if let Some(b) = self.panes.preview_of(id) {
+                            self.panes.promote(b);
+                        }
+                    }
+                }
+                self.toast(
+                    if self.cfg.preview_tabs {
+                        tr("プレビュータブ: オン (1 回クリックで開いたタブは置き換わります)")
+                    } else {
+                        tr("プレビュータブ: オフ")
+                    },
+                    true,
+                );
+            }
             Cmd::GoToDefinition => self.goto_definition(ctx),
             Cmd::GoToBracket => self.goto_bracket(ctx),
             Cmd::GoToLine => {
                 if self.editor.active.is_some() {
                     self.goto_open = true;
                     self.goto_input.clear();
+                }
+            }
+            // パレットの `:123` / `@シンボル` から来る使い捨ての座標。
+            Cmd::GoToLineAt(line, col) => self.goto_line_col(line, col),
+            Cmd::GoToLspPos(line, col) => {
+                if let Some(p) = self.active_file_path() {
+                    self.jump_to_lsp_pos(&p, line, col);
                 }
             }
             _ => {}
@@ -9148,11 +10137,22 @@ impl ZaivernApp {
                 self.sidebar_tab = SidebarTab::Git;
                 self.persist_session();
             }
-            Cmd::OpenFind => {
-                self.find.open = true;
-                self.find.focus = true;
-            }
+            Cmd::GitCommit(all) => self.open_commit_prompt(all),
+            Cmd::GitPush => self.run_git_job(GitJob::Push, ctx),
+            Cmd::GitPull => self.run_git_job(GitJob::Pull, ctx),
+            Cmd::GitHistory => self.open_git_history(ctx),
+            // 選択があればそれを検索語にする (VS Code と同じ)
+            Cmd::OpenFind => self.open_find(ctx, false),
             Cmd::NewAgent(i) => self.launch_preset(i, ctx),
+            Cmd::NewAgentIsolated(i) => self.launch_preset_isolated(i, ctx),
+            Cmd::StopAllAgents => {
+                if self.agents.running_count() == 0 {
+                    self.toast(tr("稼働中のエージェントはありません"), false);
+                } else {
+                    // 破壊的操作なので必ず確認を挟む (実行はモーダル側)。
+                    self.pending_stop_all = true;
+                }
+            }
             Cmd::FocusAgent(i) => {
                 if i < self.agents.sessions.len() {
                     self.agents.active = i;
@@ -9328,7 +10328,10 @@ impl ZaivernApp {
                 self.theme = resolve_theme(&self.cfg.theme);
                 theme::apply(ctx, &self.theme);
                 self.tree.show_hidden = self.cfg.show_hidden_files;
+                self.tree.apply_config(&self.cfg);
                 self.tree.invalidate();
+                // 索引の上限・除外の扱いも設定に追従させる (作り直しは背景で走る)
+                self.rebuild_index();
                 self.rebuild_plugins();
                 // 監視設定も入れ替える。サンプル間隔が変わるので次回刻みも捨てる。
                 self.supervisor.set_config(self.cfg.supervisor.clone());
@@ -9680,7 +10683,13 @@ impl ZaivernApp {
             Action::OpenFile(p) => {
                 // p は絶対パス (file_index が絶対パスを正として持つ)。
                 // 同名の相対パスが複数ルートにあっても取り違えない。
+                // ツリーと同じく**プレビュー**で開く — 探しているだけで
+                // タブが増え続けないようにするため (設定でオフにできる)。
+                self.open_path_preview(&p);
+            }
+            Action::OpenFileAt(p, line, col) => {
                 self.open_path(&p);
+                self.goto_line_col(line, col);
             }
             Action::Cmd(c) => self.apply_cmd(c, ctx),
         }
@@ -9877,6 +10886,15 @@ impl ZaivernApp {
         let consume = |ctx: &egui::Context, sc: KeyboardShortcut| -> bool {
             ctx.input_mut(|i| crate::keybinds::consume_shortcut_compat(i, sc))
         };
+        // **IME 変換中は 1 つも消費しない。** 日本語/中国語/韓国語を打っている
+        // 最中の生キーは IME のものであってアプリのものではない。ここを通すと
+        // 「かなを打っているだけでコマンドが走る」「変換確定の Enter が
+        // ショートカットに食われる」が起きる (ターミナル側は
+        // `terminal::translate_input` が同じ規則を持っている — エディタ側にだけ
+        // 無かった)。1 フレーム 1 回の呼び出しで変換中フラグも更新される。
+        if crate::keybinds::ime_blocks_shortcuts_now(ctx) {
+            return;
+        }
         let mut cmds: Vec<Cmd> = Vec::new();
         let mut ops: Vec<EditOp> = Vec::new();
 
@@ -9885,7 +10903,13 @@ impl ZaivernApp {
             self.palette.open_commands();
         }
         if consume(ctx, self.keys.get(BindAction::PaletteFiles)) {
-            self.palette.open_files();
+            // VS Code と同じで、開いている最中の ⌘P は「開き直す」ではなく
+            // 「次の候補へ」。連打で最近開いたファイルを下っていける。
+            if self.palette.open && !self.palette.is_command_mode() {
+                self.palette.bump_cycle();
+            } else {
+                self.palette.open_files();
+            }
         }
         if consume(ctx, self.keys.get(BindAction::SaveAll)) {
             cmds.push(Cmd::SaveAll);
@@ -9937,6 +10961,15 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.get(BindAction::PrevTab)) {
             cmds.push(Cmd::PrevTab);
+        }
+        // ⌃⇧Tab を先に取る。`Modifiers::matches_logically` は「パターンに
+        // 無い修飾キーは押されていてもよい」判定なので、⌃Tab を先に消費すると
+        // ⌃⇧Tab が吸われて逆順が永久に効かなくなる。
+        if consume(ctx, self.keys.get(BindAction::SwitchTabBack)) {
+            cmds.push(Cmd::SwitchTabBack);
+        }
+        if consume(ctx, self.keys.get(BindAction::SwitchTab)) {
+            cmds.push(Cmd::SwitchTab);
         }
         // ファイル単位ズーム (⌥⌘+ / Ctrl+Alt+Shift++ …) は「戻る/進む」より先。
         // egui の `Modifiers::matches_logically` は「パターンに無い修飾キーは
@@ -10015,6 +11048,13 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.get(BindAction::DiffNextChange)) {
             cmds.push(Cmd::DiffNextChange);
+        }
+        // 診断のジャンプ。差分と同じく ⇧F8 を F8 より先に見る。
+        if consume(ctx, self.keys.get(BindAction::PrevProblem)) {
+            cmds.push(Cmd::PrevProblem);
+        }
+        if consume(ctx, self.keys.get(BindAction::NextProblem)) {
+            cmds.push(Cmd::NextProblem);
         }
         if consume(ctx, self.keys.get(BindAction::CloseTab)) {
             cmds.push(Cmd::CloseTab);
@@ -10117,16 +11157,25 @@ impl ZaivernApp {
 
         // エディタ編集操作はエディタにフォーカスがあるときだけ消費する
         // (ターミナル内の alt+↑ 等を奪わないため)
-        let editor_focused = self
-            .editor
-            .active
-            .map(|i| {
-                let id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
-                ctx.memory(|m| m.has_focus(id))
-            })
-            .unwrap_or(false);
+        let editor_focused = self.editor_body_focused(ctx);
         let mut pages: Vec<bool> = Vec::new();
         if editor_focused {
+            // 取り消し / やり直しは `TextEdit` より**先に**消費する。
+            // egui 0.29 の TextEdit は自前 undoer を持ち外す API が無いので、
+            // ここで取らないと egui の粒度で二重に戻ってしまう。
+            // 修飾キーの多い ⇧⌘Z を先に消費する。
+            if consume(ctx, self.keys.get(BindAction::Redo)) {
+                cmds.push(Cmd::Redo);
+            }
+            if consume(ctx, self.keys.get(BindAction::Undo)) {
+                cmds.push(Cmd::Undo);
+            }
+            // egui 0.29 の `TextEdit` は ⌘Y / Ctrl+Y も内蔵 redo として扱う。
+            // 取らずに残すと egui の undoer が勝手に本文を戻してしまうので、
+            // ここで食べて自前の「やり直し」へ回す (Windows の慣習とも一致)。
+            if consume(ctx, KeyboardShortcut::new(Modifiers::COMMAND, Key::Y)) {
+                cmds.push(Cmd::Redo);
+            }
             // ⌃G (行移動)・F12 (定義)・⇧⌘\ (括弧) はエディタにフォーカスが
             // あるときだけ奪う (ターミナルの ⌃G = BEL 等と衝突させない)
             if consume(ctx, self.keys.get(BindAction::GoToLine)) {
@@ -11047,6 +12096,45 @@ impl ZaivernApp {
                     ui.close_menu();
                 }
             }
+            // ── worktree 隔離で起動 ────────────────────────────────
+            // 同じ作業ツリーを共有させないので、ファイルの取り合いが起きない。
+            // worktree は git の機能なので、git リポジトリでなければ選べない
+            // (理由はホバーで出す — 押せないボタンを無言で置かない)。
+            ui.separator();
+            let isolated_label = tr("🌿 worktree 隔離で起動…");
+            if worktree::looks_like_git_repo(&self.agent_cwd()) {
+                let m = ui.menu_button(isolated_label, |ui| {
+                    for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
+                        if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
+                            cmds.push(Cmd::NewAgentIsolated(i));
+                            ui.close_menu();
+                        }
+                    }
+                });
+                m.response.on_hover_text(tr(
+                    "このエージェント専用の git worktree (ブランチ agent/…) を切って、\n\
+                     そこを作業フォルダにして起動します。他のエージェントと\n\
+                     同じファイルを取り合いません",
+                ));
+            } else {
+                ui.add_enabled(false, egui::Button::new(isolated_label))
+                    .on_disabled_hover_text(tr(
+                        "このフォルダは git リポジトリではないので worktree を作れません",
+                    ));
+            }
+            // 稼働中が 1 体も居ないときは 1 行も使わない (常に出るだけのボタンを作らない)。
+            if self.agents.running_count() > 0
+                && ui
+                    .button(tr("🛑 全エージェントを停止…"))
+                    .on_hover_text(tr(
+                        "稼働中のエージェントをプロセスツリーごと止めます（確認あり）",
+                    ))
+                    .clicked()
+            {
+                cmds.push(Cmd::StopAllAgents);
+                ui.close_menu();
+            }
+
             ui.separator();
             // エージェントと同じ場所から呼び出せる「指揮統制の看板」。
             if ui
@@ -11654,6 +12742,10 @@ impl ZaivernApp {
         if let Some(prompt) = git_actions.review_prompt {
             self.take_review_prompt(prompt);
         }
+        // Git パネルの履歴一覧をクリック → そのコミットの差分を既存の差分ビューで開く。
+        if let Some((top, sha)) = git_actions.open_commit {
+            self.open_commit_diff_at(&top, &sha);
+        }
 
         self.md_images = md_images;
 
@@ -11821,6 +12913,8 @@ impl ZaivernApp {
             self.cfg.enable_trash,
             undo_hint,
         );
+        // ツリーの絞り込み入力。スクロール領域の外に置き、流れて消えないようにする
+        self.tree.filter_ui(ui, theme);
         egui::ScrollArea::both()
             .id_salt("zv-tree")
             .auto_shrink(false)
@@ -12329,7 +13423,9 @@ impl ZaivernApp {
             self.apply_cmd(Cmd::RefreshTree, ctx);
         }
         if let Some(p) = actions.open {
-            self.open_path(&p);
+            // ツリーの 1 回クリックは**プレビュー** — 眺めるだけでタブが増えない。
+            // 同じファイルをもう一度押す / 編集する / ピン留めすれば確定タブになる。
+            self.open_path_preview(&p);
         }
         if let Some(t) = actions.send_to_agent {
             self.send_to_agent(t);
@@ -12428,7 +13524,7 @@ impl ZaivernApp {
                 }
             }
         }
-        // 移動/コピー (D&D と ⌘C/⌘X → ⌘V)。
+        // 移動/コピー (D&D と ⌘C/⌘X → ⌘V)。複数選択でも 1 ジョブ。
         // **ここでは fs を触らない。** 確認ダイアログ (transfer_confirm_ui) を
         // 通った項目だけが run_transfer_item へ行く。
         if let Some(job) = actions.transfer {
@@ -12438,11 +13534,13 @@ impl ZaivernApp {
             self.toast_warn(msg);
         }
         if let Some(req) = actions.delete {
-            // 設定でゴミ箱を切っているときは、押した場所によらず完全削除
-            self.pending_delete = Some(DeleteRequest {
-                permanent: req.permanent || !self.cfg.enable_trash,
-                ..req
-            });
+            if !req.paths.is_empty() {
+                // 設定でゴミ箱を切っているときは、押した場所によらず完全削除
+                self.pending_delete = Some(DeleteRequest {
+                    permanent: req.permanent || !self.cfg.enable_trash,
+                    ..req
+                });
+            }
         }
         if actions.undo {
             self.undo_file_op();
@@ -12884,12 +13982,11 @@ impl ZaivernApp {
                 .unwrap_or_default()
         );
         self.editor.new_untitled();
+        let ed = self.edit_step();
         if let Some(i) = self.editor.active {
             let b = &mut self.editor.buffers[i];
             b.title = title;
-            b.text = clean;
-            b.cache = None;
-            b.gutter = None;
+            b.apply_edit(clean, ed);
         }
         self.cockpit = false;
     }
@@ -13107,6 +14204,10 @@ impl ZaivernApp {
 
     fn cockpit_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let theme = self.theme.clone();
+        // 同居しているエージェント同士のファイル衝突を見張る。
+        // 同じ作業ツリーに 2 体以上居ないときは git を 1 回も叩かない
+        // (= Cockpit を開いていてもアイドルなら追加コストはゼロ)。
+        self.sync_conflicts();
         // 押されたボタン類はクロージャの中では記録だけして、描画後に self へ反映する。
         let mut acts = CockpitActions::default();
         let mut orch_acts: Vec<orchestration::OrchAction> = Vec::new();
@@ -13133,6 +14234,7 @@ impl ZaivernApp {
             .show(ui, |ui| {
                 self.cockpit_header_ui(ui, &theme, &mut acts);
                 ui.add_space(space::XS);
+                self.cockpit_conflicts_ui(ui, &theme);
 
                 // ── 常設をやめたセクション ────────────────────────────
                 //
@@ -13175,6 +14277,105 @@ impl ZaivernApp {
 
         self.apply_cockpit_actions(ctx, &theme, &orch_rows, acts, orch_acts);
         self.apply_race_actions(race_acts, ctx);
+    }
+
+    /// 衝突の見張りへ現在のエージェント (ID・作業ツリー・生死) を渡す。
+    /// Cockpit / 看板を描くフレームでだけ呼ぶ (閉じている間は 1 命令も走らない)。
+    fn sync_conflicts(&mut self) {
+        let live: Vec<(u64, PathBuf, bool)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| (s.id, s.cwd.clone(), s.running()))
+            .collect();
+        self.conflicts.update(&live);
+    }
+
+    /// 衝突バッジのツールチップ (ファイル名と、取り合っている相手の名前)。
+    fn conflict_tooltip(&self) -> String {
+        let rep = self.conflicts.report();
+        let mut lines = vec![trf(
+            "{n} 体が同じ作業ツリーで同じファイルを触っています",
+            &[("n", rep.agents().len().to_string())],
+        )];
+        for f in rep.files.iter().take(CONFLICT_ROWS_MAX) {
+            let who: Vec<String> = f
+                .agents
+                .iter()
+                .filter_map(|id| self.agents.sessions.iter().find(|s| s.id == *id))
+                .map(|s| format!("{} {}", s.icon, s.title))
+                .collect();
+            lines.push(format!("• {} — {}", f.label, who.join(" ・ ")));
+        }
+        let more = rep.file_count().saturating_sub(CONFLICT_ROWS_MAX);
+        if more > 0 {
+            lines.push(trf("… 他 {n} 件", &[("n", more.to_string())]));
+        }
+        lines.push(tr("🌿 worktree 隔離で起動すると、この取り合いは起きません"));
+        lines.join("\n")
+    }
+
+    /// 衝突の詳細行。**閉じているときと 0 件のときは高さを 1 px も取らない**。
+    fn cockpit_conflicts_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        if !self.conflict_detail || self.conflicts.report().is_empty() {
+            return;
+        }
+        let rep = self.conflicts.report();
+        let rows: Vec<(String, String)> = rep
+            .files
+            .iter()
+            .take(CONFLICT_ROWS_MAX)
+            .map(|f| {
+                let who: Vec<String> = f
+                    .agents
+                    .iter()
+                    .filter_map(|id| self.agents.sessions.iter().find(|s| s.id == *id))
+                    .map(|s| format!("{} {}", s.icon, s.title))
+                    .collect();
+                (f.label.clone(), who.join(" ・ "))
+            })
+            .collect();
+        let more = rep.file_count().saturating_sub(rows.len());
+        egui::Frame::none()
+            .fill(theme.panel_alt)
+            .rounding(4.0)
+            .inner_margin(egui::Margin::same(space::SM))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(tr("⚠ 同じファイルを複数のエージェントが触っています"))
+                        .color(theme.warn)
+                        .strong(),
+                );
+                for (file, who) in rows {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(RichText::new(&file).monospace()).truncate())
+                            .on_hover_text(&file);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(who.clone()).small().color(theme.text_dim),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(who);
+                    });
+                }
+                if more > 0 {
+                    ui.label(
+                        RichText::new(trf("… 他 {n} 件", &[("n", more.to_string())]))
+                            .small()
+                            .color(theme.text_dim),
+                    );
+                }
+                ui.label(
+                    RichText::new(tr(
+                        "🌿 worktree 隔離で起動すると、同じファイルの取り合いは起きません",
+                    ))
+                    .small()
+                    .color(theme.text_dim),
+                );
+            });
+        ui.add_space(space::XS);
     }
 
     /// Cockpit のヘッダー行 (タイトル・稼働数・閉じる/全切替・Agent 起動・
@@ -13240,6 +14441,28 @@ impl ZaivernApp {
                 })
                 .color(theme.text_dim),
             );
+            // ── ファイル衝突のバッジ ────────────────────────────────
+            // **0 件のときは 1 ピクセルも出さない**。押すと詳細が下に開く
+            // (勝手には開かない = 画面が突然変わらない)。
+            let conflict_n = self.conflicts.report().file_count();
+            if conflict_n > 0 {
+                let tip = self.conflict_tooltip();
+                let hit = ui
+                    .selectable_label(
+                        self.conflict_detail,
+                        RichText::new(if compact {
+                            format!("⚠{conflict_n}")
+                        } else {
+                            trf("⚠ {n} ファイル競合", &[("n", conflict_n.to_string())])
+                        })
+                        .color(theme.warn)
+                        .strong(),
+                    )
+                    .on_hover_text(tip);
+                if hit.clicked() {
+                    self.conflict_detail = !self.conflict_detail;
+                }
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -14417,6 +15640,9 @@ impl ZaivernApp {
     fn kanban_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let theme = self.theme.clone();
         let active = self.agents.active;
+        // Cockpit と同じ見張り。同居が 0 なら git を 1 回も叩かない。
+        self.sync_conflicts();
+        let conflicts = self.conflicts.report().clone();
         // PTY 画面の読み直し (parser のロック) は看板が「今」と言ったフレームだけ。
         // 看板を開けっぱなしでもアイドル時のコストがゼロに近くなる。
         let now_ms = self.supervisor.elapsed_ms();
@@ -14463,6 +15689,17 @@ impl ZaivernApp {
                     // 指名スーパーエージェント (指揮官)。看板は同じ形のカードが
                     // 並ぶので、どれが指揮官かを枠と冠で一目で分かるようにする。
                     commander: self.super_agent_session == Some(s.id),
+                    // 同じ作業ツリーの誰かとファイルを取り合っていたら ⚠。
+                    // 取り合っているファイル名はホバーに畳む。
+                    conflict: conflicts.has_agent(s.id).then(|| {
+                        trf(
+                            "⚠ 他のエージェントと同じファイルを触っています: {files}",
+                            &[(
+                                "files",
+                                worktree::summarize_labels(&conflicts.labels_for(s.id), 3),
+                            )],
+                        )
+                    }),
                     can_cycle: s.permission_switch_hint().is_some(),
                     // カードの一言 + ホバープレビュー + アクティビティ分類の材料。
                     // サンプリング周期のフレームだけ実際に PTY を読む
@@ -14876,7 +16113,8 @@ impl ZaivernApp {
             self.editor.active = Some(reorder_active(a, from, to));
         }
         // 検索のヒット位置はバッファに紐づくので、並びが変わっても持ち越さない
-        self.find.last = None;
+        self.find.current = None;
+        self.find_hits = None;
         self.persist_session();
     }
 
@@ -14896,7 +16134,13 @@ impl ZaivernApp {
         let Some((top, _)) = self.gitinfo.locate(&path) else {
             return;
         };
-        let Ok((title, text)) = git::commit_diff(&top, sha) else {
+        self.open_commit_diff_at(&top, sha);
+    }
+
+    /// リポジトリを明示して開く版。Git パネルの履歴一覧とパレットの
+    /// 履歴コマンドの両方から使う (アクティブなバッファに依らずリポジトリが決まる)。
+    fn open_commit_diff_at(&mut self, top: &Path, sha: &str) {
+        let Ok((title, text)) = git::commit_diff(top, sha) else {
             return;
         };
         let id = self
@@ -14905,6 +16149,336 @@ impl ZaivernApp {
         // 同じタブを使い回すことがあるので古いパース結果は捨てる
         self.commit_diff_cache.remove(&id);
         self.persist_session();
+    }
+
+    // ─── パレットから撃つ git 操作 (commit / push / pull / 履歴) ───────
+    //
+    // `git_panel.rs` は commit / push を**意図的にスコープ外**にしている
+    // (あちらの冒頭コメント)。ここはそのパネルの中身に触らず、同じ
+    // 「別スレッドで走らせて結果だけ受け取る」作法で別に持つ。
+    // UI は絶対にブロックしない。
+
+    /// 対象リポジトリ。開いているファイルの所属を最優先し、無ければ
+    /// ワークスペースのルートから最初に見つかった git リポジトリ。
+    fn git_ops_repo(&self) -> Option<PathBuf> {
+        if let Some(p) = self.active_file_path() {
+            if let Some((top, _)) = self.gitinfo.locate(&p) {
+                return Some(top);
+            }
+        }
+        self.roots.iter().find_map(|r| git::discover_toplevel(r))
+    }
+
+    /// コミットメッセージの入力を開く。`all` なら追跡中の変更を全部
+    /// ステージしてからコミットする (`git commit -a`)。
+    fn open_commit_prompt(&mut self, all: bool) {
+        if self.git_ops_repo().is_none() {
+            self.toast(tr("git リポジトリが見つかりません"), false);
+            return;
+        }
+        self.git_ops.commit_open = true;
+        self.git_ops.commit_all = all;
+        self.git_ops.commit_focus = true;
+    }
+
+    /// git のジョブを別スレッドで走らせる。走行中は 1 本だけ。
+    fn run_git_job(&mut self, job: GitJob, ctx: &egui::Context) {
+        if self.git_ops.job.is_some() {
+            self.toast(
+                trf(
+                    "git {label} の実行中です",
+                    &[("label", self.git_ops.job_label.clone())],
+                ),
+                false,
+            );
+            return;
+        }
+        let Some(repo) = self.git_ops_repo() else {
+            self.toast(tr("git リポジトリが見つかりません"), false);
+            return;
+        };
+        let label = job.label();
+        let args = job.args();
+        let (tx, rx) = mpsc::channel();
+        let ctx2 = ctx.clone();
+        let label2 = label.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-git-ops".into())
+            .spawn(move || {
+                let out = crate::procx::hidden_command("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(&args)
+                    .output();
+                // git の言い分 (stderr) は加工せずそのまま画面へ出す。
+                let msg = match out {
+                    Ok(o) if o.status.success() => {
+                        (trf("{l} 完了", &[("l", label2.clone())]), true)
+                    }
+                    Ok(o) => {
+                        let err = crate::textenc::decode_output(&o.stderr);
+                        let err = if err.trim().is_empty() {
+                            crate::textenc::decode_output(&o.stdout)
+                        } else {
+                            err
+                        };
+                        (
+                            trf(
+                                "{l} 失敗: {e}",
+                                &[("l", label2.clone()), ("e", first_lines(&err, 3))],
+                            ),
+                            false,
+                        )
+                    }
+                    Err(e) => (
+                        trf(
+                            "{l} 失敗: {e}",
+                            &[("l", label2.clone()), ("e", e.to_string())],
+                        ),
+                        false,
+                    ),
+                };
+                let _ = tx.send(msg);
+                ctx2.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.git_ops.job = Some(rx);
+                self.git_ops.job_label = label;
+            }
+            Err(e) => self.toast(
+                trf("git を起動できません: {e}", &[("e", e.to_string())]),
+                false,
+            ),
+        }
+    }
+
+    /// コミット履歴の一覧を開き、裏で `git log` を取りに行く。
+    fn open_git_history(&mut self, ctx: &egui::Context) {
+        let Some(repo) = self.git_ops_repo() else {
+            self.toast(tr("git リポジトリが見つかりません"), false);
+            return;
+        };
+        self.git_ops.history_open = true;
+        self.git_ops.history_query.clear();
+        if self.git_ops.history_rx.is_some() {
+            return; // 取得中
+        }
+        self.git_ops.history_busy = true;
+        self.git_ops.history.clear();
+        let (tx, rx) = mpsc::channel();
+        let ctx2 = ctx.clone();
+        let n = GIT_HISTORY_MAX.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("zv-git-log".into())
+            .spawn(move || {
+                let mut out: Vec<(String, String)> = Vec::new();
+                // 区切りは 0x1F (Unit Separator)。件名にも著者名にも現れない。
+                if let Ok(o) = crate::procx::hidden_command("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args([
+                        "log",
+                        "--no-color",
+                        "-n",
+                        &n,
+                        "--pretty=%h%x1f%an%x1f%ar%x1f%s",
+                    ])
+                    .output()
+                {
+                    if o.status.success() {
+                        for line in crate::textenc::decode_output(&o.stdout).lines() {
+                            let mut it = line.split('\u{1f}');
+                            let (Some(sha), Some(an), Some(ar), Some(sub)) =
+                                (it.next(), it.next(), it.next(), it.next())
+                            else {
+                                continue;
+                            };
+                            out.push((sha.to_string(), format!("{sub}  —  {an} · {ar}")));
+                        }
+                    }
+                }
+                let _ = tx.send(out);
+                ctx2.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.git_ops.history_rx = Some(rx),
+            Err(e) => {
+                self.git_ops.history_busy = false;
+                self.toast(
+                    trf("git を起動できません: {e}", &[("e", e.to_string())]),
+                    false,
+                );
+            }
+        }
+    }
+
+    /// 走行中の git ジョブ / 履歴取得の結果を回収する (毎フレーム)。
+    fn git_ops_poll(&mut self) {
+        let done = match &self.git_ops.job {
+            Some(rx) => match rx.try_recv() {
+                Ok(m) => Some(Some(m)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(mpsc::TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+        if let Some(m) = done {
+            self.git_ops.job = None;
+            self.git_ops.job_label.clear();
+            if let Some((msg, ok)) = m {
+                self.toast(msg, ok);
+            }
+            // 一覧・ガター・レビューを取り直す
+            self.gitinfo.request_refresh();
+            self.git_panel.invalidate();
+            self.review.invalidate();
+        }
+        let hist = match &self.git_ops.history_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(list) => Some(Some(list)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(mpsc::TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+        if let Some(list) = hist {
+            self.git_ops.history = list.unwrap_or_default();
+            self.git_ops.history_rx = None;
+            self.git_ops.history_busy = false;
+        }
+    }
+
+    /// コミットメッセージの入力窓。Enter で確定、Esc で取り消し。
+    fn git_commit_window(&mut self, ctx: &egui::Context) {
+        if !self.git_ops.commit_open {
+            return;
+        }
+        let all = self.git_ops.commit_all;
+        let focus = std::mem::take(&mut self.git_ops.commit_focus);
+        let mut msg = std::mem::take(&mut self.git_ops.commit_msg);
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new(if all {
+            tr("すべての変更をコミット")
+        } else {
+            tr("ステージした変更をコミット")
+        })
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_TOP, egui::vec2(0.0, RENAME_WINDOW_Y))
+        .show(ctx, |ui| {
+            ui.set_width(GIT_COMMIT_WINDOW_W);
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut msg)
+                    .hint_text(tr("コミットメッセージ"))
+                    .desired_width(f32::INFINITY),
+            );
+            if focus {
+                r.request_focus();
+            }
+            // IME 変換の確定 Enter をコミットに使わない (Windows / Linux 対策)
+            let ime = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
+            if r.lost_focus() && !ime && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button(tr("コミット")).clicked() {
+                    submit = true;
+                }
+                if ui.button(tr("取り消し")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        self.git_ops.commit_msg = msg;
+        if cancel {
+            self.git_ops.commit_open = false;
+            self.git_ops.commit_msg.clear();
+            return;
+        }
+        if submit {
+            let message = self.git_ops.commit_msg.trim().to_string();
+            if message.is_empty() {
+                self.toast(tr("コミットメッセージを入力してください"), false);
+                self.git_ops.commit_focus = true;
+                return;
+            }
+            self.git_ops.commit_open = false;
+            self.git_ops.commit_msg.clear();
+            self.run_git_job(GitJob::Commit { message, all }, ctx);
+        }
+    }
+
+    /// コミット履歴の一覧。選ぶとそのコミットの差分タブが開く。
+    fn git_history_window(&mut self, ctx: &egui::Context) {
+        if !self.git_ops.history_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let busy = self.git_ops.history_busy;
+        let mut query = std::mem::take(&mut self.git_ops.history_query);
+        let mut open = true;
+        let mut pick: Option<String> = None;
+        let history = std::mem::take(&mut self.git_ops.history);
+        egui::Window::new(tr("コミット履歴"))
+            .open(&mut open)
+            .default_width(REF_WINDOW_W)
+            .show(ctx, |ui| {
+                if busy {
+                    ui.label(
+                        RichText::new(tr("読み込み中…"))
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    return;
+                }
+                if history.is_empty() {
+                    ui.label(
+                        RichText::new(tr("コミットがありません"))
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    return;
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut query)
+                        .hint_text(tr("件名・著者で絞り込み"))
+                        .desired_width(f32::INFINITY),
+                );
+                let pq = fuzzy::PreparedQuery::new(query.trim());
+                egui::ScrollArea::vertical()
+                    .max_height(REF_WINDOW_H)
+                    .show(ui, |ui| {
+                        for (sha, line) in &history {
+                            if pq.score(line).is_none() {
+                                continue;
+                            }
+                            // どの幅でも行からはみ出さない (全文はホバー)
+                            let r = ui.add(
+                                egui::Label::new(RichText::new(format!("{sha}  {line}")).small())
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text(line).clicked() {
+                                pick = Some(sha.clone());
+                            }
+                        }
+                    });
+            });
+        self.git_ops.history = history;
+        self.git_ops.history_query = query;
+        self.git_ops.history_open = open;
+        if let Some(sha) = pick {
+            if let Some(repo) = self.git_ops_repo() {
+                self.open_commit_diff_at(&repo, &sha);
+            }
+            self.git_ops.history_open = false;
+        }
     }
 
     // ─── UI: editor ─────────────────────────────────────────────────
@@ -14946,6 +16520,57 @@ impl ZaivernApp {
         let left = self.panes.sync(&ids, active_id);
         self.editor.active = left.and_then(|b| self.editor.buffers.iter().position(|x| x.id == b));
         self.cur_pane = self.panes.focus_id();
+        self.mirror_pane_order();
+        // **編集した瞬間に確定タブへ昇格する** (VS Code と同じ)。
+        // 編集の入口は複数あるので、入口ごとにフックせず結果 (dirty) を見る。
+        // プレビュー枠が空なら比較 0 回で抜けるので、常時のコストは無い。
+        for id in self.panes.order() {
+            let Some(b) = self.panes.preview_of(id) else {
+                continue;
+            };
+            if self.editor.buffers.iter().any(|x| x.id == b && x.dirty()) {
+                self.panes.promote(b);
+            }
+        }
+    }
+
+    /// 分割していないときだけ、ペインのタブ順を `editor.buffers` へ写し戻す。
+    ///
+    /// ピン留めは [`editor_split::EditorPane::normalize`] がタブ列の先頭へ
+    /// 寄せる。単一ペインでは「バッファ列 = 画面の並び」が前提
+    /// (`reorder_tab` は `editor.buffers` の添字で動く) なので、写し戻さないと
+    /// **ドラッグの落とし先が 1 つずれる**。並びが同じなら何もしない
+    /// (= 通常フレームのコストは比較 1 回)。
+    fn mirror_pane_order(&mut self) {
+        if self.panes.is_split() {
+            return;
+        }
+        let Some(order) = self.panes.pane(self.cur_pane).map(|p| p.tabs.clone()) else {
+            return;
+        };
+        let cur: Vec<u64> = self.editor.buffers.iter().map(|b| b.id).collect();
+        if cur == order {
+            return;
+        }
+        let active_id = self
+            .editor
+            .active
+            .and_then(|i| self.editor.buffers.get(i))
+            .map(|b| b.id);
+        let mut rest = std::mem::take(&mut self.editor.buffers);
+        let mut out = Vec::with_capacity(rest.len());
+        for id in &order {
+            if let Some(k) = rest.iter().position(|b| b.id == *id) {
+                out.push(rest.remove(k));
+            }
+        }
+        out.extend(rest);
+        self.editor.buffers = out;
+        self.editor.active =
+            active_id.and_then(|id| self.editor.buffers.iter().position(|b| b.id == id));
+        // 検索のヒット位置は本文に紐づくので、並びが変わったら捨てる。
+        self.find.current = None;
+        self.find.wrapped = None;
     }
 
     /// タブ列のクリック結果 `(activate, close)` を適用する。
@@ -14960,10 +16585,13 @@ impl ZaivernApp {
             ) {
                 if let Some(at) = p.tabs.iter().position(|x| *x == buf) {
                     p.active = at;
+                    // 押した = 使った。MRU (⌃Tab の順) の先頭へ。
+                    p.touch(buf);
                 }
             }
             self.editor.active = Some(i);
-            self.find.last = None;
+            self.find.current = None;
+            self.find_hits = None;
         }
         if let Some(i) = close {
             let buf = self.editor.buffers.get(i).map(|b| b.id);
@@ -15004,17 +16632,51 @@ impl ZaivernApp {
         if idx.is_empty() {
             return (None, None);
         }
+        // このタブ列のピン留め / プレビューを引く。ピン留めは
+        // `EditorPane::normalize` が先頭へ寄せているので「先頭から N 枚」で足りる。
+        let pane_id = self.cur_pane;
+        let pinned_ids: Vec<u64> = self
+            .panes
+            .pane(pane_id)
+            .map(|p| p.pinned.clone())
+            .unwrap_or_default();
+        let preview_id = self.panes.preview_of(pane_id);
+        let pinned_n = self
+            .panes
+            .pane(pane_id)
+            .map(|p| p.pinned_count())
+            .unwrap_or(0)
+            .min(idx.len());
         let font = egui::TextStyle::Body.resolve(ui.style());
+        // 幅の基準は**ピン留めしていないタブ**の題名だけ (ピン留めは固定幅)。
         let longest = idx
             .iter()
+            .skip(pinned_n)
             .filter_map(|i| self.editor.buffers.get(*i))
             .map(|b| {
                 let name = format!("{} {}", file_tree::icon_for(&b.title), b.title);
                 ui.fonts(|f| f.layout_no_wrap(name, font.clone(), theme.text).size().x)
             })
             .fold(0.0f32, f32::max);
-        let strip = editor_split::tab_strip(ui.available_width() - 12.0, idx.len(), longest);
+        let strip = editor_split::tab_strip_pinned(
+            ui.available_width() - 12.0,
+            idx.len(),
+            pinned_n,
+            longest,
+        );
         let text_w = (strip.tab_w - editor_split::TAB_CHROME_W).max(0.0);
+        let pin_text_w = (strip.pin_w - 20.0).max(1.0);
+        // アクティブタブへの自動スクロールは**変わったフレームだけ**。
+        // 毎フレーム要求すると横スクロールを手で動かせなくなる。
+        let active_id = active
+            .and_then(|i| self.editor.buffers.get(i))
+            .map(|b| b.id);
+        let want_follow =
+            active_id.is_some() && self.tab_scrolled.get(&pane_id) != active_id.as_ref();
+        // 右クリックメニュー / ダブルクリックの要求
+        // (`&mut self` が要るので描画後に適用する)
+        let mut pin_req: Option<usize> = None;
+        let mut promote_req: Option<usize> = None;
         let tabs = egui::Frame::none()
             .fill(theme.panel_alt)
             .inner_margin(egui::Margin {
@@ -15029,6 +16691,37 @@ impl ZaivernApp {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            // **各タブの矩形は純関数が決める** — 描画はその
+                            // 結果に従うだけ。追従スクロールもこの「計画」から
+                            // 決めるので、そのタブが初めて現れたフレームで
+                            // 確実に画面内へ入る (実測を 1 フレーム待たない)。
+                            let total = editor_split::tab_total_w(strip, idx.len(), pinned_n);
+                            let planned = editor_split::tab_rects(
+                                egui::Rect::from_min_size(
+                                    ui.cursor().min,
+                                    egui::vec2(total, ui.available_height().max(1.0)),
+                                ),
+                                strip,
+                                idx.len(),
+                                pinned_n,
+                            );
+                            // 収まらない (= 横スクロールへ逃がす) ときだけ、
+                            // 合計幅を中身の幅として先に宣言する。こうしないと
+                            // ScrollArea が 1 フレーム遅れた幅でスクロール範囲を
+                            // 決め、末尾のタブへ届かない。
+                            if strip.scroll {
+                                ui.set_min_width(total);
+                            }
+                            // アクティブタブが画面外なら追従する
+                            // (掴んでいる間は動かさない — 落とし先が逃げるため)。
+                            if want_follow && !ui.ctx().input(|i| i.pointer.any_down()) {
+                                if let Some(r) = active
+                                    .and_then(|a| idx.iter().position(|i| *i == a))
+                                    .and_then(|p| planned.get(p))
+                                {
+                                    ui.scroll_to_rect(*r, None);
+                                }
+                            }
                             for i in idx {
                                 let i = *i;
                                 let Some(b) = self.editor.buffers.get(i) else {
@@ -15055,6 +16748,11 @@ impl ZaivernApp {
                                 };
                                 let color = if active { theme.text } else { theme.text_dim };
                                 let mode = strip.mode;
+                                // ピン留め = 左端に寄る固定幅の短いタブ。
+                                // プレビュー = 斜体の使い捨てタブ。
+                                let is_pinned = pinned_ids.contains(&b.id);
+                                let is_preview = preview_id == Some(b.id);
+                                let dirty = b.dirty();
                                 let fr = egui::Frame::none()
                                     .fill(fill)
                                     .rounding(egui::Rounding {
@@ -15066,34 +16764,62 @@ impl ZaivernApp {
                                     .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                                     .show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
-                                        let lab = match mode {
-                                            // 狭いときはアイコンだけへ縮退。
-                                            // 題名はホバーで全文を出す。
-                                            editor_split::TabLabelMode::IconOnly => {
-                                                let c =
-                                                    if b.dirty() { theme.accent } else { color };
-                                                ui.add(
-                                                    egui::Label::new(RichText::new(icon).color(c))
-                                                        .selectable(false),
-                                                )
+                                        // 斜体は「まだ確定していない」の合図 (VS Code と同じ)
+                                        let styled = |t: RichText| {
+                                            if is_preview {
+                                                t.italics()
+                                            } else {
+                                                t
                                             }
-                                            editor_split::TabLabelMode::Truncated => {
-                                                ui.set_max_width(text_w.max(1.0));
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(&full).color(color),
-                                                    )
-                                                    .selectable(false)
-                                                    .truncate(),
-                                                )
-                                            }
-                                            editor_split::TabLabelMode::Full => ui.add(
-                                                egui::Label::new(RichText::new(&full).color(color))
-                                                    .selectable(false),
-                                            ),
                                         };
-                                        if mode != editor_split::TabLabelMode::Full {
+                                        let icon_only =
+                                            mode == editor_split::TabLabelMode::IconOnly;
+                                        let lab = if icon_only {
+                                            let c = if dirty { theme.accent } else { color };
+                                            ui.add(
+                                                egui::Label::new(styled(
+                                                    RichText::new(icon).color(c),
+                                                ))
+                                                .selectable(false),
+                                            )
+                                        } else if is_pinned {
+                                            // ピン留めは幅を縮めて題名を省略する
+                                            ui.set_max_width(pin_text_w);
+                                            ui.add(
+                                                egui::Label::new(styled(
+                                                    RichText::new(&full).color(color),
+                                                ))
+                                                .selectable(false)
+                                                .truncate(),
+                                            )
+                                        } else if mode == editor_split::TabLabelMode::Truncated {
+                                            ui.set_max_width(text_w.max(1.0));
+                                            ui.add(
+                                                egui::Label::new(styled(
+                                                    RichText::new(&full).color(color),
+                                                ))
+                                                .selectable(false)
+                                                .truncate(),
+                                            )
+                                        } else {
+                                            ui.add(
+                                                egui::Label::new(styled(
+                                                    RichText::new(&full).color(color),
+                                                ))
+                                                .selectable(false),
+                                            )
+                                        };
+                                        if icon_only
+                                            || is_pinned
+                                            || mode != editor_split::TabLabelMode::Full
+                                        {
                                             lab.on_hover_text(&full);
+                                        }
+                                        // **ピン留めタブには閉じるボタンを出さない** —
+                                        // 誤って閉じないことがピン留めの目的なので、
+                                        // 「×」を置いたら意味が矛盾する。
+                                        if is_pinned {
+                                            return egui::Rect::NOTHING;
                                         }
                                         ui.add(
                                             egui::Label::new(
@@ -15112,8 +16838,29 @@ impl ZaivernApp {
                                     ui.id().with(("editor-tab", i)),
                                     egui::Sense::click_and_drag(),
                                 );
+                                // 右クリックメニュー。`&mut self` が要る操作は
+                                // ここでは呼べないので、要求だけ控えて後で適用する。
+                                tab.context_menu(|ui| {
+                                    let label = if is_pinned {
+                                        tr("ピン留めを解除")
+                                    } else {
+                                        tr("タブをピン留め")
+                                    };
+                                    if ui.button(label).clicked() {
+                                        pin_req = Some(i);
+                                        ui.close_menu();
+                                    }
+                                    if ui.button(tr("タブを閉じる")).clicked() {
+                                        close_req = Some(i);
+                                        ui.close_menu();
+                                    }
+                                });
                                 if tab.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                // ダブルクリック = プレビュータブを確定させる
+                                if tab.double_clicked() {
+                                    promote_req = Some(i);
                                 }
                                 if tab.drag_started() {
                                     drag_from = Some(i);
@@ -15145,9 +16892,21 @@ impl ZaivernApp {
                                 let pos_in_strip = tab_rects.iter().position(|(b, _)| *b == from);
                                 let rects: Vec<egui::Rect> =
                                     tab_rects.iter().map(|(_, r)| *r).collect();
-                                let to = pos_in_strip.and_then(|f| {
-                                    pointer.and_then(|p| reorder_target(&rects, p.x, f))
-                                });
+                                // 落とし先は**ピン境界でクランプ**する。ピン留めは
+                                // 左の区画から出られず、通常タブは入れない
+                                // (= 「ピン留めは常に左端」を掴んでも壊さない)。
+                                let to = pos_in_strip
+                                    .and_then(|f| {
+                                        pointer.and_then(|p| reorder_target(&rects, p.x, f))
+                                    })
+                                    .map(|t| {
+                                        editor_split::clamp_reorder(
+                                            rects.len(),
+                                            pinned_n,
+                                            pos_in_strip.unwrap_or(0),
+                                            t,
+                                        )
+                                    });
                                 let row = pos_in_strip.and_then(|f| rects.get(f).copied());
                                 if down {
                                     if let (Some(f), Some(r)) = (pos_in_strip, row) {
@@ -15205,10 +16964,60 @@ impl ZaivernApp {
             tutorial::anchor(ui.ctx(), AnchorId::EditorTabs, tabs.response.rect);
         }
         self.tab_drag = drag_from;
+        if want_follow {
+            match active_id {
+                Some(b) => {
+                    self.tab_scrolled.insert(pane_id, b);
+                }
+                None => {
+                    self.tab_scrolled.remove(&pane_id);
+                }
+            }
+        }
         if let Some((from, to)) = reorder {
+            // 掴んで動かした = そのタブはもう使い捨てではない (VS Code と同じ)
+            if let Some(b) = self.editor.buffers.get(from).map(|b| b.id) {
+                self.panes.promote(b);
+            }
             self.reorder_tab(from, to);
         }
+        if let Some(b) = promote_req
+            .and_then(|i| self.editor.buffers.get(i))
+            .map(|b| b.id)
+        {
+            self.panes.promote(b);
+        }
+        if let Some(i) = pin_req {
+            self.toggle_pin_tab(i);
+        }
         (activate, close_req)
+    }
+
+    /// `editor.buffers` の添字で指したタブのピン留めを切り替える。
+    ///
+    /// ピン留めしたタブは [`editor_split::EditorPane::normalize`] が左端へ寄せ、
+    /// 単一ペインでは [`Self::mirror_pane_order`] がその並びを
+    /// `editor.buffers` へ写し戻すので、画面とバッファ列は常に一致する。
+    fn toggle_pin_tab(&mut self, i: usize) {
+        let Some(buf) = self.editor.buffers.get(i).map(|b| b.id) else {
+            return;
+        };
+        let pane = self.panes.focus_id();
+        let on = self.panes.toggle_pinned(pane, buf);
+        // ピン留め = 確定タブ (使い捨てのままピン留めはできない)
+        if on {
+            self.panes.promote(buf);
+        }
+        self.sync_panes();
+        self.toast(
+            if on {
+                tr("📌 タブをピン留めしました")
+            } else {
+                tr("ピン留めを解除しました")
+            },
+            true,
+        );
+        self.persist_session();
     }
 
     /// エディタ本文 (`editor.active` が指すバッファ) を種類ごとに振り分けて描く。
@@ -15678,101 +17487,263 @@ impl ZaivernApp {
             });
     }
 
+    /// バッファ内検索バー (VS Code の検索ウィジェット相当)。
+    ///
+    /// 幅による見せ方の判断は [`find_buffer::bar_layout`] (純粋関数 + テーブル
+    /// テスト) に閉じてある。ここは決まった配置に従って描くだけで、
+    /// 「狭いときは…」の分岐を持たない。
     fn find_bar(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme.clone();
-        let mut do_find = false;
+        let mut step: Option<bool> = None; // Some(forward)
         let mut close = false;
         let mut do_replace = false;
         let mut do_replace_all = false;
+
+        // 打鍵の案内は**生成する**。ベタ書きすると Windows/Linux では表記そのものが
+        // 違い、再割り当てでも嘘になる (keybinds の番人テスト参照)。
+        let key_next = crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
+            egui::Modifiers::NONE,
+            egui::Key::Enter,
+        ));
+        let key_prev = crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
+            egui::Modifiers::SHIFT,
+            egui::Key::Enter,
+        ));
+        let key_replace_row = self.key_hint(BindAction::OpenReplace);
+
+        // 表示用の要約はクロージャへ入る前に作る (中では self を可変で借りるため)
+        let total = self.find_hits.as_ref().map_or(0, |c| c.hits.len());
+        let truncated = self.find_hits.as_ref().is_some_and(|c| c.truncated);
+        let err = self.find_hits.as_ref().and_then(|c| c.error.clone());
+        let cur_no = self.current_hit_index().map(|i| i + 1);
+        let has_query = !self.find.query.is_empty();
+        let no_match = has_query && (total == 0 || err.is_some());
+        let count_text = if !has_query {
+            String::new()
+        } else if err.is_some() {
+            tr("エラー")
+        } else if total == 0 {
+            tr("結果なし")
+        } else {
+            // 打ち切ったときは「以上」を付ける (数え切っていないことを隠さない)
+            let n = if truncated {
+                trf("{n} 件以上", &[("n", total.to_string())])
+            } else {
+                total.to_string()
+            };
+            match cur_no {
+                Some(i) => trf("{i} / {n}", &[("i", i.to_string()), ("n", n)]),
+                // 本文が変わって現在位置を見失っている間は件数だけ出す
+                None => trf("{n} 件", &[("n", n)]),
+            }
+        };
+        let wrap_note = self.find.wrapped.map(|fw| {
+            if fw {
+                tr("末尾から先頭へ折り返しました")
+            } else {
+                tr("先頭から末尾へ折り返しました")
+            }
+        });
+        let count_display = match wrap_note {
+            Some(_) => format!("↩ {count_text}"),
+            None => count_text.clone(),
+        };
+        let count_hover = match &wrap_note {
+            Some(note) => format!("{count_text} — {note}"),
+            None => count_text.clone(),
+        };
+
+        let metrics = find_buffer::BarMetrics::default();
+        // 床より狭くても配置は崩さない (これ以上は詰められない下限がある)
+        let avail = ui.available_width().max(find_buffer::min_width(&metrics));
+        let layout = find_buffer::bar_layout(avail, &metrics);
+        debug_assert!(
+            layout.total_width(&metrics) <= avail + 0.5,
+            "検索バーが可用幅からはみ出した"
+        );
+        let row_h = ui.spacing().interact_size.y;
+        let minimal = layout.density == find_buffer::Density::Minimal;
 
         let bar = egui::Frame::none()
             .fill(theme.panel_alt)
             .inner_margin(egui::Margin::symmetric(8.0, 5.0))
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = layout.spacing;
                 ui.horizontal(|ui| {
                     // 置換行の開閉 (VS Code の検索バー左端の ▸/▾ と同じ)
-                    let caret = if self.find.replace_open { "▾" } else { "▸" };
-                    if ui
-                        .button(caret)
-                        .on_hover_text(trf(
-                            "置換行の表示切替 ({key})",
-                            &[("key", self.key_hint(BindAction::OpenReplace))],
-                        ))
-                        .clicked()
-                    {
-                        self.find.replace_open = !self.find.replace_open;
+                    if layout.show_caret {
+                        let caret = if self.find.replace_open { "▾" } else { "▸" };
+                        if ui
+                            .add_sized([metrics.caret, row_h], egui::Button::new(caret))
+                            .on_hover_text(trf(
+                                "置換行の表示切替 ({key})",
+                                &[("key", key_replace_row.clone())],
+                            ))
+                            .clicked()
+                        {
+                            self.find.replace_open = !self.find.replace_open;
+                        }
                     }
-                    ui.label("🔍");
+                    if layout.show_glyph {
+                        ui.label("🔍");
+                    }
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.find.query)
-                            .desired_width(260.0)
+                            .desired_width(layout.query_width)
                             .hint_text(tr("ファイル内検索…")),
                     );
+                    if no_match {
+                        // 0 件 / 不正な正規表現は枠の色で示す (色はテーマから取る)
+                        ui.painter().rect_stroke(
+                            resp.rect.expand(1.0),
+                            ui.visuals().widgets.inactive.rounding,
+                            egui::Stroke::new(1.0_f32, find_buffer::no_match_color(&theme)),
+                        );
+                    }
                     if self.find.focus {
                         resp.request_focus();
                         self.find.focus = false;
                     }
                     if resp.changed() {
-                        self.find.last = None;
+                        // 打鍵ごとに探し直す (VS Code のインクリメンタル検索)
+                        self.find.current = None;
+                        self.find.wrapped = None;
+                        step = Some(true);
                     }
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_find = true;
-                    }
-                    if ui.button(tr("次へ ↓")).clicked() {
-                        do_find = true;
-                    }
-                    if let Some(i) = self.editor.active {
-                        if !self.find.query.is_empty() {
-                            // 毎フレームの全文 to_lowercase を避ける:
-                            // code_editor_ui が line_marks 用に計算済みの本文ハッシュ
-                            // (last_text_hash) + query をキーにヒット数をキャッシュ
-                            let count = match &self.find_count_cache {
-                                Some((h, q, c))
-                                    if *h == self.last_text_hash && *q == self.find.query =>
-                                {
-                                    *c
-                                }
-                                _ => {
-                                    let c = self.editor.buffers[i]
-                                        .text
-                                        .to_lowercase()
-                                        .matches(&self.find.query.to_lowercase())
-                                        .count();
-                                    self.find_count_cache =
-                                        Some((self.last_text_hash, self.find.query.clone(), c));
-                                    c
-                                }
-                            };
-                            ui.label(
-                                RichText::new(trf("{count} 件", &[("count", count.to_string())]))
-                                    .color(theme.text_dim),
-                            );
+                    if resp.lost_focus() {
+                        let (enter, shift) =
+                            ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+                        if enter {
+                            step = Some(!shift);
+                            // 続けて打てるようにフォーカスを戻す
+                            self.find.focus = true;
                         }
                     }
+
+                    // トグル 3 つ。並びは VS Code の検索ウィジェットと同じ
+                    // (大小区別 → 単語単位 → 正規表現)。
+                    let mut opts_changed = false;
+                    if ui
+                        .add_sized(
+                            [metrics.toggle, row_h],
+                            egui::SelectableLabel::new(self.find.opts.case_sensitive, "Aa"),
+                        )
+                        .on_hover_text(tr("大文字小文字を区別"))
+                        .clicked()
+                    {
+                        self.find.opts.case_sensitive = !self.find.opts.case_sensitive;
+                        opts_changed = true;
+                    }
+                    if ui
+                        .add_sized(
+                            [metrics.toggle, row_h],
+                            egui::SelectableLabel::new(self.find.opts.whole_word, "ab|"),
+                        )
+                        .on_hover_text(tr("単語単位で一致"))
+                        .clicked()
+                    {
+                        self.find.opts.whole_word = !self.find.opts.whole_word;
+                        opts_changed = true;
+                    }
+                    if ui
+                        .add_sized(
+                            [metrics.toggle, row_h],
+                            egui::SelectableLabel::new(self.find.opts.regex, ".*"),
+                        )
+                        .on_hover_text(tr("正規表現"))
+                        .clicked()
+                    {
+                        self.find.opts.regex = !self.find.opts.regex;
+                        opts_changed = true;
+                    }
+                    if opts_changed {
+                        self.find.current = None;
+                        self.find.wrapped = None;
+                        step = Some(true);
+                    }
+
+                    // 前へ / 次へ。狭いときはアイコンのみへ縮退する。
+                    let (prev_label, next_label, nav_w) = if layout.nav_labels {
+                        (tr("前へ ↑"), tr("次へ ↓"), metrics.nav_label)
+                    } else {
+                        ("↑".to_string(), "↓".to_string(), metrics.nav_icon)
+                    };
+                    if ui
+                        .add_sized([nav_w, row_h], egui::Button::new(prev_label))
+                        .on_hover_text(trf("前のヒットへ ({key})", &[("key", key_prev.clone())]))
+                        .clicked()
+                    {
+                        step = Some(false);
+                    }
+                    if ui
+                        .add_sized([nav_w, row_h], egui::Button::new(next_label))
+                        .on_hover_text(trf("次のヒットへ ({key})", &[("key", key_next.clone())]))
+                        .clicked()
+                    {
+                        step = Some(true);
+                    }
+
+                    if layout.show_count && !count_display.is_empty() {
+                        let color = if no_match {
+                            find_buffer::no_match_color(&theme)
+                        } else {
+                            theme.text_dim
+                        };
+                        ui.add_sized(
+                            [metrics.count, row_h],
+                            egui::Label::new(RichText::new(&count_display).color(color)).truncate(),
+                        )
+                        .on_hover_text(count_hover.clone());
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕").clicked() {
+                        if ui
+                            .add_sized([metrics.close, row_h], egui::Button::new("✕"))
+                            .on_hover_text(tr("検索を閉じる"))
+                            .clicked()
+                        {
                             close = true;
                         }
                     });
                 });
-                // 置換行 (VS Code: ⌥⌘F)
+
+                // 正規表現が不正なときは落とさず理由を出す (regex のメッセージそのまま)
+                if let Some(e) = &err {
+                    ui.add(egui::Label::new(RichText::new(e).color(theme.err).small()).truncate())
+                        .on_hover_text(e.clone());
+                }
+
+                // 置換行 (VS Code: ⌥⌘F)。折り返しに任せてどの幅でも見切れさせない。
                 if self.find.replace_open {
-                    ui.horizontal(|ui| {
-                        ui.add_space(26.0);
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("⇄");
+                        let hint = if self.find.opts.regex {
+                            tr("置換… ($1 でグループ参照)")
+                        } else {
+                            tr("置換…")
+                        };
                         ui.add(
                             egui::TextEdit::singleline(&mut self.find.replace)
-                                .desired_width(260.0)
-                                .hint_text(tr("置換…")),
+                                .desired_width(layout.query_width)
+                                .hint_text(hint),
                         );
+                        let (one, all) = if minimal {
+                            ("⇄".to_string(), "⇄⇄".to_string())
+                        } else {
+                            (tr("置換"), tr("すべて置換"))
+                        };
                         if ui
-                            .button(tr("置換"))
+                            .button(one)
                             .on_hover_text(tr("いまのヒットを置換して次へ"))
                             .clicked()
                         {
                             do_replace = true;
                         }
-                        if ui.button(tr("すべて置換")).clicked() {
+                        if ui
+                            .button(all)
+                            .on_hover_text(tr("このファイルのヒットをすべて置換"))
+                            .clicked()
+                        {
                             do_replace_all = true;
                         }
                     });
@@ -15780,21 +17751,22 @@ impl ZaivernApp {
             });
         tutorial::anchor(ui.ctx(), AnchorId::EditorFind, bar.response.rect);
 
-        if do_find {
-            self.find_next();
+        if let Some(forward) = step {
+            self.find_step(forward);
         }
         if do_replace {
-            // 置換は本文を変えるので、次フレームのハッシュ更新を待たず即キャッシュ破棄
-            self.find_count_cache = None;
             self.replace_current();
         }
         if do_replace_all {
-            self.find_count_cache = None;
             self.replace_all_in_active();
         }
         if close {
             self.find.open = false;
             self.find.replace_open = false;
+            self.find.current = None;
+            self.find.wrapped = None;
+            // 閉じたらヒット一覧も捨てる (最大 5000 件を抱えたままにしない)
+            self.find_hits = None;
         }
     }
 
@@ -16543,34 +18515,38 @@ impl ZaivernApp {
         self.gitinfo.refresh_if_stale();
         let abs = self.editor.buffers[active].path.clone();
         let text_hash = hash_str(&self.editor.buffers[active].text);
-        // find バーのヒット数キャッシュもこのハッシュを使い回す(再計算しない)
+        // find バーもこのハッシュを使い回す (再計算しない)
         self.last_text_hash = text_hash;
-        // ミニマップに出す検索ヒット行。**本文か検索語が変わったときだけ**走査する
-        // (find バーと同じ text_hash を鍵に使うので、追加の全文走査は起きない)。
-        let mm_search: Vec<usize> = if mm_on && self.find.open && !self.find.query.is_empty() {
-            let q = self.find.query.clone();
-            let fresh = self
-                .minimap_hits
-                .as_ref()
-                .is_some_and(|(h, qq, _)| *h == text_hash && *qq == q);
-            if !fresh {
-                let needle = q.to_lowercase();
-                let lines: Vec<usize> = self.editor.buffers[active]
-                    .text
-                    .split('\n')
-                    .enumerate()
-                    .filter(|(_, l)| l.to_lowercase().contains(&needle))
-                    .map(|(i, _)| i)
-                    .take(crate::minimap::MAX_HITS)
-                    .collect();
-                self.minimap_hits = Some((text_hash, q, lines));
-            }
-            self.minimap_hits
-                .as_ref()
-                .map(|(_, _, v)| v.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        // バッファ内検索のヒットは**ここで 1 回だけ**走査する。
+        // 検索バーの「3 / 27」・ミニマップの印・本文のハイライトが同じ結果を見るので、
+        // 同じ本文を 3 回走査することはない (本文か検索条件が変わったときだけ走る)。
+        let find_on = self.find.open && !self.find.query.is_empty();
+        if find_on {
+            self.refresh_find_hits(active, text_hash);
+        }
+        // Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製されない
+        let find_hits: std::sync::Arc<Vec<find_buffer::BufHit>> = match (find_on, &self.find_hits) {
+            (true, Some(c)) => c.hits.clone(),
+            _ => std::sync::Arc::new(Vec::new()),
+        };
+        let mm_search: std::sync::Arc<Vec<usize>> = match (find_on && mm_on, &self.find_hits) {
+            (true, Some(c)) => c.mm_lines.clone(),
+            _ => std::sync::Arc::new(Vec::new()),
+        };
+        // ハイライトの色はテーマから作る (直書きしない)
+        let find_hit_bg = find_buffer::hit_bg(&self.theme);
+        let find_cur_bg = find_buffer::current_hit_bg(&self.theme);
+        let find_current = self.find.current;
+        // 本文 galley のキャッシュ鍵に混ぜる検索条件。本文そのものは鍵に入っている
+        // ので、ヒットの中身は (検索語, トグル, 現在位置) から一意に決まる。
+        let find_key: u64 = {
+            let opts = self.find.opts;
+            let flags = (opts.case_sensitive as u64)
+                | ((opts.whole_word as u64) << 1)
+                | ((opts.regex as u64) << 2)
+                | ((find_on as u64) << 3);
+            let cur = find_current.map_or(u64::MAX, |(s, e)| (s as u64).rotate_left(17) ^ e as u64);
+            combine_hash(combine_hash(hash_str(&self.find.query), flags), cur)
         };
         // Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製されない
         let marks = match &abs {
@@ -16585,8 +18561,8 @@ impl ZaivernApp {
             let ctx = ui.ctx().clone();
             self.ensure_lsp(&ctx, &p, &lang_clone, active);
         }
-        self.refresh_active_diagnostics();
-        self.diag_counts = (self.diag_cache.2, self.diag_cache.3);
+        self.refresh_active_diagnostics(text_hash);
+        self.diag_counts = (self.diag_cache.errors, self.diag_cache.warnings);
         // diag_cache の借用は、可変借用が要る第 2 次配線の準備が済んでから取る
         // (この束縛を上げると self を可変に触れなくなる)。
 
@@ -16686,9 +18662,66 @@ impl ZaivernApp {
         };
         if let Some((nt, ncur)) = expand {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
-                self.editor.buffers[active].text = nt;
-                self.editor.buffers[active].cache = None;
+                // スニペット展開は 1 段 (⌘Z 1 回で打った略語へ戻る)
+                let ed = self.edit_step().to_sel((ncur, ncur));
+                self.editor.buffers[active].apply_edit(nt, ed);
                 pending_select = Some((ncur, ncur));
+            }
+        }
+
+        // ── 複数キャレット: 打鍵を全キャレットへ配る ──────────────────
+        //
+        // `TextEdit` を描く**前**にイベントを抜き取るのが要。egui は主キャレット
+        // 1 本にしか打鍵を適用しないので、ここで横取りしないと ⌘D で 5 箇所
+        // 選んでも文字は 1 箇所にしか入らない。
+        // 本文の差し替えは 1 回だけ = 取り消しも 1 段 (`MultiPaste` と同じ約束)。
+        //
+        // ここで消費した打鍵は下の自動ペア処理にも届かない (イベントごと抜くため)
+        // ので、複数キャレット中は自動ペアが二重に走ることはない。
+        let buf_id_active = self.editor.buffers[active].id;
+        // クリック**前**のキャレット。Alt+クリックの 1 本目の種にする
+        // (クリック後は egui が主キャレットを動かしてしまい取れない)。
+        let prev_caret: Option<(usize, usize)> = egui::TextEdit::load_state(ui.ctx(), ed_id_early)
+            .and_then(|st| st.cursor.char_range())
+            .map(|r| {
+                let (a, b) = (r.primary.index, r.secondary.index);
+                (a.min(b), a.max(b))
+            });
+        let multi_live =
+            matches!(&self.multi_sel, Some((id, s)) if *id == buf_id_active && s.len() > 1);
+        if multi_live && has_focus {
+            // Escape で解除。エディタにフォーカスがあるときだけ奪うので、
+            // パレット / 検索 / 全画面解除 (どれもフォーカス無しが条件) とは
+            // 取り合いにならない。
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.multi_sel = None;
+                self.multi_sticky_col = None;
+                self.column_anchor = None;
+            } else if !folds_closed && !self.editor.buffers[active].read_only() {
+                let ops = ui.input_mut(|i| take_multi_keys(&mut i.events));
+                if !ops.is_empty() {
+                    let sel = match &self.multi_sel {
+                        Some((_, s)) => s.clone(),
+                        None => editor_ops::MultiSel::default(),
+                    };
+                    let (new_text, next) =
+                        apply_multi_keys(&self.editor.buffers[active].text, &sel, &ops);
+                    let (cs, ce) = byte_range_to_char_range(&new_text, &next.to_single_selection());
+                    // 打鍵は連続して来るので `typed` で積む — 続けて打った文字は
+                    // 1 段に併合され、⌘Z 一回で「打った塊」が戻る。プログラム的
+                    // 編集にすると 1 文字 = 1 段になり、単キャレットと粒度がずれる。
+                    // 取り消し後は編集前の主キャレット位置へ戻す。
+                    let ed = self
+                        .edit_typed()
+                        .from_sel(prev_caret.unwrap_or((cs, ce)))
+                        .to_sel((cs, ce));
+                    // 本文の書き込みはこの 1 か所だけ (取り消しが 1 段で戻る条件)
+                    self.editor.buffers[active].apply_edit(new_text, ed);
+                    self.fold_view = None;
+                    self.queue_lsp_change(active);
+                    pending_select = Some((cs, ce));
+                    self.multi_sel = Some((buf_id_active, next));
+                }
             }
         }
 
@@ -16739,13 +18772,15 @@ impl ZaivernApp {
                     });
                     match edit {
                         editor_ops::PairEdit::Insert { text: nt, cursor } => {
-                            self.editor.buffers[active].text = nt;
-                            self.editor.buffers[active].cache = None;
+                            // 自動で足した閉じ括弧は打鍵と同じ段に混ぜる
+                            let ed = self.edit_typed();
+                            self.editor.buffers[active].apply_edit(nt, ed);
                             pending_select = Some((cursor, cursor));
                         }
                         editor_ops::PairEdit::Surround { text: nt, select } => {
-                            self.editor.buffers[active].text = nt;
-                            self.editor.buffers[active].cache = None;
+                            // 選択を括弧で囲むのはプログラム的編集 (1 段)
+                            let ed = self.edit_step().from_sel((sel_min, sel_max)).to_sel(select);
+                            self.editor.buffers[active].apply_edit(nt, ed);
                             pending_select = Some(select);
                         }
                         editor_ops::PairEdit::SkipOver { cursor } => {
@@ -16759,8 +18794,8 @@ impl ZaivernApp {
                         if ui.input_mut(|i| {
                             i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
                         }) {
-                            self.editor.buffers[active].text = nt;
-                            self.editor.buffers[active].cache = None;
+                            let ed = self.edit_typed();
+                            self.editor.buffers[active].apply_edit(nt, ed);
                             pending_select = Some((cur, cur));
                         }
                     }
@@ -16915,6 +18950,26 @@ impl ZaivernApp {
             } else {
                 self.lsp_highlight_spans.clone()
             };
+        // 複数キャレットの描画データ (char 範囲)。`TextEdit` は主キャレットしか
+        // 描かないので、残りの縦線と選択の背景をここのデータで重ね塗りする。
+        // 折りたたみ中は表示テキストと char 添字がずれるので塗らない
+        // (occ_spans と同じ理由)。色はテーマから取る (固定色を書かない)。
+        let multi_spans: Vec<(usize, usize)> = match &self.multi_sel {
+            Some((mid, s)) if !folding && *mid == self.editor.buffers[active].id && s.len() > 1 => {
+                s.to_char_ranges(&self.editor.buffers[active].text)
+                    .into_iter()
+                    .take(MULTI_PAINT_MAX)
+                    .map(|r| (r.start, r.end))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let multi_caret_color = self.theme.accent;
+        let multi_sel_color = self.theme.accent.gamma_multiply(0.28);
+        // キャレットの線幅は物理ピクセルへ揃える (端末セルと同じ理由。
+        // 小数のままだと桁によって 1px/2px に揺れて汚い)。
+        let multi_caret_w = crate::theme::snap_len(1.5, ppp).max(1.0 / ppp);
+
         // ── Git blame (既定 OFF) ────────────────────────────────────
         // **可視ブロックだけ**を非同期で取る。キーは (パス, 保存時ハッシュ,
         // ブロック範囲) なので、同じ場所を見ている限り git は 1 度も起きない。
@@ -16964,8 +19019,81 @@ impl ZaivernApp {
             0.0
         };
 
-        let diag_by_line = &self.diag_cache.1;
+        // ── 対応括弧の強調 ──
+        // 相手を探すのは `editor_ops::matching_bracket` (括弧ジャンプと同じ
+        // 関数) だけ。ここは結果を (char 添字, 相手がいるか) へ写して持つ。
+        // **キャレットか本文が変わったときだけ**走査する = アイドルは 0 コスト。
+        // 折りたたみ中は表示テキストと char 添字がずれるので出さない。
+        let bracket_spans: Vec<(usize, bool)> = if folding {
+            self.bracket_hl = None;
+            Vec::new()
+        } else {
+            let caret = egui::TextEdit::load_state(ui.ctx(), ed_id_early)
+                .and_then(|st| st.cursor.char_range())
+                .filter(|r| r.primary.index == r.secondary.index)
+                .map(|r| r.primary.index);
+            match caret {
+                Some(c) => {
+                    let fresh = self
+                        .bracket_hl
+                        .as_ref()
+                        .is_some_and(|(h, cc, _)| *h == text_hash && *cc == c);
+                    if !fresh {
+                        let v = match diagview::bracket_hl(&self.editor.buffers[active].text, c) {
+                            Some(h) => {
+                                let mut v = vec![(h.at, h.other.is_some())];
+                                if let Some(o) = h.other {
+                                    v.push((o, true));
+                                }
+                                v
+                            }
+                            None => Vec::new(),
+                        };
+                        self.bracket_hl = Some((text_hash, c, v));
+                    }
+                    self.bracket_hl
+                        .as_ref()
+                        .map(|(_, _, v)| v.clone())
+                        .unwrap_or_default()
+                }
+                None => {
+                    self.bracket_hl = None;
+                    Vec::new()
+                }
+            }
+        };
+        // 対応するペアはアクセント、相手のいない括弧はエラー色 (色はテーマ由来)
+        let bracket_fill = [
+            theme_err.gamma_multiply(0.30),
+            theme_accent.gamma_multiply(0.30),
+        ];
+        let bracket_edge = [
+            theme_err.gamma_multiply(0.85),
+            theme_accent.gamma_multiply(0.85),
+        ];
+        // severity → 色 (1..=4 の順)。`diagview::severity_color` を通すので
+        // ここにも app.rs にも色のベタ書きは無い。
+        let diag_colors: [Color32; 4] = [
+            diagview::severity_color(&self.theme, 1),
+            diagview::severity_color(&self.theme, 2),
+            diagview::severity_color(&self.theme, 3),
+            diagview::severity_color(&self.theme, 4),
+        ];
+        // 行末の診断メッセージ (Error Lens 相当)。既定オン・カーソル行だけ。
+        let inline_diag_on = self.cfg.inline_diagnostics && !folding;
+        // 波線を引く範囲と、行末メッセージに使う診断そのもの。
+        // 折りたたみ中は char 添字がずれるので波線は出さない (ガターの印は残る)。
+        let empty_spans: Vec<diagview::DiagSpan> = Vec::new();
+        let diag_spans: &[diagview::DiagSpan] = if folding {
+            &empty_spans
+        } else {
+            &self.diag_cache.spans
+        };
+        let diag_items = self.diag_cache.items.clone();
+        let diag_by_line = &self.diag_cache.by_line;
         let hl = self.highlighter;
+        // 取り消し履歴へ渡すしきい値と上限は設定から (直書きしない)
+        let hist_edit = self.edit_typed();
         let buf = &mut self.editor.buffers[active];
         let Buffer {
             id,
@@ -16974,6 +19102,7 @@ impl ZaivernApp {
             cache,
             gutter,
             minimap,
+            history,
             ..
         } = buf;
 
@@ -17018,6 +19147,7 @@ impl ZaivernApp {
                 font_gen,
                 (word_wrap as u64) | ((show_ws as u64) << 1),
                 max_w.to_bits() as u64,
+                find_key,
             ]
             .into_iter()
             .fold(hash_str(t), combine_hash);
@@ -17027,6 +19157,18 @@ impl ZaivernApp {
                 Some((k, g)) if *k == key => g.clone(),
                 _ => {
                     let mut j = hl.layout_job(t, lang, &syntect_theme, font.clone(), theme_text);
+                    // 検索ヒットの背景は**空白可視化の前**に差す。
+                    // whitespace_layout_job は ' ' → '·' でバイト長を変えるので、
+                    // 後から当てるとバイト範囲がズレる (書式は引き継がれる)。
+                    if !find_hits.is_empty() {
+                        j = find_buffer::apply_hits(
+                            j,
+                            &find_hits,
+                            find_current,
+                            find_hit_bg,
+                            find_cur_bg,
+                        );
+                    }
                     if show_ws {
                         // スペース→「·」/ タブ→「→」(char 数は変えない)
                         j = crate::editor::whitespace_layout_job(j, ws_color);
@@ -17072,11 +19214,16 @@ impl ZaivernApp {
             let mut caret_at: Option<egui::Pos2> = None;
             let mut hover_hit: Option<(usize, egui::Pos2)> = None;
             let mut sel_out: Option<(usize, usize)> = None;
+            let mut multi_ptr: Option<MultiPointer> = None;
             // 編集対象: 折りたたみ中は表示テキスト、読み取り専用なら
             // is_mutable() == false の包み (選択とコピーは残る)
             let mut target = match (read_only, disp_text.as_mut()) {
                 (false, Some(d)) => EditTarget::Rw(d),
-                (false, None) => EditTarget::Rw(&mut *text),
+                (false, None) => EditTarget::Rec {
+                    text: &mut *text,
+                    hist: &mut *history,
+                    ed: hist_edit,
+                },
                 (true, Some(d)) => EditTarget::Ro(&*d),
                 (true, None) => EditTarget::Ro(&*text),
             };
@@ -17165,6 +19312,182 @@ impl ZaivernApp {
                     ui.painter().rect_filled(rect, 2.0, occ_color);
                 }
 
+                // 対応括弧の強調。カーソルに隣接する括弧と相手の**両方**を塗る。
+                // 相手がいない括弧はエラー色 (色は theme 由来・ベタ書きなし)。
+                for (idx, matched) in &bracket_spans {
+                    let c0 = output.galley.from_ccursor(egui::text::CCursor::new(*idx));
+                    let c1 = output
+                        .galley
+                        .from_ccursor(egui::text::CCursor::new(idx + 1));
+                    let r0 = output.galley.pos_from_cursor(&c0);
+                    let r1 = output.galley.pos_from_cursor(&c1);
+                    // 視覚行をまたぐと矩形が一意に決まらないので塗らない
+                    if (r0.min.y - r1.min.y).abs() > 0.5 || r1.min.x <= r0.min.x {
+                        continue;
+                    }
+                    let k = usize::from(*matched);
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(
+                            crate::theme::snap_len(output.galley_pos.x + r0.min.x, ppp),
+                            crate::theme::snap_len(output.galley_pos.y + r0.min.y, ppp),
+                        ),
+                        egui::pos2(
+                            crate::theme::snap_len(output.galley_pos.x + r1.min.x, ppp),
+                            crate::theme::snap_len(output.galley_pos.y + r0.max.y, ppp),
+                        ),
+                    );
+                    ui.painter().rect_filled(rect, 2.0, bracket_fill[k]);
+                    ui.painter().rect_stroke(
+                        rect,
+                        2.0,
+                        egui::Stroke::new(1.0_f32, bracket_edge[k]),
+                    );
+                }
+
+                // ── 複数キャレット: 追加キャレットの縦線と選択範囲の背景 ──
+                //
+                // egui は主キャレットしか描かないので、残りをここで塗る。
+                // 主キャレットぶんは egui が既に描いている (点滅する) ので
+                // 二重塗りを避けて飛ばす。追加キャレットは**点滅させない** —
+                // 点滅は毎フレームの再描画要求で、設計原則 3 に反する。
+                if !multi_spans.is_empty() {
+                    let primary = output.cursor_range.map(|cr| {
+                        let (a, b) = (cr.primary.ccursor.index, cr.secondary.ccursor.index);
+                        (a.min(b), a.max(b))
+                    });
+                    let gp = output.galley_pos.to_vec2();
+                    let rows = &output.galley.rows;
+                    let last_row = rows.len().saturating_sub(1);
+                    let focused = output.response.has_focus();
+                    // 改行が選ばれていることを示す幅 (VS Code と同じ見せ方)
+                    let nl_w = char_w * 0.5;
+                    for (s, e) in &multi_spans {
+                        if primary == Some((*s, *e)) {
+                            continue;
+                        }
+                        let c0 = output.galley.from_ccursor(egui::text::CCursor::new(*s));
+                        let c1 = output.galley.from_ccursor(egui::text::CCursor::new(*e));
+                        let q0 = output.galley.pos_from_cursor(&c0);
+                        let q1 = output.galley.pos_from_cursor(&c1);
+                        let r0 = c0.rcursor.row.min(last_row);
+                        let r1 = c1.rcursor.row.min(last_row).max(r0);
+                        if s != e && !rows.is_empty() {
+                            // 跨いだ行の矩形だけを取り出す (巨大ファイルでも O(選択行数))
+                            let span: Vec<egui::Rect> =
+                                rows[r0..=r1].iter().map(|r| r.rect).collect();
+                            for rect in selection_row_rects(&span, q0.min.x, q1.min.x, nl_w) {
+                                ui.painter()
+                                    .rect_filled(rect.translate(gp), 2.0, multi_sel_color);
+                            }
+                        }
+                        // キャレットは範囲の終端 (= タイプで伸びる側)。
+                        // フォーカスが無いときは出さない (egui の主キャレットと同じ)。
+                        if focused {
+                            ui.painter().vline(
+                                gp.x + q1.min.x,
+                                egui::Rangef::new(gp.y + q1.min.y, gp.y + q1.max.y),
+                                egui::Stroke::new(multi_caret_w, multi_caret_color),
+                            );
+                        }
+                    }
+                }
+
+                // 診断の波線。深刻度の低い順に並んでいるので、重なった場所は
+                // 後に塗る error が上に残る。可視域の外は座標だけ作って捨てる
+                // のも惜しいので、行ごとに clip_rect で先に落とす。
+                if !diag_spans.is_empty() {
+                    let clip = ui.clip_rect();
+                    let last_row = output.galley.rows.len().saturating_sub(1);
+                    for sp in diag_spans {
+                        let color = diag_colors[(sp.severity.clamp(1, 4) - 1) as usize];
+                        let c0 = output
+                            .galley
+                            .from_ccursor(egui::text::CCursor::new(sp.start));
+                        let c1 = output.galley.from_ccursor(egui::text::CCursor::new(sp.end));
+                        let row0 = c0.rcursor.row.min(last_row);
+                        let end_row = c1.rcursor.row.min(last_row);
+                        // 1 件の診断が抱える視覚行には上限を置く (巨大な範囲を
+                        // 返してくるサーバーでフレームを潰さないため)
+                        let row1 = end_row.min(row0 + diagview::SQUIGGLE_MAX_ROWS);
+                        let x0 = output.galley.pos_from_cursor(&c0).min.x;
+                        let x1 = output.galley.pos_from_cursor(&c1).min.x;
+                        for row in row0..=row1 {
+                            let Some(r) = output.galley.rows.get(row) else {
+                                break;
+                            };
+                            let y = output.galley_pos.y + r.rect.max.y - diagview::SQUIGGLE_AMP;
+                            if y < clip.top() - row_h || y > clip.bottom() + row_h {
+                                continue; // 画面外の行は描かない
+                            }
+                            let a = if row == row0 { x0 } else { r.rect.min.x };
+                            // 終端の x を使うのは**終端の行**だけ。上限で打ち切った
+                            // 行に他行の x を持ち込むと、関係ない場所へ線が伸びる。
+                            let b = if row == end_row { x1 } else { r.rect.max.x };
+                            // 範囲が次の行頭で終わる場合、その行には引くものが無い
+                            if row == end_row && row > row0 && b <= r.rect.min.x + 0.5 {
+                                continue;
+                            }
+                            // 空行や範囲の継ぎ目で幅 0 になったら 1 文字ぶんだけ見せる
+                            let b = if b <= a { a + char_w } else { b };
+                            // 可用領域 (= スクロール窓) からはみ出さないよう先に詰める
+                            let ax = (output.galley_pos.x + a).max(clip.left());
+                            let bx = (output.galley_pos.x + b).min(clip.right());
+                            let pts = diagview::squiggle_points(
+                                ax,
+                                bx,
+                                y,
+                                diagview::SQUIGGLE_AMP,
+                                diagview::SQUIGGLE_WAVE,
+                                ppp,
+                            );
+                            if pts.len() >= 2 {
+                                ui.painter()
+                                    .add(egui::Shape::line(pts, egui::Stroke::new(1.0_f32, color)));
+                            }
+                        }
+                    }
+                }
+
+                // ── Alt+クリック / Alt+ドラッグ ────────────────────────
+                //
+                // `Modifiers::alt` は macOS では ⌥、Windows/Linux では Alt に
+                // 写る (egui-winit が正規化する) ので OS 分岐は要らない。
+                // 折りたたみ中は char 添字が原文とずれるので受け付けない。
+                if !folding {
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    let to_char = |p: egui::Pos2| {
+                        output
+                            .galley
+                            .cursor_from_pos(p - output.galley_pos)
+                            .ccursor
+                            .index
+                    };
+                    multi_ptr = if alt && output.response.drag_started() {
+                        // egui はしきい値ぶん動いてからドラッグと判定するので、
+                        // 始点は「押した点」を使う (数ピクセルずれた桁を掴まない)
+                        ui.input(|i| i.pointer.press_origin())
+                            .or_else(|| output.response.interact_pointer_pos())
+                            .map(|p| MultiPointer::DragStart(to_char(p)))
+                    } else if alt && output.response.dragged() {
+                        output
+                            .response
+                            .interact_pointer_pos()
+                            .map(|p| MultiPointer::Drag(to_char(p)))
+                    } else if alt && output.response.clicked() {
+                        output
+                            .response
+                            .interact_pointer_pos()
+                            .map(|p| MultiPointer::Click(to_char(p)))
+                    } else if output.response.drag_stopped() {
+                        Some(MultiPointer::DragEnd)
+                    } else if output.response.clicked() || output.response.drag_started() {
+                        // Alt 無しのポインタ操作は複数キャレットを解除する
+                        Some(MultiPointer::Clear)
+                    } else {
+                        None
+                    };
+                }
+
                 if let Some(cr) = output.cursor_range {
                     // 選択範囲 (char 添字)。折りたたみ中は表示テキストの添字に
                     // なってしまうので、LSP へ渡せる形ではないため None のまま。
@@ -17189,6 +19512,42 @@ impl ZaivernApp {
                         None => line,
                     };
                     cursor_out = Some((line, col));
+
+                    // 行末の診断メッセージ (VS Code の Error Lens 相当)。
+                    // **キャレット行だけ** — 全行に出すと本文の右側が文章で
+                    // 埋まる。設定 `inline_diagnostics` で消せる。
+                    if inline_diag_on && !diag_items.is_empty() && char_w > 0.0 {
+                        let row = output
+                            .galley
+                            .from_ccursor(egui::text::CCursor::new(idx))
+                            .rcursor
+                            .row;
+                        if let Some(r) = output.galley.rows.get(row) {
+                            let clip = ui.clip_rect();
+                            let x = output.galley_pos.x + r.rect.max.x + char_w * 2.0;
+                            // 残り幅に収まる文字数までしか出さない (行が見切れない)
+                            let max_chars =
+                                (((clip.right() - x) / char_w).floor()).max(0.0) as usize;
+                            if let Some((msg, sev)) =
+                                diagview::inline_message(&diag_items, line - 1, max_chars)
+                            {
+                                let color = diag_colors[(sev.clamp(1, 4) - 1) as usize];
+                                ui.painter().text(
+                                    egui::pos2(
+                                        crate::theme::snap_len(x, ppp),
+                                        crate::theme::snap_len(
+                                            output.galley_pos.y + r.rect.center().y,
+                                            ppp,
+                                        ),
+                                    ),
+                                    Align2::LEFT_CENTER,
+                                    msg,
+                                    font.clone(),
+                                    color.gamma_multiply(0.75),
+                                );
+                            }
+                        }
+                    }
                 }
 
                 // Enter 直後の自動インデント
@@ -17224,6 +19583,7 @@ impl ZaivernApp {
                 caret_at,
                 hover_hit,
                 sel_out,
+                multi_ptr,
             )
         };
 
@@ -17246,7 +19606,8 @@ impl ZaivernApp {
             sa.show(ui, body_ui)
         };
 
-        let (cursor_out, changed, text_top, text_left, caret_at, hover_hit, sel_out) = inner.inner;
+        let (cursor_out, changed, text_top, text_left, caret_at, hover_hit, sel_out, multi_ptr) =
+            inner.inner;
 
         // 行番号ガター: git マークで行ごとに色分けした galley をキャッシュ。
         // 折り返し OFF は論理行と 1:1。ON は本文 galley の視覚行に合わせ、
@@ -17706,14 +20067,14 @@ impl ZaivernApp {
                 let src = self.editor.buffers[active].text.clone();
                 let next = splice_fold_edit(&src, &disp_cut, &disp_prev, &d);
                 let (at, delta) = fold_edit_shift(&src, &next, &disp_cut, &disp_prev, &d);
+                let ed = self.edit_typed();
                 let b = &mut self.editor.buffers[active];
                 if delta != 0 {
                     b.folds.shift_lines(at, delta);
                     b.bookmarks.shift_lines(at, delta);
                 }
-                b.text = next;
-                b.cache = None;
-                b.gutter = None;
+                // 折りたたみ表示への打鍵も原文側の履歴へ 1 段として積む
+                b.apply_edit(next, ed);
                 // 表示テキストは次フレームで作り直す
                 self.fold_view = None;
                 spliced = true;
@@ -17750,20 +20111,52 @@ impl ZaivernApp {
         self.caret_screen = caret_at;
         match hover_hit {
             Some((idx, p)) => {
-                self.lsp_hover_pos = Some(p);
                 let src_idx = if disp_cut_len == 0 {
                     idx
                 } else {
                     fold_display_to_source(&hover_cut, idx)
                 };
-                let t = &self.editor.buffers[active].text;
-                let byte = editor_ops::char_to_byte(t, src_idx.min(t.chars().count()));
-                self.hover_doc_pos = Some(lsp::byte_index_to_lsp_pos(t, byte));
+                // 波線の上なら診断を出す。**LSP ホバーとは排他** —
+                // 同じ場所に説明を 2 枚重ねない (要求そのものを送らない)。
+                let hit = diagview::diag_at(&self.diag_cache.spans, src_idx)
+                    .and_then(|n| self.diag_cache.get(n))
+                    .map(|d| (diagview::labeled_message(d), d.severity));
+                match hit {
+                    Some((msg, sev)) => {
+                        self.diag_hover = Some((msg, sev, p));
+                        self.hover_doc_pos = None;
+                        self.lsp_hover_pos = None;
+                        self.lsp_hover.dismiss();
+                    }
+                    None => {
+                        self.diag_hover = None;
+                        self.lsp_hover_pos = Some(p);
+                        let t = &self.editor.buffers[active].text;
+                        let byte = editor_ops::char_to_byte(t, src_idx.min(t.chars().count()));
+                        self.hover_doc_pos = Some(lsp::byte_index_to_lsp_pos(t, byte));
+                    }
+                }
             }
             None => {
+                self.diag_hover = None;
                 self.lsp_hover_pos = None;
                 self.lsp_hover.dismiss();
             }
+        }
+
+        // 複数キャレットのポインタ操作を反映する (描画中はバッファを可変借用
+        // しているので `self` を触れない。拾った操作をここで当てる)。
+        if let Some(ev) = multi_ptr {
+            self.apply_multi_pointer(active, ev, tab_w, prev_caret);
+        }
+
+        // 単一キャレットの編集 (= `TextEdit` 自身の打鍵や整形の差し込み) が
+        // 入ったら複数キャレットは捨てる。バイト位置がずれた集合を持ち越すと
+        // 本文を壊す。複数キャレット経由の編集は `TextEdit` を通らないので
+        // `changed` は立たず、ここでは消えない。
+        if (changed || spliced) && self.multi_sel.is_some() {
+            self.multi_sel = None;
+            self.multi_sticky_col = None;
         }
 
         // LSP: テキストが変わったらデバウンスして did_change を予約
@@ -17789,12 +20182,16 @@ impl ZaivernApp {
 
         if self.palette.is_command_mode() {
             self.palette_items_command_mode(&pq, &mut items);
+        } else if self.palette.is_symbol_mode() {
+            self.palette_items_symbol_mode(&pq, &mut items);
+        } else if self.palette.is_goto_mode() {
+            self.palette_items_goto_mode(&mut items);
         } else if self.palette.is_agent_mode() {
             self.palette_items_agent_mode(&pq, &mut items);
         } else if self.palette.is_root_mode() {
             self.palette_items_root_mode(&pq, &mut items);
         } else {
-            self.palette_items_file_mode(&pq, &mut items);
+            self.palette_items_file_mode(&mut items);
         }
 
         // 並べ替え・件数の頭打ち・グループ分け・空/不一致の見せ方は
@@ -17989,6 +20386,36 @@ impl ZaivernApp {
                 Cmd::OpenGitPanel,
             ),
             (
+                "✔".into(),
+                tr("Git: ステージした変更をコミット…"),
+                String::new(),
+                Cmd::GitCommit(false),
+            ),
+            (
+                "✔".into(),
+                tr("Git: すべての変更をコミット…"),
+                String::new(),
+                Cmd::GitCommit(true),
+            ),
+            (
+                "⬆".into(),
+                tr("Git: push (origin へ)"),
+                String::new(),
+                Cmd::GitPush,
+            ),
+            (
+                "⬇".into(),
+                tr("Git: pull (早送りのみ)"),
+                String::new(),
+                Cmd::GitPull,
+            ),
+            (
+                "🕘".into(),
+                tr("Git: コミット履歴"),
+                String::new(),
+                Cmd::GitHistory,
+            ),
+            (
                 "👾".into(),
                 tr("現在のファイルをエージェントに送信 (@path)"),
                 String::new(),
@@ -18160,6 +20587,24 @@ impl ZaivernApp {
                 Cmd::CloseAllTabs,
             ),
             (
+                "📌".into(),
+                tr("タブのピン留めを切り替える"),
+                String::new(),
+                Cmd::TogglePinTab,
+            ),
+            (
+                "📑".into(),
+                tr("タブ切替を 最近使った順 / 並び順 で切り替える"),
+                String::new(),
+                Cmd::ToggleTabSwitchMru,
+            ),
+            (
+                "📄".into(),
+                tr("プレビュータブの切替"),
+                String::new(),
+                Cmd::TogglePreviewTabs,
+            ),
+            (
                 "🔎".into(),
                 tr("ファイル間で検索"),
                 fmt_key(BindAction::GlobalSearch),
@@ -18244,6 +20689,24 @@ impl ZaivernApp {
                 tr("問題パネルの切替"),
                 fmt_key(BindAction::ToggleProblems),
                 Cmd::ToggleProblems,
+            ),
+            (
+                "⤓".into(),
+                tr("次の問題へ"),
+                fmt_key(BindAction::NextProblem),
+                Cmd::NextProblem,
+            ),
+            (
+                "⤒".into(),
+                tr("前の問題へ"),
+                fmt_key(BindAction::PrevProblem),
+                Cmd::PrevProblem,
+            ),
+            (
+                "💬".into(),
+                tr("行末の診断メッセージ切替"),
+                String::new(),
+                Cmd::ToggleInlineDiagnostics,
             ),
             // ── 第 2 次配線: レビュー / 折りたたみ / ブックマーク / 表 / LSP ──
             (
@@ -18746,6 +21209,26 @@ impl ZaivernApp {
                 Cmd::NewAgent(i),
             ));
         }
+        // worktree 隔離での起動。git リポジトリでないフォルダでは候補ごと出さない
+        // (押しても必ず失敗するコマンドをパレットに並べない)。
+        if worktree::looks_like_git_repo(&self.agent_cwd()) {
+            for (i, p) in self.cfg.agents.iter().enumerate() {
+                cmds.push((
+                    "🌿".into(),
+                    trf("worktree 隔離で起動: {name}", &[("name", p.name.clone())]),
+                    tr("専用ブランチ agent/… を切って、そこを作業フォルダにする"),
+                    Cmd::NewAgentIsolated(i),
+                ));
+            }
+        }
+        if self.agents.running_count() > 0 {
+            cmds.push((
+                "🛑".into(),
+                tr("全エージェントを停止"),
+                tr("稼働中のエージェントをプロセスツリーごと止めます（確認あり）"),
+                Cmd::StopAllAgents,
+            ));
+        }
         for (i, s) in self.agents.sessions.iter().enumerate() {
             cmds.push((
                 s.icon.clone(),
@@ -18867,22 +21350,73 @@ impl ZaivernApp {
     }
 
     /// パレット: ファイル検索モードの候補を items へ積む。
-    fn palette_items_file_mode(&self, pq: &fuzzy::PreparedQuery, items: &mut Vec<Item>) {
-        for f in &self.file_index {
-            // マッチはルート相対パスに対して行い、単一ルート時と同じ
-            // あいまい検索の品質を保つ。表示 (detail) は曖昧回避済みラベル、
-            // 実際に開くのは絶対パス。
-            if let Some(score) = pq.score(&f.rel) {
-                let name = f.rel.rsplit('/').next().unwrap_or(&f.rel).to_string();
-                items.push(Item {
-                    icon: file_tree::icon_for(&name).to_string(),
-                    label: name,
-                    detail: f.label.clone(),
-                    action: Action::OpenFile(f.abs.clone()),
-                    score,
-                });
-            }
+    ///
+    /// VS Code の ⌘P と同じで、**何も打っていないときは「最近開いた順」**。
+    /// 索引の残りはその後ろにアルファベット順で続く (並べ替えは palette 側)。
+    /// `ファイル名:123[:45]` と書くとその位置を開く候補になる。
+    fn palette_items_file_mode(&self, items: &mut Vec<Item>) {
+        // ランキングは純粋関数に閉じる (テーブルテストで固定できるように)。
+        // クエリは `:行` を剥がしてから作り直すので、ここでは共有 pq を使わない。
+        items.extend(file_mode_items(
+            &self.file_index,
+            &self.menu_state.recent_files,
+            self.active_file_path().as_deref(),
+            self.palette.query(),
+        ));
+    }
+
+    /// パレット: `@` シンボルモード。
+    ///
+    /// **新しい LSP 経路は作らない** — ⌘⇧O のピッカーと同じ
+    /// `textDocument/documentSymbol` の結果 (`self.lsp_symbols`) を読むだけ。
+    /// 要求は `palette_ui` が `request_breadcrumb_symbols` 経由で静かに出す。
+    fn palette_items_symbol_mode(&self, pq: &fuzzy::PreparedQuery, items: &mut Vec<Item>) {
+        let Some(path) = self.active_file_path() else {
+            return;
+        };
+        if self.lsp_symbols_path.as_deref() != Some(path.as_path()) {
+            return; // 別ファイルの結果は出さない (取り違え防止)
         }
+        let mut flat: Vec<(usize, String, u8, lsp::Position)> = Vec::new();
+        flatten_symbols(&self.lsp_symbols, 0, &mut flat);
+        for (depth, name, kind, pos) in flat.into_iter().take(MAX_SYMBOL_ROWS) {
+            let Some(score) = pq.score(&name) else {
+                continue;
+            };
+            items.push(Item {
+                icon: "◇".into(),
+                label: name,
+                detail: format!("{}{}", "  ".repeat(depth), symbol_kind_label(kind)),
+                action: Action::Cmd(Cmd::GoToLspPos(pos.line, pos.character)),
+                // 浅い階層 (トップレベルの定義) を上に出す
+                score: score - (depth as i32 * 5),
+            });
+        }
+    }
+
+    /// パレット: `:123` / `:123:45` の行 (列) ジャンプ。
+    ///
+    /// パースは `editor_ops::parse_goto` ただ 1 本 (⌃G の小窓と同じもの)。
+    /// 行数を超える値・0 行目は `char_index_at` が末尾へ丸めるので、
+    /// ここでクランプはしない (二重の丸めは挙動を読みにくくする)。
+    fn palette_items_goto_mode(&self, items: &mut Vec<Item>) {
+        let Some((line, col)) = editor_ops::parse_goto(self.palette.query()) else {
+            return;
+        };
+        if self.editor.active.is_none() {
+            return;
+        }
+        items.push(Item {
+            icon: "↧".into(),
+            label: trf("{line} 行目へ移動", &[("line", (line + 1).to_string())]),
+            detail: if col > 0 {
+                trf("{col} 桁目", &[("col", (col + 1).to_string())])
+            } else {
+                String::new()
+            },
+            action: Action::Cmd(Cmd::GoToLineAt(line, col)),
+            score: 0,
+        });
     }
 
     /// 各ルートの git worktree 一覧。パレットを開いている間だけキャッシュされる。
@@ -18944,8 +21478,35 @@ impl ZaivernApp {
         if self.palette.is_root_mode() && self.palette_worktrees.is_none() {
             self.palette_worktrees = Some(self.list_git_worktrees());
         }
+        // `@` モードは ⌘⇧O のピッカーと同じ documentSymbol の結果を読む。
+        // 無ければ静かに取りに行く (ピッカーは開かない = 画面は急に変わらない)。
+        if self.palette.is_symbol_mode() {
+            if let Some(p) = self.active_file_path() {
+                self.request_breadcrumb_symbols(&p);
+            }
+        }
+        // 復元した MRU (state.toml) に実体を結び直す。組み込みコマンド表は
+        // パレットを開いている間しか作らないので、ここが唯一の機会。
+        if self.palette.needs_rehydrate() {
+            let table: Vec<(String, String, Cmd)> = self
+                .palette_builtin_cmds()
+                .into_iter()
+                .map(|(icon, label, _, cmd)| (icon, label, cmd))
+                .collect();
+            self.palette.rehydrate(|label| {
+                table
+                    .iter()
+                    .find(|(_, l, _)| l == label)
+                    .map(|(icon, _, cmd)| (icon.clone(), Action::Cmd(cmd.clone())))
+            });
+        }
         let theme = self.theme.clone();
         let results = self.palette_items();
+        // ⌘P 連打で 1 つずつ下へ (端で先頭へ折り返す)。
+        let cycles = self.palette.take_cycle();
+        if cycles > 0 {
+            self.palette.selected = crate::palette::cycle(&results, self.palette.selected, cycles);
+        }
         let mut execute: Option<Item> = None;
         let mut close = false;
 
@@ -18973,7 +21534,7 @@ impl ZaivernApp {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.palette.input)
                                 .hint_text(tr(
-                                    "ファイル検索…  （> コマンド / @ エージェント / # worktree）",
+                                    "ファイル検索…  （> コマンド / @ シンボル / :行 / % エージェント / # worktree）",
                                 ))
                                 .font(FontId::proportional(16.0))
                                 .desired_width(f32::INFINITY),
@@ -19014,6 +21575,22 @@ impl ZaivernApp {
                             resp.request_focus();
                         }
 
+                        // ファイル検索モードのときは索引の状態を必ず出す
+                        // (作成中か、上限で打ち切ったか)。黙って切らない。
+                        if !self.palette.is_command_mode()
+                            && !self.palette.is_agent_mode()
+                            && !self.palette.is_root_mode()
+                        {
+                            if let Some(note) = self.index_note() {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(note).size(11.5).color(theme.warn),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+                        }
                         ui.add_space(6.0);
                         egui::ScrollArea::vertical()
                             .id_salt("palette-list")
@@ -19026,7 +21603,7 @@ impl ZaivernApp {
                                     &theme,
                                     &results,
                                     self.palette.selected,
-                                    down || up,
+                                    down || up || cycles > 0,
                                 ) {
                                     execute = Some(it);
                                     close = true;
@@ -19042,8 +21619,25 @@ impl ZaivernApp {
         if let Some(it) = execute {
             // 使った実績を憶えて次回の並びに効かせる (よく使う操作が上がる)。
             self.palette.note_used(&it);
+            self.persist_palette_recent();
             self.run_action(it.action, ctx);
         }
+    }
+
+    /// パレットの MRU を state.toml へ書き戻す。**変わったときだけ**書く
+    /// (ファイルを開いただけで毎回ディスクを触らない)。
+    fn persist_palette_recent(&mut self) {
+        let now: Vec<config::PaletteRecent> = self
+            .palette
+            .recent_snapshot()
+            .into_iter()
+            .map(|(label, icon, uses)| config::PaletteRecent { label, icon, uses })
+            .collect();
+        if now == self.cfg.palette_recent {
+            return;
+        }
+        self.cfg.palette_recent = now;
+        config::save_state(&self.cfg);
     }
 
     // ─── UI: modals & toasts ────────────────────────────────────────
@@ -19126,7 +21720,6 @@ impl ZaivernApp {
         }
     }
 
-    /// ファイルツリーからの削除の確認モーダル。
     // ─── ファイル操作の確認と実行 ─────────────────────────────────
     //
     // **この節の不変条件**: 復元できない fs 操作 (完全削除・置き換えのための
@@ -19138,15 +21731,19 @@ impl ZaivernApp {
     //   transfer_confirm_ui → drain_transfer → run_transfer_item → replace_dest
 
     /// 削除の確認 (VS Code の「ゴミ箱に移動しますか?」/「完全に削除しますか?」)。
-    /// キャンセルすると**1 バイトも書き換わらない**。
+    /// **複数選択に対応**し、キャンセルすると 1 バイトも書き換わらない。
     fn delete_confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(req) = self.pending_delete.clone() else {
             return;
         };
-        let path = req.path.clone();
-        let name = self.path_label(&path);
+        let paths = req.paths.clone();
+        let Some(first) = paths.first().cloned() else {
+            self.pending_delete = None;
+            return;
+        };
+        let name = self.path_label(&first);
         // is_dir はリンク先を辿るので、種類の判定はリンク自身を見る
-        let md = std::fs::symlink_metadata(&path).ok();
+        let md = std::fs::symlink_metadata(&first).ok();
         let is_dir = md.as_ref().is_some_and(|m| m.is_dir());
         let is_link = md.as_ref().is_some_and(|m| m.file_type().is_symlink());
         let warn = self.theme.warn;
@@ -19158,13 +21755,24 @@ impl ZaivernApp {
         } else {
             tr("ゴミ箱へ移動")
         };
+        // 一覧に出すラベルは先に作る (クロージャの中で self を借りないため)
+        let listed: Vec<(String, String)> = paths
+            .iter()
+            .take(8)
+            .map(|p| (self.rel_label(p), p.display().to_string()))
+            .collect();
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_max_width(440.0);
-                let what = if is_link {
+                let what = if paths.len() > 1 {
+                    trf(
+                        "選択中の {n} 件(フォルダは中身ごと)",
+                        &[("n", paths.len().to_string())],
+                    )
+                } else if is_link {
                     trf("リンク「{name}」", &[("name", name.clone())])
                 } else if is_dir {
                     trf("フォルダ(中身ごと)「{name}」", &[("name", name.clone())])
@@ -19176,6 +21784,26 @@ impl ZaivernApp {
                 } else {
                     trf("{what} をゴミ箱へ移動しますか？", &[("what", what)])
                 });
+                // 何を消すのかを必ず見せる (長いパスは省略してホバーで全文)
+                if paths.len() > 1 {
+                    ui.add_space(4.0);
+                    for (label, full) in &listed {
+                        ui.add(
+                            egui::Label::new(RichText::new(format!("• {label}")).small())
+                                .truncate(),
+                        )
+                        .on_hover_text(full);
+                    }
+                    if paths.len() > listed.len() {
+                        ui.label(
+                            RichText::new(trf(
+                                "ほか {n} 件",
+                                &[("n", (paths.len() - listed.len()).to_string())],
+                            ))
+                            .small(),
+                        );
+                    }
+                }
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(if req.permanent {
@@ -19204,7 +21832,7 @@ impl ZaivernApp {
 
         match decided {
             Some(true) => {
-                self.perform_delete(&path, req.permanent);
+                self.perform_delete(&paths, req.permanent);
                 self.pending_delete = None;
             }
             Some(false) => self.pending_delete = None,
@@ -19214,39 +21842,82 @@ impl ZaivernApp {
 
     /// 削除の実体。**`delete_confirm_ui` の「はい」からしか呼ばない。**
     ///
-    /// ゴミ箱へ送れなかったときに完全削除へ落ちることは決してしない
-    /// (理由を出して止まる = 黙ってデータを消さない)。
-    fn perform_delete(&mut self, path: &Path, permanent: bool) {
-        let name = self.path_label(path);
-        if !permanent {
-            match file_tree::trash::send(path) {
-                Ok(restore_from) => {
-                    self.after_delete(path);
-                    match restore_from {
-                        Some(rf) => {
-                            self.push_file_op(FileOp::Trash {
-                                original: path.to_path_buf(),
-                                restore_from: rf,
-                            });
-                            self.toast(
-                                trf("🗑 {name} をゴミ箱へ移動しました", &[("name", name)]),
-                                true,
-                            );
-                        }
-                        // Windows のごみ箱は中の場所を返さないので取り消せない
-                        None => self.toast_warn(trf(
-                            "🗑 {name} をゴミ箱へ移動しました (復元はごみ箱から)",
-                            &[("name", name)],
-                        )),
-                    }
+    /// 2 系統を `delete_to_trash` / `delete_permanently` に分けてあるのは、
+    /// **「戻せるもの」と「戻せないもの」を関数の境界で分ける**ため。
+    /// 履歴へ積むのは前者の戻り値だけなので、完全削除が誤って
+    /// 「取り消せる」ことになる余地が構造的に無い。
+    fn perform_delete(&mut self, paths: &[PathBuf], permanent: bool) {
+        let one = paths.len() == 1;
+        let name = paths
+            .first()
+            .map(|p| self.path_label(p))
+            .unwrap_or_default();
+        let mut ok = 0usize;
+        let mut trashed: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut unrestorable = 0usize;
+        let mut last_err: Option<String> = None;
+
+        for path in paths {
+            if permanent {
+                match self.delete_permanently(path) {
+                    Ok(()) => ok += 1,
+                    Err(e) => last_err = Some(e),
                 }
-                Err(e) => self.toast(e, false),
+                continue;
             }
-            return;
+            match self.delete_to_trash(path) {
+                Ok(Some(rf)) => {
+                    ok += 1;
+                    trashed.push((path.clone(), rf));
+                }
+                // Windows のごみ箱は中の場所を返さないので取り消せない
+                Ok(None) => {
+                    ok += 1;
+                    unrestorable += 1;
+                }
+                Err(e) => last_err = Some(e),
+            }
         }
-        // 完全削除。シンボリックリンクはリンク自体を消す (is_dir はリンク先を
-        // 辿るため、ディレクトリへのリンクを remove_dir_all に渡すと
-        // "Not a directory" で必ず失敗する)
+
+        // 履歴へ積むのはゴミ箱行きだけ (完全削除は戻せないので積まない)
+        if !trashed.is_empty() {
+            self.push_file_op(FileOp::Trash { items: trashed });
+        }
+        if ok > 0 {
+            let msg = if permanent {
+                if one {
+                    trf("🗑 {name} を削除しました", &[("name", name.clone())])
+                } else {
+                    trf("🗑 {n} 件を削除しました", &[("n", ok.to_string())])
+                }
+            } else if one {
+                trf("🗑 {name} をゴミ箱へ移動しました", &[("name", name.clone())])
+            } else {
+                trf("🗑 {n} 件をゴミ箱へ移動しました", &[("n", ok.to_string())])
+            };
+            if unrestorable > 0 {
+                self.toast_warn(msg);
+            } else {
+                self.toast(msg, true);
+            }
+        }
+        if let Some(e) = last_err {
+            self.toast(e, false);
+        }
+    }
+
+    /// 1 件をゴミ箱へ送る。戻り値は「ゴミ箱の中の実体」= 取り消しで戻せる場所。
+    /// **送れなければ何も消さずに理由を返す** (完全削除へは決して落ちない)。
+    fn delete_to_trash(&mut self, path: &Path) -> Result<Option<PathBuf>, String> {
+        let restore_from = file_tree::trash::send(path)?;
+        self.after_delete(path);
+        Ok(restore_from)
+    }
+
+    /// 1 件を完全に削除する。**戻せないので履歴へは何も積まない。**
+    /// シンボリックリンクはリンク自体を消す (is_dir はリンク先を辿るため、
+    /// ディレクトリへのリンクを remove_dir_all に渡すと必ず失敗する)。
+    fn delete_permanently(&mut self, path: &Path) -> Result<(), String> {
         let md = std::fs::symlink_metadata(path).ok();
         let is_link = md.as_ref().is_some_and(|m| m.file_type().is_symlink());
         let is_dir = md.as_ref().is_some_and(|m| m.is_dir());
@@ -19255,14 +21926,9 @@ impl ZaivernApp {
         } else {
             std::fs::remove_dir_all(path)
         };
-        match res {
-            Ok(()) => {
-                self.after_delete(path);
-                // 完全削除は戻せないので履歴へ積まない
-                self.toast(trf("🗑 {name} を削除しました", &[("name", name)]), true);
-            }
-            Err(e) => self.toast(trf("削除できません: {e}", &[("e", e.to_string())]), false),
-        }
+        res.map_err(|e| trf("削除できません: {e}", &[("e", e.to_string())]))?;
+        self.after_delete(path);
+        Ok(())
     }
 
     /// 消えた/動いたパスの後始末: 開いていたタブを畳み、ツリーを作り直す。
@@ -19545,10 +22211,8 @@ impl ZaivernApp {
                     break;
                 }
                 let item = q.items[q.idx].clone();
-                let answer = match item.clash {
-                    None => Some(true),
-                    Some(_) => q.answer.take().or(q.apply_all),
-                };
+                // 判定は純粋関数へ寄せる (テストで固定してある唯一の実装)
+                let answer = file_tree::queue_answer(item.clash, q.answer.take(), q.apply_all);
                 (item, answer)
             };
             match answer {
@@ -19792,16 +22456,25 @@ impl ZaivernApp {
                     &[("n", pairs.len().to_string())],
                 ))
             }
-            FileOp::Trash {
-                original,
-                restore_from,
-            } => {
-                self.move_back(restore_from, original)?;
-                self.tree.select(original);
-                Ok(trf(
-                    "↩ ゴミ箱から戻しました: {name}",
-                    &[("name", self.path_label(original))],
-                ))
+            FileOp::Trash { items } => {
+                // 後から捨てたものから戻す
+                for (original, restore_from) in items.iter().rev() {
+                    self.move_back(restore_from, original)?;
+                }
+                if let Some((original, _)) = items.first() {
+                    self.tree.select(original);
+                }
+                Ok(if items.len() == 1 {
+                    trf(
+                        "↩ ゴミ箱から戻しました: {name}",
+                        &[("name", self.path_label(&items[0].0))],
+                    )
+                } else {
+                    trf(
+                        "↩ ゴミ箱から {n} 件を戻しました",
+                        &[("n", items.len().to_string())],
+                    )
+                })
             }
             FileOp::Create { path, .. } => {
                 // 作成の取り消し = 消す。**必ず復元できる形 (ゴミ箱) でだけ行う。**
@@ -19811,12 +22484,10 @@ impl ZaivernApp {
                         &[("name", self.path_label(path))],
                     ));
                 }
-                let restore_from = file_tree::trash::send(path)?;
-                self.after_delete(path);
+                let restore_from = self.delete_to_trash(path)?;
                 if let Some(rf) = restore_from {
                     self.push_file_op(FileOp::Trash {
-                        original: path.clone(),
-                        restore_from: rf,
+                        items: vec![(path.clone(), rf)],
                     });
                 }
                 Ok(trf(
@@ -20400,10 +23071,10 @@ impl ZaivernApp {
             })
             .to_string();
         }
+        let ed = self.edit_step();
         let b = &mut self.editor.buffers[active];
-        b.text = text.to_string();
-        b.cache = None;
-        b.gutter = None;
+        // スマホ側からの差し替えも PC 側で ⌘Z 1 回で戻せるようにする
+        b.apply_edit(text.to_string(), ed);
         if !save {
             return json!({"ok": true, "dirty": b.dirty()}).to_string();
         }
@@ -20423,7 +23094,7 @@ impl ZaivernApp {
         let was = b.encoding;
         match b.write_to(&path) {
             Ok(promoted) => {
-                b.saved_hash = hash_str(&b.text);
+                b.mark_saved();
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 let enc = b.encoding.label();
@@ -20573,7 +23244,8 @@ impl ZaivernApp {
         use serde_json::json;
         if i < self.editor.buffers.len() {
             self.editor.active = Some(i);
-            self.find.last = None;
+            self.find.current = None;
+            self.find_hits = None;
             json!({"ok": true}).to_string()
         } else {
             json!({"ok": false, "error": "タブがありません"}).to_string()
@@ -22090,6 +24762,134 @@ impl ZaivernApp {
     }
 
     /// 前任セッションを止める提案の確認モーダル。
+    /// 全エージェント一括停止の確認モーダル (破壊的操作なので必ず通す)。
+    fn stop_all_confirm_ui(&mut self, ctx: &egui::Context) {
+        if !self.pending_stop_all {
+            return;
+        }
+        let running = self.agents.running_count();
+        if running == 0 {
+            self.pending_stop_all = false;
+            return;
+        }
+        let warn = self.theme.warn;
+        let mut decided: Option<bool> = None;
+        egui::Window::new(tr("全エージェントの停止"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(trf(
+                    "稼働中の {n} 体をすべて停止します。作業中の内容は失われる可能性があります。",
+                    &[("n", running.to_string())],
+                ));
+                ui.label(
+                    RichText::new(tr(
+                        "タブは残るので、あとから ⟳ で同じ場所から起動し直せます。",
+                    ))
+                    .small(),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new(tr("🛑 全部停止する")).color(warn))
+                        .clicked()
+                    {
+                        decided = Some(true);
+                    }
+                    if ui.button(tr("キャンセル")).clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+        match decided {
+            Some(true) => {
+                self.pending_stop_all = false;
+                let n = self.agents.stop_all();
+                self.toast(
+                    trf("🛑 {n} 体を停止しました", &[("n", n.to_string())]),
+                    true,
+                );
+            }
+            Some(false) => self.pending_stop_all = false,
+            None => {}
+        }
+    }
+
+    /// 閉じたエージェントに割り当てられていた worktree をどうするかの確認モーダル。
+    ///
+    /// **既定は「残す」側**。未コミットの変更があるときは何が失われるかを本文に
+    /// 明示し、削除ボタンだけを警告色にする (`git worktree remove --force` は
+    /// ここを通ったときにしか撃たれない)。
+    fn worktree_confirm_ui(&mut self, ctx: &egui::Context) {
+        let Some((wt, dirty)) = self.pending_worktree.clone() else {
+            return;
+        };
+        let warn = self.theme.warn;
+        let body = worktree::removal_prompt(&wt.branch, &wt.dir, dirty);
+        let mut decided: Option<bool> = None;
+        egui::Window::new(tr("worktree の後始末"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.label(body);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(tr("🌿 残す"))
+                        .on_hover_text(tr(
+                            "worktree とブランチをそのまま残します（あとで自分でマージ・削除できます）",
+                        ))
+                        .clicked()
+                    {
+                        decided = Some(false);
+                    }
+                    let del = if dirty {
+                        tr("🗑 変更ごと削除する")
+                    } else {
+                        tr("🗑 削除する")
+                    };
+                    if ui
+                        .button(RichText::new(del).color(warn))
+                        .on_hover_text(tr("worktree のフォルダとブランチを削除します"))
+                        .clicked()
+                    {
+                        decided = Some(true);
+                    }
+                });
+            });
+        match decided {
+            Some(true) => {
+                self.pending_worktree = None;
+                match worktree::remove_agent_worktree(&wt, dirty) {
+                    Ok(()) => self.toast(
+                        trf(
+                            "🗑 worktree {branch} を削除しました",
+                            &[("branch", wt.branch.clone())],
+                        ),
+                        true,
+                    ),
+                    Err(e) => self.toast(e, false),
+                }
+                self.persist_session();
+            }
+            Some(false) => {
+                self.pending_worktree = None;
+                self.toast(
+                    trf(
+                        "🌿 worktree {branch} を残しました",
+                        &[("branch", wt.branch.clone())],
+                    ),
+                    true,
+                );
+                self.persist_session();
+            }
+            None => {}
+        }
+    }
+
     fn stop_confirm_ui(&mut self, ctx: &egui::Context) {
         if self.pending_stop.is_empty() {
             return;
@@ -22414,6 +25214,8 @@ impl ZaivernApp {
         //
         // 永続 UI 設定 (検索オプション・保存時クリーンアップ) は最初のフレームで読む
         self.load_prefs_once(ctx);
+        // バックグラウンドで作っている索引の完了を取り込む (UI は止めない)
+        self.poll_index(ctx);
 
         // 画面全体のズームは毎フレームここで egui へ揃える。値が変わって
         // いなければ何も起きない (再描画も要求されない)。
@@ -22433,6 +25235,9 @@ impl ZaivernApp {
         self.poll_voice(ctx);
 
         self.handle_shortcuts(ctx);
+        // ⌃Tab の切替は**修飾キーを離したフレーム**で確定する。
+        // ショートカット処理の直後に見る (押した同じフレームで確定させない)。
+        self.tab_switcher_tick(ctx);
         // ⌘+ホイール / トラックパッドのピンチ。egui はどちらも zoom_delta へ
         // 集約するので、ここで 1 か所だけ拾う (画像タブは自前で消費する)。
         self.handle_zoom_gesture(ctx);
@@ -22484,6 +25289,8 @@ impl ZaivernApp {
         self.autosave_tick();
         // メニュー関連の小窓 (行/列へ移動・問題・ショートカット一覧・バージョン情報)
         self.menu_windows_ui(ctx);
+        // ⌃Tab の候補一覧 (押している間だけ・画面中央の 1 枚)
+        self.tab_switcher_ui(ctx);
 
         // スマホリモートからのリクエストを処理する
         self.poll_remote(ctx);
@@ -22762,6 +25569,7 @@ impl ZaivernApp {
         self.coordinate(win_focused);
         self.quota_tick();
         self.failover_tick();
+        self.git_ops_poll();
 
         self.top_bar(ctx);
         self.status_bar(ctx);
@@ -22873,6 +25681,7 @@ impl ZaivernApp {
         self.lsp_completion_popup(ctx);
         self.lsp_signature_popup(ctx);
         self.lsp_code_actions_popup(ctx);
+        self.diag_hover_popup(ctx);
         self.lsp_hover_popup(ctx);
 
         self.palette_ui(ctx);
@@ -22883,6 +25692,8 @@ impl ZaivernApp {
         self.transfer_confirm_ui(ctx);
         self.intervention_confirm_ui(ctx, win_focused);
         self.stop_confirm_ui(ctx);
+        self.stop_all_confirm_ui(ctx);
+        self.worktree_confirm_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
         self.toasts_ui(ctx);
@@ -23266,29 +26077,187 @@ fn multi_batch_insert(
     (out, next, n)
 }
 
+// ═══ 複数キャレット: 打鍵の横取りとポインタ操作 ═══════════════════
+//
+// `TextEdit` (egui 0.29) は `CCursorRange` を 1 つしか持たないので、打鍵は
+// 主キャレット 1 本にしか入らない。そこで **`TextEdit` を描く前に**
+// イベントを抜き取り、`editor_ops` の「全キャレットへ適用」系へ流す。
+// ここに置く関数はすべて純関数 (egui の状態に触らない) なのでテストで固定できる。
+
+/// 追加キャレットを描く上限。これを超える集合 (「全ての出現を選択」で数千件) は
+/// 先頭から上限ぶんだけ塗る — 画面に出るのは可視行ぶんだけなので実害はなく、
+/// 巨大ファイルで毎フレーム数千の矩形を組むほうが害になる。
+const MULTI_PAINT_MAX: usize = 512;
+
+/// `TextEdit` へ渡す**前**に横取りする打鍵 (複数キャレットのときだけ)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MultiKey {
+    /// 確定した文字入力 (`Event::Text`)。IME 変換中 (`Event::Ime`) は含まない。
+    Text(String),
+    Backspace,
+    Delete,
+    Enter,
+}
+
+/// Alt (⌥ / Alt) 付きのポインタ操作。`TextEdit` の描画中に拾い、外側で反映する
+/// (描画中はバッファを可変借用しているので `self` を触れない)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MultiPointer {
+    /// Alt+クリック: その位置のキャレットを足す / 既にあれば取り除く。
+    Click(usize),
+    /// Alt+ドラッグ開始: 矩形選択の始点 (char 添字)。
+    DragStart(usize),
+    /// Alt+ドラッグ中: 矩形の対角 (char 添字)。
+    Drag(usize),
+    /// ドラッグ終了: 始点を捨てる。
+    DragEnd,
+    /// Alt 無しのクリック / ドラッグ: 複数キャレットを解除する (VS Code と同じ)。
+    Clear,
+}
+
+/// 1 つの入力イベントが「全キャレットへ配る打鍵」かどうか。
+///
+/// 修飾キー付き (⌘Z / ⌥⌫ / ⌃A など) は**横取りしない** — 取り消しや単語削除は
+/// egui と OS の担当で、複数キャレットの意味を持たないため。
+fn multi_key_of(e: &egui::Event) -> Option<MultiKey> {
+    match e {
+        egui::Event::Text(t) if !t.is_empty() => Some(MultiKey::Text(t.clone())),
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } if !modifiers.command && !modifiers.ctrl && !modifiers.alt => match key {
+            egui::Key::Backspace => Some(MultiKey::Backspace),
+            egui::Key::Delete => Some(MultiKey::Delete),
+            egui::Key::Enter => Some(MultiKey::Enter),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// イベント列から打鍵を**抜き取る** (残りはそのまま `TextEdit` へ流れる)。
+///
+/// 1 フレームに複数届く (速いタイプ・キーリピート) ので、順番どおり全部返す。
+/// 1 つだけ拾って残りを `TextEdit` へ流すと、あふれたぶんが主キャレットにだけ
+/// 入って本文がずれる。
+fn take_multi_keys(events: &mut Vec<egui::Event>) -> Vec<MultiKey> {
+    let mut ops = Vec::new();
+    events.retain(|e| match multi_key_of(e) {
+        Some(op) => {
+            ops.push(op);
+            false
+        }
+        None => true,
+    });
+    ops
+}
+
+/// 打鍵 1 つを全キャレットへ当てる。
+fn apply_multi_key(
+    text: &str,
+    sel: &editor_ops::MultiSel,
+    op: &MultiKey,
+) -> (String, editor_ops::MultiSel) {
+    match op {
+        MultiKey::Text(t) => editor_ops::type_at_all(text, sel, t),
+        MultiKey::Backspace => editor_ops::backspace_at_all(text, sel),
+        MultiKey::Delete => editor_ops::delete_forward_at_all(text, sel),
+        MultiKey::Enter => editor_ops::newline_at_all_detect(text, sel),
+    }
+}
+
+/// 打鍵の列を順に当てる。`(新しい本文, 新しいキャレット集合)`。
+///
+/// 呼び出し側は返った本文を **1 回だけ** `Buffer::text` へ入れること
+/// (= egui の取り消しも 1 段。`multi_batch_insert` と同じ約束)。
+fn apply_multi_keys(
+    text: &str,
+    sel: &editor_ops::MultiSel,
+    ops: &[MultiKey],
+) -> (String, editor_ops::MultiSel) {
+    let mut text = text.to_string();
+    let mut sel = sel.clone();
+    for op in ops {
+        let (t, s) = apply_multi_key(&text, &sel, op);
+        text = t;
+        sel = s;
+    }
+    (text, sel)
+}
+
+/// バイト範囲 → char 範囲 (egui のキャレットは char 添字)。
+/// 範囲外や文字境界でない値はクランプする (壊れた値でも落ちない)。
+fn byte_range_to_char_range(text: &str, r: &std::ops::Range<usize>) -> (usize, usize) {
+    let clamp = |b: usize| {
+        let mut b = b.min(text.len());
+        while b > 0 && !text.is_char_boundary(b) {
+            b -= 1;
+        }
+        b
+    };
+    let s = clamp(r.start);
+    let e = clamp(r.end).max(s);
+    let cs = text[..s].chars().count();
+    (cs, cs + text[s..e].chars().count())
+}
+
+/// 複数キャレットの**選択範囲**を視覚行ごとの矩形へ割る (galley ローカル座標)。
+///
+/// `rows` は選択が跨る視覚行の矩形だけ (先頭 = 選択開始行、末尾 = 終了行)。
+/// `x0` は開始行の x、`x1` は終了行の x。行をまたぐぶんは
+/// 「開始行は x0 から行末 + `nl_w`」「中間行は行まるごと + `nl_w`」
+/// 「終了行は行頭から x1」になる (`nl_w` は改行が選ばれていることを示す幅)。
+///
+/// 返る矩形は**必ず行の矩形の上下に収まり、互いに重ならない** (行が重ならないため)。
+/// 幅 0 に潰れた行は返さない。
+fn selection_row_rects(rows: &[egui::Rect], x0: f32, x1: f32, nl_w: f32) -> Vec<egui::Rect> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let last = rows.len() - 1;
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, rr) in rows.iter().enumerate() {
+        let left = if i == 0 { x0.max(rr.left()) } else { rr.left() };
+        let right = if i == last {
+            x1
+        } else {
+            rr.right() + nl_w.max(0.0)
+        };
+        let right = right.max(left);
+        if right - left <= 0.0 {
+            continue;
+        }
+        out.push(egui::Rect::from_min_max(
+            egui::pos2(left, rr.top()),
+            egui::pos2(right, rr.bottom()),
+        ));
+    }
+    out
+}
+
 /// char 添字 → `(行 0 起点, タブ展開後の表示桁 0 起点)`。
 ///
 /// 矩形選択は「行 × 表示桁」で長方形を作る ([`editor_ops::column_selection`])
 /// ので、egui の char キャレットをこの座標系へ移す必要がある。
 /// 添字が本文より後ろなら末尾へクランプする (壊れた値でも落ちない)。
 fn char_index_to_line_col(text: &str, char_index: usize, tab_width: usize) -> (usize, usize) {
-    let tw = tab_width.max(1);
     let (mut line, mut col) = (0usize, 0usize);
     for (n, ch) in text.chars().enumerate() {
         if n >= char_index {
             break;
         }
-        match ch {
-            '\n' => {
-                line += 1;
-                col = 0;
-            }
-            // タブは次の tab_width の倍数まで進む (エディタの表示と同じ勘定)
-            '\t' => col = (col / tw + 1) * tw,
-            // CR は表示桁を進めない (CRLF の途中に桁を作らない)
-            '\r' => {}
-            _ => col += 1,
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+            continue;
         }
+        // タブ・全角 (CJK)・結合文字の桁送りは `textenc::advance_col` に一本化する。
+        // ここだけ「1 文字 = 1 桁」で数えると、日本語の行から始めた矩形選択が
+        // `editor_ops::column_selection` の数える桁とずれる (CR は制御文字 = 0 桁
+        // なので CRLF の途中に桁を作らない、も同じ表から出てくる)。
+        col = crate::textenc::advance_col(col, ch, tab_width);
     }
     (line, col)
 }
@@ -23387,6 +26356,26 @@ fn restored_roots(current: &[PathBuf], mut saved: Vec<PathBuf>) -> Option<Vec<Pa
 /// 採用し、外れたら primary ルートへ落とす:
 /// - ディレクトリとして実在する (worktree を消した後などを弾く)
 /// - いずれかのルート配下にある (ワークスペースから外したフォルダを弾く)
+/// セッション記録から「隔離 worktree の割り当て」を復元する (純粋関数)。
+///
+/// リポジトリ・ブランチ・cwd の 3 つが揃い、**フォルダが実在するときだけ**
+/// 隔離として扱う。worktree を手で消した後に記録だけ残っている状態で
+/// `git worktree remove` を撃たないための門番でもある。
+fn restored_worktree(rec: &session::AgentSessionRec) -> Option<worktree::AgentWorktree> {
+    if rec.worktree_repo.is_empty() || rec.worktree_branch.is_empty() || rec.cwd.is_empty() {
+        return None;
+    }
+    let dir = PathBuf::from(&rec.cwd);
+    if !dir.is_dir() {
+        return None;
+    }
+    Some(worktree::AgentWorktree {
+        repo: PathBuf::from(&rec.worktree_repo),
+        branch: rec.worktree_branch.clone(),
+        dir,
+    })
+}
+
 fn agent_cwd_from(roots: &[PathBuf], chosen: Option<&Path>) -> PathBuf {
     let primary = || roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     match chosen {
@@ -23882,10 +26871,9 @@ impl ZaivernApp {
                 untitled += 1;
                 continue;
             };
-            let text = b.text.clone();
             if self.editor.buffers[i].write_to(&path).is_ok() {
                 let b = &mut self.editor.buffers[i];
-                b.saved_hash = hash_str(&text);
+                b.mark_saved();
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 saved += 1;
@@ -23935,7 +26923,7 @@ impl ZaivernApp {
             }
             let Some(path) = b.path.clone() else { continue };
             if b.write_to(&path).is_ok() {
-                b.saved_hash = hash_str(&b.text);
+                b.mark_saved();
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 saved_any = true;
@@ -23967,12 +26955,10 @@ impl ZaivernApp {
         }
         // ディスク側の符号化に合わせ直す (次の保存で元の形へ書き戻せるように)
         b.encoding = encoding;
-        b.text = text;
-        b.saved_hash = hash_str(&b.text);
+        // ディスクへ戻す = 未保存の編集を捨てる操作なので履歴も畳む
+        b.reset_text(text);
         b.disk_mtime = disk_mtime(&path);
         b.conflict_notified = None;
-        b.cache = None;
-        b.gutter = None;
         let title = b.title.clone();
         self.queue_lsp_change(i);
         self.toast(
@@ -23985,9 +26971,17 @@ impl ZaivernApp {
     }
 
     /// すべてのエディタタブを閉じる。未保存タブは確認ダイアログに回す。
+    /// **ピン留めしたタブは残す** — 「誤って閉じない」がピン留めの意味なので、
+    /// 一括操作こそ効かせてはいけない (VS Code と同じ)。
     fn close_all_tabs(&mut self) {
         let mut kept_dirty = 0usize;
+        let pinned = self.panes.pinned_bufs();
+        let mut kept_pinned = 0usize;
         for i in (0..self.editor.buffers.len()).rev() {
+            if pinned.contains(&self.editor.buffers[i].id) {
+                kept_pinned += 1;
+                continue;
+            }
             if self.editor.buffers[i].dirty() && !self.editor.buffers[i].kind.read_only() {
                 kept_dirty += 1;
                 continue;
@@ -23995,6 +26989,15 @@ impl ZaivernApp {
             self.editor.close(i);
         }
         self.persist_session();
+        if kept_pinned > 0 {
+            self.toast(
+                trf(
+                    "📌 ピン留めした {n} タブは残しました",
+                    &[("n", kept_pinned.to_string())],
+                ),
+                true,
+            );
+        }
         if kept_dirty > 0 {
             // 1 件ずつ既存の確認ダイアログへ (最初の未保存タブを対象にする)
             self.pending_close = self
@@ -24022,19 +27025,6 @@ impl ZaivernApp {
             return;
         }
         self.pending_editor_events.push(ev);
-    }
-
-    fn push_editor_key(&mut self, key: egui::Key, modifiers: egui::Modifiers, mutates: bool) {
-        self.push_editor_event(
-            egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            },
-            mutates,
-        );
     }
 
     /// キューされたイベントをフレーム冒頭で注入する (update() から毎フレーム)。
@@ -24161,6 +27151,123 @@ impl ZaivernApp {
         let cur = self.editor.active.unwrap_or(0) as i64;
         self.editor.active = Some((cur + dir).rem_euclid(n as i64) as usize);
         self.persist_session();
+    }
+
+    /// ⌃Tab / ⌃⇧Tab。
+    ///
+    /// `tab_switch_mru`(既定オン) なら **押している間だけ候補一覧を出し、
+    /// 修飾キーを離したところで確定する** (VS Code / Zed と同じ)。
+    /// オフなら従来どおりの位置巡回 ([`Self::cycle_tab`]) — どちらの経路も残す。
+    fn switch_tab(&mut self, dir: i64) {
+        if !self.cfg.tab_switch_mru {
+            self.cycle_tab(dir);
+            return;
+        }
+        match self.tab_switcher.as_mut() {
+            Some(s) => s.step(dir),
+            None => {
+                let pane = self.panes.focus_id();
+                let order = self.panes.mru_order(pane);
+                // 候補が 1 枚しか無いなら `start` が None を返す = 枠を出さない。
+                self.tab_switcher = editor_split::TabSwitcher::start(pane, order, dir);
+            }
+        }
+    }
+
+    /// ⌃Tab の切替を毎フレーム見張り、**修飾キーが離れたフレームで確定する**。
+    ///
+    /// egui は押されている修飾キーを `InputState::modifiers` に持つので、
+    /// `ctrl` が false へ落ちた最初のフレームが「離した瞬間」。
+    /// Esc は取り消し (何も切り替えない)。押している間は候補が閉じられていないか
+    /// 確認し、閉じられていたら候補から落とす。
+    fn tab_switcher_tick(&mut self, ctx: &egui::Context) {
+        let Some(pane) = self.tab_switcher.as_ref().map(|s| s.pane) else {
+            return;
+        };
+        let alive: Vec<u64> = self
+            .panes
+            .pane(pane)
+            .map(|p| p.tabs.clone())
+            .unwrap_or_default();
+        let (held, cancel) = ctx.input(|i| {
+            (
+                i.modifiers.ctrl,
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                }),
+            )
+        });
+        if cancel {
+            self.tab_switcher = None;
+            return;
+        }
+        if let Some(s) = self.tab_switcher.as_mut() {
+            if !s.retain_alive(&alive) {
+                self.tab_switcher = None;
+                return;
+            }
+        }
+        if held {
+            return;
+        }
+        // 離した = 確定。
+        let pick = self.tab_switcher.take().and_then(|s| s.pick());
+        if let Some(buf) = pick {
+            self.activate_buf(pane, buf);
+        }
+    }
+
+    /// バッファ ID を指定してペインのアクティブタブを切り替える。
+    fn activate_buf(&mut self, pane: editor_split::PaneId, buf: u64) {
+        self.panes.set_focus(pane);
+        if let Some(p) = self.panes.pane_mut(pane) {
+            if let Some(at) = p.tabs.iter().position(|x| *x == buf) {
+                p.active = at;
+                p.touch(buf);
+            }
+        }
+        self.cur_pane = pane;
+        self.editor.active = self.editor.buffers.iter().position(|b| b.id == buf);
+        // ヒット位置は本文に紐づくので、別のバッファへ移ったら捨てる。
+        self.find.current = None;
+        self.find.wrapped = None;
+        self.persist_session();
+    }
+
+    /// ⌃Tab を押している間の候補一覧 (画面中央の 1 枚のカード)。
+    fn tab_switcher_ui(&mut self, ctx: &egui::Context) {
+        let Some(sw) = self.tab_switcher.clone() else {
+            return;
+        };
+        let items: Vec<(String, String)> = sw
+            .order
+            .iter()
+            .filter_map(|b| {
+                let buf = self.editor.buffers.iter().find(|x| x.id == *b)?;
+                let icon = file_tree::icon_for(&buf.title);
+                let hint = buf
+                    .path
+                    .as_ref()
+                    .map(|p| self.rel_label(p))
+                    .unwrap_or_default();
+                Some((format!("{icon} {}", buf.title), hint))
+            })
+            .collect();
+        let title = trf(
+            "{key} で切り替え · 離して確定",
+            &[("key", self.key_hint(BindAction::SwitchTab))],
+        );
+        editor_split::tab_switcher_overlay(ctx, &self.theme, &title, &items, sw.sel);
+        // 押している間はキーイベントが来ないので、こちらから描き直しを頼む。
+        // (切替が終われば要求も止まる = アイドル時のコストはゼロ)
+        ctx.request_repaint();
     }
 
     // ── ジャンプ系 ──
@@ -24610,6 +27717,8 @@ impl ZaivernApp {
     // ── 置換 (検索バーの置換行) ──
 
     /// いまのヒットを置換して次を検索する。ヒットが無ければまず検索する。
+    ///
+    /// 正規表現モードでは置換文字列の `$1` / `${name}` が展開される (VS Code 準拠)。
     fn replace_current(&mut self) {
         let Some(i) = self.editor.active else { return };
         if self.find.query.is_empty() {
@@ -24620,30 +27729,45 @@ impl ZaivernApp {
             return;
         }
         let text = self.editor.buffers[i].text.clone();
-        let qn = self.find.query.chars().count();
-        let hit = self.find.last.filter(|c| {
-            let sb = editor_ops::char_to_byte(&text, *c);
-            let eb = editor_ops::char_to_byte(&text, *c + qn);
-            eb <= text.len() && text[sb..eb].to_lowercase() == self.find.query.to_lowercase()
-        });
-        let Some(c) = hit else {
-            self.find_next();
+        self.refresh_find_hits(i, hash_str(&text));
+        // 現在位置が本文と食い違っていたら、まず探し直す (古い範囲を書き潰さない)
+        let Some(ix) = self.current_hit_index() else {
+            self.find_step(true);
             return;
         };
-        let sb = editor_ops::char_to_byte(&text, c);
-        let eb = editor_ops::char_to_byte(&text, c + qn);
-        let mut nt = String::with_capacity(text.len());
-        nt.push_str(&text[..sb]);
-        nt.push_str(&self.find.replace);
-        nt.push_str(&text[eb..]);
-        self.editor.buffers[i].text = nt;
-        // 置換文字列の直後から次のヒットを探す (置換結果に query を含んでも無限ループしない)
-        let rep_chars = self.find.replace.chars().count();
-        self.find.last = Some((c + rep_chars).saturating_sub(1));
+        let Some((hit, matcher)) = self
+            .find_hits
+            .as_ref()
+            .map(|c| (c.hits[ix], c.matcher.clone()))
+        else {
+            return;
+        };
+        let (s, e) = hit.range();
+        // `$1` の展開はヒットのある**行**の中で解決する (走査も行単位のため)。
+        // 行末の CR は走査対象から外してあるので、ここでも同じ扱いにする。
+        let ls = text[..s].rfind('\n').map_or(0, |p| p + 1);
+        let le = text[e..].find('\n').map_or(text.len(), |p| e + p);
+        let line = text[ls..le].trim_end_matches('\r');
+        let rep = find_buffer::expand(&matcher, line, (s - ls, e - ls), &self.find.replace);
+        let mut nt = String::with_capacity(text.len() + rep.len());
+        nt.push_str(&text[..s]);
+        nt.push_str(&rep);
+        nt.push_str(&text[e..]);
+        // 1 置換 = 1 段。取り消すと置換前のヒットを選んだ状態へ戻る。
+        let ed = self
+            .edit_step()
+            .from_sel(byte_range_to_char_range(&text, &(s..e)));
+        self.editor.buffers[i].apply_edit(nt, ed);
+        // 置換した結果の直後から次を探す (置換文字列が検索語を含んでも無限ループしない)
+        self.find.anchor = s + rep.len();
+        self.find.current = None;
+        // 本文を変えたのでヒット一覧は捨てる (次フレームのハッシュ更新を待たない)
+        self.find_hits = None;
         self.queue_lsp_change(i);
-        self.find_next();
+        self.find_step(true);
     }
 
+    /// このファイルのヒットをすべて置換する。
     fn replace_all_in_active(&mut self) {
         let Some(i) = self.editor.active else { return };
         if self.find.query.is_empty() {
@@ -24654,13 +27778,35 @@ impl ZaivernApp {
             return;
         }
         let text = self.editor.buffers[i].text.clone();
-        let (nt, n) = editor_ops::replace_all_ci(&text, &self.find.query, &self.find.replace);
+        self.refresh_find_hits(i, hash_str(&text));
+        let Some(matcher) = self.find_hits.as_ref().map(|c| {
+            if let Some(err) = &c.error {
+                Err(err.clone())
+            } else {
+                Ok(c.matcher.clone())
+            }
+        }) else {
+            return;
+        };
+        let matcher = match matcher {
+            Ok(m) => m,
+            // 不正な正規表現は 1 バイトも書かずに理由を出す
+            Err(e) => {
+                self.toast(e, false);
+                return;
+            }
+        };
+        let (nt, n) = find_buffer::replace_all(&text, &matcher, &self.find.replace);
         if n == 0 {
             self.toast(tr("見つかりませんでした"), false);
             return;
         }
-        self.editor.buffers[i].text = nt;
-        self.find.last = None;
+        // 「すべて置換」は何件当たっても**全体で 1 段** (⌘Z 1 回で丸ごと戻る)
+        let ed = self.edit_step();
+        self.editor.buffers[i].apply_edit(nt, ed);
+        self.find.current = None;
+        self.find.wrapped = None;
+        self.find_hits = None;
         self.queue_lsp_change(i);
         self.toast(trf("{n} 件置換しました", &[("n", n.to_string())]), true);
     }
@@ -24669,6 +27815,8 @@ impl ZaivernApp {
 
     fn menu_windows_ui(&mut self, ctx: &egui::Context) {
         self.goto_line_window(ctx);
+        self.git_commit_window(ctx);
+        self.git_history_window(ctx);
         self.problems_window(ctx);
         self.shortcuts_window(ctx);
         self.about_window(ctx);
@@ -24701,17 +27849,24 @@ impl ZaivernApp {
                 }
             });
         if let Some((line, col)) = go {
-            if let Some(i) = self.editor.active {
-                let ch = editor_ops::char_index_at(&self.editor.buffers[i].text, line, col);
-                if let Some(p) = self.active_file_path() {
-                    self.nav_push(p, ch);
-                }
-                self.jump_to_char(ch, 0);
-            }
+            self.goto_line_col(line, col);
         }
         if close {
             self.goto_open = false;
         }
+    }
+
+    /// 0 起点の (行, 桁) へ飛ぶ。⌃G の小窓とパレットの `:123` の共通経路。
+    ///
+    /// 行数を超える値・0 行目・巨大な値は `editor_ops::char_index_at` が
+    /// 末尾へ丸める (パニックしない)。負の値は `parse_goto` が弾く。
+    fn goto_line_col(&mut self, line: usize, col: usize) {
+        let Some(i) = self.editor.active else { return };
+        let ch = editor_ops::char_index_at(&self.editor.buffers[i].text, line, col);
+        if let Some(p) = self.active_file_path() {
+            self.nav_push(p, ch);
+        }
+        self.jump_to_char(ch, 0);
     }
 
     fn problems_window(&mut self, ctx: &egui::Context) {
@@ -25817,6 +28972,103 @@ mod tests {
         std::fs::write(path, body).expect("write file");
     }
 
+    /// 索引テストの既定条件 (設定の既定値をそのまま使う — 直書きしない)。
+    fn test_index_opts() -> IndexOptions {
+        IndexOptions::from_config(&config::Config::default())
+    }
+
+    /// `.gitignore` に書いたものが索引に載らないこと。
+    /// 以前はハードコード 10 種しか除外できず、`out/` のような
+    /// リポジトリ固有の生成物が ⌘P を埋め尽くしていた。
+    #[test]
+    fn file_index_respects_gitignore() {
+        let base = unique_temp_dir("zaivern-app-test", "gitignore");
+        write(
+            &base.join(".gitignore"),
+            "node_modules/\ntarget/\nout/\n*.log\n",
+        );
+        write(&base.join("src/main.rs"), "fn main() {}");
+        write(&base.join("node_modules/pkg/index.js"), "x");
+        write(&base.join("target/debug/app"), "x");
+        write(&base.join("out/bundle.js"), "x");
+        write(&base.join("debug.log"), "x");
+
+        let roots = file_tree::normalize_roots(vec![base.clone()]);
+        let out = build_file_index_with(&roots, &test_index_opts(), None);
+        let labels: Vec<&str> = out.files.iter().map(|f| f.label.as_str()).collect();
+        assert!(
+            labels.contains(&"src/main.rs"),
+            "実ソースは載る: {labels:?}"
+        );
+        for bad in ["node_modules", "target", "out", "debug.log"] {
+            assert!(
+                !labels.iter().any(|l| l.contains(bad)),
+                "{bad} は .gitignore で除外されるべき: {labels:?}"
+            );
+        }
+        assert!(!out.truncated, "上限にはほど遠い");
+
+        // 設定で切れば全部載る (respect_gitignore = false)
+        let opts = IndexOptions {
+            respect_gitignore: false,
+            ..test_index_opts()
+        };
+        let all = build_file_index_with(&roots, &opts, None);
+        assert!(
+            all.files.iter().any(|f| f.label.contains("node_modules")),
+            "無効化したら除外しない"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 上限に達したら **黙って切らず** `truncated` を立て、UI へ出す文言を作ること。
+    #[test]
+    fn file_index_reports_truncation() {
+        let base = unique_temp_dir("zaivern-app-test", "truncate");
+        for i in 0..40 {
+            write(&base.join(format!("f{i}.txt")), "x");
+        }
+        let roots = file_tree::normalize_roots(vec![base.clone()]);
+        let opts = IndexOptions {
+            max_files: 10,
+            ..test_index_opts()
+        };
+        let out = build_file_index_with(&roots, &opts, None);
+        assert_eq!(out.files.len(), 10, "上限で止まる");
+        assert!(out.truncated, "打ち切りを記録する");
+
+        // 上限を上げれば全部載り、打ち切り表示も出ない
+        let out = build_file_index_with(&roots, &test_index_opts(), None);
+        assert_eq!(out.files.len(), 40);
+        assert!(!out.truncated);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 深さ上限も設定から来ること (直書きの 12 段を撤廃した)。
+    #[test]
+    fn file_index_depth_limit_comes_from_config() {
+        let base = unique_temp_dir("zaivern-app-test", "depth");
+        write(&base.join("a/b/c/deep.txt"), "x");
+        write(&base.join("top.txt"), "x");
+        let roots = file_tree::normalize_roots(vec![base.clone()]);
+
+        let shallow = IndexOptions {
+            max_depth: 2,
+            ..test_index_opts()
+        };
+        let out = build_file_index_with(&roots, &shallow, None);
+        let labels: Vec<&str> = out.files.iter().map(|f| f.label.as_str()).collect();
+        assert!(labels.contains(&"top.txt"));
+        assert!(!labels.iter().any(|l| l.contains("deep.txt")), "{labels:?}");
+
+        let out = build_file_index_with(&roots, &test_index_opts(), None);
+        assert!(out.files.iter().any(|f| f.rel == "a/b/c/deep.txt"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     // ── タブのドラッグ並べ替え ────────────────────────────────────
 
     /// 幅 `w` のタブを隙間なく `n` 枚並べた矩形列 (中心は w/2, 3w/2, …)。
@@ -26234,6 +29486,43 @@ mod tests {
         assert_send(&DialogPurpose::OpenFile);
     }
 
+    /// DoD: 隔離エージェントは再起動後も**同じ worktree** に戻る。
+    /// セッション記録 → 割り当ての復元が壊れると、次の起動で本体ツリーへ
+    /// 落ちて隔離が黙って無効になる (一番気付きにくい壊れ方)。
+    #[test]
+    fn 隔離エージェントは再起動後も同じworktreeへ戻る() {
+        let base = crate::test_util::unique_temp_dir("zaivern-app-test", "restore-wt");
+        let wt_dir = base.join("repo-agent-claude-code-1");
+        std::fs::create_dir_all(&wt_dir).expect("worktree のふり");
+        let rec = session::AgentSessionRec {
+            preset_name: "Claude Code".into(),
+            cwd: wt_dir.to_string_lossy().into_owned(),
+            worktree_repo: base.join("repo").to_string_lossy().into_owned(),
+            worktree_branch: "agent/claude-code-1".into(),
+            ..Default::default()
+        };
+        let got = restored_worktree(&rec).expect("隔離として復元される");
+        assert_eq!(got.dir, wt_dir, "前回と同じ worktree へ戻る");
+        assert_eq!(got.branch, "agent/claude-code-1");
+        assert_eq!(got.repo, base.join("repo"));
+
+        // 隔離していない記録は None (通常起動のまま)
+        let plain = session::AgentSessionRec {
+            cwd: wt_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        assert!(restored_worktree(&plain).is_none());
+
+        // worktree を手で消した後の記録は None。
+        // ここで Some を返すと、実体の無いフォルダへ `git worktree remove` を撃つ。
+        std::fs::remove_dir_all(&wt_dir).ok();
+        assert!(
+            restored_worktree(&rec).is_none(),
+            "消えた worktree を掴んでいる"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// DoD: エージェントは「直近に開いたフォルダ」で起動する。
     /// 起動引数のフォルダ (`zai .`) も、あとから開き直したフォルダも同じ扱い。
     #[test]
@@ -26303,7 +29592,7 @@ mod tests {
 
         let roots = file_tree::normalize_roots(vec![a.clone(), b.clone()]);
         assert_eq!(roots.len(), 2, "別ツリーの 2 ルートは畳まれない");
-        let index = build_file_index(&roots);
+        let index = build_file_index_with(&roots, &test_index_opts(), None).files;
 
         // 衝突する rel は両方ともルート名付きラベルになる
         let mains: Vec<&IndexedFile> = index.iter().filter(|f| f.rel == "src/main.rs").collect();
@@ -26354,7 +29643,7 @@ mod tests {
         write(&base.join("README.md"), "# hi");
 
         let roots = file_tree::normalize_roots(vec![base.clone()]);
-        let index = build_file_index(&roots);
+        let index = build_file_index_with(&roots, &test_index_opts(), None).files;
         let mut labels: Vec<&str> = index.iter().map(|f| f.label.as_str()).collect();
         labels.sort();
         assert_eq!(labels, ["README.md", "src/main.rs"]);
@@ -28653,6 +31942,55 @@ mod wave2_tests {
         );
     }
 
+    /// **タブのピン留め / プレビュー / MRU 切替が実際に配線されている**こと。
+    ///
+    /// 実装はしたが画面から届かない (= 未完成) を検出する番人。
+    /// 純粋なロジックは `editor_split::tests` が固定しているので、ここは
+    /// 「その判断が描画と入力に繋がっているか」だけを見る。
+    #[test]
+    fn タブのピン留めとプレビューは画面から届く() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        // 到達経路: 右クリックメニュー / パレット / ⌃Tab
+        assert!(
+            src.contains("pin_req = Some(i);"),
+            "タブの右クリックからピン留めできない"
+        );
+        assert!(
+            src.contains("Cmd::TogglePinTab =>"),
+            "パレットのピン留めが実行されない"
+        );
+        assert!(
+            src.contains("self.tab_switcher_tick(ctx);")
+                && src.contains("self.tab_switcher_ui(ctx);"),
+            "MRU タブ切替の確定と候補一覧が update から呼ばれていない"
+        );
+        // ツリー / パレットの 1 回クリックはプレビューで開く
+        assert!(
+            src.contains("self.open_path_preview(&p);"),
+            "ツリーの 1 回クリックがプレビューに繋がっていない"
+        );
+        // ピン留めタブには「×」を出さない (誤って閉じないための機能なので)
+        let body = src
+            .split("fn editor_tab_strip(")
+            .nth(1)
+            .expect("タブ列の描画がある");
+        let guard = body.find("if is_pinned {").expect("ピン留めの分岐がある");
+        let cross = body
+            .find("RichText::new(\"×\")")
+            .expect("閉じるボタンがある");
+        assert!(guard < cross, "ピン留めタブでも閉じるボタンを描いてしまう");
+        // 落とし先はピン境界でクランプする
+        assert!(
+            body.contains("editor_split::clamp_reorder("),
+            "ドラッグの落とし先がピン境界でクランプされていない"
+        );
+        // アクティブタブへの追従は純関数が決めた矩形から
+        assert!(
+            body.contains("editor_split::tab_rects(") && body.contains("ui.scroll_to_rect("),
+            "アクティブタブへ自動スクロールしていない"
+        );
+    }
+
     /// `palette_builtin_cmds` の本体だけを切り出す。
     fn palette_body(src: &str) -> &str {
         let body = src
@@ -28727,6 +32065,72 @@ mod wave2_tests {
         );
     }
 
+    /// **診断のインライン表示と対応括弧の強調が画面に繋がっている。**
+    ///
+    /// 「LSP から範囲は届いているのにガターの印しか出ない」「実装したが
+    /// どこからも押せない」を潰すための番人。描画・到達経路・排他を全部見る。
+    /// ソースを読むテストなので改行は正規化する (Windows は CRLF)。
+    #[test]
+    fn 診断のインライン表示と対応括弧が画面に繋がっている() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        // 本文描画の中だけを見る (テスト自身の文字列に当たらないようにする)
+        let (_, body) = src
+            .split_once("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .expect("code_editor_ui がある");
+        let (body, _) = body
+            .split_once("\n    // ─── UI: palette ")
+            .expect("code_editor_ui の終わり");
+
+        // ① 範囲付きの診断を持ち、本文へ波線・括弧・行末メッセージを描いている
+        for draw in [
+            "diagview::squiggle_points(",
+            "egui::Shape::line(pts,",
+            "bracket_fill[k]",
+            "diagview::inline_message(",
+            "diag_colors[(sp.severity.clamp(1, 4) - 1) as usize]",
+        ] {
+            assert!(
+                body.contains(draw),
+                "{draw} が本文描画に無い (画面に出ない)"
+            );
+        }
+        // ② 括弧の相手探しは既存のマッチャ 1 つだけ (app.rs に複製しない)
+        assert!(
+            body.contains("diagview::bracket_hl("),
+            "対応括弧を求めていない"
+        );
+        assert!(
+            !src.contains(&format!("fn {}", "matching_bracket")),
+            "app.rs に括弧マッチャを複製している (editor_ops のものを使うこと)"
+        );
+        // ③ 色は必ずテーマ経由 (severity → 色のベタ書きを禁じる)
+        assert!(
+            body.contains("diagview::severity_color(&self.theme, 1)"),
+            "診断の色をテーマから取っていない"
+        );
+        // ④ 到達経路: キーバインド / パレット / 設定
+        for route in [
+            "BindAction::NextProblem",
+            "BindAction::PrevProblem",
+            "Cmd::NextProblem => self.goto_diagnostic(ctx, true)",
+            "Cmd::PrevProblem => self.goto_diagnostic(ctx, false)",
+            "Cmd::ToggleInlineDiagnostics",
+            "self.cfg.inline_diagnostics",
+            "self.diag_hover_popup(ctx);",
+        ] {
+            assert!(src.contains(route), "{route} の到達経路が無い");
+        }
+        // ⑤ 診断ホバーと LSP ホバーは排他 (同じ場所へ 2 枚重ねない)
+        let hover = body
+            .split("match hover_hit {")
+            .nth(1)
+            .expect("ホバーの分岐がある");
+        assert!(
+            hover.contains("self.diag_hover = Some(") && hover.contains("self.lsp_hover.dismiss()"),
+            "診断が当たったフレームで LSP ホバーを止めていない"
+        );
+    }
+
     /// **パレットが表示する打鍵は、その行が実行する `Cmd` の `BindAction` から作る。**
     ///
     /// ベタ書きに戻すと再割り当てで嘘になり、別のアクションの打鍵を貼ると
@@ -28743,6 +32147,8 @@ mod wave2_tests {
             ("FocusPane2", "FocusNextPane"),
             ("DiffNextChange", "DiffNextChange"),
             ("DiffPrevChange", "DiffPrevChange"),
+            ("NextProblem", "NextProblem"),
+            ("PrevProblem", "PrevProblem"),
             ("LspCodeAction", "LspCodeAction"),
             ("LspSignatureHelp", "LspSignatureHelp"),
             ("Save", "Save"),
@@ -31020,6 +34426,30 @@ mod multi_cursor_wiring_tests {
         assert_eq!(n, 2);
     }
 
+    /// マルチカーソルの一括編集は取り消し **1 段**で丸ごと戻る。
+    #[test]
+    fn マルチカーソルの一括編集は一段で戻る() {
+        use crate::editor::{Edit, HistoryLimits};
+        let mut ed = Editor::new();
+        ed.new_untitled();
+        let mut b = ed.buffers.pop().expect("untitled タブ");
+        let src = "a\nb\nc";
+        b.reset_text(src.into());
+        let sel = editor_ops::MultiSel::in_text(&b.text, [0..0, 2..2, 4..4]);
+        let (out, next, n) = multi_batch_insert(&b.text, &sel, "// ");
+        assert_eq!(n, 3, "3 箇所に入った");
+        let after = next.to_single_selection_chars(&out);
+        let step = Edit::programmatic(0, HistoryLimits::default())
+            .from_sel((0, 0))
+            .to_sel((after.start, after.end));
+        assert!(b.apply_edit(out, step));
+        assert_eq!(b.text, "// a\n// b\n// c");
+        assert_eq!(b.undo(), Some((0, 0)), "1 回で編集前の位置へ戻る");
+        assert_eq!(b.text, src, "3 箇所ぶんが 1 回の取り消しで戻る");
+        assert!(b.redo().is_some());
+        assert_eq!(b.text, "// a\n// b\n// c");
+    }
+
     /// 本文への書き込みは **1 か所だけ**。
     /// 途中で複数回代入すると取り消しが 1 段では戻らなくなる。
     #[test]
@@ -31031,9 +34461,13 @@ mod multi_cursor_wiring_tests {
             .expect("MultiPaste の腕がある");
         let arm = &body[..body.find("Cmd::ColumnSelectStart =>").unwrap_or(body.len())];
         assert_eq!(
-            arm.matches("b.text = ").count(),
+            arm.matches("apply_edit(").count(),
             1,
             "本文を 2 回以上書き換えている (取り消しが 1 段で戻らない)"
+        );
+        assert!(
+            !arm.contains(".text = "),
+            "履歴を通さず本文へ直接代入している (取り消しに乗らない)"
         );
         assert!(
             arm.contains("multi_batch_insert("),
@@ -31056,6 +34490,297 @@ mod multi_cursor_wiring_tests {
         assert_eq!(char_index_to_line_col("ab\r\ncd", 4, tw), (1, 0));
         // 範囲外はクランプ (壊れた値でも落ちない)
         assert_eq!(char_index_to_line_col("ab", 99, tw), (0, 2));
+    }
+
+    // ──────────── 打鍵の横取り (全キャレットへ配る) ────────────
+
+    fn key_ev(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// 修飾キー無しの Backspace / Delete / Enter と文字入力だけを横取りする。
+    /// ⌘Z (取り消し) や ⌥⌫ (単語削除) を奪うと、複数キャレット中だけ
+    /// それらが効かなくなる。
+    #[test]
+    fn 打鍵は修飾キー無しのときだけ横取りする() {
+        let none = egui::Modifiers::NONE;
+        let shift = egui::Modifiers::SHIFT;
+        let cmd = egui::Modifiers::COMMAND;
+        let alt = egui::Modifiers::ALT;
+        let cases: Vec<(egui::Event, Option<MultiKey>)> = vec![
+            (
+                egui::Event::Text("a".into()),
+                Some(MultiKey::Text("a".into())),
+            ),
+            (
+                egui::Event::Text("あ".into()),
+                Some(MultiKey::Text("あ".into())),
+            ),
+            (egui::Event::Text(String::new()), None),
+            (
+                key_ev(egui::Key::Backspace, none),
+                Some(MultiKey::Backspace),
+            ),
+            (
+                key_ev(egui::Key::Backspace, shift),
+                Some(MultiKey::Backspace),
+            ),
+            (key_ev(egui::Key::Backspace, alt), None),
+            (key_ev(egui::Key::Backspace, cmd), None),
+            (key_ev(egui::Key::Delete, none), Some(MultiKey::Delete)),
+            (key_ev(egui::Key::Enter, none), Some(MultiKey::Enter)),
+            (key_ev(egui::Key::Z, cmd), None),
+            (key_ev(egui::Key::ArrowDown, none), None),
+            (egui::Event::Copy, None),
+        ];
+        for (ev, want) in cases {
+            assert_eq!(multi_key_of(&ev), want, "{ev:?}");
+        }
+        // 押下だけを拾う (離鍵で二度打たない)
+        let release = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert_eq!(multi_key_of(&release), None);
+    }
+
+    /// 抜き取った打鍵だけがイベント列から消え、残りは `TextEdit` へ流れる。
+    #[test]
+    fn 横取りした打鍵だけがイベント列から消える() {
+        let mut events = vec![
+            egui::Event::Text("a".into()),
+            key_ev(egui::Key::ArrowRight, egui::Modifiers::NONE),
+            key_ev(egui::Key::Backspace, egui::Modifiers::NONE),
+            egui::Event::Text("b".into()),
+        ];
+        let ops = take_multi_keys(&mut events);
+        assert_eq!(
+            ops,
+            vec![
+                MultiKey::Text("a".into()),
+                MultiKey::Backspace,
+                MultiKey::Text("b".into()),
+            ],
+            "届いた順に全部返る"
+        );
+        assert_eq!(events.len(), 1, "矢印キーだけが残って TextEdit へ流れる");
+    }
+
+    /// 1 フレームに複数届いた打鍵を順に当てる (速いタイプ / キーリピート)。
+    /// 1 つだけ拾って残りを流すと、あふれたぶんが主キャレットにだけ入る。
+    #[test]
+    fn 一フレームの打鍵は順番どおり全キャレットへ入る() {
+        let text = "x\nx\nx\n";
+        let sel = MultiSel::in_text(text, [0..1, 2..3, 4..5]);
+        let ops = vec![
+            MultiKey::Text("a".into()),
+            MultiKey::Text("b".into()),
+            MultiKey::Backspace,
+            MultiKey::Text("c".into()),
+        ];
+        let (out, next) = apply_multi_keys(text, &sel, &ops);
+        assert_eq!(out, "ac\nac\nac\n");
+        assert_eq!(next.len(), 3, "キャレットは 3 本のまま");
+    }
+
+    /// Enter は全キャレットへ入り、キャレットは新しい行へ再配置される。
+    #[test]
+    fn enter_も全キャレットへ配られる() {
+        let text = "ab\ncd\n";
+        let sel = MultiSel::in_text(text, [2..2, 5..5]);
+        let (out, next) = apply_multi_keys(text, &sel, &[MultiKey::Enter]);
+        assert_eq!(out, "ab\n\ncd\n\n");
+        assert_eq!(next.len(), 2);
+    }
+
+    /// 空集合へ打鍵しても本文は変わらない (キャレット 0 本)。
+    #[test]
+    fn キャレットが無ければ横取りしても本文は変わらない() {
+        let text = "そのまま";
+        let sel = MultiSel::default();
+        let (out, next) = apply_multi_keys(text, &sel, &[MultiKey::Text("x".into())]);
+        assert_eq!(out, text);
+        assert!(next.is_empty());
+    }
+
+    #[test]
+    fn バイト範囲からchar範囲への変換は多バイトでも合う() {
+        let text = "あいうABC";
+        // "あい" = 6 バイト = 2 文字
+        assert_eq!(byte_range_to_char_range(text, &(0..6)), (0, 2));
+        assert_eq!(byte_range_to_char_range(text, &(9..12)), (3, 6));
+        // 範囲外はクランプ、文字境界でない値は手前へ寄せる (落ちない)
+        assert_eq!(byte_range_to_char_range(text, &(0..999)), (0, 6));
+        assert_eq!(byte_range_to_char_range(text, &(1..4)), (0, 1));
+        assert_eq!(byte_range_to_char_range("", &(0..0)), (0, 0));
+    }
+
+    // ──────────── 追加キャレット / 選択範囲の描画 ────────────
+
+    /// 行の矩形を等間隔で作る (視覚行の並びを模す)。
+    fn rows(n: usize, w: f32, h: f32) -> Vec<egui::Rect> {
+        (0..n)
+            .map(|i| {
+                egui::Rect::from_min_max(
+                    egui::pos2(0.0, i as f32 * h),
+                    egui::pos2(w, (i + 1) as f32 * h),
+                )
+            })
+            .collect()
+    }
+
+    /// 1 行に収まる選択は x0..x1 の 1 枚。
+    #[test]
+    fn 一行の選択は矩形一枚になる() {
+        let r = rows(1, 300.0, 16.0);
+        let got = selection_row_rects(&r, 40.0, 120.0, 4.0);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].left(), 40.0);
+        assert_eq!(got[0].right(), 120.0);
+        assert_eq!(got[0].top(), 0.0);
+        assert_eq!(got[0].bottom(), 16.0);
+    }
+
+    /// 行をまたぐ選択は「開始行は x から行末」「中間行は丸ごと」
+    /// 「終了行は行頭から x」に割れる。
+    #[test]
+    fn 行をまたぐ選択は行ごとに割れる() {
+        let r = rows(3, 200.0, 16.0);
+        let got = selection_row_rects(&r, 50.0, 80.0, 4.0);
+        assert_eq!(got.len(), 3);
+        assert_eq!((got[0].left(), got[0].right()), (50.0, 204.0));
+        assert_eq!((got[1].left(), got[1].right()), (0.0, 204.0));
+        assert_eq!((got[2].left(), got[2].right()), (0.0, 80.0));
+    }
+
+    /// どんな入力でも: 矩形は行の上下に収まり、互いに重ならず、幅は正。
+    /// 極端なサイズ (狭い / 広い / 逆順の x / 行が無い) で固定する。
+    #[test]
+    fn 選択矩形は行に収まり重ならない() {
+        let cases: Vec<(Vec<egui::Rect>, f32, f32, f32)> = vec![
+            (rows(1, 900.0, 18.0), 0.0, 900.0, 0.0),
+            (rows(2, 1200.0, 12.0), 1199.0, 1.0, 6.0),
+            (rows(40, 300.0, 700.0 / 40.0), 10.0, 290.0, 3.0),
+            (rows(3, 120.0, 20.0), 200.0, 0.0, 5.0), // x0 が行末より右 / x1 が行頭
+            (rows(0, 100.0, 10.0), 0.0, 10.0, 2.0),  // 行が無い
+            (rows(2, 0.0, 10.0), 0.0, 0.0, 0.0),     // 幅 0 の行 (空行)
+        ];
+        for (r, x0, x1, nl) in cases {
+            let got = selection_row_rects(&r, x0, x1, nl);
+            let bounds = r.iter().fold(None::<egui::Rect>, |acc, x| {
+                Some(acc.map_or(*x, |a| a.union(*x)))
+            });
+            for (i, g) in got.iter().enumerate() {
+                assert!(g.width() > 0.0, "幅 0 の矩形を painter へ渡している: {g:?}");
+                let b = bounds.expect("矩形があるなら行もある");
+                assert!(
+                    g.top() >= b.top() - 0.01 && g.bottom() <= b.bottom() + 0.01,
+                    "行の外へはみ出した: {g:?} / {b:?}"
+                );
+                if i > 0 {
+                    assert!(
+                        got[i - 1].bottom() <= g.top() + 0.01,
+                        "矩形が縦に重なった: {:?} と {g:?}",
+                        got[i - 1]
+                    );
+                }
+            }
+        }
+    }
+
+    // ──────────── 配線の回帰テスト (ソース検査) ────────────
+
+    /// 打鍵の横取りは **`TextEdit` を描く前**でなければならない。
+    /// 後ろに置くと egui が先に主キャレットへ適用してしまい、
+    /// 「⌘D で 5 箇所選んだのに 1 箇所にしか入らない」に戻る。
+    #[test]
+    fn 打鍵の横取りは_textedit_より前にある() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .nth(1)
+            .expect("code_editor_ui がある");
+        let take = body.find("take_multi_keys(").expect("打鍵の横取りがある");
+        let te = body
+            .find("egui::TextEdit::multiline(&mut target)")
+            .expect("本文の TextEdit がある");
+        assert!(
+            take < te,
+            "打鍵の横取りが TextEdit より後ろにある (1 箇所にしか入らない)"
+        );
+    }
+
+    /// 複数キャレットの打鍵でも本文の書き込みは **1 か所だけ**、かつ
+    /// 履歴の入口 (`apply_edit`) を通ること。2 回以上書くか、履歴を迂回すると
+    /// 取り消しが 1 段で戻らない。
+    #[test]
+    fn 打鍵の一括適用でも本文書き込みは一度だけ() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("let ops = ui.input_mut(|i| take_multi_keys(&mut i.events));")
+            .nth(1)
+            .expect("横取りの腕がある");
+        let arm = &body[..body.find("// 括弧・引用符の自動ペア").unwrap_or(body.len())];
+        assert_eq!(
+            arm.matches(".apply_edit(new_text, ed)").count(),
+            1,
+            "本文を 2 回以上書き換えている (取り消しが 1 段で戻らない)"
+        );
+        assert_eq!(
+            arm.matches(".text = ").count(),
+            0,
+            "履歴を迂回して本文を書き換えている (apply_edit を通すこと)"
+        );
+        assert!(arm.contains("apply_multi_keys("), "一括適用を通っていない");
+    }
+
+    /// Alt+クリック / Alt+ドラッグの経路が生きていること。
+    /// `modifiers.alt` を読む場所が無くなったら追加キャレットは置けない。
+    #[test]
+    fn alt_クリックとドラッグの経路がある() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .nth(1)
+            .expect("code_editor_ui がある");
+        assert!(body.contains("i.modifiers.alt"), "Alt を読んでいない");
+        for want in [
+            "MultiPointer::DragStart(",
+            "MultiPointer::Drag(",
+            "MultiPointer::Click(",
+            "MultiPointer::Clear",
+        ] {
+            assert!(body.contains(want), "{want} の経路が無い");
+        }
+        assert!(
+            body.contains("self.apply_multi_pointer("),
+            "拾った操作を反映していない"
+        );
+    }
+
+    /// 追加キャレットの色はテーマから取る (固定色を書かない)。
+    #[test]
+    fn 追加キャレットの色はテーマ由来() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .nth(1)
+            .expect("code_editor_ui がある");
+        let decl = body
+            .split("let multi_caret_color =")
+            .nth(1)
+            .expect("キャレット色の宣言がある");
+        let decl = &decl[..decl.find(';').unwrap_or(decl.len())];
+        assert!(decl.contains("self.theme."), "テーマ由来でない色: {decl}");
     }
 }
 
@@ -31802,5 +35527,216 @@ mod crisp_text_tests {
             src.contains("let (font_id, cell_w, cell_h) = cell_metrics(ui, font_size);"),
             "draw が cell_metrics を通っていない"
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  quick-open (⌘P) — 最近開いた順 / `名前:行` / 範囲外の行番号
+//
+//  ランキングは `file_mode_items` に閉じた純粋関数なので、App を組み立てずに
+//  テーブルテストで固定できる。パスは `std::env::temp_dir()` から作り、
+//  実ファイルは触らない (索引はメモリ上の値でよい)。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod quick_open_tests {
+    use super::*;
+
+    /// ルート直下に `rel` があるものとして索引の 1 件を作る。
+    fn indexed(root: &Path, rel: &str) -> IndexedFile {
+        IndexedFile {
+            abs: root.join(rel),
+            rel: rel.to_string(),
+            label: rel.to_string(),
+        }
+    }
+
+    fn labels(items: &[Item]) -> Vec<String> {
+        let p = crate::palette::Palette::new();
+        let res = p.results(items.to_vec());
+        res.items.iter().map(|i| i.label.clone()).collect()
+    }
+
+    #[test]
+    fn 空クエリでは最近開いたファイルが先頭に並ぶ() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let index: Vec<IndexedFile> = ["a.rs", "b.rs", "c.rs", "d.rs"]
+            .iter()
+            .map(|r| indexed(&root, r))
+            .collect();
+        // 最近開いた順: d → b (残りは未オープン)
+        let recent = vec![
+            root.join("d.rs").display().to_string(),
+            root.join("b.rs").display().to_string(),
+        ];
+        let items = file_mode_items(&index, &recent, None, "");
+        assert_eq!(
+            labels(&items),
+            vec!["d.rs", "b.rs", "a.rs", "c.rs"],
+            "最近順のあとはアルファベット順で続く"
+        );
+    }
+
+    #[test]
+    fn 開いているファイルは先頭に来ず直前のファイルへ戻れる() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let index: Vec<IndexedFile> = ["a.rs", "b.rs", "z.rs"]
+            .iter()
+            .map(|r| indexed(&root, r))
+            .collect();
+        // いま開いているのは z.rs、その前が b.rs
+        let recent = vec![
+            root.join("z.rs").display().to_string(),
+            root.join("b.rs").display().to_string(),
+        ];
+        let active = root.join("z.rs");
+        let items = file_mode_items(&index, &recent, Some(&active), "");
+        let l = labels(&items);
+        assert_eq!(l[0], "b.rs", "Enter で直前のファイルへ戻れない: {l:?}");
+        assert_ne!(l[0], "z.rs", "開いているファイルが先頭に居座っている");
+    }
+
+    #[test]
+    fn 入力を始めると一致の質が最近順より優先される() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let index: Vec<IndexedFile> = ["recent_only.rs", "zebra.rs"]
+            .iter()
+            .map(|r| indexed(&root, r))
+            .collect();
+        let recent = vec![root.join("recent_only.rs").display().to_string()];
+        // "zebra" は前方一致 (TIER_PREFIX)。最近順の加点では追い越せない。
+        let items = file_mode_items(&index, &recent, None, "zebra");
+        assert_eq!(labels(&items)[0], "zebra.rs");
+    }
+
+    #[test]
+    fn ファイル名に行番号を付けると位置つきで開く候補になる() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let index = vec![indexed(&root, "main.rs")];
+        for (q, want) in [("main.rs:42", (41, 0)), ("main.rs:42:5", (41, 4))] {
+            let items = file_mode_items(&index, &[], None, q);
+            assert_eq!(items.len(), 1, "q={q}");
+            match &items[0].action {
+                Action::OpenFileAt(p, line, col) => {
+                    assert_eq!(p, &root.join("main.rs"), "q={q}");
+                    assert_eq!((*line, *col), want, "q={q}");
+                }
+                _ => panic!("位置つきで開く候補になっていない: {q}"),
+            }
+            assert!(items[0].detail.contains("42"), "行番号が見えない: {q}");
+        }
+        // 行指定が無ければ従来どおり
+        let items = file_mode_items(&index, &[], None, "main");
+        assert!(matches!(items[0].action, Action::OpenFile(_)));
+    }
+
+    #[test]
+    fn 行指定として読めないコロンは名前の一部として扱う() {
+        // Windows のドライブレターや `foo:bar` を行ジャンプにしない
+        for q in ["C:/work/main.rs", "C:\\work\\main.rs", "foo:bar", "a::b"] {
+            assert_eq!(split_path_goto(q), (q, None), "q={q}");
+        }
+        assert_eq!(split_path_goto("main.rs:12"), ("main.rs", Some((11, 0))));
+        assert_eq!(split_path_goto("main.rs:12:3"), ("main.rs", Some((11, 2))));
+        // 先頭の `:` は行ジャンプモードの担当なのでここでは割らない
+        assert_eq!(split_path_goto(":12"), (":12", None));
+    }
+
+    #[test]
+    fn 範囲外の行番号はクランプされてパニックしない() {
+        let text = "1 行目\n2 行目\n3 行目";
+        // parse_goto は 1 起点 → 0 起点。0 行目・巨大値も受け付ける
+        for (input, want_line) in [
+            ("0", 0usize),
+            ("1", 0),
+            ("3", 2),
+            ("999999", 999_998),
+            ("18446744073709551615", usize::MAX - 1),
+        ] {
+            let (line, col) = editor_ops::parse_goto(input).expect(input);
+            assert_eq!(line, want_line, "input={input}");
+            // 本文末尾へ丸まるだけで、添字は必ず本文の範囲に収まる
+            let ch = editor_ops::char_index_at(text, line, col);
+            assert!(ch <= text.chars().count(), "input={input} ch={ch}");
+        }
+        // 負の値・数字以外は候補にしない (パースが弾く)
+        for bad in ["-1", "-1:2", "abc", "", " ", "1.5"] {
+            assert_eq!(editor_ops::parse_goto(bad), None, "bad={bad}");
+        }
+        // 桁が本文より大きくても丸まる
+        let ch = editor_ops::char_index_at(text, 0, usize::MAX);
+        assert_eq!(ch, "1 行目".chars().count());
+    }
+
+    #[test]
+    fn 日本語と絵文字を含むパスでもバイト境界を割らない() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let names = [
+            "日本語のファイル.rs",
+            "絵文字🎨入り/設定🚀.toml",
+            "🇯🇵/国旗.md",
+            "混在_ひらがな_カタカナ_漢字.txt",
+        ];
+        let index: Vec<IndexedFile> = names.iter().map(|r| indexed(&root, r)).collect();
+        // 部分一致・マルチバイト境界をまたぐクエリでも落ちない
+        for q in ["日本語", "🎨", "設定", "国旗", "ひらがな", "🇯🇵", "な"] {
+            let items = file_mode_items(&index, &[], None, q);
+            for it in &items {
+                assert!(!it.label.is_empty(), "q={q}");
+                // ラベルはファイル名部分 (`/` の右側) を正しく切り出す
+                assert!(!it.label.contains('/'), "q={q} label={}", it.label);
+            }
+        }
+        // 行指定つきでも同じ
+        let items = file_mode_items(&index, &[], None, "絵文字🎨入り/設定🚀.toml:7");
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].action, Action::OpenFileAt(_, 6, 0)));
+        assert_eq!(items[0].label, "設定🚀.toml");
+    }
+
+    /// 矢印キーは**選択を動かすだけ**。開くのは Enter とクリックだけで、
+    /// 選択が動いたついでに裏でファイルを開いてタブを増やしたりしない。
+    #[test]
+    fn 矢印キーはパレットを閉じずファイルも開かない() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn palette_ui(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("palette_ui が見つからない")
+            .split("\n    fn ")
+            .next()
+            .expect("palette_ui の本文が取れない");
+        // 上下キーの扱いは「選択位置の更新」1 行だけ
+        assert_eq!(
+            body.matches("results.step(self.palette.selected, down, up)")
+                .count(),
+            1,
+            "上下キーの扱いが 1 か所でない"
+        );
+        // 閉じるのは Esc / Enter / クリックだけ (down/up では close にしない)
+        assert!(
+            !body.contains("if down") && !body.contains("if up"),
+            "上下キーで別の分岐に入っている"
+        );
+        // 選択が動いただけでファイルを開かない (タブを増やさない)
+        assert!(
+            !body.contains("self.open_path("),
+            "パレットの描画中にファイルを開いている"
+        );
+        // 実行は「Enter」と「クリックの戻り値」の 2 経路のみ
+        assert_eq!(
+            body.matches("execute = Some").count(),
+            2,
+            "実行の起点が 2 経路ではない"
+        );
+    }
+
+    #[test]
+    fn 最近順の加点は索引の末尾でも正の値のまま() {
+        // `recent::MAX_RECENT` 件ぶん下がっても 0 を割らない
+        // (割ると「最近開いた」が未オープンより下に沈む)
+        let last = RECENT_FILE_BONUS - (crate::recent::MAX_RECENT as i32 - 1) * RECENT_FILE_STEP;
+        assert!(last > 0, "最近順の加点が尽きている: {last}");
+        // 一致の段 (TIER_SUBSTR = 30_000) は超えない
+        assert!(RECENT_FILE_BONUS < 30_000, "最近順が一致の質を追い越す");
     }
 }

@@ -37,6 +37,14 @@ pub enum BindAction {
     FileZoomIn,
     FileZoomOut,
     FileZoomReset,
+    /// 取り消し (VS Code: ⌘Z / Ctrl+Z)。
+    ///
+    /// **`TextEdit` より先にここで消費する。** egui 0.29 の `TextEdit` は
+    /// 自前の undoer を持っていて外す API が無いため、打鍵を先に取らないと
+    /// 「egui の粒度」と「バッファの履歴」が二重に動いてしまう。
+    Undo,
+    /// やり直し (VS Code: ⇧⌘Z / Ctrl+Y)。
+    Redo,
     ToggleComment,
     DuplicateLine,
     MoveLineUp,
@@ -52,6 +60,14 @@ pub enum BindAction {
     /// 次/前のエディタタブ (VS Code: ⇧⌘] / ⇧⌘[)
     NextTab,
     PrevTab,
+    /// **最近使った順のタブ切替** (VS Code / Zed と同じ ⌃Tab / ⌃⇧Tab)。
+    ///
+    /// 押しっぱなしの間だけ候補一覧を出し、修飾キーを離したところで確定する
+    /// (`config.toml` の `tab_switch_mru = false` なら位置巡回に戻る)。
+    /// ⌃Tab は macOS の予約表 ([`MACOS_RESERVED`]) に無い — 予約されているのは
+    /// ⌘Tab (アプリ切替) の方で、⌃Tab はアプリまで届く。
+    SwitchTab,
+    SwitchTabBack,
     /// ファイル横断検索 (VS Code: ⇧⌘F)
     GlobalSearch,
     /// 置換 (VS Code: ⌥⌘F)
@@ -65,6 +81,10 @@ pub enum BindAction {
     GoToDefinition,
     /// 対応する括弧へ移動 (VS Code: ⇧⌘\)
     GoToBracket,
+    /// 次の診断へ移動 (VS Code: F8)
+    NextProblem,
+    /// 前の診断へ移動 (VS Code: ⇧F8)
+    PrevProblem,
     /// ビルドタスクの実行 (VS Code: ⇧⌘B)
     RunBuildTask,
     /// 問題パネル (VS Code: ⇧⌘M)
@@ -125,7 +145,7 @@ pub enum BindAction {
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 61] = [
+pub const ALL_ACTIONS: [BindAction; 67] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -147,6 +167,8 @@ pub const ALL_ACTIONS: [BindAction; 61] = [
     BindAction::FileZoomIn,
     BindAction::FileZoomOut,
     BindAction::FileZoomReset,
+    BindAction::Undo,
+    BindAction::Redo,
     BindAction::ToggleComment,
     BindAction::DuplicateLine,
     BindAction::MoveLineUp,
@@ -157,6 +179,8 @@ pub const ALL_ACTIONS: [BindAction; 61] = [
     BindAction::GoToLine,
     BindAction::NextTab,
     BindAction::PrevTab,
+    BindAction::SwitchTab,
+    BindAction::SwitchTabBack,
     BindAction::GlobalSearch,
     BindAction::OpenReplace,
     BindAction::NewTerminal,
@@ -164,6 +188,8 @@ pub const ALL_ACTIONS: [BindAction; 61] = [
     BindAction::NavForward,
     BindAction::GoToDefinition,
     BindAction::GoToBracket,
+    BindAction::NextProblem,
+    BindAction::PrevProblem,
     BindAction::RunBuildTask,
     BindAction::ToggleProblems,
     BindAction::ToggleFullScreen,
@@ -250,6 +276,8 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::FileZoomIn => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Plus),
         BindAction::FileZoomOut => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Minus),
         BindAction::FileZoomReset => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Num0),
+        BindAction::Undo => KeyboardShortcut::new(cmd, Key::Z),
+        BindAction::Redo => KeyboardShortcut::new(cmd_shift, Key::Z),
         BindAction::ToggleComment => KeyboardShortcut::new(cmd, Key::Slash),
         BindAction::DuplicateLine => KeyboardShortcut::new(cmd_shift, Key::D),
         BindAction::MoveLineUp => KeyboardShortcut::new(alt, Key::ArrowUp),
@@ -260,6 +288,16 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::GoToLine => KeyboardShortcut::new(Modifiers::CTRL, Key::G),
         BindAction::NextTab => KeyboardShortcut::new(cmd_shift, Key::CloseBracket),
         BindAction::PrevTab => KeyboardShortcut::new(cmd_shift, Key::OpenBracket),
+        // ⌃Tab / ⌃⇧Tab は VS Code / Zed / ブラウザ共通の「最近使ったタブへ」。
+        // `Modifiers::CTRL` は **どの OS でも物理 Ctrl** に当たる
+        // (mac: ctrl だけ / Windows・Linux: ctrl と command の両方が立つが、
+        //  `cmd_ctrl_matches` は「パターンが ctrl を求めるなら command は
+        //  どちらでもよい」なので両方で一致する)。⌘Tab は macOS の
+        // アプリ切替に取られているので**使わない** (`MACOS_RESERVED`)。
+        BindAction::SwitchTab => KeyboardShortcut::new(Modifiers::CTRL, Key::Tab),
+        BindAction::SwitchTabBack => {
+            KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab)
+        }
         BindAction::GlobalSearch => KeyboardShortcut::new(cmd_shift, Key::F),
         // VS Code の「ファイル間で置換」と同じ ⇧⌘H。既存の割り当てとは重ならない
         BindAction::GlobalReplace => KeyboardShortcut::new(cmd_shift, Key::H),
@@ -284,6 +322,10 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         }
         BindAction::GoToDefinition => KeyboardShortcut::new(Modifiers::NONE, Key::F12),
         BindAction::GoToBracket => KeyboardShortcut::new(cmd_shift, Key::Backslash),
+        // 診断ジャンプは VS Code と同じ F8 / ⇧F8。F7 / ⇧F7 (差分の変更ジャンプ) の
+        // 隣で、macOS の予約表 (F11 = デスクトップ表示) とも衝突しない。
+        BindAction::NextProblem => KeyboardShortcut::new(Modifiers::NONE, Key::F8),
+        BindAction::PrevProblem => KeyboardShortcut::new(Modifiers::SHIFT, Key::F8),
         BindAction::RunBuildTask => KeyboardShortcut::new(cmd_shift, Key::B),
         BindAction::ToggleProblems => KeyboardShortcut::new(cmd_shift, Key::M),
         BindAction::ToggleFullScreen => {
@@ -399,6 +441,8 @@ impl Keybinds {
             // v0.5.1 までの名前。既存の config.toml を黙って壊さないための別名。
             "font_inc" => ZoomIn,
             "font_dec" => ZoomOut,
+            "undo" => Undo,
+            "redo" => Redo,
             "toggle_comment" => ToggleComment,
             "duplicate_line" => DuplicateLine,
             "move_line_up" => MoveLineUp,
@@ -409,6 +453,8 @@ impl Keybinds {
             "goto_line" => GoToLine,
             "next_tab" => NextTab,
             "prev_tab" => PrevTab,
+            "switch_tab" => SwitchTab,
+            "switch_tab_back" => SwitchTabBack,
             "global_search" => GlobalSearch,
             "global_replace" => GlobalReplace,
             "open_replace" => OpenReplace,
@@ -417,6 +463,8 @@ impl Keybinds {
             "nav_forward" => NavForward,
             "goto_definition" => GoToDefinition,
             "goto_bracket" => GoToBracket,
+            "next_problem" => NextProblem,
+            "prev_problem" => PrevProblem,
             "run_build_task" => RunBuildTask,
             "toggle_problems" => ToggleProblems,
             "toggle_fullscreen" => ToggleFullScreen,
@@ -660,6 +708,95 @@ pub fn consume_shortcut_compat(i: &mut egui::InputState, sc: KeyboardShortcut) -
         !is_match
     });
     hit
+}
+
+// ─────────────── IME 変換中はショートカットを消費しない ───────────────
+//
+// ターミナル側は `terminal::translate_input` が「未確定文字列 (preedit) が
+// 空でない間はキーを IME に任せる」規則を持っている。**エディタ側には
+// それが無く**、変換中の生キーが `handle_shortcuts` まで届く環境がある
+// (winit は IME 合成中も KeyboardInput を配ることがある)。そのままだと
+// 「ひらがなを打っているのに ⌘S 相当のバインドが発火する」「変換確定の
+// Enter がコマンドとして食われる」が起きる。
+//
+// 判定は `terminal::ime_ended_in_frame` と**同じ考え方** — イベントの並びは
+// 環境依存 (Windows は Commit の前後に Enabled/Disabled を出し、macOS は
+// Disabled を出さない) なので、順序に依存せずフレーム単位で見る。
+
+/// 変換中フラグの置き場所 (egui の一時データ)。アプリの構造体に持たせないのは、
+/// 「ショートカットを消費してよいか」の判断材料が消費地点の隣にある方が
+/// 落ちにくいため (状態と規則が離れると片方だけ直されて壊れる)。
+fn ime_state_id() -> egui::Id {
+    egui::Id::new("zv-ime-composing")
+}
+
+/// このフレームを処理し終えた時点で「まだ変換中」か。
+///
+/// * `Preedit(非空)` → 変換中に入る / 続く
+/// * `Preedit("")` → 未確定文字列が消えた = 確定 or 取り消しで変換が閉じた
+/// * `Commit` / `Enabled` / `Disabled` → 変換は開いていない
+fn ime_composing_after(events: &[egui::Event], composing: bool) -> bool {
+    let mut composing = composing;
+    for ev in events {
+        if let egui::Event::Ime(ime) = ev {
+            composing = match ime {
+                egui::ImeEvent::Preedit(t) => !t.is_empty(),
+                egui::ImeEvent::Commit(_) | egui::ImeEvent::Enabled | egui::ImeEvent::Disabled => {
+                    false
+                }
+            };
+        }
+    }
+    composing
+}
+
+/// このフレームはショートカットの消費を止めるべきか。
+///
+/// 止めるのは (1) フレーム開始時点で変換中だった (2) このフレームで未確定
+/// 文字列が出た (3) このフレームで確定した、のいずれか。(3) を含めるのは
+/// **確定に使った Enter が同じフレームに載る**ため — ハングルは 1 打鍵ごとに
+/// 音節が組み上がって確定するので、ここを外すと変換のたびに Enter バインドが
+/// 発火する。
+fn ime_blocks_shortcuts(events: &[egui::Event], composing_at_start: bool) -> bool {
+    if composing_at_start {
+        return true;
+    }
+    events.iter().any(|ev| match ev {
+        egui::Event::Ime(egui::ImeEvent::Commit(_)) => true,
+        egui::Event::Ime(egui::ImeEvent::Preedit(t)) => !t.is_empty(),
+        _ => false,
+    })
+}
+
+/// IME 変換中か (変換中フラグを次フレームへ持ち越しつつ判定する)。
+///
+/// **1 フレームに 1 回だけ呼ぶこと** (状態を更新するため)。呼び出し地点は
+/// `App::handle_shortcuts` の先頭 1 か所。
+/// IME 変換中でショートカットを止めるべきか — **状態を進めない読み取り専用版**。
+///
+/// [`ime_blocks_shortcuts_now`] は IME の状態機械を 1 フレーム分**進める**ので、
+/// 同じフレームで 2 回呼んではいけない (2 回目が変換の開始/終了を食う)。
+/// `handle_shortcuts` 以外の場所 — ファイルツリーのキー処理など — から
+/// 「いま変換中か」を見たいときは必ずこちらを使う。
+pub fn ime_blocks_shortcuts_peek(ctx: &egui::Context) -> bool {
+    let was = ctx
+        .data(|d| d.get_temp::<bool>(ime_state_id()))
+        .unwrap_or(false);
+    ctx.input(|i| ime_blocks_shortcuts(&i.events, was))
+}
+
+pub fn ime_blocks_shortcuts_now(ctx: &egui::Context) -> bool {
+    let was = ctx
+        .data(|d| d.get_temp::<bool>(ime_state_id()))
+        .unwrap_or(false);
+    let (blocked, next) = ctx.input(|i| {
+        (
+            ime_blocks_shortcuts(&i.events, was),
+            ime_composing_after(&i.events, was),
+        )
+    });
+    ctx.data_mut(|d| d.insert_temp(ime_state_id(), next));
+    blocked
 }
 
 fn hint_id(a: BindAction) -> egui::Id {
@@ -1193,6 +1330,8 @@ mod tests {
             "file_zoom_in",
             "file_zoom_out",
             "file_zoom_reset",
+            "undo",
+            "redo",
             "toggle_comment",
             "duplicate_line",
             "move_line_up",
@@ -1203,6 +1342,8 @@ mod tests {
             "goto_line",
             "next_tab",
             "prev_tab",
+            "switch_tab",
+            "switch_tab_back",
             "global_search",
             "global_replace",
             "open_replace",
@@ -1211,6 +1352,8 @@ mod tests {
             "nav_forward",
             "goto_definition",
             "goto_bracket",
+            "next_problem",
+            "prev_problem",
             "run_build_task",
             "toggle_problems",
             "toggle_fullscreen",
@@ -1314,7 +1457,9 @@ mod tests {
             .split("fn handle_shortcuts(&mut self, ctx: &egui::Context) {")
             .nth(1)
             .expect("handle_shortcuts がある");
-        let head = &body[..body.len().min(600)];
+        // 素の添字スライスは日本語コメントの途中で切れると panic するので
+        // バイト単位で切ってから lossy 変換する (`window_before` と同じ理由)。
+        let head = String::from_utf8_lossy(&body.as_bytes()[..body.len().min(600)]);
         assert!(
             head.contains("crate::keybinds::consume_shortcut_compat"),
             "handle_shortcuts の consume が互換経路を通っていない"
@@ -1454,6 +1599,167 @@ mod tests {
             },
         );
         assert!(fired, "キーイベントが届けば ⌘⇧C は消費できる");
+    }
+
+    // ──────────────── IME 変換中のショートカット保護 ────────────────
+
+    fn preedit(t: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Preedit(t.to_string()))
+    }
+    fn commit(t: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Commit(t.to_string()))
+    }
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// 日本語入力: `にほんご` を打って変換 → 確定するまで一度も消費しない。
+    ///
+    /// 変換中に生の `Text` / `Key` が漏れる環境があり、そのまま
+    /// `handle_shortcuts` へ流すと「かなを打っているだけでコマンドが走る」。
+    #[test]
+    fn 日本語の変換中はショートカットを消費しない() {
+        // (このフレームのイベント, 開始時の変換中フラグ → 期待: 止める?, 次フレームの変換中?)
+        let steps: &[(Vec<egui::Event>, bool, bool, &str)] = &[
+            (vec![], false, false, "何も起きていないフレームは素通し"),
+            (
+                vec![preedit("に")],
+                true,
+                true,
+                "未確定が出た瞬間から止める",
+            ),
+            (
+                vec![preedit("にほん"), enter()],
+                true,
+                true,
+                "変換中の Enter (候補確定) はアプリへ渡さない",
+            ),
+            (
+                vec![commit("日本語"), enter()],
+                true,
+                false,
+                "確定フレームの Enter も渡さない (確定は IME への操作)",
+            ),
+            (
+                vec![enter()],
+                false,
+                false,
+                "確定の次フレームの Enter は通常どおり",
+            ),
+        ];
+        let mut composing = false;
+        for (events, want_block, want_after, what) in steps {
+            assert_eq!(
+                ime_blocks_shortcuts(events, composing),
+                *want_block,
+                "{what}"
+            );
+            composing = ime_composing_after(events, composing);
+            assert_eq!(composing, *want_after, "{what}: 変換中フラグ");
+        }
+    }
+
+    /// ハングル: 1 打鍵ごとに音節が組み上がって確定する (ㅎ → 하 → 한)。
+    ///
+    /// 分解字母のあいだも「変換中」であり続けること。ここを取りこぼすと
+    /// 韓国語入力のあいだ中ショートカットが暴発する。
+    #[test]
+    fn ハングルの分解字母の途中でもショートカットを消費しない() {
+        let mut composing = false;
+        // 分解字母 (초성 → +중성 → +종성) が preedit として届く
+        for step in ["\u{1112}", "\u{1112}\u{1161}", "\u{1112}\u{1161}\u{11AB}"] {
+            let events = vec![preedit(step)];
+            assert!(
+                ime_blocks_shortcuts(&events, composing),
+                "分解字母 {step:?} の途中"
+            );
+            composing = ime_composing_after(&events, composing);
+            assert!(composing, "分解字母 {step:?} のあとも変換中");
+        }
+        // 確定 (完成形 한) — Windows は Commit の前後に Enabled/Disabled を出す
+        let events = vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            commit("한"),
+            egui::Event::Ime(egui::ImeEvent::Disabled),
+        ];
+        assert!(
+            ime_blocks_shortcuts(&events, composing),
+            "確定フレームも止める"
+        );
+        assert!(
+            !ime_composing_after(&events, composing),
+            "確定したら変換中は終わる"
+        );
+    }
+
+    /// 変換の**取り消し** (Escape) も、順序に依存せず変換の終わりとして扱う。
+    #[test]
+    fn 変換の取り消しでも変換中フラグが残らない() {
+        let composing = ime_composing_after(&[preedit("にほん")], false);
+        assert!(composing);
+        // macOS は Disabled を出さず Preedit("") だけ、Windows は両方出す
+        assert!(
+            !ime_composing_after(&[preedit("")], composing),
+            "macOS の並び"
+        );
+        assert!(
+            !ime_composing_after(
+                &[preedit(""), egui::Event::Ime(egui::ImeEvent::Disabled)],
+                composing
+            ),
+            "Windows の並び"
+        );
+    }
+
+    /// 実際の `egui::Context` を 2 フレーム回して、変換中フラグが
+    /// フレームをまたいで持ち越されることを確かめる。
+    #[test]
+    fn 変換中フラグはフレームをまたいで持ち越される() {
+        let ctx = egui::Context::default();
+        let run = |events: Vec<egui::Event>| -> bool {
+            let mut blocked = false;
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| blocked = ime_blocks_shortcuts_now(ctx),
+            );
+            blocked
+        };
+        assert!(!run(vec![]), "変換していないフレームは素通し");
+        assert!(run(vec![preedit("に")]), "未確定が出たフレーム");
+        // イベントの無いフレームでも「変換中」は続く (IME は開いたまま)
+        assert!(run(vec![]), "変換中はイベントが無くても止める");
+        assert!(run(vec![commit("に")]), "確定フレーム");
+        assert!(!run(vec![]), "確定の次フレームから通常どおり");
+    }
+
+    /// `handle_shortcuts` の先頭に IME ガードがある (消費の前に必ず通る)。
+    ///
+    /// ガードを消費地点の**後ろ**へ動かすと、そのフレームのショートカットは
+    /// もう食われている。位置が仕様なので構造で固定する。
+    #[test]
+    fn ショートカット消費の前に必ず変換中ガードを通る() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn handle_shortcuts(&mut self, ctx: &egui::Context)")
+            .nth(1)
+            .expect("ショートカット処理がある");
+        let guard = body
+            .find("keybinds::ime_blocks_shortcuts_now(ctx)")
+            .expect("IME ガードが handle_shortcuts に無い");
+        let first_consume = body.find("if consume(ctx,").expect("消費地点がある");
+        assert!(
+            guard < first_consume,
+            "IME ガードが最初の consume より後ろにある (変換中に食われる)"
+        );
     }
 
     /// UI に出るショートカット文字列をベタ書きしていない。

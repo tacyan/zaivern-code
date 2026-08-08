@@ -3,6 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// ファイル索引 (⌘P) の既定の上限。`.gitignore` を尊重すれば
+/// 数万ファイル規模のモノレポでも届かない値にしてある
+/// (以前は 8000 件 / 深さ 12 で**無音**に打ち切っていた)。
+pub const DEFAULT_INDEX_MAX_FILES: usize = 50_000;
+/// ファイル索引が潜る既定の深さ。node_modules を除いた実在のツリーは
+/// 20 段も無いが、生成物混じりのリポジトリでも足りるよう余裕を持たせる。
+pub const DEFAULT_INDEX_MAX_DEPTH: usize = 32;
+/// ツリーの 1 ディレクトリで一度に描く既定の行数。
+/// 画面に入るのは数十行なので、これを超えたぶんは「さらに N 件」に畳む。
+pub const DEFAULT_TREE_DIR_PAGE: usize = 300;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -17,6 +28,28 @@ pub struct Config {
     pub ui_zoom: f32,
     pub show_hidden_files: bool,
 
+    /// `.gitignore` (+ `.git/info/exclude` + `core.excludesFile`) を尊重して
+    /// ファイルツリーとファイル索引 (⌘P) から除外するか。**既定はオン**。
+    /// これが無いと `node_modules` / `target` がツリーと索引を埋め尽くす。
+    pub respect_gitignore: bool,
+
+    /// 無視されたファイルを隠さず**薄く**表示するか (VS Code と同じ見せ方)。
+    /// `respect_gitignore = false` のときは意味を持たない。既定はオフ。
+    pub dim_ignored_files: bool,
+
+    /// ファイル索引 (⌘P) に載せる最大件数。上限に達したらパレットに
+    /// 「N 件で打ち切りました」と出す (無音で切らない)。
+    /// `.gitignore` を尊重していれば数万件のリポジトリでも届かない。
+    pub index_max_files: usize,
+
+    /// ファイル索引が潜る最大の深さ (ルート直下 = 1)。
+    pub index_max_depth: usize,
+
+    /// ツリーの 1 ディレクトリで一度に描く行数の上限。
+    /// 超えたぶんは「さらに N 件」を押すと同じ数だけ伸びる
+    /// (巨大ディレクトリで数万行を描いてフレームを落とさないため)。
+    pub tree_dir_page: usize,
+
     /// エディタ本文の折り返し (VS Code の Word Wrap 相当)。既定はオフ。
     pub word_wrap: bool,
 
@@ -28,10 +61,27 @@ pub struct Config {
     /// オフにすると要求自体を送らないので、サーバーへの往復もゼロになる。
     pub lsp_highlight_occurrences: bool,
 
+    /// 診断メッセージを本文の**行末**に淡色で出すか (VS Code の Error Lens 相当)。
+    /// **既定はオン。ただし出すのはキャレット行だけ** — 全行に出すと本文の
+    /// 右側が文章で埋まり、コードより診断の方が目立ってしまう。
+    /// オフにしても波線とホバーは残る (消えるのは行末の文字だけ)。
+    pub inline_diagnostics: bool,
+
     /// エディタ右端のミニマップ (VS Code の遠景ビュー相当)。
     /// **既定はオフ** — 本文の横幅を 64px 奪うので、欲しい人だけが払う。
     /// 幅が足りない画面では設定が ON でも自動的に隠れる。
     pub minimap: bool,
+
+    /// 取り消し履歴: 連続した文字入力を 1 段へまとめる時間しきい値 (ミリ秒)。
+    /// これを越えて間が空いたら別の段になる (VS Code / Zed と同じ考え方)。
+    pub undo_merge_ms: u64,
+
+    /// 取り消し履歴の最大段数 (タブ 1 枚あたり)。古いものから捨てる。
+    pub undo_max_steps: usize,
+
+    /// 取り消し履歴が抱える差分の合計バイト上限 (タブ 1 枚あたり)。
+    /// 巨大な一括置換を何度もやっても、ここで頭打ちになる。
+    pub undo_max_bytes: usize,
 
     /// エディタ上部のブレッドクラム (`ワークスペース › フォルダ › ファイル › シンボル`)。
     /// **既定はオン** — 高さ 1 行ぶんで、どの言語でも (LSP 無しでも) 必ず出せる。
@@ -59,6 +109,23 @@ pub struct Config {
     /// エディタ左端のガターに git blame (著者 · 相対日時) を出す。既定はオフ。
     /// オンの間だけ可視範囲ぶんの `git blame` を非同期で取る。
     pub git_blame: bool,
+
+    /// タブ切替 (Ctrl+Tab) を **MRU (最近使った順)** で回すか。
+    ///
+    /// **既定はオン** — VS Code / Zed と同じで、押しっぱなしの間に候補一覧を
+    /// 出し、離したところで確定する。2 回押せば直前のファイルへ戻れる。
+    /// オフにすると従来どおりの**位置巡回** (タブの並び順) になる。
+    /// どちらでも `[keybindings]` の `switch_tab` / `switch_tab_back` で
+    /// 打鍵を付け替えられる。
+    pub tab_switch_mru: bool,
+
+    /// **プレビュータブ** (VS Code の斜体タブ) を使うか。
+    ///
+    /// **既定はオン** — ツリーやパレットからシングルクリックで開いたタブは
+    /// 使い捨てになり、次のプレビューで置き換わるのでタブが無限に増えない。
+    /// もう一度クリック / 編集 / ピン留め / ドラッグで確定タブへ昇格する。
+    /// オフにすると開いたタブは常に確定タブになる。
+    pub preview_tabs: bool,
 
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
@@ -172,6 +239,25 @@ pub struct Config {
     /// レート制限時のアカウント自動フェイルオーバー (`[failover]`)。
     /// **既定は無効** — ユーザーが明示的に有効化したときだけ働く。
     pub failover: crate::failover::FailoverConfig,
+
+    /// コマンドパレットの MRU (最近実行したコマンド。先頭が直近)。
+    ///
+    /// UI の操作から溜まる値なので手書きの config.toml には**書かない** —
+    /// state.toml 側 (`[[palette_recent]]`) に置く。`save_state` が
+    /// この控えをそのまま書き戻すので、テーマ変更などで消えることはない。
+    #[serde(skip)]
+    pub palette_recent: Vec<PaletteRecent>,
+}
+
+/// パレット MRU の永続化 1 件ぶん。**アクションは保存しない** —
+/// `Cmd` にはパスや添字が入り、次の起動では別物を指しうるため。
+/// ラベルから引き直せなければ順位付けにだけ使う (palette.rs)。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaletteRecent {
+    pub label: String,
+    pub icon: String,
+    pub uses: u32,
 }
 
 /// `[super_agent]` セクション。**どのエージェントに他のエージェントを見張らせるか**。
@@ -277,15 +363,26 @@ impl Default for Config {
             terminal_font_size: 13.0,
             ui_zoom: crate::zoom::DEFAULT,
             show_hidden_files: true,
+            respect_gitignore: true,
+            dim_ignored_files: false,
+            index_max_files: DEFAULT_INDEX_MAX_FILES,
+            index_max_depth: DEFAULT_INDEX_MAX_DEPTH,
+            tree_dir_page: DEFAULT_TREE_DIR_PAGE,
             word_wrap: false,
             show_whitespace: false,
             lsp_highlight_occurrences: true,
+            inline_diagnostics: true,
             minimap: false,
+            undo_merge_ms: crate::editor::UNDO_MERGE_MS,
+            undo_max_steps: crate::editor::UNDO_MAX_STEPS,
+            undo_max_bytes: crate::editor::UNDO_MAX_BYTES,
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
             git_blame: false,
             confirm_drag_and_drop: true,
             enable_trash: true,
+            tab_switch_mru: true,
+            preview_tabs: true,
             approval_mode: "ask".into(),
             restore_agents: false,
             show_pet: true,
@@ -326,6 +423,19 @@ impl Default for Config {
             super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),
             failover: crate::failover::FailoverConfig::default(),
+            palette_recent: Vec::new(),
+        }
+    }
+}
+
+impl Config {
+    /// 取り消し履歴のしきい値と上限。**呼び出し側で直書きしないための唯一の口**。
+    pub fn history_limits(&self) -> crate::editor::HistoryLimits {
+        crate::editor::HistoryLimits {
+            merge_ms: self.undo_merge_ms,
+            // 0 を書かれても 1 段は残す (`History::trim` 側でも守っている)
+            max_steps: self.undo_max_steps.max(1),
+            max_bytes: self.undo_max_bytes,
         }
     }
 }
@@ -482,6 +592,11 @@ struct Overlay {
     terminal_font_size: Option<f32>,
     ui_zoom: Option<f32>,
     show_hidden_files: Option<bool>,
+    respect_gitignore: Option<bool>,
+    dim_ignored_files: Option<bool>,
+    index_max_files: Option<usize>,
+    index_max_depth: Option<usize>,
+    tree_dir_page: Option<usize>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
     minimap: Option<bool>,
@@ -519,6 +634,10 @@ struct UiState {
     /// なく state 側に置く (config.toml をアプリが書き換えない方針)。
     confirm_drag_and_drop: Option<bool>,
     enable_trash: Option<bool>,
+    /// タブ切替を MRU で回すか (パレットから切り替えるので state 側に置く)。
+    tab_switch_mru: Option<bool>,
+    /// プレビュータブを使うか (同上)。
+    preview_tabs: Option<bool>,
     pet_image: Option<String>,
     pet_x: Option<f32>,
     pet_y: Option<f32>,
@@ -548,6 +667,10 @@ struct UiState {
     /// 切り替えるものなので、手書きの config.toml ではなく state 側に置く。
     /// 上限やクールダウンの数値は `[failover]` (config.toml) のまま。
     failover_enabled: Option<bool>,
+    /// コマンドパレットの MRU。**配列のテーブルなので必ず最後の項目に置く**
+    /// (TOML は値をテーブルより先に書く必要があり、途中に置くと
+    /// `toml::to_string_pretty` が state.toml 全体を書けなくなる)。
+    palette_recent: Option<Vec<PaletteRecent>>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -585,6 +708,23 @@ editor_font_size = 15.0
 terminal_font_size = 13.0
 show_hidden_files = true
 
+# .gitignore (+ .git/info/exclude + core.excludesFile) を尊重して
+# ファイルツリーとファイル検索 (⌘P) から除外します。既定は true。
+# false にすると node_modules / target なども全部並びます。
+# respect_gitignore = true
+# 無視されたファイルを隠さず「薄く」表示する (VS Code と同じ見せ方)。既定は false。
+# respect_gitignore = false のときは効きません。
+# dim_ignored_files = false
+
+# ファイル検索 (⌘P) の索引の上限。上限に達したらパレットにその旨を出します
+# (黙って切り捨てません)。索引はバックグラウンドで作るので UI は止まりません。
+# index_max_files = 50000
+# index_max_depth = 32
+
+# ツリーの 1 フォルダで一度に描く行数。超えたぶんは「さらに N 件」に畳みます
+# (巨大フォルダで数万行を描いてカクつかせないため)。
+# tree_dir_page = 300
+
 # 画面全体のズーム (0.5〜3.0)。UI の全部が一緒に拡大縮小します。
 # ⌘+ / ⌘- / ⌘0 で変えた値は ~/.zaivern/state.toml に覚えるので、
 # ここに書くのは「起動時の初期値を固定したい」ときだけで構いません。
@@ -600,6 +740,20 @@ show_hidden_files = true
 # (コマンドパレットの「同一シンボルのハイライト切替」でも変更できます)
 # lsp_highlight_occurrences = true
 
+# 診断メッセージを本文の行末に淡色で出す (VS Code の Error Lens 相当)
+# 出るのは**キャレット行だけ**です。オフにしても波線とホバーは残ります
+# (コマンドパレットの「行末の診断メッセージ切替」でも変更できます)
+# inline_diagnostics = true
+# 取り消し (Undo) 履歴の粒度とメモリ上限。タブ 1 枚あたりの値です。
+#   undo_merge_ms  = 続けて打った文字を 1 段にまとめる時間しきい値 (ミリ秒)。
+#                    これを超えて間が空くと別の段になります。0 にすると 1 打鍵 = 1 段。
+#   undo_max_steps = 保持する最大段数。超えたぶんは古い方から捨てます。
+#   undo_max_bytes = 履歴が抱える差分の合計バイト上限。巨大な一括置換を
+#                    繰り返してもここで頭打ちになります。
+# undo_merge_ms = 400
+# undo_max_steps = 400
+# undo_max_bytes = 4194304
+
 # ミニマップ (エディタ右端の遠景) とブレッドクラム (上部のパンくず)
 # (表示メニュー・コマンドパレットの「ミニマップの表示切替」「ブレッドクラムの表示切替」でも変更できます)
 # ミニマップは本文の幅を 64px 使うため既定はオフ。狭い画面では自動的に隠れます
@@ -608,6 +762,17 @@ show_hidden_files = true
 # ガターに git blame (著者 · 相対日時) を出す。既定はオフ
 # (表示メニュー・コマンドパレットの「Git blame の表示切替」でも変更できます)
 # git_blame = false
+
+# タブ切替 (Ctrl+Tab / Ctrl+Shift+Tab) を最近使った順 (MRU) で回すか。
+# 既定はオン = 押している間に候補一覧が出て、離したところで確定します
+# (2 回押せば直前のファイルへ戻る)。false にすると並び順の巡回になります。
+# (コマンドパレットの「タブ切替を最近使った順/並び順にする」でも変更できます)
+# tab_switch_mru = true
+# プレビュータブ (斜体の使い捨てタブ)。既定はオン = ツリーやパレットから
+# 1 回クリックして開いたタブは次のプレビューで置き換わるので増え続けません。
+# もう一度クリック / 編集 / ピン留め / ドラッグで確定タブになります。
+# (コマンドパレットの「プレビュータブの切替」でも変更できます)
+# preview_tabs = true
 
 # 既定の権限モード (claude / codex / agy に自動適用)
 #   "ask"   = 毎回ユーザー承認が必要（安全・デフォルト）
@@ -969,6 +1134,12 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.enable_trash {
                     cfg.enable_trash = v;
                 }
+                if let Some(v) = st.tab_switch_mru {
+                    cfg.tab_switch_mru = v;
+                }
+                if let Some(v) = st.preview_tabs {
+                    cfg.preview_tabs = v;
+                }
                 if st.pet_image.is_some() {
                     cfg.pet_image = st.pet_image;
                 }
@@ -1034,6 +1205,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 }
                 if let Some(v) = st.super_agent_timeout_secs {
                     cfg.super_agent.timeout_secs = v;
+                }
+                if let Some(v) = st.palette_recent {
+                    cfg.palette_recent = v;
                 }
                 if let Some(v) = st.failover_enabled {
                     cfg.failover.enabled = v;
@@ -1121,6 +1295,21 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
             }
             if let Some(v) = o.show_hidden_files {
                 cfg.show_hidden_files = v;
+            }
+            if let Some(v) = o.respect_gitignore {
+                cfg.respect_gitignore = v;
+            }
+            if let Some(v) = o.dim_ignored_files {
+                cfg.dim_ignored_files = v;
+            }
+            if let Some(v) = o.index_max_files {
+                cfg.index_max_files = v;
+            }
+            if let Some(v) = o.index_max_depth {
+                cfg.index_max_depth = v;
+            }
+            if let Some(v) = o.tree_dir_page {
+                cfg.tree_dir_page = v;
             }
             if let Some(v) = o.word_wrap {
                 cfg.word_wrap = v;
@@ -1361,6 +1550,8 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         git_blame: Some(cfg.global_git_blame),
         confirm_drag_and_drop: Some(cfg.confirm_drag_and_drop),
         enable_trash: Some(cfg.enable_trash),
+        tab_switch_mru: Some(cfg.tab_switch_mru),
+        preview_tabs: Some(cfg.preview_tabs),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -1384,6 +1575,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         super_agent_enabled: Some(cfg.super_agent.enabled),
         super_agent_timeout_secs: Some(cfg.super_agent.timeout_secs),
         failover_enabled: Some(cfg.failover.enabled),
+        palette_recent: Some(cfg.palette_recent.clone()),
     };
     if let Ok(s) = toml::to_string_pretty(&st) {
         let _ = std::fs::create_dir_all(dir);
@@ -1965,6 +2157,8 @@ command = "agy"
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
+            tab_switch_mru: Some(false),
+            preview_tabs: Some(false),
             minimap: Some(true),
             breadcrumbs: Some(false),
             diff_view: Some("inline".into()),
@@ -1994,6 +2188,11 @@ command = "agy"
             super_agent_enabled: Some(true),
             super_agent_timeout_secs: Some(45),
             failover_enabled: Some(true),
+            palette_recent: Some(vec![PaletteRecent {
+                label: "保存".into(),
+                icon: "💾".into(),
+                uses: 3,
+            }]),
         };
         let s = toml::to_string_pretty(&st).expect("UiState は TOML 化できる");
         let back: UiState = toml::from_str(&s).expect("読み戻せる");
@@ -2032,6 +2231,15 @@ command = "agy"
         assert_eq!(back.super_agent_timeout_secs, Some(45));
         // 自動フェイルオーバーの有効/無効も state に残る
         assert_eq!(back.failover_enabled, Some(true));
+        // パレットの MRU も state に残る (アクションは保存しない)
+        assert_eq!(
+            back.palette_recent,
+            Some(vec![PaletteRecent {
+                label: "保存".into(),
+                icon: "💾".into(),
+                uses: 3,
+            }])
+        );
     }
 
     #[test]
@@ -2645,6 +2853,76 @@ mod state_overlay_tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn パレットのmruは保存と読み込みで順序が保たれる() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "palette-mru");
+        let mut cfg = Config::default();
+        assert!(cfg.palette_recent.is_empty(), "既定は空");
+        cfg.palette_recent = vec![
+            PaletteRecent {
+                label: "ターミナル表示切替".into(),
+                icon: "🖥".into(),
+                uses: 5,
+            },
+            PaletteRecent {
+                label: "保存".into(),
+                icon: "💾".into(),
+                uses: 2,
+            },
+            PaletteRecent {
+                label: "絵文字🎨と日本語".into(),
+                icon: String::new(),
+                uses: 1,
+            },
+        ];
+        save_state_to_dir(&home, &cfg);
+        let loaded = load_from_dir(&home, &[], true);
+        assert_eq!(
+            loaded.palette_recent, cfg.palette_recent,
+            "MRU が往復で変わった (順序・回数・アイコン)"
+        );
+
+        // 別の UI 操作 (テーマ変更) で save_state しても MRU は消えない
+        let mut next = loaded;
+        next.global_theme = "zaivern-light".into();
+        save_state_to_dir(&home, &next);
+        let again = load_from_dir(&home, &[], true);
+        assert_eq!(again.palette_recent, cfg.palette_recent, "MRU が消えた");
+        assert_eq!(again.theme, "zaivern-light");
+
+        // config.toml (手書き) には書かない = state.toml 側だけに現れる
+        let state = std::fs::read_to_string(home.join("state.toml")).expect("state.toml");
+        assert!(state.contains("palette_recent"), "state.toml に無い");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn 壊れたstateファイルでもmruはパニックせず既定に戻る() {
+        for (tag, body) in [
+            ("broken-toml", "palette_recent = [[[\n"),
+            ("wrong-type", "palette_recent = 42\n"),
+            (
+                "missing-fields",
+                "theme = \"zaivern-dark\"\n[[palette_recent]]\n",
+            ),
+            ("empty", ""),
+        ] {
+            let home = crate::test_util::unique_temp_dir("zaivern-config-test", tag);
+            std::fs::write(home.join("state.toml"), body).expect("write state.toml");
+            // 壊れていても load は成立し、MRU は既定 (空 or 既定値) に落ちる
+            let cfg = load_from_dir(&home, &[], true);
+            for r in &cfg.palette_recent {
+                // 欠けたフィールドは serde の default (空文字 / 0) で埋まる
+                assert!(r.uses < u32::MAX, "tag={tag}");
+            }
+            if tag != "missing-fields" {
+                assert!(cfg.palette_recent.is_empty(), "tag={tag} は空に戻るはず");
+            }
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     #[test]
