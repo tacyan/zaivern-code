@@ -344,10 +344,12 @@ fn edit_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
     let ed = info.has_editor;
     ui.menu_button(tr("編集"), |ui| {
         ui.set_min_width(280.0);
-        if item(ui, &tr("元に戻す"), &native_sc("cmd+z"), ed) {
+        // 取り消しは自前の履歴なので、割り当ては config.toml で変えられる。
+        // ここも必ず現在のバインドから表記を作る (ベタ書きは嘘になる)。
+        if item(ui, &tr("元に戻す"), &sc(keys, BindAction::Undo), ed) {
             cmds.push(Cmd::Undo);
         }
-        if item(ui, &tr("やり直し"), &native_sc("cmd+shift+z"), ed) {
+        if item(ui, &tr("やり直し"), &sc(keys, BindAction::Redo), ed) {
             cmds.push(Cmd::Redo);
         }
         ui.separator();

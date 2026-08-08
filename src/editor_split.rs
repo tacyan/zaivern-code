@@ -46,6 +46,9 @@ pub const TAB_CHROME_W: f32 = 20.0 + 18.0;
 pub const TAB_MIN_TEXT_W: f32 = 46.0;
 /// アイコンのみのタブの幅。
 pub const TAB_ICON_W: f32 = 30.0;
+/// ピン留めタブの幅。**アイコン + 短縮名だけ**で、「×」は置かない —
+/// 誤って閉じないことがピン留めの目的なので、閉じるボタンを出す意味が無い。
+pub const TAB_PIN_W: f32 = TAB_ICON_W + 24.0;
 
 // ════════════════════════════════════════════════════════════════════
 // 純関数のレイアウト
@@ -101,61 +104,195 @@ pub enum TabLabelMode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TabStrip {
     pub mode: TabLabelMode,
-    /// タブ 1 枚の幅。
+    /// 通常タブ 1 枚の幅。
     pub tab_w: f32,
+    /// ピン留めタブ 1 枚の幅 (常に `tab_w` 以下か、アイコン幅と同じ)。
+    pub pin_w: f32,
     /// 横スクロールが要るか (アイコンのみでも収まらないとき)。
     pub scroll: bool,
 }
 
-/// **可用幅・タブ数・最長ラベル幅 → 1 枚の幅と縮退の度合い** (純関数)。
+/// **可用幅・タブ数・ピン留め枚数・最長ラベル幅 → 各タブの幅** (純関数)。
+///
+/// ピン留めタブは左端に固定幅 ([`TAB_PIN_W`]) で並び、残りの幅を通常タブが
+/// 分け合う。縮退の順は「そのまま → 省略 → アイコンのみ → 横スクロール」。
 ///
 /// 不変条件:
-/// * `tab_w >= 0` かつ有限
-/// * `scroll == false` なら `tab_w * count <= avail_w` (= 見切れない)
-/// * `count == 0` なら `tab_w == 0`
-pub fn tab_strip(avail_w: f32, count: usize, longest_label_w: f32) -> TabStrip {
+/// * `tab_w` / `pin_w` は有限で 0 以上
+/// * `scroll == false` なら [`tab_total_w`] `<= avail_w` (= 見切れない)
+/// * `count == 0` なら幅はどちらも 0
+pub fn tab_strip_pinned(
+    avail_w: f32,
+    count: usize,
+    pinned: usize,
+    longest_label_w: f32,
+) -> TabStrip {
     if count == 0 || !avail_w.is_finite() || avail_w <= 0.0 {
         return TabStrip {
             mode: TabLabelMode::IconOnly,
             tab_w: 0.0,
+            pin_w: 0.0,
             scroll: false,
         };
     }
-    let n = count as f32;
+    let pinned = pinned.min(count);
+    let rest = count - pinned;
     let label = if longest_label_w.is_finite() {
         longest_label_w.max(0.0)
     } else {
         0.0
     };
     let ideal = label + TAB_CHROME_W;
-    if ideal * n <= avail_w {
+    let pin_take = TAB_PIN_W * pinned as f32;
+    if pin_take + ideal * rest as f32 <= avail_w {
         return TabStrip {
             mode: TabLabelMode::Full,
-            tab_w: ideal,
+            // 全部ピン留めなら「通常タブの幅」は使われないが、
+            // 不変条件 (`tab_w * count <= avail_w`) を保つ値にしておく。
+            tab_w: if rest == 0 { TAB_PIN_W } else { ideal },
+            pin_w: TAB_PIN_W,
             scroll: false,
         };
     }
-    let share = avail_w / n;
-    if share >= TAB_MIN_TEXT_W {
+    let share = if rest == 0 {
+        0.0
+    } else {
+        (avail_w - pin_take) / rest as f32
+    };
+    if rest > 0 && share >= TAB_MIN_TEXT_W {
         return TabStrip {
             mode: TabLabelMode::Truncated,
             tab_w: share,
+            pin_w: TAB_PIN_W,
             scroll: false,
         };
     }
     // アイコンだけにしても入らない幅 → 横スクロールへ逃がす。
-    if TAB_ICON_W * n <= avail_w {
-        TabStrip {
-            mode: TabLabelMode::IconOnly,
-            tab_w: TAB_ICON_W,
-            scroll: false,
+    TabStrip {
+        mode: TabLabelMode::IconOnly,
+        tab_w: TAB_ICON_W,
+        pin_w: TAB_ICON_W,
+        scroll: TAB_ICON_W * count as f32 > avail_w,
+    }
+}
+
+/// タブ列が実際に使う横幅 (純関数)。`scroll == false` ならこれが可用幅以下。
+pub fn tab_total_w(layout: TabStrip, count: usize, pinned: usize) -> f32 {
+    let pinned = pinned.min(count);
+    layout.pin_w * pinned as f32 + layout.tab_w * (count - pinned) as f32
+}
+
+/// **タブ列の矩形 → 1 枚ずつの矩形** (純関数)。左から
+/// ピン留め ([`TabStrip::pin_w`]) → 通常 ([`TabStrip::tab_w`]) の順に詰める。
+///
+/// 不変条件: 返る矩形は互いに重ならず、`scroll == false` なら全部 `strip` の内側。
+pub fn tab_rects(
+    strip: egui::Rect,
+    layout: TabStrip,
+    count: usize,
+    pinned: usize,
+) -> Vec<egui::Rect> {
+    let mut out = Vec::with_capacity(count);
+    if count == 0 || strip.height() <= 0.0 || (layout.tab_w <= 0.0 && layout.pin_w <= 0.0) {
+        return out;
+    }
+    let pinned = pinned.min(count);
+    let mut x = strip.min.x;
+    for i in 0..count {
+        let w = if i < pinned {
+            layout.pin_w
+        } else {
+            layout.tab_w
         }
+        .max(0.0);
+        out.push(egui::Rect::from_min_max(
+            egui::pos2(x, strip.min.y),
+            egui::pos2(x + w, strip.max.y),
+        ));
+        x += w;
+    }
+    out
+}
+
+/// ドラッグの落とし先を**ピン境界でクランプ**する (純関数)。
+///
+/// ピン留めタブは左の区画から出られず、通常タブは左の区画へ入れない
+/// (= ピン留めが常に左端に固まっているという不変条件を、ドラッグでも壊さない)。
+pub fn clamp_reorder(count: usize, pinned: usize, from: usize, to: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let pinned = pinned.min(count);
+    let last = count - 1;
+    if from < pinned {
+        to.min(pinned.saturating_sub(1))
     } else {
-        TabStrip {
-            mode: TabLabelMode::IconOnly,
-            tab_w: TAB_ICON_W,
-            scroll: true,
+        to.max(pinned).min(last)
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// MRU タブ切替 (⌃Tab)
+// ════════════════════════════════════════════════════════════════════
+
+/// ⌃Tab を**押している間**だけ生きる切替の状態。
+///
+/// VS Code / Zed と同じ約束: 押すたびに候補を 1 つ進め、修飾キーを
+/// **離した瞬間に確定**する。押している間はどのタブもアクティブにしない
+/// (画面が突然変わらない — 動くのはオーバーレイの選択枠だけ)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabSwitcher {
+    /// 切替の対象ペイン。別のペインへフォーカスが移ったら畳む。
+    pub pane: PaneId,
+    /// MRU 順の候補 (先頭 = 開き始めた時点のアクティブ)。
+    pub order: Vec<BufId>,
+    /// いま選んでいる位置 (`order` の index)。
+    pub sel: usize,
+}
+
+impl TabSwitcher {
+    /// `order` の 2 番目 (= 直前に使ったタブ) を選んだ状態で始める。
+    /// **候補が 2 枚未満なら `None`** — 1 枚しか無いのに枠だけ出さない。
+    pub fn start(pane: PaneId, order: Vec<BufId>, dir: i64) -> Option<Self> {
+        if order.len() < 2 {
+            return None;
         }
+        let mut s = Self {
+            pane,
+            order,
+            sel: 0,
+        };
+        s.step(dir);
+        Some(s)
+    }
+
+    /// 候補を 1 つ進める / 戻す (端は巡回する)。
+    pub fn step(&mut self, dir: i64) {
+        let n = self.order.len();
+        if n == 0 {
+            return;
+        }
+        let d = if dir >= 0 { 1 } else { -1 };
+        self.sel = (self.sel as i64 + d).rem_euclid(n as i64) as usize;
+    }
+
+    /// いま選んでいるバッファ。
+    pub fn pick(&self) -> Option<BufId> {
+        self.order.get(self.sel).copied()
+    }
+
+    /// 候補から消えたタブ (閉じられた) を落とす。空になったら `false` =
+    /// 呼び出し側は切替を畳む。
+    pub fn retain_alive(&mut self, alive: &[BufId]) -> bool {
+        let cur = self.pick();
+        self.order.retain(|b| alive.contains(b));
+        if self.order.len() < 2 {
+            return false;
+        }
+        self.sel = cur
+            .and_then(|c| self.order.iter().position(|b| *b == c))
+            .unwrap_or(0);
+        true
     }
 }
 
@@ -176,6 +313,16 @@ pub struct EditorPane {
     pub scroll: f32,
     /// カーソル (行, 桁) 1 始まり (ペインごと)。
     pub cursor: (usize, usize),
+    /// ピン留めされたタブ。[`Self::normalize`] が `tabs` の**先頭側へ寄せる**ので、
+    /// 「先頭から連続する N 枚がピン留め」という不変条件が常に成り立つ。
+    pub pinned: Vec<BufId>,
+    /// 最近使った順 (先頭が最新)。Ctrl+Tab の巡回順の真実源。
+    /// `tabs` に居ないバッファは持たない。
+    pub mru: Vec<BufId>,
+    /// プレビュータブ (使い捨て・斜体)。ペインに高々 1 枚。
+    /// 次のプレビューで置き換わり、確定 (編集 / ピン留め / ドラッグ / 再クリック)
+    /// で `None` へ落ちる。
+    pub preview: Option<BufId>,
 }
 
 impl EditorPane {
@@ -186,6 +333,9 @@ impl EditorPane {
             active: 0,
             scroll: 0.0,
             cursor: (1, 1),
+            pinned: Vec::new(),
+            mru: Vec::new(),
+            preview: None,
         }
     }
 
@@ -198,6 +348,7 @@ impl EditorPane {
         match self.tabs.iter().position(|b| *b == buf) {
             Some(i) => {
                 self.active = i;
+                self.touch(buf);
                 true
             }
             None => false,
@@ -217,7 +368,120 @@ impl EditorPane {
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         }
+        // ピン留め・MRU・プレビューからも必ず落とす
+        // (消えたタブを指したままにすると Ctrl+Tab が幽霊を選ぶ)。
+        self.pinned.retain(|b| *b != buf);
+        self.mru.retain(|b| *b != buf);
+        if self.preview == Some(buf) {
+            self.preview = None;
+        }
         true
+    }
+
+    // ── ピン留め / MRU / プレビュー ──────────────────────────────
+
+    /// ピン留めされているか。
+    pub fn is_pinned(&self, buf: BufId) -> bool {
+        self.pinned.contains(&buf)
+    }
+
+    /// 先頭から連続するピン留めタブの枚数 (= レイアウトの「左の区画」の幅)。
+    pub fn pinned_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .take_while(|b| self.pinned.contains(b))
+            .count()
+    }
+
+    /// ピン留めを付け外しする。付けた時点で**確定タブへ昇格**する
+    /// (使い捨てのままピン留めできると意味が矛盾するため)。
+    pub fn set_pinned(&mut self, buf: BufId, on: bool) -> bool {
+        if !self.tabs.contains(&buf) || self.pinned.contains(&buf) == on {
+            return false;
+        }
+        if on {
+            self.pinned.push(buf);
+            if self.preview == Some(buf) {
+                self.preview = None;
+            }
+        } else {
+            self.pinned.retain(|b| *b != buf);
+        }
+        self.normalize();
+        true
+    }
+
+    /// プレビュー枠を張り替える。ピン留め済み / 居ないタブは受け付けない。
+    pub fn set_preview(&mut self, buf: Option<BufId>) {
+        self.preview = buf.filter(|b| self.tabs.contains(b) && !self.pinned.contains(b));
+    }
+
+    /// プレビュータブを確定タブへ昇格させる (戻り値は昇格したか)。
+    pub fn promote(&mut self, buf: BufId) -> bool {
+        if self.preview == Some(buf) {
+            self.preview = None;
+            return true;
+        }
+        false
+    }
+
+    /// 「今このタブを使った」を MRU へ記録する。
+    pub fn touch(&mut self, buf: BufId) {
+        if !self.tabs.contains(&buf) {
+            return;
+        }
+        self.mru.retain(|b| *b != buf);
+        self.mru.insert(0, buf);
+    }
+
+    /// MRU 順のタブ列 (先頭 = いまアクティブ、その次 = 直前に使ったもの)。
+    ///
+    /// 記録に無いタブは並びの後ろへ回すので、**必ず `tabs` と同じ集合**を返す。
+    /// Ctrl+Tab はこの並びを 1 つずつ進むだけ (= 2 回で直前のファイルへ戻る)。
+    pub fn mru_order(&self) -> Vec<BufId> {
+        let mut out: Vec<BufId> = self
+            .mru
+            .iter()
+            .copied()
+            .filter(|b| self.tabs.contains(b))
+            .collect();
+        for b in &self.tabs {
+            if !out.contains(b) {
+                out.push(*b);
+            }
+        }
+        if let Some(a) = self.active_buf() {
+            if let Some(i) = out.iter().position(|b| *b == a) {
+                let a = out.remove(i);
+                out.insert(0, a);
+            }
+        }
+        out
+    }
+
+    /// タブの並びを整える: ピン留めを先頭へ寄せ、消えたタブを
+    /// ピン留め / MRU / プレビューから落とす。アクティブは同じタブを指し続ける。
+    pub fn normalize(&mut self) {
+        let tabs = std::mem::take(&mut self.tabs);
+        self.pinned.retain(|b| tabs.contains(b));
+        self.mru.retain(|b| tabs.contains(b));
+        if self.preview.is_some_and(|p| !tabs.contains(&p)) {
+            self.preview = None;
+        }
+        if self.preview.is_some_and(|p| self.pinned.contains(&p)) {
+            self.preview = None;
+        }
+        let cur = tabs.get(self.active).copied();
+        let mut out: Vec<BufId> = Vec::with_capacity(tabs.len());
+        out.extend(tabs.iter().filter(|b| self.pinned.contains(b)));
+        out.extend(tabs.iter().filter(|b| !self.pinned.contains(b)));
+        self.active = cur
+            .and_then(|c| out.iter().position(|x| *x == c))
+            .unwrap_or(0);
+        self.tabs = out;
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        }
     }
 }
 
@@ -302,6 +566,73 @@ impl EditorPanes {
         self.panes.iter().filter(|p| p.tabs.contains(&buf)).count()
     }
 
+    // ── ピン留め / MRU / プレビュー ──────────────────────────────
+
+    /// ピン留めを付け外しする (そのペインの中だけ)。
+    pub fn set_pinned(&mut self, pane: PaneId, buf: BufId, on: bool) -> bool {
+        self.pane_mut(pane)
+            .map(|p| p.set_pinned(buf, on))
+            .unwrap_or(false)
+    }
+
+    /// ピン留めの反転。戻り値は**反転後の状態**。
+    pub fn toggle_pinned(&mut self, pane: PaneId, buf: BufId) -> bool {
+        let on = !self.is_pinned(pane, buf);
+        self.set_pinned(pane, buf, on);
+        self.is_pinned(pane, buf)
+    }
+
+    pub fn is_pinned(&self, pane: PaneId, buf: BufId) -> bool {
+        self.pane(pane).is_some_and(|p| p.is_pinned(buf))
+    }
+
+    /// どこかのペインでピン留めされているバッファ (永続化用)。
+    pub fn pinned_bufs(&self) -> Vec<BufId> {
+        let mut out: Vec<BufId> = Vec::new();
+        for p in &self.panes {
+            for b in &p.tabs {
+                if p.is_pinned(*b) && !out.contains(b) {
+                    out.push(*b);
+                }
+            }
+        }
+        out
+    }
+
+    /// プレビュー枠を張り替える。
+    pub fn set_preview(&mut self, pane: PaneId, buf: Option<BufId>) {
+        if let Some(p) = self.pane_mut(pane) {
+            p.set_preview(buf);
+        }
+    }
+
+    /// そのペインのプレビュータブ。
+    pub fn preview_of(&self, pane: PaneId) -> Option<BufId> {
+        self.pane(pane).and_then(|p| p.preview)
+    }
+
+    /// プレビュータブを確定タブへ昇格させる (全ペイン)。
+    /// 同じファイルを別ペインでプレビューしていても、まとめて確定になる。
+    pub fn promote(&mut self, buf: BufId) -> bool {
+        let mut hit = false;
+        for p in &mut self.panes {
+            hit |= p.promote(buf);
+        }
+        hit
+    }
+
+    /// 「今このタブを使った」を記録する。
+    pub fn touch(&mut self, pane: PaneId, buf: BufId) {
+        if let Some(p) = self.pane_mut(pane) {
+            p.touch(buf);
+        }
+    }
+
+    /// そのペインの MRU 順 (先頭 = アクティブ)。
+    pub fn mru_order(&self, pane: PaneId) -> Vec<BufId> {
+        self.pane(pane).map(|p| p.mru_order()).unwrap_or_default()
+    }
+
     // ── 幾何 ────────────────────────────────────────────────────
 
     /// 描画するペインの矩形。ズーム中はフォーカス中の 1 枚だけ。
@@ -342,11 +673,16 @@ impl EditorPanes {
         let mut pane = EditorPane::new(id);
         if let Some(b) = inherit {
             pane.tabs.push(b);
+            pane.mru.push(b);
         }
         // 分割元のスクロール位置とカーソルも引き継ぐ (画面が飛ばない)。
+        // ピン留めも引き継ぐ — 「大事なタブ」の意味は分割で変わらない。
         if let Some(src) = self.pane(src_id) {
             pane.scroll = src.scroll;
             pane.cursor = src.cursor;
+            if let Some(b) = inherit.filter(|b| src.is_pinned(*b)) {
+                pane.pinned.push(b);
+            }
         }
         self.panes.push(pane);
         id
@@ -360,25 +696,42 @@ impl EditorPanes {
         }
         let keep = self.focus_id();
         let mut tabs: Vec<BufId> = Vec::new();
+        let mut pinned: Vec<BufId> = Vec::new();
+        let mut mru: Vec<BufId> = Vec::new();
         let active = self.active_buf();
-        for id in self.order() {
+        // 畳み先を先に見る — 残る側の MRU 順とプレビュー枠をそのまま活かす。
+        let mut ids = vec![keep];
+        ids.extend(self.order().into_iter().filter(|id| *id != keep));
+        for id in ids {
             if let Some(p) = self.pane(id) {
                 for b in &p.tabs {
                     if !tabs.contains(b) {
                         tabs.push(*b);
                     }
+                    if p.is_pinned(*b) && !pinned.contains(b) {
+                        pinned.push(*b);
+                    }
+                }
+                for b in p.mru_order() {
+                    if !mru.contains(&b) {
+                        mru.push(b);
+                    }
                 }
             }
         }
-        let (scroll, cursor) = self
+        let (scroll, cursor, preview) = self
             .pane(keep)
-            .map(|p| (p.scroll, p.cursor))
-            .unwrap_or((0.0, (1, 1)));
+            .map(|p| (p.scroll, p.cursor, p.preview))
+            .unwrap_or((0.0, (1, 1), None));
         self.panes.clear();
         let mut pane = EditorPane::new(keep);
         pane.tabs = tabs;
+        pane.pinned = pinned;
+        pane.mru = mru;
+        pane.preview = preview;
         pane.scroll = scroll;
         pane.cursor = cursor;
+        pane.normalize();
         if let Some(b) = active {
             pane.activate(b);
         }
@@ -393,13 +746,15 @@ impl EditorPanes {
             return false;
         }
         // 畳む前に、他のどのペインにも居ないタブを残る側へ移す。
-        let orphans: Vec<BufId> = self
+        // ピン留めは**タブと一緒に**引っ越す (畳んだ拍子に外れない)。
+        let orphans: Vec<(BufId, bool)> = self
             .pane(id)
             .map(|p| {
                 p.tabs
                     .iter()
                     .copied()
                     .filter(|b| self.open_count(*b) <= 1)
+                    .map(|b| (b, p.is_pinned(b)))
                     .collect()
             })
             .unwrap_or_default();
@@ -407,11 +762,15 @@ impl EditorPanes {
         self.panes.retain(|p| p.id != id);
         let f = self.focus_id();
         if let Some(p) = self.pane_mut(f) {
-            for b in orphans {
+            for (b, pin) in orphans {
                 if !p.tabs.contains(&b) {
                     p.tabs.push(b);
                 }
+                if pin && !p.pinned.contains(&b) {
+                    p.pinned.push(b);
+                }
             }
+            p.normalize();
         }
         true
     }
@@ -450,6 +809,7 @@ impl EditorPanes {
             return false;
         };
         let src = self.focus_id();
+        let pinned = self.is_pinned(src, buf);
         if !self.is_split() {
             // 右へ分割 → 新ペインは分割元のタブを引き継いでいるので、
             // 元のペインから外せば「移動」になる。
@@ -464,6 +824,10 @@ impl EditorPanes {
                 if !p.tabs.contains(&buf) {
                     p.tabs.push(buf);
                 }
+                if pinned && !p.pinned.contains(&buf) {
+                    p.pinned.push(buf);
+                }
+                p.normalize();
                 p.activate(buf);
             }
         }
@@ -527,6 +891,8 @@ impl EditorPanes {
                     .unwrap_or(fallback);
                 p.tabs = keep;
                 p.active = next;
+                // 消えたバッファをピン留め / MRU / プレビューからも落とす。
+                p.normalize();
             }
         }
         // 空ペインを畳む (最後の 1 枚は残す)
@@ -554,6 +920,10 @@ impl EditorPanes {
                 .unwrap_or(0);
             p.tabs = buffer_ids.to_vec();
             p.active = next;
+            // ピン留めを左端へ寄せ直す。呼び出し側 (`app::sync_panes`) は
+            // この並びを `editor.buffers` へ写し戻すので、**画面の並びと
+            // バッファ列は必ず一致する** (ドラッグの添字がずれない)。
+            p.normalize();
         } else {
             let missing: Vec<BufId> = buffer_ids
                 .iter()
@@ -565,6 +935,7 @@ impl EditorPanes {
                 for b in missing {
                     f.tabs.push(b);
                 }
+                f.normalize();
             }
         }
 
@@ -574,7 +945,14 @@ impl EditorPanes {
             if !f.activate(b) {
                 f.tabs.push(b);
                 f.active = f.tabs.len() - 1;
+                f.normalize();
+                f.activate(b);
             }
+        }
+        // アクティブは必ず MRU の先頭 (Ctrl+Tab の起点)。
+        let f = self.focus_id();
+        if let Some(b) = self.pane(f).and_then(|p| p.active_buf()) {
+            self.touch(f, b);
         }
         self.active_buf()
     }
@@ -776,6 +1154,9 @@ impl EditorPanesRec {
             let mut pane = EditorPane::new(next_id);
             next_id += 1;
             pane.active = active.min(tabs.len() - 1);
+            // 再起動直後の Ctrl+Tab は「保存されていた並び」を辿る
+            // (MRU は実行時の記録なので保存しない — 嘘の履歴を作らない)。
+            pane.mru = tabs.clone();
             pane.tabs = tabs;
             live.push((r.key.clone(), pane));
         }
@@ -806,6 +1187,90 @@ impl EditorPanesRec {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// 描画 (⌃Tab のオーバーレイ)
+// ════════════════════════════════════════════════════════════════════
+
+/// ⌃Tab を押している間だけ出す候補一覧。
+///
+/// * **画面中央の 1 枚のカード**だけ — レイアウトは 1px も動かさない
+///   (「画面が突然変わらない」の原則)。
+/// * 幅は画面幅から導くので、どの幅でも見切れない。長い題名は省略して
+///   ホバーで全文を出す。
+/// * `items` は (アイコン + 題名, 補足) の並び。`sel` が選択位置。
+pub fn tab_switcher_overlay(
+    ctx: &egui::Context,
+    theme: &crate::theme::Theme,
+    title: &str,
+    items: &[(String, String)],
+    sel: usize,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let card_w = (screen.width() * 0.6)
+        .min((screen.width() - 32.0).max(0.0))
+        .clamp(0.0, 560.0);
+    if card_w <= 0.0 {
+        return;
+    }
+    egui::Area::new(egui::Id::new("zv-tab-switcher"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(theme.panel)
+                .stroke(egui::Stroke::new(1.0_f32, theme.border))
+                .rounding(8.0)
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_width(card_w);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(title).color(theme.text_dim).small())
+                            .selectable(false),
+                    );
+                    ui.add_space(4.0);
+                    for (i, (name, hint)) in items.iter().enumerate() {
+                        let on = i == sel;
+                        let fill = if on {
+                            theme.accent_soft
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        egui::Frame::none()
+                            .fill(fill)
+                            .rounding(5.0)
+                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    let c = if on { theme.text } else { theme.text_dim };
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(name).color(c))
+                                            .selectable(false)
+                                            .truncate(),
+                                    )
+                                    .on_hover_text(name);
+                                    if !hint.is_empty() {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(hint)
+                                                    .color(theme.text_dim)
+                                                    .small(),
+                                            )
+                                            .selectable(false)
+                                            .truncate(),
+                                        );
+                                    }
+                                });
+                            });
+                    }
+                });
+        });
+}
+
+// ════════════════════════════════════════════════════════════════════
 // テスト
 // ════════════════════════════════════════════════════════════════════
 
@@ -825,24 +1290,6 @@ mod tests {
         x && y
     }
 
-    /// タブ列の中にタブを詰める (テスト用の参照実装)。
-    /// `scroll` のときは可用幅を超えるぶんも返す — 実際は `ScrollArea` の
-    /// 中に置かれるので見切れない。
-    fn tab_rects(strip: Rect, layout: TabStrip, count: usize) -> Vec<Rect> {
-        let mut out = Vec::with_capacity(count);
-        if count == 0 || layout.tab_w <= 0.0 || strip.height() <= 0.0 {
-            return out;
-        }
-        for i in 0..count {
-            let x0 = strip.min.x + layout.tab_w * i as f32;
-            out.push(Rect::from_min_max(
-                pos2(x0, strip.min.y),
-                pos2(x0 + layout.tab_w, strip.max.y),
-            ));
-        }
-        out
-    }
-
     fn inside(inner: Rect, outer: Rect) -> bool {
         inner.min.x >= outer.min.x - 0.01
             && inner.min.y >= outer.min.y - 0.01
@@ -855,6 +1302,7 @@ mod tests {
     const SIZES: &[(f32, f32)] = &[
         (320.0, 240.0),
         (320.0, 700.0),
+        (400.0, 700.0),
         (900.0, 700.0),
         (1200.0, 300.0),
         (1920.0, 1080.0),
@@ -935,7 +1383,7 @@ mod tests {
             (900.0, 0, 80.0, TabLabelMode::IconOnly),
         ];
         for (w, n, longest, want) in cases {
-            let got = tab_strip(*w, *n, *longest);
+            let got = tab_strip_pinned(*w, *n, 0, *longest);
             assert_eq!(got.mode, *want, "avail={w} n={n} longest={longest}");
         }
     }
@@ -945,7 +1393,7 @@ mod tests {
         for (w, _) in SIZES {
             for n in [0usize, 1, 2, 5, 20, 200] {
                 for longest in [0.0f32, 12.0, 90.0, 400.0] {
-                    let s = tab_strip(*w, n, longest);
+                    let s = tab_strip_pinned(*w, n, 0, longest);
                     assert!(s.tab_w.is_finite() && s.tab_w >= 0.0, "幅が壊れた: {s:?}");
                     if n == 0 {
                         assert_eq!(s.tab_w, 0.0);
@@ -968,8 +1416,8 @@ mod tests {
             for n in [0usize, 1, 4, 30] {
                 let pane = area(*w, *h);
                 let l = pane_layout(pane, n, TAB_STRIP_H);
-                let s = tab_strip(l.tabs.width(), n, 90.0);
-                let rects = tab_rects(l.tabs, s, n);
+                let s = tab_strip_pinned(l.tabs.width(), n, 0, 90.0);
+                let rects = tab_rects(l.tabs, s, n, 0);
                 for (i, r) in rects.iter().enumerate() {
                     // スクロールするときは可用幅を超えてよい (ScrollArea の中)
                     if !s.scroll {
@@ -996,6 +1444,352 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── 純関数: ピン留めを含むタブ列 ──────────────────────────
+
+    /// **可用幅・タブ数・ピン留め枚数・最長ラベル幅 → 各タブの矩形**を
+    /// 極端なサイズで総当たりし、「全部が可用領域に収まり、互いに重ならない」
+    /// を固定する。見切れを許すのは `scroll == true` (= ScrollArea の中) だけ。
+    #[test]
+    fn ピン留め込みのタブ矩形はどの幅でも収まり重ならない() {
+        for (w, h) in SIZES {
+            for n in [0usize, 1, 2, 5, 12, 40] {
+                for pinned in [0usize, 1, 3, 40] {
+                    for longest in [0.0f32, 40.0, 120.0, 400.0] {
+                        let pinned = pinned.min(n);
+                        let pane = area(*w, *h);
+                        let l = pane_layout(pane, n, TAB_STRIP_H);
+                        let s = tab_strip_pinned(l.tabs.width(), n, pinned, longest);
+                        let rects = tab_rects(l.tabs, s, n, pinned);
+                        let ctx = format!("{w}x{h} n={n} pin={pinned} longest={longest}");
+                        assert!(s.tab_w.is_finite() && s.tab_w >= 0.0, "{ctx}: 幅が壊れた");
+                        assert!(
+                            s.pin_w.is_finite() && s.pin_w >= 0.0,
+                            "{ctx}: ピン幅が壊れた"
+                        );
+                        if n == 0 {
+                            assert!(rects.is_empty(), "{ctx}: タブ 0 枚で矩形が出た");
+                            continue;
+                        }
+                        if l.tabs.height() <= 0.0 {
+                            continue;
+                        }
+                        assert_eq!(rects.len(), n, "{ctx}: 矩形の数が合わない");
+                        if !s.scroll {
+                            assert!(
+                                tab_total_w(s, n, pinned) <= l.tabs.width() + 0.01,
+                                "{ctx}: 合計幅が可用幅を超えた ({s:?})"
+                            );
+                        }
+                        for (i, r) in rects.iter().enumerate() {
+                            if !s.scroll {
+                                assert!(inside(*r, l.tabs), "{ctx} #{i}: タブがはみ出した");
+                            }
+                            assert!(r.width() >= 0.0, "{ctx} #{i}: 幅が負");
+                            for (j, o) in rects.iter().enumerate() {
+                                if i != j {
+                                    assert!(!overlaps(*r, *o), "{ctx}: タブ {i} と {j} が重なった");
+                                }
+                            }
+                        }
+                        // ピン留めは必ず左端から、幅は**固定**
+                        // (題名の長さで動かない = 左端の区画がぶれない)。
+                        for (i, r) in rects.iter().take(pinned).enumerate() {
+                            assert!(
+                                (r.width() - s.pin_w).abs() < 0.01,
+                                "{ctx} #{i}: ピン留めの幅が固定でない"
+                            );
+                            assert!(
+                                r.min.x <= rects[pinned.min(n - 1)].min.x + 0.01,
+                                "{ctx} #{i}: ピン留めが通常タブより右にある"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// ピン留めだけのタブ列 / 幅が足りないケースの縮退。
+    #[test]
+    fn 全部ピン留めでも幅が足りなければ縮退してから横スクロールへ逃げる() {
+        // (可用幅, 件数=ピン留め件数) -> 期待
+        let wide = tab_strip_pinned(900.0, 4, 4, 300.0);
+        assert_eq!(wide.mode, TabLabelMode::Full);
+        assert_eq!(wide.pin_w, TAB_PIN_W);
+        assert!(!wide.scroll, "広ければスクロールしない");
+
+        // ピン留め 8 枚 = 432px。300px には入らないのでアイコンのみへ
+        let narrow = tab_strip_pinned(300.0, 8, 8, 300.0);
+        assert_eq!(narrow.mode, TabLabelMode::IconOnly);
+        assert!(!narrow.scroll, "アイコンなら 240px で 300px に入る");
+        assert!(tab_total_w(narrow, 8, 8) <= 300.0);
+
+        // アイコンでも入らない幅 → 横スクロール
+        let tiny = tab_strip_pinned(100.0, 8, 8, 300.0);
+        assert!(tiny.scroll, "アイコンでも入らないならスクロールへ逃がす");
+    }
+
+    /// ピン留めが左を占めると、通常タブの取り分だけが縮む。
+    #[test]
+    fn ピン留めは固定幅で残りを通常タブが分け合う() {
+        let s = tab_strip_pinned(600.0, 6, 2, 400.0);
+        assert_eq!(s.pin_w, TAB_PIN_W);
+        assert_eq!(s.mode, TabLabelMode::Truncated);
+        let want = (600.0 - TAB_PIN_W * 2.0) / 4.0;
+        assert!((s.tab_w - want).abs() < 0.01, "{s:?}");
+        let rects = tab_rects(area(600.0, 30.0), s, 6, 2);
+        assert!((rects[0].width() - TAB_PIN_W).abs() < 0.01);
+        assert!((rects[1].width() - TAB_PIN_W).abs() < 0.01);
+        assert!((rects[2].width() - want).abs() < 0.01);
+        // 左端から隙間なく並ぶ
+        assert!((rects[0].min.x - 0.0).abs() < 0.01);
+        for i in 1..rects.len() {
+            assert!(
+                (rects[i].min.x - rects[i - 1].max.x).abs() < 0.01,
+                "隙間 {i}"
+            );
+        }
+    }
+
+    /// ドラッグの落とし先はピン境界を越えない。
+    #[test]
+    fn ドラッグの落とし先はピン境界でクランプされる() {
+        // (件数, ピン留め, from, to) -> 期待
+        let cases: &[(usize, usize, usize, usize, usize)] = &[
+            // ピン留めタブは左の区画から出られない
+            (5, 2, 0, 4, 1),
+            (5, 2, 1, 3, 1),
+            (5, 2, 0, 1, 1),
+            // 通常タブは左の区画へ入れない
+            (5, 2, 4, 0, 2),
+            (5, 2, 3, 1, 2),
+            (5, 2, 3, 4, 4),
+            // ピン留めが無ければ素通し
+            (5, 0, 0, 4, 4),
+            (5, 0, 4, 0, 0),
+            // 全部ピン留め
+            (3, 3, 2, 0, 0),
+            // 端
+            (0, 0, 0, 0, 0),
+            (1, 1, 0, 9, 0),
+        ];
+        for (count, pinned, from, to, want) in cases {
+            assert_eq!(
+                clamp_reorder(*count, *pinned, *from, *to),
+                *want,
+                "count={count} pinned={pinned} from={from} to={to}"
+            );
+        }
+    }
+
+    // ── ピン留め / MRU / プレビュー ────────────────────────────
+
+    #[test]
+    fn ピン留めはタブ列の先頭へ寄りアクティブを見失わない() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11, 12, 13], Some(13));
+        let pane = p.focus_id();
+        assert!(p.set_pinned(pane, 12, true));
+        assert_eq!(p.pane(pane).unwrap().tabs, vec![12, 10, 11, 13]);
+        assert_eq!(p.pane(pane).unwrap().pinned_count(), 1);
+        // 掴んでいたタブ (アクティブ) は同じものを指し続ける
+        assert_eq!(p.active_buf(), Some(13));
+        assert!(p.set_pinned(pane, 11, true));
+        assert_eq!(p.pane(pane).unwrap().tabs, vec![12, 11, 10, 13]);
+        assert_eq!(p.pane(pane).unwrap().pinned_count(), 2);
+        assert_eq!(p.pinned_bufs(), vec![12, 11]);
+        // 解除で通常タブ側へ戻る
+        assert!(p.set_pinned(pane, 12, false));
+        assert_eq!(p.pane(pane).unwrap().pinned_count(), 1);
+        assert_eq!(p.pane(pane).unwrap().tabs[0], 11);
+        // 同じ状態への設定は何も起きない
+        assert!(!p.set_pinned(pane, 11, true));
+        // 居ないタブは無視
+        assert!(!p.set_pinned(pane, 999, true));
+    }
+
+    #[test]
+    fn ピン留めタブは同期でも並び替えでも左端に残る() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11, 12], Some(10));
+        let pane = p.focus_id();
+        p.set_pinned(pane, 12, true);
+        // 新しいバッファが増えても、ピン留めは先頭のまま
+        p.sync(&[10, 11, 12, 13, 14], Some(14));
+        assert_eq!(p.pane(pane).unwrap().tabs, vec![12, 10, 11, 13, 14]);
+        assert_eq!(p.pane(pane).unwrap().pinned_count(), 1);
+    }
+
+    #[test]
+    fn ctrl_tab_を2回押すと直前のファイルへ戻る() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11, 12], Some(10));
+        let pane = p.focus_id();
+        // 10 → 11 → 12 の順に使った
+        p.pane_mut(pane).unwrap().activate(11);
+        p.pane_mut(pane).unwrap().activate(12);
+        let order = p.mru_order(pane);
+        assert_eq!(order, vec![12, 11, 10], "MRU の先頭はアクティブ");
+
+        // 1 回目: 直前のファイル (11) が選ばれる
+        let mut sw = TabSwitcher::start(pane, order.clone(), 1).expect("2 枚以上ある");
+        assert_eq!(sw.pick(), Some(11));
+        // 離して確定 → 11 がアクティブ
+        p.pane_mut(pane).unwrap().activate(sw.pick().unwrap());
+        assert_eq!(p.active_buf(), Some(11));
+
+        // もう一度 ⌃Tab 2 回で 12 → 元の 12 へ戻れる (2 つのファイルを行き来できる)
+        let order = p.mru_order(pane);
+        assert_eq!(order, vec![11, 12, 10]);
+        sw = TabSwitcher::start(pane, order, 1).expect("2 枚以上ある");
+        assert_eq!(sw.pick(), Some(12));
+        p.pane_mut(pane).unwrap().activate(12);
+        assert_eq!(p.active_buf(), Some(12));
+    }
+
+    #[test]
+    fn ctrl_shift_tab_は逆順で回り候補が1枚なら開かない() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11, 12], Some(10));
+        let pane = p.focus_id();
+        p.pane_mut(pane).unwrap().activate(11);
+        p.pane_mut(pane).unwrap().activate(12);
+        let order = p.mru_order(pane); // [12, 11, 10]
+        let sw = TabSwitcher::start(pane, order.clone(), -1).expect("2 枚以上");
+        assert_eq!(sw.pick(), Some(10), "逆順は末尾から");
+
+        // 巡回する
+        let mut sw = TabSwitcher::start(pane, order, 1).expect("2 枚以上");
+        for want in [11, 10, 12, 11] {
+            assert_eq!(sw.pick(), Some(want));
+            sw.step(1);
+        }
+
+        // 候補 1 枚 / 0 枚では開かない (枠だけ出さない)
+        assert!(TabSwitcher::start(pane, vec![10], 1).is_none());
+        assert!(TabSwitcher::start(pane, Vec::new(), 1).is_none());
+    }
+
+    #[test]
+    fn プレビュータブを閉じた直後もmruは整合する() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11, 12], Some(10));
+        let pane = p.focus_id();
+        p.pane_mut(pane).unwrap().activate(11);
+        p.pane_mut(pane).unwrap().activate(12);
+        p.set_preview(pane, Some(12));
+        assert_eq!(p.preview_of(pane), Some(12));
+
+        // プレビュータブが閉じられた (= バッファが消えた)
+        p.close_tab(pane, 12);
+        p.sync(&[10, 11], Some(11));
+        assert_eq!(p.preview_of(pane), None, "消えたタブがプレビューに残った");
+        let order = p.mru_order(pane);
+        assert_eq!(order, vec![11, 10], "消えたタブが MRU に残った");
+        assert!(
+            !order.contains(&12),
+            "閉じたタブを ⌃Tab が選べてしまう ({order:?})"
+        );
+        // 切替の候補からも落ちる
+        let mut sw = TabSwitcher::start(pane, vec![12, 11, 10], 1).expect("2 枚以上");
+        assert!(sw.retain_alive(&[10, 11]));
+        assert_eq!(sw.order, vec![11, 10]);
+        // 1 枚以下になったら畳む
+        assert!(!sw.retain_alive(&[10]));
+    }
+
+    #[test]
+    fn ペインを閉じるとそのmruも消えピン留めは残る() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11], Some(10));
+        let first = p.focus_id();
+        let second = p.split(SplitDir::Horizontal);
+        p.set_focus(second);
+        p.sync(&[10, 11, 12], Some(12));
+        p.set_pinned(second, 12, true);
+        assert!(p.is_pinned(second, 12));
+
+        // 2 枚目を閉じる → 孤児のタブは残る側へ、ピン留めも一緒に引っ越す
+        assert!(p.close_pane(second));
+        assert!(p.pane(second).is_none(), "閉じたペインが残っている");
+        let keep = p.focus_id();
+        assert_eq!(keep, first);
+        assert!(p.pane(keep).unwrap().tabs.contains(&12));
+        assert!(p.is_pinned(keep, 12), "畳んだ拍子にピン留めが外れた");
+        assert_eq!(p.pane(keep).unwrap().tabs[0], 12, "ピン留めが左端に無い");
+        // 消えたペインの MRU を引きずらない
+        for b in p.mru_order(keep) {
+            assert!(p.pane(keep).unwrap().tabs.contains(&b));
+        }
+    }
+
+    #[test]
+    fn ピン留めとプレビューは分割をまたいでも壊れない() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11], Some(11));
+        let first = p.focus_id();
+        p.set_pinned(first, 11, true);
+        // 分割 → 新ペインもピン留めを引き継ぐ
+        let second = p.split(SplitDir::Vertical);
+        assert!(p.is_pinned(second, 11), "分割でピン留てが落ちた");
+        // タブを次のペインへ移してもピン留めは付いてくる
+        p.set_focus(first);
+        p.sync(&[10, 11], Some(11));
+        assert!(p.move_active_tab_to_next());
+        let holder = p.order().into_iter().find(|id| {
+            p.pane(*id)
+                .map(|q| q.tabs.contains(&11) && q.is_pinned(11))
+                .unwrap_or(false)
+        });
+        assert!(holder.is_some(), "移動でピン留めが外れた");
+        // 分割解除でもピン留めは残り、左端へ寄る
+        p.unsplit();
+        let one = p.focus_id();
+        assert!(p.is_pinned(one, 11));
+        assert_eq!(p.pane(one).unwrap().tabs[0], 11);
+    }
+
+    #[test]
+    fn ピン留めするとプレビューは確定タブになる() {
+        let mut p = EditorPanes::new();
+        p.sync(&[10, 11], Some(11));
+        let pane = p.focus_id();
+        p.set_preview(pane, Some(11));
+        assert_eq!(p.preview_of(pane), Some(11));
+        p.set_pinned(pane, 11, true);
+        assert_eq!(p.preview_of(pane), None, "ピン留めしたのに使い捨てのまま");
+        // ピン留め済みのタブはプレビュー枠に入れない
+        p.set_preview(pane, Some(11));
+        assert_eq!(p.preview_of(pane), None);
+        // 昇格はどのペインからでも効く
+        p.set_preview(pane, Some(10));
+        assert!(p.promote(10));
+        assert_eq!(p.preview_of(pane), None);
+        assert!(!p.promote(10), "2 回目は何も起きない");
+    }
+
+    #[test]
+    fn タブ0枚とピン留めのみの端でも壊れない() {
+        // タブ 0 枚
+        let s = tab_strip_pinned(900.0, 0, 0, 100.0);
+        assert_eq!(s.tab_w, 0.0);
+        assert_eq!(s.pin_w, 0.0);
+        assert!(tab_rects(area(900.0, 30.0), s, 0, 0).is_empty());
+        assert_eq!(tab_total_w(s, 0, 0), 0.0);
+        // ピン留め枚数がタブ数を超えても飽和する
+        let s = tab_strip_pinned(900.0, 2, 9, 100.0);
+        assert!(tab_total_w(s, 2, 9) <= 900.0);
+        assert_eq!(tab_rects(area(900.0, 30.0), s, 2, 9).len(), 2);
+        // 空のペインでもピン留め API は嘘をつかない
+        let mut p = EditorPanes::new();
+        let pane = p.focus_id();
+        assert!(!p.set_pinned(pane, 10, true));
+        assert!(!p.is_pinned(pane, 10));
+        assert!(p.pinned_bufs().is_empty());
+        assert!(p.mru_order(pane).is_empty());
+        assert_eq!(p.preview_of(pane), None);
     }
 
     // ── ペインの矩形 ──────────────────────────────────────────

@@ -45,6 +45,9 @@ pub struct GitActions {
     /// エージェントへ追いプロンプトとして流したいレビュー内容
     /// (レビュー画面のインラインコメント → 「エージェントに送る」)。
     pub review_prompt: Option<String>,
+    /// このコミットの差分を開いてほしい `(リポジトリの toplevel, SHA)`。
+    /// 履歴一覧のクリック → 既存の `git::commit_diff` → `panels::commit_diff_ui`。
+    pub open_commit: Option<(PathBuf, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +153,49 @@ impl ChangeEntry {
     pub fn untracked(&self) -> bool {
         self.code.starts_with('?')
     }
+
+    /// index に載っているか (= コミット対象)。`??` (未追跡) は載っていない。
+    pub fn staged(&self) -> bool {
+        let x = self.code.chars().next().unwrap_or(' ');
+        x != ' ' && x != '?' && x != '!'
+    }
+}
+
+/// ステージ済みの件数。コミットボタンの活性はこの数だけで決まる。
+pub fn staged_count(changes: &[ChangeEntry]) -> usize {
+    changes.iter().filter(|c| c.staged()).count()
+}
+
+/// upstream との位置関係。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct UpstreamInfo {
+    /// `origin/main` 等。未設定なら None。
+    pub name: Option<String>,
+    /// upstream に無いローカルのコミット数 (push できる数)。
+    pub ahead: usize,
+    /// ローカルに無い upstream のコミット数 (pull できる数)。
+    pub behind: usize,
+    /// リモート名の一覧 (`git remote`)。空ならリモート自体が無い。
+    pub remotes: Vec<String>,
+}
+
+impl UpstreamInfo {
+    /// push の宛先として提案する `(remote, branch)`。
+    /// upstream が無く、リモートが 1 つ以上あるときだけ返す。
+    pub fn suggest_push_target(&self, head: &HeadState) -> Option<(String, String)> {
+        if self.name.is_some() {
+            return None;
+        }
+        let HeadState::OnBranch(b) = head else {
+            return None;
+        };
+        let remote = self
+            .remotes
+            .iter()
+            .find(|r| *r == "origin")
+            .or_else(|| self.remotes.first())?;
+        Some((remote.clone(), b.clone()))
+    }
 }
 
 /// 収集済みリポジトリ情報。
@@ -160,6 +206,10 @@ pub struct RepoInfo {
     pub branches: BranchList,
     pub worktrees: Vec<WorktreeEntry>,
     pub changes: Vec<ChangeEntry>,
+    /// upstream / ahead / behind / remote 一覧 (push・pull ボタンの判断材料)。
+    pub upstream: UpstreamInfo,
+    /// 直前のコミットのメッセージ全文 (`--amend` の初期値)。
+    pub head_message: Option<String>,
 }
 
 /// パネルの表示状態。
@@ -195,9 +245,39 @@ impl RunErr {
 
 /// `git -C <ws> <args>` を同期実行する。呼ぶ側がスレッドを用意すること。
 fn run_git(ws: &Path, args: &[&str]) -> Result<String, RunErr> {
-    let mut c = Command::new("git");
     // color.ui=always な環境でも ANSI エスケープ無しの出力を得る
     // (branch 一覧の "* " マーカー判定やブランチ名検証が壊れないように)
+    let out = git_command(ws, args)
+        .output()
+        .map_err(|e| RunErr::Spawn(e.to_string()))?;
+    finish_output(out, args)
+}
+
+/// ネットワークを触る git (push / pull / fetch) を待たせずに走らせる上限。
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 対話プロンプトを**構造的に**封じる。認証を聞かれたら待たずに失敗させる。
+///
+/// - `GIT_TERMINAL_PROMPT=0`: git 自身のユーザー名 / パスワード入力を止める
+/// - `GIT_ASKPASS` / `SSH_ASKPASS` を空にし `SSH_ASKPASS_REQUIRE=never`:
+///   GUI のパスワードダイアログ経路も塞ぐ
+/// - `GIT_SSH_COMMAND`: ssh を `BatchMode=yes` にして鍵パスフレーズ待ちを止める
+/// - `GIT_LFS_SKIP_SMUDGE=1`: lfs のフィルタが端末を掴んで止まるのを避ける
+fn apply_noninteractive_env(c: &mut Command) {
+    c.env("GIT_TERMINAL_PROMPT", "0");
+    c.env("GIT_ASKPASS", "");
+    c.env("SSH_ASKPASS", "");
+    c.env("SSH_ASKPASS_REQUIRE", "never");
+    c.env("GIT_LFS_SKIP_SMUDGE", "1");
+    c.env(
+        "GIT_SSH_COMMAND",
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+    );
+}
+
+/// `git -C <ws> <args>` の共通土台。`color.ui=false` と OS 差分をここへ寄せる。
+fn git_command(ws: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new("git");
     c.arg("-c")
         .arg("color.ui=false")
         .arg("-C")
@@ -210,7 +290,11 @@ fn run_git(ws: &Path, args: &[&str]) -> Result<String, RunErr> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         c.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = c.output().map_err(|e| RunErr::Spawn(e.to_string()))?;
+    c
+}
+
+/// 出力を `RunErr` へ畳む共通処理。
+fn finish_output(out: std::process::Output, args: &[&str]) -> Result<String, RunErr> {
     if !out.status.success() {
         let err = crate::textenc::decode_output(&out.stderr)
             .trim()
@@ -222,6 +306,70 @@ fn run_git(ws: &Path, args: &[&str]) -> Result<String, RunErr> {
         }));
     }
     Ok(crate::textenc::decode_output(&out.stdout))
+}
+
+/// 標準入力へパッチを流し込む `git`。ハンク単位のステージで使う。
+fn run_git_stdin(ws: &Path, args: &[&str], input: &str) -> Result<String, RunErr> {
+    use std::io::Write;
+    let mut c = git_command(ws, args);
+    c.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().map_err(|e| RunErr::Spawn(e.to_string()))?;
+    if let Some(mut si) = child.stdin.take() {
+        // パイプが先に閉じても (git が読まずに終了) 失敗にはしない。
+        // 本当の理由は下の終了コード + stderr が持っている。
+        let _ = si.write_all(input.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| RunErr::Spawn(e.to_string()))?;
+    finish_output(out, args)
+}
+
+/// ネットワークを触る `git`。**非対話を強制**し、上限時間で
+/// プロセスツリーごと落とす (認証待ちでスレッドを永久に眠らせない)。
+fn run_git_network(ws: &Path, args: &[&str]) -> Result<String, RunErr> {
+    let mut c = git_command(ws, args);
+    apply_noninteractive_env(&mut c);
+    c.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // 子を独立したプロセスグループにする。こうしないと kill_tree が
+        // 孫 (ssh / credential helper) を取り逃がす。
+        unsafe {
+            c.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    let mut child = c.spawn().map_err(|e| RunErr::Spawn(e.to_string()))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => return Err(RunErr::Spawn(e.to_string())),
+        }
+        if started.elapsed() >= NETWORK_TIMEOUT {
+            // **まだ生きている**ことを try_wait で確かめた上で撃つ
+            // (wait 済みの PID へ撃つと無関係なプロセスを巻き添えにする)。
+            crate::procx::kill_tree(child.id());
+            let _ = child.wait();
+            return Err(RunErr::Failed(tr(
+                "時間内に終わりませんでした。認証が要るならターミナルで実行してください",
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| RunErr::Spawn(e.to_string()))?;
+    finish_output(out, args)
 }
 
 /// ワークスペースの git 情報をまとめて集める (バックグラウンドスレッドで呼ぶ)。
@@ -264,13 +412,62 @@ fn collect(ws: &Path) -> RepoState {
         .map(|s| parse_status_porcelain(&s))
         .unwrap_or_default();
 
+    // upstream は「無い」が正常系なので失敗を静かに畳む。
+    let upstream_name = run_git(
+        ws,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+    let (ahead, behind) = match &upstream_name {
+        Some(_) => run_git(ws, &["rev-list", "--left-right", "--count", "@{u}...HEAD"])
+            .ok()
+            .and_then(|s| parse_left_right_count(&s))
+            .unwrap_or((0, 0)),
+        None => (0, 0),
+    };
+    let remotes = run_git(ws, &["remote"])
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // %B は生のメッセージ全文。改行も引用符もそのまま出る。
+    let head_message = run_git(ws, &["log", "-1", "--no-color", "--pretty=format:%B"])
+        .ok()
+        .map(|s| s.trim_end_matches('\n').to_string())
+        .filter(|s| !s.trim().is_empty());
+
     RepoState::Ready(Box::new(RepoInfo {
         toplevel,
         head,
         branches,
         worktrees,
         changes,
+        upstream: UpstreamInfo {
+            name: upstream_name,
+            ahead,
+            behind,
+            remotes,
+        },
+        head_message,
     }))
+}
+
+/// `git rev-list --left-right --count @{u}...HEAD` の出力 → `(ahead, behind)`。
+///
+/// 出力は `<behind>\t<ahead>` (左 = upstream 側にしか無い数)。
+/// **ロケール非依存** — 数字とタブしか出ない形式を選んでいる。
+pub fn parse_left_right_count(out: &str) -> Option<(usize, usize)> {
+    let line = out.lines().find(|l| !l.trim().is_empty())?;
+    let mut it = line.split_whitespace();
+    let left: usize = it.next()?.parse().ok()?;
+    let right: usize = it.next()?.parse().ok()?;
+    Some((right, left))
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +712,122 @@ pub fn resolve_worktree_target(
 }
 
 // ---------------------------------------------------------------------------
+// commit / push / pull / log の引数表 (純関数 — ここだけをテストする)
+// ---------------------------------------------------------------------------
+
+/// `git commit` の引数表。
+///
+/// **メッセージはシェルを通さず引数配列の 1 要素として渡す**ので、
+/// `"` も改行も絵文字も日本語もそのまま通る (クォート処理は存在しない)。
+/// `--cleanup=whitespace` を明示するのは、ユーザーの `commit.cleanup` 設定に
+/// 引きずられて `#` 始まりの行が消えるのを防ぐため。
+pub fn commit_args(message: &str, amend: bool) -> Vec<String> {
+    let mut a: Vec<String> = vec!["commit".into(), "--cleanup=whitespace".into()];
+    if amend {
+        a.push("--amend".into());
+    }
+    a.push("--message".into());
+    a.push(message.to_string());
+    a
+}
+
+/// コミットできない理由 (無ければ None)。ボタンの活性はこれ 1 本で決まる。
+pub fn commit_blocker(staged: usize, amend: bool, message: &str) -> Option<String> {
+    if message.trim().is_empty() {
+        return Some(tr("コミットメッセージを入力してください"));
+    }
+    // amend は「直前のコミットを書き換える」ので、ステージ 0 件でも意味がある。
+    if staged == 0 && !amend {
+        return Some(tr("ステージ済みの変更がありません"));
+    }
+    None
+}
+
+/// `git push` の引数表。**force は一切生成しない** (このアプリの方針)。
+///
+/// `set_upstream` はユーザーが明示的に確認したときだけ true にすること。
+pub fn push_args(remote: &str, branch: &str, set_upstream: bool) -> Result<Vec<String>, String> {
+    let r = remote.trim();
+    let b = branch.trim();
+    if r.is_empty() || b.is_empty() {
+        return Err(tr("push 先のリモートとブランチが決まりません"));
+    }
+    if r.starts_with('-') || b.starts_with('-') {
+        return Err(tr("名前を - で始めることはできません"));
+    }
+    let mut a: Vec<String> = vec!["push".into()];
+    if set_upstream {
+        a.push("--set-upstream".into());
+    }
+    a.push("--".into());
+    a.push(r.to_string());
+    a.push(b.to_string());
+    Ok(a)
+}
+
+/// `git pull` の引数表。**早送りできるときだけ**取り込む
+/// (勝手にマージコミットや rebase を作らない)。
+pub fn pull_args() -> Vec<String> {
+    vec!["pull".into(), "--ff-only".into()]
+}
+
+/// 履歴 1 ページの件数。
+pub const HISTORY_PAGE: usize = 30;
+
+/// `git log` の引数表。区切りは **NUL (`%x00`)** 固定。
+///
+/// コミットメッセージには改行もタブも `|` も入るので、行や記号で区切ると
+/// 必ず壊れる。NUL だけはメッセージに入り得ない。
+pub fn log_args(skip: usize, count: usize) -> Vec<String> {
+    vec![
+        "log".into(),
+        "--no-color".into(),
+        "-z".into(),
+        format!("--skip={skip}"),
+        format!("--max-count={count}"),
+        "--pretty=format:%H%x00%h%x00%an%x00%at%x00%s".into(),
+    ]
+}
+
+/// 履歴 1 行ぶん。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CommitEntry {
+    pub sha: String,
+    pub short: String,
+    pub author: String,
+    /// author date (unix epoch 秒)
+    pub time: i64,
+    /// 件名 (`%s`)。git が 1 行へ畳んでくれるので改行は入らない。
+    pub subject: String,
+}
+
+/// [`log_args`] の出力をパースする。
+///
+/// フィールド数は 5 固定なので、5 個ずつ切り出すだけ。区切りが NUL なので
+/// **メッセージに改行・タブ・引用符・絵文字が入っても列がずれない**。
+pub fn parse_log_z(out: &str) -> Vec<CommitEntry> {
+    let fields: Vec<&str> = out.split('\0').collect();
+    let mut v = Vec::new();
+    for c in fields.chunks(5) {
+        if c.len() < 5 {
+            break;
+        }
+        let sha = c[0].trim_matches('\n');
+        if sha.is_empty() {
+            continue;
+        }
+        v.push(CommitEntry {
+            sha: sha.to_string(),
+            short: c[1].to_string(),
+            author: c[2].to_string(),
+            time: c[3].trim().parse().unwrap_or(0),
+            subject: c[4].to_string(),
+        });
+    }
+    v
+}
+
+// ---------------------------------------------------------------------------
 // パネル本体
 // ---------------------------------------------------------------------------
 
@@ -527,6 +840,19 @@ enum Job {
         branch: Option<String>,
     },
     Fetch,
+    /// コミット (`--amend` 込み)
+    Commit {
+        message: String,
+        amend: bool,
+    },
+    /// push。`set_upstream` はユーザーが確認したときだけ true。
+    Push {
+        remote: String,
+        branch: String,
+        set_upstream: bool,
+    },
+    /// pull (`--ff-only`)
+    Pull,
 }
 
 pub struct GitPanel {
@@ -544,6 +870,24 @@ pub struct GitPanel {
     worktree_input: String,
     worktree_new_branch: bool,
     show_remote: bool,
+    /// コミットメッセージ (1 行目 = 件名 / 空行 / 本文)
+    commit_msg: String,
+    /// `--amend` (直前のコミットを書き換える)
+    amend: bool,
+    /// amend を入れた瞬間に直前のメッセージを 1 度だけ読み込むための札。
+    amend_loaded: bool,
+    /// upstream 未設定のまま push を押したときの確認 `(remote, branch)`。
+    confirm_upstream: Option<(String, String)>,
+    /// 取得済みの履歴 (ページングで後ろへ伸びる)
+    history: Vec<CommitEntry>,
+    /// まだ続きがあるか (最後のページが満杯だったか)
+    history_more: bool,
+    /// 走行中の履歴取得
+    history_rx: Option<Receiver<(Vec<CommitEntry>, bool)>>,
+    /// 履歴セクションがこのフレームで開かれていたか (開くまで git log を撃たない)
+    history_open: bool,
+    /// 走行中のジョブが成功したらメッセージ欄を空にするか (コミットのときだけ)
+    job_clears_commit: bool,
 }
 
 impl GitPanel {
@@ -559,13 +903,36 @@ impl GitPanel {
             worktree_input: String::new(),
             worktree_new_branch: true,
             show_remote: false,
+            commit_msg: String::new(),
+            amend: false,
+            amend_loaded: false,
+            confirm_upstream: None,
+            history: Vec::new(),
+            history_more: false,
+            history_rx: None,
+            history_open: false,
+            job_clears_commit: false,
         }
+    }
+
+    /// 履歴を捨てて次に開いたとき取り直させる。
+    fn reset_history(&mut self) {
+        self.history.clear();
+        self.history_more = false;
+        // 飛行中の取得は受信口ごと捨てる (旧リポジトリの結果を混ぜない)。
+        self.history_rx = None;
     }
 
     pub fn set_workspace(&mut self, ws: PathBuf) {
         if self.workspace != ws {
             self.workspace = ws;
             self.state = RepoState::Loading;
+            // 別リポジトリのメッセージ / 履歴を持ち越さない
+            self.commit_msg.clear();
+            self.amend = false;
+            self.amend_loaded = false;
+            self.confirm_upstream = None;
+            self.reset_history();
             // 旧ワークスペース向けの飛行中の収集は受信口ごと捨てる。
             // 残すと旧リポジトリの結果が新パネルとして表示され、
             // そのブランチ名で checkout を発行できてしまう。
@@ -614,11 +981,15 @@ impl GitPanel {
             RepoState::Ready(info) => {
                 self.head_ui(ui, theme, info);
                 ui.separator();
+                self.commit_ui(ui, theme, info, busy, &mut req);
+                ui.separator();
                 self.branches_ui(ui, theme, info, busy, &mut req);
                 ui.separator();
                 self.worktrees_ui(ui, theme, info, busy, actions, &mut req);
                 ui.separator();
                 self.changes_ui(ui, theme, info);
+                ui.separator();
+                self.history_ui(ui, theme, info, actions);
             }
         }
 
@@ -635,12 +1006,307 @@ impl GitPanel {
 
         self.state = state;
 
+        // 履歴は**開いたときだけ**取りに行く (巨大リポで開くたびに固まらせない)。
+        if self.history_open && self.history.is_empty() && self.history_rx.is_none() {
+            self.spawn_history(&ctx, 0);
+        }
+
         if let Some(job) = req {
             self.spawn_job(&ctx, job, actions);
         }
     }
 
     // -- 各セクション -------------------------------------------------------
+
+    /// コミット導線。メッセージ欄 + [コミット] + amend + push / pull。
+    ///
+    /// **ここが無いとユーザーは必ずターミナルへ落ちる**ので、
+    /// 折りたたまず常に見える位置 (HEAD の直下) に置く。
+    fn commit_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        info: &RepoInfo,
+        busy: bool,
+        req: &mut Option<Job>,
+    ) {
+        let staged = staged_count(&info.changes);
+        // amend に入れた瞬間だけ直前のメッセージを流し込む (以後は編集を尊重)。
+        if self.amend && !self.amend_loaded {
+            self.amend_loaded = true;
+            if self.commit_msg.trim().is_empty() {
+                if let Some(m) = &info.head_message {
+                    self.commit_msg = m.clone();
+                }
+            }
+        }
+        if !self.amend {
+            self.amend_loaded = false;
+        }
+
+        let avail = ui.available_width();
+        ui.add(
+            egui::TextEdit::multiline(&mut self.commit_msg)
+                .id_salt("zv-git-commit-msg")
+                .desired_rows(3)
+                .desired_width(avail)
+                .hint_text(tr("1 行目 = 件名 / 2 行目は空けて本文")),
+        );
+
+        let blocker = commit_blocker(staged, self.amend, &self.commit_msg);
+        let up = &info.upstream;
+        let can_pull = up.name.is_some();
+        let push_target = up.suggest_push_target(&info.head);
+        let can_push = up.name.is_some() || push_target.is_some();
+
+        // ボタンの並びは可用幅で決める (純関数 → テーブルテストで固定)。
+        let commit_label = if self.amend {
+            tr("直前を修正")
+        } else {
+            tr("コミット")
+        };
+        let push_label = if up.ahead > 0 {
+            trf("push ({n})", &[("n", up.ahead.to_string())])
+        } else {
+            tr("push")
+        };
+        let pull_label = if up.behind > 0 {
+            trf("pull ({n})", &[("n", up.behind.to_string())])
+        } else {
+            tr("pull")
+        };
+        let full = [
+            commit_label.clone(),
+            tr("直前を修正 (amend)"),
+            push_label.clone(),
+            pull_label.clone(),
+            tr("fetch"),
+        ];
+        let icons = [
+            "✔".to_string(),
+            "✎".into(),
+            "⬆".into(),
+            "⬇".into(),
+            "⟳".into(),
+        ];
+        let char_w = ui.fonts(|f| f.glyph_width(&egui::FontId::proportional(12.0), '0'));
+        let plan = crate::diff::plan_button_bar(avail, &full, &icons, char_w);
+        let text = |i: usize| -> String {
+            if plan.icon_only {
+                icons[i].clone()
+            } else {
+                full[i].clone()
+            }
+        };
+
+        for row in &plan.rows {
+            ui.horizontal_wrapped(|ui| {
+                for &i in row {
+                    match i {
+                        0 => {
+                            let r = ui
+                                .add_enabled(
+                                    !busy && blocker.is_none(),
+                                    egui::Button::new(text(0)).small(),
+                                )
+                                // 無効なときは**理由**をホバーで出す (押せない訳が分かる)
+                                .on_hover_text(match &blocker {
+                                    Some(why) => why.clone(),
+                                    None => commit_label.clone(),
+                                });
+                            if r.clicked() {
+                                *req = Some(Job::Commit {
+                                    message: self.commit_msg.clone(),
+                                    amend: self.amend,
+                                });
+                            }
+                        }
+                        1 => {
+                            if ui
+                                .selectable_label(self.amend, text(1))
+                                .on_hover_text(tr(
+                                    "直前のコミットを作り直す (まだ push していないときだけ使う)",
+                                ))
+                                .clicked()
+                            {
+                                self.amend = !self.amend;
+                            }
+                        }
+                        2 => {
+                            if ui
+                                .add_enabled(!busy && can_push, egui::Button::new(text(2)).small())
+                                .on_hover_text(match &up.name {
+                                    Some(n) => trf("{n} へ push", &[("n", n.clone())]),
+                                    None => tr("upstream が未設定です"),
+                                })
+                                .clicked()
+                            {
+                                match (&up.name, &push_target) {
+                                    // upstream があるならそのまま押し出す
+                                    (Some(_), _) => {
+                                        if let HeadState::OnBranch(b) = &info.head {
+                                            let remote = up
+                                                .name
+                                                .as_deref()
+                                                .and_then(|n| n.split_once('/'))
+                                                .map(|(r, _)| r.to_string())
+                                                .unwrap_or_else(|| "origin".to_string());
+                                            *req = Some(Job::Push {
+                                                remote,
+                                                branch: b.clone(),
+                                                set_upstream: false,
+                                            });
+                                        }
+                                    }
+                                    // 無いときは**勝手に --set-upstream しない**。確認を挟む。
+                                    (None, Some(t)) => self.confirm_upstream = Some(t.clone()),
+                                    (None, None) => {}
+                                }
+                            }
+                        }
+                        3 => {
+                            if ui
+                                .add_enabled(!busy && can_pull, egui::Button::new(text(3)).small())
+                                .on_hover_text(tr("早送りできるときだけ取り込む (--ff-only)"))
+                                .clicked()
+                            {
+                                *req = Some(Job::Pull);
+                            }
+                        }
+                        _ => {
+                            if ui
+                                .add_enabled(!busy, egui::Button::new(text(4)).small())
+                                .on_hover_text(tr("リモートの情報を取り直す"))
+                                .clicked()
+                            {
+                                *req = Some(Job::Fetch);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // upstream 未設定の確認 (押した本人にだけ出る 1 行)。
+        if let Some((remote, branch)) = self.confirm_upstream.clone() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(trf(
+                        "upstream 未設定です。{r}/{b} を upstream にしますか?",
+                        &[("r", remote.clone()), ("b", branch.clone())],
+                    ))
+                    .color(theme.warn)
+                    .small(),
+                );
+                if ui.small_button(tr("設定して push")).clicked() {
+                    *req = Some(Job::Push {
+                        remote: remote.clone(),
+                        branch: branch.clone(),
+                        set_upstream: true,
+                    });
+                    self.confirm_upstream = None;
+                }
+                if ui.small_button(tr("やめる")).clicked() {
+                    self.confirm_upstream = None;
+                }
+            });
+        }
+
+        // 「押せない理由」を必ず 1 行で見せる (無効なボタンだけ置いて黙らない)。
+        if let Some(reason) = &blocker {
+            ui.label(RichText::new(reason).color(theme.text_dim).small());
+        } else if staged > 0 {
+            ui.label(
+                RichText::new(trf("ステージ済み {n} 件", &[("n", staged.to_string())]))
+                    .color(theme.text_dim)
+                    .small(),
+            );
+        }
+    }
+
+    /// コミット履歴。**開いたときに初回 N 件**、続きはボタンで足す。
+    fn history_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        info: &RepoInfo,
+        actions: &mut GitActions,
+    ) {
+        let mut open = false;
+        let mut load_more = false;
+        let title = if self.history.is_empty() {
+            tr("履歴")
+        } else {
+            trf("履歴 ({n})", &[("n", self.history.len().to_string())])
+        };
+        egui::CollapsingHeader::new(RichText::new(title).color(theme.text).small())
+            .id_salt("zv_git_history")
+            .default_open(false)
+            .show(ui, |ui| {
+                open = true;
+                if self.history.is_empty() {
+                    let msg = if self.history_rx.is_some() {
+                        tr("読み込み中…")
+                    } else {
+                        tr("コミットがありません")
+                    };
+                    ui.label(RichText::new(msg).color(theme.text_dim).small());
+                    return;
+                }
+                let now = crate::git::unix_now();
+                for c in &self.history {
+                    // 素の Button / SelectableLabel は自動採番なので
+                    // 同じ見た目が並んでも ID は衝突しない (push_id 不要)。
+                    ui.horizontal(|ui| {
+                        let rel = crate::git::relative_time(c.time, now);
+                        let resp = ui
+                            .selectable_label(
+                                false,
+                                RichText::new(&c.short)
+                                    .monospace()
+                                    .color(theme.accent)
+                                    .small(),
+                            )
+                            .on_hover_text(trf(
+                                "{s}\n{a} · {t}\n\n{m}",
+                                &[
+                                    ("s", c.sha.clone()),
+                                    ("a", c.author.clone()),
+                                    ("t", rel.clone()),
+                                    ("m", c.subject.clone()),
+                                ],
+                            ));
+                        if resp.clicked() {
+                            actions.open_commit = Some((info.toplevel.clone(), c.sha.clone()));
+                        }
+                        ui.add(
+                            egui::Label::new(RichText::new(&c.subject).color(theme.text).small())
+                                .truncate(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(rel).color(theme.text_dim).small());
+                        });
+                    });
+                }
+                if self.history_rx.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(11.0));
+                        ui.label(
+                            RichText::new(tr("読み込み中…"))
+                                .color(theme.text_dim)
+                                .small(),
+                        );
+                    });
+                } else if self.history_more && ui.small_button(tr("続きを読む")).clicked() {
+                    load_more = true;
+                }
+            });
+        self.history_open = open;
+        if load_more {
+            let ctx = ui.ctx().clone();
+            self.spawn_history(&ctx, self.history.len());
+        }
+    }
 
     fn header_ui(&mut self, ui: &mut egui::Ui, theme: &Theme, busy: bool) {
         ui.horizontal(|ui| {
@@ -955,22 +1621,71 @@ impl GitPanel {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(rx) = &self.history_rx {
+            match rx.try_recv() {
+                Ok((mut page, more)) => {
+                    self.history.append(&mut page);
+                    self.history_more = more;
+                    self.history_rx = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.history_rx = None;
+                    self.history_more = false;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(rx) = &self.job {
             match rx.try_recv() {
-                Ok(msg) => {
-                    actions.toast = Some(msg);
+                Ok((text, ok)) => {
+                    // コミットが通ったときだけ欄を空にする。失敗したら
+                    // 書いた文章を消さない (打ち直しを強いない)。
+                    if ok && self.job_clears_commit {
+                        self.commit_msg.clear();
+                        self.amend = false;
+                        self.amend_loaded = false;
+                    }
+                    actions.toast = Some((text, ok));
                     self.job = None;
                     self.job_label.clear();
+                    self.job_clears_commit = false;
                     // 変更が入ったのでキャッシュを捨てる
+                    self.reset_history();
                     self.invalidate();
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.job = None;
                     self.job_label.clear();
+                    self.job_clears_commit = false;
                     self.invalidate();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+    }
+
+    /// 履歴 1 ページをバックグラウンドで取る。
+    fn spawn_history(&mut self, ctx: &egui::Context, skip: usize) {
+        if self.history_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ws = self.workspace.clone();
+        let ctx2 = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-git-log".into())
+            .spawn(move || {
+                let args = log_args(skip, HISTORY_PAGE);
+                let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                let page = run_git(&ws, &argv)
+                    .map(|s| parse_log_z(&s))
+                    .unwrap_or_default();
+                let more = page.len() >= HISTORY_PAGE;
+                let _ = tx.send((page, more));
+                ctx2.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.history_rx = Some(rx);
         }
     }
 
@@ -1020,6 +1735,9 @@ impl GitPanel {
             Job::WorktreeAdd { .. } => (false, true),
             _ => (false, false),
         };
+        self.job_clears_commit = matches!(job, Job::Commit { .. });
+        // ネットワークを触るジョブだけ非対話 + タイムアウトで走らせる。
+        let network = matches!(job, Job::Push { .. } | Job::Pull | Job::Fetch);
         let (label, args) = match job {
             Job::Checkout(b) => match validate_branch_name(&b) {
                 Ok(b) => (format!("checkout {b}"), vec!["checkout".into(), b]),
@@ -1056,6 +1774,31 @@ impl GitPanel {
                 "fetch".to_string(),
                 vec!["fetch".into(), "--all".into(), "--prune".into()],
             ),
+            Job::Commit { message, amend } => {
+                // 最終防波堤は「空メッセージ」だけ (ステージ件数の判断は描画側が済ませている)。
+                if let Some(e) = commit_blocker(1, amend, &message) {
+                    actions.toast = Some((e, false));
+                    return;
+                }
+                let label = if amend {
+                    tr("コミット (amend)")
+                } else {
+                    tr("コミット")
+                };
+                (label, commit_args(&message, amend))
+            }
+            Job::Push {
+                remote,
+                branch,
+                set_upstream,
+            } => match push_args(&remote, &branch, set_upstream) {
+                Ok(a) => (trf("push {r}/{b}", &[("r", remote), ("b", branch)]), a),
+                Err(e) => {
+                    actions.toast = Some((e, false));
+                    return;
+                }
+            },
+            Job::Pull => ("pull".to_string(), pull_args()),
         };
 
         let (tx, rx) = mpsc::channel();
@@ -1066,16 +1809,27 @@ impl GitPanel {
             .name("zv-git-job".into())
             .spawn(move || {
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                let run = if network {
+                    run_git_network(&ws, &argv)
+                } else {
+                    run_git(&ws, &argv)
+                };
                 // stderr は加工せずそのまま伝える (git の拒否理由を握り潰さない)
-                let msg = match run_git(&ws, &argv) {
+                let msg = match run {
                     Ok(_) => (trf("{label2} 完了", &[("label2", label2.clone())]), true),
-                    Err(e) => (
-                        trf(
+                    Err(e) => {
+                        let mut t = trf(
                             "{label2} 失敗: {e}",
                             &[("label2", label2.clone()), ("e", e.text().to_string())],
-                        ),
-                        false,
-                    ),
+                        );
+                        // 対話は構造的に封じてあるので、認証が要るなら
+                        // ここでは絶対に通らない。逃げ道を必ず案内する。
+                        if network {
+                            t.push('\n');
+                            t.push_str(&tr("認証が必要な場合はターミナルで実行してください"));
+                        }
+                        (t, false)
+                    }
                 };
                 let _ = tx.send(msg);
                 ctx2.request_repaint();
@@ -1283,6 +2037,51 @@ pub fn discard_args(path: &str, untracked: bool) -> Vec<String> {
             "--".into(),
             path.to_string(),
         ]
+    }
+}
+
+/// `git apply` の引数表 (ハンク単位のステージ / アンステージ / 破棄)。
+///
+/// パッチは**標準入力**から渡す (`-`)。一時ファイルを作らないので
+/// パスを直書きする必要がない = どの OS でもそのまま動く。
+///
+/// - ステージ:     `cached=true,  reverse=false`
+/// - アンステージ: `cached=true,  reverse=true`
+/// - 破棄:         `cached=false, reverse=true` (作業ツリーだけ巻き戻す)
+pub fn apply_patch_args(cached: bool, reverse: bool) -> Vec<String> {
+    let mut a: Vec<String> = vec!["apply".into()];
+    if cached {
+        a.push("--cached".into());
+    }
+    if reverse {
+        a.push("--reverse".into());
+    }
+    // 空白の警告だけで失敗させない (本文はこちらが組んだものなので触らせない)
+    a.push("--whitespace=nowarn".into());
+    a.push("-".into());
+    a
+}
+
+/// このベースでハンク単位に撃てる操作。
+///
+/// - 未ステージ (作業ツリー vs index) の差分は `--cached` でそのまま index へ載る
+/// - ステージ済み (index vs HEAD) の差分は `--cached --reverse` で index から下りる
+/// - 「作業ツリー vs HEAD」や任意リビジョンは**両方の差分が混ざる**ので、
+///   パッチが index と一致する保証が無い → ボタンを出さない
+/// - `--ignore-all-space` を掛けた差分は原理的に適用できない → 出さない
+pub fn hunk_ops_for(
+    base: &ReviewBase,
+    ignore_ws: bool,
+    untracked: bool,
+) -> Vec<crate::diff::HunkOp> {
+    use crate::diff::HunkOp;
+    if ignore_ws || untracked {
+        return Vec::new();
+    }
+    match base {
+        ReviewBase::Unstaged => vec![HunkOp::Stage, HunkOp::Discard],
+        ReviewBase::Staged => vec![HunkOp::Unstage],
+        ReviewBase::Head | ReviewBase::Rev(_) => Vec::new(),
     }
 }
 
@@ -1521,7 +2320,17 @@ fn collect_review(ws: &Path, base: &ReviewBase, ctx: ContextLines, ignore_ws: bo
 enum ReviewJob {
     Stage(String),
     Unstage(String),
-    Discard { path: String, untracked: bool },
+    Discard {
+        path: String,
+        untracked: bool,
+    },
+    /// ハンク単位。`patch` を標準入力から `git apply` へ流す。
+    ApplyHunk {
+        label: String,
+        patch: String,
+        cached: bool,
+        reverse: bool,
+    },
 }
 
 /// PR 風のローカル変更レビュー画面。
@@ -1551,6 +2360,8 @@ pub struct ReviewPanel {
     collapsed: std::collections::HashSet<String>,
     /// 「変更を破棄」の 2 段確認 (race パネルの [破棄] と同じ流儀)。
     confirm_discard: Option<String>,
+    /// ハンク破棄の 2 段確認 `(ファイル添字, ハンク添字)`。**取り消せない**ので必須。
+    confirm_hunk: Option<(usize, usize)>,
     /// ファイルごとのインラインコメント。パスを鍵にするので、
     /// 再収集して添字がずれてもコメントは付いたまま。
     comments: std::collections::HashMap<String, crate::diff::DiffCommentStore>,
@@ -1576,6 +2387,7 @@ impl ReviewPanel {
             scroll_to: None,
             collapsed: std::collections::HashSet::new(),
             confirm_discard: None,
+            confirm_hunk: None,
             comments: std::collections::HashMap::new(),
             list_focused: false,
         }
@@ -1591,6 +2403,7 @@ impl ReviewPanel {
             self.loaded = false;
             self.selected = None;
             self.confirm_discard = None;
+            self.confirm_hunk = None;
             self.comments.clear();
             self.invalidate();
         }
@@ -1610,6 +2423,8 @@ impl ReviewPanel {
         if self.base != base {
             self.base = base;
             self.selected = None;
+            // ベースが変わればハンクの添字も意味も変わる。確認は必ず外す。
+            self.confirm_hunk = None;
             self.invalidate();
         }
     }
@@ -1678,7 +2493,7 @@ impl ReviewPanel {
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("zv-review-diff")
-                    .show(ui, |ui| self.diff_pane_ui(ui, theme, actions));
+                    .show(ui, |ui| self.diff_pane_ui(ui, theme, actions, &mut job));
             });
         } else {
             egui::ScrollArea::vertical()
@@ -1686,7 +2501,7 @@ impl ReviewPanel {
                 .show(ui, |ui| {
                     self.file_list_ui(ui, theme, &mut job, actions);
                     ui.separator();
-                    self.diff_pane_ui(ui, theme, actions);
+                    self.diff_pane_ui(ui, theme, actions, &mut job);
                 });
         }
 
@@ -1909,9 +2724,16 @@ impl ReviewPanel {
         });
     }
 
-    fn diff_pane_ui(&mut self, ui: &mut egui::Ui, theme: &Theme, actions: &mut GitActions) {
+    fn diff_pane_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        actions: &mut GitActions,
+        job: &mut Option<ReviewJob>,
+    ) {
         let scroll_to = self.scroll_to.take();
         let mut prompt: Option<String> = None;
+        let mut hunk_hit: Option<(usize, usize, crate::diff::HunkOp)> = None;
         for i in 0..self.data.files.len() {
             let path = self.data.files[i].path.clone();
             let collapsed = self.collapsed.contains(&path);
@@ -1951,15 +2773,29 @@ impl ReviewPanel {
                 if !collapsed {
                     // 既存の diff レンダラをそのまま使う。構文色も、
                     // 行クリックのインラインレビューコメントもこれで効く。
+                    let ops = hunk_ops_for(
+                        &self.base,
+                        self.ignore_ws,
+                        self.data.files[i].untracked || self.data.files[i].diff.is_binary,
+                    );
+                    let confirm = self.confirm_hunk.filter(|(f, _)| *f == i).map(|(_, h)| h);
                     let store = self.comments.entry(path.clone()).or_default();
-                    let action = crate::diff::diff_ui_with_actions(
+                    let action = crate::diff::diff_ui_with_hunk_actions(
                         ui,
                         theme,
                         std::slice::from_ref(&self.data.files[i].diff),
                         store,
+                        Some(crate::diff::HunkActions {
+                            ops: &ops,
+                            confirm_discard: confirm,
+                        }),
                     );
-                    if let crate::diff::DiffAction::SendToAgent(p) = action {
-                        prompt = Some(p);
+                    match action {
+                        crate::diff::DiffAction::SendToAgent(p) => prompt = Some(p),
+                        crate::diff::DiffAction::Hunk { hunk, op, .. } => {
+                            hunk_hit = Some((i, hunk, op));
+                        }
+                        crate::diff::DiffAction::None => {}
                     }
                 }
             });
@@ -1971,6 +2807,57 @@ impl ReviewPanel {
         if let Some(p) = prompt {
             actions.review_prompt = Some(p);
         }
+        if let Some((fi, hi, op)) = hunk_hit {
+            self.on_hunk_op(fi, hi, op, job, actions);
+        }
+    }
+
+    /// ハンクのボタンが押されたときの分岐。
+    /// **破棄だけは 2 段確認**を挟む (取り消せないので)。
+    fn on_hunk_op(
+        &mut self,
+        fi: usize,
+        hi: usize,
+        op: crate::diff::HunkOp,
+        job: &mut Option<ReviewJob>,
+        actions: &mut GitActions,
+    ) {
+        use crate::diff::HunkOp;
+        if op == HunkOp::Discard && self.confirm_hunk != Some((fi, hi)) {
+            self.confirm_hunk = Some((fi, hi));
+            return;
+        }
+        self.confirm_hunk = None;
+        let Some(f) = self.data.files.get(fi) else {
+            return;
+        };
+        let Some(patch) = crate::diff::build_hunk_patch(&f.diff, hi) else {
+            actions.toast = Some((tr("このハンクはパッチにできません"), false));
+            return;
+        };
+        let (label, cached, reverse) = match op {
+            HunkOp::Stage => (
+                trf("ハンクをステージ {p}", &[("p", f.path.clone())]),
+                true,
+                false,
+            ),
+            HunkOp::Unstage => (
+                trf("ハンクをアンステージ {p}", &[("p", f.path.clone())]),
+                true,
+                true,
+            ),
+            HunkOp::Discard => (
+                trf("ハンクを破棄 {p}", &[("p", f.path.clone())]),
+                false,
+                true,
+            ),
+        };
+        *job = Some(ReviewJob::ApplyHunk {
+            label,
+            patch,
+            cached,
+            reverse,
+        });
     }
 
     /// n / p / ↓ / ↑ で次・前の変更へ。
@@ -2011,6 +2898,9 @@ impl ReviewPanel {
                     self.data = data;
                     self.loaded = true;
                     self.pending = None;
+                    // 再収集でハンクの並びが変わる。破棄の確認は必ず外す
+                    // (別のハンクを消してしまわないように)。
+                    self.confirm_hunk = None;
                     // 選択が範囲外になったら外す
                     if self.selected.is_some_and(|i| i >= self.data.files.len()) {
                         self.selected = None;
@@ -2074,16 +2964,28 @@ impl ReviewPanel {
         if self.job.is_some() {
             return;
         }
-        let (label, args) = match job {
-            ReviewJob::Stage(p) => (trf("ステージ {p}", &[("p", p.clone())]), stage_args(&p)),
+        let (label, args, patch) = match job {
+            ReviewJob::Stage(p) => (
+                trf("ステージ {p}", &[("p", p.clone())]),
+                stage_args(&p),
+                None,
+            ),
             ReviewJob::Unstage(p) => (
                 trf("アンステージ {p}", &[("p", p.clone())]),
                 unstage_args(&p),
+                None,
             ),
             ReviewJob::Discard { path, untracked } => (
                 trf("破棄 {p}", &[("p", path.clone())]),
                 discard_args(&path, untracked),
+                None,
             ),
+            ReviewJob::ApplyHunk {
+                label,
+                patch,
+                cached,
+                reverse,
+            } => (label, apply_patch_args(cached, reverse), Some(patch)),
         };
         let (tx, rx) = mpsc::channel();
         let ws = self.workspace.clone();
@@ -2093,7 +2995,11 @@ impl ReviewPanel {
             .name("zv-git-review-job".into())
             .spawn(move || {
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                let msg = match run_git(&ws, &argv) {
+                let run = match &patch {
+                    Some(p) => run_git_stdin(&ws, &argv, p),
+                    None => run_git(&ws, &argv),
+                };
+                let msg = match run {
                     Ok(_) => (trf("{label2} 完了", &[("label2", label2.clone())]), true),
                     Err(e) => (
                         trf(
@@ -2822,5 +3728,523 @@ bare
         let store = comments.get("src/deep/mod.rs").expect("パス鍵で引ける");
         assert_eq!(store.at(&anchor).len(), 1);
         assert_eq!(store.badge(&anchor), Some((1, false)));
+    }
+
+    // ── commit / push / pull / log の引数表 ─────────────────────────
+
+    /// コミットメッセージは**シェルを通らない**ので、引用符も改行も
+    /// 絵文字も日本語も、そのまま 1 個の引数として届かなければならない。
+    #[test]
+    fn commit_args_pass_the_message_verbatim_as_one_argv_element() {
+        let msgs = [
+            "普通の件名",
+            "quote \" と ' を含む",
+            "件名\n\n本文の 1 行目\n本文の 2 行目",
+            "絵文字 🎉 と タブ\t混じり",
+            "-- で始まる怪しい行\n--amend",
+            "#1234 を直す", // cleanup で消えてはいけない
+            "日本語の件名（全角括弧）と `backtick` と $VAR と ;rm -rf /",
+        ];
+        for m in msgs {
+            let a = commit_args(m, false);
+            assert_eq!(a[0], "commit");
+            assert!(
+                a.contains(&"--cleanup=whitespace".to_string()),
+                "commit.cleanup の設定に引きずられない: {a:?}"
+            );
+            let i = a.iter().position(|s| s == "--message").expect("--message");
+            assert_eq!(a[i + 1], m, "メッセージは加工せず 1 要素で渡す");
+            assert_eq!(a.len(), i + 2, "メッセージの後ろに何も足さない: {a:?}");
+            // シェルを経由しない証拠: クォートもエスケープも一切足していない
+            assert!(
+                !a[i + 1].contains("\\\"") && !a[i + 1].starts_with('\''),
+                "クォート処理を挟んでいない: {:?}",
+                a[i + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn commit_args_amend_inserts_the_flag_before_the_message() {
+        let a = commit_args("直前を直す", true);
+        assert_eq!(
+            a,
+            vec![
+                "commit".to_string(),
+                "--cleanup=whitespace".into(),
+                "--amend".into(),
+                "--message".into(),
+                "直前を直す".into(),
+            ]
+        );
+        assert!(
+            !commit_args("x", false).contains(&"--amend".to_string()),
+            "amend でないときは付けない"
+        );
+    }
+
+    #[test]
+    fn commit_blocker_table() {
+        // (ステージ数, amend, メッセージ, 止まるか, 何を見ているか)
+        let cases: &[(usize, bool, &str, bool, &str)] = &[
+            (0, false, "件名", true, "ステージ 0 件ではコミットできない"),
+            (1, false, "件名", false, "1 件あれば通す"),
+            (
+                0,
+                true,
+                "件名",
+                false,
+                "amend はステージ 0 件でも意味がある",
+            ),
+            (3, false, "", true, "空メッセージは止める"),
+            (3, false, "   \n\t ", true, "空白だけも空と同じ"),
+            (0, false, "", true, "両方欠けていても理由は 1 つ"),
+        ];
+        for (staged, amend, msg, want_block, why) in cases {
+            let got = commit_blocker(*staged, *amend, msg);
+            assert_eq!(got.is_some(), *want_block, "{why}");
+            if let Some(r) = got {
+                assert!(!r.trim().is_empty(), "{why}: 理由を必ず言葉にする");
+            }
+        }
+    }
+
+    #[test]
+    fn push_and_pull_arg_tables() {
+        assert_eq!(
+            push_args("origin", "main", false).expect("ok"),
+            vec!["push", "--", "origin", "main"]
+        );
+        assert_eq!(
+            push_args("origin", "feat/x", true).expect("ok"),
+            vec!["push", "--set-upstream", "--", "origin", "feat/x"]
+        );
+        // force は**生成できない** (このアプリのスコープ外)
+        for su in [false, true] {
+            let a = push_args("origin", "main", su).expect("ok");
+            assert!(
+                !a.iter().any(|s| s.contains("force") || s == "-f"),
+                "force を組み立ててはいけない: {a:?}"
+            );
+        }
+        for (r, b) in [
+            ("", "main"),
+            ("origin", ""),
+            ("-x", "main"),
+            ("origin", "-b"),
+        ] {
+            assert!(push_args(r, b, false).is_err(), "{r:?}/{b:?} は弾く");
+        }
+        assert_eq!(pull_args(), vec!["pull", "--ff-only"]);
+    }
+
+    #[test]
+    fn log_args_use_nul_separators_and_paging() {
+        let a = log_args(30, 30);
+        assert_eq!(a[0], "log");
+        assert!(a.contains(&"-z".to_string()), "レコード区切りは NUL: {a:?}");
+        assert!(a.contains(&"--skip=30".to_string()), "{a:?}");
+        assert!(a.contains(&"--max-count=30".to_string()), "{a:?}");
+        let fmt = a.last().expect("format");
+        assert!(fmt.starts_with("--pretty=format:"), "{fmt}");
+        assert_eq!(fmt.matches("%x00").count(), 4, "5 列 = 区切り 4 個: {fmt}");
+        assert!(
+            !fmt.contains('|') && !fmt.contains("%x09"),
+            "メッセージに入り得る文字を区切りに使わない: {fmt}"
+        );
+    }
+
+    /// コミットメッセージに改行・タブ・区切りっぽい文字が入っても列がずれない。
+    #[test]
+    fn parse_log_z_survives_nasty_subjects() {
+        let rec = |sha: &str, short: &str, who: &str, t: &str, subj: &str| {
+            format!("{sha}\0{short}\0{who}\0{t}\0{subj}")
+        };
+        let out = [
+            rec(
+                "a".repeat(40).as_str(),
+                "aaaaaaa",
+                "山田 太郎",
+                "1786209772",
+                "タブ\tと | と \" を含む件名 🎉",
+            ),
+            rec(
+                "b".repeat(40).as_str(),
+                "bbbbbbb",
+                "Ada Lovelace",
+                "1700000000",
+                "fix: -z を使う",
+            ),
+        ]
+        .join("\0");
+        let v = parse_log_z(&out);
+        assert_eq!(v.len(), 2, "2 件に割れる: {v:?}");
+        assert_eq!(v[0].author, "山田 太郎");
+        assert_eq!(v[0].subject, "タブ\tと | と \" を含む件名 🎉");
+        assert_eq!(v[0].time, 1786209772);
+        assert_eq!(v[1].short, "bbbbbbb");
+        assert_eq!(v[1].subject, "fix: -z を使う");
+    }
+
+    #[test]
+    fn parse_log_z_handles_empty_and_ragged_output() {
+        assert!(parse_log_z("").is_empty());
+        assert!(
+            parse_log_z("\0\0\0").is_empty(),
+            "空フィールドだけなら 0 件"
+        );
+        // 途中で切れたレコードは捨てる (panic しない)
+        let half = format!("{}\0short\0who", "c".repeat(40));
+        assert!(parse_log_z(&half).is_empty());
+    }
+
+    #[test]
+    fn parse_left_right_count_reads_behind_then_ahead() {
+        assert_eq!(
+            parse_left_right_count("2\t5\n"),
+            Some((5, 2)),
+            "左=behind 右=ahead"
+        );
+        assert_eq!(parse_left_right_count("0\t0"), Some((0, 0)));
+        assert_eq!(parse_left_right_count(""), None);
+        assert_eq!(parse_left_right_count("garbage"), None);
+    }
+
+    #[test]
+    fn staged_count_only_counts_the_index_side() {
+        let e = |code: &str, path: &str| ChangeEntry {
+            code: code.to_string(),
+            path: path.to_string(),
+            orig: None,
+        };
+        let changes = vec![
+            e("M ", "staged.rs"),
+            e("MM", "both.rs"),
+            e(" M", "worktree-only.rs"),
+            e("??", "untracked.rs"),
+            e("A ", "added.rs"),
+            e("R ", "renamed.rs"),
+            e("UU", "conflict.rs"),
+        ];
+        assert_eq!(staged_count(&changes), 5, "index 側に印がある 5 件");
+        assert!(!changes[2].staged() && !changes[3].staged());
+    }
+
+    #[test]
+    fn upstream_suggests_origin_but_never_decides_alone() {
+        let head = HeadState::OnBranch("feat/x".into());
+        let up = UpstreamInfo {
+            name: None,
+            remotes: vec!["upstream".into(), "origin".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            up.suggest_push_target(&head),
+            Some(("origin".to_string(), "feat/x".to_string())),
+            "origin があれば origin を推す"
+        );
+        let only = UpstreamInfo {
+            name: None,
+            remotes: vec!["gitlab".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            only.suggest_push_target(&head),
+            Some(("gitlab".to_string(), "feat/x".to_string()))
+        );
+        // upstream が既にある / detached / リモート無し では提案しない
+        let has = UpstreamInfo {
+            name: Some("origin/main".into()),
+            remotes: vec!["origin".into()],
+            ..Default::default()
+        };
+        assert_eq!(has.suggest_push_target(&head), None);
+        assert_eq!(
+            up.suggest_push_target(&HeadState::Detached("abc1234".into())),
+            None
+        );
+        let none = UpstreamInfo::default();
+        assert_eq!(none.suggest_push_target(&head), None);
+    }
+
+    #[test]
+    fn hunk_ops_depend_on_the_base_and_never_lie() {
+        use crate::diff::HunkOp;
+        assert_eq!(
+            hunk_ops_for(&ReviewBase::Unstaged, false, false),
+            vec![HunkOp::Stage, HunkOp::Discard]
+        );
+        assert_eq!(
+            hunk_ops_for(&ReviewBase::Staged, false, false),
+            vec![HunkOp::Unstage]
+        );
+        // 作業ツリー vs HEAD は index と一致する保証が無いので出さない
+        assert!(hunk_ops_for(&ReviewBase::Head, false, false).is_empty());
+        assert!(hunk_ops_for(&ReviewBase::Rev("main".into()), false, false).is_empty());
+        // 空白無視の差分は原理的に適用できない / 未追跡はハンクが無い
+        assert!(hunk_ops_for(&ReviewBase::Unstaged, true, false).is_empty());
+        assert!(hunk_ops_for(&ReviewBase::Unstaged, false, true).is_empty());
+    }
+
+    #[test]
+    fn apply_patch_arg_table() {
+        assert_eq!(
+            apply_patch_args(true, false),
+            vec!["apply", "--cached", "--whitespace=nowarn", "-"]
+        );
+        assert_eq!(
+            apply_patch_args(true, true),
+            vec!["apply", "--cached", "--reverse", "--whitespace=nowarn", "-"]
+        );
+        assert_eq!(
+            apply_patch_args(false, true),
+            vec!["apply", "--reverse", "--whitespace=nowarn", "-"]
+        );
+        for (c, r) in [(true, false), (true, true), (false, true)] {
+            let a = apply_patch_args(c, r);
+            assert_eq!(
+                a.last().map(String::as_str),
+                Some("-"),
+                "パッチは標準入力から"
+            );
+        }
+    }
+
+    /// **UI から到達できない実装は未完成**。コミット / 履歴 / ハンク操作が
+    /// 実際に描画経路へ繋がっていることをソースで固定する
+    /// (`include_str!` は CRLF チェックアウト対策で必ず正規化する)。
+    #[test]
+    fn コミット導線とハンク操作が画面に繋がっている() {
+        let panel = include_str!("git_panel.rs").replace("\r\n", "\n");
+        assert!(
+            panel.contains("self.commit_ui(ui, theme, info, busy, &mut req);"),
+            "コミット欄を描いていない (描かないと画面に出ない)"
+        );
+        assert!(
+            panel.contains("self.history_ui(ui, theme, info, actions);"),
+            "履歴を描いていない"
+        );
+        assert!(
+            panel.contains("crate::diff::diff_ui_with_hunk_actions("),
+            "ハンク操作付きの差分レンダラを呼んでいない"
+        );
+        assert!(
+            panel.contains("self.spawn_history(&ctx, 0);"),
+            "履歴の初回読み込みが仕込まれていない"
+        );
+        let app = include_str!("app.rs").replace("\r\n", "\n");
+        assert!(
+            app.contains("self.git_panel.ui(ui, &theme, &mut git_actions);"),
+            "GitPanel を描いていない"
+        );
+        assert!(
+            app.contains("if let Some((top, sha)) = git_actions.open_commit {"),
+            "履歴クリックのコミット差分を app 側で受けていない"
+        );
+        assert!(
+            app.contains("self.open_commit_diff_at(&top, &sha);"),
+            "既存の commit_diff → commit_diff_ui の経路へ流していない"
+        );
+    }
+
+    // ── 実 git フィクスチャ: コミット導線とハンクステージ ───────────
+
+    /// ステージ → メッセージ → コミット → 履歴に出る、が引数表だけで完結する。
+    /// **`git push` は絶対に走らせない** (ネットワークへ出ない)。
+    #[test]
+    fn commit_flow_lands_in_the_log() {
+        let Some(repo) = review_repo("commit-flow") else {
+            return; // git が無い環境ではスキップ
+        };
+        std::fs::write(repo.join("keep.rs"), "fn main() { changed(); }\n").expect("edit");
+        // ステージ前は 0 件 → コミットできない
+        let before =
+            parse_status_porcelain(&run_git(&repo, &["status", "--porcelain=v1"]).expect("status"));
+        assert_eq!(staged_count(&before), 0);
+        assert!(commit_blocker(staged_count(&before), false, "件名").is_some());
+
+        let sa = stage_args("keep.rs");
+        let argv: Vec<&str> = sa.iter().map(String::as_str).collect();
+        run_git(&repo, &argv).expect("stage");
+        let after =
+            parse_status_porcelain(&run_git(&repo, &["status", "--porcelain=v1"]).expect("status"));
+        assert_eq!(staged_count(&after), 1, "ステージ済み 1 件");
+        assert!(commit_blocker(staged_count(&after), false, "件名").is_none());
+
+        // 引用符 / 改行 / タブ / 絵文字 / 日本語を全部入れる
+        let msg = "修正: \"引用符\"\tと絵文字 🎉\n\n本文の 1 行目\n本文の 2 行目";
+        let ca = commit_args(msg, false);
+        let argv: Vec<&str> = ca.iter().map(String::as_str).collect();
+        run_git(&repo, &["config", "user.name", "zv"]).expect("name");
+        run_git(&repo, &["config", "user.email", "zv@example.com"]).expect("email");
+        run_git(&repo, &argv).expect("commit");
+
+        let la = log_args(0, HISTORY_PAGE);
+        let argv: Vec<&str> = la.iter().map(String::as_str).collect();
+        let log = parse_log_z(&run_git(&repo, &argv).expect("log"));
+        assert_eq!(log.len(), 2, "init + 今のコミット: {log:?}");
+        // %s は「1 行目 = 件名 / 空行 / 本文」の慣習どおり件名だけを返す。
+        // タブも引用符も絵文字も列をずらさない (区切りが NUL だから)。
+        assert_eq!(log[0].subject, "修正: \"引用符\"\tと絵文字 🎉");
+        assert_eq!(log[0].sha.len(), 40);
+        assert!(log[0].time > 0, "author date が取れる");
+
+        // amend: 直前のメッセージを読み直して書き換える
+        let head_msg =
+            run_git(&repo, &["log", "-1", "--no-color", "--pretty=format:%B"]).expect("%B");
+        assert!(
+            head_msg.contains("本文の 2 行目"),
+            "%B は全文: {head_msg:?}"
+        );
+        let aa = commit_args("件名を書き直した", true);
+        let argv: Vec<&str> = aa.iter().map(String::as_str).collect();
+        run_git(&repo, &argv).expect("amend");
+        let log = parse_log_z(
+            &run_git(
+                &repo,
+                &[
+                    "log",
+                    "--no-color",
+                    "-z",
+                    "--max-count=30",
+                    "--pretty=format:%H%x00%h%x00%an%x00%at%x00%s",
+                ],
+            )
+            .expect("log"),
+        );
+        assert_eq!(log.len(), 2, "amend でコミットは増えない");
+        assert_eq!(log[0].subject, "件名を書き直した");
+
+        // ページング: 2 件目以降を skip で取り直せる
+        let la = log_args(1, HISTORY_PAGE);
+        let argv: Vec<&str> = la.iter().map(String::as_str).collect();
+        let page2 = parse_log_z(&run_git(&repo, &argv).expect("log"));
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].sha, log[1].sha, "続きは重複しない");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// 組み立てたパッチが **実際に `git apply` へ通る**こと。
+    /// ここが通らないとハンクステージは絵に描いた餅になる。
+    #[test]
+    fn hunk_patch_applies_to_the_index_and_back() {
+        let Some(repo) = review_repo("hunk-apply") else {
+            return;
+        };
+        // 離れた 2 か所を変える → ハンクが 2 本になる
+        let base: String = (1..=40).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(repo.join("many.txt"), &base).expect("seed");
+        run_git(&repo, &["add", "-A"]).expect("add");
+        run_git(&repo, &["config", "user.name", "zv"]).expect("name");
+        run_git(&repo, &["config", "user.email", "zv@example.com"]).expect("email");
+        run_git(&repo, &["commit", "--quiet", "-m", "seed"]).expect("commit");
+        let edited = base
+            .replace("line3\n", "LINE3\n")
+            .replace("line30\n", "LINE30\n");
+        std::fs::write(repo.join("many.txt"), &edited).expect("edit");
+
+        // 未ステージの差分 (作業ツリー vs index) を取る
+        let data = collect_review(&repo, &ReviewBase::Unstaged, ContextLines::Three, false);
+        let f = data
+            .files
+            .iter()
+            .find(|f| f.path == "many.txt")
+            .expect("many.txt の差分");
+        assert_eq!(f.diff.hunks.len(), 2, "ハンクは 2 本");
+
+        // 1 本目だけステージ
+        let patch = crate::diff::build_hunk_patch(&f.diff, 0).expect("パッチ");
+        let args = apply_patch_args(true, false);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git_stdin(&repo, &argv, &patch).expect("apply --cached");
+
+        let staged = run_git(&repo, &["diff", "--cached", "--no-color", "-U0"]).expect("staged");
+        assert!(
+            staged.contains("+LINE3\n"),
+            "1 本目が index に載った:\n{staged}"
+        );
+        assert!(
+            !staged.contains("+LINE30"),
+            "2 本目まで載せてはいけない:\n{staged}"
+        );
+        // 作業ツリーは両方変わったまま
+        let wt = std::fs::read_to_string(repo.join("many.txt")).expect("read");
+        assert!(wt.contains("LINE3\n") && wt.contains("LINE30\n"));
+
+        // ステージ済みの差分からアンステージ (--cached --reverse)
+        let staged_data = collect_review(&repo, &ReviewBase::Staged, ContextLines::Three, false);
+        let sf = staged_data
+            .files
+            .iter()
+            .find(|f| f.path == "many.txt")
+            .expect("ステージ済み差分");
+        let patch = crate::diff::build_hunk_patch(&sf.diff, 0).expect("パッチ");
+        let args = apply_patch_args(true, true);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git_stdin(&repo, &argv, &patch).expect("apply --cached --reverse");
+        let staged = run_git(&repo, &["diff", "--cached", "--name-only"]).expect("staged");
+        assert!(staged.trim().is_empty(), "index が空に戻る: {staged:?}");
+
+        // 破棄 (作業ツリーだけ巻き戻す)
+        let data = collect_review(&repo, &ReviewBase::Unstaged, ContextLines::Three, false);
+        let f = data
+            .files
+            .iter()
+            .find(|f| f.path == "many.txt")
+            .expect("差分");
+        let patch = crate::diff::build_hunk_patch(&f.diff, 1).expect("パッチ");
+        let args = apply_patch_args(false, true);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git_stdin(&repo, &argv, &patch).expect("apply --reverse");
+        let wt = std::fs::read_to_string(repo.join("many.txt")).expect("read");
+        assert!(wt.contains("LINE3\n"), "1 本目は残る");
+        assert!(!wt.contains("LINE30\n"), "2 本目だけ巻き戻る");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// 末尾に改行が無いファイル / CRLF のファイル / 新規ファイルの
+    /// パッチが実際に `git apply --cached` へ通ること。
+    #[test]
+    fn hunk_patch_applies_for_no_newline_crlf_and_new_files() {
+        let Some(repo) = review_repo("hunk-edge") else {
+            return;
+        };
+        run_git(&repo, &["config", "user.name", "zv"]).expect("name");
+        run_git(&repo, &["config", "user.email", "zv@example.com"]).expect("email");
+        // 末尾に改行が無いファイルと CRLF のファイルを種として置く
+        std::fs::write(repo.join("nn.txt"), "p\nq").expect("nn");
+        std::fs::write(repo.join("crlf.txt"), "l1\r\nl2\r\n").expect("crlf");
+        run_git(&repo, &["add", "-A"]).expect("add");
+        run_git(&repo, &["commit", "--quiet", "-m", "edge seed"]).expect("commit");
+
+        std::fs::write(repo.join("nn.txt"), "p\nQ").expect("nn edit");
+        std::fs::write(repo.join("crlf.txt"), "l1\r\nL2\r\n").expect("crlf edit");
+        std::fs::write(repo.join("brand-new.txt"), "n1\nn2\n").expect("new");
+        run_git(&repo, &["add", "--intent-to-add", "brand-new.txt"]).expect("intent");
+
+        let data = collect_review(&repo, &ReviewBase::Unstaged, ContextLines::Three, false);
+        for name in ["nn.txt", "crlf.txt", "brand-new.txt"] {
+            let f = data
+                .files
+                .iter()
+                .find(|f| f.path == name)
+                .unwrap_or_else(|| panic!("{name} の差分が無い"));
+            let patch = crate::diff::build_hunk_patch(&f.diff, 0)
+                .unwrap_or_else(|| panic!("{name} のパッチ"));
+            let args = apply_patch_args(true, false);
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_git_stdin(&repo, &argv, &patch)
+                .unwrap_or_else(|e| panic!("{name}: apply が通らない: {}\n{patch}", e.text()));
+        }
+        // index の中身がバイト単位で作業ツリーと一致する
+        for name in ["nn.txt", "crlf.txt", "brand-new.txt"] {
+            let idx = run_git(&repo, &["show", &format!(":{name}")]).expect("show");
+            let wt = std::fs::read_to_string(repo.join(name)).expect("read");
+            assert_eq!(idx, wt, "{name}: index と作業ツリーが一致する");
+        }
+
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
