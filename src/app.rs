@@ -74,6 +74,168 @@ use crate::zoom;
 // 型が 2 組できてしまい、片方に入れた状態がもう片方から見えなくなる。
 use crate::deck;
 
+// ---------------------------------------------------------------------------
+// 問題パネル (LSP 診断) — 絞り込みとグループ化は純関数に切り出す
+// ---------------------------------------------------------------------------
+
+/// severity 1..4 のアイコン。添字 0..3 が severity 1..4。
+const PROBLEM_SEV_ICONS: [&str; 4] = ["❌", "⚠", "ℹ", "💬"];
+/// severity 1..4 の名前 (ホバーで出す。`tr` に通して使う)。
+const PROBLEM_SEV_NAMES: [&str; 4] = ["エラー", "警告", "情報", "ヒント"];
+
+/// 問題パネルの 1 件。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProblemItem {
+    pub path: PathBuf,
+    /// 表示名 (ファイル名だけ)。
+    pub title: String,
+    /// 0 起点。
+    pub line: usize,
+    /// 0 起点 (LSP の UTF-16 単位)。
+    pub col: usize,
+    /// 1=エラー 2=警告 3=情報 4=ヒント。
+    pub severity: u8,
+    pub message: String,
+    /// そのファイルの LSP がクイックフィックスに対応しているか。
+    pub can_fix: bool,
+    /// エディタで開いているファイルか (開いていないものは薄く出す)。
+    pub open: bool,
+}
+
+/// 問題パネルの絞り込み条件。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProblemsFilter {
+    /// 添字 0..3 が severity 1..4。
+    pub sev: [bool; 4],
+    pub text: String,
+}
+
+impl Default for ProblemsFilter {
+    fn default() -> Self {
+        Self {
+            sev: [true; 4],
+            text: String::new(),
+        }
+    }
+}
+
+/// 問題パネルの表示行。ファイル見出しと診断本文を **1 本の列にならす**。
+///
+/// `ScrollArea::show_rows` に渡して「見えている分だけ描く」ため、
+/// 1000 件でもフレーム時間が伸びない (`CollapsingHeader` を可変長リストに
+/// 並べると ID の取り回しも面倒になる — この形なら `Button` だけで済む)。
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProblemRow {
+    Header {
+        path: PathBuf,
+        title: String,
+        count: usize,
+        /// そのファイルで最も重い severity。
+        worst: u8,
+    },
+    Item(ProblemItem),
+}
+
+/// severity ごとの件数 (トグルのバッジ用)。添字 0..3 = severity 1..4。
+pub fn problem_counts(items: &[ProblemItem]) -> [usize; 4] {
+    let mut out = [0usize; 4];
+    for it in items {
+        out[(it.severity.clamp(1, 4) - 1) as usize] += 1;
+    }
+    out
+}
+
+/// severity トグルとテキストで絞り込む (純関数)。
+///
+/// テキストは **ファイル名・パス・メッセージのどれかに当たれば通す**。
+/// あいまい検索は既存の [`fuzzy::PreparedQuery`] を再利用する
+/// (新しいマッチャは書かない)。
+pub fn filter_problems(items: &[ProblemItem], f: &ProblemsFilter) -> Vec<ProblemItem> {
+    let q = f.text.trim();
+    let pq = (!q.is_empty()).then(|| fuzzy::PreparedQuery::new(q));
+    items
+        .iter()
+        .filter(|it| {
+            if !f.sev[(it.severity.clamp(1, 4) - 1) as usize] {
+                return false;
+            }
+            match &pq {
+                None => true,
+                Some(pq) => {
+                    pq.score(&it.title).is_some()
+                        || pq.score(&it.message).is_some()
+                        || pq.score(&it.path.to_string_lossy()).is_some()
+                }
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// ファイルごとにまとめ、畳まれているものは中身を出さない (純関数)。
+///
+/// 並びは「そのファイルの最悪 severity → パス」、ファイル内は (行, 桁)。
+pub fn group_problems(
+    mut items: Vec<ProblemItem>,
+    collapsed: &HashSet<PathBuf>,
+) -> Vec<ProblemRow> {
+    items.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.col.cmp(&b.col))
+            .then(a.severity.cmp(&b.severity))
+    });
+    let mut groups: Vec<(PathBuf, String, u8, Vec<ProblemItem>)> = Vec::new();
+    for it in items {
+        match groups.last_mut() {
+            Some(g) if g.0 == it.path => {
+                g.2 = g.2.min(it.severity);
+                g.3.push(it);
+            }
+            _ => groups.push((it.path.clone(), it.title.clone(), it.severity, vec![it])),
+        }
+    }
+    groups.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)));
+    let mut out = Vec::new();
+    for (path, title, worst, list) in groups {
+        out.push(ProblemRow::Header {
+            path: path.clone(),
+            title,
+            count: list.len(),
+            worst,
+        });
+        if !collapsed.contains(&path) {
+            out.extend(list.into_iter().map(ProblemRow::Item));
+        }
+    }
+    out
+}
+
+/// 問題が 0 件のときの空状態。
+///
+/// パネルの中身を空にせず、**可用領域の中央に 1 枚のカード**で示す
+/// (矩形は `panels::empty_card` が決めるので、どの窓サイズでもはみ出さない)。
+fn problems_empty_card(ui: &mut egui::Ui, theme: &Theme, msg: &str, sub: &str) {
+    let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    let card = panels::empty_card(avail, 0).card;
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(card), |ui| {
+        egui::Frame::none()
+            .fill(theme.panel_alt)
+            .stroke(egui::Stroke::new(1.0_f32, theme.border))
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::same(space::MD))
+            .show(ui, |ui| {
+                ui.set_width((card.width() - space::MD * 2.0).max(1.0));
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("✔").size(40.0).color(theme.text_dim));
+                    ui.label(RichText::new(msg).size(15.0).color(theme.text));
+                    ui.label(RichText::new(sub).size(12.0).color(theme.text_dim));
+                });
+            });
+    });
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum SidebarTab {
     Files,
@@ -2710,6 +2872,10 @@ pub struct ZaivernApp {
     goto_input: String,
     /// 問題 (LSP 診断) パネル (VS Code: ⇧⌘M)
     problems_open: bool,
+    /// 問題パネルの絞り込み (severity トグル + テキスト)
+    problems_filter: ProblemsFilter,
+    /// 問題パネルで畳んでいるファイル
+    problems_collapsed: HashSet<PathBuf>,
     /// キーバインド編集 UI (⌘K ⌘S) / バージョン情報ダイアログ
     shortcuts_open: bool,
     /// キーバインド編集 UI の状態 (検索語・記録中の行)。
@@ -3469,6 +3635,8 @@ impl ZaivernApp {
             goto_open: false,
             goto_input: String::new(),
             problems_open: false,
+            problems_filter: ProblemsFilter::default(),
+            problems_collapsed: HashSet::new(),
             shortcuts_open: false,
             keybind_ui: KeybindUi::default(),
             chord: crate::keybinds::ChordState::default(),
@@ -26166,6 +26334,13 @@ impl ZaivernApp {
                 }
             });
 
+        // ── 端末のリンククリック ──
+        // `terminal::draw` の呼び出し口は多数あるので、戻り値ではなく egui の
+        // 一時データ経由で受け取る (ドロップの印と同じ約束)。
+        if let Some((path, line, col)) = terminal::take_open_request(ctx) {
+            self.open_path_at(&path, line, col);
+        }
+
         // ── OS からのファイルドロップ ──
         // ターミナル (terminal::draw) が受けた分は印が立つので、残りをエディタ側で
         // 処理する: ファイル → タブで開く / フォルダ → ワークスペースに追加。
@@ -28391,6 +28566,24 @@ impl ZaivernApp {
     ///
     /// 行数を超える値・0 行目・巨大な値は `editor_ops::char_index_at` が
     /// 末尾へ丸める (パニックしない)。負の値は `parse_goto` が弾く。
+    /// 端末リンクから開く。0 起点の `(行, 桁)`。
+    ///
+    /// 端末が指す桁は **文字数**なので、LSP の UTF-16 桁を扱う
+    /// [`Self::jump_to_lsp_pos`] ではなく [`Self::goto_line_col`] を通す。
+    fn open_path_at(&mut self, path: &Path, line: usize, col: usize) {
+        if !path.is_file() {
+            self.toast(
+                trf("{p} が見つかりません", &[("p", path.display().to_string())]),
+                false,
+            );
+            return;
+        }
+        if self.active_file_path().as_deref() != Some(path) {
+            self.open_path(path);
+        }
+        self.goto_line_col(line, col);
+    }
+
     fn goto_line_col(&mut self, line: usize, col: usize) {
         let Some(i) = self.editor.active else { return };
         let ch = editor_ops::char_index_at(&self.editor.buffers[i].text, line, col);
@@ -28400,89 +28593,194 @@ impl ZaivernApp {
         self.jump_to_char(ch, 0);
     }
 
+    /// ワークスペース全体の診断を集める。
+    ///
+    /// **開いていないファイルも対象**。LSP サーバーはプロジェクト全体の
+    /// `publishDiagnostics` を送ってくるので、[`lsp::LspClient::all_diagnostics`]
+    /// から丸ごと拾う (以前は開いているバッファだけを回していた)。
+    fn collect_problems(&self) -> Vec<ProblemItem> {
+        let open: HashSet<PathBuf> = self
+            .editor
+            .buffers
+            .iter()
+            .filter_map(|b| b.path.clone())
+            .collect();
+        let mut out: Vec<ProblemItem> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        for client in self.lsp.values() {
+            // can_fix = その LSP がクイックフィックスに対応しているか
+            // (対応していない言語で「押しても何も起きないボタン」を並べない)。
+            let can_fix = client.caps().code_action;
+            for (path, diags) in client.all_diagnostics() {
+                // 同じファイルを複数サーバーが見ている場合の二重計上を防ぐ
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
+                let title = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                for d in diags.iter() {
+                    out.push(ProblemItem {
+                        path: path.clone(),
+                        title: title.clone(),
+                        line: d.line,
+                        col: d.col,
+                        severity: d.severity,
+                        message: d.message.clone(),
+                        can_fix,
+                        open: open.contains(&path),
+                    });
+                }
+            }
+        }
+        out
+    }
+
     fn problems_window(&mut self, ctx: &egui::Context) {
         if !self.problems_open {
             return;
         }
         let theme = self.theme.clone();
-        // 開いている全ファイルの診断を集める。
-        // 4 つ目の bool = そのファイルの LSP がクイックフィックスに対応しているか
-        // (対応していない言語で「押しても何も起きないボタン」を並べない)。
-        let mut rows: Vec<(PathBuf, String, lsp::Diagnostic, bool)> = Vec::new();
-        for b in &self.editor.buffers {
-            let Some(path) = b.path.clone() else { continue };
-            let key = self.lsp_key_for(&path, &b.lang);
-            let Some(client) = self.lsp.get(&key) else {
-                continue;
-            };
-            let can_fix = client.caps().code_action;
-            let Some(diags) = client.diagnostics(&path) else {
-                continue;
-            };
-            for d in diags.iter() {
-                rows.push((path.clone(), b.title.clone(), d.clone(), can_fix));
-            }
-        }
-        rows.sort_by_key(|(_, _, d, _)| (d.severity, d.line));
+        let all = self.collect_problems();
+        let counts = problem_counts(&all);
+        let shown = filter_problems(&all, &self.problems_filter);
+        let rows = group_problems(shown, &self.problems_collapsed);
+
         let mut open = self.problems_open;
+        let mut filter = self.problems_filter.clone();
+        let mut toggle_group: Option<PathBuf> = None;
         let mut jump: Option<(PathBuf, usize, usize)> = None;
         // 「この診断を直す」= その位置へ飛んでからクイックフィックスを要求する
         let mut fix: Option<(PathBuf, usize, usize)> = None;
+        let collapsed = self.problems_collapsed.clone();
         egui::Window::new(tr("⚠ 問題"))
             .open(&mut open)
-            .default_size([560.0, 300.0])
+            .default_size([620.0, 340.0])
             .show(ctx, |ui| {
-                if rows.is_empty() {
-                    ui.label(
-                        RichText::new(tr(
-                            "問題は検出されていません (LSP が有効なファイルのみ対象)",
-                        ))
-                        .color(theme.text_dim),
+                // ── 絞り込み ──
+                // severity のトグル (SelectableLabel なので同じラベルが並んでも
+                // ID は衝突しない) と、ファイル名・メッセージ両方に効く検索。
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (i, icon) in PROBLEM_SEV_ICONS.iter().enumerate() {
+                        let label = format!("{icon} {}", counts[i]);
+                        let r = ui.selectable_label(filter.sev[i], label);
+                        if r.on_hover_text(tr(PROBLEM_SEV_NAMES[i])).clicked() {
+                            filter.sev[i] = !filter.sev[i];
+                        }
+                    }
+                    ui.add_space(space::SM);
+                    // 幅は「残り」を素直に使う。どの窓幅でも見切れない。
+                    let w = (ui.available_width() - 4.0).max(80.0);
+                    ui.add_sized(
+                        [w, 22.0],
+                        egui::TextEdit::singleline(&mut filter.text)
+                            .id_salt("zv-problems-filter")
+                            .hint_text(tr("ファイル名 / メッセージで絞り込み")),
                     );
+                });
+                ui.add_space(space::XS);
+
+                if rows.is_empty() {
+                    let msg = if all.is_empty() {
+                        tr("問題は検出されていません")
+                    } else {
+                        tr("絞り込みに一致する問題はありません")
+                    };
+                    let sub = if all.is_empty() {
+                        tr("LSP が有効なファイルが対象です")
+                    } else {
+                        trf(
+                            "{n} 件の問題を絞り込みで隠しています",
+                            &[("n", all.len().to_string())],
+                        )
+                    };
+                    problems_empty_card(ui, &theme, &msg, &sub);
                     return;
                 }
+
+                // 1000 件でも破綻しないよう、行高を固定して見えている分だけ描く。
+                let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
                 egui::ScrollArea::vertical()
                     .id_salt("zv-problems")
                     .auto_shrink(false)
-                    .show(ui, |ui| {
-                        for (path, title, d, can_fix) in &rows {
-                            let icon = match d.severity {
-                                1 => "❌",
-                                2 => "⚠",
-                                _ => "ℹ",
-                            };
-                            let label = format!(
-                                "{icon} {title}:{}  {}",
-                                d.line + 1,
-                                d.message.lines().next().unwrap_or("")
-                            );
-                            // 1 行 = [💡] + 診断本文。💡 は固定幅なので、残りは
-                            // 必ず available_width に収まる (見切れは Truncate 側で吸収)。
-                            ui.horizontal(|ui| {
-                                if *can_fix
-                                    && ui
-                                        .add(egui::Button::new("💡").frame(false))
-                                        .on_hover_text(tr("クイックフィックス"))
-                                        .clicked()
-                                {
-                                    fix = Some((path.clone(), d.line, d.col));
+                    .show_rows(ui, row_h, rows.len(), |ui, range| {
+                        for row in &rows[range] {
+                            match row {
+                                ProblemRow::Header {
+                                    path,
+                                    title,
+                                    count,
+                                    worst,
+                                } => {
+                                    let open_group = !collapsed.contains(path);
+                                    let label = format!(
+                                        "{} {title}  ({count})",
+                                        if open_group { "▾" } else { "▸" }
+                                    );
+                                    let full = path.display().to_string();
+                                    let r = ui.add(
+                                        egui::Button::new(
+                                            RichText::new(label)
+                                                .size(12.5)
+                                                .color(diagview::severity_color(&theme, *worst)),
+                                        )
+                                        .frame(false)
+                                        .wrap_mode(egui::TextWrapMode::Truncate),
+                                    );
+                                    if r.on_hover_text(full).clicked() {
+                                        toggle_group = Some(path.clone());
+                                    }
                                 }
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new(label).size(12.5))
+                                ProblemRow::Item(it) => {
+                                    let icon =
+                                        PROBLEM_SEV_ICONS[(it.severity.clamp(1, 4) - 1) as usize];
+                                    let label = format!(
+                                        "    {icon} {}:{}  {}",
+                                        it.line + 1,
+                                        it.col + 1,
+                                        it.message.lines().next().unwrap_or("")
+                                    );
+                                    // 1 行 = [💡] + 診断本文。💡 は固定幅なので、残りは
+                                    // 必ず available_width に収まる (見切れは Truncate 側で吸収)。
+                                    ui.horizontal(|ui| {
+                                        if it.can_fix
+                                            && it.open
+                                            && ui
+                                                .add(egui::Button::new("💡").frame(false))
+                                                .on_hover_text(tr("クイックフィックス"))
+                                                .clicked()
+                                        {
+                                            fix = Some((it.path.clone(), it.line, it.col));
+                                        }
+                                        let color =
+                                            if it.open { theme.text } else { theme.text_dim };
+                                        let r = ui.add(
+                                            egui::Button::new(
+                                                RichText::new(label).size(12.5).color(color),
+                                            )
                                             .frame(false)
                                             .wrap_mode(egui::TextWrapMode::Truncate),
-                                    )
-                                    .clicked()
-                                {
-                                    jump = Some((path.clone(), d.line, d.col));
+                                        );
+                                        if r.on_hover_text(&it.message).clicked() {
+                                            jump = Some((it.path.clone(), it.line, it.col));
+                                        }
+                                    });
                                 }
-                            });
+                            }
                         }
                     });
             });
         self.problems_open = open;
+        self.problems_filter = filter;
+        if let Some(p) = toggle_group {
+            if !self.problems_collapsed.remove(&p) {
+                self.problems_collapsed.insert(p);
+            }
+        }
         if let Some((path, line, col)) = jump {
+            // 行だけでなく**桁**まで飛ぶ (LSP の col は UTF-16 単位)
             self.jump_to_lsp_pos(&path, line, col);
         }
         if let Some((path, line, col)) = fix {
@@ -36618,5 +36916,240 @@ mod quick_open_tests {
         assert!(last > 0, "最近順の加点が尽きている: {last}");
         // 一致の段 (TIER_SUBSTR = 30_000) は超えない
         assert!(RECENT_FILE_BONUS < 30_000, "最近順が一致の質を追い越す");
+    }
+}
+
+/// 問題パネルの絞り込み・グループ化 (純関数) の表テスト。
+///
+/// UI を描かずに固定できるところは全部ここで固定する。
+#[cfg(test)]
+mod problems_tests {
+    use super::{
+        filter_problems, group_problems, problem_counts, ProblemItem, ProblemRow, ProblemsFilter,
+    };
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    /// テスト用の診断 1 件。パスは相対名だけで実在させない
+    /// (問題パネルは実ファイルを読まないので触る必要が無い)。
+    fn item(path: &str, line: usize, col: usize, sev: u8, msg: &str) -> ProblemItem {
+        let p = PathBuf::from(path);
+        ProblemItem {
+            title: p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path: p,
+            line,
+            col,
+            severity: sev,
+            message: msg.to_string(),
+            can_fix: true,
+            open: false,
+        }
+    }
+
+    fn rows(items: Vec<ProblemItem>) -> Vec<ProblemRow> {
+        group_problems(items, &HashSet::new())
+    }
+
+    #[test]
+    fn 零件なら行も零件() {
+        assert!(rows(Vec::new()).is_empty());
+        assert_eq!(problem_counts(&[]), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn 一件なら見出しと本文の二行になる() {
+        let got = rows(vec![item("src/a.rs", 0, 0, 1, "boom")]);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(matches!(&got[0], ProblemRow::Header { count: 1, .. }));
+        assert!(matches!(&got[1], ProblemRow::Item(_)));
+    }
+
+    #[test]
+    fn 同じファイルの複数診断は一つの見出しにまとまる() {
+        let got = rows(vec![
+            item("src/a.rs", 5, 1, 2, "warn"),
+            item("src/a.rs", 1, 2, 1, "err"),
+            item("src/b.rs", 0, 0, 2, "warn"),
+        ]);
+        let headers: Vec<_> = got
+            .iter()
+            .filter_map(|r| match r {
+                ProblemRow::Header {
+                    title,
+                    count,
+                    worst,
+                    ..
+                } => Some((title.clone(), *count, *worst)),
+                ProblemRow::Item(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![("a.rs".into(), 2usize, 1u8), ("b.rs".into(), 1, 2)],
+            "エラーを含むファイルが先、件数と最悪 severity が出る"
+        );
+        // ファイル内は行順
+        let lines: Vec<usize> = got
+            .iter()
+            .filter_map(|r| match r {
+                ProblemRow::Item(i) if i.title == "a.rs" => Some(i.line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, vec![1, 5]);
+    }
+
+    #[test]
+    fn 折り畳んだファイルは見出しだけ残る() {
+        let items = vec![
+            item("src/a.rs", 0, 0, 1, "err"),
+            item("src/b.rs", 0, 0, 1, "err"),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert(PathBuf::from("src/a.rs"));
+        let got = group_problems(items, &collapsed);
+        assert_eq!(got.len(), 3, "見出し 2 + 畳んでいない方の本文 1: {got:?}");
+    }
+
+    #[test]
+    fn severityのトグルで絞り込める() {
+        let items = vec![
+            item("src/a.rs", 0, 0, 1, "err"),
+            item("src/a.rs", 1, 0, 2, "warn"),
+            item("src/a.rs", 2, 0, 3, "info"),
+            item("src/a.rs", 3, 0, 4, "hint"),
+        ];
+        assert_eq!(problem_counts(&items), [1, 1, 1, 1]);
+        let mut f = ProblemsFilter::default();
+        assert_eq!(filter_problems(&items, &f).len(), 4);
+        f.sev = [true, false, false, false];
+        let only_err = filter_problems(&items, &f);
+        assert_eq!(only_err.len(), 1);
+        assert_eq!(only_err[0].severity, 1);
+        f.sev = [false; 4];
+        assert!(filter_problems(&items, &f).is_empty());
+    }
+
+    #[test]
+    fn テキスト絞り込みはファイル名とメッセージの両方に効く() {
+        let items = vec![
+            item("src/alpha.rs", 0, 0, 1, "unused variable"),
+            item("src/beta.rs", 0, 0, 1, "missing semicolon"),
+        ];
+        let hit = |q: &str| -> Vec<String> {
+            let f = ProblemsFilter {
+                sev: [true; 4],
+                text: q.to_string(),
+            };
+            filter_problems(&items, &f)
+                .into_iter()
+                .map(|i| i.title)
+                .collect()
+        };
+        assert_eq!(hit("alpha"), vec!["alpha.rs".to_string()], "ファイル名");
+        assert_eq!(hit("semicolon"), vec!["beta.rs".to_string()], "メッセージ");
+        assert_eq!(hit("src/beta"), vec!["beta.rs".to_string()], "パス");
+        assert_eq!(hit(""), vec!["alpha.rs".to_string(), "beta.rs".to_string()]);
+        assert!(hit("ぜんぜん一致しない語").is_empty());
+    }
+
+    #[test]
+    fn 絞り込みで零件になったら行も零件() {
+        let items = vec![item("src/a.rs", 0, 0, 1, "err")];
+        let f = ProblemsFilter {
+            sev: [true; 4],
+            text: "zzzz".into(),
+        };
+        assert!(rows(filter_problems(&items, &f)).is_empty());
+    }
+
+    #[test]
+    fn 大量の診断でも行数が線形に収まる() {
+        // 1000 件 = 100 ファイル × 10 件。見出し 100 + 本文 1000 = 1100 行。
+        // `ScrollArea::show_rows` は見えている分しか描かないので、
+        // ここで押さえるのは「行の作り方が破綻しない」ことだけ。
+        let mut items = Vec::new();
+        for f in 0..100 {
+            for l in 0..10 {
+                items.push(item(
+                    &format!("src/f{f:03}.rs"),
+                    l,
+                    0,
+                    1 + (l % 4) as u8,
+                    "x",
+                ));
+            }
+        }
+        assert_eq!(items.len(), 1000);
+        let got = rows(items.clone());
+        assert_eq!(got.len(), 1100, "見出し 100 + 本文 1000");
+        // 絞り込みも 1000 件で壊れない
+        let f = ProblemsFilter {
+            sev: [true, false, false, false],
+            text: "f001".into(),
+        };
+        let narrowed = filter_problems(&items, &f);
+        assert!(!narrowed.is_empty() && narrowed.len() < 1000);
+        assert!(narrowed.iter().all(|i| i.severity == 1));
+    }
+
+    /// 0 件のときの空状態は **窓の中央に 1 枚**で、はみ出さないこと。
+    ///
+    /// 極端な窓サイズ (低い窓・広い窓) でカードが下へ突き抜けると、
+    /// 「何も無いのに何も見えない」パネルになる。
+    #[test]
+    fn 空状態のカードは窓の中に収まる() {
+        use eframe::egui::{pos2, vec2, Rect};
+        let ctx = egui::Context::default();
+        let theme = crate::theme::by_name("zaivern-dark");
+        for screen in [vec2(900.0, 700.0), vec2(1200.0, 300.0), vec2(520.0, 240.0)] {
+            let mut card = Rect::NOTHING;
+            let mut inner = Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), screen)),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                let mut open = true;
+                egui::Window::new("問題")
+                    .open(&mut open)
+                    .default_size([620.0, 340.0])
+                    .show(ctx, |ui| {
+                        inner = ui.clip_rect();
+                        let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+                        card = crate::panels::empty_card(avail, 0).card;
+                        super::problems_empty_card(ui, &theme, "問題はありません", "対象なし");
+                    });
+            });
+            assert!(
+                card.width() > 0.0 && card.height() > 0.0 && card.width().is_finite(),
+                "{screen:?}: カードの寸法が壊れた {card:?}"
+            );
+            assert!(
+                inner.contains_rect(card),
+                "{screen:?}: カード {card:?} が窓 {inner:?} をはみ出した"
+            );
+        }
+    }
+
+    #[test]
+    fn 開いていないファイルの診断も行になる() {
+        // 問題パネルはバッファではなく LSP の診断表から作るので、
+        // `open == false` でも必ず一覧に出る。
+        let mut a = item("src/closed.rs", 3, 7, 1, "err");
+        a.open = false;
+        let got = rows(vec![a]);
+        assert_eq!(got.len(), 2, "{got:?}");
+        match &got[1] {
+            ProblemRow::Item(i) => {
+                assert!(!i.open);
+                // 行だけでなく桁も保つ (クリックで行と桁へ飛ぶため)
+                assert_eq!((i.line, i.col), (3, 7));
+            }
+            ProblemRow::Header { .. } => panic!("2 行目は本文のはず"),
+        }
     }
 }
