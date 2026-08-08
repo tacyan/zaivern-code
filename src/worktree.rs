@@ -1034,7 +1034,15 @@ mod tests {
 
     /// 実 git で最小のリポジトリを作る。git が無い環境では None を返して黙って飛ばす。
     fn fixture_repo(tag: &str) -> Option<PathBuf> {
-        let root = crate::test_util::unique_temp_dir("zaivern-wt-test", tag);
+        // リポジトリを**一段深く**掘る理由は `race.rs` の同名関数と同じ。
+        // `worktree_base` は `repo.parent()` を置き場にするので、
+        // リポジトリを一時ディレクトリ直下に作ると worktree が共有の
+        // $TMPDIR 直下へ生まれ、並列実行時にディレクトリロックで詰まる。
+        let base = crate::test_util::unique_temp_dir("zaivern-wt-test", tag);
+        let root = base.join("repo");
+        if std::fs::create_dir_all(&root).is_err() {
+            return None;
+        }
         let ok = |args: &[&str]| git_out(&root, args).is_ok();
         if crate::procx::hidden_command("git")
             .arg("--version")
@@ -1050,7 +1058,7 @@ mod tests {
             || !ok(&["add", "-A"])
             || !ok(&["commit", "-q", "-m", "init"])
         {
-            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&base);
             return None;
         }
         Some(root)

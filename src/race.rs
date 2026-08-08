@@ -1845,9 +1845,20 @@ mod tests {
 
     /// 初期コミット済みの使い捨てリポジトリ。git が無ければ None。
     fn fixture_repo(tag: &str) -> Option<PathBuf> {
-        let dir = crate::test_util::unique_temp_dir("zaivern-race", tag);
+        // リポジトリを**一段深く**掘る。`race_worktree_base` は `repo.parent()` を
+        // worktree の置き場にするので、リポジトリを一時ディレクトリ直下に作ると
+        // worktree が**共有の $TMPDIR 直下**へ生まれる。そこに数千の残骸が溜まると
+        // 並列実行時の `git worktree add` がディレクトリロックで詰まり、
+        // 単独 2 秒のテストが 90 秒を超えて slow-timeout に当たる (実測)。
+        // 親をテスト専用にすれば、他のテストと取り合わない。
+        let base = crate::test_util::unique_temp_dir("zaivern-race", tag);
+        let dir = base.join("repo");
+        if std::fs::create_dir_all(&dir).is_err() {
+            std::fs::remove_dir_all(&base).ok();
+            return None;
+        }
         if run_git(&dir, &["init", "--quiet"]).is_err() {
-            std::fs::remove_dir_all(&dir).ok();
+            std::fs::remove_dir_all(&base).ok();
             return None; // git が無い環境ではスキップ
         }
         std::fs::write(dir.join("a.txt"), "base\n").expect("write a.txt");
