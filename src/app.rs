@@ -12,6 +12,7 @@ use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
 use crate::coordinator;
+use crate::diagview;
 use crate::editor::{combine_hash, disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
 use crate::editor_split;
@@ -2531,10 +2532,15 @@ pub struct ZaivernApp {
     lsp_which_missing: HashMap<String, Instant>,
     /// アクティブバッファの診断件数 (エラー, 警告) — ステータスバー用
     diag_counts: (usize, usize),
-    /// アクティブバッファの診断キャッシュ:
-    /// (内容ハッシュ, 行→最悪 severity, エラー数, 警告数)。
-    /// (line, severity) 列が変わったときだけマップを作り直す
-    diag_cache: (u64, HashMap<usize, u8>, usize, usize),
+    /// アクティブバッファの診断キャッシュ (行→最悪 severity + **範囲付きの診断**)。
+    /// 行だけでなく範囲を持つので、ガターの印と本文の波線が同じ源から出る。
+    diag_cache: diagview::DiagCache,
+    /// 対応括弧の強調キャッシュ: (本文ハッシュ, キャレット char, 塗る位置)。
+    /// 位置は (char 添字, 相手がいるか)。キャレットが動かない限り本文を走査しない。
+    bracket_hl: Option<(u64, usize, Vec<(usize, bool)>)>,
+    /// 本文でホバー中の診断 (メッセージ, severity, 画面位置)。
+    /// LSP ホバーより**優先**する (診断があるところに説明を二重で出さない)。
+    diag_hover: Option<(String, u8, egui::Pos2)>,
     /// プラグインパネルの内容: (プラグイン名, パネルID) → 本文
     plugin_panels: HashMap<(String, String), String>,
     /// プラグインがステータスバーへ出した文字列(空なら非表示)
@@ -3042,7 +3048,9 @@ impl ZaivernApp {
             lsp_which_missing: HashMap::new(),
             diag_counts: (0, 0),
             // 初期キーは番兵 (u64::MAX): 最初の refresh で必ず作り直す
-            diag_cache: (u64::MAX, HashMap::new(), 0, 0),
+            diag_cache: diagview::DiagCache::default(),
+            bracket_hl: None,
+            diag_hover: None,
             plugin_panels: HashMap::new(),
             plugin_status: String::new(),
             hook_last_run: HashMap::new(),
@@ -4431,38 +4439,53 @@ impl ZaivernApp {
     }
 
     /// アクティブバッファの診断を `self.diag_cache` へ反映する。
-    /// 結果は diag_cache = (内容ハッシュ, 行→最悪 severity, エラー数, 警告数)。
-    /// (line, severity) 列のハッシュが前回と同じなら HashMap は作り直さない
-    /// (毎フレームのマップ構築アロケを避ける。既存の (hash, value) キャッシュと同じ流儀)。
-    fn refresh_active_diagnostics(&mut self) {
+    ///
+    /// キャッシュは **範囲付き** で持つ (行→severity だけだと本文に波線を
+    /// 引けない)。組み直しの判定と中身は [`diagview::DiagCache`] 側にあり、
+    /// 診断も本文も変わっていないフレームでは何も確保しない。
+    fn refresh_active_diagnostics(&mut self, text_hash: u64) {
         let diags = (|| {
             let i = self.editor.active?;
             let path = self.editor.buffers[i].path.as_ref()?;
             let key = self.lsp_key_for(path, &self.editor.buffers[i].lang);
             self.lsp.get(&key)?.diagnostics(path)
-        })();
-        let diags: &[lsp::Diagnostic] = diags.as_deref().map_or(&[], |v| v.as_slice());
-        let mut content = diags.len() as u64;
-        for d in diags {
-            content = combine_hash(content, ((d.line as u64) << 8) | d.severity as u64);
-        }
-        if content == self.diag_cache.0 {
+        })()
+        .unwrap_or_default();
+        let text = self
+            .editor
+            .active
+            .map(|i| self.editor.buffers[i].text.as_str())
+            .unwrap_or("");
+        self.diag_cache.refresh(diags, text, text_hash);
+    }
+
+    /// 次 / 前の診断へ飛ぶ (VS Code の F8 / ⇧F8)。端では巻き戻る。
+    fn goto_diagnostic(&mut self, ctx: &egui::Context, forward: bool) {
+        let Some(i) = self.editor.active else { return };
+        let Some(path) = self.editor.buffers[i].path.clone() else {
+            self.toast(tr("このタブには診断がありません"), false);
+            return;
+        };
+        let diags = self.diag_cache.items.clone();
+        if diags.is_empty() {
+            self.toast(tr("診断はありません"), false);
             return;
         }
-        let mut by_line: HashMap<usize, u8> = HashMap::new();
-        let (mut errs, mut warns) = (0usize, 0usize);
-        for d in diags {
-            match d.severity {
-                1 => errs += 1,
-                2 => warns += 1,
-                _ => {}
-            }
-            let e = by_line.entry(d.line).or_insert(4);
-            if d.severity < *e {
-                *e = d.severity;
-            }
-        }
-        self.diag_cache = (content, by_line, errs, warns);
+        let cur_char = self.active_cursor_char(ctx);
+        let (line, col) = lsp::char_index_to_lsp_pos(&self.editor.buffers[i].text, cur_char);
+        let Some(n) = diagview::step_diag(&diags, lsp::Position::new(line, col), forward) else {
+            return;
+        };
+        let d = diags[n].clone();
+        self.jump_to_lsp_pos(&path, d.line, d.col);
+        // 飛んだ先が何なのかを 1 行で見せる (行末表示を切っていても分かるように)。
+        // トーストの種別は severity に合わせる (error だけ赤くする)。
+        let kind = match d.severity {
+            1 => 2u8,
+            2 => 1,
+            _ => 0,
+        };
+        self.push_toast(diagview::labeled_message(&d), kind);
     }
 
     /// 保存済みのエディタ分割レイアウトを復元する。
@@ -8083,6 +8106,39 @@ impl ZaivernApp {
     }
 
     /// ホバーポップアップ。本文は markdown なので既存のレンダラで描く。
+    /// 診断のホバー。波線の上にマウスがあるフレームだけ出す。
+    ///
+    /// [`Self::lsp_hover_popup`] とは**排他** — 本文描画側で診断が当たった
+    /// フレームは LSP ホバーを dismiss しているので、2 枚重なることはない。
+    fn diag_hover_popup(&mut self, ctx: &egui::Context) {
+        // take: 本文を描いていないフレーム (別ビューへ切り替えた等) で
+        // ツールチップが取り残されないように、1 フレームで使い切る。
+        // ホバーが続いていれば `code_editor_ui` が毎フレーム入れ直す。
+        let Some((msg, sev, at)) = self.diag_hover.take() else {
+            return;
+        };
+        let color = diagview::severity_color(&self.theme, sev);
+        let (panel, text) = (self.theme.panel, self.theme.text);
+        egui::Area::new(egui::Id::new("zv-diag-hover"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(at + egui::vec2(0.0, HOVER_OFFSET_Y))
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(panel)
+                    .stroke(egui::Stroke::new(1.0_f32, color))
+                    .rounding(egui::Rounding::same(4.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        // 幅は LSP ホバーと同じ上限。長文は折り返して収める。
+                        ui.set_max_width(HOVER_POPUP_W);
+                        ui.horizontal_top(|ui| {
+                            ui.label(RichText::new("\u{25cf}").color(color));
+                            ui.label(RichText::new(msg).color(text));
+                        });
+                    });
+            });
+    }
+
     fn lsp_hover_popup(&mut self, ctx: &egui::Context) {
         let Some(info) = self.lsp_hover.shown() else {
             return;
@@ -8659,6 +8715,9 @@ impl ZaivernApp {
             | Cmd::ShowExplorer
             | Cmd::ShowGitHubTab
             | Cmd::ToggleProblems
+            | Cmd::NextProblem
+            | Cmd::PrevProblem
+            | Cmd::ToggleInlineDiagnostics
             | Cmd::ToggleFullScreen
             | Cmd::NavBack
             | Cmd::NavForward
@@ -9031,6 +9090,17 @@ impl ZaivernApp {
                 self.github.active = true;
             }
             Cmd::ToggleProblems => self.problems_open = !self.problems_open,
+            Cmd::NextProblem => self.goto_diagnostic(ctx, true),
+            Cmd::PrevProblem => self.goto_diagnostic(ctx, false),
+            Cmd::ToggleInlineDiagnostics => {
+                self.cfg.inline_diagnostics = !self.cfg.inline_diagnostics;
+                let msg = if self.cfg.inline_diagnostics {
+                    tr("行末の診断メッセージ: ON")
+                } else {
+                    tr("行末の診断メッセージ: OFF")
+                };
+                self.toast(msg, true);
+            }
             Cmd::ToggleFullScreen => {
                 // 救出 (壊れた全画面から脱出) 中・枠復元の予約中は何も送らない。
                 // 遷移の最中に styleMask/zoom を重ねると AppKit が NSException を
@@ -10186,6 +10256,13 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.get(BindAction::DiffNextChange)) {
             cmds.push(Cmd::DiffNextChange);
+        }
+        // 診断のジャンプ。差分と同じく ⇧F8 を F8 より先に見る。
+        if consume(ctx, self.keys.get(BindAction::PrevProblem)) {
+            cmds.push(Cmd::PrevProblem);
+        }
+        if consume(ctx, self.keys.get(BindAction::NextProblem)) {
+            cmds.push(Cmd::NextProblem);
         }
         if consume(ctx, self.keys.get(BindAction::CloseTab)) {
             cmds.push(Cmd::CloseTab);
@@ -16918,8 +16995,8 @@ impl ZaivernApp {
             let ctx = ui.ctx().clone();
             self.ensure_lsp(&ctx, &p, &lang_clone, active);
         }
-        self.refresh_active_diagnostics();
-        self.diag_counts = (self.diag_cache.2, self.diag_cache.3);
+        self.refresh_active_diagnostics(text_hash);
+        self.diag_counts = (self.diag_cache.errors, self.diag_cache.warnings);
         // diag_cache の借用は、可変借用が要る第 2 次配線の準備が済んでから取る
         // (この束縛を上げると self を可変に触れなくなる)。
 
@@ -17368,7 +17445,78 @@ impl ZaivernApp {
             0.0
         };
 
-        let diag_by_line = &self.diag_cache.1;
+        // ── 対応括弧の強調 ──
+        // 相手を探すのは `editor_ops::matching_bracket` (括弧ジャンプと同じ
+        // 関数) だけ。ここは結果を (char 添字, 相手がいるか) へ写して持つ。
+        // **キャレットか本文が変わったときだけ**走査する = アイドルは 0 コスト。
+        // 折りたたみ中は表示テキストと char 添字がずれるので出さない。
+        let bracket_spans: Vec<(usize, bool)> = if folding {
+            self.bracket_hl = None;
+            Vec::new()
+        } else {
+            let caret = egui::TextEdit::load_state(ui.ctx(), ed_id_early)
+                .and_then(|st| st.cursor.char_range())
+                .filter(|r| r.primary.index == r.secondary.index)
+                .map(|r| r.primary.index);
+            match caret {
+                Some(c) => {
+                    let fresh = self
+                        .bracket_hl
+                        .as_ref()
+                        .is_some_and(|(h, cc, _)| *h == text_hash && *cc == c);
+                    if !fresh {
+                        let v = match diagview::bracket_hl(&self.editor.buffers[active].text, c) {
+                            Some(h) => {
+                                let mut v = vec![(h.at, h.other.is_some())];
+                                if let Some(o) = h.other {
+                                    v.push((o, true));
+                                }
+                                v
+                            }
+                            None => Vec::new(),
+                        };
+                        self.bracket_hl = Some((text_hash, c, v));
+                    }
+                    self.bracket_hl
+                        .as_ref()
+                        .map(|(_, _, v)| v.clone())
+                        .unwrap_or_default()
+                }
+                None => {
+                    self.bracket_hl = None;
+                    Vec::new()
+                }
+            }
+        };
+        // 対応するペアはアクセント、相手のいない括弧はエラー色 (色はテーマ由来)
+        let bracket_fill = [
+            theme_err.gamma_multiply(0.30),
+            theme_accent.gamma_multiply(0.30),
+        ];
+        let bracket_edge = [
+            theme_err.gamma_multiply(0.85),
+            theme_accent.gamma_multiply(0.85),
+        ];
+        // severity → 色 (1..=4 の順)。`diagview::severity_color` を通すので
+        // ここにも app.rs にも色のベタ書きは無い。
+        let diag_colors: [Color32; 4] = [
+            diagview::severity_color(&self.theme, 1),
+            diagview::severity_color(&self.theme, 2),
+            diagview::severity_color(&self.theme, 3),
+            diagview::severity_color(&self.theme, 4),
+        ];
+        // 行末の診断メッセージ (Error Lens 相当)。既定オン・カーソル行だけ。
+        let inline_diag_on = self.cfg.inline_diagnostics && !folding;
+        // 波線を引く範囲と、行末メッセージに使う診断そのもの。
+        // 折りたたみ中は char 添字がずれるので波線は出さない (ガターの印は残る)。
+        let empty_spans: Vec<diagview::DiagSpan> = Vec::new();
+        let diag_spans: &[diagview::DiagSpan] = if folding {
+            &empty_spans
+        } else {
+            &self.diag_cache.spans
+        };
+        let diag_items = self.diag_cache.items.clone();
+        let diag_by_line = &self.diag_cache.by_line;
         let hl = self.highlighter;
         let buf = &mut self.editor.buffers[active];
         let Buffer {
@@ -17583,6 +17731,38 @@ impl ZaivernApp {
                     ui.painter().rect_filled(rect, 2.0, occ_color);
                 }
 
+                // 対応括弧の強調。カーソルに隣接する括弧と相手の**両方**を塗る。
+                // 相手がいない括弧はエラー色 (色は theme 由来・ベタ書きなし)。
+                for (idx, matched) in &bracket_spans {
+                    let c0 = output.galley.from_ccursor(egui::text::CCursor::new(*idx));
+                    let c1 = output
+                        .galley
+                        .from_ccursor(egui::text::CCursor::new(idx + 1));
+                    let r0 = output.galley.pos_from_cursor(&c0);
+                    let r1 = output.galley.pos_from_cursor(&c1);
+                    // 視覚行をまたぐと矩形が一意に決まらないので塗らない
+                    if (r0.min.y - r1.min.y).abs() > 0.5 || r1.min.x <= r0.min.x {
+                        continue;
+                    }
+                    let k = usize::from(*matched);
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(
+                            crate::theme::snap_len(output.galley_pos.x + r0.min.x, ppp),
+                            crate::theme::snap_len(output.galley_pos.y + r0.min.y, ppp),
+                        ),
+                        egui::pos2(
+                            crate::theme::snap_len(output.galley_pos.x + r1.min.x, ppp),
+                            crate::theme::snap_len(output.galley_pos.y + r0.max.y, ppp),
+                        ),
+                    );
+                    ui.painter().rect_filled(rect, 2.0, bracket_fill[k]);
+                    ui.painter().rect_stroke(
+                        rect,
+                        2.0,
+                        egui::Stroke::new(1.0_f32, bracket_edge[k]),
+                    );
+                }
+
                 // ── 複数キャレット: 追加キャレットの縦線と選択範囲の背景 ──
                 //
                 // egui は主キャレットしか描かないので、残りをここで塗る。
@@ -17627,6 +17807,62 @@ impl ZaivernApp {
                                 egui::Rangef::new(gp.y + q1.min.y, gp.y + q1.max.y),
                                 egui::Stroke::new(multi_caret_w, multi_caret_color),
                             );
+                        }
+                    }
+                }
+
+                // 診断の波線。深刻度の低い順に並んでいるので、重なった場所は
+                // 後に塗る error が上に残る。可視域の外は座標だけ作って捨てる
+                // のも惜しいので、行ごとに clip_rect で先に落とす。
+                if !diag_spans.is_empty() {
+                    let clip = ui.clip_rect();
+                    let last_row = output.galley.rows.len().saturating_sub(1);
+                    for sp in diag_spans {
+                        let color = diag_colors[(sp.severity.clamp(1, 4) - 1) as usize];
+                        let c0 = output
+                            .galley
+                            .from_ccursor(egui::text::CCursor::new(sp.start));
+                        let c1 = output.galley.from_ccursor(egui::text::CCursor::new(sp.end));
+                        let row0 = c0.rcursor.row.min(last_row);
+                        let end_row = c1.rcursor.row.min(last_row);
+                        // 1 件の診断が抱える視覚行には上限を置く (巨大な範囲を
+                        // 返してくるサーバーでフレームを潰さないため)
+                        let row1 = end_row.min(row0 + diagview::SQUIGGLE_MAX_ROWS);
+                        let x0 = output.galley.pos_from_cursor(&c0).min.x;
+                        let x1 = output.galley.pos_from_cursor(&c1).min.x;
+                        for row in row0..=row1 {
+                            let Some(r) = output.galley.rows.get(row) else {
+                                break;
+                            };
+                            let y = output.galley_pos.y + r.rect.max.y - diagview::SQUIGGLE_AMP;
+                            if y < clip.top() - row_h || y > clip.bottom() + row_h {
+                                continue; // 画面外の行は描かない
+                            }
+                            let a = if row == row0 { x0 } else { r.rect.min.x };
+                            // 終端の x を使うのは**終端の行**だけ。上限で打ち切った
+                            // 行に他行の x を持ち込むと、関係ない場所へ線が伸びる。
+                            let b = if row == end_row { x1 } else { r.rect.max.x };
+                            // 範囲が次の行頭で終わる場合、その行には引くものが無い
+                            if row == end_row && row > row0 && b <= r.rect.min.x + 0.5 {
+                                continue;
+                            }
+                            // 空行や範囲の継ぎ目で幅 0 になったら 1 文字ぶんだけ見せる
+                            let b = if b <= a { a + char_w } else { b };
+                            // 可用領域 (= スクロール窓) からはみ出さないよう先に詰める
+                            let ax = (output.galley_pos.x + a).max(clip.left());
+                            let bx = (output.galley_pos.x + b).min(clip.right());
+                            let pts = diagview::squiggle_points(
+                                ax,
+                                bx,
+                                y,
+                                diagview::SQUIGGLE_AMP,
+                                diagview::SQUIGGLE_WAVE,
+                                ppp,
+                            );
+                            if pts.len() >= 2 {
+                                ui.painter()
+                                    .add(egui::Shape::line(pts, egui::Stroke::new(1.0_f32, color)));
+                            }
                         }
                     }
                 }
@@ -17695,6 +17931,42 @@ impl ZaivernApp {
                         None => line,
                     };
                     cursor_out = Some((line, col));
+
+                    // 行末の診断メッセージ (VS Code の Error Lens 相当)。
+                    // **キャレット行だけ** — 全行に出すと本文の右側が文章で
+                    // 埋まる。設定 `inline_diagnostics` で消せる。
+                    if inline_diag_on && !diag_items.is_empty() && char_w > 0.0 {
+                        let row = output
+                            .galley
+                            .from_ccursor(egui::text::CCursor::new(idx))
+                            .rcursor
+                            .row;
+                        if let Some(r) = output.galley.rows.get(row) {
+                            let clip = ui.clip_rect();
+                            let x = output.galley_pos.x + r.rect.max.x + char_w * 2.0;
+                            // 残り幅に収まる文字数までしか出さない (行が見切れない)
+                            let max_chars =
+                                (((clip.right() - x) / char_w).floor()).max(0.0) as usize;
+                            if let Some((msg, sev)) =
+                                diagview::inline_message(&diag_items, line - 1, max_chars)
+                            {
+                                let color = diag_colors[(sev.clamp(1, 4) - 1) as usize];
+                                ui.painter().text(
+                                    egui::pos2(
+                                        crate::theme::snap_len(x, ppp),
+                                        crate::theme::snap_len(
+                                            output.galley_pos.y + r.rect.center().y,
+                                            ppp,
+                                        ),
+                                    ),
+                                    Align2::LEFT_CENTER,
+                                    msg,
+                                    font.clone(),
+                                    color.gamma_multiply(0.75),
+                                );
+                            }
+                        }
+                    }
                 }
 
                 // Enter 直後の自動インデント
@@ -18258,17 +18530,34 @@ impl ZaivernApp {
         self.caret_screen = caret_at;
         match hover_hit {
             Some((idx, p)) => {
-                self.lsp_hover_pos = Some(p);
                 let src_idx = if disp_cut_len == 0 {
                     idx
                 } else {
                     fold_display_to_source(&hover_cut, idx)
                 };
-                let t = &self.editor.buffers[active].text;
-                let byte = editor_ops::char_to_byte(t, src_idx.min(t.chars().count()));
-                self.hover_doc_pos = Some(lsp::byte_index_to_lsp_pos(t, byte));
+                // 波線の上なら診断を出す。**LSP ホバーとは排他** —
+                // 同じ場所に説明を 2 枚重ねない (要求そのものを送らない)。
+                let hit = diagview::diag_at(&self.diag_cache.spans, src_idx)
+                    .and_then(|n| self.diag_cache.get(n))
+                    .map(|d| (diagview::labeled_message(d), d.severity));
+                match hit {
+                    Some((msg, sev)) => {
+                        self.diag_hover = Some((msg, sev, p));
+                        self.hover_doc_pos = None;
+                        self.lsp_hover_pos = None;
+                        self.lsp_hover.dismiss();
+                    }
+                    None => {
+                        self.diag_hover = None;
+                        self.lsp_hover_pos = Some(p);
+                        let t = &self.editor.buffers[active].text;
+                        let byte = editor_ops::char_to_byte(t, src_idx.min(t.chars().count()));
+                        self.hover_doc_pos = Some(lsp::byte_index_to_lsp_pos(t, byte));
+                    }
+                }
             }
             None => {
+                self.diag_hover = None;
                 self.lsp_hover_pos = None;
                 self.lsp_hover.dismiss();
             }
@@ -18767,6 +19056,24 @@ impl ZaivernApp {
                 tr("問題パネルの切替"),
                 fmt_key(BindAction::ToggleProblems),
                 Cmd::ToggleProblems,
+            ),
+            (
+                "⤓".into(),
+                tr("次の問題へ"),
+                fmt_key(BindAction::NextProblem),
+                Cmd::NextProblem,
+            ),
+            (
+                "⤒".into(),
+                tr("前の問題へ"),
+                fmt_key(BindAction::PrevProblem),
+                Cmd::PrevProblem,
+            ),
+            (
+                "💬".into(),
+                tr("行末の診断メッセージ切替"),
+                String::new(),
+                Cmd::ToggleInlineDiagnostics,
             ),
             // ── 第 2 次配線: レビュー / 折りたたみ / ブックマーク / 表 / LSP ──
             (
@@ -22785,6 +23092,7 @@ impl ZaivernApp {
         self.lsp_completion_popup(ctx);
         self.lsp_signature_popup(ctx);
         self.lsp_code_actions_popup(ctx);
+        self.diag_hover_popup(ctx);
         self.lsp_hover_popup(ctx);
 
         self.palette_ui(ctx);
@@ -28829,6 +29137,72 @@ mod wave2_tests {
         );
     }
 
+    /// **診断のインライン表示と対応括弧の強調が画面に繋がっている。**
+    ///
+    /// 「LSP から範囲は届いているのにガターの印しか出ない」「実装したが
+    /// どこからも押せない」を潰すための番人。描画・到達経路・排他を全部見る。
+    /// ソースを読むテストなので改行は正規化する (Windows は CRLF)。
+    #[test]
+    fn 診断のインライン表示と対応括弧が画面に繋がっている() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        // 本文描画の中だけを見る (テスト自身の文字列に当たらないようにする)
+        let (_, body) = src
+            .split_once("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .expect("code_editor_ui がある");
+        let (body, _) = body
+            .split_once("\n    // ─── UI: palette ")
+            .expect("code_editor_ui の終わり");
+
+        // ① 範囲付きの診断を持ち、本文へ波線・括弧・行末メッセージを描いている
+        for draw in [
+            "diagview::squiggle_points(",
+            "egui::Shape::line(pts,",
+            "bracket_fill[k]",
+            "diagview::inline_message(",
+            "diag_colors[(sp.severity.clamp(1, 4) - 1) as usize]",
+        ] {
+            assert!(
+                body.contains(draw),
+                "{draw} が本文描画に無い (画面に出ない)"
+            );
+        }
+        // ② 括弧の相手探しは既存のマッチャ 1 つだけ (app.rs に複製しない)
+        assert!(
+            body.contains("diagview::bracket_hl("),
+            "対応括弧を求めていない"
+        );
+        assert!(
+            !src.contains(&format!("fn {}", "matching_bracket")),
+            "app.rs に括弧マッチャを複製している (editor_ops のものを使うこと)"
+        );
+        // ③ 色は必ずテーマ経由 (severity → 色のベタ書きを禁じる)
+        assert!(
+            body.contains("diagview::severity_color(&self.theme, 1)"),
+            "診断の色をテーマから取っていない"
+        );
+        // ④ 到達経路: キーバインド / パレット / 設定
+        for route in [
+            "BindAction::NextProblem",
+            "BindAction::PrevProblem",
+            "Cmd::NextProblem => self.goto_diagnostic(ctx, true)",
+            "Cmd::PrevProblem => self.goto_diagnostic(ctx, false)",
+            "Cmd::ToggleInlineDiagnostics",
+            "self.cfg.inline_diagnostics",
+            "self.diag_hover_popup(ctx);",
+        ] {
+            assert!(src.contains(route), "{route} の到達経路が無い");
+        }
+        // ⑤ 診断ホバーと LSP ホバーは排他 (同じ場所へ 2 枚重ねない)
+        let hover = body
+            .split("match hover_hit {")
+            .nth(1)
+            .expect("ホバーの分岐がある");
+        assert!(
+            hover.contains("self.diag_hover = Some(") && hover.contains("self.lsp_hover.dismiss()"),
+            "診断が当たったフレームで LSP ホバーを止めていない"
+        );
+    }
+
     /// **パレットが表示する打鍵は、その行が実行する `Cmd` の `BindAction` から作る。**
     ///
     /// ベタ書きに戻すと再割り当てで嘘になり、別のアクションの打鍵を貼ると
@@ -28845,6 +29219,8 @@ mod wave2_tests {
             ("FocusPane2", "FocusNextPane"),
             ("DiffNextChange", "DiffNextChange"),
             ("DiffPrevChange", "DiffPrevChange"),
+            ("NextProblem", "NextProblem"),
+            ("PrevProblem", "PrevProblem"),
             ("LspCodeAction", "LspCodeAction"),
             ("LspSignatureHelp", "LspSignatureHelp"),
             ("Save", "Save"),

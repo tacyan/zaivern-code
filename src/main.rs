@@ -12,6 +12,7 @@ mod coordinator;
 mod deck;
 mod desktop;
 mod diagnostician;
+mod diagview;
 mod diff;
 mod editor;
 mod editor_ops;
