@@ -81,6 +81,9 @@ pub enum Cmd {
     RestartAgent,
     KillAgent,
     SetTheme(String),
+    /// 設定画面 (検索できる一覧) を開く。VS Code の「設定を開く (UI)」相当。
+    OpenSettings,
+    /// config.toml をエディタで開く。GUI で表現しきれない設定はこちらから触る。
     OpenConfig,
     ReloadConfig,
     /// 画面全体を 1 段拡大する (VS Code の「ズームイン」= ⌘+)。
@@ -782,7 +785,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::SetVoiceTarget(_) => Group::Agent,
 
         // ── 設定・ヘルプ ───────────────────────────────────────────
-        Cmd::OpenConfig
+        Cmd::OpenSettings
+        | Cmd::OpenConfig
         | Cmd::ReloadConfig
         | Cmd::ToggleRemote
         | Cmd::OpenSshRemote

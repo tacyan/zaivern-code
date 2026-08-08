@@ -382,6 +382,19 @@ impl History {
         self.saved_at == Some(self.cursor)
     }
 
+    /// 「本文が動いたか」を **本文をハッシュせずに** 見分けるための安い値。
+    ///
+    /// Hot Exit の退避がこれを毎フレーム見る。段数と位置だけだと、続けて
+    /// 打った文字が直前の段へ**併合**されたときに変化しないので、履歴が
+    /// 抱えている差分の合計バイト数まで混ぜる。値そのものに意味は無く、
+    /// 「前フレームと違うか」だけを使う (設計原則 3: アイドル時のコストはゼロ)。
+    pub fn revision(&self) -> u64 {
+        let mut h = self.steps.len() as u64;
+        h = combine_hash(h, self.cursor as u64);
+        h = combine_hash(h, self.dropped as u64);
+        combine_hash(h, self.bytes as u64)
+    }
+
     /// いまの位置を「保存した時点」として覚える。
     pub fn mark_saved(&mut self) {
         self.saved_at = Some(self.cursor);
