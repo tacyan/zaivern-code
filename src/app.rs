@@ -18,6 +18,7 @@ use crate::editor_split;
 use crate::failover;
 use crate::file_search;
 use crate::file_tree::{self, FileTree, TreeActions};
+use crate::find_buffer;
 use crate::firewall;
 use crate::fuzzy;
 use crate::git;
@@ -236,10 +237,39 @@ struct FindState {
     open: bool,
     query: String,
     focus: bool,
-    last: Option<usize>,
+    /// いま選ばれているヒットの**バイト範囲**。本文が変わると照合に失敗するので
+    /// 「見つからなければ現在位置なし」として扱う (古い位置へ飛ばない)。
+    current: Option<(usize, usize)>,
+    /// 現在位置が無いときの探索起点 (バイト)。検索バーを開いた時点のカーソル。
+    anchor: usize,
+    /// 直前の移動で折り返したか。`Some(true)` = 末尾から先頭へ、
+    /// `Some(false)` = 先頭から末尾へ。`None` = 折り返していない。
+    wrapped: Option<bool>,
     /// 置換行 (VS Code: ⌥⌘F) を表示するか
     replace_open: bool,
     replace: String,
+    /// 検索バーのトグル 3 つ (大小区別 / 単語単位 / 正規表現)
+    opts: find_buffer::FindOptions,
+}
+
+/// バッファ内検索のヒット一覧キャッシュ。
+///
+/// 鍵は**本文ハッシュ + 検索語 + トグル**。1 回の走査結果を検索バー・
+/// ミニマップの印・本文のハイライトが共有する (同じ本文を 3 回走査しない)。
+struct FindHitCache {
+    text_hash: u64,
+    query: String,
+    opts: find_buffer::FindOptions,
+    /// 走査に使ったマッチャ (置換の `$1` 展開でも同じものを使う)
+    matcher: file_search::Matcher,
+    /// Arc 共有: 毎フレームの clone は参照カウント増加のみ
+    hits: std::sync::Arc<Vec<find_buffer::BufHit>>,
+    /// ミニマップに出す行 (重複を潰し、minimap::MAX_HITS で打ち切り)
+    mm_lines: std::sync::Arc<Vec<usize>>,
+    /// [`find_buffer::MAX_HITS`] で打ち切ったか
+    truncated: bool,
+    /// 正規表現のコンパイルエラー。あるときヒットは空。
+    error: Option<String>,
 }
 
 /// 置換フローの段階。**ドライラン → 確認 → 実行**の 3 段でしか進まない。
@@ -2306,13 +2336,9 @@ pub struct ZaivernApp {
     last_scroll_y: f32,
     /// アクティブバッファ本文のハッシュ (code_editor_ui が line_marks 用に毎フレーム更新)
     last_text_hash: u64,
-    /// find バーのヒット数キャッシュ: (本文ハッシュ, query, ヒット数)。
-    /// 本文ハッシュは last_text_hash を使い回し、新たな全文走査はしない
-    find_count_cache: Option<(u64, String, usize)>,
-    /// ミニマップに出す検索ヒット行のキャッシュ: (本文ハッシュ, query, 行番号)。
-    /// find バーと同じ `last_text_hash` を鍵に使うので、新たな全文走査は
-    /// 検索語か本文が変わったときだけ起きる。
-    minimap_hits: Option<(u64, String, Vec<usize>)>,
+    /// バッファ内検索のヒット一覧 (検索バー / ミニマップの印 / 本文のハイライトが共有)。
+    /// 本文か検索条件が変わったときだけ走査し直す。
+    find_hits: Option<FindHitCache>,
     /// ブレッドクラム用に documentSymbol を投げた記録: (パス, 本文ハッシュ, 時刻)。
     /// 同じ内容へ二重に投げないためのデバウンス。
     breadcrumb_symbols_asked: Option<(PathBuf, u64, Instant)>,
@@ -2920,9 +2946,12 @@ impl ZaivernApp {
                 open: false,
                 query: String::new(),
                 focus: false,
-                last: None,
+                current: None,
+                anchor: 0,
+                wrapped: None,
                 replace_open: false,
                 replace: String::new(),
+                opts: find_buffer::FindOptions::default(),
             },
             menu_state: recent::load(),
             autosave_at: None,
@@ -2964,8 +2993,7 @@ impl ZaivernApp {
             zoom_wheel_on_file: false,
             last_scroll_y: 0.0,
             last_text_hash: 0,
-            find_count_cache: None,
-            minimap_hits: None,
+            find_hits: None,
             breadcrumb_symbols_asked: None,
             remote: None,
             remote_err: None,
@@ -6334,29 +6362,163 @@ impl ZaivernApp {
         }
     }
 
-    fn find_next(&mut self) {
+    /// バッファ内検索のヒット一覧を最新にする。
+    ///
+    /// **本文か検索条件が変わったときだけ**走査する (鍵は本文ハッシュ + 検索語 +
+    /// トグル)。正規表現が不正でも panic せず、理由を [`FindHitCache::error`] に
+    /// 持ってヒット 0 件として扱う。
+    fn refresh_find_hits(&mut self, buf: usize, text_hash: u64) {
+        if self.find.query.is_empty() {
+            self.find_hits = None;
+            return;
+        }
+        let fresh = self.find_hits.as_ref().is_some_and(|c| {
+            c.text_hash == text_hash && c.query == self.find.query && c.opts == self.find.opts
+        });
+        if fresh {
+            return;
+        }
+        let (matcher, error) = match find_buffer::compile(&self.find.query, self.find.opts) {
+            Ok(m) => (m, None),
+            // 打鍵の途中は必ず不正な状態を通る (`(` を打った瞬間など)。
+            // 空マッチャへ落として理由だけ持ち、UI は赤枠と説明で示す。
+            Err(e) => (
+                find_buffer::compile("", self.find.opts).expect("空クエリは常にコンパイルできる"),
+                Some(e.to_string()),
+            ),
+        };
+        let (hits, truncated) = if error.is_some() {
+            (Vec::new(), false)
+        } else {
+            find_buffer::find_all(&self.editor.buffers[buf].text, &matcher)
+        };
+        // ミニマップの印は「ヒットのある行」なので重複を潰す (hits は行順)
+        let mut mm_lines: Vec<usize> = Vec::new();
+        for h in &hits {
+            if mm_lines.last() != Some(&h.line) {
+                if mm_lines.len() >= crate::minimap::MAX_HITS {
+                    break;
+                }
+                mm_lines.push(h.line);
+            }
+        }
+        self.find_hits = Some(FindHitCache {
+            text_hash,
+            query: self.find.query.clone(),
+            opts: self.find.opts,
+            matcher,
+            hits: std::sync::Arc::new(hits),
+            mm_lines: std::sync::Arc::new(mm_lines),
+            truncated,
+            error,
+        });
+    }
+
+    /// いまの現在位置がヒット一覧の何番目か (本文が変わって見失っていれば None)。
+    /// ヒットは start 昇順なので二分探索で足りる (毎フレーム線形走査しない)。
+    fn current_hit_index(&self) -> Option<usize> {
+        let (s, e) = self.find.current?;
+        let c = self.find_hits.as_ref()?;
+        let ix = c.hits.binary_search_by_key(&s, |h| h.start).ok()?;
+        (c.hits[ix].end == e).then_some(ix)
+    }
+
+    /// 次 (Enter) / 前 (⇧Enter) のヒットへ移動する。末尾↔先頭の折り返しに対応し、
+    /// 折り返したことは [`FindState::wrapped`] に残して検索バーで示す。
+    fn find_step(&mut self, forward: bool) {
         let Some(i) = self.editor.active else {
             return;
         };
         if self.find.query.is_empty() {
             return;
         }
-        let text = self.editor.buffers[i].text.clone();
-        // 大小無視の検索と境界ずれ (İ Ω 等) のフォールバックは find_ci に集約
-        let start_char = self.find.last.map(|c| c + 1).unwrap_or(0);
-        let Some(char_pos) = editor_ops::find_ci(&text, &self.find.query, start_char) else {
-            self.toast(tr("見つかりませんでした"), false);
-            self.find.last = None;
+        let text_hash = hash_str(&self.editor.buffers[i].text);
+        self.refresh_find_hits(i, text_hash);
+        // 現在位置が本文と食い違っていたら起点へ戻す (古い位置へ飛ばない)
+        let cur_start = self
+            .current_hit_index()
+            .map(|ix| self.find_hits.as_ref().expect("直前に確認済み").hits[ix].start);
+        let from = match cur_start {
+            Some(s) if forward => s + 1,
+            Some(s) => s,
+            None => self.find.anchor,
+        };
+        let picked = self
+            .find_hits
+            .as_ref()
+            .filter(|c| c.error.is_none())
+            .and_then(|c| find_buffer::step(&c.hits, from, forward).map(|(ix, w)| (c.hits[ix], w)));
+        let Some((hit, wrapped)) = picked else {
+            // 0 件 / 正規表現エラーはバー側 (赤枠と件数) で示す。
+            // 打鍵ごとにトーストを出すと通知が埋まるので鳴らさない。
+            self.find.current = None;
+            self.find.wrapped = None;
             return;
         };
-
-        let n_chars = self.find.query.chars().count();
-        self.find.last = Some(char_pos);
-        self.pending_select = Some((char_pos, char_pos + n_chars));
-        let line = editor_ops::line_of_char(&text, char_pos);
+        self.find.current = Some(hit.range());
+        self.find.wrapped = wrapped.then_some(forward);
+        let text = &self.editor.buffers[i].text;
+        let cs = find_buffer::byte_to_char(text, hit.start);
+        let ce = find_buffer::byte_to_char(text, hit.end);
+        self.pending_select = Some((cs, ce));
         // VS Code 同様、ヒット行が画面の中央付近に来るようにスクロールする
         self.pending_scroll =
-            Some((line as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
+            Some((hit.line as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
+    }
+
+    /// 検索バーを開く。選択があればそれを検索語にする (VS Code と同じ)。
+    ///
+    /// 入れない場合が 2 つある:
+    /// * **行をまたぐ選択** — 走査は行単位なので必ず 0 件になる。
+    /// * **選択がいまのヒットそのもの** — 直前の検索が付けた選択なので、
+    ///   入れると正規表現がヒット文字列に置き換わって消える。
+    fn open_find(&mut self, ctx: &egui::Context, with_replace: bool) {
+        let sel = self.active_cursor_bytes(ctx);
+        if let Some((s, e)) = sel {
+            let from_hit = e > s && self.find.current == Some((s, e));
+            let text = self
+                .editor
+                .active
+                .map(|i| self.editor.buffers[i].text.as_str());
+            if let Some(picked) = text.filter(|_| e > s && !from_hit).map(|t| &t[s..e]) {
+                if !picked.contains('\n') {
+                    // 正規表現モードでは選択を**そのまま探す**意図なのでエスケープする
+                    // (VS Code と同じ)。
+                    self.find.query = if self.find.opts.regex {
+                        regex::escape(picked)
+                    } else {
+                        picked.to_string()
+                    };
+                    self.find.current = None;
+                    self.find.wrapped = None;
+                }
+            }
+        }
+        // 起点はいまのカーソル (選択があれば手前側)。近い方のヒットから回る。
+        self.find.anchor = sel.map_or(0, |(s, _)| s);
+        self.find.open = true;
+        self.find.focus = true;
+        if with_replace {
+            self.find.replace_open = true;
+        }
+    }
+
+    /// アクティブバッファのカーソル位置をバイト範囲で返す。
+    /// 選択が無ければ `(c, c)`。バッファが無い / 状態が無いときは `None`。
+    fn active_cursor_bytes(&self, ctx: &egui::Context) -> Option<(usize, usize)> {
+        let b = self.editor.active.map(|i| &self.editor.buffers[i])?;
+        let ed_id = buf_edit_id(self.cur_pane, b.id);
+        let r = egui::TextEdit::load_state(ctx, ed_id)?
+            .cursor
+            .char_range()?;
+        let (s, e) = (
+            r.primary.index.min(r.secondary.index),
+            r.primary.index.max(r.secondary.index),
+        );
+        Some((
+            editor_ops::char_to_byte(&b.text, s),
+            editor_ops::char_to_byte(&b.text, e),
+        ))
     }
 
     /// 指定フォルダをワークスペースとして開き直す (フォルダを開く / worktree を開く)。
@@ -8636,9 +8798,7 @@ impl ZaivernApp {
             Cmd::MoveLineDown => self.editor_op(ctx, EditOp::Move(false)),
             Cmd::OpenReplace => {
                 if self.editor.active.is_some() {
-                    self.find.open = true;
-                    self.find.focus = true;
-                    self.find.replace_open = true;
+                    self.open_find(ctx, true);
                 }
             }
             _ => {}
@@ -9081,10 +9241,8 @@ impl ZaivernApp {
                 self.sidebar_tab = SidebarTab::Git;
                 self.persist_session();
             }
-            Cmd::OpenFind => {
-                self.find.open = true;
-                self.find.focus = true;
-            }
+            // 選択があればそれを検索語にする (VS Code と同じ)
+            Cmd::OpenFind => self.open_find(ctx, false),
             Cmd::NewAgent(i) => self.launch_preset(i, ctx),
             Cmd::FocusAgent(i) => {
                 if i < self.agents.sessions.len() {
@@ -14802,7 +14960,8 @@ impl ZaivernApp {
             self.editor.active = Some(reorder_active(a, from, to));
         }
         // 検索のヒット位置はバッファに紐づくので、並びが変わっても持ち越さない
-        self.find.last = None;
+        self.find.current = None;
+        self.find_hits = None;
         self.persist_session();
     }
 
@@ -14889,7 +15048,8 @@ impl ZaivernApp {
                 }
             }
             self.editor.active = Some(i);
-            self.find.last = None;
+            self.find.current = None;
+            self.find_hits = None;
         }
         if let Some(i) = close {
             let buf = self.editor.buffers.get(i).map(|b| b.id);
@@ -15604,101 +15764,263 @@ impl ZaivernApp {
             });
     }
 
+    /// バッファ内検索バー (VS Code の検索ウィジェット相当)。
+    ///
+    /// 幅による見せ方の判断は [`find_buffer::bar_layout`] (純粋関数 + テーブル
+    /// テスト) に閉じてある。ここは決まった配置に従って描くだけで、
+    /// 「狭いときは…」の分岐を持たない。
     fn find_bar(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme.clone();
-        let mut do_find = false;
+        let mut step: Option<bool> = None; // Some(forward)
         let mut close = false;
         let mut do_replace = false;
         let mut do_replace_all = false;
+
+        // 打鍵の案内は**生成する**。ベタ書きすると Windows/Linux では表記そのものが
+        // 違い、再割り当てでも嘘になる (keybinds の番人テスト参照)。
+        let key_next = crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
+            egui::Modifiers::NONE,
+            egui::Key::Enter,
+        ));
+        let key_prev = crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
+            egui::Modifiers::SHIFT,
+            egui::Key::Enter,
+        ));
+        let key_replace_row = self.key_hint(BindAction::OpenReplace);
+
+        // 表示用の要約はクロージャへ入る前に作る (中では self を可変で借りるため)
+        let total = self.find_hits.as_ref().map_or(0, |c| c.hits.len());
+        let truncated = self.find_hits.as_ref().is_some_and(|c| c.truncated);
+        let err = self.find_hits.as_ref().and_then(|c| c.error.clone());
+        let cur_no = self.current_hit_index().map(|i| i + 1);
+        let has_query = !self.find.query.is_empty();
+        let no_match = has_query && (total == 0 || err.is_some());
+        let count_text = if !has_query {
+            String::new()
+        } else if err.is_some() {
+            tr("エラー")
+        } else if total == 0 {
+            tr("結果なし")
+        } else {
+            // 打ち切ったときは「以上」を付ける (数え切っていないことを隠さない)
+            let n = if truncated {
+                trf("{n} 件以上", &[("n", total.to_string())])
+            } else {
+                total.to_string()
+            };
+            match cur_no {
+                Some(i) => trf("{i} / {n}", &[("i", i.to_string()), ("n", n)]),
+                // 本文が変わって現在位置を見失っている間は件数だけ出す
+                None => trf("{n} 件", &[("n", n)]),
+            }
+        };
+        let wrap_note = self.find.wrapped.map(|fw| {
+            if fw {
+                tr("末尾から先頭へ折り返しました")
+            } else {
+                tr("先頭から末尾へ折り返しました")
+            }
+        });
+        let count_display = match wrap_note {
+            Some(_) => format!("↩ {count_text}"),
+            None => count_text.clone(),
+        };
+        let count_hover = match &wrap_note {
+            Some(note) => format!("{count_text} — {note}"),
+            None => count_text.clone(),
+        };
+
+        let metrics = find_buffer::BarMetrics::default();
+        // 床より狭くても配置は崩さない (これ以上は詰められない下限がある)
+        let avail = ui.available_width().max(find_buffer::min_width(&metrics));
+        let layout = find_buffer::bar_layout(avail, &metrics);
+        debug_assert!(
+            layout.total_width(&metrics) <= avail + 0.5,
+            "検索バーが可用幅からはみ出した"
+        );
+        let row_h = ui.spacing().interact_size.y;
+        let minimal = layout.density == find_buffer::Density::Minimal;
 
         let bar = egui::Frame::none()
             .fill(theme.panel_alt)
             .inner_margin(egui::Margin::symmetric(8.0, 5.0))
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = layout.spacing;
                 ui.horizontal(|ui| {
                     // 置換行の開閉 (VS Code の検索バー左端の ▸/▾ と同じ)
-                    let caret = if self.find.replace_open { "▾" } else { "▸" };
-                    if ui
-                        .button(caret)
-                        .on_hover_text(trf(
-                            "置換行の表示切替 ({key})",
-                            &[("key", self.key_hint(BindAction::OpenReplace))],
-                        ))
-                        .clicked()
-                    {
-                        self.find.replace_open = !self.find.replace_open;
+                    if layout.show_caret {
+                        let caret = if self.find.replace_open { "▾" } else { "▸" };
+                        if ui
+                            .add_sized([metrics.caret, row_h], egui::Button::new(caret))
+                            .on_hover_text(trf(
+                                "置換行の表示切替 ({key})",
+                                &[("key", key_replace_row.clone())],
+                            ))
+                            .clicked()
+                        {
+                            self.find.replace_open = !self.find.replace_open;
+                        }
                     }
-                    ui.label("🔍");
+                    if layout.show_glyph {
+                        ui.label("🔍");
+                    }
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.find.query)
-                            .desired_width(260.0)
+                            .desired_width(layout.query_width)
                             .hint_text(tr("ファイル内検索…")),
                     );
+                    if no_match {
+                        // 0 件 / 不正な正規表現は枠の色で示す (色はテーマから取る)
+                        ui.painter().rect_stroke(
+                            resp.rect.expand(1.0),
+                            ui.visuals().widgets.inactive.rounding,
+                            egui::Stroke::new(1.0_f32, find_buffer::no_match_color(&theme)),
+                        );
+                    }
                     if self.find.focus {
                         resp.request_focus();
                         self.find.focus = false;
                     }
                     if resp.changed() {
-                        self.find.last = None;
+                        // 打鍵ごとに探し直す (VS Code のインクリメンタル検索)
+                        self.find.current = None;
+                        self.find.wrapped = None;
+                        step = Some(true);
                     }
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        do_find = true;
-                    }
-                    if ui.button(tr("次へ ↓")).clicked() {
-                        do_find = true;
-                    }
-                    if let Some(i) = self.editor.active {
-                        if !self.find.query.is_empty() {
-                            // 毎フレームの全文 to_lowercase を避ける:
-                            // code_editor_ui が line_marks 用に計算済みの本文ハッシュ
-                            // (last_text_hash) + query をキーにヒット数をキャッシュ
-                            let count = match &self.find_count_cache {
-                                Some((h, q, c))
-                                    if *h == self.last_text_hash && *q == self.find.query =>
-                                {
-                                    *c
-                                }
-                                _ => {
-                                    let c = self.editor.buffers[i]
-                                        .text
-                                        .to_lowercase()
-                                        .matches(&self.find.query.to_lowercase())
-                                        .count();
-                                    self.find_count_cache =
-                                        Some((self.last_text_hash, self.find.query.clone(), c));
-                                    c
-                                }
-                            };
-                            ui.label(
-                                RichText::new(trf("{count} 件", &[("count", count.to_string())]))
-                                    .color(theme.text_dim),
-                            );
+                    if resp.lost_focus() {
+                        let (enter, shift) =
+                            ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+                        if enter {
+                            step = Some(!shift);
+                            // 続けて打てるようにフォーカスを戻す
+                            self.find.focus = true;
                         }
                     }
+
+                    // トグル 3 つ。並びは VS Code の検索ウィジェットと同じ
+                    // (大小区別 → 単語単位 → 正規表現)。
+                    let mut opts_changed = false;
+                    if ui
+                        .add_sized(
+                            [metrics.toggle, row_h],
+                            egui::SelectableLabel::new(self.find.opts.case_sensitive, "Aa"),
+                        )
+                        .on_hover_text(tr("大文字小文字を区別"))
+                        .clicked()
+                    {
+                        self.find.opts.case_sensitive = !self.find.opts.case_sensitive;
+                        opts_changed = true;
+                    }
+                    if ui
+                        .add_sized(
+                            [metrics.toggle, row_h],
+                            egui::SelectableLabel::new(self.find.opts.whole_word, "ab|"),
+                        )
+                        .on_hover_text(tr("単語単位で一致"))
+                        .clicked()
+                    {
+                        self.find.opts.whole_word = !self.find.opts.whole_word;
+                        opts_changed = true;
+                    }
+                    if ui
+                        .add_sized(
+                            [metrics.toggle, row_h],
+                            egui::SelectableLabel::new(self.find.opts.regex, ".*"),
+                        )
+                        .on_hover_text(tr("正規表現"))
+                        .clicked()
+                    {
+                        self.find.opts.regex = !self.find.opts.regex;
+                        opts_changed = true;
+                    }
+                    if opts_changed {
+                        self.find.current = None;
+                        self.find.wrapped = None;
+                        step = Some(true);
+                    }
+
+                    // 前へ / 次へ。狭いときはアイコンのみへ縮退する。
+                    let (prev_label, next_label, nav_w) = if layout.nav_labels {
+                        (tr("前へ ↑"), tr("次へ ↓"), metrics.nav_label)
+                    } else {
+                        ("↑".to_string(), "↓".to_string(), metrics.nav_icon)
+                    };
+                    if ui
+                        .add_sized([nav_w, row_h], egui::Button::new(prev_label))
+                        .on_hover_text(trf("前のヒットへ ({key})", &[("key", key_prev.clone())]))
+                        .clicked()
+                    {
+                        step = Some(false);
+                    }
+                    if ui
+                        .add_sized([nav_w, row_h], egui::Button::new(next_label))
+                        .on_hover_text(trf("次のヒットへ ({key})", &[("key", key_next.clone())]))
+                        .clicked()
+                    {
+                        step = Some(true);
+                    }
+
+                    if layout.show_count && !count_display.is_empty() {
+                        let color = if no_match {
+                            find_buffer::no_match_color(&theme)
+                        } else {
+                            theme.text_dim
+                        };
+                        ui.add_sized(
+                            [metrics.count, row_h],
+                            egui::Label::new(RichText::new(&count_display).color(color)).truncate(),
+                        )
+                        .on_hover_text(count_hover.clone());
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕").clicked() {
+                        if ui
+                            .add_sized([metrics.close, row_h], egui::Button::new("✕"))
+                            .on_hover_text(tr("検索を閉じる"))
+                            .clicked()
+                        {
                             close = true;
                         }
                     });
                 });
-                // 置換行 (VS Code: ⌥⌘F)
+
+                // 正規表現が不正なときは落とさず理由を出す (regex のメッセージそのまま)
+                if let Some(e) = &err {
+                    ui.add(egui::Label::new(RichText::new(e).color(theme.err).small()).truncate())
+                        .on_hover_text(e.clone());
+                }
+
+                // 置換行 (VS Code: ⌥⌘F)。折り返しに任せてどの幅でも見切れさせない。
                 if self.find.replace_open {
-                    ui.horizontal(|ui| {
-                        ui.add_space(26.0);
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("⇄");
+                        let hint = if self.find.opts.regex {
+                            tr("置換… ($1 でグループ参照)")
+                        } else {
+                            tr("置換…")
+                        };
                         ui.add(
                             egui::TextEdit::singleline(&mut self.find.replace)
-                                .desired_width(260.0)
-                                .hint_text(tr("置換…")),
+                                .desired_width(layout.query_width)
+                                .hint_text(hint),
                         );
+                        let (one, all) = if minimal {
+                            ("⇄".to_string(), "⇄⇄".to_string())
+                        } else {
+                            (tr("置換"), tr("すべて置換"))
+                        };
                         if ui
-                            .button(tr("置換"))
+                            .button(one)
                             .on_hover_text(tr("いまのヒットを置換して次へ"))
                             .clicked()
                         {
                             do_replace = true;
                         }
-                        if ui.button(tr("すべて置換")).clicked() {
+                        if ui
+                            .button(all)
+                            .on_hover_text(tr("このファイルのヒットをすべて置換"))
+                            .clicked()
+                        {
                             do_replace_all = true;
                         }
                     });
@@ -15706,21 +16028,22 @@ impl ZaivernApp {
             });
         tutorial::anchor(ui.ctx(), AnchorId::EditorFind, bar.response.rect);
 
-        if do_find {
-            self.find_next();
+        if let Some(forward) = step {
+            self.find_step(forward);
         }
         if do_replace {
-            // 置換は本文を変えるので、次フレームのハッシュ更新を待たず即キャッシュ破棄
-            self.find_count_cache = None;
             self.replace_current();
         }
         if do_replace_all {
-            self.find_count_cache = None;
             self.replace_all_in_active();
         }
         if close {
             self.find.open = false;
             self.find.replace_open = false;
+            self.find.current = None;
+            self.find.wrapped = None;
+            // 閉じたらヒット一覧も捨てる (最大 5000 件を抱えたままにしない)
+            self.find_hits = None;
         }
     }
 
@@ -16469,34 +16792,38 @@ impl ZaivernApp {
         self.gitinfo.refresh_if_stale();
         let abs = self.editor.buffers[active].path.clone();
         let text_hash = hash_str(&self.editor.buffers[active].text);
-        // find バーのヒット数キャッシュもこのハッシュを使い回す(再計算しない)
+        // find バーもこのハッシュを使い回す (再計算しない)
         self.last_text_hash = text_hash;
-        // ミニマップに出す検索ヒット行。**本文か検索語が変わったときだけ**走査する
-        // (find バーと同じ text_hash を鍵に使うので、追加の全文走査は起きない)。
-        let mm_search: Vec<usize> = if mm_on && self.find.open && !self.find.query.is_empty() {
-            let q = self.find.query.clone();
-            let fresh = self
-                .minimap_hits
-                .as_ref()
-                .is_some_and(|(h, qq, _)| *h == text_hash && *qq == q);
-            if !fresh {
-                let needle = q.to_lowercase();
-                let lines: Vec<usize> = self.editor.buffers[active]
-                    .text
-                    .split('\n')
-                    .enumerate()
-                    .filter(|(_, l)| l.to_lowercase().contains(&needle))
-                    .map(|(i, _)| i)
-                    .take(crate::minimap::MAX_HITS)
-                    .collect();
-                self.minimap_hits = Some((text_hash, q, lines));
-            }
-            self.minimap_hits
-                .as_ref()
-                .map(|(_, _, v)| v.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        // バッファ内検索のヒットは**ここで 1 回だけ**走査する。
+        // 検索バーの「3 / 27」・ミニマップの印・本文のハイライトが同じ結果を見るので、
+        // 同じ本文を 3 回走査することはない (本文か検索条件が変わったときだけ走る)。
+        let find_on = self.find.open && !self.find.query.is_empty();
+        if find_on {
+            self.refresh_find_hits(active, text_hash);
+        }
+        // Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製されない
+        let find_hits: std::sync::Arc<Vec<find_buffer::BufHit>> = match (find_on, &self.find_hits) {
+            (true, Some(c)) => c.hits.clone(),
+            _ => std::sync::Arc::new(Vec::new()),
+        };
+        let mm_search: std::sync::Arc<Vec<usize>> = match (find_on && mm_on, &self.find_hits) {
+            (true, Some(c)) => c.mm_lines.clone(),
+            _ => std::sync::Arc::new(Vec::new()),
+        };
+        // ハイライトの色はテーマから作る (直書きしない)
+        let find_hit_bg = find_buffer::hit_bg(&self.theme);
+        let find_cur_bg = find_buffer::current_hit_bg(&self.theme);
+        let find_current = self.find.current;
+        // 本文 galley のキャッシュ鍵に混ぜる検索条件。本文そのものは鍵に入っている
+        // ので、ヒットの中身は (検索語, トグル, 現在位置) から一意に決まる。
+        let find_key: u64 = {
+            let opts = self.find.opts;
+            let flags = (opts.case_sensitive as u64)
+                | ((opts.whole_word as u64) << 1)
+                | ((opts.regex as u64) << 2)
+                | ((find_on as u64) << 3);
+            let cur = find_current.map_or(u64::MAX, |(s, e)| (s as u64).rotate_left(17) ^ e as u64);
+            combine_hash(combine_hash(hash_str(&self.find.query), flags), cur)
         };
         // Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製されない
         let marks = match &abs {
@@ -16944,6 +17271,7 @@ impl ZaivernApp {
                 font_gen,
                 (word_wrap as u64) | ((show_ws as u64) << 1),
                 max_w.to_bits() as u64,
+                find_key,
             ]
             .into_iter()
             .fold(hash_str(t), combine_hash);
@@ -16953,6 +17281,18 @@ impl ZaivernApp {
                 Some((k, g)) if *k == key => g.clone(),
                 _ => {
                     let mut j = hl.layout_job(t, lang, &syntect_theme, font.clone(), theme_text);
+                    // 検索ヒットの背景は**空白可視化の前**に差す。
+                    // whitespace_layout_job は ' ' → '·' でバイト長を変えるので、
+                    // 後から当てるとバイト範囲がズレる (書式は引き継がれる)。
+                    if !find_hits.is_empty() {
+                        j = find_buffer::apply_hits(
+                            j,
+                            &find_hits,
+                            find_current,
+                            find_hit_bg,
+                            find_cur_bg,
+                        );
+                    }
                     if show_ws {
                         // スペース→「·」/ タブ→「→」(char 数は変えない)
                         j = crate::editor::whitespace_layout_job(j, ws_color);
@@ -19887,7 +20227,8 @@ impl ZaivernApp {
         use serde_json::json;
         if i < self.editor.buffers.len() {
             self.editor.active = Some(i);
-            self.find.last = None;
+            self.find.current = None;
+            self.find_hits = None;
             json!({"ok": true}).to_string()
         } else {
             json!({"ok": false, "error": "タブがありません"}).to_string()
@@ -23923,6 +24264,8 @@ impl ZaivernApp {
     // ── 置換 (検索バーの置換行) ──
 
     /// いまのヒットを置換して次を検索する。ヒットが無ければまず検索する。
+    ///
+    /// 正規表現モードでは置換文字列の `$1` / `${name}` が展開される (VS Code 準拠)。
     fn replace_current(&mut self) {
         let Some(i) = self.editor.active else { return };
         if self.find.query.is_empty() {
@@ -23933,30 +24276,41 @@ impl ZaivernApp {
             return;
         }
         let text = self.editor.buffers[i].text.clone();
-        let qn = self.find.query.chars().count();
-        let hit = self.find.last.filter(|c| {
-            let sb = editor_ops::char_to_byte(&text, *c);
-            let eb = editor_ops::char_to_byte(&text, *c + qn);
-            eb <= text.len() && text[sb..eb].to_lowercase() == self.find.query.to_lowercase()
-        });
-        let Some(c) = hit else {
-            self.find_next();
+        self.refresh_find_hits(i, hash_str(&text));
+        // 現在位置が本文と食い違っていたら、まず探し直す (古い範囲を書き潰さない)
+        let Some(ix) = self.current_hit_index() else {
+            self.find_step(true);
             return;
         };
-        let sb = editor_ops::char_to_byte(&text, c);
-        let eb = editor_ops::char_to_byte(&text, c + qn);
-        let mut nt = String::with_capacity(text.len());
-        nt.push_str(&text[..sb]);
-        nt.push_str(&self.find.replace);
-        nt.push_str(&text[eb..]);
+        let Some((hit, matcher)) = self
+            .find_hits
+            .as_ref()
+            .map(|c| (c.hits[ix], c.matcher.clone()))
+        else {
+            return;
+        };
+        let (s, e) = hit.range();
+        // `$1` の展開はヒットのある**行**の中で解決する (走査も行単位のため)。
+        // 行末の CR は走査対象から外してあるので、ここでも同じ扱いにする。
+        let ls = text[..s].rfind('\n').map_or(0, |p| p + 1);
+        let le = text[e..].find('\n').map_or(text.len(), |p| e + p);
+        let line = text[ls..le].trim_end_matches('\r');
+        let rep = find_buffer::expand(&matcher, line, (s - ls, e - ls), &self.find.replace);
+        let mut nt = String::with_capacity(text.len() + rep.len());
+        nt.push_str(&text[..s]);
+        nt.push_str(&rep);
+        nt.push_str(&text[e..]);
         self.editor.buffers[i].text = nt;
-        // 置換文字列の直後から次のヒットを探す (置換結果に query を含んでも無限ループしない)
-        let rep_chars = self.find.replace.chars().count();
-        self.find.last = Some((c + rep_chars).saturating_sub(1));
+        // 置換した結果の直後から次を探す (置換文字列が検索語を含んでも無限ループしない)
+        self.find.anchor = s + rep.len();
+        self.find.current = None;
+        // 本文を変えたのでヒット一覧は捨てる (次フレームのハッシュ更新を待たない)
+        self.find_hits = None;
         self.queue_lsp_change(i);
-        self.find_next();
+        self.find_step(true);
     }
 
+    /// このファイルのヒットをすべて置換する。
     fn replace_all_in_active(&mut self) {
         let Some(i) = self.editor.active else { return };
         if self.find.query.is_empty() {
@@ -23967,13 +24321,33 @@ impl ZaivernApp {
             return;
         }
         let text = self.editor.buffers[i].text.clone();
-        let (nt, n) = editor_ops::replace_all_ci(&text, &self.find.query, &self.find.replace);
+        self.refresh_find_hits(i, hash_str(&text));
+        let Some(matcher) = self.find_hits.as_ref().map(|c| {
+            if let Some(err) = &c.error {
+                Err(err.clone())
+            } else {
+                Ok(c.matcher.clone())
+            }
+        }) else {
+            return;
+        };
+        let matcher = match matcher {
+            Ok(m) => m,
+            // 不正な正規表現は 1 バイトも書かずに理由を出す
+            Err(e) => {
+                self.toast(e, false);
+                return;
+            }
+        };
+        let (nt, n) = find_buffer::replace_all(&text, &matcher, &self.find.replace);
         if n == 0 {
             self.toast(tr("見つかりませんでした"), false);
             return;
         }
         self.editor.buffers[i].text = nt;
-        self.find.last = None;
+        self.find.current = None;
+        self.find.wrapped = None;
+        self.find_hits = None;
         self.queue_lsp_change(i);
         self.toast(trf("{n} 件置換しました", &[("n", n.to_string())]), true);
     }
