@@ -12039,6 +12039,10 @@ impl ZaivernApp {
         if let Some(prompt) = git_actions.review_prompt {
             self.take_review_prompt(prompt);
         }
+        // Git パネルの履歴一覧をクリック → そのコミットの差分を既存の差分ビューで開く。
+        if let Some((top, sha)) = git_actions.open_commit {
+            self.open_commit_diff_at(&top, &sha);
+        }
 
         self.md_images = md_images;
 
@@ -15300,7 +15304,13 @@ impl ZaivernApp {
         let Some((top, _)) = self.gitinfo.locate(&path) else {
             return;
         };
-        let Ok((title, text)) = git::commit_diff(&top, sha) else {
+        self.open_commit_diff_at(&top, sha);
+    }
+
+    /// リポジトリを明示して開く版。Git パネルの履歴一覧から使う
+    /// (アクティブなバッファに依らずリポジトリが決まっているため)。
+    fn open_commit_diff_at(&mut self, top: &Path, sha: &str) {
+        let Ok((title, text)) = git::commit_diff(top, sha) else {
             return;
         };
         let id = self
