@@ -51,8 +51,16 @@ pub struct DiffLine {
     pub kind: LineKind,
     pub old_no: Option<usize>,
     pub new_no: Option<usize>,
-    /// 先頭のマーカー (' ' / '+' / '-') を除いた本文。
+    /// 先頭のマーカー (' ' / '+' / '-') と行末の `\r` を除いた本文。
     pub text: String,
+    /// この行の直後に `\ No newline at end of file` が付いていたか。
+    /// **表示には使わないが、パッチを組み直すときに必須** — 落とすと
+    /// `git apply` が末尾に改行を足してしまう。
+    pub no_newline: bool,
+    /// 元の diff でこの行が `\r\n` で終わっていたか (CRLF のファイル)。
+    /// `str::lines()` は `\r` を捨てるので、ここに退避しないと
+    /// 組み直したパッチが本文と一致せず `git apply` が落ちる。
+    pub crlf: bool,
 }
 
 /// `@@ -a,b +c,d @@ ...` で区切られる 1 ハンク。
@@ -75,6 +83,10 @@ pub struct FileDiff {
     pub is_rename: bool,
     pub additions: usize,
     pub deletions: usize,
+    /// `new file mode 100644` / `deleted file mode 100755` の数値部分。
+    /// パッチを組み直すとき、これが無いと `git apply --cached` が
+    /// 「dev/null が index に無い」と言って新規作成を拒む。
+    pub file_mode: Option<String>,
 }
 
 const DEV_NULL: &str = "/dev/null";
@@ -89,7 +101,18 @@ impl FileDiff {
             is_rename: false,
             additions: 0,
             deletions: 0,
+            file_mode: None,
         }
+    }
+
+    /// 新規作成の差分か (旧側が `/dev/null`)。
+    pub fn is_new_file(&self) -> bool {
+        self.old_path == DEV_NULL || (self.old_path.is_empty() && !self.new_path.is_empty())
+    }
+
+    /// 削除の差分か (新側が `/dev/null`)。
+    pub fn is_deleted_file(&self) -> bool {
+        self.new_path == DEV_NULL || (self.new_path.is_empty() && !self.old_path.is_empty())
     }
 
     /// 表示用のパス。リネームなら `old → new`、それ以外は存在する方。
@@ -550,6 +573,38 @@ fn split_git_header(rest: &str) -> Option<(String, String)> {
 /// 対応: 複数ファイル / `diff --git` ヘッダ / `--- +++` / `@@` (カウント省略含む) /
 /// new file・deleted file mode / バイナリ / リネーム (ハンク無しも可) /
 /// `\ No newline at end of file` (本文行として数えない)。
+/// `str::lines()` と同じ切り方をしつつ、**その行が `\r\n` で終わっていたか**を
+/// 一緒に返す。CRLF のファイルは diff 本文にも `\r` が入っているので、
+/// これを落とすとパッチを組み直せない (`git apply` が本文不一致で落ちる)。
+fn lines_with_cr(input: &str) -> impl Iterator<Item = (&str, bool)> {
+    let mut rest: &str = input;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (line, next) = match rest.find('\n') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+        rest = next;
+        match line.strip_suffix('\r') {
+            Some(body) => Some((body, true)),
+            None => Some((line, false)),
+        }
+    })
+}
+
+/// 直前に積んだ行へ `\ No newline at end of file` の印を付ける。
+fn mark_no_newline(cur: &mut Option<FileDiff>) {
+    if let Some(l) = cur
+        .as_mut()
+        .and_then(|f| f.hunks.last_mut())
+        .and_then(|h| h.lines.last_mut())
+    {
+        l.no_newline = true;
+    }
+}
+
 pub fn parse_unified(input: &str) -> Vec<FileDiff> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut cur: Option<FileDiff> = None;
@@ -560,11 +615,13 @@ pub fn parse_unified(input: &str) -> Vec<FileDiff> {
     let mut new_no = 0usize;
     let mut in_hunk = false;
 
-    for line in input.lines() {
+    for (line, had_cr) in lines_with_cr(input) {
         // --- ハンク本体 (宣言された行数を消化しきるまでを最優先で処理) ---
         if in_hunk && (rem_old > 0 || rem_new > 0) {
             if line.starts_with('\\') {
-                // "\ No newline at end of file" — 本文行ではない。
+                // "\ No newline at end of file" — 本文行ではないが、
+                // 直前の行に印だけ残す (パッチの組み直しに要る)。
+                mark_no_newline(&mut cur);
                 continue;
             }
             let parsed = match line.as_bytes().first() {
@@ -618,6 +675,8 @@ pub fn parse_unified(input: &str) -> Vec<FileDiff> {
                     old_no: o,
                     new_no: n,
                     text: body.to_string(),
+                    no_newline: false,
+                    crlf: had_cr,
                 });
             if rem_old == 0 && rem_new == 0 {
                 in_hunk = false;
@@ -645,6 +704,7 @@ pub fn parse_unified(input: &str) -> Vec<FileDiff> {
 
         // 宣言行数を消化しきった直後の "\ No newline" はここに落ちてくる。
         if line.starts_with('\\') {
+            mark_no_newline(&mut cur);
             continue;
         }
 
@@ -717,10 +777,309 @@ fn process_file_level(line: &str, cur: &mut Option<FileDiff>, files: &mut Vec<Fi
         let f = cur.get_or_insert_with(FileDiff::new);
         f.is_rename = true;
         f.new_path = strip_side_prefix(rest);
+        return;
     }
 
-    // new file mode / deleted file mode / index / similarity index / mode 変更などは
-    // 追加情報を持たないので読み飛ばす。
+    // 新規 / 削除のファイルモード。**パッチを組み直すのに要る**ので拾う
+    // (`git apply --cached` は mode 行が無いと新規作成を拒む)。
+    for head in ["new file mode ", "deleted file mode ", "new mode "] {
+        if let Some(rest) = line.strip_prefix(head) {
+            let m: String = rest.trim().chars().filter(char::is_ascii_digit).collect();
+            if !m.is_empty() {
+                cur.get_or_insert_with(FileDiff::new).file_mode = Some(m);
+            }
+            return;
+        }
+    }
+
+    // index / similarity index / old mode などは追加情報を持たないので読み飛ばす。
+}
+
+// ===========================================================================
+// ハンク単位のパッチ組み立て — **GUI に一切依存しない純関数**
+//
+// `git apply --cached` (アンステージは `--reverse`) に食わせる 1 ハンクだけの
+// パッチを、**すでにパースした差分データから**組み直す。新しい diff
+// アルゴリズムは書かない (行の中身も行番号も git の出力そのまま)。
+// ===========================================================================
+
+/// パッチに書き出す既定のファイルモード (mode 行が読めなかったとき)。
+const DEFAULT_FILE_MODE: &str = "100644";
+
+/// パッチのパス欄。`/dev/null` はそのまま、他は `a/` `b/` を冠する。
+fn patch_side(path: &str, prefix: char) -> String {
+    if path.is_empty() || path == DEV_NULL {
+        DEV_NULL.to_string()
+    } else {
+        format!("{prefix}/{path}")
+    }
+}
+
+/// git に渡す実パス (リネームなら新側、削除なら旧側)。
+fn real_path(file: &FileDiff) -> &str {
+    if !file.new_path.is_empty() && file.new_path != DEV_NULL {
+        &file.new_path
+    } else {
+        &file.old_path
+    }
+}
+
+/// 1 行を unified diff の 1 行 (+ 必要なら `\ No newline` 行) へ戻す。
+fn push_patch_line(out: &mut String, marker: char, line: &DiffLine) {
+    out.push(marker);
+    out.push_str(&line.text);
+    if line.crlf {
+        out.push('\r');
+    }
+    out.push('\n');
+    if line.no_newline {
+        out.push_str("\\ No newline at end of file\n");
+    }
+}
+
+/// `file` の `hunk_index` 番目のハンクだけを含むパッチ本文を作る。
+///
+/// - 行数 (`@@ -a,b +c,d @@` の b / d) は**行から数え直す**。
+///   `\ No newline at end of file` は本文行ではないので数えない。
+/// - CRLF のファイルは `\r` を復元する。
+/// - 新規 / 削除は `new file mode` / `deleted file mode` を、
+///   リネームは `rename from` / `rename to` を必ず添える
+///   (これが無いと `git apply --cached` が拒む)。
+///
+/// バイナリ差分と、そもそもハンクが無い差分は `None`。
+pub fn build_hunk_patch(file: &FileDiff, hunk_index: usize) -> Option<String> {
+    if file.is_binary {
+        return None;
+    }
+    let hunk = file.hunks.get(hunk_index)?;
+    if hunk.lines.is_empty() {
+        return None;
+    }
+
+    let mut old_count = 0usize;
+    let mut new_count = 0usize;
+    for l in &hunk.lines {
+        match l.kind {
+            LineKind::Context => {
+                old_count += 1;
+                new_count += 1;
+            }
+            LineKind::Removed => old_count += 1,
+            LineKind::Added => new_count += 1,
+        }
+    }
+    // 片側が空なら開始行は 0 (git は新規作成を `-0,0`、全削除を `+0,0` と書く)。
+    let old_start = if old_count == 0 { 0 } else { hunk.old_start };
+    let new_start = if new_count == 0 { 0 } else { hunk.new_start };
+
+    let old_side = patch_side(&file.old_path, 'a');
+    let new_side = patch_side(&file.new_path, 'b');
+    // `diff --git` の見出しは常に実パスで書く (/dev/null は書かない)。
+    let head_old = if file.old_path.is_empty() || file.old_path == DEV_NULL {
+        real_path(file)
+    } else {
+        &file.old_path
+    };
+    let head_new = if file.new_path.is_empty() || file.new_path == DEV_NULL {
+        real_path(file)
+    } else {
+        &file.new_path
+    };
+    let mode = file.file_mode.as_deref().unwrap_or(DEFAULT_FILE_MODE);
+
+    let mut out = String::with_capacity(hunk.lines.len() * 24 + 128);
+    out.push_str(&format!("diff --git a/{head_old} b/{head_new}\n"));
+    if file.is_new_file() {
+        out.push_str(&format!("new file mode {mode}\n"));
+    } else if file.is_deleted_file() {
+        out.push_str(&format!("deleted file mode {mode}\n"));
+    } else if file.is_rename && file.old_path != file.new_path {
+        out.push_str(&format!("rename from {}\n", file.old_path));
+        out.push_str(&format!("rename to {}\n", file.new_path));
+    }
+    out.push_str(&format!("--- {old_side}\n"));
+    out.push_str(&format!("+++ {new_side}\n"));
+    out.push_str(&format!(
+        "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+    ));
+    for l in &hunk.lines {
+        let marker = match l.kind {
+            LineKind::Context => ' ',
+            LineKind::Added => '+',
+            LineKind::Removed => '-',
+        };
+        push_patch_line(&mut out, marker, l);
+    }
+    Some(out)
+}
+
+// ===========================================================================
+// ボタン列のレイアウト判断 — **GUI に一切依存しない純関数**
+//
+// 「どの幅でも見切れない」は目視ではなくテーブルテストで固定する。
+// 可用幅 → (折り返しの行割り / アイコンのみへの縮退) をここだけで決め、
+// 描画側はその結果をそのまま並べる。
+// ===========================================================================
+
+/// ボタン 1 個の内側余白 + 枠 (egui の `Button::small` の実測に合わせた見積もり)。
+pub const BTN_PAD_W: f32 = 16.0;
+/// ボタン同士の間隔。
+pub const BTN_GAP: f32 = 4.0;
+/// 2 行を超えたら「読める並び」ではないので、アイコンのみへ落とす。
+const BTN_MAX_ROWS: usize = 2;
+
+/// ボタン列の割り付け結果。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ButtonBar {
+    /// アイコンのみの表記へ縮退したか。
+    pub icon_only: bool,
+    /// 行ごとのボタン添字 (`rows[i]` が 1 行ぶん)。
+    pub rows: Vec<Vec<usize>>,
+    /// 採用した表記での各ボタンの見積もり幅 (添字は入力と同じ)。
+    pub widths: Vec<f32>,
+}
+
+impl ButtonBar {
+    /// `row` 行目の合計幅 (間隔込み)。
+    pub fn row_width(&self, row: usize) -> f32 {
+        let Some(r) = self.rows.get(row) else {
+            return 0.0;
+        };
+        let sum: f32 = r.iter().map(|i| self.widths[*i]).sum();
+        sum + BTN_GAP * (r.len().saturating_sub(1)) as f32
+    }
+    /// いちばん広い行の幅。
+    pub fn max_row_width(&self) -> f32 {
+        (0..self.rows.len())
+            .map(|r| self.row_width(r))
+            .fold(0.0, f32::max)
+    }
+}
+
+/// 文字数から見積もるボタン幅。
+fn btn_width(label: &str, char_w: f32) -> f32 {
+    label.chars().count() as f32 * char_w + BTN_PAD_W
+}
+
+/// 貪欲に行へ詰める。1 個だけで可用幅を超えるボタンは単独行に置く
+/// (そこで折り返さないと**次のボタンごと画面外へ出る**)。
+fn pack_rows(widths: &[f32], avail_w: f32) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut used = 0.0f32;
+    for (i, w) in widths.iter().enumerate() {
+        let need = if cur.is_empty() { *w } else { *w + BTN_GAP };
+        if !cur.is_empty() && used + need > avail_w {
+            rows.push(std::mem::take(&mut cur));
+            used = 0.0;
+            cur.push(i);
+            used += *w;
+        } else {
+            cur.push(i);
+            used += need;
+        }
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    rows
+}
+
+/// **可用幅 → 折り返し / アイコンのみ**を決める。
+///
+/// `full` と `icons` は同じ長さ。`char_w` は 1 文字の見積もり幅。
+/// 全文表記が 2 行に収まらない、または 1 個でも可用幅を超えるなら
+/// アイコンのみへ縮退する。
+pub fn plan_button_bar(avail_w: f32, full: &[String], icons: &[String], char_w: f32) -> ButtonBar {
+    if full.is_empty() {
+        return ButtonBar {
+            icon_only: false,
+            rows: Vec::new(),
+            widths: Vec::new(),
+        };
+    }
+    let avail = avail_w.max(0.0);
+    let full_w: Vec<f32> = full.iter().map(|s| btn_width(s, char_w)).collect();
+    let rows = pack_rows(&full_w, avail);
+    let too_wide = full_w.iter().any(|w| *w > avail);
+    if !too_wide && rows.len() <= BTN_MAX_ROWS {
+        return ButtonBar {
+            icon_only: false,
+            rows,
+            widths: full_w,
+        };
+    }
+    let icon_w: Vec<f32> = icons
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            // アイコンが用意されていなければ全文のまま (縮退しようがない)。
+            if s.is_empty() {
+                full_w[i]
+            } else {
+                btn_width(s, char_w)
+            }
+        })
+        .collect();
+    let rows = pack_rows(&icon_w, avail);
+    ButtonBar {
+        icon_only: true,
+        rows,
+        widths: icon_w,
+    }
+}
+
+/// ハンク見出しの帯に残す最小幅 (`@@ -1,2 +1,2 @@` が読める程度)。
+const HUNK_HEADER_MIN_W: f32 = 90.0;
+
+/// ハンクのボタン列の割り付け。
+#[derive(Clone, Debug, PartialEq)]
+pub struct HunkBar {
+    /// 出すボタン (入力の順番のまま)。
+    pub ops: Vec<HunkOp>,
+    /// アイコンのみへ縮退したか。
+    pub icon_only: bool,
+    /// ボタン列の合計幅。**必ず可用幅以下**。
+    pub bar_w: f32,
+    /// 見出しに残る幅。
+    pub header_w: f32,
+}
+
+/// 帯 1 本ぶんの割り付けを決める。折り返しはしない (帯は 1 行) ので、
+/// 2 行必要になった時点でアイコンのみへ落とす。
+pub fn hunk_bar_plan(avail_w: f32, ops: &[HunkOp], confirm: bool, char_w: f32) -> HunkBar {
+    if ops.is_empty() {
+        return HunkBar {
+            ops: Vec::new(),
+            icon_only: false,
+            bar_w: 0.0,
+            header_w: avail_w.max(0.0),
+        };
+    }
+    let avail = avail_w.max(0.0);
+    let full: Vec<String> = ops
+        .iter()
+        .map(|o| hunk_button_text(*o, false, confirm))
+        .collect();
+    let icons: Vec<String> = ops
+        .iter()
+        .map(|o| hunk_button_text(*o, true, confirm))
+        .collect();
+    // 見出しに最低限を残した幅で判断する (ボタンが見出しを押し出さない)。
+    let for_bar = (avail - HUNK_HEADER_MIN_W).max(0.0);
+    let mut plan = plan_button_bar(for_bar, &full, &icons, char_w);
+    // 帯は 1 行しかないので、折り返しが要る時点でアイコンのみへ落とす。
+    if plan.rows.len() > 1 && !plan.icon_only {
+        plan = plan_button_bar(for_bar, &icons, &icons, char_w);
+        plan.icon_only = true;
+    }
+    let bar_w = plan.max_row_width().min(avail);
+    HunkBar {
+        ops: ops.to_vec(),
+        icon_only: plan.icon_only,
+        bar_w,
+        header_w: (avail - bar_w).max(0.0),
+    }
 }
 
 // ===========================================================================
@@ -1490,6 +1849,46 @@ struct HlCell {
     spans: std::sync::Arc<Vec<Vec<(usize, usize, Color32)>>>,
 }
 
+/// ハンク単位の操作。UI はボタンを出すだけで、git を叩くのは呼び出し側。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HunkOp {
+    /// このハンクだけ index へ載せる (`git apply --cached`)
+    Stage,
+    /// このハンクだけ index から下ろす (`git apply --cached --reverse`)
+    Unstage,
+    /// このハンクだけ作業ツリーから巻き戻す (`git apply --reverse`)。**取り消せない**
+    Discard,
+}
+
+impl HunkOp {
+    /// ボタンの文言 (広いとき)。
+    pub fn label(self) -> String {
+        match self {
+            HunkOp::Stage => tr("＋ ハンクをステージ"),
+            HunkOp::Unstage => tr("－ ハンクをアンステージ"),
+            HunkOp::Discard => tr("✖ ハンクを破棄"),
+        }
+    }
+    /// 幅が足りないときのアイコンのみ表記。
+    pub fn icon(self) -> &'static str {
+        match self {
+            HunkOp::Stage => "＋",
+            HunkOp::Unstage => "－",
+            HunkOp::Discard => "✖",
+        }
+    }
+}
+
+/// ハンク操作ボタンの描画指示。`None` を渡せばボタンは一切出ない
+/// (既存の呼び出し元は今まで通り)。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HunkActions<'a> {
+    /// 出すボタン (順番どおりに並ぶ)。
+    pub ops: &'a [HunkOp],
+    /// この添字のハンクだけ、破棄ボタンを「本当に破棄」の 2 段目で描く。
+    pub confirm_discard: Option<usize>,
+}
+
 /// diff ビューが呼び出し側へ返すアクション。
 ///
 /// 既定は `None` なので、返り値を無視する既存の呼び出し元は今まで通り動く。
@@ -1500,6 +1899,12 @@ pub enum DiffAction {
     None,
     /// 「エージェントに送る」が押された。中身は組み立て済みプロンプト。
     SendToAgent(String),
+    /// ハンクのボタンが押された (`file` / `hunk` は渡した `files` 内の添字)。
+    Hunk {
+        file: usize,
+        hunk: usize,
+        op: HunkOp,
+    },
 }
 
 /// `diff_ui` が生成したプロンプトの一時置き場 (型で衝突を防ぐための newtype)。
@@ -1554,6 +1959,19 @@ pub fn diff_ui_with_actions(
     files: &[FileDiff],
     comments: &mut DiffCommentStore,
 ) -> DiffAction {
+    diff_ui_with_hunk_actions(ui, theme, files, comments, None)
+}
+
+/// ハンク単位の操作ボタン付きで描く版 (Git のレビュー画面から使う)。
+///
+/// `hunk_actions` が `None` なら [`diff_ui_with_actions`] と完全に同じ。
+pub fn diff_ui_with_hunk_actions(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    files: &[FileDiff],
+    comments: &mut DiffCommentStore,
+    hunk_actions: Option<HunkActions>,
+) -> DiffAction {
     let pal = DiffPalette::from_theme(theme);
     let size = 12.5;
 
@@ -1607,6 +2025,8 @@ pub fn diff_ui_with_actions(
 
     let font = FontId::monospace(size);
     let row_h = crate::theme::snap_len(ui.fonts(|f| f.row_height(&font)) + 2.0, ppp);
+    // ハンクのボタンが押されたら控える (描画は最後まで通す)。
+    let mut hunk_hit: Option<(usize, usize, HunkOp)> = None;
 
     for (fi, file) in files.iter().enumerate() {
         let header = file_header_job(file, theme, size);
@@ -1641,7 +2061,10 @@ pub fn diff_ui_with_actions(
                 // ファイル内の通し行番号 (syntax の添字)。
                 let mut ord = 0usize;
                 for (hi, hunk) in file.hunks.iter().enumerate() {
-                    hunk_header_ui(ui, theme, &pal, hunk, size);
+                    if let Some(op) = hunk_header_ui(ui, theme, &pal, hunk, size, hunk_actions, hi)
+                    {
+                        hunk_hit = Some((fi, hi, op));
+                    }
                     let base = ord;
                     ord += hunk.lines.len();
                     let kinds: Vec<LineKind> = hunk.lines.iter().map(|l| l.kind).collect();
@@ -1705,6 +2128,10 @@ pub fn diff_ui_with_actions(
             unfolded.insert(k);
         }
         ui.data_mut(|d| d.insert_temp(unfold_id, UnfoldedCell(unfolded)));
+    }
+    // ハンク操作は「エージェントに送る」より手前 (押した本人の意図が明確) 。
+    if let Some((file, hunk, op)) = hunk_hit {
+        return DiffAction::Hunk { file, hunk, op };
     }
     action
 }
@@ -1854,26 +2281,94 @@ fn file_header_job(file: &FileDiff, theme: &Theme, size: f32) -> egui::text::Lay
 const HUNK_PAD_X: f32 = 4.0;
 
 /// ハンク見出し (`@@ ... @@`) — アクセント色の帯で本文と区別する。
-fn hunk_header_ui(ui: &mut egui::Ui, theme: &Theme, pal: &DiffPalette, hunk: &Hunk, size: f32) {
+/// ハンクの見出し帯。ボタンが押されたらその操作を返す。
+///
+/// ボタンは**帯の右端**に置き、`@@` の見出しは残りの幅で切り詰める
+/// (どの幅でもボタンが見切れない = 到達経路が幅で消えない)。
+/// 幅が足りなければ [`hunk_bar_plan`] の判断でアイコンのみへ縮退する。
+fn hunk_header_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    pal: &DiffPalette,
+    hunk: &Hunk,
+    size: f32,
+    actions: Option<HunkActions>,
+    hunk_index: usize,
+) -> Option<HunkOp> {
     // 余白は帯の**内側**なので、可用幅から先に引く。引き忘れると帯が
     // 左右の余白ぶんだけ広がり、可用領域からはみ出す。
     let w = (ui.available_width() - HUNK_PAD_X * 2.0).max(0.0);
+    let ops: &[HunkOp] = actions.map(|a| a.ops).unwrap_or(&[]);
+    let confirm = actions
+        .and_then(|a| a.confirm_discard)
+        .is_some_and(|i| i == hunk_index);
+    let char_w = ui.fonts(|f| f.glyph_width(&FontId::proportional(size), '0'));
+    let plan = hunk_bar_plan(w, ops, confirm, char_w);
+    let mut hit: Option<HunkOp> = None;
     egui::Frame::none()
         .fill(pal.hunk_bg)
         .inner_margin(egui::Margin::symmetric(HUNK_PAD_X, 2.0))
         .show(ui, |ui| {
             ui.set_min_width(w);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(&hunk.header)
-                        .monospace()
-                        .size(size)
-                        .color(theme.accent),
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&hunk.header)
+                            .monospace()
+                            .size(size)
+                            .color(theme.accent),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Truncate),
                 )
-                .wrap_mode(egui::TextWrapMode::Truncate),
-            )
-            .on_hover_text(&hunk.header);
+                .on_hover_text(&hunk.header);
+                if plan.ops.is_empty() {
+                    return;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // right_to_left なので末尾から積む (見た目の並びは ops のまま)。
+                    for op in plan.ops.iter().rev() {
+                        let danger = *op == HunkOp::Discard;
+                        let text = hunk_button_text(*op, plan.icon_only, confirm);
+                        let rich = if danger {
+                            RichText::new(text).size(size - 1.0).color(theme.err)
+                        } else {
+                            RichText::new(text).size(size - 1.0)
+                        };
+                        let hint = if danger && confirm {
+                            tr("この操作は取り消せません")
+                        } else if danger {
+                            tr("もう一度押すと確定します (取り消せません)")
+                        } else {
+                            op.label()
+                        };
+                        if ui
+                            .add(egui::Button::new(rich).small())
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            hit = Some(*op);
+                        }
+                    }
+                });
+            });
         });
+    hit
+}
+
+/// ハンクのボタン 1 個の文言。
+fn hunk_button_text(op: HunkOp, icon_only: bool, confirm: bool) -> String {
+    if op == HunkOp::Discard && confirm {
+        return if icon_only {
+            "⚠".to_string()
+        } else {
+            tr("⚠ 本当に破棄")
+        };
+    }
+    if icon_only {
+        op.icon().to_string()
+    } else {
+        op.label()
+    }
 }
 
 /// ファイル差分の全行を 1 パスで色分けし、ハンクを跨いだ通し番号で引ける表を返す。
@@ -3689,6 +4184,8 @@ diff --git a/src/foo.rs b/src/foo.rs
                 old_no,
                 new_no,
                 text: (*t).to_string(),
+                no_newline: false,
+                crlf: false,
             });
         }
         Hunk {
@@ -4520,5 +5017,330 @@ diff --git a/src/foo.rs b/src/foo.rs
         for s in ["inline", "Inline", " UNIFIED ", "1"] {
             assert_eq!(DiffMode::from_config_str(s), DiffMode::Inline, "{s:?}");
         }
+    }
+
+    // ---- ハンク単位のパッチ組み立て --------------------------------------
+
+    /// `@@` ヘッダだけを取り出す。
+    fn header_of(patch: &str) -> &str {
+        patch
+            .lines()
+            .find(|l| l.starts_with("@@"))
+            .expect("@@ ヘッダが無い")
+    }
+
+    fn one(text: &str) -> FileDiff {
+        let mut v = parse_unified(text);
+        assert_eq!(v.len(), 1, "1 ファイルのはず: {text:?}");
+        v.remove(0)
+    }
+
+    #[test]
+    fn patch_header_counts_are_recounted_from_the_lines() {
+        // (元の diff, 期待するヘッダ, 何を見ているか)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,4 @@\n a\n-b\n+B\n c\n+d\n",
+                "@@ -1,3 +1,4 @@",
+                "文脈 2 + 削除 1 = 3 / 文脈 2 + 追加 2 = 4",
+            ),
+            (
+                // カウント省略形 (`@@ -1 +1 @@` は 1 行の意味)
+                "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -7 +7 @@\n-x\n+y\n",
+                "@@ -7,1 +7,1 @@",
+                "省略されたカウントも数え直して必ず書く",
+            ),
+            (
+                "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -10,2 +10,0 @@\n-x\n-y\n",
+                "@@ -10,2 +0,0 @@",
+                "新側が空なら開始行は 0",
+            ),
+        ];
+        for (src, want, why) in cases {
+            let f = one(src);
+            let p = build_hunk_patch(&f, 0).expect("パッチ");
+            assert_eq!(header_of(&p), *want, "{why}");
+        }
+    }
+
+    #[test]
+    fn patch_keeps_no_newline_at_end_of_file_marker() {
+        let src = "diff --git a/nn.txt b/nn.txt\n--- a/nn.txt\n+++ b/nn.txt\n\
+@@ -1,2 +1,2 @@\n p\n-q\n\\ No newline at end of file\n+Q\n\\ No newline at end of file\n";
+        let f = one(src);
+        // パースは本文行として数えない (既存の約束)
+        assert_eq!(f.hunks[0].lines.len(), 3);
+        let p = build_hunk_patch(&f, 0).expect("パッチ");
+        assert_eq!(header_of(&p), "@@ -1,2 +1,2 @@", "\\ 行は数に入れない");
+        assert_eq!(
+            p.matches("\\ No newline at end of file").count(),
+            2,
+            "落とすと git apply が末尾へ改行を足してしまう:\n{p}"
+        );
+        assert!(
+            p.ends_with("+Q\n\\ No newline at end of file\n"),
+            "印は対象行の直後に置く:\n{p}"
+        );
+    }
+
+    #[test]
+    fn patch_restores_crlf_line_endings() {
+        // CRLF のファイルは diff 本文にも \r が入る (str::lines は捨てるので要復元)
+        let src = "diff --git a/c.txt b/c.txt\r\n--- a/c.txt\r\n+++ b/c.txt\r\n\
+@@ -1,2 +1,2 @@\r\n l1\r\n-l2\r\n+L2\r\n";
+        let f = one(src);
+        assert!(f.hunks[0].lines.iter().all(|l| l.crlf), "CRLF を覚えている");
+        assert_eq!(f.hunks[0].lines[0].text, "l1", "本文からは \\r を外す");
+        let p = build_hunk_patch(&f, 0).expect("パッチ");
+        assert!(p.contains("-l2\r\n"), "\\r を復元する:\n{p:?}");
+        assert!(p.contains("+L2\r\n"), "\\r を復元する:\n{p:?}");
+        assert!(p.contains(" l1\r\n"), "文脈行も同じ:\n{p:?}");
+    }
+
+    #[test]
+    fn patch_for_new_file_carries_mode_and_dev_null() {
+        let src = "diff --git a/n.txt b/n.txt\nnew file mode 100755\n--- /dev/null\n\
++++ b/n.txt\n@@ -0,0 +1,2 @@\n+new1\n+new2\n";
+        let f = one(src);
+        assert!(f.is_new_file());
+        assert_eq!(f.file_mode.as_deref(), Some("100755"));
+        let p = build_hunk_patch(&f, 0).expect("パッチ");
+        assert!(p.starts_with("diff --git a/n.txt b/n.txt\n"), "{p}");
+        assert!(
+            p.contains("new file mode 100755\n"),
+            "mode が無いと git apply --cached が新規作成を拒む:\n{p}"
+        );
+        assert!(p.contains("--- /dev/null\n"), "{p}");
+        assert_eq!(header_of(&p), "@@ -0,0 +1,2 @@");
+    }
+
+    #[test]
+    fn patch_for_deleted_file_carries_mode_and_dev_null() {
+        let src = "diff --git a/d.txt b/d.txt\ndeleted file mode 100644\n--- a/d.txt\n\
++++ /dev/null\n@@ -1,2 +0,0 @@\n-x\n-y\n";
+        let f = one(src);
+        assert!(f.is_deleted_file());
+        let p = build_hunk_patch(&f, 0).expect("パッチ");
+        assert!(p.contains("deleted file mode 100644\n"), "{p}");
+        assert!(p.contains("+++ /dev/null\n"), "{p}");
+        assert_eq!(header_of(&p), "@@ -1,2 +0,0 @@");
+    }
+
+    #[test]
+    fn patch_for_rename_carries_rename_from_to() {
+        let src = "diff --git a/old.txt b/new.txt\nsimilarity index 80%\nrename from old.txt\n\
+rename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,3 +1,3 @@\n r1\n-r2\n+R2\n r3\n";
+        let f = one(src);
+        assert!(f.is_rename);
+        let p = build_hunk_patch(&f, 0).expect("パッチ");
+        assert!(p.contains("rename from old.txt\n"), "{p}");
+        assert!(p.contains("rename to new.txt\n"), "{p}");
+        assert!(
+            p.contains("--- a/old.txt\n") && p.contains("+++ b/new.txt\n"),
+            "{p}"
+        );
+        assert_eq!(header_of(&p), "@@ -1,3 +1,3 @@");
+    }
+
+    #[test]
+    fn patch_picks_only_the_requested_hunk() {
+        let src = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,3 @@\n a\n+A\n b\n\
+@@ -30,2 +31,2 @@\n-x\n+X\n";
+        let f = one(src);
+        assert_eq!(f.hunks.len(), 2);
+        let p = build_hunk_patch(&f, 1).expect("パッチ");
+        assert_eq!(header_of(&p), "@@ -30,1 +31,1 @@");
+        assert!(!p.contains("+A"), "他のハンクを混ぜない:\n{p}");
+        assert_eq!(p.matches("@@").count(), 2, "ヘッダは 1 行だけ:\n{p}");
+    }
+
+    #[test]
+    fn patch_refuses_binary_and_out_of_range() {
+        let bin = one("diff --git a/b.png b/b.png\nBinary files a/b.png and b/b.png differ\n");
+        assert_eq!(build_hunk_patch(&bin, 0), None, "バイナリは組めない");
+        let f = one("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n");
+        assert_eq!(build_hunk_patch(&f, 9), None, "範囲外は None");
+    }
+
+    // ---- ボタン列のレイアウト (可用幅 → 折り返し / 縮退) -----------------
+
+    /// 行が可用幅に収まっているかを確かめる。
+    fn assert_bar_fits(bar: &ButtonBar, avail: f32, why: &str) {
+        for r in 0..bar.rows.len() {
+            let w = bar.row_width(r);
+            assert!(
+                w <= avail + 0.5,
+                "{why}: {r} 行目が可用幅を超えた ({w} > {avail})",
+            );
+        }
+        let n: usize = bar.rows.iter().map(Vec::len).sum();
+        assert_eq!(n, bar.widths.len(), "{why}: 消えたボタンがある");
+    }
+
+    #[test]
+    fn button_bar_plan_table() {
+        let full: Vec<String> = ["コミット", "直前を修正 (amend)", "push", "pull", "fetch"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let icons: Vec<String> = ["✔", "✎", "⬆", "⬇", "⟳"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let char_w = 7.0;
+        // (可用幅, アイコンのみへ落ちるか, 行数, 何を見ているか)
+        let cases: &[(f32, bool, usize, &str)] = &[
+            (900.0, false, 1, "広ければ全文のまま 1 行"),
+            (400.0, false, 1, "全部で 306px なので 400px にも 1 行で入る"),
+            (250.0, false, 2, "入らない分は折り返す (まだ読める)"),
+            (150.0, true, 1, "3 行必要になったらアイコンのみへ縮退する"),
+        ];
+        for (avail, want_icon, want_rows, why) in cases {
+            let bar = plan_button_bar(*avail, &full, &icons, char_w);
+            assert_eq!(bar.icon_only, *want_icon, "{why} (幅 {avail})");
+            assert_eq!(bar.rows.len(), *want_rows, "{why} (幅 {avail})");
+            assert_bar_fits(&bar, *avail, why);
+        }
+    }
+
+    #[test]
+    fn button_bar_plan_handles_extremes() {
+        let full: Vec<String> = vec!["とても長いボタンの名前です".into()];
+        let icons: Vec<String> = vec!["✔".into()];
+        // 1 個でも入らない幅 → アイコンのみ。それでも溢れるなら単独行に置く。
+        for avail in [100.0f32, 60.0, 20.0, 0.0] {
+            let bar = plan_button_bar(avail, &full, &icons, 7.0);
+            assert!(bar.icon_only, "幅 {avail}: 縮退する");
+            assert_eq!(bar.rows.len(), 1, "幅 {avail}: 1 個なら 1 行");
+        }
+        let empty = plan_button_bar(300.0, &[], &[], 7.0);
+        assert!(
+            empty.rows.is_empty() && !empty.icon_only,
+            "0 個なら空の計画"
+        );
+    }
+
+    #[test]
+    fn hunk_bar_plan_never_pushes_the_header_out() {
+        let ops = [HunkOp::Stage, HunkOp::Discard];
+        // (可用幅, アイコンのみか, 何を見ているか)
+        let cases: &[(f32, bool, &str)] = &[
+            (900.0, false, "広ければ全文"),
+            (
+                400.0,
+                false,
+                "見出しの取り分 (90px) を引いても全文が 1 行に入る",
+            ),
+            (
+                250.0,
+                true,
+                "見出しを残すと全文は 1 行に入らない → アイコンへ",
+            ),
+        ];
+        for (avail, want_icon, why) in cases {
+            let bar = hunk_bar_plan(*avail, &ops, false, 7.0);
+            assert_eq!(bar.icon_only, *want_icon, "{why} (幅 {avail})");
+            assert!(
+                bar.bar_w <= *avail + 0.5,
+                "{why}: ボタン列が可用幅を超えた ({} > {avail})",
+                bar.bar_w
+            );
+            assert!(
+                bar.bar_w + bar.header_w <= *avail + 0.5,
+                "{why}: 見出しとボタンの合計が可用幅を超えた"
+            );
+            assert_eq!(bar.ops.len(), 2, "{why}: ボタンは消さない");
+        }
+        let none = hunk_bar_plan(900.0, &[], false, 7.0);
+        assert!(none.ops.is_empty(), "操作が無ければ帯は見出しだけ");
+        assert_eq!(none.header_w, 900.0, "帯を丸ごと見出しへ渡す");
+    }
+
+    /// 実際の描画でボタンが出て、**可用幅の外へ出ない**こと。
+    /// 純関数の表だけでは「呼んでいない」を検出できないので目で見る代わりに描く。
+    #[test]
+    fn hunk_action_buttons_are_painted_inside_the_viewport() {
+        let theme = crate::theme::all()[0].clone();
+        let files = sbs_diff();
+        let ops = [HunkOp::Stage, HunkOp::Discard];
+        for (w, needle, why) in [
+            (900.0f32, HunkOp::Stage.label(), "広ければ全文が出る"),
+            (200.0, HunkOp::Stage.icon().to_string(), "狭ければアイコン"),
+        ] {
+            let ctx = egui::Context::default();
+            set_diff_mode(&ctx, DiffMode::Inline);
+            let mut store = DiffCommentStore::default();
+            let mut shapes = Vec::new();
+            // 1 フレーム目はレイアウト確定用 (折りたたみヘッダの高さが決まる)
+            for _ in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, 700.0),
+                    )),
+                    ..Default::default()
+                };
+                shapes = ctx
+                    .run(raw, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            diff_ui_with_hunk_actions(
+                                ui,
+                                &theme,
+                                &files,
+                                &mut store,
+                                Some(HunkActions {
+                                    ops: &ops,
+                                    confirm_discard: None,
+                                }),
+                            );
+                        });
+                    })
+                    .shapes;
+            }
+            let r = galley_rect(&shapes, &needle).unwrap_or_else(|| {
+                let mut seen: Vec<String> = Vec::new();
+                fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+                    match s {
+                        egui::Shape::Text(t) => out.push(t.galley.job.text.clone()),
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                        _ => {}
+                    }
+                }
+                for c in &shapes {
+                    walk(&c.shape, &mut seen);
+                }
+                panic!("{why} (幅 {w}): {needle:?} が描かれていない / 実際: {seen:?}")
+            });
+            assert!(
+                r.max.x <= w + 0.5,
+                "{why} (幅 {w}): ボタンが右へはみ出した {r:?}"
+            );
+            assert!(r.min.x >= -0.5, "{why} (幅 {w}): 左へはみ出した {r:?}");
+        }
+    }
+
+    /// ボタンを渡さなければ 1 個も描かない (既存の呼び出し元は今まで通り)。
+    #[test]
+    fn hunk_actions_are_absent_when_not_requested() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        set_diff_mode(&ctx, DiffMode::Inline);
+        let files = sbs_diff();
+        let mut store = DiffCommentStore::default();
+        let _ = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), Vec::new());
+        let shapes = render(&ctx, &theme, &files, &mut store, (900.0, 700.0), Vec::new());
+        assert!(
+            galley_rect(&shapes, &HunkOp::Stage.label()).is_none(),
+            "ハンク操作を頼んでいないのにボタンが出ている"
+        );
+    }
+
+    #[test]
+    fn hunk_bar_plan_confirm_state_changes_the_label() {
+        let plain = hunk_button_text(HunkOp::Discard, false, false);
+        let confirm = hunk_button_text(HunkOp::Discard, false, true);
+        assert_ne!(plain, confirm, "2 段目は文言が変わる");
+        assert!(confirm.contains('⚠'), "2 段目は警告色の文言: {confirm}");
+        assert_eq!(hunk_button_text(HunkOp::Stage, true, false), "＋");
     }
 }

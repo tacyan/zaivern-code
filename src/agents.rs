@@ -1880,6 +1880,27 @@ impl AgentManager {
         }
     }
 
+    /// 稼働中のセッションを**全部**止める (タブは残す)。戻り値は止めに行った本数。
+    ///
+    /// - [`Session::kill`] を通すので、**プロセスツリーごと**落ちる
+    ///   (`procx::kill_tree` → unix はプロセスグループ、Windows は `taskkill /T`)。
+    ///   直接の子だけを撃つと、シェルが `exec` せずに起こした孫がパイプを
+    ///   握ったまま残り、読み取りの join が戻らず UI が固まる。
+    /// - **終了済みには撃たない**。wait 済みの PID は OS に返却されており、
+    ///   無関係なプロセス (グループ) に再利用され得るため
+    ///   (`Session::kill` 側にも同じガードがあり、ここは二重の栓)。
+    /// - kill は別スレッドへ投げるだけなので、UI スレッドから呼んでよい。
+    pub fn stop_all(&mut self) -> usize {
+        let mut n = 0;
+        for s in self.sessions.iter_mut() {
+            if s.running() {
+                s.kill();
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn active_session(&mut self) -> Option<&mut Session> {
         self.sessions.get_mut(self.active)
     }
@@ -2979,6 +3000,84 @@ mod tests {
                 "{} は Ask で全自動になってはいけない",
                 bin
             );
+        }
+    }
+
+    // ---- stop_all(): 全エージェント一括停止 ----
+    //
+    // 実 PTY を使うので unix 限定 (remove_active と同じ理由)。
+    // **長い sleep を書かない** — 取りこぼしたときにプロセスが残り続けるため、
+    // 子は数秒で自然終了する長さにしておく。
+    #[cfg(unix)]
+    mod stop_all_tests {
+        use crate::agents::AgentManager;
+        use crate::terminal::{Session, SpawnSpec};
+        use eframe::egui;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        fn mgr(n: usize) -> AgentManager {
+            let mut m = AgentManager::new();
+            for i in 0..n {
+                let spec = SpawnSpec {
+                    title: format!("s{}", i + 1),
+                    preset_name: "t".into(),
+                    icon: "t".into(),
+                    // 取りこぼしても 8 秒で自然に消える長さ。
+                    command: "/bin/sleep 8".into(),
+                    cwd: std::env::temp_dir(),
+                    env: HashMap::new(),
+                    log_path: None,
+                };
+                let s = Session::spawn(i as u64 + 1, spec, egui::Context::default())
+                    .expect("テスト用セッションの起動に失敗");
+                m.sessions.push(s);
+            }
+            m
+        }
+
+        /// 全部が終了するまで待つ (上限つき)。返り値は「全部止まったか」。
+        fn wait_all_exited(m: &AgentManager, limit: Duration) -> bool {
+            let start = Instant::now();
+            while start.elapsed() < limit {
+                if m.running_count() == 0 {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            m.running_count() == 0
+        }
+
+        #[test]
+        fn 一括停止は稼働中を全部止めて本数を返す() {
+            let mut m = mgr(3);
+            assert_eq!(m.running_count(), 3, "3 本起動しているはず");
+            assert_eq!(m.stop_all(), 3, "止めに行った本数");
+            assert!(
+                wait_all_exited(&m, Duration::from_secs(6)),
+                "一括停止で全部止まらなかった (孤児が残っている疑い)"
+            );
+            // タブ自体は残る (あとから ⟳ で起動し直せる)。
+            assert_eq!(m.sessions.len(), 3);
+            for s in &mut m.sessions {
+                s.kill();
+            }
+        }
+
+        #[test]
+        fn 終了済みへは撃たない() {
+            let mut m = mgr(2);
+            assert_eq!(m.stop_all(), 2);
+            assert!(wait_all_exited(&m, Duration::from_secs(6)), "止まらない");
+            // 2 度目は 1 本も撃たない — wait 済みの PID は再利用され得るので、
+            // ここで撃つと無関係なプロセス (グループ) を巻き添えにする。
+            assert_eq!(m.stop_all(), 0, "終了済みへ kill を撃っている");
+        }
+
+        #[test]
+        fn セッションが無いときは何もしない() {
+            let mut m = AgentManager::new();
+            assert_eq!(m.stop_all(), 0);
         }
     }
 

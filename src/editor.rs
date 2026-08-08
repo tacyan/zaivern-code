@@ -94,6 +94,478 @@ impl BufferKind {
     }
 }
 
+// ─── 取り消し履歴 (Undo / Redo) ───────────────────────────────────────
+//
+// **バッファ自身が履歴を持つ**。egui 0.29 の `TextEdit` にも undoer は
+// あるが、次の 3 つが原理的に直せない:
+//
+//   1. 粒度が egui 任せ。整形・コードアクション・行移動・一括置換のような
+//      プログラム的編集が「打った操作の単位」で戻る保証が無い。
+//   2. 取り消し後のカーソルが編集していた場所へ戻らない。
+//   3. 保存時点を知らないので、取り消しで保存時点へ戻っても未保存印が残る。
+//
+// `TextEdit` の undoer を外す API は無いので、⌘Z / ⇧⌘Z は
+// `handle_shortcuts` が**先に消費**して egui 側へ届かないようにしている
+// (`BindAction::Undo` / `BindAction::Redo`)。
+//
+// 履歴は**バイト範囲の置換**の列として持つ (差分スタック)。本文まるごとの
+// スナップショットは持たない — 1 段あたりのメモリが編集の大きさに比例する。
+
+/// 取り消し 1 段の種類。どこで段を切るかを決める。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditKind {
+    /// 文字入力。連続していれば 1 段へまとめる。
+    Typing,
+    /// 削除 (Backspace / Delete)。連続していれば 1 段へまとめる。
+    Deleting,
+    /// 改行を含む編集。**必ず段を切る** (直後の自動インデントだけは吸収する)。
+    Newline,
+    /// 整形・コードアクション・行移動・複製・コメント切替・マルチカーソル
+    /// 一括編集・置換など。**必ず 1 段**として積み、前後の打鍵と混ざらない。
+    Programmatic,
+}
+
+impl EditKind {
+    /// 差分の形から打鍵らしさを推定する (`TextEdit` 経由の編集で使う)。
+    pub fn classify(before: &str, after: &str) -> Self {
+        if before.contains('\n') || after.contains('\n') {
+            return EditKind::Newline;
+        }
+        match (before.is_empty(), after.is_empty()) {
+            (true, false) => EditKind::Typing,
+            (false, true) => EditKind::Deleting,
+            // 選択を打ち換えた (削除 + 挿入) は打鍵として扱う
+            (false, false) => EditKind::Typing,
+            (true, true) => EditKind::Programmatic,
+        }
+    }
+}
+
+/// 併合判定に使う文字の種別。境界をまたいだら段を切る。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    /// 英数字・`_`・CJK (漢字/かな/ハングルは `is_alphanumeric` が真)
+    Word,
+    Space,
+    Other,
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else if c.is_whitespace() {
+        CharClass::Space
+    } else {
+        CharClass::Other
+    }
+}
+
+/// 履歴の上限としきい値。**値は設定 (`Config`) から来る** — ここに持つのは
+/// 設定を読めない場所 (テスト・単体の `History`) のための素の既定値だけ。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryLimits {
+    /// 連続入力を 1 段へまとめる時間しきい値 (ミリ秒)
+    pub merge_ms: u64,
+    /// 保持する最大段数
+    pub max_steps: usize,
+    /// 保持する差分の合計バイト上限
+    pub max_bytes: usize,
+}
+
+/// 既定値。`Config` の既定もここから取るので、二重管理にならない。
+pub const UNDO_MERGE_MS: u64 = 400;
+pub const UNDO_MAX_STEPS: usize = 400;
+pub const UNDO_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+impl Default for HistoryLimits {
+    fn default() -> Self {
+        Self {
+            merge_ms: UNDO_MERGE_MS,
+            max_steps: UNDO_MAX_STEPS,
+            max_bytes: UNDO_MAX_BYTES,
+        }
+    }
+}
+
+/// 取り消し 1 段 = 「`at` から `after` を `before` へ戻す」置換。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndoStep {
+    /// 置換したバイト位置。**必ず char 境界** (CJK / 絵文字を割らない)。
+    at: usize,
+    /// `at` までの char 数。前後どちらの本文でも同じなので選択範囲の復元に使える。
+    at_chars: usize,
+    /// 置換前の文字列 (取り消しで書き戻すもの)
+    before: String,
+    /// 置換後の文字列 (やり直しで書き戻すもの)
+    after: String,
+    kind: EditKind,
+    /// この段へ最後に併合した時刻 (ms)
+    at_ms: u64,
+    /// 取り消しで復元する選択範囲 (char)。`None` なら `before` の末尾へ畳む。
+    sel_before: Option<(usize, usize)>,
+    /// やり直しで復元する選択範囲 (char)。`None` なら `after` の末尾へ畳む。
+    sel_after: Option<(usize, usize)>,
+}
+
+impl UndoStep {
+    fn bytes(&self) -> usize {
+        self.before.len() + self.after.len()
+    }
+
+    fn is_noop(&self) -> bool {
+        self.before == self.after
+    }
+
+    /// 取り消したあとに置くカーソル / 選択範囲。
+    fn sel_for_undo(&self) -> (usize, usize) {
+        self.sel_before.unwrap_or_else(|| {
+            let c = self.at_chars + self.before.chars().count();
+            (c, c)
+        })
+    }
+
+    /// やり直したあとに置くカーソル / 選択範囲。
+    fn sel_for_redo(&self) -> (usize, usize) {
+        self.sel_after.unwrap_or_else(|| {
+            let c = self.at_chars + self.after.chars().count();
+            (c, c)
+        })
+    }
+
+    /// この段の**編集後**の末尾バイト位置 (次の編集が続いているかの判定に使う)。
+    fn tail(&self) -> usize {
+        self.at + self.after.len()
+    }
+
+    /// `next` をこの段へ吸収できるなら吸収して `true`。
+    ///
+    /// 吸収するのは「カーソルが続いている打鍵」だけ:
+    /// 末尾への純粋な追記か、末尾からの純粋な削除。
+    fn merge(&mut self, next: &UndoStep, merge_ms: u64) -> bool {
+        if next.at_ms.saturating_sub(self.at_ms) > merge_ms {
+            return false;
+        }
+        // プログラム的編集は前後どちらの向きにも混ざらない (必ず 1 段)
+        if self.kind == EditKind::Programmatic || next.kind == EditKind::Programmatic {
+            return false;
+        }
+        // 明示的な選択範囲を持つ段には積まない
+        if self.sel_after.is_some() || next.sel_before.is_some() {
+            return false;
+        }
+        // 「選択を消してから入れる」= ユーザーには 1 操作 (貼り付け・選択の
+        // 打ち換え)。`TextEdit` は削除と挿入の 2 回に分けて呼ぶので、
+        // ここで 1 段へ畳む。改行を含む貼り付けでも 1 段にする。
+        if self.after.is_empty()
+            && !self.before.is_empty()
+            && next.before.is_empty()
+            && !next.after.is_empty()
+            && next.at == self.at
+        {
+            self.after.push_str(&next.after);
+            self.kind = EditKind::classify(&self.before, &self.after);
+            self.at_ms = next.at_ms;
+            return true;
+        }
+        // 改行そのものは必ず段を切る。ただし直後の自動インデント
+        // (空白だけの追記) は同じ段に入れる — Enter 1 回で戻れるように。
+        if next.kind == EditKind::Newline {
+            return false;
+        }
+        if self.kind == EditKind::Newline
+            && !(next.before.is_empty() && next.after.chars().all(|c| c.is_whitespace()))
+        {
+            return false;
+        }
+        if next.before.is_empty() && !next.after.is_empty() {
+            // 追記: 末尾に続いていること
+            if next.at != self.tail() {
+                return false;
+            }
+            if !self.class_continues(next.after.chars().next()) {
+                return false;
+            }
+            self.after.push_str(&next.after);
+        } else if next.after.is_empty() && !next.before.is_empty() {
+            // 削除: 末尾から後ろ向きに削っていること
+            if next.at + next.before.len() != self.tail() {
+                return false;
+            }
+            if !self.class_continues(next.before.chars().next_back()) {
+                return false;
+            }
+            let k = next.before.len();
+            if k <= self.after.len() {
+                // この段で足した分を削っただけ
+                let keep = self.after.len() - k;
+                self.after.truncate(keep);
+            } else {
+                // 段の頭を越えて元の本文まで食い込んだ
+                let extra = k - self.after.len();
+                self.at -= extra;
+                self.at_chars -= next.before[..extra].chars().count();
+                let mut b = next.before[..extra].to_string();
+                b.push_str(&self.before);
+                self.before = b;
+                self.after.clear();
+            }
+            self.kind = EditKind::Deleting;
+        } else {
+            return false;
+        }
+        self.at_ms = next.at_ms;
+        true
+    }
+
+    /// 併合の相手の文字が、この段の末尾と同じ種別か (単語境界で切るため)。
+    ///
+    /// この段がまだ何も足していない (= 純粋な削除の段) ときは比較相手が
+    /// 無いので常に許す — 続けた Backspace は 1 段のままにする。
+    fn class_continues(&self, c: Option<char>) -> bool {
+        let Some(c) = c else { return true };
+        match self.after.chars().next_back() {
+            Some(l) => char_class(l) == char_class(c),
+            None => true,
+        }
+    }
+}
+
+/// バッファ 1 本ぶんの取り消し履歴。
+pub struct History {
+    steps: Vec<UndoStep>,
+    /// `steps[..cursor]` が本文へ適用済み。取り消しは `steps[cursor - 1]`。
+    cursor: usize,
+    /// 保存した時点の `cursor`。上限で捨てて到達不能になったら `None`。
+    saved_at: Option<usize>,
+    /// 上限を越えて捨てた段の数 (「これ以上は戻せません」の説明に使う)。
+    dropped: usize,
+    /// `steps` が抱えている差分の合計バイト数。
+    bytes: usize,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            steps: Vec::new(),
+            cursor: 0,
+            // 開いた直後 = ディスクの内容 = 保存済み
+            saved_at: Some(0),
+            dropped: 0,
+            bytes: 0,
+        }
+    }
+}
+
+impl History {
+    pub fn can_undo(&self) -> bool {
+        self.cursor > 0
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.cursor < self.steps.len()
+    }
+
+    /// 上限で捨てた段の数。0 でなければ「古い履歴は破棄済み」と伝える。
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// 保持している段数。粒度のテーブルテスト専用 (製品コードは
+    /// `can_undo` / `can_redo` しか見ない)。
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// いま保存した時点にいるか (未保存印を消してよいか)。
+    pub fn at_saved_point(&self) -> bool {
+        self.saved_at == Some(self.cursor)
+    }
+
+    /// いまの位置を「保存した時点」として覚える。
+    pub fn mark_saved(&mut self) {
+        self.saved_at = Some(self.cursor);
+    }
+
+    /// 履歴を捨てて「開いた直後」に戻す (ファイル読み込み / 文字コード変更)。
+    pub fn reset(&mut self) {
+        *self = History::default();
+    }
+
+    /// **すでに本文へ適用済み**の置換を 1 段として積む (履歴の唯一の入口)。
+    ///
+    /// `at` は char 境界のバイト位置、`at_chars` はそこまでの char 数。
+    /// 打鍵 (`Typing` / `Deleting`) は差分の形から種別を決め直すので、
+    /// 呼び出し側が改行かどうかを気にしなくてよい。
+    pub fn record(&mut self, at: usize, at_chars: usize, before: String, after: String, ed: Edit) {
+        if before == after {
+            return;
+        }
+        let kind = match ed.kind {
+            EditKind::Typing | EditKind::Deleting => EditKind::classify(&before, &after),
+            k => k,
+        };
+        self.push(
+            UndoStep {
+                at,
+                at_chars,
+                before,
+                after,
+                kind,
+                at_ms: ed.now_ms,
+                sel_before: ed.sel_before,
+                sel_after: ed.sel_after,
+            },
+            ed.limits,
+        );
+    }
+
+    /// 1 段積む。連続した打鍵なら直前の段へ併合する。
+    fn push(&mut self, step: UndoStep, limits: HistoryLimits) {
+        // 新しい編集をした瞬間にやり直し先は消える
+        if self.cursor < self.steps.len() {
+            for s in self.steps.drain(self.cursor..) {
+                self.bytes -= s.bytes();
+            }
+            if self.saved_at.map(|k| k > self.cursor).unwrap_or(false) {
+                self.saved_at = None;
+            }
+        }
+        if self.try_merge(&step, limits) {
+            return;
+        }
+        self.bytes += step.bytes();
+        self.steps.push(step);
+        self.cursor = self.steps.len();
+        self.trim(limits);
+    }
+
+    fn try_merge(&mut self, next: &UndoStep, limits: HistoryLimits) -> bool {
+        if self.cursor == 0 || self.cursor != self.steps.len() {
+            return false;
+        }
+        let last = &mut self.steps[self.cursor - 1];
+        let was = last.bytes();
+        if !last.merge(next, limits.merge_ms) {
+            return false;
+        }
+        self.bytes = self.bytes + last.bytes() - was;
+        // 打ち消し合って何も変えない段になったら残さない
+        if self.steps[self.cursor - 1].is_noop() {
+            let s = self.steps.pop().expect("直前の段がある");
+            self.bytes -= s.bytes();
+            self.cursor -= 1;
+            // 保存マーカーは本文ハッシュ側の判定に委ねる (嘘の「保存済み」を出さない)
+            if self.saved_at.map(|k| k > self.cursor).unwrap_or(false) {
+                self.saved_at = None;
+            }
+        }
+        true
+    }
+
+    /// 上限を越えたぶんを古い方から捨てる。
+    fn trim(&mut self, limits: HistoryLimits) {
+        let max_steps = limits.max_steps.max(1);
+        while self.steps.len() > max_steps
+            || (self.bytes > limits.max_bytes && self.steps.len() > 1)
+        {
+            let s = self.steps.remove(0);
+            self.bytes -= s.bytes();
+            self.cursor = self.cursor.saturating_sub(1);
+            self.dropped += 1;
+            self.saved_at = match self.saved_at {
+                Some(0) | None => None,
+                Some(k) => Some(k - 1),
+            };
+        }
+    }
+}
+
+/// 共通接頭辞 / 接尾辞を落として `(置換開始バイト, 置換開始の char 数, 旧, 新)` を返す。
+///
+/// 切る位置は**必ず char 境界**に丸める。UTF-8 のバイト比較で止めると
+/// CJK や絵文字の途中で切れて `String` が壊れる (パニックする)。
+/// 1 バイトも変わっていなければ `None`。
+pub fn diff_replace(old: &str, new: &str) -> Option<(usize, usize, String, String)> {
+    if old == new {
+        return None;
+    }
+    let (ob, nb) = (old.as_bytes(), new.as_bytes());
+    let mut at = 0usize;
+    let max = ob.len().min(nb.len());
+    while at < max && ob[at] == nb[at] {
+        at += 1;
+    }
+    // 共通接頭辞なので old と new で char 境界の位置は一致する
+    while at > 0 && !old.is_char_boundary(at) {
+        at -= 1;
+    }
+    let (mut oe, mut ne) = (ob.len(), nb.len());
+    while oe > at && ne > at && ob[oe - 1] == nb[ne - 1] {
+        oe -= 1;
+        ne -= 1;
+    }
+    while oe < ob.len() && !old.is_char_boundary(oe) {
+        oe += 1;
+        ne += 1;
+    }
+    let at_chars = old[..at].chars().count();
+    Some((
+        at,
+        at_chars,
+        old[at..oe].to_string(),
+        new[at..ne].to_string(),
+    ))
+}
+
+/// 1 回の編集に添える情報 (種類・前後の選択範囲・時刻・上限)。
+///
+/// しきい値と上限は**設定から渡す** — 呼び出し側で直書きしない。
+#[derive(Clone, Copy, Debug)]
+pub struct Edit {
+    pub kind: EditKind,
+    pub sel_before: Option<(usize, usize)>,
+    pub sel_after: Option<(usize, usize)>,
+    pub now_ms: u64,
+    pub limits: HistoryLimits,
+}
+
+impl Edit {
+    /// プログラム的編集 (必ず 1 段)。
+    pub fn programmatic(now_ms: u64, limits: HistoryLimits) -> Self {
+        Self {
+            kind: EditKind::Programmatic,
+            sel_before: None,
+            sel_after: None,
+            now_ms,
+            limits,
+        }
+    }
+
+    /// 打鍵らしさを差分から決める編集 (`TextEdit` 経由・折りたたみ表示の差し戻し)。
+    pub fn typed(now_ms: u64, limits: HistoryLimits) -> Self {
+        Self {
+            kind: EditKind::Typing,
+            sel_before: None,
+            sel_after: None,
+            now_ms,
+            limits,
+        }
+    }
+
+    /// 編集**前**の選択範囲 (取り消しでここへ戻る)。
+    pub fn from_sel(mut self, sel: (usize, usize)) -> Self {
+        self.sel_before = Some(sel);
+        self
+    }
+
+    /// 編集**後**の選択範囲 (やり直しでここへ戻る)。
+    pub fn to_sel(mut self, sel: (usize, usize)) -> Self {
+        self.sel_after = Some(sel);
+        self
+    }
+}
+
 pub struct Buffer {
     pub id: u64,
     pub path: Option<PathBuf>,
@@ -102,6 +574,10 @@ pub struct Buffer {
     pub title: String,
     pub text: String,
     pub saved_hash: u64,
+    /// 取り消し履歴。**本文を書き換える経路は必ず `apply_edit` /
+    /// `reset_text` / `History::record` のどれかを通す** (直に `text` へ
+    /// 代入すると履歴と保存マーカーが嘘になる。`editor::tests` の番人が検出する)。
+    pub history: History,
     pub lang: String,
     /// 読み込んだときの文字コード。保存で元の形へ戻すために持つ。
     ///
@@ -1324,7 +1800,76 @@ pub fn parse_table_with(text: &str, delimiter: char, max_rows: usize) -> TableVi
 
 impl Buffer {
     pub fn dirty(&self) -> bool {
+        // 履歴の保存マーカーに戻っていれば本文も保存時点と同じ。
+        // 巨大ファイルで毎フレーム全文をハッシュしないための近道でもある
+        // (設計原則 3: アイドル時のコストはゼロ)。
+        if self.history.at_saved_point() {
+            return false;
+        }
         hash_str(&self.text) != self.saved_hash
+    }
+
+    // ─── 本文書き換えの入口 (ここ以外から `text` を書かない) ──────────
+
+    /// 本文を丸ごと差し替え、差分を取り消し 1 段として積む。
+    ///
+    /// 1 バイトも変わらなければ何もせず `false`。
+    pub fn apply_edit(&mut self, new_text: String, ed: Edit) -> bool {
+        let Some((at, at_chars, before, after)) = diff_replace(&self.text, &new_text) else {
+            return false;
+        };
+        self.text = new_text;
+        self.history.record(at, at_chars, before, after, ed);
+        self.invalidate_render_cache();
+        true
+    }
+
+    /// 履歴を捨てて本文を入れ替える (ファイル読み込み・文字コード変更・
+    /// ディスクへ戻す)。取り消しで**ファイルを開く前**へは戻さない。
+    pub fn reset_text(&mut self, text: String) {
+        self.text = text;
+        self.saved_hash = hash_str(&self.text);
+        self.history.reset();
+        self.invalidate_render_cache();
+    }
+
+    /// 保存した時点を履歴へ記録する (未保存印を消す基準)。
+    pub fn mark_saved(&mut self) {
+        self.saved_hash = hash_str(&self.text);
+        self.history.mark_saved();
+    }
+
+    /// 1 段取り消す。返り値は復元すべき選択範囲 (char 添字)。
+    pub fn undo(&mut self) -> Option<(usize, usize)> {
+        if !self.history.can_undo() {
+            return None;
+        }
+        let step = self.history.steps[self.history.cursor - 1].clone();
+        let end = step.tail();
+        self.text.replace_range(step.at..end, &step.before);
+        self.history.cursor -= 1;
+        self.invalidate_render_cache();
+        Some(step.sel_for_undo())
+    }
+
+    /// 1 段やり直す。返り値は復元すべき選択範囲 (char 添字)。
+    pub fn redo(&mut self) -> Option<(usize, usize)> {
+        if !self.history.can_redo() {
+            return None;
+        }
+        let step = self.history.steps[self.history.cursor].clone();
+        let end = step.at + step.before.len();
+        self.text.replace_range(step.at..end, &step.after);
+        self.history.cursor += 1;
+        self.invalidate_render_cache();
+        Some(step.sel_for_redo())
+    }
+
+    /// 本文が変わったときに捨てる描画キャッシュ。
+    pub fn invalidate_render_cache(&mut self) {
+        self.cache = None;
+        self.gutter = None;
+        self.minimap = None;
     }
 
     /// このタブが読み取り専用か。種類 (画像 / PDF / 差分) と
@@ -1438,6 +1983,7 @@ impl Editor {
             title: format!("untitled-{}", self.untitled_count),
             text: String::new(),
             saved_hash: hash_str(""),
+            history: History::default(),
             lang: "Plain Text".into(),
             // 新規ファイルは UTF-8 で作る (既定)
             encoding: crate::textenc::Encoding::Utf8,
@@ -1481,6 +2027,7 @@ impl Editor {
             title,
             text: String::new(),
             saved_hash: hash_str(""),
+            history: History::default(),
             lang: "Plain Text".into(),
             encoding: crate::textenc::Encoding::Utf8,
             cache: None,
@@ -1590,6 +2137,7 @@ impl Editor {
                 // 検索のどの経路でも画像タブは素通りされる
                 text: String::new(),
                 saved_hash: hash_str(""),
+                history: History::default(),
                 lang: "Plain Text".into(),
                 encoding: crate::textenc::Encoding::Utf8,
                 cache: None,
@@ -1637,6 +2185,7 @@ impl Editor {
                 // read_only() との二重の防御で、抽出テキストが元の PDF へ
                 // 書き戻されることはない。
                 saved_hash: hash_str(&text),
+                history: History::default(),
                 text,
                 lang: "Plain Text".into(),
                 encoding: crate::textenc::Encoding::Utf8,
@@ -1675,6 +2224,7 @@ impl Editor {
             kind: BufferKind::File,
             title,
             saved_hash: hash_str(&text),
+            history: History::default(),
             text,
             lang,
             encoding,
@@ -1709,10 +2259,8 @@ impl Editor {
         if let Some(i) = self.buffers.iter().position(|b| b.kind == kind) {
             let b = &mut self.buffers[i];
             b.title = title;
-            b.saved_hash = hash_str(&text);
-            b.text = text;
-            b.cache = None;
-            b.gutter = None;
+            // 仮想タブは「開き直し」なので取り消し履歴も作り直す
+            b.reset_text(text);
             self.active = Some(i);
             return b.id;
         }
@@ -1724,6 +2272,7 @@ impl Editor {
             kind,
             title,
             saved_hash: hash_str(&text),
+            history: History::default(),
             text,
             lang: "Diff".into(),
             // 読み取り専用タブ (PR 差分など) は保存経路を通らない
@@ -1794,13 +2343,10 @@ impl Editor {
             }
             let file_bytes = raw.len() as u64;
             let (text, job) = start_pdf_extraction(&b.title, raw, file_bytes);
-            b.saved_hash = hash_str(&text);
-            b.text = text;
+            b.reset_text(text);
             // 走っていた古い抽出は捨てる (受け口を落とせばワーカーの送信は
             // 失敗するだけ)。差し替え後の本文を古い結果で上書きしない
             b.pdf_job = job;
-            b.cache = None;
-            b.gutter = None;
             b.disk_mtime = m;
             b.conflict_notified = None;
             return true;
@@ -1812,7 +2358,8 @@ impl Editor {
             b.encoding = encoding;
             b.disk_mtime = m;
             b.conflict_notified = None;
-            b.saved_hash = hash_str(&text);
+            // 本文は同じなので履歴は残したまま「今が保存時点」にする
+            b.mark_saved();
             return false;
         }
         if b.dirty() {
@@ -1824,10 +2371,8 @@ impl Editor {
         b.encoding = encoding;
         b.disk_mtime = m;
         b.conflict_notified = None;
-        b.saved_hash = hash_str(&text);
-        b.text = text;
-        b.cache = None;
-        b.gutter = None;
+        // ディスクの内容へ読み直した = 取り消しで前の本文へは戻さない
+        b.reset_text(text);
         // 中身が入れ替わったのでインデントも取り直す (エージェントが
         // 別の様式で書き換えたときにステータスバーが嘘を出さないように)
         self.apply_indent_defaults(i);
@@ -1850,11 +2395,8 @@ impl Editor {
                 continue;
             };
             // 読み取り専用タブなので dirty にしない (saved_hash も合わせる)
-            b.saved_hash = hash_str(&text);
-            b.text = text;
+            b.reset_text(text);
             b.pdf_job = None;
-            b.cache = None;
-            b.gutter = None;
             changed = true;
         }
         changed
@@ -2001,7 +2543,12 @@ mod tests {
     fn external_change_keeps_dirty_buffer_and_warns_once() {
         let dir = unique_temp_dir("zaivern-editor-test", "conflict");
         let (mut ed, path, _hl) = open_one(&dir, "a.md", "old");
-        ed.buffers[0].text = "my unsaved edit".into();
+        // 未保存の編集は履歴を通す (直に text へ代入すると dirty が立たない)
+        ed.buffers[0].apply_edit(
+            "my unsaved edit".into(),
+            Edit::programmatic(0, HistoryLimits::default()),
+        );
+        assert!(ed.buffers[0].dirty(), "未保存の編集が立っている");
 
         std::fs::write(&path, "agent wrote this").expect("external write");
         bump_mtime(&path);
@@ -2037,7 +2584,8 @@ mod tests {
         assert_eq!(ed.buffers[0].encoding, crate::textenc::Encoding::Utf8);
         assert_eq!(ed.buffers[0].text, "日本語の本文");
 
-        ed.buffers[0].text.push_str("と追記");
+        let appended = format!("{}と追記", ed.buffers[0].text);
+        ed.buffers[0].apply_edit(appended, Edit::programmatic(0, HistoryLimits::default()));
         assert!(
             !ed.buffers[0].write_to(&path).expect("save"),
             "格上げは起きない"
@@ -2123,7 +2671,8 @@ mod tests {
         let hl = Highlighter::new();
         let mut ed = Editor::new();
         assert_eq!(ed.open(&path, &hl), Ok(false));
-        ed.buffers[0].text.push_str(" 🚀");
+        let appended = format!("{} 🚀", ed.buffers[0].text);
+        ed.buffers[0].apply_edit(appended, Edit::programmatic(0, HistoryLimits::default()));
 
         assert!(
             ed.buffers[0].write_to(&path).expect("save"),
@@ -2721,8 +3270,7 @@ mod tests {
         let placeholder = pdf_loading_text("slow.pdf", 1234);
         {
             let b = &mut ed.buffers[0];
-            b.saved_hash = hash_str(&placeholder);
-            b.text = placeholder;
+            b.reset_text(placeholder);
             b.pdf_job = Some(PdfJob::for_test(rx, "slow.pdf", 1234));
         }
         assert!(ed.buffers[0].text.contains("読み込み中"), "まずは待ち表示");
@@ -3287,5 +3835,417 @@ fn g() {
         b.drop_table();
         assert!(b.table.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── 取り消し履歴 (History) のテーブルテスト ───────────────────
+
+    /// 履歴つきの素のバッファ。`~/.zaivern` にもディスクにも触らない。
+    fn undo_buf(text: &str) -> Buffer {
+        let mut ed = Editor::new();
+        ed.new_untitled();
+        let mut b = ed.buffers.pop().expect("untitled タブができている");
+        b.reset_text(text.to_string());
+        b
+    }
+
+    fn lim() -> HistoryLimits {
+        HistoryLimits::default()
+    }
+
+    /// `TextEdit` が `char_index` へ文字を入れたのと同じ記録をする。
+    fn type_at(b: &mut Buffer, char_index: usize, s: &str, now_ms: u64, limits: HistoryLimits) {
+        let at = crate::editor_ops::char_to_byte(&b.text, char_index);
+        b.text.insert_str(at, s);
+        b.history.record(
+            at,
+            char_index,
+            String::new(),
+            s.to_string(),
+            Edit::typed(now_ms, limits),
+        );
+    }
+
+    /// `char_index` の直前 1 文字を Backspace で消したのと同じ記録をする。
+    fn backspace_at(b: &mut Buffer, char_index: usize, now_ms: u64, limits: HistoryLimits) {
+        let start = crate::editor_ops::char_to_byte(&b.text, char_index - 1);
+        let end = crate::editor_ops::char_to_byte(&b.text, char_index);
+        let removed = b.text[start..end].to_string();
+        b.text.replace_range(start..end, "");
+        b.history.record(
+            start,
+            char_index - 1,
+            removed,
+            String::new(),
+            Edit::typed(now_ms, limits),
+        );
+    }
+
+    /// 続けて打った文字は 1 段にまとまる (⌘Z 1 回で打った語ごと消える)。
+    #[test]
+    fn 連続入力は一段にまとまる() {
+        let mut b = undo_buf("");
+        for (i, c) in "hello".chars().enumerate() {
+            type_at(&mut b, i, &c.to_string(), i as u64 * 10, lim());
+        }
+        assert_eq!(b.text, "hello");
+        assert_eq!(b.history.len(), 1, "連続入力は 1 段");
+        assert_eq!(b.undo(), Some((0, 0)));
+        assert_eq!(b.text, "", "1 回の取り消しで全部戻る");
+    }
+
+    /// しきい値を超えて間が空いたら別の段になる (値は設定から来る)。
+    #[test]
+    fn しきい値を超えた入力は別の段になる() {
+        let l = lim();
+        let mut b = undo_buf("");
+        type_at(&mut b, 0, "a", 0, l);
+        type_at(&mut b, 1, "b", l.merge_ms + 1, l);
+        assert_eq!(b.history.len(), 2, "しきい値超えで段が切れる");
+        assert_eq!(b.undo(), Some((1, 1)));
+        assert_eq!(b.text, "a");
+    }
+
+    /// 改行は必ず段を切る。直後の自動インデント (空白) だけは同じ段に入る。
+    #[test]
+    fn 改行で段が切れて自動インデントは同じ段に入る() {
+        let l = lim();
+        let mut b = undo_buf("");
+        type_at(&mut b, 0, "a", 0, l);
+        type_at(&mut b, 1, "b", 5, l);
+        type_at(&mut b, 2, "\n", 10, l);
+        type_at(&mut b, 3, "    ", 12, l); // 自動インデント
+        type_at(&mut b, 7, "c", 20, l);
+        type_at(&mut b, 8, "d", 25, l);
+        assert_eq!(b.text, "ab\n    cd");
+        assert_eq!(b.history.len(), 3, "「ab」「改行+インデント」「cd」の 3 段");
+        b.undo();
+        assert_eq!(b.text, "ab\n    ");
+        b.undo();
+        assert_eq!(b.text, "ab", "改行と自動インデントは 1 回で戻る");
+    }
+
+    /// 単語の切れ目でも段を切る (VS Code / Zed と同じ)。
+    #[test]
+    fn 単語境界で段が切れる() {
+        let l = lim();
+        let mut b = undo_buf("");
+        for (i, c) in "foo bar".chars().enumerate() {
+            type_at(&mut b, i, &c.to_string(), i as u64, l);
+        }
+        assert_eq!(b.history.len(), 3, "「foo」「空白」「bar」");
+        b.undo();
+        assert_eq!(b.text, "foo ");
+    }
+
+    /// カーソルが飛んだら段を切る (離れた場所への入力は別の操作)。
+    #[test]
+    fn カーソルが飛んだら段が切れる() {
+        let l = lim();
+        let mut b = undo_buf("");
+        type_at(&mut b, 0, "a", 0, l);
+        type_at(&mut b, 1, "b", 5, l);
+        type_at(&mut b, 0, "z", 10, l); // 先頭へ戻って打つ
+        assert_eq!(b.text, "zab");
+        assert_eq!(b.history.len(), 2, "連続していないので別の段");
+        assert_eq!(b.undo(), Some((0, 0)));
+        assert_eq!(b.text, "ab");
+    }
+
+    /// 続けた Backspace は 1 段にまとまり、段の頭を越えても壊れない。
+    #[test]
+    fn 連続削除は一段にまとまる() {
+        let l = lim();
+        let mut b = undo_buf("abcdef");
+        for k in 0..3 {
+            backspace_at(&mut b, 6 - k, (k * 5) as u64, l);
+        }
+        assert_eq!(b.text, "abc");
+        assert_eq!(b.history.len(), 1, "連続削除は 1 段");
+        b.undo();
+        assert_eq!(b.text, "abcdef");
+    }
+
+    /// 選択を消してから入れる (貼り付け・選択の打ち換え) は 1 段。
+    /// `TextEdit` は削除と挿入の 2 回に分けて呼ぶが、ユーザーには 1 操作。
+    #[test]
+    fn 選択の打ち換えと貼り付けは一段() {
+        let l = lim();
+        let mut b = undo_buf("hello world");
+        // 選択 "world" を消して複数行を貼り付けた想定
+        let start = crate::editor_ops::char_to_byte(&b.text, 6);
+        let removed = b.text[start..].to_string();
+        b.text.replace_range(start.., "");
+        b.history
+            .record(start, 6, removed, String::new(), Edit::typed(0, l));
+        b.text.push_str("one\ntwo");
+        b.history.record(
+            start,
+            6,
+            String::new(),
+            "one\ntwo".into(),
+            Edit::typed(1, l),
+        );
+        assert_eq!(b.text, "hello one\ntwo");
+        assert_eq!(b.history.len(), 1, "削除 + 挿入で 1 段");
+        b.undo();
+        assert_eq!(b.text, "hello world");
+    }
+
+    /// プログラム的編集 (整形・行移動・コードアクション) は**必ず 1 段**。
+    /// 前後の打鍵と混ざらない。
+    #[test]
+    fn プログラム的編集は必ず一段() {
+        let l = lim();
+        let mut b = undo_buf("");
+        type_at(&mut b, 0, "a", 0, l);
+        // 整形が本文を全面的に書き換えた想定 (時刻はしきい値内)
+        assert!(b.apply_edit("A;\nB;\n".into(), Edit::programmatic(1, l)));
+        type_at(&mut b, 6, "x", 2, l);
+        assert_eq!(b.history.len(), 3, "打鍵 / 整形 / 打鍵 が混ざらない");
+        b.undo();
+        assert_eq!(b.text, "A;\nB;\n");
+        b.undo();
+        assert_eq!(b.text, "a", "整形を 1 回の取り消しで丸ごと戻せる");
+    }
+
+    /// 「すべて置換」は何件当たっても全体で 1 段。
+    #[test]
+    fn 全置換は全体で一段() {
+        let l = lim();
+        let src = "foo foo foo\nfoo\n";
+        let mut b = undo_buf(src);
+        let replaced = src.replace("foo", "bar");
+        assert!(b.apply_edit(replaced.clone(), Edit::programmatic(0, l)));
+        assert_eq!(b.text, replaced);
+        assert_eq!(b.history.len(), 1, "4 件でも 1 段");
+        b.undo();
+        assert_eq!(b.text, src, "1 回の取り消しで全件戻る");
+    }
+
+    /// 取り消し → やり直し → 取り消しの往復で本文もカーソルも一致する。
+    #[test]
+    fn 取り消しとやり直しの往復() {
+        let l = lim();
+        let mut b = undo_buf("start");
+        type_at(&mut b, 5, "!", 0, l);
+        assert_eq!(b.text, "start!");
+        assert_eq!(b.undo(), Some((5, 5)), "取り消し後は編集していた場所");
+        assert_eq!(b.text, "start");
+        assert_eq!(b.redo(), Some((6, 6)), "やり直し後は編集の直後");
+        assert_eq!(b.text, "start!");
+        assert_eq!(b.undo(), Some((5, 5)));
+        assert_eq!(b.text, "start");
+        assert!(!b.history.can_undo());
+        assert_eq!(b.undo(), None, "これ以上は戻せない");
+    }
+
+    /// 取り消したあとに新しい編集をしたら、やり直し先は消える。
+    #[test]
+    fn 新しい編集でやり直しは消える() {
+        let l = lim();
+        let mut b = undo_buf("");
+        type_at(&mut b, 0, "a", 0, l);
+        type_at(&mut b, 1, "b", l.merge_ms + 1, l);
+        b.undo();
+        assert!(b.history.can_redo());
+        type_at(&mut b, 1, "z", 2 * (l.merge_ms + 1), l);
+        assert!(!b.history.can_redo(), "分岐したらやり直しは捨てる");
+        assert_eq!(b.redo(), None);
+        assert_eq!(b.text, "az");
+    }
+
+    /// プログラム的編集は取り消しで**編集前の選択範囲**へ戻す。
+    #[test]
+    fn 取り消しで編集前の選択へ戻る() {
+        let l = lim();
+        let mut b = undo_buf("hello world");
+        let ed = Edit::programmatic(0, l).from_sel((6, 11)).to_sel((6, 9));
+        assert!(b.apply_edit("hello rust".into(), ed));
+        assert_eq!(b.redo(), None);
+        assert_eq!(b.undo(), Some((6, 11)), "取り消しで元の選択が戻る");
+        assert_eq!(b.redo(), Some((6, 9)), "やり直しで編集後の選択が戻る");
+    }
+
+    /// CJK と絵文字を含む本文でも、差分の切り出しが char 境界を割らない。
+    #[test]
+    fn cjkと絵文字でバイト境界を割らない() {
+        // 先頭バイトが同じ文字どうし: 素朴なバイト比較だと途中で切れる
+        assert_eq!(
+            diff_replace("あい", "あう"),
+            Some((3, 1, "い".into(), "う".into()))
+        );
+        assert_eq!(
+            diff_replace("a🎉b", "a🚀b"),
+            Some((1, 1, "🎉".into(), "🚀".into()))
+        );
+        // 変化なしは None (書き込みも履歴積みも省ける)
+        assert_eq!(diff_replace("日本語", "日本語"), None);
+
+        let l = lim();
+        let mut b = undo_buf("日本語のテキスト🎉");
+        for (i, c) in "です".chars().enumerate() {
+            type_at(&mut b, 9 + i, &c.to_string(), i as u64, l);
+        }
+        assert_eq!(b.text, "日本語のテキスト🎉です");
+        assert_eq!(b.history.len(), 1, "CJK でも連続入力は 1 段");
+        b.undo();
+        assert_eq!(b.text, "日本語のテキスト🎉");
+        b.redo();
+        assert_eq!(b.text, "日本語のテキスト🎉です");
+        // 絵文字をまたぐプログラム的編集
+        assert!(b.apply_edit("日本語のテキスト🚀です".into(), Edit::programmatic(1, l)));
+        b.undo();
+        assert_eq!(b.text, "日本語のテキスト🎉です");
+    }
+
+    /// 空バッファ: 何も無いところで取り消し / やり直しを撃っても壊れない。
+    #[test]
+    fn 空バッファでも安全() {
+        let l = lim();
+        let mut b = undo_buf("");
+        assert_eq!(b.undo(), None);
+        assert_eq!(b.redo(), None);
+        assert!(!b.dirty(), "開いた直後は未保存印なし");
+        type_at(&mut b, 0, "x", 0, l);
+        assert!(b.dirty());
+        assert_eq!(b.undo(), Some((0, 0)));
+        assert_eq!(b.text, "");
+        assert_eq!(b.undo(), None);
+        assert!(!b.dirty(), "保存時点まで戻ったので未保存印は消える");
+    }
+
+    /// 上限に達したら古い段から捨て、捨てたことが分かる。
+    #[test]
+    fn 上限に達したら古い段から捨てる() {
+        let l = HistoryLimits {
+            merge_ms: 0,
+            max_steps: 3,
+            max_bytes: usize::MAX,
+        };
+        let mut b = undo_buf("");
+        for i in 0..5u64 {
+            type_at(&mut b, i as usize, "x", i * 100, l);
+        }
+        assert_eq!(b.text, "xxxxx");
+        assert_eq!(b.history.len(), 3, "上限どおり 3 段だけ残る");
+        assert_eq!(b.history.dropped(), 2, "捨てた段数が分かる");
+        for _ in 0..3 {
+            assert!(b.undo().is_some());
+        }
+        assert_eq!(b.undo(), None, "捨てたぶんは戻せない");
+        assert_eq!(b.text, "xx", "捨てた 2 段ぶんは本文に残る");
+    }
+
+    /// バイト上限でも古い段から捨てる (巨大な一括置換を繰り返しても頭打ち)。
+    #[test]
+    fn バイト上限でも古い段から捨てる() {
+        let l = HistoryLimits {
+            merge_ms: 0,
+            max_steps: usize::MAX,
+            max_bytes: 16,
+        };
+        let mut b = undo_buf("");
+        for i in 0..4u64 {
+            let mut nt = b.text.clone();
+            nt.push_str("0123456789");
+            assert!(b.apply_edit(nt, Edit::programmatic(i * 1000, l)));
+        }
+        assert!(b.history.len() <= 2, "バイト上限で古い段が落ちる");
+        assert!(b.history.dropped() > 0, "捨てたことが分かる");
+    }
+
+    /// 保存マーカー: 保存 → 編集 → 取り消しで未保存印が消える。
+    /// 逆に 保存 → 取り消し → やり直しで未保存印が戻る。
+    #[test]
+    fn 保存マーカーが履歴に追従する() {
+        let l = lim();
+        let mut b = undo_buf("hello");
+        b.mark_saved();
+        assert!(!b.dirty());
+
+        type_at(&mut b, 5, "!", 0, l);
+        assert!(b.dirty(), "編集したら未保存");
+        b.undo();
+        assert!(!b.dirty(), "保存時点まで戻したら未保存印は消える");
+        b.redo();
+        assert!(b.dirty(), "やり直したらまた未保存");
+
+        // 編集した状態で保存し直すと、保存時点そのものが移動する
+        b.mark_saved();
+        assert!(!b.dirty());
+        b.undo();
+        assert!(b.dirty(), "保存時点より前へ戻したら未保存");
+        b.redo();
+        assert!(!b.dirty(), "保存時点へ戻れば未保存印は消える");
+    }
+
+    /// ファイルを読み直したら履歴は畳む (取り消しで前の内容へ戻さない)。
+    #[test]
+    fn 読み直しで履歴を畳む() {
+        let l = lim();
+        let mut b = undo_buf("old");
+        type_at(&mut b, 3, "!", 0, l);
+        assert!(b.history.can_undo());
+        b.reset_text("new from disk".into());
+        assert!(!b.history.can_undo(), "読み直し前へは戻さない");
+        assert!(!b.dirty(), "読み直した直後は保存済み");
+    }
+
+    /// 打って消して元に戻ったら、その段は履歴に残さない。
+    #[test]
+    fn 打ち消し合った段は残さない() {
+        let l = lim();
+        let mut b = undo_buf("ab");
+        type_at(&mut b, 2, "c", 0, l);
+        backspace_at(&mut b, 3, 5, l);
+        assert_eq!(b.text, "ab");
+        assert_eq!(b.history.len(), 0, "何も変えていない段は積まない");
+    }
+
+    /// 本文の書き換えは履歴の入口だけを通る。
+    ///
+    /// ここを緩めると「取り消しに乗らない編集」が生えて、⌘Z が飛び飛びになる。
+    /// `dirty()` が履歴の保存マーカーを信用できるのもこの不変条件のおかげ。
+    #[test]
+    fn 本文の書き換えは履歴の入口だけを通る() {
+        for (name, raw) in [
+            ("app.rs", include_str!("app.rs")),
+            ("editor.rs", include_str!("editor.rs")),
+        ] {
+            // Windows のチェックアウトは CRLF なので必ず正規化してから探す
+            let src = raw.replace("\r\n", "\n");
+            // テストコードは対象外 (テストは Buffer を直接組み立ててよい)
+            let head = src
+                .split("\n#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap_or("");
+            // 代入は問答無用で禁止 (差分が取れないので履歴に乗らない)
+            for pat in ["b.text = ", "buf.text = ", "b.text.push_str("] {
+                assert!(
+                    !head.contains(pat),
+                    "{name}: `{pat}` が履歴を通さず本文を書き換えている \
+                     (apply_edit / reset_text のどちらかを通すこと)"
+                );
+            }
+            // その場書き換えは許すが、直後に必ず履歴へ積んでいること
+            for pat in ["b.text.insert_str(", "b.text.replace_range("] {
+                let mut from = 0usize;
+                while let Some(rel) = head[from..].find(pat) {
+                    let at = from + rel;
+                    // 日本語コメントが多いので char 境界へ丸めてから切る
+                    let mut end = (at + 400).min(head.len());
+                    while end < head.len() && !head.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    let win = &head[at..end];
+                    assert!(
+                        win.contains(".record("),
+                        "{name}: `{pat}` の直後で履歴へ積んでいない \
+                         (⌘Z で戻せない編集になる)"
+                    );
+                    from = at + pat.len();
+                }
+            }
+        }
     }
 }

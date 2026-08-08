@@ -56,9 +56,6 @@ use crate::theme::Theme;
 pub const MIN_RACERS: usize = 2;
 pub const MAX_RACERS: usize = 4;
 
-/// ブランチ名に使うスラグの最大長 (ASCII 前提)。
-const SLUG_MAX: usize = 24;
-
 /// 差分量ポーリングの間隔。
 const STAT_TTL: Duration = Duration::from_secs(4);
 
@@ -78,26 +75,7 @@ const PATH_CHARS_MAX: usize = 44;
 /// プロンプトからブランチ用スラグを作る。ASCII 英数字だけを残し、他は `-` に
 /// 潰して連結する。日本語だけのプロンプトのように何も残らない場合は "race"。
 pub fn slugify_prompt(prompt: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = true; // 先頭のダッシュを抑止
-    for c in prompt.chars() {
-        if out.len() >= SLUG_MAX {
-            break;
-        }
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "race".to_string()
-    } else {
-        out
-    }
+    crate::worktree::slugify(prompt, "race")
 }
 
 /// racer `i` (1 始まり) のブランチ名。
@@ -131,27 +109,12 @@ pub fn unique_slug(base: &str, mut taken: impl FnMut(&str) -> bool) -> String {
 /// リポジトリが `.claude/worktrees` 配下 (Claude セッションの管理領域) にある、
 /// または親が取れない場合は `temp_dir()/zaivern-races` へ退避する。
 pub fn race_worktree_base(repo: &Path) -> PathBuf {
-    let inside_claude_worktrees = repo.ancestors().any(|a| {
-        a.file_name().is_some_and(|n| n == "worktrees")
-            && a.parent()
-                .and_then(|p| p.file_name())
-                .is_some_and(|n| n == ".claude")
-    });
-    match repo.parent() {
-        Some(p) if !inside_claude_worktrees && p != Path::new("") => p.to_path_buf(),
-        _ => std::env::temp_dir().join("zaivern-races"),
-    }
+    crate::worktree::worktree_base(repo, "zaivern-races")
 }
 
 /// `git worktree remove` の引数列。--force は UI の確認フラグを経た時だけ付く。
-pub fn worktree_remove_args(dir: &str, force: bool) -> Vec<String> {
-    let mut args = vec!["worktree".to_string(), "remove".to_string()];
-    if force {
-        args.push("--force".to_string());
-    }
-    args.push(dir.to_string());
-    args
-}
+/// 実体は [`crate::worktree`] (通常運用の隔離 worktree と同じ道を通す)。
+pub use crate::worktree::worktree_remove_args;
 
 /// racer に自動投入するプロンプト本文。ユーザーの指示 + レースの約束事。
 pub fn build_race_prompt(prompt: &str, branch: &str) -> String {
@@ -233,140 +196,14 @@ pub fn parse_merge_kind(out: &str) -> MergeKind {
 // 純粋ロジック: 触ったファイルの収集と衝突検出
 // ---------------------------------------------------------------------------
 
-/// `git status --porcelain=v1 -z` の 1 レコード。
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct StatusEntry {
-    /// 状態 2 文字 (index, worktree)。例: `" M"` / `"??"` / `"R "`。
-    pub xy: String,
-    /// 触れたパス。リネーム / コピーは (新, 旧) の 2 本になる。
-    pub paths: Vec<PathBuf>,
-}
+// `git status --porcelain=v1 -z` / `diff --name-only -z` のパーサは
+// [`crate::worktree`] が持つ (通常運用のファイル衝突検出と同じ実装を使う)。
+// ここでは回帰テストだけが直接呼ぶので、取り込みは `mod tests` の中で行う。
 
-impl StatusEntry {
-    /// 未追跡ファイルか (`??`)。
-    pub fn is_untracked(&self) -> bool {
-        self.xy == "??"
-    }
-}
-
-/// `git status --porcelain=v1 -z` をパースする。
-///
-/// `-z` にする理由は 2 つ: (1) 空白や日本語を含むパスが引用符でエスケープされない、
-/// (2) 改行を含むパスでもレコードが壊れない。レコードは `XY<空白>PATH\0` で、
-/// リネーム / コピーのときだけ直後に旧パスの NUL 終端フィールドが 1 本続く。
-pub fn parse_status_z(raw: &str) -> Vec<StatusEntry> {
-    let mut out = Vec::new();
-    let mut it = raw.split('\0');
-    while let Some(field) = it.next() {
-        let b = field.as_bytes();
-        // "XY PATH" に満たないもの (末尾の空フィールド等) は読み飛ばす。
-        if b.len() < 4 || b[2] != b' ' {
-            continue;
-        }
-        let xy = field[..2].to_string();
-        let mut paths = vec![PathBuf::from(&field[3..])];
-        // R/C は「新パス」に続けて「旧パス」が別フィールドで来る。両方が
-        // 触られたファイルなので両方を数える (旧パスは削除として衝突しうる)。
-        let renamed = b[..2].iter().any(|c| *c == b'R' || *c == b'C');
-        if renamed {
-            if let Some(orig) = it.next().filter(|s| !s.is_empty()) {
-                paths.push(PathBuf::from(orig));
-            }
-        }
-        out.push(StatusEntry { xy, paths });
-    }
-    out
-}
-
-/// `git diff --name-only -z` (NUL 区切り) の出力をパスの列にする。
-pub fn parse_name_only_z(raw: &str) -> Vec<PathBuf> {
-    raw.split('\0')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect()
-}
-
-/// 触ったファイルの重なり。添字は [`Race::racers`] の添字。
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
-pub struct OverlapReport {
-    /// 2 体以上が触っているファイル → 触っている racer の添字 (昇順)。
-    /// 1 体しか触っていないファイルは載らない (= 安全なので見せる必要がない)。
-    pub contended: BTreeMap<PathBuf, Vec<usize>>,
-    /// 重なりのある組 `(小さい添字, 大きい添字, 重なったファイル)`。添字順・パス順。
-    pub pairs: Vec<(usize, usize, Vec<PathBuf>)>,
-}
-
-impl OverlapReport {
-    /// 誰ともぶつかっていないか。
-    pub fn is_clean(&self) -> bool {
-        self.contended.is_empty()
-    }
-
-    /// 2 体以上で競合しているファイルの本数。
-    pub fn contended_count(&self) -> usize {
-        self.contended.len()
-    }
-
-    /// `idx` の相手と、その相手と重なったファイル (相手の添字順)。
-    pub fn for_racer(&self, idx: usize) -> Vec<(usize, Vec<PathBuf>)> {
-        self.pairs
-            .iter()
-            .filter_map(|(a, b, files)| match (*a == idx, *b == idx) {
-                (true, _) => Some((*b, files.clone())),
-                (_, true) => Some((*a, files.clone())),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// `idx` が誰かと取り合っているファイルの合併 (昇順・重複なし)。
-    pub fn files_for(&self, idx: usize) -> Vec<PathBuf> {
-        self.contended
-            .iter()
-            .filter(|(_, who)| who.contains(&idx))
-            .map(|(p, _)| p.clone())
-            .collect()
-    }
-}
-
-/// racer ごとの「触ったファイル集合」から衝突を畳む。
-///
-/// 入力は `(racer 添字, 集合)` の列で、破棄済みなど対象外の racer は
-/// 呼び出し側で落としておく。同じ添字が 2 度来ることは想定しない。
-pub fn compute_overlaps(sets: &[(usize, HashSet<PathBuf>)]) -> OverlapReport {
-    // ファイル → 触った racer。BTreeMap なので出力順は常にパス昇順で決定的。
-    let mut by_file: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-    for (idx, files) in sets {
-        for f in files {
-            by_file.entry(f.clone()).or_default().push(*idx);
-        }
-    }
-    let mut contended: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-    // 組 → 取り合っているファイル。contended から作るので両者は必ず整合する。
-    let mut pair_files: BTreeMap<(usize, usize), Vec<PathBuf>> = BTreeMap::new();
-    for (file, who) in by_file {
-        if who.len() < 2 {
-            continue;
-        }
-        let mut who = who;
-        who.sort_unstable();
-        who.dedup();
-        if who.len() < 2 {
-            continue;
-        }
-        for (i, a) in who.iter().enumerate() {
-            for b in &who[i + 1..] {
-                pair_files.entry((*a, *b)).or_default().push(file.clone());
-            }
-        }
-        contended.insert(file, who);
-    }
-    let pairs = pair_files
-        .into_iter()
-        .map(|((a, b), files)| (a, b, files))
-        .collect();
-    OverlapReport { contended, pairs }
-}
+// 触ったファイルの重なりを畳む部分は [`crate::worktree`] が持つ。
+// レースも通常運用の Cockpit も**同じ 1 実装**を通る (添字は
+// [`Race::racers`] の添字として使う)。
+pub use crate::worktree::{compute_overlaps, OverlapReport};
 
 /// [採用] を押したときの判断。**塞がずに知らせる**のが方針で、`NeedsConfirm` は
 /// 「1 度目のクリックは警告に使う」という意味 (破棄の 2 段確認と同じ流儀)。
@@ -549,28 +386,7 @@ pub struct Race {
 /// `git -C <repo> <args...>` を窓なしで実行する。出力文言の判定があるので
 /// LC_ALL=C で英語に固定する (procx が PATH も面倒を見る)。
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let out = crate::procx::hidden_command("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|e| trf("git を起動できません: {e}", &[("e", e.to_string())]))?;
-    let stdout = crate::textenc::decode_output(&out.stdout);
-    if out.status.success() {
-        Ok(stdout.trim_end().to_string())
-    } else {
-        let stderr = crate::textenc::decode_output(&out.stderr);
-        let msg = if stderr.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            stderr.trim().to_string()
-        };
-        Err(format!(
-            "git {}: {msg}",
-            args.first().copied().unwrap_or_default()
-        ))
-    }
+    crate::worktree::git_out(repo, args)
 }
 
 /// レースを開始する: リポジトリ検証 → 汚れチェック → racer ごとの worktree 作成。
@@ -690,12 +506,12 @@ pub fn start_race(root: &Path, prompt: &str, presets: &[(String, String)]) -> Re
 fn collect_scan(dir: &Path, base_commit: &str) -> Result<(DiffStat, HashSet<PathBuf>), String> {
     let short = run_git(dir, &["diff", "--shortstat", base_commit])?;
     let mut st = parse_shortstat(&short);
-    let entries = parse_status_z(&run_git(dir, &["status", "--porcelain=v1", "-z"])?);
-    st.untracked = entries.iter().filter(|e| e.is_untracked()).count();
-    let mut touched: HashSet<PathBuf> = entries.into_iter().flat_map(|e| e.paths).collect();
-    let range = format!("{base_commit}...HEAD");
-    let committed = run_git(dir, &["diff", "--name-only", "-z", &range])?;
-    touched.extend(parse_name_only_z(&committed));
+    st.untracked = crate::worktree::status_entries(dir)?
+        .iter()
+        .filter(|e| e.is_untracked())
+        .count();
+    // 未コミット + 未追跡 + コミット済み (`<base>...HEAD`) の合併。
+    let touched = crate::worktree::scan_touched(dir, Some(base_commit))?;
     Ok((st, touched))
 }
 
@@ -1515,6 +1331,7 @@ pub fn race_diff_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::{parse_name_only_z, parse_status_z, SLUG_MAX};
 
     // ── スラグ / ブランチ名 ────────────────────────────────────────
 
