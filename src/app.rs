@@ -2105,6 +2105,18 @@ struct TasksCache {
     doc: tasks::TasksDoc,
 }
 
+/// キーバインド編集 UI の状態。
+///
+/// **記録中かどうかは 1 か所 (`recording`) だけが持つ。** bool を複数持つと
+/// 「記録中なのに通常のショートカットも走る」が構造的に起こり得るため。
+#[derive(Default)]
+struct KeybindUi {
+    /// 絞り込みの検索語 (あいまい検索は `fuzzy` を使う)
+    query: String,
+    /// 打鍵の記録中の行。`Some` の間は通常のショートカット消費を止める。
+    recording: Option<crate::keybinds::Recorder>,
+}
+
 pub struct ZaivernApp {
     cfg: Config,
     theme: Theme,
@@ -2230,8 +2242,12 @@ pub struct ZaivernApp {
     goto_input: String,
     /// 問題 (LSP 診断) パネル (VS Code: ⇧⌘M)
     problems_open: bool,
-    /// キーボードショートカット一覧 / バージョン情報ダイアログ
+    /// キーバインド編集 UI (⌘K ⌘S) / バージョン情報ダイアログ
     shortcuts_open: bool,
+    /// キーバインド編集 UI の状態 (検索語・記録中の行)。
+    keybind_ui: KeybindUi,
+    /// chord (2 打鍵) の待機。フレームを跨ぐので `App` が持つ。
+    chord: crate::keybinds::ChordState,
     about_open: bool,
     /// ライセンス (Pro) の状態ダイアログを開いているか。
     license_open: bool,
@@ -2930,6 +2946,8 @@ impl ZaivernApp {
             goto_input: String::new(),
             problems_open: false,
             shortcuts_open: false,
+            keybind_ui: KeybindUi::default(),
+            chord: crate::keybinds::ChordState::default(),
             about_open: false,
             // 起動時に 1 回だけローカルのキーを読んで検証する (通信なし)。
             license_open: false,
@@ -9798,7 +9816,7 @@ impl ZaivernApp {
     /// という二重の嘘になる。`keybinds::画面のショートカット表記をベタ書きしていない`
     /// が番人。
     fn key_hint(&self, a: BindAction) -> String {
-        crate::keybinds::format_shortcut(self.keys.get(a))
+        self.keys.label(a)
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -9807,68 +9825,97 @@ impl ZaivernApp {
         // ⌘⇧C / ⌘⇧V の **押下イベントごと** 捨てて Copy/Paste にすり替えるため、
         // 素のままだと「画面には ⌘⇧C と出ているのに効かない」になる
         // (詳細は `keybinds::clipboard_alias`)。
-        let consume = |ctx: &egui::Context, sc: KeyboardShortcut| -> bool {
+        let consume_sc = |ctx: &egui::Context, sc: KeyboardShortcut| -> bool {
             ctx.input_mut(|i| crate::keybinds::consume_shortcut_compat(i, sc))
+        };
+        // キーバインドの記録中は、打鍵をここで **最初に** 取り込んでから戻る。
+        // 通常の消費より前に置くのが要点 — 記録しようとした ⌘S でファイルが
+        // 保存されたり、エディタへ文字が入ったりしたら意味がない。
+        if self.keybind_record_tick(ctx) {
+            return;
+        }
+        // chord の待機は毎フレームここで進める。時間切れ / Esc で捨てる。
+        // self から取り出して回し、消費し終えたら戻す (self の借用を跨がせない)。
+        let mut chord = std::mem::take(&mut self.chord);
+        let tick = ctx.input_mut(|i| chord.begin_frame(i));
+        if chord.is_waiting() {
+            // 待機中だけ再描画を予約する (時間切れを画面へ反映するため)。
+            // 待っていないフレームでは 1 回も呼ばない = アイドルのコストは 0。
+            let left = chord.remaining(ctx.input(|i| i.time));
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left.min(0.1)));
+        } else if matches!(
+            tick,
+            crate::keybinds::ChordTick::TimedOut | crate::keybinds::ChordTick::Cancelled
+        ) {
+            ctx.request_repaint();
+        }
+        let mut consume = |ctx: &egui::Context, b: crate::keybinds::Binding| -> bool {
+            ctx.input_mut(|i| crate::keybinds::consume_binding(i, b, &mut chord))
         };
         let mut cmds: Vec<Cmd> = Vec::new();
         let mut ops: Vec<EditOp> = Vec::new();
 
         // 修飾キーの多いものを先に消費する
-        if consume(ctx, self.keys.get(BindAction::PaletteCommands)) {
+        if consume(ctx, self.keys.binding(BindAction::PaletteCommands)) {
             self.palette.open_commands();
         }
-        if consume(ctx, self.keys.get(BindAction::PaletteFiles)) {
+        if consume(ctx, self.keys.binding(BindAction::PaletteFiles)) {
             self.palette.open_files();
         }
-        if consume(ctx, self.keys.get(BindAction::SaveAll)) {
+        // ⌘K ⌘S (2 打鍵)。prefix の ⌘K を握っている間は他のバインドが
+        // 素通ししない — `keybinds::consume_binding` がそこを見ている。
+        if consume(ctx, self.keys.binding(BindAction::KeybindEditor)) {
+            cmds.push(Cmd::ShowShortcuts);
+        }
+        if consume(ctx, self.keys.binding(BindAction::SaveAll)) {
             cmds.push(Cmd::SaveAll);
         }
-        if consume(ctx, self.keys.get(BindAction::SaveAs)) {
+        if consume(ctx, self.keys.binding(BindAction::SaveAs)) {
             cmds.push(Cmd::SaveAs);
         }
-        if consume(ctx, self.keys.get(BindAction::Save)) {
+        if consume(ctx, self.keys.binding(BindAction::Save)) {
             cmds.push(Cmd::Save);
         }
-        if consume(ctx, self.keys.get(BindAction::OpenFile)) {
+        if consume(ctx, self.keys.binding(BindAction::OpenFile)) {
             cmds.push(Cmd::OpenFileDialog);
         }
         // ⇧⌘F (横断検索) / ⌥⌘F (置換) は ⌘F (検索) より修飾キーが多いので先に
         // エディタの分割 (⌘\ / ⌥⌘\ / ⌘1-3)。修飾の多いものを先に消費する。
-        if consume(ctx, self.keys.get(BindAction::SplitEditorDown)) {
+        if consume(ctx, self.keys.binding(BindAction::SplitEditorDown)) {
             cmds.push(Cmd::SplitEditorDown);
         }
-        if consume(ctx, self.keys.get(BindAction::SplitEditorRight)) {
+        if consume(ctx, self.keys.binding(BindAction::SplitEditorRight)) {
             cmds.push(Cmd::SplitEditorRight);
         }
-        // ここはループで畳まない。畳むと `consume(ctx, self.keys.get(BindAction::X))`
+        // ここはループで畳まない。畳むと `consume(ctx, self.keys.binding(BindAction::X))`
         // という一様な形が崩れ、`keybinds::tests::全アクションが消費地点に
         // 繋がっている` が「押せない」と誤検出する (実際に 3 OS で落ちた)。
         // 番人を緩めるより、消費地点を 1 アクション 1 行に揃える方を選ぶ。
-        if consume(ctx, self.keys.get(BindAction::FocusPane1)) {
+        if consume(ctx, self.keys.binding(BindAction::FocusPane1)) {
             cmds.push(Cmd::FocusEditorPane(1));
         }
-        if consume(ctx, self.keys.get(BindAction::FocusPane2)) {
+        if consume(ctx, self.keys.binding(BindAction::FocusPane2)) {
             cmds.push(Cmd::FocusEditorPane(2));
         }
-        if consume(ctx, self.keys.get(BindAction::FocusPane3)) {
+        if consume(ctx, self.keys.binding(BindAction::FocusPane3)) {
             cmds.push(Cmd::FocusEditorPane(3));
         }
-        if consume(ctx, self.keys.get(BindAction::GlobalSearch)) {
+        if consume(ctx, self.keys.binding(BindAction::GlobalSearch)) {
             cmds.push(Cmd::GlobalSearch);
         }
-        if consume(ctx, self.keys.get(BindAction::GlobalReplace)) {
+        if consume(ctx, self.keys.binding(BindAction::GlobalReplace)) {
             cmds.push(Cmd::GlobalReplace);
         }
-        if consume(ctx, self.keys.get(BindAction::OpenReplace)) {
+        if consume(ctx, self.keys.binding(BindAction::OpenReplace)) {
             cmds.push(Cmd::OpenReplace);
         }
-        if consume(ctx, self.keys.get(BindAction::NewTerminal)) {
+        if consume(ctx, self.keys.binding(BindAction::NewTerminal)) {
             cmds.push(Cmd::NewTerminal);
         }
-        if consume(ctx, self.keys.get(BindAction::NextTab)) {
+        if consume(ctx, self.keys.binding(BindAction::NextTab)) {
             cmds.push(Cmd::NextTab);
         }
-        if consume(ctx, self.keys.get(BindAction::PrevTab)) {
+        if consume(ctx, self.keys.binding(BindAction::PrevTab)) {
             cmds.push(Cmd::PrevTab);
         }
         // ファイル単位ズーム (⌥⌘+ / Ctrl+Alt+Shift++ …) は「戻る/進む」より先。
@@ -9877,101 +9924,101 @@ impl ZaivernApp {
         // 少ない方 (戻る・画面全体ズーム) に吸われる。
         // ⌥⌘= の別名も足す: macOS の ⌥= は「≠」を打つ組み合わせで論理キーが
         // 取れず、winit が物理キー (Equal) へフォールバックするため。
-        if consume(ctx, self.keys.get(BindAction::FileZoomIn))
-            || consume(
+        if consume(ctx, self.keys.binding(BindAction::FileZoomIn))
+            || consume_sc(
                 ctx,
                 KeyboardShortcut::new(self.keys.get(BindAction::FileZoomIn).modifiers, Key::Equals),
             )
         {
             cmds.push(Cmd::FileZoomIn);
         }
-        if consume(ctx, self.keys.get(BindAction::FileZoomOut)) {
+        if consume(ctx, self.keys.binding(BindAction::FileZoomOut)) {
             cmds.push(Cmd::FileZoomOut);
         }
-        if consume(ctx, self.keys.get(BindAction::FileZoomReset)) {
+        if consume(ctx, self.keys.binding(BindAction::FileZoomReset)) {
             cmds.push(Cmd::FileZoomReset);
         }
-        if consume(ctx, self.keys.get(BindAction::NavForward)) {
+        if consume(ctx, self.keys.binding(BindAction::NavForward)) {
             cmds.push(Cmd::NavForward);
         }
-        if consume(ctx, self.keys.get(BindAction::NavBack)) {
+        if consume(ctx, self.keys.binding(BindAction::NavBack)) {
             cmds.push(Cmd::NavBack);
         }
-        if consume(ctx, self.keys.get(BindAction::RunBuildTask)) {
+        if consume(ctx, self.keys.binding(BindAction::RunBuildTask)) {
             cmds.push(Cmd::RunBuildTask);
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleProblems)) {
+        if consume(ctx, self.keys.binding(BindAction::ToggleProblems)) {
             cmds.push(Cmd::ToggleProblems);
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleFullScreen)) {
+        if consume(ctx, self.keys.binding(BindAction::ToggleFullScreen)) {
             cmds.push(Cmd::ToggleFullScreen);
         }
         // ── 第 2 次配線 ──────────────────────────────────────────
         // ⇧⌘T は ⌘T を持っていないので順序の縛りはない。
-        if consume(ctx, self.keys.get(BindAction::ReopenClosedTab)) {
+        if consume(ctx, self.keys.binding(BindAction::ReopenClosedTab)) {
             cmds.push(Cmd::ReopenClosedTab);
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleFold)) {
+        if consume(ctx, self.keys.binding(BindAction::ToggleFold)) {
             cmds.push(Cmd::ToggleFold);
         }
-        if consume(ctx, self.keys.get(BindAction::UnfoldAll)) {
+        if consume(ctx, self.keys.binding(BindAction::UnfoldAll)) {
             cmds.push(Cmd::UnfoldAll);
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleBookmark)) {
+        if consume(ctx, self.keys.binding(BindAction::ToggleBookmark)) {
             cmds.push(Cmd::ToggleBookmark);
         }
-        if consume(ctx, self.keys.get(BindAction::LspReferences)) {
+        if consume(ctx, self.keys.binding(BindAction::LspReferences)) {
             cmds.push(Cmd::LspReferences);
         }
-        if consume(ctx, self.keys.get(BindAction::LspSymbols)) {
+        if consume(ctx, self.keys.binding(BindAction::LspSymbols)) {
             cmds.push(Cmd::LspSymbols);
         }
-        if consume(ctx, self.keys.get(BindAction::LspRename)) {
+        if consume(ctx, self.keys.binding(BindAction::LspRename)) {
             cmds.push(Cmd::LspRename);
         }
-        if consume(ctx, self.keys.get(BindAction::LspFormat)) {
+        if consume(ctx, self.keys.binding(BindAction::LspFormat)) {
             cmds.push(Cmd::LspFormat);
         }
-        if consume(ctx, self.keys.get(BindAction::LspCodeAction)) {
+        if consume(ctx, self.keys.binding(BindAction::LspCodeAction)) {
             cmds.push(Cmd::LspCodeAction);
         }
-        if consume(ctx, self.keys.get(BindAction::LspSignatureHelp)) {
+        if consume(ctx, self.keys.binding(BindAction::LspSignatureHelp)) {
             cmds.push(Cmd::LspSignatureHelp);
         }
         // ⌘D: 次の出現を選択 (⇧⌘D の行複製より修飾キーが少ないので後に見る)
-        if consume(ctx, self.keys.get(BindAction::SelectNextOccurrence)) {
+        if consume(ctx, self.keys.binding(BindAction::SelectNextOccurrence)) {
             cmds.push(Cmd::SelectNextOccurrence);
         }
         // 差分の変更ジャンプ。⇧F7 を F7 より先に見る (修飾キーが多い方が先)。
-        if consume(ctx, self.keys.get(BindAction::DiffPrevChange)) {
+        if consume(ctx, self.keys.binding(BindAction::DiffPrevChange)) {
             cmds.push(Cmd::DiffPrevChange);
         }
-        if consume(ctx, self.keys.get(BindAction::DiffNextChange)) {
+        if consume(ctx, self.keys.binding(BindAction::DiffNextChange)) {
             cmds.push(Cmd::DiffNextChange);
         }
-        if consume(ctx, self.keys.get(BindAction::CloseTab)) {
+        if consume(ctx, self.keys.binding(BindAction::CloseTab)) {
             cmds.push(Cmd::CloseTab);
         }
         // ⇧⌘N (新しいウィンドウ) は ⌘N (新規ファイル) より修飾キーが多いので先に
-        if consume(ctx, self.keys.get(BindAction::NewWindow)) {
+        if consume(ctx, self.keys.binding(BindAction::NewWindow)) {
             cmds.push(Cmd::NewWindow);
         }
-        if consume(ctx, self.keys.get(BindAction::NewFile)) {
+        if consume(ctx, self.keys.binding(BindAction::NewFile)) {
             cmds.push(Cmd::NewFile);
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleTerminal))
-            || consume(
+        if consume(ctx, self.keys.binding(BindAction::ToggleTerminal))
+            || consume_sc(
                 ctx,
                 KeyboardShortcut::new(Modifiers::COMMAND, Key::Backtick),
             )
         {
             cmds.push(Cmd::ToggleTerminal);
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleSidebar)) {
+        if consume(ctx, self.keys.binding(BindAction::ToggleSidebar)) {
             cmds.push(Cmd::ToggleSidebar);
         }
         // VS Code: ⌘⇧E / Ctrl+Shift+E = エクスプローラーを表示してフォーカス
-        if consume(ctx, self.keys.get(BindAction::FocusExplorer)) {
+        if consume(ctx, self.keys.binding(BindAction::FocusExplorer)) {
             self.sidebar_open = true;
             self.sidebar_tab = SidebarTab::Files;
             // エディタ等が持つキーボードフォーカスを外し、ツリーへ渡す
@@ -9982,7 +10029,7 @@ impl ZaivernApp {
             });
             self.tree.focus();
         }
-        if consume(ctx, self.keys.get(BindAction::Find)) {
+        if consume(ctx, self.keys.binding(BindAction::Find)) {
             // 端末フォーカス中の Cmd+F は端末内検索 (前フレームで terminal::draw が
             // 残したフォーカス中セッションIDで振り分ける)。それ以外はエディタ検索。
             let term_sid: Option<u64> =
@@ -9998,19 +10045,19 @@ impl ZaivernApp {
                 cmds.push(Cmd::OpenFind);
             }
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleCockpit)) {
+        if consume(ctx, self.keys.binding(BindAction::ToggleCockpit)) {
             cmds.push(Cmd::ToggleCockpit);
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleKanban)) {
+        if consume(ctx, self.keys.binding(BindAction::ToggleKanban)) {
             cmds.push(Cmd::ToggleKanban);
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleDeck)) {
+        if consume(ctx, self.keys.binding(BindAction::ToggleDeck)) {
             cmds.push(Cmd::ToggleDeck);
         }
-        if consume(ctx, self.keys.get(BindAction::ToggleMdPreview)) {
+        if consume(ctx, self.keys.binding(BindAction::ToggleMdPreview)) {
             cmds.push(Cmd::ToggleMdPreview);
         }
-        if consume(ctx, self.keys.get(BindAction::NewAgent)) {
+        if consume(ctx, self.keys.binding(BindAction::NewAgent)) {
             cmds.push(Cmd::NewAgent(DEFAULT_PRESET_IX));
         }
         // ズーム: 画面全体 (⌘+ / ⌘- / ⌘0) とファイル単位 (⌥ を足したもの)。
@@ -10026,24 +10073,24 @@ impl ZaivernApp {
         // ファイル単位 (⌘⌥+ / ⌘⌥- / ⌘⌥0) は上でもう消費済み — ⌥ 付きを
         // 先に取らないと、少ない方 (画面全体) へ吸われるため。
         // `=` の別名も割り当てから作る (再割り当てしても別名がついてくる)。
-        if consume(ctx, self.keys.get(BindAction::ZoomIn))
-            || consume(
+        if consume(ctx, self.keys.binding(BindAction::ZoomIn))
+            || consume_sc(
                 ctx,
                 KeyboardShortcut::new(self.keys.get(BindAction::ZoomIn).modifiers, Key::Equals),
             )
         {
             cmds.push(Cmd::ZoomIn);
         }
-        if consume(ctx, self.keys.get(BindAction::ZoomOut)) {
+        if consume(ctx, self.keys.binding(BindAction::ZoomOut)) {
             cmds.push(Cmd::ZoomOut);
         }
-        if consume(ctx, self.keys.get(BindAction::ZoomReset)) {
+        if consume(ctx, self.keys.binding(BindAction::ZoomReset)) {
             cmds.push(Cmd::ZoomReset);
         }
 
         // プラグインコマンドの keybind (plugin.toml の keybind = "cmd+alt+u" など)
         for (sc, pi, ci) in self.plugin_keys.clone() {
-            if consume(ctx, sc) {
+            if consume_sc(ctx, sc) {
                 cmds.push(Cmd::RunPlugin(pi, ci));
             }
         }
@@ -10062,25 +10109,25 @@ impl ZaivernApp {
         if editor_focused {
             // ⌃G (行移動)・F12 (定義)・⇧⌘\ (括弧) はエディタにフォーカスが
             // あるときだけ奪う (ターミナルの ⌃G = BEL 等と衝突させない)
-            if consume(ctx, self.keys.get(BindAction::GoToLine)) {
+            if consume(ctx, self.keys.binding(BindAction::GoToLine)) {
                 cmds.push(Cmd::GoToLine);
             }
-            if consume(ctx, self.keys.get(BindAction::GoToDefinition)) {
+            if consume(ctx, self.keys.binding(BindAction::GoToDefinition)) {
                 cmds.push(Cmd::GoToDefinition);
             }
-            if consume(ctx, self.keys.get(BindAction::GoToBracket)) {
+            if consume(ctx, self.keys.binding(BindAction::GoToBracket)) {
                 cmds.push(Cmd::GoToBracket);
             }
-            if consume(ctx, self.keys.get(BindAction::ToggleComment)) {
+            if consume(ctx, self.keys.binding(BindAction::ToggleComment)) {
                 ops.push(EditOp::ToggleComment);
             }
-            if consume(ctx, self.keys.get(BindAction::DuplicateLine)) {
+            if consume(ctx, self.keys.binding(BindAction::DuplicateLine)) {
                 ops.push(EditOp::Duplicate);
             }
-            if consume(ctx, self.keys.get(BindAction::MoveLineUp)) {
+            if consume(ctx, self.keys.binding(BindAction::MoveLineUp)) {
                 ops.push(EditOp::Move(true));
             }
-            if consume(ctx, self.keys.get(BindAction::MoveLineDown)) {
+            if consume(ctx, self.keys.binding(BindAction::MoveLineDown)) {
                 ops.push(EditOp::Move(false));
             }
             // PageUp / PageDown: VS Code 同様に 1 画面ぶんカーソル移動+スクロール
@@ -10116,6 +10163,9 @@ impl ZaivernApp {
         {
             cmds.push(Cmd::ToggleFullScreen);
         }
+
+        // 消費が終わったので chord の待機状態を self へ戻す (フレームを跨ぐ持ち物)。
+        self.chord = chord;
 
         for c in cmds {
             self.apply_cmd(c, ctx);
@@ -11070,6 +11120,15 @@ impl ZaivernApp {
         let ui_zoom = self.cfg.ui_zoom;
         let file_zoom = self.file_zoom();
         let mut zoom_cmd: Option<Cmd> = None;
+        // chord (2 打鍵) の 1 打鍵目を握っている間の案内。
+        // 何も出さないと「固まった」ように見えるので、VS Code と同じく必ず出す。
+        // 待機していないフレームでは 1 ピクセルも出さない。
+        let chord_hint = self.chord.pending().map(|sc| {
+            trf(
+                "{keys} が押されました。待機中…",
+                &[("keys", crate::keybinds::format_shortcut(sc))],
+            )
+        });
 
         let bar = egui::TopBottomPanel::bottom("zv-status")
             .exact_height(26.0)
@@ -11101,6 +11160,16 @@ impl ZaivernApp {
                             ))
                             .size(11.5)
                             .color(theme.ok),
+                        );
+                    }
+
+                    // chord の待機中だけ出る案内 (⌘K を握っている間)
+                    if let Some(hint) = &chord_hint {
+                        ui.label(
+                            RichText::new(format!("⌨ {hint}"))
+                                .size(11.5)
+                                .color(theme.warn)
+                                .strong(),
                         );
                     }
 
@@ -17732,7 +17801,7 @@ impl ZaivernApp {
     fn palette_builtin_cmds(&self) -> Vec<(String, String, String, Cmd)> {
         // 実際に効いているキーバインドをそのまま出す (config で上書きされていても
         // パレットの表示とズレない)
-        let fmt_key = |a: BindAction| crate::keybinds::format_shortcut(self.keys.get(a));
+        let fmt_key = |a: BindAction| self.keys.label(a);
         let mut rows: Vec<(String, String, String, Cmd)> = vec![
             (
                 "💾".into(),
@@ -18354,8 +18423,8 @@ impl ZaivernApp {
             ),
             (
                 "⌨".into(),
-                tr("キーボード ショートカットのリファレンス"),
-                String::new(),
+                tr("キーボード ショートカットの設定"),
+                fmt_key(BindAction::KeybindEditor),
                 Cmd::ShowShortcuts,
             ),
             (
@@ -24119,43 +24188,288 @@ impl ZaivernApp {
         }
     }
 
+    /// キーバインド編集 UI (VS Code の ⌘K ⌘S 相当)。
+    ///
+    /// 読み取り専用の一覧ではなく **その場で再割り当てできる表**。
+    /// 変更は `[keybindings]` 区画だけを書き換えて config.toml へ残すので、
+    /// 手書きの設定とコメントは 1 行も消えない。
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
         if !self.shortcuts_open {
             return;
         }
         let theme = self.theme.clone();
         let mut open = self.shortcuts_open;
-        let rows: Vec<(String, String)> = shortcut_reference(&self.keys);
+        let rows = keybind_rows(&self.keys, &self.keybind_ui.query);
+        // 注記の列を出すかは表全体で 1 回だけ決める (行ごとに変えると列がぶれる)
+        let notes: Vec<Option<String>> =
+            rows.iter().map(|a| conflict_note(&self.keys, *a)).collect();
+        let has_note = notes.iter().any(|n| n.is_some());
+        let recording = self.keybind_ui.recording.as_ref().map(|r| r.action);
+        let record_hint = self
+            .keybind_ui
+            .recording
+            .as_ref()
+            .and_then(|r| r.preview())
+            .map(crate::keybinds::format_binding);
+        let mut query = std::mem::take(&mut self.keybind_ui.query);
+        let mut start_record: Option<BindAction> = None;
+        let mut reset_one: Option<BindAction> = None;
+        let mut reset_all = false;
+
         egui::Window::new(tr("⌨ キーボード ショートカット"))
             .open(&mut open)
-            .default_size([460.0, 420.0])
+            .default_size([620.0, 460.0])
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(tr("検索")).size(11.5).color(theme.text_dim));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text(tr("アクション名 / 打鍵で絞り込み"))
+                            .desired_width(200.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(tr("すべて既定へ戻す"))
+                            .on_hover_text(tr("全アクションの割り当てを出荷時へ戻します"))
+                            .clicked()
+                        {
+                            reset_all = true;
+                        }
+                    });
+                });
                 ui.label(
                     RichText::new(tr(
-                        "config.toml の [keybindings] で上書きできます (action名 = \"cmd+shift+p\")",
+                        "行の「記録」を押すと次の打鍵を取り込みます。2 打鍵 (chord) は続けて押してください。中止は Esc。",
                     ))
-                    .size(11.5)
+                    .size(11.0)
                     .color(theme.text_dim),
                 );
                 ui.separator();
+                if rows.is_empty() {
+                    // 空状態は利用可能領域の中央に 1 枚だけ出す
+                    ui.allocate_ui_with_layout(
+                        ui.available_size(),
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                        |ui| {
+                            ui.label(
+                                RichText::new(tr("一致するアクションがありません"))
+                                    .color(theme.text_dim),
+                            );
+                        },
+                    );
+                    return;
+                }
                 egui::ScrollArea::vertical()
-                    .id_salt("zv-shortcuts")
+                    .id_salt("zv-keybind-rows")
                     .auto_shrink(false)
                     .show(ui, |ui| {
-                        egui::Grid::new("zv-shortcut-grid")
-                            .num_columns(2)
-                            .striped(true)
-                            .spacing([28.0, 5.0])
-                            .show(ui, |ui| {
-                                for (label, key) in &rows {
-                                    ui.label(label);
-                                    ui.label(RichText::new(key).monospace());
-                                    ui.end_row();
+                        let avail = ui.available_width();
+                        let cols = crate::keybinds::keybind_columns(avail, has_note);
+                        let row_h = ui.spacing().interact_size.y;
+                        for (a, note) in rows.iter().zip(notes.iter()) {
+                            let a = *a;
+                            let is_rec = recording == Some(a);
+                            ui.horizontal(|ui| {
+                                // 行の実幅は列の合計で決める (可用幅を超えない)
+                                ui.set_max_width(cols.total_w().min(avail));
+                                ui.spacing_mut().item_spacing.x = crate::keybinds::KEYBIND_COL_GAP;
+                                let label = tr(crate::keybinds::action_label(a));
+                                keybind_col(ui, cols.label_w, row_h, |ui| {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&label).size(12.0))
+                                            .truncate(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{label}  ({})",
+                                        crate::keybinds::config_name(a)
+                                    ));
+                                });
+                                let keys_txt = if is_rec {
+                                    record_hint
+                                        .clone()
+                                        .map(|k| format!("{k} …"))
+                                        .unwrap_or_else(|| tr("打鍵を待っています…"))
+                                } else {
+                                    self.keys.label(a)
+                                };
+                                let keys_col = if is_rec { theme.warn } else { theme.text };
+                                keybind_col(ui, cols.keys_w, row_h, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&keys_txt)
+                                                .monospace()
+                                                .size(12.0)
+                                                .color(keys_col),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&keys_txt);
+                                });
+                                if cols.note_w > 0.0 {
+                                    let txt = note.clone().unwrap_or_default();
+                                    keybind_col(ui, cols.note_w, row_h, |ui| {
+                                        if !txt.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&txt)
+                                                        .size(11.0)
+                                                        .color(theme.warn),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(&txt);
+                                        }
+                                    });
+                                }
+                                if cols.buttons_w > 0.0 {
+                                    keybind_col(ui, cols.buttons_w, row_h, |ui| {
+                                        let rec_label = if cols.icon_only {
+                                            "⌨".to_string()
+                                        } else {
+                                            tr("記録")
+                                        };
+                                        if ui
+                                            .button(RichText::new(rec_label).size(11.5))
+                                            .on_hover_text(tr("次に押した打鍵を割り当てます"))
+                                            .clicked()
+                                        {
+                                            start_record = Some(a);
+                                        }
+                                        let is_def = self.keys.is_default(a);
+                                        let def_label = if cols.icon_only {
+                                            "↺".to_string()
+                                        } else {
+                                            tr("既定")
+                                        };
+                                        if ui
+                                            .add_enabled(
+                                                !is_def,
+                                                egui::Button::new(
+                                                    RichText::new(def_label).size(11.5),
+                                                ),
+                                            )
+                                            .on_hover_text(tr("この行を既定へ戻します"))
+                                            .clicked()
+                                        {
+                                            reset_one = Some(a);
+                                        }
+                                    });
                                 }
                             });
+                            // 注記の列を畳んだ幅でも、警告そのものは失わない
+                            if cols.note_w <= 0.0 {
+                                if let Some(txt) = note {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(txt).size(10.5).color(theme.warn),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(txt);
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(tr("以下は入力欄に組み込みで、変更できません"))
+                                .size(11.0)
+                                .color(theme.text_dim),
+                        );
+                        for (label, keys) in builtin_shortcuts() {
+                            ui.horizontal(|ui| {
+                                ui.set_max_width(cols.total_w().min(avail));
+                                keybind_col(ui, cols.label_w, row_h, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&label)
+                                                .size(11.5)
+                                                .color(theme.text_dim),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                                keybind_col(ui, cols.keys_w, row_h, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&keys)
+                                                .monospace()
+                                                .size(11.5)
+                                                .color(theme.text_dim),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                            });
+                        }
                     });
             });
         self.shortcuts_open = open;
+        self.keybind_ui.query = query;
+        if let Some(a) = start_record {
+            self.keybind_ui.recording = Some(crate::keybinds::Recorder::new(a));
+            ctx.request_repaint();
+        }
+        if reset_all {
+            self.keys.reset_all();
+            self.persist_keybindings();
+        } else if let Some(a) = reset_one {
+            self.keys.reset(a);
+            self.persist_keybindings();
+        }
+    }
+
+    /// 記録モードの打鍵を取り込む。記録中なら `true` (呼び出し側は即戻る)。
+    ///
+    /// **`handle_shortcuts` の先頭から呼ぶこと。** 通常の消費やエディタより
+    /// 先に打鍵を取らないと、記録しようとした ⌘S でファイルが保存される。
+    /// 中止は Esc、1 打鍵目から [`crate::keybinds::CHORD_TIMEOUT`] だけ
+    /// 2 打鍵目を待ち、来なければ単打として確定する。
+    fn keybind_record_tick(&mut self, ctx: &egui::Context) -> bool {
+        let Some(mut rec) = self.keybind_ui.recording.take() else {
+            return false;
+        };
+        let now = ctx.input(|i| i.time);
+        let esc = ctx.input_mut(|i| {
+            crate::keybinds::consume_shortcut_compat(
+                i,
+                egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Escape),
+            )
+        });
+        if esc {
+            // 中止。記録は捨てて通常の消費へ戻す (このフレームは休む)
+            ctx.request_repaint();
+            return true;
+        }
+        let stroke = ctx.input_mut(crate::keybinds::record_stroke);
+        let done = match stroke {
+            Some(sc) => rec.push(sc, now),
+            None => rec.tick(now),
+        };
+        match done {
+            Some(b) => {
+                let a = rec.action;
+                self.keys.set(a, b);
+                self.persist_keybindings();
+                ctx.request_repaint();
+            }
+            None => {
+                // 2 打鍵目の締切まで画面を回す (待っている間だけ)
+                let left = rec.remaining(now).min(0.1);
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+                self.keybind_ui.recording = Some(rec);
+            }
+        }
+        true
+    }
+
+    /// キーバインドの変更を config.toml の `[keybindings]` 区画へ書き戻す。
+    /// **既定と同じ行は書かない** ので、既定を変えたときに古い値へ固定されない。
+    fn persist_keybindings(&mut self) {
+        let ov = self.keys.overrides();
+        self.cfg.keybindings = ov.clone();
+        if let Err(e) = config::save_keybindings(&ov) {
+            self.toast(e, false);
+        }
     }
 
     fn about_window(&mut self, ctx: &egui::Context) {
@@ -24407,191 +24721,80 @@ fn license_status_head(
     }
 }
 
-/// ショートカット一覧 (ダイアログ表示用)。実際のバインド (上書き込み) に追従する。
-fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
-    use crate::keybinds::format_shortcut;
-    let mut rows: Vec<(String, String)> = vec![
-        (
-            tr("コマンド パレット"),
-            format_shortcut(keys.get(BindAction::PaletteCommands)),
-        ),
-        (
-            tr("ファイルへ移動"),
-            format_shortcut(keys.get(BindAction::PaletteFiles)),
-        ),
-        (tr("保存"), format_shortcut(keys.get(BindAction::Save))),
-        (
-            tr("名前を付けて保存"),
-            format_shortcut(keys.get(BindAction::SaveAs)),
-        ),
-        (
-            tr("すべて保存"),
-            format_shortcut(keys.get(BindAction::SaveAll)),
-        ),
-        (
-            tr("新規ファイル"),
-            format_shortcut(keys.get(BindAction::NewFile)),
-        ),
-        (
-            tr("新しいウィンドウ"),
-            format_shortcut(keys.get(BindAction::NewWindow)),
-        ),
-        (
-            tr("ファイルを開く"),
-            format_shortcut(keys.get(BindAction::OpenFile)),
-        ),
-        (
-            tr("タブを閉じる"),
-            format_shortcut(keys.get(BindAction::CloseTab)),
-        ),
-        (
-            tr("エディタを右に分割"),
-            format_shortcut(keys.get(BindAction::SplitEditorRight)),
-        ),
-        (
-            tr("エディタを下に分割"),
-            format_shortcut(keys.get(BindAction::SplitEditorDown)),
-        ),
-        (
-            tr("1 番目のペインへ"),
-            format_shortcut(keys.get(BindAction::FocusPane1)),
-        ),
-        (
-            tr("2 番目のペインへ"),
-            format_shortcut(keys.get(BindAction::FocusPane2)),
-        ),
-        (
-            tr("3 番目のペインへ"),
-            format_shortcut(keys.get(BindAction::FocusPane3)),
-        ),
-        (tr("検索"), format_shortcut(keys.get(BindAction::Find))),
-        (
-            tr("置換"),
-            format_shortcut(keys.get(BindAction::OpenReplace)),
-        ),
-        (
-            tr("ファイル間で検索"),
-            format_shortcut(keys.get(BindAction::GlobalSearch)),
-        ),
-        (
-            tr("ファイル間で置換"),
-            format_shortcut(keys.get(BindAction::GlobalReplace)),
-        ),
-        (
-            tr("行コメントの切り替え"),
-            format_shortcut(keys.get(BindAction::ToggleComment)),
-        ),
-        (
-            tr("行を複製"),
-            format_shortcut(keys.get(BindAction::DuplicateLine)),
-        ),
-        (
-            tr("行を上へ移動"),
-            format_shortcut(keys.get(BindAction::MoveLineUp)),
-        ),
-        (
-            tr("行を下へ移動"),
-            format_shortcut(keys.get(BindAction::MoveLineDown)),
-        ),
-        (
-            tr("行/列へ移動"),
-            format_shortcut(keys.get(BindAction::GoToLine)),
-        ),
-        (
-            tr("定義へ移動"),
-            format_shortcut(keys.get(BindAction::GoToDefinition)),
-        ),
-        (
-            tr("ブラケットへ移動"),
-            format_shortcut(keys.get(BindAction::GoToBracket)),
-        ),
-        (tr("戻る"), format_shortcut(keys.get(BindAction::NavBack))),
-        (
-            tr("進む"),
-            format_shortcut(keys.get(BindAction::NavForward)),
-        ),
-        (
-            tr("次のエディター"),
-            format_shortcut(keys.get(BindAction::NextTab)),
-        ),
-        (
-            tr("前のエディター"),
-            format_shortcut(keys.get(BindAction::PrevTab)),
-        ),
-        (
-            tr("エクスプローラー"),
-            format_shortcut(keys.get(BindAction::FocusExplorer)),
-        ),
-        (
-            tr("サイドバー切替"),
-            format_shortcut(keys.get(BindAction::ToggleSidebar)),
-        ),
-        (
-            tr("ターミナル切替"),
-            format_shortcut(keys.get(BindAction::ToggleTerminal)),
-        ),
-        (
-            tr("新しいターミナル"),
-            format_shortcut(keys.get(BindAction::NewTerminal)),
-        ),
-        (
-            tr("Cockpit 切替"),
-            format_shortcut(keys.get(BindAction::ToggleCockpit)),
-        ),
-        (
-            tr("フリート看板 切替"),
-            format_shortcut(keys.get(BindAction::ToggleKanban)),
-        ),
-        (
-            tr("エージェントデッキ 切替"),
-            format_shortcut(keys.get(BindAction::ToggleDeck)),
-        ),
-        (
-            tr("Markdown プレビュー"),
-            format_shortcut(keys.get(BindAction::ToggleMdPreview)),
-        ),
-        (
-            tr("エージェント起動"),
-            format_shortcut(keys.get(BindAction::NewAgent)),
-        ),
-        (
-            tr("ビルド タスクの実行"),
-            format_shortcut(keys.get(BindAction::RunBuildTask)),
-        ),
-        (
-            tr("問題パネル"),
-            format_shortcut(keys.get(BindAction::ToggleProblems)),
-        ),
-        (
-            tr("フルスクリーン"),
-            format_shortcut(keys.get(BindAction::ToggleFullScreen)),
-        ),
-        (
-            tr("画面全体をズームイン"),
-            format_shortcut(keys.get(BindAction::ZoomIn)),
-        ),
-        (
-            tr("画面全体をズームアウト"),
-            format_shortcut(keys.get(BindAction::ZoomOut)),
-        ),
-        (
-            tr("画面全体のズームを戻す"),
-            format_shortcut(keys.get(BindAction::ZoomReset)),
-        ),
-        (
-            tr("このファイルだけズームイン"),
-            format_shortcut(keys.get(BindAction::FileZoomIn)),
-        ),
-        (
-            tr("このファイルだけズームアウト"),
-            format_shortcut(keys.get(BindAction::FileZoomOut)),
-        ),
-        (
-            tr("このファイルのズームを解除"),
-            format_shortcut(keys.get(BindAction::FileZoomReset)),
-        ),
-    ];
-    // egui TextEdit 内蔵 (バインド変更不可) のもの
+/// キーバインド編集 UI の 1 行ぶんの列を、決めた幅で描く。
+///
+/// **どの幅でも見切れない**ための唯一の入口。幅は
+/// [`crate::keybinds::keybind_columns`] が可用幅から決めた値をそのまま渡す。
+fn keybind_col(ui: &mut egui::Ui, w: f32, h: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(w.max(0.0), h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_width(w.max(0.0));
+            add(ui);
+        },
+    );
+}
+
+/// 編集 UI に並べるアクションを、検索語で絞って返す。
+///
+/// あいまい検索は既存の [`fuzzy`] をそのまま使う (新しいマッチャは書かない)。
+/// アクション名・config 名・現在の打鍵のどれに当たっても拾う。
+/// 検索語が空なら [`crate::keybinds::ALL_ACTIONS`] の並び順のまま。
+fn keybind_rows(keys: &Keybinds, query: &str) -> Vec<BindAction> {
+    let q = query.trim();
+    if q.is_empty() {
+        return crate::keybinds::ALL_ACTIONS.to_vec();
+    }
+    let prepared = fuzzy::PreparedQuery::new(q);
+    let mut scored: Vec<(i32, usize, BindAction)> = Vec::new();
+    for (i, a) in crate::keybinds::ALL_ACTIONS.iter().enumerate() {
+        let label = tr(crate::keybinds::action_label(*a));
+        let name = crate::keybinds::config_name(*a);
+        let keys_txt = keys.label(*a);
+        let best = [label.as_str(), name, keys_txt.as_str()]
+            .into_iter()
+            .filter_map(|t| prepared.score(t))
+            .max();
+        if let Some(sc) = best {
+            scored.push((sc, i, *a));
+        }
+    }
+    // 同点は元の並び順で安定させる (毎フレーム行が入れ替わらないように)
+    scored.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+    scored.into_iter().map(|(_, _, a)| a).collect()
+}
+
+/// この行に出す注記 (衝突 / OS 予約)。問題が無ければ None。
+///
+/// 「同じ打鍵が他のアクションにもある」「chord の prefix と単打がぶつかる」
+/// 「macOS が OS 側で握っている」を 1 本の文字列にまとめる。
+fn conflict_note(keys: &Keybinds, a: BindAction) -> Option<String> {
+    use crate::keybinds::Conflict;
+    let items = crate::keybinds::conflicts_for(keys, a, keys.binding(a));
+    if items.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = items
+        .iter()
+        .map(|c| match c {
+            Conflict::Duplicate(other) => trf(
+                "{action} と重複",
+                &[("action", tr(crate::keybinds::action_label(*other)))],
+            ),
+            Conflict::Prefix(other) => trf(
+                "{action} の 1 打鍵目と衝突",
+                &[("action", tr(crate::keybinds::action_label(*other)))],
+            ),
+            Conflict::Reserved(why) => trf("macOS が使用中: {why}", &[("why", tr(why))]),
+        })
+        .collect();
+    Some(parts.join(" / "))
+}
+
+/// egui の TextEdit に組み込みで、キーバインド表からは変更できないもの。
+fn builtin_shortcuts() -> Vec<(String, String)> {
+    let mut rows = Vec::new();
     for (label, spec) in [
         (tr("元に戻す"), "cmd+z"),
         (tr("やり直し"), "cmd+shift+z"),
@@ -24601,7 +24804,7 @@ fn shortcut_reference(keys: &Keybinds) -> Vec<(String, String)> {
         (tr("すべて選択"), "cmd+a"),
     ] {
         if let Some(sc) = parse_shortcut(spec) {
-            rows.push((label, format_shortcut(sc)));
+            rows.push((label, crate::keybinds::format_shortcut(sc)));
         }
     }
     rows
@@ -26085,36 +26288,95 @@ mod tests {
         );
     }
 
-    // ── shortcut_reference: ショートカット一覧ダイアログの整合性 ─────
+    // ── キーバインド編集 UI の行組み立て ─────────────────────────────
 
     #[test]
-    fn shortcut_reference_rows_are_all_filled() {
-        let rows = shortcut_reference(&Keybinds::default());
-        assert!(!rows.is_empty());
-        for (label, shortcut) in &rows {
-            assert!(!label.is_empty(), "ラベルが空の行がある");
-            assert!(!shortcut.is_empty(), "{label}: ショートカット表記が空");
+    fn keybind_rows_の全行にラベルと打鍵がある() {
+        let keys = Keybinds::default();
+        let rows = keybind_rows(&keys, "");
+        assert_eq!(rows.len(), crate::keybinds::ALL_ACTIONS.len());
+        for a in rows {
+            assert!(
+                !tr(crate::keybinds::action_label(a)).is_empty(),
+                "{a:?}: ラベルが空"
+            );
+            assert!(!keys.label(a).is_empty(), "{a:?}: 打鍵表記が空");
         }
     }
 
     #[test]
-    fn shortcut_reference_labels_are_unique() {
+    fn keybind_rows_のラベルは重複しない() {
         // 同じラベルが 2 行あると、どちらのキーか読み分けられない
-        let rows = shortcut_reference(&Keybinds::default());
+        let keys = Keybinds::default();
         let mut seen = HashSet::new();
-        for (label, _) in &rows {
-            assert!(seen.insert(label.as_str()), "ラベル重複: {label}");
+        for a in keybind_rows(&keys, "") {
+            let l = tr(crate::keybinds::action_label(a));
+            assert!(seen.insert(l.clone()), "ラベル重複: {l}");
         }
     }
 
     #[test]
-    fn shortcut_reference_covers_core_actions() {
-        let rows = shortcut_reference(&Keybinds::default());
-        let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
-        // バインドに追従する側 + egui TextEdit 内蔵の固定側の両方から拾う
-        for want in ["保存", "コマンド パレット", "検索", "コピー"] {
-            let want = tr(want);
-            assert!(labels.contains(&want.as_str()), "一覧に {want} が無い");
+    fn keybind_rows_はあいまい検索で絞り込める() {
+        let keys = Keybinds::default();
+        // config 名でも当たる
+        let rows = keybind_rows(&keys, "palette_commands");
+        assert!(rows.contains(&BindAction::PaletteCommands));
+        assert!(
+            rows.len() < crate::keybinds::ALL_ACTIONS.len(),
+            "絞れていない"
+        );
+        // 打鍵表記でも当たる (⌘K ⌘S を貼って探せる)
+        let spec = keys.label(BindAction::KeybindEditor);
+        assert!(keybind_rows(&keys, &spec).contains(&BindAction::KeybindEditor));
+        // 一致しない語では空になり、空状態の分岐へ落ちる
+        assert!(keybind_rows(&keys, "zzzqqqxxxyyy").is_empty());
+    }
+
+    #[test]
+    fn 既定のキーバインドに衝突の注記は出ない() {
+        // 出荷時の割り当ては重複も prefix 衝突も OS 予約も踏んでいないこと。
+        let keys = Keybinds::default();
+        let bad: Vec<String> = crate::keybinds::ALL_ACTIONS
+            .iter()
+            .filter_map(|a| conflict_note(&keys, *a).map(|n| format!("{a:?}: {n}")))
+            .collect();
+        assert!(bad.is_empty(), "既定に衝突がある: {bad:?}");
+    }
+
+    #[test]
+    fn 再割り当てすると衝突の注記が出る() {
+        let mut keys = Keybinds::default();
+        // 保存を「コマンドパレット」と同じ打鍵にする
+        keys.set(BindAction::Save, keys.binding(BindAction::PaletteCommands));
+        let note = conflict_note(&keys, BindAction::Save).expect("重複の注記が出ていない");
+        assert!(
+            note.contains(&tr(crate::keybinds::action_label(
+                BindAction::PaletteCommands
+            ))),
+            "衝突相手のアクション名が出ていない: {note}"
+        );
+        // chord の prefix (⌘K) と単打がぶつかる場合も出る
+        let prefix = keys.binding(BindAction::KeybindEditor).first();
+        keys.set(
+            BindAction::NewFile,
+            crate::keybinds::Binding::Single(prefix),
+        );
+        let note = conflict_note(&keys, BindAction::NewFile).expect("prefix 衝突の注記が無い");
+        assert!(
+            note.contains(&tr(crate::keybinds::action_label(
+                BindAction::KeybindEditor
+            ))),
+            "prefix の相手が出ていない: {note}"
+        );
+    }
+
+    #[test]
+    fn 内蔵ショートカットの一覧は空でない() {
+        let rows = builtin_shortcuts();
+        assert_eq!(rows.len(), 6);
+        for (label, keys) in &rows {
+            assert!(!label.is_empty());
+            assert!(!keys.is_empty(), "{label}: 打鍵表記が空");
         }
     }
 
@@ -28102,6 +28364,7 @@ mod wave2_tests {
             ("LspRename", "LspRename"),
             ("LspFormat", "LspFormat"),
             ("SelectNextOccurrence", "SelectNextOccurrence"),
+            ("KeybindEditor", "ShowShortcuts"),
         ];
         let src = &include_str!("app.rs").replace("\r\n", "\n");
         let list = palette_body(src);

@@ -1224,6 +1224,71 @@ pub fn save_plugins_config(plugins: &PluginsConfig) -> Result<(), String> {
     std::fs::write(&path, updated).map_err(|e| format!("config.toml を書けません: {e}"))
 }
 
+/// `[keybindings]` 区画だけを書き戻す。GUI のキーバインド編集がここを通る。
+///
+/// **他のセクションと手書きのコメントは 1 行も触らない** — config.toml は
+/// ユーザーの持ち物で、アプリが丸ごと書き直して良い場所ではない。
+/// (`[plugins]` の書き戻しと同じ作法。新しい保存経路は増やさない)
+pub fn save_keybindings(overrides: &HashMap<String, String>) -> Result<(), String> {
+    let path = config_path();
+    ensure_default();
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = rewrite_keybindings_section(&raw, overrides);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, updated).map_err(|e| format!("config.toml を書けません: {e}"))
+}
+
+/// 既存の `[keybindings]` 区画を取り除き、末尾に現在の内容を書き足す。
+/// 上書きが 1 つも無ければ区画ごと消える (空の見出しを残さない)。
+fn rewrite_keybindings_section(raw: &str, overrides: &HashMap<String, String>) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut skipping = false;
+
+    for line in raw.lines() {
+        let t = line.trim();
+        // 見出しかどうか。`# [keybindings]` のようなコメント行は見出しではない
+        // (既定テンプレートが持っているので、誤認すると以降が丸ごと消える)。
+        let is_header = t.starts_with('[') && t.ends_with(']');
+        if is_header {
+            let name = t.trim_start_matches('[').trim_end_matches(']');
+            let name = name.trim_start_matches('[').trim_end_matches(']');
+            skipping = name == "keybindings";
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+
+    while out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        out.pop();
+    }
+    let mut text = out.join("\n");
+
+    if !overrides.is_empty() {
+        // HashMap の順序は不定なので、書くたびに差分が出ないよう名前で並べる
+        let mut names: Vec<&String> = overrides.keys().collect();
+        names.sort();
+        let mut block = String::from("[keybindings]\n");
+        for n in names {
+            block.push_str(&format!(
+                "{} = {}\n",
+                n,
+                toml::Value::String(overrides[n].clone())
+            ));
+        }
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(block.trim_end());
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
 /// 既存の `[plugins]` / `[plugins.settings.*]` 区画を取り除き、
 /// 末尾に現在の内容を書き足した文字列を返す。
 fn rewrite_plugins_section(raw: &str, plugins: &PluginsConfig) -> String {
@@ -2317,6 +2382,137 @@ mod plugins_config_tests {
         let back: Config = toml::from_str(&out).expect("書き戻した config.toml が壊れている");
         assert!(!back.plugins.is_enabled("new-one"));
         assert_eq!(back.plugins.setting("bar", "host"), Some("example.com"));
+    }
+
+    // ── [keybindings] 区画の書き戻し (GUI のキーバインド編集) ──────────
+
+    #[test]
+    fn keybindings区画の書き換えでコメントと他の設定が残る() {
+        let raw = concat!(
+            "# 大事なメモ\n",
+            "theme = \"dark\"\n",
+            "\n",
+            "[keybindings]\n",
+            "# 手書きの覚え書き\n",
+            "save = \"cmd+s\"\n",
+            "\n",
+            "[plugins]\n",
+            "disabled = [\"old\"]\n",
+        );
+        let mut ov = HashMap::new();
+        ov.insert("save".to_string(), "cmd+alt+s".to_string());
+        ov.insert("keybind_editor".to_string(), "cmd+k cmd+s".to_string());
+        let out = rewrite_keybindings_section(raw, &ov);
+
+        assert!(out.contains("# 大事なメモ"), "区画外のコメントが消えた");
+        assert!(out.contains("theme = \"dark\""), "他のキーが消えた");
+        assert!(out.contains("[plugins]"), "他のセクションが消えた");
+        assert!(
+            out.contains("disabled = [\"old\"]"),
+            "他セクションの中身が消えた"
+        );
+        assert!(
+            !out.contains("# 手書きの覚え書き"),
+            "古い区画の中身が残っている"
+        );
+        assert!(!out.contains("\"cmd+s\""), "古い割り当てが残っている");
+
+        let back: Config = toml::from_str(&out).expect("書き戻した config.toml が壊れている");
+        assert_eq!(back.theme, "dark");
+        assert_eq!(
+            back.keybindings.get("save").map(String::as_str),
+            Some("cmd+alt+s")
+        );
+        assert_eq!(
+            back.keybindings.get("keybind_editor").map(String::as_str),
+            Some("cmd+k cmd+s")
+        );
+        assert_eq!(back.keybindings.len(), 2);
+        assert!(
+            !back.plugins.is_enabled("old"),
+            "plugins 区画の意味が変わった"
+        );
+    }
+
+    #[test]
+    fn keybindingsが空なら区画ごと消える() {
+        let raw = "theme = \"dark\"\n\n[keybindings]\nsave = \"cmd+s\"\n";
+        let out = rewrite_keybindings_section(raw, &HashMap::new());
+        assert!(!out.contains("[keybindings]"), "空なら区画ごと消えるべき");
+        assert!(out.contains("theme"));
+        let back: Config = toml::from_str(&out).expect("parse");
+        assert!(back.keybindings.is_empty());
+    }
+
+    #[test]
+    fn keybindings区画が無くても追記できる() {
+        let mut ov = HashMap::new();
+        ov.insert("find".to_string(), "ctrl+f".to_string());
+        let out = rewrite_keybindings_section("theme = \"dark\"\n", &ov);
+        let back: Config = toml::from_str(&out).expect("parse");
+        assert_eq!(
+            back.keybindings.get("find").map(String::as_str),
+            Some("ctrl+f")
+        );
+        assert_eq!(back.theme, "dark");
+    }
+
+    #[test]
+    fn keybindings_コメントアウトされた見出しは区画扱いしない() {
+        // 既定テンプレートは "# [keybindings]" を含む。本物の見出しと
+        // 誤認すると、以降の行が丸ごと消えてしまう。
+        let out = rewrite_keybindings_section(DEFAULT_CONFIG, &HashMap::new());
+        assert!(out.contains("# [keybindings]"), "コメント行が消えた");
+        assert!(out.contains("[[agents]]"), "エージェント定義が消えた");
+        let back: Config = toml::from_str(&out).expect("既定テンプレートが壊れた");
+        assert!(!back.agents.is_empty());
+    }
+
+    #[test]
+    fn keybindings区画は書くたびに同じ並びになる() {
+        // HashMap の順序は不定。書くたびに差分が出ると git が汚れる。
+        let mut ov = HashMap::new();
+        for (k, v) in [
+            ("zoom_in", "cmd+plus"),
+            ("find", "ctrl+f"),
+            ("save", "cmd+k cmd+s"),
+            ("new_file", "alt+n"),
+        ] {
+            ov.insert(k.to_string(), v.to_string());
+        }
+        let a = rewrite_keybindings_section("theme = \"dark\"\n", &ov);
+        let b = rewrite_keybindings_section("theme = \"dark\"\n", &ov);
+        assert_eq!(a, b);
+        let names: Vec<&str> = a
+            .lines()
+            .skip_while(|l| l.trim() != "[keybindings]")
+            .skip(1)
+            .filter_map(|l| l.split(" = ").next())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "名前順に並んでいない: {names:?}");
+    }
+
+    #[test]
+    fn 書き戻した区画をkeybindsが読み直せる() {
+        // config.rs の書き戻し → keybinds の読み込み、の一周を固定する。
+        let mut kb = crate::keybinds::Keybinds::default();
+        kb.set(
+            crate::keybinds::BindAction::Save,
+            crate::keybinds::Binding::Chord(
+                egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K),
+                egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W),
+            ),
+        );
+        let out = rewrite_keybindings_section("# メモ\ntheme = \"dark\"\n", &kb.overrides());
+        assert!(out.contains("# メモ"));
+        let back: Config = toml::from_str(&out).expect("parse");
+        let kb2 = crate::keybinds::Keybinds::from_overrides(&back.keybindings);
+        assert_eq!(
+            kb2.binding(crate::keybinds::BindAction::Save),
+            kb.binding(crate::keybinds::BindAction::Save)
+        );
     }
 
     #[test]

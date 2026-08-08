@@ -186,7 +186,8 @@ fn heading(ui: &mut egui::Ui, text: &str) {
 
 /// キーバインド済みアクションのショートカット表記。
 fn sc(keys: &Keybinds, a: BindAction) -> String {
-    format_shortcut(keys.get(a))
+    // chord (2 打鍵) も丸ごと出す。1 打鍵目だけ出すと嘘になる
+    keys.label(a)
 }
 
 /// egui TextEdit が内蔵処理するキー (メニューには表記だけ出す)。
@@ -313,7 +314,14 @@ fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             if item(ui, &tr("設定を再読み込み"), "", true) {
                 cmds.push(Cmd::ReloadConfig);
             }
-            if item(ui, &tr("キーボード ショートカット"), "", true) {
+            // メニューからの到達はここ 1 か所だけ (VS Code と同じ「設定」の下)。
+            // ヘルプにも同じ項目があったが、同じ操作への入口を 2 つ持たない。
+            if item(
+                ui,
+                &tr("キーボード ショートカット"),
+                &sc(keys, BindAction::KeybindEditor),
+                true,
+            ) {
                 cmds.push(Cmd::ShowShortcuts);
             }
         });
@@ -1030,9 +1038,6 @@ fn help_menu(ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
         // 初回起動ガイドツアー。「もう一度見たい」を探す場所はここ以外に無い。
         if item(ui, &tr("チュートリアルを再開"), "", true) {
             cmds.push(Cmd::RestartTutorial);
-        }
-        if item(ui, &tr("キーボード ショートカットのリファレンス"), "", true) {
-            cmds.push(Cmd::ShowShortcuts);
         }
         if item(
             ui,
