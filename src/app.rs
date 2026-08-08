@@ -2448,6 +2448,12 @@ pub struct ZaivernApp {
     commit_diff_cache: HashMap<u64, Vec<crate::diff::FileDiff>>,
     /// ドラッグ中のエディタタブの添字 (ドラッグ並べ替え)。押していない間は None。
     tab_drag: Option<usize>,
+    /// ⌃Tab を**押している間**だけ生きる MRU 切替。離すと確定して None に戻る。
+    tab_switcher: Option<editor_split::TabSwitcher>,
+    /// ペインごとに「どのタブへ自動スクロール済みか」。同じタブへ毎フレーム
+    /// スクロールを要求すると横スクロールが手で動かせなくなるため、
+    /// **アクティブが変わった 1 回だけ**追従する。
+    tab_scrolled: HashMap<editor_split::PaneId, u64>,
     /// Git サイドバー。単一 repo 表示なので常に primary ルートを見る。
     git_panel: git_panel::GitPanel,
     /// PR 風のローカル変更レビュー。Git サイドバーのサブタブとして出す。
@@ -2973,6 +2979,8 @@ impl ZaivernApp {
             editor: Editor::new(),
             panes: editor_split::EditorPanes::new(),
             cur_pane: 1,
+            tab_switcher: None,
+            tab_scrolled: HashMap::new(),
             tasks_cache: TasksCache::default(),
             agents: AgentManager::new(),
             splits: HashMap::new(),
@@ -4587,6 +4595,34 @@ impl ZaivernApp {
         }
     }
 
+    /// 保存済みのピン留めを戻す。
+    ///
+    /// 記録はファイルの**絶対パス**なので、開き直せなかったファイルは黙って
+    /// 落ちる (バッファ ID は再起動で必ず変わる)。同じファイルを複数ペインで
+    /// 開いていたら、その全部でピン留めし直す。
+    fn restore_pinned_tabs(&mut self, files: &[String]) {
+        if files.is_empty() {
+            return;
+        }
+        for f in files {
+            let path = Path::new(f);
+            let Some(buf) = self
+                .editor
+                .buffers
+                .iter()
+                .find(|b| b.path.as_deref() == Some(path))
+                .map(|b| b.id)
+            else {
+                continue;
+            };
+            for id in self.panes.order() {
+                self.panes.set_pinned(id, buf, true);
+            }
+        }
+        // ピン留めを左端へ寄せた並びを `editor.buffers` へ写し戻す。
+        self.sync_panes();
+    }
+
     /// 現在のタブ構成などをワークスペース単位で保存する。
     fn persist_session(&self) {
         let data = session::SessionData {
@@ -4619,6 +4655,21 @@ impl ZaivernApp {
                         .map(|p| p.to_string_lossy().into_owned())
                 })
                 .to_line(),
+            // ピン留めは分割の有無に関わらず残す (分割していないと
+            // `editor_split` は空になるので、こちらが唯一の記録になる)。
+            pinned_files: self
+                .panes
+                .pinned_bufs()
+                .into_iter()
+                .filter_map(|b| {
+                    self.editor
+                        .buffers
+                        .iter()
+                        .find(|x| x.id == b)
+                        .and_then(|x| x.path.as_ref())
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+                .collect(),
             // 走らせているエージェントタブの記録 (チャット履歴のフォルダ別保存)。
             // 終了済みは復元しても意味が無いので残さない。
             agents: self
@@ -4689,6 +4740,7 @@ impl ZaivernApp {
             }
         }
         self.restore_editor_split(&sess.editor_split);
+        self.restore_pinned_tabs(&sess.pinned_files);
         self.sidebar_open = sess.sidebar_open;
         self.sidebar_tab = SidebarTab::from_key(&sess.sidebar_tab);
         self.agents.panel_open = sess.panel_open;
@@ -5363,6 +5415,68 @@ impl ZaivernApp {
                 self.persist_session()
             }
             Err(e) => self.toast(e, false),
+        }
+    }
+
+    /// **プレビュー**としてファイルを開く (ツリー / パレットの 1 回クリック)。
+    ///
+    /// VS Code の斜体タブと同じ約束:
+    /// * 直前のプレビュータブは**置き換わる** — 眺めるだけでタブが増え続けない。
+    /// * 未保存の編集があるタブは置き換えず、確定タブへ昇格させてから残す。
+    /// * 同じファイルをもう一度開いたら確定タブへ昇格する
+    ///   (ツリーの 2 回目のクリック = ダブルクリック相当)。
+    ///
+    /// `preview_tabs = false` なら素通しで [`Self::open_path`] と同じ。
+    fn open_path_preview(&mut self, path: &Path) {
+        if !self.cfg.preview_tabs {
+            self.open_path(path);
+            return;
+        }
+        let pane = self.panes.focus_id();
+        let prev = self.panes.preview_of(pane);
+        let already = self
+            .editor
+            .buffers
+            .iter()
+            .find(|b| b.path.as_deref() == Some(path))
+            .map(|b| b.id);
+        if let Some(id) = already {
+            // 2 回目 = 確定タブへ昇格 (以後は他のプレビューに潰されない)
+            if prev == Some(id) {
+                self.panes.promote(id);
+            }
+            self.open_path(path);
+            return;
+        }
+        // 使い捨て枠を空ける。編集中のタブは捨てずに確定タブへ格上げする。
+        if let Some(old) = prev {
+            let dirty = self
+                .editor
+                .buffers
+                .iter()
+                .find(|b| b.id == old)
+                .map(|b| b.dirty())
+                .unwrap_or(false);
+            if dirty {
+                self.panes.promote(old);
+            } else if self.panes.open_count(old) > 1 {
+                self.panes.close_tab(pane, old);
+            } else if let Some(i) = self.editor.buffers.iter().position(|b| b.id == old) {
+                self.editor.close(i);
+            }
+        }
+        self.open_path(path);
+        // 開けていたら、そのタブを新しいプレビュー枠にする。
+        if let Some(id) = self
+            .editor
+            .buffers
+            .iter()
+            .find(|b| b.path.as_deref() == Some(path))
+            .map(|b| b.id)
+        {
+            self.sync_panes();
+            let pane = self.panes.focus_id();
+            self.panes.set_preview(pane, Some(id));
         }
     }
 
@@ -8921,6 +9035,7 @@ impl ZaivernApp {
             | Cmd::SaveAll
             | Cmd::ToggleAutoSave
             | Cmd::RevertFile
+            | Cmd::TogglePinTab
             | Cmd::CloseAllTabs => self.apply_cmd_file(cmd, ctx),
             Cmd::Undo
             | Cmd::Redo
@@ -8963,6 +9078,10 @@ impl ZaivernApp {
             | Cmd::NavForward
             | Cmd::NextTab
             | Cmd::PrevTab
+            | Cmd::SwitchTab
+            | Cmd::SwitchTabBack
+            | Cmd::ToggleTabSwitchMru
+            | Cmd::TogglePreviewTabs
             | Cmd::GoToDefinition
             | Cmd::GoToBracket
             | Cmd::GoToLine => self.apply_cmd_view_nav(cmd, ctx),
@@ -9137,6 +9256,11 @@ impl ZaivernApp {
                 );
             }
             Cmd::RevertFile => self.revert_active(),
+            Cmd::TogglePinTab => {
+                if let Some(i) = self.editor.active {
+                    self.toggle_pin_tab(i);
+                }
+            }
             Cmd::CloseAllTabs => self.close_all_tabs(),
             _ => {}
         }
@@ -9387,6 +9511,42 @@ impl ZaivernApp {
             Cmd::NavForward => self.nav_go(1),
             Cmd::NextTab => self.cycle_tab(1),
             Cmd::PrevTab => self.cycle_tab(-1),
+            Cmd::SwitchTab => self.switch_tab(1),
+            Cmd::SwitchTabBack => self.switch_tab(-1),
+            Cmd::ToggleTabSwitchMru => {
+                self.cfg.tab_switch_mru = !self.cfg.tab_switch_mru;
+                config::save_state(&self.cfg);
+                self.tab_switcher = None;
+                self.toast(
+                    if self.cfg.tab_switch_mru {
+                        tr("タブ切替: 最近使った順 (押している間に候補、離して確定)")
+                    } else {
+                        tr("タブ切替: 並び順")
+                    },
+                    true,
+                );
+            }
+            Cmd::TogglePreviewTabs => {
+                self.cfg.preview_tabs = !self.cfg.preview_tabs;
+                config::save_state(&self.cfg);
+                if !self.cfg.preview_tabs {
+                    // オフにした瞬間、いま開いているプレビューは確定タブにする
+                    // (斜体のまま置き去りにしない)。
+                    for id in self.panes.order() {
+                        if let Some(b) = self.panes.preview_of(id) {
+                            self.panes.promote(b);
+                        }
+                    }
+                }
+                self.toast(
+                    if self.cfg.preview_tabs {
+                        tr("プレビュータブ: オン (1 回クリックで開いたタブは置き換わります)")
+                    } else {
+                        tr("プレビュータブ: オフ")
+                    },
+                    true,
+                );
+            }
             Cmd::GoToDefinition => self.goto_definition(ctx),
             Cmd::GoToBracket => self.goto_bracket(ctx),
             Cmd::GoToLine => {
@@ -10166,7 +10326,9 @@ impl ZaivernApp {
             Action::OpenFile(p) => {
                 // p は絶対パス (file_index が絶対パスを正として持つ)。
                 // 同名の相対パスが複数ルートにあっても取り違えない。
-                self.open_path(&p);
+                // ツリーと同じく**プレビュー**で開く — 探しているだけで
+                // タブが増え続けないようにするため (設定でオフにできる)。
+                self.open_path_preview(&p);
             }
             Action::Cmd(c) => self.apply_cmd(c, ctx),
         }
@@ -10432,6 +10594,15 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.get(BindAction::PrevTab)) {
             cmds.push(Cmd::PrevTab);
+        }
+        // ⌃⇧Tab を先に取る。`Modifiers::matches_logically` は「パターンに
+        // 無い修飾キーは押されていてもよい」判定なので、⌃Tab を先に消費すると
+        // ⌃⇧Tab が吸われて逆順が永久に効かなくなる。
+        if consume(ctx, self.keys.get(BindAction::SwitchTabBack)) {
+            cmds.push(Cmd::SwitchTabBack);
+        }
+        if consume(ctx, self.keys.get(BindAction::SwitchTab)) {
+            cmds.push(Cmd::SwitchTab);
         }
         // ファイル単位ズーム (⌥⌘+ / Ctrl+Alt+Shift++ …) は「戻る/進む」より先。
         // egui の `Modifiers::matches_logically` は「パターンに無い修飾キーは
@@ -12868,7 +13039,9 @@ impl ZaivernApp {
             self.apply_cmd(Cmd::RefreshTree, ctx);
         }
         if let Some(p) = actions.open {
-            self.open_path(&p);
+            // ツリーの 1 回クリックは**プレビュー** — 眺めるだけでタブが増えない。
+            // 同じファイルをもう一度押す / 編集する / ピン留めすれば確定タブになる。
+            self.open_path_preview(&p);
         }
         if let Some(t) = actions.send_to_agent {
             self.send_to_agent(t);
@@ -15656,6 +15829,57 @@ impl ZaivernApp {
         let left = self.panes.sync(&ids, active_id);
         self.editor.active = left.and_then(|b| self.editor.buffers.iter().position(|x| x.id == b));
         self.cur_pane = self.panes.focus_id();
+        self.mirror_pane_order();
+        // **編集した瞬間に確定タブへ昇格する** (VS Code と同じ)。
+        // 編集の入口は複数あるので、入口ごとにフックせず結果 (dirty) を見る。
+        // プレビュー枠が空なら比較 0 回で抜けるので、常時のコストは無い。
+        for id in self.panes.order() {
+            let Some(b) = self.panes.preview_of(id) else {
+                continue;
+            };
+            if self.editor.buffers.iter().any(|x| x.id == b && x.dirty()) {
+                self.panes.promote(b);
+            }
+        }
+    }
+
+    /// 分割していないときだけ、ペインのタブ順を `editor.buffers` へ写し戻す。
+    ///
+    /// ピン留めは [`editor_split::EditorPane::normalize`] がタブ列の先頭へ
+    /// 寄せる。単一ペインでは「バッファ列 = 画面の並び」が前提
+    /// (`reorder_tab` は `editor.buffers` の添字で動く) なので、写し戻さないと
+    /// **ドラッグの落とし先が 1 つずれる**。並びが同じなら何もしない
+    /// (= 通常フレームのコストは比較 1 回)。
+    fn mirror_pane_order(&mut self) {
+        if self.panes.is_split() {
+            return;
+        }
+        let Some(order) = self.panes.pane(self.cur_pane).map(|p| p.tabs.clone()) else {
+            return;
+        };
+        let cur: Vec<u64> = self.editor.buffers.iter().map(|b| b.id).collect();
+        if cur == order {
+            return;
+        }
+        let active_id = self
+            .editor
+            .active
+            .and_then(|i| self.editor.buffers.get(i))
+            .map(|b| b.id);
+        let mut rest = std::mem::take(&mut self.editor.buffers);
+        let mut out = Vec::with_capacity(rest.len());
+        for id in &order {
+            if let Some(k) = rest.iter().position(|b| b.id == *id) {
+                out.push(rest.remove(k));
+            }
+        }
+        out.extend(rest);
+        self.editor.buffers = out;
+        self.editor.active =
+            active_id.and_then(|id| self.editor.buffers.iter().position(|b| b.id == id));
+        // 検索のヒット位置は本文に紐づくので、並びが変わったら捨てる。
+        self.find.current = None;
+        self.find.wrapped = None;
     }
 
     /// タブ列のクリック結果 `(activate, close)` を適用する。
@@ -15670,6 +15894,8 @@ impl ZaivernApp {
             ) {
                 if let Some(at) = p.tabs.iter().position(|x| *x == buf) {
                     p.active = at;
+                    // 押した = 使った。MRU (⌃Tab の順) の先頭へ。
+                    p.touch(buf);
                 }
             }
             self.editor.active = Some(i);
@@ -15715,17 +15941,51 @@ impl ZaivernApp {
         if idx.is_empty() {
             return (None, None);
         }
+        // このタブ列のピン留め / プレビューを引く。ピン留めは
+        // `EditorPane::normalize` が先頭へ寄せているので「先頭から N 枚」で足りる。
+        let pane_id = self.cur_pane;
+        let pinned_ids: Vec<u64> = self
+            .panes
+            .pane(pane_id)
+            .map(|p| p.pinned.clone())
+            .unwrap_or_default();
+        let preview_id = self.panes.preview_of(pane_id);
+        let pinned_n = self
+            .panes
+            .pane(pane_id)
+            .map(|p| p.pinned_count())
+            .unwrap_or(0)
+            .min(idx.len());
         let font = egui::TextStyle::Body.resolve(ui.style());
+        // 幅の基準は**ピン留めしていないタブ**の題名だけ (ピン留めは固定幅)。
         let longest = idx
             .iter()
+            .skip(pinned_n)
             .filter_map(|i| self.editor.buffers.get(*i))
             .map(|b| {
                 let name = format!("{} {}", file_tree::icon_for(&b.title), b.title);
                 ui.fonts(|f| f.layout_no_wrap(name, font.clone(), theme.text).size().x)
             })
             .fold(0.0f32, f32::max);
-        let strip = editor_split::tab_strip(ui.available_width() - 12.0, idx.len(), longest);
+        let strip = editor_split::tab_strip_pinned(
+            ui.available_width() - 12.0,
+            idx.len(),
+            pinned_n,
+            longest,
+        );
         let text_w = (strip.tab_w - editor_split::TAB_CHROME_W).max(0.0);
+        let pin_text_w = (strip.pin_w - 20.0).max(1.0);
+        // アクティブタブへの自動スクロールは**変わったフレームだけ**。
+        // 毎フレーム要求すると横スクロールを手で動かせなくなる。
+        let active_id = active
+            .and_then(|i| self.editor.buffers.get(i))
+            .map(|b| b.id);
+        let want_follow =
+            active_id.is_some() && self.tab_scrolled.get(&pane_id) != active_id.as_ref();
+        // 右クリックメニュー / ダブルクリックの要求
+        // (`&mut self` が要るので描画後に適用する)
+        let mut pin_req: Option<usize> = None;
+        let mut promote_req: Option<usize> = None;
         let tabs = egui::Frame::none()
             .fill(theme.panel_alt)
             .inner_margin(egui::Margin {
@@ -15740,6 +16000,37 @@ impl ZaivernApp {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            // **各タブの矩形は純関数が決める** — 描画はその
+                            // 結果に従うだけ。追従スクロールもこの「計画」から
+                            // 決めるので、そのタブが初めて現れたフレームで
+                            // 確実に画面内へ入る (実測を 1 フレーム待たない)。
+                            let total = editor_split::tab_total_w(strip, idx.len(), pinned_n);
+                            let planned = editor_split::tab_rects(
+                                egui::Rect::from_min_size(
+                                    ui.cursor().min,
+                                    egui::vec2(total, ui.available_height().max(1.0)),
+                                ),
+                                strip,
+                                idx.len(),
+                                pinned_n,
+                            );
+                            // 収まらない (= 横スクロールへ逃がす) ときだけ、
+                            // 合計幅を中身の幅として先に宣言する。こうしないと
+                            // ScrollArea が 1 フレーム遅れた幅でスクロール範囲を
+                            // 決め、末尾のタブへ届かない。
+                            if strip.scroll {
+                                ui.set_min_width(total);
+                            }
+                            // アクティブタブが画面外なら追従する
+                            // (掴んでいる間は動かさない — 落とし先が逃げるため)。
+                            if want_follow && !ui.ctx().input(|i| i.pointer.any_down()) {
+                                if let Some(r) = active
+                                    .and_then(|a| idx.iter().position(|i| *i == a))
+                                    .and_then(|p| planned.get(p))
+                                {
+                                    ui.scroll_to_rect(*r, None);
+                                }
+                            }
                             for i in idx {
                                 let i = *i;
                                 let Some(b) = self.editor.buffers.get(i) else {
@@ -15766,6 +16057,11 @@ impl ZaivernApp {
                                 };
                                 let color = if active { theme.text } else { theme.text_dim };
                                 let mode = strip.mode;
+                                // ピン留め = 左端に寄る固定幅の短いタブ。
+                                // プレビュー = 斜体の使い捨てタブ。
+                                let is_pinned = pinned_ids.contains(&b.id);
+                                let is_preview = preview_id == Some(b.id);
+                                let dirty = b.dirty();
                                 let fr = egui::Frame::none()
                                     .fill(fill)
                                     .rounding(egui::Rounding {
@@ -15777,34 +16073,62 @@ impl ZaivernApp {
                                     .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                                     .show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.x = 6.0;
-                                        let lab = match mode {
-                                            // 狭いときはアイコンだけへ縮退。
-                                            // 題名はホバーで全文を出す。
-                                            editor_split::TabLabelMode::IconOnly => {
-                                                let c =
-                                                    if b.dirty() { theme.accent } else { color };
-                                                ui.add(
-                                                    egui::Label::new(RichText::new(icon).color(c))
-                                                        .selectable(false),
-                                                )
+                                        // 斜体は「まだ確定していない」の合図 (VS Code と同じ)
+                                        let styled = |t: RichText| {
+                                            if is_preview {
+                                                t.italics()
+                                            } else {
+                                                t
                                             }
-                                            editor_split::TabLabelMode::Truncated => {
-                                                ui.set_max_width(text_w.max(1.0));
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(&full).color(color),
-                                                    )
-                                                    .selectable(false)
-                                                    .truncate(),
-                                                )
-                                            }
-                                            editor_split::TabLabelMode::Full => ui.add(
-                                                egui::Label::new(RichText::new(&full).color(color))
-                                                    .selectable(false),
-                                            ),
                                         };
-                                        if mode != editor_split::TabLabelMode::Full {
+                                        let icon_only =
+                                            mode == editor_split::TabLabelMode::IconOnly;
+                                        let lab = if icon_only {
+                                            let c = if dirty { theme.accent } else { color };
+                                            ui.add(
+                                                egui::Label::new(styled(
+                                                    RichText::new(icon).color(c),
+                                                ))
+                                                .selectable(false),
+                                            )
+                                        } else if is_pinned {
+                                            // ピン留めは幅を縮めて題名を省略する
+                                            ui.set_max_width(pin_text_w);
+                                            ui.add(
+                                                egui::Label::new(styled(
+                                                    RichText::new(&full).color(color),
+                                                ))
+                                                .selectable(false)
+                                                .truncate(),
+                                            )
+                                        } else if mode == editor_split::TabLabelMode::Truncated {
+                                            ui.set_max_width(text_w.max(1.0));
+                                            ui.add(
+                                                egui::Label::new(styled(
+                                                    RichText::new(&full).color(color),
+                                                ))
+                                                .selectable(false)
+                                                .truncate(),
+                                            )
+                                        } else {
+                                            ui.add(
+                                                egui::Label::new(styled(
+                                                    RichText::new(&full).color(color),
+                                                ))
+                                                .selectable(false),
+                                            )
+                                        };
+                                        if icon_only
+                                            || is_pinned
+                                            || mode != editor_split::TabLabelMode::Full
+                                        {
                                             lab.on_hover_text(&full);
+                                        }
+                                        // **ピン留めタブには閉じるボタンを出さない** —
+                                        // 誤って閉じないことがピン留めの目的なので、
+                                        // 「×」を置いたら意味が矛盾する。
+                                        if is_pinned {
+                                            return egui::Rect::NOTHING;
                                         }
                                         ui.add(
                                             egui::Label::new(
@@ -15823,8 +16147,29 @@ impl ZaivernApp {
                                     ui.id().with(("editor-tab", i)),
                                     egui::Sense::click_and_drag(),
                                 );
+                                // 右クリックメニュー。`&mut self` が要る操作は
+                                // ここでは呼べないので、要求だけ控えて後で適用する。
+                                tab.context_menu(|ui| {
+                                    let label = if is_pinned {
+                                        tr("ピン留めを解除")
+                                    } else {
+                                        tr("タブをピン留め")
+                                    };
+                                    if ui.button(label).clicked() {
+                                        pin_req = Some(i);
+                                        ui.close_menu();
+                                    }
+                                    if ui.button(tr("タブを閉じる")).clicked() {
+                                        close_req = Some(i);
+                                        ui.close_menu();
+                                    }
+                                });
                                 if tab.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                // ダブルクリック = プレビュータブを確定させる
+                                if tab.double_clicked() {
+                                    promote_req = Some(i);
                                 }
                                 if tab.drag_started() {
                                     drag_from = Some(i);
@@ -15856,9 +16201,21 @@ impl ZaivernApp {
                                 let pos_in_strip = tab_rects.iter().position(|(b, _)| *b == from);
                                 let rects: Vec<egui::Rect> =
                                     tab_rects.iter().map(|(_, r)| *r).collect();
-                                let to = pos_in_strip.and_then(|f| {
-                                    pointer.and_then(|p| reorder_target(&rects, p.x, f))
-                                });
+                                // 落とし先は**ピン境界でクランプ**する。ピン留めは
+                                // 左の区画から出られず、通常タブは入れない
+                                // (= 「ピン留めは常に左端」を掴んでも壊さない)。
+                                let to = pos_in_strip
+                                    .and_then(|f| {
+                                        pointer.and_then(|p| reorder_target(&rects, p.x, f))
+                                    })
+                                    .map(|t| {
+                                        editor_split::clamp_reorder(
+                                            rects.len(),
+                                            pinned_n,
+                                            pos_in_strip.unwrap_or(0),
+                                            t,
+                                        )
+                                    });
                                 let row = pos_in_strip.and_then(|f| rects.get(f).copied());
                                 if down {
                                     if let (Some(f), Some(r)) = (pos_in_strip, row) {
@@ -15916,10 +16273,60 @@ impl ZaivernApp {
             tutorial::anchor(ui.ctx(), AnchorId::EditorTabs, tabs.response.rect);
         }
         self.tab_drag = drag_from;
+        if want_follow {
+            match active_id {
+                Some(b) => {
+                    self.tab_scrolled.insert(pane_id, b);
+                }
+                None => {
+                    self.tab_scrolled.remove(&pane_id);
+                }
+            }
+        }
         if let Some((from, to)) = reorder {
+            // 掴んで動かした = そのタブはもう使い捨てではない (VS Code と同じ)
+            if let Some(b) = self.editor.buffers.get(from).map(|b| b.id) {
+                self.panes.promote(b);
+            }
             self.reorder_tab(from, to);
         }
+        if let Some(b) = promote_req
+            .and_then(|i| self.editor.buffers.get(i))
+            .map(|b| b.id)
+        {
+            self.panes.promote(b);
+        }
+        if let Some(i) = pin_req {
+            self.toggle_pin_tab(i);
+        }
         (activate, close_req)
+    }
+
+    /// `editor.buffers` の添字で指したタブのピン留めを切り替える。
+    ///
+    /// ピン留めしたタブは [`editor_split::EditorPane::normalize`] が左端へ寄せ、
+    /// 単一ペインでは [`Self::mirror_pane_order`] がその並びを
+    /// `editor.buffers` へ写し戻すので、画面とバッファ列は常に一致する。
+    fn toggle_pin_tab(&mut self, i: usize) {
+        let Some(buf) = self.editor.buffers.get(i).map(|b| b.id) else {
+            return;
+        };
+        let pane = self.panes.focus_id();
+        let on = self.panes.toggle_pinned(pane, buf);
+        // ピン留め = 確定タブ (使い捨てのままピン留めはできない)
+        if on {
+            self.panes.promote(buf);
+        }
+        self.sync_panes();
+        self.toast(
+            if on {
+                tr("📌 タブをピン留めしました")
+            } else {
+                tr("ピン留めを解除しました")
+            },
+            true,
+        );
+        self.persist_session();
     }
 
     /// エディタ本文 (`editor.active` が指すバッファ) を種類ごとに振り分けて描く。
@@ -19438,6 +19845,24 @@ impl ZaivernApp {
                 tr("すべてのエディターを閉じる"),
                 String::new(),
                 Cmd::CloseAllTabs,
+            ),
+            (
+                "📌".into(),
+                tr("タブのピン留めを切り替える"),
+                String::new(),
+                Cmd::TogglePinTab,
+            ),
+            (
+                "📑".into(),
+                tr("タブ切替を 最近使った順 / 並び順 で切り替える"),
+                String::new(),
+                Cmd::ToggleTabSwitchMru,
+            ),
+            (
+                "📄".into(),
+                tr("プレビュータブの切替"),
+                String::new(),
+                Cmd::TogglePreviewTabs,
             ),
             (
                 "🔎".into(),
@@ -23325,6 +23750,9 @@ impl ZaivernApp {
         self.poll_voice(ctx);
 
         self.handle_shortcuts(ctx);
+        // ⌃Tab の切替は**修飾キーを離したフレーム**で確定する。
+        // ショートカット処理の直後に見る (押した同じフレームで確定させない)。
+        self.tab_switcher_tick(ctx);
         // ⌘+ホイール / トラックパッドのピンチ。egui はどちらも zoom_delta へ
         // 集約するので、ここで 1 か所だけ拾う (画像タブは自前で消費する)。
         self.handle_zoom_gesture(ctx);
@@ -23376,6 +23804,8 @@ impl ZaivernApp {
         self.autosave_tick();
         // メニュー関連の小窓 (行/列へ移動・問題・ショートカット一覧・バージョン情報)
         self.menu_windows_ui(ctx);
+        // ⌃Tab の候補一覧 (押している間だけ・画面中央の 1 枚)
+        self.tab_switcher_ui(ctx);
 
         // スマホリモートからのリクエストを処理する
         self.poll_remote(ctx);
@@ -25057,9 +25487,17 @@ impl ZaivernApp {
     }
 
     /// すべてのエディタタブを閉じる。未保存タブは確認ダイアログに回す。
+    /// **ピン留めしたタブは残す** — 「誤って閉じない」がピン留めの意味なので、
+    /// 一括操作こそ効かせてはいけない (VS Code と同じ)。
     fn close_all_tabs(&mut self) {
         let mut kept_dirty = 0usize;
+        let pinned = self.panes.pinned_bufs();
+        let mut kept_pinned = 0usize;
         for i in (0..self.editor.buffers.len()).rev() {
+            if pinned.contains(&self.editor.buffers[i].id) {
+                kept_pinned += 1;
+                continue;
+            }
             if self.editor.buffers[i].dirty() && !self.editor.buffers[i].kind.read_only() {
                 kept_dirty += 1;
                 continue;
@@ -25067,6 +25505,15 @@ impl ZaivernApp {
             self.editor.close(i);
         }
         self.persist_session();
+        if kept_pinned > 0 {
+            self.toast(
+                trf(
+                    "📌 ピン留めした {n} タブは残しました",
+                    &[("n", kept_pinned.to_string())],
+                ),
+                true,
+            );
+        }
         if kept_dirty > 0 {
             // 1 件ずつ既存の確認ダイアログへ (最初の未保存タブを対象にする)
             self.pending_close = self
@@ -25233,6 +25680,123 @@ impl ZaivernApp {
         let cur = self.editor.active.unwrap_or(0) as i64;
         self.editor.active = Some((cur + dir).rem_euclid(n as i64) as usize);
         self.persist_session();
+    }
+
+    /// ⌃Tab / ⌃⇧Tab。
+    ///
+    /// `tab_switch_mru`(既定オン) なら **押している間だけ候補一覧を出し、
+    /// 修飾キーを離したところで確定する** (VS Code / Zed と同じ)。
+    /// オフなら従来どおりの位置巡回 ([`Self::cycle_tab`]) — どちらの経路も残す。
+    fn switch_tab(&mut self, dir: i64) {
+        if !self.cfg.tab_switch_mru {
+            self.cycle_tab(dir);
+            return;
+        }
+        match self.tab_switcher.as_mut() {
+            Some(s) => s.step(dir),
+            None => {
+                let pane = self.panes.focus_id();
+                let order = self.panes.mru_order(pane);
+                // 候補が 1 枚しか無いなら `start` が None を返す = 枠を出さない。
+                self.tab_switcher = editor_split::TabSwitcher::start(pane, order, dir);
+            }
+        }
+    }
+
+    /// ⌃Tab の切替を毎フレーム見張り、**修飾キーが離れたフレームで確定する**。
+    ///
+    /// egui は押されている修飾キーを `InputState::modifiers` に持つので、
+    /// `ctrl` が false へ落ちた最初のフレームが「離した瞬間」。
+    /// Esc は取り消し (何も切り替えない)。押している間は候補が閉じられていないか
+    /// 確認し、閉じられていたら候補から落とす。
+    fn tab_switcher_tick(&mut self, ctx: &egui::Context) {
+        let Some(pane) = self.tab_switcher.as_ref().map(|s| s.pane) else {
+            return;
+        };
+        let alive: Vec<u64> = self
+            .panes
+            .pane(pane)
+            .map(|p| p.tabs.clone())
+            .unwrap_or_default();
+        let (held, cancel) = ctx.input(|i| {
+            (
+                i.modifiers.ctrl,
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                }),
+            )
+        });
+        if cancel {
+            self.tab_switcher = None;
+            return;
+        }
+        if let Some(s) = self.tab_switcher.as_mut() {
+            if !s.retain_alive(&alive) {
+                self.tab_switcher = None;
+                return;
+            }
+        }
+        if held {
+            return;
+        }
+        // 離した = 確定。
+        let pick = self.tab_switcher.take().and_then(|s| s.pick());
+        if let Some(buf) = pick {
+            self.activate_buf(pane, buf);
+        }
+    }
+
+    /// バッファ ID を指定してペインのアクティブタブを切り替える。
+    fn activate_buf(&mut self, pane: editor_split::PaneId, buf: u64) {
+        self.panes.set_focus(pane);
+        if let Some(p) = self.panes.pane_mut(pane) {
+            if let Some(at) = p.tabs.iter().position(|x| *x == buf) {
+                p.active = at;
+                p.touch(buf);
+            }
+        }
+        self.cur_pane = pane;
+        self.editor.active = self.editor.buffers.iter().position(|b| b.id == buf);
+        // ヒット位置は本文に紐づくので、別のバッファへ移ったら捨てる。
+        self.find.current = None;
+        self.find.wrapped = None;
+        self.persist_session();
+    }
+
+    /// ⌃Tab を押している間の候補一覧 (画面中央の 1 枚のカード)。
+    fn tab_switcher_ui(&mut self, ctx: &egui::Context) {
+        let Some(sw) = self.tab_switcher.clone() else {
+            return;
+        };
+        let items: Vec<(String, String)> = sw
+            .order
+            .iter()
+            .filter_map(|b| {
+                let buf = self.editor.buffers.iter().find(|x| x.id == *b)?;
+                let icon = file_tree::icon_for(&buf.title);
+                let hint = buf
+                    .path
+                    .as_ref()
+                    .map(|p| self.rel_label(p))
+                    .unwrap_or_default();
+                Some((format!("{icon} {}", buf.title), hint))
+            })
+            .collect();
+        let title = trf(
+            "{key} で切り替え · 離して確定",
+            &[("key", self.key_hint(BindAction::SwitchTab))],
+        );
+        editor_split::tab_switcher_overlay(ctx, &self.theme, &title, &items, sw.sel);
+        // 押している間はキーイベントが来ないので、こちらから描き直しを頼む。
+        // (切替が終われば要求も止まる = アイドル時のコストはゼロ)
+        ctx.request_repaint();
     }
 
     // ── ジャンプ系 ──
@@ -29889,6 +30453,55 @@ mod wave2_tests {
         assert!(
             src.contains("fn reorder_tab(&mut self, from: usize, to: usize)"),
             "並べ替えの実体が無い"
+        );
+    }
+
+    /// **タブのピン留め / プレビュー / MRU 切替が実際に配線されている**こと。
+    ///
+    /// 実装はしたが画面から届かない (= 未完成) を検出する番人。
+    /// 純粋なロジックは `editor_split::tests` が固定しているので、ここは
+    /// 「その判断が描画と入力に繋がっているか」だけを見る。
+    #[test]
+    fn タブのピン留めとプレビューは画面から届く() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        // 到達経路: 右クリックメニュー / パレット / ⌃Tab
+        assert!(
+            src.contains("pin_req = Some(i);"),
+            "タブの右クリックからピン留めできない"
+        );
+        assert!(
+            src.contains("Cmd::TogglePinTab =>"),
+            "パレットのピン留めが実行されない"
+        );
+        assert!(
+            src.contains("self.tab_switcher_tick(ctx);")
+                && src.contains("self.tab_switcher_ui(ctx);"),
+            "MRU タブ切替の確定と候補一覧が update から呼ばれていない"
+        );
+        // ツリー / パレットの 1 回クリックはプレビューで開く
+        assert!(
+            src.contains("self.open_path_preview(&p);"),
+            "ツリーの 1 回クリックがプレビューに繋がっていない"
+        );
+        // ピン留めタブには「×」を出さない (誤って閉じないための機能なので)
+        let body = src
+            .split("fn editor_tab_strip(")
+            .nth(1)
+            .expect("タブ列の描画がある");
+        let guard = body.find("if is_pinned {").expect("ピン留めの分岐がある");
+        let cross = body
+            .find("RichText::new(\"×\")")
+            .expect("閉じるボタンがある");
+        assert!(guard < cross, "ピン留めタブでも閉じるボタンを描いてしまう");
+        // 落とし先はピン境界でクランプする
+        assert!(
+            body.contains("editor_split::clamp_reorder("),
+            "ドラッグの落とし先がピン境界でクランプされていない"
+        );
+        // アクティブタブへの追従は純関数が決めた矩形から
+        assert!(
+            body.contains("editor_split::tab_rects(") && body.contains("ui.scroll_to_rect("),
+            "アクティブタブへ自動スクロールしていない"
         );
     }
 

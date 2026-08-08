@@ -52,6 +52,14 @@ pub enum BindAction {
     /// 次/前のエディタタブ (VS Code: ⇧⌘] / ⇧⌘[)
     NextTab,
     PrevTab,
+    /// **最近使った順のタブ切替** (VS Code / Zed と同じ ⌃Tab / ⌃⇧Tab)。
+    ///
+    /// 押しっぱなしの間だけ候補一覧を出し、修飾キーを離したところで確定する
+    /// (`config.toml` の `tab_switch_mru = false` なら位置巡回に戻る)。
+    /// ⌃Tab は macOS の予約表 ([`MACOS_RESERVED`]) に無い — 予約されているのは
+    /// ⌘Tab (アプリ切替) の方で、⌃Tab はアプリまで届く。
+    SwitchTab,
+    SwitchTabBack,
     /// ファイル横断検索 (VS Code: ⇧⌘F)
     GlobalSearch,
     /// 置換 (VS Code: ⌥⌘F)
@@ -129,7 +137,7 @@ pub enum BindAction {
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 63] = [
+pub const ALL_ACTIONS: [BindAction; 65] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -161,6 +169,8 @@ pub const ALL_ACTIONS: [BindAction; 63] = [
     BindAction::GoToLine,
     BindAction::NextTab,
     BindAction::PrevTab,
+    BindAction::SwitchTab,
+    BindAction::SwitchTabBack,
     BindAction::GlobalSearch,
     BindAction::OpenReplace,
     BindAction::NewTerminal,
@@ -266,6 +276,16 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::GoToLine => KeyboardShortcut::new(Modifiers::CTRL, Key::G),
         BindAction::NextTab => KeyboardShortcut::new(cmd_shift, Key::CloseBracket),
         BindAction::PrevTab => KeyboardShortcut::new(cmd_shift, Key::OpenBracket),
+        // ⌃Tab / ⌃⇧Tab は VS Code / Zed / ブラウザ共通の「最近使ったタブへ」。
+        // `Modifiers::CTRL` は **どの OS でも物理 Ctrl** に当たる
+        // (mac: ctrl だけ / Windows・Linux: ctrl と command の両方が立つが、
+        //  `cmd_ctrl_matches` は「パターンが ctrl を求めるなら command は
+        //  どちらでもよい」なので両方で一致する)。⌘Tab は macOS の
+        // アプリ切替に取られているので**使わない** (`MACOS_RESERVED`)。
+        BindAction::SwitchTab => KeyboardShortcut::new(Modifiers::CTRL, Key::Tab),
+        BindAction::SwitchTabBack => {
+            KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab)
+        }
         BindAction::GlobalSearch => KeyboardShortcut::new(cmd_shift, Key::F),
         // VS Code の「ファイル間で置換」と同じ ⇧⌘H。既存の割り当てとは重ならない
         BindAction::GlobalReplace => KeyboardShortcut::new(cmd_shift, Key::H),
@@ -419,6 +439,8 @@ impl Keybinds {
             "goto_line" => GoToLine,
             "next_tab" => NextTab,
             "prev_tab" => PrevTab,
+            "switch_tab" => SwitchTab,
+            "switch_tab_back" => SwitchTabBack,
             "global_search" => GlobalSearch,
             "global_replace" => GlobalReplace,
             "open_replace" => OpenReplace,
@@ -1291,6 +1313,8 @@ mod tests {
             "goto_line",
             "next_tab",
             "prev_tab",
+            "switch_tab",
+            "switch_tab_back",
             "global_search",
             "global_replace",
             "open_replace",

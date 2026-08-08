@@ -163,8 +163,15 @@ pub enum Cmd {
     ToggleAutoSave,
     /// アクティブなファイルをディスクの内容へ戻す (VS Code: Revert File)
     RevertFile,
-    /// すべてのエディタタブを閉じる (未保存タブは確認を挟む)
+    /// すべてのエディタタブを閉じる (未保存タブは確認を挟む。ピン留めは残す)
     CloseAllTabs,
+    /// アクティブなタブのピン留めを切り替える (VS Code の Pin/Unpin Editor)。
+    /// ピン留めタブは左端に寄り、幅を縮めて閉じるボタンを出さない。
+    TogglePinTab,
+    /// タブ切替 (⌃Tab) を「最近使った順 (MRU)」と「並び順」で切り替える
+    ToggleTabSwitchMru,
+    /// プレビュータブ (斜体の使い捨てタブ) を使うかを切り替える
+    TogglePreviewTabs,
     /// エディタの編集操作 (フォーカス経由で egui TextEdit に委譲)
     Undo,
     Redo,
@@ -203,6 +210,10 @@ pub enum Cmd {
     /// タブ切替 (VS Code: ⇧⌘] / ⇧⌘[)
     NextTab,
     PrevTab,
+    /// 最近使った順のタブ切替 (⌃Tab / ⌃⇧Tab)。押している間は候補一覧を出し、
+    /// 修飾キーを離したところで確定する。設定で位置巡回にも戻せる。
+    SwitchTab,
+    SwitchTabBack,
     /// 定義へ移動 (LSP。VS Code: F12)
     GoToDefinition,
     /// 対応する括弧へ移動 (VS Code: ⇧⌘\)
@@ -487,6 +498,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::NewFile
         | Cmd::CloseTab
         | Cmd::CloseAllTabs
+        | Cmd::TogglePinTab
         | Cmd::OpenFolder
         | Cmd::NewWindow
         | Cmd::NewWindowFolder
@@ -551,6 +563,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::NavForward
         | Cmd::NextTab
         | Cmd::PrevTab
+        | Cmd::SwitchTab
+        | Cmd::SwitchTabBack
         | Cmd::ReopenClosedTab
         | Cmd::ToggleBookmark
         | Cmd::NextBookmark
@@ -573,6 +587,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleWordWrap
         | Cmd::ToggleShowWhitespace
         | Cmd::ToggleMinimap
+        | Cmd::ToggleTabSwitchMru
+        | Cmd::TogglePreviewTabs
         | Cmd::ToggleBreadcrumbs
         | Cmd::ToggleProblems
         | Cmd::ToggleInlineDiagnostics

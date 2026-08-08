@@ -85,6 +85,23 @@ pub struct Config {
     /// オンの間だけ可視範囲ぶんの `git blame` を非同期で取る。
     pub git_blame: bool,
 
+    /// タブ切替 (Ctrl+Tab) を **MRU (最近使った順)** で回すか。
+    ///
+    /// **既定はオン** — VS Code / Zed と同じで、押しっぱなしの間に候補一覧を
+    /// 出し、離したところで確定する。2 回押せば直前のファイルへ戻れる。
+    /// オフにすると従来どおりの**位置巡回** (タブの並び順) になる。
+    /// どちらでも `[keybindings]` の `switch_tab` / `switch_tab_back` で
+    /// 打鍵を付け替えられる。
+    pub tab_switch_mru: bool,
+
+    /// **プレビュータブ** (VS Code の斜体タブ) を使うか。
+    ///
+    /// **既定はオン** — ツリーやパレットからシングルクリックで開いたタブは
+    /// 使い捨てになり、次のプレビューで置き換わるのでタブが無限に増えない。
+    /// もう一度クリック / 編集 / ピン留め / ドラッグで確定タブへ昇格する。
+    /// オフにすると開いたタブは常に確定タブになる。
+    pub preview_tabs: bool,
+
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
@@ -315,6 +332,8 @@ impl Default for Config {
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
             git_blame: false,
+            tab_switch_mru: true,
+            preview_tabs: true,
             approval_mode: "ask".into(),
             restore_agents: false,
             show_pet: true,
@@ -548,6 +567,10 @@ struct UiState {
     /// 差分ビューの表示モード ("side_by_side" | "inline")。
     diff_view: Option<String>,
     git_blame: Option<bool>,
+    /// タブ切替を MRU で回すか (パレットから切り替えるので state 側に置く)。
+    tab_switch_mru: Option<bool>,
+    /// プレビュータブを使うか (同上)。
+    preview_tabs: Option<bool>,
     pet_image: Option<String>,
     pet_x: Option<f32>,
     pet_y: Option<f32>,
@@ -659,6 +682,17 @@ show_hidden_files = true
 # ガターに git blame (著者 · 相対日時) を出す。既定はオフ
 # (表示メニュー・コマンドパレットの「Git blame の表示切替」でも変更できます)
 # git_blame = false
+
+# タブ切替 (Ctrl+Tab / Ctrl+Shift+Tab) を最近使った順 (MRU) で回すか。
+# 既定はオン = 押している間に候補一覧が出て、離したところで確定します
+# (2 回押せば直前のファイルへ戻る)。false にすると並び順の巡回になります。
+# (コマンドパレットの「タブ切替を最近使った順/並び順にする」でも変更できます)
+# tab_switch_mru = true
+# プレビュータブ (斜体の使い捨てタブ)。既定はオン = ツリーやパレットから
+# 1 回クリックして開いたタブは次のプレビューで置き換わるので増え続けません。
+# もう一度クリック / 編集 / ピン留め / ドラッグで確定タブになります。
+# (コマンドパレットの「プレビュータブの切替」でも変更できます)
+# preview_tabs = true
 
 # 既定の権限モード (claude / codex / agy に自動適用)
 #   "ask"   = 毎回ユーザー承認が必要（安全・デフォルト）
@@ -1013,6 +1047,12 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 }
                 if let Some(v) = st.git_blame {
                     cfg.git_blame = v;
+                }
+                if let Some(v) = st.tab_switch_mru {
+                    cfg.tab_switch_mru = v;
+                }
+                if let Some(v) = st.preview_tabs {
+                    cfg.preview_tabs = v;
                 }
                 if st.pet_image.is_some() {
                     cfg.pet_image = st.pet_image;
@@ -1419,6 +1459,8 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         breadcrumbs: Some(cfg.global_breadcrumbs),
         diff_view: Some(cfg.diff_view.clone()),
         git_blame: Some(cfg.global_git_blame),
+        tab_switch_mru: Some(cfg.tab_switch_mru),
+        preview_tabs: Some(cfg.preview_tabs),
         pet_image: cfg.pet_image.clone(),
         pet_x: cfg.pet_x,
         pet_y: cfg.pet_y,
@@ -2018,6 +2060,8 @@ command = "agy"
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
+            tab_switch_mru: Some(false),
+            preview_tabs: Some(false),
             minimap: Some(true),
             breadcrumbs: Some(false),
             diff_view: Some("inline".into()),
