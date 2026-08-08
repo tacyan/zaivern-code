@@ -310,6 +310,9 @@ fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         ui.separator();
         ui.menu_button(tr("ユーザー設定"), |ui| {
             ui.set_min_width(280.0);
+            if item(ui, &tr("設定"), "", true) {
+                cmds.push(Cmd::OpenSettings);
+            }
             if item(ui, &tr("設定 config.toml を開く"), "", true) {
                 cmds.push(Cmd::OpenConfig);
             }

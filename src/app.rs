@@ -2722,6 +2722,35 @@ struct KeybindUi {
     recording: Option<crate::keybinds::Recorder>,
 }
 
+/// 設定画面の状態。値そのものは `Config` が持つので、ここには
+/// **画面だけの状態** (検索語・絞り込み・入力途中の文字列) しか置かない。
+#[derive(Default)]
+struct SettingsUi {
+    /// 絞り込みの検索語。`@modified` と書いても既定と違うものだけになる。
+    query: String,
+    /// 「既定から変えたものだけ」のチェック。
+    only_modified: bool,
+    /// 文字列欄の編集途中の値 (キー → 入力中の文字列)。
+    /// 確定するまで `Config` へ入れないので、打つたびに config.toml を
+    /// 書きに行くことがない (1 文字ごとの I/O を撃たない)。
+    drafts: HashMap<String, String>,
+}
+
+/// 復元した本文とディスクが食い違っている 1 件。
+///
+/// **選ばせるまで消さない** — 黙ってどちらかを採ると、片方の変更が
+/// 何の跡も残さずに消える。
+struct HotExitConflict {
+    /// 対象のファイル (競合が起きるのは名前付きのバッファだけ)。
+    path: PathBuf,
+    title: String,
+    /// 退避しておいた未保存の本文。
+    text: String,
+    /// いまのディスクの本文 (読めたときだけ)。
+    disk_text: Option<String>,
+    state: session::DiskState,
+}
+
 pub struct ZaivernApp {
     cfg: Config,
     theme: Theme,
@@ -2880,6 +2909,23 @@ pub struct ZaivernApp {
     shortcuts_open: bool,
     /// キーバインド編集 UI の状態 (検索語・記録中の行)。
     keybind_ui: KeybindUi,
+    /// 設定画面 (検索できる一覧) を開いているか。
+    settings_open: bool,
+    /// 設定画面の状態 (検索語・@modified・文字列欄の編集途中)。
+    settings_ui: SettingsUi,
+    /// Hot Exit: 未保存本文の退避帳。
+    hotexit: session::HotExitStore,
+    /// 退避を書き出す予定時刻。**変更があったときだけ入る** —
+    /// 何も編集していないフレームでは触らない (アイドル時のコストはゼロ)。
+    hotexit_due: Option<Instant>,
+    /// 前フレームの未保存バッファの指紋。安く変化を見つけるためだけの値で、
+    /// 実際に何を書くかは [`session::HotExitStore::sync`] が厳密に決める。
+    hotexit_fingerprint: u64,
+    /// 復元時にディスク側と食い違っていたバッファ (選ばせるまで消さない)。
+    hotexit_conflicts: Vec<HotExitConflict>,
+    /// 上限超過をもう伝えたバッファのタイトル。退避は数秒ごとに走るので、
+    /// これが無いと同じ警告を延々と出し続ける (伝えるのは 1 回でいい)。
+    hotexit_warned: HashSet<String>,
     /// chord (2 打鍵) の待機。フレームを跨ぐので `App` が持つ。
     chord: crate::keybinds::ChordState,
     about_open: bool,
@@ -3502,6 +3548,12 @@ impl ZaivernApp {
         // ネットワークは叩かない (通信ゼロの約束を破らない)。未ライセンスでも
         // アプリは完全に動くので、失敗しても起動を止めない。
         let license_boot = license::current_status();
+        // Hot Exit の退避先はワークスペース (ルート集合) ごと。
+        // `roots` はこの後で構造体へ移るので、先に取っておく。
+        let hotexit = session::HotExitStore::new(
+            session::hotexit_dir_for(&roots),
+            cfg.hot_exit_max_kb.saturating_mul(1024),
+        );
         let mut app = Self {
             tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
             gitinfo: git::GitSet::new(roots.clone()),
@@ -3639,6 +3691,13 @@ impl ZaivernApp {
             problems_collapsed: HashSet::new(),
             shortcuts_open: false,
             keybind_ui: KeybindUi::default(),
+            settings_open: false,
+            settings_ui: SettingsUi::default(),
+            hotexit,
+            hotexit_due: None,
+            hotexit_fingerprint: 0,
+            hotexit_conflicts: Vec::new(),
+            hotexit_warned: HashSet::new(),
             chord: crate::keybinds::ChordState::default(),
             about_open: false,
             // 起動時に 1 回だけローカルのキーを読んで検証する (通信なし)。
@@ -5320,6 +5379,19 @@ impl ZaivernApp {
     /// 保存済みセッション(開いていたタブ等)を復元する。
     /// セッションに記録されたルート一覧の方が広ければ、フォルダ構成ごと復元する。
     fn restore_session(&mut self, ctx: &egui::Context) {
+        self.restore_session_data(ctx);
+        // Hot Exit: 未保存だった本文を戻す。
+        //
+        // **セッションファイルが無くても必ず走らせる** — 退避は数秒ごと、
+        // セッションはタブ構成が変わったときに書くので、「退避だけが
+        // 残っている」落ち方が現実に起こる。タブを開き直した**後**に
+        // 呼ぶこと (同じファイルのタブが二重にならない)。
+        self.hotexit_restore();
+    }
+
+    /// 保存済みセッション本体 (タブ・分割・エージェント) の復元。
+    /// セッションファイルが無ければ何もしない。
+    fn restore_session_data(&mut self, ctx: &egui::Context) {
         // ついでに古いターミナルログを掃除する (新しい 40 本だけ残す)
         session::prune_term_logs(self.primary_root(), 40);
         let Some(sess) = session::load(&self.roots) else {
@@ -5352,6 +5424,9 @@ impl ZaivernApp {
         if self.cfg.restore_agents && !sess.agents.is_empty() {
             self.restore_agent_sessions(&sess.agents, ctx);
         }
+        // Hot Exit: 未保存だった本文を戻す。タブを開き直した**後**に
+        // 走らせること (同じファイルのタブが二重にならない)。
+        self.hotexit_restore();
     }
 
     /// 保存済みエージェント記録からターミナルタブを復元する。
@@ -7258,6 +7333,8 @@ impl ZaivernApp {
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 self.tree.invalidate();
+                // 保存した本文の退避はもう要らない (ゴミを残さない)
+                self.hotexit_flush();
                 if promoted {
                     self.toast_warn(trf(
                         "💾 保存しました: {path}\n\u{3000}{from} では表せない文字があるため UTF-8 で保存しました",
@@ -9970,6 +10047,7 @@ impl ZaivernApp {
             | Cmd::NewAgentIsolated(_)
             | Cmd::StopAllAgents => self.apply_cmd_agent(cmd, ctx),
             Cmd::SetTheme(_)
+            | Cmd::OpenSettings
             | Cmd::OpenConfig
             | Cmd::ReloadConfig
             | Cmd::ZoomIn
@@ -10831,6 +10909,7 @@ impl ZaivernApp {
                     true,
                 );
             }
+            Cmd::OpenSettings => self.settings_open = true,
             Cmd::OpenConfig => {
                 config::ensure_default();
                 self.open_path(&config::config_path());
@@ -21084,6 +21163,12 @@ impl ZaivernApp {
             ),
             (
                 "⚙".into(),
+                tr("設定を開く"),
+                String::new(),
+                Cmd::OpenSettings,
+            ),
+            (
+                "📝".into(),
                 tr("設定 config.toml を開く"),
                 String::new(),
                 Cmd::OpenConfig,
@@ -26036,6 +26121,10 @@ impl ZaivernApp {
         // 外部(エージェント等)によるファイル書き換えを検知して自動リロードする
         self.check_external_changes();
 
+        // Hot Exit: 未保存の本文を間引いて退避する。
+        // 編集が無いフレームでは指紋を取るだけ (I/O も再描画も起こさない)。
+        self.hotexit_tick(ctx);
+
         // LSP: デバウンスした変更を送信し、閉じたドキュメントを did_close する
         self.flush_lsp_changes();
         if !self.lsp_opened.is_empty() {
@@ -27591,6 +27680,8 @@ impl ZaivernApp {
         }
         if saved > 0 {
             self.persist_session();
+            // 保存した本文の退避はもう要らない (ゴミを残さない)
+            self.hotexit_flush();
             self.toast(
                 trf(
                     "💾 {n} 件のファイルを保存しました",
@@ -28525,6 +28616,8 @@ impl ZaivernApp {
         self.git_history_window(ctx);
         self.problems_window(ctx);
         self.shortcuts_window(ctx);
+        self.settings_window(ctx);
+        self.hotexit_conflict_window(ctx);
         self.about_window(ctx);
         self.license_window(ctx);
     }
@@ -28788,6 +28881,700 @@ impl ZaivernApp {
             self.jump_to_lsp_pos(&path, line, col);
             self.lsp_code_actions();
         }
+    }
+
+    // ── Hot Exit — 未保存の本文の退避と復元 ────────────────────────
+
+    /// 未保存バッファの安い指紋。**本文をハッシュしない** —
+    /// 「前フレームから何か動いたか」だけを見るための値で、実際に何を
+    /// 書くかは [`Self::hotexit_flush`] が厳密に決める。
+    ///
+    /// 未保存かどうかは `Buffer::dirty()` ではなく `history.at_saved_point()`
+    /// で見る。`dirty()` は保存点から外れているときに全文をハッシュするので、
+    /// 毎フレーム呼ぶと巨大ファイルでフレームを落とす。
+    fn hotexit_fingerprint(&self) -> u64 {
+        let mut h: u64 = 0;
+        for b in &self.editor.buffers {
+            if b.kind.read_only() || b.history.at_saved_point() {
+                continue;
+            }
+            h = combine_hash(h, b.id);
+            h = combine_hash(h, b.text.len() as u64);
+            h = combine_hash(h, b.history.revision());
+            h = combine_hash(h, b.saved_hash);
+        }
+        h
+    }
+
+    /// 退避を間引いて書き出す。**変化があったときだけ**締切を立て、
+    /// 締切のぶんだけ再描画を予約する (常時再描画も常時 I/O も起こさない)。
+    fn hotexit_tick(&mut self, ctx: &egui::Context) {
+        if !self.cfg.hot_exit {
+            return;
+        }
+        let fp = self.hotexit_fingerprint();
+        if fp != self.hotexit_fingerprint {
+            self.hotexit_fingerprint = fp;
+            if self.hotexit_due.is_none() {
+                let wait = Duration::from_millis(self.cfg.hot_exit_interval_ms);
+                self.hotexit_due = Some(Instant::now() + wait);
+                // 間隔ぶん先の 1 フレームだけ予約する。編集が止まれば
+                // 予約も止まるので、アイドル時のコストはゼロのまま。
+                ctx.request_repaint_after(wait);
+            }
+        }
+        let Some(due) = self.hotexit_due else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        self.hotexit_due = None;
+        self.hotexit_flush();
+    }
+
+    /// いまの未保存バッファをそのまま退避へ反映する (間引きを飛ばす)。
+    ///
+    /// 保存・タブを閉じた直後に呼ぶ。ここを通らないと、保存済みの退避が
+    /// 次の間隔まで残り続ける。
+    fn hotexit_flush(&mut self) {
+        if !self.cfg.hot_exit {
+            return;
+        }
+        let report = {
+            let snaps: Vec<session::HotExitSnapshot> = self
+                .editor
+                .buffers
+                .iter()
+                // 読み取り専用タブ (画像 / PDF / 16 進) は本文を持たない
+                .filter(|b| !b.kind.read_only() && b.dirty())
+                .map(|b| session::HotExitSnapshot {
+                    id: b.id,
+                    path: b.path.as_deref(),
+                    title: b.title.as_str(),
+                    text: b.text.as_str(),
+                    saved_hash: b.saved_hash,
+                })
+                .collect();
+            self.hotexit.sync(&snaps)
+        };
+        // 黙って落とさない。ただし退避は数秒ごとに走るので、同じバッファに
+        // ついて伝えるのは 1 回だけ (トーストを埋め尽くさない)。
+        let fresh: Vec<String> = report
+            .skipped
+            .iter()
+            .filter(|t| !self.hotexit_warned.contains(*t))
+            .cloned()
+            .collect();
+        // もう上限を超えていないものは、次に超えたときまた伝える
+        self.hotexit_warned
+            .retain(|t| report.skipped.iter().any(|s| s == t));
+        if !fresh.is_empty() {
+            let names = fresh.join(", ");
+            let kb = self.cfg.hot_exit_max_kb.to_string();
+            self.hotexit_warned.extend(fresh);
+            self.toast_warn(trf(
+                "⚠ {names} は {kb} KiB を超えるため退避していません — 保存してください",
+                &[("names", names), ("kb", kb)],
+            ));
+        }
+    }
+
+    /// 退避しておいた未保存の本文を戻す (起動時に 1 回だけ)。
+    ///
+    /// ディスク側が外から変わっていたバッファは**黙って戻さず**、
+    /// [`Self::hotexit_conflicts`] へ積んで選ばせる。
+    fn hotexit_restore(&mut self) {
+        if !self.cfg.hot_exit {
+            return;
+        }
+        let saved = session::load_hotexit(self.hotexit.dir());
+        if saved.is_empty() {
+            return;
+        }
+        let mut restored = 0usize;
+        for r in saved {
+            let Some(path) = r.path.clone() else {
+                // 名前のないバッファ (untitled) も戻す
+                self.editor.new_untitled();
+                let Some(b) = self.editor.buffers.last_mut() else {
+                    continue;
+                };
+                b.title = r.title.clone();
+                // 履歴は戻さない (本文だけ)。空の新規タブからの差分にする
+                b.reset_text(r.text);
+                b.saved_hash = hash_str("");
+                restored += 1;
+                continue;
+            };
+            if r.disk.needs_choice() {
+                self.hotexit_conflicts.push(HotExitConflict {
+                    path,
+                    title: r.title,
+                    text: r.text,
+                    disk_text: r.disk_text,
+                    state: r.disk,
+                });
+                continue;
+            }
+            let i = match self
+                .editor
+                .buffers
+                .iter()
+                .position(|b| b.path == Some(path.clone()))
+            {
+                Some(i) => i,
+                None => {
+                    if self.editor.open(&path, self.highlighter).is_err() {
+                        // 保存前に名前だけ付いていたバッファ (ディスクに実体が無い)
+                        self.editor.new_untitled();
+                        let last = self.editor.buffers.len() - 1;
+                        let b = &mut self.editor.buffers[last];
+                        b.path = Some(path.clone());
+                        b.title = r.title.clone();
+                        last
+                    } else {
+                        match self
+                            .editor
+                            .buffers
+                            .iter()
+                            .position(|b| b.path == Some(path.clone()))
+                        {
+                            Some(i) => i,
+                            None => continue,
+                        }
+                    }
+                }
+            };
+            let b = &mut self.editor.buffers[i];
+            // ディスクの内容として読み込んだ時点のハッシュを覚えておき、
+            // 本文を差し替えたあとで戻す = 「未保存」の印がちゃんと残る。
+            let base = b.saved_hash;
+            b.reset_text(r.text);
+            b.saved_hash = base;
+            self.queue_lsp_change(i);
+            restored += 1;
+        }
+        if restored > 0 {
+            self.toast(
+                trf(
+                    "↩ 未保存だった {n} 件の本文を復元しました",
+                    &[("n", restored.to_string())],
+                ),
+                true,
+            );
+        }
+        // 競合していない分は退避を最新化する (戻した本文はまだ未保存のまま)
+        self.hotexit_fingerprint = self.hotexit_fingerprint();
+        self.hotexit_flush();
+    }
+
+    /// 復元した本文とディスクが食い違っていたときに選ばせる小窓。
+    ///
+    /// **どちらかを勝手に採らない。** 退避を採ればディスクは上書きされず
+    /// 未保存のまま残り、ディスクを採れば退避だけが捨てられる。
+    fn hotexit_conflict_window(&mut self, ctx: &egui::Context) {
+        if self.hotexit_conflicts.is_empty() {
+            return;
+        }
+        let theme = self.theme.clone();
+        let mut keep: Option<usize> = None;
+        let mut drop_one: Option<usize> = None;
+        let mut diff: Option<usize> = None;
+        let mut keep_all = false;
+        let mut drop_all = false;
+        let mut open = true;
+        egui::Window::new(tr("⚠ 未保存の復元とディスクが食い違っています"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_size([560.0, 320.0])
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(tr(
+                        "退避しておいた未保存の本文と、いまのディスクの内容が違います。どちらを開くか選んでください (ディスクは書き換えません)。",
+                    ))
+                    .size(11.5)
+                    .color(theme.text_dim),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("zv-hotexit-conflicts")
+                    .max_height(220.0)
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        for (i, c) in self.hotexit_conflicts.iter().enumerate() {
+                            let avail = ui.available_width();
+                            ui.horizontal_wrapped(|ui| {
+                                ui.set_max_width(avail);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&c.title).size(12.0).strong(),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(c.path.to_string_lossy());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(tr(c.state.reason()))
+                                            .size(11.0)
+                                            .color(theme.warn),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.set_max_width(avail);
+                                if ui
+                                    .button(tr("復元した本文を開く"))
+                                    .on_hover_text(tr(
+                                        "未保存のまま開きます。保存するまでディスクは変わりません",
+                                    ))
+                                    .clicked()
+                                {
+                                    keep = Some(i);
+                                }
+                                if ui
+                                    .button(tr("ディスクを開く"))
+                                    .on_hover_text(tr("退避しておいた本文は捨てます"))
+                                    .clicked()
+                                {
+                                    drop_one = Some(i);
+                                }
+                                if c.disk_text.is_some()
+                                    && ui
+                                        .button(tr("差分を見る"))
+                                        .on_hover_text(tr("ディスクと復元した本文を並べます"))
+                                        .clicked()
+                                {
+                                    diff = Some(i);
+                                }
+                            });
+                            ui.separator();
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    if ui.button(tr("すべて復元した本文を開く")).clicked() {
+                        keep_all = true;
+                    }
+                    if ui.button(tr("すべてディスクを開く")).clicked() {
+                        drop_all = true;
+                    }
+                });
+            });
+        // 「×」で閉じたら、まだ選んでいない分は安全側 (本文を失わない側) へ倒す
+        if !open {
+            keep_all = true;
+        }
+        if let Some(i) = diff {
+            let c = &self.hotexit_conflicts[i];
+            let (path, text) = (c.path.clone(), c.text.clone());
+            let disk = c.disk_text.clone().unwrap_or_default();
+            self.open_hotexit_diff(&path, &disk, &text);
+            return;
+        }
+        let take: Vec<(HotExitConflict, bool)> = if keep_all {
+            std::mem::take(&mut self.hotexit_conflicts)
+                .into_iter()
+                .map(|c| (c, true))
+                .collect()
+        } else if drop_all {
+            std::mem::take(&mut self.hotexit_conflicts)
+                .into_iter()
+                .map(|c| (c, false))
+                .collect()
+        } else if let Some(i) = keep.or(drop_one) {
+            let use_saved = keep.is_some();
+            vec![(self.hotexit_conflicts.remove(i), use_saved)]
+        } else {
+            Vec::new()
+        };
+        for (c, use_saved) in take {
+            self.apply_hotexit_choice(c, use_saved);
+        }
+    }
+
+    /// 競合 1 件の決着をつける。`use_saved` なら退避の本文で開き (未保存)、
+    /// そうでなければディスクをそのまま開く (退避は捨てる)。
+    fn apply_hotexit_choice(&mut self, c: HotExitConflict, use_saved: bool) {
+        let opened = self.editor.open(&c.path, self.highlighter).is_ok();
+        if !use_saved {
+            if !opened {
+                self.toast_warn(trf(
+                    "⚠ {title} を開けませんでした",
+                    &[("title", c.title.clone())],
+                ));
+            }
+            self.hotexit_flush();
+            return;
+        }
+        let i = match self
+            .editor
+            .buffers
+            .iter()
+            .position(|b| b.path == Some(c.path.clone()))
+        {
+            Some(i) => i,
+            None => {
+                // ディスクから消えていた: 名前を持った未保存タブとして復活させる
+                self.editor.new_untitled();
+                let last = self.editor.buffers.len() - 1;
+                let b = &mut self.editor.buffers[last];
+                b.path = Some(c.path.clone());
+                b.title = c.title.clone();
+                last
+            }
+        };
+        let b = &mut self.editor.buffers[i];
+        // ディスクから読んだ時点のハッシュへ戻す = 未保存印が必ず残る。
+        // ディスクを書き換えるのは、この後ユーザーが保存したときだけ。
+        let base = b.saved_hash;
+        b.reset_text(c.text);
+        b.saved_hash = base;
+        self.queue_lsp_change(i);
+        self.hotexit_flush();
+    }
+
+    /// 退避した本文とディスクの差分を読み取り専用タブで見せる。
+    ///
+    /// 描画は既存の unified diff ビューをそのまま使う
+    /// (`BufferKind::CommitDiff` = 1 本しか出ない読み取り専用の差分タブ)。
+    /// 新しいタブ種別を足すより、既にある差分の見せ方に揃える方が良い。
+    fn open_hotexit_diff(&mut self, path: &Path, disk: &str, saved: &str) {
+        let title = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let mut text = format!(
+            "--- {}\n+++ {}\n",
+            tr("ディスク"),
+            tr("復元した未保存の本文")
+        );
+        text.push_str(&unified_lines(disk, saved, HOTEXIT_DIFF_MAX_CELLS));
+        self.editor.open_virtual(
+            trf("差分: {title}", &[("title", title)]),
+            text,
+            crate::editor::BufferKind::CommitDiff,
+        );
+    }
+
+    /// 設定画面 (VS Code の「設定 (UI)」相当)。
+    ///
+    /// 一覧・あいまい検索・`@modified`・変更マーカー・既定へ戻す、そして
+    /// GUI で表現しきれない設定のための「config.toml を直接編集」。
+    /// 値の書き戻しは [`config::save_settings`] が**その行だけ**を差し替える。
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let mut open = self.settings_open;
+        let mut query = std::mem::take(&mut self.settings_ui.query);
+        let mut only_modified = self.settings_ui.only_modified;
+        let rows = config::settings_rows(&self.cfg, &query, only_modified);
+        // このフレームで確定した変更 (キー → 新しい値)
+        let mut changed: Vec<(&'static str, config::SettingValue)> = Vec::new();
+        let mut reset_all = false;
+        let mut open_toml = false;
+
+        egui::Window::new(tr("⚙ 設定"))
+            .open(&mut open)
+            .default_size([680.0, 520.0])
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(tr("検索")).size(11.5).color(theme.text_dim));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .id_salt("zv-settings-query")
+                            .hint_text(tr("設定名 / 説明で絞り込み (@modified も使えます)"))
+                            .desired_width(220.0),
+                    );
+                    ui.checkbox(&mut only_modified, tr("変更したものだけ"));
+                    if ui
+                        .button(tr("config.toml"))
+                        .on_hover_text(tr("GUI に無い設定はテキストで直接編集します"))
+                        .clicked()
+                    {
+                        open_toml = true;
+                    }
+                    if ui
+                        .button(tr("すべて既定へ"))
+                        .on_hover_text(tr("この一覧の設定を全部、出荷時の値へ戻します"))
+                        .clicked()
+                    {
+                        reset_all = true;
+                    }
+                });
+                ui.separator();
+                if rows.is_empty() {
+                    // 空状態は利用可能領域の中央に 1 枚だけ (下に取り残さない)
+                    let msg = if only_modified || query.contains("@modified") {
+                        tr("既定から変えた設定はありません")
+                    } else {
+                        tr("一致する設定がありません")
+                    };
+                    ui.allocate_ui_with_layout(
+                        ui.available_size(),
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                        |ui| {
+                            ui.label(RichText::new(msg).color(theme.text_dim));
+                        },
+                    );
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("zv-settings-rows")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let avail = ui.available_width();
+                        let cols = config::settings_columns(avail);
+                        let row_h = ui.spacing().interact_size.y;
+                        // 絞り込み中は一致度の順に並ぶので、グループ見出しは
+                        // 出さない (同じ見出しが何度も割り込んで読みにくくなる)。
+                        let show_groups = query
+                            .split_whitespace()
+                            .all(|t| t.eq_ignore_ascii_case("@modified"));
+                        let mut group = "";
+                        for d in &rows {
+                            if show_groups && d.group != group {
+                                group = d.group;
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(tr(group))
+                                        .size(11.0)
+                                        .strong()
+                                        .color(theme.accent),
+                                );
+                            }
+                            let modified = config::is_setting_modified(&self.cfg, d.key);
+                            let Some(cur) = config::setting_value(&self.cfg, d.key) else {
+                                continue;
+                            };
+                            ui.horizontal(|ui| {
+                                ui.set_max_width(cols.total_w().min(avail));
+                                ui.spacing_mut().item_spacing.x = config::SETTINGS_COL_GAP;
+                                // 変更マーカー (VS Code の左端の色バー)
+                                settings_col(ui, cols.marker_w, row_h, |ui| {
+                                    if modified {
+                                        let r = ui.max_rect();
+                                        ui.painter().rect_filled(r, 1.0, theme.accent);
+                                    }
+                                });
+                                settings_col(ui, cols.label_w, row_h, |ui| {
+                                    let doc = config::setting_doc(d.key);
+                                    let hover = if doc.is_empty() {
+                                        d.key.to_string()
+                                    } else {
+                                        format!("{}\n\n{}", d.key, tr(&doc))
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(tr(d.label)).size(11.5).color(theme.text),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(hover);
+                                });
+                                settings_col(ui, cols.value_w, row_h, |ui| {
+                                    if let Some(v) = self.setting_widget(ui, d, &cur) {
+                                        changed.push((d.key, v));
+                                    }
+                                });
+                                if cols.reset_w > 0.0 {
+                                    settings_col(ui, cols.reset_w, row_h, |ui| {
+                                        let label = if cols.icon_only {
+                                            "↺".to_string()
+                                        } else {
+                                            tr("既定へ戻す")
+                                        };
+                                        let btn =
+                                            egui::Button::new(RichText::new(label).size(11.0));
+                                        if ui
+                                            .add_enabled(modified, btn)
+                                            .on_hover_text(tr("この設定だけを出荷時の値へ戻します"))
+                                            .clicked()
+                                        {
+                                            if let Some(def) = config::setting_default(d.key) {
+                                                changed.push((d.key, def));
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                            // 説明は 1 行だけ添える (畳んだ幅でもホバーで全文が出る)
+                            let doc = config::setting_doc(d.key);
+                            if !doc.is_empty() {
+                                let one = doc.lines().next().unwrap_or_default().to_string();
+                                ui.horizontal(|ui| {
+                                    ui.set_max_width(avail);
+                                    ui.add_space(cols.marker_w + config::SETTINGS_COL_GAP);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(tr(&one))
+                                                .size(10.5)
+                                                .color(theme.text_dim),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(tr(&doc));
+                                });
+                            }
+                        }
+                    });
+            });
+
+        self.settings_open = open;
+        self.settings_ui.query = query;
+        self.settings_ui.only_modified = only_modified;
+        if reset_all {
+            for d in config::setting_defs() {
+                if let Some(def) = config::setting_default(d.key) {
+                    changed.push((d.key, def));
+                }
+            }
+            self.settings_ui.drafts.clear();
+        }
+        if !changed.is_empty() {
+            self.apply_settings(changed, ctx);
+        }
+        if open_toml {
+            config::ensure_default();
+            self.open_path(&config::config_path());
+            self.settings_open = false;
+        }
+    }
+
+    /// 設定 1 行の値ウィジェット。確定した新しい値だけを返す。
+    fn setting_widget(
+        &mut self,
+        ui: &mut egui::Ui,
+        d: &config::SettingDef,
+        cur: &config::SettingValue,
+    ) -> Option<config::SettingValue> {
+        use config::{SettingKind as K, SettingValue as V};
+        let w = ui.available_width();
+        match (d.kind, cur) {
+            (K::Bool, V::Bool(b)) => {
+                let mut on = *b;
+                // Checkbox は自動採番の ID なので push_id は要らない
+                if ui.checkbox(&mut on, "").changed() {
+                    return Some(V::Bool(on));
+                }
+            }
+            (K::Int { min, max }, V::Int(i)) => {
+                let mut v = *i;
+                if ui
+                    .add_sized(
+                        [w, ui.spacing().interact_size.y],
+                        egui::DragValue::new(&mut v).range(min..=max),
+                    )
+                    .changed()
+                {
+                    return Some(V::Int(v.clamp(min, max)));
+                }
+            }
+            (K::Float { min, max }, V::Float(f)) => {
+                let mut v = *f;
+                if ui
+                    .add_sized(
+                        [w, ui.spacing().interact_size.y],
+                        egui::DragValue::new(&mut v).speed(0.1).range(min..=max),
+                    )
+                    .changed()
+                {
+                    return Some(V::Float(v.clamp(min, max)));
+                }
+            }
+            (K::Choice(opts), V::Text(s)) => {
+                let mut picked: Option<&str> = None;
+                // 可変長リストの中の ComboBox は ID を明示する
+                // (`make_persistent_id` を通るので自動採番されない)
+                egui::ComboBox::from_id_salt(("zv-set-combo", d.key))
+                    .selected_text(s.as_str())
+                    .width(w)
+                    .show_ui(ui, |ui| {
+                        for o in opts {
+                            if ui.selectable_label(s == o, *o).clicked() {
+                                picked = Some(o);
+                            }
+                        }
+                    });
+                if let Some(o) = picked {
+                    return Some(V::Text(o.to_string()));
+                }
+            }
+            (K::Text, V::Text(s)) => {
+                // 1 文字ごとに config.toml を書かないよう、確定するまで下書きに置く
+                let draft = self
+                    .settings_ui
+                    .drafts
+                    .entry(d.key.to_string())
+                    .or_insert_with(|| s.clone());
+                let r = ui.add(
+                    egui::TextEdit::singleline(draft)
+                        .id_salt(("zv-set-text", d.key))
+                        .desired_width(w),
+                );
+                let typed = draft.clone();
+                if r.lost_focus() {
+                    // 欄を離れた (Enter / 別の欄へ移った) ところで確定する
+                    self.settings_ui.drafts.remove(d.key);
+                    if typed != *s {
+                        return Some(V::Text(typed));
+                    }
+                } else if !r.has_focus() {
+                    // 触っていない間は設定の値をそのまま映す。
+                    // 下書きを持ち越すと、他の経路 (🎨 メニュー等) で
+                    // 変わった値が画面に反映されない。
+                    self.settings_ui.drafts.remove(d.key);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// 変更を `Config` へ入れ、config.toml へ書き戻し、画面へ反映する。
+    fn apply_settings(
+        &mut self,
+        changed: Vec<(&'static str, config::SettingValue)>,
+        ctx: &egui::Context,
+    ) {
+        let mut write: std::collections::BTreeMap<String, String> = Default::default();
+        let mut touched = false;
+        for (key, v) in changed {
+            if !config::set_setting_value(&mut self.cfg, key, &v) {
+                continue;
+            }
+            write.insert(key.to_string(), v.to_toml());
+            touched = true;
+        }
+        if !touched {
+            return;
+        }
+        if let Err(e) = config::save_settings(&write) {
+            self.toast_warn(e);
+        }
+        self.apply_config_to_ui(ctx);
+    }
+
+    /// 設定値を「いま見えているもの」へ効かせる。
+    /// 設定画面から変えた直後と、config.toml を読み直した直後に通る。
+    fn apply_config_to_ui(&mut self, ctx: &egui::Context) {
+        self.theme = resolve_theme(&self.cfg.theme);
+        theme::apply(ctx, &self.theme);
+        apply_ui_zoom(ctx, self.cfg.ui_zoom);
+        self.tree.show_hidden = self.cfg.show_hidden_files;
+        self.tree.apply_config(&self.cfg);
+        self.tree.invalidate();
+        self.format_on_save = self.cfg.format_on_save;
+        self.bracket_colorization = self.cfg.bracket_colorization;
+        self.lsp_highlight_on = self.cfg.lsp_highlight_occurrences;
+        self.rulers = normalize_rulers(&self.cfg.rulers);
+        self.hotexit
+            .set_max_bytes(self.cfg.hot_exit_max_kb.saturating_mul(1024));
+        // 画面に出ている値が変わるので 1 フレームだけ描き直す
+        ctx.request_repaint();
     }
 
     /// キーバインド編集 UI (VS Code の ⌘K ⌘S 相当)。
@@ -29321,6 +30108,79 @@ fn license_status_head(
         license::LicenseStatus::BadSignature => ("⚠", tr("キーの署名が不正です"), theme.err),
         license::LicenseStatus::Unlicensed => ("🆓", tr("未ライセンス (無料版)"), theme.text_dim),
     }
+}
+
+/// 設定画面の 1 行ぶんの列を、決めた幅で描く。
+///
+/// **どの幅でも見切れない**ための唯一の入口。幅は
+/// [`config::settings_columns`] が可用幅から決めた値をそのまま渡す。
+fn settings_col(ui: &mut egui::Ui, w: f32, h: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(w.max(0.0), h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_width(w.max(0.0));
+            add(ui);
+        },
+    );
+}
+
+/// Hot Exit の差分で LCS を諦める上限 (旧行数 × 新行数)。
+/// 超えたら「どこが違うか」ではなく「違う」ことだけを出す。
+const HOTEXIT_DIFF_MAX_CELLS: usize = 2_000_000;
+
+/// 2 つの本文を行単位で比べ、unified diff 風のテキストにする (純粋関数)。
+///
+/// Hot Exit の競合で「退避とディスクのどちらを採るか」を選ぶための表示。
+/// マス数が `max_cells` を超えるときは LCS を諦め、行数だけを出す —
+/// 選ぶのに必要なのは「違う」ことの提示であって、完全な差分ではない。
+fn unified_lines(old: &str, new: &str, max_cells: usize) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    if a == b {
+        return tr("(行の内容に違いはありません — 改行コードだけが違う可能性があります)\n");
+    }
+    let (n, m) = (a.len(), b.len());
+    if n.saturating_mul(m) > max_cells {
+        return trf(
+            "@@ 大きすぎるため差分を計算していません @@\n-{old_n} 行 (ディスク)\n+{new_n} 行 (復元した本文)\n",
+            &[("old_n", n.to_string()), ("new_n", m.to_string())],
+        );
+    }
+    // dp[i][j] = a[i..] と b[j..] の LCS 長 (計算量・記憶量とも n*m)
+    let mut dp = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[at(i, j)] = if a[i] == b[j] {
+                dp[at(i + 1, j + 1)] + 1
+            } else {
+                dp[at(i + 1, j)].max(dp[at(i, j + 1)])
+            };
+        }
+    }
+    let mut out = String::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            out.push_str(&format!(" {}\n", a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[at(i + 1, j)] >= dp[at(i, j + 1)] {
+            out.push_str(&format!("-{}\n", a[i]));
+            i += 1;
+        } else {
+            out.push_str(&format!("+{}\n", b[j]));
+            j += 1;
+        }
+    }
+    for l in &a[i..] {
+        out.push_str(&format!("-{l}\n"));
+    }
+    for l in &b[j..] {
+        out.push_str(&format!("+{l}\n"));
+    }
+    out
 }
 
 /// キーバインド編集 UI の 1 行ぶんの列を、決めた幅で描く。
@@ -33016,6 +33876,115 @@ mod wave2_tests {
         assert!(
             body.contains("editor_split::tab_rects(") && body.contains("ui.scroll_to_rect("),
             "アクティブタブへ自動スクロールしていない"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Hot Exit の差分表示 / 設定画面への到達経路
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn 復元とディスクの差分は追加と削除を並べる() {
+        let disk = "one\ntwo\nthree\n";
+        let saved = "one\nTWO\nthree\nfour\n";
+        let d = unified_lines(disk, saved, HOTEXIT_DIFF_MAX_CELLS);
+        assert!(d.contains("-two\n"), "{d}");
+        assert!(d.contains("+TWO\n"), "{d}");
+        assert!(d.contains(" one\n") && d.contains(" three\n"), "{d}");
+        assert!(d.contains("+four\n"), "{d}");
+        // 片側が空でも壊れない
+        assert!(unified_lines("", "a\n", HOTEXIT_DIFF_MAX_CELLS).contains("+a\n"));
+        assert!(unified_lines("a\n", "", HOTEXIT_DIFF_MAX_CELLS).contains("-a\n"));
+        assert!(unified_lines("", "", HOTEXIT_DIFF_MAX_CELLS).contains("違いはありません"));
+        // CJK と絵文字を含む行も落ちない
+        let d = unified_lines("日本語\n", "日本語👨‍👩‍👧‍👦\n", HOTEXIT_DIFF_MAX_CELLS);
+        assert!(d.contains("-日本語\n") && d.contains("+日本語👨‍👩‍👧‍👦\n"), "{d}");
+    }
+
+    #[test]
+    fn 巨大な差分は計算せず行数だけ出す() {
+        // 上限を超えたら LCS を諦める (フレームを落とさない)
+        let a: String = (0..200).map(|i| format!("a{i}\n")).collect();
+        let b: String = (0..200).map(|i| format!("b{i}\n")).collect();
+        let d = unified_lines(&a, &b, 100);
+        assert!(d.contains("大きすぎるため"), "{d}");
+        assert!(d.contains("200"), "{d}");
+        // 上限内なら普通に差分が出る
+        assert!(!unified_lines(&a, &b, 1_000_000).contains("大きすぎるため"));
+    }
+
+    /// 設定画面には**必ず**到達経路がある (パレット + メニュー)。
+    /// 実装したのに繋いでいない、を構造で検出する。
+    #[test]
+    fn 設定画面はパレットとメニューから開ける() {
+        let app_src = include_str!("app.rs").replace("\r\n", "\n");
+        let menu_src = include_str!("menu_bar.rs").replace("\r\n", "\n");
+        let head = app_src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or("");
+        assert!(
+            head.contains("Cmd::OpenSettings => self.settings_open = true"),
+            "設定画面を開くコマンドの処理が無い"
+        );
+        assert!(
+            palette_body(&app_src).contains("Cmd::OpenSettings"),
+            "パレットに設定画面が無い"
+        );
+        assert!(
+            menu_src.contains("Cmd::OpenSettings"),
+            "メニューに設定画面が無い"
+        );
+        // config.toml を直接編集する口も必ず残す (GUI で表現しきれない設定用)
+        assert!(
+            palette_body(&app_src).contains("Cmd::OpenConfig"),
+            "config.toml を開く口が消えている"
+        );
+        assert!(
+            head.contains("self.settings_window(ctx);"),
+            "設定画面が描画されていない"
+        );
+        assert!(
+            head.contains("self.hotexit_conflict_window(ctx);"),
+            "Hot Exit の競合ダイアログが描画されていない"
+        );
+    }
+
+    /// Hot Exit が「編集したときだけ」働くことをソースで固定する。
+    /// 常時 I/O / 常時再描画は設計原則 3 (アイドル時のコストはゼロ) 違反。
+    #[test]
+    fn hot_exitは編集があったときだけ退避する() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let head = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or("");
+        assert!(
+            head.contains("self.hotexit_tick(ctx);"),
+            "退避の刻みが update から呼ばれていない"
+        );
+        // 指紋は本文をハッシュしない (巨大ファイルで毎フレーム走らせない)
+        let at = head
+            .find("fn hotexit_fingerprint(&self)")
+            .expect("hotexit_fingerprint が無い");
+        let mut end = (at + 900).min(head.len());
+        while end < head.len() && !head.is_char_boundary(end) {
+            end += 1;
+        }
+        let body = &head[at..end];
+        assert!(
+            !body.contains("hash_str(") && !body.contains(".dirty()"),
+            "指紋が本文をハッシュしている (毎フレーム全文を舐めることになる)"
+        );
+        assert!(
+            body.contains("history.revision()"),
+            "履歴の安い版数を見ていない"
+        );
+        // 保存したら即座に退避を掃除する (次の間隔まで残さない)
+        assert!(
+            head.contains("// 保存した本文の退避はもう要らない (ゴミを残さない)\n                self.hotexit_flush();")
+                || head.contains("// 保存した本文の退避はもう要らない (ゴミを残さない)\n            self.hotexit_flush();"),
+            "保存後に退避を掃除していない"
         );
     }
 

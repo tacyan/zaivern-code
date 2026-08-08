@@ -13,6 +13,13 @@ pub const DEFAULT_INDEX_MAX_DEPTH: usize = 32;
 /// ツリーの 1 ディレクトリで一度に描く既定の行数。
 /// 画面に入るのは数十行なので、これを超えたぶんは「さらに N 件」に畳む。
 pub const DEFAULT_TREE_DIR_PAGE: usize = 300;
+/// Hot Exit が 1 バッファあたりに退避する既定の上限 (KiB)。
+/// 普通のソースは数十 KiB なので余裕があり、生成物やログを開いたまま
+/// 落ちても数百 MiB を `~/.zaivern` に抱え込まない値にしてある。
+pub const DEFAULT_HOT_EXIT_MAX_KB: usize = 4096;
+/// Hot Exit の退避を書き出す既定の最短間隔 (ミリ秒)。
+/// 打鍵のたびに書くと大きなファイルで I/O が飽和するので必ず間引く。
+pub const DEFAULT_HOT_EXIT_INTERVAL_MS: u64 = 1500;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -82,6 +89,19 @@ pub struct Config {
     /// 取り消し履歴が抱える差分の合計バイト上限 (タブ 1 枚あたり)。
     /// 巨大な一括置換を何度もやっても、ここで頭打ちになる。
     pub undo_max_bytes: usize,
+
+    /// 未保存の本文を退避して再起動後に復元する (VS Code の `files.hotExit`)。
+    /// **既定はオン** — 落ちたら本文が消えるのはデータ損失なので、既定で守る。
+    /// 退避先は `~/.zaivern/hotexit/<ワークスペース>/`。保存して閉じれば消える。
+    pub hot_exit: bool,
+
+    /// Hot Exit が 1 バッファあたりに退避する上限 (KiB)。
+    /// 超えたバッファは退避せず、その旨をトーストで伝える (無音で落とさない)。
+    pub hot_exit_max_kb: usize,
+
+    /// Hot Exit の退避を書き出す最短間隔 (ミリ秒)。
+    /// 打鍵のたびに書かないためのスロットリング。0 にすると変更のたびに書く。
+    pub hot_exit_interval_ms: u64,
 
     /// エディタ上部のブレッドクラム (`ワークスペース › フォルダ › ファイル › シンボル`)。
     /// **既定はオン** — 高さ 1 行ぶんで、どの言語でも (LSP 無しでも) 必ず出せる。
@@ -408,6 +428,9 @@ impl Default for Config {
             undo_merge_ms: crate::editor::UNDO_MERGE_MS,
             undo_max_steps: crate::editor::UNDO_MAX_STEPS,
             undo_max_bytes: crate::editor::UNDO_MAX_BYTES,
+            hot_exit: true,
+            hot_exit_max_kb: DEFAULT_HOT_EXIT_MAX_KB,
+            hot_exit_interval_ms: DEFAULT_HOT_EXIT_INTERVAL_MS,
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
             git_blame: false,
@@ -746,8 +769,11 @@ pub const DEFAULT_CONFIG: &str = r#"# ══════════════
 # カラーテーマJSON (VS Code 互換形式) へのフルパスも指定できます
 # (~/.zaivern/themes とプラグイン同梱のテーマは 🎨 メニューに自動で並びます)
 theme = "zaivern-dark"
+# エディタ本文の文字サイズ (pt)。⌘+ / ⌘- の画面ズームとは別で、本文だけに効きます。
 editor_font_size = 15.0
+# ターミナル / エージェントタブの文字サイズ (pt)。
 terminal_font_size = 13.0
+# ドット始まりのファイル・フォルダをツリーと検索に出す。
 show_hidden_files = true
 
 # .gitignore (+ .git/info/exclude + core.excludesFile) を尊重して
@@ -760,12 +786,20 @@ show_hidden_files = true
 
 # ファイル検索 (⌘P) の索引の上限。上限に達したらパレットにその旨を出します
 # (黙って切り捨てません)。索引はバックグラウンドで作るので UI は止まりません。
+#   index_max_files = 索引に載せる最大件数。
+#   index_max_depth = 索引が潜る最大の深さ (ルート直下 = 1)。
 # index_max_files = 50000
 # index_max_depth = 32
 
 # ツリーの 1 フォルダで一度に描く行数。超えたぶんは「さらに N 件」に畳みます
 # (巨大フォルダで数万行を描いてカクつかせないため)。
 # tree_dir_page = 300
+
+# ドラッグ&ドロップで移動するとき「"X" を "Y" へ移動しますか?」を出す。
+# オフにしても、同名ファイルを潰す操作の確認だけは必ず出ます。
+# confirm_drag_and_drop = true
+# 削除をゴミ箱へ送る。オフにすると削除は常に完全削除 (取り消せません)。
+# enable_trash = true
 
 # 画面全体のズーム (0.5〜3.0)。UI の全部が一緒に拡大縮小します。
 # ⌘+ / ⌘- / ⌘0 で変えた値は ~/.zaivern/state.toml に覚えるので、
@@ -775,6 +809,8 @@ show_hidden_files = true
 
 # エディタ本文の折り返しと空白文字 (·/→) の可視化
 # (表示メニュー・コマンドパレットの「折り返し切替」「空白文字表示切替」でも変更できます)
+#   word_wrap       = 本文を可用幅で折り返す。
+#   show_whitespace = スペースを「·」タブを「→」で見せる。
 # word_wrap = false
 # show_whitespace = false
 
@@ -796,11 +832,29 @@ show_hidden_files = true
 # undo_max_steps = 400
 # undo_max_bytes = 4194304
 
+# ── Hot Exit (未保存の本文の復元) ──
+# 未保存のまま落ちても、次の起動で本文を戻します (VS Code の files.hotExit 相当)。
+# 退避先は ~/.zaivern/hotexit/<ワークスペース>/ で、保存して閉じれば消えます。
+# ディスク側が外から書き換わっていた場合は、黙って戻さず選ばせます。
+#   hot_exit             = 未保存の本文を退避して復元する。既定はオン。
+#   hot_exit_max_kb      = 1 バッファあたりの退避上限 (KiB)。超えたぶんは
+#                          退避せず、その旨をトーストで伝えます。
+#   hot_exit_interval_ms = 退避を書き出す最短間隔 (ミリ秒)。打鍵のたびに
+#                          書かないためのスロットリングです。
+# hot_exit = true
+# hot_exit_max_kb = 4096
+# hot_exit_interval_ms = 1500
+
 # ミニマップ (エディタ右端の遠景) とブレッドクラム (上部のパンくず)
 # (表示メニュー・コマンドパレットの「ミニマップの表示切替」「ブレッドクラムの表示切替」でも変更できます)
-# ミニマップは本文の幅を 64px 使うため既定はオフ。狭い画面では自動的に隠れます
+#   minimap     = エディタ右端の遠景。本文の幅を 64px 使うため既定はオフ。
+#                 狭い画面では設定がオンでも自動的に隠れます。
+#   breadcrumbs = 上部のパンくず (ワークスペース › フォルダ › ファイル › シンボル)。
 # minimap = false
 # breadcrumbs = true
+# 差分ビューの既定の表示: "side_by_side" (左右 2 列) | "inline" (1 列)。
+# 幅が足りないときは設定に関わらず 1 列へ自動で縮退します。
+# diff_view = "side_by_side"
 # ガターに git blame (著者 · 相対日時) を出す。既定はオフ
 # (表示メニュー・コマンドパレットの「Git blame の表示切替」でも変更できます)
 # git_blame = false
@@ -819,6 +873,8 @@ show_hidden_files = true
 # 縦のルーラーを引く桁 (等幅の桁数)。既定は空 = 1 本も引きません
 # rulers = [80, 120]
 # 開いたファイルの中身からインデントを推定する (オフなら下の 2 つをそのまま使う)
+#   tab_size      = インデント 1 段の桁数。
+#   insert_spaces = インデントにタブではなくスペースを使う。
 # detect_indentation = true
 # tab_size = 4
 # insert_spaces = true
@@ -858,6 +914,12 @@ show_pet = true
 # webhook_url = "https://ntfy.sh/あなたのトピック名"
 # webhook_url = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
 # webhook_url = "https://discord.com/api/webhooks/XXX/YYY"
+
+# ── SSH リモート ──────────────
+# 踏み台の接続先 ("user@host" / "user@host:port")。空 = 未設定。
+# 鍵とパスフレーズはここに書きません — 認証は OS の ssh と ~/.ssh/config
+# (ssh-agent) に任せます。ここに置くのは接続先だけです。
+# ssh_tunnel_host = "user@example.com"
 
 # ── ペットの好み設定 ──────────────
 # pet_variant = "blocky"   # 見た目: "blocky" | "crab" | "cat" | "cloud"
@@ -1707,6 +1769,987 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+//  設定 GUI の土台 — 一覧 / 検索 / @modified / 既定へ戻す / 書き戻し
+// ═════════════════════════════════════════════════════════════════════════
+//
+// **説明文は 1 か所にしか無い**: [`DEFAULT_CONFIG`] のコメント。
+// GUI はそこを実行時に読み取る ([`setting_doc`])。ここに同じ文言を
+// 書き写すと、片方だけ直した瞬間に嘘になるので絶対に増やさない。
+//
+// 書き戻しは `rewrite_keybindings_section` / `rewrite_plugins_section` と
+// 同じ作法 — **触るのは対象の行だけ**。手書きのコメントも、GUI が知らない
+// 設定も、セクションも 1 行も消さない。
+
+/// 設定 1 項目の型。GUI がどのウィジェットを出すかを決める。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SettingKind {
+    Bool,
+    /// 整数 (件数・ミリ秒・バイト)。範囲は GUI が丸めるためのもの。
+    Int {
+        min: i64,
+        max: i64,
+    },
+    Float {
+        min: f32,
+        max: f32,
+    },
+    /// 自由入力 (パス・URL・言語タグ)。
+    Text,
+    /// 決められた候補から選ぶ。
+    Choice(&'static [&'static str]),
+}
+
+/// 設定 1 項目の値。`Config` のフィールド型の違いをここへ畳む。
+#[derive(Clone, PartialEq, Debug)]
+pub enum SettingValue {
+    Bool(bool),
+    Int(i64),
+    Float(f32),
+    Text(String),
+}
+
+impl SettingValue {
+    /// config.toml へ書くリテラル表現。
+    pub fn to_toml(&self) -> String {
+        match self {
+            Self::Bool(b) => b.to_string(),
+            Self::Int(i) => i.to_string(),
+            // 整数に見える浮動小数も TOML の float として書く
+            // (`15` と書くと次回 f32 として読めずファイル全体が落ちる)
+            Self::Float(f) => {
+                let s = format!("{f}");
+                if s.contains(['.', 'e', 'E']) {
+                    s
+                } else {
+                    format!("{s}.0")
+                }
+            }
+            Self::Text(s) => toml::Value::String(s.clone()).to_string(),
+        }
+    }
+}
+
+/// 設定 1 項目の定義。**説明文は持たない** (テンプレートから引く)。
+#[derive(Clone, Copy)]
+pub struct SettingDef {
+    /// config.toml のキー名。`Config` のフィールド名と一致させる。
+    pub key: &'static str,
+    /// 画面上のグループ見出し。
+    pub group: &'static str,
+    /// 画面上の項目名。
+    pub label: &'static str,
+    pub kind: SettingKind,
+}
+
+const APPROVAL_MODES: &[&str] = &["ask", "auto", "agent"];
+const DIFF_VIEWS: &[&str] = &["side_by_side", "inline"];
+const VOICE_ENGINES: &[&str] = &["auto", "mac", "powershell", "browser", "command", "off"];
+const VOICE_TARGETS: &[&str] = &["active", "broadcast"];
+
+/// GUI に出す設定の一覧。
+///
+/// ここに無い設定 (エージェントプリセット / キーバインド / プラグイン /
+/// 承認ポリシー) は、それぞれ専用の画面を持っているので二重に作らない。
+/// 表現しきれないものは「config.toml を直接編集」のボタンから触る。
+pub fn setting_defs() -> &'static [SettingDef] {
+    use SettingKind::*;
+    const G_LOOK: &str = "外観";
+    const G_EDITOR: &str = "エディタ";
+    const G_FILES: &str = "ファイル";
+    const G_SAVE: &str = "保存";
+    const G_RESTORE: &str = "復元";
+    const G_AGENT: &str = "エージェント";
+    const G_LINK: &str = "音声・連携";
+    &[
+        SettingDef {
+            key: "theme",
+            group: G_LOOK,
+            label: "テーマ",
+            kind: Text,
+        },
+        SettingDef {
+            key: "editor_font_size",
+            group: G_LOOK,
+            label: "エディタの文字サイズ",
+            kind: Float {
+                min: 6.0,
+                max: 48.0,
+            },
+        },
+        SettingDef {
+            key: "terminal_font_size",
+            group: G_LOOK,
+            label: "ターミナルの文字サイズ",
+            kind: Float {
+                min: 6.0,
+                max: 48.0,
+            },
+        },
+        SettingDef {
+            key: "ui_zoom",
+            group: G_LOOK,
+            label: "画面全体のズーム",
+            kind: Float { min: 0.5, max: 3.0 },
+        },
+        SettingDef {
+            key: "show_pet",
+            group: G_LOOK,
+            label: "デスクトップペットを出す",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "word_wrap",
+            group: G_EDITOR,
+            label: "本文を折り返す",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "show_whitespace",
+            group: G_EDITOR,
+            label: "空白文字を可視化する",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "minimap",
+            group: G_EDITOR,
+            label: "ミニマップを出す",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "breadcrumbs",
+            group: G_EDITOR,
+            label: "ブレッドクラムを出す",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "bracket_colorization",
+            group: G_EDITOR,
+            label: "括弧を深さで色分けする",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "inline_diagnostics",
+            group: G_EDITOR,
+            label: "行末に診断を出す",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "lsp_highlight_occurrences",
+            group: G_EDITOR,
+            label: "同一シンボルをハイライトする",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "git_blame",
+            group: G_EDITOR,
+            label: "ガターに git blame を出す",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "detect_indentation",
+            group: G_EDITOR,
+            label: "インデントを本文から推定する",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "tab_size",
+            group: G_EDITOR,
+            label: "インデント幅 (桁)",
+            kind: Int { min: 1, max: 16 },
+        },
+        SettingDef {
+            key: "insert_spaces",
+            group: G_EDITOR,
+            label: "インデントにスペースを使う",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "diff_view",
+            group: G_EDITOR,
+            label: "差分ビューの既定",
+            kind: Choice(DIFF_VIEWS),
+        },
+        SettingDef {
+            key: "undo_merge_ms",
+            group: G_EDITOR,
+            label: "取り消しをまとめる時間 (ms)",
+            kind: Int {
+                min: 0,
+                max: 10_000,
+            },
+        },
+        SettingDef {
+            key: "undo_max_steps",
+            group: G_EDITOR,
+            label: "取り消しの最大段数",
+            kind: Int {
+                min: 1,
+                max: 100_000,
+            },
+        },
+        SettingDef {
+            key: "undo_max_bytes",
+            group: G_EDITOR,
+            label: "取り消しの合計バイト上限",
+            kind: Int {
+                min: 1024,
+                max: 1 << 30,
+            },
+        },
+        SettingDef {
+            key: "show_hidden_files",
+            group: G_FILES,
+            label: "隠しファイルを表示する",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "respect_gitignore",
+            group: G_FILES,
+            label: ".gitignore を尊重する",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "dim_ignored_files",
+            group: G_FILES,
+            label: "無視されたファイルを薄く出す",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "index_max_files",
+            group: G_FILES,
+            label: "ファイル索引の上限件数",
+            kind: Int {
+                min: 100,
+                max: 5_000_000,
+            },
+        },
+        SettingDef {
+            key: "index_max_depth",
+            group: G_FILES,
+            label: "ファイル索引の最大深さ",
+            kind: Int { min: 1, max: 128 },
+        },
+        SettingDef {
+            key: "tree_dir_page",
+            group: G_FILES,
+            label: "ツリーの 1 回の表示件数",
+            kind: Int {
+                min: 10,
+                max: 100_000,
+            },
+        },
+        SettingDef {
+            key: "confirm_drag_and_drop",
+            group: G_FILES,
+            label: "ドラッグ移動を確認する",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "enable_trash",
+            group: G_FILES,
+            label: "削除をゴミ箱へ送る",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "preview_tabs",
+            group: G_FILES,
+            label: "プレビュータブを使う",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "tab_switch_mru",
+            group: G_FILES,
+            label: "タブ切替を最近使った順にする",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "trim_trailing_whitespace",
+            group: G_SAVE,
+            label: "保存時に行末の空白を落とす",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "trim_final_newlines",
+            group: G_SAVE,
+            label: "保存時に末尾の空行を落とす",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "insert_final_newline",
+            group: G_SAVE,
+            label: "保存時に最終行へ改行を入れる",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "format_on_save",
+            group: G_SAVE,
+            label: "保存時に整形する",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "hot_exit",
+            group: G_RESTORE,
+            label: "未保存の本文を復元する (Hot Exit)",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "hot_exit_max_kb",
+            group: G_RESTORE,
+            label: "退避の上限 (KiB / バッファ)",
+            kind: Int {
+                min: 0,
+                max: 1 << 20,
+            },
+        },
+        SettingDef {
+            key: "hot_exit_interval_ms",
+            group: G_RESTORE,
+            label: "退避の最短間隔 (ms)",
+            kind: Int {
+                min: 0,
+                max: 600_000,
+            },
+        },
+        SettingDef {
+            key: "restore_agents",
+            group: G_RESTORE,
+            label: "前回のエージェントを復元する",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "approval_mode",
+            group: G_AGENT,
+            label: "既定の権限モード",
+            kind: Choice(APPROVAL_MODES),
+        },
+        SettingDef {
+            key: "voice_engine",
+            group: G_LINK,
+            label: "音声認識エンジン",
+            kind: Choice(VOICE_ENGINES),
+        },
+        SettingDef {
+            key: "voice_target",
+            group: G_LINK,
+            label: "音声入力の届け先",
+            kind: Choice(VOICE_TARGETS),
+        },
+        SettingDef {
+            key: "voice_lang",
+            group: G_LINK,
+            label: "認識言語 (BCP-47)",
+            kind: Text,
+        },
+        SettingDef {
+            key: "webhook_url",
+            group: G_LINK,
+            label: "通知の Webhook URL",
+            kind: Text,
+        },
+        SettingDef {
+            key: "ssh_tunnel_host",
+            group: G_LINK,
+            label: "SSH リモートの踏み台",
+            kind: Text,
+        },
+    ]
+}
+
+/// 現在値を読む。未知のキーは None。
+pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
+    use SettingValue::{Bool as B, Float as F, Int as I, Text as T};
+    Some(match key {
+        "theme" => T(cfg.theme.clone()),
+        "editor_font_size" => F(cfg.editor_font_size),
+        "terminal_font_size" => F(cfg.terminal_font_size),
+        "ui_zoom" => F(cfg.ui_zoom),
+        "show_pet" => B(cfg.show_pet),
+        "word_wrap" => B(cfg.word_wrap),
+        "show_whitespace" => B(cfg.show_whitespace),
+        "minimap" => B(cfg.minimap),
+        "breadcrumbs" => B(cfg.breadcrumbs),
+        "bracket_colorization" => B(cfg.bracket_colorization),
+        "inline_diagnostics" => B(cfg.inline_diagnostics),
+        "lsp_highlight_occurrences" => B(cfg.lsp_highlight_occurrences),
+        "git_blame" => B(cfg.git_blame),
+        "detect_indentation" => B(cfg.detect_indentation),
+        "tab_size" => I(cfg.tab_size as i64),
+        "insert_spaces" => B(cfg.insert_spaces),
+        "diff_view" => T(cfg.diff_view.clone()),
+        "undo_merge_ms" => I(cfg.undo_merge_ms as i64),
+        "undo_max_steps" => I(cfg.undo_max_steps as i64),
+        "undo_max_bytes" => I(cfg.undo_max_bytes as i64),
+        "show_hidden_files" => B(cfg.show_hidden_files),
+        "respect_gitignore" => B(cfg.respect_gitignore),
+        "dim_ignored_files" => B(cfg.dim_ignored_files),
+        "index_max_files" => I(cfg.index_max_files as i64),
+        "index_max_depth" => I(cfg.index_max_depth as i64),
+        "tree_dir_page" => I(cfg.tree_dir_page as i64),
+        "confirm_drag_and_drop" => B(cfg.confirm_drag_and_drop),
+        "enable_trash" => B(cfg.enable_trash),
+        "preview_tabs" => B(cfg.preview_tabs),
+        "tab_switch_mru" => B(cfg.tab_switch_mru),
+        "trim_trailing_whitespace" => B(cfg.trim_trailing_whitespace),
+        "trim_final_newlines" => B(cfg.trim_final_newlines),
+        "insert_final_newline" => B(cfg.insert_final_newline),
+        "format_on_save" => B(cfg.format_on_save),
+        "hot_exit" => B(cfg.hot_exit),
+        "hot_exit_max_kb" => I(cfg.hot_exit_max_kb as i64),
+        "hot_exit_interval_ms" => I(cfg.hot_exit_interval_ms as i64),
+        "restore_agents" => B(cfg.restore_agents),
+        "approval_mode" => T(cfg.approval_mode.clone()),
+        "voice_engine" => T(cfg.voice_engine.clone()),
+        "voice_target" => T(cfg.voice_target.clone()),
+        "voice_lang" => T(cfg.voice_lang.clone()),
+        "webhook_url" => T(cfg.webhook_url.clone()),
+        "ssh_tunnel_host" => T(cfg.ssh_tunnel_host.clone()),
+        _ => return None,
+    })
+}
+
+/// 値を書き込む。型が合わない / 未知のキーなら false (何もしない)。
+///
+/// **`global_*` の控えも一緒に更新する** — save_state はそちらを書くので、
+/// ここを忘れるとプロジェクト overlay 下で変更が永続化されない。
+pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool {
+    use SettingValue::{Bool as B, Float as F, Int as I, Text as T};
+    // 使う側の取り違えを 1 か所で弾く (型が合わなければ触らない)
+    macro_rules! b {
+        ($f:expr) => {
+            match v {
+                B(x) => {
+                    $f = *x;
+                    true
+                }
+                _ => false,
+            }
+        };
+    }
+    macro_rules! i {
+        ($f:expr, $t:ty) => {
+            match v {
+                I(x) if *x >= 0 => {
+                    $f = *x as $t;
+                    true
+                }
+                _ => false,
+            }
+        };
+    }
+    macro_rules! f {
+        ($f:expr) => {
+            match v {
+                F(x) => {
+                    $f = *x;
+                    true
+                }
+                _ => false,
+            }
+        };
+    }
+    macro_rules! t {
+        ($f:expr) => {
+            match v {
+                T(x) => {
+                    $f = x.clone();
+                    true
+                }
+                _ => false,
+            }
+        };
+    }
+    match key {
+        "theme" => {
+            let ok = t!(cfg.theme);
+            if ok {
+                cfg.global_theme = cfg.theme.clone();
+            }
+            ok
+        }
+        "editor_font_size" => f!(cfg.editor_font_size),
+        "terminal_font_size" => f!(cfg.terminal_font_size),
+        "ui_zoom" => {
+            let ok = f!(cfg.ui_zoom);
+            if ok {
+                cfg.global_ui_zoom = cfg.ui_zoom;
+            }
+            ok
+        }
+        "show_pet" => {
+            let ok = b!(cfg.show_pet);
+            if ok {
+                cfg.global_show_pet = cfg.show_pet;
+            }
+            ok
+        }
+        "word_wrap" => {
+            let ok = b!(cfg.word_wrap);
+            if ok {
+                cfg.global_word_wrap = cfg.word_wrap;
+            }
+            ok
+        }
+        "show_whitespace" => {
+            let ok = b!(cfg.show_whitespace);
+            if ok {
+                cfg.global_show_whitespace = cfg.show_whitespace;
+            }
+            ok
+        }
+        "minimap" => {
+            let ok = b!(cfg.minimap);
+            if ok {
+                cfg.global_minimap = cfg.minimap;
+            }
+            ok
+        }
+        "breadcrumbs" => {
+            let ok = b!(cfg.breadcrumbs);
+            if ok {
+                cfg.global_breadcrumbs = cfg.breadcrumbs;
+            }
+            ok
+        }
+        "git_blame" => {
+            let ok = b!(cfg.git_blame);
+            if ok {
+                cfg.global_git_blame = cfg.git_blame;
+            }
+            ok
+        }
+        "bracket_colorization" => b!(cfg.bracket_colorization),
+        "inline_diagnostics" => b!(cfg.inline_diagnostics),
+        "lsp_highlight_occurrences" => b!(cfg.lsp_highlight_occurrences),
+        "detect_indentation" => b!(cfg.detect_indentation),
+        "tab_size" => i!(cfg.tab_size, usize),
+        "insert_spaces" => b!(cfg.insert_spaces),
+        "diff_view" => t!(cfg.diff_view),
+        "undo_merge_ms" => i!(cfg.undo_merge_ms, u64),
+        "undo_max_steps" => i!(cfg.undo_max_steps, usize),
+        "undo_max_bytes" => i!(cfg.undo_max_bytes, usize),
+        "show_hidden_files" => b!(cfg.show_hidden_files),
+        "respect_gitignore" => b!(cfg.respect_gitignore),
+        "dim_ignored_files" => b!(cfg.dim_ignored_files),
+        "index_max_files" => i!(cfg.index_max_files, usize),
+        "index_max_depth" => i!(cfg.index_max_depth, usize),
+        "tree_dir_page" => i!(cfg.tree_dir_page, usize),
+        "confirm_drag_and_drop" => b!(cfg.confirm_drag_and_drop),
+        "enable_trash" => b!(cfg.enable_trash),
+        "preview_tabs" => b!(cfg.preview_tabs),
+        "tab_switch_mru" => b!(cfg.tab_switch_mru),
+        "trim_trailing_whitespace" => b!(cfg.trim_trailing_whitespace),
+        "trim_final_newlines" => b!(cfg.trim_final_newlines),
+        "insert_final_newline" => b!(cfg.insert_final_newline),
+        "format_on_save" => b!(cfg.format_on_save),
+        "hot_exit" => b!(cfg.hot_exit),
+        "hot_exit_max_kb" => i!(cfg.hot_exit_max_kb, usize),
+        "hot_exit_interval_ms" => i!(cfg.hot_exit_interval_ms, u64),
+        "restore_agents" => b!(cfg.restore_agents),
+        "approval_mode" => {
+            let ok = t!(cfg.approval_mode);
+            if ok {
+                cfg.global_approval_mode = cfg.approval_mode.clone();
+            }
+            ok
+        }
+        "voice_engine" => t!(cfg.voice_engine),
+        "voice_target" => t!(cfg.voice_target),
+        "voice_lang" => t!(cfg.voice_lang),
+        "webhook_url" => t!(cfg.webhook_url),
+        "ssh_tunnel_host" => t!(cfg.ssh_tunnel_host),
+        _ => false,
+    }
+}
+
+/// 出荷時の値 (`Config::default()`)。「既定へ戻す」と `@modified` の基準。
+pub fn setting_default(key: &str) -> Option<SettingValue> {
+    // Config::default() は毎回組むと重いので 1 度だけ作って使い回す
+    static DEFAULTS: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+    setting_value(DEFAULTS.get_or_init(Config::default), key)
+}
+
+/// 既定から変えられているか (VS Code の `@modified` 相当)。
+///
+/// **既定と同じ値に戻したら false になる** — 「一度触ったから」ではなく
+/// 「いま既定と違うか」で判定する (そうでないと戻しても消えない)。
+pub fn is_setting_modified(cfg: &Config, key: &str) -> bool {
+    match (setting_value(cfg, key), setting_default(key)) {
+        (Some(now), Some(def)) => now != def,
+        _ => false,
+    }
+}
+
+/// 検索と `@modified` で絞った表示順の一覧。
+///
+/// あいまい検索は既存の [`crate::fuzzy`] をそのまま使う (新しいマッチャは
+/// 書かない)。キー名・ラベル・グループ・説明文のどれに当たっても拾う。
+pub fn settings_rows(cfg: &Config, query: &str, only_modified: bool) -> Vec<&'static SettingDef> {
+    // `@modified` はクエリに直接書いても効く (VS Code と同じ書き方)
+    let mut modified_only = only_modified;
+    let mut q = String::new();
+    for tok in query.split_whitespace() {
+        if tok.eq_ignore_ascii_case("@modified") {
+            modified_only = true;
+        } else {
+            if !q.is_empty() {
+                q.push(' ');
+            }
+            q.push_str(tok);
+        }
+    }
+    let prepared = crate::fuzzy::PreparedQuery::new(&q);
+    let mut hits: Vec<(i32, usize, &'static SettingDef)> = Vec::new();
+    for (i, d) in setting_defs().iter().enumerate() {
+        if modified_only && !is_setting_modified(cfg, d.key) {
+            continue;
+        }
+        if q.is_empty() {
+            hits.push((0, i, d));
+            continue;
+        }
+        // ラベル → キー → グループ → 説明文の順に見て、最初に当たった点を使う
+        let doc = setting_doc(d.key);
+        let score = [d.label, d.key, d.group, doc.as_str()]
+            .iter()
+            .filter_map(|t| prepared.score(t))
+            .max();
+        if let Some(s) = score {
+            hits.push((s, i, d));
+        }
+    }
+    // 点が同じなら定義順 (グループの並びが崩れない)
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, _, d)| d).collect()
+}
+
+// ── 説明文は DEFAULT_CONFIG のコメントが唯一の出どころ ──────────────
+
+/// キー → 説明文。[`DEFAULT_CONFIG`] のコメントから 1 度だけ組む。
+pub fn setting_doc(key: &str) -> String {
+    static DOCS: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    DOCS.get_or_init(|| template_docs(DEFAULT_CONFIG))
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// テンプレートの「キー → 直前のコメント」表を作る。
+///
+/// テンプレートは 2 通りの書き方が混ざっている。両方を拾う:
+/// 1. 説明のコメント塊が行の上に積まれている (`theme` など)
+/// 2. 1 つの塊が複数キーをまとめて説明し、キーごとに
+///    `#   undo_max_bytes = …` の形で名指ししている (`undo_*` など)
+///
+/// 加えて `# trim_final_newlines = false   # 末尾の空行を落とす` のような
+/// **行末コメント**も説明として拾う。セクション見出し (`[...]`) を見たら
+/// そこで打ち切る — トップレベルの単純値だけが GUI の相手だから。
+pub fn template_docs(raw: &str) -> HashMap<String, String> {
+    let mut docs: HashMap<String, String> = HashMap::new();
+    let mut block: Vec<String> = Vec::new();
+    let mut last_block: Vec<String> = Vec::new();
+    for line in raw.replace("\r\n", "\n").lines() {
+        let t = line.trim_end();
+        let tt = t.trim();
+        if tt.starts_with('[') && tt.ends_with(']') {
+            break; // 以降はセクション = トップレベルではない
+        }
+        if tt.is_empty() {
+            if !block.is_empty() {
+                last_block = std::mem::take(&mut block);
+            }
+            continue;
+        }
+        // `#` を 1 枚だけ剥がす。**続く空白は残す** — 塊の中の
+        // 「名指し行とその続き」をインデントで見分けるのに使う。
+        let body = tt.strip_prefix('#');
+        let content = body.unwrap_or(tt);
+        // `key = 値 # 行末コメント` に割る。値が TOML リテラルとして
+        // 読めるときだけ「設定の行」と見なす。そうしないと
+        // `# respect_gitignore = false のときは効きません。` のような
+        // **説明文**まで設定の行に数えてしまう。
+        let assign = split_assign(content.trim()).map(|(k, v)| {
+            let (val, inline) = split_inline_comment(v);
+            (k, val.trim(), inline)
+        });
+        let Some((key, val, inline)) = assign.filter(|(_, v, _)| looks_like_toml_value(v)) else {
+            if body.is_some() && !is_rule_line(content) {
+                block.push(content.to_string());
+            }
+            continue;
+        };
+        let _ = val;
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(c) = inline {
+            parts.push(c);
+        }
+        if let Some(d) = pick_doc(&block, key) {
+            parts.push(d);
+        } else if let Some(d) = named_doc(&last_block, key) {
+            parts.push(d);
+        }
+        if !block.is_empty() {
+            last_block = std::mem::take(&mut block);
+        }
+        let doc = parts.join("\n");
+        if !doc.is_empty() {
+            docs.entry(key.to_string()).or_insert(doc);
+        }
+    }
+    docs
+}
+
+/// `key = value` に割る (キーは裸のキーだけを認める)。
+fn split_assign(s: &str) -> Option<(&str, &str)> {
+    let (k, v) = s.split_once('=')?;
+    let k = k.trim();
+    if k.is_empty()
+        || !k
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some((k, v))
+}
+
+/// 値が TOML のリテラルとして読めるか (説明文と設定の行を分ける唯一の基準)。
+fn looks_like_toml_value(v: &str) -> bool {
+    let v = v.trim();
+    if v == "true" || v == "false" {
+        return true;
+    }
+    if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
+        return true;
+    }
+    (v.starts_with('"') && v.len() >= 2 && v.ends_with('"'))
+        || (v.starts_with('[') && v.ends_with(']'))
+}
+
+/// 値の行の行末コメントを剥がす (文字列リテラルの中の `#` は残す)。
+fn split_inline_comment(s: &str) -> (&str, Option<String>) {
+    let mut in_str = false;
+    let mut prev_escape = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' if !prev_escape => in_str = !in_str,
+            '#' if !in_str => {
+                let c = s[i + 1..].trim();
+                return (&s[..i], (!c.is_empty()).then(|| c.to_string()));
+            }
+            _ => {}
+        }
+        prev_escape = c == '\\' && !prev_escape;
+    }
+    (s, None)
+}
+
+/// 罫線・見出し飾りだけの行か (説明として出しても意味が無い)。
+fn is_rule_line(c: &str) -> bool {
+    let t = c.trim();
+    t.is_empty()
+        || t.chars()
+            .all(|ch| matches!(ch, '─' | '━' | '═' | '-' | '=' | '│' | ' '))
+}
+
+/// 塊からこのキーの説明を採る。名指し行があればそれだけ、無ければ塊全体。
+fn pick_doc(block: &[String], key: &str) -> Option<String> {
+    if block.is_empty() {
+        return None;
+    }
+    named_doc(block, key).or_else(|| {
+        // 塊をそのまま出すときは、コメントのインデントを落とす
+        // (画面に出るのは文章であって、テンプレートの見た目ではない)
+        let joined = block
+            .iter()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!joined.trim().is_empty()).then_some(joined)
+    })
+}
+
+/// 塊の中の `key = 説明` 行 (と、その下のより深いインデントの続き) を採る。
+fn named_doc(block: &[String], key: &str) -> Option<String> {
+    let at = block.iter().position(|l| match split_assign(l.trim()) {
+        Some((k, v)) => k == key && !v.trim().is_empty(),
+        None => false,
+    })?;
+    let head = split_assign(block[at].trim())?.1.trim().to_string();
+    let indent = |s: &str| s.len() - s.trim_start().len();
+    let base = indent(&block[at]);
+    let mut out = vec![head];
+    for l in &block[at + 1..] {
+        if indent(l) <= base || split_assign(l.trim()).is_some() {
+            break;
+        }
+        out.push(l.trim().to_string());
+    }
+    Some(out.join(" "))
+}
+
+// ── config.toml への書き戻し ────────────────────────────────────────
+
+/// 設定 GUI からの変更を config.toml へ書き戻す。
+///
+/// **触るのは渡されたキーの行だけ。** 手書きのコメントも、GUI が知らない
+/// 設定も、`[keybindings]` などのセクションも 1 行も消さない
+/// (`save_keybindings` / `save_plugins_section` と同じ作法)。
+pub fn save_settings(values: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let path = config_path();
+    ensure_default();
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = rewrite_scalar_settings(&raw, values);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, updated).map_err(|e| format!("config.toml を書けません: {e}"))
+}
+
+/// トップレベルの単純値を差し替えた文字列を返す。
+///
+/// - **有効な** `key = …` 行があれば、その行だけを置き換える
+/// - 無ければ最初のセクション見出しの直前へ足す
+///   (コメントアウトされた `# key = …` は説明なので消さない)
+/// - セクションの中の同名キーは別物なので触らない
+fn rewrite_scalar_settings(
+    raw: &str,
+    values: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let src = raw.replace("\r\n", "\n");
+    let mut out: Vec<String> = Vec::new();
+    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 追記位置 = 最初のセクション見出しの行番号 (無ければ末尾)
+    let mut insert_at: Option<usize> = None;
+
+    for line in src.lines() {
+        let t = line.trim();
+        let is_header = t.starts_with('[') && t.ends_with(']');
+        if is_header && insert_at.is_none() {
+            insert_at = Some(out.len());
+        }
+        if insert_at.is_none() && !t.starts_with('#') {
+            let (code, _) = split_inline_comment(t);
+            if let Some((k, _)) = split_assign(code.trim()) {
+                if let Some(v) = values.get(k) {
+                    out.push(format!("{k} = {v}"));
+                    done.insert(k.to_string());
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+
+    let add: Vec<String> = values
+        .iter()
+        .filter(|(k, _)| !done.contains(k.as_str()))
+        .map(|(k, v)| format!("{k} = {v}"))
+        .collect();
+    if !add.is_empty() {
+        let at = insert_at.unwrap_or(out.len());
+        let mut block = add;
+        block.push(String::new());
+        out.splice(at..at, block);
+    }
+    let mut text = out.join("\n");
+    while text.ends_with("\n\n") {
+        text.pop();
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+// ── 設定画面のレイアウト (純粋関数) ─────────────────────────────────
+
+/// 設定 1 行の列幅。**どの幅でも見切れない**ことを保証するため純関数にする。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SettingsColumns {
+    /// 変更マーカーの色バー (VS Code の左端の線)。
+    pub marker_w: f32,
+    /// 項目名 + 説明文。
+    pub label_w: f32,
+    /// 値のウィジェット。
+    pub value_w: f32,
+    /// 「既定へ戻す」ボタン (0 なら出さない)。
+    pub reset_w: f32,
+    /// 狭いのでボタンをアイコンだけへ縮退させるか。
+    pub icon_only: bool,
+}
+
+impl SettingsColumns {
+    /// 左端からの [開始, 終了] を列順に返す (重なり検査用)。
+    pub fn spans(&self) -> Vec<(f32, f32)> {
+        let mut out = Vec::with_capacity(4);
+        let mut x = 0.0f32;
+        for w in [self.marker_w, self.label_w, self.value_w, self.reset_w] {
+            if w > 0.0 {
+                out.push((x, x + w));
+                x += w + SETTINGS_COL_GAP;
+            }
+        }
+        out
+    }
+
+    pub fn total_w(&self) -> f32 {
+        self.spans().last().map(|(_, e)| *e).unwrap_or(0.0)
+    }
+}
+
+/// 列と列のあいだ。
+pub const SETTINGS_COL_GAP: f32 = 8.0;
+/// 変更マーカーの幅 (色バー 1 本)。
+const SETTINGS_MARKER_W: f32 = 3.0;
+/// 値のウィジェットの幅。
+const SETTINGS_VALUE_W: f32 = 190.0;
+/// 「既定へ戻す」ボタンの幅。
+const SETTINGS_RESET_W: f32 = 96.0;
+/// アイコンだけへ縮退したときのボタン幅。
+const SETTINGS_RESET_ICON_W: f32 = 30.0;
+/// これより狭ければボタンをアイコンだけにする。
+const SETTINGS_NARROW_W: f32 = 560.0;
+/// 項目名に最低限残す幅。
+const SETTINGS_LABEL_MIN_W: f32 = 90.0;
+
+/// 可用幅から列幅を決める。**戻り値の合計は必ず `avail_w` 以下**。
+pub fn settings_columns(avail_w: f32) -> SettingsColumns {
+    let avail = avail_w.max(0.0);
+    let icon_only = avail < SETTINGS_NARROW_W;
+    let reset_w = if icon_only {
+        SETTINGS_RESET_ICON_W
+    } else {
+        SETTINGS_RESET_W
+    };
+    let gaps = SETTINGS_COL_GAP * 3.0;
+    let fixed = SETTINGS_MARKER_W + SETTINGS_VALUE_W + reset_w + gaps;
+    let label_w = avail - fixed;
+    if label_w >= SETTINGS_LABEL_MIN_W {
+        return SettingsColumns {
+            marker_w: SETTINGS_MARKER_W,
+            label_w,
+            value_w: SETTINGS_VALUE_W,
+            reset_w,
+            icon_only,
+        };
+    }
+    // 極端に狭い: 戻すボタンを畳み、名前と値を比率で分ける
+    // (マーカーは 3px しか使わないので、どんなに狭くても必ず残す)
+    let usable = (avail - SETTINGS_MARKER_W - SETTINGS_COL_GAP * 2.0).max(0.0);
+    let value_w = (usable * 0.45).min(SETTINGS_VALUE_W);
+    SettingsColumns {
+        marker_w: SETTINGS_MARKER_W.min(avail),
+        label_w: (usable - value_w).max(0.0),
+        value_w,
+        reset_w: 0.0,
+        icon_only: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1716,6 +2759,337 @@ mod tests {
     // は state_overlay_tests で一時ディレクトリを差し込んで検証する。
 
     // ---- Config / AgentPreset の既定値 ----
+
+    // ─────────────────────────────────────────────────────────────────
+    // 設定 GUI — 一覧 / 説明 / @modified / 既定へ戻す / 書き戻し
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn 全ての設定項目に説明文がテンプレートから届く() {
+        // 説明を 2 か所に書かないための番人。GUI へ項目を足したら
+        // DEFAULT_CONFIG にもコメントを書く (逆は自由)。
+        let missing: Vec<&str> = setting_defs()
+            .iter()
+            .filter(|d| setting_doc(d.key).trim().is_empty())
+            .map(|d| d.key)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "DEFAULT_CONFIG に説明コメントが無い設定: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn 設定の定義はキーが重複せず現在値と既定を必ず引ける() {
+        let cfg = Config::default();
+        let mut seen = std::collections::HashSet::new();
+        for d in setting_defs() {
+            assert!(seen.insert(d.key), "キーが重複している: {}", d.key);
+            assert!(
+                setting_value(&cfg, d.key).is_some(),
+                "{} の現在値を引けない",
+                d.key
+            );
+            assert!(
+                setting_default(d.key).is_some(),
+                "{} の既定を引けない",
+                d.key
+            );
+            assert!(!d.label.is_empty() && !d.group.is_empty());
+            // 候補型は既定値が候補の中にあること (GUI で選べない値にしない)
+            if let SettingKind::Choice(opts) = d.kind {
+                let Some(SettingValue::Text(v)) = setting_default(d.key) else {
+                    panic!("{} は Choice なのに既定が文字列ではない", d.key);
+                };
+                assert!(
+                    opts.contains(&v.as_str()),
+                    "{} の既定 {v} が候補に無い",
+                    d.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 設定の書き込みは型が合うときだけ通る() {
+        let mut cfg = Config::default();
+        assert!(set_setting_value(
+            &mut cfg,
+            "word_wrap",
+            &SettingValue::Bool(true)
+        ));
+        assert!(cfg.word_wrap);
+        // 型違いは黙って無視 (壊さない)
+        assert!(!set_setting_value(
+            &mut cfg,
+            "word_wrap",
+            &SettingValue::Int(1)
+        ));
+        assert!(cfg.word_wrap);
+        assert!(!set_setting_value(
+            &mut cfg,
+            "存在しないキー",
+            &SettingValue::Bool(true)
+        ));
+        // global_* の控えも一緒に動く (overlay 下でも永続化されるため)
+        assert!(set_setting_value(
+            &mut cfg,
+            "theme",
+            &SettingValue::Text("zaivern-light".into())
+        ));
+        assert_eq!(cfg.global_theme, "zaivern-light");
+    }
+
+    #[test]
+    fn modifiedは既定と同じ値へ戻したら外れる() {
+        let mut cfg = Config::default();
+        assert!(!is_setting_modified(&cfg, "word_wrap"));
+        cfg.word_wrap = true;
+        assert!(is_setting_modified(&cfg, "word_wrap"));
+        // 「一度触ったから」ではなく「いま既定と違うか」で判定する
+        cfg.word_wrap = false;
+        assert!(!is_setting_modified(&cfg, "word_wrap"));
+
+        // 浮動小数も同じ (15.0 -> 18.0 -> 15.0)
+        cfg.editor_font_size = 18.0;
+        assert!(is_setting_modified(&cfg, "editor_font_size"));
+        cfg.editor_font_size = Config::default().editor_font_size;
+        assert!(!is_setting_modified(&cfg, "editor_font_size"));
+    }
+
+    #[test]
+    fn modifiedフィルタは変えた項目だけを残す() {
+        let mut cfg = Config::default();
+        assert!(
+            settings_rows(&cfg, "", true).is_empty(),
+            "既定のままなのに @modified に何か出ている"
+        );
+        cfg.minimap = true;
+        let rows = settings_rows(&cfg, "", true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, "minimap");
+        // クエリに @modified と書いても同じ
+        let rows = settings_rows(&cfg, "@modified", false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, "minimap");
+        // 絞り込みと併用できる
+        assert!(settings_rows(&cfg, "@modified minimap", false).len() == 1);
+        assert!(settings_rows(&cfg, "@modified word_wrap", false).is_empty());
+    }
+
+    #[test]
+    fn 設定の検索はあいまい一致で拾う() {
+        let cfg = Config::default();
+        let all = settings_rows(&cfg, "", false);
+        assert_eq!(all.len(), setting_defs().len(), "空クエリで全部出ない");
+        let hit = settings_rows(&cfg, "hotexit", false);
+        assert!(
+            hit.iter().any(|d| d.key == "hot_exit"),
+            "hot_exit があいまい検索で出ない"
+        );
+        // 日本語のラベルでも引ける
+        assert!(settings_rows(&cfg, "折り返", false)
+            .iter()
+            .any(|d| d.key == "word_wrap"));
+        assert!(settings_rows(&cfg, "存在しない語彙xyzzy", false).is_empty());
+    }
+
+    #[test]
+    fn 設定の書き戻しでコメントと未対応の設定が残る() {
+        let raw = concat!(
+            "# 手書きのコメント (絶対に消さない)\n",
+            "theme = \"zaivern-dark\"\n",
+            "editor_font_size = 15.0\n",
+            "# コメントアウトされた既定はドキュメントなので残す\n",
+            "# minimap = false\n",
+            "\"未対応の設定\" = 1\n",
+            "unknown_key = \"手で書いた値\"\n",
+            "\n",
+            "[keybindings]\n",
+            "save = \"cmd+s\"\n",
+            "\n",
+            "[plugins]\n",
+            "disabled = [\"foo\"]\n",
+        );
+        let mut vals = std::collections::BTreeMap::new();
+        vals.insert("theme".to_string(), "\"zaivern-light\"".to_string());
+        vals.insert("minimap".to_string(), "true".to_string());
+        let out = rewrite_scalar_settings(raw, &vals);
+
+        assert!(out.contains("# 手書きのコメント (絶対に消さない)"));
+        assert!(out.contains("# コメントアウトされた既定はドキュメントなので残す"));
+        assert!(out.contains("# minimap = false"), "説明のコメントを消した");
+        assert!(out.contains("unknown_key = \"手で書いた値\""));
+        assert!(out.contains("\"未対応の設定\" = 1"));
+        assert!(out.contains("[keybindings]") && out.contains("save = \"cmd+s\""));
+        assert!(out.contains("[plugins]") && out.contains("disabled = [\"foo\"]"));
+        // 変えた値は 1 本だけ (既存行の置き換え / 新規は見出しの手前へ)
+        assert!(out.contains("theme = \"zaivern-light\""));
+        assert!(!out.contains("theme = \"zaivern-dark\""));
+        assert_eq!(out.matches("\nminimap = true").count(), 1);
+        assert!(
+            out.contains("editor_font_size = 15.0"),
+            "触っていない値が消えた"
+        );
+        // 書き戻した結果がそのまま読めること
+        let cfg: Config = toml::from_str(&out).expect("書き戻した config.toml が読めない");
+        assert_eq!(cfg.theme, "zaivern-light");
+        assert!(cfg.minimap);
+    }
+
+    #[test]
+    fn 設定の書き戻しは何度やっても同じ形になる() {
+        let raw = "theme = \"zaivern-dark\"\n\n[plugins]\ndisabled = []\n";
+        let mut vals = std::collections::BTreeMap::new();
+        vals.insert("word_wrap".to_string(), "true".to_string());
+        let once = rewrite_scalar_settings(raw, &vals);
+        let twice = rewrite_scalar_settings(&once, &vals);
+        assert_eq!(once, twice, "書くたびに差分が出ている");
+        assert_eq!(once.matches("word_wrap").count(), 1);
+        // 追記はセクションより前 (トップレベルのまま = TOML として正しい)
+        let cfg: Config = toml::from_str(&once).unwrap();
+        assert!(cfg.word_wrap);
+    }
+
+    #[test]
+    fn 設定の書き戻しはセクションの中の同名キーを触らない() {
+        let raw = concat!(
+            "theme = \"zaivern-dark\"\n",
+            "\n",
+            "[plugins.settings.demo]\n",
+            "theme = \"プラグインの設定であって本体ではない\"\n",
+        );
+        let mut vals = std::collections::BTreeMap::new();
+        vals.insert("theme".to_string(), "\"zaivern-light\"".to_string());
+        let out = rewrite_scalar_settings(raw, &vals);
+        assert!(out.contains("theme = \"プラグインの設定であって本体ではない\""));
+        assert!(out.contains("theme = \"zaivern-light\""));
+    }
+
+    #[test]
+    fn 既定へ戻すは1項目でも全部でも効く() {
+        let mut cfg = Config::default();
+        cfg.minimap = true;
+        cfg.word_wrap = true;
+        cfg.tab_size = 8;
+        // 1 項目
+        let def = setting_default("minimap").unwrap();
+        assert!(set_setting_value(&mut cfg, "minimap", &def));
+        assert!(!cfg.minimap);
+        assert!(cfg.word_wrap, "他の項目まで戻してはいけない");
+        // 全部
+        for d in setting_defs() {
+            let def = setting_default(d.key).unwrap();
+            assert!(set_setting_value(&mut cfg, d.key, &def), "{}", d.key);
+        }
+        assert!(!cfg.word_wrap);
+        assert_eq!(cfg.tab_size, Config::default().tab_size);
+        assert!(
+            setting_defs()
+                .iter()
+                .all(|d| !is_setting_modified(&cfg, d.key)),
+            "全部戻したのに modified が残っている"
+        );
+    }
+
+    #[test]
+    fn テンプレートの説明抽出は塊と名指しと行末コメントを拾う() {
+        let raw = concat!(
+            "# ────────────────\n",
+            "# 塊のコメントはそのまま説明になる\n",
+            "alpha = \"x\"\n",
+            "# ひとまとめの説明\n",
+            "#   beta  = ベータの説明。\n",
+            "#           続きの行もつながる。\n",
+            "#   gamma = ガンマの説明。\n",
+            "# beta = 1\n",
+            "# gamma = 2\n",
+            "# delta = false   # 行末コメントが説明になる\n",
+            "# epsilon = false のときは効きません。\n",
+            "[section]\n",
+            "zeta = 1\n",
+        );
+        let docs = template_docs(raw);
+        assert_eq!(docs["alpha"], "塊のコメントはそのまま説明になる");
+        assert_eq!(docs["beta"], "ベータの説明。 続きの行もつながる。");
+        assert_eq!(docs["gamma"], "ガンマの説明。");
+        assert_eq!(docs["delta"], "行末コメントが説明になる");
+        // 値がリテラルでない = ただの説明文。設定の行として数えない
+        assert!(!docs.contains_key("epsilon"));
+        // セクションより後ろは見ない
+        assert!(!docs.contains_key("zeta"));
+    }
+
+    #[test]
+    fn 設定表の列はどの幅でも収まり重ならない() {
+        // 極端な画面サイズ (900×700 / 1200×300 / 400×700) まで含めて検証する。
+        // 幅だけが列を決めるので、高さは行数の目安としてだけ使う。
+        for (w, h) in [
+            (1200.0f32, 300.0f32),
+            (900.0, 700.0),
+            (400.0, 700.0),
+            (700.0, 700.0),
+            (560.0, 400.0),
+            (300.0, 300.0),
+            (120.0, 200.0),
+            (0.0, 0.0),
+        ] {
+            let c = settings_columns(w);
+            let spans = c.spans();
+            assert!(
+                c.total_w() <= w + 0.01,
+                "{w}×{h} で列がはみ出した: {c:?} -> {}",
+                c.total_w()
+            );
+            for s in &spans {
+                assert!(s.0 >= -0.01 && s.1 <= w + 0.01, "{w}×{h}: {s:?} が範囲外");
+                assert!(s.1 >= s.0, "{w}×{h}: 負の幅 {s:?}");
+            }
+            for pair in spans.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0 + 0.01,
+                    "{w}×{h}: 列が重なっている {pair:?}"
+                );
+            }
+            if w > 0.0 {
+                assert!(c.marker_w > 0.0, "{w}×{h}: 変更マーカーが消えた");
+            }
+            if w >= 300.0 {
+                assert!(
+                    c.label_w > 0.0 && c.value_w > 0.0,
+                    "{w}×{h}: 名前か値が消えた"
+                );
+            }
+        }
+        // 広いときだけ「既定へ戻す」がラベル付きで出る
+        assert!(!settings_columns(1200.0).icon_only);
+        assert!(settings_columns(1200.0).reset_w > settings_columns(400.0).reset_w);
+        assert!(settings_columns(400.0).icon_only);
+    }
+
+    #[test]
+    fn 設定値のtoml表現がそのまま読み直せる() {
+        // f32 は "15" ではなく "15.0" と書く (整数だと次回 float として読めない)
+        assert_eq!(SettingValue::Float(15.0).to_toml(), "15.0");
+        assert_eq!(SettingValue::Float(1.25).to_toml(), "1.25");
+        assert_eq!(SettingValue::Bool(true).to_toml(), "true");
+        assert_eq!(SettingValue::Int(400).to_toml(), "400");
+        // 引用符とバックスラッシュを含む値もそのまま往復する
+        let v = SettingValue::Text("a\"b\\c 日本語".into());
+        let line = format!("theme = {}", v.to_toml());
+        let cfg: Config = toml::from_str(&line).expect("書いた値が読めない");
+        assert_eq!(cfg.theme, "a\"b\\c 日本語");
+        // 全項目の既定値を書き出して読み直せること
+        let mut vals = std::collections::BTreeMap::new();
+        for d in setting_defs() {
+            vals.insert(d.key.to_string(), setting_default(d.key).unwrap().to_toml());
+        }
+        let text = rewrite_scalar_settings("", &vals);
+        let cfg: Config = toml::from_str(&text).expect("既定を書き出したら読めなくなった");
+        for d in setting_defs() {
+            assert!(!is_setting_modified(&cfg, d.key), "{} が既定と違う", d.key);
+        }
+    }
 
     #[test]
     fn default_config_has_expected_values() {
