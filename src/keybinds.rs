@@ -1476,6 +1476,9 @@ mod tests {
             "⌘V",
             "⌘X",
             "⌘C",
+            // ツリーのファイル操作の取り消し。BindAction ではなく
+            // `FileTree::keys_undo` が直接拾う OS 固定キー (本文の ⌘Z と同じ打鍵)
+            "⌘Z",
             // エージェント入力欄の送信キー (`panels::send_hint` が OS で書き分け)
             "⌘+Enter",
             "⌘⌫",

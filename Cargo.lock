@@ -5220,6 +5220,7 @@ dependencies = [
  "syntect",
  "toml 0.8.23",
  "vt100",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 

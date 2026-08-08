@@ -64,6 +64,21 @@ base64 = "0.22"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows の**本物のごみ箱** (file_tree::trash) を呼ぶための Win32 API。
+# 削除は既定でゴミ箱行きにするので、3 OS ぶんの実装が要る
+# (macOS は ~/.Trash、Linux は freedesktop 仕様で自前実装 = 依存ゼロ。
+#  Windows だけは SHFileOperationW を叩かないと本物のごみ箱へ入らない)。
+#   * ライセンス MIT OR Apache-2.0 (本体 Apache-2.0 と両立)
+#   * Microsoft 公式の**純 Rust** バインディング。C の toolchain も
+#     実行時 DLL の同梱も要らず、素の `cargo build` が通る
+#   * windows-sys 0.59 は既に winit / eframe 経由で Cargo.lock に入っている
+#     ため、依存グラフに増える実体は 0
+#   * cfg(windows) 限定なので macOS / Linux のビルドには一切入らない
+#   * `trash` クレートは採らない: macOS でゴミ箱の中のパスを返さないため
+#     「削除の取り消し」が作れない (自前実装なら戻り先が分かる)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Shell"] }
+
 # Windows のタスクマネージャー「説明」列に "Zaivern Code" を出すための
 # VERSIONINFO リソースを build.rs から埋め込む。
 #   * ライセンス MIT / 純 Rust (winres の後継フォーク)
