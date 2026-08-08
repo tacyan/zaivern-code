@@ -8,7 +8,9 @@ use crate::config::zaivern_dir;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-const MAX_RECENT: usize = 12;
+/// 「最近使用した項目」に覚えておく件数 (フォルダ / ファイルそれぞれ)。
+/// ⌘P の「最近開いた順」の加点もこの件数を前提に設計してある (app.rs)。
+pub const MAX_RECENT: usize = 12;
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 #[serde(default)]
