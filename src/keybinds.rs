@@ -37,6 +37,14 @@ pub enum BindAction {
     FileZoomIn,
     FileZoomOut,
     FileZoomReset,
+    /// 取り消し (VS Code: ⌘Z / Ctrl+Z)。
+    ///
+    /// **`TextEdit` より先にここで消費する。** egui 0.29 の `TextEdit` は
+    /// 自前の undoer を持っていて外す API が無いため、打鍵を先に取らないと
+    /// 「egui の粒度」と「バッファの履歴」が二重に動いてしまう。
+    Undo,
+    /// やり直し (VS Code: ⇧⌘Z / Ctrl+Y)。
+    Redo,
     ToggleComment,
     DuplicateLine,
     MoveLineUp,
@@ -125,7 +133,7 @@ pub enum BindAction {
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 61] = [
+pub const ALL_ACTIONS: [BindAction; 63] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -147,6 +155,8 @@ pub const ALL_ACTIONS: [BindAction; 61] = [
     BindAction::FileZoomIn,
     BindAction::FileZoomOut,
     BindAction::FileZoomReset,
+    BindAction::Undo,
+    BindAction::Redo,
     BindAction::ToggleComment,
     BindAction::DuplicateLine,
     BindAction::MoveLineUp,
@@ -250,6 +260,8 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::FileZoomIn => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Plus),
         BindAction::FileZoomOut => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Minus),
         BindAction::FileZoomReset => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Num0),
+        BindAction::Undo => KeyboardShortcut::new(cmd, Key::Z),
+        BindAction::Redo => KeyboardShortcut::new(cmd_shift, Key::Z),
         BindAction::ToggleComment => KeyboardShortcut::new(cmd, Key::Slash),
         BindAction::DuplicateLine => KeyboardShortcut::new(cmd_shift, Key::D),
         BindAction::MoveLineUp => KeyboardShortcut::new(alt, Key::ArrowUp),
@@ -399,6 +411,8 @@ impl Keybinds {
             // v0.5.1 までの名前。既存の config.toml を黙って壊さないための別名。
             "font_inc" => ZoomIn,
             "font_dec" => ZoomOut,
+            "undo" => Undo,
+            "redo" => Redo,
             "toggle_comment" => ToggleComment,
             "duplicate_line" => DuplicateLine,
             "move_line_up" => MoveLineUp,
@@ -1193,6 +1207,8 @@ mod tests {
             "file_zoom_in",
             "file_zoom_out",
             "file_zoom_reset",
+            "undo",
+            "redo",
             "toggle_comment",
             "duplicate_line",
             "move_line_up",

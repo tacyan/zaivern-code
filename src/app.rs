@@ -12,6 +12,7 @@ use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
 use crate::coordinator;
+use crate::editor;
 use crate::editor::{combine_hash, disk_mtime, hash_str, Buffer, Editor, ExternalEvent};
 use crate::editor_ops;
 use crate::editor_split;
@@ -1947,39 +1948,75 @@ fn large_file_reasons(read_only: bool, highlight_off: bool) -> Vec<String> {
 /// 止まる**。巨大ファイル / 差分タブと、折りたたみ中の一時テキストを、
 /// 同じ `TextEdit` 呼び出しで扱うための薄い包み。
 enum EditTarget<'a> {
-    /// 通常編集 (原文そのもの、または折りたたみ表示テキスト)
+    /// 折りたたみ表示テキストへの編集 (原文ではないので履歴は取らない。
+    /// 原文への差し戻しは `splice_fold_edit` の側で 1 段として積む)
     Rw(&'a mut String),
+    /// 原文への通常編集。**`TextEdit` が入れた差分をその場で履歴へ積む**。
+    ///
+    /// フレーム終端で本文全体を突き合わせるのではなく、`TextBuffer` の
+    /// 挿入 / 削除をそのまま拾う。本文のコピーを 1 本も持たずに済み、
+    /// CJK / 絵文字でもバイト境界を割らない (位置は egui から char で来る)。
+    Rec {
+        text: &'a mut String,
+        hist: &'a mut editor::History,
+        ed: editor::Edit,
+    },
     /// 読み取り専用 (巨大ファイル・差分タブ)
     Ro(&'a str),
 }
 
 impl EditTarget<'_> {
     fn set(&mut self, s: String) {
-        if let EditTarget::Rw(t) = self {
-            **t = s;
+        match self {
+            EditTarget::Rw(t) => **t = s,
+            EditTarget::Rec { text, hist, ed } => {
+                if let Some((at, at_chars, before, after)) = editor::diff_replace(text, &s) {
+                    **text = s;
+                    hist.record(at, at_chars, before, after, *ed);
+                }
+            }
+            EditTarget::Ro(_) => {}
         }
     }
 }
 
 impl egui::TextBuffer for EditTarget<'_> {
     fn is_mutable(&self) -> bool {
-        matches!(self, EditTarget::Rw(_))
+        matches!(self, EditTarget::Rw(_) | EditTarget::Rec { .. })
     }
     fn as_str(&self) -> &str {
         match self {
             EditTarget::Rw(t) => t.as_str(),
+            EditTarget::Rec { text, .. } => text.as_str(),
             EditTarget::Ro(t) => t,
         }
     }
     fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
         match self {
             EditTarget::Rw(t) => <String as egui::TextBuffer>::insert_text(t, text, char_index),
+            EditTarget::Rec { text: t, hist, ed } => {
+                let at = editor_ops::char_to_byte(t, char_index);
+                let n = <String as egui::TextBuffer>::insert_text(*t, text, char_index);
+                hist.record(at, char_index, String::new(), text.to_string(), *ed);
+                n
+            }
             EditTarget::Ro(_) => 0,
         }
     }
     fn delete_char_range(&mut self, char_range: std::ops::Range<usize>) {
-        if let EditTarget::Rw(t) = self {
-            <String as egui::TextBuffer>::delete_char_range(t, char_range);
+        match self {
+            EditTarget::Rw(t) => {
+                <String as egui::TextBuffer>::delete_char_range(t, char_range);
+            }
+            EditTarget::Rec { text: t, hist, ed } => {
+                let (cs, ce) = (char_range.start, char_range.end);
+                let s = editor_ops::char_to_byte(t, cs);
+                let e = editor_ops::char_to_byte(t, ce);
+                let removed = t[s..e].to_string();
+                <String as egui::TextBuffer>::delete_char_range(*t, char_range);
+                hist.record(s, cs, removed, String::new(), *ed);
+            }
+            EditTarget::Ro(_) => {}
         }
     }
 }
@@ -2287,6 +2324,9 @@ pub struct ZaivernApp {
     pending_delete: Option<PathBuf>,
     pending_select: Option<(usize, usize)>,
     pending_scroll: Option<f32>,
+    /// 取り消し履歴の「連続入力」判定に使う単調時計の原点。
+    /// `SystemTime` ではなく `Instant` — 時刻がずれても粒度が壊れない。
+    undo_clock: Instant,
     last_row_h: f32,
     /// エディタ可視領域の高さ(前フレーム値)。PageUp/Down・検索ジャンプで使用
     last_view_h: f32,
@@ -2956,6 +2996,7 @@ impl ZaivernApp {
             pending_delete: None,
             pending_select: None,
             pending_scroll: None,
+            undo_clock: Instant::now(),
             last_row_h: 18.0,
             last_view_h: 620.0,
             zoom_area: None,
@@ -3566,12 +3607,11 @@ impl ZaivernApp {
                 }
                 plugins::CmdSink::NewTab => {
                     self.editor.new_untitled();
+                    let ed = self.edit_step();
                     if let Some(i) = self.editor.active {
                         let b = &mut self.editor.buffers[i];
                         b.title = r.title.clone();
-                        b.text = r.stdout.clone();
-                        b.cache = None;
-                        b.gutter = None;
+                        b.apply_edit(r.stdout.clone(), ed);
                     }
                     self.toast(
                         trf("🔌 {title} → 新規タブ", &[("title", r.title.clone())]),
@@ -3599,12 +3639,14 @@ impl ZaivernApp {
                         .and_then(|st| st.cursor.char_range())
                         .map(|c| c.primary.index)
                         .unwrap_or_else(|| self.editor.buffers[i].text.chars().count());
+                    let ed = self.edit_step();
                     let b = &mut self.editor.buffers[i];
                     let cur = cur.min(b.text.chars().count());
                     let byte = editor_ops::char_to_byte(&b.text, cur);
                     b.text.insert_str(byte, &r.stdout);
-                    b.cache = None;
-                    b.gutter = None;
+                    b.history
+                        .record(byte, cur, String::new(), r.stdout.clone(), ed);
+                    b.invalidate_render_cache();
                     let end = cur + r.stdout.chars().count();
                     self.pending_select = Some((end, end));
                     self.toast(
@@ -3628,6 +3670,7 @@ impl ZaivernApp {
                         );
                         continue;
                     };
+                    let ed = self.edit_step();
                     let b = &mut self.editor.buffers[i];
                     match r.replace_range {
                         // 選択範囲の置換: 実行中に編集されていたら黙って上書きしない
@@ -3645,9 +3688,10 @@ impl ZaivernApp {
                             }
                             let start = editor_ops::char_to_byte(&b.text, s);
                             let end = editor_ops::char_to_byte(&b.text, e);
+                            let removed = b.text[start..end].to_string();
                             b.text.replace_range(start..end, &r.stdout);
-                            b.cache = None;
-                            b.gutter = None;
+                            b.history.record(start, s, removed, r.stdout.clone(), ed);
+                            b.invalidate_render_cache();
                             let np = s + r.stdout.chars().count();
                             self.pending_select = Some((np, np));
                             self.toast(
@@ -3680,15 +3724,13 @@ impl ZaivernApp {
                                 );
                                 continue;
                             }
-                            b.text = r.stdout.clone();
-                            b.cache = None;
-                            b.gutter = None;
+                            b.apply_edit(r.stdout.clone(), ed);
                             // 保存時フック由来なら整形結果をそのままファイルへ書き戻す
                             if r.resave {
                                 if let Some(path) = b.path.clone() {
                                     match b.write_to(&path) {
                                         Ok(_) => {
-                                            b.saved_hash = hash_str(&b.text);
+                                            b.mark_saved();
                                             b.disk_mtime = disk_mtime(&path);
                                             b.conflict_notified = None;
                                             self.toast(
@@ -3859,22 +3901,19 @@ impl ZaivernApp {
                 A::InsertText { text } => self.insert_at_cursor(&text, ctx),
                 A::ReplaceBuffer { text } => match self.editor.active {
                     Some(i) => {
-                        let b = &mut self.editor.buffers[i];
-                        b.text = text;
-                        b.cache = None;
-                        b.gutter = None;
+                        let ed = self.edit_step();
+                        self.editor.buffers[i].apply_edit(text, ed);
                         self.toast(tr("🔌 バッファを置き換えました"), true);
                     }
                     None => self.toast(tr("🔌 置き換え先のタブがありません"), false),
                 },
                 A::NewTab { title, text } => {
                     self.editor.new_untitled();
+                    let ed = self.edit_step();
                     if let Some(i) = self.editor.active {
                         let b = &mut self.editor.buffers[i];
                         b.title = title;
-                        b.text = text;
-                        b.cache = None;
-                        b.gutter = None;
+                        b.apply_edit(text, ed);
                     }
                 }
                 A::AgentPrompt {
@@ -3945,12 +3984,14 @@ impl ZaivernApp {
             .and_then(|st| st.cursor.char_range())
             .map(|c| c.primary.index)
             .unwrap_or_else(|| self.editor.buffers[i].text.chars().count());
+        let ed = self.edit_step();
         let b = &mut self.editor.buffers[i];
         let cur = cur.min(b.text.chars().count());
         let byte = editor_ops::char_to_byte(&b.text, cur);
         b.text.insert_str(byte, text);
-        b.cache = None;
-        b.gutter = None;
+        b.history
+            .record(byte, cur, String::new(), text.to_string(), ed);
+        b.invalidate_render_cache();
         let end = cur + text.chars().count();
         self.pending_select = Some((end, end));
     }
@@ -4649,6 +4690,80 @@ impl ZaivernApp {
         }
     }
 
+    // ─── 取り消し履歴 (バッファ側の `editor::History` を駆動する) ─────
+
+    /// 単調時計の現在値 (ms)。連続入力の併合判定に使う。
+    fn undo_now_ms(&self) -> u64 {
+        self.undo_clock.elapsed().as_millis() as u64
+    }
+
+    /// プログラム的編集 1 回ぶんの記録情報 (整形・置換・行移動など)。
+    /// しきい値と上限は**必ず設定から**取る。
+    fn edit_step(&self) -> editor::Edit {
+        editor::Edit::programmatic(self.undo_now_ms(), self.cfg.history_limits())
+    }
+
+    /// 打鍵らしさを差分から決める記録情報 (`TextEdit` 経由・折りたたみの差し戻し)。
+    fn edit_typed(&self) -> editor::Edit {
+        editor::Edit::typed(self.undo_now_ms(), self.cfg.history_limits())
+    }
+
+    /// 取り消し / やり直しの後始末 (選択復元・折りたたみ表示の作り直し・LSP 通知)。
+    fn after_undo_redo(&mut self, i: usize, sel: (usize, usize)) {
+        self.pending_select = Some(sel);
+        self.fold_view = None;
+        self.queue_lsp_change(i);
+    }
+
+    /// アクティブなタブを 1 段取り消す。
+    fn undo_active(&mut self) {
+        let Some(i) = self.editor.active else { return };
+        if self.editor.buffers[i].read_only() {
+            self.toast(tr("このタブは読み取り専用です"), false);
+            return;
+        }
+        match self.editor.buffers[i].undo() {
+            Some(sel) => self.after_undo_redo(i, sel),
+            None => {
+                // 上限で古い段を捨てていたなら、黙って「戻せない」で終わらせない
+                let msg = if self.editor.buffers[i].history.dropped() > 0 {
+                    tr("これ以上取り消せません (古い履歴は上限で破棄しました)")
+                } else {
+                    tr("これ以上取り消せません")
+                };
+                self.toast(msg, false);
+            }
+        }
+    }
+
+    /// アクティブなタブを 1 段やり直す。
+    fn redo_active(&mut self) {
+        let Some(i) = self.editor.active else { return };
+        if self.editor.buffers[i].read_only() {
+            self.toast(tr("このタブは読み取り専用です"), false);
+            return;
+        }
+        match self.editor.buffers[i].redo() {
+            Some(sel) => self.after_undo_redo(i, sel),
+            None => self.toast(tr("やり直せる操作がありません"), false),
+        }
+    }
+
+    /// 本文エディタ (中央の `TextEdit`) にフォーカスがあるか。
+    ///
+    /// ⌘Z を横取りしてよいのはこのときだけ。検索欄やエージェント入力の
+    /// `TextEdit` では、そちらの取り消しをそのまま使わせる。
+    fn editor_body_focused(&self, ctx: &egui::Context) -> bool {
+        let Some(i) = self.editor.active else {
+            return false;
+        };
+        let Some(b) = self.editor.buffers.get(i) else {
+            return false;
+        };
+        let id = buf_edit_id(self.cur_pane, b.id);
+        ctx.memory(|m| m.has_focus(id))
+    }
+
     /// アクティブバッファへ editor_ops の編集操作を適用する。
     fn editor_op(&mut self, ctx: &egui::Context, op: EditOp) {
         let Some(i) = self.editor.active else {
@@ -4671,6 +4786,7 @@ impl ZaivernApp {
             return;
         }
 
+        let (now_ms, limits) = (self.undo_now_ms(), self.cfg.history_limits());
         let buf = &mut self.editor.buffers[i];
         let (new_text, new_sel) = match op {
             EditOp::ToggleComment => {
@@ -4693,11 +4809,11 @@ impl ZaivernApp {
                 (t, (s, e))
             }
         };
-        if new_text != buf.text {
-            buf.text = new_text;
-            buf.cache = None;
-            buf.gutter = None;
-        }
+        // プログラム的編集なので**必ず 1 段**。取り消しで編集前の選択へ戻す。
+        let ed = editor::Edit::programmatic(now_ms, limits)
+            .from_sel((start, end))
+            .to_sel(new_sel);
+        buf.apply_edit(new_text, ed);
         self.pending_select = Some(new_sel);
     }
 
@@ -4845,10 +4961,11 @@ impl ZaivernApp {
                 }
                 // **1 回だけ**本文を差し替える = egui の取り消しも 1 段。
                 let (new_text, sel, n) = multi_batch_insert(&text, &seed, &ins);
-                let b = &mut self.editor.buffers[i];
-                b.text = new_text;
-                b.cache = None;
-                b.gutter = None;
+                let ed = self.edit_step().from_sel((start, end)).to_sel({
+                    let r = sel.to_single_selection_chars(&new_text);
+                    (r.start, r.end)
+                });
+                self.editor.buffers[i].apply_edit(new_text, ed);
                 self.fold_view = None;
                 self.queue_lsp_change(i);
                 self.commit_multi(buf_id, sel, false);
@@ -4857,16 +4974,10 @@ impl ZaivernApp {
                         "✏ {n} 箇所へ貼り付けました ({undo} 一回で戻ります)",
                         &[
                             ("n", n.to_string()),
-                            // 取り消しは egui の TextEdit が持つ固定の打鍵なので
-                            // BindAction は無い。表記だけは同じ整形器で作る
-                            // (ベタ書きの ⌘Z は Windows/Linux で嘘になる)。
-                            (
-                                "undo",
-                                crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
-                                    egui::Modifiers::COMMAND,
-                                    egui::Key::Z,
-                                )),
-                            ),
+                            // 取り消しは自前の履歴なので割り当ては設定で変えられる。
+                            // 表記は必ず現在のバインドから作る
+                            // (ベタ書きの ⌘Z は Windows/Linux でも再割り当てでも嘘になる)。
+                            ("undo", self.key_hint(BindAction::Undo)),
                         ],
                     ),
                     true,
@@ -5927,10 +6038,9 @@ impl ZaivernApp {
             return;
         };
         self.pending_select = Some(sel);
-        let b = &mut self.editor.buffers[i];
-        b.text = cleaned;
-        b.cache = None;
-        b.gutter = None;
+        // 保存時の掃除も取り消せる 1 段にする (VS Code の formatOnSave と同じ)
+        let ed = self.edit_step().to_sel(sel);
+        self.editor.buffers[i].apply_edit(cleaned, ed);
     }
 
     /// バッファ `i` を `path` へ書き出して後始末する。成功したら true。
@@ -5950,7 +6060,8 @@ impl ZaivernApp {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "???".into());
                 b.path = Some(path.clone());
-                b.saved_hash = hash_str(&text);
+                // 保存時点を履歴へ刻む (ここまで取り消したら未保存印が消える)
+                b.mark_saved();
                 b.lang = lang;
                 b.cache = None;
                 b.disk_mtime = disk_mtime(&path);
@@ -6051,11 +6162,9 @@ impl ZaivernApp {
         let label = rep.format.label();
         {
             let b = &mut self.editor.buffers[i];
-            b.text = rep.text;
+            // 別の符号化で**開き直した** = 取り消しで前の解釈へは戻さない
+            b.reset_text(rep.text);
             b.encoding = rep.format.encoding;
-            b.saved_hash = hash_str(&b.text);
-            b.cache = None;
-            b.gutter = None;
             b.disk_mtime = disk_mtime(&path);
             b.conflict_notified = None;
         }
@@ -6102,7 +6211,7 @@ impl ZaivernApp {
                 Ok(()) => {
                     let b = &mut self.editor.buffers[i];
                     b.encoding = enc;
-                    b.saved_hash = hash_str(&text);
+                    b.mark_saved();
                     b.disk_mtime = disk_mtime(&path);
                     b.conflict_notified = None;
                     self.tree.invalidate();
@@ -7305,10 +7414,9 @@ impl ZaivernApp {
             let ci = (base.max(0) as usize) + m.new_text.chars().count();
             self.pending_select = Some((ci, ci));
         }
-        let b = &mut self.editor.buffers[i];
-        b.text = after;
-        b.cache = None;
-        b.gutter = None;
+        // 補完の確定は additionalTextEdits も含めて**まとめて 1 段**
+        let ed = self.edit_step();
+        self.editor.buffers[i].apply_edit(after, ed);
         self.fold_view = None;
         self.queue_lsp_change(i);
         true
@@ -7345,12 +7453,11 @@ impl ZaivernApp {
                 },
             };
             let Some(i) = idx else { continue };
+            let ed = self.edit_step();
             let b = &mut self.editor.buffers[i];
             let next = lsp::apply_file_edits(&b.text, fe);
-            if next != b.text {
-                b.text = next;
-                b.cache = None;
-                b.gutter = None;
+            // ファイル 1 本ぶんの rename は 1 段 (⌘Z 1 回で丸ごと戻る)
+            if b.apply_edit(next, ed) {
                 files += 1;
             }
             self.queue_lsp_change(i);
@@ -7512,11 +7619,9 @@ impl ZaivernApp {
         if !edits.is_empty() {
             let before = self.editor.buffers[i].text.clone();
             let after = lsp::apply_text_edits(&before, &edits);
-            if after != before {
-                let b = &mut self.editor.buffers[i];
-                b.text = after;
-                b.cache = None;
-                b.gutter = None;
+            // 整形はファイル全体でも**必ず 1 段**
+            let ed = self.edit_step();
+            if self.editor.buffers[i].apply_edit(after, ed) {
                 self.fold_view = None;
                 self.queue_lsp_change(i);
             }
@@ -8613,16 +8718,8 @@ impl ZaivernApp {
     #[allow(clippy::collapsible_match)]
     fn apply_cmd_edit(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
-            Cmd::Undo => {
-                self.push_editor_key(egui::Key::Z, egui::Modifiers::COMMAND, true);
-            }
-            Cmd::Redo => {
-                self.push_editor_key(
-                    egui::Key::Z,
-                    egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
-                    true,
-                );
-            }
+            Cmd::Undo => self.undo_active(),
+            Cmd::Redo => self.redo_active(),
             Cmd::CutSelection => self.push_editor_event(egui::Event::Cut, true),
             Cmd::CopySelection => self.push_editor_event(egui::Event::Copy, false),
             Cmd::PasteClipboard => match menu_bar::clipboard_text() {
@@ -10050,16 +10147,25 @@ impl ZaivernApp {
 
         // エディタ編集操作はエディタにフォーカスがあるときだけ消費する
         // (ターミナル内の alt+↑ 等を奪わないため)
-        let editor_focused = self
-            .editor
-            .active
-            .map(|i| {
-                let id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
-                ctx.memory(|m| m.has_focus(id))
-            })
-            .unwrap_or(false);
+        let editor_focused = self.editor_body_focused(ctx);
         let mut pages: Vec<bool> = Vec::new();
         if editor_focused {
+            // 取り消し / やり直しは `TextEdit` より**先に**消費する。
+            // egui 0.29 の TextEdit は自前 undoer を持ち外す API が無いので、
+            // ここで取らないと egui の粒度で二重に戻ってしまう。
+            // 修飾キーの多い ⇧⌘Z を先に消費する。
+            if consume(ctx, self.keys.get(BindAction::Redo)) {
+                cmds.push(Cmd::Redo);
+            }
+            if consume(ctx, self.keys.get(BindAction::Undo)) {
+                cmds.push(Cmd::Undo);
+            }
+            // egui 0.29 の `TextEdit` は ⌘Y / Ctrl+Y も内蔵 redo として扱う。
+            // 取らずに残すと egui の undoer が勝手に本文を戻してしまうので、
+            // ここで食べて自前の「やり直し」へ回す (Windows の慣習とも一致)。
+            if consume(ctx, KeyboardShortcut::new(Modifiers::COMMAND, Key::Y)) {
+                cmds.push(Cmd::Redo);
+            }
             // ⌃G (行移動)・F12 (定義)・⇧⌘\ (括弧) はエディタにフォーカスが
             // あるときだけ奪う (ターミナルの ⌃G = BEL 等と衝突させない)
             if consume(ctx, self.keys.get(BindAction::GoToLine)) {
@@ -12810,12 +12916,11 @@ impl ZaivernApp {
                 .unwrap_or_default()
         );
         self.editor.new_untitled();
+        let ed = self.edit_step();
         if let Some(i) = self.editor.active {
             let b = &mut self.editor.buffers[i];
             b.title = title;
-            b.text = clean;
-            b.cache = None;
-            b.gutter = None;
+            b.apply_edit(clean, ed);
         }
         self.cockpit = false;
     }
@@ -16612,8 +16717,9 @@ impl ZaivernApp {
         };
         if let Some((nt, ncur)) = expand {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
-                self.editor.buffers[active].text = nt;
-                self.editor.buffers[active].cache = None;
+                // スニペット展開は 1 段 (⌘Z 1 回で打った略語へ戻る)
+                let ed = self.edit_step().to_sel((ncur, ncur));
+                self.editor.buffers[active].apply_edit(nt, ed);
                 pending_select = Some((ncur, ncur));
             }
         }
@@ -16665,13 +16771,15 @@ impl ZaivernApp {
                     });
                     match edit {
                         editor_ops::PairEdit::Insert { text: nt, cursor } => {
-                            self.editor.buffers[active].text = nt;
-                            self.editor.buffers[active].cache = None;
+                            // 自動で足した閉じ括弧は打鍵と同じ段に混ぜる
+                            let ed = self.edit_typed();
+                            self.editor.buffers[active].apply_edit(nt, ed);
                             pending_select = Some((cursor, cursor));
                         }
                         editor_ops::PairEdit::Surround { text: nt, select } => {
-                            self.editor.buffers[active].text = nt;
-                            self.editor.buffers[active].cache = None;
+                            // 選択を括弧で囲むのはプログラム的編集 (1 段)
+                            let ed = self.edit_step().from_sel((sel_min, sel_max)).to_sel(select);
+                            self.editor.buffers[active].apply_edit(nt, ed);
                             pending_select = Some(select);
                         }
                         editor_ops::PairEdit::SkipOver { cursor } => {
@@ -16685,8 +16793,8 @@ impl ZaivernApp {
                         if ui.input_mut(|i| {
                             i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
                         }) {
-                            self.editor.buffers[active].text = nt;
-                            self.editor.buffers[active].cache = None;
+                            let ed = self.edit_typed();
+                            self.editor.buffers[active].apply_edit(nt, ed);
                             pending_select = Some((cur, cur));
                         }
                     }
@@ -16892,6 +17000,8 @@ impl ZaivernApp {
 
         let diag_by_line = &self.diag_cache.1;
         let hl = self.highlighter;
+        // 取り消し履歴へ渡すしきい値と上限は設定から (直書きしない)
+        let hist_edit = self.edit_typed();
         let buf = &mut self.editor.buffers[active];
         let Buffer {
             id,
@@ -16900,6 +17010,7 @@ impl ZaivernApp {
             cache,
             gutter,
             minimap,
+            history,
             ..
         } = buf;
 
@@ -17002,7 +17113,11 @@ impl ZaivernApp {
             // is_mutable() == false の包み (選択とコピーは残る)
             let mut target = match (read_only, disp_text.as_mut()) {
                 (false, Some(d)) => EditTarget::Rw(d),
-                (false, None) => EditTarget::Rw(&mut *text),
+                (false, None) => EditTarget::Rec {
+                    text: &mut *text,
+                    hist: &mut *history,
+                    ed: hist_edit,
+                },
                 (true, Some(d)) => EditTarget::Ro(&*d),
                 (true, None) => EditTarget::Ro(&*text),
             };
@@ -17632,14 +17747,14 @@ impl ZaivernApp {
                 let src = self.editor.buffers[active].text.clone();
                 let next = splice_fold_edit(&src, &disp_cut, &disp_prev, &d);
                 let (at, delta) = fold_edit_shift(&src, &next, &disp_cut, &disp_prev, &d);
+                let ed = self.edit_typed();
                 let b = &mut self.editor.buffers[active];
                 if delta != 0 {
                     b.folds.shift_lines(at, delta);
                     b.bookmarks.shift_lines(at, delta);
                 }
-                b.text = next;
-                b.cache = None;
-                b.gutter = None;
+                // 折りたたみ表示への打鍵も原文側の履歴へ 1 段として積む
+                b.apply_edit(next, ed);
                 // 表示テキストは次フレームで作り直す
                 self.fold_view = None;
                 spliced = true;
@@ -19714,10 +19829,10 @@ impl ZaivernApp {
             })
             .to_string();
         }
+        let ed = self.edit_step();
         let b = &mut self.editor.buffers[active];
-        b.text = text.to_string();
-        b.cache = None;
-        b.gutter = None;
+        // スマホ側からの差し替えも PC 側で ⌘Z 1 回で戻せるようにする
+        b.apply_edit(text.to_string(), ed);
         if !save {
             return json!({"ok": true, "dirty": b.dirty()}).to_string();
         }
@@ -19737,7 +19852,7 @@ impl ZaivernApp {
         let was = b.encoding;
         match b.write_to(&path) {
             Ok(promoted) => {
-                b.saved_hash = hash_str(&b.text);
+                b.mark_saved();
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 let enc = b.encoding.label();
@@ -23195,10 +23310,9 @@ impl ZaivernApp {
                 untitled += 1;
                 continue;
             };
-            let text = b.text.clone();
             if self.editor.buffers[i].write_to(&path).is_ok() {
                 let b = &mut self.editor.buffers[i];
-                b.saved_hash = hash_str(&text);
+                b.mark_saved();
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 saved += 1;
@@ -23248,7 +23362,7 @@ impl ZaivernApp {
             }
             let Some(path) = b.path.clone() else { continue };
             if b.write_to(&path).is_ok() {
-                b.saved_hash = hash_str(&b.text);
+                b.mark_saved();
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 saved_any = true;
@@ -23280,12 +23394,10 @@ impl ZaivernApp {
         }
         // ディスク側の符号化に合わせ直す (次の保存で元の形へ書き戻せるように)
         b.encoding = encoding;
-        b.text = text;
-        b.saved_hash = hash_str(&b.text);
+        // ディスクへ戻す = 未保存の編集を捨てる操作なので履歴も畳む
+        b.reset_text(text);
         b.disk_mtime = disk_mtime(&path);
         b.conflict_notified = None;
-        b.cache = None;
-        b.gutter = None;
         let title = b.title.clone();
         self.queue_lsp_change(i);
         self.toast(
@@ -23335,19 +23447,6 @@ impl ZaivernApp {
             return;
         }
         self.pending_editor_events.push(ev);
-    }
-
-    fn push_editor_key(&mut self, key: egui::Key, modifiers: egui::Modifiers, mutates: bool) {
-        self.push_editor_event(
-            egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            },
-            mutates,
-        );
     }
 
     /// キューされたイベントをフレーム冒頭で注入する (update() から毎フレーム)。
@@ -23949,7 +24048,8 @@ impl ZaivernApp {
         nt.push_str(&text[..sb]);
         nt.push_str(&self.find.replace);
         nt.push_str(&text[eb..]);
-        self.editor.buffers[i].text = nt;
+        let ed = self.edit_step().from_sel((c, c + qn));
+        self.editor.buffers[i].apply_edit(nt, ed);
         // 置換文字列の直後から次のヒットを探す (置換結果に query を含んでも無限ループしない)
         let rep_chars = self.find.replace.chars().count();
         self.find.last = Some((c + rep_chars).saturating_sub(1));
@@ -23972,7 +24072,9 @@ impl ZaivernApp {
             self.toast(tr("見つかりませんでした"), false);
             return;
         }
-        self.editor.buffers[i].text = nt;
+        // 「すべて置換」は何件当たっても**全体で 1 段** (⌘Z 1 回で丸ごと戻る)
+        let ed = self.edit_step();
+        self.editor.buffers[i].apply_edit(nt, ed);
         self.find.last = None;
         self.queue_lsp_change(i);
         self.toast(trf("{n} 件置換しました", &[("n", n.to_string())]), true);
@@ -30333,6 +30435,30 @@ mod multi_cursor_wiring_tests {
         assert_eq!(n, 2);
     }
 
+    /// マルチカーソルの一括編集は取り消し **1 段**で丸ごと戻る。
+    #[test]
+    fn マルチカーソルの一括編集は一段で戻る() {
+        use crate::editor::{Edit, HistoryLimits};
+        let mut ed = Editor::new();
+        ed.new_untitled();
+        let mut b = ed.buffers.pop().expect("untitled タブ");
+        let src = "a\nb\nc";
+        b.reset_text(src.into());
+        let sel = editor_ops::MultiSel::in_text(&b.text, [0..0, 2..2, 4..4]);
+        let (out, next, n) = multi_batch_insert(&b.text, &sel, "// ");
+        assert_eq!(n, 3, "3 箇所に入った");
+        let after = next.to_single_selection_chars(&out);
+        let step = Edit::programmatic(0, HistoryLimits::default())
+            .from_sel((0, 0))
+            .to_sel((after.start, after.end));
+        assert!(b.apply_edit(out, step));
+        assert_eq!(b.text, "// a\n// b\n// c");
+        assert_eq!(b.undo(), Some((0, 0)), "1 回で編集前の位置へ戻る");
+        assert_eq!(b.text, src, "3 箇所ぶんが 1 回の取り消しで戻る");
+        assert!(b.redo().is_some());
+        assert_eq!(b.text, "// a\n// b\n// c");
+    }
+
     /// 本文への書き込みは **1 か所だけ**。
     /// 途中で複数回代入すると取り消しが 1 段では戻らなくなる。
     #[test]
@@ -30344,9 +30470,13 @@ mod multi_cursor_wiring_tests {
             .expect("MultiPaste の腕がある");
         let arm = &body[..body.find("Cmd::ColumnSelectStart =>").unwrap_or(body.len())];
         assert_eq!(
-            arm.matches("b.text = ").count(),
+            arm.matches("apply_edit(").count(),
             1,
             "本文を 2 回以上書き換えている (取り消しが 1 段で戻らない)"
+        );
+        assert!(
+            !arm.contains(".text = "),
+            "履歴を通さず本文へ直接代入している (取り消しに乗らない)"
         );
         assert!(
             arm.contains("multi_batch_insert("),
