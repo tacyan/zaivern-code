@@ -61,6 +61,11 @@ pub enum Cmd {
     OpenGitPanel,
     OpenFind,
     NewAgent(usize),
+    /// プリセット `usize` を **専用の git worktree** で起動する。
+    /// 同じツリーを他のエージェントと共有しないので、ファイルの取り合いが起きない。
+    NewAgentIsolated(usize),
+    /// 稼働中のエージェントを**全部**止める (破壊的なので必ず確認を取る)。
+    StopAllAgents,
     /// カタログ全 CLI から選んでプリセットを追加するピッカーを開く
     OpenAgentPicker,
     FocusAgent(usize),
@@ -613,6 +618,8 @@ fn group_of(cmd: &Cmd) -> Group {
 
         // ── エージェント ───────────────────────────────────────────
         Cmd::NewAgent(_)
+        | Cmd::NewAgentIsolated(_)
+        | Cmd::StopAllAgents
         | Cmd::OpenAgentPicker
         | Cmd::FocusAgent(_)
         | Cmd::RestartAgent

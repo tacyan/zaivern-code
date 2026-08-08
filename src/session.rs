@@ -65,6 +65,15 @@ pub struct AgentSessionRec {
     /// 既存フィールドの並び順に依存した壊れ方をする。空 = 分割なし。
     /// リーフはセッション ID ではなく**生ログのパス**で指す (再起動で ID は変わる)。
     pub split: String,
+    /// worktree 隔離で起動していた場合の**本体リポジトリ** (絶対パス)。空 = 隔離なし。
+    ///
+    /// worktree のフォルダそのものは `cwd` に入っているので、ここには
+    /// 「どのリポジトリの worktree か」だけを持つ (破棄時に `git -C <repo>
+    /// worktree remove` を撃つ相手)。復元時はこの 2 本が揃っているときだけ
+    /// 隔離エージェントとして扱い、**前回と同じ worktree へ戻す**。
+    pub worktree_repo: String,
+    /// worktree 隔離で起動していた場合のブランチ名 (`agent/<slug>-<n>`)。空 = 隔離なし。
+    pub worktree_branch: String,
 }
 
 /// `~/.zaivern/sessions/<ルート集合ハッシュhex>.toml` から読む。無ければ None。
@@ -383,6 +392,8 @@ mod tests {
                     log_file: "/logs/Claude_Code-1.log".into(),
                     // 分割レイアウト (リーフ = 生ログのパス)。
                     split: String::new(),
+                    worktree_repo: String::new(),
+                    worktree_branch: String::new(),
                 },
                 AgentSessionRec {
                     preset_name: "Codex".into(),
@@ -392,6 +403,8 @@ mod tests {
                     cwd: "/p/サブ".into(),
                     log_file: "/logs/Codex__2-2.log".into(),
                     split: String::new(),
+                    worktree_repo: String::new(),
+                    worktree_branch: String::new(),
                 },
             ],
             ..Default::default()
@@ -416,6 +429,53 @@ mod tests {
         let loaded = load_from(&dir, roots).expect("old session should still load");
         assert!(loaded.agents.is_empty(), "旧ファイルでは空の agents になる");
         assert_eq!(loaded.open_files, vec!["/a.rs"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// worktree 隔離で起動したエージェントの記録が、保存 → 復元で往復すること。
+    /// ここが落ちると「再起動したら自分の worktree に戻れない」= 隔離が壊れる。
+    #[test]
+    fn worktree隔離の記録が保存と復元で保たれる() {
+        let dir = unique_temp_dir("zaivern-session-test", "agent-worktree");
+        let roots = &[dir.join("ws")];
+        // 日本語・空白入りのパスでも壊れないこと (TOML の文字列としてそのまま往復する)
+        let wt_dir = "/親 フォルダ/repo-agent-claude-code-1";
+        let data = SessionData {
+            agents: vec![
+                AgentSessionRec {
+                    preset_name: "Claude Code".into(),
+                    title: "Claude Code".into(),
+                    command: "claude".into(),
+                    cwd: wt_dir.into(),
+                    worktree_repo: "/親 フォルダ/repo".into(),
+                    worktree_branch: "agent/claude-code-1".into(),
+                    ..Default::default()
+                },
+                // 隔離していないエージェントは空文字のまま (= 通常起動)
+                AgentSessionRec {
+                    preset_name: "Codex".into(),
+                    cwd: "/親 フォルダ/repo".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        save_to(&dir, roots, &data);
+        let loaded = load_from(&dir, roots).expect("session should load");
+        assert_eq!(loaded.agents.len(), 2);
+        assert_eq!(loaded.agents[0].cwd, wt_dir, "worktree の cwd へ戻る");
+        assert_eq!(loaded.agents[0].worktree_repo, "/親 フォルダ/repo");
+        assert_eq!(loaded.agents[0].worktree_branch, "agent/claude-code-1");
+        assert!(loaded.agents[1].worktree_branch.is_empty(), "隔離なしは空");
+        assert!(loaded.agents[1].worktree_repo.is_empty(), "隔離なしは空");
+
+        // この欄を持たない旧ファイルでも読める (= 空文字 = 隔離なし扱い)
+        let old = "open_files = []\n[[agents]]\npreset_name = \"Claude Code\"\ncwd = \"/p\"\n";
+        std::fs::write(session_file_in(&dir, roots), old).expect("write old session");
+        let loaded = load_from(&dir, roots).expect("old session should still load");
+        assert_eq!(loaded.agents.len(), 1);
+        assert!(loaded.agents[0].worktree_branch.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

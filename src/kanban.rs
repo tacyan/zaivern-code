@@ -1481,6 +1481,10 @@ pub struct Card {
     pub tail_lines: Vec<String>,
     /// coordinator に割り当て中のタスク名
     pub task: Option<String>,
+    /// 他のエージェントと**同じファイルを取り合っている**か
+    /// ([`crate::worktree::ConflictReport`])。true のカードだけ ⚠ が付く。
+    /// 中身はホバーで出す (カードの中に一覧を広げない)。
+    pub conflict: Option<String>,
 }
 
 /// 画面末尾から「いま何をしているか」の一言を取り出す (最後の非空行)。
@@ -3430,6 +3434,12 @@ fn card_ui(
                                      @宛先: 指示 で指揮します",
                                 ));
                             }
+                            // ファイルの取り合いは**1 文字**だけで知らせる。
+                            // 詳細はホバー — カードの中で領域を広げない。
+                            if let Some(files) = &c.conflict {
+                                ui.label(RichText::new("⚠").size(12.0).color(theme.warn))
+                                    .on_hover_text(files);
+                            }
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(format!(
@@ -5099,6 +5109,7 @@ mod tests {
             can_cycle: false,
             tail_lines: Vec::new(),
             task: None,
+            conflict: None,
         }
     }
 

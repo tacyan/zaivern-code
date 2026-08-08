@@ -74,6 +74,7 @@ mod theme_json;
 mod tunnel;
 mod tutorial;
 mod voice;
+mod worktree;
 mod zoom;
 
 use eframe::egui;
