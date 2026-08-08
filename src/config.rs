@@ -72,6 +72,17 @@ pub struct Config {
     /// 幅が足りない画面では設定が ON でも自動的に隠れる。
     pub minimap: bool,
 
+    /// 取り消し履歴: 連続した文字入力を 1 段へまとめる時間しきい値 (ミリ秒)。
+    /// これを越えて間が空いたら別の段になる (VS Code / Zed と同じ考え方)。
+    pub undo_merge_ms: u64,
+
+    /// 取り消し履歴の最大段数 (タブ 1 枚あたり)。古いものから捨てる。
+    pub undo_max_steps: usize,
+
+    /// 取り消し履歴が抱える差分の合計バイト上限 (タブ 1 枚あたり)。
+    /// 巨大な一括置換を何度もやっても、ここで頭打ちになる。
+    pub undo_max_bytes: usize,
+
     /// エディタ上部のブレッドクラム (`ワークスペース › フォルダ › ファイル › シンボル`)。
     /// **既定はオン** — 高さ 1 行ぶんで、どの言語でも (LSP 無しでも) 必ず出せる。
     pub breadcrumbs: bool,
@@ -329,6 +340,9 @@ impl Default for Config {
             lsp_highlight_occurrences: true,
             inline_diagnostics: true,
             minimap: false,
+            undo_merge_ms: crate::editor::UNDO_MERGE_MS,
+            undo_max_steps: crate::editor::UNDO_MAX_STEPS,
+            undo_max_bytes: crate::editor::UNDO_MAX_BYTES,
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
             git_blame: false,
@@ -374,6 +388,18 @@ impl Default for Config {
             super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),
             failover: crate::failover::FailoverConfig::default(),
+        }
+    }
+}
+
+impl Config {
+    /// 取り消し履歴のしきい値と上限。**呼び出し側で直書きしないための唯一の口**。
+    pub fn history_limits(&self) -> crate::editor::HistoryLimits {
+        crate::editor::HistoryLimits {
+            merge_ms: self.undo_merge_ms,
+            // 0 を書かれても 1 段は残す (`History::trim` 側でも守っている)
+            max_steps: self.undo_max_steps.max(1),
+            max_bytes: self.undo_max_bytes,
         }
     }
 }
@@ -673,6 +699,15 @@ show_hidden_files = true
 # 出るのは**キャレット行だけ**です。オフにしても波線とホバーは残ります
 # (コマンドパレットの「行末の診断メッセージ切替」でも変更できます)
 # inline_diagnostics = true
+# 取り消し (Undo) 履歴の粒度とメモリ上限。タブ 1 枚あたりの値です。
+#   undo_merge_ms  = 続けて打った文字を 1 段にまとめる時間しきい値 (ミリ秒)。
+#                    これを超えて間が空くと別の段になります。0 にすると 1 打鍵 = 1 段。
+#   undo_max_steps = 保持する最大段数。超えたぶんは古い方から捨てます。
+#   undo_max_bytes = 履歴が抱える差分の合計バイト上限。巨大な一括置換を
+#                    繰り返してもここで頭打ちになります。
+# undo_merge_ms = 400
+# undo_max_steps = 400
+# undo_max_bytes = 4194304
 
 # ミニマップ (エディタ右端の遠景) とブレッドクラム (上部のパンくず)
 # (表示メニュー・コマンドパレットの「ミニマップの表示切替」「ブレッドクラムの表示切替」でも変更できます)
