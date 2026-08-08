@@ -46,6 +46,39 @@ pub struct Config {
     /// オンの間だけ可視範囲ぶんの `git blame` を非同期で取る。
     pub git_blame: bool,
 
+    // ── 保存時の整形 (VS Code の files.* / editor.formatOnSave 相当) ──
+    //
+    // **どれも既定はオフ** — VS Code の既定と同じ。保存しただけで差分が
+    // 増えるのは事故なので、明示的に選んだ人だけが払う。
+    /// 保存時に各行の末尾空白を落とす (`files.trimTrailingWhitespace`)。
+    /// 全角スペース U+3000 と NBSP は落とさない
+    /// ([`crate::editor_ops::trim_trailing_whitespace`] を参照)。
+    pub trim_trailing_whitespace: bool,
+    /// 保存時に末尾の余分な空行を落とす (`files.trimFinalNewlines`)。
+    pub trim_final_newlines: bool,
+    /// 保存時に最終行へ改行を入れる (`files.insertFinalNewline`)。
+    pub insert_final_newline: bool,
+    /// 保存時に LSP の整形をかける (`editor.formatOnSave`)。
+    /// 整形の経路は「ドキュメントを整形」と同じ 1 本。
+    pub format_on_save: bool,
+
+    // ── エディタの見た目・インデント ──────────────────────────────
+    /// 括弧を入れ子の深さごとに色分けする
+    /// (`editor.bracketPairColorization.enabled`)。**既定はオン**。
+    /// 色はテーマの ANSI 表から採る ([`crate::theme::Theme::bracket_colors`])。
+    pub bracket_colorization: bool,
+    /// 縦のルーラーを引く桁 (`editor.rulers`)。既定は空 = 1 本も引かない。
+    /// 例: `rulers = [80, 120]`。桁は等幅の**桁数**で数える (東アジア文字幅ではない)。
+    pub rulers: Vec<usize>,
+    /// 開いたファイルの中身からインデントを推定する
+    /// (`editor.detectIndentation`)。**既定はオン**。
+    /// オフにすると `tab_size` / `insert_spaces` をそのまま使う。
+    pub detect_indentation: bool,
+    /// インデント 1 段の桁数 (`editor.tabSize`)。既定 4。
+    pub tab_size: usize,
+    /// インデントにスペースを使う (`editor.insertSpaces`)。既定オン。
+    pub insert_spaces: bool,
+
     /// 既定の権限モード: "ask"(毎回ユーザー承認) | "auto"(全て自動YES) |
     /// "agent"(Agent欄優先: プリセットのコマンドに書かれたフラグをそのまま使う)
     pub approval_mode: String,
@@ -270,6 +303,16 @@ impl Default for Config {
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
             git_blame: false,
+            // 保存時の整形は VS Code と同じく全部オフから始める
+            trim_trailing_whitespace: false,
+            trim_final_newlines: false,
+            insert_final_newline: false,
+            format_on_save: false,
+            bracket_colorization: true,
+            rulers: Vec::new(),
+            detect_indentation: true,
+            tab_size: crate::editor_ops::IndentStyle::DEFAULT_WIDTH,
+            insert_spaces: true,
             approval_mode: "ask".into(),
             restore_agents: false,
             show_pet: true,
@@ -587,6 +630,24 @@ show_hidden_files = true
 # ガターに git blame (著者 · 相対日時) を出す。既定はオフ
 # (表示メニュー・コマンドパレットの「Git blame の表示切替」でも変更できます)
 # git_blame = false
+
+# ── 保存時の整形 (VS Code の files.* / editor.formatOnSave 相当) ──
+# どれも既定はオフ。保存しただけで差分が増えないようにするためで、
+# コマンドパレットの「保存時に…」からも個別に切り替えられます。
+# trim_trailing_whitespace = false   # 各行の末尾空白を落とす (全角スペースは残す)
+# trim_final_newlines      = false   # 末尾の余分な空行を落とす
+# insert_final_newline     = false   # 最終行に改行が無ければ足す
+# format_on_save           = false   # LSP の整形をかけてから保存する
+
+# ── 括弧の色分け / 縦のルーラー / インデント ──
+# 括弧を入れ子の深さごとに色分けする (色はテーマの ANSI 表から採ります)
+# bracket_colorization = true
+# 縦のルーラーを引く桁 (等幅の桁数)。既定は空 = 1 本も引きません
+# rulers = [80, 120]
+# 開いたファイルの中身からインデントを推定する (オフなら下の 2 つをそのまま使う)
+# detect_indentation = true
+# tab_size = 4
+# insert_spaces = true
 
 # 既定の権限モード (claude / codex / agy に自動適用)
 #   "ask"   = 毎回ユーザー承認が必要（安全・デフォルト）

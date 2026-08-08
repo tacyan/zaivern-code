@@ -162,6 +162,13 @@ pub struct Buffer {
     /// 永続化すると、後から「なぜこのファイルだけ字が大きいのか」が
     /// どこにも書かれていない謎として残るため。
     pub zoom: f32,
+    /// このタブのインデント様式 (VS Code のステータスバー「スペース: 4」)。
+    ///
+    /// 開いたときに本文から推定して入れる (`editor.detectIndentation`)。
+    /// **ファイルの中身ではない**ので永続化しない — 開き直せばまた推定する。
+    /// ステータスバーから切り替えると、ここだけが変わる (表示のみ) か、
+    /// 本文も変換されるかをユーザーが選ぶ。
+    pub indent: crate::editor_ops::IndentStyle,
 }
 
 /// 画像タブのデコード結果。
@@ -1383,6 +1390,13 @@ pub struct Editor {
     untitled_count: u64,
     /// 直近に閉じたタブ (Ctrl+Shift+T で開き直す)。
     pub closed_tabs: ClosedTabs,
+    /// インデントの既定 `(推定するか, 推定できなかったときの様式)`。
+    ///
+    /// `config.toml` の `detect_indentation` / `tab_size` / `insert_spaces` を
+    /// app 側が毎フレーム流し込む。ここに置いているのは、タブを開く経路が
+    /// 6 か所あって、そのすべてに設定を引き回すと配線が漏れるため
+    /// (漏れたタブだけインデント表示が既定値になる、という気づきにくい壊れ方をする)。
+    pub indent_defaults: (bool, crate::editor_ops::IndentStyle),
 }
 
 impl Editor {
@@ -1394,7 +1408,23 @@ impl Editor {
             cursor: (1, 1),
             untitled_count: 0,
             closed_tabs: ClosedTabs::default(),
+            indent_defaults: (true, crate::editor_ops::IndentStyle::default()),
         }
+    }
+
+    /// 開いた本文からこのタブのインデント様式を決める。
+    ///
+    /// 推定がオフなら設定値をそのまま入れる (VS Code の `editor.detectIndentation`)。
+    pub fn apply_indent_defaults(&mut self, i: usize) {
+        let (detect, fallback) = self.indent_defaults;
+        let Some(b) = self.buffers.get_mut(i) else {
+            return;
+        };
+        b.indent = if detect {
+            crate::editor_ops::detect_indent(&b.text, fallback)
+        } else {
+            fallback
+        };
     }
 
     pub fn new_untitled(&mut self) {
@@ -1424,8 +1454,10 @@ impl Editor {
             preview: None,
             minimap: None,
             zoom: crate::zoom::DEFAULT,
+            indent: crate::editor_ops::IndentStyle::default(),
         });
         self.active = Some(self.buffers.len() - 1);
+        self.apply_indent_defaults(self.buffers.len() - 1);
     }
 
     /// 専用ビューアのタブ (16 進 / メディア / 書庫) を 1 枚積んでアクティブにする。
@@ -1464,8 +1496,10 @@ impl Editor {
             preview,
             minimap: None,
             zoom: crate::zoom::DEFAULT,
+            indent: crate::editor_ops::IndentStyle::default(),
         });
         self.active = Some(self.buffers.len() - 1);
+        self.apply_indent_defaults(self.buffers.len() - 1);
     }
 
     /// Open a file (or focus it if already open).
@@ -1571,8 +1605,10 @@ impl Editor {
                 preview: None,
                 minimap: None,
                 zoom: crate::zoom::DEFAULT,
+                indent: crate::editor_ops::IndentStyle::default(),
             });
             self.active = Some(self.buffers.len() - 1);
+            self.apply_indent_defaults(self.buffers.len() - 1);
             return Ok(false);
         }
         // PDF は抽出したテキストを読み取り専用タブに載せる。バイナリを
@@ -1617,8 +1653,10 @@ impl Editor {
                 preview: None,
                 minimap: None,
                 zoom: crate::zoom::DEFAULT,
+                indent: crate::editor_ops::IndentStyle::default(),
             });
             self.active = Some(self.buffers.len() - 1);
+            self.apply_indent_defaults(self.buffers.len() - 1);
             return Ok(false);
         }
         let (text, encoding) = crate::textenc::decode_bytes(&raw);
@@ -1653,8 +1691,10 @@ impl Editor {
             preview: None,
             minimap: None,
             zoom: crate::zoom::DEFAULT,
+            indent: crate::editor_ops::IndentStyle::default(),
         });
         self.active = Some(self.buffers.len() - 1);
+        self.apply_indent_defaults(self.buffers.len() - 1);
         Ok(false)
     }
 
@@ -1701,8 +1741,10 @@ impl Editor {
             preview: None,
             minimap: None,
             zoom: crate::zoom::DEFAULT,
+            indent: crate::editor_ops::IndentStyle::default(),
         });
         self.active = Some(self.buffers.len() - 1);
+        self.apply_indent_defaults(self.buffers.len() - 1);
         id
     }
 
@@ -1786,6 +1828,9 @@ impl Editor {
         b.text = text;
         b.cache = None;
         b.gutter = None;
+        // 中身が入れ替わったのでインデントも取り直す (エージェントが
+        // 別の様式で書き換えたときにステータスバーが嘘を出さないように)
+        self.apply_indent_defaults(i);
         true
     }
 

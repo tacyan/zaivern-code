@@ -853,6 +853,119 @@ fn save_cleanup_edit(
     Some((cleaned, (s, e)))
 }
 
+// ───────────────── インデントの切替 (ステータスバー) ─────────────────
+
+/// ステータスバーのインデントメニューで選ばれたもの。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IndentAction {
+    /// 表示だけ変える (本文は 1 文字も触らない)。
+    Display(editor_ops::IndentStyle),
+    /// 本文のインデントも新しい様式へ書き換える。
+    Convert(editor_ops::IndentStyle),
+    /// 中身から推定し直す。
+    Detect,
+}
+
+/// ステータスバーのインデントメニューの中身 (純粋な描画。self を借りない)。
+///
+/// **選択肢は「表示だけ」と「変換する」の 2 段**。VS Code と同じく、
+/// 押しただけで本文が書き換わることが無いようにする
+/// (書き換える側は取り消し 1 段で戻せる)。
+fn indent_menu_ui(ui: &mut egui::Ui, cur: editor_ops::IndentStyle, out: &mut Option<IndentAction>) {
+    // 幅の候補。設定の tab_size とは独立の「よくある値」で、
+    // 現在値がこの並びに無ければ先頭へ足して必ず選べるようにする。
+    let mut widths: Vec<usize> = vec![2, 4, 8];
+    if !widths.contains(&cur.width) {
+        widths.push(cur.width);
+        widths.sort_unstable();
+    }
+    let mut row = |ui: &mut egui::Ui, convert: bool| {
+        // 行は必ず可用幅に収める (ボタンは短いラベルなので折り返さない)
+        ui.horizontal_wrapped(|ui| {
+            for w in &widths {
+                let st = editor_ops::IndentStyle::new(false, *w);
+                if ui
+                    .selectable_label(cur == st, format!("␣{w}"))
+                    .on_hover_text(trf("スペース {n}", &[("n", w.to_string())]))
+                    .clicked()
+                {
+                    *out = Some(if convert {
+                        IndentAction::Convert(st)
+                    } else {
+                        IndentAction::Display(st)
+                    });
+                    ui.close_menu();
+                }
+            }
+            let st = editor_ops::IndentStyle::new(true, cur.width);
+            if ui
+                .selectable_label(cur.tabs, tr("タブ"))
+                .on_hover_text(trf("タブ (幅 {n})", &[("n", cur.width.to_string())]))
+                .clicked()
+            {
+                *out = Some(if convert {
+                    IndentAction::Convert(st)
+                } else {
+                    IndentAction::Display(st)
+                });
+                ui.close_menu();
+            }
+        });
+    };
+    ui.label(RichText::new(tr("表示だけ変える")).strong());
+    row(ui, false);
+    ui.separator();
+    ui.label(RichText::new(tr("インデントを変換する")).strong());
+    row(ui, true);
+    ui.separator();
+    if ui.button(tr("中身から推定し直す")).clicked() {
+        *out = Some(IndentAction::Detect);
+        ui.close_menu();
+    }
+}
+
+// ───────────────── 縦のルーラー (editor.rulers) ─────────────────
+
+/// 設定の桁並びを描画に使える形へ正規化する。
+///
+/// 0 桁は落とす — 本文の左端に重なるだけで「桁の目印」にならないため。
+/// 重複も落として昇順にする (描画側が毎フレーム並べ替えないで済む)。
+fn normalize_rulers(cols: &[usize]) -> Vec<usize> {
+    let mut v: Vec<usize> = cols.iter().copied().filter(|c| *c > 0).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// ルーラーを引く x 座標を返す (可用領域に収まるものだけ)。
+///
+/// 桁は**等幅の桁数**で数える — 東アジア文字の幅は数えない (VS Code と同じ)。
+/// 座標は [`theme::snap_len`] で整数ピクセルへ揃える。小数のままだと
+/// 100% 表示で線が隣の桁へにじみ、文字がガタガタに見えるため。
+///
+/// `clip` は描いてよい x の範囲 (ガターの右端 〜 表示域の右端)。
+/// はみ出す桁は**返さない**ので、呼び出し側は無条件に描いてよい。
+fn ruler_x_positions(
+    cols: &[usize],
+    text_left: f32,
+    char_w: f32,
+    clip: egui::Rangef,
+    ppp: f32,
+) -> Vec<f32> {
+    if !char_w.is_finite() || char_w <= 0.0 || !text_left.is_finite() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(cols.len());
+    for c in cols {
+        let x = text_left + theme::snap_len(*c as f32 * char_w, ppp);
+        if !x.is_finite() || x < clip.min || x > clip.max {
+            continue;
+        }
+        out.push(x);
+    }
+    out
+}
+
 /// glob 欄 1 本を個々のパターンへ割る。区切りはカンマ・空白・改行のどれでもよい。
 /// 空の断片は落とすので、末尾のカンマや二重空白があっても空パターンにならない
 /// (空パターンは「何にも一致しない」ので、混ざると結果が黙って 0 件になる)。
@@ -1069,6 +1182,16 @@ enum EditOp {
     Move(bool),
     /// 本文の改行コードを揃える (ステータスバー / パレット / 編集メニュー)。
     NormalizeEol(crate::textenc::LineEnding),
+    /// 選択範囲の大文字小文字を変換する。
+    Case(editor_ops::CaseKind),
+    /// 選択範囲の行を並べ替える (true = 降順)。
+    Sort(bool),
+    /// 選択範囲の重複行を削る。
+    Dedupe,
+    /// 選択範囲 (無選択なら本文全体) を JSON として整形する。
+    FormatJson,
+    /// 本文のインデントを別の様式へ変換する (ステータスバーから)。
+    ConvertIndent(editor_ops::IndentStyle),
 }
 
 /// LSP サーバーのキー: (言語ID, ルート)。ルート毎に 1 プロセス起動する
@@ -2343,9 +2466,12 @@ pub struct ZaivernApp {
     /// レート制限時のアカウント自動フェイルオーバー。**既定は無効**。
     /// 段 (検知→候補選定→切替→再開→検証) と履歴をここが持つ。
     failover: failover::Failover,
-    /// 保存時に行末の空白を落とす (egui memory へ永続化。将来は config.toml へ)
+    /// 保存時に行末の空白を落とす (`config.trim_trailing_whitespace` が種。
+    /// セッション中の切替は egui memory へ覚える)
     save_trim_trailing: bool,
-    /// 保存時に最終行へ改行を入れる (同上)
+    /// 保存時に末尾の余分な空行を落とす (`config.trim_final_newlines` が種)
+    save_trim_final_newlines: bool,
+    /// 保存時に最終行へ改行を入れる (`config.insert_final_newline` が種)
     save_final_newline: bool,
     /// egui memory から永続設定を読み終えたか (最初のフレームで 1 度だけ)
     prefs_loaded: bool,
@@ -2444,9 +2570,13 @@ pub struct ZaivernApp {
     /// 直近フレームの本文選択範囲 (char 添字, start < end)。無選択なら None。
     /// 折りたたみ表示中は表示テキストの添字になってしまうので None にする。
     editor_sel_chars: Option<(usize, usize)>,
-    /// 保存時に LSP で整形するか。config.rs は別担当なのでここでは
-    /// セッション内の切替のみ (既定は OFF = 何も変えない)。
+    /// 保存時に LSP で整形するか (`config.format_on_save` が種)。
     format_on_save: bool,
+    /// 括弧を入れ子の深さごとに色分けするか (`config.bracket_colorization`)。
+    bracket_colorization: bool,
+    /// 縦のルーラーを引く桁 (`config.rulers`)。空なら 1 本も引かない。
+    /// 昇順・重複なしに正規化して持つ (描画側で毎フレーム並べ替えないため)。
+    rulers: Vec<usize>,
     /// 外部変更チェックの直近実行時刻(約1秒スロットリング)
     ext_check_at: Option<Instant>,
     keys: Keybinds,
@@ -2870,7 +3000,9 @@ impl ZaivernApp {
             lsp_highlight_buf: None,
             lsp_highlight_on: cfg.lsp_highlight_occurrences,
             editor_sel_chars: None,
-            format_on_save: false,
+            format_on_save: cfg.format_on_save,
+            bracket_colorization: cfg.bracket_colorization,
+            rulers: normalize_rulers(&cfg.rulers),
             ext_check_at: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
             theme,
@@ -2981,8 +3113,9 @@ impl ZaivernApp {
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             failover: failover::Failover::new(cfg.failover.clone()),
-            save_trim_trailing: false,
-            save_final_newline: false,
+            save_trim_trailing: cfg.trim_trailing_whitespace,
+            save_trim_final_newlines: cfg.trim_final_newlines,
+            save_final_newline: cfg.insert_final_newline,
             prefs_loaded: false,
             le_cache: None,
             pet_pos: match (cfg.pet_x, cfg.pet_y) {
@@ -4671,6 +4804,40 @@ impl ZaivernApp {
             return;
         }
 
+        // JSON 整形だけは失敗しうる (壊れた JSON を黙って書き換えない)。
+        // 先にここで断ると、下の借用を跨いで toast を出さずに済む。
+        if matches!(op, EditOp::FormatJson) {
+            let unit = self.editor.buffers[i].indent.unit();
+            let text = self.editor.buffers[i].text.clone();
+            // 選択が無ければ本文全体を対象にする (VS Code の Format Document 相当)
+            let (s, e) = if start == end {
+                (0, text.chars().count())
+            } else {
+                (start, end)
+            };
+            let src: String = text.chars().skip(s).take(e - s).collect();
+            match editor_ops::format_json(&src, &unit) {
+                Ok(out) => {
+                    let sb = editor_ops::char_to_byte(&text, s);
+                    let eb = editor_ops::char_to_byte(&text, e);
+                    let mut new_text = String::with_capacity(text.len());
+                    new_text.push_str(&text[..sb]);
+                    new_text.push_str(&out);
+                    new_text.push_str(&text[eb..]);
+                    let new_sel = (s, s + out.chars().count());
+                    if new_text != self.editor.buffers[i].text {
+                        let b = &mut self.editor.buffers[i];
+                        b.text = new_text;
+                        b.cache = None;
+                        b.gutter = None;
+                    }
+                    self.pending_select = Some(new_sel);
+                }
+                Err(e) => self.toast(trf("JSON として読めません: {e}", &[("e", e)]), false),
+            }
+            return;
+        }
+
         let buf = &mut self.editor.buffers[i];
         let (new_text, new_sel) = match op {
             EditOp::ToggleComment => {
@@ -4692,6 +4859,38 @@ impl ZaivernApp {
                 let e = editor_ops::adjust_char_index_after_cleanup(&buf.text, &t, end);
                 (t, (s, e))
             }
+            EditOp::Case(kind) => {
+                // 変換で文字数が変わることがある (ß → SS) ので、
+                // 選択の終わりは**変換後の長さ**から取り直す。
+                let sb = editor_ops::char_to_byte(&buf.text, start);
+                let eb = editor_ops::char_to_byte(&buf.text, end);
+                let out = editor_ops::transform_case(&buf.text[sb..eb], kind);
+                let mut t = String::with_capacity(buf.text.len());
+                t.push_str(&buf.text[..sb]);
+                t.push_str(&out);
+                t.push_str(&buf.text[eb..]);
+                let e = start + out.chars().count();
+                (t, (start, e))
+            }
+            EditOp::Sort(desc) => {
+                let (t, s, e) = editor_ops::sort_lines(&buf.text, start, end, desc);
+                (t, (s, e))
+            }
+            EditOp::Dedupe => {
+                let (t, s, e) = editor_ops::dedupe_lines(&buf.text, start, end);
+                (t, (s, e))
+            }
+            EditOp::ConvertIndent(to) => {
+                let from = buf.indent;
+                let t = editor_ops::convert_indentation(&buf.text, from, to);
+                // 行頭の空白が増減するので、選択範囲は必ず付け替える
+                let s = editor_ops::adjust_char_index_after_cleanup(&buf.text, &t, start);
+                let e = editor_ops::adjust_char_index_after_cleanup(&buf.text, &t, end);
+                buf.indent = to;
+                (t, (s, e))
+            }
+            // 上で処理済み (借用を跨げないので早期 return してある)
+            EditOp::FormatJson => (buf.text.clone(), (start, end)),
         };
         if new_text != buf.text {
             buf.text = new_text;
@@ -5118,11 +5317,82 @@ impl ZaivernApp {
         }
     }
 
+    /// ステータスバーで選ばれたインデントの切替を反映する。
+    ///
+    /// 「表示だけ」は本文に触らない = 取り消し履歴も汚さない。
+    /// 「変換する」は [`EditOp::ConvertIndent`] 1 回で済ませるので、
+    /// ⌘Z 一回で元に戻る。
+    fn apply_indent_action(&mut self, action: IndentAction, ctx: &egui::Context) {
+        let Some(i) = self.editor.active else {
+            return;
+        };
+        match action {
+            IndentAction::Display(st) => {
+                self.editor.buffers[i].indent = st;
+                self.toast(
+                    trf(
+                        "インデントの表示: {kind} {n}",
+                        &[
+                            ("kind", tr(if st.tabs { "タブ" } else { "スペース" })),
+                            ("n", st.width.to_string()),
+                        ],
+                    ),
+                    true,
+                );
+            }
+            IndentAction::Convert(st) => {
+                if self.editor.buffers[i].indent == st {
+                    return;
+                }
+                self.editor_op(ctx, EditOp::ConvertIndent(st));
+                self.toast(
+                    trf(
+                        "インデントを変換しました: {kind} {n}",
+                        &[
+                            ("kind", tr(if st.tabs { "タブ" } else { "スペース" })),
+                            ("n", st.width.to_string()),
+                        ],
+                    ),
+                    true,
+                );
+            }
+            IndentAction::Detect => {
+                // 推定は設定に関わらず必ず走らせる (明示的に頼まれた操作なので)
+                let saved = self.editor.indent_defaults;
+                self.editor.indent_defaults.0 = true;
+                self.editor.apply_indent_defaults(i);
+                self.editor.indent_defaults = saved;
+                let st = self.editor.buffers[i].indent;
+                self.toast(
+                    trf(
+                        "中身から推定しました: {kind} {n}",
+                        &[
+                            ("kind", tr(if st.tabs { "タブ" } else { "スペース" })),
+                            ("n", st.width.to_string()),
+                        ],
+                    ),
+                    true,
+                );
+            }
+        }
+    }
+
+    /// `config.toml` のインデント設定を [`editor::Editor`] へ流し込む。
+    ///
+    /// タブを開く経路は 6 か所あるので、設定を引き回さずに Editor 側へ
+    /// 1 度だけ置く (漏れたタブだけ既定値になる、という壊れ方を避ける)。
+    fn sync_indent_defaults(&mut self) {
+        self.editor.indent_defaults = (
+            self.cfg.detect_indentation,
+            editor_ops::IndentStyle::new(!self.cfg.insert_spaces, self.cfg.tab_size),
+        );
+    }
+
     // ── 永続する UI 設定 (egui memory) ──
     //
-    // config.toml ではなく egui の永続メモリに置いてある。config.rs は別担当が
-    // 触っている最中なので、そちらが空いたら config.toml へ移すこと
-    // (移すときはこの 4 つ: 検索の Aa / Ab| / .*、保存時の 2 つ)。
+    // 保存時のクリーンアップ (末尾空白 / 末尾の空行 / 最終行の改行 / 整形) は
+    // **config.toml が持ち主**で、ここにはセッション中の切替だけを覚える。
+    // 検索の Aa / Ab| / .* は画面の状態なので egui memory だけで完結する。
 
     fn search_prefs_id() -> egui::Id {
         egui::Id::new("zv-search-prefs")
@@ -5138,17 +5408,33 @@ impl ZaivernApp {
             return;
         }
         self.prefs_loaded = true;
+        // インデントの既定を Editor へ (以後開くタブはこれを使う)。
+        // 起動時に復元されたタブは推定前なので、ここで取り直す。
+        self.sync_indent_defaults();
+        for i in 0..self.editor.buffers.len() {
+            self.editor.apply_indent_defaults(i);
+        }
         // (大文字小文字, 単語単位, 正規表現)
         let (c, w, r) = ctx
             .data_mut(|d| *d.get_persisted_mut_or(Self::search_prefs_id(), (false, false, false)));
         self.gsearch.case_sensitive = c;
         self.gsearch.whole_word = w;
         self.gsearch.regex = r;
-        // (末尾空白を除去, 最終行に改行)
-        let (t, n) =
-            ctx.data_mut(|d| *d.get_persisted_mut_or(Self::editor_prefs_id(), (false, false)));
+        // (末尾空白を除去, 末尾の空行を落とす, 最終行に改行, 保存時に整形)
+        // **種は config.toml** — 設定に書いた既定で始まり、セッション中の
+        // 切替 (パレット / メニュー) だけをここへ覚える。
+        let seed = (
+            self.cfg.trim_trailing_whitespace,
+            self.cfg.trim_final_newlines,
+            self.cfg.insert_final_newline,
+            self.cfg.format_on_save,
+        );
+        let (t, tf, n, f) =
+            ctx.data_mut(|d| *d.get_persisted_mut_or(Self::editor_prefs_id(), seed));
         self.save_trim_trailing = t;
+        self.save_trim_final_newlines = tf;
         self.save_final_newline = n;
+        self.format_on_save = f;
         // 差分ビューの表示モードは config が持ち主。ここで 1 回だけ ctx へ種を蒔く
         // (以降はビューのトグル / パレット / F7 が ctx 側を書き換え、
         //  update の頭で config へ書き戻す)。
@@ -5168,7 +5454,12 @@ impl ZaivernApp {
     }
 
     fn save_editor_prefs(&self, ctx: &egui::Context) {
-        let v = (self.save_trim_trailing, self.save_final_newline);
+        let v = (
+            self.save_trim_trailing,
+            self.save_trim_final_newlines,
+            self.save_final_newline,
+            self.format_on_save,
+        );
         ctx.data_mut(|d| d.insert_persisted(Self::editor_prefs_id(), v));
     }
 
@@ -5909,6 +6200,7 @@ impl ZaivernApp {
     fn apply_save_cleanup(&mut self, i: usize) {
         let opts = editor_ops::SaveCleanup {
             trim_trailing: self.save_trim_trailing,
+            trim_final_newlines: self.save_trim_final_newlines,
             final_newline: self.save_final_newline,
             target_ending: None,
         };
@@ -6678,7 +6970,7 @@ impl ZaivernApp {
     // ═══════════════════════════════════════════════════════════════
 
     /// パレット・キーバインドから来る「エディタまわりの追加機能」をさばく。
-    fn apply_cmd_editor_extras(&mut self, cmd: Cmd) {
+    fn apply_cmd_editor_extras(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
             Cmd::OpenReview => self.open_review_panel(),
             Cmd::SetReviewBase(ref kind) => {
@@ -6740,6 +7032,7 @@ impl ZaivernApp {
             }
             Cmd::ToggleFormatOnSave => {
                 self.format_on_save = !self.format_on_save;
+                self.save_editor_prefs(ctx);
                 let msg = if self.format_on_save {
                     tr("保存時に整形する: ON")
                 } else {
@@ -7085,10 +7378,14 @@ impl ZaivernApp {
             return false;
         };
         // 保存時クリーンアップの設定と食い違わせない
+        // (サーバー側で削って、こちらでも削って、で二重にならないようにする)
+        let ind = self.editor.buffers[i].indent;
         let opts = lsp::FormatOptions {
+            tab_size: ind.width as u32,
+            insert_spaces: !ind.tabs,
             trim_trailing_whitespace: self.save_trim_trailing,
             insert_final_newline: self.save_final_newline,
-            ..Default::default()
+            trim_final_newlines: self.save_trim_final_newlines,
         };
         let sel = if save_after {
             None
@@ -7513,6 +7810,22 @@ impl ZaivernApp {
             let before = self.editor.buffers[i].text.clone();
             let after = lsp::apply_text_edits(&before, &edits);
             if after != before {
+                // 整形で本文の長さが変わるので、キャレットは必ず付け替える。
+                // 付け替えないと「保存したらカーソルが別の行へ飛んだ」になる
+                // (行末の空白が削れる保存時クリーンアップと同じ事故)。
+                let sel = self.pending_select.unwrap_or_else(|| {
+                    let (ln, col) = self.editor.cursor;
+                    let c = editor_ops::char_index_at(
+                        &before,
+                        ln.saturating_sub(1),
+                        col.saturating_sub(1),
+                    );
+                    (c, c)
+                });
+                self.pending_select = Some((
+                    editor_ops::adjust_char_index_after_cleanup(&before, &after, sel.0),
+                    editor_ops::adjust_char_index_after_cleanup(&before, &after, sel.1),
+                ));
                 let b = &mut self.editor.buffers[i];
                 b.text = after;
                 b.cache = None;
@@ -8381,7 +8694,7 @@ impl ZaivernApp {
             | Cmd::LspCodeAction
             | Cmd::LspSignatureHelp
             | Cmd::ToggleLspHighlight
-            | Cmd::ToggleFormatOnSave => self.apply_cmd_editor_extras(cmd),
+            | Cmd::ToggleFormatOnSave => self.apply_cmd_editor_extras(cmd, ctx),
             Cmd::Save
             | Cmd::SaveAs
             | Cmd::CloseTab
@@ -8403,6 +8716,10 @@ impl ZaivernApp {
             | Cmd::DuplicateLine
             | Cmd::MoveLineUp
             | Cmd::MoveLineDown
+            | Cmd::TransformCase(_)
+            | Cmd::SortLines(_)
+            | Cmd::DedupeLines
+            | Cmd::FormatJsonSelection
             | Cmd::OpenReplace => self.apply_cmd_edit(cmd, ctx),
             Cmd::SplitEditorRight
             | Cmd::SplitEditorDown
@@ -8420,6 +8737,7 @@ impl ZaivernApp {
             | Cmd::ToggleFailover
             | Cmd::ToggleTrimTrailingOnSave
             | Cmd::ToggleFinalNewlineOnSave
+            | Cmd::ToggleTrimFinalNewlinesOnSave
             | Cmd::ConvertLineEnding(_)
             | Cmd::OpenCommandPalette
             | Cmd::OpenFilePalette
@@ -8634,6 +8952,10 @@ impl ZaivernApp {
             Cmd::DuplicateLine => self.editor_op(ctx, EditOp::Duplicate),
             Cmd::MoveLineUp => self.editor_op(ctx, EditOp::Move(true)),
             Cmd::MoveLineDown => self.editor_op(ctx, EditOp::Move(false)),
+            Cmd::TransformCase(kind) => self.editor_op(ctx, EditOp::Case(kind)),
+            Cmd::SortLines(desc) => self.editor_op(ctx, EditOp::Sort(desc)),
+            Cmd::DedupeLines => self.editor_op(ctx, EditOp::Dedupe),
+            Cmd::FormatJsonSelection => self.editor_op(ctx, EditOp::FormatJson),
             Cmd::OpenReplace => {
                 if self.editor.active.is_some() {
                     self.find.open = true;
@@ -8764,6 +9086,18 @@ impl ZaivernApp {
                         "保存時に最終行へ改行を入れます"
                     } else {
                         "保存時に最終行へ改行を入れません"
+                    }),
+                    true,
+                );
+            }
+            Cmd::ToggleTrimFinalNewlinesOnSave => {
+                self.save_trim_final_newlines = !self.save_trim_final_newlines;
+                self.save_editor_prefs(ctx);
+                self.toast(
+                    tr(if self.save_trim_final_newlines {
+                        "保存時に末尾の余分な空行を落とします"
+                    } else {
+                        "保存時に末尾の余分な空行を落としません"
                     }),
                     true,
                 );
@@ -9274,6 +9608,15 @@ impl ZaivernApp {
                 // config.toml / state.toml の ui_zoom を画面へ戻す
                 // (読み直したのに倍率だけ前のまま、を作らない)
                 apply_ui_zoom(ctx, self.cfg.ui_zoom);
+                // エディタの見た目 (括弧の色分け / ルーラー / インデント) も
+                // 読み直した設定へ揃える。開いているタブのインデントは
+                // 取り直す — 設定を変えたのにステータスバーだけ前のまま、を作らない。
+                self.bracket_colorization = self.cfg.bracket_colorization;
+                self.rulers = normalize_rulers(&self.cfg.rulers);
+                self.sync_indent_defaults();
+                for i in 0..self.editor.buffers.len() {
+                    self.editor.apply_indent_defaults(i);
+                }
                 for b in &mut self.editor.buffers {
                     b.cache = None;
                     b.gutter = None;
@@ -11046,6 +11389,9 @@ impl ZaivernApp {
         let (quota_sev, quota_tip) = self.quota_status();
         let fmt_label = self.text_format_label();
         let mut convert_eol: Option<crate::textenc::LineEnding> = None;
+        // ステータスバーのインデントメニューで選ばれたもの
+        // (クロージャの中では記録だけして、パネル描画後に self へ反映する)
+        let mut indent_action: Option<IndentAction> = None;
         // 統合承認キューの待ち件数バッジ (押すとボトムパネルの承認ビューを開く)
         let approvals_pending = self.agents.approvals.pending_len();
         let mut open_approvals = false;
@@ -11189,6 +11535,31 @@ impl ZaivernApp {
                             if bm > 0 {
                                 ui.label(dim(format!("◆ {bm}")));
                             }
+                            // インデント (VS Code の「スペース: 4」)。押すと切替。
+                            // 打ち込めないタブ (差分 / 画像 / 巨大ファイル) では
+                            // 変えても意味が無いので 1 ピクセルも出さない。
+                            if !self.editor.buffers[i].read_only() {
+                                let ind = self.editor.buffers[i].indent;
+                                let label = trf(
+                                    "{kind}: {n}",
+                                    &[
+                                        ("kind", tr(if ind.tabs { "タブ" } else { "スペース" })),
+                                        ("n", ind.width.to_string()),
+                                    ],
+                                );
+                                ui.menu_button(
+                                    RichText::new(label).size(11.5).color(theme.text_dim),
+                                    |ui| {
+                                        ui.set_min_width(240.0);
+                                        indent_menu_ui(ui, ind, &mut indent_action);
+                                    },
+                                )
+                                .response
+                                .on_hover_text(tr(
+                                    "このタブのインデント — 押すと切り替えます\n\u{3000}\
+                                     (開いたときに本文から推定しています)",
+                                ));
+                            }
                             if self.format_on_save {
                                 ui.label(dim(tr("🛠 保存時に整形")));
                             }
@@ -11294,6 +11665,9 @@ impl ZaivernApp {
         }
         if let Some(le) = convert_eol {
             self.editor_op(ctx, EditOp::NormalizeEol(le));
+        }
+        if let Some(a) = indent_action {
+            self.apply_indent_action(a, ctx);
         }
         if let Some(c) = zoom_cmd {
             self.apply_cmd(c, ctx);
@@ -16890,6 +17264,16 @@ impl ZaivernApp {
             0.0
         };
 
+        // 虹色括弧 (VS Code の editor.bracketPairColorization)。
+        // 色は**テーマから**採る (直書きしない)。強調表示を切っている
+        // 巨大ファイルでは走らせない — 本文全走査になるため。
+        let bracket_on = self.bracket_colorization && structure_on;
+        let bracket_cols = self.theme.bracket_colors();
+        let bracket_err = self.theme.err;
+        // 括弧の色はテーマ由来なので、テーマ名もキャッシュキーに混ぜる
+        // (syntect テーマ名は複数のテーマで共有されていて区別にならない)。
+        let theme_name_hash = hash_str(&self.theme.name);
+
         let diag_by_line = &self.diag_cache.1;
         let hl = self.highlighter;
         let buf = &mut self.editor.buffers[active];
@@ -16940,9 +17324,10 @@ impl ZaivernApp {
             let key = [
                 hash_str(lang.as_str()),
                 hash_str(&syntect_theme),
+                theme_name_hash,
                 font.size.to_bits() as u64,
                 font_gen,
-                (word_wrap as u64) | ((show_ws as u64) << 1),
+                (word_wrap as u64) | ((show_ws as u64) << 1) | ((bracket_on as u64) << 2),
                 max_w.to_bits() as u64,
             ]
             .into_iter()
@@ -16953,6 +17338,16 @@ impl ZaivernApp {
                 Some((k, g)) if *k == key => g.clone(),
                 _ => {
                     let mut j = hl.layout_job(t, lang, &syntect_theme, font.clone(), theme_text);
+                    if bracket_on {
+                        // 括弧だけを深さの色へ塗り替える (本文は 1 バイトも動かない)
+                        let hits = crate::highlight::bracket_pairs(t, lang);
+                        j = crate::highlight::colorize_brackets(
+                            j,
+                            &hits,
+                            &bracket_cols,
+                            bracket_err,
+                        );
+                    }
                     if show_ws {
                         // スペース→「·」/ タブ→「→」(char 数は変えない)
                         j = crate::editor::whitespace_layout_job(j, ws_color);
@@ -17384,6 +17779,22 @@ impl ZaivernApp {
                         egui::Stroke::new(1.0_f32, if on { hot } else { dim }),
                     );
                 }
+            }
+        }
+
+        // 縦のルーラー (VS Code の editor.rulers): 指定した桁に縦線を引く。
+        // 桁は等幅の**桁数**で数える (東アジア文字幅ではない)。
+        // 設定が空なら 1 ピクセルも出さない。
+        if let (false, Some(tl)) = (self.rulers.is_empty(), text_left) {
+            let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
+            let clip = egui::Rangef::new(gutter_edge, vis.right());
+            let ppp = ui.ctx().pixels_per_point();
+            for x in ruler_x_positions(&self.rulers, tl, char_w, clip, ppp) {
+                painter.vline(
+                    x,
+                    vis.y_range(),
+                    egui::Stroke::new(1.0_f32, self.theme.ruler_color()),
+                );
             }
         }
 
@@ -18454,6 +18865,55 @@ impl ZaivernApp {
                 tr("保存時に最終行へ改行を入れる (切替)"),
                 String::new(),
                 Cmd::ToggleFinalNewlineOnSave,
+            ),
+            (
+                "⏎".into(),
+                tr("保存時に末尾の余分な空行を落とす (切替)"),
+                String::new(),
+                Cmd::ToggleTrimFinalNewlinesOnSave,
+            ),
+            // ── 選択範囲への編集コマンド ──
+            (
+                "AA".into(),
+                tr("選択範囲を大文字にする"),
+                String::new(),
+                Cmd::TransformCase(editor_ops::CaseKind::Upper),
+            ),
+            (
+                "aa".into(),
+                tr("選択範囲を小文字にする"),
+                String::new(),
+                Cmd::TransformCase(editor_ops::CaseKind::Lower),
+            ),
+            (
+                "Aa".into(),
+                tr("選択範囲を先頭大文字にする"),
+                String::new(),
+                Cmd::TransformCase(editor_ops::CaseKind::Title),
+            ),
+            (
+                "↓".into(),
+                tr("選択範囲の行を昇順に並べ替える"),
+                String::new(),
+                Cmd::SortLines(false),
+            ),
+            (
+                "↑".into(),
+                tr("選択範囲の行を降順に並べ替える"),
+                String::new(),
+                Cmd::SortLines(true),
+            ),
+            (
+                "⧉".into(),
+                tr("選択範囲の重複行を削除する"),
+                String::new(),
+                Cmd::DedupeLines,
+            ),
+            (
+                "{}".into(),
+                tr("選択範囲を JSON として整形する"),
+                String::new(),
+                Cmd::FormatJsonSelection,
             ),
             (
                 "↩".into(),
@@ -27746,6 +28206,12 @@ mod wave2_tests {
             "Cmd::ToggleFailover",
             // ── Git blame ──
             "Cmd::ToggleGitBlame",
+            // ── 保存時のクリーンアップ / 選択範囲への編集コマンド ──
+            "Cmd::ToggleTrimFinalNewlinesOnSave",
+            "Cmd::TransformCase",
+            "Cmd::SortLines",
+            "Cmd::DedupeLines",
+            "Cmd::FormatJsonSelection",
         ] {
             assert!(list.contains(c), "{c} がコマンドパレットに無い");
             assert!(router.contains(c), "{c} のディスパッチが無い");
@@ -29007,6 +29473,7 @@ mod ui_wiring_tests {
     fn 末尾空白を落とすとカーソルが行末へ寄る() {
         let opts = editor_ops::SaveCleanup {
             trim_trailing: true,
+            trim_final_newlines: false,
             final_newline: false,
             target_ending: None,
         };
@@ -29025,6 +29492,7 @@ mod ui_wiring_tests {
     fn 最終行の改行はカーソルを動かさない() {
         let opts = editor_ops::SaveCleanup {
             trim_trailing: false,
+            trim_final_newlines: false,
             final_newline: true,
             target_ending: None,
         };
@@ -29039,6 +29507,7 @@ mod ui_wiring_tests {
     fn 日本語の途中でカーソルを割らない() {
         let opts = editor_ops::SaveCleanup {
             trim_trailing: true,
+            trim_final_newlines: false,
             final_newline: true,
             target_ending: None,
         };
@@ -29055,6 +29524,7 @@ mod ui_wiring_tests {
     fn 選択範囲は両端とも付け替える() {
         let opts = editor_ops::SaveCleanup {
             trim_trailing: true,
+            trim_final_newlines: false,
             final_newline: false,
             target_ending: None,
         };
@@ -29065,6 +29535,152 @@ mod ui_wiring_tests {
             s < e && e <= out.chars().count(),
             "選択が潰れない: ({s}, {e})"
         );
+    }
+
+    /// **保存後にカーソル位置が保たれる。**
+    ///
+    /// 「末尾空白を削ったせいでカーソルが行頭へ戻る」は保存時整形の
+    /// 典型的な事故なので、行と桁が保たれることを表で固定する。
+    #[test]
+    fn 保存後もカーソルの行と桁が保たれる() {
+        let opts = editor_ops::SaveCleanup {
+            trim_trailing: true,
+            trim_final_newlines: true,
+            final_newline: true,
+            target_ending: None,
+        };
+        //           0123 4567 8
+        let text = "ab  \ncd  \nef";
+        // (元の char 位置, 期待する新しい位置, 説明)
+        for (from, want, why) in [
+            (0, 0, "1 行目の行頭は動かない"),
+            (1, 1, "1 行目の途中はそのまま"),
+            (2, 2, "消える空白の直前は行末のまま"),
+            (3, 2, "消える空白の中にいたら新しい行末へ"),
+            (5, 3, "2 行目の行頭 (改行のぶんだけ前へ)"),
+            (6, 4, "2 行目の 2 文字目 (c|d)"),
+            (10, 6, "3 行目の行頭"),
+        ] {
+            let (out, (s, e)) = save_cleanup_edit(text, (from, from), &opts).expect("変わる");
+            assert_eq!(out, "ab\ncd\nef\n");
+            assert_eq!(s, e, "{why}: 空選択のまま");
+            assert_eq!(s, want, "{why}");
+            // 行番号が変わっていないこと (= 別の行へ飛んでいない)
+            let line_before = editor_ops::line_of_char(text, from);
+            let line_after = editor_ops::line_of_char(&out, s);
+            assert_eq!(line_before, line_after, "{why}: 行が変わった");
+        }
+        // 何も削るものが無い本文では保存でカーソルに触れない
+        assert!(save_cleanup_edit("ab\ncd\n", (4, 4), &opts).is_none());
+    }
+
+    /// **1 保存 = 取り消し 1 段。**
+    ///
+    /// 行末空白の除去・末尾の空行の削除・最終行の改行は 1 回の
+    /// [`editor_ops::apply_save_cleanup_checked`] で合成され、本文の
+    /// 書き換えも 1 回だけ。段を分けると ⌘Z を 3 回押さないと保存前へ
+    /// 戻れなくなる (整形が本文の一部として残る)。
+    #[test]
+    fn 保存時の整形は本文を一度だけ書き換える() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn apply_save_cleanup(&mut self, i: usize) {")
+            .nth(1)
+            .expect("保存時クリーンアップがある")
+            .split("\n    fn ")
+            .next()
+            .expect("関数の終わり");
+        assert_eq!(
+            body.matches("b.text = ").count(),
+            1,
+            "本文の書き換えが 2 回以上ある (取り消しが 1 段で戻らない)"
+        );
+        assert_eq!(
+            body.matches("apply_save_cleanup_checked").count()
+                + body.matches("save_cleanup_edit(").count(),
+            1,
+            "整形の合成は 1 か所だけ"
+        );
+        // 書き出しの前に必ず整形を通す
+        let save = src
+            .split("fn save_buffer_to(&mut self, i: usize, path: PathBuf) -> bool {")
+            .nth(1)
+            .expect("保存がある");
+        let head = save.split("write_to").next().expect("書き出しがある");
+        assert!(
+            head.contains("self.apply_save_cleanup(i);"),
+            "整形が書き出しより後ろにある"
+        );
+    }
+
+    // ── 縦のルーラー (editor.rulers) ──────────────────────────────
+
+    /// 設定の桁並びの正規化: 0 桁と重複を落として昇順にする。
+    #[test]
+    fn ルーラーの桁は正規化される() {
+        assert_eq!(normalize_rulers(&[]), Vec::<usize>::new());
+        assert_eq!(normalize_rulers(&[0]), Vec::<usize>::new(), "0 桁は落とす");
+        assert_eq!(normalize_rulers(&[120, 80, 80, 0]), vec![80, 120]);
+        assert_eq!(normalize_rulers(&[80]), vec![80]);
+    }
+
+    /// ルーラーの x 座標が可用領域からはみ出さず、整数ピクセルに揃う。
+    #[test]
+    fn ルーラーは可用領域に収まり整数ピクセルへ揃う() {
+        let char_w = 7.3_f32;
+        let left = 40.0_f32;
+        let clip = egui::Rangef::new(40.0, 400.0);
+        for ppp in [1.0_f32, 1.25, 1.5, 2.0] {
+            // 複数指定: 収まるものだけが返る
+            let xs = ruler_x_positions(&[10, 40, 80, 120], left, char_w, clip, ppp);
+            assert!(!xs.is_empty(), "ppp={ppp}: 1 本も返らない");
+            for x in &xs {
+                assert!(
+                    *x >= clip.min && *x <= clip.max,
+                    "ppp={ppp}: 可用領域からはみ出した ({x})"
+                );
+                // 整数ピクセルに揃っている (小数のままだと桁間隔が揺れる)
+                let px = x * ppp;
+                assert!(
+                    (px - px.round()).abs() < 1e-3,
+                    "ppp={ppp}: 物理ピクセルが整数でない ({px})"
+                );
+            }
+            // 昇順のまま (入力が昇順なら出力も昇順)
+            assert!(xs.windows(2).all(|w| w[0] <= w[1]), "ppp={ppp}: 昇順でない");
+
+            // 巨大な桁は 1 本も返らない (無限大や NaN にもならない)
+            assert!(ruler_x_positions(&[usize::MAX], left, char_w, clip, ppp).is_empty());
+            assert!(ruler_x_positions(&[1_000_000], left, char_w, clip, ppp).is_empty());
+            // 0 桁は本文の左端 (= clip の左端) にちょうど乗る
+            assert_eq!(ruler_x_positions(&[0], left, char_w, clip, ppp), vec![left]);
+            // 文字幅が取れない状況では描かない (0 除算・NaN を作らない)
+            assert!(ruler_x_positions(&[80], left, 0.0, clip, ppp).is_empty());
+            assert!(ruler_x_positions(&[80], left, f32::NAN, clip, ppp).is_empty());
+            // 設定が空なら 1 ピクセルも出さない
+            assert!(ruler_x_positions(&[], left, char_w, clip, ppp).is_empty());
+        }
+    }
+
+    // ── インデントの切替 (ステータスバー) ─────────────────────────
+
+    /// ステータスバーの選択肢が「表示だけ」と「変換する」に分かれていること。
+    ///
+    /// 変換は本文を書き換えるので、押しただけで走ると事故になる。
+    /// 経路が 2 本に分かれていることをソースの構造で固定する。
+    #[test]
+    fn インデントの切替は表示と変換で経路が分かれている() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        for k in [
+            "IndentAction::Display(",
+            "IndentAction::Convert(",
+            "IndentAction::Detect",
+            "EditOp::ConvertIndent(",
+            "fn indent_menu_ui(",
+            "self.apply_indent_action(a, ctx)",
+        ] {
+            assert!(src.contains(k), "{k} が無い (ステータスバーから届かない)");
+        }
     }
 
     // ── GAP4: 改行コードの変換 ────────────────────────────────────
