@@ -225,6 +225,25 @@ pub struct Config {
     /// レート制限時のアカウント自動フェイルオーバー (`[failover]`)。
     /// **既定は無効** — ユーザーが明示的に有効化したときだけ働く。
     pub failover: crate::failover::FailoverConfig,
+
+    /// コマンドパレットの MRU (最近実行したコマンド。先頭が直近)。
+    ///
+    /// UI の操作から溜まる値なので手書きの config.toml には**書かない** —
+    /// state.toml 側 (`[[palette_recent]]`) に置く。`save_state` が
+    /// この控えをそのまま書き戻すので、テーマ変更などで消えることはない。
+    #[serde(skip)]
+    pub palette_recent: Vec<PaletteRecent>,
+}
+
+/// パレット MRU の永続化 1 件ぶん。**アクションは保存しない** —
+/// `Cmd` にはパスや添字が入り、次の起動では別物を指しうるため。
+/// ラベルから引き直せなければ順位付けにだけ使う (palette.rs)。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaletteRecent {
+    pub label: String,
+    pub icon: String,
+    pub uses: u32,
 }
 
 /// `[super_agent]` セクション。**どのエージェントに他のエージェントを見張らせるか**。
@@ -388,6 +407,7 @@ impl Default for Config {
             super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),
             failover: crate::failover::FailoverConfig::default(),
+            palette_recent: Vec::new(),
         }
     }
 }
@@ -626,6 +646,10 @@ struct UiState {
     /// 切り替えるものなので、手書きの config.toml ではなく state 側に置く。
     /// 上限やクールダウンの数値は `[failover]` (config.toml) のまま。
     failover_enabled: Option<bool>,
+    /// コマンドパレットの MRU。**配列のテーブルなので必ず最後の項目に置く**
+    /// (TOML は値をテーブルより先に書く必要があり、途中に置くと
+    /// `toml::to_string_pretty` が state.toml 全体を書けなくなる)。
+    palette_recent: Option<Vec<PaletteRecent>>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -1155,6 +1179,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.super_agent_timeout_secs {
                     cfg.super_agent.timeout_secs = v;
                 }
+                if let Some(v) = st.palette_recent {
+                    cfg.palette_recent = v;
+                }
                 if let Some(v) = st.failover_enabled {
                     cfg.failover.enabled = v;
                 }
@@ -1519,6 +1546,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         super_agent_enabled: Some(cfg.super_agent.enabled),
         super_agent_timeout_secs: Some(cfg.super_agent.timeout_secs),
         failover_enabled: Some(cfg.failover.enabled),
+        palette_recent: Some(cfg.palette_recent.clone()),
     };
     if let Ok(s) = toml::to_string_pretty(&st) {
         let _ = std::fs::create_dir_all(dir);
@@ -2124,6 +2152,11 @@ command = "agy"
             super_agent_enabled: Some(true),
             super_agent_timeout_secs: Some(45),
             failover_enabled: Some(true),
+            palette_recent: Some(vec![PaletteRecent {
+                label: "保存".into(),
+                icon: "💾".into(),
+                uses: 3,
+            }]),
         };
         let s = toml::to_string_pretty(&st).expect("UiState は TOML 化できる");
         let back: UiState = toml::from_str(&s).expect("読み戻せる");
@@ -2162,6 +2195,15 @@ command = "agy"
         assert_eq!(back.super_agent_timeout_secs, Some(45));
         // 自動フェイルオーバーの有効/無効も state に残る
         assert_eq!(back.failover_enabled, Some(true));
+        // パレットの MRU も state に残る (アクションは保存しない)
+        assert_eq!(
+            back.palette_recent,
+            Some(vec![PaletteRecent {
+                label: "保存".into(),
+                icon: "💾".into(),
+                uses: 3,
+            }])
+        );
     }
 
     #[test]
@@ -2775,6 +2817,76 @@ mod state_overlay_tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn パレットのmruは保存と読み込みで順序が保たれる() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "palette-mru");
+        let mut cfg = Config::default();
+        assert!(cfg.palette_recent.is_empty(), "既定は空");
+        cfg.palette_recent = vec![
+            PaletteRecent {
+                label: "ターミナル表示切替".into(),
+                icon: "🖥".into(),
+                uses: 5,
+            },
+            PaletteRecent {
+                label: "保存".into(),
+                icon: "💾".into(),
+                uses: 2,
+            },
+            PaletteRecent {
+                label: "絵文字🎨と日本語".into(),
+                icon: String::new(),
+                uses: 1,
+            },
+        ];
+        save_state_to_dir(&home, &cfg);
+        let loaded = load_from_dir(&home, &[], true);
+        assert_eq!(
+            loaded.palette_recent, cfg.palette_recent,
+            "MRU が往復で変わった (順序・回数・アイコン)"
+        );
+
+        // 別の UI 操作 (テーマ変更) で save_state しても MRU は消えない
+        let mut next = loaded;
+        next.global_theme = "zaivern-light".into();
+        save_state_to_dir(&home, &next);
+        let again = load_from_dir(&home, &[], true);
+        assert_eq!(again.palette_recent, cfg.palette_recent, "MRU が消えた");
+        assert_eq!(again.theme, "zaivern-light");
+
+        // config.toml (手書き) には書かない = state.toml 側だけに現れる
+        let state = std::fs::read_to_string(home.join("state.toml")).expect("state.toml");
+        assert!(state.contains("palette_recent"), "state.toml に無い");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn 壊れたstateファイルでもmruはパニックせず既定に戻る() {
+        for (tag, body) in [
+            ("broken-toml", "palette_recent = [[[\n"),
+            ("wrong-type", "palette_recent = 42\n"),
+            (
+                "missing-fields",
+                "theme = \"zaivern-dark\"\n[[palette_recent]]\n",
+            ),
+            ("empty", ""),
+        ] {
+            let home = crate::test_util::unique_temp_dir("zaivern-config-test", tag);
+            std::fs::write(home.join("state.toml"), body).expect("write state.toml");
+            // 壊れていても load は成立し、MRU は既定 (空 or 既定値) に落ちる
+            let cfg = load_from_dir(&home, &[], true);
+            for r in &cfg.palette_recent {
+                // 欠けたフィールドは serde の default (空文字 / 0) で埋まる
+                assert!(r.uses < u32::MAX, "tag={tag}");
+            }
+            if tag != "missing-fields" {
+                assert!(cfg.palette_recent.is_empty(), "tag={tag} は空に戻るはず");
+            }
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     #[test]

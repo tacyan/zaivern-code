@@ -1152,6 +1152,87 @@ struct IndexOutcome {
     truncated: bool,
 }
 
+/// ⌘P で「最近開いたファイル」を索引の残りより上へ持ち上げる加点。
+///
+/// fuzzy の素点 (数十〜数百) は必ず超えるが、`palette` の一致段
+/// (TIER_SUBSTR = 30_000) には届かない値にしてある = **入力を始めたら
+/// 一致の質が最近順より必ず優先される**。
+const RECENT_FILE_BONUS: i32 = 5_000;
+/// 最近順 1 件ぶんの目減り。`recent::MAX_RECENT` (12) 件でも 0 にならない。
+const RECENT_FILE_STEP: i32 = 100;
+
+/// ⌘P (ファイル検索) の候補を組み立てる純粋関数。
+///
+/// * `recent` — 最近開いたファイルの絶対パス文字列 (先頭が直近。`recent.rs`)
+/// * `active` — いま開いているファイル。**加点しない** ので、クエリが空なら
+///   先頭に来るのは「直前に開いていたファイル」= ⌘P → Enter で戻れる
+/// * `query`  — `ファイル名:123[:45]` を含みうる生のクエリ
+fn file_mode_items(
+    index: &[IndexedFile],
+    recent: &[String],
+    active: Option<&Path>,
+    query: &str,
+) -> Vec<Item> {
+    let (name_q, goto) = split_path_goto(query);
+    let pq = fuzzy::PreparedQuery::new(name_q.trim());
+    // 実在確認 (`MenuState::files()`) はここでは通さない — パレットは毎フレーム
+    // 組み直されるので、12 回の stat を毎フレーム撃たない。
+    let rank: HashMap<&Path, usize> = recent
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (Path::new(s.as_str()), i))
+        .collect();
+    let mut out: Vec<Item> = Vec::with_capacity(index.len().min(256));
+    for f in index {
+        // マッチはルート相対パスに対して行い、単一ルート時と同じあいまい検索の
+        // 品質を保つ。表示 (detail) は曖昧回避済みラベル、開くのは絶対パス。
+        let Some(score) = pq.score(&f.rel) else {
+            continue;
+        };
+        let name = f.rel.rsplit('/').next().unwrap_or(&f.rel).to_string();
+        let bonus = match rank.get(f.abs.as_path()) {
+            Some(_) if active == Some(f.abs.as_path()) => 0,
+            Some(i) => RECENT_FILE_BONUS - (*i as i32) * RECENT_FILE_STEP,
+            None => 0,
+        };
+        let (detail, action) = match goto {
+            Some((line, col)) => (
+                trf(
+                    "{label} : {line} 行目",
+                    &[("label", f.label.clone()), ("line", (line + 1).to_string())],
+                ),
+                Action::OpenFileAt(f.abs.clone(), line, col),
+            ),
+            None => (f.label.clone(), Action::OpenFile(f.abs.clone())),
+        };
+        out.push(Item {
+            icon: file_tree::icon_for(&name).to_string(),
+            label: name,
+            detail,
+            action,
+            score: score.saturating_add(bonus),
+        });
+    }
+    out
+}
+
+/// `foo.rs:12:3` を (名前部分, 0 起点の (行, 桁)) に割る。
+///
+/// 行指定として読めない `:` (Windows のドライブレター `C:\`、`foo:bar`) は
+/// 名前側に残す。判定は `editor_ops::parse_goto` に委ねる — 数値の解釈を
+/// 2 箇所に書かないため。左から最初に「残りが行指定として読める」`:` で割る。
+fn split_path_goto(q: &str) -> (&str, Option<(usize, usize)>) {
+    for (i, _) in q.match_indices(':') {
+        if i == 0 {
+            continue; // 先頭の `:` は行ジャンプモード側の役目
+        }
+        if let Some(go) = editor_ops::parse_goto(&q[i + 1..]) {
+            return (&q[..i], Some(go));
+        }
+    }
+    (q, None)
+}
+
 // ── ネイティブファイルダイアログのジョブ化 ────────────────────────────
 //
 // rfd の同期 API を UI スレッド (= eframe の `update` の中) で呼ぶと、winit の
@@ -1647,6 +1728,88 @@ const REF_WINDOW_H: f32 = 360.0;
 const MAX_SYMBOL_ROWS: usize = 300;
 /// リネーム入力を画面上端からどれだけ下に置くか。
 const RENAME_WINDOW_Y: f32 = 120.0;
+/// コミットメッセージ入力窓の幅。
+const GIT_COMMIT_WINDOW_W: f32 = 460.0;
+/// パレットの「コミット履歴」に読み込む件数の上限。
+const GIT_HISTORY_MAX: usize = 200;
+
+/// パレットから撃つ git 操作。`git_panel.rs` は commit / push を
+/// スコープ外にしているので、実行はここが受け持つ (あちらは触らない)。
+#[derive(Clone)]
+enum GitJob {
+    Commit { message: String, all: bool },
+    Push,
+    Pull,
+}
+
+impl GitJob {
+    /// 画面に出す名前 (トーストの主語)。
+    fn label(&self) -> String {
+        match self {
+            GitJob::Commit { all: false, .. } => tr("コミット"),
+            GitJob::Commit { all: true, .. } => tr("すべてコミット"),
+            GitJob::Push => tr("push"),
+            GitJob::Pull => tr("pull"),
+        }
+    }
+
+    /// `git -C <repo>` に続けて渡す引数。
+    fn args(&self) -> Vec<String> {
+        match self {
+            GitJob::Commit { message, all } => {
+                let mut a: Vec<String> = vec!["commit".into()];
+                if *all {
+                    a.push("--all".into());
+                }
+                // `--` は付けない (パスではなくメッセージなので `-m` の値で確定する)。
+                a.push("-m".into());
+                a.push(message.clone());
+                a
+            }
+            // 追跡ブランチが無い初回でも通るように upstream を張る。
+            GitJob::Push => vec![
+                "push".into(),
+                "--porcelain".into(),
+                "--set-upstream".into(),
+                "origin".into(),
+                "HEAD".into(),
+            ],
+            // 履歴を勝手に書き換えない (merge も rebase もしない) 安全側。
+            GitJob::Pull => vec!["pull".into(), "--ff-only".into()],
+        }
+    }
+}
+
+/// パレットから撃つ git 操作の走行状態と小窓。
+#[derive(Default)]
+struct GitOps {
+    /// 走行中のジョブ (同時に 1 つだけ)
+    job: Option<mpsc::Receiver<(String, bool)>>,
+    /// 走行中ジョブの表示名
+    job_label: String,
+    commit_open: bool,
+    commit_msg: String,
+    commit_all: bool,
+    commit_focus: bool,
+    history_open: bool,
+    history_busy: bool,
+    /// (短い SHA, 「件名 — 著者 · 相対日時」)
+    history: Vec<(String, String)>,
+    history_rx: Option<mpsc::Receiver<Vec<(String, String)>>>,
+    history_query: String,
+}
+
+/// エラー本文の先頭 `n` 行だけを取り出す (トーストを縦に伸ばさない)。
+fn first_lines(s: &str, n: usize) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for l in s.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        out.push(l);
+        if out.len() >= n {
+            break;
+        }
+    }
+    out.join(" / ")
+}
 /// スティッキーヘッダの最大段数 (VS Code の既定と同じ 3 段)。
 const STICKY_MAX_ROWS: usize = 3;
 /// ガターの右端に確保する、折りたたみ記号 ▸ / ▾ の桁幅。
@@ -2496,6 +2659,8 @@ pub struct ZaivernApp {
     tab_scrolled: HashMap<editor_split::PaneId, u64>,
     /// Git サイドバー。単一 repo 表示なので常に primary ルートを見る。
     git_panel: git_panel::GitPanel,
+    /// パレットから撃つ git 操作 (commit / push / pull / 履歴) の状態。
+    git_ops: GitOps,
     /// PR 風のローカル変更レビュー。Git サイドバーのサブタブとして出す。
     review: git_panel::ReviewPanel,
     /// Git サイドバーのサブタブ: true = 「変更をレビュー」/ false = 「変更」
@@ -2973,6 +3138,7 @@ impl ZaivernApp {
             review: git_panel::ReviewPanel::new(
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
             ),
+            git_ops: GitOps::default(),
             git_sub_review: false,
             fold_view: None,
             sticky_cache: None,
@@ -3025,7 +3191,18 @@ impl ZaivernApp {
             agents: AgentManager::new(),
             splits: HashMap::new(),
             split_rect: HashMap::new(),
-            palette: Palette::new(),
+            palette: {
+                // MRU (state.toml) を復元。実体 (Cmd) は保存していないので、
+                // パレットを最初に開いたフレームで組み込み表から引き直す。
+                let mut p = Palette::new();
+                let saved: Vec<(String, String, u32)> = cfg
+                    .palette_recent
+                    .iter()
+                    .map(|r| (r.label.clone(), r.icon.clone(), r.uses))
+                    .collect();
+                p.restore_recent(&saved);
+                p
+            },
             palette_worktrees: None,
             pending_prompts: Vec::new(),
             race: race::RacePanel::new(),
@@ -9189,7 +9366,9 @@ impl ZaivernApp {
             | Cmd::TogglePreviewTabs
             | Cmd::GoToDefinition
             | Cmd::GoToBracket
-            | Cmd::GoToLine => self.apply_cmd_view_nav(cmd, ctx),
+            | Cmd::GoToLine
+            | Cmd::GoToLineAt(_, _)
+            | Cmd::GoToLspPos(_, _) => self.apply_cmd_view_nav(cmd, ctx),
             Cmd::RunActiveFile
             | Cmd::RunBuildTask
             | Cmd::RunJsonTask(_)
@@ -9217,6 +9396,10 @@ impl ZaivernApp {
             | Cmd::ToggleMdPreview
             | Cmd::ToggleSidebar
             | Cmd::OpenGitPanel
+            | Cmd::GitCommit(_)
+            | Cmd::GitPush
+            | Cmd::GitPull
+            | Cmd::GitHistory
             | Cmd::OpenFind
             | Cmd::NewAgent(_)
             | Cmd::FocusAgent(_)
@@ -9652,6 +9835,13 @@ impl ZaivernApp {
                     self.goto_input.clear();
                 }
             }
+            // パレットの `:123` / `@シンボル` から来る使い捨ての座標。
+            Cmd::GoToLineAt(line, col) => self.goto_line_col(line, col),
+            Cmd::GoToLspPos(line, col) => {
+                if let Some(p) = self.active_file_path() {
+                    self.jump_to_lsp_pos(&p, line, col);
+                }
+            }
             _ => {}
         }
     }
@@ -9881,6 +10071,10 @@ impl ZaivernApp {
                 self.sidebar_tab = SidebarTab::Git;
                 self.persist_session();
             }
+            Cmd::GitCommit(all) => self.open_commit_prompt(all),
+            Cmd::GitPush => self.run_git_job(GitJob::Push, ctx),
+            Cmd::GitPull => self.run_git_job(GitJob::Pull, ctx),
+            Cmd::GitHistory => self.open_git_history(ctx),
             // 選択があればそれを検索語にする (VS Code と同じ)
             Cmd::OpenFind => self.open_find(ctx, false),
             Cmd::NewAgent(i) => self.launch_preset(i, ctx),
@@ -10427,6 +10621,10 @@ impl ZaivernApp {
                 // タブが増え続けないようにするため (設定でオフにできる)。
                 self.open_path_preview(&p);
             }
+            Action::OpenFileAt(p, line, col) => {
+                self.open_path(&p);
+                self.goto_line_col(line, col);
+            }
             Action::Cmd(c) => self.apply_cmd(c, ctx),
         }
     }
@@ -10639,7 +10837,13 @@ impl ZaivernApp {
             self.palette.open_commands();
         }
         if consume(ctx, self.keys.get(BindAction::PaletteFiles)) {
-            self.palette.open_files();
+            // VS Code と同じで、開いている最中の ⌘P は「開き直す」ではなく
+            // 「次の候補へ」。連打で最近開いたファイルを下っていける。
+            if self.palette.open && !self.palette.is_command_mode() {
+                self.palette.bump_cycle();
+            } else {
+                self.palette.open_files();
+            }
         }
         if consume(ctx, self.keys.get(BindAction::SaveAll)) {
             cmds.push(Cmd::SaveAll);
@@ -15881,8 +16085,8 @@ impl ZaivernApp {
         self.open_commit_diff_at(&top, sha);
     }
 
-    /// リポジトリを明示して開く版。Git パネルの履歴一覧から使う
-    /// (アクティブなバッファに依らずリポジトリが決まっているため)。
+    /// リポジトリを明示して開く版。Git パネルの履歴一覧とパレットの
+    /// 履歴コマンドの両方から使う (アクティブなバッファに依らずリポジトリが決まる)。
     fn open_commit_diff_at(&mut self, top: &Path, sha: &str) {
         let Ok((title, text)) = git::commit_diff(top, sha) else {
             return;
@@ -15893,6 +16097,336 @@ impl ZaivernApp {
         // 同じタブを使い回すことがあるので古いパース結果は捨てる
         self.commit_diff_cache.remove(&id);
         self.persist_session();
+    }
+
+    // ─── パレットから撃つ git 操作 (commit / push / pull / 履歴) ───────
+    //
+    // `git_panel.rs` は commit / push を**意図的にスコープ外**にしている
+    // (あちらの冒頭コメント)。ここはそのパネルの中身に触らず、同じ
+    // 「別スレッドで走らせて結果だけ受け取る」作法で別に持つ。
+    // UI は絶対にブロックしない。
+
+    /// 対象リポジトリ。開いているファイルの所属を最優先し、無ければ
+    /// ワークスペースのルートから最初に見つかった git リポジトリ。
+    fn git_ops_repo(&self) -> Option<PathBuf> {
+        if let Some(p) = self.active_file_path() {
+            if let Some((top, _)) = self.gitinfo.locate(&p) {
+                return Some(top);
+            }
+        }
+        self.roots.iter().find_map(|r| git::discover_toplevel(r))
+    }
+
+    /// コミットメッセージの入力を開く。`all` なら追跡中の変更を全部
+    /// ステージしてからコミットする (`git commit -a`)。
+    fn open_commit_prompt(&mut self, all: bool) {
+        if self.git_ops_repo().is_none() {
+            self.toast(tr("git リポジトリが見つかりません"), false);
+            return;
+        }
+        self.git_ops.commit_open = true;
+        self.git_ops.commit_all = all;
+        self.git_ops.commit_focus = true;
+    }
+
+    /// git のジョブを別スレッドで走らせる。走行中は 1 本だけ。
+    fn run_git_job(&mut self, job: GitJob, ctx: &egui::Context) {
+        if self.git_ops.job.is_some() {
+            self.toast(
+                trf(
+                    "git {label} の実行中です",
+                    &[("label", self.git_ops.job_label.clone())],
+                ),
+                false,
+            );
+            return;
+        }
+        let Some(repo) = self.git_ops_repo() else {
+            self.toast(tr("git リポジトリが見つかりません"), false);
+            return;
+        };
+        let label = job.label();
+        let args = job.args();
+        let (tx, rx) = mpsc::channel();
+        let ctx2 = ctx.clone();
+        let label2 = label.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-git-ops".into())
+            .spawn(move || {
+                let out = crate::procx::hidden_command("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(&args)
+                    .output();
+                // git の言い分 (stderr) は加工せずそのまま画面へ出す。
+                let msg = match out {
+                    Ok(o) if o.status.success() => {
+                        (trf("{l} 完了", &[("l", label2.clone())]), true)
+                    }
+                    Ok(o) => {
+                        let err = crate::textenc::decode_output(&o.stderr);
+                        let err = if err.trim().is_empty() {
+                            crate::textenc::decode_output(&o.stdout)
+                        } else {
+                            err
+                        };
+                        (
+                            trf(
+                                "{l} 失敗: {e}",
+                                &[("l", label2.clone()), ("e", first_lines(&err, 3))],
+                            ),
+                            false,
+                        )
+                    }
+                    Err(e) => (
+                        trf(
+                            "{l} 失敗: {e}",
+                            &[("l", label2.clone()), ("e", e.to_string())],
+                        ),
+                        false,
+                    ),
+                };
+                let _ = tx.send(msg);
+                ctx2.request_repaint();
+            });
+        match spawned {
+            Ok(_) => {
+                self.git_ops.job = Some(rx);
+                self.git_ops.job_label = label;
+            }
+            Err(e) => self.toast(
+                trf("git を起動できません: {e}", &[("e", e.to_string())]),
+                false,
+            ),
+        }
+    }
+
+    /// コミット履歴の一覧を開き、裏で `git log` を取りに行く。
+    fn open_git_history(&mut self, ctx: &egui::Context) {
+        let Some(repo) = self.git_ops_repo() else {
+            self.toast(tr("git リポジトリが見つかりません"), false);
+            return;
+        };
+        self.git_ops.history_open = true;
+        self.git_ops.history_query.clear();
+        if self.git_ops.history_rx.is_some() {
+            return; // 取得中
+        }
+        self.git_ops.history_busy = true;
+        self.git_ops.history.clear();
+        let (tx, rx) = mpsc::channel();
+        let ctx2 = ctx.clone();
+        let n = GIT_HISTORY_MAX.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("zv-git-log".into())
+            .spawn(move || {
+                let mut out: Vec<(String, String)> = Vec::new();
+                // 区切りは 0x1F (Unit Separator)。件名にも著者名にも現れない。
+                if let Ok(o) = crate::procx::hidden_command("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args([
+                        "log",
+                        "--no-color",
+                        "-n",
+                        &n,
+                        "--pretty=%h%x1f%an%x1f%ar%x1f%s",
+                    ])
+                    .output()
+                {
+                    if o.status.success() {
+                        for line in crate::textenc::decode_output(&o.stdout).lines() {
+                            let mut it = line.split('\u{1f}');
+                            let (Some(sha), Some(an), Some(ar), Some(sub)) =
+                                (it.next(), it.next(), it.next(), it.next())
+                            else {
+                                continue;
+                            };
+                            out.push((sha.to_string(), format!("{sub}  —  {an} · {ar}")));
+                        }
+                    }
+                }
+                let _ = tx.send(out);
+                ctx2.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.git_ops.history_rx = Some(rx),
+            Err(e) => {
+                self.git_ops.history_busy = false;
+                self.toast(
+                    trf("git を起動できません: {e}", &[("e", e.to_string())]),
+                    false,
+                );
+            }
+        }
+    }
+
+    /// 走行中の git ジョブ / 履歴取得の結果を回収する (毎フレーム)。
+    fn git_ops_poll(&mut self) {
+        let done = match &self.git_ops.job {
+            Some(rx) => match rx.try_recv() {
+                Ok(m) => Some(Some(m)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(mpsc::TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+        if let Some(m) = done {
+            self.git_ops.job = None;
+            self.git_ops.job_label.clear();
+            if let Some((msg, ok)) = m {
+                self.toast(msg, ok);
+            }
+            // 一覧・ガター・レビューを取り直す
+            self.gitinfo.request_refresh();
+            self.git_panel.invalidate();
+            self.review.invalidate();
+        }
+        let hist = match &self.git_ops.history_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(list) => Some(Some(list)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+                Err(mpsc::TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+        if let Some(list) = hist {
+            self.git_ops.history = list.unwrap_or_default();
+            self.git_ops.history_rx = None;
+            self.git_ops.history_busy = false;
+        }
+    }
+
+    /// コミットメッセージの入力窓。Enter で確定、Esc で取り消し。
+    fn git_commit_window(&mut self, ctx: &egui::Context) {
+        if !self.git_ops.commit_open {
+            return;
+        }
+        let all = self.git_ops.commit_all;
+        let focus = std::mem::take(&mut self.git_ops.commit_focus);
+        let mut msg = std::mem::take(&mut self.git_ops.commit_msg);
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new(if all {
+            tr("すべての変更をコミット")
+        } else {
+            tr("ステージした変更をコミット")
+        })
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_TOP, egui::vec2(0.0, RENAME_WINDOW_Y))
+        .show(ctx, |ui| {
+            ui.set_width(GIT_COMMIT_WINDOW_W);
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut msg)
+                    .hint_text(tr("コミットメッセージ"))
+                    .desired_width(f32::INFINITY),
+            );
+            if focus {
+                r.request_focus();
+            }
+            // IME 変換の確定 Enter をコミットに使わない (Windows / Linux 対策)
+            let ime = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
+            if r.lost_focus() && !ime && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button(tr("コミット")).clicked() {
+                    submit = true;
+                }
+                if ui.button(tr("取り消し")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        self.git_ops.commit_msg = msg;
+        if cancel {
+            self.git_ops.commit_open = false;
+            self.git_ops.commit_msg.clear();
+            return;
+        }
+        if submit {
+            let message = self.git_ops.commit_msg.trim().to_string();
+            if message.is_empty() {
+                self.toast(tr("コミットメッセージを入力してください"), false);
+                self.git_ops.commit_focus = true;
+                return;
+            }
+            self.git_ops.commit_open = false;
+            self.git_ops.commit_msg.clear();
+            self.run_git_job(GitJob::Commit { message, all }, ctx);
+        }
+    }
+
+    /// コミット履歴の一覧。選ぶとそのコミットの差分タブが開く。
+    fn git_history_window(&mut self, ctx: &egui::Context) {
+        if !self.git_ops.history_open {
+            return;
+        }
+        let theme = self.theme.clone();
+        let busy = self.git_ops.history_busy;
+        let mut query = std::mem::take(&mut self.git_ops.history_query);
+        let mut open = true;
+        let mut pick: Option<String> = None;
+        let history = std::mem::take(&mut self.git_ops.history);
+        egui::Window::new(tr("コミット履歴"))
+            .open(&mut open)
+            .default_width(REF_WINDOW_W)
+            .show(ctx, |ui| {
+                if busy {
+                    ui.label(
+                        RichText::new(tr("読み込み中…"))
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    return;
+                }
+                if history.is_empty() {
+                    ui.label(
+                        RichText::new(tr("コミットがありません"))
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    return;
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut query)
+                        .hint_text(tr("件名・著者で絞り込み"))
+                        .desired_width(f32::INFINITY),
+                );
+                let pq = fuzzy::PreparedQuery::new(query.trim());
+                egui::ScrollArea::vertical()
+                    .max_height(REF_WINDOW_H)
+                    .show(ui, |ui| {
+                        for (sha, line) in &history {
+                            if pq.score(line).is_none() {
+                                continue;
+                            }
+                            // どの幅でも行からはみ出さない (全文はホバー)
+                            let r = ui.add(
+                                egui::Label::new(RichText::new(format!("{sha}  {line}")).small())
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text(line).clicked() {
+                                pick = Some(sha.clone());
+                            }
+                        }
+                    });
+            });
+        self.git_ops.history = history;
+        self.git_ops.history_query = query;
+        self.git_ops.history_open = open;
+        if let Some(sha) = pick {
+            if let Some(repo) = self.git_ops_repo() {
+                self.open_commit_diff_at(&repo, &sha);
+            }
+            self.git_ops.history_open = false;
+        }
     }
 
     // ─── UI: editor ─────────────────────────────────────────────────
@@ -19596,12 +20130,16 @@ impl ZaivernApp {
 
         if self.palette.is_command_mode() {
             self.palette_items_command_mode(&pq, &mut items);
+        } else if self.palette.is_symbol_mode() {
+            self.palette_items_symbol_mode(&pq, &mut items);
+        } else if self.palette.is_goto_mode() {
+            self.palette_items_goto_mode(&mut items);
         } else if self.palette.is_agent_mode() {
             self.palette_items_agent_mode(&pq, &mut items);
         } else if self.palette.is_root_mode() {
             self.palette_items_root_mode(&pq, &mut items);
         } else {
-            self.palette_items_file_mode(&pq, &mut items);
+            self.palette_items_file_mode(&mut items);
         }
 
         // 並べ替え・件数の頭打ち・グループ分け・空/不一致の見せ方は
@@ -19794,6 +20332,36 @@ impl ZaivernApp {
                 tr("Git パネルを開く"),
                 String::new(),
                 Cmd::OpenGitPanel,
+            ),
+            (
+                "✔".into(),
+                tr("Git: ステージした変更をコミット…"),
+                String::new(),
+                Cmd::GitCommit(false),
+            ),
+            (
+                "✔".into(),
+                tr("Git: すべての変更をコミット…"),
+                String::new(),
+                Cmd::GitCommit(true),
+            ),
+            (
+                "⬆".into(),
+                tr("Git: push (origin へ)"),
+                String::new(),
+                Cmd::GitPush,
+            ),
+            (
+                "⬇".into(),
+                tr("Git: pull (早送りのみ)"),
+                String::new(),
+                Cmd::GitPull,
+            ),
+            (
+                "🕘".into(),
+                tr("Git: コミット履歴"),
+                String::new(),
+                Cmd::GitHistory,
             ),
             (
                 "👾".into(),
@@ -20730,22 +21298,73 @@ impl ZaivernApp {
     }
 
     /// パレット: ファイル検索モードの候補を items へ積む。
-    fn palette_items_file_mode(&self, pq: &fuzzy::PreparedQuery, items: &mut Vec<Item>) {
-        for f in &self.file_index {
-            // マッチはルート相対パスに対して行い、単一ルート時と同じ
-            // あいまい検索の品質を保つ。表示 (detail) は曖昧回避済みラベル、
-            // 実際に開くのは絶対パス。
-            if let Some(score) = pq.score(&f.rel) {
-                let name = f.rel.rsplit('/').next().unwrap_or(&f.rel).to_string();
-                items.push(Item {
-                    icon: file_tree::icon_for(&name).to_string(),
-                    label: name,
-                    detail: f.label.clone(),
-                    action: Action::OpenFile(f.abs.clone()),
-                    score,
-                });
-            }
+    ///
+    /// VS Code の ⌘P と同じで、**何も打っていないときは「最近開いた順」**。
+    /// 索引の残りはその後ろにアルファベット順で続く (並べ替えは palette 側)。
+    /// `ファイル名:123[:45]` と書くとその位置を開く候補になる。
+    fn palette_items_file_mode(&self, items: &mut Vec<Item>) {
+        // ランキングは純粋関数に閉じる (テーブルテストで固定できるように)。
+        // クエリは `:行` を剥がしてから作り直すので、ここでは共有 pq を使わない。
+        items.extend(file_mode_items(
+            &self.file_index,
+            &self.menu_state.recent_files,
+            self.active_file_path().as_deref(),
+            self.palette.query(),
+        ));
+    }
+
+    /// パレット: `@` シンボルモード。
+    ///
+    /// **新しい LSP 経路は作らない** — ⌘⇧O のピッカーと同じ
+    /// `textDocument/documentSymbol` の結果 (`self.lsp_symbols`) を読むだけ。
+    /// 要求は `palette_ui` が `request_breadcrumb_symbols` 経由で静かに出す。
+    fn palette_items_symbol_mode(&self, pq: &fuzzy::PreparedQuery, items: &mut Vec<Item>) {
+        let Some(path) = self.active_file_path() else {
+            return;
+        };
+        if self.lsp_symbols_path.as_deref() != Some(path.as_path()) {
+            return; // 別ファイルの結果は出さない (取り違え防止)
         }
+        let mut flat: Vec<(usize, String, u8, lsp::Position)> = Vec::new();
+        flatten_symbols(&self.lsp_symbols, 0, &mut flat);
+        for (depth, name, kind, pos) in flat.into_iter().take(MAX_SYMBOL_ROWS) {
+            let Some(score) = pq.score(&name) else {
+                continue;
+            };
+            items.push(Item {
+                icon: "◇".into(),
+                label: name,
+                detail: format!("{}{}", "  ".repeat(depth), symbol_kind_label(kind)),
+                action: Action::Cmd(Cmd::GoToLspPos(pos.line, pos.character)),
+                // 浅い階層 (トップレベルの定義) を上に出す
+                score: score - (depth as i32 * 5),
+            });
+        }
+    }
+
+    /// パレット: `:123` / `:123:45` の行 (列) ジャンプ。
+    ///
+    /// パースは `editor_ops::parse_goto` ただ 1 本 (⌃G の小窓と同じもの)。
+    /// 行数を超える値・0 行目は `char_index_at` が末尾へ丸めるので、
+    /// ここでクランプはしない (二重の丸めは挙動を読みにくくする)。
+    fn palette_items_goto_mode(&self, items: &mut Vec<Item>) {
+        let Some((line, col)) = editor_ops::parse_goto(self.palette.query()) else {
+            return;
+        };
+        if self.editor.active.is_none() {
+            return;
+        }
+        items.push(Item {
+            icon: "↧".into(),
+            label: trf("{line} 行目へ移動", &[("line", (line + 1).to_string())]),
+            detail: if col > 0 {
+                trf("{col} 桁目", &[("col", (col + 1).to_string())])
+            } else {
+                String::new()
+            },
+            action: Action::Cmd(Cmd::GoToLineAt(line, col)),
+            score: 0,
+        });
     }
 
     /// 各ルートの git worktree 一覧。パレットを開いている間だけキャッシュされる。
@@ -20807,8 +21426,35 @@ impl ZaivernApp {
         if self.palette.is_root_mode() && self.palette_worktrees.is_none() {
             self.palette_worktrees = Some(self.list_git_worktrees());
         }
+        // `@` モードは ⌘⇧O のピッカーと同じ documentSymbol の結果を読む。
+        // 無ければ静かに取りに行く (ピッカーは開かない = 画面は急に変わらない)。
+        if self.palette.is_symbol_mode() {
+            if let Some(p) = self.active_file_path() {
+                self.request_breadcrumb_symbols(&p);
+            }
+        }
+        // 復元した MRU (state.toml) に実体を結び直す。組み込みコマンド表は
+        // パレットを開いている間しか作らないので、ここが唯一の機会。
+        if self.palette.needs_rehydrate() {
+            let table: Vec<(String, String, Cmd)> = self
+                .palette_builtin_cmds()
+                .into_iter()
+                .map(|(icon, label, _, cmd)| (icon, label, cmd))
+                .collect();
+            self.palette.rehydrate(|label| {
+                table
+                    .iter()
+                    .find(|(_, l, _)| l == label)
+                    .map(|(icon, _, cmd)| (icon.clone(), Action::Cmd(cmd.clone())))
+            });
+        }
         let theme = self.theme.clone();
         let results = self.palette_items();
+        // ⌘P 連打で 1 つずつ下へ (端で先頭へ折り返す)。
+        let cycles = self.palette.take_cycle();
+        if cycles > 0 {
+            self.palette.selected = crate::palette::cycle(&results, self.palette.selected, cycles);
+        }
         let mut execute: Option<Item> = None;
         let mut close = false;
 
@@ -20836,7 +21482,7 @@ impl ZaivernApp {
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.palette.input)
                                 .hint_text(tr(
-                                    "ファイル検索…  （> コマンド / @ エージェント / # worktree）",
+                                    "ファイル検索…  （> コマンド / @ シンボル / :行 / % エージェント / # worktree）",
                                 ))
                                 .font(FontId::proportional(16.0))
                                 .desired_width(f32::INFINITY),
@@ -20905,7 +21551,7 @@ impl ZaivernApp {
                                     &theme,
                                     &results,
                                     self.palette.selected,
-                                    down || up,
+                                    down || up || cycles > 0,
                                 ) {
                                     execute = Some(it);
                                     close = true;
@@ -20921,8 +21567,25 @@ impl ZaivernApp {
         if let Some(it) = execute {
             // 使った実績を憶えて次回の並びに効かせる (よく使う操作が上がる)。
             self.palette.note_used(&it);
+            self.persist_palette_recent();
             self.run_action(it.action, ctx);
         }
+    }
+
+    /// パレットの MRU を state.toml へ書き戻す。**変わったときだけ**書く
+    /// (ファイルを開いただけで毎回ディスクを触らない)。
+    fn persist_palette_recent(&mut self) {
+        let now: Vec<config::PaletteRecent> = self
+            .palette
+            .recent_snapshot()
+            .into_iter()
+            .map(|(label, icon, uses)| config::PaletteRecent { label, icon, uses })
+            .collect();
+        if now == self.cfg.palette_recent {
+            return;
+        }
+        self.cfg.palette_recent = now;
+        config::save_state(&self.cfg);
     }
 
     // ─── UI: modals & toasts ────────────────────────────────────────
@@ -24204,6 +24867,7 @@ impl ZaivernApp {
         self.coordinate(win_focused);
         self.quota_tick();
         self.failover_tick();
+        self.git_ops_poll();
 
         self.top_bar(ctx);
         self.status_bar(ctx);
@@ -26448,6 +27112,8 @@ impl ZaivernApp {
 
     fn menu_windows_ui(&mut self, ctx: &egui::Context) {
         self.goto_line_window(ctx);
+        self.git_commit_window(ctx);
+        self.git_history_window(ctx);
         self.problems_window(ctx);
         self.shortcuts_window(ctx);
         self.about_window(ctx);
@@ -26480,17 +27146,24 @@ impl ZaivernApp {
                 }
             });
         if let Some((line, col)) = go {
-            if let Some(i) = self.editor.active {
-                let ch = editor_ops::char_index_at(&self.editor.buffers[i].text, line, col);
-                if let Some(p) = self.active_file_path() {
-                    self.nav_push(p, ch);
-                }
-                self.jump_to_char(ch, 0);
-            }
+            self.goto_line_col(line, col);
         }
         if close {
             self.goto_open = false;
         }
+    }
+
+    /// 0 起点の (行, 桁) へ飛ぶ。⌃G の小窓とパレットの `:123` の共通経路。
+    ///
+    /// 行数を超える値・0 行目・巨大な値は `editor_ops::char_index_at` が
+    /// 末尾へ丸める (パニックしない)。負の値は `parse_goto` が弾く。
+    fn goto_line_col(&mut self, line: usize, col: usize) {
+        let Some(i) = self.editor.active else { return };
+        let ch = editor_ops::char_index_at(&self.editor.buffers[i].text, line, col);
+        if let Some(p) = self.active_file_path() {
+            self.nav_push(p, ch);
+        }
+        self.jump_to_char(ch, 0);
     }
 
     fn problems_window(&mut self, ctx: &egui::Context) {
@@ -34151,5 +34824,216 @@ mod crisp_text_tests {
             src.contains("let (font_id, cell_w, cell_h) = cell_metrics(ui, font_size);"),
             "draw が cell_metrics を通っていない"
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  quick-open (⌘P) — 最近開いた順 / `名前:行` / 範囲外の行番号
+//
+//  ランキングは `file_mode_items` に閉じた純粋関数なので、App を組み立てずに
+//  テーブルテストで固定できる。パスは `std::env::temp_dir()` から作り、
+//  実ファイルは触らない (索引はメモリ上の値でよい)。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod quick_open_tests {
+    use super::*;
+
+    /// ルート直下に `rel` があるものとして索引の 1 件を作る。
+    fn indexed(root: &Path, rel: &str) -> IndexedFile {
+        IndexedFile {
+            abs: root.join(rel),
+            rel: rel.to_string(),
+            label: rel.to_string(),
+        }
+    }
+
+    fn labels(items: &[Item]) -> Vec<String> {
+        let p = crate::palette::Palette::new();
+        let res = p.results(items.to_vec());
+        res.items.iter().map(|i| i.label.clone()).collect()
+    }
+
+    #[test]
+    fn 空クエリでは最近開いたファイルが先頭に並ぶ() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let index: Vec<IndexedFile> = ["a.rs", "b.rs", "c.rs", "d.rs"]
+            .iter()
+            .map(|r| indexed(&root, r))
+            .collect();
+        // 最近開いた順: d → b (残りは未オープン)
+        let recent = vec![
+            root.join("d.rs").display().to_string(),
+            root.join("b.rs").display().to_string(),
+        ];
+        let items = file_mode_items(&index, &recent, None, "");
+        assert_eq!(
+            labels(&items),
+            vec!["d.rs", "b.rs", "a.rs", "c.rs"],
+            "最近順のあとはアルファベット順で続く"
+        );
+    }
+
+    #[test]
+    fn 開いているファイルは先頭に来ず直前のファイルへ戻れる() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let index: Vec<IndexedFile> = ["a.rs", "b.rs", "z.rs"]
+            .iter()
+            .map(|r| indexed(&root, r))
+            .collect();
+        // いま開いているのは z.rs、その前が b.rs
+        let recent = vec![
+            root.join("z.rs").display().to_string(),
+            root.join("b.rs").display().to_string(),
+        ];
+        let active = root.join("z.rs");
+        let items = file_mode_items(&index, &recent, Some(&active), "");
+        let l = labels(&items);
+        assert_eq!(l[0], "b.rs", "Enter で直前のファイルへ戻れない: {l:?}");
+        assert_ne!(l[0], "z.rs", "開いているファイルが先頭に居座っている");
+    }
+
+    #[test]
+    fn 入力を始めると一致の質が最近順より優先される() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let index: Vec<IndexedFile> = ["recent_only.rs", "zebra.rs"]
+            .iter()
+            .map(|r| indexed(&root, r))
+            .collect();
+        let recent = vec![root.join("recent_only.rs").display().to_string()];
+        // "zebra" は前方一致 (TIER_PREFIX)。最近順の加点では追い越せない。
+        let items = file_mode_items(&index, &recent, None, "zebra");
+        assert_eq!(labels(&items)[0], "zebra.rs");
+    }
+
+    #[test]
+    fn ファイル名に行番号を付けると位置つきで開く候補になる() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let index = vec![indexed(&root, "main.rs")];
+        for (q, want) in [("main.rs:42", (41, 0)), ("main.rs:42:5", (41, 4))] {
+            let items = file_mode_items(&index, &[], None, q);
+            assert_eq!(items.len(), 1, "q={q}");
+            match &items[0].action {
+                Action::OpenFileAt(p, line, col) => {
+                    assert_eq!(p, &root.join("main.rs"), "q={q}");
+                    assert_eq!((*line, *col), want, "q={q}");
+                }
+                _ => panic!("位置つきで開く候補になっていない: {q}"),
+            }
+            assert!(items[0].detail.contains("42"), "行番号が見えない: {q}");
+        }
+        // 行指定が無ければ従来どおり
+        let items = file_mode_items(&index, &[], None, "main");
+        assert!(matches!(items[0].action, Action::OpenFile(_)));
+    }
+
+    #[test]
+    fn 行指定として読めないコロンは名前の一部として扱う() {
+        // Windows のドライブレターや `foo:bar` を行ジャンプにしない
+        for q in ["C:/work/main.rs", "C:\\work\\main.rs", "foo:bar", "a::b"] {
+            assert_eq!(split_path_goto(q), (q, None), "q={q}");
+        }
+        assert_eq!(split_path_goto("main.rs:12"), ("main.rs", Some((11, 0))));
+        assert_eq!(split_path_goto("main.rs:12:3"), ("main.rs", Some((11, 2))));
+        // 先頭の `:` は行ジャンプモードの担当なのでここでは割らない
+        assert_eq!(split_path_goto(":12"), (":12", None));
+    }
+
+    #[test]
+    fn 範囲外の行番号はクランプされてパニックしない() {
+        let text = "1 行目\n2 行目\n3 行目";
+        // parse_goto は 1 起点 → 0 起点。0 行目・巨大値も受け付ける
+        for (input, want_line) in [
+            ("0", 0usize),
+            ("1", 0),
+            ("3", 2),
+            ("999999", 999_998),
+            ("18446744073709551615", usize::MAX - 1),
+        ] {
+            let (line, col) = editor_ops::parse_goto(input).expect(input);
+            assert_eq!(line, want_line, "input={input}");
+            // 本文末尾へ丸まるだけで、添字は必ず本文の範囲に収まる
+            let ch = editor_ops::char_index_at(text, line, col);
+            assert!(ch <= text.chars().count(), "input={input} ch={ch}");
+        }
+        // 負の値・数字以外は候補にしない (パースが弾く)
+        for bad in ["-1", "-1:2", "abc", "", " ", "1.5"] {
+            assert_eq!(editor_ops::parse_goto(bad), None, "bad={bad}");
+        }
+        // 桁が本文より大きくても丸まる
+        let ch = editor_ops::char_index_at(text, 0, usize::MAX);
+        assert_eq!(ch, "1 行目".chars().count());
+    }
+
+    #[test]
+    fn 日本語と絵文字を含むパスでもバイト境界を割らない() {
+        let root = std::env::temp_dir().join("zv-quick-open");
+        let names = [
+            "日本語のファイル.rs",
+            "絵文字🎨入り/設定🚀.toml",
+            "🇯🇵/国旗.md",
+            "混在_ひらがな_カタカナ_漢字.txt",
+        ];
+        let index: Vec<IndexedFile> = names.iter().map(|r| indexed(&root, r)).collect();
+        // 部分一致・マルチバイト境界をまたぐクエリでも落ちない
+        for q in ["日本語", "🎨", "設定", "国旗", "ひらがな", "🇯🇵", "な"] {
+            let items = file_mode_items(&index, &[], None, q);
+            for it in &items {
+                assert!(!it.label.is_empty(), "q={q}");
+                // ラベルはファイル名部分 (`/` の右側) を正しく切り出す
+                assert!(!it.label.contains('/'), "q={q} label={}", it.label);
+            }
+        }
+        // 行指定つきでも同じ
+        let items = file_mode_items(&index, &[], None, "絵文字🎨入り/設定🚀.toml:7");
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].action, Action::OpenFileAt(_, 6, 0)));
+        assert_eq!(items[0].label, "設定🚀.toml");
+    }
+
+    /// 矢印キーは**選択を動かすだけ**。開くのは Enter とクリックだけで、
+    /// 選択が動いたついでに裏でファイルを開いてタブを増やしたりしない。
+    #[test]
+    fn 矢印キーはパレットを閉じずファイルも開かない() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn palette_ui(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("palette_ui が見つからない")
+            .split("\n    fn ")
+            .next()
+            .expect("palette_ui の本文が取れない");
+        // 上下キーの扱いは「選択位置の更新」1 行だけ
+        assert_eq!(
+            body.matches("results.step(self.palette.selected, down, up)")
+                .count(),
+            1,
+            "上下キーの扱いが 1 か所でない"
+        );
+        // 閉じるのは Esc / Enter / クリックだけ (down/up では close にしない)
+        assert!(
+            !body.contains("if down") && !body.contains("if up"),
+            "上下キーで別の分岐に入っている"
+        );
+        // 選択が動いただけでファイルを開かない (タブを増やさない)
+        assert!(
+            !body.contains("self.open_path("),
+            "パレットの描画中にファイルを開いている"
+        );
+        // 実行は「Enter」と「クリックの戻り値」の 2 経路のみ
+        assert_eq!(
+            body.matches("execute = Some").count(),
+            2,
+            "実行の起点が 2 経路ではない"
+        );
+    }
+
+    #[test]
+    fn 最近順の加点は索引の末尾でも正の値のまま() {
+        // `recent::MAX_RECENT` 件ぶん下がっても 0 を割らない
+        // (割ると「最近開いた」が未オープンより下に沈む)
+        let last = RECENT_FILE_BONUS - (crate::recent::MAX_RECENT as i32 - 1) * RECENT_FILE_STEP;
+        assert!(last > 0, "最近順の加点が尽きている: {last}");
+        // 一致の段 (TIER_SUBSTR = 30_000) は超えない
+        assert!(RECENT_FILE_BONUS < 30_000, "最近順が一致の質を追い越す");
     }
 }
