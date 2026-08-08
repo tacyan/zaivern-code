@@ -726,43 +726,47 @@ fn snap_char_boundary(s: &str, byte: usize) -> usize {
 
 // ═══════════════ マルチカーソル / 矩形選択エンジン ═══════════════
 //
-// # なぜ「エンジンだけ」なのか
+// # 役割の分担
 //
-// 本文の編集面は `egui::TextEdit::multiline` で、**キャレットは 1 本しか持てない**
-// (egui 0.29 の `TextEditState` は `CCursorRange` を 1 つだけ覚える)。
-// つまり「N 本のキャレットが同時に点滅し、タイプすると N 箇所へ同時に入る」
-// という VS Code の見た目は、egui を差し替えるまで実現できない。
+// `egui::TextEdit` (0.29) の `TextEditState` は `CCursorRange` を **1 つ**しか
+// 覚えない。だから「N 本のキャレット」は egui に持たせず、**このモジュールが
+// 真の所有者**になる (設計原則 1: モデルはウィジェットより長生きさせる)。
+// UI (`app::code_editor_ui`) はその純粋なビューで、次の 3 つだけを担う:
 //
-// そこで**選択集合の計算と一括編集だけ**をここに置く。UI は 1 本のキャレットの
-// ままでも、コマンド 1 回 = [`MultiSel`] を組み立てて一括編集を 1 回、という形で
-// 今すぐ価値を出せる (「全ての出現を選択 → まとめて置換」「矩形選択 → 各行の先頭へ挿入」)。
+// 1. **入力の横取り** — `TextEdit` を描く**前**に `Event::Text` /
+//    Backspace / Delete / Enter を `ui.input_mut` から抜き取り、
+//    [`type_at_all`] / [`backspace_at_all`] / [`delete_forward_at_all`] /
+//    [`newline_at_all_detect`] へ流す。本文の差し替えは **1 回だけ**行うので
+//    egui の取り消しも 1 段で戻る (VS Code も複数キャレットの編集を 1 undo にする)。
+// 2. **描画の足し込み** — `TextEditOutput.galley` で [`MultiSel::to_char_ranges`]
+//    の各範囲の矩形とキャレットの縦線を自前で塗る。egui 本体の改造は要らない。
+// 3. **ポインタ** — Alt+クリックでキャレット追加、Alt+ドラッグで
+//    [`column_selection`] を組み立てる。
+//
+// egui のキャレット (1 本) は「主キャレット」として
+// [`MultiSel::to_single_selection_chars`] で同期する。点滅と IME はそこに乗る。
 //
 // # UI 側の採用手順 (このモジュールを使う側がやること)
 //
-// 1. `Buffer` に `multi: MultiSel` を 1 本持つ (既存の単一選択とは別に持つ)。
+// 1. `App` に `multi_sel: Option<(バッファ ID, MultiSel)>` を 1 本持つ
+//    (タブを跨いだら捨てる — 別のファイルのバイト位置は本文を壊す)。
 // 2. コマンド発火時、egui の `CCursorRange` (= **char** インデックス) から
 //    [`MultiSel::from_char_ranges`] で種を作る。
 //    ```ignore
 //    let seed = MultiSel::from_char_ranges(&buf.text, [ccur.primary.index..ccur.secondary.index]);
 //    let sel = editor_ops::add_cursor_below(&buf.text, &seed, tab_width);
 //    ```
-// 3. 編集は [`apply_edit_to_all`] 系を 1 回呼ぶ。返る `String` を `buf.text` へ入れ、
-//    undo スタックへは**その 1 回ぶん**を積む (VS Code も複数キャレットの編集を
-//    1 undo にまとめる)。
+// 3. 編集は [`apply_edit_to_all`] 系を 1 回呼ぶ。返る `String` を `buf.text` へ入れる。
 // 4. キャレットの復帰は [`MultiSel::to_single_selection_chars`] で char 範囲に
 //    直して `TextEditState::cursor.set_char_range(..)` に戻す。
 //
-// # 今の UI で「できないこと」と回避策
+// # 残っている制約
 //
-// | できないこと | 理由 | 今できる代替 |
-// |---|---|---|
-// | N 本のキャレットが同時に点滅する | `TextEdit` が `CCursorRange` を 1 つしか持たない | [`MultiSel::to_single_selection`] で 1 本だけ表示 |
-// | タイプした 1 文字が N 箇所へ同時に入る | キー入力は egui が単一キャレットへ適用する | コマンド (例:「選択箇所へ入力」) から [`insert_at_all`] を呼ぶ |
-// | N 個の選択ハイライトが出る | 同上 | `TextEditOutput.galley` を使い、UI 側で `to_char_ranges` の各範囲の矩形を**自前で塗る**ことは可能 (描画だけなら egui 改造不要) |
-// | キャレットごとの undo | undo は本文まるごと | 一括編集を 1 undo として積む |
-//
-// つまり「描画の足し込み (自前で矩形とキャレットを塗る)」までは今の egui でも到達でき、
-// 「入力の分配」だけが `TextEdit` を自前実装に置き換えるまで残る。
+// | 制約 | 理由 |
+// |---|---|
+// | IME 変換中の文字は主キャレットにだけ入る | `Event::Ime` は変換の途中状態を持ち、途中で分配すると確定前の候補が N 箇所に散る |
+// | キャレットごとの undo は無い | undo は本文まるごとのスナップショット。一括編集を 1 段として積む |
+// | 追加キャレットは点滅しない | 点滅は毎フレーム再描画を要求する (設計原則 3: アイドル時のコストはゼロ)。主キャレットだけが点滅する |
 
 use std::ops::Range;
 
@@ -1203,6 +1207,140 @@ pub fn delete_at_all(text: &str, sel: &MultiSel) -> (String, MultiSel) {
 /// 全キャレットの選択内容を `rep` に置き換える (「全ての出現を選択 → まとめて置換」)。
 pub fn replace_all_ranges(text: &str, sel: &MultiSel, rep: &str) -> (String, MultiSel) {
     apply_edit_to_all(text, sel, |_| rep.to_string())
+}
+
+// ─────────────────────── 打鍵を全キャレットへ配る ───────────────────────
+//
+// UI (`app::code_editor_ui`) が `TextEdit` より**先に**キー/文字イベントを
+// 横取りして、ここへ流す。返るのは「新しい本文」と「編集後の本文に対する
+// キャレット集合」で、本文の差し替えは呼び出し側で **1 回だけ**行う
+// (= egui の取り消しも 1 段。`MultiPaste` と同じ約束)。
+//
+// どれも戻り値のキャレットは**空** (選択なし) に畳む。VS Code も
+// タイプ後は選択が消えてキャレットだけが残る。
+
+/// バイト位置の**直前**の文字の開始位置。先頭なら 0。
+/// CRLF は 1 つの改行として扱う (`\n` だけ消して `\r` を残さない)。
+fn prev_char_start(s: &str, byte: usize) -> usize {
+    let mut b = snap_char_boundary(s, byte.min(s.len()));
+    if b == 0 {
+        return 0;
+    }
+    b -= 1;
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    // CRLF は 2 バイトまとめて 1 つの改行
+    if s.as_bytes().get(b) == Some(&b'\n') && b > 0 && s.as_bytes().get(b - 1) == Some(&b'\r') {
+        b -= 1;
+    }
+    b
+}
+
+/// バイト位置の**直後**の文字の終了位置。末尾なら `s.len()`。
+/// CRLF は 1 つの改行として扱う。
+fn next_char_end(s: &str, byte: usize) -> usize {
+    let mut b = snap_boundary_up(s, byte.min(s.len()));
+    if b >= s.len() {
+        return s.len();
+    }
+    let crlf = s.as_bytes().get(b) == Some(&b'\r') && s.as_bytes().get(b + 1) == Some(&b'\n');
+    b += 1;
+    while b < s.len() && !s.is_char_boundary(b) {
+        b += 1;
+    }
+    if crlf {
+        b += 1;
+    }
+    b
+}
+
+/// 編集後のキャレットを**末尾へ畳む** (選択を解いて 1 点にする)。
+fn collapse_to_end(sel: MultiSel) -> MultiSel {
+    MultiSel::new(
+        sel.carets()
+            .iter()
+            .map(|r| r.end..r.end)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// 全キャレットへ**タイプした文字**を入れる。選択があればその内容を置き換える。
+///
+/// 空キャレットどうしが同じ位置へ来た場合は [`MultiSel`] の融合規則で 1 本になる。
+pub fn type_at_all(text: &str, sel: &MultiSel, ins: &str) -> (String, MultiSel) {
+    let (out, moved) = apply_edit_to_all(text, sel, |_| ins.to_string());
+    (out, collapse_to_end(moved))
+}
+
+/// 全キャレットで Backspace。選択があればそれを消し、空キャレットなら**直前の
+/// 1 文字**を消す (行頭なら前の行とつながる)。本文先頭のキャレットは何もしない。
+///
+/// 後退で範囲が重なったキャレットは [`MultiSel`] の融合規則で 1 本になるので、
+/// 同じ文字を二度消すことはない。
+pub fn backspace_at_all(text: &str, sel: &MultiSel) -> (String, MultiSel) {
+    let ranges: Vec<Range<usize>> = sel
+        .carets()
+        .iter()
+        .map(|r| {
+            if r.start < r.end {
+                r.clone()
+            } else {
+                prev_char_start(text, r.start)..r.start
+            }
+        })
+        .collect();
+    let (out, moved) = delete_at_all(text, &MultiSel::in_text(text, ranges));
+    (out, collapse_to_end(moved))
+}
+
+/// 全キャレットで Delete (前方削除)。選択があればそれを消し、空キャレットなら
+/// **直後の 1 文字**を消す。本文末尾のキャレットは何もしない。
+pub fn delete_forward_at_all(text: &str, sel: &MultiSel) -> (String, MultiSel) {
+    let ranges: Vec<Range<usize>> = sel
+        .carets()
+        .iter()
+        .map(|r| {
+            if r.start < r.end {
+                r.clone()
+            } else {
+                r.start..next_char_end(text, r.start)
+            }
+        })
+        .collect();
+    let (out, moved) = delete_at_all(text, &MultiSel::in_text(text, ranges));
+    (out, collapse_to_end(moved))
+}
+
+/// 全キャレットで Enter。選択は置き換え、改行の後ろへ**その行の字下げ**を複製する
+/// (単一キャレットの [`auto_indent_after_newline`] と同じ感覚)。
+///
+/// `ending` は本文の改行様式。CRLF のファイルへ LF を混ぜないために受け取る。
+pub fn newline_at_all(text: &str, sel: &MultiSel, ending: LineEnding) -> (String, MultiSel) {
+    // 混在ファイルは `as_str` が最多の様式へ寄せてくれる (LF 決め打ちにしない)
+    let nl = ending.as_str();
+    let reps: Vec<String> = sel
+        .carets()
+        .iter()
+        .map(|r| {
+            let at = r.start.min(text.len());
+            let (ls, _) = line_bounds(text, at);
+            let indent: String = text[ls..at]
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            format!("{nl}{indent}")
+        })
+        .collect();
+    let mut it = reps.into_iter();
+    let (out, moved) =
+        apply_edit_to_all(text, sel, |_| it.next().unwrap_or_else(|| nl.to_string()));
+    (out, collapse_to_end(moved))
+}
+
+/// 本文の改行様式を見て [`newline_at_all`] を呼ぶ (呼び出し側の判定を 1 か所に)。
+pub fn newline_at_all_detect(text: &str, sel: &MultiSel) -> (String, MultiSel) {
+    newline_at_all(text, sel, detect_line_ending(text))
 }
 
 #[cfg(test)]
@@ -2220,6 +2358,164 @@ mod tests {
         assert_eq!(replace_all_ranges(text, &sel, "x").0, text);
         assert_eq!(delete_at_all(text, &sel).0, text);
         assert_eq!(insert_at_all(text, &sel, "x").0, text);
+    }
+
+    // ──────────── 打鍵を全キャレットへ配る (type / backspace / delete / enter) ────────────
+
+    /// ⌘D を 5 回 = 5 箇所選択のあとタイプすると、5 箇所すべてが同時に置き換わる。
+    #[test]
+    fn 五箇所へ同時にタイプできる() {
+        let text = "a x\nb x\nc x\nd x\ne x\n";
+        let sel = select_all_occurrences(text, "x", MatchOpts::default());
+        assert_eq!(sel.len(), 5, "⌘D 5 回ぶんのキャレット");
+        let (out, after) = type_at_all(text, &sel, "Z");
+        assert_eq!(out, "a Z\nb Z\nc Z\nd Z\ne Z\n");
+        assert_eq!(after.len(), 5, "キャレットは 5 本のまま");
+        // タイプ後は選択が消えて挿入直後の空キャレットになる
+        assert!(after.carets().iter().all(|r| r.start == r.end));
+        assert_eq!(after.carets()[0], 3..3);
+        assert_invariants(&out, &after, "5 箇所へタイプ");
+    }
+
+    /// 空キャレットと範囲選択が混ざっていても、それぞれの意味どおりに効く。
+    #[test]
+    fn 空キャレットと範囲選択が混ざってもタイプできる() {
+        let text = "abc def";
+        // 0..0 は空キャレット、4..7 ("def") は範囲選択
+        let sel = MultiSel::in_text(text, [0..0, 4..7]);
+        let (out, after) = type_at_all(text, &sel, "-");
+        assert_eq!(out, "-abc -");
+        assert_eq!(after.carets(), &[1..1, 6..6], "挿入した文字の直後へ畳む");
+        assert_invariants(&out, &after, "混在のタイプ");
+    }
+
+    /// 多バイト文字も 1 文字単位で消える (バイト単位で切らない)。
+    #[test]
+    fn backspace_は多バイト文字を一文字ずつ消す() {
+        let text = "あい\nうえ\n";
+        // 各行の 2 文字目のうしろ
+        let sel = MultiSel::in_text(text, [6..6, 13..13]);
+        let (out, after) = backspace_at_all(text, &sel);
+        assert_eq!(out, "あ\nう\n");
+        assert_eq!(after.len(), 2);
+        assert_invariants(&out, &after, "多バイトの Backspace");
+    }
+
+    /// Backspace で行が消えたら、キャレットは前の行末へ再配置される。
+    #[test]
+    fn backspace_で行が消えたらキャレットは前の行末へ移る() {
+        let text = "ab\ncd\nef";
+        // 2 行目と 3 行目の行頭 (行頭 Backspace = 前の行とつながる)
+        let sel = MultiSel::in_text(text, [3..3, 6..6]);
+        let (out, after) = backspace_at_all(text, &sel);
+        assert_eq!(out, "abcdef");
+        // "ab" のうしろ (2) と "abcd" のうしろ (4)
+        assert_eq!(after.carets(), &[2..2, 4..4]);
+        assert_invariants(&out, &after, "行が消えた後の再配置");
+    }
+
+    /// 本文先頭のキャレットは Backspace で何も消さない (パニックもしない)。
+    #[test]
+    fn 本文先頭の_backspace_は何もしない() {
+        let text = "abc";
+        let sel = MultiSel::in_text(text, [0..0, 2..2]);
+        let (out, after) = backspace_at_all(text, &sel);
+        assert_eq!(out, "ac");
+        assert_eq!(after.carets(), &[0..0, 1..1]);
+    }
+
+    /// 後退で範囲が重なったキャレットは 1 本に融合する (同じ文字を二度消さない)。
+    #[test]
+    fn backspace_で重なったキャレットは融合する() {
+        let text = "abcd";
+        // 隣り合う空キャレット。後退すると 0..1 と 1..2 で、消えるのは "ab"
+        let sel = MultiSel::in_text(text, [1..1, 2..2]);
+        let (out, after) = backspace_at_all(text, &sel);
+        assert_eq!(out, "cd");
+        assert_eq!(after.carets(), &[0..0], "同じ位置のキャレットは 1 本へ");
+        assert_invariants(&out, &after, "融合");
+    }
+
+    /// CRLF は 1 つの改行として消える (`\r` が取り残されない)。
+    #[test]
+    fn backspace_は_crlf_をまとめて消す() {
+        let text = "ab\r\ncd";
+        let sel = MultiSel::in_text(text, [4..4]); // 2 行目の行頭
+        let (out, _) = backspace_at_all(text, &sel);
+        assert_eq!(out, "abcd", "\\r が取り残されていない");
+    }
+
+    #[test]
+    fn delete_は直後の一文字を消し末尾では何もしない() {
+        let text = "あい\nうえ";
+        let sel = MultiSel::in_text(text, [0..0, text.len()..text.len()]);
+        let (out, after) = delete_forward_at_all(text, &sel);
+        assert_eq!(out, "い\nうえ");
+        assert_eq!(after.carets(), &[0..0, out.len()..out.len()]);
+        assert_invariants(&out, &after, "前方削除");
+    }
+
+    #[test]
+    fn delete_は_crlf_をまとめて消す() {
+        let text = "ab\r\ncd";
+        let sel = MultiSel::in_text(text, [2..2]);
+        assert_eq!(delete_forward_at_all(text, &sel).0, "abcd");
+    }
+
+    /// Enter は各キャレットの行の字下げを複製する。
+    #[test]
+    fn enter_は各行の字下げを複製する() {
+        let text = "    foo\n\tbar\nbaz";
+        let sel = MultiSel::in_text(text, [7..7, 12..12, text.len()..text.len()]);
+        let (out, after) = newline_at_all(text, &sel, LineEnding::Lf);
+        assert_eq!(out, "    foo\n    \n\tbar\n\t\nbaz\n");
+        assert_eq!(after.len(), 3);
+        assert!(after.carets().iter().all(|r| r.start == r.end));
+        assert_invariants(&out, &after, "Enter");
+    }
+
+    /// CRLF のファイルへ LF を混ぜない。
+    #[test]
+    fn enter_は本文の改行様式に合わせる() {
+        let text = "ab\r\ncd\r\n";
+        let sel = MultiSel::in_text(text, [2..2]);
+        let (out, _) = newline_at_all_detect(text, &sel);
+        assert_eq!(out, "ab\r\n\r\ncd\r\n");
+    }
+
+    /// 選択があるまま Enter を押すと、選択が消えて改行になる。
+    #[test]
+    fn enter_は選択を置き換える() {
+        let text = "abcXYZdef";
+        let sel = MultiSel::in_text(text, [3..6]);
+        let (out, after) = newline_at_all(text, &sel, LineEnding::Lf);
+        assert_eq!(out, "abc\ndef");
+        assert_eq!(after.carets(), &[4..4]);
+    }
+
+    /// 行末より右の桁に立てたキャレット (矩形選択の端) でもタイプで壊れない。
+    #[test]
+    fn 行末を超える桁のキャレットでもタイプできる() {
+        // 2 行目は短い。桁 5 の矩形を作ると 2 行目は行末で止まる
+        let text = "abcdefgh\nij\nklmnopqr\n";
+        let sel = column_selection(text, 0, 5, 2, 5, 4);
+        assert_invariants(text, &sel, "行末を超える矩形");
+        let (out, after) = type_at_all(text, &sel, "#");
+        // 3 行の桁 5 に "#" が入り、短い行は行末へ寄る
+        assert_eq!(out, "abcde#fgh\nij#\nklmno#pqr\n");
+        assert_eq!(after.len(), 3);
+        assert_invariants(&out, &after, "行末超えのタイプ");
+    }
+
+    /// 空集合へ打鍵しても本文は変わらない (0 本のキャレット)。
+    #[test]
+    fn キャレットが無ければ打鍵は本文を変えない() {
+        let text = "そのまま";
+        let sel = MultiSel::default();
+        assert_eq!(type_at_all(text, &sel, "x").0, text);
+        assert_eq!(backspace_at_all(text, &sel).0, text);
+        assert_eq!(delete_forward_at_all(text, &sel).0, text);
+        assert_eq!(newline_at_all_detect(text, &sel).0, text);
     }
 
     // ──────────────── 出現の選択 ────────────────
