@@ -29,6 +29,7 @@ mod highlight;
 mod html;
 mod i18n;
 mod ide;
+mod ignore;
 mod instances;
 mod jsonc;
 mod kanban;

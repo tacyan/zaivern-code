@@ -3,6 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// ファイル索引 (⌘P) の既定の上限。`.gitignore` を尊重すれば
+/// 数万ファイル規模のモノレポでも届かない値にしてある
+/// (以前は 8000 件 / 深さ 12 で**無音**に打ち切っていた)。
+pub const DEFAULT_INDEX_MAX_FILES: usize = 50_000;
+/// ファイル索引が潜る既定の深さ。node_modules を除いた実在のツリーは
+/// 20 段も無いが、生成物混じりのリポジトリでも足りるよう余裕を持たせる。
+pub const DEFAULT_INDEX_MAX_DEPTH: usize = 32;
+/// ツリーの 1 ディレクトリで一度に描く既定の行数。
+/// 画面に入るのは数十行なので、これを超えたぶんは「さらに N 件」に畳む。
+pub const DEFAULT_TREE_DIR_PAGE: usize = 300;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -16,6 +27,28 @@ pub struct Config {
     /// ファイル単位のズームは倍率をバッファ側が持つので、ここには入らない。
     pub ui_zoom: f32,
     pub show_hidden_files: bool,
+
+    /// `.gitignore` (+ `.git/info/exclude` + `core.excludesFile`) を尊重して
+    /// ファイルツリーとファイル索引 (⌘P) から除外するか。**既定はオン**。
+    /// これが無いと `node_modules` / `target` がツリーと索引を埋め尽くす。
+    pub respect_gitignore: bool,
+
+    /// 無視されたファイルを隠さず**薄く**表示するか (VS Code と同じ見せ方)。
+    /// `respect_gitignore = false` のときは意味を持たない。既定はオフ。
+    pub dim_ignored_files: bool,
+
+    /// ファイル索引 (⌘P) に載せる最大件数。上限に達したらパレットに
+    /// 「N 件で打ち切りました」と出す (無音で切らない)。
+    /// `.gitignore` を尊重していれば数万件のリポジトリでも届かない。
+    pub index_max_files: usize,
+
+    /// ファイル索引が潜る最大の深さ (ルート直下 = 1)。
+    pub index_max_depth: usize,
+
+    /// ツリーの 1 ディレクトリで一度に描く行数の上限。
+    /// 超えたぶんは「さらに N 件」を押すと同じ数だけ伸びる
+    /// (巨大ディレクトリで数万行を描いてフレームを落とさないため)。
+    pub tree_dir_page: usize,
 
     /// エディタ本文の折り返し (VS Code の Word Wrap 相当)。既定はオフ。
     pub word_wrap: bool,
@@ -263,6 +296,11 @@ impl Default for Config {
             terminal_font_size: 13.0,
             ui_zoom: crate::zoom::DEFAULT,
             show_hidden_files: true,
+            respect_gitignore: true,
+            dim_ignored_files: false,
+            index_max_files: DEFAULT_INDEX_MAX_FILES,
+            index_max_depth: DEFAULT_INDEX_MAX_DEPTH,
+            tree_dir_page: DEFAULT_TREE_DIR_PAGE,
             word_wrap: false,
             show_whitespace: false,
             lsp_highlight_occurrences: true,
@@ -466,6 +504,11 @@ struct Overlay {
     terminal_font_size: Option<f32>,
     ui_zoom: Option<f32>,
     show_hidden_files: Option<bool>,
+    respect_gitignore: Option<bool>,
+    dim_ignored_files: Option<bool>,
+    index_max_files: Option<usize>,
+    index_max_depth: Option<usize>,
+    tree_dir_page: Option<usize>,
     word_wrap: Option<bool>,
     show_whitespace: Option<bool>,
     minimap: Option<bool>,
@@ -563,6 +606,23 @@ theme = "zaivern-dark"
 editor_font_size = 15.0
 terminal_font_size = 13.0
 show_hidden_files = true
+
+# .gitignore (+ .git/info/exclude + core.excludesFile) を尊重して
+# ファイルツリーとファイル検索 (⌘P) から除外します。既定は true。
+# false にすると node_modules / target なども全部並びます。
+# respect_gitignore = true
+# 無視されたファイルを隠さず「薄く」表示する (VS Code と同じ見せ方)。既定は false。
+# respect_gitignore = false のときは効きません。
+# dim_ignored_files = false
+
+# ファイル検索 (⌘P) の索引の上限。上限に達したらパレットにその旨を出します
+# (黙って切り捨てません)。索引はバックグラウンドで作るので UI は止まりません。
+# index_max_files = 50000
+# index_max_depth = 32
+
+# ツリーの 1 フォルダで一度に描く行数。超えたぶんは「さらに N 件」に畳みます
+# (巨大フォルダで数万行を描いてカクつかせないため)。
+# tree_dir_page = 300
 
 # 画面全体のズーム (0.5〜3.0)。UI の全部が一緒に拡大縮小します。
 # ⌘+ / ⌘- / ⌘0 で変えた値は ~/.zaivern/state.toml に覚えるので、
@@ -1094,6 +1154,21 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
             }
             if let Some(v) = o.show_hidden_files {
                 cfg.show_hidden_files = v;
+            }
+            if let Some(v) = o.respect_gitignore {
+                cfg.respect_gitignore = v;
+            }
+            if let Some(v) = o.dim_ignored_files {
+                cfg.dim_ignored_files = v;
+            }
+            if let Some(v) = o.index_max_files {
+                cfg.index_max_files = v;
+            }
+            if let Some(v) = o.index_max_depth {
+                cfg.index_max_depth = v;
+            }
+            if let Some(v) = o.tree_dir_page {
+                cfg.tree_dir_page = v;
             }
             if let Some(v) = o.word_wrap {
                 cfg.word_wrap = v;
