@@ -25,13 +25,6 @@ failure-output = "immediate-final"
 [test-groups]
 # 実PTYテストは同時実行するとシェル起動が競合しフレーキーになるため直列化。
 pty = { max-threads = 1 }
-# 実 `git` を起動するテスト。1 件が数十本の子プロセスを撃つ (worktree 作成・
-# コミット・スキャン) ため、無制限に並べるとプロセス生成が詰まり、
-# **単独 6.7 秒のテストが 60 秒の slow-timeout に当たる**。
-# `terminate-after = 1` なので 1 件当たれば**全体の実行が中断**する
-# (実測: 2346/2875 で停止)。フレーキーではなく飽和なので、
-# 同時実行数を絞って解く。
-git = { max-threads = 4 }
 
 [[profile.ci.overrides]]
 # 実 PTY を起動するモジュールのみ。他の terminal:: テストは並列で構わない。
@@ -41,11 +34,3 @@ test-group = "pty"
 # ハング 1 件のコストは ≤50 秒 (旧設定の 4 分から短縮)。
 slow-timeout = { period = "45s", terminate-after = 1, grace-period = "5s" }
 
-[[profile.ci.overrides]]
-# 実 `git` を起動するモジュール。純粋ロジックのテストも同じ名前空間に居るが、
-# 分けるほどの数ではない (合計 158 件) ので、モジュール単位で束ねる。
-filter = 'test(/^(race|worktree|git_panel|git)::/)'
-test-group = "git"
-# 子プロセスの起動待ちを含むので PTY と同じ 45 秒を与える。
-# 単独実行はいずれも 10 秒未満なので、ここに当たるのは異常のときだけ。
-slow-timeout = { period = "45s", terminate-after = 2, grace-period = "5s" }
