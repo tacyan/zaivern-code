@@ -92,6 +92,20 @@ pub struct Config {
     /// 自動で 1 列へ縮退させるので、狭いウィンドウでも見切れない。
     /// 値の解釈は [`crate::diff::DiffMode::from_config_str`] に集約してある。
     pub diff_view: String,
+    /// ドラッグ&ドロップで移動するとき「"X" を "Y" へ移動しますか?」を出すか
+    /// (VS Code の `explorer.confirmDragAndDrop`)。**既定はオン**。
+    ///
+    /// 確認ダイアログの「今後確認しない」を押すとここが false になり
+    /// state.toml へ残る。同名衝突の確認は**この設定では消せない**
+    /// (既存を壊す操作なので、必ず聞く)。
+    pub confirm_drag_and_drop: bool,
+
+    /// 削除をゴミ箱へ送るか (VS Code の `files.enableTrash`)。**既定はオン**。
+    ///
+    /// オフにすると削除は常に完全削除 (取り消せない) になる。
+    /// オンでも Shift 併用なら完全削除を選べる。
+    pub enable_trash: bool,
+
     /// エディタ左端のガターに git blame (著者 · 相対日時) を出す。既定はオフ。
     /// オンの間だけ可視範囲ぶんの `git blame` を非同期で取る。
     pub git_blame: bool,
@@ -365,6 +379,8 @@ impl Default for Config {
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
             git_blame: false,
+            confirm_drag_and_drop: true,
+            enable_trash: true,
             tab_switch_mru: true,
             preview_tabs: true,
             approval_mode: "ask".into(),
@@ -613,6 +629,11 @@ struct UiState {
     /// 差分ビューの表示モード ("side_by_side" | "inline")。
     diff_view: Option<String>,
     git_blame: Option<bool>,
+    /// D&D の移動確認 / ゴミ箱の使用。確認ダイアログの「今後確認しない」と
+    /// ツリーのメニューから切り替えるものなので、手書きの config.toml では
+    /// なく state 側に置く (config.toml をアプリが書き換えない方針)。
+    confirm_drag_and_drop: Option<bool>,
+    enable_trash: Option<bool>,
     /// タブ切替を MRU で回すか (パレットから切り替えるので state 側に置く)。
     tab_switch_mru: Option<bool>,
     /// プレビュータブを使うか (同上)。
@@ -1107,6 +1128,12 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.git_blame {
                     cfg.git_blame = v;
                 }
+                if let Some(v) = st.confirm_drag_and_drop {
+                    cfg.confirm_drag_and_drop = v;
+                }
+                if let Some(v) = st.enable_trash {
+                    cfg.enable_trash = v;
+                }
                 if let Some(v) = st.tab_switch_mru {
                     cfg.tab_switch_mru = v;
                 }
@@ -1586,6 +1613,8 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         breadcrumbs: Some(cfg.global_breadcrumbs),
         diff_view: Some(cfg.diff_view.clone()),
         git_blame: Some(cfg.global_git_blame),
+        confirm_drag_and_drop: Some(cfg.confirm_drag_and_drop),
+        enable_trash: Some(cfg.enable_trash),
         tab_switch_mru: Some(cfg.tab_switch_mru),
         preview_tabs: Some(cfg.preview_tabs),
         pet_image: cfg.pet_image.clone(),
@@ -1637,6 +1666,11 @@ mod tests {
         assert_eq!(c.terminal_font_size, 13.0);
         assert!(c.show_hidden_files);
         assert_eq!(c.approval_mode, "ask", "既定は必ず安全側 (ask)");
+        assert!(
+            c.confirm_drag_and_drop,
+            "D&D の移動確認は既定でオン (VS Code と同じ)"
+        );
+        assert!(c.enable_trash, "削除は既定でゴミ箱行き (戻せる側が既定)");
         assert!(c.show_pet);
         assert_eq!(c.pet_image, None);
         assert_eq!(c.pet_x, None);
@@ -2194,6 +2228,8 @@ command = "agy"
             breadcrumbs: Some(false),
             diff_view: Some("inline".into()),
             git_blame: Some(true),
+            confirm_drag_and_drop: Some(false),
+            enable_trash: Some(false),
             pet_image: Some("/tmp/p.png".into()),
             pet_x: Some(10.0),
             pet_y: Some(20.5),

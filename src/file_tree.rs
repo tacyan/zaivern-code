@@ -51,14 +51,52 @@ pub struct TreeActions {
     pub create_dir: Option<PathBuf>,
     /// 名前の変更 (旧パス, 新パス)
     pub rename: Option<(PathBuf, PathBuf)>,
-    /// 削除要求(確認ダイアログは呼び出し側が出す)。**複数選択に対応**するため
-    /// 集合で渡す。単一選択なら 1 件だけ入る(従来と同じ見え方)。
-    pub delete: Vec<PathBuf>,
-    /// 貼り付け (コピー元, 貼り付け先フルパス, 種類)。fs 操作は呼び出し側。
-    /// 複数選択のクリップボードに対応するため集合で渡す。
-    pub transfer: Vec<(PathBuf, PathBuf, Transfer)>,
+    /// 削除要求(確認ダイアログは呼び出し側が出す)。**複数選択に対応**する。
+    /// `None` = 削除要求なし。中の `paths` が実際の対象 (1 件でも複数でも同じ形)。
+    pub delete: Option<DeleteRequest>,
+    /// 移動/コピーの実行計画。**fs 操作も確認ダイアログも呼び出し側**が行う。
+    /// 複数選択のドロップ / 貼り付けは 1 ジョブに複数件入る
+    /// (同名衝突を「すべてに適用」で 1 回だけ聞くため)。
+    pub transfer: Option<TransferJob>,
+    /// ファイル操作の取り消し要求 (ツリーの ⌘Z / Ctrl+Z)。
+    ///
+    /// エディタ本文の取り消し (`editor::History`) とは**別の履歴**で、
+    /// ここが立つのは [`FileTree::handle_keys`] の先頭ガードを通ったとき
+    /// = ツリーがフォーカスを持ち、かつどの egui ウィジェットもキーボード
+    /// フォーカスを持っていないときだけ。エディタに居るあいだは構造的に
+    /// 立たない (「本文を ⌘Z したらファイルが動いた」を起こさない)。
+    pub undo: bool,
+    /// 設定の変更要求 (ツリーのコンテキストメニューのトグル)。
+    /// `Some(v)` なら呼び出し側が config へ書いて永続化する。
+    pub set_confirm_dnd: Option<bool>,
+    pub set_use_trash: Option<bool>,
     /// ユーザーへ知らせたい注意(貼り付け不可など)。呼び出し側がトーストで出す。
     pub notice: Option<String>,
+}
+
+/// 削除要求。**複数選択に対応**するので対象は集合で持つ。
+/// `permanent` は 1 回の操作に 1 つ (Shift 併用 = ゴミ箱を通さない完全削除)。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct DeleteRequest {
+    /// 消す対象 (ルートは含まない)。空なら何もしない。
+    pub paths: Vec<PathBuf>,
+    /// true なら復元できない完全削除 (Shift+削除 / 設定でゴミ箱を切っている)。
+    pub permanent: bool,
+}
+
+/// 1 回のドロップ / 貼り付けでまとめて動かすもの。
+///
+/// 「1 操作 = 1 ジョブ」にしてあるのは、同名衝突の確認で
+/// **「すべてに適用」を 1 回だけ聞く**ため (1 件ずつ聞かない)。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TransferJob {
+    pub items: Vec<TransferItem>,
+    pub kind: Transfer,
+    /// ドラッグ&ドロップ由来か。VS Code の `explorer.confirmDragAndDrop` は
+    /// **D&D のときだけ**「移動しますか?」を出すので、貼り付けと区別する。
+    pub from_drag: bool,
+    /// フォルダ同士のマージとして展開されたジョブか (後始末で空フォルダを畳む)。
+    pub merge_root: Option<(PathBuf, PathBuf)>,
 }
 
 /// ツリー内インライン編集の種類。
@@ -281,6 +319,13 @@ pub struct FileTree {
     auto_reveal_dirty: bool,
     /// 前フレームのウィンドウフォーカス (復帰の立ち上がりで git 再スキャン要求)。
     window_focused: bool,
+    /// 呼び出し側 (config.rs) が持つファイル操作の設定の**写し**。
+    /// ツリーは表示とトグル要求 (`TreeActions::set_*`) を出すだけで、
+    /// 値の持ち主にはならない (設定の真実源を 2 つにしない)。
+    confirm_dnd: bool,
+    use_trash: bool,
+    /// 取り消せるファイル操作の表示名。`None` = 履歴が空。
+    undo_hint: Option<String>,
     /// `.gitignore` の判定器 (設定で無効化できる)。
     ignorer: crate::ignore::Ignorer,
     /// 無視されたファイルを隠さず薄く表示するか。
@@ -328,6 +373,9 @@ impl FileTree {
             auto_reveal: None,
             auto_reveal_dirty: false,
             window_focused: true,
+            confirm_dnd: true,
+            use_trash: true,
+            undo_hint: None,
             ignorer: crate::ignore::Ignorer::new(true),
             dim_ignored: false,
             dir_page: crate::config::DEFAULT_TREE_DIR_PAGE,
@@ -406,6 +454,19 @@ impl FileTree {
     }
 
     /// 切り取り移動が成功したときに呼ぶ (アプリ側から)。
+    /// ファイル操作まわりの設定と取り消し履歴の状態を毎フレーム受け取る。
+    /// 値は config.rs 側が持ち、ここは表示に使うだけ。
+    pub fn set_file_ops_state(
+        &mut self,
+        confirm_dnd: bool,
+        use_trash: bool,
+        undo_hint: Option<String>,
+    ) {
+        self.confirm_dnd = confirm_dnd;
+        self.use_trash = use_trash;
+        self.undo_hint = undo_hint;
+    }
+
     pub fn clear_clipboard(&mut self) {
         self.clipboard = None;
     }
@@ -813,7 +874,9 @@ impl FileTree {
                 });
                 let (_, header, _) =
                     hr.body(|ui| self.dir_ui(ui, root, theme, gitinfo, actions, 0));
+                // ルート見出しもドロップ先にする (ルート直下へ動かせる)
                 let resp = header.inner;
+                self.drop_target(ui, &resp, root, theme, actions);
                 if resp.clicked() {
                     let mods = ui.input(|i| i.modifiers);
                     self.click_select(root, mods);
@@ -846,6 +909,7 @@ impl FileTree {
                         ui.ctx().copy_text(root.to_string_lossy().to_string());
                     }
                     ui.separator();
+                    self.file_ops_menu(ui, actions);
                     self.auto_reveal_menu(ui);
                 });
             }
@@ -862,6 +926,9 @@ impl FileTree {
                 }
             }
         }
+        // ドラッグ中のゴースト (何を・移動かコピーか)。前景レイヤに 1 枚だけ。
+        self.drag_ghost(&ctx, theme);
+
         // スクロール要求はこのフレームで消化(行が見つからなくても持ち越さない)
         self.scroll_to = None;
     }
@@ -934,6 +1001,12 @@ impl FileTree {
         if ui.ctx().memory(|m| m.focused().is_some()) {
             return;
         }
+        // IME 変換中はキーを一切拾わない (⌘Z のファイル操作取り消しも含む)。
+        // 状態機械を進めない peek 版を使う — `handle_shortcuts` が同じフレームで
+        // 進めるので、ここで 2 回目を撃つと変換の開始/終了を食ってしまう。
+        if crate::keybinds::ime_blocks_shortcuts_peek(ui.ctx()) {
+            return;
+        }
         if rows.is_empty() {
             return;
         }
@@ -958,6 +1031,7 @@ impl FileTree {
         self.keys_navigate(ui, rows, sel_idx, &ctx, mac);
         self.keys_open_rename(ui, actions, rows, sel_idx, &ctx, mac);
         self.keys_clipboard_delete(ui, actions, rows, sel_idx, &ctx, mac);
+        self.keys_undo(ui, actions);
         self.keys_type_ahead(rows, sel_idx, &typed, now);
     }
 
@@ -1152,16 +1226,38 @@ impl FileTree {
             }
         }
 
-        // ── 削除 (moveFileToTrash / deleteFile — アプリ側で確認ダイアログ) ──
-        let del = if mac {
-            pressed(Modifiers::COMMAND, Key::Backspace)
-                || pressed(Modifiers::COMMAND.plus(Modifiers::ALT), Key::Backspace)
-                || pressed(Modifiers::NONE, Key::Delete)
+        // ── 削除 (VS Code と同じ 2 系統。どちらもアプリ側で確認ダイアログ) ──
+        //   moveFileToTrash: ⌘⌫ (mac) / Delete      → ゴミ箱 (戻せる)
+        //   deleteFile     : ⌥⌘⌫ (mac) / ⇧Delete    → 完全削除 (戻せない)
+        // 修飾キーの多い方を先に消費する (少ない方に吸われないように)。
+        let perm = if mac {
+            pressed(Modifiers::COMMAND.plus(Modifiers::ALT), Key::Backspace)
         } else {
-            pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::SHIFT, Key::Delete)
+            pressed(Modifiers::SHIFT, Key::Delete)
         };
-        if del && !targets.is_empty() {
-            actions.delete = targets;
+        let trash = if mac {
+            pressed(Modifiers::COMMAND, Key::Backspace) || pressed(Modifiers::NONE, Key::Delete)
+        } else {
+            pressed(Modifiers::NONE, Key::Delete)
+        };
+        if (perm || trash) && !targets.is_empty() {
+            actions.delete = Some(DeleteRequest {
+                paths: targets,
+                // 設定でゴミ箱を切っているときも完全削除になる
+                permanent: perm || !self.use_trash,
+            });
+        }
+    }
+
+    /// handle_keys の取り消し部 — **ファイル操作**の ⌘Z / Ctrl+Z。
+    ///
+    /// エディタ本文の取り消し (`editor::History`) とは別の履歴を戻す。
+    /// ここへ来られるのは [`FileTree::handle_keys`] の先頭ガード
+    /// (`self.focused` かつ `memory().focused().is_none()`) を通ったときだけ
+    /// なので、エディタや入力欄に居るあいだは**構造的に**発火しない。
+    fn keys_undo(&mut self, ui: &mut egui::Ui, actions: &mut TreeActions) {
+        if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z)) {
+            actions.undo = true;
         }
     }
 
@@ -1206,19 +1302,177 @@ impl FileTree {
         let Some((srcs, cut)) = self.clipboard.clone() else {
             return;
         };
+        let kind = if cut { Transfer::Move } else { Transfer::Copy };
+        // コピーは VS Code の incrementalNaming どおり自動採番 (既存を壊さない)。
+        // 切り取り = 移動なので、既存があれば確認を取る (Ask)。
+        let numbering = if cut { Numbering::Ask } else { Numbering::Auto };
+        // 複数選択ぶんを**1 ジョブ**にまとめる。ここが「すべてに適用」の土台:
+        // 1 件ずつジョブにすると、衝突のたびに聞き直すことになる。
+        let mut items = Vec::new();
         for src in srcs {
-            match paste_plan(&src, cut, &dest_dir) {
+            match transfer_plan(&src, &dest_dir, kind, numbering) {
                 Ok(None) => {}
-                Ok(Some((dest, kind))) => {
-                    actions.transfer.push((src, dest, kind));
-                    // 切り取りのクリップボードはここでは消さない。移動の成否は
-                    // アプリ側で判るため、成功時に clear_clipboard() を呼んで
-                    // もらう (失敗時に切り取り内容が失われないように)。
-                }
+                Ok(Some(item)) => items.push(item),
                 // 1 件だめでも残りは貼り付ける (最後の理由だけ知らせる)
                 Err(msg) => actions.notice = Some(msg),
             }
         }
+        if !items.is_empty() {
+            actions.transfer = Some(TransferJob {
+                items,
+                kind,
+                from_drag: false,
+                merge_root: None,
+            });
+            // 切り取りのクリップボードはここでは消さない。移動の成否は
+            // アプリ側で判るため、成功時に clear_clipboard() を呼んで
+            // もらう (失敗時に切り取り内容が失われないように)。
+        }
+    }
+
+    /// ドロップされた `src` を `dest_dir` へ入れる計画を立てる。
+    ///
+    /// `alt` (macOS の ⌥ / Windows・Linux の Alt) が押されていればコピー、
+    /// でなければ移動 — VS Code と同じ。`Modifiers::alt` は egui-winit が
+    /// 両 OS 分を正規化して入れてくれるので OS 分岐は要らない。
+    ///
+    /// **掴んだ行が選択に入っていれば選択集合ごと運ぶ** (VS Code と同じ)。
+    /// 集合はそのまま 1 ジョブになるので、同名衝突は「すべてに適用」で
+    /// 1 回だけ聞ける。
+    fn drop_into(&mut self, src: &Path, dest_dir: PathBuf, alt: bool, actions: &mut TreeActions) {
+        let kind = if alt { Transfer::Copy } else { Transfer::Move };
+        let mut items = Vec::new();
+        for s in self.selection_targets(src) {
+            match transfer_plan(&s, &dest_dir, kind, Numbering::Ask) {
+                Ok(None) => {}
+                Ok(Some(item)) => items.push(item),
+                // 1 件だめでも残りは運ぶ (最後の理由だけ知らせる)
+                Err(msg) => actions.notice = Some(msg),
+            }
+        }
+        if items.is_empty() {
+            return;
+        }
+        actions.transfer = Some(TransferJob {
+            items,
+            kind,
+            from_drag: true,
+            merge_root: None,
+        });
+        self.focused = true;
+        // 移動先がツリーから見えなくなるなら、黙って消えたように見せない
+        if let Some(msg) = self.hidden_dest_notice(&dest_dir) {
+            actions.notice = Some(msg);
+        }
+    }
+
+    /// ドロップ先がツリーから見えなくなる場合の注意文。
+    ///
+    /// - **絞り込み中**: 絞り込みは「一致した要素 + その祖先」を残す剪定なので、
+    ///   行は本物のツリーのまま = 落とし先は曖昧にならない (だから受け付ける)。
+    ///   ただし移動後に新しい場所がクエリに当たらないと画面から消える。
+    /// - **`.gitignore` の対象**: 隠す設定なら行が無いので構造的に落とせない。
+    ///   薄表示のときは落とせるが、隠す設定に戻すと見えなくなる。
+    fn hidden_dest_notice(&mut self, dest_dir: &Path) -> Option<String> {
+        let ignored = root_for(&self.roots, dest_dir).is_some_and(|root| {
+            let root = root.to_path_buf();
+            self.ignorer.is_ignored(&root, dest_dir, true)
+        });
+        let filtering = !self.filter.trim().is_empty();
+        drop_visibility_notice(&label_of(dest_dir), ignored, filtering)
+    }
+
+    /// 右クリック / ドラッグの対象。その行が選択に入っていれば選択集合ごと、
+    /// 入っていなければその 1 件 (VS Code と同じ)。ルートは常に外す。
+    fn selection_targets(&self, path: &Path) -> Vec<PathBuf> {
+        let is_root = |p: &Path| self.roots.iter().any(|r| r == p);
+        if self.sel.contains(path) && self.sel.len() > 1 {
+            self.sel
+                .paths()
+                .iter()
+                .filter(|p| !is_root(p))
+                .cloned()
+                .collect()
+        } else if is_root(path) {
+            Vec::new()
+        } else {
+            vec![path.to_path_buf()]
+        }
+    }
+
+    /// 行をツリー内 D&D の受け口にする。
+    /// フォルダ行はその中、ファイル行は親フォルダが宛先 (VS Code と同じ)。
+    ///
+    /// ドロップできない先 (自分自身 / 自分の配下) は赤枠 + `NotAllowed` で示し、
+    /// Alt を押していれば `Copy` カーソルで「コピーになる」ことを見せる。
+    fn drop_target(
+        &mut self,
+        ui: &egui::Ui,
+        resp: &egui::Response,
+        dest_dir: &Path,
+        theme: &Theme,
+        actions: &mut TreeActions,
+    ) {
+        let Some(src) = resp.dnd_hover_payload::<PathBuf>() else {
+            return;
+        };
+        let alt = ui.input(|i| i.modifiers.alt);
+        let kind = if alt { Transfer::Copy } else { Transfer::Move };
+        let ok = matches!(
+            transfer_plan(&src, dest_dir, kind, Numbering::Ask),
+            Ok(Some(_))
+        );
+        let color = if ok { theme.accent } else { theme.err };
+        ui.painter().rect_stroke(
+            resp.rect.expand(1.0),
+            egui::Rounding::same(4.0),
+            egui::Stroke::new(1.5_f32, color),
+        );
+        ui.ctx().set_cursor_icon(if !ok {
+            egui::CursorIcon::NotAllowed
+        } else if alt {
+            egui::CursorIcon::Copy
+        } else {
+            egui::CursorIcon::Move
+        });
+        if let Some(src) = resp.dnd_release_payload::<PathBuf>() {
+            self.drop_into(&src, dest_dir.to_path_buf(), alt, actions);
+        }
+    }
+
+    /// ドラッグ中にカーソルの脇へ出す小さなゴースト。
+    /// 「何を」「移動なのかコピーなのか」を掴んだまま見せる (VS Code 相当)。
+    fn drag_ghost(&self, ctx: &egui::Context, theme: &Theme) {
+        let Some(src) = egui::DragAndDrop::payload::<PathBuf>(ctx) else {
+            return;
+        };
+        let Some(pos) = ctx.pointer_interact_pos() else {
+            return;
+        };
+        let alt = ctx.input(|i| i.modifiers.alt);
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let label = if alt {
+            trf("📄 {name} をコピー", &[("name", name)])
+        } else {
+            trf("➡ {name} を移動", &[("name", name)])
+        };
+        egui::Area::new(egui::Id::new("zv-tree-dnd-ghost"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos + egui::vec2(16.0, 16.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(theme.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, theme.accent))
+                    .rounding(egui::Rounding::same(6.0))
+                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(label).small().color(theme.text));
+                    });
+            });
     }
 
     /// そのパスを含むルートからの相対パス(どのルートにも属さなければフルパス)。
@@ -1470,7 +1724,10 @@ impl FileTree {
                 });
                 let (_, header, _) =
                     hr.body(|ui| self.dir_ui(ui, &e.path, theme, gitinfo, actions, depth + 1));
-                let resp = header.inner;
+                // ツリー内 D&D: フォルダは掴む側にも落とす側にもなる
+                let resp = header.inner.interact(egui::Sense::click_and_drag());
+                resp.dnd_set_drag_payload(e.path.clone());
+                self.drop_target(ui, &resp, &e.path, theme, actions);
                 if resp.clicked() {
                     // VS Code: フォルダのクリックは選択 + 開閉
                     // (⌘/Ctrl・Shift 付きは選択だけを広げ、開閉しない)
@@ -1505,10 +1762,9 @@ impl FileTree {
                     if menu_btn(ui, tr("✏ 名前を変更"), h("Enter", "F2")) {
                         self.start_rename(e.path.clone());
                     }
-                    if menu_btn(ui, tr("🗑 削除…"), h("⌘⌫", "Delete")) {
-                        actions.delete = self.delete_targets(&e.path);
-                    }
+                    self.delete_menu(ui, &e.path, actions);
                     ui.separator();
+                    self.file_ops_menu(ui, actions);
                     self.auto_reveal_menu(ui);
                 });
             } else {
@@ -1536,6 +1792,8 @@ impl FileTree {
                 // (クリック=開く はそのまま。ドラッグとクリックは egui が排他にする)
                 let resp = resp.interact(egui::Sense::click_and_drag());
                 resp.dnd_set_drag_payload(e.path.clone());
+                // ファイル行へ落としたら「その隣」= 親フォルダへ入れる (VS Code と同じ)
+                self.drop_target(ui, &resp, dir, theme, actions);
                 if resp.clicked() {
                     let mods = ui.input(|i| i.modifiers);
                     self.click_select(&e.path, mods);
@@ -1571,10 +1829,9 @@ impl FileTree {
                     if menu_btn(ui, tr("✏ 名前を変更"), h("Enter", "F2")) {
                         self.start_rename(e.path.clone());
                     }
-                    if menu_btn(ui, tr("🗑 削除…"), h("⌘⌫", "Delete")) {
-                        actions.delete = self.delete_targets(&e.path);
-                    }
+                    self.delete_menu(ui, &e.path, actions);
                     ui.separator();
+                    self.file_ops_menu(ui, actions);
                     self.auto_reveal_menu(ui);
                 });
             }
@@ -1657,6 +1914,71 @@ impl FileTree {
         }
     }
 
+    /// 削除メニュー。ゴミ箱行きと完全削除を**別の項目**にして、
+    /// どちらを押したのかが文言で分かるようにする (VS Code と同じ 2 系統)。
+    fn delete_menu(&mut self, ui: &mut egui::Ui, path: &Path, actions: &mut TreeActions) {
+        // 右クリックした行が選択に入っていれば選択集合ごと消す (VS Code と同じ)
+        let targets = self.delete_targets(path);
+        let n = targets.len();
+        let suffix = if n > 1 {
+            trf(" ({n} 件)", &[("n", n.to_string())])
+        } else {
+            String::new()
+        };
+        if self.use_trash
+            && menu_btn(
+                ui,
+                format!("{}{suffix}", tr("🗑 ゴミ箱へ移動…")),
+                h("⌘⌫", "Delete"),
+            )
+        {
+            actions.delete = Some(DeleteRequest {
+                paths: targets.clone(),
+                permanent: false,
+            });
+        }
+        if menu_btn(
+            ui,
+            format!("{}{suffix}", tr("🗑 完全に削除…")),
+            h("⌥⌘⌫", "Shift+Delete"),
+        ) {
+            actions.delete = Some(DeleteRequest {
+                paths: targets,
+                permanent: true,
+            });
+        }
+    }
+
+    /// ファイル操作の設定 (移動の確認 / ゴミ箱) と取り消し。
+    /// 設定値は config.rs 側が持ち、ここは要求を出すだけ。
+    fn file_ops_menu(&mut self, ui: &mut egui::Ui, actions: &mut TreeActions) {
+        if let Some(hint) = self.undo_hint.clone() {
+            if menu_btn(
+                ui,
+                trf("↩ 元に戻す: {op}", &[("op", hint)]),
+                h("⌘Z", "Ctrl+Z"),
+            ) {
+                actions.undo = true;
+            }
+        }
+        let label = if self.confirm_dnd {
+            tr("🖐 移動の確認: ON")
+        } else {
+            tr("🖐 移動の確認: OFF")
+        };
+        if menu_btn(ui, label, "") {
+            actions.set_confirm_dnd = Some(!self.confirm_dnd);
+        }
+        let label = if self.use_trash {
+            tr("🗑 削除はゴミ箱へ: ON")
+        } else {
+            tr("🗑 削除はゴミ箱へ: OFF (常に完全削除)")
+        };
+        if menu_btn(ui, label, "") {
+            actions.set_use_trash = Some(!self.use_trash);
+        }
+    }
+
     /// アクティブファイル追従のトグル (VS Code: explorer.autoReveal 相当)。
     /// 状態は egui の永続メモリに保存する (ui() 冒頭で書き戻し)。
     fn auto_reveal_menu(&mut self, ui: &mut egui::Ui) {
@@ -1674,19 +1996,7 @@ impl FileTree {
     /// 右クリックされた行に対する削除対象。選択集合に入っていれば
     /// **集合ごと**、入っていなければその 1 件だけ (ルートは常に除く)。
     fn delete_targets(&self, path: &Path) -> Vec<PathBuf> {
-        let is_root = |p: &Path| self.roots.iter().any(|r| r == p);
-        if self.sel.contains(path) && self.sel.len() > 1 {
-            self.sel
-                .paths()
-                .iter()
-                .filter(|p| !is_root(p))
-                .cloned()
-                .collect()
-        } else if is_root(path) {
-            Vec::new()
-        } else {
-            vec![path.to_path_buf()]
-        }
+        self.selection_targets(path)
     }
 
     /// パスのコピー / エージェント送信 のメニュー節。
@@ -1778,36 +2088,224 @@ pub(crate) fn reveal_ancestors(roots: &[PathBuf], path: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// 貼り付けの実行計画。`Ok(None)` は何もしない(同じ場所への切り取り貼り付け等)。
-/// エラーはそのままユーザーへ見せるメッセージ。
-pub fn paste_plan(
+// ─── 同名衝突の検出 (VS Code の「置き換えますか?」の土台) ─────────
+
+/// 移動/コピー先に既にあるものの種類。文言の出し分けに使う。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Clash {
+    /// 同名のファイル (壊れたリンクを含むシンボリックリンクも) がある。
+    /// 実行すると**中身が置き換わる**。
+    Overwrite,
+    /// フォルダ同士。VS Code と同じく**中身のマージ**になるので、
+    /// ファイルの上書きとは別の文言にする。
+    Merge,
+    /// 種類が違う (ファイル ↔ フォルダ)。片方が丸ごと消えるので最も危険。
+    Mismatch {
+        /// 移動先がフォルダか (= フォルダが中身ごと消える側か)。
+        dest_is_dir: bool,
+    },
+}
+
+/// パスの実体の種類。`symlink_metadata` を使うので**リンクは辿らない**。
+/// 壊れたリンクも「ある」と数える — `fs::rename` はそれを黙って上書きするため、
+/// `Path::exists()` (リンク先を見る) で判定すると取りこぼす。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EntryKind {
+    Dir,
+    File,
+    Symlink,
+}
+
+fn entry_kind(p: &Path) -> Option<EntryKind> {
+    let t = std::fs::symlink_metadata(p).ok()?.file_type();
+    Some(if t.is_symlink() {
+        EntryKind::Symlink
+    } else if t.is_dir() {
+        EntryKind::Dir
+    } else {
+        EntryKind::File
+    })
+}
+
+/// `a` と `b` が**同じ実体**を指すか。
+///
+/// macOS (APFS/HFS+ の既定) と Windows (NTFS) は大文字小文字を区別しないため、
+/// `a.txt` → `A.txt` のリネームでも `b` は「存在する」ことになる。これを同名衝突と
+/// 数えると case-only rename が永久にできなくなる (実際に起きやすい事故) ので、
+/// 正規化したパスが一致するものは衝突ではないと判定する。
+/// `canonicalize` は macOS / Windows とも**実際のディスク上の綴り**を返すので、
+/// 大小違いの 2 つの綴りは同じ結果に畳まれる。
+pub fn same_entry(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// `src` を `dest` へ動かしたときに壊すものがあるか。無ければ `None`。
+pub fn clash_at(src: &Path, dest: &Path) -> Option<Clash> {
+    let dk = entry_kind(dest)?;
+    if same_entry(src, dest) {
+        return None; // 大文字小文字だけの違い等 = 自分自身
+    }
+    match (entry_kind(src), dk) {
+        (Some(EntryKind::Dir), EntryKind::Dir) => Some(Clash::Merge),
+        (_, EntryKind::Dir) => Some(Clash::Mismatch { dest_is_dir: true }),
+        (Some(EntryKind::Dir), _) => Some(Clash::Mismatch { dest_is_dir: false }),
+        _ => Some(Clash::Overwrite),
+    }
+}
+
+/// 既存があったときの振る舞い。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Numbering {
+    /// `x copy.txt` へ自動採番する (⌘C→⌘V / 同じフォルダへの複製)。
+    /// 既存を壊さないので確認は要らない。
+    Auto,
+    /// 既存があれば [`Clash`] として返し、確認は呼び出し側に任せる
+    /// (D&D / 切り取り貼り付け)。
+    Ask,
+}
+
+/// 移動/コピー 1 件の実行計画。**この構造体を作るだけでは fs は変わらない**。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TransferItem {
+    pub src: PathBuf,
+    pub dest: PathBuf,
+    pub kind: Transfer,
+    /// 実行すると壊れるものがあるか。`Some` なら確認を取ってからでないと
+    /// 実行してはいけない。
+    pub clash: Option<Clash>,
+}
+
+/// 移動/コピー 1 件の計画を立てる。`Ok(None)` は何もしない
+/// (同じ場所への移動など)。エラーはそのままユーザーへ見せるメッセージ。
+pub fn transfer_plan(
     src: &Path,
-    cut: bool,
     dest_dir: &Path,
-) -> Result<Option<(PathBuf, Transfer)>, String> {
-    if !src.exists() {
-        return Err(tr("貼り付け元が見つかりません"));
-    }
-    let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
-        return Err(tr("貼り付け元が見つかりません"));
+    kind: Transfer,
+    numbering: Numbering,
+) -> Result<Option<TransferItem>, String> {
+    let Some(sk) = entry_kind(src) else {
+        return Err(tr("移動元が見つかりません"));
     };
-    if src.is_dir() && dest_dir.starts_with(src) {
-        return Err(tr("フォルダを自身の中へは貼り付けできません"));
+    let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
+        return Err(tr("移動元が見つかりません"));
+    };
+    // 自分自身 / 自分の配下へは入れられない (無限再帰になる)
+    if sk == EntryKind::Dir && dest_dir.starts_with(src) {
+        return Err(tr("フォルダを自身の中へは移動できません"));
     }
-    if cut {
-        if src.parent() == Some(dest_dir) {
-            return Ok(None); // 同じ場所への移動は VS Code 同様なにもしない
-        }
-        let dest = dest_dir.join(&name);
-        if dest.exists() {
-            return Err(trf("既に存在します: {path}", &[("path", name)]));
-        }
-        return Ok(Some((dest, Transfer::Move)));
+    let same_dir = src.parent() == Some(dest_dir);
+    if same_dir && kind == Transfer::Move {
+        return Ok(None); // 同じ場所への移動は VS Code 同様なにもしない
     }
-    Ok(Some((
-        next_paste_path(dest_dir, &name, src.is_dir()),
-        Transfer::Copy,
-    )))
+    // 同じフォルダへのコピーは「複製」ジェスチャなので必ず採番する
+    let numbering = if same_dir { Numbering::Auto } else { numbering };
+    let (dest, clash) = match numbering {
+        Numbering::Auto => (next_paste_path(dest_dir, &name, sk == EntryKind::Dir), None),
+        Numbering::Ask => {
+            let d = dest_dir.join(&name);
+            let c = clash_at(src, &d);
+            (d, c)
+        }
+    };
+    Ok(Some(TransferItem {
+        src: src.to_path_buf(),
+        dest,
+        kind,
+        clash,
+    }))
+}
+
+/// フォルダ同士のマージを「1 ファイル 1 件」の計画へ展開する。
+///
+/// VS Code と同じく、フォルダの衝突は上書きではなく**中身のマージ**なので、
+/// 実際に上書きが起きるのは中の個々のファイルだけ。ここで 1 件ずつ
+/// [`Clash`] を載せておくと、呼び出し側が「すべてに適用」でまとめて答えられる。
+/// **fs は一切変更しない。**
+pub fn expand_merge(
+    src_dir: &Path,
+    dest_dir: &Path,
+    kind: Transfer,
+) -> Result<Vec<TransferItem>, String> {
+    let mut out = Vec::new();
+    walk_merge(src_dir, dest_dir, kind, 0, &mut out)?;
+    Ok(out)
+}
+
+fn walk_merge(
+    src_dir: &Path,
+    dest_dir: &Path,
+    kind: Transfer,
+    depth: usize,
+    out: &mut Vec<TransferItem>,
+) -> Result<(), String> {
+    if depth > 64 {
+        return Err(tr("フォルダが深すぎます (>64)"));
+    }
+    let rd = std::fs::read_dir(src_dir)
+        .map_err(|e| trf("読み取れません: {e}", &[("e", e.to_string())]))?;
+    let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    // 並びをファイルシステム依存にしない (確認の順序を決定的にする)
+    entries.sort();
+    for src in entries {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dest = dest_dir.join(name);
+        // リンクは辿らない (辿ると循環・意図しない大量コピーの危険)
+        if entry_kind(&src) == Some(EntryKind::Dir) && entry_kind(&dest) == Some(EntryKind::Dir) {
+            walk_merge(&src, &dest, kind, depth + 1, out)?;
+            continue;
+        }
+        out.push(TransferItem {
+            clash: clash_at(&src, &dest),
+            src,
+            dest,
+            kind,
+        });
+    }
+    Ok(())
+}
+
+/// マージ完了後の後始末。
+///
+/// 中身を 1 件ずつ動かしただけでは**空フォルダが移動先に生まれない**ので、
+/// ここで `src_dir` 側の階層をなぞって移動先に作り直す。
+///
+/// `remove_src` が true (移動) のときは、空になった元フォルダを畳む。
+/// **中身が残っているフォルダ (= 衝突をスキップした) は消さない** —
+/// `remove_dir` は中身があれば必ず失敗するので、構造的にそうなる。
+/// コピーでは false を渡す (元は 1 つも触らない)。
+pub fn prune_merged_dirs(src_dir: &Path, dest_dir: &Path, remove_src: bool) {
+    prune_inner(src_dir, dest_dir, remove_src, 0);
+}
+
+fn prune_inner(src_dir: &Path, dest_dir: &Path, remove_src: bool, depth: usize) {
+    if depth > 64 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(src_dir) else {
+        return;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        let sp = e.path();
+        if entry_kind(&sp) != Some(EntryKind::Dir) {
+            continue;
+        }
+        let Some(name) = sp.file_name() else { continue };
+        prune_inner(&sp, &dest_dir.join(name), remove_src, depth + 1);
+    }
+    // 階層は必ず作り直す (空フォルダを失わない)
+    let _ = std::fs::create_dir_all(dest_dir);
+    if remove_src {
+        // 空になったものだけ畳む (remove_dir は中身があれば必ず失敗する = 安全)
+        let _ = std::fs::remove_dir(src_dir);
+    }
 }
 
 /// VS Code の `explorer.incrementalNaming = "simple"` 準拠の重複回避:
@@ -1900,6 +2398,412 @@ pub fn icon_for(name: &str) -> &'static str {
         "lock" => "🔒",
         "sh" | "bash" | "zsh" | "fish" => "💲",
         _ => "📄",
+    }
+}
+
+// ─── ファイル操作の取り消し履歴 ───────────────────────────────
+
+/// ファイル操作の取り消し履歴 1 件。
+///
+/// **エディタ本文の取り消し (`crate::editor::History`) とは完全に別物。**
+/// 混ぜると「本文で ⌘Z したらファイルが移動した」という最悪の事故になるので、
+/// 型も履歴もフォーカスの条件も分けてある。
+/// **完全削除は復元できないので、そもそもここへ積まない。**
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum FileOp {
+    /// 名前の変更 (旧, 新)。
+    Rename { from: PathBuf, to: PathBuf },
+    /// 移動 (元, 先) の並び。1 回の D&D / 貼り付けをまとめて 1 手で戻す。
+    Move {
+        pairs: Vec<(PathBuf, PathBuf)>,
+        /// フォルダ統合として展開したときの (元, 先)。戻すときに畳む。
+        merge_root: Option<(PathBuf, PathBuf)>,
+    },
+    /// 新規作成 / 貼り付けで増えたもの。取り消しは**ゴミ箱経由**で消す。
+    Create { path: PathBuf, is_dir: bool },
+    /// ゴミ箱へ送ったもの (元の場所, ゴミ箱の中の実体) の並び。
+    /// 複数選択の削除をまとめて 1 手で戻す。
+    Trash { items: Vec<(PathBuf, PathBuf)> },
+}
+
+impl FileOp {
+    /// メニューに出す表示名 (「元に戻す: ○○」の ○○)。
+    pub fn label(&self) -> String {
+        match self {
+            FileOp::Rename { .. } => tr("名前の変更"),
+            FileOp::Move { .. } => tr("移動"),
+            FileOp::Create { is_dir: true, .. } => tr("フォルダの作成"),
+            FileOp::Create { is_dir: false, .. } => tr("ファイルの作成"),
+            FileOp::Trash { .. } => tr("ゴミ箱へ移動"),
+        }
+    }
+}
+
+/// ファイル操作の取り消し履歴 (エディタ本文の履歴とは別の入れ物)。
+#[derive(Default)]
+pub struct FileHistory {
+    ops: Vec<FileOp>,
+}
+
+impl FileHistory {
+    /// 保持する手数の上限。増え続けさせない。
+    pub const MAX: usize = 64;
+
+    pub fn push(&mut self, op: FileOp) {
+        self.ops.push(op);
+        if self.ops.len() > Self::MAX {
+            self.ops.remove(0);
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<FileOp> {
+        self.ops.pop()
+    }
+
+    /// 直近の操作の表示名。`None` = 履歴が空。
+    pub fn hint(&self) -> Option<String> {
+        self.ops.last().map(FileOp::label)
+    }
+}
+
+/// 確認キューの 1 件を「実行してよいか」の判定 (純粋関数)。
+///
+/// - `None` を返したら**ユーザーに聞かなければならない** — ここが
+///   「確認を経ずに壊さない」の要。
+/// - 衝突が無い項目は常に実行してよい (聞かない)。
+/// - 「すべてに適用」(`apply_all`) が決まっていれば残り全部に効く。
+///   決まっていなければ「いま答えた 1 件ぶん」(`answer`) だけを使う。
+pub fn queue_answer(
+    clash: Option<Clash>,
+    answer: Option<bool>,
+    apply_all: Option<bool>,
+) -> Option<bool> {
+    match clash {
+        None => Some(true),
+        Some(_) => answer.or(apply_all),
+    }
+}
+
+/// ドロップ先がツリーから見えなくなるときの注意文 (純粋関数)。
+///
+/// **「落とした先が画面から消える」を黙って起こさない**ためだけのもので、
+/// ドロップ自体は止めない (行はどちらの場合も本物のツリーの行なので、
+/// 落とし先が曖昧になることはない)。
+pub fn drop_visibility_notice(
+    dest_name: &str,
+    dest_ignored: bool,
+    filtering: bool,
+) -> Option<String> {
+    match (dest_ignored, filtering) {
+        (true, _) => Some(trf(
+            "移動先の「{name}」は .gitignore の対象です (ツリーに出ないことがあります)",
+            &[("name", dest_name.to_string())],
+        )),
+        (false, true) => Some(trf(
+            "絞り込み中です: 移動先「{name}」の中身は条件に合うものだけが出ます",
+            &[("name", dest_name.to_string())],
+        )),
+        (false, false) => None,
+    }
+}
+
+/// 取り消しのための移動。
+///
+/// **対象が消えている / 戻り先が既に塞がっているときは、何もせず失敗する。**
+/// 取り消しが新しい破壊 (上書き) を生まないための一番大事な性質で、
+/// ここを緩めると「⌘Z したら別のファイルが消えた」になる。
+pub fn move_back(from: &Path, to: &Path) -> Result<(), String> {
+    if entry_kind(from).is_none() {
+        return Err(trf(
+            "取り消せません: {name} が見つかりません",
+            &[("name", label_of(from))],
+        ));
+    }
+    if entry_kind(to).is_some() {
+        return Err(trf(
+            "取り消せません: {name} が既にあります",
+            &[("name", label_of(to))],
+        ));
+    }
+    if let Some(d) = to.parent() {
+        std::fs::create_dir_all(d)
+            .map_err(|e| trf("取り消せません: {e}", &[("e", e.to_string())]))?;
+    }
+    std::fs::rename(from, to).map_err(|e| trf("取り消せません: {e}", &[("e", e.to_string())]))
+}
+
+/// 表示用のファイル名 (取れなければフルパス)。
+pub fn label_of(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+/// OS のゴミ箱へ送る (VS Code の `files.enableTrash` 相当)。
+///
+/// ## 方針
+/// - **3 OS ぶん全部を実装する。** 外部コマンド (`osascript` / `gio` / `trash-put`)
+///   には一切頼らない — 入っていない環境で黙って壊れるため。
+/// - **失敗したら完全削除へ落ちない。** 理由を文字列で返して止める。
+///   「ゴミ箱へ入れたつもりが消えていた」を構造的に起こさない。
+/// - 戻り先が分かる OS では**ゴミ箱の中の実体パス**を返す。ファイル操作の
+///   取り消し (⌘Z) はこれを使って元の場所へ戻す。
+///
+/// ## OS ごとの実体
+/// - **macOS**: `~/.Trash`。Finder がそのまま「ゴミ箱」として見せる場所。
+///   (Finder の「戻す」に要るメタデータは書かないので、戻すのはアプリ側の ⌘Z か
+///   ゴミ箱からのドラッグになる)
+/// - **Linux / その他 Unix**: freedesktop.org Trash 仕様。
+///   `$XDG_DATA_HOME/Trash/{files,info}` (既定 `~/.local/share/Trash`)。
+///   `.trashinfo` を書くので、どのファイルマネージャからでも「元に戻す」が効く。
+/// - **Windows**: `SHFileOperationW(FO_DELETE | FOF_ALLOWUNDO)` = 本物のごみ箱。
+///   ごみ箱の中のパスは API から返らないため、取り消しでは戻せない (`Ok(None)`)。
+pub mod trash {
+    use crate::i18n::{tr, trf};
+    use std::ffi::{OsStr, OsString};
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    /// ゴミ箱へ「移す」形の OS (macOS / Unix) 用の実行計画。
+    ///
+    /// **これを組み立てるだけでは fs は 1 バイトも変わらない。**
+    /// テストはこの純粋関数だけを検証するので、実行するユーザーの
+    /// ゴミ箱には何も入らない。
+    #[cfg(any(unix, test))]
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    pub struct MovePlan {
+        /// 実体を置くディレクトリ (`~/.Trash` または `<trash>/files`)。
+        pub files_dir: PathBuf,
+        /// 置くときの名前 (既存とぶつかるなら `.2` `.3` … を足したもの)。
+        pub file_name: OsString,
+        /// freedesktop の `.trashinfo` (書き出し先, 中身)。macOS では `None`。
+        pub info: Option<(PathBuf, String)>,
+    }
+
+    /// ゴミ箱の中で使える名前を選ぶ。`taken` は「そこに何かあるか」を返す述語で、
+    /// テストからは fs を触らないダミーを渡せる。
+    #[cfg(any(unix, test))]
+    fn unique_name(
+        dir: &Path,
+        base: &OsStr,
+        now: SystemTime,
+        taken: &dyn Fn(&Path) -> bool,
+    ) -> OsString {
+        if !taken(&dir.join(base)) {
+            return base.to_os_string();
+        }
+        for n in 2..=9999u32 {
+            let mut c = base.to_os_string();
+            c.push(format!(".{n}"));
+            if !taken(&dir.join(&c)) {
+                return c;
+            }
+        }
+        // 9999 まで埋まっている異常時だけ時刻を混ぜる (実質起きない)
+        let nanos = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let mut c = base.to_os_string();
+        c.push(format!(".{nanos}"));
+        c
+    }
+
+    /// freedesktop の `Path=` 用パーセントエンコード。
+    /// 予約されていない文字と `/` はそのまま、それ以外を `%XX` にする。
+    #[cfg(any(unix, test))]
+    pub fn pct_encode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.as_bytes() {
+            let c = *b as char;
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '/') {
+                out.push(c);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
+    /// `YYYY-MM-DDThh:mm:ss` (UTC)。chrono を足さずに済ませるための最小実装。
+    /// 仕様上はローカル時刻だが、ずれるのは表示される削除日時だけで
+    /// 復元には影響しない。
+    #[cfg(any(unix, test))]
+    pub fn iso8601_utc(unix_secs: i64) -> String {
+        let days = unix_secs.div_euclid(86_400);
+        let rem = unix_secs.rem_euclid(86_400);
+        let (y, m, d) = civil_from_days(days);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}",
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        )
+    }
+
+    /// 1970-01-01 からの日数 → (年, 月, 日)。Howard Hinnant の civil_from_days。
+    #[cfg(any(unix, test))]
+    fn civil_from_days(z: i64) -> (i64, u32, u32) {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+        (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
+    /// ゴミ箱へ移す計画を立てる (fs は触らない)。
+    ///
+    /// `home` / `data` は `dirs` から渡す — **場所を直書きしない**ので、
+    /// どのユーザー名でも `$XDG_DATA_HOME` を変えた環境でも動く。
+    /// テストからは一時ディレクトリを渡せるので、実ゴミ箱には触れない。
+    #[cfg(any(unix, test))]
+    pub fn move_plan(
+        path: &Path,
+        home: Option<&Path>,
+        data: Option<&Path>,
+        now: SystemTime,
+        taken: &dyn Fn(&Path) -> bool,
+    ) -> Result<MovePlan, String> {
+        let Some(base) = path.file_name() else {
+            return Err(tr("削除できません: 名前が取れません"));
+        };
+        if cfg!(target_os = "macos") {
+            let Some(home) = home else {
+                return Err(tr("ホームディレクトリが分からないためゴミ箱を使えません"));
+            };
+            let files_dir = home.join(".Trash");
+            let file_name = unique_name(&files_dir, base, now, taken);
+            return Ok(MovePlan {
+                files_dir,
+                file_name,
+                info: None,
+            });
+        }
+        let Some(data) = data else {
+            return Err(tr("データディレクトリが分からないためゴミ箱を使えません"));
+        };
+        let root = data.join("Trash");
+        let files_dir = root.join("files");
+        let file_name = unique_name(&files_dir, base, now, taken);
+        let secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut info_name = file_name.clone();
+        info_name.push(".trashinfo");
+        let body = format!(
+            "[Trash Info]\nPath={}\nDeletionDate={}\n",
+            pct_encode(&path.to_string_lossy()),
+            iso8601_utc(secs)
+        );
+        Ok(MovePlan {
+            files_dir,
+            file_name,
+            info: Some((root.join("info").join(info_name), body)),
+        })
+    }
+
+    /// Windows のごみ箱 API へ渡す引数を組み立てる (呼び出しはしない)。
+    ///
+    /// `pFrom` は**二重 NUL 終端**のワイド文字列でなければならない
+    /// (1 個しか付けないと隣のメモリまで対象として読まれる)。
+    /// フラグは「確認ダイアログもエラー UI も出さず、元に戻せる形で削除」。
+    /// 確認はアプリ側で既に取っているので OS 側では出さない。
+    #[cfg(any(windows, test))]
+    pub fn windows_delete_args(path: &Path) -> (Vec<u16>, u16) {
+        // FOF_ALLOWUNDO(0x40) | FOF_NOCONFIRMATION(0x10) | FOF_SILENT(0x4)
+        // | FOF_NOERRORUI(0x400) | FOF_WANTNUKEWARNING(0x4000)
+        // WANTNUKEWARNING は「ごみ箱に入らず完全に消える」ときだけ OS に
+        // 警告を出させるためのもの (黙って消えるのを防ぐ)。
+        const FLAGS: u16 = 0x0040 | 0x0010 | 0x0004 | 0x0400 | 0x4000;
+        let mut from: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+        from.push(0);
+        from.push(0);
+        (from, FLAGS)
+    }
+
+    /// `path` を OS のゴミ箱へ送る。
+    ///
+    /// `Ok(Some(p))` = ゴミ箱の中の実体 (取り消しで戻せる)。
+    /// `Ok(None)`    = 送れたが戻り先が分からない (Windows のごみ箱)。
+    /// `Err(msg)`    = 送れなかった。**このとき対象は消えていない。**
+    #[cfg(unix)]
+    pub fn send(path: &Path) -> Result<Option<PathBuf>, String> {
+        let home = dirs::home_dir();
+        let data = dirs::data_dir();
+        let now = SystemTime::now();
+        let plan = move_plan(path, home.as_deref(), data.as_deref(), now, &|p| {
+            std::fs::symlink_metadata(p).is_ok()
+        })?;
+        std::fs::create_dir_all(&plan.files_dir)
+            .map_err(|e| trf("ゴミ箱を用意できません: {e}", &[("e", e.to_string())]))?;
+        if let Some((info_path, body)) = &plan.info {
+            if let Some(d) = info_path.parent() {
+                std::fs::create_dir_all(d)
+                    .map_err(|e| trf("ゴミ箱を用意できません: {e}", &[("e", e.to_string())]))?;
+            }
+            std::fs::write(info_path, body)
+                .map_err(|e| trf("ゴミ箱を用意できません: {e}", &[("e", e.to_string())]))?;
+        }
+        let dest = plan.files_dir.join(&plan.file_name);
+        match std::fs::rename(path, &dest) {
+            Ok(()) => Ok(Some(dest)),
+            Err(e) => {
+                // 予約した .trashinfo を残さない (幽霊エントリになる)
+                if let Some((info_path, _)) = &plan.info {
+                    let _ = std::fs::remove_file(info_path);
+                }
+                if e.raw_os_error() == Some(libc::EXDEV) {
+                    // 別ボリューム。仕様上は <ボリューム>/.Trash-$uid だが、
+                    // 場所を推測して書くより「消さずに理由を出す」方を選ぶ。
+                    Err(tr(
+                        "別のボリュームにあるためゴミ箱へ送れません (完全に削除するなら Shift を押しながら削除してください)",
+                    ))
+                } else {
+                    Err(trf("ゴミ箱へ送れません: {e}", &[("e", e.to_string())]))
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn send(path: &Path) -> Result<Option<PathBuf>, String> {
+        use windows_sys::Win32::UI::Shell::{SHFileOperationW, FO_DELETE, SHFILEOPSTRUCTW};
+        if std::fs::symlink_metadata(path).is_err() {
+            return Err(tr("削除できません: 見つかりません"));
+        }
+        let (from, flags) = windows_delete_args(path);
+        // SAFETY: op は zeroed で埋めてから必要な項目だけ設定する。
+        // pFrom は `from` を指し、`from` は呼び出しの間ずっと生きている。
+        let rc = unsafe {
+            let mut op: SHFILEOPSTRUCTW = std::mem::zeroed();
+            op.wFunc = FO_DELETE;
+            op.pFrom = from.as_ptr();
+            op.fFlags = flags;
+            let rc = SHFileOperationW(&mut op);
+            if rc == 0 && op.fAnyOperationsAborted != 0 {
+                return Err(tr("ゴミ箱への移動が中止されました"));
+            }
+            rc
+        };
+        if rc != 0 {
+            return Err(trf(
+                "ゴミ箱へ送れません (コード {code})",
+                &[("code", rc.to_string())],
+            ));
+        }
+        // ごみ箱の中のパスは API から返らないため、取り消しでは戻せない
+        Ok(None)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub fn send(_path: &Path) -> Result<Option<PathBuf>, String> {
+        Err(tr("この環境ではゴミ箱を使えません"))
     }
 }
 
@@ -2397,29 +3301,770 @@ mod tests {
     }
 
     #[test]
-    fn paste_plan_rules() {
-        let dir = unique_temp_dir("zaivern-tree-test", "paste-plan");
+    fn transfer_plan_rules() {
+        let dir = unique_temp_dir("zaivern-tree-test", "transfer-plan");
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).expect("mkdir");
         let file = dir.join("f.txt");
         std::fs::write(&file, "x").expect("write");
 
-        // コピー: 同じフォルダへは "f copy.txt" が生える
-        let plan = paste_plan(&file, false, &dir).expect("plan");
-        assert_eq!(plan, Some((dir.join("f copy.txt"), Transfer::Copy)));
-        // 切り取り: 同じフォルダへは何もしない
-        assert_eq!(paste_plan(&file, true, &dir).expect("plan"), None);
-        // 切り取り: 別フォルダへは移動
+        // コピー: 同じフォルダへは "f copy.txt" が生える (衝突しないので確認不要)
+        let plan = transfer_plan(&file, &dir, Transfer::Copy, Numbering::Auto)
+            .expect("plan")
+            .expect("some");
+        assert_eq!(plan.dest, dir.join("f copy.txt"));
+        assert_eq!(plan.clash, None);
+        // 同じフォルダへのコピーは Ask を渡しても採番になる (複製ジェスチャ)
+        let plan = transfer_plan(&file, &dir, Transfer::Copy, Numbering::Ask)
+            .expect("plan")
+            .expect("some");
+        assert_eq!(plan.dest, dir.join("f copy.txt"));
+        assert_eq!(plan.clash, None);
+        // 移動: 同じフォルダへは何もしない
         assert_eq!(
-            paste_plan(&file, true, &sub).expect("plan"),
-            Some((sub.join("f.txt"), Transfer::Move))
+            transfer_plan(&file, &dir, Transfer::Move, Numbering::Ask).expect("plan"),
+            None
         );
-        // フォルダを自分の中へは貼り付けない
-        assert!(paste_plan(&dir, false, &sub).is_err());
+        // 移動: 別フォルダへは衝突なしで移動
+        let plan = transfer_plan(&file, &sub, Transfer::Move, Numbering::Ask)
+            .expect("plan")
+            .expect("some");
+        assert_eq!(plan.dest, sub.join("f.txt"));
+        assert_eq!(plan.clash, None);
+        assert_eq!(plan.kind, Transfer::Move);
+        // フォルダを自分の中へは入れられない
+        assert!(transfer_plan(&dir, &sub, Transfer::Copy, Numbering::Ask).is_err());
+        assert!(transfer_plan(&dir, &dir, Transfer::Move, Numbering::Ask).is_err());
         // 消えたソースはエラー
-        assert!(paste_plan(&dir.join("gone.txt"), false, &sub).is_err());
+        assert!(
+            transfer_plan(&dir.join("gone.txt"), &sub, Transfer::Copy, Numbering::Ask).is_err()
+        );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── 同名衝突の検出 ─────────────────────────────────────────
+
+    #[test]
+    fn 衝突検出は同名だけを拾い大文字小文字違いは拾わない() {
+        let dir = unique_temp_dir("zaivern-tree-test", "clash-case");
+        let lower = dir.join("a.txt");
+        let upper = dir.join("A.txt");
+        std::fs::write(&lower, "x").expect("write");
+
+        // 同名が無い → 衝突なし
+        assert_eq!(clash_at(&lower, &dir.join("b.txt")), None);
+
+        // 同名がある → 上書きの衝突
+        let other = dir.join("b.txt");
+        std::fs::write(&other, "y").expect("write");
+        assert_eq!(clash_at(&other, &lower), Some(Clash::Overwrite));
+
+        // 大文字小文字だけが違う名前。
+        // cfg! ではなく実測で分岐する: macOS には大小を区別する APFS ボリューム
+        // が作れるし、Linux でも大小無視の FS をマウントできるため、
+        // 「mac/Windows なら必ず case-insensitive」は成り立たない。
+        let insensitive = upper.exists();
+        if insensitive {
+            // macOS / Windows の既定。exists() は真になるが、同じ実体なので
+            // 衝突ではない (ここを衝突とすると case-only rename が永久にできない)
+            assert!(
+                same_entry(&lower, &upper),
+                "大小違いの綴りは同じ実体として畳まれる"
+            );
+        } else {
+            // Linux 等の case-sensitive: そもそも存在しない
+            assert!(!upper.exists());
+        }
+        assert_eq!(
+            clash_at(&lower, &upper),
+            None,
+            "a.txt → A.txt は大小どちらの FS でも衝突ではない"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 衝突検出はフォルダ同士とファイルフォルダ違いを区別する() {
+        let dir = unique_temp_dir("zaivern-tree-test", "clash-kind");
+        let src_dir = dir.join("src").join("shared");
+        let dst_dir = dir.join("dst").join("shared");
+        std::fs::create_dir_all(&src_dir).expect("mkdir");
+        std::fs::create_dir_all(&dst_dir).expect("mkdir");
+        // フォルダ同士 → マージ (上書きではない)
+        assert_eq!(clash_at(&src_dir, &dst_dir), Some(Clash::Merge));
+
+        // ファイル → フォルダ (フォルダが中身ごと消える)
+        let f = dir.join("src").join("thing");
+        std::fs::write(&f, "x").expect("write");
+        assert_eq!(
+            clash_at(&f, &dst_dir),
+            Some(Clash::Mismatch { dest_is_dir: true })
+        );
+        // フォルダ → ファイル
+        let g = dir.join("dst").join("thing");
+        std::fs::write(&g, "y").expect("write");
+        assert_eq!(
+            clash_at(&src_dir, &g),
+            Some(Clash::Mismatch { dest_is_dir: false })
+        );
+        // ファイル → ファイル
+        assert_eq!(clash_at(&f, &g), Some(Clash::Overwrite));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 衝突検出はシンボリックリンクも既存として数える() {
+        let dir = unique_temp_dir("zaivern-tree-test", "clash-link");
+        let real = dir.join("real.txt");
+        std::fs::write(&real, "x").expect("write");
+        let src = dir.join("src.txt");
+        std::fs::write(&src, "y").expect("write");
+        let link = dir.join("link.txt");
+        let broken = dir.join("broken.txt");
+
+        #[cfg(unix)]
+        let made = {
+            std::os::unix::fs::symlink(&real, &link).expect("symlink");
+            // 壊れたリンク: exists() は false でも rename は黙って潰す
+            std::os::unix::fs::symlink(dir.join("nope"), &broken).expect("symlink");
+            true
+        };
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&real, &link).is_ok()
+            && std::os::windows::fs::symlink_file(dir.join("nope"), &broken).is_ok();
+
+        if made {
+            assert_eq!(
+                clash_at(&src, &link),
+                Some(Clash::Overwrite),
+                "リンクは辿らず、リンク自身が既存として衝突する"
+            );
+            assert!(!broken.exists(), "壊れたリンクは exists() では見えない");
+            assert_eq!(
+                clash_at(&src, &broken),
+                Some(Clash::Overwrite),
+                "壊れたリンクも既存として数える (rename が黙って潰すため)"
+            );
+        } else {
+            // Windows で開発者モードが無いとリンクを作れない。その環境では
+            // 「リンクを作れないので試験対象が無い」だけで、判定式は同じ。
+            assert_eq!(clash_at(&src, &real), Some(Clash::Overwrite));
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn パス区切りは環境をまたいで同じ計画になる() {
+        let dir = unique_temp_dir("zaivern-tree-test", "sep");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").expect("write");
+
+        // OS の区切り文字で文字列から組んだ宛先でも、join で組んだものと同じ計画
+        let sep = if cfg!(windows) { "\\" } else { "/" };
+        let dest_dir = PathBuf::from(format!("{}{}sub", dir.display(), sep));
+        let plan = transfer_plan(&file, &dest_dir, Transfer::Move, Numbering::Ask)
+            .expect("plan")
+            .expect("some");
+        assert_eq!(plan.dest, sub.join("f.txt"));
+
+        if cfg!(windows) {
+            // Windows は '/' も区切りとして受け付ける
+            let alt = PathBuf::from(format!("{}/sub", dir.display()));
+            let p2 = transfer_plan(&file, &alt, Transfer::Move, Numbering::Ask)
+                .expect("plan")
+                .expect("some");
+            assert_eq!(p2.dest.file_name(), Some(std::ffi::OsStr::new("f.txt")));
+            assert!(p2.dest.parent().is_some_and(|d| d.ends_with("sub")));
+        } else {
+            // Unix では '\\' はただの文字。フォルダの区切りにはならない
+            assert_eq!(
+                Path::new("a\\b").file_name(),
+                Some(std::ffi::OsStr::new("a\\b")),
+                "Unix では逆スラッシュは名前の一部"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── 自動採番 ───────────────────────────────────────────────
+
+    #[test]
+    fn 自動採番は多重拡張子と連番を守る() {
+        let dir = unique_temp_dir("zaivern-tree-test", "numbering");
+        // 拡張子なし
+        std::fs::write(dir.join("a"), "x").expect("write");
+        assert_eq!(next_paste_path(&dir, "a", false), dir.join("a copy"));
+        // 単一拡張子
+        std::fs::write(dir.join("a.txt"), "x").expect("write");
+        assert_eq!(
+            next_paste_path(&dir, "a.txt", false),
+            dir.join("a copy.txt")
+        );
+        // 多重拡張子: VS Code と同じく**最後のドットだけ**を拡張子とみなす
+        std::fs::write(dir.join("a.tar.gz"), "x").expect("write");
+        assert_eq!(
+            next_paste_path(&dir, "a.tar.gz", false),
+            dir.join("a.tar copy.gz")
+        );
+        // "a copy.txt" が既にある → "a copy 2.txt"
+        std::fs::write(dir.join("a copy.txt"), "x").expect("write");
+        assert_eq!(
+            next_paste_path(&dir, "a.txt", false),
+            dir.join("a copy 2.txt")
+        );
+        // 2 まである → 3
+        std::fs::write(dir.join("a copy 2.txt"), "x").expect("write");
+        assert_eq!(
+            next_paste_path(&dir, "a.txt", false),
+            dir.join("a copy 3.txt")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 自動採番は_999_まで埋まっていても続く() {
+        let dir = unique_temp_dir("zaivern-tree-test", "numbering-999");
+        std::fs::write(dir.join("a.txt"), "x").expect("write");
+        std::fs::write(dir.join("a copy.txt"), "x").expect("write");
+        for n in 2..=999u32 {
+            std::fs::write(dir.join(format!("a copy {n}.txt")), "x").expect("write");
+        }
+        assert_eq!(
+            next_paste_path(&dir, "a.txt", false),
+            dir.join("a copy 1000.txt"),
+            "3 桁で止まらない (桁上がりを文字列比較でやっていない)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── フォルダの統合 ─────────────────────────────────────────
+
+    #[test]
+    fn フォルダの統合は中身を一件ずつの計画へ展開する() {
+        let dir = unique_temp_dir("zaivern-tree-test", "merge");
+        let src = dir.join("src").join("shared");
+        let dst = dir.join("dst").join("shared");
+        std::fs::create_dir_all(src.join("deep")).expect("mkdir");
+        std::fs::create_dir_all(dst.join("deep")).expect("mkdir");
+        std::fs::write(src.join("both.txt"), "s").expect("write");
+        std::fs::write(dst.join("both.txt"), "d").expect("write");
+        std::fs::write(src.join("only-src.txt"), "s").expect("write");
+        std::fs::write(src.join("deep").join("x.txt"), "s").expect("write");
+        std::fs::write(dst.join("deep").join("x.txt"), "d").expect("write");
+
+        let items = expand_merge(&src, &dst, Transfer::Move).expect("expand");
+        let clashing: Vec<&TransferItem> = items.iter().filter(|i| i.clash.is_some()).collect();
+        assert_eq!(
+            clashing.len(),
+            2,
+            "重なるのは both.txt と deep/x.txt の 2 件"
+        );
+        assert!(items
+            .iter()
+            .any(|i| i.dest == dst.join("only-src.txt") && i.clash.is_none()));
+        assert!(
+            items
+                .iter()
+                .any(|i| i.dest == dst.join("deep").join("x.txt")
+                    && i.clash == Some(Clash::Overwrite))
+        );
+        // フォルダ自身は項目にならない (上書きではなくマージなので)
+        assert!(!items.iter().any(|i| i.src == src.join("deep")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 統合の後始末は空フォルダだけを畳む() {
+        let dir = unique_temp_dir("zaivern-tree-test", "prune");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(src.join("empty").join("nested")).expect("mkdir");
+        std::fs::create_dir_all(src.join("kept")).expect("mkdir");
+        std::fs::write(src.join("kept").join("stay.txt"), "x").expect("write");
+        std::fs::create_dir_all(&dst).expect("mkdir");
+
+        // コピー (remove_src=false): 階層だけ作り、元は 1 つも触らない
+        prune_merged_dirs(&src, &dst, false);
+        assert!(
+            dst.join("empty").join("nested").is_dir(),
+            "コピーでも空フォルダの階層は移動先へ作る"
+        );
+        assert!(src.join("empty").exists(), "コピーは元を消さない");
+
+        // 移動 (remove_src=true): 空になったものだけ畳む
+        prune_merged_dirs(&src, &dst, true);
+        assert!(!src.join("empty").exists(), "空フォルダは畳まれる");
+        assert!(
+            dst.join("empty").join("nested").is_dir(),
+            "階層は移動先に残る"
+        );
+        assert!(
+            src.join("kept").join("stay.txt").exists(),
+            "中身が残っているフォルダは絶対に消さない"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── ゴミ箱 (実ゴミ箱には一切触らない) ─────────────────────
+
+    #[test]
+    fn ゴミ箱の計画は実ゴミ箱に触れずに組み立てられる() {
+        // home / data は一時ディレクトリを注入する = 実 ~/.Trash には触らない。
+        // 「取られている名前」も注入した述語で答えるので fs も読まない。
+        let home = PathBuf::from("/zv-test-home");
+        let data = PathBuf::from("/zv-test-data");
+        let target = PathBuf::from("/zv-test-work/やった.txt");
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+        let none_taken = |_: &Path| false;
+        let plan =
+            trash::move_plan(&target, Some(&home), Some(&data), now, &none_taken).expect("plan");
+        if cfg!(target_os = "macos") {
+            assert_eq!(plan.files_dir, home.join(".Trash"));
+            assert!(
+                plan.info.is_none(),
+                "macOS の ~/.Trash に .trashinfo は無い"
+            );
+        } else {
+            assert_eq!(plan.files_dir, data.join("Trash").join("files"));
+            let (info_path, body) = plan.info.as_ref().expect("freedesktop は info を書く");
+            assert_eq!(
+                info_path,
+                &data.join("Trash").join("info").join("やった.txt.trashinfo")
+            );
+            assert!(body.starts_with("[Trash Info]\n"));
+            assert!(
+                body.contains("Path=/zv-test-work/%E3%82%84%E3%81%A3%E3%81%9F.txt"),
+                "元のパスは percent-encode されて入る: {body}"
+            );
+            assert!(body.contains("DeletionDate=2023-11-14T22:13:20"));
+        }
+        assert_eq!(plan.file_name, std::ffi::OsString::from("やった.txt"));
+
+        // 同名が埋まっていたら .2 .3 と避ける
+        let taken = |p: &Path| {
+            let n = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            n == "やった.txt" || n == "やった.txt.2"
+        };
+        let plan = trash::move_plan(&target, Some(&home), Some(&data), now, &taken).expect("plan");
+        assert_eq!(plan.file_name, std::ffi::OsString::from("やった.txt.3"));
+
+        // home / data が取れない環境では**消さずに理由を返す**
+        assert!(trash::move_plan(&target, None, None, now, &none_taken).is_err());
+    }
+
+    #[test]
+    fn ゴミ箱の日付とエンコードは仕様どおり() {
+        assert_eq!(trash::iso8601_utc(0), "1970-01-01T00:00:00");
+        assert_eq!(trash::iso8601_utc(951_782_400), "2000-02-29T00:00:00");
+        assert_eq!(trash::iso8601_utc(1_700_000_000), "2023-11-14T22:13:20");
+        assert_eq!(trash::pct_encode("/a b/c#d"), "/a%20b/c%23d");
+        assert_eq!(trash::pct_encode("/plain-_.~/x"), "/plain-_.~/x");
+    }
+
+    #[test]
+    fn ごみ箱を呼ぶ引数は二重ヌルで終わる() {
+        let (from, flags) = trash::windows_delete_args(Path::new("C:\\tmp\\a.txt"));
+        assert_eq!(
+            &from[from.len() - 2..],
+            &[0u16, 0u16],
+            "pFrom は二重 NUL 終端でないと隣のメモリまで対象になる"
+        );
+        let text: String = String::from_utf16(&from[..from.len() - 2]).expect("utf16");
+        assert_eq!(text, "C:\\tmp\\a.txt");
+        // FOF_ALLOWUNDO が無いと「ごみ箱へ入れたつもりが完全削除」になる
+        assert_eq!(flags & 0x0040, 0x0040, "FOF_ALLOWUNDO は必須");
+        assert_eq!(flags & 0x0010, 0x0010, "確認はアプリ側で済ませている");
+    }
+
+    // ─── 取り消し ───────────────────────────────────────────────
+
+    #[test]
+    fn 取り消しはリネームと移動とゴミ箱行きを戻す() {
+        let dir = unique_temp_dir("zaivern-tree-test", "undo");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "x").expect("write");
+
+        // リネーム → 取り消し
+        std::fs::rename(&a, &b).expect("rename");
+        assert!(move_back(&b, &a).is_ok());
+        assert!(a.exists() && !b.exists());
+
+        // 移動 → 取り消し
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let moved = sub.join("a.txt");
+        std::fs::rename(&a, &moved).expect("rename");
+        assert!(move_back(&moved, &a).is_ok());
+        assert!(a.exists() && !moved.exists());
+
+        // 削除(ゴミ箱行き) → 取り消し。ゴミ箱は一時ディレクトリで代用する
+        // (実ゴミ箱へは物を入れない)
+        let fake_trash = dir.join("trash-files");
+        std::fs::create_dir_all(&fake_trash).expect("mkdir");
+        let trashed = fake_trash.join("a.txt");
+        std::fs::rename(&a, &trashed).expect("rename");
+        assert!(move_back(&trashed, &a).is_ok());
+        assert!(a.exists() && !trashed.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 取り消しは対象が消えていても戻り先が塞がっていても壊さない() {
+        let dir = unique_temp_dir("zaivern-tree-test", "undo-fail");
+        let a = dir.join("a.txt");
+        let gone = dir.join("gone.txt");
+        std::fs::write(&a, "keep").expect("write");
+
+        // 戻す対象が消えている → 失敗するだけ
+        let e = move_back(&gone, &dir.join("x.txt")).expect_err("消えていれば失敗");
+        assert!(e.contains("見つかりません"), "{e}");
+        assert!(!dir.join("x.txt").exists());
+
+        // 戻り先が既に埋まっている → 上書きせずに失敗する (ここが一番大事)
+        let other = dir.join("other.txt");
+        std::fs::write(&other, "other").expect("write");
+        let e = move_back(&other, &a).expect_err("塞がっていれば失敗");
+        assert!(e.contains("既にあります"), "{e}");
+        assert_eq!(std::fs::read_to_string(&a).expect("read"), "keep");
+        assert_eq!(std::fs::read_to_string(&other).expect("read"), "other");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 履歴は上限で古いものから落ちる() {
+        let mut h = FileHistory::default();
+        assert_eq!(h.hint(), None);
+        for i in 0..FileHistory::MAX + 5 {
+            h.push(FileOp::Create {
+                path: PathBuf::from(format!("f{i}")),
+                is_dir: false,
+            });
+        }
+        h.push(FileOp::Rename {
+            from: PathBuf::from("a"),
+            to: PathBuf::from("b"),
+        });
+        assert_eq!(h.hint(), Some(tr("名前の変更")));
+        let mut n = 0;
+        while h.pop().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, FileHistory::MAX, "上限を超えて溜め込まない");
+    }
+
+    // ─── 構造検査 (ソースを読んで不変条件を固定する) ─────────────
+
+    /// ソースを「関数名 → その関数の本文(次の fn まで)」へ大雑把に切る。
+    /// CRLF を先に潰すのは Windows のチェックアウト対策。
+    fn split_fns(src: &str) -> Vec<(String, String)> {
+        let re = regex::Regex::new(
+            r"(?m)^\s*(?:pub(?:\([a-z()]+\))?\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)",
+        )
+        .expect("regex");
+        let mut marks: Vec<(usize, String)> = re
+            .captures_iter(src)
+            .map(|c| {
+                (
+                    c.get(0).expect("m").start(),
+                    c.get(1).expect("name").as_str().to_string(),
+                )
+            })
+            .collect();
+        marks.push((src.len(), String::new()));
+        marks
+            .windows(2)
+            .map(|w| (w[0].1.clone(), src[w[0].0..w[1].0].to_string()))
+            .collect()
+    }
+
+    /// `needle` を含む関数の名前 (重複除去・整列)。
+    fn owners(fns: &[(String, String)], needle: &str) -> Vec<String> {
+        let mut v: Vec<String> = fns
+            .iter()
+            .filter(|(_, b)| b.contains(needle))
+            .map(|(n, _)| n.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    fn body(fns: &[(String, String)], name: &str) -> String {
+        fns.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.clone())
+            .unwrap_or_else(|| panic!("{name} が見つからない"))
+    }
+
+    /// app.rs の非テスト部分だけを関数へ切る (テストは一時ディレクトリを
+    /// 掃除するために remove_dir_all を使うので対象外)。
+    fn app_fns() -> Vec<(String, String)> {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let cut = src.find("\n#[cfg(test)]\nmod ").unwrap_or(src.len());
+        split_fns(&src[..cut])
+    }
+
+    #[test]
+    fn 破壊的なファイル操作は確認を経ずに呼ばれない() {
+        let fns = app_fns();
+
+        // ① 復元できない fs 操作 (完全削除 / 置き換えのための退避) を持つ関数は
+        //    この 2 つだけ。増えたらここが落ちる = レビューを強制する。
+        let mut destructive = owners(&fns, "std::fs::remove_dir_all(");
+        destructive.extend(owners(&fns, "std::fs::remove_file("));
+        destructive.sort();
+        destructive.dedup();
+        assert_eq!(
+            destructive,
+            vec!["delete_permanently".to_string(), "replace_dest".to_string()],
+            "復元できない削除は delete_permanently / replace_dest の中だけに置くこと"
+        );
+
+        // ② その 2 つへ至る経路は 1 本ずつしかない
+        assert_eq!(
+            owners(&fns, "self.delete_permanently("),
+            vec!["perform_delete".to_string()],
+        );
+        assert_eq!(
+            owners(&fns, "self.perform_delete("),
+            vec!["delete_confirm_ui".to_string()],
+            "削除の実体は確認ダイアログからしか呼ばない"
+        );
+        assert_eq!(
+            owners(&fns, "self.replace_dest("),
+            vec!["run_transfer_item".to_string()],
+        );
+        assert_eq!(
+            owners(&fns, "self.run_transfer_item("),
+            vec!["drain_transfer".to_string()],
+        );
+        assert_eq!(
+            owners(&fns, "self.drain_transfer("),
+            vec!["transfer_confirm_ui".to_string()],
+        );
+
+        // ③ 削除の実体は「ユーザーが決めた」分岐の後ろにしか無い
+        let dc = body(&fns, "delete_confirm_ui");
+        let decided = dc.find("Some(true) =>").expect("決定の分岐がある");
+        let call = dc.find("self.perform_delete(").expect("呼び出しがある");
+        assert!(
+            decided < call,
+            "確認の答えを見る前に削除を実行している (デフォルトで消えてしまう)"
+        );
+
+        // ④ 上書きは衝突の答えを持つ項目でしか起きない
+        let rt = body(&fns, "run_transfer_item");
+        assert!(
+            rt.contains("if item.clash.is_some()"),
+            "衝突が無い項目で置き換え (削除) を走らせてはいけない"
+        );
+
+        // ⑤ 実行してよいかの判定は純粋関数 1 つに寄せる
+        //    (テストで固定した実装と、動いている実装を食い違わせない)
+        assert_eq!(
+            owners(&fns, "file_tree::queue_answer("),
+            vec!["drain_transfer".to_string()],
+        );
+
+        // ⑥ 完全削除は履歴へ積まない (積むと「戻せる」と嘘になる)。
+        //    「戻せるもの」と「戻せないもの」を関数の境界で分けてあるので、
+        //    完全削除側の関数に履歴が出てこないことだけ確かめればよい。
+        assert!(
+            !body(&fns, "delete_permanently").contains("push_file_op"),
+            "完全削除は取り消せないので履歴へ積まないこと"
+        );
+        // 履歴へ積むゴミ箱行きは、戻り先が分かる経路からしか来ない
+        assert_eq!(
+            owners(&fns, "FileOp::Trash {"),
+            vec!["perform_delete".to_string(), "revert_file_op".to_string()],
+        );
+    }
+
+    #[test]
+    fn 複数選択の一括移動は答えを一度だけ聞けば残り全部に効く() {
+        // 「すべてに適用」の実体は queue_answer。ここを通って初めて実行される
+        // ので、これが None を返すあいだは 1 バイトも動かない。
+        // 衝突なしは常に実行 (聞かない)
+        assert_eq!(queue_answer(None, None, None), Some(true));
+        // 衝突あり + 未回答 → 必ず聞く
+        assert_eq!(queue_answer(Some(Clash::Overwrite), None, None), None);
+        // 「すべてに適用」が決まっていれば残り全部に効く
+        assert_eq!(
+            queue_answer(Some(Clash::Overwrite), None, Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            queue_answer(Some(Clash::Overwrite), None, Some(false)),
+            Some(false)
+        );
+        // 1 件ぶんの答えは「すべてに適用」より優先される
+        assert_eq!(
+            queue_answer(Some(Clash::Merge), Some(false), Some(true)),
+            Some(false)
+        );
+
+        // 実際に 3 件を一括移動して、答えが 1 回で済むことを確かめる
+        let dir = unique_temp_dir("zaivern-tree-test", "apply-all");
+        let src = dir.join("src");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::create_dir_all(&dst).expect("mkdir");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(src.join(n), "new").expect("write");
+            std::fs::write(dst.join(n), "old").expect("write");
+        }
+        // 複数選択のドロップ = 1 ジョブに 3 件
+        let items: Vec<TransferItem> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|n| {
+                transfer_plan(&src.join(n), &dst, Transfer::Move, Numbering::Ask)
+                    .expect("plan")
+                    .expect("some")
+            })
+            .collect();
+        assert!(
+            items.iter().all(|i| i.clash == Some(Clash::Overwrite)),
+            "3 件とも衝突する"
+        );
+
+        // app 側の drain_transfer と同じ順路を辿る (判定は同じ純粋関数)
+        let mut asked = 0usize;
+        let mut apply_all: Option<bool> = None;
+        for it in &items {
+            let mut answer = queue_answer(it.clash, None, apply_all);
+            if answer.is_none() {
+                // ここが確認ダイアログ。「置き換える」+「すべてに適用」を選ぶ
+                asked += 1;
+                apply_all = Some(true);
+                answer = Some(true);
+            }
+            if answer == Some(true) {
+                std::fs::remove_file(&it.dest).expect("replace");
+                std::fs::rename(&it.src, &it.dest).expect("move");
+            }
+        }
+        assert_eq!(asked, 1, "3 件でも聞かれるのは 1 回だけ");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            assert_eq!(
+                std::fs::read_to_string(dst.join(n)).expect("read"),
+                "new",
+                "{n} が置き換わっている"
+            );
+            assert!(!src.join(n).exists(), "{n} は移動済み");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 複数選択の対象は掴んだ行が選択に入っているときだけ集合になる() {
+        let dir = unique_temp_dir("zaivern-tree-test", "sel-targets");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let c = dir.join("c.txt");
+        for p in [&a, &b, &c] {
+            std::fs::write(p, "x").expect("write");
+        }
+        let mut t = FileTree::new(vec![dir.clone()], true);
+        t.sel.set_single(&a);
+        t.sel.toggle(&b);
+        // 選択に入っている行を掴んだら選択集合ごと
+        let mut got = t.selection_targets(&a);
+        got.sort();
+        assert_eq!(got, vec![a.clone(), b.clone()]);
+        // 選択の外を掴んだらその 1 件だけ (VS Code と同じ)
+        assert_eq!(t.selection_targets(&c), vec![c.clone()]);
+        // ルートは絶対に対象にしない (ワークスペースごと動かさない)
+        assert!(t.selection_targets(&dir).is_empty());
+        // 削除の対象も同じ規則 (実装を 1 本にしてある)
+        let mut del = t.delete_targets(&a);
+        del.sort();
+        assert_eq!(del, got);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 見えなくなるドロップ先は黙って受けずに知らせる() {
+        // 普通のフォルダ: 何も言わない
+        assert_eq!(drop_visibility_notice("src", false, false), None);
+        // .gitignore の対象へ入れた: ツリーから消えるので知らせる
+        let m = drop_visibility_notice("target", true, false).expect("注意が出る");
+        assert!(m.contains("target") && m.contains(".gitignore"), "{m}");
+        // 絞り込み中: 行は本物のツリーのままなので受け付けるが、
+        // 条件に合わないものは出ないことを知らせる
+        let m = drop_visibility_notice("src", false, true).expect("注意が出る");
+        assert!(m.contains("絞り込み"), "{m}");
+        // 両方なら .gitignore の方を出す (消える理由として強い)
+        let m = drop_visibility_notice("target", true, true).expect("注意が出る");
+        assert!(m.contains(".gitignore"), "{m}");
+    }
+
+    #[test]
+    fn ファイル操作の取り消しはツリーがフォーカスを持つときだけ発火する() {
+        let src = include_str!("file_tree.rs").replace("\r\n", "\n");
+        let cut = src.find("\n#[cfg(test)]\nmod ").unwrap_or(src.len());
+        let fns = split_fns(&src[..cut]);
+
+        // 取り消し要求を立てるのは、キー処理とツリーのメニューだけ
+        assert_eq!(
+            owners(&fns, "actions.undo = true"),
+            vec!["file_ops_menu".to_string(), "keys_undo".to_string()],
+            "ツリーの外から取り消しを立てないこと"
+        );
+        // キー経路は handle_keys からしか来ない
+        assert_eq!(
+            owners(&fns, "self.keys_undo("),
+            vec!["handle_keys".to_string()]
+        );
+
+        // handle_keys は「ツリーがフォーカス」「どのウィジェットもキーボード
+        // フォーカスを持たない」を確かめてからでないと keys_* を呼ばない。
+        // = エディタや入力欄に居るあいだ ⌘Z は本文の取り消しのまま。
+        let hk = body(&fns, "handle_keys");
+        let g1 = hk
+            .find("if !self.focused || self.edit.is_some()")
+            .expect("ツリーフォーカスのガード");
+        let g2 = hk
+            .find("m.focused().is_some()")
+            .expect("ウィジェットフォーカスのガード");
+        let call = hk.find("self.keys_undo(").expect("取り消しの呼び出し");
+        assert!(
+            g1 < call && g2 < call,
+            "フォーカスを確かめる前にファイル操作の取り消しを撃っている"
+        );
+        assert!(
+            hk[g1..call].contains("return"),
+            "ガードは return で抜けること"
+        );
+        assert!(
+            hk[g2..call].contains("return"),
+            "ガードは return で抜けること"
+        );
+
+        // app 側の入口も 1 本だけ
+        let app = app_fns();
+        assert_eq!(
+            owners(&app, "self.undo_file_op("),
+            vec!["apply_tree_actions".to_string()],
+            "ファイル操作の取り消しはツリーの要求からしか呼ばない"
+        );
     }
 
     #[test]

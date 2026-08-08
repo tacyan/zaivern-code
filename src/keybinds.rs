@@ -1618,6 +1618,19 @@ fn ime_blocks_shortcuts(events: &[egui::Event], composing_at_start: bool) -> boo
 ///
 /// **1 フレームに 1 回だけ呼ぶこと** (状態を更新するため)。呼び出し地点は
 /// `App::handle_shortcuts` の先頭 1 か所。
+/// IME 変換中でショートカットを止めるべきか — **状態を進めない読み取り専用版**。
+///
+/// [`ime_blocks_shortcuts_now`] は IME の状態機械を 1 フレーム分**進める**ので、
+/// 同じフレームで 2 回呼んではいけない (2 回目が変換の開始/終了を食う)。
+/// `handle_shortcuts` 以外の場所 — ファイルツリーのキー処理など — から
+/// 「いま変換中か」を見たいときは必ずこちらを使う。
+pub fn ime_blocks_shortcuts_peek(ctx: &egui::Context) -> bool {
+    let was = ctx
+        .data(|d| d.get_temp::<bool>(ime_state_id()))
+        .unwrap_or(false);
+    ctx.input(|i| ime_blocks_shortcuts(&i.events, was))
+}
+
 pub fn ime_blocks_shortcuts_now(ctx: &egui::Context) -> bool {
     let was = ctx
         .data(|d| d.get_temp::<bool>(ime_state_id()))
@@ -2665,6 +2678,9 @@ mod tests {
             "⌘V",
             "⌘X",
             "⌘C",
+            // ツリーのファイル操作の取り消し。BindAction ではなく
+            // `FileTree::keys_undo` が直接拾う OS 固定キー (本文の ⌘Z と同じ打鍵)
+            "⌘Z",
             // エージェント入力欄の送信キー (`panels::send_hint` が OS で書き分け)
             "⌘+Enter",
             "⌘⌫",
