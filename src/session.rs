@@ -33,6 +33,13 @@ pub struct SessionData {
     /// `Vec` を足してはいけない。空 = 分割なし (1 ペインで開く)。
     /// リーフはバッファ ID ではなく**ファイルの絶対パス**で指す (再起動で ID は変わる)。
     pub editor_split: String,
+    /// **ピン留めされていたタブ**のファイル絶対パス (ピン順)。
+    ///
+    /// ペイン ID ではなくパスで持つ理由は [`Self::editor_split`] と同じ
+    /// (バッファ ID は再起動で必ず変わる)。復元時は、そのファイルを開いている
+    /// 全ペインでピン留めし直す。旧形式のファイルには無いので空 = ピン留めなし。
+    /// TOML の制約でテーブル配列 (`agents`) より**前**に置くこと。
+    pub pinned_files: Vec<String>,
     /// 走らせていたエージェントタブの記録 (チャット履歴のフォルダ別保存)。
     /// フォルダを開き直したときに、タブ + 前回スクロールバックを復元し、
     /// 対応 CLI (claude / codex) は会話を再開する。旧ファイルには無いので空。
@@ -452,6 +459,39 @@ mod tests {
         std::fs::write(session_file_in(&dir, roots), old).expect("write old session");
         let loaded = load_from(&dir, roots).expect("old session should still load");
         assert_eq!(loaded.editor_split, "");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ピン留めは**再起動をまたいで残る**。旧セッションファイル (この欄が無い)
+    /// でも空 = ピン留めなしとして読める。
+    #[test]
+    fn ピン留めは往復し古いセッションでも読める() {
+        let dir = unique_temp_dir("zaivern-session-test", "pinned");
+        let roots = &[dir.join("ws")];
+        // パスはハードコードせず一時ディレクトリから組む (どの OS でも通る)
+        let a = dir.join("a.rs").to_string_lossy().into_owned();
+        let b = dir.join("b.rs").to_string_lossy().into_owned();
+        let data = SessionData {
+            open_files: vec![a.clone(), b.clone()],
+            pinned_files: vec![b.clone()],
+            agents: vec![AgentSessionRec {
+                preset_name: "Claude Code".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        save_to(&dir, roots, &data);
+        let loaded = load_from(&dir, roots).expect("session should load");
+        assert_eq!(loaded.pinned_files, vec![b], "ピン留めがそのまま戻る");
+        assert_eq!(loaded.open_files.len(), 2);
+        assert_eq!(loaded.agents.len(), 1, "テーブル配列と共存できる");
+
+        // この欄を持たない旧ファイルは空 (= ピン留めなし)
+        let old = "open_files = [\"/a.rs\"]\nsidebar_open = true\npanel_open = false\n";
+        std::fs::write(session_file_in(&dir, roots), old).expect("write old session");
+        let loaded = load_from(&dir, roots).expect("old session should still load");
+        assert!(loaded.pinned_files.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }
