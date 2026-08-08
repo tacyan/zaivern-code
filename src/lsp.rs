@@ -976,6 +976,25 @@ impl LspClient {
         lock_ok(&self.shared.diags).get(&canonical(path)).cloned()
     }
 
+    /// **受信済みの全ファイル**の診断 (パス, 診断)。
+    ///
+    /// サーバーは開いていないファイルの `publishDiagnostics` も送ってくる
+    /// (rust-analyzer / tsserver はプロジェクト全体を出す)。受信スレッドは
+    /// それを [`handle_publish_diagnostics`] で全部貯めているのに、これまで
+    /// 取り出し口が [`Self::diagnostics`] (パス指定) しか無かったため、
+    /// 問題パネルは「開いているバッファ」の分しか見られなかった。
+    ///
+    /// 空の診断 (= サーバーが「このファイルはもう問題なし」と言った通知) は
+    /// 呼び出し側の都合で残しても意味が無いので、ここで落として返す。
+    /// `Arc` の clone だけなので中身の `Vec` は複製しない。
+    pub fn all_diagnostics(&self) -> Vec<(PathBuf, Arc<Vec<Diagnostic>>)> {
+        lock_ok(&self.shared.diags)
+            .iter()
+            .filter(|(_, d)| !d.is_empty())
+            .map(|(p, d)| (p.clone(), Arc::clone(d)))
+            .collect()
+    }
+
     /// initialize 応答から読み取ったサーバー能力 (未受信の間は全 false)。
     pub fn caps(&self) -> ServerCaps {
         lock_ok(&self.shared.caps).clone()

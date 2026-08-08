@@ -351,6 +351,8 @@ pub struct Session {
     pub last_prompt: Option<String>,
     /// このセッションの生ログの書き出し先 (再起動時の引き継ぎ・UI 表示用)。
     pub log_path: Option<PathBuf>,
+    /// リンク検出の実行時状態 (実在確認のメモ + 直近に解析した 1 行)。
+    links: LinkState,
 }
 
 /// scan_attention の結果。
@@ -1747,6 +1749,7 @@ impl Session {
             rl_hits: 0,
             last_prompt: None,
             log_path: spec.log_path,
+            links: LinkState::default(),
         })
     }
 
@@ -6456,6 +6459,642 @@ fn cursor_span(screen: &vt100::Screen, row: u16, col: u16) -> (u16, u16) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// リンク検出 (URL / ファイルパス:行:桁)
+// ---------------------------------------------------------------------------
+//
+// エージェントとビルドツールの出力は **ほぼ全部** `src/foo.rs:12:5` の形で
+// ファイルを指す。ここをクリックで開けるかどうかが AI コックピットの生死を分ける。
+//
+// 設計の要:
+// * 判定は **純関数** (`detect_links`) に閉じ込め、ファイルシステムは
+//   `exists` という差し込み口だけで触る。テストは実ファイル無しで書け、
+//   実装側は TTL キャッシュを挿せる (毎フレーム `stat` を撃たない)。
+// * **実在しないパスはリンクにしない**。押せそうに見えて押せないのが最悪。
+// * 走査するのは **ポインタの下の 1 行だけ**。画面全体は見ない
+//   (設計原則 3 = アイドル時のコストはゼロ)。
+
+/// 行テキストから見つけたリンク候補。位置は **行テキストのバイト範囲**で、
+/// `&line[start..end]` は必ず有効な部分文字列になる (CJK でも境界を割らない)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkMatch {
+    pub start: usize,
+    pub end: usize,
+    pub kind: LinkKind,
+}
+
+/// リンクの中身。行・桁は **1 起点** (画面に書かれていたまま)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkKind {
+    Url(String),
+    File {
+        raw: String,
+        line: Option<u32>,
+        col: Option<u32>,
+    },
+}
+
+/// 画面上で解決済みのリンク (桁範囲 + 飛び先)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedLink {
+    pub col_start: u16,
+    /// 終端は含まない。
+    pub col_end: u16,
+    pub target: LinkTarget,
+}
+
+/// リンクの飛び先。ファイルの行・桁は **0 起点** (エディタ側の数え方)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkTarget {
+    Url(String),
+    File {
+        path: PathBuf,
+        line: usize,
+        col: usize,
+    },
+}
+
+/// 端末リンクの実行時状態。実在確認のメモと、直近に解析した 1 行だけを持つ。
+#[derive(Default)]
+pub struct LinkState {
+    exists: HashMap<PathBuf, (bool, Instant)>,
+    /// (行, 行テキストのハッシュ, 解決済みリンク)。
+    row: Option<(u16, u64, Vec<ResolvedLink>)>,
+}
+
+/// 実在確認の有効期間。ビルドで生まれたファイルが数秒で拾えるだけの短さ。
+const LINK_EXISTS_TTL: Duration = Duration::from_secs(5);
+/// 実在確認メモの上限 (超えたら丸ごと捨てる。LRU を持つほどの物ではない)。
+const LINK_EXISTS_CAP: usize = 512;
+/// 空白を含むパスのために後続トークンを何個まで連結して試すか。
+const LINK_MERGE_MAX: usize = 4;
+
+const URL_SCHEMES: [&str; 2] = ["https://", "http://"];
+
+/// 開き括弧・引用符。トークンの頭に付いていたら落とす。
+const LINK_OPENERS: [char; 8] = ['(', '[', '{', '<', '"', '\'', '`', '@'];
+
+fn count_char(s: &str, c: char) -> usize {
+    s.chars().filter(|x| *x == c).count()
+}
+
+/// URL の本体に入り得る文字か。空白・制御文字・`<>"` ` は必ず外。
+fn is_url_body(c: char) -> bool {
+    !c.is_whitespace() && !c.is_control() && !matches!(c, '<' | '>' | '"' | '`' | '\u{3000}')
+}
+
+/// URL の末尾から「文章の句読点」を落とす。
+///
+/// 括弧は **釣り合っていない閉じだけ**を落とすので、`(https://example.com)` の
+/// `)` は消え、`https://example.com/a_(b)` は丸ごと残る。
+fn trim_url_tail(url: &str) -> &str {
+    let mut end = url.len();
+    while let Some(c) = url[..end].chars().next_back() {
+        let head = &url[..end];
+        let drop = match c {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '、' | '。' | '，' | '．' => true,
+            ')' => count_char(head, '(') < count_char(head, ')'),
+            ']' => count_char(head, '[') < count_char(head, ']'),
+            '}' => count_char(head, '{') < count_char(head, '}'),
+            '>' => true,
+            _ => false,
+        };
+        if !drop {
+            break;
+        }
+        end -= c.len_utf8();
+    }
+    &url[..end]
+}
+
+/// 行から `http(s)://…` を拾う。ファイルシステムには触らない純関数。
+pub fn detect_urls(line: &str) -> Vec<LinkMatch> {
+    let mut out: Vec<LinkMatch> = Vec::new();
+    let mut i = 0usize;
+    while i < line.len() {
+        let Some(rel) = line[i..].find("http") else {
+            break;
+        };
+        let s = i + rel;
+        i = s + 4;
+        // 直前が ASCII 英数字なら別の語の一部 (`xhttp://…`) — 単語境界を見る。
+        // CJK は日本語の本文へ URL を直に埋め込むのが普通なので境界扱いにする
+        // (`説明はhttps://…` を落とさない)。
+        if line[..s]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        let Some(scheme) = URL_SCHEMES.iter().find(|p| line[s..].starts_with(**p)) else {
+            continue;
+        };
+        let mut e = s + scheme.len();
+        for c in line[e..].chars() {
+            if !is_url_body(c) {
+                break;
+            }
+            e += c.len_utf8();
+        }
+        let trimmed = trim_url_tail(&line[s..e]);
+        // ホスト部が空 (`https://`) はリンクにしない
+        if trimmed[scheme.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric())
+        {
+            out.push(LinkMatch {
+                start: s,
+                end: s + trimmed.len(),
+                kind: LinkKind::Url(trimmed.to_string()),
+            });
+            i = i.max(s + trimmed.len());
+        }
+    }
+    out
+}
+
+/// 行を空白で切ったトークンのバイト範囲。全角空白 (U+3000) も区切りになる。
+fn whitespace_tokens(line: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in line.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                out.push((s, i));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, line.len()));
+    }
+    out
+}
+
+/// 末尾の要素が `.<拡張子>` を持つか (`foo.rs` / `日本語ファイル.txt`)。
+fn has_file_ext(s: &str) -> bool {
+    let name = s.rsplit(['/', '\\']).next().unwrap_or(s);
+    let Some(dot) = name.rfind('.') else {
+        return false;
+    };
+    if dot == 0 || dot + 1 >= name.len() {
+        return false;
+    }
+    let ext = &name[dot + 1..];
+    ext.len() <= 16
+        && ext
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+}
+
+/// **パスらしさ**。区切りか拡張子のどちらかが要る。
+///
+/// 「画面テキストの部分一致で状態を判定しない」と同じ教訓で、`error` や `12` を
+/// 「たまたま存在しないファイル」として毎回 `stat` しないための足切りでもある。
+fn looks_like_path(s: &str) -> bool {
+    if s.is_empty() || s.len() > 1024 {
+        return false;
+    }
+    if s.chars().any(|c| c.is_control()) || s.contains("://") {
+        return false;
+    }
+    if !s.chars().any(|c| c.is_alphanumeric()) {
+        return false;
+    }
+    s.contains('/') || s.contains('\\') || has_file_ext(s)
+}
+
+/// パス候補の末尾から句読点・閉じ括弧・引用符を落とす。
+fn trim_path_tail(s: &str) -> &str {
+    let mut end = s.len();
+    while let Some(c) = s[..end].chars().next_back() {
+        let head = &s[..end];
+        let drop = match c {
+            '.' | ',' | ';' | ':' | '!' | '?' | '、' | '。' | '，' | '．' => true,
+            '"' | '\'' | '`' => true,
+            ')' => count_char(head, '(') < count_char(head, ')'),
+            ']' => count_char(head, '[') < count_char(head, ']'),
+            '}' => count_char(head, '{') < count_char(head, '}'),
+            '>' => count_char(head, '<') < count_char(head, '>'),
+            _ => false,
+        };
+        if !drop {
+            break;
+        }
+        end -= c.len_utf8();
+    }
+    &s[..end]
+}
+
+fn trim_path_quotes(s: &str) -> &str {
+    s.trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+}
+
+/// MSVC 形式 `foo.rs(12,5)` / `foo.rs(12)` の末尾を割る。
+fn split_paren_pos(s: &str) -> Option<(&str, u32, Option<u32>)> {
+    let body = s.strip_suffix(')')?;
+    let open = body.rfind('(')?;
+    let inside = &body[open + 1..];
+    if inside.is_empty() {
+        return None;
+    }
+    let mut it = inside.splitn(2, ',');
+    let line = it.next()?.trim().parse::<u32>().ok()?;
+    let col = match it.next() {
+        Some(c) => Some(c.trim().parse::<u32>().ok()?),
+        None => None,
+    };
+    Some((&body[..open], line, col))
+}
+
+/// 末尾の `:<数字>` を 1 つ剥がす。
+///
+/// Windows の `C:\path\foo.rs` を壊さないよう、残りが 1 文字のドライブ文字
+/// だけになる場合は剥がさない。
+fn split_colon_num(s: &str) -> Option<(&str, u32)> {
+    let colon = s.rfind(':')?;
+    let num = &s[colon + 1..];
+    if num.is_empty() || num.len() > 9 || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let head = &s[..colon];
+    if head.is_empty() {
+        return None;
+    }
+    if head.len() == 1 && head.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some((head, num.parse().ok()?))
+}
+
+/// [`parse_path_token`] の結果。
+/// `(トークン内の先頭バイト, 終端バイト, パス, 1 起点の行, 1 起点の桁)`。
+type ParsedPath = (usize, usize, String, Option<u32>, Option<u32>);
+
+/// トークン (またはトークンを連結した範囲) 1 個を「パス + 行 + 桁」に割る。
+/// 返す `(先頭, 終端)` は渡した文字列内の相対バイト位置。
+fn parse_path_token(tok: &str) -> Option<ParsedPath> {
+    let mut s = 0usize;
+    while let Some(c) = tok[s..].chars().next() {
+        if LINK_OPENERS.contains(&c) {
+            s += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let body = &tok[s..];
+    if body.is_empty() {
+        return None;
+    }
+    // MSVC 形式を先に見る (末尾の `)` を句読点として落とさないため)
+    if let Some((path, line, col)) = split_paren_pos(body) {
+        let path = trim_path_quotes(path);
+        if looks_like_path(path) {
+            return Some((s, s + body.len(), path.to_string(), Some(line), col));
+        }
+    }
+    let t = trim_path_tail(body);
+    if t.is_empty() {
+        return None;
+    }
+    let end = s + t.len();
+    let (mut path, mut line, mut col) = (t, None, None);
+    if let Some((head, n)) = split_colon_num(path) {
+        if let Some((head2, n2)) = split_colon_num(head) {
+            path = head2;
+            line = Some(n2);
+            col = Some(n);
+        } else {
+            path = head;
+            line = Some(n);
+        }
+    }
+    let path = trim_path_quotes(path);
+    if !looks_like_path(path) {
+        return None;
+    }
+    Some((s, end, path.to_string(), line, col))
+}
+
+/// 行 1 本からリンクを検出する **純関数**。
+///
+/// `exists` は「パス文字列 → 実在するか」を答える差し込み口。テストは実ファイルを
+/// 作らずに済み、実装側は TTL キャッシュを挿せる (毎フレーム `stat` を撃たない
+/// ための唯一の口)。**`exists` が false を返したものはリンクにならない。**
+pub fn detect_links(line: &str, exists: &mut dyn FnMut(&str) -> bool) -> Vec<LinkMatch> {
+    let mut out = detect_urls(line);
+    let toks = whitespace_tokens(line);
+    let mut ti = 0usize;
+    while ti < toks.len() {
+        let (ts, te) = toks[ti];
+        // URL と重なるトークンは飛ばす (`https://x/a.rs:12` を二重に拾わない)
+        if out.iter().any(|l| l.start < te && ts < l.end) {
+            ti += 1;
+            continue;
+        }
+        // 空白を含むパスのため後続トークンを連結して試す。連結候補も
+        // 「`looks_like_path` を通り、かつ実在するもの」しか採らないので、
+        // 誤検出も無駄な `stat` も増えない。
+        let last = (ti + LINK_MERGE_MAX).min(toks.len() - 1);
+        let mut consumed = ti;
+        let mut hit: Option<LinkMatch> = None;
+        for (tj, tok) in toks.iter().enumerate().take(last + 1).skip(ti) {
+            let Some((rs, re, raw, ln, col)) = parse_path_token(&line[ts..tok.1]) else {
+                continue;
+            };
+            if !exists(&raw) {
+                continue;
+            }
+            consumed = tj;
+            hit = Some(LinkMatch {
+                start: ts + rs,
+                end: ts + re,
+                kind: LinkKind::File { raw, line: ln, col },
+            });
+            break;
+        }
+        match hit {
+            Some(m) => {
+                out.push(m);
+                ti = consumed + 1;
+            }
+            None => ti += 1,
+        }
+    }
+    out.sort_by_key(|m| m.start);
+    out
+}
+
+/// 相対パスを **その端末の作業ディレクトリ**基準で解決する。
+///
+/// ワークスペースルート直書きは禁止 — 端末が `cd` していたら別のファイルを
+/// 開いてしまう。`~` はホームへ展開する (`dirs` 経由なのでユーザー名に依存しない)。
+pub fn resolve_link_path(raw: &str, cwd: &Path) -> PathBuf {
+    let expanded: PathBuf = if raw == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw))
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        match dirs::home_dir() {
+            Some(h) => h.join(rest),
+            None => PathBuf::from(raw),
+        }
+    } else {
+        PathBuf::from(raw)
+    };
+    // Windows の `C:\…` は unix 上では is_absolute() が false になるが、
+    // その場合 join した先は実在しないので結局リンクにならない (両 OS で正しい)。
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    }
+}
+
+/// 実在確認の TTL 付きメモ。行の中身が変わったときだけ通る道なので、
+/// 静止した画面では `stat` が 1 回も飛ばない。
+fn exists_cached(cache: &mut HashMap<PathBuf, (bool, Instant)>, p: &Path) -> bool {
+    let now = Instant::now();
+    if let Some((v, at)) = cache.get(p) {
+        if now.duration_since(*at) < LINK_EXISTS_TTL {
+            return *v;
+        }
+    }
+    if cache.len() >= LINK_EXISTS_CAP {
+        cache.clear();
+    }
+    let v = p.is_file();
+    cache.insert(p.to_path_buf(), (v, now));
+    v
+}
+
+fn link_text_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// 画面 1 行のテキストと「文字の開始バイト位置 → 桁」の対応表。
+///
+/// 全角文字は 2 桁進むので、バイト位置をそのまま桁にしてはいけない。
+fn row_text_cols(screen: &vt100::Screen, row: u16) -> (String, Vec<(usize, u16)>) {
+    let (_, cols) = screen.size();
+    let mut text = String::new();
+    let mut map: Vec<(usize, u16)> = Vec::with_capacity(usize::from(cols));
+    for c in 0..cols {
+        let Some(cell) = screen.cell(row, c) else {
+            continue;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        map.push((text.len(), c));
+        let s = cell.contents();
+        if s.is_empty() {
+            text.push(' ');
+        } else {
+            text.push_str(&s);
+        }
+    }
+    (text, map)
+}
+
+/// バイト範囲 → 桁範囲。`map` は [`row_text_cols`] が返す対応表。
+fn cols_for_range(map: &[(usize, u16)], start: usize, end: usize, cols: u16) -> (u16, u16) {
+    let col_start = map
+        .iter()
+        .rev()
+        .find(|(b, _)| *b <= start)
+        .map_or(0, |(_, c)| *c);
+    let col_end = map
+        .iter()
+        .find(|(b, _)| *b >= end)
+        .map_or(cols, |(_, c)| *c);
+    (col_start, col_end.max(col_start.saturating_add(1)))
+}
+
+/// クリックでリンクを開くときに要求する修飾キーの表示名。
+///
+/// `BindAction` を持たない **マウス操作の修飾**なので keybinds 表には無い。
+/// それでも打鍵表記をソースにベタ書きしないよう egui の表から生成する。
+fn link_modifier_label() -> String {
+    let mac = cfg!(target_os = "macos");
+    let names = if mac {
+        egui::ModifierNames::SYMBOLS
+    } else {
+        egui::ModifierNames::NAMES
+    };
+    names.format(&egui::Modifiers::COMMAND, mac)
+}
+
+/// 端末のリンククリックが積む「このファイルのこの位置を開いて」要求のキー。
+/// `draw` の呼び出し側は多数あるので戻り値ではなく egui の一時データを通す
+/// (`zv-drop-consumed` と同じ約束)。
+const OPEN_REQUEST_KEY: &str = "zv-terminal-open-file";
+
+/// 端末リンクのクリック要求を回収する。行・桁は **0 起点**。
+pub fn take_open_request(ctx: &egui::Context) -> Option<(PathBuf, usize, usize)> {
+    ctx.data_mut(|d| d.remove_temp::<(PathBuf, usize, usize)>(egui::Id::new(OPEN_REQUEST_KEY)))
+}
+
+impl Session {
+    /// ポインタ下 `(row, col)` にあるリンク。無ければ None。
+    ///
+    /// 解析するのは **その 1 行だけ**で、行テキストが変わらない限り再計算しない。
+    fn link_at(&mut self, row: u16, col: u16) -> Option<ResolvedLink> {
+        let (text, map, cols) = {
+            let p = lock_ok(&self.parser);
+            let screen = p.screen();
+            let (_, cols) = screen.size();
+            let (t, m) = row_text_cols(screen, row);
+            (t, m, cols)
+        };
+        let h = link_text_hash(&text);
+        let fresh = self
+            .links
+            .row
+            .as_ref()
+            .is_some_and(|(r, hh, _)| *r == row && *hh == h);
+        if !fresh {
+            let cwd = self.cwd.clone();
+            let cache = &mut self.links.exists;
+            let mut resolved: HashMap<String, PathBuf> = HashMap::new();
+            let matches = {
+                let mut exists = |raw: &str| -> bool {
+                    let p = resolve_link_path(raw, &cwd);
+                    let ok = exists_cached(cache, &p);
+                    if ok {
+                        resolved.insert(raw.to_string(), p);
+                    }
+                    ok
+                };
+                detect_links(&text, &mut exists)
+            };
+            let mut out = Vec::new();
+            for m in matches {
+                let (cs, ce) = cols_for_range(&map, m.start, m.end, cols);
+                let target = match m.kind {
+                    LinkKind::Url(u) => LinkTarget::Url(u),
+                    LinkKind::File { raw, line, col } => {
+                        let Some(path) = resolved.get(&raw).cloned() else {
+                            continue;
+                        };
+                        LinkTarget::File {
+                            path,
+                            line: line.unwrap_or(1).saturating_sub(1) as usize,
+                            col: col.unwrap_or(1).saturating_sub(1) as usize,
+                        }
+                    }
+                };
+                out.push(ResolvedLink {
+                    col_start: cs,
+                    col_end: ce,
+                    target,
+                });
+            }
+            self.links.row = Some((row, h, out));
+        }
+        self.links
+            .row
+            .as_ref()?
+            .2
+            .iter()
+            .find(|l| col >= l.col_start && col < l.col_end)
+            .cloned()
+    }
+}
+
+/// リンクのホバー表示とクリック処理。
+///
+/// クリックに **修飾キー (mac は Command / 他は Ctrl) を要求する**のは VS Code と
+/// 同じ理由: 端末の素のクリックは「選択の解除」とドラッグ選択の起点として既に
+/// 使われており、横取りすると文字選択が壊れる。修飾キーが押されている間だけ
+/// 手のカーソルに変え、押されていない間も下線と案内を出して「押せば開ける」と
+/// 分かるようにする。
+#[allow(clippy::too_many_arguments)]
+fn handle_links(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    session: &mut Session,
+    theme: &Theme,
+    response: &egui::Response,
+    rect: egui::Rect,
+    padding: f32,
+    cell_w: f32,
+    cell_h: f32,
+) {
+    if cell_w <= 0.0 || cell_h <= 0.0 {
+        return;
+    }
+    let Some(pos) = ui.ctx().pointer_hover_pos() else {
+        return;
+    };
+    if !rect.contains(pos) {
+        return;
+    }
+    let (rows_n, cols_n) = session.size;
+    if rows_n == 0 || cols_n == 0 {
+        return;
+    }
+    let colf = (pos.x - rect.min.x - padding) / cell_w;
+    let rowf = (pos.y - rect.min.y - padding) / cell_h;
+    if colf < 0.0 || rowf < 0.0 {
+        return;
+    }
+    let (col, row) = (colf.floor() as u16, rowf.floor() as u16);
+    if row >= rows_n || col >= cols_n {
+        return;
+    }
+    let Some(link) = session.link_at(row, col) else {
+        return;
+    };
+
+    let modded = ui.input(|i| i.modifiers.command);
+    // 端末セルと同じく整数ピクセルへ揃える (小数のままだと 100% 表示で揺れる)
+    let ppp = ui.ctx().pixels_per_point();
+    let origin = rect.min + egui::vec2(padding, padding);
+    let x0 = crate::theme::snap_len(origin.x + f32::from(link.col_start) * cell_w, ppp);
+    let x1 =
+        crate::theme::snap_len(origin.x + f32::from(link.col_end) * cell_w, ppp).min(rect.max.x);
+    let y = crate::theme::snap_len(origin.y + f32::from(row) * cell_h + cell_h - 1.0, ppp);
+    let (color, width) = if modded {
+        (theme.accent, 1.5_f32)
+    } else {
+        (theme.text_dim, 1.0_f32)
+    };
+    painter.line_segment(
+        [egui::pos2(x0, y), egui::pos2(x1, y)],
+        egui::Stroke::new(width, color),
+    );
+
+    let label = match &link.target {
+        LinkTarget::Url(u) => u.clone(),
+        LinkTarget::File { path, line, .. } => {
+            format!("{}:{}", path.display(), line.saturating_add(1))
+        }
+    };
+    if modded {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clone().on_hover_text(trf(
+        "{k} + クリックで開く: {t}",
+        &[("k", link_modifier_label()), ("t", label)],
+    ));
+
+    if modded && response.clicked() {
+        match link.target {
+            LinkTarget::Url(u) => ui.ctx().open_url(egui::OpenUrl::new_tab(u)),
+            LinkTarget::File { path, line, col } => {
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new(OPEN_REQUEST_KEY), (path, line, col));
+                });
+            }
+        }
+    }
+}
+
 /// 画面グリッド(文字セル・選択ハイライト)、カーソル、IME オーバーレイの描画。
 #[allow(clippy::too_many_arguments)]
 fn draw_screen(
@@ -6767,6 +7406,14 @@ pub fn draw(
     draw_screen(
         ui, &painter, session, theme, &font_id, rect, padding, cell_w, cell_h, focused,
     );
+
+    // リンク (URL / ファイル:行:桁) のホバー表示とクリック。
+    // 走査するのはポインタ下の 1 行だけなので、静止中のコストは 0。
+    if interactive && response.hovered() {
+        handle_links(
+            ui, &painter, session, theme, &response, rect, padding, cell_w, cell_h,
+        );
+    }
 
     // 端末内検索 (Cmd+F): 表示中画面のヒットをハイライトし、バーを浮かせる
     if session.search.open && !session.search.query.is_empty() {
@@ -11324,5 +11971,297 @@ mod split_tests {
                 }
             }
         }
+    }
+}
+
+/// リンク検出のテーブルテスト。
+///
+/// PTY は一切起動しない — 判定は純関数なので、実在確認は差し込み口
+/// (`exists`) を偽装するだけで済む。実ファイルを使うテストだけ
+/// `crate::test_util::unique_temp_dir` を通す (実 `~/.zaivern` に触れない)。
+#[cfg(test)]
+mod link_tests {
+    use super::{
+        cols_for_range, detect_links, detect_urls, exists_cached, resolve_link_path, row_text_cols,
+        LinkKind, LinkMatch,
+    };
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// `known` に載っているパスだけ「実在する」とみなして検出する。
+    fn links(line: &str, known: &[&str]) -> Vec<LinkMatch> {
+        let mut oracle = |p: &str| known.contains(&p);
+        detect_links(line, &mut oracle)
+    }
+
+    /// ファイル系リンクだけを `(パス, 行, 桁, 画面上の文字列)` に落とす。
+    fn files(line: &str, known: &[&str]) -> Vec<(String, Option<u32>, Option<u32>, String)> {
+        links(line, known)
+            .into_iter()
+            .filter_map(|m| match m.kind {
+                LinkKind::File { raw, line: l, col } => {
+                    Some((raw, l, col, line[m.start..m.end].to_string()))
+                }
+                LinkKind::Url(_) => None,
+            })
+            .collect()
+    }
+
+    fn urls(line: &str) -> Vec<String> {
+        detect_urls(line)
+            .into_iter()
+            .map(|m| match m.kind {
+                LinkKind::Url(u) => u,
+                LinkKind::File { .. } => unreachable!("detect_urls は URL しか返さない"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ファイルパスの表記ゆれを表で押さえる() {
+        // (行, 実在するとみなすパス, 期待するパス, 行, 桁)
+        let table: &[(&str, &str, &str, Option<u32>, Option<u32>)] = &[
+            // 行 + 桁 (rustc / eslint / tsc)
+            (
+                "error at src/foo.rs:12:5",
+                "src/foo.rs",
+                "src/foo.rs",
+                Some(12),
+                Some(5),
+            ),
+            // 行だけ
+            ("src/foo.rs:12", "src/foo.rs", "src/foo.rs", Some(12), None),
+            // 明示的な相対
+            ("./foo.rs:12", "./foo.rs", "./foo.rs", Some(12), None),
+            // 絶対 (先頭の / も含めて 1 トークン)
+            (
+                "/abs/foo.rs:12",
+                "/abs/foo.rs",
+                "/abs/foo.rs",
+                Some(12),
+                None,
+            ),
+            // Windows のドライブ付き。`C:` を行番号と読み違えない
+            (
+                "C:\\path\\foo.rs:12",
+                "C:\\path\\foo.rs",
+                "C:\\path\\foo.rs",
+                Some(12),
+                None,
+            ),
+            // MSVC 形式
+            ("foo.rs(12,5)", "foo.rs", "foo.rs", Some(12), Some(5)),
+            ("foo.rs(12)", "foo.rs", "foo.rs", Some(12), None),
+            // 行番号なし
+            ("see src/foo.rs", "src/foo.rs", "src/foo.rs", None, None),
+            // 括弧に包まれている
+            (
+                "(src/foo.rs:12)",
+                "src/foo.rs",
+                "src/foo.rs",
+                Some(12),
+                None,
+            ),
+            // 文末のピリオドを飲み込まない
+            (
+                "壊れたのは src/foo.rs:12。",
+                "src/foo.rs",
+                "src/foo.rs",
+                Some(12),
+                None,
+            ),
+            // 日本語ファイル名
+            (
+                "テスト/日本語ファイル.rs:3:1",
+                "テスト/日本語ファイル.rs",
+                "テスト/日本語ファイル.rs",
+                Some(3),
+                Some(1),
+            ),
+            // 引用符で囲われた空白入りのパス
+            (
+                "\"a b/c d.rs\":12",
+                "a b/c d.rs",
+                "a b/c d.rs",
+                Some(12),
+                None,
+            ),
+            // 引用符なしの空白入りパス (連結して実在するものだけ採る)
+            ("in a b/c.rs:7", "a b/c.rs", "a b/c.rs", Some(7), None),
+        ];
+        for (line, known, path, ln, col) in table {
+            let got = files(line, &[known]);
+            assert_eq!(got.len(), 1, "{line:?} でリンクが 1 件にならない: {got:?}");
+            assert_eq!(
+                (got[0].0.as_str(), got[0].1, got[0].2),
+                (*path, *ln, *col),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 実在しないパスはリンクにしない() {
+        for line in [
+            "src/does_not_exist.rs:12:5",
+            "foo.rs(12,5)",
+            "/abs/nope.rs",
+            "./nope.rs:1",
+        ] {
+            assert!(
+                files(line, &[]).is_empty(),
+                "{line:?} を実在確認なしでリンクにした"
+            );
+        }
+    }
+
+    #[test]
+    fn パスらしくない語では実在確認すら撃たない() {
+        // stat の回数がそのままアイドルコストになるので、足切りを固定する。
+        let mut asked: Vec<String> = Vec::new();
+        let mut oracle = |p: &str| {
+            asked.push(p.to_string());
+            false
+        };
+        detect_links("error: test 12 FAILED おわり", &mut oracle);
+        assert!(asked.is_empty(), "パスらしくない語を stat した: {asked:?}");
+    }
+
+    #[test]
+    fn 単体のurlをそのまま拾う() {
+        assert_eq!(urls("https://example.com"), ["https://example.com"]);
+        assert_eq!(urls("開く http://example.com/a"), ["http://example.com/a"]);
+    }
+
+    #[test]
+    fn urlの末尾の句読点と閉じ括弧を含めない() {
+        let table: &[(&str, &str)] = &[
+            ("(https://example.com)", "https://example.com"),
+            ("詳しくは https://example.com。", "https://example.com"),
+            ("see https://example.com.", "https://example.com"),
+            ("[https://example.com]", "https://example.com"),
+            ("https://example.com,", "https://example.com"),
+            ("<https://example.com>", "https://example.com"),
+            // 釣り合っている括弧は URL の一部として残す
+            ("https://example.com/a_(b)", "https://example.com/a_(b)"),
+            ("(https://example.com/a_(b))", "https://example.com/a_(b)"),
+        ];
+        for (line, want) in table {
+            assert_eq!(urls(line), [*want], "{line:?}");
+        }
+    }
+
+    #[test]
+    fn スキームだけの文字列と語の途中はurlにしない() {
+        assert!(urls("https://").is_empty());
+        assert!(urls("xhttps://example.com").is_empty());
+        // 日本語の本文に直に埋め込まれた URL は拾う (境界扱い)
+        assert_eq!(
+            urls("説明はhttps://example.com です"),
+            ["https://example.com"]
+        );
+    }
+
+    #[test]
+    fn 一行に複数のリンクがあっても全部拾う() {
+        let line = "src/a.rs:1:2 と src/b.rs:3 と https://example.com";
+        let got = links(line, &["src/a.rs", "src/b.rs"]);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(&line[got[0].start..got[0].end], "src/a.rs:1:2");
+        assert_eq!(&line[got[1].start..got[1].end], "src/b.rs:3");
+        assert_eq!(&line[got[2].start..got[2].end], "https://example.com");
+    }
+
+    #[test]
+    fn cjkを含む行でバイト境界を割らない() {
+        // 範囲は必ず文字境界。割れていればこのスライスがパニックする。
+        let line = "日本語のログ src/foo.rs:12:5 を確認 https://例え.jp/パス です";
+        let got = links(line, &["src/foo.rs"]);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(&line[got[0].start..got[0].end], "src/foo.rs:12:5");
+        assert_eq!(&line[got[1].start..got[1].end], "https://例え.jp/パス");
+        for m in &got {
+            assert!(line.is_char_boundary(m.start) && line.is_char_boundary(m.end));
+        }
+    }
+
+    fn parser(rows: u16, cols: u16) -> vt100::Parser {
+        vt100::Parser::new(rows, cols, 0)
+    }
+
+    #[test]
+    fn ansi色付きの行でも検出できる() {
+        let mut p = parser(1, 40);
+        p.process(b"\x1b[31msrc/foo.rs:12:5\x1b[0m ok");
+        let (text, _) = row_text_cols(p.screen(), 0);
+        let got = files(&text, &["src/foo.rs"]);
+        assert_eq!(got.len(), 1, "text={text:?}");
+        assert_eq!((got[0].1, got[0].2), (Some(12), Some(5)));
+    }
+
+    #[test]
+    fn 全角文字の手前にあるリンクの桁がずれない() {
+        // 「日本語」= 6 桁ぶん。バイト位置をそのまま桁にすると 9 になってしまう。
+        let mut p = parser(1, 40);
+        p.process("日本語 src/foo.rs:12".as_bytes());
+        let (text, map) = row_text_cols(p.screen(), 0);
+        let got = links(&text, &["src/foo.rs"]);
+        assert_eq!(got.len(), 1, "text={text:?}");
+        let (c0, c1) = cols_for_range(&map, got[0].start, got[0].end, 40);
+        assert_eq!(c0, 7, "全角 3 文字 + 空白 のあと = 7 桁目");
+        assert_eq!(c1, 7 + "src/foo.rs:12".len() as u16);
+    }
+
+    #[test]
+    fn 相対パスは端末の作業ディレクトリ基準で解決する() {
+        let dir = crate::test_util::unique_temp_dir("zv-link", "cwd");
+        let sub = dir.join("src");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let file = sub.join("foo.rs");
+        std::fs::write(&file, "fn main() {}").expect("write");
+
+        // ワークスペースルートではなく cwd 基準であることの確認
+        let mut oracle = |raw: &str| resolve_link_path(raw, &dir).is_file();
+        let got = detect_links("error at src/foo.rs:12:5", &mut oracle);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(resolve_link_path("src/foo.rs", &dir), file);
+        // 別の cwd から見れば同じ行でもリンクにならない
+        let other = crate::test_util::unique_temp_dir("zv-link", "other");
+        let mut oracle2 = |raw: &str| resolve_link_path(raw, &other).is_file();
+        assert!(detect_links("error at src/foo.rs:12:5", &mut oracle2).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn windowsの絶対パスは両osで壊れない() {
+        let cwd = std::env::temp_dir();
+        let p = resolve_link_path("C:\\path\\foo.rs", &cwd);
+        if cfg!(windows) {
+            assert!(p.is_absolute(), "Windows では絶対パスのまま: {p:?}");
+            assert_eq!(p, PathBuf::from("C:\\path\\foo.rs"));
+        } else {
+            // unix ではドライブ表記は絶対にならないので cwd 配下へ落ちる
+            // (実在しない = リンクにならない)。パニックしないことが要件。
+            assert!(p.starts_with(&cwd), "unix では cwd 配下: {p:?}");
+            assert!(!p.is_file());
+        }
+    }
+
+    #[test]
+    fn 実在確認はttlの間キャッシュされる() {
+        // 毎フレーム stat を撃たないための要。消したファイルでも TTL 内は
+        // 覚えていた答えを返す = ファイルシステムを叩いていない証拠。
+        let dir = crate::test_util::unique_temp_dir("zv-link", "cache");
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "x").expect("write");
+        let mut cache: HashMap<PathBuf, (bool, std::time::Instant)> = HashMap::new();
+        assert!(exists_cached(&mut cache, &file));
+        std::fs::remove_file(&file).expect("rm");
+        assert!(
+            exists_cached(&mut cache, &file),
+            "TTL 内なのに stat し直している"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
