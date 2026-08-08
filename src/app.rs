@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
@@ -1117,6 +1119,31 @@ struct IndexedFile {
     abs: PathBuf,
     rel: String,
     label: String,
+}
+
+/// ファイル索引の走査条件 (すべて設定から来る — マジックナンバーを持たない)。
+#[derive(Clone)]
+struct IndexOptions {
+    max_files: usize,
+    max_depth: usize,
+    respect_gitignore: bool,
+}
+
+impl IndexOptions {
+    fn from_config(cfg: &config::Config) -> Self {
+        Self {
+            max_files: cfg.index_max_files,
+            max_depth: cfg.index_max_depth,
+            respect_gitignore: cfg.respect_gitignore,
+        }
+    }
+}
+
+/// 索引の走査結果。**打ち切りを黙って隠さない** — `truncated` を UI へ出す。
+struct IndexOutcome {
+    files: Vec<IndexedFile>,
+    /// 上限 (`index_max_files`) に達して途中で止めたか。
+    truncated: bool,
 }
 
 // ── ネイティブファイルダイアログのジョブ化 ────────────────────────────
@@ -2249,6 +2276,14 @@ pub struct ZaivernApp {
     branch_nav: git::BranchNav,
     file_index: Vec<IndexedFile>,
     index_at: Option<Instant>,
+    /// バックグラウンド索引の受け口 (世代付き)。`Some` = 走査中。
+    index_rx: Option<mpsc::Receiver<(u64, IndexOutcome)>>,
+    /// 走査済み件数 (索引スレッドが書き、UI が読むだけ)。
+    index_progress: Arc<AtomicUsize>,
+    /// 索引が上限で打ち切られたか (⌘P に必ず出す — 黙って切らない)。
+    index_truncated: bool,
+    /// 索引ジョブの世代。ルートが変わった後に届いた古い結果を捨てる。
+    index_gen: u64,
     /// カスタムテーマ (~/.zaivern/themes + プラグイン同梱): (表示名, JSONフルパス)
     custom_themes: Vec<(String, String)>,
     find: FindState,
@@ -2315,7 +2350,9 @@ pub struct ZaivernApp {
     toasts: Vec<Toast>,
     pending_close: Option<usize>,
     /// ファイルツリーからの削除確認待ち(対象パス)
-    pending_delete: Option<PathBuf>,
+    /// ツリーから削除を求められたパス (複数選択に対応するため集合)。
+    /// 空 = 確認ダイアログを出さない。
+    pending_delete: Vec<PathBuf>,
     pending_select: Option<(usize, usize)>,
     pending_scroll: Option<f32>,
     last_row_h: f32,
@@ -2947,6 +2984,10 @@ impl ZaivernApp {
             branch_nav: git::BranchNav::new(primary_root.clone()),
             file_index: Vec::new(),
             index_at: None,
+            index_rx: None,
+            index_progress: Arc::new(AtomicUsize::new(0)),
+            index_truncated: false,
+            index_gen: 0,
             custom_themes: Vec::new(),
             find: FindState {
                 open: false,
@@ -2988,7 +3029,7 @@ impl ZaivernApp {
             awaiting_definition: None,
             toasts: Vec::new(),
             pending_close: None,
-            pending_delete: None,
+            pending_delete: Vec::new(),
             pending_select: None,
             pending_scroll: None,
             last_row_h: 18.0,
@@ -3115,6 +3156,7 @@ impl ZaivernApp {
             }
             Err(e) => app.remote_err = Some(e),
         }
+        app.tree.apply_config(&app.cfg);
         app.rebuild_index();
         app.restore_session(&cc.egui_ctx);
         // コマンドラインで渡されたファイルはセッション復元の後に開く
@@ -3201,6 +3243,7 @@ impl ZaivernApp {
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
         self.tree.show_hidden = self.cfg.show_hidden_files;
+        self.tree.apply_config(&self.cfg);
         self.rebuild_index();
         // CLI (`zai open <file>`) が見る接続情報も新しいワークスペースへ更新する。
         // 起動時に書いたままだと、フォルダを開き直した後の相対パス解決が
@@ -5054,28 +5097,97 @@ impl ZaivernApp {
         }
     }
 
+    /// ファイル索引の作り直しを**バックグラウンドで**始める。
+    ///
+    /// 設計原則 2: 隠れている処理は欠落ありで良いが、決して UI をブロックしない。
+    /// 走査中も ⌘P は開けて、そのとき出来ている分だけが出る (進捗を添える)。
     fn rebuild_index(&mut self) {
-        self.file_index = build_file_index(&self.roots);
+        let roots = self.roots.clone();
+        let opts = IndexOptions::from_config(&self.cfg);
+        self.index_gen = self.index_gen.wrapping_add(1);
+        let gen = self.index_gen;
+        let progress = Arc::new(AtomicUsize::new(0));
+        self.index_progress = progress.clone();
+        let (tx, rx) = mpsc::channel();
+        let job = opts.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-file-index".into())
+            .spawn(move || {
+                let out = build_file_index_with(&roots, &job, Some(&progress));
+                let _ = tx.send((gen, out));
+            })
+            .is_ok();
+        if spawned {
+            self.index_rx = Some(rx);
+        } else {
+            // スレッドが立てられない環境では従来どおり同期で作る
+            // (遅くはなるが「索引が無い」よりはよい)。
+            let out = build_file_index_with(&self.roots, &opts, None);
+            self.apply_index(out);
+        }
+    }
+
+    /// バックグラウンド索引の完了を取り込む (毎フレーム呼んでよい)。
+    /// 走査中は控えめな再描画を予約して進捗が止まって見えないようにする。
+    fn poll_index(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.index_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((gen, out)) => {
+                self.index_rx = None;
+                // 古い世代 (ルートが変わった等) の結果は捨てる
+                if gen == self.index_gen {
+                    self.apply_index(out);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.index_rx = None,
+        }
+    }
+
+    fn apply_index(&mut self, out: IndexOutcome) {
+        self.index_truncated = out.truncated;
+        self.file_index = out.files;
         self.index_at = Some(Instant::now());
+    }
+
+    /// ⌘P のパレットに出す「索引の状態」。作成中/打ち切りのときだけ Some。
+    fn index_note(&self) -> Option<String> {
+        if self.index_rx.is_some() {
+            let n = self.index_progress.load(Ordering::Relaxed);
+            return Some(trf(
+                "索引を作成中… {n} 件走査 (今ある分から探せます)",
+                &[("n", n.to_string())],
+            ));
+        }
+        if self.index_truncated {
+            return Some(trf(
+                "{n} 件で打ち切りました (設定 index_max_files で変更できます)",
+                &[("n", self.file_index.len().to_string())],
+            ));
+        }
+        None
     }
 }
 
 /// 全ルートを走査してファイル索引を作る (純関数 — テスト可能)。
-fn build_file_index(roots: &[PathBuf]) -> Vec<IndexedFile> {
+///
+/// 除外は `.gitignore` (+ `.git/info/exclude` + `core.excludesFile`) に任せる。
+/// 以前はここに `node_modules` / `target` などのハードコード 10 種しか無く、
+/// リポジトリ固有の生成物 (`out/` `.turbo/` …) が全部索引に載っていた。
+fn build_file_index_with(
+    roots: &[PathBuf],
+    opts: &IndexOptions,
+    progress: Option<&Arc<AtomicUsize>>,
+) -> IndexOutcome {
     {
-        const SKIP: [&str; 10] = [
-            "target",
-            "node_modules",
-            ".git",
-            ".venv",
-            "venv",
-            "__pycache__",
-            "dist",
-            "build",
-            ".next",
-            ".cache",
-        ];
+        let mut ig = crate::ignore::Ignorer::new(opts.respect_gitignore);
         let mut out: Vec<IndexedFile> = Vec::new();
+        let mut truncated = false;
+        let mut scanned = 0usize;
         // ルートを跨いで DFS。エントリは絶対パスを正として持ち、
         // 相対パスは所属ルート基準で作る (あいまい検索の品質を保つため)。
         for root in roots {
@@ -5085,32 +5197,48 @@ fn build_file_index(roots: &[PathBuf]) -> Vec<IndexedFile> {
                 .unwrap_or_else(|| root.to_string_lossy().to_string());
             let mut stack = vec![(root.clone(), 0usize)];
             while let Some((dir, depth)) = stack.pop() {
-                if depth > 12 || out.len() >= 8000 {
+                if depth >= opts.max_depth {
                     continue;
+                }
+                if out.len() >= opts.max_files {
+                    truncated = true;
+                    break;
                 }
                 let Ok(rd) = std::fs::read_dir(&dir) else {
                     continue;
                 };
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
+                    if name == ".git" || name == ".DS_Store" {
+                        continue;
+                    }
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let abs = e.path();
+                    scanned += 1;
+                    if let Some(p) = progress {
+                        // 進捗は 128 件ごとに 1 回だけ書く (アトミックの往復を減らす)
+                        if scanned % 128 == 0 {
+                            p.store(scanned, Ordering::Relaxed);
+                        }
+                    }
+                    if ig.is_ignored(root, &abs, is_dir) {
+                        continue;
+                    }
                     if is_dir {
-                        if !SKIP.contains(&name.as_str()) && !name.starts_with('.') {
-                            stack.push((e.path(), depth + 1));
+                        if !name.starts_with('.') {
+                            stack.push((abs, depth + 1));
                         }
-                    } else if name != ".DS_Store" {
-                        let abs = e.path();
-                        let mut rel = abs
-                            .strip_prefix(root)
-                            .unwrap_or(&abs)
-                            .to_string_lossy()
-                            .to_string();
-                        // 索引の相対パスは Windows でも / 区切りに正規化する。
+                    } else {
+                        if out.len() >= opts.max_files {
+                            truncated = true;
+                            break;
+                        }
+                        // 索引の相対パスは Windows でも / 区切りに正規化する
+                        // (`ignore::rel_slash` が `Path::components` で切るので、
                         // ファイル名抽出 (rsplit('/')) やあいまい検索の入力・
-                        // ラベル表示を OS 間で一致させるため (abs はネイティブのまま)。
-                        if cfg!(windows) {
-                            rel = rel.replace('\\', "/");
-                        }
+                        // ラベル表示が OS 間で一致する。abs はネイティブのまま)。
+                        let rel = crate::ignore::rel_slash(root, &abs)
+                            .unwrap_or_else(|| abs.to_string_lossy().to_string());
                         out.push(IndexedFile {
                             abs,
                             label: format!("{root_name}/{rel}"),
@@ -5143,7 +5271,13 @@ fn build_file_index(roots: &[PathBuf]) -> Vec<IndexedFile> {
             }
         }
         out.sort_by(|a, b| a.label.cmp(&b.label));
-        out
+        if let Some(p) = progress {
+            p.store(scanned, Ordering::Relaxed);
+        }
+        IndexOutcome {
+            files: out,
+            truncated,
+        }
     }
 }
 
@@ -9560,7 +9694,10 @@ impl ZaivernApp {
                 self.theme = resolve_theme(&self.cfg.theme);
                 theme::apply(ctx, &self.theme);
                 self.tree.show_hidden = self.cfg.show_hidden_files;
+                self.tree.apply_config(&self.cfg);
                 self.tree.invalidate();
+                // 索引の上限・除外の扱いも設定に追従させる (作り直しは背景で走る)
+                self.rebuild_index();
                 self.rebuild_plugins();
                 // 監視設定も入れ替える。サンプル間隔が変わるので次回刻みも捨てる。
                 self.supervisor.set_config(self.cfg.supervisor.clone());
@@ -12061,6 +12198,8 @@ impl ZaivernApp {
         // アクティブファイル追従 (VS Code の explorer.autoReveal): ツリーへ通知
         let active = self.active_file_path();
         self.tree.set_active_file(active.as_deref());
+        // ツリーの絞り込み入力。スクロール領域の外に置き、流れて消えないようにする
+        self.tree.filter_ui(ui, theme);
         egui::ScrollArea::both()
             .id_salt("zv-tree")
             .auto_shrink(false)
@@ -12656,45 +12795,68 @@ impl ZaivernApp {
                 }
             }
         }
-        // 貼り付け (⌘C/⌘X → ⌘V): コピーは再帰コピー、切り取りは移動
-        if let Some((src, dest, kind)) = actions.transfer {
-            let res = match kind {
-                file_tree::Transfer::Move => std::fs::rename(&src, &dest),
-                file_tree::Transfer::Copy => file_tree::copy_recursively(&src, &dest),
-            };
-            match res {
-                Ok(()) => {
-                    if kind == file_tree::Transfer::Move {
-                        self.retarget_buffers(&src, &dest);
-                        self.persist_session();
-                        // 切り取りは移動が成功してからクリップボードを空にする
-                        self.tree.clear_clipboard();
+        // 貼り付け (⌘C/⌘X → ⌘V): コピーは再帰コピー、切り取りは移動。
+        // 複数選択のクリップボードに対応するため集合で受ける (1 件なら従来と同じ)。
+        let transfers = actions.transfer;
+        if !transfers.is_empty() {
+            let mut done: Vec<PathBuf> = Vec::new();
+            let mut moved = false;
+            let mut last_err: Option<String> = None;
+            for (src, dest, kind) in transfers {
+                let res = match kind {
+                    file_tree::Transfer::Move => std::fs::rename(&src, &dest),
+                    file_tree::Transfer::Copy => file_tree::copy_recursively(&src, &dest),
+                };
+                match res {
+                    Ok(()) => {
+                        if kind == file_tree::Transfer::Move {
+                            self.retarget_buffers(&src, &dest);
+                            moved = true;
+                        }
+                        done.push(dest);
                     }
-                    self.tree.invalidate();
-                    self.tree.select(&dest);
-                    let msg = match kind {
-                        file_tree::Transfer::Move => trf(
+                    Err(e) => last_err = Some(e.to_string()),
+                }
+            }
+            if moved {
+                self.persist_session();
+                // 切り取りは移動が成功してからクリップボードを空にする
+                self.tree.clear_clipboard();
+            }
+            if let Some(dest) = done.last().cloned() {
+                self.tree.invalidate();
+                self.tree.select(&dest);
+                let msg = if done.len() == 1 {
+                    if moved {
+                        trf(
                             "➡ {path} へ移動しました",
                             &[("path", self.rel_label(&dest))],
-                        ),
-                        file_tree::Transfer::Copy => trf(
+                        )
+                    } else {
+                        trf(
                             "📋 {path} に貼り付けました",
                             &[("path", self.rel_label(&dest))],
-                        ),
-                    };
-                    self.toast(msg, true);
-                }
-                Err(e) => self.toast(
-                    trf("貼り付けできません: {e}", &[("e", e.to_string())]),
-                    false,
-                ),
+                        )
+                    }
+                } else if moved {
+                    trf("➡ {n} 件を移動しました", &[("n", done.len().to_string())])
+                } else {
+                    trf(
+                        "📋 {n} 件を貼り付けました",
+                        &[("n", done.len().to_string())],
+                    )
+                };
+                self.toast(msg, true);
+            }
+            if let Some(e) = last_err {
+                self.toast(trf("貼り付けできません: {e}", &[("e", e)]), false);
             }
         }
         if let Some(msg) = actions.notice {
             self.toast_warn(msg);
         }
-        if let Some(p) = actions.delete {
-            self.pending_delete = Some(p);
+        if !actions.delete.is_empty() {
+            self.pending_delete = actions.delete;
         }
     }
 
@@ -19844,6 +20006,22 @@ impl ZaivernApp {
                             resp.request_focus();
                         }
 
+                        // ファイル検索モードのときは索引の状態を必ず出す
+                        // (作成中か、上限で打ち切ったか)。黙って切らない。
+                        if !self.palette.is_command_mode()
+                            && !self.palette.is_agent_mode()
+                            && !self.palette.is_root_mode()
+                        {
+                            if let Some(note) = self.index_note() {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(note).size(11.5).color(theme.warn),
+                                    )
+                                    .truncate(),
+                                );
+                            }
+                        }
                         ui.add_space(6.0);
                         egui::ScrollArea::vertical()
                             .id_salt("palette-list")
@@ -19956,11 +20134,13 @@ impl ZaivernApp {
         }
     }
 
-    /// ファイルツリーからの削除の確認モーダル。
+    /// ファイルツリーからの削除の確認モーダル (複数選択にも対応)。
     fn delete_confirm_ui(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.pending_delete.clone() else {
+        if self.pending_delete.is_empty() {
             return;
-        };
+        }
+        let paths = self.pending_delete.clone();
+        let path = paths[0].clone();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -19974,7 +20154,12 @@ impl ZaivernApp {
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(if is_dir {
+                ui.label(if paths.len() > 1 {
+                    trf(
+                        "選択中の {n} 件(フォルダは中身ごと)を削除しますか？",
+                        &[("n", paths.len().to_string())],
+                    )
+                } else if is_dir {
                     trf(
                         "フォルダ(中身ごと)「{name}」を削除しますか？",
                         &[("name", name.clone())],
@@ -19985,6 +20170,26 @@ impl ZaivernApp {
                         &[("name", name.clone())],
                     )
                 });
+                // 何を消すのかを必ず見せる (長いパスは省略してホバーで全文)
+                if paths.len() > 1 {
+                    for p in paths.iter().take(8) {
+                        let label = self.rel_label(p);
+                        ui.add(
+                            egui::Label::new(RichText::new(format!("• {label}")).small())
+                                .truncate(),
+                        )
+                        .on_hover_text(p.display().to_string());
+                    }
+                    if paths.len() > 8 {
+                        ui.label(
+                            RichText::new(trf(
+                                "ほか {n} 件",
+                                &[("n", (paths.len() - 8).to_string())],
+                            ))
+                            .small(),
+                        );
+                    }
+                }
                 ui.label(
                     RichText::new(tr("この操作は取り消せません"))
                         .small()
@@ -20003,52 +20208,64 @@ impl ZaivernApp {
 
         match decided {
             Some(true) => {
-                // シンボリックリンクはリンク自体を消す (is_dir はリンク先を
-                // 辿るため、ディレクトリへのリンクを remove_dir_all に渡すと
-                // "Not a directory" で必ず失敗する)
-                let is_symlink = std::fs::symlink_metadata(&path)
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false);
-                let res = if is_symlink {
-                    std::fs::remove_file(&path)
-                } else if is_dir {
-                    std::fs::remove_dir_all(&path)
-                } else {
-                    std::fs::remove_file(&path)
-                };
-                match res {
-                    Ok(()) => {
-                        // 開いていたタブの後始末: 変更なしは閉じ、未保存の変更が
-                        // あるものはパスを外して内容を保持する(⌘S で保存先を選び直せる)
-                        let mut close: Vec<usize> = Vec::new();
-                        for (i, b) in self.editor.buffers.iter_mut().enumerate() {
-                            let Some(p) = b.path.as_ref() else { continue };
-                            if p == &path || p.starts_with(&path) {
-                                if b.dirty() {
-                                    b.path = None;
-                                } else {
-                                    close.push(i);
+                let mut ok = 0usize;
+                let mut last_err: Option<String> = None;
+                for path in &paths {
+                    // シンボリックリンクはリンク自体を消す (is_dir はリンク先を
+                    // 辿るため、ディレクトリへのリンクを remove_dir_all に渡すと
+                    // "Not a directory" で必ず失敗する)
+                    let is_symlink = std::fs::symlink_metadata(path)
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false);
+                    let res = if is_symlink {
+                        std::fs::remove_file(path)
+                    } else if path.is_dir() {
+                        std::fs::remove_dir_all(path)
+                    } else {
+                        std::fs::remove_file(path)
+                    };
+                    match res {
+                        Ok(()) => {
+                            ok += 1;
+                            // 開いていたタブの後始末: 変更なしは閉じ、未保存の変更が
+                            // あるものはパスを外して内容を保持する(⌘S で保存先を選び直せる)
+                            let mut close: Vec<usize> = Vec::new();
+                            for (i, b) in self.editor.buffers.iter_mut().enumerate() {
+                                let Some(p) = b.path.as_ref() else { continue };
+                                if p == path || p.starts_with(path) {
+                                    if b.dirty() {
+                                        b.path = None;
+                                    } else {
+                                        close.push(i);
+                                    }
                                 }
                             }
+                            for i in close.into_iter().rev() {
+                                self.editor.close(i);
+                            }
+                            self.tree.deselect_under(path);
                         }
-                        for i in close.into_iter().rev() {
-                            self.editor.close(i);
-                        }
-                        self.tree.invalidate();
-                        self.tree.deselect_under(&path);
-                        self.persist_session();
-                        self.toast(
-                            trf("🗑 {name} を削除しました", &[("name", name.clone())]),
-                            true,
-                        );
-                    }
-                    Err(e) => {
-                        self.toast(trf("削除できません: {e}", &[("e", e.to_string())]), false)
+                        Err(e) => last_err = Some(e.to_string()),
                     }
                 }
-                self.pending_delete = None;
+                if ok > 0 {
+                    self.tree.invalidate();
+                    self.persist_session();
+                    self.toast(
+                        if paths.len() == 1 {
+                            trf("🗑 {name} を削除しました", &[("name", name.clone())])
+                        } else {
+                            trf("🗑 {n} 件を削除しました", &[("n", ok.to_string())])
+                        },
+                        true,
+                    );
+                }
+                if let Some(e) = last_err {
+                    self.toast(trf("削除できません: {e}", &[("e", e)]), false);
+                }
+                self.pending_delete.clear();
             }
-            Some(false) => self.pending_delete = None,
+            Some(false) => self.pending_delete.clear(),
             _ => {}
         }
     }
@@ -22633,6 +22850,8 @@ impl ZaivernApp {
         //
         // 永続 UI 設定 (検索オプション・保存時クリーンアップ) は最初のフレームで読む
         self.load_prefs_once(ctx);
+        // バックグラウンドで作っている索引の完了を取り込む (UI は止めない)
+        self.poll_index(ctx);
 
         // 画面全体のズームは毎フレームここで egui へ揃える。値が変わって
         // いなければ何も起きない (再描画も要求されない)。
@@ -26227,6 +26446,103 @@ mod tests {
         std::fs::write(path, body).expect("write file");
     }
 
+    /// 索引テストの既定条件 (設定の既定値をそのまま使う — 直書きしない)。
+    fn test_index_opts() -> IndexOptions {
+        IndexOptions::from_config(&config::Config::default())
+    }
+
+    /// `.gitignore` に書いたものが索引に載らないこと。
+    /// 以前はハードコード 10 種しか除外できず、`out/` のような
+    /// リポジトリ固有の生成物が ⌘P を埋め尽くしていた。
+    #[test]
+    fn file_index_respects_gitignore() {
+        let base = unique_temp_dir("zaivern-app-test", "gitignore");
+        write(
+            &base.join(".gitignore"),
+            "node_modules/\ntarget/\nout/\n*.log\n",
+        );
+        write(&base.join("src/main.rs"), "fn main() {}");
+        write(&base.join("node_modules/pkg/index.js"), "x");
+        write(&base.join("target/debug/app"), "x");
+        write(&base.join("out/bundle.js"), "x");
+        write(&base.join("debug.log"), "x");
+
+        let roots = file_tree::normalize_roots(vec![base.clone()]);
+        let out = build_file_index_with(&roots, &test_index_opts(), None);
+        let labels: Vec<&str> = out.files.iter().map(|f| f.label.as_str()).collect();
+        assert!(
+            labels.contains(&"src/main.rs"),
+            "実ソースは載る: {labels:?}"
+        );
+        for bad in ["node_modules", "target", "out", "debug.log"] {
+            assert!(
+                !labels.iter().any(|l| l.contains(bad)),
+                "{bad} は .gitignore で除外されるべき: {labels:?}"
+            );
+        }
+        assert!(!out.truncated, "上限にはほど遠い");
+
+        // 設定で切れば全部載る (respect_gitignore = false)
+        let opts = IndexOptions {
+            respect_gitignore: false,
+            ..test_index_opts()
+        };
+        let all = build_file_index_with(&roots, &opts, None);
+        assert!(
+            all.files.iter().any(|f| f.label.contains("node_modules")),
+            "無効化したら除外しない"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 上限に達したら **黙って切らず** `truncated` を立て、UI へ出す文言を作ること。
+    #[test]
+    fn file_index_reports_truncation() {
+        let base = unique_temp_dir("zaivern-app-test", "truncate");
+        for i in 0..40 {
+            write(&base.join(format!("f{i}.txt")), "x");
+        }
+        let roots = file_tree::normalize_roots(vec![base.clone()]);
+        let opts = IndexOptions {
+            max_files: 10,
+            ..test_index_opts()
+        };
+        let out = build_file_index_with(&roots, &opts, None);
+        assert_eq!(out.files.len(), 10, "上限で止まる");
+        assert!(out.truncated, "打ち切りを記録する");
+
+        // 上限を上げれば全部載り、打ち切り表示も出ない
+        let out = build_file_index_with(&roots, &test_index_opts(), None);
+        assert_eq!(out.files.len(), 40);
+        assert!(!out.truncated);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 深さ上限も設定から来ること (直書きの 12 段を撤廃した)。
+    #[test]
+    fn file_index_depth_limit_comes_from_config() {
+        let base = unique_temp_dir("zaivern-app-test", "depth");
+        write(&base.join("a/b/c/deep.txt"), "x");
+        write(&base.join("top.txt"), "x");
+        let roots = file_tree::normalize_roots(vec![base.clone()]);
+
+        let shallow = IndexOptions {
+            max_depth: 2,
+            ..test_index_opts()
+        };
+        let out = build_file_index_with(&roots, &shallow, None);
+        let labels: Vec<&str> = out.files.iter().map(|f| f.label.as_str()).collect();
+        assert!(labels.contains(&"top.txt"));
+        assert!(!labels.iter().any(|l| l.contains("deep.txt")), "{labels:?}");
+
+        let out = build_file_index_with(&roots, &test_index_opts(), None);
+        assert!(out.files.iter().any(|f| f.rel == "a/b/c/deep.txt"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     // ── タブのドラッグ並べ替え ────────────────────────────────────
 
     /// 幅 `w` のタブを隙間なく `n` 枚並べた矩形列 (中心は w/2, 3w/2, …)。
@@ -26713,7 +27029,7 @@ mod tests {
 
         let roots = file_tree::normalize_roots(vec![a.clone(), b.clone()]);
         assert_eq!(roots.len(), 2, "別ツリーの 2 ルートは畳まれない");
-        let index = build_file_index(&roots);
+        let index = build_file_index_with(&roots, &test_index_opts(), None).files;
 
         // 衝突する rel は両方ともルート名付きラベルになる
         let mains: Vec<&IndexedFile> = index.iter().filter(|f| f.rel == "src/main.rs").collect();
@@ -26764,7 +27080,7 @@ mod tests {
         write(&base.join("README.md"), "# hi");
 
         let roots = file_tree::normalize_roots(vec![base.clone()]);
-        let index = build_file_index(&roots);
+        let index = build_file_index_with(&roots, &test_index_opts(), None).files;
         let mut labels: Vec<&str> = index.iter().map(|f| f.label.as_str()).collect();
         labels.sort();
         assert_eq!(labels, ["README.md", "src/main.rs"]);
