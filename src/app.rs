@@ -59,6 +59,7 @@ use crate::theme_json;
 use crate::tunnel;
 use crate::tutorial::{self, AnchorId};
 use crate::voice;
+use crate::worktree;
 use crate::zoom;
 
 // エージェントデッキ (縦 1 本のエージェント管理画面) は main.rs が
@@ -1034,6 +1035,10 @@ fn take_split_key(ctx: &egui::Context) -> Option<terminal::SplitAction> {
 
 /// Cockpit で押されたボタン類。クロージャの中では記録だけして、
 /// パネル描画後に self へ反映する (PluginActions と同じ流儀)。
+/// 衝突の一覧に並べる最大行数 (残りは「他 N 件」に畳む)。
+/// 警告は**目立つが邪魔にならない**のが方針なので、画面を占領させない。
+const CONFLICT_ROWS_MAX: usize = 6;
+
 #[derive(Default)]
 struct CockpitActions {
     launch: Option<usize>,
@@ -2163,6 +2168,23 @@ pub struct ZaivernApp {
     /// 🏁 プロンプトレース (1 プロンプトを複数エージェントに並走させる) の
     /// ダッシュボード状態。描画・git 操作の実体は race.rs。
     race: race::RacePanel,
+    /// worktree 隔離で起動したエージェント (セッション ID → 割り当てた worktree)。
+    ///
+    /// セッションの `cwd` にも worktree のフォルダは入っているが、
+    /// 「どのリポジトリの worktree か / どのブランチか」はここにしか無い。
+    /// 破棄時の `git worktree remove` と、セッション保存 / 復元がこれを見る。
+    agent_worktrees: HashMap<u64, worktree::AgentWorktree>,
+    /// 同じ作業ツリーに同居しているエージェント同士のファイル衝突の見張り。
+    /// 同居が 0 なら git を 1 回も叩かない (アイドル時のコストはゼロ)。
+    conflicts: worktree::ConflictWatch,
+    /// 衝突バッジの詳細 (どのファイルを誰が取り合っているか) を開いているか。
+    /// **既定は閉じ**。画面が勝手に開かないよう、明示的に押されたときだけ広がる。
+    conflict_detail: bool,
+    /// 全エージェント一括停止の確認モーダルが出ているか (破壊的操作)。
+    pending_stop_all: bool,
+    /// 閉じたエージェントに割り当てられていた worktree の後始末待ち。
+    /// `(worktree, 未コミット変更が残っているか)`。**確認なしには消さない**。
+    pending_worktree: Option<(worktree::AgentWorktree, bool)>,
     /// 構文ハイライタ。プロセスで 1 つの共有インスタンス
     /// (`SyntaxSet` は数 MB あるので差分ビューと二重に持たない)。
     highlighter: &'static Highlighter,
@@ -2890,6 +2912,11 @@ impl ZaivernApp {
             palette_worktrees: None,
             pending_prompts: Vec::new(),
             race: race::RacePanel::new(),
+            agent_worktrees: HashMap::new(),
+            conflicts: worktree::ConflictWatch::new(),
+            conflict_detail: false,
+            pending_stop_all: false,
+            pending_worktree: None,
             highlighter: crate::highlight::shared(),
             cockpit: false,
             cockpit_followed: None,
@@ -4518,6 +4545,18 @@ impl ZaivernApp {
                         .unwrap_or_default(),
                     // 分割しているタイルだけが中身を持つ (他は空文字)。
                     split: self.split_line_for(s.id),
+                    // worktree 隔離で起動した 1 体だけが中身を持つ (他は空文字)。
+                    // これが往復しないと、再起動で自分の worktree に戻れない。
+                    worktree_repo: self
+                        .agent_worktrees
+                        .get(&s.id)
+                        .map(|w| w.repo.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    worktree_branch: self
+                        .agent_worktrees
+                        .get(&s.id)
+                        .map(|w| w.branch.clone())
+                        .unwrap_or_default(),
                 })
                 .collect(),
         };
@@ -4624,7 +4663,17 @@ impl ZaivernApp {
                 log_path,
             };
             match self.agents.launch_restored(spec, &replay, ctx) {
-                Ok(()) => restored += 1,
+                Ok(()) => {
+                    restored += 1;
+                    // 隔離エージェントは**前回と同じ worktree** へ戻す。
+                    // cwd は上で worktree のフォルダを指しているので、
+                    // ここでは「どのリポジトリ / どのブランチか」を繋ぎ直す。
+                    if let Some(id) = self.agents.sessions.last().map(|s| s.id) {
+                        if let Some(wt) = restored_worktree(rec) {
+                            self.agent_worktrees.insert(id, wt);
+                        }
+                    }
+                }
                 Err(e) => self.toast(e, false),
             }
         }
@@ -5732,6 +5781,55 @@ impl ZaivernApp {
         }
     }
 
+    /// プリセット `i` を **専用の git worktree** で起動する。
+    ///
+    /// 「並列エージェントは衝突を後で発見させない」の一番強い形 —
+    /// そもそも同じ作業ツリーを共有させない。作業フォルダが git リポジトリで
+    /// ないときは worktree を作れないので、理由を出して何もしない
+    /// (メニュー側でも同じ判定で選択肢を無効化している)。
+    fn launch_preset_isolated(&mut self, i: usize, ctx: &egui::Context) {
+        let Some(p) = self.cfg.agents.get(i).cloned() else {
+            return;
+        };
+        let root = self.agent_cwd();
+        if !worktree::looks_like_git_repo(&root) {
+            self.toast(
+                tr("git リポジトリではないので worktree 隔離は使えません（worktree は git の機能です）"),
+                false,
+            );
+            return;
+        }
+        let wt = match worktree::create_agent_worktree(&root, &p.name) {
+            Ok(wt) => wt,
+            Err(e) => {
+                self.toast(e, false);
+                return;
+            }
+        };
+        let before = self.agents.sessions.len();
+        self.launch_preset_with(i, p.command.clone(), &wt.dir, ctx);
+        match self.agents.sessions.len() > before {
+            true => {
+                if let Some(id) = self.agents.sessions.last().map(|s| s.id) {
+                    self.agent_worktrees.insert(id, wt.clone());
+                }
+                self.toast(
+                    trf(
+                        "🌿 {name} を隔離 worktree ({branch}) で起動しました",
+                        &[("name", p.name.clone()), ("branch", wt.branch.clone())],
+                    ),
+                    true,
+                );
+                self.persist_session();
+            }
+            // 起動できなかったなら、作ったばかりの worktree を残さず畳む
+            // (中身は空なので force で消して構わない)。
+            false => {
+                let _ = worktree::remove_agent_worktree(&wt, true);
+            }
+        }
+    }
+
     fn launch_preset(&mut self, i: usize, ctx: &egui::Context) {
         let cmd = self.cfg.agents.get(i).map(|p| p.command.clone());
         let Some(cmd) = cmd else { return };
@@ -5814,10 +5912,18 @@ impl ZaivernApp {
     fn close_agent(&mut self, i: usize) {
         // セッション ID は再利用され得るので、フェイルオーバーの段も一緒に忘れる
         // (残すと別セッションの状態として読まれてしまう)。
+        let mut freed: Option<worktree::AgentWorktree> = None;
         if let Some(id) = self.agents.sessions.get(i).map(|s| s.id) {
             self.failover.forget_session(id);
+            freed = self.agent_worktrees.remove(&id);
         }
         self.agents.remove(i);
+        // 隔離 worktree を持っていたなら、**残すか消すかをユーザーに選ばせる**。
+        // 黙って消すと未コミットの成果ごと消える (git 自身の拒否も回避してしまう)。
+        if let Some(wt) = freed {
+            let dirty = worktree::worktree_is_dirty(&wt.dir);
+            self.pending_worktree = Some((wt, dirty));
+        }
         // 閉じたセッションが分割ペインだったら、木からも外して畳む
         // (残り 1 枚になったタイルは分割なしの描画へ戻る)。
         self.normalize_splits();
@@ -8465,7 +8571,9 @@ impl ZaivernApp {
             | Cmd::NewAgent(_)
             | Cmd::FocusAgent(_)
             | Cmd::RestartAgent
-            | Cmd::KillAgent => self.apply_cmd_agent(cmd, ctx),
+            | Cmd::KillAgent
+            | Cmd::NewAgentIsolated(_)
+            | Cmd::StopAllAgents => self.apply_cmd_agent(cmd, ctx),
             Cmd::SetTheme(_)
             | Cmd::OpenConfig
             | Cmd::ReloadConfig
@@ -9086,6 +9194,15 @@ impl ZaivernApp {
                 self.find.focus = true;
             }
             Cmd::NewAgent(i) => self.launch_preset(i, ctx),
+            Cmd::NewAgentIsolated(i) => self.launch_preset_isolated(i, ctx),
+            Cmd::StopAllAgents => {
+                if self.agents.running_count() == 0 {
+                    self.toast(tr("稼働中のエージェントはありません"), false);
+                } else {
+                    // 破壊的操作なので必ず確認を挟む (実行はモーダル側)。
+                    self.pending_stop_all = true;
+                }
+            }
             Cmd::FocusAgent(i) => {
                 if i < self.agents.sessions.len() {
                     self.agents.active = i;
@@ -10980,6 +11097,45 @@ impl ZaivernApp {
                     ui.close_menu();
                 }
             }
+            // ── worktree 隔離で起動 ────────────────────────────────
+            // 同じ作業ツリーを共有させないので、ファイルの取り合いが起きない。
+            // worktree は git の機能なので、git リポジトリでなければ選べない
+            // (理由はホバーで出す — 押せないボタンを無言で置かない)。
+            ui.separator();
+            let isolated_label = tr("🌿 worktree 隔離で起動…");
+            if worktree::looks_like_git_repo(&self.agent_cwd()) {
+                let m = ui.menu_button(isolated_label, |ui| {
+                    for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
+                        if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
+                            cmds.push(Cmd::NewAgentIsolated(i));
+                            ui.close_menu();
+                        }
+                    }
+                });
+                m.response.on_hover_text(tr(
+                    "このエージェント専用の git worktree (ブランチ agent/…) を切って、\n\
+                     そこを作業フォルダにして起動します。他のエージェントと\n\
+                     同じファイルを取り合いません",
+                ));
+            } else {
+                ui.add_enabled(false, egui::Button::new(isolated_label))
+                    .on_disabled_hover_text(tr(
+                        "このフォルダは git リポジトリではないので worktree を作れません",
+                    ));
+            }
+            // 稼働中が 1 体も居ないときは 1 行も使わない (常に出るだけのボタンを作らない)。
+            if self.agents.running_count() > 0
+                && ui
+                    .button(tr("🛑 全エージェントを停止…"))
+                    .on_hover_text(tr(
+                        "稼働中のエージェントをプロセスツリーごと止めます（確認あり）",
+                    ))
+                    .clicked()
+            {
+                cmds.push(Cmd::StopAllAgents);
+                ui.close_menu();
+            }
+
             ui.separator();
             // エージェントと同じ場所から呼び出せる「指揮統制の看板」。
             if ui
@@ -13033,6 +13189,10 @@ impl ZaivernApp {
 
     fn cockpit_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let theme = self.theme.clone();
+        // 同居しているエージェント同士のファイル衝突を見張る。
+        // 同じ作業ツリーに 2 体以上居ないときは git を 1 回も叩かない
+        // (= Cockpit を開いていてもアイドルなら追加コストはゼロ)。
+        self.sync_conflicts();
         // 押されたボタン類はクロージャの中では記録だけして、描画後に self へ反映する。
         let mut acts = CockpitActions::default();
         let mut orch_acts: Vec<orchestration::OrchAction> = Vec::new();
@@ -13059,6 +13219,7 @@ impl ZaivernApp {
             .show(ui, |ui| {
                 self.cockpit_header_ui(ui, &theme, &mut acts);
                 ui.add_space(space::XS);
+                self.cockpit_conflicts_ui(ui, &theme);
 
                 // ── 常設をやめたセクション ────────────────────────────
                 //
@@ -13101,6 +13262,105 @@ impl ZaivernApp {
 
         self.apply_cockpit_actions(ctx, &theme, &orch_rows, acts, orch_acts);
         self.apply_race_actions(race_acts, ctx);
+    }
+
+    /// 衝突の見張りへ現在のエージェント (ID・作業ツリー・生死) を渡す。
+    /// Cockpit / 看板を描くフレームでだけ呼ぶ (閉じている間は 1 命令も走らない)。
+    fn sync_conflicts(&mut self) {
+        let live: Vec<(u64, PathBuf, bool)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| (s.id, s.cwd.clone(), s.running()))
+            .collect();
+        self.conflicts.update(&live);
+    }
+
+    /// 衝突バッジのツールチップ (ファイル名と、取り合っている相手の名前)。
+    fn conflict_tooltip(&self) -> String {
+        let rep = self.conflicts.report();
+        let mut lines = vec![trf(
+            "{n} 体が同じ作業ツリーで同じファイルを触っています",
+            &[("n", rep.agents().len().to_string())],
+        )];
+        for f in rep.files.iter().take(CONFLICT_ROWS_MAX) {
+            let who: Vec<String> = f
+                .agents
+                .iter()
+                .filter_map(|id| self.agents.sessions.iter().find(|s| s.id == *id))
+                .map(|s| format!("{} {}", s.icon, s.title))
+                .collect();
+            lines.push(format!("• {} — {}", f.label, who.join(" ・ ")));
+        }
+        let more = rep.file_count().saturating_sub(CONFLICT_ROWS_MAX);
+        if more > 0 {
+            lines.push(trf("… 他 {n} 件", &[("n", more.to_string())]));
+        }
+        lines.push(tr("🌿 worktree 隔離で起動すると、この取り合いは起きません"));
+        lines.join("\n")
+    }
+
+    /// 衝突の詳細行。**閉じているときと 0 件のときは高さを 1 px も取らない**。
+    fn cockpit_conflicts_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        if !self.conflict_detail || self.conflicts.report().is_empty() {
+            return;
+        }
+        let rep = self.conflicts.report();
+        let rows: Vec<(String, String)> = rep
+            .files
+            .iter()
+            .take(CONFLICT_ROWS_MAX)
+            .map(|f| {
+                let who: Vec<String> = f
+                    .agents
+                    .iter()
+                    .filter_map(|id| self.agents.sessions.iter().find(|s| s.id == *id))
+                    .map(|s| format!("{} {}", s.icon, s.title))
+                    .collect();
+                (f.label.clone(), who.join(" ・ "))
+            })
+            .collect();
+        let more = rep.file_count().saturating_sub(rows.len());
+        egui::Frame::none()
+            .fill(theme.panel_alt)
+            .rounding(4.0)
+            .inner_margin(egui::Margin::same(space::SM))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(tr("⚠ 同じファイルを複数のエージェントが触っています"))
+                        .color(theme.warn)
+                        .strong(),
+                );
+                for (file, who) in rows {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(RichText::new(&file).monospace()).truncate())
+                            .on_hover_text(&file);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(who.clone()).small().color(theme.text_dim),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(who);
+                    });
+                }
+                if more > 0 {
+                    ui.label(
+                        RichText::new(trf("… 他 {n} 件", &[("n", more.to_string())]))
+                            .small()
+                            .color(theme.text_dim),
+                    );
+                }
+                ui.label(
+                    RichText::new(tr(
+                        "🌿 worktree 隔離で起動すると、同じファイルの取り合いは起きません",
+                    ))
+                    .small()
+                    .color(theme.text_dim),
+                );
+            });
+        ui.add_space(space::XS);
     }
 
     /// Cockpit のヘッダー行 (タイトル・稼働数・閉じる/全切替・Agent 起動・
@@ -13166,6 +13426,28 @@ impl ZaivernApp {
                 })
                 .color(theme.text_dim),
             );
+            // ── ファイル衝突のバッジ ────────────────────────────────
+            // **0 件のときは 1 ピクセルも出さない**。押すと詳細が下に開く
+            // (勝手には開かない = 画面が突然変わらない)。
+            let conflict_n = self.conflicts.report().file_count();
+            if conflict_n > 0 {
+                let tip = self.conflict_tooltip();
+                let hit = ui
+                    .selectable_label(
+                        self.conflict_detail,
+                        RichText::new(if compact {
+                            format!("⚠{conflict_n}")
+                        } else {
+                            trf("⚠ {n} ファイル競合", &[("n", conflict_n.to_string())])
+                        })
+                        .color(theme.warn)
+                        .strong(),
+                    )
+                    .on_hover_text(tip);
+                if hit.clicked() {
+                    self.conflict_detail = !self.conflict_detail;
+                }
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -14343,6 +14625,9 @@ impl ZaivernApp {
     fn kanban_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let theme = self.theme.clone();
         let active = self.agents.active;
+        // Cockpit と同じ見張り。同居が 0 なら git を 1 回も叩かない。
+        self.sync_conflicts();
+        let conflicts = self.conflicts.report().clone();
         // PTY 画面の読み直し (parser のロック) は看板が「今」と言ったフレームだけ。
         // 看板を開けっぱなしでもアイドル時のコストがゼロに近くなる。
         let now_ms = self.supervisor.elapsed_ms();
@@ -14389,6 +14674,17 @@ impl ZaivernApp {
                     // 指名スーパーエージェント (指揮官)。看板は同じ形のカードが
                     // 並ぶので、どれが指揮官かを枠と冠で一目で分かるようにする。
                     commander: self.super_agent_session == Some(s.id),
+                    // 同じ作業ツリーの誰かとファイルを取り合っていたら ⚠。
+                    // 取り合っているファイル名はホバーに畳む。
+                    conflict: conflicts.has_agent(s.id).then(|| {
+                        trf(
+                            "⚠ 他のエージェントと同じファイルを触っています: {files}",
+                            &[(
+                                "files",
+                                worktree::summarize_labels(&conflicts.labels_for(s.id), 3),
+                            )],
+                        )
+                    }),
                     can_cycle: s.permission_switch_hint().is_some(),
                     // カードの一言 + ホバープレビュー + アクティビティ分類の材料。
                     // サンプリング周期のフレームだけ実際に PTY を読む
@@ -18672,6 +18968,26 @@ impl ZaivernApp {
                 Cmd::NewAgent(i),
             ));
         }
+        // worktree 隔離での起動。git リポジトリでないフォルダでは候補ごと出さない
+        // (押しても必ず失敗するコマンドをパレットに並べない)。
+        if worktree::looks_like_git_repo(&self.agent_cwd()) {
+            for (i, p) in self.cfg.agents.iter().enumerate() {
+                cmds.push((
+                    "🌿".into(),
+                    trf("worktree 隔離で起動: {name}", &[("name", p.name.clone())]),
+                    tr("専用ブランチ agent/… を切って、そこを作業フォルダにする"),
+                    Cmd::NewAgentIsolated(i),
+                ));
+            }
+        }
+        if self.agents.running_count() > 0 {
+            cmds.push((
+                "🛑".into(),
+                tr("全エージェントを停止"),
+                tr("稼働中のエージェントをプロセスツリーごと止めます（確認あり）"),
+                Cmd::StopAllAgents,
+            ));
+        }
         for (i, s) in self.agents.sessions.iter().enumerate() {
             cmds.push((
                 s.icon.clone(),
@@ -21404,6 +21720,134 @@ impl ZaivernApp {
     }
 
     /// 前任セッションを止める提案の確認モーダル。
+    /// 全エージェント一括停止の確認モーダル (破壊的操作なので必ず通す)。
+    fn stop_all_confirm_ui(&mut self, ctx: &egui::Context) {
+        if !self.pending_stop_all {
+            return;
+        }
+        let running = self.agents.running_count();
+        if running == 0 {
+            self.pending_stop_all = false;
+            return;
+        }
+        let warn = self.theme.warn;
+        let mut decided: Option<bool> = None;
+        egui::Window::new(tr("全エージェントの停止"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(trf(
+                    "稼働中の {n} 体をすべて停止します。作業中の内容は失われる可能性があります。",
+                    &[("n", running.to_string())],
+                ));
+                ui.label(
+                    RichText::new(tr(
+                        "タブは残るので、あとから ⟳ で同じ場所から起動し直せます。",
+                    ))
+                    .small(),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new(tr("🛑 全部停止する")).color(warn))
+                        .clicked()
+                    {
+                        decided = Some(true);
+                    }
+                    if ui.button(tr("キャンセル")).clicked() {
+                        decided = Some(false);
+                    }
+                });
+            });
+        match decided {
+            Some(true) => {
+                self.pending_stop_all = false;
+                let n = self.agents.stop_all();
+                self.toast(
+                    trf("🛑 {n} 体を停止しました", &[("n", n.to_string())]),
+                    true,
+                );
+            }
+            Some(false) => self.pending_stop_all = false,
+            None => {}
+        }
+    }
+
+    /// 閉じたエージェントに割り当てられていた worktree をどうするかの確認モーダル。
+    ///
+    /// **既定は「残す」側**。未コミットの変更があるときは何が失われるかを本文に
+    /// 明示し、削除ボタンだけを警告色にする (`git worktree remove --force` は
+    /// ここを通ったときにしか撃たれない)。
+    fn worktree_confirm_ui(&mut self, ctx: &egui::Context) {
+        let Some((wt, dirty)) = self.pending_worktree.clone() else {
+            return;
+        };
+        let warn = self.theme.warn;
+        let body = worktree::removal_prompt(&wt.branch, &wt.dir, dirty);
+        let mut decided: Option<bool> = None;
+        egui::Window::new(tr("worktree の後始末"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.label(body);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(tr("🌿 残す"))
+                        .on_hover_text(tr(
+                            "worktree とブランチをそのまま残します（あとで自分でマージ・削除できます）",
+                        ))
+                        .clicked()
+                    {
+                        decided = Some(false);
+                    }
+                    let del = if dirty {
+                        tr("🗑 変更ごと削除する")
+                    } else {
+                        tr("🗑 削除する")
+                    };
+                    if ui
+                        .button(RichText::new(del).color(warn))
+                        .on_hover_text(tr("worktree のフォルダとブランチを削除します"))
+                        .clicked()
+                    {
+                        decided = Some(true);
+                    }
+                });
+            });
+        match decided {
+            Some(true) => {
+                self.pending_worktree = None;
+                match worktree::remove_agent_worktree(&wt, dirty) {
+                    Ok(()) => self.toast(
+                        trf(
+                            "🗑 worktree {branch} を削除しました",
+                            &[("branch", wt.branch.clone())],
+                        ),
+                        true,
+                    ),
+                    Err(e) => self.toast(e, false),
+                }
+                self.persist_session();
+            }
+            Some(false) => {
+                self.pending_worktree = None;
+                self.toast(
+                    trf(
+                        "🌿 worktree {branch} を残しました",
+                        &[("branch", wt.branch.clone())],
+                    ),
+                    true,
+                );
+                self.persist_session();
+            }
+            None => {}
+        }
+    }
+
     fn stop_confirm_ui(&mut self, ctx: &egui::Context) {
         if self.pending_stop.is_empty() {
             return;
@@ -22196,6 +22640,8 @@ impl ZaivernApp {
         self.delete_confirm_ui(ctx);
         self.intervention_confirm_ui(ctx, win_focused);
         self.stop_confirm_ui(ctx);
+        self.stop_all_confirm_ui(ctx);
+        self.worktree_confirm_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
         self.toasts_ui(ctx);
@@ -22700,6 +23146,26 @@ fn restored_roots(current: &[PathBuf], mut saved: Vec<PathBuf>) -> Option<Vec<Pa
 /// 採用し、外れたら primary ルートへ落とす:
 /// - ディレクトリとして実在する (worktree を消した後などを弾く)
 /// - いずれかのルート配下にある (ワークスペースから外したフォルダを弾く)
+/// セッション記録から「隔離 worktree の割り当て」を復元する (純粋関数)。
+///
+/// リポジトリ・ブランチ・cwd の 3 つが揃い、**フォルダが実在するときだけ**
+/// 隔離として扱う。worktree を手で消した後に記録だけ残っている状態で
+/// `git worktree remove` を撃たないための門番でもある。
+fn restored_worktree(rec: &session::AgentSessionRec) -> Option<worktree::AgentWorktree> {
+    if rec.worktree_repo.is_empty() || rec.worktree_branch.is_empty() || rec.cwd.is_empty() {
+        return None;
+    }
+    let dir = PathBuf::from(&rec.cwd);
+    if !dir.is_dir() {
+        return None;
+    }
+    Some(worktree::AgentWorktree {
+        repo: PathBuf::from(&rec.worktree_repo),
+        branch: rec.worktree_branch.clone(),
+        dir,
+    })
+}
+
 fn agent_cwd_from(roots: &[PathBuf], chosen: Option<&Path>) -> PathBuf {
     let primary = || roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     match chosen {
@@ -25545,6 +26011,43 @@ mod tests {
         assert_eq!(DialogSpec::pick_folder().mode, DialogMode::PickFolder);
         assert_eq!(DialogSpec::save_file().mode, DialogMode::SaveFile);
         assert_send(&DialogPurpose::OpenFile);
+    }
+
+    /// DoD: 隔離エージェントは再起動後も**同じ worktree** に戻る。
+    /// セッション記録 → 割り当ての復元が壊れると、次の起動で本体ツリーへ
+    /// 落ちて隔離が黙って無効になる (一番気付きにくい壊れ方)。
+    #[test]
+    fn 隔離エージェントは再起動後も同じworktreeへ戻る() {
+        let base = crate::test_util::unique_temp_dir("zaivern-app-test", "restore-wt");
+        let wt_dir = base.join("repo-agent-claude-code-1");
+        std::fs::create_dir_all(&wt_dir).expect("worktree のふり");
+        let rec = session::AgentSessionRec {
+            preset_name: "Claude Code".into(),
+            cwd: wt_dir.to_string_lossy().into_owned(),
+            worktree_repo: base.join("repo").to_string_lossy().into_owned(),
+            worktree_branch: "agent/claude-code-1".into(),
+            ..Default::default()
+        };
+        let got = restored_worktree(&rec).expect("隔離として復元される");
+        assert_eq!(got.dir, wt_dir, "前回と同じ worktree へ戻る");
+        assert_eq!(got.branch, "agent/claude-code-1");
+        assert_eq!(got.repo, base.join("repo"));
+
+        // 隔離していない記録は None (通常起動のまま)
+        let plain = session::AgentSessionRec {
+            cwd: wt_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        assert!(restored_worktree(&plain).is_none());
+
+        // worktree を手で消した後の記録は None。
+        // ここで Some を返すと、実体の無いフォルダへ `git worktree remove` を撃つ。
+        std::fs::remove_dir_all(&wt_dir).ok();
+        assert!(
+            restored_worktree(&rec).is_none(),
+            "消えた worktree を掴んでいる"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// DoD: エージェントは「直近に開いたフォルダ」で起動する。
