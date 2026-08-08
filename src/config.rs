@@ -28,6 +28,12 @@ pub struct Config {
     /// オフにすると要求自体を送らないので、サーバーへの往復もゼロになる。
     pub lsp_highlight_occurrences: bool,
 
+    /// 診断メッセージを本文の**行末**に淡色で出すか (VS Code の Error Lens 相当)。
+    /// **既定はオン。ただし出すのはキャレット行だけ** — 全行に出すと本文の
+    /// 右側が文章で埋まり、コードより診断の方が目立ってしまう。
+    /// オフにしても波線とホバーは残る (消えるのは行末の文字だけ)。
+    pub inline_diagnostics: bool,
+
     /// エディタ右端のミニマップ (VS Code の遠景ビュー相当)。
     /// **既定はオフ** — 本文の横幅を 64px 奪うので、欲しい人だけが払う。
     /// 幅が足りない画面では設定が ON でも自動的に隠れる。
@@ -266,6 +272,7 @@ impl Default for Config {
             word_wrap: false,
             show_whitespace: false,
             lsp_highlight_occurrences: true,
+            inline_diagnostics: true,
             minimap: false,
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
@@ -578,6 +585,11 @@ show_hidden_files = true
 # カーソル下のシンボルと同じものを本文で薄くハイライトする (LSP documentHighlight)
 # (コマンドパレットの「同一シンボルのハイライト切替」でも変更できます)
 # lsp_highlight_occurrences = true
+
+# 診断メッセージを本文の行末に淡色で出す (VS Code の Error Lens 相当)
+# 出るのは**キャレット行だけ**です。オフにしても波線とホバーは残ります
+# (コマンドパレットの「行末の診断メッセージ切替」でも変更できます)
+# inline_diagnostics = true
 
 # ミニマップ (エディタ右端の遠景) とブレッドクラム (上部のパンくず)
 # (表示メニュー・コマンドパレットの「ミニマップの表示切替」「ブレッドクラムの表示切替」でも変更できます)

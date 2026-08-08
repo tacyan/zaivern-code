@@ -65,6 +65,10 @@ pub enum BindAction {
     GoToDefinition,
     /// 対応する括弧へ移動 (VS Code: ⇧⌘\)
     GoToBracket,
+    /// 次の診断へ移動 (VS Code: F8)
+    NextProblem,
+    /// 前の診断へ移動 (VS Code: ⇧F8)
+    PrevProblem,
     /// ビルドタスクの実行 (VS Code: ⇧⌘B)
     RunBuildTask,
     /// 問題パネル (VS Code: ⇧⌘M)
@@ -125,7 +129,7 @@ pub enum BindAction {
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 61] = [
+pub const ALL_ACTIONS: [BindAction; 63] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -164,6 +168,8 @@ pub const ALL_ACTIONS: [BindAction; 61] = [
     BindAction::NavForward,
     BindAction::GoToDefinition,
     BindAction::GoToBracket,
+    BindAction::NextProblem,
+    BindAction::PrevProblem,
     BindAction::RunBuildTask,
     BindAction::ToggleProblems,
     BindAction::ToggleFullScreen,
@@ -284,6 +290,10 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         }
         BindAction::GoToDefinition => KeyboardShortcut::new(Modifiers::NONE, Key::F12),
         BindAction::GoToBracket => KeyboardShortcut::new(cmd_shift, Key::Backslash),
+        // 診断ジャンプは VS Code と同じ F8 / ⇧F8。F7 / ⇧F7 (差分の変更ジャンプ) の
+        // 隣で、macOS の予約表 (F11 = デスクトップ表示) とも衝突しない。
+        BindAction::NextProblem => KeyboardShortcut::new(Modifiers::NONE, Key::F8),
+        BindAction::PrevProblem => KeyboardShortcut::new(Modifiers::SHIFT, Key::F8),
         BindAction::RunBuildTask => KeyboardShortcut::new(cmd_shift, Key::B),
         BindAction::ToggleProblems => KeyboardShortcut::new(cmd_shift, Key::M),
         BindAction::ToggleFullScreen => {
@@ -417,6 +427,8 @@ impl Keybinds {
             "nav_forward" => NavForward,
             "goto_definition" => GoToDefinition,
             "goto_bracket" => GoToBracket,
+            "next_problem" => NextProblem,
+            "prev_problem" => PrevProblem,
             "run_build_task" => RunBuildTask,
             "toggle_problems" => ToggleProblems,
             "toggle_fullscreen" => ToggleFullScreen,
@@ -1211,6 +1223,8 @@ mod tests {
             "nav_forward",
             "goto_definition",
             "goto_bracket",
+            "next_problem",
+            "prev_problem",
             "run_build_task",
             "toggle_problems",
             "toggle_fullscreen",

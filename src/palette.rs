@@ -185,6 +185,11 @@ pub enum Cmd {
     ShowGitHubTab,
     /// 問題 (LSP 診断) パネルの表示切替 (VS Code: ⇧⌘M)
     ToggleProblems,
+    /// 次 / 前の診断へ移動 (VS Code: F8 / ⇧F8)
+    NextProblem,
+    PrevProblem,
+    /// 行末の診断メッセージ (Error Lens 相当) の表示切替
+    ToggleInlineDiagnostics,
     /// フルスクリーン切替 (VS Code: ⌃⌘F)
     ToggleFullScreen,
     /// ナビゲーション履歴 (VS Code: ⌃- / ⌃⇧-)
@@ -534,6 +539,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleSearchRegex
         | Cmd::GoToDefinition
         | Cmd::GoToBracket
+        | Cmd::NextProblem
+        | Cmd::PrevProblem
         | Cmd::GoToLine
         | Cmd::NavBack
         | Cmd::NavForward
@@ -563,6 +570,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleMinimap
         | Cmd::ToggleBreadcrumbs
         | Cmd::ToggleProblems
+        | Cmd::ToggleInlineDiagnostics
         | Cmd::ToggleFullScreen
         | Cmd::ToggleTableView
         | Cmd::ToggleLspHighlight
