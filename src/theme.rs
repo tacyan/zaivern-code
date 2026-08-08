@@ -29,6 +29,91 @@ const fn c(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// 虹色括弧で塗り分ける深さの本数 (これを超えたら先頭へ折り返す)。
+///
+/// VS Code の既定と同じ 3 色。**11 種のテーマすべてで互いに見分けが付く**
+/// 上限がここだった — 4 本目に緑を足すと Everforest 系 (`zaivern-forest`)
+/// で黄と緑が距離 57 まで近づき、深さの違いが読めなくなる。
+/// 色数を増やすより、どのテーマでも確実に読めるほうを採る
+/// (`theme::tests::虹色括弧の色が全テーマで読めて見分けが付く` が番人)。
+pub const BRACKET_DEPTHS: usize = 3;
+
+/// sRGB の相対輝度 (WCAG 2.x)。
+pub fn relative_luminance(col: Color32) -> f32 {
+    let f = |v: u8| {
+        let s = v as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * f(col.r()) + 0.7152 * f(col.g()) + 0.0722 * f(col.b())
+}
+
+/// 2 色のコントラスト比 (WCAG 2.x)。1.0 (同色) 〜 21.0 (黒と白)。
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (x, y) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// `a` を `b` へ `t` (0..=1) だけ寄せる。
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| {
+        (x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+/// `bg` の上で最低 `min` のコントラストになるまで `col` を明暗方向へ寄せる。
+///
+/// 寄せ先は白か黒 (地が暗ければ白、明るければ黒) — 色相を保ったまま
+/// 明度だけ動かすので、読めるようにしたせいで色同士が潰れることがない。
+fn readable_on(col: Color32, bg: Color32, min: f32) -> Color32 {
+    let target = if relative_luminance(bg) < 0.5 {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    let mut out = col;
+    for _ in 0..12 {
+        if contrast_ratio(out, bg) >= min {
+            break;
+        }
+        out = mix(out, target, 0.12);
+    }
+    out
+}
+
+impl Theme {
+    /// 括弧の入れ子を深さごとに塗り分ける色 (VS Code の
+    /// `editor.bracketPairColorization`)。
+    ///
+    /// **テーマの ANSI 表から採る** — 直書きしないので、テーマを変えれば
+    /// 括弧の色も一緒に変わる。並びは「黄 → 紫 → 青」
+    /// (VS Code の既定 Gold / Orchid / LightSkyBlue と同じ順)。
+    /// 地に沈む色は明暗方向へ寄せてコントラスト 3:1 を確保する。
+    pub fn bracket_colors(&self) -> [Color32; BRACKET_DEPTHS] {
+        // ansi: 1=赤 2=緑 3=黄 4=青 5=紫 6=シアン
+        // 赤はエラー色と、シアンは青と、緑は黄と紛れるテーマがあるので使わない。
+        const IDX: [usize; BRACKET_DEPTHS] = [3, 5, 4];
+        let mut out = [Color32::WHITE; BRACKET_DEPTHS];
+        for (o, i) in out.iter_mut().zip(IDX) {
+            *o = readable_on(self.ansi[i], self.bg, 3.0);
+        }
+        out
+    }
+
+    /// 縦のルーラー (`editor.rulers`) の線の色。
+    /// 本文の邪魔にならないよう境界線と同じ濃さにする。
+    pub fn ruler_color(&self) -> Color32 {
+        self.border
+    }
+}
+
 fn zaivern_dark() -> Theme {
     Theme {
         name: "zaivern-dark".into(),
@@ -984,23 +1069,54 @@ mod tests {
         }
     }
 
-    /// sRGB の相対輝度 (WCAG 2.x)。
-    fn relative_luminance(col: Color32) -> f32 {
-        let f = |v: u8| {
-            let s = v as f32 / 255.0;
-            if s <= 0.03928 {
-                s / 12.92
-            } else {
-                ((s + 0.055) / 1.055).powf(2.4)
+    /// 虹色括弧の色が、既定のテーマすべてで「読めて・見分けが付く」こと。
+    ///
+    /// 色はテーマの ANSI 表から採るので、テーマを足したときにここが落ちる
+    /// = そのテーマでは括弧の深さが判別できない、という検出器になる。
+    #[test]
+    fn 虹色括弧の色が全テーマで読めて見分けが付く() {
+        for t in all() {
+            let cols = t.bracket_colors();
+            assert_eq!(cols.len(), BRACKET_DEPTHS);
+            for (i, col) in cols.iter().enumerate() {
+                let r = contrast_ratio(*col, t.bg);
+                assert!(r >= 3.0, "{}: 深さ {i} の括弧が地に沈む ({r:.2})", t.name);
+                // エラー色 (対応が取れない括弧) と紛れない
+                let d = dist(*col, t.err);
+                assert!(
+                    d >= 48,
+                    "{}: 深さ {i} がエラー色と紛れる (距離 {d})",
+                    t.name
+                );
             }
-        };
-        0.2126 * f(col.r()) + 0.7152 * f(col.g()) + 0.0722 * f(col.b())
+            for i in 0..cols.len() {
+                for j in (i + 1)..cols.len() {
+                    let d = dist(cols[i], cols[j]);
+                    assert!(
+                        d >= 60,
+                        "{}: 深さ {i} と {j} が見分けられない (距離 {d})",
+                        t.name
+                    );
+                }
+            }
+        }
     }
 
-    fn contrast_ratio(a: Color32, b: Color32) -> f32 {
-        let (x, y) = (relative_luminance(a), relative_luminance(b));
-        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
-        (hi + 0.05) / (lo + 0.05)
+    /// ルーラーの色はテーマの境界線色 (直書きしていない)。
+    #[test]
+    fn ルーラーの色はテーマから来る() {
+        for t in all() {
+            assert_eq!(t.ruler_color(), t.border, "{}", t.name);
+            // 地と同色だと 1px も見えない
+            assert_ne!(t.ruler_color(), t.bg, "{}", t.name);
+        }
+    }
+
+    /// チャンネルごとの差の合計 (見分けが付くかの粗い指標)。
+    fn dist(a: Color32, b: Color32) -> i32 {
+        (a.r() as i32 - b.r() as i32).abs()
+            + (a.g() as i32 - b.g() as i32).abs()
+            + (a.b() as i32 - b.b() as i32).abs()
     }
 
     #[test]

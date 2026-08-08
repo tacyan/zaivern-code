@@ -194,6 +194,14 @@ pub enum Cmd {
     DuplicateLine,
     MoveLineUp,
     MoveLineDown,
+    /// 選択範囲の大文字小文字を変換する (VS Code: Transform to Upper/Lower/Title Case)
+    TransformCase(crate::editor_ops::CaseKind),
+    /// 選択範囲の行を並べ替える (true = 降順)
+    SortLines(bool),
+    /// 選択範囲の重複行を削る (VS Code: Delete Duplicate Lines)
+    DedupeLines,
+    /// 選択範囲を JSON として整形する (選択が無ければ本文全体)
+    FormatJsonSelection,
     /// 検索バーを置換モードで開く (VS Code: ⌥⌘F)
     OpenReplace,
     /// サイドバーの横断検索タブを開く (VS Code: ⇧⌘F)
@@ -272,6 +280,8 @@ pub enum Cmd {
     ToggleTrimTrailingOnSave,
     /// 保存時に最終行へ改行を入れる (切替)
     ToggleFinalNewlineOnSave,
+    /// 保存時に末尾の余分な空行を落とす (切替)
+    ToggleTrimFinalNewlinesOnSave,
     /// アクティブなファイルの改行コードを揃える
     ConvertLineEnding(crate::textenc::LineEnding),
 
@@ -613,6 +623,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::RefreshTree
         | Cmd::ToggleTrimTrailingOnSave
         | Cmd::ToggleFinalNewlineOnSave
+        | Cmd::ToggleTrimFinalNewlinesOnSave
         | Cmd::ToggleFormatOnSave
         | Cmd::ConvertLineEnding(_) => Group::File,
 
@@ -627,6 +638,10 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::DuplicateLine
         | Cmd::MoveLineUp
         | Cmd::MoveLineDown
+        | Cmd::TransformCase(_)
+        | Cmd::SortLines(_)
+        | Cmd::DedupeLines
+        | Cmd::FormatJsonSelection
         | Cmd::AddCursorAbove
         | Cmd::AddCursorBelow
         | Cmd::SelectAllOccurrences

@@ -114,6 +114,8 @@ pub struct MenuInfo {
     pub file_zoom: Option<f32>,
     /// 保存時に行末の空白を落とす (編集メニューのチェック状態)
     pub trim_trailing_on_save: bool,
+    /// 保存時に末尾の余分な空行を落とす (同上)
+    pub trim_final_newlines_on_save: bool,
     /// 保存時に最終行へ改行を入れる (同上)
     pub final_newline_on_save: bool,
     /// ビルドタスクのラベル。**⇧⌘B が実際に走らせる方**を入れる
@@ -417,8 +419,9 @@ fn edit_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             },
         );
         ui.separator();
-        // 保存時のクリーンアップ。いまは egui memory に持っている
-        // (config.toml へ移すのは config.rs 側の担当が空いてから)
+        // 保存時のクリーンアップ。既定は config.toml
+        // (trim_trailing_whitespace / trim_final_newlines / insert_final_newline)
+        // で、ここでの切替はセッション中の上書き。
         let trim = if info.trim_trailing_on_save {
             tr("✓ 保存時に末尾空白を除去")
         } else {
@@ -426,6 +429,14 @@ fn edit_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         };
         if item(ui, &trim, "", true) {
             cmds.push(Cmd::ToggleTrimTrailingOnSave);
+        }
+        let tfn = if info.trim_final_newlines_on_save {
+            tr("✓ 保存時に末尾の余分な空行を落とす")
+        } else {
+            tr("保存時に末尾の余分な空行を落とす")
+        };
+        if item(ui, &tfn, "", true) {
+            cmds.push(Cmd::ToggleTrimFinalNewlinesOnSave);
         }
         let fnl = if info.final_newline_on_save {
             tr("✓ 保存時に最終行へ改行を入れる")

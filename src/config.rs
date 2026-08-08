@@ -110,6 +110,38 @@ pub struct Config {
     /// オンの間だけ可視範囲ぶんの `git blame` を非同期で取る。
     pub git_blame: bool,
 
+    // ── 保存時の整形 (VS Code の files.* / editor.formatOnSave 相当) ──
+    //
+    // **どれも既定はオフ** — VS Code の既定と同じ。保存しただけで差分が
+    // 増えるのは事故なので、明示的に選んだ人だけが払う。
+    /// 保存時に各行の末尾空白を落とす (`files.trimTrailingWhitespace`)。
+    /// 全角スペース U+3000 と NBSP は落とさない
+    /// ([`crate::editor_ops::trim_trailing_whitespace`] を参照)。
+    pub trim_trailing_whitespace: bool,
+    /// 保存時に末尾の余分な空行を落とす (`files.trimFinalNewlines`)。
+    pub trim_final_newlines: bool,
+    /// 保存時に最終行へ改行を入れる (`files.insertFinalNewline`)。
+    pub insert_final_newline: bool,
+    /// 保存時に LSP の整形をかける (`editor.formatOnSave`)。
+    /// 整形の経路は「ドキュメントを整形」と同じ 1 本。
+    pub format_on_save: bool,
+
+    // ── エディタの見た目・インデント ──────────────────────────────
+    /// 括弧を入れ子の深さごとに色分けする
+    /// (`editor.bracketPairColorization.enabled`)。**既定はオン**。
+    /// 色はテーマの ANSI 表から採る ([`crate::theme::Theme::bracket_colors`])。
+    pub bracket_colorization: bool,
+    /// 縦のルーラーを引く桁 (`editor.rulers`)。既定は空 = 1 本も引かない。
+    /// 例: `rulers = [80, 120]`。桁は等幅の**桁数**で数える (東アジア文字幅ではない)。
+    pub rulers: Vec<usize>,
+    /// 開いたファイルの中身からインデントを推定する
+    /// (`editor.detectIndentation`)。**既定はオン**。
+    /// オフにすると `tab_size` / `insert_spaces` をそのまま使う。
+    pub detect_indentation: bool,
+    /// インデント 1 段の桁数 (`editor.tabSize`)。既定 4。
+    pub tab_size: usize,
+    /// インデントにスペースを使う (`editor.insertSpaces`)。既定オン。
+    pub insert_spaces: bool,
     /// タブ切替 (Ctrl+Tab) を **MRU (最近使った順)** で回すか。
     ///
     /// **既定はオン** — VS Code / Zed と同じで、押しっぱなしの間に候補一覧を
@@ -381,6 +413,16 @@ impl Default for Config {
             git_blame: false,
             confirm_drag_and_drop: true,
             enable_trash: true,
+            // 保存時の整形は VS Code と同じく全部オフから始める
+            trim_trailing_whitespace: false,
+            trim_final_newlines: false,
+            insert_final_newline: false,
+            format_on_save: false,
+            bracket_colorization: true,
+            rulers: Vec::new(),
+            detect_indentation: true,
+            tab_size: crate::editor_ops::IndentStyle::DEFAULT_WIDTH,
+            insert_spaces: true,
             tab_switch_mru: true,
             preview_tabs: true,
             approval_mode: "ask".into(),
@@ -763,6 +805,23 @@ show_hidden_files = true
 # (表示メニュー・コマンドパレットの「Git blame の表示切替」でも変更できます)
 # git_blame = false
 
+# ── 保存時の整形 (VS Code の files.* / editor.formatOnSave 相当) ──
+# どれも既定はオフ。保存しただけで差分が増えないようにするためで、
+# コマンドパレットの「保存時に…」からも個別に切り替えられます。
+# trim_trailing_whitespace = false   # 各行の末尾空白を落とす (全角スペースは残す)
+# trim_final_newlines      = false   # 末尾の余分な空行を落とす
+# insert_final_newline     = false   # 最終行に改行が無ければ足す
+# format_on_save           = false   # LSP の整形をかけてから保存する
+
+# ── 括弧の色分け / 縦のルーラー / インデント ──
+# 括弧を入れ子の深さごとに色分けする (色はテーマの ANSI 表から採ります)
+# bracket_colorization = true
+# 縦のルーラーを引く桁 (等幅の桁数)。既定は空 = 1 本も引きません
+# rulers = [80, 120]
+# 開いたファイルの中身からインデントを推定する (オフなら下の 2 つをそのまま使う)
+# detect_indentation = true
+# tab_size = 4
+# insert_spaces = true
 # タブ切替 (Ctrl+Tab / Ctrl+Shift+Tab) を最近使った順 (MRU) で回すか。
 # 既定はオン = 押している間に候補一覧が出て、離したところで確定します
 # (2 回押せば直前のファイルへ戻る)。false にすると並び順の巡回になります。
@@ -1691,6 +1750,57 @@ mod tests {
         assert_eq!(c.voice_keyword, "", "空 = 常に手動 Enter");
         assert!(c.keybindings.is_empty());
         assert!(!c.agents.is_empty());
+    }
+
+    /// エディタ細部の既定値は **VS Code の既定に合わせる**。
+    ///
+    /// 保存時の整形は全部オフ (保存しただけで差分が増えないため)、
+    /// 括弧の色分けとインデント推定はオン、ルーラーは 1 本も引かない。
+    #[test]
+    fn 保存時の整形とエディタ表示の既定はvscodeに合わせる() {
+        let c = Config::default();
+        assert!(!c.trim_trailing_whitespace, "files.trimTrailingWhitespace");
+        assert!(!c.trim_final_newlines, "files.trimFinalNewlines");
+        assert!(!c.insert_final_newline, "files.insertFinalNewline");
+        assert!(!c.format_on_save, "editor.formatOnSave");
+        assert!(c.bracket_colorization, "editor.bracketPairColorization");
+        assert!(c.rulers.is_empty(), "editor.rulers は既定で空");
+        assert!(c.detect_indentation, "editor.detectIndentation");
+        assert_eq!(c.tab_size, 4, "editor.tabSize");
+        assert!(c.insert_spaces, "editor.insertSpaces");
+        // 同梱テンプレートを読んでも同じ既定になる (コメントアウト済み)
+        let t: Config = toml::from_str(DEFAULT_CONFIG).expect("同梱テンプレは常にパースできる");
+        assert!(!t.trim_trailing_whitespace);
+        assert!(!t.trim_final_newlines);
+        assert!(!t.insert_final_newline);
+        assert!(!t.format_on_save);
+        assert!(t.bracket_colorization);
+        assert!(t.rulers.is_empty());
+        assert!(t.detect_indentation);
+        assert_eq!(t.tab_size, 4);
+        assert!(t.insert_spaces);
+        // 実際に書けば読める (設定として機能する)
+        let on: Config = toml::from_str(
+            "trim_trailing_whitespace = true\n\
+             trim_final_newlines = true\n\
+             insert_final_newline = true\n\
+             format_on_save = true\n\
+             bracket_colorization = false\n\
+             rulers = [80, 120]\n\
+             detect_indentation = false\n\
+             tab_size = 2\n\
+             insert_spaces = false\n",
+        )
+        .expect("個別にオンオフできる");
+        assert!(on.trim_trailing_whitespace);
+        assert!(on.trim_final_newlines);
+        assert!(on.insert_final_newline);
+        assert!(on.format_on_save);
+        assert!(!on.bracket_colorization);
+        assert_eq!(on.rulers, vec![80, 120]);
+        assert!(!on.detect_indentation);
+        assert_eq!(on.tab_size, 2);
+        assert!(!on.insert_spaces);
     }
 
     #[test]
