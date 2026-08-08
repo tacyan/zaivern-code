@@ -4745,12 +4745,7 @@ impl ZaivernApp {
             sel.to_single_selection()
         };
         // バイト範囲 → char 範囲 (egui のキャレットは char 添字)
-        let cs = text[..r.start.min(text.len())].chars().count();
-        let ce = cs
-            + text[r.start.min(text.len())..r.end.min(text.len())]
-                .chars()
-                .count();
-        self.pending_select = Some((cs, ce));
+        self.pending_select = Some(byte_range_to_char_range(&text, &r));
         self.multi_sel = Some((buf_id, sel));
         if n > 1 {
             self.toast(
@@ -4760,6 +4755,82 @@ impl ZaivernApp {
                 ),
                 true,
             );
+        }
+    }
+
+    /// Alt 付きポインタ操作を複数キャレットへ反映する。
+    ///
+    /// `prev_caret` はクリック**前**の egui キャレット (char 範囲)。クリックの
+    /// 時点で egui は主キャレットを動かしてしまうので、1 本目の種はこれを使う。
+    fn apply_multi_pointer(
+        &mut self,
+        buf_index: usize,
+        ev: MultiPointer,
+        tab_width: usize,
+        prev_caret: Option<(usize, usize)>,
+    ) {
+        let Some(b) = self.editor.buffers.get(buf_index) else {
+            return;
+        };
+        let buf_id = b.id;
+        let text = b.text.clone();
+        match ev {
+            MultiPointer::Clear => {
+                self.multi_sel = None;
+                self.multi_sticky_col = None;
+            }
+            MultiPointer::DragEnd => {
+                self.column_anchor = None;
+            }
+            MultiPointer::DragStart(idx) => {
+                let (line, col) = char_index_to_line_col(&text, idx, tab_width);
+                self.column_anchor = Some((buf_id, line, col));
+                self.multi_sticky_col = None;
+            }
+            MultiPointer::Drag(idx) => {
+                let Some((aid, al, ac)) = self.column_anchor else {
+                    return;
+                };
+                if aid != buf_id {
+                    return;
+                }
+                let (hl, hc) = char_index_to_line_col(&text, idx, tab_width);
+                let sel = editor_ops::column_selection(&text, al, ac, hl, hc, tab_width);
+                if !sel.is_empty() {
+                    // egui 自身もドラッグで「行をまたぐ 1 本の選択」を作ってしまう。
+                    // 主キャレットを矩形の最後の行へ寄せて、画面に出るのが
+                    // 矩形だけになるようにする (寄せないと 2 種類の選択が重なる)。
+                    self.pending_select =
+                        Some(byte_range_to_char_range(&text, &sel.to_single_selection()));
+                    self.multi_sel = Some((buf_id, sel));
+                }
+            }
+            MultiPointer::Click(idx) => {
+                let byte = editor_ops::char_to_byte(&text, idx);
+                let mut ranges: Vec<std::ops::Range<usize>> = match &self.multi_sel {
+                    Some((id, s)) if *id == buf_id => s.carets().to_vec(),
+                    _ => Vec::new(),
+                };
+                if ranges.is_empty() {
+                    if let Some((a, z)) = prev_caret {
+                        ranges.push(
+                            editor_ops::char_to_byte(&text, a)..editor_ops::char_to_byte(&text, z),
+                        );
+                    }
+                }
+                match ranges.iter().position(|r| r.start == byte && r.end == byte) {
+                    // 同じ位置をもう一度 Alt+クリック → 取り除く (VS Code と同じ)。
+                    // 最後の 1 本は残す (0 本にすると打鍵の行き先が消える)。
+                    Some(p) if ranges.len() > 1 => {
+                        ranges.remove(p);
+                    }
+                    Some(_) => {}
+                    None => ranges.push(byte..byte),
+                }
+                let sel = editor_ops::MultiSel::in_text(&text, ranges);
+                self.multi_sel = (!sel.is_empty()).then_some((buf_id, sel));
+                self.multi_sticky_col = None;
+            }
         }
     }
 
@@ -16618,6 +16689,57 @@ impl ZaivernApp {
             }
         }
 
+        // ── 複数キャレット: 打鍵を全キャレットへ配る ──────────────────
+        //
+        // `TextEdit` を描く**前**にイベントを抜き取るのが要。egui は主キャレット
+        // 1 本にしか打鍵を適用しないので、ここで横取りしないと ⌘D で 5 箇所
+        // 選んでも文字は 1 箇所にしか入らない。
+        // 本文の差し替えは 1 回だけ = 取り消しも 1 段 (`MultiPaste` と同じ約束)。
+        //
+        // ここで消費した打鍵は下の自動ペア処理にも届かない (イベントごと抜くため)
+        // ので、複数キャレット中は自動ペアが二重に走ることはない。
+        let buf_id_active = self.editor.buffers[active].id;
+        // クリック**前**のキャレット。Alt+クリックの 1 本目の種にする
+        // (クリック後は egui が主キャレットを動かしてしまい取れない)。
+        let prev_caret: Option<(usize, usize)> = egui::TextEdit::load_state(ui.ctx(), ed_id_early)
+            .and_then(|st| st.cursor.char_range())
+            .map(|r| {
+                let (a, b) = (r.primary.index, r.secondary.index);
+                (a.min(b), a.max(b))
+            });
+        let multi_live =
+            matches!(&self.multi_sel, Some((id, s)) if *id == buf_id_active && s.len() > 1);
+        if multi_live && has_focus {
+            // Escape で解除。エディタにフォーカスがあるときだけ奪うので、
+            // パレット / 検索 / 全画面解除 (どれもフォーカス無しが条件) とは
+            // 取り合いにならない。
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.multi_sel = None;
+                self.multi_sticky_col = None;
+                self.column_anchor = None;
+            } else if !folds_closed && !self.editor.buffers[active].read_only() {
+                let ops = ui.input_mut(|i| take_multi_keys(&mut i.events));
+                if !ops.is_empty() {
+                    let sel = match &self.multi_sel {
+                        Some((_, s)) => s.clone(),
+                        None => editor_ops::MultiSel::default(),
+                    };
+                    let (new_text, next) =
+                        apply_multi_keys(&self.editor.buffers[active].text, &sel, &ops);
+                    let (cs, ce) = byte_range_to_char_range(&new_text, &next.to_single_selection());
+                    let b = &mut self.editor.buffers[active];
+                    // 本文の書き込みはこの 1 か所だけ (取り消しが 1 段で戻る条件)
+                    b.text = new_text;
+                    b.cache = None;
+                    b.gutter = None;
+                    self.fold_view = None;
+                    self.queue_lsp_change(active);
+                    pending_select = Some((cs, ce));
+                    self.multi_sel = Some((buf_id_active, next));
+                }
+            }
+        }
+
         // 括弧・引用符の自動ペア (VS Code の autoClosingBrackets 相当):
         // 開き括弧で自動閉じ/選択囲み、閉じ括弧でスキップ、
         // 空ペアの間での Backspace は両方まとめて削除。
@@ -16841,6 +16963,26 @@ impl ZaivernApp {
             } else {
                 self.lsp_highlight_spans.clone()
             };
+        // 複数キャレットの描画データ (char 範囲)。`TextEdit` は主キャレットしか
+        // 描かないので、残りの縦線と選択の背景をここのデータで重ね塗りする。
+        // 折りたたみ中は表示テキストと char 添字がずれるので塗らない
+        // (occ_spans と同じ理由)。色はテーマから取る (固定色を書かない)。
+        let multi_spans: Vec<(usize, usize)> = match &self.multi_sel {
+            Some((mid, s)) if !folding && *mid == self.editor.buffers[active].id && s.len() > 1 => {
+                s.to_char_ranges(&self.editor.buffers[active].text)
+                    .into_iter()
+                    .take(MULTI_PAINT_MAX)
+                    .map(|r| (r.start, r.end))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let multi_caret_color = self.theme.accent;
+        let multi_sel_color = self.theme.accent.gamma_multiply(0.28);
+        // キャレットの線幅は物理ピクセルへ揃える (端末セルと同じ理由。
+        // 小数のままだと桁によって 1px/2px に揺れて汚い)。
+        let multi_caret_w = crate::theme::snap_len(1.5, ppp).max(1.0 / ppp);
+
         // ── Git blame (既定 OFF) ────────────────────────────────────
         // **可視ブロックだけ**を非同期で取る。キーは (パス, 保存時ハッシュ,
         // ブロック範囲) なので、同じ場所を見ている限り git は 1 度も起きない。
@@ -16998,6 +17140,7 @@ impl ZaivernApp {
             let mut caret_at: Option<egui::Pos2> = None;
             let mut hover_hit: Option<(usize, egui::Pos2)> = None;
             let mut sel_out: Option<(usize, usize)> = None;
+            let mut multi_ptr: Option<MultiPointer> = None;
             // 編集対象: 折りたたみ中は表示テキスト、読み取り専用なら
             // is_mutable() == false の包み (選択とコピーは残る)
             let mut target = match (read_only, disp_text.as_mut()) {
@@ -17091,6 +17234,94 @@ impl ZaivernApp {
                     ui.painter().rect_filled(rect, 2.0, occ_color);
                 }
 
+                // ── 複数キャレット: 追加キャレットの縦線と選択範囲の背景 ──
+                //
+                // egui は主キャレットしか描かないので、残りをここで塗る。
+                // 主キャレットぶんは egui が既に描いている (点滅する) ので
+                // 二重塗りを避けて飛ばす。追加キャレットは**点滅させない** —
+                // 点滅は毎フレームの再描画要求で、設計原則 3 に反する。
+                if !multi_spans.is_empty() {
+                    let primary = output.cursor_range.map(|cr| {
+                        let (a, b) = (cr.primary.ccursor.index, cr.secondary.ccursor.index);
+                        (a.min(b), a.max(b))
+                    });
+                    let gp = output.galley_pos.to_vec2();
+                    let rows = &output.galley.rows;
+                    let last_row = rows.len().saturating_sub(1);
+                    let focused = output.response.has_focus();
+                    // 改行が選ばれていることを示す幅 (VS Code と同じ見せ方)
+                    let nl_w = char_w * 0.5;
+                    for (s, e) in &multi_spans {
+                        if primary == Some((*s, *e)) {
+                            continue;
+                        }
+                        let c0 = output.galley.from_ccursor(egui::text::CCursor::new(*s));
+                        let c1 = output.galley.from_ccursor(egui::text::CCursor::new(*e));
+                        let q0 = output.galley.pos_from_cursor(&c0);
+                        let q1 = output.galley.pos_from_cursor(&c1);
+                        let r0 = c0.rcursor.row.min(last_row);
+                        let r1 = c1.rcursor.row.min(last_row).max(r0);
+                        if s != e && !rows.is_empty() {
+                            // 跨いだ行の矩形だけを取り出す (巨大ファイルでも O(選択行数))
+                            let span: Vec<egui::Rect> =
+                                rows[r0..=r1].iter().map(|r| r.rect).collect();
+                            for rect in selection_row_rects(&span, q0.min.x, q1.min.x, nl_w) {
+                                ui.painter()
+                                    .rect_filled(rect.translate(gp), 2.0, multi_sel_color);
+                            }
+                        }
+                        // キャレットは範囲の終端 (= タイプで伸びる側)。
+                        // フォーカスが無いときは出さない (egui の主キャレットと同じ)。
+                        if focused {
+                            ui.painter().vline(
+                                gp.x + q1.min.x,
+                                egui::Rangef::new(gp.y + q1.min.y, gp.y + q1.max.y),
+                                egui::Stroke::new(multi_caret_w, multi_caret_color),
+                            );
+                        }
+                    }
+                }
+
+                // ── Alt+クリック / Alt+ドラッグ ────────────────────────
+                //
+                // `Modifiers::alt` は macOS では ⌥、Windows/Linux では Alt に
+                // 写る (egui-winit が正規化する) ので OS 分岐は要らない。
+                // 折りたたみ中は char 添字が原文とずれるので受け付けない。
+                if !folding {
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    let to_char = |p: egui::Pos2| {
+                        output
+                            .galley
+                            .cursor_from_pos(p - output.galley_pos)
+                            .ccursor
+                            .index
+                    };
+                    multi_ptr = if alt && output.response.drag_started() {
+                        // egui はしきい値ぶん動いてからドラッグと判定するので、
+                        // 始点は「押した点」を使う (数ピクセルずれた桁を掴まない)
+                        ui.input(|i| i.pointer.press_origin())
+                            .or_else(|| output.response.interact_pointer_pos())
+                            .map(|p| MultiPointer::DragStart(to_char(p)))
+                    } else if alt && output.response.dragged() {
+                        output
+                            .response
+                            .interact_pointer_pos()
+                            .map(|p| MultiPointer::Drag(to_char(p)))
+                    } else if alt && output.response.clicked() {
+                        output
+                            .response
+                            .interact_pointer_pos()
+                            .map(|p| MultiPointer::Click(to_char(p)))
+                    } else if output.response.drag_stopped() {
+                        Some(MultiPointer::DragEnd)
+                    } else if output.response.clicked() || output.response.drag_started() {
+                        // Alt 無しのポインタ操作は複数キャレットを解除する
+                        Some(MultiPointer::Clear)
+                    } else {
+                        None
+                    };
+                }
+
                 if let Some(cr) = output.cursor_range {
                     // 選択範囲 (char 添字)。折りたたみ中は表示テキストの添字に
                     // なってしまうので、LSP へ渡せる形ではないため None のまま。
@@ -17150,6 +17381,7 @@ impl ZaivernApp {
                 caret_at,
                 hover_hit,
                 sel_out,
+                multi_ptr,
             )
         };
 
@@ -17172,7 +17404,8 @@ impl ZaivernApp {
             sa.show(ui, body_ui)
         };
 
-        let (cursor_out, changed, text_top, text_left, caret_at, hover_hit, sel_out) = inner.inner;
+        let (cursor_out, changed, text_top, text_left, caret_at, hover_hit, sel_out, multi_ptr) =
+            inner.inner;
 
         // 行番号ガター: git マークで行ごとに色分けした galley をキャッシュ。
         // 折り返し OFF は論理行と 1:1。ON は本文 galley の視覚行に合わせ、
@@ -17690,6 +17923,21 @@ impl ZaivernApp {
                 self.lsp_hover_pos = None;
                 self.lsp_hover.dismiss();
             }
+        }
+
+        // 複数キャレットのポインタ操作を反映する (描画中はバッファを可変借用
+        // しているので `self` を触れない。拾った操作をここで当てる)。
+        if let Some(ev) = multi_ptr {
+            self.apply_multi_pointer(active, ev, tab_w, prev_caret);
+        }
+
+        // 単一キャレットの編集 (= `TextEdit` 自身の打鍵や整形の差し込み) が
+        // 入ったら複数キャレットは捨てる。バイト位置がずれた集合を持ち越すと
+        // 本文を壊す。複数キャレット経由の編集は `TextEdit` を通らないので
+        // `changed` は立たず、ここでは消えない。
+        if (changed || spliced) && self.multi_sel.is_some() {
+            self.multi_sel = None;
+            self.multi_sticky_col = None;
         }
 
         // LSP: テキストが変わったらデバウンスして did_change を予約
@@ -22577,6 +22825,166 @@ fn multi_batch_insert(
     let n = sel.len();
     let (out, next) = editor_ops::insert_at_all(text, sel, ins);
     (out, next, n)
+}
+
+// ═══ 複数キャレット: 打鍵の横取りとポインタ操作 ═══════════════════
+//
+// `TextEdit` (egui 0.29) は `CCursorRange` を 1 つしか持たないので、打鍵は
+// 主キャレット 1 本にしか入らない。そこで **`TextEdit` を描く前に**
+// イベントを抜き取り、`editor_ops` の「全キャレットへ適用」系へ流す。
+// ここに置く関数はすべて純関数 (egui の状態に触らない) なのでテストで固定できる。
+
+/// 追加キャレットを描く上限。これを超える集合 (「全ての出現を選択」で数千件) は
+/// 先頭から上限ぶんだけ塗る — 画面に出るのは可視行ぶんだけなので実害はなく、
+/// 巨大ファイルで毎フレーム数千の矩形を組むほうが害になる。
+const MULTI_PAINT_MAX: usize = 512;
+
+/// `TextEdit` へ渡す**前**に横取りする打鍵 (複数キャレットのときだけ)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MultiKey {
+    /// 確定した文字入力 (`Event::Text`)。IME 変換中 (`Event::Ime`) は含まない。
+    Text(String),
+    Backspace,
+    Delete,
+    Enter,
+}
+
+/// Alt (⌥ / Alt) 付きのポインタ操作。`TextEdit` の描画中に拾い、外側で反映する
+/// (描画中はバッファを可変借用しているので `self` を触れない)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MultiPointer {
+    /// Alt+クリック: その位置のキャレットを足す / 既にあれば取り除く。
+    Click(usize),
+    /// Alt+ドラッグ開始: 矩形選択の始点 (char 添字)。
+    DragStart(usize),
+    /// Alt+ドラッグ中: 矩形の対角 (char 添字)。
+    Drag(usize),
+    /// ドラッグ終了: 始点を捨てる。
+    DragEnd,
+    /// Alt 無しのクリック / ドラッグ: 複数キャレットを解除する (VS Code と同じ)。
+    Clear,
+}
+
+/// 1 つの入力イベントが「全キャレットへ配る打鍵」かどうか。
+///
+/// 修飾キー付き (⌘Z / ⌥⌫ / ⌃A など) は**横取りしない** — 取り消しや単語削除は
+/// egui と OS の担当で、複数キャレットの意味を持たないため。
+fn multi_key_of(e: &egui::Event) -> Option<MultiKey> {
+    match e {
+        egui::Event::Text(t) if !t.is_empty() => Some(MultiKey::Text(t.clone())),
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } if !modifiers.command && !modifiers.ctrl && !modifiers.alt => match key {
+            egui::Key::Backspace => Some(MultiKey::Backspace),
+            egui::Key::Delete => Some(MultiKey::Delete),
+            egui::Key::Enter => Some(MultiKey::Enter),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// イベント列から打鍵を**抜き取る** (残りはそのまま `TextEdit` へ流れる)。
+///
+/// 1 フレームに複数届く (速いタイプ・キーリピート) ので、順番どおり全部返す。
+/// 1 つだけ拾って残りを `TextEdit` へ流すと、あふれたぶんが主キャレットにだけ
+/// 入って本文がずれる。
+fn take_multi_keys(events: &mut Vec<egui::Event>) -> Vec<MultiKey> {
+    let mut ops = Vec::new();
+    events.retain(|e| match multi_key_of(e) {
+        Some(op) => {
+            ops.push(op);
+            false
+        }
+        None => true,
+    });
+    ops
+}
+
+/// 打鍵 1 つを全キャレットへ当てる。
+fn apply_multi_key(
+    text: &str,
+    sel: &editor_ops::MultiSel,
+    op: &MultiKey,
+) -> (String, editor_ops::MultiSel) {
+    match op {
+        MultiKey::Text(t) => editor_ops::type_at_all(text, sel, t),
+        MultiKey::Backspace => editor_ops::backspace_at_all(text, sel),
+        MultiKey::Delete => editor_ops::delete_forward_at_all(text, sel),
+        MultiKey::Enter => editor_ops::newline_at_all_detect(text, sel),
+    }
+}
+
+/// 打鍵の列を順に当てる。`(新しい本文, 新しいキャレット集合)`。
+///
+/// 呼び出し側は返った本文を **1 回だけ** `Buffer::text` へ入れること
+/// (= egui の取り消しも 1 段。`multi_batch_insert` と同じ約束)。
+fn apply_multi_keys(
+    text: &str,
+    sel: &editor_ops::MultiSel,
+    ops: &[MultiKey],
+) -> (String, editor_ops::MultiSel) {
+    let mut text = text.to_string();
+    let mut sel = sel.clone();
+    for op in ops {
+        let (t, s) = apply_multi_key(&text, &sel, op);
+        text = t;
+        sel = s;
+    }
+    (text, sel)
+}
+
+/// バイト範囲 → char 範囲 (egui のキャレットは char 添字)。
+/// 範囲外や文字境界でない値はクランプする (壊れた値でも落ちない)。
+fn byte_range_to_char_range(text: &str, r: &std::ops::Range<usize>) -> (usize, usize) {
+    let clamp = |b: usize| {
+        let mut b = b.min(text.len());
+        while b > 0 && !text.is_char_boundary(b) {
+            b -= 1;
+        }
+        b
+    };
+    let s = clamp(r.start);
+    let e = clamp(r.end).max(s);
+    let cs = text[..s].chars().count();
+    (cs, cs + text[s..e].chars().count())
+}
+
+/// 複数キャレットの**選択範囲**を視覚行ごとの矩形へ割る (galley ローカル座標)。
+///
+/// `rows` は選択が跨る視覚行の矩形だけ (先頭 = 選択開始行、末尾 = 終了行)。
+/// `x0` は開始行の x、`x1` は終了行の x。行をまたぐぶんは
+/// 「開始行は x0 から行末 + `nl_w`」「中間行は行まるごと + `nl_w`」
+/// 「終了行は行頭から x1」になる (`nl_w` は改行が選ばれていることを示す幅)。
+///
+/// 返る矩形は**必ず行の矩形の上下に収まり、互いに重ならない** (行が重ならないため)。
+/// 幅 0 に潰れた行は返さない。
+fn selection_row_rects(rows: &[egui::Rect], x0: f32, x1: f32, nl_w: f32) -> Vec<egui::Rect> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let last = rows.len() - 1;
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, rr) in rows.iter().enumerate() {
+        let left = if i == 0 { x0.max(rr.left()) } else { rr.left() };
+        let right = if i == last {
+            x1
+        } else {
+            rr.right() + nl_w.max(0.0)
+        };
+        let right = right.max(left);
+        if right - left <= 0.0 {
+            continue;
+        }
+        out.push(egui::Rect::from_min_max(
+            egui::pos2(left, rr.top()),
+            egui::pos2(right, rr.bottom()),
+        ));
+    }
+    out
 }
 
 /// char 添字 → `(行 0 起点, タブ展開後の表示桁 0 起点)`。
@@ -30369,6 +30777,291 @@ mod multi_cursor_wiring_tests {
         assert_eq!(char_index_to_line_col("ab\r\ncd", 4, tw), (1, 0));
         // 範囲外はクランプ (壊れた値でも落ちない)
         assert_eq!(char_index_to_line_col("ab", 99, tw), (0, 2));
+    }
+
+    // ──────────── 打鍵の横取り (全キャレットへ配る) ────────────
+
+    fn key_ev(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// 修飾キー無しの Backspace / Delete / Enter と文字入力だけを横取りする。
+    /// ⌘Z (取り消し) や ⌥⌫ (単語削除) を奪うと、複数キャレット中だけ
+    /// それらが効かなくなる。
+    #[test]
+    fn 打鍵は修飾キー無しのときだけ横取りする() {
+        let none = egui::Modifiers::NONE;
+        let shift = egui::Modifiers::SHIFT;
+        let cmd = egui::Modifiers::COMMAND;
+        let alt = egui::Modifiers::ALT;
+        let cases: Vec<(egui::Event, Option<MultiKey>)> = vec![
+            (
+                egui::Event::Text("a".into()),
+                Some(MultiKey::Text("a".into())),
+            ),
+            (
+                egui::Event::Text("あ".into()),
+                Some(MultiKey::Text("あ".into())),
+            ),
+            (egui::Event::Text(String::new()), None),
+            (
+                key_ev(egui::Key::Backspace, none),
+                Some(MultiKey::Backspace),
+            ),
+            (
+                key_ev(egui::Key::Backspace, shift),
+                Some(MultiKey::Backspace),
+            ),
+            (key_ev(egui::Key::Backspace, alt), None),
+            (key_ev(egui::Key::Backspace, cmd), None),
+            (key_ev(egui::Key::Delete, none), Some(MultiKey::Delete)),
+            (key_ev(egui::Key::Enter, none), Some(MultiKey::Enter)),
+            (key_ev(egui::Key::Z, cmd), None),
+            (key_ev(egui::Key::ArrowDown, none), None),
+            (egui::Event::Copy, None),
+        ];
+        for (ev, want) in cases {
+            assert_eq!(multi_key_of(&ev), want, "{ev:?}");
+        }
+        // 押下だけを拾う (離鍵で二度打たない)
+        let release = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert_eq!(multi_key_of(&release), None);
+    }
+
+    /// 抜き取った打鍵だけがイベント列から消え、残りは `TextEdit` へ流れる。
+    #[test]
+    fn 横取りした打鍵だけがイベント列から消える() {
+        let mut events = vec![
+            egui::Event::Text("a".into()),
+            key_ev(egui::Key::ArrowRight, egui::Modifiers::NONE),
+            key_ev(egui::Key::Backspace, egui::Modifiers::NONE),
+            egui::Event::Text("b".into()),
+        ];
+        let ops = take_multi_keys(&mut events);
+        assert_eq!(
+            ops,
+            vec![
+                MultiKey::Text("a".into()),
+                MultiKey::Backspace,
+                MultiKey::Text("b".into()),
+            ],
+            "届いた順に全部返る"
+        );
+        assert_eq!(events.len(), 1, "矢印キーだけが残って TextEdit へ流れる");
+    }
+
+    /// 1 フレームに複数届いた打鍵を順に当てる (速いタイプ / キーリピート)。
+    /// 1 つだけ拾って残りを流すと、あふれたぶんが主キャレットにだけ入る。
+    #[test]
+    fn 一フレームの打鍵は順番どおり全キャレットへ入る() {
+        let text = "x\nx\nx\n";
+        let sel = MultiSel::in_text(text, [0..1, 2..3, 4..5]);
+        let ops = vec![
+            MultiKey::Text("a".into()),
+            MultiKey::Text("b".into()),
+            MultiKey::Backspace,
+            MultiKey::Text("c".into()),
+        ];
+        let (out, next) = apply_multi_keys(text, &sel, &ops);
+        assert_eq!(out, "ac\nac\nac\n");
+        assert_eq!(next.len(), 3, "キャレットは 3 本のまま");
+    }
+
+    /// Enter は全キャレットへ入り、キャレットは新しい行へ再配置される。
+    #[test]
+    fn enter_も全キャレットへ配られる() {
+        let text = "ab\ncd\n";
+        let sel = MultiSel::in_text(text, [2..2, 5..5]);
+        let (out, next) = apply_multi_keys(text, &sel, &[MultiKey::Enter]);
+        assert_eq!(out, "ab\n\ncd\n\n");
+        assert_eq!(next.len(), 2);
+    }
+
+    /// 空集合へ打鍵しても本文は変わらない (キャレット 0 本)。
+    #[test]
+    fn キャレットが無ければ横取りしても本文は変わらない() {
+        let text = "そのまま";
+        let sel = MultiSel::default();
+        let (out, next) = apply_multi_keys(text, &sel, &[MultiKey::Text("x".into())]);
+        assert_eq!(out, text);
+        assert!(next.is_empty());
+    }
+
+    #[test]
+    fn バイト範囲からchar範囲への変換は多バイトでも合う() {
+        let text = "あいうABC";
+        // "あい" = 6 バイト = 2 文字
+        assert_eq!(byte_range_to_char_range(text, &(0..6)), (0, 2));
+        assert_eq!(byte_range_to_char_range(text, &(9..12)), (3, 6));
+        // 範囲外はクランプ、文字境界でない値は手前へ寄せる (落ちない)
+        assert_eq!(byte_range_to_char_range(text, &(0..999)), (0, 6));
+        assert_eq!(byte_range_to_char_range(text, &(1..4)), (0, 1));
+        assert_eq!(byte_range_to_char_range("", &(0..0)), (0, 0));
+    }
+
+    // ──────────── 追加キャレット / 選択範囲の描画 ────────────
+
+    /// 行の矩形を等間隔で作る (視覚行の並びを模す)。
+    fn rows(n: usize, w: f32, h: f32) -> Vec<egui::Rect> {
+        (0..n)
+            .map(|i| {
+                egui::Rect::from_min_max(
+                    egui::pos2(0.0, i as f32 * h),
+                    egui::pos2(w, (i + 1) as f32 * h),
+                )
+            })
+            .collect()
+    }
+
+    /// 1 行に収まる選択は x0..x1 の 1 枚。
+    #[test]
+    fn 一行の選択は矩形一枚になる() {
+        let r = rows(1, 300.0, 16.0);
+        let got = selection_row_rects(&r, 40.0, 120.0, 4.0);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].left(), 40.0);
+        assert_eq!(got[0].right(), 120.0);
+        assert_eq!(got[0].top(), 0.0);
+        assert_eq!(got[0].bottom(), 16.0);
+    }
+
+    /// 行をまたぐ選択は「開始行は x から行末」「中間行は丸ごと」
+    /// 「終了行は行頭から x」に割れる。
+    #[test]
+    fn 行をまたぐ選択は行ごとに割れる() {
+        let r = rows(3, 200.0, 16.0);
+        let got = selection_row_rects(&r, 50.0, 80.0, 4.0);
+        assert_eq!(got.len(), 3);
+        assert_eq!((got[0].left(), got[0].right()), (50.0, 204.0));
+        assert_eq!((got[1].left(), got[1].right()), (0.0, 204.0));
+        assert_eq!((got[2].left(), got[2].right()), (0.0, 80.0));
+    }
+
+    /// どんな入力でも: 矩形は行の上下に収まり、互いに重ならず、幅は正。
+    /// 極端なサイズ (狭い / 広い / 逆順の x / 行が無い) で固定する。
+    #[test]
+    fn 選択矩形は行に収まり重ならない() {
+        let cases: Vec<(Vec<egui::Rect>, f32, f32, f32)> = vec![
+            (rows(1, 900.0, 18.0), 0.0, 900.0, 0.0),
+            (rows(2, 1200.0, 12.0), 1199.0, 1.0, 6.0),
+            (rows(40, 300.0, 700.0 / 40.0), 10.0, 290.0, 3.0),
+            (rows(3, 120.0, 20.0), 200.0, 0.0, 5.0), // x0 が行末より右 / x1 が行頭
+            (rows(0, 100.0, 10.0), 0.0, 10.0, 2.0),  // 行が無い
+            (rows(2, 0.0, 10.0), 0.0, 0.0, 0.0),     // 幅 0 の行 (空行)
+        ];
+        for (r, x0, x1, nl) in cases {
+            let got = selection_row_rects(&r, x0, x1, nl);
+            let bounds = r.iter().fold(None::<egui::Rect>, |acc, x| {
+                Some(acc.map_or(*x, |a| a.union(*x)))
+            });
+            for (i, g) in got.iter().enumerate() {
+                assert!(g.width() > 0.0, "幅 0 の矩形を painter へ渡している: {g:?}");
+                let b = bounds.expect("矩形があるなら行もある");
+                assert!(
+                    g.top() >= b.top() - 0.01 && g.bottom() <= b.bottom() + 0.01,
+                    "行の外へはみ出した: {g:?} / {b:?}"
+                );
+                if i > 0 {
+                    assert!(
+                        got[i - 1].bottom() <= g.top() + 0.01,
+                        "矩形が縦に重なった: {:?} と {g:?}",
+                        got[i - 1]
+                    );
+                }
+            }
+        }
+    }
+
+    // ──────────── 配線の回帰テスト (ソース検査) ────────────
+
+    /// 打鍵の横取りは **`TextEdit` を描く前**でなければならない。
+    /// 後ろに置くと egui が先に主キャレットへ適用してしまい、
+    /// 「⌘D で 5 箇所選んだのに 1 箇所にしか入らない」に戻る。
+    #[test]
+    fn 打鍵の横取りは_textedit_より前にある() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .nth(1)
+            .expect("code_editor_ui がある");
+        let take = body.find("take_multi_keys(").expect("打鍵の横取りがある");
+        let te = body
+            .find("egui::TextEdit::multiline(&mut target)")
+            .expect("本文の TextEdit がある");
+        assert!(
+            take < te,
+            "打鍵の横取りが TextEdit より後ろにある (1 箇所にしか入らない)"
+        );
+    }
+
+    /// 複数キャレットの打鍵でも本文の書き込みは **1 か所だけ**
+    /// (2 回以上書くと取り消しが 1 段で戻らない)。
+    #[test]
+    fn 打鍵の一括適用でも本文書き込みは一度だけ() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("let ops = ui.input_mut(|i| take_multi_keys(&mut i.events));")
+            .nth(1)
+            .expect("横取りの腕がある");
+        let arm = &body[..body.find("// 括弧・引用符の自動ペア").unwrap_or(body.len())];
+        assert_eq!(
+            arm.matches("b.text = ").count(),
+            1,
+            "本文を 2 回以上書き換えている (取り消しが 1 段で戻らない)"
+        );
+        assert!(arm.contains("apply_multi_keys("), "一括適用を通っていない");
+    }
+
+    /// Alt+クリック / Alt+ドラッグの経路が生きていること。
+    /// `modifiers.alt` を読む場所が無くなったら追加キャレットは置けない。
+    #[test]
+    fn alt_クリックとドラッグの経路がある() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .nth(1)
+            .expect("code_editor_ui がある");
+        assert!(body.contains("i.modifiers.alt"), "Alt を読んでいない");
+        for want in [
+            "MultiPointer::DragStart(",
+            "MultiPointer::Drag(",
+            "MultiPointer::Click(",
+            "MultiPointer::Clear",
+        ] {
+            assert!(body.contains(want), "{want} の経路が無い");
+        }
+        assert!(
+            body.contains("self.apply_multi_pointer("),
+            "拾った操作を反映していない"
+        );
+    }
+
+    /// 追加キャレットの色はテーマから取る (固定色を書かない)。
+    #[test]
+    fn 追加キャレットの色はテーマ由来() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .nth(1)
+            .expect("code_editor_ui がある");
+        let decl = body
+            .split("let multi_caret_color =")
+            .nth(1)
+            .expect("キャレット色の宣言がある");
+        let decl = &decl[..decl.find(';').unwrap_or(decl.len())];
+        assert!(decl.contains("self.theme."), "テーマ由来でない色: {decl}");
     }
 }
 
