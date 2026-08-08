@@ -22,6 +22,7 @@ mod file_search;
 mod file_tree;
 mod find_buffer;
 mod firewall;
+mod follow;
 mod fuzzy;
 mod git;
 mod git_panel;
