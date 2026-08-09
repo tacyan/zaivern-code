@@ -142,13 +142,18 @@ pub enum BindAction {
     DiffNextChange,
     /// 差分ビューで前の変更へ (VS Code: ⇧F7)
     DiffPrevChange,
+    /// レビューで**次の「差分のあるファイル」へ**ジャンプ (cmux: `]f`)。
+    /// 既定は 2 打鍵 ([`Binding::Chord`])。
+    DiffNextFile,
+    /// レビューで前の「差分のあるファイル」へジャンプ (cmux: `[f`)。
+    DiffPrevFile,
     /// キーバインド編集 UI を開く (VS Code: ⌘K ⌘S)。
     /// 既定は 2 打鍵 ([`Binding::Chord`])。
     KeybindEditor,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 68] = [
+pub const ALL_ACTIONS: [BindAction; 70] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -216,6 +221,8 @@ pub const ALL_ACTIONS: [BindAction; 68] = [
     BindAction::FocusPane3,
     BindAction::DiffNextChange,
     BindAction::DiffPrevChange,
+    BindAction::DiffNextFile,
+    BindAction::DiffPrevFile,
     BindAction::KeybindEditor,
 ];
 
@@ -384,6 +391,13 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         // F7 は既定でメディアキー扱いでもアプリへ届く (fn 併用が要る機種はある)。
         BindAction::DiffNextChange => KeyboardShortcut::new(Modifiers::NONE, Key::F7),
         BindAction::DiffPrevChange => KeyboardShortcut::new(Modifiers::SHIFT, Key::F7),
+        // `]f` / `[f` (cmux) の **1 打鍵目**。2 打鍵目は [`default_binding`] が付ける。
+        // 修飾キー無しの `]` `[` を prefix にしているので、**テキスト入力に
+        // フォーカスがあるフレームでは消費しない** (app.rs 側のガード)。
+        // macOS の予約表 ([`MACOS_RESERVED`]) にブラケットは無く、既存の
+        // ⌘⇧] / ⌘⇧[ (タブ移動) とは修飾キーが違うので食い合わない。
+        BindAction::DiffNextFile => KeyboardShortcut::new(Modifiers::NONE, Key::CloseBracket),
+        BindAction::DiffPrevFile => KeyboardShortcut::new(Modifiers::NONE, Key::OpenBracket),
         // ⌘K ⌘S (VS Code の「キーボードショートカット」) の **1 打鍵目**。
         // 2 打鍵目は [`default_binding`] が付ける。⌘K 単打の既定は他に無い。
         BindAction::KeybindEditor => KeyboardShortcut::new(cmd, Key::K),
@@ -400,6 +414,16 @@ pub fn default_binding(a: BindAction) -> Binding {
         BindAction::KeybindEditor => Binding::Chord(
             KeyboardShortcut::new(Modifiers::COMMAND, Key::K),
             KeyboardShortcut::new(Modifiers::COMMAND, Key::S),
+        ),
+        // cmux と同じ `]f` / `[f`。**ファイル間のジャンプが並列レビューの単位**
+        // なので、スクロール系 (F7) とは別の打鍵にしてある。
+        BindAction::DiffNextFile => Binding::Chord(
+            KeyboardShortcut::new(Modifiers::NONE, Key::CloseBracket),
+            KeyboardShortcut::new(Modifiers::NONE, Key::F),
+        ),
+        BindAction::DiffPrevFile => Binding::Chord(
+            KeyboardShortcut::new(Modifiers::NONE, Key::OpenBracket),
+            KeyboardShortcut::new(Modifiers::NONE, Key::F),
         ),
         _ => Binding::Single(default_shortcut(a)),
     }
@@ -480,6 +504,8 @@ pub fn config_name(a: BindAction) -> &'static str {
         FocusPane3 => "focus_pane_3",
         DiffNextChange => "diff_next_change",
         DiffPrevChange => "diff_prev_change",
+        DiffNextFile => "diff_next_file",
+        DiffPrevFile => "diff_prev_file",
         KeybindEditor => "keybind_editor",
     }
 }
@@ -558,6 +584,8 @@ pub fn action_label(a: BindAction) -> &'static str {
         FocusPane3 => "3 番目のペインへ",
         DiffNextChange => "次の変更へ",
         DiffPrevChange => "前の変更へ",
+        DiffNextFile => "次の差分ファイルへ",
+        DiffPrevFile => "前の差分ファイルへ",
         KeybindEditor => "キーボード ショートカットの設定",
     }
 }
@@ -748,6 +776,8 @@ impl Keybinds {
             "focus_pane_3" => FocusPane3,
             "diff_next_change" => DiffNextChange,
             "diff_prev_change" => DiffPrevChange,
+            "diff_next_file" => DiffNextFile,
+            "diff_prev_file" => DiffPrevFile,
             "keybind_editor" => KeybindEditor,
             _ => return None,
         })

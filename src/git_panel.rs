@@ -2182,6 +2182,151 @@ pub fn move_selection(cur: Option<usize>, len: usize, delta: i32) -> Option<usiz
     })
 }
 
+// ---------------------------------------------------------------------------
+// レビュー画面のモードとレイアウト (純関数)
+// ---------------------------------------------------------------------------
+
+/// レビュー画面の**中央ビュー**。独立した bool を並べると
+/// 「2 つのビューが同時に描かれる」事故が構造的に起こり得るので、
+/// 1 個の列挙型で持つ (CLAUDE.md の UI 原則)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReviewMode {
+    /// 従来どおり: 左に変更ファイル一覧・右に差分。
+    #[default]
+    Files,
+    /// Diff Focus Mode: **1 ファイルだけ**を大きく見せる。
+    /// 他のファイルは画面から外し、`]f` / `[f` で行き来する。
+    Focus,
+    /// 横断ハンクレビューキュー: 全ファイルの変更を 1 本に並べ、
+    /// ハンク単位で採用 / 却下する。
+    Queue,
+}
+
+impl ReviewMode {
+    pub fn label(self) -> String {
+        match self {
+            ReviewMode::Files => tr("一覧"),
+            ReviewMode::Focus => tr("集中"),
+            ReviewMode::Queue => tr("キュー"),
+        }
+    }
+    pub fn hint(self) -> String {
+        match self {
+            ReviewMode::Files => tr("左に変更ファイル、右に差分"),
+            ReviewMode::Focus => tr("1 ファイルに集中する (他のファイルは出さない)"),
+            ReviewMode::Queue => tr("全ファイルの変更を 1 本に並べ、ハンク単位で採用 / 却下する"),
+        }
+    }
+}
+
+/// ツールバー 1 段の高さ (見出し + コンボ + トグル)。
+const REVIEW_BAR_H: f32 = 24.0;
+/// 位置カウンタ / 集計の 1 段。
+const REVIEW_COUNT_H: f32 = 20.0;
+/// ツールバーが 2 段に折り返す幅。これより狭いと 1 行に収まらない。
+const REVIEW_WRAP_W: f32 = 420.0;
+/// ファイル一覧と差分を左右に並べる最小幅 (これ未満は縦積み)。
+const REVIEW_WIDE_W: f32 = 640.0;
+
+/// レビュー画面の矩形割り。**すべて `avail` の中に収まり、互いに重ならない。**
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReviewLayout {
+    /// ツールバー (比較ベース・文脈行数・モード切替)。
+    pub bar: egui::Rect,
+    /// 位置カウンタ / 集計の 1 行。
+    pub counter: egui::Rect,
+    /// 変更ファイル一覧。`Focus` / `Queue` と 0 件のときは出さない。
+    pub list: Option<egui::Rect>,
+    /// 差分 (あるいはキュー) 本体。0 件のときは空状態カードに譲る。
+    pub body: Option<egui::Rect>,
+    /// 空状態カード。**利用可能領域の中央に 1 枚**だけ。
+    pub empty: Option<egui::Rect>,
+    /// 一覧と差分を左右に並べず縦へ積むか。
+    pub stacked: bool,
+}
+
+/// 可用領域・モード・件数から矩形を決める**純関数**。
+///
+/// 不変条件 (テーブルテストで固定):
+/// - 返す矩形はすべて `avail` の中 (どの幅でも見切れない)
+/// - `bar` / `counter` / `list` / `body` / `empty` は互いに重ならない
+/// - 0 件のときは一覧も差分も**高さを確保しない** (空白を作らない)。
+///   代わりに空状態カードを利用可能領域の中央へ 1 枚だけ置く
+pub fn review_layout(avail: egui::Rect, mode: ReviewMode, files: usize) -> ReviewLayout {
+    let w = avail.width().max(0.0);
+    let bar_h = if w < REVIEW_WRAP_W {
+        REVIEW_BAR_H * 2.0
+    } else {
+        REVIEW_BAR_H
+    }
+    .min(avail.height());
+    let bar = egui::Rect::from_min_size(avail.min, egui::vec2(w, bar_h));
+    let counter_h = (avail.height() - bar_h).clamp(0.0, REVIEW_COUNT_H);
+    let counter = egui::Rect::from_min_size(
+        egui::pos2(avail.left(), bar.bottom()),
+        egui::vec2(w, counter_h),
+    );
+    let rest = egui::Rect::from_min_max(
+        egui::pos2(avail.left(), counter.bottom()),
+        egui::pos2(avail.right(), avail.bottom().max(counter.bottom())),
+    );
+    if files == 0 {
+        // 空のセクションは高さを確保しない。空状態は中央に 1 枚。
+        let card = crate::panels::empty_card(rest, 1).card;
+        return ReviewLayout {
+            bar,
+            counter,
+            list: None,
+            body: None,
+            empty: Some(card),
+            stacked: false,
+        };
+    }
+    // 集中モードとキューは 1 ファイル / 1 本のスクロールなので一覧を出さない。
+    if mode != ReviewMode::Files {
+        return ReviewLayout {
+            bar,
+            counter,
+            list: None,
+            body: Some(rest),
+            empty: None,
+            stacked: false,
+        };
+    }
+    if w >= REVIEW_WIDE_W {
+        let list_w = (w * 0.32).clamp(200.0, 380.0).min(w);
+        let list = egui::Rect::from_min_size(rest.min, egui::vec2(list_w, rest.height()));
+        let body = egui::Rect::from_min_max(
+            egui::pos2(list.right(), rest.top()),
+            egui::pos2(rest.right(), rest.bottom()),
+        );
+        ReviewLayout {
+            bar,
+            counter,
+            list: Some(list),
+            body: Some(body),
+            empty: None,
+            stacked: false,
+        }
+    } else {
+        // 縦積み: 一覧は上 40% (最低 1 行分)、残りが差分。
+        let list_h = (rest.height() * 0.4).clamp(0.0, rest.height());
+        let list = egui::Rect::from_min_size(rest.min, egui::vec2(w, list_h));
+        let body = egui::Rect::from_min_max(
+            egui::pos2(rest.left(), list.bottom()),
+            egui::pos2(rest.right(), rest.bottom()),
+        );
+        ReviewLayout {
+            bar,
+            counter,
+            list: Some(list),
+            body: Some(body),
+            empty: None,
+            stacked: true,
+        }
+    }
+}
+
 /// NUL を含むならバイナリ扱い (git 自身と同じ経験則)。
 fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8000).any(|b| *b == 0)
@@ -2367,6 +2512,22 @@ pub struct ReviewPanel {
     comments: std::collections::HashMap<String, crate::diff::DiffCommentStore>,
     /// 一覧をクリックしたか (キーボード操作を横取りしないための足枷)。
     list_focused: bool,
+    /// 中央ビュー。**独立した bool を並べない** (2 つ同時に描かれる事故を防ぐ)。
+    mode: ReviewMode,
+    /// 「レビュー済み」の印を付けたファイル (repo 相対パス)。
+    /// セッションへ往復する ([`Self::reviewed_paths`] / [`Self::set_reviewed_paths`])。
+    reviewed: std::collections::HashSet<String>,
+    /// 印が変わったので保存し直したい (app.rs が 1 回だけ拾う)。
+    reviewed_dirty: bool,
+    /// 横断ハンクキューの判断台帳 (鍵は安定ハンク ID)。
+    queue: crate::diff::ReviewQueue,
+    /// キューで次に読む位置 (「あと何件」の起点)。
+    queue_pos: usize,
+    /// 横断キューの並び。**収集のたびに 1 回だけ**作る
+    /// (毎フレーム全差分を走査しない — アイドルのコストをゼロに保つ)。
+    items: Vec<crate::diff::QueueItem>,
+    /// 却下の 2 段確認 (安定ハンク ID)。**破壊的**なので必須。
+    confirm_reject: Option<String>,
 }
 
 impl ReviewPanel {
@@ -2390,7 +2551,45 @@ impl ReviewPanel {
             confirm_hunk: None,
             comments: std::collections::HashMap::new(),
             list_focused: false,
+            mode: ReviewMode::default(),
+            reviewed: std::collections::HashSet::new(),
+            reviewed_dirty: false,
+            queue: crate::diff::ReviewQueue::default(),
+            queue_pos: 0,
+            items: Vec::new(),
+            confirm_reject: None,
         }
+    }
+
+    /// セッションへ書き出す「レビュー済み」の印 (repo 相対パス・並び順は安定)。
+    pub fn reviewed_paths(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.reviewed.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// セッションから読み戻す。**再起動しても印が残る**のはこの経路。
+    pub fn set_reviewed_paths(&mut self, paths: &[String]) {
+        self.reviewed = paths.iter().cloned().collect();
+        self.reviewed_dirty = false;
+    }
+
+    /// 印が変わったか (app.rs が 1 回だけ拾ってセッションへ書く)。
+    pub fn take_reviewed_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.reviewed_dirty)
+    }
+
+    /// 中央ビューを外から切り替える (パレット / キーバインドの配線用)。
+    pub fn set_mode(&mut self, mode: ReviewMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.confirm_hunk = None;
+            self.confirm_reject = None;
+        }
+    }
+
+    pub fn mode(&self) -> ReviewMode {
+        self.mode
     }
 
     pub fn set_workspace(&mut self, ws: PathBuf) {
@@ -2404,7 +2603,12 @@ impl ReviewPanel {
             self.selected = None;
             self.confirm_discard = None;
             self.confirm_hunk = None;
+            self.confirm_reject = None;
             self.comments.clear();
+            // 別リポジトリのハンク ID を持ち越さない (パスが同じでも別物)。
+            self.queue.clear();
+            self.queue_pos = 0;
+            self.reviewed.clear();
             self.invalidate();
         }
     }
@@ -2435,8 +2639,17 @@ impl ReviewPanel {
         self.poll(actions);
         self.maybe_refresh(&ctx);
 
+        // 矩形割りは純関数が決める (テーブルテストで固定してある)。
+        // ここでは「縦積みにするか」「一覧の幅」だけを取り出して使う。
+        let plan = review_layout(
+            ui.available_rect_before_wrap().intersect(ui.clip_rect()),
+            self.mode,
+            self.data.files.len(),
+        );
         self.toolbar_ui(ui, theme);
         self.summary_ui(ui, theme);
+        // `]f` / `[f` は差分が出ているフレームでだけ効く (依頼は 1 フレームで腐る)。
+        self.apply_file_jump(&ctx);
 
         if let Some(err) = self.data.error.clone() {
             ui.label(RichText::new(err).color(theme.err).small());
@@ -2454,10 +2667,12 @@ impl ReviewPanel {
             return;
         }
         if self.data.files.is_empty() {
-            ui.label(
-                RichText::new(tr("このベースとの差分はありません"))
-                    .color(theme.text_dim)
-                    .small(),
+            // 空のセクションは高さを確保しない。**中央に 1 枚**だけ出す。
+            self.empty_card_ui(
+                ui,
+                theme,
+                &tr("このベースとの差分はありません"),
+                &tr("レビューは閉じました"),
             );
             return;
         }
@@ -2473,41 +2688,185 @@ impl ReviewPanel {
         }
 
         self.handle_keys(ui);
+        // 位置カウンタは**どのモードでも常に出す** (あと何件で終わるかが本質)。
+        self.counter_ui(ui, theme);
 
         let mut job: Option<ReviewJob> = None;
-        // 幅が狭いときは縦積み (左サイドバーに置かれても潰れない)。
-        let wide = ui.available_width() >= 640.0;
-        if wide {
-            let list_w = (ui.available_width() * 0.32).clamp(200.0, 380.0);
-            let h = ui.available_height();
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(list_w, h),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("zv-review-list")
-                            .show(ui, |ui| self.file_list_ui(ui, theme, &mut job, actions));
-                    },
-                );
-                ui.separator();
+        match self.mode {
+            ReviewMode::Focus => {
                 egui::ScrollArea::vertical()
-                    .id_salt("zv-review-diff")
-                    .show(ui, |ui| self.diff_pane_ui(ui, theme, actions, &mut job));
-            });
-        } else {
-            egui::ScrollArea::vertical()
-                .id_salt("zv-review-stacked")
-                .show(ui, |ui| {
-                    self.file_list_ui(ui, theme, &mut job, actions);
-                    ui.separator();
-                    self.diff_pane_ui(ui, theme, actions, &mut job);
-                });
+                    .id_salt("zv-review-focus")
+                    .show(ui, |ui| self.focus_pane_ui(ui, theme, actions, &mut job));
+            }
+            ReviewMode::Queue => {
+                egui::ScrollArea::vertical()
+                    .id_salt("zv-review-queue")
+                    .show(ui, |ui| self.queue_pane_ui(ui, theme, &mut job));
+            }
+            ReviewMode::Files => {
+                // 幅が狭いときは縦積み (左サイドバーに置かれても潰れない)。
+                let list_w = plan.list.map(|r| r.width()).unwrap_or(0.0);
+                if !plan.stacked && list_w > 0.0 {
+                    let h = ui.available_height();
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(list_w, h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("zv-review-list")
+                                    .show(ui, |ui| self.file_list_ui(ui, theme, &mut job, actions));
+                            },
+                        );
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("zv-review-diff")
+                            .show(ui, |ui| self.diff_pane_ui(ui, theme, actions, &mut job));
+                    });
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("zv-review-stacked")
+                        .show(ui, |ui| {
+                            self.file_list_ui(ui, theme, &mut job, actions);
+                            ui.separator();
+                            self.diff_pane_ui(ui, theme, actions, &mut job);
+                        });
+                }
+            }
         }
 
         if let Some(j) = job {
             self.spawn_review_job(&ctx, j, actions);
         }
+    }
+
+    /// 空状態。**利用可能領域の中央に 1 枚のカード**で示す
+    /// (矩形は `panels::empty_card` が決めるので、どの窓サイズでもはみ出さない)。
+    fn empty_card_ui(&self, ui: &mut egui::Ui, theme: &Theme, msg: &str, sub: &str) {
+        let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+        let card = crate::panels::empty_card(avail, 1).card;
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(card), |ui| {
+            egui::Frame::none()
+                .fill(theme.panel_alt)
+                .stroke(egui::Stroke::new(1.0_f32, theme.border))
+                .rounding(egui::Rounding::same(10.0))
+                .inner_margin(egui::Margin::same(crate::panels::space::MD))
+                .show(ui, |ui| {
+                    ui.set_width((card.width() - crate::panels::space::MD * 2.0).max(1.0));
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("✔").size(40.0).color(theme.text_dim));
+                        ui.label(RichText::new(msg).size(15.0).color(theme.text));
+                        ui.label(RichText::new(sub).size(12.0).color(theme.text_dim));
+                    });
+                });
+        });
+    }
+
+    /// レビュー済みでないファイルの並び (Focus Mode のジャンプ対象)。
+    fn reviewed_flags(&self) -> Vec<bool> {
+        self.data
+            .files
+            .iter()
+            .map(|f| self.reviewed.contains(&f.path))
+            .collect()
+    }
+
+    /// `]f` / `[f` の依頼を消化する。**レビュー済みは飛ばす。**
+    fn apply_file_jump(&mut self, ctx: &egui::Context) {
+        if crate::diff::take_mark_viewed(ctx) {
+            if let Some(i) = self.selected {
+                if let Some(p) = self.data.files.get(i).map(|f| f.path.clone()) {
+                    self.toggle_reviewed(&p);
+                }
+            }
+        }
+        let Some(delta) = crate::diff::take_file_jump(ctx) else {
+            return;
+        };
+        let flags = self.reviewed_flags();
+        match crate::diff::next_unreviewed(self.selected, delta, &flags) {
+            Some(i) => {
+                self.selected = Some(i);
+                self.scroll_to = Some(i);
+                self.confirm_discard = None;
+                self.confirm_hunk = None;
+            }
+            None => {
+                let msg = if flags.is_empty() {
+                    tr("差分のあるファイルがありません")
+                } else {
+                    tr("すべてレビュー済みです")
+                };
+                crate::diff::set_review_notice(ctx, msg);
+            }
+        }
+    }
+
+    /// レビュー済みの印を付け外しする (セッションへも書き戻す)。
+    fn toggle_reviewed(&mut self, path: &str) {
+        if !self.reviewed.remove(path) {
+            self.reviewed.insert(path.to_string());
+        }
+        self.reviewed_dirty = true;
+    }
+
+    /// 位置カウンタと残数。**「あと何件で終わるか」を常に出す。**
+    fn counter_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let total = self.data.files.len();
+        let reviewed = self.reviewed_flags().iter().filter(|b| **b).count();
+        ui.horizontal_wrapped(|ui| match self.mode {
+            ReviewMode::Queue => {
+                let c = self.queue.counts(&self.items);
+                ui.label(
+                    RichText::new(crate::diff::position_label(
+                        (c.total > 0).then_some(self.queue_pos.min(c.total.saturating_sub(1))),
+                        c.total,
+                    ))
+                    .color(theme.text)
+                    .strong()
+                    .monospace(),
+                );
+                ui.label(
+                    RichText::new(crate::diff::remaining_label(
+                        c.total,
+                        c.accepted + c.rejected,
+                    ))
+                    .color(if c.remaining == 0 {
+                        theme.ok
+                    } else {
+                        theme.text_dim
+                    })
+                    .small(),
+                );
+                ui.label(
+                    RichText::new(trf("採用 {n}", &[("n", c.accepted.to_string())]))
+                        .color(theme.ok)
+                        .small(),
+                );
+                ui.label(
+                    RichText::new(trf("却下 {n}", &[("n", c.rejected.to_string())]))
+                        .color(theme.err)
+                        .small(),
+                );
+            }
+            _ => {
+                ui.label(
+                    RichText::new(crate::diff::position_label(self.selected, total))
+                        .color(theme.text)
+                        .strong()
+                        .monospace(),
+                );
+                ui.label(
+                    RichText::new(crate::diff::remaining_label(total, reviewed))
+                        .color(if reviewed == total && total > 0 {
+                            theme.ok
+                        } else {
+                            theme.text_dim
+                        })
+                        .small(),
+                );
+            }
+        });
     }
 
     // -- 各パーツ -----------------------------------------------------------
@@ -2579,6 +2938,17 @@ impl ReviewPanel {
             if ui.button(tr("再読み込み")).clicked() {
                 changed = true;
             }
+            ui.separator();
+            // 中央ビューの切替。**1 個の列挙型**なので 2 つ同時には描かれない。
+            for m in [ReviewMode::Files, ReviewMode::Focus, ReviewMode::Queue] {
+                if ui
+                    .selectable_label(self.mode == m, m.label())
+                    .on_hover_text(m.hint())
+                    .clicked()
+                {
+                    self.set_mode(m);
+                }
+            }
         });
         if changed {
             self.invalidate();
@@ -2636,11 +3006,23 @@ impl ReviewPanel {
                 };
                 let (color, badge, hint) = crate::file_tree::git_status_style(status, theme);
                 let name = path.rsplit_once('/').map(|(_, n)| n).unwrap_or(&path);
+                let viewed = self.reviewed.contains(&path);
                 ui.horizontal(|ui| {
+                    // レビュー済みの印 (VS Code の Mark as viewed)。
+                    // **ただの SelectableLabel なので同じラベルが並んでも衝突しない。**
+                    if ui
+                        .selectable_label(viewed, RichText::new(if viewed { "☑" } else { "☐" }))
+                        .on_hover_text(tr("レビュー済みの印 (次から飛ばす)"))
+                        .clicked()
+                    {
+                        self.toggle_reviewed(&path);
+                    }
                     let sel = self.selected == Some(i);
                     let label = format!("{badge}  {name}");
+                    let text =
+                        RichText::new(label).color(if viewed { theme.text_dim } else { color });
                     let resp = ui
-                        .selectable_label(sel, RichText::new(label).color(color))
+                        .selectable_label(sel, if viewed { text.strikethrough() } else { text })
                         .on_hover_text(format!("{path}\n{}", tr(hint)));
                     if resp.clicked() {
                         self.selected = Some(i);
@@ -2812,6 +3194,291 @@ impl ReviewPanel {
         }
     }
 
+    /// Diff Focus Mode — **1 ファイルだけ**を大きく見せる。
+    ///
+    /// 他のファイルは画面から外す。行き来は `]f` / `[f` (ファイル間のジャンプが
+    /// 並列レビューの単位)。位置カウンタは [`Self::counter_ui`] が常に出す。
+    fn focus_pane_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        actions: &mut GitActions,
+        job: &mut Option<ReviewJob>,
+    ) {
+        let flags = self.reviewed_flags();
+        // 現在地が無ければ、最初の**未レビュー**へ寄せる。
+        // 全部レビュー済みなら `None` のまま = キューが閉じた。
+        if self.selected.is_none() {
+            self.selected = crate::diff::next_unreviewed(None, 1, &flags);
+        }
+        let Some(i) = self.selected.filter(|i| *i < self.data.files.len()) else {
+            self.empty_card_ui(
+                ui,
+                theme,
+                &tr("すべてレビュー済みです"),
+                &tr("印を外すと、もう一度読み直せます"),
+            );
+            return;
+        };
+        let path = self.data.files[i].path.clone();
+        let viewed = self.reviewed.contains(&path);
+        let (color, badge, _) =
+            crate::file_tree::git_status_style(self.data.files[i].status, theme);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(badge).color(color).monospace());
+            ui.label(RichText::new(&path).color(theme.text).monospace())
+                .on_hover_text(&path);
+            let jump =
+                crate::keybinds::key_hint(ui.ctx(), crate::keybinds::BindAction::DiffNextFile);
+            let back =
+                crate::keybinds::key_hint(ui.ctx(), crate::keybinds::BindAction::DiffPrevFile);
+            if ui
+                .small_button("◀")
+                .on_hover_text(trf("前のファイルへ ({k})", &[("k", back)]))
+                .clicked()
+            {
+                crate::diff::request_file_jump(ui.ctx(), -1);
+            }
+            if ui
+                .small_button("▶")
+                .on_hover_text(trf("次のファイルへ ({k})", &[("k", jump)]))
+                .clicked()
+            {
+                crate::diff::request_file_jump(ui.ctx(), 1);
+            }
+            if ui
+                .selectable_label(
+                    viewed,
+                    RichText::new(if viewed {
+                        tr("☑ レビュー済み")
+                    } else {
+                        tr("☐ レビュー済みにする")
+                    })
+                    .small(),
+                )
+                .on_hover_text(tr("印を付けると `]f` で飛ばされる"))
+                .clicked()
+            {
+                self.toggle_reviewed(&path);
+            }
+        });
+        ui.separator();
+        let ops = hunk_ops_for(
+            &self.base,
+            self.ignore_ws,
+            self.data.files[i].untracked || self.data.files[i].diff.is_binary,
+        );
+        let confirm = self.confirm_hunk.filter(|(f, _)| *f == i).map(|(_, h)| h);
+        let store = self.comments.entry(path.clone()).or_default();
+        let action = crate::diff::diff_ui_with_hunk_actions(
+            ui,
+            theme,
+            std::slice::from_ref(&self.data.files[i].diff),
+            store,
+            Some(crate::diff::HunkActions {
+                ops: &ops,
+                confirm_discard: confirm,
+            }),
+        );
+        match action {
+            crate::diff::DiffAction::SendToAgent(p) => actions.review_prompt = Some(p),
+            crate::diff::DiffAction::Hunk { hunk, op, .. } => {
+                self.on_hunk_op(i, hunk, op, job, actions)
+            }
+            crate::diff::DiffAction::None => {}
+        }
+    }
+
+    /// 横断ハンクレビューキュー — 全ファイルの変更を **1 本のスクロール**に集約し、
+    /// ハンク単位で採用 / 却下する。
+    ///
+    /// 差分の中身は既存のレンダラに描かせ、git を叩くのも既存の
+    /// [`crate::diff::build_hunk_patch`] + `git apply` 経路。
+    /// ここが持つのは「どれを判断したか」だけ (鍵は**安定ハンク ID**)。
+    fn queue_pane_ui(&mut self, ui: &mut egui::Ui, theme: &Theme, job: &mut Option<ReviewJob>) {
+        // 並びは収集のたびに 1 回だけ作ってある ([`Self::poll`])。
+        let items = std::mem::take(&mut self.items);
+        if items.is_empty() {
+            self.items = items;
+            self.empty_card_ui(
+                ui,
+                theme,
+                &tr("判断できる変更がありません"),
+                &tr("バイナリ差分はキューに載りません"),
+            );
+            return;
+        }
+        self.queue_pos = self.queue_pos.min(items.len() - 1);
+        // 取り消し (却下は破壊的なので、戻す道を必ず用意する)。
+        if let Some(v) = self.queue.last().map(|e| e.verdict) {
+            let label = trf("↶ {v} を取り消す", &[("v", v.label())]);
+            let busy = self.job.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new(RichText::new(label).small()))
+                .on_hover_text(tr("直前の判断を逆向きのパッチで戻す"))
+                .clicked()
+            {
+                if let Some(e) = self.queue.undo() {
+                    // 採用の取り消し = index から下ろす / 却下の取り消し = 作業ツリーへ戻す
+                    let (cached, reverse) = match e.verdict {
+                        crate::diff::HunkVerdict::Accepted => (true, true),
+                        crate::diff::HunkVerdict::Rejected => (false, false),
+                    };
+                    *job = Some(ReviewJob::ApplyHunk {
+                        label: trf("{v} を取り消す", &[("v", e.verdict.label())]),
+                        patch: e.patch,
+                        cached,
+                        reverse,
+                    });
+                }
+            }
+            ui.separator();
+        }
+        let mut hit: Option<(usize, crate::diff::HunkVerdict)> = None;
+        for (k, it) in items.iter().enumerate() {
+            // 可変長リストなので ID には**要素の ID を混ぜる** (egui 0.29 の
+            // 永続 ID 系ウィジェットを中で使うため)。
+            ui.push_id(&it.id, |ui| {
+                let verdict = self.queue.verdict(&it.id);
+                ui.horizontal_wrapped(|ui| {
+                    if self.queue_pos == k {
+                        ui.label(RichText::new("▶").color(theme.accent).small());
+                    }
+                    ui.label(
+                        RichText::new(format!("{}/{}", k + 1, items.len()))
+                            .color(theme.text_dim)
+                            .monospace()
+                            .small(),
+                    );
+                    ui.label(RichText::new(&it.path).color(theme.text).monospace())
+                        .on_hover_text(&it.path);
+                    ui.label(
+                        RichText::new(format!("+{}", it.adds))
+                            .color(theme.ok)
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new(format!("−{}", it.dels))
+                            .color(theme.err)
+                            .small(),
+                    );
+                    match verdict {
+                        Some(v) => {
+                            let c = match v {
+                                crate::diff::HunkVerdict::Accepted => theme.ok,
+                                crate::diff::HunkVerdict::Rejected => theme.err,
+                            };
+                            ui.label(RichText::new(v.label()).color(c).small());
+                        }
+                        None => {
+                            let busy = self.job.is_some();
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(RichText::new(tr("✔ 採用")).small()),
+                                )
+                                .on_hover_text(tr("このハンクだけ index へ載せる"))
+                                .clicked()
+                            {
+                                hit = Some((k, crate::diff::HunkVerdict::Accepted));
+                            }
+                            // 却下は**取り消せる**が破壊的なので 2 段確認を挟む。
+                            if self.confirm_reject.as_deref() == Some(it.id.as_str()) {
+                                if ui
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new(
+                                            RichText::new(tr("⚠ 本当に却下"))
+                                                .color(theme.err)
+                                                .small(),
+                                        ),
+                                    )
+                                    .on_hover_text(tr("作業ツリーから巻き戻す (取り消せます)"))
+                                    .clicked()
+                                {
+                                    hit = Some((k, crate::diff::HunkVerdict::Rejected));
+                                }
+                            } else if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(RichText::new(tr("✖ 却下")).small()),
+                                )
+                                .on_hover_text(tr("もう一度押すと確定します"))
+                                .clicked()
+                            {
+                                self.confirm_reject = Some(it.id.clone());
+                            }
+                        }
+                    }
+                });
+                // 判断済みは畳んだまま (残りに集中させる)。
+                if verdict.is_none() {
+                    if let Some(f) = self.data.files.get(it.file) {
+                        let one = crate::diff::FileDiff {
+                            hunks: f
+                                .diff
+                                .hunks
+                                .get(it.hunk)
+                                .cloned()
+                                .map(|h| vec![h])
+                                .unwrap_or_default(),
+                            ..f.diff.clone()
+                        };
+                        let store = self.comments.entry(it.path.clone()).or_default();
+                        let _ =
+                            crate::diff::diff_ui_with_hunk_actions(ui, theme, &[one], store, None);
+                    }
+                }
+                ui.add_space(4.0);
+            });
+        }
+        if let Some((k, v)) = hit {
+            self.decide_hunk(&items, k, v, job);
+        }
+        self.items = items;
+    }
+
+    /// キューの 1 件を判断して git ジョブへ落とす。
+    ///
+    /// パッチは **既存の [`crate::diff::build_hunk_patch`]** で組む
+    /// (新しい diff アルゴリズムも新しい git 経路も作らない)。
+    fn decide_hunk(
+        &mut self,
+        items: &[crate::diff::QueueItem],
+        k: usize,
+        verdict: crate::diff::HunkVerdict,
+        job: &mut Option<ReviewJob>,
+    ) {
+        self.confirm_reject = None;
+        let Some(it) = items.get(k) else {
+            return;
+        };
+        let Some(f) = self.data.files.get(it.file) else {
+            return;
+        };
+        let Some(patch) = crate::diff::build_hunk_patch(&f.diff, it.hunk) else {
+            return;
+        };
+        // **既存の [`crate::diff::HunkOp`] へ落として git 経路を再利用する。**
+        let (cached, reverse) = match verdict.op() {
+            crate::diff::HunkOp::Stage => (true, false),
+            crate::diff::HunkOp::Unstage => (true, true),
+            crate::diff::HunkOp::Discard => (false, true),
+        };
+        self.queue.decide(&it.id, verdict, patch.clone());
+        // 次の未判断へ寄せる (キューが自分で閉じていく)。
+        self.queue_pos = self.queue.next_pending(items, k).unwrap_or(k);
+        *job = Some(ReviewJob::ApplyHunk {
+            label: trf(
+                "{v}: {p}",
+                &[("v", verdict.label()), ("p", it.path.clone())],
+            ),
+            patch,
+            cached,
+            reverse,
+        });
+    }
+
     /// ハンクのボタンが押されたときの分岐。
     /// **破棄だけは 2 段確認**を挟む (取り消せないので)。
     fn on_hunk_op(
@@ -2898,9 +3565,20 @@ impl ReviewPanel {
                     self.data = data;
                     self.loaded = true;
                     self.pending = None;
+                    // 横断キューの並びは **収集のたびに 1 回だけ** 作り直す。
+                    // 判断は安定ハンク ID で持っているので、添字がずれても
+                    // 採用 / 却下は追随する。消えたハンクの判断は捨てる。
+                    self.items = crate::diff::queue_items(self.data.files.iter().map(|f| &f.diff));
+                    self.queue.retain(&self.items);
+                    self.queue_pos = self
+                        .queue
+                        .next_pending(&self.items, 0)
+                        .unwrap_or(0)
+                        .min(self.items.len().saturating_sub(1));
                     // 再収集でハンクの並びが変わる。破棄の確認は必ず外す
                     // (別のハンクを消してしまわないように)。
                     self.confirm_hunk = None;
+                    self.confirm_reject = None;
                     // 選択が範囲外になったら外す
                     if self.selected.is_some_and(|i| i >= self.data.files.len()) {
                         self.selected = None;
@@ -4246,5 +4924,346 @@ bare
         }
 
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── レビュー画面のレイアウト (純関数のテーブルテスト) ─────────
+
+    /// 2 つの矩形が重なっているか (辺を共有するだけは重なりでない)。
+    fn overlaps(a: egui::Rect, b: egui::Rect) -> bool {
+        let x = a.right() > b.left() + 0.01 && b.right() > a.left() + 0.01;
+        let y = a.bottom() > b.top() + 0.01 && b.bottom() > a.top() + 0.01;
+        x && y
+    }
+
+    fn assert_layout_sane(avail: egui::Rect, l: ReviewLayout, what: &str) {
+        let mut rects = vec![("bar", l.bar), ("counter", l.counter)];
+        for (n, r) in [("list", l.list), ("body", l.body), ("empty", l.empty)] {
+            if let Some(r) = r {
+                rects.push((n, r));
+            }
+        }
+        for (n, r) in &rects {
+            assert!(
+                r.left() >= avail.left() - 0.01
+                    && r.right() <= avail.right() + 0.01
+                    && r.top() >= avail.top() - 0.01
+                    && r.bottom() <= avail.bottom() + 0.01,
+                "{what}: {n} が可用領域からはみ出した {r:?} ⊄ {avail:?}"
+            );
+            assert!(
+                r.width() >= 0.0 && r.height() >= 0.0,
+                "{what}: {n} が負の矩形"
+            );
+        }
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                assert!(
+                    !overlaps(rects[i].1, rects[j].1),
+                    "{what}: {} と {} が重なっている {:?} / {:?}",
+                    rects[i].0,
+                    rects[j].0,
+                    rects[i].1,
+                    rects[j].1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn レビュー画面のレイアウトはどの幅でも収まり重ならない() {
+        // (幅, 高さ) — 極端なサイズを含める
+        for &(w, h) in &[
+            (900.0_f32, 700.0_f32),
+            (1200.0, 300.0),
+            (400.0, 700.0),
+            (200.0, 120.0),
+            (1600.0, 900.0),
+        ] {
+            let avail = egui::Rect::from_min_size(egui::pos2(12.0, 30.0), egui::vec2(w, h));
+            for mode in [ReviewMode::Files, ReviewMode::Focus, ReviewMode::Queue] {
+                for files in [0usize, 1, 7, 300] {
+                    let l = review_layout(avail, mode, files);
+                    assert_layout_sane(avail, l, &format!("{w}x{h} {mode:?} {files} 件"));
+                    if files == 0 {
+                        // 空のセクションは高さを確保しない。中央に 1 枚だけ。
+                        assert!(l.list.is_none() && l.body.is_none(), "空なのに枠を確保した");
+                        let card = l.empty.expect("空状態カードが無い");
+                        assert!(card.width() > 0.0, "空状態カードが潰れている");
+                    } else {
+                        assert!(l.empty.is_none(), "中身があるのに空状態を出した");
+                        assert!(l.body.is_some(), "差分の置き場が無い");
+                        // 集中モードとキューは一覧を出さない (1 ファイル / 1 本)
+                        assert_eq!(
+                            l.list.is_some(),
+                            mode == ReviewMode::Files,
+                            "{mode:?} の一覧の有無が違う"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn レビュー画面は狭いと縦積みへ落ちる() {
+        let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 700.0));
+        assert!(!review_layout(wide, ReviewMode::Files, 3).stacked);
+        assert!(review_layout(narrow, ReviewMode::Files, 3).stacked);
+        // 縦積みでもツールバーは 2 段になり、全部が可用領域に収まる
+        let l = review_layout(narrow, ReviewMode::Files, 3);
+        assert!(l.bar.height() > review_layout(wide, ReviewMode::Files, 3).bar.height());
+        assert_layout_sane(narrow, l, "narrow");
+    }
+
+    // ── レビュー済みの印とキューの配線 ───────────────────────────
+
+    #[test]
+    fn レビュー済みの印はセッションへ往復する() {
+        let dir = crate::test_util::unique_temp_dir("zv-review", "viewed");
+        let mut p = ReviewPanel::new(dir.clone());
+        assert!(p.reviewed_paths().is_empty());
+        assert!(!p.take_reviewed_dirty());
+
+        p.toggle_reviewed("src/b.rs");
+        p.toggle_reviewed("src/a.rs");
+        assert_eq!(
+            p.reviewed_paths(),
+            vec!["src/a.rs", "src/b.rs"],
+            "並びが安定しない"
+        );
+        assert!(p.take_reviewed_dirty(), "保存の合図が立っていない");
+        assert!(!p.take_reviewed_dirty(), "合図が 1 回で消えていない");
+
+        // 付け外し
+        p.toggle_reviewed("src/a.rs");
+        assert_eq!(p.reviewed_paths(), vec!["src/b.rs"]);
+
+        // 再起動相当: 別インスタンスへ読み戻す
+        let saved = p.reviewed_paths();
+        let mut q = ReviewPanel::new(dir.clone());
+        q.set_reviewed_paths(&saved);
+        assert_eq!(q.reviewed_paths(), saved);
+        assert!(
+            !q.take_reviewed_dirty(),
+            "読み戻しただけで保存の合図が立った"
+        );
+
+        // 別リポジトリへ移ったら持ち越さない
+        q.set_workspace(dir.join("other"));
+        assert!(q.reviewed_paths().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn レビューの中央ビューは単一の列挙型で切り替わる() {
+        let dir = crate::test_util::unique_temp_dir("zv-review", "mode");
+        let mut p = ReviewPanel::new(dir.clone());
+        assert_eq!(p.mode(), ReviewMode::Files);
+        p.set_mode(ReviewMode::Focus);
+        assert_eq!(p.mode(), ReviewMode::Focus);
+        p.set_mode(ReviewMode::Queue);
+        assert_eq!(p.mode(), ReviewMode::Queue);
+        // 表示名は全部埋まっていて重複しない
+        let mut seen = std::collections::HashSet::new();
+        for m in [ReviewMode::Files, ReviewMode::Focus, ReviewMode::Queue] {
+            assert!(
+                !m.label().is_empty() && !m.hint().is_empty(),
+                "{m:?} の文言が空"
+            );
+            assert!(seen.insert(m.label()), "{m:?} の表示名が重複している");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// キューの採用 / 却下が**実際に git へ届き、取り消しで戻る**こと。
+    /// パッチは既存の `build_hunk_patch` + `apply_patch_args` を使う。
+    #[test]
+    fn キューの採用と却下が実リポジトリで往復する() {
+        let Some(repo) = review_repo("queue-roundtrip") else {
+            return;
+        };
+        std::fs::write(repo.join("q.txt"), "one\ntwo\nthree\n").expect("seed");
+        git_ok(&repo, &["add", "-A"]);
+        git_commit(&repo, "seed");
+        std::fs::write(repo.join("q.txt"), "one\nTWO\nthree\n").expect("edit");
+
+        let data = collect_review(&repo, &ReviewBase::Unstaged, ContextLines::Three, false);
+        let diffs: Vec<crate::diff::FileDiff> = data.files.iter().map(|f| f.diff.clone()).collect();
+        let items = crate::diff::queue_items(&diffs);
+        assert_eq!(items.len(), 1, "1 ハンクのはず: {items:?}");
+        let patch = crate::diff::build_hunk_patch(&data.files[0].diff, 0).expect("patch");
+
+        let mut q = crate::diff::ReviewQueue::default();
+        // 却下 = 作業ツリーから巻き戻す
+        q.decide(
+            &items[0].id,
+            crate::diff::HunkVerdict::Rejected,
+            patch.clone(),
+        );
+        let args = apply_patch_args(false, true);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git_stdin(&repo, &argv, &patch).expect("却下を当てられない");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("q.txt")).expect("read"),
+            "one\ntwo\nthree\n",
+            "却下が効いていない"
+        );
+        assert_eq!(q.counts(&items).rejected, 1);
+
+        // 取り消し = 同じパッチを順方向で当て直す
+        let e = q.undo().expect("取り消せる");
+        let args = apply_patch_args(false, false);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git_stdin(&repo, &argv, &e.patch).expect("取り消しを当てられない");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("q.txt")).expect("read"),
+            "one\nTWO\nthree\n",
+            "却下を取り消せていない"
+        );
+        assert_eq!(q.counts(&items).remaining, 1);
+
+        // 採用 = index へ載せる
+        q.decide(
+            &items[0].id,
+            crate::diff::HunkVerdict::Accepted,
+            patch.clone(),
+        );
+        let args = apply_patch_args(true, false);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git_stdin(&repo, &argv, &patch).expect("採用を当てられない");
+        assert_eq!(
+            run_git(&repo, &["show", ":q.txt"]).expect("show"),
+            "one\nTWO\nthree\n",
+            "採用が index に載っていない"
+        );
+        assert_eq!(q.counts(&items).accepted, 1);
+        assert_eq!(q.counts(&items).remaining, 0, "キューが閉じていない");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// 3 つのモードを実際に描いて、どの窓サイズでも落ちないことを確かめる。
+    ///
+    /// 位置カウンタ (`2 / 5`) と残数が**画面に出ている**ことまで見る
+    /// (「あと何件で終わるか」が見えるのがこの機能の本質なので)。
+    #[test]
+    fn レビュー画面は3モードとも描けて位置カウンタが出る() {
+        let files = crate::diff::parse_unified(
+            "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,1 +1,1 @@
+-a1
++a2
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -1,1 +1,1 @@
+-日本語 🐟
++日本語 🐠
+",
+        );
+        let dir = crate::test_util::unique_temp_dir("zv-review", "render");
+        let theme = crate::theme::all()[0].clone();
+        for &(w, h) in &[(900.0_f32, 700.0_f32), (1200.0, 300.0), (400.0, 700.0)] {
+            for mode in [ReviewMode::Files, ReviewMode::Focus, ReviewMode::Queue] {
+                let mut p = ReviewPanel::new(dir.clone());
+                p.data = ReviewData {
+                    toplevel: dir.clone(),
+                    files: files
+                        .iter()
+                        .map(|d| ReviewFile {
+                            path: review_path(d),
+                            status: review_file_status(d, false),
+                            staged: false,
+                            untracked: false,
+                            diff: d.clone(),
+                        })
+                        .collect(),
+                    truncated: false,
+                    error: None,
+                };
+                p.loaded = true;
+                p.items = crate::diff::queue_items(p.data.files.iter().map(|f| &f.diff));
+                p.selected = Some(0);
+                p.set_mode(mode);
+                let ctx = egui::Context::default();
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, h),
+                    )),
+                    ..Default::default()
+                };
+                let mut texts: Vec<String> = Vec::new();
+                let out = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut acts = GitActions::default();
+                        p.ui(ui, &theme, &mut acts);
+                    });
+                });
+                for s in &out.shapes {
+                    if let egui::epaint::Shape::Text(t) = &s.shape {
+                        texts.push(t.galley.text().to_string());
+                    }
+                }
+                let joined = texts.join("\n");
+                assert!(
+                    joined.contains("1 / 2") || joined.contains("残り"),
+                    "{w}x{h} {mode:?}: 位置カウンタ / 残数が出ていない\n{joined}"
+                );
+                // 集中モードは **1 ファイルだけ**。もう一方のパスは出さない。
+                if mode == ReviewMode::Focus {
+                    assert!(joined.contains("a.rs"), "集中モードで対象が出ていない");
+                    assert!(
+                        !joined.contains("b.rs"),
+                        "集中モードなのに他のファイルが出ている\n{joined}"
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 集中モード・キュー・比較・位置カウンタが **UI から到達できる**。
+    /// (作ったのに繋いでいない、を検出する構造テスト。改行は正規化する。)
+    #[test]
+    fn 集中モードとキューが画面に繋がっている() {
+        let src = include_str!("git_panel.rs").replace("\r\n", "\n");
+        for k in [
+            "fn focus_pane_ui(",
+            "fn queue_pane_ui(",
+            "fn counter_ui(",
+            "self.counter_ui(ui, theme);",
+            "self.apply_file_jump(&ctx);",
+            "crate::diff::next_unreviewed(",
+            "crate::diff::request_file_jump(",
+            "crate::diff::take_mark_viewed(",
+            "self.set_mode(m);",
+            // 却下は 2 段確認 + 取り消し
+            "self.confirm_reject = Some(it.id.clone());",
+            "if let Some(e) = self.queue.undo() {",
+            // 空状態は中央に 1 枚のカード
+            "crate::panels::empty_card(avail, 1).card",
+        ] {
+            assert!(src.contains(k), "レビュー画面に配線が無い: {k}");
+        }
+        let app = include_str!("app.rs").replace("\r\n", "\n");
+        for k in [
+            "Cmd::DiffNextFile",
+            "Cmd::DiffPrevFile",
+            "Cmd::DiffMarkViewed",
+            "Cmd::SetReviewMode",
+            "Cmd::CompareWithSaved",
+            "Cmd::SelectForCompare",
+            "Cmd::CompareWithSelected",
+            "self.compare_window(ctx);",
+            "reviewed_files: self.review.reviewed_paths(),",
+            "self.review.set_reviewed_paths(&sess.reviewed_files);",
+        ] {
+            assert!(app.contains(k), "app.rs に配線が無い: {k}");
+        }
     }
 }

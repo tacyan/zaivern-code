@@ -300,6 +300,20 @@ pub enum Cmd {
     DiffNextChange,
     /// 差分の前の変更へ (VS Code: ⇧F7)
     DiffPrevChange,
+    /// 次の「差分のあるファイル」へジャンプ (cmux: `]f`)。レビュー済みは飛ばす
+    DiffNextFile,
+    /// 前の「差分のあるファイル」へジャンプ (cmux: `[f`)
+    DiffPrevFile,
+    /// いま見ているファイルの「レビュー済み」の印を付け外しする
+    DiffMarkViewed,
+    /// レビューの中央ビューを切り替える。値は "files" | "focus" | "queue"
+    SetReviewMode(String),
+    /// アクティブなタブの本文を、ディスク上の保存済みファイルと比較する
+    CompareWithSaved,
+    /// アクティブなファイルを「比較の左側」として覚える (VS Code: Select for Compare)
+    SelectForCompare,
+    /// 覚えたファイルとアクティブなファイルを比較する (VS Code: Compare with Selected)
+    CompareWithSelected,
 
     // ── 折りたたみ (highlight.rs の構造解析 + editor::FoldState) ────
     /// カーソル行の折りたたみを切り替える
@@ -745,6 +759,13 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleDiffView
         | Cmd::DiffNextChange
         | Cmd::DiffPrevChange
+        | Cmd::DiffNextFile
+        | Cmd::DiffPrevFile
+        | Cmd::DiffMarkViewed
+        | Cmd::SetReviewMode(_)
+        | Cmd::CompareWithSaved
+        | Cmd::SelectForCompare
+        | Cmd::CompareWithSelected
         | Cmd::ToggleGitBlame => Group::Git,
 
         // ── ターミナル・実行 ───────────────────────────────────────
