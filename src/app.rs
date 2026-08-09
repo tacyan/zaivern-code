@@ -11229,7 +11229,6 @@ impl ZaivernApp {
             Cmd::OpenApprovals => self.open_approvals_panel(),
             Cmd::OpenMcp => self.open_mcp_panel(),
             Cmd::OpenSkills => self.open_skills_panel(),
-            Cmd::OpenSpec => self.open_spec_panel(),
             Cmd::OpenApprovalAudit => {
                 self.open_approvals_panel();
                 self.approvals_audit = true;
@@ -16976,7 +16975,9 @@ impl ZaivernApp {
 
     /// ボトムパネルを開いて「📐 Spec」ビューへ切り替える
     /// (コマンドパレット / タブの共通の入口)。
-    fn open_spec_panel(&mut self) {
+    /// spec パネルを開く。`pub(crate)` なのは [`crate::feature`] のレジストリ
+    /// から呼ぶため (機能側が `app.rs` を編集せずに済むようにする配線口)。
+    pub(crate) fn open_spec_panel(&mut self) {
         self.agents.panel_open = true;
         self.cockpit = false;
         self.kanban = false;
@@ -16986,6 +16987,16 @@ impl ZaivernApp {
         self.spec_view = true;
         // 開いた回だけ取り直す (アイドル時に走らせない)
         self.spec.invalidate();
+    }
+
+    /// spec パネルを「陳腐化の疑いだけ」に絞って開く。
+    ///
+    /// フィールドを `pub(crate)` にして機能側から触らせるのではなく、
+    /// **操作をメソッドとして 1 つ出す**。内部表現を外へ漏らさずに済み、
+    /// レジストリ側のクロージャも 1 行で書ける。
+    pub(crate) fn open_spec_stale(&mut self) {
+        self.open_spec_panel();
+        self.spec.focus_stale();
     }
 
     /// spec パネルが積んだ要求を実行する。**描画の外でだけ呼ぶ** (I/O があるため)。
@@ -24771,12 +24782,6 @@ impl ZaivernApp {
                 tr("Skills / コマンドを管理"),
                 String::new(),
                 Cmd::OpenSkills,
-            ),
-            (
-                "📐".into(),
-                tr("Spec — 仕様の差分と陳腐化を見る"),
-                String::new(),
-                Cmd::OpenSpec,
             ),
             (
                 "✏".into(),

@@ -420,7 +420,6 @@ pub enum Cmd {
     /// Skills / slash command 管理パネルを開く
     OpenSkills,
     /// spec 駆動開発パネル (仕様の差分と陳腐化の見張り) を開く
-    OpenSpec,
     /// キャレットを 1 つ上の行に増やす
     AddCursorAbove,
     /// キャレットを 1 つ下の行に増やす
@@ -873,7 +872,6 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenApprovalAudit
         | Cmd::OpenMcp
         | Cmd::OpenSkills
-        | Cmd::OpenSpec
         | Cmd::ShowSessions
         | Cmd::ShowQuota
         | Cmd::ToggleFailover

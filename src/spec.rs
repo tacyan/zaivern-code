@@ -2633,6 +2633,47 @@ fn delta_row(ui: &mut egui::Ui, theme: &Theme, verb: Verb, name: &str, text: &st
 // テスト
 // ---------------------------------------------------------------------------
 
+// ─────────────────────────────────────────────────────────────────────────
+// 機能レジストリへの登録
+//
+// **`app.rs` / `palette.rs` を編集せずに到達経路を作るための唯一の口。**
+// 経緯は `feature.rs` の冒頭 (並列開発で 8 本のブランチが app.rs の同じ
+// 5 箇所を奪い合った実測)。
+// ─────────────────────────────────────────────────────────────────────────
+
+/// コマンドパレットからの到達経路。
+///
+/// 打鍵は割り当てていない。パレットとボトムパネルのタブで既に 2 経路あり、
+/// CLAUDE.md の「同じ操作への到達経路が 3 つあるなら 2 つ削る」に従う。
+pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
+    module: "spec",
+    entries: &[
+        crate::feature::Entry {
+            icon: "📐",
+            label: "Spec — 仕様の差分と陳腐化を見る",
+            id: "spec.open",
+        },
+        crate::feature::Entry {
+            icon: "⚠",
+            label: "陳腐化した仕様だけを一覧する",
+            id: "spec.stale",
+        },
+    ],
+    dispatch: |app, _ctx, id| match id {
+        "spec.open" => {
+            app.open_spec_panel();
+            true
+        }
+        "spec.stale" => {
+            app.open_spec_stale();
+            true
+        }
+        _ => false,
+    },
+    // パネルはボトムパネル側で描くので、全画面オーバーレイは持たない。
+    draw: None,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3358,9 +3399,39 @@ mod tests {
             "app.rs が spec_view で囲って poll していない"
         );
         for needle in [
-            "Cmd::OpenSpec => self.open_spec_panel(),",
             "spec_action = spec::ui(ui, &theme, &mut self.spec);",
             "self.apply_spec_action(spec_action);",
+        ] {
+            assert!(src.contains(needle), "app.rs に {needle} が無い");
+        }
+    }
+
+    /// **到達経路がレジストリ経由で生きている。**
+    ///
+    /// 以前は `app.rs` に `Cmd::OpenSpec => self.open_spec_panel(),` が
+    /// 直書きされていたが、並列開発で `app.rs` を奪い合わないために
+    /// [`crate::feature`] のレジストリへ移した (経緯は `feature.rs` の冒頭)。
+    /// 「UI から到達できない実装は未完成」なので、経路が消えていないことを
+    /// ここで固定する。ソースではなく**レジストリの実体**を見るので、
+    /// 配線が変わっても壊れない。
+    #[test]
+    fn パレットからの到達経路がレジストリに登録されている() {
+        assert_eq!(FEATURE.module, "spec");
+        let ids: Vec<&str> = FEATURE.entries.iter().map(|e| e.id).collect();
+        assert!(ids.contains(&"spec.open"), "spec.open が無い: {ids:?}");
+        assert!(ids.contains(&"spec.stale"), "spec.stale が無い: {ids:?}");
+        // レジストリ本体に載っていなければパレットに出ない
+        assert!(
+            crate::feature::REGISTRY
+                .iter()
+                .any(|f| f.module == FEATURE.module),
+            "feature::REGISTRY に spec が登録されていない (統合担当が 1 行足す)"
+        );
+        // app.rs 側の受け口 (メソッド) が残っていること
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        for needle in [
+            "pub(crate) fn open_spec_panel(&mut self)",
+            "pub(crate) fn open_spec_stale(&mut self)",
         ] {
             assert!(src.contains(needle), "app.rs に {needle} が無い");
         }
