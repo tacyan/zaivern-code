@@ -282,6 +282,10 @@ pub const ALL_ACTIONS: [BindAction; 84] = [
 /// 直書きしていた。** その結果 Linux / Windows では `canonical_mods` が ⌃ を ⌘ へ
 /// 畳むせいで「このファイルをズームアウト」と「戻る」が同じ打鍵になり、
 /// 片方が永久に効かなくなっていた (CI の衝突検出が暴いた)。
+pub(crate) fn file_zoom_mods_for_test() -> Modifiers {
+    file_zoom_mods()
+}
+
 fn file_zoom_mods() -> Modifiers {
     if cfg!(target_os = "macos") {
         Modifiers::COMMAND.plus(Modifiers::ALT)
@@ -2162,9 +2166,11 @@ mod tests {
         ov.insert("bogus_action".to_string(), "cmd+s".to_string()); // 不明action → 無視
         ov.insert("find".to_string(), "not+a+key".to_string()); // 不正文字列 → デフォルト維持
         let kb = Keybinds::from_overrides(&ov);
+        // 非 mac では `canonical_mods` が ⌃ を ⌘ へ畳むので、生の値は一致しない。
+        // 同じ**物理打鍵**かどうかを見るのが目的なので、両辺を正規形にして比べる。
         assert_eq!(
-            kb.get(BindAction::Save),
-            sc(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::S)
+            canonical_shortcut(kb.get(BindAction::Save)),
+            canonical_shortcut(sc(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::S))
         );
         assert_eq!(kb.get(BindAction::Find), sc(Modifiers::COMMAND, Key::F));
         assert_eq!(kb.get(BindAction::NewFile), sc(Modifiers::COMMAND, Key::N));
@@ -2582,6 +2588,13 @@ mod tests {
     }
 
     /// 既定バインドが macOS の OS 予約と衝突していない。
+    ///
+    /// **macOS ビルドでのみ意味がある。** `default_shortcut` は OS ごとに違う値を
+    /// 返すので、Linux / Windows のビルドで macOS の予約表と突き合わせても
+    /// 「その OS では使わない打鍵」を咎めるだけになる
+    /// (例: 非 mac の全画面 = F11 は macOS では「デスクトップを表示」だが、
+    ///  macOS ではそもそも F11 を割り当てていない)。
+    #[cfg(target_os = "macos")]
     #[test]
     fn 既定バインドはシステム予約と衝突しない() {
         let mut clashes: Vec<String> = Vec::new();
@@ -3018,9 +3031,10 @@ mod tests {
         let mut o = HashMap::new();
         o.insert("font_inc".to_string(), "ctrl+shift+u".to_string());
         let kb = Keybinds::from_overrides(&o);
+        // 非 mac では ⌃ が ⌘ へ畳まれるため、生の値ではなく正規形で比べる。
         assert_eq!(
-            kb.get(BindAction::ZoomIn),
-            parse_shortcut("ctrl+shift+u").unwrap()
+            canonical_shortcut(kb.get(BindAction::ZoomIn)),
+            canonical_shortcut(parse_shortcut("ctrl+shift+u").unwrap())
         );
     }
 
@@ -3284,19 +3298,32 @@ mod tests {
         // ⌘Q = アプリケーションを終了 (実測の予約表にある)
         let quit = Binding::Single(KeyboardShortcut::new(Modifiers::COMMAND, Key::Q));
         let got = conflicts_for(&keys, BindAction::Save, quit);
-        assert!(
-            got.iter().any(|c| matches!(c, Conflict::Reserved(_))),
-            "OS 予約を検出できていない: {got:?}"
-        );
+        // `conflicts_for` が予約表を見るのは **macOS のときだけ**。
+        // 他 OS で見ると、⌃ が ⌘ へ畳まれるせいで ⌃Tab が ⌘Tab (アプリ切替) と
+        // 同じ形になり「macOS が使用中」という嘘の警告が出る。
+        if cfg!(target_os = "macos") {
+            assert!(
+                got.iter().any(|c| matches!(c, Conflict::Reserved(_))),
+                "OS 予約を検出できていない: {got:?}"
+            );
+        } else {
+            assert!(
+                !got.iter().any(|c| matches!(c, Conflict::Reserved(_))),
+                "macOS 以外で予約表を見てしまっている: {got:?}"
+            );
+        }
         assert!(macos_reservation(KeyboardShortcut::new(Modifiers::COMMAND, Key::Q)).is_some());
-        // chord の 2 打鍵目に予約が来ても拾う
+        // chord の 2 打鍵目に予約が来ても拾う (予約表を見るのは macOS だけ)
         let chord = Binding::Chord(
             KeyboardShortcut::new(Modifiers::COMMAND, Key::Y),
             KeyboardShortcut::new(Modifiers::COMMAND, Key::Q),
         );
-        assert!(conflicts_for(&keys, BindAction::Save, chord)
-            .iter()
-            .any(|c| matches!(c, Conflict::Reserved(_))));
+        let chord_got = conflicts_for(&keys, BindAction::Save, chord);
+        assert_eq!(
+            chord_got.iter().any(|c| matches!(c, Conflict::Reserved(_))),
+            cfg!(target_os = "macos"),
+            "chord の 2 打鍵目の予約判定が OS 前提と食い違う: {chord_got:?}"
+        );
         // 予約されていない打鍵では出ない
         assert!(macos_reservation(KeyboardShortcut::new(Modifiers::COMMAND, Key::Y)).is_none());
     }

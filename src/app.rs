@@ -36735,7 +36735,9 @@ mod wave2_tests {
         ] {
             let ctx = egui::Context::default();
             let mut input = egui::RawInput::default();
-            let mods = Modifiers::COMMAND.plus(Modifiers::ALT);
+            // ファイル単位ズームの修飾キーは OS で違う (非 mac は ⇧ を足して
+            // 「戻る」との衝突を避ける)。ここで直書きすると非 mac で外れる。
+            let mods = crate::keybinds::file_zoom_mods_for_test();
             input.events.push(egui::Event::Key {
                 key,
                 physical_key: None,

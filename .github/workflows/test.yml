@@ -60,12 +60,20 @@ env:
 jobs:
   # terminal:: 以外の全テスト。表示名: "fast (ubuntu-latest)" など。
   fast:
-    # 同一リポジトリからの PR はスキップする。push run が同じコミットを
-    # 既に見ているため二重実行になるだけで、得るものが無い。
-    # fork からの PR は push イベントが飛んでこないので、そこだけ実体を持つ。
+    # 同一リポジトリからの PR のうち、**push run が実際に走るブランチ**だけを
+    # スキップする (二重実行になるだけで得るものが無いため)。
+    #
+    # 以前は「同一リポジトリなら push run が見ているはず」と決め打っていたが、
+    # 上の `on.push.branches` は main と night/** しか拾わない。そのため
+    # **feature ブランチからの PR は push run も PR run も走らず、CI が
+    # 一度も回らないまま main へ入れられる状態**だった (実際に 43,000 行の
+    # 変更が無検証のまま PR になり、手動起動して初めて 3 OS のうち 2 つで
+    # 落ちることが分かった)。判定は push の対象ブランチと必ず揃えること。
     if: >-
       github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name != github.repository
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !(github.event.pull_request.head.ref == 'main' ||
+        startsWith(github.event.pull_request.head.ref, 'night/'))
     strategy:
       fail-fast: false
       matrix:
@@ -111,12 +119,20 @@ jobs:
   # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
   # 表示名: "pty (ubuntu-latest)" など。
   pty:
-    # 同一リポジトリからの PR はスキップする。push run が同じコミットを
-    # 既に見ているため二重実行になるだけで、得るものが無い。
-    # fork からの PR は push イベントが飛んでこないので、そこだけ実体を持つ。
+    # 同一リポジトリからの PR のうち、**push run が実際に走るブランチ**だけを
+    # スキップする (二重実行になるだけで得るものが無いため)。
+    #
+    # 以前は「同一リポジトリなら push run が見ているはず」と決め打っていたが、
+    # 上の `on.push.branches` は main と night/** しか拾わない。そのため
+    # **feature ブランチからの PR は push run も PR run も走らず、CI が
+    # 一度も回らないまま main へ入れられる状態**だった (実際に 43,000 行の
+    # 変更が無検証のまま PR になり、手動起動して初めて 3 OS のうち 2 つで
+    # 落ちることが分かった)。判定は push の対象ブランチと必ず揃えること。
     if: >-
       github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name != github.repository
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !(github.event.pull_request.head.ref == 'main' ||
+        startsWith(github.event.pull_request.head.ref, 'night/'))
     strategy:
       fail-fast: false
       matrix:
@@ -158,12 +174,20 @@ jobs:
   #   並行編集と全面衝突するので、**並行作業がゼロになった瞬間**にまとめて
   #   適用し、そのまま --check を入れて二度と溜まらないようにしてある。
   lint:
-    # 同一リポジトリからの PR はスキップする。push run が同じコミットを
-    # 既に見ているため二重実行になるだけで、得るものが無い。
-    # fork からの PR は push イベントが飛んでこないので、そこだけ実体を持つ。
+    # 同一リポジトリからの PR のうち、**push run が実際に走るブランチ**だけを
+    # スキップする (二重実行になるだけで得るものが無いため)。
+    #
+    # 以前は「同一リポジトリなら push run が見ているはず」と決め打っていたが、
+    # 上の `on.push.branches` は main と night/** しか拾わない。そのため
+    # **feature ブランチからの PR は push run も PR run も走らず、CI が
+    # 一度も回らないまま main へ入れられる状態**だった (実際に 43,000 行の
+    # 変更が無検証のまま PR になり、手動起動して初めて 3 OS のうち 2 つで
+    # 落ちることが分かった)。判定は push の対象ブランチと必ず揃えること。
     if: >-
       github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name != github.repository
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !(github.event.pull_request.head.ref == 'main' ||
+        startsWith(github.event.pull_request.head.ref, 'night/'))
     name: lint (clippy)
     runs-on: ubuntu-latest
     timeout-minutes: 10
