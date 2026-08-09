@@ -541,6 +541,12 @@ impl Tracker {
         self.ring.len()
     }
 
+    /// 直近コマンドの終了コード。**毎フレームの描画経路から呼ばれる**ので、
+    /// [`Command`] を写さず数値だけ返す (1 フレームに 1 アロケーションを作らない)。
+    pub fn last_exit(&self) -> Option<i32> {
+        self.ring.back()?.exit_code
+    }
+
     /// いま実行中のコマンド行 (実行中でなければ `None`)。
     pub fn running_command(&self) -> Option<&str> {
         self.cur

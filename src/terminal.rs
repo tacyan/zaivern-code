@@ -2144,9 +2144,14 @@ impl Session {
         self.writer.send(bytes);
     }
 
-    /// シェル統合の段 (`crate::shellint::Tier`)。
-    pub fn shell_tier(&self) -> crate::shellint::Tier {
-        lock_ok(&self.shell).tier()
+    /// 端末の隅に出すバッジ用: (段, 直近の終了コード)。
+    ///
+    /// 段が `None` (シェル統合が来ていない) なら `None` — 呼び出し側は
+    /// 1 ピクセルも描かない。毎フレーム通る道なので、ロック 1 回・
+    /// アロケーション 0 で済ませる (設計原則 3)。
+    pub fn shell_badge(&self) -> Option<(crate::shellint::Tier, Option<i32>)> {
+        let t = lock_ok(&self.shell);
+        (t.tier() != crate::shellint::Tier::None).then(|| (t.tier(), t.last_exit()))
     }
 
     /// メニュー見出し用のまとめ: (段, 記録件数, 段の変化ログ)。
@@ -7926,41 +7931,36 @@ pub fn draw(
     // **段が None のときは何も描かない** = 使っていない人の画面は 1 px も
     // 変わらない (「画面が突然変わらない」)。出すのは 3 語ぶんの幅だけで、
     // 色が直近コマンドの成否 (終了コードという事実) を表す。
-    {
-        let tier = session.shell_tier();
-        if tier != crate::shellint::Tier::None {
-            let recent = session.shell_recent(1);
-            let last = recent.first();
-            let color = match last.and_then(|c| c.ok()) {
-                Some(true) => theme.ok,
-                Some(false) => theme.err,
-                None => theme.text_dim,
-            };
-            let text = match last.and_then(|c| c.exit_code) {
-                Some(code) if code != 0 => trf(
-                    "{mark} shell {tier} · exit {code}",
-                    &[
-                        ("mark", tier.mark().to_string()),
-                        ("tier", tr(tier.label())),
-                        ("code", code.to_string()),
-                    ],
-                ),
-                _ => trf(
-                    "{mark} shell {tier}",
-                    &[
-                        ("mark", tier.mark().to_string()),
-                        ("tier", tr(tier.label())),
-                    ],
-                ),
-            };
-            painter.text(
-                egui::pos2(rect.min.x + 8.0, rect.max.y - 6.0),
-                egui::Align2::LEFT_BOTTOM,
-                text,
-                egui::FontId::proportional(10.0),
-                color.gamma_multiply(0.85),
-            );
-        }
+    if let Some((tier, exit)) = session.shell_badge() {
+        let color = match exit {
+            Some(0) => theme.ok,
+            Some(_) => theme.err,
+            None => theme.text_dim,
+        };
+        let text = match exit {
+            Some(code) if code != 0 => trf(
+                "{mark} shell {tier} · exit {code}",
+                &[
+                    ("mark", tier.mark().to_string()),
+                    ("tier", tr(tier.label())),
+                    ("code", code.to_string()),
+                ],
+            ),
+            _ => trf(
+                "{mark} shell {tier}",
+                &[
+                    ("mark", tier.mark().to_string()),
+                    ("tier", tr(tier.label())),
+                ],
+            ),
+        };
+        painter.text(
+            egui::pos2(rect.min.x + 8.0, rect.max.y - 6.0),
+            egui::Align2::LEFT_BOTTOM,
+            text,
+            egui::FontId::proportional(10.0),
+            color.gamma_multiply(0.85),
+        );
     }
 
     // 右クリックメニュー: コピー操作
