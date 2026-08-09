@@ -441,7 +441,7 @@ pub fn draw(
     // 再描画は「本当に絵が変わるとき」だけ要求する。
     let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
     if let Some(ms) = repaint_ms(state, focused) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+        crate::perf::repaint_after(ctx, std::time::Duration::from_millis(ms), "pet_anim");
     }
 
     PetResponse {

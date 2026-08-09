@@ -1414,7 +1414,7 @@ fn reader_loop(
                 // これをやらないと UI が「応答待ち」のまま永久に固まる。
                 shared.abandon_all();
                 // tx が drop され (LspClient 側と合わせて) writer_loop も終了する
-                ctx.request_repaint();
+                crate::perf::repaint(&ctx, "lsp");
                 break;
             }
             Ok(n) => {
@@ -1422,7 +1422,7 @@ fn reader_loop(
                 while let Some(msg) = dec.next_message() {
                     handle_message(&msg, &shared, &tx);
                 }
-                ctx.request_repaint();
+                crate::perf::repaint(&ctx, "lsp");
             }
         }
     }

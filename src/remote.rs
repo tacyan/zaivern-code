@@ -593,7 +593,7 @@ fn handle_conn(
 
     // 一方向の指示は積んだ時点で成功。UI スレッドの復帰を待たない。
     if let Some(js) = immediate {
-        ctx.request_repaint();
+        crate::perf::repaint(&ctx, "remote");
         return respond(
             &mut stream,
             200,
@@ -606,7 +606,7 @@ fn handle_conn(
     // 取りこぼす。応答が返るまで一定間隔で起こし続ける。
     let deadline = Instant::now() + REMOTE_TIMEOUT;
     let reply = loop {
-        ctx.request_repaint();
+        crate::perf::repaint(&ctx, "remote");
         match rrx.recv_timeout(Duration::from_millis(150)) {
             Ok(js) => break Some(js),
             Err(mpsc::RecvTimeoutError::Disconnected) => break None,

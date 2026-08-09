@@ -2244,8 +2244,11 @@ pub fn ui(
     let t = tally_lanes(cards, &lanes);
     st.record_sample(now_ms, t);
     // 無条件の再描画はしない。動きがあるときだけ速く回す (アイドル時は 1〜2 秒)。
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(st.next_repaint_ms()));
+    crate::perf::repaint_after(
+        ui.ctx(),
+        std::time::Duration::from_millis(st.next_repaint_ms()),
+        "kanban",
+    );
 
     egui::Frame::none()
         .inner_margin(egui::Margin::same(10.0))

@@ -1762,12 +1762,12 @@ impl Session {
                             if !reply.is_empty() {
                                 writer.send(&reply);
                             }
-                            ctx.request_repaint();
+                            crate::perf::repaint(&ctx, "pty_read");
                         }
                     }
                 }
                 exited.store(true, Ordering::SeqCst);
-                ctx.request_repaint();
+                crate::perf::repaint(&ctx, "pty_read");
             });
         }
         {
@@ -1778,7 +1778,7 @@ impl Session {
                     *lock_ok(&exit_code) = Some(status.exit_code());
                 }
                 exited.store(true, Ordering::SeqCst);
-                ctx.request_repaint();
+                crate::perf::repaint(&ctx, "pty_exit");
             });
         }
 
@@ -7547,7 +7547,7 @@ pub fn draw(
             // 安定カウント (RESIZE_STABLE_FRAMES) が完走する前に再描画が
             // 止まると、最終サイズが PTY へ届かないまま残る。完走するまで
             // フレームを回し続けて取りこぼしを防ぐ (高々 K フレーム)。
-            ui.ctx().request_repaint();
+            crate::perf::repaint(ui.ctx(), "term_focus");
         }
     }
 
@@ -7729,8 +7729,11 @@ pub fn draw(
             );
             painter.rect_filled(bg, 8.0, theme.accent);
             painter.galley(bg.min + egui::vec2(7.0, 3.0), galley, theme.term_bg);
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(150));
+            crate::perf::repaint_after(
+                ui.ctx(),
+                std::time::Duration::from_millis(150),
+                "term_osc52",
+            );
         } else {
             session.copied_at = None;
         }
