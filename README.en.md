@@ -161,6 +161,7 @@ a workspace-wide problems panel · clickable file paths and URLs in the terminal
 - **Rebuilt state detection** — structured output and hooks instead of guessing from the screen, and the source of each verdict is shown
 - **Isolated worktrees and conflict detection** — if two agents touch the same file, you hear about it now, not at review time
 - **Focused diff review** — a "2 / 5" counter and `]f` / `[f` to move between files
+- **Cost limits and alerts** — set a session or daily cap on estimated spend: warn at 80%, notify on arrival, and with `stop` new messages are blocked with the reason shown (notify-only by default; nothing is drawn at all until you set a limit)
 - ⌃1–⌃9 preset launch, automatic session naming, token usage and estimated cost
 
 **Quality:** 3,134 tests, green CI on macOS, Linux and Windows, clean `cargo fmt --check`.

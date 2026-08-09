@@ -1323,15 +1323,40 @@ pub fn scan_tokens(since: SystemTime) -> Vec<AgentTokens> {
 /// 出さない」を、UI ではなくデータの側で担保する。
 /// 戻りは消費の多い順 (どのエージェントが高いかが一目で分かるように)。
 pub fn scan_tokens_in(home: &Path, since: SystemTime) -> Vec<AgentTokens> {
-    let mut out = Vec::new();
+    scan_tokens_multi_in(home, &[since])
+        .pop()
+        .unwrap_or_default()
+}
+
+/// 起点を複数まとめて **1 パス**で集計する (戻りは `sinces` と同じ並び)。
+///
+/// 上限判定には「窓ぶん (24h)」「その日ぶん」「このセッションぶん」と別々の
+/// 起点が要る。起点ごとに [`scan_tokens_in`] を呼ぶと同じファイルを何度も
+/// 読むことになり、アイドル時の背景 I/O が起点の本数だけ増える (設計原則 3)。
+/// ファイルの絞り込みは**最も古い起点**で 1 回だけ行い、以降は読み込んだ行を
+/// 起点ごとの積み上げへ振り分けるだけにする。
+///
+/// 時刻が読めなかった行は [`scan_tokens_in`] と同じくどの起点にも数える。
+/// 予算の見張りとしては「多め」へ倒すほうが安全なため (少なく見せない)。
+pub fn scan_tokens_multi_in(home: &Path, sinces: &[SystemTime]) -> Vec<Vec<AgentTokens>> {
+    /// 起点 1 つぶんの積み上げ。
+    #[derive(Default)]
+    struct Acc {
+        by_model: HashMap<String, TokenUsage>,
+        total: TokenUsage,
+        turns: usize,
+    }
+    let mut out: Vec<Vec<AgentTokens>> = sinces.iter().map(|_| Vec::new()).collect();
+    if sinces.is_empty() {
+        return out;
+    }
+    let oldest = sinces.iter().copied().min().unwrap_or(UNIX_EPOCH);
     for d in AGENT_QUOTAS {
         let TokenSource::Transcript { locator, parser } = &d.tokens else {
             continue;
         };
-        let (files, mut truncated) = recent_files(home, locator, since, TOKEN_MAX_FILES);
-        let mut by_model: HashMap<String, TokenUsage> = HashMap::new();
-        let mut total = TokenUsage::default();
-        let mut turns = 0usize;
+        let (files, mut truncated) = recent_files(home, locator, oldest, TOKEN_MAX_FILES);
+        let mut acc: Vec<Acc> = sinces.iter().map(|_| Acc::default()).collect();
         for path in files {
             // 末尾しか読まないので、それより長いファイルは先頭を取りこぼす。
             // 「実際はこれ以上」と正直に印を立てる (少なく見せない)。
@@ -1345,35 +1370,45 @@ pub fn scan_tokens_in(home: &Path, since: SystemTime) -> Vec<AgentTokens> {
                 continue;
             };
             for t in parser(&content) {
-                // 時刻が読めた行は窓で切る。読めない行は落とさない
-                // (ファイルの mtime で既に窓に入っているため)。
-                if t.at.map(|a| a < since).unwrap_or(false) {
-                    continue;
-                }
                 let key = t.model.unwrap_or_default();
-                by_model.entry(key).or_default().add(&t.usage);
-                total.add(&t.usage);
-                turns += 1;
+                for (i, since) in sinces.iter().enumerate() {
+                    // 時刻が読めた行は窓で切る。読めない行は落とさない
+                    // (ファイルの mtime で既に一番古い窓に入っているため)。
+                    if t.at.map(|a| a < *since).unwrap_or(false) {
+                        continue;
+                    }
+                    acc[i]
+                        .by_model
+                        .entry(key.clone())
+                        .or_default()
+                        .add(&t.usage);
+                    acc[i].total.add(&t.usage);
+                    acc[i].turns += 1;
+                }
             }
         }
-        if turns == 0 {
-            continue;
+        for (i, a) in acc.into_iter().enumerate() {
+            if a.turns == 0 {
+                continue;
+            }
+            // 飽和した = これ以上は数えられていない
+            let truncated = truncated || a.total.total() == u64::MAX;
+            let mut by_model: Vec<(String, TokenUsage)> = a.by_model.into_iter().collect();
+            by_model.sort_by(|x, y| y.1.total().cmp(&x.1.total()).then(x.0.cmp(&y.0)));
+            out[i].push(AgentTokens {
+                agent: d.bin.to_string(),
+                label: d.label.to_string(),
+                account: d.account.to_string(),
+                total: a.total,
+                by_model,
+                turns: a.turns,
+                truncated,
+            });
         }
-        // 飽和した = これ以上は数えられていない
-        truncated = truncated || total.total() == u64::MAX;
-        let mut by_model: Vec<(String, TokenUsage)> = by_model.into_iter().collect();
-        by_model.sort_by(|a, b| b.1.total().cmp(&a.1.total()).then(a.0.cmp(&b.0)));
-        out.push(AgentTokens {
-            agent: d.bin.to_string(),
-            label: d.label.to_string(),
-            account: d.account.to_string(),
-            total,
-            by_model,
-            turns,
-            truncated,
-        });
     }
-    out.sort_by(|a, b| b.total.total().cmp(&a.total.total()));
+    for v in out.iter_mut() {
+        v.sort_by(|a, b| b.total.total().cmp(&a.total.total()));
+    }
     out
 }
 
@@ -1567,6 +1602,247 @@ pub fn token_badge_layout(
         };
     }
     BadgeLayout::hidden()
+}
+
+// ── コスト上限とアラート ───────────────────────────────────────────────
+//
+// 「エージェントを N 本走らせて、気付いたら $200」を止めるための見張り。
+// **金額も通貨もこの module には無い** — 上限は設定 (`config.rs`) から
+// [`CostLimits`] として渡され、ここは比較と分類しかしない。
+
+/// 1 日の長さ (秒)。日次集計の境界に使う。
+pub const DAY_SECS: u64 = 24 * 3600;
+
+/// `t` が属する「日」の通し番号 (UTC。1970-01-01 = 0)。
+///
+/// ## なぜローカル時刻ではなく UTC で切るのか
+///
+/// 1. **依存を増やさない。** `std` にはタイムゾーン DB が無い。ローカルの
+///    暦日を正しく出すには `chrono` / `time` が要るが、この製品は依存を
+///    増やさない方針 (うるう秒・夏時間・歴史的な UTC オフセット変更まで
+///    抱え込むことになる)。
+/// 2. **境界が動かない。** ローカル時刻で切ると、出張・OS のタイムゾーン
+///    更新・夏時間の切り替えで「今日」の始まりが黙って前後する。夏時間の
+///    移行日は 23 時間や 25 時間の「日」が生まれ、上限の意味が日によって
+///    変わってしまう。UTC の通し番号は**どの環境でも同じ結果**になり、
+///    テストに固定の epoch 秒を渡すだけで再現できる。
+/// 3. **ロケールに依存しない。** 週の始まり・暦 (和暦/イスラム暦) ・
+///    カレンダー設定のどれにも左右されない。
+///
+/// 表示では「今日 (UTC)」と明示すること。ユーザーの深夜 0 時とはズレる。
+pub fn utc_day_index(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / DAY_SECS
+}
+
+/// `t` が属する UTC の日の始まり。
+pub fn utc_day_start(t: SystemTime) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(utc_day_index(t) * DAY_SECS)
+}
+
+/// 上限に対する現在の状態。深刻な順に大きい (`max` で最悪を取れる)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BudgetState {
+    /// 余裕あり (上限が未設定のときもここ)。
+    Normal,
+    /// 警告割合を超えた。
+    Warn,
+    /// 上限に達した / 超えた。
+    Over,
+}
+
+/// 上限に達したときの動作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LimitAction {
+    /// 知らせるだけ。**既定** — 勝手に止めない。
+    #[default]
+    Notify,
+    /// 新規の送信を止める。
+    Stop,
+}
+
+impl LimitAction {
+    /// 設定の文字列から。未知の値は既定 (`Notify`) — 打ち間違いで
+    /// 勝手に止まるほうが害が大きい。
+    ///
+    /// 毎フレーム呼ばれる経路 (送信の門) にいるので**確保を作らない**
+    /// (`to_ascii_lowercase` は String を確保する)。
+    pub fn from_key(s: &str) -> Self {
+        if s.trim().eq_ignore_ascii_case("stop") {
+            Self::Stop
+        } else {
+            Self::Notify
+        }
+    }
+
+    /// 設定へ書き戻す文字列。
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Notify => "notify",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+/// どの上限か。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetKind {
+    /// このアプリを起動してからの消費。
+    Session,
+    /// 今日 (UTC) の消費。
+    Daily,
+}
+
+impl BudgetKind {
+    /// 画面に出す名前。
+    pub fn label(self) -> String {
+        match self {
+            Self::Session => tr("このセッション"),
+            Self::Daily => tr("今日 (UTC)"),
+        }
+    }
+}
+
+/// **判定の中心にある純粋関数**: (消費, 上限, 警告割合) → 状態。
+///
+/// 規則 (この順で判定する):
+///
+/// 1. 上限が有限の正数でなければ `Normal` (0 / 負 / NaN / ∞ = 無制限)
+/// 2. 消費が NaN なら `Normal` (数えられていないものを咎めない)
+/// 3. 消費 ≥ 上限 なら `Over` (**ちょうど上限は Over**。「上限まで使える」の
+///    「まで」を含む側に倒す — 超えてから止めるのでは遅い)
+/// 4. 消費 > 0 かつ 消費 ≥ 上限 × 警告割合 なら `Warn`
+///    (割合は 0.0..=1.0 へ丸める。消費 0 は割合 0 でも `Normal`)
+/// 5. それ以外は `Normal`
+pub fn budget_state(spent: f64, limit: f64, warn_ratio: f32) -> BudgetState {
+    if !limit.is_finite() || limit <= 0.0 {
+        return BudgetState::Normal;
+    }
+    if spent.is_nan() {
+        return BudgetState::Normal;
+    }
+    if spent >= limit {
+        return BudgetState::Over;
+    }
+    // `f32` の 0.8 は正確な 0.8 ではない (0.800000011920929…)。そのまま掛けると
+    // 上限 50 の 8 割が 40.0000005 になり、「ちょうど 40」が警告に入らない。
+    // 設定に書くのは 10 進の割合なので、6 桁で丸めて意図した値へ戻してから比べる
+    // (f32 の有効桁は約 7 桁なので、これで打ち込んだ小数がそのまま戻る)。
+    // NaN は clamp も round も NaN のままなので、比較が false = Normal になる。
+    let ratio = (f64::from(warn_ratio.clamp(0.0, 1.0)) * 1e6).round() / 1e6;
+    if spent > 0.0 && spent >= limit * ratio {
+        return BudgetState::Warn;
+    }
+    BudgetState::Normal
+}
+
+/// 上限 1 件の判定結果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BudgetStatus {
+    pub kind: BudgetKind,
+    pub state: BudgetState,
+    /// 推定消費 (通貨単位)。
+    pub spent: f64,
+    /// 上限 (通貨単位)。必ず正。
+    pub limit: f64,
+}
+
+impl BudgetStatus {
+    /// 上限に対する割合 (0.0..)。表示用。
+    pub fn fraction(&self) -> f64 {
+        if self.limit > 0.0 {
+            (self.spent / self.limit).max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// ステータスバーに出す短い文字列 (`$12.34 / $50.00`)。
+    /// 通貨記号は設定から渡す — ここに書かない。
+    pub fn short_label(&self, currency: &str) -> String {
+        format!("{currency}{:.2} / {currency}{:.2}", self.spent, self.limit)
+    }
+}
+
+/// コスト上限の設定 (金額は `config.rs` から来る)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostLimits {
+    /// セッション単位の上限。0 以下 = 無制限。
+    pub session: f64,
+    /// 1 日 (UTC) の上限。0 以下 = 無制限。
+    pub daily: f64,
+    /// 上限の何割で警告するか。
+    pub warn_ratio: f32,
+    /// 上限に達したときの動作。
+    pub action: LimitAction,
+}
+
+impl Default for CostLimits {
+    /// **上限なし** が既定。設定しない限り 1px も出さないし、何も止めない。
+    fn default() -> Self {
+        Self {
+            session: 0.0,
+            daily: 0.0,
+            warn_ratio: 0.0,
+            action: LimitAction::Notify,
+        }
+    }
+}
+
+impl CostLimits {
+    /// 上限が 1 つでも設定されているか。false なら**画面に何も出さない**。
+    pub fn any(&self) -> bool {
+        (self.session.is_finite() && self.session > 0.0)
+            || (self.daily.is_finite() && self.daily > 0.0)
+    }
+
+    /// 設定されている上限だけを判定する (未設定の上限は結果に入らない)。
+    /// 並びは深刻な順 → 同率なら日次を先に (期間の長いほうが重い)。
+    pub fn evaluate(&self, session_spent: f64, daily_spent: f64) -> Vec<BudgetStatus> {
+        let mut out = Vec::new();
+        for (kind, spent, limit) in [
+            (BudgetKind::Daily, daily_spent, self.daily),
+            (BudgetKind::Session, session_spent, self.session),
+        ] {
+            if !limit.is_finite() || limit <= 0.0 {
+                continue;
+            }
+            out.push(BudgetStatus {
+                kind,
+                state: budget_state(spent, limit, self.warn_ratio),
+                spent,
+                limit,
+            });
+        }
+        out.sort_by(|a, b| b.state.cmp(&a.state));
+        out
+    }
+
+    /// 最も深刻な 1 件 (上限が 1 つも無ければ None)。
+    pub fn worst(&self, session_spent: f64, daily_spent: f64) -> Option<BudgetStatus> {
+        self.evaluate(session_spent, daily_spent).into_iter().next()
+    }
+
+    /// 新規の送信を止めるべきか。`Stop` を選んでいて、かつ `Over` のときだけ。
+    pub fn blocks(&self, session_spent: f64, daily_spent: f64) -> Option<BudgetStatus> {
+        if self.action != LimitAction::Stop {
+            return None;
+        }
+        self.worst(session_spent, daily_spent)
+            .filter(|s| s.state == BudgetState::Over)
+    }
+}
+
+/// 通知を「入った瞬間に一度だけ」にするための鍵。
+///
+/// [`crate::notify::EdgeGate`] へ渡す。同じ状態が続く限り同じ文字列になるので
+/// 毎フレーム鳴らない。`Normal` と「上限なし」は空文字 = 鳴らす対象ではない。
+pub fn budget_edge_key(worst: Option<&BudgetStatus>) -> String {
+    match worst {
+        Some(s) if s.state != BudgetState::Normal => {
+            format!("{:?}/{:?}", s.kind, s.state)
+        }
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -2819,5 +3095,286 @@ mod token_tests {
                 "{bin} は確認できていない"
             );
         }
+    }
+
+    // ── コスト上限とアラート ──────────────────────────────────────────
+
+    /// 日付境界は **UTC の通し番号**で決める。
+    /// ローカル時刻・ロケール・夏時間に一切依存しないことを固定する。
+    #[test]
+    fn 日付境界は_utc_の通し番号で決まる() {
+        // 1970-01-01T00:00:00Z = 0 日目
+        assert_eq!(utc_day_index(UNIX_EPOCH), 0);
+        assert_eq!(utc_day_start(UNIX_EPOCH), UNIX_EPOCH);
+        // 同じ日の 23:59:59 までは同じ番号
+        let almost = UNIX_EPOCH + Duration::from_secs(DAY_SECS - 1);
+        assert_eq!(utc_day_index(almost), 0);
+        assert_eq!(utc_day_start(almost), UNIX_EPOCH);
+        // 24 時間ちょうどで繰り上がる
+        let next = UNIX_EPOCH + Duration::from_secs(DAY_SECS);
+        assert_eq!(utc_day_index(next), 1);
+        assert_eq!(utc_day_start(next), next);
+        // epoch より前でも落ちない (0 に丸める)
+        assert_eq!(utc_day_index(UNIX_EPOCH - Duration::from_secs(1)), 0);
+        // 起点は必ずその日の 0 時ちょうど (端数が残らない)
+        let odd = UNIX_EPOCH + Duration::from_secs(DAY_SECS * 20_000 + 12_345);
+        assert_eq!(
+            utc_day_start(odd),
+            UNIX_EPOCH + Duration::from_secs(DAY_SECS * 20_000)
+        );
+        // 「今」で呼んでも境界はぴったり 0 時 (端数が残らない)
+        assert_eq!(
+            utc_day_start(SystemTime::now())
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                % DAY_SECS,
+            0
+        );
+    }
+
+    /// 判定の中心。境界・0・負・NaN・∞・極端な値をまとめて固定する。
+    #[test]
+    fn 上限判定の決定表() {
+        use BudgetState::{Normal, Over, Warn};
+        // (消費, 上限, 警告割合, 期待, 説明)
+        let table: &[(f64, f64, f32, BudgetState, &str)] = &[
+            // 上限なし = 何をしても Normal
+            (0.0, 0.0, 0.8, Normal, "上限 0 は無制限"),
+            (
+                1_000_000.0,
+                0.0,
+                0.8,
+                Normal,
+                "上限 0 はいくら使っても無制限",
+            ),
+            (100.0, -5.0, 0.8, Normal, "上限が負なら無制限"),
+            (100.0, f64::NAN, 0.8, Normal, "上限が NaN なら無制限"),
+            (100.0, f64::INFINITY, 0.8, Normal, "上限が ∞ なら無制限"),
+            // 消費が数えられていない
+            (f64::NAN, 50.0, 0.8, Normal, "消費が NaN なら咎めない"),
+            // 通常域
+            (0.0, 50.0, 0.8, Normal, "消費 0"),
+            (-1.0, 50.0, 0.8, Normal, "消費が負でも Normal"),
+            (39.99, 50.0, 0.8, Normal, "警告のすぐ手前"),
+            // 警告のちょうど境界 (50 × 0.8 = 40)
+            (40.0, 50.0, 0.8, Warn, "ちょうど警告割合は Warn"),
+            (49.99, 50.0, 0.8, Warn, "上限の直前は Warn"),
+            // 上限のちょうど境界
+            (50.0, 50.0, 0.8, Over, "ちょうど上限は Over"),
+            (50.01, 50.0, 0.8, Over, "超過は Over"),
+            (1e18, 50.0, 0.8, Over, "極端に大きくても Over"),
+            (f64::INFINITY, 50.0, 0.8, Over, "消費が ∞ なら Over"),
+            // 警告割合の端
+            (0.01, 50.0, 0.0, Warn, "割合 0 は消費した瞬間に Warn"),
+            (0.0, 50.0, 0.0, Normal, "割合 0 でも消費 0 は Normal"),
+            (49.99, 50.0, 1.0, Normal, "割合 1.0 は上限まで黙る"),
+            (50.0, 50.0, 1.0, Over, "割合 1.0 でも上限は Over"),
+            // 割合が範囲外でも 0.0..=1.0 へ丸める
+            (0.01, 50.0, -3.0, Warn, "負の割合は 0 扱い"),
+            (49.99, 50.0, 9.0, Normal, "1 超えの割合は 1 扱い"),
+            // clamp は NaN をそのまま返すので、比較は必ず false = Normal
+            (25.0, 50.0, f32::NAN, Normal, "割合が NaN なら警告しない"),
+            // 極端に小さい上限
+            (0.02, 0.01, 0.8, Over, "上限が 1 セントでも効く"),
+            (0.009, 0.01, 0.8, Warn, "1 セント上限の 9 割は警告"),
+            (0.005, 0.01, 0.8, Normal, "1 セント上限の半分はまだ通常"),
+        ];
+        for (spent, limit, ratio, want, why) in table {
+            assert_eq!(
+                budget_state(*spent, *limit, *ratio),
+                *want,
+                "{why}: spent={spent} limit={limit} ratio={ratio}"
+            );
+        }
+    }
+
+    /// 深刻さは Normal < Warn < Over の順に並ぶ (`max` で最悪を取れる)。
+    #[test]
+    fn 上限の深刻さは順序を持つ() {
+        use BudgetState::{Normal, Over, Warn};
+        assert!(Normal < Warn && Warn < Over);
+        assert_eq!([Normal, Over, Warn].into_iter().max(), Some(Over));
+    }
+
+    /// 上限が未設定なら結果は空 = 画面に 1px も出さない。
+    #[test]
+    fn 上限が未設定なら判定結果は空() {
+        let l = CostLimits::default();
+        assert!(!l.any());
+        assert!(l.evaluate(999.0, 999.0).is_empty());
+        assert_eq!(l.worst(999.0, 999.0), None);
+        assert_eq!(l.blocks(999.0, 999.0), None);
+        assert_eq!(budget_edge_key(None), "");
+    }
+
+    /// 設定した上限だけが判定に載り、深刻な順に並ぶ。
+    #[test]
+    fn 設定した上限だけが深刻な順に並ぶ() {
+        let l = CostLimits {
+            session: 10.0,
+            daily: 100.0,
+            warn_ratio: 0.8,
+            action: LimitAction::Notify,
+        };
+        assert!(l.any());
+        // セッションだけ超過
+        let got = l.evaluate(12.0, 5.0);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].kind, BudgetKind::Session);
+        assert_eq!(got[0].state, BudgetState::Over);
+        assert_eq!(got[1].state, BudgetState::Normal);
+        assert_eq!(l.worst(12.0, 5.0).unwrap().kind, BudgetKind::Session);
+        // 同率なら日次が先 (期間の長いほうを重く見る)
+        let both = CostLimits {
+            session: 10.0,
+            daily: 10.0,
+            ..l
+        };
+        assert_eq!(both.worst(20.0, 20.0).unwrap().kind, BudgetKind::Daily);
+        // 片方だけ設定したら 1 件だけ
+        let only_daily = CostLimits { session: 0.0, ..l };
+        let got = only_daily.evaluate(9999.0, 1.0);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, BudgetKind::Daily);
+    }
+
+    /// `stop` を選んだときだけ、しかも `Over` のときだけ止める。
+    #[test]
+    fn 送信を止めるのは_stop_かつ超過のときだけ() {
+        let notify = CostLimits {
+            session: 10.0,
+            daily: 0.0,
+            warn_ratio: 0.8,
+            action: LimitAction::Notify,
+        };
+        // 既定は notify = 何があっても止めない
+        assert_eq!(notify.blocks(1_000.0, 0.0), None);
+        let stop = CostLimits {
+            action: LimitAction::Stop,
+            ..notify
+        };
+        assert_eq!(stop.blocks(8.0, 0.0), None, "Warn では止めない");
+        let b = stop.blocks(10.0, 0.0).expect("ちょうど上限で止まる");
+        assert_eq!(b.kind, BudgetKind::Session);
+        assert_eq!(b.state, BudgetState::Over);
+        // 未設定の上限は stop でも止めない
+        let none = CostLimits {
+            session: 0.0,
+            daily: 0.0,
+            ..stop
+        };
+        assert_eq!(none.blocks(1e9, 1e9), None);
+    }
+
+    /// 設定文字列 → 動作。**未知の値は既定 (notify)** — 打ち間違いで止めない。
+    #[test]
+    fn 上限到達時の動作は文字列から引ける() {
+        assert_eq!(LimitAction::from_key("stop"), LimitAction::Stop);
+        assert_eq!(LimitAction::from_key("  STOP "), LimitAction::Stop);
+        assert_eq!(LimitAction::from_key("notify"), LimitAction::Notify);
+        assert_eq!(LimitAction::from_key(""), LimitAction::Notify);
+        assert_eq!(LimitAction::from_key("halt"), LimitAction::Notify);
+        assert_eq!(LimitAction::default(), LimitAction::Notify);
+        // 往復する
+        for a in [LimitAction::Notify, LimitAction::Stop] {
+            assert_eq!(LimitAction::from_key(a.key()), a);
+        }
+    }
+
+    /// 同じ状態のあいだ鍵は変わらない = 毎フレーム鳴らない。
+    #[test]
+    fn 上限通知の鍵は状態が変わったときだけ動く() {
+        let l = CostLimits {
+            session: 10.0,
+            daily: 0.0,
+            warn_ratio: 0.8,
+            action: LimitAction::Notify,
+        };
+        let key = |spent: f64| budget_edge_key(l.worst(spent, 0.0).as_ref());
+        assert_eq!(key(1.0), "", "Normal は鳴らさない");
+        let warn = key(8.0);
+        assert!(!warn.is_empty());
+        assert_eq!(warn, key(9.0), "Warn のあいだは同じ鍵");
+        let over = key(10.0);
+        assert!(!over.is_empty());
+        assert_ne!(warn, over, "段が上がったら鍵が変わる");
+        assert_eq!(over, key(999.0), "Over のあいだは同じ鍵");
+        // 実際に EdgeGate が 1 度しか通さないこと
+        let mut gate = crate::notify::EdgeGate::default();
+        assert!(gate.changed(0, &warn));
+        assert!(!gate.changed(0, &warn));
+        assert!(gate.changed(0, &over));
+        assert!(!gate.changed(0, &over));
+    }
+
+    /// 表示用の値。通貨記号は引数から来る (コードに埋めない)。
+    #[test]
+    fn 上限の表示ラベルは通貨記号を引数から取る() {
+        let s = BudgetStatus {
+            kind: BudgetKind::Daily,
+            state: BudgetState::Warn,
+            spent: 12.3456,
+            limit: 50.0,
+        };
+        assert_eq!(s.short_label("$"), "$12.35 / $50.00");
+        assert_eq!(s.short_label("¥"), "¥12.35 / ¥50.00");
+        assert!((s.fraction() - 0.246_912).abs() < 1e-6);
+        // 上限 0 は fraction を 0 にする (0 除算を作らない)
+        let zero = BudgetStatus {
+            limit: 0.0,
+            ..s.clone()
+        };
+        assert_eq!(zero.fraction(), 0.0);
+        // 負の消費でも割合は 0 未満にならない
+        let neg = BudgetStatus { spent: -5.0, ..s };
+        assert_eq!(neg.fraction(), 0.0);
+        assert!(!BudgetKind::Session.label().is_empty());
+        assert!(!BudgetKind::Daily.label().is_empty());
+    }
+
+    /// 複数の起点を **1 パス**で数え分けられる (同じファイルを何度も読まない)。
+    #[test]
+    fn 複数の起点を一度の走査で数え分ける() {
+        let home = crate::test_util::unique_temp_dir("zv-quota", "multi");
+        let proj = home.join(".claude").join("projects").join("-tmp-multi");
+        std::fs::create_dir_all(&proj).unwrap();
+        let line = |ts: &str, out: u64| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","message":{{"model":"m","usage":{{"input_tokens":0,"output_tokens":{out}}}}}}}"#
+            )
+        };
+        // 時刻は固定値 (ローカル時刻・実行日に依存させない)
+        std::fs::write(
+            proj.join("s.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                line("2020-01-01T00:00:00Z", 100),
+                line("2020-01-02T00:00:00Z", 20),
+                line("2020-01-03T00:00:00Z", 3),
+            ),
+        )
+        .unwrap();
+        let at = |s: &str| parse_rfc3339(s).expect("固定の RFC3339");
+        let sinces = [
+            at("2019-12-31T00:00:00Z"), // 全部
+            at("2020-01-02T00:00:00Z"), // 後ろ 2 本 (境界はその時刻を含む)
+            at("2020-01-03T00:00:00Z"), // 最後の 1 本
+        ];
+        let got = scan_tokens_multi_in(&home, &sinces);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0][0].total.output, 123, "全部");
+        assert_eq!(got[1][0].total.output, 23, "後ろ 2 本");
+        assert_eq!(got[2][0].total.output, 3, "最後の 1 本");
+        // 1 本だけ渡した場合は従来の scan_tokens_in と一致する
+        let one = scan_tokens_multi_in(&home, &sinces[..1]);
+        assert_eq!(one[0], scan_tokens_in(&home, sinces[0]));
+        // 起点ゼロ本は空 (ファイルも読まない)
+        assert!(scan_tokens_multi_in(&home, &[]).is_empty());
+        // 誰も消費していない窓は 1 件も返さない (= 1px も出さない)
+        let future = scan_tokens_multi_in(&home, &[at("2099-01-01T00:00:00Z")]);
+        assert_eq!(future.len(), 1);
+        assert!(future[0].is_empty());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

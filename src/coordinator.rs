@@ -1605,11 +1605,25 @@ pub mod quota;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// トークン集計 1 回ぶん。同じ走査から 3 つの窓を切り出す。
+///
+/// 窓ごとに読み直すと背景 I/O が 3 倍になるので、
+/// [`quota::scan_tokens_multi_in`] が 1 パスで振り分ける (設計原則 3)。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TokenScan {
+    /// 直近 [`quota::TOKEN_WINDOW`] (表示用の「直近 24 時間」)。
+    pub window: Vec<quota::AgentTokens>,
+    /// 今日 (UTC) ぶん。日次の上限判定に使う。
+    pub today: Vec<quota::AgentTokens>,
+    /// このアプリを起動してからぶん。セッションの上限判定に使う。
+    pub session: Vec<quota::AgentTokens>,
+}
+
 /// 背景スレッド 1 回分の読み取り結果。
 ///
 /// トークン集計は使用率よりずっと重い ([`quota::TOKEN_TTL`]) ので、
 /// 読まなかった回は `None` = 前の結果を据え置く。
-type ScanResult = (Vec<quota::QuotaSnapshot>, Option<Vec<quota::AgentTokens>>);
+type ScanResult = (Vec<quota::QuotaSnapshot>, Option<TokenScan>);
 
 /// ベンダーファイルを読み直す間隔。ファイルの更新はターン単位なので
 /// 短くしすぎない (UI は毎フレーム [`QuotaWatch::refresh_if_stale`] を呼べる)。
@@ -1640,7 +1654,7 @@ pub const QUOTA_EVENT_CAP: usize = 256;
 pub struct QuotaWatch {
     pending: Option<Receiver<ScanResult>>,
     snapshots: Vec<quota::QuotaSnapshot>,
-    tokens: Vec<quota::AgentTokens>,
+    tokens: TokenScan,
     events: Vec<quota::RateLimitEvent>,
     history: quota::BurnHistory,
     running: Vec<(String, usize)>,
@@ -1648,6 +1662,10 @@ pub struct QuotaWatch {
     last_refresh: Option<Instant>,
     /// トークン集計を最後に読んだ時刻 ([`quota::TOKEN_TTL`] で間引く)。
     last_token_scan: Option<Instant>,
+    /// このアプリが起動した時刻 (セッション上限の起点)。
+    session_since: SystemTime,
+    /// 「今日ぶん」を数えた日 (UTC の通し番号)。ここが変われば日次はリセット。
+    token_day: u64,
     /// 取り込みに成功した回数 (テスト・診断用)。
     applied: u64,
 }
@@ -1663,15 +1681,42 @@ impl QuotaWatch {
         Self {
             pending: None,
             snapshots: Vec::new(),
-            tokens: Vec::new(),
+            tokens: TokenScan::default(),
             events: Vec::new(),
             history: quota::BurnHistory::new(),
             running: Vec::new(),
             policy: quota::Policy::default(),
             last_refresh: None,
             last_token_scan: None,
+            session_since: SystemTime::now(),
+            token_day: quota::utc_day_index(SystemTime::now()),
             applied: 0,
         }
+    }
+
+    /// セッション上限の起点を差し替える (時刻を注入したいテスト用)。
+    pub fn set_session_since(&mut self, at: SystemTime) {
+        self.session_since = at;
+    }
+
+    /// 日 (UTC) をまたいでいたら「今日ぶん」を捨てて読み直させる。跨いだら true。
+    ///
+    /// 集計は [`quota::TOKEN_TTL`] 間隔でしか回らないので、放っておくと
+    /// 日をまたいだ直後に**前日の額**が数分残る。日次の上限は「その日ぶん」
+    /// なので、境界を越えた時点で 0 に戻す (前日の額で送信を止め続けない)。
+    /// 「このセッションぶん」は日をまたいでも続くので触らない。
+    ///
+    /// 日の切り方 (UTC) の理由は [`quota::utc_day_index`] を参照。
+    pub fn roll_day_if_needed(&mut self, now: SystemTime) -> bool {
+        let day = quota::utc_day_index(now);
+        if self.token_day == day {
+            return false;
+        }
+        self.token_day = day;
+        self.tokens.today.clear();
+        // 次の refresh で必ず読み直す (TTL の途中でも待たせない)。
+        self.last_token_scan = None;
+        true
     }
 
     /// しきい値を差し替える (設定から)。
@@ -1760,6 +1805,9 @@ impl QuotaWatch {
         }
         // 失敗時も時刻は更新し、毎フレーム再起動しない。
         self.last_refresh = Some(Instant::now());
+        // 日 (UTC) をまたいだら「今日ぶん」を捨てる。ここで見るので
+        // 判定の遅れは最大でも QUOTA_TTL で済む (毎フレームは見ない)。
+        self.roll_day_if_needed(SystemTime::now());
         // トークン集計は何十本ものトランスクリプトを舐めるので、使用率と
         // 同じ間隔では回さない (アイドル時の背景 I/O を抑える)。
         let scan_tokens = self
@@ -1769,6 +1817,7 @@ impl QuotaWatch {
         if scan_tokens {
             self.last_token_scan = Some(Instant::now());
         }
+        let session_since = self.session_since;
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("zv-quota".into())
@@ -1776,10 +1825,25 @@ impl QuotaWatch {
                 // 使用率とトークン消費は同じ 1 本のスレッドで読む
                 // (エージェント本数ぶんスレッドを増やさない)。
                 let tokens = scan_tokens.then(|| {
-                    let since = SystemTime::now()
-                        .checked_sub(quota::TOKEN_WINDOW)
-                        .unwrap_or(UNIX_EPOCH);
-                    quota::scan_tokens(since)
+                    let now = SystemTime::now();
+                    let window = now.checked_sub(quota::TOKEN_WINDOW).unwrap_or(UNIX_EPOCH);
+                    // セッションの起点は窓より古くしない。トランスクリプトは
+                    // 窓のぶんしか読まないので、それより前へ遡っても数字は
+                    // 増えず、走査するファイルだけが際限なく増えてしまう。
+                    let session = session_since.max(window);
+                    let sinces = [window, quota::utc_day_start(now), session];
+                    let mut got = match dirs::home_dir() {
+                        Some(h) => quota::scan_tokens_multi_in(&h, &sinces),
+                        None => Vec::new(),
+                    };
+                    let mut take = |i: usize| -> Vec<quota::AgentTokens> {
+                        got.get_mut(i).map(std::mem::take).unwrap_or_default()
+                    };
+                    TokenScan {
+                        window: take(0),
+                        today: take(1),
+                        session: take(2),
+                    }
                 });
                 let _ = tx.send((quota::snapshot_all(), tokens));
             });
@@ -1856,21 +1920,31 @@ impl QuotaWatch {
     /// 直近 [`quota::TOKEN_WINDOW`] のトークン消費 (消費の多い順)。
     /// **消費ゼロのエージェントは入っていない** ので、空なら 1px も出さない。
     pub fn tokens(&self) -> &[quota::AgentTokens] {
+        &self.tokens.window
+    }
+
+    /// 3 つの窓ぶんの集計そのもの。
+    pub fn token_scan(&self) -> &TokenScan {
         &self.tokens
     }
 
     /// 読み取り結果を直接差し込む (時刻・I/O を注入したいテスト用)。
     pub fn set_tokens(&mut self, tokens: Vec<quota::AgentTokens>) {
-        self.tokens = tokens;
+        self.tokens.window = tokens;
+    }
+
+    /// 3 つの窓ぶんをまとめて差し込む (時刻・I/O を注入したいテスト用)。
+    pub fn set_token_scan(&mut self, scan: TokenScan) {
+        self.tokens = scan;
     }
 
     /// 全エージェントを合算したトークン消費。1 件も無ければ None。
     pub fn tokens_total(&self) -> Option<quota::TokenUsage> {
-        if self.tokens.is_empty() {
+        if self.tokens.window.is_empty() {
             return None;
         }
         let mut t = quota::TokenUsage::default();
-        for a in &self.tokens {
+        for a in &self.tokens.window {
             t.add(&a.total);
         }
         Some(t)
@@ -1878,11 +1952,29 @@ impl QuotaWatch {
 
     /// 全エージェントを合算した推定コスト。1 件も無ければ None。
     pub fn cost_total(&self, prices: &dyn quota::PriceLookup) -> Option<quota::CostEstimate> {
-        if self.tokens.is_empty() {
+        if self.tokens.window.is_empty() {
             return None;
         }
+        Some(Self::sum_cost(&self.tokens.window, prices))
+    }
+
+    /// 今日 (UTC) ぶんの推定コスト額。消費が無ければ 0.0。
+    pub fn cost_today(&self, prices: &dyn quota::PriceLookup) -> f64 {
+        Self::sum_cost(&self.tokens.today, prices).amount
+    }
+
+    /// このアプリを起動してからの推定コスト額。消費が無ければ 0.0。
+    pub fn cost_session(&self, prices: &dyn quota::PriceLookup) -> f64 {
+        Self::sum_cost(&self.tokens.session, prices).amount
+    }
+
+    /// エージェント別の集計を 1 つの推定コストへ畳む。
+    fn sum_cost(
+        list: &[quota::AgentTokens],
+        prices: &dyn quota::PriceLookup,
+    ) -> quota::CostEstimate {
         let mut est = quota::CostEstimate::default();
-        for a in &self.tokens {
+        for a in list {
             let e = quota::estimate_cost(a, prices);
             est.amount += e.amount;
             est.unknown_tokens = est.unknown_tokens.saturating_add(e.unknown_tokens);
@@ -1893,7 +1985,7 @@ impl QuotaWatch {
             }
         }
         est.unknown_models.sort();
-        Some(est)
+        est
     }
 }
 
@@ -2832,5 +2924,104 @@ mod tests {
             quota::AGENT_QUOTAS.len(),
             "記述子の数だけ行が出る"
         );
+    }
+
+    /// 単価表 (テスト用。1 モデルだけ持つ)。
+    struct FlatPrice(f64);
+
+    impl quota::PriceLookup for FlatPrice {
+        fn rate(&self, _model: &str) -> Option<quota::ModelRate> {
+            Some(quota::ModelRate {
+                input: self.0,
+                output: self.0,
+                cache_write: self.0,
+                cache_read: self.0,
+            })
+        }
+        fn currency(&self) -> &str {
+            "$"
+        }
+    }
+
+    fn agent_tokens(label: &str, output: u64) -> quota::AgentTokens {
+        let usage = quota::TokenUsage {
+            output,
+            ..Default::default()
+        };
+        quota::AgentTokens {
+            agent: label.into(),
+            label: label.into(),
+            account: label.into(),
+            total: usage,
+            by_model: vec![("m".into(), usage)],
+            turns: 1,
+            truncated: false,
+        }
+    }
+
+    /// 窓 / 今日 / セッションは別々に数えられ、どれも 0 なら 0 を返す。
+    #[test]
+    fn 窓と今日とセッションの推定コストを別々に取れる() {
+        let mut w = QuotaWatch::new();
+        // 1 単位 = 100 万トークンあたり 1.0 → 100 万トークンで $1.00
+        let prices = FlatPrice(1.0);
+        // 何も読めていないうちは 0 (「不明」を 0 と言い張るのではなく、
+        // 判定側が上限未設定なら見に来ない)
+        assert_eq!(w.cost_today(&prices), 0.0);
+        assert_eq!(w.cost_session(&prices), 0.0);
+        assert_eq!(w.cost_total(&prices), None);
+        w.set_token_scan(TokenScan {
+            window: vec![agent_tokens("a", 3_000_000)],
+            today: vec![agent_tokens("a", 2_000_000)],
+            session: vec![agent_tokens("a", 1_000_000)],
+        });
+        assert_eq!(w.cost_total(&prices).unwrap().amount, 3.0);
+        assert_eq!(w.cost_today(&prices), 2.0);
+        assert_eq!(w.cost_session(&prices), 1.0);
+        // 表示用の窓は従来どおり `tokens()` から取れる
+        assert_eq!(w.tokens().len(), 1);
+        assert_eq!(w.token_scan().today.len(), 1);
+    }
+
+    /// セッションの起点は注入できる (テストが実時間に依存しない)。
+    #[test]
+    fn セッションの起点は注入できる() {
+        let mut w = QuotaWatch::new();
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        w.set_session_since(t);
+        // 起点を変えただけでは何も読まない (副作用が無い)
+        assert_eq!(w.applied(), 0);
+        assert!(w.token_scan().session.is_empty());
+    }
+
+    /// 日 (UTC) をまたいだら日次だけ 0 に戻り、セッションぶんは残る。
+    #[test]
+    fn 日をまたいだら今日ぶんだけリセットされる() {
+        let mut w = QuotaWatch::new();
+        w.set_token_scan(TokenScan {
+            window: vec![agent_tokens("a", 3)],
+            today: vec![agent_tokens("a", 2)],
+            session: vec![agent_tokens("a", 1)],
+        });
+        let day0 = std::time::UNIX_EPOCH + Duration::from_secs(quota::DAY_SECS * 100);
+        // 同じ日のうちは何もしない (同じ日に何度呼んでも副作用ゼロ)
+        assert!(w.roll_day_if_needed(day0));
+        assert!(w.token_scan().today.is_empty(), "跨いだので今日ぶんは空");
+        assert_eq!(w.token_scan().session.len(), 1, "セッションぶんは残る");
+        assert_eq!(w.token_scan().window.len(), 1, "窓ぶんは残る");
+        w.set_token_scan(TokenScan {
+            today: vec![agent_tokens("a", 2)],
+            ..w.token_scan().clone()
+        });
+        for _ in 0..3 {
+            assert!(
+                !w.roll_day_if_needed(day0 + Duration::from_secs(quota::DAY_SECS - 1)),
+                "同じ日 (UTC) では跨いだことにしない"
+            );
+        }
+        assert_eq!(w.token_scan().today.len(), 1, "同じ日なら捨てない");
+        // 24 時間ちょうどで次の日
+        assert!(w.roll_day_if_needed(day0 + Duration::from_secs(quota::DAY_SECS)));
+        assert!(w.token_scan().today.is_empty());
     }
 }
