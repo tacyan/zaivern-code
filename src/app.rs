@@ -1000,6 +1000,183 @@ fn top_bar_density(bar_w: f32) -> TopBarDensity {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  起動バーのレイアウト (純関数 + テーブルテスト)
+//
+//  「どの幅でも見切れない」を証明できる形にしておく。矩形は必ず可用領域へ
+//  収まり、互いに重ならない。**0 件のときは高さを 1px も取らない**。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// チップ 1 個の左右余白 + 番号バッジの幅 (px)。
+const QUICK_CHIP_PAD: f32 = 26.0;
+/// チップ同士の間隔 (px)。
+const QUICK_CHIP_GAP: f32 = 6.0;
+/// アイコンだけへ縮退したチップの幅 (px)。
+const QUICK_CHIP_ICON_W: f32 = 46.0;
+/// 起動バーの行の高さ (px)。0 件のときは**この高さも取らない**。
+const QUICK_BAR_H: f32 = 26.0;
+
+/// 起動バー 1 行の割り付け。
+#[derive(Clone, PartialEq, Debug)]
+struct QuickBarPlan {
+    /// 描くチップの数 (先頭から。入り切らない分は落とす)。
+    shown: usize,
+    /// ラベルを落としてアイコン + 番号だけにするか。
+    icons_only: bool,
+    /// チップ 1 個あたりの幅 (px)。全チップ同じ幅にする。
+    chip_w: f32,
+    /// 行の高さ (px)。**0 件なら 0.0** — 空のセクションは高さを取らない。
+    height: f32,
+}
+
+impl QuickBarPlan {
+    /// `i` 番目のチップの左端 x (可用領域の左端からの相対)。
+    /// 矩形が重ならないことをテーブルテストで証明するためのもの
+    /// (描画は egui の `horizontal` が同じ間隔で並べる)。
+    #[cfg(test)]
+    fn chip_x(&self, i: usize) -> f32 {
+        i as f32 * (self.chip_w + QUICK_CHIP_GAP)
+    }
+
+    /// 行全体が使う幅 (px)。
+    fn used_w(&self) -> f32 {
+        match self.shown {
+            0 => 0.0,
+            n => n as f32 * self.chip_w + (n - 1) as f32 * QUICK_CHIP_GAP,
+        }
+    }
+}
+
+/// 起動バーの割り付けを決める (純関数)。
+///
+/// * `avail_w`: 使ってよい横幅 (`ui.available_width()`)。
+/// * `label_ws`: チップごとのラベル実寸 (px)。件数 = 割り当て数。
+///
+/// 決め方は 3 段: ①全部ラベル付きで入るか → ②アイコンのみへ縮退して入るか →
+/// ③それでも入らないなら**入る個数だけ**描く (見切れさせない)。
+fn quick_bar_plan(avail_w: f32, label_ws: &[f32]) -> QuickBarPlan {
+    let n = label_ws.len();
+    if n == 0 || avail_w <= 0.0 {
+        // 空のセクションは見出しごと消す = 高さを 1px も取らない。
+        return QuickBarPlan {
+            shown: 0,
+            icons_only: false,
+            chip_w: 0.0,
+            height: 0.0,
+        };
+    }
+    let widest = label_ws.iter().cloned().fold(0.0_f32, f32::max);
+    let full_w = (widest + QUICK_CHIP_PAD).max(QUICK_CHIP_ICON_W);
+    let fits = |chip_w: f32, count: usize| -> bool {
+        count > 0
+            && count as f32 * chip_w + (count.saturating_sub(1)) as f32 * QUICK_CHIP_GAP <= avail_w
+    };
+    if fits(full_w, n) {
+        return QuickBarPlan {
+            shown: n,
+            icons_only: false,
+            chip_w: full_w,
+            height: QUICK_BAR_H,
+        };
+    }
+    // アイコン + 番号だけへ縮退させる。
+    let icon_w = QUICK_CHIP_ICON_W;
+    if fits(icon_w, n) {
+        return QuickBarPlan {
+            shown: n,
+            icons_only: true,
+            chip_w: icon_w,
+            height: QUICK_BAR_H,
+        };
+    }
+    // それでも入らない: 入る個数だけ描く (はみ出させない)。
+    let mut shown = 0usize;
+    while fits(icon_w, shown + 1) && shown < n {
+        shown += 1;
+    }
+    QuickBarPlan {
+        shown,
+        icons_only: true,
+        chip_w: icon_w,
+        height: if shown == 0 { 0.0 } else { QUICK_BAR_H },
+    }
+}
+
+/// 出力が止まってから「ターンが終わった」と見なすまでの静穏時間 (ms)。
+///
+/// 短すぎるとモデルの思考の合間で切れ、長すぎると命名が遅れる。
+/// エージェントの**状態**の判定には使わない値なので、外しても害は無い
+/// (誤検知 = 題名が 1 回多く付く / 取りこぼし = 従来名のまま)。
+const AUTO_NAME_QUIET_MS: u64 = 4_000;
+
+/// 自動命名を撃つかどうかの判断材料 (すべて外から与える)。
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+struct AutoNameSignals {
+    /// 設定で有効になっているか (**既定は false**)
+    enabled: bool,
+    /// ターンが終わった瞬間か
+    turn_ended: bool,
+    /// セッションが生きているか
+    running: bool,
+    /// ユーザーが手で名前を付けた相手か
+    manual: bool,
+    /// そのセッション自身の CLI が非対話の一発実行に対応しているか
+    has_generator: bool,
+    /// 送れる材料 (ユーザー自身の指示文) があるか
+    has_brief: bool,
+    /// 同じ材料で既に命名済みか
+    already_named: bool,
+}
+
+/// このセッションへ自動命名を撃つか (純関数)。
+///
+/// **手動名は常に勝つ**・**既定はオフ**・**同じ材料で二度は撃たない**を
+/// ここ 1 か所で決める。どれか 1 つでも欠けたら撃たない。
+fn should_auto_name(s: AutoNameSignals) -> bool {
+    s.enabled
+        && s.turn_ended
+        && s.running
+        && !s.manual
+        && s.has_generator
+        && s.has_brief
+        && !s.already_named
+}
+
+/// 生成結果をタイトルへ反映する (純関数)。
+///
+/// * 手で付けた名前は**絶対に**上書きしない。
+/// * 生成に失敗した (`None`) ら**黙って従来の名前のまま**。
+fn apply_named_title(current: &str, manual: bool, generated: Option<String>) -> String {
+    match (manual, generated) {
+        (false, Some(t)) if !t.trim().is_empty() => t,
+        _ => current.to_string(),
+    }
+}
+
+/// 命名に使った指示文の指紋。同じ指示のまま次のターンが終わっても
+/// もう一度は走らせないための照合キー (内容そのものは保持しない)。
+fn auto_name_signature(brief: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    brief.hash(&mut h);
+    h.finish()
+}
+
+/// 起動バーの割り当て編集 (右クリックメニューから)。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum QuickBarEdit {
+    /// スロット `usize` を 1 つ左へ (番号が 1 つ小さくなる)
+    MoveLeft(usize),
+    /// スロット `usize` を 1 つ右へ
+    MoveRight(usize),
+    /// スロット `usize` を起動バーから外す
+    Remove(usize),
+    /// プリセット `usize` を末尾のスロットへ足す
+    Add(usize),
+    /// 既定 (プリセットの並びの先頭から) へ戻す
+    Reset,
+}
+
 /// 1 行帯コンポーザをヘッダー行へ畳み込むのに要る最小の残り幅 (px)。
 ///
 /// 内訳: 宛先チップ ~70 + 入力欄の下限 80 + 送信/▾ ~92 + 間隔。これを
@@ -2864,6 +3041,20 @@ pub struct ZaivernApp {
     /// 「どのリポジトリの worktree か / どのブランチか」はここにしか無い。
     /// 破棄時の `git worktree remove` と、セッション保存 / 復元がこれを見る。
     agent_worktrees: HashMap<u64, worktree::AgentWorktree>,
+    /// **手で名前を付けたセッション** (セッション ID)。自動命名はここに
+    /// 載っている相手を絶対に上書きしない (手動が常に勝つ)。
+    manual_titles: std::collections::HashSet<u64>,
+    /// エージェントタブのリネーム入力 (セッション ID, 入力中の文字列)。
+    /// `None` = 開いていない (窓も 1px も描かない)。
+    rename_agent: Option<(u64, String)>,
+    /// 自動命名のターン境界検出。`auto_name_sessions` が false のときは
+    /// 1 度も触らない (アイドル時のコストはゼロ)。
+    turns: crate::agents::naming::TurnWatcher,
+    /// 自動命名の実行係 (要求ごとに 1 スレッド、結果はチャネル)。
+    namer: crate::agents::naming::Namer,
+    /// セッション ID → 既に命名に使った指示文のハッシュ。
+    /// 同じ指示のまま次のターンが終わっても**もう一度は走らせない**。
+    named_for: HashMap<u64, u64>,
     /// 同じ作業ツリーに同居しているエージェント同士のファイル衝突の見張り。
     /// 同居が 0 なら git を 1 回も叩かない (アイドル時のコストはゼロ)。
     conflicts: worktree::ConflictWatch,
@@ -3701,6 +3892,11 @@ impl ZaivernApp {
             pending_prompts: Vec::new(),
             race: race::RacePanel::new(),
             agent_worktrees: HashMap::new(),
+            manual_titles: std::collections::HashSet::new(),
+            rename_agent: None,
+            turns: crate::agents::naming::TurnWatcher::default(),
+            namer: crate::agents::naming::Namer::default(),
+            named_for: HashMap::new(),
             conflicts: worktree::ConflictWatch::new(),
             conflict_detail: false,
             pending_stop_all: false,
@@ -7173,6 +7369,85 @@ impl ZaivernApp {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  起動バー (⌃1〜⌃9) — 打鍵 1 つでプリセットを起動する
+    //
+    //  **番号は固定**。スロット → プリセットの対応を決めるのは
+    //  `config::quick_launch_slots` という純粋関数だけで、その入力は
+    //  「プリセット一覧」と「ユーザーが保存した並び」しか無い。
+    //  使用頻度・未読・通知はどこからも入らない (cmux が HN で批判された
+    //  「通知順で並べ替えたら ⌘1-9 の割当が動き続ける」を構造的に禁じる)。
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// いまのスロット割り当て (添字 0 が ⌃1)。中身はプリセットの添字。
+    fn quick_slots(&self) -> Vec<usize> {
+        crate::config::quick_launch_slots(&self.cfg.agents, self.cfg.quick_launch.as_deref())
+    }
+
+    /// スロット番号 (1〜9) のプリセットを起動する。空きスロットは何もしない。
+    fn launch_quick_slot(&mut self, slot: usize, isolated: bool, ctx: &egui::Context) {
+        let Some(i) = slot
+            .checked_sub(1)
+            .and_then(|ix| self.quick_slots().get(ix).copied())
+        else {
+            // 割り当てが無い番号は**黙って無視**する (トーストで叱らない —
+            // 起動バーを見れば何番が空きかは分かる)。
+            return;
+        };
+        match isolated {
+            true => self.launch_preset_isolated(i, ctx),
+            false => self.launch_preset(i, ctx),
+        }
+    }
+
+    /// 起動バーの並びを保存する (state.toml)。**渡された順のまま**書く。
+    fn save_quick_slots(&mut self, slots: &[usize]) {
+        self.cfg.quick_launch = Some(crate::config::quick_launch_names(&self.cfg.agents, slots));
+        crate::config::save_state(&self.cfg);
+    }
+
+    /// スロットの並べ替え / 取り外し / 追加。`Cmd` を増やさずに済むよう、
+    /// 起動バーの右クリックメニューから直接呼ぶ。
+    fn edit_quick_slots(&mut self, edit: QuickBarEdit) {
+        let mut slots = self.quick_slots();
+        match edit {
+            QuickBarEdit::MoveLeft(ix) => {
+                if ix > 0 && ix < slots.len() {
+                    slots.swap(ix - 1, ix);
+                }
+            }
+            QuickBarEdit::MoveRight(ix) => {
+                if ix + 1 < slots.len() {
+                    slots.swap(ix, ix + 1);
+                }
+            }
+            QuickBarEdit::Remove(ix) => {
+                if ix < slots.len() {
+                    slots.remove(ix);
+                }
+            }
+            QuickBarEdit::Add(preset) => {
+                if !slots.contains(&preset) && slots.len() < crate::config::QUICK_LAUNCH_SLOTS {
+                    slots.push(preset);
+                }
+            }
+            QuickBarEdit::Reset => {
+                self.cfg.quick_launch = None;
+                crate::config::save_state(&self.cfg);
+                return;
+            }
+        }
+        self.save_quick_slots(&slots);
+    }
+
+    /// エージェントタブの名前を手で付け直す入口 (自動命名より常に優先される)。
+    fn begin_rename_agent(&mut self, i: usize) {
+        let Some(s) = self.agents.sessions.get(i) else {
+            return;
+        };
+        self.rename_agent = Some((s.id, s.title.clone()));
+    }
+
     fn launch_preset(&mut self, i: usize, ctx: &egui::Context) {
         let cmd = self.cfg.agents.get(i).map(|p| p.command.clone());
         let Some(cmd) = cmd else { return };
@@ -7258,6 +7533,19 @@ impl ZaivernApp {
         let mut freed: Option<worktree::AgentWorktree> = None;
         if let Some(id) = self.agents.sessions.get(i).map(|s| s.id) {
             self.failover.forget_session(id);
+            // 自動命名の状態も一緒に忘れる。セッション ID は再利用され得るので、
+            // 残すと別のセッションの「命名済み」として読まれてしまう。
+            self.turns.forget(id);
+            self.namer.forget(id);
+            self.named_for.remove(&id);
+            self.manual_titles.remove(&id);
+            if self
+                .rename_agent
+                .as_ref()
+                .is_some_and(|(rid, _)| *rid == id)
+            {
+                self.rename_agent = None;
+            }
             freed = self.agent_worktrees.remove(&id);
         }
         self.agents.remove(i);
@@ -10291,6 +10579,9 @@ impl ZaivernApp {
             | Cmd::RestartAgent
             | Cmd::KillAgent
             | Cmd::NewAgentIsolated(_)
+            | Cmd::QuickLaunch(_)
+            | Cmd::QuickLaunchIsolated(_)
+            | Cmd::RenameAgent(_)
             | Cmd::ToggleFollowAgent
             | Cmd::ResumeFollowAgent
             | Cmd::NextUnreadAgent
@@ -10997,6 +11288,9 @@ impl ZaivernApp {
             Cmd::OpenFind => self.open_find(ctx, false),
             Cmd::NewAgent(i) => self.launch_preset(i, ctx),
             Cmd::NewAgentIsolated(i) => self.launch_preset_isolated(i, ctx),
+            Cmd::QuickLaunch(slot) => self.launch_quick_slot(slot, false, ctx),
+            Cmd::QuickLaunchIsolated(slot) => self.launch_quick_slot(slot, true, ctx),
+            Cmd::RenameAgent(i) => self.begin_rename_agent(i),
             Cmd::StopAllAgents => {
                 if self.agents.running_count() == 0 {
                     self.toast(tr("稼働中のエージェントはありません"), false);
@@ -12078,6 +12372,39 @@ impl ZaivernApp {
         if consume(ctx, self.keys.binding(BindAction::SplitEditorRight)) {
             cmds.push(Cmd::SplitEditorRight);
         }
+        // ── 起動バー (⌃1〜⌃9 / 他 OS は ⌃⌥1〜⌃⌥9) ────────────────────
+        // **必ず FocusPane1..3 より先に消費する。** 他 OS では ⌃⌥1 が
+        // ⌘1 (= Ctrl+1) のパターンにも一致してしまう (egui の
+        // `matches_logically` は「余分に押された修飾キー」を許す) ので、
+        // 修飾キーの多い方を先に取らないとエディタのペイン移動に化ける。
+        // ここもループで畳まない (下のコメントと同じ理由)。
+        if consume(ctx, self.keys.binding(BindAction::QuickLaunch1)) {
+            cmds.push(Cmd::QuickLaunch(1));
+        }
+        if consume(ctx, self.keys.binding(BindAction::QuickLaunch2)) {
+            cmds.push(Cmd::QuickLaunch(2));
+        }
+        if consume(ctx, self.keys.binding(BindAction::QuickLaunch3)) {
+            cmds.push(Cmd::QuickLaunch(3));
+        }
+        if consume(ctx, self.keys.binding(BindAction::QuickLaunch4)) {
+            cmds.push(Cmd::QuickLaunch(4));
+        }
+        if consume(ctx, self.keys.binding(BindAction::QuickLaunch5)) {
+            cmds.push(Cmd::QuickLaunch(5));
+        }
+        if consume(ctx, self.keys.binding(BindAction::QuickLaunch6)) {
+            cmds.push(Cmd::QuickLaunch(6));
+        }
+        if consume(ctx, self.keys.binding(BindAction::QuickLaunch7)) {
+            cmds.push(Cmd::QuickLaunch(7));
+        }
+        if consume(ctx, self.keys.binding(BindAction::QuickLaunch8)) {
+            cmds.push(Cmd::QuickLaunch(8));
+        }
+        if consume(ctx, self.keys.binding(BindAction::QuickLaunch9)) {
+            cmds.push(Cmd::QuickLaunch(9));
+        }
         // ここはループで畳まない。畳むと `consume(ctx, self.keys.binding(BindAction::X))`
         // という一様な形が崩れ、`keybinds::tests::全アクションが消費地点に
         // 繋がっている` が「押せない」と誤検出する (実際に 3 OS で落ちた)。
@@ -12520,6 +12847,10 @@ impl ZaivernApp {
         // ガイドツアーへ「ツールバーはここ」と申告する (非表示なら申告しないだけ)
         tutorial::anchor(ctx, AnchorId::Toolbar, bar.response.rect);
 
+        // 起動バー (⌃1〜⌃9)。**割り当てが 0 件ならパネルごと作らない** —
+        // 高さも枠線も 1px も取らせない (空のセクションは見出しごと消す)。
+        self.quick_bar_ui(ctx, &theme, &mut cmds);
+
         // ブランチ切り替え: 走り終わったジョブの回収 → 新しい要求の実行。
         // (メニューを閉じていてもジョブは走り続けるので毎フレーム見る)
         if let Some((msg, ok)) = self.branch_nav.poll_job() {
@@ -12540,6 +12871,301 @@ impl ZaivernApp {
 
         for c in cmds {
             self.apply_cmd(c, ctx);
+        }
+    }
+
+    /// 起動バー (⌃1〜⌃9)。**割り当てが 0 件なら 1px も描かない**。
+    ///
+    /// 番号 → プリセットの対応は [`Self::quick_slots`] (= 純粋関数
+    /// `config::quick_launch_slots`) だけが決める。並べ替え・取り外し・追加は
+    /// 右クリックメニューから行い、その場で state.toml へ書く。
+    fn quick_bar_ui(&mut self, ctx: &egui::Context, theme: &Theme, cmds: &mut Vec<Cmd>) {
+        let slots = self.quick_slots();
+        if slots.is_empty() {
+            return; // 空のセクションは高さを取らない (パネルごと作らない)
+        }
+        let labels: Vec<String> = slots
+            .iter()
+            .filter_map(|i| self.cfg.agents.get(*i))
+            .map(|p| format!("{} {}", p.icon, p.name))
+            .collect();
+        if labels.len() != slots.len() {
+            return; // 設定が壊れている間は何も描かない
+        }
+        let mut edit: Option<QuickBarEdit> = None;
+        let mut add_req: Vec<usize> = Vec::new();
+        egui::TopBottomPanel::top("zv-quick-launch")
+            .exact_height(QUICK_BAR_H + 8.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(theme.bg)
+                    .inner_margin(egui::Margin::symmetric(10.0, 4.0)),
+            )
+            .show(ctx, |ui| {
+                let label_ws: Vec<f32> = labels
+                    .iter()
+                    .map(|l| {
+                        ui.fonts(|f| {
+                            f.layout_no_wrap(
+                                l.clone(),
+                                egui::FontId::proportional(11.5),
+                                theme.text,
+                            )
+                            .size()
+                            .x
+                        })
+                    })
+                    .collect();
+                let plan = quick_bar_plan(ui.available_width(), &label_ws);
+                // 行は必ず可用幅に収める (`quick_bar_plan` が入る個数まで削っている)。
+                ui.set_max_width(plan.used_w().min(ui.available_width()));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = QUICK_CHIP_GAP;
+                    for ix in 0..plan.shown {
+                        let slot = ix + 1;
+                        let preset = slots[ix];
+                        let hint = crate::keybinds::quick_launch_action(slot)
+                            .map(|a| self.key_hint(a))
+                            .unwrap_or_default();
+                        let icon = self
+                            .cfg
+                            .agents
+                            .get(preset)
+                            .map(|p| p.icon.clone())
+                            .unwrap_or_default();
+                        let text = match plan.icons_only {
+                            true => format!("{slot}{icon}"),
+                            false => format!("{slot} {}", labels[ix]),
+                        };
+                        let btn = ui.add_sized(
+                            [plan.chip_w, QUICK_BAR_H],
+                            egui::Button::new(RichText::new(text).size(11.5).color(theme.text))
+                                .fill(theme.panel),
+                        );
+                        if btn.clicked() {
+                            cmds.push(Cmd::QuickLaunch(slot));
+                        }
+                        btn.clone().on_hover_text(trf(
+                            "{name} を起動 ({key})",
+                            &[("name", labels[ix].clone()), ("key", hint)],
+                        ));
+                        btn.context_menu(|ui| {
+                            if ui.button(tr("🌿 専用ツリーで起動")).clicked() {
+                                cmds.push(Cmd::QuickLaunchIsolated(slot));
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ix > 0 && ui.button(tr("◀ 番号を 1 つ前へ")).clicked() {
+                                edit = Some(QuickBarEdit::MoveLeft(ix));
+                                ui.close_menu();
+                            }
+                            if ix + 1 < slots.len() && ui.button(tr("番号を 1 つ後へ ▶")).clicked()
+                            {
+                                edit = Some(QuickBarEdit::MoveRight(ix));
+                                ui.close_menu();
+                            }
+                            if ui.button(tr("✕ 起動バーから外す")).clicked() {
+                                edit = Some(QuickBarEdit::Remove(ix));
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            for (i, p) in self.cfg.agents.iter().enumerate() {
+                                if slots.contains(&i) {
+                                    continue;
+                                }
+                                if ui
+                                    .button(trf(
+                                        "＋ {name} を末尾へ",
+                                        &[("name", format!("{} {}", p.icon, p.name))],
+                                    ))
+                                    .clicked()
+                                {
+                                    add_req.push(i);
+                                    ui.close_menu();
+                                }
+                            }
+                            if ui.button(tr("↺ 並びを既定へ戻す")).clicked() {
+                                edit = Some(QuickBarEdit::Reset);
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                });
+            });
+        if let Some(e) = edit {
+            self.edit_quick_slots(e);
+        }
+        for i in add_req {
+            self.edit_quick_slots(QuickBarEdit::Add(i));
+        }
+    }
+
+    /// エージェント名のリネーム窓。**開いていないときは 1px も描かない**。
+    /// ここで付けた名前は `manual_titles` に載り、自動命名が二度と上書きしない。
+    fn rename_agent_ui(&mut self, ctx: &egui::Context) {
+        let Some((id, mut buf)) = self.rename_agent.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut commit = false;
+        let mut cancel = false;
+        // このセッション自身の CLI が命名を担えるか (別の相手へは投げない)。
+        let gen = self
+            .agents
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| crate::agents::title_generator_for_command(&s.command));
+        let auto_on = self.cfg.auto_name_sessions;
+        egui::Window::new(tr("エージェント名の変更"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                let te = ui.add(
+                    egui::TextEdit::singleline(&mut buf)
+                        .id_salt(("zv-rename-agent", id))
+                        .desired_width(ui.available_width()),
+                );
+                ui.label(
+                    RichText::new(tr("手で付けた名前は自動命名に上書きされません"))
+                        .size(10.5)
+                        .weak(),
+                );
+                // どの CLI が自動命名を担えるか。**確認方法まで出す** —
+                // 「対応」と書いてあるのに実機で確かめていない、を作らないため。
+                if let Some(g) = gen {
+                    ui.label(
+                        RichText::new(trf(
+                            "自動命名: {bin} が担当 ({state})",
+                            &[
+                                ("bin", g.bin.to_string()),
+                                (
+                                    "state",
+                                    match auto_on {
+                                        true => tr("有効"),
+                                        false => tr("設定で無効"),
+                                    },
+                                ),
+                            ],
+                        ))
+                        .size(10.5)
+                        .weak(),
+                    )
+                    .on_hover_text(trf(
+                        "非対話実行: {bin} {args}\n確認方法: {ver}",
+                        &[
+                            ("bin", g.bin.to_string()),
+                            ("args", g.args.to_string()),
+                            ("ver", g.verified.to_string()),
+                        ],
+                    ));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(tr("変更")).clicked()
+                        || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    {
+                        commit = true;
+                    }
+                    if ui.button(tr("やめる")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if commit {
+            let name = buf.trim().to_string();
+            if !name.is_empty() {
+                if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == id) {
+                    s.title = name;
+                }
+                // 手動が常に勝つ: 以後この相手へは自動命名を撃たない。
+                self.manual_titles.insert(id);
+                self.persist_session();
+            }
+            self.rename_agent = None;
+        } else if cancel || !open {
+            self.rename_agent = None;
+        } else {
+            self.rename_agent = Some((id, buf));
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  セッションの自動命名 (cmux 由来)
+    //
+    //  ターンが終わった瞬間に **そのエージェント自身の CLI** へ
+    //  「2〜5 語の題名を」と頼む。送るのは**ユーザーが自分で送った指示文の
+    //  冒頭だけ** — コードもエージェントの出力も画面の中身も送らない。
+    //  既定はオフ。失敗したら黙って従来名のまま。手動名は絶対に上書きしない。
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// 毎フレームの自動命名の面倒 (結果の反映 → ターン境界の検出 → 依頼)。
+    ///
+    /// 既定オフのときは結果の回収だけして即戻るので、追加コストは 0
+    /// (`Namer::poll` は `try_recv` を 1 回舐めるだけ)。
+    fn auto_name_tick(&mut self, ctx: &egui::Context) {
+        // ① 届いた結果を先に反映する (オフに切り替えた後も取りこぼさない)。
+        for n in self.namer.poll() {
+            // 走らせている間に手で付けられていたら手動が勝つ。
+            // 生成に失敗 (None) なら黙って従来名のまま。判断は純関数に集約。
+            let manual = self.manual_titles.contains(&n.session_id);
+            let mut changed = false;
+            if let Some(s) = self
+                .agents
+                .sessions
+                .iter_mut()
+                .find(|s| s.id == n.session_id)
+            {
+                let next = apply_named_title(&s.title, manual, n.title);
+                changed = next != s.title;
+                s.title = next;
+            }
+            if changed {
+                self.persist_session();
+            }
+        }
+        if !self.cfg.auto_name_sessions {
+            return; // 既定オフ: ここから先は 1 行も走らない
+        }
+        // ② ターン境界を見る。`output_advanced` は scan_attention が間引いて
+        //    更新している値なので、ここで追加のコストは発生しない。
+        let now_ms = (ctx.input(|i| i.time).max(0.0) * 1000.0) as u64;
+        let mut want: Vec<(u64, &'static crate::agents::TitleGen, String)> = Vec::new();
+        for s in self.agents.sessions.iter() {
+            let ended = self
+                .turns
+                .observe(s.id, s.output_advanced(), now_ms, AUTO_NAME_QUIET_MS);
+            // **そのセッション自身の CLI** しか引けない (別の相手へ投げない)。
+            let gen = crate::agents::title_generator_for_command(&s.command);
+            // 送るのはユーザー自身が打った指示文の冒頭だけ。
+            let brief = s
+                .last_prompt
+                .as_deref()
+                .map(crate::agents::naming::brief)
+                .filter(|b| !b.is_empty());
+            let sig = brief.as_deref().map(auto_name_signature);
+            let go = should_auto_name(AutoNameSignals {
+                enabled: self.cfg.auto_name_sessions,
+                turn_ended: ended,
+                running: s.running(),
+                manual: self.manual_titles.contains(&s.id),
+                has_generator: gen.is_some(),
+                has_brief: brief.is_some(),
+                already_named: sig.is_some() && self.named_for.get(&s.id) == sig.as_ref(),
+            });
+            if !go {
+                continue;
+            }
+            let (Some(gen), Some(brief), Some(sig)) = (gen, brief, sig) else {
+                continue;
+            };
+            self.named_for.insert(s.id, sig);
+            want.push((s.id, gen, brief));
+        }
+        for (id, gen, brief) in want {
+            self.namer.request(id, gen, brief, ctx.clone());
         }
     }
 
@@ -14314,6 +14940,7 @@ impl ZaivernApp {
             .auto_shrink(false)
             .show(ui, |ui| {
                 let mut set_unread: Option<usize> = None;
+                let mut rename_req: Option<usize> = None;
                 for (i, s) in self.agents.sessions.iter().enumerate() {
                     let active = i == self.agents.active;
                     let frame = egui::Frame::none()
@@ -14420,6 +15047,17 @@ impl ZaivernApp {
                             *focus = Some(i);
                             ui.close_menu();
                         }
+                        // 手で付けた名前は自動命名に**絶対に**上書きされない。
+                        if ui
+                            .button(tr("✏️ 名前を変更…"))
+                            .on_hover_text(tr(
+                                "手で付けた名前は、ターン終了時の自動命名に上書きされません",
+                            ))
+                            .clicked()
+                        {
+                            rename_req = Some(i);
+                            ui.close_menu();
+                        }
                     });
                 }
                 if let Some(i) = set_unread {
@@ -14431,6 +15069,9 @@ impl ZaivernApp {
                         // 後回し宣言 = 次に待機へ戻ったらもう一度だけ鳴らす
                         self.work_gate.forget(id);
                     }
+                }
+                if let Some(i) = rename_req {
+                    self.begin_rename_agent(i);
                 }
 
                 ui.add_space(8.0);
@@ -22783,6 +23424,15 @@ impl ZaivernApp {
                 String::new(),
                 Cmd::FocusAgent(i),
             ));
+            cmds.push((
+                "✏️".into(),
+                trf(
+                    "エージェント名の変更: {title}",
+                    &[("title", s.title.clone())],
+                ),
+                tr("手で付けた名前は、ターン終了時の自動命名に上書きされません"),
+                Cmd::RenameAgent(i),
+            ));
         }
         for (icon, label, detail, cmd) in cmds {
             if let Some(score) = pq.score(&label) {
@@ -26866,6 +27516,11 @@ impl ZaivernApp {
 
         // 「エージェントを追加」ピッカー (PATH 検出の結果取り込みも兼ねる)
         self.agent_picker_ui(ctx);
+
+        // エージェント名のリネーム窓 (開いていなければ 1px も描かない)
+        self.rename_agent_ui(ctx);
+        // セッションの自動命名 (既定オフ。結果の回収 → ターン境界 → 依頼)
+        self.auto_name_tick(ctx);
 
         // フック: 起動時 (初回フレームの後に一度だけ)
         if !self.startup_hooks_done {
@@ -31641,6 +32296,354 @@ pub fn idle_repaint_ms(s: IdleSignals) -> Option<u64> {
     } else {
         IDLE_BACKGROUND_MS
     })
+}
+
+#[cfg(test)]
+mod quick_launch_tests {
+    use super::*;
+    use crate::config::{quick_launch_names, quick_launch_slots, AgentPreset, QUICK_LAUNCH_SLOTS};
+
+    fn presets(names: &[&str]) -> Vec<AgentPreset> {
+        names
+            .iter()
+            .map(|n| AgentPreset {
+                name: (*n).to_string(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    // ── 割り当ての決まり方 ───────────────────────────────────────
+    #[test]
+    fn 既定はプリセットの並びの先頭から九件() {
+        let ps = presets(&["a", "b", "c"]);
+        assert_eq!(quick_launch_slots(&ps, None), vec![0, 1, 2]);
+        let many: Vec<String> = (0..20).map(|i| format!("p{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let ps = presets(&refs);
+        assert_eq!(quick_launch_slots(&ps, None).len(), QUICK_LAUNCH_SLOTS);
+    }
+
+    #[test]
+    fn 保存した並びがそのまま番号になる() {
+        let ps = presets(&["a", "b", "c"]);
+        let stored = ["c".to_string(), "a".to_string()];
+        assert_eq!(quick_launch_slots(&ps, Some(&stored)), vec![2, 0]);
+    }
+
+    #[test]
+    fn 空の割り当ては空のまま() {
+        // ユーザーが全部外した状態。既定へ勝手に戻さない (= 起動バーは 0 件)。
+        let ps = presets(&["a", "b"]);
+        assert!(quick_launch_slots(&ps, Some(&[])).is_empty());
+    }
+
+    #[test]
+    fn 壊れた設定でもpanicしない() {
+        let ps = presets(&["a", "b"]);
+        // 消えたプリセット名 / 重複 / 空文字 / 9 件超 — どれも落ちない
+        let stored = vec![
+            "居ない".to_string(),
+            "b".to_string(),
+            "b".to_string(),
+            String::new(),
+            "a".to_string(),
+        ];
+        assert_eq!(quick_launch_slots(&ps, Some(&stored)), vec![1, 0]);
+        // プリセットが 0 件でも落ちない
+        assert!(quick_launch_slots(&[], Some(&stored)).is_empty());
+        assert!(quick_launch_slots(&[], None).is_empty());
+        let over: Vec<String> = (0..50).map(|i| format!("p{i}")).collect();
+        let many: Vec<String> = (0..50).map(|i| format!("p{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(
+            quick_launch_slots(&presets(&refs), Some(&over)).len(),
+            QUICK_LAUNCH_SLOTS
+        );
+    }
+
+    #[test]
+    fn 割り当ての永続化は往復しても順序が保たれる() {
+        let ps = presets(&["a", "b", "c", "d"]);
+        let slots = vec![3usize, 0, 2];
+        let saved = quick_launch_names(&ps, &slots);
+        assert_eq!(saved, vec!["d", "a", "c"]);
+        // 保存 → 読み込み → もう一度保存、で 1 回も並びが動かない
+        let back = quick_launch_slots(&ps, Some(&saved));
+        assert_eq!(back, slots, "読み込みで順序が変わった");
+        assert_eq!(
+            quick_launch_names(&ps, &back),
+            saved,
+            "再保存で順序が変わった"
+        );
+    }
+
+    /// **番号は使用頻度や通知で動かない。**
+    ///
+    /// 構造検査: 番号を決める関数の入力は「プリセット一覧」と「保存済みの並び」
+    /// しか無く、本体に並べ替えも頻度・未読・通知の参照も無い。
+    /// (cmux が HN で「通知順で並べ替えたら ⌘1-9 の割当が動き続ける」と
+    /// 批判された轍を、構造として踏めないようにしておく)
+    #[test]
+    fn 番号は使用頻度や通知で変わらない() {
+        let src = include_str!("config.rs").replace("\r\n", "\n");
+        let body = src
+            .split("pub fn quick_launch_slots(")
+            .nth(1)
+            .expect("quick_launch_slots がある");
+        let body = body.split("\n}\n").next().expect("関数の終わり");
+        for banned in [
+            "sort",
+            "reverse",
+            "unread",
+            "recent",
+            "notif",
+            "count",
+            "usage",
+            "rank",
+            "score",
+            "last_used",
+            "activity",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "番号の決定に {banned} が混ざっている: 番号が動く"
+            );
+        }
+        // 引数は 2 つだけ (プリセット一覧 + 保存済みの並び)。
+        let sig = src
+            .split("pub fn quick_launch_slots(")
+            .nth(1)
+            .and_then(|b| b.split(')').next())
+            .expect("シグネチャ");
+        assert_eq!(sig.matches(':').count(), 2, "入力が増えている: {sig}");
+
+        // 同じ入力なら何度呼んでも同じ並び (呼び出し回数で動かない)。
+        let ps = presets(&["a", "b", "c"]);
+        let stored = ["c".to_string(), "b".to_string(), "a".to_string()];
+        let first = quick_launch_slots(&ps, Some(&stored));
+        for _ in 0..10 {
+            assert_eq!(quick_launch_slots(&ps, Some(&stored)), first);
+        }
+
+        // 打鍵 → スロット番号の対応も固定 (keybinds 側)。
+        for n in 1..=9usize {
+            let a = crate::keybinds::quick_launch_action(n).expect("1〜9 はある");
+            assert_eq!(crate::keybinds::quick_launch_slot(a), Some(n));
+        }
+        assert!(crate::keybinds::quick_launch_action(0).is_none());
+        assert!(crate::keybinds::quick_launch_action(10).is_none());
+    }
+
+    /// 起動バーは **FocusPane より先に**消費される。
+    /// (他 OS では ⌃⌥1 が ⌘1 のパターンにも一致するため、順序が逆だと
+    ///  エディタのペイン移動に化ける)
+    #[test]
+    fn 起動バーはペイン移動より先に消費される() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn handle_shortcuts(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("handle_shortcuts がある");
+        let quick = body
+            .find("BindAction::QuickLaunch1)")
+            .expect("起動バーを消費していない");
+        let pane = body
+            .find("BindAction::FocusPane1)")
+            .expect("ペイン移動を消費していない");
+        assert!(quick < pane, "起動バーの消費がペイン移動より後ろにある");
+    }
+
+    // ── レイアウト (どの幅でも見切れない / 空なら高さゼロ) ────────
+    fn label_ws(n: usize, w: f32) -> Vec<f32> {
+        vec![w; n]
+    }
+
+    #[test]
+    fn 割り当てが無いときは一ピクセルも取らない() {
+        let plan = quick_bar_plan(1200.0, &[]);
+        assert_eq!(plan.shown, 0);
+        assert_eq!(plan.height, 0.0, "空なのに高さを取っている");
+        assert_eq!(plan.used_w(), 0.0);
+        // 幅が 0 でも落ちない
+        let plan = quick_bar_plan(0.0, &label_ws(3, 80.0));
+        assert_eq!(plan.height, 0.0);
+        assert_eq!(plan.shown, 0);
+    }
+
+    /// 極端なサイズで **全ての矩形が可用領域に収まり、重ならない**。
+    #[test]
+    fn どの幅でもチップは収まり重ならない() {
+        // (可用幅, 件数, ラベル実寸)
+        let cases = [
+            (1200.0_f32, 9usize, 110.0_f32), // 1200x300 相当の広い画面
+            (1200.0, 3, 40.0),
+            (900.0, 9, 110.0), // 900x700
+            (900.0, 6, 60.0),
+            (400.0, 9, 110.0), // 400x700 (最狭)
+            (400.0, 2, 200.0),
+            (120.0, 9, 90.0), // サイドバーを開き切った極端な幅
+            (40.0, 5, 90.0),  // 1 個も入らない
+        ];
+        for (avail, n, w) in cases {
+            let plan = quick_bar_plan(avail, &label_ws(n, w));
+            assert!(plan.shown <= n, "{avail}x{n}: 件数より多く描いている");
+            assert!(
+                plan.used_w() <= avail + 0.01,
+                "{avail}x{n}: 行が可用幅を超える ({} > {avail})",
+                plan.used_w()
+            );
+            if plan.shown == 0 {
+                assert_eq!(plan.height, 0.0, "{avail}x{n}: 0 件なのに高さを取っている");
+                continue;
+            }
+            assert!(plan.height > 0.0);
+            assert!(plan.chip_w > 0.0);
+            // 全ての矩形が可用領域に収まり、互いに重ならない
+            for i in 0..plan.shown {
+                let (x0, x1) = (plan.chip_x(i), plan.chip_x(i) + plan.chip_w);
+                assert!(x0 >= 0.0, "{avail}x{n}: 左へはみ出した");
+                assert!(x1 <= avail + 0.01, "{avail}x{n}: 右へはみ出した ({x1})");
+                if i + 1 < plan.shown {
+                    assert!(
+                        x1 <= plan.chip_x(i + 1) + 0.01,
+                        "{avail}x{n}: チップ {i} と {} が重なる",
+                        i + 1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 狭いときだけアイコンへ縮退する() {
+        let wide = quick_bar_plan(1200.0, &label_ws(4, 90.0));
+        assert!(!wide.icons_only, "広いのに縮退している");
+        let narrow = quick_bar_plan(260.0, &label_ws(4, 90.0));
+        assert!(narrow.icons_only, "狭いのに縮退していない");
+        assert_eq!(narrow.shown, 4, "縮退すれば全部入るはず");
+    }
+
+    // ── 自動命名の判断 (純関数) ─────────────────────────────────
+    fn ready() -> AutoNameSignals {
+        AutoNameSignals {
+            enabled: true,
+            turn_ended: true,
+            running: true,
+            manual: false,
+            has_generator: true,
+            has_brief: true,
+            already_named: false,
+        }
+    }
+
+    #[test]
+    fn 自動命名の既定はオフ() {
+        // Config の既定 (config.rs 側) と、判断関数の既定の両方を固定する。
+        assert!(
+            !crate::config::Config::default().auto_name_sessions,
+            "既定でオンになっている"
+        );
+        assert!(!should_auto_name(AutoNameSignals::default()));
+        assert!(!should_auto_name(AutoNameSignals {
+            enabled: false,
+            ..ready()
+        }));
+    }
+
+    #[test]
+    fn 自動命名はターン終了時にだけ走る() {
+        assert!(should_auto_name(ready()));
+        assert!(!should_auto_name(AutoNameSignals {
+            turn_ended: false,
+            ..ready()
+        }));
+        // 同じ材料で二度は走らせない
+        assert!(!should_auto_name(AutoNameSignals {
+            already_named: true,
+            ..ready()
+        }));
+        // 終了済み / 対応 CLI でない / 材料が無い、も走らせない
+        for s in [
+            AutoNameSignals {
+                running: false,
+                ..ready()
+            },
+            AutoNameSignals {
+                has_generator: false,
+                ..ready()
+            },
+            AutoNameSignals {
+                has_brief: false,
+                ..ready()
+            },
+        ] {
+            assert!(!should_auto_name(s), "{s:?} で走ってしまう");
+        }
+    }
+
+    #[test]
+    fn 手動名が常に勝つ() {
+        // 依頼の段でも撃たない
+        assert!(!should_auto_name(AutoNameSignals {
+            manual: true,
+            ..ready()
+        }));
+        // 走らせている間に手で付けられた場合も、結果を捨てて手動名を残す
+        assert_eq!(
+            apply_named_title("わたしの名前", true, Some("Auto Title".into())),
+            "わたしの名前"
+        );
+    }
+
+    #[test]
+    fn 生成に失敗したら従来の名前のまま() {
+        assert_eq!(
+            apply_named_title("Claude Code #2", false, None),
+            "Claude Code #2"
+        );
+        // 空 / 空白だけの結果も従来名のまま (検疫をすり抜けた場合の二重の栓)
+        assert_eq!(
+            apply_named_title("Claude Code #2", false, Some(String::new())),
+            "Claude Code #2"
+        );
+        assert_eq!(
+            apply_named_title("Claude Code #2", false, Some("   ".into())),
+            "Claude Code #2"
+        );
+        // まともな題名は反映される
+        assert_eq!(
+            apply_named_title("Claude Code #2", false, Some("ログイン修正".into())),
+            "ログイン修正"
+        );
+    }
+
+    /// 自動命名は **そのセッション自身の CLI** しか呼ばない。
+    /// (別のエージェントへ投げない、を構造で固定する)
+    #[test]
+    fn 命名は自分自身のcliへしか投げない() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn auto_name_tick(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("auto_name_tick がある");
+        let body = body.split("\n    }\n").next().expect("関数の終わり");
+        assert!(
+            body.contains("title_generator_for_command(&s.command)"),
+            "命名器をそのセッションのコマンドから引いていない"
+        );
+        for banned in [
+            "super_agent",
+            "diagnostician",
+            "supervisor",
+            "AGENT_CATALOG",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "別の相手へ投げる経路がある: {banned}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

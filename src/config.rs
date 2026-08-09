@@ -188,6 +188,13 @@ pub struct Config {
     /// true にすると前回スクロールバックを再生し、対応 CLI (claude / codex) は
     /// 再開指定付きで起動する。
     pub restore_agents: bool,
+    /// ターンが終わった時点で、**そのエージェント自身の CLI** に 2〜5 語の
+    /// 題名を作らせてタブ名にするか (cmux 由来)。
+    ///
+    /// **既定は false。** 有効にしても、手で付けた名前は上書きしない /
+    /// 生成に失敗したら黙って従来名のまま / アイドル時は 1 プロセスも起こさない。
+    /// 対応 CLI は [`crate::agents::TITLE_GENERATORS`] (実機で確認できたものだけ)。
+    pub auto_name_sessions: bool,
     pub show_pet: bool,
     /// state.toml へ書き戻すグローバル値の控え (プロジェクト overlay 適用前)。
     /// save_state はこちらを書くので、.zaivern.toml のプロジェクト値が
@@ -303,6 +310,72 @@ pub struct Config {
     /// この控えをそのまま書き戻すので、テーマ変更などで消えることはない。
     #[serde(skip)]
     pub palette_recent: Vec<PaletteRecent>,
+
+    /// ⌃1〜⌃9 の起動バーに並べるプリセット名 (**ユーザーが決めた順**)。
+    ///
+    /// * `None` = まだ何も決めていない → [`quick_launch_slots`] が
+    ///   `agents` の**先頭から**既定の並びを作る (プリセットの並び自体が固定順)。
+    /// * `Some(空)` = ユーザーが全部外した → 起動バーは 1px も描かない。
+    ///
+    /// **使用頻度・通知・未読で並べ替えない。** cmux が「通知順でタイルを
+    /// 並べ替えたら ⌘1-9 の割当が動き続ける」と批判された轍を踏まないため、
+    /// 番号 → プリセットの対応は `quick_launch_slots` という純粋関数だけが決め、
+    /// その入力は「プリセット一覧」と「この保存済みの並び」しか無い。
+    ///
+    /// UI の操作から溜まる値なので手書きの config.toml には書かない
+    /// (state.toml 側に `quick_launch = [...]` として置く)。
+    #[serde(skip)]
+    pub quick_launch: Option<Vec<String>>,
+}
+
+/// ⌃1〜⌃9 に割り当たるプリセットの添字を**スロット順**で返す。
+///
+/// * 入力は「プリセット一覧」と「保存済みの並び」だけ — 使用頻度も未読も
+///   通知も受け取らないので、**番号が勝手に動く余地が構造的に無い**。
+/// * 保存済みの名前が今のプリセットに無ければ黙って飛ばす
+///   (壊れた設定でも panic しない)。
+/// * 同じ名前が 2 度並んでいたら 1 度だけ採る。
+/// * 返す件数は最大 [`QUICK_LAUNCH_SLOTS`] 件。添字 0 が ⌃1。
+pub fn quick_launch_slots(agents: &[AgentPreset], stored: Option<&[String]>) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    match stored {
+        // 既定: プリセットの並びの先頭から。プリセットの並び自体が固定なので、
+        // ここでも並べ替えは起こらない。
+        None => {
+            for (i, _) in agents.iter().enumerate() {
+                if out.len() >= QUICK_LAUNCH_SLOTS {
+                    break;
+                }
+                out.push(i);
+            }
+        }
+        Some(names) => {
+            for name in names {
+                if out.len() >= QUICK_LAUNCH_SLOTS {
+                    break;
+                }
+                let Some(i) = agents.iter().position(|p| p.name == *name) else {
+                    continue; // 消えたプリセットは黙って飛ばす
+                };
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 起動バーの枠数。⌃1〜⌃9 の 9 個で固定。
+pub const QUICK_LAUNCH_SLOTS: usize = 9;
+
+/// 現在のスロット割り当てを**保存する形** (プリセット名の並び) にする。
+/// 保存 → 読み込みで順序が変わらないことは往復テストで固定してある。
+pub fn quick_launch_names(agents: &[AgentPreset], slots: &[usize]) -> Vec<String> {
+    slots
+        .iter()
+        .filter_map(|i| agents.get(*i).map(|p| p.name.clone()))
+        .collect()
 }
 
 /// パレット MRU の永続化 1 件ぶん。**アクションは保存しない** —
@@ -522,6 +595,7 @@ impl Default for Config {
             preview_tabs: true,
             approval_mode: "ask".into(),
             restore_agents: false,
+            auto_name_sessions: false,
             show_pet: true,
             global_theme: "zaivern-dark".into(),
             global_approval_mode: "ask".into(),
@@ -562,6 +636,7 @@ impl Default for Config {
             failover: crate::failover::FailoverConfig::default(),
             race_eval: RaceEvalConfig::default(),
             palette_recent: Vec::new(),
+            quick_launch: None,
         }
     }
 }
@@ -805,6 +880,10 @@ struct UiState {
     /// 切り替えるものなので、手書きの config.toml ではなく state 側に置く。
     /// 上限やクールダウンの数値は `[failover]` (config.toml) のまま。
     failover_enabled: Option<bool>,
+    /// ⌃1〜⌃9 の起動バーの割り当て (プリセット名の並び)。
+    /// **単純値の配列**なのでテーブル配列 (`palette_recent`) より前に置くこと。
+    /// 並びはユーザーが決めたものをそのまま書き、**読み書きで一切並べ替えない**。
+    quick_launch: Option<Vec<String>>,
     /// コマンドパレットの MRU。**配列のテーブルなので必ず最後の項目に置く**
     /// (TOML は値をテーブルより先に書く必要があり、途中に置くと
     /// `toml::to_string_pretty` が state.toml 全体を書けなくなる)。
@@ -976,6 +1055,14 @@ approval_mode = "ask"
 # true にすると前回のスクロールバックが見える状態で、claude は --continue /
 # codex は resume --last 付きで起動します。
 # restore_agents = false
+
+# ターンが終わった時点で、そのエージェント自身の CLI に 2〜5 語の題名を作らせ、
+# タブ名にする（並列で走らせたときにサイドバーで見分けるため）
+# 既定は false — 有効にしたときだけ、ターンが終わった瞬間に 1 回だけ走ります。
+# 手で付けた名前は上書きしません。生成に失敗したら黙って従来の名前のままです。
+# 送るのは「あなたがそのエージェントへ送った指示文の冒頭」だけで、
+# コードもエージェントの出力も送りません（実行は一時ディレクトリで行います）。
+# auto_name_sessions = false
 
 # デスクトップペット (🐾) の表示
 show_pet = true
@@ -1415,6 +1502,11 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.failover_enabled {
                     cfg.failover.enabled = v;
                 }
+                // 起動バーの割り当ては「空の配列」も意味を持つ
+                // (= ユーザーが全部外した → 1px も描かない)。Option のまま渡す。
+                if let Some(v) = st.quick_launch {
+                    cfg.quick_launch = Some(v);
+                }
             }
         }
     }
@@ -1843,6 +1935,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         super_agent_enabled: Some(cfg.super_agent.enabled),
         super_agent_timeout_secs: Some(cfg.super_agent.timeout_secs),
         failover_enabled: Some(cfg.failover.enabled),
+        quick_launch: cfg.quick_launch.clone(),
         palette_recent: Some(cfg.palette_recent.clone()),
     };
     if let Ok(s) = toml::to_string_pretty(&st) {
@@ -2200,6 +2293,12 @@ pub fn setting_defs() -> &'static [SettingDef] {
             kind: Bool,
         },
         SettingDef {
+            key: "auto_name_sessions",
+            group: G_AGENT,
+            label: "ターン終了時にセッション名を自動生成する",
+            kind: Bool,
+        },
+        SettingDef {
             key: "approval_mode",
             group: G_AGENT,
             label: "既定の権限モード",
@@ -2280,6 +2379,7 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
         "hot_exit_max_kb" => I(cfg.hot_exit_max_kb as i64),
         "hot_exit_interval_ms" => I(cfg.hot_exit_interval_ms as i64),
         "restore_agents" => B(cfg.restore_agents),
+        "auto_name_sessions" => B(cfg.auto_name_sessions),
         "approval_mode" => T(cfg.approval_mode.clone()),
         "voice_engine" => T(cfg.voice_engine.clone()),
         "voice_target" => T(cfg.voice_target.clone()),
@@ -2428,6 +2528,7 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
         "hot_exit_max_kb" => i!(cfg.hot_exit_max_kb, usize),
         "hot_exit_interval_ms" => i!(cfg.hot_exit_interval_ms, u64),
         "restore_agents" => b!(cfg.restore_agents),
+        "auto_name_sessions" => b!(cfg.auto_name_sessions),
         "approval_mode" => {
             let ok = t!(cfg.approval_mode);
             if ok {
@@ -3819,6 +3920,7 @@ command = "agy"
             super_agent_enabled: Some(true),
             super_agent_timeout_secs: Some(45),
             failover_enabled: Some(true),
+            quick_launch: Some(vec!["Codex".into(), "Claude Code".into()]),
             palette_recent: Some(vec![PaletteRecent {
                 label: "保存".into(),
                 icon: "💾".into(),
@@ -3862,6 +3964,11 @@ command = "agy"
         assert_eq!(back.super_agent_timeout_secs, Some(45));
         // 自動フェイルオーバーの有効/無効も state に残る
         assert_eq!(back.failover_enabled, Some(true));
+        // 起動バーの割り当ては**保存した順のまま**戻る (並べ替えない)
+        assert_eq!(
+            back.quick_launch,
+            Some(vec!["Codex".to_string(), "Claude Code".to_string()]),
+        );
         // パレットの MRU も state に残る (アクションは保存しない)
         assert_eq!(
             back.palette_recent,
@@ -4685,6 +4792,111 @@ mod state_overlay_tests {
             }
             let _ = std::fs::remove_dir_all(&home);
         }
+    }
+
+    // ── 起動バー (⌃1〜⌃9) の割り当て ────────────────────────────
+    #[test]
+    fn 起動バーの割り当ては保存と読み込みで順序が保たれる() {
+        let home = crate::test_util::unique_temp_dir("zaivern-config-test", "quick-launch");
+        let mut cfg = Config::default();
+        // 既定は「まだ決めていない」= プリセットの並びの先頭から
+        assert!(cfg.quick_launch.is_none(), "既定は None (プリセットの並び)");
+        let names: Vec<String> = cfg
+            .agents
+            .iter()
+            .rev()
+            .take(4)
+            .map(|p| p.name.clone())
+            .collect();
+        let slots_before = quick_launch_slots(&cfg.agents, Some(&names));
+        cfg.quick_launch = Some(names.clone());
+        save_state_to_dir(&home, &cfg);
+
+        let loaded = load_from_dir(&home, &[], true);
+        assert_eq!(
+            loaded.quick_launch.as_deref(),
+            Some(names.as_slice()),
+            "保存した並びがそのまま戻らない"
+        );
+        assert_eq!(
+            quick_launch_slots(&loaded.agents, loaded.quick_launch.as_deref()),
+            slots_before,
+            "読み直しで番号が動いた"
+        );
+
+        // もう一度読み書きしても 1 つも動かない (再起動の繰り返しに耐える)
+        save_state_to_dir(&home, &loaded);
+        let again = load_from_dir(&home, &[], true);
+        assert_eq!(
+            again.quick_launch, loaded.quick_launch,
+            "2 周目で並びが変わった"
+        );
+
+        // 「全部外した」も意味を持つ状態として往復する (既定へ勝手に戻さない)
+        let mut empty = again;
+        empty.quick_launch = Some(Vec::new());
+        save_state_to_dir(&home, &empty);
+        let back = load_from_dir(&home, &[], true);
+        assert_eq!(
+            back.quick_launch,
+            Some(Vec::new()),
+            "空の割り当てが復元されない"
+        );
+        assert!(
+            quick_launch_slots(&back.agents, back.quick_launch.as_deref()).is_empty(),
+            "空なのに起動バーが出てしまう"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn 壊れた起動バー設定でもパニックしない() {
+        for (tag, body) in [
+            ("broken-toml", "quick_launch = [[[\n"),
+            ("wrong-type", "quick_launch = 42\n"),
+            ("wrong-elem", "quick_launch = [1, 2, 3]\n"),
+            (
+                "unknown-names",
+                "quick_launch = [\"居ないプリセット\", \"\"]\n",
+            ),
+            ("empty", ""),
+        ] {
+            let home = crate::test_util::unique_temp_dir("zaivern-config-test", tag);
+            std::fs::write(home.join("state.toml"), body).expect("write state.toml");
+            let cfg = load_from_dir(&home, &[], true);
+            // 壊れていても落ちず、番号の解決も落ちない
+            let slots = quick_launch_slots(&cfg.agents, cfg.quick_launch.as_deref());
+            assert!(slots.len() <= QUICK_LAUNCH_SLOTS, "tag={tag}");
+            if tag == "unknown-names" {
+                assert!(slots.is_empty(), "tag={tag}: 居ない名前が番号を取っている");
+            }
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    #[test]
+    fn セッション自動命名の既定はオフ() {
+        assert!(
+            !Config::default().auto_name_sessions,
+            "既定でオンにすると、起動しただけで外部プロセスが走る"
+        );
+        let t: Config = toml::from_str(DEFAULT_CONFIG).expect("同梱テンプレはパースできる");
+        assert!(
+            !t.auto_name_sessions,
+            "同梱テンプレの既定がオンになっている"
+        );
+        // 設定 GUI から切り替えられる (到達経路がある)
+        assert!(
+            setting_defs().iter().any(|d| d.key == "auto_name_sessions"),
+            "設定 GUI に項目が無い"
+        );
+        let mut cfg = Config::default();
+        assert!(set_setting_value(
+            &mut cfg,
+            "auto_name_sessions",
+            &SettingValue::Bool(true)
+        ));
+        assert!(cfg.auto_name_sessions);
     }
 
     #[test]

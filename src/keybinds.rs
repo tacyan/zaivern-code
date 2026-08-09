@@ -163,10 +163,29 @@ pub enum BindAction {
     DeferUnread,
     /// いまの相手の未読フラグを反転する。
     ToggleUnread,
+    // ── 起動バー: ⌃1〜⌃9 でプリセットを直接起動 (superset 由来) ──────
+    //
+    // **番号は固定順**。どのプリセットが何番かは `config::quick_launch_slots`
+    // だけが決め、使用頻度でも通知でも動かない (cmux が「通知順で並べ替えたら
+    // ⌘1-9 の割当が動き続ける」と批判された轍を踏まないため)。
+    //
+    // 打鍵は macOS が ⌃1〜⌃9 (`MACOS_RESERVED` に ⌃ + 数字は 1 つも無い)。
+    // **Windows/Linux では ⌃⌥1〜⌃⌥9** — 他 OS の `Modifiers::CTRL` は
+    // `COMMAND` と同じ打鍵に畳まれるため、素の Ctrl+1〜3 のままだと
+    // `FocusPane1..3` (⌘1〜⌘3) と食い合う (`NavBack` と同じ理由・同じ逃げ方)。
+    QuickLaunch1,
+    QuickLaunch2,
+    QuickLaunch3,
+    QuickLaunch4,
+    QuickLaunch5,
+    QuickLaunch6,
+    QuickLaunch7,
+    QuickLaunch8,
+    QuickLaunch9,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 75] = [
+pub const ALL_ACTIONS: [BindAction; 84] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -242,6 +261,15 @@ pub const ALL_ACTIONS: [BindAction; 75] = [
     BindAction::NextUnread,
     BindAction::DeferUnread,
     BindAction::ToggleUnread,
+    BindAction::QuickLaunch1,
+    BindAction::QuickLaunch2,
+    BindAction::QuickLaunch3,
+    BindAction::QuickLaunch4,
+    BindAction::QuickLaunch5,
+    BindAction::QuickLaunch6,
+    BindAction::QuickLaunch7,
+    BindAction::QuickLaunch8,
+    BindAction::QuickLaunch9,
 ];
 
 /// ファイル単位ズームの修飾キー。macOS は ⌥⌘、他は Ctrl+Alt+Shift。
@@ -431,7 +459,71 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::NextUnread => KeyboardShortcut::new(cmd_shift, Key::U),
         BindAction::DeferUnread => KeyboardShortcut::new(cmd_shift, Key::J),
         BindAction::ToggleUnread => KeyboardShortcut::new(cmd_shift, Key::I),
+        // ── 起動バー (⌃1〜⌃9 / 他 OS は ⌃⌥1〜⌃⌥9) ──────────────────
+        // macOS の実測予約表 (`MACOS_RESERVED`) に ⌃ + 数字は 1 つも無い
+        // (取られているのは ⌃Space / ⌃⌥Space / ⌃⇧Space / ⌃矢印)。
+        // 他 OS で ⌥ を足す理由は `NavBack` と同じ — `Modifiers::CTRL` が
+        // `COMMAND` に畳まれ、⌘1〜⌘3 (`FocusPane1..3`) と同じ打鍵になるため。
+        BindAction::QuickLaunch1 => KeyboardShortcut::new(quick_launch_mods(), Key::Num1),
+        BindAction::QuickLaunch2 => KeyboardShortcut::new(quick_launch_mods(), Key::Num2),
+        BindAction::QuickLaunch3 => KeyboardShortcut::new(quick_launch_mods(), Key::Num3),
+        BindAction::QuickLaunch4 => KeyboardShortcut::new(quick_launch_mods(), Key::Num4),
+        BindAction::QuickLaunch5 => KeyboardShortcut::new(quick_launch_mods(), Key::Num5),
+        BindAction::QuickLaunch6 => KeyboardShortcut::new(quick_launch_mods(), Key::Num6),
+        BindAction::QuickLaunch7 => KeyboardShortcut::new(quick_launch_mods(), Key::Num7),
+        BindAction::QuickLaunch8 => KeyboardShortcut::new(quick_launch_mods(), Key::Num8),
+        BindAction::QuickLaunch9 => KeyboardShortcut::new(quick_launch_mods(), Key::Num9),
     }
+}
+
+/// 起動バー (⌃1〜⌃9) の修飾キー。macOS は ⌃、他 OS は Ctrl+Alt。
+///
+/// 他 OS で ⌥ を足すのは、`Modifiers::CTRL` が [`canonical_mods`] で
+/// `COMMAND` へ畳まれる = ⌘1〜⌘3 (`FocusPane1..3`) と**同じ打鍵**に
+/// なってしまうため (`NavBack` の Ctrl+- と同じ罠)。
+fn quick_launch_mods() -> Modifiers {
+    if cfg!(target_os = "macos") {
+        Modifiers::CTRL
+    } else {
+        Modifiers::CTRL.plus(Modifiers::ALT)
+    }
+}
+
+/// `BindAction::QuickLaunchN` → スロット番号 (1〜9)。起動バー以外は `None`。
+///
+/// **番号はここで固定される** — 使用頻度も通知も入力に取らないので、
+/// 「番号が動く」余地が構造的に無い。
+pub fn quick_launch_slot(a: BindAction) -> Option<usize> {
+    use BindAction::*;
+    Some(match a {
+        QuickLaunch1 => 1,
+        QuickLaunch2 => 2,
+        QuickLaunch3 => 3,
+        QuickLaunch4 => 4,
+        QuickLaunch5 => 5,
+        QuickLaunch6 => 6,
+        QuickLaunch7 => 7,
+        QuickLaunch8 => 8,
+        QuickLaunch9 => 9,
+        _ => return None,
+    })
+}
+
+/// スロット番号 (1〜9) → `BindAction`。範囲外は `None`。
+pub fn quick_launch_action(slot: usize) -> Option<BindAction> {
+    use BindAction::*;
+    Some(match slot {
+        1 => QuickLaunch1,
+        2 => QuickLaunch2,
+        3 => QuickLaunch3,
+        4 => QuickLaunch4,
+        5 => QuickLaunch5,
+        6 => QuickLaunch6,
+        7 => QuickLaunch7,
+        8 => QuickLaunch8,
+        9 => QuickLaunch9,
+        _ => return None,
+    })
 }
 
 /// 既定のバインド。2 打鍵 (chord) を持つのはここだけが知っている。
@@ -542,6 +634,15 @@ pub fn config_name(a: BindAction) -> &'static str {
         NextUnread => "next_unread",
         DeferUnread => "defer_unread",
         ToggleUnread => "toggle_unread",
+        QuickLaunch1 => "quick_launch_1",
+        QuickLaunch2 => "quick_launch_2",
+        QuickLaunch3 => "quick_launch_3",
+        QuickLaunch4 => "quick_launch_4",
+        QuickLaunch5 => "quick_launch_5",
+        QuickLaunch6 => "quick_launch_6",
+        QuickLaunch7 => "quick_launch_7",
+        QuickLaunch8 => "quick_launch_8",
+        QuickLaunch9 => "quick_launch_9",
     }
 }
 
@@ -627,6 +728,15 @@ pub fn action_label(a: BindAction) -> &'static str {
         NextUnread => "次の未読エージェントへ",
         DeferUnread => "あとで見る (未読に戻して次へ)",
         ToggleUnread => "未読の切り替え",
+        QuickLaunch1 => "起動バー 1",
+        QuickLaunch2 => "起動バー 2",
+        QuickLaunch3 => "起動バー 3",
+        QuickLaunch4 => "起動バー 4",
+        QuickLaunch5 => "起動バー 5",
+        QuickLaunch6 => "起動バー 6",
+        QuickLaunch7 => "起動バー 7",
+        QuickLaunch8 => "起動バー 8",
+        QuickLaunch9 => "起動バー 9",
     }
 }
 
@@ -824,6 +934,15 @@ impl Keybinds {
             "next_unread" => NextUnread,
             "defer_unread" => DeferUnread,
             "toggle_unread" => ToggleUnread,
+            "quick_launch_1" => QuickLaunch1,
+            "quick_launch_2" => QuickLaunch2,
+            "quick_launch_3" => QuickLaunch3,
+            "quick_launch_4" => QuickLaunch4,
+            "quick_launch_5" => QuickLaunch5,
+            "quick_launch_6" => QuickLaunch6,
+            "quick_launch_7" => QuickLaunch7,
+            "quick_launch_8" => QuickLaunch8,
+            "quick_launch_9" => QuickLaunch9,
             _ => return None,
         })
     }
@@ -2458,6 +2577,64 @@ mod tests {
         assert!(
             clashes.is_empty(),
             "macOS が握っていてアプリに届かない打鍵を既定にしている: {clashes:?}"
+        );
+    }
+
+    /// 起動バー (⌃1〜⌃9) が **OS 予約とも既存の割り当てとも食い合わない**。
+    ///
+    /// `conflicts_for` は修飾キーを [`canonical_mods`] で畳んでから比べるので、
+    /// 「macOS では別だが Windows/Linux では同じ打鍵」も検出できる
+    /// (⌘1〜⌘3 = `FocusPane1..3` が素の Ctrl+1〜3 と一致する罠)。
+    #[test]
+    fn 起動バーの打鍵はos予約とも既存割り当てとも食い合わない() {
+        let keys = Keybinds::from_overrides(&HashMap::new());
+        for n in 1..=9usize {
+            let a = quick_launch_action(n).expect("1〜9 は在る");
+            let b = keys.binding(a);
+            // ① macOS の実測予約表に無い (⌃ + 数字は 1 つも取られていない)
+            assert_eq!(
+                macos_reservation(b.first()),
+                None,
+                "⌃{n} が OS 予約と衝突している"
+            );
+            // ② 他のアクションと食い合わない (正規化して比較)
+            let clashes = conflicts_for(&keys, a, b);
+            assert!(
+                clashes.is_empty(),
+                "起動バー {n} が衝突している: {clashes:?} ({})",
+                keys.label(a)
+            );
+            // ③ 打鍵表記は必ず format 経由で出せる (ベタ書きしない)
+            assert!(!keys.label(a).is_empty());
+            assert!(quick_launch_slot(a) == Some(n));
+        }
+        // 起動バー以外は番号を持たない
+        assert_eq!(quick_launch_slot(BindAction::Save), None);
+    }
+
+    /// 起動バーの修飾キーは OS で分岐している (**両側を実装**している)。
+    #[test]
+    fn 起動バーの修飾キーはosごとに分けてある() {
+        let m = quick_launch_mods();
+        assert!(m.ctrl, "⌃ が付いていない");
+        if cfg!(target_os = "macos") {
+            assert!(!m.alt, "macOS では ⌃ だけで良い (⌃ + 数字は空いている)");
+        } else {
+            // 他 OS の Modifiers::CTRL は COMMAND と同じ打鍵に畳まれるので、
+            // ⌥ を足さないと ⌘1〜⌘3 (ペイン移動) と同じになる。
+            assert!(
+                m.alt,
+                "Windows/Linux では ⌥ を足さないとペイン移動と衝突する"
+            );
+        }
+        let src = include_str!("keybinds.rs").replace("\r\n", "\n");
+        assert!(
+            src.contains("fn quick_launch_mods() -> Modifiers {")
+                && src
+                    .split("fn quick_launch_mods() -> Modifiers {")
+                    .nth(1)
+                    .is_some_and(|b| b.contains("cfg!(target_os = \"macos\")")),
+            "OS 差分の分岐が無い"
         );
     }
 

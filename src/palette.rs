@@ -75,6 +75,13 @@ pub enum Cmd {
     /// プリセット `usize` を **専用の git worktree** で起動する。
     /// 同じツリーを他のエージェントと共有しないので、ファイルの取り合いが起きない。
     NewAgentIsolated(usize),
+    /// 起動バーのスロット `usize` (**1〜9**) のプリセットを起動する (⌃1〜⌃9)。
+    /// スロット → プリセットの対応は `config::quick_launch_slots` だけが決める。
+    QuickLaunch(usize),
+    /// 起動バーのスロット `usize` (1〜9) を **worktree 隔離**で起動する。
+    QuickLaunchIsolated(usize),
+    /// エージェントタブ `usize` の名前を手で付け直す (自動命名より常に優先される)。
+    RenameAgent(usize),
     /// 稼働中のエージェントを**全部**止める (破壊的なので必ず確認を取る)。
     StopAllAgents,
     /// カタログ全 CLI から選んでプリセットを追加するピッカーを開く
@@ -792,6 +799,9 @@ fn group_of(cmd: &Cmd) -> Group {
         // ── エージェント ───────────────────────────────────────────
         Cmd::NewAgent(_)
         | Cmd::NewAgentIsolated(_)
+        | Cmd::QuickLaunch(_)
+        | Cmd::QuickLaunchIsolated(_)
+        | Cmd::RenameAgent(_)
         | Cmd::StopAllAgents
         | Cmd::OpenAgentPicker
         | Cmd::FocusAgent(_)
