@@ -1603,7 +1603,13 @@ impl Coordinator {
 pub mod quota;
 
 use std::sync::mpsc::{self, Receiver};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 背景スレッド 1 回分の読み取り結果。
+///
+/// トークン集計は使用率よりずっと重い ([`quota::TOKEN_TTL`]) ので、
+/// 読まなかった回は `None` = 前の結果を据え置く。
+type ScanResult = (Vec<quota::QuotaSnapshot>, Option<Vec<quota::AgentTokens>>);
 
 /// ベンダーファイルを読み直す間隔。ファイルの更新はターン単位なので
 /// 短くしすぎない (UI は毎フレーム [`QuotaWatch::refresh_if_stale`] を呼べる)。
@@ -1632,13 +1638,16 @@ pub const QUOTA_EVENT_CAP: usize = 256;
 /// 5. セッションの出力から上限警告を拾ったら [`QuotaWatch::note_rate_limited`]
 ///    (agents.rs の `SessionEvent::RateLimited` をそのまま流せる)。
 pub struct QuotaWatch {
-    pending: Option<Receiver<Vec<quota::QuotaSnapshot>>>,
+    pending: Option<Receiver<ScanResult>>,
     snapshots: Vec<quota::QuotaSnapshot>,
+    tokens: Vec<quota::AgentTokens>,
     events: Vec<quota::RateLimitEvent>,
     history: quota::BurnHistory,
     running: Vec<(String, usize)>,
     policy: quota::Policy,
     last_refresh: Option<Instant>,
+    /// トークン集計を最後に読んだ時刻 ([`quota::TOKEN_TTL`] で間引く)。
+    last_token_scan: Option<Instant>,
     /// 取り込みに成功した回数 (テスト・診断用)。
     applied: u64,
 }
@@ -1654,11 +1663,13 @@ impl QuotaWatch {
         Self {
             pending: None,
             snapshots: Vec::new(),
+            tokens: Vec::new(),
             events: Vec::new(),
             history: quota::BurnHistory::new(),
             running: Vec::new(),
             policy: quota::Policy::default(),
             last_refresh: None,
+            last_token_scan: None,
             applied: 0,
         }
     }
@@ -1726,7 +1737,10 @@ impl QuotaWatch {
         // 1) 完了した読み取りがあれば取り込む
         if let Some(rx) = &self.pending {
             match rx.try_recv() {
-                Ok(snaps) => {
+                Ok((snaps, tokens)) => {
+                    if let Some(t) = tokens {
+                        self.tokens = t;
+                    }
                     self.apply(snaps, SystemTime::now());
                     self.pending = None;
                 }
@@ -1746,11 +1760,28 @@ impl QuotaWatch {
         }
         // 失敗時も時刻は更新し、毎フレーム再起動しない。
         self.last_refresh = Some(Instant::now());
+        // トークン集計は何十本ものトランスクリプトを舐めるので、使用率と
+        // 同じ間隔では回さない (アイドル時の背景 I/O を抑える)。
+        let scan_tokens = self
+            .last_token_scan
+            .map(|t| t.elapsed() >= quota::TOKEN_TTL)
+            .unwrap_or(true);
+        if scan_tokens {
+            self.last_token_scan = Some(Instant::now());
+        }
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("zv-quota".into())
             .spawn(move || {
-                let _ = tx.send(quota::snapshot_all());
+                // 使用率とトークン消費は同じ 1 本のスレッドで読む
+                // (エージェント本数ぶんスレッドを増やさない)。
+                let tokens = scan_tokens.then(|| {
+                    let since = SystemTime::now()
+                        .checked_sub(quota::TOKEN_WINDOW)
+                        .unwrap_or(UNIX_EPOCH);
+                    quota::scan_tokens(since)
+                });
+                let _ = tx.send((quota::snapshot_all(), tokens));
             });
         if spawned.is_ok() {
             self.pending = Some(rx);
@@ -1820,6 +1851,49 @@ impl QuotaWatch {
             .map(|(_, a)| a)
             .max_by_key(|a| a.severity())
             .unwrap_or(quota::Advice::Ok)
+    }
+
+    /// 直近 [`quota::TOKEN_WINDOW`] のトークン消費 (消費の多い順)。
+    /// **消費ゼロのエージェントは入っていない** ので、空なら 1px も出さない。
+    pub fn tokens(&self) -> &[quota::AgentTokens] {
+        &self.tokens
+    }
+
+    /// 読み取り結果を直接差し込む (時刻・I/O を注入したいテスト用)。
+    pub fn set_tokens(&mut self, tokens: Vec<quota::AgentTokens>) {
+        self.tokens = tokens;
+    }
+
+    /// 全エージェントを合算したトークン消費。1 件も無ければ None。
+    pub fn tokens_total(&self) -> Option<quota::TokenUsage> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+        let mut t = quota::TokenUsage::default();
+        for a in &self.tokens {
+            t.add(&a.total);
+        }
+        Some(t)
+    }
+
+    /// 全エージェントを合算した推定コスト。1 件も無ければ None。
+    pub fn cost_total(&self, prices: &dyn quota::PriceLookup) -> Option<quota::CostEstimate> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+        let mut est = quota::CostEstimate::default();
+        for a in &self.tokens {
+            let e = quota::estimate_cost(a, prices);
+            est.amount += e.amount;
+            est.unknown_tokens = est.unknown_tokens.saturating_add(e.unknown_tokens);
+            for m in e.unknown_models {
+                if !est.unknown_models.contains(&m) {
+                    est.unknown_models.push(m);
+                }
+            }
+        }
+        est.unknown_models.sort();
+        Some(est)
     }
 }
 

@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::i18n::trf;
+use crate::i18n::{tr, trf};
 
 // ── 記述子表 (エージェント固有の知識はここだけ) ──────────────────────────
 
@@ -87,6 +87,8 @@ pub struct AgentQuota {
     pub account: &'static str,
     /// 使用量の在り処。
     pub source: QuotaSource,
+    /// トークン消費の在り処 (プラン使用率とは別のファイルにあることが多い)。
+    pub tokens: TokenSource,
 }
 
 /// 対応エージェントの表。行を足すだけで新しい CLI に対応できる。
@@ -98,6 +100,20 @@ pub static AGENT_QUOTAS: &[AgentQuota] = &[
         // Claude Code はプラン使用率をローカルへ永続化しない (statusline へ
         // stdin で渡すだけ)。よって観測のみ。
         source: QuotaSource::ObservedOnly,
+        // ただしトランスクリプトには 1 ターンごとの `usage` が残る。
+        // 置き場は `~/.claude/projects/<cwd をエンコードした名前>/<sessionId>.jsonl`
+        // なので base 直下 + 1 階層。
+        tokens: TokenSource::Transcript {
+            locator: FileLocator {
+                base: &[".claude", "projects"],
+                file_prefix: "",
+                file_ext: "jsonl",
+                max_depth: 2,
+                max_entries: 8192,
+                tail_bytes: 512 * 1024,
+            },
+            parser: parse_claude_transcript,
+        },
     },
     AgentQuota {
         bin: "codex",
@@ -114,18 +130,35 @@ pub static AGENT_QUOTAS: &[AgentQuota] = &[
             },
             parser: parse_codex_rollout,
         },
+        // 使用率と同じロールアウトに `token_count` イベントが混ざっている。
+        tokens: TokenSource::Transcript {
+            locator: FileLocator {
+                base: &[".codex", "sessions"],
+                file_prefix: "rollout-",
+                file_ext: "jsonl",
+                max_depth: 4,
+                max_entries: 4096,
+                tail_bytes: 512 * 1024,
+            },
+            parser: parse_codex_tokens,
+        },
     },
     AgentQuota {
         bin: "gemini",
         label: "Gemini CLI",
         account: "google",
         source: QuotaSource::ObservedOnly,
+        // `~/.gemini/tmp/*/chats/*.jsonl` に本文は残るが、トークン数を書いた
+        // ファイルは見つからなかった (`totalTokenCount` 等を全走査して 0 件)。
+        tokens: TokenSource::None,
     },
     AgentQuota {
         bin: "cursor-agent",
         label: "Cursor Agent",
         account: "cursor",
         source: QuotaSource::ObservedOnly,
+        // 未確認。
+        tokens: TokenSource::None,
     },
 ];
 
@@ -1001,6 +1034,541 @@ pub fn pct(f: f32) -> u32 {
     (f.clamp(0.0, 1.0) * 100.0).round() as u32
 }
 
+// ── トークン消費とコスト推定 ──────────────────────────────────────────
+//
+// ## ローカルに実際に何があるか (実測。2026-08 時点)
+//
+// | CLI | ファイル | 取れるもの |
+// |---|---|---|
+// | claude | `~/.claude/projects/<cwd をエンコードした名前>/<sessionId>.jsonl` | `type:"assistant"` の行の `message.usage` (`input_tokens` / `output_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`) と `message.model` |
+// | codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `payload.type=="token_count"` の `info.last_token_usage` (`input_tokens` / `cached_input_tokens` / `output_tokens`) |
+// | gemini | **無し**。`~/.gemini/tmp/*/chats/*.jsonl` に本文はあるが、トークン数を書いたファイルは見つからなかった | — |
+// | その他 | 未確認 | — |
+//
+// **本文は一切読み出さない。** 拾うのは数値・時刻・モデル名だけで、
+// プロンプト本文やツール出力は構造体にも画面にも一切載せない。
+
+/// 1 行として受け付ける最大バイト数。超える行は飛ばす。
+/// 壊れた/巨大な 1 行に JSON パーサを噛ませて固まらせないための上限。
+pub const TOKEN_MAX_LINE: usize = 2 * 1024 * 1024;
+
+/// 集計で見るファイル数の上限 (新しい順)。
+///
+/// 1 ファイルあたり [`FileLocator::tail_bytes`] しか読まないので、
+/// 1 回の集計で読むのは最大 `TOKEN_MAX_FILES × tail_bytes`。
+/// **この積が背景 I/O の上限**なので、増やすときは [`TOKEN_TTL`] と一緒に見る。
+pub const TOKEN_MAX_FILES: usize = 64;
+
+/// 集計の既定の窓。「いま並列度をどうするか」を決めるための直近ぶん。
+pub const TOKEN_WINDOW: Duration = Duration::from_secs(24 * 3600);
+
+/// トークン集計を読み直す最短間隔。
+///
+/// 使用率 ([`crate::coordinator::QUOTA_TTL`]) より**ずっと長い**。
+/// 使用率は 1 ファイルの末尾数百 KB で済むが、トークン集計は
+/// 何十本ものトランスクリプトを舐めるので、同じ間隔で回すと
+/// アイドル時に無視できない背景 I/O になる (設計原則 3)。
+pub const TOKEN_TTL: Duration = Duration::from_secs(120);
+
+/// 1 回のやり取り (= 1 API リクエスト) 分のトークン。
+///
+/// 加算は全て飽和 (`saturating_*`)。桁あふれで負や 0 に化けさせない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// キャッシュに当たらなかった入力。
+    pub input: u64,
+    /// 出力 (推論トークンを含む)。
+    pub output: u64,
+    /// キャッシュ**書き込み** (ベンダーが区別しないなら 0)。
+    pub cache_write: u64,
+    /// キャッシュ**読み出し**。
+    pub cache_read: u64,
+}
+
+impl TokenUsage {
+    /// 全部の合計。
+    pub fn total(&self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.cache_read)
+    }
+
+    /// 1 つも消費していないか。
+    pub fn is_zero(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// 足し込む (飽和)。
+    pub fn add(&mut self, o: &TokenUsage) {
+        self.input = self.input.saturating_add(o.input);
+        self.output = self.output.saturating_add(o.output);
+        self.cache_write = self.cache_write.saturating_add(o.cache_write);
+        self.cache_read = self.cache_read.saturating_add(o.cache_read);
+    }
+}
+
+/// トランスクリプト 1 行分。**本文は持たない**。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnUsage {
+    /// その行が書かれた時刻 (取れなければ None)。
+    pub at: Option<SystemTime>,
+    /// モデル名 (取れなければ None)。単価の引き当てに使う。
+    pub model: Option<String>,
+    /// 消費。
+    pub usage: TokenUsage,
+}
+
+/// トークン消費の在り処。
+pub enum TokenSource {
+    /// ローカルのトランスクリプトを読む。パーサは**内容だけ**を受け取る純関数。
+    Transcript {
+        locator: FileLocator,
+        parser: fn(&str) -> Vec<TurnUsage>,
+    },
+    /// ローカルに残らない (調査して確認できなかったものも含む)。
+    None,
+}
+
+// ── パーサ (純関数。内容だけを受け取る) ────────────────────────────────
+
+/// Claude Code のトランスクリプト JSONL から `message.usage` を拾う。
+///
+/// 1 行 1 レコード。`type:"assistant"` の行だけが `message.usage` を持つ。
+/// 途中で切れた行・非 JSON・`usage` の無い行・空行は**黙って飛ばす**
+/// (壊れた 1 行のためにファイル全体を捨てない)。
+pub fn parse_claude_transcript(content: &str) -> Vec<TurnUsage> {
+    content.lines().filter_map(claude_line_usage).collect()
+}
+
+fn claude_line_usage(line: &str) -> Option<TurnUsage> {
+    let line = line.trim();
+    // 安いふるいを先に通す。全行を JSON パースすると巨大な履歴で重すぎる。
+    if line.len() > TOKEN_MAX_LINE || !line.contains("\"usage\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let msg = v.get("message")?;
+    let u = msg.get("usage")?;
+    let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let usage = TokenUsage {
+        input: n("input_tokens"),
+        output: n("output_tokens"),
+        cache_write: n("cache_creation_input_tokens"),
+        cache_read: n("cache_read_input_tokens"),
+    };
+    if usage.is_zero() {
+        return None;
+    }
+    Some(TurnUsage {
+        at: v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(parse_rfc3339),
+        model: msg
+            .get("model")
+            .and_then(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        usage,
+    })
+}
+
+/// codex のロールアウト JSONL から `token_count` イベントを拾う。
+///
+/// **`total_token_usage` ではなく `last_token_usage` を足し上げる。**
+/// 前者はセッション内の累計なので、窓で切ると二重計上になる
+/// (実測: total が 19594 → 44626 と伸びるのに対し last は 19594 / 25032 で、
+/// last の総和が total に一致する)。
+pub fn parse_codex_tokens(content: &str) -> Vec<TurnUsage> {
+    content.lines().filter_map(codex_line_tokens).collect()
+}
+
+fn codex_line_tokens(line: &str) -> Option<TurnUsage> {
+    let line = line.trim();
+    if line.len() > TOKEN_MAX_LINE || !line.contains("token_count") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let info = v.get("payload").and_then(|p| p.get("info"))?;
+    let lu = info
+        .get("last_token_usage")
+        .or_else(|| info.get("total_token_usage"))?;
+    let n = |k: &str| lu.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let cached = n("cached_input_tokens");
+    // codex (OpenAI 系) の input_tokens はキャッシュ読み出しを**含む**合計。
+    // Claude 側と揃えるためにここで引いておく。
+    let usage = TokenUsage {
+        input: n("input_tokens").saturating_sub(cached),
+        output: n("output_tokens"),
+        // 書き込み側の課金区分をベンダーが出さないので 0 のまま。
+        cache_write: 0,
+        cache_read: cached,
+    };
+    if usage.is_zero() {
+        return None;
+    }
+    Some(TurnUsage {
+        at: v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(parse_rfc3339),
+        model: info
+            .get("model")
+            .and_then(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        usage,
+    })
+}
+
+// ── 集計 ───────────────────────────────────────────────────────────────
+
+/// エージェント 1 種類分のトークン集計。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentTokens {
+    /// bin 名。
+    pub agent: String,
+    /// 表示名。
+    pub label: String,
+    /// プラン共有鍵。
+    pub account: String,
+    /// 合計。
+    pub total: TokenUsage,
+    /// モデル別内訳 (合計の降順)。モデル名が取れなかった分のキーは空文字。
+    pub by_model: Vec<(String, TokenUsage)>,
+    /// 数えたやり取りの本数。
+    pub turns: usize,
+    /// 上限に当たって読み切れなかった (= 実際はこれ以上)。
+    pub truncated: bool,
+}
+
+/// `base` 配下で条件に合うファイルを**新しい順**に最大 `max_files` 件返す。
+///
+/// `newer_than` より古いものは落とす。走査はルート注入 + `max_depth` /
+/// `max_entries` で有界 (巨大なセッション置き場でも止まらない)。
+/// 第 2 戻り値は「上限に当たって取りこぼした」印。
+pub fn recent_files(
+    root: &Path,
+    loc: &FileLocator,
+    newer_than: SystemTime,
+    max_files: usize,
+) -> (Vec<PathBuf>, bool) {
+    let mut dir = root.to_path_buf();
+    for seg in loc.base {
+        dir.push(seg);
+    }
+    if !dir.is_dir() {
+        return (Vec::new(), false);
+    }
+    let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut seen = 0usize;
+    let mut budget_hit = false;
+    let mut stack = vec![(dir, 0usize)];
+    while let Some((d, depth)) = stack.pop() {
+        let rd = match std::fs::read_dir(&d) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            seen += 1;
+            if seen > loc.max_entries {
+                budget_hit = true;
+                break;
+            }
+            let path = ent.path();
+            let ft = match ent.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                if depth < loc.max_depth {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !matches_name(&path, loc) {
+                continue;
+            }
+            let mtime = ent
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            if mtime < newer_than {
+                continue;
+            }
+            found.push((mtime, path));
+        }
+        if budget_hit {
+            break;
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    let truncated = budget_hit || found.len() > max_files;
+    found.truncate(max_files);
+    (found.into_iter().map(|(_, p)| p).collect(), truncated)
+}
+
+/// 全エージェントのトークン集計。**背景スレッドから呼ぶこと**。
+pub fn scan_tokens(since: SystemTime) -> Vec<AgentTokens> {
+    match dirs::home_dir() {
+        Some(h) => scan_tokens_in(&h, since),
+        None => Vec::new(),
+    }
+}
+
+/// ホーム相当のルートを注入する版 (テストはこれを使い、本物のホームを触らない)。
+///
+/// 消費がゼロのエージェントは**返さない**。「変化していないものは 1px も
+/// 出さない」を、UI ではなくデータの側で担保する。
+/// 戻りは消費の多い順 (どのエージェントが高いかが一目で分かるように)。
+pub fn scan_tokens_in(home: &Path, since: SystemTime) -> Vec<AgentTokens> {
+    let mut out = Vec::new();
+    for d in AGENT_QUOTAS {
+        let TokenSource::Transcript { locator, parser } = &d.tokens else {
+            continue;
+        };
+        let (files, mut truncated) = recent_files(home, locator, since, TOKEN_MAX_FILES);
+        let mut by_model: HashMap<String, TokenUsage> = HashMap::new();
+        let mut total = TokenUsage::default();
+        let mut turns = 0usize;
+        for path in files {
+            // 末尾しか読まないので、それより長いファイルは先頭を取りこぼす。
+            // 「実際はこれ以上」と正直に印を立てる (少なく見せない)。
+            if std::fs::metadata(&path)
+                .map(|m| m.len() > locator.tail_bytes)
+                .unwrap_or(false)
+            {
+                truncated = true;
+            }
+            let Some(content) = read_tail(&path, locator.tail_bytes) else {
+                continue;
+            };
+            for t in parser(&content) {
+                // 時刻が読めた行は窓で切る。読めない行は落とさない
+                // (ファイルの mtime で既に窓に入っているため)。
+                if t.at.map(|a| a < since).unwrap_or(false) {
+                    continue;
+                }
+                let key = t.model.unwrap_or_default();
+                by_model.entry(key).or_default().add(&t.usage);
+                total.add(&t.usage);
+                turns += 1;
+            }
+        }
+        if turns == 0 {
+            continue;
+        }
+        // 飽和した = これ以上は数えられていない
+        truncated = truncated || total.total() == u64::MAX;
+        let mut by_model: Vec<(String, TokenUsage)> = by_model.into_iter().collect();
+        by_model.sort_by(|a, b| b.1.total().cmp(&a.1.total()).then(a.0.cmp(&b.0)));
+        out.push(AgentTokens {
+            agent: d.bin.to_string(),
+            label: d.label.to_string(),
+            account: d.account.to_string(),
+            total,
+            by_model,
+            turns,
+            truncated,
+        });
+    }
+    out.sort_by(|a, b| b.total.total().cmp(&a.total.total()));
+    out
+}
+
+// ── コスト推定 ─────────────────────────────────────────────────────────
+
+/// 100 万トークンあたりの単価。
+///
+/// **モデル名も金額もこの module には無い。** 価格は変わるので、表は
+/// `config.rs` が設定として持ち、ここは [`PriceLookup`] 越しに引くだけ。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelRate {
+    pub input: f64,
+    pub output: f64,
+    pub cache_write: f64,
+    pub cache_read: f64,
+}
+
+/// 単価の引き当て。実装は `config.rs` の設定側。
+pub trait PriceLookup {
+    /// モデル名 → 単価。表に無ければ None (**0 円にしない**)。
+    fn rate(&self, model: &str) -> Option<ModelRate>;
+    /// 通貨の表示記号。
+    fn currency(&self) -> &str;
+}
+
+/// 推定コスト。**必ず「推定」として出すこと。**
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CostEstimate {
+    /// 単価が引けたぶんの合計。
+    pub amount: f64,
+    /// 単価が引けなかったモデル名 (重複なし・昇順)。
+    pub unknown_models: Vec<String>,
+    /// 単価が引けなかったぶんのトークン数。
+    pub unknown_tokens: u64,
+}
+
+impl CostEstimate {
+    /// 全てのモデルの単価が引けたか。
+    pub fn is_complete(&self) -> bool {
+        self.unknown_models.is_empty()
+    }
+
+    /// 表示用の文字列。**必ず「推定」と明示し、不明ぶんは 0 円にしない**。
+    pub fn label(&self, currency: &str) -> String {
+        let money = format!("{currency}{:.2}", self.amount);
+        if self.is_complete() {
+            return trf("推定 {money}", &[("money", money)]);
+        }
+        if self.amount <= 0.0 {
+            return trf(
+                "推定不可 (単価未設定: {models})",
+                &[("models", self.unknown_models.join(", "))],
+            );
+        }
+        trf(
+            "推定 {money} 以上 (単価未設定: {models})",
+            &[("money", money), ("models", self.unknown_models.join(", "))],
+        )
+    }
+}
+
+/// 単価 1 つ分のコスト (通貨単位)。
+///
+/// `u64::MAX` を入れても `f64` の範囲 (約 1.8e19 × 単価 / 1e6) に収まるので
+/// 桁あふれしない。
+pub fn rate_cost(u: &TokenUsage, r: &ModelRate) -> f64 {
+    (u.input as f64 * r.input
+        + u.output as f64 * r.output
+        + u.cache_write as f64 * r.cache_write
+        + u.cache_read as f64 * r.cache_read)
+        / 1_000_000.0
+}
+
+/// エージェント 1 本分の推定コスト。単価が引けないモデルは合計に入れず、
+/// 名前を [`CostEstimate::unknown_models`] へ残す (**0 円にしない**)。
+pub fn estimate_cost(t: &AgentTokens, prices: &dyn PriceLookup) -> CostEstimate {
+    let mut est = CostEstimate::default();
+    for (model, u) in &t.by_model {
+        match prices.rate(model) {
+            Some(r) => est.amount += rate_cost(u, &r),
+            None => {
+                est.unknown_tokens = est.unknown_tokens.saturating_add(u.total());
+                let name = if model.is_empty() {
+                    tr("(モデル不明)")
+                } else {
+                    model.clone()
+                };
+                if !est.unknown_models.contains(&name) {
+                    est.unknown_models.push(name);
+                }
+            }
+        }
+    }
+    est.unknown_models.sort();
+    est
+}
+
+/// 数を「12.3k / 4.5M」へ丸める。
+///
+/// **桁が上がっても表示幅を暴れさせない**のが目的なので、`u64` の全域を
+/// 覆う接尾辞まで用意する (実際のトークン数が E に届くことは無いが、
+/// 幅の上限を型で保証しておく)。
+pub fn short_tokens(n: u64) -> String {
+    const UNITS: &[(u64, &str)] = &[
+        (1_000_000_000_000_000_000, "E"),
+        (1_000_000_000_000_000, "P"),
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "G"),
+        (1_000_000, "M"),
+        (1_000, "k"),
+    ];
+    for (scale, suffix) in UNITS {
+        if n >= *scale {
+            return format!("{:.1}{suffix}", n as f64 / *scale as f64);
+        }
+    }
+    n.to_string()
+}
+
+// ── ステータスバーの並べ方 (純粋関数) ──────────────────────────────────
+
+/// バッジ 1 列の配置。矩形は必ず可用領域に収まり、互いに重ならない。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BadgeLayout {
+    /// 描くか。消費ゼロ・幅不足なら false = **1px も出さない**。
+    pub visible: bool,
+    /// 詳細 (エージェント別) を諦めて合算 1 個へ縮退したか。
+    pub compact: bool,
+    /// 各要素の矩形 `(x, y, w, h)`。
+    pub rects: Vec<(f32, f32, f32, f32)>,
+}
+
+impl BadgeLayout {
+    /// 何も描かない。
+    pub fn hidden() -> Self {
+        Self {
+            visible: false,
+            compact: false,
+            rects: Vec::new(),
+        }
+    }
+}
+
+/// ステータスバーのトークン/コストバッジをどう並べるかを決める。
+///
+/// - `avail`: 使ってよい領域 `(幅, 高さ)`
+/// - `items`: 詳細表示のときの各バッジの希望幅 (エージェント別)
+/// - `compact_w`: 合算 1 個へ縮退したときの幅
+/// - `row_h` / `gap`: 行の高さと要素間の隙間
+/// - `want_detail`: 利用者が詳細表示を選んでいるか
+///
+/// 詳細が入りきらなければ compact へ、compact も入らなければ非表示へ、と
+/// 段階的に縮退する。**行は必ず `avail.0` に収まる** (見切れさせない)。
+pub fn token_badge_layout(
+    avail: (f32, f32),
+    items: &[f32],
+    compact_w: f32,
+    row_h: f32,
+    gap: f32,
+    want_detail: bool,
+) -> BadgeLayout {
+    let (aw, ah) = avail;
+    if items.is_empty() || aw <= 0.0 || ah <= 0.0 || row_h <= 0.0 || row_h > ah {
+        return BadgeLayout::hidden();
+    }
+    let gap = gap.max(0.0);
+    let place = |widths: &[f32]| -> Vec<(f32, f32, f32, f32)> {
+        let mut x = 0.0f32;
+        let mut out = Vec::with_capacity(widths.len());
+        for w in widths {
+            out.push((x, 0.0, *w, row_h));
+            x += *w + gap;
+        }
+        out
+    };
+    let span = |widths: &[f32]| -> f32 {
+        widths.iter().copied().sum::<f32>() + gap * (widths.len().saturating_sub(1)) as f32
+    };
+    if want_detail && items.iter().all(|w| *w > 0.0) && span(items) <= aw {
+        return BadgeLayout {
+            visible: true,
+            compact: false,
+            rects: place(items),
+        };
+    }
+    if compact_w > 0.0 && compact_w <= aw {
+        return BadgeLayout {
+            visible: true,
+            compact: true,
+            rects: place(&[compact_w]),
+        };
+    }
+    BadgeLayout::hidden()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1693,5 +2261,563 @@ mod tests {
             descriptor("claude").unwrap().source,
             QuotaSource::ObservedOnly
         ));
+    }
+}
+
+// ── トークン消費 / コスト推定のテスト ─────────────────────────────────
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    /// 行の高さ。テストで使う想定値 (ステータスバーの内寸)。
+    const TOKEN_ROW_TEST_H: f32 = 18.0;
+
+    /// テスト用の単価表。**本物の設定 (`config.rs`) には触らない。**
+    struct Prices(Vec<(&'static str, ModelRate)>);
+
+    impl Prices {
+        fn one(name: &'static str, input: f64, output: f64) -> Self {
+            Self(vec![(
+                name,
+                ModelRate {
+                    input,
+                    output,
+                    cache_write: input * 1.25,
+                    cache_read: input * 0.1,
+                },
+            )])
+        }
+        fn empty() -> Self {
+            Self(Vec::new())
+        }
+    }
+
+    impl PriceLookup for Prices {
+        fn rate(&self, model: &str) -> Option<ModelRate> {
+            self.0
+                .iter()
+                .filter(|(k, _)| !k.is_empty() && model.starts_with(k))
+                .max_by_key(|(k, _)| k.len())
+                .map(|(_, r)| *r)
+        }
+        fn currency(&self) -> &str {
+            "$"
+        }
+    }
+
+    fn tokens(agent: &str, by_model: &[(&str, TokenUsage)]) -> AgentTokens {
+        let mut total = TokenUsage::default();
+        for (_, u) in by_model {
+            total.add(u);
+        }
+        AgentTokens {
+            agent: agent.into(),
+            label: agent.into(),
+            account: agent.into(),
+            total,
+            by_model: by_model
+                .iter()
+                .map(|(m, u)| ((*m).to_string(), *u))
+                .collect(),
+            turns: by_model.len(),
+            truncated: false,
+        }
+    }
+
+    // ── パーサ: 正常系 ────────────────────────────────────────────────
+
+    /// Claude Code のトランスクリプトから 4 種類のトークンとモデル名が取れる。
+    /// (実ファイルから起こした形。`message.usage` は assistant 行にだけ付く)
+    #[test]
+    fn claude_のトランスクリプトから_usage_が取れる() {
+        let content = concat!(
+            r#"{"type":"user","timestamp":"2026-07-20T18:35:10.000Z","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-07-20T18:35:15.437Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2,"cache_creation_input_tokens":17296,"cache_read_input_tokens":14953,"output_tokens":74}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-07-20T18:36:00.000Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":32249,"output_tokens":120}}}"#,
+            "\n",
+        );
+        let turns = parse_claude_transcript(content);
+        assert_eq!(turns.len(), 2, "assistant 行だけを拾う");
+        assert_eq!(
+            turns[0].usage,
+            TokenUsage {
+                input: 2,
+                output: 74,
+                cache_write: 17296,
+                cache_read: 14953,
+            }
+        );
+        assert_eq!(turns[0].model.as_deref(), Some("claude-opus-4-8"));
+        assert!(turns[0].at.is_some(), "時刻が読める");
+        assert_eq!(turns[1].usage.cache_read, 32249);
+    }
+
+    /// codex のロールアウトからは **last_token_usage** を拾う。
+    /// total は累計なので足すと二重計上になる (last の総和 = total)。
+    #[test]
+    fn codex_のロールアウトから_token_count_が取れる() {
+        let content = concat!(
+            r#"{"timestamp":"2026-08-09T08:22:30.000Z","type":"session_meta","payload":{"id":"x","cwd":"/tmp"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-09T08:23:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-x","total_token_usage":{"input_tokens":19594,"cached_input_tokens":0,"output_tokens":1000,"total_tokens":19594},"last_token_usage":{"input_tokens":19594,"cached_input_tokens":0,"output_tokens":1000,"total_tokens":19594}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-09T08:24:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-x","total_token_usage":{"input_tokens":44626,"cached_input_tokens":8960,"output_tokens":2000,"total_tokens":44626},"last_token_usage":{"input_tokens":25032,"cached_input_tokens":8960,"output_tokens":1000,"total_tokens":25032}}}}"#,
+            "\n",
+        );
+        let turns = parse_codex_tokens(content);
+        assert_eq!(turns.len(), 2);
+        // 2 件目: input_tokens はキャッシュを含む合計なので引いてある
+        assert_eq!(turns[1].usage.input, 25032 - 8960);
+        assert_eq!(turns[1].usage.cache_read, 8960);
+        assert_eq!(turns[1].usage.cache_write, 0, "書き込み区分は出ない");
+        assert_eq!(turns[1].model.as_deref(), Some("gpt-x"));
+        // 足し上げが total と一致する (二重計上していない)
+        let sum: u64 = turns
+            .iter()
+            .map(|t| t.usage.input + t.usage.cache_read)
+            .sum();
+        assert_eq!(sum, 44626);
+    }
+
+    // ── パーサ: 壊れた入力 ────────────────────────────────────────────
+
+    /// 途中で切れた行があっても、その行だけを捨てて残りは読む。
+    #[test]
+    fn 途中で切れた行は捨てて残りを読む() {
+        let content = concat!(
+            r#"{"type":"assistant","message":{"model":"m","usage":{"input_tok"#, // ← 切れている
+            "\n",
+            r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":10,"output_tokens":20}}}"#,
+            "\n",
+        );
+        let turns = parse_claude_transcript(content);
+        assert_eq!(turns.len(), 1, "壊れた 1 行のために全部を捨てない");
+        assert_eq!(turns[0].usage.input, 10);
+    }
+
+    /// 非 JSON・空行・`usage` の無い行は静かに飛ばす (panic しない)。
+    #[test]
+    fn 不正な_json_や_usage_無しの行は飛ばす() {
+        let content = concat!(
+            "\n",
+            "これは JSON ではない\n",
+            "{}\n",
+            "[]\n",
+            "null\n",
+            r#"{"usage":"文字列でも落ちない"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"usage":{}}}"#, // 中身が空 = 0 トークン
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant"}}"#, // usage 無し
+            "\n",
+            "   \n",
+        );
+        assert!(parse_claude_transcript(content).is_empty());
+        assert!(parse_codex_tokens(content).is_empty());
+    }
+
+    /// 巨大な 1 行は上限で弾く (JSON パーサを噛ませて固まらせない)。
+    #[test]
+    fn 巨大な一行は上限で弾く() {
+        let huge = format!(
+            r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":1,"output_tokens":1}},"pad":"{}"}}}}"#,
+            "あ".repeat(TOKEN_MAX_LINE) // 1 文字 3 バイト → 必ず上限超え
+        );
+        assert!(huge.len() > TOKEN_MAX_LINE);
+        assert!(
+            parse_claude_transcript(&huge).is_empty(),
+            "上限超えの行は読まない"
+        );
+        // 上限のすぐ内側なら普通に読める (弾きすぎていない)
+        let ok = r#"{"type":"assistant","message":{"usage":{"input_tokens":7,"output_tokens":8}}}"#;
+        assert_eq!(parse_claude_transcript(ok).len(), 1);
+    }
+
+    /// 空文字列 (= 空ファイルの内容) は空の結果。
+    #[test]
+    fn 空の内容は空の結果になる() {
+        assert!(parse_claude_transcript("").is_empty());
+        assert!(parse_codex_tokens("").is_empty());
+        assert!(parse_claude_transcript("\n\n\n").is_empty());
+    }
+
+    // ── 実ファイル読み: UTF-8 の割れ / 空ファイル / 無いディレクトリ ──
+
+    /// tail 読みが UTF-8 の途中で割れても panic せず、壊れた先頭行を捨てる。
+    #[test]
+    fn utf8_の途中で割れても壊れない() {
+        let dir = crate::test_util::unique_temp_dir("zv-quota", "utf8");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        // 3 バイト文字を並べた行 + 正しい JSON 行。tail をわざと
+        // マルチバイトの途中から始まる位置で切る。
+        let head = format!(
+            r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":1,"output_tokens":1}},"pad":"{}"}}}}"#,
+            "あ".repeat(100)
+        );
+        let tail_line =
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":42,"output_tokens":9}}}"#;
+        std::fs::write(&path, format!("{head}\n{tail_line}\n")).unwrap();
+        let full = std::fs::metadata(&path).unwrap().len();
+        for back in [tail_line.len() as u64 + 3, tail_line.len() as u64 + 4] {
+            let content = read_tail(&path, back).expect("読めること");
+            let turns = parse_claude_transcript(&content);
+            assert_eq!(turns.len(), 1, "back={back} content={content:?}");
+            assert_eq!(turns[0].usage.input, 42);
+        }
+        // 丸ごと読めば 2 行とも取れる
+        let all = read_tail(&path, full).unwrap();
+        assert_eq!(parse_claude_transcript(&all).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空ファイルでも落ちず、集計は 0 件。
+    #[test]
+    fn 空ファイルは空として扱う() {
+        let dir = crate::test_util::unique_temp_dir("zv-quota", "empty");
+        let proj = dir.join(".claude").join("projects").join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("s.jsonl"), "").unwrap();
+        let since = SystemTime::now() - Duration::from_secs(3600);
+        assert!(
+            scan_tokens_in(&dir, since).is_empty(),
+            "消費ゼロなら 1 件も返さない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 存在しないディレクトリでも落ちず、空を返す。
+    #[test]
+    fn 存在しないディレクトリでも落ちない() {
+        // unique_temp_dir は実体を作るので、その中の**作っていない**子を使う
+        let base = crate::test_util::unique_temp_dir("zv-quota", "missing");
+        let missing = base.join("no-such-home");
+        assert!(!missing.exists(), "わざと作らない");
+        assert!(scan_tokens_in(&missing, UNIX_EPOCH).is_empty());
+        let loc = FileLocator {
+            base: &["nope"],
+            file_prefix: "",
+            file_ext: "jsonl",
+            max_depth: 2,
+            max_entries: 16,
+            tail_bytes: 1024,
+        };
+        let (files, truncated) = recent_files(&missing, &loc, UNIX_EPOCH, 8);
+        assert!(files.is_empty());
+        assert!(!truncated);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 注入したホームから集計できる (実 `~/.claude` を触らない)。
+    #[test]
+    fn 注入したホームから集計できる() {
+        let home = crate::test_util::unique_temp_dir("zv-quota", "scan");
+        let proj = home.join(".claude").join("projects").join("-tmp-x");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"model":"mdl-a","usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":50}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"model":"mdl-b","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let since = SystemTime::now() - Duration::from_secs(3600);
+        let got = scan_tokens_in(&home, since);
+        assert_eq!(got.len(), 1, "claude だけが消費している");
+        let a = &got[0];
+        assert_eq!(a.agent, "claude");
+        assert_eq!(a.turns, 2);
+        assert_eq!(a.total.input, 101);
+        assert_eq!(a.total.output, 12);
+        assert_eq!(a.total.cache_write, 5);
+        assert_eq!(a.total.cache_read, 50);
+        // モデル別は消費の多い順
+        assert_eq!(a.by_model[0].0, "mdl-a");
+        assert_eq!(a.by_model[1].0, "mdl-b");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// **本文は絶対に集計結果へ載らない。**
+    #[test]
+    fn 本文は集計結果に載らない() {
+        let secret = "SECRET-PROMPT-BODY";
+        let content = format!(
+            r#"{{"type":"assistant","message":{{"model":"m","content":[{{"type":"text","text":"{secret}"}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+        );
+        let turns = parse_claude_transcript(&content);
+        assert_eq!(turns.len(), 1);
+        let dump = format!("{turns:?}");
+        assert!(!dump.contains(secret), "本文が混ざっている: {dump}");
+    }
+
+    // ── コスト計算 ────────────────────────────────────────────────────
+
+    /// 0 トークンなら 0 円で、不明モデルにもならない。
+    #[test]
+    fn ゼロトークンはゼロ円() {
+        let t = tokens("x", &[("mdl", TokenUsage::default())]);
+        let est = estimate_cost(&t, &Prices::one("mdl", 5.0, 25.0));
+        assert_eq!(est.amount, 0.0);
+        assert!(est.is_complete());
+        assert_eq!(est.unknown_tokens, 0);
+    }
+
+    /// キャッシュ読み / 書きは別の単価で計算される (同じ扱いにしない)。
+    #[test]
+    fn キャッシュの読み書きを単価で区別する() {
+        let p = Prices::one("mdl", 10.0, 50.0); // 書き 12.5 / 読み 1.0
+        let only_write = tokens(
+            "x",
+            &[(
+                "mdl",
+                TokenUsage {
+                    cache_write: 1_000_000,
+                    ..Default::default()
+                },
+            )],
+        );
+        let only_read = tokens(
+            "x",
+            &[(
+                "mdl",
+                TokenUsage {
+                    cache_read: 1_000_000,
+                    ..Default::default()
+                },
+            )],
+        );
+        let w = estimate_cost(&only_write, &p).amount;
+        let r = estimate_cost(&only_read, &p).amount;
+        assert!((w - 12.5).abs() < 1e-9, "書き込み {w}");
+        assert!((r - 1.0).abs() < 1e-9, "読み出し {r}");
+        assert!(w > r, "書き込みの方が高い");
+        // 入力 100 万 = 10.0、出力 100 万 = 50.0
+        let io = tokens(
+            "x",
+            &[(
+                "mdl",
+                TokenUsage {
+                    input: 1_000_000,
+                    output: 1_000_000,
+                    ..Default::default()
+                },
+            )],
+        );
+        assert!((estimate_cost(&io, &p).amount - 60.0).abs() < 1e-9);
+    }
+
+    /// 単価が設定に無いモデルは **0 円にせず「不明」** として残す。
+    #[test]
+    fn 単価が無いモデルは不明として残る() {
+        let t = tokens(
+            "x",
+            &[
+                (
+                    "known",
+                    TokenUsage {
+                        input: 1_000_000,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "unknown-model",
+                    TokenUsage {
+                        input: 2_000_000,
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        let est = estimate_cost(&t, &Prices::one("known", 3.0, 15.0));
+        assert!(!est.is_complete(), "不明があると complete ではない");
+        assert_eq!(est.unknown_models, vec!["unknown-model".to_string()]);
+        assert_eq!(est.unknown_tokens, 2_000_000);
+        assert!((est.amount - 3.0).abs() < 1e-9, "既知ぶんだけ合計する");
+        // 表示は「以上」と「単価未設定」を必ず含む (0 円だと嘘をつかない)
+        let label = est.label("$");
+        assert!(label.contains("以上"), "{label}");
+        assert!(label.contains("unknown-model"), "{label}");
+
+        // 全部不明なら「推定不可」
+        let all_unknown = estimate_cost(&t, &Prices::empty());
+        assert_eq!(all_unknown.amount, 0.0);
+        let l2 = all_unknown.label("$");
+        assert!(l2.contains("推定不可"), "{l2}");
+        assert!(!l2.contains("$0.00"), "0 円と断言しない: {l2}");
+    }
+
+    /// モデル名が取れなかった分も「(モデル不明)」として数える。
+    #[test]
+    fn モデル名が取れない分も不明として数える() {
+        let t = tokens(
+            "x",
+            &[(
+                "",
+                TokenUsage {
+                    input: 10,
+                    ..Default::default()
+                },
+            )],
+        );
+        let est = estimate_cost(&t, &Prices::one("m", 1.0, 1.0));
+        assert_eq!(est.unknown_models.len(), 1);
+        assert!(est.unknown_models[0].contains("不明"));
+    }
+
+    /// 桁あふれしない: `u64::MAX` を入れても有限の値になる。
+    #[test]
+    fn 桁あふれしない() {
+        let big = TokenUsage {
+            input: u64::MAX,
+            output: u64::MAX,
+            cache_write: u64::MAX,
+            cache_read: u64::MAX,
+        };
+        // total は飽和して u64::MAX で止まる (0 に巻き戻らない)
+        assert_eq!(big.total(), u64::MAX);
+        let mut acc = big;
+        acc.add(&big);
+        assert_eq!(acc.input, u64::MAX, "加算も飽和する");
+        let t = tokens("x", &[("mdl", big)]);
+        let est = estimate_cost(&t, &Prices::one("mdl", 1000.0, 1000.0));
+        assert!(est.amount.is_finite(), "{}", est.amount);
+        assert!(est.amount > 0.0);
+        assert!(!est.label("$").is_empty());
+        assert!(!short_tokens(u64::MAX).is_empty());
+    }
+
+    /// 短縮表記は桁が上がっても幅が暴れない。
+    #[test]
+    fn 短縮表記の桁() {
+        assert_eq!(short_tokens(0), "0");
+        assert_eq!(short_tokens(999), "999");
+        assert_eq!(short_tokens(1_000), "1.0k");
+        assert_eq!(short_tokens(12_345), "12.3k");
+        assert_eq!(short_tokens(1_500_000), "1.5M");
+        assert_eq!(short_tokens(2_000_000_000), "2.0G");
+        assert_eq!(short_tokens(u64::MAX), "18.4E");
+        // 桁が上がっても幅が暴れない (バッジの幅計算が壊れない)
+        for n in [0u64, 999, 1_000, 12_345, 1_000_000, 1 << 40, u64::MAX] {
+            assert!(short_tokens(n).chars().count() <= 8, "{n}");
+        }
+    }
+
+    // ── ステータスバーの配置 (純粋関数) ───────────────────────────────
+
+    /// 極端なサイズでも矩形が可用領域に収まり、互いに重ならない。
+    #[test]
+    fn バッジの矩形は可用領域に収まり重ならない() {
+        // 900x700 / 1200x300 / 400x700
+        let sizes = [(900.0f32, 700.0f32), (1200.0, 300.0), (400.0, 700.0)];
+        let item_sets: Vec<Vec<f32>> = vec![
+            vec![120.0],
+            vec![120.0, 140.0],
+            vec![120.0, 140.0, 160.0, 180.0],
+        ];
+        for (w, h) in sizes {
+            for items in &item_sets {
+                for want_detail in [false, true] {
+                    // ステータスバーはウィンドウ幅の一部しか使えない
+                    let avail = (w * 0.4, TOKEN_ROW_TEST_H.min(h));
+                    let lay = token_badge_layout(avail, items, 110.0, 16.0, 8.0, want_detail);
+                    if !lay.visible {
+                        assert!(lay.rects.is_empty(), "非表示なら矩形も無い");
+                        continue;
+                    }
+                    for (i, (x, y, rw, rh)) in lay.rects.iter().enumerate() {
+                        assert!(*x >= 0.0 && *y >= 0.0, "{i}: 原点より外 {:?}", lay.rects[i]);
+                        assert!(
+                            x + rw <= avail.0 + 0.001,
+                            "{w}x{h} detail={want_detail} {i}: 右へ見切れる {} > {}",
+                            x + rw,
+                            avail.0
+                        );
+                        assert!(
+                            y + rh <= avail.1 + 0.001,
+                            "{w}x{h} {i}: 下へ見切れる {} > {}",
+                            y + rh,
+                            avail.1
+                        );
+                    }
+                    for i in 0..lay.rects.len() {
+                        for j in (i + 1)..lay.rects.len() {
+                            let (ax, _, aw, _) = lay.rects[i];
+                            let (bx, _, bw, _) = lay.rects[j];
+                            let overlap = (ax + aw > bx) && (bx + bw > ax);
+                            assert!(!overlap, "{i} と {j} が重なっている: {:?}", lay.rects);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 幅が足りなければ詳細 → コンパクト → 非表示へ段階的に縮退する。
+    #[test]
+    fn 幅が足りなければ段階的に縮退する() {
+        let items = vec![120.0, 140.0, 160.0];
+        // 十分広い: 詳細のまま
+        let wide = token_badge_layout((1000.0, 20.0), &items, 110.0, 16.0, 8.0, true);
+        assert!(wide.visible && !wide.compact);
+        assert_eq!(wide.rects.len(), 3);
+        // 詳細は入らないがコンパクトは入る
+        let mid = token_badge_layout((200.0, 20.0), &items, 110.0, 16.0, 8.0, true);
+        assert!(mid.visible && mid.compact);
+        assert_eq!(mid.rects.len(), 1);
+        // どちらも入らない: 1px も出さない
+        let narrow = token_badge_layout((40.0, 20.0), &items, 110.0, 16.0, 8.0, true);
+        assert!(!narrow.visible);
+        assert!(narrow.rects.is_empty());
+        // 高さが足りなくても出さない
+        let short = token_badge_layout((1000.0, 8.0), &items, 110.0, 16.0, 8.0, true);
+        assert!(!short.visible);
+    }
+
+    /// 消費ゼロ (= 要素なし) なら、どんなに広くても 1px も出さない。
+    #[test]
+    fn 消費ゼロなら何も出さない() {
+        for w in [0.0f32, 400.0, 1200.0, 4000.0] {
+            let lay = token_badge_layout((w, 20.0), &[], 110.0, 16.0, 8.0, true);
+            assert!(!lay.visible, "w={w}");
+            assert!(lay.rects.is_empty());
+        }
+    }
+
+    /// コンパクト指定なら、詳細が入る幅でも合算 1 個しか出さない。
+    #[test]
+    fn コンパクト指定なら合算だけを出す() {
+        let items = vec![120.0, 140.0];
+        let lay = token_badge_layout((4000.0, 20.0), &items, 110.0, 16.0, 8.0, false);
+        assert!(lay.visible && lay.compact);
+        assert_eq!(lay.rects.len(), 1);
+        assert_eq!(lay.rects[0].2, 110.0);
+    }
+
+    /// 記述子表: トークンの在り処が調査結果どおりに入っている。
+    #[test]
+    fn トークンの記述子表が調査結果と合っている() {
+        // 実測で取れたもの
+        for bin in ["claude", "codex"] {
+            assert!(
+                matches!(
+                    descriptor(bin).unwrap().tokens,
+                    TokenSource::Transcript { .. }
+                ),
+                "{bin} はトランスクリプトから取れる"
+            );
+        }
+        // 取れなかったもの (無いものを在ることにしない)
+        for bin in ["gemini", "cursor-agent"] {
+            assert!(
+                matches!(descriptor(bin).unwrap().tokens, TokenSource::None),
+                "{bin} は確認できていない"
+            );
+        }
     }
 }
