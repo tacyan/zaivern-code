@@ -1243,6 +1243,11 @@ pub fn rel_label(file: &Path, root: &Path) -> String {
 /// ⌃⇧ + 数字は 1 つも無い (取られているのは ⌃⇧Space)。非 macOS では
 /// 畳まれて実体が `Ctrl+Shift+数字` になるが、既定表に ⌘⇧ + 数字は無いので
 /// こちらも食い合わない。**両 OS で通る唯一の枠**なので、分岐せず固定する。
+///
+/// なお `MACOS_RESERVED` との突き合わせは **macOS ビルドでだけ**行うこと。
+/// 非 macOS では `canonical_mods` が ⌃ を ⌘ へ畳むので `⌃⇧3` が `⇧⌘3`
+/// (macOS のスクリーンショット) と一致して見えるが、Linux / Windows で
+/// 押されるのは物理 `Ctrl+Shift+3` で、そこに macOS の予約は無い。
 pub fn digit_jump_mods() -> egui::Modifiers {
     egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT)
 }
@@ -2883,24 +2888,40 @@ description = "旧形式"
         }
     }
 
+    /// macOS の実測予約表と突き合わせる。
+    ///
+    /// **macOS ビルドでだけ意味がある。** 非 macOS では
+    /// [`crate::keybinds::canonical_mods`] が ⌃ を ⌘ へ畳むので、`⌃⇧3` が
+    /// `⇧⌘3` (= macOS のスクリーンショット) と一致してしまう。だが
+    /// Linux / Windows で押されるのは物理 `Ctrl+Shift+3` であって、macOS の
+    /// 予約はそこには存在しない。**この表を非 mac で当てると「その OS では
+    /// 使わない打鍵」を咎めるだけになる** (実際に Docker の Linux で落ちた)。
+    #[cfg(target_os = "macos")]
     #[test]
-    fn 数字ジャンプはos予約とも既存割り当てとも食い合わない() {
+    fn 数字ジャンプはmacの予約と食い合わない() {
+        for d in 0u8..=9 {
+            let sc = digit_jump_shortcut(d).expect("在る");
+            assert_eq!(
+                crate::keybinds::macos_reservation(sc),
+                None,
+                "数字 {d} の打鍵が macOS の予約と衝突している"
+            );
+        }
+    }
+
+    /// 既定の割り当てと**畳んだ形で**一致しないこと。
+    ///
+    /// こちらは**全 OS で走らせる**。`canonical_mods` が非 macOS で ⌃ を ⌘ へ
+    /// 畳むため、「macOS では別だが Linux / Windows では同じ打鍵」という
+    /// 片方が永久に死ぬ事故 (`⌃⌘F` と `⌘F`) はここでしか捕まらない。
+    #[test]
+    fn 数字ジャンプは既存の割り当てと食い合わない() {
         use crate::keybinds::{self, Binding, Keybinds};
         let keys = Keybinds::from_overrides(&HashMap::new());
         for d in 0u8..=9 {
             let sc = digit_jump_shortcut(d).expect("在る");
-            // ① macOS の実測予約表に無い
-            assert_eq!(
-                keybinds::macos_reservation(sc),
-                None,
-                "数字 {d} の打鍵が OS 予約と衝突している"
-            );
-            // ② 既定の割り当てと**畳んだ形で**一致しない。
-            //    `canonical_mods` は非 macOS で ⌃ を ⌘ へ畳むので、
-            //    ここが Linux / Windows でだけ落ちる罠を捕まえる。
             for a in keybinds::ALL_ACTIONS {
-                let b = keys.binding(a);
-                let hit = match b {
+                let hit = match keys.binding(a) {
                     Binding::Single(x) => keybinds::same_stroke(x, sc),
                     Binding::Chord(x, _) => keybinds::same_stroke(x, sc),
                 };
@@ -2909,6 +2930,13 @@ description = "旧形式"
                     "数字 {d} の打鍵が {a:?} ({}) と同じ打鍵になっている",
                     keys.label(a)
                 );
+            }
+            // 数字ジャンプどうしも当然ぶつからない
+            for e in 0u8..=9 {
+                if e != d {
+                    let other = digit_jump_shortcut(e).expect("在る");
+                    assert!(!keybinds::same_stroke(other, sc), "{d} と {e} が同じ打鍵");
+                }
             }
         }
     }
