@@ -305,6 +305,9 @@ pub enum Cmd {
     RunSelection,
     /// 新しいターミナル (Shell プリセット) を開く (VS Code: ⌃⇧`)
     NewTerminal,
+    /// **シェル統合 (OSC 633 / 133) の注入**を切り替える。
+    /// 受け取り側 (パース) は常時 on なので、これは「こちらから仕込むか」の切替。
+    ToggleShellIntegration,
     /// キーボードショートカット一覧ダイアログ
     ShowShortcuts,
     /// バージョン情報ダイアログ
@@ -862,7 +865,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::RunActiveFile
         | Cmd::RunBuildTask
         | Cmd::RunJsonTask(_)
-        | Cmd::RunSelection => Group::Run,
+        | Cmd::RunSelection
+        | Cmd::ToggleShellIntegration => Group::Run,
 
         // ── エージェント ───────────────────────────────────────────
         Cmd::NewAgent(_)

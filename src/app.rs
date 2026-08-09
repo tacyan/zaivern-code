@@ -3903,6 +3903,9 @@ impl ZaivernApp {
             roots
         };
         let cfg = config::load(&roots, true);
+        // シェル統合の注入は設定 1 つで決まる (既定 off)。ここで反映しないと
+        // 「設定に書いたのに次の起動で効かない」になる。
+        crate::shellint::set_enabled(cfg.shell_integration);
         // 画面全体のズームは **テーマ適用より先** に入れる。theme::apply は
         // その時点の pixels_per_point でフォントサイズを物理ピクセルへ丸めるので、
         // 後から倍率を変えると最初のフレームだけ丸めがズレた絵になる。
@@ -4371,6 +4374,7 @@ impl ZaivernApp {
         // 復元を撃てないよう、裏のスレッドごと捨てて張り直す)。
         let lh_root = self.primary_root().to_path_buf();
         self.local_history.set_workspace(lh_root, &self.cfg);
+        crate::shellint::set_enabled(self.cfg.shell_integration);
         self.tree.show_hidden = self.cfg.show_hidden_files;
         self.tree.apply_config(&self.cfg);
         self.rebuild_index();
@@ -11397,6 +11401,7 @@ impl ZaivernApp {
             | Cmd::ToggleWordWrap
             | Cmd::ToggleShowWhitespace
             | Cmd::ToggleMinimap
+            | Cmd::ToggleShellIntegration
             | Cmd::ToggleBreadcrumbs => self.apply_cmd_settings(cmd, ctx),
             Cmd::ToggleGitBlame => self.apply_cmd_settings(cmd, ctx),
             Cmd::VoiceInput(_)
@@ -12702,6 +12707,37 @@ impl ZaivernApp {
                         tr("🗺 ミニマップ: オン (クリック / ドラッグでスクロールできます)")
                     } else {
                         tr("🗺 ミニマップ: オフ")
+                    },
+                    true,
+                );
+            }
+            Cmd::ToggleShellIntegration => {
+                self.cfg.shell_integration = !self.cfg.shell_integration;
+                let on = self.cfg.shell_integration;
+                // 有効化した時点でシムを書き出す (crate::shellint::set_enabled)。
+                crate::shellint::set_enabled(on);
+                config::save_state(&self.cfg);
+                // 既に OSC を出しているシェル (iTerm2 / kitty / starship 等) では
+                // シム側が降りる。**「入れたのに何も変わらない」の理由を先に言う** —
+                // 黙って何もしないのが一番たちが悪い。
+                let already = on
+                    && crate::shellint::already_integrated(
+                        &|k| std::env::var(k).ok(),
+                        &crate::shellint::default_rc_files(),
+                    );
+                // **既存の端末には効かない**ことを隠さない。シェルの起動引数を
+                // 変える機能なので、次に開いた端末からしか働かない。
+                self.toast(
+                    match (on, already) {
+                        (true, true) => tr(
+                            "🐚 シェル統合: オン — ただしお使いのシェル設定は既に OSC 133/633 を出しています。二重発行を避けるためシムは何もしません (受信側はそのまま働きます)",
+                        ),
+                        (true, false) => tr(
+                            "🐚 シェル統合: オン — 次に開くターミナルから、コマンドの境界と終了コードをシェルが直接報告します",
+                        ),
+                        (false, _) => tr(
+                            "🐚 シェル統合: オフ — 次に開くターミナルは従来どおり起動します (受信側は動いたまま)",
+                        ),
                     },
                     true,
                 );
@@ -24315,6 +24351,12 @@ impl ZaivernApp {
                 tr("ミニマップの表示切替"),
                 String::new(),
                 Cmd::ToggleMinimap,
+            ),
+            (
+                "🐚".into(),
+                tr("シェル統合 (OSC 633) の切替 — コマンドの終了コードを画面から推測しない"),
+                String::new(),
+                Cmd::ToggleShellIntegration,
             ),
             (
                 "🔗".into(),
@@ -37252,6 +37294,7 @@ mod super_agent_tests {
             command: "claude".into(),
             cwd: std::path::PathBuf::new(),
             raw_log: None,
+            shell: None,
         }
     }
 

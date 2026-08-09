@@ -353,6 +353,15 @@ pub struct Config {
     pub keybindings: HashMap<String, String>,
     /// プラグインの有効/無効と設定値。
     pub plugins: PluginsConfig,
+    /// **シェル統合 (OSC 633 / 133) の注入**。既定は `false` = オプトイン。
+    ///
+    /// off のとき、端末の起動経路は導入前と 1 バイトも変わらない。
+    /// on にすると素のシェル (コマンド指定なしのターミナル) だけが
+    /// `~/.zaivern/shellint/` のシムを読んで起動し、コマンドの境界・
+    /// 終了コード・コマンド行を OSC で報告するようになる。
+    /// 受け取り側 (パース) は常時 on — iTerm2 / kitty / starship を
+    /// 使っている人のシェルは注入しなくても既に喋っているため。
+    pub shell_integration: bool,
     /// エージェント監視 (スーパーバイザー) の設定。
     /// `[supervisor]` セクションが無い既存の config.toml でも、
     /// `SupervisorConfig` 側の `#[serde(default)]` により既定値で読み込まれる。
@@ -877,6 +886,7 @@ impl Default for Config {
             webhook_url: String::new(),
             agents: default_agents(),
             keybindings: HashMap::new(),
+            shell_integration: false,
             supervisor: crate::supervisor::SupervisorConfig::default(),
             super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),

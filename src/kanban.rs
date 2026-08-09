@@ -372,6 +372,9 @@ pub enum Source {
     Protocol,
     /// ベンダー提供フックからの通知 (`supervisor::hooks`) — ラダー 2 段目
     Hook,
+    /// シェル統合 OSC 633/133 (`crate::shellint`) — ラダー 3 段目。
+    /// 終了コードは**事実**なので、画面の文字列一致より必ず強い。
+    Shell,
     /// terminal.rs の承認プロンプト検出
     Prompt,
     /// terminal.rs のレート制限検出
@@ -389,6 +392,7 @@ impl Source {
             Source::Process => "プロセス",
             Source::Protocol => "構造化プロトコル",
             Source::Hook => "ベンダーフック",
+            Source::Shell => "シェル統合",
             Source::Prompt => "プロンプト検出",
             Source::RateLimit => "上限検出",
             Source::Supervisor => "見張り",
@@ -401,12 +405,14 @@ impl Source {
     ///
     /// - `◆` 構造化プロトコル (最上段。画面を 1 文字も読んでいない)
     /// - `◇` ベンダーフック (2 段目。同じく画面を読んでいない)
+    /// - `◈` シェル統合 (3 段目。同じく画面を読んでいない)
     /// - `✓` 事実だが下の段 (プロセス生死 / プロンプト検出 / 上限 / 見張り)
     /// - `≈` 画面推定 (最下段。当てにならないかもしれない)
     pub fn mark(self) -> &'static str {
         match self {
             Source::Protocol => "◆",
             Source::Hook => "◇",
+            Source::Shell => "◈",
             Source::Screen => "≈",
             _ => "✓",
         }
@@ -417,9 +423,9 @@ impl Source {
         matches!(self, Source::Screen)
     }
 
-    /// **画面に一切触れずに得た判定か** (ラダー上位 2 段)。
+    /// **画面に一切触れずに得た判定か** (ラダー上位 3 段)。
     pub fn is_structured(self) -> bool {
-        matches!(self, Source::Protocol | Source::Hook)
+        matches!(self, Source::Protocol | Source::Hook | Source::Shell)
     }
 
     /// **信号の段位** (小さいほど強い)。CLAUDE.md 原則 #4 の優先順位そのもの:
@@ -434,10 +440,13 @@ impl Source {
             Source::Process => 0,
             Source::Protocol => 1,
             Source::Hook => 2,
-            Source::Prompt => 3,
-            Source::RateLimit => 4,
-            Source::Supervisor => 5,
-            Source::Screen => 6,
+            // シェル統合はベンダーの協力なしで**終了コードという事実**を運ぶ。
+            // 承認プロンプト検出より上に置く理由がここ (推定ではない)。
+            Source::Shell => 3,
+            Source::Prompt => 4,
+            Source::RateLimit => 5,
+            Source::Supervisor => 6,
+            Source::Screen => 7,
         }
     }
 }
@@ -914,6 +923,7 @@ pub fn classify_stream(
             let src = match l.rung {
                 supervisor::Rung::Protocol => Source::Protocol,
                 supervisor::Rung::Hook => Source::Hook,
+                supervisor::Rung::Shell => Source::Shell,
             };
             let detail = if l.detail.is_empty() {
                 // 補足が無いときは、せめて「どの段の何か」が判るようにする。
@@ -4186,6 +4196,9 @@ mod tests {
         }
         // 段位の順序そのもの (原則 #4: 構造化 > フック > 状態 > 画面)
         assert!(Source::Process.rung() < Source::Prompt.rung());
+        assert!(Source::Hook.rung() < Source::Shell.rung());
+        assert!(Source::Shell.rung() < Source::Prompt.rung());
+        assert!(Source::Shell.is_structured(), "画面を読んでいない段");
         assert!(Source::Prompt.rung() < Source::RateLimit.rung());
         assert!(Source::RateLimit.rung() < Source::Supervisor.rung());
         assert!(Source::Supervisor.rung() < Source::Screen.rung());

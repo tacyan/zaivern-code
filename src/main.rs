@@ -72,6 +72,7 @@ mod remote;
 mod session;
 mod session_picker;
 mod shellenv;
+mod shellint;
 mod skills;
 mod snippets;
 mod sound;
