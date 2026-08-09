@@ -1574,11 +1574,17 @@ pub fn agent_composer_inline_ui(
     buf: &mut AgentInputBuffer,
     target: Option<(u64, &str)>,
     expand: &mut bool,
+    men: &mut crate::mention::Mention,
+    msrc: &crate::mention::Source<'_>,
 ) -> ComposerAction {
     buf.sync_target(target.map(|(id, _)| id));
 
     let te_id = ui.make_persistent_id("agent_composer_text");
     let mut press = ComposerPress::None;
+
+    // `@` ピッカーは**入力欄より先に**打鍵をさらう (Enter / Esc / ↑↓ / Tab)。
+    // 後回しにすると Enter が改行や送信に取られ、候補を確定できない。
+    men.sync(ui, buf, te_id, msrc);
 
     // ⌘V / Ctrl+V の画像貼り付け (本文へ `@パス ` を挿す)。文字が載っている
     // ときは何もせず、egui 標準の貼り付けに任せる。
@@ -1632,6 +1638,7 @@ pub fn agent_composer_inline_ui(
             if r.changed() {
                 buf.set_text(text);
             }
+            men.popup(ui, theme, r.rect);
             // **Enter 単体では送らない。** 以前はここで `lost_focus() + Enter` を
             // 送信にしていて、IME の変換確定やタイプミスで書きかけの指示が
             // 飛んでいた (誤送信は取り返しがつかない)。Google AI Studio と同じく
@@ -1842,6 +1849,8 @@ pub fn agent_composer_ui(
     // stalled: 止まっているエージェントの数 (⏸ チップの表示と件数)
     stalled: usize,
     expand: &mut bool,
+    men: &mut crate::mention::Mention,
+    msrc: &crate::mention::Source<'_>,
 ) -> ComposerAction {
     // 宛先をアクティブなエージェントに追従させる (ピン留めは尊重する)
     buf.sync_target(target.map(|(id, _)| id));
@@ -1849,6 +1858,9 @@ pub fn agent_composer_ui(
     // 送信先が変わっても入力欄の同一性 (= フォーカス) は保つので ID は固定
     let te_id = ui.make_persistent_id("agent_composer_text");
     let focused = ui.memory(|m| m.has_focus(te_id));
+
+    // `@` ピッカーは**入力欄より先に**打鍵をさらう (下の送信コード判定より前)。
+    men.sync(ui, buf, te_id, msrc);
 
     // ⌘V / Ctrl+V の画像貼り付け (本文へ `@パス ` を挿す)。宛先が 1 体でも
     // 全員宛てでも同じ — 挿す先は本文なので区別しない。
@@ -1919,7 +1931,8 @@ pub fn agent_composer_ui(
         let cols = wrap_cols(ui.available_width(), char_w.max(1.0));
         let rows = composer_rows(buf.text(), cols, COMPOSER_MAX_ROWS);
         let mut text = buf.text().to_string();
-        let changed = egui::ScrollArea::vertical()
+        // `@` ポップアップの錨に矩形が要るので、Response をクロージャの外へ出す。
+        let r = egui::ScrollArea::vertical()
             .id_salt("agent_composer_scroll")
             .max_height(row_h.max(1.0) * (COMPOSER_MAX_ROWS + 1) as f32)
             .auto_shrink([false, true])
@@ -1932,12 +1945,12 @@ pub fn agent_composer_ui(
                         .desired_width(f32::INFINITY)
                         .font(font.clone()),
                 )
-                .changed()
             })
             .inner;
-        if changed {
+        if r.changed() {
             buf.set_text(text);
         }
+        men.popup(ui, theme, r.rect);
     }
 
     // ── 宛先チップ (入力欄の**下**) ───────────────────────────

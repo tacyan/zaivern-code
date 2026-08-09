@@ -146,6 +146,25 @@ pub enum ProblemRow {
     Item(ProblemItem),
 }
 
+/// LSP の SymbolNode を `(名前, 開始行, 終端行, kind)` へ平らにする。
+/// 行はどちらも 0 起点・**両端を含む** (`mention::Target::Symbol` と同じ約束)。
+fn collect_symbol_ranges(nodes: &[lsp::SymbolNode], out: &mut Vec<(String, usize, usize, u8)>) {
+    for n in nodes {
+        out.push((
+            n.name.clone(),
+            n.range.start.line,
+            n.range.end.line.max(n.range.start.line),
+            n.kind,
+        ));
+        collect_symbol_ranges(&n.children, out);
+    }
+}
+
+/// severity (1..4) の日本語名。表 [`PROBLEM_SEV_NAMES`] が唯一の出所。
+fn severity_word(sev: u8) -> &'static str {
+    PROBLEM_SEV_NAMES[(sev.clamp(1, 4) - 1) as usize]
+}
+
 /// severity ごとの件数 (トグルのバッジ用)。添字 0..3 = severity 1..4。
 pub fn problem_counts(items: &[ProblemItem]) -> [usize; 4] {
     let mut out = [0usize; 4];
@@ -3314,6 +3333,12 @@ pub struct ZaivernApp {
     tunnel_err: Option<String>,
     /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
+    /// `@` コンテキスト参照 (mention.rs)。添付台帳と裏の走査を持つ。
+    mention: mention::Mention,
+    /// `@` ピッカーへ渡す相対パス一覧 (索引が届いたときだけ作り直す)。
+    mention_rels: Vec<String>,
+    /// `@` ピッカーへ渡すシンボル (LSP の documentSymbol が届いたら作り直す)。
+    mention_syms: Vec<mention::SymbolHit>,
     /// プラン使用量の監視 (集約・枯渇予測)。読み取りはこの中で TTL 付きの
     /// バックグラウンドスレッドへ逃がされるので、毎フレーム触ってよい。
     quota: coordinator::QuotaWatch,
@@ -4074,6 +4099,9 @@ impl ZaivernApp {
             tunnel_host: cfg.ssh_tunnel_host.clone(),
             tunnel_err: None,
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
+            mention: mention::Mention::default(),
+            mention_rels: Vec::new(),
+            mention_syms: Vec::new(),
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             token_detail: false,
@@ -6450,6 +6478,17 @@ impl ZaivernApp {
         self.index_truncated = out.truncated;
         self.file_index = out.files;
         self.index_at = Some(Instant::now());
+        // `@` ピッカーは**主ルート配下だけ**を扱う (rel は所属ルート基準なので、
+        // 別ルートのものを混ぜると root.join(rel) が別のファイルを指す)。
+        self.mention_rels = match self.roots.first() {
+            Some(root) => self
+                .file_index
+                .iter()
+                .filter(|f| f.abs.starts_with(root))
+                .map(|f| f.rel.clone())
+                .collect(),
+            None => Vec::new(),
+        };
     }
 
     /// ⌘P のパレットに出す「索引の状態」。作成中/打ち切りのときだけ Some。
@@ -9555,6 +9594,7 @@ impl ZaivernApp {
             self.lsp_symbols_query.clear();
             self.lsp_symbols_path = Some(path);
             self.lsp_symbols_quiet = false;
+            self.rebuild_mention_symbols();
         }
     }
 
@@ -32013,6 +32053,104 @@ impl ZaivernApp {
         }
         let subtitle = self.rel_label(&top);
         self.open_multibuffer(mbuf::Source::Changes, &subtitle, &seeds);
+    }
+
+    /// LSP の documentSymbol を `@` ピッカーが読める形へ落とす。
+    ///
+    /// **`@` ピッカーは LSP が出した範囲を「正確 (=)」として扱う。**
+    /// LSP が動いていない言語は `mention::scan_symbols` の近似 (≈) で補う。
+    fn rebuild_mention_symbols(&mut self) {
+        self.mention_syms.clear();
+        let Some(path) = self.lsp_symbols_path.clone() else {
+            return;
+        };
+        let Some(root) = self.roots.first() else {
+            return;
+        };
+        let Some(rel) = crate::ignore::rel_slash(root, &path) else {
+            return;
+        };
+        // documentSymbol は入れ子を持つ。子も含めて平らにし、
+        // それぞれの `range` (本体全体) をそのまま添付範囲に使う。
+        let mut ranges: Vec<(String, usize, usize, u8)> = Vec::new();
+        collect_symbol_ranges(&self.lsp_symbols, &mut ranges);
+        for (name, start, end, kind) in ranges {
+            self.mention_syms.push(mention::SymbolHit {
+                name,
+                kind_label: symbol_kind_label(kind).to_string(),
+                rel: rel.clone(),
+                start_line: start,
+                end_line: end,
+                exact: true,
+            });
+        }
+    }
+
+    /// `@` ピッカーへ渡す材料を組む。**ここでは I/O を一切しない**
+    /// (索引・シンボル・診断はすべて既に手元にある値)。
+    fn mention_source<'a>(
+        &'a self,
+        root: &'a Path,
+        terminals: &'a [(u64, String)],
+        repo: Option<&'a Path>,
+        problems: usize,
+    ) -> mention::Source<'a> {
+        mention::Source {
+            root,
+            files: &self.mention_rels,
+            files_truncated: self.index_truncated,
+            symbols: &self.mention_syms,
+            symbols_busy: self.lsp_symbols_busy || self.index_rx.is_some(),
+            terminals,
+            problems,
+            repo,
+        }
+    }
+
+    /// `@` の確定で「App しか持っていない本文」を求められたら返す。
+    fn serve_mention_need(&mut self, need: mention::Need) {
+        match need {
+            mention::Need::Terminal { token, id } => {
+                let text = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| {
+                        s.screen_tail_lines(mention::TERM_TAIL_ROWS, mention::TERM_TAIL_COLS)
+                            .join("\n")
+                    })
+                    .unwrap_or_else(|| tr("その端末はもうありません"));
+                self.mention.provide(&token, text);
+            }
+            mention::Need::Problems { token } => {
+                let body = self
+                    .collect_problems()
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}:{}:{}: [{}] {}",
+                            p.path.display(),
+                            p.line + 1,
+                            p.col + 1,
+                            severity_word(p.severity),
+                            p.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.mention.provide(&token, body);
+            }
+        }
+    }
+
+    /// 送信直前に `@` 添付を本文へ展開する。宛先が 1 体なら、その CLI の
+    /// ファイル参照記法 (`agents.rs` のカタログ) に従って重複を省く。
+    fn expand_mentions(&self, text: &str, to: Option<u64>) -> String {
+        let cmd = to
+            .and_then(|id| self.agents.sessions.iter().find(|s| s.id == id))
+            .map(|s| s.command.clone());
+        self.mention.expand_for(text, cmd.as_deref())
     }
 
     /// ワークスペース全体の診断を集める。
