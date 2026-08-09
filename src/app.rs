@@ -11011,7 +11011,6 @@ impl ZaivernApp {
                     .and_then(|i| self.editor.buffers[i].path.clone());
                 self.local_history.open_for(p.as_deref(), ctx);
             }
-            Cmd::LocalHistoryLabel => self.local_history.open_label(ctx),
             // `]f` / `[f`: **ファイル間**のジャンプ (並列レビューの単位)。
             // 依頼を ctx に置くだけ。消化するのはレビュー画面自身なので、
             // 画面が出ていなければ 1 フレームで腐って何も起きない。
@@ -23756,15 +23755,9 @@ impl ZaivernApp {
             ),
             (
                 "🕰".into(),
-                tr("ローカルヒストリ: 履歴を開く"),
+                tr("ローカルヒストリ (取り消し履歴)"),
                 String::new(),
                 Cmd::LocalHistoryOpen,
-            ),
-            (
-                "🕰".into(),
-                tr("ローカルヒストリ: ラベルを付ける"),
-                String::new(),
-                Cmd::LocalHistoryLabel,
             ),
             (
                 "🎛".into(),

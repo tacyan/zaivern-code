@@ -1758,12 +1758,6 @@ impl LocalHistory {
         self.send(Msg::Load);
     }
 
-    /// ラベル入力を開いた状態で一覧を出す (パレットの「ラベルを付ける」)。
-    pub fn open_label(&mut self, ctx: &egui::Context) {
-        self.open_for(None, ctx);
-        self.label_open = true;
-    }
-
     fn send(&mut self, msg: Msg) {
         if !self.enabled {
             self.status = tr("ローカルヒストリは設定で無効になっています");
