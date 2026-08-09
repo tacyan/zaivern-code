@@ -1049,6 +1049,18 @@ impl Engine {
                 Some(sh) => {
                     let prev = sh.content.clone();
                     let (new_id, structure_only) = self.store_file(abs, *size);
+                    // 内容を持たない物 (バイナリ / 上限超過) が**そのまま在り続けて
+                    // いる**だけなら何も記録しない。IntelliJ が「バイナリは構造を
+                    // 版管理して中身は持たない」と言うときの構造とは
+                    // 作成・削除のことで、書き換えのたびに中身の無いリビジョンを
+                    // 積むという意味ではない (積むと、ビルド中に触られる .png 1 枚で
+                    // 一覧が埋まる)。
+                    if structure_only && prev.is_empty() {
+                        if let Some(e) = self.shadow.get_mut(rel) {
+                            e.stamp = stamp;
+                        }
+                        continue;
+                    }
                     if new_id == prev && !structure_only {
                         // 中身は同じ。スタンプだけ更新して記録しない。
                         self.store.release(&new_id);
@@ -2754,6 +2766,25 @@ mod tests {
                 .is_some_and(|s| s.content.is_empty()),
             "内容は持たない"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn バイナリを書き換えても中身の無いリビジョンは積まない() {
+        let (dir, mut e) = engine_for("binmod");
+        let ws = e.root.clone();
+        std::fs::write(ws.join("art.png"), [0u8, 1, 2, 3]).expect("write");
+        e.scan("初回");
+        let n = e.log.len();
+        assert_eq!(n, 1, "作成は 1 件記録する (構造)");
+        // 中身を変えても「構造」は変わっていない
+        write_file(&ws.join("art.png"), "\u{0}\u{1}\u{2}\u{3}\u{4}");
+        e.scan("保存");
+        assert_eq!(e.log.len(), n, "書き換えではリビジョンを積まない");
+        // 消えたら構造が変わるので記録する
+        std::fs::remove_file(ws.join("art.png")).expect("rm");
+        e.scan("削除");
+        assert_eq!(e.log.len(), n + 1, "削除は記録する");
         std::fs::remove_dir_all(&dir).ok();
     }
 
