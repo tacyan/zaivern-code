@@ -413,9 +413,17 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
 
 /// `zai hook --zaivern <agent> <event>` — ベンダー CLI のフックから呼ばれる。
 ///
-/// 標準入力の JSON ペイロードを読み、`~/.zaivern/hooks/` へ 1 ファイル置くだけ。
-/// **ポートは開かない** (remote.rs の 8899〜 と衝突させない)。GUI が動いていなくても
-/// 失敗しない — フックがエラーを返すとベンダー CLI 側の動作を妨げるため。
+/// 2 つの仕事をする:
+/// 1. 標準入力の JSON ペイロードを `~/.zaivern/hooks/` へ 1 ファイル投函する
+///    (状態ラダー 2 段目。**ポートは開かない** — remote.rs の 8899〜 と
+///    衝突させない)。GUI が動いていなくても失敗しない。
+/// 2. **ファイル所有リースの強制** ([`crate::lease::gate`])。書き込み系ツールが
+///    他人の持つパスへ向いていたら、ベンダーの許可判断へ `deny` を返して
+///    ツール呼び出しそのものを止める。この分岐が「衝突を後で発見させない」の
+///    実効部で、GUI が居なくても効く。
+///
+/// フック自身のエラーでベンダー CLI を妨げないこと (fail-open) は
+/// [`crate::lease::gate`] 側の責務。
 ///
 /// 引数の並びは [`crate::supervisor::hooks::HOOK_MARK`] が作る形と対。
 fn run_hook(args: &[String]) -> i32 {
@@ -433,7 +441,15 @@ fn run_hook(args: &[String]) -> i32 {
     let _ = std::io::stdin().read_to_string(&mut payload);
     let ev = hooks::event_from_payload(agent, event, &payload);
     let _ = hooks::post(&hooks::inbox_dir(), &ev);
-    0
+    // 投函のあとで判断する (投函は状態表示、判断は強制で、目的が別)。
+    let answer = crate::lease::gate(agent, event, &payload);
+    if !answer.stdout.is_empty() {
+        println!("{}", answer.stdout);
+    }
+    if !answer.stderr.is_empty() {
+        eprintln!("{}", answer.stderr);
+    }
+    answer.exit
 }
 
 // ───────────────────────── status: 実行検知 (インスタンス不要) ─────────────────────────

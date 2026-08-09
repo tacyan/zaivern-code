@@ -43,6 +43,7 @@ mod jsonc;
 mod jump;
 mod kanban;
 mod keybinds;
+mod lease;
 mod license;
 mod local_history;
 mod lockx;
