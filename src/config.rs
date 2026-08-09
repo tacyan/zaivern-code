@@ -159,6 +159,13 @@ pub struct Config {
     /// これを超える空白は「活動していない」と見なして 1ms と数える (時間)。
     /// IntelliJ の既定 (12 時間) に合わせてある。
     pub local_history_gap_hours: u32,
+    /// which-key ポップアップを出すまでの待ち (ミリ秒)。
+    ///
+    /// chord (2 打鍵) の 1 打鍵目を握ってからこの時間が経つと、そこから続く
+    /// 打鍵の一覧が右下に出る。**待ちがあるのは、chord を淀みなく打つ人に
+    /// ポップアップを 1 度も見せないため**。0 にすると即座に出る。
+    /// 2 打鍵目以降は待たない ([`crate::whichkey::SECOND_DELAY`] = 0)。
+    pub whichkey_delay_ms: u64,
 
     /// エディタ上部のブレッドクラム (`ワークスペース › フォルダ › ファイル › シンボル`)。
     /// **既定はオン** — 高さ 1 行ぶんで、どの言語でも (LSP 無しでも) 必ず出せる。
@@ -814,6 +821,7 @@ impl Default for Config {
             local_history: true,
             local_history_days: DEFAULT_LOCAL_HISTORY_DAYS,
             local_history_gap_hours: DEFAULT_LOCAL_HISTORY_GAP_HOURS,
+            whichkey_delay_ms: crate::whichkey::DEFAULT_FIRST_DELAY_MS,
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
             git_blame: false,
@@ -1272,6 +1280,11 @@ show_hidden_files = true
 # local_history = true
 # local_history_days = 5
 # local_history_gap_hours = 12
+# chord (2 打鍵) の 1 打鍵目を握ってから、続きの打鍵一覧 (which-key) を
+# 出すまでの待ち時間 (ミリ秒)。0 にすると即座に出ます。
+# 待ちがあるのは、chord を淀みなく打ち切る人にポップアップを見せないためです
+# (2 打鍵目以降は待ちません)。
+# whichkey_delay_ms = 200
 
 # ミニマップ (エディタ右端の遠景) とブレッドクラム (上部のパンくず)
 # (表示メニュー・コマンドパレットの「ミニマップの表示切替」「ブレッドクラムの表示切替」でも変更できます)
@@ -2482,6 +2495,15 @@ pub fn setting_defs() -> &'static [SettingDef] {
             kind: Choice(DIFF_VIEWS),
         },
         SettingDef {
+            key: "whichkey_delay_ms",
+            group: G_EDITOR,
+            label: "続きの打鍵一覧を出すまでの待ち (ms)",
+            kind: Int {
+                min: 0,
+                max: crate::whichkey::MAX_FIRST_DELAY_MS as i64,
+            },
+        },
+        SettingDef {
             key: "undo_merge_ms",
             group: G_EDITOR,
             label: "取り消しをまとめる時間 (ms)",
@@ -2745,6 +2767,7 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
         "insert_spaces" => B(cfg.insert_spaces),
         "diff_view" => T(cfg.diff_view.clone()),
         "undo_merge_ms" => I(cfg.undo_merge_ms as i64),
+        "whichkey_delay_ms" => I(cfg.whichkey_delay_ms as i64),
         "undo_max_steps" => I(cfg.undo_max_steps as i64),
         "undo_max_bytes" => I(cfg.undo_max_bytes as i64),
         "show_hidden_files" => B(cfg.show_hidden_files),
@@ -2909,6 +2932,7 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
         "insert_spaces" => b!(cfg.insert_spaces),
         "diff_view" => t!(cfg.diff_view),
         "undo_merge_ms" => i!(cfg.undo_merge_ms, u64),
+        "whichkey_delay_ms" => i!(cfg.whichkey_delay_ms, u64),
         "undo_max_steps" => i!(cfg.undo_max_steps, usize),
         "undo_max_bytes" => i!(cfg.undo_max_bytes, usize),
         "show_hidden_files" => b!(cfg.show_hidden_files),

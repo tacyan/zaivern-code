@@ -87,6 +87,7 @@ mod tunnel;
 mod tutorial;
 mod voice;
 mod whats_new;
+mod whichkey;
 mod worktree;
 mod zoom;
 

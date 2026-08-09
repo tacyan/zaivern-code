@@ -2078,6 +2078,10 @@ fn key_label(key: Key) -> String {
         Backslash => "\\".into(),
         Space => "Space".into(),
         Tab => "Tab".into(),
+        Backspace => "⌫".into(),
+        // `Key::name()` は "Questionmark" という変種名を返す。which-key の
+        // 案内 (`?`: すべて表示) がそのまま出ると読めないので、ここで記号にする。
+        Questionmark => "?".into(),
         _ => {
             // Key::name() は "A" や "F12" を返す
             key.name().to_string()
@@ -3054,8 +3058,9 @@ mod tests {
             "⌥⌘C",
             "⇧⌥⌘C",
         ];
-        let files: [(&str, &str); 7] = [
+        let files: [(&str, &str); 8] = [
             ("app.rs", include_str!("app.rs")),
+            ("whichkey.rs", include_str!("whichkey.rs")),
             ("menu_bar.rs", include_str!("menu_bar.rs")),
             ("palette.rs", include_str!("palette.rs")),
             ("tutorial.rs", include_str!("tutorial.rs")),

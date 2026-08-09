@@ -364,6 +364,15 @@ impl Git {
         self.status_cache.len()
     }
 
+    /// 変更ファイルの (相対パス, ステータス) 一覧。**キャッシュを読むだけで
+    /// git を 1 回も起動しない** ので、描画スレッドから呼んでよい。
+    pub fn changed_rel(&self) -> Vec<(&str, FileStatus)> {
+        self.status_cache
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect()
+    }
+
     /// 指定ファイルの 0-based 行番号 → LineMark (ガターの差分マーク)。
     ///
     /// **git は UI スレッドで待たない。** いま手元にあるマークをそのまま返し、
@@ -552,6 +561,29 @@ impl GitSet {
     /// 全 repo の変更ファイル数の合計。
     pub fn dirty_count(&self) -> usize {
         self.repos.values().map(|g| g.dirty_count()).sum()
+    }
+
+    /// 全 repo の変更ファイル `(絶対パス, repo からの相対パス, ステータス)`。
+    /// 相対パス順に並べ、`limit` 件で打ち切る。
+    ///
+    /// **git は 1 回も起動しない** — 直近のスキャン結果 (`status_cache`) を
+    /// 読むだけなので、描画スレッドから呼んでもフレームが止まらない
+    /// (CLAUDE.md「git は UI スレッドで待たない」)。
+    pub fn changed_paths(&self, limit: usize) -> Vec<(PathBuf, String, FileStatus)> {
+        let mut out: Vec<(PathBuf, String, FileStatus)> = Vec::new();
+        for (top, g) in &self.repos {
+            for (rel, st) in g.changed_rel() {
+                // git は / 区切りで報告する。実パスは OS の区切りへ戻す。
+                let mut abs = top.clone();
+                for seg in rel.split('/').filter(|s| !s.is_empty()) {
+                    abs.push(seg);
+                }
+                out.push((abs, rel.to_string(), st));
+            }
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out.truncate(limit);
+        out
     }
 
     /// 絶対パスの行マーク。repo 外なら空。
