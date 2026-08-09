@@ -237,6 +237,17 @@ fn problems_empty_card(ui: &mut egui::Ui, theme: &Theme, msg: &str, sub: &str) {
     });
 }
 
+/// 任意 2 テキストの比較結果 (「保存済みと比較」/「2 つのファイルを比較」)。
+///
+/// Git 基準ではないので `ReviewPanel` には載せず、**明示的に開いた
+/// ウィンドウ**にだけ出す (レイアウトを勝手に押しのけない)。
+struct CompareView {
+    title: String,
+    file: crate::diff::FileDiff,
+    /// 行クリックのインラインコメント。比較でも同じレンダラを使うので必要。
+    comments: crate::diff::DiffCommentStore,
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum SidebarTab {
     Files,
@@ -3123,6 +3134,11 @@ pub struct ZaivernApp {
     review: git_panel::ReviewPanel,
     /// Git サイドバーのサブタブ: true = 「変更をレビュー」/ false = 「変更」
     git_sub_review: bool,
+    /// 「比較の左側」として覚えたファイル (VS Code: Select for Compare)。
+    compare_left: Option<PathBuf>,
+    /// 任意 2 テキストの比較結果。**明示的な操作でしか開かない**
+    /// (画面が突然変わらないよう、レイアウトを押しのけない別ウィンドウ)。
+    compare_view: Option<CompareView>,
     /// 折りたたみ表示のキャッシュ (毎フレーム本文を作り直さないため)。
     /// 詳細は [`FoldView`] を参照。
     fold_view: Option<FoldView>,
@@ -3614,6 +3630,8 @@ impl ZaivernApp {
             ),
             git_ops: GitOps::default(),
             git_sub_review: false,
+            compare_left: None,
+            compare_view: None,
             fold_view: None,
             sticky_cache: None,
             guide_cache: None,
@@ -5382,6 +5400,9 @@ impl ZaivernApp {
                         .map(|p| p.to_string_lossy().into_owned())
                 })
                 .collect(),
+            // 変更レビューの「レビュー済み」の印。**印が消えるとレビューは
+            // 有限でなくなる** (毎回ゼロから読み直しになる) ので必ず往復させる。
+            reviewed_files: self.review.reviewed_paths(),
             // 走らせているエージェントタブの記録 (チャット履歴のフォルダ別保存)。
             // 終了済みは復元しても意味が無いので残さない。
             agents: self
@@ -5468,6 +5489,8 @@ impl ZaivernApp {
         self.restore_pinned_tabs(&sess.pinned_files);
         self.sidebar_open = sess.sidebar_open;
         self.sidebar_tab = SidebarTab::from_key(&sess.sidebar_tab);
+        // レビュー済みの印はセッションを跨いで残す (VS Code の Mark as viewed)。
+        self.review.set_reviewed_paths(&sess.reviewed_files);
         self.agents.panel_open = sess.panel_open;
         // 前回走らせていたエージェントタブの復元 (チャット履歴の再開)。
         // restore_agents = false なら何もしない (タブも作らない)。
@@ -8253,6 +8276,20 @@ impl ZaivernApp {
                 self.open_review_panel();
                 self.toast(trf("レビューの比較: {b}", &[("b", label)]), true);
             }
+            Cmd::SetReviewMode(ref kind) => {
+                let mode = match kind.as_str() {
+                    "focus" => git_panel::ReviewMode::Focus,
+                    "queue" => git_panel::ReviewMode::Queue,
+                    _ => git_panel::ReviewMode::Files,
+                };
+                let label = mode.label();
+                self.review.set_mode(mode);
+                self.open_review_panel();
+                self.toast(trf("レビュー: {m}", &[("m", label)]), true);
+            }
+            Cmd::CompareWithSaved => self.compare_with_saved(),
+            Cmd::SelectForCompare => self.select_for_compare(),
+            Cmd::CompareWithSelected => self.compare_with_selected(),
             Cmd::ToggleFold | Cmd::FoldAll | Cmd::UnfoldAll | Cmd::FoldLevel(_) => {
                 self.apply_fold_cmd(&cmd)
             }
@@ -8310,6 +8347,140 @@ impl ZaivernApp {
                 self.toast(msg, true);
             }
             _ => {}
+        }
+    }
+
+    // ── 任意 2 テキストの比較 (VS Code の Compare With) ──────────
+
+    /// 開いているタブの本文を**ディスク上の保存済み**と比べる。
+    ///
+    /// `diff.rs` は Git 基準専用だったので、任意の 2 テキストで駆動できる
+    /// [`crate::diff::diff_texts`] を使う。ハンクの形は git 由来のものと
+    /// 同じなので、既存の描画・折りたたみ・語単位ハイライトがそのまま効く。
+    fn compare_with_saved(&mut self) {
+        let Some(i) = self.editor.active else {
+            self.toast_warn(tr("比較するタブがありません"));
+            return;
+        };
+        let Some(path) = self.editor.buffers[i].path.clone() else {
+            self.toast_warn(tr("保存されていないタブは比較できません"));
+            return;
+        };
+        let disk = match crate::diff::read_compare_file(&path, crate::diff::COMPARE_MAX_BYTES) {
+            Ok(t) => t,
+            Err(e) => {
+                self.toast_warn(e);
+                return;
+            }
+        };
+        let name = path.display().to_string();
+        if disk.truncated {
+            self.toast_warn(tr("保存済みが大きいため、途中までを比較しています"));
+        }
+        let f = if disk.binary {
+            crate::diff::binary_diff(&name, &name)
+        } else {
+            crate::diff::diff_texts(
+                &trf("{p} (保存済み)", &[("p", name.clone())]),
+                &trf("{p} (編集中)", &[("p", name.clone())]),
+                &disk.text,
+                &self.editor.buffers[i].text,
+            )
+        };
+        self.show_compare(tr("保存済みと比較"), f);
+    }
+
+    /// このファイルを「比較の左側」として覚える。
+    fn select_for_compare(&mut self) {
+        let Some(p) = self
+            .editor
+            .active
+            .and_then(|i| self.editor.buffers[i].path.clone())
+        else {
+            self.toast_warn(tr("保存されたファイルを開いてから実行してください"));
+            return;
+        };
+        let name = p.display().to_string();
+        self.compare_left = Some(p);
+        self.toast(trf("比較の左側: {p}", &[("p", name)]), true);
+    }
+
+    /// 覚えた左側と、いま開いているファイルを比べる。
+    fn compare_with_selected(&mut self) {
+        let Some(left) = self.compare_left.clone() else {
+            self.toast_warn(tr("先に「比較の左側として選ぶ」を実行してください"));
+            return;
+        };
+        let Some(right) = self
+            .editor
+            .active
+            .and_then(|i| self.editor.buffers[i].path.clone())
+        else {
+            self.toast_warn(tr("保存されたファイルを開いてから実行してください"));
+            return;
+        };
+        match crate::diff::compare_files(&left, &right, crate::diff::COMPARE_MAX_BYTES) {
+            Ok(f) => self.show_compare(tr("2 つのファイルを比較"), f),
+            Err(e) => self.toast_warn(e),
+        }
+    }
+
+    /// 比較結果を出す。**レイアウトを押しのけない別ウィンドウ**に置く
+    /// (「画面が突然変わらない」— 大きな領域を勝手に開かない)。
+    fn show_compare(&mut self, title: String, file: crate::diff::FileDiff) {
+        let empty = file.hunks.is_empty() && !file.is_binary;
+        self.compare_view = Some(CompareView {
+            title,
+            file,
+            comments: crate::diff::DiffCommentStore::default(),
+        });
+        if empty {
+            self.toast(tr("差分はありません"), true);
+        }
+    }
+
+    /// 比較ウィンドウ。閉じるまで出しっぱなし (中身は既存の diff レンダラ)。
+    fn compare_window(&mut self, ctx: &egui::Context) {
+        let Some(view) = self.compare_view.as_mut() else {
+            return;
+        };
+        let theme = self.theme.clone();
+        let mut open = true;
+        egui::Window::new(view.title.clone())
+            .open(&mut open)
+            .collapsible(true)
+            .resizable(true)
+            .default_size(egui::vec2(760.0, 520.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(view.file.display_path())
+                        .color(theme.text_dim)
+                        .monospace()
+                        .small(),
+                );
+                if view.file.hunks.is_empty() && !view.file.is_binary {
+                    ui.label(
+                        RichText::new(tr("差分はありません"))
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    return;
+                }
+                egui::ScrollArea::both()
+                    .id_salt("zv-compare-view")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let _ = crate::diff::diff_ui_with_hunk_actions(
+                            ui,
+                            &theme,
+                            std::slice::from_ref(&view.file),
+                            &mut view.comments,
+                            None,
+                        );
+                    });
+            });
+        if !open {
+            self.compare_view = None;
         }
     }
 
@@ -9969,9 +10140,28 @@ impl ZaivernApp {
             }
             Cmd::DiffNextChange => crate::diff::request_jump(ctx, 1),
             Cmd::DiffPrevChange => crate::diff::request_jump(ctx, -1),
+            // `]f` / `[f`: **ファイル間**のジャンプ (並列レビューの単位)。
+            // 依頼を ctx に置くだけ。消化するのはレビュー画面自身なので、
+            // 画面が出ていなければ 1 フレームで腐って何も起きない。
+            Cmd::DiffNextFile => {
+                self.open_review_panel();
+                crate::diff::request_file_jump(ctx, 1);
+            }
+            Cmd::DiffPrevFile => {
+                self.open_review_panel();
+                crate::diff::request_file_jump(ctx, -1);
+            }
+            Cmd::DiffMarkViewed => {
+                self.open_review_panel();
+                crate::diff::request_mark_viewed(ctx);
+            }
             // 折りたたみ / ブックマーク / テーブル表示 / レビュー / LSP
             Cmd::OpenReview
             | Cmd::SetReviewBase(_)
+            | Cmd::SetReviewMode(_)
+            | Cmd::CompareWithSaved
+            | Cmd::SelectForCompare
+            | Cmd::CompareWithSelected
             | Cmd::ToggleFold
             | Cmd::FoldAll
             | Cmd::UnfoldAll
@@ -11989,6 +12179,18 @@ impl ZaivernApp {
         if consume(ctx, self.keys.binding(BindAction::DiffNextChange)) {
             cmds.push(Cmd::DiffNextChange);
         }
+        // `]f` / `[f` (cmux) — **テキスト入力にフォーカスが無いときだけ**。
+        // 1 打鍵目が修飾キー無しの `]` `[` なので、本文を打っている最中に
+        // 待機へ入ると 1 秒間ほかのショートカットが素通ししなくなる
+        // (`consume_binding` は prefix を握っている間、単打を 1 つも通さない)。
+        if ctx.memory(|m| m.focused().is_none()) {
+            if consume(ctx, self.keys.binding(BindAction::DiffPrevFile)) {
+                cmds.push(Cmd::DiffPrevFile);
+            }
+            if consume(ctx, self.keys.binding(BindAction::DiffNextFile)) {
+                cmds.push(Cmd::DiffNextFile);
+            }
+        }
         // 診断のジャンプ。差分と同じく ⇧F8 を F8 より先に見る。
         if consume(ctx, self.keys.binding(BindAction::PrevProblem)) {
             cmds.push(Cmd::PrevProblem);
@@ -13842,6 +14044,11 @@ impl ZaivernApp {
         }
         if let Some((root, issue, preset_idx)) = gh_actions.start_issue {
             self.start_issue_flow(&root, &issue, preset_idx, ctx);
+        }
+        // レビュー済みの印が変わったらセッションへ書き戻す
+        // (印が残らないとレビューは「有限」でなくなる)。
+        if self.review.take_reviewed_dirty() {
+            self.persist_session();
         }
         if let Some((msg, ok)) = git_actions.toast {
             self.toast(msg, ok);
@@ -21948,6 +22155,60 @@ impl ZaivernApp {
                 Cmd::DiffPrevChange,
             ),
             (
+                "⇥".into(),
+                tr("レビュー: 次の差分ファイルへ (レビュー済みは飛ばす)"),
+                fmt_key(BindAction::DiffNextFile),
+                Cmd::DiffNextFile,
+            ),
+            (
+                "⇤".into(),
+                tr("レビュー: 前の差分ファイルへ"),
+                fmt_key(BindAction::DiffPrevFile),
+                Cmd::DiffPrevFile,
+            ),
+            (
+                "☑".into(),
+                tr("レビュー: このファイルをレビュー済みにする / 戻す"),
+                String::new(),
+                Cmd::DiffMarkViewed,
+            ),
+            (
+                "🎯".into(),
+                tr("レビュー: 1 ファイルに集中する (Focus Mode)"),
+                String::new(),
+                Cmd::SetReviewMode("focus".into()),
+            ),
+            (
+                "📋".into(),
+                tr("レビュー: 横断ハンクキュー (採用 / 却下)"),
+                String::new(),
+                Cmd::SetReviewMode("queue".into()),
+            ),
+            (
+                "🗂".into(),
+                tr("レビュー: ファイル一覧に戻す"),
+                String::new(),
+                Cmd::SetReviewMode("files".into()),
+            ),
+            (
+                "⇔".into(),
+                tr("保存済みと比較 (編集中の本文 vs ディスク)"),
+                String::new(),
+                Cmd::CompareWithSaved,
+            ),
+            (
+                "◧".into(),
+                tr("比較の左側として選ぶ"),
+                String::new(),
+                Cmd::SelectForCompare,
+            ),
+            (
+                "◨".into(),
+                tr("選んだファイルと比較"),
+                String::new(),
+                Cmd::CompareWithSelected,
+            ),
+            (
                 "🔎".into(),
                 tr("レビューの比較: 作業ツリー vs HEAD"),
                 String::new(),
@@ -29340,6 +29601,7 @@ impl ZaivernApp {
         self.git_commit_window(ctx);
         self.git_history_window(ctx);
         self.problems_window(ctx);
+        self.compare_window(ctx);
         self.shortcuts_window(ctx);
         self.settings_window(ctx);
         self.hotexit_conflict_window(ctx);
@@ -34926,6 +35188,8 @@ mod wave2_tests {
             ("LspRename", "LspRename"),
             ("LspFormat", "LspFormat"),
             ("SelectNextOccurrence", "SelectNextOccurrence"),
+            ("DiffNextFile", "DiffNextFile"),
+            ("DiffPrevFile", "DiffPrevFile"),
             ("KeybindEditor", "ShowShortcuts"),
             ("FollowAgent", "ToggleFollowAgent"),
             ("FollowResume", "ResumeFollowAgent"),
