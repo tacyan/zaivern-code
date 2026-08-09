@@ -2245,6 +2245,18 @@ rename to new.rs
     // 本物の git リポジトリでの統合テスト (ユーザーのリポジトリには触らない)
     // -----------------------------------------------------------------
 
+    /// この環境に git があるか。**無ければテストごとスキップする** —
+    /// `rust:1.90-slim` (`tools/linux-test.sh` の既定イメージ) には git が
+    /// 入っておらず、`expect` で落とすと「Docker でだけ赤い」テストになる。
+    /// CI の ubuntu には git があるので、そこでは必ず実行される。
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .arg("-C")
@@ -2263,6 +2275,10 @@ rename to new.rs
 
     #[test]
     fn 本物のワークツリー二本で衝突を分類する() {
+        if !git_available() {
+            println!("git が無い環境なのでスキップ");
+            return;
+        }
         let root = crate::test_util::unique_temp_dir("zv-conflict", "real");
         let base = root.join("base");
         std::fs::create_dir_all(&base).expect("base");
@@ -2378,6 +2394,10 @@ rename to new.rs
 
     #[test]
     fn 離れた変更はコミット済みならgitの判定で情報へ落ちる() {
+        if !git_available() {
+            println!("git が無い環境なのでスキップ");
+            return;
+        }
         let root = crate::test_util::unique_temp_dir("zv-conflict", "clean");
         let base = root.join("base");
         std::fs::create_dir_all(&base).expect("base");
