@@ -97,6 +97,9 @@ pub enum Cmd {
     StopAllAgents,
     /// カタログ全 CLI から選んでプリセットを追加するピッカーを開く
     OpenAgentPicker,
+    /// **ACP (Agent Client Protocol) パネル**を開閉する。
+    /// 端末の文字列ではなく構造化プロトコルでエージェントを駆動する経路。
+    ToggleAcpPanel,
     FocusAgent(usize),
     RestartAgent,
     KillAgent,
@@ -862,6 +865,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenApprovals
         | Cmd::OpenApprovalAudit
         | Cmd::OpenMcp
+        | Cmd::ToggleAcpPanel
         | Cmd::OpenSkills
         | Cmd::ShowSessions
         | Cmd::ShowQuota

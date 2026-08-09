@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
 
+use crate::acp;
 use crate::agent_picker::{self, AgentPicker};
 use crate::agents::{self, AgentManager, SessionEvent};
 use crate::breadcrumb;
@@ -3646,6 +3647,11 @@ pub struct ZaivernApp {
     /// 折りたたみを開いている承認要求の ID (詳細 / 生プロンプト抜粋)。
     approvals_expanded: HashSet<u64>,
 
+    // ── ACP クライアント (crate::acp) ─────────────────────────────
+    /// 構造化プロトコル (ACP) で駆動しているエージェント群とそのパネル。
+    /// 接続 0 本のときは何も描かず、1 フレームも起こさない。
+    acp: acp::AcpManager,
+
     // ── MCP サーバ管理パネル (crate::mcp) ─────────────────────────
     /// ボトムパネルを「🔌 MCP」表示に切り替えているか。
     mcp_view: bool,
@@ -4156,6 +4162,7 @@ impl ZaivernApp {
             approvals_audit: false,
             approvals_audit_cache: None,
             approvals_expanded: HashSet::new(),
+            acp: acp::AcpManager::default(),
             mcp_view: false,
             mcp: mcp::McpPanel::default(),
             skills_view: false,
@@ -11202,6 +11209,17 @@ impl ZaivernApp {
             }
             Cmd::OpenApprovals => self.open_approvals_panel(),
             Cmd::OpenMcp => self.open_mcp_panel(),
+            // ACP パネルは**オーバーレイ**なので中央ビューを奪わない
+            // (起動しただけで画面が激変しない)。
+            Cmd::ToggleAcpPanel => {
+                self.acp.open = !self.acp.open;
+                if self.acp.open {
+                    self.toast(
+                        tr("🛰 ACP: 構造化プロトコルでエージェントを駆動します"),
+                        true,
+                    );
+                }
+            }
             Cmd::OpenSkills => self.open_skills_panel(),
             Cmd::OpenApprovalAudit => {
                 self.open_approvals_panel();
@@ -17002,6 +17020,12 @@ impl ZaivernApp {
         let mut sent = 0usize;
         let mut lost = 0usize;
         for (sid, action) in &res.replies {
+            // **ACP (構造化プロトコル) の要求が先。** PTY のセッション ID とは
+            // 別空間 (`acp::ACP_SESSION_ID_BASE`) なので取り違えは起きない。
+            if self.acp.reply(*sid, *action) {
+                sent += 1;
+                continue;
+            }
             let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == *sid) else {
                 lost += 1;
                 continue;
@@ -24648,6 +24672,12 @@ impl ZaivernApp {
                 Cmd::OpenMcp,
             ),
             (
+                "🛰".into(),
+                tr("ACP エージェント (構造化プロトコル)"),
+                String::new(),
+                Cmd::ToggleAcpPanel,
+            ),
+            (
                 "🧩".into(),
                 tr("Skills / コマンドを管理"),
                 String::new(),
@@ -29488,6 +29518,10 @@ impl ZaivernApp {
         // `IdleSignals::animating` として見えるので、二重予約にはならない
         // (`idle_repaint_ms` は animating のとき `None` を返す)。
         // 非表示のときは 1 本も予約しないので、完全アイドルの 0fps は保たれる。
+        // ── ACP (構造化プロトコル) のオーバーレイ ──
+        // ツアーの直前 = 他の全パネルの上。接続が無ければ即 return する。
+        self.acp_tick(ctx);
+
         self.tutorial_tick(ctx);
 
         // 今フレームのズームジェスチャの持ち主を確定させる。描かなかった
@@ -29516,6 +29550,46 @@ impl ZaivernApp {
         let theme = self.theme.clone();
         if let Some(act) = self.tutorial.overlay(ctx, &theme, &self.keys) {
             self.apply_tutorial_action(act, ctx);
+        }
+    }
+
+    /// ACP (構造化プロトコル) の 1 フレーム。
+    ///
+    /// 受信の畳み込みとオーバーレイの描画をここ 1 か所へ集める。接続が
+    /// 0 本のときは**何も起きない** (設計原則 3: アイドルのコストはゼロ)。
+    fn acp_tick(&mut self, ctx: &egui::Context) {
+        if self.acp.is_empty() && !self.acp.open {
+            return;
+        }
+        // 未保存のエディタバッファを公開する。`fs/read_text_file` が
+        // ディスクではなく「いま画面に見えている内容」を返せる = エディタを
+        // 持つクライアントだけの強み。署名が変わらなければ本文は読まない。
+        self.acp.sync_unsaved(
+            self.editor
+                .buffers
+                .iter()
+                .filter(|b| b.dirty())
+                .filter_map(|b| {
+                    b.path
+                        .as_deref()
+                        .map(|p| (p, b.history.revision(), b.text.as_str()))
+                }),
+        );
+        let theme = self.theme.clone();
+        let cwd = self.agent_cwd();
+        let toasts = self.acp.frame(
+            ctx,
+            &theme,
+            &mut self.agents.approvals,
+            &self.roots.clone(),
+            &cwd,
+        );
+        for (msg, ok) in toasts {
+            if ok {
+                self.toast(msg, true);
+            } else {
+                self.toast_warn(msg);
+            }
         }
     }
 

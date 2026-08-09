@@ -1379,6 +1379,104 @@ fn basename(token: &str) -> &str {
     token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  ACP (Agent Client Protocol) カタログ
+// ══════════════════════════════════════════════════════════════════════
+
+/// **ACP で駆動できるエージェント**。上の [`AGENT_CATALOG`] が「PTY で動かす
+/// CLI」の表であるのに対し、こちらは「構造化プロトコルで話せる相手」の表。
+///
+/// 形はレジストリ (`crate::acp::REGISTRY_URL`, 38 エージェント登録) の
+/// `distribution` に合わせてある。**ネットワーク取得は任意**で、この既定表
+/// だけでオフラインでも動く。
+///
+/// 出どころ (実測の起動コマンド):
+/// ```text
+/// claude-acp     npx @agentclientprotocol/claude-agent-acp@0.66.0
+/// codex-acp      npx @agentclientprotocol/codex-acp@1.1.14
+/// gemini         npx @google/gemini-cli@0.54.4 --acp
+/// github-copilot npx @github/copilot@1.0.78 --acp
+/// qwen-code      npx @qwen-code/qwen-code@0.21.8 --acp --experimental-skills
+/// cline          npx cline@3.0.52 --acp
+/// ```
+///
+/// 注意:
+/// - `@zed-industries/claude-code-acp` は **deprecated**。
+///   `@agentclientprotocol/claude-agent-acp` へ改名済み (codex-acp も同様)。
+/// - Gemini CLI のフラグは `--experimental-acp` ではなく **`--acp`**。
+/// - ローカルに実行ファイルがあればそちらを優先する (`local_bin`)。
+///   npx はパッケージ取得が要るぶん初回が遅い。
+pub const ACP_CATALOG: &[crate::acp::AcpEntry] = &[
+    crate::acp::AcpEntry {
+        id: "claude-acp",
+        label: "Claude Agent (ACP)",
+        icon: "👾",
+        // アダプタは npm 配布のみ (claude 本体は ACP を話さない)。
+        local_bin: "claude-agent-acp",
+        local_args: &[],
+        npx_package: "@agentclientprotocol/claude-agent-acp",
+        npx_version: "0.66.0",
+        npx_args: &[],
+        note: "走行中のターンへ割り込める (_session/steering)",
+    },
+    crate::acp::AcpEntry {
+        id: "codex-acp",
+        label: "Codex (ACP)",
+        icon: "💡",
+        local_bin: "codex-acp",
+        local_args: &[],
+        npx_package: "@agentclientprotocol/codex-acp",
+        npx_version: "1.1.14",
+        npx_args: &[],
+        note: "session/new の結果に非標準の models が付く",
+    },
+    crate::acp::AcpEntry {
+        id: "gemini",
+        label: "Gemini CLI (ACP)",
+        icon: "✨",
+        // 本体が --acp を持つので、入っていれば直接起動する。
+        local_bin: "gemini",
+        local_args: &["--acp"],
+        npx_package: "@google/gemini-cli",
+        npx_version: "0.54.4",
+        npx_args: &["--acp"],
+        note: "sessionCapabilities を広告しない (再開・一覧は非対応)",
+    },
+    crate::acp::AcpEntry {
+        id: "github-copilot",
+        label: "GitHub Copilot (ACP)",
+        icon: "🐙",
+        local_bin: "copilot",
+        local_args: &["--acp"],
+        npx_package: "@github/copilot",
+        npx_version: "1.0.78",
+        npx_args: &["--acp"],
+        note: "",
+    },
+    crate::acp::AcpEntry {
+        id: "qwen-code",
+        label: "Qwen Code (ACP)",
+        icon: "🐦",
+        local_bin: "qwen",
+        local_args: &["--acp"],
+        npx_package: "@qwen-code/qwen-code",
+        npx_version: "0.21.8",
+        npx_args: &["--acp", "--experimental-skills"],
+        note: "",
+    },
+    crate::acp::AcpEntry {
+        id: "cline",
+        label: "Cline (ACP)",
+        icon: "🧵",
+        local_bin: "cline",
+        local_args: &["--acp"],
+        npx_package: "cline",
+        npx_version: "3.0.52",
+        npx_args: &["--acp"],
+        note: "",
+    },
+];
+
 /// コマンド文字列(先頭トークン)からカタログ定義を引く。
 /// `codex exec` / `goose run` のようなサブコマンド形式でも先頭トークンだけで一致する。
 pub fn spec_for_command(command: &str) -> Option<&'static AgentSpec> {
