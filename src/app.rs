@@ -61,6 +61,7 @@ use crate::shellenv;
 use crate::skills;
 use crate::snippets::{self, Snippet};
 use crate::sound::{self, SoundKind};
+use crate::spec;
 use crate::submit;
 use crate::supervisor;
 use crate::tasks;
@@ -938,18 +939,22 @@ enum BottomView {
     Mcp,
     /// 🧩 Skills / slash command 管理
     Skills,
+    /// 📐 spec 駆動開発 (差分と陳腐化の見張り)
+    Spec,
 }
 
-/// 3 本のフラグから「今フレーム描くボトムパネルの中身」を 1 つ決める (純関数)。
+/// 4 本のフラグから「今フレーム描くボトムパネルの中身」を 1 つ決める (純関数)。
 ///
-/// 優先順は 承認 > MCP > Skills > 端末。複数立っていても返り値は必ず 1 つ。
-fn bottom_view(approvals: bool, mcp: bool, skills: bool) -> BottomView {
+/// 優先順は 承認 > MCP > Skills > Spec > 端末。複数立っていても返り値は必ず 1 つ。
+fn bottom_view(approvals: bool, mcp: bool, skills: bool, spec: bool) -> BottomView {
     if approvals {
         BottomView::Approvals
     } else if mcp {
         BottomView::Mcp
     } else if skills {
         BottomView::Skills
+    } else if spec {
+        BottomView::Spec
     } else {
         BottomView::Terminal
     }
@@ -3669,6 +3674,13 @@ pub struct ZaivernApp {
     /// (プラグインの木は数百ディレクトリで、毎フレーム歩く相手ではない)。
     skills: skills::SkillsPanel,
 
+    // ── spec 駆動開発パネル (crate::spec) ───────────────────────────
+    /// ボトムパネルを「📐 Spec」表示に切り替えているか。
+    spec_view: bool,
+    /// 仕様・差分・陳腐化の判定。走査は**このビューを出している間だけ**、
+    /// しかも**裏のスレッド**で行う (git を描画スレッドで待たない)。
+    spec: spec::SpecPanel,
+
     // ── 複数キャレット (crate::editor_ops::MultiSel) ────────────────
     /// `(バッファ ID, 選択集合)`。**タブごとに 1 つ**で、タブを切り替えると
     /// 捨てる (別のファイルのバイト位置を持ち越すと本文を壊すため)。
@@ -4172,6 +4184,8 @@ impl ZaivernApp {
             mcp: mcp::McpPanel::default(),
             skills_view: false,
             skills: skills::SkillsPanel::default(),
+            spec_view: false,
+            spec: spec::SpecPanel::default(),
             multi_sel: None,
             multi_sticky_col: None,
             column_anchor: None,
@@ -10980,6 +10994,18 @@ impl ZaivernApp {
 
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
+            // feature.rs のレジストリ経由。**ここが唯一のディスパッチ口**で、
+            // 機能が何個増えてもこのアームは 1 つのまま (並列開発の衝突対策。
+            // 経緯は feature.rs の冒頭)。未知の ID を黙って捨てると
+            // 「押したのに無反応」になるので、必ずユーザーへ知らせる。
+            Cmd::Feature(id) => {
+                if !crate::feature::dispatch(self, ctx, id) {
+                    self.toast_warn(trf(
+                        "機能 {id} は登録されていません",
+                        &[("id", id.to_string())],
+                    ));
+                }
+            }
             // 差分ビュー: 表示モードの切替と変更箇所のジャンプ。
             // ctx へ書くだけで、実際の反映は差分ビュー自身が同フレームで行う。
             Cmd::ToggleDiffView => {
@@ -16481,6 +16507,7 @@ impl ZaivernApp {
         let mut mcp_action = mcp::McpAction::None;
         // Skills パネルの要求 (開く / 送る / コピー / 再走査) も描画後に実行する。
         let mut skills_action = skills::SkillAction::None;
+        let mut spec_action = spec::SpecAction::None;
 
         let panel = egui::TopBottomPanel::bottom("zv-terminal")
             .resizable(true)
@@ -16597,6 +16624,7 @@ impl ZaivernApp {
                                     self.kanban = false;
                                     self.mcp_view = false;
                                     self.skills_view = false;
+                self.spec_view = false;
                                     self.term_focus_pending = true;
                                     self.agents.sessions[i].acknowledge();
                                 }
@@ -16635,6 +16663,7 @@ impl ZaivernApp {
                                 self.kanban = false;
                                 self.mcp_view = false;
                                 self.skills_view = false;
+                self.spec_view = false;
                             }
                         }
                         // MCP タブ: 全エージェント横断の MCP サーバ一覧。
@@ -16657,6 +16686,7 @@ impl ZaivernApp {
                                 self.kanban = false;
                                 self.approvals_view = false;
                                 self.skills_view = false;
+                self.spec_view = false;
                                 // 開いた回だけ読み直す (毎フレーム I/O にしない)
                                 self.mcp.invalidate();
                             }
@@ -16683,6 +16713,38 @@ impl ZaivernApp {
                                 self.mcp_view = false;
                                 // 開いた回だけ読み直す (毎フレーム I/O にしない)
                                 self.skills.invalidate();
+                            }
+                        }
+                        // Spec タブ: 仕様の差分と「陳腐化の疑い」。
+                        // 件数は **疑いがあるときだけ** 出す (常に 0 のバッジを作らない)。
+                        let sp_label = match self.spec.badge() {
+                            Some(n) => format!("{} {n}", tr("📐 Spec")),
+                            None => tr("📐 Spec"),
+                        };
+                        let sp_btn = ui.selectable_label(
+                            self.spec_view,
+                            RichText::new(sp_label).color(if self.spec.badge().is_some() {
+                                theme.warn
+                            } else {
+                                theme.text
+                            }),
+                        );
+                        if sp_btn
+                            .on_hover_text(tr(
+                                "spec 駆動開発 — 変更は差分 (ADDED / MODIFIED / REMOVED) で書き、\n\
+                                 統べているコードが動いたのに要件の文が動いていないものを\n\
+                                 「陳腐化の疑い」として出します (判定は裏のスレッド)",
+                            ))
+                            .clicked()
+                        {
+                            self.spec_view = !self.spec_view;
+                            if self.spec_view {
+                                self.kanban = false;
+                                self.approvals_view = false;
+                                self.mcp_view = false;
+                                self.skills_view = false;
+                                // 開いた回だけ取り直す (アイドル時に走らせない)
+                                self.spec.invalidate();
                             }
                         }
                         ui.menu_button("📜", |ui| {
@@ -16758,7 +16820,12 @@ impl ZaivernApp {
                 // 「🛡 承認」タブ表示中やセッションが 0 件の間に消してしまうと、
                 // タブ切替やエージェントを閉じた直後のフォーカス要求が握り潰され、
                 // どこにも入力が届かなくなる。
-                let view = bottom_view(self.approvals_view, self.mcp_view, self.skills_view);
+                let view = bottom_view(
+                    self.approvals_view,
+                    self.mcp_view,
+                    self.skills_view,
+                    self.spec_view,
+                );
                 if view == BottomView::Terminal && !self.agents.sessions.is_empty() {
                     self.term_focus_pending = false;
                 }
@@ -16788,6 +16855,10 @@ impl ZaivernApp {
                     BottomView::Skills => {
                         // 「🧩 Skills」タブ: 走査は描画の外 (この下) で行う。
                         skills_action = skills::ui(ui, &theme, &mut self.skills);
+                    }
+                    BottomView::Spec => {
+                        // 「📐 Spec」タブ: 走査は描画の外 (この下) で、しかも裏のスレッド。
+                        spec_action = spec::ui(ui, &theme, &mut self.spec);
                     }
                     BottomView::Terminal => {
                         if let Some(s) = self.agents.active_session() {
@@ -16837,6 +16908,13 @@ impl ZaivernApp {
         if self.skills_view && !self.skills.scanned {
             self.skills.entries = skills::scan(&self.roots);
             self.skills.scanned = true;
+        }
+        // spec パネルの実行 (描画後)。走査も**このビューを出している間だけ**で、
+        // 中身は裏のスレッドへ逃げる (`poll` は決して待たない)。
+        self.apply_spec_action(spec_action);
+        if self.spec_view {
+            let root = self.primary_root().to_path_buf();
+            self.spec.poll(&root);
         }
 
         if let Some(i) = launch {
@@ -16910,7 +16988,57 @@ impl ZaivernApp {
         self.kanban = false;
         self.mcp_view = false;
         self.skills_view = false;
+        self.spec_view = false;
         self.approvals_view = true;
+    }
+
+    // ─── spec 駆動開発 (パネルの外側の実行部) ──────────────────────
+
+    /// ボトムパネルを開いて「📐 Spec」ビューへ切り替える
+    /// (コマンドパレット / タブの共通の入口)。
+    /// spec パネルを開く。`pub(crate)` なのは [`crate::feature`] のレジストリ
+    /// から呼ぶため (機能側が `app.rs` を編集せずに済むようにする配線口)。
+    pub(crate) fn open_spec_panel(&mut self) {
+        self.agents.panel_open = true;
+        self.cockpit = false;
+        self.kanban = false;
+        self.approvals_view = false;
+        self.mcp_view = false;
+        self.skills_view = false;
+        self.spec_view = true;
+        // 開いた回だけ取り直す (アイドル時に走らせない)
+        self.spec.invalidate();
+    }
+
+    /// spec パネルを「陳腐化の疑いだけ」に絞って開く。
+    ///
+    /// フィールドを `pub(crate)` にして機能側から触らせるのではなく、
+    /// **操作をメソッドとして 1 つ出す**。内部表現を外へ漏らさずに済み、
+    /// レジストリ側のクロージャも 1 行で書ける。
+    pub(crate) fn open_spec_stale(&mut self) {
+        self.open_spec_panel();
+        self.spec.focus_stale();
+    }
+
+    /// spec パネルが積んだ要求を実行する。**描画の外でだけ呼ぶ** (I/O があるため)。
+    fn apply_spec_action(&mut self, action: spec::SpecAction) {
+        match action {
+            spec::SpecAction::None => {}
+            spec::SpecAction::Rescan => self.spec.invalidate(),
+            spec::SpecAction::Open(path) => self.open_path(&path),
+            spec::SpecAction::Hand(text) => self.send_to_agent(text),
+            spec::SpecAction::Write(req) => {
+                let root = self.primary_root().to_path_buf();
+                match spec::apply_write(req, &root) {
+                    Ok(msg) => {
+                        self.toast(msg, true);
+                        // 書いた結果を次の走査で必ず拾う
+                        self.spec.invalidate();
+                    }
+                    Err(e) => self.toast(e, false),
+                }
+            }
+        }
     }
 
     // ─── MCP サーバ管理 (パネルの外側の実行部) ─────────────────────
@@ -16923,6 +17051,7 @@ impl ZaivernApp {
         self.kanban = false;
         self.approvals_view = false;
         self.skills_view = false;
+        self.spec_view = false;
         self.mcp_view = true;
         // 開いた回だけ読み直す (アイドル時に I/O しない)
         self.mcp.invalidate();
@@ -16987,6 +17116,7 @@ impl ZaivernApp {
         self.kanban = false;
         self.approvals_view = false;
         self.mcp_view = false;
+        self.spec_view = false;
         self.skills_view = true;
         // 開いた回だけ読み直す (アイドル時に I/O しない)
         self.skills.invalidate();
@@ -24887,6 +25017,9 @@ impl ZaivernApp {
         for (icon, label, cmd) in panels::ide_palette_entries() {
             cmds.push((icon, label, String::new(), cmd));
         }
+        // feature.rs のレジストリに登録された機能。**ここが唯一の差し込み口**で、
+        // 機能が増えてもこの 1 ブロックは変わらない (並列開発の衝突対策)。
+        cmds.extend(crate::feature::palette_entries());
         // 実行中のセッション毎に音声入力エントリを出す (パレットで「音声」検索用)
         for s in self.agents.sessions.iter().take(20) {
             cmds.push((
@@ -29464,6 +29597,11 @@ impl ZaivernApp {
         self.conflict_radar_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
+        // feature.rs のレジストリに登録された機能のオーバーレイ。
+        // **ここが唯一の描画差し込み口**で、機能が増えてもこの 1 行は
+        // 変わらない (並列開発の衝突対策)。トーストより手前に置いて、
+        // 通知が機能のオーバーレイに隠れないようにしておく。
+        crate::feature::draw_all(self, ctx);
         self.toasts_ui(ctx);
 
         // デスクトップペット 🐾
@@ -29693,6 +29831,7 @@ impl ZaivernApp {
                 self.approvals_view = false;
                 self.mcp_view = false;
                 self.skills_view = false;
+                self.spec_view = false;
             }
             TA::ShowCockpit => {
                 self.cockpit = true;
@@ -29705,6 +29844,7 @@ impl ZaivernApp {
                 self.approvals_view = false;
                 self.mcp_view = false;
                 self.skills_view = false;
+                self.spec_view = false;
             }
             TA::ShowDeck => {
                 self.deck = true;
@@ -29714,6 +29854,7 @@ impl ZaivernApp {
                 self.approvals_view = false;
                 self.mcp_view = false;
                 self.skills_view = false;
+                self.spec_view = false;
             }
             TA::OpenPalette => self.palette.open_commands(),
             TA::OpenRaceForm => {
@@ -40259,31 +40400,44 @@ mod cockpit_layout_tests {
     /// 「🛡 承認」「🔌 MCP」「🧩 Skills」を独立した bool で持つ以上、描く直前に畳む。
     #[test]
     fn ボトムパネルのビューは常に一つだけ() {
-        // (承認, MCP, Skills) → 描くもの
+        // (承認, MCP, Skills, Spec) → 描くもの
         let table = [
-            (false, false, false, BottomView::Terminal),
-            (true, false, false, BottomView::Approvals),
-            (false, true, false, BottomView::Mcp),
-            (false, false, true, BottomView::Skills),
-            // 複数立っていても 1 つ (承認 > MCP > Skills)
-            (true, true, true, BottomView::Approvals),
-            (false, true, true, BottomView::Mcp),
+            (false, false, false, false, BottomView::Terminal),
+            (true, false, false, false, BottomView::Approvals),
+            (false, true, false, false, BottomView::Mcp),
+            (false, false, true, false, BottomView::Skills),
+            (false, false, false, true, BottomView::Spec),
+            // 複数立っていても 1 つ (承認 > MCP > Skills > Spec)
+            (true, true, true, true, BottomView::Approvals),
+            (false, true, true, true, BottomView::Mcp),
+            (false, false, true, true, BottomView::Skills),
         ];
-        for (a, m, s, want) in table {
-            assert_eq!(bottom_view(a, m, s), want, "承認={a} MCP={m} Skills={s}");
+        for (a, m, s, p, want) in table {
+            assert_eq!(
+                bottom_view(a, m, s, p),
+                want,
+                "承認={a} MCP={m} Skills={s} Spec={p}"
+            );
         }
-        // 全 8 通りで必ず 1 つの値になる (= 重ねようがない)
+        // 全 16 通りで必ず 1 つの値になる (= 重ねようがない)
         for a in [false, true] {
             for m in [false, true] {
                 for s in [false, true] {
-                    let v = bottom_view(a, m, s);
-                    let hits = [
-                        v == BottomView::Terminal,
-                        v == BottomView::Approvals,
-                        v == BottomView::Mcp,
-                        v == BottomView::Skills,
-                    ];
-                    assert_eq!(hits.iter().filter(|x| **x).count(), 1, "a={a} m={m} s={s}");
+                    for p in [false, true] {
+                        let v = bottom_view(a, m, s, p);
+                        let hits = [
+                            v == BottomView::Terminal,
+                            v == BottomView::Approvals,
+                            v == BottomView::Mcp,
+                            v == BottomView::Skills,
+                            v == BottomView::Spec,
+                        ];
+                        assert_eq!(
+                            hits.iter().filter(|x| **x).count(),
+                            1,
+                            "a={a} m={m} s={s} p={p}"
+                        );
+                    }
                 }
             }
         }
@@ -40295,9 +40449,8 @@ mod cockpit_layout_tests {
     fn ボトムパネルの分岐は畳んだ値を見る() {
         let src = &include_str!("app.rs").replace("\r\n", "\n");
         assert!(
-            src.contains(
-                "let view = bottom_view(self.approvals_view, self.mcp_view, self.skills_view);"
-            ),
+            src.contains("let view = bottom_view(")
+                && src.contains("self.spec_view,\n                );"),
             "描く直前に 1 つへ畳んでいない"
         );
         assert!(
@@ -40305,6 +40458,7 @@ mod cockpit_layout_tests {
                 && src.contains("BottomView::Approvals => {")
                 && src.contains("BottomView::Mcp => {")
                 && src.contains("BottomView::Skills => {")
+                && src.contains("BottomView::Spec => {")
                 && src.contains("BottomView::Terminal => {"),
             "ボトムパネルの分岐が match になっていない"
         );

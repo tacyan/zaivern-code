@@ -37,7 +37,29 @@ image=${ZAIVERN_LINUX_IMAGE:-rust:1.90-slim}
 
 # **ホストの target/ を汚さないのが要点。** 同じディレクトリを使うと Linux の
 # 成果物で macOS のビルドが無効化され、戻ったときにフルビルドが走る。
-target=${ZAIVERN_LINUX_TARGET:-/tmp/zaivern-linux-target}
+#
+# ただし以前は `CARGO_TARGET_DIR` をコンテナ内の `/tmp` に置いていたため、
+# `--rm` で毎回捨てられて **全実行がコールドビルド**になっていた。隔離
+# ワークツリーで 6 本を同時に走らせたところ、6 つのフルビルドがメモリを
+# 食い尽くして **OOM kill (signal: 9)** でコンパイル途中に落ちた (実測)。
+#
+# そこで **docker の名前付きボリュームをワークツリーごとに 1 つ**持たせる:
+#   * ボリュームは Docker VM 側の FS なので、macOS のバインドマウントと違い
+#     cargo が遅くならない
+#   * `--rm` を跨いで残るので 2 回目以降が warm になる
+#   * 名前にワークツリー由来のスラッグを混ぜるので、**同時に走る別の
+#     ワークツリーと絶対に取り合わない** (cargo のビルドロックは
+#     target ディレクトリ単位なので、共有すると直列化する)
+# ホスト側の実体を触らせないため、パスではなくボリューム名で分ける。
+if [ -n "${ZAIVERN_LINUX_TARGET:-}" ]; then
+    # 明示指定があればホストのパスをそのまま使う (従来どおりの逃げ道)
+    target_mount="$ZAIVERN_LINUX_TARGET"
+    mkdir -p "$target_mount"
+else
+    # ルートの絶対パスから安定したスラッグを作る (パスの直書きをしない)
+    slug=$(printf '%s' "$root" | cksum | cut -d' ' -f1)
+    target_mount="zaivern-lx-$(basename "$root")-$slug"
+fi
 
 if ! docker info >/dev/null 2>&1; then
     echo "docker が動いていません。Docker Desktop を起動してください。" >&2
@@ -52,8 +74,10 @@ else
 fi
 
 echo "== Linux ($image) で実行: $cmd"
+echo "   target: $target_mount (ワークツリーごとに分離。2 回目以降は warm)"
 exec docker run --rm \
     -v "$root":/w -w /w \
-    -e CARGO_TARGET_DIR="$target" \
+    -v "$target_mount":/target \
+    -e CARGO_TARGET_DIR=/target \
     "$image" \
     sh -c "$cmd"
