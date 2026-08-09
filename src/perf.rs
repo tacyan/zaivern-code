@@ -298,10 +298,23 @@ pub fn frame_end(started: Option<Instant>) {
     let Some(t0) = started else { return };
     let us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
     let idle = IDLE_FLAG.swap(false, Ordering::Relaxed);
+    // このフレームぶんの要求を取り出す。アイドルでなければ捨てる
+    // (入力に応じた再描画は正常なので、分布に混ぜると本命が埋もれる)。
+    let pending = frame_repaints()
+        .lock()
+        .map(|mut f| std::mem::take(&mut *f))
+        .unwrap_or_default();
     if let Ok(mut s) = state().lock() {
         s.frames.record(us);
         if idle {
             s.idle_frames += 1;
+            for (tag, n) in pending {
+                if s.repaints.len() >= REPAINT_TAGS_CAP && !s.repaints.contains_key(tag) {
+                    *s.repaints.entry("other").or_insert(0) += n;
+                } else {
+                    *s.repaints.entry(tag).or_insert(0) += n;
+                }
+            }
         }
     }
 }
@@ -316,16 +329,27 @@ pub fn frame_end(started: Option<Instant>) {
 /// 無効時は `enabled()` の読み出し 1 回で戻る。
 #[inline]
 pub fn note_repaint(tag: &'static str) {
-    if !enabled() || !IDLE_FLAG.load(Ordering::Relaxed) {
+    if !enabled() {
         return;
     }
-    if let Ok(mut s) = state().lock() {
-        if s.repaints.len() >= REPAINT_TAGS_CAP && !s.repaints.contains_key(tag) {
-            *s.repaints.entry("other").or_insert(0) += 1;
+    // **要求の時点では「アイドルか」がまだ確定していない。**
+    // `note_idle` はフレームの後半で呼ばれるので、ここで旗を見ると
+    // それより前に来た要求 (= ほとんど全部) を数え損ねる
+    // (実際に内訳が 0 行のまま出てきた)。いったん貯めて、
+    // フレームの終わり (`frame_end`) にアイドルと判れば本体へ足す。
+    if let Ok(mut f) = frame_repaints().lock() {
+        if f.len() >= REPAINT_TAGS_CAP && !f.contains_key(tag) {
+            *f.entry("other").or_insert(0) += 1;
             return;
         }
-        *s.repaints.entry(tag).or_insert(0) += 1;
+        *f.entry(tag).or_insert(0) += 1;
     }
+}
+
+/// このフレーム中に来た再描画要求 (アイドルと確定してから本体へ移す)。
+fn frame_repaints() -> &'static Mutex<std::collections::BTreeMap<&'static str, u64>> {
+    static F: OnceLock<Mutex<std::collections::BTreeMap<&'static str, u64>>> = OnceLock::new();
+    F.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
 }
 
 /// 再描画を要求しつつ、出所を記録する。**アプリ側はこれを通すこと。**
