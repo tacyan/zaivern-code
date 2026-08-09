@@ -111,8 +111,40 @@ pub struct Git {
     pending: Option<Receiver<Option<StatusSnapshot>>>,
     /// 相対パス → (text_hash, 行マーク) のキャッシュ。
     marks_cache: HashMap<String, MarksEntry>,
+    /// 取り直し中のマーク (相対パス → 要求時の text_hash と受け口)。
+    /// **UI スレッドで git diff を待たない**ためにある。
+    marks_pending: HashMap<String, (u64, Receiver<Vec<(usize, LineMark)>>)>,
     /// ブランチ名の TTL キャッシュ (値, 取得時刻)。
     branch_cache: Option<(Option<String>, Instant)>,
+    /// 実行中のブランチ名スキャン。**UI スレッドで git を待たない**ための受け口。
+    branch_pending: Option<Receiver<Option<String>>>,
+    /// 直近のブランチ名スキャンの所要時間。次の間隔を決めるのに使う。
+    branch_cost: Option<Duration>,
+    /// ブランチ名スキャンを始めた時刻 (所要時間の計測用)。
+    branch_started: Option<Instant>,
+    /// 直近の status スキャンの所要時間。次の間隔を決めるのに使う。
+    status_cost: Option<Duration>,
+    /// status スキャンを始めた時刻。
+    status_started: Option<Instant>,
+}
+
+/// 次のスキャンまでの間隔 (純関数)。
+///
+/// **速いリポジトリでは今までどおり、遅いリポジトリでは自動で下がる。**
+/// git は作業ツリーが大きいほど遅くなる (実測: `target/` が 40GB のツリーで
+/// `git status` に 2.3〜10.2 秒)。固定 TTL のまま回し続けると、
+/// スキャンが終わった直後にまた次が始まり、**git が常時走っている**状態になる。
+/// そうなると他の git (UI が出すものも含む) が index を取り合って
+/// 数秒待たされ、アプリ全体が遅くなる。
+///
+/// 直近の所要時間の `MULTIPLE` 倍を空ける (= git の稼働率を 1/(1+MULTIPLE) 以下に
+/// 抑える)。上限を置くのは、一時的に遅かっただけのときに何分も更新が
+/// 止まらないようにするため。
+pub fn scan_interval(base: Duration, last_cost: Option<Duration>) -> Duration {
+    const MULTIPLE: u32 = 4;
+    const CEILING: Duration = Duration::from_secs(60);
+    let Some(cost) = last_cost else { return base };
+    (cost * MULTIPLE).clamp(base, CEILING)
 }
 
 impl Git {
@@ -125,7 +157,13 @@ impl Git {
             last_refresh: None,
             pending: None,
             marks_cache: HashMap::new(),
+            marks_pending: HashMap::new(),
             branch_cache: None,
+            branch_pending: None,
+            branch_cost: None,
+            branch_started: None,
+            status_cost: None,
+            status_started: None,
         }
     }
 
@@ -136,42 +174,86 @@ impl Git {
             self.dir_cache.clear();
             self.deleted_cache.clear();
             self.marks_cache.clear();
+            self.marks_pending.clear();
             self.last_refresh = None;
             self.pending = None;
             self.branch_cache = None;
+            self.branch_pending = None;
+            self.branch_cost = None;
+            self.branch_started = None;
+            self.status_cost = None;
+            self.status_started = None;
         }
     }
 
     /// 現在のブランチ名 (3 秒 TTL キャッシュ)。detached HEAD なら短縮 SHA。
     ///
-    /// `.git/HEAD` の直接パースではなく `git rev-parse` を使うため、
-    /// worktree / submodule / `.git` がファイルのケースでも正しく動く。
+    /// **git は絶対に UI スレッドで待たない。** status
+    /// ([`Self::refresh`]) と同じくバックグラウンドスレッド + チャネルで受け、
+    /// 呼び出し側へは**いま手元にある値をそのまま返す** (古くてもよい)。
+    ///
+    /// ここを同期実行にしていたのが、巨大な作業ツリーで
+    /// **1 フレーム 6 秒の停止**を起こしていた原因である。`git branch
+    /// --show-current` は HEAD を読むだけに見えるが、裏で走っている
+    /// `git status` と index を取り合うため、リポジトリが大きいと
+    /// 数秒返ってこない (実測: 3.9〜6.0 秒 / target 40GB のツリー)。
+    /// 3 秒 TTL なので、**3 秒ごとに数秒固まる**状態になっていた。
+    ///
+    /// `.git/HEAD` の直接パースではなく git に聞くのは変えない
+    /// (worktree / submodule / `.git` がファイルのケースで正しく動くため)。
     pub fn branch(&mut self) -> Option<String> {
-        if let Some((v, at)) = &self.branch_cache {
-            if at.elapsed() < BRANCH_CACHE_TTL {
-                return v.clone();
+        // 1) 終わっていれば取り込む。**待たない** (try_recv)
+        if let Some(rx) = &self.branch_pending {
+            match rx.try_recv() {
+                Ok(v) => {
+                    self.branch_cache = Some((v, Instant::now()));
+                    self.branch_pending = None;
+                    self.branch_cost = self.branch_started.take().map(|t| t.elapsed());
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.branch_pending = None,
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        // `branch --show-current` は「まだ 1 コミットも無い (unborn HEAD)」でも
-        // ブランチ名を返す。detached HEAD のときだけ空になるので、
-        // その場合は短縮 SHA へフォールバックする。
-        let name = self
-            .run_git(&["branch", "--show-current"])
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                self.run_git(&["rev-parse", "--short", "HEAD"])
-                    .map(|h| h.trim().to_string())
-                    .filter(|h| !h.is_empty())
-            });
-        self.branch_cache = Some((name.clone(), Instant::now()));
-        name
+        // 2) TTL 切れなら裏で取り直す (走っている間は二重に起こさない)
+        let wait = scan_interval(BRANCH_CACHE_TTL, self.branch_cost);
+        let stale = self
+            .branch_cache
+            .as_ref()
+            .is_none_or(|(_, at)| at.elapsed() >= wait);
+        if stale && self.branch_pending.is_none() {
+            let ws = self.workspace.clone();
+            let (tx, rx) = mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("zv-git-branch".into())
+                .spawn(move || {
+                    let _ = tx.send(scan_branch(&ws));
+                });
+            if spawned.is_ok() {
+                self.branch_pending = Some(rx);
+                self.branch_started = Some(Instant::now());
+            } else {
+                // スレッドを起こせない環境。**同期実行へは落とさない**
+                // (落とすと元の固まる挙動が復活する)。次のフレームで再挑戦する。
+                self.branch_cache = Some((None, Instant::now()));
+            }
+        }
+        // 3) いま手元にある値。まだ 1 度も取れていなければ None
+        //    (ブランチ名が一瞬出ないのは、数秒固まるより遥かに良い)
+        self.branch_cache.as_ref().and_then(|(v, _)| v.clone())
     }
 
     /// ブランチ名の TTL キャッシュを捨てる (checkout 直後など、
-    /// 次の描画で必ず新しい名前を出したいとき)。
+    /// 次の描画で必ず新しい名前を取りに行かせたいとき)。
+    ///
+    /// 取りに行くのは裏のスレッドなので、**この呼び出し自体は即座に返る**。
     pub fn invalidate_branch(&mut self) {
         self.branch_cache = None;
+    }
+
+    /// ブランチ名スキャンが走っているか (テストと診断用)。
+    #[cfg(test)]
+    pub fn branch_scanning(&self) -> bool {
+        self.branch_pending.is_some()
     }
 
     /// 2 秒 TTL で status スキャンを回す (呼び出しは毎フレームでも安全)。
@@ -189,6 +271,7 @@ impl Git {
                 Ok(snap) => {
                     self.apply_scan(snap);
                     self.pending = None;
+                    self.status_cost = self.status_started.take().map(|t| t.elapsed());
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.pending = None,
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -199,8 +282,9 @@ impl Git {
             return;
         }
         if !force {
+            let wait = scan_interval(STATUS_CACHE_TTL, self.status_cost);
             if let Some(t) = self.last_refresh {
-                if t.elapsed() < STATUS_CACHE_TTL {
+                if t.elapsed() < wait {
                     return;
                 }
             }
@@ -216,6 +300,7 @@ impl Git {
             });
         if spawned.is_ok() {
             self.pending = Some(rx);
+            self.status_started = Some(Instant::now());
         }
     }
 
@@ -279,42 +364,70 @@ impl Git {
         self.status_cache.len()
     }
 
-    /// 指定ファイルの 0-based 行番号 → LineMark。
-    /// `text_hash` が前回と同一ならキャッシュを返し、git は再実行しない。
+    /// 指定ファイルの 0-based 行番号 → LineMark (ガターの差分マーク)。
+    ///
+    /// **git は UI スレッドで待たない。** いま手元にあるマークをそのまま返し、
+    /// 古ければ裏のスレッドで取り直す。ガターの色が 1 テンポ遅れて更新される
+    /// のは許容できるが、**1 フレーム数秒の停止は許容できない**。
+    ///
+    /// 同期実行だったころは `git diff` の起動がそのままフレームに乗っていた。
+    /// 単独なら数十 ms で終わるが、このアプリは status スキャンと衝突スキャンも
+    /// 同じリポジトリへ同時に撃つため、index を取り合って**数秒返ってこない**
+    /// ことがある (実測: 同時実行下で `git status` が 2.3〜10.2 秒)。
+    ///
     /// 戻りは Arc 共有: キャッシュヒット時は参照カウント増加のみで Vec は複製しない。
     pub fn line_marks(&mut self, rel_path: &str, text_hash: u64) -> Arc<Vec<(usize, LineMark)>> {
-        if let Some((hash, at, marks)) = self.marks_cache.get(rel_path) {
+        // 1) 終わっている取り直しを回収する (待たない)
+        self.collect_marks();
+        let cached = self.marks_cache.get(rel_path);
+        let fresh = cached.is_some_and(|(hash, at, _)| {
             // タイプ中はデバウンス: ハッシュが変わっていても直近に取った
-            // マークをそのまま返し、git diff の同期起動を 400ms に 1 回へ
-            // 抑える (キーストロークごとのプロセス起動はヒッチになる)。
-            if *hash == text_hash || at.elapsed() < MARKS_DEBOUNCE {
-                return Arc::clone(marks);
+            // マークをそのまま使い、git diff の起動を 400ms に 1 回へ抑える。
+            *hash == text_hash || at.elapsed() < MARKS_DEBOUNCE
+        });
+        if !fresh && !self.marks_pending.contains_key(rel_path) {
+            let ws = self.workspace.clone();
+            let rel = rel_path.to_string();
+            let (tx, rx) = mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("zv-git-marks".into())
+                .spawn(move || {
+                    let _ = tx.send(scan_marks(&ws, &rel));
+                });
+            if spawned.is_ok() {
+                self.marks_pending
+                    .insert(rel_path.to_string(), (text_hash, rx));
             }
+            // スレッドを起こせなくても**同期実行へは落とさない**。
+            // 落とすと「たまに数秒固まる」が復活する。次の描画で再挑戦する。
         }
-        let marks = Arc::new(
-            self.run_git(&["diff", "--unified=0", "--", rel_path])
-                .map(|out| parse_hunk_marks(&out))
-                .unwrap_or_default(),
-        );
-        self.marks_cache.insert(
-            rel_path.to_string(),
-            (text_hash, Instant::now(), Arc::clone(&marks)),
-        );
-        marks
+        match self.marks_cache.get(rel_path) {
+            Some((_, _, marks)) => Arc::clone(marks),
+            // まだ 1 度も取れていない = マーク無しで描く (ガターが一瞬素になる)
+            None => Arc::new(Vec::new()),
+        }
     }
 
-    /// `git -C <workspace> <args>` を実行。git 不在・非 repo・失敗時は None。
-    fn run_git(&self, args: &[&str]) -> Option<String> {
-        let out = crate::procx::hidden_command("git")
-            .arg("-C")
-            .arg(&self.workspace)
-            .args(args)
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
+    /// 終わったマーク取得を取り込む (**待たない**)。
+    fn collect_marks(&mut self) {
+        if self.marks_pending.is_empty() {
+            return;
         }
-        String::from_utf8(out.stdout).ok()
+        let mut done: Vec<String> = Vec::new();
+        for (rel, (hash, rx)) in self.marks_pending.iter() {
+            match rx.try_recv() {
+                Ok(marks) => {
+                    self.marks_cache
+                        .insert(rel.clone(), (*hash, Instant::now(), Arc::new(marks)));
+                    done.push(rel.clone());
+                }
+                Err(mpsc::TryRecvError::Disconnected) => done.push(rel.clone()),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        for rel in done {
+            self.marks_pending.remove(&rel);
+        }
     }
 }
 
@@ -644,6 +757,49 @@ fn derive_deleted_by_dir(files: &HashMap<String, FileStatus>) -> HashMap<String,
 /// `git -C <ws> status --porcelain=v1 -z` を実行し、スナップショットを組み立てる。
 /// バックグラウンドスレッドから呼ばれる (UI スレッドでは呼ばない)。
 /// git 不在・非 repo・失敗時は None。
+/// 1 ファイルぶんのガターマークを取る (**バックグラウンドスレッド専用**)。
+fn scan_marks(workspace: &Path, rel_path: &str) -> Vec<(usize, LineMark)> {
+    let out = crate::procx::hidden_command("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["diff", "--unified=0", "--", rel_path])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8(o.stdout)
+            .map(|s| parse_hunk_marks(&s))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// ブランチ名を 1 回取る (**バックグラウンドスレッド専用**)。
+///
+/// `branch --show-current` は「まだ 1 コミットも無い (unborn HEAD)」でも
+/// ブランチ名を返す。detached HEAD のときだけ空になるので、その場合だけ
+/// 短縮 SHA へフォールバックする (= 通常は git を 1 回しか起こさない)。
+fn scan_branch(workspace: &Path) -> Option<String> {
+    let run = |args: &[&str]| -> Option<String> {
+        let out = crate::procx::hidden_command("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(args)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()
+    };
+    run(&["branch", "--show-current"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            run(&["rev-parse", "--short", "HEAD"])
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+}
+
 fn scan_status(workspace: &Path) -> Option<StatusSnapshot> {
     let out = crate::procx::hidden_command("git")
         .arg("-C")
@@ -2120,10 +2276,97 @@ index 1234567..89abcde 100644
         assert_eq!(crate::pathx::canonical(&top), canon_repo);
         assert_eq!(rel, "crates/inner/lib.rs", "repo 相対パスになる");
 
-        // ブランチ名は rev-parse 経由で取れる(worktree/submodule 対応)
-        assert!(set.branch().is_some(), "初期化直後でもブランチ名が取れる");
+        // ブランチ名は rev-parse 経由で取れる(worktree/submodule 対応)。
+        // **1 回目は None で構わない** — git は裏のスレッドで走らせ、
+        // UI スレッドは待たないため (同期実行に戻すと巨大な作業ツリーで
+        // 1 フレーム数秒の停止が復活する)。
+        assert!(
+            branch_eventually(&mut set).is_some(),
+            "少し待てばブランチ名が取れる"
+        );
 
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// ブランチ名は裏のスレッドが取るので、**取れるまで少しだけ待つ**。
+    /// 待ち上限は CI の遅いランナーでも足りる長さにし、超えたら None を返す
+    /// (テストが固まるのではなく落ちるように)。
+    fn branch_eventually(set: &mut GitSet) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(b) = set.branch() {
+                return Some(b);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// **UI スレッドで git を待たない**という約束の番人。
+    ///
+    /// `Git::branch` が同期実行 (`self.run_git`) へ戻ると、巨大な作業ツリーで
+    /// 3 秒ごとに数秒フレームが止まる (実測: `git branch --show-current` が
+    /// 3.9〜6.0 秒、フレーム最大 5.5 秒)。ここが崩れたら必ず気付けるようにする。
+    #[test]
+    fn UIスレッドから同期でgitを撃つ経路が残っていない() {
+        // `Git` は描画のたびに呼ばれる。ここで git の完了を待つと、
+        // そのままフレームが止まる (実測: 同時実行下で 3.9〜6.0 秒)。
+        let src = include_str!("git.rs").replace("\r\n", "\n");
+        for (name, sig) in [
+            ("Git::branch", "pub fn branch(&mut self) -> Option<String> {"),
+            (
+                "Git::line_marks",
+                "pub fn line_marks(&mut self, rel_path: &str, text_hash: u64) -> Arc<Vec<(usize, LineMark)>> {",
+            ),
+        ] {
+            let body = src
+                .split(sig)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} が見つからない"));
+            let body = body.split("\n    }\n").next().expect("本体の終端");
+            assert!(
+                !body.contains(".output()"),
+                "{name} が同期 git を撃っている (UI スレッドが数秒止まる)"
+            );
+            assert!(
+                body.contains("std::thread::Builder::new()"),
+                "{name} が git を裏のスレッドへ逃がしていない"
+            );
+        }
+        // 同期実行そのものが `Git` から消えたこと (経路を 1 本も残さない)。
+        // 探す文字列をそのまま書くと**このテスト自身に当たる**ので分割する。
+        let needle = concat!("fn run_git", "(&self");
+        assert!(
+            !src.contains(needle),
+            "Git::run_git (同期実行) が残っている"
+        );
+    }
+
+    /// 遅いリポジトリではスキャン間隔が自動で伸びる (git を常時走らせない)。
+    #[test]
+    fn スキャン間隔は直近の所要時間に応じて伸びる() {
+        let base = Duration::from_secs(2);
+        // 実測が無いうちは今までどおり
+        assert_eq!(scan_interval(base, None), base);
+        // 速いリポジトリでは base を下回らない
+        assert_eq!(scan_interval(base, Some(Duration::from_millis(10))), base);
+        // 遅いリポジトリでは 4 倍空ける (git の稼働率を 1/5 以下へ)
+        assert_eq!(
+            scan_interval(base, Some(Duration::from_secs(6))),
+            Duration::from_secs(24)
+        );
+        // 一時的に極端に遅くても上限で止める (更新が何分も止まらない)
+        assert_eq!(
+            scan_interval(base, Some(Duration::from_secs(600))),
+            Duration::from_secs(60)
+        );
+        // 境界: ちょうど上限
+        assert_eq!(
+            scan_interval(base, Some(Duration::from_secs(15))),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
