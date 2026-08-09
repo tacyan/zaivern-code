@@ -13,6 +13,16 @@ path = "src/main.rs"
 eframe = "0.29"
 egui = "0.29"
 syntect = "5.2"
+# bat が使っている**拡張シンタックス／テーマセット**を syntect 向けに配布する crate。
+# syntect 同梱の既定セットは 75 構文しか無く、TypeScript / TSX / Vue / Svelte /
+# Kotlin / Zig / TOML / GraphQL / Terraform / Dart / Elixir / Nix / Solidity /
+# Dockerfile などが**丸ごと欠けている** (実測: 既定 75 → 拡張 220 構文)。
+#   * ライセンス MIT OR Apache-2.0 (本体 Apache-2.0 と両立)
+#   * 純 Rust。構文定義は `include_bytes!` された syntect のダンプなので、
+#     実行時にファイルを探しに行かない = どの OS / どのインストール先でも動く
+#   * syntect ^5.3 を要求し、こちらのロックは 5.3.0。バージョン衝突は起きない
+#   * 既定 feature は `syntect-onig` のみで、既に有効な syntect の onig と同じ
+two-face = "0.5"
 portable-pty = "0.8"
 vt100 = "0.15"
 serde = { version = "1", features = ["derive"] }
