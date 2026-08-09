@@ -21,6 +21,10 @@ pub enum Cmd {
     RemoveFolder(PathBuf),
     ToggleTerminal,
     ToggleCockpit,
+    /// チェックポイント一覧 (巻き戻し)。
+    CheckpointList,
+    /// 今の作業ツリーをチェックポイントとして記録する。
+    CheckpointNow,
     /// フリート看板 (全エージェントを状態列で俯瞰・指揮するカンバン画面) 切替
     ToggleKanban,
     /// エージェントデッキ (稼働中 / ローカルのセッション / 新規 を縦 1 本で管理する画面) 切替
@@ -848,6 +852,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenRace
         | Cmd::EvalRace
         | Cmd::ToggleCockpit
+        | Cmd::CheckpointList
+        | Cmd::CheckpointNow
         | Cmd::ToggleKanban
         | Cmd::ToggleDeck
         | Cmd::SetApproval(_)

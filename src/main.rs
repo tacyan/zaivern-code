@@ -5,6 +5,7 @@ mod agent_picker;
 mod agents;
 mod app;
 mod breadcrumb;
+mod checkpoint;
 mod cli;
 mod commander;
 mod config;
