@@ -30,6 +30,23 @@
 ## テストと検証
 
 - 検証は**ローカル優先**。CI は最小構成 + `Swatinem/rust-cache` 必須。
+- **Linux 側は毎回 `tools/linux-test.sh` で確認する。** macOS だけで開発していると
+  **Linux / Windows でしか出ない不具合が素通りする**。実際に 43,000 行の変更が
+  macOS では全部緑なのに CI の Linux / Windows で落ちた
+  (`keybinds::canonical_mods` が非 macOS で ⌃ を ⌘ へ畳むため、
+   `⌃⌘F` と `⌘F` が同じ打鍵になり片方が永久に効かなくなっていた)。
+  CI 往復は 1 周 5〜6 分かかるうえ切り分けに要る情報が出てこないが、
+  Docker なら **1 周 30 秒**で回せる。
+  - `tools/linux-test.sh` / `tools/linux-test.sh keybinds::` / `tools/linux-test.sh --check`
+  - **ホストの `target/` を汚さないこと** (同じディレクトリを使うと Linux の成果物で
+    macOS のビルドが無効化され、戻るたびにフルビルドが走る)。スクリプトは
+    `CARGO_TARGET_DIR` を分けている
+  - **Docker でだけ落ちるものは追わない**: `app::glyph_tests::*` (フォント無し) /
+    `cli::tests::instance_current_uses_own_pid` (PID 名前空間) /
+    `terminal::reap_pty_tests::*` (コンテナ内 PTY)。CI の ubuntu では通る
+- **OS で分岐する既定値は、テストも OS 条件を明示する。** `#[cfg(target_os = "macos")]` か
+  `cfg!(...)` を期待値に入れる。macOS の予約表と突き合わせるテストを非 mac で走らせると、
+  「その OS では使わない打鍵」を咎めるだけになる。
 - `terminal::` は実 PTY テスト。1 つの `cargo test` プロセス内で走らせると子プロセスツリーが蓄積し **Linux ランナーを殺す**ため、CI は cargo-nextest（テスト毎プロセス + `pty` test-group で直列化 + slow-timeout のプロセスグループ kill）で実行する。設定は `.config/nextest.toml`。
 - ローカル実行例: `cargo nextest run --profile ci`（全量）/ `cargo test session::`（モジュール別）。
 - テストは `crate::test_util::unique_temp_dir` を使い、実 `~/.zaivern` に触れない。
