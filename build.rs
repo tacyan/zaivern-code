@@ -1,4 +1,13 @@
-//! ビルドスクリプト — いまのところ **Windows の版情報リソース埋め込み専用**。
+//! ビルドスクリプト — **機能レジストリの生成**と **Windows の版情報リソース埋め込み**。
+//!
+//! ## 機能レジストリの生成
+//!
+//! `src/features/*.rs` を走査して `mod` 宣言と一覧を `OUT_DIR` へ生成する。
+//! これにより**機能の追加が「新規ファイルを 1 つ作る」だけ**になり、共有
+//! ファイルへの追記が消えるので、並列ブランチが構造的に衝突しなくなる。
+//! 詳しくは [`generate_feature_registry`] と `src/features/mod.rs` を参照。
+//!
+//! ## Windows の版情報リソース
 //!
 //! Windows のタスクマネージャーは実行ファイル名 (`zai.exe`) の隣に
 //! VERSIONINFO リソースの `FileDescription` を「説明」列として出す。
@@ -17,8 +26,98 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/Zaivern.ico");
+    generate_feature_registry();
     #[cfg(windows)]
     embed_windows_version_info();
+}
+
+/// `src/features/*.rs` を走査して、`mod` 宣言とレジストリ配列を生成する。
+///
+/// ## なぜコード生成なのか (実測の動機)
+///
+/// 機能を 1 つ足すのに、以前は `app.rs` と `palette.rs` の **5 箇所**を
+/// 編集する必要があった。`src/feature.rs` のレジストリでそれを
+/// 「共有リストへ 1 行追記」まで減らしたが、**追記が残る限り衝突は消えない**。
+/// 実際に which-key と local_history が `config.rs` の同じ設定リストへ
+/// 追記して 3 ハンクで衝突した。
+///
+/// **git が衝突を作るのは「2 つのブランチが同じファイルの近い行を触った」時
+/// だけ**なので、共有ファイルを 1 バイトも触らせなければ衝突は構造的に
+/// 起こり得ない。機能の追加を「`src/features/<名前>.rs` を新規作成する」
+/// だけにするのがこの関数の目的。
+///
+/// 生成物は `OUT_DIR` に置き、`src/features/mod.rs` が `include!` する。
+/// リポジトリへコミットしないので、生成物自体が衝突することもない。
+fn generate_feature_registry() {
+    // ディレクトリごと監視する。ファイルが増減したら再生成が要る。
+    println!("cargo:rerun-if-changed=src/features");
+
+    let dir = std::path::Path::new("src/features");
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // mod.rs は入れ物なので登録対象ではない
+            if stem == "mod" {
+                continue;
+            }
+            // 生成コードに入るので、識別子として妥当なものだけ通す。
+            // (ここで弾かないと生成物がコンパイルエラーになり、原因が
+            //  分かりにくい場所で失敗する)
+            let ok = !stem.is_empty()
+                && stem
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && stem.starts_with(|c: char| c.is_ascii_lowercase());
+            if !ok {
+                println!(
+                    "cargo:warning=src/features/{stem}.rs は識別子として使えない名前なので登録しません (小文字・数字・_ のみ、先頭は小文字)"
+                );
+                continue;
+            }
+            // 個々のファイルも監視対象にしておく (中身だけ変えた時の取りこぼし防止)
+            println!("cargo:rerun-if-changed=src/features/{stem}.rs");
+            names.push(stem.to_string());
+        }
+    }
+    // **並びを固定する。** read_dir の順序は OS とファイルシステムで変わるので、
+    // 揃えないと生成物が環境ごとに変わり、パレットの並びも変わってしまう。
+    names.sort();
+
+    // `include!` された側の `mod x;` は **インクルード先 (OUT_DIR) を基準に**
+    // ファイルを探すため、そのままでは `src/features/x.rs` を見つけられない
+    // (実際に E0583 file not found for module で落ちた)。`#[path]` で実体を
+    // 明示する。パスは `CARGO_MANIFEST_DIR` から導出するので直書きではない。
+    // Windows のバックスラッシュは `#[path]` の文字列リテラルでエスケープが
+    // 要るため、`/` へ寄せる (Windows も `/` を受け付ける)。
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let manifest = manifest.replace('\\', "/");
+
+    let mut out =
+        String::from("// build.rs が生成したファイル。手で編集しない (次のビルドで消える)。\n");
+    for n in &names {
+        out.push_str(&format!(
+            "#[path = \"{manifest}/src/features/{n}.rs\"]\npub mod {n};\n"
+        ));
+    }
+    out.push_str("\n/// build.rs が `src/features/*.rs` から集めた登録一覧。\npub const GENERATED: &[&crate::feature::Feature] = &[\n");
+    for n in &names {
+        out.push_str(&format!("    &{n}::FEATURE,\n"));
+    }
+    out.push_str("];\n");
+
+    let dest = std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR"))
+        .join("features_generated.rs");
+    // 中身が同じなら書かない (mtime を動かすと下流が無駄に再ビルドされる)
+    if std::fs::read_to_string(&dest).ok().as_deref() != Some(out.as_str()) {
+        std::fs::write(&dest, out).expect("features_generated.rs を書けない");
+    }
 }
 
 /// 埋め込む文字列フィールド。タスクマネージャー / エクスプローラーの

@@ -96,7 +96,7 @@ pub struct Feature {
 /// **ここへ行を足してよいのは統合担当だけ。** 機能ブランチ側でこの配列を
 /// 編集すると、まさに避けたかった衝突が戻ってくる (モジュール本体だけを
 /// 書いて、統合時に 1 行足してもらうこと)。
-pub const REGISTRY: &[&Feature] = &[&crate::spec::FEATURE];
+pub const REGISTRY: &[&Feature] = crate::features::GENERATED;
 
 /// パレットのコマンド一覧へ差し込む行。
 ///
