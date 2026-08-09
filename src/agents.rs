@@ -1800,10 +1800,7 @@ impl AgentManager {
         // しか読めず、それ以外のエージェントは一覧にすら出なかった。
         // 起動は全部この関数を通るので、ここ 1 箇所で記録すれば漏れない。
         // 失敗しても起動は続ける (履歴が書けないことで作業を止めない)。
-        let s = self
-            .sessions
-            .last()
-            .expect("push した直後なので必ずある");
+        let s = self.sessions.last().expect("push した直後なので必ずある");
         let _ = crate::history::append(&crate::history::Entry {
             id: s.id,
             agent_bin: spec_for_command(&s.command)

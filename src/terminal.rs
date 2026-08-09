@@ -1116,7 +1116,7 @@ pub struct TypedLine {
 /// - `\x03` (Ctrl+C) / `\x15` (Ctrl+U) … 行を捨てる
 /// - `ESC` から始まる列 … カーソル移動などなので**その行ごと捨てる**
 ///   (途中に矢印キーが入った行を正しく再現するのは無理筋で、
-///    間違った本文を覚えるより覚えない方が良い)
+///   間違った本文を覚えるより覚えない方が良い)
 /// - bracketed paste の囲み … 剥がして中身だけ残す
 /// - その他の制御文字 … 無視
 ///
@@ -12483,23 +12483,159 @@ mod link_tests {
         const SLOP: f32 = 6.0;
         // (説明, hovering, dragged_px, click_count, modified, had_selection, 期待)
         let table: &[(&str, bool, f32, u8, bool, bool, bool)] = &[
-            ("素のシングルクリックは開く", true, 0.0, 1, false, false, true),
-            ("修飾キー付きも従来どおり開く", true, 0.0, 1, true, false, true),
-            ("リンクの上でなければ開かない", false, 0.0, 1, true, false, false),
-            ("クリックしていないフレームは開かない", true, 0.0, 0, false, false, false),
-            ("ダブルクリック(語選択)では開かない", true, 0.0, 2, false, false, false),
-            ("修飾キー付きダブルクリックでも開かない", true, 0.0, 2, true, false, false),
-            ("トリプルクリック(行選択)では開かない", true, 0.0, 3, false, false, false),
-            ("修飾キー付きトリプルクリックでも開かない", true, 0.0, 3, true, false, false),
-            ("しきい値ちょうどの微動はクリック", true, SLOP, 1, false, false, true),
-            ("しきい値を超えたらドラッグ選択", true, SLOP + 0.001, 1, false, false, false),
-            ("大きく引きずったら開かない", true, 400.0, 1, false, false, false),
-            ("引きずれば修飾キー付きでも開かない", true, 400.0, 1, true, false, false),
-            ("選択が残っている素のクリックは解除の意図", true, 0.0, 1, false, true, false),
-            ("選択があっても修飾キー付きなら開く", true, 0.0, 1, true, true, true),
-            ("測れない距離(NaN)は開かない", true, f32::NAN, 1, false, false, false),
-            ("測れない距離(∞)は開かない", true, f32::INFINITY, 1, false, false, false),
-            ("負の距離はあり得ないので開かない", true, -1.0, 1, false, false, false),
+            (
+                "素のシングルクリックは開く",
+                true,
+                0.0,
+                1,
+                false,
+                false,
+                true,
+            ),
+            (
+                "修飾キー付きも従来どおり開く",
+                true,
+                0.0,
+                1,
+                true,
+                false,
+                true,
+            ),
+            (
+                "リンクの上でなければ開かない",
+                false,
+                0.0,
+                1,
+                true,
+                false,
+                false,
+            ),
+            (
+                "クリックしていないフレームは開かない",
+                true,
+                0.0,
+                0,
+                false,
+                false,
+                false,
+            ),
+            (
+                "ダブルクリック(語選択)では開かない",
+                true,
+                0.0,
+                2,
+                false,
+                false,
+                false,
+            ),
+            (
+                "修飾キー付きダブルクリックでも開かない",
+                true,
+                0.0,
+                2,
+                true,
+                false,
+                false,
+            ),
+            (
+                "トリプルクリック(行選択)では開かない",
+                true,
+                0.0,
+                3,
+                false,
+                false,
+                false,
+            ),
+            (
+                "修飾キー付きトリプルクリックでも開かない",
+                true,
+                0.0,
+                3,
+                true,
+                false,
+                false,
+            ),
+            (
+                "しきい値ちょうどの微動はクリック",
+                true,
+                SLOP,
+                1,
+                false,
+                false,
+                true,
+            ),
+            (
+                "しきい値を超えたらドラッグ選択",
+                true,
+                SLOP + 0.001,
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "大きく引きずったら開かない",
+                true,
+                400.0,
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "引きずれば修飾キー付きでも開かない",
+                true,
+                400.0,
+                1,
+                true,
+                false,
+                false,
+            ),
+            (
+                "選択が残っている素のクリックは解除の意図",
+                true,
+                0.0,
+                1,
+                false,
+                true,
+                false,
+            ),
+            (
+                "選択があっても修飾キー付きなら開く",
+                true,
+                0.0,
+                1,
+                true,
+                true,
+                true,
+            ),
+            (
+                "測れない距離(NaN)は開かない",
+                true,
+                f32::NAN,
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "測れない距離(∞)は開かない",
+                true,
+                f32::INFINITY,
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "負の距離はあり得ないので開かない",
+                true,
+                -1.0,
+                1,
+                false,
+                false,
+                false,
+            ),
         ];
         for (why, hovering, dragged, count, modified, had_sel, want) in table {
             let got = should_open_link(*hovering, *dragged, SLOP, *count, *modified, *had_sel);
@@ -12518,7 +12654,6 @@ mod link_tests {
         }
     }
 }
-
 
 #[cfg(test)]
 mod typed_line_tests {

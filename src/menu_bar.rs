@@ -1093,9 +1093,9 @@ fn help_menu(ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
         if item(ui, &tr("バージョン情報"), "", true) {
             cmds.push(Cmd::ShowAbout);
         }
-            if item(ui, &tr("この版の新機能 (What's New)"), "", true) {
-                cmds.push(Cmd::ShowWhatsNew);
-            }
+        if item(ui, &tr("この版の新機能 (What's New)"), "", true) {
+            cmds.push(Cmd::ShowWhatsNew);
+        }
     });
 }
 

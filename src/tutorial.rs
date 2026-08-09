@@ -1042,7 +1042,7 @@ impl Tutorial {
         if self.missing.observe(now, present) {
             let act = self.pending.take();
             self.next();
-            crate::perf::repaint(&ctx, "tutorial");
+            crate::perf::repaint(ctx, "tutorial");
             return act;
         }
 
@@ -1053,7 +1053,11 @@ impl Tutorial {
         self.card(ctx, theme, step, target, screen, keys);
 
         // リングのアニメーションのため、控えめな間隔で再描画を促す。
-        crate::perf::repaint_after(&ctx, std::time::Duration::from_millis(REPAINT_MS), "tutorial");
+        crate::perf::repaint_after(
+            ctx,
+            std::time::Duration::from_millis(REPAINT_MS),
+            "tutorial",
+        );
 
         self.handle_keys(ctx);
         self.pending.take()
@@ -1134,7 +1138,7 @@ impl Tutorial {
         let got = resp.response.rect.size();
         if (got.y - measured.y).abs() > 0.5 {
             ctx.data_mut(|d| d.insert_temp(size_id, got));
-            crate::perf::repaint(&ctx, "tutorial");
+            crate::perf::repaint(ctx, "tutorial");
         }
     }
 

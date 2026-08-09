@@ -254,8 +254,7 @@ impl FrameStats {
 
     /// アイドル中の再描画要求を多い順に返す (UI / テストから読む)。
     pub fn repaint_ranking(&self) -> Vec<(&'static str, u64)> {
-        let mut v: Vec<(&'static str, u64)> =
-            self.repaints.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut v: Vec<(&'static str, u64)> = self.repaints.iter().map(|(k, v)| (*k, *v)).collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         v
     }
@@ -475,7 +474,9 @@ mod tests {
         st.repaints.insert("blame", 2);
         let lines = st.report_lines("test");
         assert!(
-            lines.iter().any(|l| l.starts_with(TAG_REPAINT) && l.contains("source=blame count=2")),
+            lines
+                .iter()
+                .any(|l| l.starts_with(TAG_REPAINT) && l.contains("source=blame count=2")),
             "内訳行が無い: {lines:?}"
         );
     }
@@ -484,7 +485,10 @@ mod tests {
     #[test]
     fn 出所が無ければ内訳行は出さない() {
         let st = FrameStats::new();
-        assert!(!st.report_lines("test").iter().any(|l| l.starts_with(TAG_REPAINT)));
+        assert!(!st
+            .report_lines("test")
+            .iter()
+            .any(|l| l.starts_with(TAG_REPAINT)));
     }
 
     // ── バケット ──────────────────────────────────────────────────────

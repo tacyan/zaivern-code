@@ -1596,7 +1596,10 @@ fn empty_lines() -> &'static BTreeSet<usize> {
 
 /// ハンクの各行が「選べる行か」(= 変更行か) の表。
 pub fn selectable_lines(hunk: &Hunk) -> Vec<bool> {
-    hunk.lines.iter().map(|l| l.kind != LineKind::Context).collect()
+    hunk.lines
+        .iter()
+        .map(|l| l.kind != LineKind::Context)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3187,7 +3190,10 @@ fn diff_row_ui(cx: &mut RowCtx, args: RowArgs) -> Option<RowSelect> {
                 egui::pos2(x0, rect.top()),
                 egui::pos2(x0 + cols.width, rect.bottom()),
             );
-            let p = cx.ui.painter().with_clip_rect(pane.intersect(cx.ui.clip_rect()));
+            let p = cx
+                .ui
+                .painter()
+                .with_clip_rect(pane.intersect(cx.ui.clip_rect()));
             p.rect_filled(pane, 0.0, mix(Color32::TRANSPARENT, theme.accent, 0.20));
             p.rect_filled(
                 egui::Rect::from_min_max(
@@ -6405,20 +6411,8 @@ rename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,3 +1,3 @@\n r1\n-r2\n+R2\
                 "@@ -1,4 +1,4 @@\n a\n-b\n c\n d\n+D\n",
                 "飛び飛びの選択",
             ),
-            (
-                MIX,
-                &[0, 3],
-                false,
-                "",
-                "文脈行しか選んでいない → 組まない",
-            ),
-            (
-                MIX,
-                &[],
-                false,
-                "",
-                "何も選んでいない → 組まない",
-            ),
+            (MIX, &[0, 3], false, "", "文脈行しか選んでいない → 組まない"),
+            (MIX, &[], false, "", "何も選んでいない → 組まない"),
             (
                 MIX,
                 &[2],
@@ -6537,8 +6531,14 @@ rename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,3 +1,3 @@\n r1\n-r2\n+R2\
         // 逆向きで 1 行だけ = 「新規ファイルの 1 行をアンステージ」。
         // 旧側に行が残るので /dev/null も new file mode も書けない。
         let p = build_line_patch(&f, 0, &sel(&[1]), true).expect("組める");
-        assert!(!p.contains("new file mode"), "旧側が空でないのに新規扱い:\n{p}");
-        assert!(p.contains("--- a/n.txt\n") && p.contains("+++ b/n.txt\n"), "{p}");
+        assert!(
+            !p.contains("new file mode"),
+            "旧側が空でないのに新規扱い:\n{p}"
+        );
+        assert!(
+            p.contains("--- a/n.txt\n") && p.contains("+++ b/n.txt\n"),
+            "{p}"
+        );
         assert_eq!(body_of(&p), "@@ -1,2 +1,3 @@\n n1\n+n2\n n3\n");
 
         let delf = "diff --git a/d.txt b/d.txt\ndeleted file mode 100644\n--- a/d.txt\n\
@@ -6634,7 +6634,10 @@ rename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,3 +1,3 @@\n r1\n-r2\n+R2\
         assert_eq!(s.lines(1, 2).iter().copied().collect::<Vec<_>>(), vec![0]);
         // Shift+↓ 相当
         s.step(1, &ok);
-        assert_eq!(s.lines(1, 2).iter().copied().collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(
+            s.lines(1, 2).iter().copied().collect::<Vec<_>>(),
+            vec![0, 2]
+        );
         // Shift+↑ 相当 (1 は文脈なので 0 まで戻る)
         s.step(-1, &ok);
         assert_eq!(s.lines(1, 2).iter().copied().collect::<Vec<_>>(), vec![0]);
@@ -6848,7 +6851,10 @@ rename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,3 +1,3 @@\n r1\n-r2\n+R2\
         let confirm = hunk_button_text(HunkOp::Discard, false, true, OpScope::Hunk);
         assert_ne!(plain, confirm, "2 段目は文言が変わる");
         assert!(confirm.contains('⚠'), "2 段目は警告色の文言: {confirm}");
-        assert_eq!(hunk_button_text(HunkOp::Stage, true, false, OpScope::Hunk), "＋");
+        assert_eq!(
+            hunk_button_text(HunkOp::Stage, true, false, OpScope::Hunk),
+            "＋"
+        );
     }
 
     /// 行を選んでいる間の帯。**同じ場所・同じ本数のまま**、

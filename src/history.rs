@@ -277,7 +277,13 @@ fn finish_in(
 /// **起動時点では存在しない**ため。`Session::last_prompt` が埋まるのは
 /// 最初の指示を送った後なので、締めのタイミングで初めて書ける。
 /// 要約が空なら既存の値を残す (上書きで消さない)。
-pub fn finish(agent_bin: &str, cwd: &Path, id: u64, ended: i64, brief: &str) -> std::io::Result<()> {
+pub fn finish(
+    agent_bin: &str,
+    cwd: &Path,
+    id: u64,
+    ended: i64,
+    brief: &str,
+) -> std::io::Result<()> {
     finish_in(&history_root(), agent_bin, cwd, id, ended, brief)
 }
 

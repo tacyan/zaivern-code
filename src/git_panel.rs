@@ -5321,7 +5321,10 @@ bare
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         run_git_stdin(&repo, &argv, &back).expect("git apply --cached --reverse が拒んだ");
         let staged = run_git(&repo, &["diff", "--cached"]).expect("diff --cached");
-        assert!(staged.trim().is_empty(), "index が空に戻っていない:\n{staged}");
+        assert!(
+            staged.trim().is_empty(),
+            "index が空に戻っていない:\n{staged}"
+        );
 
         let _ = std::fs::remove_dir_all(&repo);
     }

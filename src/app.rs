@@ -6355,7 +6355,11 @@ impl ZaivernApp {
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                crate::perf::repaint_after(ctx, std::time::Duration::from_millis(200), "poll_index");
+                crate::perf::repaint_after(
+                    ctx,
+                    std::time::Duration::from_millis(200),
+                    "poll_index",
+                );
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.index_rx = None,
         }
@@ -12487,7 +12491,11 @@ impl ZaivernApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             }
-            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(50), "fullscreen_guard");
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(50),
+                "fullscreen_guard",
+            );
         }
 
         // 矩形の「真の安定」観測: 前フレームから 1px 超動いたら時刻を取り直す。
@@ -12522,7 +12530,11 @@ impl ZaivernApp {
             // 時間 (1.5 秒) に加えて「矩形が 0.5 秒動いていない」ことも要求する —
             // 負荷でアニメが 1.5 秒を超えても、動いている間は絶対に送らない。
             let since = *self.fs_broken_since.get_or_insert_with(Instant::now);
-            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(200), "fullscreen_guard");
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(200),
+                "fullscreen_guard",
+            );
             if since.elapsed().as_millis() >= 1500
                 && rect_stable_ms >= 500
                 && !self.fs_rescue_pending
@@ -12592,7 +12604,11 @@ impl ZaivernApp {
                     }
                 }
                 // 入力が無くても状態機械が進むようフレームを回し続ける
-                crate::perf::repaint_after(ctx, std::time::Duration::from_millis(100), "fullscreen_guard");
+                crate::perf::repaint_after(
+                    ctx,
+                    std::time::Duration::from_millis(100),
+                    "fullscreen_guard",
+                );
             }
         }
     }
@@ -12623,7 +12639,11 @@ impl ZaivernApp {
         if let Some((pos, size)) = self.fake_fullscreen.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
             self.fake_fs_restore = Some((pos, size, Instant::now()));
-            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(50), "exit_fake_fullscreen");
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(50),
+                "exit_fake_fullscreen",
+            );
         }
     }
 
@@ -12672,7 +12692,11 @@ impl ZaivernApp {
             // 待機中だけ再描画を予約する (時間切れを画面へ反映するため)。
             // 待っていないフレームでは 1 回も呼ばない = アイドルのコストは 0。
             let left = chord.remaining(ctx.input(|i| i.time));
-            crate::perf::repaint_after(ctx, std::time::Duration::from_secs_f64(left.min(0.1)), "handle_shortcuts");
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_secs_f64(left.min(0.1)),
+                "handle_shortcuts",
+            );
         } else if matches!(
             tick,
             crate::keybinds::ChordTick::TimedOut | crate::keybinds::ChordTick::Cancelled
@@ -28738,7 +28762,11 @@ impl ZaivernApp {
             visible: !minimized,
         };
         if let Some(ms) = idle_repaint_ms(signals) {
-            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(ms), "schedule_idle_repaint");
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(ms),
+                "schedule_idle_repaint",
+            );
         }
         // 「実入力が無いのに描いたフレーム」を数える。
         // `ZAIVERN_PERF=1` のときだけ働き、レポートは `perf::dump` で 1 回だけ出す
@@ -32041,7 +32069,11 @@ impl ZaivernApp {
             None => {
                 // 2 打鍵目の締切まで画面を回す (待っている間だけ)
                 let left = rec.remaining(now).min(0.1);
-                crate::perf::repaint_after(ctx, std::time::Duration::from_secs_f64(left), "keybind_record_tick");
+                crate::perf::repaint_after(
+                    ctx,
+                    std::time::Duration::from_secs_f64(left),
+                    "keybind_record_tick",
+                );
                 self.keybind_ui.recording = Some(rec);
             }
         }
@@ -32078,8 +32110,11 @@ impl ZaivernApp {
     /// 起動のたびに同じものが出る。
     fn whats_new_on_start(&mut self) {
         let cur = crate::whats_new::current_version();
-        let shown =
-            crate::whats_new::unseen(&crate::whats_new::releases(), &self.cfg.last_seen_version, cur);
+        let shown = crate::whats_new::unseen(
+            &crate::whats_new::releases(),
+            &self.cfg.last_seen_version,
+            cur,
+        );
         // 見た印は「出す物が無かった」場合も含めて必ず進める
         // (次の更新まで毎回同じ計算をしないため)。
         if self.cfg.last_seen_version != cur {

@@ -207,7 +207,10 @@ fn highlight_doc(
             if let Some(c) = prev {
                 let ol = i as isize - delta;
                 if ol >= 0 {
-                    if let Ok(k) = c.checkpoints.binary_search_by_key(&(ol as usize), |cp| cp.line) {
+                    if let Ok(k) = c
+                        .checkpoints
+                        .binary_search_by_key(&(ol as usize), |cp| cp.line)
+                    {
                         if c.checkpoints[k].ps == state.0 && c.checkpoints[k].hs == state.1 {
                             spans.extend_from_slice(&c.spans[ol as usize..]);
                             checkpoints.extend(c.checkpoints[k..].iter().map(|cp| Checkpoint {
@@ -226,7 +229,7 @@ fn highlight_doc(
                 }
             }
         }
-        if i > start && i % CHECKPOINT_LINES == 0 {
+        if i > start && i.is_multiple_of(CHECKPOINT_LINES) {
             checkpoints.push(Checkpoint {
                 line: i,
                 ps: state.0.clone(),
@@ -3454,24 +3457,12 @@ mod incremental {
     /// 行キャッシュを空にしてから 1 回塗る (= ゼロから塗った答え)。
     fn from_scratch(h: &Highlighter, text: &str, lang: &str) -> LayoutJob {
         DOC_CACHE.with(|c| *c.borrow_mut() = None);
-        h.layout_job(
-            text,
-            lang,
-            theme(),
-            FontId::monospace(12.0),
-            Color32::WHITE,
-        )
+        h.layout_job(text, lang, theme(), FontId::monospace(12.0), Color32::WHITE)
     }
 
     /// 直前の結果を残したまま塗る (= 差分計算した答え)。
     fn incremental(h: &Highlighter, text: &str, lang: &str) -> LayoutJob {
-        h.layout_job(
-            text,
-            lang,
-            theme(),
-            FontId::monospace(12.0),
-            Color32::WHITE,
-        )
+        h.layout_job(text, lang, theme(), FontId::monospace(12.0), Color32::WHITE)
     }
 
     fn same(a: &LayoutJob, b: &LayoutJob) -> bool {
@@ -3499,16 +3490,25 @@ mod incremental {
         let base = padded("// 先頭\n", 600);
         let lines: Vec<&str> = base.split_inclusive('\n').collect();
         // 先頭 / 中間 / 末尾 / チェックポイント境界のそれぞれを編集する
-        let targets = [0usize, 1, 255, 256, 257, 300, lines.len() / 2, lines.len() - 1];
+        let targets = [
+            0usize,
+            1,
+            255,
+            256,
+            257,
+            300,
+            lines.len() / 2,
+            lines.len() - 1,
+        ];
         // まず 1 回塗って行キャッシュを作る
         let _ = from_scratch(&h, &base, "Rust");
         for t in targets {
             for edit in [
-                "let z = \"文字列\";\n",       // 置換
-                "/* 開いたまま\n",              // 行を跨ぐコメントを開く
-                "*/ let w = 1;\n",              // 閉じる
-                "",                             // 行の削除
-                "let a = 1;\nlet b = 2;\n",     // 行の挿入
+                "let z = \"文字列\";\n",    // 置換
+                "/* 開いたまま\n",          // 行を跨ぐコメントを開く
+                "*/ let w = 1;\n",          // 閉じる
+                "",                         // 行の削除
+                "let a = 1;\nlet b = 2;\n", // 行の挿入
             ] {
                 let mut v = lines.clone();
                 if edit.is_empty() {
@@ -3562,7 +3562,10 @@ mod incremental {
             Color32::WHITE,
         );
         let fresh_ts = from_scratch(&h, &src, "TypeScript");
-        assert!(same(&as_ts, &fresh_ts), "言語を変えたのに前の結果を流用した");
+        assert!(
+            same(&as_ts, &fresh_ts),
+            "言語を変えたのに前の結果を流用した"
+        );
         assert_eq!(as_rust.text, as_ts.text);
     }
 }
@@ -3588,21 +3591,9 @@ mod huge_files {
 
     /// `lang` の構文で `text` を塗り、行ごとの塗り分けを返す。
     fn spans_of(h: &Highlighter, text: &str, lang: &str) -> Vec<Vec<LineSpan>> {
-        let syntax = h
-            .ps()
-            .find_syntax_by_name(lang)
-            .expect("構文が引ける");
+        let syntax = h.ps().find_syntax_by_name(lang).expect("構文が引ける");
         DOC_CACHE.with(|c| *c.borrow_mut() = None);
-        highlight_doc(
-            h.ps(),
-            syntax,
-            theme_of(h),
-            text,
-            Color32::WHITE,
-            0,
-            None,
-        )
-        .spans
+        highlight_doc(h.ps(), syntax, theme_of(h), text, Color32::WHITE, 0, None).spans
     }
 
     /// 5 万行。1 行目でブロックコメントを開き、3 万行目で閉じる。
@@ -3654,10 +3645,13 @@ mod huge_files {
         assert_eq!(spans[1].len(), 1, "長すぎる行を塗ろうとしている");
         assert_eq!(spans[1][0].end as usize, long.len());
         // 前後の行は普通に塗れている (状態を壊していない)
-        assert!(spans[0].len() >= 1);
+        assert!(!spans[0].is_empty());
         assert!(spans[2].len() >= 2, "長い行の後ろが塗れていない");
         // 素通しなので行長に比例した費用は掛からない
-        assert!(took < std::time::Duration::from_secs(3), "遅すぎる: {took:?}");
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "遅すぎる: {took:?}"
+        );
     }
 
     #[test]
@@ -4110,10 +4104,15 @@ mod language_coverage {
                 .iter()
                 .map(|s| s.format.color.to_array())
                 .collect();
-            let named: Vec<(&str, &str)> = [("コメント", *cmt), ("文字列", *string), ("キーワード", *kw), ("数値", *num)]
-                .into_iter()
-                .filter(|(_, n)| !n.is_empty())
-                .collect();
+            let named: Vec<(&str, &str)> = [
+                ("コメント", *cmt),
+                ("文字列", *string),
+                ("キーワード", *kw),
+                ("数値", *num),
+            ]
+            .into_iter()
+            .filter(|(_, n)| !n.is_empty())
+            .collect();
             // 色の下限。コメントしか無い言語 (Git Commit / justfile) に
             // 3 色を求めても意味が無いので、見る断片の数から決める。
             let want = if named.len() >= 2 { 3 } else { 2 };

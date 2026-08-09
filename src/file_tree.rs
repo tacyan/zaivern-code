@@ -1223,8 +1223,7 @@ impl FileTree {
         } else {
             egui::KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::C)
         };
-        let copy_path =
-            ui.input_mut(|i| crate::keybinds::consume_shortcut_compat(i, copy_path_sc));
+        let copy_path = ui.input_mut(|i| crate::keybinds::consume_shortcut_compat(i, copy_path_sc));
         if copy_path {
             if let Some(r) = sel_idx.map(|i| &rows[i]) {
                 ctx.copy_text(r.path.to_string_lossy().to_string());

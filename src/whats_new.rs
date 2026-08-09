@@ -92,7 +92,9 @@ fn is_version(s: &str) -> bool {
 
 /// 版を数値の組へ (比較用)。読めない部分は 0 として扱う。
 fn parts_of(v: &str) -> Vec<u64> {
-    v.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect()
+    v.split('.')
+        .map(|s| s.parse::<u64>().unwrap_or(0))
+        .collect()
 }
 
 /// `a` が `b` より新しいか (純関数)。
@@ -103,7 +105,10 @@ pub fn is_newer(a: &str, b: &str) -> bool {
     let (x, y) = (parts_of(a), parts_of(b));
     let n = x.len().max(y.len());
     for i in 0..n {
-        let (l, r) = (x.get(i).copied().unwrap_or(0), y.get(i).copied().unwrap_or(0));
+        let (l, r) = (
+            x.get(i).copied().unwrap_or(0),
+            y.get(i).copied().unwrap_or(0),
+        );
         if l != r {
             return l > r;
         }

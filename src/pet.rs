@@ -1018,8 +1018,14 @@ mod tests {
             let groove = repaint_ms(PetState::Groove, bg).expect("動く");
             for short in [PetState::Attention, PetState::Error, PetState::Happy] {
                 let s = repaint_ms(short, bg).expect("動く");
-                assert!(work > s, "focused={bg}: Working {work}ms は {short:?} {s}ms より粗いはず");
-                assert!(groove > s, "focused={bg}: Groove {groove}ms は {short:?} {s}ms より粗いはず");
+                assert!(
+                    work > s,
+                    "focused={bg}: Working {work}ms は {short:?} {s}ms より粗いはず"
+                );
+                assert!(
+                    groove > s,
+                    "focused={bg}: Groove {groove}ms は {short:?} {s}ms より粗いはず"
+                );
             }
         }
     }
