@@ -1956,15 +1956,25 @@ impl AcpClient {
     /// 同じセッションへ複数の返事が来たときは古い順に消化する
     /// (`ApprovalQueue::apply` はまとめ処理で同じ ID を複数回返し得る)。
     pub fn answer_permission(&mut self, action: ReplyAction) -> bool {
-        if self.perms.is_empty() {
+        if self.perms.is_empty() || action == ReplyAction::None {
             return false;
         }
+        let p = self.perms.remove(0);
+        self.reply_permission(p, action)
+    }
+
+    /// **その 1 件**へ答える。
+    ///
+    /// キューを経由しない即断 (ポリシーが決めた / 重複) は、`perms` の
+    /// 先頭ではなく**いま届いた要求**へ返さなければならない。先頭を消化して
+    /// しまうと、古い要求が新しい要求の判断で答えられ、新しい要求は永久に
+    /// 宙に浮く (エージェントがそこで止まる)。
+    fn reply_permission(&mut self, p: PendingPerm, action: ReplyAction) -> bool {
         let allow = match action {
             ReplyAction::Approve => true,
             ReplyAction::Deny => false,
             ReplyAction::None => return false,
         };
-        let p = self.perms.remove(0);
         let msg = match pick_option(&p.options, allow) {
             Some(opt) => {
                 self.log.push_back(format!(
@@ -2272,24 +2282,25 @@ impl AcpClient {
                 ));
             }
             Verdict::Decided { reply, note, .. } => {
-                // ポリシーが即断した。その場で答える。
-                self.perms.push(PendingPerm {
+                // ポリシーが即断した。**この 1 件へ**その場で答える
+                // (キューへ積んでから先頭を消化すると、古い要求を巻き込む)。
+                let p = PendingPerm {
                     approval_id: 0,
                     req_id,
                     options: params.options,
-                });
-                self.answer_permission(reply);
+                };
+                self.reply_permission(p, reply);
                 toasts.push((tr(note), reply == ReplyAction::Approve));
             }
             Verdict::Duplicate => {
                 // 指紋がリクエスト ID 由来なので通常は起きない。起きたら
                 // 答えないと相手が止まるので、安全側 (拒否) で必ず返す。
-                self.perms.push(PendingPerm {
+                let p = PendingPerm {
                     approval_id: 0,
                     req_id,
                     options: params.options,
-                });
-                self.answer_permission(ReplyAction::Deny);
+                };
+                self.reply_permission(p, ReplyAction::Deny);
             }
         }
     }
@@ -4345,6 +4356,120 @@ rl.on("line", (line) => {
         c.stop();
         assert!(c.phase.is_dead());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 子プロセスを持たない検査用クライアント (送信内容だけを見る)。
+    fn fake_client() -> (AcpClient, mpsc::Receiver<String>, mpsc::Sender<AcpEvent>) {
+        let (tx_out, rx_out) = mpsc::channel::<String>();
+        let (tx_ev, rx) = mpsc::channel::<AcpEvent>();
+        let c = AcpClient {
+            id: ACP_SESSION_ID_BASE,
+            entry_id: "mock",
+            label: "Mock".into(),
+            icon: "🧪",
+            bin: "mock".into(),
+            cwd: std::env::temp_dir(),
+            via_npx: false,
+            child: None,
+            pid: None,
+            tx_out,
+            rx,
+            next_id: 0,
+            inflight: HashMap::new(),
+            perms: Vec::new(),
+            phase: Phase::Idle,
+            info: None,
+            caps: AgentCapabilities::default(),
+            steering: false,
+            session: Some("s1".into()),
+            turn: Turn::default(),
+            log: VecDeque::new(),
+            prompt_draft: String::new(),
+            steer_draft: String::new(),
+            started: Instant::now(),
+        };
+        (c, rx_out, tx_ev)
+    }
+
+    fn perm_params(tool_id: &str) -> PermissionParams {
+        serde_json::from_value(json!({
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": tool_id, "title": "Terminal", "kind": "execute",
+                         "rawInput": {"command": "echo hi"}},
+            "options": [{"optionId":"reject","name":"Deny","kind":"reject_once"},
+                        {"optionId":"allow","name":"Allow","kind":"allow_once"}]
+        }))
+        .expect("権限要求")
+    }
+
+    #[test]
+    fn 即断の返事は先頭ではなくその1件へ返す() {
+        // **回帰**: ポリシーが即断した要求を `perms` へ積んでから先頭を
+        // 消化していたため、既に並んでいた古い要求が新しい要求の判断で
+        // 答えられ、新しい要求は永久に宙に浮いていた (= エージェントが止まる)。
+        let dir = crate::test_util::unique_temp_dir("zaivern", "acp-perm");
+        let mut q = ApprovalQueue::in_dir(dir.join("logs"));
+        let (mut c, rx_out, _keep) = fake_client();
+        let mut toasts = Vec::new();
+
+        // 1 件目はキューへ積まれる (ポリシー無し)
+        c.on_permission(json!(1), perm_params("t1"), &mut q, &mut toasts);
+        assert_eq!(c.perms.len(), 1);
+        assert!(rx_out.try_recv().is_err(), "積んだだけで答えてはいけない");
+
+        // 2 件目を即断で返す (ポリシーが決めたときと同じ経路)
+        let p2 = PendingPerm {
+            approval_id: 0,
+            req_id: json!(2),
+            options: perm_params("t2").options,
+        };
+        assert!(c.reply_permission(p2, ReplyAction::Deny));
+        let sent: Value =
+            serde_json::from_str(&rx_out.try_recv().expect("返事が出ている")).expect("JSON");
+        assert_eq!(sent["id"], json!(2), "古い要求へ答えてしまっている");
+        assert_eq!(sent["result"]["outcome"]["optionId"], json!("reject"));
+        assert_eq!(c.perms.len(), 1, "並んでいた要求を消してはいけない");
+
+        // 承認パネル経由は従来どおり古い順 (FIFO)
+        assert!(c.answer_permission(ReplyAction::Approve));
+        let sent: Value =
+            serde_json::from_str(&rx_out.try_recv().expect("返事が出ている")).expect("JSON");
+        assert_eq!(sent["id"], json!(1));
+        assert_eq!(sent["result"]["outcome"]["optionId"], json!("allow"));
+        assert!(c.perms.is_empty());
+        assert!(!c.answer_permission(ReplyAction::Approve), "空なら false");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn キャンセルは保留中の権限要求へ全部cancelledを返す() {
+        // 仕様上の義務: session/cancel を撃ったら保留中の全要求へ
+        // `{"outcome":"cancelled"}` を返さなければならない。
+        let dir = crate::test_util::unique_temp_dir("zaivern", "acp-cancel");
+        let mut q = ApprovalQueue::in_dir(dir.join("logs"));
+        let (mut c, rx_out, _keep) = fake_client();
+        let mut toasts = Vec::new();
+        c.on_permission(json!(1), perm_params("t1"), &mut q, &mut toasts);
+        c.on_permission(json!(2), perm_params("t2"), &mut q, &mut toasts);
+        assert_eq!(c.perms.len(), 2);
+        assert_eq!(q.pending_len(), 2);
+
+        c.cancel(&mut q);
+        let first = rx_out.try_recv().expect("1 件目の返事");
+        assert!(
+            first.contains("session/cancel"),
+            "先に session/cancel を撃つ: {first}"
+        );
+        let mut cancelled = 0;
+        while let Ok(line) = rx_out.try_recv() {
+            let v: Value = serde_json::from_str(&line).expect("JSON");
+            assert_eq!(v["result"]["outcome"]["outcome"], json!("cancelled"));
+            cancelled += 1;
+        }
+        assert_eq!(cancelled, 2, "保留中の全部へ返していない");
+        assert!(c.perms.is_empty());
+        assert_eq!(q.pending_len(), 0, "承認キューに残骸が残っている");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
