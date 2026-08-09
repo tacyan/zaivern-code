@@ -16,14 +16,22 @@
 #   tools/windows-check.sh --build      # 実際に zai.exe を作る (リンクまで通す)
 #   tools/windows-check.sh --clippy     # CI と同じ債務リストで clippy
 #   tools/windows-check.sh --gnu        # mingw 経由の windows-gnu で型検査
-#   tools/windows-check.sh keybinds::   # そのテストを Windows バイナリで実行 (要 wine)
+#   tools/windows-check.sh --wine       # lease:: と instances:: を **実際に実行**する
+#   tools/windows-check.sh --wine git:: # 実行するテストを絞る
+#   tools/windows-check.sh keybinds::   # そのテストを Windows バイナリで実行 (--wine と同じ)
 #
 # ## どこまで担保できるか (正直な話)
 #
 #   * **担保できる**: コンパイルとリンク。`#[cfg(windows)]` の型エラー・
 #     未使用 import・Windows 限定 API の誤用は全部ここで落ちる。
 #     実際に PE32+ の `zai.exe` が macOS 上で出来上がる。
-#   * **担保できない**: 実行時の挙動と GUI。実機 Windows でしか分からない。
+#   * **一部だけ担保できる**: 実行時の挙動。`--wine` が Windows のテスト
+#     バイナリを wine で走らせる。ホストに wine が無ければ **docker の
+#     コンテナ内の wine** へ自動で落ちる (tools/linux-test.sh と同じ流儀)。
+#     ファイル API (`create_new` の排他 / `rename` の置換) や PID の生存確認
+#     など、**OS のカーネルの振る舞いに依るものはここで実際に動く**。
+#   * **担保できない**: GUI と、wine が実装していない Win32 の細部。
+#     wine が緑でも実機 Windows の保証にはならない (CI の windows-latest が本番)。
 #   * **担保できない**: build.rs の VERSIONINFO 埋め込み。Cargo は
 #     `[target.'cfg(windows)'.build-dependencies]` を**ホスト**で評価するため、
 #     macOS からのクロスビルドでは winresource が入らず、build.rs の
@@ -115,6 +123,113 @@ clippy_debt() {
 EOS
 }
 
+# ── Windows バイナリを「実際に動かす」ための runner ─────────────────────
+#
+# ホストの wine が第一候補。macOS では wine-stable の cask が
+# **gstreamer-runtime の pkg インストールに sudo を要求する**ため
+# 非対話の環境では入らない (実際に入らなかった)。そこで docker の
+# コンテナ内 wine へ落ちる。tools/linux-test.sh と同じく
+# 「ホストに何も入れずに別 OS を動かす」流儀。
+#
+# **wine は 9 以上が要る。** Rust の std は 1.78 以降 `bcryptprimitives.dll` の
+# ProcessPrng を引く。wine 8 (debian bookworm) にはこの DLL が無く、
+# 実行は `err:module:import_dll Library bcryptprimitives.dll ... not found` で
+# **出力を 1 行も出さずに終了コード 53** になる (実測)。緑にも赤にも見えない
+# ので、最も気付きにくい壊れ方をする。既定を wine 10 の debian:trixie にしてある。
+wine_image=${ZAIVERN_WINE_IMAGE:-zaivern-wine10}
+wine_base=${ZAIVERN_WINE_BASE_IMAGE:-debian:trixie}
+# WINEPREFIX は名前付きボリュームへ置く。--rm を跨いで残るので
+# 2 回目以降は初回セットアップ (数秒) を払わずに済み、
+# **ホストの ~/.wine も target/ も汚さない**。
+wine_prefix_vol=${ZAIVERN_WINE_PREFIX_VOLUME:-zaivern-wineprefix}
+
+# --wine に引数が無いときに走らせる既定のテスト。
+# **Windows で実行が 1 行も検証されていなかった 2 つ**を既定にしてある。
+default_wine_filters="lease:: instances::"
+
+# ホストの wine が使えるか (バージョン 9 以上か) を見る。
+host_wine_ok() {
+    command -v "$1" >/dev/null 2>&1 || return 1
+    v=$("$1" --version 2>/dev/null | sed -n 's/^wine-\([0-9][0-9]*\).*/\1/p')
+    [ -n "$v" ] && [ "$v" -ge 9 ]
+}
+
+ensure_wine_image() {
+    if docker image inspect "$wine_image" >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "== wine イメージを作ります: $wine_image ($wine_base / 初回だけ・数分)"
+    # $wine_base を展開したいので heredoc は非クォート。
+    docker build -t "$wine_image" - <<EOS
+FROM $wine_base
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends wine wine64 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+EOS
+}
+
+# 引数: 実行ファイル (ホストのパス) と、テストバイナリへ渡す引数。
+#
+# 出力に出る次の 2 つは**無害**なので気にしないこと:
+#   * "it looks like wine32 is missing"      — 64bit の exe には要らない
+#   * "failed to open ...\\rundll32.exe"      — prefix 初期化時の探索
+run_with_wine() {
+    exe=$1
+    shift
+    for w in wine64 wine; do
+        if host_wine_ok "$w"; then
+            echo "== ホストの $w で実行"
+            exec env WINEDEBUG=-all "$w" "$exe" "$@"
+        fi
+    done
+    if ! docker info >/dev/null 2>&1; then
+        cat >&2 <<'EOS'
+Windows バイナリを実行するには **wine 9 以上**が要ります。ホストにも docker にも
+見つかりませんでした (古い wine はバージョンが足りないため使いません)。
+次のどちらかを用意してください。
+
+    * Docker Desktop を起動する (このスクリプトが wine 入りイメージを自動で作ります)
+    * ホストへ wine 9+ を入れる (Debian/Ubuntu: sudo apt install wine)
+
+型検査だけなら wine も docker も不要です:
+
+    tools/windows-check.sh
+EOS
+        exit 1
+    fi
+    ensure_wine_image
+    # 実行ファイルの置き場だけを読み取り専用でマウントする。
+    dir=$(CDPATH= cd -- "$(dirname -- "$exe")" && pwd)
+    base=$(basename -- "$exe")
+    echo "== docker ($wine_image) の wine で実行: $base $*"
+    # XDG_RUNTIME_DIR が無いと wine が毎回エラー行を吐くので、
+    # コンテナ内に 0700 の一時ディレクトリを作って渡す (/tmp は 1777 なので不可)。
+    exec docker run --rm \
+        -v "$dir":/exe:ro \
+        -v "$wine_prefix_vol":/wineprefix \
+        -e WINEDEBUG=-all \
+        -e WINEPREFIX=/wineprefix \
+        -w /tmp \
+        "$wine_image" \
+        sh -c 'mkdir -p /tmp/xdg && chmod 700 /tmp/xdg && XDG_RUNTIME_DIR=/tmp/xdg exec wine "$@"' \
+        wine "/exe/$base" "$@"
+}
+
+# テストバイナリ (.exe) を作り、そのパスを標準出力へ返す。
+build_test_exe() {
+    need_xwin
+    ensure_std "$triple"
+    echo "== Windows ($triple) で実行: cargo xwin test --bin zai --no-run" >&2
+    CARGO_TARGET_DIR="$target" cargo xwin test --bin zai --target "$triple" --no-run >&2
+    # 2 回目は warm なので即返る。**パスを ls -t で推測しない** —
+    # 古い .exe が残っていると別物を動かしてしまう。cargo に聞く。
+    CARGO_TARGET_DIR="$target" cargo xwin test --bin zai --target "$triple" \
+        --no-run --message-format=json 2>/dev/null \
+        | grep -o '"executable":"[^"]*\.exe"' \
+        | tail -1 \
+        | sed 's/^"executable":"//; s/"$//'
+}
+
 mode=${1:-}
 
 case "$mode" in
@@ -173,30 +288,37 @@ EOS
     exec env CARGO_TARGET_DIR="$target" \
         cargo xwin check --target "$triple" --all-targets
     ;;
+--wine)
+    # 引数が無ければ「Windows で実行が検証されていなかった 2 モジュール」。
+    shift 2>/dev/null || true
+    if [ "$#" -gt 0 ]; then
+        filters=$*
+    else
+        filters=$default_wine_filters
+    fi
+    exe=$(build_test_exe)
+    if [ -z "$exe" ] || [ ! -f "$exe" ]; then
+        echo "テストバイナリのパスを cargo から取得できませんでした" >&2
+        exit 1
+    fi
+    # libtest は複数のフィルタを受け付ける (どれかに一致すれば実行)。
+    # --test-threads=1 は付けない: 並列でこそ出る競合 (リースのロック取り合い)
+    # を見たいのがこのモードの目的だから。
+    # shellcheck disable=SC2086
+    run_with_wine "$exe" $filters --nocapture
+    ;;
 -*)
-    echo "不明なオプション: $mode (--build / --clippy / --gnu のいずれか)" >&2
+    echo "不明なオプション: $mode (--build / --clippy / --gnu / --wine のいずれか)" >&2
     exit 2
     ;;
 *)
-    # テストの**実行**は Windows バイナリを動かすことなので wine が要る。
-    # 型検査と違って「無くても代替できる」ものではないため、無ければ手順を出す。
-    if ! command -v wine >/dev/null 2>&1 && ! command -v wine64 >/dev/null 2>&1; then
-        cat >&2 <<EOS
-テストの「実行」には wine が要ります (Windows の exe を macOS / Linux で動かすため)。
-
-    brew install --cask wine-stable   # macOS
-    sudo apt install wine64           # Debian / Ubuntu
-
-型エラーだけ見たいなら引数なしで実行してください (wine 不要):
-
-    tools/windows-check.sh
-EOS
+    # 素のフィルタ指定も実行モード。--wine と同じ runner を通す
+    # (ホストに wine が無ければ docker のコンテナ内 wine へ落ちる)。
+    exe=$(build_test_exe)
+    if [ -z "$exe" ] || [ ! -f "$exe" ]; then
+        echo "テストバイナリのパスを cargo から取得できませんでした" >&2
         exit 1
     fi
-    need_xwin
-    ensure_std "$triple"
-    echo "== Windows ($triple, wine) で実行: cargo xwin test $mode"
-    exec env CARGO_TARGET_DIR="$target" \
-        cargo xwin test --bin zai --target "$triple" -- "$mode"
+    run_with_wine "$exe" "$mode" --nocapture
     ;;
 esac

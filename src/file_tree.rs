@@ -2371,14 +2371,42 @@ fn bump_copy_name(stem: &str) -> String {
     format!("{stem} copy")
 }
 
+// ══════════════════════════════════════════════════════════════════
+//  ファイル所有リースの門
+// ══════════════════════════════════════════════════════════════════
+
+/// 門の判定。テストから差し替えられるように 1 段挟む
+/// (シングルトンを経由せずに「拒否されたら実行しない」を試せる)。
+pub type Gate<'a> = &'a dyn Fn(&Path) -> Option<String>;
+
+/// 既定の門: ファイル所有リースへ問い合わせる。
+///
+/// ガードが無効なスコープでは [`crate::lease::check_write`] が即 `Allow` を
+/// 返すので、単独で使う人の払うコストはゼロ (設計原則 3)。
+/// **早期 return を自前で書かない** — 二重判定はいつかズレる。
+fn lease_deny(path: &Path) -> Option<String> {
+    match crate::lease::check_write(path) {
+        crate::lease::Verdict::Deny(msg) => Some(msg),
+        crate::lease::Verdict::Allow => None,
+    }
+}
+
 /// ファイルは fs::copy、フォルダは再帰コピー。
 /// シンボリックリンクは辿らずスキップする (祖先を指すリンクがあると
 /// 無限再帰でスタックオーバーフローする)。深さも保険で制限する。
+///
+/// **他の担当が持っているファイルの上へは書かない。** 拒否されたら
+/// `PermissionDenied` で理由を返す (`src/editor.rs` の保存と同じ形)。
 pub fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
-    copy_recursively_inner(src, dst, 0)
+    copy_recursively_inner(src, dst, 0, &lease_deny)
 }
 
-fn copy_recursively_inner(src: &Path, dst: &Path, depth: usize) -> std::io::Result<()> {
+fn copy_recursively_inner(
+    src: &Path,
+    dst: &Path,
+    depth: usize,
+    gate: Gate<'_>,
+) -> std::io::Result<()> {
     if depth > 64 {
         return Err(std::io::Error::other("フォルダが深すぎます (>64)"));
     }
@@ -2391,10 +2419,17 @@ fn copy_recursively_inner(src: &Path, dst: &Path, depth: usize) -> std::io::Resu
         std::fs::create_dir_all(dst)?;
         for e in std::fs::read_dir(src)? {
             let e = e?;
-            copy_recursively_inner(&e.path(), &dst.join(e.file_name()), depth + 1)?;
+            copy_recursively_inner(&e.path(), &dst.join(e.file_name()), depth + 1, gate)?;
         }
         Ok(())
     } else {
+        // 書く直前に門を通す (見るのは**書かれる側**だけ。元は 1 つも触らない)。
+        if let Some(msg) = gate(dst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                msg,
+            ));
+        }
         std::fs::copy(src, dst).map(|_| ())
     }
 }
@@ -2535,6 +2570,10 @@ pub fn drop_visibility_notice(
 /// 取り消しが新しい破壊 (上書き) を生まないための一番大事な性質で、
 /// ここを緩めると「⌘Z したら別のファイルが消えた」になる。
 pub fn move_back(from: &Path, to: &Path) -> Result<(), String> {
+    move_back_gated(from, to, &lease_deny)
+}
+
+fn move_back_gated(from: &Path, to: &Path, gate: Gate<'_>) -> Result<(), String> {
     if entry_kind(from).is_none() {
         return Err(trf(
             "取り消せません: {name} が見つかりません",
@@ -2546,6 +2585,15 @@ pub fn move_back(from: &Path, to: &Path) -> Result<(), String> {
             "取り消せません: {name} が既にあります",
             &[("name", label_of(to))],
         ));
+    }
+    // **改名は元と先の両方を見る。** 他人のファイルを動かすのは、他人の
+    // ファイルを潰すのと同じだけ悪い。ディレクトリを作る前に判定する
+    // (拒否されたときに痕跡を残さない)。
+    if let Some(msg) = gate(from) {
+        return Err(msg);
+    }
+    if let Some(msg) = gate(to) {
+        return Err(msg);
     }
     if let Some(d) = to.parent() {
         std::fs::create_dir_all(d)
@@ -2761,8 +2809,27 @@ pub mod trash {
     /// `Ok(Some(p))` = ゴミ箱の中の実体 (取り消しで戻せる)。
     /// `Ok(None)`    = 送れたが戻り先が分からない (Windows のごみ箱)。
     /// `Err(msg)`    = 送れなかった。**このとき対象は消えていない。**
-    #[cfg(unix)]
+    ///
+    /// **他の担当が持っているファイルは消さない。** 消すのは上書きより
+    /// 取り返しがつかないので、門は OS ごとの実装の**手前**に 1 つだけ置く
+    /// (3 OS ぶんに散らすと、いつか 1 つだけ忘れる)。
     pub fn send(path: &Path) -> Result<Option<PathBuf>, String> {
+        send_gated(path, &super::lease_deny)
+    }
+
+    /// 判定を差し替えられる中身。
+    pub(super) fn send_gated(
+        path: &Path,
+        gate: super::Gate<'_>,
+    ) -> Result<Option<PathBuf>, String> {
+        if let Some(msg) = gate(path) {
+            return Err(msg);
+        }
+        send_inner(path)
+    }
+
+    #[cfg(unix)]
+    fn send_inner(path: &Path) -> Result<Option<PathBuf>, String> {
         let home = dirs::home_dir();
         let data = dirs::data_dir();
         let now = SystemTime::now();
@@ -2801,7 +2868,7 @@ pub mod trash {
     }
 
     #[cfg(windows)]
-    pub fn send(path: &Path) -> Result<Option<PathBuf>, String> {
+    fn send_inner(path: &Path) -> Result<Option<PathBuf>, String> {
         use windows_sys::Win32::UI::Shell::{SHFileOperationW, FO_DELETE, SHFILEOPSTRUCTW};
         if std::fs::symlink_metadata(path).is_err() {
             return Err(tr("削除できません: 見つかりません"));
@@ -2831,7 +2898,7 @@ pub mod trash {
     }
 
     #[cfg(not(any(unix, windows)))]
-    pub fn send(_path: &Path) -> Result<Option<PathBuf>, String> {
+    fn send_inner(_path: &Path) -> Result<Option<PathBuf>, String> {
         Err(tr("この環境ではゴミ箱を使えません"))
     }
 }
@@ -4094,6 +4161,100 @@ mod tests {
             vec!["apply_tree_actions".to_string()],
             "ファイル操作の取り消しはツリーの要求からしか呼ばない"
         );
+    }
+
+    // ── ファイル所有リースの門 ──────────────────────────────
+
+    /// 「別の担当が持っている」門 (シングルトンを経由せずに試す)。
+    fn 拒む門(p: &Path) -> Option<String> {
+        Some(format!(
+            "{} は別の担当 (sess-other) が編集中です",
+            p.display()
+        ))
+    }
+
+    /// 「誰も持っていない」門 (= ガードが無効なときと同じ答え)。
+    fn 通す門(_p: &Path) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn 他人が持つファイルの上へはコピーしない() {
+        let dir = unique_temp_dir("zaivern-tree-test", "lease-copy");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(src.join("a.txt"), "新しい中身").expect("write");
+        let dst = dir.join("dst");
+        std::fs::create_dir_all(&dst).expect("mkdir");
+        std::fs::write(dst.join("a.txt"), "他人の作業中の中身").expect("write");
+
+        let e = copy_recursively_inner(&src, &dst, 0, &拒む門).expect_err("門で止まらない");
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "他のエラーと区別できない"
+        );
+        assert!(e.to_string().contains("別の担当"), "理由が返らない: {e}");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a.txt")).expect("read"),
+            "他人の作業中の中身",
+            "拒否されたのに上書きされた"
+        );
+
+        // 門が通れば従来どおりコピーできる
+        copy_recursively_inner(&src, &dst, 0, &通す門).expect("通らない");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a.txt")).expect("read"),
+            "新しい中身"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 他人が持つファイルはリネームの取り消しで動かさない() {
+        let dir = unique_temp_dir("zaivern-tree-test", "lease-undo");
+        let from = dir.join("b.txt");
+        let to = dir.join("a.txt");
+        std::fs::write(&from, "中身").expect("write");
+
+        let e = move_back_gated(&from, &to, &拒む門).expect_err("門で止まらない");
+        assert!(e.contains("別の担当"), "理由が返らない: {e}");
+        assert!(from.exists(), "拒否されたのに動かされた");
+        assert!(!to.exists(), "拒否されたのに戻り先ができている");
+
+        // 戻り先だけを他人が持っている場合も止める (潰さない)
+        let only_dest = |p: &Path| {
+            if p == to.as_path() {
+                拒む門(p)
+            } else {
+                None
+            }
+        };
+        let e = move_back_gated(&from, &to, &only_dest).expect_err("戻り先を見ていない");
+        assert!(e.contains("別の担当"), "{e}");
+        assert!(from.exists() && !to.exists());
+
+        // 門が通れば従来どおり戻せる
+        move_back_gated(&from, &to, &通す門).expect("通らない");
+        assert!(to.exists() && !from.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 他人が持つファイルはゴミ箱へ送らない() {
+        let dir = unique_temp_dir("zaivern-tree-test", "lease-trash");
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "中身").expect("write");
+
+        // 実ゴミ箱には触れない: 門で止まるので OS の実装まで進まない。
+        let e = trash::send_gated(&f, &拒む門).expect_err("門で止まらない");
+        assert!(e.contains("別の担当"), "理由が返らない: {e}");
+        assert!(f.exists(), "拒否されたのに消えた");
+        assert_eq!(std::fs::read_to_string(&f).expect("read"), "中身");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

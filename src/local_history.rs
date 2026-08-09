@@ -896,6 +896,9 @@ pub enum Done {
         written: usize,
         /// その時点で存在しなかったので**消さずに残した**件数。
         kept: usize,
+        /// **書き戻せなかった理由** (他の担当が持っている / 書き込みに失敗)。
+        /// 空でなければ画面に出す — 無音で「何も起きない」にしない。
+        refused: Vec<String>,
     },
     /// 失敗。
     Failed(String),
@@ -1344,16 +1347,26 @@ impl Engine {
             let base = self.root.join(rel_to_os(path));
             let mut written = 0usize;
             let mut kept = 0usize;
-            self.write_tree(&tree, &base, &mut written, &mut kept);
+            let mut refused: Vec<String> = Vec::new();
+            self.write_tree(&tree, &base, &mut written, &mut kept, &mut refused);
             self.scan(&tr("フォルダを復元"));
-            return Done::Restored { written, kept };
+            return Done::Restored {
+                written,
+                kept,
+                refused,
+            };
         }
         let (written, kept) = match self.write_state(&st, path) {
             Ok(v) => v,
+            // 門で止まったときもここを通る (理由はそのまま画面へ出る)。
             Err(e) => return Done::Failed(e),
         };
         self.scan(&tr("復元"));
-        Done::Restored { written, kept }
+        Done::Restored {
+            written,
+            kept,
+            refused: Vec::new(),
+        }
     }
 
     /// `idx` 以降に触れた物をまとめて `idx` の直前へ戻す。
@@ -1394,9 +1407,10 @@ impl Engine {
         self.scan(&tr("復元前"));
         let mut written = 0usize;
         let mut kept = 0usize;
+        let mut refused: Vec<String> = Vec::new();
         for (p, t) in &trees {
             let base = self.root.join(rel_to_os(p));
-            self.write_tree(t, &base, &mut written, &mut kept);
+            self.write_tree(t, &base, &mut written, &mut kept, &mut refused);
         }
         for (p, st) in &states {
             match self.write_state(st, p) {
@@ -1404,11 +1418,19 @@ impl Engine {
                     written += w;
                     kept += k;
                 }
-                Err(_) => kept += 1,
+                // **黙って件数へ畳まない。** 門で止まった理由は必ず持ち帰る。
+                Err(e) => {
+                    kept += 1;
+                    push_reason(&mut refused, e);
+                }
             }
         }
         self.scan(&tr("この時点へ戻した"));
-        Done::Restored { written, kept }
+        Done::Restored {
+            written,
+            kept,
+            refused,
+        }
     }
 
     /// 1 パスをその時点の姿へ。**「無かった物」は消さない** (件数だけ返す)。
@@ -1424,24 +1446,28 @@ impl Engine {
                     .read(id)
                     .ok_or_else(|| tr("その時点の内容は保持期間を過ぎています"))?;
                 let abs = self.root.join(rel_to_os(path));
-                if let Some(d) = abs.parent() {
-                    std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-                }
-                std::fs::write(&abs, &b).map_err(|e| e.to_string())?;
+                restore_file(&abs, &b)?;
                 Ok((1, 0))
             }
         }
     }
 
     /// 写しを実体へ書き戻す (フォルダごとの復元)。
-    fn write_tree(&self, e: &Entry, at: &Path, written: &mut usize, kept: &mut usize) {
+    fn write_tree(
+        &self,
+        e: &Entry,
+        at: &Path,
+        written: &mut usize,
+        kept: &mut usize,
+        refused: &mut Vec<String>,
+    ) {
         if e.dir {
             if std::fs::create_dir_all(at).is_err() {
                 *kept += 1;
                 return;
             }
             for c in &e.children {
-                self.write_tree(c, &at.join(&c.name), written, kept);
+                self.write_tree(c, &at.join(&c.name), written, kept, refused);
             }
             return;
         }
@@ -1451,16 +1477,13 @@ impl Engine {
             return;
         }
         match self.store.read(&e.content) {
-            Some(b) => {
-                if let Some(d) = at.parent() {
-                    std::fs::create_dir_all(d).ok();
-                }
-                if std::fs::write(at, &b).is_ok() {
-                    *written += 1;
-                } else {
+            Some(b) => match restore_file(at, &b) {
+                Ok(()) => *written += 1,
+                Err(msg) => {
                     *kept += 1;
+                    push_reason(refused, msg);
                 }
-            }
+            },
             None => *kept += 1,
         }
     }
@@ -1556,6 +1579,73 @@ fn take_name(pending: &mut Option<(String, i64)>) -> String {
         Some((n, at)) if now_ms().saturating_sub(at) <= NAME_GRACE_MS => n,
         _ => tr("外部変更"),
     }
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  ワークスペースへ書き戻す口 (門つき)
+// ══════════════════════════════════════════════════════════════════
+
+/// 門の判定。テストから差し替えられるように 1 段挟む
+/// (シングルトンを経由せずに「拒否されたら書かない」を試せる)。
+type Gate<'a> = &'a dyn Fn(&Path) -> Option<String>;
+
+/// 既定の門: ファイル所有リースへ問い合わせる。
+///
+/// ガードが無効なスコープでは [`crate::lease::check_write`] が即 `Allow` を
+/// 返すので、単独で使う人の払うコストはゼロ (設計原則 3)。
+/// **早期 return を自前で書かない** — 二重判定はいつかズレる。
+fn lease_deny(abs: &Path) -> Option<String> {
+    match crate::lease::check_write(abs) {
+        crate::lease::Verdict::Deny(msg) => Some(msg),
+        crate::lease::Verdict::Allow => None,
+    }
+}
+
+/// **復元がワークスペースを書く唯一の口。** `src/editor.rs` の `Buffer::write_to`
+/// と同じ形で、書き込みの直前に門を通す。ここを 1 つに絞ってあるので、
+/// 呼び出しが増えても門を呼び忘れる経路が作れない。
+fn restore_file(abs: &Path, bytes: &[u8]) -> Result<(), String> {
+    restore_file_gated(abs, bytes, &lease_deny)
+}
+
+/// 判定を差し替えられる中身。
+fn restore_file_gated(abs: &Path, bytes: &[u8], gate: Gate<'_>) -> Result<(), String> {
+    // 拒否されたら**ディレクトリも作らない** (痕跡を残さない)。
+    if let Some(msg) = gate(abs) {
+        return Err(msg);
+    }
+    if let Some(d) = abs.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(abs, bytes).map_err(|e| e.to_string())
+}
+
+/// 同じ理由を何度も並べない (1 フォルダ復元で同じ担当の名前が 100 行出ない)。
+fn push_reason(into: &mut Vec<String>, msg: String) {
+    if into.len() < MAX_REASONS && !into.contains(&msg) {
+        into.push(msg);
+    }
+}
+
+/// 持ち帰る理由の上限。
+const MAX_REASONS: usize = 4;
+
+/// 書き戻し結果の一行 (純粋関数)。**書けなかったものがあれば必ず出す。**
+fn restored_status(written: usize, kept: usize, refused: &[String]) -> String {
+    if refused.is_empty() {
+        return trf(
+            "{n} 件を書き戻しました (その時点に無かった {k} 件はそのまま)",
+            &[("n", written.to_string()), ("k", kept.to_string())],
+        );
+    }
+    trf(
+        "{n} 件を書き戻しました / {m} 件は書き戻せません: {why}",
+        &[
+            ("n", written.to_string()),
+            ("m", refused.len().to_string()),
+            ("why", refused.join(" / ")),
+        ],
+    )
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1848,11 +1938,12 @@ impl LocalHistory {
                 self.log = v.clone();
                 self.rebuild();
             }
-            Done::Restored { written, kept } => {
-                self.status = trf(
-                    "{n} 件を書き戻しました (その時点に無かった {k} 件はそのまま)",
-                    &[("n", written.to_string()), ("k", kept.to_string())],
-                );
+            Done::Restored {
+                written,
+                kept,
+                refused,
+            } => {
+                self.status = restored_status(*written, *kept, refused);
             }
             Done::Diff { .. } => self.status.clear(),
             Done::Failed(e) => self.status = e.clone(),
@@ -2957,5 +3048,79 @@ mod tests {
         assert!(p.starts_with(crate::config::zaivern_dir().join("local_history")));
         // ワークスペースが違えば別のフォルダ
         assert_ne!(store_dir(Path::new(".")), store_dir(Path::new("..")));
+    }
+
+    // ── ファイル所有リースの門 ──────────────────────────────
+
+    /// 「別の担当が持っている」門 (シングルトンを経由せずに試す)。
+    fn 拒む門(p: &Path) -> Option<String> {
+        Some(format!(
+            "{} は別の担当 (sess-other) が編集中です",
+            p.display()
+        ))
+    }
+
+    /// 「誰も持っていない」門 (= ガードが無効なときと同じ答え)。
+    fn 通す門(_p: &Path) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn 他人が持つファイルへは復元しない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-lh-test", "lease-deny");
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "いまの中身").expect("write");
+
+        let e =
+            restore_file_gated(&f, "むかしの中身".as_bytes(), &拒む門).expect_err("門で止まらない");
+        assert!(e.contains("別の担当"), "理由が返っていない: {e}");
+        assert_eq!(
+            std::fs::read_to_string(&f).expect("read"),
+            "いまの中身",
+            "拒否されたのに上書きされた"
+        );
+
+        // 無かったファイルも作らない (ディレクトリごと痕跡を残さない)
+        let deep = dir.join("nest").join("b.txt");
+        assert!(restore_file_gated(&deep, b"x", &拒む門).is_err());
+        assert!(!deep.exists(), "拒否されたのに作られた");
+        assert!(!dir.join("nest").exists(), "拒否されたのに親が作られた");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 門が通れば従来どおり書き戻す() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-lh-test", "lease-allow");
+        let f = dir.join("nest").join("a.txt");
+        restore_file_gated(&f, "むかしの中身".as_bytes(), &通す門).expect("通らない");
+        assert_eq!(std::fs::read_to_string(&f).expect("read"), "むかしの中身");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 書き戻せなかった理由は画面の一行に出る() {
+        // 全部書けたときは従来の文面のまま。
+        let ok = restored_status(3, 1, &[]);
+        assert!(ok.contains('3') && ok.contains('1'), "{ok}");
+        assert!(!ok.contains("書き戻せません"), "{ok}");
+
+        // 1 件でも止まったら理由が出る (無音にしない)。
+        let ng = restored_status(2, 1, &["src/app.rs は別の担当が編集中です".into()]);
+        assert!(ng.contains("別の担当"), "理由が消えている: {ng}");
+        assert!(ng.contains("src/app.rs"), "どのファイルか出ていない: {ng}");
+    }
+
+    #[test]
+    fn 同じ理由は何度も並べない() {
+        let mut v: Vec<String> = Vec::new();
+        for _ in 0..10 {
+            push_reason(&mut v, "同じ担当が持っています".into());
+        }
+        assert_eq!(v.len(), 1);
+        for i in 0..10 {
+            push_reason(&mut v, format!("理由 {i}"));
+        }
+        assert_eq!(v.len(), MAX_REASONS, "上限を超えて溜まっている");
     }
 }

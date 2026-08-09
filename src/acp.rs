@@ -998,6 +998,219 @@ pub fn resolve_in_roots(roots: &[PathBuf], raw: &str) -> Result<PathBuf, FsDenie
     }
 }
 
+// ── ファイル所有リースの門 (ACP 側) ───────────────────────────────────────
+//
+// ACP では **Zaivern 自身がファイルを書く** (`fs/write_text_file`)。つまり
+// ベンダー側のフックを 1 つも設置せずに、`ACP_CATALOG` の全アダプタへ
+// リースを効かせられる唯一の場所がここ。エディタ側の `Buffer::write_to` と
+// 同じ「書き込み口を 1 つに絞って、その手前に門を置く」形にしてある。
+
+/// 書き込みの門。`Some(理由)` なら**書かずに**その文面を返す。
+///
+/// 判定を引数で挟むのは `local_history.rs` の `Gate` と同じ作法。シングル
+/// トン (`lease::check_write`) にも実 `~/.zaivern` にも触れずにテストできる。
+type WriteGate<'a> = &'a dyn Fn(&Path) -> Option<String>;
+
+/// ACP セッションの身元。**リースの持ち主はこれで決まる**。
+///
+/// `session` を第一の身元に据えるのが肝で ([`crate::lease::Holder::same`] の
+/// 規則)、同じフォルダで 2 体走っていても互いの所有を素通りさせない。
+#[derive(Clone, Debug, Default)]
+struct AcpWho {
+    /// ベンダーが振った `sessionId`。
+    session: String,
+    /// 画面と拒否理由に出す名前 (カタログのラベル)。
+    agent: String,
+    /// エージェント本体の PID。0 = 生存確認なし (TTL だけで回収)。
+    pid: u32,
+}
+
+impl AcpWho {
+    /// スコープのツリーを添えてリースの持ち主にする。
+    ///
+    /// `cwd` を入れるのは **`session` が空のときの保険** ([`crate::lease::Holder::same`]
+    /// はセッション ID が無ければ `cwd` + `agent` で照合する)。`sessionId` を
+    /// 送ってこないアダプタでも、少なくとも自分自身とは一致する
+    /// = 自分が確保したファイルへの再書き込みで自分に止められない。
+    fn holder(&self, tree: &Path) -> crate::lease::Holder {
+        crate::lease::Holder {
+            agent: if self.agent.is_empty() {
+                tr("ACP エージェント")
+            } else {
+                self.agent.clone()
+            },
+            session: self.session.clone(),
+            cwd: crate::lease::normalize_path(&tree.to_string_lossy()),
+            pid: self.pid,
+        }
+    }
+}
+
+/// 書き込み先を含むワークスペースルート (いちばん深いもの) を返す (**純関数**)。
+///
+/// スコープを `AcpClient` の作業フォルダから起こすと**マルチルートで外れる**
+/// ので、パス自身が属するルートから起こす。ここへ来るパスは
+/// [`resolve_in_roots`] が既にルート内だと検査済み。
+fn scope_root<'a>(roots: &'a [PathBuf], abs: &Path) -> Option<&'a Path> {
+    roots
+        .iter()
+        .filter(|r| abs.starts_with(r))
+        .max_by_key(|r| r.components().count())
+        .map(PathBuf::as_path)
+}
+
+/// 台帳の置き場所を明示した**書き込みの門**。`Some(理由)` なら書かせない。
+///
+/// 本番は `dir = lease::store_dir()`。**テストが実 `~/.zaivern` に触れない
+/// ため**に引数へ出してある (環境変数で分岐させると、本番の経路に
+/// テスト専用の枝が残る)。
+///
+/// **[`crate::lease::check_write`] を使っていないのは意図的。** あれは持ち主を
+/// エディタ自身 (`editor_holder`) に固定するので、ACP セッションが自分で
+/// 確保したファイルへ 2 度目を書いた瞬間に**自分のリースで拒否される**。
+/// 門は「いま誰が書こうとしているか」ごとに要る。
+fn lease_verdict_in(dir: &Path, roots: &[PathBuf], who: &AcpWho, abs: &Path) -> Option<String> {
+    let base = scope_root(roots, abs)?;
+    let r = crate::lease::roots_of(base);
+    let store = crate::lease::store_path_in(dir, &r.key);
+    // 使っていない人が払う全コストがここ (`stat` 1 回)。設計原則 3。
+    if !crate::lease::enabled(&store) {
+        return None;
+    }
+    // ツリーの外 (別リポジトリ / システムのファイル) は関知しない。
+    let rel = crate::lease::rel_within(&r.tree, abs)?;
+    let holder = who.holder(&r.tree);
+    // **判定と確保を 1 回で済ませる。** 誰も持っていなければ書いた本人の
+    // ものにする (`lease::gate` と同じ考え方) — そうしないと台帳が空のままで、
+    // 2 人目が同じファイルへ来ても止められない。
+    match crate::lease::claim_for(
+        &store,
+        &holder,
+        &rel,
+        crate::lease::now_secs(),
+        crate::lease::DEFAULT_TTL_SECS,
+        &crate::instances::pid_alive,
+    ) {
+        // 文面が取れないのは台帳を読み直せなかったときだけ。誰が持っているかは
+        // 分かっているので、それだけでも必ず出す (「拒否されました」だけでは
+        // ユーザーは機能を切る)。
+        crate::lease::Own::Taken { owner, reason } if reason.is_empty() => Some(trf(
+            "「{path}」は {owner} が確保しています。\n\
+             同じファイルを 2 人が同時に編集すると、衝突はマージのときまで見えません。\n\
+             対処: 担当を分けるか、Zaivern Code の「ファイル所有の一覧」から該当のリースを解放してください",
+            &[("path", rel.clone()), ("owner", owner)],
+        )),
+        crate::lease::Own::Taken { reason, .. } => Some(reason),
+        // 台帳を触れない (`Own::Off`) は fail-open。エディタ自身の保存経路は
+        // fail-closed なので、手元の編集はそちらで守られている。
+        crate::lease::Own::Off | crate::lease::Own::Pending | crate::lease::Own::Mine { .. } => {
+            None
+        }
+    }
+}
+
+/// このセッションが持っているリースを全ルートで解放する。
+///
+/// 置き場所を引数に出してある理由は [`lease_verdict_in`] と同じ。
+fn release_leases_in(dir: &Path, roots: &[PathBuf], who: &AcpWho) {
+    for base in roots {
+        let r = crate::lease::roots_of(base);
+        let store = crate::lease::store_path_in(dir, &r.key);
+        if !crate::lease::enabled(&store) {
+            continue;
+        }
+        // 取れなければ諦める (TTL が回収する)。待つのは最大 200ms。
+        let _ =
+            crate::lease::with_store(&store, |s| crate::lease::release(s, &who.holder(&r.tree)));
+    }
+}
+
+/// [`FsHost::write_text_file`] の中身。**門を引数で挟んである**。
+fn write_text_file_gated(
+    roots: &[PathBuf],
+    params: &Value,
+    gate: WriteGate<'_>,
+) -> Result<Value, (i64, String)> {
+    let raw = params.get("path").and_then(Value::as_str).unwrap_or("");
+    let content = params
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let path = resolve_in_roots(roots, raw).map_err(|d| {
+        (
+            ERR_INVALID_PARAMS,
+            trf(
+                "書き込みを拒否しました ({why}): {path}",
+                &[("why", tr(d.label())), ("path", raw.to_string())],
+            ),
+        )
+    })?;
+    // **ここが門。** 親フォルダを作る前に判定する — 拒否した書き込みの副作用で
+    // ディレクトリだけ生えると、後から見て「触った」ように見えるため。
+    // 文面は `lease::deny_reason` を**そのまま**返す (誰が・いつから持っていて・
+    // どうすればよいかが入っているので、エージェントは自分で担当を変えられる)。
+    // コードは経路脱出と同じ `-32602` — 「このパラメータでは通せない」で形が揃う。
+    if let Some(why) = gate(&path) {
+        return Err((ERR_INVALID_PARAMS, why));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                ERR_INTERNAL,
+                trf("親フォルダを作れません: {e}", &[("e", e.to_string())]),
+            )
+        })?;
+    }
+    std::fs::write(&path, content).map_err(|e| {
+        (
+            ERR_INTERNAL,
+            trf(
+                "書き込めません: {path} ({e})",
+                &[("path", raw.to_string()), ("e", e.to_string())],
+            ),
+        )
+    })?;
+    Ok(Value::Null)
+}
+
+/// 承認要求が「他人が確保しているファイルへの編集」か (**純関数**)。
+///
+/// `locations` は ACP では**助言**で読み取り対象が混ざるので、
+/// **編集系の kind のときだけ**見る。全部を見て拒否すると `Read` まで落ちる。
+fn permission_lease_block(
+    store: &crate::lease::Store,
+    holder: &crate::lease::Holder,
+    tree: &Path,
+    row: &ToolCallRow,
+    now: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> Option<String> {
+    if !matches!(
+        row.kind,
+        Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
+    ) {
+        return None;
+    }
+    for l in row.locations.as_ref()? {
+        let raw = Path::new(&l.path);
+        let abs = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            tree.join(raw)
+        };
+        let Some(rel) = crate::lease::rel_within(tree, &abs) else {
+            continue;
+        };
+        if let crate::lease::Verdict::Deny(why) =
+            crate::lease::decide(store, holder, &rel, now, alive)
+        {
+            return Some(why);
+        }
+    }
+    None
+}
+
 /// クライアント側 `fs/*` の実装。**リーダースレッドから直接呼ばれる**
 /// (UI のフレームを待たせない)。
 pub struct FsHost {
@@ -1011,6 +1224,23 @@ struct FsHostState {
     /// **まだ保存していないエディタバッファ**。ここが ACP の存在意義の 1 つで、
     /// ディスクではなく「いま画面に見えている内容」をエージェントへ返せる。
     unsaved: HashMap<PathBuf, String>,
+    /// `sessionId` → リースの持ち主。`fs/write_text_file` はここから引く。
+    sessions: HashMap<String, AcpWho>,
+}
+
+impl FsHostState {
+    /// `sessionId` から身元を引く。登録が無くても**門は通す** — セッション ID
+    /// だけで [`crate::lease::Holder::same`] は自分自身と一致するので、
+    /// 名前が出ないだけで所有の判定は正しく効く。
+    fn who_of(&self, session_id: &str) -> AcpWho {
+        self.sessions
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| AcpWho {
+                session: session_id.to_string(),
+                ..AcpWho::default()
+            })
+    }
 }
 
 impl Default for FsHost {
@@ -1053,6 +1283,47 @@ impl FsHost {
         self.inner.lock().map(|g| g.unsaved.len()).unwrap_or(0)
     }
 
+    /// セッションが出来たら身元を登録する (`session/new` の返事で 1 回)。
+    ///
+    /// これがあると拒否の文面に**エージェント名**が出る。無くても
+    /// `sessionId` だけで所有の判定は成立する ([`FsHostState::who_of`])。
+    pub fn register_session(&self, session_id: &str, agent: &str, pid: u32) {
+        if session_id.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.inner.lock() {
+            g.sessions.insert(
+                session_id.to_string(),
+                AcpWho {
+                    session: session_id.to_string(),
+                    agent: agent.to_string(),
+                    pid,
+                },
+            );
+        }
+    }
+
+    /// セッションを畳み、**持っていたリースをその場で返す**。
+    ///
+    /// 返さないと、接続を切ったあと TTL (既定 30 分) のあいだ他の担当と
+    /// エディタ自身の保存まで止まる。台帳が無いワークスペースでは
+    /// ルートごとに `stat` 1 回で抜ける。
+    pub fn release_session(&self, session_id: &str) -> bool {
+        let (who, roots) = {
+            let Ok(mut g) = self.inner.lock() else {
+                return false;
+            };
+            let Some(who) = g.sessions.remove(session_id) else {
+                return false;
+            };
+            (who, g.roots.clone())
+        };
+        // **ロックを手放してから** I/O する (リーダースレッドの `fs/*` を
+        // 台帳のロック待ちで止めないため)。
+        release_leases_in(&crate::lease::store_dir(), &roots, &who);
+        true
+    }
+
     /// `fs/read_text_file`。`line` は 1 始まり、`limit` は行数。
     fn read_text_file(&self, params: &Value) -> Result<Value, (i64, String)> {
         let raw = params.get("path").and_then(Value::as_str).unwrap_or("");
@@ -1091,47 +1362,31 @@ impl FsHost {
     }
 
     /// `fs/write_text_file`。**ファイルが無ければ作る** (親ディレクトリごと)。
+    ///
+    /// ACP では**このプロセスがファイルを書く**ので、ベンダー側のフックを
+    /// 1 つも設置せずにファイル所有リースを効かせられる唯一の場所がここ。
+    /// 持ち主は `sessionId` なので、同じエージェントの再書き込みが
+    /// 自分自身に阻まれることはない。
+    ///
+    /// **効く範囲**: client の `fs/writeTextFile` を経由するアダプタだけ。
+    /// 自分でファイルを書くアダプタには届かないので、そちらは
+    /// [`AcpClient::lease_denies`] (承認要求) 側の門で受ける。
     fn write_text_file(&self, params: &Value) -> Result<Value, (i64, String)> {
-        let raw = params.get("path").and_then(Value::as_str).unwrap_or("");
-        let content = params
-            .get("content")
+        let session = params
+            .get("sessionId")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let roots = {
+            .unwrap_or_default();
+        let (roots, who) = {
             let g = self
                 .inner
                 .lock()
                 .map_err(|_| (ERR_INTERNAL, tr("内部状態を取得できません")))?;
-            g.roots.clone()
+            (g.roots.clone(), g.who_of(session))
         };
-        let path = resolve_in_roots(&roots, raw).map_err(|d| {
-            (
-                ERR_INVALID_PARAMS,
-                trf(
-                    "書き込みを拒否しました ({why}): {path}",
-                    &[("why", tr(d.label())), ("path", raw.to_string())],
-                ),
-            )
-        })?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                (
-                    ERR_INTERNAL,
-                    trf("親フォルダを作れません: {e}", &[("e", e.to_string())]),
-                )
-            })?;
-        }
-        std::fs::write(&path, content).map_err(|e| {
-            (
-                ERR_INTERNAL,
-                trf(
-                    "書き込めません: {path} ({e})",
-                    &[("path", raw.to_string()), ("e", e.to_string())],
-                ),
-            )
-        })?;
-        Ok(Value::Null)
+        let dir = crate::lease::store_dir();
+        write_text_file_gated(&roots, params, &|abs: &Path| {
+            lease_verdict_in(&dir, &roots, &who, abs)
+        })
     }
 
     /// リーダースレッドから呼ぶ入口。**このモジュールが答えられるものだけ**扱う。
@@ -1674,6 +1929,9 @@ pub struct AcpClient {
     child: Option<std::process::Child>,
     /// 生きている間だけ持つ PID。wait 済みなら `None` (再利用 PID を撃たない)。
     pid: Option<u32>,
+    /// クライアント側 `fs/*` の実体。**リースの持ち主表を持っている**ので、
+    /// セッションが出来た / 消えたときにここへ知らせる。
+    host: Arc<FsHost>,
     tx_out: mpsc::Sender<String>,
     rx: mpsc::Receiver<AcpEvent>,
 
@@ -1829,6 +2087,7 @@ impl AcpClient {
             via_npx: launch.via_npx,
             child: Some(child),
             pid: Some(pid),
+            host,
             tx_out,
             rx,
             next_id: 0,
@@ -2158,6 +2417,11 @@ impl AcpClient {
                         false,
                     ));
                 }
+                // **リースの持ち主として登録する。** 以降 `fs/write_text_file`
+                // は `sessionId` からこの身元を引き、書いたファイルを
+                // このセッション名義で確保する。
+                self.host
+                    .register_session(&sid, &self.label, self.pid.unwrap_or(0));
                 self.session = Some(sid);
                 self.phase = Phase::Idle;
                 Some((
@@ -2262,6 +2526,41 @@ impl AcpClient {
         p.status.apply(&mut row.status);
         p.locations.apply(&mut row.locations);
         p.raw_input.apply(&mut row.raw_input);
+        // ── 他人が持っているファイルへの編集要求は、ユーザーへ出す前に断る ──
+        //
+        // **なぜここにも門を置くか**: ACP アダプタには client の
+        // `fs/writeTextFile` を通さず**自分でファイルを書く**ものがある。
+        // その場合 `FsHost` の門は 1 度も呼ばれず、`session/request_permission`
+        // がクライアント側に残る唯一の関所になる。
+        //
+        // **なぜ確保しないか**: `locations` は助言で読み取り対象が混ざるので、
+        // ここから自動確保すると「読んだだけのファイル」を TTL のあいだ
+        // 他人から奪う。確保は実際に書きに来た `fs/write_text_file` でだけ行う。
+        //
+        // **なぜロックを取らないか**: ここは UI スレッド。台帳の置き換えは
+        // tmp → rename なので、ロック無しで読んでも書きかけは見えない
+        // (CLAUDE.md「git を UI スレッドで待たない」と同じ理由)。
+        //
+        // ACP の承認応答に理由を載せる欄は無いので、文面はログとトーストへ出す。
+        if let Some(why) = self.lease_denies(&crate::lease::store_dir(), &row) {
+            self.log.push_back(format!("lease deny: {why}"));
+            toasts.push((
+                trf(
+                    "🛡 {label}: 他の担当が持っているファイルなので編集を断りました",
+                    &[("label", self.label.clone())],
+                ),
+                false,
+            ));
+            self.reply_permission(
+                PendingPerm {
+                    approval_id: 0,
+                    req_id,
+                    options: params.options,
+                },
+                ReplyAction::Deny,
+            );
+            return;
+        }
         let text = permission_prompt_text(&row);
         // 指紋はリクエスト ID から作る。**同じ内容でも重複扱いにしない**
         // (重複で握り潰すとエージェントが永久に待つ)。
@@ -2305,8 +2604,46 @@ impl AcpClient {
         }
     }
 
+    /// リースの持ち主としてのこの接続 (`fs/write_text_file` と同じ身元)。
+    fn who(&self) -> AcpWho {
+        AcpWho {
+            session: self.session.clone().unwrap_or_default(),
+            agent: self.label.clone(),
+            pid: self.pid.unwrap_or(0),
+        }
+    }
+
+    /// この承認要求が他人のリースを侵すか。侵すなら**拒否の本文**を返す。
+    ///
+    /// 台帳の置き場所を引数に出してあるのはテストのため (本番は
+    /// [`crate::lease::store_dir`])。
+    fn lease_denies(&self, dir: &Path, row: &ToolCallRow) -> Option<String> {
+        let roots = crate::lease::roots_of(&self.cwd);
+        let store = crate::lease::store_path_in(dir, &roots.key);
+        // 使っていない人が払う全コストがここ (`stat` 1 回)。
+        if !crate::lease::enabled(&store) {
+            return None;
+        }
+        // 読めない / 壊れている = こちらの都合。**通す** (`lease::gate` と同じ向き)。
+        let st = crate::lease::read_store(&store).ok()?;
+        permission_lease_block(
+            &st,
+            &self.who().holder(&roots.tree),
+            &roots.tree,
+            row,
+            crate::lease::now_secs(),
+            &crate::instances::pid_alive,
+        )
+    }
+
     /// 明示的に止める。**プロセスツリーごと** (孫の MCP まで)。
     pub fn stop(&mut self) {
+        // 持っていたファイルのリースを返す。**返さないと、接続を切ったあとも
+        // TTL (既定 30 分) のあいだ他の担当とエディタ自身の保存が止まる。**
+        // 2 度目以降は登録が消えているので何もしない (`Drop` からも通る)。
+        if let Some(sid) = self.session.clone() {
+            self.host.release_session(&sid);
+        }
         if let Some(pid) = self.pid.take() {
             crate::procx::kill_tree(pid);
         }
@@ -3220,6 +3557,8 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     // オーバーレイ。**接続が 0 本でパネルも閉じているなら即 return する**
     // ので、アイドルのフレームでは 1 ピクセルも触らない (設計原則 3)。
     draw: Some(|app, ctx| app.acp_tick(ctx)),
+    settings: &[],
+    binds: &[],
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3872,6 +4211,263 @@ mod tests {
         assert_eq!(slice_lines(text, Some(99), Some(2)), "");
     }
 
+    // ── ファイル所有リース × ACP ──────────────────────────────────
+    //
+    // 門は引数で挟んであるので、シングルトンにも実 `~/.zaivern` にも
+    // 触れずに丸ごと動かせる。台帳は temp に作る。
+
+    /// `(ワークスペースルート, 台帳フォルダ, 台帳ファイル)` を temp に用意する。
+    fn lease_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = crate::test_util::unique_temp_dir("zaivern", tag);
+        let root = base.join("ws");
+        let dir = base.join("leases");
+        std::fs::create_dir_all(&root).expect("ルートを作れる");
+        std::fs::create_dir_all(&dir).expect("台帳フォルダを作れる");
+        let root = crate::pathx::canonical(&root);
+        let store = crate::lease::store_path_in(&dir, &crate::lease::roots_of(&root).key);
+        crate::lease::enable(&store).expect("有効化できる");
+        (root, dir, store)
+    }
+
+    fn 書く(
+        roots: &[PathBuf],
+        dir: &Path,
+        who: &AcpWho,
+        target: &Path,
+        body: &str,
+    ) -> Result<Value, (i64, String)> {
+        write_text_file_gated(
+            roots,
+            &json!({
+                "sessionId": who.session.clone(),
+                "path": target.display().to_string(),
+                "content": body,
+            }),
+            &|abs: &Path| lease_verdict_in(dir, roots, who, abs),
+        )
+    }
+
+    #[test]
+    fn 他人が確保したファイルへの書き込みは書かずにエラーを返す() {
+        let (root, dir, store) = lease_fixture("acp-lease-deny");
+        let target = root.join("src").join("shared.rs");
+        // 先に別の担当が確保する
+        let other = crate::lease::Holder {
+            agent: "別の担当".to_string(),
+            session: "sess-other".to_string(),
+            cwd: crate::lease::normalize_path(&root.to_string_lossy()),
+            pid: 0,
+        };
+        let own = crate::lease::claim_for(
+            &store,
+            &other,
+            "src/shared.rs",
+            crate::lease::now_secs(),
+            600,
+            &|_| false,
+        );
+        assert!(matches!(own, crate::lease::Own::Mine { .. }), "{own:?}");
+
+        let me = AcpWho {
+            session: "sess-mine".to_string(),
+            agent: "Codex (ACP)".to_string(),
+            pid: 0,
+        };
+        let roots = vec![root.clone()];
+        let err = 書く(&roots, &dir, &me, &target, "上書き").expect_err("拒否される");
+        // 経路脱出と同じ形 (-32602)
+        assert_eq!(err.0, ERR_INVALID_PARAMS);
+        // 拒否の本文に**誰が持っているか**が入る
+        assert!(err.1.contains("別の担当"), "持ち主が出ていない: {}", err.1);
+        assert!(
+            err.1.contains("src/shared.rs"),
+            "対象が出ていない: {}",
+            err.1
+        );
+        assert!(!target.exists(), "拒否したのに書かれている");
+        assert!(
+            !target.parent().expect("親がある").exists(),
+            "拒否したのに親フォルダを作っている"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().expect("base"));
+    }
+
+    #[test]
+    fn 誰も持っていなければ書けて自分名義で確保される() {
+        let (root, dir, store) = lease_fixture("acp-lease-claim");
+        let target = root.join("a.rs");
+        let me = AcpWho {
+            session: "sess-a".to_string(),
+            agent: "Codex (ACP)".to_string(),
+            pid: 0,
+        };
+        let roots = vec![root.clone()];
+        書く(&roots, &dir, &me, &target, "1").expect("書ける");
+        assert_eq!(std::fs::read_to_string(&target).expect("読める"), "1");
+
+        // そのとき自分名義で確保されている
+        let st = crate::lease::read_store(&store).expect("台帳を読める");
+        assert_eq!(st.leases.len(), 1, "{st:?}");
+        assert_eq!(st.leases[0].holder.session, "sess-a");
+        assert!(st.leases[0].covers_path("a.rs"), "{st:?}");
+
+        // 同じセッションの再書き込みは自分に阻まれない
+        書く(&roots, &dir, &me, &target, "2").expect("2 度目も書ける");
+        assert_eq!(std::fs::read_to_string(&target).expect("読める"), "2");
+
+        // 別セッションはここで止まる (= 2 人目が来た瞬間に効く)
+        let other = AcpWho {
+            session: "sess-b".to_string(),
+            agent: "Gemini (ACP)".to_string(),
+            pid: 0,
+        };
+        let err = 書く(&roots, &dir, &other, &target, "3").expect_err("止まる");
+        assert!(err.1.contains("Codex (ACP)"), "{}", err.1);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("読める"),
+            "2",
+            "拒否したのに上書きされた"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().expect("base"));
+    }
+
+    #[test]
+    fn 台帳が無いワークスペースでは門を通らず従来どおり書ける() {
+        let base = crate::test_util::unique_temp_dir("zaivern", "acp-lease-off");
+        let root = crate::pathx::canonical(&base);
+        // enable しない = このスコープでは機能が無効
+        let dir = root.join("leases-not-created");
+        let target = root.join("b.rs");
+        let me = AcpWho {
+            session: "sess-x".to_string(),
+            agent: "Codex (ACP)".to_string(),
+            pid: 0,
+        };
+        let roots = vec![root.clone()];
+        assert!(lease_verdict_in(&dir, &roots, &me, &target).is_none());
+        書く(&roots, &dir, &me, &target, "素通り").expect("書ける");
+        assert_eq!(std::fs::read_to_string(&target).expect("読める"), "素通り");
+        assert!(!dir.exists(), "無効なのに台帳を作っている");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 接続を切るとそのセッションのリースが返る() {
+        let (root, dir, store) = lease_fixture("acp-lease-release");
+        let target = root.join("c.rs");
+        let me = AcpWho {
+            session: "sess-gone".to_string(),
+            agent: "Codex (ACP)".to_string(),
+            pid: 0,
+        };
+        let roots = vec![root.clone()];
+        書く(&roots, &dir, &me, &target, "x").expect("書ける");
+        assert_eq!(
+            crate::lease::read_store(&store)
+                .expect("読める")
+                .leases
+                .len(),
+            1
+        );
+        release_leases_in(&dir, &roots, &me);
+        assert!(
+            crate::lease::read_store(&store)
+                .expect("読める")
+                .leases
+                .is_empty(),
+            "接続を切ってもリースが残っている"
+        );
+        // 返ったので次の担当が書ける
+        let next = AcpWho {
+            session: "sess-next".to_string(),
+            agent: "Gemini (ACP)".to_string(),
+            pid: 0,
+        };
+        書く(&roots, &dir, &next, &target, "y").expect("次の担当が書ける");
+        let _ = std::fs::remove_dir_all(root.parent().expect("base"));
+    }
+
+    #[test]
+    fn 他人が持つファイルの編集承認は自動で断り読み取りは通す() {
+        let root = crate::pathx::canonical(&crate::test_util::unique_temp_dir(
+            "zaivern",
+            "acp-lease-perm",
+        ));
+        let other = crate::lease::Holder {
+            agent: "別の担当".to_string(),
+            session: "sess-other".to_string(),
+            cwd: crate::lease::normalize_path(&root.to_string_lossy()),
+            pid: 0,
+        };
+        let st = crate::lease::Store {
+            leases: vec![crate::lease::Lease {
+                holder: other.clone(),
+                patterns: vec!["src/a.rs".to_string()],
+                acquired_at: 100,
+                expires_at: 1000,
+                note: String::new(),
+            }],
+        };
+        let me = AcpWho {
+            session: "sess-mine".to_string(),
+            agent: "Codex (ACP)".to_string(),
+            pid: 0,
+        };
+        let mine = me.holder(&root);
+        let loc = vec![ToolCallLocation {
+            path: root.join("src").join("a.rs").display().to_string(),
+            line: None,
+        }];
+        let edit = ToolCallRow {
+            kind: Some(ToolKind::Edit),
+            locations: Some(loc.clone()),
+            ..Default::default()
+        };
+        let why = permission_lease_block(&st, &mine, &root, &edit, 200, &|_| false)
+            .expect("編集は断られる");
+        assert!(why.contains("別の担当"), "{why}");
+
+        // `locations` は助言なので、読み取り種別は落とさない
+        let read = ToolCallRow {
+            kind: Some(ToolKind::Read),
+            locations: Some(loc.clone()),
+            ..Default::default()
+        };
+        assert!(permission_lease_block(&st, &mine, &root, &read, 200, &|_| false).is_none());
+
+        // 自分が持っているなら通る
+        let owner_side = AcpWho {
+            session: "sess-other".to_string(),
+            agent: "別の担当".to_string(),
+            pid: 0,
+        };
+        assert!(
+            permission_lease_block(&st, &owner_side.holder(&root), &root, &edit, 200, &|_| {
+                false
+            })
+            .is_none()
+        );
+
+        // 期限切れなら止めない (リースは無期限に居座らない)
+        assert!(permission_lease_block(&st, &mine, &root, &edit, 100_000, &|_| false).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 書き込み先はいちばん深いルートでスコープを決める() {
+        // パスは temp から起こす (どの OS でも成り立つ形にする)
+        let a = std::env::temp_dir().join("zaivern-scope-a");
+        let b = a.join("inner");
+        let roots = vec![a.clone(), b.clone()];
+        assert_eq!(scope_root(&roots, &a.join("x.rs")), Some(a.as_path()));
+        assert_eq!(scope_root(&roots, &b.join("x.rs")), Some(b.as_path()));
+        // どのルートにも属さないなら関知しない
+        let outside = std::env::temp_dir()
+            .join("zaivern-scope-other")
+            .join("x.rs");
+        assert_eq!(scope_root(&roots, &outside), None);
+    }
+
     #[test]
     fn 知らないクライアントメソッドは_32601で返す() {
         let host = FsHost::default();
@@ -4372,6 +4968,7 @@ rl.on("line", (line) => {
             via_npx: false,
             child: None,
             pid: None,
+            host: Arc::new(FsHost::default()),
             tx_out,
             rx,
             next_id: 0,

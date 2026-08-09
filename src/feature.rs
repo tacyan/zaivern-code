@@ -75,6 +75,56 @@ pub struct Entry {
     pub id: &'static str,
 }
 
+/// 機能が自分で宣言する設定 1 件。
+///
+/// **`config.rs` の `Config` 構造体へフィールドを足させないための面。**
+/// 従来は設定を持つ機能が `Config` と既定値と設定画面の 3 か所へ追記して
+/// いたので、2 つのブランチが同時に設定を足すと必ず衝突した
+/// (which-key と local_history が実際に 3 ハンク衝突した)。値は
+/// [`crate::config::Config::extra`] に `key` 文字列で入るので、
+/// **共有ファイルへの追記が 1 行も要らない**。
+pub struct Setting {
+    /// `"<module>.<name>"` 形式の安定キー。設定ファイルにもこの文字列で載る。
+    pub key: &'static str,
+    /// 設定画面の見出し。**日本語の原文**を置く (表示時に [`tr`] を通す)。
+    pub label: &'static str,
+    /// 補足説明。空でよい。
+    pub help: &'static str,
+    /// 既定値。設定ファイルに無ければこれが使われる。
+    pub default: SettingValue,
+}
+
+/// [`Setting`] の値。設定画面の入力欄の種類もこれで決まる。
+///
+/// **4 種すべてを最初から持たせてある。** レジストリの目的は「設定を足すのに
+/// 共有ファイルを触らせない」ことなので、種類が足りずに後から
+/// `feature.rs` と `config.rs` を editing する羽目になったら本末転倒になる。
+/// いま実際に使われているのは `Bool` / `Int` / `Text` だけで、`Float` は
+/// まだ使い手がいない — それでも消さないのはこの理由による
+/// (使い手が現れた日に共有ファイルを 2 つ触るコストのほうが高い)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(dead_code)]
+pub enum SettingValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Text(&'static str),
+}
+
+/// 機能が自分で宣言する既定のキーバインド 1 件。
+///
+/// `keybinds.rs` の `BindAction` は固定長配列 (`[BindAction; N]`) ＋ 件数検査
+/// テストなので、機能側から増やすと必ず共有ファイルの追記になる。こちらは
+/// [`Cmd::Feature`] を直に指すので、**`BindAction` を 1 つも増やさない**。
+pub struct Bind {
+    /// 対象の [`Entry::id`]。同じモジュールの ID だけを指せる。
+    pub id: &'static str,
+    /// 既定の打鍵 (`"⌘⇧J"` / `"Ctrl+Shift+J"` のような表記)。
+    /// **画面に出すときはここではなく実際の割り当てから起こす**
+    /// (`config.toml` で再割り当てされたら表記も変わるため)。
+    pub default: &'static str,
+}
+
 /// 1 つの機能モジュールが公開する登録内容。
 pub struct Feature {
     /// モジュール名 (`src/<module>.rs` と一致させる)。ID の接頭辞にもなる。
@@ -89,6 +139,10 @@ pub struct Feature {
     /// **アイドル時に再描画を要求しないこと** (設計原則 3: アイドル時の
     /// コストはゼロ)。描くものが無いフレームは 1 ピクセルも触らない。
     pub draw: Option<fn(&mut ZaivernApp, &egui::Context)>,
+    /// この機能が持つ設定 ([`Setting`])。無ければ空スライス。
+    pub settings: &'static [Setting],
+    /// この機能の既定キーバインド ([`Bind`])。無ければ空スライス。
+    pub binds: &'static [Bind],
 }
 
 /// 登録済みの機能。

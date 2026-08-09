@@ -171,6 +171,11 @@ pub enum OrchAction {
         title: String,
         description: String,
         caps: Vec<String>,
+        /// 担当ファイル (スコープ相対 / `/` 区切り / glob 可)。
+        ///
+        /// **これが空だと衝突の事前チェックは何も見ない。** 並列で走らせる
+        /// なら必ず入れる — 割り当ての瞬間に重なりを止める唯一の材料。
+        files: Vec<String>,
         target: TaskTarget,
     },
     SendMessage {
@@ -191,6 +196,11 @@ pub struct OrchState {
     pub title: String,
     pub description: String,
     pub caps: String,
+    /// 担当ファイル (カンマ / 空白 / 改行区切り、glob 可)。
+    ///
+    /// **ここが空だと衝突は「警告」止まりで、割り当ては止まらない。**
+    /// 埋まっていれば `coordinator::admit` が重なりを fail-closed で断る。
+    pub files: String,
     pub target: TaskTarget,
 
     // メッセージ送信フォーム
@@ -224,6 +234,7 @@ impl Default for OrchState {
             title: String::new(),
             description: String::new(),
             caps: String::new(),
+            files: String::new(),
             target: TaskTarget::default(),
             msg_open: false,
             msg_body: String::new(),
@@ -325,10 +336,13 @@ pub fn apply_action(
             title,
             description,
             caps,
+            files,
             target,
         } => {
             let caps_ref: Vec<&str> = caps.iter().map(|s| s.as_str()).collect();
-            let tid = co.add_task(title.clone(), description, &caps_ref, now);
+            let files_ref: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+            let tid =
+                co.add_task_with_files(title.clone(), description, &caps_ref, &files_ref, now);
 
             // 指名なら候補をその 1 つに絞る。自動なら生きている全員。
             let cands: Vec<SessionInfo> = match target {
@@ -577,6 +591,24 @@ pub fn redispatch_ready(
                         co.limits().max_attempts
                     ));
                     co.escalate(body, now);
+                }
+            }
+            Err(AssignRefusal::FileOverlap { .. }) => {
+                // **黙って落とさない。** 「割り当たらない」だけが見えると、
+                // ユーザーは機能が壊れていると判断する (実際にそう報告された
+                // 類の失敗)。誰と何が重なったか・どう分ければよいかを出す。
+                // 文面は coordinator が履歴へ残しているので、それを見せる
+                // (同じ説明を 2 か所に書くとズレる)。
+                let why = co.task(tid).and_then(|t| {
+                    t.history.iter().rev().find_map(|(_, ev)| match ev {
+                        coordinator::TaskEvent::OverlapRefused { reason, .. } => {
+                            Some(reason.clone())
+                        }
+                        _ => None,
+                    })
+                });
+                if let Some(why) = why {
+                    eff.warn(why);
                 }
             }
             Err(_) => {
@@ -990,7 +1022,7 @@ pub fn task_form_ui(
             // 既に別のワークツリーが触っているファイルを名指ししていたら、
             // **始まる前に** 知らせる。当たらなければ高さを 1 px も取らない。
             let warns = crate::conflict::dispatch_check(
-                &format!("{} {}", st.title, st.description),
+                &format!("{} {} {}", st.title, st.description, st.files),
                 owners,
             );
             if !warns.is_empty() {
@@ -1027,6 +1059,20 @@ pub fn task_form_ui(
                         );
                     });
             }
+
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(tr("担当ファイル (任意・カンマ / 空白区切り・glob 可)"))
+                    .small()
+                    .color(theme.text_dim),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut st.files)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(tr(
+                        "src/app.rs, src/ui/**  — 埋めると重なる割り当てを実際に止めます",
+                    )),
+            );
 
             ui.add_space(6.0);
             ui.label(
@@ -1087,6 +1133,13 @@ pub fn task_form_ui(
                             .map(|s| s.trim().to_lowercase())
                             .filter(|s| !s.is_empty())
                             .collect(),
+                        files: st
+                            .files
+                            .split([',', ' ', '\n'])
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .map(crate::lease::normalize_path)
+                            .collect(),
                         target: st.target,
                     });
                     close = true;
@@ -1102,6 +1155,7 @@ pub fn task_form_ui(
         st.title.clear();
         st.description.clear();
         st.caps.clear();
+        st.files.clear();
         st.target = TaskTarget::Auto;
     }
     acts
@@ -1269,6 +1323,7 @@ mod tests {
             &mut co,
             &rows,
             OrchAction::CreateTask {
+                files: Vec::new(),
                 title: "テストを直す".into(),
                 description: "cargo test が赤い".into(),
                 caps: vec![],
@@ -1294,6 +1349,7 @@ mod tests {
             &mut co,
             &[],
             OrchAction::CreateTask {
+                files: Vec::new(),
                 title: "誰もいない".into(),
                 description: String::new(),
                 caps: vec![],
