@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
 
+use crate::agent_input::ComposerTarget;
 use crate::agent_picker::{self, AgentPicker};
 use crate::agents::{self, AgentManager, SessionEvent};
 use crate::breadcrumb;
@@ -44,6 +45,7 @@ use crate::lsp;
 use crate::markdown;
 use crate::marks;
 use crate::mcp;
+use crate::mention;
 use crate::menu_bar;
 use crate::notify;
 use crate::orchestration;
@@ -147,6 +149,29 @@ pub enum ProblemRow {
         worst: u8,
     },
     Item(ProblemItem),
+}
+
+/// LSP の SymbolNode を `(名前, 開始行, 終端行, kind)` へ平らにする。
+/// 行はどちらも 0 起点・**両端を含む** (`mention::Target::Symbol` と同じ約束)。
+fn collect_symbol_ranges(
+    nodes: &[lsp::SymbolNode],
+    out: &mut Vec<(String, usize, usize, usize, u8)>,
+) {
+    for n in nodes {
+        out.push((
+            n.name.clone(),
+            n.range.start.line,
+            n.range.end.line.max(n.range.start.line),
+            n.range.end.character,
+            n.kind,
+        ));
+        collect_symbol_ranges(&n.children, out);
+    }
+}
+
+/// severity (1..4) の日本語名。表 [`PROBLEM_SEV_NAMES`] が唯一の出所。
+fn severity_word(sev: u8) -> &'static str {
+    PROBLEM_SEV_NAMES[(sev.clamp(1, 4) - 1) as usize]
 }
 
 /// severity ごとの件数 (トグルのバッジ用)。添字 0..3 = severity 1..4。
@@ -3330,6 +3355,12 @@ pub struct ZaivernApp {
     tunnel_err: Option<String>,
     /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
+    /// `@` コンテキスト参照 (mention.rs)。添付台帳と裏の走査を持つ。
+    mention: mention::Mention,
+    /// `@` ピッカーへ渡す相対パス一覧 (索引が届いたときだけ作り直す)。
+    mention_rels: Vec<String>,
+    /// `@` ピッカーへ渡すシンボル (LSP の documentSymbol が届いたら作り直す)。
+    mention_syms: Vec<mention::SymbolHit>,
     /// プラン使用量の監視 (集約・枯渇予測)。読み取りはこの中で TTL 付きの
     /// バックグラウンドスレッドへ逃がされるので、毎フレーム触ってよい。
     quota: coordinator::QuotaWatch,
@@ -4112,6 +4143,9 @@ impl ZaivernApp {
             tunnel_host: cfg.ssh_tunnel_host.clone(),
             tunnel_err: None,
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
+            mention: mention::Mention::default(),
+            mention_rels: Vec::new(),
+            mention_syms: Vec::new(),
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             token_detail: false,
@@ -6497,6 +6531,17 @@ impl ZaivernApp {
         self.index_truncated = out.truncated;
         self.file_index = out.files;
         self.index_at = Some(Instant::now());
+        // `@` ピッカーは**主ルート配下だけ**を扱う (rel は所属ルート基準なので、
+        // 別ルートのものを混ぜると root.join(rel) が別のファイルを指す)。
+        self.mention_rels = match self.roots.first() {
+            Some(root) => self
+                .file_index
+                .iter()
+                .filter(|f| f.abs.starts_with(root))
+                .map(|f| f.rel.clone())
+                .collect(),
+            None => Vec::new(),
+        };
     }
 
     /// ⌘P のパレットに出す「索引の状態」。作成中/打ち切りのときだけ Some。
@@ -9694,6 +9739,7 @@ impl ZaivernApp {
             self.lsp_symbols_query.clear();
             self.lsp_symbols_path = Some(path);
             self.lsp_symbols_quiet = false;
+            self.rebuild_mention_symbols();
         }
     }
 
@@ -17568,6 +17614,49 @@ impl ZaivernApp {
         // 「⏸ 停止中」チップの件数。`&mut self.agent_input_buf` を借りる前に
         // 数え終えておく (借用が重なるため)。
         let stalled = self.stalled_session_ids().len();
+
+        // ── `@` コンテキスト参照の材料 ──────────────────────────
+        // **ここでは I/O を 1 つもしない。** 索引・シンボル・ブランチ名は
+        // すべて裏で取り終えて手元にある値で、診断もメモリ上の集計。
+        // 借用が重ならないよう、`&mut self.agent_input_buf` を取る前に
+        // 必要なものを局所変数へ移しておく (`mem::take` はポインタ交換だけ)。
+        let m_root = self.roots.first().cloned().unwrap_or_default();
+        let m_terms: Vec<(u64, String)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| (s.id, format!("{} {}", s.icon, s.title)))
+            .collect();
+        // 診断の集計はピッカーが開いている間だけ (毎フレーム全診断を舐めない)。
+        let m_problems = if self.mention.is_open() {
+            self.collect_problems().len()
+        } else {
+            0
+        };
+        // git があるかは**裏でキャッシュ済みのブランチ名**で判定する
+        // (ここで `git rev-parse` を撃つと UI スレッドが数秒止まる)。
+        let m_repo = self.git_branch().is_some().then(|| m_root.clone());
+        let m_trunc = self.index_truncated;
+        let m_busy = self.lsp_symbols_busy || self.index_rx.is_some();
+        let m_rels = std::mem::take(&mut self.mention_rels);
+        let m_syms = std::mem::take(&mut self.mention_syms);
+        let msrc = mention::Source {
+            root: &m_root,
+            files: &m_rels,
+            files_truncated: m_trunc,
+            symbols: &m_syms,
+            symbols_busy: m_busy,
+            terminals: &m_terms,
+            problems: m_problems,
+            repo: m_repo.as_deref(),
+        };
+        // `self` は下のクロージャ群が丸ごと借りるので、ピッカーの状態も
+        // 一旦手元へ引き取る (`mem::take` は構造体の移動だけで割り当てはしない)。
+        let mut mstate = std::mem::take(&mut self.mention);
+        let mut mhook = mention::Hook {
+            state: &mut mstate,
+            source: &msrc,
+        };
         // ヘッダー行に埋め込めたか。埋め込めなかった分だけ下に別行で出す。
         let mut inline_done = false;
         let mut composer = panels::ComposerAction::None;
@@ -17723,6 +17812,7 @@ impl ZaivernApp {
                         &mut self.agent_input_buf,
                         target.as_ref().map(|(id, t)| (*id, t.as_str())),
                         &mut expand,
+                        &mut mhook,
                     );
                     inline_done = true;
                 }
@@ -17756,6 +17846,7 @@ impl ZaivernApp {
                     &targets,
                     stalled,
                     &mut expand,
+                    &mut mhook,
                 )
             } else {
                 // ヘッダーが詰まっていた場合の逃げ場 (窓が狭いとき)。
@@ -17765,8 +17856,23 @@ impl ZaivernApp {
                     &mut self.agent_input_buf,
                     target.as_ref().map(|(id, t)| (*id, t.as_str())),
                     &mut expand,
+                    &mut mhook,
                 )
             };
+        }
+        // ここでピッカーの状態を返す (`mhook` の借用はこの行で終わる)。
+        let mention::Hook { .. } = mhook;
+        self.mention = mstate;
+        // 添付チップ (印・解決先・**1 件ごとの概算トークン**)。空なら何も描かない。
+        if let Some(token) = mention::chips_ui(ui, theme, self.mention.ledger()) {
+            let stripped = mention::strip_token(self.agent_input_buf.text(), &token);
+            self.agent_input_buf.set_text(stripped);
+        }
+        self.mention_rels = m_rels;
+        self.mention_syms = m_syms;
+        // 端末の末尾・診断は App しか持っていないので、ここで詰めて返す。
+        if let Some(need) = self.mention.take_need() {
+            self.serve_mention_need(need);
         }
         ui.memory_mut(|m| m.data.insert_temp(expand_id, expand));
         match composer {
@@ -18673,6 +18779,8 @@ impl ZaivernApp {
         mut orch_acts: Vec<orchestration::OrchAction>,
     ) {
         if let Some(text) = acts.broadcast {
+            // `@` 添付を本文へ展開してから流す (印だけでは中身が届かない)。
+            let text = self.expand_mentions(&text, None, ComposerTarget::Broadcast);
             // None はコスト上限で止めたとき。理由は送信側が説明済みなので
             // 「宛先がいない」と嘘を重ねない。
             match self.queue_submit_all(&text) {
@@ -18687,6 +18795,7 @@ impl ZaivernApp {
         // 止まっているものだけへの一斉送信。作業中は巻き込まないので、
         // 「全員へ送ると進行中の作業まで分断される」を避けられる。
         if let Some(text) = acts.broadcast_stalled {
+            let text = self.expand_mentions(&text, None, ComposerTarget::Stalled);
             match self.queue_submit_stalled(&text) {
                 None => {}
                 Some(0) => self.toast(tr("止まっているエージェントはありません"), false),
@@ -18701,6 +18810,7 @@ impl ZaivernApp {
         }
         // 宛先を指名した送信は**その 1 体だけ**へ届ける (broadcast は通らない)
         if let Some((id, text)) = acts.send_to {
+            let text = self.expand_mentions(&text, Some(id), ComposerTarget::Agent(id));
             let live = self
                 .agents
                 .sessions
@@ -32544,6 +32654,84 @@ impl ZaivernApp {
         }
         let subtitle = self.rel_label(&top);
         self.open_multibuffer(mbuf::Source::Changes, &subtitle, &seeds);
+    }
+
+    /// LSP の documentSymbol を `@` ピッカーが読める形へ落とす。
+    ///
+    /// **`@` ピッカーは LSP が出した範囲を「正確 (=)」として扱う。**
+    /// LSP が動いていない言語は `mention::scan_symbols` の近似 (≈) で補う。
+    fn rebuild_mention_symbols(&mut self) {
+        self.mention_syms.clear();
+        let Some(path) = self.lsp_symbols_path.clone() else {
+            return;
+        };
+        let Some(root) = self.roots.first() else {
+            return;
+        };
+        let Some(rel) = crate::ignore::rel_slash(root, &path) else {
+            return;
+        };
+        // documentSymbol は入れ子を持つ。子も含めて平らにし、
+        // それぞれの `range` (本体全体) をそのまま添付範囲に使う。
+        let mut ranges: Vec<(String, usize, usize, usize, u8)> = Vec::new();
+        collect_symbol_ranges(&self.lsp_symbols, &mut ranges);
+        for (name, start, end, end_col, kind) in ranges {
+            self.mention_syms.push(mention::SymbolHit {
+                name,
+                kind_label: symbol_kind_label(kind).to_string(),
+                rel: rel.clone(),
+                start_line: start,
+                end_line: end,
+                end_col: Some(end_col),
+                exact: true,
+            });
+        }
+    }
+
+    /// `@` の確定で「App しか持っていない本文」を求められたら返す。
+    fn serve_mention_need(&mut self, need: mention::Need) {
+        match need {
+            mention::Need::Terminal { token, id } => {
+                let text = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| {
+                        s.screen_tail_lines(mention::TERM_TAIL_ROWS, mention::TERM_TAIL_COLS)
+                            .join("\n")
+                    })
+                    .unwrap_or_else(|| tr("その端末はもうありません"));
+                self.mention.provide(&token, text, mention::Keep::Tail);
+            }
+            mention::Need::Problems { token } => {
+                let body = self
+                    .collect_problems()
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}:{}:{}: [{}] {}",
+                            p.path.display(),
+                            p.line + 1,
+                            p.col + 1,
+                            severity_word(p.severity),
+                            p.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.mention.provide(&token, body, mention::Keep::Head);
+            }
+        }
+    }
+
+    /// 送信直前に `@` 添付を本文へ展開する。宛先が 1 体なら、その CLI の
+    /// ファイル参照記法 (`agents.rs` のカタログ) に従って重複を省く。
+    fn expand_mentions(&self, text: &str, to: Option<u64>, ledger: ComposerTarget) -> String {
+        let cmd = to
+            .and_then(|id| self.agents.sessions.iter().find(|s| s.id == id))
+            .map(|s| s.command.clone());
+        self.mention.expand_for(text, cmd.as_deref(), ledger)
     }
 
     /// ワークスペース全体の診断を集める。

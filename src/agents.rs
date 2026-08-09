@@ -139,6 +139,16 @@ impl AgentSpec {
         launch_args_for(self.bin)
     }
 
+    /// この CLI 自身が展開できる「ファイル参照」の書き方 (`{path}` を差し替える)。
+    /// 持たない CLI は "" — `mention.rs` は本文をこちらで同梱する。
+    pub fn file_ref_syntax(&self) -> &'static str {
+        FILE_REF_SYNTAX
+            .iter()
+            .find(|(b, _)| *b == self.bin)
+            .map(|(_, syn)| *syn)
+            .unwrap_or("")
+    }
+
     /// そのまま端末へ打てる起動コマンド。`launch_args` が無ければ `bin` と同じ。
     pub fn launch_command(&self) -> String {
         let args = self.launch_args();
@@ -149,6 +159,23 @@ impl AgentSpec {
         }
     }
 }
+
+/// bin → 「その CLI 自身がファイルを読み込む参照の書き方」。`mention.rs` が使う。
+///
+/// **`AgentSpec` のフィールドにしない理由は [`SESSION_STORES`] と同じ** —
+/// 構造体リテラルが他モジュール (diagnostician.rs のフィクスチャ) にもあり、
+/// フィールドを増やすとそれらが一斉に壊れる。
+///
+/// **載せるのは公式ドキュメントで `@パス` のファイル取り込みが確認できた CLI だけ。**
+/// 未確認は載せない — 既定 (空文字) は `mention.rs` が本文を同梱するので、
+/// どの CLI へ送っても内容が届くことは変わらない。載せる効果は
+/// 「同じ内容を二重に送らない」ぶんのトークン節約だけで、外しても壊れない。
+const FILE_REF_SYNTAX: &[(&str, &str)] = &[
+    // claude: `@path/to/file` で対象ファイルを読み込む (Claude Code の公式ドキュメント)
+    ("claude", "@{path}"),
+    // gemini: `@path/to/file` でファイル/ディレクトリの内容をプロンプトへ差し込む
+    ("gemini", "@{path}"),
+];
 
 /// 「フラグ + 値」の 2 トークンで自動承認になる指定の表。
 ///

@@ -50,6 +50,7 @@ mod lsp;
 mod markdown;
 mod marks;
 mod mcp;
+mod mention;
 mod menu_bar;
 mod minimap;
 mod multibuffer;
