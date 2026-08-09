@@ -22,6 +22,7 @@ mod editor_ops;
 mod editor_split;
 mod failover;
 mod feature;
+mod features;
 mod file_search;
 mod file_tree;
 mod find_buffer;
@@ -88,6 +89,7 @@ mod tunnel;
 mod tutorial;
 mod voice;
 mod whats_new;
+mod whichkey;
 mod worktree;
 mod zoom;
 

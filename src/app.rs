@@ -40,6 +40,7 @@ use crate::ide;
 use crate::kanban;
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::license;
+use crate::local_history;
 use crate::lsp;
 use crate::markdown;
 use crate::mcp;
@@ -3208,6 +3209,15 @@ pub struct ZaivernApp {
     hotexit_warned: HashSet<String>,
     /// chord (2 打鍵) の待機。フレームを跨ぐので `App` が持つ。
     chord: crate::keybinds::ChordState,
+    /// which-key ポップアップ (chord の続きの一覧) の表示状態。
+    whichkey: crate::whichkey::WhichKey,
+    /// which-key に出す実データ行の実体 `(絶対パス, repo 相対パス, 状態)`。
+    ///
+    /// **1 フレームに 1 回だけ作り、打鍵経路と描画経路で同じものを見る。**
+    /// 都度作り直すと、git のスキャンがフレームの途中で着地したときに
+    /// 「画面の 3 番」と「押した 3 番」が別のファイルを指し得る。
+    /// prefix を握っていないフレームでは空 (アイドルのコストはゼロ)。
+    whichkey_live: Vec<(PathBuf, String, crate::git::FileStatus)>,
     about_open: bool,
     /// **What's New** に出す変更点。空でない間だけウィンドウを描く
     /// (bool を別に持つと「開いているのに中身が空」が構造的に起こり得る)。
@@ -3372,6 +3382,9 @@ pub struct ZaivernApp {
     /// チェックポイント (エージェントへ指示を送る直前の作業ツリーの写し)。
     /// git は全て裏のスレッドで走る。
     checkpoints: checkpoint::Checkpoints,
+    /// 🕰 ローカルヒストリ (VCS に依らない取り消し履歴)。走査も書き出しも
+    /// 裏のスレッドで、UI はここから `std::fs` を 1 度も呼ばない。
+    local_history: local_history::LocalHistory,
     /// 次の配達で取るチェックポイントの `(エージェント, 指示要約)`。
     /// `queue_submit` は `egui::Context` を持たないので、ここへ predoc して
     /// `submit_tick` (ctx を持つ) が実際の取得を仕込む。一斉送信で N 体ぶん
@@ -3895,6 +3908,10 @@ impl ZaivernApp {
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
             ),
             checkpoint_pending: None,
+            local_history: local_history::LocalHistory::new(
+                roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
+                &cfg,
+            ),
             tab_drag: None,
             git_panel: git_panel::GitPanel::new(
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
@@ -4046,6 +4063,8 @@ impl ZaivernApp {
             hotexit_conflicts: Vec::new(),
             hotexit_warned: HashSet::new(),
             chord: crate::keybinds::ChordState::default(),
+            whichkey: crate::whichkey::WhichKey::default(),
+            whichkey_live: Vec::new(),
             about_open: false,
             whats_new: Vec::new(),
             // 起動時に 1 回だけローカルのキーを読んで検証する (通信なし)。
@@ -4306,6 +4325,10 @@ impl ZaivernApp {
         self.checkpoints.set_repo(self.primary_root().to_path_buf());
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
+        // ローカルヒストリも新しいワークスペースへ (別プロジェクトの履歴へ
+        // 復元を撃てないよう、裏のスレッドごと捨てて張り直す)。
+        let lh_root = self.primary_root().to_path_buf();
+        self.local_history.set_workspace(lh_root, &self.cfg);
         self.tree.show_hidden = self.cfg.show_hidden_files;
         self.tree.apply_config(&self.cfg);
         self.rebuild_index();
@@ -8070,6 +8093,10 @@ impl ZaivernApp {
         // (この関数は配達を進める唯一の経路なので、取り漏らしが起きない)。
         if let Some((agent, note)) = self.checkpoint_pending.take() {
             self.checkpoints.capture_before_submit(&agent, &note, ctx);
+            // ローカルヒストリにもターン境界の 1 枚を残す。git 側と違い
+            // `.gitignore` の外や未追跡も含めてファイルシステムから撮るので、
+            // エージェントの shell が書いた変更もここに入る。
+            self.local_history.snapshot(&agent);
         }
         let now = Instant::now();
         let mut next: Option<Duration> = None;
@@ -8265,6 +8292,9 @@ impl ZaivernApp {
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 self.tree.invalidate();
+                // 「保存」という**コマンド名**でローカルヒストリへ刻む。
+                // 取り込みは遅延して裏で走る (連続保存で歩き回らない)。
+                self.local_history.note(&tr("保存"));
                 // 保存した本文の退避はもう要らない (ゴミを残さない)
                 self.hotexit_flush();
                 if promoted {
@@ -11021,6 +11051,15 @@ impl ZaivernApp {
             // ここは要求を出すだけ。結果は `checkpoint_ui` が受ける。
             Cmd::CheckpointList => self.checkpoints.open_list(ctx),
             Cmd::CheckpointNow => self.checkpoints.capture_now(ctx),
+            // 🕰 ローカルヒストリ。走査も復元も裏のスレッドなので、ここは
+            // 要求を出すだけ。結果は `local_history_ui` が受ける。
+            Cmd::LocalHistoryOpen => {
+                let p = self
+                    .editor
+                    .active
+                    .and_then(|i| self.editor.buffers[i].path.clone());
+                self.local_history.open_for(p.as_deref(), ctx);
+            }
             // `]f` / `[f`: **ファイル間**のジャンプ (並列レビューの単位)。
             // 依頼を ctx に置くだけ。消化するのはレビュー画面自身なので、
             // 画面が出ていなければ 1 フレームで腐って何も起きない。
@@ -14762,16 +14801,6 @@ impl ZaivernApp {
         let ui_zoom = self.cfg.ui_zoom;
         let file_zoom = self.file_zoom();
         let mut zoom_cmd: Option<Cmd> = None;
-        // chord (2 打鍵) の 1 打鍵目を握っている間の案内。
-        // 何も出さないと「固まった」ように見えるので、VS Code と同じく必ず出す。
-        // 待機していないフレームでは 1 ピクセルも出さない。
-        let chord_hint = self.chord.pending().map(|sc| {
-            trf(
-                "{keys} が押されました。待機中…",
-                &[("keys", crate::keybinds::format_shortcut(sc))],
-            )
-        });
-
         let bar = egui::TopBottomPanel::bottom("zv-status")
             .exact_height(26.0)
             .frame(
@@ -14802,16 +14831,6 @@ impl ZaivernApp {
                             ))
                             .size(11.5)
                             .color(theme.ok),
-                        );
-                    }
-
-                    // chord の待機中だけ出る案内 (⌘K を握っている間)
-                    if let Some(hint) = &chord_hint {
-                        ui.label(
-                            RichText::new(format!("⌨ {hint}"))
-                                .size(11.5)
-                                .color(theme.warn)
-                                .strong(),
                         );
                     }
 
@@ -19414,6 +19433,43 @@ impl ZaivernApp {
         }
     }
 
+    /// 🕰 ローカルヒストリの一覧を描き、裏のスレッドの結果を捌く。
+    ///
+    /// **アイドル時のコストはゼロ** — 一覧を閉じていれば描画は即 return し、
+    /// 依頼が 1 つも無ければ受信口すら作られていないので `poll` も即 return する。
+    fn local_history_ui(&mut self, ctx: &egui::Context) {
+        self.local_history.ui(ctx);
+        // 復元は「戻した」と「一覧が変わった」を続けて返すので、溜まっている
+        // ぶんはこのフレームで全部捌く (次の再描画まで持ち越さない)。
+        while let Some(done) = self.local_history.poll() {
+            match done {
+                local_history::Done::Diff {
+                    title,
+                    path,
+                    old,
+                    new,
+                } => {
+                    // **差分ビューアは 2 つ書かない。** 既存の比較ウィンドウへ渡す。
+                    let f = crate::diff::diff_texts(
+                        &trf("{p} ({t})", &[("p", path.clone()), ("t", title)]),
+                        &trf("{p} (今)", &[("p", path)]),
+                        &old,
+                        &new,
+                    );
+                    self.show_compare(tr("🕰 ローカルヒストリ"), f);
+                }
+                local_history::Done::Restored { .. } => {
+                    // 作業ツリーが変わった。git の色付けと開いているタブを
+                    // 取り直す (依頼を出すだけ。ここでは待たない)。
+                    self.gitinfo.request_refresh();
+                    self.ext_check_at = None;
+                }
+                local_history::Done::Failed(e) => self.toast(e, false),
+                local_history::Done::Scanned { .. } | local_history::Done::Loaded(_) => {}
+            }
+        }
+    }
+
     /// リポジトリを明示して開く版。Git パネルの履歴一覧とパレットの
     /// 履歴コマンドの両方から使う (アクティブなバッファに依らずリポジトリが決まる)。
     fn open_commit_diff_at(&mut self, top: &Path, sha: &str) {
@@ -23970,6 +24026,12 @@ impl ZaivernApp {
                 Cmd::CheckpointNow,
             ),
             (
+                "🕰".into(),
+                tr("ローカルヒストリ (取り消し履歴)"),
+                String::new(),
+                Cmd::LocalHistoryOpen,
+            ),
+            (
                 "🎛".into(),
                 tr("Cockpit 切替"),
                 fmt_key(BindAction::ToggleCockpit),
@@ -26409,6 +26471,121 @@ impl ZaivernApp {
         file_tree::move_back(from, to)?;
         self.retarget_buffers(from, to);
         Ok(())
+    }
+
+    /// which-key ポップアップ。chord の 1 打鍵目を握っている間だけ、
+    /// そこから続く打鍵の一覧を中央ビューの右下に出す。
+    ///
+    /// 以前はステータスバーへ「⌘K が押されました。待機中…」と 1 行出すだけで、
+    /// **次に何を押せるのかは画面のどこにも無かった**。中身は
+    /// [`crate::whichkey`] に閉じてあり、ここは材料を渡して結果を捌くだけ。
+    fn whichkey_ui(&mut self, ctx: &egui::Context) {
+        use crate::whichkey;
+        // 実データの行 (which-key.nvim の content plugin 相当)。
+        // 差分ファイル間移動の prefix を握っている間だけ作る。
+        let live = self.whichkey_live_rows();
+        let mut st = std::mem::take(&mut self.whichkey);
+        let out = whichkey::popup_ui(
+            ctx,
+            &mut st,
+            whichkey::Params {
+                pending: self.chord.pending(),
+                keys: &self.keys,
+                theme: &self.theme,
+                live: &live,
+                first_delay: whichkey::first_delay(self.cfg.whichkey_delay_ms),
+                area: ctx.available_rect(),
+                bottom_inset: 8.0,
+            },
+        );
+        self.whichkey = st;
+        self.apply_whichkey(out, ctx);
+    }
+
+    /// which-key が拾う打鍵をフレームの頭で取る (本文の TextEdit より先)。
+    /// 握っていないフレームでは**イベントに一切触らない**。
+    fn whichkey_keys(&mut self, ctx: &egui::Context) {
+        // このフレームの実データ行をここで 1 回だけ確定させる。描画側も同じ
+        // ものを見るので、行番号と実体がずれない。
+        self.whichkey_live = self.scan_whichkey_live();
+        // 変換中の生キーは IME のものであってアプリのものではない。判定は
+        // `handle_shortcuts` が直前に入れた値を読む (2 か所で判定しない)。
+        if !self.chord.is_waiting()
+            || self.chord.ime_active()
+            || self.keybind_ui.recording.is_some()
+        {
+            return;
+        }
+        if let Some(out) = crate::whichkey::take_keys(ctx, self.whichkey_live.len()) {
+            self.apply_whichkey(out, ctx);
+        }
+    }
+
+    /// which-key の操作を捌く。打鍵経路と描画経路で同じ処理を通す。
+    fn apply_whichkey(&mut self, out: crate::whichkey::Outcome, ctx: &egui::Context) {
+        use crate::whichkey::Outcome;
+        match out {
+            Outcome::None => {}
+            // 1 打鍵戻す。いまの chord は 2 打鍵までなので、戻り切ったら待機ごと捨てる。
+            Outcome::Pop => {
+                if !self.whichkey.pop() || !self.whichkey.is_active() {
+                    self.chord.clear();
+                    self.whichkey.clear();
+                }
+                crate::perf::repaint(ctx, "whichkey");
+            }
+            // 検索できる全ショートカット一覧へ抜ける (2 つ目の一覧は作らない)
+            Outcome::OpenAll => {
+                self.chord.clear();
+                self.whichkey.clear();
+                self.shortcuts_open = true;
+            }
+            Outcome::Pick(i) => {
+                let path = self.whichkey_live.get(i).map(|(p, _, _)| p.clone());
+                self.chord.clear();
+                self.whichkey.clear();
+                if let Some(p) = path {
+                    self.apply_cmd(Cmd::OpenRecentFile(p), ctx);
+                }
+            }
+        }
+    }
+
+    /// which-key に出す実データの行。**差分ファイル間移動 (`]f` / `[f`) の
+    /// prefix を握っている間だけ**、いま変更のあるファイルを並べる。
+    ///
+    /// `]f` は「次の変更ファイルへ」を目隠しで撃つ打鍵だが、握っているだけで
+    /// 行き先が見えて番号で直接飛べる。判定は打鍵をベタ書きせず
+    /// **キーバインド表から引く** (再割り当てされても付いてくる)。
+    fn whichkey_diff_prefix_held(&self) -> bool {
+        let Some(sc) = self.chord.pending() else {
+            return false;
+        };
+        [BindAction::DiffNextFile, BindAction::DiffPrevFile]
+            .into_iter()
+            .any(|a| crate::keybinds::same_stroke(self.keys.binding(a).first(), sc))
+    }
+
+    /// 実データ行の実体を作る (フレームに 1 回。`git` は 1 回も起動しない)。
+    fn scan_whichkey_live(&self) -> Vec<(PathBuf, String, crate::git::FileStatus)> {
+        if !self.whichkey_diff_prefix_held() {
+            return Vec::new();
+        }
+        self.gitinfo.changed_paths(crate::whichkey::MAX_LIVE_ROWS)
+    }
+
+    /// 実体を画面の行へ写す。`self.whichkey_live` と 1 対 1 で並ぶ。
+    fn whichkey_live_rows(&self) -> Vec<crate::whichkey::LiveRow> {
+        self.whichkey_live
+            .iter()
+            .map(|(_, rel, st)| {
+                let (_, mark, _) = crate::file_tree::git_status_style(*st, &self.theme);
+                crate::whichkey::LiveRow {
+                    desc: format!("{mark}  {rel}"),
+                    detail: rel.clone(),
+                }
+            })
+            .collect()
     }
 
     fn toasts_ui(&mut self, ctx: &egui::Context) {
@@ -29152,6 +29329,10 @@ impl ZaivernApp {
         self.poll_voice(ctx);
 
         self.handle_shortcuts(ctx);
+        // which-key が拾う打鍵 (⌫ / ? / 番号) は **パネルを描く前に**取る。
+        // ポップアップ自身は最後に描くが、そのころには本文の TextEdit が
+        // Backspace を食べ終わっている (フォーカスがあれば必ず取る)。
+        self.whichkey_keys(ctx);
         // ⌃Tab の切替は**修飾キーを離したフレーム**で確定する。
         // ショートカット処理の直後に見る (押した同じフレームで確定させない)。
         self.tab_switcher_tick(ctx);
@@ -29590,6 +29771,7 @@ impl ZaivernApp {
         self.stop_all_confirm_ui(ctx);
         self.worktree_confirm_ui(ctx);
         self.checkpoint_ui(ctx);
+        self.local_history_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
         // feature.rs のレジストリに登録された機能のオーバーレイ。
@@ -29598,6 +29780,7 @@ impl ZaivernApp {
         // 通知が機能のオーバーレイに隠れないようにしておく。
         crate::feature::draw_all(self, ctx);
         self.toasts_ui(ctx);
+        self.whichkey_ui(ctx);
 
         // デスクトップペット 🐾
         if self.cfg.show_pet {

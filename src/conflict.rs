@@ -1686,36 +1686,6 @@ fn draw_matrix(
     }
 }
 
-// ---------------------------------------------------------------------------
-// 機能レジストリへの登録 (`app.rs` / `palette.rs` / `keybinds.rs` を触らない)
-// ---------------------------------------------------------------------------
-
-/// パレットからの到達経路。**共有される 5 箇所を 1 つも編集しない**ので、
-/// 並列ブランチ同士がこの登録で衝突することがない ([`crate::feature`])。
-///
-/// これは皮肉ではなく設計として噛み合っている: このモジュールは
-/// 「起きてしまう衝突を早く見せる」側、レジストリは「そもそも起こさない」側で、
-/// 並列エージェント開発には両方が要る。
-pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
-    module: "conflict",
-    entries: &[crate::feature::Entry {
-        icon: "🛰",
-        label: "衝突レーダー — 並列ワークツリーのマージ衝突を先に見る",
-        id: "conflict.open",
-    }],
-    dispatch: |app, _ctx, id| match id {
-        "conflict.open" => {
-            app.toggle_conflict_radar();
-            true
-        }
-        _ => false,
-    },
-    // 窓は中央ビューに属さないオーバーレイなので、毎フレームここから描く。
-    // **閉じているときは 1 命令も走らない** (`conflict_radar_ui` の先頭で返る)
-    // ので、アイドル時のコストはゼロのまま。
-    draw: Some(|app, ctx| app.conflict_radar_ui(ctx)),
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;
