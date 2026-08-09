@@ -2326,13 +2326,16 @@ impl GitJob {
     fn args(&self) -> Vec<String> {
         match self {
             GitJob::Commit { message, all } => {
-                let mut a: Vec<String> = vec!["commit".into()];
+                // **引数表は `git_panel::commit_args` 1 本へ寄せる。**
+                // ここで別に組み立てていたときは `--cleanup=whitespace` が
+                // 抜けており、`#` で始まるコミットメッセージがユーザーの
+                // `commit.cleanup` 設定で**黙って落ちていた**
+                // (同じ操作なのに Git パネル経由では残る、という食い違い)。
+                // `--` は付けない (パスではなくメッセージなので値で確定する)。
+                let mut a = crate::git_panel::commit_args(message, false);
                 if *all {
-                    a.push("--all".into());
+                    a.insert(1, "--all".into());
                 }
-                // `--` は付けない (パスではなくメッセージなので `-m` の値で確定する)。
-                a.push("-m".into());
-                a.push(message.clone());
                 a
             }
             // 追跡ブランチが無い初回でも通るように upstream を張る。
@@ -3787,6 +3790,7 @@ impl ZaivernApp {
         // その時点の pixels_per_point でフォントサイズを物理ピクセルへ丸めるので、
         // 後から倍率を変えると最初のフレームだけ丸めがズレた絵になる。
         apply_ui_zoom(&cc.egui_ctx, cfg.ui_zoom);
+        crate::theme::set_text_scale(&cc.egui_ctx, cfg.text_scale);
         let theme = resolve_theme(&cfg.theme);
         theme::apply(&cc.egui_ctx, &theme);
 
@@ -7826,7 +7830,10 @@ impl ZaivernApp {
         });
         self.outbox = queue;
         for title in delivered {
-            self.toast(trf("📋 {title} へ指示を配達しました", &[("title", title)]), true);
+            self.toast(
+                trf("📋 {title} へ指示を配達しました", &[("title", title)]),
+                true,
+            );
         }
         for title in gave_up {
             self.toast_warn(trf(
@@ -10193,7 +10200,7 @@ impl ZaivernApp {
         };
         let body = info.contents.clone();
         let theme = self.theme.clone();
-        let base = self.cfg.editor_font_size;
+        let base = self.scaled_editor_font();
         let mut images = std::mem::take(&mut self.md_images);
         let hl = self.highlighter;
         egui::Area::new(egui::Id::new("zv-lsp-hover"))
@@ -10859,6 +10866,9 @@ impl ZaivernApp {
             | Cmd::FileZoomIn
             | Cmd::FileZoomOut
             | Cmd::FileZoomReset
+            | Cmd::TextSizeIn
+            | Cmd::TextSizeOut
+            | Cmd::TextSizeReset
             | Cmd::SendFileToAgent
             | Cmd::RefreshTree
             | Cmd::SetApproval(_)
@@ -11862,6 +11872,44 @@ impl ZaivernApp {
         config::save_state(&self.cfg);
     }
 
+    /// **文字サイズだけ**の倍率を設定して state.toml へ覚える。
+    ///
+    /// `set_ui_zoom` との違い: あちらは `zoom_factor` を動かすので
+    /// 余白・ボタン・パネル幅まで拡大し、画面に入る情報量が減る。
+    /// こちらは本文・ボタン文字・エディタ・ターミナルの**文字サイズだけ**を
+    /// 掛け直すので、レイアウトはそのままで字だけ読みやすくできる。
+    /// 実際の反映は `theme::set_text_scale` が次フレーム先頭で行う
+    /// (スタイルの書き換え地点を 1 つに保ち、誤差を積み上げないため)。
+    fn set_text_scale(&mut self, scale: f32) {
+        let scale = zoom::clamp(scale);
+        if (scale - self.cfg.text_scale).abs() < 1e-4 {
+            return;
+        }
+        self.cfg.text_scale = scale;
+        self.cfg.global_text_scale = scale;
+        config::save_state(&self.cfg);
+        // 本文とガターの galley はフォントサイズをキーに持っているので、
+        // 倍率が変わったら作り直させる (残すと古いサイズのまま描かれる)。
+        for b in &mut self.editor.buffers {
+            b.cache = None;
+            b.gutter = None;
+        }
+        self.toast(
+            trf("🔠 文字サイズ {pct}", &[("pct", zoom::label(scale))]),
+            true,
+        );
+    }
+
+    /// 文字サイズ倍率を掛けたエディタのフォントサイズ。
+    fn scaled_editor_font(&self) -> f32 {
+        (self.cfg.editor_font_size * self.cfg.text_scale).clamp(6.0, 96.0)
+    }
+
+    /// 文字サイズ倍率を掛けたターミナルのフォントサイズ。
+    fn scaled_terminal_font(&self) -> f32 {
+        (self.cfg.terminal_font_size * self.cfg.text_scale).clamp(6.0, 96.0)
+    }
+
     /// アクティブなタブだけのズームを段送りする。
     ///
     /// 本文とガターの galley はフォントサイズをキーに持っているので、
@@ -11908,7 +11956,7 @@ impl ZaivernApp {
     /// 二重に掛けないこと — `zoom_factor` は pixels_per_point 側を動かすので、
     /// ここでも掛けると倍率が二乗になる。
     fn editor_font_pt(&self) -> f32 {
-        (self.cfg.editor_font_size * self.file_zoom()).clamp(6.0, 96.0)
+        (self.scaled_editor_font() * self.file_zoom()).clamp(6.0, 96.0)
     }
 
     /// ⌘ + ホイール / トラックパッドのピンチを、ポインタの位置で振り分ける。
@@ -12005,6 +12053,7 @@ impl ZaivernApp {
                 // config.toml / state.toml の ui_zoom を画面へ戻す
                 // (読み直したのに倍率だけ前のまま、を作らない)
                 apply_ui_zoom(ctx, self.cfg.ui_zoom);
+                crate::theme::set_text_scale(ctx, self.cfg.text_scale);
                 // エディタの見た目 (括弧の色分け / ルーラー / インデント) も
                 // 読み直した設定へ揃える。開いているタブのインデントは
                 // 取り直す — 設定を変えたのにステータスバーだけ前のまま、を作らない。
@@ -12027,6 +12076,9 @@ impl ZaivernApp {
             Cmd::FileZoomIn => self.step_file_zoom(1),
             Cmd::FileZoomOut => self.step_file_zoom(-1),
             Cmd::FileZoomReset => self.reset_file_zoom(),
+            Cmd::TextSizeIn => self.set_text_scale(zoom::step_up(self.cfg.text_scale)),
+            Cmd::TextSizeOut => self.set_text_scale(zoom::step_down(self.cfg.text_scale)),
+            Cmd::TextSizeReset => self.set_text_scale(zoom::DEFAULT),
             Cmd::SendFileToAgent => {
                 let rel = self.editor.active.and_then(|i| {
                     let b = &self.editor.buffers[i];
@@ -14556,6 +14608,26 @@ impl ZaivernApp {
                                 zoom_cmd = Some(Cmd::ZoomReset);
                             }
                         }
+                        // 文字サイズ倍率も等倍のときは 1 ピクセルも描かない
+                        // (常に 100% と出るバッジを置かない)。
+                        let text_scale = zoom::clamp(self.cfg.text_scale);
+                        if !zoom::is_default(text_scale) {
+                            let r = ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("🔠 {}", zoom::label(text_scale)))
+                                        .size(11.5)
+                                        .color(theme.accent),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text(tr(
+                                "文字サイズ (レイアウトは変えていません) — 押すと 100% に戻します",
+                            ))
+                            .clicked()
+                            {
+                                zoom_cmd = Some(Cmd::TextSizeReset);
+                            }
+                        }
                         let (ln, col) = self.editor.cursor;
                         if let Some(i) = self.editor.active {
                             ui.label(dim(format!("Ln {ln}, Col {col}")));
@@ -15765,7 +15837,7 @@ impl ZaivernApp {
         pl: &mut PluginActions,
         p: &plugins::Plugin,
     ) {
-        let md_base = self.cfg.editor_font_size;
+        let md_base = self.scaled_editor_font();
         let hl = self.highlighter;
         for pa in &p.panels {
             ui.add_space(2.0);
@@ -16250,7 +16322,7 @@ impl ZaivernApp {
 
                 ui.add_space(4.0);
 
-                let font = self.cfg.terminal_font_size;
+                let font = self.scaled_terminal_font();
                 let want_focus = self.term_focus_pending;
                 // 予約を下ろすのは、この後で実際に端末を描くときだけ。
                 // 「🛡 承認」タブ表示中やセッションが 0 件の間に消してしまうと、
@@ -17304,7 +17376,7 @@ impl ZaivernApp {
         }
 
         let avail = ui.available_size();
-        let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
+        let mini_font = (self.scaled_terminal_font() - 3.0).clamp(8.0, 14.0);
         // 6 枚以上でも 1 枚ずつは読める高さを保つ。入り切らないぶんは
         // 縦スクロールで見せる (潰さない)。
         let g = cockpit_grid_metrics(avail, n, grid_comfort_cell_h(mini_font));
@@ -18158,7 +18230,7 @@ impl ZaivernApp {
         // ライブペイン: 端末描画は Cockpit と同じ道 (`terminal::draw`) をそのまま使う。
         // 看板側は矩形を用意して呼ぶだけ — 端末を再実装しない。
         // 借用は分けて取る (kanban_state と agents.sessions は別フィールド)。
-        let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
+        let mini_font = (self.scaled_terminal_font() - 3.0).clamp(8.0, 14.0);
         let dead: std::collections::HashSet<u64> = self
             .agents
             .sessions
@@ -18387,7 +18459,7 @@ impl ZaivernApp {
         let scanning = !self.deck_branch_pending.is_empty();
 
         // ライブ端末は Cockpit / 看板とまったく同じ道 (`terminal::draw`) を通す。
-        let mini_font = (self.cfg.terminal_font_size - 2.0).clamp(8.0, 16.0);
+        let mini_font = (self.scaled_terminal_font() - 2.0).clamp(8.0, 16.0);
         let dead: HashSet<u64> = self
             .agents
             .sessions
@@ -20537,7 +20609,7 @@ impl ZaivernApp {
     fn hex_viewer_ui(&mut self, ui: &mut egui::Ui, i: usize) {
         let theme = self.theme.clone();
         let ppp = ui.ctx().pixels_per_point();
-        let font = FontId::monospace(crate::theme::snap_font_size(self.cfg.editor_font_size, ppp));
+        let font = FontId::monospace(crate::theme::snap_font_size(self.scaled_editor_font(), ppp));
         let row_h = ui
             .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
             .max(1.0 / ppp);
@@ -22981,6 +23053,26 @@ impl ZaivernApp {
                 tr("このファイルのズームを解除"),
                 fmt_key(BindAction::FileZoomReset),
                 Cmd::FileZoomReset,
+            ),
+            // 文字サイズは「ズーム」と別物。ラベルで違いを言い切る
+            // (ズームは余白まで大きくなり画面に入る情報が減るが、こちらは減らない)。
+            (
+                "🔠".into(),
+                tr("文字サイズを大きく (レイアウトは変えない)"),
+                String::new(),
+                Cmd::TextSizeIn,
+            ),
+            (
+                "🔠".into(),
+                tr("文字サイズを小さく (レイアウトは変えない)"),
+                String::new(),
+                Cmd::TextSizeOut,
+            ),
+            (
+                "🔠".into(),
+                tr("文字サイズを 100% に戻す"),
+                String::new(),
+                Cmd::TextSizeReset,
             ),
             (
                 "🌲".into(),
@@ -29692,6 +29784,7 @@ impl ZaivernApp {
                 .editor
                 .active
                 .map(|i| zoom::clamp(self.editor.buffers[i].zoom)),
+            text_scale: zoom::clamp(self.cfg.text_scale),
             trim_trailing_on_save: self.save_trim_trailing,
             trim_final_newlines_on_save: self.save_trim_final_newlines,
             final_newline_on_save: self.save_final_newline,

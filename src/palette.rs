@@ -120,6 +120,17 @@ pub enum Cmd {
     FileZoomOut,
     /// アクティブなタブのズームを解除して画面全体の倍率に戻す (⌘⌥0)。
     FileZoomReset,
+    /// **文字サイズだけ**を 1 段大きくする。
+    ///
+    /// `ZoomIn` との違いが要点: あちらは egui の `zoom_factor` を動かすので
+    /// 余白・ボタン・パネル幅まで一緒に大きくなり、**画面に入る情報が減る**。
+    /// こちらはレイアウトを変えずに文字だけ掛け直すので、
+    /// 「窓は広いまま、字だけ読みやすく」ができる。
+    TextSizeIn,
+    /// 文字サイズだけを 1 段小さくする。
+    TextSizeOut,
+    /// 文字サイズの倍率を 100% へ戻す。
+    TextSizeReset,
     SendFileToAgent,
     RefreshTree,
     /// 既定の承認モード: "ask"(毎回ユーザー承認) | "auto"(全自動YES) | "agent"(Agent欄優先)
@@ -754,6 +765,9 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::FileZoomIn
         | Cmd::FileZoomOut
         | Cmd::FileZoomReset
+        | Cmd::TextSizeIn
+        | Cmd::TextSizeOut
+        | Cmd::TextSizeReset
         | Cmd::SetTheme(_)
         | Cmd::ShowExplorer
         | Cmd::TogglePet
