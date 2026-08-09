@@ -1242,6 +1242,8 @@ pub enum ComposerAction {
     None,
     /// 全エージェントへ一斉送信
     Send(String),
+    /// **止まっているエージェントだけ**へ一斉送信 (作業中は巻き込まない)
+    SendStalled(String),
     /// セッション ID で指名した 1 体へ送信
     SendTo(u64, String),
     /// 閉じたい (下書きは残っている)
@@ -1492,6 +1494,7 @@ pub fn composer_wants_expand(text: &str, forced: bool) -> bool {
 pub fn inline_target_label(target: ComposerTarget, agent: Option<&str>) -> String {
     match (target, agent) {
         (ComposerTarget::Broadcast, _) => tr("📢 全員"),
+        (ComposerTarget::Stalled, _) => tr("⏸ 停止中"),
         (ComposerTarget::Agent(_), Some(name)) => format!("▸ {name}"),
         (ComposerTarget::Agent(_), None) => tr("▸ 選択中"),
     }
@@ -1540,6 +1543,7 @@ pub fn composer_action(buf: &mut AgentInputBuffer, press: ComposerPress) -> Comp
             }
             match target {
                 ComposerTarget::Broadcast => ComposerAction::Send(out),
+                ComposerTarget::Stalled => ComposerAction::SendStalled(out),
                 ComposerTarget::Agent(id) => ComposerAction::SendTo(id, out),
             }
         }
@@ -1722,11 +1726,22 @@ pub fn disambiguate_labels(labels: &[String]) -> Vec<String> {
 /// のも避けるため。
 ///
 /// `targets` は `(セッション ID, 表示名)`。並び順はそのまま出す。
+/// 宛先チップを出すか (純関数)。
+///
+/// 「常に 0 を表示するバッジを作らない」ため、**止まっているものが 1 体も
+/// 居なければ停止中チップは出さない**。ただし、いまその宛先を選んでいる間は
+/// 消さない — 消すと書きかけの下書きへ戻る手段が画面から無くなる。
+pub fn show_stalled_chip(stalled: usize, target: ComposerTarget) -> bool {
+    stalled > 0 || target == ComposerTarget::Stalled
+}
+
+/// 宛先チップの並び。`stalled` は「止まっているエージェントの数」。
 pub fn composer_target_chips(
     ui: &mut egui::Ui,
     theme: &Theme,
     buf: &mut AgentInputBuffer,
     targets: &[(u64, String)],
+    stalled: usize,
 ) {
     egui::ScrollArea::horizontal()
         .id_salt("agent_composer_targets")
@@ -1747,6 +1762,26 @@ pub fn composer_target_chips(
                     .clicked()
                 {
                     buf.pick_target(ComposerTarget::Broadcast);
+                }
+                // ⏸ 停止中 — 作業中を巻き込まずに、止まっているものだけ押し出す。
+                // 居ないときは出さない (0 のバッジを常設しない)。
+                if show_stalled_chip(stalled, buf.target()) {
+                    let ssel = buf.target() == ComposerTarget::Stalled;
+                    let stxt = RichText::new(trf(
+                        "⏸ 停止中 {n}",
+                        &[("n", stalled.to_string())],
+                    ))
+                    .size(11.5)
+                    .color(if ssel { theme.warn } else { theme.text_dim });
+                    if ui
+                        .selectable_label(ssel, stxt)
+                        .on_hover_text(tr(
+                            "待機・停滞・ループ・エラーで止まっているエージェントだけへ送ります。\n                             作業中のものは巻き込みません (承認待ちも対象外です —                              そちらは承認の口で答えてください)",
+                        ))
+                        .clicked()
+                    {
+                        buf.pick_target(ComposerTarget::Stalled);
+                    }
                 }
                 for (id, label) in targets {
                     let sel = buf.target() == ComposerTarget::Agent(*id);
@@ -1804,6 +1839,8 @@ pub fn agent_composer_ui(
     buf: &mut AgentInputBuffer,
     target: Option<(u64, &str)>,
     targets: &[(u64, String)],
+    // stalled: 止まっているエージェントの数 (⏸ チップの表示と件数)
+    stalled: usize,
     expand: &mut bool,
 ) -> ComposerAction {
     // 宛先をアクティブなエージェントに追従させる (ピン留めは尊重する)
@@ -1904,13 +1941,22 @@ pub fn agent_composer_ui(
     }
 
     // ── 宛先チップ (入力欄の**下**) ───────────────────────────
-    composer_target_chips(ui, theme, buf, targets);
+    composer_target_chips(ui, theme, buf, targets, stalled);
     if buf.target().is_broadcast() && !targets.is_empty() {
         // 誤爆が一番痛いので、全員宛てのときだけ明示的に注意を出す
         ui.label(
             RichText::new(tr("⚠ 起動中のすべてのエージェントへ送られます"))
                 .color(theme.warn)
                 .size(10.5),
+        );
+    } else if buf.target() == ComposerTarget::Stalled {
+        ui.label(
+            RichText::new(trf(
+                "⏸ 止まっている {n} 体だけへ送られます (作業中は巻き込みません)",
+                &[("n", stalled.to_string())],
+            ))
+            .color(theme.warn)
+            .size(10.5),
         );
     }
 
@@ -3046,6 +3092,88 @@ mod tests {
         }
     }
 
+    // ── ⏸ 停止中への一括送信 ──────────────────────────────────
+
+    #[test]
+    fn 停止中宛ての送信は専用の経路へ落ちる() {
+        let mut b = AgentInputBuffer::new();
+        b.pick_target(ComposerTarget::Stalled);
+        b.set_text("続けてください");
+        assert_eq!(
+            composer_action(&mut b, ComposerPress::Send),
+            ComposerAction::SendStalled("続けてください".into()),
+            "全員宛て (Send) へ落ちてはいけない"
+        );
+        assert!(b.text().is_empty(), "送ったら下書きは空になる");
+    }
+
+    #[test]
+    fn 停止中チップは居ないときに出さず選択中なら残る() {
+        // 0 件なら出さない (常に 0 を表示するバッジを作らない)
+        assert!(!show_stalled_chip(0, ComposerTarget::Broadcast));
+        assert!(!show_stalled_chip(0, ComposerTarget::Agent(1)));
+        // 1 件でもいれば出す
+        assert!(show_stalled_chip(1, ComposerTarget::Broadcast));
+        // 0 件でも、いまその宛先を選んでいるなら消さない
+        // (消すと書きかけの下書きへ戻る手段が画面から無くなる)
+        assert!(show_stalled_chip(0, ComposerTarget::Stalled));
+    }
+
+    #[test]
+    fn 停止中宛ては下書きが全員宛てと混ざらない() {
+        let mut b = AgentInputBuffer::new();
+        b.pick_target(ComposerTarget::Broadcast);
+        b.set_text("全員へ");
+        b.pick_target(ComposerTarget::Stalled);
+        assert_eq!(b.text(), "", "宛先を替えたら別の下書きになる");
+        b.set_text("止まっている人へ");
+        b.pick_target(ComposerTarget::Broadcast);
+        assert_eq!(b.text(), "全員へ");
+        b.pick_target(ComposerTarget::Stalled);
+        assert_eq!(b.text(), "止まっている人へ");
+    }
+
+    #[test]
+    fn 停止中宛てはアクティブが動いても外れない() {
+        let mut b = AgentInputBuffer::new();
+        b.sync_target(Some(1));
+        b.pick_target(ComposerTarget::Stalled);
+        // アクティブなエージェントが動いても、モードとして選んだ宛先は守る
+        b.sync_target(Some(2));
+        assert_eq!(b.target(), ComposerTarget::Stalled);
+        b.sync_target(Some(3));
+        assert_eq!(b.target(), ComposerTarget::Stalled);
+        // 宛先にできる相手が居なくなったら全員宛てへ戻す (既存の規則どおり)
+        b.sync_target(None);
+        assert_eq!(b.target(), ComposerTarget::Broadcast);
+    }
+
+    #[test]
+    fn 停止中の下書きはセッションが消えても残る() {
+        let mut b = AgentInputBuffer::new();
+        b.pick_target(ComposerTarget::Stalled);
+        b.set_text("押し出す指示");
+        b.pick_target(ComposerTarget::Agent(9));
+        b.set_text("9 番へ");
+        // 9 番が消えた
+        b.retain_agents(&[]);
+        b.pick_target(ComposerTarget::Stalled);
+        assert_eq!(
+            b.text(),
+            "押し出す指示",
+            "グループ宛ての下書きはセッションに紐づかないので残る"
+        );
+    }
+
+    #[test]
+    fn 宛先ラベルは停止中を名指しする() {
+        assert_eq!(
+            inline_target_label(ComposerTarget::Stalled, Some("Claude Code")),
+            "⏸ 停止中",
+            "選択中のエージェント名に化けてはいけない"
+        );
+    }
+
     // ── 宛先チップ (複数エージェントを横に並べて選ぶ) ─────────────
 
     /// チップ行に出る要素は「📢 全員 + 起動中の全エージェント」。
@@ -3160,7 +3288,8 @@ mod tests {
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = agent_composer_inline_ui(ui, &theme, buf, Some(active), &mut expand);
-                composer_target_chips(ui, &theme, buf, targets);
+                // 停止中は 0 件 (このハーネスは宛先の追従だけを見る)
+                composer_target_chips(ui, &theme, buf, targets, 0);
             });
         });
     }

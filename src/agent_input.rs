@@ -194,6 +194,13 @@ impl SlashCommandEngine {
 pub enum ComposerTarget {
     /// 全エージェントへ一斉送信 (従来の `broadcast_input` に相当)
     Broadcast,
+    /// **止まっているエージェントだけ**へ一斉送信。
+    ///
+    /// 「作業中のものは邪魔せず、待機・停滞・ループ・エラーで前へ進まなく
+    /// なったものだけを一括で押し出す」ための宛先。全員宛てとの違いは
+    /// 作業中を巻き込まない点で、承認待ちも外す
+    /// (`supervisor::SessionState::is_stuck` が唯一の判定元)。
+    Stalled,
     /// セッション ID で指名した 1 体だけへ送信
     Agent(u64),
 }
@@ -202,6 +209,14 @@ impl ComposerTarget {
     /// 全員宛てか
     pub fn is_broadcast(self) -> bool {
         matches!(self, Self::Broadcast)
+    }
+
+    /// **複数へ一斉に送る宛先か** (全員 / 停止中)。
+    ///
+    /// 1 体の名指しと違い、これらは「モード」なのでアクティブなエージェントが
+    /// 動いても外れない ([`AgentInputBuffer::sync_target`])。
+    pub fn is_group(self) -> bool {
+        matches!(self, Self::Broadcast | Self::Stalled)
     }
 }
 
@@ -360,7 +375,7 @@ impl AgentInputBuffer {
                 ComposerTarget::Broadcast
             }
             Some(id) => match self.pinned {
-                Some(ComposerTarget::Broadcast) => ComposerTarget::Broadcast,
+                Some(t) if t.is_group() => t,
                 Some(t @ ComposerTarget::Agent(_)) if !moved => t,
                 _ => {
                     self.pinned = None;
@@ -475,7 +490,8 @@ impl AgentInputBuffer {
     /// 生きているセッション ID だけを残し、消えた分の下書きを掃除する
     pub fn retain_agents(&mut self, alive: &[u64]) {
         self.drafts.retain(|k, _| match k {
-            ComposerTarget::Broadcast => true,
+            // グループ宛て (全員 / 停止中) は特定のセッションに紐づかないので残す
+            ComposerTarget::Broadcast | ComposerTarget::Stalled => true,
             ComposerTarget::Agent(id) => alive.contains(id),
         });
         if let ComposerTarget::Agent(id) = self.target {

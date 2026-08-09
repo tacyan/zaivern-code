@@ -70,6 +70,13 @@ pub enum Cmd {
     GitPull,
     /// コミット履歴の一覧を開く (選ぶとその差分がタブで開く)
     GitHistory,
+    // ── マルチバッファ (複数ファイルの抜粋を 1 本の面へ / Zed の multibuffer) ──
+    /// 直近のワークスペース検索の**全ヒット**を 1 枚の面で開く
+    OpenSearchMultibuffer,
+    /// ワークスペース全体の**診断**を 1 枚の面で開く
+    OpenProblemsMultibuffer,
+    /// **未コミットの変更**を 1 枚の面で開く (エージェントの成果をまとめて読む)
+    OpenChangesMultibuffer,
     OpenFind,
     NewAgent(usize),
     /// プリセット `usize` を **専用の git worktree** で起動する。
@@ -782,7 +789,9 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::TogglePetFreeRoam
         | Cmd::TogglePetSleep
         | Cmd::TogglePetSounds
-        | Cmd::TogglePetBubbles => Group::View,
+        | Cmd::TogglePetBubbles
+        | Cmd::OpenSearchMultibuffer
+        | Cmd::OpenProblemsMultibuffer => Group::View,
 
         // ── Git ────────────────────────────────────────────────────
         Cmd::OpenGitPanel
@@ -790,6 +799,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::GitPush
         | Cmd::GitPull
         | Cmd::GitHistory
+        | Cmd::OpenChangesMultibuffer
         | Cmd::ShowGitHubTab
         | Cmd::OpenReview
         | Cmd::SetReviewBase(_)

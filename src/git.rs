@@ -1662,6 +1662,34 @@ pub(crate) fn run_git_at(dir: &Path, args: &[String]) -> Result<String, String> 
     Ok(crate::textenc::decode_output(&out.stdout))
 }
 
+/// 作業ツリーの未コミット変更を **1 本の unified diff** で取る。
+///
+/// - `HEAD` との比較なので、**ステージ済みも未ステージも両方**入る
+///   (レビューしたいのは「前回のコミットから何が変わったか」であって、
+///    index に載っているかどうかではない)。
+/// - 未追跡ファイルは含まれない。git がそれらを diff の対象にしないため。
+/// - `-U0` にはしない。前後の文脈が消えると、削除だけのハンクがどこの話か
+///   分からなくなる。
+/// - コミットが 1 つも無いリポジトリでは `HEAD` が解決できないので、
+///   **空ツリー**との比較へ落とす (初回コミット前でも変更が見える)。
+pub fn working_tree_diff(repo: &Path) -> Result<String, String> {
+    let run = |rev: &str| {
+        let args: Vec<String> = ["diff", rev, "--no-color", "--no-ext-diff"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        run_git_at(repo, &args)
+    };
+    run("HEAD").or_else(|e| run(EMPTY_TREE_SHA1).map_err(|_| e))
+}
+
+/// 空ツリーのオブジェクト ID (git の定数。`git hash-object -t tree` の結果と同じ)。
+///
+/// **パスではなく git 自身が定義する値**なので、どの OS でも同じものを指す。
+/// SHA-256 で初期化されたリポジトリでは当たらないが、その場合は
+/// [`working_tree_diff`] が元の `HEAD` のエラーをそのまま返すだけで済む。
+const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 fn git_text(dir: &Path, args: &[&str]) -> Option<String> {
     let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
     run_git_at(dir, &owned).ok()

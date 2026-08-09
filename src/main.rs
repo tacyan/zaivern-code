@@ -45,6 +45,7 @@ mod markdown;
 mod mcp;
 mod menu_bar;
 mod minimap;
+mod multibuffer;
 mod notify;
 mod orchestration;
 mod palette;

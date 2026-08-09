@@ -835,6 +835,12 @@ pub enum PreviewDoc {
     Media(MediaDoc),
     /// 書庫の中身一覧。
     Archive(ArchiveDoc),
+    /// マルチバッファ (複数ファイルの抜粋を 1 本の面に並べたもの)。
+    ///
+    /// 他の 3 つと違い**ファイル 1 本の中身ではない**が、「専用ビューアで描く
+    /// タブの中身」という役割は同じなので同じ列挙型に入れる
+    /// (`Buffer` にフィールドを増やすと生成箇所が全部壊れるため)。
+    Multi(crate::multibuffer::Multibuffer),
 }
 
 /// どのプレビューかの印 (借用を握ったまま `&mut self` を呼べないので、
@@ -844,6 +850,7 @@ pub enum PreviewTag {
     Hex,
     Media,
     Archive,
+    Multi,
 }
 
 impl PreviewDoc {
@@ -853,6 +860,7 @@ impl PreviewDoc {
             PreviewDoc::Hex(_) => PreviewTag::Hex,
             PreviewDoc::Media(_) => PreviewTag::Media,
             PreviewDoc::Archive(_) => PreviewTag::Archive,
+            PreviewDoc::Multi(_) => PreviewTag::Multi,
         }
     }
 }
