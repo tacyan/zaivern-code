@@ -1503,7 +1503,7 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
             default: crate::feature::SettingValue::Int(30),
         },
     ],
-    binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 /// 台帳の非同期読み取り 1 回ぶん。

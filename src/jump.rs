@@ -840,6 +840,11 @@ fn notice_card(ctx: &egui::Context, text: &str, anchor: egui::Align2) {
 }
 
 /// コマンドパレット / キーバインドからの到達経路。
+// 今日は 6 欄すべてを自分で埋めているので `..DEFAULT` は「効果が無い」と
+// clippy に怒られる。**狙いは今日ではなく明日**で、`Feature` に欄が 1 つ
+// 増えた瞬間にこのモジュールだけが壊れるのを防ぐためにある。効果が出る日
+// まで残すので、ここだけ個別に許可する。
+#[allow(clippy::needless_update)]
 pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     module: "jump",
     entries: &[crate::feature::Entry {
@@ -869,6 +874,7 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
         id: "jump.start",
         default: "cmd+shift+y",
     }],
+    ..crate::feature::Feature::DEFAULT
 };
 
 #[cfg(test)]
