@@ -68,6 +68,9 @@ const CONFLICT_INLINE_MAX: usize = 2;
 /// 衝突バッジ / ツールチップで 1 パスに許す文字数。
 const PATH_CHARS_MAX: usize = 44;
 
+/// [🏆 勝者を評価] を文字つきで置くのに要る残り幅。これを切ったらアイコンだけにする。
+const EVAL_BTN_FULL_W: f32 = 130.0;
+
 // ---------------------------------------------------------------------------
 // 純粋ロジック: スラグ / ブランチ名 / パース
 // ---------------------------------------------------------------------------
@@ -603,6 +606,675 @@ pub fn discard_racer(race: &Race, idx: usize, force: bool) -> Result<(), String>
 }
 
 // ---------------------------------------------------------------------------
+// 勝者評価 (Crown evaluation) — **すべて in-process**
+// ---------------------------------------------------------------------------
+//
+// N 体を走らせた後に残る最後の人力が「どれが勝ったか」の判定である。ここはそれを
+// 助ける層で、次の 3 点を守る:
+//
+// 1. **提案であって決定ではない。** 出すのは `{勝者, 理由}` だけで、採用 (マージ) は
+//    従来どおりユーザーの明示操作。評価結果で勝手にマージすることは絶対にしない。
+// 2. **明示操作でだけ走る。** ボタン / パレットから 1 回。走行中の自動評価はしない
+//    (設計原則 3: アイドル時のコストはゼロ)。git を叩くのでワーカースレッド。
+// 3. **壊れても race は壊れない。** 収集も判定も失敗は `EvalOutcome::Failed` に畳み、
+//    採用・破棄・差分表示は一切影響を受けない。評価は付加価値であって前提ではない。
+//
+// 「in-process」は `supervisor` の Diagnostician と同じ原則である。判定は外部 CLI
+// エージェントへ投げず、この場で決定的に決める。将来 LLM を判定役に差すときのために
+// **依頼 (`build_eval_request`) と応答の解析 (`parse_verdict`) を判定本体から分けて**
+// あるので、`judge_in_process` を差し替えるだけで経路は変わらない。
+
+/// 評価に必要な候補の最小本数。これ未満なら比べる意味がないのでスキップする。
+pub const MIN_EVAL_CANDIDATES: usize = 2;
+
+/// 理由として採用する最大文字数 (diagnostician の `MAX_WHY_CHARS` と同じ流儀)。
+pub const MAX_REASON_CHARS: usize = 300;
+
+/// 除外サマリに名前を並べるファイル数 (残りは「他 N 件」に畳む)。
+const EXCLUDE_INLINE_MAX: usize = 3;
+
+/// 評価に載せる候補 1 本。
+///
+/// `Serialize` を持つのは飾りではない: 判定役への入力は**依頼 JSON だけ**という
+/// 形を守るため、`build_eval_request` がこれをそのまま書き出し、
+/// `judge_in_process` はその JSON を読んで判定する (外部判定役と同じ入口)。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Candidate {
+    /// `Race::racers` の添字 (勝者を racer へ戻すため)
+    pub idx: usize,
+    /// 表示名 = 判定の「勝者名」。同名プリセットが並んでも一意になるよう作る。
+    pub name: String,
+    pub branch: String,
+    /// 除外・切り詰めを済ませた unified diff
+    pub diff: String,
+    /// 差分に残ったファイル数
+    pub files: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    /// 差分に残ったファイルのパス (テスト有無などの判定に使う)
+    pub paths: Vec<String>,
+    /// 落としたパス (ロックファイル / ビルド成果物 / バイナリ / 巨大生成物)
+    pub excluded: Vec<String>,
+    /// 上限で切り詰めたか。**黙って切らない**ので本文にも印が入る。
+    pub truncated: bool,
+    /// 未コミット (未追跡を含む) の変更を抱えているか。
+    /// [採用] はコミット済みの成果しかマージできないので、これは重い減点になる。
+    pub uncommitted: bool,
+    /// 他の racer と取り合っているファイル数
+    pub conflicts: usize,
+}
+
+impl Candidate {
+    /// 差分が 1 バイトも無い (= まだ何も出していない)。
+    pub fn is_empty(&self) -> bool {
+        self.diff.trim().is_empty()
+    }
+
+    /// 変更行の合計 (規模の比較に使う)。
+    pub fn churn(&self) -> usize {
+        self.insertions + self.deletions
+    }
+}
+
+/// 評価 1 回ぶんの結果。**Decided は提案** — 採用はユーザーが選ぶ。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvalOutcome {
+    /// 比べる意味がないので評価しなかった (理由つき)。
+    Skipped(String),
+    /// 勝者と理由。`note` は除外・切り詰めの内訳 (根拠の透明性のため必ず作る)。
+    Decided {
+        winner: usize,
+        name: String,
+        reason: String,
+        note: String,
+    },
+    /// 評価そのものが失敗した。採用フローには影響しない。
+    Failed(String),
+}
+
+/// 判定役の応答 (`{"winner", "reason"}`) を解析した結果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verdict {
+    pub winner: String,
+    pub reason: String,
+}
+
+/// unified diff を 1 ファイルぶんに切ったもの。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffChunk {
+    pub path: String,
+    pub body: String,
+    /// `Binary files ... differ` / `GIT binary patch` を含む = 読ませても意味がない
+    pub binary: bool,
+    /// 最長行のバイト数 (minified な生成物の検出に使う)
+    pub max_line: usize,
+}
+
+// ── 純粋ロジック: 差分の切り分け / 除外 / 切り詰め ─────────────────
+
+/// `a/` `b/` の接頭辞を落とす (git の既定プレフィックス)。
+fn strip_ab(p: &str) -> &str {
+    p.strip_prefix("a/")
+        .or_else(|| p.strip_prefix("b/"))
+        .unwrap_or(p)
+}
+
+/// 1 ファイルぶんのヘッダ領域からパスを取る。
+///
+/// `+++ b/<path>` / `--- a/<path>` を優先する — **行末までがパス**なので、空白を
+/// 含むファイル名でも壊れない。ハンク (`@@`) に入った後の `+++` は本文なので見ない。
+/// どちらも無い (モード変更だけ等) ときだけ `diff --git` 行から推測する。
+fn chunk_path(header: &str, body: &str) -> String {
+    let mut plus: Option<&str> = None;
+    let mut minus: Option<&str> = None;
+    for line in body.lines() {
+        if line.starts_with("@@ ") {
+            break;
+        }
+        if let Some(p) = line.strip_prefix("+++ ") {
+            if p != "/dev/null" && plus.is_none() {
+                plus = Some(strip_ab(p));
+            }
+        } else if let Some(p) = line.strip_prefix("--- ") {
+            if p != "/dev/null" && minus.is_none() {
+                minus = Some(strip_ab(p));
+            }
+        }
+    }
+    if let Some(p) = plus.or(minus) {
+        return p.to_string();
+    }
+    // 最後の手段: `diff --git a/x b/x` の a/ 側。
+    let rest = header.trim_start_matches("diff --git ").trim();
+    if let Some(a) = rest.strip_prefix("a/") {
+        if let Some(cut) = a.find(" b/") {
+            return a[..cut].to_string();
+        }
+        return a.to_string();
+    }
+    rest.to_string()
+}
+
+/// unified diff (`git diff`) を `diff --git` 行ごとに切る。
+///
+/// git が出す形だけを見る純関数なので、テストは git 無しで書ける。
+pub fn split_diff_files(text: &str) -> Vec<DiffChunk> {
+    let mut out: Vec<DiffChunk> = Vec::new();
+    let mut header: Option<String> = None;
+    let mut body = String::new();
+    fn flush(header: &mut Option<String>, body: &mut String, out: &mut Vec<DiffChunk>) {
+        let Some(h) = header.take() else {
+            body.clear();
+            return;
+        };
+        let binary = body
+            .lines()
+            .any(|l| l.starts_with("Binary files ") || l.starts_with("GIT binary patch"));
+        let max_line = body.lines().map(str::len).max().unwrap_or(0);
+        let path = chunk_path(&h, body);
+        let mut whole = h;
+        whole.push('\n');
+        whole.push_str(body);
+        out.push(DiffChunk {
+            path,
+            body: whole,
+            binary,
+            max_line,
+        });
+        body.clear();
+    }
+    for line in text.lines() {
+        if line.starts_with("diff --git ") {
+            flush(&mut header, &mut body, &mut out);
+            header = Some(line.to_string());
+        } else if header.is_some() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    flush(&mut header, &mut body, &mut out);
+    out
+}
+
+/// 設定から作る除外の判定器。**パターンは設定からしか来ない** —
+/// このモジュールに既定値は 1 つも持たない。
+pub struct DiffFilter {
+    pats: Vec<crate::ignore::Pattern>,
+    max_line: usize,
+}
+
+impl DiffFilter {
+    pub fn new(cfg: &crate::config::RaceEvalConfig) -> Self {
+        Self {
+            pats: crate::ignore::parse(&cfg.exclude.join("\n")),
+            max_line: cfg.max_line_bytes,
+        }
+    }
+
+    /// パス自体が除外パターンに当たるか。
+    ///
+    /// `.gitignore` はディレクトリを歩きながら判定するが、ここにはファイルパスしか
+    /// 無い。`target/` のようなディレクトリ指定を効かせるため、**祖先を 1 段ずつ
+    /// ディレクトリとして照合**してから、最後にファイル自身を照合する。
+    pub fn path_excluded(&self, rel: &str) -> bool {
+        if self.pats.is_empty() {
+            return false;
+        }
+        let comps = crate::ignore::split_rel_os(rel, cfg!(windows));
+        let layer: &[&str] = &[];
+        for k in 1..comps.len() {
+            if crate::ignore::decide(&[(layer, &self.pats)], &comps[..k], true) == Some(true) {
+                return true;
+            }
+        }
+        crate::ignore::decide(&[(layer, &self.pats)], &comps, false) == Some(true)
+    }
+
+    /// このチャンクを評価に載せないか。載せない理由も返す (説明のため)。
+    pub fn reject(&self, c: &DiffChunk) -> Option<String> {
+        if self.path_excluded(&c.path) {
+            return Some(tr("除外設定"));
+        }
+        if c.binary {
+            return Some(tr("バイナリ"));
+        }
+        if self.max_line > 0 && c.max_line > self.max_line {
+            return Some(tr("巨大な生成物"));
+        }
+        None
+    }
+}
+
+/// 除外を適用した差分。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FilteredDiff {
+    pub text: String,
+    pub paths: Vec<String>,
+    pub excluded: Vec<String>,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+/// 差分から「読ませる価値のないもの」を落とす。
+pub fn filter_diff(text: &str, filter: &DiffFilter) -> FilteredDiff {
+    let mut out = FilteredDiff::default();
+    for c in split_diff_files(text) {
+        if filter.reject(&c).is_some() {
+            out.excluded.push(c.path);
+            continue;
+        }
+        for line in c.body.lines() {
+            if line.starts_with("+++") || line.starts_with("---") {
+                continue;
+            }
+            if line.starts_with('+') {
+                out.insertions += 1;
+            } else if line.starts_with('-') {
+                out.deletions += 1;
+            }
+        }
+        out.paths.push(c.path);
+        out.text.push_str(&c.body);
+    }
+    out
+}
+
+/// バイト上限で差分を切り詰める。**切ったことを本文に明示する** (黙って切らない)。
+/// 戻り値は (本文, 切り詰めたか)。
+pub fn truncate_diff(text: &str, max_bytes: usize) -> (String, bool) {
+    if max_bytes == 0 || text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    // 文字境界まで戻す (マルチバイトの途中で切らない)。
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // 行の途中で切ると差分として読めないので、直前の改行まで戻す。
+    if let Some(nl) = text[..cut].rfind('\n') {
+        cut = nl + 1;
+    }
+    let dropped = text.len() - cut;
+    let mut s = text[..cut].to_string();
+    s.push_str(&trf(
+        "\n… ここで打ち切りました ({limit} バイトの上限を超えたため、残り {n} バイトは評価に載せていません)\n",
+        &[
+            ("limit", max_bytes.to_string()),
+            ("n", dropped.to_string()),
+        ],
+    ));
+    (s, true)
+}
+
+/// 同名プリセットが並んでも一意になる候補名を作る。
+/// (勝者名で候補を引き戻すので、ここが重複すると判定が曖昧になる)
+pub fn candidate_names(race: &Race) -> Vec<String> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut out = Vec::with_capacity(race.racers.len());
+    for r in &race.racers {
+        let base = format!("{} {}", r.icon, r.preset_name);
+        let n = seen.entry(base.clone()).or_insert(0);
+        *n += 1;
+        out.push(if *n == 1 {
+            base
+        } else {
+            format!("{base} #{n}")
+        });
+    }
+    out
+}
+
+/// テストらしいパスか。**部分一致では見ない** — `latest.rs` を「テスト」に
+/// 数えないため、パス要素ちょうどか、ファイル名の定型だけを拾う。
+pub fn looks_like_test(path: &str) -> bool {
+    let comps = crate::ignore::split_rel_os(path, cfg!(windows));
+    if comps
+        .iter()
+        .any(|c| matches!(*c, "test" | "tests" | "spec" | "specs" | "__tests__"))
+    {
+        return true;
+    }
+    let Some(file) = comps.last() else {
+        return false;
+    };
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+    stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with(".test")
+        || stem.ends_with(".spec")
+        || stem.ends_with("Test")
+}
+
+/// ドキュメントらしいパスか。
+fn looks_like_doc(path: &str) -> bool {
+    let comps = crate::ignore::split_rel_os(path, cfg!(windows));
+    if comps.iter().any(|c| matches!(*c, "docs" | "doc")) {
+        return true;
+    }
+    comps
+        .last()
+        .is_some_and(|f| f.to_ascii_lowercase().ends_with(".md"))
+}
+
+// ── 判定 (in-process) ─────────────────────────────────────────────
+
+/// 候補 1 本の採点結果。点そのものより**内訳 (notes)** が本体で、理由文はこれで組む。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Score {
+    pub idx: usize,
+    pub name: String,
+    pub points: i64,
+    pub notes: Vec<String>,
+}
+
+/// 候補を採点する。**決定的** — 同じ入力なら必ず同じ順位になる。
+///
+/// 見るのは「差分から機械的に読める事実」だけ:
+/// 成果があるか / 採用でマージに載るか / テストを伴うか / 他とぶつからないか /
+/// 同じことをより小さく済ませているか。
+pub fn score_candidates(cands: &[Candidate]) -> Vec<Score> {
+    // 規模の順位付けは非空の候補だけで行う (空は比較対象にしない)。
+    let mut by_size: Vec<(usize, usize)> = cands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_empty())
+        .map(|(i, c)| (i, c.churn()))
+        .collect();
+    by_size.sort_by_key(|&(i, churn)| (churn, i));
+
+    let mut scores: Vec<Score> = Vec::with_capacity(cands.len());
+    for (i, c) in cands.iter().enumerate() {
+        let mut pts: i64 = 0;
+        let mut notes: Vec<String> = Vec::new();
+        if c.is_empty() {
+            pts -= 1000;
+            notes.push(tr("差分が空 (まだ成果が出ていない)"));
+        } else {
+            pts += 100;
+            notes.push(trf(
+                "{f} ファイル +{a} -{d} の成果",
+                &[
+                    ("f", c.files.to_string()),
+                    ("a", c.insertions.to_string()),
+                    ("d", c.deletions.to_string()),
+                ],
+            ));
+        }
+        if c.uncommitted {
+            pts -= 400;
+            notes.push(tr(
+                "未コミットの変更が残っている (このままでは採用のマージに載らない)",
+            ));
+        }
+        if !c.is_empty() && c.paths.iter().any(|p| looks_like_test(p)) {
+            pts += 150;
+            notes.push(tr("テストを伴っている"));
+        }
+        if !c.is_empty() && c.paths.iter().any(|p| looks_like_doc(p)) {
+            pts += 40;
+            notes.push(tr("ドキュメントを更新している"));
+        }
+        if c.conflicts > 0 {
+            let pen = (c.conflicts as i64 * 40).min(200);
+            pts -= pen;
+            notes.push(trf(
+                "他のレーサーと {n} ファイルで衝突している",
+                &[("n", c.conflicts.to_string())],
+            ));
+        }
+        if let Some(rank) = by_size.iter().position(|&(j, _)| j == i) {
+            let bonus = match rank {
+                0 => 80,
+                1 => 40,
+                _ => 0,
+            };
+            pts += bonus;
+            if rank == 0 && by_size.len() >= 2 {
+                notes.push(trf(
+                    "最小の差分で済ませている ({n} 行)",
+                    &[("n", c.churn().to_string())],
+                ));
+            }
+        }
+        if c.truncated {
+            notes.push(tr("差分が上限を超えたため一部だけを見て判定している"));
+        }
+        scores.push(Score {
+            idx: c.idx,
+            name: c.name.clone(),
+            points: pts,
+            notes,
+        });
+    }
+    scores
+}
+
+/// 判定役へ渡す依頼 (cmux の Crown evaluation と同じ形: `{prompt, candidates[]}`)。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvalRequest {
+    pub prompt: String,
+    pub candidates: Vec<Candidate>,
+}
+
+/// 依頼を JSON にする。
+///
+/// **判定役の入口をここ 1 つに絞る**ための層である。in-process の判定役も外部の
+/// 判定役も、受け取るのはこの JSON だけ。差し替えても経路は変わらない。
+pub fn build_eval_request(prompt: &str, cands: &[Candidate]) -> Result<String, String> {
+    serde_json::to_string(&EvalRequest {
+        prompt: prompt.to_string(),
+        candidates: cands.to_vec(),
+    })
+    .map_err(|_| tr("評価の依頼を組み立てられませんでした"))
+}
+
+/// in-process の判定役。依頼 JSON を読み、応答は `{"winner","reason"}` の JSON。
+///
+/// **外部 CLI エージェントへは投げない** (supervisor の Diagnostician と同じ原則)。
+/// 判定は決定的で、同じ依頼からは必ず同じ勝者が出る。
+pub fn judge_in_process(request: &str) -> Result<String, String> {
+    let req: EvalRequest =
+        serde_json::from_str(request).map_err(|_| tr("評価の依頼を読み取れませんでした"))?;
+    let scores = score_candidates(&req.candidates);
+    // 同点は添字の小さいほう (出走順) を勝ちにして、結果を安定させる。
+    let Some(best) = scores
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, s)| (s.points, -(*i as i64)))
+        .map(|(i, _)| i)
+    else {
+        return Err(tr("候補がありません"));
+    };
+    let win = &scores[best];
+    let mut reason = win.notes.join(&tr("、"));
+    if reason.is_empty() {
+        reason = tr("減点が最も少ない");
+    }
+    // 次点との差を 1 句だけ添える (順位の根拠を示すため)。
+    let runner = scores
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != best)
+        .max_by_key(|(i, s)| (s.points, -(*i as i64)));
+    if let Some((_, r)) = runner {
+        let diff = win.points - r.points;
+        reason.push_str(&trf(
+            " — 次点 {name} との差は {d} 点",
+            &[("name", r.name.clone()), ("d", diff.to_string())],
+        ));
+    }
+    Ok(serde_json::json!({ "winner": win.name, "reason": reason }).to_string())
+}
+
+/// 判定役の応答を解析する。**曖昧なら必ず `Err`** (diagnostician と同じ作法)。
+///
+/// `Err` にする条件:
+/// - JSON として読めない / 途中で切れている
+/// - オブジェクトでない
+/// - `winner` が無い / 文字列でない / 空
+/// - `reason` が無い / 文字列でない / 空 (**根拠の無い順位は採らない**)
+/// - `winner` が候補名のどれにも一致しない
+pub fn parse_verdict(raw: &str, names: &[String]) -> Result<Verdict, String> {
+    // コードフェンスで包んでくる判定役 (LLM) があるので、そこだけは剥がす。
+    let mut body = raw.trim();
+    if let Some(rest) = body.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        body = rest.trim_start().trim_end_matches('`').trim();
+    }
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| tr("評価結果を JSON として読めませんでした (途中で切れている可能性)"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| tr("評価結果が JSON オブジェクトではありません"))?;
+    let winner = obj
+        .get("winner")
+        .and_then(|w| w.as_str())
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .ok_or_else(|| tr("評価結果に勝者がありません"))?;
+    let reason = obj
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| tr("評価結果に理由がありません — 根拠の無い順位は採用しません"))?;
+    if !names.iter().any(|n| n == winner) {
+        return Err(trf(
+            "勝者 {w} は候補にいません",
+            &[("w", winner.to_string())],
+        ));
+    }
+    Ok(Verdict {
+        winner: winner.to_string(),
+        reason: reason.chars().take(MAX_REASON_CHARS).collect(),
+    })
+}
+
+/// 除外・切り詰めの内訳を 1 行にする (何を見せていないかを必ず出す)。
+pub fn collection_note(cands: &[Candidate]) -> String {
+    let mut excluded: Vec<String> = Vec::new();
+    for c in cands {
+        for e in &c.excluded {
+            if !excluded.contains(e) {
+                excluded.push(e.clone());
+            }
+        }
+    }
+    let truncated = cands.iter().filter(|c| c.truncated).count();
+    let mut parts: Vec<String> = Vec::new();
+    if !excluded.is_empty() {
+        let paths: Vec<PathBuf> = excluded.iter().map(PathBuf::from).collect();
+        parts.push(trf(
+            "除外 {n} 件 ({files})",
+            &[
+                ("n", excluded.len().to_string()),
+                ("files", summarize_files(&paths, EXCLUDE_INLINE_MAX)),
+            ],
+        ));
+    }
+    if truncated > 0 {
+        parts.push(trf(
+            "{n} 本を上限で切り詰め",
+            &[("n", truncated.to_string())],
+        ));
+    }
+    parts.join(" / ")
+}
+
+/// 候補から勝者を決める。**採用は一切しない** — 返すのは提案だけ。
+///
+/// 失敗はすべて `EvalOutcome::Failed` に畳む。ここから例外も panic も出さないので、
+/// 評価がどう転んでも採用・破棄・差分表示は従来どおり動く。
+pub fn evaluate(prompt: &str, cands: &[Candidate]) -> EvalOutcome {
+    if cands.len() < MIN_EVAL_CANDIDATES {
+        return EvalOutcome::Skipped(trf(
+            "候補が {n} 本しかありません — 比べるには {min} 本以上が要ります",
+            &[
+                ("n", cands.len().to_string()),
+                ("min", MIN_EVAL_CANDIDATES.to_string()),
+            ],
+        ));
+    }
+    if cands.iter().all(Candidate::is_empty) {
+        return EvalOutcome::Skipped(tr(
+            "どの候補もまだ差分を出していません — もう少し走らせてから評価してください",
+        ));
+    }
+    let names: Vec<String> = cands.iter().map(|c| c.name.clone()).collect();
+    let raw = match build_eval_request(prompt, cands).and_then(|req| judge_in_process(&req)) {
+        Ok(raw) => raw,
+        Err(e) => return EvalOutcome::Failed(e),
+    };
+    match parse_verdict(&raw, &names) {
+        Ok(v) => {
+            let Some(c) = cands.iter().find(|c| c.name == v.winner) else {
+                return EvalOutcome::Failed(tr("勝者を候補へ戻せませんでした"));
+            };
+            EvalOutcome::Decided {
+                winner: c.idx,
+                name: v.winner,
+                reason: v.reason,
+                note: collection_note(cands),
+            }
+        }
+        Err(e) => EvalOutcome::Failed(e),
+    }
+}
+
+/// レースの各 worktree から候補を集める (git を叩くのでワーカースレッド側で呼ぶ)。
+///
+/// 破棄済み / worktree が消えた racer は候補にしない。1 体でも失敗したら
+/// **その 1 体だけ落として続ける** — 評価が全滅するより比べられる本数を残す。
+pub fn collect_candidates(
+    race: &Race,
+    conflicts: &BTreeMap<usize, usize>,
+    cfg: &crate::config::RaceEvalConfig,
+) -> Vec<Candidate> {
+    let filter = DiffFilter::new(cfg);
+    let names = candidate_names(race);
+    let mut budget = cfg.max_total_bytes;
+    let mut out: Vec<Candidate> = Vec::new();
+    for (i, r) in race.racers.iter().enumerate() {
+        if matches!(r.status, RacerStatus::Discarded) || !r.dir.is_dir() {
+            continue;
+        }
+        // core.quotepath=false: 非 ASCII のパスを 8 進エスケープさせない。
+        let Ok(raw) = run_git(
+            &r.dir,
+            &["-c", "core.quotepath=false", "diff", &race.base_commit],
+        ) else {
+            continue;
+        };
+        let uncommitted = crate::worktree::status_entries(&r.dir)
+            .map(|e| !e.is_empty())
+            .unwrap_or(false);
+        let f = filter_diff(&raw, &filter);
+        // 1 本ぶんの上限と、全体の残り予算の**厳しいほう**で切る。
+        let cap = cfg.max_diff_bytes.min(budget.max(1));
+        let (text, truncated) = truncate_diff(&f.text, cap);
+        budget = budget.saturating_sub(text.len());
+        out.push(Candidate {
+            idx: i,
+            name: names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| racer_label(race, i)),
+            branch: r.branch.clone(),
+            diff: text,
+            files: f.paths.len(),
+            insertions: f.insertions,
+            deletions: f.deletions,
+            paths: f.paths,
+            excluded: f.excluded,
+            truncated,
+            uncommitted,
+            conflicts: conflicts.get(&i).copied().unwrap_or(0),
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // ダッシュボード (UI 状態 + 描画)
 // ---------------------------------------------------------------------------
 
@@ -622,6 +1294,9 @@ pub enum RaceAction {
     Adopt(usize),
     /// racer の worktree + ブランチを削除する
     Discard { idx: usize, force: bool },
+    /// 勝者を評価する (**提案を出すだけ** — 採用はユーザーの明示操作のまま)。
+    /// 設定 (除外パターン・上限) を持っているのは app.rs なので、実行は向こうへ頼む。
+    Evaluate,
     /// ダッシュボードを畳む (worktree とブランチはそのまま残る)
     Close,
 }
@@ -645,6 +1320,10 @@ pub struct RacePanel {
     /// 触ったファイルから畳んだ衝突。ポーリング結果が届いた時だけ作り直す
     /// (毎フレームの計算も git もしない)。
     overlap: OverlapReport,
+    /// 直近の勝者評価。**明示操作でしか埋まらない** (自動評価はしない)。
+    eval: Option<EvalOutcome>,
+    /// 飛行中の評価。UI スレッドは待たない (差分量ポーリングと同じ流儀)。
+    eval_pending: Option<Receiver<EvalOutcome>>,
 }
 
 impl Default for RacePanel {
@@ -664,6 +1343,8 @@ impl RacePanel {
             pending: None,
             last_refresh: None,
             overlap: OverlapReport::default(),
+            eval: None,
+            eval_pending: None,
         }
     }
 
@@ -677,6 +1358,8 @@ impl RacePanel {
         self.pending = None;
         self.last_refresh = None;
         self.overlap = OverlapReport::default();
+        self.eval = None;
+        self.eval_pending = None;
     }
 
     /// ダッシュボードを畳む。worktree とブランチには触らない。
@@ -686,11 +1369,80 @@ impl RacePanel {
         self.pending = None;
         self.last_refresh = None;
         self.overlap = OverlapReport::default();
+        self.eval = None;
+        self.eval_pending = None;
     }
 
     /// 今わかっている衝突。UI と外部 (テスト) から読むだけ。
     pub fn overlap(&self) -> &OverlapReport {
         &self.overlap
+    }
+
+    /// 直近の評価結果 (未評価なら None)。
+    pub fn eval_result(&self) -> Option<&EvalOutcome> {
+        self.eval.as_ref()
+    }
+
+    /// 評価が飛行中か (ボタンの見た目と二重起動の防止に使う)。
+    pub fn eval_running(&self) -> bool {
+        self.eval_pending.is_some()
+    }
+
+    /// racer の添字ごとの衝突ファイル数 (評価の入力に使う)。
+    fn conflict_counts(&self) -> BTreeMap<usize, usize> {
+        let Some(race) = &self.race else {
+            return BTreeMap::new();
+        };
+        (0..race.racers.len())
+            .map(|i| (i, self.overlap.files_for(i).len()))
+            .filter(|&(_, n)| n > 0)
+            .collect()
+    }
+
+    /// 勝者評価を**明示操作で 1 回だけ**走らせる。
+    ///
+    /// git を叩くのでワーカースレッドへ出し、UI はブロックしない。二重起動しない。
+    /// 失敗しても `EvalOutcome::Failed` に畳むだけで、採用・破棄には一切触らない。
+    pub fn start_eval(&mut self, cfg: &crate::config::RaceEvalConfig, ctx: &egui::Context) {
+        if self.eval_pending.is_some() {
+            return;
+        }
+        let Some(race) = self.race.clone() else {
+            self.eval = Some(EvalOutcome::Failed(tr("レースがありません")));
+            return;
+        };
+        let conflicts = self.conflict_counts();
+        let cfg = cfg.clone();
+        let (tx, rx) = channel();
+        self.eval_pending = Some(rx);
+        self.eval = None;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let cands = collect_candidates(&race, &conflicts, &cfg);
+            let _ = tx.send(evaluate(&race.prompt, &cands));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 飛行中の評価を回収する (UI スレッドは待たない)。
+    fn poll_eval(&mut self) {
+        let Some(rx) = &self.eval_pending else { return };
+        match rx.try_recv() {
+            Ok(outcome) => {
+                self.eval_pending = None;
+                self.eval = Some(outcome);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.eval_pending = None;
+                // スレッドが答えずに落ちた場合でも、評価だけが失敗したと分かるように残す。
+                if self.eval.is_none() {
+                    self.eval = Some(EvalOutcome::Failed(tr(
+                        "評価が途中で終了しました — もう一度お試しください",
+                    )));
+                }
+            }
+        }
     }
 
     /// racer のセッション id。
@@ -915,6 +1667,7 @@ pub fn race_section(
 ) -> Vec<RaceAction> {
     let mut acts: Vec<RaceAction> = Vec::new();
     panel.poll();
+    panel.poll_eval();
     panel.maybe_refresh(ui.ctx());
     panel.sync_sessions(sessions);
 
@@ -934,6 +1687,27 @@ pub fn race_section(
                     .clicked()
                 {
                     acts.push(RaceAction::Close);
+                }
+                // 🏆 勝者評価 — **押したときだけ**走る (走行中の自動評価はしない)。
+                // 見出しと [閉じる] を置いた残りが狭ければアイコンだけへ縮退させる
+                // (行がはみ出して見切れるより、説明をホバーへ送るほうが良い)。
+                let busy = panel.eval_running();
+                let compact = ui.available_width() < EVAL_BTN_FULL_W;
+                let label = match (busy, compact) {
+                    (true, false) => tr("🏆 評価中…"),
+                    (true, true) => tr("🏆…"),
+                    (false, false) => tr("🏆 勝者を評価"),
+                    (false, true) => tr("🏆"),
+                };
+                if ui
+                    .add_enabled(!busy, egui::Button::new(label))
+                    .on_hover_text(tr(
+                        "各 racer の差分 (ロックファイル・ビルド成果物・バイナリを除く) を比べて\
+                         勝者と理由を出します。出るのは提案だけ — 採用は [採用] を押したときです",
+                    ))
+                    .clicked()
+                {
+                    acts.push(RaceAction::Evaluate);
                 }
             } else {
                 let label = if panel.form_open {
@@ -1098,6 +1872,75 @@ fn race_rows_ui(
                 .size(11.0),
         );
     }
+    // 🏆 勝者評価の結果。**明示操作の後にしか埋まらない**ので、未評価なら 1 行も描かない
+    // (空のセクションで高さを取らない)。ここに出るのは提案で、採用は下の [採用] のまま。
+    let winner_idx: Option<usize> = if panel.eval_running() {
+        ui.label(
+            RichText::new(tr("🏆 評価中… (各 racer の差分を集めています)"))
+                .color(theme.text_dim)
+                .size(11.0),
+        );
+        None
+    } else {
+        match panel.eval_result() {
+            Some(EvalOutcome::Decided {
+                winner,
+                name,
+                reason,
+                note,
+            }) => {
+                let mut full = reason.clone();
+                if !note.is_empty() {
+                    full.push('\n');
+                    full.push_str(note);
+                }
+                full.push('\n');
+                full.push_str(&tr(
+                    "※ これは提案です。採用 (マージ) は [採用] を押したときにだけ行われます",
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(trf("🏆 勝者 (提案): {name}", &[("name", name.clone())]))
+                            .color(theme.ok)
+                            .strong()
+                            .size(11.5),
+                    );
+                    ui.label(
+                        RichText::new(crate::notify::truncate_chars(reason, 72))
+                            .color(theme.text_dim)
+                            .size(11.0),
+                    )
+                    .on_hover_text(full);
+                });
+                Some(*winner)
+            }
+            Some(EvalOutcome::Skipped(why)) => {
+                ui.label(
+                    RichText::new(trf(
+                        "🏆 評価をスキップしました — {why}",
+                        &[("why", crate::notify::truncate_chars(why, 72))],
+                    ))
+                    .color(theme.text_dim)
+                    .size(11.0),
+                )
+                .on_hover_text(why.clone());
+                None
+            }
+            Some(EvalOutcome::Failed(e)) => {
+                ui.label(
+                    RichText::new(trf(
+                        "🏆 評価に失敗しました — {e} (採用・破棄はこれまでどおり使えます)",
+                        &[("e", crate::notify::truncate_chars(e, 60))],
+                    ))
+                    .color(theme.warn)
+                    .size(11.0),
+                )
+                .on_hover_text(e.clone());
+                None
+            }
+            None => None,
+        }
+    };
     for (i, r) in race.racers.iter().enumerate() {
         let peers = overlap.for_racer(i);
         let conflict_files = overlap.files_for(i);
@@ -1111,6 +1954,13 @@ fn race_rows_ui(
             );
             let (badge, color) = status_badge(&r.status, theme);
             ui.label(RichText::new(badge).color(color).size(11.0));
+            // 🏆 勝者バッジ — 評価が済んでいるときだけ 1 体に付く。
+            if winner_idx == Some(i) {
+                ui.label(RichText::new(tr("🏆 勝者")).color(theme.ok).strong().size(11.0))
+                    .on_hover_text(tr(
+                        "評価の提案です。採用 (マージ) は [採用] を押したときにだけ行われます",
+                    ));
+            }
             let stat_text = match &r.stat {
                 Some(st) => {
                     let mut t = trf(
@@ -2248,6 +3098,623 @@ mod tests {
             panel.overlap()
         );
         assert!(panel.race.as_ref().unwrap().racers[1].touched.is_none());
+        let snapshot = panel.race.as_ref().unwrap().clone();
+        cleanup(&snapshot);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 🏆 勝者評価
+    // ═══════════════════════════════════════════════════════════════
+
+    use crate::config::RaceEvalConfig;
+
+    /// 純粋ロジックのテスト用に候補を 1 本でっち上げる。
+    fn cand(idx: usize, name: &str, paths: &[&str], ins: usize, del: usize) -> Candidate {
+        Candidate {
+            idx,
+            name: name.to_string(),
+            branch: format!("race/x-{}", idx + 1),
+            diff: if paths.is_empty() {
+                String::new()
+            } else {
+                format!("diff --git a/{p} b/{p}\n+x\n", p = paths[0])
+            },
+            files: paths.len(),
+            insertions: ins,
+            deletions: del,
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            excluded: Vec::new(),
+            truncated: false,
+            uncommitted: false,
+            conflicts: 0,
+        }
+    }
+
+    /// 1 ファイルぶんの unified diff を組む (git の出力そのままの形)。
+    fn diff_file(path: &str, body: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\nindex 111..222 100644\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n{body}\n"
+        )
+    }
+
+    // ── 差分の切り分け ────────────────────────────────────────────
+
+    #[test]
+    fn 差分をファイル単位に切り分ける() {
+        let text = format!(
+            "{}{}",
+            diff_file("src/a.rs", "+fn a() {}"),
+            diff_file("docs/b.md", "+# b")
+        );
+        let chunks = split_diff_files(&text);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].path, "src/a.rs");
+        assert_eq!(chunks[1].path, "docs/b.md");
+        assert!(chunks.iter().all(|c| !c.binary));
+        // 本文にはヘッダ行も残る (そのまま判定役へ渡せる形)
+        assert!(chunks[0].body.starts_with("diff --git a/src/a.rs"));
+    }
+
+    #[test]
+    fn 空白を含むパスもハンク内の記号も取り違えない() {
+        // `+++ b/<path>` は行末までがパスなので空白を含んでも壊れない。
+        // ハンクに入った後の `+++ わな` は本文なのでパスに使わない。
+        let text = "diff --git a/my dir/a b.txt b/my dir/a b.txt\n\
+                    --- a/my dir/a b.txt\n\
+                    +++ b/my dir/a b.txt\n\
+                    @@ -1 +1 @@\n\
+                    +++ わな\n";
+        let chunks = split_diff_files(text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].path, "my dir/a b.txt");
+    }
+
+    #[test]
+    fn バイナリのチャンクを見分ける() {
+        let text = "diff --git a/logo.png b/logo.png\n\
+                    index 111..222 100644\n\
+                    Binary files a/logo.png and b/logo.png differ\n";
+        let chunks = split_diff_files(text);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].binary, "Binary files 行でバイナリと分かる");
+    }
+
+    // ── 除外は設定から来る ────────────────────────────────────────
+
+    #[test]
+    fn 除外パターンは設定から来る() {
+        // 既定はロックファイル・ビルド成果物を落とす
+        let f = DiffFilter::new(&RaceEvalConfig::default());
+        assert!(f.path_excluded("Cargo.lock"));
+        assert!(f.path_excluded("target/debug/zai"));
+        assert!(!f.path_excluded("src/race.rs"));
+
+        // 設定を空にすれば**何も落ちない** (= 判定はコードでなく設定が握っている)
+        let empty = RaceEvalConfig {
+            exclude: Vec::new(),
+            ..RaceEvalConfig::default()
+        };
+        let f = DiffFilter::new(&empty);
+        assert!(!f.path_excluded("Cargo.lock"));
+        assert!(!f.path_excluded("target/debug/zai"));
+
+        // 設定に書いたものだけが落ちる
+        let custom = RaceEvalConfig {
+            exclude: vec!["secret/".to_string(), "*.golden".to_string()],
+            ..RaceEvalConfig::default()
+        };
+        let f = DiffFilter::new(&custom);
+        assert!(f.path_excluded("secret/keys.txt"));
+        assert!(f.path_excluded("tests/out.golden"));
+        assert!(!f.path_excluded("Cargo.lock"), "設定に無いものは落とさない");
+    }
+
+    #[test]
+    fn ロックファイルとビルド成果物は評価に載せない() {
+        let text = format!(
+            "{}{}{}{}",
+            diff_file("Cargo.lock", "+checksum = \"x\""),
+            diff_file("node_modules/left-pad/index.js", "+module.exports"),
+            diff_file("target/debug/build.rs", "+generated"),
+            diff_file("src/race.rs", "+fn win() {}")
+        );
+        let f = DiffFilter::new(&RaceEvalConfig::default());
+        let out = filter_diff(&text, &f);
+        assert_eq!(out.paths, vec!["src/race.rs".to_string()]);
+        assert_eq!(out.excluded.len(), 3, "落とした 3 件は黙って消さず数える");
+        assert!(!out.text.contains("Cargo.lock"));
+        assert!(!out.text.contains("node_modules"));
+        assert!(out.text.contains("src/race.rs"));
+    }
+
+    #[test]
+    fn バイナリと巨大な生成物は評価に載せない() {
+        let big = "+".to_string() + &"a".repeat(9000);
+        let text = format!(
+            "diff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n{}{}",
+            diff_file("bundle.js", &big),
+            diff_file("src/a.rs", "+fn a() {}")
+        );
+        let cfg = RaceEvalConfig {
+            max_line_bytes: 4096,
+            ..RaceEvalConfig::default()
+        };
+        let out = filter_diff(&text, &DiffFilter::new(&cfg));
+        assert_eq!(out.paths, vec!["src/a.rs".to_string()]);
+        assert!(out.excluded.contains(&"logo.png".to_string()));
+        assert!(out.excluded.contains(&"bundle.js".to_string()));
+    }
+
+    // ── 切り詰め ─────────────────────────────────────────────────
+
+    #[test]
+    fn 上限を超えた差分は切り詰めて明示する() {
+        let text = (0..200).map(|i| format!("+line {i}\n")).collect::<String>();
+        let (cut, truncated) = truncate_diff(&text, 200);
+        assert!(truncated);
+        assert!(cut.contains("打ち切り"), "黙って切らない: {cut}");
+        assert!(cut.contains("バイト"), "何バイト捨てたかを出す: {cut}");
+        // 上限に収まるものは触らない
+        let (same, t2) = truncate_diff("short\n", 4096);
+        assert_eq!(same, "short\n");
+        assert!(!t2);
+    }
+
+    #[test]
+    fn 切り詰めはマルチバイトの途中で割らない() {
+        let text = "あいうえお\nかきくけこ\n".to_string();
+        let (cut, truncated) = truncate_diff(&text, 20);
+        assert!(truncated);
+        // String として成立している = char 境界を割っていない
+        assert!(cut.starts_with("あいうえお"));
+    }
+
+    // ── 応答の解析 ───────────────────────────────────────────────
+
+    fn names2() -> Vec<String> {
+        vec!["👾 Claude".to_string(), "⚡ Codex".to_string()]
+    }
+
+    #[test]
+    fn 評価結果のパース_正常() {
+        let raw = r#"{"winner":"⚡ Codex","reason":"テストを伴っている"}"#;
+        let v = parse_verdict(raw, &names2()).expect("読める");
+        assert_eq!(v.winner, "⚡ Codex");
+        assert_eq!(v.reason, "テストを伴っている");
+    }
+
+    #[test]
+    fn 評価結果のパース_コードフェンス付きでも読める() {
+        let raw = "```json\n{\"winner\":\"👾 Claude\",\"reason\":\"最小の差分\"}\n```";
+        let v = parse_verdict(raw, &names2()).expect("フェンスは剥がす");
+        assert_eq!(v.winner, "👾 Claude");
+    }
+
+    #[test]
+    fn 評価結果のパース_壊れた入力() {
+        for raw in ["", "   ", "not json at all", "[1,2,3]", "\"just a string\""] {
+            assert!(
+                parse_verdict(raw, &names2()).is_err(),
+                "JSON として読めないものは必ず Err: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 評価結果のパース_途中で切れた応答() {
+        let raw = r#"{"winner":"⚡ Codex","reason":"テストを伴っ"#;
+        let e = parse_verdict(raw, &names2()).expect_err("途中で切れていたら黙る");
+        assert!(e.contains("JSON"), "e={e}");
+    }
+
+    #[test]
+    fn 評価結果のパース_勝者が候補に無い名前() {
+        let raw = r#"{"winner":"🦊 Gemini","reason":"速かった"}"#;
+        let e = parse_verdict(raw, &names2()).expect_err("候補外は採らない");
+        assert!(e.contains("候補にいません"), "e={e}");
+    }
+
+    #[test]
+    fn 評価結果のパース_理由が空() {
+        for raw in [
+            r#"{"winner":"⚡ Codex","reason":""}"#,
+            r#"{"winner":"⚡ Codex","reason":"   "}"#,
+            r#"{"winner":"⚡ Codex"}"#,
+            r#"{"winner":"⚡ Codex","reason":42}"#,
+        ] {
+            let e = parse_verdict(raw, &names2()).expect_err("根拠の無い順位は採らない");
+            assert!(e.contains("理由"), "raw={raw} e={e}");
+        }
+        // 勝者側が空でも同じく黙る
+        assert!(parse_verdict(r#"{"winner":"","reason":"x"}"#, &names2()).is_err());
+    }
+
+    #[test]
+    fn 評価結果の理由は上限で打ち切られる() {
+        let long = "あ".repeat(MAX_REASON_CHARS + 50);
+        let raw = serde_json::json!({ "winner": "⚡ Codex", "reason": long }).to_string();
+        let v = parse_verdict(&raw, &names2()).expect("読める");
+        assert_eq!(v.reason.chars().count(), MAX_REASON_CHARS);
+    }
+
+    // ── 判定 ─────────────────────────────────────────────────────
+
+    #[test]
+    fn 候補が2本未満なら評価をスキップする() {
+        match evaluate("p", &[]) {
+            EvalOutcome::Skipped(why) => assert!(why.contains("0 本"), "why={why}"),
+            other => panic!("0 本はスキップ: {other:?}"),
+        }
+        match evaluate("p", &[cand(0, "👾 Claude", &["src/a.rs"], 10, 0)]) {
+            EvalOutcome::Skipped(why) => {
+                assert!(why.contains("1 本"), "why={why}");
+                assert!(why.contains("2 本以上"), "必要本数も伝える: {why}");
+            }
+            other => panic!("1 本はスキップ: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 候補が2本なら勝者と理由が出る() {
+        let cands = [
+            cand(0, "👾 Claude", &["src/a.rs"], 400, 200),
+            cand(1, "⚡ Codex", &["src/a.rs", "tests/a_test.rs"], 40, 5),
+        ];
+        match evaluate("dark mode", &cands) {
+            EvalOutcome::Decided {
+                winner,
+                name,
+                reason,
+                ..
+            } => {
+                assert_eq!(winner, 1, "テスト付き + 小さい差分が勝つ");
+                assert_eq!(name, "⚡ Codex");
+                assert!(!reason.trim().is_empty(), "理由は必ず出る");
+                assert!(reason.contains("テスト"), "根拠が読める: {reason}");
+            }
+            other => panic!("2 本なら決まる: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 候補が3本以上でも勝者は1本に決まる() {
+        let cands = [
+            cand(0, "👾 Claude", &["src/a.rs"], 500, 400),
+            cand(1, "⚡ Codex", &["src/a.rs"], 300, 100),
+            cand(2, "✨ Gemini", &["src/a.rs", "tests/t.rs"], 60, 10),
+            cand(3, "🦆 Goose", &["src/a.rs"], 80, 10),
+        ];
+        match evaluate("x", &cands) {
+            EvalOutcome::Decided { winner, name, .. } => {
+                assert_eq!(winner, 2);
+                assert_eq!(name, "✨ Gemini");
+            }
+            other => panic!("決まるはず: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 差分が空の候補は勝者にならない() {
+        let mut empty = cand(0, "👾 Claude", &[], 0, 0);
+        empty.diff.clear();
+        let cands = [empty, cand(1, "⚡ Codex", &["src/a.rs"], 12, 0)];
+        match evaluate("x", &cands) {
+            EvalOutcome::Decided { winner, .. } => assert_eq!(winner, 1),
+            other => panic!("片方に成果があれば決まる: {other:?}"),
+        }
+        // 全部空ならスキップ (比べる材料がない)
+        let mut a = cand(0, "👾 Claude", &[], 0, 0);
+        let mut b = cand(1, "⚡ Codex", &[], 0, 0);
+        a.diff.clear();
+        b.diff.clear();
+        match evaluate("x", &[a, b]) {
+            EvalOutcome::Skipped(why) => assert!(why.contains("差分"), "why={why}"),
+            other => panic!("全部空はスキップ: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 未コミットの候補は勝てない() {
+        // [採用] はコミット済みの成果しかマージできないので、そこを重く見る。
+        let mut dirty = cand(0, "👾 Claude", &["src/a.rs", "tests/t.rs"], 30, 0);
+        dirty.uncommitted = true;
+        let cands = [dirty, cand(1, "⚡ Codex", &["src/a.rs"], 200, 100)];
+        match evaluate("x", &cands) {
+            EvalOutcome::Decided { winner, .. } => assert_eq!(winner, 1),
+            other => panic!("決まるはず: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 評価は決定的で同じ入力から同じ勝者を出す() {
+        let cands = [
+            cand(0, "👾 Claude", &["src/a.rs"], 100, 0),
+            cand(1, "⚡ Codex", &["src/b.rs"], 100, 0),
+        ];
+        let first = evaluate("x", &cands);
+        for _ in 0..5 {
+            assert_eq!(evaluate("x", &cands), first, "同じ入力なら同じ結果");
+        }
+        // 同点は出走順 (添字の小さいほう) が勝つ
+        match first {
+            EvalOutcome::Decided { winner, .. } => assert_eq!(winner, 0),
+            other => panic!("決まるはず: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 依頼は判定役の唯一の入口になっている() {
+        let cands = [
+            cand(0, "👾 Claude", &["src/a.rs"], 10, 0),
+            cand(1, "⚡ Codex", &["src/b.rs"], 20, 0),
+        ];
+        let req = build_eval_request("dark mode", &cands).expect("組める");
+        let parsed: serde_json::Value = serde_json::from_str(&req).expect("JSON");
+        assert_eq!(parsed["prompt"], "dark mode");
+        assert_eq!(parsed["candidates"].as_array().map(Vec::len), Some(2));
+        // 判定役は依頼 JSON だけを受け取る
+        let raw = judge_in_process(&req).expect("判定できる");
+        let names: Vec<String> = cands.iter().map(|c| c.name.clone()).collect();
+        assert!(parse_verdict(&raw, &names).is_ok());
+        // 壊れた依頼では黙って Err (捏造しない)
+        assert!(judge_in_process("{ broken").is_err());
+    }
+
+    #[test]
+    fn 除外と切り詰めの内訳は必ず出す() {
+        let mut a = cand(0, "👾 Claude", &["src/a.rs"], 10, 0);
+        a.excluded = vec!["Cargo.lock".into(), "target/x".into()];
+        a.truncated = true;
+        let b = cand(1, "⚡ Codex", &["src/b.rs"], 10, 0);
+        let note = collection_note(&[a, b]);
+        assert!(note.contains("除外 2 件"), "note={note}");
+        assert!(note.contains("切り詰め"), "note={note}");
+        // 何も落としていなければ空 (空の行を描かせない)
+        let clean = collection_note(&[cand(0, "x", &["a.rs"], 1, 0)]);
+        assert!(clean.is_empty());
+    }
+
+    // ── 補助の純関数 ─────────────────────────────────────────────
+
+    #[test]
+    fn テスト判定は部分一致で拾わない() {
+        assert!(looks_like_test("tests/race.rs"));
+        assert!(looks_like_test("src/__tests__/a.js"));
+        assert!(looks_like_test("src/test_race.py"));
+        assert!(looks_like_test("src/race_test.go"));
+        assert!(looks_like_test("web/app.spec.ts"));
+        // 「test」を含むだけの名前は数えない
+        assert!(!looks_like_test("src/latest.rs"));
+        assert!(!looks_like_test("src/contest.rs"));
+        assert!(!looks_like_test("src/testing_utils_helper.rs"));
+    }
+
+    // ── git 実フィクスチャ ────────────────────────────────────────
+
+    fn three_presets() -> Vec<(String, String)> {
+        vec![
+            ("👾".to_string(), "Claude".to_string()),
+            ("⚡".to_string(), "Codex".to_string()),
+            ("✨".to_string(), "Gemini".to_string()),
+        ]
+    }
+
+    /// racer の worktree にファイルを置いてコミットする。
+    fn racer_commit(r: &Racer, files: &[(&str, &str)], msg: &str) {
+        for (name, body) in files {
+            let path = r.dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            std::fs::write(&path, body).expect("write");
+        }
+        git_ok(&r.dir, &["add", "."]);
+        commit(&r.dir, msg);
+    }
+
+    #[test]
+    fn 候補収集は2体ぶんの差分を集めロックファイルと成果物を落とす() {
+        let Some(repo) = fixture_repo("cand2") else {
+            return;
+        };
+        let race = start_race(&repo, "eval two", &two_presets()).expect("開始");
+        racer_commit(
+            &race.racers[0],
+            &[
+                ("src/win.rs", "fn win() {}\n"),
+                ("Cargo.lock", "# generated\nname = \"x\"\n"),
+                ("target/debug/out", "binary-ish\n"),
+            ],
+            "work 1",
+        );
+        racer_commit(
+            &race.racers[1],
+            &[("src/other.rs", "fn other() {}\n")],
+            "work 2",
+        );
+        let cands = collect_candidates(&race, &BTreeMap::new(), &RaceEvalConfig::default());
+        assert_eq!(cands.len(), 2, "2 体とも候補になる");
+        assert_eq!(cands[0].idx, 0);
+        assert_eq!(cands[0].paths, vec!["src/win.rs".to_string()]);
+        assert!(
+            cands[0].excluded.contains(&"Cargo.lock".to_string()),
+            "excluded={:?}",
+            cands[0].excluded
+        );
+        assert!(cands[0].excluded.iter().any(|p| p.starts_with("target/")));
+        assert!(!cands[0].diff.contains("Cargo.lock"));
+        assert!(cands[0].diff.contains("src/win.rs"));
+        assert!(cands.iter().all(|c| !c.uncommitted));
+        // 2 本そろえば勝者が出る
+        assert!(matches!(
+            evaluate(&race.prompt, &cands),
+            EvalOutcome::Decided { .. }
+        ));
+        cleanup(&race);
+    }
+
+    #[test]
+    fn 候補収集は3体以上でも全員を集める() {
+        let Some(repo) = fixture_repo("cand3") else {
+            return;
+        };
+        let race = start_race(&repo, "eval three", &three_presets()).expect("開始");
+        for (i, r) in race.racers.iter().enumerate() {
+            racer_commit(r, &[("src/a.rs", &format!("fn a{i}() {{}}\n"))], "work");
+        }
+        let cands = collect_candidates(&race, &BTreeMap::new(), &RaceEvalConfig::default());
+        assert_eq!(cands.len(), 3);
+        assert_eq!(
+            cands.iter().map(|c| c.idx).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        match evaluate(&race.prompt, &cands) {
+            EvalOutcome::Decided { winner, reason, .. } => {
+                assert!(winner < 3);
+                assert!(!reason.is_empty());
+            }
+            other => panic!("3 本なら決まる: {other:?}"),
+        }
+        cleanup(&race);
+    }
+
+    #[test]
+    fn 破棄済みは候補にならず1本以下ならスキップされる() {
+        let Some(repo) = fixture_repo("cand1") else {
+            return;
+        };
+        let race = start_race(&repo, "eval one", &two_presets()).expect("開始");
+        racer_commit(&race.racers[0], &[("src/a.rs", "fn a() {}\n")], "work");
+        let mut panel = RacePanel::new();
+        panel.begin(race);
+        panel.discard(1, true).expect("破棄");
+        let race = panel.race.as_ref().expect("レース").clone();
+        let cands = collect_candidates(&race, &BTreeMap::new(), &RaceEvalConfig::default());
+        assert_eq!(cands.len(), 1, "破棄済みは候補にしない");
+        match evaluate(&race.prompt, &cands) {
+            EvalOutcome::Skipped(why) => assert!(why.contains("1 本"), "why={why}"),
+            other => panic!("1 本はスキップ: {other:?}"),
+        }
+        cleanup(&race);
+    }
+
+    #[test]
+    fn 差分が空のracerも候補には載る() {
+        let Some(repo) = fixture_repo("candempty") else {
+            return;
+        };
+        let race = start_race(&repo, "eval empty", &two_presets()).expect("開始");
+        racer_commit(&race.racers[0], &[("src/a.rs", "fn a() {}\n")], "work");
+        // racer 1 は何もしていない
+        let cands = collect_candidates(&race, &BTreeMap::new(), &RaceEvalConfig::default());
+        assert_eq!(cands.len(), 2);
+        assert!(!cands[0].is_empty());
+        assert!(cands[1].is_empty(), "何もしていない racer は空の候補");
+        assert_eq!(cands[1].files, 0);
+        match evaluate(&race.prompt, &cands) {
+            EvalOutcome::Decided { winner, .. } => assert_eq!(winner, 0),
+            other => panic!("成果のあるほうが勝つ: {other:?}"),
+        }
+        cleanup(&race);
+    }
+
+    #[test]
+    fn 候補収集は上限で切り詰めて明示する() {
+        let Some(repo) = fixture_repo("candcut") else {
+            return;
+        };
+        let race = start_race(&repo, "eval big", &two_presets()).expect("開始");
+        let big: String = (0..400).map(|i| format!("line {i}\n")).collect();
+        racer_commit(&race.racers[0], &[("src/big.rs", &big)], "big");
+        racer_commit(&race.racers[1], &[("src/small.rs", "fn s() {}\n")], "small");
+        let cfg = RaceEvalConfig {
+            max_diff_bytes: 512,
+            ..RaceEvalConfig::default()
+        };
+        let cands = collect_candidates(&race, &BTreeMap::new(), &cfg);
+        assert!(cands[0].truncated, "上限を超えたら切り詰める");
+        assert!(
+            cands[0].diff.contains("打ち切り"),
+            "切ったことを本文で明示する: {}",
+            cands[0].diff
+        );
+        assert!(!cands[1].truncated, "収まっているほうは触らない");
+        // 内訳にも出る
+        assert!(collection_note(&cands).contains("切り詰め"));
+        cleanup(&race);
+    }
+
+    #[test]
+    fn 未コミットの成果は候補にそう記録される() {
+        let Some(repo) = fixture_repo("canddirty") else {
+            return;
+        };
+        let race = start_race(&repo, "eval dirty", &two_presets()).expect("開始");
+        std::fs::write(race.racers[0].dir.join("a.txt"), "uncommitted\n").expect("write");
+        racer_commit(&race.racers[1], &[("src/b.rs", "fn b() {}\n")], "clean");
+        let cands = collect_candidates(&race, &BTreeMap::new(), &RaceEvalConfig::default());
+        assert!(cands[0].uncommitted, "未コミットを見落とさない");
+        assert!(!cands[1].uncommitted);
+        cleanup(&race);
+    }
+
+    #[test]
+    fn 候補名は同名プリセットでも一意になる() {
+        let Some(repo) = fixture_repo("canddup") else {
+            return;
+        };
+        let dup = vec![
+            ("👾".to_string(), "Claude".to_string()),
+            ("👾".to_string(), "Claude".to_string()),
+        ];
+        let race = start_race(&repo, "eval dup", &dup).expect("開始");
+        let names = candidate_names(&race);
+        assert_eq!(names[0], "👾 Claude");
+        assert_eq!(names[1], "👾 Claude #2");
+        assert_ne!(names[0], names[1], "勝者名で引き戻せる必要がある");
+        cleanup(&race);
+    }
+
+    #[test]
+    fn 評価が失敗しても採用フローは従来どおり動く() {
+        let Some(repo) = fixture_repo("evalfail") else {
+            return;
+        };
+        let race = start_race(&repo, "eval fail", &two_presets()).expect("開始");
+        racer_commit(&race.racers[0], &[("win.txt", "winner\n")], "winner work");
+        let mut panel = RacePanel::new();
+        panel.begin(race);
+        // 評価だけが失敗した状態にする (収集も判定も壊れたのと同じ)
+        panel.eval = Some(EvalOutcome::Failed("判定役が答えませんでした".into()));
+        assert!(matches!(panel.eval_result(), Some(EvalOutcome::Failed(_))));
+        assert!(!panel.eval_running());
+        // 採用は従来どおり通る
+        let msg = panel.adopt(0).expect("評価の失敗は採用を妨げない");
+        assert!(
+            msg.contains("fast-forward") || msg.contains("マージ"),
+            "msg={msg}"
+        );
+        assert_eq!(
+            panel.race.as_ref().unwrap().racers[0].status,
+            RacerStatus::Adopted
+        );
+        // 破棄も従来どおり通る
+        panel.discard(1, true).expect("破棄も従来どおり");
+        let snapshot = panel.race.as_ref().unwrap().clone();
+        cleanup(&snapshot);
+    }
+
+    #[test]
+    fn 評価は自動では走らない() {
+        // 設計原則 3: アイドル時のコストはゼロ。レースを始めただけでは評価しない。
+        let Some(repo) = fixture_repo("evalidle") else {
+            return;
+        };
+        let race = start_race(&repo, "idle", &two_presets()).expect("開始");
+        let mut panel = RacePanel::new();
+        panel.begin(race);
+        assert!(panel.eval_result().is_none(), "始めただけでは評価しない");
+        assert!(!panel.eval_running());
         let snapshot = panel.race.as_ref().unwrap().clone();
         cleanup(&snapshot);
     }
