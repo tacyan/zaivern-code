@@ -61,6 +61,27 @@ zai .
 
 The installer automatically downloads the right app for your operating system. Run the same command again whenever you want to update.
 
+### Update
+
+```bash
+zai update            # Check for a newer release, show the command, then update
+zai update --check    # Only check; nothing is executed
+zai update --yes      # Update without asking for confirmation
+```
+
+The update method follows where the binary lives: `cargo install --force` when it sits in `~/.cargo/bin`, otherwise the one-liner installer above.
+
+### Uninstall
+
+```bash
+zai uninstall --dry-run       # List everything that would be removed, with sizes (removes nothing)
+zai uninstall                 # Show the list, then ask for `y` before removing
+zai uninstall --keep-config   # Keep your settings (config.toml / state.toml)
+zai uninstall --yes           # Remove without asking for confirmation
+```
+
+Only the **executable itself and `~/.zaivern`** (settings, session records, terminal logs) are removed. The OS app registration is unregistered at the same time. Any other `zai` still on your `PATH` is listed rather than deleted, so nothing outside those two locations is ever touched.
+
 ### After the first launch
 
 1. Follow the two-minute guided tour

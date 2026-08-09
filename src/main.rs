@@ -29,6 +29,7 @@ mod git_panel;
 mod github;
 mod grammar;
 mod highlight;
+mod history;
 mod html;
 mod i18n;
 mod ide;
