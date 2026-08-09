@@ -1902,6 +1902,9 @@ pub struct SpecPanel {
     pub new_id: String,
     pub new_cap: String,
     pub new_gear: Gear,
+    /// **疑いのある要件だけに絞る。** 能力が数十本あると、⚠ の 3 件が
+    /// 埋もれて見つからない。バッジと同じ数だけを画面に残す絞り込み。
+    pub only_stale: bool,
     /// 1 度でも走査したか (空状態と「まだ読んでいない」を区別する)
     pub scanned: bool,
     pending: Option<Receiver<Scan>>,
@@ -1926,6 +1929,32 @@ impl SpecPanel {
     /// 次の [`poll`](Self::poll) で必ず取り直す。
     pub fn invalidate(&mut self) {
         self.last = None;
+    }
+
+    /// **疑いのある要件だけを見る。** 絞り込みを立て、最初に疑いのある能力へ
+    /// 選択を移す。疑いが 1 件も無いときは**何も変えない**
+    /// (押しても空の画面になるだけ、という操作を作らない)。
+    /// 走査前で判定がまだ無いときも、絞り込みだけ立てて次の走査を待つ。
+    pub fn focus_stale(&mut self) {
+        if self.scanned && self.stale_count() == 0 {
+            return;
+        }
+        self.only_stale = true;
+        if let Some(c) = self.first_stale_capability() {
+            self.selected = Some(Sel::Capability(c));
+        }
+    }
+
+    /// 疑いのある要件を持つ最初の能力。
+    fn first_stale_capability(&self) -> Option<String> {
+        self.caps
+            .iter()
+            .find(|c| {
+                c.requirements
+                    .iter()
+                    .any(|r| self.status_of(&c.name, &r.name).is_suspect())
+            })
+            .map(|c| c.name.clone())
     }
 
     fn status_of(&self, cap: &str, req: &str) -> Staleness {
@@ -2097,6 +2126,21 @@ fn header(ui: &mut egui::Ui, theme: &Theme, panel: &mut SpecPanel, action: &mut 
                         .collect(),
                 });
             }
+            // 疑いが 1 件も無いときはボタン自体を出さない
+            // (押しても何も起きない操作を画面へ置かない)
+            if stale > 0
+                && ui
+                    .selectable_label(panel.only_stale, tr("⚠ 疑いだけ"))
+                    .on_hover_text(tr("陳腐化の疑い / リンク切れのある要件だけに絞ります"))
+                    .clicked()
+            {
+                if panel.only_stale {
+                    panel.only_stale = false;
+                } else {
+                    // 絞り込みの入口は 1 本だけ (パレットからもここを通る)
+                    panel.focus_stale();
+                }
+            }
             if ui
                 .button(tr("＋ 変更"))
                 .on_hover_text(tr("新しい変更 (delta) の骨組みを作ります"))
@@ -2220,8 +2264,9 @@ fn empty_state(ui: &mut egui::Ui, theme: &Theme, panel: &mut SpecPanel, action: 
 }
 
 fn list_ui(ui: &mut egui::Ui, theme: &Theme, panel: &mut SpecPanel) {
-    // 中身が無いセクションは**見出しごと出さない** (空白を作らない)
-    if !panel.changes.is_empty() {
+    // 中身が無いセクションは**見出しごと出さない** (空白を作らない)。
+    // 「⚠ 疑いだけ」の間は、疑いを持たない進行中の変更も畳む。
+    if !panel.changes.is_empty() && !panel.only_stale {
         ui.label(
             RichText::new(tr("進行中の変更"))
                 .size(11.0)
@@ -2273,6 +2318,9 @@ fn list_ui(ui: &mut egui::Ui, theme: &Theme, panel: &mut SpecPanel) {
             })
             .collect();
         for (name, n, stale) in rows {
+            if panel.only_stale && stale == 0 {
+                continue;
+            }
             let on = panel.selected == Some(Sel::Capability(name.clone()));
             let label = if stale > 0 {
                 format!("⚠ {name}  {stale}/{n}")
@@ -2355,6 +2403,9 @@ fn capability_detail(
     });
     for r in &cap.requirements {
         let st = panel.status_of(&cap.name, &r.name);
+        if panel.only_stale && !st.is_suspect() {
+            continue;
+        }
         ui.push_id(&r.name, |ui| {
             egui::Frame::none()
                 .fill(theme.bg)
@@ -3233,6 +3284,37 @@ mod tests {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn 疑いだけに絞る操作は空振りしない() {
+        let mut panel = SpecPanel {
+            caps: tiny_caps(),
+            scanned: true,
+            ..SpecPanel::default()
+        };
+        // 疑いが 1 件も無いなら**何も変えない** (空の画面を作らない)
+        panel.focus_stale();
+        assert!(!panel.only_stale);
+        assert_eq!(panel.selected, None);
+
+        // 疑いがあれば、その能力へ選択を移して絞り込む
+        panel.status.insert(
+            "auth/B".into(),
+            Staleness::Suspect {
+                files: vec!["src/b.rs".into()],
+                lines: 1,
+            },
+        );
+        assert_eq!(panel.stale_count(), 1);
+        assert_eq!(panel.badge(), Some(1));
+        panel.focus_stale();
+        assert!(panel.only_stale);
+        assert_eq!(panel.selected, Some(Sel::Capability("auth".into())));
+
+        // 疑いが 0 件ならバッジは出さない (常に 0 のバッジを作らない)
+        panel.status.clear();
+        assert_eq!(panel.badge(), None);
     }
 
     // ── 描画スレッドで git を待たない (番人) ──────────────────────
