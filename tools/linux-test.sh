@@ -73,11 +73,25 @@ else
     cmd="cargo test --bin zai ${filter}"
 fi
 
+# **cargo のレジストリも毎回消えていた。** target だけ残しても、crates.io の
+# インデックスと展開済みソースが `--rm` で捨てられるので、2 回目以降も依存の
+# 取得からやり直しになる。ここは**全ワークツリーで共有してよい** (読み取りが
+# 主で、cargo がファイルロックを持つ) ので 1 つにまとめる。
+registry_vol=${ZAIVERN_LINUX_REGISTRY:-zaivern-lx-cargo-registry}
+
 echo "== Linux ($image) で実行: $cmd"
-echo "   target: $target_mount (ワークツリーごとに分離。2 回目以降は warm)"
+echo "   target:   $target_mount (ワークツリーごとに分離。2 回目以降は warm)"
+echo "   registry: $registry_vol (全ワークツリーで共有)"
+# `CARGO_PROFILE_TEST_DEBUG=0` — Docker VM の RAM は実測 7.65GiB しか無く、
+# 並列エージェントのコンテナが同時に居ると `zai` のテストバイナリを
+# `debuginfo=2` でリンクする瞬間に **OOM kill (signal: 9)** される。
+# 素の "could not compile" としてしか出ないのでコードの失敗と誤読しやすい。
+# Linux 側の目的は**挙動の確認**でデバッガを当てることではないので落とす。
 exec docker run --rm \
     -v "$root":/w -w /w \
     -v "$target_mount":/target \
+    -v "$registry_vol":/usr/local/cargo/registry \
     -e CARGO_TARGET_DIR=/target \
+    -e CARGO_PROFILE_TEST_DEBUG=0 \
     "$image" \
     sh -c "$cmd"
