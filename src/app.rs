@@ -39,6 +39,7 @@ use crate::ide;
 use crate::kanban;
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::license;
+use crate::local_history;
 use crate::lsp;
 use crate::markdown;
 use crate::mcp;
@@ -3358,6 +3359,9 @@ pub struct ZaivernApp {
     /// チェックポイント (エージェントへ指示を送る直前の作業ツリーの写し)。
     /// git は全て裏のスレッドで走る。
     checkpoints: checkpoint::Checkpoints,
+    /// 🕰 ローカルヒストリ (VCS に依らない取り消し履歴)。走査も書き出しも
+    /// 裏のスレッドで、UI はここから `std::fs` を 1 度も呼ばない。
+    local_history: local_history::LocalHistory,
     /// 次の配達で取るチェックポイントの `(エージェント, 指示要約)`。
     /// `queue_submit` は `egui::Context` を持たないので、ここへ predoc して
     /// `submit_tick` (ctx を持つ) が実際の取得を仕込む。一斉送信で N 体ぶん
@@ -3874,6 +3878,10 @@ impl ZaivernApp {
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
             ),
             checkpoint_pending: None,
+            local_history: local_history::LocalHistory::new(
+                roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
+                &cfg,
+            ),
             tab_drag: None,
             git_panel: git_panel::GitPanel::new(
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
@@ -4280,6 +4288,10 @@ impl ZaivernApp {
         self.checkpoints.set_repo(self.primary_root().to_path_buf());
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
+        // ローカルヒストリも新しいワークスペースへ (別プロジェクトの履歴へ
+        // 復元を撃てないよう、裏のスレッドごと捨てて張り直す)。
+        let lh_root = self.primary_root().to_path_buf();
+        self.local_history.set_workspace(lh_root, &self.cfg);
         self.tree.show_hidden = self.cfg.show_hidden_files;
         self.tree.apply_config(&self.cfg);
         self.rebuild_index();
@@ -8044,6 +8056,10 @@ impl ZaivernApp {
         // (この関数は配達を進める唯一の経路なので、取り漏らしが起きない)。
         if let Some((agent, note)) = self.checkpoint_pending.take() {
             self.checkpoints.capture_before_submit(&agent, &note, ctx);
+            // ローカルヒストリにもターン境界の 1 枚を残す。git 側と違い
+            // `.gitignore` の外や未追跡も含めてファイルシステムから撮るので、
+            // エージェントの shell が書いた変更もここに入る。
+            self.local_history.snapshot(&agent);
         }
         let now = Instant::now();
         let mut next: Option<Duration> = None;
@@ -8239,6 +8255,9 @@ impl ZaivernApp {
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 self.tree.invalidate();
+                // 「保存」という**コマンド名**でローカルヒストリへ刻む。
+                // 取り込みは遅延して裏で走る (連続保存で歩き回らない)。
+                self.local_history.note(&tr("保存"));
                 // 保存した本文の退避はもう要らない (ゴミを残さない)
                 self.hotexit_flush();
                 if promoted {
@@ -10983,6 +11002,16 @@ impl ZaivernApp {
             // ここは要求を出すだけ。結果は `checkpoint_ui` が受ける。
             Cmd::CheckpointList => self.checkpoints.open_list(ctx),
             Cmd::CheckpointNow => self.checkpoints.capture_now(ctx),
+            // 🕰 ローカルヒストリ。走査も復元も裏のスレッドなので、ここは
+            // 要求を出すだけ。結果は `local_history_ui` が受ける。
+            Cmd::LocalHistoryOpen => {
+                let p = self
+                    .editor
+                    .active
+                    .and_then(|i| self.editor.buffers[i].path.clone());
+                self.local_history.open_for(p.as_deref(), ctx);
+            }
+            Cmd::LocalHistoryLabel => self.local_history.open_label(ctx),
             // `]f` / `[f`: **ファイル間**のジャンプ (並列レビューの単位)。
             // 依頼を ctx に置くだけ。消化するのはレビュー画面自身なので、
             // 画面が出ていなければ 1 フレームで腐って何も起きない。
@@ -19133,6 +19162,43 @@ impl ZaivernApp {
         }
     }
 
+    /// 🕰 ローカルヒストリの一覧を描き、裏のスレッドの結果を捌く。
+    ///
+    /// **アイドル時のコストはゼロ** — 一覧を閉じていれば描画は即 return し、
+    /// 依頼が 1 つも無ければ受信口すら作られていないので `poll` も即 return する。
+    fn local_history_ui(&mut self, ctx: &egui::Context) {
+        self.local_history.ui(ctx);
+        // 復元は「戻した」と「一覧が変わった」を続けて返すので、溜まっている
+        // ぶんはこのフレームで全部捌く (次の再描画まで持ち越さない)。
+        while let Some(done) = self.local_history.poll() {
+            match done {
+                local_history::Done::Diff {
+                    title,
+                    path,
+                    old,
+                    new,
+                } => {
+                    // **差分ビューアは 2 つ書かない。** 既存の比較ウィンドウへ渡す。
+                    let f = crate::diff::diff_texts(
+                        &trf("{p} ({t})", &[("p", path.clone()), ("t", title)]),
+                        &trf("{p} (今)", &[("p", path)]),
+                        &old,
+                        &new,
+                    );
+                    self.show_compare(tr("🕰 ローカルヒストリ"), f);
+                }
+                local_history::Done::Restored { .. } => {
+                    // 作業ツリーが変わった。git の色付けと開いているタブを
+                    // 取り直す (依頼を出すだけ。ここでは待たない)。
+                    self.gitinfo.request_refresh();
+                    self.ext_check_at = None;
+                }
+                local_history::Done::Failed(e) => self.toast(e, false),
+                local_history::Done::Scanned { .. } | local_history::Done::Loaded(_) => {}
+            }
+        }
+    }
+
     /// リポジトリを明示して開く版。Git パネルの履歴一覧とパレットの
     /// 履歴コマンドの両方から使う (アクティブなバッファに依らずリポジトリが決まる)。
     fn open_commit_diff_at(&mut self, top: &Path, sha: &str) {
@@ -23687,6 +23753,18 @@ impl ZaivernApp {
                 tr("チェックポイント: 今すぐ取る"),
                 String::new(),
                 Cmd::CheckpointNow,
+            ),
+            (
+                "🕰".into(),
+                tr("ローカルヒストリ: 履歴を開く"),
+                String::new(),
+                Cmd::LocalHistoryOpen,
+            ),
+            (
+                "🕰".into(),
+                tr("ローカルヒストリ: ラベルを付ける"),
+                String::new(),
+                Cmd::LocalHistoryLabel,
             ),
             (
                 "🎛".into(),
@@ -29306,6 +29384,7 @@ impl ZaivernApp {
         self.stop_all_confirm_ui(ctx);
         self.worktree_confirm_ui(ctx);
         self.checkpoint_ui(ctx);
+        self.local_history_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
         self.toasts_ui(ctx);

@@ -20,6 +20,12 @@ pub const DEFAULT_HOT_EXIT_MAX_KB: usize = 4096;
 /// Hot Exit の退避を書き出す既定の最短間隔 (ミリ秒)。
 /// 打鍵のたびに書くと大きなファイルで I/O が飽和するので必ず間引く。
 pub const DEFAULT_HOT_EXIT_INTERVAL_MS: u64 = 1500;
+/// ローカルヒストリの既定の保持日数。IntelliJ の lvcs と同じ 5 日。
+/// **壁時計ではなく活動時間**で数えるので、離席した日数は消費しない。
+pub const DEFAULT_LOCAL_HISTORY_DAYS: u32 = 5;
+/// 「活動していない」と見なす空白の既定のしきい値 (時間)。
+/// IntelliJ の `INTERVAL_BETWEEN_ACTIVITIES` (12 時間) に合わせてある。
+pub const DEFAULT_LOCAL_HISTORY_GAP_HOURS: u32 = 12;
 
 /// コスト上限の既定の警告割合 (8 割)。
 ///
@@ -140,6 +146,19 @@ pub struct Config {
     /// Hot Exit の退避を書き出す最短間隔 (ミリ秒)。
     /// 打鍵のたびに書かないためのスロットリング。0 にすると変更のたびに書く。
     pub hot_exit_interval_ms: u64,
+
+    /// ローカルヒストリ (VCS に依らない取り消し履歴) を記録するか。
+    /// **既定はオン** — 「コミットしていない変更を壊した」は git では戻せない。
+    pub local_history: bool,
+
+    /// ローカルヒストリの保持日数。**壁時計ではなく「活動時間」**で数えるので、
+    /// 1 週間マシンを離れても予算を食わない
+    /// ([`crate::local_history::purge_from`])。
+    pub local_history_days: u32,
+
+    /// これを超える空白は「活動していない」と見なして 1ms と数える (時間)。
+    /// IntelliJ の既定 (12 時間) に合わせてある。
+    pub local_history_gap_hours: u32,
 
     /// エディタ上部のブレッドクラム (`ワークスペース › フォルダ › ファイル › シンボル`)。
     /// **既定はオン** — 高さ 1 行ぶんで、どの言語でも (LSP 無しでも) 必ず出せる。
@@ -792,6 +811,9 @@ impl Default for Config {
             hot_exit: true,
             hot_exit_max_kb: DEFAULT_HOT_EXIT_MAX_KB,
             hot_exit_interval_ms: DEFAULT_HOT_EXIT_INTERVAL_MS,
+            local_history: true,
+            local_history_days: DEFAULT_LOCAL_HISTORY_DAYS,
+            local_history_gap_hours: DEFAULT_LOCAL_HISTORY_GAP_HOURS,
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
             git_blame: false,
@@ -1233,6 +1255,23 @@ show_hidden_files = true
 # hot_exit = true
 # hot_exit_max_kb = 4096
 # hot_exit_interval_ms = 1500
+
+# ── ローカルヒストリ (VCS に依らない取り消し履歴) ──
+# コミットしていない変更を「20 分前の姿」まで戻せます。エディタの編集だけでなく
+# エージェントの shell が書いた変更 (rm -rf を含む) も、ファイルシステム側で
+# 見ているので拾えます。取り込みは保存・エージェントのターン境界・履歴を開いた
+# 時だけで、何もしていない間は 1 バイトも読み書きしません。
+# 置き場は ~/.zaivern/local_history/<ワークスペース>/ で、内容は 1 個だけ持つ
+# アドレス指定の倉庫に入るので、同じ内容が何世代あっても容量は増えません。
+# コマンドパレットの「ローカルヒストリ: 履歴を開く」から見られます。
+#   local_history           = 記録するか。既定はオン。
+#   local_history_days      = 保持する日数。**壁時計ではなく活動時間**で数えるので、
+#                             1 週間マシンを離れても予算を食いません。
+#   local_history_gap_hours = これを超える空白は「活動していない」と見なして
+#                             1ms と数えます。
+# local_history = true
+# local_history_days = 5
+# local_history_gap_hours = 12
 
 # ミニマップ (エディタ右端の遠景) とブレッドクラム (上部のパンくず)
 # (表示メニュー・コマンドパレットの「ミニマップの表示切替」「ブレッドクラムの表示切替」でも変更できます)
@@ -2584,6 +2623,24 @@ pub fn setting_defs() -> &'static [SettingDef] {
             },
         },
         SettingDef {
+            key: "local_history",
+            group: G_RESTORE,
+            label: "ローカルヒストリを記録する",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "local_history_days",
+            group: G_RESTORE,
+            label: "ローカルヒストリの保持日数 (活動時間)",
+            kind: Int { min: 1, max: 365 },
+        },
+        SettingDef {
+            key: "local_history_gap_hours",
+            group: G_RESTORE,
+            label: "活動していないと見なす空白 (時間)",
+            kind: Int { min: 1, max: 720 },
+        },
+        SettingDef {
             key: "restore_agents",
             group: G_RESTORE,
             label: "前回のエージェントを復元する",
@@ -2707,6 +2764,9 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
         "hot_exit" => B(cfg.hot_exit),
         "hot_exit_max_kb" => I(cfg.hot_exit_max_kb as i64),
         "hot_exit_interval_ms" => I(cfg.hot_exit_interval_ms as i64),
+        "local_history" => B(cfg.local_history),
+        "local_history_days" => I(cfg.local_history_days as i64),
+        "local_history_gap_hours" => I(cfg.local_history_gap_hours as i64),
         "restore_agents" => B(cfg.restore_agents),
         "auto_name_sessions" => B(cfg.auto_name_sessions),
         "approval_mode" => T(cfg.approval_mode.clone()),
@@ -2868,6 +2928,9 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
         "hot_exit" => b!(cfg.hot_exit),
         "hot_exit_max_kb" => i!(cfg.hot_exit_max_kb, usize),
         "hot_exit_interval_ms" => i!(cfg.hot_exit_interval_ms, u64),
+        "local_history" => b!(cfg.local_history),
+        "local_history_days" => i!(cfg.local_history_days, u32),
+        "local_history_gap_hours" => i!(cfg.local_history_gap_hours, u32),
         "restore_agents" => b!(cfg.restore_agents),
         "auto_name_sessions" => b!(cfg.auto_name_sessions),
         "approval_mode" => {
