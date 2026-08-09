@@ -3319,6 +3319,16 @@ pub struct ZaivernApp {
     /// ステータスバーのトークン/コスト表示をエージェント別まで開くか。
     /// **既定はコンパクト (合算 1 個)**。消費ゼロならどちらでも 1px も出さない。
     token_detail: bool,
+    /// コスト上限の判定結果 (最も深刻な 1 件)。**上限が未設定なら常に None**
+    /// で、そのときステータスバーには 1px も出ない。
+    cost_alert: Option<coordinator::quota::BudgetStatus>,
+    /// 上の判定をやり直した材料 (取り込み回数, 上限の設定)。
+    /// **これが変わったときだけ**推定コストを計算し直す (設計原則 3)。
+    cost_stamp: Option<(u64, coordinator::quota::CostLimits)>,
+    /// 最後に数えた推定コスト (このセッションぶん, 今日 (UTC) ぶん)。
+    cost_spent: (f64, f64),
+    /// コスト上限の通知を「段が変わった瞬間 1 度だけ」にする門番。
+    cost_gate: notify::EdgeGate,
     /// レート制限時のアカウント自動フェイルオーバー。**既定は無効**。
     /// 段 (検知→候補選定→切替→再開→検証) と履歴をここが持つ。
     failover: failover::Failover,
@@ -4049,6 +4059,10 @@ impl ZaivernApp {
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             token_detail: false,
+            cost_alert: None,
+            cost_stamp: None,
+            cost_spent: (0.0, 0.0),
+            cost_gate: notify::EdgeGate::default(),
             failover: failover::Failover::new(cfg.failover.clone()),
             save_trim_trailing: cfg.trim_trailing_whitespace,
             save_trim_final_newlines: cfg.trim_final_newlines,
@@ -6831,6 +6845,96 @@ impl ZaivernApp {
         }
         self.quota.set_running(by_bin);
         self.quota.refresh_if_stale();
+        self.cost_limit_tick();
+    }
+
+    /// コスト上限の判定を進める。
+    ///
+    /// **集計か上限の設定が変わったときだけ**計算し直す。推定コストは
+    /// エージェント × モデルぶんの掛け算なので、毎フレーム回すと
+    /// 「アイドル時のコストはゼロ」(設計原則 3) が崩れる。
+    /// 集計は [`coordinator::quota::TOKEN_TTL`] 間隔でしか更新されないので、
+    /// 実際に走るのは 2 分に 1 回と、設定を触った直後だけ。
+    fn cost_limit_tick(&mut self) {
+        let limits = self.cfg.cost_limits();
+        let stamp = (self.quota.applied(), limits);
+        if self.cost_stamp == Some(stamp) {
+            return;
+        }
+        self.cost_stamp = Some(stamp);
+        if !limits.any() {
+            // 上限が未設定 = 見張らない。表示も通知も残さない。
+            self.cost_alert = None;
+            self.cost_spent = (0.0, 0.0);
+            self.cost_gate.retain(&[]);
+            return;
+        }
+        let prices = &self.cfg.pricing;
+        let session = self.quota.cost_session(prices);
+        let today = self.quota.cost_today(prices);
+        self.cost_spent = (session, today);
+        self.cost_alert = limits.worst(session, today);
+        // 段が変わった瞬間だけ 1 度鳴らす (毎フレーム鳴らさない)。
+        let key = coordinator::quota::budget_edge_key(self.cost_alert.as_ref());
+        if !self.cost_gate.changed(Self::COST_GATE_ID, &key) || key.is_empty() {
+            return;
+        }
+        let Some(st) = self.cost_alert.clone() else {
+            return;
+        };
+        let body = self.cost_alert_message(&st);
+        let title = match st.state {
+            coordinator::quota::BudgetState::Over => tr("💸 コスト上限に達しました"),
+            _ => tr("💰 コスト上限に近づいています"),
+        };
+        // 画面 (トースト) と OS 通知の両方。レイアウトは動かさない。
+        match st.state {
+            coordinator::quota::BudgetState::Over => self.toast(body.clone(), false),
+            _ => self.toast_warn(body.clone()),
+        }
+        notify::notify(&title, &body);
+        if !self.cfg.webhook_url.trim().is_empty() {
+            notify::webhook(&self.cfg.webhook_url, &title, &body);
+        }
+    }
+
+    /// コスト上限の通知は 1 つしか無いので、門番の鍵も 1 つ固定で使う
+    /// ([`notify::EdgeGate`] はセッション ID で引く作りなので、
+    ///  セッションの ID 空間と衝突しない番号を使う)。
+    const COST_GATE_ID: u64 = u64::MAX;
+
+    /// 上限の状態を 1 行の日本語にする (通貨記号は設定から)。
+    fn cost_alert_message(&self, st: &coordinator::quota::BudgetStatus) -> String {
+        let amount = st.short_label(&self.cfg.pricing.currency);
+        let scope = st.kind.label();
+        match st.state {
+            coordinator::quota::BudgetState::Over => trf(
+                "{scope}の推定コストが上限に達しました ({amount})",
+                &[("scope", scope), ("amount", amount)],
+            ),
+            _ => trf(
+                "{scope}の推定コストが上限の {pct}% に達しました ({amount})",
+                &[
+                    ("scope", scope),
+                    ("pct", ((st.fraction() * 100.0).round() as i64).to_string()),
+                    ("amount", amount),
+                ],
+            ),
+        }
+    }
+
+    /// コスト上限で新規の送信を止めるべきなら、その理由を返す。
+    ///
+    /// **`stop` を選んでいて、かつ上限に達しているときだけ。** 既定の
+    /// `notify` では常に `None` = 何も止めない。判定そのものは
+    /// [`coordinator::quota::CostLimits::blocks`] が持つ (規則を二重に書かない)。
+    fn cost_block_reason(&self) -> Option<String> {
+        let (session, today) = self.cost_spent;
+        let blocked = self.cfg.cost_limits().blocks(session, today)?;
+        Some(trf(
+            "⛔ {reason} — 設定の「上限に達したときの動作」を notify に戻すか、上限を上げると送れます",
+            &[("reason", self.cost_alert_message(&blocked))],
+        ))
     }
 
     /// このセッションが「レート制限だ」と言える根拠のうち、いちばん上の段。
@@ -7766,7 +7870,10 @@ impl ZaivernApp {
             );
             return;
         };
-        self.queue_submit(submit::Job::user(id, text));
+        if !self.queue_submit(submit::Job::user(id, text)) {
+            // 積めなかった理由 (コスト上限など) は queue_submit が説明済み
+            return;
+        }
         self.agents.panel_open = true;
         self.toast(tr("アクティブなエージェントに送信しました"), true);
     }
@@ -7785,15 +7892,26 @@ impl ZaivernApp {
     // ══════════════════════════════════════════════════════════════════
 
     /// 指示 1 通を配達待ちへ積む。空文字と宛先不明は黙って捨てる。
-    fn queue_submit(&mut self, mut job: submit::Job) {
+    ///
+    /// **コスト上限で止まっているときはここで弾く。** 送信経路が 1 本なので、
+    /// 見張りもここ 1 か所で済む。**黙って捨てない** — なぜ送れないかを
+    /// トーストで説明する。
+    /// 戻りは「配達待ちへ積めたか」。呼び出し側は積めなかったときに
+    /// 「送信しました」と嘘をつかないこと。
+    fn queue_submit(&mut self, mut job: submit::Job) -> bool {
         if job.text.trim().is_empty() {
-            return;
+            return false;
+        }
+        if let Some(why) = self.cost_block_reason() {
+            self.toast(why, false);
+            return false;
         }
         let Some(s) = self.agents.sessions.iter().find(|s| s.id == job.session) else {
-            return;
+            return false;
         };
         job.title = s.title.clone();
         self.outbox.push(submit::Pending::new(job, Instant::now()));
+        true
     }
 
     /// 起動中の全セッションへ同じ指示を積む (Cockpit の一斉送信)。宛先数を返す。
@@ -7803,12 +7921,18 @@ impl ZaivernApp {
     /// 状態が取れないセッション (起動直後で supervisor がまだ何も見ていない) は
     /// **対象にしない** — 「分からないもの」を止まっている扱いにすると、
     /// 立ち上がったばかりのエージェントへ横から指示が刺さる。
-    fn queue_submit_stalled(&mut self, text: &str) -> usize {
+    /// **`None` = コスト上限で止まっている** (理由はトーストで説明済み)。
+    /// 宛先ごとに 1 回ずつ理由を出すとうるさいので、ここで一度だけ弾く。
+    fn queue_submit_stalled(&mut self, text: &str) -> Option<usize> {
+        if let Some(why) = self.cost_block_reason() {
+            self.toast(why, false);
+            return None;
+        }
         let ids: Vec<u64> = self.stalled_session_ids();
         for id in &ids {
             self.queue_submit(submit::Job::user(*id, text));
         }
-        ids.len()
+        Some(ids.len())
     }
 
     /// 止まっているセッションの ID (起動順)。チップの件数表示と送信で共有する。
@@ -7826,7 +7950,12 @@ impl ZaivernApp {
             .collect()
     }
 
-    fn queue_submit_all(&mut self, text: &str) -> usize {
+    /// **`None` = コスト上限で止まっている** (理由はトーストで説明済み)。
+    fn queue_submit_all(&mut self, text: &str) -> Option<usize> {
+        if let Some(why) = self.cost_block_reason() {
+            self.toast(why, false);
+            return None;
+        }
         let ids: Vec<u64> = self
             .agents
             .sessions
@@ -7837,7 +7966,7 @@ impl ZaivernApp {
         for id in &ids {
             self.queue_submit(submit::Job::user(*id, text));
         }
-        ids.len()
+        Some(ids.len())
     }
 
     /// 配達待ちを 1 フレームぶん進める。
@@ -14480,6 +14609,9 @@ impl ZaivernApp {
         let token_badges = self.token_badges();
         let want_token_detail = self.token_detail;
         let mut toggle_token_detail = false;
+        // コスト上限。**上限を設定していなければ None = 1 ピクセルも出さない**。
+        let cost_badge = self.cost_badge();
+        let mut open_cost_settings = false;
         // Pro の解錠判定は license::is_pro **1 か所だけ**を通す。
         // 未ライセンス時は 1 ピクセルも出さない (常に何かを表示するバッジは作らない)。
         let pro_badge = license::is_pro(&self.license_status).then(|| match &self.license_status {
@@ -14666,6 +14798,24 @@ impl ZaivernApp {
                                 if r.on_hover_text(tip.clone()).clicked() {
                                     toggle_token_detail = true;
                                 }
+                            }
+                        }
+                    }
+
+                    // コスト上限。上限が未設定なら `cost_badge` が None なので
+                    // ここは丸ごと飛ぶ (常に 0 を出すバッジを作らない)。
+                    // 幅の判断はトークンバッジと同じ作法 — この後に右詰めの列
+                    // (テーマ / 行桁 / Pro …) が同じ行へ入るので、残り全部では
+                    // なく左側の取り分だけを予算にする (どの幅でも見切れない)。
+                    if let Some((text, tip, color)) = &cost_badge {
+                        let budget = ui.available_width() * TOKEN_BADGE_MAX_FRACTION;
+                        if budget >= badge_width_px(text) {
+                            let r = ui.add(
+                                egui::Label::new(RichText::new(text).size(11.5).color(*color))
+                                    .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text(tip.clone()).clicked() {
+                                open_cost_settings = true;
                             }
                         }
                     }
@@ -14898,6 +15048,11 @@ impl ZaivernApp {
         if toggle_token_detail {
             self.token_detail = !self.token_detail;
         }
+        if open_cost_settings {
+            // バッジから上限の編集へ 1 クリックで届くようにする
+            // (「なぜ止まっているのか」から「どこを直すのか」へ迷わせない)。
+            self.open_cost_settings();
+        }
         if let Some(le) = convert_eol {
             self.editor_op(ctx, EditOp::NormalizeEol(le));
         }
@@ -15015,6 +15170,55 @@ impl ZaivernApp {
             compact: (compact_text, compact_tip),
             detail,
         })
+    }
+
+    /// ステータスバーのコスト上限バッジ `(本文, ツールチップ, 色)`。
+    ///
+    /// **上限が 1 つも設定されていなければ `None`** — そのとき画面には
+    /// 1 ピクセルも出ない (常に 0 を表示するバッジを作らない)。
+    fn cost_badge(&self) -> Option<(String, String, egui::Color32)> {
+        use coordinator::quota::{BudgetState, LimitAction};
+        let st = self.cost_alert.as_ref()?;
+        let cur = &self.cfg.pricing.currency;
+        let (icon, color) = match st.state {
+            BudgetState::Over => ("⛔", self.theme.err),
+            BudgetState::Warn => ("⚠", self.theme.warn),
+            BudgetState::Normal => ("💰", self.theme.text_dim),
+        };
+        let text = format!("{icon} {}", st.short_label(cur));
+        let limits = self.cfg.cost_limits();
+        let (session, today) = self.cost_spent;
+        let mut tip = vec![
+            trf(
+                "コスト上限 — {scope} ({pct}%)",
+                &[
+                    ("scope", st.kind.label()),
+                    ("pct", ((st.fraction() * 100.0).round() as i64).to_string()),
+                ],
+            ),
+            // 設定してある上限だけを並べる (未設定の行は出さない)。
+            // 「今の消費」は 2 つとも出す — どちらで引っかかったのかが分かる。
+        ];
+        for s in limits.evaluate(session, today) {
+            tip.push(format!("  {} {}", s.kind.label(), s.short_label(cur)));
+        }
+        tip.push(tr(
+            "金額は推定です (単価は設定 [pricing] から。通信はしません)",
+        ));
+        if limits.action == LimitAction::Stop {
+            tip.push(tr("上限に達している間は新規の送信を止めます (設定: stop)"));
+        }
+        tip.push(tr("押すと上限の設定を開きます"));
+        Some((text, tip.join("\n"), color))
+    }
+
+    /// コスト上限の設定を開く (設定ウィンドウを「コスト」で絞った状態)。
+    fn open_cost_settings(&mut self) {
+        self.settings_open = true;
+        self.settings_ui.only_modified = false;
+        // 絞り込み語はキー名の共通接頭辞から作る — 画面のラベル
+        // (翻訳で変わる) をベタ書きしない。
+        self.settings_ui.query = "cost_".into();
     }
 
     fn quota_status(&self) -> (Option<u8>, String) {
@@ -18093,30 +18297,30 @@ impl ZaivernApp {
         mut orch_acts: Vec<orchestration::OrchAction>,
     ) {
         if let Some(text) = acts.broadcast {
-            let n = self.queue_submit_all(&text);
-            if n == 0 {
-                self.toast(tr("実行中のエージェントがありません"), false);
-            } else {
-                self.toast(
+            // None はコスト上限で止めたとき。理由は送信側が説明済みなので
+            // 「宛先がいない」と嘘を重ねない。
+            match self.queue_submit_all(&text) {
+                None => {}
+                Some(0) => self.toast(tr("実行中のエージェントがありません"), false),
+                Some(n) => self.toast(
                     trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
                     true,
-                );
+                ),
             }
         }
         // 止まっているものだけへの一斉送信。作業中は巻き込まないので、
         // 「全員へ送ると進行中の作業まで分断される」を避けられる。
         if let Some(text) = acts.broadcast_stalled {
-            let n = self.queue_submit_stalled(&text);
-            if n == 0 {
-                self.toast(tr("止まっているエージェントはありません"), false);
-            } else {
-                self.toast(
+            match self.queue_submit_stalled(&text) {
+                None => {}
+                Some(0) => self.toast(tr("止まっているエージェントはありません"), false),
+                Some(n) => self.toast(
                     trf(
                         "⏸ 止まっている {n} セッションへ送信しました",
                         &[("n", n.to_string())],
                     ),
                     true,
-                );
+                ),
             }
         }
         // 宛先を指名した送信は**その 1 体だけ**へ届ける (broadcast は通らない)
@@ -18129,8 +18333,9 @@ impl ZaivernApp {
                 .map(|s| (s.running(), s.title.clone()));
             match live {
                 Some((true, title)) => {
-                    self.queue_submit(submit::Job::user(id, text));
-                    self.toast(trf("✏ 送信: {title}", &[("title", title)]), true);
+                    if self.queue_submit(submit::Job::user(id, text)) {
+                        self.toast(trf("✏ 送信: {title}", &[("title", title)]), true);
+                    }
                 }
                 Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
                 None => self.toast(tr("宛先のセッションが見つかりません"), false),
@@ -18454,24 +18659,23 @@ impl ZaivernApp {
                         .map(|s| (s.id, s.running(), s.title.clone()));
                     match live {
                         Some((id, true, title)) => {
-                            self.queue_submit(submit::Job::user(id, text));
-                            self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true);
+                            if self.queue_submit(submit::Job::user(id, text)) {
+                                self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true);
+                            }
                         }
                         Some((_, false, _)) => self.toast(tr("セッションが終了しています"), false),
                         None => {}
                     }
                 }
-                kanban::KanbanAction::Broadcast(text) => {
-                    let n = self.queue_submit_all(&text);
-                    if n == 0 {
-                        self.toast(tr("実行中のエージェントがありません"), false);
-                    } else {
-                        self.toast(
-                            trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
-                            true,
-                        );
-                    }
-                }
+                kanban::KanbanAction::Broadcast(text) => match self.queue_submit_all(&text) {
+                    // None はコスト上限で止めたとき (理由は送信側が説明済み)
+                    None => {}
+                    Some(0) => self.toast(tr("実行中のエージェントがありません"), false),
+                    Some(n) => self.toast(
+                        trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
+                        true,
+                    ),
+                },
                 kanban::KanbanAction::OpenCockpit => {
                     self.cockpit = true;
                     self.kanban = false;
@@ -29279,6 +29483,87 @@ mod work_phase_tests {
         assert!(!g.note(1, work_phase(true, None)));
         // 最初の観測がいきなり待機でも鳴らない
         assert!(!g.note(1, work_phase(true, Some(S::Idle))));
+    }
+}
+
+/// コスト上限の配線 (ソース構造の回帰テスト)。
+///
+/// 判定そのものは `coordinator::quota` の純粋関数がテーブルテストで押さえて
+/// いる。ここは **app.rs がその門を通っていること**だけを固定する
+/// (egui の描画は headless で目視できないので、配線が消えたことを検出する)。
+#[cfg(test)]
+mod cost_limit_wiring_tests {
+    fn src() -> String {
+        include_str!("app.rs").replace("\r\n", "\n")
+    }
+
+    /// 関数 1 本ぶんの本文を、次の同じインデントの `fn ` まで切り出す。
+    fn body_of(sig: &str) -> String {
+        let after = src()
+            .split(sig)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{sig} が無い"))
+            .to_string();
+        match after.find("\n    fn ") {
+            Some(i) => after[..i].to_string(),
+            None => after.chars().take(4000).collect(),
+        }
+    }
+
+    /// 送信経路は 1 本なので、見張りもそこ 1 か所で足りる。
+    #[test]
+    fn 送信経路はコスト上限の門を通る() {
+        for sig in [
+            "fn queue_submit(&mut self, mut job: submit::Job) -> bool {",
+            "fn queue_submit_all(&mut self, text: &str) -> Option<usize> {",
+            "fn queue_submit_stalled(&mut self, text: &str) -> Option<usize> {",
+        ] {
+            let body = body_of(sig);
+            assert!(
+                body.contains("self.cost_block_reason()"),
+                "{sig} がコスト上限の門を通っていない"
+            );
+        }
+    }
+
+    /// **黙って無視しない** — 止めたときは必ず理由を画面へ出す。
+    #[test]
+    fn 止めた理由を必ず画面に出す() {
+        let body = body_of("fn queue_submit(&mut self, mut job: submit::Job) -> bool {");
+        assert!(
+            body.contains("if let Some(why) = self.cost_block_reason() {")
+                && body.contains("self.toast(why, false);"),
+            "止めた理由をトーストで出していない"
+        );
+    }
+
+    /// 上限を設定していないときは 1 ピクセルも出さない。
+    #[test]
+    fn 上限が未設定ならバッジを作らない() {
+        let body = body_of("fn cost_badge(&self) -> Option<(String, String, egui::Color32)> {");
+        assert!(
+            body.contains("let st = self.cost_alert.as_ref()?;"),
+            "判定が無いときに None を返す門が消えた (常に 0 を出すバッジになる)"
+        );
+        let tick = body_of("fn cost_limit_tick(&mut self) {");
+        assert!(
+            tick.contains("if !limits.any() {") && tick.contains("self.cost_alert = None;"),
+            "上限が未設定でも判定結果を残している"
+        );
+    }
+
+    /// アイドル時のコストはゼロ — 集計か設定が変わったときだけ計算し直す。
+    #[test]
+    fn 上限の判定は集計か設定が変わったときだけ走る() {
+        let tick = body_of("fn cost_limit_tick(&mut self) {");
+        assert!(
+            tick.contains("if self.cost_stamp == Some(stamp) {") && tick.contains("return;"),
+            "毎フレーム推定コストを計算し直している"
+        );
+        assert!(
+            tick.contains("self.cost_gate.changed(Self::COST_GATE_ID, &key)"),
+            "通知が門番 (EdgeGate) を通っていない = 毎回鳴る"
+        );
     }
 }
 

@@ -486,6 +486,18 @@
 "{account}: {used} / {proj}" = "{account}: {used} / {proj}"
 "　{agents} / {n} 本並列 / {proj}" = "　{agents} / {n} running / {proj}"
 
+# ── コスト上限とアラート ──
+"このセッション" = "This session"
+"今日 (UTC)" = "Today (UTC)"
+"💸 コスト上限に達しました" = "💸 Cost limit reached"
+"💰 コスト上限に近づいています" = "💰 Approaching your cost limit"
+"{scope}の推定コストが上限に達しました ({amount})" = "Estimated cost for {scope} hit the limit ({amount})"
+"{scope}の推定コストが上限の {pct}% に達しました ({amount})" = "Estimated cost for {scope} reached {pct}% of the limit ({amount})"
+"⛔ {reason} — 設定の「上限に達したときの動作」を notify に戻すか、上限を上げると送れます" = "⛔ {reason} — set the limit action back to notify, or raise the limit, to send again"
+"コスト上限 — {scope} ({pct}%)" = "Cost limit — {scope} ({pct}%)"
+"上限に達している間は新規の送信を止めます (設定: stop)" = "New messages are blocked while over the limit (action: stop)"
+"押すと上限の設定を開きます" = "Click to open the cost limit settings"
+
 # ── 文字コードと改行コード / 保存時のクリーンアップ ──
 "この文字コード・改行コードのまま保存します\n　(表せない文字を足したときだけ UTF-8 で保存します)" = "Saved with this encoding and line ending\n　(switches to UTF-8 only if you add characters it cannot represent)"
 "改行コードを変換" = "Convert line endings"
