@@ -10,6 +10,7 @@ use eframe::egui::{self, Align2, Color32, FontId, RichText};
 use crate::agent_picker::{self, AgentPicker};
 use crate::agents::{self, AgentManager, SessionEvent};
 use crate::breadcrumb;
+use crate::checkpoint;
 use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
@@ -1653,6 +1654,8 @@ struct CockpitActions {
     remove: Option<usize>,
     cycle: Option<usize>,
     cycle_all: bool,
+    /// チェックポイント一覧を開く (Cockpit ヘッダから)。
+    checkpoints: bool,
     broadcast: Option<String>,
     /// **止まっているエージェントだけ**へ送る本文。
     /// 作業中のものは巻き込まない (判定は `SessionState::is_stuck`)。
@@ -3342,6 +3345,14 @@ pub struct ZaivernApp {
     /// blame からクリックで開いたコミット差分タブのパース結果
     /// (バッファ id → ファイル差分)。毎フレーム parse_unified を回さないため。
     commit_diff_cache: HashMap<u64, Vec<crate::diff::FileDiff>>,
+    /// チェックポイント (エージェントへ指示を送る直前の作業ツリーの写し)。
+    /// git は全て裏のスレッドで走る。
+    checkpoints: checkpoint::Checkpoints,
+    /// 次の配達で取るチェックポイントの `(エージェント, 指示要約)`。
+    /// `queue_submit` は `egui::Context` を持たないので、ここへ predoc して
+    /// `submit_tick` (ctx を持つ) が実際の取得を仕込む。一斉送信で N 体ぶん
+    /// 積まれても**先頭の 1 件だけ**が残る = スナップショットは 1 回。
+    checkpoint_pending: Option<(String, String)>,
     /// ドラッグ中のエディタタブの添字 (ドラッグ並べ替え)。押していない間は None。
     tab_drag: Option<usize>,
     /// ⌃Tab を**押している間**だけ生きる MRU 切替。離すと確定して None に戻る。
@@ -3846,6 +3857,10 @@ impl ZaivernApp {
             gitinfo: git::GitSet::new(roots.clone()),
             blame: git::Blame::default(),
             commit_diff_cache: HashMap::new(),
+            checkpoints: checkpoint::Checkpoints::new(
+                roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
+            ),
+            checkpoint_pending: None,
             tab_drag: None,
             git_panel: git_panel::GitPanel::new(
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
@@ -4242,6 +4257,9 @@ impl ZaivernApp {
         // ブランチピッカーも新しいリポジトリへ。旧 repo の一覧が残っていると、
         // そこに無いブランチへの切り替えを発行できてしまう。
         self.branch_nav.set_repo(self.primary_root().to_path_buf());
+        // チェックポイントも新しいリポジトリへ。旧 repo の sha を握ったままだと
+        // 別リポジトリへ復元を撃ててしまう。
+        self.checkpoints.set_repo(self.primary_root().to_path_buf());
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
         self.tree.show_hidden = self.cfg.show_hidden_files;
@@ -7793,6 +7811,13 @@ impl ZaivernApp {
             return;
         };
         job.title = s.title.clone();
+        // 送る**直前**の作業ツリーを 1 枚残す。承認キューは「通す前」しか
+        // 守れないので、通した後に暴走した変更を戻せる唯一の足場がこれ。
+        // 実際の取得は ctx を持つ `submit_tick` が仕込む。
+        if self.checkpoint_pending.is_none() {
+            self.checkpoint_pending =
+                Some((job.title.clone(), checkpoint::one_line(&job.text, 160)));
+        }
         self.outbox.push(submit::Pending::new(job, Instant::now()));
     }
 
@@ -7848,6 +7873,12 @@ impl ZaivernApp {
     fn submit_tick(&mut self, ctx: &egui::Context) {
         if self.outbox.is_empty() {
             return;
+        }
+        // 配達の**直前**に作業ツリーを 1 枚残す。`queue_submit` は
+        // `egui::Context` を持たないので、予約の消化はここで行う
+        // (この関数は配達を進める唯一の経路なので、取り漏らしが起きない)。
+        if let Some((agent, note)) = self.checkpoint_pending.take() {
+            self.checkpoints.capture_before_submit(&agent, &note, ctx);
         }
         let now = Instant::now();
         let mut next: Option<Duration> = None;
@@ -10783,6 +10814,10 @@ impl ZaivernApp {
             }
             Cmd::DiffNextChange => crate::diff::request_jump(ctx, 1),
             Cmd::DiffPrevChange => crate::diff::request_jump(ctx, -1),
+            // ⏱ チェックポイント (巻き戻し)。git は全て裏のスレッドで走るので、
+            // ここは要求を出すだけ。結果は `checkpoint_ui` が受ける。
+            Cmd::CheckpointList => self.checkpoints.open_list(ctx),
+            Cmd::CheckpointNow => self.checkpoints.capture_now(ctx),
             // `]f` / `[f`: **ファイル間**のジャンプ (並列レビューの単位)。
             // 依頼を ctx に置くだけ。消化するのはレビュー画面自身なので、
             // 画面が出ていなければ 1 フレームで腐って何も起きない。
@@ -17101,6 +17136,24 @@ impl ZaivernApp {
                 {
                     acts.cycle_all = true;
                 }
+                // 巻き戻し。承認キューを通した**後**に暴走した変更を戻す唯一の
+                // 足場なので、Cockpit から 1 打で開けるようにする。件数は
+                // 一覧を開くまで数えないため、0 のときは数字を出さない。
+                let cp_n = self.checkpoints.count();
+                let cp_label = match (compact, cp_n) {
+                    (true, _) => "⏱".to_string(),
+                    (false, 0) => tr("⏱ 巻き戻し"),
+                    (false, n) => trf("⏱ 巻き戻し ({n})", &[("n", n.to_string())]),
+                };
+                if ui
+                    .button(RichText::new(cp_label).color(theme.text_dim))
+                    .on_hover_text(tr(
+                        "指示を送る直前の作業ツリーを記録しています。選んだ時点へ戻せます (後から作られたファイルは消しません)",
+                    ))
+                    .clicked()
+                {
+                    acts.checkpoints = true;
+                }
                 ui.menu_button(if compact { "＋" } else { "＋ Agent" }, |ui| {
                     for (i, p) in self.cfg.agents.iter().enumerate() {
                         if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
@@ -18148,6 +18201,9 @@ impl ZaivernApp {
         if acts.cycle_all {
             self.apply_cmd(Cmd::CyclePermissionAll, ctx);
         }
+        if acts.checkpoints {
+            self.apply_cmd(Cmd::CheckpointList, ctx);
+        }
         if let Some(i) = acts.cycle {
             match self.agents.cycle_permission(i) {
                 Some(hint) => self.toast_warn(trf(
@@ -18753,6 +18809,68 @@ impl ZaivernApp {
             return;
         };
         self.open_commit_diff_at(&top, sha);
+    }
+
+    /// チェックポイント一覧を描き、裏のスレッドから返ってきた結果を捌く。
+    ///
+    /// **アイドル時のコストはゼロ** — 一覧を閉じていれば `ui` は即 return し、
+    /// 走行中の仕事が無ければ `poll` も即 return する (再描画も要求しない)。
+    fn checkpoint_ui(&mut self, ctx: &egui::Context) {
+        self.checkpoints.ui(ctx);
+        let Some(done) = self.checkpoints.poll() else {
+            return;
+        };
+        match done {
+            // 指示のたびの自動取得は黙って済ませる (通知が溢れると読まれない)。
+            checkpoint::Done::Captured { cp, announce } => {
+                if announce {
+                    self.toast(
+                        trf(
+                            "⏱ チェックポイントを取りました ({sha})",
+                            &[("sha", cp.sha.chars().take(8).collect::<String>())],
+                        ),
+                        true,
+                    );
+                }
+            }
+            checkpoint::Done::Skipped { announce } => {
+                if announce {
+                    self.toast(tr("前回から変更がないので取りませんでした"), true);
+                }
+            }
+            checkpoint::Done::Listed(_) => {}
+            checkpoint::Done::Restored { restored, kept } => {
+                self.toast(
+                    trf(
+                        "⏱ {n} 件を書き戻しました (スナップショットに無かった {k} 件はそのまま)",
+                        &[("n", restored.to_string()), ("k", kept.to_string())],
+                    ),
+                    true,
+                );
+                // 作業ツリーが変わったので、git の色付けと開いているファイルを
+                // 取り直す (裏のスキャンへ依頼するだけ。ここでは待たない)。
+                self.gitinfo.request_refresh();
+                // 開いているタブは既存の外部変更ウォッチャ
+                // (`check_external_changes` → `Editor::check_external`) が
+                // 読み直す。スロットルを開けて次のティックで必ず拾わせる。
+                self.ext_check_at = None;
+            }
+            checkpoint::Done::Diff(label, text) => {
+                if text.trim().is_empty() {
+                    self.toast(tr("このチェックポイントと今との差分はありません"), true);
+                    return;
+                }
+                let title = trf("⏱ チェックポイント {sha}", &[("sha", label)]);
+                let id = self.editor.open_virtual(
+                    title,
+                    text,
+                    crate::editor::BufferKind::CheckpointDiff,
+                );
+                // 同じタブを使い回すので古いパース結果は捨てる。
+                self.commit_diff_cache.remove(&id);
+            }
+            checkpoint::Done::Failed(e) => self.toast(e, false),
+        }
     }
 
     /// リポジトリを明示して開く版。Git パネルの履歴一覧とパレットの
@@ -19662,7 +19780,10 @@ impl ZaivernApp {
                 return;
             }
             // コミット差分タブ (blame のガターから開く) も読み取り専用の専用ビュー
-            if self.editor.buffers[i].kind == crate::editor::BufferKind::CommitDiff {
+            if matches!(
+                self.editor.buffers[i].kind,
+                crate::editor::BufferKind::CommitDiff | crate::editor::BufferKind::CheckpointDiff
+            ) {
                 let b = &self.editor.buffers[i];
                 let (id, title, text) = (b.id, b.title.clone(), b.text.clone());
                 let cache = &mut self.commit_diff_cache;
@@ -23198,6 +23319,18 @@ impl ZaivernApp {
                 tr("ターミナル表示切替"),
                 fmt_key(BindAction::ToggleTerminal),
                 Cmd::ToggleTerminal,
+            ),
+            (
+                "⏱".into(),
+                tr("チェックポイント: 一覧"),
+                String::new(),
+                Cmd::CheckpointList,
+            ),
+            (
+                "⏱".into(),
+                tr("チェックポイント: 今すぐ取る"),
+                String::new(),
+                Cmd::CheckpointNow,
             ),
             (
                 "🎛".into(),
@@ -28810,6 +28943,7 @@ impl ZaivernApp {
         self.stop_confirm_ui(ctx);
         self.stop_all_confirm_ui(ctx);
         self.worktree_confirm_ui(ctx);
+        self.checkpoint_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
         self.toasts_ui(ctx);

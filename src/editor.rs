@@ -57,6 +57,12 @@ pub enum BufferKind {
     /// 1 コミットの差分ビュー (ガターの git blame をクリックして開く)。
     /// 本文は `git show` の unified diff。
     CommitDiff,
+    /// チェックポイントと「今」の差分ビュー (`checkpoint.rs` の一覧から開く)。
+    /// 本文は tree 同士の unified diff なので、描画は `CommitDiff` と同じ
+    /// `panels::commit_diff_ui` を使い回す。**種別を分けているのは、
+    /// コミット差分タブを開いても巻き戻しの差分が消えないようにするため**
+    /// (`open_virtual` は同じ種別のタブを使い回す)。
+    CheckpointDiff,
     /// 画像ビューア (png/jpg 等)。ピクセルは `Buffer::image` に持つ。
     /// `path` は `Some` (外部変更の mtime 監視で再デコードするため) だが、
     /// `read_only()` が真なので保存・編集の経路には乗らない。
