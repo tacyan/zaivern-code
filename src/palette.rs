@@ -422,6 +422,7 @@ pub enum Cmd {
     OpenMcp,
     /// Skills / slash command 管理パネルを開く
     OpenSkills,
+    /// spec 駆動開発パネル (仕様の差分と陳腐化の見張り) を開く
     /// キャレットを 1 つ上の行に増やす
     AddCursorAbove,
     /// キャレットを 1 つ下の行に増やす
@@ -442,6 +443,14 @@ pub enum Cmd {
     ReopenWithEncoding(Option<String>),
     /// 符号化を選んで保存する (`None` ならピッカーを開く)
     SaveWithEncoding(Option<String>),
+    /// [`crate::feature`] のレジストリに登録された機能を呼ぶ。
+    ///
+    /// **並列開発で衝突しないための唯一の口。** 機能を 1 つ足すたびに
+    /// この `enum` へ variant を増やしていたため、隔離ワークツリーで
+    /// 8 本のブランチを同時に走らせると全員がここを編集して衝突した。
+    /// 以後、新しい機能は variant を増やさず `"<module>.<action>"` の
+    /// 安定 ID を載せてここを通す (詳しい経緯は `feature.rs` の冒頭)。
+    Feature(&'static str),
 }
 
 #[derive(Clone)]
@@ -894,7 +903,11 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ShowAbout
         | Cmd::ShowWhatsNew
         | Cmd::OpenLicense
-        | Cmd::RestartTutorial => Group::Tools,
+        | Cmd::RestartTutorial
+        // レジストリ経由の機能は「ツール」に寄せる。分類を機能ごとに
+        // 分けたくなるが、そうすると `Group` がまた共有の壁になるので
+        // ここは 1 つに固定する (分類は 8 つまで、という既存の約束もある)。
+        | Cmd::Feature(_) => Group::Tools,
     }
 }
 
