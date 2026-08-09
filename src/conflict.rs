@@ -552,20 +552,6 @@ impl Report {
         c
     }
 
-    /// セッション `id` が誰かと衝突しているか (カードの ⚠ 判定)。
-    /// 返すのは警報 (Warn 以上) の件数。
-    pub fn alarms_for(&self, id: u64) -> usize {
-        let Some(i) = self.trees.iter().position(|t| t.id == id) else {
-            return 0;
-        };
-        self.hits
-            .iter()
-            .filter(|h| h.severity >= Severity::Warn && (h.a == i || h.b == i))
-            .map(|h| h.path.as_str())
-            .collect::<BTreeSet<_>>()
-            .len()
-    }
-
     /// カードのツールチップ本文。警報が無ければ `None` (何も描かない)。
     pub fn card_hint(&self, id: u64) -> Option<String> {
         let i = self.trees.iter().position(|t| t.id == id)?;
@@ -961,37 +947,57 @@ pub fn matrix_layout(avail_w: f32, avail_h: f32, n: usize) -> MatrixLayout {
     lay
 }
 
-/// 行列が占める全ての矩形 (見出し + セル)。**テストで重なりを検査する** ために
-/// 描画と同じ式をここへ 1 本化しておく。
-pub fn matrix_rects(lay: &MatrixLayout, origin: egui::Pos2) -> Vec<egui::Rect> {
+/// 行列を構成する 1 要素。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// 列見出し (ツリーの添字)
+    ColHead(usize),
+    /// 行見出し (ツリーの添字)
+    RowHead(usize),
+    /// マス (行, 列)
+    Cell(usize, usize),
+}
+
+/// 行列の全要素と、その矩形。**描画とテストが同じ式を通る** ようにここへ
+/// 1 本化してある (描画側だけ式が変わって「テストは緑なのに見切れる」を防ぐ)。
+pub fn matrix_slots(lay: &MatrixLayout, origin: egui::Pos2) -> Vec<(Slot, egui::Rect)> {
     let mut out = Vec::new();
     if lay.list_only {
         return out;
     }
-    // 列見出し
     for c in 0..lay.shown {
         let x = origin.x + lay.head_w + c as f32 * lay.cell;
-        out.push(egui::Rect::from_min_size(
-            egui::pos2(x, origin.y),
-            egui::vec2(lay.cell, HEADER_H),
+        out.push((
+            Slot::ColHead(c),
+            egui::Rect::from_min_size(egui::pos2(x, origin.y), egui::vec2(lay.cell, HEADER_H)),
         ));
     }
-    // 行
     for r in 0..lay.shown {
         let y = origin.y + HEADER_H + r as f32 * lay.cell;
-        out.push(egui::Rect::from_min_size(
-            egui::pos2(origin.x, y),
-            egui::vec2(lay.head_w, lay.cell),
+        out.push((
+            Slot::RowHead(r),
+            egui::Rect::from_min_size(egui::pos2(origin.x, y), egui::vec2(lay.head_w, lay.cell)),
         ));
         for c in 0..lay.shown {
             let x = origin.x + lay.head_w + c as f32 * lay.cell;
-            out.push(egui::Rect::from_min_size(
-                egui::pos2(x, y),
-                egui::vec2(lay.cell, lay.cell),
+            out.push((
+                Slot::Cell(r, c),
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(lay.cell, lay.cell)),
             ));
         }
     }
     out
+}
+
+/// 行列が占める総寸法 ([`matrix_slots`] と同じ式から導く)。
+pub fn matrix_size(lay: &MatrixLayout) -> egui::Vec2 {
+    if lay.list_only {
+        return egui::Vec2::ZERO;
+    }
+    egui::vec2(
+        lay.head_w + lay.cell * lay.shown as f32,
+        HEADER_H + lay.cell * lay.shown as f32,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,7 +1366,7 @@ fn radar_body(
                 tr("並列で動いているワークツリーが 1 本以下です"),
                 theme.text_dim,
             )
-        } else if n == 0 {
+        } else if rep.is_quiet() {
             (tr("✅ 衝突は見つかっていません"), theme.ok)
         } else {
             (
@@ -1576,59 +1582,48 @@ fn draw_matrix(
     lay: &MatrixLayout,
     selected: &mut Option<(usize, usize)>,
 ) {
-    // 列見出し
-    ui.horizontal(|ui| {
-        ui.allocate_exact_size(egui::vec2(lay.head_w, HEADER_H), egui::Sense::hover());
-        for c in 0..lay.shown {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(lay.cell, HEADER_H), egui::Sense::hover());
-            let name = rep
-                .trees
-                .get(c)
-                .map(|t| t.label.clone())
-                .unwrap_or_default();
-            ui.painter().text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                short_label(&name),
-                egui::FontId::proportional(11.0),
-                theme.text_dim,
-            );
-        }
-    });
-    // 本体
-    for r in 0..lay.shown {
-        ui.horizontal(|ui| {
-            let name = rep
-                .trees
-                .get(r)
-                .map(|t| t.label.clone())
-                .unwrap_or_default();
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(lay.head_w, lay.cell), egui::Sense::hover());
-            ui.painter().text(
-                egui::pos2(rect.left() + space::XS, rect.center().y),
-                Align2::LEFT_CENTER,
-                crate::mcp::ellipsize(&name, ((lay.head_w - space::SM) / 7.0) as usize),
-                egui::FontId::proportional(12.0),
-                theme.text,
-            );
-            for c in 0..lay.shown {
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(lay.cell, lay.cell), egui::Sense::click());
+    // 場所は [`matrix_slots`] が決める。描画側で座標を組み直さないので、
+    // 「テーブルテストは緑なのに実画面では見切れる」が起こり得ない。
+    let (area, _) = ui.allocate_exact_size(matrix_size(lay), egui::Sense::hover());
+    let painter = ui.painter().clone();
+    let name_of = |i: usize| {
+        rep.trees
+            .get(i)
+            .map(|t| t.label.clone())
+            .unwrap_or_default()
+    };
+    for (slot, rect) in matrix_slots(lay, area.min) {
+        match slot {
+            Slot::ColHead(c) => {
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    short_label(&name_of(c)),
+                    egui::FontId::proportional(11.0),
+                    theme.text_dim,
+                );
+            }
+            Slot::RowHead(r) => {
+                painter.text(
+                    egui::pos2(rect.left() + space::XS, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    crate::mcp::ellipsize(&name_of(r), ((lay.head_w - space::SM) / 7.0) as usize),
+                    egui::FontId::proportional(12.0),
+                    theme.text,
+                );
+            }
+            Slot::Cell(r, c) => {
                 if r == c {
-                    ui.painter()
-                        .rect_filled(rect.shrink(1.0), 2.0, theme.panel_alt);
+                    painter.rect_filled(rect.shrink(1.0), 2.0, theme.panel_alt);
                     continue;
                 }
                 let cell = rep.cell(r, c);
                 let (bg, fg) = match cell.worst() {
                     Some(Severity::Certain) => (theme.err.gamma_multiply(0.30), theme.err),
                     Some(Severity::Warn) => (theme.warn.gamma_multiply(0.25), theme.warn),
-                    Some(Severity::Info) => (theme.panel_alt, theme.text_dim),
-                    None => (theme.panel_alt, theme.text_dim),
+                    _ => (theme.panel_alt, theme.text_dim),
                 };
-                ui.painter().rect_filled(rect.shrink(1.0), 2.0, bg);
+                painter.rect_filled(rect.shrink(1.0), 2.0, bg);
                 let n = cell.alarms();
                 let text = if n > 0 {
                     n.to_string()
@@ -1638,7 +1633,7 @@ fn draw_matrix(
                     String::new()
                 };
                 if !text.is_empty() {
-                    ui.painter().text(
+                    painter.text(
                         rect.center(),
                         Align2::CENTER_CENTER,
                         text,
@@ -1646,34 +1641,33 @@ fn draw_matrix(
                         fg,
                     );
                 }
-                if cell.total() > 0 {
-                    let na = rep
-                        .trees
-                        .get(r)
-                        .map(|t| t.label.clone())
-                        .unwrap_or_default();
-                    let nb = rep
-                        .trees
-                        .get(c)
-                        .map(|t| t.label.clone())
-                        .unwrap_or_default();
-                    resp.on_hover_text(trf(
+                if cell.total() == 0 {
+                    continue;
+                }
+                // ID は座標から作る (`make_persistent_id` を通さないので、
+                // 可変長のマスが並んでも衝突しない)。
+                let resp = ui.interact(
+                    rect,
+                    egui::Id::new(("zv-conflict-cell", r, c)),
+                    egui::Sense::click(),
+                );
+                if resp
+                    .on_hover_text(trf(
                         "{a} ⇄ {b}: 衝突確実 {c} / 要注意 {w} / 情報 {i}",
                         &[
-                            ("a", na),
-                            ("b", nb),
+                            ("a", name_of(r)),
+                            ("b", name_of(c)),
                             ("c", cell.certain.to_string()),
                             ("w", cell.warn.to_string()),
                             ("i", cell.info.to_string()),
                         ],
                     ))
                     .clicked()
-                    .then(|| {
-                        *selected = Some(if r < c { (r, c) } else { (c, r) });
-                    });
+                {
+                    *selected = Some(if r < c { (r, c) } else { (c, r) });
                 }
             }
-        });
+        }
     }
 }
 
@@ -2109,7 +2103,10 @@ rename to new.rs
         for (w, h, n) in cases {
             let lay = matrix_layout(w, h, n);
             let origin = egui::pos2(0.0, 0.0);
-            let rects = matrix_rects(&lay, origin);
+            let rects: Vec<egui::Rect> = matrix_slots(&lay, origin)
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect();
             let area = egui::Rect::from_min_size(origin, egui::vec2(w, h));
             for (i, r) in rects.iter().enumerate() {
                 assert!(
@@ -2185,8 +2182,7 @@ rename to new.rs
             &BTreeMap::new(),
             NEAR_LINES,
         );
-        assert_eq!(rep.alarms_for(100), 0, "情報どまりならバッジは出さない");
-        assert_eq!(rep.card_hint(100), None);
+        assert_eq!(rep.card_hint(100), None, "情報どまりならバッジは出さない");
         assert_eq!(rep.card_hint(999), None, "知らない ID");
     }
 
@@ -2281,7 +2277,40 @@ rename to new.rs
                 dir: wb.clone(),
             },
         ];
-        let rep = scan(&specs, false);
+        let rep = scan(&specs, true);
+        // 実際に何が出るかを目で見られるようにする (`-- --nocapture`)。
+        println!("--- 衝突レーダー ({:?}) ---", rep.took);
+        println!(
+            "ベース: {:?}  {}",
+            rep.base,
+            rep.note.clone().unwrap_or_default()
+        );
+        for t in &rep.trees {
+            println!(
+                "  ツリー {} [{}] {} ファイル / dirty={} / {}",
+                t.label,
+                t.branch,
+                t.files.len(),
+                t.dirty,
+                t.disk.map(|(b, c)| human_bytes(b, c)).unwrap_or_default()
+            );
+        }
+        for h in &rep.hits {
+            println!(
+                "  {} {:8} {:12} {} ⇄ {}  行{:?}  — {}",
+                h.severity.glyph(),
+                h.severity.label(),
+                h.path,
+                rep.trees[h.a].label,
+                rep.trees[h.b].label,
+                h.line,
+                h.reason.label()
+            );
+        }
+        for hs in &rep.hotspots {
+            println!("  🔥 {} ← {:?}", hs.path, hs.trees);
+        }
+        println!("  警報ファイル数: {}", rep.alarm_files());
         assert!(rep.base.is_some(), "共通ベースが取れる: {rep:?}");
         let shared = rep
             .hits
@@ -2358,6 +2387,18 @@ rename to new.rs
             },
         ];
         let rep = scan(&specs, false);
+        println!("--- 離れた変更・両側コミット済み ({:?}) ---", rep.took);
+        println!("ベース: {:?}  note={:?}", rep.base, rep.note);
+        for h in &rep.hits {
+            println!(
+                "  {} {:8} {:12} — {}",
+                h.severity.glyph(),
+                h.severity.label(),
+                h.path,
+                h.reason.label()
+            );
+        }
+        println!("  警報ファイル数: {}", rep.alarm_files());
         assert!(rep.trees.iter().all(|t| !t.dirty), "両方コミット済み");
         let h = rep
             .hits
