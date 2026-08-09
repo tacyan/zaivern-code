@@ -51,6 +51,12 @@ pub enum Rung {
     Protocol,
     /// ベンダー提供フックからの通知
     Hook,
+    /// シェル統合 (OSC 633 / 133) — 端末そのものが持つ構造化プロトコル。
+    ///
+    /// ベンダーの協力が要らないぶん**いつでも使える**が、分かるのは
+    /// 「シェルから見たコマンドの境界と終了コード」までで、エージェントが
+    /// 内部で何をしているかは分からない。だからフックの下、画面の上。
+    Shell,
 }
 
 impl Rung {
@@ -59,6 +65,7 @@ impl Rung {
         match self {
             Rung::Protocol => "構造化",
             Rung::Hook => "フック",
+            Rung::Shell => "シェル統合",
         }
     }
 }
@@ -626,6 +633,9 @@ pub struct SessionSnapshot {
     /// PTY の**生ログ**の置き場 (`~/.zaivern/term_logs/…`)。
     /// 構造化出力つきで起動されたセッションでは、ここが JSONL の入り口になる。
     pub raw_log: Option<std::path::PathBuf>,
+    /// シェル統合 (OSC 633 / 133) からの判定。**画面を 1 文字も読んでいない**。
+    /// マーカーが来ていなければ `None` で、そのときの挙動は導入前と同じ。
+    pub shell: Option<ProtoRead>,
 }
 
 impl SessionSnapshot {
@@ -648,6 +658,7 @@ impl SessionSnapshot {
             command: s.command.clone(),
             cwd: s.cwd.clone(),
             raw_log: s.log_path.clone(),
+            shell: s.shell_read(),
         }
     }
 }
@@ -1533,6 +1544,10 @@ pub struct Supervisor {
     hook_router: hooks::HookRouter,
     /// フックの投函箱。テストでは実 `~/.zaivern` を避けて差し替える。
     hook_inbox: std::path::PathBuf,
+    /// 3 段目: シェル統合の直近判定 (セッション ID → 判定)。
+    /// 鮮度は端末側 (`shellint::Tracker::read_now`) で見ているので、
+    /// ここには「いま生きている判定」だけが入る。
+    shells: HashMap<u64, ProtoRead>,
 }
 
 impl Supervisor {
@@ -1551,6 +1566,7 @@ impl Supervisor {
             proto_offsets: HashMap::new(),
             hook_router: hooks::HookRouter::default(),
             hook_inbox: hooks::inbox_dir(),
+            shells: HashMap::new(),
         }
     }
 
@@ -1576,9 +1592,19 @@ impl Supervisor {
                 detail: r.detail,
             });
         }
-        let r: ProtoRead = self.hook_router.read(id, now_ms, HOOK_STALE_MS)?;
+        if let Some(r) = self.hook_router.read(id, now_ms, HOOK_STALE_MS) {
+            return Some(LadderRead {
+                rung: Rung::Hook,
+                state: r.state,
+                detail: r.detail,
+            });
+        }
+        // 3 段目: シェル統合。終了コードは**事実**なので、下の段
+        // (画面テキストの部分一致) が `error` の 3 文字で誤判定するのを
+        // ここで防げる。喋っていなければ黙って下へ降りる。
+        let r = self.shells.get(&id)?.clone();
         Some(LadderRead {
-            rung: Rung::Hook,
+            rung: Rung::Shell,
             state: r.state,
             detail: r.detail,
         })
@@ -1626,6 +1652,19 @@ impl Supervisor {
         }
         let ids: Vec<u64> = alive.iter().copied().collect();
         self.hook_router.retain(&ids);
+        // 3 段目: 端末が持っているシェル統合の判定を写す。鮮度切れ (None) は
+        // 消す — 古い判定を握り続けると、下の段へ降りられなくなる。
+        for snap in snaps {
+            match &snap.shell {
+                Some(r) => {
+                    self.shells.insert(snap.id, r.clone());
+                }
+                None => {
+                    self.shells.remove(&snap.id);
+                }
+            }
+        }
+        self.shells.retain(|id, _| alive.contains(id));
     }
 
     /// 生ログ (`~/.zaivern/term_logs/…`) の**続き**を読んで構造化段へ流す。
@@ -1709,6 +1748,7 @@ impl Supervisor {
         self.protos.remove(&id);
         self.proto_offsets.remove(&id);
         self.hook_router.forget(id);
+        self.shells.remove(&id);
     }
 
     /// UI スレッドから毎フレーム呼ぶ。内部で間引くので毎フレームで安い。

@@ -3832,6 +3832,9 @@ impl ZaivernApp {
             roots
         };
         let cfg = config::load(&roots, true);
+        // シェル統合の注入は設定 1 つで決まる (既定 off)。ここで反映しないと
+        // 「設定に書いたのに次の起動で効かない」になる。
+        crate::shellint::set_enabled(cfg.shell_integration);
         // 画面全体のズームは **テーマ適用より先** に入れる。theme::apply は
         // その時点の pixels_per_point でフォントサイズを物理ピクセルへ丸めるので、
         // 後から倍率を変えると最初のフレームだけ丸めがズレた絵になる。
@@ -4280,6 +4283,7 @@ impl ZaivernApp {
         self.checkpoints.set_repo(self.primary_root().to_path_buf());
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
+        crate::shellint::set_enabled(self.cfg.shell_integration);
         self.tree.show_hidden = self.cfg.show_hidden_files;
         self.tree.apply_config(&self.cfg);
         self.rebuild_index();
@@ -11176,6 +11180,7 @@ impl ZaivernApp {
             | Cmd::ToggleWordWrap
             | Cmd::ToggleShowWhitespace
             | Cmd::ToggleMinimap
+            | Cmd::ToggleShellIntegration
             | Cmd::ToggleBreadcrumbs => self.apply_cmd_settings(cmd, ctx),
             Cmd::ToggleGitBlame => self.apply_cmd_settings(cmd, ctx),
             Cmd::VoiceInput(_)
@@ -12481,6 +12486,23 @@ impl ZaivernApp {
                         tr("🗺 ミニマップ: オン (クリック / ドラッグでスクロールできます)")
                     } else {
                         tr("🗺 ミニマップ: オフ")
+                    },
+                    true,
+                );
+            }
+            Cmd::ToggleShellIntegration => {
+                self.cfg.shell_integration = !self.cfg.shell_integration;
+                let on = self.cfg.shell_integration;
+                // 有効化した時点でシムを書き出す (crate::shellint::set_enabled)。
+                crate::shellint::set_enabled(on);
+                config::save_state(&self.cfg);
+                // **既存の端末には効かない**ことを隠さない。シェルの起動引数を
+                // 変える機能なので、次に開いた端末からしか働かない。
+                self.toast(
+                    if on {
+                        tr("🐚 シェル統合: オン — 次に開くターミナルから、コマンドの境界と終了コードをシェルが直接報告します")
+                    } else {
+                        tr("🐚 シェル統合: オフ — 次に開くターミナルは従来どおり起動します (受信側は動いたまま)")
                     },
                     true,
                 );
@@ -23819,6 +23841,12 @@ impl ZaivernApp {
                 tr("ミニマップの表示切替"),
                 String::new(),
                 Cmd::ToggleMinimap,
+            ),
+            (
+                "🐚".into(),
+                tr("シェル統合 (OSC 633) の切替 — コマンドの終了コードを画面から推測しない"),
+                String::new(),
+                Cmd::ToggleShellIntegration,
             ),
             (
                 "🔗".into(),
