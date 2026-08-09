@@ -139,6 +139,16 @@ impl AgentSpec {
         launch_args_for(self.bin)
     }
 
+    /// この CLI 自身が展開できる「ファイル参照」の書き方 (`{path}` を差し替える)。
+    /// 持たない CLI は "" — `mention.rs` は本文をこちらで同梱する。
+    pub fn file_ref_syntax(&self) -> &'static str {
+        FILE_REF_SYNTAX
+            .iter()
+            .find(|(b, _)| *b == self.bin)
+            .map(|(_, syn)| *syn)
+            .unwrap_or("")
+    }
+
     /// そのまま端末へ打てる起動コマンド。`launch_args` が無ければ `bin` と同じ。
     pub fn launch_command(&self) -> String {
         let args = self.launch_args();
@@ -149,6 +159,23 @@ impl AgentSpec {
         }
     }
 }
+
+/// bin → 「その CLI 自身がファイルを読み込む参照の書き方」。`mention.rs` が使う。
+///
+/// **`AgentSpec` のフィールドにしない理由は [`SESSION_STORES`] と同じ** —
+/// 構造体リテラルが他モジュール (diagnostician.rs のフィクスチャ) にもあり、
+/// フィールドを増やすとそれらが一斉に壊れる。
+///
+/// **載せるのは公式ドキュメントで `@パス` のファイル取り込みが確認できた CLI だけ。**
+/// 未確認は載せない — 既定 (空文字) は `mention.rs` が本文を同梱するので、
+/// どの CLI へ送っても内容が届くことは変わらない。載せる効果は
+/// 「同じ内容を二重に送らない」ぶんのトークン節約だけで、外しても壊れない。
+const FILE_REF_SYNTAX: &[(&str, &str)] = &[
+    // claude: `@path/to/file` で対象ファイルを読み込む (Claude Code の公式ドキュメント)
+    ("claude", "@{path}"),
+    // gemini: `@path/to/file` でファイル/ディレクトリの内容をプロンプトへ差し込む
+    ("gemini", "@{path}"),
+];
 
 /// 「フラグ + 値」の 2 トークンで自動承認になる指定の表。
 ///
@@ -1379,6 +1406,104 @@ fn basename(token: &str) -> &str {
     token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  ACP (Agent Client Protocol) カタログ
+// ══════════════════════════════════════════════════════════════════════
+
+/// **ACP で駆動できるエージェント**。上の [`AGENT_CATALOG`] が「PTY で動かす
+/// CLI」の表であるのに対し、こちらは「構造化プロトコルで話せる相手」の表。
+///
+/// 形はレジストリ (`crate::acp::REGISTRY_URL`, 38 エージェント登録) の
+/// `distribution` に合わせてある。**ネットワーク取得は任意**で、この既定表
+/// だけでオフラインでも動く。
+///
+/// 出どころ (実測の起動コマンド):
+/// ```text
+/// claude-acp     npx @agentclientprotocol/claude-agent-acp@0.66.0
+/// codex-acp      npx @agentclientprotocol/codex-acp@1.1.14
+/// gemini         npx @google/gemini-cli@0.54.4 --acp
+/// github-copilot npx @github/copilot@1.0.78 --acp
+/// qwen-code      npx @qwen-code/qwen-code@0.21.8 --acp --experimental-skills
+/// cline          npx cline@3.0.52 --acp
+/// ```
+///
+/// 注意:
+/// - `@zed-industries/claude-code-acp` は **deprecated**。
+///   `@agentclientprotocol/claude-agent-acp` へ改名済み (codex-acp も同様)。
+/// - Gemini CLI のフラグは `--experimental-acp` ではなく **`--acp`**。
+/// - ローカルに実行ファイルがあればそちらを優先する (`local_bin`)。
+///   npx はパッケージ取得が要るぶん初回が遅い。
+pub const ACP_CATALOG: &[crate::acp::AcpEntry] = &[
+    crate::acp::AcpEntry {
+        id: "claude-acp",
+        label: "Claude Agent (ACP)",
+        icon: "👾",
+        // アダプタは npm 配布のみ (claude 本体は ACP を話さない)。
+        local_bin: "claude-agent-acp",
+        local_args: &[],
+        npx_package: "@agentclientprotocol/claude-agent-acp",
+        npx_version: "0.66.0",
+        npx_args: &[],
+        note: "走行中のターンへ割り込める (_session/steering)",
+    },
+    crate::acp::AcpEntry {
+        id: "codex-acp",
+        label: "Codex (ACP)",
+        icon: "💡",
+        local_bin: "codex-acp",
+        local_args: &[],
+        npx_package: "@agentclientprotocol/codex-acp",
+        npx_version: "1.1.14",
+        npx_args: &[],
+        note: "session/new の結果に非標準の models が付く",
+    },
+    crate::acp::AcpEntry {
+        id: "gemini",
+        label: "Gemini CLI (ACP)",
+        icon: "✨",
+        // 本体が --acp を持つので、入っていれば直接起動する。
+        local_bin: "gemini",
+        local_args: &["--acp"],
+        npx_package: "@google/gemini-cli",
+        npx_version: "0.54.4",
+        npx_args: &["--acp"],
+        note: "sessionCapabilities を広告しない (再開・一覧は非対応)",
+    },
+    crate::acp::AcpEntry {
+        id: "github-copilot",
+        label: "GitHub Copilot (ACP)",
+        icon: "🐙",
+        local_bin: "copilot",
+        local_args: &["--acp"],
+        npx_package: "@github/copilot",
+        npx_version: "1.0.78",
+        npx_args: &["--acp"],
+        note: "",
+    },
+    crate::acp::AcpEntry {
+        id: "qwen-code",
+        label: "Qwen Code (ACP)",
+        icon: "🐦",
+        local_bin: "qwen",
+        local_args: &["--acp"],
+        npx_package: "@qwen-code/qwen-code",
+        npx_version: "0.21.8",
+        npx_args: &["--acp", "--experimental-skills"],
+        note: "",
+    },
+    crate::acp::AcpEntry {
+        id: "cline",
+        label: "Cline (ACP)",
+        icon: "🧵",
+        local_bin: "cline",
+        local_args: &["--acp"],
+        npx_package: "cline",
+        npx_version: "3.0.52",
+        npx_args: &["--acp"],
+        note: "",
+    },
+];
+
 /// コマンド文字列(先頭トークン)からカタログ定義を引く。
 /// `codex exec` / `goose run` のようなサブコマンド形式でも先頭トークンだけで一致する。
 pub fn spec_for_command(command: &str) -> Option<&'static AgentSpec> {
@@ -2225,7 +2350,11 @@ pub static HOOK_TARGETS: &[HookTarget] = &[HookTarget {
         ("SessionEnd", ProtoState::Done, false),
     ],
     tools: CLAUDE_TOOLS,
-    verified: "claude 2.1.226 — stream-json に hook_started/hook_response を観測 + 実在の ~/.claude/settings.json の hooks スキーマ",
+    // PreToolUse の tool_input に載るパスのキー。公式ドキュメント
+    // (code.claude.com/docs/en/hooks) の Edit/Write は `file_path`、
+    // NotebookEdit は `notebook_path`。並びは優先順。
+    write_path_keys: &["file_path", "notebook_path"],
+    verified: "claude 2.1.226 — stream-json に hook_started/hook_response を観測 + 実在の ~/.claude/settings.json の hooks スキーマ + 公式 hooks リファレンスの PreToolUse 入出力スキーマ",
 }];
 
 /// フック設定の対象。持たないエージェントでは `None`。

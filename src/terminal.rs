@@ -312,6 +312,11 @@ pub struct Session {
     user_typed: bool,
     /// DECSCUSR で指定された現在のカーソル形状(読取スレッドが書き、描画が読む)。
     cursor_shape: Arc<AtomicU8>,
+    /// シェル統合 (OSC 633 / 133) の追跡。読取スレッドが書き、UI が読む。
+    ///
+    /// **画面 (vt100) を 1 文字も見ない**判定の出どころ。マーカーが来なければ
+    /// 空のままで、その場合の挙動は導入前と完全に同じ (`Tier::None`)。
+    shell: Arc<Mutex<crate::shellint::Tracker>>,
     /// アプリが CSI ?1004h でフォーカス通知を要求しているか。
     /// (set_focus 経由でのみ読む。app.rs から呼ばれるまでは未使用)
     #[allow(dead_code)]
@@ -1261,6 +1266,9 @@ pub enum TermEvent {
     Clipboard(String),
     /// OSC 10/11 の色問い合わせ (10=前景 / 11=背景)。
     ColorQuery(u8),
+    /// OSC 633 / OSC 133 — シェル統合のマーカー (`crate::shellint`)。
+    /// **これが来る間は、コマンドの境界と終了コードを画面から推測しない**。
+    Shell(crate::shellint::Marker),
 }
 
 /// Primary DA (CSI c) の返事。
@@ -1506,6 +1514,14 @@ fn on_osc(body: &[u8], out: &mut Vec<TermEvent>) {
             let n = if ps == b"10" { 10 } else { 11 };
             out.push(TermEvent::ColorQuery(n));
         }
+        // OSC 633 / 133: シェル統合。プロンプトとコマンドの境界・終了コード・
+        // コマンド行そのものが構造化されて届く (crate::shellint の説明を参照)。
+        // 読むだけで返事はしないので、対応していない発行元にも副作用が無い。
+        b"633" | b"133" => {
+            if let Some(m) = crate::shellint::parse_osc(ps, rest) {
+                out.push(TermEvent::Shell(m));
+            }
+        }
         _ => {}
     }
 }
@@ -1687,6 +1703,7 @@ impl Session {
             PtyWriter { tx, queued }
         };
         let cursor_shape = Arc::new(AtomicU8::new(CursorShape::Block.to_u8()));
+        let shell = Arc::new(Mutex::new(crate::shellint::Tracker::new()));
         let focus_reports = Arc::new(AtomicBool::new(false));
         let clipboard_pending: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         // 既定はダークテーマ寄りの色。app.rs から set_report_colors で上書きできる。
@@ -1712,6 +1729,7 @@ impl Session {
             let ctx = ctx.clone();
             let writer = writer.clone();
             let cursor_shape = cursor_shape.clone();
+            let shell = shell.clone();
             let focus_reports = focus_reports.clone();
             let clipboard_pending = clipboard_pending.clone();
             let report_fg = report_fg.clone();
@@ -1757,6 +1775,10 @@ impl Session {
                                             .load(Ordering::Relaxed);
                                         reply.extend_from_slice(&color_report(ps, rgb));
                                     }
+                                    // シェル統合。ここでの仕事は小さな構造体を
+                                    // 1 つ積むだけ — 読取スレッドを止めない
+                                    // (設計原則 2)。UI が居なくても記録は進む。
+                                    TermEvent::Shell(m) => lock_ok(&shell).feed(m),
                                 }
                             }
                             if !reply.is_empty() {
@@ -1827,6 +1849,7 @@ impl Session {
             copied_at: None,
             user_typed: false,
             cursor_shape,
+            shell,
             focus_reports,
             focus_sent: None,
             clipboard_pending,
@@ -2119,6 +2142,56 @@ impl Session {
     /// アプリ全体が固まる ([`PtyWriter`] の説明を参照)。
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.writer.send(bytes);
+    }
+
+    /// 端末の隅に出すバッジ用: (段, 直近の終了コード)。
+    ///
+    /// 段が `None` (シェル統合が来ていない) なら `None` — 呼び出し側は
+    /// 1 ピクセルも描かない。毎フレーム通る道なので、ロック 1 回・
+    /// アロケーション 0 で済ませる (設計原則 3)。
+    pub fn shell_badge(&self) -> Option<(crate::shellint::Tier, Option<i32>)> {
+        let t = lock_ok(&self.shell);
+        (t.tier() != crate::shellint::Tier::None).then(|| (t.tier(), t.last_exit()))
+    }
+
+    /// メニュー見出し用のまとめ: (段, 記録件数, 段の変化ログ)。
+    ///
+    /// 段の変化を出せるようにしておくのは「黙って劣化しない」ための約束
+    /// (CLAUDE.md 設計原則 4)。ロックは 1 回で済ませる。
+    pub fn shell_status(&self) -> (crate::shellint::Tier, usize, Option<String>) {
+        let t = lock_ok(&self.shell);
+        (t.tier(), t.recorded(), t.tier_log_text())
+    }
+
+    /// **状態ラダーへの供給** — シェルが直接教えてきた判定。
+    ///
+    /// 画面を 1 文字も読んでいないので、`error` の 3 文字が並んでいるだけで
+    /// 「異常」に落ちることが構造的に起こらない。何も来ていなければ `None`
+    /// (呼び出し側は従来どおり下の段へ降りる = 導入前と同じ挙動)。
+    pub fn shell_read(&self) -> Option<crate::supervisor::protocol::ProtoRead> {
+        lock_ok(&self.shell).read_now()
+    }
+
+    /// UI へ渡す直近コマンドの写し (新しい順、最大 `n` 件)。
+    ///
+    /// 参照ではなく値で返すのは、描画中にロックを握り続けないため
+    /// (読取スレッドを待たせない)。
+    pub fn shell_recent(&self, n: usize) -> Vec<crate::shellint::Command> {
+        lock_ok(&self.shell)
+            .recent(n)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// 上限超えで捨てた件数のギャップ標識 (捨てていなければ `None`)。
+    pub fn shell_gap_note(&self) -> Option<String> {
+        lock_ok(&self.shell).gap_note()
+    }
+
+    /// いま実行中のコマンド行 (シェル統合が無い / 実行中でないなら `None`)。
+    pub fn shell_running_command(&self) -> Option<String> {
+        lock_ok(&self.shell).running_command().map(str::to_string)
     }
 
     /// アプリが DECSCUSR で指定した現在のカーソル形状。
@@ -4797,6 +4870,44 @@ mod tests {
         panic!("プロンプト {needle:?} が画面に出なかった");
     }
 
+    /// **配線の証明**: 実 PTY から届いた OSC 633 が [`Session`] のトラッカーへ入る。
+    ///
+    /// 見るのは「シェルが言った終了コード」だけで、画面は 1 文字も読まない。
+    /// 逆に**画面には終了コードがどこにも書かれていない**ことも確かめる —
+    /// これが「画面からは原理的に取れない情報を取っている」という主張の中身。
+    #[cfg(unix)]
+    #[test]
+    fn シェル統合のマーカーが実ptyからトラッカーへ届く() {
+        use std::time::Duration;
+        // 長い sleep は書かない (プロセス残留の温床)。1 度出して終わるだけ。
+        let cmd = r#"printf '\033]633;A\007\033]633;B\007\033]633;E;cargo test;n1\007\033]633;C\007out\r\n\033]633;D;3\007'"#;
+        let s = spawn_prompt_session(983, cmd);
+        let mut got = None;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Some(c) = s.shell_recent(1).into_iter().next() {
+                got = Some(c);
+                break;
+            }
+        }
+        let c = got.expect("D まで届かなかった (読取スレッドの配線が切れている)");
+        assert_eq!(
+            c.command_line, "cargo test",
+            "コマンド行はシェルが直接教える"
+        );
+        assert_eq!(c.exit_code, Some(3));
+        let (tier, n, log) = s.shell_status();
+        assert_eq!(tier, crate::shellint::Tier::Rich);
+        assert_eq!(n, 1);
+        assert!(log.is_some(), "段の変化が記録されていない");
+        let screen = super::lock_ok(&s.parser).screen().contents();
+        assert!(
+            !screen.contains('3') || !screen.contains("code"),
+            "画面に終了コードが書かれているなら前提が崩れる: {screen:?}"
+        );
+        super::reap(s);
+    }
+
     #[cfg(unix)]
     #[test]
     fn scan_throttle_blocks_under_900ms_and_adopts_at_boundary() {
@@ -5376,24 +5487,50 @@ fn expand_windows_env_refs(command: &str, lookup: &dyn Fn(&str) -> Option<String
 }
 
 fn build_command(command: &str, cwd: &Path, env: &HashMap<String, String>) -> CommandBuilder {
+    let has_command = !command.trim().is_empty();
+    // シェル統合 (OSC 633) の注入計画。**オプトインで、コマンド指定が無いとき
+    // だけ**返る。無効なら None なので、以下の分岐は導入前と 1 バイトも変わらない。
+    #[cfg(not(windows))]
+    let shell_program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    // Windows の既定 (cmd.exe) にシェル統合の手段は無い — VS Code も同じ判断。
+    // COMSPEC を pwsh へ向けている人だけがここで拾われる。
+    #[cfg(windows)]
+    let shell_program = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    let plan = crate::shellint::launch_plan(&shell_program, has_command);
+
     #[cfg(not(windows))]
     let mut cmd = {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let mut c = CommandBuilder::new(shell);
-        if command.trim().is_empty() {
-            c.arg("-l");
-        } else {
-            c.arg("-lc");
-            c.arg(command);
+        let mut c = CommandBuilder::new(&shell_program);
+        match &plan {
+            Some(p) => {
+                for a in &p.args {
+                    c.arg(a);
+                }
+            }
+            None if has_command => {
+                c.arg("-lc");
+                c.arg(command);
+            }
+            None => {
+                c.arg("-l");
+            }
         }
         c
     };
     #[cfg(windows)]
     let mut cmd = {
-        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-        let mut c = CommandBuilder::new(shell);
-        for a in windows_shell_args(!command.trim().is_empty()) {
-            c.arg(a);
+        let mut c = CommandBuilder::new(&shell_program);
+        match &plan {
+            Some(p) => {
+                for a in &p.args {
+                    c.arg(a);
+                }
+            }
+            None => {
+                for a in windows_shell_args(has_command) {
+                    c.arg(a);
+                }
+            }
         }
         c
     };
@@ -5407,6 +5544,20 @@ fn build_command(command: &str, cwd: &Path, env: &HashMap<String, String>) -> Co
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("ZAIVERN", "1");
+    // エージェント PTY の印。プロンプトフレームワーク (bash-preexec /
+    // 自作 PROMPT_COMMAND / bash-git-prompt) がエージェント端末を固める問題へ、
+    // 「エージェントのシェルだけ切る」逃げ道を渡す (VS Code の VSCODE_AGENT 相当)。
+    // エージェントが起動する孫シェルまで環境として伝わるのが要点。
+    if has_command {
+        for (k, v) in crate::shellint::agent_env() {
+            cmd.env(k, v);
+        }
+    }
+    if let Some(p) = &plan {
+        for (k, v) in &p.env {
+            cmd.env(k, v);
+        }
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -7481,6 +7632,109 @@ pub fn cell_metrics(ui: &egui::Ui, font_size: f32) -> (egui::FontId, f32, f32) {
     (font_id, w, h)
 }
 
+/// 右クリックメニューに出す直近コマンドの件数。
+///
+/// メニューは画面に浮くので、長すぎると下が見切れる (「どの幅でも見切れない」)。
+/// 「さっき打ったやつ」を拾うのに 8 行あれば足りる。
+const SHELL_MENU_ROWS: usize = 8;
+
+/// 右クリックメニューのシェル統合セクション。
+///
+/// **段を必ず出す** — CLAUDE.md 設計原則 4 の「今どの段にいるか を UI に出す」。
+/// ただし段が `None` (マーカーが 1 つも来ていない) のときは**見出しごと出さない**。
+/// 常に「無効」と書いた行を置くのは「常に0を表示するバッジ」と同じで、
+/// 情報ではなく雑音になる。
+fn shell_integration_menu(ui: &mut egui::Ui, session: &mut Session, theme: &Theme) {
+    use crate::shellint::Tier;
+    let (tier, recorded, tier_log) = session.shell_status();
+    if tier == Tier::None {
+        return;
+    }
+    ui.separator();
+    let head = ui.label(
+        egui::RichText::new(trf(
+            "{mark} シェル統合: {tier} ({n} 件)",
+            &[
+                ("mark", tier.mark().to_string()),
+                ("tier", tr(tier.label())),
+                ("n", recorded.to_string()),
+            ],
+        ))
+        .small()
+        .color(theme.text_dim),
+    );
+    // 「どうやってこの段になったか」はホバーで出す (常時出すと行が増えるだけ)。
+    if let Some(log) = tier_log {
+        head.on_hover_text(log);
+    }
+    if let Some(cmd) = session.shell_running_command() {
+        let cmd = if cmd.is_empty() {
+            tr("(コマンド行は不明)")
+        } else {
+            cmd
+        };
+        ui.label(
+            egui::RichText::new(trf("▶ 実行中: {cmd}", &[("cmd", ellipsize(&cmd, 48))]))
+                .small()
+                .color(theme.accent),
+        );
+    }
+    // 捨てたぶんは黙って消さない (設計原則 2 のギャップ標識)。
+    if let Some(gap) = session.shell_gap_note() {
+        ui.label(egui::RichText::new(gap).small().color(theme.text_dim));
+    }
+    let recent = session.shell_recent(SHELL_MENU_ROWS);
+    if recent.is_empty() {
+        return;
+    }
+    let mut insert: Option<String> = None;
+    for c in &recent {
+        let color = match c.ok() {
+            Some(true) => theme.ok,
+            Some(false) => theme.err,
+            None => theme.text_dim,
+        };
+        let label = ellipsize(&c.summary(), 56);
+        let hover = trf(
+            "クリックで入力欄へ挿入 (Enter は送りません)\n{cmd}\n終了コード: {code} / 所要 {ms}ms",
+            &[
+                ("cmd", c.command_line.clone()),
+                (
+                    "code",
+                    c.exit_code
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| tr("不明")),
+                ),
+                ("ms", c.duration_ms().to_string()),
+            ],
+        );
+        let btn = egui::Button::new(egui::RichText::new(label).color(color)).frame(false);
+        // コマンド行を知らない段では押しても入れるものが無いので押させない。
+        let r = ui
+            .add_enabled(!c.command_line.is_empty(), btn)
+            .on_hover_text(hover);
+        if r.clicked() {
+            insert = Some(c.command_line.clone());
+        }
+    }
+    if let Some(line) = insert {
+        // **Enter は送らない。** 誤クリックで `rm -rf` が走る作りにしない。
+        // 打ち直しの手間を消すのが目的で、勝手に実行するのは目的ではない。
+        session.write_bytes(line.as_bytes());
+        session.note_user_input();
+        ui.close_menu();
+    }
+}
+
+/// 表示用に `max` 文字で省略する (全文はホバーで出す)。
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
 /// Render a terminal session. `interactive` forwards keyboard input on focus,
 /// `allow_resize` lets this view drive the PTY size.
 /// `hover_scroll`: ホバーだけでホイールを履歴スクロールに使うか。
@@ -7672,6 +7926,43 @@ pub fn draw(
         );
     }
 
+    // シェル統合の段と直近の終了コードを左下に小さく出す。
+    //
+    // **段が None のときは何も描かない** = 使っていない人の画面は 1 px も
+    // 変わらない (「画面が突然変わらない」)。出すのは 3 語ぶんの幅だけで、
+    // 色が直近コマンドの成否 (終了コードという事実) を表す。
+    if let Some((tier, exit)) = session.shell_badge() {
+        let color = match exit {
+            Some(0) => theme.ok,
+            Some(_) => theme.err,
+            None => theme.text_dim,
+        };
+        let text = match exit {
+            Some(code) if code != 0 => trf(
+                "{mark} shell {tier} · exit {code}",
+                &[
+                    ("mark", tier.mark().to_string()),
+                    ("tier", tr(tier.label())),
+                    ("code", code.to_string()),
+                ],
+            ),
+            _ => trf(
+                "{mark} shell {tier}",
+                &[
+                    ("mark", tier.mark().to_string()),
+                    ("tier", tr(tier.label())),
+                ],
+            ),
+        };
+        painter.text(
+            egui::pos2(rect.min.x + 8.0, rect.max.y - 6.0),
+            egui::Align2::LEFT_BOTTOM,
+            text,
+            egui::FontId::proportional(10.0),
+            color.gamma_multiply(0.85),
+        );
+    }
+
     // 右クリックメニュー: コピー操作
     if interactive {
         response.context_menu(|ui| {
@@ -7712,6 +8003,7 @@ pub fn draw(
                 session.sel_anchor = None;
                 ui.close_menu();
             }
+            shell_integration_menu(ui, session, theme);
         });
     }
 

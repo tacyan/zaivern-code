@@ -25,6 +25,10 @@ pub enum Cmd {
     CheckpointList,
     /// 今の作業ツリーをチェックポイントとして記録する。
     CheckpointNow,
+    /// 🕰 ローカルヒストリ (VCS に依らない取り消し履歴) を開く。
+    /// アクティブなファイルがあればそれに絞る。ラベル付けは開いた窓の
+    /// 「ラベル…」から届くので、**パレットの行はこれ 1 本だけ**にしてある。
+    LocalHistoryOpen,
     /// フリート看板 (全エージェントを状態列で俯瞰・指揮するカンバン画面) 切替
     ToggleKanban,
     /// エージェントデッキ (稼働中 / ローカルのセッション / 新規 を縦 1 本で管理する画面) 切替
@@ -301,6 +305,9 @@ pub enum Cmd {
     RunSelection,
     /// 新しいターミナル (Shell プリセット) を開く (VS Code: ⌃⇧`)
     NewTerminal,
+    /// **シェル統合 (OSC 633 / 133) の注入**を切り替える。
+    /// 受け取り側 (パース) は常時 on なので、これは「こちらから仕込むか」の切替。
+    ToggleShellIntegration,
     /// キーボードショートカット一覧ダイアログ
     ShowShortcuts,
     /// バージョン情報ダイアログ
@@ -381,6 +388,19 @@ pub enum Cmd {
     PrevBookmark,
     /// このファイルのブックマークをすべて解除
     ClearBookmarks,
+
+    // ── ニーモニック付きブックマーク (marks.rs / JetBrains の Bookmarks) ──
+    /// ニーモニック (0-9 / A-Z) を選んでブックマークを付け外しする。
+    /// 選択範囲があればそれが説明になる。
+    MarkToggleMnemonic,
+    /// ブックマーク一覧 (ツリー + プレビュー) を開く
+    MarksPanel,
+    /// ニーモニックを 1 打鍵で選ぶジャンプポップアップを開く
+    MarkJump,
+    /// 数字ニーモニック `0`〜`9` へ直行する (キーバインド専用)
+    MarkJumpDigit(u8),
+    /// プロジェクト全体のブックマークを消す
+    MarksClearAll,
     /// 直前に閉じたタブを開き直す
     ReopenClosedTab,
 
@@ -419,6 +439,7 @@ pub enum Cmd {
     OpenMcp,
     /// Skills / slash command 管理パネルを開く
     OpenSkills,
+    /// spec 駆動開発パネル (仕様の差分と陳腐化の見張り) を開く
     /// キャレットを 1 つ上の行に増やす
     AddCursorAbove,
     /// キャレットを 1 つ下の行に増やす
@@ -439,6 +460,14 @@ pub enum Cmd {
     ReopenWithEncoding(Option<String>),
     /// 符号化を選んで保存する (`None` ならピッカーを開く)
     SaveWithEncoding(Option<String>),
+    /// [`crate::feature`] のレジストリに登録された機能を呼ぶ。
+    ///
+    /// **並列開発で衝突しないための唯一の口。** 機能を 1 つ足すたびに
+    /// この `enum` へ variant を増やしていたため、隔離ワークツリーで
+    /// 8 本のブランチを同時に走らせると全員がここを編集して衝突した。
+    /// 以後、新しい機能は variant を増やさず `"<module>.<action>"` の
+    /// 安定 ID を載せてここを通す (詳しい経緯は `feature.rs` の冒頭)。
+    Feature(&'static str),
 }
 
 #[derive(Clone)]
@@ -689,7 +718,10 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleFinalNewlineOnSave
         | Cmd::ToggleTrimFinalNewlinesOnSave
         | Cmd::ToggleFormatOnSave
-        | Cmd::ConvertLineEnding(_) => Group::File,
+        | Cmd::ConvertLineEnding(_)
+        // ローカルヒストリはファイル/フォルダを戻す操作なので「ファイル」。
+        // git のコミット履歴とは別物 (コミットしていない変更が対象)。
+        | Cmd::LocalHistoryOpen => Group::File,
 
         // ── 編集 ───────────────────────────────────────────────────
         Cmd::Undo
@@ -750,6 +782,11 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::NextBookmark
         | Cmd::PrevBookmark
         | Cmd::ClearBookmarks
+        | Cmd::MarkToggleMnemonic
+        | Cmd::MarksPanel
+        | Cmd::MarkJump
+        | Cmd::MarkJumpDigit(_)
+        | Cmd::MarksClearAll
         | Cmd::LspReferences
         | Cmd::LspSymbols
         | Cmd::OpenCommandPalette
@@ -828,7 +865,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::RunActiveFile
         | Cmd::RunBuildTask
         | Cmd::RunJsonTask(_)
-        | Cmd::RunSelection => Group::Run,
+        | Cmd::RunSelection
+        | Cmd::ToggleShellIntegration => Group::Run,
 
         // ── エージェント ───────────────────────────────────────────
         Cmd::NewAgent(_)
@@ -890,7 +928,11 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ShowAbout
         | Cmd::ShowWhatsNew
         | Cmd::OpenLicense
-        | Cmd::RestartTutorial => Group::Tools,
+        | Cmd::RestartTutorial
+        // レジストリ経由の機能は「ツール」に寄せる。分類を機能ごとに
+        // 分けたくなるが、そうすると `Group` がまた共有の壁になるので
+        // ここは 1 つに固定する (分類は 8 つまで、という既存の約束もある)。
+        | Cmd::Feature(_) => Group::Tools,
     }
 }
 

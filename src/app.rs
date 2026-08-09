@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
 
+use crate::acp;
+use crate::agent_input::ComposerTarget;
 use crate::agent_picker::{self, AgentPicker};
 use crate::agents::{self, AgentManager, SessionEvent};
 use crate::breadcrumb;
@@ -14,6 +16,7 @@ use crate::checkpoint;
 use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
+use crate::conflict;
 use crate::coordinator;
 use crate::diagview;
 use crate::editor;
@@ -39,9 +42,12 @@ use crate::ide;
 use crate::kanban;
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::license;
+use crate::local_history;
 use crate::lsp;
 use crate::markdown;
+use crate::marks;
 use crate::mcp;
+use crate::mention;
 use crate::menu_bar;
 use crate::notify;
 use crate::orchestration;
@@ -60,6 +66,7 @@ use crate::shellenv;
 use crate::skills;
 use crate::snippets::{self, Snippet};
 use crate::sound::{self, SoundKind};
+use crate::spec;
 use crate::submit;
 use crate::supervisor;
 use crate::tasks;
@@ -144,6 +151,29 @@ pub enum ProblemRow {
         worst: u8,
     },
     Item(ProblemItem),
+}
+
+/// LSP の SymbolNode を `(名前, 開始行, 終端行, kind)` へ平らにする。
+/// 行はどちらも 0 起点・**両端を含む** (`mention::Target::Symbol` と同じ約束)。
+fn collect_symbol_ranges(
+    nodes: &[lsp::SymbolNode],
+    out: &mut Vec<(String, usize, usize, usize, u8)>,
+) {
+    for n in nodes {
+        out.push((
+            n.name.clone(),
+            n.range.start.line,
+            n.range.end.line.max(n.range.start.line),
+            n.range.end.character,
+            n.kind,
+        ));
+        collect_symbol_ranges(&n.children, out);
+    }
+}
+
+/// severity (1..4) の日本語名。表 [`PROBLEM_SEV_NAMES`] が唯一の出所。
+fn severity_word(sev: u8) -> &'static str {
+    PROBLEM_SEV_NAMES[(sev.clamp(1, 4) - 1) as usize]
 }
 
 /// severity ごとの件数 (トグルのバッジ用)。添字 0..3 = severity 1..4。
@@ -937,18 +967,22 @@ enum BottomView {
     Mcp,
     /// 🧩 Skills / slash command 管理
     Skills,
+    /// 📐 spec 駆動開発 (差分と陳腐化の見張り)
+    Spec,
 }
 
-/// 3 本のフラグから「今フレーム描くボトムパネルの中身」を 1 つ決める (純関数)。
+/// 4 本のフラグから「今フレーム描くボトムパネルの中身」を 1 つ決める (純関数)。
 ///
-/// 優先順は 承認 > MCP > Skills > 端末。複数立っていても返り値は必ず 1 つ。
-fn bottom_view(approvals: bool, mcp: bool, skills: bool) -> BottomView {
+/// 優先順は 承認 > MCP > Skills > Spec > 端末。複数立っていても返り値は必ず 1 つ。
+fn bottom_view(approvals: bool, mcp: bool, skills: bool, spec: bool) -> BottomView {
     if approvals {
         BottomView::Approvals
     } else if mcp {
         BottomView::Mcp
     } else if skills {
         BottomView::Skills
+    } else if spec {
+        BottomView::Spec
     } else {
         BottomView::Terminal
     }
@@ -3085,6 +3119,14 @@ pub struct ZaivernApp {
     /// 衝突バッジの詳細 (どのファイルを誰が取り合っているか) を開いているか。
     /// **既定は閉じ**。画面が勝手に開かないよう、明示的に押されたときだけ広がる。
     conflict_detail: bool,
+    /// 🛰 衝突レーダー — **worktree で隔離した** エージェント同士の
+    /// マージ衝突を、マージする前に見つける。`ConflictWatch` (同居のみ) の裏側。
+    /// 見張る対象が 2 本未満なら git を 1 回も起こさない。
+    conflict_radar: conflict::ConflictRadar,
+    /// レーダーの窓が開いているか。**既定は閉じ**。
+    radar_open: bool,
+    /// レーダーで選んでいるワークツリーの組 (行列のマス)。`None` = 全件。
+    radar_pair: Option<(usize, usize)>,
     /// 全エージェント一括停止の確認モーダルが出ているか (破壊的操作)。
     pending_stop_all: bool,
     /// 閉じたエージェントに割り当てられていた worktree の後始末待ち。
@@ -3194,6 +3236,15 @@ pub struct ZaivernApp {
     hotexit_warned: HashSet<String>,
     /// chord (2 打鍵) の待機。フレームを跨ぐので `App` が持つ。
     chord: crate::keybinds::ChordState,
+    /// which-key ポップアップ (chord の続きの一覧) の表示状態。
+    whichkey: crate::whichkey::WhichKey,
+    /// which-key に出す実データ行の実体 `(絶対パス, repo 相対パス, 状態)`。
+    ///
+    /// **1 フレームに 1 回だけ作り、打鍵経路と描画経路で同じものを見る。**
+    /// 都度作り直すと、git のスキャンがフレームの途中で着地したときに
+    /// 「画面の 3 番」と「押した 3 番」が別のファイルを指し得る。
+    /// prefix を握っていないフレームでは空 (アイドルのコストはゼロ)。
+    whichkey_live: Vec<(PathBuf, String, crate::git::FileStatus)>,
     about_open: bool,
     /// **What's New** に出す変更点。空でない間だけウィンドウを描く
     /// (bool を別に持つと「開いているのに中身が空」が構造的に起こり得る)。
@@ -3314,6 +3365,12 @@ pub struct ZaivernApp {
     tunnel_err: Option<String>,
     /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
+    /// `@` コンテキスト参照 (mention.rs)。添付台帳と裏の走査を持つ。
+    mention: mention::Mention,
+    /// `@` ピッカーへ渡す相対パス一覧 (索引が届いたときだけ作り直す)。
+    mention_rels: Vec<String>,
+    /// `@` ピッカーへ渡すシンボル (LSP の documentSymbol が届いたら作り直す)。
+    mention_syms: Vec<mention::SymbolHit>,
     /// プラン使用量の監視 (集約・枯渇予測)。読み取りはこの中で TTL 付きの
     /// バックグラウンドスレッドへ逃がされるので、毎フレーム触ってよい。
     quota: coordinator::QuotaWatch,
@@ -3358,6 +3415,9 @@ pub struct ZaivernApp {
     /// チェックポイント (エージェントへ指示を送る直前の作業ツリーの写し)。
     /// git は全て裏のスレッドで走る。
     checkpoints: checkpoint::Checkpoints,
+    /// 🕰 ローカルヒストリ (VCS に依らない取り消し履歴)。走査も書き出しも
+    /// 裏のスレッドで、UI はここから `std::fs` を 1 度も呼ばない。
+    local_history: local_history::LocalHistory,
     /// 次の配達で取るチェックポイントの `(エージェント, 指示要約)`。
     /// `queue_submit` は `egui::Context` を持たないので、ここへ predoc して
     /// `submit_tick` (ctx を持つ) が実際の取得を仕込む。一斉送信で N 体ぶん
@@ -3646,6 +3706,14 @@ pub struct ZaivernApp {
     /// 折りたたみを開いている承認要求の ID (詳細 / 生プロンプト抜粋)。
     approvals_expanded: HashSet<u64>,
 
+    // ── ACP クライアント (crate::acp) ─────────────────────────────
+    /// 構造化プロトコル (ACP) で駆動しているエージェント群とそのパネル。
+    /// 接続 0 本のときは何も描かず、1 フレームも起こさない。
+    ///
+    /// `pub` にしてあるのは `crate::feature` の登録面 (`dispatch` / `draw` が
+    /// `&mut ZaivernApp` を受け取る) から触れるようにするため。
+    pub acp: acp::AcpManager,
+
     // ── MCP サーバ管理パネル (crate::mcp) ─────────────────────────
     /// ボトムパネルを「🔌 MCP」表示に切り替えているか。
     mcp_view: bool,
@@ -3659,6 +3727,13 @@ pub struct ZaivernApp {
     /// 走査結果・検索語・展開状態。走査は**このビューを出したときだけ**行う
     /// (プラグインの木は数百ディレクトリで、毎フレーム歩く相手ではない)。
     skills: skills::SkillsPanel,
+
+    // ── spec 駆動開発パネル (crate::spec) ───────────────────────────
+    /// ボトムパネルを「📐 Spec」表示に切り替えているか。
+    spec_view: bool,
+    /// 仕様・差分・陳腐化の判定。走査は**このビューを出している間だけ**、
+    /// しかも**裏のスレッド**で行う (git を描画スレッドで待たない)。
+    spec: spec::SpecPanel,
 
     // ── 複数キャレット (crate::editor_ops::MultiSel) ────────────────
     /// `(バッファ ID, 選択集合)`。**タブごとに 1 つ**で、タブを切り替えると
@@ -3675,6 +3750,11 @@ pub struct ZaivernApp {
     enc_picker: Option<bool>,
     /// ピッカーの絞り込み文字列。
     enc_filter: String,
+
+    // ── ニーモニック付きブックマーク (crate::marks) ─────────────────
+    /// プロジェクト全体のブックマーク。`editor::Bookmarks` (タブ内の行集合)
+    /// とは別で、`~/.zaivern/bookmarks` へ永続化し編集を跨いで行を追う。
+    marks: marks::MarksState,
 }
 
 /// 指揮官に選べないセッションの理由。選べるなら `None`。
@@ -3832,6 +3912,9 @@ impl ZaivernApp {
             roots
         };
         let cfg = config::load(&roots, true);
+        // シェル統合の注入は設定 1 つで決まる (既定 off)。ここで反映しないと
+        // 「設定に書いたのに次の起動で効かない」になる。
+        crate::shellint::set_enabled(cfg.shell_integration);
         // 画面全体のズームは **テーマ適用より先** に入れる。theme::apply は
         // その時点の pixels_per_point でフォントサイズを物理ピクセルへ丸めるので、
         // 後から倍率を変えると最初のフレームだけ丸めがズレた絵になる。
@@ -3874,6 +3957,10 @@ impl ZaivernApp {
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
             ),
             checkpoint_pending: None,
+            local_history: local_history::LocalHistory::new(
+                roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
+                &cfg,
+            ),
             tab_drag: None,
             git_panel: git_panel::GitPanel::new(
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
@@ -3961,12 +4048,16 @@ impl ZaivernApp {
             named_for: HashMap::new(),
             conflicts: worktree::ConflictWatch::new(),
             conflict_detail: false,
+            conflict_radar: conflict::ConflictRadar::new(),
+            radar_open: false,
+            radar_pair: None,
             pending_stop_all: false,
             pending_worktree: None,
             highlighter: crate::highlight::shared(),
             cockpit: false,
             cockpit_followed: None,
             center: CenterView::Editor,
+            marks: marks::MarksState::new(&primary_root),
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
             deck: false,
@@ -4022,6 +4113,8 @@ impl ZaivernApp {
             hotexit_conflicts: Vec::new(),
             hotexit_warned: HashSet::new(),
             chord: crate::keybinds::ChordState::default(),
+            whichkey: crate::whichkey::WhichKey::default(),
+            whichkey_live: Vec::new(),
             about_open: false,
             whats_new: Vec::new(),
             // 起動時に 1 回だけローカルのキーを読んで検証する (通信なし)。
@@ -4074,6 +4167,9 @@ impl ZaivernApp {
             tunnel_host: cfg.ssh_tunnel_host.clone(),
             tunnel_err: None,
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
+            mention: mention::Mention::default(),
+            mention_rels: Vec::new(),
+            mention_syms: Vec::new(),
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             token_detail: false,
@@ -4156,10 +4252,13 @@ impl ZaivernApp {
             approvals_audit: false,
             approvals_audit_cache: None,
             approvals_expanded: HashSet::new(),
+            acp: acp::AcpManager::default(),
             mcp_view: false,
             mcp: mcp::McpPanel::default(),
             skills_view: false,
             skills: skills::SkillsPanel::default(),
+            spec_view: false,
+            spec: spec::SpecPanel::default(),
             multi_sel: None,
             multi_sticky_col: None,
             column_anchor: None,
@@ -4272,6 +4371,9 @@ impl ZaivernApp {
         self.git_panel
             .set_workspace(self.primary_root().to_path_buf());
         self.review.set_workspace(self.primary_root().to_path_buf());
+        // ブックマークもワークスペース単位。前のぶんは書き出してから読み替える。
+        let ws = self.primary_root().to_path_buf();
+        self.marks.set_workspace(&ws);
         // ブランチピッカーも新しいリポジトリへ。旧 repo の一覧が残っていると、
         // そこに無いブランチへの切り替えを発行できてしまう。
         self.branch_nav.set_repo(self.primary_root().to_path_buf());
@@ -4280,6 +4382,11 @@ impl ZaivernApp {
         self.checkpoints.set_repo(self.primary_root().to_path_buf());
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
+        // ローカルヒストリも新しいワークスペースへ (別プロジェクトの履歴へ
+        // 復元を撃てないよう、裏のスレッドごと捨てて張り直す)。
+        let lh_root = self.primary_root().to_path_buf();
+        self.local_history.set_workspace(lh_root, &self.cfg);
+        crate::shellint::set_enabled(self.cfg.shell_integration);
         self.tree.show_hidden = self.cfg.show_hidden_files;
         self.tree.apply_config(&self.cfg);
         self.rebuild_index();
@@ -6450,6 +6557,17 @@ impl ZaivernApp {
         self.index_truncated = out.truncated;
         self.file_index = out.files;
         self.index_at = Some(Instant::now());
+        // `@` ピッカーは**主ルート配下だけ**を扱う (rel は所属ルート基準なので、
+        // 別ルートのものを混ぜると root.join(rel) が別のファイルを指す)。
+        self.mention_rels = match self.roots.first() {
+            Some(root) => self
+                .file_index
+                .iter()
+                .filter(|f| f.abs.starts_with(root))
+                .map(|f| f.rel.clone())
+                .collect(),
+            None => Vec::new(),
+        };
     }
 
     /// ⌘P のパレットに出す「索引の状態」。作成中/打ち切りのときだけ Some。
@@ -8044,6 +8162,10 @@ impl ZaivernApp {
         // (この関数は配達を進める唯一の経路なので、取り漏らしが起きない)。
         if let Some((agent, note)) = self.checkpoint_pending.take() {
             self.checkpoints.capture_before_submit(&agent, &note, ctx);
+            // ローカルヒストリにもターン境界の 1 枚を残す。git 側と違い
+            // `.gitignore` の外や未追跡も含めてファイルシステムから撮るので、
+            // エージェントの shell が書いた変更もここに入る。
+            self.local_history.snapshot(&agent);
         }
         let now = Instant::now();
         let mut next: Option<Duration> = None;
@@ -8239,8 +8361,14 @@ impl ZaivernApp {
                 b.disk_mtime = disk_mtime(&path);
                 b.conflict_notified = None;
                 self.tree.invalidate();
+                // 「保存」という**コマンド名**でローカルヒストリへ刻む。
+                // 取り込みは遅延して裏で走る (連続保存で歩き回らない)。
+                self.local_history.note(&tr("保存"));
                 // 保存した本文の退避はもう要らない (ゴミを残さない)
                 self.hotexit_flush();
+                // ブックマークの追悼パスは 2 秒のデバウンスで走るので、
+                // 保存 (= ここまでを確定する操作) の直前に 1 回流しておく。
+                self.marks.flush_memorial(&path, &text);
                 if promoted {
                     self.toast_warn(trf(
                         "💾 保存しました: {path}\n\u{3000}{from} では表せない文字があるため UTF-8 で保存しました",
@@ -9135,6 +9263,11 @@ impl ZaivernApp {
             Cmd::ToggleBookmark | Cmd::NextBookmark | Cmd::PrevBookmark | Cmd::ClearBookmarks => {
                 self.apply_bookmark_cmd(&cmd)
             }
+            Cmd::MarkToggleMnemonic
+            | Cmd::MarksPanel
+            | Cmd::MarkJump
+            | Cmd::MarkJumpDigit(_)
+            | Cmd::MarksClearAll => self.apply_mark_cmd(&cmd),
             Cmd::ReopenClosedTab => self.reopen_closed_tab(),
             Cmd::ToggleTableView => self.toggle_table_view(),
             Cmd::LspCompletion => {
@@ -9412,6 +9545,83 @@ impl ZaivernApp {
         }
     }
 
+    /// ニーモニック付きブックマーク (`crate::marks`) のコマンド。
+    ///
+    /// **描画も判定も `marks` 側の純粋関数に置く** — ここは「いまのファイルと
+    /// 行を渡して、返ってきた要求を実行する」だけに保つ (app.rs は 42k 行あり、
+    /// 10 本のブランチが直列にマージされるので差分を局所化する)。
+    fn apply_mark_cmd(&mut self, cmd: &Cmd) {
+        match cmd {
+            Cmd::MarksPanel => self.marks.panel_open = !self.marks.panel_open,
+            Cmd::MarkJump => self.marks.jump_open = !self.marks.jump_open,
+            Cmd::MarksClearAll => {
+                self.marks.clear_all();
+                self.toast(tr("ブックマークをすべて消しました"), true);
+            }
+            Cmd::MarkJumpDigit(d) => match self.marks.goto_digit(*d) {
+                Some(a) => self.run_mark_action(a),
+                None => self.toast_warn(tr("そのニーモニックのブックマークがありません")),
+            },
+            Cmd::MarkToggleMnemonic => {
+                let Some(i) = self.editor.active else {
+                    self.toast_warn(tr("ファイルを開いてから使ってください"));
+                    return;
+                };
+                let Some(path) = self.editor.buffers[i].path.clone() else {
+                    self.toast_warn(tr("保存されていないファイルには付けられません"));
+                    return;
+                };
+                let line = self.caret_line0();
+                let text = self.editor.buffers[i].text.clone();
+                let sel = self.editor_selection_text();
+                self.marks.begin_toggle(&path, line, &text, sel);
+            }
+            _ => {}
+        }
+    }
+
+    /// 選択範囲の文字列 (無ければ `None`)。ブックマークの説明の種になる。
+    fn editor_selection_text(&self) -> Option<String> {
+        let i = self.editor.active?;
+        let (a, b) = self.editor_sel_chars?;
+        let (lo, hi) = (a.min(b), a.max(b));
+        if lo >= hi {
+            return None;
+        }
+        let t = &self.editor.buffers[i].text;
+        Some(t.chars().skip(lo).take(hi - lo).collect())
+    }
+
+    /// `marks` から返ってきた要求を実行する。
+    fn run_mark_action(&mut self, a: marks::MarkAction) {
+        match a {
+            marks::MarkAction::Goto(path, line0) => {
+                if self.active_file_path().as_deref() != Some(path.as_path()) {
+                    self.open_path(&path);
+                }
+                if let Some(i) = self.editor.active {
+                    self.reveal_line(i, line0);
+                }
+                self.goto_line(line0 + 1);
+            }
+            marks::MarkAction::Toast(msg, ok) => self.toast(msg, ok),
+        }
+    }
+
+    /// ブックマークの小窓 (一覧 / ニーモニック選択 / ジャンプ) を描く。
+    fn marks_windows(&mut self, ctx: &egui::Context) {
+        let hints = marks::Hints {
+            toggle: self.key_hint(BindAction::MarkToggleMnemonic),
+            panel: self.key_hint(BindAction::MarksPanel),
+        };
+        let theme = self.theme.clone();
+        let root = self.primary_root().to_path_buf();
+        let acts = marks::windows_ui(ctx, &mut self.marks, &theme, &hints, &root);
+        for a in acts {
+            self.run_mark_action(a);
+        }
+    }
+
     /// 直前に閉じたタブを開き直す (VS Code: ⇧⌘T)。
     fn reopen_closed_tab(&mut self) {
         let Some(t) = self.editor.closed_tabs.pop_closed() else {
@@ -9555,6 +9765,7 @@ impl ZaivernApp {
             self.lsp_symbols_query.clear();
             self.lsp_symbols_path = Some(path);
             self.lsp_symbols_quiet = false;
+            self.rebuild_mention_symbols();
         }
     }
 
@@ -10968,6 +11179,18 @@ impl ZaivernApp {
 
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
+            // feature.rs のレジストリ経由。**ここが唯一のディスパッチ口**で、
+            // 機能が何個増えてもこのアームは 1 つのまま (並列開発の衝突対策。
+            // 経緯は feature.rs の冒頭)。未知の ID を黙って捨てると
+            // 「押したのに無反応」になるので、必ずユーザーへ知らせる。
+            Cmd::Feature(id) => {
+                if !crate::feature::dispatch(self, ctx, id) {
+                    self.toast_warn(trf(
+                        "機能 {id} は登録されていません",
+                        &[("id", id.to_string())],
+                    ));
+                }
+            }
             // 差分ビュー: 表示モードの切替と変更箇所のジャンプ。
             // ctx へ書くだけで、実際の反映は差分ビュー自身が同フレームで行う。
             Cmd::ToggleDiffView => {
@@ -10983,6 +11206,15 @@ impl ZaivernApp {
             // ここは要求を出すだけ。結果は `checkpoint_ui` が受ける。
             Cmd::CheckpointList => self.checkpoints.open_list(ctx),
             Cmd::CheckpointNow => self.checkpoints.capture_now(ctx),
+            // 🕰 ローカルヒストリ。走査も復元も裏のスレッドなので、ここは
+            // 要求を出すだけ。結果は `local_history_ui` が受ける。
+            Cmd::LocalHistoryOpen => {
+                let p = self
+                    .editor
+                    .active
+                    .and_then(|i| self.editor.buffers[i].path.clone());
+                self.local_history.open_for(p.as_deref(), ctx);
+            }
             // `]f` / `[f`: **ファイル間**のジャンプ (並列レビューの単位)。
             // 依頼を ctx に置くだけ。消化するのはレビュー画面自身なので、
             // 画面が出ていなければ 1 フレームで腐って何も起きない。
@@ -11013,6 +11245,11 @@ impl ZaivernApp {
             | Cmd::NextBookmark
             | Cmd::PrevBookmark
             | Cmd::ClearBookmarks
+            | Cmd::MarkToggleMnemonic
+            | Cmd::MarksPanel
+            | Cmd::MarkJump
+            | Cmd::MarkJumpDigit(_)
+            | Cmd::MarksClearAll
             | Cmd::ReopenClosedTab
             | Cmd::ToggleTableView
             | Cmd::LspCompletion
@@ -11176,6 +11413,7 @@ impl ZaivernApp {
             | Cmd::ToggleWordWrap
             | Cmd::ToggleShowWhitespace
             | Cmd::ToggleMinimap
+            | Cmd::ToggleShellIntegration
             | Cmd::ToggleBreadcrumbs => self.apply_cmd_settings(cmd, ctx),
             Cmd::ToggleGitBlame => self.apply_cmd_settings(cmd, ctx),
             Cmd::VoiceInput(_)
@@ -12485,6 +12723,37 @@ impl ZaivernApp {
                     true,
                 );
             }
+            Cmd::ToggleShellIntegration => {
+                self.cfg.shell_integration = !self.cfg.shell_integration;
+                let on = self.cfg.shell_integration;
+                // 有効化した時点でシムを書き出す (crate::shellint::set_enabled)。
+                crate::shellint::set_enabled(on);
+                config::save_state(&self.cfg);
+                // 既に OSC を出しているシェル (iTerm2 / kitty / starship 等) では
+                // シム側が降りる。**「入れたのに何も変わらない」の理由を先に言う** —
+                // 黙って何もしないのが一番たちが悪い。
+                let already = on
+                    && crate::shellint::already_integrated(
+                        &|k| std::env::var(k).ok(),
+                        &crate::shellint::default_rc_files(),
+                    );
+                // **既存の端末には効かない**ことを隠さない。シェルの起動引数を
+                // 変える機能なので、次に開いた端末からしか働かない。
+                self.toast(
+                    match (on, already) {
+                        (true, true) => tr(
+                            "🐚 シェル統合: オン — ただしお使いのシェル設定は既に OSC 133/633 を出しています。二重発行を避けるためシムは何もしません (受信側はそのまま働きます)",
+                        ),
+                        (true, false) => tr(
+                            "🐚 シェル統合: オン — 次に開くターミナルから、コマンドの境界と終了コードをシェルが直接報告します",
+                        ),
+                        (false, _) => tr(
+                            "🐚 シェル統合: オフ — 次に開くターミナルは従来どおり起動します (受信側は動いたまま)",
+                        ),
+                    },
+                    true,
+                );
+            }
             Cmd::ToggleBreadcrumbs => {
                 self.cfg.breadcrumbs = !self.cfg.breadcrumbs;
                 self.cfg.global_breadcrumbs = self.cfg.breadcrumbs;
@@ -13136,6 +13405,24 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.binding(BindAction::ToggleBookmark)) {
             cmds.push(Cmd::ToggleBookmark);
+        }
+        if consume(ctx, self.keys.binding(BindAction::MarkToggleMnemonic)) {
+            cmds.push(Cmd::MarkToggleMnemonic);
+        }
+        if consume(ctx, self.keys.binding(BindAction::MarksPanel)) {
+            cmds.push(Cmd::MarksPanel);
+        }
+        if consume(ctx, self.keys.binding(BindAction::MarkJump)) {
+            cmds.push(Cmd::MarkJump);
+        }
+        // 数字ニーモニックへの直行。**打鍵は OS ごとに `marks` が固定して持つ**
+        // (⌃ + 数字は mac の起動バー、⌃⌥ + 数字は非 mac の起動バーが既に使う)。
+        for d in 0u8..=9 {
+            if let Some(sc) = marks::digit_jump_shortcut(d) {
+                if consume_sc(ctx, sc) {
+                    cmds.push(Cmd::MarkJumpDigit(d));
+                }
+            }
         }
         if consume(ctx, self.keys.binding(BindAction::LspReferences)) {
             cmds.push(Cmd::LspReferences);
@@ -14724,16 +15011,6 @@ impl ZaivernApp {
         let ui_zoom = self.cfg.ui_zoom;
         let file_zoom = self.file_zoom();
         let mut zoom_cmd: Option<Cmd> = None;
-        // chord (2 打鍵) の 1 打鍵目を握っている間の案内。
-        // 何も出さないと「固まった」ように見えるので、VS Code と同じく必ず出す。
-        // 待機していないフレームでは 1 ピクセルも出さない。
-        let chord_hint = self.chord.pending().map(|sc| {
-            trf(
-                "{keys} が押されました。待機中…",
-                &[("keys", crate::keybinds::format_shortcut(sc))],
-            )
-        });
-
         let bar = egui::TopBottomPanel::bottom("zv-status")
             .exact_height(26.0)
             .frame(
@@ -14764,16 +15041,6 @@ impl ZaivernApp {
                             ))
                             .size(11.5)
                             .color(theme.ok),
-                        );
-                    }
-
-                    // chord の待機中だけ出る案内 (⌘K を握っている間)
-                    if let Some(hint) = &chord_hint {
-                        ui.label(
-                            RichText::new(format!("⌨ {hint}"))
-                                .size(11.5)
-                                .color(theme.warn)
-                                .strong(),
                         );
                     }
 
@@ -16460,6 +16727,7 @@ impl ZaivernApp {
         let mut mcp_action = mcp::McpAction::None;
         // Skills パネルの要求 (開く / 送る / コピー / 再走査) も描画後に実行する。
         let mut skills_action = skills::SkillAction::None;
+        let mut spec_action = spec::SpecAction::None;
 
         let panel = egui::TopBottomPanel::bottom("zv-terminal")
             .resizable(true)
@@ -16576,6 +16844,7 @@ impl ZaivernApp {
                                     self.kanban = false;
                                     self.mcp_view = false;
                                     self.skills_view = false;
+                self.spec_view = false;
                                     self.term_focus_pending = true;
                                     self.agents.sessions[i].acknowledge();
                                 }
@@ -16614,6 +16883,7 @@ impl ZaivernApp {
                                 self.kanban = false;
                                 self.mcp_view = false;
                                 self.skills_view = false;
+                self.spec_view = false;
                             }
                         }
                         // MCP タブ: 全エージェント横断の MCP サーバ一覧。
@@ -16636,6 +16906,7 @@ impl ZaivernApp {
                                 self.kanban = false;
                                 self.approvals_view = false;
                                 self.skills_view = false;
+                self.spec_view = false;
                                 // 開いた回だけ読み直す (毎フレーム I/O にしない)
                                 self.mcp.invalidate();
                             }
@@ -16662,6 +16933,38 @@ impl ZaivernApp {
                                 self.mcp_view = false;
                                 // 開いた回だけ読み直す (毎フレーム I/O にしない)
                                 self.skills.invalidate();
+                            }
+                        }
+                        // Spec タブ: 仕様の差分と「陳腐化の疑い」。
+                        // 件数は **疑いがあるときだけ** 出す (常に 0 のバッジを作らない)。
+                        let sp_label = match self.spec.badge() {
+                            Some(n) => format!("{} {n}", tr("📐 Spec")),
+                            None => tr("📐 Spec"),
+                        };
+                        let sp_btn = ui.selectable_label(
+                            self.spec_view,
+                            RichText::new(sp_label).color(if self.spec.badge().is_some() {
+                                theme.warn
+                            } else {
+                                theme.text
+                            }),
+                        );
+                        if sp_btn
+                            .on_hover_text(tr(
+                                "spec 駆動開発 — 変更は差分 (ADDED / MODIFIED / REMOVED) で書き、\n\
+                                 統べているコードが動いたのに要件の文が動いていないものを\n\
+                                 「陳腐化の疑い」として出します (判定は裏のスレッド)",
+                            ))
+                            .clicked()
+                        {
+                            self.spec_view = !self.spec_view;
+                            if self.spec_view {
+                                self.kanban = false;
+                                self.approvals_view = false;
+                                self.mcp_view = false;
+                                self.skills_view = false;
+                                // 開いた回だけ取り直す (アイドル時に走らせない)
+                                self.spec.invalidate();
                             }
                         }
                         ui.menu_button("📜", |ui| {
@@ -16737,7 +17040,12 @@ impl ZaivernApp {
                 // 「🛡 承認」タブ表示中やセッションが 0 件の間に消してしまうと、
                 // タブ切替やエージェントを閉じた直後のフォーカス要求が握り潰され、
                 // どこにも入力が届かなくなる。
-                let view = bottom_view(self.approvals_view, self.mcp_view, self.skills_view);
+                let view = bottom_view(
+                    self.approvals_view,
+                    self.mcp_view,
+                    self.skills_view,
+                    self.spec_view,
+                );
                 if view == BottomView::Terminal && !self.agents.sessions.is_empty() {
                     self.term_focus_pending = false;
                 }
@@ -16767,6 +17075,10 @@ impl ZaivernApp {
                     BottomView::Skills => {
                         // 「🧩 Skills」タブ: 走査は描画の外 (この下) で行う。
                         skills_action = skills::ui(ui, &theme, &mut self.skills);
+                    }
+                    BottomView::Spec => {
+                        // 「📐 Spec」タブ: 走査は描画の外 (この下) で、しかも裏のスレッド。
+                        spec_action = spec::ui(ui, &theme, &mut self.spec);
                     }
                     BottomView::Terminal => {
                         if let Some(s) = self.agents.active_session() {
@@ -16816,6 +17128,13 @@ impl ZaivernApp {
         if self.skills_view && !self.skills.scanned {
             self.skills.entries = skills::scan(&self.roots);
             self.skills.scanned = true;
+        }
+        // spec パネルの実行 (描画後)。走査も**このビューを出している間だけ**で、
+        // 中身は裏のスレッドへ逃げる (`poll` は決して待たない)。
+        self.apply_spec_action(spec_action);
+        if self.spec_view {
+            let root = self.primary_root().to_path_buf();
+            self.spec.poll(&root);
         }
 
         if let Some(i) = launch {
@@ -16889,7 +17208,57 @@ impl ZaivernApp {
         self.kanban = false;
         self.mcp_view = false;
         self.skills_view = false;
+        self.spec_view = false;
         self.approvals_view = true;
+    }
+
+    // ─── spec 駆動開発 (パネルの外側の実行部) ──────────────────────
+
+    /// ボトムパネルを開いて「📐 Spec」ビューへ切り替える
+    /// (コマンドパレット / タブの共通の入口)。
+    /// spec パネルを開く。`pub(crate)` なのは [`crate::feature`] のレジストリ
+    /// から呼ぶため (機能側が `app.rs` を編集せずに済むようにする配線口)。
+    pub(crate) fn open_spec_panel(&mut self) {
+        self.agents.panel_open = true;
+        self.cockpit = false;
+        self.kanban = false;
+        self.approvals_view = false;
+        self.mcp_view = false;
+        self.skills_view = false;
+        self.spec_view = true;
+        // 開いた回だけ取り直す (アイドル時に走らせない)
+        self.spec.invalidate();
+    }
+
+    /// spec パネルを「陳腐化の疑いだけ」に絞って開く。
+    ///
+    /// フィールドを `pub(crate)` にして機能側から触らせるのではなく、
+    /// **操作をメソッドとして 1 つ出す**。内部表現を外へ漏らさずに済み、
+    /// レジストリ側のクロージャも 1 行で書ける。
+    pub(crate) fn open_spec_stale(&mut self) {
+        self.open_spec_panel();
+        self.spec.focus_stale();
+    }
+
+    /// spec パネルが積んだ要求を実行する。**描画の外でだけ呼ぶ** (I/O があるため)。
+    fn apply_spec_action(&mut self, action: spec::SpecAction) {
+        match action {
+            spec::SpecAction::None => {}
+            spec::SpecAction::Rescan => self.spec.invalidate(),
+            spec::SpecAction::Open(path) => self.open_path(&path),
+            spec::SpecAction::Hand(text) => self.send_to_agent(text),
+            spec::SpecAction::Write(req) => {
+                let root = self.primary_root().to_path_buf();
+                match spec::apply_write(req, &root) {
+                    Ok(msg) => {
+                        self.toast(msg, true);
+                        // 書いた結果を次の走査で必ず拾う
+                        self.spec.invalidate();
+                    }
+                    Err(e) => self.toast(e, false),
+                }
+            }
+        }
     }
 
     // ─── MCP サーバ管理 (パネルの外側の実行部) ─────────────────────
@@ -16902,6 +17271,7 @@ impl ZaivernApp {
         self.kanban = false;
         self.approvals_view = false;
         self.skills_view = false;
+        self.spec_view = false;
         self.mcp_view = true;
         // 開いた回だけ読み直す (アイドル時に I/O しない)
         self.mcp.invalidate();
@@ -16966,6 +17336,7 @@ impl ZaivernApp {
         self.kanban = false;
         self.approvals_view = false;
         self.mcp_view = false;
+        self.spec_view = false;
         self.skills_view = true;
         // 開いた回だけ読み直す (アイドル時に I/O しない)
         self.skills.invalidate();
@@ -17002,6 +17373,12 @@ impl ZaivernApp {
         let mut sent = 0usize;
         let mut lost = 0usize;
         for (sid, action) in &res.replies {
+            // **ACP (構造化プロトコル) の要求が先。** PTY のセッション ID とは
+            // 別空間 (`acp::ACP_SESSION_ID_BASE`) なので取り違えは起きない。
+            if self.acp.reply(*sid, *action) {
+                sent += 1;
+                continue;
+            }
             let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == *sid) else {
                 lost += 1;
                 continue;
@@ -17177,6 +17554,103 @@ impl ZaivernApp {
             .map(|s| (s.id, s.cwd.clone(), s.running()))
             .collect();
         self.conflicts.update(&live);
+        // 🛰 レーダーは**隔離済み**の worktree 同士を見る (同居は上の担当)。
+        // ディスク使用量は窓を開けている間だけ測る (閉じていればゼロコスト)。
+        // 結果が差し替わっても**自分からは再描画を要求しない** (`ConflictWatch`
+        // と同じ約束)。エージェントが動いていれば PTY 出力で描き直しが起きるし、
+        // 全員止まっていれば描き直す理由が無い = アイドルのコストはゼロ。
+        let specs = self.radar_specs();
+        let _ = self.conflict_radar.update(&specs, self.radar_open);
+    }
+
+    /// レーダーが見張るワークツリーの一覧 (git を 1 回も呼ばない)。
+    ///
+    /// **稼働中で worktree 隔離されたエージェント** を、同じリポジトリごとに
+    /// まとめ、いちばん大きな束を選ぶ。そこへ本体のリポジトリ自身も 1 本
+    /// (ID 0) として加える — ユーザー自身の未コミット変更もエージェントと
+    /// ぶつかるので、隠すと「後で発見させない」という目的に反する。
+    fn radar_specs(&self) -> Vec<conflict::TreeSpec> {
+        let mut by_repo: HashMap<PathBuf, Vec<conflict::TreeSpec>> = HashMap::new();
+        for s in self.agents.sessions.iter().filter(|s| s.running()) {
+            let Some(wt) = self.agent_worktrees.get(&s.id) else {
+                continue;
+            };
+            by_repo
+                .entry(worktree::path_key(&wt.repo))
+                .or_default()
+                .push(conflict::TreeSpec {
+                    id: s.id,
+                    label: format!("{} {}", s.icon, s.title),
+                    branch: wt.branch.clone(),
+                    dir: wt.dir.clone(),
+                });
+        }
+        // 同じ画面に 2 つのリポジトリの行列を混ぜない (共通ベースが無い)。
+        let Some((_, mut specs)) = by_repo
+            .into_iter()
+            .max_by_key(|(k, v)| (v.len(), k.clone()))
+        else {
+            return Vec::new();
+        };
+        specs.sort_by_key(|s| s.id);
+        // 本体リポジトリ。エージェントの worktree の `repo` から取るので、
+        // ワークスペースをどこに開いていても正しい相手になる。
+        if let Some(repo) = self
+            .agent_worktrees
+            .values()
+            .find(|w| specs.iter().any(|s| s.dir == w.dir))
+            .map(|w| w.repo.clone())
+        {
+            let name = repo
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| tr("リポジトリ本体"));
+            specs.insert(
+                0,
+                conflict::TreeSpec {
+                    id: 0,
+                    label: trf("📁 {name} (本体)", &[("name", name)]),
+                    branch: String::new(),
+                    dir: repo,
+                },
+            );
+        }
+        specs
+    }
+
+    /// 🛰 衝突レーダーの開閉 ([`crate::conflict::FEATURE`] から呼ばれる)。
+    pub(crate) fn toggle_conflict_radar(&mut self) {
+        self.radar_open = !self.radar_open;
+        if self.radar_open {
+            // 開くたびに絞り込みは解く (前回選んだ組が残っていると
+            // 「開いたのに何も出ない」に見える)。
+            self.radar_pair = None;
+        }
+    }
+
+    /// 🛰 衝突レーダーの窓。**閉じているときは 1 命令も走らない**。
+    pub(crate) fn conflict_radar_ui(&mut self, ctx: &egui::Context) {
+        if !self.radar_open {
+            return;
+        }
+        // Cockpit を閉じたまま窓だけ開いた場合も更新が止まらないよう、
+        // ここでも 1 段だけ進める (二重に呼んでも走査は 1 本しか起きない)。
+        let specs = self.radar_specs();
+        let _ = self.conflict_radar.update(&specs, true);
+        let theme = self.theme.clone();
+        let mut open = true;
+        let mut pair = self.radar_pair;
+        let acts = conflict::radar_window(ctx, &theme, &mut open, &self.conflict_radar, &mut pair);
+        self.radar_pair = pair;
+        if !open {
+            self.radar_open = false;
+        }
+        for a in acts {
+            match a {
+                conflict::RadarAction::Open(path, line) => self.open_path_at(&path, line, 1),
+                conflict::RadarAction::Close => self.radar_open = false,
+            }
+        }
     }
 
     /// 衝突バッジのツールチップ (ファイル名と、取り合っている相手の名前)。
@@ -17301,6 +17775,49 @@ impl ZaivernApp {
         // 「⏸ 停止中」チップの件数。`&mut self.agent_input_buf` を借りる前に
         // 数え終えておく (借用が重なるため)。
         let stalled = self.stalled_session_ids().len();
+
+        // ── `@` コンテキスト参照の材料 ──────────────────────────
+        // **ここでは I/O を 1 つもしない。** 索引・シンボル・ブランチ名は
+        // すべて裏で取り終えて手元にある値で、診断もメモリ上の集計。
+        // 借用が重ならないよう、`&mut self.agent_input_buf` を取る前に
+        // 必要なものを局所変数へ移しておく (`mem::take` はポインタ交換だけ)。
+        let m_root = self.roots.first().cloned().unwrap_or_default();
+        let m_terms: Vec<(u64, String)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| (s.id, format!("{} {}", s.icon, s.title)))
+            .collect();
+        // 診断の集計はピッカーが開いている間だけ (毎フレーム全診断を舐めない)。
+        let m_problems = if self.mention.is_open() {
+            self.collect_problems().len()
+        } else {
+            0
+        };
+        // git があるかは**裏でキャッシュ済みのブランチ名**で判定する
+        // (ここで `git rev-parse` を撃つと UI スレッドが数秒止まる)。
+        let m_repo = self.git_branch().is_some().then(|| m_root.clone());
+        let m_trunc = self.index_truncated;
+        let m_busy = self.lsp_symbols_busy || self.index_rx.is_some();
+        let m_rels = std::mem::take(&mut self.mention_rels);
+        let m_syms = std::mem::take(&mut self.mention_syms);
+        let msrc = mention::Source {
+            root: &m_root,
+            files: &m_rels,
+            files_truncated: m_trunc,
+            symbols: &m_syms,
+            symbols_busy: m_busy,
+            terminals: &m_terms,
+            problems: m_problems,
+            repo: m_repo.as_deref(),
+        };
+        // `self` は下のクロージャ群が丸ごと借りるので、ピッカーの状態も
+        // 一旦手元へ引き取る (`mem::take` は構造体の移動だけで割り当てはしない)。
+        let mut mstate = std::mem::take(&mut self.mention);
+        let mut mhook = mention::Hook {
+            state: &mut mstate,
+            source: &msrc,
+        };
         // ヘッダー行に埋め込めたか。埋め込めなかった分だけ下に別行で出す。
         let mut inline_done = false;
         let mut composer = panels::ComposerAction::None;
@@ -17352,6 +17869,30 @@ impl ZaivernApp {
                     .on_hover_text(tip);
                 if hit.clicked() {
                     self.conflict_detail = !self.conflict_detail;
+                }
+            }
+            // ── 🛰 衝突レーダー (隔離済み worktree 同士) ──────────────
+            // **綺麗なときは静かである**。警報が 0 件なら 1 ピクセルも出さない。
+            let radar_n = self.conflict_radar.report().alarm_files();
+            if radar_n > 0 {
+                let hit = ui
+                    .selectable_label(
+                        self.radar_open,
+                        RichText::new(if compact {
+                            format!("🛰{radar_n}")
+                        } else {
+                            trf("🛰 {n} ファイル衝突予測", &[("n", radar_n.to_string())])
+                        })
+                        .color(theme.err)
+                        .strong(),
+                    )
+                    .on_hover_text(tr(
+                        "別々の worktree で走っているエージェントが、マージすると\n\
+                         衝突するファイルを触っています。押すと衝突レーダーが開きます。",
+                    ));
+                if hit.clicked() {
+                    // パレット経由と同じ入口を通す (絞り込みの解除も揃う)。
+                    self.toggle_conflict_radar();
                 }
             }
 
@@ -17456,6 +17997,7 @@ impl ZaivernApp {
                         &mut self.agent_input_buf,
                         target.as_ref().map(|(id, t)| (*id, t.as_str())),
                         &mut expand,
+                        &mut mhook,
                     );
                     inline_done = true;
                 }
@@ -17489,6 +18031,7 @@ impl ZaivernApp {
                     &targets,
                     stalled,
                     &mut expand,
+                    &mut mhook,
                 )
             } else {
                 // ヘッダーが詰まっていた場合の逃げ場 (窓が狭いとき)。
@@ -17498,8 +18041,23 @@ impl ZaivernApp {
                     &mut self.agent_input_buf,
                     target.as_ref().map(|(id, t)| (*id, t.as_str())),
                     &mut expand,
+                    &mut mhook,
                 )
             };
+        }
+        // ここでピッカーの状態を返す (`mhook` の借用はこの行で終わる)。
+        let mention::Hook { .. } = mhook;
+        self.mention = mstate;
+        // 添付チップ (印・解決先・**1 件ごとの概算トークン**)。空なら何も描かない。
+        if let Some(token) = mention::chips_ui(ui, theme, self.mention.ledger()) {
+            let stripped = mention::strip_token(self.agent_input_buf.text(), &token);
+            self.agent_input_buf.set_text(stripped);
+        }
+        self.mention_rels = m_rels;
+        self.mention_syms = m_syms;
+        // 端末の末尾・診断は App しか持っていないので、ここで詰めて返す。
+        if let Some(need) = self.mention.take_need() {
+            self.serve_mention_need(need);
         }
         ui.memory_mut(|m| m.data.insert_temp(expand_id, expand));
         match composer {
@@ -18406,6 +18964,8 @@ impl ZaivernApp {
         mut orch_acts: Vec<orchestration::OrchAction>,
     ) {
         if let Some(text) = acts.broadcast {
+            // `@` 添付を本文へ展開してから流す (印だけでは中身が届かない)。
+            let text = self.expand_mentions(&text, None, ComposerTarget::Broadcast);
             // None はコスト上限で止めたとき。理由は送信側が説明済みなので
             // 「宛先がいない」と嘘を重ねない。
             match self.queue_submit_all(&text) {
@@ -18420,6 +18980,7 @@ impl ZaivernApp {
         // 止まっているものだけへの一斉送信。作業中は巻き込まないので、
         // 「全員へ送ると進行中の作業まで分断される」を避けられる。
         if let Some(text) = acts.broadcast_stalled {
+            let text = self.expand_mentions(&text, None, ComposerTarget::Stalled);
             match self.queue_submit_stalled(&text) {
                 None => {}
                 Some(0) => self.toast(tr("止まっているエージェントはありません"), false),
@@ -18434,6 +18995,7 @@ impl ZaivernApp {
         }
         // 宛先を指名した送信は**その 1 体だけ**へ届ける (broadcast は通らない)
         if let Some((id, text)) = acts.send_to {
+            let text = self.expand_mentions(&text, Some(id), ComposerTarget::Agent(id));
             let live = self
                 .agents
                 .sessions
@@ -18500,11 +19062,20 @@ impl ZaivernApp {
         // タスク作成 / メッセージ送信のフォームと、押されたボタンの適用。
         let prev_task_target = self.orch.target;
         let prev_msg_target = self.orch.msg_target;
+        // ディスパッチ前チェックの材料 (レーダーが既に持っている逆引き表)。
+        // 宛先に指名した相手は外す — 自分が持っているファイルを自分へ
+        // 警告しても意味が無い。
+        let exclude = match self.orch.target {
+            orchestration::TaskTarget::Session(id) => Some(id),
+            orchestration::TaskTarget::Auto => None,
+        };
+        let owners = self.conflict_radar.report().all_owners(exclude);
         orch_acts.extend(orchestration::task_form_ui(
             &mut self.orch,
             ctx,
             theme,
             orch_rows,
+            &owners,
         ));
         orch_acts.extend(orchestration::message_form_ui(
             &mut self.orch,
@@ -18576,6 +19147,7 @@ impl ZaivernApp {
         // Cockpit と同じ見張り。同居が 0 なら git を 1 回も叩かない。
         self.sync_conflicts();
         let conflicts = self.conflicts.report().clone();
+        let radar = self.conflict_radar.report().clone();
         // PTY 画面の読み直し (parser のロック) は看板が「今」と言ったフレームだけ。
         // 看板を開けっぱなしでもアイドル時のコストがゼロに近くなる。
         let now_ms = self.supervisor.elapsed_ms();
@@ -18627,15 +19199,23 @@ impl ZaivernApp {
                     commander: self.super_agent_session == Some(s.id),
                     // 同じ作業ツリーの誰かとファイルを取り合っていたら ⚠。
                     // 取り合っているファイル名はホバーに畳む。
-                    conflict: conflicts.has_agent(s.id).then(|| {
-                        trf(
-                            "⚠ 他のエージェントと同じファイルを触っています: {files}",
-                            &[(
-                                "files",
-                                worktree::summarize_labels(&conflicts.labels_for(s.id), 3),
-                            )],
-                        )
-                    }),
+                    // **隔離済み worktree 同士**の衝突予測 (🛰 レーダー) も
+                    // 同じ 1 本のバッジに畳む — 同じ意味の印を 2 つ並べない。
+                    conflict: [
+                        conflicts.has_agent(s.id).then(|| {
+                            trf(
+                                "⚠ 他のエージェントと同じファイルを触っています: {files}",
+                                &[(
+                                    "files",
+                                    worktree::summarize_labels(&conflicts.labels_for(s.id), 3),
+                                )],
+                            )
+                        }),
+                        radar.card_hint(s.id),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .reduce(|a, b| format!("{a}\n{b}")),
                     can_cycle: s.permission_switch_hint().is_some(),
                     // カードの一言 + ホバープレビュー + アクティビティ分類の材料。
                     // サンプリング周期のフレームだけ実際に PTY を読む
@@ -19130,6 +19710,43 @@ impl ZaivernApp {
                 self.commit_diff_cache.remove(&id);
             }
             checkpoint::Done::Failed(e) => self.toast(e, false),
+        }
+    }
+
+    /// 🕰 ローカルヒストリの一覧を描き、裏のスレッドの結果を捌く。
+    ///
+    /// **アイドル時のコストはゼロ** — 一覧を閉じていれば描画は即 return し、
+    /// 依頼が 1 つも無ければ受信口すら作られていないので `poll` も即 return する。
+    fn local_history_ui(&mut self, ctx: &egui::Context) {
+        self.local_history.ui(ctx);
+        // 復元は「戻した」と「一覧が変わった」を続けて返すので、溜まっている
+        // ぶんはこのフレームで全部捌く (次の再描画まで持ち越さない)。
+        while let Some(done) = self.local_history.poll() {
+            match done {
+                local_history::Done::Diff {
+                    title,
+                    path,
+                    old,
+                    new,
+                } => {
+                    // **差分ビューアは 2 つ書かない。** 既存の比較ウィンドウへ渡す。
+                    let f = crate::diff::diff_texts(
+                        &trf("{p} ({t})", &[("p", path.clone()), ("t", title)]),
+                        &trf("{p} (今)", &[("p", path)]),
+                        &old,
+                        &new,
+                    );
+                    self.show_compare(tr("🕰 ローカルヒストリ"), f);
+                }
+                local_history::Done::Restored { .. } => {
+                    // 作業ツリーが変わった。git の色付けと開いているタブを
+                    // 取り直す (依頼を出すだけ。ここでは待たない)。
+                    self.gitinfo.request_refresh();
+                    self.ext_check_at = None;
+                }
+                local_history::Done::Failed(e) => self.toast(e, false),
+                local_history::Done::Scanned { .. } | local_history::Done::Loaded(_) => {}
+            }
         }
     }
 
@@ -21766,6 +22383,9 @@ impl ZaivernApp {
         let theme_panel = self.theme.panel;
         let theme_border = self.theme.border;
         let theme_accent = self.theme.accent;
+        // ブックマークのニーモニックはアクセント色の四角の上に載せるので、
+        // 文字色は本文背景 (= アクセントの反対側) を使う。
+        let theme_bg = self.theme.bg;
         // 現在行ハイライト用 (テキストの上に重ねるのでごく薄く)
         let cur_line_hl = self.theme.text.gamma_multiply(0.07);
         // 折り返しと空白可視化 (コマンド/メニューで切替、config に永続化)
@@ -21832,6 +22452,15 @@ impl ZaivernApp {
         }
         self.refresh_active_diagnostics(text_hash);
         self.refresh_inlay_hints(text_hash);
+        // ブックマークの行追従。**毎フレームやるのはハッシュ比較だけ**で、
+        // 実際の差分は 100ms のデバウンス後にバックグラウンドスレッドが取る
+        // (編集経路で本文を走査すると、このリポジトリが git で踏んだ
+        //  「UI スレッドが数秒返ってこない」を再演することになる)。
+        if let Some(p) = abs.clone() {
+            let mut m = std::mem::take(&mut self.marks);
+            m.tick(ui.ctx(), &p, text_hash, &self.editor.buffers[active].text);
+            self.marks = m;
+        }
         self.diag_counts = (self.diag_cache.errors, self.diag_cache.warnings);
         // diag_cache の借用は、可変借用が要る第 2 次配線の準備が済んでから取る
         // (この束縛を上げると self を可変に触れなくなる)。
@@ -22123,6 +22752,12 @@ impl ZaivernApp {
             HashMap::new()
         };
         let bookmark_lines: HashSet<usize> = self.editor.buffers[active].bookmarks.iter().collect();
+        // ニーモニック付きブックマーク (crate::marks) の印。行 → 表示文字。
+        // **ガターは 1 系統しか持たない** — 既存の ◆ と同じ列に重ねて描く。
+        let mark_glyphs: HashMap<usize, char> = match &abs {
+            Some(p) => self.marks.store().glyphs(p),
+            None => HashMap::new(),
+        };
 
         // インデントガイド (鍵にキャレット行を含める = 強調ガイドが行依存のため)
         let tab_w = crate::highlight::DEFAULT_TAB_WIDTH;
@@ -23304,26 +23939,48 @@ impl ZaivernApp {
         let fold_x = gutter_edge - FOLD_MARKER_W;
         let mark_x = gutter_edge - FOLD_MARKER_W * 2.0;
         let mut toggle_line: Option<usize> = None;
+        let mut mark_toggle_line: Option<usize> = None;
         if structure_on {
-            let hit = ui
-                .interact(
-                    egui::Rect::from_min_max(
-                        egui::pos2(mark_x, vis.top()),
-                        egui::pos2(gutter_edge, vis.bottom()),
-                    ),
-                    ed_id.with("fold-gutter"),
-                    egui::Sense::click(),
-                )
-                .interact_pointer_pos();
+            let gutter_resp = ui.interact(
+                egui::Rect::from_min_max(
+                    egui::pos2(mark_x, vis.top()),
+                    egui::pos2(gutter_edge, vis.bottom()),
+                ),
+                ed_id.with("fold-gutter"),
+                egui::Sense::click(),
+            );
+            let hit = gutter_resp.interact_pointer_pos();
+            // 印の列 (折りたたみ列より手前) のホバーだけ案内を出す。
+            // **打鍵表記はキーマップから作る** — ベタ書きしない。
+            if gutter_resp
+                .hover_pos()
+                .map(|p| p.x < fold_x)
+                .unwrap_or(false)
+            {
+                let hint = crate::keybinds::key_hint(ui.ctx(), BindAction::MarkToggleMnemonic);
+                let _ = gutter_resp.on_hover_text(crate::marks::gutter_tooltip(&hint));
+            }
             for (src, y0, _) in &row_lines {
-                if bookmark_lines.contains(src) {
-                    painter.text(
+                match mark_glyphs.get(src) {
+                    // ニーモニック付きはアイコン + 文字 (0.75 倍・中央)
+                    Some(g) => crate::marks::paint_gutter_glyph(
+                        &painter,
                         egui::pos2(mark_x, *y0),
-                        Align2::LEFT_TOP,
-                        "◆",
-                        font.clone(),
+                        row_h,
+                        *g,
                         theme_accent,
-                    );
+                        theme_bg,
+                    ),
+                    None if bookmark_lines.contains(src) => {
+                        painter.text(
+                            egui::pos2(mark_x, *y0),
+                            Align2::LEFT_TOP,
+                            "◆",
+                            font.clone(),
+                            theme_accent,
+                        );
+                    }
+                    None => {}
                 }
                 if let Some(folded) = fold_marks.get(src) {
                     painter.text(
@@ -23337,6 +23994,9 @@ impl ZaivernApp {
             }
             if let Some(p) = hit {
                 toggle_line = fold_click_line(&row_lines, &fold_marks, fold_x, p);
+                // 折りたたみの列より手前 (印の列) はブックマークの付け外し
+                let rows: Vec<(usize, f32)> = row_lines.iter().map(|(l, y, _)| (*l, *y)).collect();
+                mark_toggle_line = crate::marks::gutter_click_line(&rows, row_h, mark_x, fold_x, p);
             }
         }
 
@@ -23486,6 +24146,14 @@ impl ZaivernApp {
                 }
                 // 折りたたみ表示への打鍵も原文側の履歴へ 1 段として積む
                 b.apply_edit(next, ed);
+                let spliced_text = b.text.clone();
+                // 増減が分かっている編集は差分を待たずに追従させる
+                // (`marks` の経路 1。デバウンス後の一括更新より 1 テンポ速い)
+                if delta != 0 {
+                    if let Some(p) = path_clone.clone() {
+                        self.marks.note_edit(&p, at, delta, &spliced_text);
+                    }
+                }
                 // 表示テキストは次フレームで作り直す
                 self.fold_view = None;
                 spliced = true;
@@ -23579,6 +24247,15 @@ impl ZaivernApp {
                     self.lsp_pending.insert(p, (text, Instant::now(), key));
                 }
             }
+        }
+
+        // ガターの印をクリックしていたらここで付け外しする。
+        // 描画中は `self` の別フィールドを不変借用しているので、
+        // トーストを出せるのはこの位置まで来てから (複数キャレットと同じ流儀)。
+        if let (Some(l), Some(p)) = (mark_toggle_line, path_clone) {
+            let text = self.editor.buffers[active].text.clone();
+            let out = self.marks.quick_toggle(&p, l, &text);
+            self.toast(crate::marks::toggle_message(&out), true);
         }
     }
 
@@ -23687,6 +24364,12 @@ impl ZaivernApp {
                 tr("チェックポイント: 今すぐ取る"),
                 String::new(),
                 Cmd::CheckpointNow,
+            ),
+            (
+                "🕰".into(),
+                tr("ローカルヒストリ (取り消し履歴)"),
+                String::new(),
+                Cmd::LocalHistoryOpen,
             ),
             (
                 "🎛".into(),
@@ -23819,6 +24502,12 @@ impl ZaivernApp {
                 tr("ミニマップの表示切替"),
                 String::new(),
                 Cmd::ToggleMinimap,
+            ),
+            (
+                "🐚".into(),
+                tr("シェル統合 (OSC 633) の切替 — コマンドの終了コードを画面から推測しない"),
+                String::new(),
+                Cmd::ToggleShellIntegration,
             ),
             (
                 "🔗".into(),
@@ -24375,6 +25064,30 @@ impl ZaivernApp {
                 Cmd::ClearBookmarks,
             ),
             (
+                "🔖".into(),
+                tr("ニーモニック付きブックマーク"),
+                fmt_key(BindAction::MarkToggleMnemonic),
+                Cmd::MarkToggleMnemonic,
+            ),
+            (
+                "🔖".into(),
+                tr("ブックマーク一覧"),
+                fmt_key(BindAction::MarksPanel),
+                Cmd::MarksPanel,
+            ),
+            (
+                "🔖".into(),
+                tr("ブックマークへジャンプ"),
+                fmt_key(BindAction::MarkJump),
+                Cmd::MarkJump,
+            ),
+            (
+                "🔖".into(),
+                tr("ブックマークをプロジェクト全体から消す"),
+                String::new(),
+                Cmd::MarksClearAll,
+            ),
+            (
                 "📑".into(),
                 tr("閉じたタブを開き直す"),
                 fmt_key(BindAction::ReopenClosedTab),
@@ -24732,6 +25445,9 @@ impl ZaivernApp {
         for (icon, label, cmd) in panels::ide_palette_entries() {
             cmds.push((icon, label, String::new(), cmd));
         }
+        // feature.rs のレジストリに登録された機能。**ここが唯一の差し込み口**で、
+        // 機能が増えてもこの 1 ブロックは変わらない (並列開発の衝突対策)。
+        cmds.extend(crate::feature::palette_entries());
         // 実行中のセッション毎に音声入力エントリを出す (パレットで「音声」検索用)
         for s in self.agents.sessions.iter().take(20) {
             cmds.push((
@@ -26125,6 +26841,121 @@ impl ZaivernApp {
         file_tree::move_back(from, to)?;
         self.retarget_buffers(from, to);
         Ok(())
+    }
+
+    /// which-key ポップアップ。chord の 1 打鍵目を握っている間だけ、
+    /// そこから続く打鍵の一覧を中央ビューの右下に出す。
+    ///
+    /// 以前はステータスバーへ「⌘K が押されました。待機中…」と 1 行出すだけで、
+    /// **次に何を押せるのかは画面のどこにも無かった**。中身は
+    /// [`crate::whichkey`] に閉じてあり、ここは材料を渡して結果を捌くだけ。
+    fn whichkey_ui(&mut self, ctx: &egui::Context) {
+        use crate::whichkey;
+        // 実データの行 (which-key.nvim の content plugin 相当)。
+        // 差分ファイル間移動の prefix を握っている間だけ作る。
+        let live = self.whichkey_live_rows();
+        let mut st = std::mem::take(&mut self.whichkey);
+        let out = whichkey::popup_ui(
+            ctx,
+            &mut st,
+            whichkey::Params {
+                pending: self.chord.pending(),
+                keys: &self.keys,
+                theme: &self.theme,
+                live: &live,
+                first_delay: whichkey::first_delay(self.cfg.whichkey_delay_ms),
+                area: ctx.available_rect(),
+                bottom_inset: 8.0,
+            },
+        );
+        self.whichkey = st;
+        self.apply_whichkey(out, ctx);
+    }
+
+    /// which-key が拾う打鍵をフレームの頭で取る (本文の TextEdit より先)。
+    /// 握っていないフレームでは**イベントに一切触らない**。
+    fn whichkey_keys(&mut self, ctx: &egui::Context) {
+        // このフレームの実データ行をここで 1 回だけ確定させる。描画側も同じ
+        // ものを見るので、行番号と実体がずれない。
+        self.whichkey_live = self.scan_whichkey_live();
+        // 変換中の生キーは IME のものであってアプリのものではない。判定は
+        // `handle_shortcuts` が直前に入れた値を読む (2 か所で判定しない)。
+        if !self.chord.is_waiting()
+            || self.chord.ime_active()
+            || self.keybind_ui.recording.is_some()
+        {
+            return;
+        }
+        if let Some(out) = crate::whichkey::take_keys(ctx, self.whichkey_live.len()) {
+            self.apply_whichkey(out, ctx);
+        }
+    }
+
+    /// which-key の操作を捌く。打鍵経路と描画経路で同じ処理を通す。
+    fn apply_whichkey(&mut self, out: crate::whichkey::Outcome, ctx: &egui::Context) {
+        use crate::whichkey::Outcome;
+        match out {
+            Outcome::None => {}
+            // 1 打鍵戻す。いまの chord は 2 打鍵までなので、戻り切ったら待機ごと捨てる。
+            Outcome::Pop => {
+                if !self.whichkey.pop() || !self.whichkey.is_active() {
+                    self.chord.clear();
+                    self.whichkey.clear();
+                }
+                crate::perf::repaint(ctx, "whichkey");
+            }
+            // 検索できる全ショートカット一覧へ抜ける (2 つ目の一覧は作らない)
+            Outcome::OpenAll => {
+                self.chord.clear();
+                self.whichkey.clear();
+                self.shortcuts_open = true;
+            }
+            Outcome::Pick(i) => {
+                let path = self.whichkey_live.get(i).map(|(p, _, _)| p.clone());
+                self.chord.clear();
+                self.whichkey.clear();
+                if let Some(p) = path {
+                    self.apply_cmd(Cmd::OpenRecentFile(p), ctx);
+                }
+            }
+        }
+    }
+
+    /// which-key に出す実データの行。**差分ファイル間移動 (`]f` / `[f`) の
+    /// prefix を握っている間だけ**、いま変更のあるファイルを並べる。
+    ///
+    /// `]f` は「次の変更ファイルへ」を目隠しで撃つ打鍵だが、握っているだけで
+    /// 行き先が見えて番号で直接飛べる。判定は打鍵をベタ書きせず
+    /// **キーバインド表から引く** (再割り当てされても付いてくる)。
+    fn whichkey_diff_prefix_held(&self) -> bool {
+        let Some(sc) = self.chord.pending() else {
+            return false;
+        };
+        [BindAction::DiffNextFile, BindAction::DiffPrevFile]
+            .into_iter()
+            .any(|a| crate::keybinds::same_stroke(self.keys.binding(a).first(), sc))
+    }
+
+    /// 実データ行の実体を作る (フレームに 1 回。`git` は 1 回も起動しない)。
+    fn scan_whichkey_live(&self) -> Vec<(PathBuf, String, crate::git::FileStatus)> {
+        if !self.whichkey_diff_prefix_held() {
+            return Vec::new();
+        }
+        self.gitinfo.changed_paths(crate::whichkey::MAX_LIVE_ROWS)
+    }
+
+    /// 実体を画面の行へ写す。`self.whichkey_live` と 1 対 1 で並ぶ。
+    fn whichkey_live_rows(&self) -> Vec<crate::whichkey::LiveRow> {
+        self.whichkey_live
+            .iter()
+            .map(|(_, rel, st)| {
+                let (_, mark, _) = crate::file_tree::git_status_style(*st, &self.theme);
+                crate::whichkey::LiveRow {
+                    desc: format!("{mark}  {rel}"),
+                    detail: rel.clone(),
+                }
+            })
+            .collect()
     }
 
     fn toasts_ui(&mut self, ctx: &egui::Context) {
@@ -28868,6 +29699,10 @@ impl ZaivernApp {
         self.poll_voice(ctx);
 
         self.handle_shortcuts(ctx);
+        // which-key が拾う打鍵 (⌫ / ? / 番号) は **パネルを描く前に**取る。
+        // ポップアップ自身は最後に描くが、そのころには本文の TextEdit が
+        // Backspace を食べ終わっている (フォーカスがあれば必ず取る)。
+        self.whichkey_keys(ctx);
         // ⌃Tab の切替は**修飾キーを離したフレーム**で確定する。
         // ショートカット処理の直後に見る (押した同じフレームで確定させない)。
         self.tab_switcher_tick(ctx);
@@ -28876,7 +29711,11 @@ impl ZaivernApp {
         self.handle_zoom_gesture(ctx);
         // Keybinds を持てない描画側 (ターミナルの右クリックメニュー等) へ
         // 打鍵表記を配る。ベタ書きを増やさないための唯一の経路。
-        crate::keybinds::publish_key_hints(ctx, &self.keys, &[BindAction::Find]);
+        crate::keybinds::publish_key_hints(
+            ctx,
+            &self.keys,
+            &[BindAction::Find, BindAction::MarkToggleMnemonic],
+        );
 
         // メニューバー経由のエディタ操作 (元に戻す/貼り付け等) を、パネル描画前に
         // フォーカス復帰 + イベント注入で TextEdit へ届ける
@@ -29306,9 +30145,16 @@ impl ZaivernApp {
         self.stop_all_confirm_ui(ctx);
         self.worktree_confirm_ui(ctx);
         self.checkpoint_ui(ctx);
+        self.local_history_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
+        // feature.rs のレジストリに登録された機能のオーバーレイ。
+        // **ここが唯一の描画差し込み口**で、機能が増えてもこの 1 行は
+        // 変わらない (並列開発の衝突対策)。トーストより手前に置いて、
+        // 通知が機能のオーバーレイに隠れないようにしておく。
+        crate::feature::draw_all(self, ctx);
         self.toasts_ui(ctx);
+        self.whichkey_ui(ctx);
 
         // デスクトップペット 🐾
         if self.cfg.show_pet {
@@ -29519,6 +30365,59 @@ impl ZaivernApp {
         }
     }
 
+    /// ACP パネルを開閉する (`crate::acp::FEATURE` から呼ばれる)。
+    ///
+    /// **オーバーレイ**なので中央ビューを奪わない (起動しただけで画面が激変しない)。
+    pub fn toggle_acp_panel(&mut self) {
+        self.acp.open = !self.acp.open;
+        if self.acp.open {
+            self.toast(
+                tr("🛰 ACP: 構造化プロトコルでエージェントを駆動します"),
+                true,
+            );
+        }
+    }
+
+    /// ACP (構造化プロトコル) の 1 フレーム。
+    ///
+    /// 受信の畳み込みとオーバーレイの描画をここ 1 か所へ集める。接続が
+    /// 0 本のときは**何も起きない** (設計原則 3: アイドルのコストはゼロ)。
+    pub fn acp_tick(&mut self, ctx: &egui::Context) {
+        if self.acp.is_empty() && !self.acp.open {
+            return;
+        }
+        // 未保存のエディタバッファを公開する。`fs/read_text_file` が
+        // ディスクではなく「いま画面に見えている内容」を返せる = エディタを
+        // 持つクライアントだけの強み。署名が変わらなければ本文は読まない。
+        self.acp.sync_unsaved(
+            self.editor
+                .buffers
+                .iter()
+                .filter(|b| b.dirty())
+                .filter_map(|b| {
+                    b.path
+                        .as_deref()
+                        .map(|p| (p, b.history.revision(), b.text.as_str()))
+                }),
+        );
+        let theme = self.theme.clone();
+        let cwd = self.agent_cwd();
+        let toasts = self.acp.frame(
+            ctx,
+            &theme,
+            &mut self.agents.approvals,
+            &self.roots.clone(),
+            &cwd,
+        );
+        for (msg, ok) in toasts {
+            if ok {
+                self.toast(msg, true);
+            } else {
+                self.toast_warn(msg);
+            }
+        }
+    }
+
     /// ツアーからの「これを開いておいて」を実行する。
     ///
     /// 実行できなくても構わない設計 (アンカーが現れなければツアー側が
@@ -29537,6 +30436,7 @@ impl ZaivernApp {
                 self.approvals_view = false;
                 self.mcp_view = false;
                 self.skills_view = false;
+                self.spec_view = false;
             }
             TA::ShowCockpit => {
                 self.cockpit = true;
@@ -29549,6 +30449,7 @@ impl ZaivernApp {
                 self.approvals_view = false;
                 self.mcp_view = false;
                 self.skills_view = false;
+                self.spec_view = false;
             }
             TA::ShowDeck => {
                 self.deck = true;
@@ -29558,6 +30459,7 @@ impl ZaivernApp {
                 self.approvals_view = false;
                 self.mcp_view = false;
                 self.skills_view = false;
+                self.spec_view = false;
             }
             TA::OpenPalette => self.palette.open_commands(),
             TA::OpenRaceForm => {
@@ -31766,6 +32668,7 @@ impl ZaivernApp {
 
     fn menu_windows_ui(&mut self, ctx: &egui::Context) {
         self.goto_line_window(ctx);
+        self.marks_windows(ctx);
         self.git_commit_window(ctx);
         self.git_history_window(ctx);
         self.problems_window(ctx);
@@ -32013,6 +32916,84 @@ impl ZaivernApp {
         }
         let subtitle = self.rel_label(&top);
         self.open_multibuffer(mbuf::Source::Changes, &subtitle, &seeds);
+    }
+
+    /// LSP の documentSymbol を `@` ピッカーが読める形へ落とす。
+    ///
+    /// **`@` ピッカーは LSP が出した範囲を「正確 (=)」として扱う。**
+    /// LSP が動いていない言語は `mention::scan_symbols` の近似 (≈) で補う。
+    fn rebuild_mention_symbols(&mut self) {
+        self.mention_syms.clear();
+        let Some(path) = self.lsp_symbols_path.clone() else {
+            return;
+        };
+        let Some(root) = self.roots.first() else {
+            return;
+        };
+        let Some(rel) = crate::ignore::rel_slash(root, &path) else {
+            return;
+        };
+        // documentSymbol は入れ子を持つ。子も含めて平らにし、
+        // それぞれの `range` (本体全体) をそのまま添付範囲に使う。
+        let mut ranges: Vec<(String, usize, usize, usize, u8)> = Vec::new();
+        collect_symbol_ranges(&self.lsp_symbols, &mut ranges);
+        for (name, start, end, end_col, kind) in ranges {
+            self.mention_syms.push(mention::SymbolHit {
+                name,
+                kind_label: symbol_kind_label(kind).to_string(),
+                rel: rel.clone(),
+                start_line: start,
+                end_line: end,
+                end_col: Some(end_col),
+                exact: true,
+            });
+        }
+    }
+
+    /// `@` の確定で「App しか持っていない本文」を求められたら返す。
+    fn serve_mention_need(&mut self, need: mention::Need) {
+        match need {
+            mention::Need::Terminal { token, id } => {
+                let text = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| {
+                        s.screen_tail_lines(mention::TERM_TAIL_ROWS, mention::TERM_TAIL_COLS)
+                            .join("\n")
+                    })
+                    .unwrap_or_else(|| tr("その端末はもうありません"));
+                self.mention.provide(&token, text, mention::Keep::Tail);
+            }
+            mention::Need::Problems { token } => {
+                let body = self
+                    .collect_problems()
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}:{}:{}: [{}] {}",
+                            p.path.display(),
+                            p.line + 1,
+                            p.col + 1,
+                            severity_word(p.severity),
+                            p.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.mention.provide(&token, body, mention::Keep::Head);
+            }
+        }
+    }
+
+    /// 送信直前に `@` 添付を本文へ展開する。宛先が 1 体なら、その CLI の
+    /// ファイル参照記法 (`agents.rs` のカタログ) に従って重複を省く。
+    fn expand_mentions(&self, text: &str, to: Option<u64>, ledger: ComposerTarget) -> String {
+        let cmd = to
+            .and_then(|id| self.agents.sessions.iter().find(|s| s.id == id))
+            .map(|s| s.command.clone());
+        self.mention.expand_for(text, cmd.as_deref(), ledger)
     }
 
     /// ワークスペース全体の診断を集める。
@@ -36464,6 +37445,7 @@ mod super_agent_tests {
             command: "claude".into(),
             cwd: std::path::PathBuf::new(),
             raw_log: None,
+            shell: None,
         }
     }
 
@@ -38234,6 +39216,9 @@ mod wave2_tests {
             ("ToggleFold", "ToggleFold"),
             ("UnfoldAll", "UnfoldAll"),
             ("ToggleBookmark", "ToggleBookmark"),
+            ("MarkToggleMnemonic", "MarkToggleMnemonic"),
+            ("MarksPanel", "MarksPanel"),
+            ("MarkJump", "MarkJump"),
             ("ReopenClosedTab", "ReopenClosedTab"),
             ("LspCompletion", "LspCompletion"),
             ("LspReferences", "LspReferences"),
@@ -40103,31 +41088,44 @@ mod cockpit_layout_tests {
     /// 「🛡 承認」「🔌 MCP」「🧩 Skills」を独立した bool で持つ以上、描く直前に畳む。
     #[test]
     fn ボトムパネルのビューは常に一つだけ() {
-        // (承認, MCP, Skills) → 描くもの
+        // (承認, MCP, Skills, Spec) → 描くもの
         let table = [
-            (false, false, false, BottomView::Terminal),
-            (true, false, false, BottomView::Approvals),
-            (false, true, false, BottomView::Mcp),
-            (false, false, true, BottomView::Skills),
-            // 複数立っていても 1 つ (承認 > MCP > Skills)
-            (true, true, true, BottomView::Approvals),
-            (false, true, true, BottomView::Mcp),
+            (false, false, false, false, BottomView::Terminal),
+            (true, false, false, false, BottomView::Approvals),
+            (false, true, false, false, BottomView::Mcp),
+            (false, false, true, false, BottomView::Skills),
+            (false, false, false, true, BottomView::Spec),
+            // 複数立っていても 1 つ (承認 > MCP > Skills > Spec)
+            (true, true, true, true, BottomView::Approvals),
+            (false, true, true, true, BottomView::Mcp),
+            (false, false, true, true, BottomView::Skills),
         ];
-        for (a, m, s, want) in table {
-            assert_eq!(bottom_view(a, m, s), want, "承認={a} MCP={m} Skills={s}");
+        for (a, m, s, p, want) in table {
+            assert_eq!(
+                bottom_view(a, m, s, p),
+                want,
+                "承認={a} MCP={m} Skills={s} Spec={p}"
+            );
         }
-        // 全 8 通りで必ず 1 つの値になる (= 重ねようがない)
+        // 全 16 通りで必ず 1 つの値になる (= 重ねようがない)
         for a in [false, true] {
             for m in [false, true] {
                 for s in [false, true] {
-                    let v = bottom_view(a, m, s);
-                    let hits = [
-                        v == BottomView::Terminal,
-                        v == BottomView::Approvals,
-                        v == BottomView::Mcp,
-                        v == BottomView::Skills,
-                    ];
-                    assert_eq!(hits.iter().filter(|x| **x).count(), 1, "a={a} m={m} s={s}");
+                    for p in [false, true] {
+                        let v = bottom_view(a, m, s, p);
+                        let hits = [
+                            v == BottomView::Terminal,
+                            v == BottomView::Approvals,
+                            v == BottomView::Mcp,
+                            v == BottomView::Skills,
+                            v == BottomView::Spec,
+                        ];
+                        assert_eq!(
+                            hits.iter().filter(|x| **x).count(),
+                            1,
+                            "a={a} m={m} s={s} p={p}"
+                        );
+                    }
                 }
             }
         }
@@ -40139,9 +41137,8 @@ mod cockpit_layout_tests {
     fn ボトムパネルの分岐は畳んだ値を見る() {
         let src = &include_str!("app.rs").replace("\r\n", "\n");
         assert!(
-            src.contains(
-                "let view = bottom_view(self.approvals_view, self.mcp_view, self.skills_view);"
-            ),
+            src.contains("let view = bottom_view(")
+                && src.contains("self.spec_view,\n                );"),
             "描く直前に 1 つへ畳んでいない"
         );
         assert!(
@@ -40149,6 +41146,7 @@ mod cockpit_layout_tests {
                 && src.contains("BottomView::Approvals => {")
                 && src.contains("BottomView::Mcp => {")
                 && src.contains("BottomView::Skills => {")
+                && src.contains("BottomView::Spec => {")
                 && src.contains("BottomView::Terminal => {"),
             "ボトムパネルの分岐が match になっていない"
         );

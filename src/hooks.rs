@@ -54,6 +54,13 @@ pub struct HookTarget {
     pub events: &'static [(&'static str, ProtoState, bool)],
     /// ツール名 → 状態の細分表。
     pub tools: &'static [(&'static str, ProtoState)],
+    /// 書き込み系ツールのペイロードから**対象ファイルのパス**を取り出すキー
+    /// (優先順)。`tool_input.<key>` を順に見る。
+    ///
+    /// ファイル所有リース ([`crate::lease`]) の強制がここを読む。
+    /// **キー名はベンダーごとに違うのでカタログに置く** — 機構側
+    /// (`lease::target_path`) はリテラルを 1 つも持たない。
+    pub write_path_keys: &'static [&'static str],
     /// **実機で確認した方法**。空は禁止 (カタログ整合テストが落とす)。
     pub verified: &'static str,
 }

@@ -37,7 +37,29 @@ image=${ZAIVERN_LINUX_IMAGE:-rust:1.90-slim}
 
 # **ホストの target/ を汚さないのが要点。** 同じディレクトリを使うと Linux の
 # 成果物で macOS のビルドが無効化され、戻ったときにフルビルドが走る。
-target=${ZAIVERN_LINUX_TARGET:-/tmp/zaivern-linux-target}
+#
+# ただし以前は `CARGO_TARGET_DIR` をコンテナ内の `/tmp` に置いていたため、
+# `--rm` で毎回捨てられて **全実行がコールドビルド**になっていた。隔離
+# ワークツリーで 6 本を同時に走らせたところ、6 つのフルビルドがメモリを
+# 食い尽くして **OOM kill (signal: 9)** でコンパイル途中に落ちた (実測)。
+#
+# そこで **docker の名前付きボリュームをワークツリーごとに 1 つ**持たせる:
+#   * ボリュームは Docker VM 側の FS なので、macOS のバインドマウントと違い
+#     cargo が遅くならない
+#   * `--rm` を跨いで残るので 2 回目以降が warm になる
+#   * 名前にワークツリー由来のスラッグを混ぜるので、**同時に走る別の
+#     ワークツリーと絶対に取り合わない** (cargo のビルドロックは
+#     target ディレクトリ単位なので、共有すると直列化する)
+# ホスト側の実体を触らせないため、パスではなくボリューム名で分ける。
+if [ -n "${ZAIVERN_LINUX_TARGET:-}" ]; then
+    # 明示指定があればホストのパスをそのまま使う (従来どおりの逃げ道)
+    target_mount="$ZAIVERN_LINUX_TARGET"
+    mkdir -p "$target_mount"
+else
+    # ルートの絶対パスから安定したスラッグを作る (パスの直書きをしない)
+    slug=$(printf '%s' "$root" | cksum | cut -d' ' -f1)
+    target_mount="zaivern-lx-$(basename "$root")-$slug"
+fi
 
 if ! docker info >/dev/null 2>&1; then
     echo "docker が動いていません。Docker Desktop を起動してください。" >&2
@@ -51,9 +73,25 @@ else
     cmd="cargo test --bin zai ${filter}"
 fi
 
+# **cargo のレジストリも毎回消えていた。** target だけ残しても、crates.io の
+# インデックスと展開済みソースが `--rm` で捨てられるので、2 回目以降も依存の
+# 取得からやり直しになる。ここは**全ワークツリーで共有してよい** (読み取りが
+# 主で、cargo がファイルロックを持つ) ので 1 つにまとめる。
+registry_vol=${ZAIVERN_LINUX_REGISTRY:-zaivern-lx-cargo-registry}
+
 echo "== Linux ($image) で実行: $cmd"
+echo "   target:   $target_mount (ワークツリーごとに分離。2 回目以降は warm)"
+echo "   registry: $registry_vol (全ワークツリーで共有)"
+# `CARGO_PROFILE_TEST_DEBUG=0` — Docker VM の RAM は実測 7.65GiB しか無く、
+# 並列エージェントのコンテナが同時に居ると `zai` のテストバイナリを
+# `debuginfo=2` でリンクする瞬間に **OOM kill (signal: 9)** される。
+# 素の "could not compile" としてしか出ないのでコードの失敗と誤読しやすい。
+# Linux 側の目的は**挙動の確認**でデバッガを当てることではないので落とす。
 exec docker run --rm \
     -v "$root":/w -w /w \
-    -e CARGO_TARGET_DIR="$target" \
+    -v "$target_mount":/target \
+    -v "$registry_vol":/usr/local/cargo/registry \
+    -e CARGO_TARGET_DIR=/target \
+    -e CARGO_PROFILE_TEST_DEBUG=0 \
     "$image" \
     sh -c "$cmd"

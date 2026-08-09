@@ -20,7 +20,7 @@
 //! `coordinator` 側はそれを [`coordinator::AssignRefusal::PreviousHolderNotStopped`]
 //! で断るので、ここは**その拒否を回避せず、順序を守って進めるだけ**。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -942,11 +942,18 @@ fn task_list(
 }
 
 /// タスク作成ウィンドウ。開いていないときは何もしない。
+/// タスク作成フォーム。
+///
+/// `owners` は **ファイルパス → いま触っているワークツリーの表示名**
+/// ([`crate::conflict::Report::all_owners`])。指示文の中に既に誰かが
+/// 触っているファイルが出てきたら、**投げる前に**警告を出す。
+/// 空の表を渡せば警告は 1 ピクセルも描かない。
 pub fn task_form_ui(
     st: &mut OrchState,
     ctx: &egui::Context,
     theme: &Theme,
     rows: &[SessionRow],
+    owners: &BTreeMap<String, Vec<String>>,
 ) -> Vec<OrchAction> {
     if !st.form_open {
         return Vec::new();
@@ -978,6 +985,48 @@ pub fn task_form_ui(
                     .desired_rows(4)
                     .hint_text(tr("担当するエージェントへそのまま送られます")),
             );
+
+            // ── ディスパッチ前チェック ────────────────────────────
+            // 既に別のワークツリーが触っているファイルを名指ししていたら、
+            // **始まる前に** 知らせる。当たらなければ高さを 1 px も取らない。
+            let warns = crate::conflict::dispatch_check(
+                &format!("{} {}", st.title, st.description),
+                owners,
+            );
+            if !warns.is_empty() {
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(theme.panel_alt)
+                    .rounding(4.0)
+                    .inner_margin(egui::Margin::same(6.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(crate::conflict::dispatch_summary(&warns))
+                                .small()
+                                .color(theme.warn)
+                                .strong(),
+                        );
+                        for w in warns.iter().take(5) {
+                            let line = format!("{} — {}", w.path, w.owners.join(" ・ "));
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&line).small().color(theme.text_dim),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(line);
+                        }
+                        ui.label(
+                            RichText::new(tr(
+                                "同じ場所を 2 体で触ると、マージのときに解決コストを払います。\n\
+                                 別のファイルへ割るか、担当を先の相手に合わせてください。",
+                            ))
+                            .small()
+                            .color(theme.text_dim),
+                        );
+                    });
+            }
 
             ui.add_space(6.0);
             ui.label(
