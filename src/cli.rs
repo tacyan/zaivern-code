@@ -210,6 +210,7 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "worktree"
             | "session"
             | "agent"
+            | "hook"
             | "help"
             | "--help"
             | "-h"
@@ -225,7 +226,7 @@ pub fn is_cli_subcommand(word: &str) -> bool {
 fn yields_to_directory(word: &str) -> bool {
     matches!(
         word,
-        "app" | "firewall" | "worktree" | "session" | "agent" | "help"
+        "app" | "firewall" | "worktree" | "session" | "agent" | "hook" | "help"
     )
 }
 
@@ -310,6 +311,10 @@ agent (対応エージェント CLI):
 ";
 
 const HELP_TAIL: &str = "\
+ベンダーフック (エージェント CLI から自動的に呼ばれます — 手で打つものではありません):
+  zai hook --zaivern <エージェント> <イベント>
+                                        フック通知を受け取る (標準入力の JSON を投函)
+
 その他:
   zai help                              このヘルプ
   zai <サブコマンド> --help             そのサブコマンドの使い方だけを表示
@@ -358,6 +363,10 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         "worktree" => finish(worktree_dispatch(rest)),
         "session" => finish(session_dispatch(rest)),
         "agent" => finish(agent_dispatch(rest)),
+        // ベンダー提供フックの受け口 (状態ラダー 2 段目)。
+        // ベンダー CLI がこれを呼ぶ。GUI が居なくても成功して構わない
+        // (投函箱に置くだけ — GUI は次のサンプリングで拾う)。
+        "hook" => run_hook(rest),
         other => match run_remote(other, rest) {
             Ok(out) => {
                 if !out.is_empty() {
@@ -371,6 +380,33 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
             }
         },
     })
+}
+
+// ───────────────────────── hook: ベンダーフックの受け口 ─────────────────────────
+
+/// `zai hook --zaivern <agent> <event>` — ベンダー CLI のフックから呼ばれる。
+///
+/// 標準入力の JSON ペイロードを読み、`~/.zaivern/hooks/` へ 1 ファイル置くだけ。
+/// **ポートは開かない** (remote.rs の 8899〜 と衝突させない)。GUI が動いていなくても
+/// 失敗しない — フックがエラーを返すとベンダー CLI 側の動作を妨げるため。
+///
+/// 引数の並びは [`crate::supervisor::hooks::HOOK_MARK`] が作る形と対。
+fn run_hook(args: &[String]) -> i32 {
+    use crate::supervisor::hooks;
+    // "--zaivern" は「これは Zaivern が仕掛けたフックだ」という目印
+    // (設置/解除で自分の項目だけを見分けるために要る)。
+    let rest: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
+    let agent = rest.first().copied().unwrap_or_default();
+    let event = rest.get(1).copied().unwrap_or_default();
+    let mut payload = String::new();
+    let _ = std::io::stdin().read_to_string(&mut payload);
+    let ev = hooks::event_from_payload(agent, event, &payload);
+    let _ = hooks::post(&hooks::inbox_dir(), &ev);
+    0
 }
 
 // ───────────────────────── status: 実行検知 (インスタンス不要) ─────────────────────────

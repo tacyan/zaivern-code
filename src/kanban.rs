@@ -23,10 +23,19 @@
 //!
 //! ## 状態の出どころ (重要 — CLAUDE.md 原則 #4)
 //! 画面のテキストを読んだだけの推定を「事実」として扱わない。
-//! [`classify`] は強い信号から順に見て、必ず出どころ ([`Source`]) を添えて返す:
-//! プロセス生死 → 承認プロンプト検出 (terminal.rs) → レート制限検出 (terminal.rs)
-//! → 見張りの状態判定 (supervisor.rs) → 最後の手段として画面末尾の表引き。
-//! 画面推定のときだけ UI に「推定」(≈) と出す。
+//! [`classify_stream`] は強い信号から順に見て、必ず出どころ ([`Source`]) を
+//! 添えて返す。**ラダー**は上から:
+//!
+//! 1. プロセス生死 (事実)
+//! 2. 承認プロンプト検出 / レート制限検出 — 人を呼ぶ信号は握り潰さない
+//! 3. **構造化プロトコル** (`supervisor::protocol` — ベンダー CLI の JSONL)
+//! 4. **ベンダー提供フック** (`supervisor::hooks` — CLI からの通知)
+//! 5. 見張りの状態判定 (supervisor.rs)
+//! 6. 最後の手段として画面末尾の表引き
+//!
+//! **いま何段目に居るかは必ずカードに出す** ([`Source::mark`]):
+//! `◆` 構造化 / `◇` フック / `✓` その他の事実 / `≈` 画面推定。
+//! 上位段が沈黙すれば判定は自動的に下の段へ降り、印もそのように変わる。
 //!
 //! さらに**確信度の床**を敷いてある ([`Read::lane`]): 画面推定だけの判定は
 //! 作業系レーンまでしか動かせない。人を呼ぶ「承認待ち」「停滞・異常」と、
@@ -82,7 +91,8 @@ use crate::theme::Theme;
 /// 「カードが多いときは分散していた方が見やすい」というオーナー判断で 8 本へ戻した。
 ///
 /// 畳んだときに入れた正しい修正はそのまま残している:
-/// 確信度の床 ([`Read::lane`])・出どころの表示 (✓/≈)・二重計上しない集計 ([`Tally`])。
+/// 確信度の床 ([`Read::lane`])・出どころの表示 ([`Source::mark`])・
+/// 二重計上しない集計 ([`Tally`])。
 ///
 /// 細かく分けるほどカードはよく動くので、移動には [`Column::hold_ms`] の
 /// ヒステリシスを掛ける (思考↔編集↔実行↔検証 の往復でちらつかせない)。
@@ -356,8 +366,12 @@ impl Activity {
 /// 判定の**出どころ**。画面推定を事実として扱わないために必ず持ち回る。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source {
-    /// プロセスの生死 (最強)
+    /// プロセスの生死 (**事実**。推測の段位より上)
     Process,
+    /// ベンダー CLI の構造化イベント列 (`supervisor::protocol`) — ラダー 1 段目
+    Protocol,
+    /// ベンダー提供フックからの通知 (`supervisor::hooks`) — ラダー 2 段目
+    Hook,
     /// terminal.rs の承認プロンプト検出
     Prompt,
     /// terminal.rs のレート制限検出
@@ -373,10 +387,28 @@ impl Source {
     pub fn label(self) -> &'static str {
         match self {
             Source::Process => "プロセス",
+            Source::Protocol => "構造化プロトコル",
+            Source::Hook => "ベンダーフック",
             Source::Prompt => "プロンプト検出",
             Source::RateLimit => "上限検出",
             Source::Supervisor => "見張り",
             Source::Screen => "画面推定",
+        }
+    }
+
+    /// **いま何段目に居るかを 1 文字で出す印** (CLAUDE.md 原則 #4 の
+    /// 「どの段にいるかを UI に出す」)。
+    ///
+    /// - `◆` 構造化プロトコル (最上段。画面を 1 文字も読んでいない)
+    /// - `◇` ベンダーフック (2 段目。同じく画面を読んでいない)
+    /// - `✓` 事実だが下の段 (プロセス生死 / プロンプト検出 / 上限 / 見張り)
+    /// - `≈` 画面推定 (最下段。当てにならないかもしれない)
+    pub fn mark(self) -> &'static str {
+        match self {
+            Source::Protocol => "◆",
+            Source::Hook => "◇",
+            Source::Screen => "≈",
+            _ => "✓",
         }
     }
 
@@ -385,17 +417,27 @@ impl Source {
         matches!(self, Source::Screen)
     }
 
+    /// **画面に一切触れずに得た判定か** (ラダー上位 2 段)。
+    pub fn is_structured(self) -> bool {
+        matches!(self, Source::Protocol | Source::Hook)
+    }
+
     /// **信号の段位** (小さいほど強い)。CLAUDE.md 原則 #4 の優先順位そのもの:
     /// 構造化プロトコル > ベンダー提供フック > 状態ファイル > 画面スクレイプ。
+    ///
+    /// [`Source::Process`] だけは推測ではなく**事実**なので、この序列の外側
+    /// (いちばん上) に置いてある。
     ///
     /// レーンの判断はこの段位で足切りする ([`Read::lane`])。
     pub const fn rung(self) -> u8 {
         match self {
             Source::Process => 0,
-            Source::Prompt => 1,
-            Source::RateLimit => 2,
-            Source::Supervisor => 3,
-            Source::Screen => 4,
+            Source::Protocol => 1,
+            Source::Hook => 2,
+            Source::Prompt => 3,
+            Source::RateLimit => 4,
+            Source::Supervisor => 5,
+            Source::Screen => 6,
         }
     }
 }
@@ -819,8 +861,69 @@ pub fn classify_flow(
     tail: &[String],
     flow: Flow,
 ) -> Read {
+    classify_stream(running, attention, rate_limited, None, sup, tail, flow)
+}
+
+/// 構造化イベントから読んだ状態 → 看板のアクティビティ (**純関数**)。
+///
+/// 粗い代わりに**画面を 1 文字も読んでいない**。粗さは `detail`
+/// (ツール名・コマンド) が補う。
+pub fn activity_of(state: supervisor::protocol::ProtoState) -> Activity {
+    use supervisor::protocol::ProtoState as P;
+    match state {
+        P::Starting => Activity::Starting,
+        P::Thinking => Activity::Thinking,
+        P::Running => Activity::Running,
+        P::Editing => Activity::Editing,
+        P::Approval => Activity::Approval,
+        P::Idle => Activity::Idle,
+        P::Done => Activity::Exited,
+        // 失敗して終わったのは「完了」ではない。人が見るべき列へ置く。
+        P::Failed => Activity::Stalled,
+    }
+}
+
+/// [`classify_flow`] に**状態ラダー上位 2 段** ([`supervisor::LadderRead`]) を
+/// 足した本体 (純関数)。CLAUDE.md 設計原則 #4 の実装。
+///
+/// 優先順位 (上ほど強い):
+/// 1. プロセス生死 — 死んでいるのは**事実**。推測の出る幕ではない
+/// 2. 承認プロンプト検出 / レート制限検出 — **人を呼ぶ信号は決して握り潰さない**。
+///    ラダーの上段が「思考中」と言っていても、画面に本物の承認プロンプトが
+///    出ているなら人を呼ぶ (見落としのコストの方が高い)
+/// 3. **構造化プロトコル / ベンダーフック** — 画面に触れずに得た判定。
+///    ここが生きている限り、下の段 (見張り・画面推定) は一切見ない
+/// 4. 見張りの状態判定 → 画面末尾の表引き (従来どおり)
+///
+/// 上段が沈黙すれば `ladder` は `None` になり ([`supervisor::Supervisor::ladder_read`]
+/// が古い判定を返さない)、自動的に下の段へ降りる。降りたことは
+/// [`Source`] としてカードに出る。
+pub fn classify_stream(
+    running: bool,
+    attention: bool,
+    rate_limited: bool,
+    ladder: Option<&supervisor::LadderRead>,
+    sup: Option<supervisor::SessionState>,
+    tail: &[String],
+    flow: Flow,
+) -> Read {
     use supervisor::SessionState as S;
     let read = Read::new;
+    if running && !attention && !rate_limited {
+        if let Some(l) = ladder {
+            let src = match l.rung {
+                supervisor::Rung::Protocol => Source::Protocol,
+                supervisor::Rung::Hook => Source::Hook,
+            };
+            let detail = if l.detail.is_empty() {
+                // 補足が無いときは、せめて「どの段の何か」が判るようにする。
+                tr(l.state.label())
+            } else {
+                l.detail.clone()
+            };
+            return read(activity_of(l.state), src, detail);
+        }
+    }
     // 「動いている」ときの中身 — 画面末尾の表引き (推定と明示する)
     let working = |tail: &[String]| match classify_screen(tail) {
         Some((a, detail)) => read(a, Source::Screen, detail),
@@ -1464,6 +1567,12 @@ pub struct Card {
     pub running: bool,
     /// 見張り (supervisor.rs) の判定。[`classify`] が画面推定より優先して使う。
     pub sup: Option<supervisor::SessionState>,
+    /// **状態ラダー上位 2 段の判定** (`supervisor::Supervisor::ladder_of`)。
+    ///
+    /// 構造化プロトコル / ベンダーフックから来た「画面を読まずに得た事実」。
+    /// 生きている間は [`classify_stream`] が見張りより優先して採る。
+    /// 上段が沈黙すると `None` になり、判定は自動的に下の段へ降りる。
+    pub ladder: Option<supervisor::LadderRead>,
     /// ⚡/🛡 (権限モード対応エージェントのみ、他は "")
     pub permission_badge: &'static str,
     /// **指名スーパーエージェント (指揮官) か** ([`config::SuperAgentConfig`])。
@@ -1851,14 +1960,19 @@ impl KanbanState {
                 // 生の出力ストリームの裏取り — 見張りの「停滞/エラー多発」が
                 // 実際の進捗と矛盾していないかを、ここで初めて突き合わせる。
                 let flow = prev.map(|t| t.flow(now_ms)).unwrap_or_default();
+                // ラダー上位段 (構造化プロトコル / ベンダーフック) が生きて
+                // いれば、画面末尾は最初から見ない (CLAUDE.md 原則 #4)。
+                let ld = c.ladder.as_ref();
                 match (fresh, prev) {
                     (true, _) => {
-                        classify_flow(c.running, c.attention, rl, c.sup, &c.tail_lines, flow)
+                        classify_stream(c.running, c.attention, rl, ld, c.sup, &c.tail_lines, flow)
                     }
                     (false, Some(t)) => {
-                        classify_flow(c.running, c.attention, rl, c.sup, &t.tail, flow)
+                        classify_stream(c.running, c.attention, rl, ld, c.sup, &t.tail, flow)
                     }
-                    (false, None) => classify_flow(c.running, c.attention, rl, c.sup, &[], flow),
+                    (false, None) => {
+                        classify_stream(c.running, c.attention, rl, ld, c.sup, &[], flow)
+                    }
                 }
             };
 
@@ -3493,22 +3607,26 @@ fn card_ui(
                                 )
                                 .on_hover_text(tr("この状態が続いている時間"));
                             }
-                            // 画面テキストからの推定は必ず「推定」(≈) と断る。
+                            // **いま何段目に居るかを必ず出す** (CLAUDE.md 原則 #4)。
+                            // ◆ 構造化プロトコル / ◇ ベンダーフック (画面を読んで
+                            // いない) / ✓ その他の事実 / ≈ 画面推定。
                             // 人を呼ぶレーンのカードは「**何がここへ入れたか**」まで見せる。
                             if let Some(s) = source {
-                                let mark = if s.is_guess() { "≈" } else { "✓" };
                                 let why = match (&track, lane.loud()) {
                                     (Some(t), true) => {
                                         trf("このレーンに居る理由: {why}", &[("why", t.reason())])
                                     }
                                     _ => trf("判定の出どころ: {src}", &[("src", tr(s.label()))]),
                                 };
-                                ui.label(RichText::new(mark).size(9.0).color(if s.is_guess() {
+                                let col = if s.is_guess() {
                                     theme.warn
+                                } else if s.is_structured() {
+                                    theme.ok
                                 } else {
                                     theme.text_dim
-                                }))
-                                .on_hover_text(why);
+                                };
+                                ui.label(RichText::new(s.mark()).size(9.0).color(col))
+                                    .on_hover_text(why);
                             }
                             // 見張りが疑ったが、出力が続いていたので採らなかった判定。
                             // **レーンは動かさないが、握り潰しもしない。**
@@ -4281,6 +4399,225 @@ mod tests {
             let r = classify(true, false, false, Some(s), &editing);
             assert_eq!(r.activity, Activity::Stalled);
             assert_eq!(r.lane(), Column::Trouble);
+        }
+    }
+
+    // ── 状態ラダー上位 2 段 (CLAUDE.md 設計原則 #4) ────────────────────────
+
+    fn ladder(
+        rung: supervisor::Rung,
+        state: supervisor::protocol::ProtoState,
+    ) -> supervisor::LadderRead {
+        supervisor::LadderRead {
+            rung,
+            state,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn ラダー上位段が生きている間は画面推定を採らない() {
+        use supervisor::protocol::ProtoState as P;
+        use supervisor::Rung;
+        // 画面には「編集中」に見える残骸が出ているが、構造化段は「実行中」と言う。
+        let screen = vec!["⏺ Update(src/a.rs)".to_string()];
+        let l = ladder(Rung::Protocol, P::Running);
+        let r = classify_stream(
+            true,
+            false,
+            false,
+            Some(&l),
+            Some(S::Working),
+            &screen,
+            Flow::Unknown,
+        );
+        assert_eq!(
+            (r.activity, r.source),
+            (Activity::Running, Source::Protocol)
+        );
+        assert!(!r.source.is_guess(), "構造化段は推定ではない");
+        assert!(r.source.is_structured());
+        // フック段も同じく画面より上
+        let l = ladder(Rung::Hook, P::Editing);
+        let r = classify_stream(
+            true,
+            false,
+            false,
+            Some(&l),
+            Some(S::Working),
+            &screen,
+            Flow::Unknown,
+        );
+        assert_eq!((r.activity, r.source), (Activity::Editing, Source::Hook));
+        // 見張りが「異常」と言っていても、上位段が生きていればそちらを採る
+        // (「作業中なのに停滞・異常」の構造的な根治)
+        let l = ladder(Rung::Protocol, P::Thinking);
+        let r = classify_stream(
+            true,
+            false,
+            false,
+            Some(&l),
+            Some(S::Errored),
+            &screen,
+            Flow::Silent,
+        );
+        assert_eq!(
+            (r.activity, r.source),
+            (Activity::Thinking, Source::Protocol)
+        );
+        assert_eq!(r.lane(), Column::Thinking);
+    }
+
+    #[test]
+    fn 上位段が沈黙したら下位段へ降りる() {
+        use supervisor::protocol::ProtoState as P;
+        use supervisor::Rung;
+        let screen = vec!["⏺ Update(src/a.rs)".to_string()];
+        let l = ladder(Rung::Protocol, P::Running);
+        let up = classify_stream(
+            true,
+            false,
+            false,
+            Some(&l),
+            Some(S::Working),
+            &screen,
+            Flow::Unknown,
+        );
+        // 上位段が黙ると supervisor::ladder_read が None を返す = ここでは None
+        let down = classify_stream(
+            true,
+            false,
+            false,
+            None,
+            Some(S::Working),
+            &screen,
+            Flow::Unknown,
+        );
+        assert_eq!(up.source, Source::Protocol);
+        assert_eq!(down.source, Source::Screen, "降りた先は画面推定");
+        assert!(
+            down.source.rung() > up.source.rung(),
+            "段位が下がっていない"
+        );
+        // 降りたことが UI の印に出る
+        assert_eq!(up.source.mark(), "◆");
+        assert_eq!(down.source.mark(), "≈");
+        assert_ne!(up.source.mark(), down.source.mark());
+        // ホバーに出す理由にも出どころが載る
+        assert!(up.reason().contains(&tr(Source::Protocol.label())));
+        assert!(down.reason().contains(&tr(Source::Screen.label())));
+    }
+
+    #[test]
+    fn ラダーの段位は原則の優先順位どおり() {
+        // 構造化プロトコル > ベンダーフック > (プロンプト/上限/見張り) > 画面
+        assert!(Source::Protocol.rung() < Source::Hook.rung());
+        assert!(Source::Hook.rung() < Source::Prompt.rung());
+        assert!(Source::Screen.rung() > Source::Supervisor.rung());
+        // プロセス生死は「推測」ではなく事実なので、序列の外側 (最上位)
+        assert!(Source::Process.rung() < Source::Protocol.rung());
+        // 上位 2 段だけが「画面に触れていない」と名乗れる
+        for s in [Source::Protocol, Source::Hook] {
+            assert!(s.is_structured() && !s.is_guess());
+        }
+        for s in [
+            Source::Process,
+            Source::Prompt,
+            Source::RateLimit,
+            Source::Supervisor,
+            Source::Screen,
+        ] {
+            assert!(!s.is_structured());
+        }
+        // 印は段ごとに違う (どの段かが 1 文字で判る)
+        let marks: Vec<&str> = [
+            Source::Protocol,
+            Source::Hook,
+            Source::Supervisor,
+            Source::Screen,
+        ]
+        .iter()
+        .map(|s| s.mark())
+        .collect();
+        let mut uniq = marks.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), marks.len(), "段の印が重複している: {marks:?}");
+    }
+
+    #[test]
+    fn 人を呼ぶ信号は上位段でも握り潰さない() {
+        use supervisor::protocol::ProtoState as P;
+        use supervisor::Rung;
+        // 構造化段が「思考中」と言っていても、承認プロンプトが出ているなら人を呼ぶ
+        let l = ladder(Rung::Protocol, P::Thinking);
+        let r = classify_stream(
+            true,
+            true,
+            false,
+            Some(&l),
+            Some(S::Working),
+            &[],
+            Flow::Unknown,
+        );
+        assert_eq!((r.activity, r.source), (Activity::Approval, Source::Prompt));
+        // レート制限も同じ
+        let r = classify_stream(
+            true,
+            false,
+            true,
+            Some(&l),
+            Some(S::Working),
+            &[],
+            Flow::Unknown,
+        );
+        assert_eq!(
+            (r.activity, r.source),
+            (Activity::RateLimited, Source::RateLimit)
+        );
+        // 死んでいるのは事実。上位段の言い分より強い
+        let l = ladder(Rung::Protocol, P::Running);
+        let r = classify_stream(
+            false,
+            false,
+            false,
+            Some(&l),
+            Some(S::Working),
+            &[],
+            Flow::Unknown,
+        );
+        assert_eq!((r.activity, r.source), (Activity::Exited, Source::Process));
+    }
+
+    #[test]
+    fn 上位段の状態は看板のレーンへ正しく落ちる() {
+        use supervisor::protocol::ProtoState as P;
+        use supervisor::Rung;
+        let table: &[(P, Column)] = &[
+            (P::Starting, Column::Ready),
+            (P::Thinking, Column::Thinking),
+            (P::Running, Column::Running),
+            (P::Editing, Column::Editing),
+            (P::Approval, Column::Approval),
+            (P::Idle, Column::Ready),
+            (P::Done, Column::Done),
+            // 失敗して終わったものを「完了」に混ぜない
+            (P::Failed, Column::Trouble),
+        ];
+        for (state, want) in table {
+            let l = ladder(Rung::Hook, *state);
+            let r = classify_stream(
+                true,
+                false,
+                false,
+                Some(&l),
+                Some(S::Working),
+                &[],
+                Flow::Unknown,
+            );
+            assert_eq!(r.lane(), *want, "{state:?} のレーンが違う");
+            // 上位段は確信度の床に弾かれない (人を呼ぶ列にも入れる)
+            assert_eq!(r.lane(), r.activity.column());
         }
     }
 
@@ -5104,6 +5441,7 @@ mod tests {
             attention: false,
             running,
             sup: None,
+            ladder: None,
             permission_badge: "",
             commander: false,
             can_cycle: false,

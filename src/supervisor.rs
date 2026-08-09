@@ -23,6 +23,69 @@ use serde::{Deserialize, Serialize};
 
 use crate::agents::Approval;
 
+// 状態ラダーの上位 2 段。`agents.rs` の `approvals` と同じ流儀で `#[path]` により
+// このモジュールの子として取り込む (main.rs へ `mod` を足す必要は無い)。
+// 外からは `crate::supervisor::protocol::…` / `crate::supervisor::hooks::…`。
+
+/// 1 段目: ベンダー CLI の構造化イベント列 (JSONL) を読む機構。
+#[path = "protocol.rs"]
+pub mod protocol;
+
+/// 2 段目: ベンダー提供フックの受け口と設置/解除。
+#[path = "hooks.rs"]
+pub mod hooks;
+
+use protocol::{ProtoRead, ProtoState, ProtoTracker};
+
+// ---------------------------------------------------------------------------
+// 状態ラダー (CLAUDE.md 設計原則 #4)
+// ---------------------------------------------------------------------------
+
+/// 見張りが握っている**上位段**の出どころ。
+///
+/// 下位段 (状態ファイル / 画面) は `kanban::Source` 側が持つ。ここは
+/// 「画面を 1 文字も読まずに得られた」判定だけを表す。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rung {
+    /// ベンダー CLI の構造化イベント列 (最上段)
+    Protocol,
+    /// ベンダー提供フックからの通知
+    Hook,
+}
+
+impl Rung {
+    /// UI に出す短い名前 (tr のキーになる日本語原文)。
+    pub fn label(self) -> &'static str {
+        match self {
+            Rung::Protocol => "構造化",
+            Rung::Hook => "フック",
+        }
+    }
+}
+
+/// 上位段から得た 1 件の判定。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LadderRead {
+    pub rung: Rung,
+    pub state: ProtoState,
+    /// ツール名・コマンドなどの補足。無ければ空。
+    pub detail: String,
+}
+
+/// 構造化イベントが途切れたと見なすまでの時間 (ミリ秒)。
+///
+/// ツール実行の合間は数十秒黙ることがあるので、短すぎると上位段と下位段の間で
+/// 判定が往復する。長すぎると死んだストリームを信じ続ける。
+pub const PROTO_STALE_MS: u64 = 120_000;
+
+/// フック通知が途切れたと見なすまでの時間 (ミリ秒)。
+/// フックは「起きたときだけ」来るので、構造化ストリームより長く効かせる。
+pub const HOOK_STALE_MS: u64 = 300_000;
+
+/// 生ログの追い読みで 1 回に読む上限 (バイト)。
+/// UI スレッドを止めないため、溜まっていても 1 ティックではここまで。
+const TAIL_CHUNK_MAX: u64 = 512 * 1024;
+
 // ---------------------------------------------------------------------------
 // 設定
 // ---------------------------------------------------------------------------
@@ -535,6 +598,14 @@ pub struct SessionSnapshot {
     pub user_typed: bool,
     /// PTY の累積出力バイト数が取れるなら渡す。無ければ画面から推定する。
     pub total_output_bytes: Option<u64>,
+    /// 起動コマンド。**状態ラダー上位段の判定に使う** — カタログを引いて
+    /// 「このセッションは構造化出力つきで起動されたか」を決める。
+    pub command: String,
+    /// 作業ディレクトリ。フック通知をセッションへ割り当てる鍵。
+    pub cwd: std::path::PathBuf,
+    /// PTY の**生ログ**の置き場 (`~/.zaivern/term_logs/…`)。
+    /// 構造化出力つきで起動されたセッションでは、ここが JSONL の入り口になる。
+    pub raw_log: Option<std::path::PathBuf>,
 }
 
 impl SessionSnapshot {
@@ -554,6 +625,9 @@ impl SessionSnapshot {
             exit_code,
             user_typed,
             total_output_bytes: None,
+            command: s.command.clone(),
+            cwd: s.cwd.clone(),
+            raw_log: s.log_path.clone(),
         }
     }
 }
@@ -1430,6 +1504,15 @@ pub struct Supervisor {
     diagnostician: Option<Arc<dyn Diagnostician>>,
     diag_tx: Sender<Diagnosis>,
     diag_rx: Receiver<Diagnosis>,
+    // ── 状態ラダー上位 2 段 (CLAUDE.md 設計原則 #4) ──────────────────────
+    /// 1 段目: セッション ID → 構造化イベント列の追跡。
+    protos: HashMap<u64, ProtoTracker>,
+    /// 生ログをどこまで読んだか (セッション ID → バイト位置)。
+    proto_offsets: HashMap<u64, u64>,
+    /// 2 段目: フック通知の割り当て。
+    hook_router: hooks::HookRouter,
+    /// フックの投函箱。テストでは実 `~/.zaivern` を避けて差し替える。
+    hook_inbox: std::path::PathBuf,
 }
 
 impl Supervisor {
@@ -1444,7 +1527,131 @@ impl Supervisor {
             diagnostician: None,
             diag_tx,
             diag_rx,
+            protos: HashMap::new(),
+            proto_offsets: HashMap::new(),
+            hook_router: hooks::HookRouter::default(),
+            hook_inbox: hooks::inbox_dir(),
         }
+    }
+
+    /// フックの投函箱を差し替える (テスト用 — 実 `~/.zaivern` に触れない)。
+    #[cfg(test)]
+    pub fn set_hook_inbox(&mut self, dir: std::path::PathBuf) {
+        self.hook_inbox = dir;
+    }
+
+    /// **状態ラダー上位段の判定** — 画面を 1 文字も読まずに得られたものだけ。
+    ///
+    /// 上から順に見て、最初に生きている段を返す。どの段も黙っていれば `None`
+    /// (= 呼び出し側は下位段 — 見張りの状態判定・画面推定 — へ降りる)。
+    pub fn ladder_read(&self, id: u64, now_ms: u64) -> Option<LadderRead> {
+        if let Some(r) = self
+            .protos
+            .get(&id)
+            .and_then(|t| t.read(now_ms, PROTO_STALE_MS))
+        {
+            return Some(LadderRead {
+                rung: Rung::Protocol,
+                state: r.state,
+                detail: r.detail,
+            });
+        }
+        let r: ProtoRead = self.hook_router.read(id, now_ms, HOOK_STALE_MS)?;
+        Some(LadderRead {
+            rung: Rung::Hook,
+            state: r.state,
+            detail: r.detail,
+        })
+    }
+
+    /// 現在の時刻での [`ladder_read`](Self::ladder_read)。
+    pub fn ladder_of(&self, id: u64) -> Option<LadderRead> {
+        self.ladder_read(id, self.elapsed_ms())
+    }
+
+    /// 構造化ストリームを直接流し込む (テスト・将来のヘッドレス実行用)。
+    ///
+    /// カタログに方言が無いエージェントでは何もしない。
+    pub fn feed_protocol(&mut self, id: u64, command: &str, chunk: &[u8], now_ms: u64) {
+        let Some(dialect) = crate::agents::stream_dialect_for_command(command) else {
+            return;
+        };
+        self.protos
+            .entry(id)
+            .or_insert_with(|| ProtoTracker::new(dialect))
+            .feed(chunk, now_ms);
+    }
+
+    /// 上位 2 段をまとめて更新する (1 サンプル周期に 1 回だけ呼ばれる)。
+    fn pump_ladder(&mut self, snaps: &[SessionSnapshot], now_ms: u64, alive: &HashSet<u64>) {
+        // 1 段目: 構造化出力つきで起動されたセッションの生ログを追い読みする。
+        for snap in snaps {
+            self.pump_protocol(snap, now_ms);
+        }
+        // 2 段目: フックの投函箱を空にして、セッションへ割り当てる。
+        let targets: Vec<hooks::HookTargetSession> = snaps
+            .iter()
+            .filter_map(|s| {
+                let spec = crate::agents::spec_for_command(&s.command)?;
+                Some(hooks::HookTargetSession {
+                    id: s.id,
+                    bin: spec.bin.to_string(),
+                    cwd: s.cwd.clone(),
+                })
+            })
+            .collect();
+        let evs = hooks::drain(&self.hook_inbox, now_ms);
+        if !evs.is_empty() {
+            self.hook_router.route(&evs, &targets, now_ms);
+        }
+        let ids: Vec<u64> = alive.iter().copied().collect();
+        self.hook_router.retain(&ids);
+    }
+
+    /// 生ログ (`~/.zaivern/term_logs/…`) の**続き**を読んで構造化段へ流す。
+    ///
+    /// 画面 (vt100) には触らない。読むのは前回位置から先だけで、1 ティックあたり
+    /// [`TAIL_CHUNK_MAX`] まで (UI を止めない)。ログが縮んだ (ローテートされた)
+    /// ときは位置を 0 へ戻す。
+    fn pump_protocol(&mut self, snap: &SessionSnapshot, now_ms: u64) {
+        let Some(dialect) = crate::agents::stream_dialect_for_command(&snap.command) else {
+            return;
+        };
+        let Some(path) = snap.raw_log.as_ref() else {
+            return;
+        };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        let len = meta.len();
+        let off = self.proto_offsets.entry(snap.id).or_insert(0);
+        if len < *off {
+            *off = 0; // ローテート
+        }
+        if len == *off {
+            return;
+        }
+        let from = *off;
+        let take = (len - from).min(TAIL_CHUNK_MAX);
+        let mut buf = vec![0u8; take as usize];
+        let read = {
+            use std::io::{Read, Seek, SeekFrom};
+            let Ok(mut f) = std::fs::File::open(path) else {
+                return;
+            };
+            if f.seek(SeekFrom::Start(from)).is_err() {
+                return;
+            }
+            match f.read(&mut buf) {
+                Ok(n) => n,
+                Err(_) => return,
+            }
+        };
+        *self.proto_offsets.entry(snap.id).or_insert(0) = from + read as u64;
+        self.protos
+            .entry(snap.id)
+            .or_insert_with(|| ProtoTracker::new(dialect))
+            .feed(&buf[..read], now_ms);
     }
 
     pub fn config(&self) -> &SupervisorConfig {
@@ -1478,6 +1685,10 @@ impl Supervisor {
 
     pub fn forget(&mut self, id: u64) {
         self.monitors.remove(&id);
+        // ラダー上位段の状態も一緒に捨てる (残すと死んだ判定を配り続ける)。
+        self.protos.remove(&id);
+        self.proto_offsets.remove(&id);
+        self.hook_router.forget(id);
     }
 
     /// UI スレッドから毎フレーム呼ぶ。内部で間引くので毎フレームで安い。
@@ -1510,6 +1721,13 @@ impl Supervisor {
         // 消えたセッションの監視状態を捨てる (無制限に増やさない)
         let alive: HashSet<u64> = snaps.iter().map(|s| s.id).collect();
         self.monitors.retain(|k, _| alive.contains(k));
+        self.protos.retain(|k, _| alive.contains(k));
+        self.proto_offsets.retain(|k, _| alive.contains(k));
+
+        // ── 状態ラダー上位 2 段を更新する (CLAUDE.md 設計原則 #4) ──────────
+        // ここはサンプリング周期のゲートより後なので、アイドル時の追加コストは
+        // 「readdir 1 回 + 生ログの続き読み」だけ。常時再描画は起こさない。
+        self.pump_ladder(snaps, now_ms, &alive);
 
         let mut intents = Vec::new();
         for snap in snaps {
@@ -1870,6 +2088,9 @@ impl Supervisor {
             exit_code: None,
             user_typed: false,
             total_output_bytes: None,
+            command: String::new(),
+            cwd: std::path::PathBuf::new(),
+            raw_log: None,
         };
         let now = self.origin.elapsed().as_millis() as u64;
         let mut i = Self::make_intent(
@@ -2610,7 +2831,163 @@ mod tests {
             exit_code: None,
             user_typed: false,
             total_output_bytes: None,
+            command: "claude".into(),
+            cwd: std::path::PathBuf::new(),
+            raw_log: None,
         }
+    }
+
+    // ── 状態ラダー上位 2 段 (CLAUDE.md 設計原則 #4) ────────────────────────
+
+    /// 生ログ + コマンドを差し替えたスナップショット。
+    fn snap_with(
+        id: u64,
+        command: &str,
+        cwd: &std::path::Path,
+        raw_log: Option<std::path::PathBuf>,
+    ) -> SessionSnapshot {
+        let mut s = snap(id, "", true, false);
+        s.command = command.to_string();
+        s.cwd = cwd.to_path_buf();
+        s.raw_log = raw_log;
+        s
+    }
+
+    #[test]
+    fn 構造化出力つきのセッションは画面ではなく生ログから状態を決める() {
+        let dir = crate::test_util::unique_temp_dir("zaivern", "sup-ladder-proto");
+        let log = dir.join("agent.log");
+        let dialect = crate::agents::stream_dialect("claude").expect("方言");
+        let cmd = format!("claude {}", dialect.args);
+        // 実機で採取した形の 1 行 (ファイル編集ツールの呼び出し)
+        std::fs::write(
+            &log,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Edit\",\"input\":{}}]}}\n",
+        )
+        .expect("write");
+        let mut sv = Supervisor::new(cfg());
+        let snaps = vec![snap_with(1, &cmd, &dir, Some(log.clone()))];
+        sv.tick_ms(&snaps, Approval::Ask, 0);
+        let r = sv.ladder_read(1, 0).expect("構造化段が読めていない");
+        assert_eq!(r.rung, Rung::Protocol);
+        assert_eq!(r.state, ProtoState::Editing);
+        assert_eq!(r.detail, "Edit");
+
+        // 続きだけを追い読みする (同じ行を二度読まない)
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .expect("open");
+            writeln!(
+                f,
+                "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}"
+            )
+            .expect("append");
+        }
+        sv.tick_ms(&snaps, Approval::Ask, 2_000);
+        assert_eq!(
+            sv.ladder_read(1, 2_000).expect("読める").state,
+            ProtoState::Done
+        );
+
+        // 沈黙したら上位段は判定を返さない = 下位段へ降りる
+        assert!(sv.ladder_read(1, 2_000 + PROTO_STALE_MS + 1).is_none());
+
+        // 構造化フラグ無しで起動していれば、そもそもこの段に入らない
+        let mut plain = Supervisor::new(cfg());
+        let snaps = vec![snap_with(1, "claude", &dir, Some(log.clone()))];
+        plain.tick_ms(&snaps, Approval::Ask, 0);
+        assert!(plain.ladder_read(1, 0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn フックの投函箱から状態を受け取り消えたら降りる() {
+        let dir = crate::test_util::unique_temp_dir("zaivern", "sup-ladder-hook");
+        let inbox = dir.join("inbox");
+        let mut sv = Supervisor::new(cfg());
+        sv.set_hook_inbox(inbox.clone());
+        let snaps = vec![snap_with(3, "claude", &dir, None)];
+        hooks::post(
+            &inbox,
+            &hooks::HookEvent {
+                agent: "claude".into(),
+                session: "v-1".into(),
+                cwd: dir.to_string_lossy().to_string(),
+                event: "PermissionRequest".into(),
+                tool: String::new(),
+            },
+        )
+        .expect("投函");
+        sv.tick_ms(&snaps, Approval::Ask, 0);
+        let r = sv.ladder_read(3, 0).expect("フック段が読めていない");
+        assert_eq!(r.rung, Rung::Hook);
+        assert_eq!(r.state, ProtoState::Approval);
+        // 投函箱は空になっている (二重計上しない)
+        assert!(hooks::drain(&inbox, 0).is_empty());
+        // 沈黙したら降りる
+        assert!(sv.ladder_read(3, HOOK_STALE_MS + 1).is_none());
+        // セッションを忘れたら上位段の記憶も消える
+        sv.forget(3);
+        assert!(sv.ladder_read(3, 0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 構造化段はフック段より優先される() {
+        let dir = crate::test_util::unique_temp_dir("zaivern", "sup-ladder-order");
+        let inbox = dir.join("inbox");
+        let dialect = crate::agents::stream_dialect("claude").expect("方言");
+        let cmd = format!("claude {}", dialect.args);
+        let log = dir.join("agent.log");
+        std::fs::write(&log, "{\"type\":\"system\",\"subtype\":\"init\"}\n").expect("write");
+        let mut sv = Supervisor::new(cfg());
+        sv.set_hook_inbox(inbox.clone());
+        hooks::post(
+            &inbox,
+            &hooks::HookEvent {
+                agent: "claude".into(),
+                session: "v-2".into(),
+                cwd: dir.to_string_lossy().to_string(),
+                event: "Stop".into(),
+                tool: String::new(),
+            },
+        )
+        .expect("投函");
+        let snaps = vec![snap_with(5, &cmd, &dir, Some(log))];
+        sv.tick_ms(&snaps, Approval::Ask, 0);
+        let r = sv.ladder_read(5, 0).expect("読める");
+        assert_eq!(r.rung, Rung::Protocol, "上位段が取れたら下位段を採らない");
+        assert_eq!(r.state, ProtoState::Starting);
+        // 構造化段が沈黙すれば、まだ生きているフック段へ降りる
+        let later = PROTO_STALE_MS + 1;
+        let r = sv.ladder_read(5, later).expect("フック段へ降りる");
+        assert_eq!(r.rung, Rung::Hook);
+        assert_eq!(r.state, ProtoState::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 構造化ストリームを直接流し込める() {
+        let mut sv = Supervisor::new(cfg());
+        let dialect = crate::agents::stream_dialect("codex").expect("方言");
+        let cmd = format!("codex {}", dialect.args);
+        sv.feed_protocol(
+            9,
+            &cmd,
+            b"{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\",\"command\":\"ls\"}}\n",
+            0,
+        );
+        let r = sv.ladder_read(9, 0).expect("読める");
+        assert_eq!(
+            (r.rung, r.state, r.detail.as_str()),
+            (Rung::Protocol, ProtoState::Running, "ls")
+        );
+        // 方言を持たないエージェントでは何も起きない
+        sv.feed_protocol(10, "aider --json", b"{\"type\":\"x\"}\n", 0);
+        assert!(sv.ladder_read(10, 0).is_none());
     }
 
     #[test]
