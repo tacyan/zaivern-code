@@ -562,7 +562,10 @@ impl MarkStore {
             .filter(|m| m.file == file)
             .map(|m| m.line)
             .collect();
-        let used: HashSet<Mnemonic> = self.marks.iter().filter_map(|m| m.mnemonic).collect();
+        // ニーモニックの一意性は復活の**途中でも**保つ。無効な印が同じ文字を
+        // 2 件持っていた場合 (旧版の保存ファイル) に両方戻すと壊れるため、
+        // 復活させたそばから使用中へ入れていく。
+        let mut used: HashSet<Mnemonic> = self.marks.iter().filter_map(|m| m.mnemonic).collect();
         let mut back: Vec<Mark> = Vec::new();
         let mut gone: Vec<usize> = Vec::new();
         for (k, inv) in self.invalid.iter().enumerate() {
@@ -574,9 +577,13 @@ impl MarkStore {
             });
             if let Some(l) = hit {
                 let mut m = inv.revive(l);
-                // ニーモニックの一意性を壊さない (留守中に奪われていたら無印で戻す)
-                if m.mnemonic.map(|x| used.contains(&x)).unwrap_or(false) {
-                    m.mnemonic = None;
+                // 一意性を壊さない (留守中に奪われていたら無印で戻す)
+                match m.mnemonic {
+                    Some(x) if used.contains(&x) => m.mnemonic = None,
+                    Some(x) => {
+                        used.insert(x);
+                    }
+                    None => {}
                 }
                 occupied.insert(l);
                 back.push(m);
@@ -2495,6 +2502,32 @@ mod tests {
         assert_eq!(s.marks()[0].line, 1);
         assert_eq!(s.marks()[0].mnemonic, Mnemonic::new('F'));
         assert!(s.invalid().is_empty());
+    }
+
+    #[test]
+    fn 復活してもニーモニックは一意のまま() {
+        let mut s = MarkStore::default();
+        let f = p("a.rs");
+        // 旧版の保存ファイル由来で、同じ文字を持つ無効な印が 2 件あるとする
+        for t in ["one", "two"] {
+            s.invalid.push(InvalidMark {
+                file: f.clone(),
+                line: 0,
+                expected_text: t.into(),
+                mnemonic: Mnemonic::new('9'),
+                description: String::new(),
+                group: default_group(),
+            });
+        }
+        let rep = s.on_edit(&f, 0, 2, "one\ntwo\nz");
+        assert_eq!(rep.revived, 2);
+        let with9 = s
+            .marks()
+            .iter()
+            .filter(|m| m.mnemonic == Mnemonic::new('9'))
+            .count();
+        assert_eq!(with9, 1, "同じニーモニックは 1 件だけ");
+        assert_eq!(s.assigned().len(), 1);
     }
 
     #[test]
