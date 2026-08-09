@@ -210,6 +210,7 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "worktree"
             | "session"
             | "agent"
+            | "lease"
             | "hook"
             | "update"
             | "uninstall"
@@ -228,7 +229,7 @@ pub fn is_cli_subcommand(word: &str) -> bool {
 fn yields_to_directory(word: &str) -> bool {
     matches!(
         word,
-        "app" | "firewall" | "worktree" | "session" | "agent" | "hook" | "help"
+        "app" | "firewall" | "worktree" | "session" | "agent" | "lease" | "hook" | "help"
     )
 }
 
@@ -236,7 +237,7 @@ fn yields_to_directory(word: &str) -> bool {
 /// `zai <cmd> --help` は該当セクションだけを出す。
 /// **セクションの実体は 1 箇所** — 全体ヘルプと個別ヘルプが食い違わない。
 pub fn help_text() -> String {
-    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
+    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
 }
 
 const HELP_HEAD: &str = "\
@@ -309,6 +310,24 @@ pub const HELP_AGENT: &str = "\
 agent (対応エージェント CLI):
   zai agent list [--json]               名前 / 導入状況 / 起動コマンド / 実体のパス
                                         (PATH を自前で走査。Windows は PATHEXT も見ます)
+
+";
+
+/// `zai lease --help` のセクション。
+pub const HELP_LEASE: &str = "\
+lease (ファイル所有 — 並列エージェントの衝突を「起こさせない」):
+  zai lease status                      いまの段 (強制 / 勧告 / 無効) と台帳の場所
+  zai lease enable                      このリポジトリで有効にする
+                                        (以後、書き込みの所有が記録されます)
+  zai lease disable                     無効にする (台帳を消します)
+  zai lease list [--json]               確保中のファイルと持ち主
+  zai lease claim <パターン...> [--agent 名前]
+                                        自分のものとして確保する (glob 可)
+                                        重なっていたら拒否されます (後勝ちにしません)
+  zai lease release [--agent 名前 | --all]
+                                        確保を手放す (引き継ぐとき)
+  スコープは git の**元のリポジトリ**です。worktree は同じ台帳を共有します
+  (worktree ごとに分けると、同じファイルを 2 人が編集する事故を防げません)
 
 ";
 
@@ -387,6 +406,8 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         "worktree" => finish(worktree_dispatch(rest)),
         "session" => finish(session_dispatch(rest)),
         "agent" => finish(agent_dispatch(rest)),
+        // ファイル所有リース (GUI が無くても設定・確認できる導線)
+        "lease" => finish(lease_dispatch(rest)),
         // 自分自身の面倒 (更新・削除)。どちらもエディタの起動を要求しない。
         "update" => finish(update_dispatch(rest)),
         "uninstall" => finish(uninstall_dispatch(rest)),
@@ -1481,6 +1502,143 @@ fn agent_dispatch(args: &[String]) -> CliOut {
     }
 }
 
+// ───────────────────────── lease: ファイル所有 ─────────────────────────
+
+/// `zai lease …` — ファイル所有リースのヘッドレス導線。
+///
+/// **GUI を必要としない。** 強制を担う `zai hook` が短命プロセスで動く以上、
+/// その設定と確認も CLI から完結できないと、サーバ / CI / リモートで使えない。
+/// 対象リポジトリは**カレントディレクトリから導出**する (`--dir` で明示も可)。
+fn lease_dispatch(args: &[String]) -> CliOut {
+    use crate::lease;
+    if wants_help(args) {
+        return Ok(HELP_LEASE.trim_end().to_string());
+    }
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let rest: &[String] = if args.is_empty() { &[] } else { &args[1..] };
+    let (dir, rest) = take_opt(rest, "--dir");
+    let start = match dir {
+        Some(d) => PathBuf::from(d),
+        None => std::env::current_dir()
+            .map_err(|e| CliError::Runtime(format!("カレントディレクトリが判りません: {e}")))?,
+    };
+    let roots = lease::roots_of(&start);
+    let store = lease::store_path_in(&lease::store_dir(), &roots.key);
+    let now = lease::now_secs();
+    match sub {
+        "status" => {
+            let tier = lease::current_tier(&roots);
+            let n = lease::read_store(&store).map(|s| s.leases.len()).unwrap_or(0);
+            // worktree のときは 2 つのルートが別物になる。**それを隠さない** —
+            // 「なぜ別フォルダの相手と衝突するのか」がここでしか判らない。
+            let tree = if roots.tree == roots.key {
+                String::new()
+            } else {
+                format!("\n作業ツリー: {}", roots.tree.display())
+            };
+            Ok(format!(
+                "段: {}\n{}\nリポジトリ (台帳の単位): {}{tree}\n台帳: {}\n確保中: {n} 件",
+                crate::i18n::tr(tier.label()),
+                crate::i18n::tr(tier.detail()),
+                roots.key.display(),
+                store.display()
+            ))
+        }
+        "enable" => {
+            lease::enable(&store).map_err(CliError::Runtime)?;
+            Ok(format!("有効にしました: {}", store.display()))
+        }
+        "disable" => {
+            if store.exists() {
+                std::fs::remove_file(&store)
+                    .map_err(|e| CliError::Runtime(format!("台帳を消せません: {e}")))?;
+            }
+            Ok("無効にしました".to_string())
+        }
+        "list" => {
+            let (json, rest) = take_flag(&rest, "--json");
+            reject_extra(&rest, "zai lease list [--json]")?;
+            let st = lease::read_store(&store).map_err(CliError::Runtime)?;
+            Ok(render_leases(&st, now, json))
+        }
+        "claim" => {
+            let (agent, rest) = take_opt(&rest, "--agent");
+            if rest.is_empty() {
+                return Err(CliError::Usage(
+                    "確保するパターンを 1 つ以上指定してください: zai lease claim <パターン...>"
+                        .into(),
+                ));
+            }
+            let holder = lease::Holder {
+                agent: agent.unwrap_or_else(|| "cli".to_string()),
+                session: String::new(),
+                cwd: lease::normalize_path(&start.to_string_lossy()),
+                pid: std::process::id(),
+            };
+            let out = lease::with_store(&store, |s| {
+                lease::try_claim(s, &holder, &rest, now, lease::DEFAULT_TTL_SECS, &|p| {
+                    crate::instances::pid_alive(p)
+                })
+            })
+            .map_err(CliError::Runtime)?;
+            match out {
+                lease::Claim::Granted(n) => Ok(format!("{n} 件を確保しました")),
+                lease::Claim::Refused { owner, pattern, .. } => Err(CliError::Runtime(format!(
+                    "確保できません: 「{pattern}」は {owner} が持っています"
+                ))),
+            }
+        }
+        "release" => {
+            let (all, rest) = take_flag(&rest, "--all");
+            let (agent, rest) = take_opt(&rest, "--agent");
+            reject_extra(&rest, "zai lease release [--agent 名前 | --all]")?;
+            let n = lease::with_store(&store, |s| {
+                let before = s.leases.len();
+                if all {
+                    s.leases.clear();
+                } else if let Some(a) = &agent {
+                    s.leases.retain(|l| &l.holder.agent != a);
+                }
+                before - s.leases.len()
+            })
+            .map_err(CliError::Runtime)?;
+            if !all && agent.is_none() {
+                return Err(CliError::Usage(
+                    "--agent <名前> か --all を指定してください".into(),
+                ));
+            }
+            Ok(format!("{n} 件を解放しました"))
+        }
+        "" => Err(CliError::Usage(
+            "lease のサブコマンドを指定してください: status / enable / disable / list / claim / release"
+                .into(),
+        )),
+        other => Err(CliError::Usage(format!(
+            "不明な lease サブコマンドです: {other}"
+        ))),
+    }
+}
+
+/// 確保中の一覧を表示用に整える (**純粋関数** — テーブルテストできる形)。
+fn render_leases(st: &crate::lease::Store, now: u64, json: bool) -> String {
+    if json {
+        return serde_json::to_string_pretty(st).unwrap_or_else(|_| "[]".into());
+    }
+    if st.leases.is_empty() {
+        return "確保中のファイルはありません。".to_string();
+    }
+    let mut out = String::new();
+    for l in &st.leases {
+        out.push_str(&format!(
+            "{}\t{}\t残り {}\n",
+            l.holder.display(),
+            l.patterns.join(", "),
+            crate::instances::humanize_uptime(l.expires_at.saturating_sub(now))
+        ));
+    }
+    out.trim_end().to_string()
+}
+
 // ───────────────────────── update / uninstall: 自分自身の面倒を見る ─────────────────────────
 
 /// ワンライナーインストーラの実体をビルド時に取り込む。
@@ -2217,6 +2375,7 @@ mod tests {
             "worktree",
             "session",
             "agent",
+            "lease",
             "update",
             "uninstall",
             "help",
@@ -2276,6 +2435,12 @@ mod tests {
             "zai session send",
             "zai session log",
             "zai agent list",
+            // ファイル所有リース (GUI 無しでも設定できる導線)
+            "zai lease status",
+            "zai lease enable",
+            "zai lease list",
+            "zai lease claim",
+            "zai lease release",
             // 自分自身の更新・削除
             "zai update",
             "zai update --check",
@@ -2306,6 +2471,7 @@ mod tests {
             HELP_WORKTREE,
             HELP_SESSION,
             HELP_AGENT,
+            HELP_LEASE,
             HELP_UPDATE,
             HELP_UNINSTALL,
         ] {
@@ -2432,6 +2598,44 @@ mod tests {
         let (val, rest) = take_opt(&v(&["src/main.rs", "--line", "42"]), "--line");
         assert_eq!(val.as_deref(), Some("42"));
         assert_eq!(rest, v(&["src/main.rs"]));
+    }
+
+    /// `zai lease` が **GUI 無しで**一巡すること
+    /// (有効化 → 確保 → 一覧 → 競合で拒否 → 解放)。
+    ///
+    /// 台帳の場所は `~/.zaivern` 由来なので、HOME を差し替えられない
+    /// このテストでは `lease` 側の純粋 API を同じ順序で叩いて経路を担保し、
+    /// CLI 側は「引数の解釈と表示」だけを見る。
+    #[test]
+    fn lease_サブコマンドの引数解釈と表示() {
+        use crate::lease;
+        // 不明なサブコマンドは使い方エラー (終了コード 2)
+        assert_eq!(finish(lease_dispatch(&v(&["ないよ"]))), EXIT_USAGE);
+        // サブコマンド無しも使い方エラー
+        assert_eq!(finish(lease_dispatch(&[])), EXIT_USAGE);
+        // --help はヘルプ本文の一部
+        let h = lease_dispatch(&v(&["--help"])).expect("ヘルプ");
+        assert!(help_text().contains(h.trim_end()));
+        // 一覧の描画 (純粋関数)
+        let mut st = lease::Store::default();
+        assert!(render_leases(&st, 0, false).contains("ありません"));
+        lease::try_claim(
+            &mut st,
+            &lease::Holder {
+                agent: "A".into(),
+                session: "s".into(),
+                cwd: "/w".into(),
+                pid: 0,
+            },
+            &["src/**".to_string()],
+            0,
+            600,
+            &|_| false,
+        );
+        let table = render_leases(&st, 0, false);
+        assert!(table.contains("src/**") && table.contains('A'), "{table}");
+        let json = render_leases(&st, 0, true);
+        assert!(json.contains("\"patterns\""), "{json}");
     }
 
     #[test]

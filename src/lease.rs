@@ -300,7 +300,9 @@ fn seg_intersects(x: &str, y: &str) -> bool {
 /// `worktrees/<名前>` を 2 つ落とすと `.git` に戻り、その親が元のルート。
 /// 形が違えば `None` (推測しない)。
 pub fn main_repo_root_from_pointer(text: &str) -> Option<PathBuf> {
-    let line = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?;
+    let line = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))?;
     let gitdir = PathBuf::from(line.trim());
     // …/.git/worktrees/<名前> → …/.git → …
     let git = gitdir.parent()?.parent()?;
@@ -310,44 +312,92 @@ pub fn main_repo_root_from_pointer(text: &str) -> Option<PathBuf> {
     git.parent().map(Path::to_path_buf)
 }
 
-/// 与えられた場所が属する**リース台帳のスコープ** (= 元のリポジトリのルート)。
+/// 台帳のキーになるルートと、パスを相対化する作業ツリーのルート。
 ///
-/// 1. 上へ辿って最初の `.git` を探す
-/// 2. `.git` がファイルなら linked worktree → 元のリポジトリへ寄せる
-///    (**ここを寄せないと worktree ごとに台帳が割れて、この機能の意味が消える**)
-/// 3. `.git` が見つからなければ、その場所自身 (git 管理でないフォルダでも動く)
-pub fn scope_of(start: &Path) -> PathBuf {
-    let found = scope_raw(start);
-    // **返り値は必ず同じ正規形にする。** 片方だけ canonicalize すると、
-    // macOS の `/var` → `/private/var` のようなシンボリックリンクで
-    // 同じリポジトリが 2 つのキーへ割れる (実際にテストで踏んだ)。
-    found.canonicalize().unwrap_or(found)
+/// **この 2 つは linked worktree では別物**で、そこを取り違えると機能が
+/// 丸ごと無言で効かなくなる (実際に e2e で踏んだ: worktree のファイルは
+/// 元のリポジトリの配下に**無い**ので、元リポジトリ基準の相対化が必ず失敗し、
+/// 全部「スコープ外」として素通りしていた)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Roots {
+    /// 台帳のキー = **元のリポジトリのルート**。worktree 群が 1 つの台帳を共有する。
+    pub key: PathBuf,
+    /// パスの相対化に使う = **いまいる作業ツリーのルート**。
+    pub tree: PathBuf,
 }
 
-fn scope_raw(start: &Path) -> PathBuf {
+/// 与えられた場所から [`Roots`] を出す。
+///
+/// 1. 上へ辿って最初の `.git` を探す → そこが `tree`
+/// 2. `.git` がファイルなら linked worktree → `key` は元のリポジトリへ寄せる
+///    (**ここを寄せないと worktree ごとに台帳が割れて、この機能の意味が消える**)
+/// 3. `.git` が見つからなければ、その場所自身 (git 管理でないフォルダでも動く)
+///
+/// 返り値は必ず同じ正規形にする。片方だけ canonicalize すると、macOS の
+/// `/var` → `/private/var` のようなシンボリックリンクで同じリポジトリが
+/// 2 つのキーへ割れる (これもテストで踏んだ)。
+pub fn roots_of(start: &Path) -> Roots {
+    let (key, tree) = roots_raw(start);
+    Roots {
+        key: key.canonicalize().unwrap_or(key),
+        tree: tree.canonicalize().unwrap_or(tree),
+    }
+}
+
+fn roots_raw(start: &Path) -> (PathBuf, PathBuf) {
     let base = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     for dir in base.ancestors() {
         let dot = dir.join(".git");
         if dot.is_dir() {
-            return dir.to_path_buf();
+            return (dir.to_path_buf(), dir.to_path_buf());
         }
         if dot.is_file() {
-            if let Some(main) = std::fs::read_to_string(&dot)
+            let main = std::fs::read_to_string(&dot)
                 .ok()
                 .and_then(|t| main_repo_root_from_pointer(&t))
-            {
-                return main;
-            }
-            return dir.to_path_buf();
+                .unwrap_or_else(|| dir.to_path_buf());
+            return (main, dir.to_path_buf());
         }
     }
-    base
+    (base.clone(), base)
 }
 
-/// スコープからの相対パス (正規形)。スコープの外なら `None` = **関知しない**。
-pub fn rel_within(scope: &Path, target: &Path) -> Option<String> {
-    let t = target.canonicalize().unwrap_or_else(|_| target.to_path_buf());
-    let s = scope.canonicalize().unwrap_or_else(|_| scope.to_path_buf());
+/// **まだ存在しないパスでも**実在する祖先まで解決する canonicalize。
+///
+/// 素の [`Path::canonicalize`] は存在しないパスで失敗する。そこで諦めると
+/// **`Write` による新規ファイル作成が丸ごと素通りする** — 台帳側は
+/// canonicalize 済み (macOS なら `/private/var/…`) なのに、対象だけ
+/// 生のパス (`/var/…`) のままになり、前方一致が必ず外れるため。
+fn canonical_best_effort(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    while let Some(name) = cur.file_name().map(|s| s.to_os_string()) {
+        let Some(parent) = cur.parent().map(Path::to_path_buf) else {
+            break;
+        };
+        rest.push(name);
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            for r in rest.iter().rev() {
+                out.push(r);
+            }
+            return out;
+        }
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        cur = parent;
+    }
+    p.to_path_buf()
+}
+
+/// ルートからの相対パス (正規形)。ルートの外なら `None` = **関知しない**。
+pub fn rel_within(root: &Path, target: &Path) -> Option<String> {
+    let t = canonical_best_effort(target);
+    let s = canonical_best_effort(root);
     let rel = t.strip_prefix(&s).ok()?;
     let norm = normalize_path(&rel.to_string_lossy());
     if norm.is_empty() {
@@ -852,7 +902,8 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
     };
     // 「書き込み系ツールか」もカタログから引く (ここにツール名を書かない)。
     let tool = s("tool_name");
-    if crate::agents::hook_tool_state(agent, &tool) != Some(crate::supervisor::protocol::ProtoState::Editing)
+    if crate::agents::hook_tool_state(agent, &tool)
+        != Some(crate::supervisor::protocol::ProtoState::Editing)
     {
         return pass_answer();
     }
@@ -866,20 +917,22 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
     } else {
         PathBuf::from(cwd)
     };
-    let scope = scope_of(&cwd);
+    let roots = roots_of(&cwd);
     let dir = store_dir();
-    let store = store_path_in(&dir, &scope);
+    let store = store_path_in(&dir, &roots.key);
     // ここが「使っていない人が払う全コスト」= stat 1 回。
     if !enabled(&store) {
         return pass_answer();
     }
-    // 相対パスへ。スコープの外 (別リポジトリ・システムのファイル) は関知しない。
+    // 相対パスへ。**相対化は作業ツリー基準**で行う (worktree のファイルは
+    // 元のリポジトリの配下に無いので、key 基準にすると必ず外れる)。
+    // ツリーの外 (別リポジトリ・システムのファイル) は関知しない。
     let abs = if Path::new(&raw).is_absolute() {
         PathBuf::from(&raw)
     } else {
         cwd.join(&raw)
     };
-    let Some(rel) = rel_within(&scope, &abs) else {
+    let Some(rel) = rel_within(&roots.tree, &abs) else {
         return pass_answer();
     };
     let holder = Holder {
@@ -1093,12 +1146,16 @@ pub fn tier(store_exists: bool, hook_installed: bool) -> Tier {
 }
 
 /// いまの段を実際に調べる (I/O)。**UI スレッドから直接呼ばない**。
-pub fn current_tier(scope: &Path) -> Tier {
-    let store = store_path_in(&store_dir(), scope);
+///
+/// 2 つのルートを取り違えないこと: 台帳は `key` (元のリポジトリ)、
+/// フックの設定ファイル (`.claude/settings.json`) は `tree` (いまの作業ツリー)。
+/// 片方で両方を引くと「有効にした直後に無効と出る」(実際に e2e で出した)。
+pub fn current_tier(roots: &Roots) -> Tier {
+    let store = store_path_in(&store_dir(), &roots.key);
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zai"));
     // 1 つでも設置済みなら「強制」。カタログを回すのでリテラルは持たない。
     let installed = crate::agents::HOOK_TARGETS.iter().any(|t| {
-        crate::supervisor::hooks::plan_for(t.bin, scope, &exe)
+        crate::supervisor::hooks::plan_for(t.bin, &roots.tree, &exe)
             .map(|p| crate::supervisor::hooks::status(&p))
             == Some(crate::supervisor::hooks::HookStatus::Installed)
     });
@@ -1174,6 +1231,29 @@ pub fn empty_card(avail: egui::Rect) -> egui::Rect {
 //  10. UI — パレットから開くパネル
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// パレットへの登録。**共有ファイルを 1 バイトも触らずに機能が繋がる**入口
+/// (`src/features/lease.rs` が `pub use` するだけで build.rs が拾う)。
+///
+/// 打鍵は割り当てていない — `keybinds::BindAction` は固定長配列 + 件数検査を
+/// 持つ最も硬い共有面で、機能ブランチ側から増やすと直列マージが必ず衝突する。
+pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
+    module: "lease",
+    entries: &[crate::feature::Entry {
+        icon: "🔐",
+        label: "ファイル所有の一覧 — 並列エージェントの衝突を防ぐ",
+        id: "lease.list",
+    }],
+    dispatch: |_app, _ctx, id| match id {
+        "lease.list" => {
+            open_panel();
+            true
+        }
+        _ => false,
+    },
+    // パネルはウィンドウとして自分で描く (`app.rs` のビュー列挙に触らない)。
+    draw: Some(draw),
+};
+
 /// 台帳の非同期読み取り 1 回ぶん。
 struct Snapshot {
     store: Result<Store, String>,
@@ -1187,7 +1267,7 @@ struct Snapshot {
 #[derive(Default)]
 struct PanelState {
     open: bool,
-    scope: PathBuf,
+    roots: Roots,
     store: Store,
     tier: Tier,
     error: String,
@@ -1223,10 +1303,10 @@ fn gui_workspace_root() -> PathBuf {
 
 /// パレットの項目から呼ぶ入口。
 pub fn open_panel() {
-    let scope = scope_of(&gui_workspace_root());
+    let roots = roots_of(&gui_workspace_root());
     if let Ok(mut st) = state().lock() {
         st.open = true;
-        st.scope = scope;
+        st.roots = roots;
         st.last_scan = None; // 開いた回だけ必ず取り直す
         st.toast.clear();
     }
@@ -1237,12 +1317,12 @@ pub fn open_panel() {
 /// git の教訓と同じで、UI スレッドで同期 I/O を撃つと最悪のときにフレームが
 /// 止まる (実測: 同期 `git branch --show-current` が 6023ms / 最悪フレーム 4376ms)。
 /// 台帳は小さいが、ロック待ち最大 200ms が乗り得るので裏へ出す。
-fn spawn_scan(scope: PathBuf) -> Receiver<Snapshot> {
+fn spawn_scan(roots: Roots) -> Receiver<Snapshot> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let t0 = Instant::now();
-        let store = read_store(&store_path_in(&store_dir(), &scope));
-        let tier = current_tier(&scope);
+        let store = read_store(&store_path_in(&store_dir(), &roots.key));
+        let tier = current_tier(&roots);
         let _ = tx.send(Snapshot {
             store,
             tier,
@@ -1289,7 +1369,7 @@ enum PanelAction {
 }
 
 fn apply(st: &mut PanelState, action: PanelAction) {
-    let store_path = store_path_in(&store_dir(), &st.scope);
+    let store_path = store_path_in(&store_dir(), &st.roots.key);
     match action {
         PanelAction::None => {}
         PanelAction::Refresh => st.last_scan = None,
@@ -1325,7 +1405,7 @@ fn apply(st: &mut PanelState, action: PanelAction) {
             let holder = Holder {
                 agent: tr("あなた (Zaivern Code)"),
                 session: String::new(),
-                cwd: normalize_path(&st.scope.to_string_lossy()),
+                cwd: normalize_path(&st.roots.tree.to_string_lossy()),
                 pid: std::process::id(),
             };
             let now = now_secs();
@@ -1337,9 +1417,7 @@ fn apply(st: &mut PanelState, action: PanelAction) {
                     st.claim_text.clear();
                     trf("{n} 件のパターンを確保しました", &[("n", n.to_string())])
                 }
-                Ok(Claim::Refused {
-                    owner, pattern, ..
-                }) => trf(
+                Ok(Claim::Refused { owner, pattern, .. }) => trf(
                     "確保できません: 「{pattern}」は {owner} が持っています",
                     &[("pattern", pattern), ("owner", owner)],
                 ),
@@ -1377,7 +1455,7 @@ fn poll(st: &mut PanelState, ctx: &egui::Context) {
             .last_scan
             .is_none_or(|t| t.elapsed() >= crate::git::scan_interval(SCAN_BASE, st.last_cost));
         if due {
-            st.pending = Some(spawn_scan(st.scope.clone()));
+            st.pending = Some(spawn_scan(st.roots.clone()));
         }
     }
     // 開いている間だけ、結果を拾うために軽く回す。
@@ -1395,8 +1473,21 @@ fn body(ui: &mut egui::Ui, st: &mut PanelState) -> PanelAction {
                 .strong(),
         )
         .on_hover_text(tr(tier_now.detail()));
-        ui.label(egui::RichText::new(ellipsize(&st.scope.to_string_lossy(), 52)).weak())
-            .on_hover_text(st.scope.display().to_string());
+        // worktree のときは 2 つのルートが別物になる。**それを隠さない** —
+        // 「なぜ別フォルダの相手と衝突するのか」がここでしか判らない。
+        let hover = if st.roots.tree == st.roots.key {
+            st.roots.key.display().to_string()
+        } else {
+            trf(
+                "台帳の単位 (元のリポジトリ): {key}\n作業ツリー: {tree}",
+                &[
+                    ("key", st.roots.key.display().to_string()),
+                    ("tree", st.roots.tree.display().to_string()),
+                ],
+            )
+        };
+        ui.label(egui::RichText::new(ellipsize(&st.roots.key.to_string_lossy(), 52)).weak())
+            .on_hover_text(hover);
         if ui.button("⟳").on_hover_text(tr("読み直す")).clicked() {
             action = PanelAction::Refresh;
         }
@@ -1456,11 +1547,7 @@ fn toast_line(ui: &mut egui::Ui, st: &PanelState) {
     }
 }
 
-fn lease_rows(
-    ui: &mut egui::Ui,
-    st: &PanelState,
-    vis: &egui::Visuals,
-) -> Option<PanelAction> {
+fn lease_rows(ui: &mut egui::Ui, st: &PanelState, vis: &egui::Visuals) -> Option<PanelAction> {
     let now = now_secs();
     if st.store.leases.is_empty() {
         ui.label(
@@ -1545,8 +1632,10 @@ fn claim_form(ui: &mut egui::Ui, st: &mut PanelState) -> bool {
 fn plan_section(ui: &mut egui::Ui, st: &mut PanelState, vis: &egui::Visuals) {
     ui.label(egui::RichText::new(tr("配る前に重なりを見る")).strong());
     ui.label(
-        egui::RichText::new(tr("1 行に「担当: パターン, パターン」。配る前に重なりが判ります"))
-            .weak(),
+        egui::RichText::new(tr(
+            "1 行に「担当: パターン, パターン」。配る前に重なりが判ります",
+        ))
+        .weak(),
     );
     let w = ui.available_width().max(120.0);
     ui.add(
@@ -1600,11 +1689,8 @@ fn plan_section(ui: &mut egui::Ui, st: &mut PanelState, vis: &egui::Visuals) {
     }
     if !serial.is_empty() {
         ui.label(
-            egui::RichText::new(trf(
-                "直列にやる分: {list}",
-                &[("list", serial.join(", "))],
-            ))
-            .color(vis.warn_fg_color),
+            egui::RichText::new(trf("直列にやる分: {list}", &[("list", serial.join(", "))]))
+                .color(vis.warn_fg_color),
         );
     }
 }
@@ -1648,8 +1734,14 @@ mod tests {
         assert_eq!(normalize_path("src/"), "src");
         assert_eq!(normalize_path(""), "");
         // 非 ASCII (CJK・空白入り) も壊さない
-        assert_eq!(normalize_path("ドキュメント/設計 メモ.md"), "ドキュメント/設計 メモ.md");
-        assert_eq!(normalize_path(".\\日本語\\ファイル.rs"), "日本語/ファイル.rs");
+        assert_eq!(
+            normalize_path("ドキュメント/設計 メモ.md"),
+            "ドキュメント/設計 メモ.md"
+        );
+        assert_eq!(
+            normalize_path(".\\日本語\\ファイル.rs"),
+            "日本語/ファイル.rs"
+        );
         // Windows は大文字小文字を畳む。unix は畳まない — **両側を書く**
         if cfg!(windows) {
             assert_eq!(normalize_path("SRC/App.rs"), "src/app.rs");
@@ -1724,7 +1816,11 @@ mod tests {
         let b = "*b*b*b*b*b*b*b*b*b*b*";
         let t0 = Instant::now();
         assert!(overlaps(a, b), "どちらも任意文字列に当たるので重なる");
-        assert!(t0.elapsed() < Duration::from_millis(200), "{:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]
@@ -1751,7 +1847,10 @@ mod tests {
         let got = main_repo_root_from_pointer("gitdir: C:/r/p/.git/worktrees/w1");
         assert_eq!(got, Some(PathBuf::from("C:/r/p")));
         // 形が違えば推測しない
-        assert_eq!(main_repo_root_from_pointer("gitdir: /repos/proj/.git"), None);
+        assert_eq!(
+            main_repo_root_from_pointer("gitdir: /repos/proj/.git"),
+            None
+        );
         assert_eq!(main_repo_root_from_pointer("これは違う"), None);
     }
 
@@ -1761,7 +1860,10 @@ mod tests {
         let sub = dir.join("a/b");
         std::fs::create_dir_all(&sub).expect("mkdir");
         // .git が無ければその場所自身。パニックしない
-        assert_eq!(scope_of(&sub), sub.canonicalize().unwrap_or(sub.clone()));
+        let r = roots_of(&sub);
+        let want = sub.canonicalize().unwrap_or_else(|_| sub.clone());
+        assert_eq!(r.key, want);
+        assert_eq!(r.tree, want, "git 管理外では 2 つのルートが一致する");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1778,12 +1880,25 @@ mod tests {
             format!("gitdir: {}/.git/worktrees/w1\n", main.display()),
         )
         .expect("write");
-        // **ここが競合との差**: worktree でも元のリポジトリへ寄る
-        let a = scope_of(&main.join("src"));
-        let b = scope_of(&wt);
-        assert_eq!(a, b, "worktree が別スコープになると衝突を防げない");
+        // **ここが競合との差**: worktree でも台帳のキーは元のリポジトリへ寄る
+        let a = roots_of(&main.join("src"));
+        let b = roots_of(&wt);
+        assert_eq!(a.key, b.key, "worktree が別スコープになると衝突を防げない");
         let dir = base.join("leases");
-        assert_eq!(store_path_in(&dir, &a), store_path_in(&dir, &b));
+        assert_eq!(store_path_in(&dir, &a.key), store_path_in(&dir, &b.key));
+        // **相対化は作業ツリー基準**。ここを key 基準にすると worktree の
+        // ファイルが 1 つも当たらず、機能が無言で死ぬ (実際に踏んだ)。
+        assert_ne!(a.tree, b.tree, "作業ツリーは別物のはず");
+        assert_eq!(
+            rel_within(&b.tree, &wt.join("a.rs")),
+            Some("src/a.rs".to_string()),
+            "worktree のファイルは worktree 基準で相対化する"
+        );
+        assert_eq!(
+            rel_within(&a.key, &wt.join("a.rs")),
+            None,
+            "元リポジトリ基準では当たらない (これが e2e で踏んだ穴)"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1799,6 +1914,16 @@ mod tests {
         );
         assert_eq!(rel_within(&scope, &dir.join("other")), None);
         assert_eq!(rel_within(&scope, &scope), None, "スコープ自身は対象外");
+        // **まだ無いファイル** (Write で新規作成される側) も相対化できること。
+        // ここが外れると新規ファイルの衝突を 1 件も止められない。
+        assert_eq!(
+            rel_within(&scope, &scope.join("src/まだ無い.rs")),
+            Some("src/まだ無い.rs".to_string())
+        );
+        assert_eq!(
+            rel_within(&scope, &scope.join("新しい階層/深い/file.rs")),
+            Some("新しい階層/深い/file.rs".to_string())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1854,7 +1979,14 @@ mod tests {
         let a = holder("A", "s-a");
         try_claim(&mut s, &a, &["src/a.rs".into()], 0, 600, &dead);
         assert_eq!(
-            try_claim(&mut s, &a, &["src/a.rs".into(), "src/b.rs".into()], 300, 600, &dead),
+            try_claim(
+                &mut s,
+                &a,
+                &["src/a.rs".into(), "src/b.rs".into()],
+                300,
+                600,
+                &dead
+            ),
             Claim::Granted(1),
             "既に持っているパターンは数えない"
         );
@@ -1882,7 +2014,14 @@ mod tests {
     #[test]
     fn 期限切れは回収される() {
         let mut s = Store::default();
-        try_claim(&mut s, &holder("A", "s-a"), &["src/**".into()], 0, 600, &dead);
+        try_claim(
+            &mut s,
+            &holder("A", "s-a"),
+            &["src/**".into()],
+            0,
+            600,
+            &dead,
+        );
         prune(&mut s, 599, &dead);
         assert_eq!(s.leases.len(), 1, "期限内は残る");
         prune(&mut s, 601, &dead);
@@ -1898,7 +2037,10 @@ mod tests {
         };
         try_claim(&mut s, &h, &["src/**".into()], 0, 600, &living);
         // 期限切れでも、プロセスが生きている間は猶予
-        assert!(s.leases[0].active(700, &living), "戻ってきた本人から奪わない");
+        assert!(
+            s.leases[0].active(700, &living),
+            "戻ってきた本人から奪わない"
+        );
         // **上限がある** (PID 再利用で永久に残らない)
         assert!(
             !s.leases[0].active(600 + RECLAIM_GRACE_SECS + 1, &living),
@@ -1956,7 +2098,10 @@ mod tests {
         // 台帳の場所は workspace_key 由来なので、この壊れたファイルとは別。
         // ここでは「読めない入力でも panic しない」ことを見る。
         assert_eq!(gate("claude", "PreToolUse", &payload).exit, 0);
-        assert_eq!(gate("claude", "PreToolUse", "これは JSON ではない"), pass_answer());
+        assert_eq!(
+            gate("claude", "PreToolUse", "これは JSON ではない"),
+            pass_answer()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2042,7 +2187,14 @@ mod tests {
         });
         let h2 = std::thread::spawn(move || {
             with_store(&s2, |s| {
-                try_claim(s, &holder("B", "s-b"), &["src/app.rs".into()], 0, 600, &dead)
+                try_claim(
+                    s,
+                    &holder("B", "s-b"),
+                    &["src/app.rs".into()],
+                    0,
+                    600,
+                    &dead,
+                )
             })
         });
         let r1 = h1.join().expect("join");
@@ -2054,7 +2206,11 @@ mod tests {
         // 少なくとも片方は取れ、台帳の中身は 1 人ぶんだけ (後勝ちが起きない)
         assert!(granted >= 1, "{r1:?} {r2:?}");
         let got = read_store(&store).expect("読める");
-        assert_eq!(got.leases.len(), 1, "2 人が同時に所有してはいけない: {got:?}");
+        assert_eq!(
+            got.leases.len(),
+            1,
+            "2 人が同時に所有してはいけない: {got:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
