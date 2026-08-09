@@ -56,7 +56,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::agents::approvals::{self, ApprovalQueue, ReplyAction, Verdict};
@@ -97,6 +97,16 @@ const MESSAGE_CAP: usize = 200_000;
 const USAGE_REPAINT_MS: u64 = 500;
 /// メッセージチャンクの再描画間引き (約 30fps)。チャンクは 1 文字単位で届く。
 const CHUNK_REPAINT_MS: u64 = 33;
+/// ハンドシェイクを諦めるまでの時間。
+///
+/// **実測の動機**: `npx @agentclientprotocol/claude-agent-acp@0.66.0` は
+/// `initialize` に即答するのに、`session/new` へ **45 秒待っても答えなかった**
+/// (未ログインだと内部の CLI 起動で止まる)。答えを待ち続けると「セッション
+/// 作成中」のまま固まったパネルが残るので、時間で切って PTY への降格を促す。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
+/// ハンドシェイク中だけ回す最小フレーム間隔 (時間切れ判定を進めるため)。
+/// **アイドルでは 1 本も予約しない** (この予約はハンドシェイク中限定)。
+const HANDSHAKE_TICK: Duration = Duration::from_millis(500);
 
 // ═══════════════════════════════════════════════════════════════════════
 //  1. エージェントカタログ (**データは src/agents.rs**)
@@ -336,7 +346,9 @@ impl ToolKind {
             ToolKind::Delete => "🗑",
             ToolKind::Move => "📦",
             ToolKind::Search => "🔍",
-            ToolKind::Execute => "⌘",
+            // コマンドキーの記号は打鍵表記と紛らわしいので使わない
+            // (番人テスト `画面に出す打鍵表記をベタ書きしていない` が咎める)
+            ToolKind::Execute => "▶",
             ToolKind::Think => "💭",
             ToolKind::Fetch => "🌐",
             ToolKind::SwitchMode => "🔀",
@@ -1404,6 +1416,13 @@ pub struct Turn {
     pub message: String,
     /// 思考 (チャンクを連結したもの)。
     pub thought: String,
+    /// **こちらの依頼**。`session/load` / `session/resume` の再生では過去の
+    /// やり取りが `user_message_chunk` として流れてくるので、それを受ける。
+    pub user_message: String,
+    /// 設定オプションの件数 (中身は今のところ操作面を持たないので数だけ)。
+    pub config_options: usize,
+    /// セッションの最終更新時刻 (エージェント申告。表示はホバーだけ)。
+    pub updated_at: Option<String>,
     /// 使用量 (最後の 1 件だけ持つ = 合体)。
     pub usage: Option<Usage>,
     /// セッションの自動タイトル。
@@ -1424,6 +1443,7 @@ impl Turn {
         self.tools.clear();
         self.message.clear();
         self.thought.clear();
+        self.user_message.clear();
         self.stop = None;
     }
 
@@ -1436,7 +1456,9 @@ impl Turn {
             SessionUpdate::AgentThoughtChunk { content } => {
                 push_capped(&mut self.thought, &content.display_text());
             }
-            SessionUpdate::UserMessageChunk { .. } => {}
+            SessionUpdate::UserMessageChunk { content } => {
+                push_capped(&mut self.user_message, &content.display_text());
+            }
             SessionUpdate::ToolCall(p) | SessionUpdate::ToolCallUpdate(p) => self.upsert_tool(p),
             SessionUpdate::Plan { entries } => self.plan = entries,
             SessionUpdate::AvailableCommandsUpdate { available_commands } => {
@@ -1445,10 +1467,17 @@ impl Turn {
             SessionUpdate::CurrentModeUpdate { current_mode_id } => {
                 self.mode = Some(current_mode_id);
             }
-            SessionUpdate::ConfigOptionUpdate { .. } => {}
-            SessionUpdate::SessionInfoUpdate { title, .. } => {
+            SessionUpdate::ConfigOptionUpdate { config_options } => {
+                // 完全な状態が毎回届く。操作面を持たないので件数だけ持つ
+                // (中身を抱えても表示できず、抱えるだけ嘘になる)。
+                self.config_options = config_options.as_array().map(Vec::len).unwrap_or(0);
+            }
+            SessionUpdate::SessionInfoUpdate { title, updated_at } => {
                 if let Some(t) = title {
                     self.title = Some(t);
+                }
+                if updated_at.is_some() {
+                    self.updated_at = updated_at;
                 }
             }
             SessionUpdate::UsageUpdate(u) => self.usage = Some(u),
@@ -1604,6 +1633,16 @@ impl Phase {
     pub fn is_dead(&self) -> bool {
         matches!(self, Phase::Failed(_) | Phase::Ended)
     }
+
+    /// まだハンドシェイクの途中か (時間切れの対象)。
+    pub fn is_handshaking(&self) -> bool {
+        matches!(self, Phase::Initializing | Phase::CreatingSession)
+    }
+}
+
+/// ハンドシェイクを諦めるか (**純関数**)。
+pub fn handshake_timed_out(phase: &Phase, elapsed: Duration) -> bool {
+    phase.is_handshaking() && elapsed >= HANDSHAKE_TIMEOUT
 }
 
 /// 送ったリクエストの種別 (返事の相関に使う)。
@@ -1655,6 +1694,8 @@ pub struct AcpClient {
     pub prompt_draft: String,
     /// UI の入力欄 (割り込み)。
     pub steer_draft: String,
+    /// 起動した時刻 (ハンドシェイクの時間切れ判定に使う)。
+    started: Instant,
 }
 
 impl AcpClient {
@@ -1791,6 +1832,7 @@ impl AcpClient {
             log: VecDeque::new(),
             prompt_draft: String::new(),
             steer_draft: String::new(),
+            started: Instant::now(),
         };
         c.request(
             Call::Initialize,
@@ -1956,6 +1998,21 @@ impl AcpClient {
     /// 返すのはトースト用の `(本文, 成功か)`。
     pub fn pump(&mut self, queue: &mut ApprovalQueue) -> Vec<(String, bool)> {
         let mut toasts = Vec::new();
+        // **答えの来ないハンドシェイクを待ち続けない。** 固まったパネルを
+        // 残すより、理由を出して PTY へ降りてもらう方がよい。
+        if handshake_timed_out(&self.phase, self.started.elapsed()) {
+            self.phase = Phase::Failed(tr("ハンドシェイクが時間内に終わりませんでした"));
+            self.stop();
+            self.perms.clear();
+            queue.forget_session(self.id);
+            toasts.push((
+                trf(
+                    "🛰 {label}: ACP のハンドシェイクが返りません (未ログインの可能性) — PTY で起動してください",
+                    &[("label", self.label.clone())],
+                ),
+                false,
+            ));
+        }
         loop {
             let ev = match self.rx.try_recv() {
                 Ok(e) => e,
@@ -2497,6 +2554,11 @@ impl AcpManager {
             for c in &mut self.clients {
                 toasts.extend(c.pump(queue));
             }
+            // ハンドシェイク中だけ低頻度で回す (時間切れ判定を進めるため)。
+            // **終わったら 1 本も予約しない** = アイドルのコストはゼロ。
+            if self.clients.iter().any(|c| c.phase.is_handshaking()) {
+                crate::perf::repaint_after(ctx, HANDSHAKE_TICK, "acp-handshake");
+            }
         }
         if !self.open {
             return toasts;
@@ -2727,7 +2789,12 @@ fn panel_ui(
         }
     });
     if let Some(t) = &c.turn.title {
-        ui.label(RichText::new(t.clone()).size(11.5).color(theme.text));
+        let hover = match &c.turn.updated_at {
+            Some(at) => trf("最終更新: {at}", &[("at", at.clone())]),
+            None => t.clone(),
+        };
+        ui.label(RichText::new(t.clone()).size(11.5).color(theme.text))
+            .on_hover_text(hover);
     }
     ui.horizontal_wrapped(|ui| {
         ui.label(
@@ -2741,6 +2808,19 @@ fn panel_ui(
                     .size(10.5)
                     .color(theme.text_dim),
             );
+        }
+        if c.turn.config_options > 0 {
+            ui.label(
+                RichText::new(trf(
+                    "⚙ 設定 {n} 件",
+                    &[("n", c.turn.config_options.to_string())],
+                ))
+                .size(10.5)
+                .color(theme.text_dim),
+            )
+            .on_hover_text(tr(
+                "エージェント側の設定項目 (この画面からは変更できません)",
+            ));
         }
     });
     // ── 承認待ち (0 件なら 1 ピクセルも描かない) ──
@@ -2823,6 +2903,22 @@ fn panel_ui(
                 for t in &c.turn.tools {
                     tool_row(ui, theme, t, &l);
                 }
+                ui.add_space(space::XS);
+            }
+
+            // ── こちらの依頼 (再開・読込の再生でだけ埋まる) ──
+            if !c.turn.user_message.is_empty() {
+                ui.label(
+                    RichText::new(tr("🙋 依頼"))
+                        .size(12.0)
+                        .strong()
+                        .color(theme.text),
+                );
+                ui.label(
+                    RichText::new(c.turn.user_message.clone())
+                        .size(11.0)
+                        .color(theme.text_dim),
+                );
                 ui.add_space(space::XS);
             }
 
@@ -3087,7 +3183,7 @@ mod tests {
     // ── フレーミングと振り分け ──────────────────────────────────
 
     #[test]
-    fn 送信するJSONに生の改行が入らない() {
+    fn 送信する1行に生の改行が入らない() {
         // 改行を含む本文でも、1 メッセージ = 1 行の規約は破られない。
         let line = rpc_request(1, "session/prompt", json!({"text":"a\nb\r\nc"}));
         assert!(!line.contains('\n'), "生の改行が混ざった: {line}");
@@ -3232,7 +3328,41 @@ mod tests {
     }
 
     #[test]
-    fn 知らない種別はUnknownになって落ちない() {
+    fn セッション情報と設定件数と依頼の再生を取り込む() {
+        let mut turn = Turn::default();
+        // 自動タイトルは**プロンプト応答の後**に届く
+        turn.apply(parse_update(
+            r#"{"sessionUpdate":"session_info_update","title":"直したい","updatedAt":"2026-08-09T00:00:00Z"}"#,
+        ));
+        assert_eq!(turn.title.as_deref(), Some("直したい"));
+        assert_eq!(turn.updated_at.as_deref(), Some("2026-08-09T00:00:00Z"));
+        // title だけの更新で updatedAt を消さない
+        turn.apply(parse_update(
+            r#"{"sessionUpdate":"session_info_update","title":"別の題"}"#,
+        ));
+        assert_eq!(turn.updated_at.as_deref(), Some("2026-08-09T00:00:00Z"));
+        // 設定オプションは完全な状態で届く (件数だけ持つ)
+        turn.apply(parse_update(
+            r#"{"sessionUpdate":"config_option_update","configOptions":[{"id":"a"},{"id":"b"}]}"#,
+        ));
+        assert_eq!(turn.config_options, 2);
+        // session/load の再生は user_message_chunk で流れてくる
+        turn.apply(parse_update(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"直して"}}"#,
+        ));
+        assert_eq!(turn.user_message, "直して");
+        // 新しいターンを始めたら**ターン固有のものだけ**捨てる
+        turn.apply(parse_update(
+            r#"{"sessionUpdate":"current_mode_update","currentModeId":"plan"}"#,
+        ));
+        turn.begin();
+        assert!(turn.user_message.is_empty());
+        assert_eq!(turn.mode.as_deref(), Some("plan"), "モードは残る");
+        assert_eq!(turn.title.as_deref(), Some("別の題"), "タイトルは残る");
+    }
+
+    #[test]
+    fn 知らない種別は未知として扱われ落ちない() {
         let u = parse_update(r#"{"sessionUpdate":"future_thing","whatever":1}"#);
         assert!(matches!(u, SessionUpdate::Unknown));
         // 未知の余分なフィールドがあっても既知の種別は読める
@@ -3270,7 +3400,7 @@ mod tests {
     // ── 実測ターンの再現 ─────────────────────────────────────────
 
     #[test]
-    fn toolcallのタイトルは後から訂正されrawInputは少しずつ埋まる() {
+    fn ツール呼び出しのタイトルは後から訂正され引数は少しずつ埋まる() {
         let mut turn = Turn::default();
         // 実測: 総称のタイトル + 空の rawInput で先に届く
         turn.apply(parse_update(
@@ -3902,6 +4032,33 @@ mod tests {
     // ── 段の表示 (設計原則 4) ─────────────────────────────────────
 
     #[test]
+    fn 答えの来ないハンドシェイクは時間で打ち切る() {
+        // 実測: claude-agent-acp は initialize に即答するのに session/new へ
+        // 45 秒答えなかった (未ログイン)。固まったパネルを残さない。
+        let table: &[(Phase, Duration, bool)] = &[
+            (Phase::Initializing, Duration::from_secs(1), false),
+            (Phase::Initializing, HANDSHAKE_TIMEOUT, true),
+            (Phase::CreatingSession, HANDSHAKE_TIMEOUT, true),
+            // 走り出したあとは**いくらかかっても切らない** (長いターンは正常)
+            (Phase::Idle, Duration::from_secs(6000), false),
+            (Phase::Running, Duration::from_secs(6000), false),
+            (Phase::Ended, Duration::from_secs(6000), false),
+            (
+                Phase::Failed(String::new()),
+                Duration::from_secs(6000),
+                false,
+            ),
+        ];
+        for (phase, elapsed, want) in table {
+            assert_eq!(
+                handshake_timed_out(phase, *elapsed),
+                *want,
+                "{phase:?} / {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
     fn 段の表示は構造化プロトコルと画面スクレイプを区別する() {
         assert_ne!(Rung::StructuredProtocol.label(), Rung::ScreenScrape.label());
         assert!(Rung::StructuredProtocol.label().contains("ACP"));
@@ -3912,7 +4069,7 @@ mod tests {
     // ── 疑似セッション ID ────────────────────────────────────────
 
     #[test]
-    fn acpのセッションIDはPTYと空間が重ならない() {
+    fn acpのセッション識別子は端末側と空間が重ならない() {
         let m = AcpManager::default();
         assert!(
             m.next_id >= ACP_SESSION_ID_BASE,
@@ -3944,14 +4101,224 @@ mod tests {
 
     // ── 表示文字列 ───────────────────────────────────────────────
 
+    // ── 実プロセスでの一巡 (既定では走らない) ─────────────────────
+    //
+    // **通常のテストは実エージェントのバイナリを要求しない** (上の
+    // `read_loop` を `Cursor` で回すテストが振り分けの正体を押さえている)。
+    // ここだけは子プロセスを本当に起こして initialize → prompt → ツール →
+    // 権限要求 → stopReason を通す確認で、`#[ignore]` を付けてある。
+    //
+    //   cargo test --bin zai acp:: -- --ignored --nocapture
+
+    /// 最小のモック ACP エージェント (Node.js)。実測ターンを縮約したもの。
+    const MOCK_AGENT_JS: &str = r#"
+const rl = require("readline").createInterface({ input: process.stdin });
+const out = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+const upd = (u) => out({ jsonrpc: "2.0", method: "session/update",
+                         params: { sessionId: "s1", update: u } });
+let permResolve = null;
+process.stderr.write("mock-acp ready\n");
+rl.on("line", (line) => {
+  const m = JSON.parse(line);
+  if (m.method === undefined && m.id === 900 && permResolve) { permResolve(m); return; }
+  if (m.method === "initialize") {
+    out({ jsonrpc: "2.0", id: m.id, result: {
+      protocolVersion: 1,
+      agentCapabilities: { promptCapabilities: { image: true }, loadSession: true,
+                           sessionCapabilities: { resume: {} } },
+      agentInfo: { name: "mock-acp", title: "Mock ACP", version: "0.0.1" },
+      authMethods: [], _meta: { steering: { supported: true } } } });
+    return;
+  }
+  if (m.method === "session/new") {
+    out({ jsonrpc: "2.0", id: m.id, result: { sessionId: "s1", models: [{ id: "x" }] } });
+    return;
+  }
+  if (m.method === "session/prompt") {
+    upd({ sessionUpdate: "plan", entries: [
+      { content: "やる", status: "in_progress", priority: "high" } ] });
+    for (const t of ["I", "'ll ", "run", " it"])
+      upd({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: t } });
+    upd({ sessionUpdate: "tool_call", toolCallId: "t1", title: "Terminal",
+          kind: "execute", status: "pending", rawInput: {} });
+    for (let i = 0; i < 7; i++)
+      upd({ sessionUpdate: "usage_update", used: 100 * i, size: 200000 });
+    permResolve = (reply) => {
+      const ok = reply.result && reply.result.outcome &&
+                 reply.result.outcome.outcome === "selected" &&
+                 reply.result.outcome.optionId === "allow";
+      process.stderr.write("picked " + JSON.stringify(reply.result) + "\n");
+      upd({ sessionUpdate: "tool_call_update", toolCallId: "t1", title: "echo hi",
+            status: ok ? "completed" : "failed", rawInput: { command: "echo hi" },
+            locations: [{ path: PROBE, line: 1 }] });
+      out({ jsonrpc: "2.0", id: m.id,
+            result: { stopReason: ok ? "end_turn" : "refusal", usage: { in: 1 } } });
+      upd({ sessionUpdate: "session_info_update", title: "モックのターン" });
+    };
+    out({ jsonrpc: "2.0", id: 900, method: "session/request_permission", params: {
+      sessionId: "s1",
+      toolCall: { toolCallId: "t1", title: "Terminal", kind: "execute",
+                  rawInput: { command: "echo hi" } },
+      options: [ { optionId: "reject", name: "Deny", kind: "reject_once" },
+                 { optionId: "allow", name: "Allow Once", kind: "allow_once" },
+                 { optionId: "allow_always", name: "Always", kind: "allow_always" } ] } });
+    return;
+  }
+  if (m.method === "_session/steering") {
+    process.stderr.write("steering ok\n");
+    out({ jsonrpc: "2.0", id: m.id, result: {} });
+    return;
+  }
+  if (m.id !== undefined)
+    out({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "no" } });
+});
+"#;
+
+    /// 条件が揃うまで `pump` を回す。揃わなければ `false`。
+    fn pump_until(
+        c: &mut AcpClient,
+        q: &mut ApprovalQueue,
+        secs: u64,
+        mut done: impl FnMut(&AcpClient) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            c.pump(q);
+            if done(c) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        c.pump(q);
+        done(c)
+    }
+
+    #[test]
+    #[ignore = "node の子プロセスを起こす実プロセス試験 (--ignored で実行)"]
+    fn 実プロセスで一巡する() {
+        let Some(_node) = crate::shellenv::which("node") else {
+            panic!("node が無いので走らせられない");
+        };
+        let root = crate::test_util::unique_temp_dir("zaivern", "acp-live");
+        let probe = root.join("README.md");
+        std::fs::write(&probe, "hello").expect("プローブを書ける");
+        let script = root.join("mock-acp.js");
+        let js = format!(
+            "const PROBE = {};\n{MOCK_AGENT_JS}",
+            serde_json::to_string(&probe.display().to_string()).expect("パスを JSON 化")
+        );
+        std::fs::write(&script, js).expect("モックを書ける");
+
+        // 'static なカタログ項目をその場で作る (テスト専用のリーク)。
+        let arg: &'static str = Box::leak(script.display().to_string().into_boxed_str());
+        let args: &'static [&'static str] = Box::leak(vec![arg].into_boxed_slice());
+        let entry: &'static AcpEntry = Box::leak(Box::new(AcpEntry {
+            id: "mock",
+            label: "Mock ACP",
+            icon: "🧪",
+            local_bin: "node",
+            local_args: args,
+            npx_package: "",
+            npx_version: "",
+            npx_args: &[],
+            note: "",
+        }));
+
+        let host = Arc::new(FsHost::default());
+        host.set_roots(&[root.clone()]);
+        let mut q = ApprovalQueue::in_dir(root.join("logs"));
+        let mut c = AcpClient::start(entry, ACP_SESSION_ID_BASE, root.clone(), host, None)
+            .expect("モックを起動できる");
+
+        assert!(
+            pump_until(&mut c, &mut q, 20, |c| c.phase == Phase::Idle),
+            "ハンドシェイクが終わらない: {:?} log={:?}",
+            c.phase,
+            c.log
+        );
+        assert!(c.steering, "_meta.steering.supported を拾えていない");
+        assert_eq!(
+            c.info.as_ref().map(|i| i.display_line()),
+            Some("Mock ACP 0.0.1".to_string())
+        );
+        assert!(c.caps.session_supports("resume"));
+        assert!(c.caps.supports_image());
+
+        assert!(c.prompt("やって"), "プロンプトを送れない");
+        assert!(
+            pump_until(&mut c, &mut q, 20, |c| !c
+                .pending_permission_ids()
+                .is_empty()),
+            "権限要求が承認キューへ積まれない: log={:?}",
+            c.log
+        );
+        assert_eq!(q.pending_len(), 1, "承認キューに 1 件積まれている");
+        let req = q.pending().next().expect("承認要求").clone();
+        assert_eq!(
+            req.kind,
+            approvals::ApprovalKind::ShellCommand,
+            "承認種別の翻訳が効いていない: {}",
+            req.summary
+        );
+
+        // 承認パネルが「承認」を押したのと同じ経路を通す。
+        let res = q.apply(req.id, approvals::Command::Approve);
+        assert_eq!(res.replies.len(), 1);
+        for (sid, action) in &res.replies {
+            assert_eq!(*sid, c.id);
+            assert!(c.answer_permission(*action), "返事を送れない");
+        }
+
+        assert!(
+            pump_until(&mut c, &mut q, 20, |c| c.turn.stop.is_some()),
+            "stopReason が返らない: log={:?}",
+            c.log
+        );
+        assert_eq!(c.turn.stop, Some(StopReason::EndTurn));
+        assert_eq!(c.turn.message, "I'll run it", "チャンクの連結が壊れている");
+        assert_eq!(c.turn.tools.len(), 1);
+        assert_eq!(
+            c.turn.tools[0].display_title(),
+            "echo hi",
+            "タイトルの訂正が効いていない"
+        );
+        assert_eq!(c.turn.tools[0].status, Some(ToolCallStatus::Completed));
+        assert!(
+            c.turn.tools[0].location_line().contains("README.md"),
+            "場所が取れていない: {}",
+            c.turn.tools[0].location_line()
+        );
+        assert_eq!(c.turn.plan.len(), 1);
+        assert!(c.turn.usage.is_some(), "usage を取り込んでいない");
+
+        // 割り込み (走行中でなくても受け付けられる = promptRequired へ降格)
+        assert!(c.steer("そのファイルじゃない"), "割り込みを送れない");
+        assert!(
+            pump_until(&mut c, &mut q, 10, |c| c
+                .log
+                .iter()
+                .any(|l| l.contains("steering ok"))),
+            "割り込みがエージェントへ届いていない: log={:?}",
+            c.log
+        );
+
+        c.cancel(&mut q);
+        c.stop();
+        assert!(c.phase.is_dead());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn 画面に出す打鍵表記をベタ書きしていない() {
         // このモジュールはショートカットを持たない。持ったら keybinds 経由に
         // すること (config.toml で再割り当てされた瞬間に嘘になるため)。
         let src = include_str!("acp.rs").replace("\r\n", "\n");
+        // 検査対象は**本体だけ** (このテスト自身が持つ照合パターンを
+        // 自分で拾ってしまわないよう、テストモジュールから先は見ない)。
+        let body = src.split("#[cfg(test)]").next().expect("本体がある");
         for pat in ["⌘", "Ctrl+", "⌃", "⌥"] {
             assert!(
-                !src.contains(pat),
+                !body.contains(pat),
                 "打鍵表記 {pat} をベタ書きしている — keybinds::format_shortcut を使うこと"
             );
         }

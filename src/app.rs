@@ -3650,7 +3650,10 @@ pub struct ZaivernApp {
     // ── ACP クライアント (crate::acp) ─────────────────────────────
     /// 構造化プロトコル (ACP) で駆動しているエージェント群とそのパネル。
     /// 接続 0 本のときは何も描かず、1 フレームも起こさない。
-    acp: acp::AcpManager,
+    ///
+    /// `pub` にしてあるのは `crate::feature` の登録面 (`dispatch` / `draw` が
+    /// `&mut ZaivernApp` を受け取る) から触れるようにするため。
+    pub acp: acp::AcpManager,
 
     // ── MCP サーバ管理パネル (crate::mcp) ─────────────────────────
     /// ボトムパネルを「🔌 MCP」表示に切り替えているか。
