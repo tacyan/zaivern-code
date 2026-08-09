@@ -589,7 +589,12 @@ mod tests {
             ..peek_ready()
         };
         assert_eq!(
-            decide(&Job::user(1, "やって"), &peek, Duration::ZERO, Duration::ZERO),
+            decide(
+                &Job::user(1, "やって"),
+                &peek,
+                Duration::ZERO,
+                Duration::ZERO
+            ),
             Act::Gone
         );
     }
