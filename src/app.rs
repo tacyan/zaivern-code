@@ -11149,7 +11149,6 @@ impl ZaivernApp {
             | Cmd::RemoveFolder(_) => self.apply_cmd_run_workspace(cmd, ctx),
             Cmd::ToggleTerminal
             | Cmd::ToggleCockpit
-            | Cmd::ToggleConflictRadar
             | Cmd::ToggleKanban
             | Cmd::ToggleDeck
             | Cmd::OpenAgentPicker
@@ -11818,14 +11817,6 @@ impl ZaivernApp {
                     self.agents.panel_open = !self.agents.panel_open;
                 }
                 self.persist_session();
-            }
-            Cmd::ToggleConflictRadar => {
-                self.radar_open = !self.radar_open;
-                if self.radar_open {
-                    // 開くたびに絞り込みは解く (前回の選択が残っていると
-                    // 「開いたのに何も出ない」に見える)。
-                    self.radar_pair = None;
-                }
             }
             Cmd::ToggleCockpit => {
                 self.cockpit = !self.cockpit;
@@ -17392,8 +17383,18 @@ impl ZaivernApp {
         specs
     }
 
+    /// 🛰 衝突レーダーの開閉 ([`crate::conflict::FEATURE`] から呼ばれる)。
+    pub(crate) fn toggle_conflict_radar(&mut self) {
+        self.radar_open = !self.radar_open;
+        if self.radar_open {
+            // 開くたびに絞り込みは解く (前回選んだ組が残っていると
+            // 「開いたのに何も出ない」に見える)。
+            self.radar_pair = None;
+        }
+    }
+
     /// 🛰 衝突レーダーの窓。**閉じているときは 1 命令も走らない**。
-    fn conflict_radar_ui(&mut self, ctx: &egui::Context) {
+    pub(crate) fn conflict_radar_ui(&mut self, ctx: &egui::Context) {
         if !self.radar_open {
             return;
         }
@@ -23974,12 +23975,6 @@ impl ZaivernApp {
                 Cmd::ToggleCockpit,
             ),
             (
-                "🛰".into(),
-                tr("衝突レーダー (並列ワークツリーのマージ衝突予測)"),
-                String::new(),
-                Cmd::ToggleConflictRadar,
-            ),
-            (
                 "📋".into(),
                 tr("フリート看板 切替"),
                 fmt_key(BindAction::ToggleKanban),
@@ -29594,7 +29589,6 @@ impl ZaivernApp {
         self.stop_all_confirm_ui(ctx);
         self.worktree_confirm_ui(ctx);
         self.checkpoint_ui(ctx);
-        self.conflict_radar_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
         // feature.rs のレジストリに登録された機能のオーバーレイ。
