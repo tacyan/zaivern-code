@@ -1880,6 +1880,27 @@ impl AgentManager {
         }
     }
 
+    /// 稼働中のセッションを**全部**止める (タブは残す)。戻り値は止めに行った本数。
+    ///
+    /// - [`Session::kill`] を通すので、**プロセスツリーごと**落ちる
+    ///   (`procx::kill_tree` → unix はプロセスグループ、Windows は `taskkill /T`)。
+    ///   直接の子だけを撃つと、シェルが `exec` せずに起こした孫がパイプを
+    ///   握ったまま残り、読み取りの join が戻らず UI が固まる。
+    /// - **終了済みには撃たない**。wait 済みの PID は OS に返却されており、
+    ///   無関係なプロセス (グループ) に再利用され得るため
+    ///   (`Session::kill` 側にも同じガードがあり、ここは二重の栓)。
+    /// - kill は別スレッドへ投げるだけなので、UI スレッドから呼んでよい。
+    pub fn stop_all(&mut self) -> usize {
+        let mut n = 0;
+        for s in self.sessions.iter_mut() {
+            if s.running() {
+                s.kill();
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn active_session(&mut self) -> Option<&mut Session> {
         self.sessions.get_mut(self.active)
     }
@@ -1994,6 +2015,1054 @@ impl AgentManager {
             }
         }
         n
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  状態ラダー上位 2 段のカタログ (CLAUDE.md 設計原則 #4)
+//
+//  構造化プロトコル > ベンダー提供フック > 状態ファイル > 画面スクレイプ。
+//  上 2 段の**エージェント固有値**(フラグ・イベント名・ツール名・設定ファイルの
+//  場所) はすべてここにデータとして持つ。機構は `supervisor::protocol` /
+//  `supervisor::hooks` にあり、リテラルを 1 つも持たない。
+//
+//  **実機で確認できたものだけを書く。** 憶測で 1 行足すと、そのエージェントは
+//  「画面より確かな判定」として嘘を配ることになる (最下段より有害)。
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::supervisor::hooks::HookTarget;
+use crate::supervisor::protocol::{EventRule, ProtoState, StreamDialect};
+
+/// Claude Code のツール名 → 状態。名前は実機 `stream-json` の
+/// `{"type":"system","subtype":"init","tools":[…]}` から採取した実在の値。
+///
+/// ここに無いツールは規則側の状態 (= ツール実行 → 実行中) のままにする。
+const CLAUDE_TOOLS: &[(&str, ProtoState)] = &[
+    ("Edit", ProtoState::Editing),
+    ("Write", ProtoState::Editing),
+    ("NotebookEdit", ProtoState::Editing),
+];
+
+/// 構造化出力を持つと**実機で確認できた**エージェントの方言表。
+///
+/// ## 確認方法と結果 (2026-08)
+/// - `claude` 2.1.226: `claude --help` に
+///   `--output-format <format> … "stream-json" (realtime streaming)` があり、
+///   `claude -p --output-format stream-json --verbose` を実行して JSONL を採取。
+///   観測した `type`: `system`(subtype=`init`/`hook_started`/`hook_response`/
+///   `thinking_tokens`) / `assistant` / `rate_limit_event` / `result`(subtype=`success`)。
+///   **注意**: `--output-format` は `--print` (非対話) 専用。対話 PTY セッションでは
+///   出ないので、この段が効くのはヘッドレス実行のときだけ。対話セッションは
+///   フック段 ([`HOOK_TARGETS`]) が受け持つ。
+/// - `codex` 0.147.0: `codex exec --help` に `--json  Print events to stdout as JSONL`。
+///   `codex exec --json` を実行して JSONL を採取。観測した `type`:
+///   `thread.started` / `turn.started` / `item.started` / `item.completed`
+///   (`item.type` = `agent_message` / `command_execution`) / `turn.completed`。
+/// - `gemini` 0.51.0: `gemini --help` に `-o, --output-format … "stream-json"` は
+///   **在る**。しかし実行がアカウント制限 (IneligibleTierError) で通らず、
+///   イベントの語彙を 1 件も観測できなかった → **意図的に表へ入れていない**。
+///   観測できたら 1 エントリ足すだけで有効になる。
+pub static STREAM_DIALECTS: &[StreamDialect] = &[
+    StreamDialect {
+        bin: "claude",
+        args: "--print --verbose --output-format stream-json",
+        kind_path: "type",
+        rules: &[
+            EventRule {
+                kind: "system",
+                sub_path: "subtype",
+                sub_value: "init",
+                state: ProtoState::Starting,
+                detail_path: "",
+            },
+            // 失敗を先に見る (result は成功も失敗も同じ種別で来る)。
+            EventRule {
+                kind: "result",
+                sub_path: "is_error",
+                sub_value: "true",
+                state: ProtoState::Failed,
+                detail_path: "",
+            },
+            EventRule {
+                kind: "result",
+                sub_path: "subtype",
+                sub_value: "success",
+                state: ProtoState::Done,
+                detail_path: "",
+            },
+            // content[] の中に tool_use ブロックが在れば「ツールを使っている」。
+            EventRule {
+                kind: "assistant",
+                sub_path: "message.content[].type",
+                sub_value: "tool_use",
+                state: ProtoState::Running,
+                detail_path: "message.content[].name",
+            },
+            EventRule {
+                kind: "assistant",
+                sub_path: "",
+                sub_value: "",
+                state: ProtoState::Thinking,
+                detail_path: "",
+            },
+        ],
+        tools: CLAUDE_TOOLS,
+        verified: "claude 2.1.226 — --help の choices + `claude -p --output-format stream-json --verbose` の実出力",
+    },
+    StreamDialect {
+        bin: "codex",
+        args: "exec --json",
+        kind_path: "type",
+        rules: &[
+            EventRule {
+                kind: "thread.started",
+                sub_path: "",
+                sub_value: "",
+                state: ProtoState::Starting,
+                detail_path: "",
+            },
+            EventRule {
+                kind: "item.started",
+                sub_path: "item.type",
+                sub_value: "command_execution",
+                state: ProtoState::Running,
+                detail_path: "item.command",
+            },
+            // コマンドが終われば手番はモデルへ戻る。
+            EventRule {
+                kind: "item.completed",
+                sub_path: "item.type",
+                sub_value: "command_execution",
+                state: ProtoState::Thinking,
+                detail_path: "item.command",
+            },
+            EventRule {
+                kind: "item.completed",
+                sub_path: "item.type",
+                sub_value: "agent_message",
+                state: ProtoState::Thinking,
+                detail_path: "",
+            },
+            EventRule {
+                kind: "turn.started",
+                sub_path: "",
+                sub_value: "",
+                state: ProtoState::Thinking,
+                detail_path: "",
+            },
+            EventRule {
+                kind: "turn.completed",
+                sub_path: "",
+                sub_value: "",
+                state: ProtoState::Idle,
+                detail_path: "",
+            },
+        ],
+        // codex の item は `command_execution` しか観測できていない。
+        // ファイル編集の item 種別は未観測なので表を空にしておく (憶測を書かない)。
+        tools: &[],
+        verified: "codex-cli 0.147.0 — `codex exec --help` の --json + `codex exec --json` の実出力",
+    },
+];
+
+/// 構造化出力の方言。持たないエージェントでは `None`。
+pub fn stream_dialect(bin: &str) -> Option<&'static StreamDialect> {
+    STREAM_DIALECTS.iter().find(|d| d.bin == bin)
+}
+
+/// **このコマンドは構造化出力つきで起動されているか**。
+///
+/// カタログの `args` に並んだトークンが**すべて**コマンド行に在るときだけ
+/// `Some`。素の `claude` を「構造化段が使える」と誤認しないための関門であり、
+/// フラグ名のリテラルはここにも一切置かない (表から引くだけ)。
+pub fn stream_dialect_for_command(command: &str) -> Option<&'static StreamDialect> {
+    let spec = spec_for_command(command)?;
+    let d = stream_dialect(spec.bin)?;
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    d.args
+        .split_whitespace()
+        .all(|need| tokens.contains(&need))
+        .then_some(d)
+}
+
+/// フックを仕掛けられると**実機で確認できた**エージェント。
+///
+/// ## 確認方法 (2026-08)
+/// `claude` 2.1.226 の `--output-format stream-json` に
+/// `{"type":"system","subtype":"hook_started","hook_event":"SessionStart",
+///   "hook_name":"SessionStart:startup"}` と、続く `hook_response` が流れた
+/// = フックが実際に発火している。設定の形と有効なイベント名は実在する
+/// `~/.claude/settings.json` から採取した (`hooks.<Event>[].hooks[].command`)。
+///
+/// 表に入れているのは、その中で**名前から意味が一意に決まるもの**だけ。
+/// `Notification` / `Elicitation` などは「何を待っているか」がペイロード次第
+/// なので、当てずっぽうで承認待ちに落とさない。
+pub static HOOK_TARGETS: &[HookTarget] = &[HookTarget {
+    bin: "claude",
+    settings_rel: ".claude/settings.json",
+    events: &[
+        ("SessionStart", ProtoState::Starting, false),
+        ("UserPromptSubmit", ProtoState::Thinking, false),
+        // ツールを使う直前 = そのツール名で状態を細分できる唯一の点。
+        ("PreToolUse", ProtoState::Running, true),
+        ("PostToolUse", ProtoState::Thinking, false),
+        ("PermissionRequest", ProtoState::Approval, false),
+        ("Stop", ProtoState::Idle, false),
+        ("SessionEnd", ProtoState::Done, false),
+    ],
+    tools: CLAUDE_TOOLS,
+    verified: "claude 2.1.226 — stream-json に hook_started/hook_response を観測 + 実在の ~/.claude/settings.json の hooks スキーマ",
+}];
+
+/// フック設定の対象。持たないエージェントでは `None`。
+pub fn hook_target(bin: &str) -> Option<&'static HookTarget> {
+    HOOK_TARGETS.iter().find(|t| t.bin == bin)
+}
+
+/// フックイベント名 → (状態, ツール名で細分してよいか)。カタログに無ければ `None`。
+pub fn hook_event_state(bin: &str, event: &str) -> Option<(ProtoState, bool)> {
+    hook_target(bin)?
+        .events
+        .iter()
+        .find(|(e, _, _)| *e == event)
+        .map(|(_, s, refine)| (*s, *refine))
+}
+
+/// ツール名 → 状態 (フック段の細分)。表に無ければ `None`。
+pub fn hook_tool_state(bin: &str, tool: &str) -> Option<ProtoState> {
+    if tool.is_empty() {
+        return None;
+    }
+    hook_target(bin)?
+        .tools
+        .iter()
+        .find(|(n, _)| *n == tool)
+        .map(|(_, s)| *s)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  非対話 (ヘッドレス) の一発実行カタログ — セッションの自動命名に使う
+//
+//  「そのエージェント自身の CLI に、自分の作業へ短い題名を付けさせる」ための表。
+//  **コマンド名もフラグもここにしか無い** (機構側は `naming` モジュールにあり、
+//  リテラルを 1 つも持たない)。`STREAM_DIALECTS` / `HOOK_TARGETS` と同じ流儀。
+//
+//  supervisor の診断を外部 CLI へ投げない方針とは無関係 — あちらは「見張りの
+//  判断」、こちらは「本人に自分の作業を名付けさせる」もの。**別のエージェントへ
+//  投げてはいけない**という一線だけは共通で、`title_generator_for_command` が
+//  そのセッション自身の bin しか引けないようにして構造で守っている。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 非対話の一発実行 (ヘッドレス) ができると**実機で確認できた**エージェント。
+///
+/// プロンプトは常に**最後の 1 引数**として渡す。`args` に並べたトークンを
+/// bin の直後へ置くだけで済むよう、そう揃えてある
+/// (`claude -p <prompt>` / `codex exec … <prompt>` / `agy -p <prompt>`)。
+pub struct TitleGen {
+    /// 実行ファイル名 ([`AgentSpec::bin`] と同じ値)。
+    pub bin: &'static str,
+    /// bin の直後に置く引数列 (空白区切り)。プロンプトはこの後ろへ 1 引数で足す。
+    pub args: &'static str,
+    /// 何をどう確かめたか。**実機で撃った証拠だけ**を書くこと。
+    pub verified: &'static str,
+}
+
+/// セッションの自動命名を任せられる CLI の表。
+///
+/// ## 確認方法と結果 (2026-08、実機 macOS)
+/// - `claude` 2.1.226: `claude --help` に `-p, --print  Print response and exit`。
+///   `claude -p "…" --model haiku` を実行し、**標準出力に本文だけ**が出ることを確認。
+/// - `codex` 0.147.0: `codex exec --help` に `Run Codex non-interactively` と
+///   `[PROMPT]`。`codex exec --skip-git-repo-check --color never -s read-only "…"`
+///   を実行し、**進行ログは stderr・最終メッセージだけが stdout** に出ることを確認。
+///   `--skip-git-repo-check` はリポジトリ外 (命名は一時ディレクトリで走らせる) の
+///   ため、`-s read-only` は命名のついでにファイルを触らせないための栓。
+/// - `agy` (Antigravity): `agy --help` に
+///   `--print  Run a single prompt non-interactively and print the response`。
+///   `agy -p "…"` を実行し、標準出力に本文だけが出ることを確認。
+///
+/// ## **意図的に入れていない** CLI (この機では実行を確認できなかった)
+/// - `gemini` 0.51.0: `--help` に `-p, --prompt … non-interactive (headless) mode`
+///   は在るが、実行が `IneligibleTierError` + 「trusted directory ではない」で
+///   通らず、出力を 1 度も観測できなかった (`STREAM_DIALECTS` の gemini と同じ理由)。
+/// - `cursor-agent`: `--help` に `-p, --print` は在るが、未サインインで
+///   「Press any key to sign in...」の画面しか返らなかった。
+/// - `droid`: `--help` に `exec … Run non-interactively` は在るが、
+///   `Authentication failed` で本文を観測できなかった。
+///
+/// いずれも**観測できたら 1 エントリ足すだけ**で有効になる。憶測で先に書くと、
+/// 「対応と宣言したのに毎ターン無駄なプロセスを起こす」だけの表になる。
+pub static TITLE_GENERATORS: &[TitleGen] = &[
+    TitleGen {
+        bin: "claude",
+        args: "-p",
+        verified: "claude 2.1.226 — --help の `-p, --print` + `claude -p …` の実出力 (stdout に本文のみ)",
+    },
+    TitleGen {
+        bin: "codex",
+        args: "exec --skip-git-repo-check --color never -s read-only",
+        verified: "codex-cli 0.147.0 — `codex exec --help` の [PROMPT] + 実行して stdout が最終メッセージのみと確認",
+    },
+    TitleGen {
+        bin: "agy",
+        args: "-p",
+        verified: "agy — --help の `--print` + `agy -p …` の実出力 (stdout に本文のみ)",
+    },
+];
+
+/// 非対話の一発実行ができる CLI か。できなければ `None`。
+pub fn title_generator(bin: &str) -> Option<&'static TitleGen> {
+    TITLE_GENERATORS.iter().find(|g| g.bin == bin)
+}
+
+/// **このセッションを起動したコマンド自身**の命名器。
+///
+/// 引くのはコマンド行の先頭トークンから解決した bin だけ — 別のエージェントへ
+/// 投げる経路をそもそも作らない (方針「別のエージェントへ投げない」の構造的な栓)。
+pub fn title_generator_for_command(command: &str) -> Option<&'static TitleGen> {
+    title_generator(spec_for_command(command)?.bin)
+}
+
+/// セッションの自動命名 (cmux 由来) — ターン境界の検出 / 題名の検疫 / 実行。
+///
+/// **既定はオフ**。有効なときだけ、ターンが終わった瞬間に 1 回だけ走る。
+/// アイドル時は 1 プロセスも起こさない (設計原則 3)。
+pub mod naming {
+    use std::collections::HashMap;
+    use std::io::Read;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::time::{Duration, Instant};
+
+    /// 題名として受け入れる最大文字数 (Unicode スカラー値の数)。
+    /// サイドバーの 1 行に収まる長さ。超えた分は切り詰める。
+    pub const MAX_TITLE_CHARS: usize = 32;
+    /// これより長い 1 行は「題名」ではなく地の文なので**捨てる**。
+    pub const REJECT_LINE_CHARS: usize = 200;
+    /// 命名の材料として送るユーザー指示の最大文字数。
+    pub const MAX_BRIEF_CHARS: usize = 300;
+    /// 命名プロセスの上限時間。超えたらプロセスツリーごと畳んで諦める。
+    pub const TIMEOUT: Duration = Duration::from_secs(45);
+    /// 出力の保持上限 (超えた分は読み捨てる。読むのはやめない)。
+    const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+    /// 同じ bin で連続して失敗したら、このセッション中はもう起こさない。
+    pub const GIVE_UP_AFTER: u32 = 3;
+
+    /// ターン境界の検出器。
+    ///
+    /// 「出力が動いた → 静かになった」を **1 回だけ** true にする。時計は
+    /// 引数で受け取るので、テストから実時間なしで回せる。状態は 1 セッション
+    /// あたり 16 バイト程度で、動いていないセッションでは何も起こさない。
+    ///
+    /// これは状態ラダーの最下段 (画面) に依る判定だが、使い道が
+    /// 「題名を付け直す時点」だけなので、外しても害が無い
+    /// (誤検知 = 題名が 1 回多く付く / 取りこぼし = 従来名のまま)。
+    /// エージェントの**状態**の判定には使わないこと。
+    #[derive(Default)]
+    pub struct TurnWatcher {
+        per: HashMap<u64, TurnState>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TurnState {
+        last_advance_ms: u64,
+        armed: bool,
+    }
+
+    impl TurnWatcher {
+        /// `quiet_ms`: 出力が止まってからターン終了と見なすまでの静穏時間。
+        pub fn observe(&mut self, id: u64, advanced: bool, now_ms: u64, quiet_ms: u64) -> bool {
+            let e = self.per.entry(id).or_insert(TurnState {
+                last_advance_ms: now_ms,
+                armed: false,
+            });
+            if advanced {
+                e.last_advance_ms = now_ms;
+                e.armed = true;
+                return false;
+            }
+            if e.armed && now_ms.saturating_sub(e.last_advance_ms) >= quiet_ms {
+                e.armed = false;
+                return true;
+            }
+            false
+        }
+
+        /// セッションが消えたら忘れる (ID は再利用され得るので残さない)。
+        pub fn forget(&mut self, id: u64) {
+            self.per.remove(&id);
+        }
+
+        #[cfg(test)]
+        pub fn tracked(&self) -> usize {
+            self.per.len()
+        }
+    }
+
+    /// 命名器へ送る「材料」を最小化する。
+    ///
+    /// **送るのはユーザー自身が打った指示文の冒頭だけ** — エージェントの出力も、
+    /// 画面の中身も、ファイルの内容も 1 バイトも入れない。制御文字と改行は
+    /// 潰し、長さも切り詰める。
+    pub fn brief(user_prompt: &str) -> String {
+        let mut out = String::new();
+        let mut space = false;
+        for c in user_prompt.chars() {
+            if c.is_control() || c.is_whitespace() {
+                space = !out.is_empty();
+                continue;
+            }
+            if space {
+                out.push(' ');
+                space = false;
+            }
+            if out.chars().count() >= MAX_BRIEF_CHARS {
+                break;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// 題名を作らせるプロンプト。材料は [`brief`] を通したものだけ。
+    pub fn naming_prompt(brief: &str) -> String {
+        format!(
+            "Give a title for this task in 2-5 words. \
+             Reply with the title only: no quotes, no punctuation at the end, \
+             no explanation, one line. Use the same language as the task.\n\
+             Task: {brief}"
+        )
+    }
+
+    /// 生成結果を**そのまま信用しない**ための検疫。
+    ///
+    /// 受け取るのは他所のプロセスの標準出力なので、改行だらけ・空・制御文字混じり・
+    /// 何 KB もある、が普通に起こる。通すのは「1 行の短い題名」だけ。
+    /// CJK と絵文字は文字数で数えるので途中で壊れない (バイト境界で切らない)。
+    pub fn sanitize_title(raw: &str) -> Option<String> {
+        // ① 最初の「中身のある行」を取る。前置きの空行や飾り線は捨てる。
+        let line = raw
+            .lines()
+            .map(str::trim)
+            .find(|l| l.chars().any(|c| !c.is_control() && !c.is_whitespace()))?;
+        // ② 地の文の長さなら題名ではない。捨てる (切り詰めると意味が壊れる)。
+        if line.chars().count() > REJECT_LINE_CHARS {
+            return None;
+        }
+        // ③ 制御文字を落とし、連続空白を 1 つに畳む。
+        let mut s = String::new();
+        let mut space = false;
+        for c in line.chars() {
+            if c.is_control() {
+                continue;
+            }
+            if c.is_whitespace() {
+                space = !s.is_empty();
+                continue;
+            }
+            if space {
+                s.push(' ');
+                space = false;
+            }
+            s.push(c);
+        }
+        // ④ 見出し記号・引用符・箇条書きの飾りを剥がす。
+        let s = s
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\''
+                        | '`'
+                        | '#'
+                        | '*'
+                        | '-'
+                        | '_'
+                        | '“'
+                        | '”'
+                        | '「'
+                        | '」'
+                        | '『'
+                        | '』'
+                        | '【'
+                        | '】'
+                        | ':'
+                        | '：'
+                        | '.'
+                        | '。'
+                        | ' '
+                )
+            })
+            .to_string();
+        if s.is_empty() {
+            return None;
+        }
+        // ⑤ 長すぎるものは切り詰める。**文字単位**で切り、結合文字や
+        //    ZWJ で終わらないところまで戻す (絵文字の連結を割らない)。
+        let mut t: String = s.chars().take(MAX_TITLE_CHARS).collect();
+        if t.chars().count() < s.chars().count() {
+            while t
+                .chars()
+                .next_back()
+                .is_some_and(|c| c == '\u{200d}' || is_modifier_char(c))
+            {
+                t.pop();
+            }
+            t = t.trim_end().to_string();
+            if t.is_empty() {
+                return None;
+            }
+            t.push('…');
+        }
+        Some(t)
+    }
+
+    /// 単独では意味を持たない結合系の文字 (異体字セレクタ・肌色・結合記号)。
+    fn is_modifier_char(c: char) -> bool {
+        matches!(c as u32,
+            0x0300..=0x036F      // 結合分音記号
+            | 0xFE00..=0xFE0F    // 異体字セレクタ
+            | 0x1F3FB..=0x1F3FF  // 肌の色
+            | 0xE0100..=0xE01EF) // 異体字セレクタ補助
+    }
+
+    /// 1 件の命名結果。`title` が None なら**黙って従来名のまま**にする。
+    pub struct Named {
+        pub session_id: u64,
+        pub bin: &'static str,
+        pub title: Option<String>,
+    }
+
+    /// 命名の実行係。要求ごとに 1 スレッドを起こし、結果をチャネルで返す。
+    ///
+    /// UI スレッドは `poll()` の `try_recv` を舐めるだけなので、走っていない
+    /// ときのコストは 0 (設計原則 3)。
+    pub struct Namer {
+        tx: Sender<Named>,
+        rx: Receiver<Named>,
+        inflight: HashMap<u64, ()>,
+        failures: HashMap<&'static str, u32>,
+    }
+
+    impl Default for Namer {
+        fn default() -> Self {
+            let (tx, rx) = channel();
+            Self {
+                tx,
+                rx,
+                inflight: HashMap::new(),
+                failures: HashMap::new(),
+            }
+        }
+    }
+
+    impl Namer {
+        /// このセッションの命名がまだ走っているか。
+        pub fn busy(&self, session_id: u64) -> bool {
+            self.inflight.contains_key(&session_id)
+        }
+
+        /// この CLI は連続失敗で諦め済みか。
+        pub fn given_up(&self, bin: &str) -> bool {
+            self.failures.get(bin).is_some_and(|n| *n >= GIVE_UP_AFTER)
+        }
+
+        /// 命名を 1 件依頼する。走らせない条件に当たったら false。
+        pub fn request(
+            &mut self,
+            session_id: u64,
+            gen: &'static super::TitleGen,
+            brief: String,
+            ctx: egui::Context,
+        ) -> bool {
+            if self.busy(session_id) || self.given_up(gen.bin) || brief.is_empty() {
+                return false;
+            }
+            self.inflight.insert(session_id, ());
+            let tx = self.tx.clone();
+            let prompt = naming_prompt(&brief);
+            let ok = std::thread::Builder::new()
+                .name("zv-name".into())
+                .spawn(move || {
+                    let title = run_title(gen, &prompt)
+                        .ok()
+                        .and_then(|s| sanitize_title(&s));
+                    let _ = tx.send(Named {
+                        session_id,
+                        bin: gen.bin,
+                        title,
+                    });
+                    // 結果が届いたことを UI へ知らせる (1 フレームだけ起こす)。
+                    ctx.request_repaint();
+                })
+                .is_ok();
+            if !ok {
+                self.inflight.remove(&session_id);
+            }
+            ok
+        }
+
+        /// 届いた結果を取り出す。毎フレーム呼んでよい (待たない)。
+        pub fn poll(&mut self) -> Vec<Named> {
+            let mut out = Vec::new();
+            while let Ok(n) = self.rx.try_recv() {
+                self.inflight.remove(&n.session_id);
+                match n.title.is_some() {
+                    true => {
+                        self.failures.remove(n.bin);
+                    }
+                    false => *self.failures.entry(n.bin).or_insert(0) += 1,
+                }
+                out.push(n);
+            }
+            out
+        }
+
+        /// セッションが消えたら在庫も忘れる。
+        pub fn forget(&mut self, session_id: u64) {
+            self.inflight.remove(&session_id);
+        }
+
+        #[cfg(test)]
+        pub fn note_failure(&mut self, bin: &'static str) {
+            *self.failures.entry(bin).or_insert(0) += 1;
+        }
+    }
+
+    /// 命名を走らせる作業ディレクトリ。
+    ///
+    /// **プロジェクトフォルダでは走らせない** — CLI がそこの `CLAUDE.md` や
+    /// リポジトリの中身を読み込んでしまうため。OS の一時ディレクトリ配下に
+    /// 空のフォルダを 1 つだけ作って、そこを cwd にする
+    /// (パスの直書きをしないので Windows / Linux / macOS のどれでも通る)。
+    pub fn scratch_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join("zaivern-naming");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// 子プロセスを起こしてプロンプトを渡し、標準出力を返す。
+    ///
+    /// `diagnostician::run` と同じ作法: stdin は null、stdout/stderr は
+    /// 読み取りスレッドで読み切り、期限を過ぎたら**プロセスツリーごと**畳む。
+    fn run_title(gen: &'static super::TitleGen, prompt: &str) -> Result<String, String> {
+        let mut cmd = crate::procx::hidden_command(gen.bin);
+        for a in gen.args.split_whitespace() {
+            cmd.arg(a);
+        }
+        cmd.arg(prompt);
+        cmd.current_dir(scratch_dir());
+        cmd.env("NO_COLOR", "1")
+            .env("CLICOLOR", "0")
+            .env("TERM", "dumb")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // 子を独立したプロセスグループへ。こうしないと kill_tree が
+            // 孫 (CLI が起こす node / ラッパー) を取り逃がす。
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", gen.bin))?;
+        let out_rx = child.stdout.take().map(spawn_capped_reader);
+        let err_rx = child.stderr.take().map(spawn_capped_reader);
+
+        let deadline = Instant::now() + TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // **まだ生きている**ことを try_wait で確かめた上で撃つ。
+                        // wait 済みの PID へ撃つと無関係なプロセスを巻き添えにする。
+                        crate::procx::kill_tree(child.id());
+                        let _ = child.wait();
+                        return Err(format!("{}: 命名が時間内に終わらなかった", gen.bin));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(format!("{}: {e}", gen.bin)),
+            }
+        };
+        // kill 済みでもパイプが閉じるので join は必ず戻る。
+        let stdout = out_rx.and_then(|h| h.join().ok()).unwrap_or_default();
+        let _ = err_rx.and_then(|h| h.join().ok());
+        if !status.success() {
+            return Err(format!("{}: code={:?}", gen.bin, status.code()));
+        }
+        Ok(stdout)
+    }
+
+    /// 上限付きで読み切るリーダースレッド。**保持は有界、読み取りは EOF まで**
+    /// (途中でやめるとパイプが詰まって相手が write でブロックする)。
+    fn spawn_capped_reader<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut buf: Vec<u8> = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            loop {
+                match r.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if buf.len() < MAX_OUTPUT_BYTES {
+                            let room = MAX_OUTPUT_BYTES - buf.len();
+                            buf.extend_from_slice(&chunk[..n.min(room)]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    }
+}
+
+/// 状態ラダー上位 2 段のカタログ整合 (CLAUDE.md 原則 #4 の番人)。
+///
+/// **「構造化出力を持つ」と宣言したのに引かせる表が無い**状態は、画面推定より
+/// 強い段位で嘘を配ることになる。ここで落とす。
+#[cfg(test)]
+mod ladder_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn 構造化出力を宣言したプリセットはフラグと確認方法を持つ() {
+        assert!(
+            !STREAM_DIALECTS.is_empty(),
+            "上位段が空では原則 #4 を満たさない"
+        );
+        for d in STREAM_DIALECTS {
+            assert!(
+                spec_for_bin(d.bin).is_some(),
+                "{}: カタログに居ないエージェントの方言",
+                d.bin
+            );
+            assert!(
+                !d.args.is_empty(),
+                "{}: 構造化出力を有効にする引数が空",
+                d.bin
+            );
+            assert!(!d.kind_path.is_empty(), "{}: 種別フィールドが空", d.bin);
+            assert!(!d.rules.is_empty(), "{}: 規則表が空 (引けない)", d.bin);
+            assert!(
+                !d.verified.is_empty(),
+                "{}: 実機での確認方法が空 — 憶測で書かれた疑いがある",
+                d.bin
+            );
+            for r in d.rules {
+                assert!(
+                    !(r.kind.is_empty() && r.sub_path.is_empty()),
+                    "{}: 何にでも当たる規則は書かない",
+                    d.bin
+                );
+                assert!(
+                    !(r.sub_path.is_empty() && !r.sub_value.is_empty()),
+                    "{}: 絞り込み先の無い値が指定されている",
+                    d.bin
+                );
+            }
+            // 方言の引数を足したコマンドは、必ずその方言として引けること。
+            let cmd = format!("{} {}", d.bin, d.args);
+            assert_eq!(
+                stream_dialect_for_command(&cmd).map(|x| x.bin),
+                Some(d.bin),
+                "{}: 宣言した引数で構造化段に入れない",
+                d.bin
+            );
+        }
+    }
+
+    #[test]
+    fn フック対象は設定ファイルの場所とイベントを持つ() {
+        for t in HOOK_TARGETS {
+            assert!(
+                spec_for_bin(t.bin).is_some(),
+                "{}: カタログに居ないエージェント",
+                t.bin
+            );
+            assert!(
+                !t.settings_rel.is_empty(),
+                "{}: 設定ファイルの場所が空",
+                t.bin
+            );
+            assert!(
+                !t.settings_rel.contains('\\'),
+                "{}: 相対パスは / で書く (OS ごとの解決は Path::join に任せる)",
+                t.bin
+            );
+            assert!(!t.events.is_empty(), "{}: 仕掛けるイベントが無い", t.bin);
+            assert!(
+                !t.verified.is_empty(),
+                "{}: 実機での確認方法が空 — 憶測で書かれた疑いがある",
+                t.bin
+            );
+            for (ev, _, _) in t.events {
+                assert!(!ev.is_empty(), "{}: 空のイベント名", t.bin);
+                assert!(
+                    hook_event_state(t.bin, ev).is_some(),
+                    "{}: {ev} を引けない",
+                    t.bin
+                );
+            }
+            // ツール名で細分してよいイベントが 1 つも無いのに表だけ在る、は無駄。
+            if !t.tools.is_empty() {
+                assert!(
+                    t.events.iter().any(|(_, _, refine)| *refine),
+                    "{}: ツール表が使われない",
+                    t.bin
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 未知のエージェントは上位段を名乗れない() {
+        assert!(stream_dialect("そんなCLIは無い").is_none());
+        assert!(hook_target("そんなCLIは無い").is_none());
+        assert!(hook_event_state("claude", "そんなイベントは無い").is_none());
+        assert!(hook_tool_state("claude", "").is_none());
+    }
+
+    /// **自動命名に対応と宣言したプリセットは、コマンドとフラグを持つ。**
+    ///
+    /// 「対応」と書いてあるのに引数が空 / カタログに居ない bin、は毎ターン
+    /// 無駄なプロセスを起こすだけになる。
+    #[test]
+    fn 自動命名に対応と宣言したプリセットはコマンドとフラグを持つ() {
+        assert!(!TITLE_GENERATORS.is_empty(), "命名器の表が空");
+        let mut seen: Vec<&str> = Vec::new();
+        for g in TITLE_GENERATORS {
+            assert!(
+                !seen.contains(&g.bin),
+                "{}: 命名器の表が重複している",
+                g.bin
+            );
+            seen.push(g.bin);
+            let spec = spec_for_bin(g.bin)
+                .unwrap_or_else(|| panic!("{}: カタログに居ないエージェント", g.bin));
+            assert_eq!(spec.bin, g.bin, "{}: 別名で登録されている", g.bin);
+            assert!(!g.args.is_empty(), "{}: 非対話実行の引数が空", g.bin);
+            assert!(
+                !g.verified.is_empty(),
+                "{}: 実機での確認方法が空 — 憶測で書かれた疑いがある",
+                g.bin
+            );
+            // カタログの headless 指定と食い違っていないこと
+            // (`-p` と `codex exec` はどちらも headless 欄に在る形)。
+            let head = g.args.split_whitespace().next().unwrap_or("");
+            assert!(
+                spec.headless.split_whitespace().any(|t| t == head),
+                "{}: headless 欄 ({}) と命名器の引数 ({head}) が食い違う",
+                g.bin,
+                spec.headless
+            );
+            // 素のコマンドから、そのエージェント自身の命名器が引けること。
+            assert_eq!(
+                title_generator_for_command(g.bin).map(|x| x.bin),
+                Some(g.bin),
+                "{}: 自分自身の命名器を引けない",
+                g.bin
+            );
+        }
+    }
+
+    #[test]
+    fn 命名器を持たないcliは引けない() {
+        assert!(title_generator("そんなCLIは無い").is_none());
+        assert!(title_generator_for_command("bash -lc ls").is_none());
+        // 実行を観測できていない CLI は**意図的に**表へ入れていない。
+        for bin in ["gemini", "cursor-agent", "droid"] {
+            assert!(
+                title_generator(bin).is_none(),
+                "{bin}: 実行を確認できていないのに命名器として宣言されている"
+            );
+        }
+    }
+}
+
+/// セッション自動命名 (ターン境界の検出 / 題名の検疫)。
+#[cfg(test)]
+mod naming_tests {
+    use super::naming::*;
+
+    // ── ターン境界 ───────────────────────────────────────────────
+    #[test]
+    fn ターン終了は出力が止まったとき一度だけ立つ() {
+        let mut w = TurnWatcher::default();
+        // 出力が動いている間は立たない
+        assert!(!w.observe(1, true, 0, 1500));
+        assert!(!w.observe(1, true, 500, 1500));
+        // 静穏時間に満たないうちも立たない
+        assert!(!w.observe(1, false, 1000, 1500));
+        // 静穏時間を超えて 1 回だけ
+        assert!(w.observe(1, false, 2100, 1500));
+        assert!(!w.observe(1, false, 9000, 1500));
+        assert!(!w.observe(1, false, 99000, 1500));
+        // 次のターンが始まって終われば、また 1 回だけ
+        assert!(!w.observe(1, true, 100_000, 1500));
+        assert!(w.observe(1, false, 102_000, 1500));
+    }
+
+    #[test]
+    fn 一度も出力していないセッションではターンが終わらない() {
+        let mut w = TurnWatcher::default();
+        for t in [0u64, 5_000, 50_000, 500_000] {
+            assert!(!w.observe(7, false, t, 1500), "t={t} で誤検知");
+        }
+    }
+
+    #[test]
+    fn セッションを忘れると追跡もやめる() {
+        let mut w = TurnWatcher::default();
+        w.observe(1, true, 0, 1500);
+        w.observe(2, true, 0, 1500);
+        assert_eq!(w.tracked(), 2);
+        w.forget(1);
+        assert_eq!(w.tracked(), 1);
+    }
+
+    // ── 題名の検疫 ───────────────────────────────────────────────
+    #[test]
+    fn まともな題名はそのまま通る() {
+        assert_eq!(
+            sanitize_title("Fix login redirect"),
+            Some("Fix login redirect".into())
+        );
+        assert_eq!(
+            sanitize_title("  Fix login redirect \n"),
+            Some("Fix login redirect".into())
+        );
+    }
+
+    #[test]
+    fn 空と空白だけは捨てる() {
+        assert_eq!(sanitize_title(""), None);
+        assert_eq!(sanitize_title("   "), None);
+        assert_eq!(sanitize_title("\n\n\t \n"), None);
+        assert_eq!(sanitize_title("\"\""), None);
+        assert_eq!(sanitize_title("---"), None);
+    }
+
+    #[test]
+    fn 改行入りは最初の中身のある行だけを使う() {
+        assert_eq!(
+            sanitize_title("\n\nRefactor parser\nand then some explanation\nmore"),
+            Some("Refactor parser".into())
+        );
+    }
+
+    #[test]
+    fn 制御文字は落とす() {
+        let raw = "Fix\u{7} pars\u{1b}er\u{0}\nignored";
+        let t = sanitize_title(raw).expect("題名が取れる");
+        assert_eq!(t, "Fix parser");
+        assert!(
+            !t.chars().any(char::is_control),
+            "制御文字が残っている: {t:?}"
+        );
+    }
+
+    #[test]
+    fn 極端に長い一行は題名ではないので捨てる() {
+        let long = "a".repeat(REJECT_LINE_CHARS + 1);
+        assert_eq!(sanitize_title(&long), None);
+    }
+
+    #[test]
+    fn 長すぎる題名は切り詰める() {
+        let src = "abcdefghij".repeat(6); // 60 文字
+        let t = sanitize_title(&src).expect("切り詰めて通る");
+        assert!(t.chars().count() <= MAX_TITLE_CHARS + 1, "{t:?}");
+        assert!(t.ends_with('…'), "切り詰めた印が無い: {t:?}");
+    }
+
+    #[test]
+    fn cjkと絵文字は文字単位で扱う() {
+        // CJK: バイト境界で切ると壊れる長さ
+        let jp = "認証まわりのリファクタリングと動作確認".repeat(3);
+        let t = sanitize_title(&jp).expect("CJK でも題名になる");
+        assert!(t.chars().count() <= MAX_TITLE_CHARS + 1, "{t:?}");
+        assert!(t.is_char_boundary(t.len()));
+        // 絵文字 (肌色・ZWJ・異体字セレクタ) の途中で終わらない
+        let emoji = "👨‍👩‍👧‍👦🎉👍🏽".repeat(10);
+        let t = sanitize_title(&emoji).expect("絵文字でも題名になる");
+        assert!(
+            !t.trim_end_matches('…').ends_with('\u{200d}'),
+            "ZWJ で終わっている: {t:?}"
+        );
+        // 短い絵文字混じりはそのまま通る
+        assert_eq!(
+            sanitize_title("🎉 リリース準備"),
+            Some("🎉 リリース準備".into())
+        );
+    }
+
+    #[test]
+    fn 飾りと引用符は剥がす() {
+        assert_eq!(sanitize_title("\"Fix login\""), Some("Fix login".into()));
+        assert_eq!(sanitize_title("**Fix login**"), Some("Fix login".into()));
+        assert_eq!(sanitize_title("# Fix login"), Some("Fix login".into()));
+        assert_eq!(
+            sanitize_title("「ログイン修正」"),
+            Some("ログイン修正".into())
+        );
+        assert_eq!(sanitize_title("- Fix login."), Some("Fix login".into()));
+    }
+
+    // ── 送る材料 ─────────────────────────────────────────────────
+    #[test]
+    fn 送る材料はユーザーの指示だけで長さも切り詰める() {
+        let b = brief("  ログイン\nの\tリダイレクトを直して  ");
+        assert_eq!(b, "ログイン の リダイレクトを直して");
+        assert!(!b.chars().any(char::is_control));
+        let long = brief(&"あ".repeat(MAX_BRIEF_CHARS * 3));
+        assert_eq!(long.chars().count(), MAX_BRIEF_CHARS);
+    }
+
+    #[test]
+    fn 命名プロンプトは材料以外を含まない() {
+        let p = naming_prompt("ログイン修正");
+        assert!(p.contains("ログイン修正"));
+        assert_eq!(p.lines().count(), 2, "1 行の指示 + Task 行だけ: {p:?}");
+    }
+
+    // ── 実行係 ───────────────────────────────────────────────────
+    #[test]
+    fn 材料が空なら一度も起動しない() {
+        let mut n = Namer::default();
+        let g = super::title_generator("claude").expect("claude は命名器を持つ");
+        let ctx = egui::Context::default();
+        assert!(!n.request(1, g, String::new(), ctx));
+    }
+
+    #[test]
+    fn 連続失敗したcliは諦める() {
+        let mut n = Namer::default();
+        assert!(!n.given_up("claude"));
+        for _ in 0..GIVE_UP_AFTER {
+            n.note_failure("claude");
+        }
+        assert!(n.given_up("claude"));
+        let g = super::title_generator("claude").expect("claude は命名器を持つ");
+        let ctx = egui::Context::default();
+        assert!(
+            !n.request(1, g, "テスト".into(), ctx),
+            "諦めた後に起動している"
+        );
+    }
+
+    #[test]
+    fn 命名は一時ディレクトリで走らせる() {
+        // プロジェクトフォルダを cwd にすると CLI がそこの内容を読み込む。
+        let d = scratch_dir();
+        assert!(d.starts_with(std::env::temp_dir()), "{d:?}");
+        assert!(d.is_dir(), "作業ディレクトリを用意できていない: {d:?}");
     }
 }
 
@@ -2979,6 +4048,84 @@ mod tests {
                 "{} は Ask で全自動になってはいけない",
                 bin
             );
+        }
+    }
+
+    // ---- stop_all(): 全エージェント一括停止 ----
+    //
+    // 実 PTY を使うので unix 限定 (remove_active と同じ理由)。
+    // **長い sleep を書かない** — 取りこぼしたときにプロセスが残り続けるため、
+    // 子は数秒で自然終了する長さにしておく。
+    #[cfg(unix)]
+    mod stop_all_tests {
+        use crate::agents::AgentManager;
+        use crate::terminal::{Session, SpawnSpec};
+        use eframe::egui;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        fn mgr(n: usize) -> AgentManager {
+            let mut m = AgentManager::new();
+            for i in 0..n {
+                let spec = SpawnSpec {
+                    title: format!("s{}", i + 1),
+                    preset_name: "t".into(),
+                    icon: "t".into(),
+                    // 取りこぼしても 8 秒で自然に消える長さ。
+                    command: "/bin/sleep 8".into(),
+                    cwd: std::env::temp_dir(),
+                    env: HashMap::new(),
+                    log_path: None,
+                };
+                let s = Session::spawn(i as u64 + 1, spec, egui::Context::default())
+                    .expect("テスト用セッションの起動に失敗");
+                m.sessions.push(s);
+            }
+            m
+        }
+
+        /// 全部が終了するまで待つ (上限つき)。返り値は「全部止まったか」。
+        fn wait_all_exited(m: &AgentManager, limit: Duration) -> bool {
+            let start = Instant::now();
+            while start.elapsed() < limit {
+                if m.running_count() == 0 {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            m.running_count() == 0
+        }
+
+        #[test]
+        fn 一括停止は稼働中を全部止めて本数を返す() {
+            let mut m = mgr(3);
+            assert_eq!(m.running_count(), 3, "3 本起動しているはず");
+            assert_eq!(m.stop_all(), 3, "止めに行った本数");
+            assert!(
+                wait_all_exited(&m, Duration::from_secs(6)),
+                "一括停止で全部止まらなかった (孤児が残っている疑い)"
+            );
+            // タブ自体は残る (あとから ⟳ で起動し直せる)。
+            assert_eq!(m.sessions.len(), 3);
+            for s in &mut m.sessions {
+                s.kill();
+            }
+        }
+
+        #[test]
+        fn 終了済みへは撃たない() {
+            let mut m = mgr(2);
+            assert_eq!(m.stop_all(), 2);
+            assert!(wait_all_exited(&m, Duration::from_secs(6)), "止まらない");
+            // 2 度目は 1 本も撃たない — wait 済みの PID は再利用され得るので、
+            // ここで撃つと無関係なプロセス (グループ) を巻き添えにする。
+            assert_eq!(m.stop_all(), 0, "終了済みへ kill を撃っている");
+        }
+
+        #[test]
+        fn セッションが無いときは何もしない() {
+            let mut m = AgentManager::new();
+            assert_eq!(m.stop_all(), 0);
         }
     }
 

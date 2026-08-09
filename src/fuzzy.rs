@@ -502,4 +502,53 @@ mod tests {
         assert_eq!(pq.score("short"), score(&long_q, "short"));
         assert_eq!(pq.score(""), score(&long_q, ""));
     }
+
+    /// 日本語 / 絵文字 / 結合文字 (ZWJ・国旗) を含むパスでも
+    /// **バイト境界を割らない** (文字単位で走査していることの確認)。
+    /// ⌘P はファイルパスに対してこの関数を毎フレーム回すので、
+    /// ここが割れるとパレットを開いた瞬間に落ちる。
+    #[test]
+    fn 日本語と絵文字のパスでもバイト境界を割らない() {
+        let targets = [
+            "src/日本語のファイル.rs",
+            "設定/絵文字🎨入り/テーマ🚀.toml",
+            "🇯🇵/国旗.md",
+            "👨‍👩‍👧‍👦/家族.txt",
+            "ひらがなカタカナ漢字ABC123.rs",
+            "",
+        ];
+        let queries = [
+            "日本",
+            "🎨",
+            "テーマ",
+            "🇯🇵",
+            "👨‍👩‍👧‍👦",
+            "な",
+            "ABC",
+            "abc",
+            "日本語のファイル",
+            "存在しない語",
+            "",
+        ];
+        for q in queries {
+            let pq = PreparedQuery::new(q);
+            for t in targets {
+                // 落ちないことと、素の score と同じ答えになること
+                assert_eq!(pq.score(t), score(q, t), "q={q:?} t={t:?}");
+            }
+        }
+        // 実際に当たること (部分一致・大小無視)
+        assert!(PreparedQuery::new("日本語")
+            .score("src/日本語のファイル.rs")
+            .is_some());
+        assert!(PreparedQuery::new("🎨")
+            .score("設定/絵文字🎨入り/テーマ🚀.toml")
+            .is_some());
+        assert!(PreparedQuery::new("abc")
+            .score("ひらがなカタカナ漢字ABC123.rs")
+            .is_some());
+        assert!(PreparedQuery::new("zzz")
+            .score("src/日本語のファイル.rs")
+            .is_none());
+    }
 }

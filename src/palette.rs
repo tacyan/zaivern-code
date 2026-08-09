@@ -29,6 +29,8 @@ pub enum Cmd {
     NewTask,
     /// プロンプトレースの開始フォームを開く (Cockpit も一緒に開く)
     OpenRace,
+    /// 走行中のレースの勝者を評価する (**提案だけ** — 採用はしない)
+    EvalRace,
     /// エージェントへのメッセージ送信フォームを開く
     SendAgentMessage,
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替
@@ -59,14 +61,49 @@ pub enum Cmd {
     ToggleGitBlame,
     /// サイドバーを Git タブで開く
     OpenGitPanel,
+    /// コミットメッセージの入力を開く。`true` なら追跡中の変更を全部
+    /// ステージしてからコミットする (`git commit -a`)。
+    GitCommit(bool),
+    /// `git push` (追跡ブランチが無ければ `--set-upstream` 付きで押し出す)
+    GitPush,
+    /// `git pull`
+    GitPull,
+    /// コミット履歴の一覧を開く (選ぶとその差分がタブで開く)
+    GitHistory,
     OpenFind,
     NewAgent(usize),
+    /// プリセット `usize` を **専用の git worktree** で起動する。
+    /// 同じツリーを他のエージェントと共有しないので、ファイルの取り合いが起きない。
+    NewAgentIsolated(usize),
+    /// 起動バーのスロット `usize` (**1〜9**) のプリセットを起動する (⌃1〜⌃9)。
+    /// スロット → プリセットの対応は `config::quick_launch_slots` だけが決める。
+    QuickLaunch(usize),
+    /// 起動バーのスロット `usize` (1〜9) を **worktree 隔離**で起動する。
+    QuickLaunchIsolated(usize),
+    /// エージェントタブ `usize` の名前を手で付け直す (自動命名より常に優先される)。
+    RenameAgent(usize),
+    /// 稼働中のエージェントを**全部**止める (破壊的なので必ず確認を取る)。
+    StopAllAgents,
     /// カタログ全 CLI から選んでプリセットを追加するピッカーを開く
     OpenAgentPicker,
     FocusAgent(usize),
     RestartAgent,
     KillAgent,
+    /// **アクティブなエージェントの追従**を開始 / 解除する (Zed の "follow")。
+    /// エディタのビューポートが、そのエージェントが触っている行を追いかける。
+    ToggleFollowAgent,
+    /// 追従の再開。ユーザーが自分でスクロールして止まったものを明示的に戻す。
+    ResumeFollowAgent,
+    /// **次の未読エージェントへ飛ぶ** (端で折り返す)。
+    NextUnreadAgent,
+    /// いまの相手を未読に戻して次の未読へ (後回し宣言)。
+    DeferUnreadAgent,
+    /// いまの相手の未読フラグを反転する。
+    ToggleUnreadAgent,
     SetTheme(String),
+    /// 設定画面 (検索できる一覧) を開く。VS Code の「設定を開く (UI)」相当。
+    OpenSettings,
+    /// config.toml をエディタで開く。GUI で表現しきれない設定はこちらから触る。
     OpenConfig,
     ReloadConfig,
     /// 画面全体を 1 段拡大する (VS Code の「ズームイン」= ⌘+)。
@@ -158,8 +195,15 @@ pub enum Cmd {
     ToggleAutoSave,
     /// アクティブなファイルをディスクの内容へ戻す (VS Code: Revert File)
     RevertFile,
-    /// すべてのエディタタブを閉じる (未保存タブは確認を挟む)
+    /// すべてのエディタタブを閉じる (未保存タブは確認を挟む。ピン留めは残す)
     CloseAllTabs,
+    /// アクティブなタブのピン留めを切り替える (VS Code の Pin/Unpin Editor)。
+    /// ピン留めタブは左端に寄り、幅を縮めて閉じるボタンを出さない。
+    TogglePinTab,
+    /// タブ切替 (⌃Tab) を「最近使った順 (MRU)」と「並び順」で切り替える
+    ToggleTabSwitchMru,
+    /// プレビュータブ (斜体の使い捨てタブ) を使うかを切り替える
+    TogglePreviewTabs,
     /// エディタの編集操作 (フォーカス経由で egui TextEdit に委譲)
     Undo,
     Redo,
@@ -173,6 +217,14 @@ pub enum Cmd {
     DuplicateLine,
     MoveLineUp,
     MoveLineDown,
+    /// 選択範囲の大文字小文字を変換する (VS Code: Transform to Upper/Lower/Title Case)
+    TransformCase(crate::editor_ops::CaseKind),
+    /// 選択範囲の行を並べ替える (true = 降順)
+    SortLines(bool),
+    /// 選択範囲の重複行を削る (VS Code: Delete Duplicate Lines)
+    DedupeLines,
+    /// 選択範囲を JSON として整形する (選択が無ければ本文全体)
+    FormatJsonSelection,
     /// 検索バーを置換モードで開く (VS Code: ⌥⌘F)
     OpenReplace,
     /// サイドバーの横断検索タブを開く (VS Code: ⇧⌘F)
@@ -185,6 +237,11 @@ pub enum Cmd {
     ShowGitHubTab,
     /// 問題 (LSP 診断) パネルの表示切替 (VS Code: ⇧⌘M)
     ToggleProblems,
+    /// 次 / 前の診断へ移動 (VS Code: F8 / ⇧F8)
+    NextProblem,
+    PrevProblem,
+    /// 行末の診断メッセージ (Error Lens 相当) の表示切替
+    ToggleInlineDiagnostics,
     /// フルスクリーン切替 (VS Code: ⌃⌘F)
     ToggleFullScreen,
     /// ナビゲーション履歴 (VS Code: ⌃- / ⌃⇧-)
@@ -193,12 +250,23 @@ pub enum Cmd {
     /// タブ切替 (VS Code: ⇧⌘] / ⇧⌘[)
     NextTab,
     PrevTab,
+    /// 最近使った順のタブ切替 (⌃Tab / ⌃⇧Tab)。押している間は候補一覧を出し、
+    /// 修飾キーを離したところで確定する。設定で位置巡回にも戻せる。
+    SwitchTab,
+    SwitchTabBack,
     /// 定義へ移動 (LSP。VS Code: F12)
     GoToDefinition,
     /// 対応する括弧へ移動 (VS Code: ⇧⌘\)
     GoToBracket,
     /// 行/列へ移動ダイアログ (VS Code: ⌃G)
     GoToLine,
+    /// パレットの `:123` / `:123:45` から作られる「この位置へ飛べ」。
+    /// **0 起点** の (行, 桁)。値は `editor_ops::parse_goto` が作る。
+    /// 組み込みコマンド表には載らない (`hidden_from_palette`)。
+    GoToLineAt(usize, usize),
+    /// パレットの `@` (シンボル) から作られる「この LSP 位置へ飛べ」。
+    /// **0 起点** の (行, UTF-16 桁)。組み込みコマンド表には載らない。
+    GoToLspPos(usize, usize),
     /// アクティブなファイルを新しいターミナルで実行
     RunActiveFile,
     /// ビルドタスク (cargo build / npm run build / make) を実行 (VS Code: ⇧⌘B)
@@ -235,6 +303,8 @@ pub enum Cmd {
     ToggleTrimTrailingOnSave,
     /// 保存時に最終行へ改行を入れる (切替)
     ToggleFinalNewlineOnSave,
+    /// 保存時に末尾の余分な空行を落とす (切替)
+    ToggleTrimFinalNewlinesOnSave,
     /// アクティブなファイルの改行コードを揃える
     ConvertLineEnding(crate::textenc::LineEnding),
 
@@ -250,6 +320,20 @@ pub enum Cmd {
     DiffNextChange,
     /// 差分の前の変更へ (VS Code: ⇧F7)
     DiffPrevChange,
+    /// 次の「差分のあるファイル」へジャンプ (cmux: `]f`)。レビュー済みは飛ばす
+    DiffNextFile,
+    /// 前の「差分のあるファイル」へジャンプ (cmux: `[f`)
+    DiffPrevFile,
+    /// いま見ているファイルの「レビュー済み」の印を付け外しする
+    DiffMarkViewed,
+    /// レビューの中央ビューを切り替える。値は "files" | "focus" | "queue"
+    SetReviewMode(String),
+    /// アクティブなタブの本文を、ディスク上の保存済みファイルと比較する
+    CompareWithSaved,
+    /// アクティブなファイルを「比較の左側」として覚える (VS Code: Select for Compare)
+    SelectForCompare,
+    /// 覚えたファイルとアクティブなファイルを比較する (VS Code: Compare with Selected)
+    CompareWithSelected,
 
     // ── 折りたたみ (highlight.rs の構造解析 + editor::FoldState) ────
     /// カーソル行の折りたたみを切り替える
@@ -333,6 +417,9 @@ pub enum Cmd {
 #[derive(Clone)]
 pub enum Action {
     OpenFile(PathBuf),
+    /// ファイルを開いて指定位置へ移動する (`ファイル名:123[:45]`)。
+    /// 行・桁はどちらも **0 起点** (`editor_ops::parse_goto` の戻り値そのまま)。
+    OpenFileAt(PathBuf, usize, usize),
     Cmd(Cmd),
 }
 
@@ -345,14 +432,54 @@ pub struct Item {
     pub score: i32,
 }
 
+// ── モードのプレフィクス ──────────────────────────────────────────────
+//
+// VS Code と同じ意味に揃える (`@` = シンボル / `:` = 行番号)。Zaivern 固有の
+// 2 つは空いている記号へ逃がす:
+//   ・エージェント (旧 `@`) → `%`
+//   ・worktree / ルート     → `#` のまま
+// `#` を VS Code のワークスペースシンボルへ明け渡さない理由は
+// [`PREFIX_ROOT`] のドキュメントに書いてある。
+/// `>` — コマンド。
+pub const PREFIX_COMMAND: char = '>';
+/// `@` — **いま開いているファイルのシンボル** (VS Code と同じ意味)。
+/// v0.7 までは「エージェント」だったので、`@` を打った直後だけ
+/// 「エージェントは `%`」の案内を 1 行出して乗り換えを助ける。
+pub const PREFIX_SYMBOL: char = '@';
+/// `%` — エージェントセッション / プリセット (旧 `@`)。
+pub const PREFIX_AGENT: char = '%';
+/// `#` — ワークスペースルート / git worktree。
+///
+/// VS Code では `#` はワークスペースシンボルだが、Zaivern には
+/// 「ファイル間で検索」(⇧⌘F) という別口が既にあり、worktree の横断は
+/// 他のどこからもワンアクションでは届かない。**独自の価値が大きい方**を
+/// 残す判断で `#` は worktree のまま据え置く。
+pub const PREFIX_ROOT: char = '#';
+/// `:` — 行 (列) へ移動。`:123` / `:123:45`。
+pub const PREFIX_GOTO: char = ':';
+
+/// モードのプレフィクス一覧 (`query()` が剥がす文字)。
+const PREFIXES: [char; 5] = [
+    PREFIX_COMMAND,
+    PREFIX_SYMBOL,
+    PREFIX_AGENT,
+    PREFIX_ROOT,
+    PREFIX_GOTO,
+];
+
 pub struct Palette {
     pub open: bool,
     pub input: String,
     pub selected: usize,
     pub just_opened: bool,
+    /// ⌘P の連打で「次の候補へ」送る回数。押した側 (ショートカット処理) が
+    /// 積み、描画側が [`Palette::take_cycle`] で取り出して消費する。
+    /// 候補一覧は描画時にしか組み上がらないので、押した瞬間には動かせない。
+    cycle_pending: usize,
     /// パレットから実行したコマンドの履歴 (先頭が直近)。ランキングの MRU と、
     /// 何も入力していないとき / 何も一致しないときの候補に使う。
-    /// プロセス内だけ保つ (config へは書かない = 起動が遅くならない)。
+    /// ラベルと回数だけ state.toml へ永続化する (アクションは復元時に
+    /// [`Palette::rehydrate`] で組み込みコマンド表から引き直す)。
     recent: Vec<Recent>,
 }
 
@@ -363,6 +490,7 @@ impl Palette {
             input: String::new(),
             selected: 0,
             just_opened: false,
+            cycle_pending: 0,
             recent: Vec::new(),
         }
     }
@@ -372,43 +500,82 @@ impl Palette {
         self.input.clear();
         self.selected = 0;
         self.just_opened = true;
+        self.cycle_pending = 0;
     }
 
     pub fn open_commands(&mut self) {
         self.open = true;
-        self.input = ">".into();
+        self.input = PREFIX_COMMAND.to_string();
         self.selected = 0;
         self.just_opened = true;
+        self.cycle_pending = 0;
     }
 
     pub fn close(&mut self) {
         self.open = false;
         self.input.clear();
         self.selected = 0;
+        self.cycle_pending = 0;
+    }
+
+    /// ファイル検索が開いている状態でもう一度 ⌘P が押された = 次の候補へ。
+    /// (VS Code の「⌘P 連打で MRU を下っていく」挙動)
+    pub fn bump_cycle(&mut self) {
+        self.cycle_pending = self.cycle_pending.saturating_add(1);
+    }
+
+    /// 溜まった連打ぶんを取り出す (描画側が 1 フレームに 1 回だけ呼ぶ)。
+    pub fn take_cycle(&mut self) -> usize {
+        std::mem::take(&mut self.cycle_pending)
+    }
+
+    fn has_prefix(&self, p: char) -> bool {
+        self.input.trim_start().starts_with(p)
     }
 
     pub fn is_command_mode(&self) -> bool {
-        self.input.trim_start().starts_with('>')
+        self.has_prefix(PREFIX_COMMAND)
     }
 
-    /// `@` で始まる = エージェントセッション / プリセットの横断検索モード。
+    /// `@` で始まる = **開いているファイルのシンボル**検索モード (VS Code 準拠)。
+    pub fn is_symbol_mode(&self) -> bool {
+        self.has_prefix(PREFIX_SYMBOL)
+    }
+
+    /// `%` で始まる = エージェントセッション / プリセットの横断検索モード。
     pub fn is_agent_mode(&self) -> bool {
-        self.input.trim_start().starts_with('@')
+        self.has_prefix(PREFIX_AGENT)
     }
 
     /// `#` で始まる = ワークスペースルート / git worktree の横断検索モード。
     pub fn is_root_mode(&self) -> bool {
-        self.input.trim_start().starts_with('#')
+        self.has_prefix(PREFIX_ROOT)
+    }
+
+    /// `:` で始まる = 開いているファイルの行 (列) へ移動するモード。
+    pub fn is_goto_mode(&self) -> bool {
+        self.has_prefix(PREFIX_GOTO)
     }
 
     pub fn query(&self) -> &str {
         let t = self.input.trim_start();
-        t.strip_prefix('>')
-            .or_else(|| t.strip_prefix('@'))
-            .or_else(|| t.strip_prefix('#'))
-            .map(|s| s.trim_start())
-            .unwrap_or(t)
+        match t.chars().next() {
+            Some(c) if PREFIXES.contains(&c) => t[c.len_utf8()..].trim_start(),
+            _ => t,
+        }
     }
+}
+
+/// ⌘P 連打で選択を `times` 回だけ下へ送る (端で先頭へ折り返す)。
+///
+/// 純粋関数にしてあるのは、折り返しの挙動をヘッドレスでテーブルテストに
+/// 固定するため。見出し行は [`Results::step`] が飛ばす。
+pub fn cycle(res: &Results, selected: usize, times: usize) -> usize {
+    let mut s = res.clamp(selected);
+    for _ in 0..times {
+        s = res.step(s, true, false);
+    }
+    s
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -477,6 +644,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::NewFile
         | Cmd::CloseTab
         | Cmd::CloseAllTabs
+        | Cmd::TogglePinTab
         | Cmd::OpenFolder
         | Cmd::NewWindow
         | Cmd::NewWindowFolder
@@ -492,6 +660,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::RefreshTree
         | Cmd::ToggleTrimTrailingOnSave
         | Cmd::ToggleFinalNewlineOnSave
+        | Cmd::ToggleTrimFinalNewlinesOnSave
         | Cmd::ToggleFormatOnSave
         | Cmd::ConvertLineEnding(_) => Group::File,
 
@@ -506,6 +675,10 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::DuplicateLine
         | Cmd::MoveLineUp
         | Cmd::MoveLineDown
+        | Cmd::TransformCase(_)
+        | Cmd::SortLines(_)
+        | Cmd::DedupeLines
+        | Cmd::FormatJsonSelection
         | Cmd::AddCursorAbove
         | Cmd::AddCursorBelow
         | Cmd::SelectAllOccurrences
@@ -534,11 +707,17 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleSearchRegex
         | Cmd::GoToDefinition
         | Cmd::GoToBracket
+        | Cmd::NextProblem
+        | Cmd::PrevProblem
         | Cmd::GoToLine
+        | Cmd::GoToLineAt(_, _)
+        | Cmd::GoToLspPos(_, _)
         | Cmd::NavBack
         | Cmd::NavForward
         | Cmd::NextTab
         | Cmd::PrevTab
+        | Cmd::SwitchTab
+        | Cmd::SwitchTabBack
         | Cmd::ReopenClosedTab
         | Cmd::ToggleBookmark
         | Cmd::NextBookmark
@@ -561,8 +740,11 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleWordWrap
         | Cmd::ToggleShowWhitespace
         | Cmd::ToggleMinimap
+        | Cmd::ToggleTabSwitchMru
+        | Cmd::TogglePreviewTabs
         | Cmd::ToggleBreadcrumbs
         | Cmd::ToggleProblems
+        | Cmd::ToggleInlineDiagnostics
         | Cmd::ToggleFullScreen
         | Cmd::ToggleTableView
         | Cmd::ToggleLspHighlight
@@ -587,12 +769,23 @@ fn group_of(cmd: &Cmd) -> Group {
 
         // ── Git ────────────────────────────────────────────────────
         Cmd::OpenGitPanel
+        | Cmd::GitCommit(_)
+        | Cmd::GitPush
+        | Cmd::GitPull
+        | Cmd::GitHistory
         | Cmd::ShowGitHubTab
         | Cmd::OpenReview
         | Cmd::SetReviewBase(_)
         | Cmd::ToggleDiffView
         | Cmd::DiffNextChange
         | Cmd::DiffPrevChange
+        | Cmd::DiffNextFile
+        | Cmd::DiffPrevFile
+        | Cmd::DiffMarkViewed
+        | Cmd::SetReviewMode(_)
+        | Cmd::CompareWithSaved
+        | Cmd::SelectForCompare
+        | Cmd::CompareWithSelected
         | Cmd::ToggleGitBlame => Group::Git,
 
         // ── ターミナル・実行 ───────────────────────────────────────
@@ -605,14 +798,25 @@ fn group_of(cmd: &Cmd) -> Group {
 
         // ── エージェント ───────────────────────────────────────────
         Cmd::NewAgent(_)
+        | Cmd::NewAgentIsolated(_)
+        | Cmd::QuickLaunch(_)
+        | Cmd::QuickLaunchIsolated(_)
+        | Cmd::RenameAgent(_)
+        | Cmd::StopAllAgents
         | Cmd::OpenAgentPicker
         | Cmd::FocusAgent(_)
         | Cmd::RestartAgent
         | Cmd::KillAgent
+        | Cmd::ToggleFollowAgent
+        | Cmd::ResumeFollowAgent
+        | Cmd::NextUnreadAgent
+        | Cmd::DeferUnreadAgent
+        | Cmd::ToggleUnreadAgent
         | Cmd::SendFileToAgent
         | Cmd::SendAgentMessage
         | Cmd::NewTask
         | Cmd::OpenRace
+        | Cmd::EvalRace
         | Cmd::ToggleCockpit
         | Cmd::ToggleKanban
         | Cmd::ToggleDeck
@@ -631,7 +835,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::SetVoiceTarget(_) => Group::Agent,
 
         // ── 設定・ヘルプ ───────────────────────────────────────────
-        Cmd::OpenConfig
+        Cmd::OpenSettings
+        | Cmd::OpenConfig
         | Cmd::ReloadConfig
         | Cmd::ToggleRemote
         | Cmd::OpenSshRemote
@@ -662,13 +867,16 @@ fn group_of(cmd: &Cmd) -> Group {
 /// | `SetPetImage` / `ResetPetImage` / `ResetPetPos` | ペットの右クリックメニューに同じ項目がある (app.rs)。対象が見えていないと選べない操作でもある |
 /// | `NewPlugin` / `InstallPlugin` / `RescanPlugins` | プラグインタブのボタン (app.rs)。タブを開く `ShowPlugins` はパレットに残す |
 /// | `ShowAbout` | ヘルプメニュー (menu_bar.rs)。押す頻度がゼロに近い純粋な情報表示 |
+/// | `GoToLineAt` / `GoToLspPos` | 座標を埋めた使い捨て。`:123` / `@` が毎回作る |
 ///
 /// `ShowShortcuts` はヘルプメニューにもあるが、「キーバインドを思い出す」のは
 /// パレットで最も起きる用事なので**残す**。
 fn hidden_from_palette(cmd: &Cmd) -> bool {
     matches!(
         cmd,
-        Cmd::SetReviewBase(_)
+        Cmd::GoToLineAt(_, _)
+            | Cmd::GoToLspPos(_, _)
+            | Cmd::SetReviewBase(_)
             | Cmd::ConvertLineEnding(_)
             | Cmd::SetPetImage
             | Cmd::ResetPetImage
@@ -759,7 +967,10 @@ fn match_tier(label: &str, group_title: Option<&str>, q: &str) -> i32 {
 struct Recent {
     icon: String,
     label: String,
-    action: Action,
+    /// 実行できる本体。永続化から戻した直後は `None` — `Cmd` にはパスや
+    /// 添字が入るので**保存せず**、次の起動でラベルから引き直す
+    /// ([`Palette::rehydrate`])。引けなくても順位付け (MRU) には使える。
+    action: Option<Action>,
     uses: u32,
 }
 
@@ -835,6 +1046,8 @@ impl Palette {
         if let Some(i) = self.recent.iter().position(|r| r.label == item.label) {
             let mut r = self.recent.remove(i);
             r.uses = r.uses.saturating_add(1);
+            r.icon = item.icon.clone();
+            r.action = Some(item.action.clone());
             self.recent.insert(0, r);
         } else {
             self.recent.insert(
@@ -842,12 +1055,62 @@ impl Palette {
                 Recent {
                     icon: item.icon.clone(),
                     label: item.label.clone(),
-                    action: item.action.clone(),
+                    action: Some(item.action.clone()),
                     uses: 1,
                 },
             );
             self.recent.truncate(RECENT_MAX);
         }
+    }
+
+    /// MRU を永続化用の (ラベル, アイコン, 回数) へ落とす。先頭が直近。
+    pub fn recent_snapshot(&self) -> Vec<(String, String, u32)> {
+        self.recent
+            .iter()
+            .map(|r| (r.label.clone(), r.icon.clone(), r.uses))
+            .collect()
+    }
+
+    /// 永続化した MRU を戻す。**アクションは空のまま**なので、
+    /// 使えるようにするには [`Palette::rehydrate`] を通すこと。
+    /// 壊れた入力 (空ラベル・重複・上限超え) は黙って捨てる。
+    pub fn restore_recent(&mut self, saved: &[(String, String, u32)]) {
+        self.recent.clear();
+        for (label, icon, uses) in saved {
+            if label.trim().is_empty() || self.recent.iter().any(|r| &r.label == label) {
+                continue;
+            }
+            if self.recent.len() >= RECENT_MAX {
+                break;
+            }
+            self.recent.push(Recent {
+                icon: icon.clone(),
+                label: label.clone(),
+                action: None,
+                uses: (*uses).max(1),
+            });
+        }
+    }
+
+    /// 復元した MRU にアクションを結び直す (ラベル → アクションの引き当て)。
+    /// 引けなかったものは順位付けにだけ効き、候補としては出さない。
+    pub fn rehydrate(&mut self, lookup: impl Fn(&str) -> Option<(String, Action)>) {
+        for r in self.recent.iter_mut() {
+            if r.action.is_some() {
+                continue;
+            }
+            if let Some((icon, action)) = lookup(&r.label) {
+                if !icon.is_empty() {
+                    r.icon = icon;
+                }
+                r.action = Some(action);
+            }
+        }
+    }
+
+    /// 復元待ち (アクションが未解決) の項目が残っているか。
+    pub fn needs_rehydrate(&self) -> bool {
+        self.recent.iter().any(|r| r.action.is_none())
     }
 
     fn mru_bonus(&self, label: &str) -> i32 {
@@ -864,19 +1127,22 @@ impl Palette {
     /// 何も一致しなかったときに「代わりに」出す候補。最近使ったものが
     /// あればそれ、無ければ定番 4 つ。**必ず 1 件以上返す**。
     fn fallback_items(&self) -> Vec<Item> {
-        if !self.recent.is_empty() {
-            return self
-                .recent
-                .iter()
-                .take(RECENT_SHOWN)
-                .map(|r| Item {
+        let restored: Vec<Item> = self
+            .recent
+            .iter()
+            .filter_map(|r| {
+                Some(Item {
                     icon: r.icon.clone(),
                     label: r.label.clone(),
                     detail: String::new(),
-                    action: r.action.clone(),
+                    action: r.action.clone()?,
                     score: 0,
                 })
-                .collect();
+            })
+            .take(RECENT_SHOWN)
+            .collect();
+        if !restored.is_empty() {
+            return restored;
         }
         // ラベルは app.rs の組み込み一覧と同じ文字列にしてある (辞書が効き、
         // MRU のキーも一致する)。アイコンは UI_SYMBOLS にある字だけ。
@@ -909,16 +1175,13 @@ impl Palette {
         if cmd_mode {
             items.retain(|it| match &it.action {
                 Action::Cmd(c) => !hidden_from_palette(c),
-                Action::OpenFile(_) => true,
+                Action::OpenFile(_) | Action::OpenFileAt(..) => true,
             });
         }
 
         // 2) ランキング: 一致の質 (段) + MRU を fuzzy 素点に足す
         for it in items.iter_mut() {
-            let group = match &it.action {
-                Action::Cmd(c) => Some(group_of(c)),
-                Action::OpenFile(_) => None,
-            };
+            let group = group_of_item(it);
             let gt = group.map(|g| g.title().to_lowercase());
             let tier = match_tier(&it.label.to_lowercase(), gt.as_deref(), &q);
             it.score = it
@@ -932,6 +1195,13 @@ impl Palette {
         items.truncate(if cmd_mode { 400 } else { 100 });
 
         let mut notes: Vec<String> = Vec::new();
+        // `@` は v0.7 までエージェントだった。乗り換え先を候補一覧の**先頭**で
+        // 必ず伝える (打った瞬間に「消えた」と誤解させない)。
+        if self.is_symbol_mode() {
+            notes.push(tr(
+                "@ はこのファイルのシンボルです。エージェントを探すなら % を使ってください",
+            ));
+        }
         // 見出しを出すのは「読む」場面 = コマンドモードでクエリが空のときだけ
         let browse = cmd_mode && q.is_empty();
         // 見出しと行末タグは排他 — 両方出すと同じ情報が 2 回出る
@@ -946,17 +1216,19 @@ impl Palette {
                 trf("{q} に一致するものはありません", &[("q", q.clone())])
             });
             if cmd_mode {
+                let usable_recent = self.recent.iter().any(|r| r.action.is_some());
                 items = self.fallback_items();
-                rows.push(Row::Heading(if self.recent.is_empty() {
-                    tr("代わりに: よく使う操作")
-                } else {
+                rows.push(Row::Heading(if usable_recent {
                     tr("代わりに: 最近使ったコマンド")
+                } else {
+                    tr("代わりに: よく使う操作")
                 }));
                 rows.extend((0..items.len()).map(Row::Item));
                 tags = false; // 見出しを出したのでタグは出さない
-            } else {
+            } else if !self.is_symbol_mode() {
+                // シンボルモードでは先頭に案内を出しているので重ねない
                 notes.push(tr(
-                    "> でコマンド、@ でエージェント、# で worktree を探せます",
+                    "> でコマンド、@ でシンボル、: で行番号、% でエージェント、# で worktree を探せます",
                 ));
             }
         } else if browse {
@@ -1011,7 +1283,7 @@ impl Palette {
 fn group_of_item(it: &Item) -> Option<Group> {
     match &it.action {
         Action::Cmd(c) => Some(group_of(c)),
-        Action::OpenFile(_) => None,
+        Action::OpenFile(_) | Action::OpenFileAt(..) => None,
     }
 }
 
@@ -1129,17 +1401,29 @@ mod tests {
         assert!(p.is_command_mode());
         assert_eq!(p.query(), "save");
 
-        p.input = "@ claude".into();
-        assert!(p.is_agent_mode() && !p.is_command_mode() && !p.is_root_mode());
+        // `@` は VS Code と同じ「このファイルのシンボル」
+        p.input = "@ new".into();
+        assert!(p.is_symbol_mode() && !p.is_agent_mode() && !p.is_command_mode());
+        assert_eq!(p.query(), "new");
+
+        // エージェントは `%` へ移した (旧 `@`)
+        p.input = "% claude".into();
+        assert!(p.is_agent_mode() && !p.is_symbol_mode() && !p.is_root_mode());
         assert_eq!(p.query(), "claude");
 
         p.input = "#issue".into();
         assert!(p.is_root_mode());
         assert_eq!(p.query(), "issue");
 
+        // `:` は行ジャンプ
+        p.input = ":123".into();
+        assert!(p.is_goto_mode() && !p.is_symbol_mode());
+        assert_eq!(p.query(), "123");
+
         // 素の入力はファイル検索 (どのモードでもない)
         p.input = "main.rs".into();
         assert!(!p.is_command_mode() && !p.is_agent_mode() && !p.is_root_mode());
+        assert!(!p.is_symbol_mode() && !p.is_goto_mode());
         assert_eq!(p.query(), "main.rs");
     }
 
@@ -1227,16 +1511,20 @@ mod tests {
     #[test]
     fn mode_predicates_are_mutually_exclusive() {
         let mut p = Palette::new();
-        for (input, cmd, agent, root) in [
-            (">x", true, false, false),
-            ("@x", false, true, false),
-            ("#x", false, false, true),
-            ("x", false, false, false),
+        for (input, cmd, sym, agent, root, goto) in [
+            (">x", true, false, false, false, false),
+            ("@x", false, true, false, false, false),
+            ("%x", false, false, true, false, false),
+            ("#x", false, false, false, true, false),
+            (":9", false, false, false, false, true),
+            ("x", false, false, false, false, false),
         ] {
             p.input = input.into();
             assert_eq!(p.is_command_mode(), cmd, "input={input:?}");
+            assert_eq!(p.is_symbol_mode(), sym, "input={input:?}");
             assert_eq!(p.is_agent_mode(), agent, "input={input:?}");
             assert_eq!(p.is_root_mode(), root, "input={input:?}");
+            assert_eq!(p.is_goto_mode(), goto, "input={input:?}");
         }
     }
 
@@ -1245,10 +1533,14 @@ mod tests {
         let mut p = Palette::new();
         p.input = "   >save".into();
         assert!(p.is_command_mode());
-        p.input = "\t@claude".into();
+        p.input = "\t@Foo".into();
+        assert!(p.is_symbol_mode());
+        p.input = " \t%claude".into();
         assert!(p.is_agent_mode());
         p.input = "  #wt".into();
         assert!(p.is_root_mode());
+        p.input = "  :42".into();
+        assert!(p.is_goto_mode());
     }
 
     #[test]
@@ -1263,7 +1555,7 @@ mod tests {
     #[test]
     fn query_prefix_only_is_empty() {
         let mut p = Palette::new();
-        for input in [">", "@", "#", ">   ", "  @\t"] {
+        for input in [">", "@", "%", "#", ":", ">   ", "  @\t", " % "] {
             p.input = input.into();
             assert_eq!(p.query(), "", "input={input:?}");
         }
@@ -1807,5 +2099,187 @@ mod group_tests {
         ] {
             assert!(hi - lo > max_mru, "段の間隔が MRU より狭い: {hi} - {lo}");
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  VS Code 相当の quick-open (ファイルパレット連打 / `@` シンボル / MRU 永続化)
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod quick_open_tests {
+    use super::*;
+
+    fn item(label: &str, action: Action) -> Item {
+        Item {
+            icon: "●".into(),
+            label: label.into(),
+            detail: String::new(),
+            action,
+            score: 0,
+        }
+    }
+
+    fn files(names: &[&str]) -> Vec<Item> {
+        names
+            .iter()
+            .map(|n| item(n, Action::OpenFile(PathBuf::from(n))))
+            .collect()
+    }
+
+    #[test]
+    fn ファイルパレット連打は候補を下へ送り端で先頭に折り返す() {
+        let p = Palette::new(); // ファイルモード (見出し無し)
+        let res = p.results(files(&["a.rs", "b.rs", "c.rs"]));
+        assert_eq!(res.rows.len(), 3, "見出しの無い 3 行");
+        let mut sel = 0usize;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            sel = cycle(&res, sel, 1);
+            seen.push(sel);
+        }
+        // 0 → 1 → 2 → 0 (折り返し) → 1 → 2
+        assert_eq!(seen, vec![1, 2, 0, 1, 2], "端で先頭へ戻らない");
+        // まとめて 4 回押したときも同じ位置に着く
+        assert_eq!(cycle(&res, 0, 4), cycle(&res, 0, 1));
+    }
+
+    #[test]
+    fn 候補が空でも1件でも連打はパニックしない() {
+        let p = Palette::new();
+        let empty = p.results(Vec::new());
+        assert_eq!(cycle(&empty, 0, 3), empty.clamp(0));
+        let one = p.results(files(&["only.rs"]));
+        assert_eq!(cycle(&one, 0, 7), 0, "1 件なら動かない");
+    }
+
+    #[test]
+    fn 連打は見出しを飛び越す() {
+        let mut p = Palette::new();
+        p.open_commands(); // クエリ空 = 見出しつきの一覧
+        let res = p.results(vec![
+            item("保存", Action::Cmd(Cmd::Save)),
+            item("ターミナル表示切替", Action::Cmd(Cmd::ToggleTerminal)),
+        ]);
+        assert!(
+            res.rows.iter().any(|r| matches!(r, Row::Heading(_))),
+            "見出しが出ていない前提が崩れている"
+        );
+        let n = res.rows.len();
+        for k in 0..n * 2 {
+            let s = cycle(&res, res.clamp(0), k);
+            assert!(
+                matches!(res.rows[s], Row::Item(_)),
+                "{k} 回目で見出しに止まった"
+            );
+        }
+    }
+
+    #[test]
+    fn シンボルモードはエージェントの移動先を先頭で案内する() {
+        let mut p = Palette::new();
+        p.input = "@New".into();
+        assert!(p.is_symbol_mode());
+        let res = p.results(vec![item("NewFoo", Action::Cmd(Cmd::GoToLspPos(10, 4)))]);
+        assert!(!res.notes.is_empty(), "案内が出ていない");
+        assert!(
+            res.notes[0].contains('%'),
+            "エージェントの新しいプレフィクスを案内していない: {}",
+            res.notes[0]
+        );
+        // 案内は行ではなくノート = 選べない (Enter で誤爆しない)
+        assert_eq!(res.rows.len(), 1);
+        assert!(matches!(res.rows[0], Row::Item(_)));
+    }
+
+    #[test]
+    fn シンボルモードで候補が無くても案内だけは残る() {
+        let mut p = Palette::new();
+        p.input = "@zzz".into();
+        let res = p.results(Vec::new());
+        assert!(res.notes.iter().any(|n| n.contains('%')));
+        // 「> でコマンド…」の一般案内と二重に出さない
+        assert_eq!(
+            res.notes.iter().filter(|n| n.contains('%')).count(),
+            1,
+            "案内が重複している: {:?}",
+            res.notes
+        );
+    }
+
+    #[test]
+    fn mruは保存して読み直しても順序が保たれる() {
+        let mut p = Palette::new();
+        for label in ["保存", "検索", "ターミナル表示切替"] {
+            p.note_used(&item(label, Action::Cmd(Cmd::Save)));
+        }
+        let snap = p.recent_snapshot();
+        assert_eq!(
+            snap.iter().map(|(l, ..)| l.as_str()).collect::<Vec<_>>(),
+            vec!["ターミナル表示切替", "検索", "保存"],
+            "直近が先頭でない"
+        );
+
+        let mut restored = Palette::new();
+        restored.restore_recent(&snap);
+        assert_eq!(restored.recent_snapshot(), snap, "往復で順序が変わった");
+        // 復元直後は実体が無い → 引き直しが要る
+        assert!(restored.needs_rehydrate());
+        restored.rehydrate(|label| Some((format!("[{label}]"), Action::Cmd(Cmd::Save))));
+        assert!(!restored.needs_rehydrate());
+        // 順位付け (MRU) は復元直後から効く
+        let res = restored.results(vec![
+            item("保存", Action::Cmd(Cmd::Save)),
+            item("ターミナル表示切替", Action::Cmd(Cmd::ToggleTerminal)),
+        ]);
+        assert_eq!(res.items[0].label, "ターミナル表示切替");
+    }
+
+    #[test]
+    fn 壊れたmruを渡してもパニックせず捨てる() {
+        let mut p = Palette::new();
+        let mut junk: Vec<(String, String, u32)> = vec![
+            (String::new(), "x".into(), 1),  // 空ラベル
+            ("  ".into(), String::new(), 0), // 空白だけ
+            ("保存".into(), "💾".into(), 0), // uses が 0
+            ("保存".into(), "💾".into(), 9), // 重複
+            ("絵文字🎨と日本語".into(), String::new(), u32::MAX),
+        ];
+        // 上限を超える件数を足しても落ちない
+        for i in 0..(RECENT_MAX * 3) {
+            junk.push((format!("cmd-{i}"), String::new(), 1));
+        }
+        p.restore_recent(&junk);
+        let snap = p.recent_snapshot();
+        assert!(snap.len() <= RECENT_MAX, "上限を超えて復元した");
+        assert_eq!(snap[0].0, "保存");
+        assert_eq!(snap[0].2, 1, "uses は 1 以上に丸める");
+        assert_eq!(snap[1].0, "絵文字🎨と日本語");
+    }
+
+    #[test]
+    fn 実体の無いmruは代替候補に出さない() {
+        let mut p = Palette::new();
+        p.input = ">zzzz".into();
+        p.restore_recent(&[("復元だけされた".into(), String::new(), 2)]);
+        let res = p.results(Vec::new());
+        assert!(
+            !res.items.iter().any(|i| i.label == "復元だけされた"),
+            "実体の無い項目が候補に出ている"
+        );
+        assert!(!res.items.is_empty(), "代わりの候補が 1 件も無い");
+    }
+
+    #[test]
+    fn 位置つきで開く候補も分類なしのファイルとして扱われる() {
+        let p = Palette::new();
+        let res = p.results(vec![item(
+            "main.rs",
+            Action::OpenFileAt(PathBuf::from("main.rs"), 41, 4),
+        )]);
+        assert_eq!(res.rows.len(), 1);
+        assert!(matches!(
+            res.selected_item(0).map(|i| i.action.clone()),
+            Some(Action::OpenFileAt(_, 41, 4))
+        ));
     }
 }

@@ -5200,7 +5200,7 @@ dependencies = [
 
 [[package]]
 name = "zaivern-code"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "arboard",
  "base64",
@@ -5220,6 +5220,7 @@ dependencies = [
  "syntect",
  "toml 0.8.23",
  "vt100",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 

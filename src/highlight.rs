@@ -926,23 +926,38 @@ struct SourceScan {
     brackets: Vec<(usize, usize)>,
 }
 
-/// 文字列・コメントを飛ばしながら 1 パスで走査する。
+/// [`scan_lex`] が吐くできごと。**文字列リテラルとコメントの中は出てこない。**
+enum Lex {
+    /// 括弧の開き: (本文先頭からのバイト位置, 行, 対応する閉じ括弧)
+    Open(usize, usize, char),
+    /// 括弧の閉じ: (本文先頭からのバイト位置, 行, 文字)
+    Close(usize, usize, char),
+    /// この行で行コメントが始まった (行)
+    LineComment(usize),
+    /// この行にコード (空白・コメント以外) があった (行)
+    Code(usize),
+    /// 行を跨いだブロックコメント (開始行, 終了行)
+    Block(usize, usize),
+}
+
+/// 文字列・コメントを飛ばしながら 1 パスで走査し、できごとを `f` へ流す。
+///
+/// **このクレートで「ソースの字句を追う」のはここ 1 か所だけ**。
+/// 折りたたみ ([`scan_source`]) も虹色括弧 ([`bracket_pairs`]) もここを通るので、
+/// 「文字列やコメントの中の `{` は数えない」という規則が 1 か所で決まる。
 ///
 /// 単一行文字列を前提にしている (行末で強制的に閉じる)。Rust の生文字列
 /// `r#".."#` や JS のテンプレートリテラルの複数行は正確に追えないが、
-/// 折りたたみが少しずれるだけで壊れはしない。
-fn scan_source(text: &str, spec: &LangSpec) -> SourceScan {
-    let mut out = SourceScan::default();
+/// 折りたたみと色が少しずれるだけで壊れはしない。
+fn scan_lex(text: &str, spec: &LangSpec, mut f: impl FnMut(Lex)) {
     // (終了トークン, 開始行)
     let mut in_block: Option<(&'static str, usize)> = None;
-    // (期待する閉じ括弧, 開いた行)
-    let mut stack: Vec<(char, usize)> = Vec::new();
     let mut last_line = 0usize;
+    // 行頭の絶対バイト位置
+    let mut base = 0usize;
     for (ln, raw) in text.split('\n').enumerate() {
         last_line = ln;
         let line = raw.strip_suffix('\r').unwrap_or(raw);
-        let mut saw_code = false;
-        let mut saw_line_comment = false;
         let mut i = 0usize;
         while i < line.len() {
             let rest = &line[i..];
@@ -950,7 +965,7 @@ fn scan_source(text: &str, spec: &LangSpec) -> SourceScan {
                 match rest.find(close) {
                     Some(p) => {
                         if ln > start {
-                            out.block_comments.push((start, ln));
+                            f(Lex::Block(start, ln));
                         }
                         in_block = None;
                         i += p + close.len();
@@ -968,7 +983,7 @@ fn scan_source(text: &str, spec: &LangSpec) -> SourceScan {
                 continue;
             }
             if spec.line_comment.iter().any(|t| rest.starts_with(*t)) {
-                saw_line_comment = true;
+                f(Lex::LineComment(ln));
                 break;
             }
             if let Some(bc) = spec.block_comment.iter().find(|p| rest.starts_with(p.0)) {
@@ -977,7 +992,7 @@ fn scan_source(text: &str, spec: &LangSpec) -> SourceScan {
                 continue;
             }
             if spec.quotes.contains(&ch) {
-                saw_code = true;
+                f(Lex::Code(ln));
                 i += ch.len_utf8();
                 while i < line.len() {
                     let c = match line[i..].chars().next() {
@@ -998,37 +1013,201 @@ fn scan_source(text: &str, spec: &LangSpec) -> SourceScan {
                 continue;
             }
             if let Some(b) = spec.brackets.iter().find(|p| p.0 == ch) {
-                saw_code = true;
-                stack.push((b.1, ln));
+                f(Lex::Code(ln));
+                f(Lex::Open(base + i, ln, b.1));
                 i += ch.len_utf8();
                 continue;
             }
             if spec.brackets.iter().any(|p| p.1 == ch) {
-                saw_code = true;
-                // 対応する開きを探す。見つからない/入れ違いは黙って捨てる
-                // (壊れたソースでも panic しないことを最優先)。
-                if let Some(pos) = stack.iter().rposition(|p| p.0 == ch) {
-                    let open_ln = stack[pos].1;
-                    stack.truncate(pos);
-                    if ln > open_ln {
-                        out.brackets.push((open_ln, ln));
-                    }
-                }
+                f(Lex::Code(ln));
+                f(Lex::Close(base + i, ln, ch));
                 i += ch.len_utf8();
                 continue;
             }
-            saw_code = true;
+            f(Lex::Code(ln));
             i += ch.len_utf8();
         }
-        out.comment_only.push(saw_line_comment && !saw_code);
+        base += raw.len() + 1;
     }
     // 閉じられていないブロックコメントは末尾まで畳めるようにする
     if let Some((_, start)) = in_block {
         if last_line > start {
-            out.block_comments.push((start, last_line));
+            f(Lex::Block(start, last_line));
         }
     }
+}
+
+/// 文字列・コメントを飛ばしながら 1 パスで走査する ([`scan_lex`] の集計)。
+fn scan_source(text: &str, spec: &LangSpec) -> SourceScan {
+    let n = text.split('\n').count();
+    let mut out = SourceScan::default();
+    let mut saw_code = vec![false; n];
+    let mut saw_line_comment = vec![false; n];
+    // (期待する閉じ括弧, 開いた行)
+    let mut stack: Vec<(char, usize)> = Vec::new();
+    scan_lex(text, spec, |ev| match ev {
+        Lex::Open(_, ln, close) => stack.push((close, ln)),
+        Lex::Close(_, ln, ch) => {
+            // 対応する開きを探す。見つからない/入れ違いは黙って捨てる
+            // (壊れたソースでも panic しないことを最優先)。
+            if let Some(pos) = stack.iter().rposition(|p| p.0 == ch) {
+                let open_ln = stack[pos].1;
+                stack.truncate(pos);
+                if ln > open_ln {
+                    out.brackets.push((open_ln, ln));
+                }
+            }
+        }
+        Lex::LineComment(ln) => saw_line_comment[ln] = true,
+        Lex::Code(ln) => saw_code[ln] = true,
+        Lex::Block(s, e) => out.block_comments.push((s, e)),
+    });
+    out.comment_only = saw_line_comment
+        .iter()
+        .zip(&saw_code)
+        .map(|(c, k)| *c && !*k)
+        .collect();
     out
+}
+
+// ───────────────── 虹色括弧 (bracket pair colorization) ─────────────────
+
+/// 括弧 1 個ぶんの色付け情報。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BracketHit {
+    /// 本文先頭からのバイト位置。括弧は必ず 1 バイトの ASCII なので、
+    /// `byte..byte + 1` が常に文字境界に収まる (CJK を含む行でも割れない)。
+    pub byte: usize,
+    /// 入れ子の深さ (一番外側が 0)。相手が居ないときは 0。
+    pub depth: usize,
+    /// 相手が見つからなかった括弧か (エラー色で描く)。
+    pub unmatched: bool,
+}
+
+/// 本文から「深さ付きの括弧の位置」を拾う (VS Code の
+/// `editor.bracketPairColorization`)。
+///
+/// 走査は [`scan_lex`] 1 本なので、**文字列リテラルとコメントの中の括弧は
+/// 数えない**。対応の取れない括弧は `unmatched` が立つ。
+/// 巨大ファイル ([`MAX_HIGHLIGHT_BYTES`] 超) は空を返す — 強調表示自体を
+/// 止めている本文で括弧だけ走査しても意味が無いため。
+///
+/// 返り値はバイト位置の昇順。
+pub fn bracket_pairs(text: &str, lang: &str) -> Vec<BracketHit> {
+    if text.len() > MAX_HIGHLIGHT_BYTES {
+        return Vec::new();
+    }
+    let spec = lang_spec(lang);
+    if spec.brackets.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<BracketHit> = Vec::new();
+    // (期待する閉じ括弧, out の添字)
+    let mut stack: Vec<(char, usize)> = Vec::new();
+    scan_lex(text, spec, |ev| match ev {
+        Lex::Open(byte, _, close) => {
+            // いったん「相手なし」で積み、閉じが来たら降ろす
+            out.push(BracketHit {
+                byte,
+                depth: stack.len(),
+                unmatched: true,
+            });
+            stack.push((close, out.len() - 1));
+        }
+        Lex::Close(byte, _, ch) => match stack.iter().rposition(|p| p.0 == ch) {
+            Some(pos) => {
+                let oi = stack[pos].1;
+                // 途中で放置された開きは unmatched のまま捨てる
+                stack.truncate(pos);
+                out[oi].unmatched = false;
+                let depth = out[oi].depth;
+                out.push(BracketHit {
+                    byte,
+                    depth,
+                    unmatched: false,
+                });
+            }
+            None => out.push(BracketHit {
+                byte,
+                depth: 0,
+                unmatched: true,
+            }),
+        },
+        _ => {}
+    });
+    out.sort_by_key(|h| h.byte);
+    out
+}
+
+/// [`LayoutJob`] の括弧 1 文字ずつを深さの色へ塗り替える。
+///
+/// 節 (section) を括弧の前後で割って色だけ差し替えるので、
+/// **本文の 1 バイトも動かさない** (バイト範囲は連続・昇順のまま)。
+/// `colors` が空なら何もしない。
+pub fn colorize_brackets(
+    mut job: LayoutJob,
+    hits: &[BracketHit],
+    colors: &[Color32],
+    err: Color32,
+) -> LayoutJob {
+    if hits.is_empty() || colors.is_empty() {
+        return job;
+    }
+    let mut out: Vec<eframe::egui::text::LayoutSection> =
+        Vec::with_capacity(job.sections.len() + hits.len() * 2);
+    // hits は昇順なので、節を進めながら添字も前へ進めるだけで足りる
+    let mut hi = 0usize;
+    for sec in job.sections.drain(..) {
+        let (start, end) = (sec.byte_range.start, sec.byte_range.end);
+        while hi < hits.len() && hits[hi].byte < start {
+            hi += 1;
+        }
+        if hi >= hits.len() || hits[hi].byte >= end {
+            out.push(sec);
+            continue;
+        }
+        let mut cur = start;
+        let mut k = hi;
+        while k < hits.len() && hits[k].byte < end {
+            let b = hits[k].byte;
+            k += 1;
+            if b < cur || b + 1 > end {
+                continue;
+            }
+            if b > cur {
+                out.push(eframe::egui::text::LayoutSection {
+                    leading_space: if cur == start { sec.leading_space } else { 0.0 },
+                    byte_range: cur..b,
+                    format: sec.format.clone(),
+                });
+            }
+            let mut fmt = sec.format.clone();
+            fmt.color = if hits[k - 1].unmatched {
+                err
+            } else {
+                colors[hits[k - 1].depth % colors.len()]
+            };
+            // 下線が付いている節では下線の色も合わせる (色だけ浮かないように)
+            if fmt.underline.width > 0.0 {
+                fmt.underline.color = fmt.color;
+            }
+            out.push(eframe::egui::text::LayoutSection {
+                leading_space: if cur == start { sec.leading_space } else { 0.0 },
+                byte_range: b..b + 1,
+                format: fmt,
+            });
+            cur = b + 1;
+        }
+        if cur < end {
+            out.push(eframe::egui::text::LayoutSection {
+                leading_space: if cur == start { sec.leading_space } else { 0.0 },
+                byte_range: cur..end,
+                format: sec.format.clone(),
+            });
+        }
+    }
+    job.sections = out;
+    job
 }
 
 /// インデント方式の折りたたみ範囲を積む。O(行数)。
@@ -2335,6 +2514,194 @@ int main(int argc)
             vec![(2, "int main(int argc)".to_string())],
             "コメントは貼らず、`{{` の行ではなく宣言行を貼る"
         );
+    }
+
+    // ───────────────── 虹色括弧 (bracket pair colorization) ─────────────────
+
+    /// `(バイト位置, 深さ, 相手なしか)` の並びへ落として比較しやすくする。
+    fn hits(text: &str, lang: &str) -> Vec<(usize, usize, bool)> {
+        let v = bracket_pairs(text, lang);
+        // 不変条件: 昇順・1 バイトの ASCII・必ず文字境界
+        let mut prev = None;
+        for h in &v {
+            assert!(
+                prev.map(|p| p < h.byte).unwrap_or(true),
+                "昇順でない: {v:?}"
+            );
+            prev = Some(h.byte);
+            assert!(
+                text.is_char_boundary(h.byte) && text.is_char_boundary(h.byte + 1),
+                "多バイト文字を割った: {h:?} in {text:?}"
+            );
+        }
+        v.iter().map(|h| (h.byte, h.depth, h.unmatched)).collect()
+    }
+
+    /// 入れ子の深さが 0 から順に付く。
+    #[test]
+    fn 括弧の深さが入れ子の順に付く() {
+        //             0123456789...
+        let text = "fn a() { b[0] }";
+        assert_eq!(
+            hits(text, "Rust"),
+            vec![
+                (4, 0, false),  // (
+                (5, 0, false),  // )
+                (7, 0, false),  // {
+                (10, 1, false), // [
+                (12, 1, false), // ]
+                (14, 0, false), // }
+            ]
+        );
+        // 深さ N まで積み上がる
+        let deep = "((((()))))";
+        let got = hits(deep, "Rust");
+        assert_eq!(got.len(), 10);
+        for (i, h) in got.iter().take(5).enumerate() {
+            assert_eq!(h.1, i, "開きの深さ");
+        }
+        for (i, h) in got.iter().skip(5).enumerate() {
+            assert_eq!(h.1, 4 - i, "閉じは相手と同じ深さ");
+        }
+        assert!(got.iter().all(|h| !h.2), "全部対応が取れている");
+    }
+
+    /// 対応の取れない括弧には `unmatched` が立つ。
+    #[test]
+    fn 対応の取れない括弧に印が立つ() {
+        assert_eq!(hits("(", "Rust"), vec![(0, 0, true)]);
+        assert_eq!(hits(")", "Rust"), vec![(0, 0, true)]);
+        // 入れ違い: `(` は捨てられ、`]` は相手なし
+        assert_eq!(
+            hits("[(]", "Rust"),
+            vec![(0, 0, false), (1, 1, true), (2, 0, false)]
+        );
+        // 閉じ忘れ
+        assert_eq!(hits("{ a", "Rust"), vec![(0, 0, true)]);
+        // 空の本文
+        assert!(hits("", "Rust").is_empty());
+    }
+
+    /// **文字列リテラルの中の括弧は数えない。**
+    #[test]
+    fn 文字列の中の括弧を数えない() {
+        // 中の `(` `{` は無視され、外側の () だけが残る
+        let text = "f(\"a(b{c\")";
+        assert_eq!(hits(text, "Rust"), vec![(1, 0, false), (9, 0, false)]);
+        // エスケープされた引用符で文字列が閉じたことにならない
+        let text = "f(\"\\\"(\")";
+        assert_eq!(hits(text, "Rust"), vec![(1, 0, false), (7, 0, false)]);
+    }
+
+    /// **コメントの中の括弧は数えない。**
+    #[test]
+    fn コメントの中の括弧を数えない() {
+        // 行コメント
+        let text = "a(); // ) } ]\nb();";
+        let got = hits(text, "Rust");
+        assert_eq!(
+            got,
+            vec![(1, 0, false), (2, 0, false), (15, 0, false), (16, 0, false)]
+        );
+        // ブロックコメント (行を跨いでも)
+        let text = "/* ( */ x() /*\n{ */ y()";
+        let got = hits(text, "Rust");
+        assert_eq!(
+            got.iter().map(|h| h.0).collect::<Vec<_>>(),
+            vec![9, 10, 21, 22]
+        );
+        assert!(got.iter().all(|h| !h.2));
+    }
+
+    /// CJK を含む行でもバイト境界を割らない (`hits` の中で検査済み)。
+    #[test]
+    fn cjkを含む行でもバイト境界を割らない() {
+        //          あ  (  い  )  う  [  え  ]
+        // バイト:   0-2 3  4-6 7  8-10 11 12-14 15
+        let text = "あ(い)う[え]";
+        let got = hits(text, "Rust");
+        assert_eq!(
+            got,
+            vec![(3, 0, false), (7, 0, false), (11, 0, false), (15, 0, false)]
+        );
+        // 絵文字 (4 バイト) を跨いでも同じ
+        let text = "🎉(🎉)";
+        assert_eq!(hits(text, "Rust"), vec![(4, 0, false), (9, 0, false)]);
+    }
+
+    /// 巨大ファイルでは走らせない (強調表示自体を止めているため)。
+    #[test]
+    fn 巨大ファイルでは括弧を走査しない() {
+        let big = "()".repeat(MAX_HIGHLIGHT_BYTES);
+        assert!(bracket_pairs(&big, "Rust").is_empty());
+    }
+
+    /// [`colorize_brackets`] は本文を動かさず、色だけを差し替える。
+    #[test]
+    fn 括弧の色分けは本文を動かさない() {
+        let text = "a(b[c]d)e";
+        let font = FontId::monospace(12.0);
+        let base = Color32::WHITE;
+        let mut job = LayoutJob::default();
+        job.append(
+            text,
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color: base,
+                ..Default::default()
+            },
+        );
+        let cols = [Color32::RED, Color32::GREEN];
+        let err = Color32::BLUE;
+        let out = colorize_brackets(job, &bracket_pairs(text, "Rust"), &cols, err);
+        assert_eq!(out.text, text, "本文は 1 バイトも変わらない");
+        // 節はバイト範囲が連続していて、本文全体を覆う
+        let mut at = 0usize;
+        for s in &out.sections {
+            assert_eq!(
+                s.byte_range.start, at,
+                "節が連続していない: {:?}",
+                out.sections
+            );
+            at = s.byte_range.end;
+        }
+        assert_eq!(at, text.len(), "本文の末尾まで覆っていない");
+        // 括弧の位置の色が深さどおり ( ( → cols[0], [ → cols[1] )
+        let color_at = |b: usize| {
+            out.sections
+                .iter()
+                .find(|s| s.byte_range.start <= b && b < s.byte_range.end)
+                .map(|s| s.format.color)
+                .unwrap()
+        };
+        assert_eq!(color_at(1), cols[0], "( は深さ 0");
+        assert_eq!(color_at(7), cols[0], ") は深さ 0");
+        assert_eq!(color_at(3), cols[1], "[ は深さ 1");
+        assert_eq!(color_at(5), cols[1], "] は深さ 1");
+        assert_eq!(color_at(0), base, "括弧以外は元の色のまま");
+
+        // 相手のいない括弧はエラー色
+        let text = "(";
+        let mut job = LayoutJob::default();
+        job.append(
+            text,
+            0.0,
+            TextFormat {
+                font_id: font,
+                color: base,
+                ..Default::default()
+            },
+        );
+        let out = colorize_brackets(job, &bracket_pairs(text, "Rust"), &cols, err);
+        assert_eq!(out.sections[0].format.color, err);
+
+        // 括弧が無ければ節はそのまま (無駄に割らない)
+        let mut job = LayoutJob::default();
+        job.append("abc", 0.0, TextFormat::default());
+        let n = job.sections.len();
+        let out = colorize_brackets(job, &[], &cols, err);
+        assert_eq!(out.sections.len(), n);
     }
 }
 

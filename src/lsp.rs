@@ -26,6 +26,8 @@ pub struct Diagnostic {
     pub end_col: usize,
     pub severity: u8, // 1=err 2=warn 3=info 4=hint
     pub message: String,
+    /// 診断を出したサーバー/ツール名 (`"rustc"` 等)。省略するサーバーもあるので空になり得る。
+    pub source: String,
 }
 
 /// LSP の位置。`character` は **UTF-16 code unit** 数 (仕様の既定 PositionEncodingKind)。
@@ -974,6 +976,25 @@ impl LspClient {
         lock_ok(&self.shared.diags).get(&canonical(path)).cloned()
     }
 
+    /// **受信済みの全ファイル**の診断 (パス, 診断)。
+    ///
+    /// サーバーは開いていないファイルの `publishDiagnostics` も送ってくる
+    /// (rust-analyzer / tsserver はプロジェクト全体を出す)。受信スレッドは
+    /// それを [`handle_publish_diagnostics`] で全部貯めているのに、これまで
+    /// 取り出し口が [`Self::diagnostics`] (パス指定) しか無かったため、
+    /// 問題パネルは「開いているバッファ」の分しか見られなかった。
+    ///
+    /// 空の診断 (= サーバーが「このファイルはもう問題なし」と言った通知) は
+    /// 呼び出し側の都合で残しても意味が無いので、ここで落として返す。
+    /// `Arc` の clone だけなので中身の `Vec` は複製しない。
+    pub fn all_diagnostics(&self) -> Vec<(PathBuf, Arc<Vec<Diagnostic>>)> {
+        lock_ok(&self.shared.diags)
+            .iter()
+            .filter(|(_, d)| !d.is_empty())
+            .map(|(p, d)| (p.clone(), Arc::clone(d)))
+            .collect()
+    }
+
     /// initialize 応答から読み取ったサーバー能力 (未受信の間は全 false)。
     pub fn caps(&self) -> ServerCaps {
         lock_ok(&self.shared.caps).clone()
@@ -1559,18 +1580,29 @@ fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
             .and_then(|m| m.as_str())
             .unwrap_or("")
             .to_string(),
+        source: v
+            .get("source")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
 fn diagnostic_to_json(d: &Diagnostic) -> Value {
-    json!({
+    let mut v = json!({
         "range": {
             "start": { "line": d.line, "character": d.col },
             "end": { "line": d.end_line, "character": d.end_col }
         },
         "severity": d.severity,
         "message": d.message,
-    })
+    });
+    // source は省略可能。空文字を送ると「source が "" のサーバー」を
+    // 名乗ることになるので、持っているときだけ足す。
+    if !d.source.is_empty() {
+        v["source"] = Value::String(d.source.clone());
+    }
+    v
 }
 
 // ---------------------------------------------------------------------------
@@ -4122,6 +4154,32 @@ mod tests {
         assert_eq!(action_range("", None, pos(9, 3)), rng(9, 0, 9, 3));
     }
 
+    /// 診断は **範囲まるごと** (開始/終了の行と列) と `source` を保持する。
+    /// 行だけに潰すと本文へ波線を引けない (ガターの印しか出せなくなる)。
+    #[test]
+    fn 診断は範囲とソースを落とさずに読む() {
+        let v: Value = serde_json::from_str(
+            r#"{"range":{"start":{"line":3,"character":7},"end":{"line":5,"character":2}},
+                "severity":2,"message":"unused","source":"rustc"}"#,
+        )
+        .expect("テスト用 JSON");
+        let d = parse_diagnostic(&v).expect("読めるはず");
+        assert_eq!((d.line, d.col, d.end_line, d.end_col), (3, 7, 5, 2));
+        assert_eq!(
+            (d.severity, d.message.as_str(), d.source.as_str()),
+            (2, "unused", "rustc")
+        );
+        // source を出さないサーバーでも壊れない / 往復しても範囲が消えない
+        let v2: Value = serde_json::from_str(
+            r#"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"message":"x"}"#,
+        )
+        .expect("テスト用 JSON");
+        let d2 = parse_diagnostic(&v2).expect("読めるはず");
+        assert!(d2.source.is_empty());
+        assert_eq!(parse_diagnostic(&diagnostic_to_json(&d)), Some(d));
+        assert_eq!(parse_diagnostic(&diagnostic_to_json(&d2)), Some(d2));
+    }
+
     #[test]
     fn diagnostics_in_range_は重なりだけ拾う() {
         let d = |l: usize, c: usize, el: usize, ec: usize| Diagnostic {
@@ -4131,6 +4189,7 @@ mod tests {
             end_col: ec,
             severity: 1,
             message: format!("{l}:{c}"),
+            source: String::new(),
         };
         let all = vec![
             d(0, 0, 0, 5), // 行 0

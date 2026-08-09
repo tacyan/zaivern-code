@@ -114,6 +114,8 @@ pub struct MenuInfo {
     pub file_zoom: Option<f32>,
     /// 保存時に行末の空白を落とす (編集メニューのチェック状態)
     pub trim_trailing_on_save: bool,
+    /// 保存時に末尾の余分な空行を落とす (同上)
+    pub trim_final_newlines_on_save: bool,
     /// 保存時に最終行へ改行を入れる (同上)
     pub final_newline_on_save: bool,
     /// ビルドタスクのラベル。**⇧⌘B が実際に走らせる方**を入れる
@@ -186,7 +188,8 @@ fn heading(ui: &mut egui::Ui, text: &str) {
 
 /// キーバインド済みアクションのショートカット表記。
 fn sc(keys: &Keybinds, a: BindAction) -> String {
-    format_shortcut(keys.get(a))
+    // chord (2 打鍵) も丸ごと出す。1 打鍵目だけ出すと嘘になる
+    keys.label(a)
 }
 
 /// egui TextEdit が内蔵処理するキー (メニューには表記だけ出す)。
@@ -307,13 +310,23 @@ fn file_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         ui.separator();
         ui.menu_button(tr("ユーザー設定"), |ui| {
             ui.set_min_width(280.0);
+            if item(ui, &tr("設定"), "", true) {
+                cmds.push(Cmd::OpenSettings);
+            }
             if item(ui, &tr("設定 config.toml を開く"), "", true) {
                 cmds.push(Cmd::OpenConfig);
             }
             if item(ui, &tr("設定を再読み込み"), "", true) {
                 cmds.push(Cmd::ReloadConfig);
             }
-            if item(ui, &tr("キーボード ショートカット"), "", true) {
+            // メニューからの到達はここ 1 か所だけ (VS Code と同じ「設定」の下)。
+            // ヘルプにも同じ項目があったが、同じ操作への入口を 2 つ持たない。
+            if item(
+                ui,
+                &tr("キーボード ショートカット"),
+                &sc(keys, BindAction::KeybindEditor),
+                true,
+            ) {
                 cmds.push(Cmd::ShowShortcuts);
             }
         });
@@ -336,10 +349,12 @@ fn edit_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
     let ed = info.has_editor;
     ui.menu_button(tr("編集"), |ui| {
         ui.set_min_width(280.0);
-        if item(ui, &tr("元に戻す"), &native_sc("cmd+z"), ed) {
+        // 取り消しは自前の履歴なので、割り当ては config.toml で変えられる。
+        // ここも必ず現在のバインドから表記を作る (ベタ書きは嘘になる)。
+        if item(ui, &tr("元に戻す"), &sc(keys, BindAction::Undo), ed) {
             cmds.push(Cmd::Undo);
         }
-        if item(ui, &tr("やり直し"), &native_sc("cmd+shift+z"), ed) {
+        if item(ui, &tr("やり直し"), &sc(keys, BindAction::Redo), ed) {
             cmds.push(Cmd::Redo);
         }
         ui.separator();
@@ -407,8 +422,9 @@ fn edit_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             },
         );
         ui.separator();
-        // 保存時のクリーンアップ。いまは egui memory に持っている
-        // (config.toml へ移すのは config.rs 側の担当が空いてから)
+        // 保存時のクリーンアップ。既定は config.toml
+        // (trim_trailing_whitespace / trim_final_newlines / insert_final_newline)
+        // で、ここでの切替はセッション中の上書き。
         let trim = if info.trim_trailing_on_save {
             tr("✓ 保存時に末尾空白を除去")
         } else {
@@ -416,6 +432,14 @@ fn edit_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         };
         if item(ui, &trim, "", true) {
             cmds.push(Cmd::ToggleTrimTrailingOnSave);
+        }
+        let tfn = if info.trim_final_newlines_on_save {
+            tr("✓ 保存時に末尾の余分な空行を落とす")
+        } else {
+            tr("保存時に末尾の余分な空行を落とす")
+        };
+        if item(ui, &tfn, "", true) {
+            cmds.push(Cmd::ToggleTrimFinalNewlinesOnSave);
         }
         let fnl = if info.final_newline_on_save {
             tr("✓ 保存時に最終行へ改行を入れる")
@@ -1030,9 +1054,6 @@ fn help_menu(ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
         // 初回起動ガイドツアー。「もう一度見たい」を探す場所はここ以外に無い。
         if item(ui, &tr("チュートリアルを再開"), "", true) {
             cmds.push(Cmd::RestartTutorial);
-        }
-        if item(ui, &tr("キーボード ショートカットのリファレンス"), "", true) {
-            cmds.push(Cmd::ShowShortcuts);
         }
         if item(
             ui,

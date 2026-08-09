@@ -28,7 +28,7 @@
 #![allow(dead_code)]
 
 use crate::i18n::tr;
-use crate::keybinds::{format_shortcut, BindAction, Keybinds};
+use crate::keybinds::{BindAction, Keybinds};
 use eframe::egui;
 use egui::{Color32, Id, Pos2, Rect, Rounding, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
@@ -1177,7 +1177,7 @@ impl Tutorial {
             Some(
                 step.keys
                     .iter()
-                    .map(|a| format_shortcut(keys.get(*a)))
+                    .map(|a| keys.label(*a))
                     .collect::<Vec<_>>()
                     .join(" / "),
             )

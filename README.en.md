@@ -96,15 +96,40 @@ Check progress, send instructions, approve actions, and edit files from your pho
 
 Read code and review changes made by your AI tools without leaving the app. The editor can also open images, PDFs, CSVs, Markdown, and large files.
 
-## 🆕 Latest release: v0.7.1
+## 🆕 Latest release: v0.8.0
 
-- Auto-YES now types a digit into choice prompts only after the screen has been completely frozen for 30 seconds
-- Normal scans never send digits, so bullet lists in agent output can no longer trigger a burst of keystrokes
-- When a digit is sent, the notification states exactly which entry was picked
+**22 gaps in day-to-day usability, closed.** We studied superset, VS Code, cmux, orca and Zed,
+and worked through the missing pieces starting with the ones that made the editor unusable.
 
-**Quality:** 2,567 tests, clean `cargo fmt --check`.
+**Made it a real editor**
 
-[v0.7.1 details](https://github.com/tacyan/zaivern-code/releases/latest) · [Previous releases](https://github.com/tacyan/zaivern-code/releases)
+- Commit, push, pull, hunk-level staging and history, all inside the app (you previously had to drop to a terminal)
+- `.gitignore` is respected, and index truncation is now visible (`node_modules` used to swallow the index and silently break ⌘P)
+- Unsaved buffers survive a restart (hot exit). If the file changed on disk, you get a diff instead of a silent overwrite
+- Multi-cursor actually edits (⌘D only *selected* before)
+- A real undo history, so formatting and code actions rewind in one ⌘Z
+- Drag-and-drop moves with overwrite confirmation, trash instead of hard delete, and ⌘Z in the file tree
+
+**VS Code parity**
+
+Regex / case / whole-word / find-previous / highlight-all in buffer search · inline diagnostic squiggles and hover ·
+matching-bracket highlight and rainbow brackets · vertical rulers · indentation auto-detect ·
+MRU tab switching, pinning and preview tabs · recently-used ordering, `:123` and `@` symbols in Quick Open ·
+two-stroke chords (⌘K ⌘S) and a keybinding editor · a settings UI ·
+a workspace-wide problems panel · clickable file paths and URLs in the terminal
+
+**As an AI cockpit**
+
+- **Follow mode** — the editor tracks whatever the running agent is editing
+- **Unread cursor** — jump to whichever agent is waiting on you
+- **Rebuilt state detection** — structured output and hooks instead of guessing from the screen, and the source of each verdict is shown
+- **Isolated worktrees and conflict detection** — if two agents touch the same file, you hear about it now, not at review time
+- **Focused diff review** — a "2 / 5" counter and `]f` / `[f` to move between files
+- ⌃1–⌃9 preset launch, automatic session naming, token usage and estimated cost
+
+**Quality:** 3,134 tests, green CI on macOS, Linux and Windows, clean `cargo fmt --check`.
+
+[v0.8.0 details](https://github.com/tacyan/zaivern-code/releases/latest) · [Previous releases](https://github.com/tacyan/zaivern-code/releases)
 
 ## Supported environments
 

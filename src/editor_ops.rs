@@ -614,11 +614,38 @@ pub fn ensure_final_newline(text: &str, ending: LineEnding) -> String {
     out
 }
 
+/// 末尾の余分な空行を落とす (VS Code の `files.trimFinalNewlines`)。
+///
+/// 「最後の改行より後ろの改行を全部落とす」— つまり本文の終わりに改行が
+/// あれば **1 本だけ**残す。改行で終わっていない本文は 1 文字も変えない
+/// (足すのは [`ensure_final_newline`] の仕事で、こちらは削るだけ)。
+///
+/// CRLF / CR も 1 本の改行として数えるので、`"a\r\n\r\n"` は `"a\r\n"` になる。
+pub fn trim_final_newlines(text: &str) -> String {
+    let content = text.trim_end_matches(['\n', '\r']);
+    if content.len() == text.len() {
+        return text.to_string();
+    }
+    // 本文の直後にある改行 1 本ぶんだけを残す
+    let rest = &text[content.len()..];
+    let keep = if rest.starts_with("\r\n") {
+        2
+    } else {
+        rest.chars().next().map(|c| c.len_utf8()).unwrap_or(0)
+    };
+    let mut out = String::with_capacity(content.len() + keep);
+    out.push_str(content);
+    out.push_str(&rest[..keep]);
+    out
+}
+
 /// 保存時に本文へかける整形。すべて既定は「何もしない」。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SaveCleanup {
     /// 行末の空白を落とす。
     pub trim_trailing: bool,
+    /// 末尾の余分な空行を落とす。
+    pub trim_final_newlines: bool,
     /// 最終行に改行を入れる。
     pub final_newline: bool,
     /// 改行コードを揃える。`None` なら本文の改行には触らない。
@@ -628,18 +655,23 @@ pub struct SaveCleanup {
 impl SaveCleanup {
     /// 何も仕事が無い設定か (呼び出し側が丸ごと省けるようにする)。
     pub fn is_noop(&self) -> bool {
-        !self.trim_trailing && !self.final_newline && self.target_ending.is_none()
+        !self.trim_trailing
+            && !self.trim_final_newlines
+            && !self.final_newline
+            && self.target_ending.is_none()
     }
 }
 
 /// [`SaveCleanup`] を順に適用する。適用順は固定:
 ///
 /// 1. 行末の空白を落とす
-/// 2. 改行コードを揃える (`target_ending` があるとき)
-/// 3. 最終行に改行を入れる
+/// 2. 末尾の余分な空行を落とす
+/// 3. 改行コードを揃える (`target_ending` があるとき)
+/// 4. 最終行に改行を入れる
 ///
-/// この順でないと、1 で行末が空白だけになった行を 3 が数え違えたり、
-/// 3 が足した改行を 2 が揃え忘れたりする。
+/// この順でないと、1 で行末が空白だけになった行を 4 が数え違えたり、
+/// 4 が足した改行を 3 が揃え忘れたりする。2 が 1 の後なのは、
+/// 「空白だけの行」が 1 で空行になってはじめて削れるようになるため。
 pub fn apply_save_cleanup(text: &str, opts: &SaveCleanup) -> String {
     apply_save_cleanup_checked(text, opts).0
 }
@@ -657,6 +689,9 @@ pub fn apply_save_cleanup_checked(text: &str, opts: &SaveCleanup) -> (String, bo
     } else {
         text.to_string()
     };
+    if opts.trim_final_newlines {
+        out = trim_final_newlines(&out);
+    }
     if let Some(target) = opts.target_ending {
         out = normalize_to(&out, target);
     }
@@ -726,43 +761,47 @@ fn snap_char_boundary(s: &str, byte: usize) -> usize {
 
 // ═══════════════ マルチカーソル / 矩形選択エンジン ═══════════════
 //
-// # なぜ「エンジンだけ」なのか
+// # 役割の分担
 //
-// 本文の編集面は `egui::TextEdit::multiline` で、**キャレットは 1 本しか持てない**
-// (egui 0.29 の `TextEditState` は `CCursorRange` を 1 つだけ覚える)。
-// つまり「N 本のキャレットが同時に点滅し、タイプすると N 箇所へ同時に入る」
-// という VS Code の見た目は、egui を差し替えるまで実現できない。
+// `egui::TextEdit` (0.29) の `TextEditState` は `CCursorRange` を **1 つ**しか
+// 覚えない。だから「N 本のキャレット」は egui に持たせず、**このモジュールが
+// 真の所有者**になる (設計原則 1: モデルはウィジェットより長生きさせる)。
+// UI (`app::code_editor_ui`) はその純粋なビューで、次の 3 つだけを担う:
 //
-// そこで**選択集合の計算と一括編集だけ**をここに置く。UI は 1 本のキャレットの
-// ままでも、コマンド 1 回 = [`MultiSel`] を組み立てて一括編集を 1 回、という形で
-// 今すぐ価値を出せる (「全ての出現を選択 → まとめて置換」「矩形選択 → 各行の先頭へ挿入」)。
+// 1. **入力の横取り** — `TextEdit` を描く**前**に `Event::Text` /
+//    Backspace / Delete / Enter を `ui.input_mut` から抜き取り、
+//    [`type_at_all`] / [`backspace_at_all`] / [`delete_forward_at_all`] /
+//    [`newline_at_all_detect`] へ流す。本文の差し替えは **1 回だけ**行うので
+//    egui の取り消しも 1 段で戻る (VS Code も複数キャレットの編集を 1 undo にする)。
+// 2. **描画の足し込み** — `TextEditOutput.galley` で [`MultiSel::to_char_ranges`]
+//    の各範囲の矩形とキャレットの縦線を自前で塗る。egui 本体の改造は要らない。
+// 3. **ポインタ** — Alt+クリックでキャレット追加、Alt+ドラッグで
+//    [`column_selection`] を組み立てる。
+//
+// egui のキャレット (1 本) は「主キャレット」として
+// [`MultiSel::to_single_selection_chars`] で同期する。点滅と IME はそこに乗る。
 //
 // # UI 側の採用手順 (このモジュールを使う側がやること)
 //
-// 1. `Buffer` に `multi: MultiSel` を 1 本持つ (既存の単一選択とは別に持つ)。
+// 1. `App` に `multi_sel: Option<(バッファ ID, MultiSel)>` を 1 本持つ
+//    (タブを跨いだら捨てる — 別のファイルのバイト位置は本文を壊す)。
 // 2. コマンド発火時、egui の `CCursorRange` (= **char** インデックス) から
 //    [`MultiSel::from_char_ranges`] で種を作る。
 //    ```ignore
 //    let seed = MultiSel::from_char_ranges(&buf.text, [ccur.primary.index..ccur.secondary.index]);
 //    let sel = editor_ops::add_cursor_below(&buf.text, &seed, tab_width);
 //    ```
-// 3. 編集は [`apply_edit_to_all`] 系を 1 回呼ぶ。返る `String` を `buf.text` へ入れ、
-//    undo スタックへは**その 1 回ぶん**を積む (VS Code も複数キャレットの編集を
-//    1 undo にまとめる)。
+// 3. 編集は [`apply_edit_to_all`] 系を 1 回呼ぶ。返る `String` を `buf.text` へ入れる。
 // 4. キャレットの復帰は [`MultiSel::to_single_selection_chars`] で char 範囲に
 //    直して `TextEditState::cursor.set_char_range(..)` に戻す。
 //
-// # 今の UI で「できないこと」と回避策
+// # 残っている制約
 //
-// | できないこと | 理由 | 今できる代替 |
-// |---|---|---|
-// | N 本のキャレットが同時に点滅する | `TextEdit` が `CCursorRange` を 1 つしか持たない | [`MultiSel::to_single_selection`] で 1 本だけ表示 |
-// | タイプした 1 文字が N 箇所へ同時に入る | キー入力は egui が単一キャレットへ適用する | コマンド (例:「選択箇所へ入力」) から [`insert_at_all`] を呼ぶ |
-// | N 個の選択ハイライトが出る | 同上 | `TextEditOutput.galley` を使い、UI 側で `to_char_ranges` の各範囲の矩形を**自前で塗る**ことは可能 (描画だけなら egui 改造不要) |
-// | キャレットごとの undo | undo は本文まるごと | 一括編集を 1 undo として積む |
-//
-// つまり「描画の足し込み (自前で矩形とキャレットを塗る)」までは今の egui でも到達でき、
-// 「入力の分配」だけが `TextEdit` を自前実装に置き換えるまで残る。
+// | 制約 | 理由 |
+// |---|---|
+// | IME 変換中の文字は主キャレットにだけ入る | `Event::Ime` は変換の途中状態を持ち、途中で分配すると確定前の候補が N 箇所に散る |
+// | キャレットごとの undo は無い | undo は本文まるごとのスナップショット。一括編集を 1 段として積む |
+// | 追加キャレットは点滅しない | 点滅は毎フレーム再描画を要求する (設計原則 3: アイドル時のコストはゼロ)。主キャレットだけが点滅する |
 
 use std::ops::Range;
 
@@ -909,17 +948,22 @@ fn snap_boundary_up(s: &str, byte: usize) -> usize {
 
 /// 行内のバイト位置 `byte` (行頭からの相対) の**表示桁** (0 起点)。
 ///
-/// タブは次の `tab_width` の倍数まで進む。**タブ以外は全て 1 桁**として数える
-/// (VS Code の「桁」の定義。全角文字を 2 桁と数えないので、日本語の行でも
-/// 「上下のカーソル追加」が文字数どおりに並ぶ)。
+/// 桁送りは [`crate::textenc::advance_col`] に委ねる = **端末と同じ表**を使う。
+/// 以前はタブ以外を一律 1 桁として数えていたが、それだと日本語・中国語・
+/// ハングルの行で矩形選択と「上下へキャレット追加」が画面と合わない
+/// (`あいう` は 3 文字だが画面では 6 桁を占める)。CJK を最優先の品質領域と
+/// する以上、「桁」は**画面で占める桁**でなければならない。
+///
+/// 結合記号 (濁点・アクセント)・異体字セレクタ・ZWJ・ハングルの中声/終声は
+/// 0 桁なので、`が` (か+゛) や `한` (分解されたハングル) は基底 1 文字ぶんの
+/// 桁しか進まない — 入力途中の分解字母が別々の桁に散らない。
 fn visual_col_in_line(line: &str, byte: usize, tab_width: usize) -> usize {
-    let tw = tab_width.max(1);
     let mut col = 0usize;
     for (b, c) in line.char_indices() {
         if b >= byte {
             break;
         }
-        col += if c == '\t' { tw - (col % tw) } else { 1 };
+        col = crate::textenc::advance_col(col, c, tab_width);
     }
     col
 }
@@ -927,24 +971,30 @@ fn visual_col_in_line(line: &str, byte: usize, tab_width: usize) -> usize {
 /// 表示桁 `col` に当たる行内バイト位置 (行頭からの相対)。
 ///
 /// - 行がその桁まで届かない → 行末を返す (短い行では行末に寄る = VS Code と同じ)。
-/// - タブの途中に当たった → 近い方の端へ丸める (タブを割らない)。
+/// - 文字の途中 (タブの内側・全角の右半分) に当たった → 近い方の端へ丸める。
+///
+/// 走査は**書記素クラスタ単位** ([`crate::textenc::grapheme_end`])。1 文字ずつ
+/// 進めると「幅 0 の結合文字の手前」で止まれてしまい、`が` を `か` と `゛` に
+/// 割った位置や、家族絵文字を ZWJ の途中で割った位置を返してしまう
+/// (そこで矩形選択を切ると文字が壊れる)。戻り値は常にクラスタ境界。
 fn byte_at_visual_col(line: &str, col: usize, tab_width: usize) -> usize {
-    let tw = tab_width.max(1);
     let mut cur = 0usize;
-    for (b, c) in line.char_indices() {
+    let mut b = 0usize;
+    while b < line.len() {
         if col <= cur {
             return b;
         }
-        let next = cur + if c == '\t' { tw - (cur % tw) } else { 1 };
+        let end = crate::textenc::grapheme_end(line, b);
+        // クラスタ内の各文字ぶん桁を進める (結合文字は 0 桁なので効かない)
+        let next = line[b..end]
+            .chars()
+            .fold(cur, |acc, c| crate::textenc::advance_col(acc, c, tab_width));
         if col < next {
-            // 文字の途中 (タブの内側) — 近い端へ寄せる
-            return if col - cur <= next - col {
-                b
-            } else {
-                b + c.len_utf8()
-            };
+            // クラスタの途中 (タブの内側・全角の右半分) — 近い端へ寄せる
+            return if col - cur <= next - col { b } else { end };
         }
         cur = next;
+        b = end;
     }
     line.len()
 }
@@ -1107,8 +1157,11 @@ pub fn select_next_occurrence(
 /// 矩形 (列) 選択。行 × 表示桁の長方形を、行ごとの範囲の集合に変換する。
 ///
 /// - 行・桁は 0 起点。順序は問わない (逆向きに指定しても同じ矩形になる)。
-/// - 桁は**タブ展開後の表示桁**。タブの途中に辺が来たら近い端へ丸める
-///   (タブを割ったバイト位置は作らない)。
+/// - 桁は**画面で占める表示桁** (タブ展開後・東アジア文字幅つき)。全角 (CJK)・
+///   絵文字は 2 桁、結合記号や ZWJ は 0 桁なので、日本語の行と英語の行が
+///   混じっていても矩形の辺が視覚的に揃う。
+/// - タブの内側・全角の右半分に辺が来たら近い端へ丸める (文字を割ったバイト
+///   位置は作らない。書記素クラスタも割らない)。
 /// - 矩形より短い行は**行末の空キャレット**になる (VS Code と同じ。行を飛ばさないので
 ///   「各行の同じ桁に挿入」が短い行でも効く)。
 /// - 幅 0 の矩形は各行の空キャレット = 「複数行の先頭にカーソルを立てる」になる。
@@ -1203,6 +1256,492 @@ pub fn delete_at_all(text: &str, sel: &MultiSel) -> (String, MultiSel) {
 /// 全キャレットの選択内容を `rep` に置き換える (「全ての出現を選択 → まとめて置換」)。
 pub fn replace_all_ranges(text: &str, sel: &MultiSel, rep: &str) -> (String, MultiSel) {
     apply_edit_to_all(text, sel, |_| rep.to_string())
+}
+
+// ═══════════════ インデントの推定と変換 (VS Code 相当) ═══════════════
+//
+// VS Code の `editor.detectIndentation` は「開いたファイルの中身から
+// タブ / スペースと 1 段の桁数を当てる」機能。ステータスバーの
+// 「スペース: 4」表示と、そこからの切り替えがこの型を通る。
+
+/// インデントの様式。`width` はタブのときも意味を持つ
+/// (タブ 1 個を何桁として**表示**するか)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndentStyle {
+    /// タブでインデントしているか (false = スペース)。
+    pub tabs: bool,
+    /// 1 段ぶんの桁数。必ず 1..=[`MAX_INDENT_WIDTH`] ([`IndentStyle::new`] が丸める)。
+    pub width: usize,
+}
+
+/// 推定・設定で許す最大の桁数。9 桁以上のインデントは実在しないので
+/// 候補から外す (「たまたま 12 桁ずれた行」を 1 段と誤認しないため)。
+pub const MAX_INDENT_WIDTH: usize = 8;
+
+impl IndentStyle {
+    /// 何も判らないときの桁数 (VS Code の `editor.tabSize` 既定と同じ)。
+    pub const DEFAULT_WIDTH: usize = 4;
+
+    /// 幅を 1..=[`MAX_INDENT_WIDTH`] に丸めて作る。
+    pub fn new(tabs: bool, width: usize) -> Self {
+        Self {
+            tabs,
+            width: width.clamp(1, MAX_INDENT_WIDTH),
+        }
+    }
+
+    /// 1 段ぶんの実体 (タブなら `"\t"`、スペースなら幅ぶんの空白)。
+    pub fn unit(&self) -> String {
+        if self.tabs {
+            "\t".to_string()
+        } else {
+            " ".repeat(self.width)
+        }
+    }
+}
+
+impl Default for IndentStyle {
+    /// 何も判らないときの既定。VS Code の `editor.tabSize` 既定と同じ 4 スペース。
+    fn default() -> Self {
+        Self {
+            tabs: false,
+            width: Self::DEFAULT_WIDTH,
+        }
+    }
+}
+
+/// 行頭の空白を「(タブ数, スペース数, 空白の終わりのバイト位置)」で返す。
+///
+/// タブとスペースが混ざっていても順序どおり数えるだけで、判定はしない。
+/// 空白しか無い行 (= 本文が無い行) は `None`。
+fn leading_ws(line: &str) -> Option<(usize, usize, usize)> {
+    let mut tabs = 0usize;
+    let mut spaces = 0usize;
+    let mut end = 0usize;
+    for c in line.chars() {
+        match c {
+            '\t' => tabs += 1,
+            ' ' => spaces += 1,
+            _ => return Some((tabs, spaces, end)),
+        }
+        end += c.len_utf8();
+    }
+    // 行末まで空白だけ = 本文が無い行
+    None
+}
+
+/// 行頭の空白を「桁」に直す (タブは `tab_width` 桁のタブストップ)。
+fn leading_columns(line: &str, tab_width: usize) -> usize {
+    let tw = tab_width.max(1);
+    let mut col = 0usize;
+    for c in line.chars() {
+        match c {
+            ' ' => col += 1,
+            '\t' => col = (col / tw + 1) * tw,
+            _ => break,
+        }
+    }
+    col
+}
+
+/// ブロックコメントの継続行 (`* …`) か。
+///
+/// JSDoc / rustdoc の `*` 行は本文より 1 桁だけ深いので、素直に数えると
+/// 「1 桁インデント」が最頻値になってしまう。VS Code も同じ理由で外す。
+fn is_block_comment_cont(line: &str) -> bool {
+    line.trim_start().starts_with('*')
+}
+
+/// 本文からインデントの様式を推定する (VS Code の `editor.detectIndentation`)。
+///
+/// 判らないときは `fallback` をそのまま返すので、**必ず何かを返す**
+/// (推定に失敗しても設定値で動き続ける)。手順:
+///
+/// 1. 行頭がタブで始まる行とスペースで始まる行を数え、多いほうを採る。
+/// 2. スペースなら、隣り合う行のインデント桁の**差**を集計して最頻値を幅にする。
+///    差が一度も出なければ (全行が同じ深さ) 最小のインデント桁を使う。
+/// 3. どちらの証拠も無ければ `fallback`。
+///
+/// 空白だけの行とブロックコメントの継続行 (`* …`) は数えない。
+pub fn detect_indent(text: &str, fallback: IndentStyle) -> IndentStyle {
+    let mut tab_lines = 0usize;
+    let mut space_lines = 0usize;
+    // スペース字下げの桁数 (行順)。`usize::MAX` は「タブ字下げの行」の目印で、
+    // ここで統計を切る (混在ファイルでタブ行を跨いだ差を数えないため)。
+    let mut cols: Vec<usize> = Vec::new();
+    for raw in text.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let Some((tabs, spaces, _)) = leading_ws(line) else {
+            continue;
+        };
+        if is_block_comment_cont(line) {
+            continue;
+        }
+        if tabs > 0 {
+            tab_lines += 1;
+            cols.push(usize::MAX);
+            continue;
+        }
+        if spaces > 0 {
+            space_lines += 1;
+        }
+        cols.push(spaces);
+    }
+    if tab_lines == 0 && space_lines == 0 {
+        return fallback;
+    }
+    if tab_lines > space_lines {
+        return IndentStyle::new(true, fallback.width);
+    }
+    // 隣り合う行の差を集計 (0 と 9 桁以上は無視)
+    let mut hist = [0usize; MAX_INDENT_WIDTH + 1];
+    let mut prev: Option<usize> = None;
+    for c in &cols {
+        if *c == usize::MAX {
+            prev = None;
+            continue;
+        }
+        if let Some(p) = prev {
+            let d = c.abs_diff(p);
+            if (1..=MAX_INDENT_WIDTH).contains(&d) {
+                hist[d] += 1;
+            }
+        }
+        prev = Some(*c);
+    }
+    // 最頻値。同数なら小さいほうを採る (2 と 4 が並んだら「2 スペースを
+    // 2 段」のほうが実在しやすい)。
+    let best = (1..=MAX_INDENT_WIDTH).fold((0usize, 0usize), |(bw, bn), w| {
+        if hist[w] > bn {
+            (w, hist[w])
+        } else {
+            (bw, bn)
+        }
+    });
+    if best.1 > 0 {
+        return IndentStyle::new(false, best.0);
+    }
+    // 差が一度も出なかった = 全行が同じ深さ。最小の字下げ桁を 1 段とみなす。
+    match cols
+        .iter()
+        .filter(|c| **c != usize::MAX && **c > 0)
+        .min()
+        .copied()
+    {
+        Some(c) if c <= MAX_INDENT_WIDTH => IndentStyle::new(false, c),
+        _ => fallback,
+    }
+}
+
+/// 行頭のインデントだけを `from` の様式から `to` の様式へ書き換える。
+///
+/// 段数を保つ変換: `桁 / from.width` を段数、余りを桁ずれとして扱い、
+/// `段数 * to.width + 余り` 桁を新しい様式で描き直す。これで
+/// 「スペース 4 → スペース 2」が本当に半分になり、「タブ → スペース」も
+/// 見た目どおりの桁数になる。行数・改行コード・本文は 1 文字も変えない。
+pub fn convert_indentation(text: &str, from: IndentStyle, to: IndentStyle) -> String {
+    if from == to {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for (s, e, seg_end) in line_segments(text) {
+        let line = &text[s..e];
+        match leading_ws(line) {
+            Some((_, _, ws_end)) => {
+                let col = leading_columns(line, from.width);
+                let level = col / from.width;
+                let rem = col % from.width;
+                let new_col = level * to.width + rem;
+                if to.tabs {
+                    out.push_str(&"\t".repeat(new_col / to.width));
+                    out.push_str(&" ".repeat(new_col % to.width));
+                } else {
+                    out.push_str(&" ".repeat(new_col));
+                }
+                out.push_str(&line[ws_end..]);
+            }
+            // 空白だけの行は触らない (行末空白の除去は保存時の仕事)
+            None => out.push_str(line),
+        }
+        out.push_str(&text[e..seg_end]);
+    }
+    out
+}
+
+// ═══════════════ 選択範囲への編集コマンド (VS Code 相当) ═══════════════
+
+/// 大文字小文字の変換の種類。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseKind {
+    /// すべて大文字へ
+    Upper,
+    /// すべて小文字へ
+    Lower,
+    /// 単語の先頭だけ大文字へ (残りは小文字)
+    Title,
+}
+
+/// 文字列の大文字小文字を変換する。
+///
+/// Unicode の規則に従うので、`ß` → `SS` のように**文字数が変わることがある**
+/// (呼び出し側は選択範囲を「変換後の長さ」で取り直すこと)。
+/// 日本語・絵文字はそのまま通る (大文字小文字を持たない)。
+pub fn transform_case(s: &str, kind: CaseKind) -> String {
+    match kind {
+        CaseKind::Upper => s.to_uppercase(),
+        CaseKind::Lower => s.to_lowercase(),
+        CaseKind::Title => {
+            let mut out = String::with_capacity(s.len());
+            // 直前が「単語を構成する文字」だったか
+            let mut in_word = false;
+            for c in s.chars() {
+                let is_word = c.is_alphanumeric() || c == '_';
+                if is_word && !in_word {
+                    out.extend(c.to_uppercase());
+                } else if is_word {
+                    out.extend(c.to_lowercase());
+                } else {
+                    out.push(c);
+                }
+                in_word = is_word;
+            }
+            out
+        }
+    }
+}
+
+/// 選択範囲 (char) を覆う「行の範囲」を char 添字で返す。
+///
+/// 選択が無い (start == end) ときはその 1 行。選択が行頭ちょうどで終わって
+/// いるときは、その行を巻き込まない (VS Code と同じ)。
+/// 返り値は `(行頭 char, 行末 char)` で、行末は**最後の行の改行の手前**。
+fn line_span_of(text: &str, start_char: usize, end_char: usize) -> (usize, usize) {
+    let (a, b) = (start_char.min(end_char), start_char.max(end_char));
+    let sb = char_to_byte(text, a);
+    let eb = char_to_byte(text, b);
+    let segs = line_segments(text);
+    let first = segs.iter().rposition(|&(s, _, _)| s <= sb).unwrap_or(0);
+    let mut last = segs.iter().rposition(|&(s, _, _)| s <= eb).unwrap_or(first);
+    if last > first && eb == segs[last].0 {
+        last -= 1;
+    }
+    (
+        byte_to_char(text, segs[first].0),
+        byte_to_char(text, segs[last].1),
+    )
+}
+
+/// 行単位の編集を選択範囲へ当てる共通の骨。
+///
+/// `f` は「選択が覆う行の並び」を受け取り、新しい行の並びを返す。
+/// 改行コードは元の本文のものを使い回すので、CRLF のファイルが LF に化けない。
+/// 返り値は `(新しい本文, 選択の開始 char, 選択の終わり char)` で、
+/// 選択は書き換えた行の全体になる (VS Code と同じ)。
+fn edit_lines<F>(text: &str, start_char: usize, end_char: usize, f: F) -> (String, usize, usize)
+where
+    F: FnOnce(&[&str]) -> Vec<String>,
+{
+    let (ls, le) = line_span_of(text, start_char, end_char);
+    let sb = char_to_byte(text, ls);
+    let eb = char_to_byte(text, le);
+    let block = &text[sb..eb];
+    // 元の本文で使われている改行を拾う (無ければ LF)
+    let nl = if block.contains("\r\n") {
+        "\r\n"
+    } else if block.contains('\r') {
+        "\r"
+    } else {
+        "\n"
+    };
+    let segs = line_segments(block);
+    let rows: Vec<&str> = segs.iter().map(|&(s, e, _)| &block[s..e]).collect();
+    let joined = f(&rows).join(nl);
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..sb]);
+    out.push_str(&joined);
+    out.push_str(&text[eb..]);
+    let new_end = ls + joined.chars().count();
+    (out, ls, new_end)
+}
+
+/// 選択範囲の行を並べ替える (`desc` が真なら降順)。
+///
+/// 比較はロケールに依存しないバイト列順 = どの環境でも同じ結果になる。
+/// 選択が 1 行なら並べ替えるものが無いので本文は変わらない。
+pub fn sort_lines(
+    text: &str,
+    start_char: usize,
+    end_char: usize,
+    desc: bool,
+) -> (String, usize, usize) {
+    edit_lines(text, start_char, end_char, |rows| {
+        let mut v: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+        v.sort();
+        if desc {
+            v.reverse();
+        }
+        v
+    })
+}
+
+/// 選択範囲から重複行を削る (最初の 1 本だけ残す。並び順は変えない)。
+pub fn dedupe_lines(text: &str, start_char: usize, end_char: usize) -> (String, usize, usize) {
+    edit_lines(text, start_char, end_char, |rows| {
+        let mut seen = std::collections::HashSet::new();
+        rows.iter()
+            .filter(|r| seen.insert(r.to_string()))
+            .map(|r| r.to_string())
+            .collect()
+    })
+}
+
+/// 文字列を JSON として整形する。
+///
+/// パースできなければ `Err` にメッセージを返す (本文には触らない) —
+/// 壊れた JSON を黙って書き換えると、元に戻せない事故になるため。
+/// インデントは呼び出し側が [`IndentStyle::unit`] から渡す
+/// (エディタの設定と違う字下げで整形しない)。
+pub fn format_json(src: &str, unit: &str) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_str(src.trim()).map_err(|e| e.to_string())?;
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(unit.as_bytes());
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+    serde::Serialize::serialize(&v, &mut ser).map_err(|e| e.to_string())?;
+    String::from_utf8(buf).map_err(|e| e.to_string())
+}
+
+// ─────────────────────── 打鍵を全キャレットへ配る ───────────────────────
+//
+// UI (`app::code_editor_ui`) が `TextEdit` より**先に**キー/文字イベントを
+// 横取りして、ここへ流す。返るのは「新しい本文」と「編集後の本文に対する
+// キャレット集合」で、本文の差し替えは呼び出し側で **1 回だけ**行う
+// (= egui の取り消しも 1 段。`MultiPaste` と同じ約束)。
+//
+// どれも戻り値のキャレットは**空** (選択なし) に畳む。VS Code も
+// タイプ後は選択が消えてキャレットだけが残る。
+
+/// バイト位置の**直前**の文字の開始位置。先頭なら 0。
+/// CRLF は 1 つの改行として扱う (`\n` だけ消して `\r` を残さない)。
+fn prev_char_start(s: &str, byte: usize) -> usize {
+    let mut b = snap_char_boundary(s, byte.min(s.len()));
+    if b == 0 {
+        return 0;
+    }
+    b -= 1;
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    // CRLF は 2 バイトまとめて 1 つの改行
+    if s.as_bytes().get(b) == Some(&b'\n') && b > 0 && s.as_bytes().get(b - 1) == Some(&b'\r') {
+        b -= 1;
+    }
+    b
+}
+
+/// バイト位置の**直後**の文字の終了位置。末尾なら `s.len()`。
+/// CRLF は 1 つの改行として扱う。
+fn next_char_end(s: &str, byte: usize) -> usize {
+    let mut b = snap_boundary_up(s, byte.min(s.len()));
+    if b >= s.len() {
+        return s.len();
+    }
+    let crlf = s.as_bytes().get(b) == Some(&b'\r') && s.as_bytes().get(b + 1) == Some(&b'\n');
+    b += 1;
+    while b < s.len() && !s.is_char_boundary(b) {
+        b += 1;
+    }
+    if crlf {
+        b += 1;
+    }
+    b
+}
+
+/// 編集後のキャレットを**末尾へ畳む** (選択を解いて 1 点にする)。
+fn collapse_to_end(sel: MultiSel) -> MultiSel {
+    MultiSel::new(
+        sel.carets()
+            .iter()
+            .map(|r| r.end..r.end)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// 全キャレットへ**タイプした文字**を入れる。選択があればその内容を置き換える。
+///
+/// 空キャレットどうしが同じ位置へ来た場合は [`MultiSel`] の融合規則で 1 本になる。
+pub fn type_at_all(text: &str, sel: &MultiSel, ins: &str) -> (String, MultiSel) {
+    let (out, moved) = apply_edit_to_all(text, sel, |_| ins.to_string());
+    (out, collapse_to_end(moved))
+}
+
+/// 全キャレットで Backspace。選択があればそれを消し、空キャレットなら**直前の
+/// 1 文字**を消す (行頭なら前の行とつながる)。本文先頭のキャレットは何もしない。
+///
+/// 後退で範囲が重なったキャレットは [`MultiSel`] の融合規則で 1 本になるので、
+/// 同じ文字を二度消すことはない。
+pub fn backspace_at_all(text: &str, sel: &MultiSel) -> (String, MultiSel) {
+    let ranges: Vec<Range<usize>> = sel
+        .carets()
+        .iter()
+        .map(|r| {
+            if r.start < r.end {
+                r.clone()
+            } else {
+                prev_char_start(text, r.start)..r.start
+            }
+        })
+        .collect();
+    let (out, moved) = delete_at_all(text, &MultiSel::in_text(text, ranges));
+    (out, collapse_to_end(moved))
+}
+
+/// 全キャレットで Delete (前方削除)。選択があればそれを消し、空キャレットなら
+/// **直後の 1 文字**を消す。本文末尾のキャレットは何もしない。
+pub fn delete_forward_at_all(text: &str, sel: &MultiSel) -> (String, MultiSel) {
+    let ranges: Vec<Range<usize>> = sel
+        .carets()
+        .iter()
+        .map(|r| {
+            if r.start < r.end {
+                r.clone()
+            } else {
+                r.start..next_char_end(text, r.start)
+            }
+        })
+        .collect();
+    let (out, moved) = delete_at_all(text, &MultiSel::in_text(text, ranges));
+    (out, collapse_to_end(moved))
+}
+
+/// 全キャレットで Enter。選択は置き換え、改行の後ろへ**その行の字下げ**を複製する
+/// (単一キャレットの [`auto_indent_after_newline`] と同じ感覚)。
+///
+/// `ending` は本文の改行様式。CRLF のファイルへ LF を混ぜないために受け取る。
+pub fn newline_at_all(text: &str, sel: &MultiSel, ending: LineEnding) -> (String, MultiSel) {
+    // 混在ファイルは `as_str` が最多の様式へ寄せてくれる (LF 決め打ちにしない)
+    let nl = ending.as_str();
+    let reps: Vec<String> = sel
+        .carets()
+        .iter()
+        .map(|r| {
+            let at = r.start.min(text.len());
+            let (ls, _) = line_bounds(text, at);
+            let indent: String = text[ls..at]
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            format!("{nl}{indent}")
+        })
+        .collect();
+    let mut it = reps.into_iter();
+    let (out, moved) =
+        apply_edit_to_all(text, sel, |_| it.next().unwrap_or_else(|| nl.to_string()));
+    (out, collapse_to_end(moved))
+}
+
+/// 本文の改行様式を見て [`newline_at_all`] を呼ぶ (呼び出し側の判定を 1 か所に)。
+pub fn newline_at_all_detect(text: &str, sel: &MultiSel) -> (String, MultiSel) {
+    newline_at_all(text, sel, detect_line_ending(text))
 }
 
 #[cfg(test)]
@@ -1702,6 +2241,7 @@ mod tests {
     fn save_cleanup_composes_trim_ending_and_final_newline() {
         let opts = SaveCleanup {
             trim_trailing: true,
+            trim_final_newlines: false,
             final_newline: true,
             target_ending: Some(LineEnding::Crlf),
         };
@@ -1719,6 +2259,7 @@ mod tests {
     fn save_cleanup_changed_flag_is_exact() {
         let all = SaveCleanup {
             trim_trailing: true,
+            trim_final_newlines: false,
             final_newline: true,
             target_ending: None,
         };
@@ -1740,6 +2281,7 @@ mod tests {
     fn save_cleanup_final_newline_follows_the_existing_ending() {
         let opts = SaveCleanup {
             trim_trailing: false,
+            trim_final_newlines: false,
             final_newline: true,
             target_ending: None,
         };
@@ -1749,6 +2291,7 @@ mod tests {
         // 改行コードだけ揃える (本文には触らない)
         let only_ending = SaveCleanup {
             trim_trailing: false,
+            trim_final_newlines: false,
             final_newline: false,
             target_ending: Some(LineEnding::Lf),
         };
@@ -1878,6 +2421,7 @@ mod tests {
         let original = "行1  \n行2\t\t\n";
         let opts = SaveCleanup {
             trim_trailing: true,
+            trim_final_newlines: false,
             final_newline: true,
             target_ending: Some(LineEnding::Crlf),
         };
@@ -2126,11 +2670,173 @@ mod tests {
     }
 
     #[test]
-    fn column_selection_over_japanese_uses_character_columns() {
+    fn column_selection_over_japanese_uses_display_columns() {
         let text = "あいうえお\nかきくけこ";
-        let sel = column_selection(text, 0, 1, 1, 3, 4);
-        assert_eq!(sel.slices(text), vec!["いう", "きく"], "全角も1桁と数える");
+        // 全角は 2 桁。`いう` は表示桁 2..6 (文字数では 1..3)。
+        let sel = column_selection(text, 0, 2, 1, 6, 4);
+        assert_eq!(
+            sel.slices(text),
+            vec!["いう", "きく"],
+            "全角は 2 桁と数える"
+        );
         assert_invariants(text, &sel, "日本語の矩形");
+    }
+
+    /// 全角の**右半分**に辺が来たら近い端へ丸める (半分だけ選ばない)。
+    #[test]
+    fn column_selection_rounds_inside_a_wide_char() {
+        let text = "あいうえお\nかきくけこ";
+        // 桁 1 は `あ` の右半分 — 左端 (桁 0) へ寄る
+        assert_eq!(column_selection(text, 0, 0, 0, 1, 4).carets(), &[0..0]);
+        // 桁 3 は `い` の右半分 — 近いのは左端 (桁 2)
+        let sel = column_selection(text, 0, 2, 0, 3, 4);
+        assert_eq!(sel.carets(), &[3..3], "全角を割ったバイト位置は作らない");
+        assert_invariants(text, &sel, "全角の内側で丸める");
+    }
+
+    // ──────────────── 表示幅 (East Asian Width) ────────────────
+
+    /// 表示桁の表。**画面で何桁を占めるか**を 1 行ずつ固定する。
+    ///
+    /// 桁の勘定は `textenc::advance_col` (端末と同じ表) に一本化してある。
+    /// 幅 0 の文字 (結合記号・ZWJ・ハングルの中声/終声) を「1 文字 = 1 桁」で
+    /// 数えると、日本語の行で矩形選択とキャレット追加が必ずずれる。
+    ///
+    /// | 入力 | タブ幅 | 期待桁 |
+    /// |---|---|---|
+    /// | `""` (空行) | 4 | 0 |
+    /// | `abc` | 4 | 3 |
+    /// | `あいう` | 4 | 6 |
+    /// | `中文字` | 4 | 6 |
+    /// | `한` (完成形) | 4 | 2 |
+    /// | `ㅎ+ㅏ+ㄴ` (分解字母) | 4 | 2 |
+    /// | `ｱｲｳ` (半角カナ) | 4 | 3 |
+    /// | `😀` | 4 | 2 |
+    /// | `👍🏽` (肌色修飾子) | 4 | 4 |
+    /// | `👨‍👩‍👧‍👦` (ZWJ 家族) | 4 | 8 |
+    /// | `か+゛` (結合濁点) | 4 | 2 |
+    /// | `e+´` (結合アクセント) | 4 | 1 |
+    /// | `\t` | 4 / 8 | 4 / 8 |
+    /// | `BEL` (制御文字) | 4 | 0 |
+    #[test]
+    fn visual_column_follows_east_asian_width() {
+        // (入力, タブ幅, 期待桁, 何を固定しているか)
+        let table: &[(&str, usize, usize, &str)] = &[
+            ("", 4, 0, "空行"),
+            ("abc", 4, 3, "ASCII は 1 桁"),
+            ("あいう", 4, 6, "日本語 (かな) は 2 桁"),
+            ("漢字", 4, 4, "日本語 (漢字) は 2 桁"),
+            ("中文字", 4, 6, "中国語は 2 桁"),
+            ("한", 4, 2, "ハングル完成形は 2 桁"),
+            (
+                "\u{1112}\u{1161}\u{11AB}",
+                4,
+                2,
+                "ハングル分解字母 ㅎ+ㅏ+ㄴ = 初声 2 + 中声 0 + 終声 0 (1 音節ぶん)",
+            ),
+            ("ｱｲｳ", 4, 3, "半角カナは 1 桁"),
+            ("😀", 4, 2, "絵文字は 2 桁"),
+            (
+                "👍🏽",
+                4,
+                4,
+                "肌色修飾子は基底の後ろで 2 桁 (端末グリッドと同じ数え方)",
+            ),
+            (
+                "👨\u{200D}👩\u{200D}👧\u{200D}👦",
+                4,
+                8,
+                "ZWJ 家族絵文字 = 人 4 つ分。ZWJ 自体は 0 桁",
+            ),
+            ("か\u{3099}", 4, 2, "結合濁点は 0 桁 (基底に乗る)"),
+            ("e\u{0301}", 4, 1, "結合アクセントは 0 桁"),
+            ("\t", 4, 4, "タブは次のタブストップまで"),
+            ("ab\t", 4, 4, "桁 2 のタブは桁 4 まで"),
+            ("あ\t", 4, 4, "全角 (2 桁) の後ろのタブも桁で数える"),
+            ("\t", 8, 8, "タブ幅は設定から来る (8 なら 8)"),
+            (
+                "あいうえ\t",
+                8,
+                16,
+                "8 桁ちょうどのタブは次のストップ (16) へ",
+            ),
+            ("\u{7}", 4, 0, "制御文字 (BEL) は桁を進めない"),
+            ("a\u{7}b", 4, 2, "制御文字は行の途中でも 0 桁"),
+        ];
+        for (line, tab, want, what) in table {
+            assert_eq!(
+                visual_col_in_line(line, line.len(), *tab),
+                *want,
+                "{what}: {line:?} (タブ幅 {tab})"
+            );
+        }
+    }
+
+    /// 表示桁 → バイト位置は必ず**書記素クラスタの境界**を返す。
+    ///
+    /// 結合文字の手前で切ると `が` が `か` と `゛` に割れ、ZWJ の途中で切ると
+    /// 家族絵文字がばらける。ハングルは入力の途中で分解字母 (ㅎ+ㅏ+ㄴ) として
+    /// 届くので、ここを割ると打っている最中の音節が壊れる。
+    #[test]
+    fn byte_at_visual_col_never_splits_a_cluster() {
+        // (行, 桁, 期待バイト, 何を固定しているか)
+        let table: &[(&str, usize, usize, &str)] = &[
+            ("か\u{3099}あ", 2, 6, "結合濁点の後ろ (か+゛の間で切らない)"),
+            ("👍🏽X", 4, 8, "肌色修飾子の後ろ (基底と修飾子の間で切らない)"),
+            (
+                "\u{1112}\u{1161}\u{11AB}X",
+                2,
+                9,
+                "ハングル分解字母 3 つの後ろ (音節を割らない)",
+            ),
+            (
+                "👨\u{200D}👩X",
+                4,
+                11,
+                "ZWJ 連結の後ろ (絵文字の連結を割らない)",
+            ),
+        ];
+        for (line, col, want, what) in table {
+            let got = byte_at_visual_col(line, *col, 4);
+            assert_eq!(got, *want, "{what}: {line:?} 桁 {col}");
+            assert!(line.is_char_boundary(got), "{what}: 文字境界でない");
+        }
+    }
+
+    /// 日本語の行と英語の行が混じっていても、矩形の辺が**視覚桁で揃う**。
+    #[test]
+    fn column_selection_aligns_japanese_and_english_rows() {
+        let text = "あいうえお\nabcdefghij\n漢字abcd";
+        let (lo, hi) = (2usize, 6usize);
+        let sel = column_selection(text, 0, lo, 2, hi, 4);
+        assert_eq!(
+            sel.slices(text),
+            vec!["いう", "cdef", "字ab"],
+            "同じ桁で切り出される"
+        );
+        for r in sel.carets() {
+            assert_eq!(visual_column_of(text, r.start, 4), lo, "左辺が揃う");
+            assert_eq!(visual_column_of(text, r.end, 4), hi, "右辺が揃う");
+        }
+        assert_invariants(text, &sel, "日英混在の矩形");
+    }
+
+    /// 「上下へキャレット追加」も視覚桁で揃う (日本語 → 英語 → 日本語)。
+    #[test]
+    fn add_cursor_below_aligns_japanese_and_english_visually() {
+        let text = "あいうえお\nabcdefghij\n漢字abcd";
+        // 1 行目の `あいう` の直後 = 表示桁 6
+        let seed = MultiSel::in_text(text, [9..9]);
+        assert_eq!(visual_column_of(text, 9, 4), 6);
+        let mut got = seed;
+        for _ in 0..2 {
+            got = add_cursor_below(text, &got, 4);
+        }
+        assert_eq!(got.len(), 3, "3 行ぶんのキャレット");
+        for r in got.carets() {
+            assert_eq!(visual_column_of(text, r.start, 4), 6, "桁 6 に揃う");
+        }
+        assert_invariants(text, &got, "日英混在のキャレット追加");
     }
 
     // ──────────────── 一括編集 (後ろから前へ) ────────────────
@@ -2186,7 +2892,8 @@ mod tests {
     #[test]
     fn insert_at_all_keeps_the_selected_text_selected() {
         let text = "あ\nい\nう";
-        let sel = column_selection(text, 0, 0, 2, 1, 4);
+        // 全角 1 文字 = 表示桁 0..2
+        let sel = column_selection(text, 0, 0, 2, 2, 4);
         let (out, new) = insert_at_all(text, &sel, "# ");
         assert_eq!(out, "# あ\n# い\n# う");
         assert_eq!(new.slices(&out), vec!["あ", "い", "う"], "選択内容は残る");
@@ -2220,6 +2927,164 @@ mod tests {
         assert_eq!(replace_all_ranges(text, &sel, "x").0, text);
         assert_eq!(delete_at_all(text, &sel).0, text);
         assert_eq!(insert_at_all(text, &sel, "x").0, text);
+    }
+
+    // ──────────── 打鍵を全キャレットへ配る (type / backspace / delete / enter) ────────────
+
+    /// ⌘D を 5 回 = 5 箇所選択のあとタイプすると、5 箇所すべてが同時に置き換わる。
+    #[test]
+    fn 五箇所へ同時にタイプできる() {
+        let text = "a x\nb x\nc x\nd x\ne x\n";
+        let sel = select_all_occurrences(text, "x", MatchOpts::default());
+        assert_eq!(sel.len(), 5, "⌘D 5 回ぶんのキャレット");
+        let (out, after) = type_at_all(text, &sel, "Z");
+        assert_eq!(out, "a Z\nb Z\nc Z\nd Z\ne Z\n");
+        assert_eq!(after.len(), 5, "キャレットは 5 本のまま");
+        // タイプ後は選択が消えて挿入直後の空キャレットになる
+        assert!(after.carets().iter().all(|r| r.start == r.end));
+        assert_eq!(after.carets()[0], 3..3);
+        assert_invariants(&out, &after, "5 箇所へタイプ");
+    }
+
+    /// 空キャレットと範囲選択が混ざっていても、それぞれの意味どおりに効く。
+    #[test]
+    fn 空キャレットと範囲選択が混ざってもタイプできる() {
+        let text = "abc def";
+        // 0..0 は空キャレット、4..7 ("def") は範囲選択
+        let sel = MultiSel::in_text(text, [0..0, 4..7]);
+        let (out, after) = type_at_all(text, &sel, "-");
+        assert_eq!(out, "-abc -");
+        assert_eq!(after.carets(), &[1..1, 6..6], "挿入した文字の直後へ畳む");
+        assert_invariants(&out, &after, "混在のタイプ");
+    }
+
+    /// 多バイト文字も 1 文字単位で消える (バイト単位で切らない)。
+    #[test]
+    fn backspace_は多バイト文字を一文字ずつ消す() {
+        let text = "あい\nうえ\n";
+        // 各行の 2 文字目のうしろ
+        let sel = MultiSel::in_text(text, [6..6, 13..13]);
+        let (out, after) = backspace_at_all(text, &sel);
+        assert_eq!(out, "あ\nう\n");
+        assert_eq!(after.len(), 2);
+        assert_invariants(&out, &after, "多バイトの Backspace");
+    }
+
+    /// Backspace で行が消えたら、キャレットは前の行末へ再配置される。
+    #[test]
+    fn backspace_で行が消えたらキャレットは前の行末へ移る() {
+        let text = "ab\ncd\nef";
+        // 2 行目と 3 行目の行頭 (行頭 Backspace = 前の行とつながる)
+        let sel = MultiSel::in_text(text, [3..3, 6..6]);
+        let (out, after) = backspace_at_all(text, &sel);
+        assert_eq!(out, "abcdef");
+        // "ab" のうしろ (2) と "abcd" のうしろ (4)
+        assert_eq!(after.carets(), &[2..2, 4..4]);
+        assert_invariants(&out, &after, "行が消えた後の再配置");
+    }
+
+    /// 本文先頭のキャレットは Backspace で何も消さない (パニックもしない)。
+    #[test]
+    fn 本文先頭の_backspace_は何もしない() {
+        let text = "abc";
+        let sel = MultiSel::in_text(text, [0..0, 2..2]);
+        let (out, after) = backspace_at_all(text, &sel);
+        assert_eq!(out, "ac");
+        assert_eq!(after.carets(), &[0..0, 1..1]);
+    }
+
+    /// 後退で範囲が重なったキャレットは 1 本に融合する (同じ文字を二度消さない)。
+    #[test]
+    fn backspace_で重なったキャレットは融合する() {
+        let text = "abcd";
+        // 隣り合う空キャレット。後退すると 0..1 と 1..2 で、消えるのは "ab"
+        let sel = MultiSel::in_text(text, [1..1, 2..2]);
+        let (out, after) = backspace_at_all(text, &sel);
+        assert_eq!(out, "cd");
+        assert_eq!(after.carets(), &[0..0], "同じ位置のキャレットは 1 本へ");
+        assert_invariants(&out, &after, "融合");
+    }
+
+    /// CRLF は 1 つの改行として消える (`\r` が取り残されない)。
+    #[test]
+    fn backspace_は_crlf_をまとめて消す() {
+        let text = "ab\r\ncd";
+        let sel = MultiSel::in_text(text, [4..4]); // 2 行目の行頭
+        let (out, _) = backspace_at_all(text, &sel);
+        assert_eq!(out, "abcd", "\\r が取り残されていない");
+    }
+
+    #[test]
+    fn delete_は直後の一文字を消し末尾では何もしない() {
+        let text = "あい\nうえ";
+        let sel = MultiSel::in_text(text, [0..0, text.len()..text.len()]);
+        let (out, after) = delete_forward_at_all(text, &sel);
+        assert_eq!(out, "い\nうえ");
+        assert_eq!(after.carets(), &[0..0, out.len()..out.len()]);
+        assert_invariants(&out, &after, "前方削除");
+    }
+
+    #[test]
+    fn delete_は_crlf_をまとめて消す() {
+        let text = "ab\r\ncd";
+        let sel = MultiSel::in_text(text, [2..2]);
+        assert_eq!(delete_forward_at_all(text, &sel).0, "abcd");
+    }
+
+    /// Enter は各キャレットの行の字下げを複製する。
+    #[test]
+    fn enter_は各行の字下げを複製する() {
+        let text = "    foo\n\tbar\nbaz";
+        let sel = MultiSel::in_text(text, [7..7, 12..12, text.len()..text.len()]);
+        let (out, after) = newline_at_all(text, &sel, LineEnding::Lf);
+        assert_eq!(out, "    foo\n    \n\tbar\n\t\nbaz\n");
+        assert_eq!(after.len(), 3);
+        assert!(after.carets().iter().all(|r| r.start == r.end));
+        assert_invariants(&out, &after, "Enter");
+    }
+
+    /// CRLF のファイルへ LF を混ぜない。
+    #[test]
+    fn enter_は本文の改行様式に合わせる() {
+        let text = "ab\r\ncd\r\n";
+        let sel = MultiSel::in_text(text, [2..2]);
+        let (out, _) = newline_at_all_detect(text, &sel);
+        assert_eq!(out, "ab\r\n\r\ncd\r\n");
+    }
+
+    /// 選択があるまま Enter を押すと、選択が消えて改行になる。
+    #[test]
+    fn enter_は選択を置き換える() {
+        let text = "abcXYZdef";
+        let sel = MultiSel::in_text(text, [3..6]);
+        let (out, after) = newline_at_all(text, &sel, LineEnding::Lf);
+        assert_eq!(out, "abc\ndef");
+        assert_eq!(after.carets(), &[4..4]);
+    }
+
+    /// 行末より右の桁に立てたキャレット (矩形選択の端) でもタイプで壊れない。
+    #[test]
+    fn 行末を超える桁のキャレットでもタイプできる() {
+        // 2 行目は短い。桁 5 の矩形を作ると 2 行目は行末で止まる
+        let text = "abcdefgh\nij\nklmnopqr\n";
+        let sel = column_selection(text, 0, 5, 2, 5, 4);
+        assert_invariants(text, &sel, "行末を超える矩形");
+        let (out, after) = type_at_all(text, &sel, "#");
+        // 3 行の桁 5 に "#" が入り、短い行は行末へ寄る
+        assert_eq!(out, "abcde#fgh\nij#\nklmno#pqr\n");
+        assert_eq!(after.len(), 3);
+        assert_invariants(&out, &after, "行末超えのタイプ");
+    }
+
+    /// 空集合へ打鍵しても本文は変わらない (0 本のキャレット)。
+    #[test]
+    fn キャレットが無ければ打鍵は本文を変えない() {
+        let text = "そのまま";
+        let sel = MultiSel::default();
+        assert_eq!(type_at_all(text, &sel, "x").0, text);
+        assert_eq!(backspace_at_all(text, &sel).0, text);
+        assert_eq!(delete_forward_at_all(text, &sel).0, text);
+        assert_eq!(newline_at_all_detect(text, &sel).0, text);
     }
 
     // ──────────────── 出現の選択 ────────────────
@@ -2350,5 +3215,308 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ──────────────── 保存時のクリーンアップ (追加分) ────────────────
+
+    /// 行末空白の除去が、決めた規則どおりに効く (表で固定する)。
+    ///
+    /// **全角スペース U+3000 と NBSP は落とさない** — 日本語の本文では
+    /// 体裁として意図して置かれる文字なので、保存のたびに消えては困る。
+    #[test]
+    fn 末尾空白の除去は決めた規則どおり() {
+        for (name, src, want) in [
+            ("空行だけの行", "a\n   \nb\n", "a\n\nb\n"),
+            ("タブだけの行", "a\n\t\t\nb\n", "a\n\nb\n"),
+            ("CRLF は \\r を食わない", "a  \r\nb\t\r\n", "a\r\nb\r\n"),
+            ("最終行に改行が無い", "a  \nb  ", "a\nb"),
+            ("CR だけの改行", "a  \rb  \r", "a\rb\r"),
+            (
+                "全角スペースは残す",
+                "a\u{3000}\u{3000}\n",
+                "a\u{3000}\u{3000}\n",
+            ),
+            ("NBSP は残す", "a\u{00a0}\n", "a\u{00a0}\n"),
+            ("全角の後ろの半角は落とす", "a\u{3000} \n", "a\u{3000}\n"),
+            ("空の本文", "", ""),
+            ("改行だけ", "\n\n", "\n\n"),
+        ] {
+            assert_eq!(trim_trailing_whitespace(src), want, "{name}");
+        }
+    }
+
+    /// 最終行の改行の挿入。空ファイルには足さない。
+    #[test]
+    fn 最終改行の挿入は表のとおり() {
+        let lf = LineEnding::Lf;
+        for (name, src, want) in [
+            ("既にある", "a\n", "a\n"),
+            ("無い", "a", "a\n"),
+            ("空ファイル", "", ""),
+            ("改行だけのファイル", "\n", "\n"),
+            ("空白だけの本文には足す", "  ", "  \n"),
+            ("CR で終わっていれば足さない", "a\r", "a\r"),
+        ] {
+            assert_eq!(ensure_final_newline(src, lf), want, "{name}");
+        }
+        // CRLF の本文には CRLF を足す
+        assert_eq!(ensure_final_newline("a", LineEnding::Crlf), "a\r\n");
+    }
+
+    /// 末尾の余分な空行を落とす (`files.trimFinalNewlines`)。
+    #[test]
+    fn 末尾の余分な空行を落とす() {
+        for (name, src, want) in [
+            ("2 本以上は 1 本へ", "a\n\n\n", "a\n"),
+            ("1 本はそのまま", "a\n", "a\n"),
+            ("改行で終わっていなければ触らない", "a", "a"),
+            ("途中の空行は残す", "a\n\n\nb\n\n", "a\n\n\nb\n"),
+            ("CRLF は CRLF を 1 本残す", "a\r\n\r\n\r\n", "a\r\n"),
+            ("CR も 1 本残す", "a\r\r", "a\r"),
+            ("空ファイル", "", ""),
+            ("改行だけのファイル", "\n\n\n", "\n"),
+        ] {
+            assert_eq!(trim_final_newlines(src), want, "{name}");
+        }
+    }
+
+    /// 3 つの整形を一緒にかけたときの合成 (順序が効いていること)。
+    #[test]
+    fn 保存時の整形は行末空白のあとに空行を落とす() {
+        let opts = SaveCleanup {
+            trim_trailing: true,
+            trim_final_newlines: true,
+            final_newline: true,
+            target_ending: None,
+        };
+        // 「空白だけの最終行」は行末空白の除去で空行になり、そのあと落とせる
+        let (out, changed) = apply_save_cleanup_checked("a\n   \n\t\n", &opts);
+        assert_eq!(out, "a\n");
+        assert!(changed);
+        // 整い切っている本文は 1 バイトも変わらない
+        assert_eq!(
+            apply_save_cleanup_checked("a\n", &opts),
+            ("a\n".to_string(), false)
+        );
+        // trim_final_newlines だけでも is_noop にならない
+        let only = SaveCleanup {
+            trim_final_newlines: true,
+            ..Default::default()
+        };
+        assert!(!only.is_noop());
+    }
+
+    // ──────────────── インデントの推定と変換 ────────────────
+
+    /// インデント推定の表テスト。**必ず何かを返す**ことも同時に固定する。
+    #[test]
+    fn インデントの推定は表のとおり() {
+        let fb = IndentStyle::default();
+        for (name, src, want) in [
+            (
+                "タブのみ",
+                "fn a() {\n\tb();\n\tc();\n}\n",
+                IndentStyle::new(true, 4),
+            ),
+            (
+                "スペース2",
+                "a\n  b\n    c\n  d\n",
+                IndentStyle::new(false, 2),
+            ),
+            (
+                "スペース4",
+                "fn a() {\n    if x {\n        y();\n    }\n}\n",
+                IndentStyle::new(false, 4),
+            ),
+            (
+                "混在 (タブが多い)",
+                "\ta\n\tb\n  c\n",
+                IndentStyle::new(true, 4),
+            ),
+            ("インデント無し", "a\nb\nc\n", fb),
+            ("1 行だけ (字下げ無し)", "hello", fb),
+            (
+                "1 行だけ (字下げあり)",
+                "    hello",
+                IndentStyle::new(false, 4),
+            ),
+            ("空ファイル", "", fb),
+            ("空白だけのファイル", "   \n\t\n", fb),
+            ("コメント行だけ", "// a\n// b\n", fb),
+            (
+                "ブロックコメントの継続行は数えない",
+                "/**\n * a\n */\nfn b() {\n  c\n}\n",
+                IndentStyle::new(false, 2),
+            ),
+            (
+                "CRLF でも同じ",
+                "a\r\n    b\r\n",
+                IndentStyle::new(false, 4),
+            ),
+            ("9 桁以上の差は候補にしない", "a\n            b\n", fb),
+        ] {
+            assert_eq!(detect_indent(src, fb), want, "{name}");
+        }
+        // fallback がタブなら「判らない」ときはタブのまま返る
+        let tab_fb = IndentStyle::new(true, 8);
+        assert_eq!(detect_indent("a\nb\n", tab_fb), tab_fb);
+        // 幅は必ず 1..=MAX_INDENT_WIDTH へ丸まる
+        assert_eq!(IndentStyle::new(false, 0).width, 1);
+        assert_eq!(IndentStyle::new(false, 999).width, MAX_INDENT_WIDTH);
+    }
+
+    /// インデントの変換は段数を保ち、本文と改行には触らない。
+    #[test]
+    fn インデントの変換は段数を保つ() {
+        let s4 = IndentStyle::new(false, 4);
+        let s2 = IndentStyle::new(false, 2);
+        let t4 = IndentStyle::new(true, 4);
+        for (name, src, from, to, want) in [
+            (
+                "スペース4 → スペース2",
+                "    a\n        b\n",
+                s4,
+                s2,
+                "  a\n    b\n",
+            ),
+            (
+                "スペース4 → タブ",
+                "    a\n        b\n",
+                s4,
+                t4,
+                "\ta\n\t\tb\n",
+            ),
+            (
+                "タブ → スペース4",
+                "\ta\n\t\tb\n",
+                t4,
+                s4,
+                "    a\n        b\n",
+            ),
+            ("CRLF はそのまま", "    a\r\n", s4, s2, "  a\r\n"),
+            (
+                "空白だけの行は触らない",
+                "   \n    a\n",
+                s4,
+                s2,
+                "   \n  a\n",
+            ),
+            ("CJK でも桁だけ変わる", "    あ\n", s4, s2, "  あ\n"),
+            ("同じ様式なら恒等", "    a\n", s4, s4, "    a\n"),
+            ("半端な桁は余りとして残る", "     a\n", s4, s2, "   a\n"),
+        ] {
+            assert_eq!(convert_indentation(src, from, to), want, "{name}");
+        }
+        // 行数は絶対に変わらない
+        for src in ["", "a", "a\n", "\ta\n\tb\n"] {
+            let out = convert_indentation(src, t4, s2);
+            assert_eq!(
+                out.split('\n').count(),
+                src.split('\n').count(),
+                "行数が変わった: {src:?}"
+            );
+        }
+        // 1 段ぶんの実体
+        assert_eq!(s2.unit(), "  ");
+        assert_eq!(t4.unit(), "\t");
+    }
+
+    // ──────────────── 選択範囲への編集コマンド ────────────────
+
+    /// 大文字小文字の変換 (CJK・絵文字は素通し)。
+    #[test]
+    fn 大文字小文字の変換は表のとおり() {
+        for (name, src, kind, want) in [
+            ("空選択", "", CaseKind::Upper, ""),
+            ("大文字へ", "hello world", CaseKind::Upper, "HELLO WORLD"),
+            ("小文字へ", "Hello World", CaseKind::Lower, "hello world"),
+            (
+                "先頭大文字へ",
+                "hello world",
+                CaseKind::Title,
+                "Hello World",
+            ),
+            (
+                "先頭大文字は残りを小文字にする",
+                "hELLO wORLD",
+                CaseKind::Title,
+                "Hello World",
+            ),
+            (
+                "記号で区切る",
+                "foo-bar baz",
+                CaseKind::Title,
+                "Foo-Bar Baz",
+            ),
+            ("下線は単語の途中", "foo_bar", CaseKind::Title, "Foo_bar"),
+            ("CJK は変わらない", "あいう", CaseKind::Upper, "あいう"),
+            ("絵文字は変わらない", "🎉a🎉", CaseKind::Upper, "🎉A🎉"),
+            // 数字も単語の一部なので、"1st" の s は大文字にならない
+            ("数字始まりの語", "1st place", CaseKind::Title, "1st Place"),
+        ] {
+            assert_eq!(transform_case(src, kind), want, "{name}");
+        }
+    }
+
+    /// 行の並べ替え / 重複削除は、選択が覆う行だけを書き換える。
+    #[test]
+    fn 行の並べ替えと重複削除は選択した行だけに効く() {
+        // 全選択 (末尾の改行を巻き込まない)
+        let text = "b\na\nc\n";
+        let (out, s, e) = sort_lines(text, 0, text.chars().count(), false);
+        assert_eq!(out, "a\nb\nc\n");
+        assert_eq!((s, e), (0, 5), "書き換えた行の全体が選択される");
+        let (out, ..) = sort_lines(text, 0, text.chars().count(), true);
+        assert_eq!(out, "c\nb\na\n");
+
+        // 1 行だけ (選択なし) は並べ替えるものが無い
+        let (out, s, e) = sort_lines(text, 0, 0, false);
+        assert_eq!(out, text);
+        assert_eq!((s, e), (0, 1));
+
+        // 選択が覆う行だけ (2〜3 行目)
+        let text = "z\nc\nb\na\n";
+        let (out, ..) = sort_lines(text, 2, 5, false);
+        assert_eq!(out, "z\nb\nc\na\n");
+
+        // 重複削除: 最初の 1 本だけ残り、並び順は変わらない
+        let text = "b\na\nb\na\n";
+        let (out, ..) = dedupe_lines(text, 0, text.chars().count());
+        assert_eq!(out, "b\na\n");
+        // 重複が無ければ本文は変わらない
+        let text = "a\nb\nc\n";
+        let (out, ..) = dedupe_lines(text, 0, text.chars().count());
+        assert_eq!(out, text);
+
+        // CRLF は保たれる
+        let text = "b\r\na\r\n";
+        let (out, ..) = sort_lines(text, 0, text.chars().count(), false);
+        assert_eq!(out, "a\r\nb\r\n");
+
+        // CJK / 絵文字でもバイト境界を割らない
+        let text = "い\nあ\n🎉\n";
+        let (out, s, e) = sort_lines(text, 0, text.chars().count(), false);
+        assert_eq!(out, "あ\nい\n🎉\n");
+        assert!(e >= s && e <= out.chars().count());
+    }
+
+    /// JSON 整形。壊れた JSON は本文を変えずにエラーを返す。
+    #[test]
+    fn json整形はインデントを設定から採る() {
+        assert_eq!(format_json("{\"a\":1}", "  ").unwrap(), "{\n  \"a\": 1\n}");
+        assert_eq!(
+            format_json("{\"a\":[1,2]}", "\t").unwrap(),
+            "{\n\t\"a\": [\n\t\t1,\n\t\t2\n\t]\n}"
+        );
+        // 前後の空白は無視する (選択が改行を含んでいても通る)
+        assert!(format_json("\n  [1]\n", "  ").is_ok());
+        // 壊れた JSON は Err (本文には触らせない)
+        assert!(format_json("{", "  ").is_err());
+        assert!(format_json("", "  ").is_err());
+        // CJK はエスケープせずそのまま (読める形で残す)
+        assert_eq!(
+            format_json("{\"a\":\"あ\"}", " ").unwrap(),
+            "{\n \"a\": \"あ\"\n}"
+        );
     }
 }
