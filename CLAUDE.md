@@ -29,6 +29,25 @@
 
 ## テストと検証
 
+- **検証は `tools/verify.sh` 一発で終わらせる。** 整形 → コンパイル + 警告 →
+  触ったモジュールのテスト、を **1 回のコンパイル**で回す。
+  実測 (warm, 1 ファイル変更): 従来の手順 **48 秒 → 26 秒 (46% 短縮)**。
+  - `tools/verify.sh` / `tools/verify.sh git:: lsp::` / `--all` / `--quick`
+  - 引数無しなら `git status` の `src/*.rs` から対象モジュールを自動で決める
+- **`cargo check --bin zai` だけでは警告を取りこぼす。**
+  `#[cfg(test)]` をコンパイルしないので、**テストコードの警告が出ない**。
+  実際に `non_snake_case` を 2 回続けて見落とした (しかも 1 回目の「修正」は
+  識別子の途中に大文字が残っていて直っていなかった)。
+  テストまで見るなら `--all-targets` を付けるか、`cargo test --no-run` を使う。
+- **`cargo check` と `cargo test` を両方走らせない (二重払い)。**
+  check は `.rmeta` しか作らず test はコード生成まで要るので、**成果物を共有しない**。
+  実測 (warm): `check --all-targets` 13 秒 + `test` 18 秒 = 31 秒に対し、
+  `cargo test --bin zai --no-run` だけなら 18 秒で**警告も全部出る**。
+- **測っていない「効きそうな設定」を残さない。**
+  `[profile.dev] debug = "line-tables-only"` を入れてみたが、ターゲットを分けた
+  A/B でテストバイナリは **128.7MB のまま 1 バイトも変わらなかった**。
+  macOS の dev は `split-debuginfo = "unpacked"` が既定で、デバッグ情報は
+  そもそもバイナリに入っていない。**効果ゼロと分かった時点で撤回した。**
 - 検証は**ローカル優先**。CI は最小構成 + `Swatinem/rust-cache` 必須。
 - **Linux 側は毎回 `tools/linux-test.sh` で確認する。** macOS だけで開発していると
   **Linux / Windows でしか出ない不具合が素通りする**。実際に 43,000 行の変更が
