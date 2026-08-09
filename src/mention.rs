@@ -2784,6 +2784,168 @@ mod tests {
         assert!(candidates(&q, &src).items.is_empty());
     }
 
+    // ── 実際の egui を通した配線 (到達性の証明) ────────────
+
+    /// テキスト欄の状態 (キャレット) を仕込む。コンポーザと同じ読み書き経路。
+    fn put_caret(ctx: &egui::Context, te_id: egui::Id, at: usize) {
+        let mut st = egui::TextEdit::load_state(ctx, te_id).unwrap_or_default();
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(at),
+        )));
+        st.store(ctx, te_id);
+    }
+
+    /// 1 フレーム回す。**毎フレーム入力欄へフォーカスを渡す** —
+    /// egui はその id のウィジェットが描かれなかったフレームでフォーカスを
+    /// 手放すので、本物の `TextEdit` を置かないこのハーネスでは自前で保つ。
+    fn frame(
+        ctx: &egui::Context,
+        te_id: egui::Id,
+        men: &mut Mention,
+        buf: &mut AgentInputBuffer,
+        src: &Source<'_>,
+        events: Vec<egui::Event>,
+    ) -> bool {
+        let mut enter_left = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.memory_mut(|m| m.request_focus(te_id));
+                    men.sync(ui, buf, te_id, src);
+                    // ピッカーが食べなければ、後ろの描画側にまだ残っている。
+                    enter_left = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                });
+            },
+        );
+        enter_left
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// **入力欄で `@` を打つ → 候補が出る → Enter で階層を降りる → 確定**まで、
+    /// 実際の egui のイベント経路で通す。ここが通らなければ「画面から
+    /// 到達できない実装」なので、機能として数えない。
+    #[test]
+    fn 入力欄からピッカーが開いて候補を挿せる() {
+        let ctx = egui::Context::default();
+        let te_id = egui::Id::new("mention-test-te");
+        let f = files(&["app/main.rs", "app/ui.rs", "README.md"]);
+        let syms: Vec<SymbolHit> = Vec::new();
+        let src = src_for(&f, &syms);
+        let mut men = Mention::default();
+        let mut buf = AgentInputBuffer::new();
+
+        // `@app` まで打った状態。候補が出るはず。
+        buf.set_text("@app");
+        put_caret(&ctx, te_id, 4);
+        frame(&ctx, te_id, &mut men, &mut buf, &src, vec![]);
+        assert!(men.is_open(), "`@` を打ってもピッカーが開かない");
+        assert!(
+            men.ranked.items.iter().any(|c| c.label == "app/"),
+            "候補: {:?}",
+            men.ranked
+                .items
+                .iter()
+                .map(|c| &c.label)
+                .collect::<Vec<_>>()
+        );
+
+        // Enter。フォルダなので**降りるだけ**で確定しない。
+        frame(
+            &ctx,
+            te_id,
+            &mut men,
+            &mut buf,
+            &src,
+            vec![key(egui::Key::Enter)],
+        );
+        assert_eq!(buf.text(), "@app/", "Enter で 1 段降りていない");
+        assert!(men.ledger().is_empty(), "降りただけで添付してはいけない");
+        assert!(men.is_open(), "降りた直後は開いたまま");
+
+        // 直下が出る。Enter でファイルを確定する。
+        put_caret(&ctx, te_id, 5);
+        frame(&ctx, te_id, &mut men, &mut buf, &src, vec![]);
+        let labels: Vec<String> = men.ranked.items.iter().map(|c| c.label.clone()).collect();
+        assert_eq!(labels, vec!["main.rs".to_string(), "ui.rs".to_string()]);
+        frame(
+            &ctx,
+            te_id,
+            &mut men,
+            &mut buf,
+            &src,
+            vec![key(egui::Key::Enter)],
+        );
+        assert_eq!(buf.text(), "@app/main.rs ", "確定で印が入っていない");
+        assert!(!men.is_open(), "確定したら閉じる");
+        let items = men.ledger().items();
+        assert_eq!(items.len(), 1, "台帳へ積まれていない");
+        assert_eq!(items[0].token, "@app/main.rs");
+        assert_eq!(items[0].kind, Kind::File);
+
+        // 本文から印を消せば台帳からも落ちる (自己修復)。
+        buf.set_text("");
+        put_caret(&ctx, te_id, 0);
+        frame(&ctx, te_id, &mut men, &mut buf, &src, vec![]);
+        assert!(men.ledger().is_empty(), "印を消しても添付が残っている");
+    }
+
+    /// Esc はピッカーだけを閉じる。0 件のときは Enter を横取りしない
+    /// (横取りすると改行も送信もできない行き止まりになる)。
+    #[test]
+    fn 閉じる打鍵と0件のときの通し() {
+        let ctx = egui::Context::default();
+        let te_id = egui::Id::new("mention-test-te2");
+        let f = files(&["app/main.rs"]);
+        let syms: Vec<SymbolHit> = Vec::new();
+        let src = src_for(&f, &syms);
+        let mut men = Mention::default();
+        let mut buf = AgentInputBuffer::new();
+
+        buf.set_text("@app");
+        put_caret(&ctx, te_id, 4);
+        frame(&ctx, te_id, &mut men, &mut buf, &src, vec![]);
+        assert!(men.is_open());
+        frame(
+            &ctx,
+            te_id,
+            &mut men,
+            &mut buf,
+            &src,
+            vec![key(egui::Key::Escape)],
+        );
+        assert!(!men.is_open(), "Esc で閉じない");
+        assert_eq!(buf.text(), "@app", "Esc が本文を触っている");
+
+        // 0 件: Enter は素通りする (本文は変わらないままコンポーザへ渡る)。
+        buf.set_text("@zzzz");
+        put_caret(&ctx, te_id, 5);
+        frame(&ctx, te_id, &mut men, &mut buf, &src, vec![]);
+        assert!(men.is_open() && men.ranked.items.is_empty());
+        let left = frame(
+            &ctx,
+            te_id,
+            &mut men,
+            &mut buf,
+            &src,
+            vec![key(egui::Key::Enter)],
+        );
+        assert!(left, "0 件なのに Enter を横取りしている");
+        assert_eq!(buf.text(), "@zzzz");
+    }
+
     #[test]
     fn 診断と端末は中身があるときだけ出す() {
         let f: Vec<String> = Vec::new();
