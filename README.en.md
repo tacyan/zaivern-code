@@ -203,6 +203,20 @@ cargo fmt --all --check
 cargo nextest run --profile ci
 ```
 
+### Cross-OS checks (runnable locally, even from macOS)
+
+Code behind `#[cfg(windows)]` or Linux-only branches never compiles in a macOS build.
+These scripts let you catch such breakage without waiting for CI.
+
+```bash
+tools/linux-test.sh              # Reproduce the Linux tests in Docker
+tools/windows-check.sh           # Type-check for Windows (MSVC)
+tools/windows-check.sh --build   # Produce a real zai.exe (verifies linking)
+```
+
+The Windows side needs `cargo install cargo-xwin --locked` once.
+Neither script touches the host `target/` directory.
+
 For plugin development, see the [plugin guide](docs/plugins.md) and [specification](docs/PLUGIN_SPEC.md).
 
 ## Contributing

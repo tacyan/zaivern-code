@@ -1,0 +1,202 @@
+#!/usr/bin/env sh
+# Windows 側のビルドを macOS / Linux からローカルで検証する。
+#
+# ## なぜ要るか
+#
+# `#[cfg(windows)]` のコードは macOS のビルドで**一度もコンパイルされない**。
+# src/ の 23 ファイルに 87 箇所の Windows 分岐があるのに、手元では
+# `cargo check` が全部緑になる — 型エラーが眠っていても気付けない。
+#
+# tools/linux-test.sh と同じ理由で、CI 往復 (1 周 5〜6 分) に頼ると
+# 切り分けに要る情報が出てこない。これを使えば手元で完結する。
+#
+# ## 使い方
+#
+#   tools/windows-check.sh              # 型検査 (--all-targets)。既定・最速
+#   tools/windows-check.sh --build      # 実際に zai.exe を作る (リンクまで通す)
+#   tools/windows-check.sh --clippy     # CI と同じ債務リストで clippy
+#   tools/windows-check.sh --gnu        # mingw 経由の windows-gnu で型検査
+#   tools/windows-check.sh keybinds::   # そのテストを Windows バイナリで実行 (要 wine)
+#
+# ## どこまで担保できるか (正直な話)
+#
+#   * **担保できる**: コンパイルとリンク。`#[cfg(windows)]` の型エラー・
+#     未使用 import・Windows 限定 API の誤用は全部ここで落ちる。
+#     実際に PE32+ の `zai.exe` が macOS 上で出来上がる。
+#   * **担保できない**: 実行時の挙動と GUI。実機 Windows でしか分からない。
+#   * **担保できない**: build.rs の VERSIONINFO 埋め込み。Cargo は
+#     `[target.'cfg(windows)'.build-dependencies]` を**ホスト**で評価するため、
+#     macOS からのクロスビルドでは winresource が入らず、build.rs の
+#     `#[cfg(windows)]` も無効になる。ここだけは CI の windows-latest が唯一の検証。
+#
+# ## なぜ `cargo check --target x86_64-pc-windows-msvc` 単体では駄目か
+#
+# syntect が C の oniguruma (`onig_sys`) を引くので、素の cargo では
+# `fatal error: 'stdlib.h' file not found` で build script が落ちる。
+# Windows の C ヘッダと import ライブラリが要る。cargo-xwin がそれを
+# Microsoft の公式配布から取ってきて clang-cl / lld-link に渡す。
+set -eu
+
+# プロジェクトのルート (このスクリプトの 1 つ上)。パスを直書きしない。
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+# **ホストの target/ を汚さないのが要点。** 同じディレクトリを使うと Windows の
+# 成果物で macOS のビルドが無効化され、戻ったときにフルビルドが走る。
+# TMPDIR は macOS では per-user、Linux では /tmp。どちらでも書ける場所になる。
+tmp=${TMPDIR:-/tmp}
+target=${ZAIVERN_WINDOWS_TARGET:-"${tmp%/}/zaivern-windows-target"}
+
+# CI の windows-latest は MSVC。既定はそれに合わせる (target_env が食い違わない)。
+triple=${ZAIVERN_WINDOWS_TRIPLE:-x86_64-pc-windows-msvc}
+
+# rustup の std が無ければ足す。無言で失敗しないよう、どの三つ組か出す。
+ensure_std() {
+    if ! rustup target list --installed 2>/dev/null | grep -qx "$1"; then
+        echo "== rustup target add $1"
+        rustup target add "$1"
+    fi
+}
+
+need_xwin() {
+    if command -v cargo-xwin >/dev/null 2>&1; then
+        return 0
+    fi
+    cat >&2 <<'EOS'
+cargo-xwin が見つかりません。Windows の C ヘッダ / import ライブラリを
+Microsoft の公式配布から取ってきて clang-cl・lld-link へ渡す道具です。
+
+    cargo install cargo-xwin --locked
+
+初回実行時に Windows SDK と MSVC CRT を ~/.cache/cargo-xwin へ落とします
+(数百 MB・1 回だけ)。ライセンスは Microsoft のもので、成果物の再配布はしません。
+
+xwin を入れたくない / ネットワークが塞がっている場合は mingw 経由でも検査できます:
+
+    brew install mingw-w64          # macOS
+    sudo apt install gcc-mingw-w64  # Debian / Ubuntu
+    tools/windows-check.sh --gnu
+EOS
+    exit 1
+}
+
+# CI の lint ジョブ (.github/workflows/test.yml) と同じ「凍結された債務リスト」。
+# ここを CI と揃えておかないと、Windows 限定の lint だけ基準が違うことになる。
+# CI の clippy は ubuntu 1 台でしか回らないので、**Windows 限定の警告は
+# CI では永久に検出されない**。それを拾えるのがこのモードの存在理由。
+clippy_debt() {
+    cat <<'EOS'
+-Aclippy::cloned_ref_to_slice_refs
+-Aclippy::assertions_on_constants
+-Aclippy::type_complexity
+-Aclippy::manual_contains
+-Aclippy::unnecessary_sort_by
+-Aclippy::map_identity
+-Aclippy::derivable_impls
+-Aclippy::manual_inspect
+-Aclippy::neg_cmp_op_on_partial_ord
+-Aclippy::collapsible_match
+-Aclippy::doc_lazy_continuation
+-Aclippy::empty_line_after_doc_comments
+-Aclippy::int_plus_one
+-Aclippy::explicit_counter_loop
+-Aclippy::single_range_in_vec_init
+-Aclippy::cmp_owned
+-Aclippy::manual_div_ceil
+-Aclippy::field_reassign_with_default
+-Aclippy::needless_return
+-Aclippy::manual_repeat_n
+-Aclippy::manual_clamp
+-Aclippy::if_same_then_else
+-Aclippy::question_mark
+-Aclippy::single_match
+-Aclippy::redundant_pattern_matching
+-Aclippy::io_other_error
+EOS
+}
+
+mode=${1:-}
+
+case "$mode" in
+--gnu)
+    # xwin を使わない代替路。mingw-w64 の gcc が onig_sys の C を通す。
+    # cfg 的には msvc と同じ (src/ に target_env の分岐は 1 つも無い) ので
+    # Windows 限定コードの型検査としては等価。ただし CI は MSVC なので
+    # リンカ由来の差 (シンボル解決など) はこちらでは出ない。
+    triple=x86_64-pc-windows-gnu
+    cc=x86_64-w64-mingw32-gcc
+    if ! command -v "$cc" >/dev/null 2>&1; then
+        cat >&2 <<EOS
+$cc が見つかりません。
+
+    brew install mingw-w64          # macOS
+    sudo apt install gcc-mingw-w64  # Debian / Ubuntu
+EOS
+        exit 1
+    fi
+    ensure_std "$triple"
+    # cc-rs / cargo へ mingw のツールチェーンを教える。環境変数名は三つ組の
+    # `-` を `_` にしたもの。ここを直書きせず $triple から作る。
+    env_key=$(echo "$triple" | tr '-' '_')
+    echo "== Windows ($triple, mingw) で実行: cargo check --all-targets"
+    exec env \
+        CARGO_TARGET_DIR="${target}-gnu" \
+        "CC_${env_key}=$cc" \
+        "AR_${env_key}=x86_64-w64-mingw32-ar" \
+        "CARGO_TARGET_$(echo "$env_key" | tr '[:lower:]' '[:upper:]')_LINKER=$cc" \
+        cargo check --target "$triple" --all-targets
+    ;;
+--build)
+    need_xwin
+    ensure_std "$triple"
+    echo "== Windows ($triple) で実行: cargo xwin build --bin zai"
+    CARGO_TARGET_DIR="$target" cargo xwin build --bin zai --target "$triple"
+    exe="$target/$triple/debug/zai.exe"
+    echo "== 出来上がり: $exe"
+    # file が無い環境 (最小 Linux コンテナ等) でも落とさない。
+    command -v file >/dev/null 2>&1 && file "$exe" || true
+    ;;
+--clippy)
+    need_xwin
+    ensure_std "$triple"
+    echo "== Windows ($triple) で実行: cargo xwin clippy --all-targets"
+    # clippy_debt() は 1 行 1 引数。`set --` で位置パラメータへ展開する
+    # (配列の無い POSIX sh でも安全に渡せる)。
+    set -- $(clippy_debt)
+    exec env CARGO_TARGET_DIR="$target" \
+        cargo xwin clippy --target "$triple" --all-targets --locked -- -D warnings "$@"
+    ;;
+"")
+    need_xwin
+    ensure_std "$triple"
+    echo "== Windows ($triple) で実行: cargo xwin check --all-targets"
+    exec env CARGO_TARGET_DIR="$target" \
+        cargo xwin check --target "$triple" --all-targets
+    ;;
+-*)
+    echo "不明なオプション: $mode (--build / --clippy / --gnu のいずれか)" >&2
+    exit 2
+    ;;
+*)
+    # テストの**実行**は Windows バイナリを動かすことなので wine が要る。
+    # 型検査と違って「無くても代替できる」ものではないため、無ければ手順を出す。
+    if ! command -v wine >/dev/null 2>&1 && ! command -v wine64 >/dev/null 2>&1; then
+        cat >&2 <<EOS
+テストの「実行」には wine が要ります (Windows の exe を macOS / Linux で動かすため)。
+
+    brew install --cask wine-stable   # macOS
+    sudo apt install wine64           # Debian / Ubuntu
+
+型エラーだけ見たいなら引数なしで実行してください (wine 不要):
+
+    tools/windows-check.sh
+EOS
+        exit 1
+    fi
+    need_xwin
+    ensure_std "$triple"
+    echo "== Windows ($triple, wine) で実行: cargo xwin test $mode"
+    exec env CARGO_TARGET_DIR="$target" \
+        cargo xwin test --bin zai --target "$triple" -- "$mode"
+    ;;
+esac

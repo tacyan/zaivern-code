@@ -209,6 +209,20 @@ cargo fmt --all --check
 cargo nextest run --profile ci
 ```
 
+### 他OSの検証（macOSからでもローカルで回せます）
+
+`#[cfg(windows)]` や Linux 限定のコードは、macOSのビルドでは一度もコンパイルされません。
+CIの往復を待たずに手元で潰せます。
+
+```bash
+tools/linux-test.sh              # Linuxのテストを Docker で再現
+tools/windows-check.sh           # Windows(MSVC)向けの型検査
+tools/windows-check.sh --build   # 実際に zai.exe を作る（リンクまで確認）
+```
+
+Windows側は初回のみ `cargo install cargo-xwin --locked` が必要です。
+どちらのスクリプトもホストの `target/` は汚しません。
+
 プラグイン開発については[プラグインガイド](docs/plugins.md)と[仕様書](docs/PLUGIN_SPEC.md)を参照してください。
 
 ## コントリビューション

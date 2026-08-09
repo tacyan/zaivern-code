@@ -6648,6 +6648,10 @@ pub struct LinkState {
     exists: HashMap<PathBuf, (bool, Instant)>,
     /// (行, 行テキストのハッシュ, 解決済みリンク)。
     row: Option<(u16, u64, Vec<ResolvedLink>)>,
+    /// 直近にポインタを押し下げた座標。クリックとドラッグ選択を見分けるために持つ。
+    /// egui の `press_origin` は **離した瞬間のフレームでもう None** に戻るので、
+    /// クリックが確定するそのフレームでは読めない。押されている間に控えておく。
+    press_at: Option<egui::Pos2>,
 }
 
 /// 実在確認の有効期間。ビルドで生まれたファイルが数秒で拾えるだけの短さ。
@@ -7043,18 +7047,48 @@ fn cols_for_range(map: &[(usize, u16)], start: usize, end: usize, cols: u16) -> 
     (col_start, col_end.max(col_start.saturating_add(1)))
 }
 
-/// クリックでリンクを開くときに要求する修飾キーの表示名。
+/// このクリックでリンクを開いてよいか。**egui に触らない純関数**にして、
+/// 「素のクリックで開ける」と「文字選択を壊さない」の両立をテーブルテストで固定する。
 ///
-/// `BindAction` を持たない **マウス操作の修飾**なので keybinds 表には無い。
-/// それでも打鍵表記をソースにベタ書きしないよう egui の表から生成する。
-fn link_modifier_label() -> String {
-    let mac = cfg!(target_os = "macos");
-    let names = if mac {
-        egui::ModifierNames::SYMBOLS
-    } else {
-        egui::ModifierNames::NAMES
-    };
-    names.format(&egui::Modifiers::COMMAND, mac)
+/// 端末の素のクリックは既に (1) ドラッグ選択の起点 (2) 選択の解除
+/// (3) ダブル/トリプルクリックの語・行選択、として使われている。
+/// リンクを開くのは **そのどれでもないと確定したクリックだけ**。
+///
+/// * `hovering` — ポインタの下にリンクがあるか。
+/// * `dragged_px` — 押し始めから離すまでにポインタが動いた距離 (px)。
+/// * `slop_px` — クリックと見なす移動量の上限。egui が `clicked()` の判定に使う
+///   `max_click_dist` をそのまま渡す (自前のしきい値を作ると egui と食い違う)。
+/// * `click_count` — 0=クリックなし / 1=シングル / 2=ダブル / 3=トリプル。
+/// * `modified` — 修飾キー (mac は Command / 他は Ctrl) が押されているか。
+/// * `had_selection` — このクリックの **前**に選択範囲があったか。
+fn should_open_link(
+    hovering: bool,
+    dragged_px: f32,
+    slop_px: f32,
+    click_count: u8,
+    modified: bool,
+    had_selection: bool,
+) -> bool {
+    // ダブル(語選択)・トリプル(行選択)は選択操作。0 は「そもそも押していない」。
+    if !hovering || click_count != 1 {
+        return false;
+    }
+    // 測れなかった値 (NaN / 無限大 / 負) は安全側に倒して開かない。
+    // NaN は比較が常に false になるので、大小を見る前に弾いておく。
+    if !dragged_px.is_finite() || !slop_px.is_finite() || dragged_px < 0.0 {
+        return false;
+    }
+    // しきい値を超えて動いていたらドラッグ選択。開かない。
+    if dragged_px > slop_px {
+        return false;
+    }
+    // 修飾キー付きは従来からの経路。指が覚えているので、選択の有無に関わらず開く。
+    if modified {
+        return true;
+    }
+    // 素のクリックで選択範囲がある間は「選択を解除したい」の意味。
+    // ここで開くと、読み返そうとして選択しただけの人がブラウザへ飛ばされる。
+    !had_selection
 }
 
 /// 端末のリンククリックが積む「このファイルのこの位置を開いて」要求のキー。
@@ -7136,11 +7170,11 @@ impl Session {
 
 /// リンクのホバー表示とクリック処理。
 ///
-/// クリックに **修飾キー (mac は Command / 他は Ctrl) を要求する**のは VS Code と
-/// 同じ理由: 端末の素のクリックは「選択の解除」とドラッグ選択の起点として既に
-/// 使われており、横取りすると文字選択が壊れる。修飾キーが押されている間だけ
-/// 手のカーソルに変え、押されていない間も下線と案内を出して「押せば開ける」と
-/// 分かるようにする。
+/// **修飾キー無しのクリックでも開く**。VS Code は ⌘ を要求するが、
+/// 「リンクに見えるのに押しても何も起きない」の方がずっと多く報告される。
+/// 代わりに、選択操作と衝突しないクリックだけを [`should_open_link`] で選り分ける
+/// (ドラッグした / ダブル・トリプルクリック / 選択が残っている、は全部見送る)。
+/// 修飾キー付きは従来どおり開くので、覚えている指も壊れない。
 #[allow(clippy::too_many_arguments)]
 fn handle_links(
     ui: &egui::Ui,
@@ -7152,6 +7186,7 @@ fn handle_links(
     padding: f32,
     cell_w: f32,
     cell_h: f32,
+    had_selection: bool,
 ) {
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return;
@@ -7179,7 +7214,7 @@ fn handle_links(
         return;
     };
 
-    let modded = ui.input(|i| i.modifiers.command);
+    let modified = ui.input(|i| i.modifiers.command);
     // 端末セルと同じく整数ピクセルへ揃える (小数のままだと 100% 表示で揺れる)
     let ppp = ui.ctx().pixels_per_point();
     let origin = rect.min + egui::vec2(padding, padding);
@@ -7187,14 +7222,13 @@ fn handle_links(
     let x1 =
         crate::theme::snap_len(origin.x + f32::from(link.col_end) * cell_w, ppp).min(rect.max.x);
     let y = crate::theme::snap_len(origin.y + f32::from(row) * cell_h + cell_h - 1.0, ppp);
-    let (color, width) = if modded {
-        (theme.accent, 1.5_f32)
-    } else {
-        (theme.text_dim, 1.0_f32)
-    };
+    // 修飾キーの有無で見た目を変えない。押せば開けるのだから、押せると分かる
+    // 描き方を常に出す。色は `Theme::link_color()` — アクセント色を流用すると
+    // 選択の塗り・カーソル・フォーカスリングと同じ色になり、「押せるもの」と
+    // 「いま選ばれているもの」が見分けられなくなる。
     painter.line_segment(
         [egui::pos2(x0, y), egui::pos2(x1, y)],
-        egui::Stroke::new(width, color),
+        egui::Stroke::new(1.5_f32, theme.link_color()),
     );
 
     let label = match &link.target {
@@ -7203,15 +7237,39 @@ fn handle_links(
             format!("{}:{}", path.display(), line.saturating_add(1))
         }
     };
-    if modded {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response.clone().on_hover_text(trf(
-        "{k} + クリックで開く: {t}",
-        &[("k", link_modifier_label()), ("t", label)],
-    ));
+    // 手のカーソルも修飾キーに関係なく出す (押せるものは押せる形をしている)。
+    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    response
+        .clone()
+        .on_hover_text(trf("クリックで開く: {t}", &[("t", label)]));
 
-    if modded && response.clicked() {
+    // クリックとドラッグ選択の見分け。しきい値は egui が `clicked()` を判定する
+    // のに使う値をそのまま借りる (自前の数字を置くと egui の判定と食い違う)。
+    let slop_px = ui.ctx().options(|o| o.input_options.max_click_dist);
+    // 押し始めの記録が無いフレームは「測れなかった」= 開かない側へ倒す。
+    let dragged_px = session
+        .links
+        .press_at
+        .map_or(f32::INFINITY, |p| p.distance(pos));
+    // 右クリック(コンテキストメニュー)まで拾わないよう、主ボタンだけを見る。
+    // egui の `Response::clicked` はボタンを区別しない点に注意。
+    let click_count = if response.triple_clicked_by(egui::PointerButton::Primary) {
+        3
+    } else if response.double_clicked_by(egui::PointerButton::Primary) {
+        2
+    } else if response.clicked_by(egui::PointerButton::Primary) {
+        1
+    } else {
+        0
+    };
+    if should_open_link(
+        response.hovered(),
+        dragged_px,
+        slop_px,
+        click_count,
+        modified,
+        had_selection,
+    ) {
         match link.target {
             LinkTarget::Url(u) => ui.ctx().open_url(egui::OpenUrl::new_tab(u)),
             LinkTarget::File { path, line, col } => {
@@ -7494,7 +7552,16 @@ pub fn draw(
     }
 
     // ── マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行) ──
+    // リンクを開いてよいかは「このクリックの前に選択があったか」で変わるが、
+    // handle_mouse_selection はクリックで選択を消してしまう。先に控えておく。
+    let had_selection = session.selection.is_some();
     if interactive {
+        // 押し始めの座標。ドラッグ選択とクリックの見分けに使う。
+        // egui の press_origin は離した瞬間のフレームで None に戻っているので、
+        // 押されている間 (= Some の間) にこちらへ写しておく。
+        if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+            session.links.press_at = Some(p);
+        }
         handle_mouse_selection(session, &response, rect, padding, cell_w, cell_h);
     }
 
@@ -7539,7 +7606,16 @@ pub fn draw(
     // 走査するのはポインタ下の 1 行だけなので、静止中のコストは 0。
     if interactive && response.hovered() {
         handle_links(
-            ui, &painter, session, theme, &response, rect, padding, cell_w, cell_h,
+            ui,
+            &painter,
+            session,
+            theme,
+            &response,
+            rect,
+            padding,
+            cell_w,
+            cell_h,
+            had_selection,
         );
     }
 
@@ -12111,7 +12187,7 @@ mod split_tests {
 mod link_tests {
     use super::{
         cols_for_range, detect_links, detect_urls, exists_cached, resolve_link_path, row_text_cols,
-        LinkKind, LinkMatch,
+        should_open_link, LinkKind, LinkMatch,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -12391,6 +12467,52 @@ mod link_tests {
             "TTL 内なのに stat し直している"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「素のクリックで開く」が選択操作を壊していないことの表。
+    ///
+    /// ここが本体。描画側 (`handle_links`) は egui から値を集めて
+    /// この関数へ渡すだけなので、選択との衝突はこの表で固定できる。
+    /// `slop` は egui の `max_click_dist` 既定値と同じ 6px を代表値に使う
+    /// (実コードは egui の設定から読むので、値が変わっても追随する)。
+    #[test]
+    fn 素のクリックで開くが選択操作は壊さない() {
+        const SLOP: f32 = 6.0;
+        // (説明, hovering, dragged_px, click_count, modified, had_selection, 期待)
+        let table: &[(&str, bool, f32, u8, bool, bool, bool)] = &[
+            ("素のシングルクリックは開く", true, 0.0, 1, false, false, true),
+            ("修飾キー付きも従来どおり開く", true, 0.0, 1, true, false, true),
+            ("リンクの上でなければ開かない", false, 0.0, 1, true, false, false),
+            ("クリックしていないフレームは開かない", true, 0.0, 0, false, false, false),
+            ("ダブルクリック(語選択)では開かない", true, 0.0, 2, false, false, false),
+            ("修飾キー付きダブルクリックでも開かない", true, 0.0, 2, true, false, false),
+            ("トリプルクリック(行選択)では開かない", true, 0.0, 3, false, false, false),
+            ("修飾キー付きトリプルクリックでも開かない", true, 0.0, 3, true, false, false),
+            ("しきい値ちょうどの微動はクリック", true, SLOP, 1, false, false, true),
+            ("しきい値を超えたらドラッグ選択", true, SLOP + 0.001, 1, false, false, false),
+            ("大きく引きずったら開かない", true, 400.0, 1, false, false, false),
+            ("引きずれば修飾キー付きでも開かない", true, 400.0, 1, true, false, false),
+            ("選択が残っている素のクリックは解除の意図", true, 0.0, 1, false, true, false),
+            ("選択があっても修飾キー付きなら開く", true, 0.0, 1, true, true, true),
+            ("測れない距離(NaN)は開かない", true, f32::NAN, 1, false, false, false),
+            ("測れない距離(∞)は開かない", true, f32::INFINITY, 1, false, false, false),
+            ("負の距離はあり得ないので開かない", true, -1.0, 1, false, false, false),
+        ];
+        for (why, hovering, dragged, count, modified, had_sel, want) in table {
+            let got = should_open_link(*hovering, *dragged, SLOP, *count, *modified, *had_sel);
+            assert_eq!(
+                got, *want,
+                "{why}: hovering={hovering} dragged={dragged} count={count} \
+                 modified={modified} had_selection={had_sel}"
+            );
+        }
+        // しきい値そのものが壊れた値でも「開かない」側へ倒れる
+        for slop in [f32::NAN, f32::INFINITY] {
+            assert!(
+                !should_open_link(true, 0.0, slop, 1, false, false),
+                "しきい値が {slop} のとき開いてしまった"
+            );
+        }
     }
 }
 

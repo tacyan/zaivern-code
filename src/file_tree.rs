@@ -2583,8 +2583,15 @@ pub fn label_of(p: &Path) -> String {
 ///   ごみ箱の中のパスは API から返らないため、取り消しでは戻せない (`Ok(None)`)。
 pub mod trash {
     use crate::i18n::{tr, trf};
+    // 「移す」形のゴミ箱 (macOS / Unix) を組み立てるためだけの型。
+    // Windows は SHFileOperationW にパスを渡すだけなので使わない —
+    // cfg を付けないと Windows ビルドでだけ unused_imports 警告になる
+    // (CI の clippy は ubuntu 1 台でしか回らないため、この警告は
+    //  tools/windows-check.sh --clippy でしか出てこない)。
+    #[cfg(any(unix, test))]
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
+    #[cfg(any(unix, test))]
     use std::time::SystemTime;
 
     /// ゴミ箱へ「移す」形の OS (macOS / Unix) 用の実行計画。
