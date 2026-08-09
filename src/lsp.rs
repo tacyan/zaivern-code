@@ -222,6 +222,35 @@ pub struct SignatureHelp {
     pub active_parameter: Option<usize>,
 }
 
+/// textDocument/inlayHint の 1 件 (型注釈・引数名などの行内ヒント)。
+///
+/// LSP の `label` は **`string` と `InlayHintLabelPart[]` の 2 形式**が来るが、
+/// 画面に出るのは結局 1 本の文字列なので受信時に連結して畳む
+/// (パーツ毎の tooltip / 定義ジャンプは未対応。必要になったら構造を戻す)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InlayHint {
+    /// 0-based の行 (LSP 座標)
+    pub line: usize,
+    /// UTF-16 code unit の桁 (LSP 座標)
+    pub character: usize,
+    /// 表示文字列 (パーツ形式は連結済み)
+    pub label: String,
+    /// [`INLAY_KIND_TYPE`] / [`INLAY_KIND_PARAMETER`] / 0 = 種別なし
+    pub kind: u8,
+    pub padding_left: bool,
+    pub padding_right: bool,
+}
+
+/// InlayHintKind.Type
+pub const INLAY_KIND_TYPE: u8 = 1;
+/// InlayHintKind.Parameter
+pub const INLAY_KIND_PARAMETER: u8 = 2;
+
+/// 1 応答から取り込む inlay hint の上限。
+/// 巨大ファイルでサーバーが数万件返してきても、確保する `Vec` を有限に保つ
+/// (画面に出るのは可視行のぶんだけなので、実用上ここで切って困らない)。
+pub const MAX_INLAY_HINTS: usize = 4000;
+
 /// codeAction の 1 件 (Command 形式も CodeAction 形式もここへ寄せる)。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CodeAction {
@@ -323,6 +352,8 @@ pub struct ServerCaps {
     pub signature_trigger_chars: Vec<char>,
     pub code_action: bool,
     pub document_symbol: bool,
+    /// textDocument/inlayHint (型・引数名のインライン表示)。
+    pub inlay_hint: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +627,7 @@ enum Pending {
     Symbols,
     Signature,
     CodeAction,
+    Inlay,
 }
 
 /// 送信済みリクエストの控え。`at` はタイムアウト掃除 ([`LspClient::sweep_timeouts`]) 用。
@@ -680,6 +712,13 @@ struct Shared {
     symbols: Slot<Vec<SymbolNode>>,
     signature: Slot<SignatureHelp>,
     code_action: Slot<Vec<CodeAction>>,
+    /// inlay hint だけは `Slot` を使わない。**結果がキャレットではなく
+    /// 「そのパスのそのバージョン」に紐づく**ので、最新 1 件しか持てない Slot では
+    /// 「どの版に対する答えか」を表せない。id → (パス, 要求時の version) を控え、
+    /// 応答はそのままキャッシュへ入れる。
+    inlay_pending: Mutex<HashMap<u64, (PathBuf, i64)>>,
+    /// パス → (要求時の version, ヒント)。`Arc` なので取り出しは参照カウントだけ。
+    inlay: Mutex<HashMap<PathBuf, (i64, Arc<Vec<InlayHint>>)>>,
 }
 
 impl Shared {
@@ -702,6 +741,8 @@ impl Shared {
             symbols: Slot::new(),
             signature: Slot::new(),
             code_action: Slot::new(),
+            inlay_pending: Mutex::new(HashMap::new()),
+            inlay: Mutex::new(HashMap::new()),
         }
     }
 
@@ -717,7 +758,10 @@ impl Shared {
     }
 
     /// 指定種別の待機を「空の結果」で打ち切る。
-    fn abandon(&self, kind: Pending) {
+    ///
+    /// `id` が要るのは inlay hint だけ (控えが id をキーにした表なので、
+    /// 打ち切った 1 件だけを取り除く必要がある)。
+    fn abandon(&self, id: u64, kind: Pending) {
         match kind {
             Pending::Initialize => {}
             Pending::Completion => self.completion.abandon(),
@@ -731,20 +775,25 @@ impl Shared {
             Pending::Symbols => self.symbols.abandon(),
             Pending::Signature => self.signature.abandon(),
             Pending::CodeAction => self.code_action.abandon(),
+            // 待っている UI は無い (キャッシュに入らないだけ)。控えを消して
+            // おかないと、次の要求が「飛行中」と誤判定されて永久に出なくなる。
+            Pending::Inlay => {
+                lock_ok(&self.inlay_pending).remove(&id);
+            }
         }
         self.abandoned.fetch_add(1, Ordering::SeqCst);
     }
 
     /// 未応答のリクエストを全部打ち切る (サーバー死亡時)。
     fn abandon_all(&self) {
-        let kinds: Vec<Pending> = {
+        let kinds: Vec<(u64, Pending)> = {
             let mut p = lock_ok(&self.pending);
-            let ks = p.values().map(|e| e.kind).collect();
+            let ks = p.iter().map(|(id, e)| (*id, e.kind)).collect();
             p.clear();
             ks
         };
-        for k in kinds {
-            self.abandon(k);
+        for (id, k) in kinds {
+            self.abandon(id, k);
         }
     }
 }
@@ -894,7 +943,11 @@ impl LspClient {
                             ] }
                         }
                     },
-                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true }
+                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+                    // inlayHint/resolve は未対応 (resolveSupport を宣言しないので
+                    // サーバーは最初から完全な label を返す)。dynamicRegistration も
+                    // 未対応 — 能力は initialize 応答の一度きりで確定させる。
+                    "inlayHint": { "dynamicRegistration": false }
                 },
                 "workspace": {
                     // 未対応: サーバーが勝手にファイルを作り替える applyEdit は受けない
@@ -951,6 +1004,9 @@ impl LspClient {
             *v += 1;
             *v
         };
+        // 本文が変わった時点で、前の版に対する inlay hint は指す場所を失う。
+        // ずれた型注釈を出し続けるくらいなら消す (次の要求で入れ直る)。
+        lock_ok(&self.shared.inlay).remove(&p);
         self.notify(
             "textDocument/didChange",
             json!({
@@ -963,6 +1019,7 @@ impl LspClient {
     pub fn did_close(&self, path: &Path) {
         let p = canonical(path);
         lock_ok(&self.versions).remove(&p);
+        lock_ok(&self.shared.inlay).remove(&p);
         self.notify(
             "textDocument/didClose",
             json!({ "textDocument": { "uri": path_to_uri(&p) } }),
@@ -1015,7 +1072,7 @@ impl LspClient {
     /// 戻り値は打ち切った件数。
     pub fn sweep_timeouts(&self, timeout: Duration) -> usize {
         let now = std::time::Instant::now();
-        let stale: Vec<Pending> = {
+        let stale: Vec<(u64, Pending)> = {
             let mut p = lock_ok(&self.shared.pending);
             let ids: Vec<u64> = p
                 .iter()
@@ -1023,12 +1080,11 @@ impl LspClient {
                 .map(|(id, _)| *id)
                 .collect();
             ids.iter()
-                .filter_map(|id| p.remove(id))
-                .map(|e| e.kind)
+                .filter_map(|id| p.remove(id).map(|e| (*id, e.kind)))
                 .collect()
         };
-        for k in &stale {
-            self.shared.abandon(*k);
+        for (id, k) in &stale {
+            self.shared.abandon(*id, *k);
         }
         stale.len()
     }
@@ -1287,6 +1343,66 @@ impl LspClient {
         self.shared.symbols.take()
     }
 
+    // ── インレイヒント ──────────────────────────────────────────
+
+    /// textDocument/inlayHint。**文書全体**を 1 回で要求する。
+    ///
+    /// 仕様上は可視範囲だけを要求してもよいが、それだとスクロールのたびに
+    /// 往復が増える。ここは (パス, version) でキャッシュするので、
+    /// **1 バージョンにつき 1 往復**で済む全文取得の方が安い
+    /// (設計原則 3: アイドル時のコストはゼロ)。
+    ///
+    /// `text` はいま開いている本文。範囲の終端を出すためだけに使う
+    /// (`byte_index_to_lsp_pos` を通すので UTF-16 桁は既存規則のまま)。
+    pub fn request_inlay_hints(&self, path: &Path, text: &str) -> RequestStatus {
+        let st = self.begin(self.caps().inlay_hint, Pending::Inlay);
+        if let RequestStatus::Sent(id) = st {
+            let p = canonical(path);
+            let version = self.doc_version(&p);
+            lock_ok(&self.shared.inlay_pending).insert(id, (p.clone(), version));
+            let range = Range::new(Position::new(0, 0), byte_index_to_lsp_pos(text, text.len()));
+            self.request_raw(
+                id,
+                "textDocument/inlayHint",
+                json!({
+                    "textDocument": { "uri": path_to_uri(&p) },
+                    "range": Self::range_json(&range)
+                }),
+            );
+        }
+        st
+    }
+
+    /// キャッシュ済みのヒント。**いまの version と一致するときだけ** Some。
+    /// 本文が変わった後 (did_change) は None なので、古い型注釈は画面に残らない。
+    /// ヒットしても `Arc` の clone だけで中身の `Vec` は複製しない。
+    pub fn inlay_hints(&self, path: &Path) -> Option<Arc<Vec<InlayHint>>> {
+        let p = canonical(path);
+        let version = self.doc_version(&p);
+        let cache = lock_ok(&self.shared.inlay);
+        let (v, hints) = cache.get(&p)?;
+        (*v == version).then(|| Arc::clone(hints))
+    }
+
+    /// **いまの version に対する**要求が飛行中か。
+    /// 毎フレーム同じ要求を撃たないためのガード (古い版の飛行は数えない —
+    /// 打鍵直後に新しい版の要求を出せなくなるため)。
+    pub fn inlay_in_flight(&self, path: &Path) -> bool {
+        let p = canonical(path);
+        let version = self.doc_version(&p);
+        lock_ok(&self.shared.inlay_pending)
+            .values()
+            .any(|(q, v)| *v == version && *q == p)
+    }
+
+    /// did_open/did_change が振った版番号 (未 open は 0)。
+    fn doc_version(&self, canonical_path: &Path) -> i64 {
+        lock_ok(&self.versions)
+            .get(canonical_path)
+            .copied()
+            .unwrap_or(0)
+    }
+
     // ── シグネチャヘルプ ────────────────────────────────────────
 
     /// 関数呼び出しの引数ヒント ('(' や ',' の入力後)。
@@ -1511,6 +1627,15 @@ fn handle_message(raw: &str, shared: &Arc<Shared>, tx: &mpsc::Sender<Value>) {
                 Some(Pending::CodeAction) => {
                     shared.code_action.fulfill(id, parse_code_actions(&result))
                 }
+                // 結果は Slot ではなく (パス, version) 付きのキャッシュへ。
+                // 控えが消えている = 打ち切られた要求なので黙って捨てる。
+                Some(Pending::Inlay) => {
+                    let entry = lock_ok(&shared.inlay_pending).remove(&id);
+                    if let Some((path, version)) = entry {
+                        lock_ok(&shared.inlay)
+                            .insert(path, (version, Arc::new(parse_inlay_hints(&result))));
+                    }
+                }
                 None => {}
             }
         }
@@ -1674,6 +1799,9 @@ pub fn parse_server_caps(caps: &Value) -> ServerCaps {
         signature_trigger_chars: trigger_chars(caps, "signatureHelpProvider"),
         code_action: provider_on(caps, "codeActionProvider"),
         document_symbol: provider_on(caps, "documentSymbolProvider"),
+        // inlayHintProvider は true / {} / {resolveProvider, workDoneProgress} の
+        // どれでも来る。既存の provider_on が 3 形式とも面倒を見る。
+        inlay_hint: provider_on(caps, "inlayHintProvider"),
     }
 }
 
@@ -1900,6 +2028,64 @@ pub fn parse_document_highlights(result: &Value) -> Vec<DocumentHighlight> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// InlayHint[] → [`InlayHint`] の並び。null / 配列以外は空。
+///
+/// `label` は **`string` と `InlayHintLabelPart[]` の両方**が来る
+/// (rust-analyzer は前者、tsserver は後者)。空ラベルの件は落とす
+/// (出しても幅を食うだけで何も伝えない)。件数は [`MAX_INLAY_HINTS`] で切る。
+pub fn parse_inlay_hints(result: &Value) -> Vec<InlayHint> {
+    let Some(arr) = result.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for v in arr.iter().take(MAX_INLAY_HINTS) {
+        let Some(pos) = v.get("position").map(get_pos) else {
+            continue;
+        };
+        let label = inlay_label(v.get("label"));
+        if label.trim().is_empty() {
+            continue;
+        }
+        out.push(InlayHint {
+            line: pos.line,
+            character: pos.character,
+            label,
+            // 未知の kind は 0 (種別なし) へ落とす。色分けの既定へ流れるだけで
+            // 表示は壊れない (サーバーが将来 3 を足しても落ちない)。
+            kind: match v.get("kind").and_then(|k| k.as_u64()) {
+                Some(k @ 1..=2) => k as u8,
+                _ => 0,
+            },
+            padding_left: v
+                .get("paddingLeft")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+            padding_right: v
+                .get("paddingRight")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+        });
+    }
+    out
+}
+
+/// InlayHint.label: `string` | `InlayHintLabelPart[]` → 1 本の文字列。
+/// パーツ配列は `value` を順に連結する (区切りは入れない — 仕様上
+/// パーツの並びがそのまま 1 個のラベルを成す)。
+fn inlay_label(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(|p| match p {
+                Value::String(s) => s.as_str(),
+                _ => p.get("value").and_then(|s| s.as_str()).unwrap_or(""),
+            })
+            .collect(),
+        _ => String::new(),
+    }
 }
 
 /// prepareRename: Range | {range, placeholder} | {defaultBehavior} | null。
@@ -2978,7 +3164,8 @@ mod tests {
             Pending::Symbols => shared.symbols.begin(id),
             Pending::Signature => shared.signature.begin(id),
             Pending::CodeAction => shared.code_action.begin(id),
-            Pending::Initialize => {}
+            // Slot を使わない (結果は (パス, version) 付きのキャッシュへ入る)
+            Pending::Inlay | Pending::Initialize => {}
         }
     }
 
@@ -4378,14 +4565,20 @@ mod tests {
             "documentRangeFormattingProvider": false,
             "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
             "codeActionProvider": {"codeActionKinds": ["quickfix"]},
-            "documentSymbolProvider": true
+            "documentSymbolProvider": true,
+            "inlayHintProvider": {"resolveProvider": false}
         }));
         assert!(caps.completion && caps.hover && caps.rename && caps.prepare_rename);
         assert_eq!(caps.completion_trigger_chars, vec!['.', ':']);
         assert_eq!(caps.signature_trigger_chars, vec!['(', ',']);
         assert!(caps.formatting && !caps.range_formatting);
         assert!(caps.code_action && caps.document_symbol);
+        assert!(caps.inlay_hint); // オプションオブジェクト形式
         assert!(!caps.document_highlight); // 未宣言
+                                           // bool / 空オブジェクト / false の 3 形式
+        assert!(parse_server_caps(&json!({"inlayHintProvider": true})).inlay_hint);
+        assert!(parse_server_caps(&json!({"inlayHintProvider": {}})).inlay_hint);
+        assert!(!parse_server_caps(&json!({"inlayHintProvider": false})).inlay_hint);
 
         // rename が bool true のときは prepare は無し
         let c2 = parse_server_caps(&json!({"renameProvider": true}));
@@ -4395,6 +4588,166 @@ mod tests {
         assert_eq!(
             parse_server_caps(&json!({"renameProvider": false})),
             ServerCaps::default()
+        );
+    }
+
+    /// **label は string / InlayHintLabelPart[] の両方が来る。** どちらも読めること、
+    /// kind と paddingLeft/Right を落とさないこと、壊れた要素で落ちないこと。
+    #[test]
+    fn inlay_hints_parse_both_label_shapes() {
+        let hints = parse_inlay_hints(&json!([
+            // ① label が素の文字列 (rust-analyzer 形式)
+            {
+                "position": {"line": 3, "character": 9},
+                "label": ": i32",
+                "kind": 1,
+                "paddingLeft": false,
+                "paddingRight": true
+            },
+            // ② label が InlayHintLabelPart[] (tsserver 形式)。value を連結する
+            {
+                "position": {"line": 3, "character": 20},
+                "label": [{"value": "name"}, {"value": ":"}],
+                "kind": 2,
+                "paddingLeft": true
+            },
+            // ③ パーツ配列に生の文字列が混ざる壊れ方
+            {"position": {"line": 4, "character": 0}, "label": ["a", {"value": "b"}]},
+            // ④ 落とすもの: position 無し / 空ラベル / 空白のみ
+            {"label": "orphan"},
+            {"position": {"line": 5, "character": 0}, "label": ""},
+            {"position": {"line": 5, "character": 1}, "label": [{"value": "  "}]},
+            // ⑤ 未知の kind は 0 (種別なし) へ落として表示は壊さない
+            {"position": {"line": 6, "character": 2}, "label": "?", "kind": 99}
+        ]));
+        assert_eq!(hints.len(), 4);
+        assert_eq!(
+            hints[0],
+            InlayHint {
+                line: 3,
+                character: 9,
+                label: ": i32".into(),
+                kind: INLAY_KIND_TYPE,
+                padding_left: false,
+                padding_right: true,
+            }
+        );
+        assert_eq!(hints[1].label, "name:");
+        assert_eq!(hints[1].kind, INLAY_KIND_PARAMETER);
+        assert!(hints[1].padding_left && !hints[1].padding_right);
+        assert_eq!(hints[2].label, "ab");
+        assert_eq!(hints[2].kind, 0);
+        assert_eq!(hints[3].kind, 0, "未知の kind は 0 へ落とす");
+
+        // null / 配列以外 / 空配列は空 (エラーにしない)
+        assert!(parse_inlay_hints(&Value::Null).is_empty());
+        assert!(parse_inlay_hints(&json!({"items": []})).is_empty());
+        assert!(parse_inlay_hints(&json!([])).is_empty());
+    }
+
+    /// **キャッシュはパス + バージョンで効き、did_change で無効化される。**
+    /// 同じ版の要求は二度撃たず、打鍵の後は古いヒントを返さない。
+    #[test]
+    fn inlay_hints_cache_is_keyed_by_path_and_version() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-lsp-test", "inlay");
+        let p = dir.join("a.rs");
+        let client = fake_client();
+        deliver(
+            &client,
+            1,
+            Pending::Initialize,
+            json!({"capabilities": {"inlayHintProvider": true}}),
+        );
+        client.did_open(&p, "rust", "let x = 1;\n");
+
+        // ① 未応答なら None。要求は 1 回だけ (飛行中は撃ち直さない)
+        assert!(client.inlay_hints(&p).is_none());
+        assert!(!client.inlay_in_flight(&p));
+        let st = client.request_inlay_hints(&p, "let x = 1;\n");
+        assert!(st.is_sent());
+        assert!(client.inlay_in_flight(&p));
+
+        // ② 応答が来たらキャッシュに載る
+        let id = st.id().expect("送信済み");
+        deliver(
+            &client,
+            id,
+            Pending::Inlay,
+            json!([{"position": {"line": 0, "character": 5}, "label": ": i32", "kind": 1}]),
+        );
+        let got = client.inlay_hints(&p).expect("キャッシュに載っている");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].label, ": i32");
+        assert!(!client.inlay_in_flight(&p), "控えは応答で消える");
+
+        // ③ did_change で無効化 (ずれた型注釈を残さない)
+        client.did_change(&p, "let xy = 1;\n");
+        assert!(client.inlay_hints(&p).is_none(), "版が上がったら効かない");
+        // 新しい版の要求は撃てる
+        assert!(client.request_inlay_hints(&p, "let xy = 1;\n").is_sent());
+
+        // ④ 別のパスのキャッシュは巻き添えにならない
+        let q = dir.join("b.rs");
+        client.did_open(&q, "rust", "fn f() {}\n");
+        let st2 = client.request_inlay_hints(&q, "fn f() {}\n");
+        deliver(
+            &client,
+            st2.id().expect("送信済み"),
+            Pending::Inlay,
+            json!([{"position": {"line": 0, "character": 3}, "label": "->()"}]),
+        );
+        assert!(client.inlay_hints(&q).is_some());
+        assert!(client.inlay_hints(&p).is_none());
+
+        // ⑤ 能力の無いサーバーでは no-op (エラーにしない)
+        let plain = fake_client();
+        deliver(&plain, 1, Pending::Initialize, json!({"capabilities": {}}));
+        assert_eq!(
+            plain.request_inlay_hints(&p, ""),
+            RequestStatus::Unsupported
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **打ち切られた要求の控えが残らない。** 残ると「飛行中」と誤判定され、
+    /// そのバージョンのヒントが永久に出なくなる。
+    #[test]
+    fn inlay_hints_timeout_clears_in_flight() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-lsp-test", "inlay-timeout");
+        let p = dir.join("a.rs");
+        let client = fake_client();
+        deliver(
+            &client,
+            1,
+            Pending::Initialize,
+            json!({"capabilities": {"inlayHintProvider": true}}),
+        );
+        client.did_open(&p, "rust", "");
+        assert!(client.request_inlay_hints(&p, "").is_sent());
+        assert!(client.inlay_in_flight(&p));
+        // タイムアウト 0 = 全部を掃く
+        assert_eq!(client.sweep_timeouts(Duration::from_secs(0)), 1);
+        assert!(!client.inlay_in_flight(&p), "控えが残っている");
+        // 掃いた後にもう一度撃てる
+        assert!(client.request_inlay_hints(&p, "").is_sent());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **initialize で inlayHint を宣言している。** 宣言しないと多くのサーバーが
+    /// inlayHintProvider を返さないので、機能ごと死ぬ。
+    /// ソースを読むテストなので改行は正規化する (Windows は CRLF)。
+    #[test]
+    fn initialize_declares_inlay_hint_capability() {
+        let src = include_str!("lsp.rs").replace("\r\n", "\n");
+        let init = src
+            .split_once("let init_params = json!({")
+            .expect("initialize のパラメータがある")
+            .1;
+        let init = &init[..init.find("});").unwrap_or(init.len())];
+        assert!(
+            init.contains("\"inlayHint\""),
+            "client capabilities に inlayHint が無い"
         );
     }
 

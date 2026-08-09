@@ -260,6 +260,8 @@ pub enum Cmd {
     PrevProblem,
     /// 行末の診断メッセージ (Error Lens 相当) の表示切替
     ToggleInlineDiagnostics,
+    /// インレイヒント (LSP の型・引数名) の表示切替
+    ToggleInlayHints,
     /// フルスクリーン切替 (VS Code: ⌃⌘F)
     ToggleFullScreen,
     /// ナビゲーション履歴 (VS Code: ⌃- / ⌃⇧-)
@@ -766,6 +768,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleBreadcrumbs
         | Cmd::ToggleProblems
         | Cmd::ToggleInlineDiagnostics
+        | Cmd::ToggleInlayHints
         | Cmd::ToggleFullScreen
         | Cmd::ToggleTableView
         | Cmd::ToggleLspHighlight
