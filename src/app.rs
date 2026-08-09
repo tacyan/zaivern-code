@@ -2951,6 +2951,8 @@ pub struct ZaivernApp {
     settings_open: bool,
     /// 設定画面の状態 (検索語・@modified・文字列欄の編集途中)。
     settings_ui: SettingsUi,
+    /// ベンダーフック設置操作の直近の結果メッセージ (設定画面に 1 行で出す)。
+    hooks_log: String,
     /// Hot Exit: 未保存本文の退避帳。
     hotexit: session::HotExitStore,
     /// 退避を書き出す予定時刻。**変更があったときだけ入る** —
@@ -3737,6 +3739,7 @@ impl ZaivernApp {
             keybind_ui: KeybindUi::default(),
             settings_open: false,
             settings_ui: SettingsUi::default(),
+            hooks_log: String::new(),
             hotexit,
             hotexit_due: None,
             hotexit_fingerprint: 0,
@@ -16810,6 +16813,9 @@ impl ZaivernApp {
                     attention: s.attention && running,
                     running,
                     sup,
+                    // 状態ラダー上位 2 段 (構造化プロトコル / ベンダーフック)。
+                    // 生きている間は画面推定を一切使わない (CLAUDE.md 原則 #4)。
+                    ladder: self.supervisor.ladder_of(s.id),
                     permission_badge: if s.is_permission_agent() {
                         s.approval_badge()
                     } else {
@@ -30140,6 +30146,12 @@ impl ZaivernApp {
                             }
                         }
                     });
+                // ── 状態ラダー 2 段目: ベンダー提供フックの設置 ──────────
+                // ユーザーの設定ファイルを書き換えるので、同意はここでだけ取る
+                // (押されたときにしか書かない・初回はバックアップを残す)。
+                ui.separator();
+                let root = self.primary_root().to_path_buf();
+                supervisor::hooks::ui(ui, &root, &mut self.hooks_log);
             });
 
         self.settings_open = open;
@@ -33231,6 +33243,9 @@ mod super_agent_tests {
             exit_code: None,
             user_typed: false,
             total_output_bytes: None,
+            command: "claude".into(),
+            cwd: std::path::PathBuf::new(),
+            raw_log: None,
         }
     }
 

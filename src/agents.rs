@@ -2018,6 +2018,335 @@ impl AgentManager {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  状態ラダー上位 2 段のカタログ (CLAUDE.md 設計原則 #4)
+//
+//  構造化プロトコル > ベンダー提供フック > 状態ファイル > 画面スクレイプ。
+//  上 2 段の**エージェント固有値**(フラグ・イベント名・ツール名・設定ファイルの
+//  場所) はすべてここにデータとして持つ。機構は `supervisor::protocol` /
+//  `supervisor::hooks` にあり、リテラルを 1 つも持たない。
+//
+//  **実機で確認できたものだけを書く。** 憶測で 1 行足すと、そのエージェントは
+//  「画面より確かな判定」として嘘を配ることになる (最下段より有害)。
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::supervisor::hooks::HookTarget;
+use crate::supervisor::protocol::{EventRule, ProtoState, StreamDialect};
+
+/// Claude Code のツール名 → 状態。名前は実機 `stream-json` の
+/// `{"type":"system","subtype":"init","tools":[…]}` から採取した実在の値。
+///
+/// ここに無いツールは規則側の状態 (= ツール実行 → 実行中) のままにする。
+const CLAUDE_TOOLS: &[(&str, ProtoState)] = &[
+    ("Edit", ProtoState::Editing),
+    ("Write", ProtoState::Editing),
+    ("NotebookEdit", ProtoState::Editing),
+];
+
+/// 構造化出力を持つと**実機で確認できた**エージェントの方言表。
+///
+/// ## 確認方法と結果 (2026-08)
+/// - `claude` 2.1.226: `claude --help` に
+///   `--output-format <format> … "stream-json" (realtime streaming)` があり、
+///   `claude -p --output-format stream-json --verbose` を実行して JSONL を採取。
+///   観測した `type`: `system`(subtype=`init`/`hook_started`/`hook_response`/
+///   `thinking_tokens`) / `assistant` / `rate_limit_event` / `result`(subtype=`success`)。
+///   **注意**: `--output-format` は `--print` (非対話) 専用。対話 PTY セッションでは
+///   出ないので、この段が効くのはヘッドレス実行のときだけ。対話セッションは
+///   フック段 ([`HOOK_TARGETS`]) が受け持つ。
+/// - `codex` 0.147.0: `codex exec --help` に `--json  Print events to stdout as JSONL`。
+///   `codex exec --json` を実行して JSONL を採取。観測した `type`:
+///   `thread.started` / `turn.started` / `item.started` / `item.completed`
+///   (`item.type` = `agent_message` / `command_execution`) / `turn.completed`。
+/// - `gemini` 0.51.0: `gemini --help` に `-o, --output-format … "stream-json"` は
+///   **在る**。しかし実行がアカウント制限 (IneligibleTierError) で通らず、
+///   イベントの語彙を 1 件も観測できなかった → **意図的に表へ入れていない**。
+///   観測できたら 1 エントリ足すだけで有効になる。
+pub static STREAM_DIALECTS: &[StreamDialect] = &[
+    StreamDialect {
+        bin: "claude",
+        args: "--print --verbose --output-format stream-json",
+        kind_path: "type",
+        rules: &[
+            EventRule {
+                kind: "system",
+                sub_path: "subtype",
+                sub_value: "init",
+                state: ProtoState::Starting,
+                detail_path: "",
+            },
+            // 失敗を先に見る (result は成功も失敗も同じ種別で来る)。
+            EventRule {
+                kind: "result",
+                sub_path: "is_error",
+                sub_value: "true",
+                state: ProtoState::Failed,
+                detail_path: "",
+            },
+            EventRule {
+                kind: "result",
+                sub_path: "subtype",
+                sub_value: "success",
+                state: ProtoState::Done,
+                detail_path: "",
+            },
+            // content[] の中に tool_use ブロックが在れば「ツールを使っている」。
+            EventRule {
+                kind: "assistant",
+                sub_path: "message.content[].type",
+                sub_value: "tool_use",
+                state: ProtoState::Running,
+                detail_path: "message.content[].name",
+            },
+            EventRule {
+                kind: "assistant",
+                sub_path: "",
+                sub_value: "",
+                state: ProtoState::Thinking,
+                detail_path: "",
+            },
+        ],
+        tools: CLAUDE_TOOLS,
+        verified: "claude 2.1.226 — --help の choices + `claude -p --output-format stream-json --verbose` の実出力",
+    },
+    StreamDialect {
+        bin: "codex",
+        args: "exec --json",
+        kind_path: "type",
+        rules: &[
+            EventRule {
+                kind: "thread.started",
+                sub_path: "",
+                sub_value: "",
+                state: ProtoState::Starting,
+                detail_path: "",
+            },
+            EventRule {
+                kind: "item.started",
+                sub_path: "item.type",
+                sub_value: "command_execution",
+                state: ProtoState::Running,
+                detail_path: "item.command",
+            },
+            // コマンドが終われば手番はモデルへ戻る。
+            EventRule {
+                kind: "item.completed",
+                sub_path: "item.type",
+                sub_value: "command_execution",
+                state: ProtoState::Thinking,
+                detail_path: "item.command",
+            },
+            EventRule {
+                kind: "item.completed",
+                sub_path: "item.type",
+                sub_value: "agent_message",
+                state: ProtoState::Thinking,
+                detail_path: "",
+            },
+            EventRule {
+                kind: "turn.started",
+                sub_path: "",
+                sub_value: "",
+                state: ProtoState::Thinking,
+                detail_path: "",
+            },
+            EventRule {
+                kind: "turn.completed",
+                sub_path: "",
+                sub_value: "",
+                state: ProtoState::Idle,
+                detail_path: "",
+            },
+        ],
+        // codex の item は `command_execution` しか観測できていない。
+        // ファイル編集の item 種別は未観測なので表を空にしておく (憶測を書かない)。
+        tools: &[],
+        verified: "codex-cli 0.147.0 — `codex exec --help` の --json + `codex exec --json` の実出力",
+    },
+];
+
+/// 構造化出力の方言。持たないエージェントでは `None`。
+pub fn stream_dialect(bin: &str) -> Option<&'static StreamDialect> {
+    STREAM_DIALECTS.iter().find(|d| d.bin == bin)
+}
+
+/// **このコマンドは構造化出力つきで起動されているか**。
+///
+/// カタログの `args` に並んだトークンが**すべて**コマンド行に在るときだけ
+/// `Some`。素の `claude` を「構造化段が使える」と誤認しないための関門であり、
+/// フラグ名のリテラルはここにも一切置かない (表から引くだけ)。
+pub fn stream_dialect_for_command(command: &str) -> Option<&'static StreamDialect> {
+    let spec = spec_for_command(command)?;
+    let d = stream_dialect(spec.bin)?;
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    d.args
+        .split_whitespace()
+        .all(|need| tokens.contains(&need))
+        .then_some(d)
+}
+
+/// フックを仕掛けられると**実機で確認できた**エージェント。
+///
+/// ## 確認方法 (2026-08)
+/// `claude` 2.1.226 の `--output-format stream-json` に
+/// `{"type":"system","subtype":"hook_started","hook_event":"SessionStart",
+///   "hook_name":"SessionStart:startup"}` と、続く `hook_response` が流れた
+/// = フックが実際に発火している。設定の形と有効なイベント名は実在する
+/// `~/.claude/settings.json` から採取した (`hooks.<Event>[].hooks[].command`)。
+///
+/// 表に入れているのは、その中で**名前から意味が一意に決まるもの**だけ。
+/// `Notification` / `Elicitation` などは「何を待っているか」がペイロード次第
+/// なので、当てずっぽうで承認待ちに落とさない。
+pub static HOOK_TARGETS: &[HookTarget] = &[HookTarget {
+    bin: "claude",
+    settings_rel: ".claude/settings.json",
+    events: &[
+        ("SessionStart", ProtoState::Starting, false),
+        ("UserPromptSubmit", ProtoState::Thinking, false),
+        // ツールを使う直前 = そのツール名で状態を細分できる唯一の点。
+        ("PreToolUse", ProtoState::Running, true),
+        ("PostToolUse", ProtoState::Thinking, false),
+        ("PermissionRequest", ProtoState::Approval, false),
+        ("Stop", ProtoState::Idle, false),
+        ("SessionEnd", ProtoState::Done, false),
+    ],
+    tools: CLAUDE_TOOLS,
+    verified: "claude 2.1.226 — stream-json に hook_started/hook_response を観測 + 実在の ~/.claude/settings.json の hooks スキーマ",
+}];
+
+/// フック設定の対象。持たないエージェントでは `None`。
+pub fn hook_target(bin: &str) -> Option<&'static HookTarget> {
+    HOOK_TARGETS.iter().find(|t| t.bin == bin)
+}
+
+/// フックイベント名 → (状態, ツール名で細分してよいか)。カタログに無ければ `None`。
+pub fn hook_event_state(bin: &str, event: &str) -> Option<(ProtoState, bool)> {
+    hook_target(bin)?
+        .events
+        .iter()
+        .find(|(e, _, _)| *e == event)
+        .map(|(_, s, refine)| (*s, *refine))
+}
+
+/// ツール名 → 状態 (フック段の細分)。表に無ければ `None`。
+pub fn hook_tool_state(bin: &str, tool: &str) -> Option<ProtoState> {
+    if tool.is_empty() {
+        return None;
+    }
+    hook_target(bin)?
+        .tools
+        .iter()
+        .find(|(n, _)| *n == tool)
+        .map(|(_, s)| *s)
+}
+
+/// 状態ラダー上位 2 段のカタログ整合 (CLAUDE.md 原則 #4 の番人)。
+///
+/// **「構造化出力を持つ」と宣言したのに引かせる表が無い**状態は、画面推定より
+/// 強い段位で嘘を配ることになる。ここで落とす。
+#[cfg(test)]
+mod ladder_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn 構造化出力を宣言したプリセットはフラグと確認方法を持つ() {
+        assert!(
+            !STREAM_DIALECTS.is_empty(),
+            "上位段が空では原則 #4 を満たさない"
+        );
+        for d in STREAM_DIALECTS {
+            assert!(
+                spec_for_bin(d.bin).is_some(),
+                "{}: カタログに居ないエージェントの方言",
+                d.bin
+            );
+            assert!(
+                !d.args.is_empty(),
+                "{}: 構造化出力を有効にする引数が空",
+                d.bin
+            );
+            assert!(!d.kind_path.is_empty(), "{}: 種別フィールドが空", d.bin);
+            assert!(!d.rules.is_empty(), "{}: 規則表が空 (引けない)", d.bin);
+            assert!(
+                !d.verified.is_empty(),
+                "{}: 実機での確認方法が空 — 憶測で書かれた疑いがある",
+                d.bin
+            );
+            for r in d.rules {
+                assert!(
+                    !(r.kind.is_empty() && r.sub_path.is_empty()),
+                    "{}: 何にでも当たる規則は書かない",
+                    d.bin
+                );
+                assert!(
+                    !(r.sub_path.is_empty() && !r.sub_value.is_empty()),
+                    "{}: 絞り込み先の無い値が指定されている",
+                    d.bin
+                );
+            }
+            // 方言の引数を足したコマンドは、必ずその方言として引けること。
+            let cmd = format!("{} {}", d.bin, d.args);
+            assert_eq!(
+                stream_dialect_for_command(&cmd).map(|x| x.bin),
+                Some(d.bin),
+                "{}: 宣言した引数で構造化段に入れない",
+                d.bin
+            );
+        }
+    }
+
+    #[test]
+    fn フック対象は設定ファイルの場所とイベントを持つ() {
+        for t in HOOK_TARGETS {
+            assert!(
+                spec_for_bin(t.bin).is_some(),
+                "{}: カタログに居ないエージェント",
+                t.bin
+            );
+            assert!(
+                !t.settings_rel.is_empty(),
+                "{}: 設定ファイルの場所が空",
+                t.bin
+            );
+            assert!(
+                !t.settings_rel.contains('\\'),
+                "{}: 相対パスは / で書く (OS ごとの解決は Path::join に任せる)",
+                t.bin
+            );
+            assert!(!t.events.is_empty(), "{}: 仕掛けるイベントが無い", t.bin);
+            assert!(
+                !t.verified.is_empty(),
+                "{}: 実機での確認方法が空 — 憶測で書かれた疑いがある",
+                t.bin
+            );
+            for (ev, _, _) in t.events {
+                assert!(!ev.is_empty(), "{}: 空のイベント名", t.bin);
+                assert!(
+                    hook_event_state(t.bin, ev).is_some(),
+                    "{}: {ev} を引けない",
+                    t.bin
+                );
+            }
+            // ツール名で細分してよいイベントが 1 つも無いのに表だけ在る、は無駄。
+            if !t.tools.is_empty() {
+                assert!(
+                    t.events.iter().any(|(_, _, refine)| *refine),
+                    "{}: ツール表が使われない",
+                    t.bin
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 未知のエージェントは上位段を名乗れない() {
+        assert!(stream_dialect("そんなCLIは無い").is_none());
+        assert!(hook_target("そんなCLIは無い").is_none());
+        assert!(hook_event_state("claude", "そんなイベントは無い").is_none());
+        assert!(hook_tool_state("claude", "").is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
