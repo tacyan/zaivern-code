@@ -17613,7 +17613,8 @@ impl ZaivernApp {
                          衝突するファイルを触っています。押すと衝突レーダーが開きます。",
                     ));
                 if hit.clicked() {
-                    self.radar_open = !self.radar_open;
+                    // パレット経由と同じ入口を通す (絞り込みの解除も揃う)。
+                    self.toggle_conflict_radar();
                 }
             }
 
