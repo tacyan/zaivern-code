@@ -3184,6 +3184,34 @@ fn catalog_button(ui: &mut egui::Ui, e: &'static AcpEntry, acts: &mut Vec<AcpAct
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  15. 機能レジストリへの登録面 (`crate::feature`)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// パレット項目とオーバーレイ描画の登録。
+///
+/// `app.rs` / `palette.rs` を直接編集せず、ここ 1 か所を公開するだけにする
+/// (CLAUDE.md「新しい機能は `src/feature.rs` のレジストリ経由で足す」)。
+/// `REGISTRY` へ 1 行足すのは統合担当の仕事。
+pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
+    module: "acp",
+    entries: &[crate::feature::Entry {
+        icon: "🛰",
+        label: "ACP エージェント (構造化プロトコル)",
+        id: "acp.open",
+    }],
+    dispatch: |app, _ctx, id| match id {
+        "acp.open" => {
+            app.toggle_acp_panel();
+            true
+        }
+        _ => false,
+    },
+    // オーバーレイ。**接続が 0 本でパネルも閉じているなら即 return する**
+    // ので、アイドルのフレームでは 1 ピクセルも触らない (設計原則 3)。
+    draw: Some(|app, ctx| app.acp_tick(ctx)),
+};
+
+// ═══════════════════════════════════════════════════════════════════════
 //  テスト
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -4317,6 +4345,26 @@ rl.on("line", (line) => {
         c.stop();
         assert!(c.phase.is_dead());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 機能レジストリへ出す登録面が規約どおり() {
+        // ID はモジュール接頭辞 (`feature::registry_ids_are_unique_and_prefixed`
+        // と同じ規約。統合担当が REGISTRY へ足すまで番人が効かないので、
+        // こちら側でも守る)。
+        assert_eq!(FEATURE.module, "acp");
+        assert!(!FEATURE.entries.is_empty(), "パレットからの到達経路が無い");
+        for e in FEATURE.entries {
+            assert!(
+                e.id.starts_with("acp.") && e.id.len() > "acp.".len(),
+                "ID がモジュール接頭辞になっていない: {}",
+                e.id
+            );
+            assert!(!e.icon.is_empty() && !e.label.is_empty(), "{}", e.id);
+            // ラベルは**原文**を置く (表示側が tr を通すので二重にしない)
+            assert!(!e.label.contains("tr("), "{}", e.id);
+        }
+        assert!(FEATURE.draw.is_some(), "オーバーレイの描画口が無い");
     }
 
     #[test]

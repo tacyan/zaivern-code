@@ -11238,17 +11238,6 @@ impl ZaivernApp {
             }
             Cmd::OpenApprovals => self.open_approvals_panel(),
             Cmd::OpenMcp => self.open_mcp_panel(),
-            // ACP パネルは**オーバーレイ**なので中央ビューを奪わない
-            // (起動しただけで画面が激変しない)。
-            Cmd::ToggleAcpPanel => {
-                self.acp.open = !self.acp.open;
-                if self.acp.open {
-                    self.toast(
-                        tr("🛰 ACP: 構造化プロトコルでエージェントを駆動します"),
-                        true,
-                    );
-                }
-            }
             Cmd::OpenSkills => self.open_skills_panel(),
             Cmd::OpenApprovalAudit => {
                 self.open_approvals_panel();
@@ -24805,12 +24794,6 @@ impl ZaivernApp {
                 Cmd::OpenMcp,
             ),
             (
-                "🛰".into(),
-                tr("ACP エージェント (構造化プロトコル)"),
-                String::new(),
-                Cmd::ToggleAcpPanel,
-            ),
-            (
                 "🧩".into(),
                 tr("Skills / コマンドを管理"),
                 String::new(),
@@ -29659,10 +29642,6 @@ impl ZaivernApp {
         // `IdleSignals::animating` として見えるので、二重予約にはならない
         // (`idle_repaint_ms` は animating のとき `None` を返す)。
         // 非表示のときは 1 本も予約しないので、完全アイドルの 0fps は保たれる。
-        // ── ACP (構造化プロトコル) のオーバーレイ ──
-        // ツアーの直前 = 他の全パネルの上。接続が無ければ即 return する。
-        self.acp_tick(ctx);
-
         self.tutorial_tick(ctx);
 
         // 今フレームのズームジェスチャの持ち主を確定させる。描かなかった
@@ -29694,11 +29673,24 @@ impl ZaivernApp {
         }
     }
 
+    /// ACP パネルを開閉する (`crate::acp::FEATURE` から呼ばれる)。
+    ///
+    /// **オーバーレイ**なので中央ビューを奪わない (起動しただけで画面が激変しない)。
+    pub fn toggle_acp_panel(&mut self) {
+        self.acp.open = !self.acp.open;
+        if self.acp.open {
+            self.toast(
+                tr("🛰 ACP: 構造化プロトコルでエージェントを駆動します"),
+                true,
+            );
+        }
+    }
+
     /// ACP (構造化プロトコル) の 1 フレーム。
     ///
     /// 受信の畳み込みとオーバーレイの描画をここ 1 か所へ集める。接続が
     /// 0 本のときは**何も起きない** (設計原則 3: アイドルのコストはゼロ)。
-    fn acp_tick(&mut self, ctx: &egui::Context) {
+    pub fn acp_tick(&mut self, ctx: &egui::Context) {
         if self.acp.is_empty() && !self.acp.open {
             return;
         }
