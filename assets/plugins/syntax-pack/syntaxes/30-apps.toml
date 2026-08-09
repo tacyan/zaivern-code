@@ -209,6 +209,82 @@ builtins = [
   "isa", "convert", "error", "throw", "include", "@time", "@assert",
 ]
 
+[[syntax]]
+# COBOL — 金融/公共の現役システム。識別子にハイフンを使い、
+# 行頭 `*` (固定形式の 7 桁目) と `*>` (自由形式) の 2 種類のコメントを持つ。
+name = "COBOL"
+# `.cpy` (コピー句) は syntect の Python が既に持っているので**奪わない**
+extensions = ["cob", "cbl", "ccp", "cobol"]
+tokens = ["cobol", "cob"]
+case_sensitive = false
+line_comment = ["*>"]
+# 固定形式は「行頭から空白だけ」の先の `*` / `/` がコメント
+line_comment_bol = ["*", "/"]
+strings = ["\"", "'"]
+# バックスラッシュのエスケープを持たない (閉じ記号の 2 個重ねで表す)
+escape = ""
+ident_extra = "-"
+fold = "indent"
+keywords = [
+  "IDENTIFICATION", "ENVIRONMENT", "CONFIGURATION", "INPUT-OUTPUT", "DATA",
+  "PROCEDURE", "DIVISION", "SECTION", "PROGRAM-ID", "AUTHOR", "WORKING-STORAGE",
+  "LOCAL-STORAGE", "LINKAGE", "FILE", "FILE-CONTROL", "SELECT", "ASSIGN",
+  "ORGANIZATION", "ACCESS", "MOVE", "TO", "FROM", "GIVING", "DISPLAY", "ACCEPT",
+  "PERFORM", "VARYING", "UNTIL", "TIMES", "THRU", "THROUGH", "IF", "THEN", "ELSE",
+  "END-IF", "EVALUATE", "WHEN", "END-EVALUATE", "COMPUTE", "ADD", "SUBTRACT",
+  "MULTIPLY", "DIVIDE", "STOP", "RUN", "GOBACK", "EXIT", "CALL", "USING",
+  "GO", "CONTINUE", "OPEN", "CLOSE", "READ", "WRITE", "REWRITE", "DELETE",
+  "START", "SET", "SEARCH", "SORT", "MERGE", "STRING", "UNSTRING", "INSPECT",
+  "INITIALIZE", "COPY", "REPLACING", "PIC", "PICTURE", "VALUE", "VALUES",
+  "USAGE", "OCCURS", "REDEFINES", "RENAMES", "FILLER", "AT", "END", "NOT",
+  "AND", "OR", "IS", "ARE", "OF", "IN", "BY", "WITH", "END-PERFORM", "END-READ",
+]
+types = [
+  "COMP", "COMP-1", "COMP-2", "COMP-3", "COMP-4", "COMP-5", "BINARY",
+  "PACKED-DECIMAL", "INDEX", "POINTER", "NUMERIC", "ALPHABETIC", "ALPHANUMERIC",
+]
+constants = [
+  "ZERO", "ZEROS", "ZEROES", "SPACE", "SPACES", "HIGH-VALUE", "HIGH-VALUES",
+  "LOW-VALUE", "LOW-VALUES", "QUOTE", "QUOTES", "NULL", "NULLS", "TRUE", "FALSE",
+]
+
+[[syntax]]
+# Apex — Salesforce のサーバサイド言語 (Java 風・大文字小文字を区別しない)。
+# `.cls` は syntect の LaTeX (クラスファイル) が先に持っているので**奪わない**。
+# 実務で拡張子が衝突しない `.apex` / `.trigger` から引く。
+name = "Apex"
+extensions = ["apex", "trigger"]
+tokens = ["apex", "salesforce", "soql"]
+case_sensitive = false
+line_comment = ["//"]
+doc_block = [["/**", "*/"]]
+block_comment = [["/*", "*/"]]
+# 文字列はシングルクォートのみ (ダブルクォートは構文エラー)
+strings = ["'"]
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "public", "private", "protected", "global", "static", "final", "virtual",
+  "abstract", "override", "class", "interface", "enum", "extends", "implements",
+  "trigger", "on", "before", "after", "insert", "update", "upsert", "delete",
+  "undelete", "merge", "if", "else", "for", "while", "do", "switch", "case",
+  "break", "continue", "return", "try", "catch", "finally", "throw", "new",
+  "this", "super", "instanceof", "with", "without", "inherited", "sharing",
+  "testmethod", "transient", "webservice", "system", "select", "from", "where",
+  "limit", "order", "group", "having", "null",
+]
+types = [
+  "void", "Integer", "Long", "Double", "Decimal", "String", "Boolean", "Date",
+  "Datetime", "Time", "Id", "Blob", "Object", "List", "Set", "Map", "SObject",
+  "Exception", "Type",
+]
+constants = ["true", "false", "null"]
+builtins = [
+  "System", "Database", "Test", "Trigger", "Schema", "Limits", "UserInfo",
+  "ApexPages", "JSON", "Math", "String", "DateTime", "Messaging", "Http",
+  "HttpRequest", "HttpResponse", "SObjectType", "debug", "assert", "assertEquals",
+]
+
 [[alias]]
 target = "Kotlin"
 extensions = ["gradle.kts"]

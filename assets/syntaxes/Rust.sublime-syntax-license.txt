@@ -1,0 +1,59 @@
+Rust.sublime-syntax — 第三者コードの出典とライセンス
+====================================================
+
+対象ファイル : assets/syntaxes/Rust.sublime-syntax
+埋め込み経路 : src/highlight.rs の `RUST_SYNTAX_YAML`
+               (`include_str!` でバイナリへ焼き込む。実行時にファイルを探しに行かない)
+
+出典
+----
+リポジトリ : https://github.com/sublimehq/Packages
+ファイル   : Rust/Rust.sublime-syntax
+URL        : https://github.com/sublimehq/Packages/blob/master/Rust/Rust.sublime-syntax
+取得コミット: 7f74b54967118d74d7e2d439b19c526c025ea6b5
+著作        : Sublime HQ Pty Ltd および sublimehq/Packages のコントリビュータ
+
+ライセンス (sublimehq/Packages の LICENSE を全文引用)
+-----------------------------------------------------
+    If not otherwise specified (see below), files in this repository fall under
+    the following license:
+
+        Permission to copy, use, modify, sell and distribute this
+        software is granted. This software is provided "as is" without
+        express or implied warranty, and with no claim as to its
+        suitability for any purpose.
+
+    An exception is made for files in readable text which contain their own
+    license information, or files where an accompanying file exists (in the same
+    directory) with a "-license" suffix added to the base-name name of the
+    original file, and an extension of txt, html, or similar. For example "tidy"
+    is accompanied by "tidy-license.txt".
+
+Rust/Rust.sublime-syntax は「自身のライセンス表記を含むファイル」でも
+「-license 付きの添付ファイルを持つファイル」でもないため、上記の本文
+ライセンスが適用される。複製・使用・改変・販売・再配布を無条件で許諾し、
+コピーレフトも帰属表示義務も課さない permissive ライセンスなので、
+Apache-2.0 の本体 (リポジトリ直下の LICENSE) へそのまま同梱できる。
+※ このファイル自体が上記の "-license" 添付ファイルの命名規則に沿っている。
+
+なぜ同梱するのか
+----------------
+依存に入っている two-face (bat の構文セット) が持つ Rust 構文は、同じ
+sublimehq/Packages の**古い版**である。スコープをダンプして実測したところ、
+
+  * `async` / `await` にスコープが付かない (素の識別子と同じ色になる)
+  * トレイト境界の型名 (`impl<T: Display + Clone>` の `Display`) が無スコープ
+  * `.rs` 先頭のシェバンを `#` `!` `/` の演算子列として塗る
+
+という欠落があった。上流の最新版はいずれも解決済みなので、足りないスコープだけを
+足す派生構文を自作するより、同系統の新しい版へ差し替える方が壊れる余地が少ない。
+
+更新手順
+--------
+1. 上記 URL から `Rust.sublime-syntax` を取り直す。
+2. `src/highlight.rs` の `RUST_SYNTAX_YAML` の説明にある出典コメントブロックを、
+   取り直したファイルの `# http://www.sublimetext.com/docs/3/syntax.html` の
+   直後へ再度貼る。
+3. このファイルの「取得コミット」を更新する。
+4. `cargo test highlight::rust_quality` を通す
+   (期待するスコープを固定しているので、上流が壊れたらここで落ちる)。

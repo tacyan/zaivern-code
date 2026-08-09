@@ -357,8 +357,59 @@ fn push_section(
 /// 上記が全て本物の `.sublime-syntax` になる。定義は crate に
 /// `include_bytes!` されたダンプなので、実行時にファイルを探しに行かない
 /// (= インストール先やユーザー名に依存しない)。
+///
+/// Rust だけは [`RUST_SYNTAX_YAML`] の**別セット**で塗る ([`load_rust_syntax`])。
 fn load_syntaxes() -> SyntaxSet {
     two_face::syntax::extra_newlines()
+}
+
+/// 同梱する最新の Rust 構文 (`assets/syntaxes/Rust.sublime-syntax`)。
+///
+/// **出典 / ライセンスはファイル冒頭のコメントに明記してある**
+/// (sublimehq/Packages, permissive: copy/use/modify/sell/distribute 許諾)。
+///
+/// なぜ差し替えるのか — two-face が持つ Rust は同じ sublimehq/Packages の
+/// **古い版**で、スコープをダンプして実測すると次の欠落があった:
+///   * `async` / `await` にスコープが付かない → 素の識別子と同じ色
+///   * トレイト境界の型名 (`impl<T: Display + Clone>` の `Display`) が無スコープ
+///   * `.rs` 先頭のシェバンを `#` `!` `/` の**演算子列**として塗る
+///
+/// 上流の最新版はこの 3 つを全て直しているので、
+/// 「足りないスコープだけ足す派生構文を自作する」より
+/// **同系統の新しい版へ差し替える**方が壊れる余地が少ないと判断した。
+///
+/// `include_str!` でバイナリへ焼き込むので、実行時にファイルを探しに行かない
+/// (= インストール先・ユーザー名・ロケールに依存しない)。
+const RUST_SYNTAX_YAML: &str = include_str!("../assets/syntaxes/Rust.sublime-syntax");
+
+/// [`RUST_SYNTAX_YAML`] **だけ**を収めた小さな構文セットを組む。
+///
+/// なぜ拡張セットへ混ぜないのか — `SyntaxSet::into_builder()` は 220 構文の
+/// 遅延コンテキストを**全て**復号し、`build()` が全部を張り直して再直列化する。
+/// 実測 (release) で **1 回 0.6〜0.8 秒**で、two-face をそのまま読む 2〜5ms に対して
+/// 2 桁以上遅い。最初にファイルを開いた瞬間に 0.6 秒固まるのは割に合わないので、
+/// **Rust を塗るときだけ引く別セット**にして、そこも初回まで作らない。
+///
+/// 1 ファイルの不備で起動不能にしない: 読めなければ `None` を返し、
+/// 呼び出し側は拡張セットの Rust へ落ちる (少し古い塗り分けになるだけ)。
+fn load_rust_syntax() -> Option<SyntaxSet> {
+    let def =
+        syntect::parsing::SyntaxDefinition::load_from_str(RUST_SYNTAX_YAML, true, Some("Rust"))
+            .ok()?;
+    let mut b = syntect::parsing::SyntaxSetBuilder::new();
+    // `frontmatter` コンテキストが `embed: scope:source.toml` を参照する。
+    // TOML はこの小セットに居ないので、syntect の「解決できない embed は
+    // Plain Text へ落とす」経路 (`with_plain_text_fallback`) に乗せるため、
+    // Plain Text を**必ず**入れておく (入れないと参照が未解決のまま残る)。
+    b.add_plain_text_syntax();
+    b.add(def);
+    let set = b.build();
+    // 名前で引けないセットは使わない (= 拡張セットのままにする)。
+    if set.find_syntax_by_name("Rust").is_some() {
+        Some(set)
+    } else {
+        None
+    }
 }
 
 /// 端末専用テーマ。色の代わりに **ANSI パレット番号**を詰めた特殊な
@@ -411,6 +462,10 @@ pub struct Highlighter {
     /// ([`shared`] の遅延化だけでは、テーマ名を引くだけの経路でも
     /// 構文セットまで道連れになる)。
     ps: OnceLock<SyntaxSet>,
+    /// Rust 専用の小さな構文セット ([`load_rust_syntax`])。
+    /// **Rust を実際に塗るまで組まない**。組めなかったときは `None` が入り、
+    /// 以降は拡張セットの Rust をそのまま使う。
+    rust_ps: OnceLock<Option<SyntaxSet>>,
     /// syntect のテーマ集合。構文セットとは**独立に**遅延ロードする。
     ts: OnceLock<ThemeSet>,
     /// プラグインが持ち込んだ軽量シンタックス定義 (`[[syntax]]`)。
@@ -445,6 +500,7 @@ impl Highlighter {
     pub fn new() -> Self {
         Self {
             ps: OnceLock::new(),
+            rust_ps: OnceLock::new(),
             ts: OnceLock::new(),
             packs: RwLock::new(Arc::new(GrammarSet::default())),
             palettes: Mutex::new(HashMap::new()),
@@ -458,6 +514,22 @@ impl Highlighter {
     /// 構文セット (初回アクセスで読み込む)。
     fn ps(&self) -> &SyntaxSet {
         self.ps.get_or_init(load_syntaxes)
+    }
+
+    /// 言語名から「塗るのに使う構文セットと構文」を選ぶ。
+    ///
+    /// Rust だけは同梱の最新定義 ([`load_rust_syntax`]) を持つ**別セット**を返す。
+    /// `ParseState` / `HighlightLines` は自分が属するセットと組でしか使えないので、
+    /// 構文と一緒にセットも返して取り違えを型で防ぐ。
+    fn syntax_for(&self, lang: &str) -> Option<(&SyntaxSet, &SyntaxReference)> {
+        if lang == "Rust" {
+            if let Some(set) = self.rust_ps.get_or_init(load_rust_syntax).as_ref() {
+                if let Some(s) = set.find_syntax_by_name(lang) {
+                    return Some((set, s));
+                }
+            }
+        }
+        self.ps().find_syntax_by_name(lang).map(|s| (self.ps(), s))
     }
 
     /// テーマ集合 (初回アクセスで読み込む)。
@@ -664,10 +736,7 @@ impl Highlighter {
 
         // syntect が知っている言語はそちらで塗る。知らない言語 (TypeScript /
         // Kotlin / Zig …) はプラグインのパックへ落とし、そこにも無ければ素の文字。
-        let Some(syntax) = self
-            .ps()
-            .find_syntax_by_name(lang)
-            .filter(|s| s.name != "Plain Text")
+        let Some((set, syntax)) = self.syntax_for(lang).filter(|(_, s)| s.name != PLAIN_TEXT)
         else {
             let packs = self.packs();
             match (packs.by_name(lang), self.palette(theme_name)) {
@@ -692,15 +761,7 @@ impl Highlighter {
         let lines: Vec<&str> = LinesWithEndings::from(text).collect();
         job = DOC_CACHE.with(|c| {
             let mut slot = c.borrow_mut();
-            let fresh = highlight_doc(
-                self.ps(),
-                syntax,
-                theme,
-                text,
-                fallback,
-                style_key,
-                slot.as_ref(),
-            );
+            let fresh = highlight_doc(set, syntax, theme, text, fallback, style_key, slot.as_ref());
             let job = job_from_spans(text, &lines, &fresh.spans, &font);
             if text.len() >= DOC_CACHE_MIN_BYTES {
                 *slot = Some(fresh);
@@ -731,11 +792,10 @@ impl Highlighter {
         theme_name: &str,
     ) -> Vec<Vec<(usize, usize, Color32)>> {
         let total: usize = lines.iter().map(|l| l.len() + 1).sum();
-        let syntax = self
-            .ps()
-            .find_syntax_by_name(lang)
-            .unwrap_or_else(|| self.ps().find_syntax_plain_text());
-        if total > MAX_HIGHLIGHT_BYTES || syntax.name == "Plain Text" {
+        let (set, syntax) = self
+            .syntax_for(lang)
+            .unwrap_or_else(|| (self.ps(), self.ps().find_syntax_plain_text()));
+        if total > MAX_HIGHLIGHT_BYTES || syntax.name == PLAIN_TEXT {
             return Vec::new();
         }
         let Some(theme) = self.ts().themes.get(theme_name) else {
@@ -752,7 +812,7 @@ impl Highlighter {
             // syntect は行末の改行込みで状態を進めるので付けて渡し、
             // 範囲は元の行長で丸める。
             let with_nl = format!("{line}\n");
-            match h.highlight_line(&with_nl, self.ps()) {
+            match h.highlight_line(&with_nl, set) {
                 Ok(regions) => {
                     let mut spans: Vec<(usize, usize, Color32)> = Vec::with_capacity(regions.len());
                     let mut off = 0usize;
@@ -3184,6 +3244,21 @@ mod pack_integration {
             // パックの近似より精度が高いので、そちらへ寄せる。
             ("x.bzl", "Python"),
             ("x.bicep", "Bicep"),
+            // 今回埋めた 7 言語。`.v` は Verilog のまま (奪わない) で、
+            // V は曖昧でない拡張子とマニフェスト名から引く。
+            ("x.cue", "CUE"),
+            ("x.kdl", "KDL"),
+            ("x.dhall", "Dhall"),
+            ("x.cob", "COBOL"),
+            ("x.cbl", "COBOL"),
+            ("x.apex", "Apex"),
+            ("x.trigger", "Apex"),
+            ("x.sed", "sed"),
+            ("x.vv", "V"),
+            // `.vsh` は GLSL (頂点シェーダ) のまま
+            ("x.vsh", "GLSL"),
+            ("v.mod", "V"),
+            ("x.v", "Verilog"),
         ];
         for (path, want) in cases {
             let got = h.lang_for(Some(Path::new(path)), "");
@@ -3923,6 +3998,30 @@ mod language_coverage {
         ("a.nginx", "Nginx",
          "# zzcmt\nserver {\n  listen 1234567;\n  root \"zzstr\";\n}\n",
          "zzcmt", "zzstr", "server", "1234567"),
+        // ---- 拡張セットにも既存パックにも無く、今回埋めた 7 言語 ----
+        ("a.cue", "CUE",
+         "// zzcmt\npackage p\ns: \"zzstr\"\nn: 1234567\n",
+         "zzcmt", "zzstr", "package", "1234567"),
+        // KDL に予約語は無い。仕様が「キーワード値」と呼ぶ `#true` を見る
+        ("a.kdl", "KDL",
+         "// zzcmt\nnode \"zzstr\" flag=#true count=1234567\n",
+         "zzcmt", "zzstr", "#true", "1234567"),
+        ("a.dhall", "Dhall",
+         "-- zzcmt\nlet s = \"zzstr\"\nlet n = 1234567\nin { s = s, n = n }\n",
+         "zzcmt", "zzstr", "let", "1234567"),
+        ("a.cob", "COBOL",
+         "      *> zzcmt\n       PROCEDURE DIVISION.\n           DISPLAY \"zzstr\".\n           MOVE 1234567 TO WS-N.\n",
+         "zzcmt", "zzstr", "PROCEDURE", "1234567"),
+        ("a.apex", "Apex",
+         "// zzcmt\npublic class C { String s = 'zzstr'; Integer n = 1234567; }\n",
+         "zzcmt", "zzstr", "public", "1234567"),
+        // sed に文字列リテラルは無いので、文字列の検査だけ飛ばす
+        ("a.sed", "sed",
+         "# zzcmt\ns/foo/bar/g\nq 1234567\n",
+         "zzcmt", "", "s/", "1234567"),
+        ("a.vv", "V",
+         "// zzcmt\nfn main() {\n\ts := 'zzstr'\n\tn := 1234567\n\tprintln('${s} ${n}')\n}\n",
+         "zzcmt", "zzstr", "fn", "1234567"),
     ];
 
     fn hl() -> Highlighter {
@@ -4052,7 +4151,7 @@ mod language_coverage {
 mod rust_quality {
     use super::*;
 
-    const SRC: &str = r##"#!/usr/bin/env run-cargo-script
+    const SRC: &str = r##"#!/usr/bin/env rust-script
 //! クレートの doc コメント
 use std::collections::HashMap;
 
@@ -4084,12 +4183,23 @@ where
             }
         }
         let doubled = twice!(count);
-        let awaited = other().await;
-        Ok(hex + doubled as u64 + awaited + float as u64 + raw.len() as u64)
+        let joined = other().await;
+        Ok(hex + doubled as u64 + joined + float as u64 + raw.len() as u64)
     }
 }
 
 async fn other() -> u64 { 1 }
+
+pub trait Render {}
+
+impl<T: Display + Clone> Render for T {}
+
+fn label<T>(v: T) -> String
+where
+    T: Into<String>,
+{
+    v.into()
+}
 "##;
 
     fn hl() -> Highlighter {
@@ -4118,8 +4228,19 @@ async fn other() -> u64 { 1 }
         let h = hl();
         let job = colors(&h, "base16-ocean.dark");
         assert_eq!(job.text, SRC, "本文が欠けた");
-        // 比較の基準になる「ただの識別子」
-        let ident = at(&job, "doubled");
+        // 比較の基準は**テーマの地の色 (本文の色)**。
+        //
+        // 同梱した新しい Rust 構文は `let` の束縛名や式中の識別子にも
+        // `variable.other` を付ける (Sublime Text 本体と同じ塗り方) ので、
+        // 「どのスコープも付いていない素の識別子」という基準そのものが無くなった。
+        // ここで見たいのは「地の文と見分けが付くか」なので前景色を基準にする。
+        let body = h
+            .ts()
+            .themes
+            .get("base16-ocean.dark")
+            .and_then(|t| t.settings.foreground)
+            .map(|c| Color32::from_rgb(c.r, c.g, c.b))
+            .expect("既定テーマに前景色がある");
         // (見たいもの, 本文中の断片) — 基準色と違うこと
         let differs: &[(&str, &str)] = &[
             ("ライフタイム注記", "'a,"),
@@ -4135,18 +4256,23 @@ async fn other() -> u64 { 1 }
             ("unsafe", "unsafe"),
             ("where 節", "where"),
             ("生ポインタの型", "*const u8"),
+            // ここから下は同梱の `assets/syntaxes/Rust.sublime-syntax` で
+            // 初めて色が付くようになったもの (two-face が持つ古い版では
+            // 全て素の識別子と同じ色だった)。回帰したら必ずここで落ちる。
+            ("async", "async fn"),
+            (".await の await", "await;"),
+            ("トレイト境界の型", "Display + Clone"),
+            // where 節の型パラメータ (`T`) は `storage.type` が付く。
+            // 境界名そのもの (`Into`) は `support.type` で、base16 系の
+            // tmTheme はこのスコープに色を定義していない (= 構文ではなく
+            // テーマ側の都合。two-face の古い構文でも同じだった)。
+            ("where 節の型パラメータ", "T: Into"),
+            ("シェバン", "/usr/bin/env"),
         ];
-        // 【既知の欠落】同梱の Rust 構文 (two-face = bat 由来) は
-        //   * `async` / `await`
-        //   * トレイト境界の型名 (`Send`)
-        //   * `.rs` 先頭のシェバン
-        // にスコープを付けないため、素の識別子と同じ色になる。
-        // ここを直すには `.sublime-syntax` 側の修正が要るので、
-        // 期待値には入れず、代わりに下の「構造は壊れない」検査で守る。
         let mut bad = Vec::new();
         for (what, needle) in differs {
-            if at(&job, needle) == ident {
-                bad.push(format!("{what} ({needle:?}) が素の識別子と同じ色"));
+            if at(&job, needle) == body {
+                bad.push(format!("{what} ({needle:?}) が地の文と同じ色"));
             }
         }
         // 文字列は raw でも通常でも同じ扱い、コメントとは別の色
@@ -4163,6 +4289,19 @@ async fn other() -> u64 { 1 }
         if at(&job, "0xDEAD_BEEF") == s_raw || at(&job, "0xDEAD_BEEF") == cmt {
             bad.push("数値が文字列かコメントと同じ色".into());
         }
+        // 属性名が「コメント / 文字列 / 数値 / キーワード」のどれかに
+        // 紛れ込んでいないこと (地の文と違うだけでは分類として弱いため)。
+        let attr = at(&job, "derive");
+        for (what, c) in [
+            ("コメント", cmt),
+            ("文字列", s_raw),
+            ("数値", at(&job, "0xDEAD_BEEF")),
+            ("キーワード", at(&job, "unsafe")),
+        ] {
+            if attr == c {
+                bad.push(format!("属性が{what}と同じ色"));
+            }
+        }
         assert!(bad.is_empty(), "{bad:#?}");
     }
 
@@ -4170,13 +4309,23 @@ async fn other() -> u64 { 1 }
     fn シェバンで始まっても後続のrustが壊れない() {
         let h = hl();
         let job = colors(&h, "base16-ocean.dark");
-        // シェバン行そのものは同梱の Rust 構文がスコープを付けない
-        // (素の識別子と同じ色になる) が、**その後ろが壊れないこと**が要点。
-        let ident = at(&job, "doubled");
-        assert_ne!(at(&job, "pub struct"), ident, "シェバンの後ろが素通し");
-        assert_ne!(at(&job, "普通の文字列"), ident, "文字列が塗れていない");
-        assert_ne!(at(&job, "関数の doc"), ident, "doc コメントが塗れていない");
-        assert_ne!(at(&job, "macro_rules"), ident, "マクロが塗れていない");
+        // シェバン行はコメントとして塗られ、**その後ろも壊れないこと**が要点。
+        let body = h
+            .ts()
+            .themes
+            .get("base16-ocean.dark")
+            .and_then(|t| t.settings.foreground)
+            .map(|c| Color32::from_rgb(c.r, c.g, c.b))
+            .expect("既定テーマに前景色がある");
+        assert_eq!(
+            at(&job, "/usr/bin/env"),
+            at(&job, "関数の doc"),
+            "シェバンがコメント色で塗られていない"
+        );
+        assert_ne!(at(&job, "pub struct"), body, "シェバンの後ろが素通し");
+        assert_ne!(at(&job, "普通の文字列"), body, "文字列が塗れていない");
+        assert_ne!(at(&job, "関数の doc"), body, "doc コメントが塗れていない");
+        assert_ne!(at(&job, "macro_rules"), body, "マクロが塗れていない");
     }
 
     #[test]
@@ -4205,6 +4354,71 @@ async fn other() -> u64 { 1 }
             }
         }
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// 同梱の Rust 構文は **Rust を実際に塗るまで**組まない。
+    ///
+    /// `SyntaxSet::into_builder()` 経由で拡張セットへ混ぜると 220 構文を
+    /// 全部張り直すことになり、実測 (release) で 1 回 0.6〜0.8 秒かかる。
+    /// 別セットに切り出したうえで遅延させている、という設計をここで固定する。
+    #[test]
+    fn rust構文は塗るまで組まれない() {
+        let h = hl();
+        assert!(
+            h.rust_ps.get().is_none(),
+            "作っただけで Rust 構文を組んでいる"
+        );
+        // 他言語の判定・着色では触らない
+        assert_eq!(h.lang_for(Some(Path::new("a.py")), ""), "Python");
+        let _ = h.layout_job(
+            "x = 1\n",
+            "Python",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        assert!(
+            h.rust_ps.get().is_none(),
+            "他言語を塗っただけで Rust 構文を組んでいる"
+        );
+
+        let t = std::time::Instant::now();
+        let job = colors(&h, "base16-ocean.dark");
+        let first = t.elapsed();
+        assert_eq!(job.text, SRC, "本文が欠けた");
+        assert!(
+            h.rust_ps.get().and_then(|o| o.as_ref()).is_some(),
+            "Rust を塗ったのに専用セットが組まれていない"
+        );
+        // 閾値は debug ビルドでも余裕がある値 (実測 release 十数 ms)。
+        // ここが跳ねたら「拡張セットへ混ぜる」実装へ戻ってしまっている。
+        assert!(
+            first < std::time::Duration::from_millis(1500),
+            "同梱 Rust 構文の初回組み立てが遅い: {first:?}"
+        );
+    }
+
+    /// 同梱した第三者ファイルの出典とライセンスが、ファイル自身と
+    /// 添付のライセンスファイルの**両方**に書いてあること。
+    #[test]
+    fn 同梱したrust構文に出典とライセンスが書いてある() {
+        // Windows のチェックアウトは CRLF なので必ず正規化してから探す。
+        let yaml = RUST_SYNTAX_YAML.replace("\r\n", "\n");
+        for needle in [
+            "https://github.com/sublimehq/Packages",
+            "Permission to copy, use, modify, sell and distribute",
+        ] {
+            assert!(yaml.contains(needle), "構文定義に記載が無い: {needle}");
+        }
+        let lic = include_str!("../assets/syntaxes/Rust.sublime-syntax-license.txt")
+            .replace("\r\n", "\n");
+        for needle in [
+            "https://github.com/sublimehq/Packages",
+            "Permission to copy, use, modify, sell and distribute",
+            "assets/syntaxes/Rust.sublime-syntax",
+        ] {
+            assert!(lic.contains(needle), "添付ライセンスに記載が無い: {needle}");
+        }
     }
 
     #[test]
