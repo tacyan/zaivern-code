@@ -93,3 +93,10 @@ licgen_key*
 # 実機確認用のスクリーンショット (作業成果物ではない)
 screenshots/
 target-verify/
+
+# 並列エージェント用の隔離ワークツリーと作業指示書 (成果物ではない)
+.claude/worktrees/
+.claude/briefs/
+
+# @all 一斉指示フック (個人用ワークフロー。settings.local.json から参照)
+.claude/hooks/
