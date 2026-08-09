@@ -10968,6 +10968,18 @@ impl ZaivernApp {
 
     fn apply_cmd(&mut self, cmd: Cmd, ctx: &egui::Context) {
         match cmd {
+            // feature.rs のレジストリ経由。**ここが唯一のディスパッチ口**で、
+            // 機能が何個増えてもこのアームは 1 つのまま (並列開発の衝突対策。
+            // 経緯は feature.rs の冒頭)。未知の ID を黙って捨てると
+            // 「押したのに無反応」になるので、必ずユーザーへ知らせる。
+            Cmd::Feature(id) => {
+                if !crate::feature::dispatch(self, ctx, id) {
+                    self.toast_warn(trf(
+                        "機能 {id} は登録されていません",
+                        &[("id", id.to_string())],
+                    ));
+                }
+            }
             // 差分ビュー: 表示モードの切替と変更箇所のジャンプ。
             // ctx へ書くだけで、実際の反映は差分ビュー自身が同フレームで行う。
             Cmd::ToggleDiffView => {
@@ -24732,6 +24744,9 @@ impl ZaivernApp {
         for (icon, label, cmd) in panels::ide_palette_entries() {
             cmds.push((icon, label, String::new(), cmd));
         }
+        // feature.rs のレジストリに登録された機能。**ここが唯一の差し込み口**で、
+        // 機能が増えてもこの 1 ブロックは変わらない (並列開発の衝突対策)。
+        cmds.extend(crate::feature::palette_entries());
         // 実行中のセッション毎に音声入力エントリを出す (パレットで「音声」検索用)
         for s in self.agents.sessions.iter().take(20) {
             cmds.push((
@@ -29308,6 +29323,11 @@ impl ZaivernApp {
         self.checkpoint_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
+        // feature.rs のレジストリに登録された機能のオーバーレイ。
+        // **ここが唯一の描画差し込み口**で、機能が増えてもこの 1 行は
+        // 変わらない (並列開発の衝突対策)。トーストより手前に置いて、
+        // 通知が機能のオーバーレイに隠れないようにしておく。
+        crate::feature::draw_all(self, ctx);
         self.toasts_ui(ctx);
 
         // デスクトップペット 🐾
