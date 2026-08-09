@@ -25,6 +25,10 @@ pub enum Cmd {
     CheckpointList,
     /// 今の作業ツリーをチェックポイントとして記録する。
     CheckpointNow,
+    /// 🕰 ローカルヒストリ (VCS に依らない取り消し履歴) を開く。
+    /// アクティブなファイルがあればそれに絞る。ラベル付けは開いた窓の
+    /// 「ラベル…」から届くので、**パレットの行はこれ 1 本だけ**にしてある。
+    LocalHistoryOpen,
     /// フリート看板 (全エージェントを状態列で俯瞰・指揮するカンバン画面) 切替
     ToggleKanban,
     /// エージェントデッキ (稼働中 / ローカルのセッション / 新規 を縦 1 本で管理する画面) 切替
@@ -698,7 +702,10 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleFinalNewlineOnSave
         | Cmd::ToggleTrimFinalNewlinesOnSave
         | Cmd::ToggleFormatOnSave
-        | Cmd::ConvertLineEnding(_) => Group::File,
+        | Cmd::ConvertLineEnding(_)
+        // ローカルヒストリはファイル/フォルダを戻す操作なので「ファイル」。
+        // git のコミット履歴とは別物 (コミットしていない変更が対象)。
+        | Cmd::LocalHistoryOpen => Group::File,
 
         // ── 編集 ───────────────────────────────────────────────────
         Cmd::Undo
