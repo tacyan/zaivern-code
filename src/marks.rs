@@ -1800,7 +1800,7 @@ fn chooser_window(
                 .map(|(_, _, _, r)| r.bottom())
                 .unwrap_or(area.top());
             ui.allocate_space(egui::vec2(avail, bottom - area.top() + 6.0));
-            ui.add(
+            let desc_resp = ui.add(
                 egui::TextEdit::singleline(&mut ch.desc)
                     .desired_width(avail)
                     .hint_text(tr("説明 (任意)")),
@@ -1814,8 +1814,13 @@ fn chooser_window(
                 }
             });
 
-            // 素のキー入力: 一致するニーモニックは即決、矢印は移動
+            // 素のキー入力: 一致するニーモニックは即決、矢印は移動。
+            //
+            // **説明欄に入力中は 1 つも拾わない。** `i.events` を読むのは
+            // 消費ではないので、ここを素通しにすると説明へ "a" と打った
+            // 瞬間にニーモニック A が付いてポップアップが閉じてしまう。
             if ch.confirm.is_none() {
+                let typing = desc_resp.has_focus();
                 let (typed, mv, enter, esc) = ui.input(|i| {
                     let typed = i.events.iter().find_map(|e| match e {
                         egui::Event::Text(t) => t.chars().next().and_then(Mnemonic::new),
@@ -1839,11 +1844,9 @@ fn chooser_window(
                         i.key_pressed(egui::Key::Escape),
                     )
                 });
-                if let Some(m) = typed {
-                    commit = Some(Some(m));
-                } else if mv != (0, 0) {
-                    ch.cursor = grid_step(&widths, ch.cursor, mv.0, mv.1);
-                } else if enter {
+                // 確定と取り消しは説明欄からでも効く。
+                // **ニーモニックの即決と矢印移動だけ**は入力中に拾わない。
+                if enter {
                     let at = lay
                         .cells
                         .iter()
@@ -1852,6 +1855,13 @@ fn chooser_window(
                     commit = Some(at);
                 } else if esc {
                     close = true;
+                } else if typing {
+                    // 説明を打っている最中。ここで拾うと "a" の 1 打で
+                    // ニーモニック A が付いて閉じてしまう。
+                } else if let Some(m) = typed {
+                    commit = Some(Some(m));
+                } else if mv != (0, 0) {
+                    ch.cursor = grid_step(&widths, ch.cursor, mv.0, mv.1);
                 }
             }
         });
