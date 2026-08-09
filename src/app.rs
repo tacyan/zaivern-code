@@ -16,6 +16,7 @@ use crate::checkpoint;
 use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
+use crate::conflict;
 use crate::coordinator;
 use crate::diagview;
 use crate::editor;
@@ -3118,6 +3119,14 @@ pub struct ZaivernApp {
     /// 衝突バッジの詳細 (どのファイルを誰が取り合っているか) を開いているか。
     /// **既定は閉じ**。画面が勝手に開かないよう、明示的に押されたときだけ広がる。
     conflict_detail: bool,
+    /// 🛰 衝突レーダー — **worktree で隔離した** エージェント同士の
+    /// マージ衝突を、マージする前に見つける。`ConflictWatch` (同居のみ) の裏側。
+    /// 見張る対象が 2 本未満なら git を 1 回も起こさない。
+    conflict_radar: conflict::ConflictRadar,
+    /// レーダーの窓が開いているか。**既定は閉じ**。
+    radar_open: bool,
+    /// レーダーで選んでいるワークツリーの組 (行列のマス)。`None` = 全件。
+    radar_pair: Option<(usize, usize)>,
     /// 全エージェント一括停止の確認モーダルが出ているか (破壊的操作)。
     pending_stop_all: bool,
     /// 閉じたエージェントに割り当てられていた worktree の後始末待ち。
@@ -4039,6 +4048,9 @@ impl ZaivernApp {
             named_for: HashMap::new(),
             conflicts: worktree::ConflictWatch::new(),
             conflict_detail: false,
+            conflict_radar: conflict::ConflictRadar::new(),
+            radar_open: false,
+            radar_pair: None,
             pending_stop_all: false,
             pending_worktree: None,
             highlighter: crate::highlight::shared(),
@@ -17542,6 +17554,103 @@ impl ZaivernApp {
             .map(|s| (s.id, s.cwd.clone(), s.running()))
             .collect();
         self.conflicts.update(&live);
+        // 🛰 レーダーは**隔離済み**の worktree 同士を見る (同居は上の担当)。
+        // ディスク使用量は窓を開けている間だけ測る (閉じていればゼロコスト)。
+        // 結果が差し替わっても**自分からは再描画を要求しない** (`ConflictWatch`
+        // と同じ約束)。エージェントが動いていれば PTY 出力で描き直しが起きるし、
+        // 全員止まっていれば描き直す理由が無い = アイドルのコストはゼロ。
+        let specs = self.radar_specs();
+        let _ = self.conflict_radar.update(&specs, self.radar_open);
+    }
+
+    /// レーダーが見張るワークツリーの一覧 (git を 1 回も呼ばない)。
+    ///
+    /// **稼働中で worktree 隔離されたエージェント** を、同じリポジトリごとに
+    /// まとめ、いちばん大きな束を選ぶ。そこへ本体のリポジトリ自身も 1 本
+    /// (ID 0) として加える — ユーザー自身の未コミット変更もエージェントと
+    /// ぶつかるので、隠すと「後で発見させない」という目的に反する。
+    fn radar_specs(&self) -> Vec<conflict::TreeSpec> {
+        let mut by_repo: HashMap<PathBuf, Vec<conflict::TreeSpec>> = HashMap::new();
+        for s in self.agents.sessions.iter().filter(|s| s.running()) {
+            let Some(wt) = self.agent_worktrees.get(&s.id) else {
+                continue;
+            };
+            by_repo
+                .entry(worktree::path_key(&wt.repo))
+                .or_default()
+                .push(conflict::TreeSpec {
+                    id: s.id,
+                    label: format!("{} {}", s.icon, s.title),
+                    branch: wt.branch.clone(),
+                    dir: wt.dir.clone(),
+                });
+        }
+        // 同じ画面に 2 つのリポジトリの行列を混ぜない (共通ベースが無い)。
+        let Some((_, mut specs)) = by_repo
+            .into_iter()
+            .max_by_key(|(k, v)| (v.len(), k.clone()))
+        else {
+            return Vec::new();
+        };
+        specs.sort_by_key(|s| s.id);
+        // 本体リポジトリ。エージェントの worktree の `repo` から取るので、
+        // ワークスペースをどこに開いていても正しい相手になる。
+        if let Some(repo) = self
+            .agent_worktrees
+            .values()
+            .find(|w| specs.iter().any(|s| s.dir == w.dir))
+            .map(|w| w.repo.clone())
+        {
+            let name = repo
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| tr("リポジトリ本体"));
+            specs.insert(
+                0,
+                conflict::TreeSpec {
+                    id: 0,
+                    label: trf("📁 {name} (本体)", &[("name", name)]),
+                    branch: String::new(),
+                    dir: repo,
+                },
+            );
+        }
+        specs
+    }
+
+    /// 🛰 衝突レーダーの開閉 ([`crate::conflict::FEATURE`] から呼ばれる)。
+    pub(crate) fn toggle_conflict_radar(&mut self) {
+        self.radar_open = !self.radar_open;
+        if self.radar_open {
+            // 開くたびに絞り込みは解く (前回選んだ組が残っていると
+            // 「開いたのに何も出ない」に見える)。
+            self.radar_pair = None;
+        }
+    }
+
+    /// 🛰 衝突レーダーの窓。**閉じているときは 1 命令も走らない**。
+    pub(crate) fn conflict_radar_ui(&mut self, ctx: &egui::Context) {
+        if !self.radar_open {
+            return;
+        }
+        // Cockpit を閉じたまま窓だけ開いた場合も更新が止まらないよう、
+        // ここでも 1 段だけ進める (二重に呼んでも走査は 1 本しか起きない)。
+        let specs = self.radar_specs();
+        let _ = self.conflict_radar.update(&specs, true);
+        let theme = self.theme.clone();
+        let mut open = true;
+        let mut pair = self.radar_pair;
+        let acts = conflict::radar_window(ctx, &theme, &mut open, &self.conflict_radar, &mut pair);
+        self.radar_pair = pair;
+        if !open {
+            self.radar_open = false;
+        }
+        for a in acts {
+            match a {
+                conflict::RadarAction::Open(path, line) => self.open_path_at(&path, line, 1),
+                conflict::RadarAction::Close => self.radar_open = false,
+            }
+        }
     }
 
     /// 衝突バッジのツールチップ (ファイル名と、取り合っている相手の名前)。
@@ -17760,6 +17869,30 @@ impl ZaivernApp {
                     .on_hover_text(tip);
                 if hit.clicked() {
                     self.conflict_detail = !self.conflict_detail;
+                }
+            }
+            // ── 🛰 衝突レーダー (隔離済み worktree 同士) ──────────────
+            // **綺麗なときは静かである**。警報が 0 件なら 1 ピクセルも出さない。
+            let radar_n = self.conflict_radar.report().alarm_files();
+            if radar_n > 0 {
+                let hit = ui
+                    .selectable_label(
+                        self.radar_open,
+                        RichText::new(if compact {
+                            format!("🛰{radar_n}")
+                        } else {
+                            trf("🛰 {n} ファイル衝突予測", &[("n", radar_n.to_string())])
+                        })
+                        .color(theme.err)
+                        .strong(),
+                    )
+                    .on_hover_text(tr(
+                        "別々の worktree で走っているエージェントが、マージすると\n\
+                         衝突するファイルを触っています。押すと衝突レーダーが開きます。",
+                    ));
+                if hit.clicked() {
+                    // パレット経由と同じ入口を通す (絞り込みの解除も揃う)。
+                    self.toggle_conflict_radar();
                 }
             }
 
@@ -18929,11 +19062,20 @@ impl ZaivernApp {
         // タスク作成 / メッセージ送信のフォームと、押されたボタンの適用。
         let prev_task_target = self.orch.target;
         let prev_msg_target = self.orch.msg_target;
+        // ディスパッチ前チェックの材料 (レーダーが既に持っている逆引き表)。
+        // 宛先に指名した相手は外す — 自分が持っているファイルを自分へ
+        // 警告しても意味が無い。
+        let exclude = match self.orch.target {
+            orchestration::TaskTarget::Session(id) => Some(id),
+            orchestration::TaskTarget::Auto => None,
+        };
+        let owners = self.conflict_radar.report().all_owners(exclude);
         orch_acts.extend(orchestration::task_form_ui(
             &mut self.orch,
             ctx,
             theme,
             orch_rows,
+            &owners,
         ));
         orch_acts.extend(orchestration::message_form_ui(
             &mut self.orch,
@@ -19005,6 +19147,7 @@ impl ZaivernApp {
         // Cockpit と同じ見張り。同居が 0 なら git を 1 回も叩かない。
         self.sync_conflicts();
         let conflicts = self.conflicts.report().clone();
+        let radar = self.conflict_radar.report().clone();
         // PTY 画面の読み直し (parser のロック) は看板が「今」と言ったフレームだけ。
         // 看板を開けっぱなしでもアイドル時のコストがゼロに近くなる。
         let now_ms = self.supervisor.elapsed_ms();
@@ -19056,15 +19199,23 @@ impl ZaivernApp {
                     commander: self.super_agent_session == Some(s.id),
                     // 同じ作業ツリーの誰かとファイルを取り合っていたら ⚠。
                     // 取り合っているファイル名はホバーに畳む。
-                    conflict: conflicts.has_agent(s.id).then(|| {
-                        trf(
-                            "⚠ 他のエージェントと同じファイルを触っています: {files}",
-                            &[(
-                                "files",
-                                worktree::summarize_labels(&conflicts.labels_for(s.id), 3),
-                            )],
-                        )
-                    }),
+                    // **隔離済み worktree 同士**の衝突予測 (🛰 レーダー) も
+                    // 同じ 1 本のバッジに畳む — 同じ意味の印を 2 つ並べない。
+                    conflict: [
+                        conflicts.has_agent(s.id).then(|| {
+                            trf(
+                                "⚠ 他のエージェントと同じファイルを触っています: {files}",
+                                &[(
+                                    "files",
+                                    worktree::summarize_labels(&conflicts.labels_for(s.id), 3),
+                                )],
+                            )
+                        }),
+                        radar.card_hint(s.id),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .reduce(|a, b| format!("{a}\n{b}")),
                     can_cycle: s.permission_switch_hint().is_some(),
                     // カードの一言 + ホバープレビュー + アクティビティ分類の材料。
                     // サンプリング周期のフレームだけ実際に PTY を読む

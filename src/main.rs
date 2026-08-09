@@ -10,6 +10,7 @@ mod checkpoint;
 mod cli;
 mod commander;
 mod config;
+mod conflict;
 mod coordinator;
 mod deck;
 mod desktop;
