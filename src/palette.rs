@@ -21,6 +21,10 @@ pub enum Cmd {
     RemoveFolder(PathBuf),
     ToggleTerminal,
     ToggleCockpit,
+    /// チェックポイント一覧 (巻き戻し)。
+    CheckpointList,
+    /// 今の作業ツリーをチェックポイントとして記録する。
+    CheckpointNow,
     /// フリート看板 (全エージェントを状態列で俯瞰・指揮するカンバン画面) 切替
     ToggleKanban,
     /// エージェントデッキ (稼働中 / ローカルのセッション / 新規 を縦 1 本で管理する画面) 切替
@@ -70,6 +74,13 @@ pub enum Cmd {
     GitPull,
     /// コミット履歴の一覧を開く (選ぶとその差分がタブで開く)
     GitHistory,
+    // ── マルチバッファ (複数ファイルの抜粋を 1 本の面へ / Zed の multibuffer) ──
+    /// 直近のワークスペース検索の**全ヒット**を 1 枚の面で開く
+    OpenSearchMultibuffer,
+    /// ワークスペース全体の**診断**を 1 枚の面で開く
+    OpenProblemsMultibuffer,
+    /// **未コミットの変更**を 1 枚の面で開く (エージェントの成果をまとめて読む)
+    OpenChangesMultibuffer,
     OpenFind,
     NewAgent(usize),
     /// プリセット `usize` を **専用の git worktree** で起動する。
@@ -253,6 +264,8 @@ pub enum Cmd {
     PrevProblem,
     /// 行末の診断メッセージ (Error Lens 相当) の表示切替
     ToggleInlineDiagnostics,
+    /// インレイヒント (LSP の型・引数名) の表示切替
+    ToggleInlayHints,
     /// フルスクリーン切替 (VS Code: ⌃⌘F)
     ToggleFullScreen,
     /// ナビゲーション履歴 (VS Code: ⌃- / ⌃⇧-)
@@ -759,6 +772,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::ToggleBreadcrumbs
         | Cmd::ToggleProblems
         | Cmd::ToggleInlineDiagnostics
+        | Cmd::ToggleInlayHints
         | Cmd::ToggleFullScreen
         | Cmd::ToggleTableView
         | Cmd::ToggleLspHighlight
@@ -782,7 +796,9 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::TogglePetFreeRoam
         | Cmd::TogglePetSleep
         | Cmd::TogglePetSounds
-        | Cmd::TogglePetBubbles => Group::View,
+        | Cmd::TogglePetBubbles
+        | Cmd::OpenSearchMultibuffer
+        | Cmd::OpenProblemsMultibuffer => Group::View,
 
         // ── Git ────────────────────────────────────────────────────
         Cmd::OpenGitPanel
@@ -790,6 +806,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::GitPush
         | Cmd::GitPull
         | Cmd::GitHistory
+        | Cmd::OpenChangesMultibuffer
         | Cmd::ShowGitHubTab
         | Cmd::OpenReview
         | Cmd::SetReviewBase(_)
@@ -835,6 +852,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenRace
         | Cmd::EvalRace
         | Cmd::ToggleCockpit
+        | Cmd::CheckpointList
+        | Cmd::CheckpointNow
         | Cmd::ToggleKanban
         | Cmd::ToggleDeck
         | Cmd::SetApproval(_)

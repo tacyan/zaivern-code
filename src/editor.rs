@@ -57,6 +57,12 @@ pub enum BufferKind {
     /// 1 コミットの差分ビュー (ガターの git blame をクリックして開く)。
     /// 本文は `git show` の unified diff。
     CommitDiff,
+    /// チェックポイントと「今」の差分ビュー (`checkpoint.rs` の一覧から開く)。
+    /// 本文は tree 同士の unified diff なので、描画は `CommitDiff` と同じ
+    /// `panels::commit_diff_ui` を使い回す。**種別を分けているのは、
+    /// コミット差分タブを開いても巻き戻しの差分が消えないようにするため**
+    /// (`open_virtual` は同じ種別のタブを使い回す)。
+    CheckpointDiff,
     /// 画像ビューア (png/jpg 等)。ピクセルは `Buffer::image` に持つ。
     /// `path` は `Some` (外部変更の mtime 監視で再デコードするため) だが、
     /// `read_only()` が真なので保存・編集の経路には乗らない。
@@ -74,6 +80,12 @@ pub enum BufferKind {
     Media,
     /// 書庫 (ZIP 形式) の中身一覧。中身は [`PreviewDoc::Archive`]。
     Archive,
+    /// **マルチバッファ** — 複数ファイルの抜粋を 1 本の面に並べた索引タブ
+    /// (Zed の multibuffer 相当)。中身は [`PreviewDoc::Multi`]。
+    ///
+    /// 出所ごとに別タブにする (検索結果を開いても問題の一覧は消えない)。
+    /// `path` は `None` — 実体を持たない**索引**なので、保存も mtime 監視も無い。
+    Multibuffer { source: crate::multibuffer::Source },
 }
 
 impl BufferKind {
@@ -89,7 +101,11 @@ impl BufferKind {
     pub fn preview_only(&self) -> bool {
         matches!(
             self,
-            BufferKind::Image | BufferKind::Hex | BufferKind::Media | BufferKind::Archive
+            BufferKind::Image
+                | BufferKind::Hex
+                | BufferKind::Media
+                | BufferKind::Archive
+                | BufferKind::Multibuffer { .. }
         )
     }
 }
@@ -2268,6 +2284,54 @@ impl Editor {
     /// 同じ `kind` のタブが既にあれば内容を差し替えて使い回す
     /// (同じ PR を二度開いてもタブが増えない)。`path` は必ず `None` なので、
     /// 保存 / LSP / git ガター / セッション復元はいずれもこのタブを素通りする。
+    /// マルチバッファのタブを開く (同じ出所のタブがあれば中身を差し替える)。
+    ///
+    /// `open_virtual` と分けてあるのは、**中身が本文 (`text`) ではなく
+    /// `preview` に入る**ため。本文は空のままにしておくことで、検索・保存・
+    /// LSP・git ガターといった「本文を持つタブ」向けの経路には一切乗らない。
+    pub fn open_multibuffer(&mut self, mb: crate::multibuffer::Multibuffer) -> u64 {
+        let source = mb.source;
+        let kind = BufferKind::Multibuffer { source };
+        let title = crate::i18n::tr(source.title());
+        let title = format!("{} {title}", source.icon());
+        if let Some(i) = self.buffers.iter().position(|b| b.kind == kind) {
+            let b = &mut self.buffers[i];
+            b.title = title;
+            b.preview = Some(crate::preview::PreviewDoc::Multi(mb));
+            self.active = Some(i);
+            return b.id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.buffers.push(Buffer {
+            id,
+            path: None,
+            kind,
+            title,
+            saved_hash: hash_str(""),
+            history: History::default(),
+            text: String::new(),
+            lang: "Plain Text".into(),
+            encoding: crate::textenc::Encoding::Utf8,
+            cache: None,
+            gutter: None,
+            disk_mtime: None,
+            conflict_notified: None,
+            image: None,
+            pdf_job: None,
+            folds: FoldState::default(),
+            bookmarks: Bookmarks::default(),
+            large: LargeFileMode::default(),
+            table: None,
+            preview: Some(crate::preview::PreviewDoc::Multi(mb)),
+            minimap: None,
+            zoom: crate::zoom::DEFAULT,
+            indent: crate::editor_ops::IndentStyle::default(),
+        });
+        self.active = Some(self.buffers.len() - 1);
+        id
+    }
+
     pub fn open_virtual(&mut self, title: String, text: String, kind: BufferKind) -> u64 {
         if let Some(i) = self.buffers.iter().position(|b| b.kind == kind) {
             let b = &mut self.buffers[i];
@@ -3040,6 +3104,13 @@ mod tests {
             (BufferKind::Hex, true, true),
             (BufferKind::Media, true, true),
             (BufferKind::Archive, true, true),
+            (
+                BufferKind::Multibuffer {
+                    source: crate::multibuffer::Source::Search,
+                },
+                true,
+                true,
+            ),
         ];
         for (kind, ro, preview) in cases {
             assert_eq!(kind.read_only(), *ro, "{kind:?} の read_only");

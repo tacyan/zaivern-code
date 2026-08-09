@@ -117,7 +117,22 @@ Check progress, send instructions, approve actions, and edit files from your pho
 
 Read code and review changes made by your AI tools without leaving the app. The editor can also open images, PDFs, CSVs, Markdown, and large files.
 
-## 🆕 Latest release: v0.8.0
+## 🆕 New in v0.10.0
+
+**⿴ Multibuffer** — read search results, problems, and uncommitted changes as **one
+surface with real surrounding context**, instead of opening files one by one. Click a
+header to fold, click a line to jump there. Reachable from the "⿴ Open all" button in
+the search and problems panels.
+
+**⏸ Bulk send to stalled agents only** — "Everyone" interrupts agents that are still
+working. This targets only the ones that have **stopped making progress** (idle,
+stalled, looping, erroring). Agents waiting on an approval prompt are excluded — answer
+those in the approval UI instead.
+
+**Fixed multi-second freezes in large repositories** — fetching the branch name and the
+gutter diff marks was blocking the UI thread. Worst frame: **4376ms → 20.8ms**.
+
+## 🆕 Previous release: v0.8.0
 
 **22 gaps in day-to-day usability, closed.** We studied superset, VS Code, cmux, orca and Zed,
 and worked through the missing pieces starting with the ones that made the editor unusable.
@@ -146,6 +161,7 @@ a workspace-wide problems panel · clickable file paths and URLs in the terminal
 - **Rebuilt state detection** — structured output and hooks instead of guessing from the screen, and the source of each verdict is shown
 - **Isolated worktrees and conflict detection** — if two agents touch the same file, you hear about it now, not at review time
 - **Focused diff review** — a "2 / 5" counter and `]f` / `[f` to move between files
+- **Cost limits and alerts** — set a session or daily cap on estimated spend: warn at 80%, notify on arrival, and with `stop` new messages are blocked with the reason shown (notify-only by default; nothing is drawn at all until you set a limit)
 - ⌃1–⌃9 preset launch, automatic session naming, token usage and estimated cost
 
 **Quality:** 3,134 tests, green CI on macOS, Linux and Windows, clean `cargo fmt --check`.

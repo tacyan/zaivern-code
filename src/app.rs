@@ -10,6 +10,7 @@ use eframe::egui::{self, Align2, Color32, FontId, RichText};
 use crate::agent_picker::{self, AgentPicker};
 use crate::agents::{self, AgentManager, SessionEvent};
 use crate::breadcrumb;
+use crate::checkpoint;
 use crate::cli;
 use crate::commander;
 use crate::config::{self, Config};
@@ -622,6 +623,8 @@ struct GlobalSearchState {
     replace_rx: Option<mpsc::Receiver<ReplaceMsg>>,
     /// パターンのコンパイルエラー。赤字でその場に出す (黙って literal に落とさない)。
     error: Option<String>,
+    /// 「まとめて開く」が押された (マルチバッファへ)。呼び出し側が読んで倒す。
+    open_multi: bool,
 }
 
 impl GlobalSearchState {
@@ -645,6 +648,7 @@ impl GlobalSearchState {
             phase: ReplacePhase::Idle,
             replace_rx: None,
             error: None,
+            open_multi: false,
         }
     }
 
@@ -1650,7 +1654,12 @@ struct CockpitActions {
     remove: Option<usize>,
     cycle: Option<usize>,
     cycle_all: bool,
+    /// チェックポイント一覧を開く (Cockpit ヘッダから)。
+    checkpoints: bool,
     broadcast: Option<String>,
+    /// **止まっているエージェントだけ**へ送る本文。
+    /// 作業中のものは巻き込まない (判定は `SessionState::is_stuck`)。
+    broadcast_stalled: Option<String>,
     /// **1 体だけ**へ送る `(セッション ID, 本文)`。
     /// コンポーザで宛先を指名したとき。全員へは飛ばさない
     /// (「レビューのプロンプトが全エージェントへ漏れる」問題の元栓)。
@@ -3277,6 +3286,12 @@ pub struct ZaivernApp {
     /// バッファ内検索のヒット一覧 (検索バー / ミニマップの印 / 本文のハイライトが共有)。
     /// 本文か検索条件が変わったときだけ走査し直す。
     find_hits: Option<FindHitCache>,
+    /// マルチバッファのタブごとのカーソル行 (`Buffer::id` → `rows` の添字)。
+    ///
+    /// `Buffer` に持たせないのは、これが**中身ではなく表示状態**だから
+    /// (スクロール位置と同じ扱い。タブを閉じれば意味を失う)。
+    /// 出所ごとにタブは 1 枚しか作らないので、実質 3 件までしか増えない。
+    multibuffer_cursor: HashMap<u64, usize>,
     /// ブレッドクラム用に documentSymbol を投げた記録: (パス, 本文ハッシュ, 時刻)。
     /// 同じ内容へ二重に投げないためのデバウンス。
     breadcrumb_symbols_asked: Option<(PathBuf, u64, Instant)>,
@@ -3307,6 +3322,16 @@ pub struct ZaivernApp {
     /// ステータスバーのトークン/コスト表示をエージェント別まで開くか。
     /// **既定はコンパクト (合算 1 個)**。消費ゼロならどちらでも 1px も出さない。
     token_detail: bool,
+    /// コスト上限の判定結果 (最も深刻な 1 件)。**上限が未設定なら常に None**
+    /// で、そのときステータスバーには 1px も出ない。
+    cost_alert: Option<coordinator::quota::BudgetStatus>,
+    /// 上の判定をやり直した材料 (取り込み回数, 上限の設定)。
+    /// **これが変わったときだけ**推定コストを計算し直す (設計原則 3)。
+    cost_stamp: Option<(u64, coordinator::quota::CostLimits)>,
+    /// 最後に数えた推定コスト (このセッションぶん, 今日 (UTC) ぶん)。
+    cost_spent: (f64, f64),
+    /// コスト上限の通知を「段が変わった瞬間 1 度だけ」にする門番。
+    cost_gate: notify::EdgeGate,
     /// レート制限時のアカウント自動フェイルオーバー。**既定は無効**。
     /// 段 (検知→候補選定→切替→再開→検証) と履歴をここが持つ。
     failover: failover::Failover,
@@ -3330,6 +3355,14 @@ pub struct ZaivernApp {
     /// blame からクリックで開いたコミット差分タブのパース結果
     /// (バッファ id → ファイル差分)。毎フレーム parse_unified を回さないため。
     commit_diff_cache: HashMap<u64, Vec<crate::diff::FileDiff>>,
+    /// チェックポイント (エージェントへ指示を送る直前の作業ツリーの写し)。
+    /// git は全て裏のスレッドで走る。
+    checkpoints: checkpoint::Checkpoints,
+    /// 次の配達で取るチェックポイントの `(エージェント, 指示要約)`。
+    /// `queue_submit` は `egui::Context` を持たないので、ここへ predoc して
+    /// `submit_tick` (ctx を持つ) が実際の取得を仕込む。一斉送信で N 体ぶん
+    /// 積まれても**先頭の 1 件だけ**が残る = スナップショットは 1 回。
+    checkpoint_pending: Option<(String, String)>,
     /// ドラッグ中のエディタタブの添字 (ドラッグ並べ替え)。押していない間は None。
     tab_drag: Option<usize>,
     /// ⌃Tab を**押している間**だけ生きる MRU 切替。離すと確定して None に戻る。
@@ -3501,6 +3534,9 @@ pub struct ZaivernApp {
     /// アクティブバッファの診断キャッシュ (行→最悪 severity + **範囲付きの診断**)。
     /// 行だけでなく範囲を持つので、ガターの印と本文の波線が同じ源から出る。
     diag_cache: diagview::DiagCache,
+    /// アクティブバッファのインレイヒント (本文の char 添字へ写し済み)。
+    /// 組み直すのは中身が変わったフレームだけ (設計原則 3)。
+    inlay_cache: diagview::InlayCache,
     /// 対応括弧の強調キャッシュ: (本文ハッシュ, キャレット char, 塗る位置)。
     /// 位置は (char 添字, 相手がいるか)。キャレットが動かない限り本文を走査しない。
     bracket_hl: Option<(u64, usize, Vec<(usize, bool)>)>,
@@ -3834,6 +3870,10 @@ impl ZaivernApp {
             gitinfo: git::GitSet::new(roots.clone()),
             blame: git::Blame::default(),
             commit_diff_cache: HashMap::new(),
+            checkpoints: checkpoint::Checkpoints::new(
+                roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
+            ),
+            checkpoint_pending: None,
             tab_drag: None,
             git_panel: git_panel::GitPanel::new(
                 roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
@@ -4021,6 +4061,7 @@ impl ZaivernApp {
             last_scroll_y: 0.0,
             last_text_hash: 0,
             find_hits: None,
+            multibuffer_cursor: HashMap::new(),
             breadcrumb_symbols_asked: None,
             remote: None,
             remote_err: None,
@@ -4036,6 +4077,10 @@ impl ZaivernApp {
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             token_detail: false,
+            cost_alert: None,
+            cost_stamp: None,
+            cost_spent: (0.0, 0.0),
+            cost_gate: notify::EdgeGate::default(),
             failover: failover::Failover::new(cfg.failover.clone()),
             save_trim_trailing: cfg.trim_trailing_whitespace,
             save_trim_final_newlines: cfg.trim_final_newlines,
@@ -4075,6 +4120,7 @@ impl ZaivernApp {
             diag_counts: (0, 0),
             // 初期キーは番兵 (u64::MAX): 最初の refresh で必ず作り直す
             diag_cache: diagview::DiagCache::default(),
+            inlay_cache: diagview::InlayCache::default(),
             bracket_hl: None,
             diag_hover: None,
             plugin_panels: HashMap::new(),
@@ -4229,6 +4275,9 @@ impl ZaivernApp {
         // ブランチピッカーも新しいリポジトリへ。旧 repo の一覧が残っていると、
         // そこに無いブランチへの切り替えを発行できてしまう。
         self.branch_nav.set_repo(self.primary_root().to_path_buf());
+        // チェックポイントも新しいリポジトリへ。旧 repo の sha を握ったままだと
+        // 別リポジトリへ復元を撃ててしまう。
+        self.checkpoints.set_repo(self.primary_root().to_path_buf());
         // state.toml の UI 選択 (テーマ等) は維持したいので with_state = true
         self.cfg = config::load(&self.roots, true);
         self.tree.show_hidden = self.cfg.show_hidden_files;
@@ -5489,6 +5538,38 @@ impl ZaivernApp {
             .map(|i| self.editor.buffers[i].text.as_str())
             .unwrap_or("");
         self.diag_cache.refresh(diags, text, text_hash);
+    }
+
+    /// アクティブバッファのインレイヒントを要求し、`self.inlay_cache` へ写す。
+    ///
+    /// * 要求は **版が変わって、まだ同じ版の要求が飛んでいないとき**だけ 1 回。
+    ///   毎フレームは撃たない (設計原則 3)。
+    /// * 応答は受信スレッドが LSP 側のキャッシュへ入れて再描画を起こすので、
+    ///   ここは覗くだけ。**UI スレッドは一切待たない**。
+    /// * 応答待ちの間は前の版のヒントを消す — 打鍵でずれた型注釈を出し続けない。
+    fn refresh_inlay_hints(&mut self, text_hash: u64) {
+        if !self.cfg.inlay_hints {
+            self.inlay_cache.clear();
+            return;
+        }
+        let (Some((key, path)), Some(i)) = (self.active_lsp_target(), self.editor.active) else {
+            self.inlay_cache.clear();
+            return;
+        };
+        let Some(client) = self.lsp.get(&key) else {
+            self.inlay_cache.clear();
+            return;
+        };
+        let Some(hints) = client.inlay_hints(&path) else {
+            if !client.inlay_in_flight(&path) {
+                client.request_inlay_hints(&path, &self.editor.buffers[i].text);
+            }
+            self.inlay_cache.clear();
+            return;
+        };
+        // 借用は分離したフィールド同士 (inlay_cache / editor) なので複製は要らない
+        self.inlay_cache
+            .refresh(&hints, &self.editor.buffers[i].text, text_hash);
     }
 
     /// 次 / 前の診断へ飛ぶ (VS Code の F8 / ⇧F8)。端では巻き戻る。
@@ -6818,6 +6899,96 @@ impl ZaivernApp {
         }
         self.quota.set_running(by_bin);
         self.quota.refresh_if_stale();
+        self.cost_limit_tick();
+    }
+
+    /// コスト上限の判定を進める。
+    ///
+    /// **集計か上限の設定が変わったときだけ**計算し直す。推定コストは
+    /// エージェント × モデルぶんの掛け算なので、毎フレーム回すと
+    /// 「アイドル時のコストはゼロ」(設計原則 3) が崩れる。
+    /// 集計は [`coordinator::quota::TOKEN_TTL`] 間隔でしか更新されないので、
+    /// 実際に走るのは 2 分に 1 回と、設定を触った直後だけ。
+    fn cost_limit_tick(&mut self) {
+        let limits = self.cfg.cost_limits();
+        let stamp = (self.quota.applied(), limits);
+        if self.cost_stamp == Some(stamp) {
+            return;
+        }
+        self.cost_stamp = Some(stamp);
+        if !limits.any() {
+            // 上限が未設定 = 見張らない。表示も通知も残さない。
+            self.cost_alert = None;
+            self.cost_spent = (0.0, 0.0);
+            self.cost_gate.retain(&[]);
+            return;
+        }
+        let prices = &self.cfg.pricing;
+        let session = self.quota.cost_session(prices);
+        let today = self.quota.cost_today(prices);
+        self.cost_spent = (session, today);
+        self.cost_alert = limits.worst(session, today);
+        // 段が変わった瞬間だけ 1 度鳴らす (毎フレーム鳴らさない)。
+        let key = coordinator::quota::budget_edge_key(self.cost_alert.as_ref());
+        if !self.cost_gate.changed(Self::COST_GATE_ID, &key) || key.is_empty() {
+            return;
+        }
+        let Some(st) = self.cost_alert.clone() else {
+            return;
+        };
+        let body = self.cost_alert_message(&st);
+        let title = match st.state {
+            coordinator::quota::BudgetState::Over => tr("💸 コスト上限に達しました"),
+            _ => tr("💰 コスト上限に近づいています"),
+        };
+        // 画面 (トースト) と OS 通知の両方。レイアウトは動かさない。
+        match st.state {
+            coordinator::quota::BudgetState::Over => self.toast(body.clone(), false),
+            _ => self.toast_warn(body.clone()),
+        }
+        notify::notify(&title, &body);
+        if !self.cfg.webhook_url.trim().is_empty() {
+            notify::webhook(&self.cfg.webhook_url, &title, &body);
+        }
+    }
+
+    /// コスト上限の通知は 1 つしか無いので、門番の鍵も 1 つ固定で使う
+    /// ([`notify::EdgeGate`] はセッション ID で引く作りなので、
+    ///  セッションの ID 空間と衝突しない番号を使う)。
+    const COST_GATE_ID: u64 = u64::MAX;
+
+    /// 上限の状態を 1 行の日本語にする (通貨記号は設定から)。
+    fn cost_alert_message(&self, st: &coordinator::quota::BudgetStatus) -> String {
+        let amount = st.short_label(&self.cfg.pricing.currency);
+        let scope = st.kind.label();
+        match st.state {
+            coordinator::quota::BudgetState::Over => trf(
+                "{scope}の推定コストが上限に達しました ({amount})",
+                &[("scope", scope), ("amount", amount)],
+            ),
+            _ => trf(
+                "{scope}の推定コストが上限の {pct}% に達しました ({amount})",
+                &[
+                    ("scope", scope),
+                    ("pct", ((st.fraction() * 100.0).round() as i64).to_string()),
+                    ("amount", amount),
+                ],
+            ),
+        }
+    }
+
+    /// コスト上限で新規の送信を止めるべきなら、その理由を返す。
+    ///
+    /// **`stop` を選んでいて、かつ上限に達しているときだけ。** 既定の
+    /// `notify` では常に `None` = 何も止めない。判定そのものは
+    /// [`coordinator::quota::CostLimits::blocks`] が持つ (規則を二重に書かない)。
+    fn cost_block_reason(&self) -> Option<String> {
+        let (session, today) = self.cost_spent;
+        let blocked = self.cfg.cost_limits().blocks(session, today)?;
+        Some(trf(
+            "⛔ {reason} — 設定の「上限に達したときの動作」を notify に戻すか、上限を上げると送れます",
+            &[("reason", self.cost_alert_message(&blocked))],
+        ))
     }
 
     /// このセッションが「レート制限だ」と言える根拠のうち、いちばん上の段。
@@ -7753,7 +7924,10 @@ impl ZaivernApp {
             );
             return;
         };
-        self.queue_submit(submit::Job::user(id, text));
+        if !self.queue_submit(submit::Job::user(id, text)) {
+            // 積めなかった理由 (コスト上限など) は queue_submit が説明済み
+            return;
+        }
         self.agents.panel_open = true;
         self.toast(tr("アクティブなエージェントに送信しました"), true);
     }
@@ -7772,19 +7946,77 @@ impl ZaivernApp {
     // ══════════════════════════════════════════════════════════════════
 
     /// 指示 1 通を配達待ちへ積む。空文字と宛先不明は黙って捨てる。
-    fn queue_submit(&mut self, mut job: submit::Job) {
+    ///
+    /// **コスト上限で止まっているときはここで弾く。** 送信経路が 1 本なので、
+    /// 見張りもここ 1 か所で済む。**黙って捨てない** — なぜ送れないかを
+    /// トーストで説明する。
+    /// 戻りは「配達待ちへ積めたか」。呼び出し側は積めなかったときに
+    /// 「送信しました」と嘘をつかないこと。
+    fn queue_submit(&mut self, mut job: submit::Job) -> bool {
         if job.text.trim().is_empty() {
-            return;
+            return false;
+        }
+        if let Some(why) = self.cost_block_reason() {
+            self.toast(why, false);
+            return false;
         }
         let Some(s) = self.agents.sessions.iter().find(|s| s.id == job.session) else {
-            return;
+            return false;
         };
         job.title = s.title.clone();
+        // 送る**直前**の作業ツリーを 1 枚残す。承認キューは「通す前」しか
+        // 守れないので、通した後に暴走した変更を戻せる唯一の足場がこれ。
+        // 実際の取得は ctx を持つ `submit_tick` が仕込む。
+        if self.checkpoint_pending.is_none() {
+            self.checkpoint_pending =
+                Some((job.title.clone(), checkpoint::one_line(&job.text, 160)));
+        }
         self.outbox.push(submit::Pending::new(job, Instant::now()));
+        true
     }
 
     /// 起動中の全セッションへ同じ指示を積む (Cockpit の一斉送信)。宛先数を返す。
-    fn queue_submit_all(&mut self, text: &str) -> usize {
+    /// **止まっているセッションだけ**へ同じ本文を積む。届けた数を返す。
+    ///
+    /// 対象は「生きていて、かつ [`supervisor::SessionState::is_stuck`]」。
+    /// 状態が取れないセッション (起動直後で supervisor がまだ何も見ていない) は
+    /// **対象にしない** — 「分からないもの」を止まっている扱いにすると、
+    /// 立ち上がったばかりのエージェントへ横から指示が刺さる。
+    /// **`None` = コスト上限で止まっている** (理由はトーストで説明済み)。
+    /// 宛先ごとに 1 回ずつ理由を出すとうるさいので、ここで一度だけ弾く。
+    fn queue_submit_stalled(&mut self, text: &str) -> Option<usize> {
+        if let Some(why) = self.cost_block_reason() {
+            self.toast(why, false);
+            return None;
+        }
+        let ids: Vec<u64> = self.stalled_session_ids();
+        for id in &ids {
+            self.queue_submit(submit::Job::user(*id, text));
+        }
+        Some(ids.len())
+    }
+
+    /// 止まっているセッションの ID (起動順)。チップの件数表示と送信で共有する。
+    fn stalled_session_ids(&self) -> Vec<u64> {
+        self.agents
+            .sessions
+            .iter()
+            .filter(|s| s.running())
+            .filter(|s| {
+                self.supervisor
+                    .state_of(s.id)
+                    .is_some_and(|st| st.is_stuck())
+            })
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// **`None` = コスト上限で止まっている** (理由はトーストで説明済み)。
+    fn queue_submit_all(&mut self, text: &str) -> Option<usize> {
+        if let Some(why) = self.cost_block_reason() {
+            self.toast(why, false);
+            return None;
+        }
         let ids: Vec<u64> = self
             .agents
             .sessions
@@ -7795,7 +8027,7 @@ impl ZaivernApp {
         for id in &ids {
             self.queue_submit(submit::Job::user(*id, text));
         }
-        ids.len()
+        Some(ids.len())
     }
 
     /// 配達待ちを 1 フレームぶん進める。
@@ -7806,6 +8038,12 @@ impl ZaivernApp {
     fn submit_tick(&mut self, ctx: &egui::Context) {
         if self.outbox.is_empty() {
             return;
+        }
+        // 配達の**直前**に作業ツリーを 1 枚残す。`queue_submit` は
+        // `egui::Context` を持たないので、予約の消化はここで行う
+        // (この関数は配達を進める唯一の経路なので、取り漏らしが起きない)。
+        if let Some((agent, note)) = self.checkpoint_pending.take() {
+            self.checkpoints.capture_before_submit(&agent, &note, ctx);
         }
         let now = Instant::now();
         let mut next: Option<Duration> = None;
@@ -10741,6 +10979,10 @@ impl ZaivernApp {
             }
             Cmd::DiffNextChange => crate::diff::request_jump(ctx, 1),
             Cmd::DiffPrevChange => crate::diff::request_jump(ctx, -1),
+            // ⏱ チェックポイント (巻き戻し)。git は全て裏のスレッドで走るので、
+            // ここは要求を出すだけ。結果は `checkpoint_ui` が受ける。
+            Cmd::CheckpointList => self.checkpoints.open_list(ctx),
+            Cmd::CheckpointNow => self.checkpoints.capture_now(ctx),
             // `]f` / `[f`: **ファイル間**のジャンプ (並列レビューの単位)。
             // 依頼を ctx に置くだけ。消化するのはレビュー画面自身なので、
             // 画面が出ていなければ 1 フレームで腐って何も起きない。
@@ -10835,6 +11077,7 @@ impl ZaivernApp {
             | Cmd::NextProblem
             | Cmd::PrevProblem
             | Cmd::ToggleInlineDiagnostics
+            | Cmd::ToggleInlayHints
             | Cmd::ToggleFullScreen
             | Cmd::NavBack
             | Cmd::NavForward
@@ -10882,6 +11125,9 @@ impl ZaivernApp {
             | Cmd::GitPush
             | Cmd::GitPull
             | Cmd::GitHistory
+            | Cmd::OpenSearchMultibuffer
+            | Cmd::OpenProblemsMultibuffer
+            | Cmd::OpenChangesMultibuffer
             | Cmd::OpenFind
             | Cmd::NewAgent(_)
             | Cmd::FocusAgent(_)
@@ -11257,6 +11503,25 @@ impl ZaivernApp {
                 };
                 self.toast(msg, true);
             }
+            Cmd::ToggleInlayHints => {
+                self.cfg.inlay_hints = !self.cfg.inlay_hints;
+                let on = self.cfg.inlay_hints;
+                if !on {
+                    // 消したフレームで組み直しの材料も捨てる (残骸を出さない)
+                    self.inlay_cache.clear();
+                }
+                // 永続化しないのは隣の `ToggleInlineDiagnostics` と同じ判断:
+                // パレットの切替は「いまのセッションで一時的に消す/出す」ため。
+                // 恒久的に変えるときは設定画面 (editor グループ) から。
+                self.toast(
+                    tr(if on {
+                        "インレイヒント: ON"
+                    } else {
+                        "インレイヒント: OFF"
+                    }),
+                    true,
+                );
+            }
             Cmd::ToggleFullScreen => {
                 // 救出 (壊れた全画面から脱出) 中・枠復元の予約中は何も送らない。
                 // 遷移の最中に styleMask/zoom を重ねると AppKit が NSException を
@@ -11597,6 +11862,9 @@ impl ZaivernApp {
             Cmd::GitPush => self.run_git_job(GitJob::Push, ctx),
             Cmd::GitPull => self.run_git_job(GitJob::Pull, ctx),
             Cmd::GitHistory => self.open_git_history(ctx),
+            Cmd::OpenSearchMultibuffer => self.open_search_multibuffer(),
+            Cmd::OpenProblemsMultibuffer => self.open_problems_multibuffer(),
+            Cmd::OpenChangesMultibuffer => self.open_changes_multibuffer(),
             // 選択があればそれを検索語にする (VS Code と同じ)
             Cmd::OpenFind => self.open_find(ctx, false),
             Cmd::NewAgent(i) => self.launch_preset(i, ctx),
@@ -14432,6 +14700,9 @@ impl ZaivernApp {
         let token_badges = self.token_badges();
         let want_token_detail = self.token_detail;
         let mut toggle_token_detail = false;
+        // コスト上限。**上限を設定していなければ None = 1 ピクセルも出さない**。
+        let cost_badge = self.cost_badge();
+        let mut open_cost_settings = false;
         // Pro の解錠判定は license::is_pro **1 か所だけ**を通す。
         // 未ライセンス時は 1 ピクセルも出さない (常に何かを表示するバッジは作らない)。
         let pro_badge = license::is_pro(&self.license_status).then(|| match &self.license_status {
@@ -14618,6 +14889,24 @@ impl ZaivernApp {
                                 if r.on_hover_text(tip.clone()).clicked() {
                                     toggle_token_detail = true;
                                 }
+                            }
+                        }
+                    }
+
+                    // コスト上限。上限が未設定なら `cost_badge` が None なので
+                    // ここは丸ごと飛ぶ (常に 0 を出すバッジを作らない)。
+                    // 幅の判断はトークンバッジと同じ作法 — この後に右詰めの列
+                    // (テーマ / 行桁 / Pro …) が同じ行へ入るので、残り全部では
+                    // なく左側の取り分だけを予算にする (どの幅でも見切れない)。
+                    if let Some((text, tip, color)) = &cost_badge {
+                        let budget = ui.available_width() * TOKEN_BADGE_MAX_FRACTION;
+                        if budget >= badge_width_px(text) {
+                            let r = ui.add(
+                                egui::Label::new(RichText::new(text).size(11.5).color(*color))
+                                    .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text(tip.clone()).clicked() {
+                                open_cost_settings = true;
                             }
                         }
                     }
@@ -14850,6 +15139,11 @@ impl ZaivernApp {
         if toggle_token_detail {
             self.token_detail = !self.token_detail;
         }
+        if open_cost_settings {
+            // バッジから上限の編集へ 1 クリックで届くようにする
+            // (「なぜ止まっているのか」から「どこを直すのか」へ迷わせない)。
+            self.open_cost_settings();
+        }
         if let Some(le) = convert_eol {
             self.editor_op(ctx, EditOp::NormalizeEol(le));
         }
@@ -14967,6 +15261,55 @@ impl ZaivernApp {
             compact: (compact_text, compact_tip),
             detail,
         })
+    }
+
+    /// ステータスバーのコスト上限バッジ `(本文, ツールチップ, 色)`。
+    ///
+    /// **上限が 1 つも設定されていなければ `None`** — そのとき画面には
+    /// 1 ピクセルも出ない (常に 0 を表示するバッジを作らない)。
+    fn cost_badge(&self) -> Option<(String, String, egui::Color32)> {
+        use coordinator::quota::{BudgetState, LimitAction};
+        let st = self.cost_alert.as_ref()?;
+        let cur = &self.cfg.pricing.currency;
+        let (icon, color) = match st.state {
+            BudgetState::Over => ("⛔", self.theme.err),
+            BudgetState::Warn => ("⚠", self.theme.warn),
+            BudgetState::Normal => ("💰", self.theme.text_dim),
+        };
+        let text = format!("{icon} {}", st.short_label(cur));
+        let limits = self.cfg.cost_limits();
+        let (session, today) = self.cost_spent;
+        let mut tip = vec![
+            trf(
+                "コスト上限 — {scope} ({pct}%)",
+                &[
+                    ("scope", st.kind.label()),
+                    ("pct", ((st.fraction() * 100.0).round() as i64).to_string()),
+                ],
+            ),
+            // 設定してある上限だけを並べる (未設定の行は出さない)。
+            // 「今の消費」は 2 つとも出す — どちらで引っかかったのかが分かる。
+        ];
+        for s in limits.evaluate(session, today) {
+            tip.push(format!("  {} {}", s.kind.label(), s.short_label(cur)));
+        }
+        tip.push(tr(
+            "金額は推定です (単価は設定 [pricing] から。通信はしません)",
+        ));
+        if limits.action == LimitAction::Stop {
+            tip.push(tr("上限に達している間は新規の送信を止めます (設定: stop)"));
+        }
+        tip.push(tr("押すと上限の設定を開きます"));
+        Some((text, tip.join("\n"), color))
+    }
+
+    /// コスト上限の設定を開く (設定ウィンドウを「コスト」で絞った状態)。
+    fn open_cost_settings(&mut self) {
+        self.settings_open = true;
+        self.settings_ui.only_modified = false;
+        // 絞り込み語はキー名の共通接頭辞から作る — 画面のラベル
+        // (翻訳で変わる) をベタ書きしない。
+        self.settings_ui.query = "cost_".into();
     }
 
     fn quota_status(&self) -> (Option<u8>, String) {
@@ -15306,6 +15649,9 @@ impl ZaivernApp {
         }
         if let Some((path, line)) = gsearch_jump {
             self.jump_to_lsp_pos(&path, line, 0);
+        }
+        if std::mem::take(&mut self.gsearch.open_multi) {
+            self.open_search_multibuffer();
         }
         if let Some(ev) = gsearch_replace {
             self.advance_replace(ev);
@@ -16952,6 +17298,9 @@ impl ZaivernApp {
             .map(|s| s.id)
             .zip(panels::disambiguate_labels(&names))
             .collect();
+        // 「⏸ 停止中」チップの件数。`&mut self.agent_input_buf` を借りる前に
+        // 数え終えておく (借用が重なるため)。
+        let stalled = self.stalled_session_ids().len();
         // ヘッダー行に埋め込めたか。埋め込めなかった分だけ下に別行で出す。
         let mut inline_done = false;
         let mut composer = panels::ComposerAction::None;
@@ -17047,6 +17396,24 @@ impl ZaivernApp {
                 {
                     acts.cycle_all = true;
                 }
+                // 巻き戻し。承認キューを通した**後**に暴走した変更を戻す唯一の
+                // 足場なので、Cockpit から 1 打で開けるようにする。件数は
+                // 一覧を開くまで数えないため、0 のときは数字を出さない。
+                let cp_n = self.checkpoints.count();
+                let cp_label = match (compact, cp_n) {
+                    (true, _) => "⏱".to_string(),
+                    (false, 0) => tr("⏱ 巻き戻し"),
+                    (false, n) => trf("⏱ 巻き戻し ({n})", &[("n", n.to_string())]),
+                };
+                if ui
+                    .button(RichText::new(cp_label).color(theme.text_dim))
+                    .on_hover_text(tr(
+                        "指示を送る直前の作業ツリーを記録しています。選んだ時点へ戻せます (後から作られたファイルは消しません)",
+                    ))
+                    .clicked()
+                {
+                    acts.checkpoints = true;
+                }
                 ui.menu_button(if compact { "＋" } else { "＋ Agent" }, |ui| {
                     for (i, p) in self.cfg.agents.iter().enumerate() {
                         if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
@@ -17109,7 +17476,7 @@ impl ZaivernApp {
         // 宛先チップは出す** — 「複数起動したのに横に並んで選べない」を潰す。
         // 1 体以下なら選ぶ余地がないので 1 行も使わない。
         if inline_done && targets.len() >= 2 {
-            panels::composer_target_chips(ui, theme, &mut self.agent_input_buf, &targets);
+            panels::composer_target_chips(ui, theme, &mut self.agent_input_buf, &targets, stalled);
         }
 
         if !inline_done {
@@ -17120,6 +17487,7 @@ impl ZaivernApp {
                     &mut self.agent_input_buf,
                     target.as_ref().map(|(id, t)| (*id, t.as_str())),
                     &targets,
+                    stalled,
                     &mut expand,
                 )
             } else {
@@ -17136,6 +17504,7 @@ impl ZaivernApp {
         ui.memory_mut(|m| m.data.insert_temp(expand_id, expand));
         match composer {
             panels::ComposerAction::Send(t) => acts.broadcast = Some(t),
+            panels::ComposerAction::SendStalled(t) => acts.broadcast_stalled = Some(t),
             panels::ComposerAction::SendTo(id, t) => acts.send_to = Some((id, t)),
             panels::ComposerAction::Cancel => {
                 // 入力欄からフォーカスを外すだけ (下書きは消さない)。
@@ -18037,14 +18406,30 @@ impl ZaivernApp {
         mut orch_acts: Vec<orchestration::OrchAction>,
     ) {
         if let Some(text) = acts.broadcast {
-            let n = self.queue_submit_all(&text);
-            if n == 0 {
-                self.toast(tr("実行中のエージェントがありません"), false);
-            } else {
-                self.toast(
+            // None はコスト上限で止めたとき。理由は送信側が説明済みなので
+            // 「宛先がいない」と嘘を重ねない。
+            match self.queue_submit_all(&text) {
+                None => {}
+                Some(0) => self.toast(tr("実行中のエージェントがありません"), false),
+                Some(n) => self.toast(
                     trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
                     true,
-                );
+                ),
+            }
+        }
+        // 止まっているものだけへの一斉送信。作業中は巻き込まないので、
+        // 「全員へ送ると進行中の作業まで分断される」を避けられる。
+        if let Some(text) = acts.broadcast_stalled {
+            match self.queue_submit_stalled(&text) {
+                None => {}
+                Some(0) => self.toast(tr("止まっているエージェントはありません"), false),
+                Some(n) => self.toast(
+                    trf(
+                        "⏸ 止まっている {n} セッションへ送信しました",
+                        &[("n", n.to_string())],
+                    ),
+                    true,
+                ),
             }
         }
         // 宛先を指名した送信は**その 1 体だけ**へ届ける (broadcast は通らない)
@@ -18057,8 +18442,9 @@ impl ZaivernApp {
                 .map(|s| (s.running(), s.title.clone()));
             match live {
                 Some((true, title)) => {
-                    self.queue_submit(submit::Job::user(id, text));
-                    self.toast(trf("✏ 送信: {title}", &[("title", title)]), true);
+                    if self.queue_submit(submit::Job::user(id, text)) {
+                        self.toast(trf("✏ 送信: {title}", &[("title", title)]), true);
+                    }
                 }
                 Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
                 None => self.toast(tr("宛先のセッションが見つかりません"), false),
@@ -18075,6 +18461,9 @@ impl ZaivernApp {
         }
         if acts.cycle_all {
             self.apply_cmd(Cmd::CyclePermissionAll, ctx);
+        }
+        if acts.checkpoints {
+            self.apply_cmd(Cmd::CheckpointList, ctx);
         }
         if let Some(i) = acts.cycle {
             match self.agents.cycle_permission(i) {
@@ -18382,24 +18771,23 @@ impl ZaivernApp {
                         .map(|s| (s.id, s.running(), s.title.clone()));
                     match live {
                         Some((id, true, title)) => {
-                            self.queue_submit(submit::Job::user(id, text));
-                            self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true);
+                            if self.queue_submit(submit::Job::user(id, text)) {
+                                self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true);
+                            }
                         }
                         Some((_, false, _)) => self.toast(tr("セッションが終了しています"), false),
                         None => {}
                     }
                 }
-                kanban::KanbanAction::Broadcast(text) => {
-                    let n = self.queue_submit_all(&text);
-                    if n == 0 {
-                        self.toast(tr("実行中のエージェントがありません"), false);
-                    } else {
-                        self.toast(
-                            trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
-                            true,
-                        );
-                    }
-                }
+                kanban::KanbanAction::Broadcast(text) => match self.queue_submit_all(&text) {
+                    // None はコスト上限で止めたとき (理由は送信側が説明済み)
+                    None => {}
+                    Some(0) => self.toast(tr("実行中のエージェントがありません"), false),
+                    Some(n) => self.toast(
+                        trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
+                        true,
+                    ),
+                },
                 kanban::KanbanAction::OpenCockpit => {
                     self.cockpit = true;
                     self.kanban = false;
@@ -18681,6 +19069,68 @@ impl ZaivernApp {
             return;
         };
         self.open_commit_diff_at(&top, sha);
+    }
+
+    /// チェックポイント一覧を描き、裏のスレッドから返ってきた結果を捌く。
+    ///
+    /// **アイドル時のコストはゼロ** — 一覧を閉じていれば `ui` は即 return し、
+    /// 走行中の仕事が無ければ `poll` も即 return する (再描画も要求しない)。
+    fn checkpoint_ui(&mut self, ctx: &egui::Context) {
+        self.checkpoints.ui(ctx);
+        let Some(done) = self.checkpoints.poll() else {
+            return;
+        };
+        match done {
+            // 指示のたびの自動取得は黙って済ませる (通知が溢れると読まれない)。
+            checkpoint::Done::Captured { cp, announce } => {
+                if announce {
+                    self.toast(
+                        trf(
+                            "⏱ チェックポイントを取りました ({sha})",
+                            &[("sha", cp.sha.chars().take(8).collect::<String>())],
+                        ),
+                        true,
+                    );
+                }
+            }
+            checkpoint::Done::Skipped { announce } => {
+                if announce {
+                    self.toast(tr("前回から変更がないので取りませんでした"), true);
+                }
+            }
+            checkpoint::Done::Listed(_) => {}
+            checkpoint::Done::Restored { restored, kept } => {
+                self.toast(
+                    trf(
+                        "⏱ {n} 件を書き戻しました (スナップショットに無かった {k} 件はそのまま)",
+                        &[("n", restored.to_string()), ("k", kept.to_string())],
+                    ),
+                    true,
+                );
+                // 作業ツリーが変わったので、git の色付けと開いているファイルを
+                // 取り直す (裏のスキャンへ依頼するだけ。ここでは待たない)。
+                self.gitinfo.request_refresh();
+                // 開いているタブは既存の外部変更ウォッチャ
+                // (`check_external_changes` → `Editor::check_external`) が
+                // 読み直す。スロットルを開けて次のティックで必ず拾わせる。
+                self.ext_check_at = None;
+            }
+            checkpoint::Done::Diff(label, text) => {
+                if text.trim().is_empty() {
+                    self.toast(tr("このチェックポイントと今との差分はありません"), true);
+                    return;
+                }
+                let title = trf("⏱ チェックポイント {sha}", &[("sha", label)]);
+                let id = self.editor.open_virtual(
+                    title,
+                    text,
+                    crate::editor::BufferKind::CheckpointDiff,
+                );
+                // 同じタブを使い回すので古いパース結果は捨てる。
+                self.commit_diff_cache.remove(&id);
+            }
+            checkpoint::Done::Failed(e) => self.toast(e, false),
+        }
     }
 
     /// リポジトリを明示して開く版。Git パネルの履歴一覧とパレットの
@@ -19590,7 +20040,10 @@ impl ZaivernApp {
                 return;
             }
             // コミット差分タブ (blame のガターから開く) も読み取り専用の専用ビュー
-            if self.editor.buffers[i].kind == crate::editor::BufferKind::CommitDiff {
+            if matches!(
+                self.editor.buffers[i].kind,
+                crate::editor::BufferKind::CommitDiff | crate::editor::BufferKind::CheckpointDiff
+            ) {
                 let b = &self.editor.buffers[i];
                 let (id, title, text) = (b.id, b.title.clone(), b.text.clone());
                 let cache = &mut self.commit_diff_cache;
@@ -20653,6 +21106,7 @@ impl ZaivernApp {
             Some(PreviewTag::Hex) => self.hex_viewer_ui(ui, i),
             Some(PreviewTag::Media) => self.media_card_ui(ui, i),
             Some(PreviewTag::Archive) => self.archive_list_ui(ui, i),
+            Some(PreviewTag::Multi) => self.multibuffer_ui(ui, i),
             // 読み取り自体に失敗した (権限・削除・IO エラー)。
             // 空の TextEdit を出すより「開けなかった」と言い切る。
             None => {
@@ -20993,6 +21447,275 @@ impl ZaivernApp {
             });
     }
 
+    /// マルチバッファ (複数ファイルの抜粋を 1 本の面に並べた索引タブ)。
+    ///
+    /// 行は**見えている分だけ**組み立てる (`show_rows`)。ワークスペース全体の
+    /// 検索ヒット数百件でも、開いた瞬間にフレームが伸びない。
+    ///
+    /// 高さは全行で同じ (見出しも本文も注記も 1 行) なので `show_rows` の
+    /// 前提 (等高) を満たす。ここを崩すとスクロール位置が飛ぶ。
+    fn multibuffer_ui(&mut self, ui: &mut egui::Ui, i: usize) {
+        use crate::multibuffer::{self as mbuf, Row};
+        let theme = self.theme.clone();
+        let ppp = ui.ctx().pixels_per_point();
+        let font = FontId::monospace(crate::theme::snap_font_size(self.scaled_editor_font(), ppp));
+        let row_h = ui
+            .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
+            .max(1.0 / ppp);
+        let id = self.editor.buffers[i].id;
+        let Some(crate::preview::PreviewDoc::Multi(mb)) = self.editor.buffers[i].preview.as_ref()
+        else {
+            return;
+        };
+        // 借用を握ったまま &mut self を呼べないので、押された操作は記録だけする
+        let rows = mbuf::rows(mb);
+        let mut toggle: Option<usize> = None;
+        let mut open: Option<(PathBuf, usize)> = None;
+        let mut collapse_all: Option<bool> = None;
+        let mut step: Option<bool> = None;
+
+        // ── 見出し行 ──────────────────────────────────────────────
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(trf(
+                    "{icon} {n} 件 · {files} ファイル",
+                    &[
+                        ("icon", mb.source.icon().to_string()),
+                        ("n", mb.focus_count().to_string()),
+                        (
+                            "files",
+                            mb.excerpts
+                                .iter()
+                                .map(|e| e.label.as_str())
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .len()
+                                .to_string(),
+                        ),
+                    ],
+                ))
+                .color(theme.text_dim)
+                .small(),
+            );
+            if !mb.subtitle.is_empty() {
+                ui.label(
+                    RichText::new(format!("“{}”", mb.subtitle))
+                        .color(theme.accent)
+                        .small(),
+                );
+            }
+            if mb.dropped > 0 {
+                ui.label(
+                    RichText::new(trf(
+                        "⚠ {n} 件は表示していません",
+                        &[("n", mb.dropped.to_string())],
+                    ))
+                    .color(theme.warn)
+                    .small(),
+                )
+                .on_hover_text(tr("抜粋の上限に達しました。条件を絞ってください。"));
+            }
+            if mb.unreadable > 0 {
+                ui.label(
+                    RichText::new(trf(
+                        "⚠ {n} ファイルは読めませんでした",
+                        &[("n", mb.unreadable.to_string())],
+                    ))
+                    .color(theme.warn)
+                    .small(),
+                );
+            }
+            // ボタン列は右端へ寄せる。狭いときも折り返しで見切れない。
+            let expanded = mb.any_expanded();
+            if ui
+                .button(if expanded { "⊟" } else { "⊞" })
+                .on_hover_text(if expanded {
+                    tr("すべて畳む")
+                } else {
+                    tr("すべて開く")
+                })
+                .clicked()
+            {
+                collapse_all = Some(expanded);
+            }
+            if ui.button("↑").on_hover_text(tr("前の一致へ")).clicked() {
+                step = Some(false);
+            }
+            if ui.button("↓").on_hover_text(tr("次の一致へ")).clicked() {
+                step = Some(true);
+            }
+        });
+        ui.separator();
+
+        if mb.is_empty() {
+            // 空状態は利用可能領域の**中央**に 1 枚で出す (下に取り残さない)
+            let dim = theme.text_dim;
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new(tr("表示するものがありません")).color(dim));
+            });
+            return;
+        }
+
+        // ── 本体 ─────────────────────────────────────────────────
+        let cursor = self.multibuffer_cursor.get(&id).copied().unwrap_or(0);
+        let mut scroll_to: Option<usize> = None;
+        if let Some(fwd) = step {
+            if let Some(next) = mbuf::step_focus(&rows, mb, cursor, fwd) {
+                scroll_to = Some(next);
+            }
+        }
+        let gutter_w = ui.fonts(|f| f.glyph_width(&font, '0')) * 6.0;
+        egui::ScrollArea::vertical()
+            .id_salt(("zv-multibuffer", id))
+            .auto_shrink(false)
+            .show_rows(ui, row_h, rows.len(), |ui, range| {
+                for r in range {
+                    let Some(&row) = rows.get(r) else { continue };
+                    let Some(e) = mb.excerpts.get(row.excerpt()) else {
+                        continue;
+                    };
+                    let w = ui.available_width();
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(w, row_h), egui::Sense::click());
+                    if scroll_to == Some(r) {
+                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    }
+                    if !ui.is_rect_visible(rect) {
+                        continue;
+                    }
+                    let painter = ui.painter_at(rect);
+                    match row {
+                        Row::Header { ex } => {
+                            painter.rect_filled(rect, 0.0, theme.panel_alt);
+                            let mark = if e.collapsed { "▸" } else { "▾" };
+                            let title =
+                                format!("{mark} {}  {}–{}", e.label, e.first_line, e.last_line());
+                            // 見出しの色は**そのファイルで最も重い深刻度**。
+                            // 畳んだままでも「どのファイルが赤いか」が読める。
+                            let col = match e.worst_severity() {
+                                Some(1) => theme.err,
+                                Some(2) => theme.warn,
+                                _ => theme.accent,
+                            };
+                            let g =
+                                truncated_galley(ui, &title, font.clone(), col, (w - 8.0).max(1.0));
+                            painter.galley(
+                                rect.left_top() + egui::vec2(4.0, (row_h - g.size().y) * 0.5),
+                                g,
+                                col,
+                            );
+                            if resp.clicked() {
+                                toggle = Some(ex);
+                            }
+                            if resp.double_clicked() {
+                                open = mbuf::target_of(&rows, mb, r);
+                            }
+                            // 畳んでいる間は中身が見えないので、最初の一致行を
+                            // ホバーに出す (開かずに当たりを付けられる)
+                            let peek = e
+                                .focus
+                                .first()
+                                .and_then(|&l| e.line_text(l))
+                                .map(|t| format!("\n{}: {}", e.focus[0], t.trim()))
+                                .unwrap_or_default();
+                            resp.on_hover_text(trf(
+                                "{path} · クリックで開閉 / ダブルクリックで開く{peek}",
+                                &[
+                                    ("path", e.path.to_string_lossy().into_owned()),
+                                    ("peek", peek),
+                                ],
+                            ));
+                        }
+                        Row::Line { idx, .. } => {
+                            let line_no = e.first_line + idx;
+                            let focused = e.focus.binary_search(&line_no).is_ok();
+                            if focused {
+                                painter.rect_filled(rect, 0.0, theme.accent_soft);
+                            } else if resp.hovered() {
+                                painter.rect_filled(rect, 0.0, theme.panel);
+                            }
+                            let text = e.lines.get(idx).map(|s| s.as_str()).unwrap_or("");
+                            let marks: Vec<(usize, usize)> = e
+                                .marks
+                                .iter()
+                                .filter(|m| m.line == line_no)
+                                .map(|m| (m.start, m.end))
+                                .collect();
+                            let job = search_row_job(&theme, line_no, text, &marks, font.clone());
+                            let g = wrap_job_to_one_row(ui, job, (w - 8.0).max(1.0));
+                            painter.galley(
+                                rect.left_top() + egui::vec2(4.0, (row_h - g.size().y) * 0.5),
+                                g,
+                                theme.text,
+                            );
+                            if resp.clicked() {
+                                open = mbuf::target_of(&rows, mb, r);
+                            }
+                        }
+                        Row::Note { note, .. } => {
+                            let Some(n) = e.notes.get(note) else { continue };
+                            let col = match n.severity {
+                                1 => theme.err,
+                                2 => theme.warn,
+                                0 => theme.text_dim,
+                                _ => theme.accent,
+                            };
+                            let g = truncated_galley(
+                                ui,
+                                &format!("↳ {}", n.text),
+                                font.clone(),
+                                col,
+                                (w - gutter_w - 8.0).max(1.0),
+                            );
+                            painter.galley(
+                                rect.left_top() + egui::vec2(gutter_w, (row_h - g.size().y) * 0.5),
+                                g,
+                                col,
+                            );
+                            if resp.clicked() {
+                                open = mbuf::target_of(&rows, mb, r);
+                            }
+                            resp.on_hover_text(&n.text);
+                        }
+                        Row::Separator { .. } => {
+                            let y = rect.center().y;
+                            painter.hline(
+                                rect.x_range(),
+                                y,
+                                egui::Stroke::new(1.0_f32, theme.border),
+                            );
+                        }
+                    }
+                }
+            });
+
+        // ── 記録した操作を反映 (借用が切れてから) ───────────────────
+        if let Some(next) = scroll_to {
+            self.multibuffer_cursor.insert(id, next);
+        }
+        if let Some(collapsed) = collapse_all {
+            if let Some(crate::preview::PreviewDoc::Multi(mb)) =
+                self.editor.buffers[i].preview.as_mut()
+            {
+                mb.set_all_collapsed(collapsed);
+            }
+            self.multibuffer_cursor.insert(id, 0);
+        }
+        if let Some(ex) = toggle {
+            if let Some(crate::preview::PreviewDoc::Multi(mb)) =
+                self.editor.buffers[i].preview.as_mut()
+            {
+                if let Some(e) = mb.excerpts.get_mut(ex) {
+                    e.collapsed = !e.collapsed;
+                }
+            }
+            self.multibuffer_cursor.insert(id, 0);
+        }
+        if let Some((path, line)) = open {
+            // multibuffer は 1-based、jump_to_lsp_pos は 0-based
+            self.jump_to_lsp_pos(&path, line.saturating_sub(1), 0);
+        }
+    }
+
     fn code_editor_ui(&mut self, ui: &mut egui::Ui) {
         let Some(active) = self.editor.active else {
             return;
@@ -21108,6 +21831,7 @@ impl ZaivernApp {
             self.ensure_lsp(&ctx, &p, &lang_clone, active);
         }
         self.refresh_active_diagnostics(text_hash);
+        self.refresh_inlay_hints(text_hash);
         self.diag_counts = (self.diag_cache.errors, self.diag_cache.warnings);
         // diag_cache の借用は、可変借用が要る第 2 次配線の準備が済んでから取る
         // (この束縛を上げると self を可変に触れなくなる)。
@@ -21645,6 +22369,18 @@ impl ZaivernApp {
         ];
         // 行末の診断メッセージ (Error Lens 相当)。既定オン・カーソル行だけ。
         let inline_diag_on = self.cfg.inline_diagnostics && !folding;
+        // インレイヒント (型・引数名)。既定オフ・可視行すべて。
+        // 折りたたみ中は char 添字がずれるので出さない (波線と同じ判断)。
+        let inlay_views = if self.cfg.inlay_hints && !folding {
+            std::sync::Arc::clone(&self.inlay_cache.views)
+        } else {
+            std::sync::Arc::new(Vec::new())
+        };
+        // 種別 → 色 (0/1 = 型ほか, 2 = 引数名)。テーマ経由でしか取らない。
+        let inlay_colors: [Color32; 2] = [
+            diagview::inlay_color(&self.theme, lsp::INLAY_KIND_TYPE),
+            diagview::inlay_color(&self.theme, lsp::INLAY_KIND_PARAMETER),
+        ];
         // 波線を引く範囲と、行末メッセージに使う診断そのもの。
         // 折りたたみ中は char 添字がずれるので波線は出さない (ガターの印は残る)。
         let empty_spans: Vec<diagview::DiagSpan> = Vec::new();
@@ -21968,6 +22704,11 @@ impl ZaivernApp {
                     }
                 }
 
+                // 表示行 → 「インレイヒントを描き終えた x」。行末の診断メッセージが
+                // 同じ行に出るとき、そこから書き始めて重なりを避けるために使う。
+                // ヒントが 1 件も無ければ確保しない (空の HashMap は割り当てゼロ)。
+                let mut inlay_row_end: HashMap<usize, f32> = HashMap::new();
+
                 // 診断の波線。深刻度の低い順に並んでいるので、重なった場所は
                 // 後に塗る error が上に残る。可視域の外は座標だけ作って捨てる
                 // のも惜しいので、行ごとに clip_rect で先に落とす。
@@ -22020,6 +22761,80 @@ impl ZaivernApp {
                                 ui.painter()
                                     .add(egui::Shape::line(pts, egui::Stroke::new(1.0_f32, color)));
                             }
+                        }
+                    }
+                }
+
+                // ── インレイヒント (型・引数名) ───────────────────────
+                //
+                // **本文の galley には一切触らない。** ヒントを本文へ混ぜたり
+                // レイアウタで足したりすると galley の char 添字が原文とずれ、
+                // キャレット・選択・クリック位置が全部壊れる。かといって挿入
+                // 位置へ重ね描きすると右隣のコードを覆う。そこで
+                // **行末のマージンへまとめて出し、挿入位置には短い縦の目印**
+                // だけを打つ (どのヒントが行のどこに属すかは目印の x で読める)。
+                // 判断そのものは diagview::inlay_line_text 側に書いてある。
+                if !inlay_views.is_empty() && char_w > 0.0 {
+                    let clip = ui.clip_rect();
+                    let last_row = output.galley.rows.len().saturating_sub(1);
+                    let mut done_line = usize::MAX;
+                    for v in inlay_views.iter() {
+                        if v.line == done_line {
+                            continue; // 行あたり 1 回 (行末へまとめて出すため)
+                        }
+                        done_line = v.line;
+                        let anchor = output.galley.from_ccursor(egui::text::CCursor::new(v.at));
+                        let row = anchor.rcursor.row.min(last_row);
+                        let Some(r) = output.galley.rows.get(row) else {
+                            continue;
+                        };
+                        let y = output.galley_pos.y + r.rect.center().y;
+                        if y < clip.top() - row_h || y > clip.bottom() + row_h {
+                            continue; // 画面外の行は組み立てすらしない
+                        }
+                        // 行末 + 2 桁ぶんから書き始め、残り幅に収まる文字数で畳む
+                        let x = output.galley_pos.x + r.rect.max.x + char_w * 2.0;
+                        let max_chars = (((clip.right() - x) / char_w).floor()).max(0.0) as usize;
+                        let Some(text) = diagview::inlay_line_text(&inlay_views, v.line, max_chars)
+                        else {
+                            continue;
+                        };
+                        // 行末にまとめた 1 行の色は先頭のヒントの種別で決める
+                        // (1 行の中で色を混ぜると、まとまりが読み取れなくなる)。
+                        let color = inlay_colors[(v.kind == lsp::INLAY_KIND_PARAMETER) as usize];
+                        let painted = ui.painter().text(
+                            egui::pos2(
+                                crate::theme::snap_len(x, ppp),
+                                crate::theme::snap_len(y, ppp),
+                            ),
+                            Align2::LEFT_CENTER,
+                            text,
+                            font.clone(),
+                            color.gamma_multiply(0.75),
+                        );
+                        // 同じ行に行末診断も出るときは、その先へ押し出す
+                        // (2 つの文章が重なって読めなくなるのを防ぐ)
+                        inlay_row_end.insert(row, painted.max.x + char_w * 2.0);
+                        // 挿入位置の目印: 行の下端に短い縦線。キャレットと
+                        // 見間違えないよう行高の 1/4 だけにする。
+                        for (at, kind) in diagview::inlay_marks(&inlay_views, v.line) {
+                            let c = output.galley.from_ccursor(egui::text::CCursor::new(at));
+                            if c.rcursor.row.min(last_row) != row {
+                                continue;
+                            }
+                            // 目印だけは 1 件ずつの種別で塗る (型と引数名を見分ける)
+                            let mc = inlay_colors[(kind == lsp::INLAY_KIND_PARAMETER) as usize];
+                            let q = output.galley.pos_from_cursor(&c);
+                            let mx = crate::theme::snap_len(output.galley_pos.x + q.min.x, ppp);
+                            if mx < clip.left() || mx > clip.right() {
+                                continue;
+                            }
+                            let bottom = output.galley_pos.y + r.rect.max.y;
+                            ui.painter().vline(
+                                mx,
+                                egui::Rangef::new(bottom - r.rect.height() * 0.25, bottom),
+                                egui::Stroke::new(1.0_f32, mc.gamma_multiply(0.55)),
+                            );
                         }
                     }
                 }
@@ -22100,7 +22915,11 @@ impl ZaivernApp {
                             .row;
                         if let Some(r) = output.galley.rows.get(row) {
                             let clip = ui.clip_rect();
-                            let x = output.galley_pos.x + r.rect.max.x + char_w * 2.0;
+                            // インレイヒントが同じ行に出ているならその先から書く
+                            let x = inlay_row_end
+                                .get(&row)
+                                .copied()
+                                .unwrap_or(output.galley_pos.x + r.rect.max.x + char_w * 2.0);
                             // 残り幅に収まる文字数までしか出さない (行が見切れない)
                             let max_chars =
                                 (((clip.right() - x) / char_w).floor()).max(0.0) as usize;
@@ -22858,6 +23677,18 @@ impl ZaivernApp {
                 Cmd::ToggleTerminal,
             ),
             (
+                "⏱".into(),
+                tr("チェックポイント: 一覧"),
+                String::new(),
+                Cmd::CheckpointList,
+            ),
+            (
+                "⏱".into(),
+                tr("チェックポイント: 今すぐ取る"),
+                String::new(),
+                Cmd::CheckpointNow,
+            ),
+            (
                 "🎛".into(),
                 tr("Cockpit 切替"),
                 fmt_key(BindAction::ToggleCockpit),
@@ -23042,6 +23873,24 @@ impl ZaivernApp {
                 tr("Git: コミット履歴"),
                 String::new(),
                 Cmd::GitHistory,
+            ),
+            (
+                "±".into(),
+                tr("マルチバッファ: 未コミットの変更をまとめて読む"),
+                String::new(),
+                Cmd::OpenChangesMultibuffer,
+            ),
+            (
+                "🔎".into(),
+                tr("マルチバッファ: 検索結果をまとめて読む"),
+                String::new(),
+                Cmd::OpenSearchMultibuffer,
+            ),
+            (
+                "⚠".into(),
+                tr("マルチバッファ: 問題をまとめて読む"),
+                String::new(),
+                Cmd::OpenProblemsMultibuffer,
             ),
             (
                 "👾".into(),
@@ -23361,6 +24210,12 @@ impl ZaivernApp {
                 tr("行末の診断メッセージ切替"),
                 String::new(),
                 Cmd::ToggleInlineDiagnostics,
+            ),
+            (
+                "🏷".into(),
+                tr("インラインヒントの表示切替"),
+                String::new(),
+                Cmd::ToggleInlayHints,
             ),
             // ── 第 2 次配線: レビュー / 折りたたみ / ブックマーク / 表 / LSP ──
             (
@@ -28450,6 +29305,7 @@ impl ZaivernApp {
         self.stop_confirm_ui(ctx);
         self.stop_all_confirm_ui(ctx);
         self.worktree_confirm_ui(ctx);
+        self.checkpoint_ui(ctx);
         self.remote_window(ctx);
         self.voice_hud(ctx);
         self.toasts_ui(ctx);
@@ -28919,6 +29775,87 @@ mod work_phase_tests {
         assert!(!g.note(1, work_phase(true, None)));
         // 最初の観測がいきなり待機でも鳴らない
         assert!(!g.note(1, work_phase(true, Some(S::Idle))));
+    }
+}
+
+/// コスト上限の配線 (ソース構造の回帰テスト)。
+///
+/// 判定そのものは `coordinator::quota` の純粋関数がテーブルテストで押さえて
+/// いる。ここは **app.rs がその門を通っていること**だけを固定する
+/// (egui の描画は headless で目視できないので、配線が消えたことを検出する)。
+#[cfg(test)]
+mod cost_limit_wiring_tests {
+    fn src() -> String {
+        include_str!("app.rs").replace("\r\n", "\n")
+    }
+
+    /// 関数 1 本ぶんの本文を、次の同じインデントの `fn ` まで切り出す。
+    fn body_of(sig: &str) -> String {
+        let after = src()
+            .split(sig)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{sig} が無い"))
+            .to_string();
+        match after.find("\n    fn ") {
+            Some(i) => after[..i].to_string(),
+            None => after.chars().take(4000).collect(),
+        }
+    }
+
+    /// 送信経路は 1 本なので、見張りもそこ 1 か所で足りる。
+    #[test]
+    fn 送信経路はコスト上限の門を通る() {
+        for sig in [
+            "fn queue_submit(&mut self, mut job: submit::Job) -> bool {",
+            "fn queue_submit_all(&mut self, text: &str) -> Option<usize> {",
+            "fn queue_submit_stalled(&mut self, text: &str) -> Option<usize> {",
+        ] {
+            let body = body_of(sig);
+            assert!(
+                body.contains("self.cost_block_reason()"),
+                "{sig} がコスト上限の門を通っていない"
+            );
+        }
+    }
+
+    /// **黙って無視しない** — 止めたときは必ず理由を画面へ出す。
+    #[test]
+    fn 止めた理由を必ず画面に出す() {
+        let body = body_of("fn queue_submit(&mut self, mut job: submit::Job) -> bool {");
+        assert!(
+            body.contains("if let Some(why) = self.cost_block_reason() {")
+                && body.contains("self.toast(why, false);"),
+            "止めた理由をトーストで出していない"
+        );
+    }
+
+    /// 上限を設定していないときは 1 ピクセルも出さない。
+    #[test]
+    fn 上限が未設定ならバッジを作らない() {
+        let body = body_of("fn cost_badge(&self) -> Option<(String, String, egui::Color32)> {");
+        assert!(
+            body.contains("let st = self.cost_alert.as_ref()?;"),
+            "判定が無いときに None を返す門が消えた (常に 0 を出すバッジになる)"
+        );
+        let tick = body_of("fn cost_limit_tick(&mut self) {");
+        assert!(
+            tick.contains("if !limits.any() {") && tick.contains("self.cost_alert = None;"),
+            "上限が未設定でも判定結果を残している"
+        );
+    }
+
+    /// アイドル時のコストはゼロ — 集計か設定が変わったときだけ計算し直す。
+    #[test]
+    fn 上限の判定は集計か設定が変わったときだけ走る() {
+        let tick = body_of("fn cost_limit_tick(&mut self) {");
+        assert!(
+            tick.contains("if self.cost_stamp == Some(stamp) {") && tick.contains("return;"),
+            "毎フレーム推定コストを計算し直している"
+        );
+        assert!(
+            tick.contains("self.cost_gate.changed(Self::COST_GATE_ID, &key)"),
+            "通知が門番 (EdgeGate) を通っていない = 毎回鳴る"
+        );
     }
 }
 
@@ -30905,6 +31842,179 @@ impl ZaivernApp {
         self.jump_to_char(ch, 0);
     }
 
+    // ─── マルチバッファ (複数ファイルの抜粋を 1 本の面へ) ────────────
+    //
+    // 「散らばった注目点をファイルを開いて回らずに一望する」ための面。
+    // 種 (`multibuffer::Seed`) を作るところだけが出所ごとに違い、
+    // 組み立て・表示・移動は 1 本に集約してある。
+
+    /// マルチバッファへ載せるファイルの上限。これを超えるものは丸ごと落とす
+    /// (索引に巨大ファイルを引き込むと、開いた瞬間にメモリが跳ねる)。
+    const MULTIBUFFER_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// 種からマルチバッファを組み立ててタブで開く (全出所の共通経路)。
+    ///
+    /// 本文は **エディタで開いていればその未保存の本文**、無ければディスクから
+    /// 取る。画面に出ているものと索引が食い違わないようにするため。
+    fn open_multibuffer(
+        &mut self,
+        source: crate::multibuffer::Source,
+        subtitle: &str,
+        seeds: &[crate::multibuffer::Seed],
+    ) {
+        use crate::multibuffer as mbuf;
+        let mut mb = {
+            let editor = &self.editor;
+            // 同じファイルに何十件も種があるので、読み込みは 1 回だけ
+            let mut cache: HashMap<PathBuf, Option<Vec<String>>> = HashMap::new();
+            mbuf::build(
+                source,
+                subtitle,
+                seeds,
+                None,
+                mbuf::BuildOpts::for_source(source),
+                |path| {
+                    cache
+                        .entry(path.to_path_buf())
+                        .or_insert_with(|| {
+                            if let Some(b) = editor.buffers.iter().find(|b| {
+                                b.kind == crate::editor::BufferKind::File
+                                    && b.path.as_deref() == Some(path)
+                            }) {
+                                return Some(mbuf::split_lines(&b.text));
+                            }
+                            let meta = std::fs::metadata(path).ok()?;
+                            if !meta.is_file() || meta.len() > Self::MULTIBUFFER_MAX_FILE_BYTES {
+                                return None;
+                            }
+                            let bytes = std::fs::read(path).ok()?;
+                            // CP932 等も開ける経路をそのまま使う (UTF-8 決め打ちにしない)
+                            let (text, _) = crate::textenc::decode_bytes(&bytes);
+                            Some(mbuf::split_lines(&text))
+                        })
+                        .clone()
+                },
+            )
+        };
+        // 表示名は複数ルートを考慮した既存規則へ揃える (`multibuffer::label_for`
+        // は単一ルートしか知らないので、ここで上書きする)
+        for e in &mut mb.excerpts {
+            e.label = self.rel_label(&e.path);
+        }
+        let empty = mb.is_empty();
+        // 開いた直後のカーソルは**最初の一致**。0 (先頭の見出し) にすると
+        // 1 回目の「次へ」が 2 件目へ飛んで 1 件目を飛ばす。
+        let cursor = mbuf::first_focus(&mbuf::rows(&mb), &mb);
+        let id = self.editor.open_multibuffer(mb);
+        self.multibuffer_cursor.insert(id, cursor);
+        // 中央ビューはエディタでなければ見えない (Cockpit / 看板 / デッキが前面だと
+        // タブを開いても何も起きなかったように見える)
+        self.cockpit = false;
+        self.kanban = false;
+        self.deck = false;
+        if empty {
+            self.toast_warn(tr("表示するものがありませんでした"));
+        }
+        self.persist_session();
+    }
+
+    /// ワークスペース検索の全ヒットをマルチバッファで開く。
+    fn open_search_multibuffer(&mut self) {
+        use crate::multibuffer as mbuf;
+        let seeds: Vec<mbuf::Seed> = self
+            .gsearch
+            .results
+            .iter()
+            .map(|h| mbuf::Seed {
+                path: h.path.clone(),
+                // Hit.line は 0 起点、Seed.line は 1 起点
+                line: h.line + 1,
+                note: String::new(),
+                severity: 0,
+                // col / len は**元の行**基準なので、そのまま本文へ当てられる
+                mark: (h.len > 0).then_some((h.col, h.col + h.len)),
+            })
+            .collect();
+        let subtitle = self.gsearch.query.clone();
+        self.open_multibuffer(mbuf::Source::Search, &subtitle, &seeds);
+    }
+
+    /// ワークスペース全体の診断をマルチバッファで開く。
+    fn open_problems_multibuffer(&mut self) {
+        use crate::multibuffer as mbuf;
+        let mut items = self.collect_problems();
+        // 重い順 → ファイル順 → 行順。読む順序が毎回同じになる
+        items.sort_by(|a, b| {
+            a.severity
+                .cmp(&b.severity)
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+        let seeds: Vec<mbuf::Seed> = items
+            .iter()
+            .map(|it| mbuf::Seed {
+                path: it.path.clone(),
+                // ProblemItem.line は 0 起点 (LSP)、Seed.line は 1 起点
+                line: it.line + 1,
+                note: it.message.clone(),
+                severity: it.severity,
+                mark: None,
+            })
+            .collect();
+        self.open_multibuffer(mbuf::Source::Problems, "", &seeds);
+    }
+
+    /// 作業ツリーの変更 (未コミット) をマルチバッファで開く。
+    ///
+    /// `git diff HEAD` を **1 回だけ**走らせて全ファイルぶんの変更行を取る
+    /// (ファイルごとに git を起動すると、変更が多いときに固まる)。
+    fn open_changes_multibuffer(&mut self) {
+        use crate::multibuffer as mbuf;
+        let Some(top) = self.git_ops_repo() else {
+            self.toast_warn(tr("git リポジトリではありません"));
+            return;
+        };
+        let out = match git::working_tree_diff(&top) {
+            Ok(out) => out,
+            Err(e) => {
+                self.toast(e, false);
+                return;
+            }
+        };
+        let mut seeds: Vec<mbuf::Seed> = Vec::new();
+        for f in crate::diff::parse_unified(&out) {
+            if f.is_binary || f.new_path.is_empty() || f.new_path == "/dev/null" {
+                continue;
+            }
+            let path = top.join(&f.new_path);
+            for h in &f.hunks {
+                let added: Vec<usize> = h
+                    .lines
+                    .iter()
+                    .filter(|l| l.kind == crate::diff::LineKind::Added)
+                    .filter_map(|l| l.new_no)
+                    .collect();
+                if added.is_empty() {
+                    // 削除だけのハンク。消えた行は本文に無いので、
+                    // **消えた場所** (新しい側の行番号) を注目点にする
+                    seeds.push(mbuf::Seed {
+                        path: path.clone(),
+                        line: h.new_start.max(1),
+                        note: tr("ここで削除"),
+                        severity: 0,
+                        mark: None,
+                    });
+                    continue;
+                }
+                for l in added {
+                    seeds.push(mbuf::Seed::plain(path.clone(), l));
+                }
+            }
+        }
+        let subtitle = self.rel_label(&top);
+        self.open_multibuffer(mbuf::Source::Changes, &subtitle, &seeds);
+    }
+
     /// ワークスペース全体の診断を集める。
     ///
     /// **開いていないファイルも対象**。LSP サーバーはプロジェクト全体の
@@ -30963,6 +32073,8 @@ impl ZaivernApp {
         let mut filter = self.problems_filter.clone();
         let mut toggle_group: Option<PathBuf> = None;
         let mut jump: Option<(PathBuf, usize, usize)> = None;
+        // 借用を握ったまま &mut self を呼べないので、押されたら記録だけする
+        let mut open_multi = false;
         // 「この診断を直す」= その位置へ飛んでからクイックフィックスを要求する
         let mut fix: Option<(PathBuf, usize, usize)> = None;
         let collapsed = self.problems_collapsed.clone();
@@ -30983,6 +32095,17 @@ impl ZaivernApp {
                         }
                     }
                     ui.add_space(space::SM);
+                    // 0 件のときは押しても空の面が出るだけなので出さない
+                    if !all.is_empty()
+                        && ui
+                            .small_button(tr("⿴ まとめて開く"))
+                            .on_hover_text(tr(
+                                "全ての問題を前後の文脈つきで 1 枚の面に並べます (マルチバッファ)",
+                            ))
+                            .clicked()
+                    {
+                        open_multi = true;
+                    }
                     // 幅は「残り」を素直に使う。どの窓幅でも見切れない。
                     let w = (ui.available_width() - 4.0).max(80.0);
                     ui.add_sized(
@@ -31090,6 +32213,9 @@ impl ZaivernApp {
             if !self.problems_collapsed.remove(&p) {
                 self.problems_collapsed.insert(p);
             }
+        }
+        if open_multi {
+            self.open_problems_multibuffer();
         }
         if let Some((path, line, col)) = jump {
             // 行だけでなく**桁**まで飛ぶ (LSP の col は UTF-16 単位)
@@ -32603,6 +33729,43 @@ fn rustc_version() -> &'static str {
     option_env!("ZV_RUSTC_VERSION").unwrap_or("1.88+")
 }
 
+/// 1 行に収める galley (溢れたら末尾を「…」にする)。
+///
+/// 折り返すと行高が揃わなくなり `show_rows` の前提 (等高) が崩れるので、
+/// **どの幅でも必ず 1 行**にする。全文はホバーで見せること。
+fn truncated_galley(
+    ui: &egui::Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let job = egui::text::LayoutJob::single_section(
+        text.to_string(),
+        egui::TextFormat {
+            font_id: font,
+            color,
+            ..Default::default()
+        },
+    );
+    wrap_job_to_one_row(ui, job, max_w)
+}
+
+/// 出来合いの [`egui::text::LayoutJob`] を 1 行へ詰める (溢れたら「…」)。
+fn wrap_job_to_one_row(
+    ui: &egui::Ui,
+    mut job: egui::text::LayoutJob,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_w.max(1.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.fonts(|f| f.layout_job(job))
+}
+
 /// 検索結果 1 行を「行番号 + 本文 (マッチだけ強調)」の 1 枚のレイアウトにする。
 ///
 /// `marks` は**スニペット (`Hit.text`) の中の**バイト範囲。範囲が本文の外や
@@ -32813,18 +33976,31 @@ fn global_search_panel(
         } else {
             String::new()
         };
-        ui.label(
-            RichText::new(trf(
-                "{n} 件ヒット / {m} ファイル走査{capped}",
-                &[
-                    ("n", n.to_string()),
-                    ("m", gsearch.scanned.to_string()),
-                    ("capped", capped),
-                ],
-            ))
-            .size(11.5)
-            .color(theme.text_dim),
-        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(trf(
+                    "{n} 件ヒット / {m} ファイル走査{capped}",
+                    &[
+                        ("n", n.to_string()),
+                        ("m", gsearch.scanned.to_string()),
+                        ("capped", capped),
+                    ],
+                ))
+                .size(11.5)
+                .color(theme.text_dim),
+            );
+            // 0 件のときは押しても空の面が出るだけなので出さない
+            if n > 0
+                && ui
+                    .small_button(tr("⿴ まとめて開く"))
+                    .on_hover_text(tr(
+                        "全ヒットを前後の文脈つきで 1 枚の面に並べます (マルチバッファ)",
+                    ))
+                    .clicked()
+            {
+                gsearch.open_multi = true;
+            }
+        });
     }
     ui.separator();
     let mut jump: Option<(PathBuf, usize)> = None;
@@ -36866,6 +38042,75 @@ mod wave2_tests {
         );
     }
 
+    /// **インレイヒントが画面に繋がっていて、到達経路がある。**
+    ///
+    /// 「LSP からヒントは届いているのに画面に出ない」「実装したがどこからも
+    /// 切り替えられない」を潰すための番人。描画・到達経路・本文の不可侵を見る。
+    /// ソースを読むテストなので改行は正規化する (Windows は CRLF)。
+    #[test]
+    fn インレイヒントが画面に繋がっている() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let (_, body) = src
+            .split_once("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .expect("code_editor_ui がある");
+        let (body, _) = body
+            .split_once("\n    // ─── UI: palette ")
+            .expect("code_editor_ui の終わり");
+
+        // ① 本文描画の中で、純関数の結果を実際に塗っている
+        for draw in [
+            "diagview::inlay_line_text(",
+            "diagview::inlay_marks(",
+            "inlay_colors[(v.kind == lsp::INLAY_KIND_PARAMETER) as usize]",
+        ] {
+            assert!(
+                body.contains(draw),
+                "{draw} が本文描画に無い (画面に出ない)"
+            );
+        }
+        // ② 色はテーマ経由 (ベタ書き禁止)
+        assert!(
+            body.contains("diagview::inlay_color(&self.theme,"),
+            "インレイヒントの色をテーマから取っていない"
+        );
+        // ③ **本文 (galley) にヒントを混ぜていない。** 混ぜるとキャレット・選択・
+        //    クリック位置が壊れる。差し込む形の操作が本文描画に無いことを見る。
+        //    禁止パターンは分割して組み立てる (このテスト自身の文字列に当たらない)。
+        for forbidden in [
+            format!("text.{}(v.at", "insert_str"),
+            format!("target.set(with_{}", "inlay"),
+            format!("{}_apply_to_text(", "inlay"),
+        ] {
+            assert!(
+                !src.contains(&forbidden),
+                "{forbidden}: 本文へヒントを混ぜている (galley の char 添字が壊れる)"
+            );
+        }
+        // ④ 行末の診断と重ならないよう押し出している
+        assert!(
+            body.contains("inlay_row_end"),
+            "行末の診断メッセージと重なりを避けていない"
+        );
+        // ⑤ 到達経路: パレット / 設定 / 要求
+        for route in [
+            "Cmd::ToggleInlayHints",
+            "self.cfg.inlay_hints",
+            "self.refresh_inlay_hints(text_hash);",
+            "client.request_inlay_hints(",
+        ] {
+            assert!(src.contains(route), "{route} の到達経路が無い");
+        }
+        // ⑥ 要求は「飛行中でないとき」だけ (毎フレーム撃たない = 設計原則 3)
+        let refresh = src
+            .split("fn refresh_inlay_hints(&mut self, text_hash: u64) {")
+            .nth(1)
+            .expect("refresh_inlay_hints がある");
+        assert!(
+            refresh.contains("if !client.inlay_in_flight(&path)"),
+            "同じ版の要求を毎フレーム撃ってしまう"
+        );
+    }
+
     /// **診断のインライン表示と対応括弧の強調が画面に繋がっている。**
     ///
     /// 「LSP から範囲は届いているのにガターの印しか出ない」「実装したが
@@ -37682,6 +38927,7 @@ mod ui_wiring_tests {
             "Some(PreviewTag::Hex) => self.hex_viewer_ui(ui, i),",
             "Some(PreviewTag::Media) => self.media_card_ui(ui, i),",
             "Some(PreviewTag::Archive) => self.archive_list_ui(ui, i),",
+            "Some(PreviewTag::Multi) => self.multibuffer_ui(ui, i),",
             // 外部オープンとコピーが繋がっている (カードのボタンが死んでいない)
             "open_external(&p.to_string_lossy());",
             "ui.ctx().copy_text(p.to_string_lossy().to_string());",

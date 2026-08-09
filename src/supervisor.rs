@@ -338,6 +338,26 @@ impl SessionState {
         }
     }
 
+    /// **止まっているか** — 生きているのに前へ進んでいない状態。
+    ///
+    /// 「停止中のエージェントへ一括で指示を入れ直す」宛先の判定に使う。
+    /// 含めない 2 つには理由がある:
+    ///
+    /// - `Working`: 進んでいるものへ横から差し込むと作業を分断する。
+    /// - `WaitingApproval`: いま送ると本文ではなく**承認への回答**になる
+    ///   (既定が "No, exit" のプロンプトもある)。承認は承認の口で答えること。
+    ///
+    /// `Crashed` / `Done` は死んでいるので、呼び出し側の `running()` で落ちる。
+    pub fn is_stuck(self) -> bool {
+        matches!(
+            self,
+            SessionState::Idle
+                | SessionState::Stalled
+                | SessionState::Looping
+                | SessionState::Errored
+        )
+    }
+
     /// 注意を要する状態か。
     pub fn is_trouble(self) -> bool {
         matches!(
@@ -2151,6 +2171,54 @@ fn derive_state(
 // ---------------------------------------------------------------------------
 // テスト — 偽陽性のほうが本命。
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod stuck_tests {
+    use super::SessionState::*;
+    use super::*;
+
+    /// 「⏸ 停止中へ一括送信」の対象表。**状態を足したらここへ 1 行**増やすこと。
+    #[test]
+    fn 止まっている状態の表() {
+        let cases: &[(SessionState, bool)] = &[
+            // 進んでいる。横から差し込むと作業を分断する
+            (Working, false),
+            // 承認への回答になってしまう (既定が "No, exit" のプロンプトもある)
+            (WaitingApproval, false),
+            // ここから下が対象
+            (Idle, true),
+            (Stalled, true),
+            (Looping, true),
+            (Errored, true),
+            // 死んでいるので running() で落ちる。値としては対象扱いでも害はないが、
+            // 「生きているのに進んでいない」の定義から外れるので false
+            (Crashed, false),
+            (Done, false),
+        ];
+        for (st, want) in cases {
+            assert_eq!(st.is_stuck(), *want, "{st:?} ({}) の is_stuck", st.label());
+        }
+    }
+
+    /// 全員宛てとの違いは「作業中を巻き込まないこと」。ここが崩れると
+    /// ⏸ を押す意味が無くなる (= 📢 と同じになる)。
+    #[test]
+    fn 作業中と承認待ちは決して対象にならない() {
+        assert!(!Working.is_stuck());
+        assert!(!WaitingApproval.is_stuck());
+    }
+
+    /// 異常 (is_trouble) は全部「止まっている」に含まれる — 停滞・ループ・
+    /// エラー多発は、まさに一括で押し直したい相手。
+    /// `Crashed` だけは死んでいるので例外。
+    #[test]
+    fn 異常な状態は死んでいなければ全部対象() {
+        for st in [Stalled, Looping, Errored] {
+            assert!(st.is_trouble() && st.is_stuck(), "{st:?}");
+        }
+        assert!(Crashed.is_trouble() && !Crashed.is_stuck());
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -21,6 +21,17 @@ pub const DEFAULT_HOT_EXIT_MAX_KB: usize = 4096;
 /// 打鍵のたびに書くと大きなファイルで I/O が飽和するので必ず間引く。
 pub const DEFAULT_HOT_EXIT_INTERVAL_MS: u64 = 1500;
 
+/// コスト上限の既定の警告割合 (8 割)。
+///
+/// **なぜ 8 割か** — 残り 2 割は「いま走っているターンを最後まで走らせて、
+/// それから並列度を落とすか上限を上げるかを決める」ぶんの猶予として要る。
+/// 9 割では 1 ターンぶんに満たないことがあり (エージェント 1 本の 1 ターンは
+/// 数十万トークン = 上限が $50 なら数ドル規模)、警告と同時に超過する。
+/// 5 割では並列で走らせている限りほぼ常時鳴り、狼少年になる。
+/// 使用率の助言側 ([`crate::coordinator::quota::Policy::slow_fraction`]) も
+/// 同じ 0.80 で「絞れ」を出すので、しきい値の意味を 2 か所で食い違わせない。
+pub const DEFAULT_COST_WARN_RATIO: f32 = 0.80;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -91,6 +102,15 @@ pub struct Config {
     /// 右側が文章で埋まり、コードより診断の方が目立ってしまう。
     /// オフにしても波線とホバーは残る (消えるのは行末の文字だけ)。
     pub inline_diagnostics: bool,
+
+    /// LSP のインレイヒント (推論された型・引数名) を本文の行末に淡色で出すか。
+    ///
+    /// **既定はオフ**。理由は 2 つ:
+    /// 1. 出るのは行末なので、ONにすると本文の右側が型名で埋まる。ミニマップと
+    ///    同じ判断で「欲しい人だけが払う」。
+    /// 2. 本文を打つたびにサーバーへ往復が 1 つ増える (キャッシュは版ごと)。
+    ///    使わない人にその代金を払わせない (設計原則 3)。
+    pub inlay_hints: bool,
 
     /// エディタ右端のミニマップ (VS Code の遠景ビュー相当)。
     /// **既定はオフ** — 本文の横幅を 64px 奪うので、欲しい人だけが払う。
@@ -325,6 +345,21 @@ pub struct Config {
     /// トークン単価の表 (`[pricing]`)。推定コストの計算に使う。
     /// **価格は変わるのでユーザーが上書きできる** — 詳細は [`PricingConfig`]。
     pub pricing: PricingConfig,
+
+    /// このアプリを起動してからの推定コストの上限
+    /// (通貨は [`PricingConfig::currency`])。**0 = 無制限 (既定)**。
+    pub cost_limit_session: f32,
+    /// 1 日 (UTC) の推定コストの上限。**0 = 無制限 (既定)**。
+    ///
+    /// 日の境界を UTC で切る理由は
+    /// [`crate::coordinator::quota::utc_day_index`] のコメントに書いてある。
+    pub cost_limit_daily: f32,
+    /// 上限の何割を使ったら警告するか (0.0..=1.0)。
+    /// 既定は [`DEFAULT_COST_WARN_RATIO`]。
+    pub cost_warn_ratio: f32,
+    /// 上限に達したときの動作: `"notify"` (知らせるだけ) / `"stop"`
+    /// (新規の送信を止める)。**既定は `"notify"`** — 勝手に止めない。
+    pub cost_limit_action: String,
 
     /// コマンドパレットの MRU (最近実行したコマンド。先頭が直近)。
     ///
@@ -698,6 +733,22 @@ impl PricingConfig {
     }
 }
 
+impl Config {
+    /// 設定を [`crate::coordinator::quota::CostLimits`] へ畳む。
+    ///
+    /// **これが上限の唯一の作り方**。判定側 (`quota`) は金額も通貨も知らず、
+    /// ここから渡された数値を比べるだけ。
+    pub fn cost_limits(&self) -> crate::coordinator::quota::CostLimits {
+        use crate::coordinator::quota::{CostLimits, LimitAction};
+        CostLimits {
+            session: f64::from(self.cost_limit_session.max(0.0)),
+            daily: f64::from(self.cost_limit_daily.max(0.0)),
+            warn_ratio: self.cost_warn_ratio,
+            action: LimitAction::from_key(&self.cost_limit_action),
+        }
+    }
+}
+
 impl crate::coordinator::quota::PriceLookup for PricingConfig {
     fn rate(&self, model: &str) -> Option<crate::coordinator::quota::ModelRate> {
         self.lookup(model)
@@ -733,6 +784,7 @@ impl Default for Config {
             show_whitespace: false,
             lsp_highlight_occurrences: true,
             inline_diagnostics: true,
+            inlay_hints: false,
             minimap: false,
             undo_merge_ms: crate::editor::UNDO_MERGE_MS,
             undo_max_steps: crate::editor::UNDO_MAX_STEPS,
@@ -801,6 +853,12 @@ impl Default for Config {
             failover: crate::failover::FailoverConfig::default(),
             race_eval: RaceEvalConfig::default(),
             pricing: PricingConfig::default(),
+            // 上限は**出荷時は無し**。設定するまで画面に 1px も出さないし、
+            // 何も止めない (金額をコードに埋めないためでもある)。
+            cost_limit_session: 0.0,
+            cost_limit_daily: 0.0,
+            cost_warn_ratio: DEFAULT_COST_WARN_RATIO,
+            cost_limit_action: "notify".into(),
             palette_recent: Vec::new(),
             quick_launch: None,
         }
@@ -1148,6 +1206,11 @@ show_hidden_files = true
 # 出るのは**キャレット行だけ**です。オフにしても波線とホバーは残ります
 # (コマンドパレットの「行末の診断メッセージ切替」でも変更できます)
 # inline_diagnostics = true
+
+# LSP のインレイヒント (推論された型・引数名) を本文の行末に淡色で出す
+# 既定はオフです (行末が型名で埋まるのと、打鍵ごとにサーバーへの往復が増えるため)
+# (コマンドパレットの「インラインヒントの表示切替」でも変更できます)
+# inlay_hints = false
 # 取り消し (Undo) 履歴の粒度とメモリ上限。タブ 1 枚あたりの値です。
 #   undo_merge_ms  = 続けて打った文字を 1 段にまとめる時間しきい値 (ミリ秒)。
 #                    これを超えて間が空くと別の段になります。0 にすると 1 打鍵 = 1 段。
@@ -1222,6 +1285,30 @@ show_hidden_files = true
 #             「(全自動)」プリセットと通常プリセットを使い分けたい場合はこれ）
 # ツールバーの 🛡/⚡/👾 ボタンでも切替できます
 approval_mode = "ask"
+
+# ── コスト上限とアラート ──────────────────────────────
+# エージェントを何本も並列で走らせて「気付いたら $200」を防ぐ見張りです。
+# 金額の単位は [pricing] の currency と同じで、消費はローカルのトランスクリプト
+# から推定した額です (通信はしません)。上限が 0 のあいだは無制限で、
+# ステータスバーにも 1px も出ません。
+#   cost_limit_session = このアプリを起動してからの推定コストの上限。
+#                        0 = 無制限。集計はトークン集計の窓 (直近 24 時間) の
+#                        範囲で数えます。
+#   cost_limit_daily   = 1 日ぶんの推定コストの上限。0 = 無制限。
+#                        日の境界は UTC で切ります。std にタイムゾーン DB が
+#                        無く、ローカル時刻で切ると出張・夏時間・OS のタイム
+#                        ゾーン更新で「今日」の始まりが黙って動くためです
+#                        (夏時間の移行日は 23 時間 / 25 時間の日が生まれます)。
+#   cost_warn_ratio    = 上限の何割を使ったら警告するか (0.0〜1.0)。
+#                        既定 0.8。残り 2 割は「走っているターンを終わらせて、
+#                        並列度を落とすか上限を上げるかを決める」猶予です。
+#   cost_limit_action  = 上限に達したときの動作。
+#                        "notify" は知らせるだけ (既定。勝手に止めません)、
+#                        "stop" は新規の送信を止めます (理由を画面に出します)。
+# cost_limit_session = 0.0
+# cost_limit_daily = 0.0
+# cost_warn_ratio = 0.8
+# cost_limit_action = "notify"
 
 # フォルダを開き直したとき、前回のエージェントタブを復元して会話を再開する
 # 既定は false — 起動しただけでは何も立ち上がりません。過去の会話は
@@ -2207,6 +2294,14 @@ pub struct SettingDef {
 }
 
 const APPROVAL_MODES: &[&str] = &["ask", "auto", "agent"];
+const COST_LIMIT_ACTIONS: &[&str] = &["notify", "stop"];
+
+/// コスト上限の入力欄が受け付ける最大値。
+///
+/// **これは価格ではなく入力ウィジェットの範囲**。`DragValue` に上限が無いと
+/// 指が滑っただけで桁が飛び、上限が事実上消える。通貨は設定側 (`[pricing]`)
+/// なので、円建てのように 1 単位が小さい通貨でも足りる桁にしてある。
+const COST_LIMIT_MAX: f32 = 10_000_000.0;
 const DIFF_VIEWS: &[&str] = &["side_by_side", "inline"];
 const VOICE_ENGINES: &[&str] = &["auto", "mac", "powershell", "browser", "command", "off"];
 const VOICE_TARGETS: &[&str] = &["active", "broadcast"];
@@ -2224,6 +2319,7 @@ pub fn setting_defs() -> &'static [SettingDef] {
     const G_SAVE: &str = "保存";
     const G_RESTORE: &str = "復元";
     const G_AGENT: &str = "エージェント";
+    const G_COST: &str = "コスト";
     const G_LINK: &str = "音声・連携";
     &[
         SettingDef {
@@ -2302,6 +2398,12 @@ pub fn setting_defs() -> &'static [SettingDef] {
             key: "inline_diagnostics",
             group: G_EDITOR,
             label: "行末に診断を出す",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "inlay_hints",
+            group: G_EDITOR,
+            label: "インレイヒント (型・引数名) を出す",
             kind: Bool,
         },
         SettingDef {
@@ -2500,6 +2602,36 @@ pub fn setting_defs() -> &'static [SettingDef] {
             kind: Choice(APPROVAL_MODES),
         },
         SettingDef {
+            key: "cost_limit_session",
+            group: G_COST,
+            label: "このセッションの上限 (0 = 無制限)",
+            kind: Float {
+                min: 0.0,
+                max: COST_LIMIT_MAX,
+            },
+        },
+        SettingDef {
+            key: "cost_limit_daily",
+            group: G_COST,
+            label: "1 日 (UTC) の上限 (0 = 無制限)",
+            kind: Float {
+                min: 0.0,
+                max: COST_LIMIT_MAX,
+            },
+        },
+        SettingDef {
+            key: "cost_warn_ratio",
+            group: G_COST,
+            label: "警告を出す割合 (0.0〜1.0)",
+            kind: Float { min: 0.0, max: 1.0 },
+        },
+        SettingDef {
+            key: "cost_limit_action",
+            group: G_COST,
+            label: "上限に達したときの動作",
+            kind: Choice(COST_LIMIT_ACTIONS),
+        },
+        SettingDef {
             key: "voice_engine",
             group: G_LINK,
             label: "音声認識エンジン",
@@ -2548,6 +2680,7 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
         "breadcrumbs" => B(cfg.breadcrumbs),
         "bracket_colorization" => B(cfg.bracket_colorization),
         "inline_diagnostics" => B(cfg.inline_diagnostics),
+        "inlay_hints" => B(cfg.inlay_hints),
         "lsp_highlight_occurrences" => B(cfg.lsp_highlight_occurrences),
         "git_blame" => B(cfg.git_blame),
         "detect_indentation" => B(cfg.detect_indentation),
@@ -2577,6 +2710,10 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
         "restore_agents" => B(cfg.restore_agents),
         "auto_name_sessions" => B(cfg.auto_name_sessions),
         "approval_mode" => T(cfg.approval_mode.clone()),
+        "cost_limit_session" => F(cfg.cost_limit_session),
+        "cost_limit_daily" => F(cfg.cost_limit_daily),
+        "cost_warn_ratio" => F(cfg.cost_warn_ratio),
+        "cost_limit_action" => T(cfg.cost_limit_action.clone()),
         "voice_engine" => T(cfg.voice_engine.clone()),
         "voice_target" => T(cfg.voice_target.clone()),
         "voice_lang" => T(cfg.voice_lang.clone()),
@@ -2705,6 +2842,7 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
         }
         "bracket_colorization" => b!(cfg.bracket_colorization),
         "inline_diagnostics" => b!(cfg.inline_diagnostics),
+        "inlay_hints" => b!(cfg.inlay_hints),
         "lsp_highlight_occurrences" => b!(cfg.lsp_highlight_occurrences),
         "detect_indentation" => b!(cfg.detect_indentation),
         "tab_size" => i!(cfg.tab_size, usize),
@@ -2739,6 +2877,10 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
             }
             ok
         }
+        "cost_limit_session" => f!(cfg.cost_limit_session),
+        "cost_limit_daily" => f!(cfg.cost_limit_daily),
+        "cost_warn_ratio" => f!(cfg.cost_warn_ratio),
+        "cost_limit_action" => t!(cfg.cost_limit_action),
         "voice_engine" => t!(cfg.voice_engine),
         "voice_target" => t!(cfg.voice_target),
         "voice_lang" => t!(cfg.voice_lang),
@@ -5293,6 +5435,111 @@ mod quota_pricing_tests {
         assert_eq!(got.cache_read, src.cache_read);
         assert_eq!(PriceLookup::currency(&p), p.currency);
         assert!(PriceLookup::rate(&p, "no-such-model-anywhere").is_none());
+    }
+
+    // ── コスト上限 ────────────────────────────────────────────────────
+
+    /// **出荷時は上限なし。** 設定しない限り何も止まらないし何も出ない。
+    #[test]
+    fn コスト上限の既定は無制限で通知だけ() {
+        use crate::coordinator::quota::LimitAction;
+        let c = Config::default();
+        assert_eq!(c.cost_limit_session, 0.0);
+        assert_eq!(c.cost_limit_daily, 0.0);
+        assert_eq!(c.cost_warn_ratio, DEFAULT_COST_WARN_RATIO);
+        assert_eq!(c.cost_limit_action, "notify");
+        let l = c.cost_limits();
+        assert!(!l.any(), "既定で見張りが動いてはいけない");
+        assert_eq!(l.action, LimitAction::Notify, "既定で勝手に止めない");
+        assert_eq!(l.blocks(1e9, 1e9), None);
+    }
+
+    /// 設定 → [`crate::coordinator::quota::CostLimits`] の畳み方。
+    #[test]
+    fn コスト上限は設定から畳まれる() {
+        use crate::coordinator::quota::{BudgetKind, BudgetState, LimitAction};
+        let mut c = Config::default();
+        c.cost_limit_session = 10.0;
+        c.cost_limit_daily = 100.0;
+        c.cost_warn_ratio = 0.5;
+        c.cost_limit_action = "stop".into();
+        let l = c.cost_limits();
+        assert!(l.any());
+        assert_eq!(l.session, 10.0);
+        assert_eq!(l.daily, 100.0);
+        assert_eq!(l.warn_ratio, 0.5);
+        assert_eq!(l.action, LimitAction::Stop);
+        let w = l.worst(6.0, 1.0).expect("上限がある");
+        assert_eq!(w.kind, BudgetKind::Session);
+        assert_eq!(w.state, BudgetState::Warn);
+        // 打ち間違いは既定 (notify) へ倒す — 勝手に止まるほうが害が大きい
+        c.cost_limit_action = "sotp".into();
+        assert_eq!(c.cost_limits().action, LimitAction::Notify);
+        // 負の値は無制限として扱う (0 未満を上限にしない)
+        c.cost_limit_session = -5.0;
+        c.cost_limit_daily = -1.0;
+        assert!(!c.cost_limits().any());
+    }
+
+    /// 設定 GUI から編集できる (一覧に載り、現在値と既定を引け、書き戻せる)。
+    #[test]
+    fn コスト上限は設定_gui_から編集できる() {
+        let mut cfg = Config::default();
+        let keys = [
+            "cost_limit_session",
+            "cost_limit_daily",
+            "cost_warn_ratio",
+            "cost_limit_action",
+        ];
+        for k in keys {
+            assert!(
+                setting_defs().iter().any(|d| d.key == k),
+                "{k} が設定一覧に無い = GUI から届かない"
+            );
+            assert!(setting_value(&cfg, k).is_some(), "{k} の現在値が読めない");
+            assert!(setting_default(k).is_some(), "{k} の既定が引けない");
+            assert!(
+                !setting_doc(k).trim().is_empty(),
+                "{k} の説明がテンプレートから届かない"
+            );
+            assert!(!is_setting_modified(&cfg, k), "{k} が最初から変更扱い");
+        }
+        // 書き戻し (型が合うものだけ通る)
+        assert!(set_setting_value(
+            &mut cfg,
+            "cost_limit_daily",
+            &SettingValue::Float(25.0)
+        ));
+        assert_eq!(cfg.cost_limit_daily, 25.0);
+        assert!(is_setting_modified(&cfg, "cost_limit_daily"));
+        assert!(set_setting_value(
+            &mut cfg,
+            "cost_limit_action",
+            &SettingValue::Text("stop".into())
+        ));
+        assert_eq!(cfg.cost_limit_action, "stop");
+        // 型違いは触らない
+        assert!(!set_setting_value(
+            &mut cfg,
+            "cost_limit_daily",
+            &SettingValue::Text("25".into())
+        ));
+        assert_eq!(cfg.cost_limit_daily, 25.0);
+        // 選択肢は notify / stop の 2 つだけ
+        let d = setting_defs()
+            .iter()
+            .find(|d| d.key == "cost_limit_action")
+            .unwrap();
+        assert_eq!(d.kind, SettingKind::Choice(COST_LIMIT_ACTIONS));
+        assert_eq!(COST_LIMIT_ACTIONS, ["notify", "stop"]);
+        // バッジから開く絞り込み語 "cost_" で 4 項目とも出る
+        let rows = settings_rows(&cfg, "cost_", false);
+        for k in keys {
+            assert!(
+                rows.iter().any(|d| d.key == k),
+                "バッジから開いた設定画面に {k} が出ない"
+            );
+        }
     }
 
     /// TOML を往復しても表が壊れない (ユーザーが上書きできる)。
