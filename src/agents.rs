@@ -2350,7 +2350,11 @@ pub static HOOK_TARGETS: &[HookTarget] = &[HookTarget {
         ("SessionEnd", ProtoState::Done, false),
     ],
     tools: CLAUDE_TOOLS,
-    verified: "claude 2.1.226 — stream-json に hook_started/hook_response を観測 + 実在の ~/.claude/settings.json の hooks スキーマ",
+    // PreToolUse の tool_input に載るパスのキー。公式ドキュメント
+    // (code.claude.com/docs/en/hooks) の Edit/Write は `file_path`、
+    // NotebookEdit は `notebook_path`。並びは優先順。
+    write_path_keys: &["file_path", "notebook_path"],
+    verified: "claude 2.1.226 — stream-json に hook_started/hook_response を観測 + 実在の ~/.claude/settings.json の hooks スキーマ + 公式 hooks リファレンスの PreToolUse 入出力スキーマ",
 }];
 
 /// フック設定の対象。持たないエージェントでは `None`。
