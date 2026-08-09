@@ -764,11 +764,12 @@ fn fence_for(body: &str) -> String {
 /// 送信直前に本文へ添付を展開する (純粋関数)。
 ///
 /// * 本文中の印はそのまま残す — 人が読んでも文脈が分かるため。
-/// * `native_at` はそのエージェントが `@パス` を**自分で**読み込む記法。
-///   [`crate::agents::AgentSpec::file_ref_syntax`] から来るデータで、
-///   空なら常に本文を同梱する。ファイル全体の参照だけに効かせる
-///   (範囲・端末・差分・診断を自分で読める CLI は無い)。
-pub fn expand(text: &str, items: &[Attachment], native_at: bool) -> String {
+/// * `file_ref` はそのエージェント自身がファイルを読み込む参照の書き方
+///   (`@{path}` の `{path}` を差し替える)。
+///   [`crate::agents::AgentSpec::file_ref_syntax`] から来る**カタログのデータ**で、
+///   空なら常に本文を同梱する。効かせるのは**ファイル全体の参照だけ**
+///   (行範囲・端末・差分・診断を自分で読める CLI は無い)。
+pub fn expand(text: &str, items: &[Attachment], file_ref: &str) -> String {
     let live: Vec<&Attachment> = items.iter().filter(|a| text.contains(&a.token)).collect();
     if live.is_empty() {
         return text.to_string();
@@ -776,8 +777,12 @@ pub fn expand(text: &str, items: &[Attachment], native_at: bool) -> String {
     let mut out = text.trim_end().to_string();
     let mut blocks: Vec<String> = Vec::new();
     for a in live {
-        // `@パス` を CLI 自身が展開できるファイル参照は、本文を付けない。
-        if native_at && a.kind == Kind::File {
+        // CLI 自身が読めるファイル参照は、その CLI の記法へ書き換えて本文を省く
+        // (同じ内容を二重に送らない)。
+        if !file_ref.is_empty() && a.kind == Kind::File {
+            if let Some(path) = a.token.strip_prefix('@') {
+                out = out.replace(&a.token, &file_ref.replace("{path}", path));
+            }
             continue;
         }
         let head = format!("▼ {} — {}", a.token, a.detail);
@@ -1445,10 +1450,11 @@ impl Mention {
     /// エージェントごとの差は [`crate::agents::AgentSpec::file_ref_syntax`] という
     /// **カタログのデータ**から来る (ここに CLI 名を書かない)。
     pub fn expand_for(&self, text: &str, command: Option<&str>, to: ComposerTarget) -> String {
-        let native = command
+        let file_ref = command
             .and_then(crate::agents::spec_for_command)
-            .is_some_and(|s| !s.file_ref_syntax().is_empty());
-        expand(text, self.ledger_of(to).items(), native)
+            .map(|s| s.file_ref_syntax())
+            .unwrap_or("");
+        expand(text, self.ledger_of(to).items(), file_ref)
     }
 
     /// 端末・診断のように App しか持っていない本文を渡す。
@@ -2494,30 +2500,34 @@ mod tests {
     #[test]
     fn 展開は本文の後ろへフェンス付きで足す() {
         let items = vec![att("@a.rs", "fn a() {}")];
-        let out = expand("@a.rs を直して", &items, false);
+        let out = expand("@a.rs を直して", &items, "");
         assert!(out.starts_with("@a.rs を直して"));
         assert!(out.contains("▼ @a.rs — d"));
         assert!(out.contains("fn a() {}"));
         // 印が本文から消えていたら添付も出さない
-        assert_eq!(expand("なにもない", &items, false), "なにもない");
+        assert_eq!(expand("なにもない", &items, ""), "なにもない");
     }
 
     #[test]
     fn 本文にフェンスがあっても閉じ込められない() {
         let items = vec![att("@a.md", "```rust\ncode\n```")];
-        let out = expand("@a.md", &items, false);
+        let out = expand("@a.md", &items, "");
         assert!(out.contains("````"), "本文より長いフェンスを使う: {out}");
     }
 
     #[test]
     fn 自分でパスを読めるエージェントにはファイル本文を重ねない() {
         let items = vec![att("@a.rs", "fn a() {}")];
-        let native = expand("@a.rs", &items, true);
+        let native = expand("@a.rs", &items, "@{path}");
         assert!(!native.contains("fn a() {}"), "二重に送っている: {native}");
+        assert_eq!(native, "@a.rs", "記法が同じなら本文はそのまま");
+        // 記法が違う CLI では**印そのものを書き換える** (カタログのデータで決まる)。
+        let other = expand("これ @a.rs を見て", &items, "#file:{path}");
+        assert_eq!(other, "これ #file:a.rs を見て");
         // ファイル以外 (範囲・端末・差分) は必ず同梱する
         let mut span = att("@a.rs:1-3", "fn a() {}");
         span.kind = Kind::Symbol;
-        let out = expand("@a.rs:1-3", &[span], true);
+        let out = expand("@a.rs:1-3", &[span], "@{path}");
         assert!(out.contains("fn a() {}"));
     }
 
@@ -2529,14 +2539,14 @@ mod tests {
             detail: "d".into(),
             body: Body::Pending,
         };
-        assert!(expand("@x", &[pending], false).contains("未解決"));
+        assert!(expand("@x", &[pending], "").contains("未解決"));
         let failed = Attachment {
             token: "@y".into(),
             kind: Kind::Diff,
             detail: "d".into(),
             body: Body::Failed("not a git repository".into()),
         };
-        let out = expand("@y", &[failed], false);
+        let out = expand("@y", &[failed], "");
         assert!(out.contains("not a git repository"), "{out}");
     }
 
