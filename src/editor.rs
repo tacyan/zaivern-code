@@ -567,7 +567,7 @@ impl Edit {
     }
 
     /// 編集**前**の選択範囲 (取り消しでここへ戻る)。
-    pub fn from_sel(mut self, sel: (usize, usize)) -> Self {
+    pub fn with_sel_before(mut self, sel: (usize, usize)) -> Self {
         self.sel_before = Some(sel);
         self
     }
@@ -4072,7 +4072,9 @@ fn g() {
     fn 取り消しで編集前の選択へ戻る() {
         let l = lim();
         let mut b = undo_buf("hello world");
-        let ed = Edit::programmatic(0, l).from_sel((6, 11)).to_sel((6, 9));
+        let ed = Edit::programmatic(0, l)
+            .with_sel_before((6, 11))
+            .to_sel((6, 9));
         assert!(b.apply_edit("hello rust".into(), ed));
         assert_eq!(b.redo(), None);
         assert_eq!(b.undo(), Some((6, 11)), "取り消しで元の選択が戻る");

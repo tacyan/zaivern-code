@@ -277,6 +277,11 @@ pub const ALL_ACTIONS: [BindAction; 84] = [
 /// 他 OS で ⇧ まで足しているのは、Ctrl+Alt+- が「戻る」(VS Code 準拠) と
 /// 重なるため。[`Modifiers::matches_logically`] は修飾キーの **上位集合** も
 /// 一致とみなすので、重ねると消費順だけが頼りになり事故りやすい。
+///
+/// **この関数は長らく未使用のまま放置され、`default_shortcut` は `⌥⌘` を
+/// 直書きしていた。** その結果 Linux / Windows では `canonical_mods` が ⌃ を ⌘ へ
+/// 畳むせいで「このファイルをズームアウト」と「戻る」が同じ打鍵になり、
+/// 片方が永久に効かなくなっていた (CI の衝突検出が暴いた)。
 fn file_zoom_mods() -> Modifiers {
     if cfg!(target_os = "macos") {
         Modifiers::COMMAND.plus(Modifiers::ALT)
@@ -330,9 +335,9 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         // これは既定でオフ (システム設定 → アクセシビリティ → ズーム →
         // 「キーボードショートカットを使用してズーム」)。有効にしている人は
         // config.toml の [keybindings] で `file_zoom_in` などを付け替えられる。
-        BindAction::FileZoomIn => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Plus),
-        BindAction::FileZoomOut => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Minus),
-        BindAction::FileZoomReset => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Num0),
+        BindAction::FileZoomIn => KeyboardShortcut::new(file_zoom_mods(), Key::Plus),
+        BindAction::FileZoomOut => KeyboardShortcut::new(file_zoom_mods(), Key::Minus),
+        BindAction::FileZoomReset => KeyboardShortcut::new(file_zoom_mods(), Key::Num0),
         BindAction::Undo => KeyboardShortcut::new(cmd, Key::Z),
         BindAction::Redo => KeyboardShortcut::new(cmd_shift, Key::Z),
         BindAction::ToggleComment => KeyboardShortcut::new(cmd, Key::Slash),
@@ -385,8 +390,16 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::PrevProblem => KeyboardShortcut::new(Modifiers::SHIFT, Key::F8),
         BindAction::RunBuildTask => KeyboardShortcut::new(cmd_shift, Key::B),
         BindAction::ToggleProblems => KeyboardShortcut::new(cmd_shift, Key::M),
+        // mac は ⌃⌘F (OS 標準)。**他 OS は F11。**
+        // `canonical_mods` が非 mac で ⌃ を ⌘ へ畳むため、⌃⌘F は Linux / Windows では
+        // ⌘F (= 検索) と**同じ打鍵**になり、片方が永久に効かなくなる
+        // (CI が検出した。F11 は VS Code の Windows / Linux 版と同じ)。
         BindAction::ToggleFullScreen => {
-            KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::COMMAND), Key::F)
+            if cfg!(target_os = "macos") {
+                KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::COMMAND), Key::F)
+            } else {
+                KeyboardShortcut::new(Modifiers::NONE, Key::F11)
+            }
         }
         // ⌥⌘[ / ⌥⌘] は VS Code (mac) の折りたたみ / 展開と同じ。
         // 既存の ⌥⌘ 割り当ては S (すべて保存) と F (置換) だけなので空いている。
@@ -1213,9 +1226,15 @@ pub fn conflicts_for(keys: &Keybinds, action: BindAction, candidate: Binding) ->
         }
     }
     // macOS の実測予約表。1 打鍵目・2 打鍵目の両方を見る。
-    for sc in [Some(cand.first()), cand.second()].into_iter().flatten() {
-        if let Some(why) = macos_reservation(sc) {
-            out.push(Conflict::Reserved(why));
+    //
+    // **macOS でしか見ない。** 他 OS では `canonical_mods` が ⌃ を ⌘ へ畳むため、
+    // ⌃Tab が ⌘Tab (アプリケーション切替) と同じ形になり、Linux / Windows で
+    // 「macOS が使用中」という嘘の警告が出る (CI が実際に 4 件検出した)。
+    if cfg!(target_os = "macos") {
+        for sc in [Some(cand.first()), cand.second()].into_iter().flatten() {
+            if let Some(why) = macos_reservation(sc) {
+                out.push(Conflict::Reserved(why));
+            }
         }
     }
     out

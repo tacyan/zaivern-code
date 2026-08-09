@@ -5976,7 +5976,7 @@ impl ZaivernApp {
         };
         // プログラム的編集なので**必ず 1 段**。取り消しで編集前の選択へ戻す。
         let ed = editor::Edit::programmatic(now_ms, limits)
-            .from_sel((start, end))
+            .with_sel_before((start, end))
             .to_sel(new_sel);
         buf.apply_edit(new_text, ed);
         self.pending_select = Some(new_sel);
@@ -6197,7 +6197,7 @@ impl ZaivernApp {
                 }
                 // **1 回だけ**本文を差し替える = egui の取り消しも 1 段。
                 let (new_text, sel, n) = multi_batch_insert(&text, &seed, &ins);
-                let ed = self.edit_step().from_sel((start, end)).to_sel({
+                let ed = self.edit_step().with_sel_before((start, end)).to_sel({
                     let r = sel.to_single_selection_chars(&new_text);
                     (r.start, r.end)
                 });
@@ -6399,7 +6399,7 @@ fn build_file_index_with(
                     scanned += 1;
                     if let Some(p) = progress {
                         // 進捗は 128 件ごとに 1 回だけ書く (アトミックの往復を減らす)
-                        if scanned % 128 == 0 {
+                        if scanned.is_multiple_of(128) {
                             p.store(scanned, Ordering::Relaxed);
                         }
                     }
@@ -9687,7 +9687,7 @@ impl ZaivernApp {
                 editor_ops::adjust_char_index_after_cleanup(&before, &after, sel.1),
             );
             // 整形はファイル全体でも**必ず 1 段**
-            let ed = self.edit_step().from_sel(sel).to_sel(moved);
+            let ed = self.edit_step().with_sel_before(sel).to_sel(moved);
             if self.editor.buffers[i].apply_edit(after, ed) {
                 self.pending_select = Some(moved);
                 self.fold_view = None;
@@ -21000,7 +21000,7 @@ impl ZaivernApp {
                     // 取り消し後は編集前の主キャレット位置へ戻す。
                     let ed = self
                         .edit_typed()
-                        .from_sel(prev_caret.unwrap_or((cs, ce)))
+                        .with_sel_before(prev_caret.unwrap_or((cs, ce)))
                         .to_sel((cs, ce));
                     // 本文の書き込みはこの 1 か所だけ (取り消しが 1 段で戻る条件)
                     self.editor.buffers[active].apply_edit(new_text, ed);
@@ -21066,7 +21066,10 @@ impl ZaivernApp {
                         }
                         editor_ops::PairEdit::Surround { text: nt, select } => {
                             // 選択を括弧で囲むのはプログラム的編集 (1 段)
-                            let ed = self.edit_step().from_sel((sel_min, sel_max)).to_sel(select);
+                            let ed = self
+                                .edit_step()
+                                .with_sel_before((sel_min, sel_max))
+                                .to_sel(select);
                             self.editor.buffers[active].apply_edit(nt, ed);
                             pending_select = Some(select);
                         }
@@ -30528,7 +30531,7 @@ impl ZaivernApp {
         // 1 置換 = 1 段。取り消すと置換前のヒットを選んだ状態へ戻る。
         let ed = self
             .edit_step()
-            .from_sel(byte_range_to_char_range(&text, &(s..e)));
+            .with_sel_before(byte_range_to_char_range(&text, &(s..e)));
         self.editor.buffers[i].apply_edit(nt, ed);
         // 置換した結果の直後から次を探す (置換文字列が検索語を含んでも無限ループしない)
         self.find.anchor = s + rep.len();
@@ -39026,7 +39029,7 @@ mod multi_cursor_wiring_tests {
         assert_eq!(n, 3, "3 箇所に入った");
         let after = next.to_single_selection_chars(&out);
         let step = Edit::programmatic(0, HistoryLimits::default())
-            .from_sel((0, 0))
+            .with_sel_before((0, 0))
             .to_sel((after.start, after.end));
         assert!(b.apply_edit(out, step));
         assert_eq!(b.text, "// a\n// b\n// c");

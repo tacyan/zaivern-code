@@ -183,7 +183,7 @@ fn ends_with_unescaped_slash(s: &str) -> bool {
         bs += 1;
         j -= 1;
     }
-    bs % 2 == 0
+    bs.is_multiple_of(2)
 }
 
 fn contains_unescaped_slash(s: &str) -> bool {

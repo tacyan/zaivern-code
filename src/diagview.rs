@@ -318,7 +318,11 @@ pub fn squiggle_points(x0: f32, x1: f32, y: f32, amp: f32, wave: f32, ppp: f32) 
     }
     // 右端で必ず閉じる (頂点上限で打ち切られた場合も含む)
     if pts.last().is_some_and(|p| p.x < hi) {
-        let dy = if pts.len() % 2 == 0 { amp } else { -amp };
+        let dy = if pts.len().is_multiple_of(2) {
+            amp
+        } else {
+            -amp
+        };
         pts.push(Pos2::new(hi, y + dy));
     }
     pts
