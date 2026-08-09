@@ -1574,8 +1574,7 @@ pub fn agent_composer_inline_ui(
     buf: &mut AgentInputBuffer,
     target: Option<(u64, &str)>,
     expand: &mut bool,
-    men: &mut crate::mention::Mention,
-    msrc: &crate::mention::Source<'_>,
+    men: &mut crate::mention::Hook<'_, '_>,
 ) -> ComposerAction {
     buf.sync_target(target.map(|(id, _)| id));
 
@@ -1584,7 +1583,7 @@ pub fn agent_composer_inline_ui(
 
     // `@` ピッカーは**入力欄より先に**打鍵をさらう (Enter / Esc / ↑↓ / Tab)。
     // 後回しにすると Enter が改行や送信に取られ、候補を確定できない。
-    men.sync(ui, buf, te_id, msrc);
+    men.sync(ui, buf, te_id);
 
     // ⌘V / Ctrl+V の画像貼り付け (本文へ `@パス ` を挿す)。文字が載っている
     // ときは何もせず、egui 標準の貼り付けに任せる。
@@ -1840,6 +1839,9 @@ pub fn composer_target_chips(
 ///
 /// **デッキは使わない** — あちらは cmux と同じで、打った字がそのまま端末へ行く
 /// (入力欄を置くと端末の高さを削り、入力口が二重になる)。
+/// 引数は 8 本。宛先まわり (`target` / `targets` / `stalled`) は既存の契約で、
+/// まとめると呼び出し側の差分が広がるのでそのままにしてある。
+#[allow(clippy::too_many_arguments)]
 pub fn agent_composer_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -1849,8 +1851,7 @@ pub fn agent_composer_ui(
     // stalled: 止まっているエージェントの数 (⏸ チップの表示と件数)
     stalled: usize,
     expand: &mut bool,
-    men: &mut crate::mention::Mention,
-    msrc: &crate::mention::Source<'_>,
+    men: &mut crate::mention::Hook<'_, '_>,
 ) -> ComposerAction {
     // 宛先をアクティブなエージェントに追従させる (ピン留めは尊重する)
     buf.sync_target(target.map(|(id, _)| id));
@@ -1860,7 +1861,7 @@ pub fn agent_composer_ui(
     let focused = ui.memory(|m| m.has_focus(te_id));
 
     // `@` ピッカーは**入力欄より先に**打鍵をさらう (下の送信コード判定より前)。
-    men.sync(ui, buf, te_id, msrc);
+    men.sync(ui, buf, te_id);
 
     // ⌘V / Ctrl+V の画像貼り付け (本文へ `@パス ` を挿す)。宛先が 1 体でも
     // 全員宛てでも同じ — 挿す先は本文なので区別しない。
@@ -3300,7 +3301,23 @@ mod tests {
         let mut expand = false;
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = agent_composer_inline_ui(ui, &theme, buf, Some(active), &mut expand);
+                let mut mstate = crate::mention::Mention::default();
+                let msrc = crate::mention::Source {
+                    root: std::path::Path::new(""),
+                    files: &[],
+                    files_truncated: false,
+                    symbols: &[],
+                    symbols_busy: false,
+                    terminals: &[],
+                    problems: 0,
+                    repo: None,
+                };
+                let mut men = crate::mention::Hook {
+                    state: &mut mstate,
+                    source: &msrc,
+                };
+                let _ =
+                    agent_composer_inline_ui(ui, &theme, buf, Some(active), &mut expand, &mut men);
                 // 停止中は 0 件 (このハーネスは宛先の追従だけを見る)
                 composer_target_chips(ui, &theme, buf, targets, 0);
             });

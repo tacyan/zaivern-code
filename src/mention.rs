@@ -118,10 +118,7 @@ const KINDS: &[KindMeta] = &[
 
 fn meta(kind: Kind) -> &'static KindMeta {
     // カタログは全種を必ず持つ (テスト `種別カタログは全種を覆う` が番人)。
-    KINDS
-        .iter()
-        .find(|m| m.kind == kind)
-        .unwrap_or(&KINDS[0])
+    KINDS.iter().find(|m| m.kind == kind).unwrap_or(&KINDS[0])
 }
 
 impl Kind {
@@ -336,6 +333,8 @@ pub enum Target {
         rel: String,
         start_line: usize,
         end_line: usize,
+        /// 終端の桁 (LSP の UTF-16 単位)。`None` は行末まで。
+        end_col: Option<usize>,
         /// LSP が出した範囲か (false は本文走査の近似)。
         exact: bool,
     },
@@ -724,10 +723,6 @@ impl Ledger {
         self.items.retain(|a| text.contains(&a.token));
     }
 
-    pub fn clear(&mut self) {
-        self.items.clear();
-    }
-
     /// まだ裏で取っている最中の件数。
     pub fn pending(&self) -> usize {
         self.items
@@ -738,7 +733,9 @@ impl Ledger {
 
     /// 全添付の合計コスト。
     pub fn total(&self) -> Cost {
-        self.items.iter().fold(Cost::default(), |a, x| a.add(x.cost()))
+        self.items
+            .iter()
+            .fold(Cost::default(), |a, x| a.add(x.cost()))
     }
 }
 
@@ -824,6 +821,9 @@ pub struct SymbolHit {
     /// 0 起点・両端を含む。
     pub start_line: usize,
     pub end_line: usize,
+    /// 終端の桁 (**LSP の UTF-16 単位**)。`None` は「行末まで」。
+    /// LSP は範囲を桁まで持つので、1 行に 2 つ定義があっても正しく切れる。
+    pub end_col: Option<usize>,
     /// LSP が出した範囲か。false は本文走査の**近似**で、UI にもそう出す。
     pub exact: bool,
 }
@@ -913,6 +913,7 @@ pub fn candidates(q: &Query, src: &Source<'_>) -> Ranked {
                     rel: s.rel.clone(),
                     start_line: s.start_line,
                     end_line: s.end_line,
+                    end_col: s.end_col,
                     exact: s.exact,
                 },
                 score: 0,
@@ -969,10 +970,7 @@ pub fn candidates(q: &Query, src: &Source<'_>) -> Ranked {
                     out.push(Candidate {
                         kind: Kind::Diff,
                         label: trf("{n} との差分", &[("n", name.clone())]),
-                        detail: trf(
-                            "{rev} — マージベースからの差",
-                            &[("rev", rev.clone())],
-                        ),
+                        detail: trf("{rev} — マージベースからの差", &[("rev", rev.clone())]),
                         target: Target::Diff(DiffScope::Branch { rev, name }),
                         score: 0,
                     });
@@ -1103,8 +1101,7 @@ pub fn def_end_line(lines: &[&str], start: usize, max_lines: usize) -> usize {
     let base = indent_of(first);
     let limit = (start + max_lines).min(lines.len().saturating_sub(1));
     let mut end = start;
-    for i in (start + 1)..=limit {
-        let l = lines[i];
+    for (i, l) in lines.iter().enumerate().take(limit + 1).skip(start + 1) {
         if l.trim().is_empty() {
             continue;
         }
@@ -1175,6 +1172,7 @@ pub fn scan_symbols(root: &Path, files: &[String], term: &str) -> ScanResult {
                 rel: rel.clone(),
                 start_line: start,
                 end_line: end,
+                end_col: None,
                 exact: false,
             });
         }
@@ -1200,11 +1198,12 @@ pub const TERM_TAIL_COLS: usize = 400;
 pub enum Fetch {
     /// ファイル全体。
     File { abs: PathBuf },
-    /// 行範囲 (0 起点・両端を含む)。
+    /// 行範囲 (0 起点・両端を含む)。`end_col` があれば終端をその桁で切る。
     Span {
         abs: PathBuf,
         start_line: usize,
         end_line: usize,
+        end_col: Option<usize>,
     },
     /// 差分。git は**必ず裏**で撃つ (UI スレッドで待つと数秒止まる)。
     Diff { repo: PathBuf, scope: DiffScope },
@@ -1223,10 +1222,19 @@ pub fn run_fetch(job: &Fetch) -> Result<Trimmed, String> {
             abs,
             start_line,
             end_line,
+            end_col,
         } => {
             let text = std::fs::read_to_string(abs).map_err(|e| e.to_string())?;
-            let r = line_range(&text, *start_line, *end_line);
-            Ok(trim_lines(&text[r], BODY_MAX_CHARS, Keep::Head))
+            // 開始は必ず行頭から (字下げごと渡さないとコードとして読めない)。
+            let s = byte_offset(&text, *start_line, 0);
+            // 終端は桁が分かっていればそこで切る。CJK・タブ混在でも
+            // `byte_offset` が UTF-16 単位で数えるのでずれない。
+            let e = match end_col {
+                Some(c) => byte_offset(&text, *end_line, *c),
+                None => line_range(&text, *start_line, *end_line).end,
+            }
+            .max(s);
+            Ok(trim_lines(&text[s..e], BODY_MAX_CHARS, Keep::Head))
         }
         Fetch::Diff { repo, scope } => {
             let args = match scope {
@@ -1234,7 +1242,7 @@ pub fn run_fetch(job: &Fetch) -> Result<Trimmed, String> {
                     return crate::git::working_tree_diff(repo)
                         .map(|d| trim_lines(&d, BODY_MAX_CHARS, Keep::Head))
                 }
-                DiffScope::Branch { rev } => crate::git_panel::review_diff_args(
+                DiffScope::Branch { rev, .. } => crate::git_panel::review_diff_args(
                     &crate::git_panel::ReviewBase::Rev(rev.clone()),
                     crate::git_panel::ContextLines::Three,
                     false,
@@ -1379,8 +1387,8 @@ pub struct Mention {
     /// (下書きが宛先ごとに分かれているので、添付も分けないと
     ///  宛先を切り替えた瞬間に他方の添付が消える)。
     ledgers: std::collections::HashMap<ComposerTarget, Ledger>,
-    /// いま編集中の宛先。
-    cur: ComposerTarget,
+    /// いま編集中の宛先 (まだ 1 度も同期していなければ None)。
+    cur: Option<ComposerTarget>,
     open: bool,
     sel: usize,
     /// 候補を組み直す鍵 (これが変わったときだけ組み直す)。
@@ -1409,9 +1417,14 @@ impl Mention {
         self.open
     }
 
+    /// いま編集中の宛先 (未同期なら全員宛て = `AgentInputBuffer` の初期値)。
+    fn cur(&self) -> ComposerTarget {
+        self.cur.unwrap_or(ComposerTarget::Broadcast)
+    }
+
     /// いまの宛先の台帳。
     pub fn ledger(&self) -> &Ledger {
-        self.ledgers.get(&self.cur).unwrap_or(&EMPTY_LEDGER)
+        self.ledger_of(self.cur())
     }
 
     /// 指定した宛先の台帳 (送信直前の展開に使う)。
@@ -1607,6 +1620,34 @@ impl Mention {
     }
 }
 
+/// 確定しようとしている候補 (引数をまとめるためだけの束)。
+struct Pick<'a> {
+    q: &'a Query,
+    cand: &'a Candidate,
+    /// Tab で確定した — フォルダでも降りずにその場で添付する。
+    force_attach: bool,
+}
+
+/// コンポーザから `@` ピッカーへ渡す一式 (状態 + 材料)。
+///
+/// コンポーザの引数を 2 本増やさないためにまとめてある。
+pub struct Hook<'a, 'b> {
+    pub state: &'a mut Mention,
+    pub source: &'a Source<'b>,
+}
+
+impl Hook<'_, '_> {
+    /// **入力欄より先に**打鍵をさらう。
+    pub fn sync(&mut self, ui: &egui::Ui, buf: &mut AgentInputBuffer, te_id: egui::Id) {
+        self.state.sync(ui, buf, te_id, self.source);
+    }
+
+    /// **入力欄の直後**でポップアップを描く。
+    pub fn popup(&mut self, ui: &egui::Ui, theme: &Theme, anchor: egui::Rect) {
+        self.state.popup(ui, theme, anchor);
+    }
+}
+
 /// ワークスペース相対 (スラッシュ) から実パスへ。区切りは OS のものへ直す。
 fn abs_of(root: &Path, rel: &str) -> PathBuf {
     root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
@@ -1645,8 +1686,11 @@ impl Mention {
         if self.collect() {
             ctx.request_repaint();
         }
-        self.cur = buf.target();
-        self.ledgers.entry(self.cur).or_default().prune(buf.text());
+        self.cur = Some(buf.target());
+        self.ledgers
+            .entry(self.cur())
+            .or_default()
+            .prune(buf.text());
         self.ledgers.retain(|_, l| !l.is_empty());
         if !ui.memory(|m| m.has_focus(te_id)) {
             self.open = false;
@@ -1668,7 +1712,12 @@ impl Mention {
         let mut syms: Vec<SymbolHit> = src.symbols.to_vec();
         syms.extend(self.hits.iter().cloned());
         syms.sort_by(|a, b| {
-            (&a.rel, a.start_line, &a.name, !a.exact).cmp(&(&b.rel, b.start_line, &b.name, !b.exact))
+            (&a.rel, a.start_line, &a.name, !a.exact).cmp(&(
+                &b.rel,
+                b.start_line,
+                &b.name,
+                !b.exact,
+            ))
         });
         syms.dedup_by(|a, b| a.rel == b.rel && a.start_line == b.start_line && a.name == b.name);
         let local = Source {
@@ -1704,8 +1753,9 @@ impl Mention {
             ));
         }
         if src.files_truncated {
-            self.notes
-                .push(tr("ファイル索引が上限で打ち切られています (一部が出ません)"));
+            self.notes.push(tr(
+                "ファイル索引が上限で打ち切られています (一部が出ません)",
+            ));
         }
         if let Some(n) = &self.scan_note {
             self.notes.push(n.clone());
@@ -1736,7 +1786,12 @@ impl Mention {
             Nav::Up if n > 0 => self.sel = (self.sel + n - 1) % n,
             Nav::Accept | Nav::Attach if n > 0 => {
                 let c = self.ranked.items[self.sel].clone();
-                return self.commit(&ctx, buf, te_id, &q, &c, nav == Nav::Attach, src);
+                let pick = Pick {
+                    q: &q,
+                    cand: &c,
+                    force_attach: nav == Nav::Attach,
+                };
+                return self.commit(&ctx, buf, te_id, pick, src);
             }
             _ => {}
         }
@@ -1749,11 +1804,14 @@ impl Mention {
         ctx: &egui::Context,
         buf: &mut AgentInputBuffer,
         te_id: egui::Id,
-        q: &Query,
-        c: &Candidate,
-        force_attach: bool,
+        pick: Pick<'_>,
         src: &Source<'_>,
     ) -> Option<Need> {
+        let Pick {
+            q,
+            cand: c,
+            force_attach,
+        } = pick;
         let descend = matches!(c.target, Target::Folder { .. }) && !force_attach;
         let token = match (&c.target, force_attach) {
             (Target::Folder { rel }, true) => folder_token(rel),
@@ -1769,10 +1827,9 @@ impl Mention {
         let (text, caret) = apply_pick(buf.text(), q, &insert);
         buf.set_text(text);
         let mut st = egui::TextEdit::load_state(ctx, te_id).unwrap_or_default();
-        st.cursor
-            .set_char_range(Some(egui::text::CCursorRange::one(
-                egui::text::CCursor::new(caret),
-            )));
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(caret),
+        )));
         st.store(ctx, te_id);
         if descend {
             // 階層を 1 段降りただけ。ポップアップは開けたままにする。
@@ -1782,7 +1839,7 @@ impl Mention {
             return None;
         }
         self.open = false;
-        self.ledgers.entry(self.cur).or_default().add(Attachment {
+        self.ledgers.entry(self.cur()).or_default().add(Attachment {
             token: token.clone(),
             kind: c.kind,
             detail: c.detail.clone(),
@@ -1799,12 +1856,14 @@ impl Mention {
                 rel,
                 start_line,
                 end_line,
+                end_col,
                 ..
             } => {
                 let job = Fetch::Span {
                     abs: abs_of(src.root, rel),
                     start_line: *start_line,
                     end_line: *end_line,
+                    end_col: *end_col,
                 };
                 self.spawn_fetch(token, job, ctx);
             }
@@ -1812,7 +1871,13 @@ impl Mention {
                 let base = format!("{rel}/");
                 let names = children_of(src.files, &base)
                     .into_iter()
-                    .map(|c| if c.is_dir { format!("{}/", c.name) } else { c.name })
+                    .map(|c| {
+                        if c.is_dir {
+                            format!("{}/", c.name)
+                        } else {
+                            c.name
+                        }
+                    })
                     .collect();
                 self.spawn_fetch(token, Fetch::Listing { rel: base, names }, ctx);
             }
@@ -1824,9 +1889,7 @@ impl Mention {
                     };
                     self.spawn_fetch(token, job, ctx);
                 }
-                None => {
-                    self.resolve_any(&token, Body::Failed(tr("git リポジトリがありません")))
-                }
+                None => self.resolve_any(&token, Body::Failed(tr("git リポジトリがありません"))),
             },
             Target::Terminal { id, .. } => {
                 return Some(Need::Terminal { token, id: *id });
@@ -1972,18 +2035,28 @@ pub fn chips_ui(ui: &mut egui::Ui, theme: &Theme, ledger: &Ledger) -> Option<Str
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let total = ledger.total();
-        ui.label(
-            egui::RichText::new(trf(
+        let pending = ledger.pending();
+        let head = if pending > 0 {
+            trf(
+                "📎 添付 {n} 件 (解決中 {p}) / ~{t} tok / {c} 文字",
+                &[
+                    ("n", ledger.items().len().to_string()),
+                    ("p", pending.to_string()),
+                    ("t", total.short_tokens()),
+                    ("c", total.chars.to_string()),
+                ],
+            )
+        } else {
+            trf(
                 "📎 添付 {n} 件 / ~{t} tok / {c} 文字",
                 &[
                     ("n", ledger.items().len().to_string()),
                     ("t", total.short_tokens()),
                     ("c", total.chars.to_string()),
                 ],
-            ))
-            .color(theme.text_dim)
-            .size(10.5),
-        );
+            )
+        };
+        ui.label(egui::RichText::new(head).color(theme.text_dim).size(10.5));
         for a in ledger.items() {
             let cost = a.cost();
             let state = match &a.body {
@@ -1996,13 +2069,14 @@ pub fn chips_ui(ui: &mut egui::Ui, theme: &Theme, ledger: &Ledger) -> Option<Str
             };
             let label = format!("{} {} · {}", a.kind.icon(), a.token, state);
             let hover = match &a.body {
-                Body::Failed(e) => format!("{}\n{e}", a.detail),
+                Body::Failed(e) => format!("{} — {}\n{e}", a.kind.label(), a.detail),
                 Body::Ready(t) if t.is_trimmed() => format!(
-                    "{}\n{}",
+                    "{} — {}\n{}",
+                    a.kind.label(),
                     a.detail,
                     gap_marker(t.omitted_lines, t.omitted_chars)
                 ),
-                _ => a.detail.clone(),
+                _ => format!("{} — {}", a.kind.label(), a.detail),
             };
             if ui
                 .add(egui::Button::new(egui::RichText::new(label).size(10.5)).small())
@@ -2019,4 +2093,705 @@ pub fn chips_ui(ui: &mut egui::Ui, theme: &Theme, ledger: &Ledger) -> Option<Str
 /// 本文から印を 1 種類まるごと取り除く (チップの ✕ 相当)。
 pub fn strip_token(text: &str, token: &str) -> String {
     text.replace(&format!("{token} "), "").replace(token, "")
+}
+
+// ---------------------------------------------------------------------------
+// テスト
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sym(name: &str, rel: &str, s: usize, e: usize, exact: bool) -> SymbolHit {
+        SymbolHit {
+            name: name.into(),
+            kind_label: "fn".into(),
+            rel: rel.into(),
+            start_line: s,
+            end_line: e,
+            end_col: None,
+            exact,
+        }
+    }
+
+    fn files(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn src_for<'a>(f: &'a [String], syms: &'a [SymbolHit]) -> Source<'a> {
+        Source {
+            root: Path::new(""),
+            files: f,
+            files_truncated: false,
+            symbols: syms,
+            symbols_busy: false,
+            terminals: &[],
+            problems: 0,
+            repo: None,
+        }
+    }
+
+    // ── クエリの切り出し ────────────────────────────────────
+
+    #[test]
+    fn クエリの起動条件を表で固定する() {
+        // (本文, キャレット, 期待する term / None は起動しない)
+        let cases: &[(&str, usize, Option<&str>)] = &[
+            ("@", 1, Some("")),
+            ("@sym", 4, Some("sym")),
+            ("直して @app/", 9, Some("app/")),
+            ("@app/ui/", 8, Some("app/ui/")),
+            // 単語の途中の `@` では起動しない (メールアドレス)
+            ("foo@example.com", 15, None),
+            ("a@b", 3, None),
+            // `@@` はエスケープ
+            ("@@foo", 5, None),
+            // 空白を跨いだら打ち切る
+            ("@foo bar", 8, None),
+            // 行頭以外でも区切りの後なら起動する
+            ("(@x", 3, Some("x")),
+            ("直前が日本語でも空白があれば @x", 17, Some("x")),
+            // `@` が無い
+            ("ふつうの文", 5, None),
+            ("", 0, None),
+        ];
+        for (text, caret, want) in cases {
+            let got = parse_query(text, *caret);
+            match want {
+                Some(t) => {
+                    let q = got.unwrap_or_else(|| panic!("{text:?}@{caret} が起動しなかった"));
+                    assert_eq!(&q.term, t, "{text:?}");
+                    assert_eq!(q.caret, *caret);
+                }
+                None => assert!(got.is_none(), "{text:?}@{caret} が起動してしまった"),
+            }
+        }
+    }
+
+    #[test]
+    fn 名前空間は表にあるものだけを剥がす() {
+        let q = parse_query("@sym:parse", 10).expect("起動する");
+        assert_eq!(q.ns, Some(Kind::Symbol));
+        assert_eq!(q.term, "parse");
+        // 表に無い頭は名前空間ではない (Windows のドライブレターを守る)
+        let q = parse_query("@C:/work/a.rs", 13).expect("起動する");
+        assert_eq!(q.ns, None);
+        assert_eq!(q.term, "C:/work/a.rs");
+    }
+
+    #[test]
+    fn 長すぎる語では起動しない() {
+        let long = format!("@{}", "a".repeat(MAX_TERM_CHARS + 5));
+        let n = long.chars().count();
+        assert!(parse_query(&long, n).is_none());
+    }
+
+    #[test]
+    fn 階層の分割を表で固定する() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("app/ui", "app/", "ui"),
+            ("app/", "app/", ""),
+            ("ui", "", "ui"),
+            ("a/b/c", "a/b/", "c"),
+            // Windows で打った区切りも受ける
+            ("src\\app", "src\\", "app"),
+            ("", "", ""),
+        ];
+        for (term, dir, leaf) in cases {
+            assert_eq!(split_dir(term), (*dir, *leaf), "{term:?}");
+        }
+    }
+
+    // ── 階層ブラウズ ────────────────────────────────────────
+
+    #[test]
+    fn 直下だけを数え上げフォルダを先に出す() {
+        let f = files(&[
+            "README.md",
+            "src/app.rs",
+            "src/ui/a.rs",
+            "src/ui/b.rs",
+            "docs/x.md",
+        ]);
+        let top = children_of(&f, "");
+        assert_eq!(
+            top,
+            vec![
+                Child {
+                    name: "docs".into(),
+                    is_dir: true,
+                    count: 1
+                },
+                Child {
+                    name: "src".into(),
+                    is_dir: true,
+                    count: 3
+                },
+                Child {
+                    name: "README.md".into(),
+                    is_dir: false,
+                    count: 0
+                },
+            ]
+        );
+        // `@src/` で降りると **src の直下だけ** (Cursor の平坦検索との差)
+        let mid = children_of(&f, "src/");
+        assert_eq!(
+            mid,
+            vec![
+                Child {
+                    name: "ui".into(),
+                    is_dir: true,
+                    count: 2
+                },
+                Child {
+                    name: "app.rs".into(),
+                    is_dir: false,
+                    count: 0
+                },
+            ]
+        );
+        assert_eq!(children_of(&f, "src/ui/").len(), 2);
+        assert!(children_of(&f, "nope/").is_empty());
+        // 末尾の `/` を省いても同じ (正規化する)
+        assert_eq!(children_of(&f, "src"), mid);
+    }
+
+    // ── 順位付け ────────────────────────────────────────────
+
+    #[test]
+    fn 候補の並びは完全一致からフォルダの順になる() {
+        let f = files(&["main.rs", "main_helper.rs", "main/mod.rs"]);
+        let s: Vec<SymbolHit> = Vec::new();
+        let src = src_for(&f, &s);
+        let q = parse_query("@main", 5).expect("起動する");
+        let r = candidates(&q, &src);
+        let labels: Vec<&str> = r.items.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels[0], "main/", "フォルダは階層を降りる入口なので先頭");
+        assert!(labels.contains(&"main.rs"));
+        assert!(labels.contains(&"main_helper.rs"));
+        // 完全一致は前方一致より上
+        let i_exact = labels.iter().position(|l| *l == "main.rs").unwrap();
+        let i_pre = labels.iter().position(|l| *l == "main_helper.rs").unwrap();
+        assert!(i_exact < i_pre);
+    }
+
+    #[test]
+    fn 上限を超えたぶんは件数として必ず出す() {
+        let f: Vec<String> = (0..(LIST_LIMIT + 7)).map(|i| format!("f{i}.rs")).collect();
+        let s: Vec<SymbolHit> = Vec::new();
+        let src = src_for(&f, &s);
+        let q = parse_query("@f", 2).expect("起動する");
+        let r = candidates(&q, &src);
+        assert_eq!(r.items.len(), LIST_LIMIT);
+        assert_eq!(r.omitted, 7, "黙って切ってはいけない");
+    }
+
+    #[test]
+    fn シンボルは解決先の行範囲を確定前に見せる() {
+        let f = files(&["src/terminal.rs"]);
+        let s = vec![sym("parse_osc", "src/terminal.rs", 1446, 1469, true)];
+        let src = src_for(&f, &s);
+        let q = parse_query("@parse_osc", 10).expect("起動する");
+        let r = candidates(&q, &src);
+        let c = r
+            .items
+            .iter()
+            .find(|c| c.kind == Kind::Symbol)
+            .expect("シンボル候補がある");
+        assert_eq!(c.detail, "= src/terminal.rs:1447-1470 (fn)");
+        assert_eq!(token_for(&c.target), "@src/terminal.rs:1447-1470");
+    }
+
+    #[test]
+    fn 走査由来のシンボルは近似だと明示する() {
+        let f = files(&["a.rs"]);
+        let s = vec![sym("draw", "a.rs", 9, 20, false)];
+        let src = src_for(&f, &s);
+        let q = parse_query("@draw", 5).expect("起動する");
+        let r = candidates(&q, &src);
+        let c = r.items.iter().find(|c| c.kind == Kind::Symbol).unwrap();
+        assert!(c.detail.starts_with('≈'), "{}", c.detail);
+    }
+
+    // ── 切り詰め ────────────────────────────────────────────
+
+    #[test]
+    fn 切り詰めたら必ず標識を残す() {
+        let body = (0..50)
+            .map(|i| format!("行{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let head = trim_lines(&body, 40, Keep::Head);
+        assert!(head.is_trimmed());
+        assert!(head.text.contains("省略"), "{}", head.text);
+        assert!(head.text.starts_with("行0"));
+        let tail = trim_lines(&body, 40, Keep::Tail);
+        assert!(tail.text.contains("省略"));
+        assert!(tail.text.ends_with("行49"));
+        // ちょうど収まるときは触らない
+        let n = body.chars().count();
+        let all = trim_lines(&body, n, Keep::Head);
+        assert!(!all.is_trimmed());
+        assert_eq!(all.text, body);
+        // 1 文字足りないだけでも標識は出る
+        let cut = trim_lines(&body, n - 1, Keep::Head);
+        assert!(cut.is_trimmed());
+    }
+
+    #[test]
+    fn 切り詰めは行境界で行うので日本語が壊れない() {
+        let body = "日本語の行\nもう一行\nさらに一行";
+        let t = trim_lines(body, 8, Keep::Head);
+        assert!(t.is_trimmed());
+        // 途中で文字が切れていない = そのまま String として読める
+        assert!(t.text.starts_with("日本語の行"));
+    }
+
+    // ── コスト ──────────────────────────────────────────────
+
+    #[test]
+    fn コストは英数と日本語で数え方を変える() {
+        assert_eq!(cost_of("abcd").tokens, 1);
+        assert_eq!(cost_of("abcde").tokens, 2);
+        // CJK は 1 文字 1 トークン前後
+        assert_eq!(cost_of("日本語").tokens, 3);
+        let c = cost_of("ab\n日本");
+        assert_eq!(c.chars, 5);
+        assert_eq!(c.lines, 2);
+        assert_eq!(
+            Cost {
+                chars: 0,
+                lines: 0,
+                tokens: 1234
+            }
+            .short_tokens(),
+            "1.2k"
+        );
+        assert_eq!(
+            Cost {
+                chars: 0,
+                lines: 0,
+                tokens: 999
+            }
+            .short_tokens(),
+            "999"
+        );
+        assert_eq!(
+            Cost {
+                chars: 0,
+                lines: 0,
+                tokens: 42_000
+            }
+            .short_tokens(),
+            "42k"
+        );
+    }
+
+    // ── バイト範囲 (ASCII / CJK / タブ 混在) ────────────────
+
+    #[test]
+    fn シンボルの範囲は日本語とタブが混ざってもバイトで正しく出る() {
+        // タブ・CJK・絵文字 (UTF-16 で 2 単位) を 1 行に混ぜる
+        let text = "fn main() {\n\tlet 日本語 = \"🎈\";\n}\n";
+        // 行頭
+        assert_eq!(line_start_byte(text, 0), 0);
+        assert_eq!(line_start_byte(text, 1), text.find('\t').unwrap());
+        assert_eq!(line_start_byte(text, 2), text.rfind("}\n").unwrap());
+        // UTF-16 桁: \t(1) + "let "(4) = 5 で `日`
+        assert_eq!(byte_offset(text, 1, 5), text.find('日').unwrap());
+        // さらに 日本語(3) + " = \""(4) = 12 で 🎈
+        assert_eq!(byte_offset(text, 1, 12), text.find('🎈').unwrap());
+        // 🎈 は UTF-16 で 2 単位。その次は `"`
+        assert_eq!(
+            byte_offset(text, 1, 14),
+            text.find('🎈').unwrap() + '🎈'.len_utf8()
+        );
+        // 行を跨がない (桁が行末を超えたら行末で止まる)
+        assert_eq!(byte_offset(text, 1, 999), text.find("\n}").unwrap());
+        // 両端を含む行範囲
+        let r = line_range(text, 0, 1);
+        assert_eq!(&text[r], "fn main() {\n\tlet 日本語 = \"🎈\";\n");
+        let r = line_range(text, 1, 1);
+        assert_eq!(&text[r], "\tlet 日本語 = \"🎈\";\n");
+    }
+
+    #[test]
+    fn 行が足りなければ末尾へ丸める() {
+        let text = "a\nb";
+        assert_eq!(line_start_byte(text, 99), text.len());
+        assert_eq!(byte_offset(text, 99, 0), text.len());
+        let r = line_range(text, 1, 99);
+        assert_eq!(&text[r], "b");
+    }
+
+    // ── 差し込み ────────────────────────────────────────────
+
+    #[test]
+    fn 差し込みはクエリを置き換えキャレットを後ろへ置く() {
+        let text = "これを見て @app/ui";
+        let caret = text.chars().count();
+        let q = parse_query(text, caret).expect("起動する");
+        let (out, at) = apply_pick(text, &q, "@src/app.rs ");
+        assert_eq!(out, "これを見て @src/app.rs ");
+        assert_eq!(at, out.chars().count());
+        // 後ろに文字が残っていても壊さない
+        let text = "@ab のこと";
+        let q = parse_query(text, 3).expect("起動する");
+        let (out, at) = apply_pick(text, &q, "@x/");
+        assert_eq!(out, "@x/ のこと");
+        assert_eq!(at, 3);
+    }
+
+    // ── 台帳 ────────────────────────────────────────────────
+
+    fn att(token: &str, body: &str) -> Attachment {
+        Attachment {
+            token: token.into(),
+            kind: Kind::File,
+            detail: "d".into(),
+            body: Body::Ready(Trimmed {
+                text: body.into(),
+                omitted_lines: 0,
+                omitted_chars: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn 台帳は本文から消えた印を落とす() {
+        let mut l = Ledger::default();
+        l.add(att("@a.rs", "AAAA"));
+        l.add(att("@b.rs", "BBBB"));
+        assert_eq!(l.items().len(), 2);
+        l.prune("見て @a.rs をお願い");
+        assert_eq!(l.items().len(), 1);
+        assert_eq!(l.items()[0].token, "@a.rs");
+        // 同じ印は差し替え (二重添付にしない)
+        l.add(att("@a.rs", "CCCC"));
+        assert_eq!(l.items().len(), 1);
+        assert_eq!(l.total(), cost_of("CCCC"));
+        // 未解決は 0 コストで数え、件数に出す
+        l.add(Attachment {
+            token: "@c.rs".into(),
+            kind: Kind::File,
+            detail: "d".into(),
+            body: Body::Pending,
+        });
+        assert_eq!(l.pending(), 1);
+        assert_eq!(l.total(), cost_of("CCCC"));
+    }
+
+    // ── 送信直前の展開 ──────────────────────────────────────
+
+    #[test]
+    fn 展開は本文の後ろへフェンス付きで足す() {
+        let items = vec![att("@a.rs", "fn a() {}")];
+        let out = expand("@a.rs を直して", &items, false);
+        assert!(out.starts_with("@a.rs を直して"));
+        assert!(out.contains("▼ @a.rs — d"));
+        assert!(out.contains("fn a() {}"));
+        // 印が本文から消えていたら添付も出さない
+        assert_eq!(expand("なにもない", &items, false), "なにもない");
+    }
+
+    #[test]
+    fn 本文にフェンスがあっても閉じ込められない() {
+        let items = vec![att("@a.md", "```rust\ncode\n```")];
+        let out = expand("@a.md", &items, false);
+        assert!(out.contains("````"), "本文より長いフェンスを使う: {out}");
+    }
+
+    #[test]
+    fn 自分でパスを読めるエージェントにはファイル本文を重ねない() {
+        let items = vec![att("@a.rs", "fn a() {}")];
+        let native = expand("@a.rs", &items, true);
+        assert!(!native.contains("fn a() {}"), "二重に送っている: {native}");
+        // ファイル以外 (範囲・端末・差分) は必ず同梱する
+        let mut span = att("@a.rs:1-3", "fn a() {}");
+        span.kind = Kind::Symbol;
+        let out = expand("@a.rs:1-3", &[span], true);
+        assert!(out.contains("fn a() {}"));
+    }
+
+    #[test]
+    fn 未解決と失敗は黙らせない() {
+        let pending = Attachment {
+            token: "@x".into(),
+            kind: Kind::Diff,
+            detail: "d".into(),
+            body: Body::Pending,
+        };
+        assert!(expand("@x", &[pending], false).contains("未解決"));
+        let failed = Attachment {
+            token: "@y".into(),
+            kind: Kind::Diff,
+            detail: "d".into(),
+            body: Body::Failed("not a git repository".into()),
+        };
+        let out = expand("@y", &[failed], false);
+        assert!(out.contains("not a git repository"), "{out}");
+    }
+
+    #[test]
+    fn 印を外すと本文からも消える() {
+        assert_eq!(strip_token("見て @a.rs お願い", "@a.rs"), "見て お願い");
+        assert_eq!(strip_token("@a.rs", "@a.rs"), "");
+    }
+
+    // ── 定義の終端推定 ──────────────────────────────────────
+
+    #[test]
+    fn 定義の終端を字下げで推定する() {
+        let brace = ["fn a() {", "    let x = 1;", "}", "fn b() {}"];
+        assert_eq!(def_end_line(&brace, 0, 100), 2, "閉じ括弧まで取り込む");
+        let py = ["def a():", "    x = 1", "", "b = 2"];
+        assert_eq!(def_end_line(&py, 0, 100), 1, "字下げが戻る手前まで");
+        let one = ["const A = 1;", "const B = 2;"];
+        assert_eq!(def_end_line(&one, 0, 100), 0, "1 行の定義");
+        // 上限を超えない
+        let long: Vec<&str> = std::iter::once("fn a() {")
+            .chain(std::iter::repeat_n("    x;", 50))
+            .collect();
+        assert_eq!(def_end_line(&long, 0, 5), 5);
+        assert_eq!(def_end_line(&[], 0, 5), 0);
+    }
+
+    #[test]
+    fn ワークスペース走査は言語サーバが無くても定義を見つける() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-mention-test", "scan");
+        let f = dir.join("a.rs");
+        std::fs::write(
+            &f,
+            "// まえおき\nfn 検索対象(引数: u8) {\n\tlet x = 1;\n}\nfn other() {}\n",
+        )
+        .expect("write");
+        let res = scan_symbols(&dir, &files(&["a.rs"]), "検索");
+        assert_eq!(res.hits.len(), 1, "{:?}", res.hits);
+        let h = &res.hits[0];
+        assert_eq!(h.name, "検索対象");
+        assert_eq!(h.start_line, 1);
+        assert_eq!(h.end_line, 3, "閉じ括弧まで");
+        assert!(!h.exact, "走査由来は近似");
+        // 語が短すぎる / 無いときは何も返さない
+        assert!(scan_symbols(&dir, &files(&["a.rs"]), "").hits.is_empty());
+        // 索引に無いファイルは読まない (数えるだけ)
+        let miss = scan_symbols(&dir, &files(&["nope.rs"]), "検索");
+        assert_eq!(miss.skipped_files, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 範囲の取り出しは日本語とタブが混ざってもずれない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-mention-test", "span");
+        let f = dir.join("b.rs");
+        let text = "fn 頭() {}\nfn 対象() {\n\tlet 値 = \"🎈\";\n}\nfn 尾() {}\n";
+        std::fs::write(&f, text).expect("write");
+        // 1 行目から 3 行目まで (0 起点)、終端は `}` の直後 (UTF-16 で 1 桁)
+        let got = run_fetch(&Fetch::Span {
+            abs: f.clone(),
+            start_line: 1,
+            end_line: 3,
+            end_col: Some(1),
+        })
+        .expect("読める");
+        assert_eq!(got.text, "fn 対象() {\n\tlet 値 = \"🎈\";\n}");
+        // 桁を渡さなければ行末まで
+        let all = run_fetch(&Fetch::Span {
+            abs: f,
+            start_line: 1,
+            end_line: 3,
+            end_col: None,
+        })
+        .expect("読める");
+        assert_eq!(all.text, "fn 対象() {\n\tlet 値 = \"🎈\";\n}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 配置 ────────────────────────────────────────────────
+
+    fn assert_layout_ok(area: egui::Rect, lay: &PopupLayout, tag: &str) {
+        assert!(area.contains_rect(lay.frame), "{tag}: 枠が可用領域から出た");
+        for (n, r) in [
+            ("header", lay.header),
+            ("list", lay.list),
+            ("footer", lay.footer),
+        ] {
+            assert!(lay.frame.contains_rect(r), "{tag}: {n} が枠から出た");
+            assert!(area.contains_rect(r), "{tag}: {n} が可用領域から出た");
+        }
+        // 上から header → list → footer。重ならない。
+        assert!(
+            lay.header.bottom() <= lay.list.top() + 0.01,
+            "{tag}: 重なり"
+        );
+        assert!(
+            lay.list.bottom() <= lay.footer.top() + 0.01,
+            "{tag}: 重なり"
+        );
+    }
+
+    #[test]
+    fn ポップアップはどの画面でも見切れない() {
+        for (w, h) in [(900.0_f32, 700.0_f32), (1200.0_f32, 300.0_f32)] {
+            let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+            for top in [0.0_f32, h * 0.5, h - 30.0] {
+                for aw in [80.0_f32, 400.0, w] {
+                    let anchor = egui::Rect::from_min_size(
+                        egui::pos2(0.0, top),
+                        egui::vec2(aw.min(w), 24.0),
+                    );
+                    for items in [0usize, 1, 40] {
+                        let lay = popup_layout(area, anchor, items.max(1), 20.0, 16.0);
+                        let tag = format!("{w}x{h} top={top} aw={aw} n={items}");
+                        assert_layout_ok(area, &lay, &tag);
+                        assert!(lay.rows <= items.max(1), "{tag}: 入らない行を描こうとした");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 下に入らなければ上へ回す() {
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 300.0));
+        let low = egui::Rect::from_min_size(egui::pos2(10.0, 270.0), egui::vec2(400.0, 24.0));
+        let lay = popup_layout(area, low, 10, 20.0, 16.0);
+        assert!(lay.above, "下に余白が無いのに下へ出している");
+        assert_layout_ok(area, &lay, "low");
+        let high = egui::Rect::from_min_size(egui::pos2(10.0, 4.0), egui::vec2(400.0, 24.0));
+        let lay = popup_layout(area, high, 10, 20.0, 16.0);
+        assert!(!lay.above);
+        assert_layout_ok(area, &lay, "high");
+    }
+
+    // ── カタログと表記 ──────────────────────────────────────
+
+    #[test]
+    fn 種別カタログは全種を覆う() {
+        let all = [
+            Kind::Symbol,
+            Kind::File,
+            Kind::Folder,
+            Kind::Terminal,
+            Kind::Diff,
+            Kind::Problems,
+        ];
+        assert_eq!(KINDS.len(), all.len());
+        for k in all {
+            assert!(KINDS.iter().any(|m| m.kind == k), "{k:?} がカタログに無い");
+            assert!(!k.ns().is_empty());
+            assert!(!k.icon().is_empty());
+            assert!(!k.label().is_empty());
+        }
+        // 名前空間は重複しない (パーサが表引き 1 本なので衝突すると事故る)
+        let mut ns: Vec<&str> = KINDS.iter().map(|m| m.ns).collect();
+        ns.sort_unstable();
+        let n = ns.len();
+        ns.dedup();
+        assert_eq!(ns.len(), n);
+    }
+
+    #[test]
+    fn 印には空白を入れない() {
+        // 空白が入ると `parse_query` が途中で打ち切られ、印として壊れる。
+        let targets = [
+            Target::File {
+                rel: "src/a.rs".into(),
+            },
+            Target::Folder { rel: "src".into() },
+            Target::Symbol {
+                rel: "src/a.rs".into(),
+                start_line: 0,
+                end_line: 2,
+                end_col: None,
+                exact: true,
+            },
+            Target::Terminal {
+                id: 7,
+                title: "zsh 1".into(),
+            },
+            Target::Diff(DiffScope::WorkTree),
+            Target::Diff(DiffScope::Branch {
+                rev: UPSTREAM_REV.into(),
+                name: "upstream".into(),
+            }),
+            Target::Problems,
+        ];
+        for t in targets {
+            let tok = token_for(&t);
+            assert!(tok.starts_with('@'), "{tok}");
+            assert!(!tok.chars().any(char::is_whitespace), "{tok}");
+        }
+        assert_eq!(folder_token("src/ui"), "@dir:src/ui/");
+    }
+
+    #[test]
+    fn 画面のショートカット表記をベタ書きしていない() {
+        // `keybinds::tests` の番人と同じ約束。修飾キーの記号を文字列へ埋めない。
+        const GLYPHS: [char; 4] = ['⌘', '⌥', '⌃', '⇧'];
+        let src = include_str!("mention.rs").replace("\r\n", "\n");
+        for line in src.lines() {
+            if line.contains("assert") || !line.contains('"') {
+                continue;
+            }
+            assert!(
+                !line.chars().any(|c| GLYPHS.contains(&c)),
+                "打鍵表記がベタ書きされている: {}",
+                line.trim()
+            );
+        }
+    }
+
+    #[test]
+    fn 差分は名前空間を指定すれば任意の基点と比べられる() {
+        let f = files(&["a.rs"]);
+        let s: Vec<SymbolHit> = Vec::new();
+        let mut src = src_for(&f, &s);
+        let repo = PathBuf::from("");
+        src.repo = Some(&repo);
+        // `@diff:` だけなら既定の 2 つ。既定ブランチ名は推測しない
+        // (上流は git の `@{u}` に解決させる)。
+        let q = parse_query("@diff:", 6).expect("起動する");
+        let tokens: Vec<String> = candidates(&q, &src)
+            .items
+            .iter()
+            .map(|c| token_for(&c.target))
+            .collect();
+        assert!(tokens.contains(&"@diff:worktree".to_string()), "{tokens:?}");
+        assert!(tokens.contains(&"@diff:upstream".to_string()), "{tokens:?}");
+        // 基点を打てばそれと比べられる (`/` はパスではないので階層に降りない)。
+        let q = parse_query("@diff:origin/main", 17).expect("起動する");
+        let tokens: Vec<String> = candidates(&q, &src)
+            .items
+            .iter()
+            .map(|c| token_for(&c.target))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec!["@diff:origin/main".to_string()],
+            "打った基点だけが残る"
+        );
+        // repo が無ければ差分は 1 件も出さない (空の項目を並べない)。
+        src.repo = None;
+        assert!(candidates(&q, &src).items.is_empty());
+    }
+
+    #[test]
+    fn 診断と端末は中身があるときだけ出す() {
+        let f: Vec<String> = Vec::new();
+        let s: Vec<SymbolHit> = Vec::new();
+        let mut src = src_for(&f, &s);
+        let q = parse_query("@", 1).expect("起動する");
+        let empty = candidates(&q, &src);
+        assert!(empty.items.is_empty(), "空状態で項目を並べない");
+        let terms = [(3u64, "claude".to_string())];
+        src.terminals = &terms;
+        src.problems = 4;
+        let r = candidates(&q, &src);
+        let kinds: Vec<Kind> = r.items.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&Kind::Terminal));
+        assert!(kinds.contains(&Kind::Problems));
+    }
 }
