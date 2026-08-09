@@ -1747,21 +1747,26 @@ impl AcpClient {
             )
         })?;
         let pid = child.id();
-        let stdin = child.stdin.take().ok_or_else(|| tr("stdin を開けません"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| tr("stdout を開けません"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| tr("stderr を開けません"))?;
+        // ここから先で失敗したら、**起こした木ごと片付けてから**返す
+        // (エラーだけ返して孤児プロセスを残さない)。
+        macro_rules! abort {
+            ($why:expr) => {{
+                crate::procx::kill_tree(pid);
+                let _ = child.wait();
+                return Err($why);
+            }};
+        }
+        let (stdin, stdout, stderr) =
+            match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+                (Some(i), Some(o), Some(e)) => (i, o, e),
+                _ => abort!(tr("パイプを開けません")),
+            };
 
         let (tx_ev, rx) = mpsc::channel::<AcpEvent>();
         let (tx_out, rx_out) = mpsc::channel::<String>();
 
         // ライタースレッド: UI が `send` してもここで詰まらない。
-        std::thread::Builder::new()
+        let writer = std::thread::Builder::new()
             .name("acp-write".into())
             .spawn(move || {
                 let mut w = stdin;
@@ -1773,11 +1778,13 @@ impl AcpClient {
                         break;
                     }
                 }
-            })
-            .map_err(|e| e.to_string())?;
+            });
+        if let Err(e) = writer {
+            abort!(e.to_string());
+        }
 
         // リーダースレッド: パースは全部ここ。UI スレッドではやらない。
-        {
+        let reader = {
             let tx_ev = tx_ev.clone();
             let out = tx_out.clone();
             let host = host.clone();
@@ -1785,11 +1792,13 @@ impl AcpClient {
             std::thread::Builder::new()
                 .name("acp-read".into())
                 .spawn(move || read_loop(BufReader::new(stdout), tx_ev, out, host, ctx2))
-                .map_err(|e| e.to_string())?;
+        };
+        if let Err(e) = reader {
+            abort!(e.to_string());
         }
 
         // stderr 専用スレッド: **吸い続けないとパイプが埋まってエージェントが止まる。**
-        {
+        let errs = {
             let tx_ev = tx_ev.clone();
             std::thread::Builder::new()
                 .name("acp-err".into())
@@ -1801,7 +1810,9 @@ impl AcpClient {
                         }
                     }
                 })
-                .map_err(|e| e.to_string())?;
+        };
+        if let Err(e) = errs {
+            abort!(e.to_string());
         }
 
         let mut c = AcpClient {
