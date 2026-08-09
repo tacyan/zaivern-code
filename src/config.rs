@@ -292,6 +292,10 @@ pub struct Config {
     /// **既定は無効** — ユーザーが明示的に有効化したときだけ働く。
     pub failover: crate::failover::FailoverConfig,
 
+    /// 🏁 プロンプトレースの勝者評価 (`[race_eval]`)。
+    /// 除外パターンと上限は**すべてここから来る** — race.rs にリテラルは置かない。
+    pub race_eval: RaceEvalConfig,
+
     /// コマンドパレットの MRU (最近実行したコマンド。先頭が直近)。
     ///
     /// UI の操作から溜まる値なので手書きの config.toml には**書かない** —
@@ -360,6 +364,74 @@ impl SuperAgentConfig {
             None
         } else {
             Some(c)
+        }
+    }
+}
+
+/// `[race_eval]` セクション — 🏁 プロンプトレースの**勝者評価**が使う除外と上限。
+///
+/// 評価は「どの racer の差分が良いか」を見るものなので、**人が書いていない差分**を
+/// 読ませても判断の役に立たない。ロックファイル・ビルド成果物・巨大な生成物は
+/// ここに書いたパターンで落とす。**パターンはコードに直書きせず必ずここから配る**
+/// (race.rs は `&RaceEvalConfig` を受け取るだけで、既定値も知らない)。
+///
+/// 書式は `.gitignore` と同じ (`crate::ignore` がそのまま解釈する) ので、
+/// `target/` のようなディレクトリ指定も `*.png` のようなグロブも書ける。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RaceEvalConfig {
+    /// 評価の入力から落とすパス (`.gitignore` 記法)。
+    pub exclude: Vec<String>,
+    /// 候補 1 本ぶんの差分に許す最大バイト数。超えたら**切り詰めた旨を明示**する。
+    pub max_diff_bytes: usize,
+    /// 全候補を合わせた差分の最大バイト数 (1 本ぶんの上限とは別に効く)。
+    pub max_total_bytes: usize,
+    /// 1 行がこれを超えるファイルは「生成物」とみなして丸ごと落とす。
+    /// minified な生成物は行数が少なくても 1 行が数十万バイトになる。
+    pub max_line_bytes: usize,
+}
+
+/// 既定の除外パターン。**ここが唯一の出どころ**で、race.rs 側には持たせない。
+const DEFAULT_RACE_EXCLUDE: &[&str] = &[
+    // ── ロックファイル (どれも自動生成で、差分が長い割に読む価値がない) ──
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "npm-shrinkwrap.json",
+    "bun.lockb",
+    "poetry.lock",
+    "Pipfile.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "go.sum",
+    "flake.lock",
+    "uv.lock",
+    // ── ビルド成果物・依存の展開先 ──
+    "target/",
+    "node_modules/",
+    "dist/",
+    "build/",
+    "out/",
+    ".next/",
+    ".venv/",
+    "vendor/",
+    "__pycache__/",
+    "*.min.js",
+    "*.min.css",
+    "*.map",
+    // ── 生成された固定物 ──
+    "*.snap",
+    "*.pb.go",
+];
+
+impl Default for RaceEvalConfig {
+    fn default() -> Self {
+        Self {
+            exclude: DEFAULT_RACE_EXCLUDE.iter().map(|s| s.to_string()).collect(),
+            max_diff_bytes: 24 * 1024,
+            max_total_bytes: 96 * 1024,
+            max_line_bytes: 4 * 1024,
         }
     }
 }
@@ -488,6 +560,7 @@ impl Default for Config {
             super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),
             failover: crate::failover::FailoverConfig::default(),
+            race_eval: RaceEvalConfig::default(),
             palette_recent: Vec::new(),
         }
     }
@@ -1140,6 +1213,15 @@ command = ""
 # max_cooldown_secs = 3600  # クールダウンの上限
 # verify_secs = 90          # 切替先が動いていると見なすまでの観察時間
 # min_screen_hits = 2       # 画面由来の検知を信じるまでの連続一致回数
+
+# ── 🏁 レースの勝者評価 ─────────────────
+# 候補の差分から「読ませても意味がないもの」を落とす条件。
+# 書式は .gitignore と同じ。書かなければ下の既定がそのまま使われます。
+# [race_eval]
+# exclude = ["Cargo.lock", "package-lock.json", "target/", "node_modules/", "*.min.js"]
+# max_diff_bytes = 24576    # 候補 1 本ぶんの差分の上限 (超えたら切り詰めた旨を出す)
+# max_total_bytes = 98304   # 全候補あわせた上限
+# max_line_bytes = 4096     # これより長い行を含むファイルは生成物とみなして落とす
 
 # [[agents]]
 # name = "Gemini CLI"

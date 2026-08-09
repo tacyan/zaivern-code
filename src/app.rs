@@ -8149,6 +8149,11 @@ impl ZaivernApp {
                         Err(e) => self.toast(e, false),
                     }
                 }
+                // 🏆 勝者評価 — **提案を出すだけ**。ここで採用 (マージ) はしない。
+                // 除外パターンと上限は設定 (`[race_eval]`) から配る。
+                race::RaceAction::Evaluate => {
+                    self.race.start_eval(&self.cfg.race_eval, ctx);
+                }
                 race::RaceAction::Close => self.race.close(),
             }
         }
@@ -10031,6 +10036,7 @@ impl ZaivernApp {
             | Cmd::OpenAgentPicker
             | Cmd::NewTask
             | Cmd::OpenRace
+            | Cmd::EvalRace
             | Cmd::SendAgentMessage
             | Cmd::ToggleMdPreview
             | Cmd::ToggleSidebar
@@ -10697,6 +10703,17 @@ impl ZaivernApp {
                 self.cockpit = true;
                 self.kanban = false;
                 self.race.form_open = true;
+            }
+            // 🏆 勝者評価。走っているレースが無ければ何も起こさず理由を出す
+            // (**提案を出すだけ** — 採用はユーザーが [採用] を押したときだけ)。
+            Cmd::EvalRace => {
+                if self.race.race.is_none() {
+                    self.toast(tr("走っているレースがありません"), false);
+                } else {
+                    self.cockpit = true;
+                    self.kanban = false;
+                    self.race.start_eval(&self.cfg.race_eval, ctx);
+                }
             }
             Cmd::SendAgentMessage => {
                 self.cockpit = true;
@@ -21028,6 +21045,12 @@ impl ZaivernApp {
                 tr("プロンプトレース (1 プロンプトを複数エージェントで並走)"),
                 String::new(),
                 Cmd::OpenRace,
+            ),
+            (
+                "🏆".into(),
+                tr("レースの勝者を評価 (勝者と理由を提案。採用はしません)"),
+                String::new(),
+                Cmd::EvalRace,
             ),
             (
                 "📮".into(),

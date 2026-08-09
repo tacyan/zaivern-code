@@ -29,6 +29,8 @@ pub enum Cmd {
     NewTask,
     /// プロンプトレースの開始フォームを開く (Cockpit も一緒に開く)
     OpenRace,
+    /// 走行中のレースの勝者を評価する (**提案だけ** — 採用はしない)
+    EvalRace,
     /// エージェントへのメッセージ送信フォームを開く
     SendAgentMessage,
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替
@@ -767,6 +769,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::SendAgentMessage
         | Cmd::NewTask
         | Cmd::OpenRace
+        | Cmd::EvalRace
         | Cmd::ToggleCockpit
         | Cmd::ToggleKanban
         | Cmd::ToggleDeck
