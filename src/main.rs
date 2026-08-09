@@ -1,15 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acp;
 mod agent_input;
 mod agent_picker;
 mod agents;
-mod acp;
 mod app;
 mod breadcrumb;
 mod checkpoint;
 mod cli;
 mod commander;
 mod config;
+mod conflict;
 mod coordinator;
 mod deck;
 mod desktop;

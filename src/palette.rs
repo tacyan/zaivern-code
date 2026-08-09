@@ -35,6 +35,8 @@ pub enum Cmd {
     OpenRace,
     /// 走行中のレースの勝者を評価する (**提案だけ** — 採用はしない)
     EvalRace,
+    /// 🛰 衝突レーダー (並列ワークツリー同士のマージ衝突予測) の表示切替
+    ToggleConflictRadar,
     /// エージェントへのメッセージ送信フォームを開く
     SendAgentMessage,
     /// アクティブな Markdown ファイルのレンダリングプレビュー切替
@@ -851,6 +853,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::NewTask
         | Cmd::OpenRace
         | Cmd::EvalRace
+        | Cmd::ToggleConflictRadar
         | Cmd::ToggleCockpit
         | Cmd::CheckpointList
         | Cmd::CheckpointNow
