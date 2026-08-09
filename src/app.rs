@@ -32171,7 +32171,7 @@ impl ZaivernApp {
                             .join("\n")
                     })
                     .unwrap_or_else(|| tr("その端末はもうありません"));
-                self.mention.provide(&token, text);
+                self.mention.provide(&token, text, mention::Keep::Tail);
             }
             mention::Need::Problems { token } => {
                 let body = self
@@ -32189,7 +32189,7 @@ impl ZaivernApp {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                self.mention.provide(&token, body);
+                self.mention.provide(&token, body, mention::Keep::Head);
             }
         }
     }

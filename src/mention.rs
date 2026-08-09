@@ -1452,8 +1452,11 @@ impl Mention {
     }
 
     /// 端末・診断のように App しか持っていない本文を渡す。
-    pub fn provide(&mut self, token: &str, body: String) {
-        let t = trim_lines(&body, BODY_MAX_CHARS, Keep::Tail);
+    ///
+    /// `keep` は上限を超えたときにどちら側を残すか — 端末は末尾 ([`Keep::Tail`])、
+    /// 診断は先頭 ([`Keep::Head`])。どちらでも捨てた量は標識として残る。
+    pub fn provide(&mut self, token: &str, body: String, keep: Keep) {
+        let t = trim_lines(&body, BODY_MAX_CHARS, keep);
         self.resolve_any(token, Body::Ready(t));
     }
 
@@ -1569,7 +1572,10 @@ impl Mention {
     }
 
     /// 打鍵をコンポーザより**先に**さらう。ポップアップが出ている間だけ食べる。
-    fn grab(ctx: &egui::Context, open: bool) -> Nav {
+    ///
+    /// `has_items` が false のときは Enter / Tab を**取らない** — 0 件で食べると
+    /// 「Enter を押しても改行も送信もできない」行き止まりになる。
+    fn grab(ctx: &egui::Context, open: bool, has_items: bool) -> Nav {
         if !open {
             return Nav::None;
         }
@@ -1600,11 +1606,11 @@ impl Mention {
                         nav = Nav::Up;
                         false
                     }
-                    egui::Key::Enter if !ime => {
+                    egui::Key::Enter if !ime && has_items => {
                         nav = Nav::Accept;
                         false
                     }
-                    egui::Key::Tab => {
+                    egui::Key::Tab if has_items => {
                         nav = Nav::Attach;
                         false
                     }
@@ -1772,11 +1778,11 @@ impl Mention {
             }
         }
 
-        let mut nav = Self::grab(&ctx, self.open);
+        let n = self.ranked.items.len();
+        let mut nav = Self::grab(&ctx, self.open, n > 0);
         if std::mem::take(&mut self.clicked) {
             nav = Nav::Accept;
         }
-        let n = self.ranked.items.len();
         match nav {
             Nav::Close => {
                 self.open = false;
