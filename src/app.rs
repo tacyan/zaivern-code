@@ -81,6 +81,13 @@ use crate::deck;
 // ---------------------------------------------------------------------------
 
 /// severity 1..4 のアイコン。添字 0..3 が severity 1..4。
+/// エージェント別の会話履歴を 1 エージェント × 1 フォルダあたり何件残すか。
+///
+/// 起動のたびに 1 行積むので、放っておくと単調増加する。一覧に出るのは
+/// `session_picker::MAX_RESULTS` 件までなので、それより十分多く取って
+/// 「一覧の下の方が既に消えている」を起こさない。
+const HISTORY_KEEP: usize = 200;
+
 const PROBLEM_SEV_ICONS: [&str; 4] = ["❌", "⚠", "ℹ", "💬"];
 /// severity 1..4 の名前 (ホバーで出す。`tr` に通して使う)。
 const PROBLEM_SEV_NAMES: [&str; 4] = ["エラー", "警告", "情報", "ヒント"];
@@ -3179,6 +3186,9 @@ pub struct ZaivernApp {
     /// chord (2 打鍵) の待機。フレームを跨ぐので `App` が持つ。
     chord: crate::keybinds::ChordState,
     about_open: bool,
+    /// **What's New** に出す変更点。空でない間だけウィンドウを描く
+    /// (bool を別に持つと「開いているのに中身が空」が構造的に起こり得る)。
+    whats_new: Vec<crate::whats_new::Release>,
     /// ライセンス (Pro) の状態ダイアログを開いているか。
     license_open: bool,
     /// ダイアログの貼り付け欄。保存済みキーとは別に持つ (貼り直しを中断できる)。
@@ -3973,6 +3983,7 @@ impl ZaivernApp {
             hotexit_warned: HashSet::new(),
             chord: crate::keybinds::ChordState::default(),
             about_open: false,
+            whats_new: Vec::new(),
             // 起動時に 1 回だけローカルのキーを読んで検証する (通信なし)。
             license_open: false,
             license_input: String::new(),
@@ -4138,6 +4149,10 @@ impl ZaivernApp {
         for f in open_files {
             app.open_path(&f);
         }
+        // 更新後の初回起動でだけ「この版の新機能」を出す。
+        // **セッション復元の後**に置く — 復元中に開くと、復元でレイアウトが
+        // 変わる最中に窓が出て「画面が突然変わる」ように見える。
+        app.whats_new_on_start();
         app
     }
 
@@ -5674,6 +5689,13 @@ impl ZaivernApp {
     fn restore_session_data(&mut self, ctx: &egui::Context) {
         // ついでに古いターミナルログを掃除する (新しい 40 本だけ残す)
         session::prune_term_logs(self.primary_root(), 40);
+        // エージェント別の会話履歴も同じ方針で頭打ちにする。
+        // 起動のたびに 1 行積むので、放っておくと単調増加する
+        // (一覧に出るのは `session_picker::MAX_RESULTS` 件までなので、
+        //  それより十分多い分だけ残せばよい)。
+        for spec in crate::agents::AGENT_CATALOG {
+            let _ = crate::history::prune(spec.bin, self.primary_root(), HISTORY_KEEP);
+        }
         let Some(sess) = session::load(&self.roots) else {
             return;
         };
@@ -6333,7 +6355,7 @@ impl ZaivernApp {
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                crate::perf::repaint_after(ctx, std::time::Duration::from_millis(200), "poll_index");
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.index_rx = None,
         }
@@ -7673,6 +7695,20 @@ impl ZaivernApp {
         // セッション ID は再利用され得るので、フェイルオーバーの段も一緒に忘れる
         // (残すと別セッションの状態として読まれてしまう)。
         let mut freed: Option<worktree::AgentWorktree> = None;
+        // エージェント別履歴の締め (終了時刻 + 最初の指示の要約)。
+        // `agents.remove` に渡すと Session ごと別スレッドへ流れて読めなくなるので、
+        // **消す前に**書く。書けなくても閉じる操作は続ける。
+        if let Some(s) = self.agents.sessions.get(i) {
+            if let Some(bin) = crate::agents::spec_for_command(&s.command).map(|sp| sp.bin) {
+                let _ = crate::history::finish(
+                    bin,
+                    &s.cwd,
+                    s.id,
+                    crate::history::now_unix(),
+                    s.last_prompt.as_deref().unwrap_or_default(),
+                );
+            }
+        }
         if let Some(id) = self.agents.sessions.get(i).map(|s| s.id) {
             self.failover.forget_session(id);
             // 自動命名の状態も一緒に忘れる。セッション ID は再利用され得るので、
@@ -7842,7 +7878,7 @@ impl ZaivernApp {
             ));
         }
         if let Some(d) = next {
-            ctx.request_repaint_after(d);
+            crate::perf::repaint_after(ctx, d, "submit_tick");
         }
     }
 
@@ -8255,7 +8291,7 @@ impl ZaivernApp {
         }
         if self.dialogs.busy() {
             // 待っている間は少し速く回して、選ばれた瞬間に反応できるようにする
-            ctx.request_repaint_after(Duration::from_millis(50));
+            crate::perf::repaint_after(ctx, Duration::from_millis(50), "poll_dialogs");
         }
     }
 
@@ -10031,7 +10067,7 @@ impl ZaivernApp {
             // デバウンス満了の瞬間に 1 回だけ起こす。予定が無ければ何も予約
             // しないので、放っておけば再描画は止まる (常時アニメーションにしない)。
             if let Some(after) = self.lsp_highlight.due_in(now, lsp::HIGHLIGHT_DEBOUNCE) {
-                ctx.request_repaint_after(after);
+                crate::perf::repaint_after(ctx, after, "lsp_completion_tick");
             }
         } else if !self.lsp_highlight_spans.is_empty() {
             self.clear_highlight_spans();
@@ -10816,6 +10852,7 @@ impl ZaivernApp {
             | Cmd::NewTerminal
             | Cmd::ShowShortcuts
             | Cmd::ShowAbout
+            | Cmd::ShowWhatsNew
             | Cmd::OpenInIde(_)
             | Cmd::OpenFolderInIde(_)
             | Cmd::NewFile
@@ -11325,6 +11362,7 @@ impl ZaivernApp {
             Cmd::NewTerminal => self.new_terminal(ctx),
             Cmd::ShowShortcuts => self.shortcuts_open = true,
             Cmd::ShowAbout => self.about_open = true,
+            Cmd::ShowWhatsNew => self.open_whats_new(),
             Cmd::OpenInIde(key) => {
                 let file = self
                     .editor
@@ -12449,7 +12487,7 @@ impl ZaivernApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             }
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(50), "fullscreen_guard");
         }
 
         // 矩形の「真の安定」観測: 前フレームから 1px 超動いたら時刻を取り直す。
@@ -12484,7 +12522,7 @@ impl ZaivernApp {
             // 時間 (1.5 秒) に加えて「矩形が 0.5 秒動いていない」ことも要求する —
             // 負荷でアニメが 1.5 秒を超えても、動いている間は絶対に送らない。
             let since = *self.fs_broken_since.get_or_insert_with(Instant::now);
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(200), "fullscreen_guard");
             if since.elapsed().as_millis() >= 1500
                 && rect_stable_ms >= 500
                 && !self.fs_rescue_pending
@@ -12554,7 +12592,7 @@ impl ZaivernApp {
                     }
                 }
                 // 入力が無くても状態機械が進むようフレームを回し続ける
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                crate::perf::repaint_after(ctx, std::time::Duration::from_millis(100), "fullscreen_guard");
             }
         }
     }
@@ -12585,7 +12623,7 @@ impl ZaivernApp {
         if let Some((pos, size)) = self.fake_fullscreen.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
             self.fake_fs_restore = Some((pos, size, Instant::now()));
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(50), "exit_fake_fullscreen");
         }
     }
 
@@ -12634,12 +12672,12 @@ impl ZaivernApp {
             // 待機中だけ再描画を予約する (時間切れを画面へ反映するため)。
             // 待っていないフレームでは 1 回も呼ばない = アイドルのコストは 0。
             let left = chord.remaining(ctx.input(|i| i.time));
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left.min(0.1)));
+            crate::perf::repaint_after(ctx, std::time::Duration::from_secs_f64(left.min(0.1)), "handle_shortcuts");
         } else if matches!(
             tick,
             crate::keybinds::ChordTick::TimedOut | crate::keybinds::ChordTick::Cancelled
         ) {
-            ctx.request_repaint();
+            crate::perf::repaint(ctx, "handle_shortcuts");
         }
         let mut consume = |ctx: &egui::Context, b: crate::keybinds::Binding| -> bool {
             ctx.input_mut(|i| crate::keybinds::consume_binding(i, b, &mut chord))
@@ -13042,6 +13080,7 @@ impl ZaivernApp {
             && !self.goto_open
             && !self.shortcuts_open
             && !self.about_open
+            && self.whats_new.is_empty()
             && !self.license_open
             && !self.remote_open
             && ctx.memory(|m| m.focused().is_none() && !m.any_popup_open())
@@ -18722,7 +18761,7 @@ impl ZaivernApp {
                     ),
                 };
                 let _ = tx.send(msg);
-                ctx2.request_repaint();
+                crate::perf::repaint(&ctx2, "git_job_done");
             });
         match spawned {
             Ok(_) => {
@@ -18782,7 +18821,7 @@ impl ZaivernApp {
                     }
                 }
                 let _ = tx.send(out);
-                ctx2.request_repaint();
+                crate::perf::repaint(&ctx2, "git_history_done");
             });
         match spawned {
             Ok(_) => self.git_ops.history_rx = Some(rx),
@@ -19413,10 +19452,10 @@ impl ZaivernApp {
                                         // = オフセットが減る = 左のタブが見える
                                         if p.x < vis.left() + EDGE {
                                             ui.scroll_with_delta(egui::vec2(STEP, 0.0));
-                                            ui.ctx().request_repaint();
+                                            crate::perf::repaint(ui.ctx(), "tab_drag_scroll");
                                         } else if p.x > vis.right() - EDGE {
                                             ui.scroll_with_delta(egui::vec2(-STEP, 0.0));
-                                            ui.ctx().request_repaint();
+                                            crate::perf::repaint(ui.ctx(), "tab_drag_scroll");
                                         }
                                     }
                                 } else {
@@ -25235,7 +25274,7 @@ impl ZaivernApp {
                         });
                 }
             });
-        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        crate::perf::repaint_after(ctx, std::time::Duration::from_millis(300), "toasts_ui");
     }
 
     // ─── スマホリモート ─────────────────────────────────────────────
@@ -25383,7 +25422,7 @@ impl ZaivernApp {
             self.voice = VoiceState::default();
         } else {
             // 録音中は HUD を動かし続ける
-            ctx.request_repaint_after(Duration::from_millis(120));
+            crate::perf::repaint_after(ctx, Duration::from_millis(120), "poll_voice");
         }
     }
 
@@ -27879,7 +27918,7 @@ impl eframe::App for ZaivernApp {
                         ));
                     }
                 }
-                ctx.request_repaint();
+                crate::perf::repaint(ctx, "update");
             }
         }
     }
@@ -27977,7 +28016,7 @@ impl ZaivernApp {
         // 検査 1 回で戻り、再描画も要求しない (= アイドル時のコストはゼロ)。
         self.blame.poll();
         if self.blame.busy() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(80), "update_impl");
         }
         // セッションタブに出すフォルダ一覧 (is_dir を叩くので変化時だけ作り直す)
         self.refresh_session_folders();
@@ -28591,7 +28630,7 @@ impl ZaivernApp {
             self.tutorial_autostarted = true;
             if self.tutorial.autostart() {
                 // 開始フレームは必ず 1 枚描く (アイドルからでも立ち上がる)
-                ctx.request_repaint();
+                crate::perf::repaint(ctx, "tutorial_tick");
             }
         }
         let theme = self.theme.clone();
@@ -28655,7 +28694,7 @@ impl ZaivernApp {
             }
         }
         // 依頼を実行した結果を次のフレームで見せる (アイドルでも 1 枚回す)
-        ctx.request_repaint();
+        crate::perf::repaint(ctx, "apply_tutorial_action");
     }
 
     /// いまの状態から [`idle_repaint_ms`] の材料を組み立てて予約する。
@@ -28699,7 +28738,7 @@ impl ZaivernApp {
             visible: !minimized,
         };
         if let Some(ms) = idle_repaint_ms(signals) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(ms), "schedule_idle_repaint");
         }
         // 「実入力が無いのに描いたフレーム」を数える。
         // `ZAIVERN_PERF=1` のときだけ働き、レポートは `perf::dump` で 1 回だけ出す
@@ -30214,7 +30253,7 @@ impl ZaivernApp {
         editor_split::tab_switcher_overlay(ctx, &self.theme, &title, &items, sw.sel);
         // 押している間はキーイベントが来ないので、こちらから描き直しを頼む。
         // (切替が終われば要求も止まる = アイドル時のコストはゼロ)
-        ctx.request_repaint();
+        crate::perf::repaint(ctx, "tab_switcher_ui");
     }
 
     // ── ジャンプ系 ──
@@ -30770,6 +30809,7 @@ impl ZaivernApp {
         self.settings_window(ctx);
         self.hotexit_conflict_window(ctx);
         self.about_window(ctx);
+        self.whats_new_window(ctx);
         self.license_window(ctx);
     }
 
@@ -31071,7 +31111,7 @@ impl ZaivernApp {
                 self.hotexit_due = Some(Instant::now() + wait);
                 // 間隔ぶん先の 1 フレームだけ予約する。編集が止まれば
                 // 予約も止まるので、アイドル時のコストはゼロのまま。
-                ctx.request_repaint_after(wait);
+                crate::perf::repaint_after(ctx, wait, "hotexit_tick");
             }
         }
         let Some(due) = self.hotexit_due else {
@@ -31731,7 +31771,7 @@ impl ZaivernApp {
         self.hotexit
             .set_max_bytes(self.cfg.hot_exit_max_kb.saturating_mul(1024));
         // 画面に出ている値が変わるので 1 フレームだけ描き直す
-        ctx.request_repaint();
+        crate::perf::repaint(ctx, "apply_config_to_ui");
     }
 
     /// キーバインド編集 UI (VS Code の ⌘K ⌘S 相当)。
@@ -31953,7 +31993,7 @@ impl ZaivernApp {
         self.keybind_ui.query = query;
         if let Some(a) = start_record {
             self.keybind_ui.recording = Some(crate::keybinds::Recorder::new(a));
-            ctx.request_repaint();
+            crate::perf::repaint(ctx, "shortcuts_window");
         }
         if reset_all {
             self.keys.reset_all();
@@ -31983,7 +32023,7 @@ impl ZaivernApp {
         });
         if esc {
             // 中止。記録は捨てて通常の消費へ戻す (このフレームは休む)
-            ctx.request_repaint();
+            crate::perf::repaint(ctx, "keybind_record_tick");
             return true;
         }
         let stroke = ctx.input_mut(crate::keybinds::record_stroke);
@@ -31996,12 +32036,12 @@ impl ZaivernApp {
                 let a = rec.action;
                 self.keys.set(a, b);
                 self.persist_keybindings();
-                ctx.request_repaint();
+                crate::perf::repaint(ctx, "keybind_record_tick");
             }
             None => {
                 // 2 打鍵目の締切まで画面を回す (待っている間だけ)
                 let left = rec.remaining(now).min(0.1);
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+                crate::perf::repaint_after(ctx, std::time::Duration::from_secs_f64(left), "keybind_record_tick");
                 self.keybind_ui.recording = Some(rec);
             }
         }
@@ -32015,6 +32055,100 @@ impl ZaivernApp {
         self.cfg.keybindings = ov.clone();
         if let Err(e) = config::save_keybindings(&ov) {
             self.toast(e, false);
+        }
+    }
+
+    /// **What's New** を開く (ヘルプメニュー / パレットから)。
+    ///
+    /// 手動で開いたときは版に関係なく**最新の 1 件**を出す。
+    /// 何も無い (変更履歴が読めない) ときは黙って何もしない —
+    /// 空のウィンドウを出す方がよほど分かりにくい。
+    fn open_whats_new(&mut self) {
+        let all = crate::whats_new::releases();
+        self.whats_new = all.into_iter().take(1).collect();
+        if self.whats_new.is_empty() {
+            self.toast(tr("変更履歴が読み込めませんでした"), false);
+        }
+    }
+
+    /// **更新後の初回起動で 1 度だけ開く。**
+    ///
+    /// 初回インストールでは出さない (`unseen` が空を返す)。開いた時点で
+    /// 「見た版」を今の版へ進め、state.toml へ書く — 出しっぱなしにすると
+    /// 起動のたびに同じものが出る。
+    fn whats_new_on_start(&mut self) {
+        let cur = crate::whats_new::current_version();
+        let shown =
+            crate::whats_new::unseen(&crate::whats_new::releases(), &self.cfg.last_seen_version, cur);
+        // 見た印は「出す物が無かった」場合も含めて必ず進める
+        // (次の更新まで毎回同じ計算をしないため)。
+        if self.cfg.last_seen_version != cur {
+            self.cfg.last_seen_version = cur.to_string();
+            config::save_state(&self.cfg);
+        }
+        self.whats_new = shown;
+    }
+
+    /// **What's New** のウィンドウ。中身が空なら 1 ピクセルも描かない。
+    fn whats_new_window(&mut self, ctx: &egui::Context) {
+        if self.whats_new.is_empty() {
+            return;
+        }
+        let theme = self.theme.clone();
+        let mut open = true;
+        // 閉じるボタンは別の旗で受ける。`Window::open` が `&mut open` を
+        // 借りたままなので、クロージャの中から同じ変数を触れない。
+        let mut close = false;
+        egui::Window::new(tr("この版の新機能"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                // 幅を決め打ちすると狭い窓で見切れる。可用幅に収める。
+                let w = ui.available_width().min(560.0).max(280.0);
+                ui.set_width(w);
+                egui::ScrollArea::vertical()
+                    .id_salt("whats_new_body")
+                    .max_height(420.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for r in &self.whats_new {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("v{}", r.version))
+                                        .size(16.0)
+                                        .strong()
+                                        .color(theme.accent),
+                                );
+                                if !r.date.is_empty() {
+                                    ui.label(
+                                        RichText::new(r.date.clone())
+                                            .size(11.5)
+                                            .color(theme.text_dim),
+                                    );
+                                }
+                            });
+                            ui.add_space(4.0);
+                            for item in &r.items {
+                                ui.horizontal_top(|ui| {
+                                    ui.label(RichText::new("・").color(theme.text_dim));
+                                    // 長い項目は折り返す (右端で見切れない)。
+                                    ui.add(egui::Label::new(RichText::new(item).size(12.5)).wrap());
+                                });
+                            }
+                            ui.add_space(8.0);
+                        }
+                    });
+                ui.separator();
+                ui.vertical_centered(|ui| {
+                    if ui.button(tr("閉じる")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if !open || close {
+            self.whats_new.clear();
         }
     }
 
@@ -33262,7 +33396,7 @@ mod idle_repaint_tests {
                     ..signals
                 };
                 if let Some(ms) = idle_repaint_ms(s) {
-                    ctx.request_repaint_after(Duration::from_millis(ms));
+                    crate::perf::repaint_after(ctx, Duration::from_millis(ms), "drive");
                 }
             });
             delay = out
@@ -36275,6 +36409,34 @@ mod wave2_tests {
     /// **アイドル時に再構築も再描画要求もしない**ことをソースで固定する。
     ///
     /// ソースを読むテストなので改行は正規化する (Windows は CRLF)。
+    /// **アイドル時に誰が描かせているかを、必ず記録できる形に保つ。**
+    ///
+    /// 素の `ctx.request_repaint()` を直に呼ぶと、アイドルで CPU が回って
+    /// いても出所が分からず、仮説から入って外し続けることになる
+    /// (実際に 3 回外した記録がある)。app.rs の要求は必ず
+    /// `perf::repaint` / `perf::repaint_after` を通す。
+    ///
+    /// 改行は正規化する (Windows のチェックアウトは CRLF)。
+    #[test]
+    fn 再描画の要求は必ず出所つきで行う() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        // コメント行と、この検査自身は除いて数える。
+        let bad: Vec<&str> = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("/*") && !t.contains("crate::perf::repaint")
+            })
+            .filter(|l| l.contains(".request_repaint()") || l.contains(".request_repaint_after("))
+            .filter(|l| !l.contains("contains(") && !l.contains("assert"))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "出所を記録しない再描画要求がある (perf::repaint / repaint_after を通すこと):\n{}",
+            bad.join("\n")
+        );
+    }
+
     #[test]
     fn ミニマップとブレッドクラムがアイドルを増やさない配線になっている() {
         let src = include_str!("app.rs").replace("\r\n", "\n");

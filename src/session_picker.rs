@@ -155,6 +155,22 @@ pub fn list_sessions_from(home: &Path, workspace: &Path) -> Vec<PastSession> {
             }
         }
     }
+    // **ベンダーが履歴を公開していないエージェントは、アプリ自身の記録で補う。**
+    //
+    // ここまでで拾えるのは Claude / Codex / Antigravity の 3 つだけ。
+    // gemini / droid / cursor-agent / aider / opencode などは
+    // 「一覧にすら出ないので再開できない」状態だった。
+    // 起動のたびに `~/.zaivern/history/<bin>/<workspace>.jsonl` へ 1 行
+    // 積んでいるので、それを同じ形へ変換して足す。
+    //
+    // **ベンダー側が 1 件でも出している bin は足さない** — 向こうの方が
+    // 要約も再開 ID も正確なので、同じ会話が二重に並ぶ方が害になる。
+    let covered: HashSet<String> = out.iter().map(|s| s.agent_bin.clone()).collect();
+    out.extend(
+        zaivern_sessions(workspace)
+            .into_iter()
+            .filter(|s| !covered.contains(&s.agent_bin)),
+    );
     // 新しい順。同時刻は id で安定化させる (テストの再現性のため)。
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
     // 同じ会話が複数の保存先に現れても 1 行にする。
@@ -162,6 +178,49 @@ pub fn list_sessions_from(home: &Path, workspace: &Path) -> Vec<PastSession> {
     out.retain(|s| seen.insert((s.agent_bin.clone(), s.id.clone())));
     out.truncate(MAX_RESULTS);
     out
+}
+
+/// アプリ自身が記録した履歴 ([`crate::history`]) を一覧の形へ変換する。
+///
+/// `PastSession::id` にはベンダー側の再開 ID を入れる規約なので、
+/// 判っていない場合は**空文字**を入れる。`resume_command` はそのとき
+/// 「その CLI の "直前の会話を続ける" フラグ」へ落とす。
+fn zaivern_sessions(workspace: &Path) -> Vec<PastSession> {
+    entries_to_sessions(crate::history::list_all(workspace))
+}
+
+/// [`zaivern_sessions`] の変換部だけを切り出した純関数 (ファイルを読まない)。
+///
+/// 実 `~/.zaivern` を触らずにテストできるよう、I/O と分けてある。
+fn entries_to_sessions(entries: Vec<crate::history::Entry>) -> Vec<PastSession> {
+    entries
+        .into_iter()
+        .filter(|e| !e.agent_bin.is_empty())
+        .map(|e| {
+            let at = |secs: i64| {
+                // 負の値や 0 は「不明」。UNIX_EPOCH へ落として最下位に並べる。
+                u64::try_from(secs)
+                    .ok()
+                    .map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s))
+                    .unwrap_or(SystemTime::UNIX_EPOCH)
+            };
+            let started = at(e.started);
+            PastSession {
+                id: e.vendor_id.clone(),
+                agent_bin: e.agent_bin.clone(),
+                started,
+                // 終了時刻が判らない (まだ開いている / 異常終了) なら開始時刻で並べる。
+                modified: if e.ended > 0 { at(e.ended) } else { started },
+                // 要約が無ければタイトルを出す (空行を並べない)。
+                summary: if e.brief.is_empty() {
+                    e.title.clone()
+                } else {
+                    e.brief.clone()
+                },
+                cwd: PathBuf::from(&e.cwd),
+            }
+        })
+        .collect()
 }
 
 /// 選んだ過去セッションを再開するコマンドを組み立てる。
@@ -177,9 +236,31 @@ pub fn resume_command(command: &str, session: &PastSession) -> String {
         return via_catalog;
     }
     // agents.rs のテーブルに未登録の保存先 (Antigravity) はローカル表で補う。
-    match local_store_for(&session.agent_bin) {
+    let via_local = match local_store_for(&session.agent_bin) {
         Some(st) => apply_local_resume_id(command, st.resume_id_flag, &session.id),
         None => via_catalog,
+    };
+    if via_local != command {
+        return via_local;
+    }
+    // **ID が判らない相手だけ「直前の会話を続ける」フラグへ落とす。**
+    //
+    // アプリ自身の履歴から起こした行 ([`zaivern_sessions`]) は、ベンダーが
+    // 会話 ID を公開していないので `id` が空になる。ここで諦めると
+    // 「一覧には出るのに再開しない」になってしまうので、その CLI が持つ
+    // `--continue` / `--resume latest` 相当 (`AgentSpec::resume_flag`) を付ける。
+    // フラグを持たない CLI では素のコマンドがそのまま返る (作業フォルダだけは
+    // 引き継ぐので、同じ場所で仕切り直せる)。
+    //
+    // **`id` が空でないときは絶対に落とさない。** ID があるのに上で
+    // 変化しなかったのは「もう再開指定が入っている」か「安全でない ID を
+    // 弾いた」場合で、そこへ別の再開フラグを重ねると二重指定になる。
+    if !session.id.is_empty() {
+        return via_local;
+    }
+    match crate::agents::spec_for_bin(&session.agent_bin) {
+        Some(spec) => crate::agents::apply_resume(command, spec),
+        None => via_local,
     }
 }
 
@@ -1587,6 +1668,94 @@ impl SidebarState {
 
 #[cfg(test)]
 mod tests {
+    // ── アプリ自身の履歴からの一覧 (ベンダーが公開していない相手を補う) ──
+
+    /// 履歴 1 件を作る補助。
+    fn hist(bin: &str, id: u64, started: i64, ended: i64, brief: &str) -> crate::history::Entry {
+        crate::history::Entry {
+            id,
+            agent_bin: bin.into(),
+            preset_name: "テスト".into(),
+            title: format!("{bin} #{id}"),
+            icon: "🤖".into(),
+            command: bin.into(),
+            cwd: "/w".into(),
+            log_file: String::new(),
+            started,
+            ended,
+            brief: brief.into(),
+            vendor_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn 履歴の行を一覧の形へ変換できる() {
+        let out = super::entries_to_sessions(vec![hist("gemini", 1, 100, 200, "テストを直して")]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].agent_bin, "gemini");
+        assert_eq!(out[0].summary, "テストを直して");
+        // 終了時刻が入っていれば並び順はそちらで決まる。
+        assert_eq!(
+            out[0].modified,
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(200)
+        );
+    }
+
+    /// 要約が空なら**タイトルを出す** (空行を並べない)。
+    #[test]
+    fn 要約が空ならタイトルで埋める() {
+        let out = super::entries_to_sessions(vec![hist("droid", 7, 100, 0, "")]);
+        assert_eq!(out[0].summary, "droid #7");
+    }
+
+    /// まだ終わっていない (ended = 0) 行は開始時刻で並べる。
+    /// 0 のまま並べると全部が最下位へ落ちて「新しい会話ほど下」になる。
+    #[test]
+    fn 終了時刻が無ければ開始時刻で並べる() {
+        let out = super::entries_to_sessions(vec![hist("aider", 1, 500, 0, "x")]);
+        assert_eq!(
+            out[0].modified,
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(500)
+        );
+    }
+
+    /// 壊れた時刻 (負) でも panic しない。
+    #[test]
+    fn 負の時刻でも落ちない() {
+        let out = super::entries_to_sessions(vec![hist("aider", 1, -1, -1, "x")]);
+        assert_eq!(out[0].modified, std::time::SystemTime::UNIX_EPOCH);
+    }
+
+    /// bin が空の行は捨てる (どのエージェントか判らないと再開できない)。
+    #[test]
+    fn bin_が空の履歴は捨てる() {
+        let mut e = hist("", 1, 1, 2, "x");
+        e.agent_bin = String::new();
+        assert!(super::entries_to_sessions(vec![e]).is_empty());
+    }
+
+    /// **ID が判らない相手は「直前の会話を続ける」フラグへ落とす。**
+    /// ここが無いと「一覧には出るのに再開しない」になる。
+    #[test]
+    fn 再開_id_が無ければ直前の会話を続けるフラグを付ける() {
+        let s = super::entries_to_sessions(vec![hist("gemini", 1, 1, 2, "x")])
+            .pop()
+            .expect("1 件");
+        let cmd = resume_command("gemini", &s);
+        let spec = crate::agents::spec_for_bin("gemini").expect("カタログにある");
+        assert_eq!(cmd, crate::agents::apply_resume("gemini", spec));
+        assert_ne!(cmd, "gemini", "素のコマンドのままでは再開にならない");
+    }
+
+    /// 再開フラグを持たない CLI では素のコマンドのまま (作業フォルダだけ引き継ぐ)。
+    #[test]
+    fn 再開フラグが無い_cli_は素のコマンドのまま() {
+        let s = super::entries_to_sessions(vec![hist("aider", 1, 1, 2, "x")])
+            .pop()
+            .expect("1 件");
+        assert_eq!(resume_command("aider", &s), "aider");
+    }
+
     use super::*;
     use crate::test_util::unique_temp_dir;
 

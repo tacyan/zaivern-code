@@ -78,6 +78,7 @@ mod theme_json;
 mod tunnel;
 mod tutorial;
 mod voice;
+mod whats_new;
 mod worktree;
 mod zoom;
 

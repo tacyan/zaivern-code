@@ -292,6 +292,9 @@ pub enum Cmd {
     ShowShortcuts,
     /// バージョン情報ダイアログ
     ShowAbout,
+    /// この版で何が変わったかを出す (What's New)。
+    /// 更新後の初回起動で自動的に 1 度だけ開き、以後はここから開ける。
+    ShowWhatsNew,
     /// ライセンスキーの入力・状態表示ダイアログ (オフライン検証・通信ゼロ)
     OpenLicense,
     // ── 横断検索のオプション (サイドバーの検索タブと同じ状態を切り替える) ──
@@ -866,6 +869,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenFolderInIde(_)
         | Cmd::ShowShortcuts
         | Cmd::ShowAbout
+        | Cmd::ShowWhatsNew
         | Cmd::OpenLicense
         | Cmd::RestartTutorial => Group::Tools,
     }
@@ -899,6 +903,7 @@ fn hidden_from_palette(cmd: &Cmd) -> bool {
             | Cmd::InstallPlugin
             | Cmd::RescanPlugins
             | Cmd::ShowAbout
+            | Cmd::ShowWhatsNew
     )
 }
 
@@ -1708,6 +1713,7 @@ mod group_tests {
             cmd("ペット画像を変更…", Cmd::SetPetImage),
             cmd("プラグインを再スキャン", Cmd::RescanPlugins),
             cmd("バージョン情報", Cmd::ShowAbout),
+            cmd("この版の新機能 (What's New)", Cmd::ShowWhatsNew),
             cmd(
                 "改行コードを変換: LF (Unix)",
                 Cmd::ConvertLineEnding(crate::textenc::LineEnding::Lf),

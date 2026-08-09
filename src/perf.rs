@@ -32,6 +32,12 @@ pub const ENV_OUT: &str = "ZAIVERN_PERF_OUT";
 pub const TAG: &str = "ZAIVERN_PERF";
 /// ヒストグラムの内訳行の接頭辞。
 pub const TAG_BUCKET: &str = "ZAIVERN_PERF_BUCKET";
+/// 再描画要求の出所ごとの内訳行の接頭辞。
+pub const TAG_REPAINT: &str = "ZAIVERN_PERF_REPAINT";
+
+/// 出所の種類の上限。これを超えたぶんは `other` にまとめる
+/// (無制限に増やすと計測自体がメモリを食う)。
+const REPAINT_TAGS_CAP: usize = 64;
 
 // ── ヒストグラム ───────────────────────────────────────────────────────
 //
@@ -178,6 +184,14 @@ pub struct FrameStats {
     pub frames: Histogram,
     /// アイドル (実入力が無い) と判定したフレーム数。
     pub idle_frames: u64,
+    /// **アイドル中の再描画要求を、出所ごとに数えたもの。**
+    ///
+    /// `idle_fps` は「アイドルなのに何 fps 出ているか」しか教えてくれない。
+    /// 原因を潰すには**誰が要求したか**が要る (仮説から入って 3 回外した
+    /// 実績があるので、最初に分布を取れる形にしておく)。
+    /// 実入力があったフレームは数えない — 入力に応じた再描画は正常なので、
+    /// 混ぜると本命が埋もれる。
+    pub repaints: std::collections::BTreeMap<&'static str, u64>,
     /// 計測を始めてからの経過。
     pub started: Instant,
 }
@@ -193,6 +207,7 @@ impl FrameStats {
         Self {
             frames: Histogram::new(),
             idle_frames: 0,
+            repaints: std::collections::BTreeMap::new(),
             started: Instant::now(),
         }
     }
@@ -228,7 +243,21 @@ impl FrameStats {
                 hi as f64 / 1000.0
             ));
         }
+        // **多い順**に出す。アイドル再描画の犯人は上から数行で分かる。
+        let mut by_count: Vec<(&&str, &u64)> = self.repaints.iter().collect();
+        by_count.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        for (tag, n) in by_count {
+            out.push(format!("{TAG_REPAINT} source={tag} count={n}"));
+        }
         out
+    }
+
+    /// アイドル中の再描画要求を多い順に返す (UI / テストから読む)。
+    pub fn repaint_ranking(&self) -> Vec<(&'static str, u64)> {
+        let mut v: Vec<(&'static str, u64)> =
+            self.repaints.iter().map(|(k, v)| (*k, *v)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        v
     }
 }
 
@@ -246,6 +275,7 @@ fn state() -> &'static Mutex<FrameStats> {
 
 /// このフレームがアイドル (実入力なし) だったか。
 /// `note_idle` が置き、`frame_end` が読んで消費する。
+/// 再描画要求の記録 ([`note_repaint`]) も、この旗が立っている間だけ数える。
 static IDLE_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// フレームの開始時刻を取る。無効なら `None` (以降の計測も全部止まる)。
@@ -274,6 +304,45 @@ pub fn frame_end(started: Option<Instant>) {
             s.idle_frames += 1;
         }
     }
+}
+
+/// **アイドル中の再描画要求を 1 件記録する。**
+///
+/// `tag` は要求元を表す短い固定文字列 (`"blame"` / `"toast"` / `"pty"` …)。
+/// `&'static str` に限るのは、計測のために文字列を確保しないため。
+///
+/// 実入力があったフレームでは数えない — 入力に応じた再描画は正常で、
+/// 混ぜると「アイドルなのに描き続けている本命」が埋もれる。
+/// 無効時は `enabled()` の読み出し 1 回で戻る。
+#[inline]
+pub fn note_repaint(tag: &'static str) {
+    if !enabled() || !IDLE_FLAG.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut s) = state().lock() {
+        if s.repaints.len() >= REPAINT_TAGS_CAP && !s.repaints.contains_key(tag) {
+            *s.repaints.entry("other").or_insert(0) += 1;
+            return;
+        }
+        *s.repaints.entry(tag).or_insert(0) += 1;
+    }
+}
+
+/// 再描画を要求しつつ、出所を記録する。**アプリ側はこれを通すこと。**
+///
+/// 素の `ctx.request_repaint()` を直に呼ぶと、アイドル時に誰が描かせて
+/// いるのか永久に分からない (設計原則 3 を数値で守れなくなる)。
+#[inline]
+pub fn repaint(ctx: &eframe::egui::Context, tag: &'static str) {
+    note_repaint(tag);
+    ctx.request_repaint();
+}
+
+/// 時間指定つきの [`repaint`]。
+#[inline]
+pub fn repaint_after(ctx: &eframe::egui::Context, after: std::time::Duration, tag: &'static str) {
+    note_repaint(tag);
+    ctx.request_repaint_after(after);
 }
 
 /// いまの集計の複製 (UI / テストから読む)。無効なら None。
@@ -338,8 +407,16 @@ pub fn status_line() -> Option<String> {
         return None;
     }
     let ms = |us: Option<u64>| us.map(|v| v as f64 / 1000.0).unwrap_or(0.0);
+    // アイドル再描画の**筆頭の犯人**をその場に出す。
+    // 「アイドルなのに N fps 出ている」だけでは直せない — 誰が要求したかが
+    // 見えて初めて手が付けられる (仮説から入って外し続けないため)。
+    let top = s
+        .repaint_ranking()
+        .first()
+        .map(|(tag, n)| format!("  ← {tag} x{n}"))
+        .unwrap_or_default();
     Some(format!(
-        "{} frames  p50 {:.1}ms  p95 {:.1}ms  max {:.1}ms  idle {:.1}/s",
+        "{} frames  p50 {:.1}ms  p95 {:.1}ms  max {:.1}ms  idle {:.1}/s{top}",
         s.frames.count(),
         ms(s.frames.quantile(0.50)),
         ms(s.frames.quantile(0.95)),
@@ -351,6 +428,40 @@ pub fn status_line() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 再描画の出所 ──────────────────────────────────────────────────
+
+    /// 多い順に並ぶ。同数はタグ名で安定させる (レポートの再現性)。
+    #[test]
+    fn 再描画の出所は多い順に並ぶ() {
+        let mut st = FrameStats::new();
+        st.repaints.insert("blame", 3);
+        st.repaints.insert("toast", 10);
+        st.repaints.insert("pty", 3);
+        assert_eq!(
+            st.repaint_ranking(),
+            vec![("toast", 10), ("blame", 3), ("pty", 3)]
+        );
+    }
+
+    /// レポート行に出所の内訳が載る (版間で diff できる形)。
+    #[test]
+    fn レポートに再描画の内訳が載る() {
+        let mut st = FrameStats::new();
+        st.repaints.insert("blame", 2);
+        let lines = st.report_lines("test");
+        assert!(
+            lines.iter().any(|l| l.starts_with(TAG_REPAINT) && l.contains("source=blame count=2")),
+            "内訳行が無い: {lines:?}"
+        );
+    }
+
+    /// 出所が 1 件も無ければ内訳行は出さない (常に 0 の行を並べない)。
+    #[test]
+    fn 出所が無ければ内訳行は出さない() {
+        let st = FrameStats::new();
+        assert!(!st.report_lines("test").iter().any(|l| l.starts_with(TAG_REPAINT)));
+    }
 
     // ── バケット ──────────────────────────────────────────────────────
 

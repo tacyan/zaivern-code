@@ -32,11 +32,6 @@
 //! `*_in()` 系の内部関数にある。テストは `*_in()` を一時ディレクトリに向けて叩くので、
 //! **実ユーザーの `~/.zaivern` には決して触れない**。
 
-// UI 配線 (履歴パネル / 再開ボタン) は別担当の作業で、まだ呼び出し側が無い。
-// 配線が入った時点でこの allow を外すこと — 外し忘れると
-// 「作ったのに繋いでいない」の検出器 (dead_code) が効かなくなる。
-#![allow(dead_code)]
-
 use crate::config::zaivern_dir;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -96,21 +91,6 @@ pub struct Entry {
 /// `./.zaivern` に落ちるだけで動く)。
 fn history_root() -> PathBuf {
     zaivern_dir().join("history")
-}
-
-/// このエージェントの履歴ファイルが入るディレクトリ。
-///
-/// `cwd` は現在のレイアウトでは使わない (ワークスペースはファイル名側で分けている) が、
-/// **他の公開 API と引数の並びを揃える**ために受け取る。呼び出し側は常に
-/// 「エージェント + 作業フォルダ」の組で考えることになり、将来レイアウトを
-/// `history/<agent>/<key>/` へ変えても呼び出し側の変更が要らない。
-pub fn record_dir(agent_bin: &str, _cwd: &Path) -> PathBuf {
-    record_dir_in(&history_root(), agent_bin)
-}
-
-/// このエージェント × この作業フォルダの履歴ファイル (JSONL) のパス。
-pub fn record_path(agent_bin: &str, cwd: &Path) -> PathBuf {
-    record_path_in(&history_root(), agent_bin, cwd)
 }
 
 fn record_dir_in(root: &Path, agent_bin: &str) -> PathBuf {
@@ -241,17 +221,14 @@ fn append_in(root: &Path, entry: &Entry) -> std::io::Result<()> {
     f.write_all(line.as_bytes())
 }
 
-/// 該当 ID の行の `ended` を埋めて書き戻す (セッション終了時に呼ぶ想定)。
-pub fn update_end(agent_bin: &str, cwd: &Path, id: u64, ended: i64) -> std::io::Result<()> {
-    update_end_in(&history_root(), agent_bin, cwd, id, ended)
-}
-
-fn update_end_in(
+/// [`finish`] の実体 (履歴ルートを引数で受ける)。
+fn finish_in(
     root: &Path,
     agent_bin: &str,
     cwd: &Path,
     id: u64,
     ended: i64,
+    brief: &str,
 ) -> std::io::Result<()> {
     let path = record_path_in(root, agent_bin, cwd);
     let Some(text) = read_text(&path) else {
@@ -270,6 +247,10 @@ fn update_end_in(
         match serde_json::from_str::<Entry>(line) {
             Ok(mut e) if e.id == id && !hit => {
                 e.ended = ended;
+                // 要約が空なら既存の値を残す (締めのたびに消さない)。
+                if !brief.is_empty() {
+                    e.brief = brief_of(brief);
+                }
                 match serde_json::to_string(&e) {
                     Ok(s) => {
                         out.push_str(&s);
@@ -290,19 +271,44 @@ fn update_end_in(
 }
 
 /// このエージェント × この作業フォルダの履歴を**新しい順**で返す。
-pub fn list(agent_bin: &str, cwd: &Path) -> Vec<Entry> {
-    list_in(&history_root(), agent_bin, cwd)
+/// **セッションを閉じるときの締め**: 終了時刻と要約をまとめて書き戻す。
+///
+/// `update_end` と分けているのは、要約 (最初のユーザー指示) が
+/// **起動時点では存在しない**ため。`Session::last_prompt` が埋まるのは
+/// 最初の指示を送った後なので、締めのタイミングで初めて書ける。
+/// 要約が空なら既存の値を残す (上書きで消さない)。
+pub fn finish(agent_bin: &str, cwd: &Path, id: u64, ended: i64, brief: &str) -> std::io::Result<()> {
+    finish_in(&history_root(), agent_bin, cwd, id, ended, brief)
 }
 
+/// `history/` 配下の**全エージェント**の履歴を集めて新しい順で返す。
+pub fn list_all(cwd: &Path) -> Vec<Entry> {
+    list_all_in(&history_root(), cwd)
+}
+
+/// このエージェント × この作業フォルダの履歴を**新しい順**で返す。
+///
+/// 公開はしない — 一覧は [`list_all`] (全エージェント分をマージした版) だけを
+/// 使うので、公開すると「作ったのに繋いでいない」API が増える。
+/// 本番経路からは呼ばないので `cfg(test)` に閉じる。
+#[cfg(test)]
 fn list_in(root: &Path, agent_bin: &str, cwd: &Path) -> Vec<Entry> {
     let mut v = read_entries(&record_path_in(root, agent_bin, cwd));
     sort_newest_first(&mut v);
     v
 }
 
-/// `history/` 配下の**全エージェント**の履歴を集めて新しい順で返す。
-pub fn list_all(cwd: &Path) -> Vec<Entry> {
-    list_all_in(&history_root(), cwd)
+/// 終了時刻だけを書き戻す ([`finish_in`] の要約なし版)。
+/// 本番経路は要約も一緒に書く `finish` を通るので、こちらはテスト専用。
+#[cfg(test)]
+fn update_end_in(
+    root: &Path,
+    agent_bin: &str,
+    cwd: &Path,
+    id: u64,
+    ended: i64,
+) -> std::io::Result<()> {
+    finish_in(root, agent_bin, cwd, id, ended, "")
 }
 
 fn list_all_in(root: &Path, cwd: &Path) -> Vec<Entry> {
@@ -719,10 +725,12 @@ mod tests {
     fn 公開ラッパーのパスは_zaivern_dir_配下を指す() {
         // 実ファイルには触らず、パスの組み立てだけを確認する。
         let cwd = std::env::temp_dir();
-        let dir = record_dir("claude", &cwd);
+        let root = history_root();
+        assert!(root.starts_with(crate::config::zaivern_dir()));
+        let dir = record_dir_in(&root, "claude");
         assert!(dir.starts_with(crate::config::zaivern_dir().join("history")));
         assert_eq!(dir.file_name().and_then(|s| s.to_str()), Some("claude"));
-        let file = record_path("claude", &cwd);
+        let file = record_path_in(&root, "claude", &cwd);
         assert_eq!(file.parent(), Some(dir.as_path()));
         assert_eq!(
             file.extension().and_then(|s| s.to_str()),

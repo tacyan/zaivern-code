@@ -44,6 +44,13 @@ pub struct Config {
     /// エディタ / ターミナルの実サイズは `editor_font_size` /
     /// `terminal_font_size` にこの倍率を掛けたもの。
     pub text_scale: f32,
+    /// 最後に「What's New」を見た版 (`0.9.0` 形式)。空 = 一度も見ていない。
+    ///
+    /// 初回起動では**何も出さない** — 入れた直後に変更履歴を突き付けても
+    /// 意味が無く、「画面が突然変わらない」に反する。判定は
+    /// [`crate::whats_new::unseen`]。
+    #[serde(skip)]
+    pub last_seen_version: String,
     pub show_hidden_files: bool,
 
     /// `.gitignore` (+ `.git/info/exclude` + `core.excludesFile`) を尊重して
@@ -715,6 +722,7 @@ impl Default for Config {
             terminal_font_size: 13.0,
             ui_zoom: crate::zoom::DEFAULT,
             text_scale: crate::zoom::DEFAULT,
+            last_seen_version: String::new(),
             show_hidden_files: true,
             respect_gitignore: true,
             dim_ignored_files: false,
@@ -998,6 +1006,9 @@ struct UiState {
     ui_zoom: Option<f32>,
     /// 文字サイズだけの倍率。ui_zoom と同じ理由で state 側に覚える。
     text_scale: Option<f32>,
+    /// 最後に「What's New」を見た版。空 = 一度も見ていない (初回起動)。
+    /// 手書きの config.toml ではなく state 側に置く (アプリが書き換えるため)。
+    last_seen_version: Option<String>,
     minimap: Option<bool>,
     breadcrumbs: Option<bool>,
     /// 差分ビューの表示モード ("side_by_side" | "inline")。
@@ -1572,6 +1583,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.text_scale {
                     cfg.text_scale = v;
                 }
+                if let Some(v) = st.last_seen_version {
+                    cfg.last_seen_version = v;
+                }
                 if let Some(v) = st.minimap {
                     cfg.minimap = v;
                 }
@@ -2078,6 +2092,7 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         show_whitespace: Some(cfg.global_show_whitespace),
         ui_zoom: Some(crate::zoom::clamp(cfg.global_ui_zoom)),
         text_scale: Some(crate::zoom::clamp(cfg.global_text_scale)),
+        last_seen_version: Some(cfg.last_seen_version.clone()),
         minimap: Some(cfg.global_minimap),
         breadcrumbs: Some(cfg.global_breadcrumbs),
         diff_view: Some(cfg.diff_view.clone()),
@@ -4075,6 +4090,7 @@ command = "agy"
             approval_mode: Some("auto".into()),
             ui_zoom: Some(1.25),
             text_scale: Some(1.5),
+            last_seen_version: Some("0.9.0".into()),
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
@@ -4122,6 +4138,7 @@ command = "agy"
         assert_eq!(back.approval_mode, Some("auto".to_string()));
         assert_eq!(back.ui_zoom, Some(1.25));
         assert_eq!(back.text_scale, Some(1.5));
+        assert_eq!(back.last_seen_version.as_deref(), Some("0.9.0"));
         assert_eq!(back.show_pet, Some(false));
         assert_eq!(back.word_wrap, Some(true));
         assert_eq!(back.show_whitespace, Some(true));
