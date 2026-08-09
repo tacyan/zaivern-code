@@ -675,6 +675,9 @@ const LIST_MAX_W: f32 = 380.0;
 /// 1 列のときに一覧へ渡す高さの比率と下限。
 const LIST_H_RATIO: f32 = 0.55;
 const LIST_MIN_H: f32 = 90.0;
+/// 一覧 + 詳細に使う高さの下限 / 上限 (画面の 45% をこの範囲へ丸める)。
+const PANE_MIN_H: f32 = 200.0;
+const PANE_MAX_H: f32 = 460.0;
 
 /// 一覧と詳細の矩形を決める (純関数)。
 ///
@@ -1876,8 +1879,9 @@ impl LocalHistory {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
+            // **高さは指定しない。** 中身に合わせて伸ばすので、履歴が
+            // 空のときに背の高い空っぽの枠が出ない (「空白は作らない」)。
             .default_width((screen.width() * 0.72).clamp(420.0, 900.0))
-            .default_height((screen.height() * 0.62).clamp(280.0, 620.0))
             .max_width((screen.width() - 32.0).max(280.0))
             .max_height((screen.height() - 32.0).max(200.0))
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -1912,7 +1916,11 @@ impl LocalHistory {
         }
 
         // 割り付けは純関数で決める (テーブルテストで固定してある)。
-        let area = ui.available_rect_before_wrap();
+        // 高さは画面から導く — ウィンドウ側に固定値を持たせると、履歴が
+        // 空のときまでその高さを確保してしまう。
+        let h = (ui.ctx().screen_rect().height() * 0.45).clamp(PANE_MIN_H, PANE_MAX_H);
+        let top = ui.available_rect_before_wrap();
+        let area = egui::Rect::from_min_size(top.min, egui::vec2(top.width(), h.min(top.height())));
         let detail = self.revs.get(self.selected).map(|r| !r.paths.is_empty()) == Some(true);
         let (list_r, detail_r) = history_rects(area, detail);
         let mut list_ui = ui.new_child(
