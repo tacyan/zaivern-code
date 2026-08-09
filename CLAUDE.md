@@ -34,6 +34,12 @@
   実測 (warm, 1 ファイル変更): 従来の手順 **48 秒 → 26 秒 (46% 短縮)**。
   - `tools/verify.sh` / `tools/verify.sh git:: lsp::` / `--all` / `--quick`
   - 引数無しなら `git status` の `src/*.rs` から対象モジュールを自動で決める
+  - **push する前は必ず `tools/verify.sh --lint`**。CI の lint は clippy で、
+    rustc の警告より広い。**ローカルの `cargo test` が全部緑でも clippy だけ
+    赤くなる** (実際に doc コメントのインデント 1 つ = `doc_overindented_list_items`
+    で CI が落ちた)。既定で走らせないのは clippy-driver が別の fingerprint を
+    持ち、もう一度フルコンパイルが走るため。債務リストはワークフローから
+    毎回読むので、写経してずれることは無い
 - **`cargo check --bin zai` だけでは警告を取りこぼす。**
   `#[cfg(test)]` をコンパイルしないので、**テストコードの警告が出ない**。
   実際に `non_snake_case` を 2 回続けて見落とした (しかも 1 回目の「修正」は

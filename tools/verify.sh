@@ -6,6 +6,7 @@
 #   tools/verify.sh git:: lsp::     # モジュールを指定して走らせる
 #   tools/verify.sh --all           # 全テスト (cargo test。CI の nextest とは別)
 #   tools/verify.sh --quick         # 整形と警告だけ (テストは走らせない)
+#   tools/verify.sh --lint          # CI と同じ clippy (**push する前に必ず**)
 #
 # ## なぜこのスクリプトが要るのか (実測)
 #
@@ -33,10 +34,12 @@ cd "$(dirname "$0")/.."
 
 QUICK=0
 ALL=0
+LINT=0
 FILTERS=""
 for a in "$@"; do
   case "$a" in
     --quick) QUICK=1 ;;
+    --lint) LINT=1 ;;
     --all) ALL=1 ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) FILTERS="$FILTERS $a" ;;
@@ -47,6 +50,21 @@ step() { printf '\n\033[1;36m▸ %s\033[0m\n' "$1"; }
 
 step "整形 (cargo fmt --all --check)"
 cargo fmt --all --check
+
+# CI の lint は **ubuntu 1 台でしか回らない**うえ、clippy は rustc の警告より
+# 広い。ローカルの `cargo test` が緑でも clippy だけ赤くなることが実際にある
+# (doc コメントのインデント 1 つで CI が落ちた)。
+# 既定で走らせないのは、clippy-driver が別の fingerprint を持つため
+# **もう一度フルコンパイルが走る**から。push の直前だけ払う。
+if [ "$LINT" = 1 ]; then
+  step "clippy (CI と同じ債務リスト)"
+  # 債務リストは **ワークフローが唯一の出所**。ここへ写経すると必ずずれる。
+  DEBT=$(sed -n '/DEBT=(/,/^ *)/p' .github/workflows/test.yml \
+         | grep -oE -- '-A clippy::[a-z_]+' | tr '\n' ' ')
+  # shellcheck disable=SC2086
+  cargo clippy --bin zai --all-targets -- -D warnings $DEBT
+  printf '\033[1;32m✓ clippy 緑\033[0m\n'
+fi
 
 # **1 回だけコンパイルする。** ここで bin もテストコードも全部通るので、
 # 警告の検出はこれで完結する (別途 cargo check は走らせない = 二重払いしない)。
