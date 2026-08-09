@@ -18,8 +18,9 @@
 //! 2. **ハンク単位** — 共通ベースに対する変更行範囲が実際に重なるか、
 //!    [`NEAR_LINES`] 行以内に近接する。ここが信頼の分かれ目。
 //! 3. **実マージ** — `git merge-tree --write-tree` で三方向マージを
-//!    **作業ツリーに触れずに** 計算する。git 2.38 未満では使えないので
-//!    [`supports_merge_tree`] で判定し、無ければ 2 段目までへ綺麗に降格する。
+//!    **作業ツリーに触れずに** 計算する。使えるかどうかは
+//!    [`probe_supports_merge_tree`] が **実際に 1 回叩いて** 決める
+//!    (バージョン番号からは推定しない)。無ければ 2 段目までへ綺麗に降格する。
 //!
 //! ## 過剰報告より過少報告
 //!
@@ -114,6 +115,9 @@ pub const DISK_TTL: Duration = Duration::from_secs(60);
 pub const DISK_BUDGET: usize = 30_000;
 
 /// `git merge-tree --write-tree` が入ったバージョン。
+///
+/// **判定には使わない** ([`probe_supports_merge_tree`] が実際に叩いて決める)。
+/// 使えなかったときに「何を入れれば使えるのか」を利用者へ出すための数字。
 pub const MERGE_TREE_SINCE: (u32, u32) = (2, 38);
 
 /// パネルに出す行数の上限 (これを超えた分は「他 N 件」に畳む)。
@@ -735,13 +739,46 @@ pub fn build_report(
 // `git merge-tree` — 実マージの判定 (純粋部分)
 // ---------------------------------------------------------------------------
 
-/// この git が `git merge-tree --write-tree` を持っているか (2.38+)。
-/// 判別できなければ **false** — 「推測しない」で 2 段目まで使う。
-pub fn supports_merge_tree(version_out: &str) -> bool {
-    match crate::git::parse_git_version(version_out) {
-        Some(v) => v >= MERGE_TREE_SINCE,
-        None => false,
+/// 能力判定のために 1 回だけ叩く引数列 (`git -C <dir>` の後ろ)。
+///
+/// **引数を渡さない**ので、どちらの git でも実マージは起きず usage が出て終わる。
+pub fn merge_tree_probe_argv() -> Vec<&'static str> {
+    vec!["merge-tree", "--write-tree"]
+}
+
+/// この git が `git merge-tree --write-tree` を持っているか。
+///
+/// **バージョン文字列を読まない。** `git --version` からの推定は
+///
+/// * ディストリが機能をバックポートした版 (番号は古いのに機能はある)、
+/// * 逆に機能を削って再パッケージした版、
+///
+/// を必ず取り違える。ここは [`merge_tree_probe_argv`] を **実際に 1 回叩いて**、
+/// git 自身が出す usage を読む。判定材料は出力だけで、`code` は下記の番兵。
+///
+/// ## 出力の見分け方 (実測)
+///
+/// | git | 出力 |
+/// |---|---|
+/// | 2.38+ | `usage: git merge-tree [--write-tree] …` + 選択肢一覧に `--write-tree` |
+/// | 2.38 未満 | `usage: git merge-tree <base-tree> <branch1> <branch2>` (`--write-tree` が出ない) |
+/// | 2.38 未満 (option 解析する版) | `error: unknown option \`write-tree'` |
+///
+/// **終了コードでは見分けられない** — どちらも usage を出して 129 で終わる。
+/// だから「`--write-tree` が usage に載っていて、かつ unknown option と
+/// 言われていない」を条件にする。git が無い / リポジトリでない場合は
+/// `fatal: …` だけが出るので、どちらの条件も満たさず false になる (fail-closed)。
+pub fn probe_supports_merge_tree(stdout: &str, stderr: &str, code: Option<i32>) -> bool {
+    // 引数無しで **成功** する git は存在しない。0 が返ったなら我々の想定した
+    // コマンドではないので、支持されていると見なさない (「推測しない」)。
+    if code == Some(0) {
+        return false;
     }
+    let out = format!("{stdout}\n{stderr}");
+    if out.contains("unknown option") {
+        return false;
+    }
+    out.contains("--write-tree")
 }
 
 /// `git -C <dir>` の後ろに続く引数列。
@@ -1123,18 +1160,22 @@ pub fn scan(specs: &[TreeSpec], want_disk: bool) -> Report {
     }
 
     // ④ ファイル単位で重なった組だけ、実マージを撃つ。
-    let version = crate::worktree::git_out(hub, &["--version"]).unwrap_or_default();
-    let can_merge_tree = supports_merge_tree(&version);
+    // 能力は **叩いて** 確かめる (バージョン番号から推定しない)。プロセスは
+    // 1 本で、以前の `git --version` と同じ本数。
+    let can_merge_tree = match run_probe(hub, &merge_tree_probe_argv()) {
+        Some((so, se, code)) => probe_supports_merge_tree(&so, &se, code),
+        None => false,
+    };
     let mut merged_clean: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut merged_conflict: BTreeMap<(usize, usize), BTreeSet<String>> = BTreeMap::new();
     let mut degraded: Option<String> = None;
     if !can_merge_tree {
         degraded = Some(trf(
-            "git {v} には merge-tree --write-tree がありません ({need} 以上が必要)。行範囲だけで判定しています。",
-            &[
-                ("v", version.trim().to_string()),
-                ("need", format!("{}.{}", MERGE_TREE_SINCE.0, MERGE_TREE_SINCE.1)),
-            ],
+            "この git には merge-tree --write-tree がありません ({need} 以上が必要)。行範囲だけで判定しています。",
+            &[(
+                "need",
+                format!("{}.{}", MERGE_TREE_SINCE.0, MERGE_TREE_SINCE.1),
+            )],
         ));
     } else {
         let mut dirty_pairs = 0usize;
@@ -1205,6 +1246,23 @@ fn run_raw(dir: &Path, args: &[&str]) -> Option<String> {
         .output()
         .ok()?;
     Some(crate::textenc::decode_output(&out.stdout))
+}
+
+/// 能力判定用。usage は **stderr** に出るので両方と終了コードを返す。
+fn run_probe(dir: &Path, args: &[&str]) -> Option<(String, String, Option<i32>)> {
+    let out = crate::procx::hidden_command("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        // usage を英語で固定する (ロケール依存の文字列を読まないため)。
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    Some((
+        crate::textenc::decode_output(&out.stdout),
+        crate::textenc::decode_output(&out.stderr),
+        out.status.code(),
+    ))
 }
 
 /// 衝突レーダーの本体。**UI からはこれだけを触る。**
@@ -2043,12 +2101,42 @@ rename to new.rs
     }
 
     #[test]
-    fn mergetreeのバージョン判定は分からなければ使わない() {
-        assert!(supports_merge_tree("git version 2.47.1"));
-        assert!(supports_merge_tree("git version 2.38.0"));
-        assert!(!supports_merge_tree("git version 2.37.9"));
-        assert!(!supports_merge_tree("git version 2.30.1 (Apple Git-130)"));
-        assert!(!supports_merge_tree(""), "読めなければ使わない");
+    fn mergetreeの能力はバージョンではなく叩いて確かめる() {
+        // 2.38+ が引数無しで出す usage (実測。**stderr 側**に出る)。
+        let modern = "usage: git merge-tree [--write-tree] [<options>] <branch1> <branch2>\n   \
+             or: git merge-tree [--trivial-merge] <base-tree> <branch1> <branch2>\n\n    \
+             --write-tree          do a real merge instead of a trivial merge\n    \
+             -z                    separate paths with the NUL character\n";
+        assert!(probe_supports_merge_tree("", modern, Some(129)));
+
+        // 2.38 未満は option を解析せず、`--write-tree` の出ない usage を出す。
+        let legacy = "usage: git merge-tree <base-tree> <branch1> <branch2>\n";
+        assert!(!probe_supports_merge_tree("", legacy, Some(129)));
+
+        // option を解析する古い版は unknown option と言う。usage 一覧に
+        // `--write-tree` の文字が無いので、どちらの条件でも false になる。
+        let unknown = "error: unknown option `write-tree'\n\
+             usage: git merge-tree <base-tree> <branch1> <branch2>\n";
+        assert!(!probe_supports_merge_tree("", unknown, Some(129)));
+
+        // 「usage に載っているが unknown option とも言われた」矛盾した出力は
+        // 使えない側へ倒す (推測しない)。
+        let contradictory = "error: unknown option `write-tree'\n\
+             usage: git merge-tree [--write-tree] <branch1> <branch2>\n";
+        assert!(!probe_supports_merge_tree("", contradictory, Some(129)));
+
+        // git が無い / リポジトリでない。
+        assert!(!probe_supports_merge_tree(
+            "",
+            "fatal: not a git repository (or any of the parent directories): .git\n",
+            Some(128)
+        ));
+        assert!(!probe_supports_merge_tree("", "", None), "無言なら使わない");
+
+        // 引数無しで成功する git は存在しない = 想定したコマンドではない。
+        assert!(!probe_supports_merge_tree(modern, "", Some(0)));
+
+        assert_eq!(merge_tree_probe_argv(), vec!["merge-tree", "--write-tree"]);
         assert_eq!(
             merge_tree_argv("aaa", "bbb"),
             vec![
@@ -2059,6 +2147,35 @@ rename to new.rs
                 "aaa",
                 "bbb"
             ]
+        );
+    }
+
+    /// バージョン文字列から能力を推定する経路が **1 本も残っていない** こと。
+    ///
+    /// バックポート版・機能削除版を必ず取り違えるので、番号での判定へ
+    /// 戻ってしまわないよう構造で縛る。
+    #[test]
+    fn 能力判定にバージョン文字列を読む経路が残っていない() {
+        // Windows のチェックアウトは CRLF なので正規化してから探す。
+        let src = include_str!("conflict.rs").replace("\r\n", "\n");
+        let body = src
+            .split("pub fn scan(specs: &[TreeSpec], want_disk: bool) -> Report {")
+            .nth(1)
+            .expect("scan が見つからない");
+        let body = body.split("\n}\n").next().expect("本体の終端");
+        // 探す文字列をそのまま書くと**このテスト自身に当たる**ので分割する。
+        let version_flag = concat!("--ver", "sion");
+        assert!(
+            !body.contains(version_flag),
+            "scan が git のバージョン文字列を読んでいる"
+        );
+        assert!(
+            !body.contains(concat!("parse_git_", "version")),
+            "scan がバージョン解析へ戻っている"
+        );
+        assert!(
+            body.contains("probe_supports_merge_tree"),
+            "scan が能力を叩いて確かめていない"
         );
     }
 

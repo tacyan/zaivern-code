@@ -1189,10 +1189,24 @@ pub fn is_recordable(key: Key) -> bool {
 /// `command` と `ctrl` の両方に立つ。素の構造体比較で衝突検出をすると
 /// 「⌘S と ⌘S が別物」になるので、必ずここを通してから比べる。
 pub fn canonical_mods(m: Modifiers) -> Modifiers {
+    canonical_mods_on(m, cfg!(target_os = "macos"))
+}
+
+/// [`canonical_mods`] の OS 分岐を**引数で明示**する版。
+///
+/// 番人テストが「macOS の規則」と「非 macOS の規則」の**両方**を、
+/// どのホストで走らせても検査できるようにするためにある。実装を 2 本に
+/// 分けると必ずズレるので、[`canonical_mods`] はここへ委譲する。
+///
+/// **非 macOS では Ctrl が command へ畳まれる** — `⌃⌘F` と `⌘F` が同じ打鍵に
+/// なり、片方が永久に効かなくなる事故が実際に起きた (43,000 行の変更が
+/// macOS では全部緑なのに CI の Linux / Windows で落ちた)。機能側の既定打鍵は
+/// [`bind_conflicts_on`] で両側を検査する。
+pub(crate) fn canonical_mods_on(m: Modifiers, mac: bool) -> Modifiers {
     let mut out = Modifiers::NONE;
     out.alt = m.alt;
     out.shift = m.shift;
-    if cfg!(target_os = "macos") {
+    if mac {
         // mac: ⌘ (command/mac_cmd) と ⌃ (ctrl) は別のキー
         out.command = m.command || m.mac_cmd;
         out.ctrl = m.ctrl;
@@ -1231,10 +1245,7 @@ pub enum Conflict {
 
 /// この打鍵を macOS が OS 側で握っているか。握っていれば理由を返す。
 pub fn macos_reservation(sc: KeyboardShortcut) -> Option<&'static str> {
-    let sc = canonical_shortcut(sc);
-    MACOS_RESERVED.iter().find_map(|(m, k, why)| {
-        (sc.logical_key == *k && canonical_mods(*m) == sc.modifiers).then_some(*why)
-    })
+    macos_reservation_on(sc, cfg!(target_os = "macos"))
 }
 
 /// `action` に `candidate` を割り当てたときの問題を全部並べる。
@@ -1415,6 +1426,414 @@ pub fn consume_binding(i: &mut egui::InputState, b: Binding, chord: &mut ChordSt
             false
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 機能レジストリの打鍵 — `BindAction` を 1 つも増やさずに持つ
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ## なぜ要るのか (実測の動機)
+//
+// `BindAction` は固定長配列 (`ALL_ACTIONS: [BindAction; N]`) ＋ 件数検査
+// テストなので、**打鍵が欲しい機能は必ずこのファイルを触る = 必ず衝突する**。
+// 実際に which-key と local_history が共有ファイルへ追記して 3 ハンク衝突した。
+// `feature::REGISTRY` の `Feature::binds` から実行時に打鍵表を組み立てれば、
+// 機能側は `src/features/<名前>.rs` を 1 つ作るだけで打鍵を持てる
+// (このファイルへの追記は 1 バイトも要らない)。
+//
+// ## 何を諦めていないか
+//
+//   * 消費は [`consume_binding`] → [`consume_shortcut_compat`] を通る
+//     (⌘⇧C / ⌘⇧V が egui-winit に飲み込まれる罠を避ける)
+//   * `config.toml` の `[keybindings]` から再割り当てできる。ID に `.` が
+//     入るので [`config_name`] の snake_case 名とは**構造的に衝突しない**
+//   * 画面表記は [`feature_key_hint`] が**実際の割り当てから**起こす
+//   * 既定打鍵の食い合いは [`bind_conflicts_on`] が **mac / 非 mac の両方**の
+//     規則で検査する。実行時に片方が黙って死ぬ前に、テストで落とす
+
+/// 表示形式 (`"⌘⇧J"` / `"Ctrl+Shift+J"`) の打鍵をパースする。
+///
+/// [`format_shortcut`] の逆変換。`config.toml` の綴り (`"cmd+shift+j"`) も
+/// そのまま受け付けるので、機能側は好きな方で書ける。
+///
+/// **`⌘` / `cmd` は「command 修飾キー」** — macOS では ⌘、Windows/Linux では
+/// Ctrl に写る (`Modifiers::COMMAND` と同じ)。**`⌃` / `ctrl` は文字どおりの
+/// Ctrl** で、macOS では ⌘ とは別のキーになる。移植性が要るなら `⌘` 側を書くこと
+/// (非 macOS では [`canonical_mods`] が両者を畳むので同じ打鍵になる)。
+///
+/// 修飾キーだけ・空文字・解釈できない綴りは `None` (panic しない)。
+pub fn parse_display_shortcut(s: &str) -> Option<KeyboardShortcut> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (mods, rest) = split_glyph_mods(s);
+    if let Some(key) = display_key_from_name(rest) {
+        return Some(KeyboardShortcut::new(mods, key));
+    }
+    // 記号の修飾キーが付いていたのにキーが読めない = 不正
+    // (記号が無いときだけ `"ctrl+shift+j"` 形式として読み直す)
+    if mods == Modifiers::NONE {
+        parse_shortcut(s)
+    } else {
+        None
+    }
+}
+
+/// 表示形式の 1 打鍵 / 2 打鍵 (`"⌘K ⌘S"`) をパースする。
+///
+/// [`parse_binding`] と同じく**単打の解釈を先に試す** — 旧来の綴り
+/// (`"cmd + shift + p"`) を空白で割ってしまうと既存の設定が黙って壊れる。
+pub fn parse_display_binding(s: &str) -> Option<Binding> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(sc) = parse_display_shortcut(s) {
+        return Some(Binding::Single(sc));
+    }
+    let mut it = s.split_whitespace();
+    let a = parse_display_shortcut(it.next()?)?;
+    let b = parse_display_shortcut(it.next()?)?;
+    if it.next().is_some() {
+        // 3 打鍵以上は非対応 ([`parse_binding`] と同じ)
+        return None;
+    }
+    Some(Binding::Chord(a, b))
+}
+
+/// 先頭に並んだ記号の修飾キー (`⌃⌥⇧⌘`) を剥がす。残りはキーの綴り。
+fn split_glyph_mods(s: &str) -> (Modifiers, &str) {
+    let mut mods = Modifiers::NONE;
+    let mut rest = s;
+    loop {
+        let mut it = rest.chars();
+        let m = match it.next() {
+            Some('⌘') => Modifiers::COMMAND,
+            Some('⌃') => Modifiers::CTRL,
+            Some('⌥') => Modifiers::ALT,
+            Some('⇧') => Modifiers::SHIFT,
+            _ => break,
+        };
+        mods = mods.plus(m);
+        rest = it.as_str();
+    }
+    (mods, rest)
+}
+
+/// [`key_label`] が出す綴り (記号を含む) からキーへ戻す。
+///
+/// 記号でないものは [`key_from_name`] がそのまま読めるので委譲する
+/// (`"Esc"` / `"Space"` / `"F12"` / `"Equals"` / `"A"` / `"1"` など)。
+fn display_key_from_name(name: &str) -> Option<Key> {
+    let n = name.trim().to_ascii_lowercase();
+    Some(match n.as_str() {
+        "" => return None,
+        // `key_label` の記号。egui の `symbol_or_name` 綴りも一応受ける
+        "↑" | "⏶" => Key::ArrowUp,
+        "↓" | "⏷" => Key::ArrowDown,
+        "←" | "⏴" => Key::ArrowLeft,
+        "→" | "⏵" => Key::ArrowRight,
+        "↩" | "⏎" | "return" => Key::Enter,
+        "⌫" => Key::Backspace,
+        // `+` は [`parse_shortcut`] の区切り文字なので、そちらでは読めない
+        "+" => Key::Plus,
+        _ => return key_from_name(&n),
+    })
+}
+
+/// 機能 ([`crate::feature::REGISTRY`]) が宣言した**既定**の打鍵。
+///
+/// 返す形は `(feature id, 打鍵)`。`Feature::binds` の `default` が空文字なら
+/// 「既定は持たないがユーザーは割り当てられる」の意味で、ここには載らない。
+/// 解釈できない綴りも載せない (fail-closed。番人テストが落とすので、
+/// 実行時にここへ来るのは設計上ありえない)。
+pub fn feature_binds() -> Vec<(&'static str, Binding)> {
+    let mut out = Vec::new();
+    for f in crate::feature::REGISTRY {
+        for b in f.binds {
+            if let Some(binding) = parse_display_binding(b.default) {
+                out.push((b.id, binding.canonical()));
+            }
+        }
+    }
+    out
+}
+
+/// この feature id の既定打鍵 (無ければ `None`)。
+pub fn feature_default_binding(id: &str) -> Option<Binding> {
+    feature_binds()
+        .into_iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, b)| b)
+}
+
+/// 機能の打鍵の解決テーブル ([`Keybinds`] の機能版)。
+///
+/// `BindAction` を 1 つも増やさないので、**機能が N 個増えてもこのファイルの
+/// 差分は 0 行**。`app.rs` はこれを 1 つ持ち、毎フレーム [`feature_hit`] を
+/// 呼ぶだけでよい。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FeatureBinds {
+    /// `(feature id, 割り当て)`。レジストリ順 (= 消費の優先順)。
+    binds: Vec<(&'static str, Binding)>,
+}
+
+impl FeatureBinds {
+    /// 既定 + `config.toml` の `[keybindings]` から構築。
+    ///
+    /// **[`Keybinds::from_overrides`] と同じ `HashMap` を渡してよい** —
+    /// 機能の ID は `"module.action"` で `.` を含み、[`config_name`] の
+    /// snake_case 名とは構造的にぶつからないので、1 つの表を両方が読める
+    /// (= 設定ファイル側にも新しい区画が要らない)。
+    /// 不正な綴り・知らない ID は黙って無視して既定を維持する。
+    pub fn from_overrides(overrides: &HashMap<String, String>) -> Self {
+        let mut binds = feature_binds();
+        for (name, spec) in overrides {
+            // 組み込みの config 名 (snake_case) には `.` が無いので、
+            // ここで落としておけば REGISTRY を舐めるのは機能側の行だけになる。
+            if !name.contains('.') {
+                continue;
+            }
+            // `id` は `&'static str` が要る (`Cmd::Feature` に載るため)。
+            // レジストリ側の実体を引く = **存在しない ID は受け付けない**
+            // (通すと「config に書いたのに永久に効かない行」ができる)。
+            let Some(id) = static_feature_id(name) else {
+                continue;
+            };
+            let Some(b) = parse_display_binding(spec).map(Binding::canonical) else {
+                continue;
+            };
+            match binds.iter_mut().find(|(i, _)| *i == id) {
+                Some(slot) => slot.1 = b,
+                None => binds.push((id, b)),
+            }
+        }
+        Self { binds }
+    }
+
+    /// 割り当て (無ければ `None`)。
+    pub fn binding(&self, id: &str) -> Option<Binding> {
+        self.binds.iter().find(|(i, _)| *i == id).map(|(_, b)| *b)
+    }
+
+    /// レジストリ順の全割り当て。
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, Binding)> + '_ {
+        self.binds.iter().copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.binds.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.binds.len()
+    }
+
+    /// GUI からの再割り当て。**知らない ID は受け付けない** (`false` を返す)。
+    pub fn set(&mut self, id: &str, b: Binding) -> bool {
+        let Some(id) = static_feature_id(id) else {
+            return false;
+        };
+        let b = b.canonical();
+        match self.binds.iter_mut().find(|(i, _)| *i == id) {
+            Some(slot) => slot.1 = b,
+            None => self.binds.push((id, b)),
+        }
+        true
+    }
+
+    /// 1 行を既定へ戻す (既定を持たない ID なら割り当てごと消える)。
+    pub fn reset(&mut self, id: &str) {
+        match feature_default_binding(id) {
+            Some(d) => {
+                self.set(id, d);
+            }
+            None => self.binds.retain(|(i, _)| *i != id),
+        }
+    }
+
+    /// 全部を既定へ戻す。
+    pub fn reset_all(&mut self) {
+        self.binds = feature_binds();
+    }
+
+    pub fn is_default(&self, id: &str) -> bool {
+        self.binding(id).map(Binding::canonical) == feature_default_binding(id)
+    }
+
+    /// `config.toml` の `[keybindings]` へ書く形。**既定と同じ行は入れない**。
+    pub fn overrides(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for (id, b) in self.iter() {
+            if !self.is_default(id) {
+                out.insert(id.to_string(), binding_spec(b));
+            }
+        }
+        out
+    }
+}
+
+/// `config.toml` へ書き戻す 1 枚の表 (組み込み + 機能)。
+///
+/// `app.rs` の `persist_keybindings` が `Keybinds::overrides()` だけを書くと
+/// **機能側の再割り当てが毎回消える**ので、書き戻しは必ずこちらを通すこと。
+pub fn merged_overrides(keys: &Keybinds, features: &FeatureBinds) -> HashMap<String, String> {
+    let mut out = keys.overrides();
+    out.extend(features.overrides());
+    out
+}
+
+/// レジストリが持っている `&'static str` の ID を引く。
+///
+/// `config.toml` から来た `String` をそのまま `Cmd::Feature` へ載せられない
+/// (`&'static str` が要る) ので、実体へ寄せ直す。
+fn static_feature_id(id: &str) -> Option<&'static str> {
+    for f in crate::feature::REGISTRY {
+        if let Some(e) = f.entries.iter().find(|e| e.id == id) {
+            return Some(e.id);
+        }
+        if let Some(b) = f.binds.iter().find(|b| b.id == id) {
+            return Some(b.id);
+        }
+    }
+    None
+}
+
+/// 押された打鍵に対応する feature id を 1 つ返す。`app.rs` はこれを
+/// `Cmd::Feature(id)` へ回す (= `feature::dispatch` が所有者へ配る)。
+///
+/// 消費は [`consume_binding`] 経由なので、chord も
+/// egui-winit に飲み込まれる ⌘⇧C / ⌘⇧V も正しく拾える。
+/// **組み込みバインドを消費し終えた後に呼ぶこと** — 同じ打鍵が両方に
+/// 割り当たっていたら組み込みが勝つ (既定同士の食い合いは
+/// [`bind_conflicts_on`] の番人テストが先に落とす)。
+pub fn feature_hit(
+    ctx: &egui::Context,
+    binds: &FeatureBinds,
+    chord: &mut ChordState,
+) -> Option<&'static str> {
+    if binds.is_empty() {
+        // 1 つも登録が無いなら入力ロックすら取らない (アイドルのコストは 0)
+        return None;
+    }
+    ctx.input_mut(|i| feature_hit_input(i, binds, chord))
+}
+
+/// [`feature_hit`] の入力状態版 (ヘッドレステスト用)。
+pub fn feature_hit_input(
+    i: &mut egui::InputState,
+    binds: &FeatureBinds,
+    chord: &mut ChordState,
+) -> Option<&'static str> {
+    binds
+        .iter()
+        .find(|(_, b)| consume_binding(i, *b, chord))
+        .map(|(id, _)| id)
+}
+
+/// 画面に出す打鍵表記。**必ず実際の割り当てから起こす**
+/// (`config.toml` で再割り当てされた瞬間にベタ書きは嘘になる)。
+/// 割り当てが無ければ空文字 — パレットの打鍵欄は空のまま出る。
+pub fn feature_key_hint(binds: &FeatureBinds, id: &str) -> String {
+    binds
+        .binding(id)
+        .or_else(|| feature_default_binding(id))
+        .map(format_binding)
+        .unwrap_or_default()
+}
+
+/// 機能の打鍵が**そのまま採用できない**理由を全部並べる (人が読む文字列)。
+///
+/// [`conflicts_for`] は `Conflict::Duplicate(BindAction)` を返すので、
+/// 機能どうしの食い合い (相手が `BindAction` ではない) を表現できない。
+/// ここは番人テストと設定画面の両方が同じ判定を使うための 1 か所。
+pub fn bind_conflicts(keys: &Keybinds, binds: &[(&str, Binding)]) -> Vec<String> {
+    bind_conflicts_on(keys, binds, cfg!(target_os = "macos"))
+}
+
+/// [`bind_conflicts`] の OS 規則を**引数で明示**する版。
+///
+/// `mac = false` では [`canonical_mods_on`] が ⌃ を ⌘ へ畳むので、
+/// **macOS では別物だった打鍵が Windows / Linux でだけ食い合う**。
+/// これを番人テストが両側で検査する (片方が永久に効かなくなる事故の防止)。
+/// `MACOS_RESERVED` は macOS の実測表なので、`mac = true` のときだけ見る。
+pub fn bind_conflicts_on(keys: &Keybinds, binds: &[(&str, Binding)], mac: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (i, (id, b)) in binds.iter().enumerate() {
+        let label = format_binding(*b);
+        // ① 組み込みアクションとの食い合い
+        for a in ALL_ACTIONS {
+            let ob = keys.binding(a);
+            if binding_eq_on(*b, ob, mac) {
+                out.push(format!(
+                    "{id} = {label} は組み込みの {} と同じ打鍵",
+                    config_name(a)
+                ));
+            } else if prefix_clash_on(*b, ob, mac) {
+                out.push(format!(
+                    "{id} = {label} は組み込みの {} と prefix が食い合う",
+                    config_name(a)
+                ));
+            }
+        }
+        // ② 機能どうしの食い合い (先に出た方を基準にする)
+        for (oid, ob) in binds.iter().take(i) {
+            if binding_eq_on(*b, *ob, mac) {
+                out.push(format!("{id} = {label} は {oid} と同じ打鍵"));
+            } else if prefix_clash_on(*b, *ob, mac) {
+                out.push(format!("{id} = {label} は {oid} と prefix が食い合う"));
+            }
+        }
+        // ③ macOS が OS 側で握っている打鍵 (アプリまで届かない)
+        if mac {
+            for sc in [Some(b.first()), b.second()].into_iter().flatten() {
+                if let Some(why) = macos_reservation_on(sc, true) {
+                    out.push(format!("{id} = {label} は macOS が使用中 ({why})"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 同じ打鍵か (OS 規則を明示)。
+fn stroke_eq_on(a: KeyboardShortcut, b: KeyboardShortcut, mac: bool) -> bool {
+    a.logical_key == b.logical_key
+        && canonical_mods_on(a.modifiers, mac) == canonical_mods_on(b.modifiers, mac)
+}
+
+/// 同じ割り当てか (chord は 2 打鍵とも一致して初めて同じ)。
+fn binding_eq_on(a: Binding, b: Binding, mac: bool) -> bool {
+    match (a, b) {
+        (Binding::Single(x), Binding::Single(y)) => stroke_eq_on(x, y, mac),
+        (Binding::Chord(x1, x2), Binding::Chord(y1, y2)) => {
+            stroke_eq_on(x1, y1, mac) && stroke_eq_on(x2, y2, mac)
+        }
+        _ => false,
+    }
+}
+
+/// 片方が chord・もう片方が単打で 1 打鍵目が同じ = 単打は絶対に発火しない。
+fn prefix_clash_on(a: Binding, b: Binding, mac: bool) -> bool {
+    match (a, b) {
+        (Binding::Single(s), Binding::Chord(p, _)) | (Binding::Chord(p, _), Binding::Single(s)) => {
+            stroke_eq_on(s, p, mac)
+        }
+        _ => false,
+    }
+}
+
+/// [`macos_reservation`] の OS 規則を明示する版。
+///
+/// `mac = false` のホストから macOS の予約を検査するために要る
+/// (`canonical_mods` をそのまま使うと ⌃Tab が ⌘Tab に畳まれて
+/// 「macOS が使用中」という**嘘の警告**が出る — CI が実際に 4 件出した)。
+fn macos_reservation_on(sc: KeyboardShortcut, mac: bool) -> Option<&'static str> {
+    let mods = canonical_mods_on(sc.modifiers, mac);
+    MACOS_RESERVED.iter().find_map(|(m, k, why)| {
+        (sc.logical_key == *k && canonical_mods_on(*m, mac) == mods).then_some(*why)
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3636,5 +4055,399 @@ mod tests {
                 assert_eq!(format_shortcut(sc2), f1, "{a:?}");
             }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 機能レジストリの打鍵 (`BindAction` を 1 つも増やさない経路)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// 表示形式 ([`format_shortcut`] の出力) は往復する。
+    ///
+    /// **記録できる全キー × 修飾キーの組み合わせ**で見るので、
+    /// 「`key_spec` へ足したのに表示形式から戻せないキー」が残らない。
+    #[test]
+    fn 表示形式の打鍵はparseとformatを往復する() {
+        let combos = [
+            Modifiers::NONE,
+            Modifiers::COMMAND,
+            Modifiers::COMMAND.plus(Modifiers::SHIFT),
+            Modifiers::CTRL.plus(Modifiers::ALT),
+            Modifiers::ALT.plus(Modifiers::SHIFT),
+            Modifiers::COMMAND
+                .plus(Modifiers::CTRL)
+                .plus(Modifiers::ALT)
+                .plus(Modifiers::SHIFT),
+        ];
+        let mut checked = 0usize;
+        for key in Key::ALL.iter().copied().filter(|k| is_recordable(*k)) {
+            for m in combos {
+                let want = KeyboardShortcut::new(m, key);
+                let text = format_shortcut(want);
+                let back = parse_display_shortcut(&text)
+                    .unwrap_or_else(|| panic!("表示形式 {text:?} を戻せない ({key:?})"));
+                // 非 macOS では ⌃ と ⌘ が同じ綴りになるので、比較は正規形で行う
+                assert_eq!(
+                    canonical_shortcut(back),
+                    canonical_shortcut(want),
+                    "{text} ({key:?})"
+                );
+                // parse → format → parse が固定点
+                let text2 = format_shortcut(back);
+                assert_eq!(text2, text, "{key:?}");
+                assert_eq!(parse_display_shortcut(&text2), Some(back), "{key:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "検査したのは {checked} 件だけ");
+    }
+
+    /// 機能側は記号形式でも設定ファイル形式でも書ける。
+    #[test]
+    fn 表示形式は設定ファイルの綴りも受ける() {
+        let glyph = parse_display_shortcut("⌘⇧J").expect("記号形式");
+        let spec = parse_display_shortcut("cmd+shift+j").expect("設定形式");
+        assert!(same_stroke(glyph, spec));
+        // 語形式の Ctrl は**文字どおりの ⌃**。macOS では ⌘ と別のキーになり、
+        // 非 macOS では `canonical_mods` が畳むので同じ打鍵になる。
+        let word = parse_display_shortcut("Ctrl+Shift+J").expect("語形式");
+        assert_eq!(
+            same_stroke(glyph, word),
+            !cfg!(target_os = "macos"),
+            "⌃ と ⌘ の同一視が OS 前提と食い違う"
+        );
+        // 2 打鍵もどちらの綴りでも読める
+        let chord = Binding::Chord(
+            sc(Modifiers::COMMAND, Key::K),
+            sc(Modifiers::COMMAND, Key::S),
+        );
+        assert_eq!(parse_display_binding("⌘K ⌘S"), Some(chord));
+        assert_eq!(parse_display_binding("cmd+k cmd+s"), Some(chord));
+        // 旧来の空白入りの綴りを黙って壊さない
+        assert_eq!(
+            parse_display_binding("cmd + shift + p"),
+            parse_binding("cmd+shift+p")
+        );
+    }
+
+    #[test]
+    fn 不正な表示形式でpanicしない() {
+        for s in [
+            "",
+            "  ",
+            "⌘",
+            "⌘⇧",
+            "⌘ ⌘",
+            "⌘Ctrl+J",
+            "⌘K ⌘S",
+            "⌘不明",
+            "🙂",
+        ] {
+            assert_eq!(parse_display_shortcut(s), None, "{s:?}");
+        }
+        assert_eq!(parse_display_binding(""), None);
+        assert_eq!(parse_display_binding("   "), None);
+        // 3 打鍵以上は非対応
+        assert_eq!(parse_display_binding("⌘K ⌘S ⌘T"), None);
+    }
+
+    /// 機能が宣言した既定打鍵は**全部**解釈でき、ID が実在する。
+    ///
+    /// 解釈できない綴りは [`feature_binds`] から黙って落ちる (fail-closed) ので、
+    /// ここで落とさないと「登録したのに永久に効かない打鍵」ができる。
+    /// パレット項目まで要求するのは、打鍵しか無い機能が**発見できない**ため
+    /// (CLAUDE.md の「UI から到達できない実装は未完成」と同じ理由)。
+    #[test]
+    fn 機能の既定打鍵は全部解析できてidが実在する() {
+        for f in crate::feature::REGISTRY {
+            for b in f.binds {
+                assert!(
+                    b.id.len() > f.module.len() + 1
+                        && b.id.starts_with(f.module)
+                        && b.id.as_bytes().get(f.module.len()) == Some(&b'.'),
+                    "Bind の ID {:?} が \"{}.\" で始まっていない",
+                    b.id,
+                    f.module
+                );
+                assert!(
+                    f.entries.iter().any(|e| e.id == b.id),
+                    "{:?} に対応するパレット項目が無い (打鍵しか無いと発見できない)",
+                    b.id
+                );
+                if b.default.is_empty() {
+                    // 「既定は持たないがユーザーは割り当てられる」の明示
+                    continue;
+                }
+                assert!(
+                    parse_display_binding(b.default).is_some(),
+                    "{:?} の既定打鍵 {:?} が解釈できない",
+                    b.id,
+                    b.default
+                );
+            }
+        }
+    }
+
+    /// **機能の既定打鍵は、組み込みとも互いにも、macOS の予約とも食い合わない。**
+    ///
+    /// 食い合ったときに「どちらが勝つか」を決めない — 実行時には片方が黙って
+    /// 死ぬ (押しても何も起きない) だけなので、**テストで落として**統合前に
+    /// 気付かせる。**mac / 非 mac の両方の規則で検査する**のが要点で、
+    /// `canonical_mods` は非 macOS で ⌃ を ⌘ へ畳むため、macOS だけで見ていると
+    /// 「Windows / Linux でだけ死ぬ打鍵」を素通ししてしまう (実際に起きた)。
+    #[test]
+    fn 機能の既定打鍵は組み込みとも互いにも食い合わない() {
+        let keys = Keybinds::default();
+        let binds = feature_binds();
+        for mac in [true, false] {
+            let bad = bind_conflicts_on(&keys, &binds, mac);
+            assert!(bad.is_empty(), "mac={mac} の規則で食い合っている: {bad:#?}");
+        }
+        // ホスト OS 向けの入口は cfg! と一致する
+        assert_eq!(
+            bind_conflicts(&keys, &binds),
+            bind_conflicts_on(&keys, &binds, cfg!(target_os = "macos"))
+        );
+    }
+
+    /// 衝突検出そのものが効いていること (レジストリが空でも意味を持つ検査)。
+    #[test]
+    fn 衝突検出は組み込みと機能どうしとprefixとos予約を拾う() {
+        let keys = Keybinds::default();
+        // どの既定とも当たらない打鍵 (⌘⌥⇧F19)。F13 以降は既定に 1 つも無い。
+        let free = Binding::Single(sc(
+            Modifiers::COMMAND
+                .plus(Modifiers::ALT)
+                .plus(Modifiers::SHIFT),
+            Key::F19,
+        ));
+        assert!(bind_conflicts_on(&keys, &[("t.ok", free)], true).is_empty());
+        assert!(bind_conflicts_on(&keys, &[("t.ok", free)], false).is_empty());
+
+        // ① 組み込みと同じ打鍵
+        let dup = keys.binding(BindAction::Save);
+        assert!(!bind_conflicts_on(&keys, &[("t.dup", dup)], true).is_empty());
+        // ② chord の prefix を単打で奪う (奪われた側は永久に発火しない)
+        let prefix = Binding::Single(keys.binding(BindAction::KeybindEditor).first());
+        assert!(!bind_conflicts_on(&keys, &[("t.prefix", prefix)], true).is_empty());
+        // ③ 機能どうし
+        let pair = [("t.a", free), ("t.b", free)];
+        let got = bind_conflicts_on(&keys, &pair, true);
+        assert_eq!(got.len(), 1, "機能どうしの重複が 1 件だけ出る: {got:?}");
+        assert!(got[0].contains("t.a") && got[0].contains("t.b"), "{got:?}");
+        // ④ macOS の予約表 (実測表の先頭 = ⌘Space / Spotlight)
+        let (m, k, _) = MACOS_RESERVED[0];
+        let reserved = [("t.res", Binding::Single(sc(m, k)))];
+        assert!(bind_conflicts_on(&keys, &reserved, true)
+            .iter()
+            .any(|s| s.contains("macOS")));
+        // 非 macOS の規則では予約表を見ない (⌃ の畳み込みで嘘の警告になる)
+        assert!(!bind_conflicts_on(&keys, &reserved, false)
+            .iter()
+            .any(|s| s.contains("macOS")));
+    }
+
+    /// **非 macOS で ⌃ が ⌘ へ畳まれた後**の食い合いを拾う。
+    ///
+    /// `⌃⌘F` と `⌘F` が同じ打鍵になり、片方が永久に効かなくなる事故が
+    /// 実際に起きた (macOS では全部緑なのに CI の Linux / Windows で落ちた)。
+    #[test]
+    fn 非macosでは畳み込み後の重複も検出する() {
+        let keys = Keybinds::default();
+        let save = keys.binding(BindAction::Save).first();
+        let ctrl_same = [(
+            "t.ctrl",
+            Binding::Single(sc(Modifiers::CTRL, save.logical_key)),
+        )];
+        assert!(
+            bind_conflicts_on(&keys, &ctrl_same, true).is_empty(),
+            "macOS では ⌃ と ⌘ は別のキー"
+        );
+        assert!(
+            !bind_conflicts_on(&keys, &ctrl_same, false).is_empty(),
+            "非 macOS では ⌃ が ⌘ へ畳まれるので食い合う"
+        );
+        assert_eq!(
+            bind_conflicts(&keys, &ctrl_same).is_empty(),
+            cfg!(target_os = "macos"),
+            "ホスト OS 向けの入口が OS 前提と食い違う"
+        );
+    }
+
+    /// 機能の ID と組み込みの config 名は**構造的に**ぶつからない。
+    /// だから `[keybindings]` の 1 枚の表を両方が読める
+    /// (= 設定ファイル側にも新しい区画が要らない = ここでも衝突ゼロ)。
+    #[test]
+    fn 機能のidは組み込みのconfig名とぶつからない() {
+        for f in crate::feature::REGISTRY {
+            for e in f.entries {
+                assert!(e.id.contains('.'), "機能の ID に . が無い: {}", e.id);
+                assert!(
+                    Keybinds::action_from_name(e.id).is_none(),
+                    "機能の ID が組み込みの config 名と一致している: {}",
+                    e.id
+                );
+            }
+        }
+        for a in ALL_ACTIONS {
+            assert!(
+                !config_name(a).contains('.'),
+                "{a:?} の config 名に . が入っている (機能の ID とぶつかる)"
+            );
+        }
+    }
+
+    #[test]
+    fn 機能の打鍵はconfigから再割り当てできる() {
+        let mut ov = HashMap::new();
+        // 組み込みと機能が**同じ表**を読む
+        ov.insert("save".into(), "cmd+shift+f18".to_string());
+        // 実在しない ID は受け付けない (config に書いても効かない行を作らない)
+        ov.insert("zzz.nonexistent".into(), "cmd+shift+f19".to_string());
+        let keys = Keybinds::from_overrides(&ov);
+        assert_eq!(
+            keys.binding(BindAction::Save),
+            parse_binding("cmd+shift+f18")
+                .map(Binding::canonical)
+                .unwrap()
+        );
+        let fb = FeatureBinds::from_overrides(&ov);
+        assert_eq!(fb.binding("zzz.nonexistent"), None);
+
+        // レジストリに項目があるときだけ、再割り当ての往復まで見る
+        let Some(id) = crate::feature::REGISTRY
+            .iter()
+            .flat_map(|f| f.entries.iter())
+            .map(|e| e.id)
+            .next()
+        else {
+            return;
+        };
+        let mut ov2 = HashMap::new();
+        ov2.insert(id.to_string(), "cmd+alt+shift+f19".to_string());
+        let fb2 = FeatureBinds::from_overrides(&ov2);
+        assert_eq!(
+            fb2.binding(id),
+            parse_display_binding("cmd+alt+shift+f19").map(Binding::canonical),
+            "config からの再割り当てが効いていない"
+        );
+        // 書き戻して読み直しても同じ割り当て
+        let back = FeatureBinds::from_overrides(&fb2.overrides());
+        assert_eq!(back.binding(id), fb2.binding(id));
+        // 組み込みと機能を 1 枚の表で保存できる (どちらも消えない)
+        let merged = merged_overrides(&keys, &fb2);
+        assert!(
+            merged.contains_key("save") && merged.contains_key(id),
+            "書き戻しで片方が消えている: {merged:?}"
+        );
+        // 既定へ戻せば書き戻す行も消える
+        let mut fb3 = fb2.clone();
+        fb3.reset(id);
+        assert!(fb3.is_default(id), "既定へ戻せていない");
+        assert!(
+            !fb3.set("zzz.nonexistent", free_binding()),
+            "知らない ID を受け付けた"
+        );
+    }
+
+    /// 合成表を作るための打鍵 (どの既定とも当たらない)。
+    fn free_binding() -> Binding {
+        Binding::Single(sc(
+            Modifiers::COMMAND
+                .plus(Modifiers::ALT)
+                .plus(Modifiers::SHIFT),
+            Key::F19,
+        ))
+    }
+
+    #[test]
+    fn 押された打鍵から機能idを返す() {
+        // レジストリの中身に依存しない合成表 (私有フィールドを直に組む)
+        let binds = FeatureBinds {
+            binds: vec![("t.single", free_binding())],
+        };
+        let mut chord = ChordState::default();
+        let mut i = egui::InputState::default();
+        let m = Modifiers::COMMAND
+            .plus(Modifiers::ALT)
+            .plus(Modifiers::SHIFT);
+        i.events.push(egui::Event::Key {
+            key: Key::F19,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: m,
+        });
+        i.modifiers = m;
+        assert_eq!(
+            feature_hit_input(&mut i, &binds, &mut chord),
+            Some("t.single")
+        );
+        // 消費済みなので 2 回目は出ない (1 フレームに 2 回発火しない)
+        assert_eq!(feature_hit_input(&mut i, &binds, &mut chord), None);
+        // 何も押されていないフレームでは何も起きない
+        let mut idle = egui::InputState::default();
+        assert_eq!(
+            feature_hit_input(&mut idle, &binds, &mut chord),
+            None,
+            "誰も押していないのに発火した"
+        );
+    }
+
+    /// 機能の chord も **`consume_shortcut_compat` 経由**で拾える。
+    ///
+    /// 2 打鍵目の ⌘⌥C は egui-winit 0.29 が押下イベントごと捨てて
+    /// `Event::Copy` にすり替えるので、素の `consume_shortcut` では
+    /// 構造的に絶対発火しない。
+    #[test]
+    fn 機能のchordは1打鍵目で発火せず2打鍵目で拾える() {
+        let m = Modifiers::COMMAND.plus(Modifiers::ALT);
+        let binds = FeatureBinds {
+            binds: vec![("t.chord", Binding::Chord(sc(m, Key::K), sc(m, Key::C)))],
+        };
+        let mut chord = ChordState::default();
+        let mut i = egui::InputState::default();
+        i.events.push(egui::Event::Key {
+            key: Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: m,
+        });
+        i.modifiers = m;
+        assert_eq!(
+            feature_hit_input(&mut i, &binds, &mut chord),
+            None,
+            "1 打鍵目で発火した"
+        );
+        assert!(chord.is_waiting(), "prefix を握れていない");
+        // 2 打鍵目は Event::Copy に化けている
+        let mut i2 = egui::InputState::default();
+        i2.events.push(egui::Event::Copy);
+        i2.modifiers = m;
+        assert_eq!(
+            feature_hit_input(&mut i2, &binds, &mut chord),
+            Some("t.chord"),
+            "飲み込まれた 2 打鍵目が拾えていない"
+        );
+        assert!(!chord.is_waiting(), "発火後も待機が残っている");
+    }
+
+    /// 画面に出す打鍵表記は**実際の割り当て**から起こす (ベタ書きしない)。
+    #[test]
+    fn 機能の打鍵表記は実際の割り当てから起こす() {
+        let b = Binding::Single(sc(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::J));
+        let binds = FeatureBinds {
+            binds: vec![("t.x", b)],
+        };
+        let hint = feature_key_hint(&binds, "t.x");
+        assert_eq!(hint, format_binding(b));
+        // 表記そのものが OS で変わる (macOS は記号、他は "Ctrl+Shift+J")
+        assert_eq!(
+            hint.contains('⌘'),
+            cfg!(target_os = "macos"),
+            "打鍵表記が OS 前提と食い違う: {hint}"
+        );
+        // 割り当ての無い ID は空文字 (パレットの打鍵欄が空のまま出る)
+        assert_eq!(feature_key_hint(&binds, "t.unknown"), "");
     }
 }

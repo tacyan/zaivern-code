@@ -143,8 +143,16 @@ pub fn scan_and_prune(dir: &Path) -> Vec<InstanceEntry> {
 /// PID が生きているか (シグナルを送らない存在確認のみ)。
 ///
 /// unix: `kill(pid, 0)`。EPERM は「存在するが他人のプロセス」なので生存扱い。
-/// Windows: tasklist の CSV 出力に該当 PID の行があるか。
-#[cfg_attr(windows, allow(dead_code))] // Windows の entry_alive は tasklist_image を直接使う
+/// Windows: `OpenProcess` + `WaitForSingleObject(0)`。**プロセスを起こさない。**
+///
+/// **Windows で `tasklist` を起こしてはいけない理由。** この関数は
+/// [`crate::lease`] の `active()` → `prune()` から呼ばれ、その呼び出しは
+/// `with_store` が**台帳のロックを握ったまま**行う。プロセス起動は
+/// syscall の数千倍 (Windows の CreateProcess は数十 ms 級) なので、
+/// リース 1 件でもロック待ちの上限 (`lease::LOCK_WAIT_MS`) を
+/// 1 回で食い潰し得る。ロックを取れなかった側は fail-open するため、
+/// **いちばん混んでいるとき (= いちばん衝突しやすいとき) にだけ
+/// リースが効かなくなる**という最悪の壊れ方になる。
 pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -158,11 +166,178 @@ pub fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        tasklist_image(pid).is_some()
+        osrule::alive_from(win::probe(pid))
     }
     #[cfg(not(any(unix, windows)))]
     {
         false
+    }
+}
+
+// ─────────────── Windows の判定規則 (どの OS からでも検査できる形) ───────────────
+
+/// OS 依存の判定 (Windows の Win32 戻り値・パス区切り) を、**引数だけ**から
+/// 決める純粋関数群。
+///
+/// `keybinds::canonical_mods_on(m, mac)` と同じ流儀 — OS 依存の規則を引数へ
+/// 追い出して、**macOS / Linux のホストからでもテーブルテストで固定できる**
+/// ようにする。`#[cfg(windows)]` の中に規則を埋めると、開発機では 1 行も
+/// 実行されないまま「コンパイルは通る」状態で寝てしまう。
+///
+/// 非 Windows では呼び出し元がテストだけになるので dead_code を許可する。
+/// **これは「繋いでいない」のではなく、繋ぐ先が別 OS にしか無いという意味。**
+mod osrule {
+    #![cfg_attr(not(windows), allow(dead_code))]
+
+    /// `GetLastError`: 権限が足りないだけ = **プロセスは存在する** (unix の EPERM 相当)。
+    pub const ERROR_ACCESS_DENIED: u32 = 5;
+    /// `GetLastError`: そんな PID は居ない (`OpenProcess` の主な失敗理由)。
+    pub const ERROR_INVALID_PARAMETER: u32 = 87;
+    /// `WaitForSingleObject`: シグナル済み = プロセスは**終了している**。
+    pub const WAIT_OBJECT_0: u32 = 0;
+    /// `WaitForSingleObject`: 時間切れ = まだ動いている。
+    pub const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+    /// `pid_alive` が Win32 から受け取る観測結果。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Probe {
+        /// `OpenProcess` に成功し、`WaitForSingleObject(h, 0)` がこの値を返した。
+        Waited(u32),
+        /// `OpenProcess` が失敗し、`GetLastError` がこの値を返した。
+        OpenFailed(u32),
+    }
+
+    /// 観測結果 → 生死。
+    ///
+    /// **`GetExitCodeProcess` を使わない理由**: 実行中を表す `STILL_ACTIVE` は
+    /// 259 で、「終了コード 259 で終わったプロセス」と区別が付かない。
+    /// `WaitForSingleObject` はカーネルオブジェクトのシグナル状態を見るので
+    /// この曖昧さが無い。
+    pub fn alive_from(p: Probe) -> bool {
+        match p {
+            // シグナル済み = プロセスオブジェクトが終了している。
+            Probe::Waited(WAIT_OBJECT_0) => false,
+            // 時間切れ = 未シグナル = 実行中。
+            Probe::Waited(WAIT_TIMEOUT) => true,
+            // 想定外の戻り (WAIT_FAILED 等) は「開けた以上ハンドルは実在する」
+            // ので生存側へ倒す (fail-safe: リースを早すぎるタイミングで奪わない)。
+            Probe::Waited(_) => true,
+            // 開けなかった理由で分ける。ACCESS_DENIED は「居るが触れない」。
+            Probe::OpenFailed(ERROR_ACCESS_DENIED) => true,
+            Probe::OpenFailed(ERROR_INVALID_PARAMETER) => false,
+            // 理由不明の失敗は死亡扱い (存在の証拠が無い)。
+            Probe::OpenFailed(_) => false,
+        }
+    }
+
+    /// `tasklist /FO CSV /NH` の出力から該当 PID のイメージ名を取り出す。
+    ///
+    /// 出力例 (1 行): `"zai.exe","4242","Console","1","62,912 K"`
+    /// 該当なしのときは `情報: …` / `INFO: …` の 1 行が来る (ロケール依存なので
+    /// **文面では判定しない**。`"` で始まる CSV 行だけを見る)。
+    pub fn tasklist_image_of(text: &str, pid: u32) -> Option<String> {
+        let want = pid.to_string();
+        for line in text.lines() {
+            // CRLF の \r は lines() が落とさない列がある (末尾列) ため trim する。
+            let line = line.trim();
+            if !line.starts_with('"') {
+                continue;
+            }
+            let mut cols = line.trim_start_matches('"').split("\",\"");
+            let Some(image) = cols.next() else { continue };
+            if cols.next().map(|p| p.trim_matches('"')) == Some(want.as_str()) {
+                return Some(image.trim_matches('"').to_string());
+            }
+        }
+        None
+    }
+
+    /// パス文字列の basename を、**区切り規則を引数で受けて**取り出す。
+    ///
+    /// `std::path::Path::file_name` はホスト OS の規則しか知らないので、
+    /// macOS から `C:\\x\\zai.exe` を渡すと `\\` が区切りに見えず
+    /// **文字列まるごと**が返る。ここを引数化しておかないと、Windows の
+    /// 規則は Windows でしか確かめられない。
+    pub fn basename_on(path: &str, win_sep: bool) -> String {
+        let mut cut = path.rfind('/').map(|i| i + 1).unwrap_or(0);
+        if win_sep {
+            if let Some(i) = path.rfind('\\') {
+                cut = cut.max(i + 1);
+            }
+        }
+        path[cut..].to_string()
+    }
+
+    /// イメージ名の照合 (Windows のファイル名は大小非区別)。
+    /// `expect` が空 = 照合材料が無いので「合っている」とみなす (fail-open)。
+    pub fn image_matches(image: &str, expect: &str) -> bool {
+        expect.is_empty() || image.eq_ignore_ascii_case(expect)
+    }
+}
+
+/// kernel32 の直叩き。`windows-sys` の feature を増やさずに済むよう、
+/// `textenc.rs` と同じ流儀で必要な 5 つだけ宣言する
+/// (`Win32_System_Threading` を Cargo.toml へ足すと依存の解決面が広がる)。
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+
+    /// 終了コード・イメージ名の照会に足りる最小権限 (Vista 以降)。
+    /// `PROCESS_QUERY_INFORMATION` と違い、権限の低いプロセスからでも通る。
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    /// `WaitForSingleObject` に要る権限。
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+        fn QueryFullProcessImageNameW(
+            handle: *mut c_void,
+            flags: u32,
+            buf: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    /// PID を 1 回だけ観測する。**プロセスは起こさない** (syscall 3 回)。
+    pub fn probe(pid: u32) -> super::osrule::Probe {
+        let h = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() {
+            return super::osrule::Probe::OpenFailed(unsafe { GetLastError() });
+        }
+        let rc = unsafe { WaitForSingleObject(h, 0) };
+        unsafe { CloseHandle(h) };
+        super::osrule::Probe::Waited(rc)
+    }
+
+    /// PID のイメージ名 (basename)。取れなければ None。
+    /// 長さは固定で決め打たず、`MAX_PATH` から始めて足りなければ倍にする
+    /// (長いパス有効時は 32767 まで伸びうる)。
+    pub fn image_name(pid: u32) -> Option<String> {
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() {
+            return None;
+        }
+        let mut cap: usize = 260;
+        let mut out = None;
+        while cap <= 32_768 {
+            let mut buf = vec![0u16; cap];
+            let mut len = cap as u32;
+            let ok = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) };
+            if ok != 0 {
+                let full = String::from_utf16_lossy(&buf[..len as usize]);
+                out = std::path::Path::new(&full)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string());
+                break;
+            }
+            cap *= 2;
+        }
+        unsafe { CloseHandle(h) };
+        out
     }
 }
 
@@ -214,14 +389,22 @@ fn entry_alive(e: &InstanceEntry) -> bool {
     }
     #[cfg(windows)]
     {
-        let Some(image) = tasklist_image(e.pid) else {
+        // 生存確認は syscall だけで済ませる (tasklist を起こさない)。
+        if !pid_alive(e.pid) {
             return false;
-        };
+        }
         let expect = expected_image_name(e);
         if expect.is_empty() {
             return true;
         }
-        image.eq_ignore_ascii_case(&expect)
+        // イメージ名は QueryFullProcessImageNameW が第一候補。取れないとき
+        // (権限が足りない等) だけ tasklist へ落ちる — ここへ来るのは起動時と
+        // `zai status` だけで、リースのロック保持中ではない。
+        match win::image_name(e.pid).or_else(|| tasklist_image(e.pid)) {
+            Some(image) => osrule::image_matches(&image, &expect),
+            // 名前が取れない = 照合できないだけ。生きているのは確認済みなので残す。
+            None => true,
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -231,12 +414,13 @@ fn entry_alive(e: &InstanceEntry) -> bool {
 
 /// 照合に使う実行ファイル名。登録された exe の basename を第一候補、
 /// 無ければ自分自身の exe 名。どちらも取れなければ空 (= 照合をスキップ)。
-#[cfg(any(windows, target_os = "linux"))]
+// macOS からでも規則を検査できるよう、どの OS でもコンパイルする
+// (呼び出し元が居るのは Windows / Linux だけ)。
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 fn expected_image_name(e: &InstanceEntry) -> String {
-    let base = Path::new(&e.exe)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
+    // 区切り規則は cfg!(windows) を**引数として**渡す (Path::file_name だと
+    // ホスト OS の規則しか使えず、macOS から Windows の規則を検査できない)。
+    let base = osrule::basename_on(&e.exe, cfg!(windows));
     if !base.is_empty() {
         return base;
     }
@@ -301,28 +485,16 @@ fn boot_epoch() -> Option<u64> {
 }
 
 /// Windows: tasklist の CSV 出力から該当 PID のイメージ名を取り出す。
-/// 該当行が無い (「タスクはありません」等) なら None = 死んでいる。
+/// **QueryFullProcessImageNameW が取れなかったときの保険**でしかない
+/// (プロセス起動を払うので、生存確認の臨界路からは外してある)。
+/// 解析そのものは [`osrule::tasklist_image_of`] にあり、どの OS でもテストできる。
 #[cfg(windows)]
 fn tasklist_image(pid: u32) -> Option<String> {
     let out = crate::procx::hidden_command("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let want = pid.to_string();
-    for line in text.lines() {
-        let line = line.trim();
-        // CSV 行は `"image","pid","session",...` の形。INFO 行は " で始まらない。
-        if !line.starts_with('"') {
-            continue;
-        }
-        let mut cols = line.trim_start_matches('"').split("\",\"");
-        let image = cols.next()?.to_string();
-        if cols.next().map(|p| p.trim_matches('"') == want) == Some(true) {
-            return Some(image);
-        }
-    }
-    None
+    osrule::tasklist_image_of(&String::from_utf8_lossy(&out.stdout), pid)
 }
 
 // ───────────────────────── プロセス名 ─────────────────────────
@@ -548,6 +720,148 @@ mod tests {
     fn own_entry_passes_signature_check() {
         let e = InstanceEntry::current(&[PathBuf::from("/ws")]);
         assert!(entry_alive(&e), "自分自身のエントリは生存判定を通る");
+    }
+
+    // ── OS 依存の規則 (macOS / Linux のホストからでも固定する) ──
+    //
+    // `#[cfg(windows)]` の中に規則を埋めると開発機では 1 行も実行されない。
+    // keybinds::canonical_mods_on と同じく引数化してあるので、ここは
+    // **どの OS で走らせても同じ結果**になる。
+
+    #[test]
+    fn windows生存判定はwin32の戻り値だけで決まる() {
+        use osrule::{
+            Probe, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        for (probe, want, why) in [
+            (Probe::Waited(WAIT_TIMEOUT), true, "未シグナル = 実行中"),
+            (
+                Probe::Waited(WAIT_OBJECT_0),
+                false,
+                "シグナル済み = 終了している",
+            ),
+            // WAIT_FAILED。開けた以上ハンドルは実在するので生存側へ倒す。
+            (
+                Probe::Waited(0xFFFF_FFFF),
+                true,
+                "想定外の戻りは奪わない側へ",
+            ),
+            (
+                Probe::OpenFailed(ERROR_ACCESS_DENIED),
+                true,
+                "権限が無いだけ (unix の EPERM 相当) = 居る",
+            ),
+            (
+                Probe::OpenFailed(ERROR_INVALID_PARAMETER),
+                false,
+                "そんな PID は居ない",
+            ),
+            (Probe::OpenFailed(0), false, "理由不明の失敗は死亡扱い"),
+        ] {
+            assert_eq!(osrule::alive_from(probe), want, "{why}: {probe:?}");
+        }
+    }
+
+    #[test]
+    fn tasklistのcsv解析はロケールに依存しない() {
+        // 実際の `tasklist /FO CSV /NH` の出力 (CRLF・カンマ入りメモリ列)。
+        let csv = "\"zai.exe\",\"4242\",\"Console\",\"1\",\"62,912 K\"\r\n";
+        assert_eq!(
+            osrule::tasklist_image_of(csv, 4242).as_deref(),
+            Some("zai.exe")
+        );
+        assert_eq!(
+            osrule::tasklist_image_of(csv, 4243),
+            None,
+            "PID 違いは拾わない"
+        );
+
+        // 該当なしの 1 行。**文面はロケールで変わる**ので、どちらでも None。
+        for info in [
+            "INFO: No tasks are running which match the specified criteria.\r\n",
+            "情報: 指定の検索条件に一致するタスクは実行されていません。\r\n",
+            "",
+        ] {
+            assert_eq!(osrule::tasklist_image_of(info, 4242), None, "{info:?}");
+        }
+
+        // 複数行から正しい 1 行を選ぶ。
+        let many = "\"a.exe\",\"1\",\"Services\",\"0\",\"1 K\"\r\n\
+                    \"zai.exe\",\"22\",\"Console\",\"1\",\"2 K\"\r\n";
+        assert_eq!(
+            osrule::tasklist_image_of(many, 22).as_deref(),
+            Some("zai.exe")
+        );
+    }
+
+    #[test]
+    fn イメージ名の照合は大小非区別かつ空なら通す() {
+        assert!(osrule::image_matches("ZAI.EXE", "zai.exe"));
+        assert!(osrule::image_matches("zai.exe", "Zai.Exe"));
+        assert!(!osrule::image_matches("cmd.exe", "zai.exe"));
+        assert!(
+            osrule::image_matches("なんでも", ""),
+            "照合材料が無ければ通す"
+        );
+    }
+
+    #[test]
+    fn basenameはosの区切り規則を引数で受ける() {
+        // (入力, win_sep, 期待)
+        for (raw, win_sep, want) in [
+            (r"C:\Program Files\Zaivern\zai.exe", true, "zai.exe"),
+            // unix 規則では `\` は**ただの文字**。ここを Path::file_name に
+            // 任せると、macOS のテストが Windows の規則を検査できない。
+            (
+                r"C:\Program Files\Zaivern\zai.exe",
+                false,
+                r"C:\Program Files\Zaivern\zai.exe",
+            ),
+            ("/usr/local/bin/zai", false, "zai"),
+            ("/usr/local/bin/zai", true, "zai"),
+            // Windows は `/` も区切りとして受け付ける (混在も実在する)。
+            (r"C:/src\zai.exe", true, "zai.exe"),
+            (r"C:\src/zai.exe", true, "zai.exe"),
+            ("zai.exe", true, "zai.exe"),
+            ("", true, ""),
+            // 末尾が区切り = basename 無し。呼び出し側は空を「照合しない」と扱う。
+            ("/a/b/", false, ""),
+        ] {
+            assert_eq!(
+                osrule::basename_on(raw, win_sep),
+                want,
+                "raw={raw:?} win_sep={win_sep}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_image_nameは登録済みexeのbasenameを優先する() {
+        let mk = |exe: &str| InstanceEntry {
+            pid: 1,
+            start_signature: 0,
+            exe: exe.into(),
+            version: "1.0.0".into(),
+            workspace_roots: vec![],
+            launched_epoch: 1,
+        };
+        // ホスト OS の規則で畳まれる (Windows では `\` も区切り)。
+        assert_eq!(expected_image_name(&mk("/opt/zaivern/zai")), "zai");
+        assert_eq!(
+            expected_image_name(&mk(r"C:\Program Files\Zaivern\zai.exe")),
+            if cfg!(windows) {
+                "zai.exe".to_string()
+            } else {
+                r"C:\Program Files\Zaivern\zai.exe".to_string()
+            },
+            "win_sep={} — 規則そのものは basename_on のテーブルが固定する",
+            cfg!(windows)
+        );
+        // exe が空なら自分自身の名前へ落ちる (照合を諦めない)。
+        assert!(
+            !expected_image_name(&mk("")).is_empty(),
+            "空の exe は current_exe の名前で代替する"
+        );
     }
 
     // ── 表示 (純粋関数) のテーブルテスト ──

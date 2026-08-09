@@ -7,7 +7,12 @@
 #     (shared-key は自動のジョブ名ベースキーを置き換え、複数ジョブ間で安定 —
 #     両ジョブは同じ RUSTFLAGS / プロファイルでビルドするため成果物は完全に再利用可能)。
 #   - lint ジョブは ubuntu 1 台のみ。3 OS で回しても同じ診断しか出ないため無駄。
-#     6 本のテストジョブと並列に走るので wall-clock は増えない。
+#     7 本のテストジョブ (fast×3 + pty×3 + windows-lease×1) と並列に走るので
+#     wall-clock は増えない。
+#   - windows-lease は lease:: / instances:: を **素の cargo test** で回す
+#     Windows 専用の 1 本。nextest はテスト 1 件 = 1 プロセスなので、
+#     「1 プロセス内で複数スレッドが同じ台帳ロックを取り合う」経路が
+#     Windows で一度も走らない。そこだけを埋める (詳細はジョブのコメント)。
 #   - ハング時のコストは nextest の slow-timeout (terminate-after=1) で
 #     グローバル ~65 秒 / terminal:: ~50 秒に抑える (.config/nextest.toml)。
 #   - ジョブレベルの timeout-minutes は 10/12 分 — ランナーが固まっても
@@ -165,6 +170,52 @@ jobs:
 
       - name: Terminal (real PTY) tests
         run: cargo nextest run --locked --no-fail-fast --profile ci -E 'test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
+
+  # ファイル所有リース (lease::) と実行中インスタンスのレジストリ (instances::) を
+  # **Windows で実際に実行する**最小ジョブ。表示名: "windows (lease/instances)"。
+  #
+  # ■ なぜ fast (windows-latest) と別に要るのか — 2 つとも実際の穴である。
+  #   1. **nextest はテスト 1 件につき 1 プロセス**なので、「1 つのプロセスの
+  #      中で複数スレッドが同じ台帳ロックを取り合う」経路が Windows で
+  #      一度も走らない。lease は `create_new` の排他と `rename` の置換
+  #      (Windows は MoveFileEx) に乗っているので、ここは OS ごとに挙動が違う。
+  #      素の `cargo test` は 1 プロセス + スレッド並列なのでその経路を通る。
+  #   2. fast の `-E 'not test(...)'` は**ブロックリスト**である。誰かが
+  #      除外を広げた瞬間に lease:: が Windows から静かに消えても、
+  #      緑のままなので気付けない。**このジョブは消えれば必ず目に見える。**
+  #
+  # ■ 最小構成: matrix 無し・apt も choco も無し (Windows は依存パッケージ不要)。
+  #   キャッシュは fast / pty と同じ shared-key を読む — 同じ RUSTFLAGS /
+  #   プロファイルなので依存クレートのビルドはそのまま再利用され、
+  #   このジョブが増やすのは zai 本体のコンパイルとリンクだけ。
+  windows-lease:
+    # 判定は fast / pty / lint と必ず同じにする (揃えないと「PR でだけ
+    # 走らない」「push でだけ走らない」というムラが出る)。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !(github.event.pull_request.head.ref == 'main' ||
+        startsWith(github.event.pull_request.head.ref, 'night/'))
+    name: windows (lease/instances)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-windows-latest
+          cache-on-failure: true
+
+      # 2 ステップに分けるのは、落ちたときに**どちらのモジュールか**が
+      # ジョブの画面だけで分かるようにするため (再現コマンドがそのまま出る)。
+      - name: "lease:: (ファイル所有リース)"
+        run: "cargo test --bin zai --locked lease::"
+
+      - name: "instances:: (実行中インスタンスのレジストリ)"
+        run: "cargo test --bin zai --locked instances::"
 
   # 静的解析。ubuntu 1 台だけ (診断は OS 非依存。3 OS で回すのは丸損)。
   #

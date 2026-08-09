@@ -3202,6 +3202,12 @@ pub struct ZaivernApp {
     menu_state: recent::MenuState,
     /// 自動保存 (afterDelay) の直近実行時刻
     autosave_at: Option<Instant>,
+    /// ファイル所有ガードを張ってあるワークスペース。**起動直後もここが
+    /// `None` なので、最初のフレームで初めて張られる。**
+    lease_armed_for: Option<PathBuf>,
+    /// ファイル所有ガードが有効になったことを 1 度だけ知らせたか。
+    /// **毎フレーム知らせない**ため (UI 原則: 画面が突然変わらない)。
+    lease_armed_notified: bool,
     /// 行/列へ移動ダイアログ (VS Code: ⌃G)
     goto_open: bool,
     goto_input: String,
@@ -3530,6 +3536,10 @@ pub struct ZaivernApp {
     /// 外部変更チェックの直近実行時刻(約1秒スロットリング)
     ext_check_at: Option<Instant>,
     keys: Keybinds,
+    /// 機能レジストリ由来の打鍵表。**`BindAction` を 1 つも増やさずに**
+    /// `Cmd::Feature(id)` を直に指す (`keybinds.rs` が共有の壁にならない)。
+    /// 再割り当ては `keys` と同じ `[keybindings]` 表を共有する。
+    feature_keys: crate::keybinds::FeatureBinds,
     /// ペットの固定位置(None=右下うろうろ)
     pet_pos: Option<egui::Pos2>,
     /// ユーザー指定ペット画像のテクスチャ
@@ -4010,6 +4020,7 @@ impl ZaivernApp {
             rulers: normalize_rulers(&cfg.rulers),
             ext_check_at: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
+            feature_keys: crate::keybinds::FeatureBinds::from_overrides(&cfg.keybindings),
             theme,
             // 起動引数で指定されたフォルダ (`zai .` / `zai <dir>`) を作業フォルダの
             // 初期値にする。セッション復元でルートが増えても、ユーザーが
@@ -4097,6 +4108,8 @@ impl ZaivernApp {
             },
             menu_state: recent::load(),
             autosave_at: None,
+            lease_armed_for: None,
+            lease_armed_notified: false,
             goto_open: false,
             goto_input: String::new(),
             problems_open: false,
@@ -12598,6 +12611,8 @@ impl ZaivernApp {
                 // 監視役 LLM も選び直されているかもしれないので作り直す。
                 self.apply_super_agent();
                 self.keys = Keybinds::from_overrides(&self.cfg.keybindings);
+                self.feature_keys =
+                    crate::keybinds::FeatureBinds::from_overrides(&self.cfg.keybindings);
                 // config.toml / state.toml の ui_zoom を画面へ戻す
                 // (読み直したのに倍率だけ前のまま、を作らない)
                 apply_ui_zoom(ctx, self.cfg.ui_zoom);
@@ -13666,6 +13681,13 @@ impl ZaivernApp {
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
         {
             cmds.push(Cmd::ToggleFullScreen);
+        }
+
+        // 機能レジストリの打鍵は**組み込みを全部消費し終えてから**見る。
+        // 同じ打鍵が両方に割り当たったときは組み込みを勝たせる (既定同士の
+        // 食い合いは `keybinds` の番人テストが統合前に落とす)。
+        if let Some(id) = crate::keybinds::feature_hit(ctx, &self.feature_keys, &mut chord) {
+            cmds.push(Cmd::Feature(id));
         }
 
         // 消費が終わったので chord の待機状態を self へ戻す (フレームを跨ぐ持ち物)。
@@ -20100,6 +20122,9 @@ impl ZaivernApp {
     /// (bool を 2 つ持つと 2 つの経路が同時に描かれる事故が起きるため)。
     fn editor_area(&mut self, ui: &mut egui::Ui) {
         self.sync_panes();
+        // 所有が取れていないファイルを編集しているなら、**保存でつまずく前に**
+        // 出す。分割の有無より前に描くので、どちらの経路でも必ず見える。
+        self.lease_banner_ui(ui);
         if self.panes.is_split() {
             self.editor_split_ui(ui);
             return;
@@ -22348,6 +22373,9 @@ impl ZaivernApp {
         let theme_text = self.theme.text;
         let theme_dim = self.theme.text_dim;
         let syntect_theme = self.theme.syntect_theme.clone();
+        // ジャンプモードのグルー。**`self` が可変借用される前に**必要な値を写す。
+        let jump_tab_w = self.cfg.tab_size;
+        let mut jump_to: Option<crate::jump::Pos> = None;
         // 端末と同じ理由で行高を物理ピクセルの整数へ揃える (theme::snap_len)。
         // 行高が小数だと N 行目の y が丸められる位置が行ごとに変わり、
         // ガター番号・本文・スティッキーヘッダの縦位置が 1px ずつずれる。
@@ -23600,6 +23628,49 @@ impl ZaivernApp {
                         }
                     }
                 }
+
+                // ── ジャンプモード (2 打鍵で画面上の任意の語へ飛ぶ) ────────
+                // **待機中は 1 行も集めない** (`wants_view` が false)。
+                // 本文は `desired_width(INFINITY)` で折り返さないので、
+                // 視覚行と論理行が 1 対 1 に対応する = 行の切り出しが単純。
+                if crate::jump::wants_view() {
+                    let origin = output.galley_pos;
+                    let clip = ui.clip_rect();
+                    let src = egui::TextBuffer::as_str(&target);
+                    let first = (((clip.top() - origin.y) / row_h).floor()).max(0.0) as usize;
+                    let take = (clip.height() / row_h).ceil() as usize + 2;
+                    let rows: Vec<crate::jump::Row> = src
+                        .lines()
+                        .enumerate()
+                        .skip(first)
+                        .take(take)
+                        .map(|(line, text)| crate::jump::Row {
+                            line,
+                            text: text.to_string(),
+                        })
+                        .collect();
+                    // 折り返しが無いので rcursor の (row, column) が
+                    // そのまま (論理行, 行内の文字位置) になる。
+                    let caret = output
+                        .cursor_range
+                        .map(|cr| crate::jump::Pos {
+                            line: cr.primary.rcursor.row,
+                            ch: cr.primary.rcursor.column,
+                        })
+                        .unwrap_or_default();
+                    jump_to = crate::jump::exchange(
+                        ui.ctx(),
+                        crate::jump::View {
+                            rows,
+                            caret,
+                            tab_width: jump_tab_w,
+                            // ラベルは可視行の先頭を基準に置く。
+                            origin: egui::pos2(origin.x, origin.y + first as f32 * row_h),
+                            cell: egui::vec2(char_w, row_h),
+                            clip,
+                        },
+                    );
+                }
             });
             // 最終行より先までスクロールできる余白 (VS Code の scrollBeyondLastLine)
             if past_end > 0.0 {
@@ -24220,6 +24291,28 @@ impl ZaivernApp {
                 self.diag_hover = None;
                 self.lsp_hover_pos = None;
                 self.lsp_hover.dismiss();
+            }
+        }
+
+        // ジャンプが確定していたらキャレットを運ぶ。描画中はバッファを
+        // 可変借用しているので、ここまで持ち越して当てる。
+        if let Some(p) = jump_to {
+            let text = &self.editor.buffers[active].text;
+            // (行, 行内の文字位置) → 本文全体の文字位置。
+            let head: usize = text
+                .split_inclusive('\n')
+                .take(p.line)
+                .map(|l| l.chars().count())
+                .sum();
+            let at = (head + p.ch).min(text.chars().count());
+            self.pending_select = Some((at, at));
+            // 画面外へ飛んだときだけ追う (見えている語へのジャンプで
+            // 画面が動くと、UI 原則「画面が突然変わらない」に反する)。
+            let top = self.last_scroll_y / self.last_row_h.max(1.0);
+            let rows = (self.last_view_h / self.last_row_h.max(1.0)).max(1.0);
+            if (p.line as f32) < top || (p.line as f32) > top + rows - 1.0 {
+                self.pending_scroll =
+                    Some(((p.line as f32) * self.last_row_h - self.last_view_h * 0.4).max(0.0));
             }
         }
 
@@ -26255,6 +26348,11 @@ impl ZaivernApp {
     /// シンボリックリンクはリンク自体を消す (is_dir はリンク先を辿るため、
     /// ディレクトリへのリンクを remove_dir_all に渡すと必ず失敗する)。
     fn delete_permanently(&mut self, path: &Path) -> Result<(), String> {
+        // **消すのは戻せない。** 他の担当が編集中のものは、フォルダごとでも
+        // 消させない (配下まで見る)。
+        if let crate::lease::Verdict::Deny(msg) = crate::lease::check_tree(path) {
+            return Err(msg);
+        }
         let md = std::fs::symlink_metadata(path).ok();
         let is_link = md.as_ref().is_some_and(|m| m.file_type().is_symlink());
         let is_dir = md.as_ref().is_some_and(|m| m.is_dir());
@@ -26611,6 +26709,23 @@ impl ZaivernApp {
     /// 1 件を実際に動かす。**`drain_transfer` からしか呼ばない**
     /// (= 衝突があるものは確認を通ったものだけがここへ来る)。
     fn run_transfer_item(&mut self, item: &TransferItem) {
+        // 他の担当が持っているものは動かさない / 上書きしない。
+        // **移動は元も消える**ので元と先の両方を見る。フォルダなら配下まで
+        // (`check_tree`) — `src/` の移動は `src/app.rs` の持ち主にとって
+        // 上書きより強い破壊なので、そこを素通りさせない。
+        let mut guarded: Vec<&Path> = vec![item.dest.as_path()];
+        if item.kind == file_tree::Transfer::Move {
+            guarded.push(item.src.as_path());
+        }
+        for p in guarded {
+            if let crate::lease::Verdict::Deny(msg) = crate::lease::check_tree(p) {
+                if let Some(q) = self.pending_transfer.as_mut() {
+                    q.failed += 1;
+                }
+                self.toast_warn(msg);
+                return;
+            }
+        }
         if item.clash.is_some() {
             if let Err(e) = self.replace_dest(&item.dest) {
                 if let Some(q) = self.pending_transfer.as_mut() {
@@ -26656,6 +26771,10 @@ impl ZaivernApp {
     /// 置き換えのために移動先を退ける。**`run_transfer_item` からのみ呼ぶ**
     /// (= 同名衝突をユーザーが「置き換える」で通した後だけ)。
     fn replace_dest(&mut self, dest: &Path) -> Result<(), String> {
+        // 置き換えは「消してから書く」= 消される側の持ち主に断りが要る。
+        if let crate::lease::Verdict::Deny(msg) = crate::lease::check_tree(dest) {
+            return Err(msg);
+        }
         let Ok(md) = std::fs::symlink_metadata(dest) else {
             return Ok(()); // 既に無い
         };
@@ -29650,6 +29769,9 @@ impl eframe::App for ZaivernApp {
         // SSH トンネルは必ず畳む。置き去りにすると踏み台の公開ポートを掴んだ
         // ssh が残り、次に繋ぐとき「ポート使用中」で失敗する。
         self.tunnel.disconnect();
+        // 握っているファイル所有を返す。返し損ねても TTL で回収されるが、
+        // 返せば次の担当がすぐ入れる (待たせる時間がそのまま損害になる)。
+        crate::lease::release_all();
         for s in std::mem::take(&mut self.agents.sessions) {
             crate::terminal::abandon(s);
         }
@@ -29680,6 +29802,8 @@ impl ZaivernApp {
         self.load_prefs_once(ctx);
         // バックグラウンドで作っている索引の完了を取り込む (UI は止めない)
         self.poll_index(ctx);
+        // 編集中のファイルの所有を台帳と揃える (無効なら即 return する)。
+        self.sync_lease_ownership();
 
         // 画面全体のズームは毎フレームここで egui へ揃える。値が変わって
         // いなければ何も起きない (再描画も要求されない)。
@@ -31706,6 +31830,118 @@ impl ZaivernApp {
     fn touch_recent_file(&mut self, p: &Path) {
         self.menu_state.touch_file(p);
         recent::save(&self.menu_state);
+    }
+
+    /// 「このファイルは他の担当が持っている」帯。**持てているときは 1 ピクセルも
+    /// 描かない** (UI 原則: 空白は作らない / 常に 0 を表示するバッジを作らない)。
+    ///
+    /// 保存が止まってから理由を知るのでは遅い — 編集を始めた時点で出す。
+    fn lease_banner_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self
+            .editor
+            .active
+            .and_then(|i| self.editor.buffers.get(i))
+            .and_then(|b| b.path.clone())
+        else {
+            return;
+        };
+        let crate::lease::Own::Taken { owner, .. } = crate::lease::own_of(&path) else {
+            return;
+        };
+        let warn = self.theme.warn;
+        let avail = ui.available_width();
+        egui::Frame::none()
+            .fill(warn.gamma_multiply(0.18))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .show(ui, |ui| {
+                ui.set_width(avail - 16.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("🔒").color(warn));
+                    // 狭い幅でも見切れないよう、名前は縮めてホバーで全文を出す。
+                    let text = trf(
+                        "{owner} が編集中です — このまま保存すると止まります",
+                        &[("owner", owner.clone())],
+                    );
+                    let room = ((avail - 140.0) / 7.0).max(8.0) as usize;
+                    ui.label(egui::RichText::new(crate::lease::ellipsize(&text, room)).color(warn))
+                        .on_hover_text(&text);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(tr("所有一覧")).clicked() {
+                            crate::lease::open_panel();
+                        }
+                    });
+                });
+            });
+    }
+
+    /// 編集中のファイル所有を台帳と揃える (毎フレーム)。
+    ///
+    /// **「編集を始めた / 終えた」を対で呼ぶ形にしない**のが要点。対の片側を
+    /// 呼び忘れた経路が 1 つでもあると所有が漏れ続ける (タブを閉じた・元に
+    /// 戻した・ワークスペースを切り替えた…)。**いま汚れているバッファの集合**を
+    /// 丸ごと渡し、消えたぶんの解放は [`crate::lease::sync_edits`] に任せる。
+    ///
+    /// ガードが無効なスコープでは [`crate::lease::armed`] が `false` を返して
+    /// 即座に抜ける = 単独で使う人のアイドルコストはゼロ (設計原則 3)。
+    fn sync_lease_ownership(&mut self) {
+        // **ここが唯一の張り替え地点。** かつては `apply_roots` に置いていたが、
+        // あれは「フォルダを開き直した」ときにしか通らないので、**通常起動では
+        // 一度も有効にならなかった** (他リポジトリでの実測で発覚: 3/3 で台帳が
+        // 空のままだった)。毎フレームの比較 1 回に置き換えて、起動・切り替え・
+        // セッション復元のどの経路でも必ず張られるようにする。
+        let root = self.primary_root().to_path_buf();
+        if self.lease_armed_for.as_deref() != Some(root.as_path()) {
+            // 前のワークスペースの所有は返してから移る (別リポジトリの台帳へ
+            // 解放を撃たないため、順序が大事)。
+            crate::lease::release_all();
+            crate::lease::arm(
+                &root,
+                self.cfg.feature_bool("lease.auto_arm"),
+                self.cfg.feature_i64("lease.ttl_minutes"),
+            );
+            self.lease_armed_for = Some(root);
+            self.lease_armed_notified = false;
+        }
+        if !crate::lease::armed() {
+            return;
+        }
+        let editing: Vec<PathBuf> = self
+            .editor
+            .buffers
+            .iter()
+            .filter(|b| !b.kind.read_only() && b.dirty())
+            .filter_map(|b| b.path.clone())
+            .collect();
+        crate::lease::sync_edits(&editing);
+        // 段が決まったら 1 度だけ知らせる。**「強制」と「勧告」を区別して出す** —
+        // 効いていると思わせて実は警告だけ、が最悪なので (lease.rs の設計方針)。
+        if !self.lease_armed_notified {
+            let t = crate::lease::tier_now();
+            if t != crate::lease::Tier::Off {
+                self.lease_armed_notified = true;
+                let msg = trf(
+                    "🔐 ファイル所有ガード: {tier} — {detail}\n　ブロックできるエージェント: {who}",
+                    &[
+                        ("tier", tr(t.label())),
+                        ("detail", tr(t.detail())),
+                        ("who", crate::lease::gated_agents().join(", ")),
+                    ],
+                );
+                if t == crate::lease::Tier::Enforced {
+                    self.toast(msg, true);
+                } else {
+                    self.toast_warn(msg);
+                }
+            }
+        }
+        // 確保の答えが返ったものだけ知らせる。**取れた**ことは黙っている
+        // (毎回出すと通知だけで画面が埋まる)。取れなかったときは、編集を
+        // 続ける前に必ず気付いてほしいので警告で出す。
+        for n in crate::lease::pump() {
+            if let crate::lease::Own::Taken { reason, .. } = n.own {
+                self.toast_warn(reason);
+            }
+        }
     }
 
     /// 開いている全タブを保存 (VS Code: すべて保存)。無題タブは対象外。
@@ -33759,7 +33995,10 @@ impl ZaivernApp {
         self.settings_ui.query = query;
         self.settings_ui.only_modified = only_modified;
         if reset_all {
-            for d in config::setting_defs() {
+            // **機能レジストリ由来の設定も一括リセットの対象にする。**
+            // `setting_defs()` だけを回すと、`[features]` 側の設定が
+            // 「全部を既定へ戻す」を押しても取り残される。
+            for d in config::all_setting_defs() {
                 if let Some(def) = config::setting_default(d.key) {
                     changed.push((d.key, def));
                 }
@@ -34190,7 +34429,9 @@ impl ZaivernApp {
     /// キーバインドの変更を config.toml の `[keybindings]` 区画へ書き戻す。
     /// **既定と同じ行は書かない** ので、既定を変えたときに古い値へ固定されない。
     fn persist_keybindings(&mut self) {
-        let ov = self.keys.overrides();
+        // **機能側の再割り当ても一緒に保存する。** `self.keys.overrides()` だけを
+        // 書くと、保存のたびに機能の打鍵設定が消える。
+        let ov = crate::keybinds::merged_overrides(&self.keys, &self.feature_keys);
         self.cfg.keybindings = ov.clone();
         if let Err(e) = config::save_keybindings(&ov) {
             self.toast(e, false);

@@ -1947,6 +1947,18 @@ impl Buffer {
     /// バッファの `encoding` もそのとき UTF-8 へ更新するので、
     /// 次の保存からは変換を試みない。
     pub fn write_to(&mut self, path: &Path) -> std::io::Result<bool> {
+        // ── 所有していないファイルへは書かない (並列エージェントの衝突を
+        //    「起こさない」side の対策)。**書き込み口をここ 1 つに絞ってあるのが
+        //    肝**で、呼び出し側が 5 箇所あっても門は 1 つしか無い。将来 6 箇所目が
+        //    増えても自動で守られる — 門を呼ぶのを忘れる経路が作れない。
+        //    機能が無効なスコープでは `crate::lease::check_write` が即 `Allow`
+        //    を返すので、単独で使う人の払うコストはゼロ (設計原則 3)。
+        if let crate::lease::Verdict::Deny(msg) = crate::lease::check_write(path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                msg,
+            ));
+        }
         let (bytes, used) = crate::textenc::encode_bytes(&self.text, self.encoding);
         std::fs::write(path, bytes)?;
         let promoted = used != self.encoding;

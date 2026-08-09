@@ -18,6 +18,25 @@ use crate::terminal::{Session, SpawnSpec};
 #[path = "approvals.rs"]
 pub mod approvals;
 
+// シェルのコマンド行から書き込み先を抜く純関数。`Bash` ツールは
+// パスではなくコマンド文字列しか持たないので、これが無いと
+// `printf X > shared.rs` が**リース判定の入口にすら入らない**。
+// approvals と同じく `#[path]` の子として取り込む (main.rs を触らない)。
+// 外からは `crate::agents::cmdwrite::…` で参照する。
+
+/// シェルのコマンド行 → 書き込み先パス (詳細はモジュール doc)。
+#[path = "cmdwrite.rs"]
+pub mod cmdwrite;
+
+// codex の `apply_patch` は**パス欄を持たない**。対象は本文の
+// `*** Update File: <path>` に書かれているので、解かないと
+// codex のファイル編集が丸ごとリース判定を素通りする。
+// cmdwrite と同じく `#[path]` の子として取り込む (main.rs を触らない)。
+
+/// `apply_patch` の本文 → 書き込み先パス (詳細はモジュール doc)。
+#[path = "patchpath.rs"]
+pub mod patchpath;
+
 pub enum SessionEvent {
     /// (title) — セッションがユーザーの承認待ちになった
     NeedsApproval(String),
@@ -2169,7 +2188,9 @@ impl AgentManager {
 //  「画面より確かな判定」として嘘を配ることになる (最下段より有害)。
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::supervisor::hooks::HookTarget;
+use crate::supervisor::hooks::{
+    Activation, ActivationKind, DenyShape, HookTarget, DENY_EVENT, DENY_REASON,
+};
 use crate::supervisor::protocol::{EventRule, ProtoState, StreamDialect};
 
 /// Claude Code のツール名 → 状態。名前は実機 `stream-json` の
@@ -2179,6 +2200,8 @@ use crate::supervisor::protocol::{EventRule, ProtoState, StreamDialect};
 const CLAUDE_TOOLS: &[(&str, ProtoState)] = &[
     ("Edit", ProtoState::Editing),
     ("Write", ProtoState::Editing),
+    // 複数箇所を 1 回で書き換える版。**表に無いと素通りする**ので必ず要る。
+    ("MultiEdit", ProtoState::Editing),
     ("NotebookEdit", ProtoState::Editing),
 ];
 
@@ -2336,25 +2359,175 @@ pub fn stream_dialect_for_command(command: &str) -> Option<&'static StreamDialec
 /// 表に入れているのは、その中で**名前から意味が一意に決まるもの**だけ。
 /// `Notification` / `Elicitation` などは「何を待っているか」がペイロード次第
 /// なので、当てずっぽうで承認待ちに落とさない。
-pub static HOOK_TARGETS: &[HookTarget] = &[HookTarget {
-    bin: "claude",
-    settings_rel: ".claude/settings.json",
-    events: &[
-        ("SessionStart", ProtoState::Starting, false),
-        ("UserPromptSubmit", ProtoState::Thinking, false),
-        // ツールを使う直前 = そのツール名で状態を細分できる唯一の点。
-        ("PreToolUse", ProtoState::Running, true),
-        ("PostToolUse", ProtoState::Thinking, false),
-        ("PermissionRequest", ProtoState::Approval, false),
-        ("Stop", ProtoState::Idle, false),
-        ("SessionEnd", ProtoState::Done, false),
-    ],
-    tools: CLAUDE_TOOLS,
-    // PreToolUse の tool_input に載るパスのキー。公式ドキュメント
-    // (code.claude.com/docs/en/hooks) の Edit/Write は `file_path`、
-    // NotebookEdit は `notebook_path`。並びは優先順。
-    write_path_keys: &["file_path", "notebook_path"],
-    verified: "claude 2.1.226 — stream-json に hook_started/hook_response を観測 + 実在の ~/.claude/settings.json の hooks スキーマ + 公式 hooks リファレンスの PreToolUse 入出力スキーマ",
+pub static HOOK_TARGETS: &[HookTarget] = &[
+    HookTarget {
+        bin: "claude",
+        settings_rel: ".claude/settings.json",
+        events: &[
+            ("SessionStart", ProtoState::Starting, false),
+            ("UserPromptSubmit", ProtoState::Thinking, false),
+            // ツールを使う直前 = そのツール名で状態を細分できる唯一の点。
+            ("PreToolUse", ProtoState::Running, true),
+            ("PostToolUse", ProtoState::Thinking, false),
+            ("PermissionRequest", ProtoState::Approval, false),
+            ("Stop", ProtoState::Idle, false),
+            ("SessionEnd", ProtoState::Done, false),
+        ],
+        gate_event: "PreToolUse",
+        tools: CLAUDE_TOOLS,
+        // PreToolUse の tool_input に載るパスのキー。公式ドキュメント
+        // (code.claude.com/docs/en/hooks) の Edit/Write は `file_path`、
+        // NotebookEdit は `notebook_path`。並びは優先順。
+        write_path_keys: &["file_path", "notebook_path"],
+        command_tools: CLAUDE_COMMAND_TOOLS,
+        // claude にパッチ塊を渡すツールは無い (Edit/Write はパス欄を持つ)。
+        patch_tools: &[],
+        // 設定ファイルへ書けばそのまま発火する (実機で hook_started を観測)。
+        activation: &[],
+        deny: DENY_HOOK_SPECIFIC_OUTPUT,
+        verified: "claude 2.1.226 — stream-json に hook_started/hook_response を観測 + 実在の ~/.claude/settings.json の hooks スキーマ + 公式 hooks リファレンスの PreToolUse 入出力スキーマ",
+    },
+    HookTarget {
+        bin: "codex",
+        // 実在の `~/.codex/hooks.json` と同じ形をプロジェクト直下へ置く。
+        settings_rel: ".codex/hooks.json",
+        events: &[
+            ("SessionStart", ProtoState::Starting, false),
+            ("UserPromptSubmit", ProtoState::Thinking, false),
+            ("PreToolUse", ProtoState::Running, true),
+            ("PostToolUse", ProtoState::Thinking, false),
+            ("PermissionRequest", ProtoState::Approval, false),
+            ("Stop", ProtoState::Idle, false),
+            ("SessionEnd", ProtoState::Done, false),
+        ],
+        gate_event: "PreToolUse",
+        tools: CODEX_TOOLS,
+        // apply_patch はパス欄を持たない。Edit/Write 名で来た場合に備えて
+        // claude と同じキーも見る (取りこぼすより過検出側へ倒す)。
+        write_path_keys: &["file_path", "notebook_path"],
+        command_tools: CODEX_COMMAND_TOOLS,
+        patch_tools: CODEX_PATCH_TOOLS,
+        activation: CODEX_ACTIVATION,
+        // 実行ファイルに `hookSpecificOutput` / `permissionDecision` /
+        // `permissionDecisionReason` が埋まっている = claude と同一スキーマ。
+        deny: DENY_HOOK_SPECIFIC_OUTPUT,
+        verified: "codex-cli 0.147.0 — 実在の ~/.codex/hooks.json と同じ形で発火を観測 (`codex exec` 実行中に PostToolUse / Stop のフックが走った) + `codex features list` に `hooks stable true` + 実行ファイルの strings に hookSpecificOutput/permissionDecision/permissionDecisionReason と *** Update File: 系マーカー",
+    },
+    HookTarget {
+        bin: "gemini",
+        // gemini はフック専用ファイルを持たず、通常の設定ファイルに同居する。
+        settings_rel: ".gemini/settings.json",
+        // **イベント名が claude 系と全く違う** (Pre/Post ではなく Before/After)。
+        events: &[
+            ("SessionStart", ProtoState::Starting, false),
+            ("BeforeTool", ProtoState::Running, true),
+            ("AfterTool", ProtoState::Thinking, false),
+            ("SessionEnd", ProtoState::Done, false),
+        ],
+        gate_event: "BeforeTool",
+        tools: GEMINI_TOOLS,
+        write_path_keys: &["file_path"],
+        command_tools: GEMINI_COMMAND_TOOLS,
+        patch_tools: &[],
+        activation: GEMINI_ACTIVATION,
+        deny: DENY_TOP_LEVEL_DECISION,
+        verified: "gemini-cli 0.51.0 — 公式 docs/hooks/reference.md の settings.json スキーマ (hooks.<Event>[].hooks[] は claude と同形) と decision/reason 出力 + 実行ファイルの bundle に GEMINI_CLI_HOME / GEMINI_DIR / trustedFolders.json / TRUST_FOLDER・TRUST_PARENT・DO_NOT_TRUST + 実機で「信頼されていないフォルダではプロジェクト設定を読まない」旨のエラーを観測。**フック発火そのものはアカウント階層 (IneligibleTierError) で未観測**",
+    },
+];
+
+// ── 拒否の返し方 (ひな形はここにしか無い) ──────────────────────────
+
+/// claude / codex の `PreToolUse` 出力スキーマ。
+///
+/// 終了コードは **0**。「JSON output is only processed on exit 0」で、
+/// exit 2 にすると stdout は無視され stderr がエラーとして流れる。
+/// 正規の permission decision を使う (エラーではなく判断なので)。
+const DENY_HOOK_SPECIFIC_OUTPUT: DenyShape = DenyShape {
+    template: r#"{"hookSpecificOutput":{"hookEventName":"{event}","permissionDecision":"deny","permissionDecisionReason":"{reason}"}}"#,
+    exit: 0,
+};
+
+/// gemini の `BeforeTool` 出力スキーマ (**top-level** に置く)。
+///
+/// claude 形の入れ子で返しても gemini は読まないので、**素通りする**。
+const DENY_TOP_LEVEL_DECISION: DenyShape = DenyShape {
+    template: r#"{"decision":"deny","reason":"{reason}"}"#,
+    exit: 0,
+};
+
+// ── codex ────────────────────────────────────────────────────────
+
+/// codex のツール名 → 状態。
+///
+/// 公式 hooks ドキュメントの matcher 例が `apply_patch` / `Edit` / `Write`。
+/// **`apply_patch` を編集扱いにしておかないと `lease::gate` の入口で降りる**
+/// (パス欄もコマンド欄も無いツールとして捨てられる)。
+const CODEX_TOOLS: &[(&str, ProtoState)] = &[
+    ("apply_patch", ProtoState::Editing),
+    ("Edit", ProtoState::Editing),
+    ("Write", ProtoState::Editing),
+];
+
+/// codex のコマンド文字列を持つツール。シェルは claude と同じ `Bash` 名で来る。
+const CODEX_COMMAND_TOOLS: &[(&str, &str)] = &[("Bash", "command")];
+
+/// codex のパッチ本文を持つツール。
+///
+/// `apply_patch` の本文は `tool_input.command` に載る。`Bash` も併記するのは、
+/// パッチが `apply_patch <<'EOF' … EOF` の**シェル経由**で来ることがあるため
+/// (どちらの形で来ても拾えるようにしておく — 取りこぼすと黙って上書きされる)。
+const CODEX_PATCH_TOOLS: &[(&str, &str)] = &[("apply_patch", "command"), ("Bash", "command")];
+
+/// codex は**設定ファイルへ書いただけでは黙って飛ばす**。
+///
+/// 実機で確認した挙動 (codex-cli 0.147.0):
+/// - `~/.codex/config.toml` に `[features] hooks = true` が要る (既定は有効)
+/// - フック 1 件ごとに `[hooks.state."<hooks.json>:<snake イベント>:<群>:<番号>"]`
+///   の `trusted_hash` が要る。**無いと発火せず、警告も出ない**
+///   (プロジェクト直下に置いたフックが 1 度も走らないことを実測した)
+/// - 同じ節に `enabled = false` があると止まる
+///   (実際にこの環境の `pre_tool_use` がそうなっていて、PreToolUse だけ
+///   発火せず PostToolUse と Stop だけが走った)
+const CODEX_ACTIVATION: &[Activation] = &[Activation {
+    kind: ActivationKind::HookTrustToml {
+        feature: ("features", "hooks"),
+        state_table: "hooks.state",
+        trusted_key: "trusted_hash",
+        enabled_key: "enabled",
+    },
+    home_env: "CODEX_HOME",
+    home_rel: ".codex",
+    file_rel: "config.toml",
+    missing: "codex がこのフックをまだ承認していないため、書き込みは止まりません",
+    how: "codex を起動して /hooks を実行し、Zaivern のフックを信頼 (trust) してください",
+}];
+
+// ── gemini ───────────────────────────────────────────────────────
+
+/// gemini のツール名 → 状態 (公式 docs/tools の名前と引数)。
+const GEMINI_TOOLS: &[(&str, ProtoState)] = &[
+    ("write_file", ProtoState::Editing),
+    ("replace", ProtoState::Editing),
+];
+
+/// gemini のコマンド文字列を持つツール。
+const GEMINI_COMMAND_TOOLS: &[(&str, &str)] = &[("run_shell_command", "command")];
+
+/// gemini は**信頼していないフォルダではプロジェクトの設定ファイルを読まない**。
+///
+/// 読まない = `.gemini/settings.json` に書いたフックも読まれない。
+/// 実機で観測したエラー:
+/// 「Gemini CLI is not running in a trusted directory.」
+const GEMINI_ACTIVATION: &[Activation] = &[Activation {
+    kind: ActivationKind::TrustedFolderJson {
+        trusted: &["TRUST_FOLDER"],
+        trusted_parent: "TRUST_PARENT",
+    },
+    home_env: "GEMINI_CLI_HOME",
+    home_rel: ".gemini",
+    file_rel: "trustedFolders.json",
+    missing: "gemini がこのフォルダを信頼していないため、プロジェクトの設定ごと読まれません",
+    how: "gemini を起動してこのフォルダを信頼するか、環境変数 GEMINI_CLI_TRUST_WORKSPACE=true で起動してください",
 }];
 
 /// フック設定の対象。持たないエージェントでは `None`。
@@ -2381,6 +2554,169 @@ pub fn hook_tool_state(bin: &str, tool: &str) -> Option<ProtoState> {
         .iter()
         .find(|(n, _)| *n == tool)
         .map(|(_, s)| *s)
+}
+
+/// **パスを持たず、コマンド文字列を持つ**ツール → その文字列が載る
+/// `tool_input` のキー。
+///
+/// `Bash` の `tool_input` は `{"command": "...", "description": "..."}` で、
+/// [`HookTarget::write_path_keys`] のどのキーにも当たらない。**ここが空だった
+/// せいで、リースを持っていないエージェントが `printf B_WON > shared.rs` で
+/// 他人が確保中のファイルを上書きできた** (敵対的検証で実証)。
+/// エージェントは `sed -i` / `tee` / `>>` で日常的に書くので、ここが最大の穴。
+///
+/// キー名はベンダー固有なので、他のリテラルと同じく**カタログにだけ**置く
+/// ([`HookTarget::command_tools`])。
+const CLAUDE_COMMAND_TOOLS: &[(&str, &str)] = &[("Bash", "command")];
+
+/// ツール名 → コマンド文字列が載る `tool_input` のキー。無ければ `None`。
+pub fn hook_command_key(bin: &str, tool: &str) -> Option<&'static str> {
+    if tool.is_empty() {
+        return None;
+    }
+    hook_target(bin)?
+        .command_tools
+        .iter()
+        .find(|(n, _)| *n == tool)
+        .map(|(_, k)| *k)
+}
+
+/// ツール名 → パッチ本文が載る `tool_input` のキー。無ければ `None`。
+pub fn hook_patch_key(bin: &str, tool: &str) -> Option<&'static str> {
+    if tool.is_empty() {
+        return None;
+    }
+    hook_target(bin)?
+        .patch_tools
+        .iter()
+        .find(|(n, _)| *n == tool)
+        .map(|(_, k)| *k)
+}
+
+/// **このエージェントで、リースの強制に使うイベント名**。
+///
+/// `PreToolUse` (claude / codex) と `BeforeTool` (gemini) のように
+/// ベンダーで名前が違う。決め打ちにすると片方が構造的に効かなくなる。
+///
+/// **未接続**: 呼ぶのは `lease::gate` の 1 か所だけで、そのファイルは
+/// 統合担当が持っている。繋ぐまで gemini のフックは設置できても発火しない。
+#[allow(dead_code, reason = "lease::gate から繋ぐ (統合担当の担当範囲)")]
+pub fn hook_gate_event(bin: &str) -> Option<&'static str> {
+    Some(hook_target(bin)?.gate_event)
+}
+
+/// 拒否をこのベンダーのスキーマで組み立てる → `(stdout, 終了コード)`。
+///
+/// カタログのひな形 ([`DenyShape`]) の中で、**文字列値がちょうど
+/// `{reason}` / `{event}` と等しい箇所だけ**を差し替える。
+/// `format!` による文字列連結にしないのは、理由に `"` や改行が入ると
+/// 壊れた JSON になり、**ベンダーが拒否を黙って無視する**ため
+/// (= 止めたつもりで止まらない、いちばん危ない壊れ方)。
+///
+/// **未接続**: 呼ぶのは `lease::deny_answer` の 1 か所だけで、そのファイルは
+/// 統合担当が持っている。繋ぐまで gemini へは claude 形の JSON が返り、
+/// gemini はそれを読まないので**拒否が素通りする**。
+#[allow(dead_code, reason = "lease::deny_answer から繋ぐ (統合担当の担当範囲)")]
+pub fn deny_payload(bin: &str, reason: &str) -> Option<(String, i32)> {
+    let t = hook_target(bin)?;
+    let mut v: serde_json::Value = serde_json::from_str(t.deny.template).ok()?;
+    fill_placeholders(&mut v, reason, t.gate_event);
+    Some((v.to_string(), t.deny.exit))
+}
+
+/// ひな形の穴を埋める (再帰。値の**まるごと一致**だけを差し替える)。
+fn fill_placeholders(v: &mut serde_json::Value, reason: &str, event: &str) {
+    match v {
+        serde_json::Value::String(s) => {
+            if s == DENY_REASON {
+                *s = reason.to_string();
+            } else if s == DENY_EVENT {
+                *s = event.to_string();
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for x in a {
+                fill_placeholders(x, reason, event);
+            }
+        }
+        serde_json::Value::Object(m) => {
+            for (_, x) in m.iter_mut() {
+                fill_placeholders(x, reason, event);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// PreToolUse の payload から取り出した**このツールが書く対象**。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HookWrite {
+    /// 書き込み先 (相対または絶対。呼び出し側が作業ツリー基準で解決する)。
+    pub paths: Vec<String>,
+    /// **書き込みらしいのに対象が特定できなかった**か。
+    ///
+    /// ## これで拒否しないと決めた理由
+    /// `> $OUT` / `eval` / `xargs` / ヒアドキュメントは**構造的に**追えない。
+    /// ここで止めると `cargo test` や `ls` に混ざった無害な形まで落ちはじめ、
+    /// ユーザーはリース機能ごと切る。**切られた機能の保証はゼロ**なので、
+    /// 既定は「通す + 監査ログに残す」。止めたい人は明示のリース設定で止める。
+    pub opaque: bool,
+}
+
+/// PreToolUse の payload から、そのツールが**書き込む対象**を全部出す。
+///
+/// 2 系統ある:
+/// - パスを持つツール (`Edit` / `Write` / `MultiEdit` / `NotebookEdit`) …
+///   [`HookTarget::write_path_keys`] から引く
+/// - コマンド文字列を持つツール (`Bash`) … [`cmdwrite`] でコマンド行を解析する
+///
+/// 書き込み系でなければ空 (= 通してよい)。**リテラルはこの関数に 1 つも無い**。
+pub fn hook_write_targets(bin: &str, tool: &str, payload: &serde_json::Value) -> HookWrite {
+    let Some(target) = hook_target(bin) else {
+        return HookWrite::default(); // カタログに無い = 形が判らない
+    };
+    let input = payload.get("tool_input").unwrap_or(payload);
+    let text = |key: &str| -> &str { input.get(key).and_then(|v| v.as_str()).unwrap_or_default() };
+    let mut out = HookWrite::default();
+
+    // 1. パス欄を持つツール (`Edit` / `Write` / `write_file` …)。
+    if hook_tool_state(bin, tool) == Some(ProtoState::Editing) {
+        let p = crate::lease::target_path(payload, target.write_path_keys);
+        if !p.is_empty() {
+            out.paths.push(p);
+        }
+    }
+    // 2. パッチ本文を持つツール (codex の `apply_patch`)。
+    //    **パス欄が無いので、ここを解かないと codex の編集が丸ごと素通りする。**
+    if let Some(key) = hook_patch_key(bin, tool) {
+        let body = text(key);
+        let got = patchpath::patch_targets(body);
+        if got.is_empty() && patchpath::looks_like_patch(body) {
+            // パッチらしいのに宛先が取れない = 監査に残す (止めはしない)。
+            out.opaque = true;
+        }
+        out.paths.extend(got);
+    }
+    // 3. コマンド文字列を持つツール (`Bash` / `run_shell_command`)。
+    if let Some(key) = hook_command_key(bin, tool) {
+        let cmd = text(key);
+        if !cmd.is_empty() {
+            out.paths.extend(cmdwrite::write_targets(cmd));
+            out.opaque |= cmdwrite::opaque_write(cmd);
+        }
+    }
+    // 同じパスを 2 度数えない (2 と 3 は同じキーを見ることがある)。
+    // **並びは最初に出た順のまま**にする (`dedup` は隣接しか潰さない)。
+    let mut seen: Vec<String> = Vec::with_capacity(out.paths.len());
+    out.paths.retain(|p| {
+        if seen.iter().any(|s| s == p) {
+            false
+        } else {
+            seen.push(p.clone());
+            true
+        }
+    });
+    out
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2961,7 +3297,213 @@ mod ladder_catalog_tests {
                     t.bin
                 );
             }
+            // 強制に使うイベントは、必ず**仕掛けるイベントの中**に在ること。
+            // ここが外れると「設置したのにゲートが入口で降りる」= 静かに無効。
+            assert!(
+                t.events.iter().any(|(e, _, _)| *e == t.gate_event),
+                "{}: gate_event {} を設置していない",
+                t.bin,
+                t.gate_event
+            );
+            assert_eq!(
+                hook_gate_event(t.bin),
+                Some(t.gate_event),
+                "{}: gate_event を引けない",
+                t.bin
+            );
+            // ツール名で状態を細分できないイベントで強制すると、
+            // 「書き込み系かどうか」が判らないまま素通りする。
+            assert!(
+                t.events
+                    .iter()
+                    .any(|(e, _, refine)| *e == t.gate_event && *refine),
+                "{}: gate_event でツール名の細分が効いていない",
+                t.bin
+            );
+            // 書き込みを 1 つも拾えないカタログは「強制」を名乗れない。
+            assert!(
+                !t.tools.is_empty() || !t.command_tools.is_empty() || !t.patch_tools.is_empty(),
+                "{}: 書き込み系ツールを 1 つも知らない",
+                t.bin
+            );
+            for (name, key) in t.command_tools.iter().chain(t.patch_tools) {
+                assert!(!name.is_empty() && !key.is_empty(), "{}: 空の表", t.bin);
+            }
+            for (name, _) in t.command_tools {
+                assert!(
+                    hook_command_key(t.bin, name).is_some(),
+                    "{}: {name} のコマンド欄を引けない",
+                    t.bin
+                );
+            }
+            for (name, _) in t.patch_tools {
+                assert!(
+                    hook_patch_key(t.bin, name).is_some(),
+                    "{}: {name} のパッチ欄を引けない",
+                    t.bin
+                );
+            }
+            // 有効化条件は「何が足りないか」と「どう直すか」を必ず持つ
+            // (画面に出せない条件は、ユーザーには存在しないのと同じ)。
+            for a in t.activation {
+                assert!(!a.file_rel.is_empty(), "{}: 確認先が空", t.bin);
+                assert!(!a.home_rel.is_empty(), "{}: ホームが空", t.bin);
+                assert!(!a.missing.is_empty(), "{}: 不足の説明が空", t.bin);
+                assert!(!a.how.is_empty(), "{}: 直し方が空", t.bin);
+                assert!(
+                    !a.file_rel.contains('\\') && !a.home_rel.contains('\\'),
+                    "{}: 相対パスは / で書く",
+                    t.bin
+                );
+            }
         }
+        // 設定ファイルの置き場所が重なると、2 つのベンダーの設置が
+        // **お互いを消し合う**。カタログの時点で潰しておく。
+        let mut rels: Vec<&str> = HOOK_TARGETS.iter().map(|t| t.settings_rel).collect();
+        rels.sort_unstable();
+        let before = rels.len();
+        rels.dedup();
+        assert_eq!(before, rels.len(), "設定ファイルの相対パスが重複している");
+        // bin も重複してはいけない (`hook_target` は先勝ちなので片方が死ぬ)。
+        let mut bins: Vec<&str> = HOOK_TARGETS.iter().map(|t| t.bin).collect();
+        bins.sort_unstable();
+        let before = bins.len();
+        bins.dedup();
+        assert_eq!(before, bins.len(), "同じ bin が 2 回載っている");
+    }
+
+    #[test]
+    fn 拒否の応答はベンダーのスキーマに一致する() {
+        // 理由に `"` と改行を混ぜる — 文字列連結で組むと壊れる形。
+        let reason = "他の担当が持っています: \"src/a.rs\"\n数秒後に再試行してください";
+        /// そのベンダーのスキーマに一致するかを見る検査 1 件。
+        type SchemaCheck = fn(&serde_json::Value, &str);
+        // (bin, 期待する形の検査)
+        let cases: &[(&str, SchemaCheck)] = &[
+            ("claude", |v, r| {
+                let o = &v["hookSpecificOutput"];
+                assert_eq!(o["hookEventName"], "PreToolUse");
+                assert_eq!(o["permissionDecision"], "deny");
+                assert_eq!(o["permissionDecisionReason"], r);
+            }),
+            ("codex", |v, r| {
+                // codex は claude と同一スキーマ (実行ファイルの strings で確認)
+                let o = &v["hookSpecificOutput"];
+                assert_eq!(o["hookEventName"], "PreToolUse");
+                assert_eq!(o["permissionDecision"], "deny");
+                assert_eq!(o["permissionDecisionReason"], r);
+            }),
+            ("gemini", |v, r| {
+                // gemini は **top-level**。入れ子で返しても読まれない。
+                assert_eq!(v["decision"], "deny");
+                assert_eq!(v["reason"], r);
+                assert!(
+                    v.get("hookSpecificOutput").is_none(),
+                    "gemini に claude 形を混ぜている"
+                );
+            }),
+        ];
+        for (bin, check) in cases {
+            let (json, exit) = deny_payload(bin, reason).expect("拒否を組み立てられない");
+            let v: serde_json::Value =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("{bin}: 壊れた JSON: {e}"));
+            check(&v, reason);
+            assert_eq!(exit, 0, "{bin}: JSON は exit 0 のときだけ読まれる");
+        }
+        // カタログに無いエージェントには何も返さない (勝手に claude 形にしない)。
+        assert!(deny_payload("そんなCLIは無い", "x").is_none());
+        // ひな形そのものが JSON として妥当で、理由の穴を持つこと。
+        for t in HOOK_TARGETS {
+            let v: serde_json::Value = serde_json::from_str(t.deny.template)
+                .unwrap_or_else(|e| panic!("{}: ひな形が JSON ではない: {e}", t.bin));
+            assert!(
+                t.deny.template.contains(DENY_REASON),
+                "{}: 理由の穴が無い",
+                t.bin
+            );
+            // 穴が残ったまま出ていないこと (差し替え漏れの検出)。
+            let (filled, _) = deny_payload(t.bin, "R").expect("組み立て");
+            assert!(
+                !filled.contains(DENY_REASON) && !filled.contains(DENY_EVENT),
+                "{}: 差し替え漏れ: {filled}",
+                t.bin
+            );
+            let _ = v;
+        }
+    }
+
+    #[test]
+    fn codexのapply_patchから全パスが出る() {
+        let patch = "*** Begin Patch\n\
+                     *** Update File: src/a.rs\n\
+                     +新しい行\n\
+                     *** Add File: src/b.rs\n\
+                     *** Delete File: src/c.rs\n\
+                     *** End Patch";
+        let payload = serde_json::json!({
+            "tool_name": "apply_patch",
+            "tool_input": { "command": patch },
+        });
+        let w = hook_write_targets("codex", "apply_patch", &payload);
+        assert_eq!(w.paths, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+        assert!(!w.opaque);
+        // **入口で降りないこと** — `lease::gate` は編集扱いか
+        // コマンド欄を持つかで早期に抜けるので、ここが崩れると全部素通りする。
+        assert_eq!(
+            hook_tool_state("codex", "apply_patch"),
+            Some(ProtoState::Editing)
+        );
+
+        // シェル経由 (`apply_patch <<'EOF' … EOF`) で来ても拾う。
+        let via_shell = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": format!("apply_patch <<'EOF'\n{patch}\nEOF") },
+        });
+        let w = hook_write_targets("codex", "Bash", &via_shell);
+        for want in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            assert!(w.paths.iter().any(|p| p == want), "{want} を取りこぼした");
+        }
+        // 素のシェル書き込みも従来どおり拾う
+        let sh = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "printf X > src/d.rs" },
+        });
+        assert_eq!(
+            hook_write_targets("codex", "Bash", &sh).paths,
+            vec!["src/d.rs"]
+        );
+    }
+
+    #[test]
+    fn geminiは自分のツール名とキーで書き込みを拾う() {
+        let write = serde_json::json!({
+            "tool_name": "write_file",
+            "tool_input": { "file_path": "/w/x.rs", "content": "…" },
+        });
+        assert_eq!(
+            hook_write_targets("gemini", "write_file", &write).paths,
+            vec!["/w/x.rs"]
+        );
+        let replace = serde_json::json!({
+            "tool_name": "replace",
+            "tool_input": { "file_path": "/w/y.rs", "old_string": "a", "new_string": "b" },
+        });
+        assert_eq!(
+            hook_write_targets("gemini", "replace", &replace).paths,
+            vec!["/w/y.rs"]
+        );
+        // シェルは claude の `Bash` ではなく `run_shell_command`
+        let sh = serde_json::json!({
+            "tool_name": "run_shell_command",
+            "tool_input": { "command": "sed -i '' s/a/b/ /w/z.rs" },
+        });
+        assert_eq!(
+            hook_write_targets("gemini", "run_shell_command", &sh).paths,
+            vec!["/w/z.rs"]
+        );
+        // claude 名のツールで来ても gemini には無いので拾わない (取り違え防止)
+        assert!(hook_command_key("gemini", "Bash").is_none());
+        assert!(hook_tool_state("gemini", "Edit").is_none());
     }
 
     #[test]
@@ -2970,6 +3512,69 @@ mod ladder_catalog_tests {
         assert!(hook_target("そんなCLIは無い").is_none());
         assert!(hook_event_state("claude", "そんなイベントは無い").is_none());
         assert!(hook_tool_state("claude", "").is_none());
+    }
+
+    /// **書き込み系ツールの取りこぼしが、そのまま上書き事故になる。**
+    ///
+    /// `MultiEdit` が表に無く、`Bash` はコマンド文字列しか持たないせいで、
+    /// リース強制が 1 件も判定できずに素通りしていた。
+    #[test]
+    fn 書き込み系ツールをカタログから漏らさない() {
+        for t in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+            assert_eq!(
+                hook_tool_state("claude", t),
+                Some(ProtoState::Editing),
+                "{t}: 編集系として引けない"
+            );
+        }
+        assert_eq!(hook_command_key("claude", "Bash"), Some("command"));
+        // パスを持つツールはコマンド側の表に居ない (二重に数えない)。
+        assert!(hook_command_key("claude", "Edit").is_none());
+        assert!(hook_command_key("claude", "").is_none());
+        assert!(hook_command_key("そんなCLIは無い", "Bash").is_none());
+    }
+
+    /// PreToolUse の payload から書き込み先が出る (パス型 / コマンド型の両方)。
+    #[test]
+    fn フックのペイロードから書き込み先が出る() {
+        let edit = serde_json::json!({"tool_input": {"file_path": "src/shared.rs"}});
+        assert_eq!(
+            hook_write_targets("claude", "Edit", &edit).paths,
+            vec!["src/shared.rs".to_string()]
+        );
+        let multi = serde_json::json!({"tool_input": {"file_path": "src/shared.rs"}});
+        assert_eq!(
+            hook_write_targets("claude", "MultiEdit", &multi).paths,
+            vec!["src/shared.rs".to_string()]
+        );
+        // **これが素通りしていた穴** — A が持っているファイルへ B が書く形。
+        let bash = serde_json::json!({"tool_input": {"command": "printf B_WON > src/shared.rs"}});
+        assert_eq!(
+            hook_write_targets("claude", "Bash", &bash).paths,
+            vec!["src/shared.rs".to_string()]
+        );
+        let sed =
+            serde_json::json!({"tool_input": {"command": "sed -i '' -e 's/a/b/' src/shared.rs"}});
+        assert_eq!(
+            hook_write_targets("claude", "Bash", &sed).paths,
+            vec!["src/shared.rs".to_string()]
+        );
+        // 読むだけのコマンドは何も出さない = 止まらない。
+        let ls = serde_json::json!({"tool_input": {"command": "cargo test 2>&1 | head -50"}});
+        assert_eq!(
+            hook_write_targets("claude", "Bash", &ls),
+            HookWrite::default()
+        );
+        // 対象が判らない書き込みは警告だけ (拒否材料にしない)。
+        let opaque = serde_json::json!({"tool_input": {"command": "echo x > $OUT"}});
+        let w = hook_write_targets("claude", "Bash", &opaque);
+        assert!(w.paths.is_empty() && w.opaque);
+        // 書き込み系でないツールは空。
+        let read = serde_json::json!({"tool_input": {"file_path": "src/shared.rs"}});
+        assert_eq!(
+            hook_write_targets("claude", "Read", &read),
+            HookWrite::default()
+        );
     }
 
     /// **自動命名に対応と宣言したプリセットは、コマンドとフラグを持つ。**

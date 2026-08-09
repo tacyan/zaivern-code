@@ -598,6 +598,20 @@ pub enum TaskEvent {
     },
     /// 引き渡しを拒否した(前任者の停止が未確認 など)。
     HandoverRefused(AssignRefusal),
+    /// **担当ファイルの重なりで割り当てを断った**(fail-closed)。
+    ///
+    /// 「後で気付く衝突」を作らないために、断った事実だけでなく
+    /// 誰と・どのパターンで・どう分ければよいかまで履歴へ残す。
+    OverlapRefused {
+        /// 重なった相手のタスク。
+        with: TaskId,
+        /// 相手を持っているセッション(未割り当てなら None)。
+        holder: Option<SessionId>,
+        /// 重なった相手側のパターン。
+        pattern: String,
+        /// 対処まで書いた文面([`overlap_reason`] の結果)。
+        reason: String,
+    },
     /// 前任者の停止を確認した。
     PreviousStopped(SessionId),
     /// 引き継ぎ資料を渡した。
@@ -621,6 +635,14 @@ pub enum AssignRefusal {
     AttemptsExhausted { attempts: u8 },
     /// 条件を満たす候補がいない。
     NoEligibleCandidate,
+    /// **担当ファイルが他のタスクと重なる**。
+    ///
+    /// 後勝ちにしない (fail-closed)。詳しい文面は [`TaskEvent::OverlapRefused`]
+    /// に残る — ここは `Copy` を保つため ID だけを持つ。
+    FileOverlap {
+        with: TaskId,
+        holder: Option<SessionId>,
+    },
 }
 
 impl AssignRefusal {
@@ -636,6 +658,12 @@ impl AssignRefusal {
                 format!("再試行の上限に到達 ({attempts} 回) — 人手が必要")
             }
             AssignRefusal::NoEligibleCandidate => "割り当て可能なセッションがいない".into(),
+            AssignRefusal::FileOverlap { with, holder } => match holder {
+                Some(s) => format!(
+                    "タスク #{with} (session:{s} が担当中) と担当ファイルが重なるため割り当てない"
+                ),
+                None => format!("タスク #{with} と担当ファイルが重なるため割り当てない"),
+            },
         }
     }
 }
@@ -671,6 +699,12 @@ pub struct Task {
     /// 出来事の履歴(上限 [`HISTORY_CAP`]、古いものから捨てる)。
     pub history: Vec<(Instant, TaskEvent)>,
     pub required_caps: Vec<String>,
+    /// **このタスクが触るファイル集合**(スコープルートからの相対パス / `/` 区切り /
+    /// glob 可)。空なら「どこを触るか未申告」で、重なり判定の対象にならない。
+    ///
+    /// 割り当ての瞬間に [`admit`] がここを見て、他のセッションが持っている
+    /// タスクと重なるなら**割り当てない**。衝突をマージのときまで持ち越さないため。
+    pub files: Vec<String>,
 
     /// このタスクで失敗した / 停滞したセッション。**二度と割り当てない**。
     failed_by: HashSet<SessionId>,
@@ -710,6 +744,210 @@ impl Task {
     pub fn history_dropped(&self) -> u32 {
         self.history_dropped
     }
+
+    /// 表示用の短い名前。文面と分割案の両方で使う。
+    fn label(&self) -> String {
+        if self.title.is_empty() {
+            format!("#{}", self.id)
+        } else {
+            format!("#{} 「{}」", self.id, self.title)
+        }
+    }
+}
+
+// ── ファイルの重なり (割り当て前の fail-closed 判定) ──────────────────
+//
+// **並列エージェントの価値は、レビュー時の衝突解決コストで相殺される。**
+// だから衝突は「後で発見させる」のではなく、配る瞬間に止める。
+//
+// 重なり判定そのものは書かない。`lease::overlaps` / `lease::split_plan` が
+// glob (`**` / `*` / `?`)・末尾スラッシュ・Windows の大小畳み込みまで面倒を
+// 見ており、フックと画面と調停で**同じ 1 本**を通すことに意味がある
+// (判定が 2 種類あると「フックは止めたのに配ってしまう」が起きる)。
+
+/// 申告されたファイル集合を台帳と同じ正規形へ。空要素と重複は落とす。
+///
+/// 正規化を 1 箇所に閉じ込めるのは、`src\ui\a.rs` と `./src/ui/a.rs` が
+/// **別のパターンとして重なり判定を素通りする**のを防ぐため。
+fn normalize_files(files: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for f in files {
+        let p = crate::lease::normalize_path(f);
+        if p.is_empty() || out.contains(&p) {
+            continue;
+        }
+        out.push(p);
+    }
+    out
+}
+
+/// 割り当ての可否。**重なったら fail-closed**(後勝ちにしない)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Admit {
+    /// 誰とも重ならない。割り当ててよい。
+    Ok,
+    /// 他のセッションが持っているタスクと重なる。
+    Overlap {
+        /// 重なった相手のタスク。
+        with: TaskId,
+        /// 相手を持っているセッション。
+        holder: Option<SessionId>,
+        /// 重なった相手側のパターン。
+        pattern: String,
+    },
+}
+
+impl Admit {
+    /// 割り当ててよいか。
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Admit::Ok)
+    }
+}
+
+/// そのタスクは今もファイルを押さえているか。
+///
+/// 押さえているのは「誰かへ割り当て済み」かつ「終端でない」もの。
+/// 未割り当て(まだ誰も触っていない)と終端(`Done` / `NeedsUser` = 手が離れた)は
+/// 解放済みとみなす。`Failed` / `Stalled` を解放扱いにしないのは、担当が
+/// まだ生きて編集している可能性があるため — **迷ったら押さえている側に倒す**。
+fn occupies(t: &Task) -> bool {
+    t.assigned.is_some() && !t.state.is_terminal() && !t.files.is_empty()
+}
+
+/// 候補タスクを `to` へ割り当ててよいか。**I/O を持たない純粋関数**。
+///
+/// - 既に**他のセッション**へ割り当て済みで実行中のタスクと重なったら `Overlap`
+/// - **同じセッション**への割り当ては重なってよい(1 人が両方を持つのは安全)
+/// - 未割り当て / 完了済み(終端)のタスクとは重なってよい
+/// - 候補自身(同じ `id`)は当然除外する — 再割り当てが自分に阻まれない
+///
+/// 同点のときは**タスク ID の小さい順**で最初の 1 件を返す(決定的)。
+pub fn admit(tasks: &[Task], candidate: &Task, to: SessionId) -> Admit {
+    if candidate.files.is_empty() {
+        return Admit::Ok;
+    }
+    let mut hit: Option<(TaskId, Option<SessionId>, String)> = None;
+    for t in tasks {
+        if t.id == candidate.id || t.assigned == Some(to) || !occupies(t) {
+            continue;
+        }
+        for pb in &t.files {
+            if candidate
+                .files
+                .iter()
+                .any(|pa| crate::lease::overlaps(pa, pb))
+            {
+                let better = hit.as_ref().is_none_or(|(id, _, _)| t.id < *id);
+                if better {
+                    hit = Some((t.id, t.assigned, pb.clone()));
+                }
+                break;
+            }
+        }
+    }
+    match hit {
+        Some((with, holder, pattern)) => Admit::Overlap {
+            with,
+            holder,
+            pattern,
+        },
+        None => Admit::Ok,
+    }
+}
+
+/// 断ったときの文面。**「拒否しました」だけでは、ユーザーは機能を切るだけ。**
+/// 誰と・どのパターンで重なったか、そして**どう分ければ今すぐ進めるか**を出す。
+///
+/// `Admit::Ok` なら `None`(文面が要らない)。
+pub fn overlap_reason(
+    tasks: &[Task],
+    candidate: &Task,
+    to: SessionId,
+    a: &Admit,
+) -> Option<String> {
+    let Admit::Overlap {
+        with,
+        holder,
+        pattern,
+    } = a
+    else {
+        return None;
+    };
+    let other = tasks.iter().find(|t| t.id == *with);
+    let other_name = other
+        .map(|t| t.label())
+        .unwrap_or_else(|| format!("#{with}"));
+    let mine = candidate
+        .files
+        .iter()
+        .find(|pa| crate::lease::overlaps(pa, pattern))
+        .cloned()
+        .unwrap_or_else(|| pattern.clone());
+    let owner = match holder {
+        Some(s) => format!("session:{s} が担当中"),
+        None => "担当未定".to_string(),
+    };
+
+    let (now_ok, serial) = overlap_split(tasks, candidate, to);
+    let mut plan = if now_ok.is_empty() {
+        "重ならない部分が 1 つも無いので、いま渡せる範囲はありません".to_string()
+    } else {
+        format!("いま渡せるのは {}", now_ok.join(", "))
+    };
+    if !serial.is_empty() {
+        plan.push_str(&format!(" / 直列にすべきなのは {}", serial.join(", ")));
+    }
+
+    let same_session = match holder {
+        Some(s) => {
+            format!("(3) どうしても同時に進めるなら、両方を session:{s} へ渡す(1 人なら壊れない)")
+        }
+        None => "(3) 相手の担当を先に決め、どちらが持つかをはっきりさせる".to_string(),
+    };
+
+    Some(format!(
+        "タスク {mine_name} は割り当てません: {other_name} ({owner}) と担当ファイルが重なります。\n\
+         重なり: こちらの「{mine}」 と 相手の「{pattern}」\n\
+         同じファイルを 2 人が同時に編集すると、衝突はマージのときまで見えません。\n\
+         対処: (1) {other_name} の完了を待つ (2) 担当を分ける — {plan}\n\
+         {same_session}",
+        mine_name = candidate.label(),
+    ))
+}
+
+/// **重ならない部分だけ先に割り当てる**分割案。
+///
+/// 返り値は `(いま候補へ渡してよいパターン, 直列にすべきパターン)`。
+/// 既に持っている側を先に並べて [`lease::split_plan`](crate::lease::split_plan)
+/// へ渡すので、**先に走っているタスクの担当範囲は決して削られない**。
+pub fn overlap_split(
+    tasks: &[Task],
+    candidate: &Task,
+    to: SessionId,
+) -> (Vec<String>, Vec<String>) {
+    let mut list: Vec<crate::lease::Assignment> = Vec::new();
+    for t in tasks {
+        if t.id == candidate.id || t.assigned == Some(to) || !occupies(t) {
+            continue;
+        }
+        list.push(crate::lease::Assignment {
+            agent: t.label(),
+            patterns: t.files.clone(),
+        });
+    }
+    // 候補は最後 — 先着(実行中のタスク)の範囲を奪わせない。
+    list.push(crate::lease::Assignment {
+        agent: candidate.label(),
+        patterns: candidate.files.clone(),
+    });
+    let (kept, serial) = crate::lease::split_plan(&list);
+    let mine = kept.last().map(|a| a.patterns.clone()).unwrap_or_default();
+    // `serial` には他人同士の重なりも入り得るので、候補に関係する分だけ出す。
+    let serial: Vec<String> = serial
+        .into_iter()
+        .filter(|p| candidate.files.iter().any(|f| crate::lease::overlaps(f, p)))
+        .collect();
+    (mine, serial)
 }
 
 // ── 上限設定 ─────────────────────────────────────────────────────────
@@ -1177,12 +1415,31 @@ impl Coordinator {
 
     // ── タスク ──────────────────────────────────────────────────────
 
-    /// タスクを登録する。
+    /// タスクを登録する(触るファイルは未申告)。
+    ///
+    /// 触る範囲が分かっているなら [`Coordinator::add_task_with_files`] を使う。
+    /// 未申告のタスクは重なり判定の対象にならない — つまり**衝突を止められない**。
     pub fn add_task(
         &mut self,
         title: impl Into<String>,
         description: impl Into<String>,
         required_caps: &[&str],
+        now: Instant,
+    ) -> TaskId {
+        self.add_task_with_files(title, description, required_caps, &[], now)
+    }
+
+    /// 担当ファイル付きでタスクを登録する。
+    ///
+    /// `files` はスコープルートからの相対パス(`/` 区切り、glob 可)。
+    /// 正規化は [`lease::normalize_path`](crate::lease::normalize_path) に任せる
+    /// ので、`\` 区切りや `./` 付きで渡してもよい。
+    pub fn add_task_with_files(
+        &mut self,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        required_caps: &[&str],
+        files: &[&str],
         now: Instant,
     ) -> TaskId {
         let id = self.next_task_id;
@@ -1196,6 +1453,7 @@ impl Coordinator {
             attempts: 0,
             history: Vec::new(),
             required_caps: required_caps.iter().map(|s| s.to_string()).collect(),
+            files: normalize_files(files),
             failed_by: HashSet::new(),
             // まだ誰も持っていないので「前任者は停止済み」と見なす。
             prev_holder_stopped: true,
@@ -1209,6 +1467,46 @@ impl Coordinator {
 
     pub fn task(&self, id: TaskId) -> Option<&Task> {
         self.tasks.iter().find(|t| t.id == id)
+    }
+
+    /// 担当ファイルを後から差し替える(登録時に分かっていなかった場合)。
+    ///
+    /// 割り当て済みのタスクにも使えるが、**次の割り当てから効く**。
+    /// 既に配ってしまったものを遡って止めることはできない。
+    pub fn set_task_files(&mut self, task_id: TaskId, files: &[&str]) -> bool {
+        let norm = normalize_files(files);
+        match self.task_mut(task_id) {
+            Some(t) => {
+                t.files = norm;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// いまこのタスクを `to` へ渡してよいか(**配る前に**確かめる用)。
+    ///
+    /// 実際の割り当て([`Coordinator::try_assign`])も同じ判定を通るので、
+    /// ここが `Ok` を返したものは(候補の条件を満たす限り)通る。
+    pub fn admit_task(&self, task_id: TaskId, to: SessionId) -> Admit {
+        match self.task(task_id) {
+            Some(t) => admit(&self.tasks, t, to),
+            None => Admit::Ok,
+        }
+    }
+
+    /// 断ったときの文面(重ならないなら `None`)。
+    pub fn overlap_reason_for(&self, task_id: TaskId, to: SessionId) -> Option<String> {
+        let t = self.task(task_id)?;
+        overlap_reason(&self.tasks, t, to, &admit(&self.tasks, t, to))
+    }
+
+    /// 「重ならない部分だけ先に渡す」分割案。
+    pub fn overlap_split_for(&self, task_id: TaskId, to: SessionId) -> (Vec<String>, Vec<String>) {
+        match self.task(task_id) {
+            Some(t) => overlap_split(&self.tasks, t, to),
+            None => (Vec::new(), Vec::new()),
+        }
     }
 
     pub fn tasks(&self) -> &[Task] {
@@ -1358,10 +1656,67 @@ impl Coordinator {
             (t.required_caps.clone(), t.failed_by.clone(), t.assigned)
         };
 
-        let pick = candidates
+        let eligible: Vec<&SessionInfo> = candidates
             .iter()
             .filter(|c| assignable(c.state))
             .filter(|c| !failed.contains(&c.id))
+            .collect();
+
+        // ── ファイルの重なりは、配る瞬間に止める (fail-closed) ──
+        //
+        // 重なりは「渡す先」によって変わる(既に持っている本人へ渡すのは安全)
+        // ので、候補ごとに判定して**重なりを持ち込む相手を選択肢から外す**。
+        // 後勝ちにしない ＝ 断る方へ倒す。衝突をマージまで持ち越さないため。
+        let admitted: Vec<&SessionInfo> = eligible
+            .iter()
+            .copied()
+            .filter(|c| {
+                self.tasks
+                    .iter()
+                    .find(|t| t.id == task_id)
+                    .is_none_or(|t| admit(&self.tasks, t, c.id).is_ok())
+            })
+            .collect();
+
+        if admitted.is_empty() && !eligible.is_empty() {
+            // 生きている候補は居るのに、全員がファイルの重なりに当たる。
+            // 「誰と・どのパターンで・どう分ければよいか」まで残して断る。
+            let to = eligible[0].id;
+            let verdict = self
+                .tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .map(|t| (admit(&self.tasks, t, to), t))
+                .map(|(a, t)| (overlap_reason(&self.tasks, t, to, &a), a));
+            if let Some((
+                reason,
+                Admit::Overlap {
+                    with,
+                    holder,
+                    pattern,
+                },
+            )) = verdict
+            {
+                let refusal = AssignRefusal::FileOverlap { with, holder };
+                let reason = reason.unwrap_or_else(|| refusal.label());
+                if let Some(t) = self.task_mut(task_id) {
+                    t.record(
+                        now,
+                        TaskEvent::OverlapRefused {
+                            with,
+                            holder,
+                            pattern,
+                            reason,
+                        },
+                    );
+                }
+                self.last_refusal = Some(refusal);
+                return Err(refusal);
+            }
+        }
+
+        let pick = admitted
+            .iter()
             .min_by_key(|c| {
                 let matched = required.iter().filter(|r| c.caps.contains(r)).count();
                 // 能力の合致が多い順 → 空いている順 → ID の小さい順
@@ -2699,6 +3054,413 @@ mod tests {
         // 受信箱の上限までは残る。捨てるとしても理由付き。
         assert!(!c.user_inbox().is_empty());
         assert_eq!(c.take_user_messages().len(), 10);
+    }
+
+    // ── ファイルの重なり (配る瞬間に止める) ──────────────────────────
+
+    /// 状態と担当を自由に決めたタスクを 1 つ作る(判定のテーブルテスト用)。
+    fn task_with(
+        id: TaskId,
+        title: &str,
+        files: &[&str],
+        state: TaskState,
+        assigned: Option<SessionId>,
+    ) -> Task {
+        Task {
+            id,
+            title: title.to_string(),
+            description: String::new(),
+            assigned,
+            state,
+            attempts: 0,
+            history: Vec::new(),
+            required_caps: Vec::new(),
+            files: normalize_files(files),
+            failed_by: HashSet::new(),
+            prev_holder_stopped: true,
+            context: Vec::new(),
+            history_dropped: 0,
+        }
+    }
+
+    /// 何を「重なり」と呼ぶかをテーブルで固定する。
+    ///
+    /// glob の境界そのものは `lease::overlaps` 側のテストが持つ。ここで見るのは
+    /// **どの状態のタスクがファイルを押さえているとみなすか**。
+    #[test]
+    fn 割り当て可否をテーブルで固定する() {
+        // (相手のファイル, 相手の状態, 相手の担当, 候補のファイル, 渡す先, 重なるか)
+        type Case = (
+            &'static [&'static str],
+            TaskState,
+            Option<SessionId>,
+            &'static [&'static str],
+            SessionId,
+            bool,
+        );
+        let cases: &[Case] = &[
+            // 同じ具体パス → 止める
+            (
+                &["src/a.rs"],
+                TaskState::Running,
+                Some(1),
+                &["src/a.rs"],
+                2,
+                true,
+            ),
+            // glob が具体パスを覆う / その逆 → どちらも止める
+            (
+                &["src/ui/**"],
+                TaskState::Running,
+                Some(1),
+                &["src/ui/a.rs"],
+                2,
+                true,
+            ),
+            (
+                &["src/ui/a.rs"],
+                TaskState::Assigned,
+                Some(1),
+                &["src/ui/**"],
+                2,
+                true,
+            ),
+            // 停滞中でも「まだ生きて編集しているかもしれない」→ 止める
+            (
+                &["src/a.rs"],
+                TaskState::Stalled,
+                Some(1),
+                &["src/a.rs"],
+                2,
+                true,
+            ),
+            // 区切りと ./ が違うだけ → 正規化して同じものとみなす
+            (
+                &["src\\ui\\a.rs"],
+                TaskState::Running,
+                Some(1),
+                &["./src/ui/a.rs"],
+                2,
+                true,
+            ),
+            // 重ならない場所 → 通す
+            (
+                &["src/**"],
+                TaskState::Running,
+                Some(1),
+                &["docs/x.md"],
+                2,
+                false,
+            ),
+            // `*` は `/` を越えない
+            (
+                &["src/*.rs"],
+                TaskState::Running,
+                Some(1),
+                &["src/sub/a.rs"],
+                2,
+                false,
+            ),
+            // 同じセッションへ渡すなら重なってよい(1 人なら壊れない)
+            (
+                &["src/a.rs"],
+                TaskState::Running,
+                Some(1),
+                &["src/a.rs"],
+                1,
+                false,
+            ),
+            // 終端(完了 / 人待ち)は手が離れている
+            (
+                &["src/a.rs"],
+                TaskState::Done,
+                Some(1),
+                &["src/a.rs"],
+                2,
+                false,
+            ),
+            (
+                &["src/a.rs"],
+                TaskState::NeedsUser,
+                Some(1),
+                &["src/a.rs"],
+                2,
+                false,
+            ),
+            // 未割り当てはまだ誰も触っていない
+            (
+                &["src/a.rs"],
+                TaskState::Pending,
+                None,
+                &["src/a.rs"],
+                2,
+                false,
+            ),
+            // 未申告(空)は判定できない — 止めようが無い
+            (&[], TaskState::Running, Some(1), &["src/a.rs"], 2, false),
+            (&["src/a.rs"], TaskState::Running, Some(1), &[], 2, false),
+        ];
+
+        for (i, (other, state, holder, mine, to, want)) in cases.iter().enumerate() {
+            let tasks = vec![
+                task_with(1, "先客", other, *state, *holder),
+                task_with(2, "候補", mine, TaskState::Pending, None),
+            ];
+            let got = admit(&tasks, &tasks[1], *to);
+            assert_eq!(
+                !got.is_ok(),
+                *want,
+                "case {i}: {other:?}({state:?}/{holder:?}) vs {mine:?} → {to} : {got:?}"
+            );
+        }
+    }
+
+    /// 同じファイルを持つ 2 タスクを**別の**セッションへ配ろうとすると、
+    /// 2 本目は割り当てられない(後勝ちにしない)。
+    #[test]
+    fn 同じファイルの2タスクを別セッションへ配ると2本目が拒否される() {
+        let mut c = Coordinator::new();
+        let now = t0();
+        let a = c.add_task_with_files("認証を直す", "", &[], &["src/auth.rs"], now);
+        let b = c.add_task_with_files("認証にテストを足す", "", &[], &["src/auth.rs"], now);
+
+        let s1 = vec![SessionInfo::new(1, SessionState::Idle, &[])];
+        let s2 = vec![SessionInfo::new(2, SessionState::Idle, &[])];
+        assert_eq!(c.try_assign(a, &s1, now), Ok(1));
+
+        let err = c.try_assign(b, &s2, now).unwrap_err();
+        assert_eq!(
+            err,
+            AssignRefusal::FileOverlap {
+                with: a,
+                holder: Some(1)
+            }
+        );
+        // 断ったのだから、担当は付いていない。
+        assert_eq!(c.task(b).unwrap().assigned, None);
+        assert_eq!(c.task(b).unwrap().state, TaskState::Pending);
+        assert_eq!(c.last_refusal(), Some(err));
+    }
+
+    /// glob と具体パスの重なりも、配る前に止まる。
+    #[test]
+    fn globと具体パスの重なりも配る前に止まる() {
+        let mut c = Coordinator::new();
+        let now = t0();
+        let a = c.add_task_with_files("UI を整理", "", &[], &["src/ui/**"], now);
+        let b = c.add_task_with_files("ボタンを直す", "", &[], &["src/ui/a.rs"], now);
+
+        assert_eq!(
+            c.try_assign(a, &[SessionInfo::new(1, SessionState::Idle, &[])], now),
+            Ok(1)
+        );
+        assert!(matches!(
+            c.try_assign(b, &[SessionInfo::new(2, SessionState::Idle, &[])], now),
+            Err(AssignRefusal::FileOverlap { .. })
+        ));
+    }
+
+    /// **同じ**セッションへ渡すなら重なってよい。1 人が両方を持つのは安全で、
+    /// ここまで断ると「衝突しない構成」まで潰してしまう。
+    #[test]
+    fn 同一セッションへの2タスクは重なっても通る() {
+        let mut c = Coordinator::new();
+        let now = t0();
+        let a = c.add_task_with_files("A", "", &[], &["src/x.rs"], now);
+        let b = c.add_task_with_files("B", "", &[], &["src/x.rs"], now);
+        let one = vec![SessionInfo::new(1, SessionState::Idle, &[])];
+        assert_eq!(c.try_assign(a, &one, now), Ok(1));
+        assert_eq!(c.try_assign(b, &one, now), Ok(1));
+    }
+
+    /// 完了済み / 未割り当てのタスクとは重なってよい。
+    #[test]
+    fn 完了済みと未割り当てのタスクとは重なっても通る() {
+        let now = t0();
+
+        // (1) 完了済み
+        let mut c = Coordinator::new();
+        let a = c.add_task_with_files("済んだ仕事", "", &[], &["src/x.rs"], now);
+        let b = c.add_task_with_files("続き", "", &[], &["src/x.rs"], now);
+        assert_eq!(
+            c.try_assign(a, &[SessionInfo::new(1, SessionState::Idle, &[])], now),
+            Ok(1)
+        );
+        c.note_done(a, now);
+        assert_eq!(
+            c.try_assign(b, &[SessionInfo::new(2, SessionState::Idle, &[])], now),
+            Ok(2)
+        );
+
+        // (2) 未割り当て(まだ誰も触っていない)
+        let mut c = Coordinator::new();
+        let _a = c.add_task_with_files("まだ配っていない", "", &[], &["src/y.rs"], now);
+        let b = c.add_task_with_files("先に進める", "", &[], &["src/y.rs"], now);
+        assert_eq!(
+            c.try_assign(b, &[SessionInfo::new(2, SessionState::Idle, &[])], now),
+            Ok(2)
+        );
+    }
+
+    /// 断るなら、**次に何をすればよいか**まで出す。
+    /// 相手の名前と重なったパターンが欠けたら、ユーザーは機能を切るだけ。
+    #[test]
+    fn 拒否の文面に相手の名前と重なったパターンが入る() {
+        let mut c = Coordinator::new();
+        let now = t0();
+        let a = c.add_task_with_files("UI を整理", "", &[], &["src/ui/**"], now);
+        let b = c.add_task_with_files(
+            "ボタンを直す",
+            "",
+            &[],
+            &["src/ui/a.rs", "docs/button.md"],
+            now,
+        );
+        assert_eq!(
+            c.try_assign(a, &[SessionInfo::new(1, SessionState::Idle, &[])], now),
+            Ok(1)
+        );
+
+        let text = c.overlap_reason_for(b, 2).expect("重なるので文面が要る");
+        // 誰と
+        assert!(text.contains("UI を整理"), "相手の名前が無い: {text}");
+        // どのパターンで
+        assert!(text.contains("src/ui/**"), "相手のパターンが無い: {text}");
+        assert!(text.contains("src/ui/a.rs"), "自分のパターンが無い: {text}");
+        // どう分ければよいか(重ならない側は今すぐ渡せる)
+        assert!(text.contains("docs/button.md"), "分割案が無い: {text}");
+        // 誰が持っているか
+        assert!(text.contains("session:1"), "保有者が無い: {text}");
+
+        // 重ならないなら文面は要らない。
+        assert!(c.overlap_reason_for(b, 1).is_none());
+    }
+
+    /// 断った事実と理由がタスクの履歴に残る(後から「なぜ止まったか」を追える)。
+    #[test]
+    fn 重なりでの拒否はタスクの履歴に残る() {
+        let mut c = Coordinator::new();
+        let now = t0();
+        let a = c.add_task_with_files("先客", "", &[], &["src/x.rs"], now);
+        let b = c.add_task_with_files("後から", "", &[], &["src/x.rs"], now);
+        assert_eq!(
+            c.try_assign(a, &[SessionInfo::new(1, SessionState::Idle, &[])], now),
+            Ok(1)
+        );
+        assert!(c
+            .try_assign(b, &[SessionInfo::new(2, SessionState::Idle, &[])], now)
+            .is_err());
+
+        let ev = c
+            .task(b)
+            .unwrap()
+            .history
+            .iter()
+            .find_map(|(_, e)| match e {
+                TaskEvent::OverlapRefused {
+                    with,
+                    holder,
+                    pattern,
+                    reason,
+                } => Some((*with, *holder, pattern.clone(), reason.clone())),
+                _ => None,
+            })
+            .expect("拒否が履歴に残っていない");
+        assert_eq!(ev.0, a);
+        assert_eq!(ev.1, Some(1));
+        assert_eq!(ev.2, "src/x.rs");
+        assert!(ev.3.contains("先客"), "履歴の文面が薄い: {}", ev.3);
+    }
+
+    /// 再割り当て(`redispatch`)も同じ判定を通る。
+    /// **純粋関数を書いただけで呼ばれていない**ことが無いようにする番人。
+    #[test]
+    fn 再割り当ても重なりで止まる() {
+        let mut c = Coordinator::new();
+        let now = t0();
+        let b = c.add_task_with_files("移植", "", &[], &["docs/**"], now);
+        assert_eq!(
+            c.try_assign(b, &[SessionInfo::new(2, SessionState::Idle, &[])], now),
+            Ok(2)
+        );
+        // 別のタスクが src/parser.rs を押さえる。
+        let a = c.add_task_with_files("パーサ修正", "", &[], &["src/parser.rs"], now);
+        assert_eq!(
+            c.try_assign(a, &[SessionInfo::new(1, SessionState::Idle, &[])], now),
+            Ok(1)
+        );
+        // 進めるうちに、b も実は src/parser.rs を触ると分かった
+        // (**次の割り当てから効く** — 既に配ったものは遡って止められない)。
+        assert!(c.set_task_files(b, &["src/parser.rs"]));
+
+        // 担当が停滞 → 停止を確認 → 別の空きへ回そうとする。
+        c.note_stalled(2, now);
+        assert!(c.confirm_stopped(b, now));
+        let err = c
+            .redispatch(
+                b,
+                &[SessionInfo::new(3, SessionState::Idle, &[])],
+                ReassignReason::Stalled,
+                now,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AssignRefusal::FileOverlap {
+                with: a,
+                holder: Some(1)
+            }
+        );
+        // 担当は前のまま。勝手に付け替えない。
+        assert_eq!(c.task(b).unwrap().assigned, Some(2));
+    }
+
+    /// 警告だけでは足りない。**重ならない部分だけ先に渡す**案を出す。
+    #[test]
+    fn 重ならない部分だけ先に渡す分割案を返す() {
+        let mut c = Coordinator::new();
+        let now = t0();
+        let _a = {
+            let a = c.add_task_with_files("UI を整理", "", &[], &["src/ui/**"], now);
+            assert_eq!(
+                c.try_assign(a, &[SessionInfo::new(1, SessionState::Idle, &[])], now),
+                Ok(1)
+            );
+            a
+        };
+        let b = c.add_task_with_files("ボタン", "", &[], &["src/ui/a.rs", "docs/guide.md"], now);
+
+        let (now_ok, serial) = c.overlap_split_for(b, 2);
+        assert_eq!(now_ok, vec!["docs/guide.md".to_string()]);
+        assert_eq!(serial, vec!["src/ui/a.rs".to_string()]);
+
+        // 同じセッションへ渡すなら分ける必要が無い。
+        let (all, none) = c.overlap_split_for(b, 1);
+        assert_eq!(
+            all,
+            vec!["src/ui/a.rs".to_string(), "docs/guide.md".to_string()]
+        );
+        assert!(none.is_empty());
+    }
+
+    /// 重なる相手が居ても、**同じセッションが候補に居るなら**そこへ渡せる。
+    /// 「全員が重なる」ときだけ断る。
+    #[test]
+    fn 重なりを持つ候補だけを外して残りへ渡す() {
+        let mut c = Coordinator::new();
+        let now = t0();
+        let a = c.add_task_with_files("A", "", &[], &["src/x.rs"], now);
+        let b = c.add_task_with_files("B", "", &[], &["src/x.rs"], now);
+        assert_eq!(
+            c.try_assign(a, &[SessionInfo::new(1, SessionState::Idle, &[])], now),
+            Ok(1)
+        );
+        // 2 は重なるので外れ、1 が残る(忙しくても 1 しか選べない)。
+        let list = vec![
+            SessionInfo::new(1, SessionState::Working, &[]),
+            SessionInfo::new(2, SessionState::Idle, &[]),
+        ];
+        assert_eq!(c.try_assign(b, &list, now), Ok(1));
     }
 
     // ── 発信マーカーの解析 ───────────────────────────────────────────

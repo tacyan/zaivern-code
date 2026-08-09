@@ -419,6 +419,35 @@ pub struct Config {
     /// (state.toml 側に `quick_launch = [...]` として置く)。
     #[serde(skip)]
     pub quick_launch: Option<Vec<String>>,
+
+    /// 機能 ([`crate::feature::REGISTRY`]) が自分で宣言した設定の値。
+    /// config.toml では `[features]` 区画。
+    ///
+    /// **この 1 フィールドを足したのは 1 度きり。** 以後どれだけ機能が増えても
+    /// `Config` へフィールドを足す必要が無いので、2 つのブランチが同時に
+    /// 設定を足しても**同じ行を奪い合わない** — which-key と local_history が
+    /// `config.rs` へ追記して 3 ハンク衝突したのが、まさに避けたかった形。
+    /// 機能側は `src/features/<名前>.rs` に
+    /// [`crate::feature::Setting`] を宣言するだけで済む。
+    ///
+    /// キーは `"<module>.<name>"`。点を含むので TOML では必ず引用符が付く:
+    ///
+    /// ```toml
+    /// [features]
+    /// "whichkey.delay_ms" = 300
+    /// ```
+    ///
+    /// **この版が知らないキーも捨てずに持ち続ける。** 新しい版が足した設定を、
+    /// 古い版で 1 度起動しただけで消してしまう事故を防ぐため
+    /// (読み書きの往復で残ることを `機能設定の未知のキーは読み書きしても消えない`
+    /// が番人として押さえている)。
+    ///
+    /// 読み書きは型付きのアクセサ ([`Config::feature_bool`] /
+    /// [`Config::feature_i64`] / [`Config::feature_f64`] /
+    /// [`Config::feature_str`] / [`Config::set_feature`]) から行う。
+    /// **直接触ると型違いで panic する経路を作れてしまう。**
+    #[serde(default, rename = "features")]
+    pub extra: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// ⌃1〜⌃9 に割り当たるプリセットの添字を**スロット順**で返す。
@@ -901,6 +930,9 @@ impl Default for Config {
             cost_limit_action: "notify".into(),
             palette_recent: Vec::new(),
             quick_launch: None,
+            // 機能の設定は「宣言された既定」が正なので、ここは常に空から始める。
+            // 空 = 全部が既定値、という意味 (`feature_*` が宣言へ落ちる)。
+            extra: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -2812,7 +2844,9 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
         "voice_lang" => T(cfg.voice_lang.clone()),
         "webhook_url" => T(cfg.webhook_url.clone()),
         "ssh_tunnel_host" => T(cfg.ssh_tunnel_host.clone()),
-        _ => return None,
+        // 組み込みに無いキーは機能の設定 (`<module>.<name>`) として引く。
+        // 組み込みのキーは点を含まないので取り違えは起こらない。
+        _ => return feature_value(cfg, key),
     })
 }
 
@@ -2983,7 +3017,9 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
         "voice_lang" => t!(cfg.voice_lang),
         "webhook_url" => t!(cfg.webhook_url),
         "ssh_tunnel_host" => t!(cfg.ssh_tunnel_host),
-        _ => false,
+        // 機能が**宣言している**キーだけ機能の設定として書く。
+        // 宣言の無いキーは従来どおり false (打ち間違いを黙って通さない)。
+        _ => feature_setting(key).is_some() && cfg.set_feature(key, v.clone()),
     }
 }
 
@@ -3025,7 +3061,9 @@ pub fn settings_rows(cfg: &Config, query: &str, only_modified: bool) -> Vec<&'st
     }
     let prepared = crate::fuzzy::PreparedQuery::new(&q);
     let mut hits: Vec<(i32, usize, &'static SettingDef)> = Vec::new();
-    for (i, d) in setting_defs().iter().enumerate() {
+    // 組み込み + 機能が宣言した設定。**機能側は 1 行も追記しない**のに
+    // 検索にも `@modified` にも「既定へ戻す」にも自動で乗る。
+    for (i, d) in all_setting_defs().iter().enumerate() {
         if modified_only && !is_setting_modified(cfg, d.key) {
             continue;
         }
@@ -3048,10 +3086,347 @@ pub fn settings_rows(cfg: &Config, query: &str, only_modified: bool) -> Vec<&'st
     hits.into_iter().map(|(_, _, d)| d).collect()
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+//  機能が自分で宣言する設定 (`[features]`) — 追記ゼロで設定を足す面
+// ═════════════════════════════════════════════════════════════════════════
+//
+// **なぜ要るのか。** 従来は設定を持つ機能を足すたびに、この config.rs の
+//   (1) `Config` の構造体   (2) `Config::default()`   (3) `setting_defs()`
+//   (4) `setting_value()`   (5) `set_setting_value()`
+// へ追記する必要があった。**git が衝突を作るのは「2 つのブランチが同じ
+// ファイルの近い行を触った」時だけ**なので、この形では同時に設定を足した
+// 2 本のブランチは必ず衝突する (which-key と local_history が実際に 3 ハンク)。
+//
+// **解き方は追記そのものを無くすこと。** 機能側は
+// `src/features/<名前>.rs` に [`crate::feature::Setting`] を並べるだけで、
+// 値は [`Config::extra`] へ文字列キーで入る。ここにある関数は全て
+// [`crate::feature::REGISTRY`] を**走査して**組み立てるので、
+// **config.rs を 1 バイトも触らずに設定が増える**。
+
+/// 機能の設定の入力欄が受け付ける範囲。
+///
+/// **これは検証ではなくウィジェットの範囲**。[`crate::feature::Setting`] は
+/// 範囲を宣言しないので、UI が勝手に狭い範囲を発明してはいけない
+/// (機能側が意図した値を入れられなくなる)。桁飛びを防ぐのは
+/// `DragValue` の刻みであって、ここではない。
+const FEATURE_INT_MIN: i64 = i64::MIN;
+const FEATURE_INT_MAX: i64 = i64::MAX;
+const FEATURE_FLOAT_MIN: f32 = f32::MIN;
+const FEATURE_FLOAT_MAX: f32 = f32::MAX;
+
+/// 機能の設定がまとまる設定画面のグループ見出し。
+const G_FEATURE: &str = "機能";
+
+/// `feature::REGISTRY` の全 [`crate::feature::Setting`] をキーで引く表。
+///
+/// 1 度だけ組んで使い回す (レジストリは実行中に変わらない)。
+fn feature_settings() -> &'static HashMap<&'static str, &'static crate::feature::Setting> {
+    static MAP: std::sync::OnceLock<HashMap<&'static str, &'static crate::feature::Setting>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m: HashMap<&'static str, &'static crate::feature::Setting> = HashMap::new();
+        for f in crate::feature::REGISTRY {
+            for s in f.settings {
+                // 同じキーが 2 つあったら先に登録されたほうを残す。
+                // 番人テスト `機能の設定キーはモジュール接頭辞付きで一意` が
+                // 静的に禁止しているので、ここへ来るのは異常な状態。
+                m.entry(s.key).or_insert(s);
+            }
+        }
+        m
+    })
+}
+
+/// 機能の設定の**宣言**を引く。宣言の無いキーは `None`。
+///
+/// 宣言が無い = この版が知らない設定。値は [`Config::extra`] に残り続けるが
+/// 画面には出ないし、型付きアクセサは既定へ落ちる (**panic しない**)。
+pub fn feature_setting(key: &str) -> Option<&'static crate::feature::Setting> {
+    feature_settings().get(key).copied()
+}
+
+/// 宣言された既定値を、設定画面が使う [`SettingValue`] へ写す。
+///
+/// `Float` は f64 → f32 に落ちる (画面のウィジェットが f32 のため)。
+/// **値を読むだけなら [`Config::feature_f64`] を使うこと** — そちらは
+/// 落とさずに f64 のまま返す。
+fn feature_default_value(s: &crate::feature::Setting) -> SettingValue {
+    match s.default {
+        crate::feature::SettingValue::Bool(b) => SettingValue::Bool(b),
+        crate::feature::SettingValue::Int(i) => SettingValue::Int(i),
+        crate::feature::SettingValue::Float(f) => SettingValue::Float(f as f32),
+        crate::feature::SettingValue::Text(t) => SettingValue::Text(t.to_string()),
+    }
+}
+
+/// 宣言された既定値の型から、設定画面が出すウィジェットの種類を決める。
+fn feature_kind(s: &crate::feature::Setting) -> SettingKind {
+    match s.default {
+        crate::feature::SettingValue::Bool(_) => SettingKind::Bool,
+        crate::feature::SettingValue::Int(_) => SettingKind::Int {
+            min: FEATURE_INT_MIN,
+            max: FEATURE_INT_MAX,
+        },
+        crate::feature::SettingValue::Float(_) => SettingKind::Float {
+            min: FEATURE_FLOAT_MIN,
+            max: FEATURE_FLOAT_MAX,
+        },
+        crate::feature::SettingValue::Text(_) => SettingKind::Text,
+    }
+}
+
+/// [`SettingValue`] を config.toml へ入る [`toml::Value`] へ写す。
+fn feature_toml_value(v: &SettingValue) -> toml::Value {
+    match v {
+        SettingValue::Bool(b) => toml::Value::Boolean(*b),
+        SettingValue::Int(i) => toml::Value::Integer(*i),
+        SettingValue::Float(f) => toml::Value::Float(*f as f64),
+        SettingValue::Text(s) => toml::Value::String(s.clone()),
+    }
+}
+
+/// 登録済みの機能が宣言した設定を [`SettingDef`] の形で返す。
+///
+/// [`crate::feature::REGISTRY`] の並び順 = 機能の登録順 → 宣言順。
+/// 1 度だけ組んで `'static` として貸すので、設定画面は組み込みの設定と
+/// **同じ型で**扱える (専用の描画コードが要らない)。
+pub fn feature_setting_defs() -> &'static [SettingDef] {
+    static DEFS: std::sync::OnceLock<Vec<SettingDef>> = std::sync::OnceLock::new();
+    DEFS.get_or_init(|| {
+        let mut v: Vec<SettingDef> = Vec::new();
+        for f in crate::feature::REGISTRY {
+            for s in f.settings {
+                v.push(SettingDef {
+                    key: s.key,
+                    group: G_FEATURE,
+                    label: s.label,
+                    kind: feature_kind(s),
+                });
+            }
+        }
+        v
+    })
+    .as_slice()
+}
+
+/// 組み込みの設定 ([`setting_defs`]) + 機能が宣言した設定
+/// ([`feature_setting_defs`])。
+///
+/// 設定画面が見るのはこちら。**機能の設定が「自動で出る」のはこの 1 行のため**で、
+/// 機能を足す側は `setting_defs()` にも `settings_rows()` にも触らない。
+pub fn all_setting_defs() -> &'static [SettingDef] {
+    static ALL: std::sync::OnceLock<Vec<SettingDef>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut v = setting_defs().to_vec();
+        v.extend_from_slice(feature_setting_defs());
+        v
+    })
+    .as_slice()
+}
+
+/// 設定画面へ機能の設定を出すための**純粋なデータ** 1 行分。
+///
+/// 描画は `app.rs` の担当 — ここが返すのは値だけで、egui には触らない。
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeatureSettingRow {
+    /// `"<module>.<name>"` の安定キー。config.toml の `[features]` にも載る。
+    pub key: &'static str,
+    /// 画面上の項目名 (**日本語の原文**。表示時に `tr` を通すこと)。
+    pub label: &'static str,
+    /// 補足説明。空のことがある (機能側が省ける宣言なので)。
+    pub help: &'static str,
+    /// いまの値。値が無い / 型が違うときは既定と同じ値になる。
+    pub value: SettingValue,
+    /// 出荷時の値。「既定へ戻す」と変更マーカーの基準。
+    pub default: SettingValue,
+}
+
+impl FeatureSettingRow {
+    /// 既定から変えられているか (VS Code の `@modified` 相当)。
+    ///
+    /// **既定と同じ値に戻したら false**。「一度触ったから」ではない。
+    // 設定画面の共通経路は `is_setting_modified` を通るので、こちらは
+    // 専用パネルを作るとき用。現在はテストからのみ参照。
+    #[allow(dead_code)]
+    pub fn is_modified(&self) -> bool {
+        self.value != self.default
+    }
+}
+
+/// 登録済みの機能が宣言した設定を `(key, label, help, 現在値, 既定値)` で返す。
+///
+/// **機能の設定は既に設定画面 (⚙) に出ている** — [`all_setting_defs`] が
+/// 組み込みの設定と同じ形で並べるので、`app.rs` に描画コードは要らない。
+/// こちらは「機能の設定だけを別のパネルに出したい」ときの入口で、
+/// 列幅は [`settings_columns`] が可用幅から決めるので値だけを返す。
+/// 並びはレジストリの登録順 (= 宣言順) で、**使用頻度で並べ替えない**。
+///
+/// 現在は `app.rs` に呼び出し口が無く、テストからのみ参照している。
+#[allow(dead_code)]
+pub fn feature_setting_rows(cfg: &Config) -> Vec<FeatureSettingRow> {
+    let mut out = Vec::new();
+    for f in crate::feature::REGISTRY {
+        for s in f.settings {
+            let default = feature_default_value(s);
+            let value = feature_value(cfg, s.key).unwrap_or_else(|| default.clone());
+            out.push(FeatureSettingRow {
+                key: s.key,
+                label: s.label,
+                help: s.help,
+                value,
+                default,
+            });
+        }
+    }
+    out
+}
+
+/// 機能の設定の現在値を [`SettingValue`] で読む。宣言が無ければ `None`。
+///
+/// 型は**宣言が決める** — 保存されている値の型ではない。設定ファイルに
+/// 型違いが書かれていても、画面には宣言どおりのウィジェットが出る。
+fn feature_value(cfg: &Config, key: &str) -> Option<SettingValue> {
+    let s = feature_setting(key)?;
+    Some(match s.default {
+        crate::feature::SettingValue::Bool(_) => SettingValue::Bool(cfg.feature_bool(key)),
+        crate::feature::SettingValue::Int(_) => SettingValue::Int(cfg.feature_i64(key)),
+        crate::feature::SettingValue::Float(_) => SettingValue::Float(cfg.feature_f64(key) as f32),
+        crate::feature::SettingValue::Text(_) => SettingValue::Text(cfg.feature_str(key)),
+    })
+}
+
+// ── 値の解決 (純粋関数) ─────────────────────────────────────────────
+//
+// レジストリを引く部分と値を決める部分を分けてある。**値の決め方だけを
+// 表で検査できる**ようにするためで、レジストリが空でも
+// 「値なし / 型違い / 宣言なし」の全組み合わせをテストできる。
+
+/// 保存値と宣言から bool を決める。**どの組み合わせでも panic しない**。
+///
+/// 保存値 (型が合うとき) → 宣言された既定 → 型の既定 (`false`) の順。
+fn value_bool(stored: Option<&toml::Value>, decl: Option<&crate::feature::Setting>) -> bool {
+    if let Some(toml::Value::Boolean(b)) = stored {
+        return *b;
+    }
+    match decl.map(|s| s.default) {
+        Some(crate::feature::SettingValue::Bool(b)) => b,
+        _ => false,
+    }
+}
+
+/// 保存値と宣言から整数を決める。型の既定は `0`。
+fn value_i64(stored: Option<&toml::Value>, decl: Option<&crate::feature::Setting>) -> i64 {
+    if let Some(toml::Value::Integer(i)) = stored {
+        return *i;
+    }
+    match decl.map(|s| s.default) {
+        Some(crate::feature::SettingValue::Int(i)) => i,
+        _ => 0,
+    }
+}
+
+/// 保存値と宣言から実数を決める。型の既定は `0.0`。
+///
+/// **整数リテラルも受ける** — TOML は `0.5` を float、`1` を integer にする
+/// ので、手書きで `"mymod.ratio" = 1` と書いた瞬間に既定へ落ちると
+/// 「書いたのに効かない」になる。
+fn value_f64(stored: Option<&toml::Value>, decl: Option<&crate::feature::Setting>) -> f64 {
+    match stored {
+        Some(toml::Value::Float(f)) => return *f,
+        Some(toml::Value::Integer(i)) => return *i as f64,
+        _ => {}
+    }
+    match decl.map(|s| s.default) {
+        Some(crate::feature::SettingValue::Float(f)) => f,
+        Some(crate::feature::SettingValue::Int(i)) => i as f64,
+        _ => 0.0,
+    }
+}
+
+/// 保存値と宣言から文字列を決める。型の既定は空文字。
+fn value_str(stored: Option<&toml::Value>, decl: Option<&crate::feature::Setting>) -> String {
+    if let Some(toml::Value::String(s)) = stored {
+        return s.clone();
+    }
+    match decl.map(|s| s.default) {
+        Some(crate::feature::SettingValue::Text(t)) => t.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 書こうとしている値が宣言された型と一致するか。
+fn value_matches_decl(v: &SettingValue, decl: &crate::feature::Setting) -> bool {
+    matches!(
+        (v, decl.default),
+        (SettingValue::Bool(_), crate::feature::SettingValue::Bool(_))
+            | (SettingValue::Int(_), crate::feature::SettingValue::Int(_))
+            | (
+                SettingValue::Float(_),
+                crate::feature::SettingValue::Float(_)
+            )
+            | (SettingValue::Text(_), crate::feature::SettingValue::Text(_))
+    )
+}
+
+impl Config {
+    /// 機能の設定を bool で読む。
+    ///
+    /// **値が無い / 型が違う / 宣言が無い、のどれでも panic しない。**
+    /// 保存値 → 宣言された既定 → 型の既定 (`false`) の順に落ちる。
+    /// 落ちる先を宣言に置くのが要点で、設定ファイルを手で壊されても
+    /// 機能は「出荷時の挙動」で動き続ける。
+    pub fn feature_bool(&self, key: &str) -> bool {
+        value_bool(self.extra.get(key), feature_setting(key))
+    }
+
+    /// 機能の設定を整数で読む。落ち方は [`Config::feature_bool`] と同じ
+    /// (型の既定は `0`)。
+    pub fn feature_i64(&self, key: &str) -> i64 {
+        value_i64(self.extra.get(key), feature_setting(key))
+    }
+
+    /// 機能の設定を実数で読む。落ち方は [`Config::feature_bool`] と同じ
+    /// (型の既定は `0.0`)。整数リテラルも受ける。
+    pub fn feature_f64(&self, key: &str) -> f64 {
+        value_f64(self.extra.get(key), feature_setting(key))
+    }
+
+    /// 機能の設定を文字列で読む。落ち方は [`Config::feature_bool`] と同じ
+    /// (型の既定は空文字)。
+    pub fn feature_str(&self, key: &str) -> String {
+        value_str(self.extra.get(key), feature_setting(key))
+    }
+
+    /// 機能の設定を書く。書けたら `true`。
+    ///
+    /// * 宣言があるキーは**宣言された型と一致するときだけ**書く
+    ///   (型違いを入れると読み出しが既定へ落ちて「設定したのに効かない」になる)。
+    /// * 宣言の無いキーはそのまま受け入れる — 新しい版が足した設定を
+    ///   古い版が握り潰さないため。
+    ///
+    /// **config.toml への書き戻しは別**。永続化するなら
+    /// [`save_settings`] にこのキーと [`SettingValue::to_toml`] を渡す
+    /// (点を含むキーは自動で `[features]` 区画へ入る)。
+    pub fn set_feature(&mut self, key: &str, v: SettingValue) -> bool {
+        if let Some(s) = feature_setting(key) {
+            if !value_matches_decl(&v, s) {
+                return false;
+            }
+        }
+        self.extra.insert(key.to_string(), feature_toml_value(&v));
+        true
+    }
+}
+
 // ── 説明文は DEFAULT_CONFIG のコメントが唯一の出どころ ──────────────
 
 /// キー → 説明文。[`DEFAULT_CONFIG`] のコメントから 1 度だけ組む。
 pub fn setting_doc(key: &str) -> String {
+    // 機能の設定はテンプレートに書きようが無い (機能側のファイルにしか
+    // 存在しない) ので、宣言の `help` が唯一の出どころ。
+    if let Some(s) = feature_setting(key) {
+        return s.help.to_string();
+    }
     static DOCS: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
     DOCS.get_or_init(|| template_docs(DEFAULT_CONFIG))
         .get(key)
@@ -3220,6 +3595,9 @@ fn named_doc(block: &[String], key: &str) -> Option<String> {
 /// **触るのは渡されたキーの行だけ。** 手書きのコメントも、GUI が知らない
 /// 設定も、`[keybindings]` などのセクションも 1 行も消さない
 /// (`save_keybindings` / `save_plugins_section` と同じ作法)。
+/// 機能の設定 (`<module>.<name>`) も同じ入口で受ける。**点を含むキーは
+/// `[features]` 区画へ回す** — トップレベルへ `mymod.flag = true` と書くと
+/// TOML の**ドット付きキー**になり、`[features]` からは二度と読めない。
 pub fn save_settings(values: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
     if values.is_empty() {
         return Ok(());
@@ -3227,11 +3605,38 @@ pub fn save_settings(values: &std::collections::BTreeMap<String, String>) -> Res
     let path = config_path();
     ensure_default();
     let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = rewrite_scalar_settings(&raw, values);
+    let updated = rewrite_settings(&raw, values);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     std::fs::write(&path, updated).map_err(|e| format!("config.toml を書けません: {e}"))
+}
+
+/// [`save_settings`] のうち**ファイルに触らない部分**。
+///
+/// 点を含むキー = 機能の設定 → `[features]` 区画。
+/// 点を含まないキー = 組み込みの設定 → トップレベル。
+/// 分けているのは、トップレベルへ `mymod.flag = true` と書くと TOML の
+/// **ドット付きキー** (= `[mymod]` テーブル) になり、`[features]` からは
+/// 二度と読めなくなるため。
+fn rewrite_settings(raw: &str, values: &std::collections::BTreeMap<String, String>) -> String {
+    let mut top: std::collections::BTreeMap<String, String> = Default::default();
+    let mut feat: std::collections::BTreeMap<String, String> = Default::default();
+    for (k, v) in values {
+        if k.contains('.') {
+            feat.insert(k.clone(), v.clone());
+        } else {
+            top.insert(k.clone(), v.clone());
+        }
+    }
+    let mut out = raw.to_string();
+    if !top.is_empty() {
+        out = rewrite_scalar_settings(&out, &top);
+    }
+    if !feat.is_empty() {
+        out = rewrite_features_section(&out, &feat);
+    }
+    out
 }
 
 /// トップレベルの単純値を差し替えた文字列を返す。
@@ -3279,6 +3684,106 @@ fn rewrite_scalar_settings(
         let mut block = add;
         block.push(String::new());
         out.splice(at..at, block);
+    }
+    let mut text = out.join("\n");
+    while text.ends_with("\n\n") {
+        text.pop();
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// `"<key>" = …` の引用符付きキーを取り出す。
+///
+/// `[features]` のキーは `<module>.<name>` で**必ず点を含む**ので、TOML では
+/// 引用符付きでしか 1 つのキーにならない (裸で書くと入れ子テーブルになる)。
+/// エスケープは扱わない — キーに `"` や `\` は入らない。
+fn quoted_key_of(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let (key, after) = rest.split_at(end);
+    // `"…"` の直後は `=` でなければ代入行ではない
+    after.get(1..)?.trim_start().strip_prefix('=')?;
+    Some(key)
+}
+
+/// `[features]` 区画の**渡されたキーの行だけ**を差し替えた文字列を返す。
+///
+/// [`rewrite_scalar_settings`] / [`rewrite_keybindings_section`] と同じ作法で、
+/// **手書きのコメントも、この版が知らない設定も 1 行も消さない**。
+/// 区画ごと組み直す方式にすると、新しい版が足した設定を古い版で 1 度
+/// 起動しただけで消してしまう (それを避けるのがこの関数の存在理由)。
+///
+/// - 区画の中に同じキーの行があれば、その行だけを置き換える
+/// - 無ければ区画の末尾へ足す
+/// - 区画そのものが無ければファイルの末尾に作る
+fn rewrite_features_section(
+    raw: &str,
+    values: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let src = raw.replace("\r\n", "\n");
+    let mut out: Vec<String> = Vec::new();
+    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut in_section = false;
+    // 追記位置 = `[features]` 区画の最後の行の直後 (末尾の空行より前)
+    let mut insert_at: Option<usize> = None;
+    // 末尾の空行を除いた長さ (次の見出しとの間の空行を潰さないため)
+    let tail = |o: &Vec<String>| {
+        let mut at = o.len();
+        while at > 0 && o[at - 1].trim().is_empty() {
+            at -= 1;
+        }
+        at
+    };
+
+    for line in src.lines() {
+        let t = line.trim();
+        // `# [features]` のようなコメント行は見出しではない
+        // (既定テンプレートが持ち得るので、誤認すると以降が丸ごと迷子になる)
+        let is_header = t.starts_with('[') && t.ends_with(']');
+        if is_header {
+            if in_section && insert_at.is_none() {
+                insert_at = Some(tail(&out));
+            }
+            in_section = t.trim_start_matches('[').trim_end_matches(']').trim() == "features";
+        } else if in_section && !t.starts_with('#') {
+            if let Some(k) = quoted_key_of(t) {
+                if let Some(v) = values.get(k) {
+                    out.push(format!("{} = {v}", toml::Value::String(k.to_string())));
+                    done.insert(k.to_string());
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    if in_section && insert_at.is_none() {
+        insert_at = Some(tail(&out));
+    }
+
+    let add: Vec<String> = values
+        .iter()
+        .filter(|(k, _)| !done.contains(k.as_str()))
+        .map(|(k, v)| format!("{} = {v}", toml::Value::String(k.clone())))
+        .collect();
+    if !add.is_empty() {
+        match insert_at {
+            Some(at) => {
+                out.splice(at..at, add);
+            }
+            None => {
+                while out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+                    out.pop();
+                }
+                if !out.is_empty() {
+                    out.push(String::new());
+                }
+                out.push("[features]".to_string());
+                out.extend(add);
+            }
+        }
     }
     let mut text = out.join("\n");
     while text.ends_with("\n\n") {
@@ -3506,7 +4011,8 @@ mod tests {
     fn 設定の検索はあいまい一致で拾う() {
         let cfg = Config::default();
         let all = settings_rows(&cfg, "", false);
-        assert_eq!(all.len(), setting_defs().len(), "空クエリで全部出ない");
+        // 組み込み + 機能が宣言した設定。機能が 0 個でも成り立つ。
+        assert_eq!(all.len(), all_setting_defs().len(), "空クエリで全部出ない");
         let hit = settings_rows(&cfg, "hotexit", false);
         assert!(
             hit.iter().any(|d| d.key == "hot_exit"),
@@ -5665,5 +6171,397 @@ cache_read = 10.0
             again.pricing.lookup("my-model").map(|m| m.input),
             Some(100.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod feature_settings_tests {
+    use super::*;
+    use crate::feature::{Setting, SettingValue as Decl};
+
+    /// テスト用の宣言。**レジストリが空でも**値の決め方を表で検査するために、
+    /// `feature::REGISTRY` ではなく手で組んだ宣言を純粋関数へ渡す。
+    const fn decl(key: &'static str, default: Decl) -> Setting {
+        Setting {
+            key,
+            label: "テスト設定",
+            help: "テストの説明",
+            default,
+        }
+    }
+
+    // ── 番人 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn 機能の設定キーはモジュール接頭辞付きで一意() {
+        // これが無いと、2 つのブランチが偶然同じキーを選んだときに
+        // 片方の設定が静かに死ぬ (先に登録されたほうが勝つ)。
+        let mut seen: Vec<&str> = Vec::new();
+        for f in crate::feature::REGISTRY {
+            for s in f.settings {
+                let prefix = format!("{}.", f.module);
+                assert!(
+                    s.key.starts_with(&prefix) && s.key.len() > prefix.len(),
+                    "設定キー {:?} は {:?} で始めること (接頭辞が衝突回避の要)",
+                    s.key,
+                    prefix
+                );
+                assert!(
+                    !seen.contains(&s.key),
+                    "設定キーが重複している: {:?}",
+                    s.key
+                );
+                seen.push(s.key);
+                assert!(!s.label.trim().is_empty(), "{:?} のラベルが空", s.key);
+                assert!(
+                    setting_defs().iter().all(|d| d.key != s.key),
+                    "{:?} が組み込みの設定と衝突している",
+                    s.key
+                );
+            }
+        }
+    }
+
+    // ── 後方互換 / 未知のキー ─────────────────────────────────────
+
+    #[test]
+    fn features区画の無い古いconfigでも読める() {
+        let cfg: Config = toml::from_str("theme = \"zaivern-light\"\nword_wrap = true\n")
+            .expect("features を持たない config.toml が読めない");
+        assert_eq!(cfg.theme, "zaivern-light");
+        assert!(cfg.word_wrap);
+        assert!(cfg.extra.is_empty(), "無い区画を勝手に埋めている");
+        // 出荷時のテンプレートもそのまま読める
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("既定テンプレートが読めない");
+        assert!(cfg.extra.is_empty());
+    }
+
+    #[test]
+    fn 機能設定の未知のキーは読み書きしても消えない() {
+        // 「新しい版が足した設定を、古い版で 1 度起動しただけで消す」事故を防ぐ。
+        let raw = r#"
+theme = "zaivern-dark"
+
+[features]
+"whichkey.delay_ms" = 300
+"みらいの機能.flag" = true
+"#;
+        let cfg: Config = toml::from_str(raw).expect("[features] を持つ config が読めない");
+        assert_eq!(cfg.extra.len(), 2);
+        assert_eq!(cfg.feature_i64("whichkey.delay_ms"), 300);
+        assert!(cfg.feature_bool("みらいの機能.flag"));
+        // 往復 (読み → 書き → 読み) で 1 つも落ちない
+        let back = toml::to_string(&cfg).expect("Config を書けない");
+        let again: Config = toml::from_str(&back).expect("書いたものを読み直せない");
+        assert_eq!(again.extra, cfg.extra, "往復で未知のキーが消えた");
+    }
+
+    #[test]
+    fn 機能設定の書き戻しは知らないキーもコメントも消さない() {
+        let raw = concat!(
+            "theme = \"zaivern-dark\"\n",
+            "\n",
+            "[features]\n",
+            "# 手書きのコメント\n",
+            "\"whichkey.delay_ms\" = 300\n",
+            "\"みらいの機能.flag\" = true\n",
+            "\n",
+            "[keybindings]\n",
+            "palette = \"⌘K\"\n",
+        );
+        let mut vals: std::collections::BTreeMap<String, String> = Default::default();
+        vals.insert("whichkey.delay_ms".into(), "500".into());
+        let out = rewrite_features_section(raw, &vals);
+        assert!(
+            out.contains("\"whichkey.delay_ms\" = 500"),
+            "対象の行が置き換わっていない:\n{out}"
+        );
+        assert!(
+            out.contains("\"みらいの機能.flag\" = true"),
+            "この版が知らないキーが消えた:\n{out}"
+        );
+        assert!(out.contains("# 手書きのコメント"), "コメントが消えた");
+        assert!(out.contains("[keybindings]"), "他の区画が消えた");
+        // 何度書いても同じ (べき等)
+        assert_eq!(rewrite_features_section(&out, &vals), out);
+        let cfg: Config = toml::from_str(&out).expect("書き戻した結果が読めない");
+        assert_eq!(cfg.feature_i64("whichkey.delay_ms"), 500);
+        assert!(cfg.feature_bool("みらいの機能.flag"));
+    }
+
+    #[test]
+    fn features区画が無ければ末尾に作る() {
+        let mut vals: std::collections::BTreeMap<String, String> = Default::default();
+        vals.insert("mymod.on".into(), "true".into());
+        let out = rewrite_features_section("theme = \"zaivern-dark\"\n", &vals);
+        assert!(out.contains("[features]"), "区画が作られていない:\n{out}");
+        let cfg: Config = toml::from_str(&out).expect("作った区画が読めない");
+        assert!(cfg.feature_bool("mymod.on"));
+        // 空のファイルからでも壊れない
+        let out = rewrite_features_section("", &vals);
+        let cfg: Config = toml::from_str(&out).expect("空から作った区画が読めない");
+        assert!(cfg.feature_bool("mymod.on"));
+    }
+
+    #[test]
+    fn 書き戻しは点付きのキーだけをfeatures区画へ回す() {
+        // トップレベルへ `mymod.delay_ms = …` と書くと TOML の**ドット付きキー**
+        // (= `[mymod]` テーブル) になり、`[features]` からは二度と読めない。
+        let mut vals: std::collections::BTreeMap<String, String> = Default::default();
+        vals.insert("word_wrap".into(), "true".into());
+        vals.insert("mymod.delay_ms".into(), "300".into());
+        let out = rewrite_settings("theme = \"zaivern-dark\"\n", &vals);
+        let cfg: Config = toml::from_str(&out).expect("書き戻した結果が読めない");
+        assert!(cfg.word_wrap, "組み込みの設定が効いていない");
+        assert!(
+            cfg.extra.contains_key("mymod.delay_ms"),
+            "機能の設定が [features] に入っていない:\n{out}"
+        );
+        assert_eq!(cfg.feature_i64("mymod.delay_ms"), 300);
+    }
+
+    #[test]
+    fn 引用符付きキーの取り出しは代入行だけを拾う() {
+        assert_eq!(quoted_key_of("\"a.b\" = 1"), Some("a.b"));
+        assert_eq!(quoted_key_of("  \"a.b\"   =   1  "), Some("a.b"));
+        // 裸のキーは別物 (TOML では入れ子テーブルになる)
+        assert_eq!(quoted_key_of("a.b = 1"), None);
+        // 代入ではない / 閉じていない / 空 — どれも panic しない
+        assert_eq!(quoted_key_of("\"a.b\""), None);
+        assert_eq!(quoted_key_of("\"a.b\" x = 1"), None);
+        assert_eq!(quoted_key_of("\""), None);
+        assert_eq!(quoted_key_of(""), None);
+        assert_eq!(quoted_key_of("# \"a.b\" = 1"), None);
+    }
+
+    // ── 値の解決 (既定へ落ちる / panic しない) ───────────────────
+
+    #[test]
+    fn 機能の設定は値なし型違い宣言なしでも既定へ落ちる() {
+        let b = decl("t.b", Decl::Bool(true));
+        let i = decl("t.i", Decl::Int(7));
+        let f = decl("t.f", Decl::Float(1.5));
+        let s = decl("t.s", Decl::Text("既定の文字列"));
+        let wrong = toml::Value::String("ちがう型".into());
+
+        // 値が無い → 宣言された既定
+        assert!(value_bool(None, Some(&b)));
+        assert_eq!(value_i64(None, Some(&i)), 7);
+        assert_eq!(value_f64(None, Some(&f)), 1.5);
+        assert_eq!(value_str(None, Some(&s)), "既定の文字列");
+
+        // 型が違う → 宣言された既定 (panic しない)
+        assert!(value_bool(Some(&wrong), Some(&b)));
+        assert_eq!(value_i64(Some(&wrong), Some(&i)), 7);
+        assert_eq!(value_f64(Some(&wrong), Some(&f)), 1.5);
+        assert_eq!(
+            value_str(Some(&toml::Value::Integer(1)), Some(&s)),
+            "既定の文字列"
+        );
+        assert_eq!(value_i64(Some(&toml::Value::Float(1.5)), Some(&i)), 7);
+
+        // 宣言が無い → 型の既定
+        assert!(!value_bool(None, None));
+        assert_eq!(value_i64(None, None), 0);
+        assert_eq!(value_f64(None, None), 0.0);
+        assert_eq!(value_str(None, None), "");
+        assert!(!value_bool(Some(&wrong), None));
+        assert_eq!(value_f64(Some(&wrong), None), 0.0);
+
+        // 型が合う保存値は宣言より優先
+        assert!(!value_bool(Some(&toml::Value::Boolean(false)), Some(&b)));
+        assert_eq!(value_i64(Some(&toml::Value::Integer(9)), Some(&i)), 9);
+        assert_eq!(
+            value_str(Some(&toml::Value::String("上書き".into())), Some(&s)),
+            "上書き"
+        );
+        // float は整数リテラルも受ける (手書きの `= 2` を黙って捨てない)
+        assert_eq!(value_f64(Some(&toml::Value::Integer(2)), Some(&f)), 2.0);
+        // int の宣言でも float の既定を持てないので 0 ではなく宣言値へ
+        assert_eq!(value_f64(None, Some(&i)), 7.0);
+    }
+
+    #[test]
+    fn 未宣言の機能設定を読み書きしてもpanicしない() {
+        let mut cfg = Config::default();
+        assert!(!cfg.feature_bool("だれも.宣言していない"));
+        assert_eq!(cfg.feature_i64("だれも.宣言していない"), 0);
+        assert_eq!(cfg.feature_f64(""), 0.0);
+        assert_eq!(cfg.feature_str("."), "");
+        // 未宣言でも書ける (新しい版が足した設定を握り潰さないため)
+        assert!(cfg.set_feature("みらいの機能.flag", SettingValue::Bool(true)));
+        assert!(cfg.feature_bool("みらいの機能.flag"));
+        // 組み込みの設定の口からは未宣言のキーは通らない (打ち間違いを通さない)
+        assert!(!set_setting_value(
+            &mut cfg,
+            "みらいの機能.flag2",
+            &SettingValue::Bool(true)
+        ));
+        assert!(!cfg.extra.contains_key("みらいの機能.flag2"));
+    }
+
+    #[test]
+    fn 機能の設定は宣言と型が違えば書かない() {
+        let b = decl("t.b", Decl::Bool(true));
+        let s = decl("t.s", Decl::Text("あ"));
+        assert!(value_matches_decl(&SettingValue::Bool(false), &b));
+        assert!(!value_matches_decl(&SettingValue::Int(1), &b));
+        assert!(!value_matches_decl(&SettingValue::Text("1".into()), &b));
+        assert!(value_matches_decl(&SettingValue::Text("い".into()), &s));
+        assert!(!value_matches_decl(&SettingValue::Float(1.0), &s));
+    }
+
+    #[test]
+    fn 宣言の型から設定画面のウィジェットが決まる() {
+        assert_eq!(
+            feature_kind(&decl("t.b", Decl::Bool(false))),
+            SettingKind::Bool
+        );
+        assert!(matches!(
+            feature_kind(&decl("t.i", Decl::Int(0))),
+            SettingKind::Int { .. }
+        ));
+        assert!(matches!(
+            feature_kind(&decl("t.f", Decl::Float(0.0))),
+            SettingKind::Float { .. }
+        ));
+        assert_eq!(
+            feature_kind(&decl("t.s", Decl::Text(""))),
+            SettingKind::Text
+        );
+        assert_eq!(
+            feature_default_value(&decl("t.s", Decl::Text("あ"))),
+            SettingValue::Text("あ".into())
+        );
+        assert_eq!(
+            feature_default_value(&decl("t.i", Decl::Int(3))),
+            SettingValue::Int(3)
+        );
+    }
+
+    // ── 設定画面へ出すデータ ──────────────────────────────────────
+
+    #[test]
+    fn 機能の設定は設定画面の共通経路に全部乗る() {
+        let cfg = Config::default();
+        let rows = feature_setting_rows(&cfg);
+        assert_eq!(rows.len(), feature_setting_defs().len());
+        assert_eq!(
+            all_setting_defs().len(),
+            setting_defs().len() + rows.len(),
+            "組み込みと機能の設定の件数が合わない"
+        );
+        for r in &rows {
+            // 出荷時は「変更なし」から始まる
+            assert!(!r.is_modified(), "{} が最初から変更扱い", r.key);
+            // 設定画面が使う共通経路 (現在値 / 既定 / 説明 / 一覧) が全部引ける
+            assert_eq!(setting_value(&cfg, r.key).as_ref(), Some(&r.value));
+            assert_eq!(setting_default(r.key).as_ref(), Some(&r.default));
+            assert_eq!(setting_doc(r.key), r.help);
+            assert!(!is_setting_modified(&cfg, r.key));
+            assert!(
+                settings_rows(&cfg, "", false)
+                    .iter()
+                    .any(|d| d.key == r.key),
+                "{} が設定画面の一覧に出ない",
+                r.key
+            );
+        }
+        // 組み込みの設定は機能の設定に混ざらない
+        assert!(rows.iter().all(|r| r.key.contains('.')));
+    }
+
+    #[test]
+    fn 機能の設定は設定画面から変えて既定へ戻せる() {
+        // 宣言が無くても通る経路 (set_feature) で往復を確認する。
+        // 宣言のある往復は上の `機能の設定は設定画面の共通経路に全部乗る` が
+        // レジストリの実物で押さえる。
+        let mut cfg = Config::default();
+        assert!(cfg.set_feature("mymod.count", SettingValue::Int(5)));
+        assert_eq!(cfg.feature_i64("mymod.count"), 5);
+        assert!(cfg.set_feature("mymod.count", SettingValue::Int(0)));
+        assert_eq!(cfg.feature_i64("mymod.count"), 0);
+        // 書いた値はそのまま config.toml のリテラルになる
+        let mut vals: std::collections::BTreeMap<String, String> = Default::default();
+        vals.insert("mymod.count".into(), SettingValue::Int(5).to_toml());
+        let out = rewrite_settings("", &vals);
+        let back: Config = toml::from_str(&out).expect("書いたものが読めない");
+        assert_eq!(back.feature_i64("mymod.count"), 5);
+    }
+}
+
+#[cfg(test)]
+mod feature_settings_registry_tests {
+    use super::*;
+
+    /// 実際に登録されている機能の設定を、設定画面と同じ経路で往復させる。
+    ///
+    /// `feature_settings_tests` が手で組んだ宣言で「値の決め方」を押さえるのに対し、
+    /// こちらは **`feature::REGISTRY` の実物**で
+    /// 「設定画面で変える → config.toml へ書く → 読み直す」を通す。
+    /// 設定を持つ機能が 1 つも無いうちは何も検査しないが、
+    /// 機能が足された瞬間に**その機能を 1 行も書かずに**検査が始まる。
+    #[test]
+    fn 登録済みの機能の設定は設定画面から変えて書いて読み直せる() {
+        let mut cfg = Config::default();
+        let rows = feature_setting_rows(&cfg);
+        let mut vals: std::collections::BTreeMap<String, String> = Default::default();
+        for r in &rows {
+            // 既定と必ず違う値を作る (型ごとに 1 段ずらす)
+            let changed = match &r.default {
+                SettingValue::Bool(b) => SettingValue::Bool(!b),
+                SettingValue::Int(i) => SettingValue::Int(i.wrapping_add(1)),
+                SettingValue::Float(f) => SettingValue::Float(f + 1.0),
+                SettingValue::Text(s) => SettingValue::Text(format!("{s}x")),
+            };
+            assert!(
+                set_setting_value(&mut cfg, r.key, &changed),
+                "{} を設定画面の経路で書けない",
+                r.key
+            );
+            assert_eq!(setting_value(&cfg, r.key).as_ref(), Some(&changed));
+            assert!(
+                is_setting_modified(&cfg, r.key),
+                "{} が変更扱いにならない",
+                r.key
+            );
+            // 型違いは弾く (弾かないと読み出しが既定へ落ちて「効かない」になる)
+            let wrong = match &r.default {
+                SettingValue::Bool(_) => SettingValue::Int(1),
+                _ => SettingValue::Bool(true),
+            };
+            assert!(
+                !set_setting_value(&mut cfg, r.key, &wrong),
+                "{} が型違いを受け入れた",
+                r.key
+            );
+            assert_eq!(setting_value(&cfg, r.key).as_ref(), Some(&changed));
+            vals.insert(r.key.to_string(), changed.to_toml());
+        }
+        if vals.is_empty() {
+            return;
+        }
+        // config.toml へ書いて読み直しても同じ値
+        let text = rewrite_settings("", &vals);
+        let back: Config = toml::from_str(&text).expect("書き出した config.toml が読めない");
+        for r in &rows {
+            assert_eq!(
+                setting_value(&back, r.key),
+                setting_value(&cfg, r.key),
+                "{} が往復で変わった:\n{text}",
+                r.key
+            );
+            assert!(
+                is_setting_modified(&back, r.key),
+                "{} の変更が残らない",
+                r.key
+            );
+        }
+        // 既定へ戻すと `@modified` から外れる
+        for r in &rows {
+            let def = setting_default(r.key).expect("既定が引けない");
+            assert!(set_setting_value(&mut cfg, r.key, &def));
+            assert!(!is_setting_modified(&cfg, r.key), "{} が戻らない", r.key);
+        }
     }
 }

@@ -1085,24 +1085,51 @@ const FISH_SHIM: &str = r#"# Zaivern Code — fish シェル統合 (OSC 633)。�
 # `fish -l -C 'source <このファイル>'` から読まれる。
 
 if set -q ZAIVERN_SHELL_INTEGRATION
-	exit 0
+	# source を途中で止めるのは `return`。`exit` は「fish 自体を終わらせる」
+	# 側の語なので、版によって扱いが揺れる場所に賭けない。
+	return 0
 end
 
-# 二重発行の門番。fish の config.fish は -C の**後**に読まれるので、
-# 判定は最初のプロンプトまで遅らせる (--on-event fish_prompt の中で見る)。
+# ── 二重発行の門番 (その 1: 環境変数) ───────────────────────────
+# `-C` は config.fish の**後**に評価される (fish 3.7.1 で実測)。つまり
+# ここでは既に本人の設定が済んでいるので、環境変数は確実に見える。
+# bash / zsh のシムと同じ顔ぶれを見る (fish 版の iTerm2 統合も同じ印を立てる)。
+if test -n "$ITERM_SHELL_INTEGRATION_INSTALLED$KITTY_SHELL_INTEGRATION$VSCODE_SHELL_INTEGRATION$WEZTERM_SHELL_INTEGRATION"
+	set -g ZAIVERN_SHELL_INTEGRATION external
+	return 0
+end
+
 set -g ZAIVERN_SHELL_INTEGRATION 1
 set -g __zv_wrapped 0
 
+# OSC 633 の値エスケープ。
+#
+# fish の command substitution は**改行で分割する**ので、素朴に
+# `set s (string replace … $value)` と書くと改行がその場で消える。
+# 実測: `for i in 1 2` / `echo $i` / `end` の 3 行が `for i in 1 2echo $iend`
+# という 1 行に潰れ、`\n` → `\x0a` の置換は**一度も効かない**。
+# 先に 1 行ずつへ割り、各行を逃がしてから `\x0a` で繋ぎ直すのが、
+# fish で改行を落とさない順序。
+#
+# 引数を必ず引用符で囲むのも要点 — 空リストを渡すと `string` は
+# **標準入力を読み**、対話シェルがその場で固まる。
 function __zv_escape --argument-names value
-	set -l s (string replace --all -- '\\' '\\\\' $value)
-	set s (string replace --all -- ';' '\x3b' $s)
-	set s (string replace --all -- \n '\x0a' $s)
-	set s (string replace --all -- \t '\x09' $s)
-	printf '%s' $s
+	set -l lines (string split \n -- "$value")
+	set lines (string replace --all -- '\\' '\\\\' $lines)
+	set lines (string replace --all -- ';' '\x3b' $lines)
+	set lines (string replace --all -- \r '\x0d' $lines)
+	set lines (string replace --all -- \t '\x09' $lines)
+	printf '%s' (string join '\x0a' $lines)
+end
+
+# `$status` を任意の値へ戻す最小の器。fish に `$status` への代入手段は無く、
+# 関数の `return` だけがこれを作れる。
+function __zv_status --argument-names code
+	return $code
 end
 
 function __zv_preexec --on-event fish_preexec --argument-names cmd
-	printf '\033]633;E;%s;%s\007' (__zv_escape $cmd) "$ZAIVERN_SHELL_NONCE"
+	printf '\033]633;E;%s;%s\007' (__zv_escape "$cmd") "$ZAIVERN_SHELL_NONCE"
 	printf '\033]633;C\007'
 end
 
@@ -1113,16 +1140,26 @@ end
 function __zv_install_prompt --on-event fish_prompt
 	test $__zv_wrapped -eq 1; and return
 	set -g __zv_wrapped 1
-	# 既に誰かが 133/633 を出しているなら降りる。
-	if functions -q fish_prompt; and string match -q '*133;*' -- (functions fish_prompt)
+	functions -q fish_prompt; or return
+	# ── 二重発行の門番 (その 2: プロンプト関数) ─────────────────
+	# `fish_prompt` を ~/.config/fish/functions/fish_prompt.fish へ置くと
+	# **最初に必要になるまで読み込まれない** (自動読み込み)。source した時点で
+	# 覗いても空振りするので、本文の判定はここまで遅らせる。
+	set -l src (functions fish_prompt)
+	if string match -qr '(133|633);' -- "$src"
 		set -g ZAIVERN_SHELL_INTEGRATION external
 		functions -e __zv_preexec __zv_postexec
 		return
 	end
 	functions --copy fish_prompt __zv_original_fish_prompt
 	function fish_prompt
+		# 直前の終了コードを**最初に**退避する。printf を 1 本でも先に走らせると
+		# `$status` は上書きされ、終了コードを出す本人のプロンプト
+		# (fish 既定を含む) が常に 0 を見ることになる (実測: false の直後でも 0)。
+		set -l last $status
 		printf '\033]633;P;Cwd=%s\007' (__zv_escape "$PWD")
 		printf '\033]633;A\007'
+		__zv_status $last
 		__zv_original_fish_prompt
 		printf '\033]633;B\007'
 	end
@@ -1142,6 +1179,13 @@ $env:ZAIVERN_SHELL_INTEGRATION = "1"
 $Global:__ZvNonce = $env:ZAIVERN_SHELL_NONCE
 $Global:__ZvOriginalPrompt = $function:Prompt
 $Global:__ZvFirstPrompt = $true
+# 「直前のプロンプトから今までに、実際にコマンドが走ったか」。
+# 走っていないのに `D` を出すと、素の Enter や Ctrl+C が 1 件のコマンドとして
+# 積まれる (実測: 空 Enter で `E;;<nonce>` + `C` + `D` が出ていた)。
+$Global:__ZvExecuted = $false
+# PSReadLine が無いと「走ったか」を知る手が無いので、そのときだけ
+# 「最初のプロンプト以外は毎回 D」という粗い規則へ降りる。
+$Global:__ZvHasReadLine = $false
 
 # OSC 633 の値エスケープ。`\` を先に処理する (後だと自分の `\x3b` を壊す)。
 function Global:__Zv-Escape([string] $Value) {
@@ -1159,20 +1203,31 @@ function Global:Prompt() {
 	$LastSucceeded = $?
 	$LastExit = $global:LASTEXITCODE
 	$Out = ""
-	if (-not $Global:__ZvFirstPrompt) {
+	$Ran = if ($Global:__ZvHasReadLine) { $Global:__ZvExecuted } else { -not $Global:__ZvFirstPrompt }
+	if ($Ran) {
+		# 終了コードの権威は `$?` **だけ**。`$LASTEXITCODE` はネイティブ
+		# コマンドが最後に置いた値が**そのまま残り続ける**ので、無条件に
+		# 信じると後続の成功したコマンドレットまで失敗に見える
+		# (実測: `/bin/sh -c "exit 42"` の次の `echo AFTER` まで `D;42` になり、
+		#  ラダーが「異常終了」で貼り付いた)。失敗のときだけ、より具体的な
+		# 数字として $LASTEXITCODE を採る。
 		$Code = 0
-		if ($null -ne $LastExit) { $Code = $LastExit }
-		elseif (-not $LastSucceeded) { $Code = 1 }
+		if (-not $LastSucceeded) {
+			if ($null -ne $LastExit -and $LastExit -ne 0) { $Code = $LastExit } else { $Code = 1 }
+		}
 		$Out += "$([char]0x1b)]633;D;$Code$([char]0x07)"
 	}
 	$Global:__ZvFirstPrompt = $false
+	$Global:__ZvExecuted = $false
 	$Out += "$([char]0x1b)]633;A$([char]0x07)"
 	$Cwd = __Zv-Escape (Get-Location).Path
 	$Out += "$([char]0x1b)]633;P;Cwd=$Cwd$([char]0x07)"
+	# 元の終了コードは本人のプロンプトを呼ぶ**前に**戻す。oh-my-posh /
+	# starship を含む多くのプロンプトが $LASTEXITCODE を読むので、
+	# 後回しにするとこちらの副作用を見せてしまう。
+	$global:LASTEXITCODE = $LastExit
 	$Out += $Global:__ZvOriginalPrompt.Invoke()
 	$Out += "$([char]0x1b)]633;B$([char]0x07)"
-	# 元の終了コードを戻す。ここで書き換えると `$LASTEXITCODE` が
-	# プロンプトの副作用で汚れる。
 	$global:LASTEXITCODE = $LastExit
 	return $Out
 }
@@ -1181,12 +1236,20 @@ function Global:Prompt() {
 # (PSConsoleHostReadLine) を包むのが唯一「打った行そのもの」を取れる場所。
 # 入っていなければコマンド行は分からない = 段は「基本」に留まる (それでよい)。
 if (Get-Command PSConsoleHostReadLine -ErrorAction SilentlyContinue) {
+	$Global:__ZvHasReadLine = $true
 	$Global:__ZvOriginalReadLine = $function:PSConsoleHostReadLine
 	function Global:PSConsoleHostReadLine {
 		$Line = $Global:__ZvOriginalReadLine.Invoke()
-		$Escaped = __Zv-Escape $Line
-		[Console]::Write("$([char]0x1b)]633;E;$Escaped;$($Global:__ZvNonce)$([char]0x07)")
-		[Console]::Write("$([char]0x1b)]633;C$([char]0x07)")
+		$Text = [string] $Line
+		# 空行と Ctrl+C は何も実行しない。ここで E と C を出すと
+		# 「空のコマンド」が 1 件記録される (Tracker の空 Enter 除けは
+		#  `C` が来た時点で効かなくなるので、出さないのが唯一の正解)。
+		if (-not [string]::IsNullOrWhiteSpace($Text)) {
+			$Global:__ZvExecuted = $true
+			$Escaped = __Zv-Escape $Text
+			[Console]::Write("$([char]0x1b)]633;E;$Escaped;$($Global:__ZvNonce)$([char]0x07)")
+			[Console]::Write("$([char]0x1b)]633;C$([char]0x07)")
+		}
 		return $Line
 	}
 }
@@ -1736,6 +1799,234 @@ mod tests {
         assert!(
             !BASH_SHIM.contains("declare -A"),
             "連想配列は bash 4 以降。macOS 同梱の 3.2 で落ちる"
+        );
+    }
+
+    // ── 実インタプリタで見つかった壊れ方 ─────────────────────────
+    //
+    // 以下は全部 `tools/shell-verify.sh` (Docker の fish 3.7.1 / pwsh 7.4.2) で
+    // **実際に壊れているのを見てから**書いたもの。本物の検証はあちらで、
+    // ここはインタプリタが無い環境でも再発を早く知るための網。
+
+    #[test]
+    fn シムはソースから機械的に取り出せる() {
+        // `tools/shell-verify.sh` は cargo を 1 度も呼ばずに (= ホストの
+        // `target/` を汚さずに) このファイルの raw 文字列を awk で切り出して
+        // 実インタプリタへ食わせる。切り出しの規則が崩れると、検証が
+        // **別物**を検証して「緑」を出してしまうので、ここで縛る。
+        // 改行は正規化する — Windows のチェックアウトは CRLF。
+        let src = include_str!("shellint.rs").replace("\r\n", "\n");
+        for (name, body) in [
+            ("BASH_SHIM", BASH_SHIM),
+            ("ZSH_ZSHRC", ZSH_ZSHRC),
+            ("FISH_SHIM", FISH_SHIM),
+            ("PWSH_SHIM", PWSH_SHIM),
+        ] {
+            let head = format!("const {name}: &str = r#\"");
+            let start = src
+                .find(&head)
+                .unwrap_or_else(|| panic!("{name} の宣言が awk の想定どおりに書かれていない"));
+            let rest = &src[start + head.len()..];
+            let end = rest
+                .find("\n\"#;\n")
+                .unwrap_or_else(|| panic!("{name} の終端 (\"#; だけの行) が見つからない"));
+            assert_eq!(
+                body.replace("\r\n", "\n"),
+                &rest[..end + 1],
+                "{name} の切り出し結果が const と一致しない"
+            );
+        }
+    }
+
+    #[test]
+    fn 実インタプリタで見つかった壊れ方を構造検査で留める() {
+        let fish = FISH_SHIM.replace("\r\n", "\n");
+        assert!(
+            fish.contains("ITERM_SHELL_INTEGRATION_INSTALLED"),
+            "fish の門番が環境変数を見ていない — iTerm2 の fish 統合と二重発行する"
+        );
+        assert!(
+            fish.contains("string split \\n"),
+            "先に改行で割らないと command substitution が改行を食い、\
+             複数行のコマンドが 1 行に潰れる (実測: for/echo/end が 1 行になった)"
+        );
+        assert!(
+            !fish.contains("\texit 0\n"),
+            "sourced file を止めるのは return。exit は fish 自体を終わらせる側の語"
+        );
+        assert!(
+            fish.contains("set -l last $status"),
+            "プロンプトを包む前に $status を退避しないと、\
+             終了コードを出す本人のプロンプトが常に 0 を見る"
+        );
+        let pwsh = PWSH_SHIM.replace("\r\n", "\n");
+        assert!(
+            !pwsh.contains("if ($null -ne $LastExit) { $Code = $LastExit }"),
+            "$LASTEXITCODE を無条件に信じると、ネイティブコマンドの終了コードが\
+             後続の成功したコマンドへ漏れる (実測: 42 が貼り付いた)"
+        );
+        assert!(
+            pwsh.contains("IsNullOrWhiteSpace"),
+            "空の Enter で E/C を出すと、空のコマンドが 1 件ずつ積まれる"
+        );
+    }
+
+    /// `tools/shell-verify.sh --trace` の出力 (1 行 1 マーカー) を、
+    /// BEL 終端の OSC 633 の生バイト列へ戻す。**ツールの出力をそのまま
+    /// 貼れる形**にしてあるので、記録の取り直しに書き換えが要らない。
+    fn osc633_stream(trace: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        for m in trace.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            v.extend_from_slice(b"\x1b]633;");
+            v.extend_from_slice(m.as_bytes());
+            v.push(0x07);
+        }
+        v
+    }
+
+    /// 生バイト列 → QueryScanner → Tracker という**本番と同じ経路**へ流す。
+    fn replay(trace: &str) -> Tracker {
+        let mut t = Tracker::new();
+        for (i, m) in markers(&osc633_stream(trace)).into_iter().enumerate() {
+            t.feed_at(m, i as u64 * 10);
+        }
+        t
+    }
+
+    /// fish 3.7.1 (alpine:3.21 / Docker) が実際に吐いた列。
+    /// 再取得: `tools/shell-verify.sh fish --trace`
+    ///
+    /// 読みどころ:
+    /// * 3 本目 — 複数行のコマンドが `\x0a` で 1 本の値に畳まれて届く
+    ///   (ここが壊れていた頃は `for i in 1 2echo $iend` に潰れていた)。
+    /// * 4 本目 — `;` は `\x3b` で逃がされる (素朴に切ると行が半分になる)。
+    const FISH_TRACE: &str = "\
+P;Cwd=/
+A
+B
+E;echo hello;zvtest
+C
+D;0
+P;Cwd=/
+A
+B
+E;false;zvtest
+C
+D;1
+P;Cwd=/
+A
+B
+E;for i in 1 2\\x0aecho $i\\x0aend;zvtest
+C
+D;0
+P;Cwd=/
+A
+B
+E;echo a\\x3b echo b;zvtest
+C
+D;0
+P;Cwd=/
+A
+B
+E;exit;zvtest
+C
+D;0
+";
+
+    /// PowerShell 7.4.2 (mcr.microsoft.com/powershell / Docker) が実際に吐いた列。
+    /// 再取得: `tools/shell-verify.sh pwsh --trace`
+    ///
+    /// pwsh は `A` → `P` → プロンプト → `B` の順 (fish とは A/P が逆) で、
+    /// `E` は `B` の**後** (PSConsoleHostReadLine) から出る。
+    ///
+    /// 読みどころ:
+    /// * 2 本目 — 42 の**次に成功した**コマンドが `D;0` で届く。
+    ///   `$LASTEXITCODE` を信じていた頃はここが `D;42` になり、
+    ///   ラダーが「異常終了」で永久に貼り付いた。
+    /// * 3 本目 — 素の Enter。`E` も `C` も `D` も出ない = 1 件も積まれない。
+    /// * 最後 — `exit` は `D` を待たずにシェルが落ちるので実行中のまま。
+    const PWSH_TRACE: &str = "\
+A
+P;Cwd=/
+B
+E;/bin/sh -c \"exit 42\";zvtest
+C
+D;42
+A
+P;Cwd=/
+B
+E;echo AFTER;zvtest
+C
+D;0
+A
+P;Cwd=/
+B
+A
+P;Cwd=/
+B
+E;echo two;zvtest
+C
+D;0
+A
+P;Cwd=/
+B
+E;exit;zvtest
+C
+";
+
+    #[test]
+    fn 実際のfishが出したosc633列から履歴を組み立てる() {
+        let t = replay(FISH_TRACE);
+        assert_eq!(t.tier(), Tier::Rich, "コマンド行が届いている");
+        assert_eq!(t.recorded(), 5);
+        let got: Vec<(&str, Option<i32>)> = t
+            .recent(5)
+            .into_iter()
+            .rev()
+            .map(|c| (c.command_line.as_str(), c.exit_code))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("echo hello", Some(0)),
+                ("false", Some(1)),
+                ("for i in 1 2\necho $i\nend", Some(0)),
+                ("echo a; echo b", Some(0)),
+                ("exit", Some(0)),
+            ]
+        );
+        assert!(
+            t.recent(5).iter().all(|c| c.cwd.is_some()),
+            "P;Cwd が全件へ引き継がれている"
+        );
+        // 最後は成功で終わっているので「異常終了」で貼り付かない。
+        assert_eq!(t.read(300, SHELL_STALE_MS).unwrap().state, ProtoState::Idle);
+    }
+
+    #[test]
+    fn 実際のpwshが出したosc633列から履歴を組み立てる() {
+        let t = replay(PWSH_TRACE);
+        assert_eq!(t.tier(), Tier::Rich);
+        assert_eq!(t.recorded(), 3, "空の Enter を 1 件に数えていない");
+        let got: Vec<(&str, Option<i32>)> = t
+            .recent(3)
+            .into_iter()
+            .rev()
+            .map(|c| (c.command_line.as_str(), c.exit_code))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("/bin/sh -c \"exit 42\"", Some(42)),
+                ("echo AFTER", Some(0)),
+                ("echo two", Some(0)),
+            ]
+        );
+        assert_eq!(t.running_command(), Some("exit"), "最後は実行中のまま");
+        assert_eq!(
+            t.read(300, SHELL_STALE_MS).unwrap().state,
+            ProtoState::Running,
+            "42 が後続へ貼り付いていない"
         );
     }
 
