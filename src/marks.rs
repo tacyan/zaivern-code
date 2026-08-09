@@ -1367,6 +1367,16 @@ impl Default for MarksState {
 }
 
 impl MarksState {
+    /// ワークスペースを指定して作る (起動時はこちら)。
+    ///
+    /// `Default` は保存先を知らないので 1 バイトも読み書きしない。
+    /// 起動直後から前回の印を出すには、必ずここを通すこと。
+    pub fn new(workspace: &Path) -> Self {
+        let mut s = Self::default();
+        s.set_workspace(workspace);
+        s
+    }
+
     /// 参照だけ (ガター・ミニマップ)。
     pub fn store(&self) -> &MarkStore {
         &self.store
@@ -1473,7 +1483,12 @@ impl MarksState {
     /// 毎フレームの安い見張り。**本文は走査しない** — ハッシュを比べるだけ。
     ///
     /// 変化を見つけたら [`VALIDATE_DEBOUNCE_MS`] だけ待ってから、重い差分を
-    /// バックグラウンドスレッドへ投げる。
+    /// バックグラウンドスレッドへ投げる。印の無いファイルでは即座に戻るので、
+    /// アイドル時のコストは (印のあるファイルでも) ハッシュ比較 1 回。
+    ///
+    /// 呼ぶのは**アクティブなバッファぶんだけ**。開いていないファイルの印は
+    /// そのファイルを表に出したときに追いつく (`expected_text` があるので、
+    /// 間に何度書き換えられていても全文置換の経路で拾い直せる)。
     pub fn tick(&mut self, ctx: &egui::Context, file: &Path, text_hash: u64, text: &str) {
         self.poll();
         if self.store.marks().iter().all(|m| m.file != file)

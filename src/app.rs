@@ -3973,7 +3973,7 @@ impl ZaivernApp {
             cockpit: false,
             cockpit_followed: None,
             center: CenterView::Editor,
-            marks: marks::MarksState::default(),
+            marks: marks::MarksState::new(&primary_root),
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
             deck: false,
