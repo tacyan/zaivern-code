@@ -104,6 +104,16 @@ pub enum BindAction {
     UnfoldAll,
     /// カーソル行のブックマーク切替
     ToggleBookmark,
+    /// ニーモニック (0-9 / A-Z) を選んでブックマークを付け外しする
+    /// (JetBrains の「ニーモニック付きブックマーク」)。
+    ///
+    /// ⌥⌘B (素の切替) に ⇧ を足した形。⇧⌥⌘ 系の既定割り当ては 1 つも無く、
+    /// `MACOS_RESERVED` の ⌥⌘ 系は Space / D / Esc だけなので空いている。
+    MarkToggleMnemonic,
+    /// ブックマーク一覧 (ツリー + プレビュー) を開く。
+    MarksPanel,
+    /// ニーモニックを 1 打鍵で選ぶジャンプポップアップを開く。
+    MarkJump,
     /// 直前に閉じたタブを開き直す (VS Code: ⇧⌘T)
     ReopenClosedTab,
     /// 補完候補を出す (VS Code mac の第 2 割り当てと同じ ⌘I)。
@@ -185,7 +195,7 @@ pub enum BindAction {
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 84] = [
+pub const ALL_ACTIONS: [BindAction; 87] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -237,6 +247,9 @@ pub const ALL_ACTIONS: [BindAction; 84] = [
     BindAction::ToggleFold,
     BindAction::UnfoldAll,
     BindAction::ToggleBookmark,
+    BindAction::MarkToggleMnemonic,
+    BindAction::MarksPanel,
+    BindAction::MarkJump,
     BindAction::ReopenClosedTab,
     BindAction::LspCompletion,
     BindAction::LspReferences,
@@ -410,6 +423,19 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::ToggleFold => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::OpenBracket),
         BindAction::UnfoldAll => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::CloseBracket),
         BindAction::ToggleBookmark => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::B),
+        // ── ブックマーク (ニーモニック付き) ──────────────────────
+        // 素の切替 ⌥⌘B に ⇧ を足した形。⇧⌥⌘ 系の既定割り当ては 1 つも無く、
+        // `MACOS_RESERVED` にも ⇧⌥⌘ の項目は無い。
+        // 数字ニーモニックへの**直行**打鍵はここではなく `marks::digit_jump_shortcut`
+        // が OS ごとに固定して持つ (⌃ + 数字は mac の起動バー、⌃⌥ + 数字は
+        // 非 mac の起動バーが既に持っているため)。
+        BindAction::MarkToggleMnemonic => {
+            KeyboardShortcut::new(cmd.plus(Modifiers::ALT).plus(Modifiers::SHIFT), Key::B)
+        }
+        // ⌥⌘M / ⌥⌘J。⌥⌘ 系の既存は S F B [ ] \ だけで M と J は空いている
+        // (⌘M = 「ウィンドウをしまう」は ⌥ が付かない別の打鍵)。
+        BindAction::MarksPanel => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::M),
+        BindAction::MarkJump => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::J),
         BindAction::ReopenClosedTab => KeyboardShortcut::new(cmd_shift, Key::T),
         // ⌃Space は macOS が「前の入力ソース」に予約している (実測: 本文の
         // `MACOS_RESERVED` を参照)。既定は ⌘I にして、⌃Space は
@@ -627,6 +653,9 @@ pub fn config_name(a: BindAction) -> &'static str {
         ToggleFold => "toggle_fold",
         UnfoldAll => "unfold_all",
         ToggleBookmark => "toggle_bookmark",
+        MarkToggleMnemonic => "mark_toggle_mnemonic",
+        MarksPanel => "marks_panel",
+        MarkJump => "mark_jump",
         ReopenClosedTab => "reopen_closed_tab",
         LspCompletion => "lsp_completion",
         LspReferences => "lsp_references",
@@ -721,6 +750,9 @@ pub fn action_label(a: BindAction) -> &'static str {
         ToggleFold => "折りたたみの切り替え",
         UnfoldAll => "すべて展開",
         ToggleBookmark => "ブックマークの切り替え",
+        MarkToggleMnemonic => "ニーモニック付きブックマーク",
+        MarksPanel => "ブックマーク一覧",
+        MarkJump => "ブックマークへジャンプ",
         ReopenClosedTab => "閉じたエディターを開き直す",
         LspCompletion => "補完候補を表示",
         LspReferences => "参照を検索",
@@ -927,6 +959,9 @@ impl Keybinds {
             "toggle_fold" => ToggleFold,
             "unfold_all" => UnfoldAll,
             "toggle_bookmark" => ToggleBookmark,
+            "mark_toggle_mnemonic" => MarkToggleMnemonic,
+            "marks_panel" => MarksPanel,
+            "mark_jump" => MarkJump,
             "reopen_closed_tab" => ReopenClosedTab,
             "lsp_completion" => LspCompletion,
             "lsp_references" => LspReferences,

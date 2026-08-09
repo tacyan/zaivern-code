@@ -381,6 +381,19 @@ pub enum Cmd {
     PrevBookmark,
     /// このファイルのブックマークをすべて解除
     ClearBookmarks,
+
+    // ── ニーモニック付きブックマーク (marks.rs / JetBrains の Bookmarks) ──
+    /// ニーモニック (0-9 / A-Z) を選んでブックマークを付け外しする。
+    /// 選択範囲があればそれが説明になる。
+    MarkToggleMnemonic,
+    /// ブックマーク一覧 (ツリー + プレビュー) を開く
+    MarksPanel,
+    /// ニーモニックを 1 打鍵で選ぶジャンプポップアップを開く
+    MarkJump,
+    /// 数字ニーモニック `0`〜`9` へ直行する (キーバインド専用)
+    MarkJumpDigit(u8),
+    /// プロジェクト全体のブックマークを消す
+    MarksClearAll,
     /// 直前に閉じたタブを開き直す
     ReopenClosedTab,
 
@@ -750,6 +763,11 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::NextBookmark
         | Cmd::PrevBookmark
         | Cmd::ClearBookmarks
+        | Cmd::MarkToggleMnemonic
+        | Cmd::MarksPanel
+        | Cmd::MarkJump
+        | Cmd::MarkJumpDigit(_)
+        | Cmd::MarksClearAll
         | Cmd::LspReferences
         | Cmd::LspSymbols
         | Cmd::OpenCommandPalette

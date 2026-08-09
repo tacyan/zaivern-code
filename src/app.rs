@@ -41,6 +41,7 @@ use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::license;
 use crate::lsp;
 use crate::markdown;
+use crate::marks;
 use crate::mcp;
 use crate::menu_bar;
 use crate::notify;
@@ -3675,6 +3676,11 @@ pub struct ZaivernApp {
     enc_picker: Option<bool>,
     /// ピッカーの絞り込み文字列。
     enc_filter: String,
+
+    // ── ニーモニック付きブックマーク (crate::marks) ─────────────────
+    /// プロジェクト全体のブックマーク。`editor::Bookmarks` (タブ内の行集合)
+    /// とは別で、`~/.zaivern/bookmarks` へ永続化し編集を跨いで行を追う。
+    marks: marks::MarksState,
 }
 
 /// 指揮官に選べないセッションの理由。選べるなら `None`。
@@ -3967,6 +3973,7 @@ impl ZaivernApp {
             cockpit: false,
             cockpit_followed: None,
             center: CenterView::Editor,
+            marks: marks::MarksState::default(),
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
             deck: false,
@@ -4272,6 +4279,9 @@ impl ZaivernApp {
         self.git_panel
             .set_workspace(self.primary_root().to_path_buf());
         self.review.set_workspace(self.primary_root().to_path_buf());
+        // ブックマークもワークスペース単位。前のぶんは書き出してから読み替える。
+        let ws = self.primary_root().to_path_buf();
+        self.marks.set_workspace(&ws);
         // ブランチピッカーも新しいリポジトリへ。旧 repo の一覧が残っていると、
         // そこに無いブランチへの切り替えを発行できてしまう。
         self.branch_nav.set_repo(self.primary_root().to_path_buf());
@@ -8241,6 +8251,9 @@ impl ZaivernApp {
                 self.tree.invalidate();
                 // 保存した本文の退避はもう要らない (ゴミを残さない)
                 self.hotexit_flush();
+                // ブックマークの追悼パスは 2 秒のデバウンスで走るので、
+                // 保存 (= ここまでを確定する操作) の直前に 1 回流しておく。
+                self.marks.flush_memorial(&path, &text);
                 if promoted {
                     self.toast_warn(trf(
                         "💾 保存しました: {path}\n\u{3000}{from} では表せない文字があるため UTF-8 で保存しました",
@@ -9135,6 +9148,11 @@ impl ZaivernApp {
             Cmd::ToggleBookmark | Cmd::NextBookmark | Cmd::PrevBookmark | Cmd::ClearBookmarks => {
                 self.apply_bookmark_cmd(&cmd)
             }
+            Cmd::MarkToggleMnemonic
+            | Cmd::MarksPanel
+            | Cmd::MarkJump
+            | Cmd::MarkJumpDigit(_)
+            | Cmd::MarksClearAll => self.apply_mark_cmd(&cmd),
             Cmd::ReopenClosedTab => self.reopen_closed_tab(),
             Cmd::ToggleTableView => self.toggle_table_view(),
             Cmd::LspCompletion => {
@@ -9409,6 +9427,83 @@ impl ZaivernApp {
                 self.toast_warn(tr("このファイルにはブックマークがありません"))
             }
             None => {}
+        }
+    }
+
+    /// ニーモニック付きブックマーク (`crate::marks`) のコマンド。
+    ///
+    /// **描画も判定も `marks` 側の純粋関数に置く** — ここは「いまのファイルと
+    /// 行を渡して、返ってきた要求を実行する」だけに保つ (app.rs は 42k 行あり、
+    /// 10 本のブランチが直列にマージされるので差分を局所化する)。
+    fn apply_mark_cmd(&mut self, cmd: &Cmd) {
+        match cmd {
+            Cmd::MarksPanel => self.marks.panel_open = !self.marks.panel_open,
+            Cmd::MarkJump => self.marks.jump_open = !self.marks.jump_open,
+            Cmd::MarksClearAll => {
+                self.marks.clear_all();
+                self.toast(tr("ブックマークをすべて消しました"), true);
+            }
+            Cmd::MarkJumpDigit(d) => match self.marks.goto_digit(*d) {
+                Some(a) => self.run_mark_action(a),
+                None => self.toast_warn(tr("そのニーモニックのブックマークがありません")),
+            },
+            Cmd::MarkToggleMnemonic => {
+                let Some(i) = self.editor.active else {
+                    self.toast_warn(tr("ファイルを開いてから使ってください"));
+                    return;
+                };
+                let Some(path) = self.editor.buffers[i].path.clone() else {
+                    self.toast_warn(tr("保存されていないファイルには付けられません"));
+                    return;
+                };
+                let line = self.caret_line0();
+                let text = self.editor.buffers[i].text.clone();
+                let sel = self.editor_selection_text();
+                self.marks.begin_toggle(&path, line, &text, sel);
+            }
+            _ => {}
+        }
+    }
+
+    /// 選択範囲の文字列 (無ければ `None`)。ブックマークの説明の種になる。
+    fn editor_selection_text(&self) -> Option<String> {
+        let i = self.editor.active?;
+        let (a, b) = self.editor_sel_chars?;
+        let (lo, hi) = (a.min(b), a.max(b));
+        if lo >= hi {
+            return None;
+        }
+        let t = &self.editor.buffers[i].text;
+        Some(t.chars().skip(lo).take(hi - lo).collect())
+    }
+
+    /// `marks` から返ってきた要求を実行する。
+    fn run_mark_action(&mut self, a: marks::MarkAction) {
+        match a {
+            marks::MarkAction::Goto(path, line0) => {
+                if self.active_file_path().as_deref() != Some(path.as_path()) {
+                    self.open_path(&path);
+                }
+                if let Some(i) = self.editor.active {
+                    self.reveal_line(i, line0);
+                }
+                self.goto_line(line0 + 1);
+            }
+            marks::MarkAction::Toast(msg, ok) => self.toast(msg, ok),
+        }
+    }
+
+    /// ブックマークの小窓 (一覧 / ニーモニック選択 / ジャンプ) を描く。
+    fn marks_windows(&mut self, ctx: &egui::Context) {
+        let hints = marks::Hints {
+            toggle: self.key_hint(BindAction::MarkToggleMnemonic),
+            panel: self.key_hint(BindAction::MarksPanel),
+        };
+        let theme = self.theme.clone();
+        let root = self.primary_root().to_path_buf();
+        let acts = marks::windows_ui(ctx, &mut self.marks, &theme, &hints, &root);
+        for a in acts {
+            self.run_mark_action(a);
         }
     }
 
@@ -11013,6 +11108,11 @@ impl ZaivernApp {
             | Cmd::NextBookmark
             | Cmd::PrevBookmark
             | Cmd::ClearBookmarks
+            | Cmd::MarkToggleMnemonic
+            | Cmd::MarksPanel
+            | Cmd::MarkJump
+            | Cmd::MarkJumpDigit(_)
+            | Cmd::MarksClearAll
             | Cmd::ReopenClosedTab
             | Cmd::ToggleTableView
             | Cmd::LspCompletion
@@ -13136,6 +13236,24 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.binding(BindAction::ToggleBookmark)) {
             cmds.push(Cmd::ToggleBookmark);
+        }
+        if consume(ctx, self.keys.binding(BindAction::MarkToggleMnemonic)) {
+            cmds.push(Cmd::MarkToggleMnemonic);
+        }
+        if consume(ctx, self.keys.binding(BindAction::MarksPanel)) {
+            cmds.push(Cmd::MarksPanel);
+        }
+        if consume(ctx, self.keys.binding(BindAction::MarkJump)) {
+            cmds.push(Cmd::MarkJump);
+        }
+        // 数字ニーモニックへの直行。**打鍵は OS ごとに `marks` が固定して持つ**
+        // (⌃ + 数字は mac の起動バー、⌃⌥ + 数字は非 mac の起動バーが既に使う)。
+        for d in 0u8..=9 {
+            if let Some(sc) = marks::digit_jump_shortcut(d) {
+                if consume_sc(ctx, sc) {
+                    cmds.push(Cmd::MarkJumpDigit(d));
+                }
+            }
         }
         if consume(ctx, self.keys.binding(BindAction::LspReferences)) {
             cmds.push(Cmd::LspReferences);
@@ -21766,6 +21884,9 @@ impl ZaivernApp {
         let theme_panel = self.theme.panel;
         let theme_border = self.theme.border;
         let theme_accent = self.theme.accent;
+        // ブックマークのニーモニックはアクセント色の四角の上に載せるので、
+        // 文字色は本文背景 (= アクセントの反対側) を使う。
+        let theme_bg = self.theme.bg;
         // 現在行ハイライト用 (テキストの上に重ねるのでごく薄く)
         let cur_line_hl = self.theme.text.gamma_multiply(0.07);
         // 折り返しと空白可視化 (コマンド/メニューで切替、config に永続化)
@@ -21832,6 +21953,15 @@ impl ZaivernApp {
         }
         self.refresh_active_diagnostics(text_hash);
         self.refresh_inlay_hints(text_hash);
+        // ブックマークの行追従。**毎フレームやるのはハッシュ比較だけ**で、
+        // 実際の差分は 100ms のデバウンス後にバックグラウンドスレッドが取る
+        // (編集経路で本文を走査すると、このリポジトリが git で踏んだ
+        //  「UI スレッドが数秒返ってこない」を再演することになる)。
+        if let Some(p) = abs.clone() {
+            let mut m = std::mem::take(&mut self.marks);
+            m.tick(ui.ctx(), &p, text_hash, &self.editor.buffers[active].text);
+            self.marks = m;
+        }
         self.diag_counts = (self.diag_cache.errors, self.diag_cache.warnings);
         // diag_cache の借用は、可変借用が要る第 2 次配線の準備が済んでから取る
         // (この束縛を上げると self を可変に触れなくなる)。
@@ -22123,6 +22253,12 @@ impl ZaivernApp {
             HashMap::new()
         };
         let bookmark_lines: HashSet<usize> = self.editor.buffers[active].bookmarks.iter().collect();
+        // ニーモニック付きブックマーク (crate::marks) の印。行 → 表示文字。
+        // **ガターは 1 系統しか持たない** — 既存の ◆ と同じ列に重ねて描く。
+        let mark_glyphs: HashMap<usize, char> = match &abs {
+            Some(p) => self.marks.store().glyphs(p),
+            None => HashMap::new(),
+        };
 
         // インデントガイド (鍵にキャレット行を含める = 強調ガイドが行依存のため)
         let tab_w = crate::highlight::DEFAULT_TAB_WIDTH;
@@ -23304,26 +23440,48 @@ impl ZaivernApp {
         let fold_x = gutter_edge - FOLD_MARKER_W;
         let mark_x = gutter_edge - FOLD_MARKER_W * 2.0;
         let mut toggle_line: Option<usize> = None;
+        let mut mark_toggle_line: Option<usize> = None;
         if structure_on {
-            let hit = ui
-                .interact(
-                    egui::Rect::from_min_max(
-                        egui::pos2(mark_x, vis.top()),
-                        egui::pos2(gutter_edge, vis.bottom()),
-                    ),
-                    ed_id.with("fold-gutter"),
-                    egui::Sense::click(),
-                )
-                .interact_pointer_pos();
+            let gutter_resp = ui.interact(
+                egui::Rect::from_min_max(
+                    egui::pos2(mark_x, vis.top()),
+                    egui::pos2(gutter_edge, vis.bottom()),
+                ),
+                ed_id.with("fold-gutter"),
+                egui::Sense::click(),
+            );
+            let hit = gutter_resp.interact_pointer_pos();
+            // 印の列 (折りたたみ列より手前) のホバーだけ案内を出す。
+            // **打鍵表記はキーマップから作る** — ベタ書きしない。
+            if gutter_resp
+                .hover_pos()
+                .map(|p| p.x < fold_x)
+                .unwrap_or(false)
+            {
+                let hint = crate::keybinds::key_hint(ui.ctx(), BindAction::MarkToggleMnemonic);
+                let _ = gutter_resp.on_hover_text(crate::marks::gutter_tooltip(&hint));
+            }
             for (src, y0, _) in &row_lines {
-                if bookmark_lines.contains(src) {
-                    painter.text(
+                match mark_glyphs.get(src) {
+                    // ニーモニック付きはアイコン + 文字 (0.75 倍・中央)
+                    Some(g) => crate::marks::paint_gutter_glyph(
+                        &painter,
                         egui::pos2(mark_x, *y0),
-                        Align2::LEFT_TOP,
-                        "◆",
-                        font.clone(),
+                        row_h,
+                        *g,
                         theme_accent,
-                    );
+                        theme_bg,
+                    ),
+                    None if bookmark_lines.contains(src) => {
+                        painter.text(
+                            egui::pos2(mark_x, *y0),
+                            Align2::LEFT_TOP,
+                            "◆",
+                            font.clone(),
+                            theme_accent,
+                        );
+                    }
+                    None => {}
                 }
                 if let Some(folded) = fold_marks.get(src) {
                     painter.text(
@@ -23337,6 +23495,9 @@ impl ZaivernApp {
             }
             if let Some(p) = hit {
                 toggle_line = fold_click_line(&row_lines, &fold_marks, fold_x, p);
+                // 折りたたみの列より手前 (印の列) はブックマークの付け外し
+                let rows: Vec<(usize, f32)> = row_lines.iter().map(|(l, y, _)| (*l, *y)).collect();
+                mark_toggle_line = crate::marks::gutter_click_line(&rows, row_h, mark_x, fold_x, p);
             }
         }
 
@@ -23486,6 +23647,14 @@ impl ZaivernApp {
                 }
                 // 折りたたみ表示への打鍵も原文側の履歴へ 1 段として積む
                 b.apply_edit(next, ed);
+                let spliced_text = b.text.clone();
+                // 増減が分かっている編集は差分を待たずに追従させる
+                // (`marks` の経路 1。デバウンス後の一括更新より 1 テンポ速い)
+                if delta != 0 {
+                    if let Some(p) = path_clone.clone() {
+                        self.marks.note_edit(&p, at, delta, &spliced_text);
+                    }
+                }
                 // 表示テキストは次フレームで作り直す
                 self.fold_view = None;
                 spliced = true;
@@ -23579,6 +23748,15 @@ impl ZaivernApp {
                     self.lsp_pending.insert(p, (text, Instant::now(), key));
                 }
             }
+        }
+
+        // ガターの印をクリックしていたらここで付け外しする。
+        // 描画中は `self` の別フィールドを不変借用しているので、
+        // トーストを出せるのはこの位置まで来てから (複数キャレットと同じ流儀)。
+        if let (Some(l), Some(p)) = (mark_toggle_line, path_clone) {
+            let text = self.editor.buffers[active].text.clone();
+            let out = self.marks.quick_toggle(&p, l, &text);
+            self.toast(crate::marks::toggle_message(&out), true);
         }
     }
 
@@ -24373,6 +24551,30 @@ impl ZaivernApp {
                 tr("ブックマークをすべて解除"),
                 String::new(),
                 Cmd::ClearBookmarks,
+            ),
+            (
+                "🔖".into(),
+                tr("ニーモニック付きブックマーク"),
+                fmt_key(BindAction::MarkToggleMnemonic),
+                Cmd::MarkToggleMnemonic,
+            ),
+            (
+                "🔖".into(),
+                tr("ブックマーク一覧"),
+                fmt_key(BindAction::MarksPanel),
+                Cmd::MarksPanel,
+            ),
+            (
+                "🔖".into(),
+                tr("ブックマークへジャンプ"),
+                fmt_key(BindAction::MarkJump),
+                Cmd::MarkJump,
+            ),
+            (
+                "🔖".into(),
+                tr("ブックマークをプロジェクト全体から消す"),
+                String::new(),
+                Cmd::MarksClearAll,
             ),
             (
                 "📑".into(),
@@ -28876,7 +29078,11 @@ impl ZaivernApp {
         self.handle_zoom_gesture(ctx);
         // Keybinds を持てない描画側 (ターミナルの右クリックメニュー等) へ
         // 打鍵表記を配る。ベタ書きを増やさないための唯一の経路。
-        crate::keybinds::publish_key_hints(ctx, &self.keys, &[BindAction::Find]);
+        crate::keybinds::publish_key_hints(
+            ctx,
+            &self.keys,
+            &[BindAction::Find, BindAction::MarkToggleMnemonic],
+        );
 
         // メニューバー経由のエディタ操作 (元に戻す/貼り付け等) を、パネル描画前に
         // フォーカス復帰 + イベント注入で TextEdit へ届ける
@@ -31766,6 +31972,7 @@ impl ZaivernApp {
 
     fn menu_windows_ui(&mut self, ctx: &egui::Context) {
         self.goto_line_window(ctx);
+        self.marks_windows(ctx);
         self.git_commit_window(ctx);
         self.git_history_window(ctx);
         self.problems_window(ctx);
@@ -38234,6 +38441,9 @@ mod wave2_tests {
             ("ToggleFold", "ToggleFold"),
             ("UnfoldAll", "UnfoldAll"),
             ("ToggleBookmark", "ToggleBookmark"),
+            ("MarkToggleMnemonic", "MarkToggleMnemonic"),
+            ("MarksPanel", "MarksPanel"),
+            ("MarkJump", "MarkJump"),
             ("ReopenClosedTab", "ReopenClosedTab"),
             ("LspCompletion", "LspCompletion"),
             ("LspReferences", "LspReferences"),
