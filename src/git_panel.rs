@@ -4442,6 +4442,40 @@ bare
         }
     }
 
+    /// **コミットの引数を組み立てる場所は 1 つだけ。**
+    ///
+    /// app.rs 側にも同じものがあり、そちらには `--cleanup=whitespace` が
+    /// 無かったため、`#` で始まるコミットメッセージがユーザーの
+    /// `commit.cleanup` 設定で黙って落ちていた (同じ操作なのに
+    /// Git パネル経由なら残る、という食い違い)。二度と生えないよう
+    /// ソースを読んで見張る。改行は正規化する (Windows は CRLF)。
+    #[test]
+    fn コミットの引数を組み立てるのはこのモジュールだけ() {
+        let app = include_str!("app.rs").replace("\r\n", "\n");
+        assert!(
+            app.contains("crate::git_panel::commit_args("),
+            "app.rs は git_panel::commit_args を通すこと"
+        );
+        for bad in ["\"commit\".into()", "\"-m\".into()"] {
+            assert!(
+                !app.contains(bad),
+                "app.rs が commit の引数を自前で組み立てている: {bad}"
+            );
+        }
+    }
+
+    /// `--cleanup=whitespace` を落とさない (これが無いと `#` 始まりの行が消える)。
+    #[test]
+    fn コミット引数は必ず_cleanup_を明示する() {
+        for amend in [false, true] {
+            let a = commit_args("# 見出しから始まるメッセージ", amend);
+            assert!(
+                a.iter().any(|x| x == "--cleanup=whitespace"),
+                "amend={amend}"
+            );
+        }
+    }
+
     #[test]
     fn commit_args_amend_inserts_the_flag_before_the_message() {
         let a = commit_args("直前を直す", true);

@@ -349,6 +349,14 @@ pub struct Session {
     /// フェイルオーバーで別プロファイルへ引き継ぐ材料 ([`Session::note_prompt`])。
     /// キーストロークや承認キーは含めない。
     pub last_prompt: Option<String>,
+    /// **端末へ直接打ち込んでいる途中の 1 行。**
+    ///
+    /// 自動命名とフェイルオーバーの引き継ぎは `last_prompt` を材料にするが、
+    /// これを埋めていたのは**アプリ経由の送信だけ**だった。ターミナルに
+    /// 直接タイプした指示は 1 文字ずつ PTY へ流れるだけで、どこにも
+    /// 残らない (= 直接打った人のセッションは永久に無題のままになる)。
+    /// ここで打鍵を組み立て直し、確定 (Enter) の瞬間に `note_prompt` へ渡す。
+    typed_line: TypedLine,
     /// このセッションの生ログの書き出し先 (再起動時の引き継ぎ・UI 表示用)。
     pub log_path: Option<PathBuf>,
     /// リンク検出の実行時状態 (実在確認のメモ + 直近に解析した 1 行)。
@@ -1081,6 +1089,90 @@ const SIG_MARKS: [&str; 47] = [
 /// 「Do you want to proceed? / ❯ 1. Yes」自体は同一でも、直上のコマンド
 /// プレビューが変わる = 別のプロンプト、を区別するため。行テキストのみで
 /// 位置は使わないので、スクロールや下部の出力追加では変わらない。
+/// **端末へ直接打ち込んだ 1 行の組み立て状態。**
+///
+/// 「途中まで打った本文」と「この行を捨てるべきか」の 2 つを持つ。
+/// 捨てる印が要るのは、打鍵は **1 回の write に収まるとは限らない**ため。
+/// 矢印キーだけが単独で届いたフレームで本文を消しても、次のフレームから
+/// 何事も無かったように積み直してしまい、**本文の途中だけを覚える**
+/// (「abc←def」を「def」として覚える) 事故になる。
+/// 確定 (Enter) まで印を持ち越して、行ごと捨てる。
+#[derive(Default)]
+pub struct TypedLine {
+    buf: String,
+    /// この行に再現できない打鍵 (エスケープ列) が混ざったか。
+    tainted: bool,
+}
+
+/// **打鍵バイト列から「確定した 1 行」を組み立てる (純関数)。**
+///
+/// `st` は呼び出しをまたいで持ち回る途中状態。確定 (CR / LF) が来たら
+/// その行を返し、状態を空へ戻す。1 回の呼び出しに複数行が入っていれば
+/// **最後の行**を返す (直近の指示が欲しいので、古い行は捨てて良い)。
+///
+/// 扱う制御文字:
+/// - `\r` / `\n` … 確定
+/// - `\x7f` / `\x08` (Backspace) … 1 文字消す
+/// - `\x03` (Ctrl+C) / `\x15` (Ctrl+U) … 行を捨てる
+/// - `ESC` から始まる列 … カーソル移動などなので**その行ごと捨てる**
+///   (途中に矢印キーが入った行を正しく再現するのは無理筋で、
+///    間違った本文を覚えるより覚えない方が良い)
+/// - bracketed paste の囲み … 剥がして中身だけ残す
+/// - その他の制御文字 … 無視
+///
+/// UTF-8 の途中で切れたバイト列が来ても壊れない (不正な並びは捨てる)。
+pub fn feed_typed_line(st: &mut TypedLine, bytes: &[u8]) -> Option<String> {
+    // bracketed paste の囲みを剥がす (中身は普通の文字として扱う)。
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
+    let mut out: Option<String> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' | '\n' => {
+                // CRLF は 1 回の確定として扱う。
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                let line = std::mem::take(&mut st.buf);
+                let tainted = std::mem::take(&mut st.tainted);
+                if !tainted && !line.trim().is_empty() {
+                    out = Some(line);
+                }
+            }
+            '\u{7f}' | '\u{8}' => {
+                st.buf.pop();
+            }
+            '\u{3}' | '\u{15}' => {
+                st.buf.clear();
+                st.tainted = false;
+            }
+            '\u{1b}' => {
+                // エスケープ列が混ざった行は再現できないので、
+                // **確定まで印を持ち越して**行ごと捨てる。
+                st.buf.clear();
+                st.tainted = true;
+                // 続く列そのものも読み飛ばす (次の確定は下の分岐で拾う)。
+                while let Some(&c) = chars.peek() {
+                    if c == '\r' || c == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            '\t' => st.buf.push(' '),
+            c if c.is_control() => {}
+            c => {
+                // 暴走した貼り付けで無制限に伸びないよう頭打ちにする。
+                if st.buf.chars().count() < PROMPT_KEEP_CHARS {
+                    st.buf.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn prompt_signature(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1750,6 +1842,7 @@ impl Session {
             last_prompt: None,
             log_path: spec.log_path,
             links: LinkState::default(),
+            typed_line: TypedLine::default(),
         })
     }
 
@@ -1978,6 +2071,18 @@ impl Session {
             return;
         }
         self.last_prompt = Some(t.chars().take(PROMPT_KEEP_CHARS).collect());
+    }
+
+    /// **端末へ直接打ち込んだ打鍵を 1 行へ組み立て直す。**
+    ///
+    /// `write_bytes` へ流す直前のバイト列を毎回ここへ通す。Enter (CR/LF) が
+    /// 来た時点で、それまでに打った本文を `note_prompt` へ渡す。
+    /// これが無いと「ターミナルに直接タイプした指示」がどこにも残らず、
+    /// 自動命名も失敗切替の引き継ぎも材料ゼロで走ることになる。
+    pub fn note_typed_bytes(&mut self, bytes: &[u8]) {
+        if let Some(line) = feed_typed_line(&mut self.typed_line, bytes) {
+            self.note_prompt(&line);
+        }
     }
 
     /// 未読か。「最後に見た時点から意味的な画面内容が変わった」または手動ピン。
@@ -6352,6 +6457,10 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
         // 承認プロンプトへの手入力応答もここで「応答済み」として解決する
         // (自動YESオフの手動運転で attention を引きずらないため)。
         session.note_user_input();
+        // 直接打ち込んだ指示も覚える (自動命名 / 失敗切替の引き継ぎの材料)。
+        // 送る前に通すこと — `write_bytes` の後だと、送信で状態が変わった
+        // セッションに対して古い行を記録してしまう。
+        session.note_typed_bytes(&out);
         session.write_bytes(&out);
         session.set_scroll(0);
     }
@@ -12282,5 +12391,112 @@ mod link_tests {
             "TTL 内なのに stat し直している"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+
+#[cfg(test)]
+mod typed_line_tests {
+    use super::{feed_typed_line, TypedLine};
+
+    fn feed(seq: &[&str]) -> Vec<String> {
+        let mut st = TypedLine::default();
+        let mut out = Vec::new();
+        for s in seq {
+            if let Some(l) = feed_typed_line(&mut st, s.as_bytes()) {
+                out.push(l);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn 打鍵を組み立てて_enter_で確定する() {
+        assert_eq!(feed(&["テ", "ス", "ト", "して", "\r"]), vec!["テストして"]);
+    }
+
+    #[test]
+    fn 一括で来ても確定する() {
+        assert_eq!(feed(&["テストしてください\r"]), vec!["テストしてください"]);
+    }
+
+    #[test]
+    fn crlf_は一回の確定() {
+        assert_eq!(feed(&["やって\r\n"]), vec!["やって"]);
+    }
+
+    #[test]
+    fn バックスペースで消える() {
+        assert_eq!(feed(&["abcd", "\u{7f}", "\u{7f}", "\r"]), vec!["ab"]);
+    }
+
+    #[test]
+    fn ctrl_c_と_ctrl_u_で行を捨てる() {
+        assert_eq!(feed(&["書きかけ", "\u{3}", "\r"]), Vec::<String>::new());
+        assert_eq!(feed(&["書きかけ", "\u{15}", "\r"]), Vec::<String>::new());
+    }
+
+    /// 空 Enter (承認プロンプトへの Enter 等) は「指示」ではない。
+    /// ここを覚えると、承認するたびにセッション名が壊れる。
+    #[test]
+    fn 空の_enter_は確定として扱わない() {
+        assert_eq!(feed(&["\r", "\r", "  ", "\r"]), Vec::<String>::new());
+    }
+
+    /// 矢印キーなどが混ざった行は本文を再現できないので覚えない。
+    /// 間違った本文で命名するより、命名しない方が良い。
+    #[test]
+    fn エスケープ列が混ざった行は捨てる() {
+        assert_eq!(feed(&["abc", "\u{1b}[D", "x\r"]), Vec::<String>::new());
+    }
+
+    /// **エスケープ列が別の write で来ても行を捨てる。**
+    /// 打鍵は 1 回の write に収まるとは限らないので、印を確定まで持ち越す。
+    /// ここが持続しないと「abc←def」を「def」として覚えてしまう。
+    #[test]
+    fn エスケープ列の直後に打ち直しても行は捨てる() {
+        assert_eq!(
+            feed(&["abc", "\u{1b}[D", "でふぉると\r"]),
+            Vec::<String>::new()
+        );
+    }
+
+    /// 捨てた印は次の行へ持ち越さない (1 行捨てたら以後ずっと無効、を防ぐ)。
+    #[test]
+    fn 捨てた印は次の行へ持ち越さない() {
+        assert_eq!(
+            feed(&["abc", "\u{1b}[D", "x\r", "つぎの指示\r"]),
+            vec!["つぎの指示"]
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_の囲みは剥がす() {
+        assert_eq!(
+            feed(&["\u{1b}[200~一行目 二行目\u{1b}[201~", "\r"]),
+            vec!["一行目 二行目"]
+        );
+    }
+
+    /// 1 回の呼び出しに複数行が入っていたら、直近の行だけを返す。
+    #[test]
+    fn 複数行が来たら最後の行を返す() {
+        assert_eq!(feed(&["ひとつめ\r ふたつめ\r"]), vec![" ふたつめ"]);
+    }
+
+    /// 暴走した貼り付けで無制限に伸びない。
+    #[test]
+    fn 長すぎる本文は頭打ちにする() {
+        let mut st = TypedLine::default();
+        let big = "あ".repeat(10_000);
+        let got = feed_typed_line(&mut st, format!("{big}\r").as_bytes()).expect("確定する");
+        assert_eq!(got.chars().count(), super::PROMPT_KEEP_CHARS);
+    }
+
+    /// 壊れた UTF-8 が来ても panic しない (PTY 由来のバイト列は信用できない)。
+    #[test]
+    fn 壊れた_utf8_でも落ちない() {
+        let mut st = TypedLine::default();
+        let _ = feed_typed_line(&mut st, &[0xff, 0xfe, b'a', b'b', b'\r']);
     }
 }

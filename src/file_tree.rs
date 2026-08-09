@@ -1173,6 +1173,15 @@ impl FileTree {
         mac: bool,
     ) {
         let pressed = |m: Modifiers, k: Key| ui.input_mut(|i| i.consume_key(m, k));
+        // **素の ⌘C / ⌘X / ⌘V は `consume_key` では絶対に拾えない。**
+        // egui-winit 0.29 は押下イベントを握り潰して `Event::Copy` / `Cut` /
+        // `Paste` に差し替えるため (`egui-winit-0.29.1/src/lib.rs:758-774`)。
+        // ここは `handle_keys` の冒頭で「自分がキーボードの持ち主」だと
+        // 確かめた後 (`self.focused` かつ egui の focus が空) なので、
+        // 差し替え後のイベントを直接受け取ってよい。
+        let clip = |a: crate::keybinds::ClipboardAlias| {
+            ui.input_mut(|i| crate::keybinds::take_clipboard_event(i, a))
+        };
         let roots = self.roots.clone();
         let is_root = move |p: &Path| roots.iter().any(|r| r == p);
 
@@ -1185,13 +1194,17 @@ impl FileTree {
             .filter(|p| !is_root(p))
             .cloned()
             .collect();
-        if pressed(Modifiers::COMMAND, Key::C) && !targets.is_empty() {
+        // 修飾キーの多い ⌥⌘C (パスのコピー) と食い合わないよう、
+        // ⌥ が押されているフレームでは素の ⌘C を取らない
+        // (どちらも `Event::Copy` に化けて届くので、修飾キーで見分ける)。
+        let alt_held = ui.input(|i| i.modifiers.alt);
+        if !alt_held && clip(crate::keybinds::ClipboardAlias::Copy) && !targets.is_empty() {
             self.clipboard = Some((targets.clone(), false));
         }
-        if pressed(Modifiers::COMMAND, Key::X) && !targets.is_empty() {
+        if clip(crate::keybinds::ClipboardAlias::Cut) && !targets.is_empty() {
             self.clipboard = Some((targets.clone(), true));
         }
-        if pressed(Modifiers::COMMAND, Key::V) {
+        if clip(crate::keybinds::ClipboardAlias::Paste) {
             let dest = self.paste_dest_dir(rows, sel_idx);
             self.paste_into(dest, actions);
         }
@@ -1202,23 +1215,33 @@ impl FileTree {
 
         // ── パスのコピー (copyFilePath: ⌥⌘C / Shift+Alt+C,
         //    copyRelativeFilePath mac: ⇧⌥⌘C。Windows はコード系のため menu のみ) ──
-        let copy_path = if mac {
-            pressed(Modifiers::COMMAND.plus(Modifiers::ALT), Key::C)
+        // ⌥⌘C / ⇧⌥C も `command + C` なので同じすり替えを食らう。
+        // `consume_shortcut_compat` はこの形 (⌘ + shift/alt + C) を
+        // 逆再生できるので、そちらを通す。
+        let copy_path_sc = if mac {
+            egui::KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::C)
         } else {
-            pressed(Modifiers::SHIFT.plus(Modifiers::ALT), Key::C)
+            egui::KeyboardShortcut::new(Modifiers::SHIFT.plus(Modifiers::ALT), Key::C)
         };
+        let copy_path =
+            ui.input_mut(|i| crate::keybinds::consume_shortcut_compat(i, copy_path_sc));
         if copy_path {
             if let Some(r) = sel_idx.map(|i| &rows[i]) {
                 ctx.copy_text(r.path.to_string_lossy().to_string());
             }
         }
         if mac
-            && pressed(
-                Modifiers::COMMAND
-                    .plus(Modifiers::ALT)
-                    .plus(Modifiers::SHIFT),
-                Key::C,
-            )
+            && ui.input_mut(|i| {
+                crate::keybinds::consume_shortcut_compat(
+                    i,
+                    egui::KeyboardShortcut::new(
+                        Modifiers::COMMAND
+                            .plus(Modifiers::ALT)
+                            .plus(Modifiers::SHIFT),
+                        Key::C,
+                    ),
+                )
+            })
         {
             if let Some(r) = sel_idx.map(|i| &rows[i]) {
                 let rel = self.rel_of(&r.path);
