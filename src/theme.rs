@@ -1257,7 +1257,13 @@ pub fn apply(ctx: &egui::Context, t: &Theme) {
     // (記録しておかないと次フレームで無駄に丸め直しが走る。
     //  **`resync_pixel_snapping` と同じ型で書くこと** — 片方だけ変えると
     //  `get_temp` が型不一致で None を返し、毎フレーム丸め直しが走る)
-    ctx.data_mut(|d| d.insert_temp(snapped_ppp_id(), (ppp, text_scale(ctx))));
+    //  **倍率は `data_mut` に入る前に読むこと** — クロージャの中で
+    //  `text_scale(ctx)` を呼ぶと、書き込みロックを握ったまま同じ
+    //  `Memory` の読み取りロックを取りに行って**デッドロックする**
+    //  (parking_lot の RwLock は再入不可。テストが CPU 0% のまま
+    //   永久に固まり、cargo のロック待ちが repo 全体へ波及した)。
+    let scale = text_scale(ctx);
+    ctx.data_mut(|d| d.insert_temp(snapped_ppp_id(), (ppp, scale)));
     install_pixel_snap_plugin(ctx);
 }
 
