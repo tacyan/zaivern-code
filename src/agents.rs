@@ -1977,18 +1977,6 @@ impl AgentManager {
         events
     }
 
-    /// Send text to every running session (cockpit broadcast).
-    pub fn broadcast(&mut self, text: &str) {
-        let payload = format!("{text}\r");
-        for s in &mut self.sessions {
-            if s.running() {
-                // Cockpit からの一斉送信もユーザーの手入力扱い
-                s.note_user_input();
-                s.write_bytes(payload.as_bytes());
-            }
-        }
-    }
-
     /// 指定セッションの権限モード切替 UI を開く/切り替える。
     /// Claude/Antigravity は Shift+Tab、Codex は `/permissions` を送る。
     pub fn cycle_permission(&mut self, i: usize) -> Option<&'static str> {

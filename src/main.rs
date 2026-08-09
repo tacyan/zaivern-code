@@ -65,6 +65,7 @@ mod shellenv;
 mod skills;
 mod snippets;
 mod sound;
+mod submit;
 mod supervisor;
 mod tasks;
 mod terminal;

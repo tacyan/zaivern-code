@@ -59,6 +59,7 @@ use crate::shellenv;
 use crate::skills;
 use crate::snippets::{self, Snippet};
 use crate::sound::{self, SoundKind};
+use crate::submit;
 use crate::supervisor;
 use crate::tasks;
 use crate::terminal;
@@ -3028,10 +3029,14 @@ pub struct ZaivernApp {
     /// パレットを開いている間だけ保持し、閉じると破棄する
     /// (palette_items は毎フレーム呼ばれるため、都度 git を叩かない)。
     palette_worktrees: Option<Vec<(String, PathBuf, bool)>>,
-    /// セッションが安全 (Idle) になったら入力欄へ入れる指示文
-    /// (セッションid, 積んだ時刻, 本文)。Issue 着手フローが積む。
-    /// 起動直後の信頼確認プロンプト等へ流れ込まないよう、配達を遅らせる。
-    pending_prompts: Vec<(u64, Instant, String)>,
+    /// **エージェントへの指示の唯一の出口。**
+    ///
+    /// 以前は送信地点ごとに `format!("{text}\r")` を PTY へ 1 回で書いていたが、
+    /// Ink 系 TUI (Claude Code / Codex / Gemini) は本文と CR が同じ write で
+    /// 届くとまとめてペーストと判定し、**CR を改行として飲んで実行しない**。
+    /// 「送ったのにエージェントが入力欄で待機している」の原因がこれ。
+    /// 本文 → 待つ → 確定キー → 効いたか確認、の手順は `submit.rs` が持つ。
+    outbox: Vec<submit::Pending>,
     /// 🏁 プロンプトレース (1 プロンプトを複数エージェントに並走させる) の
     /// ダッシュボード状態。描画・git 操作の実体は race.rs。
     race: race::RacePanel,
@@ -3892,7 +3897,7 @@ impl ZaivernApp {
                 p
             },
             palette_worktrees: None,
-            pending_prompts: Vec::new(),
+            outbox: Vec::new(),
             race: race::RacePanel::new(),
             agent_worktrees: HashMap::new(),
             manual_titles: std::collections::HashSet::new(),
@@ -6823,7 +6828,7 @@ impl ZaivernApp {
     ///
     /// **現行セッションには一切触らない** (kill もしない)。新しいプリセットで
     /// 別セッションを立ち上げ、覚えているプロンプトを既存の遅延配達
-    /// (`pending_prompts` — 相手が落ち着いてから入れる) に載せるだけ。
+    /// (`outbox` — 相手が落ち着いてから入れる) に載せるだけ。
     /// 切り替えたら true。
     fn failover_on_rate_limit(&mut self, title: &str, line: &str, ctx: &egui::Context) -> bool {
         if !self.failover.enabled() {
@@ -6948,8 +6953,8 @@ impl ZaivernApp {
             .ok_or_else(|| tr("起動したセッションが見つかりません"))?;
         if let Some(text) = carry.filter(|t| !t.trim().is_empty()) {
             // 既存の遅延配達に載せる: 相手が落ち着く (Idle) のを待ってから入れる。
-            self.pending_prompts
-                .push((new_id, Instant::now(), format!("{}\r", text.trim())));
+            // 確定まで送る (引き継ぎは人の確認を挟まずそのまま続きをやらせる)。
+            self.queue_submit(submit::Job::deferred(new_id, text.trim(), true));
         }
         Ok(new_id)
     }
@@ -6970,7 +6975,7 @@ impl ZaivernApp {
             match stage {
                 failover::Stage::Resuming { session, .. } => {
                     // 引き継ぎ待ちが捌けたら検証へ。
-                    if !self.pending_prompts.iter().any(|(id, _, _)| *id == session) {
+                    if !self.outbox.iter().any(|p| p.job.session == session) {
                         self.failover.note_resumed(sid, now);
                     }
                 }
@@ -7697,18 +7702,140 @@ impl ZaivernApp {
     }
 
     fn send_to_agent(&mut self, text: String) {
-        if let Some(s) = self.agents.active_session() {
-            s.note_user_input();
-            // フェイルオーバーで別プロファイルへ引き継ぐ材料として覚えておく。
-            s.note_prompt(&text);
-            s.write_bytes(text.as_bytes());
-            self.agents.panel_open = true;
-            self.toast(tr("アクティブなエージェントに送信しました"), true);
-        } else {
+        let Some(id) = self.agents.active_session().map(|s| s.id) else {
             self.toast(
                 tr("エージェントセッションがありません（👾 Agent＋ から起動）"),
                 false,
             );
+            return;
+        };
+        self.queue_submit(submit::Job::user(id, text));
+        self.agents.panel_open = true;
+        self.toast(tr("アクティブなエージェントに送信しました"), true);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  エージェントへの指示 — **送信経路はここ 1 本だけ**
+    //
+    //  以前は送信地点ごとに `format!("{text}\r")` を組み立てて PTY へ
+    //  1 回で書いていた (Cockpit 指名 / 一斉 / かんばん / リモート /
+    //  失敗切替の引き継ぎ / Issue 着手 で 6 箇所)。Ink 系 TUI
+    //  (Claude Code / Codex / Gemini) は本文と CR が同じ write で届くと
+    //  まとめてペーストと判定し、**CR を改行として飲んで実行しない**。
+    //  「送ったのにエージェントが入力欄で待機している」がこれ。素のシェルは
+    //  1 回でも動くので「エージェントによって効いたり効かなかったり」に見えた。
+    //  手順 (本文 → 待つ → 確定キー → 効いたか確認) は `submit.rs` が持つ。
+    // ══════════════════════════════════════════════════════════════════
+
+    /// 指示 1 通を配達待ちへ積む。空文字と宛先不明は黙って捨てる。
+    fn queue_submit(&mut self, mut job: submit::Job) {
+        if job.text.trim().is_empty() {
+            return;
+        }
+        let Some(s) = self.agents.sessions.iter().find(|s| s.id == job.session) else {
+            return;
+        };
+        job.title = s.title.clone();
+        self.outbox.push(submit::Pending::new(job, Instant::now()));
+    }
+
+    /// 起動中の全セッションへ同じ指示を積む (Cockpit の一斉送信)。宛先数を返す。
+    fn queue_submit_all(&mut self, text: &str) -> usize {
+        let ids: Vec<u64> = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| s.running())
+            .map(|s| s.id)
+            .collect();
+        for id in &ids {
+            self.queue_submit(submit::Job::user(*id, text));
+        }
+        ids.len()
+    }
+
+    /// 配達待ちを 1 フレームぶん進める。
+    ///
+    /// **アイドル時のコストはゼロ** — 待ちが空なら即 return し、再描画も
+    /// 要求しない。待ちがある間だけ次の期限へ `request_repaint_after` する
+    /// (常時再描画にはしない)。
+    fn submit_tick(&mut self, ctx: &egui::Context) {
+        if self.outbox.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut next: Option<Duration> = None;
+        let mut delivered: Vec<String> = Vec::new();
+        let mut gave_up: Vec<String> = Vec::new();
+        let mut queue = std::mem::take(&mut self.outbox);
+        let sup = &self.supervisor;
+        let agents = &mut self.agents;
+        queue.retain_mut(|p| {
+            let sid = p.job.session;
+            let idle = matches!(sup.state_of(sid), Some(supervisor::SessionState::Idle));
+            let Some(s) = agents.sessions.iter_mut().find(|s| s.id == sid) else {
+                return false; // セッションが消えた
+            };
+            let bracketed = s.running() && s.bracketed_paste();
+            let peek = submit::Peek {
+                running: s.running(),
+                idle,
+                attention: s.attention,
+                bracketed,
+                // 入力欄の読み取りは **Verify 段だけ**。毎フレーム画面を舐めると
+                // アイドル時のコストがゼロでなくなる。
+                input: matches!(p.job.stage, submit::Stage::Verify)
+                    .then(|| s.input_text())
+                    .flatten(),
+            };
+            let mut soon = |d: Duration| {
+                next = Some(next.map_or(d, |n: Duration| n.min(d)));
+            };
+            match p.act(&peek, now) {
+                submit::Act::Gone | submit::Act::Done => false,
+                submit::Act::GaveUp => {
+                    gave_up.push(s.title.clone());
+                    false
+                }
+                submit::Act::Wait(d) => {
+                    soon(d);
+                    true
+                }
+                submit::Act::WriteBody => {
+                    // 手入力と同じ扱い (承認エピソードのラッチを立てる)。
+                    s.note_user_input();
+                    // 失敗切替で別プロファイルへ引き継ぐ材料として覚えておく。
+                    s.note_prompt(&p.job.text);
+                    s.write_bytes(&submit::body_bytes(&p.job.text, peek.bracketed));
+                    s.set_scroll(0);
+                    if p.job.wait_idle {
+                        delivered.push(s.title.clone());
+                    }
+                    p.advance(submit::Stage::Commit, now);
+                    soon(submit::COMMIT_DELAY);
+                    true
+                }
+                submit::Act::WriteCommit => {
+                    s.write_bytes(submit::COMMIT);
+                    p.job.tries = p.job.tries.saturating_add(1);
+                    p.advance(submit::Stage::Verify, now);
+                    soon(submit::VERIFY_DELAY);
+                    true
+                }
+            }
+        });
+        self.outbox = queue;
+        for title in delivered {
+            self.toast(trf("📋 {title} へ指示を配達しました", &[("title", title)]), true);
+        }
+        for title in gave_up {
+            self.toast_warn(trf(
+                "指示文を配達できませんでした ({title}): セッションが落ち着きません",
+                &[("title", title)],
+            ));
+        }
+        if let Some(d) = next {
+            ctx.request_repaint_after(d);
         }
     }
 
@@ -8503,7 +8630,8 @@ impl ZaivernApp {
             n = issue.number,
             title = issue.title,
         );
-        self.pending_prompts.push((sid, Instant::now(), prompt));
+        // 入力欄へ入れるだけ (確定はしない) — 着手前に人が内容を確かめられるように。
+        self.queue_submit(submit::Job::deferred(sid, prompt, false));
         self.toast(
             tr("⚡ エージェントを起動しました — 準備ができ次第、着手指示を入力欄へ入れます"),
             true,
@@ -8512,7 +8640,7 @@ impl ZaivernApp {
 
     /// 🏁 プロンプトレース開始ワンフロー:
     /// racer ごとの worktree 作成 → エージェント起動 → プロンプトの配達予約。
-    /// (Issue 着手フローと同じ部品 — worktree / launch / pending_prompts — の組み合わせ。
+    /// (Issue 着手フローと同じ部品 — worktree / launch / outbox — の組み合わせ。
     /// worktree の作成・検証は race.rs 側。)
     fn start_race_flow(&mut self, prompt: &str, preset_indices: &[usize], ctx: &egui::Context) {
         let root = self
@@ -8554,10 +8682,10 @@ impl ZaivernApp {
                     racer.status = race::RacerStatus::Running;
                     // 起動直後のプロンプトへ流れ込まないよう、Idle を待つ配達機構へ積む
                     if let Some(sid) = racer.session_id {
-                        self.pending_prompts.push((
+                        self.queue_submit(submit::Job::deferred(
                             sid,
-                            Instant::now(),
                             race::build_race_prompt(prompt, &racer.branch),
+                            true,
                         ));
                     }
                 }
@@ -17774,31 +17902,28 @@ impl ZaivernApp {
         mut orch_acts: Vec<orchestration::OrchAction>,
     ) {
         if let Some(text) = acts.broadcast {
-            self.agents.broadcast(&text);
-            self.toast(
-                trf(
-                    "📣 {n} セッションへ送信しました",
-                    &[("n", self.agents.running_count().to_string())],
-                ),
-                true,
-            );
+            let n = self.queue_submit_all(&text);
+            if n == 0 {
+                self.toast(tr("実行中のエージェントがありません"), false);
+            } else {
+                self.toast(
+                    trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
+                    true,
+                );
+            }
         }
         // 宛先を指名した送信は**その 1 体だけ**へ届ける (broadcast は通らない)
         if let Some((id, text)) = acts.send_to {
-            let sent = self
+            let live = self
                 .agents
                 .sessions
-                .iter_mut()
+                .iter()
                 .find(|s| s.id == id)
-                .map(|s| {
-                    // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)
-                    s.note_user_input();
-                    s.note_prompt(&text);
-                    (s.send_text(&format!("{text}\r")), s.title.clone())
-                });
-            match sent {
+                .map(|s| (s.running(), s.title.clone()));
+            match live {
                 Some((true, title)) => {
-                    self.toast(trf("✏ 送信: {title}", &[("title", title)]), true)
+                    self.queue_submit(submit::Job::user(id, text));
+                    self.toast(trf("✏ 送信: {title}", &[("title", title)]), true);
                 }
                 Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
                 None => self.toast(tr("宛先のセッションが見つかりません"), false),
@@ -18115,31 +18240,30 @@ impl ZaivernApp {
                     None => self.toast(tr("このセッションは権限モード切替に未対応です"), false),
                 },
                 kanban::KanbanAction::Send { idx, text } => {
-                    let sent = self.agents.sessions.get_mut(idx).map(|s| {
-                        // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)。
-                        s.note_user_input();
-                        s.note_prompt(&text);
-                        let mut t = text.clone();
-                        t.push('\r');
-                        (s.send_text(&t), s.title.clone())
-                    });
-                    match sent {
-                        Some((true, title)) => {
-                            self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true)
+                    let live = self
+                        .agents
+                        .sessions
+                        .get(idx)
+                        .map(|s| (s.id, s.running(), s.title.clone()));
+                    match live {
+                        Some((id, true, title)) => {
+                            self.queue_submit(submit::Job::user(id, text));
+                            self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true);
                         }
-                        Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
+                        Some((_, false, _)) => self.toast(tr("セッションが終了しています"), false),
                         None => {}
                     }
                 }
                 kanban::KanbanAction::Broadcast(text) => {
-                    self.agents.broadcast(&text);
-                    self.toast(
-                        trf(
-                            "📣 {n} セッションへ送信しました",
-                            &[("n", self.agents.running_count().to_string())],
-                        ),
-                        true,
-                    );
+                    let n = self.queue_submit_all(&text);
+                    if n == 0 {
+                        self.toast(tr("実行中のエージェントがありません"), false);
+                    } else {
+                        self.toast(
+                            trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
+                            true,
+                        );
+                    }
                 }
                 kanban::KanbanAction::OpenCockpit => {
                     self.cockpit = true;
@@ -27992,53 +28116,8 @@ impl ZaivernApp {
             }
         }
 
-        // ── Issue 着手フローの「安全になったら入力欄へ」配達 ──
-        // Idle (静かでプロンプトへ戻っている) を待って指示文を入れる。
-        // 45 秒待っても Idle にならない場合は、承認待ちでない限り入れてしまう
-        // (スピナーの誤検知等で永遠に待たないため)。2 分で諦めて知らせる。
-        if !self.pending_prompts.is_empty() {
-            let mut rest: Vec<(u64, Instant, String)> = Vec::new();
-            let mut delivered: Vec<String> = Vec::new();
-            let mut gave_up: Vec<String> = Vec::new();
-            for (sid, queued, text) in std::mem::take(&mut self.pending_prompts) {
-                let idle = matches!(
-                    self.supervisor.state_of(sid),
-                    Some(supervisor::SessionState::Idle)
-                );
-                let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == sid) else {
-                    continue; // セッションが消えた
-                };
-                if !s.running() {
-                    continue;
-                }
-                let overdue = queued.elapsed().as_secs() >= 45 && !s.attention;
-                if idle || overdue {
-                    s.note_prompt(&text);
-                    s.write_bytes(text.as_bytes());
-                    delivered.push(s.title.clone());
-                } else if queued.elapsed().as_secs() < 120 {
-                    rest.push((sid, queued, text));
-                } else {
-                    gave_up.push(s.title.clone());
-                }
-            }
-            self.pending_prompts = rest;
-            for title in delivered {
-                self.toast(
-                    trf(
-                        "📋 {title} の入力欄に着手指示を入れました — 確認して Enter",
-                        &[("title", title)],
-                    ),
-                    true,
-                );
-            }
-            for title in gave_up {
-                self.toast_warn(trf(
-                    "指示文を配達できませんでした ({title}): セッションが落ち着きません",
-                    &[("title", title)],
-                ));
-            }
-        }
+        // ── エージェントへの指示の配達 (唯一の出口) ──
+        self.submit_tick(ctx);
 
         // 表示中のアクティブセッションを既読にする。未読 (◆) は
         // 「見ていない間に意味的な出力が変わった」セッションだけに残る。

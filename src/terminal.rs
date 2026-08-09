@@ -2082,6 +2082,25 @@ impl Session {
         self.resolve_attention();
     }
 
+    /// アプリ (CLI エージェント) が bracketed paste を有効にしているか。
+    ///
+    /// 有効なら複数行の指示を `ESC[200~ … ESC[201~` で包める
+    /// ([`crate::submit::body_bytes`])。包まないと本文中の改行がその場で
+    /// 確定として扱われ、**指示が途中で分割送信される**。
+    pub fn bracketed_paste(&self) -> bool {
+        lock_ok(&self.parser).screen().bracketed_paste()
+    }
+
+    /// いま CLI の入力欄に見えている本文 (拾えなければ None)。
+    ///
+    /// 「送ったのに実行されず入力欄で待機している」を検出して確定キーを
+    /// 撃ち直すための材料 ([`crate::submit::still_pending`])。
+    /// 画面から**エージェントの状態を推測するためではない** —
+    /// 「自分が書いた文字列がまだそこにあるか」だけを見る。
+    pub fn input_text(&self) -> Option<String> {
+        input_area_selection(lock_ok(&self.parser).screen()).map(|(_, t)| t)
+    }
+
     /// 文字列をそのままPTYへ書き込む(プログラム的な入力送信)。成功で true。
     ///
     /// キーボード入力と同じ write_bytes 経路を使うため、ターミナルウィジェットに
