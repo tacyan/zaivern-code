@@ -1016,7 +1016,27 @@ pub fn parse_shortcut(s: &str) -> Option<KeyboardShortcut> {
     }
     let parts: Vec<&str> = s.split('+').map(str::trim).collect();
     let (key_part, mod_parts) = parts.split_last()?;
-    let key = key_from_name(key_part)?;
+    // **`+` は区切り文字でもありキー名でもある。** `"ctrl++"` は
+    // `["ctrl", "", ""]` に割れるので、末尾が空なら「最後の `+` はキーだった」
+    // と読み直す (`format_shortcut` が `Key::Plus` をそう出すため、
+    // ここを落とすと自分で出した表記を読み戻せない)。
+    // 見分け方: **空が 2 つ続いたときだけ**キーとしての `+`。
+    //   `"cmd++"` → `["cmd", "", ""]` → 最後の `+` はキー
+    //   `"cmd+"`  → `["cmd", ""]`     → 区切りだけ = 不正 (従来どおり None)
+    if key_part.is_empty() && parts.len() >= 2 && parts[parts.len() - 2].is_empty() {
+        let mut mods = Modifiers::NONE;
+        for m in &parts[..parts.len() - 2] {
+            mods = mods.plus(modifier_from_name(m)?);
+        }
+        return Some(KeyboardShortcut::new(mods, Key::Plus));
+    }
+    // 鍵名は**表示形式の綴りも受ける**。`format_shortcut` は矢印などを
+    // グリフ (`↓`) で出すので、`"Ctrl+↓"` のような自分で出した表記を
+    // 読み戻せないと往復が壊れる (非 macOS でのみ露見した — mac では
+    // 修飾キーが `⌃` になり `+` を含まないため別経路を通っていた)。
+    // `display_key_from_name` は `key_from_name` へ落ちる上位互換なので、
+    // 既存の `config.toml` の綴りは 1 つも壊れない。
+    let key = display_key_from_name(key_part)?;
     let mut mods = Modifiers::NONE;
     for m in mod_parts {
         mods = mods.plus(modifier_from_name(m)?);

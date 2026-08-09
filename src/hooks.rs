@@ -1153,8 +1153,13 @@ mod tests {
             .events
             .iter()
             .map(|ev| {
+                // **キーは TOML の「リテラル文字列」(単引用符) で組む。**
+                // 基本文字列 (`"…"`) だと Windows の絶対パスに含まれる `\` が
+                // エスケープ列として解釈され、`C:\Users\…` の `\U` で TOML の
+                // パースそのものが落ちる (Windows でだけ落ちて macOS/Linux では
+                // 気付けない類の罠)。リテラル文字列は中身を一切解釈しない。
                 format!(
-                    "[hooks.state.\"{}:{}:0:0\"]\ntrusted_hash = \"sha256:x\"\n",
+                    "[hooks.state.'{}:{}:0:0']\ntrusted_hash = \"sha256:x\"\n",
                     abs.display(),
                     snake_case(ev)
                 )
@@ -1183,7 +1188,7 @@ mod tests {
             ),
             (
                 // **他人のフックだけ**が信頼されている状態。
-                "[hooks.state.\"/どこか/hooks.json:pre_tool_use:0:0\"]\ntrusted_hash = \"sha256:y\"\n".into(),
+                "[hooks.state.'/どこか/hooks.json:pre_tool_use:0:0']\ntrusted_hash = \"sha256:y\"\n".into(),
                 false,
                 "別のフックが信頼されていても自分の分にはならない",
             ),
@@ -1227,30 +1232,34 @@ mod tests {
         let tf = home.join("trustedFolders.json");
         let parent = dir.to_string_lossy().to_string();
         let self_dir = gtree.to_string_lossy().to_string();
+        // **JSON は serde で組む。** `format!` で埋めると Windows の絶対パスの
+        // `\` がそのまま入り、`C:\Users\…` の `\U` が不正なエスケープになって
+        // JSON のパースごと落ちる (Windows でだけ落ちて他 OS では気付けない)。
+        let tj = |k: &str, v: &str| serde_json::json!({ k: v }).to_string();
         let gcases: Vec<(String, bool, &str)> = vec![
             ("{}".into(), false, "表が空なら未信頼"),
             (
-                format!("{{\"{self_dir}\":\"TRUST_FOLDER\"}}"),
+                tj(&self_dir, "TRUST_FOLDER"),
                 true,
                 "そのフォルダ自身が信頼されていれば有効",
             ),
             (
-                format!("{{\"{self_dir}\":\"DO_NOT_TRUST\"}}"),
+                tj(&self_dir, "DO_NOT_TRUST"),
                 false,
                 "明示的に拒否されていれば止まる",
             ),
             (
-                format!("{{\"{parent}\":\"TRUST_PARENT\"}}"),
+                tj(&parent, "TRUST_PARENT"),
                 true,
                 "祖先が配下ごと信頼していれば有効",
             ),
             (
-                format!("{{\"{parent}\":\"TRUST_FOLDER\"}}"),
+                tj(&parent, "TRUST_FOLDER"),
                 false,
                 "祖先が自分だけ信頼でも配下には及ばない",
             ),
             (
-                format!("{{\"{}\":\"TRUST_FOLDER\"}}", self_dir.to_uppercase()),
+                tj(&self_dir.to_uppercase(), "TRUST_FOLDER"),
                 cfg!(target_os = "macos") || cfg!(windows),
                 "大文字小文字を区別しない OS でだけ畳んで一致する",
             ),
