@@ -1333,16 +1333,22 @@ pub fn radar_window(
     }
     let rep = radar.report();
     let mut win_open = true;
-    egui::Window::new(tr("🛰 衝突レーダー"))
+    // **中身が無いときに大きな空箱を開かない。** 見張る相手が 2 本未満なら
+    // 高さを指定せず、egui に中身ぶんだけ縮めさせる (「空白は作らない」)。
+    let empty = rep.trees.len() < 2;
+    let mut win = egui::Window::new(tr("🛰 衝突レーダー"))
         .open(&mut win_open)
         .collapsible(false)
-        .resizable(true)
-        .default_width(620.0)
-        .default_height(460.0)
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            radar_body(ui, theme, radar, rep, selected, &mut acts);
-        });
+        .resizable(!empty)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0]);
+    win = if empty {
+        win.default_width(380.0)
+    } else {
+        win.default_width(620.0).default_height(460.0)
+    };
+    win.show(ctx, |ui| {
+        radar_body(ui, theme, radar, rep, selected, &mut acts);
+    });
     if !win_open {
         *open = false;
         acts.push(RadarAction::Close);
@@ -1399,6 +1405,15 @@ fn radar_body(
         );
     }
     if rep.trees.len() < 2 {
+        // 空状態は **1 行の案内だけ**。ここで大きなカードを描くと、
+        // 「中身より空状態を見せている時間の方が長いパネル」になる。
+        ui.label(
+            RichText::new(tr(
+                "🌿 worktree 隔離でエージェントを 2 体以上動かすと、マージ前に衝突を予測します",
+            ))
+            .small()
+            .color(theme.text_dim),
+        );
         return;
     }
     ui.add_space(space::SM);
