@@ -2055,7 +2055,7 @@ impl Supervisor {
             if let Some(out) = d.diagnose(&req) {
                 let _ = tx.send(out);
             }
-            ctx.request_repaint();
+            crate::perf::repaint(&ctx, "supervisor");
         });
     }
 

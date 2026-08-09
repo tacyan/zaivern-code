@@ -138,6 +138,35 @@ builtins = [
   "writeln", "read", "format", "nl", "tab",
 ]
 
+[[syntax]]
+# Dhall — 型の付く設定言語。`Natural/fold` のように `/` を含む組み込み名が
+# 1 語なので、`ident_extra` に `/` を入れて分断されないようにする。
+name = "Dhall"
+extensions = ["dhall"]
+tokens = ["dhall"]
+line_comment = ["--"]
+block_comment = [["{-", "-}"]]
+strings = ["\""]
+multiline_strings = [["''", "''"]]
+ident_extra = "/"
+fold = "brackets"
+keywords = [
+  "let", "in", "if", "then", "else", "merge", "toMap", "using", "with", "as",
+  "assert", "forall", "missing", "env", "http", "https", "import",
+]
+types = [
+  "Natural", "Integer", "Double", "Text", "Bool", "List", "Optional",
+  "Type", "Kind", "Sort", "Bytes", "Date", "Time", "TimeZone",
+]
+constants = ["True", "False", "None", "Some", "NaN", "Infinity"]
+builtins = [
+  "Natural/fold", "Natural/build", "Natural/isZero", "Natural/even", "Natural/odd",
+  "Natural/subtract", "Natural/toInteger", "Natural/show", "List/fold", "List/build",
+  "List/length", "List/head", "List/last", "List/indexed", "List/reverse",
+  "Text/show", "Text/replace", "Integer/show", "Integer/toDouble", "Integer/negate",
+  "Double/show", "Optional/fold", "Optional/build",
+]
+
 [[alias]]
 target = "Haskell"
 extensions = ["hs-boot", "hsig"]

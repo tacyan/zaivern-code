@@ -441,7 +441,7 @@ pub fn draw(
     // 再描画は「本当に絵が変わるとき」だけ要求する。
     let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
     if let Some(ms) = repaint_ms(state, focused) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+        crate::perf::repaint_after(ctx, std::time::Duration::from_millis(ms), "pet_anim");
     }
 
     PetResponse {
@@ -460,12 +460,31 @@ pub fn draw(
 /// 移るため、寝たまま反応しなくなることはない。
 /// 背面 (フォーカスなし) では、動いていても刻みを粗くする — 進捗は伝わるが
 /// 見ていない画面を 16fps で描く理由は無い。
+///
+/// ## 刻みを状態ごとに変える理由 (実測に基づく)
+///
+/// `ZAIVERN_PERF=1` で測ったところ、**アイドル時の再描画要求は 100% が
+/// ここ** (`pet_anim`) だった。しかも `Working` はエージェントが 1 体でも
+/// 走っていれば入る状態なので、以前の一律 60ms は
+/// **作業中ずっと 16.7fps を回し続ける**ことを意味していた
+/// (「アイドル 13fps」として報告された症状の正体)。
+///
+/// そこで **長く続く状態ほど粗く**する:
+/// - `Working` / `Groove` … 最長。動いていると伝わればよい
+/// - `Attention` / `Error` / `Happy` / `Annoyed` … 短命。ここだけ滑らかに
+///
+/// 「常時アニメーションはバッテリーのバグである」(設計原則 3) を、
+/// 進捗表示を殺さずに守るための配分。
 fn repaint_ms(state: PetState, focused: bool) -> Option<u64> {
     match state {
         PetState::Sleeping => None,
-        // うとうとはゆっくりした上下だけ。10fps で十分になめらか
-        PetState::Dozing => Some(if focused { 100 } else { 200 }),
-        _ => Some(if focused { 60 } else { 150 }),
+        // うとうとはゆっくりした上下だけ。背面ではさらに粗く。
+        PetState::Dozing => Some(if focused { 160 } else { 400 }),
+        // **一番長く続く状態**なので一番粗くする。8fps でも
+        // 「動いている」ことは十分に伝わる。
+        PetState::Working(_) | PetState::Groove => Some(if focused { 120 } else { 500 }),
+        // 短命な状態だけ滑らかに描く。
+        _ => Some(if focused { 80 } else { 250 }),
     }
 }
 
@@ -984,6 +1003,52 @@ mod tests {
         let doze = repaint_ms(PetState::Dozing, true).expect("Dozing は動く");
         let idle = repaint_ms(PetState::Idle, true).expect("Idle は動く");
         assert!(doze > idle, "Dozing {doze}ms は Idle {idle}ms より粗いはず");
+    }
+
+    /// **一番長く続く状態が一番安いこと。**
+    ///
+    /// `Working` はエージェントが 1 体でも走っていれば入る = 実運用で
+    /// 最も長く居座る状態。ここを短命な状態と同じ刻みにすると、
+    /// 作業中ずっとフレームを回し続ける (実測で「アイドル時の再描画要求の
+    /// 100% がペット」だった原因がこれ)。
+    #[test]
+    fn 作業中のアニメは短命な状態より安い() {
+        for bg in [true, false] {
+            let work = repaint_ms(PetState::Working(1), bg).expect("動く");
+            let groove = repaint_ms(PetState::Groove, bg).expect("動く");
+            for short in [PetState::Attention, PetState::Error, PetState::Happy] {
+                let s = repaint_ms(short, bg).expect("動く");
+                assert!(
+                    work > s,
+                    "focused={bg}: Working {work}ms は {short:?} {s}ms より粗いはず"
+                );
+                assert!(
+                    groove > s,
+                    "focused={bg}: Groove {groove}ms は {short:?} {s}ms より粗いはず"
+                );
+            }
+        }
+    }
+
+    /// **どの状態も 8fps を超えて回さない。**
+    /// これが破れると「常時アニメーションはバッテリーのバグ」に逆戻りする。
+    #[test]
+    fn 前景でも_8fps_を超えて回さない() {
+        for st in [
+            PetState::Idle,
+            PetState::Dozing,
+            PetState::Roam,
+            PetState::Working(1),
+            PetState::Groove,
+            PetState::Happy,
+            PetState::Annoyed,
+            PetState::Attention,
+            PetState::Error,
+        ] {
+            if let Some(ms) = repaint_ms(st, true) {
+                assert!(ms >= 80, "{st:?}: {ms}ms は速すぎる (>12.5fps)");
+            }
+        }
     }
 }
 

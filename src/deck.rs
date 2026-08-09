@@ -998,7 +998,7 @@ pub fn ui(
     st.update_tracks(live, now_ms, fresh_tail);
     // 無条件の再描画はしない。動きがあるときだけ回す (完全に静かなら 1 枚も出さない)。
     if let Some(ms) = deck_repaint_ms(st.busy, st.any_running, scanning) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+        crate::perf::repaint_after(&ctx, std::time::Duration::from_millis(ms), "deck_anim");
     }
 
     let rows = build_rows(live, &st.query);

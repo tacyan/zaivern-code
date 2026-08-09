@@ -367,6 +367,42 @@ types = [
 constants = ["true", "false"]
 
 # CUDA / Metal のホスト側は C++ そのものなので、既存の C++ 構文へ寄せる。
+[[syntax]]
+# V (vlang) — `.v` は既に Verilog が、`.vsh` は GLSL (頂点シェーダ) が
+# 持っているので**どちらも奪わない**
+# (同じ拡張子を 2 つの言語が主張すると、必ずどちらかが黙って壊れる)。
+# V 自身が曖昧回避のために用意している `.vv` と、
+# プロジェクトに必ずあるマニフェスト `v.mod` から引く。
+name = "V"
+extensions = ["vv"]
+filenames = ["v.mod"]
+tokens = ["vlang"]
+first_line = ["env -S v run", "env -S v", "/bin/v run"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+raw_strings = [["r'", "'"], ["r\"", "\""]]
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "fn", "mut", "pub", "module", "import", "struct", "enum", "interface", "union",
+  "type", "const", "if", "else", "for", "in", "is", "match", "return", "go",
+  "spawn", "defer", "or", "as", "assert", "break", "continue", "unsafe", "lock",
+  "rlock", "shared", "atomic", "static", "asm", "select", "goto", "sizeof",
+  "typeof", "isreftype", "dump", "__global", "__offsetof",
+]
+types = [
+  "bool", "string", "rune", "i8", "i16", "int", "i64", "i128", "u8", "u16",
+  "u32", "u64", "u128", "f32", "f64", "byte", "voidptr", "charptr", "byteptr",
+  "any", "map", "array", "chan", "thread", "isize", "usize",
+]
+constants = ["true", "false", "none", "nil"]
+builtins = [
+  "println", "print", "eprintln", "eprint", "panic", "error", "exit", "len",
+  "cap", "str", "json", "os", "time", "math", "strings", "arrays", "rand",
+  "flag", "net", "http", "sync", "term", "toml",
+]
+
 [[alias]]
 target = "C++"
 extensions = ["cu", "cuh", "cc", "ino", "ixx", "cppm"]

@@ -349,6 +349,14 @@ pub struct Session {
     /// フェイルオーバーで別プロファイルへ引き継ぐ材料 ([`Session::note_prompt`])。
     /// キーストロークや承認キーは含めない。
     pub last_prompt: Option<String>,
+    /// **端末へ直接打ち込んでいる途中の 1 行。**
+    ///
+    /// 自動命名とフェイルオーバーの引き継ぎは `last_prompt` を材料にするが、
+    /// これを埋めていたのは**アプリ経由の送信だけ**だった。ターミナルに
+    /// 直接タイプした指示は 1 文字ずつ PTY へ流れるだけで、どこにも
+    /// 残らない (= 直接打った人のセッションは永久に無題のままになる)。
+    /// ここで打鍵を組み立て直し、確定 (Enter) の瞬間に `note_prompt` へ渡す。
+    typed_line: TypedLine,
     /// このセッションの生ログの書き出し先 (再起動時の引き継ぎ・UI 表示用)。
     pub log_path: Option<PathBuf>,
     /// リンク検出の実行時状態 (実在確認のメモ + 直近に解析した 1 行)。
@@ -1081,6 +1089,90 @@ const SIG_MARKS: [&str; 47] = [
 /// 「Do you want to proceed? / ❯ 1. Yes」自体は同一でも、直上のコマンド
 /// プレビューが変わる = 別のプロンプト、を区別するため。行テキストのみで
 /// 位置は使わないので、スクロールや下部の出力追加では変わらない。
+/// **端末へ直接打ち込んだ 1 行の組み立て状態。**
+///
+/// 「途中まで打った本文」と「この行を捨てるべきか」の 2 つを持つ。
+/// 捨てる印が要るのは、打鍵は **1 回の write に収まるとは限らない**ため。
+/// 矢印キーだけが単独で届いたフレームで本文を消しても、次のフレームから
+/// 何事も無かったように積み直してしまい、**本文の途中だけを覚える**
+/// (「abc←def」を「def」として覚える) 事故になる。
+/// 確定 (Enter) まで印を持ち越して、行ごと捨てる。
+#[derive(Default)]
+pub struct TypedLine {
+    buf: String,
+    /// この行に再現できない打鍵 (エスケープ列) が混ざったか。
+    tainted: bool,
+}
+
+/// **打鍵バイト列から「確定した 1 行」を組み立てる (純関数)。**
+///
+/// `st` は呼び出しをまたいで持ち回る途中状態。確定 (CR / LF) が来たら
+/// その行を返し、状態を空へ戻す。1 回の呼び出しに複数行が入っていれば
+/// **最後の行**を返す (直近の指示が欲しいので、古い行は捨てて良い)。
+///
+/// 扱う制御文字:
+/// - `\r` / `\n` … 確定
+/// - `\x7f` / `\x08` (Backspace) … 1 文字消す
+/// - `\x03` (Ctrl+C) / `\x15` (Ctrl+U) … 行を捨てる
+/// - `ESC` から始まる列 … カーソル移動などなので**その行ごと捨てる**
+///   (途中に矢印キーが入った行を正しく再現するのは無理筋で、
+///   間違った本文を覚えるより覚えない方が良い)
+/// - bracketed paste の囲み … 剥がして中身だけ残す
+/// - その他の制御文字 … 無視
+///
+/// UTF-8 の途中で切れたバイト列が来ても壊れない (不正な並びは捨てる)。
+pub fn feed_typed_line(st: &mut TypedLine, bytes: &[u8]) -> Option<String> {
+    // bracketed paste の囲みを剥がす (中身は普通の文字として扱う)。
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
+    let mut out: Option<String> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' | '\n' => {
+                // CRLF は 1 回の確定として扱う。
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                let line = std::mem::take(&mut st.buf);
+                let tainted = std::mem::take(&mut st.tainted);
+                if !tainted && !line.trim().is_empty() {
+                    out = Some(line);
+                }
+            }
+            '\u{7f}' | '\u{8}' => {
+                st.buf.pop();
+            }
+            '\u{3}' | '\u{15}' => {
+                st.buf.clear();
+                st.tainted = false;
+            }
+            '\u{1b}' => {
+                // エスケープ列が混ざった行は再現できないので、
+                // **確定まで印を持ち越して**行ごと捨てる。
+                st.buf.clear();
+                st.tainted = true;
+                // 続く列そのものも読み飛ばす (次の確定は下の分岐で拾う)。
+                while let Some(&c) = chars.peek() {
+                    if c == '\r' || c == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            '\t' => st.buf.push(' '),
+            c if c.is_control() => {}
+            c => {
+                // 暴走した貼り付けで無制限に伸びないよう頭打ちにする。
+                if st.buf.chars().count() < PROMPT_KEEP_CHARS {
+                    st.buf.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn prompt_signature(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1670,12 +1762,12 @@ impl Session {
                             if !reply.is_empty() {
                                 writer.send(&reply);
                             }
-                            ctx.request_repaint();
+                            crate::perf::repaint(&ctx, "pty_read");
                         }
                     }
                 }
                 exited.store(true, Ordering::SeqCst);
-                ctx.request_repaint();
+                crate::perf::repaint(&ctx, "pty_read");
             });
         }
         {
@@ -1686,7 +1778,7 @@ impl Session {
                     *lock_ok(&exit_code) = Some(status.exit_code());
                 }
                 exited.store(true, Ordering::SeqCst);
-                ctx.request_repaint();
+                crate::perf::repaint(&ctx, "pty_exit");
             });
         }
 
@@ -1750,6 +1842,7 @@ impl Session {
             last_prompt: None,
             log_path: spec.log_path,
             links: LinkState::default(),
+            typed_line: TypedLine::default(),
         })
     }
 
@@ -1980,6 +2073,18 @@ impl Session {
         self.last_prompt = Some(t.chars().take(PROMPT_KEEP_CHARS).collect());
     }
 
+    /// **端末へ直接打ち込んだ打鍵を 1 行へ組み立て直す。**
+    ///
+    /// `write_bytes` へ流す直前のバイト列を毎回ここへ通す。Enter (CR/LF) が
+    /// 来た時点で、それまでに打った本文を `note_prompt` へ渡す。
+    /// これが無いと「ターミナルに直接タイプした指示」がどこにも残らず、
+    /// 自動命名も失敗切替の引き継ぎも材料ゼロで走ることになる。
+    pub fn note_typed_bytes(&mut self, bytes: &[u8]) {
+        if let Some(line) = feed_typed_line(&mut self.typed_line, bytes) {
+            self.note_prompt(&line);
+        }
+    }
+
     /// 未読か。「最後に見た時点から意味的な画面内容が変わった」または手動ピン。
     pub fn has_unread(&self) -> bool {
         self.pinned_unread || self.cur_hash != self.seen_hash
@@ -2080,6 +2185,25 @@ impl Session {
     pub fn note_user_input(&mut self) {
         self.user_typed = true;
         self.resolve_attention();
+    }
+
+    /// アプリ (CLI エージェント) が bracketed paste を有効にしているか。
+    ///
+    /// 有効なら複数行の指示を `ESC[200~ … ESC[201~` で包める
+    /// ([`crate::submit::body_bytes`])。包まないと本文中の改行がその場で
+    /// 確定として扱われ、**指示が途中で分割送信される**。
+    pub fn bracketed_paste(&self) -> bool {
+        lock_ok(&self.parser).screen().bracketed_paste()
+    }
+
+    /// いま CLI の入力欄に見えている本文 (拾えなければ None)。
+    ///
+    /// 「送ったのに実行されず入力欄で待機している」を検出して確定キーを
+    /// 撃ち直すための材料 ([`crate::submit::still_pending`])。
+    /// 画面から**エージェントの状態を推測するためではない** —
+    /// 「自分が書いた文字列がまだそこにあるか」だけを見る。
+    pub fn input_text(&self) -> Option<String> {
+        input_area_selection(lock_ok(&self.parser).screen()).map(|(_, t)| t)
     }
 
     /// 文字列をそのままPTYへ書き込む(プログラム的な入力送信)。成功で true。
@@ -6333,6 +6457,10 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
         // 承認プロンプトへの手入力応答もここで「応答済み」として解決する
         // (自動YESオフの手動運転で attention を引きずらないため)。
         session.note_user_input();
+        // 直接打ち込んだ指示も覚える (自動命名 / 失敗切替の引き継ぎの材料)。
+        // 送る前に通すこと — `write_bytes` の後だと、送信で状態が変わった
+        // セッションに対して古い行を記録してしまう。
+        session.note_typed_bytes(&out);
         session.write_bytes(&out);
         session.set_scroll(0);
     }
@@ -6520,6 +6648,10 @@ pub struct LinkState {
     exists: HashMap<PathBuf, (bool, Instant)>,
     /// (行, 行テキストのハッシュ, 解決済みリンク)。
     row: Option<(u16, u64, Vec<ResolvedLink>)>,
+    /// 直近にポインタを押し下げた座標。クリックとドラッグ選択を見分けるために持つ。
+    /// egui の `press_origin` は **離した瞬間のフレームでもう None** に戻るので、
+    /// クリックが確定するそのフレームでは読めない。押されている間に控えておく。
+    press_at: Option<egui::Pos2>,
 }
 
 /// 実在確認の有効期間。ビルドで生まれたファイルが数秒で拾えるだけの短さ。
@@ -6915,18 +7047,48 @@ fn cols_for_range(map: &[(usize, u16)], start: usize, end: usize, cols: u16) -> 
     (col_start, col_end.max(col_start.saturating_add(1)))
 }
 
-/// クリックでリンクを開くときに要求する修飾キーの表示名。
+/// このクリックでリンクを開いてよいか。**egui に触らない純関数**にして、
+/// 「素のクリックで開ける」と「文字選択を壊さない」の両立をテーブルテストで固定する。
 ///
-/// `BindAction` を持たない **マウス操作の修飾**なので keybinds 表には無い。
-/// それでも打鍵表記をソースにベタ書きしないよう egui の表から生成する。
-fn link_modifier_label() -> String {
-    let mac = cfg!(target_os = "macos");
-    let names = if mac {
-        egui::ModifierNames::SYMBOLS
-    } else {
-        egui::ModifierNames::NAMES
-    };
-    names.format(&egui::Modifiers::COMMAND, mac)
+/// 端末の素のクリックは既に (1) ドラッグ選択の起点 (2) 選択の解除
+/// (3) ダブル/トリプルクリックの語・行選択、として使われている。
+/// リンクを開くのは **そのどれでもないと確定したクリックだけ**。
+///
+/// * `hovering` — ポインタの下にリンクがあるか。
+/// * `dragged_px` — 押し始めから離すまでにポインタが動いた距離 (px)。
+/// * `slop_px` — クリックと見なす移動量の上限。egui が `clicked()` の判定に使う
+///   `max_click_dist` をそのまま渡す (自前のしきい値を作ると egui と食い違う)。
+/// * `click_count` — 0=クリックなし / 1=シングル / 2=ダブル / 3=トリプル。
+/// * `modified` — 修飾キー (mac は Command / 他は Ctrl) が押されているか。
+/// * `had_selection` — このクリックの **前**に選択範囲があったか。
+fn should_open_link(
+    hovering: bool,
+    dragged_px: f32,
+    slop_px: f32,
+    click_count: u8,
+    modified: bool,
+    had_selection: bool,
+) -> bool {
+    // ダブル(語選択)・トリプル(行選択)は選択操作。0 は「そもそも押していない」。
+    if !hovering || click_count != 1 {
+        return false;
+    }
+    // 測れなかった値 (NaN / 無限大 / 負) は安全側に倒して開かない。
+    // NaN は比較が常に false になるので、大小を見る前に弾いておく。
+    if !dragged_px.is_finite() || !slop_px.is_finite() || dragged_px < 0.0 {
+        return false;
+    }
+    // しきい値を超えて動いていたらドラッグ選択。開かない。
+    if dragged_px > slop_px {
+        return false;
+    }
+    // 修飾キー付きは従来からの経路。指が覚えているので、選択の有無に関わらず開く。
+    if modified {
+        return true;
+    }
+    // 素のクリックで選択範囲がある間は「選択を解除したい」の意味。
+    // ここで開くと、読み返そうとして選択しただけの人がブラウザへ飛ばされる。
+    !had_selection
 }
 
 /// 端末のリンククリックが積む「このファイルのこの位置を開いて」要求のキー。
@@ -7008,11 +7170,11 @@ impl Session {
 
 /// リンクのホバー表示とクリック処理。
 ///
-/// クリックに **修飾キー (mac は Command / 他は Ctrl) を要求する**のは VS Code と
-/// 同じ理由: 端末の素のクリックは「選択の解除」とドラッグ選択の起点として既に
-/// 使われており、横取りすると文字選択が壊れる。修飾キーが押されている間だけ
-/// 手のカーソルに変え、押されていない間も下線と案内を出して「押せば開ける」と
-/// 分かるようにする。
+/// **修飾キー無しのクリックでも開く**。VS Code は ⌘ を要求するが、
+/// 「リンクに見えるのに押しても何も起きない」の方がずっと多く報告される。
+/// 代わりに、選択操作と衝突しないクリックだけを [`should_open_link`] で選り分ける
+/// (ドラッグした / ダブル・トリプルクリック / 選択が残っている、は全部見送る)。
+/// 修飾キー付きは従来どおり開くので、覚えている指も壊れない。
 #[allow(clippy::too_many_arguments)]
 fn handle_links(
     ui: &egui::Ui,
@@ -7024,6 +7186,7 @@ fn handle_links(
     padding: f32,
     cell_w: f32,
     cell_h: f32,
+    had_selection: bool,
 ) {
     if cell_w <= 0.0 || cell_h <= 0.0 {
         return;
@@ -7051,7 +7214,7 @@ fn handle_links(
         return;
     };
 
-    let modded = ui.input(|i| i.modifiers.command);
+    let modified = ui.input(|i| i.modifiers.command);
     // 端末セルと同じく整数ピクセルへ揃える (小数のままだと 100% 表示で揺れる)
     let ppp = ui.ctx().pixels_per_point();
     let origin = rect.min + egui::vec2(padding, padding);
@@ -7059,14 +7222,13 @@ fn handle_links(
     let x1 =
         crate::theme::snap_len(origin.x + f32::from(link.col_end) * cell_w, ppp).min(rect.max.x);
     let y = crate::theme::snap_len(origin.y + f32::from(row) * cell_h + cell_h - 1.0, ppp);
-    let (color, width) = if modded {
-        (theme.accent, 1.5_f32)
-    } else {
-        (theme.text_dim, 1.0_f32)
-    };
+    // 修飾キーの有無で見た目を変えない。押せば開けるのだから、押せると分かる
+    // 描き方を常に出す。色は `Theme::link_color()` — アクセント色を流用すると
+    // 選択の塗り・カーソル・フォーカスリングと同じ色になり、「押せるもの」と
+    // 「いま選ばれているもの」が見分けられなくなる。
     painter.line_segment(
         [egui::pos2(x0, y), egui::pos2(x1, y)],
-        egui::Stroke::new(width, color),
+        egui::Stroke::new(1.5_f32, theme.link_color()),
     );
 
     let label = match &link.target {
@@ -7075,15 +7237,39 @@ fn handle_links(
             format!("{}:{}", path.display(), line.saturating_add(1))
         }
     };
-    if modded {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response.clone().on_hover_text(trf(
-        "{k} + クリックで開く: {t}",
-        &[("k", link_modifier_label()), ("t", label)],
-    ));
+    // 手のカーソルも修飾キーに関係なく出す (押せるものは押せる形をしている)。
+    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    response
+        .clone()
+        .on_hover_text(trf("クリックで開く: {t}", &[("t", label)]));
 
-    if modded && response.clicked() {
+    // クリックとドラッグ選択の見分け。しきい値は egui が `clicked()` を判定する
+    // のに使う値をそのまま借りる (自前の数字を置くと egui の判定と食い違う)。
+    let slop_px = ui.ctx().options(|o| o.input_options.max_click_dist);
+    // 押し始めの記録が無いフレームは「測れなかった」= 開かない側へ倒す。
+    let dragged_px = session
+        .links
+        .press_at
+        .map_or(f32::INFINITY, |p| p.distance(pos));
+    // 右クリック(コンテキストメニュー)まで拾わないよう、主ボタンだけを見る。
+    // egui の `Response::clicked` はボタンを区別しない点に注意。
+    let click_count = if response.triple_clicked_by(egui::PointerButton::Primary) {
+        3
+    } else if response.double_clicked_by(egui::PointerButton::Primary) {
+        2
+    } else if response.clicked_by(egui::PointerButton::Primary) {
+        1
+    } else {
+        0
+    };
+    if should_open_link(
+        response.hovered(),
+        dragged_px,
+        slop_px,
+        click_count,
+        modified,
+        had_selection,
+    ) {
         match link.target {
             LinkTarget::Url(u) => ui.ctx().open_url(egui::OpenUrl::new_tab(u)),
             LinkTarget::File { path, line, col } => {
@@ -7361,12 +7547,21 @@ pub fn draw(
             // 安定カウント (RESIZE_STABLE_FRAMES) が完走する前に再描画が
             // 止まると、最終サイズが PTY へ届かないまま残る。完走するまで
             // フレームを回し続けて取りこぼしを防ぐ (高々 K フレーム)。
-            ui.ctx().request_repaint();
+            crate::perf::repaint(ui.ctx(), "term_focus");
         }
     }
 
     // ── マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行) ──
+    // リンクを開いてよいかは「このクリックの前に選択があったか」で変わるが、
+    // handle_mouse_selection はクリックで選択を消してしまう。先に控えておく。
+    let had_selection = session.selection.is_some();
     if interactive {
+        // 押し始めの座標。ドラッグ選択とクリックの見分けに使う。
+        // egui の press_origin は離した瞬間のフレームで None に戻っているので、
+        // 押されている間 (= Some の間) にこちらへ写しておく。
+        if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+            session.links.press_at = Some(p);
+        }
         handle_mouse_selection(session, &response, rect, padding, cell_w, cell_h);
     }
 
@@ -7411,7 +7606,16 @@ pub fn draw(
     // 走査するのはポインタ下の 1 行だけなので、静止中のコストは 0。
     if interactive && response.hovered() {
         handle_links(
-            ui, &painter, session, theme, &response, rect, padding, cell_w, cell_h,
+            ui,
+            &painter,
+            session,
+            theme,
+            &response,
+            rect,
+            padding,
+            cell_w,
+            cell_h,
+            had_selection,
         );
     }
 
@@ -7525,8 +7729,11 @@ pub fn draw(
             );
             painter.rect_filled(bg, 8.0, theme.accent);
             painter.galley(bg.min + egui::vec2(7.0, 3.0), galley, theme.term_bg);
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(150));
+            crate::perf::repaint_after(
+                ui.ctx(),
+                std::time::Duration::from_millis(150),
+                "term_osc52",
+            );
         } else {
             session.copied_at = None;
         }
@@ -11983,7 +12190,7 @@ mod split_tests {
 mod link_tests {
     use super::{
         cols_for_range, detect_links, detect_urls, exists_cached, resolve_link_path, row_text_cols,
-        LinkKind, LinkMatch,
+        should_open_link, LinkKind, LinkMatch,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -12263,5 +12470,293 @@ mod link_tests {
             "TTL 内なのに stat し直している"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「素のクリックで開く」が選択操作を壊していないことの表。
+    ///
+    /// ここが本体。描画側 (`handle_links`) は egui から値を集めて
+    /// この関数へ渡すだけなので、選択との衝突はこの表で固定できる。
+    /// `slop` は egui の `max_click_dist` 既定値と同じ 6px を代表値に使う
+    /// (実コードは egui の設定から読むので、値が変わっても追随する)。
+    #[test]
+    fn 素のクリックで開くが選択操作は壊さない() {
+        const SLOP: f32 = 6.0;
+        // (説明, hovering, dragged_px, click_count, modified, had_selection, 期待)
+        let table: &[(&str, bool, f32, u8, bool, bool, bool)] = &[
+            (
+                "素のシングルクリックは開く",
+                true,
+                0.0,
+                1,
+                false,
+                false,
+                true,
+            ),
+            (
+                "修飾キー付きも従来どおり開く",
+                true,
+                0.0,
+                1,
+                true,
+                false,
+                true,
+            ),
+            (
+                "リンクの上でなければ開かない",
+                false,
+                0.0,
+                1,
+                true,
+                false,
+                false,
+            ),
+            (
+                "クリックしていないフレームは開かない",
+                true,
+                0.0,
+                0,
+                false,
+                false,
+                false,
+            ),
+            (
+                "ダブルクリック(語選択)では開かない",
+                true,
+                0.0,
+                2,
+                false,
+                false,
+                false,
+            ),
+            (
+                "修飾キー付きダブルクリックでも開かない",
+                true,
+                0.0,
+                2,
+                true,
+                false,
+                false,
+            ),
+            (
+                "トリプルクリック(行選択)では開かない",
+                true,
+                0.0,
+                3,
+                false,
+                false,
+                false,
+            ),
+            (
+                "修飾キー付きトリプルクリックでも開かない",
+                true,
+                0.0,
+                3,
+                true,
+                false,
+                false,
+            ),
+            (
+                "しきい値ちょうどの微動はクリック",
+                true,
+                SLOP,
+                1,
+                false,
+                false,
+                true,
+            ),
+            (
+                "しきい値を超えたらドラッグ選択",
+                true,
+                SLOP + 0.001,
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "大きく引きずったら開かない",
+                true,
+                400.0,
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "引きずれば修飾キー付きでも開かない",
+                true,
+                400.0,
+                1,
+                true,
+                false,
+                false,
+            ),
+            (
+                "選択が残っている素のクリックは解除の意図",
+                true,
+                0.0,
+                1,
+                false,
+                true,
+                false,
+            ),
+            (
+                "選択があっても修飾キー付きなら開く",
+                true,
+                0.0,
+                1,
+                true,
+                true,
+                true,
+            ),
+            (
+                "測れない距離(NaN)は開かない",
+                true,
+                f32::NAN,
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "測れない距離(∞)は開かない",
+                true,
+                f32::INFINITY,
+                1,
+                false,
+                false,
+                false,
+            ),
+            (
+                "負の距離はあり得ないので開かない",
+                true,
+                -1.0,
+                1,
+                false,
+                false,
+                false,
+            ),
+        ];
+        for (why, hovering, dragged, count, modified, had_sel, want) in table {
+            let got = should_open_link(*hovering, *dragged, SLOP, *count, *modified, *had_sel);
+            assert_eq!(
+                got, *want,
+                "{why}: hovering={hovering} dragged={dragged} count={count} \
+                 modified={modified} had_selection={had_sel}"
+            );
+        }
+        // しきい値そのものが壊れた値でも「開かない」側へ倒れる
+        for slop in [f32::NAN, f32::INFINITY] {
+            assert!(
+                !should_open_link(true, 0.0, slop, 1, false, false),
+                "しきい値が {slop} のとき開いてしまった"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod typed_line_tests {
+    use super::{feed_typed_line, TypedLine};
+
+    fn feed(seq: &[&str]) -> Vec<String> {
+        let mut st = TypedLine::default();
+        let mut out = Vec::new();
+        for s in seq {
+            if let Some(l) = feed_typed_line(&mut st, s.as_bytes()) {
+                out.push(l);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn 打鍵を組み立てて_enter_で確定する() {
+        assert_eq!(feed(&["テ", "ス", "ト", "して", "\r"]), vec!["テストして"]);
+    }
+
+    #[test]
+    fn 一括で来ても確定する() {
+        assert_eq!(feed(&["テストしてください\r"]), vec!["テストしてください"]);
+    }
+
+    #[test]
+    fn crlf_は一回の確定() {
+        assert_eq!(feed(&["やって\r\n"]), vec!["やって"]);
+    }
+
+    #[test]
+    fn バックスペースで消える() {
+        assert_eq!(feed(&["abcd", "\u{7f}", "\u{7f}", "\r"]), vec!["ab"]);
+    }
+
+    #[test]
+    fn ctrl_c_と_ctrl_u_で行を捨てる() {
+        assert_eq!(feed(&["書きかけ", "\u{3}", "\r"]), Vec::<String>::new());
+        assert_eq!(feed(&["書きかけ", "\u{15}", "\r"]), Vec::<String>::new());
+    }
+
+    /// 空 Enter (承認プロンプトへの Enter 等) は「指示」ではない。
+    /// ここを覚えると、承認するたびにセッション名が壊れる。
+    #[test]
+    fn 空の_enter_は確定として扱わない() {
+        assert_eq!(feed(&["\r", "\r", "  ", "\r"]), Vec::<String>::new());
+    }
+
+    /// 矢印キーなどが混ざった行は本文を再現できないので覚えない。
+    /// 間違った本文で命名するより、命名しない方が良い。
+    #[test]
+    fn エスケープ列が混ざった行は捨てる() {
+        assert_eq!(feed(&["abc", "\u{1b}[D", "x\r"]), Vec::<String>::new());
+    }
+
+    /// **エスケープ列が別の write で来ても行を捨てる。**
+    /// 打鍵は 1 回の write に収まるとは限らないので、印を確定まで持ち越す。
+    /// ここが持続しないと「abc←def」を「def」として覚えてしまう。
+    #[test]
+    fn エスケープ列の直後に打ち直しても行は捨てる() {
+        assert_eq!(
+            feed(&["abc", "\u{1b}[D", "でふぉると\r"]),
+            Vec::<String>::new()
+        );
+    }
+
+    /// 捨てた印は次の行へ持ち越さない (1 行捨てたら以後ずっと無効、を防ぐ)。
+    #[test]
+    fn 捨てた印は次の行へ持ち越さない() {
+        assert_eq!(
+            feed(&["abc", "\u{1b}[D", "x\r", "つぎの指示\r"]),
+            vec!["つぎの指示"]
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_の囲みは剥がす() {
+        assert_eq!(
+            feed(&["\u{1b}[200~一行目 二行目\u{1b}[201~", "\r"]),
+            vec!["一行目 二行目"]
+        );
+    }
+
+    /// 1 回の呼び出しに複数行が入っていたら、直近の行だけを返す。
+    #[test]
+    fn 複数行が来たら最後の行を返す() {
+        assert_eq!(feed(&["ひとつめ\r ふたつめ\r"]), vec![" ふたつめ"]);
+    }
+
+    /// 暴走した貼り付けで無制限に伸びない。
+    #[test]
+    fn 長すぎる本文は頭打ちにする() {
+        let mut st = TypedLine::default();
+        let big = "あ".repeat(10_000);
+        let got = feed_typed_line(&mut st, format!("{big}\r").as_bytes()).expect("確定する");
+        assert_eq!(got.chars().count(), super::PROMPT_KEEP_CHARS);
+    }
+
+    /// 壊れた UTF-8 が来ても panic しない (PTY 由来のバイト列は信用できない)。
+    #[test]
+    fn 壊れた_utf8_でも落ちない() {
+        let mut st = TypedLine::default();
+        let _ = feed_typed_line(&mut st, &[0xff, 0xfe, b'a', b'b', b'\r']);
     }
 }

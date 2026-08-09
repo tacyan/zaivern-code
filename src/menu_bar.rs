@@ -112,6 +112,8 @@ pub struct MenuInfo {
     pub ui_zoom: f32,
     /// アクティブなタブのズーム倍率。タブが無ければ None (ファイル単位の項目を落とす)
     pub file_zoom: Option<f32>,
+    /// **文字サイズだけ**の倍率 (1.0 = 等倍)。「戻す」の有効/無効に使う
+    pub text_scale: f32,
     /// 保存時に行末の空白を落とす (編集メニューのチェック状態)
     pub trim_trailing_on_save: bool,
     /// 保存時に末尾の余分な空行を落とす (同上)
@@ -613,6 +615,30 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             ) {
                 cmds.push(Cmd::FileZoomReset);
             }
+            ui.separator();
+            // ── 文字サイズだけ (ズームとは別物) ──
+            // ズームは余白・ボタン・パネル幅まで大きくするので画面に入る情報が
+            // 減る。こちらはレイアウトを変えずに文字だけ掛け直すので、
+            // 「窓は広いまま、字だけ読みやすく」ができる。
+            // 既定のキーバインドは持たない — ⌘⇧+ は US 配列だと ⌘+ と同じ打鍵に
+            // なり、画面全体のズームを壊すため (必要な人は config.toml で割り当てる)。
+            if item(ui, &tr("文字サイズを大きく"), "", true) {
+                cmds.push(Cmd::TextSizeIn);
+            }
+            if item(ui, &tr("文字サイズを小さく"), "", true) {
+                cmds.push(Cmd::TextSizeOut);
+            }
+            if item(
+                ui,
+                &trf(
+                    "文字サイズを戻す ({pct})",
+                    &[("pct", crate::zoom::label(info.text_scale))],
+                ),
+                "",
+                !crate::zoom::is_default(info.text_scale),
+            ) {
+                cmds.push(Cmd::TextSizeReset);
+            }
         });
         ui.separator();
         // ── エディタの分割 (VS Code の editor group 相当) ──
@@ -1066,6 +1092,9 @@ fn help_menu(ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
         ui.separator();
         if item(ui, &tr("バージョン情報"), "", true) {
             cmds.push(Cmd::ShowAbout);
+        }
+        if item(ui, &tr("この版の新機能 (What's New)"), "", true) {
+            cmds.push(Cmd::ShowWhatsNew);
         }
     });
 }

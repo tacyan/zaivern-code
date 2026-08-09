@@ -103,6 +103,20 @@ builtins = [
 ]
 constants = ["true", "false"]
 
+[[syntax]]
+# sed — コマンドが 1 文字なので、キーワード集合も 1 文字で持つ。
+# `#` は**行頭のみ**コメント (`s#a#b#` のように区切り記号にも使うため)。
+name = "sed"
+extensions = ["sed"]
+tokens = ["sed"]
+first_line = ["#!/usr/bin/sed", "#!/usr/bin/env sed", "#!/bin/sed"]
+line_comment_bol = ["#"]
+fold = "indent"
+keywords = [
+  "s", "y", "p", "P", "d", "D", "g", "G", "h", "H", "n", "N", "x", "b", "t",
+  "T", "a", "i", "c", "l", "q", "Q", "r", "R", "w", "W", "z", "F", "e", "v",
+]
+
 [[alias]]
 target = "Bourne Again Shell (bash)"
 extensions = ["ksh", "mksh", "ash", "shrc", "bats", "zshrc", "bash_profile", "profile"]

@@ -1742,6 +1742,35 @@ pub fn clipboard_alias(sc: KeyboardShortcut) -> Option<ClipboardAlias> {
     }
 }
 
+/// **素の ⌘C / ⌘X / ⌘V を、いま入力を握っているウィジェットが受け取る口。**
+///
+/// egui-winit 0.29 は押下イベントを握り潰して `Event::Copy` / `Cut` / `Paste`
+/// に差し替えてしまうので、`InputState::consume_key(COMMAND, Key::C)` は
+/// **構造的に絶対発火しない**。ファイルツリーのコピー/切り取り/貼り付けが
+/// 「メニューからは効くのにキーでは効かない」のはこれが原因だった。
+///
+/// [`consume_shortcut_compat`] が素の ⌘C を対象外にしているのは、
+/// **アプリ全体のショートカット表**から横取りするとテキスト欄のコピーが
+/// 壊れるため。こちらは逆で、「自分がキーボードの持ち主だと確かめた
+/// ウィジェットだけ」が呼ぶ前提の関数なので、素の打鍵を取ってよい。
+///
+/// 呼ぶ側は **自分にフォーカスがあることを先に確かめること**
+/// (ファイルツリーなら `self.focused` かつ egui の focus が空)。
+pub fn take_clipboard_event(i: &mut egui::InputState, alias: ClipboardAlias) -> bool {
+    let mut hit = false;
+    i.events.retain(|e| {
+        let is_match = matches!(
+            (e, alias),
+            (egui::Event::Cut, ClipboardAlias::Cut)
+                | (egui::Event::Copy, ClipboardAlias::Copy)
+                | (egui::Event::Paste(_), ClipboardAlias::Paste)
+        );
+        hit |= is_match;
+        !is_match
+    });
+    hit
+}
+
 /// [`egui::InputState::consume_shortcut`] の代替。
 ///
 /// 通常の経路で拾えなかったときだけ、[`clipboard_alias`] のすり替えを
@@ -2722,6 +2751,59 @@ mod tests {
             checked >= 2,
             "⌘⇧C / ⌘⇧V が対象から外れている ({checked} 件)"
         );
+    }
+
+    /// フォーカスの持ち主は素の ⌘C / ⌘X / ⌘V を受け取れる。
+    ///
+    /// これが取れないと、ファイルツリーのコピー/切り取り/貼り付けが
+    /// 「メニューからは効くのにキーでは効かない」に戻る。
+    #[test]
+    fn フォーカスの持ち主は素のクリップボード打鍵を受け取れる() {
+        for (alias, ev) in [
+            (ClipboardAlias::Copy, egui::Event::Copy),
+            (ClipboardAlias::Cut, egui::Event::Cut),
+            (ClipboardAlias::Paste, egui::Event::Paste("x".into())),
+        ] {
+            let ctx = egui::Context::default();
+            let (mut hit, mut left) = (false, 0);
+            let _ = ctx.run(
+                egui::RawInput {
+                    modifiers: Modifiers::COMMAND,
+                    events: vec![ev],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input_mut(|i| {
+                        hit = take_clipboard_event(i, alias);
+                        left = i.events.len();
+                    });
+                },
+            );
+            assert!(hit, "{alias:?} を拾えていない");
+            assert_eq!(left, 0, "{alias:?}: 拾ったのにイベントが残っている");
+        }
+    }
+
+    /// 種類が違うイベントは食べない (⌘C のつもりで貼り付けを消さない)。
+    #[test]
+    fn 種類の違うクリップボードイベントは食べない() {
+        let ctx = egui::Context::default();
+        let (mut hit, mut left) = (true, 0);
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: Modifiers::COMMAND,
+                events: vec![egui::Event::Paste("x".into())],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.input_mut(|i| {
+                    hit = take_clipboard_event(i, ClipboardAlias::Copy);
+                    left = i.events.len();
+                });
+            },
+        );
+        assert!(!hit);
+        assert_eq!(left, 1, "貼り付けイベントを食べてしまった");
     }
 
     /// 素の ⌘C / ⌘V は横取りしない (コピー&ペーストを壊さない)。

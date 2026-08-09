@@ -44,6 +44,23 @@
   - **Docker でだけ落ちるものは追わない**: `app::glyph_tests::*` (フォント無し) /
     `cli::tests::instance_current_uses_own_pid` (PID 名前空間) /
     `terminal::reap_pty_tests::*` (コンテナ内 PTY)。CI の ubuntu では通る
+- **Windows 側は `tools/windows-check.sh` で確認する。** `#[cfg(windows)]` のコードは
+  macOS のビルドで**一度もコンパイルされない** (src/ の 23 ファイルに 87 箇所ある)。
+  手元の `cargo check` が全部緑でも、その中身は未検証のまま残る。
+  - `tools/windows-check.sh` — `cargo xwin check --all-targets` (既定・最速)
+  - `tools/windows-check.sh --build` — 実際に PE32+ の `zai.exe` を作る (リンクまで通る)
+  - `tools/windows-check.sh --clippy` — CI と同じ債務リストで clippy。
+    **CI の lint は ubuntu 1 台でしか回らないので、Windows 限定の警告はここでしか出ない**
+    (実際に `file_tree.rs` の unused import 2 件がこれで見つかった)
+  - `tools/windows-check.sh --gnu` — mingw-w64 経由の `x86_64-pc-windows-gnu`。
+    xwin を入れたくない環境向け。src/ に `target_env` の分岐は 1 つも無いので
+    cfg 的には msvc と等価
+  - 初回だけ `cargo install cargo-xwin --locked` が要る (無ければ手順を出して終了する)。
+    素の `cargo check --target x86_64-pc-windows-msvc` は syntect が引く C の
+    `onig_sys` が `stdlib.h` を見つけられずに落ちるため**使えない**
+  - **担保できないもの**: 実行時の挙動と GUI、それに build.rs の VERSIONINFO 埋め込み。
+    Cargo は `[target.'cfg(windows)'.build-dependencies]` を**ホスト**で評価するので、
+    macOS からのクロスビルドでは winresource が入らない。ここは CI の windows-latest だけが番人
 - **OS で分岐する既定値は、テストも OS 条件を明示する。** `#[cfg(target_os = "macos")]` か
   `cfg!(...)` を期待値に入れる。macOS の予約表と突き合わせるテストを非 mac で走らせると、
   「その OS では使わない打鍵」を咎めるだけになる。

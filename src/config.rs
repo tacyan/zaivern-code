@@ -33,6 +33,24 @@ pub struct Config {
     /// メニュー・端末・エディタ) が一緒に拡大縮小する。段は `crate::zoom::STEPS`。
     /// ファイル単位のズームは倍率をバッファ側が持つので、ここには入らない。
     pub ui_zoom: f32,
+    /// **文字サイズだけ**の倍率 (既定 1.0)。段は `crate::zoom::STEPS`。
+    ///
+    /// `ui_zoom` との違いが要点: `ui_zoom` は egui の `zoom_factor` を動かすので
+    /// 余白・ボタン・パネル幅まで一緒に大きくなる = **画面の情報量が減る**。
+    /// こちらは本文・ボタン文字・エディタ・ターミナルの**文字サイズだけ**を
+    /// 掛け直すので、レイアウトはそのままで字だけ読みやすくできる。
+    /// (「画面は大きく出来るのに文字サイズだけ変えられない」への答え)
+    ///
+    /// エディタ / ターミナルの実サイズは `editor_font_size` /
+    /// `terminal_font_size` にこの倍率を掛けたもの。
+    pub text_scale: f32,
+    /// 最後に「What's New」を見た版 (`0.9.0` 形式)。空 = 一度も見ていない。
+    ///
+    /// 初回起動では**何も出さない** — 入れた直後に変更履歴を突き付けても
+    /// 意味が無く、「画面が突然変わらない」に反する。判定は
+    /// [`crate::whats_new::unseen`]。
+    #[serde(skip)]
+    pub last_seen_version: String,
     pub show_hidden_files: bool,
 
     /// `.gitignore` (+ `.git/info/exclude` + `core.excludesFile`) を尊重して
@@ -212,6 +230,8 @@ pub struct Config {
     pub global_show_whitespace: bool,
     #[serde(skip)]
     pub global_ui_zoom: f32,
+    #[serde(skip)]
+    pub global_text_scale: f32,
     #[serde(skip)]
     pub global_minimap: bool,
     #[serde(skip)]
@@ -701,6 +721,8 @@ impl Default for Config {
             editor_font_size: 15.0,
             terminal_font_size: 13.0,
             ui_zoom: crate::zoom::DEFAULT,
+            text_scale: crate::zoom::DEFAULT,
+            last_seen_version: String::new(),
             show_hidden_files: true,
             respect_gitignore: true,
             dim_ignored_files: false,
@@ -745,6 +767,7 @@ impl Default for Config {
             global_word_wrap: false,
             global_show_whitespace: false,
             global_ui_zoom: 1.0,
+            global_text_scale: 1.0,
             global_minimap: false,
             global_breadcrumbs: true,
             global_git_blame: false,
@@ -947,6 +970,7 @@ struct Overlay {
     editor_font_size: Option<f32>,
     terminal_font_size: Option<f32>,
     ui_zoom: Option<f32>,
+    text_scale: Option<f32>,
     show_hidden_files: Option<bool>,
     respect_gitignore: Option<bool>,
     dim_ignored_files: Option<bool>,
@@ -980,6 +1004,11 @@ struct UiState {
     /// 手書きの config.toml ではなく state 側に覚える
     /// (config.toml はアプリが書き換えない方針)。
     ui_zoom: Option<f32>,
+    /// 文字サイズだけの倍率。ui_zoom と同じ理由で state 側に覚える。
+    text_scale: Option<f32>,
+    /// 最後に「What's New」を見た版。空 = 一度も見ていない (初回起動)。
+    /// 手書きの config.toml ではなく state 側に置く (アプリが書き換えるため)。
+    last_seen_version: Option<String>,
     minimap: Option<bool>,
     breadcrumbs: Option<bool>,
     /// 差分ビューの表示モード ("side_by_side" | "inline")。
@@ -1101,6 +1130,8 @@ show_hidden_files = true
 # ここに書くのは「起動時の初期値を固定したい」ときだけで構いません。
 # ファイル単位のズーム (⌘⌥+ / ⌘⌥- / ⌘⌥0) はタブごとの一時的な値で、保存しません。
 # ui_zoom = 1.0
+# 文字サイズだけの倍率 (余白やボタンの大きさは変えない)。⌘⇧+ / ⌘⇧- / ⌘⇧0 で変えられる。
+# text_scale = 1.0
 
 # エディタ本文の折り返しと空白文字 (·/→) の可視化
 # (表示メニュー・コマンドパレットの「折り返し切替」「空白文字表示切替」でも変更できます)
@@ -1549,6 +1580,12 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
                 if let Some(v) = st.ui_zoom {
                     cfg.ui_zoom = v;
                 }
+                if let Some(v) = st.text_scale {
+                    cfg.text_scale = v;
+                }
+                if let Some(v) = st.last_seen_version {
+                    cfg.last_seen_version = v;
+                }
                 if let Some(v) = st.minimap {
                     cfg.minimap = v;
                 }
@@ -1661,6 +1698,7 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     cfg.global_word_wrap = cfg.word_wrap;
     cfg.global_show_whitespace = cfg.show_whitespace;
     cfg.global_ui_zoom = crate::zoom::clamp(cfg.ui_zoom);
+    cfg.global_text_scale = crate::zoom::clamp(cfg.text_scale);
     cfg.global_minimap = cfg.minimap;
     cfg.global_breadcrumbs = cfg.breadcrumbs;
     cfg.global_git_blame = cfg.git_blame;
@@ -1681,6 +1719,9 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     // ここを外すと `ui_zoom = 0` で UI が 1 ピクセルに潰れて操作不能になる
     // (設定を戻す口も潰れるので、必ず範囲へ収めてから返す)。
     cfg.ui_zoom = crate::zoom::clamp(cfg.ui_zoom);
+    // 文字サイズ倍率も同じ理由で必ず範囲へ収める
+    // (0 にすると文字が消えて設定を戻す口ごと読めなくなる)。
+    cfg.text_scale = crate::zoom::clamp(cfg.text_scale);
     cfg.pet_scale = cfg.pet_scale.clamp(0.5, 2.0);
     // 期限が 0 だと診断側で毎回丸められて分かりにくいので、ここで下限を揃える。
     cfg.super_agent.timeout_secs = cfg.super_agent.timeout_secs.clamp(5, 600);
@@ -1730,6 +1771,9 @@ fn apply_overlay(cfg: &mut Config, root: &Path) {
             }
             if let Some(v) = o.ui_zoom {
                 cfg.ui_zoom = v;
+            }
+            if let Some(v) = o.text_scale {
+                cfg.text_scale = v;
             }
             if let Some(v) = o.show_hidden_files {
                 cfg.show_hidden_files = v;
@@ -2047,6 +2091,8 @@ fn save_state_to_dir(dir: &Path, cfg: &Config) {
         word_wrap: Some(cfg.global_word_wrap),
         show_whitespace: Some(cfg.global_show_whitespace),
         ui_zoom: Some(crate::zoom::clamp(cfg.global_ui_zoom)),
+        text_scale: Some(crate::zoom::clamp(cfg.global_text_scale)),
+        last_seen_version: Some(cfg.last_seen_version.clone()),
         minimap: Some(cfg.global_minimap),
         breadcrumbs: Some(cfg.global_breadcrumbs),
         diff_view: Some(cfg.diff_view.clone()),
@@ -2208,6 +2254,12 @@ pub fn setting_defs() -> &'static [SettingDef] {
             key: "ui_zoom",
             group: G_LOOK,
             label: "画面全体のズーム",
+            kind: Float { min: 0.5, max: 3.0 },
+        },
+        SettingDef {
+            key: "text_scale",
+            group: G_LOOK,
+            label: "文字サイズの倍率 (レイアウトは変えない)",
             kind: Float { min: 0.5, max: 3.0 },
         },
         SettingDef {
@@ -2488,6 +2540,7 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
         "editor_font_size" => F(cfg.editor_font_size),
         "terminal_font_size" => F(cfg.terminal_font_size),
         "ui_zoom" => F(cfg.ui_zoom),
+        "text_scale" => F(cfg.text_scale),
         "show_pet" => B(cfg.show_pet),
         "word_wrap" => B(cfg.word_wrap),
         "show_whitespace" => B(cfg.show_whitespace),
@@ -2598,6 +2651,13 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
             let ok = f!(cfg.ui_zoom);
             if ok {
                 cfg.global_ui_zoom = cfg.ui_zoom;
+            }
+            ok
+        }
+        "text_scale" => {
+            let ok = f!(cfg.text_scale);
+            if ok {
+                cfg.global_text_scale = cfg.text_scale;
             }
             ok
         }
@@ -4029,6 +4089,8 @@ command = "agy"
             theme: Some("zaivern-light".into()),
             approval_mode: Some("auto".into()),
             ui_zoom: Some(1.25),
+            text_scale: Some(1.5),
+            last_seen_version: Some("0.9.0".into()),
             show_pet: Some(false),
             word_wrap: Some(true),
             show_whitespace: Some(true),
@@ -4075,6 +4137,8 @@ command = "agy"
         assert_eq!(back.theme, Some("zaivern-light".to_string()));
         assert_eq!(back.approval_mode, Some("auto".to_string()));
         assert_eq!(back.ui_zoom, Some(1.25));
+        assert_eq!(back.text_scale, Some(1.5));
+        assert_eq!(back.last_seen_version.as_deref(), Some("0.9.0"));
         assert_eq!(back.show_pet, Some(false));
         assert_eq!(back.word_wrap, Some(true));
         assert_eq!(back.show_whitespace, Some(true));

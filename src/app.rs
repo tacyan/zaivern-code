@@ -59,6 +59,7 @@ use crate::shellenv;
 use crate::skills;
 use crate::snippets::{self, Snippet};
 use crate::sound::{self, SoundKind};
+use crate::submit;
 use crate::supervisor;
 use crate::tasks;
 use crate::terminal;
@@ -80,6 +81,13 @@ use crate::deck;
 // ---------------------------------------------------------------------------
 
 /// severity 1..4 のアイコン。添字 0..3 が severity 1..4。
+/// エージェント別の会話履歴を 1 エージェント × 1 フォルダあたり何件残すか。
+///
+/// 起動のたびに 1 行積むので、放っておくと単調増加する。一覧に出るのは
+/// `session_picker::MAX_RESULTS` 件までなので、それより十分多く取って
+/// 「一覧の下の方が既に消えている」を起こさない。
+const HISTORY_KEEP: usize = 200;
+
 const PROBLEM_SEV_ICONS: [&str; 4] = ["❌", "⚠", "ℹ", "💬"];
 /// severity 1..4 の名前 (ホバーで出す。`tr` に通して使う)。
 const PROBLEM_SEV_NAMES: [&str; 4] = ["エラー", "警告", "情報", "ヒント"];
@@ -2325,13 +2333,16 @@ impl GitJob {
     fn args(&self) -> Vec<String> {
         match self {
             GitJob::Commit { message, all } => {
-                let mut a: Vec<String> = vec!["commit".into()];
+                // **引数表は `git_panel::commit_args` 1 本へ寄せる。**
+                // ここで別に組み立てていたときは `--cleanup=whitespace` が
+                // 抜けており、`#` で始まるコミットメッセージがユーザーの
+                // `commit.cleanup` 設定で**黙って落ちていた**
+                // (同じ操作なのに Git パネル経由では残る、という食い違い)。
+                // `--` は付けない (パスではなくメッセージなので値で確定する)。
+                let mut a = crate::git_panel::commit_args(message, false);
                 if *all {
-                    a.push("--all".into());
+                    a.insert(1, "--all".into());
                 }
-                // `--` は付けない (パスではなくメッセージなので `-m` の値で確定する)。
-                a.push("-m".into());
-                a.push(message.clone());
                 a
             }
             // 追跡ブランチが無い初回でも通るように upstream を張る。
@@ -3028,10 +3039,14 @@ pub struct ZaivernApp {
     /// パレットを開いている間だけ保持し、閉じると破棄する
     /// (palette_items は毎フレーム呼ばれるため、都度 git を叩かない)。
     palette_worktrees: Option<Vec<(String, PathBuf, bool)>>,
-    /// セッションが安全 (Idle) になったら入力欄へ入れる指示文
-    /// (セッションid, 積んだ時刻, 本文)。Issue 着手フローが積む。
-    /// 起動直後の信頼確認プロンプト等へ流れ込まないよう、配達を遅らせる。
-    pending_prompts: Vec<(u64, Instant, String)>,
+    /// **エージェントへの指示の唯一の出口。**
+    ///
+    /// 以前は送信地点ごとに `format!("{text}\r")` を PTY へ 1 回で書いていたが、
+    /// Ink 系 TUI (Claude Code / Codex / Gemini) は本文と CR が同じ write で
+    /// 届くとまとめてペーストと判定し、**CR を改行として飲んで実行しない**。
+    /// 「送ったのにエージェントが入力欄で待機している」の原因がこれ。
+    /// 本文 → 待つ → 確定キー → 効いたか確認、の手順は `submit.rs` が持つ。
+    outbox: Vec<submit::Pending>,
     /// 🏁 プロンプトレース (1 プロンプトを複数エージェントに並走させる) の
     /// ダッシュボード状態。描画・git 操作の実体は race.rs。
     race: race::RacePanel,
@@ -3171,6 +3186,9 @@ pub struct ZaivernApp {
     /// chord (2 打鍵) の待機。フレームを跨ぐので `App` が持つ。
     chord: crate::keybinds::ChordState,
     about_open: bool,
+    /// **What's New** に出す変更点。空でない間だけウィンドウを描く
+    /// (bool を別に持つと「開いているのに中身が空」が構造的に起こり得る)。
+    whats_new: Vec<crate::whats_new::Release>,
     /// ライセンス (Pro) の状態ダイアログを開いているか。
     license_open: bool,
     /// ダイアログの貼り付け欄。保存済みキーとは別に持つ (貼り直しを中断できる)。
@@ -3782,6 +3800,7 @@ impl ZaivernApp {
         // その時点の pixels_per_point でフォントサイズを物理ピクセルへ丸めるので、
         // 後から倍率を変えると最初のフレームだけ丸めがズレた絵になる。
         apply_ui_zoom(&cc.egui_ctx, cfg.ui_zoom);
+        crate::theme::set_text_scale(&cc.egui_ctx, cfg.text_scale);
         let theme = resolve_theme(&cfg.theme);
         theme::apply(&cc.egui_ctx, &theme);
 
@@ -3892,7 +3911,7 @@ impl ZaivernApp {
                 p
             },
             palette_worktrees: None,
-            pending_prompts: Vec::new(),
+            outbox: Vec::new(),
             race: race::RacePanel::new(),
             agent_worktrees: HashMap::new(),
             manual_titles: std::collections::HashSet::new(),
@@ -3964,6 +3983,7 @@ impl ZaivernApp {
             hotexit_warned: HashSet::new(),
             chord: crate::keybinds::ChordState::default(),
             about_open: false,
+            whats_new: Vec::new(),
             // 起動時に 1 回だけローカルのキーを読んで検証する (通信なし)。
             license_open: false,
             license_input: String::new(),
@@ -4129,6 +4149,10 @@ impl ZaivernApp {
         for f in open_files {
             app.open_path(&f);
         }
+        // 更新後の初回起動でだけ「この版の新機能」を出す。
+        // **セッション復元の後**に置く — 復元中に開くと、復元でレイアウトが
+        // 変わる最中に窓が出て「画面が突然変わる」ように見える。
+        app.whats_new_on_start();
         app
     }
 
@@ -5665,6 +5689,13 @@ impl ZaivernApp {
     fn restore_session_data(&mut self, ctx: &egui::Context) {
         // ついでに古いターミナルログを掃除する (新しい 40 本だけ残す)
         session::prune_term_logs(self.primary_root(), 40);
+        // エージェント別の会話履歴も同じ方針で頭打ちにする。
+        // 起動のたびに 1 行積むので、放っておくと単調増加する
+        // (一覧に出るのは `session_picker::MAX_RESULTS` 件までなので、
+        //  それより十分多い分だけ残せばよい)。
+        for spec in crate::agents::AGENT_CATALOG {
+            let _ = crate::history::prune(spec.bin, self.primary_root(), HISTORY_KEEP);
+        }
         let Some(sess) = session::load(&self.roots) else {
             return;
         };
@@ -6324,7 +6355,11 @@ impl ZaivernApp {
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                crate::perf::repaint_after(
+                    ctx,
+                    std::time::Duration::from_millis(200),
+                    "poll_index",
+                );
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.index_rx = None,
         }
@@ -6823,7 +6858,7 @@ impl ZaivernApp {
     ///
     /// **現行セッションには一切触らない** (kill もしない)。新しいプリセットで
     /// 別セッションを立ち上げ、覚えているプロンプトを既存の遅延配達
-    /// (`pending_prompts` — 相手が落ち着いてから入れる) に載せるだけ。
+    /// (`outbox` — 相手が落ち着いてから入れる) に載せるだけ。
     /// 切り替えたら true。
     fn failover_on_rate_limit(&mut self, title: &str, line: &str, ctx: &egui::Context) -> bool {
         if !self.failover.enabled() {
@@ -6948,8 +6983,8 @@ impl ZaivernApp {
             .ok_or_else(|| tr("起動したセッションが見つかりません"))?;
         if let Some(text) = carry.filter(|t| !t.trim().is_empty()) {
             // 既存の遅延配達に載せる: 相手が落ち着く (Idle) のを待ってから入れる。
-            self.pending_prompts
-                .push((new_id, Instant::now(), format!("{}\r", text.trim())));
+            // 確定まで送る (引き継ぎは人の確認を挟まずそのまま続きをやらせる)。
+            self.queue_submit(submit::Job::deferred(new_id, text.trim(), true));
         }
         Ok(new_id)
     }
@@ -6970,7 +7005,7 @@ impl ZaivernApp {
             match stage {
                 failover::Stage::Resuming { session, .. } => {
                     // 引き継ぎ待ちが捌けたら検証へ。
-                    if !self.pending_prompts.iter().any(|(id, _, _)| *id == session) {
+                    if !self.outbox.iter().any(|p| p.job.session == session) {
                         self.failover.note_resumed(sid, now);
                     }
                 }
@@ -7664,6 +7699,20 @@ impl ZaivernApp {
         // セッション ID は再利用され得るので、フェイルオーバーの段も一緒に忘れる
         // (残すと別セッションの状態として読まれてしまう)。
         let mut freed: Option<worktree::AgentWorktree> = None;
+        // エージェント別履歴の締め (終了時刻 + 最初の指示の要約)。
+        // `agents.remove` に渡すと Session ごと別スレッドへ流れて読めなくなるので、
+        // **消す前に**書く。書けなくても閉じる操作は続ける。
+        if let Some(s) = self.agents.sessions.get(i) {
+            if let Some(bin) = crate::agents::spec_for_command(&s.command).map(|sp| sp.bin) {
+                let _ = crate::history::finish(
+                    bin,
+                    &s.cwd,
+                    s.id,
+                    crate::history::now_unix(),
+                    s.last_prompt.as_deref().unwrap_or_default(),
+                );
+            }
+        }
         if let Some(id) = self.agents.sessions.get(i).map(|s| s.id) {
             self.failover.forget_session(id);
             // 自動命名の状態も一緒に忘れる。セッション ID は再利用され得るので、
@@ -7697,18 +7746,143 @@ impl ZaivernApp {
     }
 
     fn send_to_agent(&mut self, text: String) {
-        if let Some(s) = self.agents.active_session() {
-            s.note_user_input();
-            // フェイルオーバーで別プロファイルへ引き継ぐ材料として覚えておく。
-            s.note_prompt(&text);
-            s.write_bytes(text.as_bytes());
-            self.agents.panel_open = true;
-            self.toast(tr("アクティブなエージェントに送信しました"), true);
-        } else {
+        let Some(id) = self.agents.active_session().map(|s| s.id) else {
             self.toast(
                 tr("エージェントセッションがありません（👾 Agent＋ から起動）"),
                 false,
             );
+            return;
+        };
+        self.queue_submit(submit::Job::user(id, text));
+        self.agents.panel_open = true;
+        self.toast(tr("アクティブなエージェントに送信しました"), true);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  エージェントへの指示 — **送信経路はここ 1 本だけ**
+    //
+    //  以前は送信地点ごとに `format!("{text}\r")` を組み立てて PTY へ
+    //  1 回で書いていた (Cockpit 指名 / 一斉 / かんばん / リモート /
+    //  失敗切替の引き継ぎ / Issue 着手 で 6 箇所)。Ink 系 TUI
+    //  (Claude Code / Codex / Gemini) は本文と CR が同じ write で届くと
+    //  まとめてペーストと判定し、**CR を改行として飲んで実行しない**。
+    //  「送ったのにエージェントが入力欄で待機している」がこれ。素のシェルは
+    //  1 回でも動くので「エージェントによって効いたり効かなかったり」に見えた。
+    //  手順 (本文 → 待つ → 確定キー → 効いたか確認) は `submit.rs` が持つ。
+    // ══════════════════════════════════════════════════════════════════
+
+    /// 指示 1 通を配達待ちへ積む。空文字と宛先不明は黙って捨てる。
+    fn queue_submit(&mut self, mut job: submit::Job) {
+        if job.text.trim().is_empty() {
+            return;
+        }
+        let Some(s) = self.agents.sessions.iter().find(|s| s.id == job.session) else {
+            return;
+        };
+        job.title = s.title.clone();
+        self.outbox.push(submit::Pending::new(job, Instant::now()));
+    }
+
+    /// 起動中の全セッションへ同じ指示を積む (Cockpit の一斉送信)。宛先数を返す。
+    fn queue_submit_all(&mut self, text: &str) -> usize {
+        let ids: Vec<u64> = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| s.running())
+            .map(|s| s.id)
+            .collect();
+        for id in &ids {
+            self.queue_submit(submit::Job::user(*id, text));
+        }
+        ids.len()
+    }
+
+    /// 配達待ちを 1 フレームぶん進める。
+    ///
+    /// **アイドル時のコストはゼロ** — 待ちが空なら即 return し、再描画も
+    /// 要求しない。待ちがある間だけ次の期限へ `request_repaint_after` する
+    /// (常時再描画にはしない)。
+    fn submit_tick(&mut self, ctx: &egui::Context) {
+        if self.outbox.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut next: Option<Duration> = None;
+        let mut delivered: Vec<String> = Vec::new();
+        let mut gave_up: Vec<String> = Vec::new();
+        let mut queue = std::mem::take(&mut self.outbox);
+        let sup = &self.supervisor;
+        let agents = &mut self.agents;
+        queue.retain_mut(|p| {
+            let sid = p.job.session;
+            let idle = matches!(sup.state_of(sid), Some(supervisor::SessionState::Idle));
+            let Some(s) = agents.sessions.iter_mut().find(|s| s.id == sid) else {
+                return false; // セッションが消えた
+            };
+            let bracketed = s.running() && s.bracketed_paste();
+            let peek = submit::Peek {
+                running: s.running(),
+                idle,
+                attention: s.attention,
+                bracketed,
+                // 入力欄の読み取りは **Verify 段だけ**。毎フレーム画面を舐めると
+                // アイドル時のコストがゼロでなくなる。
+                input: matches!(p.job.stage, submit::Stage::Verify)
+                    .then(|| s.input_text())
+                    .flatten(),
+            };
+            let mut soon = |d: Duration| {
+                next = Some(next.map_or(d, |n: Duration| n.min(d)));
+            };
+            match p.act(&peek, now) {
+                submit::Act::Gone | submit::Act::Done => false,
+                submit::Act::GaveUp => {
+                    gave_up.push(s.title.clone());
+                    false
+                }
+                submit::Act::Wait(d) => {
+                    soon(d);
+                    true
+                }
+                submit::Act::WriteBody => {
+                    // 手入力と同じ扱い (承認エピソードのラッチを立てる)。
+                    s.note_user_input();
+                    // 失敗切替で別プロファイルへ引き継ぐ材料として覚えておく。
+                    s.note_prompt(&p.job.text);
+                    s.write_bytes(&submit::body_bytes(&p.job.text, peek.bracketed));
+                    s.set_scroll(0);
+                    if p.job.wait_idle {
+                        delivered.push(s.title.clone());
+                    }
+                    p.advance(submit::Stage::Commit, now);
+                    soon(submit::COMMIT_DELAY);
+                    true
+                }
+                submit::Act::WriteCommit => {
+                    s.write_bytes(submit::COMMIT);
+                    p.job.tries = p.job.tries.saturating_add(1);
+                    p.advance(submit::Stage::Verify, now);
+                    soon(submit::VERIFY_DELAY);
+                    true
+                }
+            }
+        });
+        self.outbox = queue;
+        for title in delivered {
+            self.toast(
+                trf("📋 {title} へ指示を配達しました", &[("title", title)]),
+                true,
+            );
+        }
+        for title in gave_up {
+            self.toast_warn(trf(
+                "指示文を配達できませんでした ({title}): セッションが落ち着きません",
+                &[("title", title)],
+            ));
+        }
+        if let Some(d) = next {
+            crate::perf::repaint_after(ctx, d, "submit_tick");
         }
     }
 
@@ -8121,7 +8295,7 @@ impl ZaivernApp {
         }
         if self.dialogs.busy() {
             // 待っている間は少し速く回して、選ばれた瞬間に反応できるようにする
-            ctx.request_repaint_after(Duration::from_millis(50));
+            crate::perf::repaint_after(ctx, Duration::from_millis(50), "poll_dialogs");
         }
     }
 
@@ -8503,7 +8677,8 @@ impl ZaivernApp {
             n = issue.number,
             title = issue.title,
         );
-        self.pending_prompts.push((sid, Instant::now(), prompt));
+        // 入力欄へ入れるだけ (確定はしない) — 着手前に人が内容を確かめられるように。
+        self.queue_submit(submit::Job::deferred(sid, prompt, false));
         self.toast(
             tr("⚡ エージェントを起動しました — 準備ができ次第、着手指示を入力欄へ入れます"),
             true,
@@ -8512,7 +8687,7 @@ impl ZaivernApp {
 
     /// 🏁 プロンプトレース開始ワンフロー:
     /// racer ごとの worktree 作成 → エージェント起動 → プロンプトの配達予約。
-    /// (Issue 着手フローと同じ部品 — worktree / launch / pending_prompts — の組み合わせ。
+    /// (Issue 着手フローと同じ部品 — worktree / launch / outbox — の組み合わせ。
     /// worktree の作成・検証は race.rs 側。)
     fn start_race_flow(&mut self, prompt: &str, preset_indices: &[usize], ctx: &egui::Context) {
         let root = self
@@ -8554,10 +8729,10 @@ impl ZaivernApp {
                     racer.status = race::RacerStatus::Running;
                     // 起動直後のプロンプトへ流れ込まないよう、Idle を待つ配達機構へ積む
                     if let Some(sid) = racer.session_id {
-                        self.pending_prompts.push((
+                        self.queue_submit(submit::Job::deferred(
                             sid,
-                            Instant::now(),
                             race::build_race_prompt(prompt, &racer.branch),
+                            true,
                         ));
                     }
                 }
@@ -9896,7 +10071,7 @@ impl ZaivernApp {
             // デバウンス満了の瞬間に 1 回だけ起こす。予定が無ければ何も予約
             // しないので、放っておけば再描画は止まる (常時アニメーションにしない)。
             if let Some(after) = self.lsp_highlight.due_in(now, lsp::HIGHLIGHT_DEBOUNCE) {
-                ctx.request_repaint_after(after);
+                crate::perf::repaint_after(ctx, after, "lsp_completion_tick");
             }
         } else if !self.lsp_highlight_spans.is_empty() {
             self.clear_highlight_spans();
@@ -10065,7 +10240,7 @@ impl ZaivernApp {
         };
         let body = info.contents.clone();
         let theme = self.theme.clone();
-        let base = self.cfg.editor_font_size;
+        let base = self.scaled_editor_font();
         let mut images = std::mem::take(&mut self.md_images);
         let hl = self.highlighter;
         egui::Area::new(egui::Id::new("zv-lsp-hover"))
@@ -10681,6 +10856,7 @@ impl ZaivernApp {
             | Cmd::NewTerminal
             | Cmd::ShowShortcuts
             | Cmd::ShowAbout
+            | Cmd::ShowWhatsNew
             | Cmd::OpenInIde(_)
             | Cmd::OpenFolderInIde(_)
             | Cmd::NewFile
@@ -10731,6 +10907,9 @@ impl ZaivernApp {
             | Cmd::FileZoomIn
             | Cmd::FileZoomOut
             | Cmd::FileZoomReset
+            | Cmd::TextSizeIn
+            | Cmd::TextSizeOut
+            | Cmd::TextSizeReset
             | Cmd::SendFileToAgent
             | Cmd::RefreshTree
             | Cmd::SetApproval(_)
@@ -11187,6 +11366,7 @@ impl ZaivernApp {
             Cmd::NewTerminal => self.new_terminal(ctx),
             Cmd::ShowShortcuts => self.shortcuts_open = true,
             Cmd::ShowAbout => self.about_open = true,
+            Cmd::ShowWhatsNew => self.open_whats_new(),
             Cmd::OpenInIde(key) => {
                 let file = self
                     .editor
@@ -11734,6 +11914,44 @@ impl ZaivernApp {
         config::save_state(&self.cfg);
     }
 
+    /// **文字サイズだけ**の倍率を設定して state.toml へ覚える。
+    ///
+    /// `set_ui_zoom` との違い: あちらは `zoom_factor` を動かすので
+    /// 余白・ボタン・パネル幅まで拡大し、画面に入る情報量が減る。
+    /// こちらは本文・ボタン文字・エディタ・ターミナルの**文字サイズだけ**を
+    /// 掛け直すので、レイアウトはそのままで字だけ読みやすくできる。
+    /// 実際の反映は `theme::set_text_scale` が次フレーム先頭で行う
+    /// (スタイルの書き換え地点を 1 つに保ち、誤差を積み上げないため)。
+    fn set_text_scale(&mut self, scale: f32) {
+        let scale = zoom::clamp(scale);
+        if (scale - self.cfg.text_scale).abs() < 1e-4 {
+            return;
+        }
+        self.cfg.text_scale = scale;
+        self.cfg.global_text_scale = scale;
+        config::save_state(&self.cfg);
+        // 本文とガターの galley はフォントサイズをキーに持っているので、
+        // 倍率が変わったら作り直させる (残すと古いサイズのまま描かれる)。
+        for b in &mut self.editor.buffers {
+            b.cache = None;
+            b.gutter = None;
+        }
+        self.toast(
+            trf("🔠 文字サイズ {pct}", &[("pct", zoom::label(scale))]),
+            true,
+        );
+    }
+
+    /// 文字サイズ倍率を掛けたエディタのフォントサイズ。
+    fn scaled_editor_font(&self) -> f32 {
+        (self.cfg.editor_font_size * self.cfg.text_scale).clamp(6.0, 96.0)
+    }
+
+    /// 文字サイズ倍率を掛けたターミナルのフォントサイズ。
+    fn scaled_terminal_font(&self) -> f32 {
+        (self.cfg.terminal_font_size * self.cfg.text_scale).clamp(6.0, 96.0)
+    }
+
     /// アクティブなタブだけのズームを段送りする。
     ///
     /// 本文とガターの galley はフォントサイズをキーに持っているので、
@@ -11780,7 +11998,7 @@ impl ZaivernApp {
     /// 二重に掛けないこと — `zoom_factor` は pixels_per_point 側を動かすので、
     /// ここでも掛けると倍率が二乗になる。
     fn editor_font_pt(&self) -> f32 {
-        (self.cfg.editor_font_size * self.file_zoom()).clamp(6.0, 96.0)
+        (self.scaled_editor_font() * self.file_zoom()).clamp(6.0, 96.0)
     }
 
     /// ⌘ + ホイール / トラックパッドのピンチを、ポインタの位置で振り分ける。
@@ -11877,6 +12095,7 @@ impl ZaivernApp {
                 // config.toml / state.toml の ui_zoom を画面へ戻す
                 // (読み直したのに倍率だけ前のまま、を作らない)
                 apply_ui_zoom(ctx, self.cfg.ui_zoom);
+                crate::theme::set_text_scale(ctx, self.cfg.text_scale);
                 // エディタの見た目 (括弧の色分け / ルーラー / インデント) も
                 // 読み直した設定へ揃える。開いているタブのインデントは
                 // 取り直す — 設定を変えたのにステータスバーだけ前のまま、を作らない。
@@ -11899,6 +12118,9 @@ impl ZaivernApp {
             Cmd::FileZoomIn => self.step_file_zoom(1),
             Cmd::FileZoomOut => self.step_file_zoom(-1),
             Cmd::FileZoomReset => self.reset_file_zoom(),
+            Cmd::TextSizeIn => self.set_text_scale(zoom::step_up(self.cfg.text_scale)),
+            Cmd::TextSizeOut => self.set_text_scale(zoom::step_down(self.cfg.text_scale)),
+            Cmd::TextSizeReset => self.set_text_scale(zoom::DEFAULT),
             Cmd::SendFileToAgent => {
                 let rel = self.editor.active.and_then(|i| {
                     let b = &self.editor.buffers[i];
@@ -12269,7 +12491,11 @@ impl ZaivernApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             }
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(50),
+                "fullscreen_guard",
+            );
         }
 
         // 矩形の「真の安定」観測: 前フレームから 1px 超動いたら時刻を取り直す。
@@ -12304,7 +12530,11 @@ impl ZaivernApp {
             // 時間 (1.5 秒) に加えて「矩形が 0.5 秒動いていない」ことも要求する —
             // 負荷でアニメが 1.5 秒を超えても、動いている間は絶対に送らない。
             let since = *self.fs_broken_since.get_or_insert_with(Instant::now);
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(200),
+                "fullscreen_guard",
+            );
             if since.elapsed().as_millis() >= 1500
                 && rect_stable_ms >= 500
                 && !self.fs_rescue_pending
@@ -12374,7 +12604,11 @@ impl ZaivernApp {
                     }
                 }
                 // 入力が無くても状態機械が進むようフレームを回し続ける
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                crate::perf::repaint_after(
+                    ctx,
+                    std::time::Duration::from_millis(100),
+                    "fullscreen_guard",
+                );
             }
         }
     }
@@ -12405,7 +12639,11 @@ impl ZaivernApp {
         if let Some((pos, size)) = self.fake_fullscreen.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
             self.fake_fs_restore = Some((pos, size, Instant::now()));
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(50),
+                "exit_fake_fullscreen",
+            );
         }
     }
 
@@ -12454,12 +12692,16 @@ impl ZaivernApp {
             // 待機中だけ再描画を予約する (時間切れを画面へ反映するため)。
             // 待っていないフレームでは 1 回も呼ばない = アイドルのコストは 0。
             let left = chord.remaining(ctx.input(|i| i.time));
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left.min(0.1)));
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_secs_f64(left.min(0.1)),
+                "handle_shortcuts",
+            );
         } else if matches!(
             tick,
             crate::keybinds::ChordTick::TimedOut | crate::keybinds::ChordTick::Cancelled
         ) {
-            ctx.request_repaint();
+            crate::perf::repaint(ctx, "handle_shortcuts");
         }
         let mut consume = |ctx: &egui::Context, b: crate::keybinds::Binding| -> bool {
             ctx.input_mut(|i| crate::keybinds::consume_binding(i, b, &mut chord))
@@ -12862,6 +13104,7 @@ impl ZaivernApp {
             && !self.goto_open
             && !self.shortcuts_open
             && !self.about_open
+            && self.whats_new.is_empty()
             && !self.license_open
             && !self.remote_open
             && ctx.memory(|m| m.focused().is_none() && !m.any_popup_open())
@@ -14428,6 +14671,26 @@ impl ZaivernApp {
                                 zoom_cmd = Some(Cmd::ZoomReset);
                             }
                         }
+                        // 文字サイズ倍率も等倍のときは 1 ピクセルも描かない
+                        // (常に 100% と出るバッジを置かない)。
+                        let text_scale = zoom::clamp(self.cfg.text_scale);
+                        if !zoom::is_default(text_scale) {
+                            let r = ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("🔠 {}", zoom::label(text_scale)))
+                                        .size(11.5)
+                                        .color(theme.accent),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text(tr(
+                                "文字サイズ (レイアウトは変えていません) — 押すと 100% に戻します",
+                            ))
+                            .clicked()
+                            {
+                                zoom_cmd = Some(Cmd::TextSizeReset);
+                            }
+                        }
                         let (ln, col) = self.editor.cursor;
                         if let Some(i) = self.editor.active {
                             ui.label(dim(format!("Ln {ln}, Col {col}")));
@@ -15637,7 +15900,7 @@ impl ZaivernApp {
         pl: &mut PluginActions,
         p: &plugins::Plugin,
     ) {
-        let md_base = self.cfg.editor_font_size;
+        let md_base = self.scaled_editor_font();
         let hl = self.highlighter;
         for pa in &p.panels {
             ui.add_space(2.0);
@@ -16122,7 +16385,7 @@ impl ZaivernApp {
 
                 ui.add_space(4.0);
 
-                let font = self.cfg.terminal_font_size;
+                let font = self.scaled_terminal_font();
                 let want_focus = self.term_focus_pending;
                 // 予約を下ろすのは、この後で実際に端末を描くときだけ。
                 // 「🛡 承認」タブ表示中やセッションが 0 件の間に消してしまうと、
@@ -17176,7 +17439,7 @@ impl ZaivernApp {
         }
 
         let avail = ui.available_size();
-        let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
+        let mini_font = (self.scaled_terminal_font() - 3.0).clamp(8.0, 14.0);
         // 6 枚以上でも 1 枚ずつは読める高さを保つ。入り切らないぶんは
         // 縦スクロールで見せる (潰さない)。
         let g = cockpit_grid_metrics(avail, n, grid_comfort_cell_h(mini_font));
@@ -17774,31 +18037,28 @@ impl ZaivernApp {
         mut orch_acts: Vec<orchestration::OrchAction>,
     ) {
         if let Some(text) = acts.broadcast {
-            self.agents.broadcast(&text);
-            self.toast(
-                trf(
-                    "📣 {n} セッションへ送信しました",
-                    &[("n", self.agents.running_count().to_string())],
-                ),
-                true,
-            );
+            let n = self.queue_submit_all(&text);
+            if n == 0 {
+                self.toast(tr("実行中のエージェントがありません"), false);
+            } else {
+                self.toast(
+                    trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
+                    true,
+                );
+            }
         }
         // 宛先を指名した送信は**その 1 体だけ**へ届ける (broadcast は通らない)
         if let Some((id, text)) = acts.send_to {
-            let sent = self
+            let live = self
                 .agents
                 .sessions
-                .iter_mut()
+                .iter()
                 .find(|s| s.id == id)
-                .map(|s| {
-                    // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)
-                    s.note_user_input();
-                    s.note_prompt(&text);
-                    (s.send_text(&format!("{text}\r")), s.title.clone())
-                });
-            match sent {
+                .map(|s| (s.running(), s.title.clone()));
+            match live {
                 Some((true, title)) => {
-                    self.toast(trf("✏ 送信: {title}", &[("title", title)]), true)
+                    self.queue_submit(submit::Job::user(id, text));
+                    self.toast(trf("✏ 送信: {title}", &[("title", title)]), true);
                 }
                 Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
                 None => self.toast(tr("宛先のセッションが見つかりません"), false),
@@ -18033,7 +18293,7 @@ impl ZaivernApp {
         // ライブペイン: 端末描画は Cockpit と同じ道 (`terminal::draw`) をそのまま使う。
         // 看板側は矩形を用意して呼ぶだけ — 端末を再実装しない。
         // 借用は分けて取る (kanban_state と agents.sessions は別フィールド)。
-        let mini_font = (self.cfg.terminal_font_size - 3.0).clamp(8.0, 14.0);
+        let mini_font = (self.scaled_terminal_font() - 3.0).clamp(8.0, 14.0);
         let dead: std::collections::HashSet<u64> = self
             .agents
             .sessions
@@ -18115,31 +18375,30 @@ impl ZaivernApp {
                     None => self.toast(tr("このセッションは権限モード切替に未対応です"), false),
                 },
                 kanban::KanbanAction::Send { idx, text } => {
-                    let sent = self.agents.sessions.get_mut(idx).map(|s| {
-                        // 手入力と同じ扱いにする (承認エピソードのラッチを立てる)。
-                        s.note_user_input();
-                        s.note_prompt(&text);
-                        let mut t = text.clone();
-                        t.push('\r');
-                        (s.send_text(&t), s.title.clone())
-                    });
-                    match sent {
-                        Some((true, title)) => {
-                            self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true)
+                    let live = self
+                        .agents
+                        .sessions
+                        .get(idx)
+                        .map(|s| (s.id, s.running(), s.title.clone()));
+                    match live {
+                        Some((id, true, title)) => {
+                            self.queue_submit(submit::Job::user(id, text));
+                            self.toast(trf("✏ 指示を送信: {title}", &[("title", title)]), true);
                         }
-                        Some((false, _)) => self.toast(tr("セッションが終了しています"), false),
+                        Some((_, false, _)) => self.toast(tr("セッションが終了しています"), false),
                         None => {}
                     }
                 }
                 kanban::KanbanAction::Broadcast(text) => {
-                    self.agents.broadcast(&text);
-                    self.toast(
-                        trf(
-                            "📣 {n} セッションへ送信しました",
-                            &[("n", self.agents.running_count().to_string())],
-                        ),
-                        true,
-                    );
+                    let n = self.queue_submit_all(&text);
+                    if n == 0 {
+                        self.toast(tr("実行中のエージェントがありません"), false);
+                    } else {
+                        self.toast(
+                            trf("📣 {n} セッションへ送信しました", &[("n", n.to_string())]),
+                            true,
+                        );
+                    }
                 }
                 kanban::KanbanAction::OpenCockpit => {
                     self.cockpit = true;
@@ -18263,7 +18522,7 @@ impl ZaivernApp {
         let scanning = !self.deck_branch_pending.is_empty();
 
         // ライブ端末は Cockpit / 看板とまったく同じ道 (`terminal::draw`) を通す。
-        let mini_font = (self.cfg.terminal_font_size - 2.0).clamp(8.0, 16.0);
+        let mini_font = (self.scaled_terminal_font() - 2.0).clamp(8.0, 16.0);
         let dead: HashSet<u64> = self
             .agents
             .sessions
@@ -18526,7 +18785,7 @@ impl ZaivernApp {
                     ),
                 };
                 let _ = tx.send(msg);
-                ctx2.request_repaint();
+                crate::perf::repaint(&ctx2, "git_job_done");
             });
         match spawned {
             Ok(_) => {
@@ -18586,7 +18845,7 @@ impl ZaivernApp {
                     }
                 }
                 let _ = tx.send(out);
-                ctx2.request_repaint();
+                crate::perf::repaint(&ctx2, "git_history_done");
             });
         match spawned {
             Ok(_) => self.git_ops.history_rx = Some(rx),
@@ -19217,10 +19476,10 @@ impl ZaivernApp {
                                         // = オフセットが減る = 左のタブが見える
                                         if p.x < vis.left() + EDGE {
                                             ui.scroll_with_delta(egui::vec2(STEP, 0.0));
-                                            ui.ctx().request_repaint();
+                                            crate::perf::repaint(ui.ctx(), "tab_drag_scroll");
                                         } else if p.x > vis.right() - EDGE {
                                             ui.scroll_with_delta(egui::vec2(-STEP, 0.0));
-                                            ui.ctx().request_repaint();
+                                            crate::perf::repaint(ui.ctx(), "tab_drag_scroll");
                                         }
                                     }
                                 } else {
@@ -20413,7 +20672,7 @@ impl ZaivernApp {
     fn hex_viewer_ui(&mut self, ui: &mut egui::Ui, i: usize) {
         let theme = self.theme.clone();
         let ppp = ui.ctx().pixels_per_point();
-        let font = FontId::monospace(crate::theme::snap_font_size(self.cfg.editor_font_size, ppp));
+        let font = FontId::monospace(crate::theme::snap_font_size(self.scaled_editor_font(), ppp));
         let row_h = ui
             .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
             .max(1.0 / ppp);
@@ -22858,6 +23117,26 @@ impl ZaivernApp {
                 fmt_key(BindAction::FileZoomReset),
                 Cmd::FileZoomReset,
             ),
+            // 文字サイズは「ズーム」と別物。ラベルで違いを言い切る
+            // (ズームは余白まで大きくなり画面に入る情報が減るが、こちらは減らない)。
+            (
+                "🔠".into(),
+                tr("文字サイズを大きく (レイアウトは変えない)"),
+                String::new(),
+                Cmd::TextSizeIn,
+            ),
+            (
+                "🔠".into(),
+                tr("文字サイズを小さく (レイアウトは変えない)"),
+                String::new(),
+                Cmd::TextSizeOut,
+            ),
+            (
+                "🔠".into(),
+                tr("文字サイズを 100% に戻す"),
+                String::new(),
+                Cmd::TextSizeReset,
+            ),
             (
                 "🌲".into(),
                 tr("ファイルツリー再読み込み"),
@@ -25019,7 +25298,7 @@ impl ZaivernApp {
                         });
                 }
             });
-        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        crate::perf::repaint_after(ctx, std::time::Duration::from_millis(300), "toasts_ui");
     }
 
     // ─── スマホリモート ─────────────────────────────────────────────
@@ -25167,7 +25446,7 @@ impl ZaivernApp {
             self.voice = VoiceState::default();
         } else {
             // 録音中は HUD を動かし続ける
-            ctx.request_repaint_after(Duration::from_millis(120));
+            crate::perf::repaint_after(ctx, Duration::from_millis(120), "poll_voice");
         }
     }
 
@@ -27663,7 +27942,7 @@ impl eframe::App for ZaivernApp {
                         ));
                     }
                 }
-                ctx.request_repaint();
+                crate::perf::repaint(ctx, "update");
             }
         }
     }
@@ -27761,7 +28040,7 @@ impl ZaivernApp {
         // 検査 1 回で戻り、再描画も要求しない (= アイドル時のコストはゼロ)。
         self.blame.poll();
         if self.blame.busy() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(80), "update_impl");
         }
         // セッションタブに出すフォルダ一覧 (is_dir を叩くので変化時だけ作り直す)
         self.refresh_session_folders();
@@ -27992,53 +28271,8 @@ impl ZaivernApp {
             }
         }
 
-        // ── Issue 着手フローの「安全になったら入力欄へ」配達 ──
-        // Idle (静かでプロンプトへ戻っている) を待って指示文を入れる。
-        // 45 秒待っても Idle にならない場合は、承認待ちでない限り入れてしまう
-        // (スピナーの誤検知等で永遠に待たないため)。2 分で諦めて知らせる。
-        if !self.pending_prompts.is_empty() {
-            let mut rest: Vec<(u64, Instant, String)> = Vec::new();
-            let mut delivered: Vec<String> = Vec::new();
-            let mut gave_up: Vec<String> = Vec::new();
-            for (sid, queued, text) in std::mem::take(&mut self.pending_prompts) {
-                let idle = matches!(
-                    self.supervisor.state_of(sid),
-                    Some(supervisor::SessionState::Idle)
-                );
-                let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == sid) else {
-                    continue; // セッションが消えた
-                };
-                if !s.running() {
-                    continue;
-                }
-                let overdue = queued.elapsed().as_secs() >= 45 && !s.attention;
-                if idle || overdue {
-                    s.note_prompt(&text);
-                    s.write_bytes(text.as_bytes());
-                    delivered.push(s.title.clone());
-                } else if queued.elapsed().as_secs() < 120 {
-                    rest.push((sid, queued, text));
-                } else {
-                    gave_up.push(s.title.clone());
-                }
-            }
-            self.pending_prompts = rest;
-            for title in delivered {
-                self.toast(
-                    trf(
-                        "📋 {title} の入力欄に着手指示を入れました — 確認して Enter",
-                        &[("title", title)],
-                    ),
-                    true,
-                );
-            }
-            for title in gave_up {
-                self.toast_warn(trf(
-                    "指示文を配達できませんでした ({title}): セッションが落ち着きません",
-                    &[("title", title)],
-                ));
-            }
-        }
+        // ── エージェントへの指示の配達 (唯一の出口) ──
+        self.submit_tick(ctx);
 
         // 表示中のアクティブセッションを既読にする。未読 (◆) は
         // 「見ていない間に意味的な出力が変わった」セッションだけに残る。
@@ -28420,7 +28654,7 @@ impl ZaivernApp {
             self.tutorial_autostarted = true;
             if self.tutorial.autostart() {
                 // 開始フレームは必ず 1 枚描く (アイドルからでも立ち上がる)
-                ctx.request_repaint();
+                crate::perf::repaint(ctx, "tutorial_tick");
             }
         }
         let theme = self.theme.clone();
@@ -28484,7 +28718,7 @@ impl ZaivernApp {
             }
         }
         // 依頼を実行した結果を次のフレームで見せる (アイドルでも 1 枚回す)
-        ctx.request_repaint();
+        crate::perf::repaint(ctx, "apply_tutorial_action");
     }
 
     /// いまの状態から [`idle_repaint_ms`] の材料を組み立てて予約する。
@@ -28528,7 +28762,11 @@ impl ZaivernApp {
             visible: !minimized,
         };
         if let Some(ms) = idle_repaint_ms(signals) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(ms),
+                "schedule_idle_repaint",
+            );
         }
         // 「実入力が無いのに描いたフレーム」を数える。
         // `ZAIVERN_PERF=1` のときだけ働き、レポートは `perf::dump` で 1 回だけ出す
@@ -29613,6 +29851,7 @@ impl ZaivernApp {
                 .editor
                 .active
                 .map(|i| zoom::clamp(self.editor.buffers[i].zoom)),
+            text_scale: zoom::clamp(self.cfg.text_scale),
             trim_trailing_on_save: self.save_trim_trailing,
             trim_final_newlines_on_save: self.save_trim_final_newlines,
             final_newline_on_save: self.save_final_newline,
@@ -30042,7 +30281,7 @@ impl ZaivernApp {
         editor_split::tab_switcher_overlay(ctx, &self.theme, &title, &items, sw.sel);
         // 押している間はキーイベントが来ないので、こちらから描き直しを頼む。
         // (切替が終われば要求も止まる = アイドル時のコストはゼロ)
-        ctx.request_repaint();
+        crate::perf::repaint(ctx, "tab_switcher_ui");
     }
 
     // ── ジャンプ系 ──
@@ -30598,6 +30837,7 @@ impl ZaivernApp {
         self.settings_window(ctx);
         self.hotexit_conflict_window(ctx);
         self.about_window(ctx);
+        self.whats_new_window(ctx);
         self.license_window(ctx);
     }
 
@@ -30899,7 +31139,7 @@ impl ZaivernApp {
                 self.hotexit_due = Some(Instant::now() + wait);
                 // 間隔ぶん先の 1 フレームだけ予約する。編集が止まれば
                 // 予約も止まるので、アイドル時のコストはゼロのまま。
-                ctx.request_repaint_after(wait);
+                crate::perf::repaint_after(ctx, wait, "hotexit_tick");
             }
         }
         let Some(due) = self.hotexit_due else {
@@ -31559,7 +31799,7 @@ impl ZaivernApp {
         self.hotexit
             .set_max_bytes(self.cfg.hot_exit_max_kb.saturating_mul(1024));
         // 画面に出ている値が変わるので 1 フレームだけ描き直す
-        ctx.request_repaint();
+        crate::perf::repaint(ctx, "apply_config_to_ui");
     }
 
     /// キーバインド編集 UI (VS Code の ⌘K ⌘S 相当)。
@@ -31781,7 +32021,7 @@ impl ZaivernApp {
         self.keybind_ui.query = query;
         if let Some(a) = start_record {
             self.keybind_ui.recording = Some(crate::keybinds::Recorder::new(a));
-            ctx.request_repaint();
+            crate::perf::repaint(ctx, "shortcuts_window");
         }
         if reset_all {
             self.keys.reset_all();
@@ -31811,7 +32051,7 @@ impl ZaivernApp {
         });
         if esc {
             // 中止。記録は捨てて通常の消費へ戻す (このフレームは休む)
-            ctx.request_repaint();
+            crate::perf::repaint(ctx, "keybind_record_tick");
             return true;
         }
         let stroke = ctx.input_mut(crate::keybinds::record_stroke);
@@ -31824,12 +32064,16 @@ impl ZaivernApp {
                 let a = rec.action;
                 self.keys.set(a, b);
                 self.persist_keybindings();
-                ctx.request_repaint();
+                crate::perf::repaint(ctx, "keybind_record_tick");
             }
             None => {
                 // 2 打鍵目の締切まで画面を回す (待っている間だけ)
                 let left = rec.remaining(now).min(0.1);
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+                crate::perf::repaint_after(
+                    ctx,
+                    std::time::Duration::from_secs_f64(left),
+                    "keybind_record_tick",
+                );
                 self.keybind_ui.recording = Some(rec);
             }
         }
@@ -31843,6 +32087,103 @@ impl ZaivernApp {
         self.cfg.keybindings = ov.clone();
         if let Err(e) = config::save_keybindings(&ov) {
             self.toast(e, false);
+        }
+    }
+
+    /// **What's New** を開く (ヘルプメニュー / パレットから)。
+    ///
+    /// 手動で開いたときは版に関係なく**最新の 1 件**を出す。
+    /// 何も無い (変更履歴が読めない) ときは黙って何もしない —
+    /// 空のウィンドウを出す方がよほど分かりにくい。
+    fn open_whats_new(&mut self) {
+        let all = crate::whats_new::releases();
+        self.whats_new = all.into_iter().take(1).collect();
+        if self.whats_new.is_empty() {
+            self.toast(tr("変更履歴が読み込めませんでした"), false);
+        }
+    }
+
+    /// **更新後の初回起動で 1 度だけ開く。**
+    ///
+    /// 初回インストールでは出さない (`unseen` が空を返す)。開いた時点で
+    /// 「見た版」を今の版へ進め、state.toml へ書く — 出しっぱなしにすると
+    /// 起動のたびに同じものが出る。
+    fn whats_new_on_start(&mut self) {
+        let cur = crate::whats_new::current_version();
+        let shown = crate::whats_new::unseen(
+            &crate::whats_new::releases(),
+            &self.cfg.last_seen_version,
+            cur,
+        );
+        // 見た印は「出す物が無かった」場合も含めて必ず進める
+        // (次の更新まで毎回同じ計算をしないため)。
+        if self.cfg.last_seen_version != cur {
+            self.cfg.last_seen_version = cur.to_string();
+            config::save_state(&self.cfg);
+        }
+        self.whats_new = shown;
+    }
+
+    /// **What's New** のウィンドウ。中身が空なら 1 ピクセルも描かない。
+    fn whats_new_window(&mut self, ctx: &egui::Context) {
+        if self.whats_new.is_empty() {
+            return;
+        }
+        let theme = self.theme.clone();
+        let mut open = true;
+        // 閉じるボタンは別の旗で受ける。`Window::open` が `&mut open` を
+        // 借りたままなので、クロージャの中から同じ変数を触れない。
+        let mut close = false;
+        egui::Window::new(tr("この版の新機能"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                // 幅を決め打ちすると狭い窓で見切れる。可用幅に収める。
+                let w = ui.available_width().min(560.0).max(280.0);
+                ui.set_width(w);
+                egui::ScrollArea::vertical()
+                    .id_salt("whats_new_body")
+                    .max_height(420.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for r in &self.whats_new {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("v{}", r.version))
+                                        .size(16.0)
+                                        .strong()
+                                        .color(theme.accent),
+                                );
+                                if !r.date.is_empty() {
+                                    ui.label(
+                                        RichText::new(r.date.clone())
+                                            .size(11.5)
+                                            .color(theme.text_dim),
+                                    );
+                                }
+                            });
+                            ui.add_space(4.0);
+                            for item in &r.items {
+                                ui.horizontal_top(|ui| {
+                                    ui.label(RichText::new("・").color(theme.text_dim));
+                                    // 長い項目は折り返す (右端で見切れない)。
+                                    ui.add(egui::Label::new(RichText::new(item).size(12.5)).wrap());
+                                });
+                            }
+                            ui.add_space(8.0);
+                        }
+                    });
+                ui.separator();
+                ui.vertical_centered(|ui| {
+                    if ui.button(tr("閉じる")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if !open || close {
+            self.whats_new.clear();
         }
     }
 
@@ -33090,7 +33431,7 @@ mod idle_repaint_tests {
                     ..signals
                 };
                 if let Some(ms) = idle_repaint_ms(s) {
-                    ctx.request_repaint_after(Duration::from_millis(ms));
+                    crate::perf::repaint_after(ctx, Duration::from_millis(ms), "drive");
                 }
             });
             delay = out
@@ -36103,6 +36444,34 @@ mod wave2_tests {
     /// **アイドル時に再構築も再描画要求もしない**ことをソースで固定する。
     ///
     /// ソースを読むテストなので改行は正規化する (Windows は CRLF)。
+    /// **アイドル時に誰が描かせているかを、必ず記録できる形に保つ。**
+    ///
+    /// 素の `ctx.request_repaint()` を直に呼ぶと、アイドルで CPU が回って
+    /// いても出所が分からず、仮説から入って外し続けることになる
+    /// (実際に 3 回外した記録がある)。app.rs の要求は必ず
+    /// `perf::repaint` / `perf::repaint_after` を通す。
+    ///
+    /// 改行は正規化する (Windows のチェックアウトは CRLF)。
+    #[test]
+    fn 再描画の要求は必ず出所つきで行う() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        // コメント行と、この検査自身は除いて数える。
+        let bad: Vec<&str> = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("/*") && !t.contains("crate::perf::repaint")
+            })
+            .filter(|l| l.contains(".request_repaint()") || l.contains(".request_repaint_after("))
+            .filter(|l| !l.contains("contains(") && !l.contains("assert"))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "出所を記録しない再描画要求がある (perf::repaint / repaint_after を通すこと):\n{}",
+            bad.join("\n")
+        );
+    }
+
     #[test]
     fn ミニマップとブレッドクラムがアイドルを増やさない配線になっている() {
         let src = include_str!("app.rs").replace("\r\n", "\n");

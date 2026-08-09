@@ -1795,6 +1795,32 @@ impl AgentManager {
             ctx.clone(),
         )?;
         self.sessions.push(session);
+        // **エージェント別の履歴へ 1 行積む。**
+        // 過去の会話一覧はベンダー側の保存物 (Claude / Codex / Antigravity)
+        // しか読めず、それ以外のエージェントは一覧にすら出なかった。
+        // 起動は全部この関数を通るので、ここ 1 箇所で記録すれば漏れない。
+        // 失敗しても起動は続ける (履歴が書けないことで作業を止めない)。
+        let s = self.sessions.last().expect("push した直後なので必ずある");
+        let _ = crate::history::append(&crate::history::Entry {
+            id: s.id,
+            agent_bin: spec_for_command(&s.command)
+                .map(|sp| sp.bin.to_string())
+                .unwrap_or_default(),
+            preset_name: s.preset_name.clone(),
+            title: s.title.clone(),
+            icon: s.icon.clone(),
+            command: s.command.clone(),
+            cwd: s.cwd.to_string_lossy().into_owned(),
+            log_file: s
+                .log_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            started: crate::history::now_unix(),
+            ended: 0,
+            brief: String::new(),
+            vendor_id: String::new(),
+        });
         self.active = self.sessions.len() - 1;
         self.panel_open = true;
         Ok(())
@@ -1975,18 +2001,6 @@ impl AgentManager {
             }
         }
         events
-    }
-
-    /// Send text to every running session (cockpit broadcast).
-    pub fn broadcast(&mut self, text: &str) {
-        let payload = format!("{text}\r");
-        for s in &mut self.sessions {
-            if s.running() {
-                // Cockpit からの一斉送信もユーザーの手入力扱い
-                s.note_user_input();
-                s.write_bytes(payload.as_bytes());
-            }
-        }
     }
 
     /// 指定セッションの権限モード切替 UI を開く/切り替える。

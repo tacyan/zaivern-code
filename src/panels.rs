@@ -1287,6 +1287,41 @@ pub fn send_hint(mac: bool) -> String {
     }
 }
 
+/// 1 行帯の入力欄に出す案内 (OS で書き分ける)。
+///
+/// **打鍵をベタ書きしない** ための唯一の生成元。以前は
+/// `tr("エージェントへの指示… (Enter で送信)")` と直書きしていて、
+/// (1) 実際の送信キーと食い違い (2) Windows/Linux では表記も違う、の二重に嘘だった。
+pub fn inline_hint(mac: bool) -> String {
+    if mac {
+        tr("エージェントへの指示… (⌘+Enter で送信)")
+    } else {
+        tr("エージェントへの指示… (Ctrl+Enter で送信)")
+    }
+}
+
+/// **Enter 単体は改行**か (純関数)。
+///
+/// Google AI Studio と同じ規則にする — `Enter` は改行、`⌘/Ctrl+Enter` が送信。
+/// 1 行帯で Enter を送信にしていたときは、変換確定の Enter や
+/// 打ち終わる前の Enter で**書きかけの指示が飛んでいた** (誤送信は取り返しがつかない)。
+///
+/// `⌘/Ctrl` が乗っているものは [`is_send_chord`] の担当なのでここでは偽。
+/// `Shift+Enter` は真 — 改行として使う指が多く、送信にしてはいけない。
+pub fn is_newline_chord(mac: bool, m: &egui::Modifiers, key: egui::Key) -> bool {
+    if key != egui::Key::Enter {
+        return false;
+    }
+    if is_send_chord(mac, m, key) {
+        return false;
+    }
+    if mac {
+        !m.mac_cmd && !m.ctrl
+    } else {
+        !m.ctrl && !m.mac_cmd
+    }
+}
+
 /// 下書きの文字数と行数。
 ///
 /// 行数は改行で割った数 — 末尾が改行なら「カーソルが乗っている次の行」も
@@ -1587,20 +1622,21 @@ pub fn agent_composer_inline_ui(
                 [te_w, row_h],
                 egui::TextEdit::singleline(&mut text)
                     .id(te_id)
-                    .hint_text(tr("エージェントへの指示… (Enter で送信)"))
+                    .hint_text(inline_hint(on_mac()))
                     .font(egui::FontId::proportional(12.5)),
             );
             if r.changed() {
                 buf.set_text(text);
             }
-            // Enter 送信。lost_focus + Enter は egui の定石 (IME 確定と両立する)。
-            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                press = ComposerPress::Send;
-            }
+            // **Enter 単体では送らない。** 以前はここで `lost_focus() + Enter` を
+            // 送信にしていて、IME の変換確定やタイプミスで書きかけの指示が
+            // 飛んでいた (誤送信は取り返しがつかない)。Google AI Studio と同じく
+            // Enter は改行 — 1 行帯に改行は置けないので、複数行フォームを開いて
+            // そちらへ改行を渡す ([`composer_wants_expand`] が拾う)。
             if r.has_focus() {
                 let mac = on_mac();
-                let chord = ui.input_mut(|i| {
-                    let mut hit = false;
+                let (send, newline) = ui.input_mut(|i| {
+                    let (mut send, mut newline) = (false, false);
                     i.events.retain(|e| {
                         if let egui::Event::Key {
                             key,
@@ -1610,16 +1646,26 @@ pub fn agent_composer_inline_ui(
                         } = e
                         {
                             if is_send_chord(mac, modifiers, *key) {
-                                hit = true;
+                                send = true;
+                                return false;
+                            }
+                            if is_newline_chord(mac, modifiers, *key) {
+                                newline = true;
                                 return false;
                             }
                         }
                         true
                     });
-                    hit
+                    (send, newline)
                 });
-                if chord {
+                if send {
                     press = ComposerPress::Send;
+                }
+                if newline {
+                    let mut t = buf.text().to_string();
+                    t.push('\n');
+                    buf.set_text(t);
+                    *expand = true;
                 }
             }
 

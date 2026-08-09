@@ -61,6 +61,27 @@ zai .
 
 インストーラはお使いのOSに合うアプリを自動で取得します。同じコマンドをもう一度実行すれば最新版へ更新できます。
 
+### 更新する
+
+```bash
+zai update            # 最新版を確認し、実行するコマンドを見せてから更新
+zai update --check    # 最新かどうかを確認するだけ (何も実行しません)
+zai update --yes      # 確認を求めずに更新
+```
+
+インストールした場所に合わせて更新手段が選ばれます（`~/.cargo/bin` にあれば `cargo install --force`、それ以外は上のワンライナー）。
+
+### アンインストールする
+
+```bash
+zai uninstall --dry-run       # 消えるものと合計サイズを一覧表示（何も消しません）
+zai uninstall                 # 一覧を出して y を確認してから削除
+zai uninstall --keep-config   # 設定 (config.toml / state.toml) は残す
+zai uninstall --yes           # 確認を求めずに削除
+```
+
+消えるのは**実行ファイル本体と `~/.zaivern`（設定・セッション記録・端末ログ）だけ**です。OSのアプリ一覧の登録も同時に解除します。PATH上に別の `zai` が残っている場合は、安全のため自動では消さず一覧に表示します。
+
 ### 最初の起動後にすること
 
 1. 約2分のガイドツアーで画面の基本操作を確認
@@ -187,6 +208,20 @@ cargo run --release -- .
 cargo fmt --all --check
 cargo nextest run --profile ci
 ```
+
+### 他OSの検証（macOSからでもローカルで回せます）
+
+`#[cfg(windows)]` や Linux 限定のコードは、macOSのビルドでは一度もコンパイルされません。
+CIの往復を待たずに手元で潰せます。
+
+```bash
+tools/linux-test.sh              # Linuxのテストを Docker で再現
+tools/windows-check.sh           # Windows(MSVC)向けの型検査
+tools/windows-check.sh --build   # 実際に zai.exe を作る（リンクまで確認）
+```
+
+Windows側は初回のみ `cargo install cargo-xwin --locked` が必要です。
+どちらのスクリプトもホストの `target/` は汚しません。
 
 プラグイン開発については[プラグインガイド](docs/plugins.md)と[仕様書](docs/PLUGIN_SPEC.md)を参照してください。
 

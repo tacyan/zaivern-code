@@ -2,8 +2,9 @@ use std::path::Path;
 
 use eframe::egui::{text::LayoutJob, Color32, FontId, TextFormat};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Highlighter as SynHighlighter, ThemeSet};
-use syntect::parsing::{Scope, SyntaxSet};
+use syntect::highlighting::{FontStyle, Highlighter as SynHighlighter, Theme, ThemeSet};
+use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter as ThemeHighlighter};
+use syntect::parsing::{ParseState, Scope, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 use crate::grammar::{self, FoldKindSpec, Grammar, GrammarSet, ScanState, Span, Tok};
@@ -13,7 +14,27 @@ const MAX_HIGHLIGHT_BYTES: usize = 400_000;
 
 /// Single lines longer than this (e.g. minified JS) are laid out without
 /// highlighting so one huge line cannot freeze the UI.
+///
+/// syntect の 1 行あたりの費用は行長にほぼ比例し、実測 (release) で
+/// **約 19µs/KB**。8KB でおよそ 0.15ms なので、1 行が極端に長くても
+/// フレーム予算を食い潰さない。ここを超えた行は色を諦めて素通しする
+/// (= 色が消えるだけで、固まらない)。
 const MAX_HIGHLIGHT_LINE_BYTES: usize = 8_192;
+
+/// 行を跨ぐ解析状態のスナップショットを取る間隔 (行)。
+///
+/// 1 打鍵ぶんの再解析は「変更行の直前のスナップショット」から始めて
+/// 「変更後に前回と状態が一致するスナップショット」で打ち切るので、
+/// 再解析する行数はおおよそ **2 × この値**で頭打ちになる。
+/// 小さくするほど再解析は速くなるがスナップショットの複製費用が増える。
+const CHECKPOINT_LINES: usize = 256;
+
+/// [`Highlighter::cache`] に置く `LayoutJob` の 1 件あたり上限。
+///
+/// 巨大な文書は行単位のキャッシュ ([`DocCache`]) 側で差分再計算するので、
+/// 完成品の `LayoutJob` まで 32 件抱えるとメモリだけを食う
+/// (2MB の文書なら本文だけで 64MB)。小さい文書に絞って持つ。
+const JOB_CACHE_MAX_BYTES: usize = 64 * 1024;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -30,9 +51,426 @@ pub fn shared() -> &'static Highlighter {
     H.get_or_init(Highlighter::new)
 }
 
+/// 行内の 1 区間。差分再計算のために「行ごとの塗り分け」を持ち回る単位。
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct LineSpan {
+    /// **行頭からの**バイト範囲 (半開区間)。
+    start: u32,
+    end: u32,
+    color: Color32,
+    italic: bool,
+    underline: bool,
+}
+
+/// 行を跨ぐ解析状態のスナップショット。`line` 行目を**読む直前**の状態。
+#[derive(Clone)]
+struct Checkpoint {
+    line: usize,
+    ps: ParseState,
+    hs: HighlightState,
+}
+
+/// 直前に塗った文書の記憶。1 文書ぶんだけ持つ。
+///
+/// 何万行のファイルで 1 文字打つたびに全行を解析し直すと、実測で秒単位
+/// かかりフレーム予算 (16ms) を軽く割る。ここに「行ごとの塗り分け」と
+/// 「一定間隔の解析状態」を残しておき、変更点の前後だけを解析し直す。
+struct DocCache {
+    /// 本文以外のキー (言語・テーマ・フォント・既定色)。変わったら作り直す。
+    style_key: u64,
+    /// 直前の本文を行に割ったもの (改行込み)。
+    lines: Vec<String>,
+    /// 行ごとの塗り分け。`lines` と同じ長さ。
+    spans: Vec<Vec<LineSpan>>,
+    /// 行番号の昇順。先頭は必ず 0 行目。
+    checkpoints: Vec<Checkpoint>,
+}
+
+// 直前に塗った文書を置く場所。
+//
+// `Highlighter` のフィールドにできない: syntect の `ParseState` は
+// onig の生ポインタを抱えていて `Send` ではないため、`Mutex` に入れると
+// `shared()` (= `&'static`, `Sync` 必須) が成立しなくなる。
+// ハイライトを走らせるのは描画スレッドなので、スレッドローカルで足りる。
+thread_local! {
+    static DOC_CACHE: std::cell::RefCell<Option<DocCache>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 行キャッシュを残す下限。これ未満の文書は作り直しても一瞬なので、
+/// 抱えるとむしろ本命 (編集中の巨大ファイル) を押し出してしまう。
+/// Markdown プレビューのコードフェンスがこれに当たる。
+const DOC_CACHE_MIN_BYTES: usize = 8 * 1024;
+
+/// `Style` を [`LineSpan`] へ落とす (色と字体だけ残す)。
+fn span_of(style: &syntect::highlighting::Style, start: usize, end: usize) -> LineSpan {
+    let fg = style.foreground;
+    LineSpan {
+        start: start as u32,
+        end: end as u32,
+        color: Color32::from_rgb(fg.r, fg.g, fg.b),
+        italic: style.font_style.contains(FontStyle::ITALIC),
+        underline: style.font_style.contains(FontStyle::UNDERLINE),
+    }
+}
+
+/// 行全体を 1 色で塗る区間 (長すぎる行・解析エラー時のフォールバック)。
+fn plain_span(len: usize, color: Color32) -> Vec<LineSpan> {
+    if len == 0 {
+        return Vec::new();
+    }
+    vec![LineSpan {
+        start: 0,
+        end: len as u32,
+        color,
+        italic: false,
+        underline: false,
+    }]
+}
+
+/// 1 文書ぶんの塗り分けを作る。**直前の結果があれば差分だけ計算する**。
+///
+/// 手順は 3 つ。
+/// 1. 前回と一致する**先頭**の行数を数え、その直前のスナップショットから再開する。
+/// 2. 変更点から前へ進みながら解析する。
+/// 3. 未変更の**末尾**に入ったあと、前回のスナップショットと解析状態が
+///    一致した時点で打ち切り、そこから先は前回の結果をそのまま使う。
+///
+/// 3 が効くので、行数が増減しても再解析は変更点の周辺だけで済む
+/// (スナップショットは行番号をずらして引き継ぐ)。
+fn highlight_doc(
+    ps: &SyntaxSet,
+    syntax: &SyntaxReference,
+    theme: &Theme,
+    text: &str,
+    fallback: Color32,
+    style_key: u64,
+    prev: Option<&DocCache>,
+) -> DocCache {
+    let lines: Vec<&str> = LinesWithEndings::from(text).collect();
+    let n = lines.len();
+    let hl = ThemeHighlighter::new(theme);
+
+    let prev = prev.filter(|c| c.style_key == style_key && !c.checkpoints.is_empty());
+
+    // --- 1. 前方一致 ---
+    let mut head = 0usize;
+    if let Some(c) = prev {
+        while head < n && head < c.lines.len() && lines[head] == c.lines[head] {
+            head += 1;
+        }
+    }
+    // --- 2. 後方一致 (前方一致と重ならない範囲で) ---
+    let mut tail = 0usize;
+    if let Some(c) = prev {
+        let old = c.lines.len();
+        while tail < n - head && tail + head < old && lines[n - 1 - tail] == c.lines[old - 1 - tail]
+        {
+            tail += 1;
+        }
+    }
+
+    let mut spans: Vec<Vec<LineSpan>> = Vec::with_capacity(n);
+    let mut checkpoints: Vec<Checkpoint> = Vec::new();
+    let mut state;
+    let mut start = 0usize;
+
+    match prev {
+        // 再開できるスナップショット = head 行目以前で最も後ろのもの。
+        Some(c) if head > 0 => {
+            let k = c.checkpoints.partition_point(|cp| cp.line <= head) - 1;
+            let cp = &c.checkpoints[k];
+            start = cp.line;
+            spans.extend_from_slice(&c.spans[..start]);
+            checkpoints.extend_from_slice(&c.checkpoints[..=k]);
+            state = (cp.ps.clone(), cp.hs.clone());
+        }
+        _ => {
+            state = (
+                ParseState::new(syntax),
+                HighlightState::new(&hl, syntect::parsing::ScopeStack::new()),
+            );
+            checkpoints.push(Checkpoint {
+                line: 0,
+                ps: state.0.clone(),
+                hs: state.1.clone(),
+            });
+        }
+    }
+
+    // 行数の増減。前回の行 `ol` は今回の行 `ol + delta` に当たる。
+    let delta: isize = prev.map_or(0, |c| n as isize - c.lines.len() as isize);
+
+    let mut i = start;
+    while i < n {
+        // --- 3. 未変更の末尾に入ったら、状態が一致した時点で打ち切る ---
+        if tail > 0 && i >= n - tail {
+            if let Some(c) = prev {
+                let ol = i as isize - delta;
+                if ol >= 0 {
+                    if let Ok(k) = c
+                        .checkpoints
+                        .binary_search_by_key(&(ol as usize), |cp| cp.line)
+                    {
+                        if c.checkpoints[k].ps == state.0 && c.checkpoints[k].hs == state.1 {
+                            spans.extend_from_slice(&c.spans[ol as usize..]);
+                            checkpoints.extend(c.checkpoints[k..].iter().map(|cp| Checkpoint {
+                                line: (cp.line as isize + delta) as usize,
+                                ps: cp.ps.clone(),
+                                hs: cp.hs.clone(),
+                            }));
+                            return DocCache {
+                                style_key,
+                                lines: lines.iter().map(|l| (*l).to_string()).collect(),
+                                spans,
+                                checkpoints,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        if i > start && i.is_multiple_of(CHECKPOINT_LINES) {
+            checkpoints.push(Checkpoint {
+                line: i,
+                ps: state.0.clone(),
+                hs: state.1.clone(),
+            });
+        }
+
+        let line = lines[i];
+        if line.len() > MAX_HIGHLIGHT_LINE_BYTES {
+            // 極端に長い 1 行 (minify 済み JS など) で UI を止めない。
+            // 色は諦めるが、解析状態は進めない = 以降の行は直前の文脈を保つ。
+            spans.push(plain_span(line.len(), fallback));
+            i += 1;
+            continue;
+        }
+        match state.0.parse_line(line, ps) {
+            Ok(ops) => {
+                let mut v = Vec::new();
+                let mut off = 0usize;
+                for (style, piece) in HighlightIterator::new(&mut state.1, &ops, line, &hl) {
+                    let end = off + piece.len();
+                    if end > off {
+                        v.push(span_of(&style, off, end));
+                    }
+                    off = end;
+                }
+                if off < line.len() {
+                    v.push(LineSpan {
+                        start: off as u32,
+                        end: line.len() as u32,
+                        color: fallback,
+                        italic: false,
+                        underline: false,
+                    });
+                }
+                spans.push(v);
+            }
+            Err(_) => {
+                // 解析器の内部状態が壊れている可能性があるので作り直す。
+                state = (
+                    ParseState::new(syntax),
+                    HighlightState::new(&hl, syntect::parsing::ScopeStack::new()),
+                );
+                spans.push(plain_span(line.len(), fallback));
+            }
+        }
+        i += 1;
+    }
+
+    DocCache {
+        style_key,
+        lines: lines.iter().map(|l| (*l).to_string()).collect(),
+        spans,
+        checkpoints,
+    }
+}
+
+/// 行ごとの塗り分けから `LayoutJob` を組む。
+///
+/// 同じ書式が続く区間はまとめる。egui の layout 費用はセクション数に
+/// 比例するので、空白と記号が延々と続くコードでは効き目が大きい。
+fn job_from_spans(text: &str, lines: &[&str], spans: &[Vec<LineSpan>], font: &FontId) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    job.text.push_str(text);
+    let mut base = 0usize;
+    // (バイト範囲, 色, italic, underline) を貯めて、変わった時点で吐く。
+    let mut cur: Option<(usize, usize, Color32, bool, bool)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        for sp in spans.get(i).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let (s, e) = (base + sp.start as usize, base + sp.end as usize);
+            match &mut cur {
+                Some((_, ce, cc, ci, cu))
+                    if *ce == s && *cc == sp.color && *ci == sp.italic && *cu == sp.underline =>
+                {
+                    *ce = e;
+                }
+                _ => {
+                    if let Some((s0, e0, c, it, ul)) = cur.take() {
+                        push_section(&mut job, s0..e0, c, it, ul, font);
+                    }
+                    cur = Some((s, e, sp.color, sp.italic, sp.underline));
+                }
+            }
+        }
+        base += line.len();
+    }
+    if let Some((s0, e0, c, it, ul)) = cur.take() {
+        push_section(&mut job, s0..e0, c, it, ul, font);
+    }
+    job
+}
+
+fn push_section(
+    job: &mut LayoutJob,
+    range: std::ops::Range<usize>,
+    color: Color32,
+    italic: bool,
+    underline: bool,
+    font: &FontId,
+) {
+    let mut format = TextFormat {
+        font_id: font.clone(),
+        color,
+        ..Default::default()
+    };
+    format.italics = italic;
+    if underline {
+        format.underline = eframe::egui::Stroke::new(1.0_f32, color);
+    }
+    job.sections.push(eframe::egui::text::LayoutSection {
+        leading_space: 0.0,
+        byte_range: range,
+        format,
+    });
+}
+
+/// syntect の構文セットを組む。
+///
+/// syntect 同梱の `SyntaxSet::load_defaults_newlines()` は Sublime Text の
+/// 既定パッケージぶんだけで、**実測 75 構文**しか無い。TypeScript / TSX /
+/// Vue / Svelte / Kotlin / Zig / TOML / GraphQL / Terraform / Dart /
+/// Elixir / Nix / Solidity / Dockerfile などが 1 つも入っておらず、
+/// これらは自前の [`crate::grammar`] が正規表現で近似していた。
+/// 近似はスコープ体系を持たないので、**同じテーマでも色が違って見える**。
+///
+/// two-face (bat が使っている拡張セット) は**実測 220 構文**を持ち、
+/// 上記が全て本物の `.sublime-syntax` になる。定義は crate に
+/// `include_bytes!` されたダンプなので、実行時にファイルを探しに行かない
+/// (= インストール先やユーザー名に依存しない)。
+///
+/// Rust だけは [`RUST_SYNTAX_YAML`] の**別セット**で塗る ([`load_rust_syntax`])。
+fn load_syntaxes() -> SyntaxSet {
+    two_face::syntax::extra_newlines()
+}
+
+/// 同梱する最新の Rust 構文 (`assets/syntaxes/Rust.sublime-syntax`)。
+///
+/// **出典 / ライセンスはファイル冒頭のコメントに明記してある**
+/// (sublimehq/Packages, permissive: copy/use/modify/sell/distribute 許諾)。
+///
+/// なぜ差し替えるのか — two-face が持つ Rust は同じ sublimehq/Packages の
+/// **古い版**で、スコープをダンプして実測すると次の欠落があった:
+///   * `async` / `await` にスコープが付かない → 素の識別子と同じ色
+///   * トレイト境界の型名 (`impl<T: Display + Clone>` の `Display`) が無スコープ
+///   * `.rs` 先頭のシェバンを `#` `!` `/` の**演算子列**として塗る
+///
+/// 上流の最新版はこの 3 つを全て直しているので、
+/// 「足りないスコープだけ足す派生構文を自作する」より
+/// **同系統の新しい版へ差し替える**方が壊れる余地が少ないと判断した。
+///
+/// `include_str!` でバイナリへ焼き込むので、実行時にファイルを探しに行かない
+/// (= インストール先・ユーザー名・ロケールに依存しない)。
+const RUST_SYNTAX_YAML: &str = include_str!("../assets/syntaxes/Rust.sublime-syntax");
+
+/// [`RUST_SYNTAX_YAML`] **だけ**を収めた小さな構文セットを組む。
+///
+/// なぜ拡張セットへ混ぜないのか — `SyntaxSet::into_builder()` は 220 構文の
+/// 遅延コンテキストを**全て**復号し、`build()` が全部を張り直して再直列化する。
+/// 実測 (release) で **1 回 0.6〜0.8 秒**で、two-face をそのまま読む 2〜5ms に対して
+/// 2 桁以上遅い。最初にファイルを開いた瞬間に 0.6 秒固まるのは割に合わないので、
+/// **Rust を塗るときだけ引く別セット**にして、そこも初回まで作らない。
+///
+/// 1 ファイルの不備で起動不能にしない: 読めなければ `None` を返し、
+/// 呼び出し側は拡張セットの Rust へ落ちる (少し古い塗り分けになるだけ)。
+fn load_rust_syntax() -> Option<SyntaxSet> {
+    let def =
+        syntect::parsing::SyntaxDefinition::load_from_str(RUST_SYNTAX_YAML, true, Some("Rust"))
+            .ok()?;
+    let mut b = syntect::parsing::SyntaxSetBuilder::new();
+    // `frontmatter` コンテキストが `embed: scope:source.toml` を参照する。
+    // TOML はこの小セットに居ないので、syntect の「解決できない embed は
+    // Plain Text へ落とす」経路 (`with_plain_text_fallback`) に乗せるため、
+    // Plain Text を**必ず**入れておく (入れないと参照が未解決のまま残る)。
+    b.add_plain_text_syntax();
+    b.add(def);
+    let set = b.build();
+    // 名前で引けないセットは使わない (= 拡張セットのままにする)。
+    if set.find_syntax_by_name("Rust").is_some() {
+        Some(set)
+    } else {
+        None
+    }
+}
+
+/// 端末専用テーマ。色の代わりに **ANSI パレット番号**を詰めた特殊な
+/// テーマで、そのまま RGB として読むとほぼ黒になる。GUI では選ばせない。
+const TERMINAL_ONLY_THEMES: &[&str] = &["ansi", "base16", "base16-256"];
+
+/// syntect が「色を付けない」ときに使う構文名。判定の途中でこれを返すと
+/// より具体的な候補を潰してしまうので、段階ごとに弾く。
+const PLAIN_TEXT: &str = "Plain Text";
+
+/// syntect のテーマ集合を組む。
+///
+/// 既定の 7 テーマに two-face の追加テーマを**足すだけ**で、同名のものは
+/// 既定側を残す。カラーテーマ (`theme::all()`) の `syntect_theme` は
+/// 既定名を指しているので、上書きすると見た目が黙って変わってしまう。
+fn load_themes() -> ThemeSet {
+    let mut ts = ThemeSet::load_defaults();
+    let extra: ThemeSet = two_face::theme::extra().into();
+    for (name, theme) in extra.themes {
+        if TERMINAL_ONLY_THEMES.contains(&name.as_str()) {
+            continue;
+        }
+        ts.themes.entry(name).or_insert(theme);
+    }
+    ts
+}
+
+/// 拡張セットが取り違えている拡張子／フェンストークン。
+/// ここに挙げたものだけは [`crate::grammar`] のパックを先に見る。
+/// **増やすときは必ず理由を書くこと。**
+const SYNTECT_MISASSIGNED: &[(&str, &str)] = &[
+    // 拡張セットは .fs をフラグメントシェーダ (GLSL) に割り当てるが、
+    // .fs は F# の実装ファイルというのが実態。シェーダ側は .frag/.fsh を使う。
+    ("fs", "拡張セットは .fs を GLSL にするが実態は F#"),
+    // 同じ理由で F# のシグネチャ／スクリプトも巻き込まれないようにする。
+    ("fsi", "F# のシグネチャファイル (.fs と揃える)"),
+    ("fsx", "F# のスクリプト (.fs と揃える)"),
+];
+
+/// [`SYNTECT_MISASSIGNED`] に載っているか (大文字小文字を無視)。
+fn is_misassigned(ext: &str) -> bool {
+    SYNTECT_MISASSIGNED
+        .iter()
+        .any(|(e, _)| e.eq_ignore_ascii_case(ext))
+}
+
 pub struct Highlighter {
-    ps: SyntaxSet,
-    ts: ThemeSet,
+    /// syntect の構文セット。**最初に着色するまで読み込まない**。
+    /// 拡張セットのダンプは約 1MB あり、起動時に必ず払う費用にしたくない
+    /// ([`shared`] の遅延化だけでは、テーマ名を引くだけの経路でも
+    /// 構文セットまで道連れになる)。
+    ps: OnceLock<SyntaxSet>,
+    /// Rust 専用の小さな構文セット ([`load_rust_syntax`])。
+    /// **Rust を実際に塗るまで組まない**。組めなかったときは `None` が入り、
+    /// 以降は拡張セットの Rust をそのまま使う。
+    rust_ps: OnceLock<Option<SyntaxSet>>,
+    /// syntect のテーマ集合。構文セットとは**独立に**遅延ロードする。
+    ts: OnceLock<ThemeSet>,
     /// プラグインが持ち込んだ軽量シンタックス定義 (`[[syntax]]`)。
     /// syntect が知らない言語 (TypeScript / Kotlin / Zig …) はこちらで塗る。
     ///
@@ -64,8 +502,9 @@ struct Palette {
 impl Highlighter {
     pub fn new() -> Self {
         Self {
-            ps: SyntaxSet::load_defaults_newlines(),
-            ts: ThemeSet::load_defaults(),
+            ps: OnceLock::new(),
+            rust_ps: OnceLock::new(),
+            ts: OnceLock::new(),
             packs: RwLock::new(Arc::new(GrammarSet::default())),
             palettes: Mutex::new(HashMap::new()),
             cache: Mutex::new((
@@ -73,6 +512,32 @@ impl Highlighter {
                 std::collections::VecDeque::with_capacity(HL_CACHE_CAP),
             )),
         }
+    }
+
+    /// 構文セット (初回アクセスで読み込む)。
+    fn ps(&self) -> &SyntaxSet {
+        self.ps.get_or_init(load_syntaxes)
+    }
+
+    /// 言語名から「塗るのに使う構文セットと構文」を選ぶ。
+    ///
+    /// Rust だけは同梱の最新定義 ([`load_rust_syntax`]) を持つ**別セット**を返す。
+    /// `ParseState` / `HighlightLines` は自分が属するセットと組でしか使えないので、
+    /// 構文と一緒にセットも返して取り違えを型で防ぐ。
+    fn syntax_for(&self, lang: &str) -> Option<(&SyntaxSet, &SyntaxReference)> {
+        if lang == "Rust" {
+            if let Some(set) = self.rust_ps.get_or_init(load_rust_syntax).as_ref() {
+                if let Some(s) = set.find_syntax_by_name(lang) {
+                    return Some((set, s));
+                }
+            }
+        }
+        self.ps().find_syntax_by_name(lang).map(|s| (self.ps(), s))
+    }
+
+    /// テーマ集合 (初回アクセスで読み込む)。
+    fn ts(&self) -> &ThemeSet {
+        self.ts.get_or_init(load_themes)
     }
 
     /// いま読み込んでいる言語定義 (`Arc` の複製を返すので、呼び出し側は
@@ -105,46 +570,84 @@ impl Highlighter {
         self.packs().grammars.len()
     }
 
+    /// パス (と必要なら本文の 1 行目) から言語名を決める。
+    ///
+    /// **syntect の拡張セットを先に見る**。拡張セットの定義は本物の
+    /// `.sublime-syntax` (文脈スタックを持ち、埋め込み言語も追える) で、
+    /// パック側の正規表現近似より精度が高いためである。実例として
+    /// `.vue` / `.svelte` はパックでは HTML 扱いだったが、拡張セットには
+    /// 専用の Vue Component / Svelte がある。パックは
+    /// **拡張セットが知らない拡張子だけを埋める**役に降りる。
+    ///
+    /// 例外は [`SYNTECT_MISASSIGNED`] に列挙した取り違えだけで、そこは
+    /// パックを先に見る。
     pub fn lang_for(&self, path: Option<&Path>, text: &str) -> String {
-        // プラグインのパックを先に見る。syntect が知らない言語を足すのが
-        // 主目的だが、`.sass` → Ruby Haml のような既定の取り違えを
-        // 利用者が上書きできる余地もここで確保する。
         let packs = self.packs();
         if let Some(p) = path {
-            if let Some(name) = packs.detect_path(p) {
-                return name;
-            }
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if let Some(s) = self.ps.find_syntax_by_extension(ext) {
+            // (1) ファイル名まるごと。`Dockerfile` / `Makefile` /
+            // `CMakeLists.txt` / `.gitignore` / `.bashrc` のような
+            // 「拡張子では決まらない」ものが拡張セットの `file_extensions`
+            // に載っている。**拡張子より具体的なので先に見る**
+            // (`CMakeLists.txt` を拡張子 `txt` = Plain Text と誤判定しないため)。
+            if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                if let Some(s) = self
+                    .ps()
+                    .find_syntax_by_extension(n)
+                    .filter(|s| s.name != PLAIN_TEXT)
+                {
                     return s.name.clone();
                 }
             }
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if let Some(s) = self.ps.find_syntax_by_extension(name) {
+            // (2) 拡張子。
+            let ext = p.extension().and_then(|e| e.to_str());
+            if let Some(e) = ext.filter(|e| !is_misassigned(e)) {
+                if let Some(s) = self
+                    .ps()
+                    .find_syntax_by_extension(e)
+                    .filter(|s| s.name != PLAIN_TEXT)
+                {
+                    return s.name.clone();
+                }
+            }
+            // (3) 拡張セットが知らない拡張子をパックが埋める。
+            if let Some(name) = packs.detect_path(p) {
+                return name;
+            }
+            // (4) 取り違え扱いにした拡張子でも、パックが無ければ
+            // (プラグインを切っている等) 素通しにせず拡張セットへ落とす。
+            // ここは Plain Text も許す (`notes.txt` の行き先はそれで正しい)。
+            if let Some(e) = ext {
+                if let Some(s) = self.ps().find_syntax_by_extension(e) {
                     return s.name.clone();
                 }
             }
         }
         if let Some(line) = text.lines().next() {
+            if let Some(s) = self.ps().find_syntax_by_first_line(line) {
+                return s.name.clone();
+            }
             if let Some(name) = packs.detect_first_line(line) {
                 return name;
-            }
-            if let Some(s) = self.ps.find_syntax_by_first_line(line) {
-                return s.name.clone();
             }
         }
         "Plain Text".into()
     }
 
     /// フェンスコードの言語トークン ("rust", "py" など) から言語名を引く。
+    /// 優先順位は [`Self::lang_for`] と同じ (拡張セット → パック)。
     pub fn lang_for_fence(&self, token: &str) -> String {
         if token.is_empty() {
             return "Plain Text".into();
         }
+        if !is_misassigned(token) {
+            if let Some(s) = self.ps().find_syntax_by_token(token) {
+                return s.name.clone();
+            }
+        }
         if let Some(name) = self.packs().detect_token(token) {
             return name;
         }
-        self.ps
+        self.ps()
             .find_syntax_by_token(token)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "Plain Text".into())
@@ -157,7 +660,7 @@ impl Highlighter {
                 return Some(p.clone());
             }
         }
-        let theme = self.ts.themes.get(theme_name)?;
+        let theme = self.ts().themes.get(theme_name)?;
         let sh = SynHighlighter::new(theme);
         let default = sh.get_default();
         let mut pal = Palette {
@@ -192,12 +695,19 @@ impl Highlighter {
         fallback: Color32,
     ) -> LayoutJob {
         // キャッシュキーのハッシュ計算
+        // 本文を**含まない**キー。行キャッシュ ([`DocCache`]) はこれが
+        // 一致するときだけ再利用できる (言語やテーマが変われば色が変わるため)。
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        text.hash(&mut hasher);
+        // 行キャッシュはスレッドローカル = インスタンス跨ぎなので、
+        // どの [`Highlighter`] が作った結果かもキーに混ぜる。
+        (self as *const Self as usize).hash(&mut hasher);
         lang.hash(&mut hasher);
         theme_name.hash(&mut hasher);
         font.hash(&mut hasher);
         fallback.hash(&mut hasher);
+        let style_key = hasher.finish();
+        // 完成品のキャッシュキーは本文も混ぜる。
+        text.hash(&mut hasher);
         let key = hasher.finish();
 
         if let Ok(guard) = self.cache.lock() {
@@ -229,10 +739,7 @@ impl Highlighter {
 
         // syntect が知っている言語はそちらで塗る。知らない言語 (TypeScript /
         // Kotlin / Zig …) はプラグインのパックへ落とし、そこにも無ければ素の文字。
-        let Some(syntax) = self
-            .ps
-            .find_syntax_by_name(lang)
-            .filter(|s| s.name != "Plain Text")
+        let Some((set, syntax)) = self.syntax_for(lang).filter(|(_, s)| s.name != PLAIN_TEXT)
         else {
             let packs = self.packs();
             match (packs.by_name(lang), self.palette(theme_name)) {
@@ -245,60 +752,25 @@ impl Highlighter {
             return job;
         };
 
-        let Some(theme) = self.ts.themes.get(theme_name) else {
+        let Some(theme) = self.ts().themes.get(theme_name) else {
             plain(&mut job);
             self.cache_put(key, &job);
             return job;
         };
 
-        let mut h = HighlightLines::new(syntax, theme);
-        for line in LinesWithEndings::from(text) {
-            if line.len() > MAX_HIGHLIGHT_LINE_BYTES {
-                job.append(
-                    line,
-                    0.0,
-                    TextFormat {
-                        font_id: font.clone(),
-                        color: fallback,
-                        ..Default::default()
-                    },
-                );
-                continue;
+        // 行ごとの塗り分けを (可能なら前回の結果を再利用して) 作り、
+        // そこから LayoutJob を組む。**1 打鍵ぶんの再解析は変更点の周辺だけ**
+        // で済むので、何万行のファイルでも編集が固まらない。
+        let lines: Vec<&str> = LinesWithEndings::from(text).collect();
+        job = DOC_CACHE.with(|c| {
+            let mut slot = c.borrow_mut();
+            let fresh = highlight_doc(set, syntax, theme, text, fallback, style_key, slot.as_ref());
+            let job = job_from_spans(text, &lines, &fresh.spans, &font);
+            if text.len() >= DOC_CACHE_MIN_BYTES {
+                *slot = Some(fresh);
             }
-            match h.highlight_line(line, &self.ps) {
-                Ok(regions) => {
-                    for (style, piece) in regions {
-                        let fg = style.foreground;
-                        let mut fmt = TextFormat {
-                            font_id: font.clone(),
-                            color: Color32::from_rgb(fg.r, fg.g, fg.b),
-                            ..Default::default()
-                        };
-                        if style.font_style.contains(FontStyle::ITALIC) {
-                            fmt.italics = true;
-                        }
-                        if style.font_style.contains(FontStyle::UNDERLINE) {
-                            fmt.underline = eframe::egui::Stroke::new(1.0_f32, fmt.color);
-                        }
-                        job.append(piece, 0.0, fmt);
-                    }
-                }
-                Err(_) => {
-                    // エラー後の HighlightLines は内部状態が壊れている可能性が
-                    // あるので、以降の行のために作り直す。
-                    h = HighlightLines::new(syntax, theme);
-                    job.append(
-                        line,
-                        0.0,
-                        TextFormat {
-                            font_id: font.clone(),
-                            color: fallback,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
-        }
+            job
+        });
 
         self.cache_put(key, &job);
 
@@ -323,14 +795,13 @@ impl Highlighter {
         theme_name: &str,
     ) -> Vec<Vec<(usize, usize, Color32)>> {
         let total: usize = lines.iter().map(|l| l.len() + 1).sum();
-        let syntax = self
-            .ps
-            .find_syntax_by_name(lang)
-            .unwrap_or_else(|| self.ps.find_syntax_plain_text());
-        if total > MAX_HIGHLIGHT_BYTES || syntax.name == "Plain Text" {
+        let (set, syntax) = self
+            .syntax_for(lang)
+            .unwrap_or_else(|| (self.ps(), self.ps().find_syntax_plain_text()));
+        if total > MAX_HIGHLIGHT_BYTES || syntax.name == PLAIN_TEXT {
             return Vec::new();
         }
-        let Some(theme) = self.ts.themes.get(theme_name) else {
+        let Some(theme) = self.ts().themes.get(theme_name) else {
             return Vec::new();
         };
         let mut h = HighlightLines::new(syntax, theme);
@@ -344,7 +815,7 @@ impl Highlighter {
             // syntect は行末の改行込みで状態を進めるので付けて渡し、
             // 範囲は元の行長で丸める。
             let with_nl = format!("{line}\n");
-            match h.highlight_line(&with_nl, &self.ps) {
+            match h.highlight_line(&with_nl, set) {
                 Ok(regions) => {
                     let mut spans: Vec<(usize, usize, Color32)> = Vec::with_capacity(regions.len());
                     let mut off = 0usize;
@@ -373,6 +844,10 @@ impl Highlighter {
     /// キャッシュへ 1 件入れる。上限は古い方から追い出す (全消しすると
     /// 次のフレームに全再ハイライトのスパイクが出るため)。
     fn cache_put(&self, key: u64, job: &LayoutJob) {
+        // 巨大な文書は行キャッシュ側で差分計算するので、完成品まで抱えない。
+        if job.text.len() > JOB_CACHE_MAX_BYTES {
+            return;
+        }
         if let Ok(mut guard) = self.cache.lock() {
             let (map, order) = &mut *guard;
             while map.len() >= HL_CACHE_CAP {
@@ -2728,7 +3203,8 @@ mod pack_integration {
         let h = hl();
         let cases: &[(&str, &str)] = &[
             ("a/b/x.ts", "TypeScript"),
-            ("x.tsx", "TypeScript"),
+            // 拡張セットは TSX を専用構文で塗る (JSX を HTML 扱いしない)
+            ("x.tsx", "TypeScriptReact"),
             ("x.mts", "TypeScript"),
             ("x.kt", "Kotlin"),
             ("x.kts", "Kotlin"),
@@ -2743,30 +3219,49 @@ mod pack_integration {
             ("x.scss", "SCSS"),
             ("x.less", "Less"),
             ("x.ps1", "PowerShell"),
-            ("x.proto", "Protocol Buffers"),
+            ("x.proto", "Protocol Buffer"),
             ("x.nix", "Nix"),
             ("x.tf", "Terraform"),
             ("Cargo.toml", "TOML"),
             ("Dockerfile", "Dockerfile"),
             ("CMakeLists.txt", "CMake"),
-            (".env", "DotEnv"),
-            (".gitignore", "Ignore List"),
+            (".env", "DotENV"),
+            (".gitignore", "Git Ignore"),
             ("justfile", "Just"),
-            ("x.vue", "HTML"),
-            ("x.svelte", "HTML"),
-            ("x.mjs", "JavaScript"),
+            // パックでは HTML 扱いだったが、拡張セットには専用構文がある
+            ("x.vue", "Vue Component"),
+            ("x.svelte", "Svelte"),
+            ("x.mjs", "JavaScript (Babel)"),
+            // 拡張セットに JSON5 は無いのでパックが埋める
             ("x.json5", "JSON"),
             ("x.vhd", "VHDL"),
-            ("x.sv", "Verilog"),
+            ("x.sv", "SystemVerilog"),
             ("x.wgsl", "WGSL"),
             ("x.fs", "F#"),
             ("x.hx", "Haxe"),
             ("x.elm", "Elm"),
             ("x.rkt", "Racket"),
-            ("x.vim", "Vim script"),
+            ("x.vim", "VimL"),
             ("x.awk", "AWK"),
-            ("x.bzl", "Starlark"),
+            // Starlark は Python の方言。拡張セットの本物の Python 構文の方が
+            // パックの近似より精度が高いので、そちらへ寄せる。
+            ("x.bzl", "Python"),
             ("x.bicep", "Bicep"),
+            // 今回埋めた 7 言語。`.v` は Verilog のまま (奪わない) で、
+            // V は曖昧でない拡張子とマニフェスト名から引く。
+            ("x.cue", "CUE"),
+            ("x.kdl", "KDL"),
+            ("x.dhall", "Dhall"),
+            ("x.cob", "COBOL"),
+            ("x.cbl", "COBOL"),
+            ("x.apex", "Apex"),
+            ("x.trigger", "Apex"),
+            ("x.sed", "sed"),
+            ("x.vv", "V"),
+            // `.vsh` は GLSL (頂点シェーダ) のまま
+            ("x.vsh", "GLSL"),
+            ("v.mod", "V"),
+            ("x.v", "Verilog"),
         ];
         for (path, want) in cases {
             let got = h.lang_for(Some(Path::new(path)), "");
@@ -2791,7 +3286,8 @@ mod pack_integration {
             ("x.md", "Markdown"),
             ("x.yaml", "YAML"),
             ("x.sql", "SQL"),
-            ("x.js", "JavaScript"),
+            // 拡張セットの既定は Babel 版 (JSX と最近の構文まで読める)
+            ("x.js", "JavaScript (Babel)"),
             ("x.lua", "Lua"),
         ];
         for (path, want) in cases {
@@ -2903,9 +3399,25 @@ mod pack_integration {
         );
         let paint = t.elapsed();
         assert_eq!(job.text, src);
+
+        // 1 行だけ書き換えたときの塗り直し。行キャッシュが効いていれば
+        // 変更点の周辺だけを解析し直すので、初回よりはっきり速くなる。
+        // **比**で見るのは、debug/release とマシンの負荷で絶対値が
+        // 2 桁変わるため (実測: 同じコードで debug 5.3s / release 0.2s)。
+        let edited = src.replacen("export const x", "export const y", 1);
+        let t = std::time::Instant::now();
+        let job2 = h.layout_job(
+            &edited,
+            "TypeScript",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        let repaint = t.elapsed();
+        assert_eq!(job2.text, edited);
         assert!(
-            paint < std::time::Duration::from_millis(1500),
-            "2000 行の着色が遅い: {paint:?}"
+            repaint * 5 < paint,
+            "1 行編集の塗り直しが差分計算になっていない (初回 {paint:?} / 再描画 {repaint:?})"
         );
     }
 
@@ -2923,5 +3435,1011 @@ mod pack_integration {
             Color32::WHITE,
         );
         assert_eq!(job.text, "x = 1\n");
+    }
+}
+
+// ===========================================================================
+// 差分ハイライト (行キャッシュ) の検証
+//
+// `highlight_doc` は「前回の結果」を再利用するため、**再利用した結果が
+// 毎回ゼロから塗った結果と 1 バイトも違わない**ことが生命線になる。
+// ここが崩れると「編集したら遠くの行の色が壊れる」という、再現しにくい
+// 不具合になるので、編集列を実際に流して総当たりで突き合わせる。
+// ===========================================================================
+#[cfg(test)]
+mod incremental {
+    use super::*;
+
+    fn theme() -> &'static str {
+        "base16-ocean.dark"
+    }
+
+    /// 行キャッシュを空にしてから 1 回塗る (= ゼロから塗った答え)。
+    fn from_scratch(h: &Highlighter, text: &str, lang: &str) -> LayoutJob {
+        DOC_CACHE.with(|c| *c.borrow_mut() = None);
+        h.layout_job(text, lang, theme(), FontId::monospace(12.0), Color32::WHITE)
+    }
+
+    /// 直前の結果を残したまま塗る (= 差分計算した答え)。
+    fn incremental(h: &Highlighter, text: &str, lang: &str) -> LayoutJob {
+        h.layout_job(text, lang, theme(), FontId::monospace(12.0), Color32::WHITE)
+    }
+
+    fn same(a: &LayoutJob, b: &LayoutJob) -> bool {
+        a.text == b.text
+            && a.sections.len() == b.sections.len()
+            && a.sections.iter().zip(&b.sections).all(|(x, y)| {
+                x.byte_range == y.byte_range
+                    && x.format.color == y.format.color
+                    && x.format.italics == y.format.italics
+            })
+    }
+
+    /// 8KB 以上でないと行キャッシュに載らないので、嵩を出すための下敷き。
+    fn padded(head: &str, body_lines: usize) -> String {
+        let mut s = String::from(head);
+        for i in 0..body_lines {
+            s.push_str(&format!("let v{i} = {i}; // 埋め草\n"));
+        }
+        s
+    }
+
+    #[test]
+    fn 差分計算はゼロから塗った結果と一致する() {
+        let h = Highlighter::new();
+        let base = padded("// 先頭\n", 600);
+        let lines: Vec<&str> = base.split_inclusive('\n').collect();
+        // 先頭 / 中間 / 末尾 / チェックポイント境界のそれぞれを編集する
+        let targets = [
+            0usize,
+            1,
+            255,
+            256,
+            257,
+            300,
+            lines.len() / 2,
+            lines.len() - 1,
+        ];
+        // まず 1 回塗って行キャッシュを作る
+        let _ = from_scratch(&h, &base, "Rust");
+        for t in targets {
+            for edit in [
+                "let z = \"文字列\";\n",    // 置換
+                "/* 開いたまま\n",          // 行を跨ぐコメントを開く
+                "*/ let w = 1;\n",          // 閉じる
+                "",                         // 行の削除
+                "let a = 1;\nlet b = 2;\n", // 行の挿入
+            ] {
+                let mut v = lines.clone();
+                if edit.is_empty() {
+                    v.remove(t);
+                } else {
+                    v[t] = edit;
+                }
+                let text: String = v.concat();
+                let inc = incremental(&h, &text, "Rust");
+                let full = from_scratch(&h, &text, "Rust");
+                assert!(
+                    same(&inc, &full),
+                    "{t} 行目を {edit:?} に変えたときの差分計算がズレた"
+                );
+                // 次の編集のために、いまの本文で行キャッシュを作り直す
+                let _ = incremental(&h, &text, "Rust");
+            }
+        }
+    }
+
+    #[test]
+    fn 行を跨ぐコメントを開いたり閉じたりしても一致する() {
+        let h = Highlighter::new();
+        let body = padded("", 800);
+        let opened = format!("/* ここから\n{body}");
+        let closed = format!("/* ここから\n{body}*/\n");
+        let _ = from_scratch(&h, &opened, "Rust");
+        // 末尾に閉じ記号を足す = 末尾一致が効かない編集
+        let inc = incremental(&h, &closed, "Rust");
+        let full = from_scratch(&h, &closed, "Rust");
+        assert!(same(&inc, &full), "コメントを閉じたときにズレた");
+        // 逆向き (閉じ記号を消す)
+        let _ = incremental(&h, &closed, "Rust");
+        let inc = incremental(&h, &opened, "Rust");
+        let full = from_scratch(&h, &opened, "Rust");
+        assert!(same(&inc, &full), "コメントを開き直したときにズレた");
+    }
+
+    #[test]
+    fn 言語やテーマが変わったら行キャッシュを流用しない() {
+        let h = Highlighter::new();
+        let src = padded("// 先頭\n", 600);
+        let _ = from_scratch(&h, &src, "Rust");
+        // 同じ本文を別の言語で塗る (流用したら Rust の色のままになる)
+        let as_rust = incremental(&h, &src, "Rust");
+        let as_ts = h.layout_job(
+            &src,
+            "TypeScript",
+            theme(),
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        let fresh_ts = from_scratch(&h, &src, "TypeScript");
+        assert!(
+            same(&as_ts, &fresh_ts),
+            "言語を変えたのに前の結果を流用した"
+        );
+        assert_eq!(as_rust.text, as_ts.text);
+    }
+}
+
+// ===========================================================================
+// 何万行のファイルでの正しさと費用
+//
+// syntect は行を跨いで状態を持つので、**見えている行だけを単独で塗ると
+// 色が壊れる**。ここでは 5 万行の本文で「1 行目で開いた複数行コメントを
+// 3 万行目で閉じる」極端な形を作り、3 万行目より前は全部コメント色、
+// 4 万行目は本文色になることを固定する。
+// ===========================================================================
+#[cfg(test)]
+mod huge_files {
+    use super::*;
+
+    fn theme_of(h: &Highlighter) -> &Theme {
+        h.ts()
+            .themes
+            .get("base16-ocean.dark")
+            .expect("既定テーマがある")
+    }
+
+    /// `lang` の構文で `text` を塗り、行ごとの塗り分けを返す。
+    fn spans_of(h: &Highlighter, text: &str, lang: &str) -> Vec<Vec<LineSpan>> {
+        let syntax = h.ps().find_syntax_by_name(lang).expect("構文が引ける");
+        DOC_CACHE.with(|c| *c.borrow_mut() = None);
+        highlight_doc(h.ps(), syntax, theme_of(h), text, Color32::WHITE, 0, None).spans
+    }
+
+    /// 5 万行。1 行目でブロックコメントを開き、3 万行目で閉じる。
+    fn commented_50k() -> String {
+        let mut s = String::from("/* ここから長いコメント\n");
+        for i in 1..30_000 {
+            s.push_str(&format!("コメントの中 {i}\n"));
+        }
+        s.push_str("*/\n");
+        for i in 30_001..50_000 {
+            s.push_str(&format!("let v{i} = {i};\n"));
+        }
+        s
+    }
+
+    #[test]
+    fn 五万行の三万行目で閉じるコメントが正しく塗り分けられる() {
+        let h = Highlighter::new();
+        let src = commented_50k();
+        let spans = spans_of(&h, &src, "Rust");
+        assert!(spans.len() >= 49_999, "行数 {}", spans.len());
+        let color = |line: usize| spans[line].first().map(|s| s.color);
+        let cmt = color(100).expect("コメント行に色がある");
+        // コメントの中はどこを取っても同じ色 (状態が引き継がれている)
+        for l in [1usize, 5_000, 20_000, 29_998] {
+            assert_eq!(color(l), Some(cmt), "{l} 行目がコメント色でない");
+        }
+        // 閉じたあとはコメント色ではない = 本文として塗られている
+        for l in [30_001usize, 40_000, 45_000, 49_998] {
+            assert_ne!(color(l), Some(cmt), "{l} 行目がコメントのままになっている");
+        }
+        // 4 万行目が「キーワード / 識別子 / 数値」に分かれていること
+        let colors: std::collections::BTreeSet<[u8; 4]> =
+            spans[40_000].iter().map(|s| s.color.to_array()).collect();
+        assert!(colors.len() >= 3, "4 万行目の色数 {}", colors.len());
+    }
+
+    #[test]
+    fn 極端に長い一行でも固まらず素通しになる() {
+        let h = Highlighter::new();
+        // 5MB の 1 行 (minify 済み JS を想定)
+        let long = format!("var a={};\n", "1+".repeat(2_500_000));
+        assert!(long.len() > 5_000_000);
+        let src = format!("// 先頭\n{long}var b=2;\n");
+        let t = std::time::Instant::now();
+        let spans = spans_of(&h, &src, "JavaScript (Babel)");
+        let took = t.elapsed();
+        // 長すぎる行は 1 区間 (= 素通し) になる
+        assert_eq!(spans[1].len(), 1, "長すぎる行を塗ろうとしている");
+        assert_eq!(spans[1][0].end as usize, long.len());
+        // 前後の行は普通に塗れている (状態を壊していない)
+        assert!(!spans[0].is_empty());
+        assert!(spans[2].len() >= 2, "長い行の後ろが塗れていない");
+        // 素通しなので行長に比例した費用は掛からない
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "遅すぎる: {took:?}"
+        );
+    }
+
+    #[test]
+    fn 上限を超える文書は素通しになるが本文は欠けない() {
+        let h = Highlighter::new();
+        let src = "let x = 1;\n".repeat(MAX_HIGHLIGHT_BYTES / 11 + 100);
+        assert!(src.len() > MAX_HIGHLIGHT_BYTES);
+        let job = h.layout_job(
+            &src,
+            "Rust",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        assert_eq!(job.text, src, "本文が欠けた");
+        assert_eq!(job.sections.len(), 1, "上限超えなのに塗っている");
+    }
+}
+
+// ===========================================================================
+// 主要言語のハイライト品質
+//
+// 「拡張子から構文が引ける」だけでは、色が付いているかは分からない。
+// ここでは 1 つの表を回して、言語ごとに**実際に塗り**、
+//   * コメント / 文字列 / キーワード / 数値が**互いに違う色**になること
+//   * どの色も背景に対して読めること (コントラスト比)
+// までを見る。言語を足すときは表に 1 行足すだけで済むようにしてある。
+// ===========================================================================
+#[cfg(test)]
+mod language_coverage {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// (ファイル名, 期待する言語名, 本文, コメント断片, 文字列断片,
+    ///  キーワード断片, 数値断片)。断片が空文字なら、その検査は飛ばす。
+    ///
+    /// 断片は本文中で**最初に現れる位置**が目的のトークンになるように選ぶ
+    /// (`zzcmt` / `zzstr` はそのための目印)。
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    );
+
+    const CASES: &[Case] = &[
+        // ---- 現代的なアプリ開発の主戦場 ----
+        ("a.rs", "Rust",
+         "// zzcmt\npub fn f() { let s = \"zzstr\"; let n = 1234567; }\n",
+         "zzcmt", "zzstr", "pub", "1234567"),
+        ("a.ts", "TypeScript",
+         "// zzcmt\nexport const s: string = \"zzstr\";\nconst n = 1234567;\n",
+         "zzcmt", "zzstr", "export", "1234567"),
+        ("a.tsx", "TypeScriptReact",
+         "// zzcmt\nexport const E = () => <div title=\"zzstr\">{1234567}</div>;\n",
+         "zzcmt", "zzstr", "export", "1234567"),
+        ("a.js", "JavaScript (Babel)",
+         "// zzcmt\nexport const s = \"zzstr\";\nconst n = 1234567;\n",
+         "zzcmt", "zzstr", "export", "1234567"),
+        ("a.jsx", "JavaScript (Babel)",
+         "// zzcmt\nexport const E = () => <div title=\"zzstr\">{1234567}</div>;\n",
+         "zzcmt", "zzstr", "export", "1234567"),
+        ("a.py", "Python",
+         "# zzcmt\ndef f():\n    s = \"zzstr\"\n    n = 1234567\n",
+         "zzcmt", "zzstr", "def", "1234567"),
+        ("a.go", "Go",
+         "// zzcmt\nfunc f() {\n\ts := \"zzstr\"\n\tn := 1234567\n\t_, _ = s, n\n}\n",
+         "zzcmt", "zzstr", "func", "1234567"),
+        ("a.java", "Java",
+         "// zzcmt\npublic class C { String s = \"zzstr\"; int n = 1234567; }\n",
+         "zzcmt", "zzstr", "public", "1234567"),
+        ("a.kt", "Kotlin",
+         "// zzcmt\nfun f() { val s = \"zzstr\"; val n = 1234567 }\n",
+         "zzcmt", "zzstr", "fun", "1234567"),
+        ("a.swift", "Swift",
+         "// zzcmt\nfunc f() { let s = \"zzstr\"; let n = 1234567 }\n",
+         "zzcmt", "zzstr", "func", "1234567"),
+        ("a.c", "C",
+         "/* zzcmt */\nint main(void) { const char *s = \"zzstr\"; return 1234567; }\n",
+         "zzcmt", "zzstr", "return", "1234567"),
+        ("a.cpp", "C++",
+         "// zzcmt\ntemplate <class T> int f() { auto s = \"zzstr\"; return 1234567; }\n",
+         "zzcmt", "zzstr", "template", "1234567"),
+        ("a.cs", "C#",
+         "// zzcmt\npublic class C { string s = \"zzstr\"; int n = 1234567; }\n",
+         "zzcmt", "zzstr", "public", "1234567"),
+        ("a.php", "PHP",
+         "<?php\n// zzcmt\nfunction f() { $s = \"zzstr\"; $n = 1234567; }\n",
+         "zzcmt", "zzstr", "function", "1234567"),
+        ("a.rb", "Ruby",
+         "# zzcmt\ndef f\n  s = \"zzstr\"\n  n = 1234567\nend\n",
+         "zzcmt", "zzstr", "def", "1234567"),
+        ("a.dart", "Dart",
+         "// zzcmt\nvoid main() { var s = \"zzstr\"; var n = 1234567; }\n",
+         "zzcmt", "zzstr", "void", "1234567"),
+        ("a.zig", "Zig",
+         "// zzcmt\npub fn main() void { const s = \"zzstr\"; const n = 1234567; _ = s; _ = n; }\n",
+         "zzcmt", "zzstr", "pub", "1234567"),
+        ("a.ex", "Elixir",
+         "# zzcmt\ndefmodule M do\n  def f do\n    s = \"zzstr\"\n    n = 1234567\n    {s, n}\n  end\nend\n",
+         "zzcmt", "zzstr", "defmodule", "1234567"),
+        ("a.scala", "Scala",
+         "// zzcmt\nobject O { val s = \"zzstr\"; val n = 1234567 }\n",
+         "zzcmt", "zzstr", "object", "1234567"),
+        ("a.hs", "Haskell",
+         "-- zzcmt\nmain = do\n  let s = \"zzstr\"\n  let n = 1234567\n  print (s, n)\n",
+         "zzcmt", "zzstr", "let", "1234567"),
+        ("a.ml", "OCaml",
+         "(* zzcmt *)\nlet s = \"zzstr\"\nlet n = 1234567\n",
+         "zzcmt", "zzstr", "let", "1234567"),
+        ("a.clj", "Clojure",
+         "; zzcmt\n(def s \"zzstr\")\n(def n 1234567)\n",
+         "zzcmt", "zzstr", "def", "1234567"),
+        ("a.erl", "Erlang",
+         "% zzcmt\n-module(m).\nf() -> S = \"zzstr\", N = 1234567, {S, N}.\n",
+         "zzcmt", "zzstr", "module", "1234567"),
+        ("a.r", "R",
+         "# zzcmt\nf <- function() { s <- \"zzstr\"; n <- 1234567 }\n",
+         "zzcmt", "zzstr", "function", "1234567"),
+        ("a.jl", "Julia",
+         "# zzcmt\nfunction f()\n    s = \"zzstr\"\n    n = 1234567\nend\n",
+         "zzcmt", "zzstr", "function", "1234567"),
+        ("a.pl", "Perl",
+         "# zzcmt\nsub f { my $s = \"zzstr\"; my $n = 1234567; }\n",
+         "zzcmt", "zzstr", "sub", "1234567"),
+        ("a.lua", "Lua",
+         "-- zzcmt\nlocal function f() local s = \"zzstr\" local n = 1234567 end\n",
+         "zzcmt", "zzstr", "local", "1234567"),
+        ("a.m", "Objective-C",
+         "// zzcmt\n@implementation C\n- (int)f { NSString *s = @\"zzstr\"; return 1234567; }\n@end\n",
+         "zzcmt", "zzstr", "return", "1234567"),
+        ("a.mm", "Objective-C++",
+         "// zzcmt\n@implementation C\n- (int)f { auto s = \"zzstr\"; return 1234567; }\n@end\n",
+         "zzcmt", "zzstr", "return", "1234567"),
+        ("a.groovy", "Groovy",
+         "// zzcmt\ndef f() { def s = \"zzstr\"; def n = 1234567 }\n",
+         "zzcmt", "zzstr", "def", "1234567"),
+        ("a.cr", "Crystal",
+         "# zzcmt\ndef f\n  s = \"zzstr\"\n  n = 1234567\nend\n",
+         "zzcmt", "zzstr", "def", "1234567"),
+        ("a.nim", "Nim",
+         "# zzcmt\nproc f() =\n  let s = \"zzstr\"\n  let n = 1234567\n",
+         "zzcmt", "zzstr", "proc", "1234567"),
+        ("a.odin", "Odin",
+         "// zzcmt\nf :: proc() { s := \"zzstr\"; n := 1234567 }\n",
+         "zzcmt", "zzstr", "proc", "1234567"),
+        ("a.elm", "Elm",
+         "-- zzcmt\nmodule M exposing (..)\ns = \"zzstr\"\nn = 1234567\n",
+         "zzcmt", "zzstr", "module", "1234567"),
+        ("a.purs", "PureScript",
+         "-- zzcmt\nmodule M where\ns = \"zzstr\"\nn = 1234567\n",
+         "zzcmt", "zzstr", "module", "1234567"),
+        ("a.rkt", "Racket",
+         "; zzcmt\n(define s \"zzstr\")\n(define n 1234567)\n",
+         "zzcmt", "zzstr", "define", "1234567"),
+        ("a.scm", "Lisp",
+         "; zzcmt\n(define s \"zzstr\")\n(define n 1234567)\n",
+         "zzcmt", "zzstr", "define", "1234567"),
+        ("a.tcl", "Tcl",
+         "# zzcmt\nproc f {} { set s \"zzstr\"; set n 1234567 }\n",
+         "zzcmt", "zzstr", "proc", "1234567"),
+        ("a.d", "D",
+         "// zzcmt\nvoid f() { auto s = \"zzstr\"; auto n = 1234567; }\n",
+         "zzcmt", "zzstr", "void", "1234567"),
+        ("a.sol", "Solidity",
+         "// zzcmt\ncontract C { string s = \"zzstr\"; uint n = 1234567; }\n",
+         "zzcmt", "zzstr", "contract", "1234567"),
+        // ---- 科学計算・ハードウェア・低レイヤ ----
+        ("a.f90", "Fortran (Modern)",
+         "! zzcmt\nprogram p\n  character(*), parameter :: s = \"zzstr\"\n  integer :: n = 1234567\nend program p\n",
+         "zzcmt", "zzstr", "program", "1234567"),
+        ("a.adb", "Ada",
+         "-- zzcmt\nprocedure P is\n   S : constant String := \"zzstr\";\n   N : Integer := 1234567;\nbegin\n   null;\nend P;\n",
+         "zzcmt", "zzstr", "procedure", "1234567"),
+        ("a.pas", "Pascal",
+         "{ zzcmt }\nprogram P;\nconst S = 'zzstr';\nvar N: Integer = 1234567;\nbegin\nend.\n",
+         "zzcmt", "zzstr", "program", "1234567"),
+        ("a.asm", "x86_64 Assembly",
+         "; zzcmt\nsection .data\nmsg db \"zzstr\", 0\nnum equ 1234567\n",
+         "zzcmt", "zzstr", "section", "1234567"),
+        ("a.v", "Verilog",
+         "// zzcmt\nmodule m; reg [31:0] n = 1234567; initial $display(\"zzstr\"); endmodule\n",
+         "zzcmt", "zzstr", "module", "1234567"),
+        ("a.vhd", "VHDL",
+         "-- zzcmt\nentity e is end entity;\narchitecture a of e is constant N : integer := 1234567; begin end;\n",
+         "zzcmt", "", "entity", "1234567"),
+        ("a.glsl", "GLSL",
+         "// zzcmt\nvoid main() { float n = 1234567.0; gl_FragColor = vec4(n); }\n",
+         "zzcmt", "", "void", "1234567"),
+        ("a.wgsl", "WGSL",
+         "// zzcmt\nfn main() { let n = 1234567; }\n",
+         "zzcmt", "", "fn", "1234567"),
+        ("a.matlab", "MATLAB",
+         "% zzcmt\nfunction f()\n  s = 'zzstr';\n  n = 1234567;\nend\n",
+         "zzcmt", "zzstr", "function", "1234567"),
+        // ---- 記述・設定・データ ----
+        ("a.html", "HTML",
+         "<!-- zzcmt -->\n<div class=\"zzstr\">text</div>\n",
+         "zzcmt", "zzstr", "div", ""),
+        ("a.css", "CSS",
+         "/* zzcmt */\n.a { color: red; content: \"zzstr\"; width: 1234567px; }\n",
+         "zzcmt", "zzstr", "color", "1234567"),
+        ("a.scss", "SCSS",
+         "// zzcmt\n@mixin m { content: \"zzstr\"; width: 1234567px; }\n",
+         "zzcmt", "zzstr", "@mixin", "1234567"),
+        ("a.vue", "Vue Component",
+         "<!-- zzcmt -->\n<template><div class=\"zzstr\">{{ msg }}</div></template>\n<script>export default { data() { return { n: 1234567 } } }</script>\n",
+         "zzcmt", "zzstr", "export", "1234567"),
+        ("a.svelte", "Svelte",
+         "<!-- zzcmt -->\n<script>export let n = 1234567;</script>\n<div class=\"zzstr\">{n}</div>\n",
+         "zzcmt", "zzstr", "export", "1234567"),
+        ("a.xml", "XML",
+         "<!-- zzcmt -->\n<root attr=\"zzstr\"><n>1</n></root>\n",
+         "zzcmt", "zzstr", "root", ""),
+        ("a.json", "JSON",
+         "{\"kkk\": \"zzstr\", \"n\": 1234567, \"b\": true}\n",
+         // JSON にキーワードは無く、キーも文字列スコープなので見ない
+         "", "zzstr", "", "1234567"),
+        ("a.yaml", "YAML",
+         "# zzcmt\nkkk: \"zzstr\"\nn: 1234567\n",
+         "zzcmt", "zzstr", "kkk", "1234567"),
+        ("a.toml", "TOML",
+         "# zzcmt\n[sect]\nkkk = \"zzstr\"\nn = 1234567\n",
+         "zzcmt", "zzstr", "kkk", "1234567"),
+        ("a.ini", "INI",
+         "; zzcmt\n[sect]\nkkk = zzstr\n",
+         "zzcmt", "", "kkk", ""),
+        ("a.properties", "Java Properties",
+         "# zzcmt\nkkk=zzstr\n",
+         "zzcmt", "", "kkk", ""),
+        ("a.md", "Markdown",
+         "# zzcmt\n\n**zzstr** and `code` and [x](http://e)\n",
+         "", "", "", ""),
+        ("a.tex", "LaTeX",
+         "% zzcmt\n\\documentclass{article}\n\\begin{document}zzstr\\end{document}\n",
+         "zzcmt", "", "documentclass", ""),
+        ("a.bib", "BibTeX",
+         "% zzcmt\n@article{k, title = {zzstr}, year = 1234567}\n",
+         "zzcmt", "", "article", ""),
+        ("a.sql", "SQL",
+         "-- zzcmt\nSELECT 'zzstr', 1234567 FROM t;\n",
+         "zzcmt", "zzstr", "SELECT", "1234567"),
+        ("a.graphql", "GraphQL",
+         "# zzcmt\ntype Q { f(a: String = \"zzstr\", n: Int = 1234567): Int }\n",
+         "zzcmt", "zzstr", "type", "1234567"),
+        ("a.proto", "Protocol Buffer",
+         "// zzcmt\nsyntax = \"zzstr\";\nmessage M { int32 n = 1234567; }\n",
+         "zzcmt", "zzstr", "message", "1234567"),
+        ("a.jsonnet", "jsonnet",
+         "// zzcmt\n{ kkk: \"zzstr\", n: 1234567 }\n",
+         "zzcmt", "zzstr", "", "1234567"),
+        ("a.tf", "Terraform",
+         "# zzcmt\nresource \"aws_s3_bucket\" \"b\" {\n  bucket = \"zzstr\"\n  count  = 1234567\n}\n",
+         "zzcmt", "zzstr", "resource", "1234567"),
+        ("a.nix", "Nix",
+         "# zzcmt\nlet s = \"zzstr\"; n = 1234567; in s\n",
+         "zzcmt", "zzstr", "let", "1234567"),
+        ("a.rego", "Rego",
+         "# zzcmt\npackage p\nallow { input.n == 1234567 }\n",
+         "zzcmt", "", "package", "1234567"),
+        ("a.typ", "Typst",
+         "// zzcmt\n#let s = \"zzstr\"\n#let n = 1234567\n",
+         "zzcmt", "zzstr", "let", "1234567"),
+        ("a.jq", "JQ",
+         "# zzcmt\n.a | select(.n == 1234567) | \"zzstr\"\n",
+         "zzcmt", "zzstr", "select", "1234567"),
+        // ---- シェル・ビルド・運用 ----
+        ("a.sh", "Bourne Again Shell (bash)",
+         "#!/bin/sh\n# zzcmt\nif true; then echo \"zzstr\" 1234567; fi\n",
+         "zzcmt", "zzstr", "if", "1234567"),
+        ("a.fish", "Fish",
+         "# zzcmt\nfunction f\n  echo \"zzstr\" 1234567\nend\n",
+         "zzcmt", "zzstr", "function", ""),
+        ("a.ps1", "PowerShell",
+         "# zzcmt\nfunction f { $s = \"zzstr\"; $n = 1234567 }\n",
+         "zzcmt", "zzstr", "function", "1234567"),
+        ("a.bat", "Batch File",
+         "REM zzcmt\n@echo off\nset N=1234567\n",
+         "zzcmt", "", "echo", ""),
+        ("a.awk", "AWK",
+         "# zzcmt\nfunction f() { s = \"zzstr\"; n = 1234567 }\n",
+         "zzcmt", "zzstr", "function", "1234567"),
+        ("a.vim", "VimL",
+         "\" zzcmt\nfunction! F()\n  let s = \"zzstr\"\n  let n = 1234567\nendfunction\n",
+         "zzcmt", "zzstr", "function", "1234567"),
+        ("Makefile", "Makefile",
+         "# zzcmt\nVAR = zzstr\nall:\n\t@echo $(VAR)\n",
+         "zzcmt", "", "all", ""),
+        ("CMakeLists.txt", "CMake",
+         "# zzcmt\nproject(P)\nset(S \"zzstr\")\nset(N 1234567)\n",
+         "zzcmt", "zzstr", "project", ""),
+        ("Dockerfile", "Dockerfile",
+         "# zzcmt\nFROM alpine:3\nRUN echo \"zzstr\"\n",
+         "zzcmt", "zzstr", "FROM", ""),
+        ("a.diff", "Diff",
+         "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old line\n+new line\n",
+         "", "", "", ""),
+        ("COMMIT_EDITMSG", "Git Commit",
+         "件名の行\n\n本文\n# zzcmt\n",
+         "zzcmt", "", "", ""),
+        ("a.gitignore", "Git Ignore",
+         "# zzcmt\n/target\n*.log\n",
+         "zzcmt", "", "", ""),
+        // ---- 拡張セットに無く、同梱パックが埋めている言語 ----
+        ("a.hx", "Haxe",
+         "// zzcmt\nclass C { function f() { var s = \"zzstr\"; var n = 1234567; } }\n",
+         "zzcmt", "zzstr", "class", "1234567"),
+        ("a.vala", "Vala",
+         "// zzcmt\nclass C { void f() { string s = \"zzstr\"; int n = 1234567; } }\n",
+         "zzcmt", "zzstr", "class", "1234567"),
+        ("a.gleam", "Gleam",
+         "// zzcmt\npub fn f() { let s = \"zzstr\" let n = 1234567 }\n",
+         "zzcmt", "zzstr", "pub", "1234567"),
+        ("a.res", "ReScript",
+         "// zzcmt\nlet s = \"zzstr\"\nlet n = 1234567\n",
+         "zzcmt", "zzstr", "let", "1234567"),
+        ("a.bicep", "Bicep",
+         "// zzcmt\nparam s string = 'zzstr'\nvar n = 1234567\n",
+         "zzcmt", "zzstr", "param", "1234567"),
+        ("a.thrift", "Thrift",
+         "// zzcmt\nstruct S { 1: string s = \"zzstr\"; 2: i32 n = 1234567; }\n",
+         "zzcmt", "zzstr", "struct", "1234567"),
+        ("a.vb", "Visual Basic",
+         "' zzcmt\nModule M\n  Dim S As String = \"zzstr\"\n  Dim N As Integer = 1234567\nEnd Module\n",
+         "zzcmt", "zzstr", "Module", "1234567"),
+        ("a.wat", "WebAssembly",
+         ";; zzcmt\n(module (func $f (result i32) (i32.const 1234567)))\n",
+         "zzcmt", "", "module", "1234567"),
+        ("a.pro", "Prolog",
+         "% zzcmt\nf(X) :- X = \"zzstr\", Y = 1234567, write(Y).\n",
+         "zzcmt", "zzstr", "write", "1234567"),
+        ("justfile", "Just",
+         "# zzcmt\nbuild:\n    cargo build\n",
+         "zzcmt", "", "", ""),
+        ("a.nginx", "Nginx",
+         "# zzcmt\nserver {\n  listen 1234567;\n  root \"zzstr\";\n}\n",
+         "zzcmt", "zzstr", "server", "1234567"),
+        // ---- 拡張セットにも既存パックにも無く、今回埋めた 7 言語 ----
+        ("a.cue", "CUE",
+         "// zzcmt\npackage p\ns: \"zzstr\"\nn: 1234567\n",
+         "zzcmt", "zzstr", "package", "1234567"),
+        // KDL に予約語は無い。仕様が「キーワード値」と呼ぶ `#true` を見る
+        ("a.kdl", "KDL",
+         "// zzcmt\nnode \"zzstr\" flag=#true count=1234567\n",
+         "zzcmt", "zzstr", "#true", "1234567"),
+        ("a.dhall", "Dhall",
+         "-- zzcmt\nlet s = \"zzstr\"\nlet n = 1234567\nin { s = s, n = n }\n",
+         "zzcmt", "zzstr", "let", "1234567"),
+        ("a.cob", "COBOL",
+         "      *> zzcmt\n       PROCEDURE DIVISION.\n           DISPLAY \"zzstr\".\n           MOVE 1234567 TO WS-N.\n",
+         "zzcmt", "zzstr", "PROCEDURE", "1234567"),
+        ("a.apex", "Apex",
+         "// zzcmt\npublic class C { String s = 'zzstr'; Integer n = 1234567; }\n",
+         "zzcmt", "zzstr", "public", "1234567"),
+        // sed に文字列リテラルは無いので、文字列の検査だけ飛ばす
+        ("a.sed", "sed",
+         "# zzcmt\ns/foo/bar/g\nq 1234567\n",
+         "zzcmt", "", "s/", "1234567"),
+        ("a.vv", "V",
+         "// zzcmt\nfn main() {\n\ts := 'zzstr'\n\tn := 1234567\n\tprintln('${s} ${n}')\n}\n",
+         "zzcmt", "zzstr", "fn", "1234567"),
+    ];
+
+    fn hl() -> Highlighter {
+        let h = Highlighter::new();
+        h.set_grammars(crate::grammar::bundled_pack::load());
+        h
+    }
+
+    /// 相対輝度 (WCAG 2.x)。
+    fn luminance(c: Color32) -> f32 {
+        let f = |v: u8| {
+            let s = v as f32 / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    }
+
+    /// コントラスト比 (1.0 = 同じ, 21.0 = 白と黒)。
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 「読める」とみなす最低コントラスト比。
+    ///
+    /// コメントは意図的に沈めるので WCAG AA (4.5) は満たさない。
+    /// ここで見たいのは「背景と同化していない」ことなので、
+    /// **地の文が背景と区別できる下限**として 1.8 を採る
+    /// (全テーマ・全言語の実測の最小が 2.1 だったので、少し余裕を持たせた値)。
+    const MIN_CONTRAST: f32 = 1.8;
+
+    /// `needle` が最初に現れる位置の色。
+    fn color_of(job: &LayoutJob, needle: &str) -> Color32 {
+        let at = job
+            .text
+            .find(needle)
+            .unwrap_or_else(|| panic!("本文に {needle:?} が無い"));
+        job.sections
+            .iter()
+            .find(|s| s.byte_range.contains(&at))
+            .map(|s| s.format.color)
+            .unwrap_or_else(|| panic!("{needle:?} を覆う区間が無い"))
+    }
+
+    #[test]
+    fn 表に載せた全ての言語が拡張子から解決される() {
+        let h = hl();
+        let mut wrong = Vec::new();
+        for (file, want, src, ..) in CASES {
+            let got = h.lang_for(Some(Path::new(file)), src);
+            if &got != want {
+                wrong.push(format!("{file}: {got} (期待 {want})"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // 要求水準 (主要 50 言語) を割ったら気づけるように
+        assert!(CASES.len() >= 50, "対応言語が減っている: {}", CASES.len());
+    }
+
+    #[test]
+    fn 全ての言語でコメントと文字列とキーワードと数値が別の色になる() {
+        let h = hl();
+        let theme = "base16-ocean.dark";
+        let bg = h
+            .ts()
+            .themes
+            .get(theme)
+            .and_then(|t| t.settings.background)
+            .map(|c| Color32::from_rgb(c.r, c.g, c.b))
+            .expect("既定テーマに背景色がある");
+        let mut bad: Vec<String> = Vec::new();
+        for (file, lang, src, cmt, string, kw, num) in CASES {
+            let job = h.layout_job(src, lang, theme, FontId::monospace(12.0), Color32::WHITE);
+            if job.text != *src {
+                bad.push(format!("{file}: 本文が欠けた"));
+                continue;
+            }
+            // どの言語も最低 3 色には分かれること (単色で塗られていない)
+            let distinct: BTreeSet<[u8; 4]> = job
+                .sections
+                .iter()
+                .map(|s| s.format.color.to_array())
+                .collect();
+            let named: Vec<(&str, &str)> = [
+                ("コメント", *cmt),
+                ("文字列", *string),
+                ("キーワード", *kw),
+                ("数値", *num),
+            ]
+            .into_iter()
+            .filter(|(_, n)| !n.is_empty())
+            .collect();
+            // 色の下限。コメントしか無い言語 (Git Commit / justfile) に
+            // 3 色を求めても意味が無いので、見る断片の数から決める。
+            let want = if named.len() >= 2 { 3 } else { 2 };
+            if distinct.len() < want {
+                bad.push(format!("{file} ({lang}): 色数 {}", distinct.len()));
+            }
+            // 指定した断片は互いに違う色で、かつ背景から浮いていること
+            let mut seen: Vec<(&str, Color32)> = Vec::new();
+            for (what, needle) in named {
+                let c = color_of(&job, needle);
+                if contrast(c, bg) < MIN_CONTRAST {
+                    bad.push(format!(
+                        "{file} ({lang}): {what} が背景に埋もれている (比 {:.2})",
+                        contrast(c, bg)
+                    ));
+                }
+                if let Some((prev, _)) = seen.iter().find(|(_, pc)| *pc == c) {
+                    bad.push(format!("{file} ({lang}): {what} と {prev} が同じ色"));
+                }
+                seen.push((what, c));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+}
+
+// ===========================================================================
+// Rust だけは細部まで見る
+//
+// 自分自身を書く言語なので、ライフタイム注記・マクロ・属性・raw string・
+// 生ポインタ・async/await・入れ子のジェネリクス・doc コメント・unsafe・
+// where 節・シェバンまで、代表的な書き方が**互いに違う色**になることを固定する。
+// ===========================================================================
+#[cfg(test)]
+mod rust_quality {
+    use super::*;
+
+    const SRC: &str = r##"#!/usr/bin/env rust-script
+//! クレートの doc コメント
+use std::collections::HashMap;
+
+/// 関数の doc コメント
+#[derive(Debug, Clone, PartialEq)]
+pub struct Holder<'a, T> {
+    borrowed: &'a str,
+    items: Vec<HashMap<String, Vec<u8>>>,
+    marker: std::marker::PhantomData<T>,
+}
+
+macro_rules! twice {
+    ($x:expr) => { $x + $x };
+}
+
+impl<'a, T> Holder<'a, T>
+where
+    T: Send + 'static,
+{
+    pub async fn fetch(&self, count: usize) -> Result<u64, String> {
+        let raw = r#"生の "文字列" はエスケープしない"#;
+        let normal = "普通の文字列\n";
+        let hex = 0xDEAD_BEEF_u64;
+        let float = 1.5e-3;
+        unsafe {
+            let ptr: *const u8 = std::ptr::null();
+            if !ptr.is_null() {
+                return Err(normal.to_string());
+            }
+        }
+        let doubled = twice!(count);
+        let joined = other().await;
+        Ok(hex + doubled as u64 + joined + float as u64 + raw.len() as u64)
+    }
+}
+
+async fn other() -> u64 { 1 }
+
+pub trait Render {}
+
+impl<T: Display + Clone> Render for T {}
+
+fn label<T>(v: T) -> String
+where
+    T: Into<String>,
+{
+    v.into()
+}
+"##;
+
+    fn hl() -> Highlighter {
+        Highlighter::new()
+    }
+
+    fn colors(h: &Highlighter, theme: &str) -> LayoutJob {
+        h.layout_job(SRC, "Rust", theme, FontId::monospace(12.0), Color32::WHITE)
+    }
+
+    /// `needle` が最初に現れる位置の色。
+    fn at(job: &LayoutJob, needle: &str) -> Color32 {
+        let i = job
+            .text
+            .find(needle)
+            .unwrap_or_else(|| panic!("本文に {needle:?} が無い"));
+        job.sections
+            .iter()
+            .find(|s| s.byte_range.contains(&i))
+            .map(|s| s.format.color)
+            .unwrap_or_else(|| panic!("{needle:?} を覆う区間が無い"))
+    }
+
+    #[test]
+    fn 代表的なrustの書き方が互いに違う色になる() {
+        let h = hl();
+        let job = colors(&h, "base16-ocean.dark");
+        assert_eq!(job.text, SRC, "本文が欠けた");
+        // 比較の基準は**テーマの地の色 (本文の色)**。
+        //
+        // 同梱した新しい Rust 構文は `let` の束縛名や式中の識別子にも
+        // `variable.other` を付ける (Sublime Text 本体と同じ塗り方) ので、
+        // 「どのスコープも付いていない素の識別子」という基準そのものが無くなった。
+        // ここで見たいのは「地の文と見分けが付くか」なので前景色を基準にする。
+        let body = h
+            .ts()
+            .themes
+            .get("base16-ocean.dark")
+            .and_then(|t| t.settings.foreground)
+            .map(|c| Color32::from_rgb(c.r, c.g, c.b))
+            .expect("既定テーマに前景色がある");
+        // (見たいもの, 本文中の断片) — 基準色と違うこと
+        let differs: &[(&str, &str)] = &[
+            ("ライフタイム注記", "'a,"),
+            ("async fn の fn", "fn fetch"),
+            ("マクロ定義", "macro_rules"),
+            ("属性", "derive"),
+            ("doc コメント (///)", "関数の doc"),
+            ("crate doc コメント (//!)", "クレートの doc"),
+            ("raw string", "生の "),
+            ("通常の文字列", "普通の文字列"),
+            ("16 進リテラル", "0xDEAD_BEEF"),
+            ("浮動小数リテラル", "1.5e-3"),
+            ("unsafe", "unsafe"),
+            ("where 節", "where"),
+            ("生ポインタの型", "*const u8"),
+            // ここから下は同梱の `assets/syntaxes/Rust.sublime-syntax` で
+            // 初めて色が付くようになったもの (two-face が持つ古い版では
+            // 全て素の識別子と同じ色だった)。回帰したら必ずここで落ちる。
+            ("async", "async fn"),
+            (".await の await", "await;"),
+            ("トレイト境界の型", "Display + Clone"),
+            // where 節の型パラメータ (`T`) は `storage.type` が付く。
+            // 境界名そのもの (`Into`) は `support.type` で、base16 系の
+            // tmTheme はこのスコープに色を定義していない (= 構文ではなく
+            // テーマ側の都合。two-face の古い構文でも同じだった)。
+            ("where 節の型パラメータ", "T: Into"),
+            ("シェバン", "/usr/bin/env"),
+        ];
+        let mut bad = Vec::new();
+        for (what, needle) in differs {
+            if at(&job, needle) == body {
+                bad.push(format!("{what} ({needle:?}) が地の文と同じ色"));
+            }
+        }
+        // 文字列は raw でも通常でも同じ扱い、コメントとは別の色
+        let s_raw = at(&job, "生の ");
+        let s_norm = at(&job, "普通の文字列");
+        let cmt = at(&job, "関数の doc");
+        if s_raw != s_norm {
+            bad.push("raw string と通常の文字列で色が違う".into());
+        }
+        if s_raw == cmt {
+            bad.push("文字列とコメントが同じ色".into());
+        }
+        // 数値はコメントとも文字列とも違う
+        if at(&job, "0xDEAD_BEEF") == s_raw || at(&job, "0xDEAD_BEEF") == cmt {
+            bad.push("数値が文字列かコメントと同じ色".into());
+        }
+        // 属性名が「コメント / 文字列 / 数値 / キーワード」のどれかに
+        // 紛れ込んでいないこと (地の文と違うだけでは分類として弱いため)。
+        let attr = at(&job, "derive");
+        for (what, c) in [
+            ("コメント", cmt),
+            ("文字列", s_raw),
+            ("数値", at(&job, "0xDEAD_BEEF")),
+            ("キーワード", at(&job, "unsafe")),
+        ] {
+            if attr == c {
+                bad.push(format!("属性が{what}と同じ色"));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn シェバンで始まっても後続のrustが壊れない() {
+        let h = hl();
+        let job = colors(&h, "base16-ocean.dark");
+        // シェバン行はコメントとして塗られ、**その後ろも壊れないこと**が要点。
+        let body = h
+            .ts()
+            .themes
+            .get("base16-ocean.dark")
+            .and_then(|t| t.settings.foreground)
+            .map(|c| Color32::from_rgb(c.r, c.g, c.b))
+            .expect("既定テーマに前景色がある");
+        assert_eq!(
+            at(&job, "/usr/bin/env"),
+            at(&job, "関数の doc"),
+            "シェバンがコメント色で塗られていない"
+        );
+        assert_ne!(at(&job, "pub struct"), body, "シェバンの後ろが素通し");
+        assert_ne!(at(&job, "普通の文字列"), body, "文字列が塗れていない");
+        assert_ne!(at(&job, "関数の doc"), body, "doc コメントが塗れていない");
+        assert_ne!(at(&job, "macro_rules"), body, "マクロが塗れていない");
+    }
+
+    #[test]
+    fn 全てのカラーテーマでrustのコメントと本文が別の色になる() {
+        let h = hl();
+        let mut bad = Vec::new();
+        for t in crate::theme::all() {
+            let job = colors(&h, &t.syntect_theme);
+            let cmt = at(&job, "関数の doc");
+            let ident = at(&job, "doubled");
+            let string = at(&job, "普通の文字列");
+            let bg = h
+                .ts()
+                .themes
+                .get(&t.syntect_theme)
+                .and_then(|s| s.settings.background)
+                .map(|c| Color32::from_rgb(c.r, c.g, c.b));
+            if cmt == ident {
+                bad.push(format!("{}: コメントと本文が同じ色", t.name));
+            }
+            if cmt == string {
+                bad.push(format!("{}: コメントと文字列が同じ色", t.name));
+            }
+            if Some(cmt) == bg {
+                bad.push(format!("{}: コメントが背景と同じ色", t.name));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// 同梱の Rust 構文は **Rust を実際に塗るまで**組まない。
+    ///
+    /// `SyntaxSet::into_builder()` 経由で拡張セットへ混ぜると 220 構文を
+    /// 全部張り直すことになり、実測 (release) で 1 回 0.6〜0.8 秒かかる。
+    /// 別セットに切り出したうえで遅延させている、という設計をここで固定する。
+    #[test]
+    fn rust構文は塗るまで組まれない() {
+        let h = hl();
+        assert!(
+            h.rust_ps.get().is_none(),
+            "作っただけで Rust 構文を組んでいる"
+        );
+        // 他言語の判定・着色では触らない
+        assert_eq!(h.lang_for(Some(Path::new("a.py")), ""), "Python");
+        let _ = h.layout_job(
+            "x = 1\n",
+            "Python",
+            "base16-ocean.dark",
+            FontId::monospace(12.0),
+            Color32::WHITE,
+        );
+        assert!(
+            h.rust_ps.get().is_none(),
+            "他言語を塗っただけで Rust 構文を組んでいる"
+        );
+
+        let t = std::time::Instant::now();
+        let job = colors(&h, "base16-ocean.dark");
+        let first = t.elapsed();
+        assert_eq!(job.text, SRC, "本文が欠けた");
+        assert!(
+            h.rust_ps.get().and_then(|o| o.as_ref()).is_some(),
+            "Rust を塗ったのに専用セットが組まれていない"
+        );
+        // 閾値は debug ビルドでも余裕がある値 (実測 release 十数 ms)。
+        // ここが跳ねたら「拡張セットへ混ぜる」実装へ戻ってしまっている。
+        assert!(
+            first < std::time::Duration::from_millis(1500),
+            "同梱 Rust 構文の初回組み立てが遅い: {first:?}"
+        );
+    }
+
+    /// 同梱した第三者ファイルの出典とライセンスが、ファイル自身と
+    /// 添付のライセンスファイルの**両方**に書いてあること。
+    #[test]
+    fn 同梱したrust構文に出典とライセンスが書いてある() {
+        // Windows のチェックアウトは CRLF なので必ず正規化してから探す。
+        let yaml = RUST_SYNTAX_YAML.replace("\r\n", "\n");
+        for needle in [
+            "https://github.com/sublimehq/Packages",
+            "Permission to copy, use, modify, sell and distribute",
+        ] {
+            assert!(yaml.contains(needle), "構文定義に記載が無い: {needle}");
+        }
+        let lic = include_str!("../assets/syntaxes/Rust.sublime-syntax-license.txt")
+            .replace("\r\n", "\n");
+        for needle in [
+            "https://github.com/sublimehq/Packages",
+            "Permission to copy, use, modify, sell and distribute",
+            "assets/syntaxes/Rust.sublime-syntax",
+        ] {
+            assert!(lic.contains(needle), "添付ライセンスに記載が無い: {needle}");
+        }
+    }
+
+    #[test]
+    fn カラーテーマのsyntect名が全て解決できる() {
+        let h = hl();
+        let mut missing = Vec::new();
+        for t in crate::theme::all() {
+            if !h.ts().themes.contains_key(&t.syntect_theme) {
+                missing.push(format!("{} → {}", t.name, t.syntect_theme));
+            }
+        }
+        assert!(missing.is_empty(), "解決できないテーマ名: {missing:#?}");
+        // 拡張セットぶんテーマが増えていること (Dracula / Nord / gruvbox …)
+        let defaults = ThemeSet::load_defaults().themes.len();
+        assert!(
+            h.ts().themes.len() > defaults,
+            "テーマが増えていない: {} (既定 {defaults})",
+            h.ts().themes.len()
+        );
+        // 端末専用テーマは混ぜない
+        for name in TERMINAL_ONLY_THEMES {
+            assert!(!h.ts().themes.contains_key(*name), "{name} を混ぜている");
+        }
     }
 }

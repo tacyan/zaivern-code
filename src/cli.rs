@@ -211,6 +211,8 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "session"
             | "agent"
             | "hook"
+            | "update"
+            | "uninstall"
             | "help"
             | "--help"
             | "-h"
@@ -234,7 +236,7 @@ fn yields_to_directory(word: &str) -> bool {
 /// `zai <cmd> --help` は該当セクションだけを出す。
 /// **セクションの実体は 1 箇所** — 全体ヘルプと個別ヘルプが食い違わない。
 pub fn help_text() -> String {
-    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_TAIL}")
+    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
 }
 
 const HELP_HEAD: &str = "\
@@ -310,6 +312,28 @@ agent (対応エージェント CLI):
 
 ";
 
+/// `zai update --help` のセクション。
+pub const HELP_UPDATE: &str = "\
+update (Zaivern Code 自身を更新します — エディタが起動していなくても使えます):
+  zai update                            最新版を確認し、実行するコマンドを見せてから更新
+  zai update --check                    最新かどうかを確認するだけ (何も実行しません)
+  zai update --yes | -y                 確認を求めずに更新する
+                                        更新手段は入っている場所で自動的に選ばれます
+                                        (~/.cargo/bin なら cargo、それ以外はインストーラ)
+
+";
+
+/// `zai uninstall --help` のセクション。
+pub const HELP_UNINSTALL: &str = "\
+uninstall (Zaivern Code を消します — 消す前に必ず一覧と合計サイズを出します):
+  zai uninstall                         消すものを一覧表示して確認を求める
+  zai uninstall --dry-run               一覧を出すだけ (何も消しません)
+  zai uninstall --keep-config           設定 (config.toml / state.toml) は残す
+  zai uninstall --yes | -y              確認を求めずに削除する
+                                        消すのは実行ファイル本体と ~/.zaivern だけです
+
+";
+
 const HELP_TAIL: &str = "\
 ベンダーフック (エージェント CLI から自動的に呼ばれます — 手で打つものではありません):
   zai hook --zaivern <エージェント> <イベント>
@@ -363,6 +387,9 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         "worktree" => finish(worktree_dispatch(rest)),
         "session" => finish(session_dispatch(rest)),
         "agent" => finish(agent_dispatch(rest)),
+        // 自分自身の面倒 (更新・削除)。どちらもエディタの起動を要求しない。
+        "update" => finish(update_dispatch(rest)),
+        "uninstall" => finish(uninstall_dispatch(rest)),
         // ベンダー提供フックの受け口 (状態ラダー 2 段目)。
         // ベンダー CLI がこれを呼ぶ。GUI が居なくても成功して構わない
         // (投函箱に置くだけ — GUI は次のサンプリングで拾う)。
@@ -1438,6 +1465,695 @@ fn agent_dispatch(args: &[String]) -> CliOut {
     }
 }
 
+// ───────────────────────── update / uninstall: 自分自身の面倒を見る ─────────────────────────
+
+/// ワンライナーインストーラの実体をビルド時に取り込む。
+///
+/// **owner/repo も配布 URL も「ここから読む」。** cli.rs に直書きすると、
+/// リポジトリを移したときに install.sh だけが直って CLI は古い URL を
+/// 案内し続ける — 直書き禁止の一形態。README が案内しているワンライナーと
+/// 同一であることは下のテストが番人になる。
+const INSTALL_SH: &str = include_str!("../install.sh");
+const INSTALL_PS1: &str = include_str!("../install.ps1");
+
+/// 配布元 (GitHub) の各 URL。すべて [`INSTALL_SH`] / [`INSTALL_PS1`] から導出する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Distribution {
+    /// `owner/name`
+    pub slug: String,
+    /// リポジトリの Web URL (`cargo install --git` に渡すもの)
+    pub repo_url: String,
+    /// 最新リリースを返す API の URL
+    pub latest_api: String,
+    /// macOS / Linux 用インストーラの URL
+    pub installer_sh: String,
+    /// Windows 用インストーラの URL
+    pub installer_ps1: String,
+}
+
+/// `https://…` のトークンを引用符・空白・パイプで切り出す。
+/// シェルと PowerShell の両方を同じ関数で読むための最小限のスキャナ。
+fn https_tokens(text: &str) -> Vec<&str> {
+    const HEAD: &str = "https://";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(HEAD) {
+        let tail = &rest[i..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '`' | '|'))
+            .unwrap_or(tail.len());
+        out.push(&tail[..end]);
+        rest = &tail[end.max(HEAD.len())..];
+    }
+    out
+}
+
+/// 条件に合う最初の `https://…` を返す。
+fn find_url(text: &str, pred: impl Fn(&str) -> bool) -> Option<&str> {
+    https_tokens(text).into_iter().find(|u| pred(u))
+}
+
+/// スクリプト内の変数参照 (`$REPO` / `$repo`) を実際の slug に置き換える。
+fn subst_repo(url: &str, slug: &str) -> String {
+    url.replace("$REPO", slug).replace("$repo", slug)
+}
+
+/// `REPO="owner/name"` / `$repo = "owner/name"` から `owner/name` を取り出す。
+///
+/// URL 形 (`REPO_URL="https://…/$REPO"`) を誤って拾わないよう、
+/// **スラッシュ 1 個・コロン無し**の形だけを受け付ける。
+pub fn parse_repo_slug(script: &str) -> Option<String> {
+    for line in script.lines() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        if !(lower.starts_with("repo=")
+            || lower.starts_with("$repo=")
+            || lower.starts_with("$repo "))
+        {
+            continue;
+        }
+        let Some(value) = t.split('"').nth(1) else {
+            continue;
+        };
+        let parts: Vec<&str> = value.split('/').collect();
+        let ok = parts.len() == 2
+            && parts.iter().all(|p| !p.is_empty())
+            && !value.contains(':')
+            && !value.contains(char::is_whitespace);
+        if ok {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// インストーラ 2 本から配布元の URL 一式を組み立てる。
+/// どれか 1 つでも読めなければ `None` (中途半端な URL を案内しない)。
+pub fn distribution_from(sh: &str, ps1: &str) -> Option<Distribution> {
+    let slug = parse_repo_slug(sh).or_else(|| parse_repo_slug(ps1))?;
+    // リポジトリ Web URL は `"https://github.com/$REPO"` の形で書かれている。
+    let repo_url = find_url(sh, |u| u.ends_with("$REPO") || u.ends_with("$repo"))
+        .or_else(|| find_url(ps1, |u| u.ends_with("$REPO") || u.ends_with("$repo")))
+        .map(|u| subst_repo(u, &slug))?;
+    let latest_api = find_url(sh, |u| u.ends_with("/releases/latest"))
+        .or_else(|| find_url(ps1, |u| u.ends_with("/releases/latest")))
+        .map(|u| subst_repo(u, &slug))?;
+    // ヘッダコメントのワンライナー = README が案内しているものと同一。
+    let installer_sh = find_url(sh, |u| u.ends_with("/install.sh"))?.to_string();
+    let installer_ps1 = find_url(ps1, |u| u.ends_with("/install.ps1"))?.to_string();
+    Some(Distribution {
+        slug,
+        repo_url,
+        latest_api,
+        installer_sh,
+        installer_ps1,
+    })
+}
+
+/// 実行時に使う配布元情報。
+fn distribution() -> Result<Distribution, CliError> {
+    distribution_from(INSTALL_SH, INSTALL_PS1).ok_or_else(|| {
+        CliError::Runtime(
+            "配布元の URL を特定できませんでした (install.sh を確認してください)".into(),
+        )
+    })
+}
+
+/// `v0.8.0` / `0.8.0-rc1` → `[0, 8, 0]`。数値として読めない要素は 0 に落とす。
+pub fn parse_version(s: &str) -> [u64; 3] {
+    let core = s.trim().trim_start_matches(['v', 'V']);
+    let mut out = [0u64; 3];
+    for (i, part) in core.split('.').take(3).enumerate() {
+        let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+        out[i] = digits.parse().unwrap_or(0);
+    }
+    out
+}
+
+/// 配布元の方が新しいか。同じ・古い場合は false (= 更新不要)。
+pub fn version_is_newer(latest: &str, current: &str) -> bool {
+    parse_version(latest) > parse_version(current)
+}
+
+/// URL の本文を取る。
+///
+/// **HTTP クライアントのクレートは足さない** — どの OS にも標準で入っている
+/// ものを子プロセスで呼ぶ (macOS / Linux: curl、Windows: PowerShell)。
+/// 依存を 1 つ増やすと配布バイナリと監査対象が増えるが、ここで欲しいのは
+/// 「タグ名 1 個」だけなので割に合わない。
+fn fetch_text(url: &str) -> Result<String, CliError> {
+    // 自前の定数由来の URL しか来ないが、埋め込む前に必ず形を確認する。
+    if !url.starts_with("https://") || url.contains('\'') || url.contains(char::is_whitespace) {
+        return Err(CliError::Runtime(format!("取得できない URL です: {url}")));
+    }
+    let out = if cfg!(windows) {
+        crate::procx::hidden_command("powershell")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(format!(
+                "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+                 (Invoke-WebRequest -UseBasicParsing -TimeoutSec 20 -Uri '{url}').Content"
+            ))
+            .output()
+    } else {
+        crate::procx::hidden_command("curl")
+            .arg("-fsSL")
+            .arg("--max-time")
+            .arg("20")
+            .arg(url)
+            .output()
+    };
+    let out = out.map_err(|e| {
+        CliError::Runtime(format!(
+            "ネットワーク取得コマンドを起動できません: {e} (curl / PowerShell が必要です)"
+        ))
+    })?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(CliError::Runtime(format!(
+            "配布元へ接続できませんでした: {url}{}",
+            if err.is_empty() {
+                String::new()
+            } else {
+                format!(" — {err}")
+            }
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// 最新リリースのタグ (`v0.8.1` など)。
+fn fetch_latest_tag(api_url: &str) -> Result<String, CliError> {
+    let body = fetch_text(api_url)?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| CliError::Runtime(format!("配布元の応答を解釈できません: {e}")))?;
+    v.get("tag_name")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| CliError::Runtime("配布元に公開済みのリリースがありません".into()))
+}
+
+/// 更新の手段。**実行ファイルの置き場所**で決まる。
+/// `cargo install` で入れた人にインストーラを流し込むと、`~/.cargo/bin` と
+/// `~/.local/bin` に別バージョンが並んで「更新したのに古いまま」になる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateMethod {
+    /// `cargo install --git … --force`
+    Cargo,
+    /// `curl -fsSL <install.sh> | sh`
+    Shell,
+    /// `irm <install.ps1> | iex`
+    PowerShell,
+}
+
+/// 更新手段を選ぶ純関数 (テストから OS と置き場所を差し込めるようにしてある)。
+pub fn choose_update_method(exe: &Path, cargo_bin: Option<&Path>, windows: bool) -> UpdateMethod {
+    if let (Some(dir), Some(parent)) = (cargo_bin, exe.parent()) {
+        if parent == dir {
+            return UpdateMethod::Cargo;
+        }
+    }
+    if windows {
+        UpdateMethod::PowerShell
+    } else {
+        UpdateMethod::Shell
+    }
+}
+
+/// `cargo install` の置き場 (`CARGO_HOME` を尊重する)。
+fn cargo_bin_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("CARGO_HOME") {
+        return Some(PathBuf::from(home).join("bin"));
+    }
+    dirs::home_dir().map(|h| h.join(".cargo").join("bin"))
+}
+
+/// 画面に見せる更新コマンド。**実行 ([`run_update`]) と対で必ずここから作る** —
+/// 表示と実行が食い違うと、ユーザーは同意していないコマンドを踏むことになる。
+pub fn update_command_line(method: UpdateMethod, dist: &Distribution) -> String {
+    match method {
+        UpdateMethod::Cargo => format!(
+            "cargo install --git {} --locked --force {}",
+            dist.repo_url,
+            env!("CARGO_PKG_NAME")
+        ),
+        UpdateMethod::Shell => format!("curl -fsSL {} | sh", dist.installer_sh),
+        UpdateMethod::PowerShell => format!("irm {} | iex", dist.installer_ps1),
+    }
+}
+
+/// 更新を実行する。**自分自身を消しには行かない** — 上書きはインストーラ
+/// (Windows は実行中 exe を改名して差し替える) に任せ、ここは待つだけ。
+fn run_update(method: UpdateMethod, dist: &Distribution) -> Result<(), CliError> {
+    let line = update_command_line(method, dist);
+    let mut cmd = match method {
+        UpdateMethod::Cargo => {
+            let mut c = std::process::Command::new("cargo");
+            c.arg("install")
+                .arg("--git")
+                .arg(&dist.repo_url)
+                .arg("--locked")
+                .arg("--force")
+                .arg(env!("CARGO_PKG_NAME"));
+            c
+        }
+        UpdateMethod::Shell => {
+            let mut c = std::process::Command::new("sh");
+            c.arg("-c")
+                .arg(format!("curl -fsSL {} | sh", dist.installer_sh));
+            c
+        }
+        UpdateMethod::PowerShell => {
+            let mut c = std::process::Command::new("powershell");
+            c.arg("-NoProfile")
+                .arg("-Command")
+                .arg(format!("irm {} | iex", dist.installer_ps1));
+            c
+        }
+    };
+    let status = cmd.status().map_err(|e| {
+        CliError::Runtime(format!(
+            "更新コマンドを起動できませんでした: {e}\n手動で次を実行してください:\n  {line}"
+        ))
+    })?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(CliError::Runtime(format!(
+        "更新に失敗しました (終了コード {})。手動で次を実行してください:\n  {line}",
+        status.code().unwrap_or(-1)
+    )))
+}
+
+/// 自分自身の絶対パス。シンボリックリンク経由でも実体を指すよう canonicalize する
+/// (リンクだけ消しても実体が残り、PATH 次第でまだ起動できてしまうため)。
+fn resolve_exe() -> Result<PathBuf, CliError> {
+    let p = std::env::current_exe()
+        .map_err(|e| CliError::Runtime(format!("実行ファイルの場所を特定できません: {e}")))?;
+    Ok(p.canonicalize().unwrap_or(p))
+}
+
+/// 破壊的な操作の前に `y` を求める。
+/// 標準入力が無い (パイプ・CI) 場合は **中止側に倒す** — 確認できないまま消さない。
+fn confirm(prompt: &str) -> bool {
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => {
+            let a = line.trim().to_ascii_lowercase();
+            a == "y" || a == "yes"
+        }
+    }
+}
+
+/// `zai update` のディスパッチ。
+fn update_dispatch(args: &[String]) -> CliOut {
+    if wants_help(args) {
+        return Ok(HELP_UPDATE.trim_end().to_string());
+    }
+    const USAGE: &str = "zai update [--check] [--yes|-y]";
+    let (check, rest) = take_flag(args, "--check");
+    let (yes_long, rest) = take_flag(&rest, "--yes");
+    let (yes_short, rest) = take_flag(&rest, "-y");
+    reject_extra(&rest, USAGE)?;
+    let yes = yes_long || yes_short;
+
+    let dist = distribution()?;
+    let current = env!("CARGO_PKG_VERSION");
+    println!("現在のバージョン: {current}");
+    println!("配布元を確認しています: {}", dist.repo_url);
+    let latest = fetch_latest_tag(&dist.latest_api)?;
+    println!("配布元の最新版:   {latest}");
+    if !version_is_newer(&latest, current) {
+        return Ok("✅ 最新です。更新の必要はありません。".into());
+    }
+
+    let exe = resolve_exe()?;
+    let method = choose_update_method(&exe, cargo_bin_dir().as_deref(), cfg!(windows));
+    let line = update_command_line(method, &dist);
+    println!();
+    println!("🆕 新しいバージョンがあります: {current} → {latest}");
+    println!("インストール先: {}", exe.display());
+    println!("次のコマンドで更新します:");
+    println!("  {line}");
+    if check {
+        return Ok("(--check のため実行していません)".into());
+    }
+    if !yes && !confirm("\n実行しますか? [y/N]: ") {
+        return Ok("中止しました。".into());
+    }
+    println!();
+    run_update(method, &dist)?;
+    Ok("✅ 更新しました。`zai --version` で確認してください。".into())
+}
+
+// ───────────────────────── uninstall ─────────────────────────
+
+/// `--keep-config` のときに残すもの (= 設定そのもの)。
+/// セッション記録や端末ログは「設定」ではないので残さない
+/// (容量の大半がここなので、残すと消したい人が消せなくなる)。
+const KEEP_ON_CONFIG: &[&str] = &["config.toml", "state.toml"];
+
+/// 削除候補 1 件 (`~/.zaivern` 直下の 1 エントリ)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninstallEntry {
+    /// 表示名 (ディレクトリは末尾に `/`)
+    pub label: String,
+    pub path: PathBuf,
+    pub size: u64,
+    /// `--keep-config` で残すもの
+    pub keep: bool,
+}
+
+/// `zai uninstall` が消すもの一式。**表示 → 確認 → 削除**の順に使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninstallPlan {
+    pub exe: PathBuf,
+    pub exe_size: u64,
+    pub data_dir: PathBuf,
+    pub entries: Vec<UninstallEntry>,
+    /// PATH 上に残る別の `zai`。**消さない** — 案内だけする。
+    pub others: Vec<PathBuf>,
+    pub keep_config: bool,
+}
+
+impl UninstallPlan {
+    /// 実際に消える合計サイズ (残すものは数えない)。
+    pub fn total(&self) -> u64 {
+        self.exe_size
+            + self
+                .entries
+                .iter()
+                .filter(|e| !e.keep)
+                .map(|e| e.size)
+                .sum::<u64>()
+    }
+
+    /// データ側の削除対象をこの順に消す。実行ファイルは含めない
+    /// (自分を消してから他を消しに行かないよう、呼び出し側で最後に扱う)。
+    pub fn removals(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| !e.keep)
+            .map(|e| e.path.clone())
+            .collect();
+        // 何も残さないなら入れ物ごと消す (空ディレクトリを置き去りにしない)。
+        if !self.keep_config && self.data_dir.exists() {
+            v.push(self.data_dir.clone());
+        }
+        v
+    }
+}
+
+/// パス配下の合計サイズ。**シンボリックリンクは辿らない** —
+/// リンク先の容量を「消える容量」に数えると桁が嘘になる。
+pub fn dir_size(p: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return 0;
+    };
+    rd.flatten().map(|e| dir_size(&e.path())).sum()
+}
+
+/// 人が読むサイズ表記。
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0usize;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else if v < 10.0 {
+        format!("{v:.1} {}", UNITS[i])
+    } else {
+        format!("{v:.0} {}", UNITS[i])
+    }
+}
+
+/// PATH 上に残る、いま動いているものとは別の `zai`。
+///
+/// **消さない。** 削除して良いのは `current_exe()` 自身と `~/.zaivern` 配下だけ、
+/// という安全規則を崩さないため、見つけたら一覧に出して手で消してもらう。
+fn other_binaries_on_path(exe: &Path) -> Vec<PathBuf> {
+    let (Some(name), Some(path)) = (exe.file_name(), std::env::var_os("PATH")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(name);
+        if !cand.is_file() {
+            continue;
+        }
+        let real = cand.canonicalize().unwrap_or(cand);
+        if real == exe || out.contains(&real) {
+            continue;
+        }
+        out.push(real);
+    }
+    out
+}
+
+/// 削除計画を組み立てる。fs を読むだけで**何も消さない**ので、
+/// テストは一時ディレクトリを渡してそのまま検証できる。
+pub fn build_uninstall_plan(
+    exe: &Path,
+    data_dir: &Path,
+    keep_config: bool,
+    others: Vec<PathBuf>,
+) -> UninstallPlan {
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(data_dir) {
+        let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for p in paths {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let label = if p.is_dir() {
+                format!("{name}/")
+            } else {
+                name.clone()
+            };
+            entries.push(UninstallEntry {
+                keep: keep_config && KEEP_ON_CONFIG.contains(&name.as_str()),
+                size: dir_size(&p),
+                label,
+                path: p,
+            });
+        }
+    }
+    UninstallPlan {
+        exe_size: dir_size(exe),
+        exe: exe.to_path_buf(),
+        data_dir: data_dir.to_path_buf(),
+        entries,
+        others,
+        keep_config,
+    }
+}
+
+/// 削除計画を人が読む形にする。**確認を求める前に必ずこれを出す。**
+pub fn render_uninstall_plan(plan: &UninstallPlan, dry_run: bool) -> String {
+    let mut s = String::new();
+    if dry_run {
+        s.push_str("(--dry-run: 一覧を出すだけで、何も消しません)\n\n");
+    }
+    s.push_str("Zaivern Code をアンインストールします。\n\n削除するもの:\n");
+    s.push_str(&format!(
+        "  [実行ファイル]   {} ({})\n",
+        plan.exe.display(),
+        human_size(plan.exe_size)
+    ));
+    if plan.entries.is_empty() {
+        s.push_str(&format!(
+            "  [設定・データ]   {} — ありません\n",
+            plan.data_dir.display()
+        ));
+    } else {
+        s.push_str(&format!("  [設定・データ]   {}\n", plan.data_dir.display()));
+        for e in &plan.entries {
+            let size = human_size(e.size);
+            if e.keep {
+                s.push_str(&format!(
+                    "      - {:<20} {:>9}  (--keep-config のため残します)\n",
+                    e.label, size
+                ));
+            } else {
+                s.push_str(&format!("      - {:<20} {:>9}\n", e.label, size));
+            }
+        }
+    }
+    s.push_str("  [OS のアプリ登録] Launchpad / アプリメニュー / スタートメニューの登録を解除\n");
+    s.push_str(&format!(
+        "\n消える合計サイズ: {}\n",
+        human_size(plan.total())
+    ));
+    if !plan.others.is_empty() {
+        s.push_str(
+            "\n⚠ PATH 上に別の zai が残ります (安全のため自動では消しません。手で削除してください):\n",
+        );
+        for p in &plan.others {
+            s.push_str(&format!("  {}\n", p.display()));
+        }
+    }
+    s
+}
+
+/// 削除してよい対象かを **1 件ずつ、消す直前に** 判定する純関数。
+///
+/// 通すのは (1) 実行ファイル自身 (2) `data_dir` そのものか配下 の 2 系統だけ。
+/// ここを通らないものは消さずに中止する — `~` やルートを巻き込む経路を
+/// 構造的に残さないため。相対パスや `..` 混じりは「判定できない」ので拒否する。
+pub fn removal_is_safe(target: &Path, exe: &Path, data_dir: &Path) -> bool {
+    use std::path::Component;
+    let sane = |p: &Path| {
+        p.file_name().is_some()
+            && p.parent().is_some()
+            && !p
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    };
+    // 入れ物側が壊れている (ルート直下・相対) なら、何一つ消さない。
+    if !sane(data_dir) || !sane(target) {
+        return false;
+    }
+    if target == exe {
+        return sane(exe);
+    }
+    target.starts_with(data_dir)
+}
+
+/// 1 件消す。**必ず [`removal_is_safe`] を通してから**消す。
+/// 既に無いものは成功扱い (何度実行しても同じ結果になるようにする)。
+fn remove_path_guarded(target: &Path, exe: &Path, data_dir: &Path) -> Result<(), String> {
+    if !removal_is_safe(target, exe, data_dir) {
+        return Err("削除対象として安全でないため消しませんでした".into());
+    }
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
+        return Ok(());
+    };
+    // シンボリックリンクは「リンクだけ」消す (リンク先を巻き込まない)。
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        std::fs::remove_dir_all(target).map_err(|e| e.to_string())
+    } else {
+        std::fs::remove_file(target).map_err(|e| e.to_string())
+    }
+}
+
+/// 実行ファイル自身を消す。
+///
+/// **Windows は実行中の exe を削除できない**ので、隣へ改名して案内に切り替える
+/// (削除は不可でも改名は可能 — install.ps1 の差し替えと同じ手口)。
+fn remove_self(exe: &Path, data_dir: &Path) -> Result<String, String> {
+    if !removal_is_safe(exe, exe, data_dir) {
+        return Err("実行ファイルの場所を確定できないため消しませんでした".into());
+    }
+    match std::fs::remove_file(exe) {
+        Ok(()) => Ok(format!("削除しました: {}", exe.display())),
+        Err(e) if cfg!(windows) => {
+            let old = exe.with_extension("old");
+            match std::fs::rename(exe, &old) {
+                Ok(()) => Ok(format!(
+                    "実行中のため {} へ改名しました (サインインし直した後に削除してください)",
+                    old.display()
+                )),
+                Err(e2) => Err(format!("{}: {e} / 改名も失敗しました: {e2}", exe.display())),
+            }
+        }
+        Err(e) => Err(format!("{}: {e}", exe.display())),
+    }
+}
+
+/// `zai uninstall` のディスパッチ。
+fn uninstall_dispatch(args: &[String]) -> CliOut {
+    if wants_help(args) {
+        return Ok(HELP_UNINSTALL.trim_end().to_string());
+    }
+    const USAGE: &str = "zai uninstall [--dry-run] [--keep-config] [--yes|-y]";
+    let (dry_run, rest) = take_flag(args, "--dry-run");
+    let (keep_config, rest) = take_flag(&rest, "--keep-config");
+    let (yes_long, rest) = take_flag(&rest, "--yes");
+    let (yes_short, rest) = take_flag(&rest, "-y");
+    reject_extra(&rest, USAGE)?;
+    let yes = yes_long || yes_short;
+
+    let exe = resolve_exe()?;
+    // `~/.zaivern` は config から導く。存在するなら canonicalize して
+    // `./.zaivern` フォールバックでも絶対パスで安全判定できるようにする。
+    let data_dir = {
+        let d = zaivern_dir();
+        d.canonicalize().unwrap_or(d)
+    };
+    let plan = build_uninstall_plan(&exe, &data_dir, keep_config, other_binaries_on_path(&exe));
+    println!("{}", render_uninstall_plan(&plan, dry_run));
+    if dry_run {
+        return Ok("(--dry-run のため何も消していません)".into());
+    }
+    if !yes && !confirm("本当に削除しますか? [y/N]: ") {
+        return Ok("中止しました。".into());
+    }
+
+    // OS のアプリ登録は実行ファイルより先に外す。
+    // 後だと .app / .desktop / .lnk が実体を失ったまま残る。失敗しても続行。
+    let _ = crate::desktop::run(&["uninstall".to_string()]);
+
+    let mut failed: Vec<String> = Vec::new();
+    for t in plan.removals() {
+        if let Err(e) = remove_path_guarded(&t, &exe, &data_dir) {
+            failed.push(format!("  {} — {e}", t.display()));
+        }
+    }
+    // 実行ファイルは最後 (消した後に他の削除へ進まない)。
+    let self_note = match remove_self(&exe, &data_dir) {
+        Ok(msg) => msg,
+        Err(e) => {
+            failed.push(format!("  {e}"));
+            String::new()
+        }
+    };
+
+    if !failed.is_empty() {
+        return Err(CliError::Runtime(format!(
+            "一部を削除できませんでした (権限を確認して手で消してください):\n{}",
+            failed.join("\n")
+        )));
+    }
+    let mut out = String::from("✅ アンインストールしました。");
+    if !self_note.is_empty() {
+        out.push_str(&format!("\n{self_note}"));
+    }
+    if keep_config {
+        out.push_str(&format!("\n設定は残しました: {}", data_dir.display()));
+    }
+    if !plan.others.is_empty() {
+        out.push_str("\n⚠ PATH 上に残った zai は手で削除してください:");
+        for p in &plan.others {
+            out.push_str(&format!("\n  {}", p.display()));
+        }
+    }
+    Ok(out)
+}
+
 // ───────────────────────── テスト ─────────────────────────
 
 #[cfg(test)]
@@ -1485,6 +2201,8 @@ mod tests {
             "worktree",
             "session",
             "agent",
+            "update",
+            "uninstall",
             "help",
             "--help",
             "-h",
@@ -1542,6 +2260,12 @@ mod tests {
             "zai session send",
             "zai session log",
             "zai agent list",
+            // 自分自身の更新・削除
+            "zai update",
+            "zai update --check",
+            "zai uninstall",
+            "zai uninstall --dry-run",
+            "zai uninstall --keep-config",
             "zai help",
             "--help",
             "--version",
@@ -1562,7 +2286,13 @@ mod tests {
     #[test]
     fn per_command_help_is_a_slice_of_the_full_help() {
         let help = help_text();
-        for section in [HELP_WORKTREE, HELP_SESSION, HELP_AGENT] {
+        for section in [
+            HELP_WORKTREE,
+            HELP_SESSION,
+            HELP_AGENT,
+            HELP_UPDATE,
+            HELP_UNINSTALL,
+        ] {
             assert!(
                 help.contains(section),
                 "全体ヘルプに含まれていない:\n{section}"
@@ -1581,6 +2311,16 @@ mod tests {
         assert_eq!(
             agent_dispatch(&v(&["-h"])),
             Ok(HELP_AGENT.trim_end().to_string())
+        );
+        // update / uninstall は --help だけでネットワークにも fs にも触らない
+        // (ヘルプを見ただけで削除の確認が走ったら事故なので、ここで固定する)。
+        assert_eq!(
+            update_dispatch(&v(&["--help"])),
+            Ok(HELP_UPDATE.trim_end().to_string())
+        );
+        assert_eq!(
+            uninstall_dispatch(&v(&["-h"])),
+            Ok(HELP_UNINSTALL.trim_end().to_string())
         );
     }
 
@@ -2169,8 +2909,298 @@ prunable gitdir file points to non-existent location
         for w in ["app", "firewall", "worktree", "session", "agent", "help"] {
             assert!(yields_to_directory(w), "{w} は譲るべき");
         }
-        for w in ["open", "prompt", "run", "state", "plugin", "status"] {
+        // update / uninstall は「動詞」であってフォルダ名ではない。
+        // 譲ってしまうと ./update があるだけで更新が GUI 起動にすり替わる。
+        for w in [
+            "open",
+            "prompt",
+            "run",
+            "state",
+            "plugin",
+            "status",
+            "update",
+            "uninstall",
+        ] {
             assert!(!yields_to_directory(w), "{w} は譲らない");
         }
+    }
+
+    // ── update: 配布元の URL は install.sh / install.ps1 が単一の真実 ──
+
+    #[test]
+    fn 配布元は付属インストーラから導出できる() {
+        let d = distribution_from(INSTALL_SH, INSTALL_PS1).expect("配布元を導出できるべき");
+        assert_eq!(
+            d.slug.split('/').count(),
+            2,
+            "slug は owner/name: {}",
+            d.slug
+        );
+        for url in [
+            &d.repo_url,
+            &d.latest_api,
+            &d.installer_sh,
+            &d.installer_ps1,
+        ] {
+            assert!(url.starts_with("https://"), "https で始まるべき: {url}");
+            assert!(!url.contains('$'), "変数が残っている: {url}");
+        }
+        assert!(d.repo_url.ends_with(&d.slug), "{}", d.repo_url);
+        assert!(d.latest_api.contains(&d.slug), "{}", d.latest_api);
+        assert!(d.installer_sh.ends_with("/install.sh"));
+        assert!(d.installer_ps1.ends_with("/install.ps1"));
+    }
+
+    /// `zai update` が案内するコマンドは、README のワンライナーと**同一**でなければ
+    /// ならない。片方だけ直ると「案内どおりにしたのに入らない」が起きる。
+    #[test]
+    fn 更新コマンドは_readme_のワンライナーと一致する() {
+        let d = distribution_from(INSTALL_SH, INSTALL_PS1).expect("配布元");
+        // Windows のチェックアウトは CRLF なので改行を正規化してから探す。
+        let readmes = [
+            include_str!("../README.md").replace("\r\n", "\n"),
+            include_str!("../README.en.md").replace("\r\n", "\n"),
+        ];
+        let sh = update_command_line(UpdateMethod::Shell, &d);
+        let ps = update_command_line(UpdateMethod::PowerShell, &d);
+        for r in &readmes {
+            assert!(r.contains(&sh), "README に無い: {sh}");
+            assert!(r.contains(&ps), "README に無い: {ps}");
+        }
+    }
+
+    #[test]
+    fn repo_slug_は_url_行を拾わない() {
+        let sh = "# https://raw.githubusercontent.com/o/n/main/install.sh\n\
+                  REPO=\"owner/name\"\nREPO_URL=\"https://github.com/$REPO\"\n";
+        assert_eq!(parse_repo_slug(sh).as_deref(), Some("owner/name"));
+        let ps1 = "$repo = \"owner/name\"\n$repoUrl = \"https://github.com/$repo\"\n";
+        assert_eq!(parse_repo_slug(ps1).as_deref(), Some("owner/name"));
+        // 形が違えば拾わない (中途半端な URL を案内しないため)
+        assert_eq!(parse_repo_slug("REPO=\"https://x/y/z\"\n"), None);
+        assert_eq!(parse_repo_slug("# REPO=\"owner/name\"\n"), None);
+    }
+
+    #[test]
+    fn バージョン比較は数値順() {
+        assert_eq!(parse_version("v0.8.0"), [0, 8, 0]);
+        assert_eq!(parse_version("0.8.10-rc1"), [0, 8, 10]);
+        assert_eq!(parse_version("1.2"), [1, 2, 0]);
+        assert_eq!(parse_version("なんだこれ"), [0, 0, 0]);
+        for (latest, current, expect) in [
+            ("v0.8.1", "0.8.0", true),
+            ("v0.9.0", "0.8.99", true),
+            ("v1.0.0", "0.9.9", true),
+            ("v0.8.0", "0.8.0", false),
+            ("v0.7.9", "0.8.0", false),
+            // 文字列比較なら "0.10.0" < "0.9.0" になる — 数値順であることの番人
+            ("v0.10.0", "0.9.0", true),
+        ] {
+            assert_eq!(
+                version_is_newer(latest, current),
+                expect,
+                "{latest} vs {current}"
+            );
+        }
+    }
+
+    #[test]
+    fn 更新手段は実行ファイルの置き場所で決まる() {
+        let cargo_bin = PathBuf::from("/opt/cargo/bin");
+        let in_cargo = cargo_bin.join("zai");
+        let elsewhere = PathBuf::from("/opt/local/bin/zai");
+        // cargo install で入れた形跡があれば OS を問わず cargo
+        for windows in [false, true] {
+            assert_eq!(
+                choose_update_method(&in_cargo, Some(&cargo_bin), windows),
+                UpdateMethod::Cargo
+            );
+        }
+        assert_eq!(
+            choose_update_method(&elsewhere, Some(&cargo_bin), false),
+            UpdateMethod::Shell
+        );
+        assert_eq!(
+            choose_update_method(&elsewhere, Some(&cargo_bin), true),
+            UpdateMethod::PowerShell
+        );
+        // CARGO_HOME が取れない環境でも両側が決まる
+        assert_eq!(
+            choose_update_method(&elsewhere, None, true),
+            UpdateMethod::PowerShell
+        );
+        assert_eq!(
+            choose_update_method(&elsewhere, None, false),
+            UpdateMethod::Shell
+        );
+    }
+
+    #[test]
+    fn 更新コマンドは手段ごとに違う形になる() {
+        let d = distribution_from(INSTALL_SH, INSTALL_PS1).expect("配布元");
+        let cargo = update_command_line(UpdateMethod::Cargo, &d);
+        assert!(cargo.starts_with("cargo install --git "), "{cargo}");
+        assert!(
+            cargo.contains(&d.repo_url) && cargo.contains("--force"),
+            "{cargo}"
+        );
+        assert!(cargo.ends_with(env!("CARGO_PKG_NAME")), "{cargo}");
+        assert!(update_command_line(UpdateMethod::Shell, &d).starts_with("curl -fsSL "));
+        assert!(update_command_line(UpdateMethod::PowerShell, &d).starts_with("irm "));
+    }
+
+    #[test]
+    fn update_の引数ミスは終了コード2() {
+        assert_eq!(
+            update_dispatch(&v(&["いらない引数"])).map_err(|e| e.code()),
+            Err(EXIT_USAGE)
+        );
+        assert_eq!(
+            uninstall_dispatch(&v(&["いらない引数"])).map_err(|e| e.code()),
+            Err(EXIT_USAGE)
+        );
+    }
+
+    // ── uninstall: 消す前の一覧と、消して良い対象の検証 ──
+
+    #[test]
+    fn サイズ表記は桁ごとに単位が変わる() {
+        for (bytes, expect) in [
+            (0u64, "0 B"),
+            (999, "999 B"),
+            (1024, "1.0 KB"),
+            (1536, "1.5 KB"),
+            (20 * 1024, "20 KB"),
+            (5 * 1024 * 1024, "5.0 MB"),
+            (3 * 1024 * 1024 * 1024, "3.0 GB"),
+        ] {
+            assert_eq!(human_size(bytes), expect, "{bytes}");
+        }
+    }
+
+    /// 一時ディレクトリに `~/.zaivern` を模した構造を作る (実 HOME には触らない)。
+    fn fake_install(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = crate::test_util::unique_temp_dir("zaivern-cli-uninstall", tag);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let exe = bin.join("zai");
+        std::fs::write(&exe, vec![0u8; 2048]).expect("exe");
+        let data = root.join(".zaivern");
+        std::fs::create_dir_all(data.join("sessions")).expect("sessions");
+        std::fs::create_dir_all(data.join("term_logs")).expect("term_logs");
+        std::fs::write(data.join("config.toml"), vec![b'x'; 100]).expect("config");
+        std::fs::write(data.join("state.toml"), vec![b'x'; 50]).expect("state");
+        std::fs::write(data.join("sessions/a.toml"), vec![b'x'; 300]).expect("session");
+        std::fs::write(data.join("term_logs/a.log"), vec![b'x'; 700]).expect("log");
+        (root, exe, data)
+    }
+
+    #[test]
+    fn 削除計画は内訳とサイズを出す() {
+        let (_root, exe, data) = fake_install("plan");
+        let plan = build_uninstall_plan(&exe, &data, false, Vec::new());
+        let labels: Vec<&str> = plan.entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["config.toml", "sessions/", "state.toml", "term_logs/"]
+        );
+        assert_eq!(plan.exe_size, 2048);
+        assert_eq!(plan.total(), 2048 + 100 + 300 + 50 + 700);
+        let text = render_uninstall_plan(&plan, true);
+        assert!(text.contains("--dry-run"), "{text}");
+        for needle in ["config.toml", "sessions/", "term_logs/", "消える合計サイズ"] {
+            assert!(text.contains(needle), "一覧に {needle} が無い:\n{text}");
+        }
+    }
+
+    #[test]
+    fn keep_config_は設定だけ残して合計から外す() {
+        let (_root, exe, data) = fake_install("keep");
+        let plan = build_uninstall_plan(&exe, &data, true, Vec::new());
+        let kept: Vec<&str> = plan
+            .entries
+            .iter()
+            .filter(|e| e.keep)
+            .map(|e| e.label.as_str())
+            .collect();
+        assert_eq!(kept, ["config.toml", "state.toml"]);
+        assert_eq!(plan.total(), 2048 + 300 + 700);
+        // 設定を残すのだから、入れ物ごとの削除は計画に入らない
+        assert!(!plan.removals().contains(&data));
+        assert!(render_uninstall_plan(&plan, false).contains("--keep-config のため残します"));
+    }
+
+    #[test]
+    fn 安全判定は実行ファイルとデータ配下だけを通す() {
+        let home = PathBuf::from("/home/someone");
+        let data = home.join(".zaivern");
+        let exe = home.join(".local/bin/zai");
+        // 通るもの
+        for ok in [
+            exe.clone(),
+            data.clone(),
+            data.join("sessions"),
+            data.join("term_logs/a.log"),
+        ] {
+            assert!(
+                removal_is_safe(&ok, &exe, &data),
+                "{} は通るべき",
+                ok.display()
+            );
+        }
+        // 通してはいけないもの
+        for ng in [
+            home.clone(),
+            PathBuf::from("/"),
+            home.join(".zaivern-backup"),
+            home.join(".local/bin/other"),
+            home.join(".ssh"),
+            PathBuf::from("relative/path"),
+            data.join("../../etc"),
+        ] {
+            assert!(
+                !removal_is_safe(&ng, &exe, &data),
+                "{} は拒否すべき",
+                ng.display()
+            );
+        }
+        // 入れ物側が壊れていたら (ルート・相対) 何一つ消さない
+        assert!(!removal_is_safe(&data, &exe, Path::new("/")));
+        assert!(!removal_is_safe(&data, &exe, Path::new(".zaivern")));
+    }
+
+    #[test]
+    fn ガード付き削除は対象外に触らない() {
+        let (root, exe, data) = fake_install("remove");
+        // データ配下は消える
+        let sessions = data.join("sessions");
+        assert!(remove_path_guarded(&sessions, &exe, &data).is_ok());
+        assert!(!sessions.exists());
+        // 対象外は「消えない」だけでなくエラーになる (黙って見逃さない)
+        let outsider = root.join("大事なファイル");
+        std::fs::write(&outsider, b"keep me").expect("outsider");
+        assert!(remove_path_guarded(&outsider, &exe, &data).is_err());
+        assert!(outsider.exists(), "対象外を消してしまった");
+        assert!(remove_path_guarded(&root, &exe, &data).is_err());
+        assert!(root.exists());
+        // 既に無いものは成功扱い (何度でも実行できる)
+        assert!(remove_path_guarded(&sessions, &exe, &data).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 計画どおりに消すとデータと実行ファイルだけが消える() {
+        let (root, exe, data) = fake_install("apply");
+        let outsider = root.join("bin/他のツール");
+        std::fs::write(&outsider, b"keep me").expect("outsider");
+        let plan = build_uninstall_plan(&exe, &data, false, Vec::new());
+        for t in plan.removals() {
+            remove_path_guarded(&t, &exe, &data).expect("削除できるべき");
+        }
+        assert!(remove_self(&exe, &data).is_ok());
+        assert!(!data.exists(), "~/.zaivern 相当が残っている");
+        assert!(!exe.exists(), "実行ファイルが残っている");
+        assert!(outsider.exists(), "無関係なファイルを消してしまった");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

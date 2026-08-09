@@ -120,6 +120,17 @@ pub enum Cmd {
     FileZoomOut,
     /// アクティブなタブのズームを解除して画面全体の倍率に戻す (⌘⌥0)。
     FileZoomReset,
+    /// **文字サイズだけ**を 1 段大きくする。
+    ///
+    /// `ZoomIn` との違いが要点: あちらは egui の `zoom_factor` を動かすので
+    /// 余白・ボタン・パネル幅まで一緒に大きくなり、**画面に入る情報が減る**。
+    /// こちらはレイアウトを変えずに文字だけ掛け直すので、
+    /// 「窓は広いまま、字だけ読みやすく」ができる。
+    TextSizeIn,
+    /// 文字サイズだけを 1 段小さくする。
+    TextSizeOut,
+    /// 文字サイズの倍率を 100% へ戻す。
+    TextSizeReset,
     SendFileToAgent,
     RefreshTree,
     /// 既定の承認モード: "ask"(毎回ユーザー承認) | "auto"(全自動YES) | "agent"(Agent欄優先)
@@ -281,6 +292,9 @@ pub enum Cmd {
     ShowShortcuts,
     /// バージョン情報ダイアログ
     ShowAbout,
+    /// この版で何が変わったかを出す (What's New)。
+    /// 更新後の初回起動で自動的に 1 度だけ開き、以後はここから開ける。
+    ShowWhatsNew,
     /// ライセンスキーの入力・状態表示ダイアログ (オフライン検証・通信ゼロ)
     OpenLicense,
     // ── 横断検索のオプション (サイドバーの検索タブと同じ状態を切り替える) ──
@@ -754,6 +768,9 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::FileZoomIn
         | Cmd::FileZoomOut
         | Cmd::FileZoomReset
+        | Cmd::TextSizeIn
+        | Cmd::TextSizeOut
+        | Cmd::TextSizeReset
         | Cmd::SetTheme(_)
         | Cmd::ShowExplorer
         | Cmd::TogglePet
@@ -852,6 +869,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::OpenFolderInIde(_)
         | Cmd::ShowShortcuts
         | Cmd::ShowAbout
+        | Cmd::ShowWhatsNew
         | Cmd::OpenLicense
         | Cmd::RestartTutorial => Group::Tools,
     }
@@ -885,6 +903,7 @@ fn hidden_from_palette(cmd: &Cmd) -> bool {
             | Cmd::InstallPlugin
             | Cmd::RescanPlugins
             | Cmd::ShowAbout
+            | Cmd::ShowWhatsNew
     )
 }
 
@@ -1694,6 +1713,7 @@ mod group_tests {
             cmd("ペット画像を変更…", Cmd::SetPetImage),
             cmd("プラグインを再スキャン", Cmd::RescanPlugins),
             cmd("バージョン情報", Cmd::ShowAbout),
+            cmd("この版の新機能 (What's New)", Cmd::ShowWhatsNew),
             cmd(
                 "改行コードを変換: LF (Unix)",
                 Cmd::ConvertLineEnding(crate::textenc::LineEnding::Lf),

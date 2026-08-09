@@ -1420,7 +1420,7 @@ impl RacePanel {
         std::thread::spawn(move || {
             let cands = collect_candidates(&race, &conflicts, &cfg);
             let _ = tx.send(evaluate(&race.prompt, &cands));
-            ctx.request_repaint();
+            crate::perf::repaint(&ctx, "race");
         });
     }
 
@@ -1627,7 +1627,7 @@ impl RacePanel {
                 }
             }
             let _ = tx.send(out);
-            ctx.request_repaint();
+            crate::perf::repaint(&ctx, "race");
         });
     }
 }
@@ -1728,7 +1728,7 @@ pub fn race_section(
     if panel.race.is_some() {
         race_rows_ui(panel, ui, theme, &mut acts);
         // 走行中はゆっくり再描画を回し、差分量ポーリングを進める
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
+        crate::perf::repaint_after(ui.ctx(), Duration::from_secs(1), "race_poll");
     }
     ui.add_space(4.0);
     acts

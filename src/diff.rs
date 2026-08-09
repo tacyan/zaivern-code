@@ -23,7 +23,7 @@
 //! `git::parse_range` / `git::parse_hunk_marks` と同じ流儀
 //! (カウント省略 = 1、行番号は diff 上 1-based) に揃えてある。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use eframe::egui::{self, Color32, FontId, RichText};
 
@@ -825,55 +825,191 @@ fn real_path(file: &FileDiff) -> &str {
 }
 
 /// 1 行を unified diff の 1 行 (+ 必要なら `\ No newline` 行) へ戻す。
-fn push_patch_line(out: &mut String, marker: char, line: &DiffLine) {
+///
+/// `no_newline` は**組み直した結果**を渡す。元の行の印をそのまま流すと、
+/// 部分パッチで「途中の行なのに改行が無い」という書けない形になる。
+fn push_patch_line(out: &mut String, marker: char, line: &DiffLine, no_newline: bool) {
     out.push(marker);
     out.push_str(&line.text);
     if line.crlf {
         out.push('\r');
     }
     out.push('\n');
-    if line.no_newline {
+    if no_newline {
         out.push_str("\\ No newline at end of file\n");
     }
 }
 
-/// `file` の `hunk_index` 番目のハンクだけを含むパッチ本文を作る。
-///
-/// - 行数 (`@@ -a,b +c,d @@` の b / d) は**行から数え直す**。
-///   `\ No newline at end of file` は本文行ではないので数えない。
-/// - CRLF のファイルは `\r` を復元する。
-/// - 新規 / 削除は `new file mode` / `deleted file mode` を、
-///   リネームは `rename from` / `rename to` を必ず添える
-///   (これが無いと `git apply --cached` が拒む)。
-///
-/// バイナリ差分と、そもそもハンクが無い差分は `None`。
-pub fn build_hunk_patch(file: &FileDiff, hunk_index: usize) -> Option<String> {
-    if file.is_binary {
-        return None;
-    }
-    let hunk = file.hunks.get(hunk_index)?;
-    if hunk.lines.is_empty() {
-        return None;
-    }
+/// 部分パッチを組めなかった理由。**画面へ出す文言まで持つ** —
+/// 押したのに何も起きない、を作らないため。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinePatchError {
+    /// バイナリ差分には行の概念が無い。
+    Binary,
+    /// ハンクの添字が範囲外、または行が 1 本も無い。
+    NoHunk,
+    /// 選んだ行に変更行が 1 本も無い (組んでも何も起きないパッチになる)。
+    NoChange,
+    /// 末尾の改行 (`\ No newline at end of file`) が、この選び方では
+    /// unified diff として書けない組み合わせになった。
+    NoNewline,
+}
 
-    let mut old_count = 0usize;
-    let mut new_count = 0usize;
-    for l in &hunk.lines {
-        match l.kind {
-            LineKind::Context => {
-                old_count += 1;
-                new_count += 1;
+impl LinePatchError {
+    /// 画面に出す説明。
+    pub fn message(self) -> String {
+        match self {
+            LinePatchError::Binary => tr("バイナリファイルは行単位で扱えません"),
+            LinePatchError::NoHunk => tr("このハンクはパッチにできません"),
+            LinePatchError::NoChange => {
+                tr("変更行を選んでください (文脈行だけではパッチになりません)")
             }
-            LineKind::Removed => old_count += 1,
-            LineKind::Added => new_count += 1,
+            LinePatchError::NoNewline => {
+                tr("末尾に改行が無い行が絡むため、この選び方ではパッチを作れません")
+            }
         }
     }
-    // 片側が空なら開始行は 0 (git は新規作成を `-0,0`、全削除を `+0,0` と書く)。
-    let old_start = if old_count == 0 { 0 } else { hunk.old_start };
-    let new_start = if new_count == 0 { 0 } else { hunk.new_start };
+}
 
-    let old_side = patch_side(&file.old_path, 'a');
-    let new_side = patch_side(&file.new_path, 'b');
+/// 出力に残す 1 行。
+struct PatchRow<'a> {
+    marker: char,
+    line: &'a DiffLine,
+    /// この行の直後に `\ No newline at end of file` を書くか。
+    no_newline: bool,
+}
+
+/// `file` の `hunk_index` 番目のハンクのうち、**`selected` の行だけ**を含む
+/// パッチ本文を組む**純関数**。
+///
+/// `reverse` は「このパッチを `git apply --reverse` で当てるか」。
+/// 適用先が差分のどちら側と一致しているかが反転するので、
+/// **選ばなかった行の扱いも丸ごと反転する**:
+///
+/// | | 適用先 = 旧側 (`reverse=false`) | 適用先 = 新側 (`reverse=true`) |
+/// |---|---|---|
+/// | 選んだ `+`   | `+` のまま                      | `+` のまま |
+/// | 選ばない `+` | **落とす** (適用先にまだ無い)   | 文脈行へ (適用先に既にある) |
+/// | 選んだ `-`   | `-` のまま                      | `-` のまま |
+/// | 選ばない `-` | 文脈行へ (適用先にまだ有る)     | **落とす** (適用先にもう無い) |
+///
+/// - `@@ -a,b +c,d @@` の b / d は**組み直した行から数え直す**。
+///   元の値を流用すると `git apply` が拒むか、**別の行が消える**。
+/// - `\ No newline at end of file` はその側の最終行にしか付けられない。
+///   元の最終行がそのまま出力の最終行になったときだけ引き継ぎ、
+///   書けない組み合わせになったら**何も作らずに断る** (壊すより断る)。
+/// - `/dev/null` と `new file mode` / `deleted file mode` は
+///   ファイルの種別ではなく**組み直した行数**で判断する。
+///   部分選択では「削除ファイルなのに新側が残る」ことがある。
+pub fn build_line_patch(
+    file: &FileDiff,
+    hunk_index: usize,
+    selected: &BTreeSet<usize>,
+    reverse: bool,
+) -> Result<String, LinePatchError> {
+    if file.is_binary {
+        return Err(LinePatchError::Binary);
+    }
+    let hunk = file.hunks.get(hunk_index).ok_or(LinePatchError::NoHunk)?;
+    if hunk.lines.is_empty() {
+        return Err(LinePatchError::NoHunk);
+    }
+
+    // --- 1. 出力に残す行を決める (上の表そのまま) ---
+    let mut rows: Vec<PatchRow> = Vec::with_capacity(hunk.lines.len());
+    // 出力行 → 元の行の添字。末尾の改行印を移すときに要る。
+    let mut src_of: Vec<usize> = Vec::with_capacity(hunk.lines.len());
+    for (i, l) in hunk.lines.iter().enumerate() {
+        let marker = match l.kind {
+            LineKind::Context => ' ',
+            LineKind::Added => {
+                if selected.contains(&i) {
+                    '+'
+                } else if reverse {
+                    ' '
+                } else {
+                    continue;
+                }
+            }
+            LineKind::Removed => {
+                if selected.contains(&i) {
+                    '-'
+                } else if reverse {
+                    continue;
+                } else {
+                    ' '
+                }
+            }
+        };
+        rows.push(PatchRow {
+            marker,
+            line: l,
+            no_newline: false,
+        });
+        src_of.push(i);
+    }
+    if !rows.iter().any(|r| r.marker != ' ') {
+        return Err(LinePatchError::NoChange);
+    }
+
+    // --- 2. 行数を数え直す (旧側 = ' ' と '-'、新側 = ' ' と '+') ---
+    let old_count = rows.iter().filter(|r| r.marker != '+').count();
+    let new_count = rows.iter().filter(|r| r.marker != '-').count();
+
+    // --- 3. 末尾の改行印を組み直す ---
+    let last_src_old = hunk.lines.iter().rposition(|l| l.kind != LineKind::Added);
+    let last_src_new = hunk.lines.iter().rposition(|l| l.kind != LineKind::Removed);
+    let last_out_old = rows.iter().rposition(|r| r.marker != '+');
+    let last_out_new = rows.iter().rposition(|r| r.marker != '-');
+    let carries = |out: Option<usize>, src: Option<usize>| -> bool {
+        match (out, src) {
+            (Some(o), Some(s)) => src_of[o] == s && hunk.lines[s].no_newline,
+            _ => false,
+        }
+    };
+    let need_old = carries(last_out_old, last_src_old);
+    let need_new = carries(last_out_new, last_src_new);
+    // 文脈行は両側に属する。印を付けられるのは「両側の最終行が同じその 1 本」
+    // のときだけで、片側だけ改行が無い状態は unified diff では書けない。
+    if last_out_old == last_out_new {
+        if need_old != need_new {
+            return Err(LinePatchError::NoNewline);
+        }
+    } else {
+        if need_old && last_out_old.is_some_and(|o| rows[o].marker == ' ') {
+            return Err(LinePatchError::NoNewline);
+        }
+        if need_new && last_out_new.is_some_and(|o| rows[o].marker == ' ') {
+            return Err(LinePatchError::NoNewline);
+        }
+    }
+    if need_old {
+        if let Some(o) = last_out_old {
+            rows[o].no_newline = true;
+        }
+    }
+    if need_new {
+        if let Some(o) = last_out_new {
+            rows[o].no_newline = true;
+        }
+    }
+
+    // --- 4. 見出し ---
+    // 片側が空になったときだけ /dev/null。組み直した行数で判断する。
+    let as_new = file.is_new_file() && old_count == 0;
+    let as_deleted = file.is_deleted_file() && new_count == 0;
+    // 片側が空なら開始行は 0 (git は新規作成を `-0,0`、全削除を `+0,0` と書く)。
+    let old_start = if old_count == 0 {
+        0
+    } else {
+        hunk.old_start.max(1)
+    };
+    let new_start = if new_count == 0 {
+        0
+    } else {
+        hunk.new_start.max(1)
+    };
+
     // `diff --git` の見出しは常に実パスで書く (/dev/null は書かない)。
     let head_old = if file.old_path.is_empty() || file.old_path == DEV_NULL {
         real_path(file)
@@ -885,13 +1021,23 @@ pub fn build_hunk_patch(file: &FileDiff, hunk_index: usize) -> Option<String> {
     } else {
         &file.new_path
     };
+    let old_side = if as_new {
+        DEV_NULL.to_string()
+    } else {
+        patch_side(head_old, 'a')
+    };
+    let new_side = if as_deleted {
+        DEV_NULL.to_string()
+    } else {
+        patch_side(head_new, 'b')
+    };
     let mode = file.file_mode.as_deref().unwrap_or(DEFAULT_FILE_MODE);
 
-    let mut out = String::with_capacity(hunk.lines.len() * 24 + 128);
+    let mut out = String::with_capacity(rows.len() * 24 + 128);
     out.push_str(&format!("diff --git a/{head_old} b/{head_new}\n"));
-    if file.is_new_file() {
+    if as_new {
         out.push_str(&format!("new file mode {mode}\n"));
-    } else if file.is_deleted_file() {
+    } else if as_deleted {
         out.push_str(&format!("deleted file mode {mode}\n"));
     } else if file.is_rename && file.old_path != file.new_path {
         out.push_str(&format!("rename from {}\n", file.old_path));
@@ -902,15 +1048,19 @@ pub fn build_hunk_patch(file: &FileDiff, hunk_index: usize) -> Option<String> {
     out.push_str(&format!(
         "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
     ));
-    for l in &hunk.lines {
-        let marker = match l.kind {
-            LineKind::Context => ' ',
-            LineKind::Added => '+',
-            LineKind::Removed => '-',
-        };
-        push_patch_line(&mut out, marker, l);
+    for r in &rows {
+        push_patch_line(&mut out, r.marker, r.line, r.no_newline);
     }
-    Some(out)
+    Ok(out)
+}
+
+/// `file` の `hunk_index` 番目のハンクだけを含むパッチ本文を作る。
+///
+/// 全行を選んだ [`build_line_patch`] と等価 (全選択なら向きは結果に効かない)。
+/// バイナリ差分と、そもそもハンクが無い差分は `None`。
+pub fn build_hunk_patch(file: &FileDiff, hunk_index: usize) -> Option<String> {
+    let all: BTreeSet<usize> = (0..file.hunks.get(hunk_index)?.lines.len()).collect();
+    build_line_patch(file, hunk_index, &all, false).ok()
 }
 
 // ===========================================================================
@@ -1029,8 +1179,23 @@ pub fn plan_button_bar(avail_w: f32, full: &[String], icons: &[String], char_w: 
     }
 }
 
+/// 選択中の行の左端に引く縦線の太さ (色に依らない目印)。
+const SEL_STRIPE_W: f32 = 2.0;
+
 /// ハンク見出しの帯に残す最小幅 (`@@ -1,2 +1,2 @@` が読める程度)。
 const HUNK_HEADER_MIN_W: f32 = 90.0;
+
+/// 帯のボタンが効く範囲。**同じ帯の同じ位置**にボタンを置いたまま、
+/// 文言と意味だけを差し替えるための札 (行を選んだ瞬間にレイアウトが
+/// 動くと「画面が突然変わらない」を破るため)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpScope {
+    /// ハンク全体 (従来どおり)。
+    #[default]
+    Hunk,
+    /// 選んだ N 行だけ。
+    Lines(usize),
+}
 
 /// ハンクのボタン列の割り付け。
 #[derive(Clone, Debug, PartialEq)]
@@ -1047,7 +1212,13 @@ pub struct HunkBar {
 
 /// 帯 1 本ぶんの割り付けを決める。折り返しはしない (帯は 1 行) ので、
 /// 2 行必要になった時点でアイコンのみへ落とす。
-pub fn hunk_bar_plan(avail_w: f32, ops: &[HunkOp], confirm: bool, char_w: f32) -> HunkBar {
+pub fn hunk_bar_plan(
+    avail_w: f32,
+    ops: &[HunkOp],
+    confirm: bool,
+    scope: OpScope,
+    char_w: f32,
+) -> HunkBar {
     if ops.is_empty() {
         return HunkBar {
             ops: Vec::new(),
@@ -1059,11 +1230,11 @@ pub fn hunk_bar_plan(avail_w: f32, ops: &[HunkOp], confirm: bool, char_w: f32) -
     let avail = avail_w.max(0.0);
     let full: Vec<String> = ops
         .iter()
-        .map(|o| hunk_button_text(*o, false, confirm))
+        .map(|o| hunk_button_text(*o, false, confirm, scope))
         .collect();
     let icons: Vec<String> = ops
         .iter()
-        .map(|o| hunk_button_text(*o, true, confirm))
+        .map(|o| hunk_button_text(*o, true, confirm, scope))
         .collect();
     // 見出しに最低限を残した幅で判断する (ボタンが見出しを押し出さない)。
     let for_bar = (avail - HUNK_HEADER_MIN_W).max(0.0);
@@ -1277,6 +1448,158 @@ pub fn diff_layout(available_w: f32, mode: DiffMode, ppp: f32) -> DiffLayout {
         gap,
         panes,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 行を選ぶ帯 (行番号 + コメント印の列) — **GUI に依存しない純関数**
+// ---------------------------------------------------------------------------
+
+/// 1 ペインの「行を選ぶ帯」の幅 = 行番号列 + コメント印の列。
+///
+/// **本文をクリック = 従来どおりコメント / この帯をクリック = 行の選択**。
+/// 修飾キーに頼らないので、既存の操作を 1 つも奪わない。
+pub fn select_zone_w(cols: &PaneCols) -> f32 {
+    cols.gutter_w + cols.mark_w
+}
+
+/// 行矩形の左端を 0 とした x が、どのペインの選択帯に入るか。
+/// どこにも入らなければ `None` (= 本文 → コメント)。
+///
+/// **不変条件**: 返した帯は必ず `text_x` より左 = 本文と 1px も重ならない。
+pub fn select_zone_at(lay: &DiffLayout, x: f32) -> Option<usize> {
+    lay.panes.iter().position(|c| {
+        let w = select_zone_w(c);
+        w > 0.0 && x >= c.x && x < c.x + w
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 行単位の選択 — **GUI に依存しない状態機械**
+// ---------------------------------------------------------------------------
+
+/// 差分ビューの行選択。
+///
+/// **選択は 1 ハンクの中に閉じる**。パッチは 1 ハンク単位でしか組めないので
+/// ([`build_line_patch`])、ハンクを跨いだ選択は意味を持てない。別のハンクを
+/// 触った瞬間に前の選択は消える — 「知らないうちに別の場所も一緒にステージ
+/// されていた」を構造的に起こさないため。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LineSelection {
+    /// 選択が閉じているハンク `(ファイル, ハンク)`。空なら `None`。
+    scope: Option<(usize, usize)>,
+    /// `scope` のハンク内の行添字。
+    lines: BTreeSet<usize>,
+    /// 範囲選択 (Shift) の起点。
+    anchor: Option<usize>,
+    /// 直近に触れた行 (キーボードで伸ばす基準)。
+    cursor: Option<usize>,
+}
+
+impl LineSelection {
+    /// 1 行も選んでいないか。
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+    /// 選択が閉じているハンク。
+    pub fn scope(&self) -> Option<(usize, usize)> {
+        self.scope
+    }
+    /// このハンクで選ばれている行 (違うハンクなら空集合)。
+    pub fn lines(&self, file: usize, hunk: usize) -> &BTreeSet<usize> {
+        if self.scope == Some((file, hunk)) {
+            &self.lines
+        } else {
+            empty_lines()
+        }
+    }
+    /// 全部解除する。
+    pub fn clear(&mut self) {
+        self.scope = None;
+        self.lines.clear();
+        self.anchor = None;
+        self.cursor = None;
+    }
+    /// 1 行を反転する。別のハンクなら前の選択は捨てる。
+    pub fn toggle(&mut self, file: usize, hunk: usize, line: usize) {
+        if self.scope != Some((file, hunk)) {
+            self.scope = Some((file, hunk));
+            self.lines.clear();
+        }
+        if !self.lines.remove(&line) {
+            self.lines.insert(line);
+        }
+        self.anchor = Some(line);
+        self.cursor = Some(line);
+        if self.lines.is_empty() {
+            self.scope = None;
+            self.anchor = None;
+            self.cursor = None;
+        }
+    }
+    /// 起点から `line` までを選び直す (Shift+クリック / Shift+↑↓)。
+    ///
+    /// `selectable` はハンク内の行と同じ長さで、変更行だけ `true`。
+    /// 文脈行を選んでもパッチには何も足せないので、範囲からは外す。
+    pub fn extend_to(&mut self, file: usize, hunk: usize, line: usize, selectable: &[bool]) {
+        if self.scope != Some((file, hunk)) || self.anchor.is_none() {
+            // 起点が無ければ「ここが起点」でしかない。
+            if selectable.get(line).copied().unwrap_or(false) {
+                self.scope = Some((file, hunk));
+                self.lines.clear();
+                self.lines.insert(line);
+                self.anchor = Some(line);
+                self.cursor = Some(line);
+            }
+            return;
+        }
+        let a = self.anchor.unwrap_or(line);
+        let (lo, hi) = if a <= line { (a, line) } else { (line, a) };
+        self.lines.clear();
+        for i in lo..=hi {
+            if selectable.get(i).copied().unwrap_or(false) {
+                self.lines.insert(i);
+            }
+        }
+        self.cursor = Some(line);
+        if self.lines.is_empty() {
+            self.scope = None;
+            self.anchor = None;
+            self.cursor = None;
+        }
+    }
+    /// カーソルを `delta` 行ぶん動かして、その先まで選び直す。
+    /// **動ける先が無ければ何もしない** (端で選択が消えない)。
+    pub fn step(&mut self, delta: i32, selectable: &[bool]) {
+        let (Some((file, hunk)), Some(cur)) = (self.scope, self.cursor) else {
+            return;
+        };
+        let mut i = cur as i64;
+        let last = selectable.len() as i64 - 1;
+        loop {
+            i += delta as i64;
+            if i < 0 || i > last {
+                return;
+            }
+            if selectable.get(i as usize).copied().unwrap_or(false) {
+                break;
+            }
+        }
+        self.extend_to(file, hunk, i as usize, selectable);
+    }
+}
+
+/// `lines()` が「違うハンク」のときに返す空集合 (毎回作らない)。
+fn empty_lines() -> &'static BTreeSet<usize> {
+    static EMPTY: std::sync::OnceLock<BTreeSet<usize>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(BTreeSet::new)
+}
+
+/// ハンクの各行が「選べる行か」(= 変更行か) の表。
+pub fn selectable_lines(hunk: &Hunk) -> Vec<bool> {
+    hunk.lines
+        .iter()
+        .map(|l| l.kind != LineKind::Context)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1925,6 +2248,15 @@ impl HunkOp {
             HunkOp::Discard => tr("✖ ハンクを破棄"),
         }
     }
+    /// 選んだ行に効くときの文言 (件数を必ず出す)。
+    pub fn lines_label(self, n: usize) -> String {
+        let n = n.to_string();
+        match self {
+            HunkOp::Stage => trf("＋ {n} 行をステージ", &[("n", n)]),
+            HunkOp::Unstage => trf("－ {n} 行をアンステージ", &[("n", n)]),
+            HunkOp::Discard => trf("✖ {n} 行を破棄", &[("n", n)]),
+        }
+    }
     /// 幅が足りないときのアイコンのみ表記。
     pub fn icon(self) -> &'static str {
         match self {
@@ -1961,6 +2293,34 @@ pub enum DiffAction {
         hunk: usize,
         op: HunkOp,
     },
+    /// **選んだ行だけ**に効くボタンが押された。`file` は
+    /// [`LineSelectCtx::file_key`] (呼び出し側の一覧の添字) をそのまま返す。
+    Lines {
+        file: usize,
+        hunk: usize,
+        op: HunkOp,
+    },
+}
+
+/// 行選択を有効にするための配線。
+///
+/// **`files` がちょうど 1 ファイルのときだけ効く**。Git のレビュー画面は
+/// 1 ファイル = 1 回この関数を呼ぶので (`git_panel::ReviewPanel`)、
+/// 選択の鍵に使うファイル添字は呼び出し側が持っている値をそのまま預かる。
+pub struct LineSelectCtx<'a> {
+    /// 選択キーのファイル成分 (呼び出し側の一覧での添字)。
+    pub file_key: usize,
+    /// 選択そのもの。呼び出し側が所有し、フレームを跨いで生き残る。
+    pub sel: &'a mut LineSelection,
+}
+
+/// 行のクリックで起きた選択操作 (ハンク内の行添字)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowSelect {
+    /// 1 行を反転する。
+    Toggle(usize),
+    /// 起点からここまでを選び直す (Shift+クリック)。
+    Extend(usize),
 }
 
 /// `diff_ui` が生成したプロンプトの一時置き場 (型で衝突を防ぐための newtype)。
@@ -2028,7 +2388,29 @@ pub fn diff_ui_with_hunk_actions(
     comments: &mut DiffCommentStore,
     hunk_actions: Option<HunkActions>,
 ) -> DiffAction {
+    diff_ui_with_line_selection(ui, theme, files, comments, hunk_actions, None)
+}
+
+/// 行単位の選択まで有効にした版 (Git のレビュー画面から使う)。
+///
+/// `select` が `None`、または `files` が 1 ファイルでないときは
+/// [`diff_ui_with_hunk_actions`] と完全に同じ振る舞い —
+/// **行を 1 つも選んでいなければ従来どおりハンク単位で動く**。
+pub fn diff_ui_with_line_selection(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    files: &[FileDiff],
+    comments: &mut DiffCommentStore,
+    hunk_actions: Option<HunkActions>,
+    mut select: Option<LineSelectCtx>,
+) -> DiffAction {
     let pal = DiffPalette::from_theme(theme);
+    // 選択の鍵に使えるのは「1 ファイルだけ渡された」ときに限る
+    // (複数渡されるとレンダラ内の添字と呼び出し側の添字がずれる)。
+    let sel_file: Option<usize> = select
+        .as_ref()
+        .filter(|_| files.len() == 1)
+        .map(|c| c.file_key);
     let size = 12.5;
 
     if files.is_empty() {
@@ -2082,7 +2464,8 @@ pub fn diff_ui_with_hunk_actions(
     let font = FontId::monospace(size);
     let row_h = crate::theme::snap_len(ui.fonts(|f| f.row_height(&font)) + 2.0, ppp);
     // ハンクのボタンが押されたら控える (描画は最後まで通す)。
-    let mut hunk_hit: Option<(usize, usize, HunkOp)> = None;
+    // 4 つ目は「選んだ行にだけ効くボタンだったか」。
+    let mut hunk_hit: Option<(usize, usize, HunkOp, bool)> = None;
 
     for (fi, file) in files.iter().enumerate() {
         let header = file_header_job(file, theme, size);
@@ -2117,10 +2500,34 @@ pub fn diff_ui_with_hunk_actions(
                 // ファイル内の通し行番号 (syntax の添字)。
                 let mut ord = 0usize;
                 for (hi, hunk) in file.hunks.iter().enumerate() {
-                    if let Some(op) = hunk_header_ui(ui, theme, &pal, hunk, size, hunk_actions, hi)
-                    {
-                        hunk_hit = Some((fi, hi, op));
+                    // このハンクで選ばれている行。借用を跨がせないため
+                    // ここで 1 度だけ複製する (選択が無いハンクでは空集合)。
+                    let sel_lines: BTreeSet<usize> = match (sel_file, select.as_ref()) {
+                        (Some(fk), Some(c)) => c.sel.lines(fk, hi).clone(),
+                        _ => BTreeSet::new(),
+                    };
+                    let scope = if sel_lines.is_empty() {
+                        OpScope::Hunk
+                    } else {
+                        OpScope::Lines(sel_lines.len())
+                    };
+                    if let Some((op, on_lines)) = hunk_header_ui(
+                        ui,
+                        theme,
+                        &pal,
+                        hunk,
+                        size,
+                        HeaderOps {
+                            actions: hunk_actions,
+                            index: hi,
+                            scope,
+                        },
+                    ) {
+                        hunk_hit = Some((fi, hi, op, on_lines));
                     }
+                    // 行のクリックはこのハンクの描画が終わってから適用する
+                    // (描画の途中で選択を動かすと同じフレーム内で表示がずれる)。
+                    let mut row_hit: Option<RowSelect> = None;
                     let base = ord;
                     ord += hunk.lines.len();
                     let kinds: Vec<LineKind> = hunk.lines.iter().map(|l| l.kind).collect();
@@ -2159,7 +2566,7 @@ pub fn diff_ui_with_hunk_actions(
                             comments: &mut *comments,
                             syntax: &syntax,
                         };
-                        diff_row_ui(
+                        if let Some(ev) = diff_row_ui(
                             &mut cx,
                             RowArgs {
                                 hunk,
@@ -2171,8 +2578,19 @@ pub fn diff_ui_with_hunk_actions(
                                 row_h,
                                 clip,
                                 scroll_here,
+                                sel: &sel_lines,
+                                selectable: sel_file.is_some(),
                             },
-                        );
+                        ) {
+                            row_hit = Some(ev);
+                        }
+                    }
+                    if let (Some(ev), Some(fk), Some(c)) = (row_hit, sel_file, select.as_mut()) {
+                        let ok = selectable_lines(hunk);
+                        match ev {
+                            RowSelect::Toggle(i) => c.sel.toggle(fk, hi, i),
+                            RowSelect::Extend(i) => c.sel.extend_to(fk, hi, i, &ok),
+                        }
                     }
                 }
             });
@@ -2186,8 +2604,17 @@ pub fn diff_ui_with_hunk_actions(
         ui.data_mut(|d| d.insert_temp(unfold_id, UnfoldedCell(unfolded)));
     }
     // ハンク操作は「エージェントに送る」より手前 (押した本人の意図が明確) 。
-    if let Some((file, hunk, op)) = hunk_hit {
-        return DiffAction::Hunk { file, hunk, op };
+    if let Some((file, hunk, op, on_lines)) = hunk_hit {
+        return if on_lines {
+            // 行の操作は呼び出し側の添字で返す (選択の鍵と揃える)。
+            DiffAction::Lines {
+                file: sel_file.unwrap_or(file),
+                hunk,
+                op,
+            }
+        } else {
+            DiffAction::Hunk { file, hunk, op }
+        };
     }
     action
 }
@@ -2337,6 +2764,16 @@ fn file_header_job(file: &FileDiff, theme: &Theme, size: f32) -> egui::text::Lay
 const HUNK_PAD_X: f32 = 4.0;
 
 /// ハンク見出し (`@@ ... @@`) — アクセント色の帯で本文と区別する。
+/// ハンク見出しの帯へ渡す「操作まわり」一式 (引数を増やさないための束ね)。
+#[derive(Clone, Copy, Default)]
+struct HeaderOps<'a> {
+    actions: Option<HunkActions<'a>>,
+    /// この見出しが何番目のハンクか (破棄の 2 段確認の照合に使う)。
+    index: usize,
+    /// ボタンが効く範囲 (ハンク全体 / 選んだ N 行)。
+    scope: OpScope,
+}
+
 /// ハンクの見出し帯。ボタンが押されたらその操作を返す。
 ///
 /// ボタンは**帯の右端**に置き、`@@` の見出しは残りの幅で切り詰める
@@ -2348,9 +2785,13 @@ fn hunk_header_ui(
     pal: &DiffPalette,
     hunk: &Hunk,
     size: f32,
-    actions: Option<HunkActions>,
-    hunk_index: usize,
-) -> Option<HunkOp> {
+    bar: HeaderOps,
+) -> Option<(HunkOp, bool)> {
+    let HeaderOps {
+        actions,
+        index: hunk_index,
+        scope,
+    } = bar;
     // 余白は帯の**内側**なので、可用幅から先に引く。引き忘れると帯が
     // 左右の余白ぶんだけ広がり、可用領域からはみ出す。
     let w = (ui.available_width() - HUNK_PAD_X * 2.0).max(0.0);
@@ -2359,8 +2800,18 @@ fn hunk_header_ui(
         .and_then(|a| a.confirm_discard)
         .is_some_and(|i| i == hunk_index);
     let char_w = ui.fonts(|f| f.glyph_width(&FontId::proportional(size), '0'));
-    let plan = hunk_bar_plan(w, ops, confirm, char_w);
-    let mut hit: Option<HunkOp> = None;
+    let plan = hunk_bar_plan(w, ops, confirm, scope, char_w);
+    let on_lines = matches!(scope, OpScope::Lines(_));
+    // 件数は**見出しの文字列に畳み込む**。別ラベルを足すとボタンを押し出して
+    // 帯が可用幅からはみ出す (Truncate はここでしか効かない)。
+    let head_text = match scope {
+        OpScope::Hunk => hunk.header.clone(),
+        OpScope::Lines(n) => trf(
+            "{h}   ▸ {n} 行を選択中",
+            &[("h", hunk.header.clone()), ("n", n.to_string())],
+        ),
+    };
+    let mut hit: Option<(HunkOp, bool)> = None;
     egui::Frame::none()
         .fill(pal.hunk_bg)
         .inner_margin(egui::Margin::symmetric(HUNK_PAD_X, 2.0))
@@ -2369,14 +2820,14 @@ fn hunk_header_ui(
             ui.horizontal(|ui| {
                 ui.add(
                     egui::Label::new(
-                        RichText::new(&hunk.header)
+                        RichText::new(&head_text)
                             .monospace()
                             .size(size)
                             .color(theme.accent),
                     )
                     .wrap_mode(egui::TextWrapMode::Truncate),
                 )
-                .on_hover_text(&hunk.header);
+                .on_hover_text(&head_text);
                 if plan.ops.is_empty() {
                     return;
                 }
@@ -2384,7 +2835,7 @@ fn hunk_header_ui(
                     // right_to_left なので末尾から積む (見た目の並びは ops のまま)。
                     for op in plan.ops.iter().rev() {
                         let danger = *op == HunkOp::Discard;
-                        let text = hunk_button_text(*op, plan.icon_only, confirm);
+                        let text = hunk_button_text(*op, plan.icon_only, confirm, scope);
                         let rich = if danger {
                             RichText::new(text).size(size - 1.0).color(theme.err)
                         } else {
@@ -2395,14 +2846,17 @@ fn hunk_header_ui(
                         } else if danger {
                             tr("もう一度押すと確定します (取り消せません)")
                         } else {
-                            op.label()
+                            match scope {
+                                OpScope::Hunk => op.label(),
+                                OpScope::Lines(n) => op.lines_label(n),
+                            }
                         };
                         if ui
                             .add(egui::Button::new(rich).small())
                             .on_hover_text(hint)
                             .clicked()
                         {
-                            hit = Some(*op);
+                            hit = Some((*op, on_lines));
                         }
                     }
                 });
@@ -2412,7 +2866,7 @@ fn hunk_header_ui(
 }
 
 /// ハンクのボタン 1 個の文言。
-fn hunk_button_text(op: HunkOp, icon_only: bool, confirm: bool) -> String {
+fn hunk_button_text(op: HunkOp, icon_only: bool, confirm: bool, scope: OpScope) -> String {
     if op == HunkOp::Discard && confirm {
         return if icon_only {
             "⚠".to_string()
@@ -2420,10 +2874,23 @@ fn hunk_button_text(op: HunkOp, icon_only: bool, confirm: bool) -> String {
             tr("⚠ 本当に破棄")
         };
     }
-    if icon_only {
-        op.icon().to_string()
-    } else {
-        op.label()
+    match scope {
+        OpScope::Hunk => {
+            if icon_only {
+                op.icon().to_string()
+            } else {
+                op.label()
+            }
+        }
+        // 行を選んでいる間は「何行に効くか」を必ず文言に出す。
+        // 狭いときのアイコンにも件数を残す (数が見えないと押せない)。
+        OpScope::Lines(n) => {
+            if icon_only {
+                format!("{}{n}", op.icon())
+            } else {
+                op.lines_label(n)
+            }
+        }
     }
 }
 
@@ -2589,13 +3056,17 @@ struct RowArgs<'a> {
     clip: egui::Rect,
     /// この行へスクロールして見せる (F7 の飛び先)。
     scroll_here: bool,
+    /// このハンクで選ばれている行 (選択が無効なら空)。
+    sel: &'a BTreeSet<usize>,
+    /// 行選択そのものが有効か (無効なら従来どおりコメントだけ)。
+    selectable: bool,
 }
 
 /// 対応する 1 行 (一列なら 1 セル、並列なら左右 2 セル) を描く。
 ///
 /// **左右のセルは同じ 1 本の矩形の中に置く**ので、行の高さは構造的に必ず揃う。
 /// スクロールの同期処理そのものが不要になり、毎フレームの再描画要求もゼロ。
-fn diff_row_ui(cx: &mut RowCtx, args: RowArgs) {
+fn diff_row_ui(cx: &mut RowCtx, args: RowArgs) -> Option<RowSelect> {
     let lay: &DiffLayout = cx.lay;
     let theme: &Theme = cx.theme;
     let pal: &DiffPalette = cx.pal;
@@ -2636,7 +3107,7 @@ fn diff_row_ui(cx: &mut RowCtx, args: RowArgs) {
         if args.scroll_here {
             cx.ui.scroll_to_rect(rect, Some(egui::Align::Center));
         }
-        return;
+        return None;
     }
 
     let (rect, resp) = cx.ui.allocate_exact_size(
@@ -2699,27 +3170,96 @@ fn diff_row_ui(cx: &mut RowCtx, args: RowArgs) {
     }
     drop(cells);
 
-    // --- クリック: 押されたペインの行へコメントを開く ---
+    // --- 選択中の行を示す (どれに効くか見えないボタンは押せない) ---
+    // ペインの外へは 1px も描かない。左端の縦線は色覚に依らない目印。
+    let refs: [Option<LineRef>; 2] = if side_by_side {
+        [args.left, args.right]
+    } else {
+        [args.left, None]
+    };
+    if !args.sel.is_empty() {
+        for (pi, cols) in lay.panes.iter().enumerate() {
+            let Some(r) = refs.get(pi).copied().flatten() else {
+                continue;
+            };
+            if !args.sel.contains(&r.idx) {
+                continue;
+            }
+            let x0 = rect.left() + cols.x;
+            let pane = egui::Rect::from_min_max(
+                egui::pos2(x0, rect.top()),
+                egui::pos2(x0 + cols.width, rect.bottom()),
+            );
+            let p = cx
+                .ui
+                .painter()
+                .with_clip_rect(pane.intersect(cx.ui.clip_rect()));
+            p.rect_filled(pane, 0.0, mix(Color32::TRANSPARENT, theme.accent, 0.20));
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(x0, rect.top()),
+                    egui::pos2(x0 + SEL_STRIPE_W, rect.bottom()),
+                ),
+                0.0,
+                theme.accent,
+            );
+        }
+    }
+
+    // --- クリック: 行番号の帯 = 行の選択 / 本文 = コメント ---
     if resp.hovered() {
         cx.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         cx.ui
             .painter()
             .rect_filled(rect, 0.0, mix(Color32::TRANSPARENT, theme.accent, 0.10));
     }
-    let resp = resp.on_hover_text(tr("クリックでコメントを追加/閉じる"));
+    let resp = resp.on_hover_text(if args.selectable {
+        tr("行番号の帯をクリックで行を選択 (Shift で範囲) / 本文をクリックでコメント")
+    } else {
+        tr("クリックでコメントを追加/閉じる")
+    });
+    let mut picked: Option<RowSelect> = None;
     if resp.clicked() {
         let x = resp
             .interact_pointer_pos()
             .map(|p| p.x - rect.left())
             .unwrap_or(0.0);
-        let right_side = side_by_side && lay.panes.len() > 1 && x >= lay.panes[1].x;
-        let target = if right_side {
-            right_anchor.clone().or_else(|| left_anchor.clone())
+        let zone = if args.selectable {
+            select_zone_at(lay, x)
         } else {
-            left_anchor.clone().or_else(|| right_anchor.clone())
+            None
         };
-        if let Some(a) = target {
-            cx.comments.toggle_draft(a);
+        match zone {
+            Some(pi) => {
+                // 文脈行を選んでもパッチには何も足せないので拾わない。
+                let target = refs.get(pi).copied().flatten();
+                if let Some(r) = target {
+                    if args
+                        .hunk
+                        .lines
+                        .get(r.idx)
+                        .is_some_and(|l| l.kind != LineKind::Context)
+                    {
+                        let shift = cx.ui.input(|i| i.modifiers.shift);
+                        picked = Some(if shift {
+                            RowSelect::Extend(r.idx)
+                        } else {
+                            RowSelect::Toggle(r.idx)
+                        });
+                    }
+                }
+            }
+            None => {
+                let right_side = side_by_side && lay.panes.len() > 1 && x >= lay.panes[1].x;
+                let target = if right_side {
+                    right_anchor.clone().or_else(|| left_anchor.clone())
+                } else {
+                    left_anchor.clone().or_else(|| right_anchor.clone())
+                };
+                if let Some(a) = target {
+                    cx.comments.toggle_draft(a);
+                }
+            }
         }
     }
 
@@ -2736,6 +3276,7 @@ fn diff_row_ui(cx: &mut RowCtx, args: RowArgs) {
             }
         }
     }
+    picked
 }
 
 /// 1 ペインぶんを塗る。**ペインの外へは 1px も描かない** (必ずクリップする)。
@@ -5807,6 +6348,322 @@ rename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,3 +1,3 @@\n r1\n-r2\n+R2\
         assert_eq!(p.matches("@@").count(), 2, "ヘッダは 1 行だけ:\n{p}");
     }
 
+    // ---- 行単位の部分パッチ ------------------------------------------------
+
+    /// 選んだ行の集合。
+    fn sel(v: &[usize]) -> BTreeSet<usize> {
+        v.iter().copied().collect()
+    }
+
+    /// パッチの `@@` 以降だけを取り出す (見出しは別のテストで見る)。
+    fn body_of(patch: &str) -> String {
+        match patch.find("@@") {
+            Some(i) => patch[i..].to_string(),
+            None => patch.to_string(),
+        }
+    }
+
+    /// 文脈 + 削除 + 追加が 2 箇所ずつ混ざった素材。
+    /// 行の添字: 0=` a` 1=`-b` 2=`+B` 3=` c` 4=`-d` 5=`+D`
+    const MIX: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n\
+@@ -1,4 +1,4 @@\n a\n-b\n+B\n c\n-d\n+D\n";
+
+    /// 部分パッチの組み立てをテーブルで固定する。
+    ///
+    /// **ここを間違えると `git apply` が拒むか、別の行が消える**ので、
+    /// 期待値は `@@` を含む本文まるごとで書く (数だけ見ると気付けない)。
+    #[test]
+    fn 行単位パッチのテーブル() {
+        // (素材, 選んだ行, reverse, 期待する本文, 何を見ているか)
+        let cases: &[(&str, &[usize], bool, &str, &str)] = &[
+            (
+                MIX,
+                &[2],
+                false,
+                "@@ -1,4 +1,5 @@\n a\n b\n+B\n c\n d\n",
+                "追加行だけ選ぶ: 選ばない削除は文脈へ、選ばない追加は落とす",
+            ),
+            (
+                MIX,
+                &[1],
+                false,
+                "@@ -1,4 +1,3 @@\n a\n-b\n c\n d\n",
+                "削除行だけ選ぶ",
+            ),
+            (
+                MIX,
+                &[1, 2],
+                false,
+                "@@ -1,4 +1,4 @@\n a\n-b\n+B\n c\n d\n",
+                "追加と削除が混ざる (ハンクの先頭側だけ)",
+            ),
+            (
+                MIX,
+                &[4, 5],
+                false,
+                "@@ -1,4 +1,4 @@\n a\n b\n c\n-d\n+D\n",
+                "ハンクの末尾だけ",
+            ),
+            (
+                MIX,
+                &[1, 5],
+                false,
+                "@@ -1,4 +1,4 @@\n a\n-b\n c\n d\n+D\n",
+                "飛び飛びの選択",
+            ),
+            (MIX, &[0, 3], false, "", "文脈行しか選んでいない → 組まない"),
+            (MIX, &[], false, "", "何も選んでいない → 組まない"),
+            (
+                MIX,
+                &[2],
+                true,
+                "@@ -1,3 +1,4 @@\n a\n+B\n c\n D\n",
+                "逆向き: 選ばない追加は文脈へ、選ばない削除は落とす",
+            ),
+            (
+                MIX,
+                &[1],
+                true,
+                "@@ -1,5 +1,4 @@\n a\n-b\n B\n c\n D\n",
+                "逆向きで削除行だけ選ぶ (index へ戻す 1 行)",
+            ),
+            (
+                MIX,
+                &[0, 1, 2, 3, 4, 5],
+                false,
+                "@@ -1,4 +1,4 @@\n a\n-b\n+B\n c\n-d\n+D\n",
+                "全部選べばハンク全体と同じ",
+            ),
+        ];
+        for (src, pick, rev, want, why) in cases {
+            let f = one(src);
+            let got = build_line_patch(&f, 0, &sel(pick), *rev);
+            if want.is_empty() {
+                assert_eq!(got, Err(LinePatchError::NoChange), "{why}");
+                continue;
+            }
+            let p = got.unwrap_or_else(|e| panic!("{why}: 組めなかった {e:?}"));
+            assert_eq!(body_of(&p), *want, "{why}");
+        }
+        // 全選択はハンク単位のパッチと 1 バイトも変わらない (退行の番人)。
+        let f = one(MIX);
+        assert_eq!(
+            build_line_patch(&f, 0, &sel(&[0, 1, 2, 3, 4, 5]), false).ok(),
+            build_hunk_patch(&f, 0),
+            "行を 1 つも外していないのにハンク単位と違うパッチになった"
+        );
+    }
+
+    /// ファイル末尾の改行 (`\ No newline at end of file`)。
+    /// **書けない組み合わせは作らずに断る** — 壊すより断る。
+    #[test]
+    fn 行単位パッチと末尾の改行() {
+        // 0=` p` 1=`-q`(改行なし) 2=`+Q`(改行なし)
+        let src = "diff --git a/nn.txt b/nn.txt\n--- a/nn.txt\n+++ b/nn.txt\n\
+@@ -1,2 +1,2 @@\n p\n-q\n\\ No newline at end of file\n+Q\n\\ No newline at end of file\n";
+        let f = one(src);
+
+        // 削除行だけ: 印は `-q` に残る (旧側の最終行のまま)
+        let p = build_line_patch(&f, 0, &sel(&[1]), false).expect("組める");
+        assert_eq!(
+            body_of(&p),
+            "@@ -1,2 +1,1 @@\n p\n-q\n\\ No newline at end of file\n",
+            "旧側の最終行に印が残る"
+        );
+
+        // 追加行だけ (順方向): `-q` が文脈行になると
+        // 「旧側だけ改行が無い文脈行」= unified diff で書けない形になる
+        assert_eq!(
+            build_line_patch(&f, 0, &sel(&[2]), false),
+            Err(LinePatchError::NoNewline),
+            "書けない組み合わせは作らずに断る"
+        );
+
+        // 逆向きで追加行だけ: `-q` は落ちるので印は `+Q` に残る
+        let p = build_line_patch(&f, 0, &sel(&[2]), true).expect("組める");
+        assert_eq!(
+            body_of(&p),
+            "@@ -1,1 +1,2 @@\n p\n+Q\n\\ No newline at end of file\n",
+            "新側の最終行に印が残る"
+        );
+
+        // 印が途中の行に残らない (残すと git apply が本文と一致しないと言う)
+        let mid = "diff --git a/m.txt b/m.txt\n--- a/m.txt\n+++ b/m.txt\n\
+@@ -1,2 +1,3 @@\n x\n-y\n\\ No newline at end of file\n+y\n+z\n";
+        let fm = one(mid);
+        let p = build_line_patch(&fm, 0, &sel(&[1]), true).expect("組める");
+        assert!(
+            !p.contains("\\ No newline"),
+            "後ろに本文が続くのに印を付けている:\n{p}"
+        );
+    }
+
+    /// CRLF のファイルでも、役割が変わった行の `\r` を落とさない。
+    #[test]
+    fn 行単位パッチは復帰文字を保つ() {
+        let src = "diff --git a/c.txt b/c.txt\r\n--- a/c.txt\r\n+++ b/c.txt\r\n\
+@@ -1,3 +1,3 @@\r\n l1\r\n-l2\r\n+L2\r\n l3\r\n";
+        let f = one(src);
+        // 追加だけ選ぶ → `-l2` が文脈行になる。ここで \r を落とすと
+        // 本文が一致せず git apply が落ちる。
+        let p = build_line_patch(&f, 0, &sel(&[2]), false).expect("組める");
+        assert_eq!(
+            body_of(&p),
+            // 見出し行は常に LF (ハンク単位のパッチと同じ約束)。
+            // 本文だけが元の \r を保つ。
+            "@@ -1,3 +1,4 @@\n l1\r\n l2\r\n+L2\r\n l3\r\n",
+            "文脈へ落ちた行も \\r を保つ"
+        );
+    }
+
+    /// 新規 / 削除ファイルは、**組み直した行数**で /dev/null を決める。
+    /// ファイルの種別だけで決めると、部分選択のときに git が拒む。
+    #[test]
+    fn 行単位パッチの新規と削除() {
+        let newf = "diff --git a/n.txt b/n.txt\nnew file mode 100755\n--- /dev/null\n\
++++ b/n.txt\n@@ -0,0 +1,3 @@\n+n1\n+n2\n+n3\n";
+        let f = one(newf);
+        // 順方向で 1 行だけ → まだ「新規作成」
+        let p = build_line_patch(&f, 0, &sel(&[1]), false).expect("組める");
+        assert!(p.contains("new file mode 100755\n"), "{p}");
+        assert!(p.contains("--- /dev/null\n"), "{p}");
+        assert_eq!(body_of(&p), "@@ -0,0 +1,1 @@\n+n2\n");
+        // 逆向きで 1 行だけ = 「新規ファイルの 1 行をアンステージ」。
+        // 旧側に行が残るので /dev/null も new file mode も書けない。
+        let p = build_line_patch(&f, 0, &sel(&[1]), true).expect("組める");
+        assert!(
+            !p.contains("new file mode"),
+            "旧側が空でないのに新規扱い:\n{p}"
+        );
+        assert!(
+            p.contains("--- a/n.txt\n") && p.contains("+++ b/n.txt\n"),
+            "{p}"
+        );
+        assert_eq!(body_of(&p), "@@ -1,2 +1,3 @@\n n1\n+n2\n n3\n");
+
+        let delf = "diff --git a/d.txt b/d.txt\ndeleted file mode 100644\n--- a/d.txt\n\
++++ /dev/null\n@@ -1,3 +0,0 @@\n-x\n-y\n-z\n";
+        let f = one(delf);
+        let p = build_line_patch(&f, 0, &sel(&[1]), false).expect("組める");
+        assert!(
+            !p.contains("deleted file mode"),
+            "新側が残るのに削除扱い:\n{p}"
+        );
+        assert!(p.contains("+++ b/d.txt\n"), "{p}");
+        assert_eq!(body_of(&p), "@@ -1,3 +1,2 @@\n x\n-y\n z\n");
+        // 全部選べば従来どおり「削除」
+        let p = build_line_patch(&f, 0, &sel(&[0, 1, 2]), false).expect("組める");
+        assert!(p.contains("deleted file mode 100644\n"), "{p}");
+        assert!(p.contains("+++ /dev/null\n"), "{p}");
+    }
+
+    /// バイナリ / 空 / 範囲外は、**理由の分かる Err** で断る。
+    #[test]
+    fn 行単位パッチが断る入力() {
+        let bin = one("diff --git a/b.png b/b.png\nBinary files a/b.png and b/b.png differ\n");
+        assert_eq!(
+            build_line_patch(&bin, 0, &sel(&[0]), false),
+            Err(LinePatchError::Binary),
+            "バイナリは行単位で扱えない"
+        );
+        let f = one(MIX);
+        assert_eq!(
+            build_line_patch(&f, 9, &sel(&[0]), false),
+            Err(LinePatchError::NoHunk),
+            "範囲外"
+        );
+        // 中身が空のファイル差分 (ハンクが 1 本も無い)
+        let empty = one("diff --git a/e.txt b/e.txt\nnew file mode 100644\n");
+        assert_eq!(
+            build_line_patch(&empty, 0, &sel(&[0]), false),
+            Err(LinePatchError::NoHunk),
+            "ハンクが無い"
+        );
+        // 文言は全部埋まっていて重複しない (押しても無反応にしない)
+        let mut seen = std::collections::HashSet::new();
+        for e in [
+            LinePatchError::Binary,
+            LinePatchError::NoHunk,
+            LinePatchError::NoChange,
+            LinePatchError::NoNewline,
+        ] {
+            let m = e.message();
+            assert!(!m.is_empty(), "{e:?} の文言が空");
+            assert!(seen.insert(m), "{e:?} の文言が重複している");
+        }
+    }
+
+    // ---- 行選択の状態機械 --------------------------------------------------
+
+    #[test]
+    fn 行選択は1ハンクの中に閉じる() {
+        let mut s = LineSelection::default();
+        assert!(s.is_empty());
+        assert_eq!(s.scope(), None);
+        s.toggle(0, 0, 2);
+        assert_eq!(s.lines(0, 0).len(), 1);
+        assert!(s.lines(0, 0).contains(&2));
+        assert!(s.lines(0, 1).is_empty(), "別のハンクへは漏れない");
+        assert!(s.lines(1, 0).is_empty(), "別のファイルへも漏れない");
+        s.toggle(0, 0, 4);
+        assert_eq!(s.lines(0, 0).len(), 2);
+        // 別のハンクを触ったら前の選択は消える (知らない場所を一緒に動かさない)
+        s.toggle(0, 1, 1);
+        assert!(s.lines(0, 0).is_empty());
+        assert_eq!(s.lines(0, 1).len(), 1);
+        // 同じ行をもう一度 → 空に戻り、範囲そのものが消える
+        s.toggle(0, 1, 1);
+        assert!(s.is_empty());
+        assert_eq!(s.scope(), None);
+    }
+
+    #[test]
+    fn 範囲選択とキーボードの伸長は文脈行を飛ばす() {
+        // 0=変更 1=文脈 2=変更 3=変更 4=文脈
+        let ok = [true, false, true, true, false];
+        let mut s = LineSelection::default();
+        s.toggle(1, 2, 0);
+        s.extend_to(1, 2, 3, &ok);
+        assert_eq!(
+            s.lines(1, 2).iter().copied().collect::<Vec<_>>(),
+            vec![0, 2, 3],
+            "文脈行は範囲から外す"
+        );
+        // 逆向きに縮める
+        s.extend_to(1, 2, 0, &ok);
+        assert_eq!(s.lines(1, 2).iter().copied().collect::<Vec<_>>(), vec![0]);
+        // Shift+↓ 相当
+        s.step(1, &ok);
+        assert_eq!(
+            s.lines(1, 2).iter().copied().collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        // Shift+↑ 相当 (1 は文脈なので 0 まで戻る)
+        s.step(-1, &ok);
+        assert_eq!(s.lines(1, 2).iter().copied().collect::<Vec<_>>(), vec![0]);
+        // 端では動かない = 選択が勝手に消えない
+        s.step(-1, &ok);
+        assert_eq!(s.lines(1, 2).iter().copied().collect::<Vec<_>>(), vec![0]);
+        s.clear();
+        assert!(s.is_empty());
+        // 起点が無い状態の extend_to は「そこが起点」
+        s.extend_to(1, 2, 2, &ok);
+        assert_eq!(s.lines(1, 2).iter().copied().collect::<Vec<_>>(), vec![2]);
+        // 選べない行を起点にはしない
+        s.clear();
+        s.extend_to(1, 2, 1, &ok);
+        assert!(s.is_empty(), "文脈行は選択の起点にならない");
+    }
+
+    #[test]
+    fn 選べる行はハンクの変更行だけ() {
+        let f = one(MIX);
+        assert_eq!(
+            selectable_lines(&f.hunks[0]),
+            vec![false, true, true, false, true, true]
+        );
+    }
+
     #[test]
     fn patch_refuses_binary_and_out_of_range() {
         let bin = one("diff --git a/b.png b/b.png\nBinary files a/b.png and b/b.png differ\n");
@@ -5891,7 +6748,7 @@ rename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,3 +1,3 @@\n r1\n-r2\n+R2\
             ),
         ];
         for (avail, want_icon, why) in cases {
-            let bar = hunk_bar_plan(*avail, &ops, false, 7.0);
+            let bar = hunk_bar_plan(*avail, &ops, false, OpScope::Hunk, 7.0);
             assert_eq!(bar.icon_only, *want_icon, "{why} (幅 {avail})");
             assert!(
                 bar.bar_w <= *avail + 0.5,
@@ -5904,7 +6761,7 @@ rename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,3 +1,3 @@\n r1\n-r2\n+R2\
             );
             assert_eq!(bar.ops.len(), 2, "{why}: ボタンは消さない");
         }
-        let none = hunk_bar_plan(900.0, &[], false, 7.0);
+        let none = hunk_bar_plan(900.0, &[], false, OpScope::Hunk, 7.0);
         assert!(none.ops.is_empty(), "操作が無ければ帯は見出しだけ");
         assert_eq!(none.header_w, 900.0, "帯を丸ごと見出しへ渡す");
     }
@@ -5990,11 +6847,111 @@ rename to new.txt\n--- a/old.txt\n+++ b/new.txt\n@@ -1,3 +1,3 @@\n r1\n-r2\n+R2\
 
     #[test]
     fn hunk_bar_plan_confirm_state_changes_the_label() {
-        let plain = hunk_button_text(HunkOp::Discard, false, false);
-        let confirm = hunk_button_text(HunkOp::Discard, false, true);
+        let plain = hunk_button_text(HunkOp::Discard, false, false, OpScope::Hunk);
+        let confirm = hunk_button_text(HunkOp::Discard, false, true, OpScope::Hunk);
         assert_ne!(plain, confirm, "2 段目は文言が変わる");
         assert!(confirm.contains('⚠'), "2 段目は警告色の文言: {confirm}");
-        assert_eq!(hunk_button_text(HunkOp::Stage, true, false), "＋");
+        assert_eq!(
+            hunk_button_text(HunkOp::Stage, true, false, OpScope::Hunk),
+            "＋"
+        );
+    }
+
+    /// 行を選んでいる間の帯。**同じ場所・同じ本数のまま**、
+    /// 文言と意味だけが変わる (選んだ瞬間にレイアウトが動かない)。
+    #[test]
+    fn 行スコープでも帯は可用幅に収まり件数が消えない() {
+        let ops = [HunkOp::Stage, HunkOp::Discard];
+        // 極端な幅と件数を総当たりする。ここが 1 つでも破れると
+        // 「押せないボタン」か「見切れた帯」になる。
+        for avail in [1200.0f32, 900.0, 700.0, 400.0, 250.0, 120.0, 40.0, 0.0] {
+            for n in [1usize, 7, 128, 99_999] {
+                for confirm in [false, true] {
+                    let scope = OpScope::Lines(n);
+                    let bar = hunk_bar_plan(avail, &ops, confirm, scope, 7.0);
+                    let a = avail.max(0.0);
+                    assert!(
+                        bar.bar_w <= a + 0.5,
+                        "幅 {avail} / {n} 行: ボタン列が可用幅を超えた ({})",
+                        bar.bar_w
+                    );
+                    assert!(
+                        bar.bar_w + bar.header_w <= a + 0.5,
+                        "幅 {avail} / {n} 行: 見出しとの合計が可用幅を超えた"
+                    );
+                    assert_eq!(
+                        bar.ops.len(),
+                        ops.len(),
+                        "幅 {avail} / {n} 行: ボタンが消えた"
+                    );
+                    // ハンク単位と同じ本数・同じ並び = 帯の見た目が飛ばない
+                    let hunk_bar = hunk_bar_plan(avail, &ops, confirm, OpScope::Hunk, 7.0);
+                    assert_eq!(bar.ops, hunk_bar.ops, "幅 {avail}: 並びが変わった");
+                }
+            }
+        }
+        // 広ければ件数まで読める / 狭くてもアイコンに件数が残る
+        assert!(hunk_button_text(HunkOp::Stage, false, false, OpScope::Lines(3)).contains('3'));
+        assert!(hunk_button_text(HunkOp::Stage, true, false, OpScope::Lines(3)).contains('3'));
+        assert_ne!(
+            hunk_button_text(HunkOp::Stage, false, false, OpScope::Lines(3)),
+            hunk_button_text(HunkOp::Stage, false, false, OpScope::Hunk),
+            "行を選んでいるのにハンクと同じ文言では嘘になる"
+        );
+    }
+
+    /// 「行を選ぶ帯」は**どの幅でも本文へ 1px も食い込まない**。
+    /// ここが破れると、本文をクリックしたつもりで行が選ばれる。
+    #[test]
+    fn 行を選ぶ帯は本文と重ならずどの幅でも可用領域に収まる() {
+        // 極端なウィンドウ (900×700 / 1200×300) と、狭い方の限界。
+        for w in [900.0f32, 1200.0, 640.0, 320.0, 120.0, 40.0, 0.0] {
+            for mode in [DiffMode::Inline, DiffMode::SideBySide] {
+                for ppp in [1.0f32, 2.0] {
+                    let lay = diff_layout(w, mode, ppp);
+                    let mut prev_end = 0.0f32;
+                    for (i, c) in lay.panes.iter().enumerate() {
+                        let zw = select_zone_w(c);
+                        assert!(zw >= 0.0, "幅 {w}: 帯が負");
+                        assert!(c.x >= prev_end - 0.01, "幅 {w}: ペイン {i} が前と重なる");
+                        assert!(
+                            c.x + zw <= c.text_x + 0.01,
+                            "幅 {w}: ペイン {i} の帯が本文へ食い込む"
+                        );
+                        assert!(
+                            c.x + c.width <= lay.width + 0.01,
+                            "幅 {w}: ペイン {i} が可用領域からはみ出す"
+                        );
+                        prev_end = c.x + c.width;
+                        // 帯の中は必ずそのペインとして拾える
+                        if zw > 0.5 {
+                            assert_eq!(select_zone_at(&lay, c.x), Some(i), "幅 {w}: 帯の左端");
+                            assert_eq!(
+                                select_zone_at(&lay, c.x + zw - 0.1),
+                                Some(i),
+                                "幅 {w}: 帯の右端"
+                            );
+                        }
+                        // 本文の真ん中は必ず帯の外 = コメントの経路が残る
+                        if c.text_w > 2.0 {
+                            assert_eq!(
+                                select_zone_at(&lay, c.text_x + c.text_w * 0.5),
+                                None,
+                                "幅 {w}: ペイン {i} の本文が帯に食われた"
+                            );
+                        }
+                    }
+                    assert!(
+                        select_zone_at(&lay, -1.0).is_none(),
+                        "幅 {w}: 左端の外を拾っている"
+                    );
+                    assert!(
+                        select_zone_at(&lay, lay.width + 1.0).is_none(),
+                        "幅 {w}: 右端の外を拾っている"
+                    );
+                }
+            }
+        }
     }
 
     // ── 安定ハンク ID ────────────────────────────────────────────

@@ -257,6 +257,54 @@ types = ["string", "int", "bool", "array", "object", "secureString", "secureObje
 constants = ["true", "false", "null"]
 builtins = ["resourceGroup", "subscription", "deployment", "union", "concat", "length", "reference", "uniqueString", "guid", "utcNow"]
 
+[[syntax]]
+# CUE — Kubernetes / Istio 界隈の設定言語。JSON の上位互換で、
+# `#Def` の定義と `@attr()` の注釈が読めないと構造が全く追えない。
+name = "CUE"
+extensions = ["cue"]
+tokens = ["cue", "cuelang"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\"", "'"]
+multiline_strings = [["\"\"\"", "\"\"\""], [", "]]
+# 定義は `#Foo` / `_#Foo` で 1 語。`#` はコメント記号ではないので衝突しない
+ident_extra = "#"
+attribute = "@"
+fold = "brackets"
+keywords = [
+  "package", "import", "if", "for", "in", "let", "div", "mod", "quo", "rem",
+]
+types = [
+  "bool", "int", "uint", "uint8", "uint16", "uint32", "uint64", "uint128",
+  "int8", "int16", "int32", "int64", "int128", "float", "float32", "float64",
+  "string", "bytes", "rune", "number", "top", "_",
+]
+constants = ["true", "false", "null"]
+builtins = [
+  "len", "close", "and", "or", "list", "strings", "strconv", "math", "regexp",
+  "json", "yaml", "time", "path", "struct", "encoding", "tool",
+]
+
+[[syntax]]
+# KDL — 設定用のドキュメント言語 (Rust の clap 系や KDL 採用ツールで増加中)。
+# 予約語を持たない代わりに `#true` / `#null` のキーワード値と生文字列がある。
+name = "KDL"
+extensions = ["kdl"]
+tokens = ["kdl"]
+line_comment = ["//"]
+block_comment = [["/*", "*/"]]
+strings = ["\""]
+raw_strings = [["r#\"", "\"#"], ["r\"", "\""]]
+# `#true` を 1 語にするため。`-` は入れない
+# (入れると `-5` が識別子になって数値の色が消える)
+ident_extra = "#"
+fold = "brackets"
+# KDL v2 の「キーワード値」。仕様上まさに keyword と呼ばれるもので、
+# 予約語を持たないこの言語で唯一キーワード扱いできる語彙
+keywords = ["#true", "#false", "#null", "#inf", "#-inf", "#nan"]
+# v1 の裸のリテラル
+constants = ["true", "false", "null"]
+
 [[alias]]
 target = "YAML"
 extensions = ["yaml.tpl", "yml.tpl", "cff", "clang-format", "clang-tidy"]

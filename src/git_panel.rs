@@ -2528,6 +2528,9 @@ pub struct ReviewPanel {
     items: Vec<crate::diff::QueueItem>,
     /// 却下の 2 段確認 (安定ハンク ID)。**破壊的**なので必須。
     confirm_reject: Option<String>,
+    /// 行単位の選択。**1 ハンクの中に閉じる** ([`crate::diff::LineSelection`])。
+    /// 空のときは従来どおりハンク単位で動く (既存の到達経路を奪わない)。
+    line_sel: crate::diff::LineSelection,
 }
 
 impl ReviewPanel {
@@ -2558,6 +2561,7 @@ impl ReviewPanel {
             queue_pos: 0,
             items: Vec::new(),
             confirm_reject: None,
+            line_sel: crate::diff::LineSelection::default(),
         }
     }
 
@@ -2604,6 +2608,7 @@ impl ReviewPanel {
             self.confirm_discard = None;
             self.confirm_hunk = None;
             self.confirm_reject = None;
+            self.line_sel.clear();
             self.comments.clear();
             // 別リポジトリのハンク ID を持ち越さない (パスが同じでも別物)。
             self.queue.clear();
@@ -3116,6 +3121,7 @@ impl ReviewPanel {
         let scroll_to = self.scroll_to.take();
         let mut prompt: Option<String> = None;
         let mut hunk_hit: Option<(usize, usize, crate::diff::HunkOp)> = None;
+        let mut lines_hit: Option<(usize, usize, crate::diff::HunkOp)> = None;
         for i in 0..self.data.files.len() {
             let path = self.data.files[i].path.clone();
             let collapsed = self.collapsed.contains(&path);
@@ -3162,7 +3168,7 @@ impl ReviewPanel {
                     );
                     let confirm = self.confirm_hunk.filter(|(f, _)| *f == i).map(|(_, h)| h);
                     let store = self.comments.entry(path.clone()).or_default();
-                    let action = crate::diff::diff_ui_with_hunk_actions(
+                    let action = crate::diff::diff_ui_with_line_selection(
                         ui,
                         theme,
                         std::slice::from_ref(&self.data.files[i].diff),
@@ -3171,11 +3177,18 @@ impl ReviewPanel {
                             ops: &ops,
                             confirm_discard: confirm,
                         }),
+                        Some(crate::diff::LineSelectCtx {
+                            file_key: i,
+                            sel: &mut self.line_sel,
+                        }),
                     );
                     match action {
                         crate::diff::DiffAction::SendToAgent(p) => prompt = Some(p),
                         crate::diff::DiffAction::Hunk { hunk, op, .. } => {
                             hunk_hit = Some((i, hunk, op));
+                        }
+                        crate::diff::DiffAction::Lines { file, hunk, op } => {
+                            lines_hit = Some((file, hunk, op));
                         }
                         crate::diff::DiffAction::None => {}
                     }
@@ -3191,6 +3204,9 @@ impl ReviewPanel {
         }
         if let Some((fi, hi, op)) = hunk_hit {
             self.on_hunk_op(fi, hi, op, job, actions);
+        }
+        if let Some((fi, hi, op)) = lines_hit {
+            self.on_lines_op(fi, hi, op, job, actions);
         }
     }
 
@@ -3270,7 +3286,7 @@ impl ReviewPanel {
         );
         let confirm = self.confirm_hunk.filter(|(f, _)| *f == i).map(|(_, h)| h);
         let store = self.comments.entry(path.clone()).or_default();
-        let action = crate::diff::diff_ui_with_hunk_actions(
+        let action = crate::diff::diff_ui_with_line_selection(
             ui,
             theme,
             std::slice::from_ref(&self.data.files[i].diff),
@@ -3279,11 +3295,18 @@ impl ReviewPanel {
                 ops: &ops,
                 confirm_discard: confirm,
             }),
+            Some(crate::diff::LineSelectCtx {
+                file_key: i,
+                sel: &mut self.line_sel,
+            }),
         );
         match action {
             crate::diff::DiffAction::SendToAgent(p) => actions.review_prompt = Some(p),
             crate::diff::DiffAction::Hunk { hunk, op, .. } => {
                 self.on_hunk_op(i, hunk, op, job, actions)
+            }
+            crate::diff::DiffAction::Lines { file, hunk, op } => {
+                self.on_lines_op(file, hunk, op, job, actions)
             }
             crate::diff::DiffAction::None => {}
         }
@@ -3527,6 +3550,73 @@ impl ReviewPanel {
         });
     }
 
+    /// **選んだ行だけ**に効くボタンが押されたときの分岐。
+    ///
+    /// パッチは [`crate::diff::build_line_patch`] が組む。
+    /// 適用の向き (`reverse`) と**同じ向き**で組むこと — ここがずれると
+    /// git が拒むか、選んでいない行まで動く。
+    /// 組めなかったら **git を一切叩かずに理由だけ出す**
+    /// (部分適用で作業ツリーを壊さない)。
+    fn on_lines_op(
+        &mut self,
+        fi: usize,
+        hi: usize,
+        op: crate::diff::HunkOp,
+        job: &mut Option<ReviewJob>,
+        actions: &mut GitActions,
+    ) {
+        use crate::diff::HunkOp;
+        let sel = self.line_sel.lines(fi, hi).clone();
+        if sel.is_empty() {
+            return;
+        }
+        // 破棄は取り消せないので、ハンクと同じ 2 段確認を通す。
+        if op == HunkOp::Discard && self.confirm_hunk != Some((fi, hi)) {
+            self.confirm_hunk = Some((fi, hi));
+            return;
+        }
+        self.confirm_hunk = None;
+        let Some(f) = self.data.files.get(fi) else {
+            return;
+        };
+        let n = sel.len().to_string();
+        let (label, cached, reverse) = match op {
+            HunkOp::Stage => (
+                trf("{n} 行をステージ {p}", &[("n", n), ("p", f.path.clone())]),
+                true,
+                false,
+            ),
+            HunkOp::Unstage => (
+                trf(
+                    "{n} 行をアンステージ {p}",
+                    &[("n", n), ("p", f.path.clone())],
+                ),
+                true,
+                true,
+            ),
+            HunkOp::Discard => (
+                trf("{n} 行を破棄 {p}", &[("n", n), ("p", f.path.clone())]),
+                false,
+                true,
+            ),
+        };
+        let patch = match crate::diff::build_line_patch(&f.diff, hi, &sel, reverse) {
+            Ok(p) => p,
+            Err(e) => {
+                actions.toast = Some((e.message(), false));
+                return;
+            }
+        };
+        *job = Some(ReviewJob::ApplyHunk {
+            label,
+            patch,
+            cached,
+            reverse,
+        });
+        // 撃った時点で添字は次の収集でずれる。選択は畳んでおく。
+        self.line_sel.clear();
+    }
+
     /// n / p / ↓ / ↑ で次・前の変更へ。
     ///
     /// 横取り防止のため 3 つ揃ったときだけ効かせる:
@@ -3535,6 +3625,32 @@ impl ReviewPanel {
     fn handle_keys(&mut self, ui: &mut egui::Ui) {
         if !self.list_focused || !ui.ui_contains_pointer() || ui.memory(|m| m.focused().is_some()) {
             return;
+        }
+        // --- 行選択のキー操作 (選んでいるときだけ効く) ---
+        // Esc = 解除 / Shift+↑↓ = 起点からの範囲を伸ばす。
+        // どちらも選択が無ければ素通りするので、既存の n / p / ↑ ↓ を奪わない。
+        let (esc, shift, up, down) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.modifiers.shift,
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+            )
+        });
+        if !self.line_sel.is_empty() {
+            if esc {
+                self.line_sel.clear();
+                return;
+            }
+            if shift && (up || down) {
+                if let Some((fi, hi)) = self.line_sel.scope() {
+                    if let Some(h) = self.data.files.get(fi).and_then(|f| f.diff.hunks.get(hi)) {
+                        let ok = crate::diff::selectable_lines(h);
+                        self.line_sel.step(if down { 1 } else { -1 }, &ok);
+                    }
+                }
+                return;
+            }
         }
         let len = self.data.files.len();
         let delta = ui.input(|i| {
@@ -3578,6 +3694,8 @@ impl ReviewPanel {
                     // 再収集でハンクの並びが変わる。破棄の確認は必ず外す
                     // (別のハンクを消してしまわないように)。
                     self.confirm_hunk = None;
+                    // 行選択も同じ理由で捨てる (添字が別の行を指しかねない)。
+                    self.line_sel.clear();
                     self.confirm_reject = None;
                     // 選択が範囲外になったら外す
                     if self.selected.is_some_and(|i| i >= self.data.files.len()) {
@@ -4442,6 +4560,40 @@ bare
         }
     }
 
+    /// **コミットの引数を組み立てる場所は 1 つだけ。**
+    ///
+    /// app.rs 側にも同じものがあり、そちらには `--cleanup=whitespace` が
+    /// 無かったため、`#` で始まるコミットメッセージがユーザーの
+    /// `commit.cleanup` 設定で黙って落ちていた (同じ操作なのに
+    /// Git パネル経由なら残る、という食い違い)。二度と生えないよう
+    /// ソースを読んで見張る。改行は正規化する (Windows は CRLF)。
+    #[test]
+    fn コミットの引数を組み立てるのはこのモジュールだけ() {
+        let app = include_str!("app.rs").replace("\r\n", "\n");
+        assert!(
+            app.contains("crate::git_panel::commit_args("),
+            "app.rs は git_panel::commit_args を通すこと"
+        );
+        for bad in ["\"commit\".into()", "\"-m\".into()"] {
+            assert!(
+                !app.contains(bad),
+                "app.rs が commit の引数を自前で組み立てている: {bad}"
+            );
+        }
+    }
+
+    /// `--cleanup=whitespace` を落とさない (これが無いと `#` 始まりの行が消える)。
+    #[test]
+    fn コミット引数は必ず_cleanup_を明示する() {
+        for amend in [false, true] {
+            let a = commit_args("# 見出しから始まるメッセージ", amend);
+            assert!(
+                a.iter().any(|x| x == "--cleanup=whitespace"),
+                "amend={amend}"
+            );
+        }
+    }
+
     #[test]
     fn commit_args_amend_inserts_the_flag_before_the_message() {
         let a = commit_args("直前を直す", true);
@@ -4705,6 +4857,18 @@ bare
         assert!(
             panel.contains("crate::diff::diff_ui_with_hunk_actions("),
             "ハンク操作付きの差分レンダラを呼んでいない"
+        );
+        assert!(
+            panel.contains("crate::diff::diff_ui_with_line_selection("),
+            "行選択付きの差分レンダラを呼んでいない (行を選べない = 未完成)"
+        );
+        assert!(
+            panel.contains("self.on_lines_op(fi, hi, op, job, actions);"),
+            "選んだ行のボタンを git 経路へ繋いでいない"
+        );
+        assert!(
+            panel.contains("crate::diff::build_line_patch(&f.diff, hi, &sel, reverse)"),
+            "部分パッチの組み立てを呼んでいない"
         );
         assert!(
             panel.contains("self.spawn_history(&ctx, 0);"),
@@ -5074,6 +5238,134 @@ bare
             assert!(seen.insert(m.label()), "{m:?} の表示名が重複している");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **行単位ステージング**が実リポジトリで往復すること。
+    ///
+    /// 1 ハンクに 2 箇所の変更があるとき、片方の行だけを index へ載せ、
+    /// `git diff --cached` に**その行しか出ない**ことを確かめる。
+    /// 戻しは同じ組み立てを `--reverse` 向きで使い回す。
+    #[test]
+    fn 選んだ行だけがindexへ載って戻る() {
+        let Some(repo) = review_repo("line-stage") else {
+            return;
+        };
+        std::fs::write(repo.join("l.txt"), "one\ntwo\nthree\nfour\nfive\n").expect("seed");
+        git_ok(&repo, &["add", "-A"]);
+        git_commit(&repo, "seed");
+        std::fs::write(repo.join("l.txt"), "one\nTWO\nthree\nFOUR\nfive\n").expect("edit");
+
+        let data = collect_review(&repo, &ReviewBase::Unstaged, ContextLines::Three, false);
+        let f = data
+            .files
+            .iter()
+            .find(|f| f.path == "l.txt")
+            .expect("l.txt の差分");
+        assert_eq!(f.diff.hunks.len(), 1, "文脈 3 行なら 1 ハンクに繋がる");
+        let lines = f.diff.hunks[0].lines.clone();
+        let pick = |kind: crate::diff::LineKind, text: &str| -> usize {
+            lines
+                .iter()
+                .position(|l| l.kind == kind && l.text == text)
+                .unwrap_or_else(|| panic!("{text} が無い"))
+        };
+        let sel: std::collections::BTreeSet<usize> = [
+            pick(crate::diff::LineKind::Removed, "two"),
+            pick(crate::diff::LineKind::Added, "TWO"),
+        ]
+        .into_iter()
+        .collect();
+
+        // --- 選んだ 2 行だけをステージ ---
+        let patch = crate::diff::build_line_patch(&f.diff, 0, &sel, false).expect("部分パッチ");
+        let args = apply_patch_args(true, false);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git_stdin(&repo, &argv, &patch).expect("git apply --cached が拒んだ");
+
+        let staged = run_git(&repo, &["diff", "--cached"]).expect("diff --cached");
+        assert!(
+            staged.contains("-two") && staged.contains("+TWO"),
+            "選んだ行が index に載っていない:\n{staged}"
+        );
+        assert!(
+            !staged.contains("FOUR"),
+            "選んでいない行まで index に載った:\n{staged}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("l.txt")).expect("読める"),
+            "one\nTWO\nthree\nFOUR\nfive\n",
+            "作業ツリーは 1 バイトも触らない"
+        );
+        let rest = run_git(&repo, &["diff"]).expect("diff");
+        assert!(
+            rest.contains("+FOUR"),
+            "選ばなかった行が未ステージで残っていない:\n{rest}"
+        );
+
+        // --- 同じ組み立てを逆向きで使ってアンステージ ---
+        let data2 = collect_review(&repo, &ReviewBase::Staged, ContextLines::Three, false);
+        let g = data2
+            .files
+            .iter()
+            .find(|f| f.path == "l.txt")
+            .expect("staged の差分");
+        let sel2: std::collections::BTreeSet<usize> = g.diff.hunks[0]
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.kind != crate::diff::LineKind::Context)
+            .map(|(i, _)| i)
+            .collect();
+        let back = crate::diff::build_line_patch(&g.diff, 0, &sel2, true).expect("逆向きパッチ");
+        let args = apply_patch_args(true, true);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git_stdin(&repo, &argv, &back).expect("git apply --cached --reverse が拒んだ");
+        let staged = run_git(&repo, &["diff", "--cached"]).expect("diff --cached");
+        assert!(
+            staged.trim().is_empty(),
+            "index が空に戻っていない:\n{staged}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// **追加行だけ**を選んだパッチ (= 削除は保留) を git が受け取ること。
+    /// `@@` の数え直しを間違えると、ここで拒まれるか別の行が消える。
+    #[test]
+    fn 追加行だけのステージをgitが受け取る() {
+        let Some(repo) = review_repo("line-stage-add-only") else {
+            return;
+        };
+        std::fs::write(repo.join("p.txt"), "a\nb\nc\n").expect("seed");
+        git_ok(&repo, &["add", "-A"]);
+        git_commit(&repo, "seed");
+        std::fs::write(repo.join("p.txt"), "a\nB\nc\n").expect("edit");
+
+        let data = collect_review(&repo, &ReviewBase::Unstaged, ContextLines::Three, false);
+        let f = data
+            .files
+            .iter()
+            .find(|f| f.path == "p.txt")
+            .expect("p.txt の差分");
+        let i = f.diff.hunks[0]
+            .lines
+            .iter()
+            .position(|l| l.kind == crate::diff::LineKind::Added)
+            .expect("追加行");
+        let sel: std::collections::BTreeSet<usize> = [i].into_iter().collect();
+        let patch = crate::diff::build_line_patch(&f.diff, 0, &sel, false).expect("部分パッチ");
+        let args = apply_patch_args(true, false);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_git_stdin(&repo, &argv, &patch).expect("git apply --cached が拒んだ");
+
+        // 削除は保留したので index には b と B が並ぶ
+        let staged = run_git(&repo, &["show", ":p.txt"]).expect("show");
+        assert_eq!(
+            staged.replace("\r\n", "\n"),
+            "a\nb\nB\nc\n",
+            "追加行だけを載せた結果が違う"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// キューの採用 / 却下が**実際に git へ届き、取り消しで戻る**こと。
