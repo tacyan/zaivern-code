@@ -48,6 +48,7 @@ mod orchestration;
 mod palette;
 mod panels;
 mod pathx;
+mod perf;
 mod pet;
 mod pet_bubble;
 mod pet_variants;

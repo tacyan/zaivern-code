@@ -292,6 +292,10 @@ pub struct Config {
     /// **既定は無効** — ユーザーが明示的に有効化したときだけ働く。
     pub failover: crate::failover::FailoverConfig,
 
+    /// トークン単価の表 (`[pricing]`)。推定コストの計算に使う。
+    /// **価格は変わるのでユーザーが上書きできる** — 詳細は [`PricingConfig`]。
+    pub pricing: PricingConfig,
+
     /// コマンドパレットの MRU (最近実行したコマンド。先頭が直近)。
     ///
     /// UI の操作から溜まる値なので手書きの config.toml には**書かない** —
@@ -407,6 +411,145 @@ impl PluginsConfig {
     }
 }
 
+/// モデル 1 種類の単価 (100 万トークンあたり、[`PricingConfig::currency`] 単位)。
+///
+/// ```toml
+/// [pricing.models."claude-opus-5"]
+/// input = 5.0
+/// output = 25.0
+/// cache_write = 6.25
+/// cache_read = 0.5
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelPrice {
+    /// キャッシュに当たらなかった入力。
+    pub input: f64,
+    /// 出力。
+    pub output: f64,
+    /// キャッシュ書き込み。
+    pub cache_write: f64,
+    /// キャッシュ読み出し。
+    pub cache_read: f64,
+}
+
+impl Default for ModelPrice {
+    fn default() -> Self {
+        Self {
+            input: 0.0,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        }
+    }
+}
+
+/// `[pricing]` セクション — **推定コストの単価表**。
+///
+/// ## なぜ設定に持つのか
+///
+/// 価格はベンダーの都合でいつでも変わる。ロジック側にモデル名と金額を
+/// 焼き込むと、値上げ・値下げ・新モデルのたびにビルドし直しになる。
+/// ここへ表として置き、`state.toml` / `config.toml` から上書きできるようにする。
+/// `quota` module 側にはモデル名も金額も**一切書かない**
+/// ([`crate::coordinator::quota::PriceLookup`] 越しに引くだけ)。
+///
+/// ## 引き当ての規則
+///
+/// 1. 完全一致
+/// 2. 無ければ**最長の前方一致** (`claude-opus-5[1m]` → `claude-opus-5`)
+/// 3. それでも無ければ「不明」。**0 円にはしない** (推定を過小に見せないため)
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PricingConfig {
+    /// 推定コストを出すか。**既定はオン** (消費ゼロなら結局何も出ない)。
+    pub enabled: bool,
+    /// 表示に使う通貨記号。既定値の表は米ドル建てなので `"$"`。
+    /// 別通貨で持つならここと `models` を一緒に書き換える。
+    pub currency: String,
+    /// モデル名 → 単価。キーは前方一致で引かれる。
+    pub models: HashMap<String, ModelPrice>,
+}
+
+impl Default for PricingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            currency: "$".into(),
+            models: default_model_prices(),
+        }
+    }
+}
+
+/// 既定の単価表。
+///
+/// **2026-08-09 時点**の公開価格 (100 万トークンあたり・米ドル)。
+/// キャッシュ単価は入力単価から導出している (書き込み = 入力の 1.25 倍 /
+/// 5 分 TTL、読み出し = 入力の 0.1 倍)。**古くなったら設定で上書きすること** —
+/// このアプリは価格を問い合わせに行かない (通信ゼロの方針)。
+///
+/// キーは前方一致で引かれるので、日付サフィックス付きの ID
+/// (`claude-haiku-4-5-20251001` 等) もここの短い名前に当たる。
+fn default_model_prices() -> HashMap<String, ModelPrice> {
+    /// 入力単価から 1 行ぶんを組み立てる (キャッシュ倍率は共通)。
+    fn row(input: f64, output: f64) -> ModelPrice {
+        ModelPrice {
+            input,
+            output,
+            cache_write: input * 1.25,
+            cache_read: input * 0.1,
+        }
+    }
+    // (モデル名の前方一致キー, 入力, 出力)
+    const TABLE: &[(&str, f64, f64)] = &[
+        // Anthropic
+        ("claude-fable-5", 10.0, 50.0),
+        ("claude-mythos-5", 10.0, 50.0),
+        ("claude-opus-5", 5.0, 25.0),
+        ("claude-opus-4", 5.0, 25.0),
+        ("claude-sonnet-5", 3.0, 15.0),
+        ("claude-sonnet-4", 3.0, 15.0),
+        ("claude-haiku-4", 1.0, 5.0),
+    ];
+    TABLE
+        .iter()
+        .map(|(name, i, o)| ((*name).to_string(), row(*i, *o)))
+        .collect()
+}
+
+impl PricingConfig {
+    /// モデル名から単価を引く (完全一致 → 最長の前方一致)。
+    pub fn lookup(&self, model: &str) -> Option<ModelPrice> {
+        if !self.enabled || model.is_empty() {
+            return None;
+        }
+        if let Some(p) = self.models.get(model) {
+            return Some(*p);
+        }
+        self.models
+            .iter()
+            .filter(|(k, _)| !k.is_empty() && model.starts_with(k.as_str()))
+            .max_by_key(|(k, _)| k.len())
+            .map(|(_, p)| *p)
+    }
+}
+
+impl crate::coordinator::quota::PriceLookup for PricingConfig {
+    fn rate(&self, model: &str) -> Option<crate::coordinator::quota::ModelRate> {
+        self.lookup(model)
+            .map(|p| crate::coordinator::quota::ModelRate {
+                input: p.input,
+                output: p.output,
+                cache_write: p.cache_write,
+                cache_read: p.cache_read,
+            })
+    }
+
+    fn currency(&self) -> &str {
+        &self.currency
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -488,6 +631,7 @@ impl Default for Config {
             super_agent: SuperAgentConfig::default(),
             plugins: PluginsConfig::default(),
             failover: crate::failover::FailoverConfig::default(),
+            pricing: PricingConfig::default(),
             palette_recent: Vec::new(),
         }
     }
@@ -4694,5 +4838,131 @@ mod state_overlay_tests {
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// 単価表 (`[pricing]`) — quota の推定コストが引く側。
+#[cfg(test)]
+mod quota_pricing_tests {
+    use super::*;
+    use crate::coordinator::quota::PriceLookup;
+
+    /// 既定の表は「入力 < 出力」「キャッシュ読 < 入力 < キャッシュ書」を守る。
+    /// 値そのものは変わりうるが、この大小関係が壊れたら表の書き間違い。
+    #[test]
+    fn 既定の単価表の大小関係が正しい() {
+        let p = PricingConfig::default();
+        assert!(p.enabled);
+        assert!(
+            !p.models.is_empty(),
+            "既定値が空だと推定が全部「不明」になる"
+        );
+        for (name, m) in &p.models {
+            assert!(m.input > 0.0, "{name}: 入力単価が 0");
+            assert!(m.output > m.input, "{name}: 出力が入力より安い");
+            assert!(
+                m.cache_write > m.input,
+                "{name}: キャッシュ書が入力より安い"
+            );
+            assert!(m.cache_read < m.input, "{name}: キャッシュ読が入力より高い");
+        }
+    }
+
+    /// 完全一致 → 最長の前方一致 の順で引く。
+    #[test]
+    fn 単価は完全一致と最長前方一致で引く() {
+        let mut p = PricingConfig {
+            enabled: true,
+            currency: "$".into(),
+            models: HashMap::new(),
+        };
+        let r = |i: f64| ModelPrice {
+            input: i,
+            output: i * 5.0,
+            cache_write: i * 1.25,
+            cache_read: i * 0.1,
+        };
+        p.models.insert("mdl".into(), r(1.0));
+        p.models.insert("mdl-pro".into(), r(9.0));
+        // 完全一致
+        assert_eq!(p.lookup("mdl").unwrap().input, 1.0);
+        assert_eq!(p.lookup("mdl-pro").unwrap().input, 9.0);
+        // 最長の前方一致が勝つ (短い "mdl" に吸われない)
+        assert_eq!(p.lookup("mdl-pro-20260809").unwrap().input, 9.0);
+        assert_eq!(p.lookup("mdl-lite").unwrap().input, 1.0);
+        // どれにも当たらなければ None (**0 円にしない**)
+        assert!(p.lookup("other-vendor-model").is_none());
+        assert!(p.lookup("").is_none());
+    }
+
+    /// 無効にすると全部「不明」になる (0 円で埋めない)。
+    #[test]
+    fn 無効なら単価を返さない() {
+        let mut p = PricingConfig::default();
+        let any = p.models.keys().next().cloned().expect("既定の表が空でない");
+        assert!(p.lookup(&any).is_some());
+        p.enabled = false;
+        assert!(p.lookup(&any).is_none());
+    }
+
+    /// 日付サフィックス付きの ID も前方一致で当たる。
+    #[test]
+    fn 日付サフィックス付きの_id_も引ける() {
+        let p = PricingConfig::default();
+        let base = p
+            .models
+            .keys()
+            .max_by_key(|k| k.len())
+            .cloned()
+            .expect("既定の表が空でない");
+        let dated = format!("{base}-20991231");
+        assert_eq!(
+            p.lookup(&dated).map(|m| m.input),
+            p.lookup(&base).map(|m| m.input),
+            "{dated} が {base} に当たる"
+        );
+    }
+
+    /// `PriceLookup` として quota から引ける (単価が素通しで渡る)。
+    #[test]
+    fn quota_の_pricelookup_として使える() {
+        let p = PricingConfig::default();
+        let name = p.models.keys().next().cloned().unwrap();
+        let src = p.models[&name];
+        let got = PriceLookup::rate(&p, &name).expect("引けること");
+        assert_eq!(got.input, src.input);
+        assert_eq!(got.output, src.output);
+        assert_eq!(got.cache_write, src.cache_write);
+        assert_eq!(got.cache_read, src.cache_read);
+        assert_eq!(PriceLookup::currency(&p), p.currency);
+        assert!(PriceLookup::rate(&p, "no-such-model-anywhere").is_none());
+    }
+
+    /// TOML を往復しても表が壊れない (ユーザーが上書きできる)。
+    #[test]
+    fn 単価表は_toml_で上書きできる() {
+        let raw = r#"
+[pricing]
+enabled = true
+currency = "¥"
+
+[pricing.models."my-model"]
+input = 100.0
+output = 500.0
+cache_write = 125.0
+cache_read = 10.0
+"#;
+        let cfg: Config = toml::from_str(raw).expect("読めること");
+        assert_eq!(cfg.pricing.currency, "¥");
+        let m = cfg.pricing.lookup("my-model").expect("引けること");
+        assert_eq!(m.input, 100.0);
+        assert_eq!(m.output, 500.0);
+        // 書き戻しても読み直せる
+        let back = toml::to_string(&cfg).expect("書けること");
+        let again: Config = toml::from_str(&back).expect("読み直せること");
+        assert_eq!(
+            again.pricing.lookup("my-model").map(|m| m.input),
+            Some(100.0)
+        );
     }
 }

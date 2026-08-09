@@ -3044,6 +3044,9 @@ pub struct ZaivernApp {
     quota: coordinator::QuotaWatch,
     /// 使用量の詳細ウィンドウ (ステータスバーの表示をクリック / パレット)
     quota_open: bool,
+    /// ステータスバーのトークン/コスト表示をエージェント別まで開くか。
+    /// **既定はコンパクト (合算 1 個)**。消費ゼロならどちらでも 1px も出さない。
+    token_detail: bool,
     /// レート制限時のアカウント自動フェイルオーバー。**既定は無効**。
     /// 段 (検知→候補選定→切替→再開→検証) と履歴をここが持つ。
     failover: failover::Failover,
@@ -3751,6 +3754,7 @@ impl ZaivernApp {
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
+            token_detail: false,
             failover: failover::Failover::new(cfg.failover.clone()),
             save_trim_trailing: cfg.trim_trailing_whitespace,
             save_trim_final_newlines: cfg.trim_final_newlines,
@@ -6769,6 +6773,12 @@ impl ZaivernApp {
         let fo_ladder = self.failover_ladder_text();
         let fo_next = self.failover_preview(mono);
         let mut toggle_failover = false;
+        // トークン消費の明細 (エージェント → モデル)。self の二重借用を避けて先に作る。
+        let token_rows = self.token_rows();
+        // フレーム時間の計測。ZAIVERN_PERF=1 のときだけ Some。
+        let perf_line = crate::perf::status_line();
+        let mut perf_dump = false;
+        let mut perf_reset = false;
         let mut open = self.quota_open;
         egui::Window::new(tr("📊 プラン使用量"))
             .open(&mut open)
@@ -6828,6 +6838,65 @@ impl ZaivernApp {
                 }
                 ui.separator();
 
+                // ── 🪙 トークン消費と推定コスト ──────────────────────
+                // 消費がゼロなら見出しごと出さない (空のセクションを作らない)。
+                if !token_rows.is_empty() {
+                    ui.label(
+                        RichText::new(tr("🪙 トークン消費 (直近 24 時間)"))
+                            .strong()
+                            .size(12.5),
+                    );
+                    for row in &token_rows {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.set_max_width(ui.available_width());
+                            ui.label(RichText::new(&row.head).size(11.5).color(if row.top {
+                                theme.warn
+                            } else {
+                                theme.text
+                            }));
+                        });
+                        for sub in &row.subs {
+                            ui.label(
+                                RichText::new(format!("　　{sub}"))
+                                    .size(11.0)
+                                    .color(theme.text_dim),
+                            );
+                        }
+                    }
+                    ui.label(
+                        RichText::new(tr(
+                            "金額は推定です (単価は設定の [pricing] から。通信はしません)",
+                        ))
+                        .size(11.0)
+                        .color(theme.text_dim),
+                    );
+                    ui.separator();
+                }
+
+                // ── ⏱ フレーム時間の計測 (ZAIVERN_PERF=1 のときだけ) ──
+                if let Some(line) = &perf_line {
+                    ui.label(RichText::new(tr("⏱ フレーム時間")).strong().size(12.5));
+                    ui.label(RichText::new(line).size(11.5).color(theme.text_dim));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .button(tr("レポートを出力"))
+                            .on_hover_text(tr("ヒストグラムを 1 行 1 レコードで書き出します \
+                                 (既定は stderr。ZAIVERN_PERF_OUT にパスを指定すると追記)"))
+                            .clicked()
+                        {
+                            perf_dump = true;
+                        }
+                        if ui
+                            .button(tr("計測をやり直す"))
+                            .on_hover_text(tr("集計を捨てて、ここから計り直します"))
+                            .clicked()
+                        {
+                            perf_reset = true;
+                        }
+                    });
+                    ui.separator();
+                }
+
                 if accounts.is_empty() {
                     ui.label(
                         RichText::new(tr(
@@ -6883,6 +6952,70 @@ impl ZaivernApp {
         if toggle_failover {
             self.set_failover_enabled(!fo_enabled);
         }
+        if perf_dump {
+            let n = crate::perf::dump();
+            self.toast(
+                trf("性能レポートを {n} 行出力しました", &[("n", n.to_string())]),
+                true,
+            );
+        }
+        if perf_reset {
+            crate::perf::reset();
+            self.toast(tr("性能の計測をやり直します"), true);
+        }
+    }
+
+    /// 使用量ウィンドウへ出すトークン消費の明細。
+    ///
+    /// 消費がゼロなら空 (見出しごと消すため)。**集計値だけ**を作る —
+    /// プロンプト本文は元データから読んでいないので混ざりようがない。
+    fn token_rows(&self) -> Vec<TokenRow> {
+        use coordinator::quota;
+        let prices = &self.cfg.pricing;
+        let cur = &prices.currency;
+        let mut out = Vec::new();
+        for (i, a) in self.quota.tokens().iter().enumerate() {
+            let est = quota::estimate_cost(a, prices);
+            let mut head = trf(
+                "{label}: {tok} トークン / {n} 回",
+                &[
+                    ("label", a.label.clone()),
+                    ("tok", quota::short_tokens(a.total.total())),
+                    ("n", a.turns.to_string()),
+                ],
+            );
+            if prices.enabled {
+                head.push_str(&format!(" · {}", est.label(cur)));
+            }
+            if a.truncated {
+                head.push_str(&tr(" (読み切れず・実際はこれ以上)"));
+            }
+            let mut subs = vec![trf(
+                "入力 {i} / 出力 {o} / キャッシュ書 {cw} / キャッシュ読 {cr}",
+                &[
+                    ("i", quota::short_tokens(a.total.input)),
+                    ("o", quota::short_tokens(a.total.output)),
+                    ("cw", quota::short_tokens(a.total.cache_write)),
+                    ("cr", quota::short_tokens(a.total.cache_read)),
+                ],
+            )];
+            for (model, u) in &a.by_model {
+                let name = if model.is_empty() {
+                    tr("(モデル不明)")
+                } else {
+                    model.clone()
+                };
+                subs.push(format!("{name}: {}", quota::short_tokens(u.total())));
+            }
+            out.push(TokenRow {
+                // 先頭 (= 最も消費しているエージェント) を目立たせる。
+                // 「どれが高いか」が一目で分かるのがこの表示の目的。
+                top: i == 0 && self.quota.tokens().len() > 1,
+                head,
+                subs,
+            });
+        }
+        out
     }
 
     /// 「どの段の情報で判断できる状態か」を段ごとに並べた説明文。
@@ -12842,6 +12975,10 @@ impl ZaivernApp {
         // 統合承認キューの待ち件数バッジ (押すとボトムパネルの承認ビューを開く)
         let approvals_pending = self.agents.approvals.pending_len();
         let mut open_approvals = false;
+        // トークン消費と推定コスト。消費ゼロなら None = 1 ピクセルも出さない。
+        let token_badges = self.token_badges();
+        let want_token_detail = self.token_detail;
+        let mut toggle_token_detail = false;
         // Pro の解錠判定は license::is_pro **1 か所だけ**を通す。
         // 未ライセンス時は 1 ピクセルも出さない (常に何かを表示するバッジは作らない)。
         let pro_badge = license::is_pro(&self.license_status).then(|| match &self.license_status {
@@ -12932,6 +13069,48 @@ impl ZaivernApp {
                             .clicked()
                     {
                         open_approvals = true;
+                    }
+
+                    // トークン消費 / 推定コスト。
+                    // 「どの幅でも見切れない」ための判断は純粋関数
+                    // [`quota::token_badge_layout`] に任せ、ここは結果に従うだけ。
+                    if let Some(badges) = &token_badges {
+                        let widths: Vec<f32> = badges
+                            .detail
+                            .iter()
+                            .map(|(t, _)| badge_width_px(t))
+                            .collect();
+                        // `available_width` は行の残り全部を返すが、この後に
+                        // 右詰めの列 (テーマ / 行桁 / Pro …) が同じ行へ入る。
+                        // 全部を使い切ると右側と食い合うので、左側の取り分だけを
+                        // 予算として渡す。
+                        let budget = ui.available_width() * TOKEN_BADGE_MAX_FRACTION;
+                        let lay = coordinator::quota::token_badge_layout(
+                            (budget, ui.available_height()),
+                            &widths,
+                            badge_width_px(&badges.compact.0),
+                            TOKEN_BADGE_H,
+                            TOKEN_BADGE_GAP,
+                            want_token_detail,
+                        );
+                        if lay.visible {
+                            let shown: Vec<&(String, String)> = if lay.compact {
+                                vec![&badges.compact]
+                            } else {
+                                badges.detail.iter().take(lay.rects.len()).collect()
+                            };
+                            for (text, tip) in shown {
+                                let r = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text).size(11.5).color(theme.text_dim),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                );
+                                if r.on_hover_text(tip.clone()).clicked() {
+                                    toggle_token_detail = true;
+                                }
+                            }
+                        }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -13129,6 +13308,9 @@ impl ZaivernApp {
         if open_quota {
             self.quota_open = true;
         }
+        if toggle_token_detail {
+            self.token_detail = !self.token_detail;
+        }
         if let Some(le) = convert_eol {
             self.editor_op(ctx, EditOp::NormalizeEol(le));
         }
@@ -13143,6 +13325,111 @@ impl ZaivernApp {
 
     /// ステータスバー用のプラン使用量サマリ。
     /// 返り値: (最悪の深刻さ。アカウントが 1 件も無ければ None, ツールチップ本文)。
+    /// ステータスバーへ出すトークン/コストの材料。
+    ///
+    /// **消費がゼロなら `None`** — 「変化していないものは 1px も出さない」。
+    /// 出すのは集計値だけで、プロンプト本文は一切載せない。
+    fn token_badges(&self) -> Option<TokenBadges> {
+        use coordinator::quota;
+        let per_agent = self.quota.tokens();
+        if per_agent.is_empty() {
+            return None;
+        }
+        let prices = &self.cfg.pricing;
+        let cur = prices.currency.clone();
+        let total = self.quota.tokens_total()?;
+        if total.is_zero() {
+            return None;
+        }
+        let window = tr("直近 24 時間");
+        // 金額は単価表が有効なときだけ。無効なら「推定不可」で埋めない。
+        let money = |est: &quota::CostEstimate| -> Option<String> {
+            prices.enabled.then(|| est.label(&cur))
+        };
+        let breakdown = |u: &quota::TokenUsage| {
+            trf(
+                "入力 {i} / 出力 {o} / キャッシュ書 {cw} / キャッシュ読 {cr}",
+                &[
+                    ("i", quota::short_tokens(u.input)),
+                    ("o", quota::short_tokens(u.output)),
+                    ("cw", quota::short_tokens(u.cache_write)),
+                    ("cr", quota::short_tokens(u.cache_read)),
+                ],
+            )
+        };
+        let total_cost = self.quota.cost_total(prices)?;
+        let mut compact_text = format!("🪙 {}", quota::short_tokens(total.total()));
+        if let Some(m) = money(&total_cost) {
+            compact_text.push_str(&format!(" · {m}"));
+        }
+        // ホバーで初めて内訳。行そのものは短く保つ。
+        let mut tip = vec![
+            trf("トークン消費 ({window})", &[("window", window.clone())]),
+            breakdown(&total),
+        ];
+        for a in per_agent {
+            let est = quota::estimate_cost(a, prices);
+            let mut line = format!("  {} {}", a.label, quota::short_tokens(a.total.total()));
+            if let Some(m) = money(&est) {
+                line.push_str(&format!(" · {m}"));
+            }
+            if a.truncated {
+                line.push_str(&tr(" (読み切れず・実際はこれ以上)"));
+            }
+            tip.push(line);
+        }
+        if prices.enabled {
+            tip.push(tr(
+                "金額は推定です (単価は設定 [pricing] から。通信はしません)",
+            ));
+        }
+        tip.push(tr("押すとエージェント別の表示に切り替わります"));
+        let compact_tip = tip.join("\n");
+
+        let detail = per_agent
+            .iter()
+            .map(|a| {
+                let est = quota::estimate_cost(a, prices);
+                let mut text = format!("🪙 {} {}", a.label, quota::short_tokens(a.total.total()));
+                if let Some(m) = money(&est) {
+                    text.push_str(&format!(" · {m}"));
+                }
+                let mut t = vec![
+                    trf(
+                        "{label} — {n} 回のやり取り ({window})",
+                        &[
+                            ("label", a.label.clone()),
+                            ("n", a.turns.to_string()),
+                            ("window", window.clone()),
+                        ],
+                    ),
+                    breakdown(&a.total),
+                ];
+                for (model, u) in &a.by_model {
+                    let name = if model.is_empty() {
+                        tr("(モデル不明)")
+                    } else {
+                        model.clone()
+                    };
+                    t.push(format!("  {name}: {}", quota::short_tokens(u.total())));
+                }
+                if !est.is_complete() {
+                    t.push(trf(
+                        "単価が設定に無いモデルがあります: {models}",
+                        &[("models", est.unknown_models.join(", "))],
+                    ));
+                }
+                t.push(tr("押すと合算表示に戻ります"));
+                (text, t.join("\n"))
+            })
+            .collect();
+
+        Some(TokenBadges {
+            compact: (compact_text, compact_tip),
+            detail,
+        })
+    }
+
     fn quota_status(&self) -> (Option<u8>, String) {
         let now = std::time::SystemTime::now();
         let accounts = self.quota.accounts(now);
@@ -25905,9 +26192,13 @@ impl eframe::App for ZaivernApp {
         // いまは時間窓で頻度を見て、収まらなければ犯人の部分ビューを隔離し、
         // それでも駄目なら最後の手段として従来どおり落とす (`FramePanicPolicy`)。
         let _ = take_drawing_subview(); // 前フレームの印が残っていたら捨てる
+                                        // フレーム時間の計測。ZAIVERN_PERF=1 のときだけ Instant を取る
+                                        // (無効時はここも [`perf::frame_end`] も即 return する)。
+        let perf_frame = crate::perf::frame_start();
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.update_impl(ctx, frame);
         }));
+        crate::perf::frame_end(perf_frame);
         let now_ms = self.frame_guard.now_ms();
         match ok {
             Ok(()) => {
@@ -25962,6 +26253,10 @@ impl eframe::App for ZaivernApp {
     /// ウィンドウが閉じないまま残る。エージェントを落として PTY は OS に任せる
     /// ([`crate::terminal::abandon`] の説明を参照)。
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 計測が有効なら、この起動ぶんのフレーム時間を 1 回だけ書き出す。
+        // 「起動 → 触る → 閉じる」で版ごとのレポートが 1 行ずつ溜まるので、
+        // 版間比較にボタン操作が要らない (無効なら何もしない)。
+        crate::perf::dump();
         // 終わる前にセッションを保存する — エージェントタブの記録はここでしか
         // 確実に残せない (走らせたまま閉じても、次回開けば会話を再開できる)。
         self.persist_session();
@@ -26802,37 +27097,54 @@ impl ZaivernApp {
         if let Some(ms) = idle_repaint_ms(signals) {
             ctx.request_repaint_after(std::time::Duration::from_millis(ms));
         }
-        // ZV_IDLE_TRACE=1 のときだけ、1 秒ごとに実フレーム数と判断材料を出す。
-        // 「アイドルで何枚描いたか」を実測するための計測窓 (既定では無効)。
-        idle_trace(signals);
+        // 「実入力が無いのに描いたフレーム」を数える。
+        // `ZAIVERN_PERF=1` のときだけ働き、レポートは `perf::dump` で 1 回だけ出す
+        // (1 フレームごとに文字列を吐くと計測自体が観測対象を歪めるため)。
+        crate::perf::note_idle(!signals.had_input);
     }
 }
 
-/// アイドル計測用のトレース。`ZV_IDLE_TRACE=1` のときだけ働く。
-/// 1 秒間に実際に回ったフレーム数と、その判断材料を stderr へ 1 行出す。
-fn idle_trace(s: IdleSignals) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("ZV_IDLE_TRACE").is_ok_and(|v| v == "1")) {
-        return;
-    }
-    static FRAMES: AtomicU64 = AtomicU64::new(0);
-    static WINDOW: OnceLock<std::sync::Mutex<Instant>> = OnceLock::new();
-    FRAMES.fetch_add(1, Ordering::Relaxed);
-    let w = WINDOW.get_or_init(|| std::sync::Mutex::new(Instant::now()));
-    let Ok(mut at) = w.lock() else { return };
-    if at.elapsed() < Duration::from_secs(1) {
-        return;
-    }
-    let n = FRAMES.swap(0, Ordering::Relaxed);
-    let secs = at.elapsed().as_secs_f32();
-    *at = Instant::now();
-    eprintln!(
-        "zv-idle: {:.1} fps ({n} frames / {secs:.2}s) next={:?} {s:?}",
-        n as f32 / secs,
-        idle_repaint_ms(s)
-    );
+/// ステータスバーのトークン/コストバッジ 1 個の高さ。
+const TOKEN_BADGE_H: f32 = 16.0;
+/// 同・バッジ間の隙間。
+const TOKEN_BADGE_GAP: f32 = 8.0;
+/// 同・行の残り幅のうちバッジ列が使ってよい割合。
+///
+/// ステータスバーは 1 行に左詰めと右詰めが同居する。`available_width()` は
+/// 行の残り全部を返すので、そのまま使うと右詰め側と食い合って見切れる。
+const TOKEN_BADGE_MAX_FRACTION: f32 = 0.45;
+
+/// 使用量ウィンドウのトークン明細 1 行分。
+struct TokenRow {
+    /// 最も消費しているエージェントか (色を変えて目立たせる)。
+    top: bool,
+    /// 見出し行。
+    head: String,
+    /// ぶら下がる内訳 (種類別 / モデル別)。
+    subs: Vec<String>,
+}
+
+/// ステータスバーへ出すトークン/コストのバッジ材料。
+///
+/// `compact` は全エージェントの合算 1 個、`detail` はエージェント別。
+/// どちらを描くかは幅次第で [`coordinator::quota::token_badge_layout`] が決める。
+struct TokenBadges {
+    /// (表示文字列, ホバーで出す内訳)。
+    compact: (String, String),
+    /// エージェント別 (消費の多い順)。
+    detail: Vec<(String, String)>,
+}
+
+/// バッジ 1 個のおおよその表示幅 (px)。
+///
+/// 等幅ではないので概算だが、**多めに見積もる**ので「入ると判断したのに
+/// 見切れる」は起きない (ASCII 6.5px / それ以外 12.5px + 余白)。
+fn badge_width_px(text: &str) -> f32 {
+    let w: f32 = text
+        .chars()
+        .map(|c| if c.is_ascii() { 6.5 } else { 12.5 })
+        .sum();
+    w + 14.0
 }
 
 /// 承認の監査ログを画面に出す件数 (末尾から。全部は読まない)。
@@ -30732,6 +31044,105 @@ mod idle_repaint_tests {
             ..idle()
         };
         assert_eq!(idle_repaint_ms(s), Some(IDLE_HOUSEKEEP_MS));
+    }
+
+    /// 実際に `egui::Context` を回して「予約されたか」を見る。
+    ///
+    /// `idle_repaint_ms` の単体テストは**判断**しか見ていないので、
+    /// 予約の呼び出しを足した/落とした事故は素通りする。ここでは
+    /// [`ZaivernApp::schedule_idle_repaint`] と同じ形でフレームを回し、
+    /// egui が実際に返す `repaint_delay` を確かめる。
+    ///
+    /// `Duration::MAX` = 「次のフレームを予約していない」= 完全に寝る。
+    fn drive(signals: IdleSignals, frames: usize) -> Duration {
+        let ctx = egui::Context::default();
+        let mut delay = Duration::ZERO;
+        for _ in 0..frames {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                // 何か 1 つは描く (完全に空だと egui が別の経路を通る)
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("idle");
+                });
+                // schedule_idle_repaint と同じ判断・同じ予約
+                let s = IdleSignals {
+                    animating: ctx.has_requested_repaint(),
+                    ..signals
+                };
+                if let Some(ms) = idle_repaint_ms(s) {
+                    ctx.request_repaint_after(Duration::from_millis(ms));
+                }
+            });
+            delay = out
+                .viewport_output
+                .values()
+                .map(|v| v.repaint_delay)
+                .min()
+                .expect("ルートビューポートが必ずある");
+        }
+        delay
+    }
+
+    /// **本命の回帰テスト**: 何も起きていないとき、egui へ 1 フレームも
+    /// 予約しない。ここが `Duration::MAX` 以外に戻ったら、アイドルで
+    /// CPU を焼き始めたということ (設計原則 3 の破れ)。
+    #[test]
+    fn ヘッドレスのアイドルでは再描画が要求されない() {
+        // 1 フレーム目はレイアウト確定で egui 自身が要求しうるので数フレーム回す
+        let delay = drive(idle(), 4);
+        assert_eq!(
+            delay,
+            Duration::MAX,
+            "アイドルなのに {delay:?} 後の再描画が予約されている"
+        );
+    }
+
+    /// 予約が「だいたい要求どおり」であることを見る。
+    ///
+    /// egui 0.29 は `request_repaint_after` で受けた遅延から
+    /// **予測フレーム時間 (`predicted_dt`、既定 1/60 秒) を引く**
+    /// (`context.rs` の `delay.saturating_sub(predicted_frame_time)`。
+    /// 目標を行き過ぎないための調整)。だから要求値ちょうどは返らない。
+    /// ここではその 1 フレームぶんだけを許容し、桁が変わる事故は落とす。
+    fn assert_scheduled(got: Duration, want_ms: u64) {
+        let want = Duration::from_millis(want_ms);
+        let slack = Duration::from_secs_f32(1.0 / 60.0) + Duration::from_millis(1);
+        assert!(got < Duration::MAX, "予約されていない (want {want:?})");
+        assert!(got <= want, "予約が要求より遅い: {got:?} > {want:?}");
+        assert!(
+            got + slack >= want,
+            "予約が要求より早すぎる: {got:?} + {slack:?} < {want:?}"
+        );
+    }
+
+    /// 稼働中 (エージェントが走っている) なら再描画が要る。
+    #[test]
+    fn ヘッドレスで稼働中なら再描画が要求される() {
+        let s = IdleSignals {
+            agents_running: true,
+            ..idle()
+        };
+        assert_scheduled(drive(s, 4), IDLE_AGENT_MS);
+    }
+
+    /// 承認待ち・応答待ちがあるなら、いちばん短い刻みで回る。
+    #[test]
+    fn ヘッドレスで応答待ちなら短い刻みで回る() {
+        let s = IdleSignals {
+            awaiting: true,
+            ..idle()
+        };
+        assert_scheduled(drive(s, 4), IDLE_AWAITING_MS);
+    }
+
+    /// 家事 (外部変更の見張り) だけがあるときは、低頻度で回る。
+    /// = 「全停止なら要らない」の対偶側を固定する。
+    #[test]
+    fn ヘッドレスで家事だけなら低頻度で回る() {
+        let s = IdleSignals {
+            watching_files: true,
+            ..idle()
+        };
+        assert_scheduled(drive(s, 4), IDLE_HOUSEKEEP_MS);
     }
 
     /// 優先順位: 応答待ち > アニメ > エージェント > 家事。
