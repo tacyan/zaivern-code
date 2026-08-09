@@ -329,6 +329,203 @@ pub fn squiggle_points(x0: f32, x1: f32, y: f32, amp: f32, wave: f32, ppp: f32) 
 }
 
 // ---------------------------------------------------------------------------
+// インレイヒント (型・引数名) の行内位置
+// ---------------------------------------------------------------------------
+
+/// 1 行に出すヒントの上限。tsserver は 1 行の関数呼び出しに引数名ヒントを
+/// 十数個返してくるので、行末の 1 行が伸びきる前にここで切る。
+pub const INLAY_MAX_PER_LINE: usize = 8;
+
+/// ヒント 1 件のラベルの最大文字数。長いジェネリック型
+/// (`Vec<HashMap<String, Vec<u8>>>`) をそのまま出すと行末が読めなくなる。
+/// 切り詰めは `lsp::one_line_label` に任せるので **char 単位** = 日本語でも
+/// 文字の途中で切れない。
+pub const INLAY_LABEL_MAX: usize = 32;
+
+/// 行末へ複数並べるときの区切り。
+const INLAY_SEP: &str = " ";
+
+/// 本文の **char** 添字へ写した「行内の挿入位置つきヒント」。
+///
+/// `at` は「本文のこの char の**直前**にヒントが入るべき」位置。実際に本文へ
+/// 差し込むことはしない ([`inlay_line_text`] の説明を参照)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlayView {
+    /// 挿入位置 (本文の char 添字)
+    pub at: usize,
+    /// 0-based の原文行
+    pub line: usize,
+    /// 画面に出す文字列 (padding 反映済み・畳み済み)
+    pub text: String,
+    /// [`lsp::INLAY_KIND_TYPE`] / [`lsp::INLAY_KIND_PARAMETER`] / 0
+    pub kind: u8,
+}
+
+/// LSP のヒント列 → 本文の char 添字つきビュー。
+///
+/// * 位置は必ず [`lsp::lsp_pos_to_char_index`] を通す (新しい変換規則は作らない)。
+///   行末を超える桁は行末へ、行が足りなければ本文末尾へクランプされる。
+/// * 本文の行数を超える行のヒントは**落とす** — クランプすると全部が最終行の
+///   末尾に積み上がり、まったく関係ない行の行末が埋まる。
+/// * `paddingLeft` / `paddingRight` は前後の半角空白として畳み込む。
+/// * ラベルが空 (または空白のみ) の件は落とす。
+/// * 位置順に安定整列し、1 行あたり [`INLAY_MAX_PER_LINE`] 件で切る。
+pub fn inlay_views(text: &str, hints: &[lsp::InlayHint]) -> Vec<InlayView> {
+    if hints.is_empty() {
+        return Vec::new();
+    }
+    let lines = text.split('\n').count(); // 空文字でも 1 行として数える
+    let n = text.chars().count();
+    let mut out: Vec<InlayView> = Vec::new();
+    for h in hints {
+        if h.line >= lines {
+            continue;
+        }
+        let label = lsp::one_line_label(&h.label, INLAY_LABEL_MAX);
+        if label.trim().is_empty() {
+            continue;
+        }
+        let mut s = String::with_capacity(label.len() + 2);
+        if h.padding_left {
+            s.push(' ');
+        }
+        s.push_str(&label);
+        if h.padding_right {
+            s.push(' ');
+        }
+        out.push(InlayView {
+            at: lsp::lsp_pos_to_char_index(text, h.line, h.character).min(n),
+            line: h.line,
+            text: s,
+            kind: h.kind,
+        });
+    }
+    // 位置順。同じ位置に複数来たらサーバーの返した順のまま (安定ソート)
+    out.sort_by_key(|v| (v.line, v.at));
+    // 行あたりの件数で切る (1 行が伸びきらない)
+    let mut kept: Vec<InlayView> = Vec::with_capacity(out.len());
+    let (mut cur_line, mut cnt) = (usize::MAX, 0usize);
+    for v in out {
+        if v.line != cur_line {
+            cur_line = v.line;
+            cnt = 0;
+        }
+        if cnt < INLAY_MAX_PER_LINE {
+            cnt += 1;
+            kept.push(v);
+        }
+    }
+    kept
+}
+
+/// `line` のヒントを **行末へ出す 1 行**にまとめる。`max_chars` に収まらなければ
+/// 末尾を畳み、幅が無ければ `None` (幅が無いのに書かない)。
+///
+/// ## なぜ行末なのか (本文へ混ぜない理由)
+///
+/// egui の `TextEdit` は **本文そのもの**から galley を組み、キャレットも選択も
+/// マウス当たり判定も galley の char 添字で表される。ヒントを本文へ混ぜたり
+/// レイアウタで足したりすると、galley の添字が原文とずれて
+/// **カーソル位置・選択・クリック位置が全部壊れる** (折りたたみ表示で
+/// 「char 添字がずれるので波線を出さない」としているのと同じ理由)。
+///
+/// かといって挿入位置へそのまま重ね描きすると、右隣のコードを覆ってしまう。
+/// そこで **行末のマージンへまとめて出し、挿入位置には細い縦の目印だけを打つ**。
+/// 本文の galley には一切触らないので添字は原文のまま、どのヒントが行の
+/// どこに属すかは目印の x で読める。
+pub fn inlay_line_text(views: &[InlayView], line: usize, max_chars: usize) -> Option<String> {
+    if max_chars == 0 {
+        return None;
+    }
+    let mut joined = String::new();
+    for v in views.iter().filter(|v| v.line == line) {
+        if !joined.is_empty() {
+            joined.push_str(INLAY_SEP);
+        }
+        joined.push_str(v.text.trim_end());
+    }
+    let s = lsp::one_line_label(&joined, max_chars);
+    (!s.is_empty()).then_some(s)
+}
+
+/// `line` のヒントの (挿入位置 = 本文の char 添字, 種別)。
+/// 描画側が縦の目印を打つために使う。件数は [`inlay_views`] で既に切ってある。
+pub fn inlay_marks(views: &[InlayView], line: usize) -> Vec<(usize, u8)> {
+    views
+        .iter()
+        .filter(|v| v.line == line)
+        .map(|v| (v.at, v.kind))
+        .collect()
+}
+
+/// インレイヒントの色。**テーマから取る** (色はどこにもベタ書きしない)。
+/// 型と引数名で少しだけ色を変える (どちらも本文より淡い)。
+pub fn inlay_color(theme: &Theme, kind: u8) -> Color32 {
+    match kind {
+        lsp::INLAY_KIND_PARAMETER => theme.accent,
+        _ => theme.text_dim,
+    }
+}
+
+/// ヒント列の内容ハッシュ。**位置もラベルも混ぜる** — 件数だけを見ると
+/// 「同じ数だけ返ってきたが中身が変わった」応答を取りこぼす。
+fn inlay_hash(hints: &[lsp::InlayHint]) -> u64 {
+    let mut h = hints.len() as u64;
+    for x in hints {
+        h = combine_hash(h, ((x.line as u64) << 20) | x.character as u64);
+        h = combine_hash(h, crate::editor::hash_str(&x.label));
+        h = combine_hash(
+            h,
+            (x.kind as u64) | ((x.padding_left as u64) << 8) | ((x.padding_right as u64) << 9),
+        );
+    }
+    h
+}
+
+/// アクティブバッファのインレイヒントのキャッシュ ([`DiagCache`] と同じ流儀)。
+///
+/// 組み直すのは **ヒントか本文が変わったフレームだけ**。それ以外では
+/// `Vec` を 1 個も確保しない (設計原則 3: アイドル時のコストはゼロ)。
+/// `views` を `Arc` で持つのは、描画側が毎フレーム clone しても
+/// 参照カウントの増減だけで済ませるため。
+pub struct InlayCache {
+    /// (ヒント, 本文) の複合ハッシュ (`u64::MAX` = 未構築の番兵)
+    key: u64,
+    pub views: Arc<Vec<InlayView>>,
+}
+
+impl Default for InlayCache {
+    fn default() -> Self {
+        InlayCache {
+            key: u64::MAX,
+            views: Arc::new(Vec::new()),
+        }
+    }
+}
+
+impl InlayCache {
+    /// ヒント / 本文が変わったときだけ組み直す。戻り値は「作り直したか」。
+    pub fn refresh(&mut self, hints: &[lsp::InlayHint], text: &str, text_hash: u64) -> bool {
+        let key = combine_hash(inlay_hash(hints), text_hash);
+        if key == self.key {
+            return false;
+        }
+        self.views = Arc::new(inlay_views(text, hints));
+        self.key = key;
+        true
+    }
+
+    /// 全部捨てる (機能 OFF / タブに LSP が無い / 応答待ち)。
+    /// 既に空なら**何も確保しない** (毎フレーム通っても無料)。
+    pub fn clear(&mut self) {
+        if self.key != u64::MAX {
+            self.views = Arc::new(Vec::new());
+            self.key = u64::MAX;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 対応括弧
 // ---------------------------------------------------------------------------
 
@@ -384,6 +581,150 @@ pub fn bracket_hl(text: &str, cursor_char: usize) -> Option<BracketHl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// インレイヒントを 1 件作る (位置は LSP 座標 = 0-based 行 / UTF-16 桁)。
+    fn ih(line: usize, character: usize, label: &str, kind: u8) -> lsp::InlayHint {
+        lsp::InlayHint {
+            line,
+            character,
+            label: label.into(),
+            kind,
+            padding_left: false,
+            padding_right: false,
+        }
+    }
+
+    /// **LSP 座標 → 本文の char 添字**。テーブルで固定する。
+    ///
+    /// 変換は `lsp::lsp_pos_to_char_index` 1 本しか通さないので、日本語 /
+    /// 絵文字の行でも「UTF-16 桁」と「char 添字」がずれない。
+    #[test]
+    fn inlay_views_は行内位置をchar添字へ写す() {
+        // 行 1 は日本語 (1 文字 = UTF-16 1)、行 2 は絵文字 (1 文字 = UTF-16 2)
+        let text = "let x = 1;\nlet 名前 = 2;\nlet 🙂 = 3;";
+        // (行, UTF-16 桁, 期待する char 添字, 説明)
+        let table: &[(usize, usize, usize, &str)] = &[
+            (0, 0, 0, "行頭"),
+            (0, 5, 5, "ASCII 行の途中"),
+            (0, 99, 10, "行末を超える桁は行末へクランプ"),
+            (1, 4, 15, "日本語の手前"),
+            (1, 6, 17, "日本語 2 文字ぶん = UTF-16 2"),
+            (2, 4, 27, "絵文字の手前"),
+            (2, 6, 28, "サロゲートペアの後ろ = char は 1 つだけ進む"),
+        ];
+        for (line, ch, want, why) in table {
+            let v = inlay_views(text, &[ih(*line, *ch, ": T", lsp::INLAY_KIND_TYPE)]);
+            assert_eq!(v.len(), 1, "{why}");
+            assert_eq!(v[0].at, *want, "{why}");
+            assert_eq!(v[0].line, *line, "{why}");
+        }
+    }
+
+    /// 落とすもの・畳むもののテーブル。
+    #[test]
+    fn inlay_views_は空ラベルと行外を落としpaddingを畳む() {
+        let text = "a\nb\n"; // 3 行 (最終行は空)
+        let long = "X".repeat(INLAY_LABEL_MAX + 20);
+        let mut pad = ih(0, 1, "name:", lsp::INLAY_KIND_PARAMETER);
+        pad.padding_left = true;
+        pad.padding_right = true;
+        let hints = vec![
+            ih(0, 0, "", lsp::INLAY_KIND_TYPE),       // 空 → 落とす
+            ih(0, 0, "   ", lsp::INLAY_KIND_TYPE),    // 空白のみ → 落とす
+            ih(0, 0, "a\n\tb", lsp::INLAY_KIND_TYPE), // 改行/タブは 1 個の空白へ
+            ih(9, 0, ": far", lsp::INLAY_KIND_TYPE),  // 本文の行数外 → 落とす
+            ih(0, 0, &long, lsp::INLAY_KIND_TYPE),    // 長すぎ → 畳む
+            pad,
+        ];
+        let v = inlay_views(text, &hints);
+        assert_eq!(v.len(), 3, "空 2 件と行外 1 件が落ちる: {v:?}");
+        assert_eq!(v[0].text, "a b");
+        assert_eq!(v[1].text.chars().count(), INLAY_LABEL_MAX);
+        assert_eq!(v[2].text, " name: ", "padding は前後の半角空白になる");
+        assert_eq!(v[2].kind, lsp::INLAY_KIND_PARAMETER);
+    }
+
+    /// 1 行あたりの件数は必ず上限で切る (行末の 1 行が伸びきらない)。
+    /// 並びは位置順で、行をまたいでも取り違えない。
+    #[test]
+    fn inlay_views_は位置順に整列して行ごとに上限で切る() {
+        let text = "aaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbb\n";
+        let mut hints = Vec::new();
+        // 行 0 は上限より多く、わざと逆順に積む
+        for i in (0..INLAY_MAX_PER_LINE + 4).rev() {
+            hints.push(ih(0, i, &format!("t{i}"), lsp::INLAY_KIND_TYPE));
+        }
+        hints.push(ih(1, 3, "z", lsp::INLAY_KIND_PARAMETER));
+        let v = inlay_views(text, &hints);
+        assert_eq!(v.len(), INLAY_MAX_PER_LINE + 1, "行 0 が上限で切れる");
+        // 行 0 は位置順 (0,1,2,...) に整列している
+        for (i, view) in v.iter().take(INLAY_MAX_PER_LINE).enumerate() {
+            assert_eq!(view.line, 0);
+            assert_eq!(view.at, i);
+            assert_eq!(view.text, format!("t{i}"));
+        }
+        // 行 1 の 1 件は上限に巻き込まれない
+        assert_eq!(v[INLAY_MAX_PER_LINE].line, 1);
+        assert_eq!(inlay_marks(&v, 1), vec![(24, lsp::INLAY_KIND_PARAMETER)]);
+        assert_eq!(inlay_marks(&v, 2), Vec::<(usize, u8)>::new());
+        assert!(inlay_views(text, &[]).is_empty());
+    }
+
+    /// 行末に出す 1 行のテーブル: 幅が無ければ出さない・足りなければ畳む。
+    #[test]
+    fn inlay_line_textは可用幅に必ず収まる() {
+        let text = "let a = f(1, 2);\nlet b = 3;\n";
+        let views = inlay_views(
+            text,
+            &[
+                ih(0, 10, "x:", lsp::INLAY_KIND_PARAMETER),
+                ih(0, 13, "y:", lsp::INLAY_KIND_PARAMETER),
+                ih(1, 5, ": i32", lsp::INLAY_KIND_TYPE),
+            ],
+        );
+        // (行, 可用文字数, 期待, 説明)
+        let table: &[(usize, usize, Option<&str>, &str)] = &[
+            (0, 0, None, "幅が無いのに書かない"),
+            (
+                0,
+                32,
+                Some("x: y:"),
+                "同じ行のヒントは区切って 1 行にまとめる",
+            ),
+            (0, 4, Some("x: …"), "収まらなければ末尾を畳む"),
+            (1, 32, Some(": i32"), "1 件なら区切りは入らない"),
+            (2, 32, None, "ヒントの無い行には何も出さない"),
+        ];
+        for (line, max, want, why) in table {
+            let got = inlay_line_text(&views, *line, *max);
+            assert_eq!(got.as_deref(), *want, "{why}");
+            // どの幅でも見切れない = 必ず可用文字数以内
+            if let Some(s) = got {
+                assert!(s.chars().count() <= *max, "{why}: {s:?} が幅を超えた");
+            }
+        }
+    }
+
+    /// キャッシュは (ヒント, 本文) が変わったフレームだけ組み直す
+    /// (アイドル時のコストはゼロ = 設計原則 3)。
+    #[test]
+    fn inlay_cacheは変わらないフレームで組み直さない() {
+        let text = "let a = 1;\n";
+        let hints = vec![ih(0, 5, ": i32", lsp::INLAY_KIND_TYPE)];
+        let mut c = InlayCache::default();
+        assert!(c.refresh(&hints, text, 1), "初回は必ず組む");
+        assert_eq!(c.views.len(), 1);
+        assert!(!c.refresh(&hints, text, 1), "同じなら組み直さない");
+        assert!(c.refresh(&hints, text, 2), "本文が変われば組み直す");
+        // 件数が同じでも中身が変われば組み直す (len だけ見ていると取りこぼす)
+        let moved = vec![ih(0, 9, ": i32", lsp::INLAY_KIND_TYPE)];
+        assert!(c.refresh(&moved, text, 2), "位置が変われば組み直す");
+        let renamed = vec![ih(0, 9, ": u8", lsp::INLAY_KIND_TYPE)];
+        assert!(c.refresh(&renamed, text, 2), "ラベルが変われば組み直す");
+        c.clear();
+        assert!(c.views.is_empty());
+        assert!(c.refresh(&renamed, text, 2), "clear の後は組み直す");
+    }
 
     /// 診断の範囲を **byte** スパンへ写す (`&text[a..b]` が成立する)。
     ///

@@ -3523,6 +3523,9 @@ pub struct ZaivernApp {
     /// アクティブバッファの診断キャッシュ (行→最悪 severity + **範囲付きの診断**)。
     /// 行だけでなく範囲を持つので、ガターの印と本文の波線が同じ源から出る。
     diag_cache: diagview::DiagCache,
+    /// アクティブバッファのインレイヒント (本文の char 添字へ写し済み)。
+    /// 組み直すのは中身が変わったフレームだけ (設計原則 3)。
+    inlay_cache: diagview::InlayCache,
     /// 対応括弧の強調キャッシュ: (本文ハッシュ, キャレット char, 塗る位置)。
     /// 位置は (char 添字, 相手がいるか)。キャレットが動かない限り本文を走査しない。
     bracket_hl: Option<(u64, usize, Vec<(usize, bool)>)>,
@@ -4102,6 +4105,7 @@ impl ZaivernApp {
             diag_counts: (0, 0),
             // 初期キーは番兵 (u64::MAX): 最初の refresh で必ず作り直す
             diag_cache: diagview::DiagCache::default(),
+            inlay_cache: diagview::InlayCache::default(),
             bracket_hl: None,
             diag_hover: None,
             plugin_panels: HashMap::new(),
@@ -5516,6 +5520,38 @@ impl ZaivernApp {
             .map(|i| self.editor.buffers[i].text.as_str())
             .unwrap_or("");
         self.diag_cache.refresh(diags, text, text_hash);
+    }
+
+    /// アクティブバッファのインレイヒントを要求し、`self.inlay_cache` へ写す。
+    ///
+    /// * 要求は **版が変わって、まだ同じ版の要求が飛んでいないとき**だけ 1 回。
+    ///   毎フレームは撃たない (設計原則 3)。
+    /// * 応答は受信スレッドが LSP 側のキャッシュへ入れて再描画を起こすので、
+    ///   ここは覗くだけ。**UI スレッドは一切待たない**。
+    /// * 応答待ちの間は前の版のヒントを消す — 打鍵でずれた型注釈を出し続けない。
+    fn refresh_inlay_hints(&mut self, text_hash: u64) {
+        if !self.cfg.inlay_hints {
+            self.inlay_cache.clear();
+            return;
+        }
+        let (Some((key, path)), Some(i)) = (self.active_lsp_target(), self.editor.active) else {
+            self.inlay_cache.clear();
+            return;
+        };
+        let Some(client) = self.lsp.get(&key) else {
+            self.inlay_cache.clear();
+            return;
+        };
+        let Some(hints) = client.inlay_hints(&path) else {
+            if !client.inlay_in_flight(&path) {
+                client.request_inlay_hints(&path, &self.editor.buffers[i].text);
+            }
+            self.inlay_cache.clear();
+            return;
+        };
+        // 借用は分離したフィールド同士 (inlay_cache / editor) なので複製は要らない
+        self.inlay_cache
+            .refresh(&hints, &self.editor.buffers[i].text, text_hash);
     }
 
     /// 次 / 前の診断へ飛ぶ (VS Code の F8 / ⇧F8)。端では巻き戻る。
@@ -11006,6 +11042,7 @@ impl ZaivernApp {
             | Cmd::NextProblem
             | Cmd::PrevProblem
             | Cmd::ToggleInlineDiagnostics
+            | Cmd::ToggleInlayHints
             | Cmd::ToggleFullScreen
             | Cmd::NavBack
             | Cmd::NavForward
@@ -11430,6 +11467,25 @@ impl ZaivernApp {
                     tr("行末の診断メッセージ: OFF")
                 };
                 self.toast(msg, true);
+            }
+            Cmd::ToggleInlayHints => {
+                self.cfg.inlay_hints = !self.cfg.inlay_hints;
+                let on = self.cfg.inlay_hints;
+                if !on {
+                    // 消したフレームで組み直しの材料も捨てる (残骸を出さない)
+                    self.inlay_cache.clear();
+                }
+                // 永続化しないのは隣の `ToggleInlineDiagnostics` と同じ判断:
+                // パレットの切替は「いまのセッションで一時的に消す/出す」ため。
+                // 恒久的に変えるときは設定画面 (editor グループ) から。
+                self.toast(
+                    tr(if on {
+                        "インレイヒント: ON"
+                    } else {
+                        "インレイヒント: OFF"
+                    }),
+                    true,
+                );
             }
             Cmd::ToggleFullScreen => {
                 // 救出 (壊れた全画面から脱出) 中・枠復元の予約中は何も送らない。
@@ -21654,6 +21710,7 @@ impl ZaivernApp {
             self.ensure_lsp(&ctx, &p, &lang_clone, active);
         }
         self.refresh_active_diagnostics(text_hash);
+        self.refresh_inlay_hints(text_hash);
         self.diag_counts = (self.diag_cache.errors, self.diag_cache.warnings);
         // diag_cache の借用は、可変借用が要る第 2 次配線の準備が済んでから取る
         // (この束縛を上げると self を可変に触れなくなる)。
@@ -22191,6 +22248,18 @@ impl ZaivernApp {
         ];
         // 行末の診断メッセージ (Error Lens 相当)。既定オン・カーソル行だけ。
         let inline_diag_on = self.cfg.inline_diagnostics && !folding;
+        // インレイヒント (型・引数名)。既定オフ・可視行すべて。
+        // 折りたたみ中は char 添字がずれるので出さない (波線と同じ判断)。
+        let inlay_views = if self.cfg.inlay_hints && !folding {
+            std::sync::Arc::clone(&self.inlay_cache.views)
+        } else {
+            std::sync::Arc::new(Vec::new())
+        };
+        // 種別 → 色 (0/1 = 型ほか, 2 = 引数名)。テーマ経由でしか取らない。
+        let inlay_colors: [Color32; 2] = [
+            diagview::inlay_color(&self.theme, lsp::INLAY_KIND_TYPE),
+            diagview::inlay_color(&self.theme, lsp::INLAY_KIND_PARAMETER),
+        ];
         // 波線を引く範囲と、行末メッセージに使う診断そのもの。
         // 折りたたみ中は char 添字がずれるので波線は出さない (ガターの印は残る)。
         let empty_spans: Vec<diagview::DiagSpan> = Vec::new();
@@ -22514,6 +22583,11 @@ impl ZaivernApp {
                     }
                 }
 
+                // 表示行 → 「インレイヒントを描き終えた x」。行末の診断メッセージが
+                // 同じ行に出るとき、そこから書き始めて重なりを避けるために使う。
+                // ヒントが 1 件も無ければ確保しない (空の HashMap は割り当てゼロ)。
+                let mut inlay_row_end: HashMap<usize, f32> = HashMap::new();
+
                 // 診断の波線。深刻度の低い順に並んでいるので、重なった場所は
                 // 後に塗る error が上に残る。可視域の外は座標だけ作って捨てる
                 // のも惜しいので、行ごとに clip_rect で先に落とす。
@@ -22566,6 +22640,80 @@ impl ZaivernApp {
                                 ui.painter()
                                     .add(egui::Shape::line(pts, egui::Stroke::new(1.0_f32, color)));
                             }
+                        }
+                    }
+                }
+
+                // ── インレイヒント (型・引数名) ───────────────────────
+                //
+                // **本文の galley には一切触らない。** ヒントを本文へ混ぜたり
+                // レイアウタで足したりすると galley の char 添字が原文とずれ、
+                // キャレット・選択・クリック位置が全部壊れる。かといって挿入
+                // 位置へ重ね描きすると右隣のコードを覆う。そこで
+                // **行末のマージンへまとめて出し、挿入位置には短い縦の目印**
+                // だけを打つ (どのヒントが行のどこに属すかは目印の x で読める)。
+                // 判断そのものは diagview::inlay_line_text 側に書いてある。
+                if !inlay_views.is_empty() && char_w > 0.0 {
+                    let clip = ui.clip_rect();
+                    let last_row = output.galley.rows.len().saturating_sub(1);
+                    let mut done_line = usize::MAX;
+                    for v in inlay_views.iter() {
+                        if v.line == done_line {
+                            continue; // 行あたり 1 回 (行末へまとめて出すため)
+                        }
+                        done_line = v.line;
+                        let anchor = output.galley.from_ccursor(egui::text::CCursor::new(v.at));
+                        let row = anchor.rcursor.row.min(last_row);
+                        let Some(r) = output.galley.rows.get(row) else {
+                            continue;
+                        };
+                        let y = output.galley_pos.y + r.rect.center().y;
+                        if y < clip.top() - row_h || y > clip.bottom() + row_h {
+                            continue; // 画面外の行は組み立てすらしない
+                        }
+                        // 行末 + 2 桁ぶんから書き始め、残り幅に収まる文字数で畳む
+                        let x = output.galley_pos.x + r.rect.max.x + char_w * 2.0;
+                        let max_chars = (((clip.right() - x) / char_w).floor()).max(0.0) as usize;
+                        let Some(text) = diagview::inlay_line_text(&inlay_views, v.line, max_chars)
+                        else {
+                            continue;
+                        };
+                        // 行末にまとめた 1 行の色は先頭のヒントの種別で決める
+                        // (1 行の中で色を混ぜると、まとまりが読み取れなくなる)。
+                        let color = inlay_colors[(v.kind == lsp::INLAY_KIND_PARAMETER) as usize];
+                        let painted = ui.painter().text(
+                            egui::pos2(
+                                crate::theme::snap_len(x, ppp),
+                                crate::theme::snap_len(y, ppp),
+                            ),
+                            Align2::LEFT_CENTER,
+                            text,
+                            font.clone(),
+                            color.gamma_multiply(0.75),
+                        );
+                        // 同じ行に行末診断も出るときは、その先へ押し出す
+                        // (2 つの文章が重なって読めなくなるのを防ぐ)
+                        inlay_row_end.insert(row, painted.max.x + char_w * 2.0);
+                        // 挿入位置の目印: 行の下端に短い縦線。キャレットと
+                        // 見間違えないよう行高の 1/4 だけにする。
+                        for (at, kind) in diagview::inlay_marks(&inlay_views, v.line) {
+                            let c = output.galley.from_ccursor(egui::text::CCursor::new(at));
+                            if c.rcursor.row.min(last_row) != row {
+                                continue;
+                            }
+                            // 目印だけは 1 件ずつの種別で塗る (型と引数名を見分ける)
+                            let mc = inlay_colors[(kind == lsp::INLAY_KIND_PARAMETER) as usize];
+                            let q = output.galley.pos_from_cursor(&c);
+                            let mx = crate::theme::snap_len(output.galley_pos.x + q.min.x, ppp);
+                            if mx < clip.left() || mx > clip.right() {
+                                continue;
+                            }
+                            let bottom = output.galley_pos.y + r.rect.max.y;
+                            ui.painter().vline(
+                                mx,
+                                egui::Rangef::new(bottom - r.rect.height() * 0.25, bottom),
+                                egui::Stroke::new(1.0_f32, mc.gamma_multiply(0.55)),
+                            );
                         }
                     }
                 }
@@ -22646,7 +22794,11 @@ impl ZaivernApp {
                             .row;
                         if let Some(r) = output.galley.rows.get(row) {
                             let clip = ui.clip_rect();
-                            let x = output.galley_pos.x + r.rect.max.x + char_w * 2.0;
+                            // インレイヒントが同じ行に出ているならその先から書く
+                            let x = inlay_row_end
+                                .get(&row)
+                                .copied()
+                                .unwrap_or(output.galley_pos.x + r.rect.max.x + char_w * 2.0);
                             // 残り幅に収まる文字数までしか出さない (行が見切れない)
                             let max_chars =
                                 (((clip.right() - x) / char_w).floor()).max(0.0) as usize;
@@ -23925,6 +24077,12 @@ impl ZaivernApp {
                 tr("行末の診断メッセージ切替"),
                 String::new(),
                 Cmd::ToggleInlineDiagnostics,
+            ),
+            (
+                "🏷".into(),
+                tr("インラインヒントの表示切替"),
+                String::new(),
+                Cmd::ToggleInlayHints,
             ),
             // ── 第 2 次配線: レビュー / 折りたたみ / ブックマーク / 表 / LSP ──
             (
@@ -37747,6 +37905,75 @@ mod wave2_tests {
         assert!(
             broken.is_empty(),
             "パレットに出るのに効かないコマンドがある: {broken:?}"
+        );
+    }
+
+    /// **インレイヒントが画面に繋がっていて、到達経路がある。**
+    ///
+    /// 「LSP からヒントは届いているのに画面に出ない」「実装したがどこからも
+    /// 切り替えられない」を潰すための番人。描画・到達経路・本文の不可侵を見る。
+    /// ソースを読むテストなので改行は正規化する (Windows は CRLF)。
+    #[test]
+    fn インレイヒントが画面に繋がっている() {
+        let src = &include_str!("app.rs").replace("\r\n", "\n");
+        let (_, body) = src
+            .split_once("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .expect("code_editor_ui がある");
+        let (body, _) = body
+            .split_once("\n    // ─── UI: palette ")
+            .expect("code_editor_ui の終わり");
+
+        // ① 本文描画の中で、純関数の結果を実際に塗っている
+        for draw in [
+            "diagview::inlay_line_text(",
+            "diagview::inlay_marks(",
+            "inlay_colors[(v.kind == lsp::INLAY_KIND_PARAMETER) as usize]",
+        ] {
+            assert!(
+                body.contains(draw),
+                "{draw} が本文描画に無い (画面に出ない)"
+            );
+        }
+        // ② 色はテーマ経由 (ベタ書き禁止)
+        assert!(
+            body.contains("diagview::inlay_color(&self.theme,"),
+            "インレイヒントの色をテーマから取っていない"
+        );
+        // ③ **本文 (galley) にヒントを混ぜていない。** 混ぜるとキャレット・選択・
+        //    クリック位置が壊れる。差し込む形の操作が本文描画に無いことを見る。
+        //    禁止パターンは分割して組み立てる (このテスト自身の文字列に当たらない)。
+        for forbidden in [
+            format!("text.{}(v.at", "insert_str"),
+            format!("target.set(with_{}", "inlay"),
+            format!("{}_apply_to_text(", "inlay"),
+        ] {
+            assert!(
+                !src.contains(&forbidden),
+                "{forbidden}: 本文へヒントを混ぜている (galley の char 添字が壊れる)"
+            );
+        }
+        // ④ 行末の診断と重ならないよう押し出している
+        assert!(
+            body.contains("inlay_row_end"),
+            "行末の診断メッセージと重なりを避けていない"
+        );
+        // ⑤ 到達経路: パレット / 設定 / 要求
+        for route in [
+            "Cmd::ToggleInlayHints",
+            "self.cfg.inlay_hints",
+            "self.refresh_inlay_hints(text_hash);",
+            "client.request_inlay_hints(",
+        ] {
+            assert!(src.contains(route), "{route} の到達経路が無い");
+        }
+        // ⑥ 要求は「飛行中でないとき」だけ (毎フレーム撃たない = 設計原則 3)
+        let refresh = src
+            .split("fn refresh_inlay_hints(&mut self, text_hash: u64) {")
+            .nth(1)
+            .expect("refresh_inlay_hints がある");
+        assert!(
+            refresh.contains("if !client.inlay_in_flight(&path)"),
+            "同じ版の要求を毎フレーム撃ってしまう"
         );
     }
 

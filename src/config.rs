@@ -103,6 +103,15 @@ pub struct Config {
     /// オフにしても波線とホバーは残る (消えるのは行末の文字だけ)。
     pub inline_diagnostics: bool,
 
+    /// LSP のインレイヒント (推論された型・引数名) を本文の行末に淡色で出すか。
+    ///
+    /// **既定はオフ**。理由は 2 つ:
+    /// 1. 出るのは行末なので、ONにすると本文の右側が型名で埋まる。ミニマップと
+    ///    同じ判断で「欲しい人だけが払う」。
+    /// 2. 本文を打つたびにサーバーへ往復が 1 つ増える (キャッシュは版ごと)。
+    ///    使わない人にその代金を払わせない (設計原則 3)。
+    pub inlay_hints: bool,
+
     /// エディタ右端のミニマップ (VS Code の遠景ビュー相当)。
     /// **既定はオフ** — 本文の横幅を 64px 奪うので、欲しい人だけが払う。
     /// 幅が足りない画面では設定が ON でも自動的に隠れる。
@@ -775,6 +784,7 @@ impl Default for Config {
             show_whitespace: false,
             lsp_highlight_occurrences: true,
             inline_diagnostics: true,
+            inlay_hints: false,
             minimap: false,
             undo_merge_ms: crate::editor::UNDO_MERGE_MS,
             undo_max_steps: crate::editor::UNDO_MAX_STEPS,
@@ -1196,6 +1206,11 @@ show_hidden_files = true
 # 出るのは**キャレット行だけ**です。オフにしても波線とホバーは残ります
 # (コマンドパレットの「行末の診断メッセージ切替」でも変更できます)
 # inline_diagnostics = true
+
+# LSP のインレイヒント (推論された型・引数名) を本文の行末に淡色で出す
+# 既定はオフです (行末が型名で埋まるのと、打鍵ごとにサーバーへの往復が増えるため)
+# (コマンドパレットの「インラインヒントの表示切替」でも変更できます)
+# inlay_hints = false
 # 取り消し (Undo) 履歴の粒度とメモリ上限。タブ 1 枚あたりの値です。
 #   undo_merge_ms  = 続けて打った文字を 1 段にまとめる時間しきい値 (ミリ秒)。
 #                    これを超えて間が空くと別の段になります。0 にすると 1 打鍵 = 1 段。
@@ -2386,6 +2401,12 @@ pub fn setting_defs() -> &'static [SettingDef] {
             kind: Bool,
         },
         SettingDef {
+            key: "inlay_hints",
+            group: G_EDITOR,
+            label: "インレイヒント (型・引数名) を出す",
+            kind: Bool,
+        },
+        SettingDef {
             key: "lsp_highlight_occurrences",
             group: G_EDITOR,
             label: "同一シンボルをハイライトする",
@@ -2659,6 +2680,7 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
         "breadcrumbs" => B(cfg.breadcrumbs),
         "bracket_colorization" => B(cfg.bracket_colorization),
         "inline_diagnostics" => B(cfg.inline_diagnostics),
+        "inlay_hints" => B(cfg.inlay_hints),
         "lsp_highlight_occurrences" => B(cfg.lsp_highlight_occurrences),
         "git_blame" => B(cfg.git_blame),
         "detect_indentation" => B(cfg.detect_indentation),
@@ -2820,6 +2842,7 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
         }
         "bracket_colorization" => b!(cfg.bracket_colorization),
         "inline_diagnostics" => b!(cfg.inline_diagnostics),
+        "inlay_hints" => b!(cfg.inlay_hints),
         "lsp_highlight_occurrences" => b!(cfg.lsp_highlight_occurrences),
         "detect_indentation" => b!(cfg.detect_indentation),
         "tab_size" => i!(cfg.tab_size, usize),
