@@ -2149,6 +2149,15 @@ impl Session {
         lock_ok(&self.shell).tier()
     }
 
+    /// メニュー見出し用のまとめ: (段, 記録件数, 段の変化ログ)。
+    ///
+    /// 段の変化を出せるようにしておくのは「黙って劣化しない」ための約束
+    /// (CLAUDE.md 設計原則 4)。ロックは 1 回で済ませる。
+    pub fn shell_status(&self) -> (crate::shellint::Tier, usize, Option<String>) {
+        let t = lock_ok(&self.shell);
+        (t.tier(), t.recorded(), t.tier_log_text())
+    }
+
     /// **状態ラダーへの供給** — シェルが直接教えてきた判定。
     ///
     /// 画面を 1 文字も読んでいないので、`error` の 3 文字が並んでいるだけで
@@ -4854,6 +4863,44 @@ mod tests {
             }
         }
         panic!("プロンプト {needle:?} が画面に出なかった");
+    }
+
+    /// **配線の証明**: 実 PTY から届いた OSC 633 が [`Session`] のトラッカーへ入る。
+    ///
+    /// 見るのは「シェルが言った終了コード」だけで、画面は 1 文字も読まない。
+    /// 逆に**画面には終了コードがどこにも書かれていない**ことも確かめる —
+    /// これが「画面からは原理的に取れない情報を取っている」という主張の中身。
+    #[cfg(unix)]
+    #[test]
+    fn シェル統合のマーカーが実ptyからトラッカーへ届く() {
+        use std::time::Duration;
+        // 長い sleep は書かない (プロセス残留の温床)。1 度出して終わるだけ。
+        let cmd = r#"printf '\033]633;A\007\033]633;B\007\033]633;E;cargo test;n1\007\033]633;C\007out\r\n\033]633;D;3\007'"#;
+        let s = spawn_prompt_session(983, cmd);
+        let mut got = None;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Some(c) = s.shell_recent(1).into_iter().next() {
+                got = Some(c);
+                break;
+            }
+        }
+        let c = got.expect("D まで届かなかった (読取スレッドの配線が切れている)");
+        assert_eq!(
+            c.command_line, "cargo test",
+            "コマンド行はシェルが直接教える"
+        );
+        assert_eq!(c.exit_code, Some(3));
+        let (tier, n, log) = s.shell_status();
+        assert_eq!(tier, crate::shellint::Tier::Rich);
+        assert_eq!(n, 1);
+        assert!(log.is_some(), "段の変化が記録されていない");
+        let screen = super::lock_ok(&s.parser).screen().contents();
+        assert!(
+            !screen.contains('3') || !screen.contains("code"),
+            "画面に終了コードが書かれているなら前提が崩れる: {screen:?}"
+        );
+        super::reap(s);
     }
 
     #[cfg(unix)]
@@ -7594,19 +7641,27 @@ const SHELL_MENU_ROWS: usize = 8;
 /// 情報ではなく雑音になる。
 fn shell_integration_menu(ui: &mut egui::Ui, session: &mut Session, theme: &Theme) {
     use crate::shellint::Tier;
-    let tier = session.shell_tier();
+    let (tier, recorded, tier_log) = session.shell_status();
     if tier == Tier::None {
         return;
     }
     ui.separator();
-    ui.label(
+    let head = ui.label(
         egui::RichText::new(trf(
-            "{mark} シェル統合: {tier}",
-            &[("mark", tier.mark().to_string()), ("tier", tr(tier.label()))],
+            "{mark} シェル統合: {tier} ({n} 件)",
+            &[
+                ("mark", tier.mark().to_string()),
+                ("tier", tr(tier.label())),
+                ("n", recorded.to_string()),
+            ],
         ))
         .small()
         .color(theme.text_dim),
     );
+    // 「どうやってこの段になったか」はホバーで出す (常時出すと行が増えるだけ)。
+    if let Some(log) = tier_log {
+        head.on_hover_text(log);
+    }
     if let Some(cmd) = session.shell_running_command() {
         let cmd = if cmd.is_empty() {
             tr("(コマンド行は不明)")
@@ -7650,7 +7705,9 @@ fn shell_integration_menu(ui: &mut egui::Ui, session: &mut Session, theme: &Them
         );
         let btn = egui::Button::new(egui::RichText::new(label).color(color)).frame(false);
         // コマンド行を知らない段では押しても入れるものが無いので押させない。
-        let r = ui.add_enabled(!c.command_line.is_empty(), btn).on_hover_text(hover);
+        let r = ui
+            .add_enabled(!c.command_line.is_empty(), btn)
+            .on_hover_text(hover);
         if r.clicked() {
             insert = Some(c.command_line.clone());
         }
@@ -7890,7 +7947,10 @@ pub fn draw(
                 ),
                 _ => trf(
                     "{mark} shell {tier}",
-                    &[("mark", tier.mark().to_string()), ("tier", tr(tier.label()))],
+                    &[
+                        ("mark", tier.mark().to_string()),
+                        ("tier", tr(tier.label())),
+                    ],
                 ),
             };
             painter.text(

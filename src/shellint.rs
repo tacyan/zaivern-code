@@ -236,11 +236,7 @@ fn truncate_chars(s: &mut String, max: usize) {
     if s.chars().count() <= max {
         return;
     }
-    let cut = s
-        .char_indices()
-        .nth(max)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
+    let cut = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
     s.truncate(cut);
     s.push('…');
 }
@@ -320,7 +316,10 @@ impl Command {
         };
         match self.exit_code {
             Some(0) => trf("✓ {cmd}", &[("cmd", head)]),
-            Some(c) => trf("✕ {cmd} (code {code})", &[("cmd", head), ("code", c.to_string())]),
+            Some(c) => trf(
+                "✕ {cmd} (code {code})",
+                &[("cmd", head), ("code", c.to_string())],
+            ),
             None => trf("· {cmd}", &[("cmd", head)]),
         }
     }
@@ -509,14 +508,11 @@ impl Tracker {
         self.tier
     }
 
-    /// 段の変化ログ (古い順)。UI に出して「黙って劣化していない」ことを示す。
-    pub fn tier_log(&self) -> impl Iterator<Item = &str> {
-        self.tier_log.iter().map(String::as_str)
-    }
-
-    /// 上限超えで捨てた件数。
-    pub fn dropped(&self) -> u64 {
-        self.dropped
+    /// 段の変化ログを 1 つの文字列に畳む (何も変わっていなければ `None`)。
+    /// ツールチップ 1 枚で「どうやってこの段になったか」を出すための形。
+    pub fn tier_log_text(&self) -> Option<String> {
+        (!self.tier_log.is_empty())
+            .then(|| self.tier_log.iter().cloned().collect::<Vec<_>>().join("\n"))
     }
 
     /// **ギャップ標識** — 古い記録を捨てたことを明示する 1 行。
@@ -540,13 +536,9 @@ impl Tracker {
         self.ring.iter().rev().take(n).collect()
     }
 
-    /// 記録件数。
-    pub fn len(&self) -> usize {
+    /// 記録できているコマンド件数 (捨てたぶんは含まない)。
+    pub fn recorded(&self) -> usize {
         self.ring.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.ring.is_empty()
     }
 
     /// いま実行中のコマンド行 (実行中でなければ `None`)。
@@ -595,15 +587,6 @@ impl Tracker {
     /// 実時刻での [`Tracker::read`]。
     pub fn read_now(&self) -> Option<ProtoRead> {
         self.read(self.now_ms(), SHELL_STALE_MS)
-    }
-
-    /// 直近のコマンドが**終了コードで**成功と言い切れるか。
-    ///
-    /// `Some(true)` が返るなら、画面に `error` の 3 文字が並んでいても
-    /// それは失敗ではない (CLAUDE.md の傷への直接の答え)。
-    /// 判断材料が無ければ `None` — 「たぶん成功」を作らない。
-    pub fn last_exit_ok(&self) -> Option<bool> {
-        self.ring.back()?.ok()
     }
 }
 
@@ -860,7 +843,8 @@ pub fn nonce() -> &'static str {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        format!("{:x}{:x}", ns, std::process::id())
+        let pid = std::process::id();
+        format!("{ns:x}{pid:x}")
     })
 }
 
@@ -869,6 +853,9 @@ pub fn launch_plan(shell: &str, has_command: bool) -> Option<LaunchPlan> {
     if !enabled() || has_command {
         return None;
     }
+    // 対応していないシェル (cmd.exe 等) はディスクに触れる前に帰る。
+    // シムの書き出しは `~/.zaivern` への write なので、無駄撃ちしない。
+    ShellKind::from_program(shell).shim_name()?;
     let dir = install_dir();
     // 有効化時に書いているが、`~/.zaivern` を消された後でも復活できるようにする。
     if !dir.join("zaivern.bash").exists() {
@@ -1405,15 +1392,17 @@ mod tests {
                 "{cols} 桁でコマンド行が変わってはいけない"
             );
             // 同じバイト列をグリッドへ流すと、狭い幅では実際に折り返る。
+            // 比べる相手は `rows()` (画面 1 行ずつ = 描画とマッチャが見る形)。
+            // `contents()` は折り返しを繋ぎ直して返すので、ここでは使えない。
             let mut p = vt100::Parser::new(10, cols, 100);
             p.process(bytes.as_bytes());
-            let screen = p.screen().contents();
-            if cols < 60 {
-                assert!(
-                    !screen.lines().any(|l| l == cmd),
-                    "{cols} 桁ならグリッド側は折り返しているはず (前提の確認)"
-                );
-            }
+            let rows: Vec<String> = p.screen().rows(0, cols).collect();
+            let intact = rows.iter().any(|l| l.trim_end() == cmd);
+            assert_eq!(
+                intact,
+                cols >= 60,
+                "{cols} 桁: グリッドの 1 行にコマンドが丸ごと残るか (前提の確認)"
+            );
         }
     }
 
@@ -1439,7 +1428,7 @@ mod tests {
         assert_eq!(t.tier(), Tier::None);
         run(&mut t, "cargo test", 0, 1000);
         assert_eq!(t.tier(), Tier::Rich);
-        assert_eq!(t.len(), 1);
+        assert_eq!(t.recorded(), 1);
         let c = t.recent(1)[0];
         assert_eq!(c.command_line, "cargo test");
         assert_eq!(c.exit_code, Some(0));
@@ -1455,7 +1444,7 @@ mod tests {
         t.feed_at(Marker::PreExec, 2);
         t.feed_at(Marker::Finished(Some(2)), 3);
         assert_eq!(t.tier(), Tier::Basic, "コマンド行が来ないので完全ではない");
-        assert_eq!(t.len(), 1);
+        assert_eq!(t.recorded(), 1);
         assert_eq!(t.recent(1)[0].command_line, "", "無いものを捏造しない");
         assert_eq!(t.recent(1)[0].exit_code, Some(2));
     }
@@ -1463,7 +1452,7 @@ mod tests {
     #[test]
     fn 段の変化は記録される() {
         let mut t = Tracker::new();
-        assert_eq!(t.tier_log().count(), 0, "最初は空 = UI に空欄を作らない");
+        assert_eq!(t.tier_log_text(), None, "最初は空 = UI に空欄を作らない");
         t.feed_at(Marker::PromptStart, 5);
         t.feed_at(
             Marker::CommandLine {
@@ -1472,10 +1461,11 @@ mod tests {
             },
             9,
         );
-        let log: Vec<&str> = t.tier_log().collect();
-        assert_eq!(log.len(), 2, "無効→基本→完全");
-        assert!(log[0].contains("基本"));
-        assert!(log[1].contains("完全"));
+        let log = t.tier_log_text().expect("2 段ぶんの変化が記録されている");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "無効→基本→完全: {log}");
+        assert!(lines[0].contains("基本"), "{log}");
+        assert!(lines[1].contains("完全"), "{log}");
     }
 
     #[test]
@@ -1497,7 +1487,7 @@ mod tests {
         t.feed_at(Marker::PromptStart, 0);
         t.feed_at(Marker::PromptEnd, 1);
         t.feed_at(Marker::Finished(Some(0)), 2);
-        assert!(t.is_empty(), "何も実行していない改行で履歴を埋めない");
+        assert_eq!(t.recorded(), 0, "何も実行していない改行で履歴を埋めない");
     }
 
     #[test]
@@ -1513,7 +1503,7 @@ mod tests {
         );
         t.feed_at(Marker::PreExec, 2);
         t.feed_at(Marker::PromptStart, 50);
-        assert_eq!(t.len(), 1);
+        assert_eq!(t.recorded(), 1);
         assert_eq!(t.recent(1)[0].exit_code, None, "不明を 0 と偽らない");
     }
 
@@ -1524,10 +1514,9 @@ mod tests {
         for i in 0..(MAX_COMMANDS + 5) {
             run(&mut t, &format!("cmd{i}"), 0, i as u64 * 100);
         }
-        assert_eq!(t.len(), MAX_COMMANDS);
-        assert_eq!(t.dropped(), 5);
+        assert_eq!(t.recorded(), MAX_COMMANDS);
         let note = t.gap_note().expect("捨てたなら必ず出す");
-        assert!(note.contains('5'), "{note}");
+        assert!(note.contains('5'), "捨てた 5 件が標識に出ていない: {note}");
         assert_eq!(
             t.recent(1)[0].command_line,
             format!("cmd{}", MAX_COMMANDS + 4),
@@ -1573,7 +1562,10 @@ mod tests {
         // 次のコマンドが始まったら「いまの状態」ではなくなる
         t.feed_at(Marker::PromptEnd, 30);
         t.feed_at(Marker::PreExec, 31);
-        assert_eq!(t.read(32, SHELL_STALE_MS).unwrap().state, ProtoState::Running);
+        assert_eq!(
+            t.read(32, SHELL_STALE_MS).unwrap().state,
+            ProtoState::Running
+        );
     }
 
     #[test]
@@ -1582,7 +1574,7 @@ mod tests {
         // 終了コード 0 は**事実**なので、文字列一致の誤判定をここで否定できる。
         let mut t = Tracker::new();
         run(&mut t, "rg error_handling", 0, 0);
-        assert_eq!(t.last_exit_ok(), Some(true));
+        assert_eq!(t.recent(1)[0].ok(), Some(true));
         assert_eq!(t.read(5, SHELL_STALE_MS).unwrap().state, ProtoState::Idle);
     }
 
@@ -1601,7 +1593,12 @@ mod tests {
     fn マーカーが無ければ何も言わない() {
         let t = Tracker::new();
         assert!(t.read(0, SHELL_STALE_MS).is_none());
-        assert_eq!(t.last_exit_ok(), None);
+        assert_eq!(t.recorded(), 0);
+        assert_eq!(
+            t.tier_log_text(),
+            None,
+            "変化が無いなら UI に空行を作らない"
+        );
     }
 
     // ── シェル判定と起動計画 ─────────────────────────────────────
@@ -1630,8 +1627,14 @@ mod tests {
         let bash = launch_plan_for("/bin/bash", &dir, "n").expect("bash");
         assert_eq!(bash.args[0], "--init-file");
         assert_eq!(bash.args[1], dir.join("zaivern.bash").display().to_string());
-        assert!(bash.args.contains(&"-i".to_string()), "対話でないと読まれない");
-        assert!(!bash.args.contains(&"-l".to_string()), "-l と --init-file は両立しない");
+        assert!(
+            bash.args.contains(&"-i".to_string()),
+            "対話でないと読まれない"
+        );
+        assert!(
+            !bash.args.contains(&"-l".to_string()),
+            "-l と --init-file は両立しない"
+        );
 
         let zsh = launch_plan_for("/bin/zsh", &dir, "n").expect("zsh");
         let zdot = zsh
@@ -1696,7 +1699,7 @@ mod tests {
         let osc = dir.join("osc.sh");
         std::fs::write(&osc, "printf '\\033]133;A\\007'\n").expect("write");
 
-        let none = |_: &str| None;
+        let none = |_: &str| -> Option<String> { None };
         assert!(!already_integrated(&none, &[plain.clone()]));
         assert!(already_integrated(&none, &[osc.clone()]));
         let iterm = |k: &str| (k == "ITERM_SHELL_INTEGRATION_INSTALLED").then(|| "Yes".to_string());
@@ -1733,8 +1736,23 @@ mod tests {
     #[test]
     fn 有効化しない限り起動計画は出ない() {
         // 既定は off。入れただけで起動経路が変わってはいけない。
-        assert!(!enabled(), "既定は無効");
-        assert!(launch_plan("/bin/bash", false).is_none());
+        // フラグは直接触る — `set_enabled(true)` は実 `~/.zaivern` へシムを
+        // 書くので、テストから呼んではいけない。
+        let was = ENABLED.swap(false, Ordering::Relaxed);
+        assert!(
+            launch_plan("/bin/bash", false).is_none(),
+            "無効なら注入しない"
+        );
+        ENABLED.store(true, Ordering::Relaxed);
+        assert!(
+            launch_plan("/bin/bash", true).is_none(),
+            "コマンド指定ありはプロンプトが出ないので注入しない"
+        );
+        assert!(
+            launch_plan("cmd.exe", false).is_none(),
+            "未対応シェルはディスクに触れずに帰る"
+        );
+        ENABLED.store(was, Ordering::Relaxed);
     }
 
     #[test]

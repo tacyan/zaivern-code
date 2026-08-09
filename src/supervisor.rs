@@ -2151,6 +2151,7 @@ impl Supervisor {
             command: String::new(),
             cwd: std::path::PathBuf::new(),
             raw_log: None,
+            shell: None,
         };
         let now = self.origin.elapsed().as_millis() as u64;
         let mut i = Self::make_intent(
@@ -2942,6 +2943,7 @@ mod tests {
             command: "claude".into(),
             cwd: std::path::PathBuf::new(),
             raw_log: None,
+            shell: None,
         }
     }
 
@@ -3074,6 +3076,56 @@ mod tests {
         let r = sv.ladder_read(5, later).expect("フック段へ降りる");
         assert_eq!(r.rung, Rung::Hook);
         assert_eq!(r.state, ProtoState::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **シェル統合はフック段の下・画面推定の上**。
+    ///
+    /// 要点は 2 つ:
+    /// (1) 上位段が黙っているときだけ採られること、
+    /// (2) 採られたら**画面に何が書いてあっても**それが判定になること。
+    /// CLAUDE.md の傷 (`Read(src/error_handling.rs)` を「エラー」に数えた) は
+    /// ここで根から消える — 終了コード 0 は推定ではなく事実だから。
+    #[test]
+    fn シェル統合段は画面推定より上でフック段より下() {
+        let dir = crate::test_util::unique_temp_dir("zaivern", "sup-ladder-shell");
+        let mut sv = Supervisor::new(cfg());
+        sv.set_hook_inbox(dir.join("inbox"));
+        // 画面には `error` の 3 文字が並んでいるが、シェルは exit 0 と言っている。
+        let mut s = snap(
+            7,
+            "Read(src/error_handling.rs)\nerror_handling を読む\n",
+            true,
+            false,
+        );
+        s.shell = Some(ProtoRead {
+            state: ProtoState::Idle,
+            detail: String::new(),
+        });
+        sv.tick_ms(&[s.clone()], Approval::Ask, 0);
+        let r = sv.ladder_read(7, 0).expect("シェル統合段が読める");
+        assert_eq!(r.rung, Rung::Shell);
+        assert_eq!(r.state, ProtoState::Idle, "画面の文字列に引きずられない");
+
+        // 失敗は失敗として上がる (握り潰さない)。
+        let mut s2 = s.clone();
+        s2.shell = Some(ProtoRead {
+            state: ProtoState::Failed,
+            detail: "cargo test → code 101".into(),
+        });
+        sv.tick_ms(&[s2], Approval::Ask, 1000);
+        let r = sv.ladder_read(7, 1000).expect("読める");
+        assert_eq!(r.state, ProtoState::Failed);
+        assert!(r.detail.contains("101"), "{}", r.detail);
+
+        // 端末が黙れば (Tracker が鮮度切れで None を返せば) 下の段へ降りる。
+        let mut s3 = s;
+        s3.shell = None;
+        sv.tick_ms(&[s3], Approval::Ask, 2000);
+        assert!(
+            sv.ladder_read(7, 2000).is_none(),
+            "古い判定を握り続けない = 画面推定へ降りられる"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -12496,13 +12496,27 @@ impl ZaivernApp {
                 // 有効化した時点でシムを書き出す (crate::shellint::set_enabled)。
                 crate::shellint::set_enabled(on);
                 config::save_state(&self.cfg);
+                // 既に OSC を出しているシェル (iTerm2 / kitty / starship 等) では
+                // シム側が降りる。**「入れたのに何も変わらない」の理由を先に言う** —
+                // 黙って何もしないのが一番たちが悪い。
+                let already = on
+                    && crate::shellint::already_integrated(
+                        &|k| std::env::var(k).ok(),
+                        &crate::shellint::default_rc_files(),
+                    );
                 // **既存の端末には効かない**ことを隠さない。シェルの起動引数を
                 // 変える機能なので、次に開いた端末からしか働かない。
                 self.toast(
-                    if on {
-                        tr("🐚 シェル統合: オン — 次に開くターミナルから、コマンドの境界と終了コードをシェルが直接報告します")
-                    } else {
-                        tr("🐚 シェル統合: オフ — 次に開くターミナルは従来どおり起動します (受信側は動いたまま)")
+                    match (on, already) {
+                        (true, true) => tr(
+                            "🐚 シェル統合: オン — ただしお使いのシェル設定は既に OSC 133/633 を出しています。二重発行を避けるためシムは何もしません (受信側はそのまま働きます)",
+                        ),
+                        (true, false) => tr(
+                            "🐚 シェル統合: オン — 次に開くターミナルから、コマンドの境界と終了コードをシェルが直接報告します",
+                        ),
+                        (false, _) => tr(
+                            "🐚 シェル統合: オフ — 次に開くターミナルは従来どおり起動します (受信側は動いたまま)",
+                        ),
                     },
                     true,
                 );
@@ -36492,6 +36506,7 @@ mod super_agent_tests {
             command: "claude".into(),
             cwd: std::path::PathBuf::new(),
             raw_log: None,
+            shell: None,
         }
     }
 
