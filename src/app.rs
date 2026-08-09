@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText};
 
+use crate::acp;
+use crate::agent_input::ComposerTarget;
 use crate::agent_picker::{self, AgentPicker};
 use crate::agents::{self, AgentManager, SessionEvent};
 use crate::breadcrumb;
@@ -42,7 +44,9 @@ use crate::license;
 use crate::local_history;
 use crate::lsp;
 use crate::markdown;
+use crate::marks;
 use crate::mcp;
+use crate::mention;
 use crate::menu_bar;
 use crate::notify;
 use crate::orchestration;
@@ -146,6 +150,29 @@ pub enum ProblemRow {
         worst: u8,
     },
     Item(ProblemItem),
+}
+
+/// LSP の SymbolNode を `(名前, 開始行, 終端行, kind)` へ平らにする。
+/// 行はどちらも 0 起点・**両端を含む** (`mention::Target::Symbol` と同じ約束)。
+fn collect_symbol_ranges(
+    nodes: &[lsp::SymbolNode],
+    out: &mut Vec<(String, usize, usize, usize, u8)>,
+) {
+    for n in nodes {
+        out.push((
+            n.name.clone(),
+            n.range.start.line,
+            n.range.end.line.max(n.range.start.line),
+            n.range.end.character,
+            n.kind,
+        ));
+        collect_symbol_ranges(&n.children, out);
+    }
+}
+
+/// severity (1..4) の日本語名。表 [`PROBLEM_SEV_NAMES`] が唯一の出所。
+fn severity_word(sev: u8) -> &'static str {
+    PROBLEM_SEV_NAMES[(sev.clamp(1, 4) - 1) as usize]
 }
 
 /// severity ごとの件数 (トグルのバッジ用)。添字 0..3 = severity 1..4。
@@ -3329,6 +3356,12 @@ pub struct ZaivernApp {
     tunnel_err: Option<String>,
     /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
+    /// `@` コンテキスト参照 (mention.rs)。添付台帳と裏の走査を持つ。
+    mention: mention::Mention,
+    /// `@` ピッカーへ渡す相対パス一覧 (索引が届いたときだけ作り直す)。
+    mention_rels: Vec<String>,
+    /// `@` ピッカーへ渡すシンボル (LSP の documentSymbol が届いたら作り直す)。
+    mention_syms: Vec<mention::SymbolHit>,
     /// プラン使用量の監視 (集約・枯渇予測)。読み取りはこの中で TTL 付きの
     /// バックグラウンドスレッドへ逃がされるので、毎フレーム触ってよい。
     quota: coordinator::QuotaWatch,
@@ -3664,6 +3697,14 @@ pub struct ZaivernApp {
     /// 折りたたみを開いている承認要求の ID (詳細 / 生プロンプト抜粋)。
     approvals_expanded: HashSet<u64>,
 
+    // ── ACP クライアント (crate::acp) ─────────────────────────────
+    /// 構造化プロトコル (ACP) で駆動しているエージェント群とそのパネル。
+    /// 接続 0 本のときは何も描かず、1 フレームも起こさない。
+    ///
+    /// `pub` にしてあるのは `crate::feature` の登録面 (`dispatch` / `draw` が
+    /// `&mut ZaivernApp` を受け取る) から触れるようにするため。
+    pub acp: acp::AcpManager,
+
     // ── MCP サーバ管理パネル (crate::mcp) ─────────────────────────
     /// ボトムパネルを「🔌 MCP」表示に切り替えているか。
     mcp_view: bool,
@@ -3700,6 +3741,11 @@ pub struct ZaivernApp {
     enc_picker: Option<bool>,
     /// ピッカーの絞り込み文字列。
     enc_filter: String,
+
+    // ── ニーモニック付きブックマーク (crate::marks) ─────────────────
+    /// プロジェクト全体のブックマーク。`editor::Bookmarks` (タブ内の行集合)
+    /// とは別で、`~/.zaivern/bookmarks` へ永続化し編集を跨いで行を追う。
+    marks: marks::MarksState,
 }
 
 /// 指揮官に選べないセッションの理由。選べるなら `None`。
@@ -3996,6 +4042,7 @@ impl ZaivernApp {
             cockpit: false,
             cockpit_followed: None,
             center: CenterView::Editor,
+            marks: marks::MarksState::new(&primary_root),
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
             deck: false,
@@ -4105,6 +4152,9 @@ impl ZaivernApp {
             tunnel_host: cfg.ssh_tunnel_host.clone(),
             tunnel_err: None,
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),
+            mention: mention::Mention::default(),
+            mention_rels: Vec::new(),
+            mention_syms: Vec::new(),
             quota: coordinator::QuotaWatch::new(),
             quota_open: false,
             token_detail: false,
@@ -4187,6 +4237,7 @@ impl ZaivernApp {
             approvals_audit: false,
             approvals_audit_cache: None,
             approvals_expanded: HashSet::new(),
+            acp: acp::AcpManager::default(),
             mcp_view: false,
             mcp: mcp::McpPanel::default(),
             skills_view: false,
@@ -4305,6 +4356,9 @@ impl ZaivernApp {
         self.git_panel
             .set_workspace(self.primary_root().to_path_buf());
         self.review.set_workspace(self.primary_root().to_path_buf());
+        // ブックマークもワークスペース単位。前のぶんは書き出してから読み替える。
+        let ws = self.primary_root().to_path_buf();
+        self.marks.set_workspace(&ws);
         // ブランチピッカーも新しいリポジトリへ。旧 repo の一覧が残っていると、
         // そこに無いブランチへの切り替えを発行できてしまう。
         self.branch_nav.set_repo(self.primary_root().to_path_buf());
@@ -6487,6 +6541,17 @@ impl ZaivernApp {
         self.index_truncated = out.truncated;
         self.file_index = out.files;
         self.index_at = Some(Instant::now());
+        // `@` ピッカーは**主ルート配下だけ**を扱う (rel は所属ルート基準なので、
+        // 別ルートのものを混ぜると root.join(rel) が別のファイルを指す)。
+        self.mention_rels = match self.roots.first() {
+            Some(root) => self
+                .file_index
+                .iter()
+                .filter(|f| f.abs.starts_with(root))
+                .map(|f| f.rel.clone())
+                .collect(),
+            None => Vec::new(),
+        };
     }
 
     /// ⌘P のパレットに出す「索引の状態」。作成中/打ち切りのときだけ Some。
@@ -8285,6 +8350,9 @@ impl ZaivernApp {
                 self.local_history.note(&tr("保存"));
                 // 保存した本文の退避はもう要らない (ゴミを残さない)
                 self.hotexit_flush();
+                // ブックマークの追悼パスは 2 秒のデバウンスで走るので、
+                // 保存 (= ここまでを確定する操作) の直前に 1 回流しておく。
+                self.marks.flush_memorial(&path, &text);
                 if promoted {
                     self.toast_warn(trf(
                         "💾 保存しました: {path}\n\u{3000}{from} では表せない文字があるため UTF-8 で保存しました",
@@ -9179,6 +9247,11 @@ impl ZaivernApp {
             Cmd::ToggleBookmark | Cmd::NextBookmark | Cmd::PrevBookmark | Cmd::ClearBookmarks => {
                 self.apply_bookmark_cmd(&cmd)
             }
+            Cmd::MarkToggleMnemonic
+            | Cmd::MarksPanel
+            | Cmd::MarkJump
+            | Cmd::MarkJumpDigit(_)
+            | Cmd::MarksClearAll => self.apply_mark_cmd(&cmd),
             Cmd::ReopenClosedTab => self.reopen_closed_tab(),
             Cmd::ToggleTableView => self.toggle_table_view(),
             Cmd::LspCompletion => {
@@ -9456,6 +9529,83 @@ impl ZaivernApp {
         }
     }
 
+    /// ニーモニック付きブックマーク (`crate::marks`) のコマンド。
+    ///
+    /// **描画も判定も `marks` 側の純粋関数に置く** — ここは「いまのファイルと
+    /// 行を渡して、返ってきた要求を実行する」だけに保つ (app.rs は 42k 行あり、
+    /// 10 本のブランチが直列にマージされるので差分を局所化する)。
+    fn apply_mark_cmd(&mut self, cmd: &Cmd) {
+        match cmd {
+            Cmd::MarksPanel => self.marks.panel_open = !self.marks.panel_open,
+            Cmd::MarkJump => self.marks.jump_open = !self.marks.jump_open,
+            Cmd::MarksClearAll => {
+                self.marks.clear_all();
+                self.toast(tr("ブックマークをすべて消しました"), true);
+            }
+            Cmd::MarkJumpDigit(d) => match self.marks.goto_digit(*d) {
+                Some(a) => self.run_mark_action(a),
+                None => self.toast_warn(tr("そのニーモニックのブックマークがありません")),
+            },
+            Cmd::MarkToggleMnemonic => {
+                let Some(i) = self.editor.active else {
+                    self.toast_warn(tr("ファイルを開いてから使ってください"));
+                    return;
+                };
+                let Some(path) = self.editor.buffers[i].path.clone() else {
+                    self.toast_warn(tr("保存されていないファイルには付けられません"));
+                    return;
+                };
+                let line = self.caret_line0();
+                let text = self.editor.buffers[i].text.clone();
+                let sel = self.editor_selection_text();
+                self.marks.begin_toggle(&path, line, &text, sel);
+            }
+            _ => {}
+        }
+    }
+
+    /// 選択範囲の文字列 (無ければ `None`)。ブックマークの説明の種になる。
+    fn editor_selection_text(&self) -> Option<String> {
+        let i = self.editor.active?;
+        let (a, b) = self.editor_sel_chars?;
+        let (lo, hi) = (a.min(b), a.max(b));
+        if lo >= hi {
+            return None;
+        }
+        let t = &self.editor.buffers[i].text;
+        Some(t.chars().skip(lo).take(hi - lo).collect())
+    }
+
+    /// `marks` から返ってきた要求を実行する。
+    fn run_mark_action(&mut self, a: marks::MarkAction) {
+        match a {
+            marks::MarkAction::Goto(path, line0) => {
+                if self.active_file_path().as_deref() != Some(path.as_path()) {
+                    self.open_path(&path);
+                }
+                if let Some(i) = self.editor.active {
+                    self.reveal_line(i, line0);
+                }
+                self.goto_line(line0 + 1);
+            }
+            marks::MarkAction::Toast(msg, ok) => self.toast(msg, ok),
+        }
+    }
+
+    /// ブックマークの小窓 (一覧 / ニーモニック選択 / ジャンプ) を描く。
+    fn marks_windows(&mut self, ctx: &egui::Context) {
+        let hints = marks::Hints {
+            toggle: self.key_hint(BindAction::MarkToggleMnemonic),
+            panel: self.key_hint(BindAction::MarksPanel),
+        };
+        let theme = self.theme.clone();
+        let root = self.primary_root().to_path_buf();
+        let acts = marks::windows_ui(ctx, &mut self.marks, &theme, &hints, &root);
+        for a in acts {
+            self.run_mark_action(a);
+        }
+    }
+
     /// 直前に閉じたタブを開き直す (VS Code: ⇧⌘T)。
     fn reopen_closed_tab(&mut self) {
         let Some(t) = self.editor.closed_tabs.pop_closed() else {
@@ -9599,6 +9749,7 @@ impl ZaivernApp {
             self.lsp_symbols_query.clear();
             self.lsp_symbols_path = Some(path);
             self.lsp_symbols_quiet = false;
+            self.rebuild_mention_symbols();
         }
     }
 
@@ -11078,6 +11229,11 @@ impl ZaivernApp {
             | Cmd::NextBookmark
             | Cmd::PrevBookmark
             | Cmd::ClearBookmarks
+            | Cmd::MarkToggleMnemonic
+            | Cmd::MarksPanel
+            | Cmd::MarkJump
+            | Cmd::MarkJumpDigit(_)
+            | Cmd::MarksClearAll
             | Cmd::ReopenClosedTab
             | Cmd::ToggleTableView
             | Cmd::LspCompletion
@@ -13201,6 +13357,24 @@ impl ZaivernApp {
         }
         if consume(ctx, self.keys.binding(BindAction::ToggleBookmark)) {
             cmds.push(Cmd::ToggleBookmark);
+        }
+        if consume(ctx, self.keys.binding(BindAction::MarkToggleMnemonic)) {
+            cmds.push(Cmd::MarkToggleMnemonic);
+        }
+        if consume(ctx, self.keys.binding(BindAction::MarksPanel)) {
+            cmds.push(Cmd::MarksPanel);
+        }
+        if consume(ctx, self.keys.binding(BindAction::MarkJump)) {
+            cmds.push(Cmd::MarkJump);
+        }
+        // 数字ニーモニックへの直行。**打鍵は OS ごとに `marks` が固定して持つ**
+        // (⌃ + 数字は mac の起動バー、⌃⌥ + 数字は非 mac の起動バーが既に使う)。
+        for d in 0u8..=9 {
+            if let Some(sc) = marks::digit_jump_shortcut(d) {
+                if consume_sc(ctx, sc) {
+                    cmds.push(Cmd::MarkJumpDigit(d));
+                }
+            }
         }
         if consume(ctx, self.keys.binding(BindAction::LspReferences)) {
             cmds.push(Cmd::LspReferences);
@@ -17151,6 +17325,12 @@ impl ZaivernApp {
         let mut sent = 0usize;
         let mut lost = 0usize;
         for (sid, action) in &res.replies {
+            // **ACP (構造化プロトコル) の要求が先。** PTY のセッション ID とは
+            // 別空間 (`acp::ACP_SESSION_ID_BASE`) なので取り違えは起きない。
+            if self.acp.reply(*sid, *action) {
+                sent += 1;
+                continue;
+            }
             let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == *sid) else {
                 lost += 1;
                 continue;
@@ -17450,6 +17630,49 @@ impl ZaivernApp {
         // 「⏸ 停止中」チップの件数。`&mut self.agent_input_buf` を借りる前に
         // 数え終えておく (借用が重なるため)。
         let stalled = self.stalled_session_ids().len();
+
+        // ── `@` コンテキスト参照の材料 ──────────────────────────
+        // **ここでは I/O を 1 つもしない。** 索引・シンボル・ブランチ名は
+        // すべて裏で取り終えて手元にある値で、診断もメモリ上の集計。
+        // 借用が重ならないよう、`&mut self.agent_input_buf` を取る前に
+        // 必要なものを局所変数へ移しておく (`mem::take` はポインタ交換だけ)。
+        let m_root = self.roots.first().cloned().unwrap_or_default();
+        let m_terms: Vec<(u64, String)> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| (s.id, format!("{} {}", s.icon, s.title)))
+            .collect();
+        // 診断の集計はピッカーが開いている間だけ (毎フレーム全診断を舐めない)。
+        let m_problems = if self.mention.is_open() {
+            self.collect_problems().len()
+        } else {
+            0
+        };
+        // git があるかは**裏でキャッシュ済みのブランチ名**で判定する
+        // (ここで `git rev-parse` を撃つと UI スレッドが数秒止まる)。
+        let m_repo = self.git_branch().is_some().then(|| m_root.clone());
+        let m_trunc = self.index_truncated;
+        let m_busy = self.lsp_symbols_busy || self.index_rx.is_some();
+        let m_rels = std::mem::take(&mut self.mention_rels);
+        let m_syms = std::mem::take(&mut self.mention_syms);
+        let msrc = mention::Source {
+            root: &m_root,
+            files: &m_rels,
+            files_truncated: m_trunc,
+            symbols: &m_syms,
+            symbols_busy: m_busy,
+            terminals: &m_terms,
+            problems: m_problems,
+            repo: m_repo.as_deref(),
+        };
+        // `self` は下のクロージャ群が丸ごと借りるので、ピッカーの状態も
+        // 一旦手元へ引き取る (`mem::take` は構造体の移動だけで割り当てはしない)。
+        let mut mstate = std::mem::take(&mut self.mention);
+        let mut mhook = mention::Hook {
+            state: &mut mstate,
+            source: &msrc,
+        };
         // ヘッダー行に埋め込めたか。埋め込めなかった分だけ下に別行で出す。
         let mut inline_done = false;
         let mut composer = panels::ComposerAction::None;
@@ -17605,6 +17828,7 @@ impl ZaivernApp {
                         &mut self.agent_input_buf,
                         target.as_ref().map(|(id, t)| (*id, t.as_str())),
                         &mut expand,
+                        &mut mhook,
                     );
                     inline_done = true;
                 }
@@ -17638,6 +17862,7 @@ impl ZaivernApp {
                     &targets,
                     stalled,
                     &mut expand,
+                    &mut mhook,
                 )
             } else {
                 // ヘッダーが詰まっていた場合の逃げ場 (窓が狭いとき)。
@@ -17647,8 +17872,23 @@ impl ZaivernApp {
                     &mut self.agent_input_buf,
                     target.as_ref().map(|(id, t)| (*id, t.as_str())),
                     &mut expand,
+                    &mut mhook,
                 )
             };
+        }
+        // ここでピッカーの状態を返す (`mhook` の借用はこの行で終わる)。
+        let mention::Hook { .. } = mhook;
+        self.mention = mstate;
+        // 添付チップ (印・解決先・**1 件ごとの概算トークン**)。空なら何も描かない。
+        if let Some(token) = mention::chips_ui(ui, theme, self.mention.ledger()) {
+            let stripped = mention::strip_token(self.agent_input_buf.text(), &token);
+            self.agent_input_buf.set_text(stripped);
+        }
+        self.mention_rels = m_rels;
+        self.mention_syms = m_syms;
+        // 端末の末尾・診断は App しか持っていないので、ここで詰めて返す。
+        if let Some(need) = self.mention.take_need() {
+            self.serve_mention_need(need);
         }
         ui.memory_mut(|m| m.data.insert_temp(expand_id, expand));
         match composer {
@@ -18555,6 +18795,8 @@ impl ZaivernApp {
         mut orch_acts: Vec<orchestration::OrchAction>,
     ) {
         if let Some(text) = acts.broadcast {
+            // `@` 添付を本文へ展開してから流す (印だけでは中身が届かない)。
+            let text = self.expand_mentions(&text, None, ComposerTarget::Broadcast);
             // None はコスト上限で止めたとき。理由は送信側が説明済みなので
             // 「宛先がいない」と嘘を重ねない。
             match self.queue_submit_all(&text) {
@@ -18569,6 +18811,7 @@ impl ZaivernApp {
         // 止まっているものだけへの一斉送信。作業中は巻き込まないので、
         // 「全員へ送ると進行中の作業まで分断される」を避けられる。
         if let Some(text) = acts.broadcast_stalled {
+            let text = self.expand_mentions(&text, None, ComposerTarget::Stalled);
             match self.queue_submit_stalled(&text) {
                 None => {}
                 Some(0) => self.toast(tr("止まっているエージェントはありません"), false),
@@ -18583,6 +18826,7 @@ impl ZaivernApp {
         }
         // 宛先を指名した送信は**その 1 体だけ**へ届ける (broadcast は通らない)
         if let Some((id, text)) = acts.send_to {
+            let text = self.expand_mentions(&text, Some(id), ComposerTarget::Agent(id));
             let live = self
                 .agents
                 .sessions
@@ -21952,6 +22196,9 @@ impl ZaivernApp {
         let theme_panel = self.theme.panel;
         let theme_border = self.theme.border;
         let theme_accent = self.theme.accent;
+        // ブックマークのニーモニックはアクセント色の四角の上に載せるので、
+        // 文字色は本文背景 (= アクセントの反対側) を使う。
+        let theme_bg = self.theme.bg;
         // 現在行ハイライト用 (テキストの上に重ねるのでごく薄く)
         let cur_line_hl = self.theme.text.gamma_multiply(0.07);
         // 折り返しと空白可視化 (コマンド/メニューで切替、config に永続化)
@@ -22018,6 +22265,15 @@ impl ZaivernApp {
         }
         self.refresh_active_diagnostics(text_hash);
         self.refresh_inlay_hints(text_hash);
+        // ブックマークの行追従。**毎フレームやるのはハッシュ比較だけ**で、
+        // 実際の差分は 100ms のデバウンス後にバックグラウンドスレッドが取る
+        // (編集経路で本文を走査すると、このリポジトリが git で踏んだ
+        //  「UI スレッドが数秒返ってこない」を再演することになる)。
+        if let Some(p) = abs.clone() {
+            let mut m = std::mem::take(&mut self.marks);
+            m.tick(ui.ctx(), &p, text_hash, &self.editor.buffers[active].text);
+            self.marks = m;
+        }
         self.diag_counts = (self.diag_cache.errors, self.diag_cache.warnings);
         // diag_cache の借用は、可変借用が要る第 2 次配線の準備が済んでから取る
         // (この束縛を上げると self を可変に触れなくなる)。
@@ -22309,6 +22565,12 @@ impl ZaivernApp {
             HashMap::new()
         };
         let bookmark_lines: HashSet<usize> = self.editor.buffers[active].bookmarks.iter().collect();
+        // ニーモニック付きブックマーク (crate::marks) の印。行 → 表示文字。
+        // **ガターは 1 系統しか持たない** — 既存の ◆ と同じ列に重ねて描く。
+        let mark_glyphs: HashMap<usize, char> = match &abs {
+            Some(p) => self.marks.store().glyphs(p),
+            None => HashMap::new(),
+        };
 
         // インデントガイド (鍵にキャレット行を含める = 強調ガイドが行依存のため)
         let tab_w = crate::highlight::DEFAULT_TAB_WIDTH;
@@ -23490,26 +23752,48 @@ impl ZaivernApp {
         let fold_x = gutter_edge - FOLD_MARKER_W;
         let mark_x = gutter_edge - FOLD_MARKER_W * 2.0;
         let mut toggle_line: Option<usize> = None;
+        let mut mark_toggle_line: Option<usize> = None;
         if structure_on {
-            let hit = ui
-                .interact(
-                    egui::Rect::from_min_max(
-                        egui::pos2(mark_x, vis.top()),
-                        egui::pos2(gutter_edge, vis.bottom()),
-                    ),
-                    ed_id.with("fold-gutter"),
-                    egui::Sense::click(),
-                )
-                .interact_pointer_pos();
+            let gutter_resp = ui.interact(
+                egui::Rect::from_min_max(
+                    egui::pos2(mark_x, vis.top()),
+                    egui::pos2(gutter_edge, vis.bottom()),
+                ),
+                ed_id.with("fold-gutter"),
+                egui::Sense::click(),
+            );
+            let hit = gutter_resp.interact_pointer_pos();
+            // 印の列 (折りたたみ列より手前) のホバーだけ案内を出す。
+            // **打鍵表記はキーマップから作る** — ベタ書きしない。
+            if gutter_resp
+                .hover_pos()
+                .map(|p| p.x < fold_x)
+                .unwrap_or(false)
+            {
+                let hint = crate::keybinds::key_hint(ui.ctx(), BindAction::MarkToggleMnemonic);
+                let _ = gutter_resp.on_hover_text(crate::marks::gutter_tooltip(&hint));
+            }
             for (src, y0, _) in &row_lines {
-                if bookmark_lines.contains(src) {
-                    painter.text(
+                match mark_glyphs.get(src) {
+                    // ニーモニック付きはアイコン + 文字 (0.75 倍・中央)
+                    Some(g) => crate::marks::paint_gutter_glyph(
+                        &painter,
                         egui::pos2(mark_x, *y0),
-                        Align2::LEFT_TOP,
-                        "◆",
-                        font.clone(),
+                        row_h,
+                        *g,
                         theme_accent,
-                    );
+                        theme_bg,
+                    ),
+                    None if bookmark_lines.contains(src) => {
+                        painter.text(
+                            egui::pos2(mark_x, *y0),
+                            Align2::LEFT_TOP,
+                            "◆",
+                            font.clone(),
+                            theme_accent,
+                        );
+                    }
+                    None => {}
                 }
                 if let Some(folded) = fold_marks.get(src) {
                     painter.text(
@@ -23523,6 +23807,9 @@ impl ZaivernApp {
             }
             if let Some(p) = hit {
                 toggle_line = fold_click_line(&row_lines, &fold_marks, fold_x, p);
+                // 折りたたみの列より手前 (印の列) はブックマークの付け外し
+                let rows: Vec<(usize, f32)> = row_lines.iter().map(|(l, y, _)| (*l, *y)).collect();
+                mark_toggle_line = crate::marks::gutter_click_line(&rows, row_h, mark_x, fold_x, p);
             }
         }
 
@@ -23672,6 +23959,14 @@ impl ZaivernApp {
                 }
                 // 折りたたみ表示への打鍵も原文側の履歴へ 1 段として積む
                 b.apply_edit(next, ed);
+                let spliced_text = b.text.clone();
+                // 増減が分かっている編集は差分を待たずに追従させる
+                // (`marks` の経路 1。デバウンス後の一括更新より 1 テンポ速い)
+                if delta != 0 {
+                    if let Some(p) = path_clone.clone() {
+                        self.marks.note_edit(&p, at, delta, &spliced_text);
+                    }
+                }
                 // 表示テキストは次フレームで作り直す
                 self.fold_view = None;
                 spliced = true;
@@ -23765,6 +24060,15 @@ impl ZaivernApp {
                     self.lsp_pending.insert(p, (text, Instant::now(), key));
                 }
             }
+        }
+
+        // ガターの印をクリックしていたらここで付け外しする。
+        // 描画中は `self` の別フィールドを不変借用しているので、
+        // トーストを出せるのはこの位置まで来てから (複数キャレットと同じ流儀)。
+        if let (Some(l), Some(p)) = (mark_toggle_line, path_clone) {
+            let text = self.editor.buffers[active].text.clone();
+            let out = self.marks.quick_toggle(&p, l, &text);
+            self.toast(crate::marks::toggle_message(&out), true);
         }
     }
 
@@ -24565,6 +24869,30 @@ impl ZaivernApp {
                 tr("ブックマークをすべて解除"),
                 String::new(),
                 Cmd::ClearBookmarks,
+            ),
+            (
+                "🔖".into(),
+                tr("ニーモニック付きブックマーク"),
+                fmt_key(BindAction::MarkToggleMnemonic),
+                Cmd::MarkToggleMnemonic,
+            ),
+            (
+                "🔖".into(),
+                tr("ブックマーク一覧"),
+                fmt_key(BindAction::MarksPanel),
+                Cmd::MarksPanel,
+            ),
+            (
+                "🔖".into(),
+                tr("ブックマークへジャンプ"),
+                fmt_key(BindAction::MarkJump),
+                Cmd::MarkJump,
+            ),
+            (
+                "🔖".into(),
+                tr("ブックマークをプロジェクト全体から消す"),
+                String::new(),
+                Cmd::MarksClearAll,
             ),
             (
                 "📑".into(),
@@ -29190,7 +29518,11 @@ impl ZaivernApp {
         self.handle_zoom_gesture(ctx);
         // Keybinds を持てない描画側 (ターミナルの右クリックメニュー等) へ
         // 打鍵表記を配る。ベタ書きを増やさないための唯一の経路。
-        crate::keybinds::publish_key_hints(ctx, &self.keys, &[BindAction::Find]);
+        crate::keybinds::publish_key_hints(
+            ctx,
+            &self.keys,
+            &[BindAction::Find, BindAction::MarkToggleMnemonic],
+        );
 
         // メニューバー経由のエディタ操作 (元に戻す/貼り付け等) を、パネル描画前に
         // フォーカス復帰 + イベント注入で TextEdit へ届ける
@@ -29837,6 +30169,59 @@ impl ZaivernApp {
         let theme = self.theme.clone();
         if let Some(act) = self.tutorial.overlay(ctx, &theme, &self.keys) {
             self.apply_tutorial_action(act, ctx);
+        }
+    }
+
+    /// ACP パネルを開閉する (`crate::acp::FEATURE` から呼ばれる)。
+    ///
+    /// **オーバーレイ**なので中央ビューを奪わない (起動しただけで画面が激変しない)。
+    pub fn toggle_acp_panel(&mut self) {
+        self.acp.open = !self.acp.open;
+        if self.acp.open {
+            self.toast(
+                tr("🛰 ACP: 構造化プロトコルでエージェントを駆動します"),
+                true,
+            );
+        }
+    }
+
+    /// ACP (構造化プロトコル) の 1 フレーム。
+    ///
+    /// 受信の畳み込みとオーバーレイの描画をここ 1 か所へ集める。接続が
+    /// 0 本のときは**何も起きない** (設計原則 3: アイドルのコストはゼロ)。
+    pub fn acp_tick(&mut self, ctx: &egui::Context) {
+        if self.acp.is_empty() && !self.acp.open {
+            return;
+        }
+        // 未保存のエディタバッファを公開する。`fs/read_text_file` が
+        // ディスクではなく「いま画面に見えている内容」を返せる = エディタを
+        // 持つクライアントだけの強み。署名が変わらなければ本文は読まない。
+        self.acp.sync_unsaved(
+            self.editor
+                .buffers
+                .iter()
+                .filter(|b| b.dirty())
+                .filter_map(|b| {
+                    b.path
+                        .as_deref()
+                        .map(|p| (p, b.history.revision(), b.text.as_str()))
+                }),
+        );
+        let theme = self.theme.clone();
+        let cwd = self.agent_cwd();
+        let toasts = self.acp.frame(
+            ctx,
+            &theme,
+            &mut self.agents.approvals,
+            &self.roots.clone(),
+            &cwd,
+        );
+        for (msg, ok) in toasts {
+            if ok {
+                self.toast(msg, true);
+            } else {
+                self.toast_warn(msg);
+            }
         }
     }
 
@@ -32090,6 +32475,7 @@ impl ZaivernApp {
 
     fn menu_windows_ui(&mut self, ctx: &egui::Context) {
         self.goto_line_window(ctx);
+        self.marks_windows(ctx);
         self.git_commit_window(ctx);
         self.git_history_window(ctx);
         self.problems_window(ctx);
@@ -32337,6 +32723,84 @@ impl ZaivernApp {
         }
         let subtitle = self.rel_label(&top);
         self.open_multibuffer(mbuf::Source::Changes, &subtitle, &seeds);
+    }
+
+    /// LSP の documentSymbol を `@` ピッカーが読める形へ落とす。
+    ///
+    /// **`@` ピッカーは LSP が出した範囲を「正確 (=)」として扱う。**
+    /// LSP が動いていない言語は `mention::scan_symbols` の近似 (≈) で補う。
+    fn rebuild_mention_symbols(&mut self) {
+        self.mention_syms.clear();
+        let Some(path) = self.lsp_symbols_path.clone() else {
+            return;
+        };
+        let Some(root) = self.roots.first() else {
+            return;
+        };
+        let Some(rel) = crate::ignore::rel_slash(root, &path) else {
+            return;
+        };
+        // documentSymbol は入れ子を持つ。子も含めて平らにし、
+        // それぞれの `range` (本体全体) をそのまま添付範囲に使う。
+        let mut ranges: Vec<(String, usize, usize, usize, u8)> = Vec::new();
+        collect_symbol_ranges(&self.lsp_symbols, &mut ranges);
+        for (name, start, end, end_col, kind) in ranges {
+            self.mention_syms.push(mention::SymbolHit {
+                name,
+                kind_label: symbol_kind_label(kind).to_string(),
+                rel: rel.clone(),
+                start_line: start,
+                end_line: end,
+                end_col: Some(end_col),
+                exact: true,
+            });
+        }
+    }
+
+    /// `@` の確定で「App しか持っていない本文」を求められたら返す。
+    fn serve_mention_need(&mut self, need: mention::Need) {
+        match need {
+            mention::Need::Terminal { token, id } => {
+                let text = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| {
+                        s.screen_tail_lines(mention::TERM_TAIL_ROWS, mention::TERM_TAIL_COLS)
+                            .join("\n")
+                    })
+                    .unwrap_or_else(|| tr("その端末はもうありません"));
+                self.mention.provide(&token, text, mention::Keep::Tail);
+            }
+            mention::Need::Problems { token } => {
+                let body = self
+                    .collect_problems()
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}:{}:{}: [{}] {}",
+                            p.path.display(),
+                            p.line + 1,
+                            p.col + 1,
+                            severity_word(p.severity),
+                            p.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.mention.provide(&token, body, mention::Keep::Head);
+            }
+        }
+    }
+
+    /// 送信直前に `@` 添付を本文へ展開する。宛先が 1 体なら、その CLI の
+    /// ファイル参照記法 (`agents.rs` のカタログ) に従って重複を省く。
+    fn expand_mentions(&self, text: &str, to: Option<u64>, ledger: ComposerTarget) -> String {
+        let cmd = to
+            .and_then(|id| self.agents.sessions.iter().find(|s| s.id == id))
+            .map(|s| s.command.clone());
+        self.mention.expand_for(text, cmd.as_deref(), ledger)
     }
 
     /// ワークスペース全体の診断を集める。
@@ -38558,6 +39022,9 @@ mod wave2_tests {
             ("ToggleFold", "ToggleFold"),
             ("UnfoldAll", "UnfoldAll"),
             ("ToggleBookmark", "ToggleBookmark"),
+            ("MarkToggleMnemonic", "MarkToggleMnemonic"),
+            ("MarksPanel", "MarksPanel"),
+            ("MarkJump", "MarkJump"),
             ("ReopenClosedTab", "ReopenClosedTab"),
             ("LspCompletion", "LspCompletion"),
             ("LspReferences", "LspReferences"),
