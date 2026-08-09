@@ -2815,6 +2815,27 @@ description = "旧形式"
     }
 
     #[test]
+    fn ブックマークの既定打鍵はosごとに固定されている() {
+        use crate::keybinds::{BindAction, Keybinds};
+        let keys = Keybinds::from_overrides(&HashMap::new());
+        // (アクション, macOS の表記, その他 OS の表記)
+        let table: &[(BindAction, &str, &str)] = &[
+            (BindAction::MarkToggleMnemonic, "⌥⇧⌘B", "Ctrl+Alt+Shift+B"),
+            (BindAction::MarksPanel, "⌥⌘M", "Ctrl+Alt+M"),
+            (BindAction::MarkJump, "⌥⌘J", "Ctrl+Alt+J"),
+        ];
+        for (a, mac, other) in table {
+            // **期待値に cfg! を入れる** — 他 OS で使わない打鍵を咎めないため
+            let want = if cfg!(target_os = "macos") {
+                mac
+            } else {
+                other
+            };
+            assert_eq!(&keys.label(*a), want, "{a:?} の既定");
+        }
+    }
+
+    #[test]
     fn 数字ジャンプはos予約とも既存割り当てとも食い合わない() {
         use crate::keybinds::{self, Binding, Keybinds};
         let keys = Keybinds::from_overrides(&HashMap::new());
