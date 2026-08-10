@@ -491,9 +491,7 @@ pub fn usage() -> String {
 /// `2`=使い方の誤り。
 //
 // **`src/cli.rs` へは自分で配線しない。** ここは並列ブランチが同時に編集すると
-// 必ず衝突する共有ファイルなので、統合担当が直列に 1 行入れる約束になっている
-// (CLAUDE.md「ゼロにできていない共有面」)。それまでの間だけ dead_code を許す。
-#[allow(dead_code)]
+/// `zai split <sub>` の実体。`src/cli.rs` の dispatch から呼ばれる。
 pub fn cli_main(argv: &[String]) -> i32 {
     match argv.first().map(String::as_str).unwrap_or("") {
         "help" | "--help" | "-h" => {

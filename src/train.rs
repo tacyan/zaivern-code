@@ -1640,9 +1640,7 @@ fn parse_flags(args: &[String], allow_dry: bool) -> Result<Flags, String> {
 ///
 /// **`src/cli.rs` は共有ファイルなので触っていない。** 配線 (`"train" =>
 /// train::cli_main(&args[1..])` の 1 行) は統合担当が入れる。それまでこの
-/// バイナリからの呼び出し元は無いので `dead_code` を明示的に許す —
-/// 中身はテスト `コマンドライン入口が計画と実行を通す` が実リポジトリで通している。
-#[allow(dead_code)]
+/// `zai train <sub>` の実体。`src/cli.rs` の dispatch から呼ばれる。
 pub fn cli_main(argv: &[String]) -> i32 {
     let Some(sub) = argv.first().map(String::as_str) else {
         print!("{}", usage());

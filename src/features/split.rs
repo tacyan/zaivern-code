@@ -11,9 +11,5 @@
 #[path = "../split.rs"]
 mod imp;
 
-// `zai split …` の配線先は `src/cli.rs` — 並列ブランチが取り合う共有ファイルなので、
-// **統合担当が直列に 1 行**入れる約束になっている (CLAUDE.md「ゼロにできていない共有面」)。
-// それまで `cli_main` を呼ぶ人が居ないので unused_imports が出るが、消すと
-// 再エクスポートごと消えて配線先が無くなる。**繋ぐまでの間だけ**許す。
-#[allow(unused_imports)]
+// `zai split …` は `src/cli.rs` の dispatch から呼ばれる (統合時に直列で配線済み)。
 pub use imp::{cli_main, FEATURE};

@@ -214,6 +214,9 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "hook"
             // ベンダー非依存の書き込み強制 (git フックがここを呼ぶ)
             | "guard"
+            // 順次統合 (マージトレイン) と、配る前の担当分割
+            | "train"
+            | "split"
             // git が custom merge driver として起動する入口 (人が打つものではない)
             | "merge-driver"
             | "update"
@@ -233,7 +236,17 @@ pub fn is_cli_subcommand(word: &str) -> bool {
 fn yields_to_directory(word: &str) -> bool {
     matches!(
         word,
-        "app" | "firewall" | "worktree" | "session" | "agent" | "lease" | "hook" | "help"
+        "app"
+            | "firewall"
+            | "worktree"
+            | "session"
+            | "agent"
+            | "lease"
+            | "hook"
+            | "guard"
+            | "train"
+            | "split"
+            | "help"
     )
 }
 
@@ -405,6 +418,10 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         }
         // git フック (pre-commit 等) と CI がここを呼ぶ。実体は src/guard.rs。
         "guard" => crate::features::guard::cli_main(rest),
+        // 順次統合。実体は src/train.rs。
+        "train" => crate::features::train::cli_main(rest),
+        // 配る前の担当分割。実体は src/split.rs。
+        "split" => crate::features::split::cli_main(rest),
         // git が `%O %A %B %L %P` を付けて起動する。実体は src/union.rs。
         "merge-driver" => crate::features::union::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。

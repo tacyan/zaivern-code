@@ -40,9 +40,5 @@ mod imp;
 
 pub use imp::FEATURE;
 
-/// `zai train <sub>` の入口。**`src/cli.rs` は共有ファイルなので、こちらでは
-/// 配線していない** — 統合担当が上の 1 行を足すまで呼び出し元が無いので、
-/// 未使用であることを明示的に許す。中身は `train.rs` のテストが実 git
-/// リポジトリを作って通している (計画・実行・終了コードまで)。
-#[allow(unused_imports)]
+/// `zai train <sub>` の入口。`src/cli.rs` の dispatch から呼ばれる。
 pub use imp::cli_main;
