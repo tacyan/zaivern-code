@@ -225,6 +225,9 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "mesh"
             // 断らずにずらす交渉層 (拒否された担当を近くの空き行域へ振り替える)
             | "negotiate"
+            // どのリポジトリでも 1 コマンドで導入・診断・実証・撤去する入口。
+            // **門に足し忘れると `zai czero doctor` が GUI の窓を開く**
+            | "czero"
             // git が custom merge driver として起動する入口 (人が打つものではない)
             | "merge-driver"
             | "update"
@@ -456,6 +459,8 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         "mesh" => crate::features::mesh::cli_main(rest),
         // 行域の交渉 (ずらす / 分割する / 待つ)。実体は src/negotiate.rs。
         "negotiate" => crate::features::negotiate::cli_main(rest),
+        // 競合ゼロの導入・診断・実証・撤去。実体は src/czero_init.rs。
+        "czero" => crate::features::czero_init::cli_main(rest),
         // git が `%O %A %B %L %P` を付けて起動する。実体は src/union.rs。
         "merge-driver" => crate::features::union::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
