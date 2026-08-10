@@ -259,36 +259,169 @@ lines_for() {
 # さらに**別のチェックアウトで作られた zai を拾うと、比較そのものが無意味**に
 # なる (ホストと Linux で違うコードを測ってしまう)。なので既定では
 # **このワークツリーの target 配下しか信用しない**。
+target_dir=${CARGO_TARGET_DIR:-$root/target}
+
+# ── 使う zai を決める (**全ベンチで 1 バイトも変えない共通ブロック**) ──
+#
+# ## なぜ「共通」でないと嘘になるか (事故3)
+#
+# 探索順が `conflict-zero-bench.sh` は release→debug、`coedit-bench.sh` は
+# debug→release で**逆だった**。この環境は release が 0.12.0・debug が
+# 0.14.0 だったので、**同一セッションで別のバイナリを測って**その数字を
+# 並べていた。順序は **release → debug → PATH** で統一する。
+#
+# ## なぜ版の照合だけでは足りないか (事故1)
+#
+# `cargo test` も `cargo test --bin zai --no-run` も **bin を作らない**ので、
+# `target/<profile>/zai` は前の実行の残骸のまま残る。実際に
+# 「ソースは 06:00 なのにバイナリは 02:40 のビルド」で `guard` の実フック
+# 試験が赤くなり、**`--version` は両方 0.14.0 だった**。版が同じでも中身は
+# 別物なので、**ソースより古いバイナリは使わない**。
+#
+# 内容ハッシュ (ビルド ID) の方が確実だが、実測で mtime 0.51ms に対し
+# ハッシュ 62.9ms (124 倍) で、しかも `build.rs` と `cli.rs` の両方を
+# 触らないと実現できない。詳細は `docs/bench-honesty.md`。
+#
+# 前提: `$root` (リポジトリルート) と `$target_dir` が決まっていること。
+# 使い方: `zai_pick <追加判定の関数名>` → 見つかれば `$zai` に入る。
+# @zai-honesty-begin
 expect_ver=$(awk -F'"' '/^version[ ]*=/ { print $2; exit }' "$root/Cargo.toml" 2>/dev/null || true)
+zai_ver=""
+zai_note=""
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+zai_reject() { zai_note="${zai_note}${zai_note:+ / }$1"; }
+
+# `$1` より新しいソースの一覧 (空なら `$1` の方が新しい = 使ってよい)。
+#
+# **mtime を数値で取らない。** GNU は `stat -c %Y`、BSD は `stat -f %m` と
+# 引数が違うため、どちらかを直書きすると必ず片方の OS で壊れる。
+# `find -newer` は POSIX にあるのでどちらでも動く。
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+newer_sources() {
+    [ -e "$1" ] || return 0
+    find "$root/src" -name '*.rs' -newer "$1" -print 2>/dev/null || true
+    find "$root/Cargo.toml" "$root/build.rs" -newer "$1" -print 2>/dev/null || true
+}
+
+# 候補 `$1` が「版が合っていて、ソースより新しい」なら 0 で `$zai_ver` を更新。
+# 駄目なら**理由を積んでから** 1 を返す (黙って次の候補へ行かない)。
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+zai_fresh() {
+    # **無い候補は黙って飛ばす。** unix で `.exe` を、release を建てていない
+    # 環境で release を、毎回「実行できません」と報告すると、本当に見てほしい
+    # 「有るのに使えない」理由が雑音に埋もれる。
+    [ -e "$1" ] || return 1
+    [ -x "$1" ] || {
+        zai_reject "$1: 実行権がありません"
+        return 1
+    }
+    _v=$("$1" --version 2>/dev/null) || {
+        zai_reject "$1: --version が動きません"
+        return 1
+    }
+    # ZAIVERN_BIN は**利用者の明示**。照合は飛ばすが、飛ばしたことは書き残す。
+    if [ -n "${ZAIVERN_BIN:-}" ] && [ "$1" = "$ZAIVERN_BIN" ]; then
+        zai_reject "ZAIVERN_BIN で明示 (版と古さの照合は飛ばしました)"
+        zai_ver=$_v
+        return 0
+    fi
+    if [ -n "$expect_ver" ]; then
+        case "$_v" in
+        *"$expect_ver"*) ;;
+        *)
+            zai_reject "$1 は版が違うので使いません ($_v != $expect_ver)"
+            return 1
+            ;;
+        esac
+    fi
+    _n=$(newer_sources "$1")
+    if [ -n "$_n" ]; then
+        # 何件が新しいのか・どれが新しいのかまで出す (出さないと直せない)。
+        # `$?` を見ないので、ここのパイプは終了コードを壊さない。
+        _cnt=$(printf '%s\n' "$_n" | grep -c . || true)
+        _one=$(printf '%s\n' "$_n" | sed -n '1p')
+        # **`${...}` で必ず囲む。** 変数の直後に日本語を置くと、macOS の
+        # /bin/sh は多バイト文字の先頭バイトを変数名に取り込んでしまい
+        # (`_one\xe3: unbound variable`)、`set -u` でその場で落ちる。
+        # しかも落ちるのは**古いバイナリを弾く経路だけ**なので、
+        # 「普段は動くのに、いちばん大事なときに死ぬ」形になる (実際に踏んだ)。
+        zai_reject "$1 はソースより古いので使いません (${_cnt} 件が新しい。例: ${_one}。\`cargo build --bin zai\` を先に走らせること)"
+        return 1
+    fi
+    zai_ver=$_v
+    return 0
+}
+
+# 候補 `$2` を、鮮度 → 計測ごとの適格判定 (`$1` の関数) の順で見る。
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+zai_try() {
+    zai_fresh "$2" || return 1
+    "$1" "$2" || {
+        zai_reject "$2: この計測に要る機能がありません"
+        return 1
+    }
+    zai=$2
+    return 0
+}
+
+# 探索順 (**全ベンチ共通**): ZAIVERN_BIN → release → debug → PATH。
+# `for` の各語を引用しているので、**空白を含むパスでも壊れない**。
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+zai_pick() {
+    zai=""
+    if [ -n "${ZAIVERN_BIN:-}" ]; then
+        zai_try "$1" "$ZAIVERN_BIN"
+        return $?
+    fi
+    for _c in \
+        "$target_dir/release/zai" "$target_dir/release/zai.exe" \
+        "$target_dir/debug/zai" "$target_dir/debug/zai.exe" \
+        "$(command -v zai 2>/dev/null || true)"; do
+        [ -n "$_c" ] || continue
+        zai_try "$1" "$_c" && return 0
+    done
+    return 1
+}
+
+# **使ったバイナリを絶対パスと版で必ず出す。** 出さない計測は再現できない。
+# shellcheck disable=SC2329  # 各ベンチの出力部から呼ぶ (静的には見えない)
+zai_identity() {
+    if [ -n "${1:-}" ]; then
+        case "$1" in
+        /*) _p=$1 ;;
+        *) _p="$PWD/$1" ;;
+        esac
+        printf 'zai: %s (%s)\n' "$_p" "${zai_ver:-版不明}"
+    else
+        printf 'zai: 見つかりません\n'
+    fi
+    [ -n "$zai_note" ] && printf 'zai の選定: %s\n' "$zai_note"
+    return 0
+}
+# @zai-honesty-end
+
 host_zai=""
 host_zai_ver=""
 host_zai_note=""
 
+# この計測の適格判定: 実行できれば足りる (下位ベンチが能力検査を持っている)。
+xplat_capable() { [ -x "$1" ]; }
+
+# 共通ブロックの結果を、このスクリプトが使う `host_zai*` へ写す。
+# **別のチェックアウトで作られた zai を拾うと比較そのものが無意味**になるので
+# (ホストと Linux で違うコードを測る)、既定ではこのワークツリーの target
+# 配下しか信用しない — その判断は共通ブロックの版・古さの照合が担う。
 resolve_host_zai() {
-    if [ -n "${ZAIVERN_BIN:-}" ]; then
-        if v=$(cap_run 20 "$ZAIVERN_BIN" --version 2>/dev/null); then
-            host_zai=$ZAIVERN_BIN
-            host_zai_ver=$(printf '%s' "$v" | awk '{print $NF}')
-            host_zai_note="ZAIVERN_BIN で明示 (版の照合は飛ばしました)"
-            return 0
-        fi
-        host_zai_note="ZAIVERN_BIN が動きません: $ZAIVERN_BIN"
+    zai_note=""
+    zai_pick xplat_capable || {
+        host_zai=""
+        host_zai_note=$zai_note
         return 1
-    fi
-    td=${CARGO_TARGET_DIR:-$root/target}
-    for cand in "$td/release/zai" "$td/release/zai.exe" "$td/debug/zai" "$td/debug/zai.exe"; do
-        [ -x "$cand" ] || continue
-        v=$(cap_run 20 "$cand" --version 2>/dev/null) || continue
-        v=$(printf '%s' "$v" | awk '{print $NF}')
-        if [ -n "$expect_ver" ] && [ "$v" != "$expect_ver" ]; then
-            host_zai_note="${host_zai_note}${host_zai_note:+ / }$cand は版が違うので使いません ($v != $expect_ver)"
-            continue
-        fi
-        host_zai=$cand
-        host_zai_ver=$v
-        return 0
-    done
-    return 1
+    }
+    host_zai=$zai
+    host_zai_ver=$(printf '%s' "$zai_ver" | awk '{print $NF}')
+    host_zai_note=$zai_note
+    return 0
 }
 
 build_host_zai() {
