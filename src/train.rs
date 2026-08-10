@@ -16,15 +16,22 @@
 //! | `lease.rs` | 同じファイルを 2 人に触らせない (**起こさない**) |
 //! | `conflict.rs` | 近い行の衝突を早く見せる (**見せる**) |
 //! | `semconf.rs` | ファイルは違うのに噛み合わない変更を見せる |
+//! | `coedit.rs` | **どの順でも一撃で通る**を証明する (立てば順序は要らない) |
 //! | `train.rs` | 見つけた後に **順番を決めて実際に統合する** |
 //!
 //! ## 設計
 //!
-//! 1. **順序決定は純関数** ([`plan_order`])。他と重なりが少ないものを先に流す。
-//!    先に入ったものが後続のリベース基準になるので、重なりの大きいものを
-//!    最後へ回すと人手が要る回数が最小になる。同点は**ブランチ名の辞書順**で
-//!    割り、`HashMap` / `HashSet` の反復順は 1 バイトも出力へ漏らさない
-//!    (`Vec` と `BTreeMap` / `BTreeSet` だけで組む)。
+//! 0. **まず [`crate::features::coedit`] の証明を取る** ([`proof_for`])。
+//!    「この N 本は互いに素だ」と言い切れる組に**順序を決める意味は無い**
+//!    ので、立ったら [`crate::features::coedit::integrate`] へ丸ごと委ね、
+//!    作業ツリーを一度も触らずに参照を 1 回だけ動かして終わる
+//!    ([`TrainReport::one_shot`])。立たなければ**どこで破れたか**を出して
+//!    下の順次統合へ降りる。**代わりに一撃経路はマージコミットを N 個作る**
+//!    ので、履歴を 1 本に保ちたいときは `--linear` で従来経路を選ぶ。
+//! 1. **順序決定は純関数** ([`plan_order`])。まず「もう載せた枝と衝突しない
+//!    もの」、その中で「他と重なりが少ないもの」を先に流す。同点は
+//!    **ブランチ名の辞書順**で割り、`HashMap` / `HashSet` の反復順は
+//!    1 バイトも出力へ漏らさない (`Vec` と `BTreeMap` / `BTreeSet` だけで組む)。
 //! 2. **実行前に必ず乾式検査** ([`dry_run`])。`git merge-tree --write-tree` を
 //!    順に当てて「この順序なら衝突する」を**参照を 1 つも動かす前に**言う。
 //!    使えない git (2.38 未満) では順序だけへ綺麗に降格する。
@@ -38,29 +45,54 @@
 //!
 //! **誇張しないために、良くない数字も並べて書く。**
 //!
-//! | 人数 | train 順: 衝突マージ/ハンク | 素朴順 (作成順) | 最初の衝突までに入った本数 (train / 素朴) |
+//! `tools/conflict-zero-bench.sh --writers N --files 6N --overlap 0.5`。
+//! 「無停止」= 最初の衝突までに自動で入った本数。
+//!
+//! | 人数 | 素朴順 (作成順) 衝突/無停止 | 旧 train 順 | **いまの train 順** |
 //! |---:|---:|---:|---:|
-//! | 8 | 4/8 · 7 | 4/8 · 7 | 4 / 2 |
-//! | 16 | 9/16 · 19 | 11/16 · 19 | 7 / 2 |
-//! | 24 | 16/24 · 40 | 19/24 · 40 | 1 / 2 |
-//! | 32 | 23/32 · 56 | 27/32 · 56 | 1 / 2 |
+//! | 8 | 4 / 2 | 4 / 4 | **3 / 5** |
+//! | 16 | 11 / 2 | 9 / 7 | **7 / 9** |
+//! | 24 | 19 / 2 | 16 / **1** | **14 / 10** |
+//! | 32 | 27 / 2 | 23 / **1** | **21 / 11** |
 //!
 //! * **衝突ハンクの総量は全規模で完全に一致する** (7 / 19 / 40 / 56)。
-//!   **順序付けは衝突を 1 つも消さない。** 消したければ `lease.rs` や
-//!   `split.rs` のように「そもそも同じ行を 2 人に触らせない」側が要る。
-//! * 減るのは**止まる回数**だけ。16 人で 11 → 9 回、32 人で 27 → 23 回。
-//! * **24 人以上では「最初の衝突までに自動で入る本数」が素朴順より短くなる**
-//!   (1 本 vs 2 本)。重なりの少ない枝を先に流しても、全員が同じ数本の
-//!   ファイルに集まる規模になると 1 本目で当たる。**ここは負けている。**
+//!   **順序付けは衝突を 1 つも消さない。** 消したければ `coedit.rs` の証明か、
+//!   `lease.rs` / `split.rs` のように「そもそも同じ行を 2 人に触らせない」側が要る。
+//! * 減るのは**止まる回数**と**手が止まるまでの長さ**だけ。
+//! * 旧実装は 24 人以上で無停止本数が **1 本**まで潰れ、素朴順 (2 本) にすら
+//!   負けていた。原因は「次数だけを見る貪欲が、いま置いた枝の隣を必ず次に
+//!   選ぶ」ことで、仮説ではなく衝突グラフを数えて割った ([`plan_order`] に
+//!   孤立点の推移と 7 seed の A/B を残してある)。
 //! * 乾式検査の的中率は 5 規模すべて **100%** (3/3・5/5・8/8・2/2・2/2)。
 //!   最初に衝突する枝も、衝突ファイル集合も、`--dry-run` の終了コードも
 //!   実際の実行と一致した。**予告としては信用してよい。**
 //!
+//! ## 証明を足したぶんの費用 (実測。debug ビルド・24 本・144 ファイル)
+//!
+//! | 段 | 所要 |
+//! |---|---:|
+//! | `zai train plan`（触った範囲 + **証明** + 乾式検査） | **9.2 秒** |
+//! | うち証明だけ (`zai coedit proof`) | **4.7 秒** |
+//! | `zai train run` (証明が立ったので一撃。24 本を統合) | **12.0 秒** |
+//!
+//! **証明は `plan` の所要をおよそ 2 倍にする。** 中身はほぼ git の起動時間で
+//! (24 本 × 2 回)、証明が立たない組では**丸ごう無駄になる**。それでも既定で
+//! 取るのは、立った組が「順序を決める・rebase する・作業ツリーを触る」を
+//! **全部やらずに済む**ようになるから。走査は裏のスレッドなので UI は
+//! 1 ミリ秒も止まらず、間隔は [`crate::git::scan_interval`] が直近の所要の
+//! 4 倍まで自動で空ける。
+//!
 //! ## 担保できないもの (正直に書く)
 //!
+//! * **一撃経路はマージコミットを N 個作る。** 作業ツリーを触らずに
+//!   `commit-tree` で積むため。上の実測でも 24 本 = マージコミット 24 個に
+//!   なっている。履歴を 1 本に保ちたいなら `zai train run --linear` で
+//!   従来の rebase + fast-forward を選ぶ (証明が立っていても順に流す)。
 //! * 乾式検査は**マージで近似**する。rebase はコミットを 1 つずつ当て直すので、
 //!   「途中のコミットだけが衝突して、最終形は綺麗に混ざる」ケースを乾式は
 //!   見落とす。そこは本番で fail-closed に止まって全部戻る (テスト済み)。
+//!   なお**証明が立った経路にはこの穴が無い** — 当て直しをしないため
+//!   (`証明が立てばrebase途中の衝突は起こり得ない` が固定している)。
 //! * **他のワークツリーが握っているブランチは動かさない。** 作業中の
 //!   エージェントの足元で履歴を書き換えるのは事故そのものなので、対象から
 //!   外して画面に理由を出す (CLAUDE.md の「統合したワークツリーは即座に消す」に
@@ -75,6 +107,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::conflict::{FileEdit, Span};
+// 🔒 衝突ゼロ証明。**実体 (`src/coedit.rs`) は 1 バイトも触らない** —
+// 登録ファイル (`src/features/coedit.rs`) の再エクスポート越しにだけ触る。
+use crate::features::coedit::{self, Clash};
 use crate::i18n::{tr, trf};
 use crate::panels::space;
 use crate::worktree::git_out;
@@ -237,9 +272,11 @@ pub fn plan_from_repo(
             .find(|(n, _)| n == &step.branch)
             .map(|(_, d)| d.display().to_string());
     }
+    let proof = proof_for(repo, onto, &plan.order());
     RepoPlan {
         plan,
         touches: touched.items,
+        proof,
     }
 }
 
@@ -248,6 +285,106 @@ pub fn plan_from_repo(
 pub struct RepoPlan {
     pub plan: TrainPlan,
     pub touches: Vec<BranchTouch>,
+    /// 衝突ゼロ証明。立っていれば**順序を決める意味が無い**。
+    pub proof: ProofSummary,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  2.5. 衝突ゼロ証明との接続 — 立つなら順序は要らない
+// ═══════════════════════════════════════════════════════════════════════
+
+/// [`crate::features::coedit`] の証明を `train` の言葉へ畳んだもの。
+///
+/// ## なぜ 2 つの層が要るのか
+///
+/// * `coedit` — **実際に書かれた行域だけ**を見て「この N 本はどの順でも
+///   一撃で通る」を言い切る。立てば作業ツリーを一度も触らず、
+///   参照を最後に 1 回動かすだけで終わる (人手 0 回が構造的に保証される)。
+/// * `train` — 立たなかったときに**順番を決めて 1 本ずつ流す**。
+///   衝突は消えないが、手が止まる回数が減る。
+///
+/// **証明が立つ組に順序を決める意味は無い** (どの順でも通ると証明できている)
+/// ので、`train` は計画時にまずここを叩き、立てば [`crate::features::coedit`]
+/// の一撃統合へ丸ごと委ねる。立たなければ**どこで破れたか**
+/// ([`ProofSummary::broke_at`]) を出したうえで従来の順次統合へ降りる。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ProofSummary {
+    /// 立ったか。**true なら順序を決める必要が無い。**
+    pub proven: bool,
+    /// 証明の対象になったブランチ (辞書順)。
+    pub branches: Vec<String>,
+    /// **どこで破れたか** (`パス: a L… ↔ b L…`)。立ったときは空。
+    /// [`MAX_SHOWN_FILES`] 件で切り、切ったぶんは [`ProofSummary::more`] に出る。
+    pub broke_at: Vec<String>,
+    /// [`ProofSummary::broke_at`] に載せ切れなかった組の数。
+    pub more: usize,
+    /// 使った安全帯 (行)。
+    pub band: u32,
+    /// 上限を超えて**見なかった**本数。
+    pub skipped: usize,
+    /// 降格・打ち切りの理由。**必ず画面に出す** (無音で切らない)。
+    pub note: Option<String>,
+    pub took_ms: u128,
+}
+
+impl ProofSummary {
+    /// 1 行の判定文 (**日本語の原文**を組み立てて返す)。
+    pub fn verdict(&self) -> String {
+        if self.proven {
+            return trf(
+                "🔒 {n} 本は互いに素だと証明できました — 順序は不要です (どの順でも一撃で通ります)",
+                &[("n", self.branches.len().to_string())],
+            );
+        }
+        if self.broke_at.is_empty() {
+            return match &self.note {
+                Some(m) => trf(
+                    "🔓 証明できません: {m} — 順序を決めて流します",
+                    &[("m", m.clone())],
+                ),
+                None => tr("🔓 証明は立ちません — 順序を決めて流します"),
+            };
+        }
+        trf(
+            "🔓 証明は {n} 組で破れました — 順序を決めて 1 本ずつ流します",
+            &[("n", (self.broke_at.len() + self.more).to_string())],
+        )
+    }
+}
+
+/// **証明を取る。裏のスレッドから呼ぶこと** (ブランチ 1 本あたり git を 2 回起動する)。
+///
+/// 判定そのものは 1 バイトも書き直さず [`crate::features::coedit::proof`] を
+/// そのまま使う。安全帯も `coedit` の既定 ([`crate::features::coedit::Opts`])
+/// から取るので、**`plan` が「立つ」と言った組は `integrate` でも必ず立つ**
+/// (2 か所で別々の帯を持つと、計画と実行がずれて一番タチの悪い形で外れる)。
+pub fn proof_for(repo: &Path, onto: &str, branches: &[String]) -> ProofSummary {
+    let band = coedit::Opts::default().band;
+    if branches.is_empty() {
+        return ProofSummary {
+            band,
+            note: Some(tr("証明するブランチがありません")),
+            ..Default::default()
+        };
+    }
+    let p = coedit::proof(repo, onto, branches, band);
+    let shown: Vec<String> = p
+        .pairs
+        .iter()
+        .take(MAX_SHOWN_FILES)
+        .map(Clash::render)
+        .collect();
+    let more = p.pairs.len().saturating_sub(shown.len()) + p.truncated;
+    ProofSummary {
+        proven: p.disjoint,
+        branches: p.names(),
+        broke_at: shown,
+        more,
+        band: p.band,
+        skipped: p.skipped,
+        note: p.note.clone(),
+        took_ms: p.took_ms,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -366,6 +503,18 @@ impl TrainPlan {
     pub fn order(&self) -> Vec<String> {
         self.steps.iter().map(|s| s.branch.clone()).collect()
     }
+
+    /// **最初に手が止まるまでに自動で入る見込みの本数。**
+    ///
+    /// 順序付けが増やせるのはここだけで、[`TrainPlan::line_pairs`]
+    /// (= 人手が要る回数の下限) は順序をどう変えても動かない。
+    /// 2 つを並べて出すのは、**良くなる方だけ見せない**ため。
+    pub fn clean_prefix(&self) -> usize {
+        self.steps
+            .iter()
+            .take_while(|s| s.expect != Risk::Line)
+            .count()
+    }
 }
 
 /// `(小さい方, 大きい方)` に正規化した鍵で引く。
@@ -378,19 +527,66 @@ fn pair_of<'a>(m: &'a BTreeMap<(String, String), Pair>, a: &str, b: &str) -> Opt
     m.get(&key)
 }
 
-/// **順序決定 (純関数)。** 他と重なりが少ないものを先に流す。
+/// **順序決定 (純関数)。** まず「もう載せたものと衝突しないもの」、その中で
+/// 「他と重なりが少ないもの」を先に流す。
 ///
-/// 先に入ったものが後続のリベース基準になるので、重なりの大きいものを最後へ
-/// 回すと「人手が要る回数」が最小になる。各段で**残っている相手**との重なりを
-/// 数え直す貪欲法で、優先度は
-/// `(行で重なる相手の数, ファイルで重なる相手の数, 重なりファイルの総数,
-///   自分が触ったファイル数, ブランチ名)` の辞書順。
-///
-/// 4 番目 (自分の触ったファイル数) が要るのは、残りの相手が同数になったときに
-/// **足跡の広いほうを後ろへ回す**ため。これが無いと、2 ファイルを触る `hub` と
-/// 1 ファイルの `tb` が「残り 1 本と重なる」で並び、名前だけで決まってしまう。
+/// 優先度は
+/// `(もう載せた枝と行で重なるか, 同じくファイルで重なるか,
+///   残りのうち行で重なる相手の数, 同じくファイルで重なる数,
+///   重なりファイルの総数, 自分が触ったファイル数, ブランチ名)` の辞書順。
 /// 最後の項が名前なので**同点でも必ず一意に決まる** (`HashMap` の反復順は
 /// 出力へ 1 バイトも漏れない)。
+///
+/// 5 番目まで同じときに 6 番目 (自分の触ったファイル数) が要るのは、
+/// **足跡の広いほうを後ろへ回す**ため。これが無いと、2 ファイルを触る `hub` と
+/// 1 ファイルの `tb` が「残り 1 本と重なる」で並び、名前だけで決まってしまう。
+///
+/// ## なぜ 1・2 番目 (もう載せた枝との衝突) が要るのか — 測ってから直した
+///
+/// 最初の実装は 3 番目以降だけ、つまり**残っている相手との次数が最小**の枝を
+/// 選ぶ素直な貪欲法だった。これは「衝突で止まる回数」は確かに減らすが、
+/// **「最初の衝突までに自動で入る本数」を高並列で 1 本まで潰していた**
+/// (24 人で train 1 本 vs 素朴順 2 本。順序付けが負けている、と `docs` に
+/// 数字が残っていた)。
+///
+/// 原因は仮説ではなく実測で割れた。`tools/conflict-zero-bench.sh` と同じ
+/// 担当表を作って衝突グラフを数えると、**行で重なる辺を 1 本も持たない枝
+/// (孤立点) の数**が規模でこう動く:
+///
+/// | 人数 | 8 | 16 | 24 | 32 | 48 |
+/// |---|---:|---:|---:|---:|---:|
+/// | 行で重なる辺 | 8 | 22 | 62 | 94 | 223 |
+/// | **孤立点** | 1 | 2 | **0** | **0** | **0** |
+/// | 次数の中央値 | 2 | 3 | 6 | 6 | 10 |
+///
+/// 孤立点が 0 になると最小次数は 1 になる。次数 1 の枝を置くと、
+/// **その唯一の隣の次数が 1 → 0 に落ちて全体の最小になる**ので、
+/// 次数だけを見る貪欲は**必ず「いま置いたものの隣」を次に選ぶ**。
+/// 24 / 32 / 48 人で「2 本目が 1 本目の隣か」を実測すると全て `true` だった。
+/// 無停止本数が 1 で止まるのはこのため — 運ではなく構造。
+///
+/// 直し方は「置いた枝を残りから引く」のをやめ、**置いた枝の隣を明示的に
+/// 後ろへ落とす**こと。効果は 7 seed の平均で見た (下の数字は担当表の模型で、
+/// **実 git の結果を種 20260810 で 1 件ずれずに再現する**ことを先に確かめてある
+/// — 8 人 4/4・16 人 9/7・24 人 16/1 が実測と完全一致した):
+///
+/// | 人数 | 衝突回数 (旧 → 新) | 無停止本数 (旧 → 新) |
+/// |---:|---:|---:|
+/// | 8 | 4.0 → 3.6 | 2.9 → **4.4** |
+/// | 16 | 10.3 → 8.7 | 4.3 → **7.3** |
+/// | 24 | 16.4 → 14.3 | 3.7 → **9.7** |
+/// | 32 | 23.7 → 21.3 | 5.1 → **10.7** |
+/// | 48 | 38.1 → 34.1 | 5.0 → **13.9** |
+/// | 64 | 52.6 → 47.7 | 6.0 → **16.3** |
+///
+/// **両方の指標で、全ての規模で改善した。悪化した規模は 1 つも無い。**
+/// ただし **衝突ハンクの総量は 1 つも減らない** — 減るのは手が止まる回数だけ。
+///
+/// 2 番目 (ファイルだけ重なる枝を後ろへ) は、この合成担当表では差が出ない
+/// (24 人で 14.3 vs 14.6、32 人で 21.3 vs 21.0 = 誤差)。**効くのは行情報が
+/// 取れないとき**で、二値・新規・リネームを混ぜて `Risk::File` 止まりの枝を
+/// 25% / 50% 入れると無停止本数が 3.7 → 4.4 / 4.6 → 5.7 (24 人)、
+/// 3.6 → 4.6 / 4.9 → 5.9 (32 人) と伸びた。**測ったので残している。**
 pub fn plan_order(touches: &[BranchTouch]) -> TrainPlan {
     // 入力の並びを出力へ漏らさない。同名は先勝ち。
     let mut by_name: BTreeMap<String, &BranchTouch> = BTreeMap::new();
@@ -419,11 +615,15 @@ pub fn plan_order(touches: &[BranchTouch]) -> TrainPlan {
     }
     let line_pairs = pairs.values().filter(|p| p.risk == Risk::Line).count();
 
-    // 貪欲に「残りとの重なりが最小」を選ぶ。
+    // 貪欲に選ぶ。**まず「もう載せた枝と衝突しないもの」、その中で
+    // 「残りとの重なりが最小」。** 隣を数から引くのではなく集合で覚えるのは、
+    // 引き算だと「いま置いた枝の隣」が次に最小になってしまうため (上の実測)。
     let mut remaining: Vec<String> = names.clone();
     let mut order: Vec<String> = Vec::with_capacity(names.len());
+    let mut line_blocked: BTreeSet<String> = BTreeSet::new();
+    let mut file_blocked: BTreeSet<String> = BTreeSet::new();
     while !remaining.is_empty() {
-        let mut best: Option<(usize, usize, usize, usize, String)> = None;
+        let mut best: Option<(usize, usize, usize, usize, usize, usize, String)> = None;
         for c in &remaining {
             let mut line_peers = 0usize;
             let mut file_peers = 0usize;
@@ -443,6 +643,8 @@ pub fn plan_order(touches: &[BranchTouch]) -> TrainPlan {
                 shared += p.files.len();
             }
             let key = (
+                usize::from(line_blocked.contains(c)),
+                usize::from(file_blocked.contains(c)),
                 line_peers,
                 file_peers,
                 shared,
@@ -453,8 +655,20 @@ pub fn plan_order(touches: &[BranchTouch]) -> TrainPlan {
                 best = Some(key);
             }
         }
-        let pick = best.expect("remaining が空でないなら必ず選ばれる").4;
+        let pick = best.expect("remaining が空でないなら必ず選ばれる").6;
         remaining.retain(|x| x != &pick);
+        // 置いた枝の隣を後ろへ落とす。**この 1 手が無停止本数を決める。**
+        for o in &remaining {
+            match pair_of(&pairs, &pick, o).map(|p| p.risk) {
+                Some(Risk::Line) => {
+                    line_blocked.insert(o.clone());
+                }
+                Some(Risk::File) => {
+                    file_blocked.insert(o.clone());
+                }
+                _ => {}
+            }
+        }
         order.push(pick);
     }
 
@@ -585,7 +799,10 @@ pub fn dry_run(repo: &Path, onto: &str, order: &[String]) -> DryResult {
         let Some(tree) = first_oid(&raw) else {
             note = Some(trf(
                 "{b} の乾式検査ができませんでした: {m}",
-                &[("b", b.clone()), ("m", raw.lines().next().unwrap_or("").into())],
+                &[
+                    ("b", b.clone()),
+                    ("m", raw.lines().next().unwrap_or("").into()),
+                ],
             ));
             break;
         };
@@ -599,7 +816,16 @@ pub fn dry_run(repo: &Path, onto: &str, order: &[String]) -> DryResult {
             break;
         }
         let mut argv: Vec<&str> = DRY_IDENT.to_vec();
-        argv.extend_from_slice(&["commit-tree", &tree, "-p", &head, "-p", b, "-m", DRY_COMMIT_MSG]);
+        argv.extend_from_slice(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &head,
+            "-p",
+            b,
+            "-m",
+            DRY_COMMIT_MSG,
+        ]);
         match git_out(repo, &argv) {
             Ok(c) if !c.trim().is_empty() => head = c.trim().to_string(),
             _ => {
@@ -632,6 +858,16 @@ pub struct TrainRequest {
     pub branches: Vec<String>,
     /// true なら乾式検査までで止める (参照を 1 つも動かさない)。
     pub dry_run: bool,
+    /// 証明が立っても**一撃経路を使わず**、順序を決めて 1 本ずつ rebase する。
+    ///
+    /// 既定 (`false`) では、[`ProofSummary::proven`] が立った組は
+    /// [`crate::features::coedit::integrate`] へ委ねる — 作業ツリーを一度も
+    /// 触らず、参照が動くのは最後の 1 回だけになる。**代わりに統合先へ
+    /// マージコミットが N 個載る** (`commit-tree` で積むため)。
+    /// 履歴を 1 本に保ちたいならここを `true` にする
+    /// (`zai train run --linear`)。速さと履歴の形は交換なので、
+    /// **黙ってどちらかに決めない。**
+    pub linear: bool,
 }
 
 /// 止まった理由。**どのブランチの・どのファイルの・どの行で・誰と** を持つ。
@@ -655,6 +891,10 @@ pub struct TrainStop {
 pub struct TrainReport {
     pub onto: String,
     pub plan: TrainPlan,
+    /// 衝突ゼロ証明。`proven` なら [`TrainReport::one_shot`] が立つ。
+    pub proof: ProofSummary,
+    /// 証明が立ったので**順序を決めずに一撃で流した**か。
+    pub one_shot: bool,
     pub dry: DryResult,
     /// 実際に統合できたブランチ (統合順)。
     pub merged: Vec<String>,
@@ -698,7 +938,12 @@ pub fn default_onto(repo: &Path) -> String {
         .unwrap_or_default();
     let head = git_out(
         repo,
-        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
     )
     .unwrap_or_default();
     if let Some((_, b)) = head.trim().split_once('/') {
@@ -736,6 +981,20 @@ pub fn candidates(repo: &Path, onto: &str) -> Candidates {
         }
     }
     out
+}
+
+/// このワークツリーに**未コミットの変更**があるか。**裏のスレッドから呼ぶこと。**
+///
+/// 追跡外のファイルは rebase を妨げないので見ない (見ると、このリポジトリでは
+/// 常に「汚れている」になる)。[`run_train`] は汚れていたら始めないので、
+/// **計画の段階で同じ判定を出しておかないと「押せるのに必ず失敗するボタン」**
+/// になる。計画そのものは読み取りしかしないので、汚れていても**出す** —
+/// 「並列で走らせている最中に、いま統合したらどうなるか」を知りたい場面で
+/// 何も出ないのでは意味がない。
+pub fn uncommitted(repo: &Path) -> bool {
+    git_out(repo, &["status", "--porcelain", "--untracked-files=no"])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// 衝突しているファイルと行 (`パス:行`) を取る。**言語に依存しない**
@@ -852,15 +1111,32 @@ pub fn run_train(req: &TrainRequest) -> Result<TrainReport, String> {
         ));
     }
 
-    // ④ 順序を決める (純関数) → 乾式検査。
+    // ④ 順序を決める (純関数) → 証明 → 乾式検査。
     // ここへ来た時点で握られているブランチは弾いてあるので held は空でよい。
-    let RepoPlan { plan, touches } = plan_from_repo(&top, &req.onto, &branches, &[]);
+    let RepoPlan {
+        plan,
+        touches,
+        proof,
+    } = plan_from_repo(&top, &req.onto, &branches, &[]);
     let order = plan.order();
+
+    // ④' **証明が立つなら順序を決める意味が無い。** どの順でも通ると
+    //     言い切れているので、`coedit` の一撃統合へ丸ごと委ねる。
+    if proof.proven && !req.linear {
+        return one_shot(&top, req, plan, proof, t0, log);
+    }
+    log.push(proof.verdict());
+    for w in proof.broke_at.iter().take(MAX_SHOWN_FILES) {
+        log.push(format!("  {w}"));
+    }
+
     let dry = dry_run(&top, &req.onto, &order);
 
     let mut report = TrainReport {
         onto: req.onto.clone(),
         plan,
+        proof,
+        one_shot: false,
         dry,
         merged: Vec::new(),
         stop: None,
@@ -953,10 +1229,15 @@ pub fn run_train(req: &TrainRequest) -> Result<TrainReport, String> {
     // ⑦ 元いた場所へ戻す (統合先とブランチは進んだまま)。
     let back = match &head_ref {
         Some(r) => git_out(&top, &["checkout", "--quiet", "--force", r]),
-        None => git_out(&top, &["checkout", "--quiet", "--force", "--detach", &head_oid]),
+        None => git_out(
+            &top,
+            &["checkout", "--quiet", "--force", "--detach", &head_oid],
+        ),
     };
     if back.is_err() {
-        log.push(tr("⚠ 元のブランチへ戻れませんでした。git status を確認してください"));
+        log.push(tr(
+            "⚠ 元のブランチへ戻れませんでした。git status を確認してください",
+        ));
     }
     log.push(trf(
         "✅ {n} 本すべてを {o} へ入れました",
@@ -968,6 +1249,89 @@ pub fn run_train(req: &TrainRequest) -> Result<TrainReport, String> {
     report.log = log;
     report.took_ms = t0.elapsed().as_millis();
     Ok(report)
+}
+
+/// **証明が立った組の一撃統合。** 順序を 1 つも使わない。
+///
+/// 判定も統合も [`crate::features::coedit::integrate`] がそのまま行う
+/// (`train` 側で三方向マージを書き直さない)。`train` がここで足すのは
+/// **報告の形を揃えること**だけ:
+///
+/// * `plan` は残す — 「どんな順序が出ていたか」は後から読めたほうがよい
+///   (ただし**その順序は使っていない**ので、`one_shot` を必ず立てて区別する)
+/// * `dry` は `integrate` が実際に走らせた `merge-tree` の鎖から起こす。
+///   別に `train::dry_run` を撃つと**同じ検査を 2 度払う**ことになる
+/// * `dry_run` 指定なら `merged` は空のまま返す — 参照は 1 つも動いていない
+///   のに「入った」と読める列を出さないため (`train` 側の契約)
+///
+/// **`-X ours` のような強行は 1 か所も無い。** 証明が立たなければここへ来ない。
+fn one_shot(
+    top: &Path,
+    req: &TrainRequest,
+    plan: TrainPlan,
+    proof: ProofSummary,
+    t0: Instant,
+    mut log: Vec<String>,
+) -> Result<TrainReport, String> {
+    log.push(proof.verdict());
+    let opts = coedit::Opts {
+        band: proof.band,
+        dry_run: req.dry_run,
+        // **証明が立った経路しか通らない。** force は「証明が立たなくても
+        // 乾式が綺麗なら通す」の意味なので、ここでは決して立てない。
+        force: false,
+    };
+    let out = coedit::integrate(top, &req.onto, &plan.order(), &opts)?;
+    let mut steps: Vec<DryStep> = out
+        .merged
+        .iter()
+        .map(|b| DryStep {
+            branch: b.clone(),
+            conflicts: Vec::new(),
+        })
+        .collect();
+    if let Some(s) = &out.stop {
+        if !s.branch.is_empty() {
+            steps.push(DryStep {
+                branch: s.branch.clone(),
+                conflicts: s.files.clone(),
+            });
+        }
+    }
+    let stop = out.stop.as_ref().map(|s| TrainStop {
+        branch: s.branch.clone(),
+        files: s.files.clone(),
+        // 参照を 1 つも動かしていないので、作業ツリーに衝突マーカは存在しない。
+        lines: Vec::new(),
+        against: s.against.clone(),
+        detail: s.detail.clone(),
+        predicted: s.predicted,
+    });
+    log.extend(out.log.iter().cloned());
+    Ok(TrainReport {
+        onto: req.onto.clone(),
+        plan,
+        proof,
+        one_shot: true,
+        dry: DryResult {
+            available: out.dry_available,
+            steps,
+            note: None,
+        },
+        // 乾式指定なら「入った」ものは無い (参照は 1 バイトも動いていない)。
+        merged: if req.dry_run {
+            Vec::new()
+        } else {
+            out.merged.clone()
+        },
+        // `coedit` の `restored` は「開始時のまま留まったか」なので、
+        // 成功したときは false になる。`train` の `restored` は
+        // 「止まったあと戻せたか」なので、止まっていなければ true。
+        restored: if stop.is_some() { out.restored } else { true },
+        stop,
+        log,
+        took_ms: t0.elapsed().as_millis(),
+    })
 }
 
 /// `files` を触っていて、`branch` より**先に入る**ブランチ (= 衝突の相手)。
@@ -1224,7 +1588,12 @@ struct Snapshot {
     repo: PathBuf,
     onto: String,
     plan: TrainPlan,
+    /// 衝突ゼロ証明。立っていれば「順序不要・一撃で通る」と出す。
+    proof: ProofSummary,
     dry: DryResult,
+    /// 未コミットの変更があるので実行は保留 ([`uncommitted`])。
+    /// **計画からは 1 本も外さない。**
+    pending_commit: bool,
     note: Option<String>,
     cost: Duration,
 }
@@ -1301,12 +1670,14 @@ fn scan(root: PathBuf) -> Snapshot {
         .cloned()
         .chain(cand.held.iter().map(|(b, _)| b.clone()))
         .collect();
-    let RepoPlan { plan, .. } = plan_from_repo(&top, &onto, &all, &cand.held);
+    let RepoPlan { plan, proof, .. } = plan_from_repo(&top, &onto, &all, &cand.held);
     let dry = dry_run(&top, &onto, &plan.order());
     Snapshot {
+        pending_commit: uncommitted(&top),
         repo: top,
         onto,
         plan,
+        proof,
         dry,
         note: None,
         cost: t0.elapsed(),
@@ -1336,6 +1707,8 @@ fn start_run(st: &mut PanelState) {
         // エージェントの足元で履歴を書き換えないため run からは外す。
         branches: runnable(&st.snap.plan),
         dry_run: false,
+        // 証明が立つなら一撃で通す (立たなければ自動で順次統合へ降りる)。
+        linear: false,
     };
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -1469,7 +1842,17 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
             ))
             .strong(),
         );
-        if st.snap.plan.line_pairs > 0 {
+        // 🔒 証明が立ったら**それが結論**なので、順序の話より先に出す。
+        if st.snap.proof.proven {
+            ui.label(
+                egui::RichText::new(tr("🔒 順序不要 — 一撃で通ります"))
+                    .color(vis.hyperlink_color)
+                    .small(),
+            )
+            .on_hover_text(tr(
+                "変更行域が互いに離れていることを証明できました。どの順で入れても衝突しません。作業ツリーは一度も触らず、参照は最後に 1 回だけ動きます。",
+            ));
+        } else if st.snap.plan.line_pairs > 0 {
             ui.label(
                 egui::RichText::new(trf(
                     "行が重なる組 {n}",
@@ -1478,8 +1861,12 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
                 .color(vis.warn_fg_color)
                 .small(),
             )
-            .on_hover_text(tr(
-                "順序をどう変えても消えない重なりです。人手が要る回数の下限になります。",
+            .on_hover_text(trf(
+                "順序をどう変えても消えない重なりです。人手が要る回数の下限になります。\n最初に止まるまでに自動で入る見込み: {k} / {n} 本",
+                &[
+                    ("k", st.snap.plan.clean_prefix().to_string()),
+                    ("n", st.snap.plan.steps.len().to_string()),
+                ],
             ));
         }
         if let Some(c) = st.last_cost {
@@ -1497,14 +1884,27 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
             let busy = st.run_rx.is_some();
             let free = runnable(&st.snap.plan).len();
             let blocked = st.snap.plan.steps.len() - free;
-            let ready = free > 0 && !st.snap.onto.is_empty();
-            let hint = if blocked > 0 {
-                trf(
-                    "動かせる {n} 本だけを順に rebase して fast-forward します (作業中の {m} 本は外します)。失敗したら即止めて、開始時の状態へ全部戻します。",
-                    &[("n", free.to_string()), ("m", blocked.to_string())],
-                )
+            // 未コミットなら `run_train` が必ず断るので、**押せるのに必ず
+            // 失敗するボタン**にしない。計画そのものは出したままにする。
+            let ready = free > 0 && !st.snap.onto.is_empty() && !st.snap.pending_commit;
+            let how = if st.snap.proof.proven {
+                tr("証明が立っているので順序を使わず一撃で入れます (作業ツリーは触らず、参照は最後に 1 回だけ動きます)")
             } else {
                 tr("順に rebase して fast-forward します。失敗したら即止めて、開始時の状態へ全部戻します。")
+            };
+            let hint = if st.snap.pending_commit {
+                tr("このワークツリーに未コミットの変更があるので実行は保留です。コミットしてから始めてください (計画はいま出ているとおりです)")
+            } else if blocked > 0 {
+                trf(
+                    "動かせる {n} 本だけが対象です (作業中の {m} 本は外します)。{h}",
+                    &[
+                        ("n", free.to_string()),
+                        ("m", blocked.to_string()),
+                        ("h", how),
+                    ],
+                )
+            } else {
+                how
             };
             if ui
                 .add_enabled(!busy && ready, egui::Button::new(tr("統合を開始")))
@@ -1523,14 +1923,25 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
         });
     });
 
-    for note in [st.snap.note.as_ref(), st.snap.dry.note.as_ref()]
-        .into_iter()
-        .flatten()
+    for note in [
+        st.snap.note.as_ref(),
+        st.snap.proof.note.as_ref(),
+        st.snap.dry.note.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         ui.label(egui::RichText::new(format!("ℹ {note}")).small().color(dim));
     }
     if let Some(e) = &st.error {
         ui.colored_label(vis.error_fg_color, format!("⛔ {e}"));
+    }
+    // **状態として出す。計画からは 1 本も外さない。**
+    if st.snap.pending_commit {
+        ui.colored_label(
+            vis.warn_fg_color,
+            tr("✍ 未コミットの変更があるので実行は保留です (計画は出しています)"),
+        );
     }
     if st.snap.plan.dropped > 0 {
         ui.colored_label(
@@ -1615,12 +2026,9 @@ fn stop_detail(ui: &mut egui::Ui, stop: &TrainStop, restored: Option<bool>) {
     );
     if !stop.against.is_empty() {
         ui.label(
-            egui::RichText::new(trf(
-                "相手: {list}",
-                &[("list", stop.against.join(", "))],
-            ))
-            .small()
-            .color(vis.weak_text_color()),
+            egui::RichText::new(trf("相手: {list}", &[("list", stop.against.join(", "))]))
+                .small()
+                .color(vis.weak_text_color()),
         );
     }
     let mut where_: Vec<String> = stop.lines.clone();
@@ -1702,8 +2110,10 @@ fn usage() -> String {
         String::new(),
         tr("  plan [--repo <path>] [--json]"),
         tr("      統合順と、その順序で予想される衝突を出す (参照は動かさない)"),
-        tr("  run  [--repo <path>] [--onto <branch>] [--dry-run]"),
-        tr("      順に rebase して fast-forward する。失敗したら全部戻す"),
+        tr("  run  [--repo <path>] [--onto <branch>] [--dry-run] [--linear]"),
+        tr("      衝突ゼロ証明が立てば順序を使わず一撃で統合する。"),
+        tr("      立たなければ順に rebase して fast-forward する。失敗したら全部戻す"),
+        tr("      --linear: 証明が立っても rebase で 1 本ずつ流す (履歴を 1 本に保つ)"),
         String::new(),
         tr("終了コード: 0=成功 / 1=衝突で停止 / 2=使い方の誤り"),
         String::new(),
@@ -1717,6 +2127,7 @@ struct Flags {
     onto: Option<String>,
     json: bool,
     dry: bool,
+    linear: bool,
 }
 
 /// 引数を読む。**知らないフラグは黙って無視しない** (使い方の誤りは 2)。
@@ -1742,6 +2153,9 @@ fn parse_flags(args: &[String], allow_dry: bool) -> Result<Flags, String> {
             }
             "--json" => f.json = true,
             "--dry-run" if allow_dry => f.dry = true,
+            // `plan` は参照を動かさないので `--linear` の意味が無い。
+            // 黙って無視せず「知らない引数」で 2 を返す。
+            "--linear" if allow_dry => f.linear = true,
             other => return Err(format!("知らない引数: {other}")),
         }
     }
@@ -1788,9 +2202,17 @@ struct PlanOut {
     /// 各段の `blocked_by` に「いま動かせない理由」が**1 本ずつ**入る。
     /// まとめた一覧を別に持つと 2 か所がずれるので、ここには置かない。
     plan: TrainPlan,
+    /// 衝突ゼロ証明。`proven` なら `run` は順序を使わず一撃で流す。
+    proof: ProofSummary,
     dry: DryResult,
     /// この計画のうち、いま `run` に回せる本数。
     runnable: usize,
+    /// 最初に手が止まるまでに自動で入る見込みの本数
+    /// ([`TrainPlan::clean_prefix`])。順序付けが増やせるのはここだけ。
+    clean_prefix: usize,
+    /// このワークツリーに未コミットの変更があるので、**計画は出せるが
+    /// `run` は保留**という状態 ([`uncommitted`])。
+    pending_commit: bool,
 }
 
 fn cli_plan(args: &[String]) -> i32 {
@@ -1811,7 +2233,10 @@ fn cli_plan(args: &[String]) -> i32 {
     };
     let onto = f.onto.unwrap_or_else(|| default_onto(&top));
     if onto.is_empty() {
-        eprintln!("{}", tr("統合先のブランチが分かりません (--onto で指定してください)"));
+        eprintln!(
+            "{}",
+            tr("統合先のブランチが分かりません (--onto で指定してください)")
+        );
         return 2;
     }
     // **plan は握られている枝も載せる** (読み取りしかしないので安全で、
@@ -1823,12 +2248,15 @@ fn cli_plan(args: &[String]) -> i32 {
         .cloned()
         .chain(cand.held.iter().map(|(b, _)| b.clone()))
         .collect();
-    let RepoPlan { plan, .. } = plan_from_repo(&top, &onto, &all, &cand.held);
+    let RepoPlan { plan, proof, .. } = plan_from_repo(&top, &onto, &all, &cand.held);
     let dry = dry_run(&top, &onto, &plan.order());
     let out = PlanOut {
         onto,
         runnable: runnable(&plan).len(),
+        clean_prefix: plan.clean_prefix(),
+        pending_commit: uncommitted(&top),
         plan,
+        proof,
         dry,
     };
     if f.json {
@@ -1845,6 +2273,17 @@ fn cli_plan(args: &[String]) -> i32 {
     if out.plan.steps.is_empty() {
         println!("{}", tr("統合を待っているブランチはありません"));
     }
+    // **証明を先に出す。** 立っていれば下の順序は「参考」でしかない。
+    println!("{}", out.proof.verdict());
+    for w in &out.proof.broke_at {
+        println!("  {w}");
+    }
+    if out.proof.more > 0 {
+        println!(
+            "{}",
+            trf("  ほか {n} 組", &[("n", out.proof.more.to_string())])
+        );
+    }
     for s in &out.plan.steps {
         let c = row_cells(s, &out.dry, None, RunPhase::Idle);
         println!(
@@ -1854,6 +2293,21 @@ fn cli_plan(args: &[String]) -> i32 {
             c.files,
             c.expect,
             c.status
+        );
+    }
+    // **良くなる方だけ出さない。** 順序付けが増やせるのは無停止本数だけで、
+    // 行が重なる組 (= 人手が要る回数の下限) は順序をどう変えても動かない。
+    if !out.proof.proven && !out.plan.steps.is_empty() {
+        println!(
+            "{}",
+            trf(
+                "最初に止まるまでに自動で入る見込み: {k} / {n} 本 (行が重なる組 {p} は順序では消えません)",
+                &[
+                    ("k", out.clean_prefix.to_string()),
+                    ("n", out.plan.steps.len().to_string()),
+                    ("p", out.plan.line_pairs.to_string()),
+                ]
+            )
         );
     }
     // **黙って切らない。** 上限で落としたぶんは必ず件数で出す。
@@ -1867,6 +2321,13 @@ fn cli_plan(args: &[String]) -> i32 {
                     ("m", out.plan.dropped.to_string())
                 ]
             )
+        );
+    }
+    // **押せるのに必ず失敗する状態を、押す前に出す。**
+    if out.pending_commit {
+        println!(
+            "{}",
+            tr("✍ このワークツリーに未コミットの変更があるので実行は保留です (計画は上のとおり出せています)")
         );
     }
     let blocked = out.plan.steps.len() - out.runnable;
@@ -1903,7 +2364,10 @@ fn cli_run(args: &[String]) -> i32 {
     };
     let onto = f.onto.unwrap_or_else(|| default_onto(&top));
     if onto.is_empty() {
-        eprintln!("{}", tr("統合先のブランチが分かりません (--onto で指定してください)"));
+        eprintln!(
+            "{}",
+            tr("統合先のブランチが分かりません (--onto で指定してください)")
+        );
         return 2;
     }
     let branches = candidates(&top, &onto).free;
@@ -1912,6 +2376,7 @@ fn cli_run(args: &[String]) -> i32 {
         onto,
         branches,
         dry_run: f.dry,
+        linear: f.linear,
     };
     let report = match run_train(&req) {
         Ok(r) => r,
@@ -1933,7 +2398,12 @@ fn cli_run(args: &[String]) -> i32 {
             println!("{l}");
         }
         if let Some(stop) = &report.stop {
-            for w in stop.lines.iter().chain(stop.files.iter()).take(MAX_SHOWN_FILES) {
+            for w in stop
+                .lines
+                .iter()
+                .chain(stop.files.iter())
+                .take(MAX_SHOWN_FILES)
+            {
                 println!("  {w}");
             }
             if !stop.against.is_empty() {
@@ -2103,6 +2573,33 @@ mod tests {
         assert_eq!(last.overlaps.len(), 1);
     }
 
+    /// **いま置いた枝の隣を次に選ばない。**
+    ///
+    /// 旧実装 (残りとの次数だけを見る貪欲) が高並列で無停止本数を 1 まで
+    /// 潰していた型を、最小の形で固定する。`a—b` が 1 組、`c—d—e` が三角形
+    /// なので最小次数は 1 (= `a` と `b`)。`a` を置くと `b` の次数が 1 → 0 に
+    /// 落ちるため、**次数だけを見る貪欲は必ず `b` を 2 番目に選び、
+    /// そこで手が止まる**。孤立点が 0 の規模で起きていたのはこれ。
+    #[test]
+    fn 置いた枝の隣を次に選ばない() {
+        let input = vec![
+            touch_lines("a", "ab.rs", 1, 5),
+            touch_lines("b", "ab.rs", 2, 6),
+            touch_lines("c", "cde.rs", 1, 5),
+            touch_lines("d", "cde.rs", 2, 6),
+            touch_lines("e", "cde.rs", 3, 7),
+        ];
+        let plan = plan_order(&input);
+        // 行が重なる組は順序では消えない (a-b / c-d / c-e / d-e)。
+        assert_eq!(plan.line_pairs, 4);
+        let order = plan.order();
+        assert_eq!(order[0], "a", "最小次数が先頭 (同点は辞書順)");
+        assert_ne!(order[1], "b", "**いま置いた枝の隣を 2 番目に選ばない**");
+        assert_eq!(order, vec!["a", "c", "b", "d", "e"], "決定的に決まる");
+        // 旧実装ならここが 1 になっていた。
+        assert_eq!(plan.clean_prefix(), 2, "最初に止まるまでに 2 本入る");
+    }
+
     /// [`plan_order`] **単体**の上限。収集側 (`touches_from_repo`) を通る経路は
     /// 下の `実リポジトリでも上限で落とした本数が消えない` が見る — 以前は
     /// 収集側が数える前に切っていたので、この直接テストだけが緑で
@@ -2168,7 +2665,14 @@ mod tests {
         assert!(!row_layout(900.0).compact);
         assert!(row_layout(240.0).compact);
         assert_eq!(row_layout(240.0).overlap_w, 0.0);
-        assert_eq!(row_rects(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 18.0)), &row_layout(240.0)).len(), 3);
+        assert_eq!(
+            row_rects(
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 18.0)),
+                &row_layout(240.0)
+            )
+            .len(),
+            3
+        );
     }
 
     #[test]
@@ -2272,8 +2776,7 @@ mod tests {
 
     impl Repo {
         fn git(&self, args: &[&str]) -> String {
-            git_out(&self.0, args)
-                .unwrap_or_else(|e| panic!("git {args:?} が失敗した: {e}"))
+            git_out(&self.0, args).unwrap_or_else(|e| panic!("git {args:?} が失敗した: {e}"))
         }
 
         fn write(&self, rel: &str, text: &str) {
@@ -2335,8 +2838,14 @@ mod tests {
             .collect()
     }
 
+    /// 互いに素な 3 本 = **証明が立つ組**。
+    ///
+    /// 立った時点で「どの順でも通る」と言い切れているので、`train` は
+    /// 順序を 1 つも使わず [`crate::features::coedit::integrate`] へ委ねる。
+    /// `merged` が計画順ではなく**辞書順**で返るのはそのため
+    /// (`plan` は「もし順に流すなら」という参考として残る)。
     #[test]
-    fn 三本のトレインが順序どおり全部入る() {
+    fn 証明が立つ三本は順序を使わず一撃で入る() {
         let Some(r) = make_repo("all-in") else { return };
         // b1 / b2 は同じファイルの遠い行、b3 は別ファイル。
         r.git(&["checkout", "--quiet", "-b", "b1"]);
@@ -2358,24 +2867,122 @@ mod tests {
             onto: "base".into(),
             branches: cand.free.clone(),
             dry_run: false,
+            linear: false,
         };
         let rep = run_train(&req).expect("実行できる");
         assert!(rep.ok(), "止まった: {:?}", rep.stop);
-        // b3 は誰とも被らないので先頭。
+        // **証明が立ったので順序は使っていない。**
+        assert!(rep.proof.proven, "証明が立つ: {:?}", rep.proof.note);
+        assert!(rep.one_shot, "一撃経路を通った");
+        assert!(rep.proof.broke_at.is_empty(), "破れた組は無い");
+        assert!(
+            rep.proof.verdict().contains("順序は不要"),
+            "{}",
+            rep.proof.verdict()
+        );
+        // 計画は「もし順に流すなら」の参考として残る (b3 は誰とも被らないので先頭)。
         assert_eq!(rep.plan.order()[0], "b3");
-        assert_eq!(rep.merged, rep.plan.order(), "順序どおりに全部入った");
+        assert_eq!(
+            rep.merged,
+            vec!["b1", "b2", "b3"],
+            "どの順でも通ると証明できているので辞書順で混ざる"
+        );
         // 3 本ぶんの変更が統合先に載っている。
         let head = r.git(&["show", "base:shared.txt"]);
         assert!(head.contains("b1 here") && head.contains("b2 here"));
         assert_eq!(r.git(&["show", "base:solo.txt"]).trim(), "b3 only");
-        // 元いたブランチへ戻っている。
+        // 元いたブランチへ戻っている (一撃経路は作業ツリーを触らないので、
+        // そもそも離れていない)。
         assert_eq!(r.git(&["symbolic-ref", "--short", "HEAD"]).trim(), "base");
         assert!(r.git(&["status", "--porcelain"]).trim().is_empty());
+
+        // 3 本の枝は 1 つも動いていない (rebase で書き換えていない証拠)。
+        // 書き換えていれば元の枝は統合先の祖先にならない。
+        for b in ["b1", "b2", "b3"] {
+            let ahead = r.git(&["rev-list", "--count", &format!("base..{b}")]);
+            assert_eq!(ahead.trim(), "0", "{b} は base の祖先のまま");
+        }
+    }
+
+    /// **未コミットでも計画は出る。実行だけが保留になる。**
+    ///
+    /// 「並列で走らせている最中に、いま統合したらどうなるか」を知りたいのが
+    /// `plan` の使い所なので、汚れているからと 0 本にしてはいけない。
+    /// 一方で [`run_train`] は必ず断るので、**押す前に状態として出す**
+    /// ([`uncommitted`] / `pending_commit`)。
+    #[test]
+    fn 未コミットでも計画は出るが実行は保留になる() {
+        let Some(r) = make_repo("pending") else {
+            return;
+        };
+        r.git(&["checkout", "--quiet", "-b", "p1"]);
+        r.commit("solo.txt", "p1\n", "p1");
+        r.git(&["checkout", "--quiet", "base"]);
+        assert!(!uncommitted(&r.0), "まだ綺麗");
+
+        // 書き手が作業中 = 追跡ファイルに未コミットの変更がある。
+        r.write("shared.txt", "書きかけ\n");
+        assert!(uncommitted(&r.0), "未コミットを検出する");
+
+        // **計画は出る** (読み取りしかしない)。
+        let cand = candidates(&r.0, "base");
+        let RepoPlan { plan, .. } = plan_from_repo(&r.0, "base", &cand.free, &cand.held);
+        assert_eq!(plan.order(), vec!["p1"], "作業中でも計画から消えない");
+
+        // **実行だけが断られる。** 参照は 1 つも動かない。
+        let before = r.oid("base");
+        let err = run_train(&TrainRequest {
+            repo: r.0.clone(),
+            onto: "base".into(),
+            branches: cand.free.clone(),
+            dry_run: false,
+            linear: false,
+        })
+        .expect_err("未コミットなら始めない");
+        assert!(err.contains("未コミット"), "{err}");
+        assert_eq!(r.oid("base"), before);
+
+        // 追跡外のファイルは rebase を妨げないので「汚れて」いない。
+        r.git(&["checkout", "--", "shared.txt"]);
+        r.write("untracked.txt", "無視される\n");
+        assert!(!uncommitted(&r.0), "追跡外は見ない");
+    }
+
+    /// `--linear` を指定すると、**証明が立っても**従来どおり
+    /// 順序を決めて 1 本ずつ rebase する (履歴を 1 本に保ちたいとき)。
+    /// 速さと履歴の形は交換なので、黙ってどちらかに決めない。
+    #[test]
+    fn linear指定なら証明が立っても順に流す() {
+        let Some(r) = make_repo("linear") else { return };
+        r.git(&["checkout", "--quiet", "-b", "l1"]);
+        r.commit("shared.txt", &edited(3, "l1 here"), "l1");
+        r.git(&["checkout", "--quiet", "base"]);
+        r.git(&["checkout", "--quiet", "-b", "l2"]);
+        r.commit("solo.txt", "l2 only\n", "l2");
+        r.git(&["checkout", "--quiet", "base"]);
+
+        let rep = run_train(&TrainRequest {
+            repo: r.0.clone(),
+            onto: "base".into(),
+            branches: vec!["l1".into(), "l2".into()],
+            dry_run: false,
+            linear: true,
+        })
+        .expect("実行できる");
+        assert!(rep.ok(), "止まった: {:?}", rep.stop);
+        assert!(rep.proof.proven, "証明そのものは立っている");
+        assert!(!rep.one_shot, "--linear なので一撃経路は通らない");
+        assert_eq!(rep.merged, rep.plan.order(), "順序どおりに入った");
+        // **マージコミットが 1 つも無い** (rebase + fast-forward なので履歴は 1 本)。
+        let merges = r.git(&["rev-list", "--merges", "--count", "base"]);
+        assert_eq!(merges.trim(), "0", "履歴が 1 本のまま: {merges}");
     }
 
     #[test]
     fn 衝突は乾式検査が参照を動かす前に止める() {
-        let Some(r) = make_repo("dry-stop") else { return };
+        let Some(r) = make_repo("dry-stop") else {
+            return;
+        };
         r.git(&["checkout", "--quiet", "-b", "c1"]);
         r.commit("shared.txt", &edited(10, "c1 wins"), "c1");
         r.git(&["checkout", "--quiet", "base"]);
@@ -2389,8 +2996,25 @@ mod tests {
             onto: "base".into(),
             branches: vec!["c1".into(), "c2".into()],
             dry_run: false,
+            linear: false,
         };
         let rep = run_train(&req).expect("実行できる");
+        // **証明は立たない。どこで破れたかを出してから順次統合へ降りる。**
+        assert!(!rep.proof.proven, "同じ行なので証明は立たない");
+        assert!(!rep.one_shot, "一撃経路は通らない");
+        assert!(
+            rep.proof
+                .broke_at
+                .iter()
+                .any(|w| w.contains("shared.txt") && w.contains("c1") && w.contains("c2")),
+            "どこで破れたかが出る: {:?}",
+            rep.proof.broke_at
+        );
+        assert!(
+            rep.log.iter().any(|l| l.contains("証明")),
+            "画面にも出る: {:?}",
+            rep.log
+        );
         let stop = rep.stop.as_ref().expect("止まる");
         assert!(stop.predicted, "参照を動かす前に予告して止めた");
         assert_eq!(stop.branch, "c2", "2 番目で衝突する");
@@ -2407,7 +3031,9 @@ mod tests {
     /// コミットで衝突する — **本番の fail-closed と全戻しの経路**。
     #[test]
     fn 乾式をすり抜けた衝突は実行時に止まり元へ戻る() {
-        let Some(r) = make_repo("run-stop") else { return };
+        let Some(r) = make_repo("run-stop") else {
+            return;
+        };
         // 統合先が 10 行目を書き換える。
         r.commit("shared.txt", &edited(10, "base moved"), "base moves");
         // ブランチは 10 行目を一度触ってから元へ戻す。
@@ -2428,11 +3054,15 @@ mod tests {
             "この筋書きは乾式をすり抜ける前提"
         );
 
+        // **`--linear` を明示する。** 既定 (証明経路) はコミットを当て直さない
+        //  ので、この筋書きそのものが起こらない
+        // (下の `証明が立てばrebase途中の衝突は起こり得ない` が押さえる)。
         let req = TrainRequest {
             repo: r.0.clone(),
             onto: "base".into(),
             branches: vec!["flip".into()],
             dry_run: false,
+            linear: true,
         };
         let rep = run_train(&req).expect("実行できる");
         let stop = rep.stop.as_ref().expect("実行時に止まる");
@@ -2455,6 +3085,45 @@ mod tests {
         assert!(!r.0.join(".git/rebase-apply").exists());
     }
 
+    /// **証明経路は「途中のコミットだけが衝突する」型を構造的に起こさない。**
+    ///
+    /// `train` のモジュール doc に「乾式検査は最終形しか見ないので、
+    /// 途中のコミットで衝突する型を見落とす」と正直に書いてあるが、それは
+    /// **rebase でコミットを当て直すから**起きる。証明が立った組は
+    /// `commit-tree` で最終形だけを積むので、当て直しそのものが存在しない。
+    /// 上の `乾式をすり抜けた…` と**同じ筋書き**を既定の経路で流して確かめる。
+    #[test]
+    fn 証明が立てばrebase途中の衝突は起こり得ない() {
+        let Some(r) = make_repo("oneshot-flip") else {
+            return;
+        };
+        r.commit("shared.txt", &edited(10, "base moved"), "base moves");
+        r.git(&["checkout", "--quiet", "-b", "flip", "HEAD~1"]);
+        r.commit("shared.txt", &edited(10, "flip touched"), "flip 1");
+        r.commit("shared.txt", &edited(10, "line 10"), "flip 2");
+        r.git(&["checkout", "--quiet", "base"]);
+        if !crate::conflict::merge_tree_available(&r.0) {
+            return; // git 2.38 未満ではこの経路そのものが無い
+        }
+
+        let rep = run_train(&TrainRequest {
+            repo: r.0.clone(),
+            onto: "base".into(),
+            branches: vec!["flip".into()],
+            dry_run: false,
+            linear: false,
+        })
+        .expect("実行できる");
+        assert!(rep.one_shot, "証明が立って一撃経路を通った");
+        assert!(rep.ok(), "止まらない: {:?}", rep.stop);
+        // 統合先の中身は「base が動かした 10 行目」のまま
+        // (flip の正味の差分はゼロなので、上書きされていない)。
+        assert!(r.git(&["show", "base:shared.txt"]).contains("base moved"));
+        assert!(!r.0.join(".git/rebase-merge").exists());
+        assert!(!r.0.join(".git/rebase-apply").exists());
+        assert!(r.git(&["status", "--porcelain"]).trim().is_empty());
+    }
+
     #[test]
     fn 作業ツリーが汚れていたら始めない() {
         let Some(r) = make_repo("dirty") else { return };
@@ -2468,6 +3137,7 @@ mod tests {
             onto: "base".into(),
             branches: vec!["d1".into()],
             dry_run: false,
+            linear: false,
         })
         .expect_err("汚れていたら拒否する");
         assert!(err.contains("未コミット"), "{err}");
@@ -2476,7 +3146,9 @@ mod tests {
 
     #[test]
     fn 乾式指定なら参照を動かさない() {
-        let Some(r) = make_repo("dry-only") else { return };
+        let Some(r) = make_repo("dry-only") else {
+            return;
+        };
         r.git(&["checkout", "--quiet", "-b", "e1"]);
         r.commit("solo.txt", "e1\n", "e1");
         r.git(&["checkout", "--quiet", "base"]);
@@ -2486,6 +3158,7 @@ mod tests {
             onto: "base".into(),
             branches: vec!["e1".into()],
             dry_run: true,
+            linear: false,
         })
         .expect("実行できる");
         assert!(rep.ok());
@@ -2495,12 +3168,15 @@ mod tests {
 
     #[test]
     fn 統合先が見つからなければ拒否する() {
-        let Some(r) = make_repo("no-onto") else { return };
+        let Some(r) = make_repo("no-onto") else {
+            return;
+        };
         let err = run_train(&TrainRequest {
             repo: r.0.clone(),
             onto: "no-such-branch".into(),
             branches: vec!["base".into()],
             dry_run: true,
+            linear: false,
         })
         .expect_err("拒否する");
         assert!(err.contains("no-such-branch"), "{err}");
@@ -2519,6 +3195,9 @@ mod tests {
         assert_eq!(cli_main(&[]), 2);
         assert_eq!(cli_main(&s(&["nope"])), 2);
         assert_eq!(cli_main(&s(&["plan", "--nope"])), 2);
+        // `plan` は参照を動かさないので `--linear` に意味が無い。**黙って
+        // 無視せず**使い方の誤りとして 2 を返す。
+        assert_eq!(cli_main(&s(&["plan", "--linear"])), 2);
         assert_eq!(cli_main(&s(&["help"])), 0);
         // 計画は参照を動かさない
         let before = (r.oid("base"), r.oid("f1"));
@@ -2628,6 +3307,7 @@ mod tests {
             onto: "base".into(),
             branches: vec!["busy".into()],
             dry_run: true,
+            linear: false,
         })
         .expect_err("作業中の枝は動かさない");
         assert!(err.contains("busy"), "{err}");
@@ -2637,7 +3317,9 @@ mod tests {
 
     #[test]
     fn 衝突で止まったら終了コード1を返す() {
-        let Some(r) = make_repo("cli-stop") else { return };
+        let Some(r) = make_repo("cli-stop") else {
+            return;
+        };
         r.git(&["checkout", "--quiet", "-b", "g1"]);
         r.commit("shared.txt", &edited(20, "g1"), "g1");
         r.git(&["checkout", "--quiet", "base"]);
