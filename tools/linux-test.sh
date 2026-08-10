@@ -111,9 +111,26 @@ fi
 
 if [ "${1:-}" = "--check" ]; then
     cmd="cargo check --all-targets"
-else
+elif [ "$#" -le 1 ]; then
     filter=${1:-}
     cmd="cargo test --bin zai ${filter}"
+else
+    # **フィルタを複数受け取る。** 以前は `filter=${1:-}` で 1 つ目しか見ず、
+    # `tools/linux-test.sh guard:: train:: union::` と打つと **guard:: だけが
+    # 走って緑**になっていた (実際に踏んだ)。「実行されていないのに緑」は
+    # このリポジトリで繰り返し出ている壊れ方なので、ここで潰す。
+    #
+    # libtest の位置引数は 1 つだけなので、**1 つのコンテナの中で順に回す**
+    # (コンテナ起動を N 回繰り返すと、その分だけ待たされる)。
+    # `&&` で繋ぐので最初に落ちたところで止まり、終了コードが伝わる。
+    cmd=""
+    for f in "$@"; do
+        [ -n "$cmd" ] && cmd="$cmd && "
+        # `$f` はここで展開してコマンド文字列へ焼き込む。エスケープして
+        # コンテナ側へ渡すと、向こうに変数が無いので**見出しが空になる**
+        # (「どれが走ったか分からない」= 実行の証拠にならない)。
+        cmd="${cmd}echo \"== $f\" && cargo test --bin zai $f"
+    done
 fi
 
 # **cargo のレジストリも毎回消えていた。** target だけ残しても、crates.io の
