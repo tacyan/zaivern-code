@@ -2381,7 +2381,26 @@ mod tests {
         let exe = std::env::current_exe().ok()?;
         let dir = exe.parent()?.parent()?;
         let p = dir.join(if cfg!(windows) { "zai.exe" } else { "zai" });
-        p.is_file().then_some(p)
+        if !p.is_file() {
+            return None;
+        }
+        // **版まで確かめる。** `cargo test --bin zai` は bin を作らないので、
+        // ここに居るのは前の実行の残骸かもしれない。古い版は `guard` を
+        // サブコマンドとして知らず、`zai` は知らない語を**ワークスペース指定**
+        // として扱うので **GUI を起こそうとして落ちる** (Docker の Linux で
+        // 実際に起きた: winit が DISPLAY が無いと言って死ぬ)。
+        // 版が違えば「本物の zai ではない」ので、飛ばしたと出して降りる。
+        let out = Command::new(&p).arg("--version").output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !text.contains(env!("CARGO_PKG_VERSION")) {
+            eprintln!(
+                "[skip] 隣の zai が版違いなので実フック試験を飛ばします: {} ({})",
+                p.display(),
+                text.trim()
+            );
+            return None;
+        }
+        Some(p)
     }
 
     /// 子プロセスの `~` を temp へ寄せる (実 `~/.zaivern` に触れないため)。
@@ -2749,15 +2768,37 @@ mod tests {
                 touched: Touched::Whole,
             })
             .collect();
-        let mut best = std::time::Duration::MAX;
-        for _ in 0..3 {
-            let t0 = std::time::Instant::now();
-            let hits = collisions(&s, Path::new("/w/me"), &changes, now, &|_| false);
-            best = best.min(t0.elapsed());
-            assert!(hits.is_empty());
+
+        // **絶対時間で線を引かない。** この判定はマシンの速さに直結するので、
+        // 500ms のような固定値は「速い macOS では通り、仮想化された Docker の
+        // ファイルシステムでは落ちる」試験になる (実際に 1.22 秒で落ちた)。
+        // 見たいのは速さそのものではなく **リース数に対して線形か** で、
+        // 潰したかった回帰 (`holder_is_me` がパス × リース回 `canonicalize` を
+        // 叩いていた = 実質二乗) は比で必ず出る。同じ機械で 2 点測って比べる。
+        let bench = |leases: usize| {
+            let mut sub = lease::Store::default();
+            sub.leases.extend(s.leases.iter().take(leases).cloned());
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let t0 = std::time::Instant::now();
+                let hits = collisions(&sub, Path::new("/w/me"), &changes, now, &|_| false);
+                best = best.min(t0.elapsed());
+                assert!(hits.is_empty());
+            }
+            best
+        };
+        let small = bench(50);
+        let large = bench(200);
+        eprintln!("行域なしの台帳: 400 パス × 50 リース {small:?} / 200 リース {large:?}");
+        // 4 倍の仕事に 8 倍まで許す (測定の揺れぶんの余裕)。二乗なら 16 倍に
+        // なるので必ず引っかかる。`small` が 0 に丸まる速い機械では比較を
+        // 諦める — そこで落ちるのは機械が速すぎるという意味でしかない。
+        if !small.is_zero() {
+            assert!(
+                large <= small * 8,
+                "リース数に対して線形でない: 50 リース {small:?} → 200 リース {large:?}"
+            );
         }
-        eprintln!("行域なしの台帳: 400 パス × 200 リース {best:?}");
-        assert!(best < std::time::Duration::from_millis(500), "{best:?}");
     }
 
     // ───────────────────────── e2e: 実際にコミットが止まる ─────────────────────────

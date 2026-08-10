@@ -4233,6 +4233,13 @@ where
         Highlighter::new()
     }
 
+    /// 同梱 Rust 構文セットに入ってよい構文の数の上限。
+    ///
+    /// 拡張セット (数百種) へ混ぜると初回の組み立てが桁で遅くなる。
+    /// **速さではなく大きさで縛る**のは、機械の速さに依存しない検査に
+    /// するため (絶対時間の閾値は負荷で必ず嘘をつく)。
+    const RUST_SYNTAX_MAX: usize = 16;
+
     fn colors(h: &Highlighter, theme: &str) -> LayoutJob {
         h.layout_job(SRC, "Rust", theme, FontId::monospace(12.0), Color32::WHITE)
     }
@@ -4417,11 +4424,26 @@ where
             h.rust_ps.get().and_then(|o| o.as_ref()).is_some(),
             "Rust を塗ったのに専用セットが組まれていない"
         );
-        // 閾値は debug ビルドでも余裕がある値 (実測 release 十数 ms)。
-        // ここが跳ねたら「拡張セットへ混ぜる」実装へ戻ってしまっている。
+        // **絶対時間で線を引かない。** 守りたいのは「Rust 専用の小さな構文
+        // セットを組む」ことであって速さそのものではない。固定の閾値は
+        // 「手元では通り、全 4251 件と同時に走らせた負荷では落ちる」試験に
+        // なる (実測 1.79 秒で落ちた)。速さはセットの大きさで決まるので、
+        // **大きさを直に見る** — これなら機械の速さに 1 ミリも依存しない。
+        let set = h
+            .rust_ps
+            .get()
+            .and_then(|o| o.as_ref())
+            .expect("組まれている");
+        let n = set.syntaxes().len();
+        eprintln!("同梱 Rust 構文: {n} 種 / 初回組み立て {first:?}");
         assert!(
-            first < std::time::Duration::from_millis(1500),
-            "同梱 Rust 構文の初回組み立てが遅い: {first:?}"
+            n <= RUST_SYNTAX_MAX,
+            "拡張セットへ混ぜる実装へ戻っている: {n} 種 (上限 {RUST_SYNTAX_MAX})"
+        );
+        // 桁違いに遅いのだけは拾う (壊れ方の smoke check。負荷では余裕を持たせる)。
+        assert!(
+            first < std::time::Duration::from_secs(15),
+            "同梱 Rust 構文の初回組み立てが桁違いに遅い: {first:?}"
         );
     }
 

@@ -1583,21 +1583,23 @@ pub fn verify(env: &Env, keep: bool) -> VerifyReport {
             .unwrap_or_default()
     ));
     let ledger = scratch.join("ledger");
-    let mut trials = Vec::new();
-
-    trials.push(run_trial(
-        "同じファイルでも、離れた行なら 2 人が同時に持てる",
-        trial_regions(),
-    ));
-    trials.push(run_trial(
-        "他人が保有するファイルへの書き込みを台帳が断る",
-        trial_ledger_denies(&scratch, &ledger),
-    ));
-    trials.push(run_trial(
-        "一覧への両側追記を merge driver が解決する",
-        trial_driver_resolves(&scratch),
-    ));
-    trials.push(trial_live_commit(env, &scratch));
+    // **順番がそのまま画面の順番**。`vec![]` で並べておくと、増やすときに
+    // 途中へ差し込むのが 1 行で済む (push の列だと順序が見えにくくなる)。
+    let mut trials = vec![
+        run_trial(
+            "同じファイルでも、離れた行なら 2 人が同時に持てる",
+            trial_regions(),
+        ),
+        run_trial(
+            "他人が保有するファイルへの書き込みを台帳が断る",
+            trial_ledger_denies(&scratch, &ledger),
+        ),
+        run_trial(
+            "一覧への両側追記を merge driver が解決する",
+            trial_driver_resolves(&scratch),
+        ),
+        trial_live_commit(env, &scratch),
+    ];
     trials.push(match env.driver_exe() {
         Ok(exe) if env.driver_capable() => run_trial(
             "一覧への両側追記が、実際の git merge で自動解決する",
@@ -3383,7 +3385,28 @@ mod tests {
         let profile_dir = me.parent()?.parent()?;
         let name = if cfg!(windows) { "zai.exe" } else { "zai" };
         let p = profile_dir.join(name);
-        p.is_file().then_some(p)
+        if !p.is_file() {
+            return None;
+        }
+        // **版まで確かめる。** `cargo test --bin zai` は bin を作らないので、
+        // ここに居るのは前の実行の残骸かもしれない。古い版は
+        // `merge-driver` / `czero` をサブコマンドとして知らないので、
+        // 実マージの段が黙って Skipped になり、テストは「配線が要ります」と
+        // いう**嘘の理由**で落ちる (Docker の Linux で実際に起きた)。
+        let out = std::process::Command::new(&p)
+            .arg("--version")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !text.contains(env!("CARGO_PKG_VERSION")) {
+            eprintln!(
+                "[skip] 隣の zai が版違いなので実バイナリ試験を飛ばします: {} ({})",
+                p.display(),
+                text.trim()
+            );
+            return None;
+        }
+        Some(p)
     }
 
     // ─────────────── uninstall ───────────────
