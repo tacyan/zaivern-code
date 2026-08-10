@@ -1853,6 +1853,28 @@ fn jitter_us(base: u64) -> u64 {
     })
 }
 
+/// この失敗は「取り合っているだけ」か (= 待てば取れるか)。
+///
+/// POSIX なら `AlreadyExists` だけ。**Windows はもう 1 つある**:
+/// ファイルを消すと、最後のハンドルが閉じるまで *delete pending* という
+/// 中間状態になり、そのあいだに `create_new` すると `AlreadyExists` ではなく
+/// **`ACCESS_DENIED` (os error 5)** が返る。64 体がロックを奪い合うと、
+/// 誰かが `LockGuard` を落とした瞬間に別の誰かが必ずこの窓を踏む。
+///
+/// これを「壊れている」と扱うと、いちばん混んでいるとき = いちばん衝突しやすい
+/// ときにだけ台帳が使えなくなる。**最悪の壊れ方**なので、Windows では
+/// 取り合いとして扱って待つ (CI の windows-latest が実際にここで落ちた:
+/// `台帳が壊れた: ロックを作れません: Access is denied. (os error 5)`)。
+///
+/// unix で `PermissionDenied` を待ちに回さないのは、あちらでは本物の権限問題
+/// だからである — 待っても直らないので、その場で正直に失敗する。
+fn lock_contended(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        return true;
+    }
+    cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied
+}
+
 fn acquire_lock(store: &Path) -> Result<LockGuard, String> {
     let path = store.with_extension("lock");
     if let Some(dir) = path.parent() {
@@ -1867,9 +1889,7 @@ fn acquire_lock(store: &Path) -> Result<LockGuard, String> {
             .open(&path)
         {
             Ok(_) => return Ok(LockGuard(path)),
-            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
-                return Err(format!("ロックを作れません: {e}"))
-            }
+            Err(e) if !lock_contended(&e) => return Err(format!("ロックを作れません: {e}")),
             Err(_) => {}
         }
         // クラッシュで置き去りになったロックは奪う (でないと永久に詰まる)。
@@ -5931,6 +5951,25 @@ mod span_tests {
     ///
     /// `docs/conflict-zero.md` が「32 体以上で busy-deny が増える」と記録した
     /// 欠陥の回帰テスト。原因は混雑ではなく**待ち方** ([`LOCK_SPIN_ROUNDS`])。
+    /// **Windows の delete pending を取り合いとして扱う。**
+    ///
+    /// CI の windows-latest が実際にここで落ちた
+    /// (`台帳が壊れた: ロックを作れません: Access is denied. (os error 5)`)。
+    /// macOS / Linux では 1 度も出ないので、この分岐はテストでしか守れない。
+    #[test]
+    fn ロックの取り合いはosごとに正しく見分ける() {
+        use std::io::{Error, ErrorKind};
+        assert!(lock_contended(&Error::new(ErrorKind::AlreadyExists, "x")));
+        assert_eq!(
+            lock_contended(&Error::new(ErrorKind::PermissionDenied, "x")),
+            cfg!(windows),
+            "Windows は delete pending を待ちに回す / unix は本物の権限問題として即失敗"
+        );
+        // 本物の異常は待たない (待っても直らない)
+        assert!(!lock_contended(&Error::new(ErrorKind::NotFound, "x")));
+        assert!(!lock_contended(&Error::new(ErrorKind::InvalidInput, "x")));
+    }
+
     #[test]
     fn 六十四体が同時に確保してもbusyは出ず勝者は一つ() {
         let dir = unique_temp_dir("zaivern", "lease-busy64");

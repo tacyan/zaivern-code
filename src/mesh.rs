@@ -3111,30 +3111,46 @@ mod tests {
         let dest = dir.join(format!("{}.{:012}.msg", a.fkey(), 0));
 
         // 別プロセスに rename させる。**どちらの OS にもある道具だけを使う。**
-        let (prog, args): (&str, Vec<String>) = if cfg!(windows) {
-            (
-                "cmd",
-                vec![
-                    "/C".into(),
-                    format!("move /Y \"{}\" \"{}\"", stage.display(), dest.display()),
-                ],
-            )
+        //
+        // **シェルへ 1 本の文字列を渡さない。** Rust の `Command` は引数ごとに
+        // Windows の規則で引用するので、`cmd /C "move /Y \"a\" \"b\""` のように
+        // コマンド全体を 1 引数へ押し込むと、cmd 側の再解析とずれて失敗する
+        // (CI の windows-latest が実際にここで落ちた)。引数は**分けて**渡し、
+        // unix でもシェルを挟まず `mv` を直に起こす (引用の問題が消える)。
+        let run =
+            |prog: &str, args: &[&str]| crate::procx::hidden_command(prog).args(args).output().ok();
+        let src = stage.to_string_lossy().to_string();
+        let dst = dest.to_string_lossy().to_string();
+        let out = if cfg!(windows) {
+            // `move` は cmd の組み込みなので cmd 経由が要る。
+            let first = run("cmd", &["/C", "move", "/Y", &src, &dst]);
+            match first {
+                Some(o) if o.status.success() => Some(o),
+                // 環境によっては cmd が使えないことがある。PowerShell へ落ちる。
+                other => run(
+                    "powershell",
+                    &[
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "Move-Item",
+                        "-LiteralPath",
+                        &src,
+                        "-Destination",
+                        &dst,
+                        "-Force",
+                    ],
+                )
+                .or(other),
+            }
         } else {
-            (
-                "sh",
-                vec![
-                    "-c".into(),
-                    format!("mv '{}' '{}'", stage.display(), dest.display()),
-                ],
-            )
+            run("mv", &[&src, &dst])
         };
-        let out = crate::procx::hidden_command(prog)
-            .args(&args)
-            .output()
-            .expect("子プロセスが起動できる");
+        let out = out.expect("子プロセスが起動できる");
         assert!(
             out.status.success(),
-            "子プロセスが失敗した: {}",
+            "子プロセスが失敗した: {} / {}",
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(!stage.exists(), "別プロセスが rename したはず");
