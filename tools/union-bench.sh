@@ -31,6 +31,12 @@
 #   union-plain   ドライバ有り + マーカ無し (= 素の git へ委譲するはず)
 #   union-whole   ドライバ (--whole) + マーカ無し
 #
+# ## 第 2 部: マーカを 1 つも置かない合成リポジトリ (= 他人のリポジトリ)
+#
+#   .gitignore / package.json / CHANGELOG.md / mod ブロック / code.rs へ
+#   N 人が同時に追記し、baseline / union-nomarker / union-auto を比べる。
+#   **誤自動解決の件数**も出す (0 でなければならない)。定義は下の方に。
+#
 # ## 使い方 (再現は 1 行)
 #
 #   tools/union-bench.sh                       既定 (8 16 32 人)
@@ -59,7 +65,7 @@ json=0
 keep=0
 
 usage() {
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
