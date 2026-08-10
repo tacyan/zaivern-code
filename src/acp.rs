@@ -4403,6 +4403,7 @@ mod tests {
             leases: vec![crate::lease::Lease {
                 holder: other.clone(),
                 patterns: vec!["src/a.rs".to_string()],
+                anchors: Vec::new(),
                 acquired_at: 100,
                 expires_at: 1000,
                 note: String::new(),

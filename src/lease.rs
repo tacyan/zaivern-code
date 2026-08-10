@@ -63,6 +63,27 @@
 //!   出せないもの (シェル経由・パッチ・巨大ファイル) は
 //!   **ファイル全体を触るもの**として扱う = 従来と同じ挙動へ落ちる
 //!
+//! ## 行域は「行番号」ではなく「そこにある内容」に紐づく (錨)
+//!
+//! 行域リースには**行番号が動く**という穴があった。A が 100 行目付近を編集して
+//! 10 行増やすと、B が持っている「200〜260 行目」は実際には「210〜270 行目」へ
+//! ずれる。台帳が行番号しか覚えていないと、次の判定で B は**他人の領域を
+//! 自分のものだと思い込む** — 拒否も警告も出ないまま「衝突ゼロ」の保証が
+//! 静かに破れる、いちばん危ない壊れ方である。
+//!
+//! * **確保の瞬間**に [`crate::region::capture_anchor`] で先頭行・末尾行の
+//!   中身を覚え、[`Lease::anchors`] へ `patterns` と並べて持つ
+//!   (`#[serde(default)]` なので**錨を知らない古い台帳もそのまま読める**)
+//! * **判定の瞬間**に [`crate::region::resolve`] で取り直す (遅延解決)。
+//!   書き込みのたびに全担当の台帳を書き直す eager な追従は**採らない** —
+//!   帳簿付けの費用が要るうえ、フックが 1 回でも飛ぶと台帳が現実とずれて
+//!   **ずれたことを誰も検出できない**
+//! * 取り直せない (域が消えた / 同じ内容の行が同距離に複数) ときは
+//!   **台帳に書いてある行番号へ落ちる** = 錨が入る前とまったく同じ判定。
+//!   理由は [`Lease::live_span_of`] に書いた
+//! * 記号で指す域 (`src/a.rs#fn:draw_toolbar`) は [`hydrate_in`] が確保の
+//!   瞬間に実ファイルから行域へ落とす。**Rust だけ**が対象
+//!
 //! ## 失敗の向き
 //!
 //! - **内部エラーは fail-open** (許可)。台帳が読めない・ロックが取れないのは
@@ -73,10 +94,16 @@
 //!
 //! いずれも**行域リースが正しく効く**うえでの制限で、直せば良くなる:
 //!
-//! 1. **`src/cli.rs`**: `zai lease claim src/a.rs#L10-40` は**そのまま動く**
-//!    ([`try_claim`] が [`normalize_spec`] を通すため)。直したいのは
-//!    `HELP_LEASE` の文面だけで、`<パターン...>` の説明へ
-//!    「`src/a.rs#L10-40` のように行域も指定できます」を足すと入口が完成する。
+//! 1. **`src/cli.rs`**: `zai lease claim src/a.rs#L10-40` も
+//!    `zai lease claim 'src/a.rs#fn:draw_toolbar'` も**そのまま動く**
+//!    ([`try_claim`] が [`normalize_spec`] と [`hydrate_in`] を通すため)。
+//!    残っているのは 2 つ:
+//!    (a) `HELP_LEASE` の `<パターン...>` の説明へ
+//!    「`src/a.rs#L10-40` / `src/a.rs#fn:名前` のように域も指定できます」を足す。
+//!    (b) `lease claim` は基準フォルダを渡さないので [`default_tree`] =
+//!    **プロセスの作業フォルダ**へ落ちる。`--dir <別フォルダ>` と記号指定を
+//!    同時に使うと別のファイルを読む。`cli.rs` が [`try_claim_in`] へ
+//!    `roots.tree` を渡せば消える (1 行)。
 //!    `lease claim` は [`with_store`] を直に呼んでいるので、
 //!    [`with_store_retry`] へ替えると混雑時の空振りも消える
 //!    (`gate` / [`claim_for`] / [`release_one`] は既に替えてある)。
@@ -305,7 +332,7 @@ pub fn spec_path(spec: &str) -> &str {
     let t = spec.trim();
     match crate::region::parse(t) {
         // `parse` は trim した文字列を `#` で分けるので、`path` は必ず前半。
-        Ok(r) if r.span.is_some() => &t[..r.path.len()],
+        Ok(r) if !r.is_whole() => &t[..r.path.len()],
         _ => spec,
     }
 }
@@ -355,7 +382,7 @@ pub fn normalize_spec_on(raw: &str, win_sep: bool, fold_case: bool) -> String {
         return normalize_path_on(raw, win_sep, fold_case);
     }
     match crate::region::parse(raw.trim()) {
-        Ok(r) if r.span.is_some() => {
+        Ok(r) if !r.is_whole() => {
             // **規則が掛かるのはパス部分だけ。** 行域はそのまま
             // `crate::region::render` が `#L…` の 1 表記へ揃える。
             let path = normalize_path_on(&r.path, win_sep, fold_case);
@@ -401,18 +428,22 @@ pub fn covers(pattern: &str, path: &str) -> bool {
 /// 3 行未満しか離れていない 2 つの変更は xdiff が 1 ハンクに畳んで
 /// **衝突にする**ので、「重なっていない」と答えてはいけない。
 pub fn covers_span(pattern: &str, path: &str, touched: &[crate::region::Span]) -> bool {
-    if !covers(pattern, path) {
-        return false;
-    }
-    let Some(own) = spec_span(pattern) else {
-        return true; // ファイル全体 = どの行でも自分の領分
+    covers(pattern, path) && hits(spec_span(pattern), touched)
+}
+
+/// 「この域は `touched` に関わるか」の**唯一の規則**。
+///
+/// `own` が `None` (= ファイル全体) と `touched` が空 (= 触れた行が判らない) は
+/// どちらも安全側 = **関わる**へ倒す。錨で取り直した域も、台帳の行番号のままの
+/// 域も必ずここを通す — 判定を 2 実装持つと必ずズレる。
+fn hits(own: Option<crate::region::Span>, touched: &[crate::region::Span]) -> bool {
+    let Some(own) = own else {
+        return true;
     };
-    if touched.is_empty() {
-        return true; // 触れた行が判らない = 安全側へ倒す
-    }
-    touched
-        .iter()
-        .any(|t| crate::region::spans_too_close(&own, t, crate::region::SAFE_BAND))
+    touched.is_empty()
+        || touched
+            .iter()
+            .any(|t| crate::region::spans_too_close(&own, t, crate::region::SAFE_BAND))
 }
 
 fn seg_covers(pat: &[String], path: &[String]) -> bool {
@@ -506,7 +537,7 @@ fn seg_one(pat: &str, s: &str) -> bool {
 pub fn overlaps(a: &str, b: &str) -> bool {
     if has_frag(a) || has_frag(b) {
         let (ra, rb) = (spec_region(a), spec_region(b));
-        if ra.span.is_some() || rb.span.is_some() {
+        if !ra.is_whole() || !rb.is_whole() {
             return crate::region::conflicts(&ra, &rb, crate::region::SAFE_BAND);
         }
     }
@@ -806,6 +837,21 @@ pub struct Lease {
     /// 所有するパターン (スコープからの相対、`/` 区切り、glob 可)。
     #[serde(default)]
     pub patterns: Vec<String>,
+    /// `patterns[i]` に対応する錨 (**行番号ではなく中身**で域を指すため)。
+    ///
+    /// ## なぜ並行する欄なのか
+    /// `patterns` の中身は `zai lease list` と画面にそのまま出る文字列で、
+    /// ここへ錨を混ぜると人が読めなくなる。**別の欄に並べて持つ**と
+    /// 表記は 1 バイトも変わらず、`#[serde(default)]` のおかげで
+    /// **錨を知らない古い台帳もそのまま読める**
+    /// ([`span_tests::錨を知らない古い台帳をそのまま読み書きできる`])。
+    ///
+    /// 長さは `patterns` に合わせるのが不変条件だが、**ずれていても落ちない** —
+    /// 手で編集された台帳や別バージョンが書いた台帳が来るので、
+    /// [`Lease::anchor_at`] が足りない分を「錨なし」として読む。
+    /// [`read_store`] が読み込みの一点で [`Lease::align_anchors`] を通す。
+    #[serde(default)]
+    pub anchors: Vec<crate::region::Anchor>,
     /// 確保した時刻 (UNIX 秒)。
     #[serde(default)]
     pub acquired_at: u64,
@@ -825,8 +871,63 @@ impl Lease {
     }
 
     /// このリースが `rel` の `touched` 行に**関わる**か ([`covers_span`])。
-    pub fn touches(&self, rel: &str, touched: &[crate::region::Span]) -> bool {
-        self.patterns.iter().any(|p| covers_span(p, rel, touched))
+    ///
+    /// `text` は `rel` の**いまの中身**。渡すと、台帳の行域を錨で取り直してから
+    /// 見る (遅延解決)。`None` なら台帳の行番号をそのまま使う。
+    pub fn touches(&self, rel: &str, touched: &[crate::region::Span], text: Option<&str>) -> bool {
+        self.patterns.iter().enumerate().any(|(i, p)| {
+            if text.is_none() || self.anchors.get(i).is_none_or(|a| a.is_blank()) {
+                // 錨が無い = 取り直しようが無い。錨が入る前とまったく同じ経路。
+                return covers_span(p, rel, touched);
+            }
+            covers(p, rel) && hits(self.live_span_of(i, text), touched)
+        })
+    }
+
+    /// `patterns[i]` に対応する錨。**長さがずれた台帳でも落ちない**
+    /// (足りない分は「錨なし」= 台帳の行番号をそのまま使う)。
+    pub fn anchor_at(&self, i: usize) -> crate::region::Anchor {
+        self.anchors.get(i).cloned().unwrap_or_default()
+    }
+
+    /// `patterns[i]` を錨つきの [`crate::region::Region`] として取り出す。
+    pub fn region_at(&self, i: usize) -> crate::region::Region {
+        let mut r = spec_region(self.patterns.get(i).map(String::as_str).unwrap_or(""));
+        r.anchor = self.anchor_at(i);
+        r
+    }
+
+    /// 錨の並びを `patterns` の長さへ揃える (足りなければ空で埋め、余りは落とす)。
+    pub fn align_anchors(&mut self) {
+        self.anchors.resize(self.patterns.len(), Default::default());
+    }
+
+    /// `patterns[i]` が**いま**指している行域。`None` = ファイル全体。
+    ///
+    /// # 取り直せなかったらどちらへ倒すか
+    ///
+    /// [`crate::region::resolve`] が `None` (域が丸ごと消えた / 同じ内容の行が
+    /// 同距離に複数あって決められない) を返したら、**台帳に書いてある行番号を
+    /// そのまま使う**。落とす先は 3 つ考えられて、選ばなかった 2 つには
+    /// はっきりした害がある:
+    ///
+    /// * 「誰のものでもない」— **2 人が同じ場所を書けるようになる**。
+    ///   このモジュールが売っている保証そのものが消えるので論外。
+    /// * 「ファイル全体」— 持ち主が**自分の域の先頭行を直しただけ**で錨は外れる
+    ///   (いちばん普通の編集)。そのたびに同じファイルの他の担当を全員締め出すので、
+    ///   並列度がファイル数で頭打ちになり、行域を入れた意味が消える。
+    /// * **記録された行番号** — 錨が入る前とまったく同じ判定。既に出荷している
+    ///   保証と同じ強さで、過剰でも過少でもない。ここへ倒す。
+    fn live_span_of(&self, i: usize, text: Option<&str>) -> Option<crate::region::Span> {
+        let r = self.region_at(i);
+        if r.is_whole() {
+            return None;
+        }
+        let recorded = r.span?;
+        let Some(t) = text else {
+            return Some(recorded);
+        };
+        Some(crate::region::resolve(&r, t).unwrap_or(recorded))
     }
 
     /// `rel` について、このリースが持っている行域。
@@ -834,13 +935,14 @@ impl Lease {
     /// `None` = **ファイル全体**を持っている (行域で切り分ける必要が無い)。
     /// `Some(vec![])` = このパスは 1 行も持っていない。
     /// 並びはパターンの登録順のまま = 決定的。
-    pub fn owned_spans(&self, rel: &str) -> Option<Vec<crate::region::Span>> {
+    /// `text` を渡すと、錨で取り直した**いまの**行域を返す。
+    pub fn owned_spans(&self, rel: &str, text: Option<&str>) -> Option<Vec<crate::region::Span>> {
         let mut out = Vec::new();
-        for p in &self.patterns {
+        for (i, p) in self.patterns.iter().enumerate() {
             if !covers(p, rel) {
                 continue;
             }
-            match spec_span(p) {
+            match self.live_span_of(i, text) {
                 None => return None,
                 Some(s) => out.push(s),
             }
@@ -894,6 +996,106 @@ pub fn prune(store: &mut Store, now: u64, alive: &dyn Fn(u32) -> bool) {
     store.leases.retain(|l| l.active(now, alive));
 }
 
+// ── 確保したい 1 件 (仕様 + 錨 + いまの中身) ──────────────────────────────
+
+/// 確保したい 1 件。**錨を打つのは確保のこの瞬間だけ。**
+///
+/// ## なぜ文字列だけでは足りないのか
+/// 台帳に載るのは `src/a.rs#L200-260` という**行番号**だが、他人が 100 行目へ
+/// 10 行足した瞬間にその中身は 210〜270 行目へ動く。行番号しか持っていないと、
+/// 次の判定で持ち主は**他人の領域を自分のものだと思い込む**。
+/// 確保の瞬間に先頭行・末尾行の中身を [`crate::region::capture_anchor`] で
+/// 覚えておき、判定のたびに [`crate::region::resolve`] で取り直す。
+///
+/// `text` は「いまのファイルの中身」。判定側が**台帳に載っている他人の域**を
+/// 取り直すのにも使うので、読んだ 1 回ぶんを持ち回る
+/// ([`gate`] は行域を出すのに既に読んでいる — 2 度読まない)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Want {
+    /// 確保したい仕様 (`src/a.rs` / `src/a.rs#L10-40`)。
+    pub spec: String,
+    /// 確保の瞬間の錨。空 = 行番号だけで持つ (ファイル全体 / ファイルが読めない)。
+    pub anchor: crate::region::Anchor,
+    /// 判定に使う「いまの中身」。`None` = 読めない / 要らない。
+    pub text: Option<std::sync::Arc<str>>,
+}
+
+impl Want {
+    /// 実ファイルを見ない 1 件 (ファイル全体の担当 / 行域を追わない確保)。
+    pub fn plain(spec: &str) -> Want {
+        Want {
+            spec: spec.to_string(),
+            anchor: crate::region::Anchor::default(),
+            text: None,
+        }
+    }
+}
+
+/// 仕様を**実ファイルへ突き合わせて**確定させる。
+///
+/// | 書き方 | すること | ファイルが読めないとき |
+/// |---|---|---|
+/// | `src/a.rs` | 何もしない (I/O ゼロ) | — |
+/// | `src/a.rs#L10-40` | [`crate::region::capture_anchor`] で錨を打つ | 錨なしで確保する |
+/// | `src/a.rs#fn:draw_toolbar` | [`crate::region::resolve_spec`] → [`crate::region::symbol_span`] で行域へ落とす | **`Err`** |
+///
+/// ## 記号指定だけ `Err` にする理由
+/// 行域指定は「錨が無い = 昔と同じ判定」へ落ちるだけなので確保して構わない。
+/// 記号指定は**行域に落ちないと意味が決まらない**。黙ってファイル全体として
+/// 扱うと、「関数 1 つ取った」つもりの本人が他の 63 体を締め出す。黙って
+/// 捨てると、取れたつもりで誰にも守られない。**その場で断るのが唯一正しい。**
+///
+/// 記号は **Rust だけ**を見る ([`crate::region::SYMBOL_KINDS`])。他言語まで
+/// 広げると誤検出が増えてユーザーが機能ごと切る、というのがこのリポジトリの流儀。
+pub fn hydrate_in(tree: &Path, spec: &str) -> Result<Want, String> {
+    if !has_frag(spec) {
+        return Ok(Want::plain(spec)); // 圧倒的多数。1 バイトも読まない
+    }
+    let parsed = match crate::region::parse_spec(spec.trim()) {
+        Ok(p) => p,
+        // 壊れた指定は [`spec_region`] と同じくファイル全体として扱う
+        // (ここで断ると、`#` を含む実在のパスが確保できなくなる)。
+        Err(_) => return Ok(Want::plain(spec)),
+    };
+    if matches!(parsed.sel, crate::region::Sel::Whole) {
+        return Ok(Want::plain(spec)); // 行番号に依存しない = 錨も要らない
+    }
+    let text = read_capped(&tree.join(&parsed.path));
+    let Some(body) = text else {
+        return match parsed.sel {
+            crate::region::Sel::Symbol { kind, name } => Err(trf(
+                "{kind} {name} を探せません: 「{path}」を読めませんでした",
+                &[
+                    ("kind", kind),
+                    ("name", name),
+                    ("path", parsed.path.clone()),
+                ],
+            )),
+            // 行域はそのまま確保できる (錨が無い = 錨が入る前と同じ判定)
+            _ => Ok(Want::plain(spec)),
+        };
+    };
+    let region = crate::region::resolve_spec(&parsed, &body)?;
+    Ok(Want {
+        spec: crate::region::render(&region),
+        anchor: region.anchor,
+        text: Some(std::sync::Arc::from(body)),
+    })
+}
+
+/// 仕様を実ファイルへ突き合わせるときの基準フォルダ。
+///
+/// **[`Holder::cwd`] は使えない** — [`normalize_path`] が先頭の `/` を落として
+/// 大小も畳むので、あれはもはやファイルシステムのパスではない (台帳の鍵専用)。
+/// 基準を明示できる呼び出し元 ([`gate`] / [`arm_in`]) は [`try_claim_in`] を
+/// 使い、明示できない `zai lease claim` だけがここへ落ちる。
+/// **`zai lease claim --dir <別のフォルダ>` と記号指定の組み合わせは、
+/// ここでプロセスの作業フォルダを見るので当たらない** (既知の限界)。
+fn default_tree() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    roots_of(&cwd).tree
+}
+
 /// 2 つの行域を包む最小の域。片方でも末尾までなら末尾まで。
 fn hull(a: crate::region::Span, b: crate::region::Span) -> crate::region::Span {
     crate::region::Span {
@@ -917,47 +1119,95 @@ fn hull(a: crate::region::Span, b: crate::region::Span) -> crate::region::Span {
 ///
 /// 1 回の吸収で新たに届く域が出る (A↔B は遠いが A∪C↔B は近い) ため、
 /// 変化が止まるまで繰り返す。並びは **(start, end) の昇順**で決定的。
-fn absorb(pats: &mut Vec<String>, want: &str) -> bool {
-    let w = spec_region(want);
-    let mut same: Vec<crate::region::Span> = Vec::new();
-    for p in pats.iter() {
-        let r = spec_region(p);
+/// 2 つの錨を包む。**片方でも錨が無いなら結果も錨なし** —
+/// 半端な錨 (先頭だけ / 末尾だけ) は [`crate::region::resolve`] が必ず断るので、
+/// 「錨がある」と嘘をつくより「無い」と言うほうが判定がぶれない。
+fn hull_anchor(
+    a: (crate::region::Span, &crate::region::Anchor),
+    b: (crate::region::Span, &crate::region::Anchor),
+) -> crate::region::Anchor {
+    if a.1.is_blank() || b.1.is_blank() {
+        return crate::region::Anchor::default();
+    }
+    let h = hull(a.0, b.0);
+    let head = if a.0.start <= b.0.start { a.1 } else { b.1 };
+    // 末尾までの域が混ざったらそちらが末尾を決める。
+    let tail_is_a = a.0.end == crate::region::Span::EOF
+        || (b.0.end != crate::region::Span::EOF && a.0.end >= b.0.end);
+    let tail = if tail_is_a { a.1 } else { b.1 };
+    crate::region::Anchor {
+        head: head.head.clone(),
+        tail: tail.tail.clone(),
+        len: if h.end == crate::region::Span::EOF {
+            a.1.len.max(b.1.len)
+        } else {
+            h.len()
+        },
+    }
+}
+
+fn absorb(pats: &mut Vec<String>, ancs: &mut Vec<crate::region::Anchor>, want: &Want) -> bool {
+    let w = spec_region(&want.spec);
+    let text = want.text.as_deref();
+    let mut same: Vec<(crate::region::Span, crate::region::Anchor)> = Vec::new();
+    for (i, p) in pats.iter().enumerate() {
+        let mut r = spec_region(p);
         if r.path != w.path {
             continue;
         }
-        match r.span {
+        if r.is_whole() {
             // 既にファイル全体を持っている = 行域を足す意味が無い
-            None => return false,
-            Some(s) => same.push(s),
+            return false;
         }
+        r.anchor = ancs.get(i).cloned().unwrap_or_default();
+        let recorded = r.span.unwrap_or(crate::region::Span { start: 1, end: 1 });
+        // **持ち主自身の域は、確保のたびに「いまの座標」へ書き直す。**
+        // 他人の帳簿には 1 行も触らないので、これは `region::follow` を
+        // 全担当へ撒く eager な追従とは別物 (落ちても誰の台帳もずれない)。
+        let live = match text {
+            Some(t) => crate::region::resolve(&r, t).unwrap_or(recorded),
+            None => recorded,
+        };
+        same.push((live, r.anchor));
     }
-    let merged: Vec<crate::region::Span> = match w.span {
+    let merged: Vec<(crate::region::Span, crate::region::Anchor)> = if w.is_whole() {
         // 足すのが「ファイル全体」なら、同じパスの行域は全部畳まれる
-        None => Vec::new(),
-        Some(w) => {
-            let mut cur = w;
-            let mut rest = same;
-            loop {
-                let mut hit = false;
-                let mut next = Vec::new();
-                for a in rest.drain(..) {
-                    if crate::region::spans_too_close(&a, &cur, crate::region::SAFE_BAND) {
-                        cur = hull(a, cur);
-                        hit = true;
-                    } else {
-                        next.push(a);
-                    }
-                }
-                rest = next;
-                if !hit {
-                    break;
+        Vec::new()
+    } else {
+        let mut cur = (
+            w.span.unwrap_or(crate::region::Span { start: 1, end: 1 }),
+            want.anchor.clone(),
+        );
+        let mut rest = same;
+        loop {
+            let mut hit = false;
+            let mut next = Vec::new();
+            for a in rest.drain(..) {
+                if crate::region::spans_too_close(&a.0, &cur.0, crate::region::SAFE_BAND) {
+                    let anchor = hull_anchor((a.0, &a.1), (cur.0, &cur.1));
+                    cur = (hull(a.0, cur.0), anchor);
+                    hit = true;
+                } else {
+                    next.push(a);
                 }
             }
-            rest.push(cur);
-            rest.sort();
-            rest.dedup();
-            rest
+            rest = next;
+            if !hit {
+                break;
+            }
         }
+        rest.push(cur);
+        rest.sort_by(|x, y| x.0.cmp(&y.0));
+        rest.dedup_by(|x, y| x.0 == y.0);
+        // 中身が手元にあるなら、畳んだ結果の錨は**その場で打ち直す**。
+        // 畳んで出来た域の先頭行・末尾行は元のどちらとも違い得るので、
+        // 継ぎ接ぎの錨より実測のほうが必ず正しい。
+        if let Some(t) = text {
+            for (s, a) in rest.iter_mut() {
+                *a = crate::region::capture_anchor(t, s);
+            }
+        }
+        rest
     };
     let render = |s: Option<crate::region::Span>| {
         crate::region::render(&crate::region::Region {
@@ -966,33 +1216,41 @@ fn absorb(pats: &mut Vec<String>, want: &str) -> bool {
             anchor: crate::region::Anchor::default(),
         })
     };
+    let place = |op: &mut Vec<String>, oa: &mut Vec<crate::region::Anchor>| {
+        if merged.is_empty() {
+            op.push(render(None));
+            oa.push(crate::region::Anchor::default()); // ファイル全体に錨は要らない
+        } else {
+            for (s, a) in merged.iter() {
+                op.push(render(Some(*s)));
+                oa.push(a.clone());
+            }
+        }
+    };
     // 同じパスの最初の位置へ畳んだ結果を置き、残りは落とす
     // (並べ直さないので、既に整っていれば台帳は 1 バイトも変わらない)。
     let mut out: Vec<String> = Vec::with_capacity(pats.len() + 1);
+    let mut out_a: Vec<crate::region::Anchor> = Vec::with_capacity(pats.len() + 1);
     let mut placed = false;
-    for p in pats.iter() {
+    for (i, p) in pats.iter().enumerate() {
         if spec_region(p).path != w.path {
             out.push(p.clone());
+            out_a.push(ancs.get(i).cloned().unwrap_or_default());
             continue;
         }
         if !placed {
             placed = true;
-            if merged.is_empty() {
-                out.push(render(None));
-            } else {
-                out.extend(merged.iter().map(|s| render(Some(*s))));
-            }
+            place(&mut out, &mut out_a);
         }
     }
     if !placed {
-        if merged.is_empty() {
-            out.push(render(None));
-        } else {
-            out.extend(merged.iter().map(|s| render(Some(*s))));
-        }
+        place(&mut out, &mut out_a);
     }
+    // **「増えた件数」は昔どおりパターンだけで数える。** 錨を打ち直しただけの
+    // 再確保を「1 件増えた」と報告すると、`zai lease claim` の出す数が嘘になる。
     let changed = out != *pats;
     *pats = out;
+    *ancs = out_a;
     changed
 }
 
@@ -1011,15 +1269,75 @@ pub fn try_claim(
     ttl: u64,
     alive: &dyn Fn(u32) -> bool,
 ) -> Claim {
+    // **`#` を含まない圧倒的多数は 1 バイトも読まない。** ここで基準フォルダを
+    // 求めてしまうと、ファイル単位の確保 (GUI / 従来の使い方) にまで
+    // `roots_of` の I/O を払わせることになる。
+    if !patterns.iter().any(|p| has_frag(p)) {
+        let wants: Vec<Want> = patterns.iter().map(|p| Want::plain(p)).collect();
+        return try_claim_wants(store, holder, &wants, now, ttl, alive);
+    }
+    try_claim_in(&default_tree(), store, holder, patterns, now, ttl, alive)
+}
+
+/// 基準フォルダを明示する [`try_claim`]。
+///
+/// `tree` は**スコープ相対パスの起点** (= [`Roots::tree`])。`src/a.rs#fn:name`
+/// のような記号指定はここからの相対で実ファイルを読んで行域へ落とす
+/// ([`hydrate_in`])。記号が見つからない / ファイルが読めないときは
+/// **1 件も確保せずに断る** (全か無か)。
+pub fn try_claim_in(
+    tree: &Path,
+    store: &mut Store,
+    holder: &Holder,
+    patterns: &[String],
+    now: u64,
+    ttl: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> Claim {
+    let mut wants: Vec<Want> = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        match hydrate_in(tree, p) {
+            Ok(w) => wants.push(w),
+            Err(reason) => {
+                return Claim::Refused {
+                    owner: reason,
+                    pattern: p.clone(),
+                    until: now,
+                }
+            }
+        }
+    }
+    try_claim_wants(store, holder, &wants, now, ttl, alive)
+}
+
+/// 錨を打ち終えた [`Want`] で確保する。**実ファイルを読まない** =
+/// 台帳ロックの内側で I/O が起きない ([`gate`] はここを直に呼ぶ)。
+pub fn try_claim_wants(
+    store: &mut Store,
+    holder: &Holder,
+    wants: &[Want],
+    now: u64,
+    ttl: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> Claim {
     prune(store, now, alive);
-    let wanted: Vec<String> = patterns
+    let wanted: Vec<Want> = wants
         .iter()
-        .map(|p| normalize_spec(p))
-        .filter(|p| !p.is_empty())
+        .map(|w| Want {
+            spec: normalize_spec(&w.spec),
+            anchor: w.anchor.clone(),
+            text: w.text.clone(),
+        })
+        .filter(|w| !w.spec.is_empty())
         .collect();
     for l in store.leases.iter().filter(|l| !l.holder.same(holder)) {
         for w in &wanted {
-            if let Some(hit) = l.patterns.iter().find(|p| overlaps(p, w)) {
+            if let Some((_, hit)) = l
+                .patterns
+                .iter()
+                .enumerate()
+                .find(|(i, p)| overlaps_live(p, &l.anchor_at(*i), &w.spec, w.text.as_deref()))
+            {
                 return Claim::Refused {
                     owner: l.holder.display(),
                     pattern: hit.clone(),
@@ -1040,9 +1358,11 @@ pub fn try_claim(
                 until: now,
             };
         }
+        // 錨の並びを patterns へ揃えてから触る (ずれた台帳でも落ちない)。
+        mine.align_anchors();
         let mut added = 0;
-        for w in wanted {
-            if absorb(&mut mine.patterns, &w) {
+        for w in &wanted {
+            if absorb(&mut mine.patterns, &mut mine.anchors, w) {
                 added += 1;
             }
         }
@@ -1072,20 +1392,62 @@ pub fn try_claim(
     }
     // 新規のリースでも同じ畳み方を通す (同じ確保に近接した域が並ぶことがある)。
     let mut patterns: Vec<String> = Vec::with_capacity(wanted.len());
+    let mut anchors: Vec<crate::region::Anchor> = Vec::with_capacity(wanted.len());
     let mut n = 0;
     for w in &wanted {
-        if absorb(&mut patterns, w) {
+        if absorb(&mut patterns, &mut anchors, w) {
             n += 1;
         }
     }
     store.leases.push(Lease {
         holder: holder.clone(),
         patterns,
+        anchors,
         acquired_at: now,
         expires_at: expires,
         note: String::new(),
     });
     Claim::Granted(n)
+}
+
+/// 台帳側の仕様を**いまのテキストで取り直してから**重なりを見る。
+///
+/// `text` は `mine` のパスの中身。**パスが一致するときだけ取り直す** —
+/// 別ファイルのテキストで錨を探すのは意味が無いどころか、偶然同じ行が
+/// あれば他人の域を勝手に動かす。glob が絡むときも取り直さない
+/// (どのファイルを指すか確定しないので、[`overlaps`] の安全側判定に任せる)。
+fn overlaps_live(
+    theirs: &str,
+    anchor: &crate::region::Anchor,
+    mine: &str,
+    text: Option<&str>,
+) -> bool {
+    let Some(t) = text else {
+        return overlaps(theirs, mine);
+    };
+    if anchor.is_blank() || !has_frag(theirs) {
+        return overlaps(theirs, mine);
+    }
+    let mut their_region = spec_region(theirs);
+    if their_region.is_whole() || their_region.path != spec_path(mine) {
+        return overlaps(theirs, mine);
+    }
+    let recorded = match their_region.span {
+        Some(s) => s,
+        None => return overlaps(theirs, mine),
+    };
+    their_region.anchor = anchor.clone();
+    // 取り直せなければ記録された行番号へ落ちる (`Lease::live_span_of` と同じ規則)。
+    let live = crate::region::resolve(&their_region, t).unwrap_or(recorded);
+    crate::region::conflicts(
+        &crate::region::Region {
+            path: their_region.path,
+            span: Some(live),
+            anchor: crate::region::Anchor::default(),
+        },
+        &spec_region(mine),
+        crate::region::SAFE_BAND,
+    )
 }
 
 /// **断る代わりに「ずらす」提案を出す純関数。**
@@ -1104,9 +1466,12 @@ pub fn try_claim(
 ///
 /// **`store` は呼び出し側が [`prune`] 済みであること** — 引数に `now` が
 /// 無いのは、交渉層 (メッシュ) が判定済みの台帳を渡す前提だから。
+/// `text` は `want.path` の**いまの中身**。台帳の行域を錨で取り直してから
+/// 空きを探す — 古い行番号のまま提案すると、提案どおり確保しても弾かれる。
 pub fn suggest_alternative(
     store: &Store,
     want: &crate::region::Region,
+    text: Option<&str>,
 ) -> Option<crate::region::Region> {
     use crate::region::{Span, SAFE_BAND};
     let span = want.span?; // ファイル全体はずらせない
@@ -1119,11 +1484,11 @@ pub fn suggest_alternative(
     let len = span.len();
     let mut busy: Vec<Span> = Vec::new();
     for l in &store.leases {
-        for p in &l.patterns {
+        for (i, p) in l.patterns.iter().enumerate() {
             if !covers(p, &want.path) {
                 continue;
             }
-            match spec_span(p) {
+            match l.live_span_of(i, text) {
                 None => return None, // 丸ごと持たれている = ずらす先が無い
                 Some(s) => busy.push(s),
             }
@@ -1226,11 +1591,26 @@ pub fn decide(
 /// 答え、収まっているかどうかは [`owns_touched`] が別に判断する
 /// (誰も持っていない域は [`gate`] がその場で自分のものにするため、
 ///  「持っていないから止める」にすると自動確保が成立しない)。
+///
+/// ## 台帳の行域は**そのまま信じない** (遅延解決)
+/// `text` は `rel` の**いまの中身**。台帳に載っている行番号は、他人が上へ
+/// 行を足した瞬間に古くなる。そのまま信じると、持ち主がもう居ない行を
+/// 「他人のもの」として止め続け、いま持っている行を素通しする —
+/// **保証が静かに破れる**いちばん危ない壊れ方なので、ここで取り直す。
+///
+/// ## なぜ遅延解決なのか (eager な追従を採らない理由)
+/// 書き込みのたびに全担当へ [`crate::region::follow`] を掛けて台帳を書き直す
+/// 手もあるが、そうすると **(1)** 書き込みごとに台帳のロックと書き込みが要り、
+/// **(2)** フックが 1 回でも落ちた / スキップされた瞬間に台帳が現実とずれて、
+/// **ずれたことを誰も検出できない**。判定の瞬間にその場のテキストから
+/// 取り直せば、帳簿付けは 0 で、フックが飛んでも次の判定が正しい答えを出す。
+#[allow(clippy::too_many_arguments)]
 pub fn decide_spans(
     store: &Store,
     holder: &Holder,
     rel: &str,
     touched: &[crate::region::Span],
+    text: Option<&str>,
     now: u64,
     alive: &dyn Fn(u32) -> bool,
 ) -> Verdict {
@@ -1238,12 +1618,12 @@ pub fn decide_spans(
         if !l.active(now, alive) || l.holder.same(holder) {
             continue;
         }
-        if l.touches(rel, touched) {
+        if l.touches(rel, touched, text) {
             let mut reason = deny_reason(&touched_label(rel, touched), l, now);
             // **断るだけで終わらせない。** 同じ長さが入る近くの空きを一緒に出す。
             // 拒否しか返せないと、エージェントは待つか諦めるかしかできない。
             if let Some(alt) =
-                wanted_region(rel, touched).and_then(|w| suggest_alternative(store, &w))
+                wanted_region(rel, touched).and_then(|w| suggest_alternative(store, &w, text))
             {
                 reason.push_str(&trf(
                     "\n(4) ずらす — {alt} なら誰とも重なりません",
@@ -1283,11 +1663,18 @@ fn touched_label(rel: &str, touched: &[crate::region::Span]) -> String {
 /// `touched` が `None` (= 行域を決められなかった) ときは、ファイル全体を
 /// 持っているときだけ `true`。持っている域からはみ出したら `false` で、
 /// 呼び出し側は改めて確保しに行く ([`crate::region::within`])。
+///
+/// `text` を渡すと**自分の域も錨で取り直してから**見る。取り直せなければ
+/// 台帳の行番号へ落ちる。ここが「持っていない」に倒れても害は無い —
+/// 呼び出し側が確保し直すだけで、その確保が他人と衝突すれば
+/// [`try_claim_wants`] が断るので、保証は [`decide_spans`] 側で閉じている。
+#[allow(clippy::too_many_arguments)]
 pub fn owns_touched(
     store: &Store,
     holder: &Holder,
     rel: &str,
     touched: Option<&[crate::region::Span]>,
+    text: Option<&str>,
     now: u64,
     alive: &dyn Fn(u32) -> bool,
 ) -> bool {
@@ -1297,7 +1684,7 @@ pub fn owns_touched(
         if !l.active(now, alive) || !l.holder.same(holder) {
             continue;
         }
-        match l.owned_spans(rel) {
+        match l.owned_spans(rel, text) {
             None => return true, // ファイル全体を持っている
             Some(s) => {
                 any |= !s.is_empty();
@@ -1386,7 +1773,15 @@ pub fn read_store(store: &Path) -> Result<Store, String> {
     if raw.trim().is_empty() {
         return Ok(Store::default());
     }
-    serde_json::from_str(&raw).map_err(|e| format!("台帳が壊れています: {e}"))
+    let mut st: Store =
+        serde_json::from_str(&raw).map_err(|e| format!("台帳が壊れています: {e}"))?;
+    // **錨の並びを patterns へ揃えるのは読み込みのこの一点だけ。**
+    // 手で編集された台帳・別バージョンが書いた台帳は長さがずれ得るので、
+    // 以後のコードが添字で対応を取れるようにここで正規化する。
+    for l in st.leases.iter_mut() {
+        l.align_anchors();
+    }
+    Ok(st)
 }
 
 /// 台帳を書く。**tmp → rename** なので、読み手が書きかけを見ることはない。
@@ -1878,12 +2273,13 @@ fn coalesce(mut v: Vec<crate::region::Span>, band: u32) -> Vec<crate::region::Sp
 /// なので `old → new` (書いた後の座標) と `new → old` (書く前の座標) の
 /// 両方を出して**合併**する。小さな編集では 2 つはほぼ一致するので域は
 /// 広がらず、全文置換のときだけ正しく広くなる。
-fn touched_of(input: &serde_json::Value, abs: &Path) -> Option<Vec<crate::region::Span>> {
-    let old = read_capped(abs)?;
-    let new = applied_text(&old, input)?;
+/// **中身は呼び出し側がもう読んである** ([`gate`] は行域を出すのにも、台帳の
+/// 行域を錨で取り直すのにも同じ 1 回ぶんを使う — 2 度読まない)。
+fn touched_in(old: &str, input: &serde_json::Value) -> Option<Vec<crate::region::Span>> {
+    let new = applied_text(old, input)?;
     let band = crate::region::SAFE_BAND;
-    let mut all = crate::region::touched_spans(&old, &new, band);
-    all.extend(crate::region::touched_spans(&new, &old, band));
+    let mut all = crate::region::touched_spans(old, &new, band);
+    all.extend(crate::region::touched_spans(&new, old, band));
     Some(coalesce(all, band))
 }
 
@@ -2022,19 +2418,39 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
     // 出せるのは「パス欄を持つ編集ツールが 1 ファイルだけを書く」形のときだけ
     // (複数ファイルを書くコマンドは、どのペイロードがどのファイルの中身かの
     //  対応が取れない)。この線引きは [`gate`] のドキュメント表にある。
-    let spans: Vec<Option<Vec<crate::region::Span>>> =
-        if editing && targets.len() == 1 && !write.opaque {
-            let input = v.get("tool_input").unwrap_or(&v);
-            vec![touched_of(input, &targets[0].0)]
+    //
+    // **中身は 1 回だけ読む。** 行域を出すのにも、台帳に載っている他人の行域を
+    // 錨で取り直すのにも同じテキストが要る (`GATE_READ_CAP` = 1MiB の上限つき)。
+    // 2 度読むとフックの往復が倍になり、短命プロセスがそのぶん遅くなる。
+    let (spans, text): (
+        Vec<Option<Vec<crate::region::Span>>>,
+        Option<std::sync::Arc<str>>,
+    ) = if editing && targets.len() == 1 && !write.opaque {
+        match read_capped(&targets[0].0) {
+            Some(old) => {
+                let input = v.get("tool_input").unwrap_or(&v);
+                let t = touched_in(&old, input);
+                (vec![t], Some(std::sync::Arc::from(old)))
+            }
+            None => (vec![None], None),
+        }
+    } else {
+        (vec![None; targets.len()], None)
+    };
+    // `text` が `Some` なのは対象が 1 件のときだけなので、添字とずれない。
+    let text_at = |i: usize| -> Option<&str> {
+        if i == 0 {
+            text.as_deref()
         } else {
-            vec![None; targets.len()]
-        };
+            None
+        }
+    };
     let now = now_secs();
     let alive: &dyn Fn(u32) -> bool = &pid_alive;
     // 1 パスぶんの判定 (ロックの内でも外でも同じ規則を使う — 2 実装は必ずズレる)。
     let judge = |st: &Store, i: usize| -> Verdict {
         match &spans[i] {
-            Some(t) => decide_spans(st, &holder, &rels[i], t, now, alive),
+            Some(t) => decide_spans(st, &holder, &rels[i], t, text_at(i), now, alive),
             None => decide(st, &holder, &rels[i], now, alive),
         }
     };
@@ -2063,8 +2479,17 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
                     >= DEFAULT_TTL_SECS as f64 * REFRESH_BELOW
         });
         if fresh
-            && (0..targets.len())
-                .all(|i| owns_touched(&st, &holder, &rels[i], spans[i].as_deref(), now, alive))
+            && (0..targets.len()).all(|i| {
+                owns_touched(
+                    &st,
+                    &holder,
+                    &rels[i],
+                    spans[i].as_deref(),
+                    text_at(i),
+                    now,
+                    alive,
+                )
+            })
         {
             return pass_answer();
         }
@@ -2089,27 +2514,48 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
                 let left = l.expires_at.saturating_sub(now) as f64;
                 left < DEFAULT_TTL_SECS as f64 * REFRESH_BELOW
             });
-        let need = !(0..targets.len())
-            .all(|i| owns_touched(st, &holder, &rels[i], spans[i].as_deref(), now, alive));
+        let need = !(0..targets.len()).all(|i| {
+            owns_touched(
+                st,
+                &holder,
+                &rels[i],
+                spans[i].as_deref(),
+                text_at(i),
+                now,
+                alive,
+            )
+        });
         if refresh || need {
             // **触れた域だけ**を確保する (`try_claim` は全か無か)。
             // 行域を決められなかったパスは、パスそのもの = ファイル全体。
-            let want: Vec<String> = (0..targets.len())
+            //
+            // **錨は「いま手元にあるテキスト」から打つ。** フックは書き込みの
+            // **前**に走るので、これは書き込み前の中身。書き込みで動いたぶんは
+            // 次の書き込みが打ち直す。取り直せなくなっても
+            // [`Lease::live_span_of`] が記録された行番号へ落ちるので、
+            // **最悪でも錨が入る前と同じ判定**にしかならない。
+            let want: Vec<Want> = (0..targets.len())
                 .flat_map(|i| match &spans[i] {
-                    None => vec![rels[i].clone()],
+                    None => vec![Want::plain(&rels[i])],
                     Some(t) => t
                         .iter()
-                        .map(|s| {
-                            crate::region::render(&crate::region::Region {
+                        .map(|s| Want {
+                            spec: crate::region::render(&crate::region::Region {
                                 path: rels[i].clone(),
                                 span: Some(*s),
                                 anchor: crate::region::Anchor::default(),
-                            })
+                            }),
+                            anchor: text_at(i)
+                                .map(|x| crate::region::capture_anchor(x, s))
+                                .unwrap_or_default(),
+                            text: if i == 0 { text.clone() } else { None },
                         })
                         .collect(),
                 })
                 .collect();
-            let _ = try_claim(st, &holder, &want, now, DEFAULT_TTL_SECS, alive);
+            // **実ファイルを読まない入口を使う** — ここは台帳ロックの内側で、
+            // I/O を足すと混雑時にロックの保持時間が伸びて全員が待つ。
+            let _ = try_claim_wants(st, &holder, &want, now, DEFAULT_TTL_SECS, alive);
         }
         Verdict::Allow
     });
@@ -3087,6 +3533,8 @@ pub fn arm_in(dir: &Path, start: &Path, auto: bool, ttl_minutes: i64) -> bool {
     }
     let holder = editor_holder(&roots.tree);
     let ttl = ttl_from_minutes(ttl_minutes);
+    // 記号指定を実ファイルへ突き合わせる基準 (`zai` の cwd ではなく作業ツリー)。
+    let tree = roots.tree.clone();
     let roots_bg = roots.clone();
     let (tx, rx) = std::sync::mpsc::channel::<Req>();
     {
@@ -3118,7 +3566,8 @@ pub fn arm_in(dir: &Path, start: &Path, auto: bool, ttl_minutes: i64) -> bool {
                         g.tier = t;
                     }
                     Req::Claim(rel) => {
-                        let own = claim_for(&store, &holder, &rel, now_secs(), ttl, &pid_alive);
+                        let own =
+                            claim_in(&tree, &store, &holder, &rel, now_secs(), ttl, &pid_alive);
                         let mut g = guard().lock().unwrap_or_else(|e| e.into_inner());
                         // arm し直された後の遅れた答えは捨てる。
                         if g.store != store {
@@ -3422,8 +3871,62 @@ pub fn claim_for(
     ttl: u64,
     alive: &dyn Fn(u32) -> bool,
 ) -> Own {
+    // **基準フォルダを求めない。** [`try_claim`] が `#` の無いパスでは
+    // [`default_tree`] へ降りないので、ファイル単位の確保 (画面から来る
+    // 大多数) は `roots_of` の I/O を 1 バイトも増やさない。
     let pats = vec![rel.to_string()];
-    match with_store_retry(store, |s| try_claim(s, holder, &pats, now, ttl, alive)) {
+    own_of_claim(
+        store,
+        holder,
+        rel,
+        now,
+        ttl,
+        alive,
+        with_store_retry(store, |s| try_claim(s, holder, &pats, now, ttl, alive)),
+    )
+}
+
+/// 基準フォルダを明示する [`claim_for`]。
+///
+/// エディタ側 ([`arm_in`] のワーカ) は作業ツリーを知っているので必ずこちらを
+/// 使う — `zai` の作業フォルダとエディタが開いているフォルダは別物であり、
+/// 記号指定 (`src/a.rs#fn:name`) が別のファイルへ当たってしまう。
+#[allow(clippy::too_many_arguments)]
+pub fn claim_in(
+    tree: &Path,
+    store: &Path,
+    holder: &Holder,
+    rel: &str,
+    now: u64,
+    ttl: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> Own {
+    let pats = vec![rel.to_string()];
+    own_of_claim(
+        store,
+        holder,
+        rel,
+        now,
+        ttl,
+        alive,
+        with_store_retry(store, |s| {
+            try_claim_in(tree, s, holder, &pats, now, ttl, alive)
+        }),
+    )
+}
+
+/// 確保の結果を画面用の [`Own`] へ。**2 つの入口で同じ落とし方をする**。
+#[allow(clippy::too_many_arguments)]
+fn own_of_claim(
+    store: &Path,
+    holder: &Holder,
+    rel: &str,
+    now: u64,
+    ttl: u64,
+    alive: &dyn Fn(u32) -> bool,
+    out: Result<Claim, String>,
+) -> Own {
+    match out {
         // 台帳を触れないときは fail-open (編集を止めない)。保存前に再度見る。
         Err(_) => Own::Off,
         Ok(Claim::Granted(_)) => Own::Mine {
@@ -3452,7 +3955,18 @@ pub fn release_one(store: &Path, holder: &Holder, rel: &str) -> Result<(), Strin
     with_store_retry(store, |s| {
         for l in s.leases.iter_mut() {
             if l.holder.same(holder) {
-                l.patterns.retain(|p| p != rel && spec_path(p) != rel);
+                // **錨は patterns と同じ添字で落とす。** 片方だけ縮めると
+                // 以後ずっと「別の域の錨」で取り直すことになる。
+                l.align_anchors();
+                let keep: Vec<bool> = l
+                    .patterns
+                    .iter()
+                    .map(|p| p != rel && spec_path(p) != rel)
+                    .collect();
+                let mut it = keep.iter();
+                l.patterns.retain(|_| it.next().copied().unwrap_or(true));
+                let mut it = keep.iter();
+                l.anchors.retain(|_| it.next().copied().unwrap_or(true));
             }
         }
         s.leases.retain(|l| !l.patterns.is_empty());
@@ -4737,6 +5251,12 @@ mod span_tests {
     use crate::region::{Span, SAFE_BAND};
     use crate::test_util::unique_temp_dir;
 
+    /// `gate` が組み立てているのとまったく同じ「実ファイル → 触れた行域」。
+    /// 本番では読んだテキストを錨の取り直しにも使い回すので 2 段になっている。
+    fn touched_of(input: &serde_json::Value, abs: &Path) -> Option<Vec<Span>> {
+        touched_in(&read_capped(abs)?, input)
+    }
+
     fn dead(_: u32) -> bool {
         false
     }
@@ -4768,12 +5288,24 @@ mod span_tests {
         .expect("write");
         let st = read_store(&store).expect("読める");
         let l = &st.leases[0];
-        assert_eq!(l.owned_spans("src/a.rs"), None, "行域なし = ファイル全体");
+        assert_eq!(
+            l.owned_spans("src/a.rs", None),
+            None,
+            "行域なし = ファイル全体"
+        );
         assert!(l.covers_path("src/a.rs"));
-        assert!(l.touches("src/a.rs", &[Span { start: 1, end: 2 }]));
+        assert!(l.touches("src/a.rs", &[Span { start: 1, end: 2 }], None));
         // 他人はどの行でも止まる
         assert!(matches!(
-            decide_spans(&st, &who("B"), "src/a.rs", &[Span::line(500)], 100, &dead),
+            decide_spans(
+                &st,
+                &who("B"),
+                "src/a.rs",
+                &[Span::line(500)],
+                None,
+                100,
+                &dead
+            ),
             Verdict::Deny(_)
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4807,7 +5339,7 @@ mod span_tests {
             "書式が往復で変わっている"
         );
         assert_eq!(
-            back.leases[0].owned_spans(&normalize_path("src/a.rs")),
+            back.leases[0].owned_spans(&normalize_path("src/a.rs"), None),
             Some(vec![Span { start: 10, end: 40 }])
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4907,21 +5439,29 @@ mod span_tests {
         let a = who("A");
         try_claim(&mut s, &a, &["src/a.rs#L1-5".into()], 100, 600, &dead);
         assert!(
-            owns_touched(&s, &a, "src/a.rs", Some(&[Span::line(3)]), 100, &dead),
+            owns_touched(&s, &a, "src/a.rs", Some(&[Span::line(3)]), None, 100, &dead),
             "自分の域は自分のもの"
         );
         assert!(
-            !owns_touched(&s, &a, "src/a.rs", Some(&[Span::line(500)]), 100, &dead),
+            !owns_touched(
+                &s,
+                &a,
+                "src/a.rs",
+                Some(&[Span::line(500)]),
+                None,
+                100,
+                &dead
+            ),
             "持っていない行を自分のものと言っている"
         );
         assert!(
-            !owns_touched(&s, &a, "src/a.rs", None, 100, &dead),
+            !owns_touched(&s, &a, "src/a.rs", None, None, 100, &dead),
             "行域が判らない (= 全体) のに通してしまっている"
         );
         // ファイル全体を持っていれば、行域が判らなくても自分のもの
         let mut s2 = Store::default();
         try_claim(&mut s2, &a, &["src/a.rs".into()], 100, 600, &dead);
-        assert!(owns_touched(&s2, &a, "src/a.rs", None, 100, &dead));
+        assert!(owns_touched(&s2, &a, "src/a.rs", None, None, 100, &dead));
     }
 
     // ── 3. 確保 — 同じファイルでも違う行なら 2 人が持てる ──────────
@@ -4942,11 +5482,11 @@ mod span_tests {
         assert_eq!(s.leases.len(), 2);
         // 互いの域には入れない
         assert!(matches!(
-            decide_spans(&s, &b, "src/a.rs", &[Span::line(10)], 100, &dead),
+            decide_spans(&s, &b, "src/a.rs", &[Span::line(10)], None, 100, &dead),
             Verdict::Deny(_)
         ));
         assert_eq!(
-            decide_spans(&s, &b, "src/a.rs", &[Span::line(50)], 100, &dead),
+            decide_spans(&s, &b, "src/a.rs", &[Span::line(50)], None, 100, &dead),
             Verdict::Allow
         );
     }
@@ -5154,7 +5694,7 @@ mod span_tests {
         let mut s = Store::default();
         try_claim(&mut s, &who("A"), &["a.rs#L10-20".into()], 100, 600, &dead);
         let want = crate::region::parse("a.rs#L15-19").expect("parse");
-        let got = suggest_alternative(&s, &want).expect("提案が無い");
+        let got = suggest_alternative(&s, &want, None).expect("提案が無い");
         // 長さは変えない (5 行欲しいなら 5 行を返す)
         assert_eq!(got.span.expect("span").len(), 5);
         // 提案された場所は本当に空いている
@@ -5168,25 +5708,29 @@ mod span_tests {
 
         // 決定的: 何度呼んでも同じ
         for _ in 0..8 {
-            assert_eq!(suggest_alternative(&s, &want), Some(got.clone()));
+            assert_eq!(suggest_alternative(&s, &want, None), Some(got.clone()));
         }
         // 空いているならずらす必要が無い
         assert_eq!(
-            suggest_alternative(&s, &crate::region::parse("a.rs#L100-104").expect("parse")),
+            suggest_alternative(
+                &s,
+                &crate::region::parse("a.rs#L100-104").expect("parse"),
+                None
+            ),
             None
         );
         // 手前が空いていて近ければそちらを選ぶ
         let mut s2 = Store::default();
         try_claim(&mut s2, &who("A"), &["a.rs#L50-60".into()], 100, 600, &dead);
         let near_front = crate::region::parse("a.rs#L48-52").expect("parse");
-        let got2 = suggest_alternative(&s2, &near_front).expect("提案が無い");
+        let got2 = suggest_alternative(&s2, &near_front, None).expect("提案が無い");
         assert_eq!(crate::region::render(&got2), "a.rs#L42-46");
         // ずらしようが無いものは正直に None
         for spec in ["a.rs", "a.rs#L5-", "src/*.rs#L1-5"] {
             let mut s3 = Store::default();
             try_claim(&mut s3, &who("A"), &["a.rs".into()], 100, 600, &dead);
             assert_eq!(
-                suggest_alternative(&s3, &crate::region::parse(spec).expect("parse")),
+                suggest_alternative(&s3, &crate::region::parse(spec).expect("parse"), None),
                 None,
                 "{spec:?}"
             );
@@ -5296,7 +5840,7 @@ mod span_tests {
         // B が 100 行目を書こうとする → 止まる
         let hit = serde_json::json!({ "old_string": "line 100", "new_string": "変更" });
         let t = touched_of(&hit, &f).expect("行域");
-        let Verdict::Deny(reason) = decide_spans(&st, &b, rel, &t, 100, &dead) else {
+        let Verdict::Deny(reason) = decide_spans(&st, &b, rel, &t, None, 100, &dead) else {
             panic!("他人の行域への書き込みを通してしまった");
         };
         assert!(
@@ -5314,8 +5858,11 @@ mod span_tests {
         let far = serde_json::json!({ "old_string": "line 10\n", "new_string": "変更\n" });
         let t2 = touched_of(&far, &f).expect("行域");
         assert_eq!(t2, vec![Span::line(10)]);
-        assert_eq!(decide_spans(&st, &b, rel, &t2, 100, &dead), Verdict::Allow);
-        assert!(!owns_touched(&st, &b, rel, Some(&t2), 100, &dead));
+        assert_eq!(
+            decide_spans(&st, &b, rel, &t2, None, 100, &dead),
+            Verdict::Allow
+        );
+        assert!(!owns_touched(&st, &b, rel, Some(&t2), None, 100, &dead));
         let want: Vec<String> = t2
             .iter()
             .map(|s| format!("{rel}#L{}-{}", s.start, s.end))
@@ -5324,13 +5871,14 @@ mod span_tests {
             try_claim(&mut st, &b, &want, 100, 600, &dead),
             Claim::Granted(1)
         );
-        assert!(owns_touched(&st, &b, rel, Some(&t2), 100, &dead));
+        assert!(owns_touched(&st, &b, rel, Some(&t2), None, 100, &dead));
         // 続けて同じ域を書くならロックすら要らない
         assert!(owns_touched(
             &st,
             &b,
             rel,
             Some(&[Span::line(10)]),
+            None,
             100,
             &dead
         ));
@@ -5339,12 +5887,12 @@ mod span_tests {
         let whole = serde_json::json!({ "content": "全部\n入れ替える\n" });
         let t3 = touched_of(&whole, &f).expect("行域");
         assert!(matches!(
-            decide_spans(&st, &b, rel, &t3, 100, &dead),
+            decide_spans(&st, &b, rel, &t3, None, 100, &dead),
             Verdict::Deny(_)
         ));
         // 行域を決められない書き込み (シェル経由) も同じく止まる
         assert!(matches!(
-            decide_spans(&st, &b, rel, &[], 100, &dead),
+            decide_spans(&st, &b, rel, &[], None, 100, &dead),
             Verdict::Deny(_)
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5491,6 +6039,469 @@ mod span_tests {
             "重なった担当が台帳に載った: {:?}",
             crate::region::conflicting_pairs(&regions, SAFE_BAND)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  錨 (アンカー) — 行域を「行番号」ではなく「そこにある内容」に紐づける
+//
+//  行域リースの弱点は、**台帳が行番号しか覚えていない**ことだった。
+//  A が 100 行目付近へ 10 行足すと、B の「200〜260 行目」は実際には
+//  「210〜270 行目」へ動く。行番号だけを信じると、次の判定で B は
+//  **他人の領域を自分のものだと思い込む** — 拒否も警告も出ないまま
+//  「衝突ゼロ」の保証が静かに破れる、いちばん危ない壊れ方である。
+//
+//  ここは `region::capture_anchor` (確保の瞬間) と `region::resolve`
+//  (判定の瞬間) が**本当に繋がっている**ことを実ファイルで固定する。
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use crate::region::{Span, SAFE_BAND};
+    use crate::test_util::unique_temp_dir;
+
+    fn dead(_: u32) -> bool {
+        false
+    }
+
+    fn who(agent: &str) -> Holder {
+        Holder {
+            agent: agent.to_string(),
+            session: format!("s-{agent}"),
+            cwd: String::new(),
+            pid: 0,
+        }
+    }
+
+    /// `line 1` … `line n` だけのファイル。**同じ内容の行が 1 つも無い**ので、
+    /// 錨が当たらなかったときに「曖昧で断った」と「消えていた」を混同しない。
+    fn numbered(n: u32) -> String {
+        (1..=n).map(|i| format!("line {i}\n")).collect()
+    }
+
+    /// `at` 行目の**手前**へ `count` 行差し込む (1 始まり)。
+    fn insert_before(text: &str, at: u32, count: u32) -> String {
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let at = (at.max(1) - 1) as usize;
+        for i in 0..count {
+            lines.insert(at + i as usize, format!("inserted {i}"));
+        }
+        lines.join("\n") + "\n"
+    }
+
+    fn claim(
+        tree: &Path,
+        store: &Path,
+        holder: &Holder,
+        spec: &str,
+        now: u64,
+    ) -> Result<Claim, String> {
+        with_store(store, |s| {
+            try_claim_in(tree, s, holder, &[spec.to_string()], now, 600, &dead)
+        })
+    }
+
+    /// スコープ相対の担当を、いまのテキストで取り直した一覧にする
+    /// (不変条件の検査に使う)。
+    fn live_regions(st: &Store, rel: &str, text: &str) -> Vec<crate::region::Region> {
+        let mut out = Vec::new();
+        for l in &st.leases {
+            for i in 0..l.patterns.len() {
+                let mut r = l.region_at(i);
+                if !covers(&l.patterns[i], rel) {
+                    continue;
+                }
+                if let Some(span) = r.span {
+                    r.span = Some(crate::region::resolve(&r, text).unwrap_or(span));
+                }
+                r.anchor = crate::region::Anchor::default();
+                out.push(r);
+            }
+        }
+        out
+    }
+
+    // ── 1. 後方互換 — 錨を知らない台帳をそのまま読み書きできる ─────────
+
+    /// **`anchors` 欄が無い台帳も、長さがずれた台帳も落ちずに読める。**
+    /// `#[serde(default)]` を外したり長さを信じたりすると、既存ユーザーの
+    /// 台帳が読めなくなる = ガードが丸ごと無効になる (fail-open の最悪形)。
+    #[test]
+    fn 錨を知らない古い台帳をそのまま読み書きできる() {
+        let dir = unique_temp_dir("zaivern", "lease-anchor-compat");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = dir.join("s.json");
+        // 版を上げていないので、`anchors` の欄そのものが無い
+        let raw = r#"{"leases":[{"holder":{"agent":"old","session":"s-old","cwd":"","pid":0},
+            "patterns":["src/a.rs#L10-40","src/b.rs"],
+            "acquired_at":1,"expires_at":4102444800,"note":""}]}"#;
+        std::fs::write(&store, raw).expect("write");
+        let st = read_store(&store).expect("古い台帳が読めない");
+        let l = &st.leases[0];
+        assert_eq!(l.patterns.len(), 2);
+        assert_eq!(l.anchors.len(), 2, "読み込みの一点で長さが揃う");
+        assert!(l.anchor_at(0).is_blank(), "錨が無い = 行番号だけで持つ");
+        assert!(l.anchor_at(99).is_blank(), "範囲外を引いても落ちない");
+
+        // 錨が無いので、テキストを渡しても判定は**錨が入る前とまったく同じ**。
+        let rel = normalize_path("src/a.rs");
+        let other = numbered(50);
+        assert!(
+            l.touches(&rel, &[Span::line(20)], Some(&other)),
+            "錨なしの域は台帳の行番号のまま効く"
+        );
+        assert!(!l.touches(&rel, &[Span::line(200)], Some(&other)));
+
+        // 錨の数が patterns とずれた台帳 (手で編集された / 別版が書いた)。
+        let skew = r#"{"leases":[{"holder":{"agent":"skew","session":"s-skew","cwd":"","pid":0},
+            "patterns":["src/a.rs#L10-40"],
+            "anchors":[{"head":"a","tail":"b","len":31},{"head":"x","tail":"y","len":9},
+                       {"head":"z","tail":"w","len":2}],
+            "acquired_at":1,"expires_at":4102444800,"note":""}]}"#;
+        std::fs::write(&store, skew).expect("write");
+        let st = read_store(&store).expect("ずれた台帳が読めない");
+        assert_eq!(st.leases[0].anchors.len(), 1, "余った錨は落とす");
+        assert_eq!(st.leases[0].anchor_at(0).head, "a", "先頭の対応は保つ");
+
+        // 錨つきの台帳は書いて読み戻せる (往復)。
+        let mut back = st.clone();
+        back.leases[0].anchors[0].len = 31;
+        write_store(&store, &back).expect("書ける");
+        assert_eq!(read_store(&store).expect("読める"), back, "往復で変わった");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 2. 本題 — 上に行が入っても持ち主が変わらない ───────────────────
+
+    /// **これが錨を繋いだ証拠。**
+    ///
+    /// 1. 300 行のファイルを置く
+    /// 2. A が `#L200-260` を確保する (ここで錨が打たれる)
+    /// 3. 100 行目の手前へ 10 行差し込む → A の担当は **210〜270 行目**として解決される
+    /// 4. さらに差し込んで合計 100 行ずらす → A は **300〜360 行目**
+    /// 5. B が「200〜260 行目」を要求したら**通る** (A はもうそこに居ない)
+    /// 6. B が「300〜360 行目」を要求したら**拒否される** (A がそこに居る)
+    ///
+    /// 5 と 6 でずらす量を 100 行にしてあるのは算数の都合:
+    /// 61 行の域を 10 行ずらしても元の域と 51 行重なるので、
+    /// 「元の行番号が空く」ことを見せられない。**元の域と離れる**ところまで
+    /// ずらして初めて、行番号ではなく中身で持っていることが確かめられる。
+    #[test]
+    fn 上に行が挿入されても行域の持ち主は変わらない() {
+        let dir = unique_temp_dir("zaivern", "lease-anchor-shift");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("src")).expect("mkdir");
+        let abs = tree.join("src").join("a.rs");
+        let store = dir.join("s.json");
+        let rel = normalize_path("src/a.rs");
+        let (a, b) = (who("a"), who("b"));
+        let now = 1_000;
+
+        let base = numbered(300);
+        std::fs::write(&abs, &base).expect("write");
+        assert!(
+            matches!(
+                claim(&tree, &store, &a, "src/a.rs#L200-260", now).expect("確保"),
+                Claim::Granted(1)
+            ),
+            "A が 200-260 を取れない"
+        );
+        // 錨は**確保の瞬間**に打たれる。
+        let st = read_store(&store).expect("読める");
+        let la = st.leases.iter().find(|l| l.holder.same(&a)).expect("A");
+        assert_eq!(la.patterns, vec![normalize_spec("src/a.rs#L200-260")]);
+        assert_eq!(
+            la.anchor_at(0).head,
+            "line 200",
+            "先頭行の中身を覚えていない"
+        );
+        assert_eq!(
+            la.anchor_at(0).tail,
+            "line 260",
+            "末尾行の中身を覚えていない"
+        );
+        assert_eq!(la.anchor_at(0).len, 61);
+
+        // 100 行目の手前へ 10 行 → 210〜270 行目
+        let shifted10 = insert_before(&base, 100, 10);
+        std::fs::write(&abs, &shifted10).expect("write");
+        assert_eq!(
+            la.owned_spans(&rel, Some(&shifted10)),
+            Some(vec![Span {
+                start: 210,
+                end: 270
+            }]),
+            "10 行入っても担当が付いていっていない"
+        );
+        // 台帳は**1 バイトも書き換えていない** (遅延解決 — 帳簿付けが要らない)。
+        assert_eq!(
+            la.patterns,
+            vec![normalize_spec("src/a.rs#L200-260")],
+            "判定のたびに台帳を書き直してはいけない"
+        );
+
+        // 合計 100 行 → 300〜360 行目
+        let shifted = insert_before(&base, 100, 100);
+        std::fs::write(&abs, &shifted).expect("write");
+        assert_eq!(
+            la.owned_spans(&rel, Some(&shifted)),
+            Some(vec![Span {
+                start: 300,
+                end: 360
+            }])
+        );
+
+        // B は「元の行番号」を取れる — A はもうそこに居ない。
+        match claim(&tree, &store, &b, "src/a.rs#L200-260", now).expect("確保") {
+            Claim::Granted(1) => {}
+            other => panic!("A が居なくなった行を取れない: {other:?}"),
+        }
+        // B は「A がいま居る行」を取れない。
+        match claim(&tree, &store, &b, "src/a.rs#L300-360", now).expect("確保") {
+            Claim::Refused { owner, .. } => assert!(owner.contains('a'), "誰に断られたか: {owner}"),
+            other => panic!("A の居る行が取れてしまった: {other:?}"),
+        }
+
+        // **不変条件**: 取り直した後でも、どの 2 人の担当も重ならない。
+        let st = read_store(&store).expect("読める");
+        let regions = live_regions(&st, &rel, &shifted);
+        assert!(
+            crate::region::is_disjoint(&regions, SAFE_BAND),
+            "重なった担当が残った: {:?}",
+            crate::region::conflicting_pairs(&regions, SAFE_BAND)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **域が丸ごと消えたら、記録された行番号のまま止め続ける。**
+    /// ここを「誰のものでもない」に倒すと 2 人が同じ場所を書けるようになり、
+    /// 「ファイル全体」に倒すと持ち主が自分の先頭行を直しただけで
+    /// 同じファイルの他の担当を全員締め出す。**どちらも採らない。**
+    #[test]
+    fn 取り直せない域は記録された行番号のまま効く() {
+        let dir = unique_temp_dir("zaivern", "lease-anchor-lost");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("src")).expect("mkdir");
+        let abs = tree.join("src").join("a.rs");
+        let store = dir.join("s.json");
+        let rel = normalize_path("src/a.rs");
+        let (a, b) = (who("a"), who("b"));
+
+        std::fs::write(&abs, numbered(300)).expect("write");
+        claim(&tree, &store, &a, "src/a.rs#L200-260", 1_000).expect("確保");
+        let st = read_store(&store).expect("読める");
+        let la = st.leases.iter().find(|l| l.holder.same(&a)).expect("A");
+
+        // 錨にした行を丸ごと消す = 取り直せない
+        let gone: String = (1..=150).map(|i| format!("line {i}\n")).collect();
+        assert_eq!(crate::region::resolve(&la.region_at(0), &gone), None);
+        assert_eq!(
+            la.owned_spans(&rel, Some(&gone)),
+            Some(vec![Span {
+                start: 200,
+                end: 260
+            }]),
+            "取り直せないときは台帳の行番号へ落ちる"
+        );
+        std::fs::write(&abs, &gone).expect("write");
+        match claim(&tree, &store, &b, "src/a.rs#L200-260", 1_000).expect("確保") {
+            Claim::Refused { .. } => {}
+            other => panic!("持ち主が判らない域を誰でも取れてしまう: {other:?}"),
+        }
+        // 離れた行はいつもどおり取れる (ファイル全体へは倒していない)。
+        assert!(matches!(
+            claim(&tree, &store, &b, "src/a.rs#L1-50", 1_000).expect("確保"),
+            Claim::Granted(1)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 3. 記号で指す域 ────────────────────────────────────────────────
+
+    /// `zai lease claim 'src/a.rs#fn:draw_toolbar'` が実ファイルから行域になる。
+    /// **直上の doc コメントと属性まで含む** (持ち主が自分の doc を直せないと
+    /// 使い物にならない)。
+    #[test]
+    fn 記号で指した域が実ファイルから行域になる() {
+        let dir = unique_temp_dir("zaivern", "lease-anchor-symbol");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("src")).expect("mkdir");
+        let store = dir.join("s.json");
+        // 2 つの関数は安全帯 (3 行) より離して置く — 隣り合っていると
+        // 「記号が読めていない」のか「近すぎて断られた」のか区別が付かない。
+        let src = [
+            "// あたま",                          // 1
+            "fn other() {",                       // 2
+            "    1",                              // 3
+            "}",                                  // 4
+            "// 埋め 1",                          // 5
+            "// 埋め 2",                          // 6
+            "// 埋め 3",                          // 7
+            "// 埋め 4",                          // 8
+            "// 埋め 5",                          // 9
+            "/// ツールバーを描く",               // 10
+            "pub fn draw_toolbar(ui: &mut Ui) {", // 11
+            "    let _ = ui;",                    // 12
+            "}",                                  // 13
+            "",                                   // 14
+            "fn tail() {}",                       // 15
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(tree.join("src").join("a.rs"), &src).expect("write");
+        let a = who("a");
+
+        assert!(matches!(
+            claim(&tree, &store, &a, "src/a.rs#fn:draw_toolbar", 1_000).expect("確保"),
+            Claim::Granted(1)
+        ));
+        let st = read_store(&store).expect("読める");
+        let l = &st.leases[0];
+        assert_eq!(
+            l.patterns,
+            vec![normalize_spec("src/a.rs#L10-13")],
+            "記号が行域へ落ちていない (直上の doc コメント込み)"
+        );
+        assert_eq!(l.anchor_at(0).head, "/// ツールバーを描く");
+        assert!(!l.anchor_at(0).is_blank(), "記号で取った域にも錨が要る");
+
+        // 別人はその関数の中を取れないが、離れた関数は取れる。
+        let b = who("b");
+        for spec in ["src/a.rs#fn:draw_toolbar", "src/a.rs#L11"] {
+            assert!(
+                matches!(
+                    claim(&tree, &store, &b, spec, 1_000).expect("確保"),
+                    Claim::Refused { .. }
+                ),
+                "{spec} が取れてしまった"
+            );
+        }
+        assert!(matches!(
+            claim(&tree, &store, &b, "src/a.rs#fn:other", 1_000).expect("確保"),
+            Claim::Granted(1)
+        ));
+        assert_eq!(
+            read_store(&store)
+                .expect("読める")
+                .leases
+                .iter()
+                .find(|l| l.holder.same(&b))
+                .expect("B")
+                .patterns,
+            vec![normalize_spec("src/a.rs#L2-4")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **記号が見つからない / ファイルが読めないときは 1 件も確保しない。**
+    ///
+    /// 黙ってファイル全体として扱うと「関数 1 つ取った」つもりの本人が
+    /// 他の担当を全員締め出し、黙って捨てると取れたつもりで誰にも守られない。
+    /// どちらも後から気付けないので、**その場で断る**のが唯一正しい。
+    #[test]
+    fn 記号が見つからないときは一件も確保しない() {
+        let dir = unique_temp_dir("zaivern", "lease-anchor-nosym");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("src")).expect("mkdir");
+        let store = dir.join("s.json");
+        std::fs::write(tree.join("src").join("a.rs"), "fn other() {}\n").expect("write");
+        let a = who("a");
+
+        for spec in ["src/a.rs#fn:居ない関数", "src/none.rs#fn:draw_toolbar"] {
+            match claim(&tree, &store, &a, spec, 1_000).expect("確保") {
+                Claim::Refused { owner, pattern, .. } => {
+                    assert_eq!(pattern, spec);
+                    assert!(!owner.is_empty(), "理由が空: {spec}");
+                }
+                other => panic!("{spec} が通ってしまった: {other:?}"),
+            }
+        }
+        // 全か無か — 1 件も載っていない。
+        assert!(read_store(&store).expect("読める").leases.is_empty());
+
+        // 同じ確保に読める記号と読めない記号が混ざっても、1 件も取らない。
+        let mixed = vec![
+            "src/a.rs#fn:other".to_string(),
+            "src/a.rs#fn:居ない関数".to_string(),
+        ];
+        let got = with_store(&store, |s| {
+            try_claim_in(&tree, s, &a, &mixed, 1_000, 600, &dead)
+        })
+        .expect("確保");
+        assert!(matches!(got, Claim::Refused { .. }), "{got:?}");
+        assert!(read_store(&store).expect("読める").leases.is_empty());
+
+        // **行域指定は読めなくても断らない** — 錨が無いだけで、
+        // 錨が入る前とまったく同じ判定へ落ちる。
+        assert!(matches!(
+            claim(&tree, &store, &a, "src/none.rs#L10-40", 1_000).expect("確保"),
+            Claim::Granted(1)
+        ));
+        assert!(read_store(&store).expect("読める").leases[0]
+            .anchor_at(0)
+            .is_blank());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 4. 不変条件 ───────────────────────────────────────────────────
+
+    /// **ファイル全体の保持者が居るなら、同じファイルの行域は 1 つも取れない。**
+    /// 逆も同じ (行域を持つ人が居るファイルは丸ごと取れない)。
+    /// 錨が入っても、この向きは 1 ミリも変わってはいけない。
+    #[test]
+    fn 全体と行域は錨が入っても互いに排他のまま() {
+        let dir = unique_temp_dir("zaivern", "lease-anchor-whole");
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("src")).expect("mkdir");
+        let store = dir.join("s.json");
+        std::fs::write(tree.join("src").join("a.rs"), numbered(300)).expect("write");
+        let (a, b) = (who("a"), who("b"));
+
+        claim(&tree, &store, &a, "src/a.rs", 1_000).expect("確保");
+        for spec in ["src/a.rs#L10-40", "src/a.rs#L900-999", "src/a.rs"] {
+            assert!(
+                matches!(
+                    claim(&tree, &store, &b, spec, 1_000).expect("確保"),
+                    Claim::Refused { .. }
+                ),
+                "全体の持ち主が居るのに {spec} が取れた"
+            );
+        }
+        // 逆向き
+        let dir2 = unique_temp_dir("zaivern", "lease-anchor-whole2");
+        let store2 = dir2.join("s.json");
+        claim(&tree, &store2, &a, "src/a.rs#L10-40", 1_000).expect("確保");
+        assert!(matches!(
+            claim(&tree, &store2, &b, "src/a.rs", 1_000).expect("確保"),
+            Claim::Refused { .. }
+        ));
+        // ファイル全体には錨を打たない (行番号に依存しないので要らない)。
+        let st = read_store(&store).expect("読める");
+        assert!(st.leases[0].anchor_at(0).is_blank());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// **fail-open の範囲は錨が入っても広がらない。**
+    /// 台帳が無いだけなら通し、在るのに読めないときは止める。
+    #[test]
+    fn 台帳が無いだけなら通し壊れていれば止める() {
+        let dir = unique_temp_dir("zaivern", "lease-anchor-failopen");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = dir.join("s.json");
+        let a = who("a");
+        // 台帳が無い = 機能が無効
+        assert!(matches!(
+            check_one(&store, &a, "src/a.rs", 1_000, &dead),
+            Verdict::Allow
+        ));
+        // 在るのに読めない = 止める (戻し方を文面に出す)
+        std::fs::write(&store, "{ 壊れた").expect("write");
+        match check_one(&store, &a, "src/a.rs", 1_000, &dead) {
+            Verdict::Deny(m) => assert!(m.contains("zai lease"), "戻し方が無い: {m}"),
+            Verdict::Allow => panic!("壊れた台帳で素通しした"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
